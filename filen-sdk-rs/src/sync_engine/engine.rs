@@ -5,7 +5,8 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	mem,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -1177,6 +1178,48 @@ struct Prepared {
 }
 
 impl Prepared {
+	/// Carry each directory move across as one move — a case-only rename included — and read the
+	/// rest of the pass where those subtrees end up (see [`plan::fold_dir_moves`]).
+	fn fold_dir_moves(&mut self) {
+		self.dir_moves = plan::fold_dir_moves(
+			self.record.mode,
+			Arc::make_mut(&mut self.baseline),
+			&mut self.local_scan.nodes,
+			&mut self.remote_view.nodes,
+			&self.holds.held_remote,
+		);
+		// What this pass blocks and reports is keyed by path too, and has to follow the fold, or a
+		// block stays behind at a path nothing is keyed by any more while its item reads as absent at
+		// the new one: a remote item the view cannot place would have its local copy quarantined.
+		// Replayed in order, each move re-keys exactly what the fold re-keyed for it.
+		for action in &self.dir_moves {
+			let (from, to) = action.endpoints();
+			// Keyed like the baseline rows they were read from. A park on the moved directory itself
+			// is cleared by its rename, as any rename clears one; carried along, it would hold back the
+			// very move that renames it.
+			rekey_paths(&mut self.unknown_remote, from, to);
+			self.failures.remove(from);
+			rekey_paths(&mut self.failures, from, to);
+			if matches!(action, SyncAction::MoveRemote { .. }) {
+				// Keyed like the remote view, which only a remote move re-keys.
+				for report in &mut self.never_synced_remote {
+					if let Some(path) = plan::moved_path(&report.rel_path, from, to) {
+						report.rel_path = path;
+					}
+				}
+			} else {
+				// Keyed like the local scan, which only a local move re-keys.
+				rekey_paths(&mut self.local_scan.invalid_names, from, to);
+				rekey_paths(&mut self.local_scan.aliased_dirs, from, to);
+				for target in self.local_scan.aliased_dirs.values_mut() {
+					if let Some(path) = plan::moved_path(target, from, to) {
+						*target = path;
+					}
+				}
+			}
+		}
+	}
+
 	/// Map internal actions onto the public [`PlannedAction`] shape, resolving each one's size from
 	/// whichever side of this pass knows it.
 	fn planned(&self, actions: &[SyncAction]) -> Vec<PlannedAction> {
@@ -1248,6 +1291,17 @@ impl Prepared {
 			.cloned()
 			.collect()
 	}
+}
+
+/// Re-key every path at or under `from` in `map` to the same place under `to`.
+fn rekey_paths<M, V>(map: &mut M, from: &str, to: &str)
+where
+	M: Default + IntoIterator<Item = (String, V)> + FromIterator<(String, V)>,
+{
+	*map = mem::take(map)
+		.into_iter()
+		.map(|(path, value)| (plan::moved_path(&path, from, to).unwrap_or(path), value))
+		.collect();
 }
 
 /// Whether a failure streak keeps its path out of a pass planned at `now` (unix millis): it has
@@ -2173,7 +2227,7 @@ impl SyncEngine {
 
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
-		let mut local_scan = tokio::task::spawn_blocking(move || {
+		let local_scan = tokio::task::spawn_blocking(move || {
 			scan::scan_local(&local_root, &scan_baseline, depth)
 		})
 		.await
@@ -2214,22 +2268,11 @@ impl SyncEngine {
 		}
 		holds.held_remote = remote_view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
-		// Carry each directory move across as one move — a case-only rename included — and read the
-		// rest of the pass where those subtrees end up. AFTER the fold: a move of ours the cache has
-		// not shown yet must read as done, not as the remote moving the directory back.
-		let mut baseline = baseline;
-		let dir_moves = plan::fold_dir_moves(
-			record.mode,
-			Arc::make_mut(&mut baseline),
-			&mut local_scan.nodes,
-			&mut remote_view.nodes,
-			&holds.held_remote,
-		);
 
-		Ok(Prepared {
+		let mut prepared = Prepared {
 			record,
 			baseline,
-			dir_moves,
+			dir_moves: Vec::new(),
 			local_scan,
 			remote_view,
 			remote_converged: snapshot.watermark.is_some(),
@@ -2241,7 +2284,11 @@ impl SyncEngine {
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
-		})
+		};
+		// AFTER the pending-write fold: a move of ours the cache has not shown yet must read as done,
+		// not as the remote moving the directory back.
+		prepared.fold_dir_moves();
+		Ok(prepared)
 	}
 
 	/// Reconcile + guard-screen a pass WITHOUT applying it: a dry run that reads both sides and
@@ -3131,6 +3178,9 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
 	let actions = drop_blocked(actions, &prep.blocked_paths());
+	let actions =
+		withhold_deletions_over_unreachable(actions, &prep.unknown_remote, &prep.holds.held_remote);
+	let actions = creates_before_dir_moves(actions);
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
 		.into_iter()
 		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
@@ -3227,6 +3277,91 @@ fn drop_blocked(actions: Vec<SyncAction>, blocked: &BTreeSet<String>) -> Vec<Syn
 			!strands
 		})
 		.collect()
+}
+
+/// Drop a deletion of a directory above a path whose remote item still exists where this pass cannot
+/// act on it, and the create a type flip pairs with it at that path (whose own stash or overwrite
+/// would take the directory just the same). Deletions are recursive; this is the per-path plan of a
+/// directory move the fold could not make.
+///
+/// - Under a path the cache is holding mid-transition (`held`), both sides wait: the reconcile
+///   deferred that path, and the next pass reads it settled.
+/// - Under a synced path whose remote item is out of the view (`unknown`), only a LOCAL deletion
+///   waits, for as long as the item stays out of reach: the local copy is the only readable one. A
+///   remote trash there still runs — the local side already let go of its copy, and a trash is
+///   recoverable.
+///
+/// A deletion around a path blocked for any other reason (a rejected name, an alias, a park) runs as
+/// it did, into the recoverable quarantine or trash.
+fn withhold_deletions_over_unreachable(
+	actions: Vec<SyncAction>,
+	unknown: &BTreeMap<String, UnsyncableReason>,
+	held: &HashSet<String>,
+) -> Vec<SyncAction> {
+	let withheld: BTreeSet<String> = actions
+		.iter()
+		.filter(|action| {
+			let dir = action.rel_path();
+			let above_held = held.iter().any(|path| plan::is_under(path, dir));
+			match action {
+				SyncAction::DeleteLocal { .. } => {
+					above_held || unknown.keys().any(|path| plan::is_under(path, dir))
+				}
+				SyncAction::TrashRemote { .. } => above_held,
+				_ => false,
+			}
+		})
+		.map(|action| action.rel_path().to_string())
+		.collect();
+	if withheld.is_empty() {
+		return actions;
+	}
+	actions
+		.into_iter()
+		.filter(|action| {
+			let waits =
+				(action.is_delete() || action.is_create()) && withheld.contains(action.rel_path());
+			if waits {
+				tracing::debug!(
+					"reconcile: skipping {} — the directory holds an item the remote side cannot be \
+					 acted on for yet",
+					action.describe()
+				);
+			}
+			!waits
+		})
+		.collect()
+}
+
+/// Run each directory move right after the creates of the new directories above its destination, on
+/// the side it moves (see `plan::parents_ready`); everything else keeps its order. Those creates
+/// are planned with the rest of the pass, which runs after the moves.
+fn creates_before_dir_moves(actions: Vec<SyncAction>) -> Vec<SyncAction> {
+	let (moves, mut rest): (Vec<_>, Vec<_>) = actions.into_iter().partition(|action| {
+		matches!(
+			action,
+			SyncAction::MoveLocal {
+				kind: NodeKind::Dir,
+				..
+			} | SyncAction::MoveRemote {
+				kind: NodeKind::Dir,
+				..
+			}
+		)
+	});
+	let mut ordered = Vec::with_capacity(moves.len() + rest.len());
+	for action in moves {
+		let local = matches!(action, SyncAction::MoveLocal { .. });
+		let to = action.rel_path();
+		ordered.extend(rest.extract_if(.., |create| match create {
+			SyncAction::CreateLocalDir { rel_path } => local && plan::is_under(to, rel_path),
+			SyncAction::CreateRemoteDir { rel_path } => !local && plan::is_under(to, rel_path),
+			_ => false,
+		}));
+		ordered.push(action);
+	}
+	ordered.extend(rest);
+	ordered
 }
 
 /// A stable identifier for one held deletion batch: the sorted `(side, path)` lines hashed. The
@@ -3412,6 +3547,806 @@ mod tests {
 		assert!(
 			drop_blocked(reconciled.actions, &unknown.keys().cloned().collect()).is_empty(),
 			"the unknown path plans nothing"
+		);
+	}
+
+	/// What a pass plans and reports once both sides are read: folded and screened exactly as a
+	/// pass folds and screens them, with a guard that holds nothing back.
+	fn folded_pass(
+		mode: SyncMode,
+		baseline: HashMap<String, BaselineEntry>,
+		local: Vec<LocalNode>,
+		remote_view: RemoteView,
+		failures: HashMap<String, PathFailure>,
+	) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
+		run_prepared(prepared(mode, baseline, local, remote_view, failures))
+	}
+
+	/// Fold and screen `prep` as a pass does.
+	fn run_prepared(mut prep: Prepared) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
+		prep.fold_dir_moves();
+		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		let mut actions = screened.decision.safe;
+		actions.extend(screened.decision.held);
+		(actions, prep.unsyncable())
+	}
+
+	/// A pass's inputs before the fold, with a complete scan that found nothing it could not sync.
+	fn prepared(
+		mode: SyncMode,
+		baseline: HashMap<String, BaselineEntry>,
+		local: Vec<LocalNode>,
+		remote_view: RemoteView,
+		failures: HashMap<String, PathFailure>,
+	) -> Prepared {
+		let (unknown_remote, never_synced_remote) =
+			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
+		Prepared {
+			record: PairRecord {
+				id: PAIR,
+				local_root: String::new(),
+				remote_root: Uuid::nil(),
+				mode,
+				delete_guard: DeleteGuard::unlimited(),
+				paused: false,
+			},
+			baseline: Arc::new(baseline),
+			dir_moves: Vec::new(),
+			local_scan: LocalScan {
+				nodes: local
+					.into_iter()
+					.map(|node| (node.rel_path.clone(), node))
+					.collect(),
+				complete: true,
+				errors: Vec::new(),
+				invalid_names: BTreeMap::new(),
+				aliased_dirs: BTreeMap::new(),
+			},
+			holds: plan::PassHolds {
+				trashed: HashSet::new(),
+				held_remote: remote_view.held_paths.clone(),
+			},
+			remote_view,
+			remote_converged: true,
+			remote_emptied: false,
+			failures,
+			unknown_remote,
+			never_synced_remote,
+			confirmed: Vec::new(),
+			dirs: Vec::new(),
+			files: Vec::new(),
+		}
+	}
+
+	fn dir_row(rel: &str, uuid: Uuid) -> BaselineEntry {
+		BaselineEntry {
+			kind: NodeKind::Dir,
+			remote_uuid: Some(uuid),
+			..synced_shell(rel)
+		}
+	}
+
+	/// A synced file in its steady state: both sides agreed on `hash`, lineage id = uuid.
+	fn file_row(rel: &str, uuid: Uuid, hash: Blake3Hash) -> BaselineEntry {
+		BaselineEntry {
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			agreed_hash: Some(hash),
+			..synced_file(rel, uuid, hash, 4)
+		}
+	}
+
+	fn remote_dir(rel: &str, uuid: Uuid) -> RemoteNode {
+		RemoteNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::Dir,
+			remote_uuid: uuid,
+			stable_uuid: None,
+			content_hash: None,
+			size: 0,
+			modified_millis: 0,
+		}
+	}
+
+	fn local_dir(rel: &str) -> LocalNode {
+		LocalNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::Dir,
+			size: 0,
+			mtime_millis: 0,
+			content_hash: None,
+		}
+	}
+
+	fn local_file(rel: &str, hash: Blake3Hash) -> LocalNode {
+		LocalNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			size: 4,
+			mtime_millis: 0,
+			content_hash: Some(hash),
+		}
+	}
+
+	fn view(
+		nodes: Vec<RemoteNode>,
+		skipped: Vec<plan::SkippedRemote>,
+		held: &[&str],
+	) -> RemoteView {
+		RemoteView {
+			nodes: nodes
+				.into_iter()
+				.map(|node| (node.rel_path.clone(), node))
+				.collect(),
+			has_collisions: false,
+			held_paths: held.iter().map(|path| path.to_string()).collect(),
+			skipped,
+		}
+	}
+
+	/// Whether `action` deletes `path`, directly or with a directory above it.
+	fn deletes(action: &SyncAction, path: &str) -> bool {
+		action.is_delete() && (action.rel_path() == path || plan::is_under(path, action.rel_path()))
+	}
+
+	/// The uuids of a synced `docs/` holding `a.txt` and `x.bin`, and their contents.
+	struct Docs {
+		dir: Uuid,
+		a: Uuid,
+		x: Uuid,
+		a_hash: Blake3Hash,
+		x_hash: Blake3Hash,
+	}
+
+	impl Docs {
+		fn new() -> Self {
+			Self {
+				dir: Uuid::new_v4(),
+				a: Uuid::new_v4(),
+				x: Uuid::new_v4(),
+				a_hash: Blake3Hash::from([1; 32]),
+				x_hash: Blake3Hash::from([2; 32]),
+			}
+		}
+
+		fn baseline(&self) -> HashMap<String, BaselineEntry> {
+			HashMap::from([
+				("docs".to_string(), dir_row("docs", self.dir)),
+				(
+					"docs/a.txt".to_string(),
+					file_row("docs/a.txt", self.a, self.a_hash),
+				),
+				(
+					"docs/x.bin".to_string(),
+					file_row("docs/x.bin", self.x, self.x_hash),
+				),
+			])
+		}
+
+		fn local(&self, at: &str) -> Vec<LocalNode> {
+			vec![
+				local_dir(at),
+				local_file(&format!("{at}/a.txt"), self.a_hash),
+				local_file(&format!("{at}/x.bin"), self.x_hash),
+			]
+		}
+
+		/// `x.bin` undecodable, so only the directory and `a.txt` are placed.
+		fn remote_with_undecodable_x(&self, at: &str) -> RemoteView {
+			view(
+				vec![
+					remote_dir(at, self.dir),
+					remote_file(&format!("{at}/a.txt"), self.a, self.a_hash, 4),
+				],
+				vec![plan::SkippedRemote {
+					remote_uuid: self.x,
+					stable_uuid: Some(StableUuid::new_for_test(self.x)),
+					rel_path: at.to_string(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				}],
+				&[],
+			)
+		}
+	}
+
+	/// A synced directory the remote renamed, holding a child whose remote item stopped decoding, is
+	/// still one local rename: the block on the child follows it into the renamed directory, so the
+	/// child is neither quarantined as a remote deletion nor pushed back over the item, and it is
+	/// reported where it now is on both sides.
+	#[test]
+	fn a_remote_dir_rename_carries_the_block_on_an_undecodable_child() {
+		for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+			let docs = Docs::new();
+			let (actions, unsyncable) = folded_pass(
+				mode,
+				docs.baseline(),
+				docs.local("docs"),
+				docs.remote_with_undecodable_x("documents"),
+				HashMap::new(),
+			);
+			assert_eq!(
+				actions,
+				vec![SyncAction::MoveLocal {
+					from_path: "docs".to_string(),
+					to_path: "documents".to_string(),
+					kind: NodeKind::Dir,
+				}],
+				"{mode:?}"
+			);
+			assert_eq!(
+				unsyncable,
+				vec![UnsyncablePath {
+					rel_path: "documents/x.bin".to_string(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A remote move into a directory the local side does not have yet is still one move: the pass
+	/// creates the new parent first, and the undecodable child moves with its directory.
+	#[test]
+	fn a_remote_dir_move_into_a_new_parent_creates_it_first() {
+		for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+			let docs = Docs::new();
+			let mut remote = docs.remote_with_undecodable_x("fresh/documents");
+			remote
+				.nodes
+				.insert("fresh".to_string(), remote_dir("fresh", Uuid::new_v4()));
+			let (actions, unsyncable) = folded_pass(
+				mode,
+				docs.baseline(),
+				docs.local("docs"),
+				remote,
+				HashMap::new(),
+			);
+			assert_eq!(
+				actions,
+				vec![
+					SyncAction::CreateLocalDir {
+						rel_path: "fresh".to_string(),
+					},
+					SyncAction::MoveLocal {
+						from_path: "docs".to_string(),
+						to_path: "fresh/documents".to_string(),
+						kind: NodeKind::Dir,
+					},
+				],
+				"{mode:?}"
+			);
+			assert_eq!(
+				unsyncable,
+				vec![UnsyncablePath {
+					rel_path: "fresh/documents/x.bin".to_string(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// The push-side mirror: `mkdir fresh; mv docs fresh/documents` with an undecodable child is one
+	/// remote move after the create of its new parent, so the child's local copy is not uploaded as a
+	/// second, readable item.
+	#[test]
+	fn a_local_dir_move_into_a_new_parent_creates_it_first() {
+		for mode in [SyncMode::TwoWay, SyncMode::LocalToRemote] {
+			let docs = Docs::new();
+			let mut local = docs.local("fresh/documents");
+			local.push(local_dir("fresh"));
+			let (actions, unsyncable) = folded_pass(
+				mode,
+				docs.baseline(),
+				local,
+				docs.remote_with_undecodable_x("docs"),
+				HashMap::new(),
+			);
+			assert_eq!(
+				actions,
+				vec![
+					SyncAction::CreateRemoteDir {
+						rel_path: "fresh".to_string(),
+					},
+					SyncAction::MoveRemote {
+						from_path: "docs".to_string(),
+						to_path: "fresh/documents".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: docs.dir,
+					},
+				],
+				"{mode:?}"
+			);
+			assert_eq!(
+				unsyncable,
+				vec![UnsyncablePath {
+					rel_path: "fresh/documents/x.bin".to_string(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// The same remote move where the fold cannot run (a new local directory already sits at the
+	/// destination): the per-path plan quarantines the old directory, and that must not take the
+	/// undecodable child's local copy with it.
+	#[test]
+	fn a_directory_delete_never_takes_a_blocked_child_with_it() {
+		for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+			let docs = Docs::new();
+			let mut local = docs.local("docs");
+			local.push(local_dir("documents"));
+			let (actions, unsyncable) = folded_pass(
+				mode,
+				docs.baseline(),
+				local,
+				docs.remote_with_undecodable_x("documents"),
+				HashMap::new(),
+			);
+			assert!(
+				!actions.iter().any(|action| deletes(action, "docs/x.bin")),
+				"{mode:?}: {actions:?}"
+			);
+			assert_eq!(
+				unsyncable,
+				vec![UnsyncablePath {
+					rel_path: "docs/x.bin".to_string(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				}],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A local rename of a directory holding a parked child is one remote move, and for the pass that
+	/// makes it the child stays parked and reported at its new path. The streak itself stays at the
+	/// old path in the store, so from the next pass the child is planned again, as after any rename.
+	#[test]
+	fn a_local_dir_rename_carries_the_park_on_a_failing_child() {
+		let docs = Docs::new();
+		let remote = view(
+			vec![
+				remote_dir("docs", docs.dir),
+				remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+				// A later version of x.bin, the download that keeps failing.
+				RemoteNode {
+					stable_uuid: Some(StableUuid::new_for_test(docs.x)),
+					..remote_file("docs/x.bin", Uuid::new_v4(), Blake3Hash::from([3; 32]), 4)
+				},
+			],
+			Vec::new(),
+			&[],
+		);
+		let now = Utc::now().timestamp_millis();
+		let (actions, unsyncable) = folded_pass(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("documents"),
+			remote,
+			HashMap::from([("docs/x.bin".to_string(), failure(MAX_PATH_FAILURES, now))]),
+		);
+		assert_eq!(
+			actions,
+			vec![SyncAction::MoveRemote {
+				from_path: "docs".to_string(),
+				to_path: "documents".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: docs.dir,
+			}]
+		);
+		assert_eq!(
+			unsyncable,
+			vec![UnsyncablePath {
+				rel_path: "documents/x.bin".to_string(),
+				reason: UnsyncableReason::RepeatedFailure {
+					attempts: MAX_PATH_FAILURES,
+					last_error: "boom".to_string(),
+				},
+			}]
+		);
+
+		// The next pass: the move committed the rows at the new path, but the stored streak is still
+		// keyed at the old one, so the child is planned again instead of being reported as parked. That
+		// stale streak is still reported at the old path until `retry_path` clears it.
+		let baseline = docs
+			.baseline()
+			.into_values()
+			.map(|mut row| {
+				row.rel_path = row.rel_path.replacen("docs", "documents", 1);
+				(row.rel_path.clone(), row)
+			})
+			.collect();
+		let remote = view(
+			vec![
+				remote_dir("documents", docs.dir),
+				remote_file("documents/a.txt", docs.a, docs.a_hash, 4),
+				RemoteNode {
+					stable_uuid: Some(StableUuid::new_for_test(docs.x)),
+					..remote_file(
+						"documents/x.bin",
+						Uuid::new_v4(),
+						Blake3Hash::from([3; 32]),
+						4,
+					)
+				},
+			],
+			Vec::new(),
+			&[],
+		);
+		let (actions, unsyncable) = folded_pass(
+			SyncMode::TwoWay,
+			baseline,
+			docs.local("documents"),
+			remote,
+			HashMap::from([("docs/x.bin".to_string(), failure(MAX_PATH_FAILURES, now))]),
+		);
+		assert!(
+			actions
+				.iter()
+				.any(|action| action.rel_path() == "documents/x.bin"),
+			"{actions:?}"
+		);
+		assert_eq!(
+			unsyncable,
+			vec![UnsyncablePath {
+				rel_path: "docs/x.bin".to_string(),
+				reason: UnsyncableReason::RepeatedFailure {
+					attempts: MAX_PATH_FAILURES,
+					last_error: "boom".to_string(),
+				},
+			}],
+			"the streak stays reported where the store keeps it"
+		);
+	}
+
+	/// A remote rename of `docs/` to `new/` with `b/` moved into it, while a child of `docs/` stopped
+	/// decoding, folds into both moves in order, so the child follows its directory instead of
+	/// holding back a deletion of `docs/` the user never made. The same holds for the local mirror.
+	#[test]
+	fn a_dir_moved_into_another_moved_dir_carries_an_undecodable_child() {
+		let b = Uuid::new_v4();
+		let b_file = Uuid::new_v4();
+		let b_hash = Blake3Hash::from([7; 32]);
+		let b_rows = |at: &str| {
+			[
+				(at.to_string(), dir_row(at, b)),
+				(
+					format!("{at}/1.txt"),
+					file_row(&format!("{at}/1.txt"), b_file, b_hash),
+				),
+			]
+		};
+		let expected_unsyncable = vec![UnsyncablePath {
+			rel_path: "new/x.bin".to_string(),
+			reason: UnsyncableReason::RemoteUndecodable,
+		}];
+
+		for mode in [SyncMode::TwoWay, SyncMode::RemoteToLocal] {
+			let docs = Docs::new();
+			let mut baseline = docs.baseline();
+			baseline.extend(b_rows("b"));
+			let mut local = docs.local("docs");
+			local.extend([local_dir("b"), local_file("b/1.txt", b_hash)]);
+			let mut remote = docs.remote_with_undecodable_x("new");
+			remote.nodes.extend([
+				("new/b".to_string(), remote_dir("new/b", b)),
+				(
+					"new/b/1.txt".to_string(),
+					remote_file("new/b/1.txt", b_file, b_hash, 4),
+				),
+			]);
+			let (actions, unsyncable) = folded_pass(mode, baseline, local, remote, HashMap::new());
+			assert_eq!(
+				actions,
+				vec![
+					SyncAction::MoveLocal {
+						from_path: "docs".to_string(),
+						to_path: "new".to_string(),
+						kind: NodeKind::Dir,
+					},
+					SyncAction::MoveLocal {
+						from_path: "b".to_string(),
+						to_path: "new/b".to_string(),
+						kind: NodeKind::Dir,
+					},
+				],
+				"pull, {mode:?}"
+			);
+			assert_eq!(unsyncable, expected_unsyncable, "pull, {mode:?}");
+		}
+
+		for mode in [SyncMode::TwoWay, SyncMode::LocalToRemote] {
+			let docs = Docs::new();
+			let mut baseline = docs.baseline();
+			baseline.extend(b_rows("b"));
+			let mut local = docs.local("new");
+			local.extend([local_dir("new/b"), local_file("new/b/1.txt", b_hash)]);
+			let mut remote = docs.remote_with_undecodable_x("docs");
+			remote.nodes.extend([
+				("b".to_string(), remote_dir("b", b)),
+				(
+					"b/1.txt".to_string(),
+					remote_file("b/1.txt", b_file, b_hash, 4),
+				),
+			]);
+			let (actions, unsyncable) = folded_pass(mode, baseline, local, remote, HashMap::new());
+			assert_eq!(
+				actions,
+				vec![
+					SyncAction::MoveRemote {
+						from_path: "docs".to_string(),
+						to_path: "new".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: docs.dir,
+					},
+					SyncAction::MoveRemote {
+						from_path: "b".to_string(),
+						to_path: "new/b".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: b,
+					},
+				],
+				"push, {mode:?}"
+			);
+			assert_eq!(unsyncable, expected_unsyncable, "push, {mode:?}");
+		}
+	}
+
+	/// A directory renamed only by case while the cache lists a child of it twice is not renamed
+	/// this pass, as a move to another path is not, and the directory at the old spelling is not
+	/// trashed with the held child in it.
+	#[test]
+	fn a_case_only_dir_rename_waits_out_a_held_child() {
+		let docs = Docs::new();
+		let mut baseline = docs.baseline();
+		baseline.remove("docs/x.bin");
+		let baseline = baseline
+			.into_values()
+			.map(|mut row| {
+				row.rel_path = row.rel_path.replacen("docs", "Docs", 1);
+				(row.rel_path.clone(), row)
+			})
+			.collect();
+		let (actions, _) = folded_pass(
+			SyncMode::TwoWay,
+			baseline,
+			vec![local_dir("docs"), local_file("docs/a.txt", docs.a_hash)],
+			view(
+				vec![
+					remote_dir("Docs", docs.dir),
+					remote_file("Docs/a.txt", docs.a, docs.a_hash, 4),
+				],
+				Vec::new(),
+				&["Docs/a.txt"],
+			),
+			HashMap::new(),
+		);
+		assert!(
+			!actions.iter().any(|action| matches!(
+				action,
+				SyncAction::MoveRemote {
+					kind: NodeKind::Dir,
+					..
+				} | SyncAction::MoveLocal {
+					kind: NodeKind::Dir,
+					..
+				}
+			)),
+			"{actions:?}"
+		);
+		assert!(
+			!actions.iter().any(|action| deletes(action, "Docs/a.txt")),
+			"{actions:?}"
+		);
+	}
+
+	/// Only a LOCAL deletion waits for a child whose remote item is out of reach, because only there
+	/// is the local copy the one readable copy left. A local `rm -r` still trashes the remote
+	/// directory (recoverably) around an undecodable child, and a remote deletion around a rejected
+	/// local name still quarantines the local directory (recoverably) as before.
+	#[test]
+	fn only_a_local_deletion_waits_for_an_unreachable_child() {
+		let docs = Docs::new();
+		let (actions, _) = folded_pass(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			Vec::new(),
+			docs.remote_with_undecodable_x("docs"),
+			HashMap::new(),
+		);
+		assert!(
+			actions.iter().any(|action| matches!(
+				action,
+				SyncAction::TrashRemote { rel_path, .. } if rel_path == "docs"
+			)),
+			"{actions:?}"
+		);
+
+		let mut baseline = docs.baseline();
+		baseline.remove("docs/x.bin");
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			baseline,
+			vec![local_dir("docs"), local_file("docs/a.txt", docs.a_hash)],
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		prep.local_scan
+			.invalid_names
+			.insert("docs/CON".to_string(), "reserved".to_string());
+		let (actions, _) = run_prepared(prep);
+		assert!(
+			actions.iter().any(|action| matches!(
+				action,
+				SyncAction::DeleteLocal { rel_path, .. } if rel_path == "docs"
+			)),
+			"{actions:?}"
+		);
+	}
+
+	/// The remote replaced a synced directory with a file while an undecodable child of it is still
+	/// on the server. Withholding the local deletion alone would let the download's own stash take the
+	/// directory, child and all, so the download waits with it.
+	#[test]
+	fn a_type_flip_waits_with_the_deletion_it_replaces() {
+		let docs = Docs::new();
+		let remote = view(
+			vec![remote_file(
+				"docs",
+				Uuid::new_v4(),
+				Blake3Hash::from([9; 32]),
+				4,
+			)],
+			vec![plan::SkippedRemote {
+				remote_uuid: docs.x,
+				stable_uuid: Some(StableUuid::new_for_test(docs.x)),
+				rel_path: "elsewhere".to_string(),
+				reason: UnsyncableReason::RemoteBrokenParent,
+			}],
+			&[],
+		);
+		let (actions, _) = folded_pass(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("docs"),
+			remote,
+			HashMap::new(),
+		);
+		assert!(
+			!actions.iter().any(|action| action.rel_path() == "docs"),
+			"{actions:?}"
+		);
+	}
+
+	/// A park on the renamed directory itself is cleared by the rename, as any rename clears one: it
+	/// does not follow the directory and hold back the move that carries it.
+	#[test]
+	fn a_park_on_a_renamed_directory_does_not_hold_back_its_move() {
+		let docs = Docs::new();
+		let remote = view(
+			vec![
+				remote_dir("documents", docs.dir),
+				remote_file("documents/a.txt", docs.a, docs.a_hash, 4),
+				remote_file("documents/x.bin", docs.x, docs.x_hash, 4),
+			],
+			Vec::new(),
+			&[],
+		);
+		let now = Utc::now().timestamp_millis();
+		let (actions, unsyncable) = folded_pass(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("docs"),
+			remote,
+			HashMap::from([("docs".to_string(), failure(MAX_PATH_FAILURES, now))]),
+		);
+		assert_eq!(
+			actions,
+			vec![SyncAction::MoveLocal {
+				from_path: "docs".to_string(),
+				to_path: "documents".to_string(),
+				kind: NodeKind::Dir,
+			}]
+		);
+		assert!(unsyncable.is_empty(), "{unsyncable:?}");
+	}
+
+	/// A remote rename folded into a local move carries what the local scan could not sync under the
+	/// directory — a rejected name, a symlink alias and its target — to the new path.
+	#[test]
+	fn a_local_move_carries_rejected_names_and_aliases() {
+		let docs = Docs::new();
+		let sub = Uuid::new_v4();
+		let mut baseline = docs.baseline();
+		baseline.insert("docs/sub".to_string(), dir_row("docs/sub", sub));
+		let mut local = docs.local("docs");
+		local.push(local_dir("docs/sub"));
+		let remote = view(
+			vec![
+				remote_dir("documents", docs.dir),
+				remote_dir("documents/sub", sub),
+				remote_file("documents/a.txt", docs.a, docs.a_hash, 4),
+				remote_file("documents/x.bin", docs.x, docs.x_hash, 4),
+			],
+			Vec::new(),
+			&[],
+		);
+		let mut prep = prepared(SyncMode::TwoWay, baseline, local, remote, HashMap::new());
+		prep.local_scan
+			.invalid_names
+			.insert("docs/CON".to_string(), "reserved".to_string());
+		prep.local_scan
+			.aliased_dirs
+			.insert("docs/link".to_string(), "docs/sub".to_string());
+		let (actions, unsyncable) = run_prepared(prep);
+		assert_eq!(
+			actions,
+			vec![SyncAction::MoveLocal {
+				from_path: "docs".to_string(),
+				to_path: "documents".to_string(),
+				kind: NodeKind::Dir,
+			}]
+		);
+		assert_eq!(
+			unsyncable,
+			vec![
+				UnsyncablePath {
+					rel_path: "documents/CON".to_string(),
+					reason: UnsyncableReason::InvalidName {
+						detail: "reserved".to_string(),
+					},
+				},
+				UnsyncablePath {
+					rel_path: "documents/link".to_string(),
+					reason: UnsyncableReason::LocalAlias {
+						target: "documents/sub".to_string(),
+					},
+				},
+			]
+		);
+	}
+
+	/// A local rename folded into a remote move carries the report of a never-synced remote item
+	/// under the directory to the new path.
+	#[test]
+	fn a_remote_move_carries_never_synced_remote_reports() {
+		let docs = Docs::new();
+		let remote = view(
+			vec![
+				remote_dir("docs", docs.dir),
+				remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+				remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+			],
+			vec![plan::SkippedRemote {
+				remote_uuid: Uuid::new_v4(),
+				stable_uuid: None,
+				rel_path: "docs".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			}],
+			&[],
+		);
+		let (actions, unsyncable) = folded_pass(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("documents"),
+			remote,
+			HashMap::new(),
+		);
+		assert_eq!(
+			actions,
+			vec![SyncAction::MoveRemote {
+				from_path: "docs".to_string(),
+				to_path: "documents".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: docs.dir,
+			}]
+		);
+		assert_eq!(
+			unsyncable,
+			vec![UnsyncablePath {
+				rel_path: "documents".to_string(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			}]
 		);
 	}
 

@@ -22,6 +22,7 @@ use filen_sdk_rs::{
 	fs::{
 		HasName,
 		categories::{DirType, Normal},
+		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 	},
 	sync_engine::{UnsyncablePath, UnsyncableReason},
 };
@@ -938,6 +939,230 @@ async fn sec12_undecryptable_item_never_reuploaded_as_plaintext() {
 	);
 
 	std::fs::remove_dir_all(&local).ok();
+}
+
+/// SEC-12b — a synced directory renamed on the remote while it holds a file nobody can decrypt is
+/// still one local rename, and the undecryptable file's local copy moves with it: the remote item
+/// moved with its parent too, so `documents/x.bin` is where it is on both sides. It is not
+/// quarantined as a remote deletion, not pushed over the item, and is reported at its new path;
+/// the decryptable sibling converges at the new path without a transfer.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn sec12b_undecryptable_child_survives_a_remote_dir_rename() {
+	undecryptable_child_survives_a_remote_dir_move("sec12b", None).await;
+}
+
+/// SEC-12c — SEC-12b with the directory moved on the remote into a folder the local side does not
+/// have yet: the pass creates that folder, then moves the directory whole into it.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn sec12c_undecryptable_child_survives_a_remote_dir_move_into_a_new_folder() {
+	undecryptable_child_survives_a_remote_dir_move("sec12c", Some("fresh")).await;
+}
+
+/// Sync `docs/` holding `a.txt` and a file that then stops decrypting, rename it to `documents` on
+/// the remote — under a new remote folder `new_parent` when given — and check the local copy of the
+/// undecryptable file moves with it and nothing is quarantined, transferred or trashed.
+#[cfg(feature = "malformed")]
+async fn undecryptable_child_survives_a_remote_dir_move(tag: &str, new_parent: Option<&str>) {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	assert!(wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await);
+	let moved = match new_parent {
+		Some(parent) => format!("{parent}/documents"),
+		None => "documents".to_string(),
+	};
+
+	let local = fresh_local_dir(tag);
+	write_file(&local, "docs/x.bin", SECRET_MARKER);
+	write_file(&local, "docs/a.txt", b"sibling");
+	let baseline_db = temp_cache_path();
+	{
+		let engine = SyncEngine::open(cache.client.clone(), baseline_db.clone())
+			.await
+			.unwrap();
+		let pair = engine
+			.add_pair(local.clone(), remote, SyncMode::TwoWay)
+			.await
+			.unwrap();
+		let r1 = engine.sync_once(pair).await.unwrap();
+		assert!(r1.errors.is_empty(), "{r1:?}");
+		assert_eq!(r1.uploaded, 2, "{r1:?}");
+		let docs = remote_dir_named(&resources, "docs").await;
+		assert!(poll_for_item(cache.db_path(), docs.uuid(), CACHE_CONVERGE_TIMEOUT).await);
+		for file in remote_dir_files(&resources, &docs).await {
+			assert!(
+				poll_for_item(cache.db_path(), file.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+				"cache never observed {:?}",
+				file.name()
+			);
+		}
+		let settled = engine.sync_once(pair).await.unwrap();
+		assert!(settled.errors.is_empty(), "{settled:?}");
+		assert_eq!(settled.uploaded + settled.downloaded, 0, "{settled:?}");
+	}
+
+	let mut docs = remote_dir_named(&resources, "docs").await;
+	resources
+		.client
+		.create_malformed_file(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&docs)),
+			"x.bin",
+			"not metadata",
+			"not a mime",
+			"not a size",
+		)
+		.await
+		.unwrap();
+	if let Some(parent) = new_parent {
+		let parent = resources
+			.client
+			.create_dir(
+				&DirType::<Normal>::Dir(Cow::Borrowed(&resources.dir)),
+				parent,
+			)
+			.await
+			.unwrap();
+		resources
+			.client
+			.move_dir(&mut docs, &DirType::<Normal>::Dir(Cow::Borrowed(&parent)))
+			.await
+			.unwrap();
+	}
+	resources
+		.client
+		.update_dir_metadata(
+			&mut docs,
+			DirectoryMetaChanges::default().name("documents").unwrap(),
+		)
+		.await
+		.unwrap();
+	let relisted = TestCache::new(&resources.client, remote).await;
+	assert!(wait_for_converged_resync(&relisted.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await);
+
+	let engine = SyncEngine::open(relisted.client.clone(), baseline_db)
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::TwoWay)
+		.await
+		.unwrap();
+	let reported = vec![UnsyncablePath {
+		rel_path: format!("{moved}/x.bin"),
+		reason: UnsyncableReason::RemoteUndecodable,
+	}];
+	let mut tree: Vec<String> = new_parent.map(str::to_string).into_iter().collect();
+	tree.extend([
+		moved.clone(),
+		format!("{moved}/a.txt"),
+		format!("{moved}/x.bin"),
+	]);
+	for pass in 1..=2 {
+		let report = engine.sync_once(pair).await.unwrap();
+		// The local copy first: losing it is what this test exists to catch.
+		let quarantine = local.join(".filen-sync-trash");
+		assert!(
+			!quarantine.exists() || walk_tree(&quarantine).is_empty(),
+			"pass {pass}: nothing was quarantined: {:?} {report:?}",
+			walk_tree(&quarantine)
+		);
+		assert_eq!(report.locally_deleted, 0, "pass {pass}: {report:?}");
+		assert_eq!(report.remotely_trashed, 0, "pass {pass}: {report:?}");
+		assert!(report.errors.is_empty(), "pass {pass}: {report:?}");
+		assert_eq!(report.unsyncable, reported, "pass {pass}: {report:?}");
+		assert!(report.held.is_empty(), "pass {pass}: {report:?}");
+		assert!(report.conflicts.is_empty(), "pass {pass}: {report:?}");
+		assert_eq!(
+			report.moved_local,
+			usize::from(pass == 1),
+			"the rename is one local move, once: {report:?}"
+		);
+		assert_eq!(
+			report.local_dirs_created,
+			usize::from(pass == 1 && new_parent.is_some()),
+			"the new folder is created once: {report:?}"
+		);
+		assert_eq!(
+			report.uploaded + report.downloaded,
+			0,
+			"pass {pass}: {report:?}"
+		);
+		assert_eq!(
+			walk_tree(&local).into_keys().collect::<Vec<_>>(),
+			tree,
+			"pass {pass}: the directory moved whole"
+		);
+		assert!(
+			read_eq(&local, &format!("{moved}/x.bin"), SECRET_MARKER),
+			"pass {pass}: the undecryptable file's local copy moved with its directory"
+		);
+		assert!(read_eq(&local, &format!("{moved}/a.txt"), b"sibling"));
+	}
+	assert_eq!(engine.plan_pair(pair).await.unwrap().unsyncable, reported);
+
+	let holder = match new_parent {
+		Some(parent) => Some(remote_dir_named(&resources, parent).await),
+		None => None,
+	};
+	let documents = remote_child_dir(
+		&resources,
+		holder.as_ref().unwrap_or(&resources.dir),
+		"documents",
+	)
+	.await;
+	let files = remote_dir_files(&resources, &documents).await;
+	assert!(
+		files.iter().all(|f| f.name() != Some("x.bin")),
+		"no decryptable stand-in was uploaded over the undecryptable item"
+	);
+	assert!(files.iter().any(|f| f.name() == Some("a.txt")));
+
+	std::fs::remove_dir_all(&local).ok();
+}
+
+/// The directory called `name` directly under the test's remote root, straight from the server.
+#[cfg(feature = "malformed")]
+async fn remote_dir_named(resources: &test_utils::TestResources, name: &str) -> RemoteDirectory {
+	remote_child_dir(resources, &resources.dir, name).await
+}
+
+/// The directory called `name` directly under `parent`, straight from the server.
+#[cfg(feature = "malformed")]
+async fn remote_child_dir(
+	resources: &test_utils::TestResources,
+	parent: &RemoteDirectory,
+	name: &str,
+) -> RemoteDirectory {
+	resources
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(parent)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap()
+		.0
+		.into_iter()
+		.find(|dir| dir.name() == Some(name))
+		.unwrap_or_else(|| panic!("no remote {name}/"))
+}
+
+/// The files directly under `dir`, straight from the server.
+#[cfg(feature = "malformed")]
+async fn remote_dir_files(
+	resources: &test_utils::TestResources,
+	dir: &RemoteDirectory,
+) -> Vec<RemoteFile> {
+	resources
+		.client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(dir)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap()
+		.1
 }
 
 #[ignore = "blocked: needs a prior-on-disk-format baseline fixture + a migrating engine build — see TODO"]
