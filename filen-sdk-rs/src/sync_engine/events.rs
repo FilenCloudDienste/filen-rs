@@ -16,7 +16,8 @@ use super::{SyncMode, apply::SyncReport};
 /// [`DeletionsHeld`](Self::DeletionsHeld) then [`Planned`](Self::Planned) followed by one
 /// in-progress event per applied action, each possibly trailed by
 /// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted). A pass the pair's
-/// pause cut short reports one [`Interrupted`](Self::Interrupted) before it completes.
+/// pause cut short, or that could not take the drive lock, reports one
+/// [`Interrupted`](Self::Interrupted) before it completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.
@@ -57,7 +58,8 @@ pub enum SyncEvent {
 	ActionFailed { rel_path: String, error: String },
 	/// The pass was cut short: the pair was paused with
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran, so `actions` of its planned
-	/// actions were not carried out — the transfer dropped in flight plus everything behind it.
+	/// actions were not carried out — the transfer dropped in flight plus everything behind it — or
+	/// the pass could not take the drive lock and carried out none of them.
 	/// They left nothing behind and the next pass re-plans them (see
 	/// [`SyncReport::interrupted`](super::SyncReport::interrupted)).
 	Interrupted { actions: usize },

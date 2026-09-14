@@ -93,11 +93,17 @@ pub struct SyncReport {
 	pub paused: bool,
 	/// How many planned actions this pass did NOT carry out because the pair was paused with
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran — the transfer dropped in
-	/// flight plus everything queued behind it. Those actions recorded nothing — a row is written
-	/// only after its action succeeded, and a transfer that succeeded is never dropped before its
-	/// row — and the next pass re-plans them. Zero on a pass that ran to the end, including one
-	/// that was merely SUSPENDED and resumed.
+	/// flight plus everything queued behind it — or because the pass could not take the drive lock,
+	/// in which case it is every planned action and `errors` says why. Those actions recorded
+	/// nothing — a row is written only after its action succeeded, and a transfer that succeeded is
+	/// never dropped before its row — and the next pass re-plans them. Zero on a pass that ran to
+	/// the end, including one that was merely SUSPENDED and resumed.
 	pub interrupted: usize,
+	/// Set when the pass could not take the drive lock, so it applied nothing. The report is still
+	/// returned (conflicts and held deletions were recorded before the lock was asked for), but a
+	/// watch loop must count the pass as failed rather than healthy. The error itself is the entry
+	/// in `errors` that starts with [`LOCK_FAILURE`].
+	pub(super) lock_failed: bool,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.
@@ -368,12 +374,7 @@ pub(super) async fn apply(
 			.await
 		{
 			Some(Ok(lock)) => Some(lock),
-			Some(Err(error)) => {
-				report
-					.errors
-					.push(format!("failed to acquire the drive lock: {error}"));
-				return;
-			}
+			Some(Err(error)) => return note_lock_failure(report, total, &error, observer),
 			None => return note_interrupted(report, total, observer),
 		}
 	} else {
@@ -455,9 +456,28 @@ pub(super) async fn apply(
 	note_interrupted(report, total - applied, observer);
 }
 
-/// Record a pass cut short by a cancel: how many planned actions it did not carry out, both on the
-/// report and as an event, so a caller can tell "nothing left to do" from "stopped part-way". A
-/// pass that ran to the end owes nothing and reports nothing.
+/// Record a pass that could not take the drive lock. It ran none of its `remaining` actions, so it
+/// is reported as [`interrupted`](SyncReport::interrupted) exactly like a cancel before the first
+/// action — which is also what keeps every planned path's failure streak untouched — and its
+/// failure is flagged in [`lock_failed`](SyncReport::lock_failed) so a watch loop backs off on it
+/// instead of reading the pass as healthy.
+pub(super) fn note_lock_failure(
+	report: &mut SyncReport,
+	remaining: usize,
+	error: &crate::Error,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) {
+	report.errors.push(format!("{LOCK_FAILURE}: {error}"));
+	report.lock_failed = true;
+	note_interrupted(report, remaining, observer);
+}
+
+/// How the error of a pass that could not take the drive lock begins in [`SyncReport::errors`].
+pub(super) const LOCK_FAILURE: &str = "failed to acquire the drive lock";
+
+/// Record a pass cut short — by a cancel, or by a drive lock it could not take: how many planned
+/// actions it did not carry out, both on the report and as an event, so a caller can tell "nothing
+/// left to do" from "stopped part-way". A pass that ran to the end owes nothing and reports nothing.
 fn note_interrupted(
 	report: &mut SyncReport,
 	remaining: usize,
