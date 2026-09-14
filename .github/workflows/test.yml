@@ -6,6 +6,14 @@ on:
 
   # Allow manual triggering from GitHub UI
   workflow_dispatch:
+    inputs:
+      sync_stress_n:
+        description: >-
+          Run ONLY the sync-engine stress lane, with this SYNC_STRESS_N (item count of the
+          round-trip tree). Leave empty for the normal test run.
+        required: false
+        default: ''
+        type: string
 
   # Run on push if commit message contains [test]
   push:
@@ -23,7 +31,7 @@ jobs:
   test:
     if: |
       github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sync_stress_n == '') ||
       contains(github.event.head_commit.message, '[test]') ||
       contains(github.event.pull_request.title, '[test]') ||
       contains(github.event.pull_request.body, '[test]')
@@ -186,7 +194,7 @@ jobs:
     if: |
       !cancelled() && (
         github.event_name == 'schedule' ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.sync_stress_n == '') ||
         contains(github.event.head_commit.message, '[test]') ||
         contains(github.event.pull_request.title, '[test]') ||
         contains(github.event.pull_request.body, '[test]')
@@ -248,7 +256,7 @@ jobs:
     if: |
       !cancelled() && (
         github.event_name == 'schedule' ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.sync_stress_n == '') ||
         contains(github.event.head_commit.message, '[test]') ||
         contains(github.event.pull_request.title, '[test]') ||
         contains(github.event.pull_request.body, '[test]')
@@ -313,10 +321,62 @@ jobs:
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+  test-sync-engine-stress:
+    # Opt-in scale lane: dispatch the workflow with `sync_stress_n` set and only this job runs
+    # (every other job skips on a non-empty input), so nothing else contends for the account's
+    # drive-write lock. It runs the four #[ignore]d `sync_engine_stress_tests`: a local ->
+    # remote -> second-client round trip of an N-item tree, two clients contending on one
+    # remote dir (SYNC_STRESS_CONTENTION_N, left at its default), and two non-colliding
+    # two-client convergence scenarios. Same account, features and build cache as
+    # test-sync-engine.
+    if: github.event_name == 'workflow_dispatch' && inputs.sync_stress_n != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Check sync_stress_n is a whole number
+        # The test silently falls back to its default on an unparseable value.
+        run: '[[ "$SYNC_STRESS_N" =~ ^[0-9]+$ ]] || { echo "sync_stress_n must be a whole number, got: $SYNC_STRESS_N"; exit 1; }'
+        env:
+          SYNC_STRESS_N: ${{ inputs.sync_stress_n }}
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-test-ubuntu-latest
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: false
+      - name: Install Wild linker
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          # Env beats .cargo/config.toml: a cache-miss cargo install runs in the repo
+          # checkout, which would otherwise need Wild to build Wild.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Install GNU time
+        run: sudo apt-get update && sudo apt-get install -y time
+      - name: Run sync_engine_stress_tests (single-threaded, ignored tests)
+        # `/usr/bin/time -v` reports the run's wall time and maximum resident set size.
+        run: |
+          cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_stress_tests --no-run
+          /usr/bin/time -v cargo test -p filen-sdk-rs -F sync-engine,malformed --test sync_engine_stress_tests --no-fail-fast -- --ignored --test-threads=1
+        env:
+          SYNC_STRESS_N: ${{ inputs.sync_stress_n }}
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::sync_engine=debug,info
   test-wasm:
     if: |
       github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.sync_stress_n == '') ||
       contains(github.event.head_commit.message, '[test]') ||
       contains(github.event.pull_request.title, '[test]') ||
       contains(github.event.pull_request.body, '[test]')
