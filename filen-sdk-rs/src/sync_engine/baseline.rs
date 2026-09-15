@@ -9,7 +9,7 @@
 //! Stored in its own SQLite DB (one writer — the engine), separate from the cache DB so the
 //! cache's single-writer worker model is untouched.
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
@@ -591,6 +591,26 @@ impl BaselineStore {
 			params![pair, rel_path],
 		)?;
 		Ok(())
+	}
+
+	/// Delete every row at or under each of `roots`, in ONE transaction.
+	pub(crate) fn delete_subtrees(
+		&self,
+		pair: PairId,
+		roots: &BTreeSet<String>,
+	) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		{
+			// `substr` and `length` both count characters in TEXT, so the prefix test is exact.
+			let mut delete = self.conn.prepare(
+				"DELETE FROM baseline WHERE pair_id = ?1
+				 AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
+			)?;
+			for root in roots {
+				delete.execute(params![pair, root])?;
+			}
+		}
+		tx.commit()
 	}
 
 	/// Journal a remote write AND apply the baseline edits it produced, in ONE transaction.
@@ -1226,6 +1246,50 @@ mod tests {
 
 		store.delete_entry(pair, "x.txt").unwrap();
 		assert_eq!(store.entry(pair, "x.txt").unwrap(), None);
+	}
+
+	#[test]
+	fn delete_subtrees_takes_each_root_and_everything_under_it_only() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for rel in ["docs", "docs/sub", "ä", "other.txt"] {
+			store.upsert_entry(pair, &dir_entry(rel)).unwrap();
+		}
+		for rel in [
+			"docs/a.txt",
+			"docs/sub/b.txt",
+			"docsx",
+			"docs.txt",
+			"ä/b.txt",
+			"äb.txt",
+		] {
+			store
+				.upsert_entry(pair, &file_entry(rel, [1u8; 32], 1))
+				.unwrap();
+		}
+		store.upsert_entry(other, &dir_entry("docs")).unwrap();
+
+		store
+			.delete_subtrees(pair, &BTreeSet::from(["docs".to_string(), "ä".to_string()]))
+			.unwrap();
+		assert_eq!(
+			store
+				.entries(pair)
+				.unwrap()
+				.iter()
+				.map(|e| e.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			vec!["docs.txt", "docsx", "other.txt", "äb.txt"]
+		);
+		assert!(
+			store.entry(other, "docs").unwrap().is_some(),
+			"another pair's rows stay"
+		);
 	}
 
 	#[test]

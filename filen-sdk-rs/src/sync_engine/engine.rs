@@ -25,6 +25,7 @@ use super::{
 		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
+	ignore::IgnoreLevel,
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
@@ -1169,6 +1170,15 @@ struct Prepared {
 	unknown_remote: BTreeMap<String, UnsyncableReason>,
 	/// Remote items out of the view that no baseline row names: reported only.
 	never_synced_remote: Vec<UnsyncablePath>,
+	/// The top-most local items the ignore rules hide, keyed like the local scan, with the level of
+	/// the rule that hides each. Nothing is done at or under one, and the baseline rows there are
+	/// dropped at the end of the pass: the path stops syncing, and reads like a first sync once the
+	/// rule goes away.
+	ignored_local: BTreeMap<String, IgnoreLevel>,
+	/// The same for the remote view, keyed like it.
+	ignored_remote: BTreeMap<String, IgnoreLevel>,
+	/// Subtrees whose ignore rules could not be read this pass: blocked, with their rows kept.
+	ignore_blocked: BTreeSet<String>,
 	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
@@ -1200,6 +1210,10 @@ impl Prepared {
 			rekey_paths(&mut self.unknown_remote, from, to);
 			self.failures.remove(from);
 			rekey_paths(&mut self.failures, from, to);
+			self.ignore_blocked = mem::take(&mut self.ignore_blocked)
+				.into_iter()
+				.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
+				.collect();
 			if matches!(action, SyncAction::MoveRemote { .. }) {
 				// Keyed like the remote view, which only a remote move re-keys.
 				for report in &mut self.never_synced_remote {
@@ -1207,8 +1221,10 @@ impl Prepared {
 						report.rel_path = path;
 					}
 				}
+				rekey_ignored(&mut self.ignored_remote, from, to);
 			} else {
 				// Keyed like the local scan, which only a local move re-keys.
+				rekey_ignored(&mut self.ignored_local, from, to);
 				rekey_paths(&mut self.local_scan.invalid_names, from, to);
 				rekey_paths(&mut self.local_scan.aliased_dirs, from, to);
 				for target in self.local_scan.aliased_dirs.values_mut() {
@@ -1282,15 +1298,51 @@ impl Prepared {
 
 	/// Every path this pass must not plan an action for: a name the remote would reject, a local
 	/// symlink to a directory inside the root, a path whose failure streak ran out, and a synced path
-	/// whose remote item is out of the view. All are reported by [`unsyncable`](Self::unsyncable).
+	/// whose remote item is out of the view, all reported by [`unsyncable`](Self::unsyncable); and an
+	/// ignored path, or one whose ignore rules could not be read.
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
 			.chain(self.local_scan.blocked_paths())
 			.chain(self.unknown_remote.keys())
+			.chain(self.ignored_local.keys())
+			.chain(self.ignored_remote.keys())
+			.chain(&self.ignore_blocked)
 			.cloned()
 			.collect()
 	}
+
+	/// The top-most ignored paths on either side: blocked, and untracked once the pass is done.
+	fn ignored_roots(&self) -> BTreeSet<String> {
+		self.ignored_local
+			.keys()
+			.chain(self.ignored_remote.keys())
+			.cloned()
+			.collect()
+	}
+}
+
+/// [`rekey_paths`] for ignored roots, carrying the directory of a `.filenignore` that decided one
+/// along with it.
+fn rekey_ignored(map: &mut BTreeMap<String, IgnoreLevel>, from: &str, to: &str) {
+	rekey_paths(map, from, to);
+	for level in map.values_mut() {
+		if let IgnoreLevel::File { dir } = level
+			&& let Some(moved) = plan::moved_path(dir, from, to)
+		{
+			*dir = moved;
+		}
+	}
+}
+
+/// Whether the remote view is wholly empty while the baseline still tracks remote items: what a
+/// transient backend or cache fault looks like. Read from the view BEFORE ignored items are filtered
+/// out of it, or a root `.filenignore` of `*` would read as a vanished remote on every pass.
+fn remote_emptied(
+	nodes: &HashMap<String, RemoteNode>,
+	baseline: &HashMap<String, BaselineEntry>,
+) -> bool {
+	nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some())
 }
 
 /// Re-key every path at or under `from` in `map` to the same place under `to`.
@@ -2233,8 +2285,7 @@ impl SyncEngine {
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
 
-		let remote_emptied =
-			remote_view.nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some());
+		let remote_emptied = remote_emptied(&remote_view.nodes, &baseline);
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
 		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
 		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
@@ -2281,6 +2332,9 @@ impl SyncEngine {
 			failures,
 			unknown_remote,
 			never_synced_remote,
+			ignored_local: BTreeMap::new(),
+			ignored_remote: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -2869,6 +2923,21 @@ impl SyncEngine {
 		result
 	}
 
+	/// Drop the baseline rows at or under every path this pass found ignored, touching neither tree:
+	/// the path stops syncing, and once no rule hides it any more it is read like a first sync. A
+	/// failure is reported and leaves the rows for the next pass, which blocks the same paths again.
+	async fn untrack_ignored(&self, pair: PairId, prep: &Prepared, report: &mut SyncReport) {
+		let roots = prep.ignored_roots();
+		if roots.is_empty() {
+			return;
+		}
+		if let Err(error) = self.store.lock().await.delete_subtrees(pair, &roots) {
+			report
+				.errors
+				.push(format!("untracking ignored paths: {error}"));
+		}
+	}
+
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
 	/// already contained.
 	async fn run_pass(
@@ -3050,6 +3119,7 @@ impl SyncEngine {
 				report.conflicts.len(),
 				report.deferred_paths,
 			);
+			self.untrack_ignored(pair, &prep, &mut report).await;
 			observer(SyncEvent::PassCompleted {
 				report: report.clone(),
 			});
@@ -3086,6 +3156,8 @@ impl SyncEngine {
 			.collect();
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		self.note_path_outcomes(pair, &attempted, &mut report).await;
+		// After the apply, which carries rows along with the directory moves the roots were re-keyed by.
+		self.untrack_ignored(pair, &prep, &mut report).await;
 		tracing::debug!(
 			"sync_once[pair {pair}]: done — {} uploaded, {} downloaded, {} remote dir(s), {} local dir(s), {} trashed, {} locally deleted, {} moved remote, {} moved local, {} conflict(s), {} held, {} deferred, {} interrupted, {} error(s)",
 			report.uploaded,
@@ -3172,14 +3244,19 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		&prep.remote_view.nodes,
 		&prep.holds,
 	);
-	let deferred_paths = plan.deferred_paths;
 	// The directory moves run before everything else in the plan, which already names their
 	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
 	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
-	let actions = drop_blocked(actions, &prep.blocked_paths());
-	let actions =
-		withhold_deletions_over_unreachable(actions, &prep.unknown_remote, &prep.holds.held_remote);
+	let actions = drop_blocked(actions, &prep.blocked_paths(), &prep.ignored_roots());
+	let (actions, over_ignored) = withhold_deletions_over_unreachable(
+		actions,
+		&prep.unknown_remote,
+		&prep.holds.held_remote,
+		[&prep.ignored_local, &prep.ignored_remote],
+		&prep.ignore_blocked,
+	);
+	let deferred_paths = plan.deferred_paths + over_ignored;
 	let actions = creates_before_dir_moves(actions);
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
 		.into_iter()
@@ -3227,22 +3304,44 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 ///
 /// Dropping the destination half of a MOVE takes the deletions that would strand its source with it
 /// (see below): an unrelocatable item must not be deleted from the side that still holds it.
-fn drop_blocked(actions: Vec<SyncAction>, blocked: &BTreeSet<String>) -> Vec<SyncAction> {
-	if blocked.is_empty() {
+///
+/// A move whose SOURCE is at or under an `ignored` root (a subset of `blocked`) goes too: the tracked
+/// copy there is no longer synced, so it must not be moved away. Nothing is stranded by that, since
+/// the deletions at the source are blocked already, and whether a directory above it may still be
+/// deleted is for [`withhold_deletions_over_unreachable`] to decide.
+fn drop_blocked(
+	actions: Vec<SyncAction>,
+	blocked: &BTreeSet<String>,
+	ignored: &BTreeSet<String>,
+) -> Vec<SyncAction> {
+	if blocked.is_empty() && ignored.is_empty() {
 		return actions;
 	}
+	let at_or_under = |roots: &BTreeSet<String>, path: &str| {
+		roots.contains(path) || roots.iter().any(|root| plan::is_under(path, root))
+	};
 	// The sources of the moves this dropped: their content is staying exactly where it is.
 	let mut stranded: Vec<String> = Vec::new();
 	let kept: Vec<SyncAction> = actions
 		.into_iter()
 		.filter(|action| {
 			let path = action.rel_path();
-			if !blocked.contains(path) && !blocked.iter().any(|root| plan::is_under(path, root)) {
+			if let SyncAction::MoveRemote { from_path, .. }
+			| SyncAction::MoveLocal { from_path, .. } = action
+				&& at_or_under(ignored, from_path)
+			{
+				tracing::debug!(
+					"reconcile: skipping {} — it moves an ignored item",
+					action.describe()
+				);
+				return false;
+			}
+			if !at_or_under(blocked, path) {
 				return true;
 			}
 			tracing::debug!(
-				"reconcile: skipping {} — its path is blocked (a name the remote rejects, or \
-				 {MAX_PATH_FAILURES} consecutive failures)",
+				"reconcile: skipping {} — its path is blocked (a name the remote rejects, \
+				 {MAX_PATH_FAILURES} consecutive failures, or an ignore rule)",
 				action.describe()
 			);
 			if let SyncAction::MoveRemote { from_path, .. }
@@ -3279,10 +3378,10 @@ fn drop_blocked(actions: Vec<SyncAction>, blocked: &BTreeSet<String>) -> Vec<Syn
 		.collect()
 }
 
-/// Drop a deletion of a directory above a path whose remote item still exists where this pass cannot
-/// act on it, and the create a type flip pairs with it at that path (whose own stash or overwrite
-/// would take the directory just the same). Deletions are recursive; this is the per-path plan of a
-/// directory move the fold could not make.
+/// Drop a deletion of a directory above a path whose item still exists where this pass cannot act on
+/// it, and the create a type flip pairs with it at that path (whose own stash or overwrite would take
+/// the directory just the same). Deletions are recursive; this is the per-path plan of a directory
+/// move the fold could not make, or of a directory deleted around content nothing may delete.
 ///
 /// - Under a path the cache is holding mid-transition (`held`), both sides wait: the reconcile
 ///   deferred that path, and the next pass reads it settled.
@@ -3290,6 +3389,13 @@ fn drop_blocked(actions: Vec<SyncAction>, blocked: &BTreeSet<String>) -> Vec<Syn
 ///   waits, for as long as the item stays out of reach: the local copy is the only readable one. A
 ///   remote trash there still runs — the local side already let go of its copy, and a trash is
 ///   recoverable.
+/// - Over an item a user-level or `.filenignore` rule hides on the side that would delete
+///   (`[ignored_local, ignored_remote]`), the deletion waits for as long as the rule stands: ignored
+///   content is never deleted, so the directory stays, holding only it. Content only the built-in
+///   defaults hide does not keep a directory, or every folder deleted elsewhere would survive on
+///   each Mac for its `.DS_Store`. Returned as the second value, counted as deferred.
+/// - Over a subtree whose ignore rules could not be read (`ignore_blocked`), on either side, the
+///   same: what those rules hide cannot be told apart from what they do not.
 ///
 /// A deletion around a path blocked for any other reason (a rejected name, an alias, a park) runs as
 /// it did, into the recoverable quarantine or trash.
@@ -3297,40 +3403,54 @@ fn withhold_deletions_over_unreachable(
 	actions: Vec<SyncAction>,
 	unknown: &BTreeMap<String, UnsyncableReason>,
 	held: &HashSet<String>,
-) -> Vec<SyncAction> {
+	[ignored_local, ignored_remote]: [&BTreeMap<String, IgnoreLevel>; 2],
+	ignore_blocked: &BTreeSet<String>,
+) -> (Vec<SyncAction>, usize) {
+	let keeps_ignored = |ignored: &BTreeMap<String, IgnoreLevel>, dir: &str| {
+		ignore_blocked.iter().any(|path| plan::is_under(path, dir))
+			|| ignored
+				.iter()
+				.any(|(path, level)| *level != IgnoreLevel::Default && plan::is_under(path, dir))
+	};
+	let mut over_ignored = 0;
 	let withheld: BTreeSet<String> = actions
 		.iter()
 		.filter(|action| {
 			let dir = action.rel_path();
 			let above_held = held.iter().any(|path| plan::is_under(path, dir));
-			match action {
-				SyncAction::DeleteLocal { .. } => {
-					above_held || unknown.keys().any(|path| plan::is_under(path, dir))
-				}
-				SyncAction::TrashRemote { .. } => above_held,
-				_ => false,
+			let (unreachable, ignored) = match action {
+				SyncAction::DeleteLocal { .. } => (
+					above_held || unknown.keys().any(|path| plan::is_under(path, dir)),
+					keeps_ignored(ignored_local, dir),
+				),
+				SyncAction::TrashRemote { .. } => (above_held, keeps_ignored(ignored_remote, dir)),
+				_ => (false, false),
+			};
+			if ignored && !unreachable {
+				over_ignored += 1;
 			}
+			unreachable || ignored
 		})
 		.map(|action| action.rel_path().to_string())
 		.collect();
 	if withheld.is_empty() {
-		return actions;
+		return (actions, over_ignored);
 	}
-	actions
+	let kept = actions
 		.into_iter()
 		.filter(|action| {
 			let waits =
 				(action.is_delete() || action.is_create()) && withheld.contains(action.rel_path());
 			if waits {
 				tracing::debug!(
-					"reconcile: skipping {} — the directory holds an item the remote side cannot be \
-					 acted on for yet",
+					"reconcile: skipping {} — the directory holds an item this pass cannot act on",
 					action.describe()
 				);
 			}
 			!waits
 		})
-		.collect()
+		.collect();
+	(kept, over_ignored)
 }
 
 /// Run each directory move right after the creates of the new directories above its destination, on
@@ -3462,14 +3582,17 @@ mod tests {
 			upload("badge/y.txt"),
 		];
 		let blocked = BTreeSet::from(["bad".to_string()]);
-		let kept: Vec<String> = drop_blocked(actions.clone(), &blocked)
+		let kept: Vec<String> = drop_blocked(actions.clone(), &blocked, &BTreeSet::new())
 			.iter()
 			.map(|a| a.rel_path().to_string())
 			.collect();
 		assert_eq!(kept, vec!["ok.txt", "badly.txt", "badge/y.txt"]);
 
 		// Nothing blocked -> the plan is untouched.
-		assert_eq!(drop_blocked(actions.clone(), &BTreeSet::new()), actions);
+		assert_eq!(
+			drop_blocked(actions.clone(), &BTreeSet::new(), &BTreeSet::new()),
+			actions
+		);
 	}
 
 	/// A synced file whose remote item dropped out of the view (its metadata stopped decoding) reads
@@ -3545,7 +3668,12 @@ mod tests {
 		);
 		assert!(never_synced.is_empty(), "{never_synced:?}");
 		assert!(
-			drop_blocked(reconciled.actions, &unknown.keys().cloned().collect()).is_empty(),
+			drop_blocked(
+				reconciled.actions,
+				&unknown.keys().cloned().collect(),
+				&BTreeSet::new()
+			)
+			.is_empty(),
 			"the unknown path plans nothing"
 		);
 	}
@@ -3612,6 +3740,9 @@ mod tests {
 			failures,
 			unknown_remote,
 			never_synced_remote,
+			ignored_local: BTreeMap::new(),
+			ignored_remote: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
 			confirmed: Vec::new(),
 			dirs: Vec::new(),
 			files: Vec::new(),
@@ -4350,6 +4481,472 @@ mod tests {
 		);
 	}
 
+	const MODES: [SyncMode; 5] = [
+		SyncMode::TwoWay,
+		SyncMode::LocalToRemote,
+		SyncMode::RemoteToLocal,
+		SyncMode::LocalBackup,
+		SyncMode::RemoteBackup,
+	];
+
+	/// `docs/` synced and now ignored by the root `.filenignore`, on both sides.
+	fn ignoring_docs(prep: &mut Prepared) {
+		let level = IgnoreLevel::File { dir: String::new() };
+		prep.ignored_local.insert("docs".to_string(), level.clone());
+		prep.ignored_remote.insert("docs".to_string(), level);
+	}
+
+	/// The baseline rows a pass that found `roots` ignored leaves behind.
+	fn untracked(
+		mut baseline: HashMap<String, BaselineEntry>,
+		roots: &BTreeSet<String>,
+	) -> HashMap<String, BaselineEntry> {
+		baseline.retain(|path, _| {
+			!roots
+				.iter()
+				.any(|root| path == root || plan::is_under(path, root))
+		});
+		baseline
+	}
+
+	/// A synced directory that becomes ignored plans nothing in any mode, whether the two sides hide
+	/// it or still show a change under it: a local deletion and a remote edit are both left alone,
+	/// and the pass untracks exactly that directory.
+	#[test]
+	fn a_synced_directory_that_becomes_ignored_plans_nothing_in_any_mode() {
+		let docs = Docs::new();
+		let edited_x = remote_file("docs/x.bin", Uuid::new_v4(), Blake3Hash::from([9; 32]), 4);
+		for mode in MODES {
+			let hidden = prepared(
+				mode,
+				docs.baseline(),
+				Vec::new(),
+				view(Vec::new(), Vec::new(), &[]),
+				HashMap::new(),
+			);
+			let changed = prepared(
+				mode,
+				docs.baseline(),
+				vec![local_dir("docs"), local_file("docs/x.bin", docs.x_hash)],
+				view(
+					vec![
+						remote_dir("docs", docs.dir),
+						remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+						edited_x.clone(),
+					],
+					Vec::new(),
+					&[],
+				),
+				HashMap::new(),
+			);
+			for (what, mut prep) in [("hidden", hidden), ("changed", changed)] {
+				ignoring_docs(&mut prep);
+				assert_eq!(
+					prep.ignored_roots(),
+					BTreeSet::from(["docs".to_string()]),
+					"{mode:?} {what}"
+				);
+				let (actions, unsyncable) = run_prepared(prep);
+				assert!(actions.is_empty(), "{mode:?} {what}: {actions:?}");
+				assert!(unsyncable.is_empty(), "{mode:?} {what}: {unsyncable:?}");
+			}
+			// Without the rules the same hidden tree reads as deleted from both sides.
+			let (actions, _) = run_prepared(prepared(
+				mode,
+				docs.baseline(),
+				Vec::new(),
+				view(Vec::new(), Vec::new(), &[]),
+				HashMap::new(),
+			));
+			assert!(!actions.is_empty(), "{mode:?}");
+		}
+	}
+
+	/// Once a pass has untracked an ignored directory, removing the rule reads its copies like a first
+	/// sync: identical ones are adopted with no transfer in every mode, and differing ones are a
+	/// conflict in a two-way pair.
+	#[test]
+	fn an_unignored_directory_reads_like_a_first_sync() {
+		let docs = Docs::new();
+		let mut ignored = prepared(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			Vec::new(),
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		ignoring_docs(&mut ignored);
+		let baseline = untracked(docs.baseline(), &ignored.ignored_roots());
+		assert!(baseline.is_empty(), "{baseline:?}");
+
+		let remote = |x: RemoteNode| {
+			view(
+				vec![
+					remote_dir("docs", docs.dir),
+					remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+					x,
+				],
+				Vec::new(),
+				&[],
+			)
+		};
+		for mode in MODES {
+			let (actions, _) = folded_pass(
+				mode,
+				baseline.clone(),
+				docs.local("docs"),
+				remote(remote_file("docs/x.bin", docs.x, docs.x_hash, 4)),
+				HashMap::new(),
+			);
+			assert!(
+				!actions.is_empty()
+					&& actions
+						.iter()
+						.all(|action| matches!(action, SyncAction::AdoptBaseline { .. })),
+				"{mode:?}: {actions:?}"
+			);
+		}
+
+		let prep = prepared(
+			SyncMode::TwoWay,
+			baseline,
+			docs.local("docs"),
+			remote(remote_file(
+				"docs/x.bin",
+				Uuid::new_v4(),
+				Blake3Hash::from([9; 32]),
+				4,
+			)),
+			HashMap::new(),
+		);
+		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		assert_eq!(
+			screened
+				.conflicts
+				.iter()
+				.map(|conflict| conflict.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			vec!["docs/x.bin"]
+		);
+	}
+
+	/// A directory deleted on one side keeps its own copy on the other while a user or `.filenignore`
+	/// rule hides something in it there, and counts that as deferred; its visible children are still
+	/// deleted. Content only the built-in defaults hide goes with the directory.
+	#[test]
+	fn a_deleted_directory_keeps_ignored_children_unless_only_defaults_hide_them() {
+		let docs = Docs::new();
+		for (level, kept) in [
+			(IgnoreLevel::User, true),
+			(
+				IgnoreLevel::File {
+					dir: "docs".to_string(),
+				},
+				true,
+			),
+			(IgnoreLevel::Default, false),
+		] {
+			let remote_side = view(
+				vec![
+					remote_dir("docs", docs.dir),
+					remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+					remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+				],
+				Vec::new(),
+				&[],
+			);
+			// Trashed on the remote, ignored content left locally; then deleted locally, ignored
+			// content left on the remote.
+			let mut pulled = prepared(
+				SyncMode::TwoWay,
+				docs.baseline(),
+				docs.local("docs"),
+				view(Vec::new(), Vec::new(), &[]),
+				HashMap::new(),
+			);
+			pulled
+				.ignored_local
+				.insert("docs/node_modules".to_string(), level.clone());
+			let mut pushed = prepared(
+				SyncMode::TwoWay,
+				docs.baseline(),
+				Vec::new(),
+				remote_side,
+				HashMap::new(),
+			);
+			pushed
+				.ignored_remote
+				.insert("docs/node_modules".to_string(), level.clone());
+
+			for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
+				let screened = reconcile_and_screen(&prep, screen_state(&prep));
+				let actions: Vec<&SyncAction> = screened
+					.decision
+					.safe
+					.iter()
+					.chain(&screened.decision.held)
+					.collect();
+				let deletes = |path: &str| {
+					actions
+						.iter()
+						.any(|action| action.is_delete() && action.rel_path() == path)
+				};
+				assert_eq!(!deletes("docs"), kept, "{level:?} {side}: {actions:?}");
+				assert!(
+					deletes("docs/a.txt") && deletes("docs/x.bin"),
+					"{level:?} {side}: {actions:?}"
+				);
+				assert_eq!(
+					screened.deferred_paths,
+					usize::from(kept),
+					"{level:?} {side}"
+				);
+			}
+		}
+	}
+
+	/// A directory deleted on one side keeps its copy on the other while a subtree in it has rules
+	/// this pass could not read: what those rules hide cannot be told apart from what they do not.
+	#[test]
+	fn a_deleted_directory_keeps_a_subtree_whose_rules_could_not_be_read() {
+		let docs = Docs::new();
+		let mut pulled = prepared(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("docs"),
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		pulled.ignore_blocked.insert("docs/sub".to_string());
+		let mut pushed = prepared(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			Vec::new(),
+			view(
+				vec![
+					remote_dir("docs", docs.dir),
+					remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+					remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+				],
+				Vec::new(),
+				&[],
+			),
+			HashMap::new(),
+		);
+		pushed.ignore_blocked.insert("docs/sub".to_string());
+
+		for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
+			let screened = reconcile_and_screen(&prep, screen_state(&prep));
+			let actions: Vec<&SyncAction> = screened
+				.decision
+				.safe
+				.iter()
+				.chain(&screened.decision.held)
+				.collect();
+			let deletes = |path: &str| {
+				actions
+					.iter()
+					.any(|action| action.is_delete() && action.rel_path() == path)
+			};
+			assert!(!deletes("docs"), "{side}: {actions:?}");
+			assert!(deletes("docs/a.txt"), "{side}: {actions:?}");
+			assert_eq!(screened.deferred_paths, 1, "{side}");
+		}
+	}
+
+	/// A file moved out of an ignored directory is not paired with its tracked copy there: that copy
+	/// is neither moved nor deleted, and once the pass has untracked the directory the file at its new
+	/// path is an ordinary new item.
+	#[test]
+	fn a_move_out_of_an_ignored_directory_leaves_the_ignored_copy_alone() {
+		let docs = Docs::new();
+		let docs_remote = || {
+			view(
+				vec![
+					remote_dir("docs", docs.dir),
+					remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+					remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+				],
+				Vec::new(),
+				&[],
+			)
+		};
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::LocalBackup,
+		] {
+			// Moved locally from docs/a.txt to a.txt; the local scan no longer shows docs/.
+			let local = vec![local_file("a.txt", docs.a_hash)];
+			let mut prep = prepared(
+				mode,
+				docs.baseline(),
+				local.clone(),
+				docs_remote(),
+				HashMap::new(),
+			);
+			prep.ignored_local
+				.insert("docs".to_string(), IgnoreLevel::User);
+			let roots = prep.ignored_roots();
+			let (actions, _) = run_prepared(prep);
+			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
+
+			let (actions, _) = folded_pass(
+				mode,
+				untracked(docs.baseline(), &roots),
+				local,
+				view(Vec::new(), Vec::new(), &[]),
+				HashMap::new(),
+			);
+			assert_eq!(actions, vec![upload("a.txt")], "{mode:?}");
+		}
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::RemoteToLocal,
+			SyncMode::RemoteBackup,
+		] {
+			// Moved on the remote from docs/a.txt to a.txt; the view no longer shows docs/.
+			let mut prep = prepared(
+				mode,
+				docs.baseline(),
+				docs.local("docs"),
+				view(
+					vec![remote_file("a.txt", docs.a, docs.a_hash, 4)],
+					Vec::new(),
+					&[],
+				),
+				HashMap::new(),
+			);
+			prep.ignored_remote
+				.insert("docs".to_string(), IgnoreLevel::User);
+			let (actions, _) = run_prepared(prep);
+			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
+		}
+	}
+
+	/// A directory move carries the ignored roots under it to the new path, each set keyed like the
+	/// side it was read from, and the directory of the `.filenignore` that decided one with it.
+	#[test]
+	fn a_dir_move_carries_the_ignored_roots_under_it() {
+		let docs = Docs::new();
+		let remote_at = |at: &str| {
+			view(
+				vec![
+					remote_dir(at, docs.dir),
+					remote_file(&format!("{at}/a.txt"), docs.a, docs.a_hash, 4),
+					remote_file(&format!("{at}/x.bin"), docs.x, docs.x_hash, 4),
+				],
+				Vec::new(),
+				&[],
+			)
+		};
+		let in_docs = |dir: &str| IgnoreLevel::File {
+			dir: dir.to_string(),
+		};
+
+		// Renamed on the remote: the local scan is re-keyed, the view already reads the new path.
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("docs"),
+			remote_at("documents"),
+			HashMap::new(),
+		);
+		prep.ignored_local
+			.insert("docs/build".to_string(), in_docs("docs"));
+		prep.ignored_remote
+			.insert("documents/cache".to_string(), IgnoreLevel::User);
+		prep.ignore_blocked.insert("docs/unreadable".to_string());
+		prep.fold_dir_moves();
+		assert_eq!(
+			prep.dir_moves,
+			vec![SyncAction::MoveLocal {
+				from_path: "docs".to_string(),
+				to_path: "documents".to_string(),
+				kind: NodeKind::Dir,
+			}]
+		);
+		assert_eq!(
+			prep.ignored_local,
+			BTreeMap::from([("documents/build".to_string(), in_docs("documents"))])
+		);
+		assert_eq!(
+			prep.ignored_remote,
+			BTreeMap::from([("documents/cache".to_string(), IgnoreLevel::User)])
+		);
+		assert_eq!(
+			prep.ignore_blocked,
+			BTreeSet::from(["documents/unreadable".to_string()])
+		);
+
+		// Renamed locally: the view is re-keyed, the local scan already reads the new path.
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			docs.baseline(),
+			docs.local("documents"),
+			remote_at("docs"),
+			HashMap::new(),
+		);
+		prep.ignored_local
+			.insert("documents/build".to_string(), IgnoreLevel::User);
+		prep.ignored_remote
+			.insert("docs/cache".to_string(), in_docs("docs"));
+		prep.ignore_blocked.insert("docs/unreadable".to_string());
+		prep.fold_dir_moves();
+		assert!(
+			matches!(&prep.dir_moves[..], [SyncAction::MoveRemote { to_path, .. }] if to_path == "documents"),
+			"{:?}",
+			prep.dir_moves
+		);
+		assert_eq!(
+			prep.ignored_local,
+			BTreeMap::from([("documents/build".to_string(), IgnoreLevel::User)])
+		);
+		assert_eq!(
+			prep.ignored_remote,
+			BTreeMap::from([("documents/cache".to_string(), in_docs("documents"))])
+		);
+		assert_eq!(
+			prep.ignore_blocked,
+			BTreeSet::from(["documents/unreadable".to_string()])
+		);
+	}
+
+	/// A root `.filenignore` of `*` hides every item on both sides. The remote is not read as emptied,
+	/// because that is decided on the unfiltered view, and no deletion is planned in any mode.
+	#[test]
+	fn ignoring_everything_neither_reads_as_an_emptied_remote_nor_deletes() {
+		let docs = Docs::new();
+		let raw = view(
+			vec![
+				remote_dir("docs", docs.dir),
+				remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+				remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+			],
+			Vec::new(),
+			&[],
+		);
+		assert!(!remote_emptied(&raw.nodes, &docs.baseline()));
+		assert!(
+			remote_emptied(&HashMap::new(), &docs.baseline()),
+			"the filtered view alone would read as a vanished remote"
+		);
+		for mode in MODES {
+			let mut prep = prepared(
+				mode,
+				docs.baseline(),
+				Vec::new(),
+				view(Vec::new(), Vec::new(), &[]),
+				HashMap::new(),
+			);
+			prep.remote_emptied = remote_emptied(&raw.nodes, &prep.baseline);
+			ignoring_docs(&mut prep);
+			assert!(screen_state(&prep).absence_trusted(), "{mode:?}");
+			let (actions, _) = run_prepared(prep);
+			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
+		}
+	}
+
 	/// A mode switch that adopts the destination's standing copies rewrites baseline rows for every
 	/// path it reads as gone on the source side, so it may only run on evidence a pass would act on.
 	/// Untrusted, the switch is worse than useless: it adopts nothing and then propagates the whole
@@ -4420,7 +5017,11 @@ mod tests {
 			remote,
 			&plan::PassHolds::default(),
 		);
-		drop_blocked(plan.actions, &scan.blocked_paths().cloned().collect())
+		drop_blocked(
+			plan.actions,
+			&scan.blocked_paths().cloned().collect(),
+			&BTreeSet::new(),
+		)
 	}
 
 	fn synced_file(rel: &str, uuid: Uuid, hash: Blake3Hash, size: u64) -> BaselineEntry {
