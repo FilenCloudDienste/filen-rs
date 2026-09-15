@@ -1188,6 +1188,9 @@ struct Prepared {
 	ignore_blocked: BTreeSet<String>,
 	/// A report line per remote `.filenignore` that could not be used, or per bad line in one.
 	remote_rule_errors: Vec<String>,
+	/// The ignored roots the pair's previous pass recorded (see
+	/// [`ignored_roots_to_record`](Self::ignored_roots_to_record)).
+	last_ignored: BTreeSet<String>,
 	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
@@ -1328,6 +1331,55 @@ impl Prepared {
 			.chain(self.ignored_remote.keys())
 			.cloned()
 			.collect()
+	}
+
+	/// Whether `path` is at or under a root this pass ignores, or under rules it could not read.
+	fn hides(&self, path: &str) -> bool {
+		self.ignore_blocked.contains("")
+			|| path
+				.match_indices('/')
+				.map(|(i, _)| &path[..i])
+				.chain([path])
+				.any(|at| {
+					self.ignored_local.contains_key(at)
+						|| self.ignored_remote.contains_key(at)
+						|| self.ignore_blocked.contains(at)
+				})
+	}
+
+	/// The roots the pair's previous pass ignored that nothing hides any more, neither a rule nor
+	/// rules this pass could not read. What sits there has no row (the pass that ignored it dropped
+	/// them), so it syncs like a first sync.
+	fn unignored(&self) -> BTreeSet<&str> {
+		self.last_ignored
+			.iter()
+			.map(String::as_str)
+			.filter(|root| !self.hides(root))
+			.collect()
+	}
+
+	/// The ignored roots to record for the pair's next pass: every root this pass ignores; a recorded
+	/// root this pass still hides, which the next pass has to see un-ignored when that ends; and an
+	/// un-ignored root while a deletion at or under it is `held`, so the next pass holds it again.
+	fn ignored_roots_to_record<'a>(
+		&self,
+		held: impl IntoIterator<Item = &'a str>,
+	) -> BTreeSet<String> {
+		let unignored = self.unignored();
+		let held: Vec<&str> = held.into_iter().collect();
+		let mut roots = self.ignored_roots();
+		roots.extend(
+			self.last_ignored
+				.iter()
+				.filter(|root| {
+					!unignored.contains(root.as_str())
+						|| held
+							.iter()
+							.any(|path| path == root || plan::is_under(path, root))
+				})
+				.cloned(),
+		);
+		roots
 	}
 
 	/// The ignored paths to report, shared by the dry run and the pass: the top of each ignored
@@ -2326,7 +2378,7 @@ impl SyncEngine {
 	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
 	/// view.
 	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
-		let (record, baseline_entries, failures, user_ignore) = {
+		let (record, baseline_entries, failures, user_ignore, last_ignored) = {
 			let store = self.store.lock().await;
 			let record = store
 				.pair(pair)
@@ -2343,7 +2395,10 @@ impl SyncEngine {
 			let user_ignore = store
 				.user_ignore()
 				.map_err(|e| db_error(e, "loading the user ignore patterns"))?;
-			(record, entries, failures, user_ignore)
+			let last_ignored = store
+				.ignored_roots(pair)
+				.map_err(|e| db_error(e, "loading the recorded ignored paths"))?;
+			(record, entries, failures, user_ignore, last_ignored)
 		};
 
 		let mut baseline_map: HashMap<String, BaselineEntry> = baseline_entries
@@ -2493,6 +2548,7 @@ impl SyncEngine {
 			ignored_remote,
 			ignore_blocked,
 			remote_rule_errors: remote_rules.errors,
+			last_ignored,
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -3116,17 +3172,31 @@ impl SyncEngine {
 	}
 
 	/// Drop the baseline rows at or under every path this pass found ignored, touching neither tree:
-	/// the path stops syncing, and once no rule hides it any more it is read like a first sync. A
-	/// failure is reported and leaves the rows for the next pass, which blocks the same paths again.
+	/// the path stops syncing, and once no rule hides it any more it is read like a first sync. Then
+	/// record the ignored roots the next pass needs to tell when that happens (see
+	/// [`Prepared::ignored_roots_to_record`]). A failure is reported; rows left behind are blocked and
+	/// dropped again by the next pass.
 	async fn untrack_ignored(&self, pair: PairId, prep: &Prepared, report: &mut SyncReport) {
 		let roots = prep.ignored_roots();
-		if roots.is_empty() {
+		let record =
+			prep.ignored_roots_to_record(report.held.iter().map(|action| action.rel_path.as_str()));
+		if roots.is_empty() && record == prep.last_ignored {
 			return;
 		}
-		if let Err(error) = self.store.lock().await.delete_subtrees(pair, &roots) {
+		let store = self.store.lock().await;
+		if !roots.is_empty()
+			&& let Err(error) = store.delete_subtrees(pair, &roots)
+		{
 			report
 				.errors
 				.push(format!("untracking ignored paths: {error}"));
+		}
+		if record != prep.last_ignored
+			&& let Err(error) = store.set_ignored_roots(pair, &record)
+		{
+			report
+				.errors
+				.push(format!("recording the ignored paths: {error}"));
 		}
 	}
 
@@ -3473,7 +3543,28 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 	} else {
 		Vec::new()
 	};
-	let decision = guard::screen(executable, state, prep.record.delete_guard);
+	// A path that stops being ignored has no rows and syncs like a first sync, whose deletions are held
+	// for approval: the rows the pair tracks elsewhere say nothing about what sits there.
+	let unignored = prep.unignored();
+	let first_sync = state.first_sync
+		|| (!unignored.is_empty()
+			&& executable.iter().any(|action| {
+				let path = action.rel_path();
+				action.is_delete()
+					&& path
+						.match_indices('/')
+						.map(|(i, _)| &path[..i])
+						.chain([path])
+						.any(|at| unignored.contains(at))
+			}));
+	let decision = guard::screen(
+		executable,
+		guard::ScreenState {
+			first_sync,
+			..state
+		},
+		prep.record.delete_guard,
+	);
 	let pass_token = (!decision.held.is_empty()).then(|| deletion_batch_token(&decision.held));
 	Screened {
 		conflicts,
@@ -3965,6 +4056,7 @@ mod tests {
 			ignored_remote: BTreeMap::new(),
 			ignore_blocked: BTreeSet::new(),
 			remote_rule_errors: Vec::new(),
+			last_ignored: BTreeSet::new(),
 			confirmed: Vec::new(),
 			dirs: Vec::new(),
 			files: Vec::new(),
@@ -4975,6 +5067,126 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	/// A path that stops being ignored syncs like a first sync in the one-way modes too: what only the
+	/// destination holds there has no row, and its deletion is held for approval as a first sync's
+	/// is, although the pair tracks other rows. A path the previous pass did not ignore gets no such
+	/// hold, and one a rule still hides plans no deletion at all.
+	#[test]
+	fn a_deletion_under_a_path_that_stops_being_ignored_is_held_like_a_first_sync() {
+		let docs = Docs::new();
+		let psd = Blake3Hash::from([7; 32]);
+		let docs_remote = |extra: Option<RemoteNode>| {
+			let mut nodes = vec![
+				remote_dir("docs", docs.dir),
+				remote_file("docs/a.txt", docs.a, docs.a_hash, 4),
+				remote_file("docs/x.bin", docs.x, docs.x_hash, 4),
+			];
+			nodes.extend(extra);
+			view(nodes, Vec::new(), &[])
+		};
+		let pushed = || {
+			prepared(
+				SyncMode::LocalToRemote,
+				docs.baseline(),
+				docs.local("docs"),
+				docs_remote(Some(remote_file("a.psd", Uuid::new_v4(), psd, 4))),
+				HashMap::new(),
+			)
+		};
+		let pulled = || {
+			let mut local = docs.local("docs");
+			local.push(local_file("a.psd", psd));
+			prepared(
+				SyncMode::RemoteToLocal,
+				docs.baseline(),
+				local,
+				docs_remote(None),
+				HashMap::new(),
+			)
+		};
+		let deletes_psd = |screened: &Screened| {
+			screened
+				.decision
+				.safe
+				.iter()
+				.chain(&screened.decision.held)
+				.any(|action| action.is_delete() && action.rel_path() == "a.psd")
+		};
+		for (side, build) in [
+			("pushed", &pushed as &dyn Fn() -> Prepared),
+			("pulled", &pulled),
+		] {
+			let plain = build();
+			let screened = reconcile_and_screen(&plain, screen_state(&plain));
+			assert!(
+				screened.decision.reason.is_none() && deletes_psd(&screened),
+				"{side}: {:?}",
+				screened.decision
+			);
+
+			let mut unignored = build();
+			unignored.last_ignored.insert("a.psd".to_string());
+			let screened = reconcile_and_screen(&unignored, screen_state(&unignored));
+			assert_eq!(
+				screened.decision.reason,
+				Some(GuardReason::FirstSyncWithDeletions { deletions: 1 }),
+				"{side}: {:?}",
+				screened.decision
+			);
+			assert!(
+				screened
+					.decision
+					.held
+					.iter()
+					.any(|action| action.rel_path() == "a.psd"),
+				"{side}"
+			);
+
+			let mut still = build();
+			still.last_ignored.insert("a.psd".to_string());
+			still
+				.ignored_local
+				.insert("a.psd".to_string(), IgnoreLevel::User);
+			still
+				.ignored_remote
+				.insert("a.psd".to_string(), IgnoreLevel::User);
+			let screened = reconcile_and_screen(&still, screen_state(&still));
+			assert!(
+				screened.decision.reason.is_none() && !deletes_psd(&screened),
+				"{side}: {:?}",
+				screened.decision
+			);
+		}
+	}
+
+	/// A pass records for the next one every root it ignores, a recorded root it still hides (under a
+	/// hidden root, or under rules it could not read), and an un-ignored root only while a deletion
+	/// under it is held.
+	#[test]
+	fn a_pass_records_the_ignored_roots_the_next_pass_needs() {
+		let docs = Docs::new();
+		let mut prep = prepared(
+			SyncMode::LocalToRemote,
+			docs.baseline(),
+			Vec::new(),
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		prep.ignored_local
+			.insert("build".to_string(), IgnoreLevel::User);
+		prep.ignore_blocked.insert("locked".to_string());
+		prep.last_ignored = ["build/cache", "locked/tmp", "held", "released"]
+			.map(String::from)
+			.into();
+		assert_eq!(prep.unignored(), BTreeSet::from(["held", "released"]));
+		assert_eq!(
+			prep.ignored_roots_to_record(["held/x.psd"]),
+			["build", "build/cache", "locked/tmp", "held"]
+				.map(String::from)
+				.into()
+		);
 	}
 
 	/// The `.filenignore` whose rules keep a withheld directory stays with it, or the next pass would
