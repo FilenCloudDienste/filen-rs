@@ -22,8 +22,6 @@ mod baseline;
 mod engine;
 mod events;
 mod guard;
-// Not wired into the pass yet; the expectation turns into a warning once it is, so it goes then.
-#[cfg_attr(not(test), expect(dead_code))]
 mod ignore;
 mod mode;
 mod outcome;
