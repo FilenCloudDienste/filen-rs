@@ -25,7 +25,10 @@ use super::{
 		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
-	ignore::{FILENIGNORE, IgnoreLevel, IgnoredPath, RemoteRules, load_remote_rules},
+	ignore::{
+		FILENIGNORE, IgnoreLevel, IgnoreSource, IgnoredPath, RemoteRules, load_remote_rules,
+		parse_user_ignore,
+	},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
@@ -2278,7 +2281,12 @@ impl SyncEngine {
 	/// Read the remote `.filenignore` files `record`'s mode takes rules from (see
 	/// [`load_remote_rules`]), reusing the bodies the pair's last pass read wherever the uuid is the
 	/// same.
-	async fn remote_rules(&self, record: &PairRecord, view: &RemoteView) -> RemoteRules {
+	async fn remote_rules(
+		&self,
+		record: &PairRecord,
+		view: &RemoteView,
+		user: Option<IgnoreSource>,
+	) -> RemoteRules {
 		// Taken rather than copied: a pass on the same pair running alongside only downloads again.
 		let cached = self
 			.remote_rule_bodies
@@ -2291,6 +2299,7 @@ impl SyncEngine {
 		let mut rules = load_remote_rules(
 			record.mode,
 			view,
+			user,
 			// One stat per remote rule file, and only on a two-way pair.
 			|dir| local_root.join(dir).join(FILENIGNORE).is_file(),
 			&cached,
@@ -2310,7 +2319,7 @@ impl SyncEngine {
 	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
 	/// view.
 	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
-		let (record, baseline_entries, failures) = {
+		let (record, baseline_entries, failures, user_ignore) = {
 			let store = self.store.lock().await;
 			let record = store
 				.pair(pair)
@@ -2324,7 +2333,10 @@ impl SyncEngine {
 				.failures(pair)
 				.map_err(|e| db_error(e, "loading the per-path failure counts"))?;
 			failures.retain(|_, failure| streak_blocks(failure, now));
-			(record, entries, failures)
+			let user_ignore = store
+				.user_ignore()
+				.map_err(|e| db_error(e, "loading the user ignore patterns"))?;
+			(record, entries, failures, user_ignore)
 		};
 
 		let mut baseline_map: HashMap<String, BaselineEntry> = baseline_entries
@@ -2361,7 +2373,18 @@ impl SyncEngine {
 		);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
 
-		let remote_rules = self.remote_rules(&record, &raw_view).await;
+		// `set_user_ignore` refuses a text that does not compile, so a stored one fails only if this
+		// build reads patterns differently from the one that stored it. Guessing what it hides could
+		// sync what the user meant to hide: block the whole pair and say why.
+		let (user, user_error) = match parse_user_ignore(&user_ignore) {
+			Ok(source) => (Some(source), None),
+			Err(error) => (None, Some(error)),
+		};
+		let mut remote_rules = self.remote_rules(&record, &raw_view, user).await;
+		if let Some(error) = user_error {
+			remote_rules.blocked.insert(String::new());
+			remote_rules.errors.push(error.to_string());
+		}
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
@@ -2512,6 +2535,38 @@ impl SyncEngine {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		Ok(())
+	}
+
+	/// Replace the device-wide user ignore patterns: gitignore syntax, read by every pair below its
+	/// `.filenignore` files and above [`DEFAULT_IGNORE_PATTERNS`](super::DEFAULT_IGNORE_PATTERNS),
+	/// from each pair's next pass. Persisted in the baseline DB; `""` clears them.
+	///
+	/// A text with a line that does not parse is refused whole, naming the first bad line, and the
+	/// stored patterns stay as they were.
+	///
+	/// A running watch is not woken for this: its next pass reads the new patterns, which is at the
+	/// latest its [`safety_net`](super::WatchConfig::safety_net) tick.
+	pub async fn set_user_ignore(&self, patterns: &str) -> Result<(), Error> {
+		parse_user_ignore(patterns).map_err(|e| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				format!("refusing the user ignore patterns: {e}"),
+			)
+		})?;
+		self.store
+			.lock()
+			.await
+			.set_user_ignore(patterns)
+			.map_err(|e| db_error(e, "storing the user ignore patterns"))
+	}
+
+	/// The stored user ignore patterns, `""` when none were set.
+	pub async fn user_ignore(&self) -> Result<String, Error> {
+		self.store
+			.lock()
+			.await
+			.user_ignore()
+			.map_err(|e| db_error(e, "loading the user ignore patterns"))
 	}
 
 	/// Every sync pair this engine has registered, in registration order.
@@ -6080,6 +6135,34 @@ mod tests {
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		(engine, pair, path)
+	}
+
+	/// The user ignore patterns round-trip, and a text with a bad line is refused whole, naming that
+	/// line and leaving the stored text alone.
+	#[tokio::test]
+	async fn user_ignore_patterns_round_trip_and_a_bad_text_is_refused_whole() {
+		let (engine, _, path) = engine_with_pair("user_ignore").await;
+		assert_eq!(engine.user_ignore().await.unwrap(), "");
+		engine.set_user_ignore("*.psd\nbuild/").await.unwrap();
+		assert_eq!(engine.user_ignore().await.unwrap(), "*.psd\nbuild/");
+
+		let error = engine
+			.set_user_ignore("*.tmp\n{a\n*.log")
+			.await
+			.unwrap_err()
+			.to_string();
+		assert!(
+			error.contains("user ignore patterns:2:"),
+			"the refusal must name the bad line: {error}"
+		);
+		assert_eq!(
+			engine.user_ignore().await.unwrap(),
+			"*.psd\nbuild/",
+			"a refused text must not replace the stored one"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
 	}
 
 	/// `list_conflicts` returns exactly the rows held for resolution — both flavours, with what each

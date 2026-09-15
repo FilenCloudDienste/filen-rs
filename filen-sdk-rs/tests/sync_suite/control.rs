@@ -19,8 +19,8 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	Backlog, CONFIRM_TENURE, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig,
-	WatchState,
+	Backlog, CONFIRM_TENURE, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine,
+	SyncEvent, SyncMode, WatchConfig, WatchState,
 };
 use uuid::Uuid;
 
@@ -236,6 +236,59 @@ async fn control_04_add_second_pair_disjoint_both_converge() {
 
 	std::fs::remove_dir_all(&local_a).ok();
 	std::fs::remove_dir_all(&local_b).ok();
+}
+
+// ===========================================================================
+// The device-wide user ignore patterns apply from the next pass, and clearing them lets what they
+// hid sync.
+// ===========================================================================
+
+#[shared_test_runtime]
+async fn control_user_ignore_applies_from_the_next_pass() {
+	let (resources, cache, remote, local) = raw_setup("c_user_ignore").await;
+	write_file(&local, "a.psd", b"layers");
+	write_file(&local, "b.txt", b"text");
+
+	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	// Upper case on purpose: the patterns match case-insensitively.
+	engine.set_user_ignore("*.PSD").await.unwrap();
+
+	let first = engine.sync_once(pair).await.unwrap();
+	assert!(first.errors.is_empty(), "first pass errors: {first:?}");
+	assert_eq!(first.uploaded, 1, "only b.txt may upload: {first:?}");
+	assert_eq!(
+		first.ignored,
+		vec![IgnoredPath {
+			rel_path: "a.psd".to_string(),
+			level: IgnoreLevel::User,
+			tracked: false,
+		}]
+	);
+	let (_, files) = list_remote(&resources).await;
+	assert!(has_file(&files, "b.txt"), "b.txt never uploaded");
+	assert!(
+		!has_file(&files, "a.psd"),
+		"a user-ignored file was uploaded"
+	);
+
+	engine.set_user_ignore("").await.unwrap();
+	let second = engine.sync_once(pair).await.unwrap();
+	assert!(second.errors.is_empty(), "second pass errors: {second:?}");
+	assert_eq!(
+		second.uploaded, 1,
+		"clearing the patterns must upload a.psd, and only it: {second:?}"
+	);
+	assert!(second.ignored.is_empty(), "{second:?}");
+	let (_, files) = list_remote(&resources).await;
+	assert!(has_file(&files, "a.psd"), "a.psd never uploaded");
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 // ===========================================================================
