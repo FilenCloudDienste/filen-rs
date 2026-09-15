@@ -214,6 +214,16 @@ impl IgnoreSource {
 	}
 }
 
+/// Compiles the device-wide user level. Unlike a `.filenignore` it is all or nothing: the first bad
+/// line refuses the whole text, so what was set is exactly what applies.
+pub(crate) fn parse_user_ignore(text: &str) -> Result<IgnoreSource, IgnoreParseError> {
+	let (source, errors) = IgnoreSource::parse(text, Origin::User)?;
+	match errors.into_iter().next() {
+		Some(error) => Err(error),
+		None => Ok(source),
+	}
+}
+
 /// Why a path is ignored: the deciding line and its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IgnoreHit<'a> {
@@ -231,8 +241,6 @@ pub(crate) struct IgnoreRules {
 }
 
 impl IgnoreRules {
-	// The pass loads no user level yet; the expectation fails the build once it does.
-	#[cfg_attr(not(test), expect(dead_code))]
 	pub(crate) fn new(user: Option<IgnoreSource>) -> Self {
 		Self {
 			user,
@@ -323,7 +331,8 @@ pub(crate) struct RemoteRules {
 	pub(crate) bodies: HashMap<Uuid, Arc<str>>,
 }
 
-/// Reads the remote `.filenignore` files whose rules `mode` takes from the remote.
+/// Reads the remote `.filenignore` files whose rules `mode` takes from the remote, on top of the
+/// `user` level.
 ///
 /// A mode that only pushes reads none: the local tree is its source of truth. A mode that only
 /// pulls reads every one, shallowest first, and skips a file under a directory the rules read so far
@@ -338,6 +347,7 @@ pub(crate) struct RemoteRules {
 pub(crate) async fn load_remote_rules<Fetch, Fut>(
 	mode: SyncMode,
 	view: &RemoteView,
+	user: Option<IgnoreSource>,
 	local_has_file: impl Fn(&str) -> bool,
 	cached: &HashMap<Uuid, Arc<str>>,
 	mut fetch: Fetch,
@@ -346,7 +356,10 @@ where
 	Fetch: FnMut(Uuid) -> Fut,
 	Fut: Future<Output = Result<Vec<u8>, Error>>,
 {
-	let mut out = RemoteRules::default();
+	let mut out = RemoteRules {
+		rules: IgnoreRules::new(user),
+		..RemoteRules::default()
+	};
 	if !mode.pulls() {
 		return out;
 	}
@@ -748,6 +761,7 @@ mod tests {
 		let rules = load_remote_rules(
 			mode,
 			view,
+			None,
 			|dir| on_disk.contains(&dir),
 			cached,
 			|uuid| {

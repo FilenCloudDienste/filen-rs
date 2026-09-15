@@ -35,6 +35,9 @@ const SCHEMA_VERSION: i64 = 1;
 /// has failed, what the last failure said, and when it happened (unix millis) — the time is what
 /// lets an exhausted streak expire and be retried. Both cascade with their pair.
 ///
+/// `user_ignore` holds the device-wide user ignore patterns: one row at most, shared by every pair,
+/// so it cascades with nothing.
+///
 /// `sync_pairs.id` is `AUTOINCREMENT` for one reason: a removed pair's id must never come back. A
 /// watch loop finishes the pass it is in when its pair is removed, and that pass goes on writing
 /// baseline and journal rows keyed by the id it started with — which a plain `INTEGER PRIMARY KEY`
@@ -89,6 +92,11 @@ CREATE TABLE IF NOT EXISTS path_failures (
 	last_error TEXT NOT NULL,
 	last_failure_at INTEGER NOT NULL,
 	PRIMARY KEY (pair_id, rel_path)
+);
+
+CREATE TABLE IF NOT EXISTS user_ignore (
+	id INTEGER PRIMARY KEY CHECK (id = 0),
+	patterns TEXT NOT NULL
 );
 ";
 
@@ -501,6 +509,27 @@ impl BaselineStore {
 				guard.ratio()
 			],
 		)
+	}
+
+	/// The stored user ignore patterns, `""` when none were ever set.
+	pub(crate) fn user_ignore(&self) -> rusqlite::Result<String> {
+		Ok(self
+			.conn
+			.query_row("SELECT patterns FROM user_ignore WHERE id = 0", [], |row| {
+				row.get(0)
+			})
+			.optional()?
+			.unwrap_or_default())
+	}
+
+	/// Replace the user ignore patterns. The caller has already validated them.
+	pub(crate) fn set_user_ignore(&self, patterns: &str) -> rusqlite::Result<()> {
+		self.conn.execute(
+			"INSERT INTO user_ignore (id, patterns) VALUES (0, ?1)
+			 ON CONFLICT (id) DO UPDATE SET patterns = excluded.patterns",
+			params![patterns],
+		)?;
+		Ok(())
 	}
 
 	fn row_to_pair(row: &Row<'_>) -> rusqlite::Result<PairRecord> {
@@ -1038,6 +1067,32 @@ mod tests {
 			store.pair(pair).unwrap().unwrap().delete_guard.floor() > u32::MAX as usize,
 			"an unlimited floor must not wrap on the way through the DB"
 		);
+		drop(store);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A fresh DB carries the user ignore table, reads it as empty, and keeps what is set across a
+	/// reopen.
+	#[test]
+	fn user_ignore_patterns_start_empty_and_survive_a_reopen() {
+		let path = temp_db_path("user_ignore");
+		{
+			let store = BaselineStore::open(&path).unwrap();
+			let tables: i64 = store
+				.conn
+				.query_row(
+					"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'user_ignore'",
+					[],
+					|row| row.get(0),
+				)
+				.unwrap();
+			assert_eq!(tables, 1, "a fresh DB has no user_ignore table");
+			assert_eq!(store.user_ignore().unwrap(), "");
+			store.set_user_ignore("*.psd").unwrap();
+			store.set_user_ignore("*.psd\n!keep.psd").unwrap();
+		}
+		let store = BaselineStore::open(&path).unwrap();
+		assert_eq!(store.user_ignore().unwrap(), "*.psd\n!keep.psd");
 		drop(store);
 		std::fs::remove_file(&path).ok();
 	}
