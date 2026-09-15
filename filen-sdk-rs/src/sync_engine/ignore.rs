@@ -94,6 +94,17 @@ impl fmt::Display for Origin<'_> {
 	}
 }
 
+/// The level an ignored path's deciding rule comes from, kept after the pass's rules are gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IgnoreLevel {
+	Default,
+	User,
+	/// The `.filenignore` in this root-relative directory (`""` is the pair root).
+	File {
+		dir: String,
+	},
+}
+
 /// A pattern text that could not be used. `line` is 1-based; `None` means the source as a whole
 /// failed to compile, so none of its rules can be trusted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
