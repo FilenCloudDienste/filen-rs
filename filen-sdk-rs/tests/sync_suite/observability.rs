@@ -19,8 +19,8 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	ConflictResolution, PlannedActionKind, PlannedConflict, PlannedNodeKind, SyncEngine, SyncEvent,
-	SyncMode, SyncReport,
+	ConflictResolution, IgnoreLevel, IgnoredPath, PlannedActionKind, PlannedConflict,
+	PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
 };
 use uuid::Uuid;
 
@@ -1286,6 +1286,70 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 	assert_eq!(applied_total(&report), actions.len(), "{report:?}");
 	assert_eq!(report.uploaded, 2, "{report:?}");
 	assert_eq!(report.remote_dirs_created, 1, "{report:?}");
+
+	sc.cleanup();
+}
+
+/// `plan_pair` and the pass report the same ignored paths: the top of each subtree a `.filenignore`
+/// hides, once, while junk only the built-in defaults hide is left out. A synced directory that
+/// becomes ignored is reported as tracked until a pass has stopped tracking it, and its remote copy
+/// stays; a new ignored directory never reaches the remote.
+#[shared_test_runtime]
+async fn observ_add_plan_and_pass_report_the_same_ignored_paths() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "cache/f.bin", b"synced before the rule");
+	let first = sc.sync().await;
+	assert!(first.errors.is_empty(), "{first:?}");
+	assert!(first.ignored.is_empty(), "{first:?}");
+
+	write_file(&sc.local, ".filenignore", b"build/\ncache/\n");
+	write_file(&sc.local, "build/out.bin", b"never uploaded");
+	write_file(&sc.local, "sub/.DS_Store", b"junk");
+	write_file(&sc.local, "sub/kept.txt", b"synced");
+	let ignored = |rel_path: &str, tracked: bool| IgnoredPath {
+		rel_path: rel_path.to_string(),
+		level: IgnoreLevel::File { dir: String::new() },
+		tracked,
+	};
+
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert_eq!(
+		plan.ignored,
+		vec![ignored("build", false), ignored("cache", true)],
+		"{plan}"
+	);
+	assert!(
+		!plan.actions.iter().any(|a| ["build", "cache"]
+			.iter()
+			.any(|dir| a.rel_path.starts_with(dir))),
+		"nothing is planned under an ignored directory: {plan}"
+	);
+	let untracking = sc.sync().await;
+	assert!(untracking.errors.is_empty(), "{untracking:?}");
+	assert_eq!(untracking.ignored, plan.ignored, "{untracking:?}");
+
+	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
+	assert_eq!(
+		plan.ignored,
+		vec![ignored("build", false), ignored("cache", false)],
+		"the pass stopped tracking cache: {plan}"
+	);
+	let steady = sc.sync().await;
+	assert!(steady.errors.is_empty(), "{steady:?}");
+	assert_eq!(steady.ignored, plan.ignored, "{steady:?}");
+
+	let client = sc.cache.client.clone();
+	let root = client.get_dir(sc.remote).await.unwrap();
+	let (dirs, _) = client
+		.list_dir(
+			&DirType::<Normal>::Dir(Cow::Borrowed(&root)),
+			None::<&fn(u64, Option<u64>)>,
+		)
+		.await
+		.unwrap();
+	let names: BTreeSet<&str> = dirs.iter().filter_map(|d| d.name()).collect();
+	assert_eq!(names, BTreeSet::from(["cache", "sub"]), "{names:?}");
+	assert!(sc.local.join("cache/f.bin").exists());
 
 	sc.cleanup();
 }

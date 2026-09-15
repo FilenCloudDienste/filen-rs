@@ -15,6 +15,7 @@ use std::{collections::HashMap, fmt};
 use super::{
 	baseline::NodeKind,
 	guard::GuardReason,
+	ignore::IgnoredPath,
 	plan::{RemoteNode, SyncAction},
 	scan::LocalNode,
 };
@@ -294,6 +295,8 @@ pub struct PlanOutcome {
 	pub conflicts: Vec<PlannedConflict>,
 	/// Paths the engine will not act on at all, and why.
 	pub unsyncable: Vec<UnsyncablePath>,
+	/// The ignored paths the pass would report, as in [`SyncReport::ignored`](super::SyncReport::ignored).
+	pub ignored: Vec<IgnoredPath>,
 	/// Set when the pass would refuse to run; everything above is then empty.
 	pub refused: Option<RefuseReason>,
 }
@@ -307,6 +310,7 @@ impl fmt::Display for PlanOutcome {
 			&& self.held.is_empty()
 			&& self.conflicts.is_empty()
 			&& self.unsyncable.is_empty()
+			&& self.ignored.is_empty()
 		{
 			return f.write_str("nothing to do");
 		}
@@ -333,6 +337,9 @@ impl fmt::Display for PlanOutcome {
 			line(f, conflict)?;
 		}
 		for path in &self.unsyncable {
+			line(f, path)?;
+		}
+		for path in &self.ignored {
 			line(f, path)?;
 		}
 		Ok(())
