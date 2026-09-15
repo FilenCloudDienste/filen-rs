@@ -341,6 +341,11 @@ pub enum ThumbnailFit {
 /// blowing that back up would only mean a blurrier thumbnail in a BIGGER
 /// payload.
 ///
+/// `lossy_quality` picks the encoding: `None` is lossless WebP, `Some(q)` is
+/// lossy WebP at quality `q` (0–100; anything above counts as 100). Lossy is
+/// honoured even where lossless would come out smaller, as it can on a flat UI
+/// graphic: the caller chose a size/quality trade, not the smallest file.
+///
 /// This is the single decode path in the SDK. It is synchronous by contract:
 /// callers run it off their async runtime's threads and hand it a `source`
 /// that knows how to fetch bytes from wherever it lives.
@@ -348,6 +353,7 @@ pub fn make_thumbnail_from_source<W>(
 	source: Box<dyn ByteSource>,
 	spec: &ThumbSpec,
 	fit: ThumbnailFit,
+	lossy_quality: Option<u8>,
 	out: &mut W,
 ) -> Result<ThumbnailOutcome, Error>
 where
@@ -392,12 +398,71 @@ where
 		ThumbnailFit::Contain => img.resize(width, height, FilterType::CatmullRom),
 		ThumbnailFit::Cover => img.resize_to_fill(width, height, FilterType::CatmullRom),
 	};
-	thumbnail.write_with_encoder(WebPEncoder::new_lossless(out))?;
-	Ok(ThumbnailOutcome::Thumbnail(ThumbnailInfo {
+	let info = ThumbnailInfo {
 		width: thumbnail.width(),
 		height: thumbnail.height(),
 		source: thumb.source,
-	}))
+	};
+	write_webp(thumbnail, lossy_quality, out)?;
+	Ok(ThumbnailOutcome::Thumbnail(info))
+}
+
+/// Largest width or height a lossy (VP8) WebP frame header can carry: each is
+/// stored in 14 bits.
+const WEBP_MAX_LOSSY_DIMENSION: u32 = 16383;
+
+/// Writes the finished thumbnail as WebP: lossless, or lossy at
+/// `lossy_quality` (see [`make_thumbnail_from_source`]).
+fn write_webp<W>(
+	thumbnail: DynamicImage,
+	lossy_quality: Option<u8>,
+	out: &mut W,
+) -> Result<(), Error>
+where
+	W: std::io::Write,
+{
+	let Some(quality) = lossy_quality else {
+		thumbnail.write_with_encoder(WebPEncoder::new_lossless(out))?;
+		return Ok(());
+	};
+	let (width, height) = (thumbnail.width(), thumbnail.height());
+	// Checked here because zenwebp does not: a zero dimension (a `Cover` fit
+	// into a 0-wide box) panics inside the encoder — on wasm that traps the
+	// whole instance — and a 16384 one "encodes" into a header that masks it
+	// to 14 bits, which no decoder will open. Both are refused the way the
+	// lossless encoder refuses a zero dimension, as an image error.
+	if !(1..=WEBP_MAX_LOSSY_DIMENSION).contains(&width)
+		|| !(1..=WEBP_MAX_LOSSY_DIMENSION).contains(&height)
+	{
+		return Err(Error::custom(
+			ErrorKind::ImageError,
+			format!(
+				"a {width}x{height} thumbnail is outside lossy WebP's 1..={WEBP_MAX_LOSSY_DIMENSION} range"
+			),
+		));
+	}
+	let config = zenwebp::LossyConfig::new().with_quality(f32::from(quality.min(100)));
+	let rgba = thumbnail.into_rgba8();
+	// An RGBA request always writes VP8X + ALPH, an alpha plane of ~100 bytes
+	// even when every pixel is opaque, so opaque pixels go in as RGB and come
+	// out as a plain `VP8 ` file. Real transparency keeps its alpha, which
+	// zenwebp encodes losslessly by default.
+	let encoded = if rgba.pixels().all(|pixel| pixel[3] == u8::MAX) {
+		let rgb = DynamicImage::ImageRgba8(rgba).into_rgb8();
+		zenwebp::EncodeRequest::lossy(&config, &rgb, zenwebp::PixelLayout::Rgb8, width, height)
+			.encode()
+	} else {
+		zenwebp::EncodeRequest::lossy(&config, &rgba, zenwebp::PixelLayout::Rgba8, width, height)
+			.encode()
+	};
+	let webp = encoded.map_err(|e| {
+		Error::custom(
+			ErrorKind::ImageError,
+			format!("lossy webp encode failed: {e}"),
+		)
+	})?;
+	out.write_all(&webp)?;
+	Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1351,7 @@ mod remote_chunks {
 		client: Arc<C>,
 		file: F,
 		spec: ThumbSpec,
+		lossy_quality: Option<u8>,
 	) -> Result<(ThumbnailOutcome, Vec<u8>), Error>
 	where
 		C: SharedClient + Send + Sync + 'static,
@@ -1293,8 +1359,13 @@ mod remote_chunks {
 	{
 		over_remote_chunks(client, &file, move |source| {
 			let mut webp = Vec::new();
-			let outcome =
-				make_thumbnail_from_source(source, &spec, ThumbnailFit::Contain, &mut webp)?;
+			let outcome = make_thumbnail_from_source(
+				source,
+				&spec,
+				ThumbnailFit::Contain,
+				lossy_quality,
+				&mut webp,
+			)?;
 			Ok((outcome, webp))
 		})
 		.await
@@ -1420,6 +1491,14 @@ mod js_impls {
 		pub file: AnyFile,
 		pub max_width: u32,
 		pub max_height: u32,
+		/// WebP quality 0–100 for a lossy thumbnail (anything above counts as
+		/// 100); absent for lossless, the default. When set the thumbnail is
+		/// ALWAYS lossy, even where lossless would come out smaller (a flat UI
+		/// graphic can), so every thumbnail a caller asked this of is encoded
+		/// the same way.
+		#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+		#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+		pub lossy_quality: Option<u8>,
 	}
 
 	/// A thumbnail, and what it cost to make.
@@ -1524,7 +1603,8 @@ mod js_impls {
 				params.max_height,
 				file.size(),
 			);
-			let (outcome, webp_data) = thumbnail_remote_file(client, file, spec).await?;
+			let (outcome, webp_data) =
+				thumbnail_remote_file(client, file, spec, params.lossy_quality).await?;
 			Ok(MakeThumbnailInMemoryResult::from_outcome(
 				outcome, webp_data,
 			))
@@ -1807,6 +1887,10 @@ mod js_impls {
 		/// optimisation and an early refusal; the cap is enforced on the bytes
 		/// regardless.
 		pub known_size: Option<u64>,
+		/// See [`MakeThumbnailInMemoryParams::lossy_quality`]: absent for
+		/// lossless, a 0–100 quality for an always-lossy thumbnail.
+		#[serde(default)]
+		pub lossy_quality: Option<u8>,
 		// swap to flatten when https://github.com/madonoharu/tsify/issues/68 is resolved
 		#[serde(default)]
 		pub managed_future: crate::js::ManagedFuture,
@@ -1821,8 +1905,12 @@ mod js_impls {
 		C: SharedClient + Send + Sync + 'static,
 	{
 		let mut chunks = spawn_stream_pump(params.reader)?;
-		let (max_width, max_height, known_size) =
-			(params.max_width, params.max_height, params.known_size);
+		let (max_width, max_height, known_size, lossy_quality) = (
+			params.max_width,
+			params.max_height,
+			params.known_size,
+			params.lossy_quality,
+		);
 
 		params
 			.managed_future
@@ -1847,6 +1935,7 @@ mod js_impls {
 						Box::new(MemSource(buf)),
 						&spec,
 						ThumbnailFit::Contain,
+						lossy_quality,
 						&mut webp,
 					)?;
 					Ok((outcome, webp))
@@ -2115,6 +2204,7 @@ mod js_impls {
 		max_width: u32,
 		max_height: u32,
 		managed_future: crate::js::ManagedFuture,
+		lossy_quality: Option<u8>,
 	) -> Result<MakeThumbnailInMemoryResult, Error>
 	where
 		C: SharedClient + Send + Sync + 'static,
@@ -2139,6 +2229,7 @@ mod js_impls {
 						source,
 						&spec,
 						ThumbnailFit::Contain,
+						lossy_quality,
 						&mut webp,
 					)?;
 					Ok((outcome, webp))
@@ -2275,12 +2366,17 @@ mod js_impls {
 		///
 		/// Decoded under the client's whole memory budget (nothing is streaming
 		/// behind it) and in turn with every other decode, on the same gate.
+		///
+		/// `lossy_quality` is [`MakeThumbnailInMemoryParams::lossy_quality`]:
+		/// absent for lossless, a 0–100 quality for an always-lossy thumbnail.
+		#[uniffi::method(default(lossy_quality = None))]
 		pub async fn make_thumbnail_from_path(
 			&self,
 			file_path: String,
 			max_width: u32,
 			max_height: u32,
 			managed_future: crate::js::ManagedFuture,
+			lossy_quality: Option<u8>,
 		) -> Result<MakeThumbnailInMemoryResult, Error> {
 			make_thumbnail_from_path_generic(
 				self.inner(),
@@ -2288,6 +2384,7 @@ mod js_impls {
 				max_width,
 				max_height,
 				managed_future,
+				lossy_quality,
 			)
 			.await
 		}
@@ -2339,12 +2436,17 @@ mod js_impls {
 		///
 		/// Decoded under the client's whole memory budget (nothing is streaming
 		/// behind it) and in turn with every other decode, on the same gate.
+		///
+		/// `lossy_quality` is [`MakeThumbnailInMemoryParams::lossy_quality`]:
+		/// absent for lossless, a 0–100 quality for an always-lossy thumbnail.
+		#[uniffi::method(default(lossy_quality = None))]
 		pub async fn make_thumbnail_from_path(
 			&self,
 			file_path: String,
 			max_width: u32,
 			max_height: u32,
 			managed_future: crate::js::ManagedFuture,
+			lossy_quality: Option<u8>,
 		) -> Result<MakeThumbnailInMemoryResult, Error> {
 			make_thumbnail_from_path_generic(
 				self.inner(),
@@ -2352,6 +2454,7 @@ mod js_impls {
 				max_width,
 				max_height,
 				managed_future,
+				lossy_quality,
 			)
 			.await
 		}
@@ -2385,9 +2488,13 @@ mod tests {
 
 	use super::{
 		DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES, RemoteChunkSource, ThumbSpec,
-		ThumbnailFit, ThumbnailOutcome, make_thumbnail_from_source,
+		ThumbnailFit, ThumbnailOutcome, WEBP_MAX_LOSSY_DIMENSION, make_thumbnail_from_source,
+		write_webp,
 	};
-	use crate::auth::http::{ClientConfig, SharedClientState};
+	use crate::{
+		Error, ErrorKind,
+		auth::http::{ClientConfig, SharedClientState},
+	};
 
 	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
 		use image::{ImageFormat, RgbImage};
@@ -2401,6 +2508,39 @@ mod tests {
 		bytes
 	}
 
+	/// A PNG of deterministic noise over a gradient — photo-like in the one way
+	/// an encoder cares about, nothing lossless can predict it away — with the
+	/// alpha `alpha(x, y)` gives each pixel.
+	fn noise_png_bytes(width: u32, height: u32, alpha: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+		// A small LCG: the same bytes on every run and every target.
+		let mut state = 0x2545_f491_u32;
+		let image = image::RgbaImage::from_fn(width, height, |x, y| {
+			state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+			let noise = (state >> 26) as u8;
+			image::Rgba([
+				((x % 256) as u8).wrapping_add(noise),
+				((y % 256) as u8).wrapping_add(noise),
+				noise,
+				alpha(x, y),
+			])
+		});
+		let mut bytes = Vec::new();
+		image
+			.write_to(
+				&mut std::io::Cursor::new(&mut bytes),
+				image::ImageFormat::Png,
+			)
+			.unwrap();
+		bytes
+	}
+
+	/// The first chunk's FourCC: `VP8L` lossless, `VP8 ` simple lossy, `VP8X`
+	/// extended (alpha, among others).
+	fn webp_fourcc(webp: &[u8]) -> &[u8] {
+		assert_eq!((&webp[..4], &webp[8..12]), (&b"RIFF"[..], &b"WEBP"[..]));
+		&webp[12..16]
+	}
+
 	/// The shape every caller uses: bytes in, webp out, plus a verdict.
 	fn thumbnail(
 		bytes: Vec<u8>,
@@ -2408,15 +2548,158 @@ mod tests {
 		mem_budget: usize,
 		fit: ThumbnailFit,
 	) -> (ThumbnailOutcome, Vec<u8>) {
+		thumbnail_with(
+			bytes,
+			&ThumbSpec::new(target, target, mem_budget),
+			fit,
+			None,
+		)
+		.unwrap()
+	}
+
+	/// [`thumbnail`] with the spec and the encoding spelled out, and the error
+	/// kept.
+	fn thumbnail_with(
+		bytes: Vec<u8>,
+		spec: &ThumbSpec,
+		fit: ThumbnailFit,
+		lossy_quality: Option<u8>,
+	) -> Result<(ThumbnailOutcome, Vec<u8>), Error> {
 		let mut out = Vec::new();
 		let outcome = make_thumbnail_from_source(
 			Box::new(MemSource(bytes)),
-			&ThumbSpec::new(target, target, mem_budget),
+			spec,
 			fit,
+			lossy_quality,
 			&mut out,
-		)
-		.unwrap();
-		(outcome, out)
+		)?;
+		Ok((outcome, out))
+	}
+
+	#[test]
+	fn lossless_unless_a_lossy_quality_is_asked_for() {
+		let (_, webp) = thumbnail(
+			noise_png_bytes(64, 64, |_, _| u8::MAX),
+			32,
+			DEFAULT_THUMBNAIL_MEM_BUDGET,
+			ThumbnailFit::Cover,
+		);
+		assert_eq!(webp_fourcc(&webp), b"VP8L");
+	}
+
+	#[test]
+	fn a_lossy_opaque_thumbnail_is_simple_lossy_and_smaller() {
+		let spec = ThumbSpec::new(128, 128, DEFAULT_THUMBNAIL_MEM_BUDGET);
+		// Cloned: the pipeline owns its source, and both encodings need one.
+		let source = noise_png_bytes(256, 256, |_, _| u8::MAX);
+		let (_, lossless) =
+			thumbnail_with(source.clone(), &spec, ThumbnailFit::Contain, None).unwrap();
+		let (outcome, lossy) =
+			thumbnail_with(source, &spec, ThumbnailFit::Contain, Some(75)).unwrap();
+		let ThumbnailOutcome::Thumbnail(info) = outcome else {
+			panic!("expected a thumbnail, got {outcome:?}");
+		};
+		// `VP8 `, not `VP8X`: an opaque thumbnail carries no alpha plane.
+		assert_eq!(webp_fourcc(&lossy), b"VP8 ");
+		let decoded = image::load_from_memory(&lossy).unwrap();
+		assert_eq!(
+			(decoded.width(), decoded.height()),
+			(info.width, info.height)
+		);
+		assert!(
+			lossy.len() < lossless.len(),
+			"lossy {} B is not smaller than lossless {} B",
+			lossy.len(),
+			lossless.len()
+		);
+	}
+
+	#[test]
+	fn a_lossy_thumbnail_keeps_real_transparency_exactly() {
+		let spec = ThumbSpec::new(64, 64, DEFAULT_THUMBNAIL_MEM_BUDGET);
+		let source = noise_png_bytes(64, 64, |x, y| ((x * 4 + y) % 256) as u8);
+		let (_, lossless) =
+			thumbnail_with(source.clone(), &spec, ThumbnailFit::Cover, None).unwrap();
+		let (outcome, lossy) =
+			thumbnail_with(source, &spec, ThumbnailFit::Cover, Some(75)).unwrap();
+		assert!(
+			matches!(outcome, ThumbnailOutcome::Thumbnail(_)),
+			"got {outcome:?}"
+		);
+		assert_eq!(webp_fourcc(&lossy), b"VP8X");
+		// The VP8X chunk is 18 bytes after the 12-byte RIFF header, and ALPH
+		// must follow it directly when there is no ICC profile.
+		assert_eq!(&lossy[30..34], b"ALPH");
+		let alpha = |webp: &[u8]| -> Vec<u8> {
+			image::load_from_memory(webp)
+				.unwrap()
+				.to_rgba8()
+				.pixels()
+				.map(|pixel| pixel[3])
+				.collect()
+		};
+		let expected = alpha(&lossless);
+		// Else this would be comparing two opaque images.
+		assert!(expected.iter().any(|&a| a != u8::MAX));
+		assert_eq!(alpha(&lossy), expected);
+	}
+
+	#[test]
+	fn a_zero_sided_cover_box_is_an_error_not_a_panic() {
+		// A `Cover` fit into a box with a 0 side makes a thumbnail with a 0 side.
+		// zenwebp panics on a 0 width and "encodes" a 0 height into a file no
+		// decoder opens. Both encodings must refuse either.
+		for (width, height) in [(0, 32), (32, 0)] {
+			let spec = ThumbSpec::new(width, height, DEFAULT_THUMBNAIL_MEM_BUDGET);
+			for lossy_quality in [None, Some(75)] {
+				let result = thumbnail_with(
+					noise_png_bytes(64, 64, |_, _| u8::MAX),
+					&spec,
+					ThumbnailFit::Cover,
+					lossy_quality,
+				);
+				let Err(e) = result else {
+					panic!("{width}x{height} {lossy_quality:?}: expected an error, got {result:?}");
+				};
+				assert_eq!(
+					e.kind(),
+					ErrorKind::ImageError,
+					"{width}x{height} {lossy_quality:?}: {e}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn a_lossy_thumbnail_past_webps_dimension_limit_is_refused() {
+		// zenwebp "encodes" 16384 into a header no decoder opens.
+		let mut out = Vec::new();
+		let too_wide = image::DynamicImage::new_rgb8(WEBP_MAX_LOSSY_DIMENSION + 1, 1);
+		let e = write_webp(too_wide, Some(75), &mut out).unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::ImageError);
+		assert!(out.is_empty());
+
+		let too_tall = image::DynamicImage::new_rgb8(1, WEBP_MAX_LOSSY_DIMENSION + 1);
+		let e = write_webp(too_tall, Some(75), &mut out).unwrap_err();
+		assert_eq!(e.kind(), ErrorKind::ImageError);
+		assert!(out.is_empty());
+
+		let widest = image::DynamicImage::new_rgb8(WEBP_MAX_LOSSY_DIMENSION, 1);
+		write_webp(widest, Some(75), &mut out).unwrap();
+		let decoded = image::load_from_memory(&out).unwrap();
+		assert_eq!(decoded.width(), WEBP_MAX_LOSSY_DIMENSION);
+	}
+
+	#[test]
+	fn a_lossy_quality_above_100_is_100() {
+		let spec = ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET);
+		let source = noise_png_bytes(64, 64, |_, _| u8::MAX);
+		let encode = |quality| {
+			thumbnail_with(source.clone(), &spec, ThumbnailFit::Cover, Some(quality))
+				.unwrap()
+				.1
+		};
+		assert_eq!(encode(250), encode(100));
 	}
 
 	#[test]
@@ -2546,6 +2829,7 @@ mod tests {
 			Box::new(source),
 			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
 			ThumbnailFit::Cover,
+			None,
 			&mut out,
 		)
 		.unwrap();
@@ -2573,6 +2857,7 @@ mod tests {
 			Box::new(source),
 			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
 			ThumbnailFit::Cover,
+			None,
 			&mut out,
 		);
 		assert!(result.is_err(), "expected a hard error, got {result:?}");
@@ -2626,6 +2911,7 @@ mod tests {
 			}),
 			&ThumbSpec::new(32, 32, DEFAULT_THUMBNAIL_MEM_BUDGET),
 			ThumbnailFit::Cover,
+			None,
 			&mut out,
 		);
 		assert!(result.is_err(), "expected a hard error, got {result:?}");
@@ -2691,6 +2977,7 @@ mod tests {
 				Box::new(MemSource(bytes.clone())),
 				&state.thumbnails().spec_local(32, 32),
 				ThumbnailFit::Cover,
+				None,
 				&mut out,
 			)
 			.unwrap();

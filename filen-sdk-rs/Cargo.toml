@@ -85,6 +85,8 @@ image = { version = "0.25.6", default-features = false, features = [
 	"webp",
 	"qoi",
 ] }
+# Lossy WebP thumbnails (`image`'s WebP encoder is lossless-only). Pinned exactly: 0.4.5 is yanked.
+zenwebp = { version = "=0.4.4", default-features = false, features = ["std"] }
 tokio = { version = "1.47.1", default-features = false, features = [
 	"sync",
 	"macros",

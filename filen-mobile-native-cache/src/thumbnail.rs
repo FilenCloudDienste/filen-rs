@@ -229,6 +229,8 @@ impl AuthCacheState {
 					// Files.app draws a fixed-size grid tile, so crop to the
 					// requested box rather than letter-boxing into it.
 					ThumbnailFit::Cover,
+					// Lossless, as every cached thumbnail has always been.
+					None,
 					&mut tmp_file,
 				)
 			},

@@ -198,7 +198,7 @@ function getDirMeta(meta: DirMeta): DecryptedDirMeta | null {
 
 /// Draws a `width`x`height` gradient on an OffscreenCanvas and encodes it, so
 /// the large fixtures below cost no bytes in the repo.
-async function generateImage(width: number, height: number, type: string): Promise<Uint8Array> {
+async function generateImage(width: number, height: number, type: string): Promise<Uint8Array<ArrayBuffer>> {
 	const canvas = new OffscreenCanvas(width, height)
 	const ctx = canvas.getContext("2d")
 	if (!ctx) {
@@ -868,6 +868,41 @@ test("large webp thumbnail", async () => {
 	// A generated WebP carries no embedded preview, so this can only have been
 	// a real (streamed, bounded) decode.
 	expect(thumb.fromEmbeddedPreview).toBe(false)
+	bitmap.close()
+})
+
+/// The first chunk's FourCC of a WebP: `VP8L` lossless, `VP8 ` simple lossy, `VP8X` extended.
+function webpFourcc(webp: Uint8Array): string {
+	return new TextDecoder().decode(webp.subarray(12, 16))
+}
+
+test("lossy webp thumbnails", async () => {
+	// Opaque and photographic, so the lossy encoding is a plain `VP8 ` frame and
+	// has real detail to trade away.
+	const bytes = await generateImage(1200, 800, "image/jpeg")
+	const file = await state.uploadFile(bytes, { parent: testDir, name: "lossy.jpg" })
+	expect(file.canMakeThumbnail).toBe(true)
+
+	const lossless = expectThumbnail(await state.makeThumbnailInMemory({ file, maxWidth: 256, maxHeight: 256 }))
+	expect(webpFourcc(lossless.webpData)).toBe("VP8L")
+
+	const lossy = expectThumbnail(await state.makeThumbnailInMemory({ file, maxWidth: 256, maxHeight: 256, lossyQuality: 75 }))
+	expect(webpFourcc(lossy.webpData)).toBe("VP8 ")
+	expect(lossy.webpData.length).toBeLessThanOrEqual(lossless.webpData.length)
+	expect([lossy.width, lossy.height]).toEqual([lossless.width, lossless.height])
+
+	const fromStream = expectThumbnail(
+		await state.makeThumbnailFromStream({
+			reader: new Blob([bytes]).stream(),
+			knownSize: bytes.length,
+			maxWidth: 256,
+			maxHeight: 256,
+			lossyQuality: 75
+		})
+	)
+	expect(webpFourcc(fromStream.webpData)).toBe("VP8 ")
+	const bitmap = await createImageBitmap(new Blob([fromStream.webpData], { type: "image/webp" }))
+	expect([bitmap.width, bitmap.height]).toEqual([fromStream.width, fromStream.height])
 	bitmap.close()
 })
 
