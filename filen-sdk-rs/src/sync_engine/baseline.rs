@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS user_ignore (
 	id INTEGER PRIMARY KEY CHECK (id = 0),
 	patterns TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ignored_roots (
+	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	rel_path TEXT NOT NULL,
+	PRIMARY KEY (pair_id, rel_path)
+);
 ";
 
 /// `pending_writes.kind` discriminants — what the write did.
@@ -530,6 +536,36 @@ impl BaselineStore {
 			params![patterns],
 		)?;
 		Ok(())
+	}
+
+	/// The ignored roots `pair`'s last pass recorded.
+	pub(crate) fn ignored_roots(&self, pair: PairId) -> rusqlite::Result<BTreeSet<String>> {
+		self.conn
+			.prepare("SELECT rel_path FROM ignored_roots WHERE pair_id = ?1")?
+			.query_map(params![pair], |row| row.get(0))?
+			.collect()
+	}
+
+	/// Replace `pair`'s recorded ignored roots, in ONE transaction.
+	pub(crate) fn set_ignored_roots(
+		&self,
+		pair: PairId,
+		roots: &BTreeSet<String>,
+	) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		self.conn.execute(
+			"DELETE FROM ignored_roots WHERE pair_id = ?1",
+			params![pair],
+		)?;
+		{
+			let mut insert = self
+				.conn
+				.prepare("INSERT INTO ignored_roots (pair_id, rel_path) VALUES (?1, ?2)")?;
+			for root in roots {
+				insert.execute(params![pair, root])?;
+			}
+		}
+		tx.commit()
 	}
 
 	fn row_to_pair(row: &Row<'_>) -> rusqlite::Result<PairRecord> {
@@ -1095,6 +1131,33 @@ mod tests {
 		assert_eq!(store.user_ignore().unwrap(), "*.psd\n!keep.psd");
 		drop(store);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pair's recorded ignored roots are replaced whole, kept apart from another pair's, and go
+	/// with the pair.
+	#[test]
+	fn ignored_roots_are_replaced_per_pair_and_go_with_it() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/a", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/b", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		assert!(store.ignored_roots(pair).unwrap().is_empty());
+		let roots = |list: &[&str]| -> BTreeSet<String> {
+			list.iter().map(|root| (*root).to_string()).collect()
+		};
+		store
+			.set_ignored_roots(pair, &roots(&["build", "ä/.DS_Store"]))
+			.unwrap();
+		store.set_ignored_roots(other, &roots(&["cache"])).unwrap();
+		store.set_ignored_roots(pair, &roots(&["build"])).unwrap();
+		assert_eq!(store.ignored_roots(pair).unwrap(), roots(&["build"]));
+		assert_eq!(store.ignored_roots(other).unwrap(), roots(&["cache"]));
+		store.delete_pair(pair).unwrap();
+		assert!(store.ignored_roots(pair).unwrap().is_empty());
+		assert_eq!(store.ignored_roots(other).unwrap(), roots(&["cache"]));
 	}
 
 	#[test]
