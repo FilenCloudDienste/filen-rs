@@ -24,7 +24,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	ffi::OsStr,
 	fmt,
-	io::ErrorKind,
+	io::{ErrorKind, Read},
 	path::{Component, Path},
 };
 
@@ -33,7 +33,10 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{
 	baseline::{BaselineEntry, NodeKind},
-	ignore::{FILENIGNORE, IgnoreLevel, IgnoreParseError, IgnoreRules, IgnoreSource, Origin},
+	ignore::{
+		FILENIGNORE, IgnoreLevel, IgnoreParseError, IgnoreRules, IgnoreSource, MAX_RULE_FILE_BYTES,
+		Origin, rule_file_text,
+	},
 };
 use crate::{
 	fs::name::ValidatedName,
@@ -280,9 +283,31 @@ pub(crate) enum RuleFiles {
 	Skip,
 }
 
-/// Loads the `.filenignore` of the root-relative directory `dir` at `dir_path` into `rules`. A missing
-/// file is no rules. A file that cannot be read, or does not compile at all, blocks `dir`: guessing
-/// could push what the user meant to hide. A bad line is only reported.
+/// The metadata of the `.filenignore` in `dir_path`, if a FILE by exactly that name is there.
+///
+/// A directory by that name is an ordinary item (reading one on Windows fails as access denied, not
+/// as a directory). So is another spelling that a case-insensitive volume opens under the rule
+/// file's name: the remote and a case-sensitive device read `.FilenIgnore` as an ordinary file, and
+/// every device has to agree on which file holds rules.
+pub(crate) fn rule_file_metadata(dir_path: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
+	let metadata = match std::fs::metadata(dir_path.join(FILENIGNORE)) {
+		Ok(metadata) if metadata.is_file() => metadata,
+		Ok(_) => return Ok(None),
+		Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(e) => return Err(e),
+	};
+	for entry in std::fs::read_dir(dir_path)? {
+		if entry?.file_name() == OsStr::new(FILENIGNORE) {
+			return Ok(Some(metadata));
+		}
+	}
+	Ok(None)
+}
+
+/// Loads the `.filenignore` of the root-relative directory `dir` at `dir_path` into `rules`. No such
+/// file is no rules. A file that cannot be read, that the remote side would refuse (see
+/// [`rule_file_text`]) or that does not compile at all blocks `dir`: guessing could push what the
+/// user meant to hide. A bad line is only reported.
 fn load_rule_file(
 	root: &Path,
 	dir: &str,
@@ -295,10 +320,21 @@ fn load_rule_file(
 		"" => FILENIGNORE.to_owned(),
 		dir => format!("{dir}/{FILENIGNORE}"),
 	};
-	let bytes = match std::fs::read(dir_path.join(FILENIGNORE)) {
-		Ok(bytes) => bytes,
-		// A directory by that name is an ordinary item, not a rule file.
-		Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::IsADirectory) => return,
+	let read = rule_file_metadata(dir_path).and_then(|found| {
+		found
+			.map(|_| {
+				// One byte past the cap is enough to refuse the file without reading all of it.
+				let mut bytes = Vec::new();
+				std::fs::File::open(dir_path.join(FILENIGNORE))?
+					.take(MAX_RULE_FILE_BYTES + 1)
+					.read_to_end(&mut bytes)?;
+				Ok(bytes)
+			})
+			.transpose()
+	});
+	let bytes = match read {
+		Ok(Some(bytes)) => bytes,
+		Ok(None) => return,
 		// A directory that cannot be listed is the walk's error to report, and it leaves the scan
 		// incomplete on its own.
 		Err(_) if std::fs::read_dir(dir_path).is_err() => return,
@@ -308,7 +344,20 @@ fn load_rule_file(
 			return;
 		}
 	};
-	match IgnoreSource::parse(&String::from_utf8_lossy(&bytes), Origin::File { dir }) {
+	let text = match rule_file_text(bytes) {
+		Ok(text) => text,
+		Err(reason) => {
+			blocked.insert(dir.to_owned());
+			let error = IgnoreParseError {
+				origin: Origin::File { dir }.to_string(),
+				line: None,
+				reason,
+			};
+			record(errors, root, ScanError::IgnoreRules(error));
+			return;
+		}
+	};
+	match IgnoreSource::parse(&text, Origin::File { dir }) {
 		Ok((source, line_errors)) => {
 			rules.insert_file(dir.to_owned(), source);
 			for error in line_errors {
@@ -1223,6 +1272,70 @@ mod tests {
 				.iter()
 				.any(|line| line.starts_with("local scan: bad/.filenignore:1: ")),
 			"{reported:?}"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A body the remote side would refuse (over the size cap, or not UTF-8) blocks its directory on
+	/// disk too, so the device that wrote it sees the same error every other device does.
+	#[test]
+	fn a_rule_file_the_remote_would_refuse_blocks_its_directory_on_disk_too() {
+		let root = temp_root();
+		fs::create_dir(root.join("latin")).unwrap();
+		fs::write(root.join("latin").join(FILENIGNORE), b"caf\xe9/\n").unwrap();
+		fs::write(root.join("latin").join("a.txt"), b"a").unwrap();
+		fs::create_dir(root.join("huge")).unwrap();
+		let too_large = usize::try_from(MAX_RULE_FILE_BYTES).unwrap() + 1;
+		fs::write(root.join("huge").join(FILENIGNORE), vec![b'#'; too_large]).unwrap();
+
+		let scan = scan_plain(&root, &HashMap::new(), ScanDepth::Fast);
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert_eq!(
+			scan.ignore_blocked,
+			BTreeSet::from(["huge".to_string(), "latin".to_string()])
+		);
+		let reported: Vec<String> = scan.reported_errors().collect();
+		assert_eq!(reported.len(), 2, "{reported:?}");
+		for dir in ["huge", "latin"] {
+			let prefix = format!("local scan: {dir}/.filenignore: ");
+			assert!(
+				reported.iter().any(|line| line.starts_with(&prefix)),
+				"{prefix}: {reported:?}"
+			);
+		}
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// Only a FILE named exactly `.filenignore` holds rules. A directory of that name is an ordinary
+	/// item (Windows reports reading one as access denied, not as a directory), and another spelling is
+	/// an ordinary file even where the volume opens it under the rule file's name, as the remote and a
+	/// case-sensitive device read it.
+	#[test]
+	fn only_a_file_named_exactly_filenignore_holds_rules() {
+		let root = temp_root();
+		fs::create_dir_all(root.join("docs").join(FILENIGNORE)).unwrap();
+		fs::write(root.join("docs").join(FILENIGNORE).join("x.txt"), b"x").unwrap();
+		fs::create_dir(root.join("proj")).unwrap();
+		fs::write(root.join("proj").join(".FilenIgnore"), b"secret\n").unwrap();
+		fs::write(root.join("proj").join("secret"), b"s").unwrap();
+
+		let scan = scan_plain(&root, &HashMap::new(), ScanDepth::Fast);
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		assert!(scan.ignore_blocked.is_empty(), "{:?}", scan.ignore_blocked);
+		assert!(scan.ignored.is_empty(), "{:?}", scan.ignored);
+		assert_eq!(
+			sorted_paths(&scan),
+			vec![
+				"docs",
+				"docs/.filenignore",
+				"docs/.filenignore/x.txt",
+				"proj",
+				"proj/.FilenIgnore",
+				"proj/secret"
+			]
 		);
 
 		fs::remove_dir_all(&root).ok();
