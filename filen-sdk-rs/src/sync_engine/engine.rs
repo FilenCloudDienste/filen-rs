@@ -25,7 +25,7 @@ use super::{
 		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
-	ignore::{FILENIGNORE, IgnoreLevel, RemoteRules, load_remote_rules},
+	ignore::{FILENIGNORE, IgnoreLevel, IgnoredPath, RemoteRules, load_remote_rules},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
@@ -1326,6 +1326,49 @@ impl Prepared {
 			.cloned()
 			.collect()
 	}
+
+	/// The ignored paths to report, shared by the dry run and the pass: the top of each ignored
+	/// subtree on either side, once, in path order. A path both sides hide carries the local scan's
+	/// level. One only the defaults hide is noise (a `.DS_Store` in every folder) and is left out,
+	/// unless a baseline row sits at or under it, which this pass drops.
+	fn ignored(&self) -> Vec<IgnoredPath> {
+		fn parents(path: &str) -> impl Iterator<Item = &str> {
+			path.match_indices('/').map(|(i, _)| &path[..i])
+		}
+		let mut roots: BTreeMap<&str, (&IgnoreLevel, bool)> = BTreeMap::new();
+		for (path, level) in self.ignored_local.iter().chain(&self.ignored_remote) {
+			roots.entry(path).or_insert((level, false));
+		}
+		if roots.is_empty() {
+			return Vec::new();
+		}
+		// Each side records only its own top-most paths; one side's can still sit under the other's.
+		let nested: Vec<&str> = roots
+			.keys()
+			.filter(|path| parents(path).any(|parent| roots.contains_key(parent)))
+			.copied()
+			.collect();
+		for path in nested {
+			roots.remove(path);
+		}
+		// One lookup per row and ancestor, rather than a scan of the baseline per ignored path.
+		for row in self.baseline.keys() {
+			for path in parents(row).chain([row.as_str()]) {
+				if let Some((_, tracked)) = roots.get_mut(path) {
+					*tracked = true;
+				}
+			}
+		}
+		roots
+			.into_iter()
+			.filter(|(_, (level, tracked))| *tracked || **level != IgnoreLevel::Default)
+			.map(|(path, (level, tracked))| IgnoredPath {
+				rel_path: path.to_owned(),
+				level: level.clone(),
+				tracked,
+			})
+			.collect()
+	}
 }
 
 /// [`rekey_paths`] for ignored roots, carrying the directory of a `.filenignore` that decided one
@@ -2445,6 +2488,7 @@ impl SyncEngine {
 			pass_token: screened.pass_token,
 			conflicts: screened.conflicts,
 			unsyncable: prep.unsyncable(),
+			ignored: prep.ignored(),
 			refused: None,
 		})
 	}
@@ -3090,6 +3134,7 @@ impl SyncEngine {
 		});
 
 		report.unsyncable = prep.unsyncable();
+		report.ignored = prep.ignored();
 		// Before the refusal check, so a refused pass still says what the scan could not read.
 		report.errors.extend(prep.local_scan.reported_errors());
 		report.errors.append(&mut prep.remote_rule_errors);
@@ -4713,6 +4758,55 @@ mod tests {
 				.map(|conflict| conflict.rel_path.as_str())
 				.collect::<Vec<_>>(),
 			vec!["docs/x.bin"]
+		);
+	}
+
+	/// The report names the top of each ignored subtree once across both sides, says whether a
+	/// baseline row sat at or under it, and leaves out what only the defaults hide unless it was
+	/// tracked. A sibling that sorts between a directory and its children is still reported.
+	#[test]
+	fn the_report_lists_each_ignored_top_once_and_skips_untracked_defaults() {
+		let docs = Docs::new();
+		let mut baseline = docs.baseline();
+		baseline.insert(
+			"old.swp".to_string(),
+			file_row("old.swp", Uuid::new_v4(), Blake3Hash::from([3; 32])),
+		);
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			baseline,
+			Vec::new(),
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		let root = || IgnoreLevel::File { dir: String::new() };
+		prep.ignored_local.extend([
+			("docs".to_string(), root()),
+			("docs b".to_string(), IgnoreLevel::User),
+			("sub/.DS_Store".to_string(), IgnoreLevel::Default),
+		]);
+		prep.ignored_remote.extend([
+			("docs".to_string(), IgnoreLevel::User),
+			("docs/x.bin".to_string(), IgnoreLevel::User),
+			("docs b/c".to_string(), IgnoreLevel::User),
+			("old.swp".to_string(), IgnoreLevel::Default),
+		]);
+		let ignored = |rel_path: &str, level: IgnoreLevel, tracked: bool| IgnoredPath {
+			rel_path: rel_path.to_string(),
+			level,
+			tracked,
+		};
+		assert_eq!(
+			prep.ignored(),
+			vec![
+				ignored("docs", root(), true),
+				ignored("docs b", IgnoreLevel::User, false),
+				ignored("old.swp", IgnoreLevel::Default, true),
+			]
+		);
+		assert_eq!(
+			ignored("docs", root(), true).to_string(),
+			r#"ignored "docs" (by .filenignore), no longer synced"#
 		);
 	}
 
