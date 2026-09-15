@@ -29,6 +29,7 @@ use super::{
 	engine::{LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites},
 	events::SyncEvent,
 	guard::GuardReason,
+	ignore::IgnoredPath,
 	outcome::{
 		HaltReason, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
 		RefuseReason, UnsyncablePath,
@@ -78,6 +79,9 @@ pub struct SyncReport {
 	/// Paths the engine will not act on at all, and why. Reported on every pass the condition
 	/// holds, so a caller always sees the current set rather than having to remember past ones.
 	pub unsyncable: Vec<UnsyncablePath>,
+	/// The top of each subtree the ignore rules hide, on either side, reported on every pass the rule
+	/// stands. One only the built-in defaults hide is left out unless this pass stopped tracking it.
+	pub ignored: Vec<IgnoredPath>,
 	/// Set when the pass refused to run: nothing was applied.
 	pub refused: Option<RefuseReason>,
 	/// How many paths the pass deliberately left alone rather than acting on: a name the cache is
