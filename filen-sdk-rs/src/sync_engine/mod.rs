@@ -22,6 +22,9 @@ mod baseline;
 mod engine;
 mod events;
 mod guard;
+// Not wired into the pass yet; the expectation turns into a warning once it is, so it goes then.
+#[cfg_attr(not(test), expect(dead_code))]
+mod ignore;
 mod mode;
 mod outcome;
 mod pause;
@@ -29,6 +32,7 @@ mod plan;
 mod scan;
 mod watch;
 
+pub use self::ignore::DEFAULT_IGNORE_PATTERNS;
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
 pub use engine::{

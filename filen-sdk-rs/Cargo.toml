@@ -21,8 +21,9 @@ http-provider = ["dep:axum", "dep:axum-extra"]
 cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 # The folder<->folder sync engine (local <-> remote). Native-only (the module is cfg'd off on
 # wasm); builds on the cache's remote mirror plus the io/ transfer + fs-tree primitives, and the
-# `notify` FS watcher for the continuous engine.
-sync-engine = ["cache", "dep:notify"]
+# `notify` FS watcher for the continuous engine, and `ignore` for gitignore-syntax `.filenignore`
+# matching.
+sync-engine = ["cache", "dep:notify", "dep:ignore"]
 # Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
 # insertion benchmark only. Never enable in production builds.
 bench-internals = ["cache"]
@@ -220,6 +221,8 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
 uniffi = { version = "0.29.4", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
+# gitignore(5) pattern matching for the sync engine's `.filenignore` rules (pure Rust).
+ignore = { version = "0.4.25", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
