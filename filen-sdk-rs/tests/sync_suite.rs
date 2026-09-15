@@ -20,6 +20,8 @@ mod control;
 mod convergence;
 #[path = "sync_suite/deletions.rs"]
 mod deletions;
+#[path = "sync_suite/filters.rs"]
+mod filters;
 #[path = "sync_suite/matrix.rs"]
 mod matrix;
 #[path = "sync_suite/migration.rs"]
