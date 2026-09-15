@@ -105,6 +105,18 @@ pub(crate) enum IgnoreLevel {
 	},
 }
 
+impl From<Origin<'_>> for IgnoreLevel {
+	fn from(origin: Origin<'_>) -> Self {
+		match origin {
+			Origin::Default => Self::Default,
+			Origin::User => Self::User,
+			Origin::File { dir } => Self::File {
+				dir: dir.to_owned(),
+			},
+		}
+	}
+}
+
 /// A pattern text that could not be used. `line` is 1-based; `None` means the source as a whole
 /// failed to compile, so none of its rules can be trusted.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -177,6 +189,8 @@ pub(crate) struct IgnoreRules {
 }
 
 impl IgnoreRules {
+	// The pass loads no user level yet; the expectation fails the build once it does.
+	#[cfg_attr(not(test), expect(dead_code))]
 	pub(crate) fn new(user: Option<IgnoreSource>) -> Self {
 		Self {
 			user,
@@ -228,6 +242,9 @@ impl IgnoreRules {
 	/// Whether `rel_path` or any directory above it is ignored (git's rule: nothing under an
 	/// ignored directory can be re-included). `memo` caches per-directory answers across calls on
 	/// the same rules.
+	// Only the remote view sees paths out of tree order, and it is not filtered yet; the expectation
+	// fails the build once it is.
+	#[cfg_attr(not(test), expect(dead_code))]
 	pub(crate) fn is_ignored_with_ancestors(
 		&self,
 		rel_path: &str,

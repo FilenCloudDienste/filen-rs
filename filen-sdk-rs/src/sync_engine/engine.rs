@@ -25,14 +25,14 @@ use super::{
 		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
-	ignore::IgnoreLevel,
+	ignore::{IgnoreLevel, IgnoreRules},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
-	scan::{self, LocalScan, ScanDepth, ScanError},
+	scan::{self, LocalScan, RuleFiles, ScanDepth, ScanError},
 };
 use crate::{
 	Error, ErrorKind,
@@ -2279,11 +2279,27 @@ impl SyncEngine {
 
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
-		let local_scan = tokio::task::spawn_blocking(move || {
-			scan::scan_local(&local_root, &scan_baseline, depth)
+		// Rules come from the side that is the source of truth: a mode that pushes reads the
+		// `.filenignore` files on disk.
+		let rule_files = if record.mode.pushes() {
+			RuleFiles::Read
+		} else {
+			RuleFiles::Skip
+		};
+		let (mut local_scan, _rules) = tokio::task::spawn_blocking(move || {
+			scan::scan_local(
+				&local_root,
+				&scan_baseline,
+				depth,
+				IgnoreRules::default(),
+				rule_files,
+			)
 		})
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
+		// Kept on the pass, where directory moves re-key them along with everything else it blocks.
+		let ignored_local = mem::take(&mut local_scan.ignored);
+		let ignore_blocked = mem::take(&mut local_scan.ignore_blocked);
 
 		let remote_emptied = remote_emptied(&remote_view.nodes, &baseline);
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
@@ -2332,9 +2348,9 @@ impl SyncEngine {
 			failures,
 			unknown_remote,
 			never_synced_remote,
-			ignored_local: BTreeMap::new(),
+			ignored_local,
 			ignored_remote: BTreeMap::new(),
-			ignore_blocked: BTreeSet::new(),
+			ignore_blocked,
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -3317,8 +3333,12 @@ fn drop_blocked(
 	if blocked.is_empty() && ignored.is_empty() {
 		return actions;
 	}
+	// `""` is the pair root, whose rules can be unreadable too: everything is under it.
 	let at_or_under = |roots: &BTreeSet<String>, path: &str| {
-		roots.contains(path) || roots.iter().any(|root| plan::is_under(path, root))
+		roots.contains(path)
+			|| roots
+				.iter()
+				.any(|root| root.is_empty() || plan::is_under(path, root))
 	};
 	// The sources of the moves this dropped: their content is staying exactly where it is.
 	let mut stranded: Vec<String> = Vec::new();
@@ -3729,6 +3749,8 @@ mod tests {
 				errors: Vec::new(),
 				invalid_names: BTreeMap::new(),
 				aliased_dirs: BTreeMap::new(),
+				ignored: BTreeMap::new(),
+				ignore_blocked: BTreeSet::new(),
 			},
 			holds: plan::PassHolds {
 				trashed: HashSet::new(),
@@ -5009,7 +5031,13 @@ mod tests {
 		baseline: &HashMap<String, BaselineEntry>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		let scan = scan::scan_local(root, &HashMap::new(), ScanDepth::Fast);
+		let (scan, _) = scan::scan_local(
+			root,
+			&HashMap::new(),
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+		);
 		let plan = plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
@@ -5017,11 +5045,44 @@ mod tests {
 			remote,
 			&plan::PassHolds::default(),
 		);
-		drop_blocked(
-			plan.actions,
-			&scan.blocked_paths().cloned().collect(),
-			&BTreeSet::new(),
-		)
+		let ignored: BTreeSet<String> = scan.ignored.keys().cloned().collect();
+		let blocked = scan
+			.blocked_paths()
+			.chain(&ignored)
+			.chain(&scan.ignore_blocked)
+			.cloned()
+			.collect();
+		drop_blocked(plan.actions, &blocked, &ignored)
+	}
+
+	/// A root `.filenignore` that cannot be read blocks the whole tree, not only the items under
+	/// some directory.
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_root_filenignore_blocks_every_action() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = scan_root("unreadable_rules");
+		std::fs::write(root.join("a.txt"), b"a").unwrap();
+		std::fs::create_dir(root.join("dir")).unwrap();
+		std::fs::write(root.join("dir").join("b.txt"), b"b").unwrap();
+		std::fs::write(root.join(".filenignore"), "*.tmp\n").unwrap();
+		let readable = planned_over_scan(&root, &HashMap::new(), &HashMap::new());
+		assert!(
+			!readable.is_empty(),
+			"the tree uploads while its rules read"
+		);
+
+		let rules = root.join(".filenignore");
+		std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o000)).unwrap();
+		let unreadable = planned_over_scan(&root, &HashMap::new(), &HashMap::new());
+		std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o644)).unwrap();
+		assert!(
+			unreadable.is_empty(),
+			"nothing may upload past rules that could not be read: {unreadable:?}"
+		);
+
+		std::fs::remove_dir_all(&root).ok();
 	}
 
 	fn synced_file(rel: &str, uuid: Uuid, hash: Blake3Hash, size: u64) -> BaselineEntry {
