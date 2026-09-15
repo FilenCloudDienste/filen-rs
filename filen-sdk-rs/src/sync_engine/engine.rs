@@ -26,8 +26,7 @@ use super::{
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
-		FILENIGNORE, IgnoreLevel, IgnoreSource, IgnoredPath, RemoteRules, load_remote_rules,
-		parse_user_ignore,
+		IgnoreLevel, IgnoreSource, IgnoredPath, RemoteRules, load_remote_rules, parse_user_ignore,
 	},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
@@ -2300,8 +2299,13 @@ impl SyncEngine {
 			record.mode,
 			view,
 			user,
-			// One stat per remote rule file, and only on a two-way pair.
-			|dir| local_root.join(dir).join(FILENIGNORE).is_file(),
+			// Only on a two-way pair: a stat per remote rule file, and a listing where one is found. A
+			// file on disk the scan cannot read is still the scan's to block, so the remote copy is not
+			// read over it.
+			|dir| {
+				scan::rule_file_metadata(&local_root.join(dir))
+					.map_or(true, |found| found.is_some())
+			},
 			&cached,
 			|uuid| async move {
 				let file = client.get_file(uuid).await?;

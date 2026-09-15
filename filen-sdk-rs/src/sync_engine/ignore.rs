@@ -41,8 +41,9 @@ use crate::Error;
 /// The name of a per-directory rule file.
 pub(crate) const FILENIGNORE: &str = ".filenignore";
 
-/// The largest remote `.filenignore` a pass reads. A bigger one blocks its directory.
-pub(crate) const MAX_REMOTE_RULE_FILE_BYTES: u64 = 1024 * 1024;
+/// The largest `.filenignore` a pass reads, on disk or on the remote. A bigger one blocks its
+/// directory.
+pub(crate) const MAX_RULE_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The built-in patterns, applied below every other level: a user-level or `.filenignore` line
 /// can re-include an entry with `!`.
@@ -433,19 +434,26 @@ where
 	Fetch: FnMut(Uuid) -> Fut,
 	Fut: Future<Output = Result<Vec<u8>, Error>>,
 {
-	let too_large = || format!("larger than {MAX_REMOTE_RULE_FILE_BYTES} bytes, not read");
-	if node.size > MAX_REMOTE_RULE_FILE_BYTES {
+	if node.size > MAX_RULE_FILE_BYTES {
 		return Err(too_large());
 	}
 	let bytes = fetch(node.remote_uuid)
 		.await
 		.map_err(|e| format!("could not be downloaded: {e}"))?;
-	if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_REMOTE_RULE_FILE_BYTES) {
+	rule_file_text(bytes).map(Arc::from)
+}
+
+/// The text of a `.filenignore` body, or why it cannot be used. The copy on disk and the remote copy
+/// are read by this one rule, so no device applies a file another device refuses.
+pub(crate) fn rule_file_text(bytes: Vec<u8>) -> Result<String, String> {
+	if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_RULE_FILE_BYTES) {
 		return Err(too_large());
 	}
-	String::from_utf8(bytes)
-		.map(Arc::from)
-		.map_err(|_| "not valid UTF-8, not read".to_owned())
+	String::from_utf8(bytes).map_err(|_| "not valid UTF-8, not read".to_owned())
+}
+
+fn too_large() -> String {
+	format!("larger than {MAX_RULE_FILE_BYTES} bytes, not read")
 }
 
 /// The root-relative directory a `.filenignore` at `rel_path` belongs to, or `None` for any other
@@ -871,11 +879,11 @@ mod tests {
 	/// A bad line only reports, and the rest of that file applies.
 	#[tokio::test]
 	async fn an_unusable_remote_rule_file_blocks_its_directory() {
-		let too_large = usize::try_from(MAX_REMOTE_RULE_FILE_BYTES).unwrap() + 1;
+		let too_large = usize::try_from(MAX_RULE_FILE_BYTES).unwrap() + 1;
 		let view = rule_view(
 			vec![
 				rule_node("offline/.filenignore", 4),
-				rule_node("huge/.filenignore", MAX_REMOTE_RULE_FILE_BYTES + 1),
+				rule_node("huge/.filenignore", MAX_RULE_FILE_BYTES + 1),
 				rule_node("binary/.filenignore", 1),
 				rule_node("understated/.filenignore", 4),
 				rule_node("fine/.filenignore", 6),
