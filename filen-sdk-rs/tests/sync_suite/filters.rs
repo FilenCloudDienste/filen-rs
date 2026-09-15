@@ -21,7 +21,8 @@ use filen_sdk_rs::{
 	},
 	io::client_impl::IoSharedClientExt,
 	sync_engine::{
-		IgnoreLevel, IgnoredPath, SyncEngine, SyncEvent, SyncMode, SyncReport, WatchConfig,
+		GuardReason, IgnoreLevel, IgnoredPath, SyncEngine, SyncEvent, SyncMode, SyncReport,
+		WatchConfig,
 	},
 };
 
@@ -430,6 +431,69 @@ async fn filter_unignore_syncs_like_a_first_sync() {
 	assert_eq!(
 		remote_bytes(&sc, "cache/edit.bin").await,
 		b"v2 from the remote"
+	);
+
+	sc.cleanup();
+}
+
+/// In a one-way mirror, removing a rule holds the deletion of what only the destination holds under
+/// it, as a first sync holds one, until the deletion is approved: another client's upload the rule
+/// hid is not trashed the moment the rule goes.
+#[shared_test_runtime]
+async fn filter_unignore_holds_a_mirror_deletion_like_a_first_sync() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "keep.txt", b"tracked");
+	clean(&sc.sync().await);
+	sc.engine.set_user_ignore("*.psd").await.unwrap();
+	upload_remote(
+		&sc.cache,
+		&sc.resources.dir,
+		"a.psd",
+		b"another client's layers",
+	)
+	.await;
+	let hidden = sc.sync().await;
+	clean(&hidden);
+	assert_eq!(hidden.remotely_trashed, 0, "{hidden:?}");
+	assert_eq!(
+		hidden.ignored,
+		vec![IgnoredPath {
+			rel_path: "a.psd".to_string(),
+			level: IgnoreLevel::User,
+			tracked: false,
+		}]
+	);
+
+	sc.engine.set_user_ignore("").await.unwrap();
+	for _ in 0..2 {
+		let held = sc.sync().await;
+		clean(&held);
+		assert!(
+			matches!(
+				held.guard,
+				Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+			),
+			"{held:?}"
+		);
+		assert_eq!(held.remotely_trashed, 0, "{held:?}");
+	}
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["a.psd", "keep.txt"])
+	);
+
+	let token = sc
+		.sync()
+		.await
+		.deletion_token
+		.expect("the deletion is still held");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let approved = sc.sync().await;
+	clean(&approved);
+	assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["keep.txt"])
 	);
 
 	sc.cleanup();
