@@ -274,13 +274,23 @@ fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Op
 }
 
 /// What the scan does with `.filenignore` files on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuleFiles {
 	/// Read each accepted directory's file, replacing any rules already given for it.
 	Read,
-	/// Leave them alone: the rules come from somewhere else (the remote copies, when the remote is
-	/// the source of truth).
-	Skip,
+	/// Read only the files of these root-relative directories (`""` is the root) and leave the rest
+	/// alone: the rules come from somewhere else (the remote copies, when the remote is the source of
+	/// truth).
+	Only(BTreeSet<String>),
+}
+
+impl RuleFiles {
+	fn reads(&self, dir: &str) -> bool {
+		match self {
+			Self::Read => true,
+			Self::Only(dirs) => dirs.contains(dir),
+		}
+	}
 }
 
 /// The metadata of the `.filenignore` in `dir_path`, if a FILE by exactly that name is there.
@@ -376,7 +386,7 @@ fn load_rule_file(
 /// [`LocalScan::complete`] either way. Blocking work — the engine calls this on a blocking thread.
 ///
 /// Entries `rules` ignore are pruned: recorded in [`LocalScan::ignored`] and never descended into.
-/// With [`RuleFiles::Read`], each directory's `.filenignore` joins `rules` before its children are
+/// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
 /// matched. The rules come back as the scan used them, for the rest of the pass to match with.
 pub(crate) fn scan_local(
 	root: &Path,
@@ -402,7 +412,7 @@ pub(crate) fn scan_local(
 	// targets. A root that does not resolve fails the walk below anyway.
 	let canonical_root = std::fs::canonicalize(root).ok();
 
-	if rule_files == RuleFiles::Read {
+	if rule_files.reads("") {
 		load_rule_file(
 			root,
 			"",
@@ -453,7 +463,7 @@ pub(crate) fn scan_local(
 				aliased_dirs.insert(rel_path, target);
 				return false;
 			}
-			if is_dir && rule_files == RuleFiles::Read {
+			if is_dir && rule_files.reads(&rel_path) {
 				load_rule_file(
 					root,
 					&rel_path,
@@ -593,7 +603,8 @@ pub(crate) fn scan_local(
 						// reported already. Nothing is planned under a blocked directory, so the
 						// missing node cannot read as a deletion.
 						Err(_)
-							if rule_files == RuleFiles::Read
+							if rule_files
+								.reads(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir))
 								&& entry.file_name() == OsStr::new(FILENIGNORE)
 								&& ignore_blocked.borrow().contains(
 									rel_path.rsplit_once('/').map_or("", |(dir, _)| dir),
@@ -1192,12 +1203,26 @@ mod tests {
 			&HashMap::new(),
 			ScanDepth::Fast,
 			IgnoreRules::default(),
-			RuleFiles::Skip,
+			RuleFiles::Only(BTreeSet::new()),
 		);
 		assert!(skipped.nodes.contains_key("build/deep/a.txt"));
 		assert_eq!(
 			skipped.ignored.keys().collect::<Vec<_>>(),
 			vec!["sub/.DS_Store"]
+		);
+		assert!(rules.decide("x.log", false).is_none());
+		// Except the ones named: a synced rule file the remote has lost still governs.
+		let (only, rules) = scan_local(
+			&root,
+			&HashMap::new(),
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
+		);
+		assert!(only.nodes.contains_key("build/deep/a.txt"));
+		assert_eq!(
+			only.ignored.keys().collect::<Vec<_>>(),
+			vec!["sub/.DS_Store", "sub/tmp"]
 		);
 		assert!(rules.decide("x.log", false).is_none());
 

@@ -479,9 +479,17 @@ async fn trash_proj_over_local_extra(sc: &SingleClient, extra: &str) -> SyncRepo
 
 	let mut proj = remote_dir_at(sc, "proj").await;
 	// A pass keeps its own recent uploads in its remote view until a snapshot lists them (or the
-	// cache announces them after the write). Trashing the directory before that would leave a.txt
+	// cache announces them after the write). Trashing the directory before that would leave them
 	// folded back in, so let a pass read them first.
-	for uuid in [proj.uuid(), a_txt.uuid()] {
+	let mut uploaded: Vec<_> = remote_tree(&sc.cache.client, &proj)
+		.await
+		.into_values()
+		.flatten()
+		.map(|file| file.uuid())
+		.collect();
+	uploaded.push(proj.uuid());
+	assert!(uploaded.contains(&a_txt.uuid()));
+	for &uuid in &uploaded {
 		assert!(
 			poll_for_item(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
 			"the cache never observed the upload"
@@ -489,7 +497,7 @@ async fn trash_proj_over_local_extra(sc: &SingleClient, extra: &str) -> SyncRepo
 	}
 	clean(&sc.sync().await);
 	sc.cache.client.trash_dir(&mut proj).await.unwrap();
-	for uuid in [proj.uuid(), a_txt.uuid()] {
+	for uuid in uploaded {
 		assert!(
 			poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
 			"the cache never observed the trash"
@@ -525,6 +533,117 @@ async fn filter_dir_delete_keeps_ignored_children() {
 	assert_eq!(
 		remote_paths(&sc.cache.client, &sc.resources.dir).await,
 		paths(&[".filenignore"])
+	);
+
+	sc.cleanup();
+}
+
+/// The directory's own `.filenignore` keeps it too, pass after pass: that rule file is kept with the
+/// directory, or the next pass would read no rule and take the ignored content down.
+#[shared_test_runtime]
+async fn filter_dir_delete_keeps_ignored_children_by_its_own_rule() {
+	let sc = single_client(SyncMode::TwoWay).await;
+	// Something outside proj stays on the remote, so the trash does not empty it and trip the guard.
+	write_file(&sc.local, "keep.txt", b"stays");
+	write_file(&sc.local, "proj/.filenignore", b"node_modules/\n");
+	let report = trash_proj_over_local_extra(&sc, "node_modules/m.js").await;
+	assert!(report.deferred_paths >= 1, "{report:?}");
+	let again = sc.sync().await;
+	clean(&again);
+	assert!(again.deferred_paths >= 1, "{again:?}");
+
+	assert!(
+		!sc.local.join("proj/a.txt").exists(),
+		"a.txt not deleted: {report:?}"
+	);
+	assert!(read_eq(&sc.local, "proj/.filenignore", b"node_modules/\n"));
+	assert!(read_eq(
+		&sc.local,
+		"proj/node_modules/m.js",
+		b"ignored extra"
+	));
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["keep.txt"])
+	);
+
+	sc.cleanup();
+}
+
+/// A mode that pulls keeps the directory by its own rule file as well, although the remote copy of
+/// that file went with the trashed directory: the local copy still has its row.
+#[shared_test_runtime]
+async fn filter_pull_dir_delete_keeps_ignored_children_by_its_own_rule() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	upload_remote(&sc.cache, &sc.resources.dir, "keep.txt", b"stays").await;
+	let mut proj = create_remote_dir(&sc.cache, &sc.resources.dir, "proj").await;
+	let rule = upload_remote(&sc.cache, &proj, ".filenignore", b"node_modules/\n").await;
+	let a_txt = upload_remote(&sc.cache, &proj, "a.txt", b"visible").await;
+	let first = sc.sync().await;
+	clean(&first);
+	assert_eq!(first.downloaded, 3, "{first:?}");
+	write_file(&sc.local, "proj/node_modules/m.js", b"ignored extra");
+	clean(&sc.sync().await);
+
+	sc.cache.client.trash_dir(&mut proj).await.unwrap();
+	for uuid in [proj.uuid(), rule.uuid(), a_txt.uuid()] {
+		assert!(
+			poll_for_item_absent(sc.cache.db_path(), uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"the cache never observed the trash"
+		);
+	}
+	for _ in 0..2 {
+		let report = sc.sync().await;
+		clean(&report);
+		assert!(report.deferred_paths >= 1, "{report:?}");
+	}
+
+	assert!(!sc.local.join("proj/a.txt").exists(), "a.txt not deleted");
+	assert!(bytes_recoverable_anywhere(&sc.local, b"visible"));
+	assert!(read_eq(&sc.local, "proj/.filenignore", b"node_modules/\n"));
+	assert!(read_eq(
+		&sc.local,
+		"proj/node_modules/m.js",
+		b"ignored extra"
+	));
+
+	sc.cleanup();
+}
+
+/// A mode that pushes keeps the remote directory by its own rule file after a local `rm -r`: the
+/// remote copy of that file is read while its row stands.
+#[shared_test_runtime]
+async fn filter_push_dir_delete_keeps_ignored_children_by_its_own_rule() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "keep.txt", b"stays");
+	write_file(&sc.local, "proj/.filenignore", b"node_modules/\n");
+	write_file(&sc.local, "proj/a.txt", b"visible");
+	let first = sc.sync().await;
+	clean(&first);
+	assert_eq!(first.uploaded, 3, "{first:?}");
+	let proj = remote_dir_at(&sc, "proj").await;
+	let modules = create_remote_dir(&sc.cache, &proj, "node_modules").await;
+	upload_remote(&sc.cache, &modules, "m.js", b"ignored extra").await;
+	let quiet = sc.sync().await;
+	clean(&quiet);
+	assert_eq!(quiet.remotely_trashed, 0, "{quiet:?}");
+
+	std::fs::remove_dir_all(sc.local.join("proj")).unwrap();
+	for _ in 0..2 {
+		let report = sc.sync().await;
+		clean(&report);
+		assert!(report.deferred_paths >= 1, "{report:?}");
+	}
+
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&[
+			"keep.txt",
+			"proj",
+			"proj/.filenignore",
+			"proj/node_modules",
+			"proj/node_modules/m.js"
+		])
 	);
 
 	sc.cleanup();
