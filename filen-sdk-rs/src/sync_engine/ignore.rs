@@ -335,21 +335,25 @@ pub(crate) struct RemoteRules {
 /// Reads the remote `.filenignore` files whose rules `mode` takes from the remote, on top of the
 /// `user` level.
 ///
-/// A mode that only pushes reads none: the local tree is its source of truth. A mode that only
-/// pulls reads every one, shallowest first, and skips a file under a directory the rules read so far
-/// ignore. A two-way pair reads a remote file only where `local_has_file` says the directory has no
-/// copy on disk, which the scan reads instead; it skips none under an ignored directory, because a
-/// local file the scan has not read yet may re-include that directory.
+/// A mode that only pulls reads every one, shallowest first, and skips a file under a directory the
+/// rules read so far ignore. The other modes take a directory's rules from disk, and read a remote
+/// file only where `local_has_file` says the directory has no copy there: a two-way pair wherever
+/// that is so (a remote-only rule file applies before it is downloaded); a mode that only pushes only
+/// where `tracked` says the file has a baseline row, since a synced rule file the disk has lost still
+/// governs until that loss propagates, and a directory deleted locally has to keep what those rules
+/// hide on the remote. Neither skips a file under an ignored directory, because a local file the scan
+/// has not read yet may re-include that directory.
 ///
 /// A body is taken from `cached` by uuid, or else fetched. A file larger than
-/// [`MAX_REMOTE_RULE_FILE_BYTES`], one that cannot be fetched, is not UTF-8 or does not compile
-/// blocks its directory for the pass: guessing its rules could sync what the user meant to hide. So
-/// does one the view holds back as listed twice.
+/// [`MAX_RULE_FILE_BYTES`], one that cannot be fetched, is not UTF-8 or does not compile blocks its
+/// directory for the pass: guessing its rules could sync what the user meant to hide. So does one
+/// the view holds back as listed twice, unless a mode that only pulls ignores its directory anyway.
 pub(crate) async fn load_remote_rules<Fetch, Fut>(
 	mode: SyncMode,
 	view: &RemoteView,
 	user: Option<IgnoreSource>,
 	local_has_file: impl Fn(&str) -> bool,
+	tracked: impl Fn(&str) -> bool,
 	cached: &HashMap<Uuid, Arc<str>>,
 	mut fetch: Fetch,
 ) -> RemoteRules
@@ -361,23 +365,16 @@ where
 		rules: IgnoreRules::new(user),
 		..RemoteRules::default()
 	};
-	if !mode.pulls() {
-		return out;
-	}
-	let reads_remote = |dir: &str| mode != SyncMode::TwoWay || !local_has_file(dir);
-	for dir in view
-		.held_paths
-		.iter()
-		.filter_map(|path| rule_file_dir(path))
-	{
-		if reads_remote(dir) {
-			out.blocked.insert(dir.to_owned());
-			out.errors.push(format!(
-				"remote {}: listed twice while the cache catches up, not read this pass",
-				Origin::File { dir }
-			));
-		}
-	}
+	let reads_remote = |dir: &str| match mode {
+		SyncMode::TwoWay => !local_has_file(dir),
+		_ if mode.pushes() => tracked(dir) && !local_has_file(dir),
+		_ => true,
+	};
+	// Only a mode that pulls alone has every rule above a file before the scan: in the others a file
+	// on disk may still re-include what the remote rules ignore.
+	let under_ignored = |rules: &IgnoreRules, dir: &str| {
+		!mode.pushes() && rules.ignored_root(dir, true, &mut HashMap::new()).is_some()
+	};
 	let mut candidates: Vec<(&str, &RemoteNode)> = view
 		.nodes
 		.values()
@@ -386,15 +383,7 @@ where
 		.collect();
 	candidates.sort_by_key(|(dir, _)| dir.matches('/').count() + usize::from(!dir.is_empty()));
 	for (dir, node) in candidates {
-		if mode == SyncMode::TwoWay {
-			if !reads_remote(dir) {
-				continue;
-			}
-		} else if out
-			.rules
-			.ignored_root(dir, true, &mut HashMap::new())
-			.is_some()
-		{
+		if !reads_remote(dir) || under_ignored(&out.rules, dir) {
 			continue;
 		}
 		let origin = Origin::File { dir };
@@ -421,6 +410,20 @@ where
 			}
 		}
 		out.bodies.insert(node.remote_uuid, body);
+	}
+	// After the rules above them are read, so a mode that pulls alone does not report one it ignores.
+	for dir in view
+		.held_paths
+		.iter()
+		.filter_map(|path| rule_file_dir(path))
+	{
+		if reads_remote(dir) && !under_ignored(&out.rules, dir) {
+			out.blocked.insert(dir.to_owned());
+			out.errors.push(format!(
+				"remote {}: listed twice while the cache catches up, not read this pass",
+				Origin::File { dir }
+			));
+		}
 	}
 	out
 }
@@ -458,7 +461,7 @@ fn too_large() -> String {
 
 /// The root-relative directory a `.filenignore` at `rel_path` belongs to, or `None` for any other
 /// path.
-fn rule_file_dir(rel_path: &str) -> Option<&str> {
+pub(crate) fn rule_file_dir(rel_path: &str) -> Option<&str> {
 	match rel_path.strip_suffix(FILENIGNORE)? {
 		"" => Some(""),
 		dir => dir.strip_suffix('/'),
@@ -760,6 +763,18 @@ mod tests {
 		bodies: &HashMap<&str, Vec<u8>>,
 		cached: &HashMap<Uuid, Arc<str>>,
 	) -> (RemoteRules, Vec<String>) {
+		load_tracked(mode, view, on_disk, &[], bodies, cached).await
+	}
+
+	/// [`load`], where `tracked` lists the directories whose rule file has a baseline row.
+	async fn load_tracked(
+		mode: SyncMode,
+		view: &RemoteView,
+		on_disk: &[&str],
+		tracked: &[&str],
+		bodies: &HashMap<&str, Vec<u8>>,
+		cached: &HashMap<Uuid, Arc<str>>,
+	) -> (RemoteRules, Vec<String>) {
 		let paths: HashMap<Uuid, &str> = view
 			.nodes
 			.values()
@@ -771,6 +786,7 @@ mod tests {
 			view,
 			None,
 			|dir| on_disk.contains(&dir),
+			|dir| tracked.contains(&dir),
 			cached,
 			|uuid| {
 				let path = paths[&uuid];
@@ -802,6 +818,51 @@ mod tests {
 			assert!(
 				rules.blocked.is_empty() && rules.errors.is_empty(),
 				"{mode:?}"
+			);
+		}
+	}
+
+	/// A mode that only pushes takes its rules from disk, but a synced rule file the disk has lost (its
+	/// row still stands) is read from the remote until the loss propagates: a directory deleted
+	/// locally is still read with the rules that keep its ignored remote content.
+	#[tokio::test]
+	async fn a_mode_that_only_pushes_reads_a_synced_rule_file_the_disk_has_lost() {
+		let view = rule_view(
+			vec![
+				rule_node(FILENIGNORE, 2),
+				rule_node("proj/.filenignore", 14),
+			],
+			&[],
+		);
+		let bodies = HashMap::from([
+			(FILENIGNORE, b"*\n".to_vec()),
+			("proj/.filenignore", b"node_modules/\n".to_vec()),
+		]);
+		for mode in [SyncMode::LocalToRemote, SyncMode::LocalBackup] {
+			let (rules, fetched) =
+				load_tracked(mode, &view, &[""], &["", "proj"], &bodies, &HashMap::new()).await;
+			assert_eq!(fetched, vec!["proj/.filenignore"], "{mode:?}");
+			assert!(remote_ignored(&rules, "proj/node_modules/m.js"), "{mode:?}");
+			assert!(!remote_ignored(&rules, "a.txt"), "{mode:?}");
+			assert!(
+				rules.blocked.is_empty() && rules.errors.is_empty(),
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A pulling mode does not report a rule file held back under a directory the rules already
+	/// ignore: nothing under that directory syncs anyway.
+	#[tokio::test]
+	async fn a_held_rule_file_under_an_ignored_directory_is_not_reported() {
+		let view = rule_view(vec![rule_node(FILENIGNORE, 7)], &["cache/sub/.filenignore"]);
+		let bodies = HashMap::from([(FILENIGNORE, b"cache/\n".to_vec())]);
+		for mode in [SyncMode::RemoteToLocal, SyncMode::RemoteBackup] {
+			let (rules, _) = load(mode, &view, &[], &bodies, &HashMap::new()).await;
+			assert!(
+				rules.errors.is_empty() && rules.blocked.is_empty(),
+				"{mode:?}: {:?}",
+				rules.errors
 			);
 		}
 	}

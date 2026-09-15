@@ -26,7 +26,8 @@ use super::{
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
-		IgnoreLevel, IgnoreSource, IgnoredPath, RemoteRules, load_remote_rules, parse_user_ignore,
+		IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules, load_remote_rules,
+		parse_user_ignore, rule_file_dir,
 	},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
@@ -2283,6 +2284,7 @@ impl SyncEngine {
 	async fn remote_rules(
 		&self,
 		record: &PairRecord,
+		baseline: &HashMap<String, BaselineEntry>,
 		view: &RemoteView,
 		user: Option<IgnoreSource>,
 	) -> RemoteRules {
@@ -2299,13 +2301,14 @@ impl SyncEngine {
 			record.mode,
 			view,
 			user,
-			// Only on a two-way pair: a stat per remote rule file, and a listing where one is found. A
-			// file on disk the scan cannot read is still the scan's to block, so the remote copy is not
-			// read over it.
+			// Asked only where a two-way pair, or a pushing pair's synced rule file, could read the
+			// remote copy: a stat, and a listing where one is found. A file on disk the scan cannot read
+			// is still the scan's to block, so the remote copy is not read over it.
 			|dir| {
 				scan::rule_file_metadata(&local_root.join(dir))
 					.map_or(true, |found| found.is_some())
 			},
+			|dir| baseline.contains_key(&Origin::File { dir }.to_string()),
 			&cached,
 			|uuid| async move {
 				let file = client.get_file(uuid).await?;
@@ -2384,7 +2387,7 @@ impl SyncEngine {
 			Ok(source) => (Some(source), None),
 			Err(error) => (None, Some(error)),
 		};
-		let mut remote_rules = self.remote_rules(&record, &raw_view, user).await;
+		let mut remote_rules = self.remote_rules(&record, &baseline, &raw_view, user).await;
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
@@ -2392,11 +2395,22 @@ impl SyncEngine {
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
-		// `.filenignore` files on disk, over any remote copy read for the same directory.
+		// `.filenignore` files on disk, over any remote copy read for the same directory. A mode that
+		// pulls alone reads on disk only the synced ones the remote has lost: they govern until that
+		// loss propagates, so a directory trashed on the remote keeps what they hide here.
 		let rule_files = if record.mode.pushes() {
 			RuleFiles::Read
 		} else {
-			RuleFiles::Skip
+			RuleFiles::Only(
+				baseline
+					.iter()
+					.filter(|(path, entry)| {
+						entry.kind == NodeKind::File && !raw_view.nodes.contains_key(*path)
+					})
+					.filter_map(|(path, _)| rule_file_dir(path))
+					.map(str::to_owned)
+					.collect(),
+			)
 		};
 		let (mut local_scan, rules) = tokio::task::spawn_blocking(move || {
 			scan::scan_local(
@@ -3597,26 +3611,45 @@ fn withhold_deletions_over_unreachable(
 				.any(|(path, level)| *level != IgnoreLevel::Default && plan::is_under(path, dir))
 	};
 	let mut over_ignored = 0;
-	let withheld: BTreeSet<String> = actions
+	// The `.filenignore` files whose rules keep a withheld directory. Deleted, they would leave the
+	// next pass no rule there, and the ignored content would go down with the directory after all.
+	let mut kept_rule_files = Vec::new();
+	let mut withheld: BTreeSet<String> = actions
 		.iter()
 		.filter(|action| {
 			let dir = action.rel_path();
 			let above_held = held.iter().any(|path| plan::is_under(path, dir));
-			let (unreachable, ignored) = match action {
+			let (unreachable, ignored, side) = match action {
 				SyncAction::DeleteLocal { .. } => (
 					above_held || unknown.keys().any(|path| plan::is_under(path, dir)),
 					keeps_ignored(ignored_local, dir),
+					ignored_local,
 				),
-				SyncAction::TrashRemote { .. } => (above_held, keeps_ignored(ignored_remote, dir)),
-				_ => (false, false),
+				SyncAction::TrashRemote { .. } => (
+					above_held,
+					keeps_ignored(ignored_remote, dir),
+					ignored_remote,
+				),
+				_ => return false,
 			};
-			if ignored && !unreachable {
-				over_ignored += 1;
+			if ignored {
+				kept_rule_files.extend(side.values().filter_map(|level| match level {
+					IgnoreLevel::File { dir: rules }
+						if rules == dir || plan::is_under(rules, dir) =>
+					{
+						Some(Origin::File { dir: rules }.to_string())
+					}
+					_ => None,
+				}));
+				if !unreachable {
+					over_ignored += 1;
+				}
 			}
 			unreachable || ignored
 		})
 		.map(|action| action.rel_path().to_string())
 		.collect();
+	withheld.extend(kept_rule_files);
 	if withheld.is_empty() {
 		return (actions, over_ignored);
 	}
@@ -4941,6 +4974,62 @@ mod tests {
 					"{level:?} {side}"
 				);
 			}
+		}
+	}
+
+	/// The `.filenignore` whose rules keep a withheld directory stays with it, or the next pass would
+	/// have no rule and take the ignored content down with the directory. A rule file above the
+	/// directory is not the directory's to keep.
+	#[test]
+	fn a_withheld_directory_keeps_the_rule_files_that_keep_it() {
+		let file_level = |dir: &str| IgnoreLevel::File {
+			dir: dir.to_string(),
+		};
+		let ignored = BTreeMap::from([
+			("proj/node_modules".to_string(), file_level("proj")),
+			("proj/sub/cache".to_string(), file_level("proj/sub")),
+			("proj/build".to_string(), file_level("")),
+		]);
+		let none = BTreeMap::new();
+		let paths = [
+			("proj/.filenignore", NodeKind::File),
+			("proj/sub/.filenignore", NodeKind::File),
+			("proj/a.txt", NodeKind::File),
+			("proj/sub", NodeKind::Dir),
+			("proj", NodeKind::Dir),
+			(".filenignore", NodeKind::File),
+		];
+		for local in [true, false] {
+			let actions = paths
+				.iter()
+				.map(|&(rel_path, kind)| {
+					let rel_path = rel_path.to_string();
+					if local {
+						SyncAction::DeleteLocal { rel_path, kind }
+					} else {
+						SyncAction::TrashRemote {
+							rel_path,
+							kind,
+							remote_uuid: Uuid::nil(),
+						}
+					}
+				})
+				.collect();
+			let sides = if local {
+				[&ignored, &none]
+			} else {
+				[&none, &ignored]
+			};
+			let (kept, deferred) = withhold_deletions_over_unreachable(
+				actions,
+				&BTreeMap::new(),
+				&HashSet::new(),
+				sides,
+				&BTreeSet::new(),
+			);
+			let kept: Vec<&str> = kept.iter().map(SyncAction::rel_path).collect();
+			assert_eq!(kept, vec!["proj/a.txt", ".filenignore"], "local: {local}");
+			assert_eq!(deferred, 2, "local: {local}");
 		}
 	}
 
