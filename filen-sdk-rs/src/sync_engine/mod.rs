@@ -30,7 +30,7 @@ mod plan;
 mod scan;
 mod watch;
 
-pub use self::ignore::DEFAULT_IGNORE_PATTERNS;
+pub use self::ignore::{DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath};
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
 pub use engine::{

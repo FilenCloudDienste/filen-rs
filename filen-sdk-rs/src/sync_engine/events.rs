@@ -24,6 +24,10 @@ use super::{SyncMode, apply::SyncReport};
 ///
 /// A pass that fails outright ends with [`PassFailed`](Self::PassFailed) instead of
 /// `PassCompleted` — with or without a `PassStarted` before it, depending on how far it got.
+// The report inline makes every event as large as `PassCompleted`, a copy of a few hundred bytes per
+// action event, which is noise beside the transfer it reports. Boxing it would make callers match
+// and compare through a `Box` for a variant delivered once per pass.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.

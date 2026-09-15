@@ -104,15 +104,47 @@ impl fmt::Display for Origin<'_> {
 	}
 }
 
-/// The level an ignored path's deciding rule comes from, kept after the pass's rules are gone.
+/// The level the rule that ignores a path comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum IgnoreLevel {
+pub enum IgnoreLevel {
+	/// [`DEFAULT_IGNORE_PATTERNS`].
 	Default,
+	/// The device-wide user patterns.
 	User,
 	/// The `.filenignore` in this root-relative directory (`""` is the pair root).
-	File {
-		dir: String,
-	},
+	File { dir: String },
+}
+
+impl fmt::Display for IgnoreLevel {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Default => Origin::Default.fmt(f),
+			Self::User => Origin::User.fmt(f),
+			Self::File { dir } => Origin::File { dir }.fmt(f),
+		}
+	}
+}
+
+/// The top of a subtree the ignore rules hide: nothing at or under it is synced in either direction,
+/// and neither copy is touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredPath {
+	pub rel_path: String,
+	pub level: IgnoreLevel,
+	/// A baseline row sat at or under the path when the pass read it: it was synced before, and this
+	/// pass stopped tracking it. Removing the rule later syncs it like a first sync. Only the pass
+	/// that drops the rows reports it so; a dry run reports it until a pass has run.
+	pub tracked: bool,
+}
+
+impl fmt::Display for IgnoredPath {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "ignored {:?} (by {})", self.rel_path, self.level)?;
+		if self.tracked {
+			f.write_str(", no longer synced")?;
+		}
+		Ok(())
+	}
 }
 
 impl From<Origin<'_>> for IgnoreLevel {
