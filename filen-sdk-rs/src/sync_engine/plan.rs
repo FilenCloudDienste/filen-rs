@@ -7,6 +7,7 @@
 //! to tell which side changed and surfaces a genuine both-sides-changed divergence as a conflict.
 
 use std::{
+	cell::RefCell,
 	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
@@ -18,6 +19,7 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	events::SyncEvent,
+	ignore::{IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
@@ -325,6 +327,9 @@ pub(crate) struct RemoteView {
 	/// Remote items that exist but are NOT in `nodes`, and why. Their absence from `nodes` is no
 	/// evidence of a deletion (see [`unknown_remote_paths`]).
 	pub(crate) skipped: Vec<SkippedRemote>,
+	/// The top-most items the ignore rules hide, with the level of the deciding rule. Neither they
+	/// nor anything under them is in `nodes` or `skipped`, or checked for collisions.
+	pub(crate) ignored: BTreeMap<String, IgnoreLevel>,
 }
 
 /// A remote item the snapshot holds that the view could not place at a path.
@@ -350,11 +355,18 @@ pub(crate) struct SkippedRemote {
 /// [`RemoteView::skipped`]. A descendant of a skipped directory is left out with it and recorded
 /// under that directory's path and reason: its own uuid is still what a synced item moved beneath
 /// the directory is found by (see [`unknown_remote_paths`]).
+///
+/// With `rules`, an item they hide at or above its path is left out of `nodes` too, before the
+/// collision check, so ignored case-twins never refuse a pass, and its top-most ignored path is
+/// recorded in [`RemoteView::ignored`]. A skipped item under an ignored path is left out unrecorded:
+/// it is out of sync, not unsyncable. Without `rules` the view shows the remote as it is, which is
+/// what a pass finds the remote rule files in and reads an emptied remote from.
 pub(crate) fn build_remote_view(
 	root: Uuid,
 	dirs: &[CacheableDir<'_>],
 	files: &[CacheableFile<'_>],
 	undecodable: &[UndecodableItem],
+	rules: Option<&IgnoreRules>,
 ) -> RemoteView {
 	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
 		.iter()
@@ -366,9 +378,21 @@ pub(crate) fn build_remote_view(
 		.map(|item| item.uuid)
 		.collect();
 
+	// Shared by the closures below, which each ask about one path at a time.
+	let memo = RefCell::new(HashMap::new());
+	let hidden = |rel_path: &str, is_dir: bool| {
+		rules.is_some_and(|rules| {
+			rules
+				.ignored_root(rel_path, is_dir, &mut memo.borrow_mut())
+				.is_some()
+		})
+	};
+
 	let mut skipped = Skipped::default();
 	for item in undecodable {
 		match resolve_parent(item.parent, root, &dir_index, &undecodable_dirs) {
+			// Its own name is unknown, so only the directory holding it can be ignored.
+			Ok(rel_path) if hidden(&rel_path, true) => {}
 			Ok(rel_path) => skipped.record(SkippedRemote {
 				remote_uuid: item.uuid,
 				stable_uuid: item.stable_uuid,
@@ -389,14 +413,21 @@ pub(crate) fn build_remote_view(
 	                 stable_uuid: Option<StableUuid>| {
 		let skip = match resolve_parent(parent, root, &dir_index, &undecodable_dirs) {
 			Ok(parent_path) if is_safe_name(name) => return Some(join_path(&parent_path, name)),
-			Ok(parent_path) => SkippedRemote {
-				remote_uuid,
-				stable_uuid,
-				rel_path: join_path(&parent_path, name),
-				reason: UnsyncableReason::RemoteInvalidName {
-					name: name.to_string(),
-				},
-			},
+			Ok(parent_path) => {
+				let rel_path = join_path(&parent_path, name);
+				// A directory has no whole-life id.
+				if hidden(&rel_path, stable_uuid.is_none()) {
+					return None;
+				}
+				SkippedRemote {
+					remote_uuid,
+					stable_uuid,
+					rel_path,
+					reason: UnsyncableReason::RemoteInvalidName {
+						name: name.to_string(),
+					},
+				}
+			}
 			Err(Unresolved::UnderSkipped(ancestor)) => {
 				skipped.under(remote_uuid, stable_uuid, ancestor);
 				return None;
@@ -418,9 +449,23 @@ pub(crate) fn build_remote_view(
 	let mut claimed: HashMap<String, String> = HashMap::new();
 	let mut has_collisions = false;
 	let mut held_paths: HashSet<String> = HashSet::new();
+	let mut ignored = BTreeMap::new();
 
 	let mut insert = |rel_path: String, node: RemoteNode| {
+		// The engine's own directory comes before every rule, and is never reported as ignored.
 		if in_quarantine(&rel_path) {
+			return;
+		}
+		// Before the collision check, so ignored case-twins never refuse the pass.
+		if let Some(rules) = rules
+			&& let Some((ignored_root, level)) = rules.ignored_root(
+				&rel_path,
+				node.kind == NodeKind::Dir,
+				&mut memo.borrow_mut(),
+			) {
+			if !ignored.contains_key(ignored_root) {
+				ignored.insert(ignored_root.to_owned(), level);
+			}
 			return;
 		}
 		match claimed.get(&collision_key(&rel_path)) {
@@ -486,6 +531,7 @@ pub(crate) fn build_remote_view(
 		has_collisions,
 		held_paths,
 		skipped: skipped.finish(),
+		ignored,
 	}
 }
 
@@ -2378,7 +2424,10 @@ mod tests {
 	use chrono::{DateTime, Utc};
 
 	use super::{
-		super::engine::{Observations, PendingKind, PendingWrites},
+		super::{
+			engine::{Observations, PendingKind, PendingWrites},
+			ignore::{IgnoreSource, Origin},
+		},
 		*,
 	};
 	use crate::sync_engine::SyncMode;
@@ -5092,7 +5141,13 @@ mod tests {
 		let ok = remote_dir("ok", root);
 		// A child under the traversal-named dir is left out with it, recorded under its record.
 		let under_evil = remote_dir("x", evil.uuid);
-		let view = build_remote_view(root, &[evil.clone(), ok, under_evil.clone()], &[], &[]);
+		let view = build_remote_view(
+			root,
+			&[evil.clone(), ok, under_evil.clone()],
+			&[],
+			&[],
+			None,
+		);
 		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["ok"]);
 		let record = |remote_uuid| SkippedRemote {
 			remote_uuid,
@@ -5125,6 +5180,7 @@ mod tests {
 			std::slice::from_ref(&sub),
 			&[],
 			&[in_sub, garbled_dir, under_garbled, elsewhere],
+			None,
 		);
 		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["sub"]);
 		let recorded: Vec<(Uuid, &str)> = view
@@ -5165,6 +5221,7 @@ mod tests {
 			&[evil.clone(), nested.clone()],
 			&[moved.clone(), stranger, deep.clone()],
 			&[garbled, in_garbled],
+			None,
 		);
 		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
 		let invalid = UnsyncableReason::RemoteInvalidName {
@@ -5271,6 +5328,91 @@ mod tests {
 		);
 	}
 
+	fn root_rules(text: &str) -> IgnoreRules {
+		let (source, errors) = IgnoreSource::parse(text, Origin::File { dir: "" }).unwrap();
+		assert!(errors.is_empty(), "{errors:?}");
+		let mut rules = IgnoreRules::default();
+		rules.insert_file(String::new(), source);
+		rules
+	}
+
+	/// An ignored item is left out of the view with everything under it, and only the top of each
+	/// ignored subtree is recorded. Ignored case-twins no longer refuse the pass, and an item the view
+	/// cannot place inside an ignored directory is not reported: it is out of sync, not unsyncable.
+	#[test]
+	fn an_ignored_remote_item_leaves_the_view_and_only_its_top_is_recorded() {
+		let root = Uuid::new_v4();
+		let build = remote_dir("build", root);
+		let deep = remote_dir("deep", build.uuid);
+		let evil_in_build = remote_dir("..", build.uuid);
+		let lineage = StableUuid::new_for_test(Uuid::new_v4());
+		let dirs = [build.clone(), deep.clone(), evil_in_build];
+		let files = [
+			cacheable_file(build.uuid, "o.bin"),
+			cacheable_file(deep.uuid, "x.bin"),
+			cacheable_file(root, "a.TMP"),
+			cacheable_file(root, "A.tmp"),
+			cacheable_file(root, "keep.txt"),
+		];
+		let stranger = undecodable(root, None);
+		let undecodables = [undecodable(build.uuid, Some(lineage)), stranger];
+
+		let raw = build_remote_view(root, &dirs, &files, &undecodables, None);
+		assert!(raw.has_collisions, "unfiltered, the twins collide");
+		assert_eq!(raw.skipped.len(), 3, "{:?}", raw.skipped);
+		assert!(raw.ignored.is_empty());
+
+		let rules = root_rules("build/\n*.tmp");
+		let view = build_remote_view(root, &dirs, &files, &undecodables, Some(&rules));
+		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
+		assert!(!view.has_collisions);
+		let level = IgnoreLevel::File { dir: String::new() };
+		assert_eq!(
+			view.ignored,
+			BTreeMap::from([
+				("A.tmp".to_string(), level.clone()),
+				("a.TMP".to_string(), level.clone()),
+				("build".to_string(), level),
+			])
+		);
+		assert_eq!(
+			view.skipped,
+			vec![SkippedRemote {
+				remote_uuid: stranger.uuid,
+				stable_uuid: None,
+				rel_path: String::new(),
+				reason: UnsyncableReason::RemoteUndecodable,
+			}]
+		);
+		let baseline = HashMap::new();
+		let (_, never_synced) = unknown_remote_paths(&baseline, &view.skipped);
+		assert_eq!(never_synced.len(), 1, "{never_synced:?}");
+	}
+
+	/// A root pattern of `*` empties the filtered view, rule file included, while the unfiltered one
+	/// still lists the remote: the pass reads its rule files and an emptied remote from that one, or
+	/// every such pass would read as a vanished remote.
+	#[test]
+	fn ignoring_everything_empties_only_the_filtered_view() {
+		let root = Uuid::new_v4();
+		let sub = remote_dir("sub", root);
+		let files = [
+			cacheable_file(root, ".filenignore"),
+			cacheable_file(sub.uuid, "f.txt"),
+		];
+		let dirs = std::slice::from_ref(&sub);
+		let raw = build_remote_view(root, dirs, &files, &[], None);
+		assert_eq!(raw.nodes.len(), 3);
+		assert!(raw.nodes.contains_key(".filenignore"));
+
+		let view = build_remote_view(root, dirs, &files, &[], Some(&root_rules("*")));
+		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
+		assert_eq!(
+			view.ignored.keys().collect::<Vec<_>>(),
+			vec![".filenignore", "sub"]
+		);
+	}
+
 	#[test]
 	fn build_remote_view_excludes_the_quarantine_dir_name() {
 		let root = Uuid::new_v4();
@@ -5283,7 +5425,7 @@ mod tests {
 			name: Cow::Borrowed(QUARANTINE_DIR),
 			created: Some(ms(1)),
 		};
-		let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[]);
+		let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[], None);
 		assert!(
 			view.nodes.is_empty(),
 			"a remote folder named like the quarantine dir must be excluded from the view"
@@ -5579,7 +5721,13 @@ mod tests {
 		};
 		let sibling = cacheable_file(root, "other.txt");
 
-		let view = build_remote_view(root, &[], &[predecessor, successor, sibling.clone()], &[]);
+		let view = build_remote_view(
+			root,
+			&[],
+			&[predecessor, successor, sibling.clone()],
+			&[],
+			None,
+		);
 
 		assert!(
 			!view.has_collisions,
@@ -5608,7 +5756,7 @@ mod tests {
 			..lower.clone()
 		};
 
-		let view = build_remote_view(root, &[], &[lower, upper], &[]);
+		let view = build_remote_view(root, &[], &[lower, upper], &[], None);
 
 		assert!(
 			view.has_collisions,
@@ -5663,6 +5811,7 @@ mod tests {
 			std::slice::from_ref(&sub),
 			&[file.clone(), orphan.clone()],
 			&[],
+			None,
 		);
 		assert!(!view.has_collisions);
 		let mut paths: Vec<_> = view.nodes.keys().cloned().collect();
