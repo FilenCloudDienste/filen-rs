@@ -25,7 +25,7 @@ use super::{
 		PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
-	ignore::{IgnoreLevel, IgnoreRules},
+	ignore::{FILENIGNORE, IgnoreLevel, RemoteRules, load_remote_rules},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
@@ -1041,6 +1041,10 @@ pub struct SyncEngine {
 	/// from that read. `Arc`: the guard is held across awaits after the map's own lock is released.
 	/// Bounded by the pair count; an entry goes with its pair.
 	reading: Mutex<HashMap<PairId, Arc<Mutex<()>>>>,
+	/// Each pair's remote `.filenignore` bodies by remote uuid, as its last pass read them (see
+	/// [`load_remote_rules`]). `Arc`: a pass takes the bodies it reuses out from under the lock.
+	/// Bounded by the pair count; an entry goes with its pair.
+	remote_rule_bodies: Mutex<HashMap<PairId, HashMap<Uuid, Arc<str>>>>,
 }
 
 #[cfg(feature = "malformed")]
@@ -1179,6 +1183,8 @@ struct Prepared {
 	ignored_remote: BTreeMap<String, IgnoreLevel>,
 	/// Subtrees whose ignore rules could not be read this pass: blocked, with their rows kept.
 	ignore_blocked: BTreeSet<String>,
+	/// A report line per remote `.filenignore` that could not be used, or per bad line in one.
+	remote_rule_errors: Vec<String>,
 	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
@@ -1508,6 +1514,7 @@ impl SyncEngine {
 			removals: Mutex::new(HashMap::new()),
 			lock_budget: LockBudget::default(),
 			reading: Mutex::new(HashMap::new()),
+			remote_rule_bodies: Mutex::new(HashMap::new()),
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -2225,6 +2232,38 @@ impl SyncEngine {
 		self.observed.forget_pushes(&decided, Instant::now());
 	}
 
+	/// Read the remote `.filenignore` files `record`'s mode takes rules from (see
+	/// [`load_remote_rules`]), reusing the bodies the pair's last pass read wherever the uuid is the
+	/// same.
+	async fn remote_rules(&self, record: &PairRecord, view: &RemoteView) -> RemoteRules {
+		// Taken rather than copied: a pass on the same pair running alongside only downloads again.
+		let cached = self
+			.remote_rule_bodies
+			.lock()
+			.await
+			.remove(&record.id)
+			.unwrap_or_default();
+		let local_root = Path::new(&record.local_root);
+		let client = &self.client;
+		let mut rules = load_remote_rules(
+			record.mode,
+			view,
+			// One stat per remote rule file, and only on a two-way pair.
+			|dir| local_root.join(dir).join(FILENIGNORE).is_file(),
+			&cached,
+			|uuid| async move {
+				let file = client.get_file(uuid).await?;
+				client.download_file(&file).await
+			},
+		)
+		.await;
+		self.remote_rule_bodies
+			.lock()
+			.await
+			.insert(record.id, mem::take(&mut rules.bodies));
+		rules
+	}
+
 	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
 	/// view.
 	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
@@ -2257,41 +2296,44 @@ impl SyncEngine {
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
 			.await?;
-		let mut remote_view = plan::build_remote_view(
+		// Without the ignore rules first: what the snapshot confirms, which remote rule files there
+		// are, and whether the remote reads as emptied are facts about the remote as it is, whatever
+		// the rules hide.
+		let raw_view = plan::build_remote_view(
 			record.remote_root,
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
+			None,
 		);
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
 		// view — before this engine's own writes are folded into it, and before the baseline is
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
-		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &remote_view.nodes);
+		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &raw_view.nodes);
 		confirmed.extend(
-			self.confirm_pushes(&mut baseline_map, &remote_view.nodes, &snapshot.files)
+			self.confirm_pushes(&mut baseline_map, &raw_view.nodes, &snapshot.files)
 				.await,
 		);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
-		let (unknown_remote, never_synced_remote) =
-			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 
+		let remote_rules = self.remote_rules(&record, &raw_view).await;
 		let local_root = PathBuf::from(&record.local_root);
 		let scan_baseline = Arc::clone(&baseline);
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
-		// `.filenignore` files on disk.
+		// `.filenignore` files on disk, over any remote copy read for the same directory.
 		let rule_files = if record.mode.pushes() {
 			RuleFiles::Read
 		} else {
 			RuleFiles::Skip
 		};
-		let (mut local_scan, _rules) = tokio::task::spawn_blocking(move || {
+		let (mut local_scan, rules) = tokio::task::spawn_blocking(move || {
 			scan::scan_local(
 				&local_root,
 				&scan_baseline,
 				depth,
-				IgnoreRules::default(),
+				remote_rules.rules,
 				rule_files,
 			)
 		})
@@ -2299,9 +2341,22 @@ impl SyncEngine {
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
 		// Kept on the pass, where directory moves re-key them along with everything else it blocks.
 		let ignored_local = mem::take(&mut local_scan.ignored);
-		let ignore_blocked = mem::take(&mut local_scan.ignore_blocked);
+		let mut ignore_blocked = mem::take(&mut local_scan.ignore_blocked);
+		ignore_blocked.extend(remote_rules.blocked);
 
-		let remote_emptied = remote_emptied(&remote_view.nodes, &baseline);
+		// Filtered with exactly the rules the scan matched with, so both sides hide the same paths.
+		let mut remote_view = plan::build_remote_view(
+			record.remote_root,
+			&snapshot.dirs,
+			&snapshot.files,
+			&snapshot.undecodable,
+			Some(&rules),
+		);
+		let ignored_remote = mem::take(&mut remote_view.ignored);
+		let (unknown_remote, never_synced_remote) =
+			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
+
+		let remote_emptied = remote_emptied(&raw_view.nodes, &baseline);
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
 		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
 		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
@@ -2310,7 +2365,8 @@ impl SyncEngine {
 		let mut holds = {
 			let store = self.store.lock().await;
 			let before = self.pending.uuids();
-			let holds = self.pending.settle(pair, &observed, &remote_view.nodes);
+			// The raw view: what the cache shows is evidence whatever the rules hide.
+			let holds = self.pending.settle(pair, &observed, &raw_view.nodes);
 			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
 			if !retired.is_empty() {
 				store
@@ -2321,8 +2377,9 @@ impl SyncEngine {
 		};
 		// A create whose path shows another version of the same file is the one thing the fold
 		// cannot settle on its own; ask the server before it paints over a stranger.
-		self.retire_superseded_creates(pair, &baseline, &remote_view.nodes, &snapshot.files)
+		self.retire_superseded_creates(pair, &baseline, &raw_view.nodes, &snapshot.files)
 			.await?;
+		drop(raw_view);
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
 		let folded = self
@@ -2349,8 +2406,9 @@ impl SyncEngine {
 			unknown_remote,
 			never_synced_remote,
 			ignored_local,
-			ignored_remote: BTreeMap::new(),
+			ignored_remote,
 			ignore_blocked,
+			remote_rule_errors: remote_rules.errors,
 			confirmed,
 			dirs: snapshot.dirs,
 			files: snapshot.files,
@@ -2476,6 +2534,7 @@ impl SyncEngine {
 		// pass from taking the cancel back — so there is nothing left to say on it.
 		self.paused.lock().await.remove(&pair);
 		self.reading.lock().await.remove(&pair);
+		self.remote_rule_bodies.lock().await.remove(&pair);
 		Ok(())
 	}
 
@@ -3002,7 +3061,7 @@ impl SyncEngine {
 				..SyncReport::default()
 			});
 		};
-		let prep = prepared?;
+		let mut prep = prepared?;
 		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
 		// read, so a dry run inside the confirmation window just leaves it for the next pass — and
 		// leaves the evidence with it, which is why the records are retired HERE and not in the
@@ -3033,6 +3092,7 @@ impl SyncEngine {
 		report.unsyncable = prep.unsyncable();
 		// Before the refusal check, so a refused pass still says what the scan could not read.
 		report.errors.extend(prep.local_scan.reported_errors());
+		report.errors.append(&mut prep.remote_rule_errors);
 
 		if let Some(refusal) = refusal(&prep) {
 			tracing::debug!("sync_once[pair {pair}]: refused — {refusal:?}");
@@ -3576,6 +3636,7 @@ mod tests {
 		sync_engine::{
 			PauseMode,
 			baseline::{BaselineChange, NodeKind},
+			ignore::IgnoreRules,
 			plan::RemoteNode,
 			scan::LocalNode,
 		},
@@ -3651,6 +3712,7 @@ mod tests {
 				parent: root,
 				stable_uuid: Some(StableUuid::new_for_test(uuid)),
 			}],
+			None,
 		);
 		let reconciled = plan::reconcile(
 			SyncMode::TwoWay,
@@ -3765,6 +3827,7 @@ mod tests {
 			ignored_local: BTreeMap::new(),
 			ignored_remote: BTreeMap::new(),
 			ignore_blocked: BTreeSet::new(),
+			remote_rule_errors: Vec::new(),
 			confirmed: Vec::new(),
 			dirs: Vec::new(),
 			files: Vec::new(),
@@ -3833,6 +3896,7 @@ mod tests {
 			has_collisions: false,
 			held_paths: held.iter().map(|path| path.to_string()).collect(),
 			skipped,
+			ignored: BTreeMap::new(),
 		}
 	}
 
