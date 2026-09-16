@@ -17,9 +17,9 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, NodeKind},
+	baseline::{BaselineEntry, BaselineState, NodeKind, Tracked},
 	events::SyncEvent,
-	ignore::{IgnoreDecision, IgnoreRules},
+	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
@@ -330,6 +330,21 @@ pub(crate) struct RemoteView {
 	/// The top-most items the ignore rules hide, with the deciding rule. Neither they nor anything
 	/// under them is in `nodes` or `skipped`, or checked for collisions.
 	pub(crate) ignored: BTreeMap<String, IgnoreDecision>,
+	/// How many items only the BUILT-IN defaults hid with no baseline row at or under them — left
+	/// out of `ignored` for the reason [`LocalScan::ignored_default_untracked`](super::scan::LocalScan::ignored_default_untracked)
+	/// gives. Counted per item rather than per root, since it is logged and never reported.
+	pub(crate) ignored_default_untracked: usize,
+}
+
+/// The rules a view is filtered with, and the baseline that says which of their hits are roots.
+///
+/// The two travel together because neither answers alone: an ignored path is only a ROOT the pass
+/// records and untracks when a row sits at or under it, unless a level above the built-in defaults
+/// hid it (see [`Tracked`]). A view built with no filter has no ignored roots and needs no baseline.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewFilter<'a> {
+	pub(crate) rules: &'a IgnoreRules,
+	pub(crate) baseline: &'a HashMap<String, BaselineEntry>,
 }
 
 /// A remote item the snapshot holds that the view could not place at a path.
@@ -366,7 +381,7 @@ pub(crate) fn build_remote_view(
 	dirs: &[CacheableDir<'_>],
 	files: &[CacheableFile<'_>],
 	undecodable: &[UndecodableItem],
-	rules: Option<&IgnoreRules>,
+	filter: Option<ViewFilter<'_>>,
 ) -> RemoteView {
 	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
 		.iter()
@@ -381,8 +396,9 @@ pub(crate) fn build_remote_view(
 	// Shared by the closures below, which each ask about one path at a time.
 	let memo = RefCell::new(HashMap::new());
 	let hidden = |rel_path: &str, is_dir: bool| {
-		rules.is_some_and(|rules| {
-			rules
+		filter.is_some_and(|filter| {
+			filter
+				.rules
 				.ignored_root(rel_path, is_dir, &mut memo.borrow_mut())
 				.is_some()
 		})
@@ -450,6 +466,8 @@ pub(crate) fn build_remote_view(
 	let mut has_collisions = false;
 	let mut held_paths: BTreeSet<String> = BTreeSet::new();
 	let mut ignored = BTreeMap::new();
+	let mut ignored_default_untracked = 0usize;
+	let mut tracked = filter.map(|filter| Tracked::new(filter.baseline));
 
 	let mut insert = |rel_path: String, node: RemoteNode| {
 		// The engine's own directory comes before every rule, and is never reported as ignored.
@@ -457,13 +475,23 @@ pub(crate) fn build_remote_view(
 			return;
 		}
 		// Before the collision check, so ignored case-twins never refuse the pass.
-		if let Some(rules) = rules
-			&& let Some((ignored_root, decision)) = rules.ignored_root(
+		if let Some(filter) = filter
+			&& let Some((ignored_root, decision)) = filter.rules.ignored_root(
 				&rel_path,
 				node.kind == NodeKind::Dir,
 				&mut memo.borrow_mut(),
 			) {
-			if !ignored.contains_key(ignored_root) {
+			// A root the rules hid ABOVE this item is a directory; the item's own hit is a root of
+			// whatever kind the item is.
+			let root_is_dir = ignored_root != rel_path || node.kind == NodeKind::Dir;
+			// Hidden either way — but only a tracked default hit is a ROOT (see `Tracked`).
+			if decision.level == IgnoreLevel::Default
+				&& !tracked
+					.as_mut()
+					.is_some_and(|tracked| tracked.covers(ignored_root, root_is_dir))
+			{
+				ignored_default_untracked += 1;
+			} else if !ignored.contains_key(ignored_root) {
 				ignored.insert(ignored_root.to_owned(), decision);
 			}
 			return;
@@ -532,6 +560,7 @@ pub(crate) fn build_remote_view(
 		held_paths,
 		skipped: skipped.finish(),
 		ignored,
+		ignored_default_untracked,
 	}
 }
 
@@ -5419,6 +5448,71 @@ mod tests {
 		rules
 	}
 
+	/// The rule the local scan follows, on the remote side: a BUILT-IN default hit is a root only
+	/// where a row sits at or under it. The item is out of the view either way, so a `.DS_Store`
+	/// synced before the defaults existed keeps its row, its report line and its untracking, while
+	/// the ones nobody ever synced stop being carried as roots at all.
+	#[test]
+	fn a_default_rule_hit_on_the_remote_is_a_root_only_where_a_row_sits_at_or_under_it() {
+		let root = Uuid::new_v4();
+		let docs = remote_dir("docs", root);
+		let dirs = [docs.clone()];
+		let files = [
+			cacheable_file(root, ".DS_Store"),
+			cacheable_file(docs.uuid, ".DS_Store"),
+			cacheable_file(docs.uuid, "keep.txt"),
+		];
+		// No lines of its own: the built-in defaults are what hides a `.DS_Store`.
+		let rules = root_rules("");
+
+		let untracked = build_remote_view(
+			root,
+			&dirs,
+			&files,
+			&[],
+			Some(ViewFilter {
+				rules: &rules,
+				baseline: &HashMap::new(),
+			}),
+		);
+
+		let mut paths: Vec<&str> = untracked.nodes.keys().map(String::as_str).collect();
+		paths.sort_unstable();
+		assert_eq!(paths, ["docs", "docs/keep.txt"], "both are still hidden");
+		assert!(
+			untracked.ignored.is_empty(),
+			"nothing was synced at either, so neither is a root: {:?}",
+			untracked.ignored
+		);
+		assert_eq!(untracked.ignored_default_untracked, 2);
+
+		let baseline = HashMap::from([(
+			"docs/.DS_Store".to_string(),
+			base_file("docs/.DS_Store", Uuid::new_v4(), [7; 32]),
+		)]);
+
+		let tracked = build_remote_view(
+			root,
+			&dirs,
+			&files,
+			&[],
+			Some(ViewFilter {
+				rules: &rules,
+				baseline: &baseline,
+			}),
+		);
+
+		assert_eq!(
+			tracked.ignored.keys().collect::<Vec<_>>(),
+			vec!["docs/.DS_Store"],
+			"the one with a row is a root, and is reported and untracked as before"
+		);
+		assert_eq!(
+			tracked.ignored_default_untracked, 1,
+			"the root's own `.DS_Store` is still untracked"
+		);
+	}
+
 	/// An ignored item is left out of the view with everything under it, and only the top of each
 	/// ignored subtree is recorded. Ignored case-twins no longer refuse the pass, and an item the view
 	/// cannot place inside an ignored directory is not reported: it is out of sync, not unsyncable.
@@ -5446,7 +5540,16 @@ mod tests {
 		assert!(raw.ignored.is_empty());
 
 		let rules = root_rules("build/\n*.tmp");
-		let view = build_remote_view(root, &dirs, &files, &undecodables, Some(&rules));
+		let view = build_remote_view(
+			root,
+			&dirs,
+			&files,
+			&undecodables,
+			Some(ViewFilter {
+				rules: &rules,
+				baseline: &HashMap::new(),
+			}),
+		);
 		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
 		assert!(!view.has_collisions);
 		let by = |pattern: &str| IgnoreDecision {
@@ -5491,7 +5594,16 @@ mod tests {
 		assert_eq!(raw.nodes.len(), 3);
 		assert!(raw.nodes.contains_key(".filenignore"));
 
-		let view = build_remote_view(root, dirs, &files, &[], Some(&root_rules("*")));
+		let view = build_remote_view(
+			root,
+			dirs,
+			&files,
+			&[],
+			Some(ViewFilter {
+				rules: &root_rules("*"),
+				baseline: &HashMap::new(),
+			}),
+		);
 		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
 		assert_eq!(
 			view.ignored.keys().collect::<Vec<_>>(),

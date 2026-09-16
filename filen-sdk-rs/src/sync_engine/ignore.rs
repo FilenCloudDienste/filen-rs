@@ -868,6 +868,7 @@ mod tests {
 			held_paths: held.iter().map(|path| (*path).to_owned()).collect(),
 			skipped: Vec::new(),
 			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
 		}
 	}
 
