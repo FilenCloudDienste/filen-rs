@@ -27,6 +27,12 @@ mod mode;
 mod outcome;
 mod pause;
 mod plan;
+// The permanent per-phase cost probe, driven by `tests/sync_engine_probe.rs`. Gated on
+// `bench-internals` like `cache::bench_support`, and deliberately not on `cfg(test)`: the `tests/`
+// binary links the library compiled WITHOUT `cfg(test)`, so such a seam would be invisible to the
+// very file that drives it.
+#[cfg(feature = "bench-internals")]
+pub mod probe;
 mod scan;
 mod watch;
 

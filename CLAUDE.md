@@ -112,7 +112,7 @@ Test notes:
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
 | `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
-| `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
+| `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
 `filen-sdk-rs/web/ubrn.config.yaml`).

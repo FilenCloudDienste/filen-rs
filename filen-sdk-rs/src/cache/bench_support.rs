@@ -38,3 +38,21 @@ impl BenchCache {
 			.expect("bench checkpoint");
 	}
 }
+
+/// One sync root's cached subtree, read exactly as a sync pass reads it (the `ENUMERATE_SUBTREE`
+/// recursive CTE plus the hydration of every row).
+///
+/// The engine's own entrance, `Client::enumerate_sync_root_snapshot`, needs an authenticated
+/// client; this one needs only a populated DB file, which is what lets the sync-engine probe
+/// ([`sync_engine::probe`](crate::sync_engine::probe)) measure the one serial SQL step of every
+/// pass with no account and no network.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) fn snapshot(
+	path: &Path,
+	root: Uuid,
+) -> rusqlite::Result<super::enumerate::SubtreeSnapshot> {
+	super::enumerate::read_subtree_snapshot(path, root)
+}
