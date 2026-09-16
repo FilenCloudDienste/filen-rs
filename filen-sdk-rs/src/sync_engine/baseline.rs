@@ -106,6 +106,19 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 );
 ";
 
+/// The two statements [`BaselineStore::delete_subtrees`] runs per root: the row AT the path, and
+/// the rows UNDER it.
+///
+/// Two seeking statements rather than the one `substr(rel_path, 1, length(?2) + 1) = ?2 || '/'`
+/// predicate they replaced: a `substr` of the indexed column cannot seek, so that form scanned
+/// every row of the pair once per root — G × N per pass, the largest single term of a pass on a
+/// tree whose directories each hold a default-ignored file. The range is exact, not approximate:
+/// `/` is 0x2F and `0` is 0x30, and TEXT compares bytewise under the default BINARY collation, so
+/// `?2 || '/' < rel_path < ?2 || '0'` is precisely "under `?2`".
+const DELETE_AT_PATH: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
+const DELETE_UNDER_PATH: &str =
+	"DELETE FROM baseline WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
+
 /// `pending_writes.kind` discriminants — what the write did.
 const KIND_CREATED: i64 = 1;
 const KIND_MOVED: i64 = 2;
@@ -666,13 +679,11 @@ impl BaselineStore {
 	) -> rusqlite::Result<()> {
 		let tx = self.conn.unchecked_transaction()?;
 		{
-			// `substr` and `length` both count characters in TEXT, so the prefix test is exact.
-			let mut delete = self.conn.prepare(
-				"DELETE FROM baseline WHERE pair_id = ?1
-				 AND (rel_path = ?2 OR substr(rel_path, 1, length(?2) + 1) = ?2 || '/')",
-			)?;
+			let mut delete_root = self.conn.prepare(DELETE_AT_PATH)?;
+			let mut delete_under = self.conn.prepare(DELETE_UNDER_PATH)?;
 			for root in roots {
-				delete.execute(params![pair, root])?;
+				delete_root.execute(params![pair, root])?;
+				delete_under.execute(params![pair, root])?;
 			}
 		}
 		tx.commit()
@@ -1375,7 +1386,7 @@ mod tests {
 		let (other, _) = store
 			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
-		for rel in ["docs", "docs/sub", "ä", "other.txt"] {
+		for rel in ["docs", "docs/sub", "ä", "other.txt", "a", "a/b"] {
 			store.upsert_entry(pair, &dir_entry(rel)).unwrap();
 		}
 		for rel in [
@@ -1385,6 +1396,13 @@ mod tests {
 			"docs.txt",
 			"ä/b.txt",
 			"äb.txt",
+			// The neighbours of the subtree range: `.` (0x2E) sorts just below the `/` the range
+			// starts at and `0` (0x30) just above it, so a range that is off by one byte at either
+			// end takes one of these with it.
+			"a/b/c",
+			"ab",
+			"a0",
+			"a.",
 		] {
 			store
 				.upsert_entry(pair, &file_entry(rel, [1u8; 32], 1))
@@ -1393,7 +1411,10 @@ mod tests {
 		store.upsert_entry(other, &dir_entry("docs")).unwrap();
 
 		store
-			.delete_subtrees(pair, &BTreeSet::from(["docs".to_string(), "ä".to_string()]))
+			.delete_subtrees(
+				pair,
+				&BTreeSet::from(["docs".to_string(), "ä".to_string(), "a".to_string()]),
+			)
 			.unwrap();
 		assert_eq!(
 			store
@@ -1402,12 +1423,51 @@ mod tests {
 				.iter()
 				.map(|e| e.rel_path.as_str())
 				.collect::<Vec<_>>(),
-			vec!["docs.txt", "docsx", "other.txt", "äb.txt"]
+			vec!["a.", "a0", "ab", "docs.txt", "docsx", "other.txt", "äb.txt"]
 		);
 		assert!(
 			store.entry(other, "docs").unwrap().is_some(),
 			"another pair's rows stay"
 		);
+	}
+
+	/// Both statements must SEEK the primary-key index, and the plan has to name the columns they
+	/// seek on.
+	///
+	/// `SEARCH baseline USING INDEX sqlite_autoindex_baseline_1 (pair_id=?)` — no `rel_path` term —
+	/// is what an unsargable predicate produces: a walk of every index entry of the pair, with no
+	/// `SCAN` step to give it away. The `substr` form these replaced plans exactly that, so
+	/// asserting only "SEARCH, and not SCAN" passes for the very shape this guards against.
+	#[test]
+	fn the_subtree_delete_seeks_the_index_instead_of_scanning_the_pair() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let assert_seeks = |sql: &str, args: &[&dyn rusqlite::ToSql], seek: &str| {
+			let plan: Vec<String> = store
+				.conn
+				.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+				.unwrap()
+				.query_map(args, |row| row.get("detail"))
+				.unwrap()
+				.collect::<rusqlite::Result<_>>()
+				.unwrap();
+			assert!(
+				// A DELETE reports the same seek as `SEARCH ... USING COVERING INDEX ...`.
+				plan.iter()
+					.any(|step| step.starts_with("SEARCH baseline USING")
+						&& step.contains("sqlite_autoindex_baseline_1")
+						&& step.contains(seek)),
+				"{sql}\nmust seek on {seek}: {plan:?}"
+			);
+			assert!(
+				!plan.iter().any(|step| step.contains("SCAN")),
+				"{sql}\nstill scans: {plan:?}"
+			);
+		};
+		let at_path = "(pair_id=? AND rel_path=?)";
+		let under_path = "(pair_id=? AND rel_path>? AND rel_path<?)";
+
+		assert_seeks(DELETE_AT_PATH, &[&1_i64, &"docs"], at_path);
+		assert_seeks(DELETE_UNDER_PATH, &[&1_i64, &"docs"], under_path);
 	}
 
 	#[test]

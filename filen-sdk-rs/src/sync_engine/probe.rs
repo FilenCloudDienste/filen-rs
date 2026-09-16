@@ -20,7 +20,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{HashMap, HashSet},
+	collections::{BTreeSet, HashMap, HashSet},
 	fmt::Write as _,
 	fs,
 	path::{Path, PathBuf},
@@ -715,6 +715,29 @@ pub fn run() -> String {
 			"{actions} actions; baseline read + snapshot + both views + warm scan + fold + \
 			 reconcile, no network and no apply"
 		),
+	);
+
+	// What `untrack_ignored` pays per pass at the shape the built-in rules produce on macOS: a
+	// `.DS_Store` root per synced directory, so G = D and not one of them matches a row. Measured
+	// after the pass phases because it is the pass's last step.
+	let roots: BTreeSet<String> = store
+		.entries(pair)
+		.expect("reading the baseline")
+		.into_iter()
+		.filter(|entry| entry.kind == NodeKind::Dir)
+		.map(|entry| format!("{}/.DS_Store", entry.rel_path))
+		.collect();
+	let root_count = roots.len();
+	let (_, untrack) = timed(|| {
+		store
+			.delete_subtrees(pair, &roots)
+			.expect("untracking the ignored roots")
+	});
+	probe.record(
+		"untrack_ignored",
+		root_count,
+		untrack,
+		"delete_subtrees, one untracked .DS_Store root per synced directory (G = D), no row hit",
 	);
 
 	drop(store);
