@@ -337,20 +337,12 @@ pub(super) async fn apply(
 		snapshot: ctx.files.iter().map(|f| (f.uuid, f)).collect(),
 		fetched: HashMap::new(),
 	};
-	let dir_by_uuid: HashMap<Uuid, &CacheableDir<'static>> =
-		ctx.dirs.iter().map(|d| (d.uuid, d)).collect();
-
-	// path -> remote directory, for resolving the parent of an item. Seeded with the root at "" and
-	// every existing remote dir; new dirs are added as they are created.
+	// path -> remote directory, for resolving the parent of an item. Seeded with the root at "";
+	// [`resolve_folded_objects`] adds the ones this plan actually names, and a new dir joins as it
+	// is created. Building one for every directory of the tree up front was a `RemoteDirectory`
+	// clone per directory — tens of thousands of them on a large pair — to answer a few lookups.
 	let mut dir_by_path: HashMap<String, RemoteDirectory> = HashMap::new();
 	dir_by_path.insert(String::new(), ctx.root_remote.clone());
-	for (path, node) in ctx.remote {
-		if node.kind == NodeKind::Dir
-			&& let Some(cacheable) = dir_by_uuid.get(&node.remote_uuid)
-		{
-			dir_by_path.insert(path.clone(), RemoteDirectory::from((*cacheable).clone()));
-		}
-	}
 	resolve_folded_objects(&ctx, &actions, &mut files, &mut dir_by_path).await;
 
 	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
@@ -958,6 +950,10 @@ impl RemoteFiles<'_> {
 /// (it minted them), and only the few the plan actually touches are fetched. One that cannot be
 /// fetched is left out: its own action then fails and the pass carries on, exactly as it did when
 /// the snapshot entry was missing.
+///
+/// Directories the snapshot DOES describe are built from its rows here, for the same handful of
+/// paths, which is why every parent lookup in the apply below is a path this function was asked
+/// about: the parent of an upload or a create, the target of a trash, and both ends of a move.
 async fn resolve_folded_objects(
 	ctx: &ApplyContext<'_>,
 	actions: &[SyncAction],
@@ -1020,12 +1016,18 @@ async fn resolve_folded_objects(
 			),
 		}
 	}
-	for path in wanted_dirs {
-		// A directory this very pass creates is filled in as it goes, and one the snapshot has is
-		// already there; only a folded one is both in the view and missing here.
-		if dir_by_path.contains_key(path) {
-			continue;
-		}
+	// What the plan names and this map has not got: the root is in it already, and a directory
+	// this very pass creates is filled in as it goes.
+	let missing: Vec<&str> = wanted_dirs
+		.into_iter()
+		.filter(|path| !dir_by_path.contains_key(*path))
+		.collect();
+	if missing.is_empty() {
+		return;
+	}
+	let dir_by_uuid: HashMap<Uuid, &CacheableDir<'static>> =
+		ctx.dirs.iter().map(|d| (d.uuid, d)).collect();
+	for path in missing {
 		let Some(node) = ctx
 			.remote
 			.get(path)
@@ -1033,6 +1035,14 @@ async fn resolve_folded_objects(
 		else {
 			continue;
 		};
+		// The snapshot described this one, so there is nothing to ask the server for.
+		if let Some(cacheable) = dir_by_uuid.get(&node.remote_uuid) {
+			dir_by_path.insert(
+				path.to_string(),
+				RemoteDirectory::from((*cacheable).clone()),
+			);
+			continue;
+		}
 		match ctx.client.get_dir(node.remote_uuid).await {
 			Ok(dir) => {
 				dir_by_path.insert(path.to_string(), dir);
