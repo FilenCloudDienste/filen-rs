@@ -336,18 +336,6 @@ fn corrupt(what: &str, value: i64) -> rusqlite::Error {
 	)
 }
 
-fn hash_from_blob(bytes: Vec<u8>) -> rusqlite::Result<Blake3Hash> {
-	<[u8; 32]>::try_from(bytes.as_slice())
-		.map(Blake3Hash::from)
-		.map_err(|_| {
-			rusqlite::Error::FromSqlConversionFailure(
-				0,
-				Type::Blob,
-				format!("content_hash blob is {} bytes, expected 32", bytes.len()).into(),
-			)
-		})
-}
-
 /// Whether the DB has never been written to — no table of ours, and none of anybody else's. That,
 /// not `user_version`, is what tells a brand-new file apart from a DB stamped at a version this
 /// build does not know: version 0 is both "SQLite's default for an empty file" and "stamped by
@@ -914,18 +902,17 @@ impl BaselineStore {
 	fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<BaselineEntry> {
 		let kind_raw: i64 = row.get("kind")?;
 		let state_raw: i64 = row.get("state")?;
-		let content_hash = row
-			.get::<_, Option<Vec<u8>>>("content_hash")?
-			.map(hash_from_blob)
-			.transpose()?;
-		let remote_hash = row
-			.get::<_, Option<Vec<u8>>>("remote_hash")?
-			.map(hash_from_blob)
-			.transpose()?;
-		let agreed_hash = row
-			.get::<_, Option<Vec<u8>>>("agreed_hash")?
-			.map(hash_from_blob)
-			.transpose()?;
+		// Straight into the fixed-size array rusqlite decodes blobs into — no `Vec` per hash, and a
+		// blob of the wrong length is refused by the column read itself rather than by a check of
+		// ours. Three of these per row, on every row of every pass's baseline read.
+		let hash = |column| -> rusqlite::Result<Option<Blake3Hash>> {
+			Ok(row
+				.get::<_, Option<[u8; 32]>>(column)?
+				.map(Blake3Hash::from))
+		};
+		let content_hash = hash("content_hash")?;
+		let remote_hash = hash("remote_hash")?;
+		let agreed_hash = hash("agreed_hash")?;
 		let side_kind = |raw: Option<i64>| match raw {
 			None => Ok(None),
 			Some(raw) => NodeKind::from_i64(raw)
