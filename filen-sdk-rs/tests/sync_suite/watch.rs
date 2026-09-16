@@ -1238,6 +1238,7 @@ async fn watch_user_ignore_wakes_a_running_loop() {
 		Some(&IgnoredPath {
 			rel_path: "art.psd".to_string(),
 			level: IgnoreLevel::User,
+			pattern: "*.psd".to_string(),
 			tracked: true,
 		}),
 		"the pass the wake-up started must report what it stopped tracking"
