@@ -798,11 +798,22 @@ impl BaselineStore {
 
 	/// Forget `rel_path`'s failure streak — it succeeded, or the caller asked for a retry.
 	pub(crate) fn clear_failure(&self, pair: PairId, rel_path: &str) -> rusqlite::Result<()> {
-		self.conn.execute(
-			"DELETE FROM path_failures WHERE pair_id = ?1 AND rel_path = ?2",
-			params![pair, rel_path],
-		)?;
-		Ok(())
+		self.clear_failures(pair, std::slice::from_ref(&rel_path))
+	}
+
+	/// Forget the failure streaks of every path in `rel_paths`, in ONE transaction: a pass clears
+	/// one per path it applied, and each on its own is a commit of its own.
+	pub(crate) fn clear_failures(&self, pair: PairId, rel_paths: &[&str]) -> rusqlite::Result<()> {
+		let tx = self.conn.unchecked_transaction()?;
+		{
+			let mut clear = self
+				.conn
+				.prepare("DELETE FROM path_failures WHERE pair_id = ?1 AND rel_path = ?2")?;
+			for rel_path in rel_paths {
+				clear.execute(params![pair, rel_path])?;
+			}
+		}
+		tx.commit()
 	}
 
 	/// Every path under `pair` with a live failure streak, by `rel_path`.
@@ -832,13 +843,16 @@ impl BaselineStore {
 	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace
 	/// window ran out).
 	pub(crate) fn delete_pending(&self, uuids: &[Uuid]) -> rusqlite::Result<()> {
-		let mut stmt = self
-			.conn
-			.prepare("DELETE FROM pending_writes WHERE uuid = ?1")?;
-		for uuid in uuids {
-			stmt.execute(params![uuid])?;
+		let tx = self.conn.unchecked_transaction()?;
+		{
+			let mut stmt = self
+				.conn
+				.prepare("DELETE FROM pending_writes WHERE uuid = ?1")?;
+			for uuid in uuids {
+				stmt.execute(params![uuid])?;
+			}
 		}
-		Ok(())
+		tx.commit()
 	}
 
 	/// The journal a previous engine left behind, minus the rows no engine may act on any more —
@@ -1326,6 +1340,67 @@ mod tests {
 	/// is in when its pair is removed, so that pass still writes baseline and journal rows keyed by
 	/// the old id: with the id reused, they land in the successor — whose first sync is supposed to
 	/// see an EMPTY baseline — instead of failing against a pair that is gone.
+	/// Clearing a pass's applied paths in one go has to write what clearing them one at a time
+	/// wrote: those streaks and no others, a path with no streak still a no-op.
+	#[test]
+	fn clearing_several_paths_at_once_leaves_every_other_streak_alone() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for path in ["a.txt", "b.txt", "c.txt"] {
+			store.record_failure(pair, path, "boom", 1_000).unwrap();
+			store.record_failure(other, path, "boom", 1_000).unwrap();
+		}
+
+		store
+			.clear_failures(pair, &["a.txt", "c.txt", "never-failed.txt"])
+			.unwrap();
+		assert_eq!(
+			store
+				.failures(pair)
+				.unwrap()
+				.into_keys()
+				.collect::<BTreeSet<_>>(),
+			BTreeSet::from(["b.txt".to_string()])
+		);
+		assert_eq!(
+			store.failures(other).unwrap().len(),
+			3,
+			"another pair's streaks are not this pair's to clear"
+		);
+	}
+
+	/// Retiring a batch of journal rows retires exactly the named ones.
+	#[test]
+	fn delete_pending_retires_exactly_the_named_writes() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let uuids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+		for uuid in &uuids {
+			store
+				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[])
+				.unwrap();
+		}
+
+		store.delete_pending(&uuids[..3]).unwrap();
+		assert_eq!(pending_count(&store), 1);
+		assert_eq!(
+			store
+				.load_pending(NOW, GRACE)
+				.unwrap()
+				.iter()
+				.map(|row| row.uuid)
+				.collect::<Vec<_>>(),
+			vec![uuids[3]]
+		);
+	}
+
 	#[test]
 	fn a_removed_pairs_id_is_never_handed_to_a_later_pair() {
 		let store = BaselineStore::open_in_memory().unwrap();
