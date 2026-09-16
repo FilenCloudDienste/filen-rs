@@ -4507,6 +4507,44 @@ mod tests {
 		assert!(plan(SyncMode::LocalBackup, &adopted, &local, &remote).is_empty());
 	}
 
+	/// The re-seed adopts only from the sides it is handed, and `reconfigure_pair` hands it the two a
+	/// pass reads — the FILTERED scan and view (pinned live by MODE-22c) — so an ignored path is at
+	/// neither of them and nothing is adopted there, tracked or not. Were it adopted, the copy
+	/// the rule hides would become an intended one, and the mirror would keep it for good instead of
+	/// syncing the path like a first sync once the rule goes.
+	#[test]
+	fn the_reseed_adopts_nothing_at_an_ignored_path() {
+		let (hidden, theirs) = (Uuid::new_v4(), Uuid::new_v4());
+		// `secret.psd` was synced before a rule hid it; `theirs.psd` is a destination-only copy the
+		// same rule hides. Neither is in the filtered sides the pass hands the re-seed.
+		let baseline = map(vec![(
+			"secret.psd",
+			base_file("secret.psd", hidden, [1; 32]),
+		)]);
+		let (local, remote) = (map(vec![]), map(vec![]));
+		for mode in [
+			SyncMode::LocalToRemote,
+			SyncMode::RemoteToLocal,
+			SyncMode::TwoWay,
+			SyncMode::LocalBackup,
+			SyncMode::RemoteBackup,
+		] {
+			let rows = adopt_destination_rows(mode, &baseline, &local, &remote);
+			assert!(rows.is_empty(), "{mode:?}: {rows:?}");
+		}
+
+		// The same switch on sides nothing hides: both copies ARE adopted, so it is the filtering
+		// that decides, not the shape of the pair.
+		let unfiltered = map(vec![
+			("secret.psd", remote_file("secret.psd", hidden, [1; 32])),
+			("theirs.psd", remote_file("theirs.psd", theirs, [2; 32])),
+		]);
+		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &unfiltered);
+		let mut adopted: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
+		adopted.sort_unstable();
+		assert_eq!(adopted, vec!["secret.psd", "theirs.psd"]);
+	}
+
 	/// TwoWay has no destination to spare: the adopted copy reads as newly created on the side that
 	/// still holds it and flows back to the other one.
 	#[test]

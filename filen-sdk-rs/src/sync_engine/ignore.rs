@@ -676,6 +676,25 @@ mod tests {
 		);
 	}
 
+	/// The user level is all or nothing, unlike a `.filenignore`: one bad line refuses the whole text,
+	/// naming it, so what the engine stores is exactly what applies.
+	#[test]
+	fn a_bad_line_refuses_the_whole_user_level() {
+		let error = parse_user_ignore("*.psd\n[z-a]\n!keep.psd\n")
+			.expect_err("a bad line refuses the whole text");
+		assert_eq!(error.line, Some(2));
+		assert!(
+			error.to_string().starts_with("user ignore patterns:2: "),
+			"{error}"
+		);
+
+		let rules = IgnoreRules::new(Some(
+			parse_user_ignore("*.psd\n!keep.psd\n").expect("a clean text compiles"),
+		));
+		assert!(ignored(&rules, "a.psd", F));
+		assert!(!ignored(&rules, "keep.psd", F));
+	}
+
 	#[test]
 	fn memo_serves_later_paths_under_an_ignored_directory() {
 		let rules = root_rules("build/");

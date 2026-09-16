@@ -937,3 +937,380 @@ async fn filter_hiding_everything_is_not_an_emptied_remote() {
 
 	sc.cleanup();
 }
+
+// ===========================================================================
+// Un-ignoring in the one-way modes
+// ===========================================================================
+
+/// Removing a rule in a pushing mirror syncs the path like a first sync: the source overwrites the
+/// destination's copy of a file both sides hold, while the destination-only file the rule hid is
+/// reported as a held deletion and trashed only once the deletion is approved.
+#[shared_test_runtime]
+async fn filter_unignore_local_to_remote_holds_the_destination_deletion() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "keep.txt", b"tracked");
+	write_file(&sc.local, "assets/photo.bin", b"v1");
+	let seed = sc.sync().await;
+	clean(&seed);
+	assert_eq!(seed.uploaded, 2, "{seed:?}");
+
+	write_file(&sc.local, ".filenignore", b"assets/\n");
+	let untracking = sc.sync().await;
+	clean(&untracking);
+	assert_eq!(untracking.ignored, vec![by_root_file("assets", true)]);
+	assert_eq!(untracking.remotely_trashed, 0, "{untracking:?}");
+
+	// Another client changes the destination while the rule hides it: an edit of the file this
+	// device still holds, and a file only the remote has.
+	let assets = remote_dir_at(&sc, "assets").await;
+	let destination_copy =
+		upload_remote(&sc.cache, &assets, "photo.bin", b"v2 from the remote").await;
+	upload_remote(&sc.cache, &assets, "extra.bin", b"another client's").await;
+	let ignored = sc.sync().await;
+	clean(&ignored);
+	assert_eq!(
+		(ignored.uploaded, ignored.remotely_trashed),
+		(0, 0),
+		"an ignored path was synced: {ignored:?}"
+	);
+	assert_eq!(ignored.ignored, vec![by_root_file("assets", false)]);
+
+	write_file(&sc.local, ".filenignore", b"# nothing ignored\n");
+	let unignored = sc.sync().await;
+	clean(&unignored);
+	assert!(unignored.ignored.is_empty(), "{unignored:?}");
+	assert_eq!(
+		unignored.uploaded, 2,
+		"the edited .filenignore and the source's own copy of photo.bin: {unignored:?}"
+	);
+	assert!(
+		matches!(
+			unignored.guard,
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+		),
+		"{unignored:?}"
+	);
+	assert_eq!(unignored.remotely_trashed, 0, "{unignored:?}");
+	assert_eq!(
+		remote_bytes(&sc, "assets/photo.bin").await,
+		b"v1",
+		"the source overwrites the destination's copy"
+	);
+	// Overwrites it, never destroys it: the edit this device never saw is still on the path's version
+	// chain, which is what makes a one-way overwrite of an unseen copy safe to do unasked.
+	let head = remote_tree(&sc.cache.client, &sc.resources.dir)
+		.await
+		.remove("assets/photo.bin")
+		.flatten()
+		.expect("no remote file at assets/photo.bin");
+	let versions = sc.cache.client.list_file_versions(&head).await.unwrap();
+	assert!(
+		versions.iter().any(|v| v.uuid() == destination_copy.uuid()),
+		"the destination's copy did not survive as a server version: {versions:?}"
+	);
+
+	let held = sc.sync().await;
+	clean(&held);
+	assert_eq!(
+		held.remotely_trashed, 0,
+		"the hold stands until it is approved: {held:?}"
+	);
+	let token = held.deletion_token.expect("the deletion is still held");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let approved = sc.sync().await;
+	clean(&approved);
+	assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&[".filenignore", "assets", "assets/photo.bin", "keep.txt"])
+	);
+
+	sc.cleanup();
+}
+
+/// The mirror image in a pulling mirror: the remote copy overwrites the local one, whose bytes are
+/// quarantined first, and the local-only file the rule hid survives until the held deletion is
+/// approved. The rules come from the remote copies here, so the rule file is edited there.
+#[shared_test_runtime]
+async fn filter_unignore_remote_to_local_holds_the_destination_deletion() {
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	upload_remote(&sc.cache, &sc.resources.dir, "keep.txt", b"tracked").await;
+	let assets = create_remote_dir(&sc.cache, &sc.resources.dir, "assets").await;
+	upload_remote(&sc.cache, &assets, "photo.bin", b"v1").await;
+	let seed = sc.sync().await;
+	clean(&seed);
+	assert_eq!(seed.downloaded, 2, "{seed:?}");
+
+	upload_remote(&sc.cache, &sc.resources.dir, ".filenignore", b"assets/\n").await;
+	let untracking = sc.sync().await;
+	clean(&untracking);
+	assert_eq!(
+		untracking.downloaded, 1,
+		"only .filenignore downloads: {untracking:?}"
+	);
+	assert_eq!(untracking.ignored, vec![by_root_file("assets", true)]);
+	assert_eq!(untracking.locally_deleted, 0, "{untracking:?}");
+
+	// The destination changes while the rule hides it: an edit of the file the remote still holds,
+	// and a file only this device has.
+	write_file(&sc.local, "assets/photo.bin", b"edited here");
+	write_file(&sc.local, "assets/extra.bin", b"made here");
+	let ignored = sc.sync().await;
+	clean(&ignored);
+	assert_eq!(
+		(ignored.downloaded, ignored.locally_deleted),
+		(0, 0),
+		"an ignored path was synced: {ignored:?}"
+	);
+	assert_eq!(ignored.ignored, vec![by_root_file("assets", false)]);
+
+	upload_remote(
+		&sc.cache,
+		&sc.resources.dir,
+		".filenignore",
+		b"# nothing ignored\n",
+	)
+	.await;
+	let unignored = sc.sync().await;
+	clean(&unignored);
+	assert!(unignored.ignored.is_empty(), "{unignored:?}");
+	assert_eq!(
+		unignored.downloaded, 2,
+		"the edited .filenignore and the source's own copy of photo.bin: {unignored:?}"
+	);
+	assert!(
+		matches!(
+			unignored.guard,
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+		),
+		"{unignored:?}"
+	);
+	assert_eq!(unignored.locally_deleted, 0, "{unignored:?}");
+	assert!(
+		read_eq(&sc.local, "assets/photo.bin", b"v1"),
+		"the source overwrites the destination's copy"
+	);
+	assert!(
+		bytes_recoverable_anywhere(&sc.local, b"edited here"),
+		"the local copy was destroyed rather than quarantined"
+	);
+
+	let held = sc.sync().await;
+	clean(&held);
+	assert_eq!(
+		held.locally_deleted, 0,
+		"the hold stands until it is approved: {held:?}"
+	);
+	let token = held.deletion_token.expect("the deletion is still held");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let approved = sc.sync().await;
+	clean(&approved);
+	assert_eq!(approved.locally_deleted, 1, "{approved:?}");
+	assert!(!sc.local.join("assets/extra.bin").exists());
+	assert!(
+		bytes_recoverable_anywhere(&sc.local, b"made here"),
+		"the deleted copy is recoverable"
+	);
+
+	sc.cleanup();
+}
+
+// ===========================================================================
+// Rules that cannot be read
+// ===========================================================================
+
+/// A `.filenignore` this process cannot read blocks its directory for the pass: nothing under it is
+/// uploaded, trashed or quarantined, and the error is reported. The scan still completed, so a
+/// deletion elsewhere is propagated rather than held for approval. The next pass recovers once the
+/// file can be read again.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn filter_unreadable_local_filenignore_blocks_its_directory() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "gone.txt", b"deleted later");
+	write_file(&sc.local, "locked/.filenignore", b"*.tmp\n");
+	write_file(&sc.local, "locked/a.txt", b"synced before");
+	let seed = sc.sync().await;
+	clean(&seed);
+	assert_eq!(seed.uploaded, 3, "{seed:?}");
+
+	let rules = sc.local.join("locked/.filenignore");
+	std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o000)).unwrap();
+	write_file(&sc.local, "locked/b.txt", b"written while blocked");
+	std::fs::remove_file(sc.local.join("locked/a.txt")).unwrap();
+	std::fs::remove_file(sc.local.join("gone.txt")).unwrap();
+
+	let blocked = sc.sync().await;
+	std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o644)).unwrap();
+	assert!(blocked.refused.is_none(), "{blocked:?}");
+	assert_eq!(blocked.errors.len(), 1, "{blocked:?}");
+	assert!(
+		blocked.errors[0].starts_with("local scan: locked/.filenignore: "),
+		"{blocked:?}"
+	);
+	assert_eq!(
+		(
+			blocked.uploaded,
+			blocked.downloaded,
+			blocked.locally_deleted
+		),
+		(0, 0, 0),
+		"nothing under rules that could not be read may sync: {blocked:?}"
+	);
+	assert!(
+		read_eq(&sc.local, "locked/b.txt", b"written while blocked"),
+		"a file under rules that could not be read was rewritten: {blocked:?}"
+	);
+	assert!(
+		!sc.local.join(".filen-sync-trash").exists(),
+		"nothing under rules that could not be read may be quarantined: {blocked:?}"
+	);
+	assert!(
+		blocked.ignored.is_empty(),
+		"rules that could not be read hide nothing: {blocked:?}"
+	);
+	assert!(
+		blocked.guard.is_none(),
+		"the scan completed, so the deletion outside is not held: {blocked:?}"
+	);
+	assert_eq!(blocked.remotely_trashed, 1, "{blocked:?}");
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["locked", "locked/.filenignore", "locked/a.txt"])
+	);
+
+	let recovered = sc.sync().await;
+	clean(&recovered);
+	assert_eq!(
+		recovered.uploaded, 1,
+		"b.txt uploads once the rules read: {recovered:?}"
+	);
+	assert_eq!(
+		recovered.remotely_trashed, 1,
+		"and the local deletion under them propagates: {recovered:?}"
+	);
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["locked", "locked/.filenignore", "locked/b.txt"])
+	);
+
+	sc.cleanup();
+}
+
+/// A remote `.filenignore` the engine refuses — one over the size cap, one that is not UTF-8 —
+/// blocks its directory the same way: nothing under it is downloaded, the local copy it might have
+/// covered is neither deleted nor quarantined, and each is reported. Replacing the body with a
+/// usable one lets the next pass through.
+#[shared_test_runtime]
+async fn filter_unusable_remote_filenignore_blocks_its_directory() {
+	// One byte past the engine's 1 MiB cap, which is refused without being downloaded at all.
+	const OVER_CAP: usize = 1024 * 1024 + 1;
+
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	upload_remote(&sc.cache, &sc.resources.dir, "keep.txt", b"pulled").await;
+	let huge = create_remote_dir(&sc.cache, &sc.resources.dir, "huge").await;
+	upload_remote(&sc.cache, &huge, ".filenignore", &vec![b'#'; OVER_CAP]).await;
+	upload_remote(&sc.cache, &huge, "a.txt", b"under unusable rules").await;
+	let binary = create_remote_dir(&sc.cache, &sc.resources.dir, "binary").await;
+	upload_remote(&sc.cache, &binary, ".filenignore", &[0xff]).await;
+	upload_remote(&sc.cache, &binary, "b.txt", b"under unusable rules").await;
+	// A local file under one of them: a pulling mirror would delete it, and must not while the rules
+	// that might cover it cannot be read.
+	write_file(&sc.local, "huge/mine.txt", b"only here");
+
+	let blocked = sc.sync().await;
+	assert!(blocked.refused.is_none(), "{blocked:?}");
+	assert_eq!(blocked.errors.len(), 2, "{blocked:?}");
+	// The whole line, not the prefix: a rule file that merely failed to download reports under the
+	// same prefix, so a flaky fetch would otherwise stand in for the bodies this test staged.
+	for (dir, reason) in [
+		("binary", "not valid UTF-8, not read"),
+		("huge", "larger than 1048576 bytes, not read"),
+	] {
+		let expected = format!("remote {dir}/.filenignore: {reason}");
+		assert!(
+			blocked.errors.contains(&expected),
+			"{expected}: {blocked:?}"
+		);
+	}
+	assert_eq!(
+		blocked.downloaded, 1,
+		"only keep.txt, which is outside both: {blocked:?}"
+	);
+	assert_eq!(blocked.locally_deleted, 0, "{blocked:?}");
+	assert!(read_eq(&sc.local, "keep.txt", b"pulled"));
+	assert!(
+		read_eq(&sc.local, "huge/mine.txt", b"only here"),
+		"a local file under rules that could not be read was touched"
+	);
+	assert!(
+		!sc.local.join("binary").exists(),
+		"a blocked directory is not created locally"
+	);
+
+	for dir in [&huge, &binary] {
+		upload_remote(&sc.cache, dir, ".filenignore", b"*.tmp\n").await;
+	}
+	let recovered = sc.sync().await;
+	clean(&recovered);
+	assert_eq!(
+		recovered.downloaded, 4,
+		"both rule files and both files under them: {recovered:?}"
+	);
+	assert_eq!(
+		recovered.locally_deleted, 1,
+		"the local-only file is mirrored away once the rules read: {recovered:?}"
+	);
+	assert!(bytes_recoverable_anywhere(&sc.local, b"only here"));
+	assert!(read_eq(&sc.local, "huge/a.txt", b"under unusable rules"));
+	assert!(read_eq(&sc.local, "binary/b.txt", b"under unusable rules"));
+
+	sc.cleanup();
+}
+
+/// A user text with a bad line is refused whole, naming the line: the stored patterns stay exactly
+/// as they were and the pair goes on using them, rather than applying the refused text in part.
+#[shared_test_runtime]
+async fn filter_invalid_user_ignore_keeps_the_stored_patterns() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	sc.engine.set_user_ignore("*.psd").await.unwrap();
+	write_file(&sc.local, "a.psd", b"layers");
+	write_file(&sc.local, "b.txt", b"text");
+	let first = sc.sync().await;
+	clean(&first);
+	assert_eq!(first.uploaded, 1, "{first:?}");
+
+	let error = sc
+		.engine
+		.set_user_ignore("!keep.psd\n[z-a]\n")
+		.await
+		.expect_err("a text with a bad line must be refused")
+		.to_string();
+	assert!(
+		error.contains("user ignore patterns:2: "),
+		"the refusal names the first bad line: {error}"
+	);
+	assert_eq!(
+		sc.engine.user_ignore().await.unwrap(),
+		"*.psd",
+		"a refused text must not be stored"
+	);
+
+	// `keep.psd` is what the refused text's first line would have re-included.
+	write_file(&sc.local, "c.psd", b"more layers");
+	write_file(&sc.local, "keep.psd", b"re-included by the refused text");
+	let second = sc.sync().await;
+	clean(&second);
+	assert_eq!(
+		second.uploaded, 0,
+		"the previously stored patterns still apply: {second:?}"
+	);
+	assert_eq!(
+		remote_paths(&sc.cache.client, &sc.resources.dir).await,
+		paths(&["b.txt"])
+	);
+
+	sc.cleanup();
+}
