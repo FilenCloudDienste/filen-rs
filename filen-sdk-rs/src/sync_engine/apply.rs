@@ -881,53 +881,23 @@ fn holds_key_at_or_under(keys: &BTreeSet<String>, rel_path: &str) -> bool {
 		.is_some_and(|next| next.starts_with(&prefix))
 }
 
-/// The rows of a moved directory's subtree as the store holds them NOW, each as `(the path the store
-/// has it under, the row re-keyed from `from` to `to`)`.
-///
-/// Read from the store, not from the pass's baseline: the plan re-keyed that one for every directory
-/// move of the pass at once (see [`plan::fold_dir_moves`](super::plan)), so for a move with another
-/// nested inside it, it already names the inner directory by the path the INNER move gives it. Taken
-/// from the store, each move commits its own step only, and an inner move that then fails leaves the
-/// rows where the directory really is.
-fn moved_rows(
-	store: &BaselineStore,
-	pair: PairId,
-	from: &str,
-	to: &str,
-) -> rusqlite::Result<Vec<(String, BaselineEntry)>> {
-	Ok(store
-		.entries(pair)?
-		.into_iter()
-		.filter(|row| row.rel_path == from || is_under(&row.rel_path, from))
-		.map(|mut row| {
-			let moved = format!("{to}{}", &row.rel_path[from.len()..]);
-			(std::mem::replace(&mut row.rel_path, moved), row)
-		})
-		.collect())
-}
-
-/// The baseline edits that move `rows` (see [`moved_rows`]) to their new paths: every delete before
-/// any upsert, so no row is written and then deleted under a path two spellings share.
-fn rename_changes(rows: &[(String, BaselineEntry)]) -> Vec<BaselineChange<'_>> {
-	let deletes = rows.iter().map(|(old, _)| BaselineChange::Delete(old));
-	let upserts = rows.iter().map(|(_, row)| BaselineChange::Upsert(row));
-	deletes.chain(upserts).collect()
-}
-
 /// Journal a remote directory move from `from` to `to` and carry its subtree's rows along, in one
 /// transaction.
+///
+/// The rows are re-keyed where they lie, from what the STORE holds rather than from the pass's
+/// baseline — see [`BaselineChange::MoveSubtree`] for why that difference matters to a move with
+/// another nested inside it.
 async fn commit_dir_move(
 	ctx: &ApplyContext<'_>,
 	uuid: Uuid,
 	from: &str,
 	to: &str,
 ) -> Result<(), crate::Error> {
-	let rows = moved_rows(&*ctx.store.lock().await, ctx.pair, from, to).map_err(db_err)?;
 	let kind = PendingKind::Moved {
 		from: from.to_string(),
 		to: to.to_string(),
 	};
-	commit_remote_write(ctx, uuid, kind, &rename_changes(&rows)).await
+	commit_remote_write(ctx, uuid, kind, &[BaselineChange::MoveSubtree { from, to }]).await
 }
 
 /// Record a pass that could not take the drive lock. It ran none of its `remaining` actions, so it
@@ -1737,10 +1707,16 @@ async fn apply_one(
 				std::fs::rename(&to, &step).map_err(io_err)?;
 				std::fs::rename(&step, &to).map_err(io_err)?;
 			}
-			let store = ctx.store.lock().await;
-			let rows = moved_rows(&store, ctx.pair, from_path, to_path).map_err(db_err)?;
-			store
-				.apply_changes(ctx.pair, &rename_changes(&rows))
+			ctx.store
+				.lock()
+				.await
+				.apply_changes(
+					ctx.pair,
+					&[BaselineChange::MoveSubtree {
+						from: from_path.as_str(),
+						to: to_path.as_str(),
+					}],
+				)
 				.map_err(db_err)?;
 			report.moved_local += 1;
 		}
@@ -2737,34 +2713,6 @@ mod tests {
 		));
 	}
 
-	/// A directory renamed in place moves every row of its subtree from the spelling the store holds
-	/// to the new one, and nothing outside it.
-	#[test]
-	fn moved_rows_map_each_subtree_row_to_its_new_path() {
-		let store = BaselineStore::open_in_memory().unwrap();
-		let (pair, _) = store
-			.create_pair("/local", Uuid::new_v4(), super::super::SyncMode::TwoWay)
-			.unwrap();
-		for path in ["Docs", "Docs/sub", "Docs-x"] {
-			store
-				.upsert_entry(pair, &dir_entry(path, Some(Uuid::new_v4()), None))
-				.unwrap();
-		}
-		let mut rows: Vec<(String, String)> = moved_rows(&store, pair, "Docs", "docs")
-			.unwrap()
-			.into_iter()
-			.map(|(old, row)| (old, row.rel_path))
-			.collect();
-		rows.sort();
-		assert_eq!(
-			rows,
-			vec![
-				("Docs".to_string(), "docs".to_string()),
-				("Docs/sub".to_string(), "docs/sub".to_string()),
-			]
-		);
-	}
-
 	/// A move nested inside another commits the rows of its own step only: after the outer move the
 	/// inner directory's rows sit where the disk has them until the inner move runs, nothing stays
 	/// behind under the outer source, and an inner move that never runs leaves the store agreeing
@@ -2788,9 +2736,10 @@ mod tests {
 				.map(|entry| entry.rel_path)
 				.collect()
 		};
-		let step = |from: &str, to: &str| {
-			let rows = moved_rows(&store, pair, from, to).unwrap();
-			store.apply_changes(pair, &rename_changes(&rows)).unwrap();
+		let step = |from, to| {
+			store
+				.apply_changes(pair, &[BaselineChange::MoveSubtree { from, to }])
+				.unwrap();
 		};
 
 		step("D", "E");
