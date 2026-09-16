@@ -104,6 +104,62 @@ jobs:
           # checkout, which would otherwise need Wild to build Wild.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      # Hypothetical fix, NOT yet confirmed: hold Windows Update off for the run.
+      #
+      # The nightly Windows legs die with "The hosted runner lost communication
+      # with the server" and no job log on every night where the runner image is a
+      # cumulative update behind AND the leg is still running past ~03:23 UTC. On
+      # 2026-09-16 the V1 leg finished at 03:23:12 on a stale image and passed
+      # while V2, same image, died — so the trigger follows the clock, not the
+      # workload.
+      #
+      # Probing a live runner showed how that is possible: the image build
+      # disables Windows Update, but none of that survives onto the deployed VM.
+      # wuauserv runs, the AU policy key is empty, Automatic Maintenance is back,
+      # the UpdateOrchestrator scan tasks are Ready, the clock is UTC, and the
+      # current cumulative update is on offer (KB5122871, build 26100.33438, while
+      # the image is 26100.33296). With no AU policy in place the default is
+      # install-and-restart at 3 AM local, which here is 03:00 UTC.
+      #
+      # So put the image's own lockdown back for the life of the job. If the
+      # Windows legs then survive a stale-image night, the cause is confirmed and
+      # this step is the fix; if they still die, the cause is outside the VM and
+      # this step should come out again. It reports what it actually managed to
+      # change, because a silent failure would make a surviving night meaningless.
+      - name: Hold off Windows Update (nightly Windows legs die around 03:00 UTC)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+          $maint = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance'
+          New-Item -Path $au -Force | Out-Null
+          New-Item -Path $maint -Force | Out-Null
+          Set-ItemProperty -Path $au -Name NoAutoUpdate -Value 1 -Type DWord
+          Set-ItemProperty -Path $au -Name AUOptions -Value 1 -Type DWord
+          Set-ItemProperty -Path $maint -Name MaintenanceDisabled -Value 1 -Type DWord
+
+          foreach ($svc in 'wuauserv', 'UsoSvc', 'WaaSMedicSvc') {
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
+            Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            # Set-Service is refused on some protected services; the service key is
+            # the fallback the image build itself uses (Start = 4 is disabled).
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svc" -Name Start -Value 4 -ErrorAction SilentlyContinue
+          }
+
+          '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\' | ForEach-Object {
+            Get-ScheduledTask -TaskPath $_ -ErrorAction SilentlyContinue |
+              Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+          }
+
+          # Read back what took effect rather than assuming it did.
+          Get-Service wuauserv, UsoSvc, WaaSMedicSvc |
+            Select-Object Name, Status, StartType | Out-String -Width 120 | Write-Host
+          Get-ItemProperty -Path $au | Select-Object NoAutoUpdate, AUOptions |
+            Out-String -Width 120 | Write-Host
+          Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\' -ErrorAction SilentlyContinue |
+            Select-Object TaskName, State | Out-String -Width 120 | Write-Host
       - name: Run tests
         run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder --no-fail-fast
         env:
