@@ -327,8 +327,11 @@ impl SyncEngine {
 			handle_gone: false,
 		};
 		let engine = Arc::clone(&self);
+		// Subscribed before the loop starts, so a change made while it sets itself up is still
+		// pending for its first wait rather than lost.
+		let rules = self.user_ignore_changes();
 		let loop_done = tokio::spawn(run_loop(
-			engine, pair, config, dirty, stop, observer, status_tx,
+			engine, pair, config, dirty, rules, stop, observer, status_tx,
 		));
 
 		Ok(WatchHandle {
@@ -386,6 +389,7 @@ async fn run_loop(
 	pair: PairId,
 	config: WatchConfig,
 	dirty: Arc<Notify>,
+	mut rules: tokio::sync::watch::Receiver<u64>,
 	mut stop: Stop,
 	mut observer: SyncObserver,
 	status: tokio::sync::watch::Sender<WatchStatus>,
@@ -463,6 +467,7 @@ async fn run_loop(
 			&mut stop,
 			&dirty,
 			&mut safety_net,
+			&mut rules,
 			next_deep,
 			config.debounce,
 			delay,
@@ -522,12 +527,15 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 /// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
 /// persistent failure retries on the backoff schedule rather than falling through to whatever the
 /// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
-/// safety-net tick, when the deep scan at `next_deep` comes due, or on a change event once the
-/// burst behind it has gone quiet for `debounce`.
+/// safety-net tick, when the deep scan at `next_deep` comes due, on new device-wide user ignore
+/// patterns (`rules`), or on a change event once the burst behind it has gone quiet for
+/// `debounce`. New patterns are not debounced: they arrive one deliberate call at a time, and a
+/// burst of calls is already one wake-up (the signal carries the latest version, not each one).
 async fn wait_for_next_pass(
 	stop: &mut Stop,
 	dirty: &Notify,
 	safety_net: &mut tokio::time::Interval,
+	rules: &mut tokio::sync::watch::Receiver<u64>,
 	next_deep: Option<Instant>,
 	debounce: Duration,
 	backoff: Option<Duration>,
@@ -545,6 +553,7 @@ async fn wait_for_next_pass(
 		_ = stop.ended() => return false,
 		_ = safety_net.tick() => {}
 		_ = deep_scan_due(next_deep) => {}
+		_ = user_ignore_changed(rules) => {}
 		_ = dirty.notified() => {
 			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it).
 			loop {
@@ -558,6 +567,16 @@ async fn wait_for_next_pass(
 		}
 	}
 	true
+}
+
+/// Resolves once the device-wide user ignore patterns have changed since `rules` last saw them —
+/// never, once the engine that owns the signal is gone. A closed channel means this loop is on its
+/// way out too (it holds the engine), so parking is what lets its stop signal end the wait, where a
+/// ready arm would spin.
+async fn user_ignore_changed(rules: &mut tokio::sync::watch::Receiver<u64>) {
+	if rules.changed().await.is_err() {
+		std::future::pending().await
+	}
 }
 
 /// Resolves once the deep scan at `next_deep` is due; never, while deep scans are off.
@@ -879,6 +898,7 @@ mod tests {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Arc::new(Notify::new());
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 		let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
 		let mut handler = local_event_handler(
 			1,
@@ -889,7 +909,18 @@ mod tests {
 
 		handler(Err(watch_limit()));
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -929,6 +960,15 @@ mod tests {
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 		interval.tick().await;
 		interval
+	}
+
+	/// The device-wide user ignore signal as the loop holds one, plus the sender the engine's
+	/// `set_user_ignore` fires.
+	fn user_ignore() -> (
+		tokio::sync::watch::Sender<u64>,
+		tokio::sync::watch::Receiver<u64>,
+	) {
+		tokio::sync::watch::channel(0)
 	}
 
 	/// A [`Stop`] as the loop holds one, plus the two senders that can trip it: the handle's
@@ -1013,12 +1053,15 @@ mod tests {
 	/// The retry after a failed pass must be governed by the backoff alone. Nothing wakes the loop
 	/// during an outage that leaves the tree quiescent — no local writes, no remote batches — so if
 	/// the backoff is only a *prefix* to the usual wait, the retry lands on the safety-net cadence
-	/// and the backoff schedule is decoration.
+	/// and the backoff schedule is decoration. New device-wide patterns are no exception: a loop
+	/// backing off is applying nothing for them to stop, and letting them cut the timer short would
+	/// turn a setter call into an on-demand retry against whatever is failing.
 	#[tokio::test(start_paused = true)]
 	async fn a_failed_pass_retries_on_the_backoff_schedule() {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (rules_tx, mut rules) = user_ignore();
 
 		let start = tokio::time::Instant::now();
 		assert!(
@@ -1026,6 +1069,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				&mut rules,
 				None,
 				DEBOUNCE,
 				Some(BASE_BACKOFF)
@@ -1038,6 +1082,26 @@ mod tests {
 			BASE_BACKOFF,
 			"the backoff is the whole wait before the retry"
 		);
+
+		rules_tx.send_modify(|version| *version += 1);
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				Some(BASE_BACKOFF)
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			BASE_BACKOFF,
+			"new patterns must not turn the backoff into an on-demand retry"
+		);
 	}
 
 	/// A healthy wait is unchanged: a change event, coalesced over [`DEBOUNCE`], or the safety net.
@@ -1046,14 +1110,37 @@ mod tests {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(start.elapsed(), DEBOUNCE, "a change waits out the debounce");
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(
 			start.elapsed(),
 			SAFETY_NET - DEBOUNCE,
@@ -1067,6 +1154,7 @@ mod tests {
 		let (shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 
 		drop(shutdown_tx);
 		let start = tokio::time::Instant::now();
@@ -1075,6 +1163,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				&mut rules,
 				None,
 				DEBOUNCE,
 				Some(MAX_BACKOFF)
@@ -1093,6 +1182,7 @@ mod tests {
 		let (_shutdown_tx, removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 
 		removed_tx.send(true).unwrap();
 		let start = tokio::time::Instant::now();
@@ -1101,6 +1191,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				&mut rules,
 				None,
 				DEBOUNCE,
 				Some(MAX_BACKOFF)
@@ -1109,7 +1200,16 @@ mod tests {
 			"a removed pair must not wait out the backoff"
 		);
 		assert!(
-			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await,
+			!wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await,
 			"a removed pair must not wait for the next trigger either"
 		);
 		assert!(
@@ -1126,23 +1226,34 @@ mod tests {
 		let (_shutdown_tx, removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 
 		drop(removed_tx);
 		let start = tokio::time::Instant::now();
 		assert!(
-			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await
+			!wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
 		);
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
 
-	/// A paused pair polls, and never consumes the change signal: the notification a paused loop
-	/// walked past is still there for the first wait after the resume, so the backlog syncs then
-	/// rather than waiting out a whole safety-net interval.
+	/// A paused pair polls, and never consumes the change signal — nor the device-wide pattern one:
+	/// what a paused loop walked past is still there for the first wait after the resume, so the
+	/// backlog syncs then rather than waiting out a whole safety-net interval.
 	#[tokio::test(start_paused = true)]
 	async fn a_paused_loop_leaves_the_change_signal_pending() {
 		let (shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (rules_tx, mut rules) = user_ignore();
 		let poll = Duration::from_millis(200);
 
 		// A change lands while the pair is paused; two paused polls walk past it.
@@ -1159,11 +1270,51 @@ mod tests {
 		// Resumed: the pending notification is what ends the very next wait, one debounce later —
 		// not the safety net, which is far away.
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
 			"the change made during the pause was swallowed"
+		);
+
+		// New user patterns behave the same: the paused loop walks past them, and they end the first
+		// wait after the resume — at once, since they are not debounced.
+		rules_tx.send_modify(|version| *version += 1);
+		let start = tokio::time::Instant::now();
+		assert!(wait_while_paused(&mut stop, poll).await);
+		assert_eq!(
+			start.elapsed(),
+			poll,
+			"a paused loop must not run a pass for new patterns"
+		);
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			Duration::ZERO,
+			"the patterns set during the pause were swallowed"
 		);
 
 		// And stopping the watch is never delayed by a paused poll.
@@ -1183,6 +1334,7 @@ mod tests {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 		let report = SyncReport {
 			paused: true,
 			..SyncReport::default()
@@ -1192,7 +1344,18 @@ mod tests {
 		}
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(
 			start.elapsed(),
 			DEBOUNCE,
@@ -1236,17 +1399,112 @@ mod tests {
 		let (shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 
 		drop(shutdown_tx);
 		stop.ended().await;
 		stop.ended().await;
 		assert!(!wait_while_paused(&mut stop, Duration::from_secs(600)).await);
 		assert!(
-			!wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await
+			!wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
 		);
 		assert!(
 			!stop.pair_removed(),
 			"the handle went away, not the pair — the loop must report the right end"
+		);
+	}
+
+	/// A device-wide user ignore change wakes a running loop, so the pass that applies it runs now
+	/// rather than at a safety-net tick up to minutes away. A burst of setter calls is ONE wake-up,
+	/// not one per call, and a watch on its way out is not woken at all.
+	#[tokio::test(start_paused = true)]
+	async fn a_user_ignore_change_wakes_the_loop() {
+		let (shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let mut safety_net = safety_net().await;
+		let (rules_tx, mut rules) = user_ignore();
+
+		rules_tx.send_modify(|version| *version += 1);
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			Duration::ZERO,
+			"new user ignore patterns must wake the loop, not wait for the safety net"
+		);
+
+		// Two calls in a row wake the loop once — the pass that follows reads the latest text ...
+		rules_tx.send_modify(|version| *version += 1);
+		rules_tx.send_modify(|version| *version += 1);
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(start.elapsed(), Duration::ZERO);
+
+		// ... and the wait after it is the ordinary one, rather than a spin on the second call.
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			SAFETY_NET,
+			"a change the loop has already picked up must not wake it again"
+		);
+
+		// A watch being stopped or its pair removed ends the wait, change pending or not.
+		drop(shutdown_tx);
+		rules_tx.send_modify(|version| *version += 1);
+		assert!(
+			!wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
 		);
 	}
 
@@ -1258,6 +1516,7 @@ mod tests {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 		let every = SAFETY_NET / 3;
 		let start = tokio::time::Instant::now();
 		let next_deep = Some(start + every);
@@ -1268,6 +1527,7 @@ mod tests {
 				&mut stop,
 				&dirty,
 				&mut safety_net,
+				&mut rules,
 				next_deep,
 				DEBOUNCE,
 				None
@@ -1291,7 +1551,18 @@ mod tests {
 		);
 
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, DEBOUNCE, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
 		assert_eq!(
 			start.elapsed(),
 			SAFETY_NET - every,
@@ -1344,11 +1615,23 @@ mod tests {
 		let (_shutdown_tx, _removed_tx, mut stop) = stop();
 		let dirty = Notify::new();
 		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
 		let debounce = Duration::from_millis(50);
 
 		dirty.notify_one();
 		let start = tokio::time::Instant::now();
-		assert!(wait_for_next_pass(&mut stop, &dirty, &mut safety_net, None, debounce, None).await);
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&mut safety_net,
+				&mut rules,
+				None,
+				debounce,
+				None
+			)
+			.await
+		);
 		assert_eq!(start.elapsed(), debounce);
 	}
 
