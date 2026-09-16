@@ -12,7 +12,6 @@ members = [
 	"uniffi-bindgen-swift",
 	"filen-cli",
 	"filen-rclone-wrapper",
-	"filen-sync-core",
 ]
 
 # Every member opts in with `[lints] workspace = true`; a new crate must too.
