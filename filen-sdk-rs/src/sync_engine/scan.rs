@@ -71,8 +71,11 @@ pub(crate) struct LocalNode {
 /// [`LocalScan::ignore_blocked`]), so nothing was missed, only withheld.
 #[derive(Debug)]
 pub(crate) enum ScanError {
-	/// An entry could not be read (permission, vanished mid-walk, hash failure, a symlink that is
-	/// dangling or part of a loop, an unreadable `.filenignore`).
+	/// An entry could not be read (permission, a directory that vanished before the walk could
+	/// descend into it, hash failure, a symlink that is dangling or part of a loop, an unreadable
+	/// `.filenignore`), or the root itself was gone when the walk finished. A FILE the walk listed
+	/// and that is gone by the time the scan stats or hashes it is NOT one of these: the walk
+	/// observed it, so it is skipped silently.
 	Io {
 		rel_path: String,
 		source: std::io::Error,
@@ -397,8 +400,23 @@ pub(crate) fn scan_local(
 	root: &Path,
 	baseline: &HashMap<String, BaselineEntry>,
 	depth: ScanDepth,
+	rules: IgnoreRules,
+	rule_files: RuleFiles,
+) -> (LocalScan, IgnoreRules) {
+	scan_local_watched(root, baseline, depth, rules, rule_files, &mut |_| {})
+}
+
+/// [`scan_local`], with a hook called for every entry the walker lists, just before the scan reads
+/// it. It exists for the tests: an entry that is there when the walk lists it and gone when the
+/// scan reads it is a race no test can produce from the outside, and it is the one this scan has
+/// to survive without calling the tree partial.
+fn scan_local_watched(
+	root: &Path,
+	baseline: &HashMap<String, BaselineEntry>,
+	depth: ScanDepth,
 	mut rules: IgnoreRules,
 	rule_files: RuleFiles,
+	on_listed: &mut dyn FnMut(&Path),
 ) -> (LocalScan, IgnoreRules) {
 	let mut nodes = HashMap::new();
 	let mut errors = Vec::new();
@@ -503,6 +521,14 @@ pub(crate) fn scan_local(
 					.and_then(|p| p.strip_prefix(root).ok())
 					.and_then(normalize_rel_path)
 					.unwrap_or_default();
+				// A directory the walk listed but could not descend into does NOT get the rule the
+				// `metadata` and hash calls below use for an entry that vanished: its children were
+				// never listed, so their absence is not something the walk observed. Trusting it
+				// reads a directory moved or removed mid-walk as one deletion per file under it,
+				// and the destination — listed before the move — is not in this scan either, so the
+				// pass cannot fold the move: it would trash the remote copies and upload them again
+				// next pass. Holding those deletions for one pass costs nothing instead.
+				//
 				// An unreadable directory or entry means the tree is partial. A symlink that leads
 				// nowhere does not: there is nothing behind it to have missed — unless a DIRECTORY
 				// was synced through it (a link to an unmounted drive), whose subtree would
@@ -529,6 +555,8 @@ pub(crate) fn scan_local(
 			}
 		};
 
+		on_listed(entry.path());
+
 		// The root itself is the pair's anchor, not a synced item.
 		if entry.depth() == 0 {
 			continue;
@@ -554,10 +582,22 @@ pub(crate) fn scan_local(
 		let metadata = match entry.metadata() {
 			Ok(metadata) => metadata,
 			Err(err) => {
-				complete = false;
 				let source = err
 					.into_io_error()
 					.unwrap_or_else(|| std::io::Error::other("metadata error"));
+				// Gone since the walk listed it: the walk observed this entry and something removed
+				// it meanwhile, so nothing was missed and the scan still completed. Its absence is
+				// real evidence, which is the whole point — a temp file that came and went during
+				// the walk must not hold every deletion of the pair. Any other error (a permission
+				// denial above all) IS missing evidence and still makes the scan partial.
+				if source.kind() == ErrorKind::NotFound {
+					tracing::debug!(
+						"local scan of {}: {rel_path:?} vanished after the walk listed it",
+						root.display()
+					);
+					continue;
+				}
+				complete = false;
 				record(&mut errors, root, ScanError::Io { rel_path, source });
 				continue;
 			}
@@ -630,6 +670,15 @@ pub(crate) fn scan_local(
 						{
 							continue;
 						}
+						// Removed between the walk listing it and the hash reading it: the same
+						// race as the `metadata` call above, and the same answer.
+						Err(source) if source.kind() == ErrorKind::NotFound => {
+							tracing::debug!(
+								"local scan of {}: {rel_path:?} vanished after the walk listed it",
+								root.display()
+							);
+							continue;
+						}
 						Err(source) => {
 							complete = false;
 							record(&mut errors, root, ScanError::Io { rel_path, source });
@@ -647,6 +696,23 @@ pub(crate) fn scan_local(
 			}
 		};
 		nodes.insert(rel_path, node);
+	}
+
+	// A root that went away DURING the walk answers `NotFound` for every entry it had already
+	// listed, and each of those was skipped just above as an entry that vanished — which on its own
+	// is indistinguishable from the tree being emptied one file at a time. One stat tells them
+	// apart: if the root itself is gone (a removed volume, a share that dropped, a lazily unmounted
+	// tree), nothing the walk listed is evidence that anything was deleted.
+	if let Err(source) = std::fs::metadata(root) {
+		complete = false;
+		record(
+			&mut errors,
+			root,
+			ScanError::Io {
+				rel_path: String::new(),
+				source,
+			},
+		);
 	}
 
 	errors.extend(rule_errors);
@@ -1028,6 +1094,142 @@ mod tests {
 		assert_eq!(
 			tracked.ignored_default_untracked, 2,
 			"the other two `.DS_Store`s are still untracked"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A FILE that is removed between the walk listing it and the scan reading it is not missing
+	/// evidence: the walk covered the whole tree and the entry is genuinely gone. Calling such a
+	/// scan incomplete holds every deletion of the pair, and a temp file written and removed while
+	/// the walk runs (a build, an editor saving) is enough to do it.
+	#[test]
+	fn a_file_that_vanishes_after_the_walk_listed_it_keeps_the_scan_complete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		fs::write(root.join("temp.txt"), b"y").unwrap();
+
+		let baseline = HashMap::new();
+		let (scan, _) = scan_local_watched(
+			&root,
+			&baseline,
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+			// Removed the moment the walker hands the entry over, before the scan stats it.
+			&mut |path| {
+				if path.ends_with("temp.txt") {
+					fs::remove_file(path).unwrap();
+				}
+			},
+		);
+
+		assert!(
+			scan.complete,
+			"an entry the walk itself listed and that is gone now is not missing evidence: {:?}",
+			scan.errors
+		);
+		assert!(
+			scan.errors.is_empty(),
+			"nothing to report either — it is not an error that a file was deleted: {:?}",
+			scan.errors
+		);
+		assert_eq!(
+			sorted_paths(&scan),
+			vec!["keep.txt"],
+			"what is gone is gone: it is absent, which is what the next pass acts on"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A DIRECTORY the walk listed but could not descend into is the opposite case: its children
+	/// were never listed, so their absence is not something the walk observed. Trusting it reads
+	/// every file under a directory that was moved or removed mid-walk as a deletion — and the
+	/// destination, listed before the move, is not in the scan either, so the pass cannot see the
+	/// move. One held pass costs nothing; the next one folds it.
+	#[test]
+	fn a_directory_the_walk_could_not_descend_into_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		// `walkdir` opens a directory as it hands the entry over, so the entry that vanishes
+		// BETWEEN listing and descent is one of the siblings already buffered in an open stream.
+		let outer = root.join("outer");
+		fs::create_dir(&outer).unwrap();
+		for i in 0..64 {
+			let dir = outer.join(format!("d{i:02}"));
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("inner.txt"), b"z").unwrap();
+		}
+
+		let baseline = HashMap::new();
+		let mut swept = false;
+		let (scan, _) = scan_local_watched(
+			&root,
+			&baseline,
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+			// The first time a child of `outer` is listed, every child of `outer` goes — while the
+			// walk still holds that directory's open stream and has yet to descend into any of them.
+			&mut |path| {
+				if !swept && path.parent() == Some(outer.as_path()) {
+					swept = true;
+					for child in fs::read_dir(&outer).unwrap() {
+						fs::remove_dir_all(child.unwrap().path()).unwrap();
+					}
+				}
+			},
+		);
+
+		assert!(
+			!scan.complete,
+			"the children of a directory the walk never descended into were not observed absent"
+		);
+		assert!(
+			scan.errors
+				.iter()
+				.any(|error| matches!(error, ScanError::Io { .. })),
+			"and the pass is told why: {:?}",
+			scan.errors
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A root that goes away DURING the walk — a removed volume, an unreachable share — answers
+	/// `NotFound` for every entry it had already listed, which on its own is indistinguishable from
+	/// each of those entries being deleted. One stat after the walk tells the two apart; without it
+	/// the scan reports a complete observation of an empty tree, and every row of the pair reads as
+	/// a deletion.
+	#[test]
+	fn a_root_that_vanishes_during_the_walk_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		// Flat on purpose: no directory to descend into, so the root check is the only thing that
+		// can catch this.
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			fs::write(root.join(name), b"x").unwrap();
+		}
+
+		let baseline = HashMap::new();
+		let mut gone = false;
+		let (scan, _) = scan_local_watched(
+			&root,
+			&baseline,
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+			&mut |path| {
+				if !gone && path.parent() == Some(root.as_path()) {
+					gone = true;
+					fs::remove_dir_all(&root).unwrap();
+				}
+			},
+		);
+
+		assert!(
+			!scan.complete,
+			"the root itself is gone: nothing the walk listed is evidence of a deletion"
 		);
 
 		fs::remove_dir_all(&root).ok();
