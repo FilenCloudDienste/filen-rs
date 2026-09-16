@@ -21,8 +21,8 @@ use super::{
 	Backlog, SyncEvent, SyncMode,
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{
-		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PathFailure,
-		PendingRow,
+		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
+		PathFailure, PendingRow,
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
@@ -3078,13 +3078,16 @@ impl SyncEngine {
 		// broken path a fresh set of retries every time someone pauses. Only the failures count. A
 		// pass that found a side full held back transfers the same way.
 		if report.interrupted == 0 && report.halted.is_none() {
-			for path in attempted
+			let cleared: Vec<&str> = attempted
 				.iter()
-				.filter(|p| !failed.contains_key(p.as_str()))
-			{
-				if let Err(e) = store.clear_failure(pair, path) {
-					problems.push(format!("{path}: clearing the failure count failed: {e}"));
-				}
+				.map(String::as_str)
+				.filter(|path| !failed.contains_key(path))
+				.collect();
+			if let Err(e) = store.clear_failures(pair, &cleared) {
+				problems.push(format!(
+					"clearing the failure count of {} applied path(s) failed: {e}",
+					cleared.len()
+				));
 			}
 		}
 		report.errors.extend(problems);
@@ -3279,12 +3282,15 @@ impl SyncEngine {
 		// leaves the evidence with it, which is why the records are retired HERE and not in the
 		// reading step.
 		if !prep.confirmed.is_empty() {
-			let store = self.store.lock().await;
-			for entry in &prep.confirmed {
-				store
-					.upsert_entry(pair, entry)
-					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
-			}
+			// One transaction for the lot: pass two of a first sync confirms every row it pushed,
+			// and a transaction per row is a transaction per item of the tree.
+			let changes: Vec<BaselineChange<'_>> =
+				prep.confirmed.iter().map(BaselineChange::Upsert).collect();
+			self.store
+				.lock()
+				.await
+				.apply_changes(pair, &changes)
+				.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
 		}
 		self.forget_settled_pushes(&prep.confirmed);
 		let mut report = SyncReport::default();
