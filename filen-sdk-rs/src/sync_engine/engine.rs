@@ -3133,10 +3133,9 @@ impl SyncEngine {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		Ok(store
-			.entries(pair)
+			.conflicts(pair)
 			.map_err(|e| db_error(e, "loading the held conflicts"))?
 			.into_iter()
-			.filter(|entry| entry.state.is_conflict())
 			.map(|entry| PlannedConflict {
 				local: entry.local_kind.map(PlannedNodeKind::from),
 				remote: entry.remote_kind.map(PlannedNodeKind::from),

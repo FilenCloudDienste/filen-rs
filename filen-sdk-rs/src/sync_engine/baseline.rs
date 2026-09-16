@@ -106,6 +106,12 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 );
 ";
 
+/// The columns [`BaselineStore::row_to_entry`] reads, named once so the statements that hand back
+/// rows cannot drift apart from each other or from it.
+const ENTRY_COLUMNS: &str = "rel_path, kind, remote_uuid, content_hash, size, local_mtime,
+	 remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
+	 remote_stable_uuid, agreed_hash";
+
 /// The two statements [`BaselineStore::delete_subtrees`] runs per root: the row AT the path, and
 /// the rows UNDER it.
 ///
@@ -658,10 +664,9 @@ impl BaselineStore {
 	) -> rusqlite::Result<Option<BaselineEntry>> {
 		self.conn
 			.query_row(
-				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-				        remote_stable_uuid, agreed_hash
-				 FROM baseline WHERE pair_id = ?1 AND rel_path = ?2",
+				&format!(
+					"SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 AND rel_path = ?2"
+				),
 				params![pair, rel_path],
 				Self::row_to_entry,
 			)
@@ -671,13 +676,32 @@ impl BaselineStore {
 	/// Every baseline row for `pair`, ordered by path (parent-before-child for same-prefix paths).
 	pub(crate) fn entries(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
 		self.conn
-			.prepare(
-				"SELECT rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-				        remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-				        remote_stable_uuid, agreed_hash
-				 FROM baseline WHERE pair_id = ?1 ORDER BY rel_path",
-			)?
+			.prepare(&format!(
+				"SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 ORDER BY rel_path"
+			))?
 			.query_map(params![pair], Self::row_to_entry)?
+			.collect()
+	}
+
+	/// The rows `pair` is holding in conflict — both flavours — ordered by path.
+	///
+	/// A `WHERE` on the state rather than a read of the whole pair filtered in Rust: what a caller
+	/// listing the conflicts wants is a handful of rows, and reading every row of the pair to find
+	/// them is the same work a pass does.
+	pub(crate) fn conflicts(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
+		self.conn
+			.prepare(&format!(
+				"SELECT {ENTRY_COLUMNS} FROM baseline
+				 WHERE pair_id = ?1 AND state IN (?2, ?3) ORDER BY rel_path"
+			))?
+			.query_map(
+				params![
+					pair,
+					BaselineState::Conflicted.as_i64(),
+					BaselineState::Overwritten.as_i64(),
+				],
+				Self::row_to_entry,
+			)?
 			.collect()
 	}
 
@@ -1541,6 +1565,50 @@ mod tests {
 			all.iter().map(|e| e.rel_path.as_str()).collect::<Vec<_>>(),
 			vec!["a", "a/b.txt"]
 		);
+	}
+
+	/// Both conflict states come back, in path order, and nothing else does: a synced or adopted row
+	/// is not a conflict, and another pair's conflict is not this pair's.
+	#[test]
+	fn conflicts_are_read_by_state_in_path_order() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let with_state = |rel_path: &str, state| BaselineEntry {
+			state,
+			..file_entry(rel_path, [1u8; 32], 1)
+		};
+		for (rel_path, state) in [
+			("b.txt", BaselineState::Conflicted),
+			("a.txt", BaselineState::Overwritten),
+			("c.txt", BaselineState::Synced),
+			("d.txt", BaselineState::Adopted),
+		] {
+			store
+				.upsert_entry(pair, &with_state(rel_path, state))
+				.unwrap();
+		}
+		store
+			.upsert_entry(other, &with_state("z.txt", BaselineState::Conflicted))
+			.unwrap();
+
+		assert_eq!(
+			store
+				.conflicts(pair)
+				.unwrap()
+				.iter()
+				.map(|entry| (entry.rel_path.as_str(), entry.state))
+				.collect::<Vec<_>>(),
+			vec![
+				("a.txt", BaselineState::Overwritten),
+				("b.txt", BaselineState::Conflicted)
+			]
+		);
+		assert_eq!(store.conflicts(other).unwrap().len(), 1);
 	}
 
 	#[test]
