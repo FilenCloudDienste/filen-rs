@@ -1913,6 +1913,13 @@ fn dir_move_from<'a>(
 ) -> Option<SyncAction> {
 	let action = if local.get(from).is_some_and(|n| n.kind == NodeKind::Dir) {
 		let to = *remote_dir_at.get(&uuid)?;
+		// The steady-state answer, before the scan that would reach it the slow way: the directory
+		// is where the baseline recorded it. `occupied(local, from)` is true whenever it is — the
+		// branch only runs with a local DIRECTORY at `from` — so this refuses exactly what it
+		// refused before, without folding the case of every local key to find that out.
+		if to == from {
+			return None;
+		}
 		(!occupied(local, to)).then(|| SyncAction::MoveLocal {
 			from_path: from.to_string(),
 			to_path: to.to_string(),
