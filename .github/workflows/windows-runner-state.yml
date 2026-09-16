@@ -1,0 +1,130 @@
+name: Windows runner state
+
+# Manual-only probe of a hosted windows-latest runner's servicing state.
+#
+# Why: since 2026-04 the nightly Windows legs die with "The hosted runner lost
+# communication with the server" and no log, on nights when the runner image
+# predates the newest Windows Server 2025 cumulative update AND the leg is still
+# running past ~03:23 UTC. A leg that finishes before that survives on the very
+# same stale image (2026-09-16: V1 passed at 03:23:12, V2 died). Nobody has
+# observed what kills the VM. The two candidates are an in-guest Windows Update
+# install + restart, and an external (Azure/GitHub) stop of VMs below the current
+# CU. This job answers the in-guest half in two minutes, without waiting a night.
+#
+# Read the output like this:
+#   - wuauserv/UsoSvc Disabled AND NoAutoUpdate=1 on the live VM
+#       -> in-guest Windows Update is off, the external actor moves up.
+#   - wuauserv not Disabled, or NoAutoUpdate=0, or UpdateOrchestrator tasks Ready
+#       -> the image lockdown did not survive deployment (cf. runner-images#8599),
+#          and ScheduledInstallTime (default 3) is the thing to look at next.
+#   - UBR below the newest CU confirms the runner image is stale.
+#   - TimeZone tells us whether a 3 AM in-guest schedule lands on 03:00 UTC.
+#   - Runner.Listener's parent says whether a graceful OS shutdown would even be
+#     reported by the runner (it only reports one when hosted by the service).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-state:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Dump servicing state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          function Section($Name, [scriptblock]$Body) {
+            Write-Host "::group::$Name"
+            try { & $Body | Out-String -Width 200 | Write-Host }
+            catch { Write-Host "FAILED: $($_.Exception.Message)" }
+            Write-Host '::endgroup::'
+          }
+
+          function Trunc($Text, $Max) {
+            if (-not $Text) { return '' }
+            $one = $Text -replace '\s+', ' '
+            if ($one.Length -le $Max) { $one } else { $one.Substring(0, $Max) }
+          }
+
+          Section 'identity' {
+            $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+            [pscustomobject]@{
+              UtcNow        = (Get-Date).ToUniversalTime().ToString('o')
+              ImageOS       = $env:ImageOS
+              ImageVersion  = $env:ImageVersion
+              Build         = "$($cv.CurrentBuild).$($cv.UBR)"
+              DisplayVersion= $cv.DisplayVersion
+              TimeZone      = (Get-TimeZone).Id
+              LastBootUpUtc = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+            }
+          }
+
+          Section 'update services' {
+            Get-Service wuauserv, UsoSvc, BITS, WaaSMedicSvc, TrustedInstaller |
+              Select-Object Name, Status, StartType
+            'registry Start values (4 = disabled):'
+            'wuauserv', 'UsoSvc', 'BITS', 'WaaSMedicSvc' | ForEach-Object {
+              $start = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -Name Start -ErrorAction SilentlyContinue).Start
+              [pscustomobject]@{ Service = $_; Start = $start }
+            }
+          }
+
+          Section 'update policy' {
+            'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate:'
+            Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue |
+              Select-Object * -Exclude PS*
+            'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU (NoAutoUpdate, AUOptions, ScheduledInstallTime):'
+            Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue |
+              Select-Object * -Exclude PS*
+            'Automatic Maintenance:'
+            Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' -ErrorAction SilentlyContinue |
+              Select-Object * -Exclude PS*
+          }
+
+          Section 'pending reboot' {
+            'CBS\RebootPending      : ' + (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+            'WU\AU\RebootRequired   : ' + (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\WindowsUpdate\Auto Update\RebootRequired')
+            'PendingFileRenameOps   : ' + [bool](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
+          }
+
+          Section 'scheduled tasks' {
+            '\Microsoft\Windows\UpdateOrchestrator\', '\Microsoft\Windows\WindowsUpdate\', '\Microsoft\Windows\TaskScheduler\' | ForEach-Object {
+              Get-ScheduledTask -TaskPath $_ -ErrorAction SilentlyContinue |
+                Select-Object TaskPath, TaskName, State
+            }
+          }
+
+          Section 'installed updates (10 newest)' {
+            Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10 HotFixID, InstalledOn, Description
+          }
+
+          Section 'runner process tree' {
+            Get-CimInstance Win32_Process -Filter "Name='Runner.Listener.exe' OR Name='Runner.Worker.exe'" | ForEach-Object {
+              $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ParentProcessId)" -ErrorAction SilentlyContinue
+              [pscustomobject]@{ Name = $_.Name; Pid = $_.ProcessId; Parent = $parent.Name; ParentPid = $_.ParentProcessId }
+            }
+          }
+
+          Section 'azure instance metadata' {
+            Invoke-RestMethod -Headers @{ Metadata = 'true' } -TimeoutSec 5 `
+              -Uri 'http://169.254.169.254/metadata/instance/compute?api-version=2021-12-13' |
+              Select-Object vmSize, location, zone, osType, version, sku, licenseType
+          }
+
+          Section 'servicing processes' {
+            Get-Process TiWorker, TrustedInstaller, MoUsoCoreWorker, UsoClient, wuauclt -ErrorAction SilentlyContinue |
+              Select-Object Name, Id, StartTime
+          }
+
+          Section 'recent windows update client events' {
+            Get-WinEvent -LogName 'Microsoft-Windows-WindowsUpdateClient/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
+              ForEach-Object { '{0} {1} {2}' -f $_.TimeCreated.ToUniversalTime().ToString('o'), $_.Id, (Trunc $_.Message 160) }
+          }
+
+          Section 'recent system shutdown/update events' {
+            Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074, 1076, 6005, 6006, 6008, 41, 19, 20, 43, 44, 7040 } `
+              -MaxEvents 40 -ErrorAction SilentlyContinue |
+              ForEach-Object { '{0} {1} {2} {3}' -f $_.TimeCreated.ToUniversalTime().ToString('o'), $_.Id, $_.ProviderName, (Trunc $_.Message 160) }
+          }
