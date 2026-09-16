@@ -1309,6 +1309,7 @@ async fn observ_add_plan_and_pass_report_the_same_ignored_paths() {
 	let ignored = |rel_path: &str, tracked: bool| IgnoredPath {
 		rel_path: rel_path.to_string(),
 		level: IgnoreLevel::File { dir: String::new() },
+		pattern: format!("{rel_path}/"),
 		tracked,
 	};
 
