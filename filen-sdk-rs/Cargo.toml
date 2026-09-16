@@ -57,6 +57,12 @@ required-features = ["sync-engine"]
 name = "sync_suite"
 required-features = ["sync-engine"]
 
+# The permanent per-phase cost probe (`src/sync_engine/probe.rs`, exposed by `bench-internals`).
+# All `#[ignore]`d — run explicitly; scaled by SYNC_PROBE_N / SYNC_PROBE_SHAPE.
+[[test]]
+name = "sync_engine_probe"
+required-features = ["sync-engine", "bench-internals"]
+
 [[bench]]
 name = "cache_insertion"
 harness = false
