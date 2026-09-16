@@ -7,7 +7,7 @@
 use std::{borrow::Cow, time::Duration};
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::sync_engine::{Backlog, PlannedActionKind};
+use filen_sdk_rs::sync_engine::{Backlog, GuardReason, PlannedActionKind};
 use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
@@ -1166,6 +1166,57 @@ async fn mode_22b_switch_local_backup_to_l2r_can_adopt_the_destination_instead()
 		find_file(&files, "y.txt").is_none(),
 		"the later deletion did not propagate"
 	);
+
+	sc.cleanup();
+}
+
+/// MODE-22c — the same switch over an IGNORED destination copy: `Backlog::AdoptDestination` reads
+/// the filtered scan and view, so a copy a rule hides is adopted by nothing. Once the rule goes, the
+/// path therefore syncs like a first sync — the mirror's deletion is HELD for approval and released
+/// only once it is given — where an adopted copy would have been left standing for good.
+#[shared_test_runtime]
+async fn mode_22c_adopt_destination_adopts_nothing_at_an_ignored_path() {
+	let sc = single_client(SyncMode::LocalBackup).await;
+	write_file(&sc.local, "x.txt", b"X");
+	let r1 = sc.sync().await;
+	assert_eq!(r1.uploaded, 1, "{r1:?}");
+
+	// Another client's file on the destination, hidden from this device by a user-level rule.
+	sc.engine.set_user_ignore("*.psd").await.unwrap();
+	let theirs = upload_remote(&sc, "theirs.psd", b"Z-FROM-ANOTHER-CLIENT").await;
+	wait_cache_has(&sc, theirs.uuid()).await;
+	let hidden = sc.sync().await;
+	assert!(hidden.errors.is_empty(), "{hidden:?}");
+	assert_eq!(hidden.ignored.len(), 1, "{hidden:?}");
+
+	sc.engine
+		.reconfigure_pair(sc.pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
+		.await
+		.unwrap();
+
+	sc.engine.set_user_ignore("").await.unwrap();
+	let unignored = sc.sync().await;
+	assert!(unignored.errors.is_empty(), "{unignored:?}");
+	assert!(
+		matches!(
+			unignored.guard,
+			Some(GuardReason::FirstSyncWithDeletions { deletions: 1 })
+		),
+		"the hidden copy was adopted by the switch: {unignored:?}"
+	);
+	assert_eq!(unignored.remotely_trashed, 0, "{unignored:?}");
+	assert_eq!(unignored.uploaded, 0, "{unignored:?}");
+
+	let token = unignored
+		.deletion_token
+		.expect("the deletion is held, not applied");
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let approved = sc.sync().await;
+	assert!(approved.errors.is_empty(), "{approved:?}");
+	assert_eq!(approved.remotely_trashed, 1, "{approved:?}");
+	let (_d, files) = list_remote_root(&sc).await;
+	assert!(find_file(&files, "theirs.psd").is_none(), "{files:?}");
+	assert!(find_file(&files, "x.txt").is_some(), "{files:?}");
 
 	sc.cleanup();
 }
