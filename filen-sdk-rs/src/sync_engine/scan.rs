@@ -21,7 +21,7 @@
 
 use std::{
 	cell::RefCell,
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	ffi::OsStr,
 	fmt,
 	io::{ErrorKind, Read},
@@ -250,6 +250,19 @@ pub(super) fn collision_key(rel_path: &str) -> String {
 	rel_path.chars().flat_map(char::to_lowercase).collect()
 }
 
+/// A 128-bit digest of a [`collision_key`], for the per-pass sets that only ever ask whether some
+/// other entry folded the same way. Keeping the digest instead of the key costs 16 bytes an entry
+/// rather than a second copy of every path; every hit is checked against the real paths, so two
+/// keys that happen to share a digest cost a lookup, never a wrong answer.
+pub(super) fn collision_hash(key: &str) -> u128 {
+	let digest = blake3::hash(key.as_bytes());
+	u128::from_le_bytes(
+		digest.as_bytes()[..16]
+			.try_into()
+			.expect("a blake3 digest is 32 bytes"),
+	)
+}
+
 /// BLAKE3 of the file at `path`, streamed (no full read into memory).
 fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
 	let file = std::fs::File::open(path)?;
@@ -418,12 +431,22 @@ fn scan_local_watched(
 	rule_files: RuleFiles,
 	on_listed: &mut dyn FnMut(&Path),
 ) -> (LocalScan, IgnoreRules) {
-	let mut nodes = HashMap::new();
+	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
+	// estimate worth having; a pair with none still gets a walk's worth of room up front.
+	let capacity = baseline.len().max(1024);
+	let mut nodes: HashMap<String, LocalNode> = HashMap::with_capacity(capacity);
 	let mut errors = Vec::new();
 	let mut invalid_names = BTreeMap::new();
 	let mut complete = true;
-	// collision key -> the rel_path that claimed it, to detect a second entry normalizing the same.
-	let mut claimed: HashMap<String, String> = HashMap::new();
+	// A digest of every collision key taken so far, to spot a second entry folding the same way.
+	// The keys themselves are not kept: a hit is rare and is resolved against the paths already
+	// taken, so this costs 16 bytes a node instead of a second copy of every path.
+	let mut claimed: HashSet<u128> = HashSet::with_capacity(capacity);
+	// Paths that claimed a folded name and then bailed before becoming a node: a file whose hash
+	// could not be read, and a rule file the scan could not use. The claim is what says the name is
+	// taken, so the lookup below has to find them too — a walk with nothing wrong pushes none. An
+	// entry skipped because it VANISHED is deliberately not here: it is gone, so its name is free.
+	let mut bailed: Vec<String> = Vec::new();
 
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
@@ -626,7 +649,17 @@ fn scan_local_watched(
 			invalid_names.insert(rel_path.clone(), reason);
 		}
 
-		if let Some(previous) = claimed.insert(collision_key(&rel_path), rel_path.clone()) {
+		let key = collision_key(&rel_path);
+		// Naming the twin means folding the paths already taken, which is why it happens on the
+		// error path only. Finding none means the digests collided rather than the names, and a
+		// pair is never refused over that.
+		if !claimed.insert(collision_hash(&key))
+			&& let Some(previous) = nodes
+				.keys()
+				.chain(bailed.iter())
+				.find(|taken| collision_key(taken.as_str()) == key)
+				.cloned()
+		{
 			complete = false;
 			record(
 				&mut errors,
@@ -668,6 +701,7 @@ fn scan_local_watched(
 									rel_path.rsplit_once('/').map_or("", |(dir, _)| dir),
 								) =>
 						{
+							bailed.push(rel_path);
 							continue;
 						}
 						// Removed between the walk listing it and the hash reading it: the same
@@ -681,6 +715,8 @@ fn scan_local_watched(
 						}
 						Err(source) => {
 							complete = false;
+							// It claimed the folded name above, so that name is still taken.
+							bailed.push(rel_path.clone());
 							record(&mut errors, root, ScanError::Io { rel_path, source });
 							continue;
 						}
@@ -1194,6 +1230,71 @@ mod tests {
 			scan.errors
 		);
 
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A twin whose first spelling claimed the folded name and then bailed — a file the scan could
+	/// not read — must still refuse the pass. The claim is what says the name is taken; forgetting
+	/// it lets the second spelling through as an ordinary new file, and since the server folds case
+	/// too, uploading it lands on top of the remote copy the first spelling is synced as.
+	#[cfg(unix)]
+	#[test]
+	fn a_twin_whose_first_spelling_could_not_be_read_is_still_a_collision() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let (upper, lower) = ("A.txt", "a.txt");
+		assert_eq!(
+			collision_key(upper),
+			collision_key(lower),
+			"the fixture needs two names that fold together"
+		);
+		let root = temp_root();
+		let (upper, lower) = (root.join(upper), root.join(lower));
+		fs::write(&upper, b"x").unwrap();
+		fs::write(&lower, b"y").unwrap();
+		// A filesystem that folds case holds one file, not two, and then there is no collision to
+		// put in front of the scan — no pair of names it keeps apart folds together either, since
+		// it folds the same way the key does. The case this guards is reachable wherever the
+		// filesystem is case-sensitive, which is where the twin can exist at all.
+		if fs::read_dir(&root).unwrap().count() < 2 {
+			fs::remove_dir_all(&root).ok();
+			return;
+		}
+
+		let baseline = HashMap::new();
+		let mut blocked = false;
+		let (scan, _) = scan_local_watched(
+			&root,
+			&baseline,
+			ScanDepth::Fast,
+			IgnoreRules::default(),
+			RuleFiles::Read,
+			// Whichever of the two the walk lists FIRST is made unreadable before the scan hashes
+			// it, so it claims the folded name and then bails. Which one that is depends on the
+			// directory's order, and the answer must not.
+			&mut |path| {
+				if !blocked && (path == upper || path == lower) {
+					blocked = true;
+					fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+				}
+			},
+		);
+
+		assert!(
+			scan.errors
+				.iter()
+				.any(|error| matches!(error, ScanError::DuplicateName { .. })),
+			"the pass must still be refused over the collision: {:?}",
+			scan.errors
+		);
+		assert!(
+			sorted_paths(&scan).is_empty(),
+			"and neither spelling may be planned: {:?}",
+			sorted_paths(&scan)
+		);
+
+		fs::set_permissions(&upper, fs::Permissions::from_mode(0o644)).ok();
+		fs::set_permissions(&lower, fs::Permissions::from_mode(0o644)).ok();
 		fs::remove_dir_all(&root).ok();
 	}
 
