@@ -1048,6 +1048,12 @@ pub struct SyncEngine {
 	/// [`load_remote_rules`]). `Arc`: a pass takes the bodies it reuses out from under the lock.
 	/// Bounded by the pair count; an entry goes with its pair.
 	remote_rule_bodies: Mutex<HashMap<PairId, HashMap<Uuid, Arc<str>>>>,
+	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
+	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
+	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
+	/// loop must see the change (a `Notify` wakes one waiter), a burst of setter calls coalesces
+	/// into one wake-up, and a version nobody is subscribed to is still a valid send.
+	user_ignore_changed: tokio::sync::watch::Sender<u64>,
 }
 
 #[cfg(feature = "malformed")]
@@ -1613,6 +1619,7 @@ impl SyncEngine {
 			lock_budget: LockBudget::default(),
 			reading: Mutex::new(HashMap::new()),
 			remote_rule_bodies: Mutex::new(HashMap::new()),
+			user_ignore_changed: tokio::sync::watch::channel(0).0,
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -2618,8 +2625,13 @@ impl SyncEngine {
 	/// A text with a line that does not parse is refused whole, naming the first bad line, and the
 	/// stored patterns stay as they were.
 	///
-	/// A running watch is not woken for this: its next pass reads the new patterns, which is at the
-	/// latest its [`safety_net`](super::WatchConfig::safety_net) tick.
+	/// Every running watch is woken once the new patterns are stored, so the pass that applies them
+	/// runs at once rather than at that loop's [`safety_net`](super::WatchConfig::safety_net) tick.
+	/// A pass already running is left alone — it planned against the patterns it read, and the pass
+	/// behind it re-reads them. A [`paused`](Self::pause_pair) pair's loop runs nothing until it is
+	/// resumed, and then picks this up with everything else it missed. Nor is a loop waiting out the
+	/// backoff after a failed pass woken: that delay is its retry timer, it is syncing nothing while
+	/// it waits, and the retry it already owes re-reads the patterns.
 	pub async fn set_user_ignore(&self, patterns: &str) -> Result<(), Error> {
 		parse_user_ignore(patterns).map_err(|e| {
 			Error::custom(
@@ -2631,7 +2643,19 @@ impl SyncEngine {
 			.lock()
 			.await
 			.set_user_ignore(patterns)
-			.map_err(|e| db_error(e, "storing the user ignore patterns"))
+			.map_err(|e| db_error(e, "storing the user ignore patterns"))?;
+		// Only once the write has committed: a loop this wakes reads the patterns back out of the
+		// DB, so a wake-up sent any earlier could run a pass on the old ones. `send_modify` rather
+		// than `send`, which fails when the last watch has gone — nobody to wake is not an error.
+		self.user_ignore_changed
+			.send_modify(|version| *version = version.wrapping_add(1));
+		Ok(())
+	}
+
+	/// A signal that fires whenever [`set_user_ignore`](Self::set_user_ignore) commits new
+	/// patterns, for a watch loop to wait on (see [`watch_with`](Self::watch_with)).
+	pub(super) fn user_ignore_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+		self.user_ignore_changed.subscribe()
 	}
 
 	/// The stored user ignore patterns, `""` when none were set.
@@ -6465,6 +6489,21 @@ mod tests {
 			"*.psd\nbuild/",
 			"a refused text must not replace the stored one"
 		);
+
+		// The signal every watch loop waits on fires for a text that was STORED, and not for one
+		// that was refused — a wake-up for patterns nothing can read is a pass for nothing.
+		let rules = engine.user_ignore_changes();
+		assert!(!rules.has_changed().unwrap());
+		engine.set_user_ignore("*.tmp\n{a").await.unwrap_err();
+		assert!(!rules.has_changed().unwrap());
+		engine.set_user_ignore("*.tmp").await.unwrap();
+		assert!(rules.has_changed().unwrap());
+
+		// And the setter does not depend on anyone listening: the last watch going away must not
+		// turn the next call into an error.
+		drop(rules);
+		engine.set_user_ignore("*.log").await.unwrap();
+		assert_eq!(engine.user_ignore().await.unwrap(), "*.log");
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
