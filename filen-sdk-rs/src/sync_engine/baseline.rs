@@ -25,9 +25,9 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
 /// first released schema is what a migration path would start from.
 const SCHEMA_VERSION: i64 = 1;
 
-/// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys` is applied
-/// per-connection in [`BaselineStore::init`] (it resets to off on every open). No WAL: a single
-/// owner writes and reads this DB, so the default rollback journal is enough.
+/// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
+/// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
+/// the WAL journal mode set there persists in the file itself.
 ///
 /// `pending_writes` is the journal of remote writes this engine has made that the cache has not
 /// announced yet (see [`PendingWrites`](super::engine::PendingWrites)), keyed by uuid like the
@@ -393,7 +393,13 @@ impl BaselineStore {
 	/// read, since there is no migration chain to bring it here and reading foreign rows under these
 	/// rules would misplan them into deletes.
 	fn init(conn: Connection) -> Result<Self, crate::Error> {
-		conn.execute_batch("PRAGMA foreign_keys = ON;")
+		// Both are per-connection, reset on every open, and neither writes to the file — so they are
+		// safe to apply before this build knows whether the DB is even one it can read. The timeout
+		// covers the version read below too: it retries a transient `SQLITE_BUSY` rather than
+		// failing a pass the moment a second opener (another process, a backup tool) touches it.
+		conn.busy_timeout(std::time::Duration::from_millis(5_000))
+			.map_err(open_error)?;
+		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")
 			.map_err(open_error)?;
 		let version: i64 = conn
 			.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -410,6 +416,30 @@ impl BaselineStore {
 				),
 			));
 		}
+		// Last, and only once the DB is one this build owns: `journal_mode` is the one pragma here
+		// that persists in the file HEADER, so setting it earlier rewrote a DB that was then
+		// refused — leaving a stranger's file in WAL with `-wal`/`-shm` sidecars — and failed on a
+		// read-only file instead of refusing it with the message that says what to do about it.
+		//
+		// WAL with `synchronous = NORMAL` is the pairing the cache uses (`cache/sql/mod.rs`): one
+		// fsync per checkpoint instead of one per commit, which is the difference between a quarter
+		// of a millisecond and a few microseconds for the row a pass writes per applied action —
+		// measured on this store, 331 µs against 14.7 µs. The trade is that a power loss can lose
+		// the last committed transactions. It can never split one, and every write that has to be
+		// atomic already is one — `record_pending` commits the journal row together with the
+		// baseline row it describes — so a lost commit leaves the pair consistent and merely
+		// re-reconciles that path on the next pass.
+		//
+		// It costs a BULK write, which the per-row figure hides: one transaction of 1M rows measured
+		// 11.0 s here against 6.0 s under the rollback journal, because its pages go into the `-wal`
+		// file and are copied into the DB again at the checkpoint, where a rollback journal over a
+		// nearly empty table has almost nothing to undo. A first sync pays that once, against the
+		// per-action writes of every pass after it being ~22x cheaper. Chunking the batch is not a
+		// way out: the one transaction is what makes a subtree's rows land together.
+		//
+		// Answers with the mode it set, which `execute` refuses and `pragma_update` allows.
+		conn.pragma_update(None, "journal_mode", "WAL")
+			.map_err(open_error)?;
 		Ok(Self { conn })
 	}
 
@@ -994,6 +1024,50 @@ mod tests {
 			.unwrap()
 	}
 
+	/// A pragma's value as this connection reports it.
+	fn pragma<T: rusqlite::types::FromSql>(store: &BaselineStore, name: &str) -> T {
+		store
+			.conn
+			.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+			.unwrap()
+	}
+
+	/// Every open runs in WAL with `synchronous = NORMAL` and a busy timeout — the reopen too, which
+	/// takes the early-returning path through `init`. Two of the three are per-connection, so an
+	/// open that skipped them would quietly go back to an fsync per commit, which is what made the
+	/// row-per-action writes of a first sync cost a quarter of a millisecond each.
+	#[test]
+	fn every_open_runs_in_wal_with_normal_sync_and_a_busy_timeout() {
+		let path = temp_db_path("wal");
+		let assert_pragmas = |store: &BaselineStore| {
+			assert_eq!(pragma::<String>(store, "journal_mode"), "wal");
+			assert_eq!(pragma::<i64>(store, "synchronous"), 1, "NORMAL is 1");
+			assert_eq!(pragma::<i64>(store, "busy_timeout"), 5_000);
+		};
+		let entry = file_entry("a.txt", [1u8; 32], 3);
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			assert_pragmas(&store);
+			let (pair, _) = store
+				.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+				.unwrap();
+			store.upsert_entry(pair, &entry).unwrap();
+			pair
+		};
+
+		let reopened = BaselineStore::open(&path).unwrap();
+		assert_pragmas(&reopened);
+		assert_eq!(
+			reopened.entry(pair, "a.txt").unwrap().as_ref(),
+			Some(&entry),
+			"the row written under WAL must read back after the reopen"
+		);
+		drop(reopened);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+		}
+	}
+
 	#[test]
 	fn a_fresh_db_is_stamped_at_the_current_schema_version() {
 		let store = BaselineStore::open_in_memory().unwrap();
@@ -1030,6 +1104,55 @@ mod tests {
 			assert_eq!(still, planted, "the refused DB was rewritten");
 			drop(raw);
 			std::fs::remove_file(&path).ok();
+		}
+	}
+
+	/// A DB this build refuses is not written to on the way out. The journal mode is the one pragma
+	/// that persists in the file HEADER, so setting it before the version check switched a stranger's
+	/// DB — one a newer build wrote — to WAL and left `-wal`/`-shm` sidecars beside it, and a
+	/// read-only file failed at the pragma instead of being refused with the message that explains
+	/// what to do about it.
+	#[test]
+	fn a_refused_db_keeps_the_journal_mode_it_arrived_in() {
+		let path = temp_db_path("refused_journal_mode");
+		let journal_mode = |conn: &Connection| -> String {
+			conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+				.unwrap()
+		};
+		{
+			// Not opened through `BaselineStore`: this file has never been in WAL, and it has a
+			// table, so it reads as written rather than brand new.
+			let raw = Connection::open(&path).unwrap();
+			raw.execute_batch(&format!(
+				"CREATE TABLE something (id INTEGER PRIMARY KEY);
+				 PRAGMA user_version = {};",
+				SCHEMA_VERSION + 1
+			))
+			.unwrap();
+			assert_eq!(
+				journal_mode(&raw),
+				"delete",
+				"the fixture starts in rollback"
+			);
+		}
+
+		match BaselineStore::open(&path) {
+			Ok(_) => panic!("a foreign schema version must be refused"),
+			Err(error) => assert!(
+				error.to_string().contains("refusing"),
+				"the refusal must name the version problem: {error}"
+			),
+		}
+
+		let raw = Connection::open(&path).unwrap();
+		assert_eq!(
+			journal_mode(&raw),
+			"delete",
+			"the refused DB was switched to WAL on the way to the refusal"
+		);
+		drop(raw);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
 		}
 	}
 
