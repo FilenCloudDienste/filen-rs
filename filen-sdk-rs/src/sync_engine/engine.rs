@@ -689,11 +689,19 @@ impl PendingWrites {
 		remote: &HashMap<String, RemoteNode>,
 	) -> plan::PassHolds {
 		let now = Instant::now();
-		let snapshot_path: HashMap<Uuid, &str> = remote
-			.iter()
-			.map(|(path, node)| (node.remote_uuid, path.as_str()))
-			.collect();
 		let mut map = self.map();
+		// Only this pair's OWN records consult the snapshot, and indexing every remote node for a
+		// pass that journalled none is the whole cost of this call on a large tree. The two rules
+		// above the pair check read the record by itself, so they still run — from an empty index —
+		// and still retire what the cache has demonstrably caught up to, whoever wrote it.
+		let snapshot_path: HashMap<Uuid, &str> = if map.values().any(|write| write.pair == pair) {
+			remote
+				.iter()
+				.map(|(path, node)| (node.remote_uuid, path.as_str()))
+				.collect()
+		} else {
+			HashMap::new()
+		};
 		map.retain(|uuid, write| {
 			// The cache announced this uuid after we wrote it: it has caught up, whether the item
 			// still exists, was superseded by a re-upload, or has since been trashed.
@@ -7982,6 +7990,30 @@ mod tests {
 		);
 		assert!(!remote.contains_key("gone.txt"), "the trash is folded out");
 		assert_eq!(remote["note.txt"].remote_uuid, created);
+	}
+
+	/// A pass indexes the snapshot only for writes of its own, and a pair that journalled none
+	/// indexes nothing. What it must NOT skip is the retirement that reads a record by itself: the
+	/// cache announcing a uuid retires that record whichever pair's pass happens to see it, or a
+	/// write nobody passes over again would be folded into the view for ever.
+	#[test]
+	fn a_pass_with_no_write_of_its_own_still_retires_an_announced_one() {
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let uuid = Uuid::new_v4();
+		pending.record(&observations, PAIR, uuid, created("a.txt", None));
+		observations.note_uuids([uuid]);
+
+		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &HashMap::new());
+
+		assert!(
+			holds.trashed.is_empty(),
+			"a pass holds nothing on behalf of another pair"
+		);
+		assert!(
+			pending.uuids().is_empty(),
+			"the announcement retires the record even though the passing pair owns no write"
+		);
 	}
 
 	/// The oldest surviving write's stamp bounds what still has to be remembered; with nothing
