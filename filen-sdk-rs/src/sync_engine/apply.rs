@@ -1624,8 +1624,19 @@ async fn apply_one(
 				ctx.remote.get(to_path),
 				local_mtime_of(&to),
 			);
-			delete_baseline(ctx, from_path).await?;
-			upsert_baseline(ctx, &row).await?;
+			// One transaction, delete before upsert: a crash between the two would leave the file
+			// with no row at either path, and the next pass would read it as newly created.
+			ctx.store
+				.lock()
+				.await
+				.apply_changes(
+					ctx.pair,
+					&[
+						BaselineChange::Delete(from_path.as_str()),
+						BaselineChange::Upsert(&row),
+					],
+				)
+				.map_err(db_err)?;
 			report.moved_local += 1;
 		}
 		SyncAction::MoveRemote {
