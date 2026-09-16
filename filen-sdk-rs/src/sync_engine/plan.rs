@@ -21,7 +21,7 @@ use super::{
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
-	scan::{LocalNode, QUARANTINE_DIR, collision_key},
+	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
 };
 use crate::{
 	cache::UndecodableItem,
@@ -459,10 +459,12 @@ pub(crate) fn build_remote_view(
 		None
 	};
 
-	let mut nodes = HashMap::new();
-	// collision key -> the raw path that claimed it, so a byte-identical duplicate is told apart
-	// from a case-only one.
-	let mut claimed: HashMap<String, String> = HashMap::new();
+	let capacity = dirs.len() + files.len();
+	let mut nodes: HashMap<String, RemoteNode> = HashMap::with_capacity(capacity);
+	// A digest of every collision key taken so far. The paths themselves are not kept: a hit is
+	// rare and is resolved against the paths already placed, which is what tells a byte-identical
+	// duplicate from a case-only one.
+	let mut claimed: HashSet<u128> = HashSet::with_capacity(capacity);
 	let mut has_collisions = false;
 	let mut held_paths: BTreeSet<String> = BTreeSet::new();
 	let mut ignored = BTreeMap::new();
@@ -496,15 +498,24 @@ pub(crate) fn build_remote_view(
 			}
 			return;
 		}
-		match claimed.get(&collision_key(&rel_path)) {
-			None => {
-				claimed.insert(collision_key(&rel_path), rel_path.clone());
-				nodes.insert(rel_path, node);
-			}
+		let key = collision_key(&rel_path);
+		if claimed.insert(collision_hash(&key)) {
+			nodes.insert(rel_path, node);
+			return;
+		}
+		// Which item already folded that way — asked on the error path only. A held path counts:
+		// both halves of such a name were taken back out of `nodes`. Finding nothing means the
+		// digests collided rather than the names, and a pass is never refused over that.
+		let twin = nodes
+			.keys()
+			.chain(held_paths.iter())
+			.find(|taken| collision_key(taken.as_str()) == key)
+			.cloned();
+		match twin {
 			// Byte-identical names under one parent cannot exist on the server, so this is the
 			// cache showing both halves of a re-upload at once. Withhold the path for this pass
 			// rather than refusing the whole one; the next snapshot has one of them.
-			Some(previous) if *previous == rel_path => {
+			Some(previous) if previous == rel_path => {
 				tracing::debug!(
 					"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
 				);
@@ -513,6 +524,9 @@ pub(crate) fn build_remote_view(
 			}
 			// A genuine case-only collision: no 1:1 local mapping exists, so the pass is refused.
 			Some(_) => has_collisions = true,
+			None => {
+				nodes.insert(rel_path, node);
+			}
 		}
 	};
 
