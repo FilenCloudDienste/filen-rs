@@ -9,7 +9,7 @@
 use std::{
 	cell::RefCell,
 	cmp::Reverse,
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
@@ -323,7 +323,7 @@ pub(crate) struct RemoteView {
 	/// its dedup is on the lowercased name hash — so it can only be a cache mid-transition: a
 	/// re-upload whose successor has been applied while the predecessor's trash has not. Only that
 	/// one path is held back; the pass runs.
-	pub(crate) held_paths: HashSet<String>,
+	pub(crate) held_paths: BTreeSet<String>,
 	/// Remote items that exist but are NOT in `nodes`, and why. Their absence from `nodes` is no
 	/// evidence of a deletion (see [`unknown_remote_paths`]).
 	pub(crate) skipped: Vec<SkippedRemote>,
@@ -448,7 +448,7 @@ pub(crate) fn build_remote_view(
 	// from a case-only one.
 	let mut claimed: HashMap<String, String> = HashMap::new();
 	let mut has_collisions = false;
-	let mut held_paths: HashSet<String> = HashSet::new();
+	let mut held_paths: BTreeSet<String> = BTreeSet::new();
 	let mut ignored = BTreeMap::new();
 
 	let mut insert = |rel_path: String, node: RemoteNode| {
@@ -1615,8 +1615,8 @@ fn detect_moves(
 
 /// Whether `key` is one of `held` or lives under one. A path the view cannot resolve makes
 /// everything the snapshot would otherwise resolve beneath it unresolvable too.
-fn is_under_held_path(key: &str, held: &HashSet<String>) -> bool {
-	held.contains(key) || held.iter().any(|p| is_under(key, p))
+fn is_under_held_path(key: &str, held: &BTreeSet<String>) -> bool {
+	at_or_under_root(held, key)
 }
 
 /// Whether `path` is a STRICT descendant of `prefix` (`prefix/...`).
@@ -1626,10 +1626,43 @@ pub(super) fn is_under(path: &str, prefix: &str) -> bool {
 		&& path.as_bytes()[..prefix.len()] == *prefix.as_bytes()
 }
 
+/// Whether `path` is one of `roots` or lives under one, found by walking the path's OWN ancestors
+/// and asking the sorted set for each: O(depth · log n), where asking [`is_under`] per root is a
+/// scan of every root for every path.
+///
+/// The walk is what makes it an ancestor test. Seeking to the nearest key at or before `path`
+/// answers something else: with `a` and `a/b` recorded, the key before `a/c` is `a/b`, which is not
+/// an ancestor of it, while the ancestor `a` lies further back still.
+///
+/// An ancestor walk never yields `""`, so a root of `""` covers only the pair root itself here. The
+/// one caller for which it means "everything is under it" asks for that separately (`drop_blocked`).
+pub(super) fn at_or_under_root(roots: &BTreeSet<String>, path: &str) -> bool {
+	roots.contains(path)
+		|| path
+			.match_indices('/')
+			.any(|(i, _)| roots.contains(&path[..i]))
+}
+
+/// The key range of everything strictly under `dir`: `dir/` up to `dir0`. `/` is 0x2F and `0` is
+/// 0x30 and paths compare bytewise, so the half-open range is exactly that subtree, and a sorted map
+/// or set answers "is anything under here?" by seeking to it instead of testing every key. `""`
+/// holds nothing by this rule, as `is_under(path, "")` holds for nothing.
+pub(super) fn subtree_bounds(dir: &str) -> std::ops::Range<String> {
+	format!("{dir}/")..format!("{dir}0")
+}
+
+/// The entries of `map` strictly under `dir`, in key order (see [`subtree_bounds`]).
+pub(super) fn under_dir<'m, V>(
+	map: &'m BTreeMap<String, V>,
+	dir: &str,
+) -> btree_map::Range<'m, String, V> {
+	map.range(subtree_bounds(dir))
+}
+
 /// Whether a directory move with `end` as one of its ends touches a path the cache is holding: at
 /// or under it, or above it.
-fn touches_held(end: &str, held: &HashSet<String>) -> bool {
-	is_under_held_path(end, held) || held.iter().any(|path| is_under(path, end))
+fn touches_held(end: &str, held: &BTreeSet<String>) -> bool {
+	is_under_held_path(end, held) || held.range(subtree_bounds(end)).next().is_some()
 }
 
 /// Where `path` lands when the directory at `from` moves to `to`; `None` when it is neither `from`
@@ -1712,7 +1745,7 @@ pub(crate) fn fold_dir_moves(
 	baseline: &mut HashMap<String, BaselineEntry>,
 	local: &mut HashMap<String, LocalNode>,
 	remote: &mut HashMap<String, RemoteNode>,
-	held: &HashSet<String>,
+	held: &BTreeSet<String>,
 ) -> Vec<SyncAction> {
 	let mut renames = Vec::new();
 	while let Some(action) = next_case_only_dir_rename(mode, baseline, local, remote, held)
@@ -1746,7 +1779,7 @@ fn next_case_only_dir_rename(
 	baseline: &HashMap<String, BaselineEntry>,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
-	held: &HashSet<String>,
+	held: &BTreeSet<String>,
 ) -> Option<SyncAction> {
 	// Collision key -> the local directory no remote item holds under that exact spelling. The scan
 	// refuses two local entries with one key, so the map loses nothing.
@@ -1846,7 +1879,7 @@ fn next_dir_move(
 	baseline: &HashMap<String, BaselineEntry>,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
-	held: &HashSet<String>,
+	held: &BTreeSet<String>,
 ) -> Option<SyncAction> {
 	let mut sources: Vec<(&str, Uuid)> = baseline
 		.iter()
@@ -1909,7 +1942,7 @@ fn dir_move_from<'a>(
 	baseline: &'a HashMap<String, BaselineEntry>,
 	local: &'a HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
-	held: &HashSet<String>,
+	held: &BTreeSet<String>,
 	sources: &[(&'a str, Uuid)],
 	remote_dir_at: &HashMap<Uuid, &str>,
 	new_local_dirs: &mut Option<Vec<NewLocalDir<'a>>>,
@@ -2167,7 +2200,7 @@ pub(crate) struct PassHolds {
 	/// freezing it would stall that.
 	pub(crate) trashed: HashSet<Uuid>,
 	/// Remote paths the cache is showing mid-transition (see [`RemoteView::held_paths`]).
-	pub(crate) held_remote: HashSet<String>,
+	pub(crate) held_remote: BTreeSet<String>,
 }
 
 /// One reconciled pass.
@@ -2486,7 +2519,7 @@ mod tests {
 			&mut baseline,
 			&mut local,
 			&mut remote,
-			&HashSet::new(),
+			&BTreeSet::new(),
 		);
 		actions.extend(plan(mode, &baseline, &local, &remote));
 		actions
@@ -2704,7 +2737,7 @@ mod tests {
 				&mut baseline,
 				&mut local,
 				&mut remote,
-				&HashSet::new()
+				&BTreeSet::new()
 			)
 			.is_empty()
 		);
@@ -3073,7 +3106,7 @@ mod tests {
 	#[test]
 	fn a_dir_under_a_held_remote_path_is_not_moved() {
 		let (mut baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
-		let held = HashSet::from(["documents/sub/b.txt".to_string()]);
+		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -5786,7 +5819,7 @@ mod tests {
 			!view.has_collisions,
 			"a cache in transition must not refuse the pass"
 		);
-		assert_eq!(view.held_paths, HashSet::from(["note.txt".to_string()]));
+		assert_eq!(view.held_paths, BTreeSet::from(["note.txt".to_string()]));
 		assert!(
 			!view.nodes.contains_key("note.txt"),
 			"neither half of the transition may be reconciled against"
@@ -5795,6 +5828,54 @@ mod tests {
 			view.nodes["other.txt"].remote_uuid, sibling.uuid,
 			"every other path still syncs"
 		);
+	}
+
+	/// The counter-example that rules out seeking to the nearest key at or before the path: with `a`
+	/// and `a/b` recorded, the key before `a/c` is `a/b`, which is no ancestor of it, while the
+	/// ancestor `a` lies further back. Walking the path's own ancestors finds it.
+	#[test]
+	fn a_root_lookup_walks_ancestors_rather_than_seeking_to_the_nearest_key() {
+		let roots: BTreeSet<String> = ["a", "a/b"].map(String::from).into();
+
+		assert!(
+			at_or_under_root(&roots, "a/c"),
+			"`a` is an ancestor of `a/c`"
+		);
+		assert!(at_or_under_root(&roots, "a"), "a root is at itself");
+		assert!(at_or_under_root(&roots, "a/b/deep"));
+		// Neighbours that merely share the prefix are not under it.
+		for outside in ["ab", "a0", "a.", "b", ""] {
+			assert!(!at_or_under_root(&roots, outside), "{outside:?}");
+		}
+	}
+
+	/// `""` is the pair root: the ancestor walk never yields it and its subtree range holds nothing,
+	/// which is exactly what `is_under(path, "")` says. A caller for which it means "everything is
+	/// under it" has to say so itself.
+	#[test]
+	fn the_pair_root_covers_only_itself() {
+		let roots: BTreeSet<String> = ["", "a"].map(String::from).into();
+
+		assert!(at_or_under_root(&roots, ""), "the pair root is at itself");
+		assert!(!is_under("x/y", ""));
+		assert!(roots.range(subtree_bounds("")).next().is_none());
+	}
+
+	/// The subtree range is the subtree and nothing else: `/` is 0x2F and `0` is 0x30, so the
+	/// half-open range stops exactly where the names that only share the prefix begin.
+	#[test]
+	fn a_subtree_range_holds_exactly_the_subtree() {
+		let roots: BTreeSet<String> = ["a", "a/b", "a/b/c", "a.", "a0", "ab", "b"]
+			.map(String::from)
+			.into();
+
+		let under: Vec<&str> = roots
+			.range(subtree_bounds("a"))
+			.map(String::as_str)
+			.collect();
+
+		assert_eq!(under, ["a/b", "a/b/c"]);
+		assert!(roots.range(subtree_bounds("b")).next().is_none());
 	}
 
 	/// A case-only collision is a real one — the server does allow both names, and no 1:1 local

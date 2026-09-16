@@ -20,7 +20,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeSet, HashMap, HashSet},
+	collections::{BTreeSet, HashMap},
 	fmt::Write as _,
 	fs,
 	path::{Path, PathBuf},
@@ -424,7 +424,7 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 	let mut baseline = baseline;
 	let mut local = scan.nodes;
 	let mut remote = view.nodes;
-	let held = HashSet::new();
+	let held = BTreeSet::new();
 	plan::fold_dir_moves(
 		SyncMode::TwoWay,
 		&mut baseline,
@@ -639,7 +639,7 @@ pub fn run() -> String {
 	let mut baseline = baseline;
 	let mut local = warm_scan.nodes;
 	let mut remote = view.nodes;
-	let held = HashSet::new();
+	let held = BTreeSet::new();
 	let (moves, fold) = timed(|| {
 		plan::fold_dir_moves(
 			SyncMode::TwoWay,
