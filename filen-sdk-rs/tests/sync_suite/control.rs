@@ -267,6 +267,8 @@ async fn control_user_ignore_applies_from_the_next_pass() {
 		vec![IgnoredPath {
 			rel_path: "a.psd".to_string(),
 			level: IgnoreLevel::User,
+			// The line as it was written, not the folded text that matched.
+			pattern: "*.PSD".to_string(),
 			tracked: false,
 		}]
 	);

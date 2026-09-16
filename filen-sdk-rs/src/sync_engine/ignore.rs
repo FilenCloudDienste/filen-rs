@@ -132,6 +132,14 @@ impl fmt::Display for IgnoreLevel {
 pub struct IgnoredPath {
 	pub rel_path: String,
 	pub level: IgnoreLevel,
+	/// The deciding line, as the user wrote it: NFC, before the case folding the matcher does, so a
+	/// rule written `Ä*` reports `Ä*`, and one that escapes its trailing space keeps it. Where an
+	/// ancestor directory's rule hides the path, `rel_path` is that ancestor, so the line names the
+	/// reported item; where both sides hide it, the local side's line is the one reported. The line
+	/// is reported as it matched, against the path it matched: a folded directory move re-keys the
+	/// entry, so a path-shaped line (`docs/build/`) can still name the pre-move path until the next
+	/// pass decides again.
+	pub pattern: String,
 	/// A baseline row sat at or under the path when the pass read it: it was synced before, and this
 	/// pass stopped tracking it. Removing the rule later syncs it like a first sync. Only the pass
 	/// that drops the rows reports it so; a dry run reports it until a pass has run.
@@ -140,7 +148,11 @@ pub struct IgnoredPath {
 
 impl fmt::Display for IgnoredPath {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "ignored {:?} (by {})", self.rel_path, self.level)?;
+		write!(
+			f,
+			"ignored {:?} (by {}: {})",
+			self.rel_path, self.level, self.pattern
+		)?;
 		if self.tracked {
 			f.write_str(", no longer synced")?;
 		}
@@ -233,6 +245,25 @@ pub(crate) struct IgnoreHit<'a> {
 	pub(crate) pattern: &'a str,
 }
 
+/// An [`IgnoreHit`] a pass keeps: the level and the deciding line, owned. The line rides BESIDE the
+/// level, never inside it, because two levels that differ only by which line matched must still
+/// compare equal — the withheld-delete rule in `engine.rs` reads them by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IgnoreDecision {
+	pub(crate) level: IgnoreLevel,
+	/// The line as written (see [`IgnoredPath::pattern`]).
+	pub(crate) pattern: String,
+}
+
+impl From<IgnoreHit<'_>> for IgnoreDecision {
+	fn from(hit: IgnoreHit<'_>) -> Self {
+		Self {
+			level: hit.origin.into(),
+			pattern: hit.pattern.to_owned(),
+		}
+	}
+}
+
 /// Every rule a pass evaluates.
 #[derive(Debug, Default)]
 pub(crate) struct IgnoreRules {
@@ -290,15 +321,15 @@ impl IgnoreRules {
 		None
 	}
 
-	/// The top-most ignored path at or above `rel_path`, with the level of the rule that hides it:
-	/// git's rule that nothing under an ignored directory can be re-included. `memo` caches
-	/// per-directory answers across calls on the same rules.
+	/// The top-most ignored path at or above `rel_path`, with the rule that hides it: git's rule that
+	/// nothing under an ignored directory can be re-included. `memo` caches per-directory answers
+	/// across calls on the same rules.
 	pub(crate) fn ignored_root<'p>(
 		&self,
 		rel_path: &'p str,
 		is_dir: bool,
-		memo: &mut HashMap<String, Option<IgnoreLevel>>,
-	) -> Option<(&'p str, IgnoreLevel)> {
+		memo: &mut HashMap<String, Option<IgnoreDecision>>,
+	) -> Option<(&'p str, IgnoreDecision)> {
 		// The pair root itself is never ignored.
 		if rel_path.is_empty() {
 			return None;
@@ -306,16 +337,18 @@ impl IgnoreRules {
 		for (i, _) in rel_path.match_indices('/') {
 			let ancestor = &rel_path[..i];
 			if !memo.contains_key(ancestor) {
-				let level = self.decide(ancestor, true).map(|hit| hit.origin.into());
-				memo.insert(ancestor.to_owned(), level);
+				let decision = self.decide(ancestor, true).map(IgnoreDecision::from);
+				memo.insert(ancestor.to_owned(), decision);
 			}
-			if let Some(Some(level)) = memo.get(ancestor) {
-				// Owned: the caller keeps the level past the memo.
-				return Some((ancestor, level.clone()));
+			if let Some(Some(decision)) = memo.get(ancestor) {
+				// Owned: the caller keeps the decision past the memo. The memo saves the matching, not
+				// this copy — a caller that only asks whether a path is hidden still copies the line
+				// once per call.
+				return Some((ancestor, decision.clone()));
 			}
 		}
 		self.decide(rel_path, is_dir)
-			.map(|hit| (rel_path, hit.origin.into()))
+			.map(|hit| (rel_path, hit.into()))
 	}
 }
 
@@ -468,11 +501,19 @@ pub(crate) fn rule_file_dir(rel_path: &str) -> Option<&str> {
 	}
 }
 
-/// The matched line before case folding (`Glob::original` is the folded one).
+/// The matched line before case folding (`Glob::original` is the folded one). Trailing whitespace is
+/// dropped exactly where the parser drops it, so a line that escapes its trailing space keeps both
+/// the escape and the space instead of reporting a dangling `\`.
 fn as_written(glob: &Glob) -> &str {
 	glob.from()
 		.and_then(Path::to_str)
-		.map_or(glob.original(), str::trim_end)
+		.map_or(glob.original(), |line| {
+			if line.ends_with("\\ ") {
+				line
+			} else {
+				line.trim_end()
+			}
+		})
 }
 
 fn parent(rel_path: &str) -> &str {
@@ -502,6 +543,14 @@ mod tests {
 		rules
 			.ignored_root(rel_path, is_dir, &mut HashMap::new())
 			.is_some()
+	}
+
+	/// The decision hiding `rel_path`, which must be hidden.
+	fn decision(rules: &IgnoreRules, rel_path: &str) -> IgnoreDecision {
+		rules
+			.ignored_root(rel_path, F, &mut HashMap::new())
+			.unwrap_or_else(|| panic!("{rel_path} is not ignored"))
+			.1
 	}
 
 	const F: bool = false;
@@ -699,19 +748,69 @@ mod tests {
 	fn memo_serves_later_paths_under_an_ignored_directory() {
 		let rules = root_rules("build/");
 		let mut memo = HashMap::new();
-		let root_level = IgnoreLevel::File { dir: String::new() };
+		let by_root = IgnoreDecision {
+			level: IgnoreLevel::File { dir: String::new() },
+			pattern: "build/".to_string(),
+		};
 		assert_eq!(
 			rules.ignored_root("build/a/b", F, &mut memo),
-			Some(("build", root_level.clone()))
+			Some(("build", by_root.clone()))
 		);
-		assert_eq!(memo.get("build"), Some(&Some(root_level.clone())));
+		assert_eq!(memo.get("build"), Some(&Some(by_root.clone())));
 		assert_eq!(
 			rules.ignored_root("build/c", F, &mut memo),
-			Some(("build", root_level))
+			Some(("build", by_root))
 		);
 		assert_eq!(rules.ignored_root("src/c", F, &mut memo), None);
 		assert_eq!(memo.get("src"), Some(&None));
 		assert_eq!(rules.ignored_root("", D, &mut memo), None);
+	}
+
+	/// A path an ancestor directory's rule hides is reported at that ancestor, so the line that comes
+	/// back is the line for the reported path — the leaf's own name matched nothing.
+	#[test]
+	fn an_ancestor_rule_comes_back_with_the_ancestor() {
+		let rules = root_rules("*.log\nbuild/");
+		// A leaf the `*.log` line also matches, so consulting the leaf first would come back with a
+		// different path AND a different line.
+		assert_eq!(
+			rules.ignored_root("build/deep/a.log", F, &mut HashMap::new()),
+			Some((
+				"build",
+				IgnoreDecision {
+					level: IgnoreLevel::File { dir: String::new() },
+					pattern: "build/".to_string(),
+				}
+			))
+		);
+	}
+
+	/// The line comes back as the user wrote it, not as the case-folded text the matcher holds.
+	#[test]
+	fn the_reported_line_is_the_one_as_written() {
+		let rules = IgnoreRules::new(Some(source("Ä*\n*.JPG", Origin::User)));
+		assert_eq!(decision(&rules, "ä.txt").pattern, "Ä*");
+		assert_eq!(decision(&rules, "sub/IMG.jpg").pattern, "*.JPG");
+	}
+
+	/// A line that escapes its trailing space keeps it. Trimming it off would report a dangling `\`,
+	/// which is not a line anyone wrote and not one that would match if pasted back.
+	#[test]
+	fn an_escaped_trailing_space_is_reported_with_the_space() {
+		let rules = root_rules("node_modules\\ ");
+		assert_eq!(decision(&rules, "node_modules ").pattern, "node_modules\\ ");
+	}
+
+	/// The line rides beside the level, never inside it: two paths one source hides with different
+	/// lines keep equal levels, which is what the rule that keeps a deleted directory compares.
+	#[test]
+	fn two_decisions_differing_only_in_the_line_keep_equal_levels() {
+		let rules = root_rules("*.log\n*.tmp");
+		let one = decision(&rules, "a.log");
+		let other = decision(&rules, "b.tmp");
+		assert_ne!(one.pattern, other.pattern);
+		assert_eq!(one.level, other.level);
+		assert_ne!(one, other);
 	}
 
 	#[test]

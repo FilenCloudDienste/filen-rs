@@ -34,8 +34,8 @@ use unicode_normalization::UnicodeNormalization;
 use super::{
 	baseline::{BaselineEntry, NodeKind},
 	ignore::{
-		FILENIGNORE, IgnoreLevel, IgnoreParseError, IgnoreRules, IgnoreSource, MAX_RULE_FILE_BYTES,
-		Origin, rule_file_text,
+		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
+		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
 	},
 };
 use crate::{
@@ -142,10 +142,10 @@ pub(crate) struct LocalScan {
 	/// path. The engine blocks every action at or under the link, so what an earlier pass synced
 	/// there is not read as deleted, and nothing is downloaded through the link.
 	pub(crate) aliased_dirs: BTreeMap<String, String>,
-	/// The top-most entries the ignore rules hide, with the level of the deciding rule. Neither they
-	/// nor anything under them is in `nodes`, hashed or checked for collisions, and a `.filenignore`
-	/// inside one is never read.
-	pub(crate) ignored: BTreeMap<String, IgnoreLevel>,
+	/// The top-most entries the ignore rules hide, with the deciding rule. Neither they nor anything
+	/// under them is in `nodes`, hashed or checked for collisions, and a `.filenignore` inside one is
+	/// never read.
+	pub(crate) ignored: BTreeMap<String, IgnoreDecision>,
 	/// Directories whose `.filenignore` could not be used (unreadable, or not compilable as a whole).
 	/// Their subtrees are still scanned into `nodes`, since they exist; `""` is the root.
 	pub(crate) ignore_blocked: BTreeSet<String>,
@@ -454,7 +454,7 @@ pub(crate) fn scan_local(
 			};
 			// Its ancestors were all accepted, so the leaf's own decision is git's answer.
 			if let Some(hit) = rules.decide(&rel_path, is_dir) {
-				ignored.insert(rel_path, hit.origin.into());
+				ignored.insert(rel_path, hit.into());
 				return false;
 			}
 			if let Some(target) = alias_target(e, canonical_root.as_deref()) {
@@ -651,7 +651,7 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::sync_engine::baseline::BaselineState;
+	use crate::sync_engine::{baseline::BaselineState, ignore::IgnoreLevel};
 
 	fn temp_root() -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!("filen_scan_test_{}", Uuid::new_v4()));
@@ -1176,19 +1176,29 @@ mod tests {
 			vec![".filenignore", "keep.txt", "sub", "sub/.filenignore", "tmp"]
 		);
 		// `build/b.log` matches `*.log` too, but the walk never went into `build`.
-		let root_file = || IgnoreLevel::File { dir: String::new() };
+		let by = |level: IgnoreLevel, pattern: &str| IgnoreDecision {
+			level,
+			pattern: pattern.to_string(),
+		};
+		let root_file = |pattern: &str| by(IgnoreLevel::File { dir: String::new() }, pattern);
 		assert_eq!(
 			scan.ignored,
 			BTreeMap::from([
-				("build".to_string(), root_file()),
-				("sub/.DS_Store".to_string(), IgnoreLevel::Default),
+				("build".to_string(), root_file("build/")),
+				(
+					"sub/.DS_Store".to_string(),
+					by(IgnoreLevel::Default, ".DS_Store")
+				),
 				(
 					"sub/tmp".to_string(),
-					IgnoreLevel::File {
-						dir: "sub".to_string()
-					}
+					by(
+						IgnoreLevel::File {
+							dir: "sub".to_string()
+						},
+						"/tmp"
+					)
 				),
-				("x.log".to_string(), root_file()),
+				("x.log".to_string(), root_file("*.log")),
 			])
 		);
 		assert!(scan.ignore_blocked.is_empty());

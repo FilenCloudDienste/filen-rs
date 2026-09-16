@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	events::SyncEvent,
-	ignore::{IgnoreLevel, IgnoreRules},
+	ignore::{IgnoreDecision, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key},
 };
@@ -327,9 +327,9 @@ pub(crate) struct RemoteView {
 	/// Remote items that exist but are NOT in `nodes`, and why. Their absence from `nodes` is no
 	/// evidence of a deletion (see [`unknown_remote_paths`]).
 	pub(crate) skipped: Vec<SkippedRemote>,
-	/// The top-most items the ignore rules hide, with the level of the deciding rule. Neither they
-	/// nor anything under them is in `nodes` or `skipped`, or checked for collisions.
-	pub(crate) ignored: BTreeMap<String, IgnoreLevel>,
+	/// The top-most items the ignore rules hide, with the deciding rule. Neither they nor anything
+	/// under them is in `nodes` or `skipped`, or checked for collisions.
+	pub(crate) ignored: BTreeMap<String, IgnoreDecision>,
 }
 
 /// A remote item the snapshot holds that the view could not place at a path.
@@ -458,13 +458,13 @@ pub(crate) fn build_remote_view(
 		}
 		// Before the collision check, so ignored case-twins never refuse the pass.
 		if let Some(rules) = rules
-			&& let Some((ignored_root, level)) = rules.ignored_root(
+			&& let Some((ignored_root, decision)) = rules.ignored_root(
 				&rel_path,
 				node.kind == NodeKind::Dir,
 				&mut memo.borrow_mut(),
 			) {
 			if !ignored.contains_key(ignored_root) {
-				ignored.insert(ignored_root.to_owned(), level);
+				ignored.insert(ignored_root.to_owned(), decision);
 			}
 			return;
 		}
@@ -2426,7 +2426,7 @@ mod tests {
 	use super::{
 		super::{
 			engine::{Observations, PendingKind, PendingWrites},
-			ignore::{IgnoreSource, Origin},
+			ignore::{IgnoreLevel, IgnoreSource, Origin},
 		},
 		*,
 	};
@@ -5404,13 +5404,16 @@ mod tests {
 		let view = build_remote_view(root, &dirs, &files, &undecodables, Some(&rules));
 		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
 		assert!(!view.has_collisions);
-		let level = IgnoreLevel::File { dir: String::new() };
+		let by = |pattern: &str| IgnoreDecision {
+			level: IgnoreLevel::File { dir: String::new() },
+			pattern: pattern.to_string(),
+		};
 		assert_eq!(
 			view.ignored,
 			BTreeMap::from([
-				("A.tmp".to_string(), level.clone()),
-				("a.TMP".to_string(), level.clone()),
-				("build".to_string(), level),
+				("A.tmp".to_string(), by("*.tmp")),
+				("a.TMP".to_string(), by("*.tmp")),
+				("build".to_string(), by("build/")),
 			])
 		);
 		assert_eq!(

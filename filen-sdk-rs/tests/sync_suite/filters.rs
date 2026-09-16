@@ -135,10 +135,11 @@ fn clean(report: &SyncReport) {
 	assert!(report.refused.is_none(), "pass refused: {report:?}");
 }
 
-fn by_root_file(rel_path: &str, tracked: bool) -> IgnoredPath {
+fn by_root_file(rel_path: &str, pattern: &str, tracked: bool) -> IgnoredPath {
 	IgnoredPath {
 		rel_path: rel_path.to_string(),
 		level: IgnoreLevel::File { dir: String::new() },
+		pattern: pattern.to_string(),
 		tracked,
 	}
 }
@@ -190,7 +191,7 @@ async fn filter_root_filenignore_both_sides() {
 	clean(&first);
 	assert_eq!(first.uploaded, 1, "only .filenignore uploads: {first:?}");
 	assert_eq!(first.downloaded, 0, "{first:?}");
-	assert_eq!(first.ignored, vec![by_root_file("build", false)]);
+	assert_eq!(first.ignored, vec![by_root_file("build", "build/", false)]);
 	let steady = sc.sync().await;
 	clean(&steady);
 	assert_eq!((steady.uploaded, steady.downloaded), (0, 0), "{steady:?}");
@@ -224,8 +225,8 @@ async fn filter_nested_and_whitelist() {
 	assert_eq!(
 		report.ignored,
 		vec![
-			by_root_file("a.log", false),
-			by_root_file("logs/b.log", false)
+			by_root_file("a.log", "*.log", false),
+			by_root_file("logs/b.log", "*.log", false)
 		]
 	);
 	assert_eq!(
@@ -246,7 +247,10 @@ async fn filter_parent_excluded_cannot_reinclude() {
 
 	let report = sc.sync().await;
 	clean(&report);
-	assert_eq!(report.ignored, vec![by_root_file("secret", false)]);
+	assert_eq!(
+		report.ignored,
+		vec![by_root_file("secret", "secret/", false)]
+	);
 	assert_eq!(
 		remote_paths(&sc.cache.client, &sc.resources.dir).await,
 		paths(&[".filenignore", "public.txt"])
@@ -273,6 +277,7 @@ async fn filter_remote_only_filenignore_applies() {
 				level: IgnoreLevel::File {
 					dir: "x".to_string(),
 				},
+				pattern: "*.tmp".to_string(),
 				tracked: false,
 			})
 			.to_vec()
@@ -310,7 +315,11 @@ async fn filter_plan_pair_reports_ignored() {
 	stage_build_on_both_sides(&sc).await;
 
 	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
-	assert_eq!(plan.ignored, vec![by_root_file("build", false)], "{plan}");
+	assert_eq!(
+		plan.ignored,
+		vec![by_root_file("build", "build/", false)],
+		"{plan}"
+	);
 	assert!(
 		!plan.actions.iter().any(|a| a.rel_path.starts_with("build")),
 		"an action was planned under an ignored directory: {plan}"
@@ -344,7 +353,10 @@ async fn stage_untracked_cache(sc: &SingleClient) {
 		untracking.uploaded, 1,
 		"only .filenignore uploads: {untracking:?}"
 	);
-	assert_eq!(untracking.ignored, vec![by_root_file("cache", true)]);
+	assert_eq!(
+		untracking.ignored,
+		vec![by_root_file("cache", "cache/", true)]
+	);
 	assert_eq!(
 		(untracking.locally_deleted, untracking.remotely_trashed),
 		(0, 0),
@@ -357,7 +369,10 @@ async fn stage_untracked_cache(sc: &SingleClient) {
 
 	let ignored = sc.sync().await;
 	clean(&ignored);
-	assert_eq!(ignored.ignored, vec![by_root_file("cache", false)]);
+	assert_eq!(
+		ignored.ignored,
+		vec![by_root_file("cache", "cache/", false)]
+	);
 	assert_eq!(
 		(
 			ignored.uploaded,
@@ -460,6 +475,7 @@ async fn filter_unignore_holds_a_mirror_deletion_like_a_first_sync() {
 		vec![IgnoredPath {
 			rel_path: "a.psd".to_string(),
 			level: IgnoreLevel::User,
+			pattern: "*.psd".to_string(),
 			tracked: false,
 		}]
 	);
@@ -773,6 +789,7 @@ async fn filter_user_level_all_pairs() {
 		vec![IgnoredPath {
 			rel_path: "a.psd".to_string(),
 			level: IgnoreLevel::User,
+			pattern: "*.psd".to_string(),
 			tracked: false,
 		}]
 	);
@@ -957,7 +974,10 @@ async fn filter_unignore_local_to_remote_holds_the_destination_deletion() {
 	write_file(&sc.local, ".filenignore", b"assets/\n");
 	let untracking = sc.sync().await;
 	clean(&untracking);
-	assert_eq!(untracking.ignored, vec![by_root_file("assets", true)]);
+	assert_eq!(
+		untracking.ignored,
+		vec![by_root_file("assets", "assets/", true)]
+	);
 	assert_eq!(untracking.remotely_trashed, 0, "{untracking:?}");
 
 	// Another client changes the destination while the rule hides it: an edit of the file this
@@ -973,7 +993,10 @@ async fn filter_unignore_local_to_remote_holds_the_destination_deletion() {
 		(0, 0),
 		"an ignored path was synced: {ignored:?}"
 	);
-	assert_eq!(ignored.ignored, vec![by_root_file("assets", false)]);
+	assert_eq!(
+		ignored.ignored,
+		vec![by_root_file("assets", "assets/", false)]
+	);
 
 	write_file(&sc.local, ".filenignore", b"# nothing ignored\n");
 	let unignored = sc.sync().await;
@@ -1048,7 +1071,10 @@ async fn filter_unignore_remote_to_local_holds_the_destination_deletion() {
 		untracking.downloaded, 1,
 		"only .filenignore downloads: {untracking:?}"
 	);
-	assert_eq!(untracking.ignored, vec![by_root_file("assets", true)]);
+	assert_eq!(
+		untracking.ignored,
+		vec![by_root_file("assets", "assets/", true)]
+	);
 	assert_eq!(untracking.locally_deleted, 0, "{untracking:?}");
 
 	// The destination changes while the rule hides it: an edit of the file the remote still holds,
@@ -1062,7 +1088,10 @@ async fn filter_unignore_remote_to_local_holds_the_destination_deletion() {
 		(0, 0),
 		"an ignored path was synced: {ignored:?}"
 	);
-	assert_eq!(ignored.ignored, vec![by_root_file("assets", false)]);
+	assert_eq!(
+		ignored.ignored,
+		vec![by_root_file("assets", "assets/", false)]
+	);
 
 	upload_remote(
 		&sc.cache,
