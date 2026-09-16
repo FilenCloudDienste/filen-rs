@@ -2507,9 +2507,23 @@ impl SyncEngine {
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
-			Some(&rules),
+			Some(plan::ViewFilter {
+				rules: &rules,
+				baseline: &baseline,
+			}),
 		);
 		let ignored_remote = mem::take(&mut remote_view.ignored);
+		// Hidden on both sides, but carried as roots on neither: the `.DS_Store` in every folder
+		// that no row was ever written for. The report leaves them out and untracking them deletes
+		// nothing, so they only cost the pass the filters they scale.
+		let hidden_by_defaults =
+			local_scan.ignored_default_untracked + remote_view.ignored_default_untracked;
+		if hidden_by_defaults > 0 {
+			tracing::debug!(
+				"sync_once[pair {pair}]: {hidden_by_defaults} item(s) hidden by the built-in \
+				 defaults with nothing synced at or under them, so not tracked as ignored roots"
+			);
+		}
 		let (unknown_remote, never_synced_remote) =
 			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 
@@ -4084,6 +4098,7 @@ mod tests {
 				invalid_names: BTreeMap::new(),
 				aliased_dirs: BTreeMap::new(),
 				ignored: BTreeMap::new(),
+				ignored_default_untracked: 0,
 				ignore_blocked: BTreeSet::new(),
 			},
 			holds: plan::PassHolds {
@@ -4170,6 +4185,7 @@ mod tests {
 			held_paths: held.iter().map(|path| path.to_string()).collect(),
 			skipped,
 			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
 		}
 	}
 

@@ -9,7 +9,10 @@
 //! Stored in its own SQLite DB (one writer — the engine), separate from the cache DB so the
 //! cache's single-writer worker model is untouched.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+	collections::{BTreeSet, HashMap},
+	path::Path,
+};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
@@ -306,6 +309,51 @@ pub(crate) struct BaselineEntry {
 	/// same lineage landing on such a row is a conflict, which is what makes two clients creating
 	/// the same name concurrently non-silent.
 	pub(crate) agreed_hash: Option<Blake3Hash>,
+}
+
+/// Whether the baseline still tracks anything at or under a path, asked of one pass's baseline.
+///
+/// It decides whether an ignore rule's hit is a ROOT — recorded, reported, and untracked with its
+/// subtree — or an entry that is merely hidden: the built-in defaults hide a `.DS_Store` in every
+/// folder, and recording one root per folder makes every later filter scale with the directory
+/// count, to no end (the report leaves an untracked default hit out, and untracking it deletes no
+/// row).
+///
+/// A file's hit is one lookup. A directory's has to see its whole subtree, so the keys are sorted
+/// once, on the first such question — a tree whose only default hits are files never pays for it.
+pub(crate) struct Tracked<'a> {
+	baseline: &'a HashMap<String, BaselineEntry>,
+	sorted: Option<Vec<&'a str>>,
+}
+
+impl<'a> Tracked<'a> {
+	pub(crate) fn new(baseline: &'a HashMap<String, BaselineEntry>) -> Self {
+		Self {
+			baseline,
+			sorted: None,
+		}
+	}
+
+	/// Whether a row sits AT `rel_path`, or anywhere under it when `is_dir`.
+	pub(crate) fn covers(&mut self, rel_path: &str, is_dir: bool) -> bool {
+		if self.baseline.contains_key(rel_path) {
+			return true;
+		}
+		if !is_dir {
+			return false;
+		}
+		let baseline = self.baseline;
+		let sorted = self.sorted.get_or_insert_with(|| {
+			let mut keys: Vec<&str> = baseline.keys().map(String::as_str).collect();
+			keys.sort_unstable();
+			keys
+		});
+		// The first key at or after `rel_path/` is the only candidate: anything under the path sorts
+		// there, and a key that does not start with the prefix means nothing does.
+		let prefix = format!("{rel_path}/");
+		let at = sorted.partition_point(|key| *key < prefix.as_str());
+		sorted.get(at).is_some_and(|key| key.starts_with(&prefix))
+	}
 }
 
 /// One row of the persisted pending-write journal: a remote write this engine made, and when by

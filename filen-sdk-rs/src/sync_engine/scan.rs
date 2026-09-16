@@ -32,7 +32,7 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::UnicodeNormalization;
 
 use super::{
-	baseline::{BaselineEntry, NodeKind},
+	baseline::{BaselineEntry, NodeKind, Tracked},
 	ignore::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
@@ -146,6 +146,11 @@ pub(crate) struct LocalScan {
 	/// under them is in `nodes`, hashed or checked for collisions, and a `.filenignore` inside one is
 	/// never read.
 	pub(crate) ignored: BTreeMap<String, IgnoreDecision>,
+	/// How many entries only the BUILT-IN defaults hid with no baseline row at or under them. They
+	/// are pruned like any other ignored entry, but they are not roots: one per `.DS_Store` gives a
+	/// pass a root under every directory, and each of them is left out of the report
+	/// (`Prepared::ignored`) and deletes no row when the pass untracks. Logged, never reported.
+	pub(crate) ignored_default_untracked: usize,
 	/// Directories whose `.filenignore` could not be used (unreadable, or not compilable as a whole).
 	/// Their subtrees are still scanned into `nodes`, since they exist; `""` is the root.
 	pub(crate) ignore_blocked: BTreeSet<String>,
@@ -404,6 +409,10 @@ pub(crate) fn scan_local(
 
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
+	let mut ignored_default_untracked = 0usize;
+	// Asked only of a default-rule hit, and it sorts the baseline's keys only if one ever hides a
+	// DIRECTORY — the everyday hit is a `.DS_Store`, which is one lookup.
+	let mut tracked = Tracked::new(baseline);
 	// Shared: the filter fills it, and the walk loop reads it for a rule file it cannot hash.
 	let ignore_blocked = RefCell::new(BTreeSet::new());
 	// Apart from `errors`, which the walk loop writes while the filter is alive.
@@ -454,7 +463,16 @@ pub(crate) fn scan_local(
 			};
 			// Its ancestors were all accepted, so the leaf's own decision is git's answer.
 			if let Some(hit) = rules.decide(&rel_path, is_dir) {
-				ignored.insert(rel_path, hit.into());
+				// Hidden either way. But a BUILT-IN default hit with nothing synced at or under it is
+				// not a root: it is the `.DS_Store` every folder has, and carrying one per folder
+				// through the pass costs every later filter its whole directory count. A user-level
+				// or `.filenignore` line makes a root whether or not anything was synced there — the
+				// user named that path, and the report says so.
+				if hit.origin == Origin::Default && !tracked.covers(&rel_path, is_dir) {
+					ignored_default_untracked += 1;
+				} else {
+					ignored.insert(rel_path, hit.into());
+				}
 				return false;
 			}
 			if let Some(target) = alias_target(e, canonical_root.as_deref()) {
@@ -639,6 +657,7 @@ pub(crate) fn scan_local(
 		invalid_names,
 		aliased_dirs,
 		ignored,
+		ignored_default_untracked,
 		ignore_blocked: ignore_blocked.into_inner(),
 	};
 	(scan, rules)
@@ -940,6 +959,80 @@ mod tests {
 		fs::remove_dir_all(&root).ok();
 	}
 
+	/// The built-in defaults hide a `.DS_Store` in every folder. Each one is pruned, but only the
+	/// ones the baseline still tracks become ignored ROOTS: recording the rest gives the pass a root
+	/// under every directory, and each is left out of the report and deletes no row when the pass
+	/// untracks. A tracked one — a file with a row, or a directory with a row under it — is a root
+	/// exactly as before.
+	#[test]
+	fn a_default_rule_hit_is_a_root_only_where_a_row_sits_at_or_under_it() {
+		let root = temp_root();
+		for dir in ["a", "b", "c"] {
+			fs::create_dir(root.join(dir)).unwrap();
+			fs::write(root.join(dir).join(".DS_Store"), b"x").unwrap();
+			fs::write(root.join(dir).join("keep.txt"), b"y").unwrap();
+		}
+		// A default-ignored DIRECTORY, which is the case that has to look at a whole subtree.
+		fs::create_dir(root.join("a").join(".Trashes")).unwrap();
+		fs::write(root.join("a").join(".Trashes").join("t.bin"), b"z").unwrap();
+
+		let untracked = scan_plain(&root, &HashMap::new(), ScanDepth::Fast);
+		assert!(
+			untracked.ignored.is_empty(),
+			"nothing was ever synced there, so none of it is a root: {:?}",
+			untracked.ignored
+		);
+		assert_eq!(
+			untracked.ignored_default_untracked, 4,
+			"3 files and 1 directory"
+		);
+		assert!(
+			!untracked.nodes.contains_key("a/.DS_Store")
+				&& !untracked.nodes.contains_key("a/.Trashes"),
+			"they are still hidden, and still not descended into"
+		);
+
+		let row = |rel_path: &str, kind: NodeKind| BaselineEntry {
+			rel_path: rel_path.to_string(),
+			kind,
+			remote_uuid: None,
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		};
+		let baseline = HashMap::from([
+			(
+				"b/.DS_Store".to_string(),
+				row("b/.DS_Store", NodeKind::File),
+			),
+			(
+				"a/.Trashes/t.bin".to_string(),
+				row("a/.Trashes/t.bin", NodeKind::File),
+			),
+		]);
+
+		let tracked = scan_plain(&root, &baseline, ScanDepth::Fast);
+		assert_eq!(
+			tracked.ignored.keys().collect::<Vec<_>>(),
+			vec!["a/.Trashes", "b/.DS_Store"],
+			"a row AT the path and a row UNDER it both make a root"
+		);
+		assert_eq!(
+			tracked.ignored_default_untracked, 2,
+			"the other two `.DS_Store`s are still untracked"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
 	#[test]
 	fn a_name_collision_is_not_reported_as_an_error_line() {
 		let scan = LocalScan {
@@ -960,6 +1053,7 @@ mod tests {
 			invalid_names: BTreeMap::new(),
 			aliased_dirs: BTreeMap::new(),
 			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
 			ignore_blocked: BTreeSet::new(),
 		};
 		let reported: Vec<String> = scan.reported_errors().collect();
@@ -1186,10 +1280,6 @@ mod tests {
 			BTreeMap::from([
 				("build".to_string(), root_file("build/")),
 				(
-					"sub/.DS_Store".to_string(),
-					by(IgnoreLevel::Default, ".DS_Store")
-				),
-				(
 					"sub/tmp".to_string(),
 					by(
 						IgnoreLevel::File {
@@ -1201,6 +1291,9 @@ mod tests {
 				("x.log".to_string(), root_file("*.log")),
 			])
 		);
+		// `sub/.DS_Store` is hidden and pruned like the rest, but only the built-in defaults hide it
+		// and this baseline tracks nothing there, so it is counted rather than carried as a root.
+		assert_eq!(scan.ignored_default_untracked, 1);
 		assert!(scan.ignore_blocked.is_empty());
 		assert!(
 			rules.decide("sub/tmp", true).is_some(),
@@ -1216,10 +1309,14 @@ mod tests {
 			RuleFiles::Only(BTreeSet::new()),
 		);
 		assert!(skipped.nodes.contains_key("build/deep/a.txt"));
-		assert_eq!(
-			skipped.ignored.keys().collect::<Vec<_>>(),
-			vec!["sub/.DS_Store"]
+		// With no rule file read, the built-in defaults are all that hides anything, and nothing was
+		// synced at the one entry they hide.
+		assert!(
+			skipped.ignored.is_empty(),
+			"{:?} is hidden but untracked, so it is no root",
+			skipped.ignored
 		);
+		assert_eq!(skipped.ignored_default_untracked, 1);
 		assert!(rules.decide("x.log", false).is_none());
 		// Except the ones named: a synced rule file the remote has lost still governs.
 		let (only, rules) = scan_local(
@@ -1230,10 +1327,8 @@ mod tests {
 			RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
 		);
 		assert!(only.nodes.contains_key("build/deep/a.txt"));
-		assert_eq!(
-			only.ignored.keys().collect::<Vec<_>>(),
-			vec!["sub/.DS_Store", "sub/tmp"]
-		);
+		assert_eq!(only.ignored.keys().collect::<Vec<_>>(), vec!["sub/tmp"]);
+		assert_eq!(only.ignored_default_untracked, 1);
 		assert!(rules.decide("x.log", false).is_none());
 
 		fs::remove_dir_all(&root).ok();
