@@ -26,7 +26,8 @@ use filen_sdk_rs::{
 	},
 	io::client_impl::IoSharedClientExt,
 	sync_engine::{
-		PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode, WatchConfig, WatchState,
+		IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode,
+		WatchConfig, WatchState,
 	},
 };
 use uuid::Uuid;
@@ -142,6 +143,19 @@ impl WatchLog {
 	}
 	fn held_deletions(&self) -> usize {
 		self.held_deletions.load(Ordering::SeqCst)
+	}
+	/// Every ignored path the completed passes reported, in arrival order.
+	fn ignored(&self) -> Vec<IgnoredPath> {
+		self.events
+			.lock()
+			.unwrap()
+			.iter()
+			.filter_map(|e| match e {
+				SyncEvent::PassCompleted { report } => Some(report.ignored.clone()),
+				_ => None,
+			})
+			.flatten()
+			.collect()
 	}
 	fn conflicts(&self) -> Vec<String> {
 		self.events
@@ -1140,6 +1154,121 @@ async fn watch_deep_scan_pushes_an_edit_that_kept_its_mtime() {
 	);
 
 	drop(handle);
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — new device-wide user ignore patterns wake a running watch
+// ============================================================================
+
+/// The rules a pass applies are the ones stored when it starts, so a running watch that is not told
+/// about `set_user_ignore` keeps syncing what the user just asked it to ignore until its safety-net
+/// tick — minutes, by default. The engine wakes every loop instead.
+#[shared_test_runtime]
+async fn watch_user_ignore_wakes_a_running_loop() {
+	/// Far enough out that a pass inside the window below cannot be a safety-net tick.
+	const LONG_NET: Duration = Duration::from_secs(600);
+	/// How long the wake-up is given — a debounce, a pass, and plenty of slack for a loaded account.
+	const WOKEN_WITHIN: Duration = Duration::from_secs(120);
+
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let (engine, pair) = watch_engine(&sc, SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "art.psd", b"layers");
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_millis(500),
+				safety_net: LONG_NET,
+				deep_scan_every: None,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// Nothing hides it yet, so it syncs like any other file.
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= 1).await,
+		"the watch never uploaded the file (passes={}, up={})",
+		log.passes(),
+		log.uploaded()
+	);
+	let (_dirs, files) = list_remote_root(&sc).await;
+	let remote = find_file(&files, "art.psd").expect("art.psd missing on remote");
+	assert_eq!(remote.size, b"layers".len() as u64, "remote size mismatch");
+	assert!(
+		log.ignored().is_empty(),
+		"nothing is ignored yet: {:?}",
+		log.ignored()
+	);
+
+	// Let the watch go quiet first. The upload's own cache batch triggers a pass of its own, and a
+	// pass that was going to run anyway would pick the patterns up without any wake-up.
+	let mut passes_before = log.passes();
+	let mut rounds = 0;
+	loop {
+		tokio::time::sleep(IDLE_QUIET).await;
+		let now = log.passes();
+		if now == passes_before {
+			break;
+		}
+		rounds += 1;
+		assert!(rounds < 10, "the watch never went quiet ({now} passes)");
+		passes_before = now;
+	}
+
+	// Now hide it. A pass must apply that well inside the safety net.
+	engine.set_user_ignore("*.psd").await.unwrap();
+	assert!(
+		wait_until(WOKEN_WITHIN, || !log.ignored().is_empty()).await,
+		"the new patterns waited for the safety net ({LONG_NET:?}): passes {} -> {}",
+		passes_before,
+		log.passes()
+	);
+	// The FIRST entry, not the whole log: a User-level path is reported by every pass, so a second
+	// one landing inside the poll window below would append to it — which says nothing about the
+	// wake-up. What that second pass may NOT do is report anything else, so the log is checked whole
+	// for that.
+	let ignored = log.ignored();
+	assert_eq!(
+		ignored.first(),
+		Some(&IgnoredPath {
+			rel_path: "art.psd".to_string(),
+			level: IgnoreLevel::User,
+			tracked: true,
+		}),
+		"the pass the wake-up started must report what it stopped tracking"
+	);
+	assert!(
+		ignored
+			.iter()
+			.all(|path| path.rel_path == "art.psd" && path.level == IgnoreLevel::User),
+		"only the newly hidden path may be reported: {ignored:?}"
+	);
+
+	// And the file has really stopped syncing, not just been reported once: an edit the watcher
+	// sees is not pushed, and the copy already on the remote is left alone.
+	let passes_after = log.passes();
+	write_file(&sc.local, "art.psd", b"many more layers");
+	assert!(
+		wait_until(WATCH_SETTLE, || log.passes() > passes_after).await,
+		"the watch never ran a pass for the edit"
+	);
+	assert_eq!(log.uploaded(), 1, "an ignored file was uploaded again");
+	let (_dirs, files) = list_remote_root(&sc).await;
+	let remote = find_file(&files, "art.psd").expect("the ignored remote copy must be left alone");
+	assert_eq!(
+		remote.size,
+		b"layers".len() as u64,
+		"an ignored file's edit reached the remote"
+	);
+	assert!(log.conflicts().is_empty(), "unexpected conflicts");
+	assert_eq!(log.remotely_trashed(), 0, "unexpected remote trash");
+
+	handle.stop().await;
 	sc.cleanup();
 }
 
