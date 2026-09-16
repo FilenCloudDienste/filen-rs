@@ -419,7 +419,10 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		&snapshot.dirs,
 		&snapshot.files,
 		&snapshot.undecodable,
-		Some(rules),
+		Some(plan::ViewFilter {
+			rules,
+			baseline: &baseline,
+		}),
 	);
 	let mut baseline = baseline;
 	let mut local = scan.nodes;
@@ -536,7 +539,12 @@ pub fn run() -> String {
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
-			Some(&rules),
+			// The fixture's baseline is written further down, and nothing in this tree is hidden by
+			// the built-in defaults, so an empty one measures the same build a pass runs.
+			Some(plan::ViewFilter {
+				rules: &rules,
+				baseline: &no_baseline,
+			}),
 		)
 	});
 	probe.record(
