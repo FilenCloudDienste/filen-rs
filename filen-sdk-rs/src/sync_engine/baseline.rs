@@ -125,6 +125,33 @@ const DELETE_AT_PATH: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_pa
 const DELETE_UNDER_PATH: &str =
 	"DELETE FROM baseline WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
 
+/// The two statements a directory move runs, in this order: the row AT `?2`, then every row under
+/// it, each swapping that prefix for `?3` over the same bytewise ranges the deletes above use.
+///
+/// Two statements for the same reason the deletes are two. Asking one `UPDATE` for both — `rel_path
+/// = ?2 OR (rel_path > ?2 || '/' AND rel_path < ?2 || '0')` — plans as `SEARCH baseline USING INDEX
+/// sqlite_autoindex_baseline_1 (pair_id=?)`: an `OR` of a point and a range is not sargable, so it
+/// walks every row of the pair, which is the cost the whole-pair read it replaced had.
+///
+/// They read the STORE rather than the pass's baseline, which is deliberate: the plan re-keys its
+/// own baseline for every directory move of the pass at once, so for a move with another nested
+/// inside it, that copy already names the inner directory by the path the INNER move gives it.
+/// Taken from the store, each move commits its own step only, and an inner move that then fails
+/// leaves the rows where the directory really is.
+///
+/// Neither can collide with itself: the sources all lie under `?2`, the destinations under `?3`,
+/// and a case-only rename has no rows at the new spelling because the key compares bytewise. They
+/// can collide with rows that were ALREADY at the destination, and `OR REPLACE` answers that the
+/// way the read-delete-upsert they replaced did — by overwriting. `plan::dir_move_from` refuses a
+/// move onto an occupied destination, but `plan::next_case_only_dir_rename` in a pushing mode does
+/// not check the local end, so rows under both spellings reach here; the directory has been renamed
+/// on disk by then, and failing on the primary key would leave the store holding it under two names.
+const MOVE_AT_PATH: &str =
+	"UPDATE OR REPLACE baseline SET rel_path = ?3 WHERE pair_id = ?1 AND rel_path = ?2";
+const MOVE_UNDER_PATH: &str =
+	"UPDATE OR REPLACE baseline SET rel_path = ?3 || substr(rel_path, length(?2) + 1)
+	 WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
+
 /// `pending_writes.kind` discriminants — what the write did.
 const KIND_CREATED: i64 = 1;
 const KIND_MOVED: i64 = 2;
@@ -297,6 +324,12 @@ pub(crate) struct PendingRow {
 pub(crate) enum BaselineChange<'a> {
 	Upsert(&'a BaselineEntry),
 	Delete(&'a str),
+	/// A directory move: the row at `from` and every row under it are re-keyed to sit under `to`,
+	/// in two seeking statements over the rows the store holds (see [`MOVE_AT_PATH`]).
+	MoveSubtree {
+		from: &'a str,
+		to: &'a str,
+	},
 }
 
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
@@ -794,6 +827,11 @@ impl BaselineStore {
 			match change {
 				BaselineChange::Upsert(entry) => self.upsert_entry(pair, entry)?,
 				BaselineChange::Delete(rel_path) => self.delete_entry(pair, rel_path)?,
+				BaselineChange::MoveSubtree { from, to } => {
+					self.conn.execute(MOVE_AT_PATH, params![pair, from, to])?;
+					self.conn
+						.execute(MOVE_UNDER_PATH, params![pair, from, to])?;
+				}
 			}
 		}
 		Ok(())
@@ -1630,6 +1668,147 @@ mod tests {
 		assert_eq!(store.entry(pair, "x.txt").unwrap(), None);
 	}
 
+	/// A directory move re-keys the row at the source and every row under it, keeps everything else
+	/// those rows hold, and touches nothing outside: not a sibling that merely shares the prefix,
+	/// not another pair. A case-only rename is a move like any other — the key compares bytewise,
+	/// so the new spelling is free — and each step re-keys from wherever the rows are now.
+	#[test]
+	fn a_subtree_move_re_keys_the_source_and_everything_under_it_only() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for rel in ["a", "a/x", "b"] {
+			store.upsert_entry(pair, &dir_entry(rel)).unwrap();
+		}
+		let deep = file_entry("a/x/y.txt", [7u8; 32], 11);
+		store.upsert_entry(pair, &deep).unwrap();
+		for rel in ["ab", "a0", "a."] {
+			store
+				.upsert_entry(pair, &file_entry(rel, [1u8; 32], 1))
+				.unwrap();
+		}
+		store.upsert_entry(other, &dir_entry("a")).unwrap();
+		let paths = |pair: PairId| -> Vec<String> {
+			store
+				.entries(pair)
+				.unwrap()
+				.into_iter()
+				.map(|entry| entry.rel_path)
+				.collect()
+		};
+		let move_subtree = |from, to| {
+			store
+				.apply_changes(pair, &[BaselineChange::MoveSubtree { from, to }])
+				.unwrap();
+		};
+
+		move_subtree("a", "b/moved");
+		assert_eq!(
+			paths(pair),
+			[
+				"a.",
+				"a0",
+				"ab",
+				"b",
+				"b/moved",
+				"b/moved/x",
+				"b/moved/x/y.txt"
+			]
+		);
+		assert_eq!(
+			store.entry(pair, "b/moved/x/y.txt").unwrap(),
+			Some(BaselineEntry {
+				rel_path: "b/moved/x/y.txt".to_string(),
+				..deep
+			}),
+			"a moved row must keep everything but its path"
+		);
+		assert_eq!(paths(other), ["a"], "another pair's rows do not move");
+
+		move_subtree("b/moved", "b/MOVED");
+		assert_eq!(
+			paths(pair),
+			[
+				"a.",
+				"a0",
+				"ab",
+				"b",
+				"b/MOVED",
+				"b/MOVED/x",
+				"b/MOVED/x/y.txt"
+			]
+		);
+		move_subtree("b/MOVED/x", "b/MOVED/x2");
+		assert_eq!(
+			paths(pair),
+			[
+				"a.",
+				"a0",
+				"ab",
+				"b",
+				"b/MOVED",
+				"b/MOVED/x2",
+				"b/MOVED/x2/y.txt"
+			]
+		);
+	}
+
+	/// A move onto a destination that already holds rows overwrites them, which is what the
+	/// read-delete-upsert this replaced did. One caller can still ask for it: the case-only rename
+	/// of a pushing mode emits its move without checking the local end, so rows left under both
+	/// spellings by an earlier half-finished rename arrive here — after the directory has already
+	/// been renamed on disk. Failing there would leave the store describing one directory under two
+	/// names.
+	#[test]
+	fn a_subtree_move_overwrites_rows_sitting_at_the_destination() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for rel in ["Docs", "docs"] {
+			store.upsert_entry(pair, &dir_entry(rel)).unwrap();
+		}
+		store
+			.upsert_entry(pair, &file_entry("Docs/a.txt", [1u8; 32], 1))
+			.unwrap();
+		store
+			.upsert_entry(pair, &file_entry("docs/a.txt", [2u8; 32], 2))
+			.unwrap();
+
+		store
+			.apply_changes(
+				pair,
+				&[BaselineChange::MoveSubtree {
+					from: "Docs",
+					to: "docs",
+				}],
+			)
+			.unwrap();
+
+		assert_eq!(
+			store
+				.entries(pair)
+				.unwrap()
+				.iter()
+				.map(|e| e.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			vec!["docs", "docs/a.txt"],
+			"one spelling is left, and it is the one the move named"
+		);
+		assert_eq!(
+			store
+				.entry(pair, "docs/a.txt")
+				.unwrap()
+				.and_then(|e| e.size),
+			Some(1),
+			"the row that moved is the one that survived"
+		);
+	}
+
 	#[test]
 	fn delete_subtrees_takes_each_root_and_everything_under_it_only() {
 		let store = BaselineStore::open_in_memory().unwrap();
@@ -1684,15 +1863,16 @@ mod tests {
 		);
 	}
 
-	/// Both statements must SEEK the primary-key index, and the plan has to name the columns they
-	/// seek on.
+	/// Every statement that works on a whole subtree must SEEK the primary-key index, and the plan
+	/// has to name the columns it seeks on.
 	///
 	/// `SEARCH baseline USING INDEX sqlite_autoindex_baseline_1 (pair_id=?)` — no `rel_path` term —
 	/// is what an unsargable predicate produces: a walk of every index entry of the pair, with no
-	/// `SCAN` step to give it away. The `substr` form these replaced plans exactly that, so
-	/// asserting only "SEARCH, and not SCAN" passes for the very shape this guards against.
+	/// `SCAN` step to give it away. Both the `substr` form these replaced and an `OR` of the two
+	/// ranges plan exactly that, so asserting only "SEARCH, and not SCAN" passes for the very shape
+	/// this guards against.
 	#[test]
-	fn the_subtree_delete_seeks_the_index_instead_of_scanning_the_pair() {
+	fn every_subtree_statement_seeks_the_index_instead_of_scanning_the_pair() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let assert_seeks = |sql: &str, args: &[&dyn rusqlite::ToSql], seek: &str| {
 			let plan: Vec<String> = store
@@ -1721,6 +1901,8 @@ mod tests {
 
 		assert_seeks(DELETE_AT_PATH, &[&1_i64, &"docs"], at_path);
 		assert_seeks(DELETE_UNDER_PATH, &[&1_i64, &"docs"], under_path);
+		assert_seeks(MOVE_AT_PATH, &[&1_i64, &"docs", &"moved"], at_path);
+		assert_seeks(MOVE_UNDER_PATH, &[&1_i64, &"docs", &"moved"], under_path);
 	}
 
 	#[test]
