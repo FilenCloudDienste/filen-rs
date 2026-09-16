@@ -58,6 +58,10 @@ use crate::{
 
 /// Default quiet window a burst of change events is coalesced over before a sync pass runs.
 const DEBOUNCE: Duration = Duration::from_millis(800);
+/// How many debounce windows a burst of change events may hold a pass off for, whether or not it
+/// ever goes quiet. A tree something writes into continuously — a build directory, a log — never
+/// does, and the quiet window alone would hold the pass for as long as the writing lasts.
+const MAX_DEBOUNCE_BURST: u32 = 8;
 /// Default periodic full pass — the backstop for anything the watchers miss or coalesce.
 const SAFETY_NET: Duration = Duration::from_secs(300);
 /// Default interval between deep-scan passes (see [`WatchConfig::deep_scan_every`]): a day.
@@ -531,6 +535,10 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 /// patterns (`rules`), or on a change event once the burst behind it has gone quiet for
 /// `debounce`. New patterns are not debounced: they arrive one deliberate call at a time, and a
 /// burst of calls is already one wake-up (the signal carries the latest version, not each one).
+///
+/// A burst that never goes quiet is coalesced for at most [`MAX_DEBOUNCE_BURST`] debounces, and a
+/// safety-net tick that comes due while it is being coalesced ends the wait too: neither the quiet
+/// window nor a continuous writer may postpone a pass indefinitely.
 async fn wait_for_next_pass(
 	stop: &mut Stop,
 	dirty: &Notify,
@@ -555,11 +563,19 @@ async fn wait_for_next_pass(
 		_ = deep_scan_due(next_deep) => {}
 		_ = user_ignore_changed(rules) => {}
 		_ = dirty.notified() => {
-			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it).
+			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it) — but
+			// for no longer than `MAX_DEBOUNCE_BURST` debounces all told, and no longer than the
+			// periodic pass was going to wait anyway. A tree something writes into continuously
+			// never goes quiet, and with the quiet window as the only way out of this loop such a
+			// tree never gets a pass at all.
+			let cap = tokio::time::sleep(debounce * MAX_DEBOUNCE_BURST);
+			tokio::pin!(cap);
 			loop {
 				tokio::select! {
 					biased;
 					_ = stop.ended() => return false,
+					_ = &mut cap => break,
+					_ = safety_net.tick() => break,
 					_ = dirty.notified() => continue,
 					_ = tokio::time::sleep(debounce) => break,
 				}
@@ -813,8 +829,8 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, DEEP_SCAN_EVERY, DEEP_SCAN_RETRY, MAX_BACKOFF, SAFETY_NET,
-		ScanDepth, Stop, SyncReport, WatchConfig, WatchState, WatchStatus, backoff,
+		BASE_BACKOFF, DEBOUNCE, DEEP_SCAN_EVERY, DEEP_SCAN_RETRY, MAX_BACKOFF, MAX_DEBOUNCE_BURST,
+		SAFETY_NET, ScanDepth, Stop, SyncReport, WatchConfig, WatchState, WatchStatus, backoff,
 		local_event_handler, next_deep_after, owes_a_pass, pass_outcome, publish_pass, scan_depth,
 		start_local_watcher, triggers_pass, wait_for_next_pass, wait_while_paused,
 	};
@@ -1146,6 +1162,76 @@ mod tests {
 			SAFETY_NET - DEBOUNCE,
 			"with nothing happening, the safety net is what ends the wait"
 		);
+	}
+
+	/// A burst that never goes quiet must not starve the pass. Something writing into the tree
+	/// continuously restarts the quiet window with every event, so the wait is capped: the pass
+	/// runs after [`MAX_DEBOUNCE_BURST`] debounces whatever the stream does, and a safety-net tick
+	/// coming due during a burst ends it too rather than being kept waiting behind it.
+	#[tokio::test(start_paused = true)]
+	async fn a_burst_that_never_goes_quiet_still_runs_a_pass() {
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Arc::new(Notify::new());
+		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
+
+		// An event every half debounce, for ever: the quiet window never elapses.
+		let stream = tokio::spawn({
+			let dirty = Arc::clone(&dirty);
+			async move {
+				loop {
+					tokio::time::sleep(DEBOUNCE / 2).await;
+					dirty.notify_one();
+				}
+			}
+		});
+
+		dirty.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(
+			tokio::time::timeout(
+				DEBOUNCE * (MAX_DEBOUNCE_BURST + 4),
+				wait_for_next_pass(
+					&mut stop,
+					&dirty,
+					&mut safety_net,
+					&mut rules,
+					None,
+					DEBOUNCE,
+					None
+				)
+			)
+			.await
+			.expect("a burst that never goes quiet must not hold the pass off for ever")
+		);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE * MAX_DEBOUNCE_BURST,
+			"the burst is coalesced for at most that long, and then the pass runs"
+		);
+
+		// And the net is an arm of that wait: a tick due mid-burst ends it at the tick.
+		let mut net = tokio::time::interval(DEBOUNCE / 4);
+		net.tick().await;
+		let start = tokio::time::Instant::now();
+		dirty.notify_one();
+		assert!(
+			tokio::time::timeout(
+				DEBOUNCE * MAX_DEBOUNCE_BURST,
+				wait_for_next_pass(
+					&mut stop, &dirty, &mut net, &mut rules, None, DEBOUNCE, None
+				)
+			)
+			.await
+			.expect("a safety-net tick must not wait out the burst")
+		);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE / 4,
+			"the periodic pass is due, so it runs — the burst does not postpone it"
+		);
+
+		stream.abort();
 	}
 
 	/// Stopping the watch is never delayed by a backoff.
