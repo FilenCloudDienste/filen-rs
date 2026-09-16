@@ -26,8 +26,8 @@ use super::{
 	},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
-		IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules, load_remote_rules,
-		parse_user_ignore, rule_file_dir,
+		IgnoreDecision, IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules,
+		load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
@@ -1183,13 +1183,12 @@ struct Prepared {
 	unknown_remote: BTreeMap<String, UnsyncableReason>,
 	/// Remote items out of the view that no baseline row names: reported only.
 	never_synced_remote: Vec<UnsyncablePath>,
-	/// The top-most local items the ignore rules hide, keyed like the local scan, with the level of
-	/// the rule that hides each. Nothing is done at or under one, and the baseline rows there are
-	/// dropped at the end of the pass: the path stops syncing, and reads like a first sync once the
-	/// rule goes away.
-	ignored_local: BTreeMap<String, IgnoreLevel>,
+	/// The top-most local items the ignore rules hide, keyed like the local scan, with the rule that
+	/// hides each. Nothing is done at or under one, and the baseline rows there are dropped at the
+	/// end of the pass: the path stops syncing, and reads like a first sync once the rule goes away.
+	ignored_local: BTreeMap<String, IgnoreDecision>,
 	/// The same for the remote view, keyed like it.
-	ignored_remote: BTreeMap<String, IgnoreLevel>,
+	ignored_remote: BTreeMap<String, IgnoreDecision>,
 	/// Subtrees whose ignore rules could not be read this pass: blocked, with their rows kept.
 	ignore_blocked: BTreeSet<String>,
 	/// A report line per remote `.filenignore` that could not be used, or per bad line in one.
@@ -1390,15 +1389,16 @@ impl Prepared {
 
 	/// The ignored paths to report, shared by the dry run and the pass: the top of each ignored
 	/// subtree on either side, once, in path order. A path both sides hide carries the local scan's
-	/// level. One only the defaults hide is noise (a `.DS_Store` in every folder) and is left out,
-	/// unless a baseline row sits at or under it, which this pass drops.
+	/// rule, level and deciding line together. One only the defaults hide is noise (a `.DS_Store` in
+	/// every folder) and is left out, unless a baseline row sits at or under it, which this pass
+	/// drops.
 	fn ignored(&self) -> Vec<IgnoredPath> {
 		fn parents(path: &str) -> impl Iterator<Item = &str> {
 			path.match_indices('/').map(|(i, _)| &path[..i])
 		}
-		let mut roots: BTreeMap<&str, (&IgnoreLevel, bool)> = BTreeMap::new();
-		for (path, level) in self.ignored_local.iter().chain(&self.ignored_remote) {
-			roots.entry(path).or_insert((level, false));
+		let mut roots: BTreeMap<&str, (&IgnoreDecision, bool)> = BTreeMap::new();
+		for (path, decision) in self.ignored_local.iter().chain(&self.ignored_remote) {
+			roots.entry(path).or_insert((decision, false));
 		}
 		if roots.is_empty() {
 			return Vec::new();
@@ -1422,10 +1422,11 @@ impl Prepared {
 		}
 		roots
 			.into_iter()
-			.filter(|(_, (level, tracked))| *tracked || **level != IgnoreLevel::Default)
-			.map(|(path, (level, tracked))| IgnoredPath {
+			.filter(|(_, (decision, tracked))| *tracked || decision.level != IgnoreLevel::Default)
+			.map(|(path, (decision, tracked))| IgnoredPath {
 				rel_path: path.to_owned(),
-				level: level.clone(),
+				level: decision.level.clone(),
+				pattern: decision.pattern.clone(),
 				tracked,
 			})
 			.collect()
@@ -1434,10 +1435,10 @@ impl Prepared {
 
 /// [`rekey_paths`] for ignored roots, carrying the directory of a `.filenignore` that decided one
 /// along with it.
-fn rekey_ignored(map: &mut BTreeMap<String, IgnoreLevel>, from: &str, to: &str) {
+fn rekey_ignored(map: &mut BTreeMap<String, IgnoreDecision>, from: &str, to: &str) {
 	rekey_paths(map, from, to);
-	for level in map.values_mut() {
-		if let IgnoreLevel::File { dir } = level
+	for decision in map.values_mut() {
+		if let IgnoreLevel::File { dir } = &mut decision.level
 			&& let Some(moved) = plan::moved_path(dir, from, to)
 		{
 			*dir = moved;
@@ -3716,14 +3717,15 @@ fn withhold_deletions_over_unreachable(
 	actions: Vec<SyncAction>,
 	unknown: &BTreeMap<String, UnsyncableReason>,
 	held: &HashSet<String>,
-	[ignored_local, ignored_remote]: [&BTreeMap<String, IgnoreLevel>; 2],
+	[ignored_local, ignored_remote]: [&BTreeMap<String, IgnoreDecision>; 2],
 	ignore_blocked: &BTreeSet<String>,
 ) -> (Vec<SyncAction>, usize) {
-	let keeps_ignored = |ignored: &BTreeMap<String, IgnoreLevel>, dir: &str| {
+	// By level alone: which line matched says nothing about whether the content must be kept.
+	let keeps_ignored = |ignored: &BTreeMap<String, IgnoreDecision>, dir: &str| {
 		ignore_blocked.iter().any(|path| plan::is_under(path, dir))
-			|| ignored
-				.iter()
-				.any(|(path, level)| *level != IgnoreLevel::Default && plan::is_under(path, dir))
+			|| ignored.iter().any(|(path, decision)| {
+				decision.level != IgnoreLevel::Default && plan::is_under(path, dir)
+			})
 	};
 	let mut over_ignored = 0;
 	// The `.filenignore` files whose rules keep a withheld directory. Deleted, they would leave the
@@ -3748,14 +3750,16 @@ fn withhold_deletions_over_unreachable(
 				_ => return false,
 			};
 			if ignored {
-				kept_rule_files.extend(side.values().filter_map(|level| match level {
-					IgnoreLevel::File { dir: rules }
-						if rules == dir || plan::is_under(rules, dir) =>
-					{
-						Some(Origin::File { dir: rules }.to_string())
-					}
-					_ => None,
-				}));
+				kept_rule_files.extend(side.values().filter_map(
+					|decision| match &decision.level {
+						IgnoreLevel::File { dir: rules }
+							if rules == dir || plan::is_under(rules, dir) =>
+						{
+							Some(Origin::File { dir: rules }.to_string())
+						}
+						_ => None,
+					},
+				));
 				if !unreachable {
 					over_ignored += 1;
 				}
@@ -4828,11 +4832,25 @@ mod tests {
 		SyncMode::RemoteBackup,
 	];
 
+	/// An ignore decision at `level` whose deciding line is `pattern`.
+	fn hidden_by(level: IgnoreLevel, pattern: &str) -> IgnoreDecision {
+		IgnoreDecision {
+			level,
+			pattern: pattern.to_string(),
+		}
+	}
+
+	/// A decision by the `pattern` line of the root `.filenignore`.
+	fn by_root_file(pattern: &str) -> IgnoreDecision {
+		hidden_by(IgnoreLevel::File { dir: String::new() }, pattern)
+	}
+
 	/// `docs/` synced and now ignored by the root `.filenignore`, on both sides.
 	fn ignoring_docs(prep: &mut Prepared) {
-		let level = IgnoreLevel::File { dir: String::new() };
-		prep.ignored_local.insert("docs".to_string(), level.clone());
-		prep.ignored_remote.insert("docs".to_string(), level);
+		let decision = by_root_file("docs/");
+		prep.ignored_local
+			.insert("docs".to_string(), decision.clone());
+		prep.ignored_remote.insert("docs".to_string(), decision);
 	}
 
 	/// The baseline rows a pass that found `roots` ignored leaves behind.
@@ -4969,9 +4987,10 @@ mod tests {
 		);
 	}
 
-	/// The report names the top of each ignored subtree once across both sides, says whether a
-	/// baseline row sat at or under it, and leaves out what only the defaults hide unless it was
-	/// tracked. A sibling that sorts between a directory and its children is still reported.
+	/// The report names the top of each ignored subtree once across both sides, with the line that
+	/// hid it, says whether a baseline row sat at or under it, and leaves out what only the defaults
+	/// hide unless it was tracked. A sibling that sorts between a directory and its children is still
+	/// reported. Where the two sides hide one path with different lines, the local one is reported.
 	#[test]
 	fn the_report_lists_each_ignored_top_once_and_skips_untracked_defaults() {
 		let docs = Docs::new();
@@ -4987,34 +5006,44 @@ mod tests {
 			view(Vec::new(), Vec::new(), &[]),
 			HashMap::new(),
 		);
-		let root = || IgnoreLevel::File { dir: String::new() };
 		prep.ignored_local.extend([
-			("docs".to_string(), root()),
-			("docs b".to_string(), IgnoreLevel::User),
-			("sub/.DS_Store".to_string(), IgnoreLevel::Default),
+			("docs".to_string(), by_root_file("docs/")),
+			("docs b".to_string(), hidden_by(IgnoreLevel::User, "docs ?")),
+			(
+				"sub/.DS_Store".to_string(),
+				hidden_by(IgnoreLevel::Default, ".DS_Store"),
+			),
 		]);
 		prep.ignored_remote.extend([
-			("docs".to_string(), IgnoreLevel::User),
-			("docs/x.bin".to_string(), IgnoreLevel::User),
-			("docs b/c".to_string(), IgnoreLevel::User),
-			("old.swp".to_string(), IgnoreLevel::Default),
+			// The same path, hidden there by another line: the local side's is the one reported.
+			("docs".to_string(), hidden_by(IgnoreLevel::User, "*ocs")),
+			(
+				"docs/x.bin".to_string(),
+				hidden_by(IgnoreLevel::User, "*.bin"),
+			),
+			("docs b/c".to_string(), hidden_by(IgnoreLevel::User, "c")),
+			(
+				"old.swp".to_string(),
+				hidden_by(IgnoreLevel::Default, "*.swp"),
+			),
 		]);
-		let ignored = |rel_path: &str, level: IgnoreLevel, tracked: bool| IgnoredPath {
+		let ignored = |rel_path: &str, decision: IgnoreDecision, tracked: bool| IgnoredPath {
 			rel_path: rel_path.to_string(),
-			level,
+			level: decision.level,
+			pattern: decision.pattern,
 			tracked,
 		};
 		assert_eq!(
 			prep.ignored(),
 			vec![
-				ignored("docs", root(), true),
-				ignored("docs b", IgnoreLevel::User, false),
-				ignored("old.swp", IgnoreLevel::Default, true),
+				ignored("docs", by_root_file("docs/"), true),
+				ignored("docs b", hidden_by(IgnoreLevel::User, "docs ?"), false),
+				ignored("old.swp", hidden_by(IgnoreLevel::Default, "*.swp"), true),
 			]
 		);
 		assert_eq!(
-			ignored("docs", root(), true).to_string(),
-			r#"ignored "docs" (by .filenignore), no longer synced"#
+			ignored("docs", by_root_file("docs/"), true).to_string(),
+			r#"ignored "docs" (by .filenignore: docs/), no longer synced"#
 		);
 	}
 
@@ -5052,9 +5081,10 @@ mod tests {
 				view(Vec::new(), Vec::new(), &[]),
 				HashMap::new(),
 			);
-			pulled
-				.ignored_local
-				.insert("docs/node_modules".to_string(), level.clone());
+			pulled.ignored_local.insert(
+				"docs/node_modules".to_string(),
+				hidden_by(level.clone(), "node_modules/"),
+			);
 			let mut pushed = prepared(
 				SyncMode::TwoWay,
 				docs.baseline(),
@@ -5062,9 +5092,10 @@ mod tests {
 				remote_side,
 				HashMap::new(),
 			);
-			pushed
-				.ignored_remote
-				.insert("docs/node_modules".to_string(), level.clone());
+			pushed.ignored_remote.insert(
+				"docs/node_modules".to_string(),
+				hidden_by(level.clone(), "node_modules/"),
+			);
 
 			for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
 				let screened = reconcile_and_screen(&prep, screen_state(&prep));
@@ -5172,10 +5203,10 @@ mod tests {
 			still.last_ignored.insert("a.psd".to_string());
 			still
 				.ignored_local
-				.insert("a.psd".to_string(), IgnoreLevel::User);
+				.insert("a.psd".to_string(), hidden_by(IgnoreLevel::User, "*.psd"));
 			still
 				.ignored_remote
-				.insert("a.psd".to_string(), IgnoreLevel::User);
+				.insert("a.psd".to_string(), hidden_by(IgnoreLevel::User, "*.psd"));
 			let screened = reconcile_and_screen(&still, screen_state(&still));
 			assert!(
 				screened.decision.reason.is_none() && !deletes_psd(&screened),
@@ -5199,7 +5230,7 @@ mod tests {
 			HashMap::new(),
 		);
 		prep.ignored_local
-			.insert("build".to_string(), IgnoreLevel::User);
+			.insert("build".to_string(), hidden_by(IgnoreLevel::User, "build/"));
 		prep.ignore_blocked.insert("locked".to_string());
 		prep.last_ignored = ["build/cache", "locked/tmp", "held", "released"]
 			.map(String::from)
@@ -5218,13 +5249,24 @@ mod tests {
 	/// directory is not the directory's to keep.
 	#[test]
 	fn a_withheld_directory_keeps_the_rule_files_that_keep_it() {
-		let file_level = |dir: &str| IgnoreLevel::File {
-			dir: dir.to_string(),
+		let file_level = |dir: &str, pattern: &str| {
+			hidden_by(
+				IgnoreLevel::File {
+					dir: dir.to_string(),
+				},
+				pattern,
+			)
 		};
 		let ignored = BTreeMap::from([
-			("proj/node_modules".to_string(), file_level("proj")),
-			("proj/sub/cache".to_string(), file_level("proj/sub")),
-			("proj/build".to_string(), file_level("")),
+			(
+				"proj/node_modules".to_string(),
+				file_level("proj", "node_modules/"),
+			),
+			(
+				"proj/sub/cache".to_string(),
+				file_level("proj/sub", "cache/"),
+			),
+			("proj/build".to_string(), file_level("", "proj/build/")),
 		]);
 		let none = BTreeMap::new();
 		let paths = [
@@ -5350,7 +5392,7 @@ mod tests {
 				HashMap::new(),
 			);
 			prep.ignored_local
-				.insert("docs".to_string(), IgnoreLevel::User);
+				.insert("docs".to_string(), hidden_by(IgnoreLevel::User, "docs/"));
 			let roots = prep.ignored_roots();
 			let (actions, _) = run_prepared(prep);
 			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
@@ -5382,14 +5424,16 @@ mod tests {
 				HashMap::new(),
 			);
 			prep.ignored_remote
-				.insert("docs".to_string(), IgnoreLevel::User);
+				.insert("docs".to_string(), hidden_by(IgnoreLevel::User, "docs/"));
 			let (actions, _) = run_prepared(prep);
 			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
 		}
 	}
 
 	/// A directory move carries the ignored roots under it to the new path, each set keyed like the
-	/// side it was read from, and the directory of the `.filenignore` that decided one with it.
+	/// side it was read from, and the directory of the `.filenignore` that decided one with it. The
+	/// deciding line moves unchanged: it is reported as it matched, so a path-shaped line keeps
+	/// naming the pre-move path until the next pass decides again.
 	#[test]
 	fn a_dir_move_carries_the_ignored_roots_under_it() {
 		let docs = Docs::new();
@@ -5404,9 +5448,15 @@ mod tests {
 				&[],
 			)
 		};
-		let in_docs = |dir: &str| IgnoreLevel::File {
-			dir: dir.to_string(),
+		let in_docs = |dir: &str| {
+			hidden_by(
+				IgnoreLevel::File {
+					dir: dir.to_string(),
+				},
+				"build/",
+			)
 		};
+		let by_user = || hidden_by(IgnoreLevel::User, "cache/");
 
 		// Renamed on the remote: the local scan is re-keyed, the view already reads the new path.
 		let mut prep = prepared(
@@ -5419,7 +5469,7 @@ mod tests {
 		prep.ignored_local
 			.insert("docs/build".to_string(), in_docs("docs"));
 		prep.ignored_remote
-			.insert("documents/cache".to_string(), IgnoreLevel::User);
+			.insert("documents/cache".to_string(), by_user());
 		prep.ignore_blocked.insert("docs/unreadable".to_string());
 		prep.fold_dir_moves();
 		assert_eq!(
@@ -5436,7 +5486,7 @@ mod tests {
 		);
 		assert_eq!(
 			prep.ignored_remote,
-			BTreeMap::from([("documents/cache".to_string(), IgnoreLevel::User)])
+			BTreeMap::from([("documents/cache".to_string(), by_user())])
 		);
 		assert_eq!(
 			prep.ignore_blocked,
@@ -5452,7 +5502,7 @@ mod tests {
 			HashMap::new(),
 		);
 		prep.ignored_local
-			.insert("documents/build".to_string(), IgnoreLevel::User);
+			.insert("documents/build".to_string(), by_user());
 		prep.ignored_remote
 			.insert("docs/cache".to_string(), in_docs("docs"));
 		prep.ignore_blocked.insert("docs/unreadable".to_string());
@@ -5464,7 +5514,7 @@ mod tests {
 		);
 		assert_eq!(
 			prep.ignored_local,
-			BTreeMap::from([("documents/build".to_string(), IgnoreLevel::User)])
+			BTreeMap::from([("documents/build".to_string(), by_user())])
 		);
 		assert_eq!(
 			prep.ignored_remote,
