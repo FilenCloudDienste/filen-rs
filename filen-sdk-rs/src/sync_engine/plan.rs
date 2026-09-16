@@ -610,6 +610,11 @@ pub(crate) fn unknown_remote_paths(
 	baseline: &HashMap<String, BaselineEntry>,
 	skipped: &[SkippedRemote],
 ) -> (BTreeMap<String, UnsyncableReason>, Vec<UnsyncablePath>) {
+	// Nothing was skipped, so nothing is looked up: the two indexes below would be built over every
+	// baseline row to answer no question at all.
+	if skipped.is_empty() {
+		return (BTreeMap::new(), Vec::new());
+	}
 	let mut by_uuid: HashMap<Uuid, &str> = HashMap::new();
 	let mut by_lineage: HashMap<StableUuid, &str> = HashMap::new();
 	for entry in baseline.values() {
