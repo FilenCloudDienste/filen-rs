@@ -5,7 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	mem,
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -1379,16 +1379,18 @@ impl Prepared {
 		held: impl IntoIterator<Item = &'a str>,
 	) -> BTreeSet<String> {
 		let unignored = self.unignored();
-		let held: Vec<&str> = held.into_iter().collect();
+		let held: BTreeSet<String> = held.into_iter().map(str::to_owned).collect();
 		let mut roots = self.ignored_roots();
 		roots.extend(
 			self.last_ignored
 				.iter()
 				.filter(|root| {
 					!unignored.contains(root.as_str())
+						|| held.contains(root.as_str())
 						|| held
-							.iter()
-							.any(|path| path == root || plan::is_under(path, root))
+							.range(plan::subtree_bounds(root.as_str()))
+							.next()
+							.is_some()
 				})
 				.cloned(),
 		);
@@ -3640,12 +3642,10 @@ fn drop_blocked(
 	if blocked.is_empty() && ignored.is_empty() {
 		return actions;
 	}
-	// `""` is the pair root, whose rules can be unreadable too: everything is under it.
+	// `""` is the pair root, whose rules can be unreadable too: everything is under it. Every other
+	// root is found by walking the path's own ancestors, rather than reading every root per action.
 	let at_or_under = |roots: &BTreeSet<String>, path: &str| {
-		roots.contains(path)
-			|| roots
-				.iter()
-				.any(|root| root.is_empty() || plan::is_under(path, root))
+		roots.contains("") || plan::at_or_under_root(roots, path)
 	};
 	// The sources of the moves this dropped: their content is staying exactly where it is.
 	let mut stranded: Vec<String> = Vec::new();
@@ -3729,16 +3729,19 @@ fn drop_blocked(
 fn withhold_deletions_over_unreachable(
 	actions: Vec<SyncAction>,
 	unknown: &BTreeMap<String, UnsyncableReason>,
-	held: &HashSet<String>,
+	held: &BTreeSet<String>,
 	[ignored_local, ignored_remote]: [&BTreeMap<String, IgnoreDecision>; 2],
 	ignore_blocked: &BTreeSet<String>,
 ) -> (Vec<SyncAction>, usize) {
-	// By level alone: which line matched says nothing about whether the content must be kept.
+	// By level alone: which line matched says nothing about whether the content must be kept. Each
+	// question is "is anything under this directory", which a sorted map answers by seeking to it.
 	let keeps_ignored = |ignored: &BTreeMap<String, IgnoreDecision>, dir: &str| {
-		ignore_blocked.iter().any(|path| plan::is_under(path, dir))
-			|| ignored.iter().any(|(path, decision)| {
-				decision.level != IgnoreLevel::Default && plan::is_under(path, dir)
-			})
+		ignore_blocked
+			.range(plan::subtree_bounds(dir))
+			.next()
+			.is_some()
+			|| plan::under_dir(ignored, dir)
+				.any(|(_, decision)| decision.level != IgnoreLevel::Default)
 	};
 	let mut over_ignored = 0;
 	// The `.filenignore` files whose rules keep a withheld directory. Deleted, they would leave the
@@ -3748,10 +3751,10 @@ fn withhold_deletions_over_unreachable(
 		.iter()
 		.filter(|action| {
 			let dir = action.rel_path();
-			let above_held = held.iter().any(|path| plan::is_under(path, dir));
+			let above_held = held.range(plan::subtree_bounds(dir)).next().is_some();
 			let (unreachable, ignored, side) = match action {
 				SyncAction::DeleteLocal { .. } => (
-					above_held || unknown.keys().any(|path| plan::is_under(path, dir)),
+					above_held || plan::under_dir(unknown, dir).next().is_some(),
 					keeps_ignored(ignored_local, dir),
 					ignored_local,
 				),
@@ -5314,7 +5317,7 @@ mod tests {
 			let (kept, deferred) = withhold_deletions_over_unreachable(
 				actions,
 				&BTreeMap::new(),
-				&HashSet::new(),
+				&BTreeSet::new(),
 				sides,
 				&BTreeSet::new(),
 			);
