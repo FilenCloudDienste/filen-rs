@@ -36,7 +36,7 @@ use super::{
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
-	scan::{self, LocalScan, RuleFiles, ScanDepth, ScanError},
+	scan::{self, LocalScan, RuleFiles, ScanError},
 };
 use crate::{
 	Error, ErrorKind,
@@ -2069,7 +2069,7 @@ impl SyncEngine {
 		let adopted = match backlog {
 			Backlog::Propagate => Vec::new(),
 			Backlog::AdoptDestination => {
-				let prep = self.prepare(pair, ScanDepth::Fast).await?;
+				let prep = self.prepare(pair).await?;
 				// The adoption rewrites baseline rows from this one read, and every row it writes is
 				// for a path it reads as GONE on the source side — so it needs the same evidence a
 				// pass needs before acting on an absence. Read through an incomplete scan or an
@@ -2134,9 +2134,7 @@ impl SyncEngine {
 	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
 	/// [`paused`](Self::pause_pair) pair stays resolvable — a pause parks a pass between actions,
 	/// never inside that read, so the wait is at most the read in flight. That read includes the
-	/// local scan, so behind a watch's deep-scan pass (see
-	/// [`WatchConfig::deep_scan_every`](super::WatchConfig::deep_scan_every)), which re-hashes every
-	/// local file, the wait can run to minutes on a large tree. A pair whose
+	/// local scan, so on a large tree the wait can run to seconds. A pair whose
 	/// [`removal`](Self::remove_pair) is under way is refused, as the other control verbs are, and
 	/// that removal waits for a resolution already running.
 	///
@@ -2591,9 +2589,8 @@ impl SyncEngine {
 		rules
 	}
 
-	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
-	/// view.
-	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
+	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
+	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
 		let (record, user_ignore) = {
 			// The registry row and the device-wide patterns: two point reads on the control
 			// connection, which no pass ever holds for longer than one statement.
@@ -2698,13 +2695,7 @@ impl SyncEngine {
 			)
 		};
 		let (mut local_scan, rules) = tokio::task::spawn_blocking(move || {
-			scan::scan_local(
-				&local_root,
-				&scan_baseline,
-				depth,
-				remote_rules.rules,
-				rule_files,
-			)
+			scan::scan_local(&local_root, &scan_baseline, remote_rules.rules, rule_files)
 		})
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
@@ -2810,7 +2801,7 @@ impl SyncEngine {
 	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
 	/// any other.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair, ScanDepth::Fast).await?;
+		let prep = self.prepare(pair).await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
@@ -3512,22 +3503,20 @@ impl SyncEngine {
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
-		self.sync_pass(pair, ScanDepth::Fast, observer).await
+		self.sync_pass(pair, observer).await
 	}
 
-	/// [`sync_once_observed`](Self::sync_once_observed) with the local scan at `depth`. A
-	/// [`Deep`](ScanDepth::Deep) pass re-hashes every local file, so a same-size edit that kept its
-	/// mtime is planned as the edit it is — and a download planned over such a file stashes it first
-	/// (see `apply::stash_local_target`). The watch runs one on its deep-scan tick.
+	/// [`sync_once_observed`](Self::sync_once_observed) plus what a finished pass owes the next one:
+	/// its outcome decides whether that pass may narrow itself to its changelists (see
+	/// [`next_pass_scope`]).
 	pub(super) async fn sync_pass(
 		&self,
 		pair: PairId,
-		depth: ScanDepth,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
 		let mut contained = super::events::contain_panics(observer);
 		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
-		let result = self.run_pass(pair, depth, observer).await;
+		let result = self.run_pass(pair, observer).await;
 		// What this pass's outcome means for the NEXT one's scope, wherever it ended. A pass that
 		// failed outright took both changelists and applied nothing, so what it took is reflected
 		// nowhere and the next pass cannot rely on them.
@@ -3598,7 +3587,6 @@ impl SyncEngine {
 	async fn run_pass(
 		&self,
 		pair: PairId,
-		depth: ScanDepth,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
 		if self.is_paused(pair).await {
@@ -3625,10 +3613,13 @@ impl SyncEngine {
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
 		let changes = self.pair_changes(pair).await;
 		let scope = changes.take();
+		// What reading both sides costs this pair — measured over the read and nothing else, since
+		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`).
+		let read_started = Instant::now();
 		let Some((recording, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
-				(recording, self.prepare(pair, depth).await)
+				(recording, self.prepare(pair).await)
 			})
 			.await
 		else {
@@ -3646,6 +3637,9 @@ impl SyncEngine {
 				..SyncReport::default()
 			});
 		};
+		// The read ends here: everything above it is the baseline, the scan, the snapshot and the
+		// view; everything below writes something.
+		let read_cost = read_started.elapsed();
 		let mut prep = prepared?;
 		let store = self.pair_store(pair).await?;
 		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
@@ -3674,7 +3668,8 @@ impl SyncEngine {
 		// knows. It is RECORDED, not yet acted on — the pass below reads and reconciles both sides
 		// whole whatever the answer is, and the change-scoped pass that consumes it comes next.
 		let mut report = SyncReport {
-			full_pass: scope.full_pass_reason(prep.baseline.len(), depth == ScanDepth::Deep),
+			full_pass: scope.full_pass_reason(prep.baseline.len()),
+			read_cost,
 			..SyncReport::default()
 		};
 		let (dirty_local, dirty_remote) = scope.sizes();
@@ -6168,7 +6163,6 @@ mod tests {
 		let (scan, _) = scan::scan_local(
 			root,
 			&HashMap::new(),
-			ScanDepth::Fast,
 			IgnoreRules::default(),
 			RuleFiles::Read,
 		);

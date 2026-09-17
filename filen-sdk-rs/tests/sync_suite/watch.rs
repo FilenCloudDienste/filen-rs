@@ -24,7 +24,6 @@ use filen_sdk_rs::{
 		dir::RemoteDirectory,
 		file::RemoteFile,
 	},
-	io::client_impl::IoSharedClientExt,
 	sync_engine::{
 		IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode,
 		WatchConfig, WatchState,
@@ -1063,101 +1062,6 @@ async fn watch_24_remote_backup_keeps_local_on_delete() {
 }
 
 // ============================================================================
-// (add) — the deep-scan tick pushes a same-size edit that kept its mtime
-// ============================================================================
-
-/// A same-size edit whose mtime is put back (`touch -r`, an `rsync -a` restore) passes the scan's
-/// `(size, mtime)` fast path, so the passes the watcher's event triggers see nothing to do. The
-/// deep-scan tick re-hashes the file and pushes the edit, byte-exact.
-#[shared_test_runtime]
-async fn watch_deep_scan_pushes_an_edit_that_kept_its_mtime() {
-	const DEEP: Duration = Duration::from_secs(30);
-
-	let sc = single_client(SyncMode::TwoWay).await;
-	write_file(&sc.local, "doc.txt", b"original");
-	let (engine, pair) = watch_engine(&sc, SyncMode::TwoWay).await;
-	let r0 = engine.sync_once(pair).await.unwrap();
-	assert_eq!(r0.uploaded, 1, "seed: {r0:?}");
-	let r1 = engine.sync_once(pair).await.unwrap();
-	assert!(
-		r1.errors.is_empty() && r1.uploaded == 0,
-		"settle pass: {r1:?}"
-	);
-
-	let started = std::time::Instant::now();
-	let log = Arc::new(WatchLog::default());
-	let handle = engine
-		.clone()
-		.watch_with(
-			pair,
-			WatchConfig {
-				debounce: Duration::from_secs(1),
-				safety_net: Duration::from_secs(3),
-				deep_scan_every: Some(DEEP),
-			},
-			observer_for(log.clone()),
-		)
-		.await
-		.unwrap();
-	assert!(
-		wait_until(WATCH_SETTLE, || log.passes() >= 1).await,
-		"the watch never ran its initial pass"
-	);
-
-	// Same size, different bytes, and the old mtime put back.
-	let path = sc.local.join("doc.txt");
-	let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-	write_file(&sc.local, "doc.txt", b"EDITED!!");
-	std::fs::File::options()
-		.write(true)
-		.open(&path)
-		.unwrap()
-		.set_times(std::fs::FileTimes::new().set_modified(mtime))
-		.unwrap();
-	assert_eq!(
-		std::fs::metadata(&path).unwrap().modified().unwrap(),
-		mtime,
-		"the mtime could not be restored"
-	);
-
-	// Before the deep scan is due, the fast passes see an unchanged file.
-	let before_deep = started + DEEP / 2;
-	tokio::time::sleep(before_deep.saturating_duration_since(std::time::Instant::now())).await;
-	assert!(
-		std::time::Instant::now() < started + DEEP,
-		"the setup outlasted the deep-scan interval; the check below proves nothing"
-	);
-	assert_eq!(
-		log.uploaded(),
-		0,
-		"a fast pass pushed an edit it cannot see"
-	);
-
-	assert!(
-		wait_until(WATCH_SETTLE, || log.uploaded() >= 1).await,
-		"the deep scan never pushed the edit (passes={}, up={})",
-		log.passes(),
-		log.uploaded()
-	);
-	assert_eq!(log.uploaded(), 1, "the edit was pushed more than once");
-	assert!(log.conflicts().is_empty(), "unexpected conflicts");
-	assert!(
-		read_eq(&sc.local, "doc.txt", b"EDITED!!"),
-		"local edit lost"
-	);
-	let (_d, files) = list_remote_root(&sc).await;
-	let remote = find_file(&files, "doc.txt").expect("doc.txt missing on remote");
-	assert_eq!(
-		sc.cache.client.download_file(remote).await.unwrap(),
-		b"EDITED!!",
-		"the remote does not hold the edit"
-	);
-
-	drop(handle);
-	sc.cleanup();
-}
-
-// ============================================================================
 // (add) — new device-wide user ignore patterns wake a running watch
 // ============================================================================
 
@@ -1182,7 +1086,6 @@ async fn watch_user_ignore_wakes_a_running_loop() {
 			WatchConfig {
 				debounce: Duration::from_millis(500),
 				safety_net: LONG_NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -1591,7 +1494,6 @@ async fn watch_15_pause_resume() {
 			WatchConfig {
 				debounce: Duration::from_secs(1),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -1696,7 +1598,6 @@ async fn watch_add_trailing_edge_debounce() {
 				debounce: DEBOUNCE,
 				// Far enough out that nothing observed here can be a safety-net pass.
 				safety_net: Duration::from_secs(3600),
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -1772,7 +1673,6 @@ async fn watch_add_net_vs_event_pass_no_double_apply() {
 			WatchConfig {
 				debounce: Duration::from_secs(1),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -1917,7 +1817,6 @@ async fn watch_26_remove_pair_stops_events() {
 			WatchConfig {
 				debounce: Duration::from_secs(1),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -2021,7 +1920,6 @@ async fn watch_add_interrupted_pass_replans_on_resume() {
 			WatchConfig {
 				debounce: Duration::from_millis(200),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -2118,7 +2016,6 @@ async fn watch_add_stop_outlasts_a_pause_issued_after_it() {
 			WatchConfig {
 				debounce: Duration::from_millis(200),
 				safety_net: Duration::from_secs(600),
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)
@@ -2207,7 +2104,6 @@ async fn watch_add_net_interval_resets_but_not_starved() {
 			WatchConfig {
 				debounce: Duration::from_secs(1),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			observer_for(log.clone()),
 		)

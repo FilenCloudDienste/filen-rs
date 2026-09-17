@@ -860,7 +860,6 @@ async fn filter_watch_applies_a_new_filenignore() {
 				debounce: Duration::from_secs(1),
 				// Far beyond the test: every pass below is triggered by a file event.
 				safety_net: Duration::from_secs(3600),
-				deep_scan_every: None,
 			},
 			Box::new(move |event| {
 				if let SyncEvent::PassCompleted { report } = event {

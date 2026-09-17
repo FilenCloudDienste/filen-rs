@@ -17,6 +17,7 @@ use std::{
 		Arc, PoisonError,
 		atomic::{AtomicBool, Ordering},
 	},
+	time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -153,6 +154,15 @@ pub struct SyncReport {
 	/// in place yet — so for now the field says what the next pass's scope WOULD be, which is what
 	/// makes the trigger table observable from the outside while it is still being built.
 	pub full_pass: Option<FullPassReason>,
+	/// How long this pass spent READING: the baseline, the local scan, the remote snapshot and the
+	/// view. Zero on a pass that never got that far.
+	///
+	/// This — and not the pass's wall time — is what a watch's safety net scales its interval by
+	/// (see [`WatchConfig::safety_net`](super::WatchConfig::safety_net)). What the net trades
+	/// against is the cost of reading this pair's tree; a pass also carries its transfers, the wait
+	/// for the drive-write lock and any stretch a suspension parked it in, none of which say
+	/// anything about how expensive the tree is to read.
+	pub(super) read_cost: Duration,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.
