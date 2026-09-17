@@ -1,14 +1,16 @@
 -- Whole-subtree dump for the sync engine's remote snapshot: every descendant
--- item under one sync root with the FULL payload columns. Unlike the search
--- window queries this has no needle/order/window/path — it returns the entire
--- subtree so the engine can reconcile it against the local tree + baseline.
+-- item under one sync root, in the SEVEN-odd columns its view actually reads
+-- (`plan::place_remote_items`). The full payload of an item is read back by
+-- uuid, for the handful a pass acts on, through hydrate_by_uuids.sql — a pass
+-- would otherwise parse a file key, decode a hash and allocate four strings per
+-- row of the whole tree to answer a few dozen questions.
 --
--- COLUMN NAMES ARE A CONTRACT: `search::hydrate::row_to_result` reads them by
--- name, so the `AS` aliases below must match the search windows' projection.
--- The recursive
--- `subtree` CTE mirrors diff_subtree_absent.sql / search_window_subtree.sql
--- (UNION dedups, so a corrupt parent cycle terminates); the anchor itself is
--- never returned (the engine syncs the root's CONTENTS, not the root node).
+-- COLUMN ORDER IS THE CONTRACT here (not the names, as in the full projection):
+-- `enumerate::slim_item` reads by index, and this statement has one reader.
+-- The recursive `subtree` CTE mirrors diff_subtree_absent.sql /
+-- search_window_subtree.sql (UNION dedups, so a corrupt parent cycle
+-- terminates); the anchor itself is never returned (the engine syncs the root's
+-- CONTENTS, not the root node).
 -- ?1 = anchor (sync root) uuid.
 WITH RECURSIVE
 subtree (uuid) AS (
@@ -24,26 +26,15 @@ SELECT
 	i.uuid,
 	i.parent,
 	i.type,
-	f.chunks_size,
-	f.chunks,
-	f.favorite AS file_favorite,
-	f.region,
-	f.bucket,
-	f.timestamp AS file_timestamp,
-	f.size,
-	f.name AS file_name,
-	f.mime,
-	f.file_key,
-	f.file_key_version,
-	f.created AS file_created,
-	f.modified,
-	f.hash,
 	f.stable_uuid,
-	d.favorite AS dir_favorite,
-	d.color,
-	d.timestamp AS dir_timestamp,
-	d.name AS dir_name,
-	d.created AS dir_created
+	f.hash,
+	-- The linter wants every plain column before the expressions, so the name
+	-- and the two defaulted values come last; `slim_item` reads by index.
+	coalesce(f.name, d.name) AS name,
+	coalesce(f.size, 0) AS size,
+	-- What the view calls `modified_millis`: a file's own modified stamp, a
+	-- directory's creation stamp (0 where it has none), both already millis.
+	coalesce(f.modified, d.created, 0) AS modified
 FROM items AS i
 INNER JOIN subtree AS s ON i.uuid = s.uuid
 LEFT JOIN files AS f ON i.id = f.id
