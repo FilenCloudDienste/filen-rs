@@ -60,6 +60,12 @@ const DEFAULT_SHAPE: &str = "20,3,73";
 /// a sample measures the same constant. The detail column names the sample size.
 const PER_ACTION_SAMPLE: usize = 20_000;
 
+/// How many times a phase that is measured AGAINST another one is run, alternating between the
+/// two. One ordered sample of each cannot separate an effect of a few per cent from this probe's
+/// own run-to-run spread — `write_batched`, with the same index in place both times, moved 20 %
+/// between two runs at 100k — and whichever phase runs second reads a warmer cache.
+const COMPARE_REPS: usize = 3;
+
 /// The user-level rules the filtered view build is measured with — five patterns over the built-in
 /// defaults, the shape a real pair carries.
 const PROBE_RULES: &str = "*.log\nbuild/\n*.tmp\nnode_modules/\n*.bak\n";
@@ -75,7 +81,12 @@ const CONTENDING_READ: Duration = Duration::from_millis(500);
 /// How long the contended control-WRITE phase keeps issuing whole-tree writes for. Long enough to
 /// cover several transactions at 100k rows, so a control write certainly lands inside one; at a
 /// million rows a single transaction already outlasts it.
-const CONTENDED_WRITE: Duration = Duration::from_millis(1_500);
+///
+/// It has to outlast that transaction's START, not just its length: with the `(pair_id, state)`
+/// index in place a 100k re-write takes about 1.6 s, and a 1.5 s window could end while the
+/// contending writer was still opening its connection — leaving the phase reporting the
+/// UNCONTENDED cost (0.7 ms, seen once) as though it were the wait it exists to find.
+const CONTENDED_WRITE: Duration = Duration::from_millis(5_000);
 
 /// The tree's shape, as `SYNC_PROBE_SHAPE` gives it.
 struct Shape {
@@ -334,6 +345,13 @@ fn peak_rss_bytes() -> u64 {
 	0
 }
 
+/// The median and the best of a phase's samples: the median is the figure a run reports, the best
+/// is the floor the noise sits above. Sorts in place; `samples` must not be empty.
+fn median_and_best(samples: &mut [Duration]) -> (Duration, Duration) {
+	samples.sort_unstable();
+	(samples[samples.len() / 2], samples[0])
+}
+
 fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
 	let start = Instant::now();
 	let value = f();
@@ -588,33 +606,182 @@ pub fn run() -> String {
 	);
 	drop(changes);
 
-	let (scratch, _) = store
-		.create_pair(
-			&format!("{local_root}#scratch"),
-			fixture.remote_root,
-			SyncMode::TwoWay,
-		)
-		.expect("registering the per-action pair");
+	// The per-action baseline write, with the `(pair_id, state)` index and without it: what the
+	// index costs on every row a pass records. Measured ALTERNATELY and several times each, because
+	// one ordered sample of each cannot separate an effect of a few per cent from this probe's own
+	// run-to-run spread — `write_batched` alone moved 20 % between two runs of it at this size —
+	// and whichever of two consecutive phases runs second gets the warmer cache.
 	let sample = entries.len().min(PER_ACTION_SAMPLE);
-	let (_, per_action) = timed(|| {
-		for entry in &entries[..sample] {
+	let mut per_action_indexed: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	let mut per_action_plain: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	for rep in 0..COMPARE_REPS {
+		for indexed in [true, false] {
 			store
-				.upsert_entry(scratch, entry)
-				.expect("writing one baseline row");
+				.set_state_index(indexed)
+				.expect("toggling the conflict-state index");
+			// A pair of its own per sample, so every sample writes its rows into an empty pair
+			// rather than replacing the previous sample's.
+			let (scratch, _) = store
+				.create_pair(
+					&format!("{local_root}#per-action-{rep}-{indexed}"),
+					fixture.remote_root,
+					SyncMode::TwoWay,
+				)
+				.expect("registering the per-action pair");
+			let (_, elapsed) = timed(|| {
+				for entry in &entries[..sample] {
+					store
+						.upsert_entry(scratch, entry)
+						.expect("writing one baseline row");
+				}
+			});
+			let samples = if indexed {
+				&mut per_action_indexed
+			} else {
+				&mut per_action_plain
+			};
+			samples.push(elapsed);
+			store
+				.delete_pair(scratch)
+				.expect("dropping the scratch pair");
 		}
-	});
+	}
+	let (per_action, per_action_best) = median_and_best(&mut per_action_indexed);
 	probe.record(
 		"write_per_action",
 		sample,
 		per_action,
 		&format!(
-			"upsert_entry, one autocommit transaction each, {sample} of {} rows",
-			entries.len()
+			"upsert_entry, one autocommit transaction each, {sample} of {} rows — median of \
+			 {COMPARE_REPS} alternating with the no-index phase, best {:.3} ms",
+			entries.len(),
+			per_action_best.as_secs_f64() * 1e3
 		),
 	);
+	let (per_action_no_index, per_action_no_index_best) = median_and_best(&mut per_action_plain);
+	probe.record(
+		"write_per_action_no_index",
+		sample,
+		per_action_no_index,
+		&format!(
+			"upsert_entry with no (pair_id, state) index, {sample} of {} rows — median of \
+			 {COMPARE_REPS}, best {:.3} ms",
+			entries.len(),
+			per_action_no_index_best.as_secs_f64() * 1e3
+		),
+	);
+
+	// The same comparison on the BATCHED write — the whole tree in one transaction, which is what
+	// a first sync actually pays and what the per-action figure cannot stand in for: that one's
+	// cost is dominated by a commit per row. Both of these REWRITE rows already present, so they
+	// are comparable to each other rather than to `write_batched` above, which inserted them.
+	let changes: Vec<BaselineChange<'_>> = entries.iter().map(BaselineChange::Upsert).collect();
+	let mut batched_indexed: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	let mut batched_plain: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	for _ in 0..COMPARE_REPS {
+		for indexed in [true, false] {
+			store
+				.set_state_index(indexed)
+				.expect("toggling the conflict-state index");
+			let (_, elapsed) = timed(|| {
+				store
+					.apply_changes(pair, &changes)
+					.expect("re-writing the baseline in one transaction")
+			});
+			let samples = if indexed {
+				&mut batched_indexed
+			} else {
+				&mut batched_plain
+			};
+			samples.push(elapsed);
+		}
+	}
+	drop(changes);
+	let (batched_with_index, batched_with_index_best) = median_and_best(&mut batched_indexed);
+	probe.record(
+		"write_batched_indexed",
+		entries.len(),
+		batched_with_index,
+		&format!(
+			"apply_changes re-writing every row in one transaction — median of {COMPARE_REPS} \
+			 alternating with the no-index phase, best {:.1} ms",
+			batched_with_index_best.as_secs_f64() * 1e3
+		),
+	);
+	let (batched_no_index, batched_no_index_best) = median_and_best(&mut batched_plain);
+	probe.record(
+		"write_batched_no_index",
+		entries.len(),
+		batched_no_index,
+		&format!(
+			"the same transaction with no (pair_id, state) index — median of {COMPARE_REPS}, best \
+			 {:.1} ms",
+			batched_no_index_best.as_secs_f64() * 1e3
+		),
+	);
+
+	// What the index costs to BUILD: every row of the file read and sorted, inside the write lock.
+	// The first open of a DB written before the index existed pays this once, and another pair's
+	// connection opening at the same moment waits it out on its busy timeout.
 	store
-		.delete_pair(scratch)
-		.expect("dropping the scratch pair");
+		.set_state_index(false)
+		.expect("dropping the conflict-state index");
+	let (_, index_build) = timed(|| {
+		store
+			.set_state_index(true)
+			.expect("creating the conflict-state index")
+	});
+	probe.record(
+		"state_index_build",
+		nodes,
+		index_build,
+		"CREATE INDEX baseline_state over the whole file — what the first open after it was added \
+		 pays, once",
+	);
+
+	// The conflict read, both ways round and alternating for the same reason the writes are. It
+	// hands back the rows a pair holds in conflict — none here, which is the steady state — so what
+	// the two phases differ by is the lookup: a seek of the `(pair_id, state)` index against a walk
+	// of every row of the pair. That walk is also how long the read holds the pair's store mutex,
+	// which is what a control verb on the same pair waits out.
+	let mut conflict_indexed: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	let mut conflict_walked: Vec<Duration> = Vec::with_capacity(COMPARE_REPS);
+	for _ in 0..COMPARE_REPS {
+		for indexed in [true, false] {
+			store
+				.set_state_index(indexed)
+				.expect("toggling the conflict-state index");
+			let (_, elapsed) = timed(|| store.conflicts(pair).expect("reading the conflicts"));
+			let samples = if indexed {
+				&mut conflict_indexed
+			} else {
+				&mut conflict_walked
+			};
+			samples.push(elapsed);
+		}
+	}
+	store
+		.set_state_index(true)
+		.expect("re-creating the conflict-state index");
+	let (conflict_read, _) = median_and_best(&mut conflict_indexed);
+	probe.record(
+		"conflict_read_indexed",
+		nodes,
+		conflict_read,
+		&format!(
+			"conflicts() on the (pair_id, state) index — also the hold it takes on the pair's \
+			 mutex; median of {COMPARE_REPS}"
+		),
+	);
+	let (conflict_read_walked, _) = median_and_best(&mut conflict_walked);
+	probe.record(
+		"conflict_read_no_index",
+		nodes,
+		conflict_read_walked,
+		&format!(
+			"conflicts() with the index dropped: every row of the pair; median of {COMPARE_REPS}"
+		),
+	);
 
 	// A control WRITE on its own connection while another connection is inside a whole-tree
 	// transaction. This is the window the control-verb target is about: WAL lets a READER through
@@ -924,10 +1091,12 @@ pub fn run() -> String {
 		let mut reads = 0usize;
 		let until = Instant::now() + CONTENDING_READ;
 		while Instant::now() < until {
-			// `conflicts` rather than `entries`: the `state` column carries no index, so it scans
-			// the pair's rows just the same, but it hands back only the few that are held. The
-			// contention is the same and a whole-tree `Vec` per read — which at a million rows
-			// would dominate the peak this harness reports — is not.
+			// `conflicts` rather than `entries`: same connection, same store lock, but only the
+			// few rows a pair holds come back, so a whole-tree `Vec` per read — which at a
+			// million rows would dominate the peak this harness reports — is not part of what
+			// this phase measures. Now that the read seeks the `(pair_id, state)` index, what
+			// sustains the contention is the LOOP rather than one long scan; a reader never
+			// blocks a reader under WAL, so the point-read figure below is unchanged by that.
 			reader.conflicts(pair).expect("scanning for held conflicts");
 			reads += 1;
 		}
@@ -948,6 +1117,17 @@ pub fn run() -> String {
 			"pair() on its own connection, while another connection ran {reads} whole-tree \
 			 scan(s) of the same file"
 		),
+	);
+
+	// What dropping a pair costs: one DELETE plus the `ON DELETE CASCADE` over every row it owns.
+	// It is the other long write a single connection makes — the one the 30 s busy timeout has to
+	// outlast for another pair's record write to land rather than fail — and it was unmeasured.
+	let (_, cascade) = timed(|| store.delete_pair(pair).expect("deleting the probe pair"));
+	probe.record(
+		"pair_delete_cascade",
+		nodes,
+		cascade,
+		"delete_pair: one DELETE and the ON DELETE CASCADE over the pair's rows",
 	);
 
 	drop(store);
