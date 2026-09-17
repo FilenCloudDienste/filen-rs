@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId},
+	changes::FullPassReason,
 	engine::{
 		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SharedStore,
 		locked, off_store,
@@ -145,6 +146,13 @@ pub struct SyncReport {
 	/// it. [`interrupted`](Self::interrupted) does not count the held transfers: the next pass
 	/// re-plans them. A watch treats such a pass as a failed one and backs off before the next.
 	pub halted: Option<HaltReason>,
+	/// Why this pass read both sides WHOLE rather than only what changed since the last one, or
+	/// `None` when its changelists described every change (see [`FullPassReason`]).
+	///
+	/// A pass reads everything today either way — the change-scoped pass that acts on this is not
+	/// in place yet — so for now the field says what the next pass's scope WOULD be, which is what
+	/// makes the trigger table observable from the outside while it is still being built.
+	pub full_pass: Option<FullPassReason>,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
 	/// ones (a refusal, a lock that could not be taken) that belong to no path.
