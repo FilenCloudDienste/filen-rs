@@ -3369,9 +3369,10 @@ impl SyncEngine {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		let store = self.pair_store(pair).await?;
-		// The `state` column carries no index, so this seeks nothing: it is a read of the pair's
-		// rows however few it hands back, and it deliberately does not wait for the pass in
-		// flight. Off the runtime thread on both counts.
+		// A seek of the `(pair_id, state)` index rather than a read of the pair's rows, and it
+		// deliberately does not wait for the pass in flight. Still off the runtime thread: the
+		// statement is cheap now, but it queues behind whatever the pass in flight is holding
+		// the pair's store mutex for.
 		Ok(off_store(&store, move |store| store.conflicts(pair))
 			.await?
 			.map_err(|e| db_error(e, "loading the held conflicts"))?
