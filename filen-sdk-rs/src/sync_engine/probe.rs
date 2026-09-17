@@ -72,6 +72,11 @@ const CONTROL_VERB_SAMPLE: usize = 100;
 /// the reads it is measured against certainly overlap it.
 const CONTENDING_READ: Duration = Duration::from_millis(500);
 
+/// How long the contended control-WRITE phase keeps issuing whole-tree writes for. Long enough to
+/// cover several transactions at 100k rows, so a control write certainly lands inside one; at a
+/// million rows a single transaction already outlasts it.
+const CONTENDED_WRITE: Duration = Duration::from_millis(1_500);
+
 /// The tree's shape, as `SYNC_PROBE_SHAPE` gives it.
 struct Shape {
 	files_per_leaf: usize,
@@ -610,6 +615,99 @@ pub fn run() -> String {
 	store
 		.delete_pair(scratch)
 		.expect("dropping the scratch pair");
+
+	// A control WRITE on its own connection while another connection is inside a whole-tree
+	// transaction. This is the window the control-verb target is about: WAL lets a READER through
+	// during a write, so `control_verb_under_read` below can never queue, but a second WRITER waits
+	// for the first to commit — and waits inside `sqlite3_step`'s busy handler, not on any lock the
+	// engine holds. The contending writer replaces rows that are already there, so the DB does not
+	// grow and its transaction is the one `write_batched` timed.
+	let (control_write, control_outcome) = {
+		let control = BaselineStore::open(&fixture.baseline_db).expect("the control connection");
+		let rows = &entries;
+		let bulk_db = fixture.baseline_db.clone();
+		std::thread::scope(|scope| {
+			// Sampled over a sustained window and reported as the WORST case, not timed once: a
+			// single sample races the contending transaction's first statement, and a control
+			// write issued in the moment before the write lock is taken measures the uncontended
+			// cost (70 us here) rather than the wait this phase exists to find.
+			let deadline = Instant::now() + CONTENDED_WRITE;
+			let writing = scope.spawn(move || {
+				let bulk =
+					BaselineStore::open(&bulk_db).expect("the contending writer's connection");
+				let changes: Vec<BaselineChange<'_>> =
+					rows.iter().map(BaselineChange::Upsert).collect();
+				let mut transactions = 0usize;
+				// One transaction at a million rows outlasts the window by itself, which is the
+				// point: the window bounds when sampling STARTS, not how long one write takes.
+				while Instant::now() < deadline {
+					bulk.apply_changes(pair, &changes)
+						.expect("the contending whole-tree write");
+					transactions += 1;
+				}
+				transactions
+			});
+			let mut worst = Duration::ZERO;
+			let mut samples = 0usize;
+			let mut failed = None;
+			while Instant::now() < deadline {
+				// The flag alternates so no sample can be a write the planner shortcuts.
+				let (outcome, verb) = timed(|| control.set_paused(pair, samples.is_multiple_of(2)));
+				worst = worst.max(verb);
+				samples += 1;
+				// Reported rather than unwrapped: a transaction longer than the busy timeout is
+				// exactly what this phase exists to find, and a panicking probe would hide it.
+				if let Err(error) = outcome {
+					failed = Some(error.to_string());
+					break;
+				}
+			}
+			let transactions = writing.join().expect("the contending writer thread");
+			control.set_paused(pair, false).expect("unpausing the pair");
+			let outcome = match failed {
+				None => format!(
+					"worst of {samples} control write(s) against {transactions} whole-tree \
+					 transaction(s)"
+				),
+				Some(error) => format!("FAILED after {samples} sample(s): {error}"),
+			};
+			(worst, outcome)
+		})
+	};
+	probe.record(
+		"control_write_under_write",
+		1,
+		control_write,
+		&format!(
+			"set_paused on its own connection while another connection held the write lock — \
+			 {control_outcome}"
+		),
+	);
+
+	// What the directory-rename phase at the end needs, taken from the rows that are already here.
+	// Reading the baseline back for it down there instead would allocate a second whole-tree `Vec`
+	// at a point where this run's peak RSS is the number a memory target gets read from — so the
+	// harness would be reporting its own measurement.
+	let rename_root = entries
+		.iter()
+		.find(|entry| entry.kind == NodeKind::Dir && !entry.rel_path.contains('/'))
+		.map(|entry| entry.rel_path.clone())
+		.expect("the probe tree must have a top-level directory");
+	let rename_rows = {
+		let under = format!("{rename_root}/");
+		entries
+			.iter()
+			.filter(|entry| entry.rel_path == rename_root || entry.rel_path.starts_with(&under))
+			.count()
+	};
+	// Every top-level directory, for the whole-tree rename phase: renaming all of them in one
+	// transaction re-keys every row of the pair, which is what renaming the pair root does. A
+	// handful of names, taken here for the same reason `rename_root` is.
+	let top_level: Vec<String> = entries
+		.iter()
+		.filter(|entry| entry.kind == NodeKind::Dir && !entry.rel_path.contains('/'))
+		.map(|entry| entry.rel_path.clone())
+		.collect();
 	drop(entries);
 
 	let (baseline, read) = timed(|| {
@@ -750,25 +848,13 @@ pub fn run() -> String {
 
 	// A directory rename, which re-keys every row of that directory's subtree in one transaction —
 	// the widest single write a pass makes, and what a pair-root rename is made of.
-	let rows = store.entries(pair).expect("reading the baseline");
-	let top = rows
-		.iter()
-		.find(|entry| entry.kind == NodeKind::Dir && !entry.rel_path.contains('/'))
-		.map(|entry| entry.rel_path.clone())
-		.expect("the probe tree must have a top-level directory");
-	let under = format!("{top}/");
-	let moved = rows
-		.iter()
-		.filter(|entry| entry.rel_path == top || entry.rel_path.starts_with(&under))
-		.count();
-	drop(rows);
-	let renamed = format!("{top}-renamed");
+	let renamed = format!("{rename_root}-renamed");
 	let (_, rename) = timed(|| {
 		store
 			.apply_changes(
 				pair,
 				&[BaselineChange::MoveSubtree {
-					from: &top,
+					from: &rename_root,
 					to: &renamed,
 				}],
 			)
@@ -776,9 +862,56 @@ pub fn run() -> String {
 	});
 	probe.record(
 		"dir_rename_subtree",
-		moved,
+		rename_rows,
 		rename,
 		"apply_changes(MoveSubtree), one transaction, every row under one top-level directory",
+	);
+
+	// The whole tree re-keyed in ONE transaction: every row of the pair, which is what renaming the
+	// pair root costs — measured rather than extrapolated from the single subtree above, because
+	// the per-row cost of an `UPDATE OR REPLACE` over the primary key grows with the rows already
+	// re-keyed in the same transaction. The `-wal` file after it is the other half of that cost:
+	// those pages are written twice, once here and once at the checkpoint. `dir_rename_subtree`
+	// has already renamed one of these directories, so that one is named by where it now is.
+	let renames: Vec<(String, String)> = top_level
+		.iter()
+		.map(|name| {
+			let from = if *name == rename_root {
+				renamed.clone()
+			} else {
+				name.clone()
+			};
+			let to = format!("{from}-w");
+			(from, to)
+		})
+		.collect();
+	let whole_tree: Vec<BaselineChange<'_>> = renames
+		.iter()
+		.map(|(from, to)| BaselineChange::MoveSubtree {
+			from: from.as_str(),
+			to: to.as_str(),
+		})
+		.collect();
+	let (_, whole_rename) = timed(|| {
+		store
+			.apply_changes(pair, &whole_tree)
+			.expect("renaming every top-level directory in one transaction")
+	});
+	let wal_mib = fs::metadata(PathBuf::from(format!(
+		"{}-wal",
+		fixture.baseline_db.display()
+	)))
+	.map(|meta| meta.len() as f64 / (1024.0 * 1024.0))
+	.unwrap_or(0.0);
+	probe.record(
+		"dir_rename_whole_tree",
+		nodes,
+		whole_rename,
+		&format!(
+			"apply_changes(MoveSubtree) for all {} top-level directories in one transaction, \
+			 -wal {wal_mib:.1} MiB after it",
+			renames.len()
+		),
 	);
 
 	// A control verb on ANOTHER pair while this pair's whole-tree read is in flight. Each pair has
@@ -791,7 +924,11 @@ pub fn run() -> String {
 		let mut reads = 0usize;
 		let until = Instant::now() + CONTENDING_READ;
 		while Instant::now() < until {
-			reader.entries(pair).expect("reading the baseline");
+			// `conflicts` rather than `entries`: the `state` column carries no index, so it scans
+			// the pair's rows just the same, but it hands back only the few that are held. The
+			// contention is the same and a whole-tree `Vec` per read — which at a million rows
+			// would dominate the peak this harness reports — is not.
+			reader.conflicts(pair).expect("scanning for held conflicts");
 			reads += 1;
 		}
 		reads
@@ -809,7 +946,7 @@ pub fn run() -> String {
 		verb,
 		&format!(
 			"pair() on its own connection, while another connection ran {reads} whole-tree \
-			 read(s) of the same file"
+			 scan(s) of the same file"
 		),
 	);
 
