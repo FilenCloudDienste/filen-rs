@@ -20,7 +20,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use filen_types::{crypto::Blake3Hash, fs::StableUuid};
+use filen_types::fs::StableUuid;
 use futures::{StreamExt, stream::FuturesUnordered};
 use uuid::Uuid;
 
@@ -40,7 +40,7 @@ use super::{
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
-	scan::{LocalNode, QUARANTINE_DIR, collision_key},
+	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 };
 use crate::{
 	auth::Client,
@@ -1411,15 +1411,7 @@ async fn apply_transfer(
 					.map_err(db_err)?,
 				None => None,
 			};
-			// The scan's hash describes the pass-start row only; a row read back from the store
-			// describes a file this pass moved here since.
-			let scanned_hash = ctx
-				.baseline
-				.get(rel_path)
-				.and(ctx.local.get(rel_path))
-				.and_then(|node| node.content_hash);
-			let stashed =
-				stash_local_target(ctx.local_root, rel_path, base.as_ref(), scanned_hash)?;
+			let stashed = stash_local_target(ctx.local_root, rel_path, base.as_ref()).await?;
 			let Some(downloaded) = ctx
 				.gate
 				.guard(ctx.client.download_file_to_path(
@@ -1446,18 +1438,47 @@ async fn apply_transfer(
 				return Err(error);
 			}
 			let remote = ctx.remote.get(rel_path);
+			// The row this writes has to carry a hash of what landed. Where the remote declares one
+			// it is that hash — the same one every later pass compares the path against. Where it
+			// declares NONE (a client that wrote no `blake3` in the file's metadata: the common
+			// cross-device case), hashing the file just written is the only way the row gets one at
+			// all, and a row without one vouches for nothing: it cannot tell a later size- and
+			// mtime-preserving edit from the copy it recorded, and the scan reads the file as
+			// locally modified on every pass because `Some(hash) != None`.
+			let landed_hash = match remote.and_then(|n| n.content_hash) {
+				Some(declared) => Some(declared),
+				// Off the runtime thread, like every other hash of a local file. A read that fails
+				// here leaves the row as it would have been before — hashless, and so not vouched
+				// for by the pre-download stash.
+				None => {
+					let landed = path.clone();
+					tokio::task::spawn_blocking(move || hash_file(&landed))
+						.await
+						.map_err(|e| {
+							internal_owned(format!("hashing a downloaded file panicked: {e}"))
+						})?
+						.inspect_err(|error| {
+							tracing::debug!(
+								"apply: {rel_path:?} landed but could not be hashed ({error}); its row records no content hash"
+							);
+						})
+						.ok()
+				}
+			};
 			upsert_file_baseline(
 				ctx,
 				rel_path,
 				Some(*remote_uuid),
 				remote.and_then(|n| n.stable_uuid),
-				remote.and_then(|n| n.content_hash),
+				landed_hash,
 				remote.map(|n| n.size).unwrap_or(0),
 				local_mtime_of(&path),
 				remote.map(|n| n.modified_millis),
 				// A pull is the moment both sides demonstrably hold the same bytes: the content just
-				// fetched IS the agreed content.
-				remote.and_then(|n| n.content_hash),
+				// fetched IS the agreed content. The two stay equal — a row whose recorded content
+				// and agreed content differ is one holding an unconfirmed local edit
+				// (`is_unconfirmed_concurrent_edit`), which a fresh pull is not.
+				landed_hash,
 			)
 			.await?;
 		}
@@ -1779,7 +1800,7 @@ async fn apply_one(
 			// waits on the drive lock in between and a file can land there meanwhile — and
 			// `rename` would destroy it without a trace. Same window, and same remedy, as the
 			// pre-download stash above.
-			stash_move_target(ctx.local_root, to_path, ctx.baseline.get(to_path))?;
+			stash_move_target(ctx.local_root, to_path, ctx.baseline.get(to_path)).await?;
 			if let Some(parent) = to.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
@@ -1936,24 +1957,23 @@ async fn apply_one(
 /// move whose destination is occupied — goes through here, so a local edit is never destroyed
 /// silently; it lands in the quarantine bin the same way a propagated deletion does.
 ///
-/// `scanned_hash` is the content hash this pass's scan read at the target, passed only when `base`
-/// is the pass-start row that scan was measured against. A scan that hashed something other than
-/// the row records is an edit the `(size, mtime)` test below cannot see — a same-size edit that kept
-/// its mtime, which only a [deep](super::scan::ScanDepth::Deep) scan hashes — so it is stashed too.
-///
 /// Returns where it was stashed (nothing stashed: `None`), for a caller whose write may still not
 /// happen — see [`restore_stashed`].
-fn stash_local_target(
+///
+/// The decision reads the target's bytes (see [`local_holds_unsynced_content`]), so it is made off
+/// the runtime thread — the same reason the local scan runs on a blocking thread.
+async fn stash_local_target(
 	local_root: &Path,
 	rel_path: &str,
 	base: Option<&BaselineEntry>,
-	scanned_hash: Option<Blake3Hash>,
 ) -> Result<Option<PathBuf>, crate::Error> {
-	let scan_saw_an_edit = matches!(
-		(base.and_then(|b| b.content_hash), scanned_hash),
-		(Some(recorded), Some(scanned)) if recorded != scanned
-	);
-	if scan_saw_an_edit || local_holds_unsynced_content(&local_path(local_root, rel_path), base) {
+	let path = local_path(local_root, rel_path);
+	let base = base.cloned();
+	let unsynced =
+		tokio::task::spawn_blocking(move || local_holds_unsynced_content(&path, base.as_ref()))
+			.await
+			.map_err(|e| internal_owned(format!("reading a local write target panicked: {e}")))?;
+	if unsynced {
 		return quarantine_local(local_root, rel_path);
 	}
 	Ok(None)
@@ -1966,8 +1986,23 @@ fn stash_local_target(
 ///
 /// Read from DISK rather than from the pass's scan snapshot: a pass waits on the drive lock
 /// between the scan and its transfers, and an edit landing in that window is exactly the one that
-/// must not be overwritten. The `(size, mtime)` comparison is the scanner's own fast-path test
-/// (`scan::fast_path_hash`), so an untouched file is not re-hashed here either.
+/// must not be overwritten.
+///
+/// `(size, mtime)` cannot answer it on its own. An edit that kept both — `touch -r`, an `rsync -a`
+/// restore, an editor that puts the timestamp back — is indistinguishable from the synced copy by
+/// stat alone, and the scan's own fast-path (`scan::fast_path_hash`) reads it as unchanged for
+/// ever, so no plan ever mentions that path. This is therefore the one place those bytes are still
+/// read: when the stat matches the row, the file is HASHED and compared. It costs one local read
+/// of a file this pass is about to replace with a download of the same path, and it is all that
+/// stands between such an edit and a silent overwrite.
+///
+/// A row that records NO hash is not vouched for either — quarantined, not refreshed in place.
+/// There is nothing to compare the bytes against, and the stat it does record is exactly what such
+/// an edit preserves. Every row a write of this engine's own produces carries a hash (a download
+/// hashes what landed where the remote declared none; an upload records what the scan hashed), and
+/// the rows that deliberately hold no local content — a `KeepLocal` resolution, a move that
+/// carried one across — record no size either, so they never reach this branch. What is left is a
+/// row from some earlier build, and a spare copy in the bin is the cheap side of that trade.
 fn local_holds_unsynced_content(path: &Path, base: Option<&BaselineEntry>) -> bool {
 	use crate::io::FilenMetaExt;
 	let Ok(meta) = std::fs::metadata(path) else {
@@ -1979,10 +2014,23 @@ fn local_holds_unsynced_content(path: &Path, base: Option<&BaselineEntry>) -> bo
 	let Some(base) = base else {
 		return true;
 	};
-	base.kind != NodeKind::File
+	if base.kind != NodeKind::File
 		|| !meta.is_file()
 		|| base.size != Some(meta.len())
 		|| base.local_mtime != Some(FilenMetaExt::modified(&meta).timestamp_millis())
+	{
+		return true;
+	}
+	match base.content_hash {
+		Some(recorded) => match hash_file(path) {
+			Ok(hash) => hash != recorded,
+			// Unreadable right now: never overwrite on the strength of a stat that may be stale.
+			Err(_) => true,
+		},
+		// Nothing to compare against, and the stat it does record is what the edit this exists to
+		// catch preserves. Quarantine rather than write over it.
+		None => true,
+	}
 }
 
 /// What an [`SyncAction::AdoptBaseline`] writes for one path. Decided purely (no I/O) so the
@@ -2417,15 +2465,14 @@ fn restore_stashed(stashed: Option<PathBuf>, path: &Path) {
 /// names apart. It is the parent directory that knows: the destination is a file of its own
 /// exactly when the directory lists that name literally. `from_path` comes from the scan, so it
 /// carries the source's on-disk spelling and cannot be the name found here.
-fn stash_move_target(
+async fn stash_move_target(
 	local_root: &Path,
 	to_path: &str,
 	base: Option<&BaselineEntry>,
 ) -> Result<(), crate::Error> {
 	if has_own_directory_entry(&local_path(local_root, to_path)) {
-		// The rename that follows always lands, so nothing here is ever put back. No scanned hash:
-		// the scan saw this destination free, so whatever is here now arrived after it.
-		let _stashed = stash_local_target(local_root, to_path, base, None)?;
+		// The rename that follows always lands, so nothing here is ever put back.
+		let _stashed = stash_local_target(local_root, to_path, base).await?;
 	}
 	Ok(())
 }
@@ -3200,11 +3247,12 @@ mod tests {
 		}
 	}
 
-	/// A file on disk plus a baseline row that vouches for exactly it.
+	/// A file on disk plus a baseline row that vouches for exactly it — its content hash included,
+	/// which is what a pull-over decision compares once the stat alone says "unchanged".
 	fn synced_file(root: &Path, bytes: &[u8]) -> (PathBuf, BaselineEntry) {
 		let path = root.join("a.txt");
 		std::fs::write(&path, bytes).unwrap();
-		let mut base = baseline_file("a.txt", Some(Blake3Hash::from([1; 32])));
+		let mut base = baseline_file("a.txt", Some(blake3::hash(bytes).into()));
 		base.size = Some(bytes.len() as u64);
 		base.local_mtime = local_mtime_of(&path);
 		(path, base)
@@ -3314,12 +3362,12 @@ mod tests {
 
 	/// A local move whose destination is occupied by a file the baseline cannot vouch for must
 	/// stash that file first: `rename` would overwrite it and lose it for good.
-	#[test]
-	fn a_local_move_onto_an_unsynced_file_stashes_it_first() {
+	#[tokio::test]
+	async fn a_local_move_onto_an_unsynced_file_stashes_it_first() {
 		let root = temp_dir();
 		std::fs::write(root.join("dest.txt"), b"never synced").unwrap();
 
-		let _stashed = stash_local_target(&root, "dest.txt", None, None).unwrap();
+		let _stashed = stash_local_target(&root, "dest.txt", None).await.unwrap();
 
 		assert!(
 			!root.join("dest.txt").exists(),
@@ -3337,12 +3385,12 @@ mod tests {
 	/// A case-only rename resolves both ends of the move to one file on a case-insensitive
 	/// filesystem: stashing "the destination" would carry the source away and leave the rename
 	/// with nothing to rename.
-	#[test]
-	fn a_case_only_rename_is_not_treated_as_an_occupied_destination() {
+	#[tokio::test]
+	async fn a_case_only_rename_is_not_treated_as_an_occupied_destination() {
 		let root = temp_dir();
 		std::fs::write(root.join("report.txt"), b"the source").unwrap();
 
-		stash_move_target(&root, "REPORT.TXT", None).unwrap();
+		stash_move_target(&root, "REPORT.TXT", None).await.unwrap();
 
 		assert_eq!(
 			std::fs::read(root.join("report.txt")).unwrap(),
@@ -3359,12 +3407,12 @@ mod tests {
 	/// Where the filesystem DOES keep the two spellings apart, the destination is somebody else's
 	/// file and the rename would destroy it: case-folding the two paths would have waved it
 	/// through as a self-move.
-	#[test]
-	fn a_destination_that_only_looks_like_the_source_is_still_stashed() {
+	#[tokio::test]
+	async fn a_destination_that_only_looks_like_the_source_is_still_stashed() {
 		let root = temp_dir();
 		std::fs::write(root.join("REPORT.TXT"), b"never synced").unwrap();
 
-		stash_move_target(&root, "REPORT.TXT", None).unwrap();
+		stash_move_target(&root, "REPORT.TXT", None).await.unwrap();
 
 		assert_eq!(
 			std::fs::read(root.join(QUARANTINE_DIR).join("REPORT.TXT")).unwrap(),
@@ -3375,12 +3423,14 @@ mod tests {
 
 	/// The other side of it: a destination holding exactly what the baseline records is just an
 	/// unmodified copy, and moving over it stashes nothing.
-	#[test]
-	fn a_local_move_onto_a_synced_copy_stashes_nothing() {
+	#[tokio::test]
+	async fn a_local_move_onto_a_synced_copy_stashes_nothing() {
 		let root = temp_dir();
 		let (path, base) = synced_file(&root, b"abc");
 
-		let stashed = stash_local_target(&root, "a.txt", Some(&base), None).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", Some(&base))
+			.await
+			.unwrap();
 		assert_eq!(stashed, None, "nothing was stashed, so nothing to put back");
 
 		assert!(path.exists(), "an unmodified copy is left where it is");
@@ -3392,30 +3442,66 @@ mod tests {
 		std::fs::remove_dir_all(&root).ok();
 	}
 
-	/// A same-size edit that kept its mtime passes the `(size, mtime)` test, so only the hash a deep
-	/// scan read can tell it from the synced copy. A pull over it must stash it first; a scan hash
-	/// matching the row stashes nothing.
-	#[test]
-	fn a_pull_over_an_edit_only_the_scan_hash_saw_quarantines_first() {
+	/// The edit no stat can see: same length, with the mtime put back (`touch -r`, an `rsync -a`
+	/// restore, an editor that restores the timestamp). The scan's fast-path reads such a file as
+	/// unchanged for ever, so no plan ever names that path and nothing else re-reads its bytes —
+	/// this decision has to hash them, or the next remote change is pulled straight over the edit.
+	#[tokio::test]
+	async fn a_pull_over_a_size_and_mtime_preserving_edit_quarantines_first() {
 		let root = temp_dir();
 		let (path, base) = synced_file(&root, b"abc");
-		assert!(!local_holds_unsynced_content(&path, Some(&base)));
+		let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-		let matching = stash_local_target(&root, "a.txt", Some(&base), base.content_hash).unwrap();
+		std::fs::write(&path, b"XYZ").unwrap();
+		std::fs::File::options()
+			.write(true)
+			.open(&path)
+			.unwrap()
+			.set_times(std::fs::FileTimes::new().set_modified(mtime))
+			.unwrap();
 		assert_eq!(
-			matching, None,
-			"a scan that read the recorded hash vouches for the copy"
+			(base.size, base.local_mtime),
+			(Some(3), local_mtime_of(&path)),
+			"the stat has to be indistinguishable from the synced copy, or this proves nothing"
 		);
 
-		let stashed =
-			stash_local_target(&root, "a.txt", Some(&base), Some(Blake3Hash::from([9; 32])))
-				.unwrap()
-				.expect("an edit the scan hashed must be stashed");
-		assert_eq!(std::fs::read(&stashed).unwrap(), b"abc");
+		assert!(
+			local_holds_unsynced_content(&path, Some(&base)),
+			"only the bytes tell this edit from the copy the row vouches for"
+		);
+		let stashed = stash_local_target(&root, "a.txt", Some(&base))
+			.await
+			.unwrap()
+			.expect("an edit no stat can see must still be stashed");
+		assert_eq!(
+			std::fs::read(&stashed).unwrap(),
+			b"XYZ",
+			"the edit stays recoverable instead of going under the download"
+		);
 		assert!(
 			!path.exists(),
 			"the edit is moved out of the download's way"
 		);
+
+		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A row recording no content hash vouches for nothing: the stat it does record is exactly what
+	/// a size- and mtime-preserving edit preserves, so there is no evidence the copy on disk is the
+	/// one that was synced. It is quarantined rather than written over.
+	#[tokio::test]
+	async fn a_row_without_a_recorded_hash_is_not_vouched_for() {
+		let root = temp_dir();
+		let (path, mut base) = synced_file(&root, b"abc");
+		base.content_hash = None;
+
+		assert!(local_holds_unsynced_content(&path, Some(&base)));
+		let stashed = stash_local_target(&root, "a.txt", Some(&base))
+			.await
+			.unwrap()
+			.expect("a copy no row vouches for must be kept");
+		assert_eq!(std::fs::read(&stashed).unwrap(), b"abc");
+		assert!(!path.exists(), "it moved out of the download's way");
 
 		std::fs::remove_dir_all(&root).ok();
 	}
@@ -3476,12 +3562,12 @@ mod tests {
 	/// stashed out of its way goes BACK: left in the bin, the path is empty, and the next pass
 	/// reads a baseline row with nothing on disk as a local deletion — a conflict over a deletion
 	/// nobody made, for a file whose only copy is in the quarantine bin.
-	#[test]
-	fn a_write_that_never_landed_puts_its_stashed_target_back() {
+	#[tokio::test]
+	async fn a_write_that_never_landed_puts_its_stashed_target_back() {
 		let root = temp_dir();
 		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
 
-		let stashed = stash_local_target(&root, "a.txt", None, None).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", None).await.unwrap();
 		assert!(
 			stashed.is_some(),
 			"a copy the baseline cannot vouch for must be stashed before the download"
@@ -3504,11 +3590,11 @@ mod tests {
 
 	/// Unless something is back at the path: that is somebody's newer write, and the stashed copy
 	/// stays recoverable in the bin rather than being put on top of it.
-	#[test]
-	fn a_restore_never_overwrites_what_took_the_path() {
+	#[tokio::test]
+	async fn a_restore_never_overwrites_what_took_the_path() {
 		let root = temp_dir();
 		std::fs::write(root.join("a.txt"), b"a local edit").unwrap();
-		let stashed = stash_local_target(&root, "a.txt", None, None).unwrap();
+		let stashed = stash_local_target(&root, "a.txt", None).await.unwrap();
 		std::fs::write(root.join("a.txt"), b"written since").unwrap();
 
 		restore_stashed(stashed, &root.join("a.txt"));

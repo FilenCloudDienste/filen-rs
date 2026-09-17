@@ -1123,6 +1123,61 @@ async fn conflict_15c_unmodified_local_refresh_leaves_no_quarantine_copy() {
 }
 
 // ===========================================================================
+// CONFLICT-15d — a local edit that kept its size AND mtime is not pulled over
+// ===========================================================================
+#[shared_test_runtime]
+async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it() {
+	// The edit no stat can see: same length, and the mtime put back (`touch -r`, an `rsync -a`
+	// restore, an editor that restores the timestamp). The scan's `(size, mtime)` fast path reads
+	// such a file as unchanged for ever, so no pass ever plans anything for that path — the only
+	// thing between this edit and a silent overwrite is the pull-over decision hashing the bytes
+	// it is about to replace.
+	let sc = single_client(SyncMode::RemoteToLocal).await;
+	let v1 = upload_remote_single(&sc, "doc.txt", b"V1V1").await;
+	wait_cache_has(&sc, v1.uuid()).await;
+	let r1 = sc.sync().await;
+	assert_eq!(r1.downloaded, 1, "{r1:?}");
+	assert!(read_eq(&sc.local, "doc.txt", b"V1V1"), "V1 did not land");
+
+	// Edit locally: same byte count, then the original mtime restored.
+	let path = sc.local.join("doc.txt");
+	let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+	write_file(&sc.local, "doc.txt", b"EDIT");
+	std::fs::File::options()
+		.write(true)
+		.open(&path)
+		.unwrap()
+		.set_times(std::fs::FileTimes::new().set_modified(mtime))
+		.unwrap();
+	assert_eq!(
+		std::fs::metadata(&path).unwrap().modified().unwrap(),
+		mtime,
+		"the mtime could not be restored, so this test proves nothing"
+	);
+
+	// Now the remote changes, which is what pulls over the local path.
+	let v2 = upload_remote_single(&sc, "doc.txt", b"V2V2").await;
+	wait_cache_has(&sc, v2.uuid()).await;
+	let mut r2 = sc.sync().await;
+	let deadline = std::time::Instant::now() + Duration::from_secs(30);
+	while !read_eq(&sc.local, "doc.txt", b"V2V2") && std::time::Instant::now() < deadline {
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		r2 = sc.sync().await;
+	}
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert!(
+		read_eq(&sc.local, "doc.txt", b"V2V2"),
+		"the remote version did not land"
+	);
+	assert!(
+		bytes_recoverable_anywhere(&sc.local.join(".filen-sync-trash"), b"EDIT"),
+		"the local edit was destroyed by the pull instead of being quarantined"
+	);
+
+	sc.cleanup();
+}
+
+// ===========================================================================
 // CONFLICT-20 — convergent edit (same new bytes both sides) is NOT a conflict
 // ===========================================================================
 #[shared_test_runtime]
