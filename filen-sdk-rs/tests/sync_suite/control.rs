@@ -922,7 +922,6 @@ async fn control_02_pause_durable_across_safety_net() {
 			WatchConfig {
 				debounce: Duration::from_secs(1),
 				safety_net: NET,
-				deep_scan_every: None,
 			},
 			recording_observer(log.clone()),
 		)
