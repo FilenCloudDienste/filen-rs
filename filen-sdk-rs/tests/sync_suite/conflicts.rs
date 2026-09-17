@@ -1173,6 +1173,14 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 		bytes_recoverable_anywhere(&sc.local.join(".filen-sync-trash"), b"EDIT"),
 		"the local edit was destroyed by the pull instead of being quarantined"
 	);
+	// ... and the pass SAYS it moved the copy aside. Nothing else in the report names this path —
+	// the edit is one no scan can see and no action failed — so without this the file reverts and
+	// the pass reads as a clean download.
+	assert_eq!(
+		r2.quarantined,
+		vec!["doc.txt".to_string()],
+		"the pull must report the local copy it quarantined: {r2:?}"
+	);
 
 	sc.cleanup();
 }

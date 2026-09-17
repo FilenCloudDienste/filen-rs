@@ -101,6 +101,14 @@ pub struct SyncReport {
 	/// Per-action failures (the pass continues past them; one that ran out of room also holds back
 	/// the transfers behind it, see [`halted`](Self::halted)).
 	pub errors: Vec<String>,
+	/// Paths whose local copy this pass moved into the pair's quarantine bin to clear the way for a
+	/// write: a remote-wins download over a copy the baseline cannot vouch for, and a move onto an
+	/// occupied destination. The bytes stay recoverable under `.filen-sync-trash`.
+	///
+	/// Nothing else in the report mentions those paths — the edit such a copy holds is by
+	/// definition one no scan could see (that is why the write was planned at all), and no action
+	/// failed — so without this the file reverts and the pass reads as a clean download.
+	pub quarantined: Vec<String>,
 	/// The pair is PAUSED (see [`SyncEngine::pause_pair`](super::SyncEngine::pause_pair)): the pass
 	/// planned nothing, wrote no baseline row and applied nothing, so every field above is at its
 	/// zero value. Not the same as a pass that ran and found nothing to do.
@@ -525,11 +533,12 @@ pub(super) async fn apply(
 				Ok(Transfer::Interrupted) => {
 					tracing::debug!("apply: {} interrupted", action.describe());
 				}
-				Ok(Transfer::Done) => {
+				Ok(Transfer::Done { quarantined }) => {
 					applied += 1;
 					writes.note(action);
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
+					report.quarantined.extend(quarantined);
 					match action {
 						SyncAction::UploadFile { .. } => report.uploaded += 1,
 						SyncAction::DownloadFile { .. } => report.downloaded += 1,
@@ -1354,7 +1363,12 @@ fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
 #[derive(Debug)]
 enum Transfer {
 	/// It ran to the end and recorded what it did.
-	Done,
+	Done {
+		/// The path whose local copy this transfer moved aside before writing, if any (see
+		/// [`SyncReport::quarantined`]). Carried out rather than counted here: transfers run
+		/// concurrently, so the report is not theirs to touch.
+		quarantined: Option<String>,
+	},
 	/// The upload landed and IS the remote head — but the server's version chain shows it went on
 	/// top of a version this pass never saw. Another client edited the file between the snapshot
 	/// this pass read and our upload, and our bytes buried it; the conflict says so.
@@ -1391,6 +1405,8 @@ async fn apply_transfer(
 	if !ctx.gate.wait_to_start().await {
 		return Ok(Transfer::Interrupted);
 	}
+	// Set where a write moved a local copy out of its way, for the caller to hear about it.
+	let mut quarantined = None;
 	match action {
 		SyncAction::DownloadFile {
 			rel_path,
@@ -1447,6 +1463,8 @@ async fn apply_transfer(
 				restore_stashed(stashed, &path);
 				return Err(error);
 			}
+			// The download has landed, so a copy moved out of its way stays in the bin: report it.
+			quarantined = stashed.as_ref().map(|_| rel_path.clone());
 			let remote = ctx.remote.get(rel_path);
 			// The row this writes has to carry a hash of what landed. Where the remote declares one
 			// it is that hash — the same one every later pass compares the path against. Where it
@@ -1590,7 +1608,7 @@ async fn apply_transfer(
 		}
 		_ => return Err(internal("apply_transfer called with a non-transfer action")),
 	}
-	Ok(Transfer::Done)
+	Ok(Transfer::Done { quarantined })
 }
 
 /// The SDK progress callback for the transfer of `rel_path`. The SDK hands it byte deltas, already
@@ -1636,15 +1654,16 @@ async fn apply_one(
 		// total and correct if a transfer is ever applied serially.
 		SyncAction::DownloadFile { .. } => {
 			// No observer reaches this fallback, so its progress goes to a channel nobody reads.
-			let outcome = apply_transfer(
+			if let Transfer::Done { quarantined } = apply_transfer(
 				ctx,
 				action,
 				files,
 				dir_by_path,
 				&tokio::sync::mpsc::unbounded_channel().0,
 			)
-			.await?;
-			if matches!(outcome, Transfer::Done) {
+			.await?
+			{
+				report.quarantined.extend(quarantined);
 				report.downloaded += 1;
 			}
 		}
@@ -1696,7 +1715,10 @@ async fn apply_one(
 			)
 			.await?
 			{
-				Transfer::Done => report.uploaded += 1,
+				Transfer::Done { quarantined } => {
+					report.quarantined.extend(quarantined);
+					report.uploaded += 1;
+				}
 				Transfer::Overwrote {
 					conflict,
 					unrecorded,
@@ -1810,7 +1832,12 @@ async fn apply_one(
 			// waits on the drive lock in between and a file can land there meanwhile — and
 			// `rename` would destroy it without a trace. Same window, and same remedy, as the
 			// pre-download stash above.
-			stash_move_target(ctx.local_root, to_path, ctx.baseline.get(to_path)).await?;
+			if stash_move_target(ctx.local_root, to_path, ctx.baseline.get(to_path))
+				.await?
+				.is_some()
+			{
+				report.quarantined.push(to_path.clone());
+			}
 			if let Some(parent) = to.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
 			}
@@ -2475,16 +2502,19 @@ fn restore_stashed(stashed: Option<PathBuf>, path: &Path) {
 /// names apart. It is the parent directory that knows: the destination is a file of its own
 /// exactly when the directory lists that name literally. `from_path` comes from the scan, so it
 /// carries the source's on-disk spelling and cannot be the name found here.
+///
+/// Returns where the occupant went, so the pass can report the path (see
+/// [`SyncReport::quarantined`]); `None` when there was nothing of its own to move.
 async fn stash_move_target(
 	local_root: &Path,
 	to_path: &str,
 	base: Option<&BaselineEntry>,
-) -> Result<(), crate::Error> {
+) -> Result<Option<PathBuf>, crate::Error> {
 	if has_own_directory_entry(&local_path(local_root, to_path)) {
 		// The rename that follows always lands, so nothing here is ever put back.
-		let _stashed = stash_local_target(local_root, to_path, base).await?;
+		return stash_local_target(local_root, to_path, base).await;
 	}
-	Ok(())
+	Ok(None)
 }
 
 /// Whether `path`'s parent directory lists `path`'s file name byte for byte.
@@ -3400,7 +3430,11 @@ mod tests {
 		let root = temp_dir();
 		std::fs::write(root.join("report.txt"), b"the source").unwrap();
 
-		stash_move_target(&root, "REPORT.TXT", None).await.unwrap();
+		assert_eq!(
+			stash_move_target(&root, "REPORT.TXT", None).await.unwrap(),
+			None,
+			"nothing of its own sits at the destination, so nothing is moved"
+		);
 
 		assert_eq!(
 			std::fs::read(root.join("report.txt")).unwrap(),
@@ -3422,7 +3456,13 @@ mod tests {
 		let root = temp_dir();
 		std::fs::write(root.join("REPORT.TXT"), b"never synced").unwrap();
 
-		stash_move_target(&root, "REPORT.TXT", None).await.unwrap();
+		assert!(
+			stash_move_target(&root, "REPORT.TXT", None)
+				.await
+				.unwrap()
+				.is_some(),
+			"somebody else's file was moved aside, and the pass has to be able to say so"
+		);
 
 		assert_eq!(
 			std::fs::read(root.join(QUARANTINE_DIR).join("REPORT.TXT")).unwrap(),
