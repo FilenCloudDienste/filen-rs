@@ -40,9 +40,10 @@ use super::{
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
-	cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, SyncRootCallback, SyncRootHandle},
-	fs::dir::cache::CacheableDir,
-	fs::file::cache::CacheableFile,
+	cache::{
+		CacheEvent, CacheEventType, DirEvent, FileEvent, SearchResult, SyncRootCallback,
+		SyncRootHandle,
+	},
 	fs::{HasParent, HasUUID},
 	io::client_impl::IoSharedClientExt,
 };
@@ -1208,8 +1209,6 @@ struct Prepared {
 	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
 	/// either way; a real pass persists them, a dry run writes nothing.
 	confirmed: Vec<BaselineEntry>,
-	dirs: Vec<CacheableDir<'static>>,
-	files: Vec<CacheableFile<'static>>,
 }
 
 impl Prepared {
@@ -2163,6 +2162,30 @@ impl SyncEngine {
 			.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
+	/// The remote file objects for `uuids`, read whole out of the cache (see
+	/// [`Client::hydrate_cached_items`](crate::auth::Client)). A uuid the cache does not hold — or
+	/// a read that fails — is simply absent: the row that named it stays unconfirmed and its
+	/// pending record stands, which is the safe direction for both callers below.
+	async fn hydrate_files(&self, uuids: Vec<Uuid>) -> HashMap<Uuid, crate::io::RemoteFile> {
+		match self.client.hydrate_cached_items(uuids).await {
+			Ok(items) => items
+				.into_iter()
+				.filter_map(|item| match item {
+					SearchResult::File(file) => {
+						Some((file.uuid, crate::io::RemoteFile::from(file)))
+					}
+					SearchResult::Dir(_) => None,
+				})
+				.collect(),
+			Err(error) => {
+				tracing::debug!(
+					"sync_once: could not read the cached file payloads this pass asks about — {error}"
+				);
+				HashMap::new()
+			}
+		}
+	}
+
 	/// Retire the confirmation gap this engine's own pushes leave, from the evidence a snapshot
 	/// listing our version at its path ([`plan::confirm_agreed_content`]) cannot supply.
 	///
@@ -2187,17 +2210,19 @@ impl SyncEngine {
 		&self,
 		baseline: &mut HashMap<String, BaselineEntry>,
 		raw_remote: &HashMap<String, RemoteNode>,
-		files: &[CacheableFile<'static>],
 	) -> Vec<BaselineEntry> {
 		let (mut confirmed, ask_server) =
 			observed_confirmations(&self.observed, baseline, raw_remote, Instant::now());
 
-		for (rel_path, ours, foreign) in ask_server {
-			let Some(cacheable) = files.iter().find(|f| f.uuid == foreign) else {
+		// The foreign versions this dates our pushes against, read whole in one go.
+		let foreign = self
+			.hydrate_files(ask_server.iter().map(|(_, _, uuid)| *uuid).collect())
+			.await;
+		for (rel_path, ours, stranger) in ask_server {
+			let Some(file) = foreign.get(&stranger) else {
 				continue;
 			};
-			let file = crate::io::RemoteFile::from(cacheable.clone());
-			let versions = match self.client.list_file_versions(&file).await {
+			let versions = match self.client.list_file_versions(file).await {
 				Ok(versions) => versions,
 				Err(error) => {
 					// Offline, or the endpoint refused: the row stays unconfirmed, which is the
@@ -2212,7 +2237,7 @@ impl SyncEngine {
 				.iter()
 				.map(|version| (version.uuid(), version.timestamp()))
 				.collect();
-			match plan::version_chain_verdict(&chain, ours, foreign, CONFIRM_TENURE) {
+			match plan::version_chain_verdict(&chain, ours, stranger, CONFIRM_TENURE) {
 				Some(true) => {
 					tracing::debug!(
 						"sync_once: the server's version chain confirms this engine's push of {rel_path:?}"
@@ -2250,15 +2275,18 @@ impl SyncEngine {
 		pair: PairId,
 		baseline: &HashMap<String, BaselineEntry>,
 		raw_remote: &HashMap<String, RemoteNode>,
-		files: &[CacheableFile<'static>],
 	) -> Result<(), Error> {
 		let candidates = self.pending.strangers(pair, baseline, raw_remote);
+		// The standing strangers, read whole in one go: their whole-life id is what the lookup
+		// below asks the server by.
+		let strangers = self
+			.hydrate_files(candidates.iter().map(|(_, _, _, uuid)| *uuid).collect())
+			.await;
 		let mut retired = Vec::new();
 		for (record, path, ours, stranger) in candidates {
-			let Some(cacheable) = files.iter().find(|f| f.uuid == stranger) else {
+			let Some(file) = strangers.get(&stranger) else {
 				continue;
 			};
-			let file = crate::io::RemoteFile::from(cacheable.clone());
 			// By LINEAGE, not by the version chain's order: the chain is sorted by original upload
 			// time to the second, so a race leaves the two versions tied and its first entry is not
 			// reliably the head. This asks the server outright, and in one call.
@@ -2315,9 +2343,7 @@ impl SyncEngine {
 				.map(|entry| (entry.rel_path.clone(), entry))
 				.collect()
 		};
-		let advanced = self
-			.confirm_pushes(&mut baseline, &HashMap::new(), &[])
-			.await;
+		let advanced = self.confirm_pushes(&mut baseline, &HashMap::new()).await;
 		if advanced.is_empty() {
 			return Ok(());
 		}
@@ -2443,16 +2469,18 @@ impl SyncEngine {
 			&snapshot.files,
 			&snapshot.undecodable,
 		);
+		// Every row of the snapshot the pass still needs is in the view now; the objects it ACTS
+		// on are read back whole by uuid, for the handful a plan names. So the payloads go here,
+		// before the local scan, rather than being carried to the end of the pass.
+		let remote_converged = snapshot.watermark.is_some();
+		drop(snapshot);
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
 		// view — before this engine's own writes are folded into it, and before the baseline is
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
 		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &view.nodes);
-		confirmed.extend(
-			self.confirm_pushes(&mut baseline_map, &view.nodes, &snapshot.files)
-				.await,
-		);
+		confirmed.extend(self.confirm_pushes(&mut baseline_map, &view.nodes).await);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
 
 		// `set_user_ignore` refuses a text that does not compile, so a stored one fails only if this
@@ -2525,7 +2553,7 @@ impl SyncEngine {
 		};
 		// A create whose path shows another version of the same file is the one thing the fold
 		// cannot settle on its own; ask the server before it paints over a stranger.
-		self.retire_superseded_creates(pair, &baseline, &view.nodes, &snapshot.files)
+		self.retire_superseded_creates(pair, &baseline, &view.nodes)
 			.await?;
 
 		// Hidden with exactly the rules the scan matched with, so both sides hide the same paths.
@@ -2569,7 +2597,7 @@ impl SyncEngine {
 			dir_moves: Vec::new(),
 			local_scan,
 			remote_view,
-			remote_converged: snapshot.watermark.is_some(),
+			remote_converged,
 			remote_emptied,
 			holds,
 			failures,
@@ -2581,8 +2609,6 @@ impl SyncEngine {
 			remote_rule_errors: remote_rules.errors,
 			last_ignored,
 			confirmed,
-			dirs: snapshot.dirs,
-			files: snapshot.files,
 		};
 		// AFTER the pending-write fold: a move of ours the cache has not shown yet must read as done,
 		// not as the remote moving the directory back.
@@ -3459,8 +3485,6 @@ impl SyncEngine {
 			remote: &prep.remote_view.nodes,
 			root_remote,
 			absence_trusted: state.absence_trusted(),
-			dirs: &prep.dirs,
-			files: &prep.files,
 			pending: &self.pending,
 			observed: &self.observed,
 			gate: &gate,
@@ -4116,8 +4140,6 @@ mod tests {
 			remote_rule_errors: Vec::new(),
 			last_ignored: BTreeSet::new(),
 			confirmed: Vec::new(),
-			dirs: Vec::new(),
-			files: Vec::new(),
 		}
 	}
 

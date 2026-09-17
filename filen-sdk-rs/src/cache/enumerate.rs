@@ -27,7 +27,10 @@ use crate::{
 			UndecodableItem,
 			columns::ITEMS_UUID,
 			list_undecodable,
-			statements::{ANCESTRY_OF_UUID, CACHE_META_GET, ENUMERATE_SUBTREE, WATERMARK_KEY},
+			statements::{
+				ANCESTRY_OF_UUID, CACHE_META_GET, ENUMERATE_SUBTREE, HYDRATE_BY_UUIDS,
+				WATERMARK_KEY,
+			},
 		},
 	},
 	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
@@ -100,6 +103,41 @@ pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result
 	})
 }
 
+/// How many uuids one [`hydrate_by_uuids`] statement binds. A plan names a handful of items; a
+/// first pull names one per item of the tree, and chunking keeps both the statement and SQLite's
+/// bound-parameter limit bounded either way.
+const HYDRATE_CHUNK: usize = 500;
+
+/// Hydrate the FULL payload of `uuids` from the cache DB at `path`: the rows the sync engine's
+/// apply and confirmation paths need whole, which the slim subtree snapshot above deliberately
+/// does not carry. Read in chunks of [`HYDRATE_CHUNK`], one prepared statement per chunk.
+///
+/// A uuid the cache does not hold is simply absent from the answer — the item may be one this
+/// engine has just written and the cache has not listed yet. The caller asks the server for what
+/// is missing; an action whose object neither side can supply FAILS, it is never skipped.
+pub(crate) fn hydrate_by_uuids(path: &Path, uuids: &[Uuid]) -> rusqlite::Result<Vec<SearchResult>> {
+	if uuids.is_empty() {
+		return Ok(Vec::new());
+	}
+	let conn = open_read_connection(path)?;
+	let mut out = Vec::with_capacity(uuids.len());
+	for chunk in uuids.chunks(HYDRATE_CHUNK) {
+		// The statement carries one `?1`, so that the file is SQL the linter can parse; the chunk
+		// needs one parameter per uuid, numbered as the rest of the raw statements are.
+		let placeholders = (1..=chunk.len())
+			.map(|i| format!("?{i}"))
+			.collect::<Vec<_>>()
+			.join(", ");
+		let mut stmt =
+			conn.prepare_cached(&HYDRATE_BY_UUIDS.replace("(?1)", &format!("({placeholders})")))?;
+		let rows = stmt.query_map(rusqlite::params_from_iter(chunk), row_to_result)?;
+		for row in rows {
+			out.push(row?);
+		}
+	}
+	Ok(out)
+}
+
 /// The cached upward ancestor chain of `uuid` — the item itself plus every ancestor up to the
 /// account root — read from the cache DB at `path`. One indexed recursive walk of `items.parent`,
 /// cycle-safe (see the SQL).
@@ -137,6 +175,39 @@ impl Client {
 					ErrorKind::Internal,
 					CacheError::db(e, format!("reading the ancestry of {uuid}")),
 					Some("reading cached ancestry".to_string()),
+				)
+			})
+	}
+
+	/// The full cached payloads of `uuids` (see [`hydrate_by_uuids`]) — the items a sync pass
+	/// actually acts on, which its subtree snapshot carries only the view's columns of. Errors if
+	/// the cache was never configured. The blocking SQLite read runs on a blocking thread.
+	pub(crate) async fn hydrate_cached_items(
+		&self,
+		uuids: Vec<Uuid>,
+	) -> Result<Vec<SearchResult>, Error> {
+		if uuids.is_empty() {
+			return Ok(Vec::new());
+		}
+		let path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
+			Error::custom(
+				ErrorKind::InvalidState,
+				"cache is not configured; call configure_cache first",
+			)
+		})?;
+		tokio::task::spawn_blocking(move || hydrate_by_uuids(&path, &uuids))
+			.await
+			.map_err(|e| {
+				Error::custom(
+					ErrorKind::Internal,
+					format!("cached item read task failed: {e}"),
+				)
+			})?
+			.map_err(|e| {
+				Error::custom_with_source(
+					ErrorKind::Internal,
+					CacheError::db(e, "hydrating cached items by uuid".to_string()),
+					Some("reading cached items".to_string()),
 				)
 			})
 	}
@@ -392,6 +463,41 @@ mod tests {
 
 		f.state.replace_undecodable(f.root, &[]).unwrap();
 		assert!(listed(&f).is_empty(), "a clean relisting clears the root");
+	}
+
+	/// The full payloads a pass acts on, read back by uuid: the ones named come whole, an unknown
+	/// uuid is simply absent rather than an error, and asking for nothing reads nothing at all.
+	#[test]
+	fn hydrate_by_uuids_returns_the_full_payloads_of_the_items_named() {
+		let f = fixture();
+		let got = hydrate_by_uuids(&f.path, &[f.a1.uuid, f.aa.uuid, Uuid::new_v4()]).unwrap();
+		assert_eq!(
+			got.len(),
+			2,
+			"the unknown uuid is absent, not an error: {got:?}"
+		);
+		let file = got
+			.iter()
+			.find_map(|item| match item {
+				SearchResult::File(file) => Some(file),
+				SearchResult::Dir(_) => None,
+			})
+			.expect("a1 present");
+		assert_eq!(*file, f.a1, "full file payload round-trips");
+		let dir = got
+			.iter()
+			.find_map(|item| match item {
+				SearchResult::Dir(dir) => Some(dir),
+				SearchResult::File(_) => None,
+			})
+			.expect("AA present");
+		assert_eq!(*dir, f.aa, "full dir payload round-trips");
+		// No uuids, so no connection is opened: a path that does not exist would otherwise error.
+		assert!(
+			hydrate_by_uuids(Path::new("/no/such/cache.db"), &[])
+				.unwrap()
+				.is_empty()
+		);
 	}
 
 	#[test]
