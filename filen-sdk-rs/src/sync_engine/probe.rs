@@ -64,6 +64,14 @@ const PER_ACTION_SAMPLE: usize = 20_000;
 /// defaults, the shape a real pair carries.
 const PROBE_RULES: &str = "*.log\nbuild/\n*.tmp\nnode_modules/\n*.bak\n";
 
+/// How many registry point reads the control-verb phase makes. One is too few to time on a
+/// microsecond clock; the cost is per read, and the phase reports the per-read figure.
+const CONTROL_VERB_SAMPLE: usize = 100;
+
+/// How long the contending whole-tree read runs for in the control-verb phase. Long enough that
+/// the reads it is measured against certainly overlap it.
+const CONTENDING_READ: Duration = Duration::from_millis(500);
+
 /// The tree's shape, as `SYNC_PROBE_SHAPE` gives it.
 struct Shape {
 	files_per_leaf: usize,
@@ -738,6 +746,71 @@ pub fn run() -> String {
 		root_count,
 		untrack,
 		"delete_subtrees, one untracked .DS_Store root per synced directory (G = D), no row hit",
+	);
+
+	// A directory rename, which re-keys every row of that directory's subtree in one transaction —
+	// the widest single write a pass makes, and what a pair-root rename is made of.
+	let rows = store.entries(pair).expect("reading the baseline");
+	let top = rows
+		.iter()
+		.find(|entry| entry.kind == NodeKind::Dir && !entry.rel_path.contains('/'))
+		.map(|entry| entry.rel_path.clone())
+		.expect("the probe tree must have a top-level directory");
+	let under = format!("{top}/");
+	let moved = rows
+		.iter()
+		.filter(|entry| entry.rel_path == top || entry.rel_path.starts_with(&under))
+		.count();
+	drop(rows);
+	let renamed = format!("{top}-renamed");
+	let (_, rename) = timed(|| {
+		store
+			.apply_changes(
+				pair,
+				&[BaselineChange::MoveSubtree {
+					from: &top,
+					to: &renamed,
+				}],
+			)
+			.expect("renaming a top-level directory")
+	});
+	probe.record(
+		"dir_rename_subtree",
+		moved,
+		rename,
+		"apply_changes(MoveSubtree), one transaction, every row under one top-level directory",
+	);
+
+	// A control verb on ANOTHER pair while this pair's whole-tree read is in flight. Each pair has
+	// its own connection, so the two never queue on one mutex; what is left to measure is SQLite's
+	// own concurrency, which is what WAL buys. The contending reader opens its own handle to the
+	// same file — exactly what another pair's store is.
+	let reader_db = fixture.baseline_db.clone();
+	let reading = std::thread::spawn(move || {
+		let reader = BaselineStore::open(&reader_db).expect("the contending reader's connection");
+		let mut reads = 0usize;
+		let until = Instant::now() + CONTENDING_READ;
+		while Instant::now() < until {
+			reader.entries(pair).expect("reading the baseline");
+			reads += 1;
+		}
+		reads
+	});
+	let control = BaselineStore::open(&fixture.baseline_db).expect("the control connection");
+	let (_, verb) = timed(|| {
+		for _ in 0..CONTROL_VERB_SAMPLE {
+			control.pair(pair).expect("reading the pair registry");
+		}
+	});
+	let reads = reading.join().expect("the contending reader thread");
+	probe.record(
+		"control_verb_under_read",
+		CONTROL_VERB_SAMPLE,
+		verb,
+		&format!(
+			"pair() on its own connection, while another connection ran {reads} whole-tree \
+			 read(s) of the same file"
+		),
 	);
 
 	drop(store);
