@@ -24,6 +24,7 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
 		PathFailure, PendingRow,
 	},
+	changes::{FullPassReason, PairChanges},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
 		IgnoreDecision, IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules,
@@ -559,10 +560,21 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 }
 
 /// The sync-root callback the engine registers per pair: it records the uuids of every committed
-/// cache batch and nothing else. It runs on the cache worker thread, so it never awaits and never
-/// touches the database.
-fn observation_callback(observations: Arc<Observations>) -> SyncRootCallback {
-	Box::new(move |events| observations.note(events))
+/// cache batch — the evidence that retires a pending write — and the batch's changes as the pair's
+/// remote changelist. It runs on the cache worker thread, so it never awaits and never touches the
+/// database.
+///
+/// The events are borrowed for the length of the call and cannot be read twice, so they are
+/// collected into one `Vec` of references (pointers, not payloads) and handed to both records.
+fn observation_callback(
+	observations: Arc<Observations>,
+	changes: Arc<PairChanges>,
+) -> SyncRootCallback {
+	Box::new(move |events| {
+		let batch: Vec<&CacheEvent<'_>> = events.collect();
+		changes.note_remote_batch(&mut batch.iter().copied());
+		observations.note(&mut batch.iter().copied());
+	})
 }
 
 /// Read what the cache's announcements say about every unconfirmed push in `baseline`: the version
@@ -1121,6 +1133,11 @@ pub struct SyncEngine {
 	/// [`load_remote_rules`]). `Arc`: a pass takes the bodies it reuses out from under the lock.
 	/// Bounded by the pair count; an entry goes with its pair.
 	remote_rule_bodies: Mutex<HashMap<PairId, HashMap<Uuid, Arc<str>>>>,
+	/// Each pair's changelists — what its filesystem watcher and the cache have announced since its
+	/// last pass — and the reasons its next pass must read both sides whole (see [`PairChanges`]).
+	/// `Arc`: the watcher's own thread and the cache's worker thread each hold one, outside this
+	/// map's lock. Bounded by the pair count; an entry goes with its pair.
+	changes: Mutex<HashMap<PairId, Arc<PairChanges>>>,
 	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
 	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
 	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
@@ -1699,11 +1716,18 @@ impl SyncEngine {
 			lock_budget: LockBudget::default(),
 			reading: Mutex::new(HashMap::new()),
 			remote_rule_bodies: Mutex::new(HashMap::new()),
+			changes: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
 		for record in engine.list_pairs().await? {
+			// Nothing was announced to THIS process yet, so its first pass has no changelist to
+			// narrow itself with.
+			engine
+				.pair_changes(record.id)
+				.await
+				.force(FullPassReason::FirstPass);
 			engine.observe_pair(record.id, record.remote_root).await;
 		}
 		// An engine that went down inside the cache-lag window left the writes it had made in the
@@ -1733,7 +1757,8 @@ impl SyncEngine {
 	/// [`PENDING_CREATE_GRACE`] fallback rather than failing the whole engine. The watch loop
 	/// registers its own subscription for wakeups; the two are independent.
 	async fn observe_pair(&self, pair: PairId, remote_root: Uuid) {
-		let callback = observation_callback(Arc::clone(&self.observed));
+		let changes = self.pair_changes(pair).await;
+		let callback = observation_callback(Arc::clone(&self.observed), Arc::clone(&changes));
 		match Arc::clone(&self.client)
 			.add_sync_root(remote_root, callback)
 			.await
@@ -1741,9 +1766,44 @@ impl SyncEngine {
 			Ok(handle) => {
 				self.roots.lock().await.insert(pair, handle);
 			}
-			Err(error) => tracing::warn!(
-				"sync pair {pair}: cache notifications are unavailable ({error}); its pending writes will retire on the grace window alone"
-			),
+			Err(error) => {
+				// Without the subscription no remote change is announced at all, so no pass can
+				// narrow its remote half down: every one reads the whole subtree, as they all do
+				// today.
+				changes.degrade(FullPassReason::RemoteEventsDegraded);
+				tracing::warn!(
+					"sync pair {pair}: cache notifications are unavailable ({error}); its pending writes will retire on the grace window alone"
+				);
+			}
+		}
+	}
+
+	/// `pair`'s changelists, created on first use — shared with the pair's cache callback and, while
+	/// it is watched, with its filesystem watcher's handler.
+	pub(super) async fn pair_changes(&self, pair: PairId) -> Arc<PairChanges> {
+		Arc::clone(
+			self.changes
+				.lock()
+				.await
+				.entry(pair)
+				.or_insert_with(|| Arc::new(PairChanges::new())),
+		)
+	}
+
+	/// `pair`'s changelists if it still HAS any — never creating one, unlike
+	/// [`pair_changes`](Self::pair_changes). For recording something onto a changelist: a pair that
+	/// has none is one `remove_pair` has already dropped (or one that was never registered), and
+	/// creating an entry under that id leaks it — sqlite reuses pair ids, so the next pair to take
+	/// this one would inherit it.
+	pub(super) async fn existing_pair_changes(&self, pair: PairId) -> Option<Arc<PairChanges>> {
+		self.changes.lock().await.get(&pair).map(Arc::clone)
+	}
+
+	/// Record that `pair`'s next pass must read both sides whole, whatever its changelists hold.
+	/// A pair with no changelist has nothing to protect: its next pass reads everything anyway.
+	pub(super) async fn force_full_pass(&self, pair: PairId, reason: FullPassReason) {
+		if let Some(changes) = self.existing_pair_changes(pair).await {
+			changes.force(reason);
 		}
 	}
 
@@ -1944,6 +2004,10 @@ impl SyncEngine {
 				),
 			));
 		}
+		// A pair nothing has passed over has no changelist to narrow its first pass with.
+		self.pair_changes(pair)
+			.await
+			.force(FullPassReason::FirstPass);
 		self.observe_pair(pair, remote_root).await;
 		Ok(pair)
 	}
@@ -2046,6 +2110,11 @@ impl SyncEngine {
 		tracing::debug!(
 			"sync pair {pair}: mode changed to {mode:?} from the next pass ({backlog:?}, {adopted_rows} destination item(s) adopted)"
 		);
+		// A mode change changes what an action MEANS at every path, so the next pass reconciles
+		// both sides whole rather than a dirty set under new rules.
+		self.pair_changes(pair)
+			.await
+			.force(FullPassReason::RulesChanged);
 		Ok(())
 	}
 
@@ -2112,9 +2181,10 @@ impl SyncEngine {
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
 		if held.state == BaselineState::Overwritten {
-			return self
-				.resolve_overwritten(pair, &record, rel_path, &held, resolution)
-				.await;
+			self.resolve_overwritten(pair, &record, rel_path, &held, resolution)
+				.await?;
+			self.note_resolution(pair).await;
+			return Ok(());
 		}
 
 		let mut winner = resolution;
@@ -2154,7 +2224,21 @@ impl SyncEngine {
 			None => store.delete_entry(pair, &resolving),
 		})
 		.await?
-		.map_err(|e| db_error(e, "resolving a conflict"))
+		.map_err(|e| db_error(e, "resolving a conflict"))?;
+		self.note_resolution(pair).await;
+		Ok(())
+	}
+
+	/// Record that a resolution is waiting to be applied at a path, so the next pass reads both
+	/// sides whole.
+	///
+	/// The resolution re-anchors the baseline row — the winning side has to read as the CHANGED
+	/// one for the next pass to propagate it — and that is a change no filesystem event and no
+	/// cache announcement carries: neither side of the pair moved. A pass narrowed to its
+	/// changelists would not look at the path at all.
+	async fn note_resolution(&self, pair: PairId) {
+		self.force_full_pass(pair, FullPassReason::ConflictResolved)
+			.await;
 	}
 
 	/// Resolve a divergence this engine's own upload created — it buried another client's edit (see
@@ -2802,6 +2886,11 @@ impl SyncEngine {
 		// than `send`, which fails when the last watch has gone — nobody to wake is not an error.
 		self.user_ignore_changed
 			.send_modify(|version| *version = version.wrapping_add(1));
+		// The patterns are device-wide: what is hidden may have changed at any path of any pair, so
+		// every pair's next pass reads both sides whole.
+		for changes in self.changes.lock().await.values() {
+			changes.force(FullPassReason::RulesChanged);
+		}
 		Ok(())
 	}
 
@@ -2886,6 +2975,9 @@ impl SyncEngine {
 		self.paused.lock().await.remove(&pair);
 		self.reading.lock().await.remove(&pair);
 		self.remote_rule_bodies.lock().await.remove(&pair);
+		// Nothing of the removed pair is left to narrow a pass with (a pair re-registered under the
+		// same id — sqlite reuses one — starts from an empty changelist and a forced first pass).
+		self.changes.lock().await.remove(&pair);
 		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
 		// file handle closes as soon as the cascade above lets this function's own handle go.
 		self.stores.lock().await.remove(&pair);
@@ -3029,6 +3121,11 @@ impl SyncEngine {
 	/// and the next pass then reads the same agreed content the pass will.
 	pub async fn resume_pair(&self, pair: PairId) -> Result<(), Error> {
 		self.set_control(pair, PassControl::Run).await?;
+		// A paused pair ran no pass to take its changelists, so a local set that overflowed while
+		// it waited is all the first pass afterwards would have: read both sides whole instead.
+		self.pair_changes(pair)
+			.await
+			.force(FullPassReason::FirstPass);
 		self.sweep_confirmations(pair).await
 	}
 
@@ -3431,6 +3528,16 @@ impl SyncEngine {
 		let mut contained = super::events::contain_panics(observer);
 		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
 		let result = self.run_pass(pair, depth, observer).await;
+		// What this pass's outcome means for the NEXT one's scope, wherever it ended. A pass that
+		// failed outright took both changelists and applied nothing, so what it took is reflected
+		// nowhere and the next pass cannot rely on them.
+		let next_scope = match &result {
+			Ok(report) => next_pass_scope(report),
+			Err(_) => Some(FullPassReason::InterruptedPass),
+		};
+		if let Some(reason) = next_scope {
+			self.force_full_pass(pair, reason).await;
+		}
 		if let Err(error) = &result {
 			observer(SyncEvent::PassFailed {
 				error: error.to_string(),
@@ -3513,6 +3620,11 @@ impl SyncEngine {
 		// land in between and be overwritten by a row written from a read that predates it. Taken
 		// under the gate: a cancel reaches a pass waiting for it as well as one reading.
 		let reading = self.reading_lock(pair).await;
+		// Both changelists, taken BEFORE either side is read: everything in them is either already
+		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
+		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
+		let changes = self.pair_changes(pair).await;
+		let scope = changes.take();
 		let Some((recording, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
@@ -3558,7 +3670,24 @@ impl SyncEngine {
 			confirmed
 		};
 		self.forget_settled_pushes(&confirmed);
-		let mut report = SyncReport::default();
+		// One decision in one place: the changelists' own reasons plus the two facts only the pass
+		// knows. It is RECORDED, not yet acted on — the pass below reads and reconciles both sides
+		// whole whatever the answer is, and the change-scoped pass that consumes it comes next.
+		let mut report = SyncReport {
+			full_pass: scope.full_pass_reason(prep.baseline.len(), depth == ScanDepth::Deep),
+			..SyncReport::default()
+		};
+		let (dirty_local, dirty_remote) = scope.sizes();
+		tracing::debug!(
+			"sync_once[pair {pair}]: {dirty_local} local path(s) and {dirty_remote} remote change(s) announced since the last pass; this pass reads everything ({})",
+			report.full_pass.map_or_else(
+				|| "no whole-tree trigger".to_string(),
+				|reason| reason.to_string()
+			),
+		);
+		// The whole tree IS read below, so the changelist caps re-scale to what the pair now
+		// tracks. The reason this pass runs full was taken with the lists above.
+		changes.note_tree_size(prep.baseline.len());
 
 		tracing::debug!(
 			"sync_once[pair {pair}]: mode {:?} — local scan {} node(s) (complete={}), remote view {} node(s) (converged={})",
@@ -3740,6 +3869,43 @@ impl SyncEngine {
 		});
 		Ok(report)
 	}
+}
+
+/// What a finished pass's outcome means for the NEXT pass's scope: the rows of the full-pass
+/// trigger table that are facts about the pass before it (see
+/// [`FullPassReason`](super::FullPassReason)). `None` leaves the next pass to its changelists.
+///
+/// Decided purely so the policy is unit-testable. The rule behind the rows: a pass consumed both
+/// changelists to make its plan, so anything it planned and did NOT carry out is in no list any
+/// more and only a whole-tree read finds it again.
+fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
+	if report.refused.is_some() {
+		return Some(FullPassReason::PreviousRefusal);
+	}
+	// Either shape of a cut-short pass: one that took the changelists and was cancelled before it
+	// had a plan (`paused`), and one whose plan was abandoned part-way (`interrupted`).
+	if report.paused || report.interrupted > 0 {
+		return Some(FullPassReason::InterruptedPass);
+	}
+	// A pass that planned work and did not apply it: the drive-write lock it could not take (its
+	// whole plan), a side that filled up (the transfers held behind it), a record of work already
+	// done that did not land (nothing more is admitted after it), or a single action that failed.
+	// Each leaves paths owed with nothing left holding them.
+	if report.lock_failed
+		|| report.store_failed
+		|| report.halted.is_some()
+		|| !report.failed_paths.is_empty()
+	{
+		return Some(FullPassReason::UnappliedWork);
+	}
+	// EVERY deletion hold, including the volume threshold and the first-sync hold: an approval
+	// names one exact batch, and the pass that offers it again has to reproduce it from the same
+	// absences — which were observations the holding pass consumed (see
+	// [`FullPassReason::DeletionHold`]).
+	if report.guard.is_some() {
+		return Some(FullPassReason::DeletionHold);
+	}
+	None
 }
 
 /// A name collision (local or remote) makes a 1:1 mapping impossible — refuse the pass.
@@ -4180,6 +4346,103 @@ mod tests {
 	fn upload(rel: &str) -> SyncAction {
 		SyncAction::UploadFile {
 			rel_path: rel.to_string(),
+		}
+	}
+
+	/// The rows of the full-pass trigger table that are facts about the PREVIOUS pass: a refusal is
+	/// whole-tree state, either shape of a cut-short pass took the changelists without applying
+	/// what it took, so did a pass that planned work it could not carry out, and so did every
+	/// deletion hold.
+	#[test]
+	fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
+		assert_eq!(
+			next_pass_scope(&SyncReport::default()),
+			None,
+			"a pass that ran to the end leaves the next one to its changelists"
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				refused: Some(RefuseReason::LocalCollision),
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::PreviousRefusal)
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				paused: true,
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::InterruptedPass),
+			"a cancel that beat the plan still consumed the changelists"
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				interrupted: 3,
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::InterruptedPass)
+		);
+
+		// EVERY deletion hold: three want evidence only a whole-tree read supplies, and the other
+		// two have to be able to offer the caller the very same batch again under the same token,
+		// which means reproducing absences the holding pass consumed.
+		for reason in [
+			GuardReason::ScanIncomplete,
+			GuardReason::RemoteUnconverged { deletions: 2 },
+			GuardReason::RemoteEmptied { deletions: 2 },
+			GuardReason::ExceededThreshold {
+				deletions: 40,
+				limit: 10,
+			},
+			GuardReason::FirstSyncWithDeletions { deletions: 4 },
+		] {
+			assert_eq!(
+				next_pass_scope(&SyncReport {
+					guard: Some(reason.clone()),
+					..SyncReport::default()
+				}),
+				Some(FullPassReason::DeletionHold),
+				"{reason:?}"
+			);
+		}
+
+		// A pass that made a plan and did not apply it, in each of the four shapes. Every one of
+		// them drained the changelists first, so the paths are owed and nothing else holds them.
+		for (label, report) in [
+			(
+				"a drive lock it could not take",
+				SyncReport {
+					lock_failed: true,
+					..SyncReport::default()
+				},
+			),
+			(
+				"a side that filled up",
+				SyncReport {
+					halted: Some(crate::sync_engine::HaltReason::LocalStorageFull),
+					..SyncReport::default()
+				},
+			),
+			(
+				"a record that did not land",
+				SyncReport {
+					store_failed: true,
+					..SyncReport::default()
+				},
+			),
+			(
+				"an action that failed",
+				SyncReport {
+					failed_paths: vec![("a.txt".to_string(), "boom".to_string())],
+					..SyncReport::default()
+				},
+			),
+		] {
+			assert_eq!(
+				next_pass_scope(&report),
+				Some(FullPassReason::UnappliedWork),
+				"{label}"
+			);
 		}
 	}
 

@@ -47,6 +47,7 @@ use super::{
 	SyncEvent, SyncObserver, SyncReport,
 	apply::{LOCK_FAILURE, STORE_FAILURE},
 	baseline::PairId,
+	changes::{FullPassReason, PairChanges},
 	engine::SyncEngine,
 	scan::{QUARANTINE_DIR, ScanDepth},
 };
@@ -291,6 +292,10 @@ impl SyncEngine {
 		// Remote-change trigger: a cache sync-root subscription that pings on any committed batch.
 		// Best-effort, like the engine's own subscription (see `SyncEngine::observe_pair`): without
 		// it remote changes wait for the safety net, which is better than no watch at all.
+		//
+		// A doorbell only. WHAT changed remotely is recorded by the engine's own per-pair
+		// subscription, which exists with or without a watch, so this one failing costs wake-ups,
+		// never the remote changelist.
 		let remote_dirty = Arc::clone(&dirty);
 		let callback: SyncRootCallback = Box::new(move |_events| {
 			remote_dirty.notify_one();
@@ -316,13 +321,43 @@ impl SyncEngine {
 		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
 		// reports canonicalized paths, so the root it filters against must be canonical too.
 		let watch_root = std::fs::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
-		let handler = local_event_handler(pair, watch_root, Arc::clone(&dirty), status_tx.clone());
+		// The pair's changelists. The handler below records what changed into them and a pass takes
+		// them; the engine holds the same ones, so a one-shot `sync_once` reads the same set.
+		let changes = self.pair_changes(pair).await;
+		let handler = local_event_handler(
+			pair,
+			watch_root,
+			Arc::clone(&dirty),
+			status_tx.clone(),
+			Arc::clone(&changes),
+		);
 		let watcher = start_local_watcher::<notify::RecommendedWatcher>(
 			pair,
 			&local_root,
 			handler,
 			&status_tx,
 		);
+		if status_tx.borrow().local_events_degraded.is_some() {
+			// The watcher could not be created, or could not cover the whole tree: what it misses
+			// is unknown, so no pass of this pair may narrow its local half down.
+			changes.degrade(FullPassReason::LocalEventsDegraded);
+		}
+		// From here on something IS recording local changes, so a pass may narrow its local half
+		// down to what the list holds. Before this — and after the loop below ends — an empty list
+		// means "nobody was looking", which is not evidence of a quiet tree.
+		changes.cover_local();
+		// A platform whose watcher cannot report a dropped event (see `PairChanges::new`) has its
+		// events permanently distrusted; say so on the status, or a caller sees a healthy watch
+		// whose passes are all full and has nothing to point at.
+		if let Some(reason) = changes.degraded() {
+			status_tx.send_if_modified(|status| {
+				if status.local_events_degraded.is_some() {
+					return false;
+				}
+				status.local_events_degraded = Some(reason.to_string());
+				true
+			});
+		}
 
 		let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 		let stop = Stop {
@@ -399,6 +434,10 @@ async fn run_loop(
 	status: tokio::sync::watch::Sender<WatchStatus>,
 ) {
 	let mut failures: u32 = 0;
+	// When a pass last read both sides whole — what the safety net measures from (see [`net_due`]).
+	// The initial pass below is one: a pair's first pass of a process has no changelist to narrow
+	// itself with.
+	let mut last_whole_pass = Instant::now();
 
 	let mut safety_net = tokio::time::interval(config.safety_net);
 	safety_net.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -421,7 +460,18 @@ async fn run_loop(
 		}
 
 		let depth = scan_depth(next_deep, Instant::now());
-		let (error, owed) = tokio::select! {
+		// The backstop for anything both changelists silently missed: a pass that reads both sides
+		// whole, at most `safety_net` after the last one that did.
+		if net_due(last_whole_pass, Instant::now(), config.safety_net) {
+			engine
+				.force_full_pass(pair, FullPassReason::SafetyNet)
+				.await;
+		}
+		let PassEnd {
+			error,
+			owed,
+			read_whole,
+		} = tokio::select! {
 			outcome = run_pass(&engine, pair, depth, observer.as_mut()) => outcome,
 			// Never resolves: it only makes sure a pass PARKED on a suspension gives up when the
 			// watch is stopped, so the pass above can finish and this loop can end. Without it a
@@ -429,6 +479,9 @@ async fn run_loop(
 			// it has none — while the pass sits on the drive-write lock.
 			() = unpark_on_stop(&engine, pair, &mut stop, config.debounce) => unreachable!(),
 		};
+		if read_whole {
+			last_whole_pass = Instant::now();
+		}
 		if error.is_none() {
 			failures = 0;
 			// The net measures time since the last SUCCESSFUL pass, not since the last tick: a pass
@@ -485,6 +538,12 @@ async fn run_loop(
 	// The terminal state, and which of the two it is: a caller watching the health is otherwise
 	// left waiting on a report that will never come, unable to tell a stopped loop from a quiet one
 	// — or a watch it stopped itself from a pair that was taken out from under it.
+	// The watcher goes away with this loop, so nothing records this pair's local changes any more:
+	// until another watch starts, every pass reads the local side whole. Looked up without
+	// creating one — the pair may be exactly what ended the loop.
+	if let Some(changes) = engine.existing_pair_changes(pair).await {
+		changes.uncover_local();
+	}
 	let ended = if stop.pair_removed() {
 		WatchState::PairRemoved
 	} else {
@@ -657,7 +716,7 @@ async fn run_pass(
 	pair: PairId,
 	depth: ScanDepth,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
-) -> (Option<String>, bool) {
+) -> PassEnd {
 	if depth == ScanDepth::Deep {
 		tracing::debug!("sync pair {pair}: deep-scan pass, re-hashing every local file");
 	}
@@ -670,9 +729,45 @@ async fn run_pass(
 		}
 		Err(e) => {
 			tracing::warn!("sync pair {pair} failed: {e}");
-			(Some(e.to_string()), false)
+			// A pass that failed outright read nothing it could finish with, so the net is still
+			// owed a whole-tree read; the engine has already forced the next pass full.
+			PassEnd {
+				error: Some(e.to_string()),
+				owed: false,
+				read_whole: false,
+			}
 		}
 	}
+}
+
+/// What one finished pass means for the loop.
+struct PassEnd {
+	/// The pass's own failure, if any.
+	error: Option<String>,
+	/// Whether a pause cut it short, leaving the loop owing a pass (see [`owes_a_pass`]).
+	owed: bool,
+	/// Whether it read both sides whole (see [`read_both_sides_whole`]).
+	read_whole: bool,
+}
+
+/// Whether this pass read both sides WHOLE — what the safety net measures from.
+///
+/// Every pass that got as far as reading does today, whatever its
+/// [`full_pass`](SyncReport::full_pass) says: the change-scoped pass that narrows a read down to a
+/// dirty set does not exist yet, so the only pass that read nothing is one a pause cut short before
+/// it had a plan ([`paused`](SyncReport::paused)). When scoping lands, this becomes
+/// `report.full_pass.is_some()` and nothing else about the loop changes.
+fn read_both_sides_whole(report: &SyncReport) -> bool {
+	!report.paused
+}
+
+/// Whether the safety net is due: no pass has read both sides whole for a whole `every`.
+///
+/// Measured from the last such pass rather than taken from the interval's own tick, so a tree busy
+/// enough to keep the loop woken by its own changes cannot starve the backstop, and so the net
+/// counts what it exists for — a whole-tree read — rather than merely a pass having run.
+fn net_due(last_whole_pass: Instant, now: Instant, every: Duration) -> bool {
+	now.saturating_duration_since(last_whole_pass) >= every
 }
 
 /// What a pass that returned a report means for the loop: its own failure, if any, and whether it
@@ -683,20 +778,31 @@ async fn run_pass(
 /// A pass [`halted`](SyncReport::halted) for want of space is a failed pass too, so it backs off.
 /// So is one whose baseline or journal write did not land (`store_failed`): the act that write was
 /// recording stands, and the next pass would run straight into the same wedged store.
-fn pass_outcome(report: SyncReport) -> (Option<String>, bool) {
+fn pass_outcome(report: SyncReport) -> PassEnd {
+	let read_whole = read_both_sides_whole(&report);
 	if !report.lock_failed {
 		let error = report
 			.halted
 			.map(|reason| reason.held_line())
 			.or_else(|| report.store_failed.then(|| STORE_FAILURE.to_string()));
-		return (error, owes_a_pass(&report));
+		return PassEnd {
+			error,
+			owed: owes_a_pass(&report),
+			read_whole,
+		};
 	}
 	let error = report
 		.errors
 		.into_iter()
 		.find(|error| error.starts_with(LOCK_FAILURE))
 		.unwrap_or_else(|| LOCK_FAILURE.to_string());
-	(Some(error), false)
+	// A pass that could not take the drive lock still READ both sides: the lock is only asked for
+	// once there is a plan to apply.
+	PassEnd {
+		error: Some(error),
+		owed: false,
+		read_whole,
+	}
 }
 
 /// Whether a pause cut this pass short, leaving the loop owing a pass of its own.
@@ -773,23 +879,32 @@ fn start_local_watcher<W: Watcher>(
 	Some(watcher)
 }
 
-/// The filesystem watcher's event handler. A change wakes the loop unless it is the engine's own
-/// staging write (see [`triggers_pass`]). An error wakes it too, and is recorded: it means the
-/// watcher may have missed something — a directory created past the OS watch limit goes unwatched,
-/// a failed read loses the events it held — so a pass runs now rather than at the next safety net.
+/// The filesystem watcher's event handler: it records WHAT changed on the pair's local changelist
+/// (see [`PairChanges::note_local_event`]) and then wakes the loop, unless the event is the
+/// engine's own staging write (see [`triggers_pass`]).
+///
+/// An error wakes the loop too, and is recorded twice: on the watch's status for a caller to see,
+/// and on the changelist, because it means the watcher may have missed something it cannot name —
+/// a directory created past the OS watch limit goes unwatched, a failed read loses the events it
+/// held — so no later pass may narrow its local half down.
+///
+/// `notify` delivers on its own thread, so everything here is a lock, a compare and a push.
 fn local_event_handler(
 	pair: PairId,
 	root: PathBuf,
 	dirty: Arc<Notify>,
 	status: tokio::sync::watch::Sender<WatchStatus>,
+	changes: Arc<PairChanges>,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
 	move |res| match res {
 		Ok(event) => {
+			changes.note_local_event(&root, &event, |path| is_engine_staging(&root, path));
 			if triggers_pass(&root, &event) {
 				dirty.notify_one();
 			}
 		}
 		Err(error) => {
+			changes.degrade(FullPassReason::LocalEventsDegraded);
 			degrade_local(pair, &status, &error);
 			dirty.notify_one();
 		}
@@ -835,9 +950,10 @@ mod tests {
 	use tokio::sync::Notify;
 
 	use super::{
-		BASE_BACKOFF, DEBOUNCE, DEEP_SCAN_EVERY, DEEP_SCAN_RETRY, MAX_BACKOFF, MAX_DEBOUNCE_BURST,
-		SAFETY_NET, ScanDepth, Stop, SyncReport, WatchConfig, WatchState, WatchStatus, backoff,
-		local_event_handler, next_deep_after, owes_a_pass, pass_outcome, publish_pass, scan_depth,
+		BASE_BACKOFF, DEBOUNCE, DEEP_SCAN_EVERY, DEEP_SCAN_RETRY, FullPassReason, MAX_BACKOFF,
+		MAX_DEBOUNCE_BURST, PairChanges, SAFETY_NET, ScanDepth, Stop, SyncReport, WatchConfig,
+		WatchState, WatchStatus, backoff, local_event_handler, net_due, next_deep_after,
+		owes_a_pass, pass_outcome, publish_pass, read_both_sides_whole, scan_depth,
 		start_local_watcher, triggers_pass, wait_for_next_pass, wait_while_paused,
 	};
 	use crate::{
@@ -922,14 +1038,21 @@ mod tests {
 		let mut safety_net = safety_net().await;
 		let (_rules_tx, mut rules) = user_ignore();
 		let (status, health) = tokio::sync::watch::channel(WatchStatus::default());
+		let changes = Arc::new(PairChanges::new());
 		let mut handler = local_event_handler(
 			1,
 			PathBuf::from("/sync/root"),
 			Arc::clone(&dirty),
 			status.clone(),
+			Arc::clone(&changes),
 		);
 
 		handler(Err(watch_limit()));
+		assert_eq!(
+			changes.take().full_pass_reason(10, false),
+			Some(FullPassReason::LocalEventsDegraded),
+			"a watcher error costs coverage nothing can narrow down again"
+		);
 		let start = tokio::time::Instant::now();
 		assert!(
 			wait_for_next_pass(
@@ -1471,15 +1594,19 @@ mod tests {
 		let mut report = SyncReport::default();
 		let cause = Error::custom(ErrorKind::RetryFailed, "held by another device");
 		note_lock_failure(&mut report, 3, &cause, &mut |_| {});
-		let (error, owed) = pass_outcome(report);
+		let end = pass_outcome(report);
 		assert_eq!(
-			error,
+			end.error,
 			Some(format!("{LOCK_FAILURE}: {cause}")),
 			"a pass that could not take the drive lock must publish its cause"
 		);
 		assert!(
-			!owed,
+			!end.owed,
 			"a failed pass is retried on the backoff, not re-armed at the debounce"
+		);
+		assert!(
+			end.read_whole,
+			"the lock is only asked for once the pass has read both sides and planned"
 		);
 	}
 
@@ -1494,15 +1621,90 @@ mod tests {
 			store_failed: true,
 			..SyncReport::default()
 		};
-		let (error, owed) = pass_outcome(report);
+		let end = pass_outcome(report);
 		assert_eq!(
-			error.as_deref(),
+			end.error.as_deref(),
 			Some(STORE_FAILURE),
 			"a pass that lost a record must publish a cause, not read as healthy"
 		);
 		assert!(
-			!owed,
+			!end.owed,
 			"a failed pass is retried on the backoff, not re-armed at the debounce"
+		);
+	}
+
+	/// The safety net measures from the last pass that READ both sides whole, not from the last
+	/// pass to run: a pass a pause cut short before it read anything leaves the net owed, so a
+	/// pair being paused and resumed repeatedly cannot starve the backstop.
+	#[tokio::test(start_paused = true)]
+	async fn the_safety_net_measures_from_the_last_whole_read() {
+		let start = tokio::time::Instant::now();
+		assert!(!net_due(start, start, SAFETY_NET));
+		assert!(!net_due(start, start + SAFETY_NET - DEBOUNCE, SAFETY_NET));
+		assert!(net_due(start, start + SAFETY_NET, SAFETY_NET));
+		assert!(net_due(start, start + SAFETY_NET * 3, SAFETY_NET));
+
+		// Every pass that gets as far as reading counts, whether or not it had a whole-tree
+		// trigger and whether or not its actions all landed.
+		assert!(read_both_sides_whole(&SyncReport::default()));
+		assert!(read_both_sides_whole(&SyncReport {
+			full_pass: Some(FullPassReason::SafetyNet),
+			..SyncReport::default()
+		}));
+		assert!(read_both_sides_whole(&SyncReport {
+			interrupted: 2,
+			..SyncReport::default()
+		}));
+		assert!(
+			!read_both_sides_whole(&SyncReport {
+				paused: true,
+				..SyncReport::default()
+			}),
+			"a pause that beat the read leaves the net owed a whole-tree pass"
+		);
+	}
+
+	/// The handler records what changed for the next pass to narrow itself with, keyed as the scan
+	/// keys it — and the engine's own staging writes dirty nothing.
+	#[test]
+	fn the_handler_records_what_changed_for_the_next_pass() {
+		let (status, _health) = tokio::sync::watch::channel(WatchStatus::default());
+		let dirty = Arc::new(Notify::new());
+		let changes = Arc::new(PairChanges::new());
+		// What `watch_with` does once the watcher is running: only then is the list evidence.
+		changes.cover_local();
+		let root = PathBuf::from("/sync/root");
+		let mut handler = local_event_handler(
+			1,
+			root.clone(),
+			Arc::clone(&dirty),
+			status,
+			Arc::clone(&changes),
+		);
+
+		handler(Ok(event(
+			EventKind::Create(CreateKind::File),
+			&["/sync/root/sub/a.txt"],
+		)));
+		handler(Ok(event(
+			EventKind::Create(CreateKind::File),
+			&["/sync/root/sub/dee76e0e-0000-0000-0000-000000000000.filendl"],
+		)));
+		handler(Ok(event(
+			EventKind::Create(CreateKind::File),
+			&["/sync/root/.filen-sync-trash/gone.txt"],
+		)));
+
+		let scope = changes.take();
+		assert_eq!(
+			scope.sizes(),
+			(1, 0),
+			"only the real change is worth re-observing"
+		);
+		assert_eq!(
+			scope.full_pass_reason(10, false),
+			None,
+			"one named path does not force a whole-tree read"
 		);
 	}
 
