@@ -19,6 +19,7 @@
 
 mod apply;
 mod baseline;
+mod changes;
 mod engine;
 mod events;
 mod guard;
@@ -39,6 +40,7 @@ mod watch;
 pub use self::ignore::{DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath};
 pub use apply::SyncReport;
 pub use baseline::{PairId, PairRecord};
+pub use changes::FullPassReason;
 pub use engine::{
 	CONFIRM_TENURE, ConflictResolution, PATH_FAILURE_RETRY_INTERVAL, PairOverlap, SyncEngine,
 };

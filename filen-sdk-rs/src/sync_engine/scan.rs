@@ -232,7 +232,10 @@ fn under_invalid_name(invalid: &BTreeMap<String, String>, rel_path: &str) -> boo
 
 /// NFC-normalize a relative path's components (case preserved) and `/`-join them. `None` if any
 /// component is non-UTF-8 or not a plain name (a walked subtree only yields `Normal` components).
-fn normalize_rel_path(rel: &Path) -> Option<String> {
+///
+/// Shared with the filesystem watcher's changelist (`changes::relative_key`), so a path an event
+/// names is keyed exactly as the walk would key it.
+pub(super) fn normalize_rel_path(rel: &Path) -> Option<String> {
 	let mut parts = Vec::new();
 	for component in rel.components() {
 		match component {
