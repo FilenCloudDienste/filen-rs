@@ -73,6 +73,17 @@ pub(crate) const UNDECODABLE_LIST: &str = "SELECT DISTINCT uuid, parent, stable_
 ))]
 pub(crate) const ENUMERATE_SUBTREE: &str = include_str!("raw/enumerate_subtree.sql");
 
+// Full-payload hydration of named items by uuid, for the few a sync pass acts on (read via
+// `cache::enumerate`, under the same gate). Its column NAMES are `row_to_result`'s contract. It
+// carries a single `(?1)` so that the file stays SQL the linter can parse;
+// `enumerate::hydrate_by_uuids` rewrites that into one numbered parameter per uuid of the chunk it
+// is about to bind, so it is never bound as-is.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) const HYDRATE_BY_UUIDS: &str = include_str!("raw/hydrate_by_uuids.sql");
+
 /// Key for the contiguous-prefix watermark stored in `cache_meta`.
 pub(crate) const WATERMARK_KEY: &str = "last_drive_message_id";
 /// Key for the durable "a resync is needed" flag in `cache_meta` (set when an event is lost — a hole,
