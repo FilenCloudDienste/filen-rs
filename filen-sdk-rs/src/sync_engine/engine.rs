@@ -2431,24 +2431,26 @@ impl SyncEngine {
 			.client
 			.enumerate_sync_root_snapshot(record.remote_root)
 			.await?;
-		// Without the ignore rules first: what the snapshot confirms, which remote rule files there
-		// are, and whether the remote reads as emptied are facts about the remote as it is, whatever
-		// the rules hide.
-		let raw_view = plan::build_remote_view(
+		// One view, built once and unfiltered at first: what the snapshot confirms, which remote
+		// rule files there are, which of this engine's own writes the cache has caught up to, and
+		// whether the remote reads as emptied are facts about the remote as it is, whatever the
+		// rules hide — and the rules cannot be known until the scan below has read the
+		// `.filenignore` files on disk. Those reads come first; then the very rules the scan
+		// matched with hide what they hide, in place (see `RemoteView::filter`).
+		let mut view = plan::place_remote_items(
 			record.remote_root,
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
-			None,
 		);
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
 		// view — before this engine's own writes are folded into it, and before the baseline is
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
-		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &raw_view.nodes);
+		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &view.nodes);
 		confirmed.extend(
-			self.confirm_pushes(&mut baseline_map, &raw_view.nodes, &snapshot.files)
+			self.confirm_pushes(&mut baseline_map, &view.nodes, &snapshot.files)
 				.await,
 		);
 		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
@@ -2460,7 +2462,7 @@ impl SyncEngine {
 			Ok(source) => (Some(source), None),
 			Err(error) => (None, Some(error)),
 		};
-		let mut remote_rules = self.remote_rules(&record, &baseline, &raw_view, user).await;
+		let mut remote_rules = self.remote_rules(&record, &baseline, &view, user).await;
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
@@ -2478,7 +2480,7 @@ impl SyncEngine {
 				baseline
 					.iter()
 					.filter(|(path, entry)| {
-						entry.kind == NodeKind::File && !raw_view.nodes.contains_key(*path)
+						entry.kind == NodeKind::File && !view.nodes.contains_key(*path)
 					})
 					.filter_map(|(path, _)| rule_file_dir(path))
 					.map(str::to_owned)
@@ -2501,17 +2503,38 @@ impl SyncEngine {
 		let mut ignore_blocked = mem::take(&mut local_scan.ignore_blocked);
 		ignore_blocked.extend(remote_rules.blocked);
 
-		// Filtered with exactly the rules the scan matched with, so both sides hide the same paths.
-		let mut remote_view = plan::build_remote_view(
-			record.remote_root,
-			&snapshot.dirs,
-			&snapshot.files,
-			&snapshot.undecodable,
-			Some(plan::ViewFilter {
-				rules: &rules,
-				baseline: &baseline,
-			}),
-		);
+		// The reads that are about the remote AS IT IS come before anything is hidden: what the
+		// cache shows is evidence whatever the rules hide.
+		let remote_emptied = remote_emptied(&view.nodes, &baseline);
+		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
+		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
+		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
+		// the one await between the two halves and this read runs under the pass's cancel: dropped
+		// there, the retirement would stand in memory and not in the DB.
+		let mut holds = {
+			let store = self.store.lock().await;
+			let before = self.pending.uuids();
+			let holds = self.pending.settle(pair, &observed, &view.nodes);
+			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
+			if !retired.is_empty() {
+				store
+					.delete_pending(&retired)
+					.map_err(|e| db_error(e, "retiring pending writes"))?;
+			}
+			holds
+		};
+		// A create whose path shows another version of the same file is the one thing the fold
+		// cannot settle on its own; ask the server before it paints over a stranger.
+		self.retire_superseded_creates(pair, &baseline, &view.nodes, &snapshot.files)
+			.await?;
+
+		// Hidden with exactly the rules the scan matched with, so both sides hide the same paths.
+		// From here on the view is the filtered set — what reconcile, the folds and apply act on.
+		view.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &baseline,
+		}));
+		let mut remote_view = view;
 		let ignored_remote = mem::take(&mut remote_view.ignored);
 		// Hidden on both sides, but carried as roots on neither: the `.DS_Store` in every folder
 		// that no row was ever written for. The report leaves them out and untracking them deletes
@@ -2527,30 +2550,6 @@ impl SyncEngine {
 		let (unknown_remote, never_synced_remote) =
 			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 
-		let remote_emptied = remote_emptied(&raw_view.nodes, &baseline);
-		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
-		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
-		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
-		// the one await between the two halves and this read runs under the pass's cancel: dropped
-		// there, the retirement would stand in memory and not in the DB.
-		let mut holds = {
-			let store = self.store.lock().await;
-			let before = self.pending.uuids();
-			// The raw view: what the cache shows is evidence whatever the rules hide.
-			let holds = self.pending.settle(pair, &observed, &raw_view.nodes);
-			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
-			if !retired.is_empty() {
-				store
-					.delete_pending(&retired)
-					.map_err(|e| db_error(e, "retiring pending writes"))?;
-			}
-			holds
-		};
-		// A create whose path shows another version of the same file is the one thing the fold
-		// cannot settle on its own; ask the server before it paints over a stranger.
-		self.retire_superseded_creates(pair, &baseline, &raw_view.nodes, &snapshot.files)
-			.await?;
-		drop(raw_view);
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
 		let folded = self
@@ -4247,6 +4246,7 @@ mod tests {
 					remote_uuid: self.x,
 					stable_uuid: Some(StableUuid::new_for_test(self.x)),
 					rel_path: at.to_string(),
+					path_is_dir: true,
 					reason: UnsyncableReason::RemoteUndecodable,
 				}],
 				&[],
@@ -4707,6 +4707,7 @@ mod tests {
 				remote_uuid: docs.x,
 				stable_uuid: Some(StableUuid::new_for_test(docs.x)),
 				rel_path: "elsewhere".to_string(),
+				path_is_dir: false,
 				reason: UnsyncableReason::RemoteBrokenParent,
 			}],
 			&[],
@@ -4827,6 +4828,7 @@ mod tests {
 				remote_uuid: Uuid::new_v4(),
 				stable_uuid: None,
 				rel_path: "docs".to_string(),
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			}],
 			&[],
