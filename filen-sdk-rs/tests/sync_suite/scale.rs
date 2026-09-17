@@ -1798,7 +1798,6 @@ async fn scale_16_watch_debounces_local_event_burst() {
 				debounce: BURST_DEBOUNCE,
 				// Far enough out that no pass observed here can be a safety-net pass.
 				safety_net: Duration::from_secs(3600),
-				deep_scan_every: None,
 			},
 			Box::new(move |event| {
 				if let SyncEvent::PassCompleted { report } = event {

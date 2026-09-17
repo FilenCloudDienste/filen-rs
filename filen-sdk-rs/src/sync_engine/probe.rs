@@ -44,7 +44,7 @@ use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	ignore::{IgnoreRules, parse_user_ignore},
 	plan::{self, PassHolds, RemoteNode},
-	scan::{self, LocalNode, LocalScan, RuleFiles, ScanDepth},
+	scan::{self, LocalNode, LocalScan, RuleFiles},
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -435,13 +435,8 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		&snapshot.files,
 		&snapshot.undecodable,
 	);
-	let (scan, rules_used) = scan::scan_local(
-		&fixture.root,
-		&baseline,
-		ScanDepth::Fast,
-		probe_rules(),
-		RuleFiles::Read,
-	);
+	let (scan, rules_used) =
+		scan::scan_local(&fixture.root, &baseline, probe_rules(), RuleFiles::Read);
 	drop(rules_used);
 	view.filter(Some(plan::ViewFilter {
 		rules,
@@ -503,15 +498,8 @@ pub fn run() -> String {
 
 	// The scan with nothing in the baseline: every file misses the fast path and is hashed.
 	let no_baseline = HashMap::new();
-	let ((cold_scan, _), cold) = timed(|| {
-		scan::scan_local(
-			&fixture.root,
-			&no_baseline,
-			ScanDepth::Fast,
-			probe_rules(),
-			RuleFiles::Read,
-		)
-	});
+	let ((cold_scan, _), cold) =
+		timed(|| scan::scan_local(&fixture.root, &no_baseline, probe_rules(), RuleFiles::Read));
 	probe.record(
 		"scan_cold",
 		nodes,
@@ -892,15 +880,8 @@ pub fn run() -> String {
 		"entries() -> Vec -> HashMap",
 	);
 
-	let ((warm_scan, _), warm_time) = timed(|| {
-		scan::scan_local(
-			&fixture.root,
-			&baseline,
-			ScanDepth::Fast,
-			probe_rules(),
-			RuleFiles::Read,
-		)
-	});
+	let ((warm_scan, _), warm_time) =
+		timed(|| scan::scan_local(&fixture.root, &baseline, probe_rules(), RuleFiles::Read));
 	probe.record("scan_warm", nodes, warm_time, "fast path, no re-hashing");
 	probe.record(
 		"hashing_only",
