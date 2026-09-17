@@ -267,7 +267,7 @@ pub(super) fn collision_hash(key: &str) -> u128 {
 }
 
 /// BLAKE3 of the file at `path`, streamed (no full read into memory).
-fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
+pub(super) fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
 	let file = std::fs::File::open(path)?;
 	let mut hasher = blake3::Hasher::new();
 	hasher.update_reader(&file)?;
