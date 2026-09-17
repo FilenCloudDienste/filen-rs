@@ -40,6 +40,7 @@ use super::{
 };
 use crate::{
 	auth::Client,
+	cache::SearchResult,
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
@@ -182,8 +183,6 @@ pub(super) struct ApplyContext<'a> {
 	/// [`ScreenState::absence_trusted`](super::guard::ScreenState::absence_trusted)) — gates
 	/// dropping a baseline row because both sides look gone.
 	pub(super) absence_trusted: bool,
-	pub(super) dirs: &'a [CacheableDir<'static>],
-	pub(super) files: &'a [CacheableFile<'static>],
 	/// Where each remote uuid this pass writes is recorded, so the NEXT pass does not mistake a
 	/// cache that has not caught up for a remote-side deletion.
 	pub(super) pending: &'a PendingWrites,
@@ -333,10 +332,10 @@ pub(super) async fn apply(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
-	let mut files = RemoteFiles {
-		snapshot: ctx.files.iter().map(|f| (f.uuid, f)).collect(),
-		fetched: HashMap::new(),
-	};
+	// uuid -> the remote file object, for every file this plan acts on: hydrated from the cache
+	// by [`resolve_folded_objects`], and from the server for what this engine wrote and the cache
+	// has not listed yet.
+	let mut files: HashMap<Uuid, RemoteFile> = HashMap::new();
 	// path -> remote directory, for resolving the parent of an item. Seeded with the root at "";
 	// [`resolve_folded_objects`] adds the ones this plan actually names, and a new dir joins as it
 	// is created. Building one for every directory of the tree up front was a `RemoteDirectory`
@@ -560,7 +559,7 @@ pub(super) async fn apply(
 async fn run_transfer<'a>(
 	ctx: &ApplyContext<'_>,
 	action: &'a SyncAction,
-	files: &RemoteFiles<'_>,
+	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 	progress: &UnboundedSender<SyncEvent>,
 ) -> (&'a SyncAction, Result<Transfer, crate::Error>) {
@@ -927,22 +926,6 @@ fn note_interrupted(
 	observer(SyncEvent::Interrupted { actions: remaining });
 }
 
-/// The remote file objects a pass can act on: the cache snapshot's, plus the ones fetched for
-/// items this engine wrote that the snapshot does not carry yet (see `PendingWrites::fold_into`).
-struct RemoteFiles<'a> {
-	snapshot: HashMap<Uuid, &'a CacheableFile<'static>>,
-	fetched: HashMap<Uuid, RemoteFile>,
-}
-
-impl RemoteFiles<'_> {
-	fn get(&self, uuid: &Uuid) -> Option<RemoteFile> {
-		self.snapshot
-			.get(uuid)
-			.map(|cacheable| RemoteFile::from((*cacheable).clone()))
-			.or_else(|| self.fetched.get(uuid).cloned())
-	}
-}
-
 /// Resolve the remote objects this plan acts on that the cache snapshot cannot supply.
 ///
 /// The remote view carries the writes this engine made that the cache has not listed yet, so an
@@ -957,7 +940,7 @@ impl RemoteFiles<'_> {
 async fn resolve_folded_objects(
 	ctx: &ApplyContext<'_>,
 	actions: &[SyncAction],
-	files: &mut RemoteFiles<'_>,
+	files: &mut HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 ) {
 	let mut wanted_files: HashSet<Uuid> = HashSet::new();
@@ -1003,31 +986,60 @@ async fn resolve_folded_objects(
 		}
 	}
 
+	// What the plan names and the map has not got: the root is in it already, and a directory this
+	// very pass creates is filled in as it goes.
+	let missing_dirs: Vec<&str> = wanted_dirs
+		.into_iter()
+		.filter(|path| !dir_by_path.contains_key(*path))
+		.collect();
+	// One cache read for every object this plan acts on, files and directories together: the
+	// pass's snapshot carries only the columns its view reads (see `cache::enumerate`), so the
+	// whole payloads are hydrated here, by uuid, and only for the handful the plan names.
+	let wanted: Vec<Uuid> = wanted_files
+		.iter()
+		.copied()
+		.chain(missing_dirs.iter().filter_map(|path| {
+			ctx.remote
+				.get(*path)
+				.filter(|node| node.kind == NodeKind::Dir)
+				.map(|node| node.remote_uuid)
+		}))
+		.collect();
+	let mut cached_files: HashMap<Uuid, CacheableFile<'static>> = HashMap::new();
+	let mut cached_dirs: HashMap<Uuid, CacheableDir<'static>> = HashMap::new();
+	match ctx.client.hydrate_cached_items(wanted).await {
+		Ok(items) => {
+			for item in items {
+				match item {
+					SearchResult::File(file) => {
+						cached_files.insert(file.uuid, file);
+					}
+					SearchResult::Dir(dir) => {
+						cached_dirs.insert(dir.uuid, dir);
+					}
+				}
+			}
+		}
+		Err(error) => tracing::debug!(
+			"apply: could not read the cached objects this plan acts on ({error}); the server is asked for each of them"
+		),
+	}
+
 	for uuid in wanted_files {
-		if files.snapshot.contains_key(&uuid) {
+		if let Some(cacheable) = cached_files.remove(&uuid) {
+			files.insert(uuid, RemoteFile::from(cacheable));
 			continue;
 		}
 		match ctx.client.get_file(uuid).await {
 			Ok(file) => {
-				files.fetched.insert(uuid, file);
+				files.insert(uuid, file);
 			}
 			Err(error) => tracing::debug!(
 				"apply: cannot resolve the file {uuid} this engine wrote ({error}); its action fails this pass"
 			),
 		}
 	}
-	// What the plan names and this map has not got: the root is in it already, and a directory
-	// this very pass creates is filled in as it goes.
-	let missing: Vec<&str> = wanted_dirs
-		.into_iter()
-		.filter(|path| !dir_by_path.contains_key(*path))
-		.collect();
-	if missing.is_empty() {
-		return;
-	}
-	let dir_by_uuid: HashMap<Uuid, &CacheableDir<'static>> =
-		ctx.dirs.iter().map(|d| (d.uuid, d)).collect();
-	for path in missing {
+	for path in missing_dirs {
 		let Some(node) = ctx
 			.remote
 			.get(path)
@@ -1035,12 +1047,9 @@ async fn resolve_folded_objects(
 		else {
 			continue;
 		};
-		// The snapshot described this one, so there is nothing to ask the server for.
-		if let Some(cacheable) = dir_by_uuid.get(&node.remote_uuid) {
-			dir_by_path.insert(
-				path.to_string(),
-				RemoteDirectory::from((*cacheable).clone()),
-			);
+		// The cache held this one, so there is nothing to ask the server for.
+		if let Some(cacheable) = cached_dirs.remove(&node.remote_uuid) {
+			dir_by_path.insert(path.to_string(), RemoteDirectory::from(cacheable));
 			continue;
 		}
 		match ctx.client.get_dir(node.remote_uuid).await {
@@ -1078,7 +1087,7 @@ fn is_transfer(action: &SyncAction) -> bool {
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	files: &RemoteFiles<'_>,
+	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
@@ -1232,7 +1241,7 @@ enum Transfer {
 async fn apply_transfer(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	files: &RemoteFiles<'_>,
+	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 	progress: &UnboundedSender<SyncEvent>,
 ) -> Result<Transfer, crate::Error> {
@@ -1246,6 +1255,7 @@ async fn apply_transfer(
 		} => {
 			let remote_file = files
 				.get(remote_uuid)
+				.cloned()
 				.ok_or_else(|| internal("download target missing from the snapshot"))?;
 			let path = confined_local_target(ctx.local_root, rel_path)?;
 			if let Some(parent) = path.parent() {
@@ -1434,7 +1444,7 @@ fn progress_callback<'a>(
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	action: &SyncAction,
-	files: &RemoteFiles<'_>,
+	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
@@ -1533,6 +1543,7 @@ async fn apply_one(
 				NodeKind::File => {
 					let mut remote_file = files
 						.get(remote_uuid)
+						.cloned()
 						.ok_or_else(|| internal("trash target file missing from the snapshot"))?;
 					ctx.client.trash_file(&mut remote_file).await?;
 				}
@@ -1564,6 +1575,7 @@ async fn apply_one(
 		} => {
 			let mut remote_file = files
 				.get(remote_uuid)
+				.cloned()
 				.ok_or_else(|| internal("move-source file missing from the snapshot"))?;
 			let (from_parent, from_name) = parent_and_name(from_path);
 			let (to_parent, to_name) = parent_and_name(to_path);
