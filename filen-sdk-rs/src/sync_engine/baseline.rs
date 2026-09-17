@@ -111,6 +111,19 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 
 /// The columns [`BaselineStore::row_to_entry`] reads, named once so the statements that hand back
 /// rows cannot drift apart from each other or from it.
+/// Objects added to the schema after version 1 was first written, created on EVERY open rather
+/// than only on a fresh DB: [`SCHEMA`] runs once, when the file holds no table of ours, so an index
+/// added to it alone would never reach a DB that already exists. `IF NOT EXISTS` makes the re-run
+/// free, and an index changes no row's MEANING, so [`SCHEMA_VERSION`] does not move — an older
+/// build opening the file just plans its own reads without it.
+///
+/// The one object here serves the conflict read ([`BaselineStore::conflicts`]): the rows a pair
+/// holds in conflict are a handful out of a whole tree, and finding them without the index is a
+/// walk of every row of the pair — a walk that runs under the pair's store mutex.
+const ADDITIVE_SCHEMA: &str = "
+CREATE INDEX IF NOT EXISTS baseline_state ON baseline (pair_id, state);
+";
+
 const ENTRY_COLUMNS: &str = "rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 	 remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
 	 remote_stable_uuid, agreed_hash";
@@ -480,12 +493,21 @@ fn is_write_lock_contention(error: &rusqlite::Error) -> bool {
 /// Run a write that RECORDS an act already done, and make its failure loud.
 ///
 /// ONE attempt, on purpose. The busy timeout [`init`](BaselineStore::init) sets makes SQLite itself
-/// sleep and retry inside `sqlite3_step` for a full 30 s before it answers `SQLITE_BUSY`, and the
-/// longest write any ONE connection to this file makes is a first sync's whole-tree transaction —
-/// 12.6 s for a million rows. A second attempt would wait out another 30 s to learn what the first
-/// one already established: the connection holding the write lock is not making progress. The
-/// unbounded retry this replaces turned that into a pass that hung for as long as the wedged writer
-/// lived, without a word.
+/// sleep and retry inside `sqlite3_step` for a full 30 s before it answers `SQLITE_BUSY`, so a
+/// second attempt would wait out another 30 s to learn what the first one already established: the
+/// connection holding the write lock is not making progress. The unbounded retry this replaces
+/// turned that into a pass that hung for as long as the wedged writer lived, without a word.
+///
+/// How much margin those 30 s leave is measured, and it is not generous. The longest write one
+/// connection makes is a whole-tree transaction, and with `ADDITIVE_SCHEMA`'s index in place a
+/// million-row re-write measured 21.2 s at best and 26.4 s by median (15.8 s without it) on an
+/// SSD, with a control write on another connection waiting 21.9 s behind one of them. A record
+/// write that lands during a first sync's confirmation pass on a tree that size has single-digit
+/// seconds to spare; on a phone's flash, or on a tree larger than a million rows, it is unmeasured
+/// and may have none. `delete_pair`'s cascade — the other long write — is 4.1 s at a million rows
+/// and is not the one to worry about. Where the
+/// margin does run out this fails, loudly, which is the point; the lever if it happens in the
+/// field is a longer timeout for these writes alone, not a retry.
 ///
 /// So the record is lost and the act it describes stands without it. Loudly, not silently: the
 /// error goes to the caller, this logs it with the pair, the path and which record failed, and a
@@ -574,6 +596,15 @@ fn describe_changes(changes: &[BaselineChange<'_>]) -> String {
 	described.join(", ")
 }
 
+/// The conflict read's statement, named so the plan test explains exactly what the read runs
+/// rather than one that merely looks like it. `(pair_id, state)` is what [`ADDITIVE_SCHEMA`]'s
+/// index covers, and there is deliberately no `ORDER BY` here: the ordering
+/// [`BaselineStore::conflicts`] promises is applied to the rows it hands back, for the reason
+/// given there.
+fn conflict_rows_sql() -> String {
+	format!("SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 AND state IN (?2, ?3)")
+}
+
 impl BaselineStore {
 	/// Open (creating if needed) the baseline DB at `path`.
 	pub(crate) fn open(path: &Path) -> Result<Self, crate::Error> {
@@ -609,6 +640,17 @@ impl BaselineStore {
 			.expect("setting a busy timeout on an open connection");
 	}
 
+	/// Drop or re-create the conflict-state index, for the plan test and the probe phases that have
+	/// to see both sides of it. Nothing in production calls it: every open creates it.
+	#[cfg(any(test, feature = "bench-internals"))]
+	pub(super) fn set_state_index(&self, present: bool) -> rusqlite::Result<()> {
+		self.conn.execute_batch(if present {
+			ADDITIVE_SCHEMA
+		} else {
+			"DROP INDEX IF EXISTS baseline_state;"
+		})
+	}
+
 	/// A fresh DB is created whole and stamped at [`SCHEMA_VERSION`]. An existing one is opened only
 	/// when it carries exactly that version: anything else — older or newer — is refused rather than
 	/// read, since there is no migration chain to bring it here and reading foreign rows under these
@@ -623,9 +665,12 @@ impl BaselineStore {
 		// engine keeps several: one per pair plus a control connection. WAL lets a reader through
 		// during a write, but not a second writer, so a control write — persisting a paused flag,
 		// storing the user ignore patterns — waits out whatever a pair is committing. The longest
-		// of those is a first sync's single transaction over the whole tree, measured at 12.6 s for
-		// a million rows, so a timeout under that would turn a pause into a `SQLITE_BUSY` error
-		// instead of a slow pause. Waiting is the right direction for every one of these callers:
+		// of those is a first sync's single transaction over the whole tree: 21.2-26.4 s for a
+		// million rows with `ADDITIVE_SCHEMA`'s index in place (15.8 s without it), and a control
+		// write measured 21.9 s waiting behind one. So 30 s is enough at that size and not by much
+		// — a timeout under it would turn a pause into a `SQLITE_BUSY` error instead of a slow
+		// pause, and a tree well past a million rows would need more than 30 s. Waiting is the
+		// right direction for every one of these callers:
 		// the flag a pause fails to persist is the one that protects the pair on the next open.
 		conn.busy_timeout(std::time::Duration::from_millis(30_000))
 			.map_err(open_error)?;
@@ -670,6 +715,9 @@ impl BaselineStore {
 		// Answers with the mode it set, which `execute` refuses and `pragma_update` allows.
 		conn.pragma_update(None, "journal_mode", "WAL")
 			.map_err(open_error)?;
+		// Then the additive objects, on every open: a DB written before one of them existed gains it
+		// here, and a fresh one has just been created without them (see [`ADDITIVE_SCHEMA`]).
+		conn.execute_batch(ADDITIVE_SCHEMA).map_err(open_error)?;
 		Ok(Self { conn })
 	}
 
@@ -931,13 +979,13 @@ impl BaselineStore {
 	///
 	/// A `WHERE` on the state rather than a read of the whole pair filtered in Rust: what a caller
 	/// listing the conflicts wants is a handful of rows, and reading every row of the pair to find
-	/// them is the same work a pass does.
+	/// them is the same work a pass does. [`ADDITIVE_SCHEMA`]'s `(pair_id, state)` index is what
+	/// makes it a seek of those rows rather than that same walk with the filtering moved into
+	/// SQLite.
 	pub(crate) fn conflicts(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
-		self.conn
-			.prepare(&format!(
-				"SELECT {ENTRY_COLUMNS} FROM baseline
-				 WHERE pair_id = ?1 AND state IN (?2, ?3) ORDER BY rel_path"
-			))?
+		let mut held: Vec<BaselineEntry> = self
+			.conn
+			.prepare(&conflict_rows_sql())?
 			.query_map(
 				params![
 					pair,
@@ -946,7 +994,15 @@ impl BaselineStore {
 				],
 				Self::row_to_entry,
 			)?
-			.collect()
+			.collect::<rusqlite::Result<_>>()?;
+		// Ordered here rather than by the statement: an `ORDER BY rel_path` is satisfied for free
+		// by the primary key, so the planner takes that walk over the state seek and the index buys
+		// nothing. Measured at 100k (103,479 rows, none of them held): the ordered form read every
+		// row of the pair in 71.6 ms, all of it under the pair's store mutex, against 0.03 ms for
+		// the seek. What comes back is the handful of rows a pair holds in conflict, so sorting them
+		// here costs nothing.
+		held.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
+		Ok(held)
 	}
 
 	/// Drop one baseline row. Fails loudly rather than waiting for another connection's write
@@ -2188,6 +2244,104 @@ mod tests {
 			store.entry(other, "docs").unwrap().is_some(),
 			"another pair's rows stay"
 		);
+	}
+
+	/// Whether the conflict-state index is in the file.
+	fn has_state_index(store: &BaselineStore) -> bool {
+		store
+			.conn
+			.query_row(
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'baseline_state'",
+				[],
+				|row| row.get::<_, i64>(0),
+			)
+			.unwrap() == 1
+	}
+
+	/// The conflict read must SEEK the `(pair_id, state)` index rather than walk the pair's rows, on
+	/// the very statement the read runs. The plan with the index dropped is asserted too, so the test
+	/// cannot pass on a plan that never mentions an index at all.
+	#[test]
+	fn the_conflict_read_seeks_the_state_index() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let sql = conflict_rows_sql();
+		let plan = |store: &BaselineStore| -> Vec<String> {
+			store
+				.conn
+				.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+				.unwrap()
+				.query_map(
+					params![
+						1_i64,
+						BaselineState::Conflicted.as_i64(),
+						BaselineState::Overwritten.as_i64()
+					],
+					|row| row.get("detail"),
+				)
+				.unwrap()
+				.collect::<rusqlite::Result<_>>()
+				.unwrap()
+		};
+
+		let indexed = plan(&store);
+		assert!(
+			indexed
+				.iter()
+				.any(|step| step.starts_with("SEARCH baseline USING INDEX baseline_state")),
+			"the conflict read must seek the state index: {indexed:?}"
+		);
+
+		store.set_state_index(false).unwrap();
+		let walked = plan(&store);
+		assert!(
+			!walked.iter().any(|step| step.contains("baseline_state")),
+			"the control plan must not name an index that is gone: {walked:?}"
+		);
+		assert!(
+			walked
+				.iter()
+				.any(|step| step.contains("sqlite_autoindex_baseline_1")),
+			"without it the read walks the pair's rows on the primary key: {walked:?}"
+		);
+	}
+
+	/// A DB written before the index existed gains it on the next open and is NOT refused for it: the
+	/// version stamp does not move, so the index is all that separates the two files.
+	#[test]
+	fn a_db_without_the_state_index_gains_it_on_open() {
+		let path = temp_db_path("state_index");
+		let entry = file_entry("a.txt", [5; 32], 9);
+		let pair = {
+			let store = BaselineStore::open(&path).unwrap();
+			let (pair, _) = store
+				.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+				.unwrap();
+			store.upsert_entry(pair, &entry).unwrap();
+			// The shape a build from before the index left behind.
+			store.set_state_index(false).unwrap();
+			assert!(!has_state_index(&store));
+			pair
+		};
+
+		let reopened = BaselineStore::open(&path).unwrap();
+		assert!(
+			has_state_index(&reopened),
+			"the open must create the index the file was missing"
+		);
+		assert_eq!(
+			version_of(&reopened),
+			SCHEMA_VERSION,
+			"and must not restamp the file for it"
+		);
+		assert_eq!(
+			reopened.entry(pair, "a.txt").unwrap().as_ref(),
+			Some(&entry),
+			"the rows it arrived with must read back"
+		);
+		drop(reopened);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+		}
 	}
 
 	/// Every statement that works on a whole subtree must SEEK the primary-key index, and the plan
