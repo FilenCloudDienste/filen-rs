@@ -5705,6 +5705,119 @@ mod tests {
 		);
 	}
 
+	/// A file recorded under an unplaceable DIRECTORY takes that directory's path, so the rules have
+	/// to be asked about that path as the directory it is. A rule written for directories only
+	/// (`bad*/`) hides the directory; asked as a file it missed, the record outlived the directory
+	/// it describes, and every pass then reported the path the rule exists to silence.
+	#[test]
+	fn a_directory_only_rule_hides_what_was_recorded_under_an_unplaceable_directory() {
+		let root = Uuid::new_v4();
+		// Legal on the server, unusable as one local path component, so the view cannot place it.
+		let bad = remote_dir("bad\\x", root);
+		let child = cacheable_file(bad.uuid, "file.txt");
+		let dirs = [bad];
+		let files = [child];
+
+		let placed = place_remote_items(root, &dirs, &files, &[]);
+		assert!(placed.nodes.is_empty(), "{:?}", placed.nodes.keys());
+		assert_eq!(
+			placed.skipped.len(),
+			2,
+			"the directory and the file that takes its record: {:?}",
+			placed.skipped
+		);
+		assert!(
+			placed.skipped.iter().all(|skip| skip.path_is_dir),
+			"both records name the directory's path, so both are directory paths: {:?}",
+			placed.skipped
+		);
+
+		let mut view = place_remote_items(root, &dirs, &files, &[]);
+		view.filter(Some(ViewFilter {
+			rules: &root_rules("bad*/"),
+			baseline: &HashMap::new(),
+		}));
+		assert!(
+			view.skipped.is_empty(),
+			"the rule hides the directory, so nothing recorded under it is unsyncable: {:?}",
+			view.skipped
+		);
+	}
+
+	/// The placed view keeps BOTH halves of a case-only pair — the consumers that read the view
+	/// before it is filtered see the remote as it is — and the filter is what resolves them and
+	/// refuses the pass.
+	#[test]
+	fn the_placed_view_keeps_both_case_twins_and_the_filter_resolves_them() {
+		let root = Uuid::new_v4();
+		let lower = cacheable_file(root, "note.txt");
+		let upper = RemoteItem {
+			uuid: Uuid::new_v4(),
+			name: "Note.txt".to_string(),
+			..lower.clone()
+		};
+		let files = [lower, upper];
+
+		let mut view = place_remote_items(root, &[], &files, &[]);
+		let mut placed: Vec<&str> = view.nodes.keys().map(String::as_str).collect();
+		placed.sort_unstable();
+		assert_eq!(placed, vec!["Note.txt", "note.txt"]);
+		assert!(
+			!view.has_collisions,
+			"placement itself refuses nothing: the reads that come before the filter are about the \
+			 remote as it is"
+		);
+
+		view.filter(None);
+		assert!(view.has_collisions, "the filter is what refuses the pass");
+		assert_eq!(view.nodes.len(), 1, "the loser leaves the view");
+	}
+
+	/// A path the cache lists twice byte-identically is HELD, and stays held where a rule hides it:
+	/// both halves are hidden together and nothing can act on the path, so the pass that finds the
+	/// cache no longer mid-transition there is the one that untracks it and reports its rule. Until
+	/// then the path is in neither `nodes` nor `ignored`.
+	#[test]
+	fn a_held_duplicate_the_rules_hide_stays_held_and_is_not_reported_as_ignored() {
+		let root = Uuid::new_v4();
+		let build = remote_dir("build", root);
+		let twin = cacheable_file(build.uuid, "out.log");
+		let second = RemoteItem {
+			uuid: Uuid::new_v4(),
+			..twin.clone()
+		};
+		let dirs = [build];
+		let files = [twin, second];
+
+		let mut view = place_remote_items(root, &dirs, &files, &[]);
+		assert_eq!(
+			view.held_paths
+				.iter()
+				.map(String::as_str)
+				.collect::<Vec<_>>(),
+			vec!["build/out.log"]
+		);
+		assert!(!view.nodes.contains_key("build/out.log"));
+
+		view.filter(Some(ViewFilter {
+			rules: &root_rules("build/"),
+			baseline: &HashMap::new(),
+		}));
+		assert_eq!(
+			view.held_paths
+				.iter()
+				.map(String::as_str)
+				.collect::<Vec<_>>(),
+			vec!["build/out.log"],
+			"a held path stays held whatever the rules say"
+		);
+		assert_eq!(
+			view.ignored.keys().collect::<Vec<_>>(),
+			vec!["build"],
+			"the held path itself was never a node, so no rule reports it"
+		);
+	}
+
 	#[test]
 	fn build_remote_view_excludes_the_quarantine_dir_name() {
 		let root = Uuid::new_v4();
