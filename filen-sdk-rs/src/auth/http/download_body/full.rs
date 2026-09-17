@@ -270,6 +270,9 @@ mod tests {
 			Err(RetryError::Retry(e)) => {
 				panic!("a mid-body read timeout must be NoRetry (fail-fast), but was Retry: {e}")
 			}
+			Err(RetryError::RetryAfterBackoff(e)) => {
+				panic!("a mid-body read timeout is not a pre-send connect failure: {e}")
+			}
 			Ok(_) => panic!("the body read must not complete while the server stalls mid-body"),
 		}
 	}
@@ -300,6 +303,9 @@ mod tests {
 			DownloadBodyFuture::new(async move { Ok::<_, RetryError<crate::Error>>(response) });
 		match fut.await {
 			Err(RetryError::Retry(_)) => {}
+			Err(RetryError::RetryAfterBackoff(e)) => {
+				panic!("a body-read failure is not a pre-send connect failure: {e}")
+			}
 			Err(RetryError::NoRetry(e)) => {
 				panic!("a connection lost mid-body must be Retry, but was NoRetry: {e}")
 			}

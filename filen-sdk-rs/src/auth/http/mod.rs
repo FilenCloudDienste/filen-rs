@@ -616,6 +616,12 @@ async fn execute_request(
 		.await
 		.and_then(|resp| resp.error_for_status())
 		.map_err(|e| {
+			// Classified before `is_attempt_retryable`, which would otherwise reject it as a
+			// request-kind error: this one provably never reached the wire, and it wants a pause
+			// rather than the instant re-attempt every other retryable class gets.
+			if is_pre_send_connect_failure(&e) {
+				return retry::RetryError::RetryAfterBackoff(Error::from(e));
+			}
 			let retryable = is_attempt_retryable(
 				e.status(),
 				e.is_builder(),
@@ -649,6 +655,10 @@ async fn execute_request(
 /// `dispatch_gone` already marked it a dead-pool failure. A connect or read timeout also surfaces as
 /// a `Kind::Request` error (`is_request`) but is not a dead-pool failure, so timeouts fall here and
 /// are NOT retried — fail fast rather than spend another full timeout on a stalled host.
+///
+/// A connect failure that is *not* a timeout never reaches this function at all:
+/// [`execute_request`] classifies it as [`retry::RetryError::RetryAfterBackoff`] first. See
+/// [`is_pre_send_connect_failure`].
 fn is_attempt_retryable(
 	status: Option<reqwest::StatusCode>,
 	is_builder: bool,
@@ -712,6 +722,26 @@ fn is_dispatch_gone(err: &reqwest::Error) -> bool {
 /// `Error::is_incomplete_message()`, so — like [`is_dispatch_gone`] — we match the stable `Display`.
 fn is_incomplete_message(err: &reqwest::Error) -> bool {
 	error_chain_mentions(err, &["connection closed before message completed"])
+}
+
+/// True for a connect failure that is not a timeout: the name did not resolve, or the TCP connect
+/// was refused outright. Both fail *before* a single byte of the request reaches the wire, so a
+/// retry is safe for the same reason [`is_dispatch_gone`] is — and, unlike the connect/read
+/// timeouts this classifier deliberately fails fast on, there is no spent timeout to burn twice: a
+/// broken resolver answers in a millisecond. On the 2026-09-17 nightly a macOS runner's resolver
+/// went away for ~17ms and three tests panicked on `EAI_NONAME`, each having failed in 1-4ms.
+///
+/// Excluding `is_timeout` is what keeps a stalled host failing fast; a connect *timeout* reports
+/// both, and stays on the old path. `reqwest::Error::is_connect` exists only off wasm, where the
+/// fetch backend exposes no connect phase and the class is therefore empty.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn is_pre_send_connect_failure(err: &reqwest::Error) -> bool {
+	err.is_connect() && !err.is_timeout()
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn is_pre_send_connect_failure(_err: &reqwest::Error) -> bool {
+	false
 }
 
 #[cfg(test)]
@@ -1327,6 +1357,11 @@ mod client_timeout_tests {
 			"a read timeout should be a request-kind error"
 		);
 		assert!(
+			!super::is_pre_send_connect_failure(&err),
+			"a timeout must not be absorbed by the pre-send connect class — that class exists for \
+			 failures that cost nothing, and a stalled host must keep failing fast"
+		);
+		assert!(
 			!super::is_attempt_retryable(
 				err.status(),
 				err.is_builder(),
@@ -1411,10 +1446,55 @@ mod client_timeout_tests {
 
 		match err {
 			super::retry::RetryError::Retry(_) => {}
+			super::retry::RetryError::RetryAfterBackoff(e) => panic!(
+				"IncompleteMessage is a response-read failure, not a pre-send connect failure, so \
+				 it must retry immediately rather than pay a backoff: {e}"
+			),
 			super::retry::RetryError::NoRetry(e) => panic!(
 				"IncompleteMessage (stale-pool connection close) must be classified retryable, \
 				 but was NoRetry: {e}"
 			),
+		}
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod pre_send_connect_tests {
+	use tokio::net::TcpListener;
+
+	use super::{ClientConfig, is_attempt_retryable, is_pre_send_connect_failure, retry};
+
+	/// A connect that fails before any byte is sent must reach the retry layer as the backoff
+	/// class. Modelled by a refused connect rather than the failed DNS lookup that motivated the
+	/// class (2026-09-17 nightly, three tests panicked on `EAI_NONAME`): both produce a
+	/// connect-kind error with no timeout, but only this one is deterministic offline — a test
+	/// that depends on a name failing to resolve depends on whatever resolver CI happens to have.
+	#[tokio::test]
+	async fn refused_connect_is_classified_as_pre_send_connect() {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		// Free the port again: nothing is listening, so the connect is refused immediately.
+		drop(listener);
+
+		let client = ClientConfig::default().build_reqwest_client().unwrap();
+		let err = client
+			.get(format!("http://{addr}/"))
+			.send()
+			.await
+			.expect_err("a connect to a closed port must fail");
+
+		assert!(err.is_connect(), "expected a connect error, got {err:?}");
+		assert!(!err.is_timeout(), "it is refused, not stalled");
+		assert!(is_pre_send_connect_failure(&err));
+		assert!(
+			!is_attempt_retryable(err.status(), err.is_builder(), err.is_request(), false),
+			"the general classifier still refuses it — which is exactly why this class exists"
+		);
+
+		match super::execute_request(client.get(format!("http://{addr}/"))).await {
+			Err(retry::RetryError::RetryAfterBackoff(_)) => {}
+			Err(other) => panic!("must classify as RetryAfterBackoff, got {other:?}"),
+			Ok(_) => panic!("a connect to a closed port must not succeed"),
 		}
 	}
 }

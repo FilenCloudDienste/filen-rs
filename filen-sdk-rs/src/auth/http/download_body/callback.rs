@@ -403,7 +403,7 @@ mod tests {
 			max_body_len,
 		);
 		block_on(fut).map_err(|e| match e {
-			RetryError::Retry(e) | RetryError::NoRetry(e) => e,
+			RetryError::Retry(e) | RetryError::RetryAfterBackoff(e) | RetryError::NoRetry(e) => e,
 		})
 	}
 
@@ -473,6 +473,9 @@ mod tests {
 		);
 		match fut.await {
 			Err(RetryError::Retry(_)) => {}
+			Err(RetryError::RetryAfterBackoff(e)) => {
+				panic!("a body-read failure is not a pre-send connect failure: {e}")
+			}
 			Err(RetryError::NoRetry(e)) => {
 				panic!("a connection lost mid-body must be Retry, but was NoRetry: {e}")
 			}
