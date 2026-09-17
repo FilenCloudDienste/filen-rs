@@ -8,7 +8,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
 	mem,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{Arc, MutexGuard, PoisonError},
 	time::{Duration, Instant},
 };
 
@@ -1014,11 +1014,75 @@ fn fold_trash(
 	true
 }
 
-/// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus the
-/// per-pair baseline store.
+/// One open connection to the baseline DB, shared with the blocking threads its whole-tree work
+/// runs on.
+///
+/// A `std` mutex rather than tokio's, because the two kinds of work this store does want opposite
+/// things. The writes a pass makes per action are single statements — 13 µs under this store's
+/// pragmas — so a thread hop costs more than the wait it saves, and they take this lock on the
+/// caller's thread ([`locked`]). The reads and writes whose cost scales with the tree do not run
+/// on a runtime thread at all ([`off_store`]). A `std` guard cannot be held across an `await`, so
+/// the compiler is what keeps a long hold from ever landing on a runtime thread.
+pub(super) type SharedStore = Arc<std::sync::Mutex<BaselineStore>>;
+
+/// Take a store for work that stays on the caller's thread: a point read, a single-row write.
+///
+/// A poisoned mutex is recovered rather than propagated. What poisons it is a panic inside
+/// rusqlite, which leaves no half-applied transaction behind — every write here is one statement
+/// or one explicit transaction — so the connection is still good, and refusing every later pass
+/// because one read panicked would be the larger failure.
+pub(super) fn locked(store: &SharedStore) -> MutexGuard<'_, BaselineStore> {
+	store.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Run `work` against `store` on a blocking thread, for everything whose cost scales with the
+/// tree: the baseline read, the untrack delete, a subtree move, the conflict read, the failure
+/// read.
+///
+/// [`block_in_place`](tokio::task::block_in_place) would be shorter and is not an option: it
+/// panics on a `current_thread` runtime, and only [`watch`](SyncEngine::watch) documents a
+/// multi-threaded one.
+pub(super) async fn off_store<T, F>(store: &SharedStore, work: F) -> Result<T, Error>
+where
+	F: FnOnce(&BaselineStore) -> T + Send + 'static,
+	T: Send + 'static,
+{
+	let store = Arc::clone(store);
+	tokio::task::spawn_blocking(move || work(&locked(&store)))
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("a baseline store task panicked: {e}"),
+			)
+		})
+}
+
+/// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus one
+/// baseline connection per pair.
 pub struct SyncEngine {
 	pub(super) client: Arc<Client>,
-	pub(super) store: Mutex<BaselineStore>,
+	/// Where the baseline DB lives, so a pair can be given its own connection to it on first use.
+	db_path: PathBuf,
+	/// The connection the ENGINE-WIDE rows go through: the pair registry, the device-wide user
+	/// ignore patterns, and the pending-write journal read back at open. A single pair's journal
+	/// rows are written through that pair's own connection instead, because they commit in the
+	/// same transaction as the baseline rows they describe.
+	///
+	/// Every statement it runs is a point read or a single-row write, so waiting for it is never
+	/// waiting for a pass.
+	control: SharedStore,
+	/// One connection per pair, opened on that pair's first use and dropped with the pair. A pass's
+	/// whole-tree work holds its own pair's lock and no other, which is what keeps a control verb
+	/// on one pair from waiting out a pass on another.
+	stores: Mutex<HashMap<PairId, SharedStore>>,
+	/// Serializes the registry read-then-act sequences that used to ride on the single store
+	/// mutex, and which mean "this pair's registration is not changing under me":
+	/// [`pass_gate`](SyncEngine::pass_gate) and [`watchable_pair`](SyncEngine::watchable_pair)
+	/// against [`remove_pair`](SyncEngine::remove_pair), and the persisted paused flag against
+	/// both. Held for the whole of each such sequence and across no network call, so a pass start
+	/// waits at most for another verb's registry work.
+	registry: Mutex<()>,
 	/// Remote writes this engine made that the cache may not reflect yet (see [`PendingWrites`]).
 	pub(super) pending: PendingWrites,
 	/// Uuids the cache has announced, shared with the per-pair sync-root callbacks — the evidence
@@ -1596,11 +1660,14 @@ impl SyncEngine {
 	/// Open the engine, creating the baseline DB at `db_path` if needed. The `client`'s cache must
 	/// be configured (it supplies the remote view).
 	pub async fn open(client: Arc<Client>, db_path: PathBuf) -> Result<Self, Error> {
-		let store = tokio::task::spawn_blocking(move || BaselineStore::open(&db_path))
-			.await
-			.map_err(|e| {
-				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
-			})??;
+		let store = {
+			let db_path = db_path.clone();
+			tokio::task::spawn_blocking(move || BaselineStore::open(&db_path))
+				.await
+				.map_err(|e| {
+					Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
+				})??
+		};
 		// A pair paused by an earlier session stays paused: read the flags before the store moves
 		// into the engine, so no pass can run against an empty map in the meantime. The pass that
 		// session had in flight died with it, so every pair comes back on the DEFAULT pause options
@@ -1618,7 +1685,10 @@ impl SyncEngine {
 			.collect();
 		let engine = Self {
 			client,
-			store: Mutex::new(store),
+			db_path,
+			control: Arc::new(std::sync::Mutex::new(store)),
+			stores: Mutex::new(HashMap::new()),
+			registry: Mutex::new(()),
 			pending: PendingWrites::default(),
 			observed: Arc::new(Observations::default()),
 			roots: Mutex::new(HashMap::new()),
@@ -1639,12 +1709,11 @@ impl SyncEngine {
 		// An engine that went down inside the cache-lag window left the writes it had made in the
 		// journal; folding them is what stops this one from making them a second time.
 		let now = Utc::now().timestamp_millis();
-		let rows = engine
-			.store
-			.lock()
-			.await
-			.load_pending(now, grace_millis())
-			.map_err(|e| db_error(e, "loading the pending-write journal"))?;
+		let rows = off_store(&engine.control, move |store| {
+			store.load_pending(now, grace_millis())
+		})
+		.await?
+		.map_err(|e| db_error(e, "loading the pending-write journal"))?;
 		if !rows.is_empty() {
 			tracing::debug!(
 				"sync engine: restoring {} unacknowledged write(s)",
@@ -1854,12 +1923,18 @@ impl SyncEngine {
 		let _registering = self.registrations.lock().await;
 		self.check_roots_free(&local_root, &local, remote_root)
 			.await?;
-		let (pair, stored_mode) = self
-			.store
-			.lock()
-			.await
-			.create_pair(&local, remote_root, mode)
-			.map_err(|e| db_error(e, "registering a sync pair"))?;
+		let (pair, stored_mode) = {
+			// The registry lock for the INSERT alone, never for the overlap check above: that check
+			// asks the server for two ancestries, and a pass taking its gate must not wait for the
+			// network. Add-versus-add is what `registrations` above covers.
+			let _registry = self.registry.lock().await;
+			// Off the runtime thread for the reason the paused flag is (see `set_control`).
+			off_store(&self.control, move |store| {
+				store.create_pair(&local, remote_root, mode)
+			})
+			.await?
+			.map_err(|e| db_error(e, "registering a sync pair"))?
+		};
 		if stored_mode != mode {
 			return Err(Error::custom(
 				ErrorKind::InvalidState,
@@ -1953,18 +2028,23 @@ impl SyncEngine {
 				)
 			}
 		};
-		let changed = self
-			.store
-			.lock()
-			.await
-			.set_mode(pair, mode, &adopted)
-			.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
+		let adopted_rows = adopted.len();
+		let store = self.pair_store(pair).await?;
+		// On the PAIR's connection, because the mode and the rows it adopts commit in one
+		// transaction and those rows are the pair's own; under the registry lock, because the mode
+		// lives in the registry row a removal deletes. Off the runtime thread: an adoption re-seeds
+		// one row per path the source no longer has, which at a backup-to-two-way switch is the
+		// whole tree.
+		let changed = {
+			let _registry = self.registry.lock().await;
+			off_store(&store, move |store| store.set_mode(pair, mode, &adopted)).await?
+		}
+		.map_err(|e| db_error(e, "reconfiguring a sync pair"))?;
 		if changed == 0 {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		tracing::debug!(
-			"sync pair {pair}: mode changed to {mode:?} from the next pass ({backlog:?}, {} destination item(s) adopted)",
-			adopted.len()
+			"sync pair {pair}: mode changed to {mode:?} from the next pass ({backlog:?}, {adopted_rows} destination item(s) adopted)"
 		);
 		Ok(())
 	}
@@ -2007,24 +2087,27 @@ impl SyncEngine {
 		if gate.retired() {
 			return Err(being_removed(pair));
 		}
-		let (record, mut held) = {
-			let store = self.store.lock().await;
-			let record = store
-				.pair(pair)
-				.map_err(|e| db_error(e, "loading the sync pair"))?
-				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
-			let held = store
-				.entry(pair, rel_path)
-				.map_err(|e| db_error(e, "loading the held conflict"))?
-				.filter(|entry| entry.state.is_conflict())
-				.ok_or_else(|| {
-					Error::custom(
-						ErrorKind::InvalidState,
-						format!("no conflict is being held at {rel_path:?} for this pair"),
-					)
-				})?;
-			(record, held)
-		};
+		let store = self.pair_store(pair).await?;
+		let record = locked(&self.control)
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+		// One row by primary key — but the lock it needs is the one a directory move's subtree
+		// re-key holds on a blocking thread for as long as that subtree takes, and the reading
+		// lock is released before a pass applies, so the two do meet. Off the runtime thread, so
+		// resolving a conflict while the same pair applies a large move waits without stalling a
+		// runtime worker.
+		let wanted = rel_path.to_string();
+		let mut held = off_store(&store, move |store| store.entry(pair, &wanted))
+			.await?
+			.map_err(|e| db_error(e, "loading the held conflict"))?
+			.filter(|entry| entry.state.is_conflict())
+			.ok_or_else(|| {
+				Error::custom(
+					ErrorKind::InvalidState,
+					format!("no conflict is being held at {rel_path:?} for this pair"),
+				)
+			})?;
 
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
@@ -2034,7 +2117,6 @@ impl SyncEngine {
 				.await;
 		}
 
-		let store = self.store.lock().await;
 		let mut winner = resolution;
 		if winner == ConflictResolution::KeepBoth {
 			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
@@ -2063,12 +2145,15 @@ impl SyncEngine {
 			held.local_kind = None;
 		}
 
-		match resolution_entry(rel_path, &held, winner) {
+		let resolved = resolution_entry(rel_path, &held, winner);
+		let resolving = rel_path.to_string();
+		off_store(&store, move |store| match resolved {
 			Some(entry) => store.upsert_entry(pair, &entry),
 			// The winner's side had nothing at this path: drop the row entirely, so the other
 			// side reads as a fresh create (or as already-gone) rather than as a second conflict.
-			None => store.delete_entry(pair, rel_path),
-		}
+			None => store.delete_entry(pair, &resolving),
+		})
+		.await?
 		.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
@@ -2155,10 +2240,10 @@ impl SyncEngine {
 		}
 		// Either way the row has said all it has to say: dropping it lets the next pass reconcile
 		// the path from what the two sides now actually hold.
-		self.store
-			.lock()
-			.await
-			.delete_entry(pair, rel_path)
+		let store = self.pair_store(pair).await?;
+		let resolving = rel_path.to_string();
+		off_store(&store, move |store| store.delete_entry(pair, &resolving))
+			.await?
 			.map_err(|e| db_error(e, "resolving a conflict"))
 	}
 
@@ -2313,16 +2398,18 @@ impl SyncEngine {
 			}
 		}
 		if !retired.is_empty() {
-			// The store lock FIRST, and the in-memory retirement under it: a cancel dropping this
-			// read between the two halves — the next candidate's lookup is a whole network call wide
-			// — would leave the DB holding a record memory has already retired, and the next open
-			// would fold this engine's write back over the version the server just said replaced it.
-			let store = self.store.lock().await;
+			let pair_store = self.pair_store(pair).await?;
+			// The in-memory retirement and the DELETE that records it under ONE hold of the pair's
+			// store, with no await between them: a cancel dropping this read in between — the next
+			// candidate's lookup is a whole network call wide — would leave the DB holding a record
+			// memory has already retired, and the next open would fold this engine's write back
+			// over the version the server just said replaced it.
+			let store = locked(&pair_store);
 			for record in &retired {
 				self.pending.retire(*record);
 			}
 			store
-				.delete_pending(&retired)
+				.delete_pending(pair, &retired)
 				.map_err(|e| db_error(e, "retiring a superseded write"))?;
 		}
 		Ok(())
@@ -2334,27 +2421,28 @@ impl SyncEngine {
 	/// there is no foreign version to date a push against, so nothing here talks to the server.
 	/// A pass does this itself; this is for the stretches where none runs.
 	async fn sweep_confirmations(&self, pair: PairId) -> Result<(), Error> {
-		let mut baseline: HashMap<String, BaselineEntry> = {
-			let store = self.store.lock().await;
-			store
-				.entries(pair)
+		let store = self.pair_store(pair).await?;
+		let mut baseline: HashMap<String, BaselineEntry> =
+			off_store(&store, move |store| store.entries(pair))
+				.await?
 				.map_err(|e| db_error(e, "loading the baseline"))?
 				.into_iter()
 				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect()
-		};
+				.collect();
 		let advanced = self.confirm_pushes(&mut baseline, &HashMap::new()).await;
 		if advanced.is_empty() {
 			return Ok(());
 		}
-		{
-			let store = self.store.lock().await;
+		// The rows come back out of the closure: the push records they retire are named by them.
+		let advanced = off_store(&store, move |store| {
 			for entry in &advanced {
 				store
 					.upsert_entry(pair, entry)
 					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
 			}
-		}
+			Ok::<_, Error>(advanced)
+		})
+		.await??;
 		self.forget_settled_pushes(&advanced);
 		Ok(())
 	}
@@ -2422,28 +2510,38 @@ impl SyncEngine {
 	/// Run the read-only half: load the baseline, scan (at `depth`), enumerate the remote, build the
 	/// view.
 	async fn prepare(&self, pair: PairId, depth: ScanDepth) -> Result<Prepared, Error> {
-		let (record, baseline_entries, failures, user_ignore, last_ignored) = {
-			let store = self.store.lock().await;
-			let record = store
+		let (record, user_ignore) = {
+			// The registry row and the device-wide patterns: two point reads on the control
+			// connection, which no pass ever holds for longer than one statement.
+			let control = locked(&self.control);
+			let record = control
 				.pair(pair)
 				.map_err(|e| db_error(e, "loading the sync pair"))?
 				.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
+			let user_ignore = control
+				.user_ignore()
+				.map_err(|e| db_error(e, "loading the user ignore patterns"))?;
+			(record, user_ignore)
+		};
+		let store = self.pair_store(pair).await?;
+		let now = Utc::now().timestamp_millis();
+		// The pair's three whole-tree reads in ONE hop off the runtime thread. The baseline is a
+		// row per tracked item and is the widest read of the pass; the other two ride along rather
+		// than paying for a hop each.
+		let (baseline_entries, failures, last_ignored) = off_store(&store, move |store| {
 			let entries = store
 				.entries(pair)
 				.map_err(|e| db_error(e, "loading the baseline"))?;
-			let now = Utc::now().timestamp_millis();
 			let mut failures = store
 				.failures(pair)
 				.map_err(|e| db_error(e, "loading the per-path failure counts"))?;
 			failures.retain(|_, failure| streak_blocks(failure, now));
-			let user_ignore = store
-				.user_ignore()
-				.map_err(|e| db_error(e, "loading the user ignore patterns"))?;
 			let last_ignored = store
 				.ignored_roots(pair)
 				.map_err(|e| db_error(e, "loading the recorded ignored paths"))?;
-			(record, entries, failures, user_ignore, last_ignored)
-		};
+			Ok::<_, Error>((entries, failures, last_ignored))
+		})
+		.await??;
 
 		let mut baseline_map: HashMap<String, BaselineEntry> = baseline_entries
 			.into_iter()
@@ -2536,17 +2634,18 @@ impl SyncEngine {
 		let remote_emptied = remote_emptied(&view.nodes, &baseline);
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
 		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
-		// pure in-memory operation — under a lock taken BEFORE it, because waiting for that lock is
-		// the one await between the two halves and this read runs under the pass's cancel: dropped
-		// there, the retirement would stand in memory and not in the DB.
+		// pure in-memory operation, and the two halves — the in-memory retirement and the DELETE
+		// that records it — run under ONE hold of the pair's store with no await between them. This
+		// read runs under the pass's cancel, and a cancel dropped between the halves would leave
+		// the retirement standing in memory and not in the DB.
 		let mut holds = {
-			let store = self.store.lock().await;
+			let journal = locked(&store);
 			let before = self.pending.uuids();
 			let holds = self.pending.settle(pair, &observed, &view.nodes);
 			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
 			if !retired.is_empty() {
-				store
-					.delete_pending(&retired)
+				journal
+					.delete_pending(pair, &retired)
 					.map_err(|e| db_error(e, "retiring pending writes"))?;
 			}
 			holds
@@ -2656,12 +2755,16 @@ impl SyncEngine {
 	/// TRUSTED at all, and stay in force under every setting including
 	/// [`DeleteGuard::unlimited`].
 	pub async fn set_delete_guard(&self, pair: PairId, guard: DeleteGuard) -> Result<(), Error> {
-		let changed = self
-			.store
-			.lock()
-			.await
-			.set_delete_guard(pair, guard)
-			.map_err(|e| db_error(e, "setting the delete guard"))?;
+		// The threshold lives in the registry row, so it takes the registry lock for the same
+		// reason the paused flag does: a removal must not land between the write and the answer.
+		let _registry = self.registry.lock().await;
+		// Off the runtime thread for the reason the paused flag is (see `set_control`): a write
+		// waits out another connection's transaction inside SQLite, not on a lock here.
+		let changed = off_store(&self.control, move |store| {
+			store.set_delete_guard(pair, guard)
+		})
+		.await?
+		.map_err(|e| db_error(e, "setting the delete guard"))?;
 		if changed == 0 {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
@@ -2689,10 +2792,10 @@ impl SyncEngine {
 				format!("refusing the user ignore patterns: {e}"),
 			)
 		})?;
-		self.store
-			.lock()
-			.await
-			.set_user_ignore(patterns)
+		// Off the runtime thread for the reason the paused flag is (see `set_control`).
+		let stored = patterns.to_owned();
+		off_store(&self.control, move |store| store.set_user_ignore(&stored))
+			.await?
 			.map_err(|e| db_error(e, "storing the user ignore patterns"))?;
 		// Only once the write has committed: a loop this wakes reads the patterns back out of the
 		// DB, so a wake-up sent any earlier could run a pass on the old ones. `send_modify` rather
@@ -2710,18 +2813,14 @@ impl SyncEngine {
 
 	/// The stored user ignore patterns, `""` when none were set.
 	pub async fn user_ignore(&self) -> Result<String, Error> {
-		self.store
-			.lock()
-			.await
+		locked(&self.control)
 			.user_ignore()
 			.map_err(|e| db_error(e, "loading the user ignore patterns"))
 	}
 
 	/// Every sync pair this engine has registered, in registration order.
 	pub async fn list_pairs(&self) -> Result<Vec<PairRecord>, Error> {
-		self.store
-			.lock()
-			.await
+		locked(&self.control)
 			.list_pairs()
 			.map_err(|e| db_error(e, "listing sync pairs"))
 	}
@@ -2763,17 +2862,22 @@ impl SyncEngine {
 		// The pair's journal rows go with it (`ON DELETE CASCADE`); drop the in-memory copies too,
 		// so nothing of the removed pair is left to be consulted or re-persisted.
 		self.pending.forget_pair(pair);
-		let store = self.store.lock().await;
-		// Under the store lock, which is also the lock a watch reads the pair and subscribes under
-		// (see `watchable_pair`): a watch setting up right now either registered before this and
-		// gets tripped here, or reads the deleted row afterwards and is refused. Before the delete,
-		// so a loop sitting between two passes learns about the removal at once rather than starting
-		// one more against the rows this is about to take away.
+		let pair_store = self.pair_store(pair).await?;
+		let _registry = self.registry.lock().await;
+		// Under the registry lock, which is also the lock a watch reads the pair and subscribes
+		// under (see `watchable_pair`): a watch setting up right now either registered before this
+		// and gets tripped here, or reads the deleted row afterwards and is refused. Before the
+		// delete, so a loop sitting between two passes learns about the removal at once rather than
+		// starting one more against the rows this is about to take away.
 		if let Some(signal) = self.removals.lock().await.remove(&pair) {
 			let _ = signal.send(true);
 		}
-		store
-			.delete_pair(pair)
+		// On the pair's OWN connection, and off the runtime thread: the registry row is one row,
+		// but the cascade under it takes every baseline, journal and failure row the pair ever had.
+		// On the control connection that cascade would be the one long hold on the lock every other
+		// pair's control verbs go through.
+		off_store(&pair_store, move |store| store.delete_pair(pair))
+			.await?
 			.map_err(|e| db_error(e, "removing a sync pair"))?;
 		// Under the same lock as the delete, and as `set_control`'s own write: a pause that landed
 		// in between would leave the map holding an id whose row is gone. The channel itself is
@@ -2782,6 +2886,9 @@ impl SyncEngine {
 		self.paused.lock().await.remove(&pair);
 		self.reading.lock().await.remove(&pair);
 		self.remote_rule_bodies.lock().await.remove(&pair);
+		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
+		// file handle closes as soon as the cascade above lets this function's own handle go.
+		self.stores.lock().await.remove(&pair);
 		Ok(())
 	}
 
@@ -2791,13 +2898,13 @@ impl SyncEngine {
 	/// the pass's own gate going away, which is what tells the two apart — a pass that has ended
 	/// from one that has merely been told to.
 	///
-	/// Holds NO other lock meanwhile: the pass it waits for takes the store lock on its way out, to
-	/// record what it did and what failed.
+	/// Holds NO other lock meanwhile: the pass it waits for takes its pair's store lock on its way
+	/// out, to record what it did and what failed.
 	async fn cancel_pass_in_flight(&self, pair: PairId) {
 		// Only a pass that has ASKED for its gate is reachable — and waited for — here, which a pass
 		// does before it reads either side, so scanning and planning are covered as well as
 		// applying. A pass that asks for its gate AFTER this is stopped by `pass_gate` refusing it,
-		// under the same store lock this removal deletes the pair row under.
+		// under the same registry lock this removal deletes the pair row under.
 		let control = self.control_channel(pair).await;
 		// `Retired`, not `Cancelled`: the cancel has to keep the last word for the whole wait. A
 		// pause landing in it would otherwise re-park the pass — on a state nothing left in the
@@ -2938,14 +3045,14 @@ impl SyncEngine {
 	/// The checkpoint a pass of `pair` parks on, cloned per pass (see the pause module). Taken at the
 	/// TOP of a pass, before either side is read, so a cancel covers the whole of it.
 	///
-	/// Taken under the store lock, and REFUSED for a pair the registry no longer knows: a pass that
-	/// asks for its gate after [`remove_pair`](Self::remove_pair) has finished learns here that its
-	/// pair is gone — before it reads or applies anything. Under the same lock as the delete, so the
-	/// two cannot interleave: either the gate is in the map before the removal reads it, and the
+	/// Taken under the registry lock, and REFUSED for a pair the registry no longer knows: a pass
+	/// that asks for its gate after [`remove_pair`](Self::remove_pair) has finished learns here that
+	/// its pair is gone — before it reads or applies anything. Under the same lock as the delete, so
+	/// the two cannot interleave: either the gate is in the map before the removal reads it, and the
 	/// removal cancels it and waits for it, or the row is already gone and there is no pass to gate.
 	async fn pass_gate(&self, pair: PairId) -> Result<PassGate, Error> {
-		let store = self.store.lock().await;
-		if store
+		let _registry = self.registry.lock().await;
+		if locked(&self.control)
 			.pair(pair)
 			.map_err(|e| db_error(e, "loading the sync pair"))?
 			.is_none()
@@ -2953,6 +3060,48 @@ impl SyncEngine {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
 		Ok(PassGate::new(self.control_channel(pair).await))
+	}
+
+	/// `pair`'s own baseline connection, opened if this is the first time anyone asked.
+	///
+	/// Every connection is to the same file, so which one a statement runs on decides only who
+	/// waits for it, never what it can see. A pair's whole-tree work therefore holds a lock nothing
+	/// outside that pair takes.
+	/// A pair the registry no longer knows gets NO connection. [`remove_pair`](Self::remove_pair)
+	/// drops the pair's entry from the map last of all, so a verb that read the registry before the
+	/// removal and asked for the store after it would otherwise open a fresh connection under a
+	/// dead id — one nothing ever removes, because the pair whose removal would have is already
+	/// gone. Checked under the registry lock, which is the lock the removal deletes the row under,
+	/// so the two cannot interleave; every caller is therefore covered rather than each verb having
+	/// to remember to check first.
+	async fn pair_store(&self, pair: PairId) -> Result<SharedStore, Error> {
+		{
+			let _registry = self.registry.lock().await;
+			if locked(&self.control)
+				.pair(pair)
+				.map_err(|e| db_error(e, "loading the sync pair"))?
+				.is_none()
+			{
+				return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+			}
+		}
+		let mut stores = self.stores.lock().await;
+		if let Some(store) = stores.get(&pair) {
+			return Ok(Arc::clone(store));
+		}
+		// Opened under the map's lock, so two first uses of one pair cannot end up with a
+		// connection each — which would read and write the same rows correctly, but would put the
+		// pair's own statements behind SQLite's write lock instead of behind its mutex, where the
+		// waiting is visible and bounded.
+		let path = self.db_path.clone();
+		let store = tokio::task::spawn_blocking(move || BaselineStore::open(&path))
+			.await
+			.map_err(|e| {
+				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
+			})??;
+		let store = Arc::new(std::sync::Mutex::new(store));
+		stores.insert(pair, Arc::clone(&store));
+		Ok(store)
 	}
 
 	/// `pair`'s reading lock (see the `reading` field), created if this is the first time anyone asked.
@@ -2975,22 +3124,21 @@ impl SyncEngine {
 		&self,
 		pair: PairId,
 	) -> Result<tokio::sync::watch::Sender<PassControl>, Error> {
-		let store = self.store.lock().await;
-		if store
+		let _registry = self.registry.lock().await;
+		if locked(&self.control)
 			.pair(pair)
 			.map_err(|e| db_error(e, "loading the sync pair"))?
 			.is_none()
 		{
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		drop(store);
 		Ok(self.control_channel(pair).await)
 	}
 
 	/// The pair a watch is about to start on, together with the signal that ends its loop.
 	///
-	/// Both come out of ONE store-lock acquisition, and [`remove_pair`](Self::remove_pair) trips the
-	/// signal under that same lock, so a removal racing a watch's setup has exactly two outcomes:
+	/// Both come out of ONE hold of the registry lock, and [`remove_pair`](Self::remove_pair) trips
+	/// the signal under that same lock, so a removal racing a watch's setup has two outcomes only:
 	/// either it deleted the row first and this reports an unknown pair, or it finds the
 	/// subscription already registered and trips it. Subscribing afterwards — the setup does real
 	/// work, a cache registration and a filesystem watcher, in between — would let a removal fall
@@ -2999,8 +3147,8 @@ impl SyncEngine {
 		&self,
 		pair: PairId,
 	) -> Result<(PairRecord, tokio::sync::watch::Receiver<bool>), Error> {
-		let store = self.store.lock().await;
-		let record = store
+		let _registry = self.registry.lock().await;
+		let record = locked(&self.control)
 			.pair(pair)
 			.map_err(|e| db_error(e, "loading pair"))?
 			.ok_or_else(|| Error::custom(ErrorKind::InvalidState, "unknown sync pair"))?;
@@ -3011,7 +3159,6 @@ impl SyncEngine {
 			));
 		}
 		let removed = self.removal_signal(pair).await;
-		drop(store);
 		Ok((record, removed))
 	}
 
@@ -3027,9 +3174,9 @@ impl SyncEngine {
 	}
 
 	async fn set_control(&self, pair: PairId, control: PassControl) -> Result<(), Error> {
-		// Both writes happen under the store lock, so a concurrent `remove_pair` cannot land between
-		// them and leave the map holding a pair it has already deleted.
-		let store = self.store.lock().await;
+		// Both writes happen under the registry lock, so a concurrent `remove_pair` cannot land
+		// between them and leave the map holding a pair it has already deleted.
+		let _registry = self.registry.lock().await;
 		// A pair whose removal is under way is REFUSED before anything is written: persisting a flag
 		// on a row that is deleted moments later describes nothing, and the caller would otherwise
 		// be told a pause took that in truth changed neither the pass nor the pair. Read WITHOUT
@@ -3046,8 +3193,17 @@ impl SyncEngine {
 		}
 		// The persisted flag FIRST: an in-memory pause the DB never learned about would silently
 		// un-pause on the next open, which is the one direction that loses data protection.
-		let known = store
-			.set_paused(pair, control.is_paused())
+		//
+		// Off the runtime thread, because this is a WRITE: WAL lets a reader through during one,
+		// but a second WRITER waits for the first to commit, and it waits inside `sqlite3_step`'s
+		// busy handler rather than on any lock this code holds. So a pause made while another pair
+		// commits its first sync sleeps out that transaction — half a second at 100k rows, twelve
+		// at a million — and would do it on whichever runtime thread called in. The registry lock
+		// is held across the hop, which is what still keeps a removal from landing between this
+		// write and the answer below.
+		let paused = control.is_paused();
+		let known = off_store(&self.control, move |store| store.set_paused(pair, paused))
+			.await?
 			.map_err(|e| db_error(e, "persisting a sync pair's paused flag"))?;
 		if !known {
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
@@ -3114,32 +3270,60 @@ impl SyncEngine {
 			.iter()
 			.map(|(path, error)| (path.as_str(), error.as_str()))
 			.collect();
-		let store = self.store.lock().await;
-		let mut problems = Vec::new();
-		let now = Utc::now().timestamp_millis();
-		for (path, error) in &failed {
-			if let Err(e) = store.record_failure(pair, path, error, now) {
-				problems.push(format!("{path}: recording the failure count failed: {e}"));
-			}
-		}
 		// A pass cut short by a cancel cannot tell which of its actions ran, and an action that
 		// never ran proves nothing about the path: clearing its streak would hand a permanently
 		// broken path a fresh set of retries every time someone pauses. Only the failures count. A
 		// pass that found a side full held back transfers the same way.
-		if report.interrupted == 0 && report.halted.is_none() {
-			let cleared: Vec<&str> = attempted
-				.iter()
-				.map(String::as_str)
-				.filter(|path| !failed.contains_key(path))
-				.collect();
-			if let Err(e) = store.clear_failures(pair, &cleared) {
-				problems.push(format!(
-					"clearing the failure count of {} applied path(s) failed: {e}",
-					cleared.len()
-				));
+		let cleared: Option<Vec<String>> = (report.interrupted == 0 && report.halted.is_none())
+			.then(|| {
+				attempted
+					.iter()
+					.filter(|path| !failed.contains_key(path.as_str()))
+					.cloned()
+					.collect()
+			});
+		let recorded: Vec<(String, String)> = failed
+			.iter()
+			.map(|(path, error)| ((*path).to_string(), (*error).to_string()))
+			.collect();
+		let store = match self.pair_store(pair).await {
+			Ok(store) => store,
+			Err(error) => {
+				report
+					.errors
+					.push(format!("recording this pass's path outcomes: {error}"));
+				return;
 			}
+		};
+		let now = Utc::now().timestamp_millis();
+		// One statement per attempted path, so this scales with the plan rather than with the
+		// tree — but a first sync's plan IS the tree. Off the runtime thread, with the paths owned
+		// by the closure that writes them.
+		let outcome = off_store(&store, move |store| {
+			let mut problems = Vec::new();
+			for (path, error) in &recorded {
+				if let Err(e) = store.record_failure(pair, path, error, now) {
+					problems.push(format!("{path}: recording the failure count failed: {e}"));
+				}
+			}
+			if let Some(cleared) = cleared {
+				let cleared: Vec<&str> = cleared.iter().map(String::as_str).collect();
+				if let Err(e) = store.clear_failures(pair, &cleared) {
+					problems.push(format!(
+						"clearing the failure count of {} applied path(s) failed: {e}",
+						cleared.len()
+					));
+				}
+			}
+			problems
+		})
+		.await;
+		match outcome {
+			Ok(problems) => report.errors.extend(problems),
+			Err(error) => report
+				.errors
+				.push(format!("recording this pass's path outcomes: {error}")),
 		}
-		report.errors.extend(problems);
 	}
 
 	/// Plan `rel_path` again on the next pass, whatever its failure history: it clears the
@@ -3151,16 +3335,20 @@ impl SyncEngine {
 	/// can retry a whole reported list without checking each entry first. Errors only if the pair
 	/// is unknown.
 	pub async fn retry_path(&self, pair: PairId, rel_path: &str) -> Result<(), Error> {
-		let store = self.store.lock().await;
-		if store
+		if locked(&self.control)
 			.pair(pair)
 			.map_err(|e| db_error(e, "loading the sync pair"))?
 			.is_none()
 		{
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		store
-			.clear_failure(pair, rel_path)
+		let store = self.pair_store(pair).await?;
+		let rel_path = rel_path.to_string();
+		// One row, so the statement itself is microseconds — but the pair it names may be in the
+		// middle of a pass, whose baseline read holds this lock for as long as the tree takes. Off
+		// the runtime thread, so a caller retrying a path cannot block one.
+		off_store(&store, move |store| store.clear_failure(pair, &rel_path))
+			.await?
 			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
@@ -3173,16 +3361,19 @@ impl SyncEngine {
 	/// wait for a pass in flight. A conflict that pass has yet to record appears once it has.
 	/// Errors only if the pair is unknown.
 	pub async fn list_conflicts(&self, pair: PairId) -> Result<Vec<PlannedConflict>, Error> {
-		let store = self.store.lock().await;
-		if store
+		if locked(&self.control)
 			.pair(pair)
 			.map_err(|e| db_error(e, "loading the sync pair"))?
 			.is_none()
 		{
 			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
 		}
-		Ok(store
-			.conflicts(pair)
+		let store = self.pair_store(pair).await?;
+		// The `state` column carries no index, so this seeks nothing: it is a read of the pair's
+		// rows however few it hands back, and it deliberately does not wait for the pass in
+		// flight. Off the runtime thread on both counts.
+		Ok(off_store(&store, move |store| store.conflicts(pair))
+			.await?
 			.map_err(|e| db_error(e, "loading the held conflicts"))?
 			.into_iter()
 			.map(|entry| PlannedConflict {
@@ -3259,20 +3450,38 @@ impl SyncEngine {
 		if roots.is_empty() && record == prep.last_ignored {
 			return;
 		}
-		let store = self.store.lock().await;
-		if !roots.is_empty()
-			&& let Err(error) = store.delete_subtrees(pair, &roots)
-		{
-			report
+		let store = match self.pair_store(pair).await {
+			Ok(store) => store,
+			Err(error) => {
+				report
+					.errors
+					.push(format!("untracking ignored paths: {error}"));
+				return;
+			}
+		};
+		let record = (record != prep.last_ignored).then_some(record);
+		// Two seeking statements per ignored root, and the roots are whatever the rules matched:
+		// off the runtime thread, with both sets owned by the closure that writes them.
+		let outcome = off_store(&store, move |store| {
+			let mut problems = Vec::new();
+			if !roots.is_empty()
+				&& let Err(error) = store.delete_subtrees(pair, &roots)
+			{
+				problems.push(format!("untracking ignored paths: {error}"));
+			}
+			if let Some(record) = record
+				&& let Err(error) = store.set_ignored_roots(pair, &record)
+			{
+				problems.push(format!("recording the ignored paths: {error}"));
+			}
+			problems
+		})
+		.await;
+		match outcome {
+			Ok(problems) => report.errors.extend(problems),
+			Err(error) => report
 				.errors
-				.push(format!("untracking ignored paths: {error}"));
-		}
-		if record != prep.last_ignored
-			&& let Err(error) = store.set_ignored_roots(pair, &record)
-		{
-			report
-				.errors
-				.push(format!("recording the ignored paths: {error}"));
+				.push(format!("untracking ignored paths: {error}")),
 		}
 	}
 
@@ -3325,22 +3534,29 @@ impl SyncEngine {
 			});
 		};
 		let mut prep = prepared?;
+		let store = self.pair_store(pair).await?;
 		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
 		// read, so a dry run inside the confirmation window just leaves it for the next pass — and
 		// leaves the evidence with it, which is why the records are retired HERE and not in the
 		// reading step.
-		if !prep.confirmed.is_empty() {
+		let confirmed = mem::take(&mut prep.confirmed);
+		let confirmed = if confirmed.is_empty() {
+			confirmed
+		} else {
 			// One transaction for the lot: pass two of a first sync confirms every row it pushed,
-			// and a transaction per row is a transaction per item of the tree.
-			let changes: Vec<BaselineChange<'_>> =
-				prep.confirmed.iter().map(BaselineChange::Upsert).collect();
-			self.store
-				.lock()
-				.await
-				.apply_changes(pair, &changes)
-				.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
-		}
-		self.forget_settled_pushes(&prep.confirmed);
+			// and a transaction per row is a transaction per item of the tree — which is also why
+			// it does not run on a runtime thread. The rows come back out of the closure, since
+			// the push records they retire are named by them.
+			let (written, confirmed) = off_store(&store, move |store| {
+				let changes: Vec<BaselineChange<'_>> =
+					confirmed.iter().map(BaselineChange::Upsert).collect();
+				(store.apply_changes(pair, &changes), confirmed)
+			})
+			.await?;
+			written.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
+			confirmed
+		};
+		self.forget_settled_pushes(&confirmed);
 		let mut report = SyncReport::default();
 
 		tracing::debug!(
@@ -3424,7 +3640,7 @@ impl SyncEngine {
 			// planning until `resolve_conflict` picks a winner, instead of being re-surfaced,
 			// unresolvable, on every pass.
 			if let Err(error) = apply::record_conflict(
-				&self.store,
+				&store,
 				pair,
 				rel_path,
 				prep.local_scan.nodes.get(rel_path),
@@ -3432,7 +3648,10 @@ impl SyncEngine {
 			)
 			.await
 			{
+				// The conflict is not held, so the next pass surfaces it again — but a pass whose
+				// record did not land is a failed pass, not a healthy one that mentions a problem.
 				report.errors.push(format!("{rel_path}: {error}"));
+				report.store_failed |= apply::record_not_written(&error);
 			}
 			observer(SyncEvent::Conflict {
 				rel_path: rel_path.clone(),
@@ -3479,7 +3698,7 @@ impl SyncEngine {
 			local_root: &local_root,
 			pair,
 			mode: prep.record.mode,
-			store: &self.store,
+			store: &store,
 			local: &prep.local_scan.nodes,
 			baseline: &prep.baseline,
 			remote: &prep.remote_view.nodes,
@@ -3932,7 +4151,10 @@ fn being_removed(pair: PairId) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashSet;
+	use std::{
+		collections::HashSet,
+		sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+	};
 
 	use base64::{Engine as _, prelude::BASE64_STANDARD};
 	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
@@ -6426,10 +6648,7 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let (pair, _) = engine
-			.store
-			.lock()
-			.await
+		let (pair, _) = locked(&engine.control)
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		engine.pause_pair(pair).await.unwrap();
@@ -6467,18 +6686,15 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let (pair, _) = engine
-			.store
-			.lock()
-			.await
+		let (pair, _) = locked(&engine.control)
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 
-		// The store lock fixes the interleaving, as in the pause/removal race above: both verbs
+		// The registry lock fixes the interleaving, as in the pause/removal race above: both verbs
 		// queue on it while this guard is held, and tokio hands the mutex out in request order, so
 		// the watch's setup runs first and the removal second — the order in which the removal has
 		// nothing registered to trip yet.
-		let guard = engine.store.lock().await;
+		let guard = engine.registry.lock().await;
 		let watching = tokio::spawn({
 			let engine = Arc::clone(&engine);
 			async move { engine.watchable_pair(pair).await }
@@ -6519,18 +6735,15 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let (pair, _) = engine
-			.store
-			.lock()
-			.await
+		let (pair, _) = locked(&engine.control)
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 
-		// The store lock fixes the interleaving: both verbs queue on it while this guard is held,
+		// The registry lock fixes the interleaving: both verbs queue on it while this guard is held,
 		// and tokio's mutex hands it out in request order, so the pause runs first and the removal
 		// second — the order in which a pause that persisted its flag can land after the row it
 		// describes is already gone.
-		let guard = engine.store.lock().await;
+		let guard = engine.registry.lock().await;
 		let pausing = tokio::spawn({
 			let engine = Arc::clone(&engine);
 			async move { engine.pause_pair(pair).await }
@@ -6544,7 +6757,7 @@ mod tests {
 		drop(guard);
 
 		// The pause itself may legitimately succeed or be refused, depending on which verb the
-		// store lock served first; what must hold either way is that nothing stays paused.
+		// registry lock served first; what must hold either way is that nothing stays paused.
 		let _ = pausing.await.unwrap();
 		removing.await.unwrap().unwrap();
 		assert!(
@@ -6557,16 +6770,124 @@ mod tests {
 		std::fs::remove_file(&path).ok();
 	}
 
+	/// One pair's store, held for as long as that pair's whole-tree read holds it. Answers once the
+	/// lock is actually in hand, and says so for as long as it keeps it, so a test can prove what
+	/// ran DURING the hold rather than timing anything.
+	fn store_held_for(
+		store: SharedStore,
+		how_long: Duration,
+	) -> (
+		tokio::sync::oneshot::Receiver<()>,
+		Arc<AtomicBool>,
+		tokio::task::JoinHandle<()>,
+	) {
+		let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+		let holding = Arc::new(AtomicBool::new(true));
+		let task = {
+			let holding = Arc::clone(&holding);
+			tokio::task::spawn_blocking(move || {
+				let _guard = locked(&store);
+				let _ = acquired_tx.send(());
+				std::thread::sleep(how_long);
+				holding.store(false, Ordering::SeqCst);
+			})
+		};
+		(acquired_rx, holding, task)
+	}
+
+	/// A pass on one pair must not hold up the control verbs of another. The pass's widest step is
+	/// its baseline read, which holds that pair's store for as long as the tree takes; before the
+	/// split there was one store for the whole engine, so `list_pairs`, `pause_pair` and
+	/// `resolve_conflict` on ANY pair queued behind it.
+	///
+	/// Asserted as "they finished while the hold was still in force" rather than as a deadline: the
+	/// property is that they never wait for that lock at all, and that reads the same on a busy
+	/// machine as on an idle one.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	async fn a_pairs_store_hold_does_not_delay_another_pairs_control_verbs() {
+		let (engine, pair_a, path) = engine_with_pair("store_split_control").await;
+		let (pair_b, _) = locked(&engine.control)
+			.create_pair("/root-b", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let store_b = engine.pair_store(pair_b).await.unwrap();
+		locked(&store_b)
+			.upsert_entry(pair_b, &converged_conflict(Uuid::new_v4()))
+			.unwrap();
+
+		let store_a = engine.pair_store(pair_a).await.unwrap();
+		let (acquired, holding, wedge) = store_held_for(store_a, Duration::from_millis(750));
+		acquired.await.unwrap();
+
+		let started = std::time::Instant::now();
+		engine.list_pairs().await.unwrap();
+		engine.pause_pair(pair_b).await.unwrap();
+		engine
+			.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
+			.await
+			.unwrap();
+		let elapsed = started.elapsed();
+		assert!(
+			holding.load(Ordering::SeqCst),
+			"pair B's control verbs waited out pair A's store hold: they took {elapsed:?}, by \
+			 which time the hold had already been released"
+		);
+
+		wedge.await.unwrap();
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// And when a verb DOES have to wait for its own pair's store, it waits on a blocking thread:
+	/// the runtime's worker keeps running other tasks meanwhile. One worker thread here, so a task
+	/// that still makes progress proves the wait is not on it — which is what stops a pass's
+	/// whole-tree SQLite work from stalling a runtime this engine shares with everything else.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+	async fn a_pairs_whole_tree_store_work_waits_off_the_runtime_thread() {
+		let (engine, pair, path) = engine_with_pair("store_off_runtime").await;
+		let store = engine.pair_store(pair).await.unwrap();
+		let (acquired, holding, wedge) = store_held_for(store, Duration::from_millis(300));
+		acquired.await.unwrap();
+
+		let ticks = Arc::new(AtomicUsize::new(0));
+		let ticking = {
+			let ticks = Arc::clone(&ticks);
+			tokio::spawn(async move {
+				loop {
+					tokio::time::sleep(Duration::from_millis(10)).await;
+					ticks.fetch_add(1, Ordering::SeqCst);
+				}
+			})
+		};
+
+		// This reads the pair's conflicts, so it wants the very lock the wedge is holding.
+		let started = std::time::Instant::now();
+		engine.list_conflicts(pair).await.unwrap();
+		let waited = started.elapsed();
+		ticking.abort();
+
+		assert!(
+			!holding.load(Ordering::SeqCst) && waited >= Duration::from_millis(150),
+			"the read did not actually contend for the store it shares with the hold: {waited:?}"
+		);
+		assert!(
+			ticks.load(Ordering::SeqCst) >= 5,
+			"the runtime's only worker made almost no progress ({} ticks) while a store read \
+			 waited: the wait is on the runtime thread, not on a blocking one",
+			ticks.load(Ordering::SeqCst)
+		);
+
+		wedge.await.unwrap();
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
 	/// A fresh engine on a throwaway baseline DB, with one pair registered.
 	async fn engine_with_pair(tag: &str) -> (SyncEngine, PairId, PathBuf) {
 		let path = std::env::temp_dir().join(format!("filen_sync_{tag}_{}.db", Uuid::new_v4()));
 		let engine = SyncEngine::open(offline_client(), path.clone())
 			.await
 			.unwrap();
-		let (pair, _) = engine
-			.store
-			.lock()
-			.await
+		let (pair, _) = locked(&engine.control)
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		(engine, pair, path)
@@ -6623,7 +6944,8 @@ mod tests {
 		assert!(engine.list_conflicts(pair).await.unwrap().is_empty());
 		let hash = Blake3Hash::from([7; 32]);
 		{
-			let store = engine.store.lock().await;
+			let pair_store = engine.pair_store(pair).await.unwrap();
+			let store = locked(&pair_store);
 			store
 				.upsert_entry(pair, &synced_file("synced.txt", Uuid::new_v4(), hash, 1))
 				.unwrap();
@@ -6852,7 +7174,7 @@ mod tests {
 		let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
 		let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 		// The pass in flight, with its bookkeeping held up the way a sibling transfer contending for
-		// the store lock holds it up: that is the window the removal spends waiting for it.
+		// its pair's store lock holds it up: that is the window the removal spends waiting for it.
 		let pass = tokio::spawn(async move {
 			let mut done = Vec::new();
 			if gate.guard(std::future::pending::<()>()).await.is_some() {
@@ -7035,7 +7357,8 @@ mod tests {
 	async fn a_pass_that_could_not_take_the_drive_lock_leaves_every_failure_streak_alone() {
 		let (engine, pair, path) = engine_with_pair("lock_failure_streaks").await;
 		{
-			let store = engine.store.lock().await;
+			let pair_store = engine.pair_store(pair).await.unwrap();
+			let store = locked(&pair_store);
 			let now = Utc::now().timestamp_millis();
 			store
 				.record_failure(pair, "broken.txt", "boom", now)
@@ -7044,7 +7367,9 @@ mod tests {
 				.record_failure(pair, "broken.txt", "boom", now)
 				.unwrap();
 		}
-		let before = engine.store.lock().await.failures(pair).unwrap();
+		let before = locked(&engine.pair_store(pair).await.unwrap())
+			.failures(pair)
+			.unwrap();
 
 		let attempted = vec!["broken.txt".to_string(), "fine.txt".to_string()];
 		let mut report = SyncReport::default();
@@ -7060,7 +7385,9 @@ mod tests {
 			.await;
 
 		assert_eq!(
-			engine.store.lock().await.failures(pair).unwrap(),
+			locked(&engine.pair_store(pair).await.unwrap())
+				.failures(pair)
+				.unwrap(),
 			before,
 			"a pass that applied nothing touched a path's failure streak"
 		);
@@ -7202,7 +7529,10 @@ mod tests {
 			"a pass dropped in its read must report the pause and nothing else"
 		);
 		assert!(
-			engine.store.lock().await.entries(pair).unwrap().is_empty(),
+			locked(&engine.pair_store(pair).await.unwrap())
+				.entries(pair)
+				.unwrap()
+				.is_empty(),
 			"a pass that never had a plan wrote a baseline row"
 		);
 		assert!(
@@ -7221,10 +7551,7 @@ mod tests {
 	async fn a_resolution_waits_for_the_pass_reading_the_pair() {
 		let (engine, pair, path) = engine_with_pair("resolve_during_prepare").await;
 		let engine = Arc::new(engine);
-		engine
-			.store
-			.lock()
-			.await
+		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
 			.unwrap();
 		let slot = engine.client.cache_slot.lock().await;
@@ -7244,10 +7571,7 @@ mod tests {
 			"the resolution landed while a pass was still reading the pair it would re-record"
 		);
 		assert!(
-			engine
-				.store
-				.lock()
-				.await
+			locked(&engine.pair_store(pair).await.unwrap())
 				.entry(pair, "a.txt")
 				.unwrap()
 				.is_some_and(|row| row.state == BaselineState::Conflicted),
@@ -7259,10 +7583,7 @@ mod tests {
 		assert!(pass.await.unwrap().is_err());
 		resolving.await.unwrap().unwrap();
 		assert_eq!(
-			engine
-				.store
-				.lock()
-				.await
+			locked(&engine.pair_store(pair).await.unwrap())
 				.entry(pair, "a.txt")
 				.unwrap()
 				.map(|row| row.state),
@@ -7288,10 +7609,7 @@ mod tests {
 			)
 			.await
 			.unwrap();
-		engine
-			.store
-			.lock()
-			.await
+		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
 			.unwrap();
 		engine
@@ -7338,10 +7656,7 @@ mod tests {
 		let engine = SyncEngine::open(offline_client(), path.clone())
 			.await
 			.unwrap();
-		let (pair, _) = engine
-			.store
-			.lock()
-			.await
+		let (pair, _) = locked(&engine.control)
 			.create_pair(root.to_str().unwrap(), Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 
@@ -7351,10 +7666,7 @@ mod tests {
 			remote_hash: Some(hash(4)),
 			..converged_conflict(Uuid::new_v4())
 		};
-		engine
-			.store
-			.lock()
-			.await
+		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &diverged)
 			.unwrap();
 		engine
@@ -7368,7 +7680,9 @@ mod tests {
 		);
 		assert!(!root.join("a.txt").exists());
 		assert_eq!(
-			engine.store.lock().await.entry(pair, "a.txt").unwrap(),
+			locked(&engine.pair_store(pair).await.unwrap())
+				.entry(pair, "a.txt")
+				.unwrap(),
 			None,
 			"with the local side moved away, the remote copy must read as a fresh create"
 		);
@@ -7379,10 +7693,7 @@ mod tests {
 			rel_path: "b.txt".to_string(),
 			..converged_conflict(Uuid::new_v4())
 		};
-		engine
-			.store
-			.lock()
-			.await
+		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &converged)
 			.unwrap();
 		engine

@@ -128,6 +128,20 @@ const DELETE_AT_PATH: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_pa
 const DELETE_UNDER_PATH: &str =
 	"DELETE FROM baseline WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
 
+/// The two row statements a pass runs most: one per applied action, and one per row of the tree in
+/// the single transactions a first sync's confirmation and a subtree re-key make.
+///
+/// Named so they can go through [`prepare_cached`](rusqlite::Connection::prepare_cached), which
+/// keys its cache on the statement text. `execute` parses and plans afresh on every call, and a
+/// 15-parameter upsert is not free to plan: a first sync pays that once per item of the tree, and
+/// the one transaction over a million rows pays it a million times.
+const UPSERT_ENTRY: &str = "INSERT OR REPLACE INTO baseline
+	 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
+	  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
+	  remote_stable_uuid, agreed_hash)
+	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
+const DELETE_ENTRY: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
+
 /// The two statements a directory move runs, in this order: the row AT `?2`, then every row under
 /// it, each swapping that prefix for `?3` over the same bytewise ranges the deletes above use.
 ///
@@ -452,6 +466,114 @@ fn create_schema(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
 	tx.commit()
 }
 
+/// Whether `error` is SQLite saying another connection holds the single write lock.
+fn is_write_lock_contention(error: &rusqlite::Error) -> bool {
+	match error {
+		rusqlite::Error::SqliteFailure(failure, _) => matches!(
+			failure.code,
+			rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+		),
+		_ => false,
+	}
+}
+
+/// Run a write that RECORDS an act already done, and make its failure loud.
+///
+/// ONE attempt, on purpose. The busy timeout [`init`](BaselineStore::init) sets makes SQLite itself
+/// sleep and retry inside `sqlite3_step` for a full 30 s before it answers `SQLITE_BUSY`, and the
+/// longest write any ONE connection to this file makes is a first sync's whole-tree transaction —
+/// 12.6 s for a million rows. A second attempt would wait out another 30 s to learn what the first
+/// one already established: the connection holding the write lock is not making progress. The
+/// unbounded retry this replaces turned that into a pass that hung for as long as the wedged writer
+/// lived, without a word.
+///
+/// So the record is lost and the act it describes stands without it. Loudly, not silently: the
+/// error goes to the caller, this logs it with the pair, the path and which record failed, and a
+/// pass carries it in [`SyncReport::errors`](super::SyncReport::errors) with `store_failed` set, so
+/// a watch loop counts the pass as failed and backs off instead of running the next one into the
+/// same wedged DB. What the next pass does about the lost record, per site:
+///
+/// - [`upsert_entry`](BaselineStore::upsert_entry) — the row after a LOCAL write (a download, a
+///   local directory create, an adopt, a conflict hold). The row still describes the state before
+///   it, so both sides read as changed and, holding the same bytes, the reconcile plans
+///   `AdoptBaseline` and records it then (`plan::reconcile_two_way`'s converged arm): no transfer,
+///   one pass late. A conflict hold that did not land is re-planned from the two sides and held
+///   again — with ONE exception: the row that holds the version an upload of ours buried
+///   (`apply::note_overwrote`). The remote head is then our own upload and the buried version
+///   survives only in the file's version history, so no view can re-derive that row; the conflict
+///   is reported and the pass fails, but the path is not HELD, and unless the caller acts on that
+///   report the next pass finds both sides holding our bytes and adopts them. A remote edit
+///   landing in between makes the two sides disagree, which is a conflict surfaced to the caller,
+///   not an overwrite.
+/// - [`delete_entry`](BaselineStore::delete_entry) — the row after a deletion (a local quarantine,
+///   an adopt that drops the row). The row survives with both sides absent at its path, which is
+///   what `apply::adopt_outcome` drops it for, under the absence gate every deletion already
+///   passes. Neither side is touched meanwhile: both are already gone.
+/// - [`record_pending`](BaselineStore::record_pending) — the journal row and the baseline rows a
+///   REMOTE write produced (an upload, a remote directory create, a trash, a remote file move).
+///   The remote write stands and nothing in this process knows it, since the in-memory journal is
+///   published only once this has committed. The next pass therefore reconciles against whatever
+///   the cache shows and can REDO the act: a second upload of the same bytes, which the server
+///   takes as another version of the same file rather than a duplicate; a second `dir/create`,
+///   which the name-hash dedup answers with the existing directory's uuid; a second trash of an
+///   item already trashed. Duplicated work, not lost content — and a foreign edit at the same path
+///   still reads as a divergence and is held.
+/// - the same call from `apply::commit_dir_move` — a directory move's journal row and subtree
+///   re-key. The directory has moved on the server with its rows still under the old path.
+///   `plan::next_dir_move` matches a baseline directory row by its remote uuid wherever the remote
+///   now lists it, so the next pass re-keys the subtree: the move is re-derived, not re-made. Where
+///   the cache has not caught up either, that pass re-issues the same move. Neither side reads the
+///   directory as deleted, because this write is one transaction — rows never end up at only one
+///   of the two paths.
+/// - [`delete_pending`](BaselineStore::delete_pending) — the journal retirement. The record memory
+///   has dropped stays in the DB, so THIS process is unaffected; the next OPEN restores it and
+///   folds our own write over the snapshot again, for what is left of the 180 s grace window
+///   `load_pending` measures by the wall clock. For a record retired because the cache caught up
+///   that fold is a no-op (`fold_create` sees the cache already showing our uuid); for one retired
+///   because the server said our write was superseded, it delays the pull of the superseding
+///   version by the rest of that window — the direction a delayed confirmation already takes.
+///
+/// A control verb's write is not wrapped at all: it records nothing that has happened, so it fails
+/// and its caller can try again.
+fn record_write<T>(
+	pair: PairId,
+	what: impl FnOnce() -> String,
+	write: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+	write().inspect_err(|error| {
+		let why = if is_write_lock_contention(error) {
+			"another connection has held SQLite's write lock for longer than the busy timeout"
+		} else {
+			"the write failed"
+		};
+		tracing::error!(
+			"baseline store[pair {pair}]: {} could NOT be written ({why}): {error} — the act it \
+			 records has already happened, so it now stands unrecorded and this pass reports a \
+			 failure",
+			what()
+		);
+	})
+}
+
+/// The changes a failed [`apply_changes`](BaselineStore::apply_changes) or
+/// [`record_pending`](BaselineStore::record_pending) did not write, for the log line that says so.
+/// Called on that failure only, so its allocations cost a pass nothing.
+fn describe_changes(changes: &[BaselineChange<'_>]) -> String {
+	let mut described: Vec<String> = changes
+		.iter()
+		.take(3)
+		.map(|change| match change {
+			BaselineChange::Upsert(entry) => format!("upsert {:?}", entry.rel_path),
+			BaselineChange::Delete(rel_path) => format!("delete {rel_path:?}"),
+			BaselineChange::MoveSubtree { from, to } => format!("move {from:?} -> {to:?}"),
+		})
+		.collect();
+	if changes.len() > 3 {
+		described.push(format!("and {} more", changes.len() - 3));
+	}
+	described.join(", ")
+}
+
 impl BaselineStore {
 	/// Open (creating if needed) the baseline DB at `path`.
 	pub(crate) fn open(path: &Path) -> Result<Self, crate::Error> {
@@ -463,6 +585,30 @@ impl BaselineStore {
 		Self::init(Connection::open_in_memory().map_err(open_error)?)
 	}
 
+	/// Take this connection's write lock and hold it until the returned transaction is dropped —
+	/// the shape another pair's whole-tree commit has, for the tests that pin what a contended write
+	/// does.
+	#[cfg(test)]
+	pub(super) fn hold_write_lock(
+		&self,
+		pair: PairId,
+		entry: &BaselineEntry,
+	) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+		let tx = self.conn.unchecked_transaction()?;
+		// The INSERT is what takes the write lock; `BEGIN DEFERRED` alone takes nothing.
+		self.upsert_entry_once(pair, entry)?;
+		Ok(tx)
+	}
+
+	/// Shorten this connection's busy timeout, so a test reaches the contended answer in
+	/// milliseconds instead of sitting out the 30 s a real open waits.
+	#[cfg(test)]
+	pub(super) fn busy_timeout_for_test(&self, timeout: std::time::Duration) {
+		self.conn
+			.busy_timeout(timeout)
+			.expect("setting a busy timeout on an open connection");
+	}
+
 	/// A fresh DB is created whole and stamped at [`SCHEMA_VERSION`]. An existing one is opened only
 	/// when it carries exactly that version: anything else — older or newer — is refused rather than
 	/// read, since there is no migration chain to bring it here and reading foreign rows under these
@@ -472,7 +618,16 @@ impl BaselineStore {
 		// safe to apply before this build knows whether the DB is even one it can read. The timeout
 		// covers the version read below too: it retries a transient `SQLITE_BUSY` rather than
 		// failing a pass the moment a second opener (another process, a backup tool) touches it.
-		conn.busy_timeout(std::time::Duration::from_millis(5_000))
+		//
+		// It has to outlast the longest write any ONE connection to this file makes, because the
+		// engine keeps several: one per pair plus a control connection. WAL lets a reader through
+		// during a write, but not a second writer, so a control write — persisting a paused flag,
+		// storing the user ignore patterns — waits out whatever a pair is committing. The longest
+		// of those is a first sync's single transaction over the whole tree, measured at 12.6 s for
+		// a million rows, so a timeout under that would turn a pause into a `SQLITE_BUSY` error
+		// instead of a slow pause. Waiting is the right direction for every one of these callers:
+		// the flag a pause fails to persist is the one that protects the pair on the next open.
+		conn.busy_timeout(std::time::Duration::from_millis(30_000))
 			.map_err(open_error)?;
 		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")
 			.map_err(open_error)?;
@@ -709,31 +864,39 @@ impl BaselineStore {
 	}
 
 	/// Insert or replace one baseline row.
+	///
+	/// Fails loudly rather than waiting when another connection holds the write lock: a pass writes
+	/// this row AFTER the transfer, rename or trash it records (see [`record_write`]).
 	pub(crate) fn upsert_entry(&self, pair: PairId, entry: &BaselineEntry) -> rusqlite::Result<()> {
-		self.conn.execute(
-			"INSERT OR REPLACE INTO baseline
-			 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
-			  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-			  remote_stable_uuid, agreed_hash)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-			params![
-				pair,
-				entry.rel_path,
-				entry.kind.as_i64(),
-				entry.remote_uuid,
-				entry.content_hash.as_ref().map(|h| h.as_ref().as_slice()),
-				entry.size.map(|s| s as i64),
-				entry.local_mtime,
-				entry.remote_modified,
-				entry.state.as_i64(),
-				entry.local_kind.map(NodeKind::as_i64),
-				entry.remote_kind.map(NodeKind::as_i64),
-				entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
-				entry.remote_size.map(|s| s as i64),
-				entry.remote_stable_uuid,
-				entry.agreed_hash.as_ref().map(|h| h.as_ref().as_slice()),
-			],
-		)?;
+		record_write(
+			pair,
+			|| format!("the baseline row for {:?}", entry.rel_path),
+			|| self.upsert_entry_once(pair, entry),
+		)
+	}
+
+	/// [`upsert_entry`](Self::upsert_entry) without the retry, for the callers already inside a
+	/// transaction of this connection's — which holds the write lock, so there is nothing left to
+	/// wait for and a retry of the statement alone would re-run it inside a transaction that has
+	/// already failed.
+	fn upsert_entry_once(&self, pair: PairId, entry: &BaselineEntry) -> rusqlite::Result<()> {
+		self.conn.prepare_cached(UPSERT_ENTRY)?.execute(params![
+			pair,
+			entry.rel_path,
+			entry.kind.as_i64(),
+			entry.remote_uuid,
+			entry.content_hash.as_ref().map(|h| h.as_ref().as_slice()),
+			entry.size.map(|s| s as i64),
+			entry.local_mtime,
+			entry.remote_modified,
+			entry.state.as_i64(),
+			entry.local_kind.map(NodeKind::as_i64),
+			entry.remote_kind.map(NodeKind::as_i64),
+			entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
+			entry.remote_size.map(|s| s as i64),
+			entry.remote_stable_uuid,
+			entry.agreed_hash.as_ref().map(|h| h.as_ref().as_slice()),
+		])?;
 		Ok(())
 	}
 
@@ -786,11 +949,22 @@ impl BaselineStore {
 			.collect()
 	}
 
+	/// Drop one baseline row. Fails loudly rather than waiting for another connection's write
+	/// transaction, for the same reason [`upsert_entry`](Self::upsert_entry) does.
 	pub(crate) fn delete_entry(&self, pair: PairId, rel_path: &str) -> rusqlite::Result<()> {
-		self.conn.execute(
-			"DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2",
-			params![pair, rel_path],
-		)?;
+		record_write(
+			pair,
+			|| format!("the deletion of the baseline row for {rel_path:?}"),
+			|| self.delete_entry_once(pair, rel_path),
+		)
+	}
+
+	/// [`delete_entry`](Self::delete_entry) without the retry, for a caller already inside one of
+	/// this connection's transactions.
+	fn delete_entry_once(&self, pair: PairId, rel_path: &str) -> rusqlite::Result<()> {
+		self.conn
+			.prepare_cached(DELETE_ENTRY)?
+			.execute(params![pair, rel_path])?;
 		Ok(())
 	}
 
@@ -817,7 +991,36 @@ impl BaselineStore {
 	/// The two have to land together: the journal row is what a reopened engine folds into its
 	/// remote view, and the baseline row is the written state it folds. A crash between them leaves
 	/// the next pass either re-doing the write or folding a row that describes nothing.
+	///
+	/// Fails loudly rather than waiting when another connection holds the write lock: the remote
+	/// write this journals has already happened (see [`record_write`]).
 	pub(crate) fn record_pending(
+		&self,
+		pair: PairId,
+		uuid: Uuid,
+		kind: &PendingKind,
+		recorded_at: i64,
+		changes: &[BaselineChange<'_>],
+	) -> rusqlite::Result<()> {
+		record_write(
+			pair,
+			|| {
+				let what = match kind {
+					PendingKind::Created { path, .. } => format!("create at {path:?}"),
+					PendingKind::Moved { from, to } => format!("move {from:?} -> {to:?}"),
+					PendingKind::Trashed => "trash".to_string(),
+				};
+				format!(
+					"the journal row for the {what} of {uuid}, and the baseline change(s) it commits \
+					 with ({})",
+					describe_changes(changes)
+				)
+			},
+			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes),
+		)
+	}
+
+	fn record_pending_once(
 		&self,
 		pair: PairId,
 		uuid: Uuid,
@@ -860,25 +1063,39 @@ impl BaselineStore {
 
 	/// Apply several baseline edits in ONE transaction — for a local write that re-keys a whole
 	/// subtree, where a crash part-way would leave rows under both spellings.
+	///
+	/// Fails loudly rather than waiting when another connection holds the write lock: the rename on
+	/// disk this re-keys has already happened (see [`record_write`]).
 	pub(crate) fn apply_changes(
 		&self,
 		pair: PairId,
 		changes: &[BaselineChange<'_>],
 	) -> rusqlite::Result<()> {
-		let tx = self.conn.unchecked_transaction()?;
-		self.write_changes(pair, changes)?;
-		tx.commit()
+		record_write(
+			pair,
+			|| format!("the baseline change(s) {}", describe_changes(changes)),
+			|| {
+				let tx = self.conn.unchecked_transaction()?;
+				self.write_changes(pair, changes)?;
+				tx.commit()
+			},
+		)
 	}
 
+	/// Runs inside a transaction the caller opened, so every statement here is the non-retrying
+	/// form: this connection already holds the write lock by the time the second one runs.
 	fn write_changes(&self, pair: PairId, changes: &[BaselineChange<'_>]) -> rusqlite::Result<()> {
 		for change in changes {
 			match change {
-				BaselineChange::Upsert(entry) => self.upsert_entry(pair, entry)?,
-				BaselineChange::Delete(rel_path) => self.delete_entry(pair, rel_path)?,
+				BaselineChange::Upsert(entry) => self.upsert_entry_once(pair, entry)?,
+				BaselineChange::Delete(rel_path) => self.delete_entry_once(pair, rel_path)?,
 				BaselineChange::MoveSubtree { from, to } => {
-					self.conn.execute(MOVE_AT_PATH, params![pair, from, to])?;
 					self.conn
-						.execute(MOVE_UNDER_PATH, params![pair, from, to])?;
+						.prepare_cached(MOVE_AT_PATH)?
+						.execute(params![pair, from, to])?;
+					self.conn
+						.prepare_cached(MOVE_UNDER_PATH)?
+						.execute(params![pair, from, to])?;
 				}
 			}
 		}
@@ -952,17 +1169,30 @@ impl BaselineStore {
 
 	/// Retire journal rows the in-memory journal has dropped (the cache caught up, or the grace
 	/// window ran out).
-	pub(crate) fn delete_pending(&self, uuids: &[Uuid]) -> rusqlite::Result<()> {
-		let tx = self.conn.unchecked_transaction()?;
-		{
-			let mut stmt = self
-				.conn
-				.prepare("DELETE FROM pending_writes WHERE uuid = ?1")?;
-			for uuid in uuids {
-				stmt.execute(params![uuid])?;
-			}
-		}
-		tx.commit()
+	///
+	/// Fails loudly rather than waiting when another connection holds the write lock: the caller has
+	/// already retired these records in memory, and a record left standing in the DB alone comes
+	/// back on the next open (see [`record_write`]).
+	///
+	/// `pair` is the pair whose connection this is, for that log line. The rows themselves are keyed
+	/// by uuid alone, and a pass retires whatever the cache has caught up to whichever pair wrote it.
+	pub(crate) fn delete_pending(&self, pair: PairId, uuids: &[Uuid]) -> rusqlite::Result<()> {
+		record_write(
+			pair,
+			|| format!("the retirement of {} journal row(s)", uuids.len()),
+			|| {
+				let tx = self.conn.unchecked_transaction()?;
+				{
+					let mut stmt = self
+						.conn
+						.prepare_cached("DELETE FROM pending_writes WHERE uuid = ?1")?;
+					for uuid in uuids {
+						stmt.execute(params![uuid])?;
+					}
+				}
+				tx.commit()
+			},
+		)
 	}
 
 	/// The journal a previous engine left behind, minus the rows no engine may act on any more —
@@ -1143,6 +1373,55 @@ mod tests {
 			.unwrap()
 	}
 
+	/// A write a pass makes AFTER the act it records must FAIL once another pair's connection has
+	/// held the write lock past the busy timeout, rather than waiting it out: a wedged writer must not
+	/// hang a pass. The act then stands unrecorded, which the log and the pass's report say — and
+	/// which every site recovers from on a later pass (see [`record_write`]).
+	#[test]
+	fn a_journal_write_under_a_held_write_lock_fails_instead_of_waiting() {
+		let path = temp_db_path("busy_journal");
+		let holder = BaselineStore::open(&path).unwrap();
+		let (pair, _) = holder
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+
+		let writer = BaselineStore::open(&path).unwrap();
+		// A real open waits 30 s, which no test can sit out; 50 ms reaches the same answer.
+		writer.busy_timeout_for_test(std::time::Duration::from_millis(50));
+		{
+			let _held = holder
+				.hold_write_lock(pair, &file_entry("a.txt", [1; 32], 3))
+				.unwrap();
+			let started = std::time::Instant::now();
+			let error = writer
+				.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+				.expect_err("the contended journal write must fail rather than wait for the lock");
+			assert!(
+				is_write_lock_contention(&error),
+				"the failure must be the write lock and not something else: {error}"
+			);
+			assert!(
+				started.elapsed() < std::time::Duration::from_secs(5),
+				"it waited {:?}: the bound is the busy timeout, not the holder's lifetime",
+				started.elapsed()
+			);
+			assert_eq!(pending_count(&writer), 0, "nothing was recorded");
+		}
+
+		// With the lock free the same write lands, so the failure above was the contention and not a
+		// connection this test broke.
+		writer
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.expect("the write must land once the lock is free");
+		assert_eq!(pending_count(&writer), 1);
+
+		drop(writer);
+		drop(holder);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+		}
+	}
+
 	/// Every open runs in WAL with `synchronous = NORMAL` and a busy timeout — the reopen too, which
 	/// takes the early-returning path through `init`. Two of the three are per-connection, so an
 	/// open that skipped them would quietly go back to an fsync per commit, which is what made the
@@ -1153,7 +1432,7 @@ mod tests {
 		let assert_pragmas = |store: &BaselineStore| {
 			assert_eq!(pragma::<String>(store, "journal_mode"), "wal");
 			assert_eq!(pragma::<i64>(store, "synchronous"), 1, "NORMAL is 1");
-			assert_eq!(pragma::<i64>(store, "busy_timeout"), 5_000);
+			assert_eq!(pragma::<i64>(store, "busy_timeout"), 30_000);
 		};
 		let entry = file_entry("a.txt", [1u8; 32], 3);
 		let pair = {
@@ -1498,7 +1777,7 @@ mod tests {
 				.unwrap();
 		}
 
-		store.delete_pending(&uuids[..3]).unwrap();
+		store.delete_pending(pair, &uuids[..3]).unwrap();
 		assert_eq!(pending_count(&store), 1);
 		assert_eq!(
 			store
@@ -2014,7 +2293,7 @@ mod tests {
 		);
 
 		// Retiring it is what the next pass does once the cache has caught up.
-		reopened.delete_pending(&[uuid]).unwrap();
+		reopened.delete_pending(pair, &[uuid]).unwrap();
 		assert!(
 			reopened
 				.load_pending(NOW + 1_000, GRACE)
