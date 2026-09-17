@@ -1,6 +1,8 @@
 //! The sync engine's read side of the cache: a consistent whole-subtree snapshot of one sync
-//! root, hydrated into the same [`CacheableDir`]/[`CacheableFile`] payloads the event dispatch and
-//! search expose, PLUS the contiguous-prefix watermark captured in the SAME read transaction.
+//! root in the projection its remote view reads ([`RemoteItem`]), PLUS the contiguous-prefix
+//! watermark captured in the SAME read transaction — and, for the handful of items a pass acts
+//! on, the full [`CacheableDir`]/[`CacheableFile`] payload read back by uuid
+//! ([`hydrate_by_uuids`], which shares the search engine's column contract).
 //!
 //! Pairing the snapshot with its watermark is the point: the sync engine subscribes to the root's
 //! event stream FIRST, then takes this snapshot, then discards buffered events whose
@@ -14,7 +16,8 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use filen_types::{crypto::Blake3Hash, fs::StableUuid};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::{
@@ -33,15 +36,14 @@ use crate::{
 			},
 		},
 	},
-	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
 };
 
 /// A consistent point-in-time view of one sync root's cached subtree: every descendant directory
 /// and file, plus the contiguous-prefix [`watermark`](Self::watermark) at the same instant.
 #[derive(Debug)]
 pub(crate) struct SubtreeSnapshot {
-	pub(crate) dirs: Vec<CacheableDir<'static>>,
-	pub(crate) files: Vec<CacheableFile<'static>>,
+	pub(crate) dirs: Vec<RemoteItem>,
+	pub(crate) files: Vec<RemoteItem>,
 	/// The cache's contiguous-prefix watermark (`last_drive_message_id`) at the snapshot instant.
 	/// `None` on a fresh cache that has applied nothing yet. Every buffered event whose
 	/// `drive_message_id <= watermark` is already reflected in `dirs`/`files`.
@@ -52,20 +54,92 @@ pub(crate) struct SubtreeSnapshot {
 	pub(crate) undecodable: Vec<UndecodableItem>,
 }
 
-/// Hydrate every descendant of `root` from `conn` into split dir/file vecs, reusing the search
-/// engine's [`row_to_result`] column contract. The anchor itself is never returned.
+/// One item of a sync root's cached subtree, in the columns the sync engine's remote view reads
+/// and no others (`plan::place_remote_items`). The full `CacheableFile`/`CacheableDir` payload of
+/// the handful of items a pass ACTS on is read back by uuid ([`hydrate_by_uuids`]); carrying it
+/// for the whole tree cost a file-key parse, a hash decode and four string allocations per row to
+/// answer a few dozen questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteItem {
+	pub(crate) uuid: Uuid,
+	pub(crate) parent: Uuid,
+	/// The leaf name as the cache holds it — NOT normalized; the view NFC-normalizes it.
+	pub(crate) name: String,
+	/// The server-minted whole-life id of a FILE; `None` for a directory, which has none.
+	pub(crate) stable_uuid: Option<StableUuid>,
+	/// BLAKE3 of the content (files); `None` for a directory and for an older file the server
+	/// stored without a hash.
+	pub(crate) hash: Option<Blake3Hash>,
+	/// The file's size; `0` for a directory.
+	pub(crate) size: u64,
+	/// A file's last-modified stamp, a directory's creation stamp, `0` where there is none.
+	pub(crate) modified_millis: i64,
+}
+
+/// One `ENUMERATE_SUBTREE` row → its [`RemoteItem`], plus whether it is a directory. Read BY
+/// INDEX, as the SQL says: this projection has exactly one reader, unlike the full payload, whose
+/// by-NAME column contract [`row_to_result`] shares with the search windows. An item of neither
+/// type is an error, exactly as it is there.
+fn slim_item(row: &Row<'_>) -> rusqlite::Result<(bool, RemoteItem)> {
+	let item_type: i64 = row.get(2)?;
+	let out_of_range = |column: usize, value: i64| {
+		rusqlite::Error::FromSqlConversionFailure(
+			column,
+			rusqlite::types::Type::Integer,
+			Box::new(rusqlite::types::FromSqlError::OutOfRange(value)),
+		)
+	};
+	// A file's whole-life id is NOT NULL in the schema, and the view tells a file from a
+	// directory by its presence: a null one here would be a file the engine reads as a directory.
+	let (is_dir, stable_uuid) = match item_type {
+		1 => (true, None),
+		2 => (false, Some(row.get(3)?)),
+		other => return Err(out_of_range(2, other)),
+	};
+	let hash = row
+		.get::<_, Option<String>>(4)?
+		.map(|hex_str| {
+			let mut bytes = [0u8; 32];
+			hex::decode_to_slice(hex_str, &mut bytes).map_err(|e| {
+				rusqlite::Error::FromSqlConversionFailure(
+					4,
+					rusqlite::types::Type::Text,
+					Box::new(e),
+				)
+			})?;
+			Ok::<_, rusqlite::Error>(Blake3Hash::from(bytes))
+		})
+		.transpose()?;
+	Ok((
+		is_dir,
+		RemoteItem {
+			uuid: row.get(0)?,
+			parent: row.get(1)?,
+			name: row.get(5)?,
+			stable_uuid,
+			hash,
+			size: row.get(6)?,
+			modified_millis: row.get(7)?,
+		},
+	))
+}
+
+/// Hydrate every descendant of `root` from `conn` into split dir/file vecs of the view's
+/// projection. The anchor itself is never returned.
 fn enumerate_subtree(
 	conn: &Connection,
 	root: Uuid,
-) -> rusqlite::Result<(Vec<CacheableDir<'static>>, Vec<CacheableFile<'static>>)> {
+) -> rusqlite::Result<(Vec<RemoteItem>, Vec<RemoteItem>)> {
 	let mut stmt = conn.prepare_cached(ENUMERATE_SUBTREE)?;
 	let mut dirs = Vec::new();
 	let mut files = Vec::new();
-	let rows = stmt.query_map(params![root], row_to_result)?;
+	let rows = stmt.query_map(params![root], slim_item)?;
 	for row in rows {
-		match row? {
-			SearchResult::Dir(dir) => dirs.push(dir),
-			SearchResult::File(file) => files.push(file),
+		let (is_dir, item) = row?;
+		if is_dir {
+			dirs.push(item);
+		} else {
+			files.push(item);
 		}
 	}
 	Ok((dirs, files))
@@ -255,7 +329,11 @@ mod tests {
 	};
 	use uuid::Uuid;
 
-	use crate::{cache::CacheState, crypto::file::FileKey};
+	use crate::{
+		cache::CacheState,
+		crypto::file::FileKey,
+		fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
+	};
 
 	use super::*;
 
@@ -386,8 +464,11 @@ mod tests {
 		);
 	}
 
+	/// The view's projection, hydrated from the same rows the full payload comes from: a file
+	/// carries its name, lineage, hash, size and modified stamp, a directory its name and created
+	/// stamp under the same field, with no lineage, no hash and no size.
 	#[test]
-	fn payloads_hydrate_faithfully() {
+	fn items_hydrate_in_the_view_projection() {
 		let f = fixture();
 		let snapshot = read_subtree_snapshot(&f.path, f.root).unwrap();
 		let got_file = snapshot
@@ -395,13 +476,35 @@ mod tests {
 			.iter()
 			.find(|file| file.uuid == f.a1.uuid)
 			.expect("a1 present");
-		assert_eq!(*got_file, f.a1, "full file payload round-trips");
+		assert_eq!(
+			*got_file,
+			RemoteItem {
+				uuid: f.a1.uuid,
+				parent: f.a.uuid,
+				name: "a1.txt".to_string(),
+				stable_uuid: Some(f.a1.stable_uuid),
+				hash: f.a1.hash,
+				size: f.a1.size,
+				modified_millis: f.a1.last_modified.timestamp_millis(),
+			}
+		);
 		let got_dir = snapshot
 			.dirs
 			.iter()
 			.find(|d| d.uuid == f.aa.uuid)
 			.expect("AA present");
-		assert_eq!(*got_dir, f.aa, "full dir payload round-trips");
+		assert_eq!(
+			*got_dir,
+			RemoteItem {
+				uuid: f.aa.uuid,
+				parent: f.a.uuid,
+				name: "AA".to_string(),
+				stable_uuid: None,
+				hash: None,
+				size: 0,
+				modified_millis: f.aa.created.unwrap().timestamp_millis(),
+			}
+		);
 	}
 
 	#[test]
