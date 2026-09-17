@@ -7,7 +7,6 @@
 //! to tell which side changed and surfaces a genuine both-sides-changed divergence as a conflict.
 
 use std::{
-	cell::RefCell,
 	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
 };
@@ -358,11 +357,20 @@ pub(crate) struct SkippedRemote {
 	/// which has no path at all, the bare name. An item under a skipped directory carries that
 	/// directory's path and reason.
 	pub(crate) rel_path: String,
+	/// Whether [`rel_path`](Self::rel_path) names a DIRECTORY — a fact about the path this record
+	/// reports, not about the item that owns the record, and the two differ. An undecodable item is
+	/// recorded at the directory that holds it, and an item under a skipped directory takes that
+	/// directory's path, so both are directory paths whatever the item itself is; only an item
+	/// recorded at its own would-be path carries its own kind.
+	///
+	/// [`RemoteView::filter`] asks the ignore rules about this path, and a rule written for
+	/// directories only (`build/`) answers differently depending on which it is asked about.
+	pub(crate) path_is_dir: bool,
 	pub(crate) reason: UnsyncableReason,
 }
 
-/// Build the remote view from a cache subtree snapshot rooted at `root`. Names are NFC-normalized
-/// so they key 1:1 against the local scan.
+/// Place every item of a cache subtree snapshot rooted at `root` at its path, BEFORE the ignore
+/// rules and the collision check. Names are NFC-normalized so they key 1:1 against the local scan.
 ///
 /// An item that cannot be placed — an unsafe name, a broken parent chain, or metadata the cache
 /// could not decode (`undecodable`, which may hold other roots' records too: only those whose
@@ -371,17 +379,17 @@ pub(crate) struct SkippedRemote {
 /// under that directory's path and reason: its own uuid is still what a synced item moved beneath
 /// the directory is found by (see [`unknown_remote_paths`]).
 ///
-/// With `rules`, an item they hide at or above its path is left out of `nodes` too, before the
-/// collision check, so ignored case-twins never refuse a pass, and its top-most ignored path is
-/// recorded in [`RemoteView::ignored`]. A skipped item under an ignored path is left out unrecorded:
-/// it is out of sync, not unsyncable. Without `rules` the view shows the remote as it is, which is
-/// what a pass finds the remote rule files in and reads an emptied remote from.
-pub(crate) fn build_remote_view(
+/// This is the view a pass reads the remote AS IT IS from: what the snapshot confirms, which remote
+/// rule files there are, which of this engine's own writes the cache has caught up to, and whether
+/// the remote came back emptied are facts about the remote whatever the rules hide. Those reads
+/// come first of necessity — the rules are not known until the local scan has read the
+/// `.filenignore` files on disk — and then [`RemoteView::filter`] hides what they hide IN PLACE,
+/// leaving the one map reconcile, the folds and apply act on.
+pub(crate) fn place_remote_items(
 	root: Uuid,
 	dirs: &[CacheableDir<'_>],
 	files: &[CacheableFile<'_>],
 	undecodable: &[UndecodableItem],
-	filter: Option<ViewFilter<'_>>,
 ) -> RemoteView {
 	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
 		.iter()
@@ -393,26 +401,16 @@ pub(crate) fn build_remote_view(
 		.map(|item| item.uuid)
 		.collect();
 
-	// Shared by the closures below, which each ask about one path at a time.
-	let memo = RefCell::new(HashMap::new());
-	let hidden = |rel_path: &str, is_dir: bool| {
-		filter.is_some_and(|filter| {
-			filter
-				.rules
-				.ignored_root(rel_path, is_dir, &mut memo.borrow_mut())
-				.is_some()
-		})
-	};
-
 	let mut skipped = Skipped::default();
 	for item in undecodable {
 		match resolve_parent(item.parent, root, &dir_index, &undecodable_dirs) {
-			// Its own name is unknown, so only the directory holding it can be ignored.
-			Ok(rel_path) if hidden(&rel_path, true) => {}
 			Ok(rel_path) => skipped.record(SkippedRemote {
 				remote_uuid: item.uuid,
 				stable_uuid: item.stable_uuid,
 				rel_path,
+				// The holding directory's path: an undecodable item's own name is what the cache
+				// could not read.
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			}),
 			Err(Unresolved::UnderSkipped(ancestor)) => {
@@ -422,28 +420,26 @@ pub(crate) fn build_remote_view(
 			Err(Unresolved::BrokenParent) => {}
 		}
 	}
-	// The path of an item named `name` under `parent`, or `None` with the reason recorded.
+	// The path of an item named `name` under `parent`, or `None` with the reason recorded. `is_dir`
+	// is the item's own kind, which is what the record's path means where the record is the item's
+	// own would-be path — taken from the caller rather than inferred from `stable_uuid`, which a
+	// file is merely expected to carry.
 	let mut place = |name: &str,
 	                 parent: Uuid,
 	                 remote_uuid: Uuid,
-	                 stable_uuid: Option<StableUuid>| {
+	                 stable_uuid: Option<StableUuid>,
+	                 is_dir: bool| {
 		let skip = match resolve_parent(parent, root, &dir_index, &undecodable_dirs) {
 			Ok(parent_path) if is_safe_name(name) => return Some(join_path(&parent_path, name)),
-			Ok(parent_path) => {
-				let rel_path = join_path(&parent_path, name);
-				// A directory has no whole-life id.
-				if hidden(&rel_path, stable_uuid.is_none()) {
-					return None;
-				}
-				SkippedRemote {
-					remote_uuid,
-					stable_uuid,
-					rel_path,
-					reason: UnsyncableReason::RemoteInvalidName {
-						name: name.to_string(),
-					},
-				}
-			}
+			Ok(parent_path) => SkippedRemote {
+				remote_uuid,
+				stable_uuid,
+				rel_path: join_path(&parent_path, name),
+				path_is_dir: is_dir,
+				reason: UnsyncableReason::RemoteInvalidName {
+					name: name.to_string(),
+				},
+			},
 			Err(Unresolved::UnderSkipped(ancestor)) => {
 				skipped.under(remote_uuid, stable_uuid, ancestor);
 				return None;
@@ -452,6 +448,7 @@ pub(crate) fn build_remote_view(
 				remote_uuid,
 				stable_uuid,
 				rel_path: name.to_string(),
+				path_is_dir: is_dir,
 				reason: UnsyncableReason::RemoteBrokenParent,
 			},
 		};
@@ -459,80 +456,32 @@ pub(crate) fn build_remote_view(
 		None
 	};
 
-	let capacity = dirs.len() + files.len();
-	let mut nodes: HashMap<String, RemoteNode> = HashMap::with_capacity(capacity);
-	// A digest of every collision key taken so far. The paths themselves are not kept: a hit is
-	// rare and is resolved against the paths already placed, which is what tells a byte-identical
-	// duplicate from a case-only one.
-	let mut claimed: HashSet<u128> = HashSet::with_capacity(capacity);
-	let mut has_collisions = false;
+	let mut nodes: HashMap<String, RemoteNode> = HashMap::with_capacity(dirs.len() + files.len());
 	let mut held_paths: BTreeSet<String> = BTreeSet::new();
-	let mut ignored = BTreeMap::new();
-	let mut ignored_default_untracked = 0usize;
-	let mut tracked = filter.map(|filter| Tracked::new(filter.baseline));
-
 	let mut insert = |rel_path: String, node: RemoteNode| {
 		// The engine's own directory comes before every rule, and is never reported as ignored.
 		if in_quarantine(&rel_path) {
 			return;
 		}
-		// Before the collision check, so ignored case-twins never refuse the pass.
-		if let Some(filter) = filter
-			&& let Some((ignored_root, decision)) = filter.rules.ignored_root(
-				&rel_path,
-				node.kind == NodeKind::Dir,
-				&mut memo.borrow_mut(),
-			) {
-			// A root the rules hid ABOVE this item is a directory; the item's own hit is a root of
-			// whatever kind the item is.
-			let root_is_dir = ignored_root != rel_path || node.kind == NodeKind::Dir;
-			// Hidden either way — but only a tracked default hit is a ROOT (see `Tracked`).
-			if decision.level == IgnoreLevel::Default
-				&& !tracked
-					.as_mut()
-					.is_some_and(|tracked| tracked.covers(ignored_root, root_is_dir))
-			{
-				ignored_default_untracked += 1;
-			} else if !ignored.contains_key(ignored_root) {
-				ignored.insert(ignored_root.to_owned(), decision);
-			}
+		// Byte-identical names under one parent cannot exist on the server, so a second item at
+		// this exact path can only be the cache showing both halves of a re-upload at once: the
+		// successor has been applied and the predecessor's trash has not. Withhold that one path
+		// for this pass rather than refusing the whole one; the next snapshot has one of them.
+		if held_paths.contains(&rel_path) {
 			return;
 		}
-		let key = collision_key(&rel_path);
-		if claimed.insert(collision_hash(&key)) {
-			nodes.insert(rel_path, node);
-			return;
-		}
-		// Which item already folded that way — asked on the error path only. A held path counts:
-		// both halves of such a name were taken back out of `nodes`. Finding nothing means the
-		// digests collided rather than the names, and a pass is never refused over that.
-		let twin = nodes
-			.keys()
-			.chain(held_paths.iter())
-			.find(|taken| collision_key(taken.as_str()) == key)
-			.cloned();
-		match twin {
-			// Byte-identical names under one parent cannot exist on the server, so this is the
-			// cache showing both halves of a re-upload at once. Withhold the path for this pass
-			// rather than refusing the whole one; the next snapshot has one of them.
-			Some(previous) if previous == rel_path => {
-				tracing::debug!(
-					"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
-				);
-				nodes.remove(&rel_path);
-				held_paths.insert(rel_path);
-			}
-			// A genuine case-only collision: no 1:1 local mapping exists, so the pass is refused.
-			Some(_) => has_collisions = true,
-			None => {
-				nodes.insert(rel_path, node);
-			}
+		if nodes.insert(rel_path.clone(), node).is_some() {
+			tracing::debug!(
+				"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
+			);
+			nodes.remove(&rel_path);
+			held_paths.insert(rel_path);
 		}
 	};
 
 	for dir in dirs {
 		let name = dir.name.nfc().collect::<String>();
-		let Some(rel_path) = place(&name, dir.parent, dir.uuid, None) else {
+		let Some(rel_path) = place(&name, dir.parent, dir.uuid, None, true) else {
 			continue;
 		};
 		insert(
@@ -551,7 +500,7 @@ pub(crate) fn build_remote_view(
 
 	for file in files {
 		let name = file.name.nfc().collect::<String>();
-		let Some(rel_path) = place(&name, file.parent, file.uuid, Some(file.stable_uuid)) else {
+		let Some(rel_path) = place(&name, file.parent, file.uuid, Some(file.stable_uuid), false) else {
 			continue;
 		};
 		insert(
@@ -570,12 +519,148 @@ pub(crate) fn build_remote_view(
 
 	RemoteView {
 		nodes,
-		has_collisions,
+		has_collisions: false,
 		held_paths,
 		skipped: skipped.finish(),
-		ignored,
-		ignored_default_untracked,
+		ignored: BTreeMap::new(),
+		ignored_default_untracked: 0,
 	}
+}
+
+impl RemoteView {
+	/// Hide what `filter`'s rules hide, then resolve the name collisions among what is left — the
+	/// two steps that turn a placed view ([`place_remote_items`]) into the set a pass reconciles,
+	/// folds and applies against.
+	///
+	/// The rules come off first, so ignored case-twins never refuse a pass. With no filter nothing
+	/// is hidden and the view stays the remote as it is, collisions resolved.
+	pub(crate) fn filter(&mut self, filter: Option<ViewFilter<'_>>) {
+		if let Some(filter) = filter {
+			self.hide(filter);
+		}
+		self.resolve_collisions();
+	}
+
+	/// The ignore half of [`filter`](Self::filter): an item the rules hide at or above its path
+	/// leaves `nodes` — everything under it with it, since nothing under an ignored directory can
+	/// be re-included — and its top-most ignored path is recorded in
+	/// [`ignored`](Self::ignored). An item the view could not place under an ignored path leaves
+	/// [`skipped`](Self::skipped) too: it is out of sync, not unsyncable.
+	///
+	/// A [held](Self::held_paths) path stays held whatever the rules say. Both halves are
+	/// byte-identical, so a rule hides them together, and a path the rules hide is blocked from
+	/// every action anyway — holding it costs the pass nothing and it is untracked, with its rule
+	/// reported, by the pass that finds the cache no longer mid-transition there.
+	fn hide(&mut self, filter: ViewFilter<'_>) {
+		let mut memo = HashMap::new();
+		let mut tracked = Tracked::new(filter.baseline);
+		let mut ignored = BTreeMap::new();
+		let mut untracked = 0usize;
+		// Whether the rules hide `rel_path`, recording the root of what they hide as the pass
+		// reports and untracks one (see [`Tracked`]).
+		let mut hidden = |rel_path: &str, is_dir: bool| {
+			let Some((ignored_root, decision)) =
+				filter.rules.ignored_root(rel_path, is_dir, &mut memo)
+			else {
+				return false;
+			};
+			// A root the rules hid ABOVE this item is a directory; the item's own hit is a root of
+			// whatever kind the item is.
+			let root_is_dir = ignored_root != rel_path || is_dir;
+			// Hidden either way — but only a tracked default hit is a ROOT (see `Tracked`).
+			if decision.level == IgnoreLevel::Default && !tracked.covers(ignored_root, root_is_dir)
+			{
+				untracked += 1;
+			} else if !ignored.contains_key(ignored_root) {
+				ignored.insert(ignored_root.to_owned(), decision);
+			}
+			true
+		};
+		self.nodes
+			.retain(|rel_path, node| !hidden(rel_path, node.kind == NodeKind::Dir));
+		self.ignored = ignored;
+		self.ignored_default_untracked = untracked;
+		// An unplaceable item's own record leaves with whatever hides it: the holding directory for
+		// an undecodable one, whose name is unknown, and the would-be path for a name the remote
+		// spells unsafely. A broken parent chain has no path to ask about. ASKED, not recorded —
+		// the root of what hides such an item is the directory the rules hid, which is a node and
+		// recorded as one; the item itself was never a root of its own.
+		//
+		// Asked about the kind the record's PATH is
+		// ([`path_is_dir`](SkippedRemote::path_is_dir)), not the kind the item is: a file recorded
+		// under a skipped directory carries that directory's path, and a rule written for
+		// directories only (`build/`) hides the path it names or nothing at all. Asked as a file,
+		// such a rule missed, the record outlived the directory it describes, and the pass reported
+		// the very path the rule was written to silence.
+		let mut is_hidden = |rel_path: &str, is_dir: bool| {
+			filter
+				.rules
+				.ignored_root(rel_path, is_dir, &mut memo)
+				.is_some()
+		};
+		self.skipped.retain(|skip| match &skip.reason {
+			UnsyncableReason::RemoteUndecodable | UnsyncableReason::RemoteInvalidName { .. } => {
+				!is_hidden(&skip.rel_path, skip.path_is_dir)
+			}
+			_ => true,
+		});
+	}
+
+	/// The collision half of [`filter`](Self::filter): two remote items whose paths fold together
+	/// case-insensitively have no 1:1 local mapping, so the loser leaves the view and the pass is
+	/// refused ([`has_collisions`](Self::has_collisions)).
+	fn resolve_collisions(&mut self) {
+		// A digest of every collision key taken so far. The keys themselves are not kept: a hit is
+		// rare and is resolved against the paths already placed, which is what tells a real
+		// case-twin from two keys that merely share a digest — a pass is never refused over that.
+		let mut claimed: HashSet<u128> =
+			HashSet::with_capacity(self.nodes.len() + self.held_paths.len());
+		// A held path took its key when the view held it, so a case-variant of one still collides.
+		claimed.extend(
+			self.held_paths
+				.iter()
+				.map(|path| collision_hash(&collision_key(path))),
+		);
+		let mut clashes: Vec<String> = Vec::new();
+		for rel_path in self.nodes.keys() {
+			if !claimed.insert(collision_hash(&collision_key(rel_path))) {
+				clashes.push(rel_path.clone());
+			}
+		}
+		for rel_path in clashes {
+			let key = collision_key(&rel_path);
+			// Which item already folded that way — asked on the error path only. A held path
+			// counts: both halves of such a name were taken back out of `nodes`.
+			let folds_onto = self
+				.nodes
+				.keys()
+				.chain(self.held_paths.iter())
+				.any(|taken| *taken != rel_path && collision_key(taken) == key);
+			if folds_onto {
+				tracing::debug!(
+					"remote view: {rel_path:?} folds onto another remote item's name, so no 1:1 local mapping exists"
+				);
+				self.has_collisions = true;
+				self.nodes.remove(&rel_path);
+			}
+		}
+	}
+}
+
+/// [`place_remote_items`] + [`RemoteView::filter`] in one call, for a caller that already has the
+/// rules to hand. A pass builds the two halves apart, so the reads it owes the unfiltered view can
+/// happen in between.
+#[cfg(test)]
+pub(crate) fn build_remote_view(
+	root: Uuid,
+	dirs: &[CacheableDir<'_>],
+	files: &[CacheableFile<'_>],
+	undecodable: &[UndecodableItem],
+	filter: Option<ViewFilter<'_>>,
+) -> RemoteView {
+	let mut view = place_remote_items(root, dirs, files, undecodable);
+	view.filter(filter);
+	view
 }
 
 /// The skipped items of a view being built: the ones recorded with a reason of their own, and the
@@ -625,6 +710,13 @@ impl Skipped {
 						remote_uuid,
 						stable_uuid,
 						rel_path,
+						// `under` is only reached through `Unresolved::UnderSkipped`, whose ancestor
+						// is always a DIRECTORY — an unsafe-named one, an undecodable one, or one
+						// whose own parent is missing — and a directory's record is either its own
+						// would-be path or the directory that holds it. So the path this record
+						// takes names a directory whatever the item under it is, and the rules have
+						// to be asked about it as one.
+						path_is_dir: true,
 						reason,
 					});
 					break;
@@ -5279,6 +5371,7 @@ mod tests {
 			remote_uuid,
 			stable_uuid: None,
 			rel_path: "..".to_string(),
+			path_is_dir: true,
 			reason: UnsyncableReason::RemoteInvalidName {
 				name: "..".to_string(),
 			},
@@ -5421,6 +5514,7 @@ mod tests {
 				remote_uuid: Uuid::new_v4(),
 				stable_uuid: Some(lineage),
 				rel_path: "docs".to_string(),
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			},
 			// Two undecodable strangers in one directory report one line.
@@ -5428,12 +5522,14 @@ mod tests {
 				remote_uuid: Uuid::new_v4(),
 				stable_uuid: None,
 				rel_path: "docs".to_string(),
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			},
 			SkippedRemote {
 				remote_uuid: Uuid::new_v4(),
 				stable_uuid: None,
 				rel_path: "docs".to_string(),
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			},
 		];
@@ -5584,6 +5680,7 @@ mod tests {
 				remote_uuid: stranger.uuid,
 				stable_uuid: None,
 				rel_path: String::new(),
+				path_is_dir: true,
 				reason: UnsyncableReason::RemoteUndecodable,
 			}]
 		);
@@ -6087,6 +6184,7 @@ mod tests {
 				remote_uuid: orphan.uuid,
 				stable_uuid: Some(orphan.stable_uuid),
 				rel_path: "f.txt".to_string(),
+				path_is_dir: false,
 				reason: UnsyncableReason::RemoteBrokenParent,
 			}],
 			"the orphan is recorded, not silently dropped"

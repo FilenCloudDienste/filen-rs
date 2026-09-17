@@ -398,12 +398,11 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		.collect();
 	let snapshot = bench_support::snapshot(&fixture.cache_db, fixture.remote_root)
 		.expect("reading the cache snapshot");
-	let raw_view = plan::build_remote_view(
+	let mut view = plan::place_remote_items(
 		fixture.remote_root,
 		&snapshot.dirs,
 		&snapshot.files,
 		&snapshot.undecodable,
-		None,
 	);
 	let (scan, rules_used) = scan::scan_local(
 		&fixture.root,
@@ -413,17 +412,10 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		RuleFiles::Read,
 	);
 	drop(rules_used);
-	drop(raw_view);
-	let view = plan::build_remote_view(
-		fixture.remote_root,
-		&snapshot.dirs,
-		&snapshot.files,
-		&snapshot.undecodable,
-		Some(plan::ViewFilter {
-			rules,
-			baseline: &baseline,
-		}),
-	);
+	view.filter(Some(plan::ViewFilter {
+		rules,
+		baseline: &baseline,
+	}));
 	let mut baseline = baseline;
 	let mut local = scan.nodes;
 	let mut remote = view.nodes;
@@ -523,47 +515,47 @@ pub fn run() -> String {
 	drop(again);
 
 	let rules = probe_rules();
-	let (raw_view, raw) = timed(|| {
-		plan::build_remote_view(
+	let (mut view, placed) = timed(|| {
+		plan::place_remote_items(
 			fixture.remote_root,
 			&snapshot.dirs,
 			&snapshot.files,
 			&snapshot.undecodable,
-			None,
-		)
-	});
-	probe.record("view_raw", nodes, raw, "build_remote_view, no rules");
-	let (view, filtered) = timed(|| {
-		plan::build_remote_view(
-			fixture.remote_root,
-			&snapshot.dirs,
-			&snapshot.files,
-			&snapshot.undecodable,
-			// The fixture's baseline is written further down, and nothing in this tree is hidden by
-			// the built-in defaults, so an empty one measures the same build a pass runs.
-			Some(plan::ViewFilter {
-				rules: &rules,
-				baseline: &no_baseline,
-			}),
 		)
 	});
 	probe.record(
-		"view_filtered",
+		"view_place",
 		nodes,
-		filtered,
-		"build_remote_view, 5 user rules + defaults",
+		placed,
+		"place_remote_items, the view before the rules",
+	);
+
+	// The baseline writes, batched and per action. The rows come off the placed view, which is
+	// what a pass records them from.
+	let entries = baseline_rows(&cold_scan, &view.nodes);
+	drop(cold_scan);
+
+	let (_, hidden) = timed(|| {
+		// The fixture's baseline is written further down, and nothing in this tree is hidden by
+		// the built-in defaults, so an empty one measures the same filter a pass runs.
+		view.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &no_baseline,
+		}));
+	});
+	probe.record(
+		"view_filter",
+		nodes,
+		hidden,
+		"RemoteView::filter, 5 user rules + defaults",
 	);
 	probe.record(
-		"view_both",
+		"view_once",
 		nodes,
-		raw + filtered,
+		placed + hidden,
 		"derived: what one pass actually builds",
 	);
 
-	// The baseline writes, batched and per action.
-	let entries = baseline_rows(&cold_scan, &raw_view.nodes);
-	drop(cold_scan);
-	drop(raw_view);
 	let store = BaselineStore::open(&fixture.baseline_db).expect("opening the baseline DB");
 	let local_root = fixture.root.to_string_lossy().into_owned();
 	let (pair, _) = store
