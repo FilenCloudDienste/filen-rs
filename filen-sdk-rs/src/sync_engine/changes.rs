@@ -127,8 +127,6 @@ pub enum FullPassReason {
 	LocalEventsUnwatched,
 	/// The periodic safety-net tick — the backstop for anything both changelists silently missed.
 	SafetyNet,
-	/// A deep pass: it re-hashes every local file, so it reads the whole tree by definition.
-	DeepScan,
 	/// The previous pass refused to run (a name collision on either side), which is whole-tree
 	/// state.
 	PreviousRefusal,
@@ -175,7 +173,6 @@ impl fmt::Display for FullPassReason {
 			Self::RemoteEventsDegraded => "no remote changes are announced for this pair",
 			Self::LocalEventsUnwatched => "no filesystem watcher is attached to this pair",
 			Self::SafetyNet => "the periodic safety-net pass",
-			Self::DeepScan => "a deep pass re-hashes every local file",
 			Self::PreviousRefusal => "the previous pass refused to run",
 			Self::DeletionHold => "the previous pass held deletions for whole-tree evidence",
 			Self::InterruptedPass => "the previous pass was cancelled part-way through",
@@ -640,16 +637,11 @@ impl PassScope {
 	/// since the last pass.
 	///
 	/// The whole trigger table in one place: the changelists' own reasons (fixed at
-	/// [`PairChanges::take`]), then the two facts only the pass knows — an empty baseline is a
-	/// first sync, and a deep pass re-hashes everything by definition.
-	pub(super) fn full_pass_reason(
-		&self,
-		baseline_items: usize,
-		deep: bool,
-	) -> Option<FullPassReason> {
+	/// [`PairChanges::take`]), then the one fact only the pass knows — an empty baseline is a first
+	/// sync, and the whole tree is the evidence for it.
+	pub(super) fn full_pass_reason(&self, baseline_items: usize) -> Option<FullPassReason> {
 		self.full
 			.or((baseline_items == 0).then_some(FullPassReason::EmptyBaseline))
-			.or(deep.then_some(FullPassReason::DeepScan))
 	}
 
 	/// How many local paths and remote changes this pass took, for its log line.
@@ -1116,7 +1108,7 @@ mod tests {
 		let changes = PairChanges::new();
 		changes.note_tree_size(4_000);
 		assert_eq!(
-			changes.take().full_pass_reason(10, false),
+			changes.take().full_pass_reason(10),
 			Some(R::LocalEventsUnwatched),
 			"a pair nothing is watching cannot narrow a pass down"
 		);
@@ -1124,14 +1116,14 @@ mod tests {
 		changes.cover_local();
 		note(&changes, &create("a.txt"));
 		assert_eq!(
-			changes.take().full_pass_reason(10, false),
+			changes.take().full_pass_reason(10),
 			None,
 			"a watcher that covers the tree is what makes the list evidence"
 		);
 
 		changes.uncover_local();
 		assert_eq!(
-			changes.take().full_pass_reason(10, false),
+			changes.take().full_pass_reason(10),
 			Some(R::LocalEventsUnwatched),
 			"a watch that ended stops being evidence for what did NOT change"
 		);
@@ -1265,11 +1257,7 @@ mod tests {
 		let changes = sized_pair();
 		note(&changes, &create("a.txt"));
 		let scope = changes.take();
-		assert_eq!(
-			scope.full_pass_reason(10, false),
-			None,
-			"nothing forced it yet"
-		);
+		assert_eq!(scope.full_pass_reason(10), None, "nothing forced it yet");
 
 		// ... and now, mid-pass, the rules change under it.
 		changes.force(R::RulesChanged);
@@ -1283,29 +1271,19 @@ mod tests {
 		);
 	}
 
-	/// The two rows only the pass itself knows: an empty baseline is a first sync, and a deep pass
-	/// re-hashes the tree whatever the changelists say.
+	/// The one row only the pass itself knows: an empty baseline is a first sync whatever the
+	/// changelists say — and a collapsed list outranks even that.
 	#[test]
-	fn the_pass_itself_contributes_the_last_two_rows() {
+	fn the_pass_itself_contributes_the_last_row() {
 		let changes = sized_pair();
 		note(&changes, &create("a.txt"));
 		let scope = changes.take();
-		assert_eq!(scope.full_pass_reason(10, false), None);
-		assert_eq!(scope.full_pass_reason(0, false), Some(R::EmptyBaseline));
-		assert_eq!(scope.full_pass_reason(10, true), Some(R::DeepScan));
-		assert_eq!(
-			scope.full_pass_reason(0, true),
-			Some(R::EmptyBaseline),
-			"the baseline is the more specific of the two"
-		);
+		assert_eq!(scope.full_pass_reason(10), None);
+		assert_eq!(scope.full_pass_reason(0), Some(R::EmptyBaseline));
 
-		// A collapsed list outranks both.
 		let lossy = sized_pair();
 		note(&lossy, &rescan());
-		assert_eq!(
-			lossy.take().full_pass_reason(0, true),
-			Some(R::KernelDropped)
-		);
+		assert_eq!(lossy.take().full_pass_reason(0), Some(R::KernelDropped));
 	}
 
 	/// Every reason renders as a sentence a caller can show.
@@ -1323,7 +1301,6 @@ mod tests {
 			R::LocalEventsDegraded,
 			R::RemoteEventsDegraded,
 			R::SafetyNet,
-			R::DeepScan,
 			R::PreviousRefusal,
 			R::DeletionHold,
 			R::InterruptedPass,
