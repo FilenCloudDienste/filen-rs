@@ -25,8 +25,11 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId},
-	engine::{LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites},
+	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId},
+	engine::{
+		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SharedStore,
+		locked, off_store,
+	},
 	events::SyncEvent,
 	guard::GuardReason,
 	ignore::IgnoredPath,
@@ -51,10 +54,7 @@ use crate::{
 	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock},
 	util::{MaybeArc, MaybeSendCallback},
 };
-use tokio::{
-	sync::{Mutex, mpsc::UnboundedSender},
-	time::Instant,
-};
+use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 
 /// Outcome of one apply pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -111,8 +111,10 @@ pub struct SyncReport {
 	pub paused: bool,
 	/// How many planned actions this pass did NOT carry out because the pair was paused with
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran — the transfer dropped in
-	/// flight plus everything queued behind it — or because the pass could not take the drive lock,
-	/// in which case it is every planned action and `errors` says why. Those actions recorded
+	/// flight plus everything queued behind it — because the pass could not take the drive lock, in
+	/// which case it is every planned action and `errors` says why, or because a record of work
+	/// already done could not be written, which stops the pass admitting anything more (see
+	/// `admits_more`). Those actions recorded
 	/// nothing — a row is written only after its action succeeded, and a transfer that succeeded is
 	/// never dropped before its row — and the next pass re-plans them. Zero on a pass that ran to
 	/// the end, including one that was merely SUSPENDED and resumed.
@@ -122,6 +124,13 @@ pub struct SyncReport {
 	/// watch loop must count the pass as failed rather than healthy. The error itself is the entry
 	/// in `errors` that starts with [`LOCK_FAILURE`].
 	pub(super) lock_failed: bool,
+	/// Set when a write that RECORDS work already done could not be persisted: a baseline row, a
+	/// journal row, or a journal retirement. The act itself stands — the transfer, the rename, the
+	/// trash — and the store's own answer is in `errors`, naming the path. Such a pass is a FAILED
+	/// pass: a watch loop backs off rather than running the next one into the same wedged DB, and the
+	/// pass after it re-derives or redoes what the lost record described (see the baseline store's
+	/// `record_write`).
+	pub(super) store_failed: bool,
 	/// Set when a side ran out of room during the pass: the local disk or the account, whichever
 	/// was found full first. The action that ran into it — and any transfer already running that
 	/// did too — is in [`errors`](Self::errors) but counts against no path's failure streak, since
@@ -172,7 +181,10 @@ pub(super) struct ApplyContext<'a> {
 	/// The pair's mode. Read only where the direction changes what an action MEANS — a two-way
 	/// upload has a divergence to surface where a one-way one has an authoritative side.
 	pub(super) mode: super::SyncMode,
-	pub(super) store: &'a Mutex<BaselineStore>,
+	/// The pair's own baseline connection. Every write here is one row or one small transaction and
+	/// runs on the caller's thread; the exception is a directory move's subtree re-key, which does
+	/// not (see [`commit_dir_move`]).
+	pub(super) store: &'a SharedStore,
 	pub(super) local: &'a HashMap<String, LocalNode>,
 	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
 	pub(super) baseline: &'a HashMap<String, BaselineEntry>,
@@ -383,6 +395,9 @@ pub(super) async fn apply(
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
 	for (action, &releasable) in pre.iter().zip(pre_release) {
+		if !admits_more(report) {
+			break;
+		}
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
@@ -430,6 +445,7 @@ pub(super) async fn apply(
 		let mut remote_in_flight = 0usize;
 		loop {
 			while in_flight.len() < concurrency
+				&& admits_more(report)
 				&& let Some(&(action, releasable)) = pending.peek()
 			{
 				// Once an action finds a side full, the transfers already running finish, and the ones
@@ -463,6 +479,9 @@ pub(super) async fn apply(
 			};
 			let Some((action, result)) = next else {
 				// Nothing in flight: the transfers are done, or the next one waits on the lock.
+				if !admits_more(report) {
+					break;
+				}
 				let Some((action, releasable)) = pending.next() else {
 					break;
 				};
@@ -501,15 +520,17 @@ pub(super) async fn apply(
 				}
 				// The upload landed and stands — it is still an upload — but it buried a
 				// concurrent edit, and that is a conflict of this pass's own making.
-				Ok(Transfer::Overwrote(conflict)) => {
+				Ok(Transfer::Overwrote {
+					conflict,
+					unrecorded,
+				}) => {
 					applied += 1;
 					writes.note(action);
-					report.uploaded += 1;
 					observer(action.to_event());
 					observer(SyncEvent::Conflict {
 						rel_path: conflict.rel_path.clone(),
 					});
-					report.conflicts.push(*conflict);
+					note_overwrote(report, action.rel_path(), *conflict, unrecorded);
 				}
 				Err(error) => {
 					applied += 1;
@@ -527,6 +548,9 @@ pub(super) async fn apply(
 	}
 
 	for (action, &releasable) in post.iter().zip(post_release) {
+		if !admits_more(report) {
+			break;
+		}
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
@@ -878,6 +902,12 @@ fn holds_key_at_or_under(keys: &BTreeSet<String>, rel_path: &str) -> bool {
 /// The rows are re-keyed where they lie, from what the STORE holds rather than from the pass's
 /// baseline — see [`BaselineChange::MoveSubtree`] for why that difference matters to a move with
 /// another nested inside it.
+///
+/// NOT cancel-safe at the join: `spawn_blocking` runs to completion, so a caller that DROPS the
+/// `sync_once` future while this transaction is committing leaves the journal row and the re-keyed
+/// rows written with the in-memory journal never told. Nothing inside the engine does that — a
+/// cancel is cooperative, and the watch loop joins its pass rather than aborting it — and the next
+/// open reloads the journal out of the DB, so the two halves are back in step from then on.
 async fn commit_dir_move(
 	ctx: &ApplyContext<'_>,
 	uuid: Uuid,
@@ -888,7 +918,30 @@ async fn commit_dir_move(
 		from: from.to_string(),
 		to: to.to_string(),
 	};
-	commit_remote_write(ctx, uuid, kind, &[BaselineChange::MoveSubtree { from, to }]).await
+	// The journal row and the re-key in ONE transaction, exactly as [`commit_remote_write`] does
+	// it — but off the runtime thread, because this re-key covers every row of the moved
+	// directory's subtree rather than a single row. Owned copies for the closure, and the
+	// in-memory journal is published only once that transaction has committed, as it is there.
+	let pair = ctx.pair;
+	let committed = kind.clone();
+	let (from, to) = (from.to_string(), to.to_string());
+	let at = Utc::now().timestamp_millis();
+	off_store(ctx.store, move |store| {
+		store.record_pending(
+			pair,
+			uuid,
+			&committed,
+			at,
+			&[BaselineChange::MoveSubtree {
+				from: &from,
+				to: &to,
+			}],
+		)
+	})
+	.await?
+	.map_err(db_err)?;
+	ctx.pending.record(ctx.observed, pair, uuid, kind);
+	Ok(())
 }
 
 /// Record a pass that could not take the drive lock. It ran none of its `remaining` actions, so it
@@ -909,6 +962,23 @@ pub(super) fn note_lock_failure(
 
 /// How the error of a pass that could not take the drive lock begins in [`SyncReport::errors`].
 pub(super) const LOCK_FAILURE: &str = "failed to acquire the drive lock";
+
+/// How a pass whose baseline or journal write did not land reports that to a watch loop. The line
+/// naming the path, and the store's own answer, is already in [`SyncReport::errors`].
+pub(super) const STORE_FAILURE: &str = "a record of work already done could not be written";
+
+/// Whether `error` is a baseline or journal write that did not land — the record of an act that has
+/// already happened, which makes the pass a failed one whatever else it managed.
+///
+/// Every such write answers with a `rusqlite::Error`, which [`db_err`] keeps as the source, and
+/// this reads ANY of those on an action's path as a lost record — including the one baseline READ
+/// an action makes (the row read back before a download quarantines what sits at its target, which
+/// reaches here through the same `?`). A read that failed lost nothing, so the pass would be failed
+/// for no reason; the consequence is one backoff, which is the safe direction, and separating the
+/// two would mean marking every write for the sake of a read failure nobody has seen.
+pub(super) fn record_not_written(error: &crate::Error) -> bool {
+	error.downcast_ref::<rusqlite::Error>().is_some()
+}
 
 /// Record a pass cut short — by a cancel, or by a drive lock it could not take: how many planned
 /// actions it did not carry out, both on the report and as an event, so a caller can tell "nothing
@@ -1137,6 +1207,9 @@ fn note_failure(
 	error: &crate::Error,
 ) -> Option<HaltReason> {
 	report.errors.push(format!("{rel_path}: {error}"));
+	if record_not_written(error) {
+		report.store_failed = true;
+	}
 	let Some(reason) = pass_halt(error) else {
 		report
 			.failed_paths
@@ -1149,6 +1222,50 @@ fn note_failure(
 	}
 	report.halted.get_or_insert(reason);
 	Some(reason)
+}
+
+/// Record an upload that buried a concurrent edit: it counts as an upload, and the conflict it made
+/// reaches the caller — even when the row holding the buried version could not be written.
+///
+/// That row is the only reference this engine ever has to the buried version: the remote head is
+/// our own upload, and the version underneath it exists only in the file's history, which is why
+/// the engine's conflict loop refuses to re-derive such a row from the current view. So a lost row
+/// costs the HOLD, not the warning: the path is not excluded from planning, and the next pass finds
+/// both sides holding our bytes and adopts them (`plan::reconcile`'s converged arm). This report is
+/// then the only word anybody gets, which is why it is made whatever the store answered — and why
+/// the answer itself still makes the pass a failed one, through [`note_failure`].
+fn note_overwrote(
+	report: &mut SyncReport,
+	rel_path: &str,
+	conflict: PlannedConflict,
+	unrecorded: Option<crate::Error>,
+) {
+	report.uploaded += 1;
+	report.conflicts.push(conflict);
+	if let Some(error) = unrecorded {
+		tracing::error!(
+			"apply: the conflict over {rel_path:?} is REPORTED but not held — the row holding the \
+			 buried version could not be written ({error}), so unless the caller resolves it from \
+			 this report, the next pass reads both sides holding our bytes and adopts them"
+		);
+		note_failure(report, rel_path, &error);
+	}
+}
+
+/// Whether the pass may still start work it has not started yet.
+///
+/// It may not once a write that RECORDS work already done has failed
+/// ([`SyncReport::store_failed`]). Such a write fails only after SQLite's 30 s busy timeout has run
+/// out on a write lock another connection is holding, so every remaining action would carry out its
+/// remote or local act and then sit out another 30 s to lose its own record too — 500 uploads into
+/// a wedged store is four hours of doing work nothing records. The rest are counted as
+/// [`interrupted`](SyncReport::interrupted) instead: they ran nothing, the next pass re-plans them,
+/// and the watch loop waits out its backoff first because the pass reports a failure.
+///
+/// Transfers already in flight are left to finish: their network op is done, and dropping one there
+/// would leave the remote holding a write nothing records at all.
+fn admits_more(report: &SyncReport) -> bool {
+	!report.store_failed
 }
 
 /// The sides of a pass found full so far, read by the transfers as they start. Atomics, because
@@ -1216,14 +1333,22 @@ fn pass_halt(error: &crate::Error) -> Option<HaltReason> {
 
 /// Whether one transfer ran at all — the pass can be cancelled before it starts, or while its
 /// network op is in flight (see [`PassGate`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum Transfer {
 	/// It ran to the end and recorded what it did.
 	Done,
 	/// The upload landed and IS the remote head — but the server's version chain shows it went on
 	/// top of a version this pass never saw. Another client edited the file between the snapshot
 	/// this pass read and our upload, and our bytes buried it; the conflict says so.
-	Overwrote(Box<PlannedConflict>),
+	Overwrote {
+		conflict: Box<PlannedConflict>,
+		/// The store's answer when the row that holds the buried version could NOT be written.
+		/// The conflict travels anyway: that row is the only place the buried version is named —
+		/// the remote head is our own upload and the version underneath it survives only in the
+		/// file's history — so dropping the conflict with the row would leave nobody, and no later
+		/// pass, any word of the edit these bytes buried.
+		unrecorded: Option<crate::Error>,
+	},
 	/// The pass was cancelled: it never started, or a cancel dropped it mid-flight. Either way it
 	/// recorded nothing, and the next pass re-plans it.
 	Interrupted,
@@ -1273,10 +1398,7 @@ async fn apply_transfer(
 			// ordinary download onto free space has nothing to lose and skips the read.
 			let base = match ctx.baseline.get(rel_path) {
 				Some(base) => Some(base.clone()),
-				None if path.exists() => ctx
-					.store
-					.lock()
-					.await
+				None if path.exists() => locked(ctx.store)
 					.entry(ctx.pair, rel_path)
 					.map_err(db_err)?,
 				None => None,
@@ -1385,15 +1507,29 @@ async fn apply_transfer(
 					"apply: the upload of {rel_path:?} went on top of version {} — a concurrent edit this pass never saw",
 					buried.uuid()
 				);
-				// No pending-write record: the path is HELD from here on, so no pass reconciles
-				// against it, and a fold would have to read the row — which describes the buried
-				// version, not what the remote holds.
-				upsert_baseline(ctx, &entry).await?;
-				return Ok(Transfer::Overwrote(Box::new(PlannedConflict {
-					rel_path: rel_path.clone(),
-					local: local.map(|node| node.kind.into()),
-					remote: Some(PlannedNodeKind::File),
-				})));
+				// No pending-write record: the path is HELD from here on (as long as this row
+				// lands), so no pass reconciles against it, and a fold would have to read the row
+				// — which describes the buried version, not what the remote holds.
+				//
+				// A row that could not be written is REPORTED rather than thrown: `?` here would
+				// turn the upload into a plain failure, and with the conflict would go the only
+				// reference to the buried version there is. Nothing else holds one — the remote
+				// head is our own upload — so the next pass would find both sides holding our
+				// bytes and adopt them, and the concurrent edit would never be mentioned again.
+				let unrecorded = upsert_baseline(ctx, &entry).await.err().map(|error| {
+					error.with_context(format!(
+						"holding version {} of {rel_path:?}, the concurrent edit this upload buried",
+						buried.uuid()
+					))
+				});
+				return Ok(Transfer::Overwrote {
+					conflict: Box::new(PlannedConflict {
+						rel_path: rel_path.clone(),
+						local: local.map(|node| node.kind.into()),
+						remote: Some(PlannedNodeKind::File),
+					}),
+					unrecorded,
+				});
 			}
 			let entry = file_entry(
 				rel_path,
@@ -1461,15 +1597,15 @@ async fn apply_one(
 		// total and correct if a transfer is ever applied serially.
 		SyncAction::DownloadFile { .. } => {
 			// No observer reaches this fallback, so its progress goes to a channel nobody reads.
-			if apply_transfer(
+			let outcome = apply_transfer(
 				ctx,
 				action,
 				files,
 				dir_by_path,
 				&tokio::sync::mpsc::unbounded_channel().0,
 			)
-			.await? == Transfer::Done
-			{
+			.await?;
+			if matches!(outcome, Transfer::Done) {
 				report.downloaded += 1;
 			}
 		}
@@ -1522,10 +1658,10 @@ async fn apply_one(
 			.await?
 			{
 				Transfer::Done => report.uploaded += 1,
-				Transfer::Overwrote(conflict) => {
-					report.uploaded += 1;
-					report.conflicts.push(*conflict);
-				}
+				Transfer::Overwrote {
+					conflict,
+					unrecorded,
+				} => note_overwrote(report, action.rel_path(), *conflict, unrecorded),
 				Transfer::Interrupted => {}
 			}
 		}
@@ -1648,9 +1784,7 @@ async fn apply_one(
 			);
 			// One transaction, delete before upsert: a crash between the two would leave the file
 			// with no row at either path, and the next pass would read it as newly created.
-			ctx.store
-				.lock()
-				.await
+			locked(ctx.store)
 				.apply_changes(
 					ctx.pair,
 					&[
@@ -1740,17 +1874,22 @@ async fn apply_one(
 				std::fs::rename(&to, &step).map_err(io_err)?;
 				std::fs::rename(&step, &to).map_err(io_err)?;
 			}
-			ctx.store
-				.lock()
-				.await
-				.apply_changes(
-					ctx.pair,
+			// Two seeking statements over every row of the moved directory's subtree, so this is
+			// the one baseline write of a local action that does not run on a runtime thread. The
+			// paths are owned by the closure that runs them.
+			let pair = ctx.pair;
+			let (from, to) = (from_path.clone(), to_path.clone());
+			off_store(ctx.store, move |store| {
+				store.apply_changes(
+					pair,
 					&[BaselineChange::MoveSubtree {
-						from: from_path.as_str(),
-						to: to_path.as_str(),
+						from: &from,
+						to: &to,
 					}],
 				)
-				.map_err(db_err)?;
+			})
+			.await?
+			.map_err(db_err)?;
 			report.moved_local += 1;
 		}
 		SyncAction::Conflict { rel_path } => {
@@ -1995,7 +2134,7 @@ fn overwritten_entry(
 /// scan saw and the remote kind/uuid/hash/size — so the resolution can re-anchor the row to the
 /// winner and leave the loser reading as stale on the next pass.
 pub(super) async fn record_conflict(
-	store: &Mutex<BaselineStore>,
+	store: &SharedStore,
 	pair: PairId,
 	rel_path: &str,
 	local: Option<&LocalNode>,
@@ -2022,11 +2161,7 @@ pub(super) async fn record_conflict(
 		// While the divergence is held there is no agreed content; resolving it records one again.
 		agreed_hash: None,
 	};
-	store
-		.lock()
-		.await
-		.upsert_entry(pair, &entry)
-		.map_err(db_err)
+	locked(store).upsert_entry(pair, &entry).map_err(db_err)
 }
 
 fn local_mtime_of(path: &Path) -> Option<i64> {
@@ -2187,9 +2322,7 @@ async fn commit_remote_write(
 	kind: PendingKind,
 	changes: &[BaselineChange<'_>],
 ) -> Result<(), crate::Error> {
-	ctx.store
-		.lock()
-		.await
+	locked(ctx.store)
 		.record_pending(
 			ctx.pair,
 			uuid,
@@ -2206,17 +2339,13 @@ async fn upsert_baseline(
 	ctx: &ApplyContext<'_>,
 	entry: &BaselineEntry,
 ) -> Result<(), crate::Error> {
-	ctx.store
-		.lock()
-		.await
+	locked(ctx.store)
 		.upsert_entry(ctx.pair, entry)
 		.map_err(db_err)
 }
 
 async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), crate::Error> {
-	ctx.store
-		.lock()
-		.await
+	locked(ctx.store)
 		.delete_entry(ctx.pair, rel_path)
 		.map_err(db_err)
 }
@@ -2356,6 +2485,7 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::*;
+	use crate::sync_engine::baseline::BaselineStore;
 
 	fn upload(rel_path: &str) -> SyncAction {
 		SyncAction::UploadFile {
@@ -2677,6 +2807,164 @@ mod tests {
 		assert_eq!(held(&full), [false, true, false]);
 		full.note(HaltReason::RemoteStorageFull);
 		assert_eq!(held(&full), [true, true, false]);
+	}
+
+	/// The store's own answer to a write another connection will not let go of: the error a record
+	/// write really fails with, mapped exactly as an action's path maps it.
+	fn contended_write_error() -> crate::Error {
+		let path =
+			std::env::temp_dir().join(format!("filen_apply_contended_{}.db", Uuid::new_v4()));
+		let holder = BaselineStore::open(&path).unwrap();
+		let (pair, _) = holder
+			.create_pair("/root", Uuid::new_v4(), super::super::SyncMode::TwoWay)
+			.unwrap();
+		let writer = BaselineStore::open(&path).unwrap();
+		writer.busy_timeout_for_test(Duration::from_millis(50));
+		let entry = dir_entry("held", Some(Uuid::new_v4()), None);
+		let error = {
+			let _held = holder.hold_write_lock(pair, &entry).unwrap();
+			writer
+				.upsert_entry(pair, &entry)
+				.map_err(db_err)
+				.expect_err("a write contended past the busy timeout must fail rather than wait")
+		};
+		drop(writer);
+		drop(holder);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+		}
+		error
+	}
+
+	fn conflict(rel_path: &str) -> PlannedConflict {
+		PlannedConflict {
+			rel_path: rel_path.to_string(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::File),
+		}
+	}
+
+	/// The row that holds a version an upload of ours buried is the only reference to that version
+	/// anywhere — no view can re-derive it. So when it cannot be written the conflict must still
+	/// reach the report, and the lost row must still make the pass a failed one.
+	#[test]
+	fn a_buried_version_whose_row_could_not_be_written_is_still_reported() {
+		let mut report = SyncReport::default();
+		note_overwrote(
+			&mut report,
+			"a.txt",
+			conflict("a.txt"),
+			Some(contended_write_error()),
+		);
+		assert_eq!(report.uploaded, 1, "the upload landed and still counts");
+		assert_eq!(
+			report
+				.conflicts
+				.iter()
+				.map(|conflict| conflict.rel_path.as_str())
+				.collect::<Vec<_>>(),
+			["a.txt"],
+			"the buried version must be surfaced even though its row was lost: {:?}",
+			report.errors
+		);
+		assert!(
+			report.store_failed,
+			"and the lost row must still fail the pass: {:?}",
+			report.errors
+		);
+		assert!(
+			report.errors.iter().any(|line| line.starts_with("a.txt: ")),
+			"naming the path whose row was lost: {:?}",
+			report.errors
+		);
+
+		let mut recorded = SyncReport::default();
+		note_overwrote(&mut recorded, "b.txt", conflict("b.txt"), None);
+		assert_eq!(recorded.conflicts.len(), 1);
+		assert!(
+			!recorded.store_failed && recorded.errors.is_empty(),
+			"a row that landed is no failure: {:?}",
+			recorded.errors
+		);
+	}
+
+	/// Once a record of work already done could not be written, the pass admits nothing more: every
+	/// action it still holds would carry out its act and then wait out another busy timeout to lose
+	/// its own record. What it does not get to is owed to the next pass instead.
+	#[test]
+	fn a_lost_record_stops_the_pass_admitting_more_work() {
+		let mut report = SyncReport::default();
+		assert!(admits_more(&report), "a healthy pass admits its actions");
+		note_failure(
+			&mut report,
+			"docs/a.txt",
+			&internal("the server refused this one"),
+		);
+		assert!(
+			admits_more(&report),
+			"an action that failed on its own leaves the pass running: {:?}",
+			report.errors
+		);
+		note_failure(&mut report, "docs/b.txt", &contended_write_error());
+		assert!(
+			!admits_more(&report),
+			"a record that did not land stops the pass: {:?}",
+			report.errors
+		);
+		note_interrupted(&mut report, 7, &mut |_| {});
+		assert_eq!(
+			report.interrupted, 7,
+			"what it did not get to is owed to the next pass"
+		);
+	}
+
+	/// The baseline write of an applied action records something that has already happened, so when
+	/// it cannot land the pass is a failed one: the store's answer reaches the report under the path,
+	/// and `store_failed` is what tells a watch loop to back off instead of reading the pass as
+	/// healthy. Both halves here are the production path — the store's own contended answer, mapped
+	/// by `db_err` and recorded by `note_failure`.
+	#[test]
+	fn a_baseline_row_that_could_not_be_written_makes_the_pass_a_failed_one() {
+		let path = std::env::temp_dir().join(format!("filen_apply_busy_{}.db", Uuid::new_v4()));
+		let holder = BaselineStore::open(&path).unwrap();
+		let (pair, _) = holder
+			.create_pair("/root", Uuid::new_v4(), super::super::SyncMode::TwoWay)
+			.unwrap();
+		let writer = BaselineStore::open(&path).unwrap();
+		writer.busy_timeout_for_test(Duration::from_millis(50));
+		let entry = dir_entry("docs", Some(Uuid::new_v4()), None);
+
+		let mut report = SyncReport::default();
+		{
+			let _held = holder.hold_write_lock(pair, &entry).unwrap();
+			let error = writer
+				.upsert_entry(pair, &entry)
+				.map_err(db_err)
+				.expect_err("the contended row write must fail rather than wait");
+			assert!(record_not_written(&error), "{error}");
+			note_failure(&mut report, "docs", &error);
+		}
+		assert!(
+			report.store_failed,
+			"a lost record must mark the pass failed: {:?}",
+			report.errors
+		);
+		assert!(
+			report.errors.iter().any(|line| line.starts_with("docs: ")),
+			"the report must name the path whose record was lost: {:?}",
+			report.errors
+		);
+		assert_eq!(
+			report.failed_paths.len(),
+			1,
+			"and the path's own streak still counts it"
+		);
+
+		drop(writer);
+		drop(holder);
+		for suffix in ["", "-wal", "-shm"] {
+			std::fs::remove_file(format!("{}{suffix}", path.display())).ok();
+		}
 	}
 
 	fn temp_dir() -> PathBuf {

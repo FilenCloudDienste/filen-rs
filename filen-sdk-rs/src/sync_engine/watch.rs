@@ -45,7 +45,7 @@ use tokio::{sync::Notify, time::Instant};
 
 use super::{
 	SyncEvent, SyncObserver, SyncReport,
-	apply::LOCK_FAILURE,
+	apply::{LOCK_FAILURE, STORE_FAILURE},
 	baseline::PairId,
 	engine::SyncEngine,
 	scan::{QUARANTINE_DIR, ScanDepth},
@@ -647,10 +647,11 @@ fn backoff(failures: u32) -> Option<Duration> {
 /// Run one pass, logging (not propagating) any failure — the loop is best-effort and the next
 /// trigger or the periodic tick retries. `observer` receives this pass's [`SyncEvent`]s.
 ///
-/// Returns the pass's own error, if any (per-action errors inside a completed pass do not count; a
-/// drive lock it could not take does, and so does a pass that found a side full — see
-/// [`halted`](SyncReport::halted) — so the loop backs off rather than running into the same full
-/// disk at the debounce cadence), and whether it left work owed (see [`pass_outcome`]).
+/// Returns the pass's own error, if any (per-action errors inside a completed pass do not count on
+/// their own; a drive lock it could not take does, so does a pass that found a side full — see
+/// [`halted`](SyncReport::halted) — and so does one whose record of work already done could not be
+/// written — `store_failed` — so the loop backs off rather than running into the same full disk or
+/// wedged store at the debounce cadence), and whether it left work owed (see [`pass_outcome`]).
 async fn run_pass(
 	engine: &SyncEngine,
 	pair: PairId,
@@ -680,9 +681,14 @@ async fn run_pass(
 /// A pass that could not take the drive lock returns a report but applied nothing, so it is a
 /// failed pass. Its backoff is the retry timer, which is why it owes no re-armed trigger on top.
 /// A pass [`halted`](SyncReport::halted) for want of space is a failed pass too, so it backs off.
+/// So is one whose baseline or journal write did not land (`store_failed`): the act that write was
+/// recording stands, and the next pass would run straight into the same wedged store.
 fn pass_outcome(report: SyncReport) -> (Option<String>, bool) {
 	if !report.lock_failed {
-		let error = report.halted.map(|reason| reason.held_line());
+		let error = report
+			.halted
+			.map(|reason| reason.held_line())
+			.or_else(|| report.store_failed.then(|| STORE_FAILURE.to_string()));
 		return (error, owes_a_pass(&report));
 	}
 	let error = report
@@ -836,7 +842,7 @@ mod tests {
 	};
 	use crate::{
 		Error, ErrorKind,
-		sync_engine::apply::{LOCK_FAILURE, note_lock_failure},
+		sync_engine::apply::{LOCK_FAILURE, STORE_FAILURE, note_lock_failure},
 	};
 
 	fn watch_limit() -> notify::Error {
@@ -1470,6 +1476,29 @@ mod tests {
 			error,
 			Some(format!("{LOCK_FAILURE}: {cause}")),
 			"a pass that could not take the drive lock must publish its cause"
+		);
+		assert!(
+			!owed,
+			"a failed pass is retried on the backoff, not re-armed at the debounce"
+		);
+	}
+
+	/// A pass that applied its actions but could not RECORD one of them ran the act without its
+	/// record. The loop must count it as a failed pass — the same way it counts a lock it could not
+	/// take — so the next one waits out the backoff instead of losing the next record to the same
+	/// wedged store.
+	#[test]
+	fn a_pass_whose_record_did_not_land_counts_as_a_failure() {
+		let report = SyncReport {
+			uploaded: 1,
+			store_failed: true,
+			..SyncReport::default()
+		};
+		let (error, owed) = pass_outcome(report);
+		assert_eq!(
+			error.as_deref(),
+			Some(STORE_FAILURE),
+			"a pass that lost a record must publish a cause, not read as healthy"
 		);
 		assert!(
 			!owed,
