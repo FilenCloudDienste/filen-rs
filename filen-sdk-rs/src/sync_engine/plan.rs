@@ -22,10 +22,7 @@ use super::{
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
 };
-use crate::{
-	cache::UndecodableItem,
-	fs::{dir::cache::CacheableDir, file::cache::CacheableFile},
-};
+use crate::cache::{RemoteItem, UndecodableItem};
 
 /// Guards against a malformed (cyclic) remote parent chain when resolving a path.
 const MAX_REMOTE_DEPTH: usize = 256;
@@ -387,8 +384,8 @@ pub(crate) struct SkippedRemote {
 /// leaving the one map reconcile, the folds and apply act on.
 pub(crate) fn place_remote_items(
 	root: Uuid,
-	dirs: &[CacheableDir<'_>],
-	files: &[CacheableFile<'_>],
+	dirs: &[RemoteItem],
+	files: &[RemoteItem],
 	undecodable: &[UndecodableItem],
 ) -> RemoteView {
 	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
@@ -493,14 +490,14 @@ pub(crate) fn place_remote_items(
 				stable_uuid: None,
 				content_hash: None,
 				size: 0,
-				modified_millis: dir.created.map(|c| c.timestamp_millis()).unwrap_or(0),
+				modified_millis: dir.modified_millis,
 			},
 		);
 	}
 
 	for file in files {
 		let name = file.name.nfc().collect::<String>();
-		let Some(rel_path) = place(&name, file.parent, file.uuid, Some(file.stable_uuid), false) else {
+		let Some(rel_path) = place(&name, file.parent, file.uuid, file.stable_uuid, false) else {
 			continue;
 		};
 		insert(
@@ -509,10 +506,10 @@ pub(crate) fn place_remote_items(
 				rel_path,
 				kind: NodeKind::File,
 				remote_uuid: file.uuid,
-				stable_uuid: Some(file.stable_uuid),
+				stable_uuid: file.stable_uuid,
 				content_hash: file.hash,
 				size: file.size,
-				modified_millis: file.last_modified.timestamp_millis(),
+				modified_millis: file.modified_millis,
 			},
 		);
 	}
@@ -653,8 +650,8 @@ impl RemoteView {
 #[cfg(test)]
 pub(crate) fn build_remote_view(
 	root: Uuid,
-	dirs: &[CacheableDir<'_>],
-	files: &[CacheableFile<'_>],
+	dirs: &[RemoteItem],
+	files: &[RemoteItem],
 	undecodable: &[UndecodableItem],
 	filter: Option<ViewFilter<'_>>,
 ) -> RemoteView {
@@ -2599,7 +2596,6 @@ fn order_actions(actions: &mut [SyncAction]) {
 
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
 
 	use chrono::{DateTime, Utc};
 
@@ -3513,30 +3509,17 @@ mod tests {
 		DateTime::from_timestamp_millis(millis).unwrap()
 	}
 
-	/// A cacheable file with a fresh uuid, named `name` under `parent`.
-	fn cacheable_file(parent: Uuid, name: &'static str) -> CacheableFile<'static> {
+	/// A remote file item with a fresh uuid, named `name` under `parent`.
+	fn cacheable_file(parent: Uuid, name: &'static str) -> RemoteItem {
 		let uuid = Uuid::new_v4();
-		CacheableFile {
+		RemoteItem {
 			uuid,
-			stable_uuid: filen_types::fs::StableUuid::new_for_test(uuid),
 			parent,
-			chunks_size: 1,
-			chunks: 1,
-			favorited: false,
-			region: Cow::Borrowed("r"),
-			bucket: Cow::Borrowed("b"),
-			timestamp: ms(1),
-			name: Cow::Borrowed(name),
-			size: 5,
-			mime: Cow::Borrowed("text/plain"),
-			key: crate::crypto::file::FileKey::from_str_with_version(
-				&"a".repeat(64),
-				filen_types::auth::FileEncryptionVersion::V3,
-			)
-			.unwrap(),
-			last_modified: ms(7),
-			created: Some(ms(1)),
+			name: name.to_string(),
+			stable_uuid: Some(filen_types::fs::StableUuid::new_for_test(uuid)),
 			hash: Some(Blake3Hash::from([5; 32])),
+			size: 5,
+			modified_millis: 7,
 		}
 	}
 
@@ -5330,15 +5313,15 @@ mod tests {
 		assert!(!is_safe_name("a\\b"), "embedded backslash");
 	}
 
-	fn remote_dir(name: &str, parent: Uuid) -> CacheableDir<'static> {
-		CacheableDir {
+	fn remote_dir(name: &str, parent: Uuid) -> RemoteItem {
+		RemoteItem {
 			uuid: Uuid::new_v4(),
 			parent,
-			color: Default::default(),
-			favorited: false,
-			timestamp: ms(1),
-			name: Cow::Owned(name.to_string()),
-			created: Some(ms(1)),
+			name: name.to_string(),
+			stable_uuid: None,
+			hash: None,
+			size: 0,
+			modified_millis: 1,
 		}
 	}
 
@@ -5725,15 +5708,7 @@ mod tests {
 	#[test]
 	fn build_remote_view_excludes_the_quarantine_dir_name() {
 		let root = Uuid::new_v4();
-		let trash = CacheableDir {
-			uuid: Uuid::new_v4(),
-			parent: root,
-			color: Default::default(),
-			favorited: false,
-			timestamp: ms(1),
-			name: Cow::Borrowed(QUARANTINE_DIR),
-			created: Some(ms(1)),
-		};
+		let trash = remote_dir(QUARANTINE_DIR, root);
 		let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[], None);
 		assert!(
 			view.nodes.is_empty(),
@@ -6024,7 +5999,7 @@ mod tests {
 	fn a_byte_identical_duplicate_remote_name_holds_only_that_path() {
 		let root = Uuid::new_v4();
 		let predecessor = cacheable_file(root, "note.txt");
-		let successor = CacheableFile {
+		let successor = RemoteItem {
 			uuid: Uuid::new_v4(),
 			..predecessor.clone()
 		};
@@ -6107,9 +6082,9 @@ mod tests {
 	fn a_case_only_remote_collision_still_refuses_the_pass() {
 		let root = Uuid::new_v4();
 		let lower = cacheable_file(root, "note.txt");
-		let upper = CacheableFile {
+		let upper = RemoteItem {
 			uuid: Uuid::new_v4(),
-			name: Cow::Borrowed("Note.txt"),
+			name: "Note.txt".to_string(),
 			..lower.clone()
 		};
 
@@ -6125,39 +6100,9 @@ mod tests {
 	#[test]
 	fn build_remote_view_resolves_paths_and_flags_collisions() {
 		let root = Uuid::new_v4();
-		let sub = CacheableDir {
-			uuid: Uuid::new_v4(),
-			parent: root,
-			color: Default::default(),
-			favorited: false,
-			timestamp: ms(1),
-			name: Cow::Borrowed("sub"),
-			created: Some(ms(1)),
-		};
-		let file_uuid = Uuid::new_v4();
-		let file = CacheableFile {
-			uuid: file_uuid,
-			stable_uuid: filen_types::fs::StableUuid::new_for_test(file_uuid),
-			parent: sub.uuid,
-			chunks_size: 1,
-			chunks: 1,
-			favorited: false,
-			region: Cow::Borrowed("r"),
-			bucket: Cow::Borrowed("b"),
-			timestamp: ms(1),
-			name: Cow::Borrowed("f.txt"),
-			size: 5,
-			mime: Cow::Borrowed("text/plain"),
-			key: crate::crypto::file::FileKey::from_str_with_version(
-				&"a".repeat(64),
-				filen_types::auth::FileEncryptionVersion::V3,
-			)
-			.unwrap(),
-			last_modified: ms(7),
-			created: Some(ms(1)),
-			hash: Some(Blake3Hash::from([5; 32])),
-		};
-		let orphan = CacheableFile {
+		let sub = remote_dir("sub", root);
+		let file = cacheable_file(sub.uuid, "f.txt");
+		let orphan = RemoteItem {
 			uuid: Uuid::new_v4(),
 			parent: Uuid::new_v4(), // a parent not in the snapshot -> orphan, skipped
 			..file.clone()
@@ -6182,7 +6127,7 @@ mod tests {
 			view.skipped,
 			vec![SkippedRemote {
 				remote_uuid: orphan.uuid,
-				stable_uuid: Some(orphan.stable_uuid),
+				stable_uuid: orphan.stable_uuid,
 				rel_path: "f.txt".to_string(),
 				path_is_dir: false,
 				reason: UnsyncableReason::RemoteBrokenParent,

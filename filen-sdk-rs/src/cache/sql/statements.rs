@@ -65,8 +65,9 @@ pub(crate) const UNDECODABLE_LIST: &str = "SELECT DISTINCT uuid, parent, stable_
 	 FROM undecodable_items WHERE uuid NOT IN (SELECT uuid FROM items)";
 
 // Whole-subtree enumeration for the sync engine's remote snapshot (read via `cache::enumerate`,
-// which is compiled under the same gate). Its column order MUST match
-// `search::hydrate::row_to_result` (indices 0-21), the shared hydration.
+// which is compiled under the same gate). It projects only the columns the engine's remote view
+// reads, in the order `enumerate::slim_item` reads them by index; the full payload of the few
+// items a pass ACTS on comes from HYDRATE_BY_UUIDS below.
 #[cfg(all(
 	feature = "sync-engine",
 	not(all(target_family = "wasm", target_os = "unknown"))
