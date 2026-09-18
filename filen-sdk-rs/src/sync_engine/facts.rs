@@ -64,7 +64,7 @@ use super::{
 /// Each field is the one `Prepared` holds today under the same name, so a pass reads them exactly
 /// as it does now; what changes is that a change-scoped pass no longer re-derives them all from a
 /// whole-tree read.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct PairFacts {
 	/// Paths whose name the remote would reject, with the validator's message
 	/// ([`LocalScan::invalid_names`]).
