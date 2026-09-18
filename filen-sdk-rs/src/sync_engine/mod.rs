@@ -39,6 +39,16 @@ mod observe;
 mod outcome;
 mod pause;
 mod plan;
+// The remote half of the same pass. Nothing calls it yet either: it applies the announced changes
+// to the derived remote view, and `run_pass` wires the two halves in together.
+#[cfg_attr(
+	not(test),
+	expect(
+		dead_code,
+		reason = "wired into `run_pass` with the rest of the change-scoped pass"
+	)
+)]
+mod remote;
 // The permanent per-phase cost probe, driven by `tests/sync_engine_probe.rs`. Gated on
 // `bench-internals` like `cache::bench_support`, and deliberately not on `cfg(test)`: the `tests/`
 // binary links the library compiled WITHOUT `cfg(test)`, so such a seam would be invisible to the
