@@ -871,7 +871,7 @@ fn restore_journal(pending: &PendingWrites, rows: Vec<PendingRow>, now: i64) {
 }
 
 /// The remote node a baseline row describes — the state the write it records left behind.
-fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> {
+pub(super) fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> {
 	let entry = entry?;
 	Some(RemoteNode {
 		rel_path: entry.rel_path.clone(),
