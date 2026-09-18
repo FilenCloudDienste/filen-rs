@@ -1568,16 +1568,16 @@ fn detect_moves(
 			.filter(|(_, node)| node.kind == NodeKind::File)
 			.filter_map(|(path, node)| Some((node.stable_uuid?, path.as_str())))
 			.collect();
-		for entry in baseline.iter() {
-			let (from, base) = (&entry.rel_path, &entry);
+		baseline.visit_rows(|base| {
+			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
 			{
-				continue;
+				return;
 			}
 			let Some(uuid) = base.remote_uuid else {
-				continue;
+				return;
 			};
 			// Only where the local side still matches the baseline — for EITHER match. With a local
 			// edit at `from` this is a genuine both-sides divergence, and consuming it as a move
@@ -1595,7 +1595,7 @@ fn detect_moves(
 			if base.content_hash.is_some()
 				&& classify_local(local.get(from), Some(base)) != Side::Unchanged
 			{
-				continue;
+				return;
 			}
 			// `carries_edit`: the lineage moved AND changed version, so the local copy this move
 			// renames is the pre-edit one and still has to be refreshed.
@@ -1606,7 +1606,7 @@ fn detect_moves(
 					.and_then(|lineage| remote_path_of_lineage.get(&lineage))
 				{
 					Some(&to) => (to, true),
-					None => continue,
+					None => return,
 				},
 			};
 			// The edit a move carried is measured by the same rule as one that stayed put: over a
@@ -1637,7 +1637,7 @@ fn detect_moves(
 				);
 				actions.push(action);
 				consumed.insert(from.clone());
-				continue;
+				return;
 			}
 			if to != from
 				&& !baseline.contains_key(to)
@@ -1674,7 +1674,7 @@ fn detect_moves(
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
-		}
+		});
 	}
 
 	if mode.pushes() {
@@ -1693,24 +1693,24 @@ fn detect_moves(
 					.push(path.as_str());
 			}
 		}
-		for entry in baseline.iter() {
-			let (from, base) = (&entry.rel_path, &entry);
+		baseline.visit_rows(|base| {
+			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
 				|| local.contains_key(from)
 			{
-				continue;
+				return;
 			}
 			let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
-				continue;
+				return;
 			};
 			// The remote must still hold the original file at `from` for there to be one to move.
 			if remote.get(from).map(|n| n.remote_uuid) != Some(uuid) {
-				continue;
+				return;
 			}
 			let Some(candidates) = created_by_hash.get(hash.as_ref()) else {
-				continue;
+				return;
 			};
 			let fresh: Vec<&str> = candidates
 				.iter()
@@ -1733,7 +1733,7 @@ fn detect_moves(
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
-		}
+		});
 	}
 }
 
@@ -2005,11 +2005,18 @@ fn next_dir_move(
 	remote: &HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
 ) -> Option<SyncAction> {
-	let mut sources: Vec<(String, Uuid)> = baseline
-		.iter()
-		.filter(|row| row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
-		.filter_map(|row| row.remote_uuid.map(|uuid| (row.rel_path, uuid)))
-		.collect();
+	// Only a synced directory can be the source of a directory move, and at any ordinary shape the
+	// directories are a small fraction of the rows — so the visitor checks that against a row it did
+	// not allocate, and a path is copied only for a row that is actually a candidate.
+	let mut sources: Vec<(String, Uuid)> = Vec::new();
+	baseline.visit_rows(|row| {
+		if row.kind == NodeKind::Dir
+			&& row.state == BaselineState::Synced
+			&& let Some(uuid) = row.remote_uuid
+		{
+			sources.push((row.rel_path.clone(), uuid));
+		}
+	});
 	if sources.is_empty() {
 		return None;
 	}
