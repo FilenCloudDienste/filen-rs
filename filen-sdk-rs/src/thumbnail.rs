@@ -273,11 +273,14 @@ pub use microthumb::{
 /// almost nothing.
 pub const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Resident bytes a [`RemoteChunkSource`] keeps for the whole decode (its two
-/// chunk slots) — callers subtract this from the budget they hand
-/// [`make_thumbnail_from_source`], because the pipeline's own accounting
-/// cannot see the source's memory.
-pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 2 * crate::consts::CHUNK_SIZE_U64 as usize;
+/// Resident bytes a [`RemoteChunkSource`] keeps for the whole decode — callers
+/// subtract this from the budget they hand [`make_thumbnail_from_source`],
+/// because the pipeline's own accounting cannot see the source's memory. Its
+/// two chunk slots, plus the one chunk a bulk stream (a full decode's
+/// read-ahead, see `RemoteChunkSource`) parks in its hand-off channel. What
+/// the stream's reader holds in flight is pool memory drawn from the client's
+/// file-io budget, exactly like any download's, and is not charged here.
+pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 3 * crate::consts::CHUNK_SIZE_U64 as usize;
 
 /// The thumbnail that was written, and how it was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,9 +696,125 @@ mod remote_chunks {
 		Ok(data)
 	}
 
+	/// The byte range of chunk `index` in a file of `len` bytes.
+	pub(super) fn chunk_range(index: u64, len: u64) -> (u64, u64) {
+		let start = index * crate::consts::CHUNK_SIZE_U64;
+		(start, (start + crate::consts::CHUNK_SIZE_U64).min(len))
+	}
+
+	/// One chunk a [`RemoteChunkSource`] needs, and how it expects the rest to
+	/// follow.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	pub(super) struct ChunkAsk {
+		pub index: u64,
+		/// The decode has committed to reading front to back from here
+		/// ([`ByteSource::hint_bulk_sequential`]): serve this chunk as the
+		/// head of a read-ahead stream, not as one range request.
+		pub bulk: bool,
+	}
+
+	/// A read-ahead reader over the rest of the file from chunk `first`: what
+	/// a bulk ask is served from. Uncapped on purpose — it reads ahead as far
+	/// as the client's file-io pool lets any download: the decode has
+	/// committed to every byte, so the fastest possible download is the
+	/// shortest possible thumbnail, and finishing sooner is what frees the
+	/// pool for everyone else.
+	fn bulk_reader<'a>(
+		client: &'a UnauthClient,
+		file: &'a dyn File,
+		first: u64,
+	) -> crate::fs::file::read::FileReader<'a> {
+		crate::fs::file::read::FileReaderBuilder::new(client, file)
+			.with_start(first * crate::consts::CHUNK_SIZE_U64)
+			.build()
+	}
+
+	/// Serves one ask on the async side of either bridge: a range request, or
+	/// — for a bulk ask — the next chunk of the read-ahead reader in `stream`,
+	/// positioned at `ask.index`. The reader is rebuilt whenever the ask is
+	/// not the chunk it would yield next (a seek; rare, and the header chunk
+	/// stays resident in the source, so a decoder restarting from the top
+	/// never asks for it) and kept otherwise, its read-ahead intact.
+	///
+	/// A short chunk means the file ended — empty when it ended before this
+	/// chunk, which the source answers as EOF like any read past the end.
+	async fn serve_chunk<'a>(
+		client: &'a UnauthClient,
+		file: &'a dyn File,
+		stream: &mut Option<(u64, crate::fs::file::read::FileReader<'a>)>,
+		ask: ChunkAsk,
+	) -> Result<Vec<u8>, Error> {
+		use futures::AsyncReadExt;
+
+		if !ask.bulk {
+			let (start, end) = chunk_range(ask.index, file.size());
+			return fetch_range(client, file, start, end).await;
+		}
+		if stream.as_ref().is_none_or(|(next, _)| *next != ask.index) {
+			*stream = Some((ask.index, bulk_reader(client, file, ask.index)));
+		}
+		let (next, reader) = stream.as_mut().expect("just ensured");
+		*next += 1;
+		let mut chunk = Vec::with_capacity(crate::consts::CHUNK_SIZE);
+		(&mut *reader)
+			.take(crate::consts::CHUNK_SIZE_U64)
+			.read_to_end(&mut chunk)
+			.await?;
+		Ok(chunk)
+	}
+
+	/// The native bulk stream: one runtime task pumping consecutive chunks
+	/// from `first` to the decode thread through a one-slot channel. The slot
+	/// is reserved BEFORE the next chunk is read, so no chunk ever waits
+	/// outside the channel — [`REMOTE_SOURCE_RESIDENT_BYTES`] charges exactly
+	/// that one slot. The receiver going away (the decode finished, was
+	/// cancelled, or asked for some other chunk) ends the task at its next
+	/// reserve. The file's end is handed over as an empty chunk, and only a
+	/// task that dies without sending one leaves the receiver empty-handed.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	async fn pump_chunks<C, F>(
+		client: Arc<C>,
+		file: Arc<F>,
+		first: u64,
+		chunks: tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+	) where
+		C: SharedClient + Send + Sync + 'static,
+		F: File + Send + Sync + 'static,
+	{
+		let mut stream = None;
+		let mut index = first;
+		while let Ok(slot) = chunks.reserve().await {
+			let ask = ChunkAsk { index, bulk: true };
+			match serve_chunk(client.get_unauth_client(), &*file, &mut stream, ask).await {
+				Ok(chunk) => {
+					let ended = chunk.is_empty();
+					slot.send(Ok(chunk));
+					if ended {
+						return;
+					}
+				}
+				Err(e) => {
+					slot.send(Err(std::io::Error::other(e)));
+					return;
+				}
+			}
+			index += 1;
+		}
+	}
+
 	/// [`ByteSource`] that fetches and decrypts 1 MiB chunks of a remote file on
 	/// demand, keeping only the last two — so a thumbnail served by an embedded
 	/// preview costs one chunk of download, not the file.
+	///
+	/// Two phases, switched by the pipeline's
+	/// [`hint_bulk_sequential`](ByteSource::hint_bulk_sequential): until it,
+	/// every miss is one range request made when the decoder stalls on it —
+	/// the header and an embedded preview cost a chunk or two whatever the
+	/// file size. From it on, the decode has committed to the whole file, and
+	/// every miss is served from a read-ahead stream instead — as many chunks
+	/// in flight as the client's file-io pool allows, like any download — so
+	/// the download runs bandwidth-bound alongside the decode rather than one
+	/// round trip per chunk in series with it.
 	///
 	/// Synchronous by contract, because the pipeline is. The bridge to the async
 	/// fetch is the one genuinely per-target piece: on native a
@@ -705,7 +824,7 @@ mod remote_chunks {
 	/// reads at chunk boundaries are shared; cancellation is NOT — only the
 	/// native bridge is ever handed a flag, see [`cancel`](Self::cancel).
 	pub struct RemoteChunkSource {
-		fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
+		fetch: Box<dyn FnMut(ChunkAsk) -> std::io::Result<Vec<u8>> + Send>,
 		/// Checked before every read: cancellation surfaces as an io error,
 		/// which unwinds the decode through its normal error path at chunk
 		/// granularity — the same points an async decoder would get to cancel
@@ -725,13 +844,18 @@ mod remote_chunks {
 		len: u64,
 		slots: [Option<(u64, Vec<u8>)>; 2],
 		next_evict: usize,
+		/// Raised by the pipeline's bulk hint; every miss from then on is a
+		/// bulk ask.
+		bulk: bool,
 	}
 
 	impl RemoteChunkSource {
+		/// `fetch` answers one ask with that chunk's plaintext — short when the
+		/// file ends inside it, empty when it ended before it.
 		pub(super) fn with_fetcher(
 			len: u64,
 			cancel: Option<Arc<AtomicBool>>,
-			fetch: Box<dyn FnMut(u64, u64) -> std::io::Result<Vec<u8>> + Send>,
+			fetch: Box<dyn FnMut(ChunkAsk) -> std::io::Result<Vec<u8>> + Send>,
 		) -> Self {
 			RemoteChunkSource {
 				fetch,
@@ -739,6 +863,7 @@ mod remote_chunks {
 				len,
 				slots: [None, None],
 				next_evict: 0,
+				bulk: false,
 			}
 		}
 
@@ -769,13 +894,38 @@ mod remote_chunks {
 			F: File + Send + Sync + 'static,
 		{
 			let len = file.size();
+			// `Arc`: every bulk stream is a spawned task that must own the file
+			// for its lifetime, and one source may start several.
+			let file = Arc::new(file);
+			// The live bulk stream: the index its next chunk carries, and the
+			// receiving end of `pump_chunks`.
+			let mut stream: Option<(u64, tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>)> =
+				None;
 			Self::with_fetcher(
 				len,
 				cancel,
-				Box::new(move |start, end| {
-					handle
-						.block_on(fetch_range(client.get_unauth_client(), &file, start, end))
-						.map_err(std::io::Error::other)
+				Box::new(move |ask| {
+					if !ask.bulk {
+						let (start, end) = chunk_range(ask.index, len);
+						return handle
+							.block_on(fetch_range(client.get_unauth_client(), &*file, start, end))
+							.map_err(std::io::Error::other);
+					}
+					// A stream yields consecutive chunks; an ask for any other
+					// one replaces it, and dropping the old receiver ends the
+					// old pump at its next reserve.
+					if stream.as_ref().is_none_or(|(next, _)| *next != ask.index) {
+						let (chunks, receiver) = tokio::sync::mpsc::channel(1);
+						handle.spawn(pump_chunks(client.clone(), file.clone(), ask.index, chunks));
+						stream = Some((ask.index, receiver));
+					}
+					let (next, receiver) = stream.as_mut().expect("just ensured");
+					*next += 1;
+					handle.block_on(receiver.recv()).unwrap_or_else(|| {
+						Err(std::io::Error::other(
+							"thumbnail chunk stream ended before the file did",
+						))
+					})
 				}),
 			)
 		}
@@ -794,7 +944,7 @@ mod remote_chunks {
 			Self::with_fetcher(
 				len,
 				cancel,
-				Box::new(move |start, end| {
+				Box::new(move |ask| {
 					// A dropped driver (the caller's future went away) closes
 					// `requests`, and the decode unwinds at the same chunk
 					// granularity a cancel flag would give it.
@@ -808,7 +958,7 @@ mod remote_chunks {
 					let cancelled = || std::io::Error::other("thumbnail cancelled");
 					let (reply, replies) = std::sync::mpsc::channel();
 					requests
-						.send(ChunkRequest { start, end, reply })
+						.send(ChunkRequest { ask, reply })
 						.map_err(|_| cancelled())?;
 					replies.recv().map_err(|_| cancelled())?
 				}),
@@ -838,9 +988,10 @@ mod remote_chunks {
 			{
 				return Ok(&self.slots[slot].as_ref().expect("just matched").1);
 			}
-			let start = index * crate::consts::CHUNK_SIZE_U64;
-			let end = (start + crate::consts::CHUNK_SIZE_U64).min(self.len);
-			let data = (self.fetch)(start, end)?;
+			let data = (self.fetch)(ChunkAsk {
+				index,
+				bulk: self.bulk,
+			})?;
 			let slot = self.next_evict;
 			self.next_evict = (self.next_evict + 1) % self.slots.len();
 			self.slots[slot] = Some((index, data));
@@ -868,13 +1019,16 @@ mod remote_chunks {
 			buf[..n].copy_from_slice(&chunk[within..within + n]);
 			Ok(n)
 		}
+
+		fn hint_bulk_sequential(&mut self) {
+			self.bulk = true;
+		}
 	}
 
 	/// One chunk fetch, crossing from the decode worker to the async runtime.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	struct ChunkRequest {
-		start: u64,
-		end: u64,
+		ask: ChunkAsk,
 		reply: std::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
 	}
 
@@ -1224,6 +1378,9 @@ mod remote_chunks {
 			// for, only a result. The arm is disabled rather than left to spin on a channel
 			// that now returns `None` immediately.
 			let mut source_gone = false;
+			// The worker's bulk asks are served from this read-ahead reader (see
+			// `serve_chunk`); it lives here because the driver is the side that can await.
+			let mut stream = None;
 			loop {
 				tokio::select! {
 					biased;
@@ -1240,14 +1397,10 @@ mod remote_chunks {
 						// connection — which is time another driver must not count against
 						// the worker.
 						decode_worker::note_activity();
-						let data = fetch_range(
-							client.get_unauth_client(),
-							file,
-							request.start,
-							request.end,
-						)
-						.await
-						.map_err(std::io::Error::other);
+						let data =
+							serve_chunk(client.get_unauth_client(), file, &mut stream, request.ask)
+								.await
+								.map_err(std::io::Error::other);
 						let _ = request.reply.send(data);
 						// Handing the chunk back is the second observation of the pair: it
 						// dates the worker's next silence from when the worker resumed, not
@@ -2489,6 +2642,7 @@ mod tests {
 	use super::{
 		DEFAULT_THUMBNAIL_MEM_BUDGET, REMOTE_SOURCE_RESIDENT_BYTES, RemoteChunkSource, ThumbSpec,
 		ThumbnailFit, ThumbnailOutcome, WEBP_MAX_LOSSY_DIMENSION, make_thumbnail_from_source,
+		remote_chunks::{ChunkAsk, chunk_range},
 		write_webp,
 	};
 	use crate::{
@@ -2814,6 +2968,55 @@ mod tests {
 	}
 
 	#[test]
+	fn the_bulk_hint_turns_every_later_miss_into_a_stream_ask() {
+		use std::sync::Mutex;
+
+		use microthumb::ByteSource;
+
+		use crate::consts::CHUNK_SIZE_U64;
+
+		let asks = Arc::new(Mutex::new(Vec::new()));
+		let len = 5 * CHUNK_SIZE_U64 + 10;
+		let mut source = RemoteChunkSource::with_fetcher(len, None, {
+			let asks = asks.clone();
+			Box::new(move |ask| {
+				asks.lock().unwrap().push(ask);
+				let (start, end) = chunk_range(ask.index, len);
+				Ok(vec![ask.index as u8; (end - start) as usize])
+			})
+		});
+		let mut buf = [0u8; 16];
+		// The header phase: on-demand range asks, and a read up against the
+		// chunk boundary stays inside the resident chunk.
+		source.read_at(0, &mut buf).unwrap();
+		source.read_at(CHUNK_SIZE_U64 - 8, &mut buf).unwrap();
+		// The decode commits. A hit is still a hit; every miss is now a bulk
+		// ask, in the order the decoder reads.
+		source.hint_bulk_sequential();
+		source.read_at(0, &mut buf).unwrap();
+		source.read_at(CHUNK_SIZE_U64, &mut buf).unwrap();
+		source.read_at(2 * CHUNK_SIZE_U64 + 100, &mut buf).unwrap();
+		assert_eq!(buf[0], 2, "chunk bytes must come from the asked chunk");
+		assert_eq!(
+			*asks.lock().unwrap(),
+			vec![
+				ChunkAsk {
+					index: 0,
+					bulk: false
+				},
+				ChunkAsk {
+					index: 1,
+					bulk: true
+				},
+				ChunkAsk {
+					index: 2,
+					bulk: true
+				},
+			]
+		);
+	}
+
+	#[test]
 	fn short_reads_at_chunk_boundaries_still_thumbnail() {
 		// A 1 KiB chunk size forces hundreds of boundary-shortened reads
 		// through the same read_at contract RemoteChunkSource answers with.
@@ -2899,7 +3102,10 @@ mod tests {
 		let inner = RemoteChunkSource::with_fetcher(
 			len,
 			Some(cancel.clone()),
-			Box::new(move |start, end| Ok(data[start as usize..end as usize].to_vec())),
+			Box::new(move |ask| {
+				let (start, end) = chunk_range(ask.index, len);
+				Ok(data[start as usize..end as usize].to_vec())
+			}),
 		);
 		let mut out = Vec::new();
 		let result = make_thumbnail_from_source(
