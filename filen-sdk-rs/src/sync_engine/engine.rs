@@ -4251,8 +4251,8 @@ impl SyncEngine {
 		};
 		self.forget_settled_pushes(&confirmed);
 		// One decision in one place: the changelists' own reasons plus the two facts only the pass
-		// knows. It is RECORDED, not yet acted on — the pass below reads and reconciles both sides
-		// whole whatever the answer is, and the change-scoped pass that consumes it comes next.
+		// knows. `prepare` above has already acted on it — a pass with no reason read only what its
+		// changelists named — and the report carries it on, for the safety net and for the caller.
 		let mut report = SyncReport {
 			full_pass: prep.read.full_pass_reason(),
 			read_cost,
