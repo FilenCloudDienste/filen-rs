@@ -2209,10 +2209,14 @@ async fn conflict_16_resolve_keep_local() {
 	assert_eq!(r3.uploaded + r3.downloaded, 0, "{r3:?}");
 
 	// Resolve keep-LOCAL; the next pass pushes the local copy and clears the hold.
-	sc.engine
-		.resolve_conflict(sc.pair, "conf.txt", ConflictResolution::KeepLocal)
-		.await
-		.expect("resolve keep-local");
+	assert_eq!(
+		sc.engine
+			.resolve_conflict(sc.pair, "conf.txt", ConflictResolution::KeepLocal)
+			.await
+			.expect("resolve keep-local"),
+		None,
+		"keep-local moves no copy into the bin"
+	);
 	let r4 = sc.sync().await;
 	assert!(r4.errors.is_empty(), "{r4:?}");
 	assert!(r4.conflicts.is_empty(), "conflict not cleared: {r4:?}");
@@ -2267,10 +2271,19 @@ async fn conflict_17_resolve_keep_remote() {
 		"divergence must surface: {r2:?}"
 	);
 
-	sc.engine
+	// The resolution names where it put the copy it took out of the way, so a caller can offer
+	// those bytes back without walking the bin.
+	let quarantined = sc
+		.engine
 		.resolve_conflict(sc.pair, "conf2.txt", ConflictResolution::KeepRemote)
 		.await
-		.expect("resolve keep-remote");
+		.expect("resolve keep-remote")
+		.expect("keep-remote must say where the losing local edit went");
+	assert_eq!(
+		std::fs::read(&quarantined).unwrap(),
+		b"LLLLLLLLLL",
+		"the path the resolution named does not hold the edit it moved aside"
+	);
 	let r3 = sc.sync().await;
 	assert!(r3.errors.is_empty(), "{r3:?}");
 	assert!(r3.conflicts.is_empty(), "conflict not cleared: {r3:?}");
@@ -2318,10 +2331,14 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"first conflict must surface"
 	);
-	sc.engine
-		.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
-		.await
-		.expect("first keep-both");
+	assert_eq!(
+		sc.engine
+			.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
+			.await
+			.expect("first keep-both"),
+		None,
+		"keep-both leaves its copy in the tree, not in the bin"
+	);
 	assert!(
 		read_eq(&sc.local, "a.old.txt", b"LOCAL-1"),
 		"keep-both must preserve the local copy as a.old.txt"
@@ -2348,10 +2365,14 @@ async fn conflict_19_conflict_copy_naming_no_collision_or_recursion() {
 		sc.sync().await.conflict_paths().any(|c| c == "a.txt"),
 		"second conflict must surface"
 	);
-	sc.engine
-		.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
-		.await
-		.expect("second keep-both");
+	assert_eq!(
+		sc.engine
+			.resolve_conflict(sc.pair, "a.txt", ConflictResolution::KeepBoth)
+			.await
+			.expect("second keep-both"),
+		None,
+		"keep-both leaves its copy in the tree, not in the bin"
+	);
 
 	// A DISTINCT name: the first preserved copy is untouched, the second gets its own.
 	assert!(
@@ -2401,10 +2422,14 @@ async fn conflict_add_resolved_copy_round_trips() {
 		"conflict must surface"
 	);
 
-	sc.engine
-		.resolve_conflict(sc.pair, "c.txt", ConflictResolution::KeepBoth)
-		.await
-		.expect("keep-both");
+	assert_eq!(
+		sc.engine
+			.resolve_conflict(sc.pair, "c.txt", ConflictResolution::KeepBoth)
+			.await
+			.expect("keep-both"),
+		None,
+		"keep-both leaves its copy in the tree, not in the bin"
+	);
 
 	// Pass 1 after the resolution: the copy uploads once, the remote copy is pulled.
 	let r1 = sc.sync().await;
@@ -2556,10 +2581,14 @@ async fn conflict_18_conflict_persists_across_restart() {
 	);
 
 	// Resolving on the RESTARTED engine propagates exactly as it does before a restart.
-	engine2
-		.resolve_conflict(pair2, "persist.txt", ConflictResolution::KeepLocal)
-		.await
-		.expect("resolve keep-local after the restart");
+	assert_eq!(
+		engine2
+			.resolve_conflict(pair2, "persist.txt", ConflictResolution::KeepLocal)
+			.await
+			.expect("resolve keep-local after the restart"),
+		None,
+		"keep-local moves no copy into the bin"
+	);
 	let r4 = engine2.sync_once(pair2).await.unwrap();
 	assert!(r4.errors.is_empty(), "{r4:?}");
 	assert!(r4.conflicts.is_empty(), "conflict not cleared: {r4:?}");
@@ -2753,14 +2782,24 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	} else {
 		(b"A-EDIT", b"B-EDIT-LONGER")
 	};
-	win_engine
-		.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepBoth)
-		.await
-		.unwrap();
-	lose_engine
+	assert_eq!(
+		win_engine
+			.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepBoth)
+			.await
+			.unwrap(),
+		None,
+		"keep-both leaves its copy in the tree, not in the bin"
+	);
+	let gave_way = lose_engine
 		.resolve_conflict(lose_pair, "race.txt", ConflictResolution::KeepRemote)
 		.await
-		.unwrap();
+		.unwrap()
+		.expect("the side that gave way must be told where its own copy went");
+	assert_eq!(
+		std::fs::read(&gave_way).unwrap().as_slice(),
+		lost_bytes,
+		"the named path does not hold the copy that gave way"
+	);
 
 	converge(
 		&tc.engine_a,
@@ -3098,10 +3137,16 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 	} else {
 		(b"A-EDIT", b"B-EDIT-LONGER")
 	};
-	win_engine
+	let ours_aside = win_engine
 		.resolve_conflict(win_pair, "race.txt", ConflictResolution::KeepRemote)
 		.await
-		.unwrap();
+		.unwrap()
+		.expect("restoring the buried version must say where our own copy went");
+	assert_eq!(
+		std::fs::read(&ours_aside).unwrap().as_slice(),
+		won_bytes,
+		"the named path does not hold the copy the restore moved aside"
+	);
 
 	// Ground truth, read from the server rather than from either client's cache: the buried
 	// version is the head again, under one name.
