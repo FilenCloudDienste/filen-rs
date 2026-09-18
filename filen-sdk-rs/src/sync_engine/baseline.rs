@@ -10,15 +10,17 @@
 //! cache's single-writer worker model is untouched.
 
 use std::{
+	cell::RefCell,
 	collections::{BTreeSet, HashMap},
 	path::Path,
+	sync::Arc,
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode};
+use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, plan::is_under};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`.
 ///
@@ -433,6 +435,14 @@ pub type PairId = i64;
 /// The baseline DB handle (sole owner / single writer).
 pub(crate) struct BaselineStore {
 	conn: Connection,
+	/// Each pair's rows as they stand, read whole from the DB once and kept in step by every write
+	/// path below (see [`BaselineStore::baseline`]). A pass reads its baseline from here instead of
+	/// paying the whole-tree `SELECT` and the map build every time.
+	///
+	/// A [`RefCell`] because every write path takes `&self` — the connection is already the single
+	/// writer, serialized by the pair's store mutex, so there is no second borrower to race. The
+	/// store is `Send` and never `Sync`, exactly as the `Connection` inside it already makes it.
+	resident: RefCell<HashMap<PairId, Arc<HashMap<String, BaselineEntry>>>>,
 }
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
@@ -578,6 +588,42 @@ fn record_write<T>(
 	})
 }
 
+/// Apply to a resident copy exactly what [`BaselineStore::write_changes`] applied to the DB.
+///
+/// `MoveSubtree` mirrors the two `UPDATE OR REPLACE` statements: every row at or under `from` is
+/// re-keyed under `to`, overwriting whatever sat at the destination. Every source is removed before
+/// any destination is written, so a case-only rename (`A` -> `a`, which shares no key with itself
+/// under a bytewise comparison but does under a lookup) cannot drop a row it has just written.
+fn apply_to_resident(rows: &mut HashMap<String, BaselineEntry>, changes: &[BaselineChange<'_>]) {
+	for change in changes {
+		match change {
+			BaselineChange::Upsert(entry) => {
+				rows.insert(entry.rel_path.clone(), (*entry).clone());
+			}
+			BaselineChange::Delete(rel_path) => {
+				rows.remove(*rel_path);
+			}
+			BaselineChange::MoveSubtree { from, to } => {
+				let moving: Vec<String> = rows
+					.keys()
+					.filter(|path| path.as_str() == *from || is_under(path, from))
+					.cloned()
+					.collect();
+				let moved: Vec<(String, BaselineEntry)> = moving
+					.into_iter()
+					.filter_map(|old| {
+						let mut entry = rows.remove(&old)?;
+						let new = format!("{to}{}", &old[from.len()..]);
+						entry.rel_path = new.clone();
+						Some((new, entry))
+					})
+					.collect();
+				rows.extend(moved);
+			}
+		}
+	}
+}
+
 /// The changes a failed [`apply_changes`](BaselineStore::apply_changes) or
 /// [`record_pending`](BaselineStore::record_pending) did not write, for the log line that says so.
 /// Called on that failure only, so its allocations cost a pass nothing.
@@ -719,7 +765,10 @@ impl BaselineStore {
 		// Then the additive objects, on every open: a DB written before one of them existed gains it
 		// here, and a fresh one has just been created without them (see [`ADDITIVE_SCHEMA`]).
 		conn.execute_batch(ADDITIVE_SCHEMA).map_err(open_error)?;
-		Ok(Self { conn })
+		Ok(Self {
+			conn,
+			resident: RefCell::new(HashMap::new()),
+		})
 	}
 
 	/// Register a pair, or find the existing one with the same `(local_root, remote_root)`.
@@ -772,10 +821,19 @@ impl BaselineStore {
 		)?;
 		if changed > 0 {
 			for entry in adopted {
-				self.upsert_entry(id, entry)?;
+				// The non-mirroring form: these rows are inside the transaction below, and a copy
+				// updated per row would keep the rows a rollback took back (see `note_written`).
+				self.upsert_entry_once(id, entry)?;
 			}
 		}
 		tx.commit()?;
+		if changed > 0 {
+			self.note_written(id, |rows| {
+				for entry in adopted {
+					rows.insert(entry.rel_path.clone(), entry.clone());
+				}
+			});
+		}
 		Ok(changed)
 	}
 
@@ -818,6 +876,7 @@ impl BaselineStore {
 		// The `ON DELETE CASCADE` (with `foreign_keys = ON`) drops the pair's baseline rows.
 		self.conn
 			.execute("DELETE FROM sync_pairs WHERE id = ?1", params![id])?;
+		self.forget_resident(id);
 		Ok(())
 	}
 
@@ -922,6 +981,11 @@ impl BaselineStore {
 			|| format!("the baseline row for {:?}", entry.rel_path),
 			|| self.upsert_entry_once(pair, entry),
 		)
+		.inspect(|()| {
+			self.note_written(pair, |rows| {
+				rows.insert(entry.rel_path.clone(), entry.clone());
+			});
+		})
 	}
 
 	/// [`upsert_entry`](Self::upsert_entry) without the retry, for the callers already inside a
@@ -976,6 +1040,56 @@ impl BaselineStore {
 			.collect()
 	}
 
+	/// `pair`'s rows keyed by path, read from the DB on the first call and kept in step by every
+	/// write path here afterwards.
+	///
+	/// This is what a pass reconciles against, so it is read once per PAIR rather than once per
+	/// pass: at 100k rows the `SELECT` and the map build it replaces cost ~180 ms, which an idle
+	/// pass would otherwise pay to find out that nothing changed.
+	///
+	/// This process's store is assumed to be the only writer of the pair's rows — it is, for every
+	/// path in the engine — and a second writer on the same file (another engine, another process)
+	/// would leave the copy describing rows that connection has since changed. Nothing enforces it.
+	///
+	/// Handed out as an [`Arc`], and every write below applies itself through
+	/// [`Arc::make_mut`]: while a pass holds a copy, that pass's view stays exactly the one it read
+	/// — the pass reconciles against a fixed baseline and writes the rows it advances — and the
+	/// FIRST write of such a pass clones the map once, after which the store owns it alone again
+	/// and the rest of that pass's writes land in place. A pass that writes nothing clones nothing.
+	pub(crate) fn baseline(
+		&self,
+		pair: PairId,
+	) -> rusqlite::Result<Arc<HashMap<String, BaselineEntry>>> {
+		if let Some(rows) = self.resident.borrow().get(&pair) {
+			return Ok(Arc::clone(rows));
+		}
+		let rows: Arc<HashMap<String, BaselineEntry>> = Arc::new(
+			self.entries(pair)?
+				.into_iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect(),
+		);
+		self.resident.borrow_mut().insert(pair, Arc::clone(&rows));
+		Ok(rows)
+	}
+
+	/// Apply to the resident copy what a write that has just COMMITTED did to the DB. Called on the
+	/// success path only: a write that failed changed no row, and mirroring it would make the
+	/// resident copy describe a DB that does not exist.
+	///
+	/// A pair nothing has read yet has no resident copy, and gains one from the DB when something
+	/// asks: there is nothing to keep in step until then.
+	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut HashMap<String, BaselineEntry>)) {
+		if let Some(rows) = self.resident.borrow_mut().get_mut(&pair) {
+			apply(Arc::make_mut(rows));
+		}
+	}
+
+	/// Drop `pair`'s resident copy: its rows are gone, or are about to be re-read from scratch.
+	fn forget_resident(&self, pair: PairId) {
+		self.resident.borrow_mut().remove(&pair);
+	}
+
 	/// The rows `pair` is holding in conflict — both flavours — ordered by path.
 	///
 	/// A `WHERE` on the state rather than a read of the whole pair filtered in Rust: what a caller
@@ -1014,6 +1128,11 @@ impl BaselineStore {
 			|| format!("the deletion of the baseline row for {rel_path:?}"),
 			|| self.delete_entry_once(pair, rel_path),
 		)
+		.inspect(|()| {
+			self.note_written(pair, |rows| {
+				rows.remove(rel_path);
+			});
+		})
 	}
 
 	/// [`delete_entry`](Self::delete_entry) without the retry, for a caller already inside one of
@@ -1040,7 +1159,15 @@ impl BaselineStore {
 				delete_under.execute(params![pair, root])?;
 			}
 		}
-		tx.commit()
+		tx.commit().inspect(|()| {
+			self.note_written(pair, |rows| {
+				rows.retain(|path, _| {
+					!roots
+						.iter()
+						.any(|root| path == root || is_under(path, root))
+				});
+			});
+		})
 	}
 
 	/// Journal a remote write AND apply the baseline edits it produced, in ONE transaction.
@@ -1075,6 +1202,7 @@ impl BaselineStore {
 			},
 			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes),
 		)
+		.inspect(|()| self.note_written(pair, |rows| apply_to_resident(rows, changes)))
 	}
 
 	fn record_pending_once(
@@ -1137,6 +1265,7 @@ impl BaselineStore {
 				tx.commit()
 			},
 		)
+		.inspect(|()| self.note_written(pair, |rows| apply_to_resident(rows, changes)))
 	}
 
 	/// Runs inside a transaction the caller opened, so every statement here is the non-retrying
@@ -2050,6 +2179,261 @@ mod tests {
 
 		store.delete_entry(pair, "x.txt").unwrap();
 		assert_eq!(store.entry(pair, "x.txt").unwrap(), None);
+	}
+
+	/// The resident copy a pass reconciles against has to describe the DB after EVERY write path,
+	/// or a pass reads rows that are not there (a fabricated absence) or misses rows that are.
+	/// Every path that writes a baseline row is driven here and the copy compared against a fresh
+	/// read of the file.
+	#[test]
+	fn every_write_path_keeps_the_resident_copy_equal_to_the_db() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		// From the DB: the copy exists from here on, so every write below has one to keep in step.
+		assert!(store.baseline(pair).unwrap().is_empty());
+
+		let agrees = |store: &BaselineStore, what: &str| {
+			let from_db: HashMap<String, BaselineEntry> = store
+				.entries(pair)
+				.unwrap()
+				.into_iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect();
+			assert_eq!(*store.baseline(pair).unwrap(), from_db, "after {what}");
+		};
+
+		store
+			.upsert_entry(pair, &file_entry("a/x.txt", [1; 32], 1))
+			.unwrap();
+		store.upsert_entry(pair, &dir_entry("a")).unwrap();
+		store.upsert_entry(pair, &dir_entry("a/sub")).unwrap();
+		store
+			.upsert_entry(pair, &file_entry("a/sub/y.txt", [2; 32], 2))
+			.unwrap();
+		store.upsert_entry(pair, &dir_entry("ab")).unwrap();
+		agrees(&store, "upsert_entry");
+
+		store.delete_entry(pair, "ab").unwrap();
+		agrees(&store, "delete_entry");
+
+		let replaced = file_entry("a/x.txt", [3; 32], 3);
+		store
+			.apply_changes(
+				pair,
+				&[
+					BaselineChange::Upsert(&replaced),
+					BaselineChange::Upsert(&dir_entry("b")),
+				],
+			)
+			.unwrap();
+		agrees(&store, "apply_changes(Upsert)");
+
+		// Onto an OCCUPIED destination, which the two `UPDATE OR REPLACE` statements overwrite.
+		store
+			.apply_changes(pair, &[BaselineChange::MoveSubtree { from: "a", to: "b" }])
+			.unwrap();
+		agrees(&store, "apply_changes(MoveSubtree)");
+
+		// A case-only rename shares no key with itself under a bytewise comparison.
+		store
+			.apply_changes(pair, &[BaselineChange::MoveSubtree { from: "b", to: "B" }])
+			.unwrap();
+		agrees(&store, "apply_changes(MoveSubtree), case only");
+
+		store
+			.record_pending(
+				pair,
+				Uuid::new_v4(),
+				&created("B/x.txt"),
+				NOW,
+				&[
+					BaselineChange::Upsert(&file_entry("B/x.txt", [4; 32], 4)),
+					BaselineChange::Delete("B/sub/y.txt"),
+				],
+			)
+			.unwrap();
+		agrees(&store, "record_pending");
+
+		store
+			.set_mode(
+				pair,
+				SyncMode::LocalToRemote,
+				&[
+					dir_entry("adopted"),
+					file_entry("adopted/z.txt", [5; 32], 5),
+				],
+			)
+			.unwrap();
+		agrees(&store, "set_mode");
+
+		store
+			.delete_subtrees(pair, &BTreeSet::from(["B".to_string()]))
+			.unwrap();
+		agrees(&store, "delete_subtrees");
+	}
+
+	/// A write that FAILED changed no row, so the copy must still describe the DB as it still is.
+	/// Triggers refuse one path per write shape, which is the only way to fail a write on purpose:
+	/// contention fails a write before it has run a statement, and what has to be covered here is a
+	/// write that fails HALF WAY — the second row of an adoption, whose rows land inside the mode
+	/// switch's own transaction, so a rollback takes back the row the loop already ran.
+	#[test]
+	fn a_failed_write_leaves_the_resident_copy_describing_the_db() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		for entry in [
+			dir_entry("guard"),
+			file_entry("guard/x.txt", [1; 32], 1),
+			file_entry("kept.txt", [2; 32], 2),
+		] {
+			store.upsert_entry(pair, &entry).unwrap();
+		}
+		let before = store.baseline(pair).unwrap();
+		assert_eq!(before.len(), 3);
+
+		store
+			.conn
+			.execute_batch(
+				"CREATE TRIGGER no_insert BEFORE INSERT ON baseline WHEN NEW.rel_path LIKE 'boom%'
+				 BEGIN SELECT RAISE(ABORT, 'insert refused'); END;
+				 CREATE TRIGGER no_update BEFORE UPDATE ON baseline WHEN NEW.rel_path LIKE 'boom%'
+				 BEGIN SELECT RAISE(ABORT, 'update refused'); END;
+				 CREATE TRIGGER no_delete BEFORE DELETE ON baseline WHEN OLD.rel_path LIKE 'guard%'
+				 BEGIN SELECT RAISE(ABORT, 'delete refused'); END;",
+			)
+			.unwrap();
+
+		let agrees = |what: &str| {
+			let from_db: HashMap<String, BaselineEntry> = store
+				.entries(pair)
+				.unwrap()
+				.into_iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect();
+			assert_eq!(
+				*store.baseline(pair).unwrap(),
+				from_db,
+				"after a failed {what}"
+			);
+			assert_eq!(
+				*store.baseline(pair).unwrap(),
+				*before,
+				"after a failed {what}"
+			);
+		};
+
+		let boom = file_entry("boom.txt", [3; 32], 3);
+		store
+			.upsert_entry(pair, &boom)
+			.expect_err("the insert trigger must refuse this row");
+		agrees("upsert_entry");
+
+		store
+			.delete_entry(pair, "guard/x.txt")
+			.expect_err("the delete trigger must refuse this row");
+		agrees("delete_entry");
+
+		// The refused row is the SECOND of the batch: the first one ran.
+		store
+			.apply_changes(
+				pair,
+				&[
+					BaselineChange::Upsert(&file_entry("kept.txt", [4; 32], 4)),
+					BaselineChange::Upsert(&boom),
+				],
+			)
+			.expect_err("the insert trigger must refuse the second change");
+		agrees("apply_changes");
+
+		store
+			.apply_changes(
+				pair,
+				&[BaselineChange::MoveSubtree {
+					from: "kept.txt",
+					to: "boom/moved",
+				}],
+			)
+			.expect_err("the update trigger must refuse the destination");
+		agrees("apply_changes(MoveSubtree)");
+
+		store
+			.record_pending(
+				pair,
+				Uuid::new_v4(),
+				&created("boom.txt"),
+				NOW,
+				&[BaselineChange::Upsert(&boom)],
+			)
+			.expect_err("the insert trigger must refuse the row this journals");
+		agrees("record_pending");
+
+		store
+			.delete_subtrees(pair, &BTreeSet::from(["guard".to_string()]))
+			.expect_err("the delete trigger must refuse the root");
+		agrees("delete_subtrees");
+
+		// The adoption re-seed: the first row runs, the second is refused, and the rollback takes
+		// the mode change AND the first row back with it.
+		store
+			.set_mode(
+				pair,
+				SyncMode::LocalToRemote,
+				&[dir_entry("adopted"), boom.clone()],
+			)
+			.expect_err("the insert trigger must refuse the second adopted row");
+		assert_eq!(
+			store.pair(pair).unwrap().unwrap().mode,
+			SyncMode::TwoWay,
+			"the mode switch rolled back with its rows"
+		);
+		agrees("set_mode");
+	}
+
+	/// A pass holds the copy it read while it writes the rows it advances: its own view must not
+	/// change underneath it, and the store's must.
+	#[test]
+	fn a_write_leaves_the_copy_a_pass_already_took_alone() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store
+			.upsert_entry(pair, &file_entry("x.txt", [1; 32], 1))
+			.unwrap();
+
+		let read_by_the_pass = store.baseline(pair).unwrap();
+		store
+			.upsert_entry(pair, &file_entry("later.txt", [2; 32], 2))
+			.unwrap();
+
+		assert_eq!(read_by_the_pass.len(), 1, "the pass's own view moved");
+		assert_eq!(
+			store.baseline(pair).unwrap().len(),
+			2,
+			"the store's did not"
+		);
+	}
+
+	/// A pair that is gone takes its resident rows with it: sqlite never hands its id out again,
+	/// but a copy left behind would be a whole tree of rows nothing can reach.
+	#[test]
+	fn deleting_a_pair_drops_its_resident_rows() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store
+			.upsert_entry(pair, &file_entry("x.txt", [1; 32], 1))
+			.unwrap();
+		assert_eq!(store.baseline(pair).unwrap().len(), 1);
+
+		store.delete_pair(pair).unwrap();
+		assert!(store.resident.borrow().is_empty());
+		assert!(store.baseline(pair).unwrap().is_empty());
 	}
 
 	/// A directory move re-keys the row at the source and every row under it, keeps everything else

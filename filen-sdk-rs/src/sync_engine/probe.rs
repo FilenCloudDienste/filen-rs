@@ -421,12 +421,7 @@ fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) {
 /// Everything a pass does locally, end to end, on inputs it re-reads itself: the phases above in
 /// the order `prepare` runs them, minus the network and the apply. Returns the action count.
 fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &IgnoreRules) -> usize {
-	let baseline: HashMap<String, BaselineEntry> = store
-		.entries(pair)
-		.expect("reading the baseline")
-		.into_iter()
-		.map(|entry| (entry.rel_path.clone(), entry))
-		.collect();
+	let baseline = store.baseline(pair).expect("reading the baseline");
 	let snapshot = bench_support::snapshot(&fixture.cache_db, fixture.remote_root)
 		.expect("reading the cache snapshot");
 	let mut view = plan::place_remote_items(
@@ -877,7 +872,42 @@ pub fn run() -> String {
 		"baseline_read",
 		baseline.len(),
 		read,
-		"entries() -> Vec -> HashMap",
+		"entries() -> Vec -> HashMap, the read a pass used to pay per pass",
+	);
+	drop(baseline);
+
+	// What a pass reads now: the same work on the pair's FIRST read, and an `Arc` clone on every
+	// one after it — which is what an idle pass pays instead of the line above.
+	let (first_read, resident_cold) = timed(|| store.baseline(pair).expect("reading the baseline"));
+	probe.record(
+		"baseline_resident_cold",
+		first_read.len(),
+		resident_cold,
+		"baseline(), first read of the pair: the SELECT and the map build",
+	);
+	drop(first_read);
+	let (baseline, resident_warm) = timed(|| store.baseline(pair).expect("reading the baseline"));
+	probe.record(
+		"baseline_resident_warm",
+		baseline.len(),
+		resident_warm,
+		"baseline(), resident: an Arc clone",
+	);
+
+	// And what it costs the pass that WRITES: the first row written while the pass holds the copy
+	// clones the whole map once (`Arc::make_mut`), every row after it lands in place. The row is
+	// one the pair already holds, written back unchanged, so the tree stays converged.
+	let first_row = baseline
+		.get(&rename_root)
+		.cloned()
+		.expect("the rename root has a baseline row");
+	let (written, first_write) = timed(|| store.upsert_entry(pair, &first_row));
+	written.expect("re-writing a row the pair already holds");
+	probe.record(
+		"baseline_first_write",
+		baseline.len(),
+		first_write,
+		"upsert while a pass holds the copy: one Arc::make_mut clone of the whole map",
 	);
 
 	let ((warm_scan, _), warm_time) =
