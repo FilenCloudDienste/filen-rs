@@ -25,6 +25,17 @@ mod events;
 mod guard;
 mod ignore;
 mod mode;
+// The local half of a change-scoped pass. Nothing calls it yet: `run_pass` wires both halves in
+// with the step that replaces the whole-tree read, and this module is the piece that has to exist
+// first — building it inside that step would mean landing the pass and its evidence rules at once.
+#[cfg_attr(
+	not(test),
+	expect(
+		dead_code,
+		reason = "wired into `run_pass` with the rest of the change-scoped pass"
+	)
+)]
+mod observe;
 mod outcome;
 mod pause;
 mod plan;
