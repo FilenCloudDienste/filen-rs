@@ -29,6 +29,7 @@ use filen_sdk_rs::{
 		WatchConfig, WatchState,
 	},
 };
+use filen_types::api::v3::dir::color::DirColor;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -2161,6 +2162,152 @@ async fn watch_add_net_interval_resets_but_not_starved() {
 		files.is_empty(),
 		"the remote gained {} file(s) from a no-op trigger",
 		files.len()
+	);
+
+	handle.stop().await;
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — one changed file plans exactly one action; a wake with nothing
+//         announced runs no pass at all
+// ============================================================================
+
+/// Every `Planned { actions }` count the log has seen, in arrival order.
+fn planned_counts(log: &WatchLog) -> Vec<usize> {
+	log.events
+		.lock()
+		.unwrap()
+		.iter()
+		.filter_map(|e| match e {
+			SyncEvent::Planned { actions } => Some(*actions),
+			_ => None,
+		})
+		.collect()
+}
+
+/// How many passes have STARTED — the event an idle wake must not produce.
+fn passes_started(log: &WatchLog) -> usize {
+	log.count(|e| matches!(e, SyncEvent::PassStarted { .. }))
+}
+
+/// Wait until `log` has gone quiet, returning the pass count it settled at.
+async fn quiesce(log: &WatchLog, label: &str) -> usize {
+	let mut before = log.passes();
+	for _ in 0..10 {
+		tokio::time::sleep(IDLE_QUIET).await;
+		let now = log.passes();
+		if now == before {
+			return now;
+		}
+		before = now;
+	}
+	panic!("{label}: the watch never went quiet ({before} passes)");
+}
+
+/// The two promises a change-scoped pass makes, as a caller can see them (optimization plan 9.3):
+/// a pass woken by ONE changed file plans that one action and nothing else, and a wake that finds
+/// nothing announced on either side runs no pass at all — no `PassStarted`.
+///
+/// The idle wake is produced the way a real one arrives: a remote favourite toggle. The cache
+/// applies it and rings this pair's doorbell, so the watch loop wakes; but a favourite changes no
+/// path, so the engine's own change list records nothing and there is nothing to look at. Before
+/// the pass narrowed its read, that wake cost a whole read of both trees.
+#[shared_test_runtime]
+async fn watch_one_change_plans_one_action_and_an_idle_wake_runs_no_pass() {
+	const DIRS: usize = 8;
+	const PER_DIR: usize = 10;
+	const FILES: usize = DIRS * PER_DIR + 1;
+	/// Far enough out that no safety-net pass can land inside the windows below.
+	const LONG_NET: Duration = Duration::from_secs(1800);
+
+	let sc = single_client(SyncMode::TwoWay).await;
+	for d in 0..DIRS {
+		for f in 0..PER_DIR {
+			let rel = format!("dir{d:02}/file{f:02}.txt");
+			write_file(&sc.local, &rel, &content_for(&rel));
+		}
+	}
+	write_file(&sc.local, "root.txt", &content_for("root.txt"));
+	let (engine, pair) = watch_engine(&sc, SyncMode::TwoWay).await;
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: Duration::from_millis(500),
+				safety_net: LONG_NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() >= FILES).await,
+		"the first sync never uploaded the tree ({} of {FILES} file(s), {} pass(es))",
+		log.uploaded(),
+		log.passes()
+	);
+	quiesce(&log, "after the first sync").await;
+
+	// ---- one file changes: exactly one action is planned for it ----
+	let planned_before = planned_counts(&log).len();
+	let uploaded_before = log.uploaded();
+	write_file(&sc.local, "dir03/file04.txt", b"changed");
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() > uploaded_before).await,
+		"the watch never uploaded the changed file ({} pass(es))",
+		log.passes()
+	);
+	quiesce(&log, "after the change").await;
+
+	let after: Vec<usize> = planned_counts(&log).split_off(planned_before);
+	let acting: Vec<usize> = after.iter().copied().filter(|count| *count > 0).collect();
+	assert_eq!(
+		acting,
+		vec![1],
+		"one changed file must plan exactly one action, and only one pass may plan anything: \
+		 {after:?}"
+	);
+	assert_eq!(
+		log.uploaded(),
+		uploaded_before + 1,
+		"the pass re-uploaded more than the one file that changed"
+	);
+	assert_eq!(log.remotely_trashed(), 0, "a derived map lost a path");
+	assert_eq!(log.locally_deleted(), 0, "a derived map lost a path");
+
+	// ---- a wake with nothing announced: no pass at all ----
+	// A directory COLOUR change is the one remote event the engine provably reads nothing from:
+	// `DirEvent::ColorChanged` is the only arm `RemoteChange::from_event` maps to `None`. A
+	// favourite is NOT one — the cache announces it as a metadata change, which names a path and
+	// is a change like any other, so a pass for it is correct.
+	let (dirs, _files) = list_remote_root(&sc).await;
+	let mut coloured = find_dir(&dirs, "dir00")
+		.expect("the remote holds the uploaded directories")
+		.clone();
+	let uuid = coloured.uuid();
+	let started_before = passes_started(&log);
+	sc.resources
+		.client
+		.set_dir_color(&mut coloured, DirColor::Blue)
+		.await
+		.expect("colouring a remote directory");
+	// The doorbell rings when the CACHE applies the event, so wait for that rather than for a
+	// fixed window: a window that simply outran the event would find no pass either, and this
+	// assertion would hold for the wrong reason.
+	assert!(
+		poll_for_dir_color(sc.cache.db_path(), uuid, "blue", CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never observed the colour change, so nothing woke the watch"
+	);
+	// Now give the woken loop its debounce and room to run a pass, if it is going to.
+	tokio::time::sleep(IDLE_QUIET).await;
+	assert_eq!(
+		passes_started(&log),
+		started_before,
+		"a wake with nothing announced on either side still ran a pass"
 	);
 
 	handle.stop().await;

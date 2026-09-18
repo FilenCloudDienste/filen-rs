@@ -8,7 +8,7 @@ use filen_sdk_rs::fs::{
 	dir::RemoteDirectory,
 	file::RemoteFile,
 };
-use filen_sdk_rs::sync_engine::{DeleteGuard, GuardReason, SyncEngine, SyncMode};
+use filen_sdk_rs::sync_engine::{DeleteGuard, GuardReason, SyncEngine, SyncEvent, SyncMode};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1689,6 +1689,79 @@ async fn delete_a7_first_sync_two_populated_trees_no_wipe() {
 	assert!(
 		r1.conflict_paths().any(|c| c.contains("shared.txt")),
 		"divergent shared.txt should surface as a conflict: {r1:?}"
+	);
+
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — a local delete that lands DURING a pass propagates on the next one
+// ============================================================================
+
+/// A file removed after a pass has read both sides is not that pass's to act on: it read the tree
+/// before the removal, so acting on it would mean acting on something it never observed. What the
+/// removal must NOT do is disappear — the next pass propagates it, and the guard does not hold it
+/// back (the optimization plan's section 9.3).
+///
+/// The delete is timed off `PassStarted`, which the engine emits only once the read is done, so
+/// the race is deterministic in the direction that matters: the pass under test cannot have seen
+/// it.
+#[shared_test_runtime]
+async fn delete_during_a_pass_propagates_on_the_next_one() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	write_file(&sc.local, "gone.txt", b"doomed");
+	write_file(&sc.local, "stays.txt", b"kept");
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, 2, "both files uploaded: {r1:?}");
+
+	// Remove the file the moment the pass says it has finished reading.
+	let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+	let victim = sc.local.join("gone.txt");
+	let deleter = tokio::spawn(async move {
+		if started_rx.await.is_ok() {
+			std::fs::remove_file(&victim).expect("removing the file mid-pass");
+		}
+	});
+	let mut started = Some(started_tx);
+	let r2 = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |event| {
+			if matches!(event, SyncEvent::PassStarted { .. })
+				&& let Some(tx) = started.take()
+			{
+				let _ = tx.send(());
+			}
+		})
+		.await
+		.expect("the pass racing the delete");
+	deleter.await.expect("the deleting task");
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(
+		r2.remotely_trashed, 0,
+		"a pass must not act on a deletion that landed after it read the tree: {r2:?}"
+	);
+
+	// The next pass owes it, and owes it as a deletion to APPLY rather than one to hold.
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(
+		r3.remotely_trashed, 1,
+		"the deletion did not propagate on the next pass: {r3:?}"
+	);
+	assert_eq!(
+		r3.held_deletions(),
+		0,
+		"the deletion was held rather than propagated: {r3:?}"
+	);
+	let (_dirs, files) = list_root(&sc).await;
+	assert!(
+		find_file(&files, "gone.txt").is_none(),
+		"gone.txt survived on the remote"
+	);
+	assert!(
+		find_file(&files, "stays.txt").is_some(),
+		"the untouched sibling was trashed too"
 	);
 
 	sc.cleanup();
