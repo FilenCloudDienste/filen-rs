@@ -163,6 +163,27 @@ fn sibling_cmp(a: &str, b: &str) -> Ordering {
 	fold_cmp(a, b).then_with(|| a.cmp(b))
 }
 
+/// A row with nothing set and no path: the buffer [`Baseline::visit_rows`] refills, and the value
+/// [`Baseline::fill_row`] writes every field of.
+fn blank_row() -> BaselineEntry {
+	BaselineEntry {
+		rel_path: String::new(),
+		kind: NodeKind::Dir,
+		remote_uuid: None,
+		content_hash: None,
+		size: None,
+		local_mtime: None,
+		remote_modified: None,
+		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+		remote_stable_uuid: None,
+		agreed_hash: None,
+	}
+}
+
 /// One pair's baseline rows, resident between passes (see the module doc).
 #[derive(Debug, Clone)]
 pub(super) struct Baseline {
@@ -313,6 +334,24 @@ impl Baseline {
 	pub(super) fn iter(&self) -> impl Iterator<Item = BaselineEntry> + '_ {
 		self.walk(NodeId::ROOT, String::new())
 			.map(|(id, path)| self.entry_at(id, path))
+	}
+
+	/// Every row, parent before child, handed to `visit` as one buffer this REFILLS per row — the
+	/// borrowing form of [`iter`](Self::iter), which builds a fresh row and a fresh path each time.
+	///
+	/// It is what the whole-tree questions of a pass ask with, the ones whose answer for almost every
+	/// row is "no": has this file's uuid moved, is this a synced directory. The predicate is then
+	/// checked against a row that cost no allocation, and only a caller that KEEPS one pays for it.
+	/// The buffer's `rel_path` is the row's own path throughout, so a row handed on is a correct row.
+	pub(super) fn visit_rows(&self, mut visit: impl FnMut(&BaselineEntry)) {
+		let mut walk = self.walk(NodeId::ROOT, String::new());
+		let mut row = blank_row();
+		while let Some(id) = walk.next_row() {
+			row.rel_path.clear();
+			row.rel_path.push_str(&walk.path);
+			self.fill_row(id, &mut row);
+			visit(&row);
+		}
 	}
 
 	/// Every row's path, parent before child.
@@ -482,30 +521,39 @@ impl Baseline {
 	}
 
 	fn entry_at(&self, id: NodeId, rel_path: String) -> BaselineEntry {
+		let mut row = blank_row();
+		row.rel_path = rel_path;
+		self.fill_row(id, &mut row);
+		row
+	}
+
+	/// Write the row at `id` over `row`, leaving its `rel_path` alone — the caller owns that.
+	///
+	/// Split out of [`entry_at`](Self::entry_at) so [`visit_rows`](Self::visit_rows) can refill one
+	/// buffer per walk instead of building a row per node, with the field list still in one place: a
+	/// second copy of it is how a new column comes to be carried by one reader and not the other.
+	fn fill_row(&self, id: NodeId, row: &mut BaselineEntry) {
 		let node = &self.nodes[id.index()];
 		let sides = self.side.get(&id);
 		let content_hash = node
 			.has(HAS_CONTENT_HASH)
 			.then(|| Blake3Hash::from(node.content_hash));
-		BaselineEntry {
-			rel_path,
-			kind: node.kind,
-			remote_uuid: node.has(HAS_REMOTE_UUID).then_some(node.remote_uuid),
-			content_hash,
-			size: node.has(HAS_SIZE).then_some(node.size),
-			local_mtime: node.has(HAS_LOCAL_MTIME).then_some(node.local_mtime),
-			remote_modified: node
-				.has(HAS_REMOTE_MODIFIED)
-				.then_some(node.remote_modified),
-			state: node.state,
-			local_kind: sides.and_then(|s| s.local_kind),
-			remote_kind: sides.and_then(|s| s.remote_kind),
-			remote_hash: sides.and_then(|s| s.remote_hash),
-			remote_size: sides.and_then(|s| s.remote_size),
-			remote_stable_uuid: node.stable_uuid,
-			// Not in the map means "the same as this side's content", which is every confirmed row.
-			agreed_hash: self.agreed.get(&id).copied().unwrap_or(content_hash),
-		}
+		row.kind = node.kind;
+		row.remote_uuid = node.has(HAS_REMOTE_UUID).then_some(node.remote_uuid);
+		row.content_hash = content_hash;
+		row.size = node.has(HAS_SIZE).then_some(node.size);
+		row.local_mtime = node.has(HAS_LOCAL_MTIME).then_some(node.local_mtime);
+		row.remote_modified = node
+			.has(HAS_REMOTE_MODIFIED)
+			.then_some(node.remote_modified);
+		row.state = node.state;
+		row.local_kind = sides.and_then(|s| s.local_kind);
+		row.remote_kind = sides.and_then(|s| s.remote_kind);
+		row.remote_hash = sides.and_then(|s| s.remote_hash);
+		row.remote_size = sides.and_then(|s| s.remote_size);
+		row.remote_stable_uuid = node.stable_uuid;
+		// Not in the map means "the same as this side's content", which is every confirmed row.
+		row.agreed_hash = self.agreed.get(&id).copied().unwrap_or(content_hash);
 	}
 
 	/// Apply exactly what [`BaselineStore::write_changes`](super::baseline::BaselineStore) applied
