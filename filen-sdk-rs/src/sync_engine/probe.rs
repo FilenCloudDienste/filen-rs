@@ -1001,6 +1001,41 @@ pub fn run() -> String {
 		&format!("{} moves found", moves.len()),
 	);
 
+	// Where the reconcile's time actually goes. The phase below times the whole of it, which cannot
+	// say whether the cost is the KEY SET it builds before deciding anything or the per-path
+	// decisions themselves — and those two are removed by different changes, so a run that cannot
+	// separate them cannot say whether either worked.
+	let (visited, walked) = timed(|| {
+		let mut rows = 0usize;
+		baseline.visit_row_paths(|_| rows += 1);
+		rows
+	});
+	probe.record(
+		"reconcile_keys_walk",
+		visited,
+		walked,
+		"visit_row_paths alone: every row's path against one reused buffer",
+	);
+	let (key_count, keys_built) = timed(|| {
+		let mut keys: BTreeSet<Cow<'_, str>> = local
+			.keys()
+			.chain(remote.keys())
+			.map(|path| Cow::Borrowed(path.as_str()))
+			.collect();
+		baseline.visit_row_paths(|path| {
+			if !local.contains_key(path) && !remote.contains_key(path) {
+				keys.insert(Cow::Owned(path.to_string()));
+			}
+		});
+		keys.len()
+	});
+	probe.record(
+		"reconcile_keys_build",
+		key_count,
+		keys_built,
+		"the sorted union of the three sides, as reconcile builds it",
+	);
+
 	let holds = PassHolds::default();
 	let (converged, reconcile_0) =
 		timed(|| plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds));
