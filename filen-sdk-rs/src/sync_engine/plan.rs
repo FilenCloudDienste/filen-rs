@@ -17,11 +17,12 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, NodeKind, Tracked},
+	baseline::{BaselineEntry, BaselineState, NodeKind},
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
+	tree::Baseline,
 };
 use crate::cache::{RemoteItem, UndecodableItem};
 
@@ -337,11 +338,12 @@ pub(crate) struct RemoteView {
 ///
 /// The two travel together because neither answers alone: an ignored path is only a ROOT the pass
 /// records and untracks when a row sits at or under it, unless a level above the built-in defaults
-/// hid it (see [`Tracked`]). A view built with no filter has no ignored roots and needs no baseline.
+/// hid it (see [`Baseline::tracked`]). A view built with no filter has no ignored roots and needs
+/// no baseline.
 #[derive(Clone, Copy)]
 pub(crate) struct ViewFilter<'a> {
 	pub(crate) rules: &'a IgnoreRules,
-	pub(crate) baseline: &'a HashMap<String, BaselineEntry>,
+	pub(crate) baseline: &'a Baseline,
 }
 
 /// A remote item the snapshot holds that the view could not place at a path.
@@ -551,11 +553,10 @@ impl RemoteView {
 	/// reported, by the pass that finds the cache no longer mid-transition there.
 	fn hide(&mut self, filter: ViewFilter<'_>) {
 		let mut memo = HashMap::new();
-		let mut tracked = Tracked::new(filter.baseline);
 		let mut ignored = BTreeMap::new();
 		let mut untracked = 0usize;
 		// Whether the rules hide `rel_path`, recording the root of what they hide as the pass
-		// reports and untracks one (see [`Tracked`]).
+		// reports and untracks one (see [`Baseline::tracked`]).
 		let mut hidden = |rel_path: &str, is_dir: bool| {
 			let Some((ignored_root, decision)) =
 				filter.rules.ignored_root(rel_path, is_dir, &mut memo)
@@ -565,8 +566,9 @@ impl RemoteView {
 			// A root the rules hid ABOVE this item is a directory; the item's own hit is a root of
 			// whatever kind the item is.
 			let root_is_dir = ignored_root != rel_path || is_dir;
-			// Hidden either way — but only a tracked default hit is a ROOT (see `Tracked`).
-			if decision.level == IgnoreLevel::Default && !tracked.covers(ignored_root, root_is_dir)
+			// Hidden either way — but only a tracked default hit is a ROOT (see `Baseline::tracked`).
+			if decision.level == IgnoreLevel::Default
+				&& !filter.baseline.tracked(ignored_root, root_is_dir)
 			{
 				untracked += 1;
 			} else if !ignored.contains_key(ignored_root) {
@@ -740,33 +742,24 @@ impl Skipped {
 /// with its reason, for the pass to leave that path and its subtree alone and report it. A skipped
 /// item no baseline row names is only reported, under its would-be path.
 pub(crate) fn unknown_remote_paths(
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	skipped: &[SkippedRemote],
 ) -> (BTreeMap<String, UnsyncableReason>, Vec<UnsyncablePath>) {
-	// Nothing was skipped, so nothing is looked up: the two indexes below would be built over every
-	// baseline row to answer no question at all.
+	// Nothing was skipped, so nothing is looked up at all.
 	if skipped.is_empty() {
 		return (BTreeMap::new(), Vec::new());
-	}
-	let mut by_uuid: HashMap<Uuid, &str> = HashMap::new();
-	let mut by_lineage: HashMap<StableUuid, &str> = HashMap::new();
-	for entry in baseline.values() {
-		if let Some(uuid) = entry.remote_uuid {
-			by_uuid.insert(uuid, &entry.rel_path);
-		}
-		if let Some(lineage) = entry.remote_stable_uuid {
-			by_lineage.insert(lineage, &entry.rel_path);
-		}
 	}
 	let mut unknown = BTreeMap::new();
 	let mut never_synced: Vec<UnsyncablePath> = Vec::new();
 	for item in skipped {
-		let synced_at = by_uuid.get(&item.remote_uuid).or_else(|| {
+		// The baseline's own uuid and lineage indexes, rather than two maps built over every row
+		// of the pair to answer one question per skipped item.
+		let synced_at = baseline.path_by_uuid(item.remote_uuid).or_else(|| {
 			item.stable_uuid
-				.and_then(|lineage| by_lineage.get(&lineage))
+				.and_then(|lineage| baseline.path_by_lineage(lineage))
 		});
 		if let Some(path) = synced_at {
-			unknown.insert((*path).to_string(), item.reason.clone());
+			unknown.insert(path, item.reason.clone());
 			continue;
 		}
 		let report = UnsyncablePath::new(item.rel_path.clone(), item.reason.clone());
@@ -1117,33 +1110,28 @@ fn create_local(rel_path: &str, remote: &RemoteNode) -> SyncAction {
 /// synthesises our own just-written version at the path from the very row being confirmed, so a
 /// folded view would confirm every push against itself and the marker would mean nothing.
 pub(super) fn confirm_agreed_content(
-	baseline: &mut HashMap<String, BaselineEntry>,
+	baseline: &mut Baseline,
 	raw_remote: &HashMap<String, RemoteNode>,
 ) -> Vec<BaselineEntry> {
-	let mut advanced = Vec::new();
-	for (rel_path, entry) in baseline.iter_mut() {
-		if !awaits_confirmation(entry) {
-			continue;
-		}
-		if raw_remote.get(rel_path).map(|node| node.remote_uuid) != entry.remote_uuid {
-			continue;
-		}
-		entry.agreed_hash = entry.content_hash;
-		tracing::debug!(
-			"plan: the remote confirms {rel_path:?} — both sides hold what the baseline records"
-		);
-		advanced.push(entry.clone());
-	}
-	advanced
-}
-
-/// Whether a row is a push still waiting for something to confirm it: this side's content is on
-/// record, and it is not what the two sides last agreed on.
-pub(super) fn awaits_confirmation(entry: &BaselineEntry) -> bool {
-	entry.kind == NodeKind::File
-		&& entry.state == BaselineState::Synced
-		&& entry.content_hash.is_some()
-		&& entry.agreed_hash != entry.content_hash
+	// The candidates first, since advancing one writes to the very structure they are read from.
+	// Only the rows that await confirmation are candidates, and the baseline indexes those, so a
+	// converged pair reads no row at all.
+	let confirmed: Vec<BaselineEntry> = baseline
+		.unconfirmed()
+		.filter(|entry| {
+			raw_remote.get(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid
+		})
+		.collect();
+	confirmed
+		.into_iter()
+		.filter_map(|entry| {
+			tracing::debug!(
+				"plan: the remote confirms {:?} — both sides hold what the baseline records",
+				entry.rel_path
+			);
+			baseline.set_agreed(&entry.rel_path, entry.content_hash)
+		})
+		.collect()
 }
 
 /// Advance the agreed-content marker of every unconfirmed row whose version uuid is in `confirmed`
@@ -1155,25 +1143,27 @@ pub(super) fn awaits_confirmation(entry: &BaselineEntry) -> bool {
 /// cache's announcement timestamps, a version listing) while the row rule is the same; keeping the
 /// rule here keeps the pass's confirmation policy in one place and unit-testable.
 pub(super) fn confirm_agreed_pushes(
-	baseline: &mut HashMap<String, BaselineEntry>,
+	baseline: &mut Baseline,
 	confirmed: &HashSet<Uuid>,
 ) -> Vec<BaselineEntry> {
-	let mut advanced = Vec::new();
-	for (rel_path, entry) in baseline.iter_mut() {
-		if !awaits_confirmation(entry)
-			|| !entry
+	let advancing: Vec<BaselineEntry> = baseline
+		.unconfirmed()
+		.filter(|entry| {
+			entry
 				.remote_uuid
 				.is_some_and(|uuid| confirmed.contains(&uuid))
-		{
-			continue;
-		}
-		entry.agreed_hash = entry.content_hash;
-		tracing::debug!(
-			"plan: {rel_path:?} — this engine's push stood as the remote head long enough to count as agreed"
-		);
-		advanced.push(entry.clone());
-	}
-	advanced
+		})
+		.collect();
+	advancing
+		.into_iter()
+		.filter_map(|entry| {
+			tracing::debug!(
+				"plan: {:?} — this engine's push stood as the remote head long enough to count as agreed",
+				entry.rel_path
+			);
+			baseline.set_agreed(&entry.rel_path, entry.content_hash)
+		})
+		.collect()
 }
 
 /// What the server's version chain says about a push of ours: how long it stood before anything
@@ -1290,15 +1280,16 @@ pub(super) fn interleaved_version(
 /// adoption would drop the divergence it is holding.
 pub(crate) fn adopt_destination_rows(
 	mode: super::SyncMode,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 ) -> Vec<BaselineEntry> {
 	let mut rows = Vec::new();
-	for (rel_path, base) in baseline {
+	for base in baseline.iter() {
 		if base.state != BaselineState::Synced {
 			continue;
 		}
+		let rel_path = &base.rel_path;
 		let (local_node, remote_node) = (local.get(rel_path), remote.get(rel_path));
 		let row = match mode {
 			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => remote_node
@@ -1554,7 +1545,7 @@ fn reconcile_two_way(
 /// source never had. Both fall through to the reconcile loop, which knows what to do with them.
 fn detect_moves(
 	mode: super::SyncMode,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	actions: &mut Vec<SyncAction>,
@@ -1576,7 +1567,8 @@ fn detect_moves(
 			.filter(|(_, node)| node.kind == NodeKind::File)
 			.filter_map(|(path, node)| Some((node.stable_uuid?, path.as_str())))
 			.collect();
-		for (from, base) in baseline {
+		for entry in baseline.iter() {
+			let (from, base) = (&entry.rel_path, &entry);
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
@@ -1700,7 +1692,8 @@ fn detect_moves(
 					.push(path.as_str());
 			}
 		}
-		for (from, base) in baseline {
+		for entry in baseline.iter() {
+			let (from, base) = (&entry.rel_path, &entry);
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
@@ -1872,7 +1865,7 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// in one pass; an index by collision key and uuid is the upgrade if mass moves show up.
 pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
-	baseline: &mut Arc<HashMap<String, BaselineEntry>>,
+	baseline: &mut Arc<Baseline>,
 	local: &mut HashMap<String, LocalNode>,
 	remote: &mut HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
@@ -1893,9 +1886,7 @@ pub(crate) fn fold_dir_moves(
 		}
 		// Taken by value only once a move is actually being folded: the baseline the pass reads is
 		// the store's resident copy, and a pass that folds no directory move must not clone it.
-		rekey_subtree(Arc::make_mut(baseline), from, to, |entry, path| {
-			entry.rel_path = path.to_string()
-		});
+		Arc::make_mut(baseline).move_subtree(from, to);
 		tracing::debug!(
 			"plan: {} — the two sides spell the directory differently only by case",
 			action.describe()
@@ -1908,7 +1899,7 @@ pub(crate) fn fold_dir_moves(
 /// The shallowest case-only directory rename left in the inputs (see [`fold_dir_moves`]).
 fn next_case_only_dir_rename(
 	mode: super::SyncMode,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
@@ -1943,8 +1934,8 @@ fn next_case_only_dir_rename(
 			let at_local = baseline.get(local_path);
 			let at_remote = baseline.get(remote_path);
 			if at_local
-				.into_iter()
-				.chain(at_remote)
+				.iter()
+				.chain(at_remote.iter())
 				.any(|row| row.state.is_conflict())
 				|| [local_path, remote_path]
 					.into_iter()
@@ -2008,20 +1999,22 @@ fn next_case_only_dir_rename(
 ///   taken.
 fn next_dir_move(
 	mode: super::SyncMode,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
 ) -> Option<SyncAction> {
-	let mut sources: Vec<(&str, Uuid)> = baseline
+	let mut sources: Vec<(String, Uuid)> = baseline
 		.iter()
-		.filter(|(_, row)| row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
-		.filter_map(|(path, row)| Some((path.as_str(), row.remote_uuid?)))
+		.filter(|row| row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
+		.filter_map(|row| row.remote_uuid.map(|uuid| (row.rel_path, uuid)))
 		.collect();
 	if sources.is_empty() {
 		return None;
 	}
-	sources.sort_unstable_by_key(|(path, _)| (path.matches('/').count(), *path));
+	sources.sort_unstable_by(|(a, _), (b, _)| {
+		(a.matches('/').count(), a.as_str()).cmp(&(b.matches('/').count(), b.as_str()))
+	});
 	let remote_dir_at: HashMap<Uuid, &str> = remote
 		.iter()
 		.filter(|_| mode.pulls())
@@ -2036,7 +2029,7 @@ fn next_dir_move(
 	// fill its destination and refuse it.
 	let candidates: Vec<SyncAction> = sources
 		.iter()
-		.filter_map(|&(from, uuid)| {
+		.filter_map(|(from, uuid)| {
 			dir_move_from(
 				mode,
 				baseline,
@@ -2047,7 +2040,7 @@ fn next_dir_move(
 				&remote_dir_at,
 				&mut new_local_dirs,
 				from,
-				uuid,
+				*uuid,
 			)
 		})
 		.collect();
@@ -2071,11 +2064,11 @@ fn next_dir_move(
 #[allow(clippy::too_many_arguments)] // the pass's inputs plus two indexes built once per call
 fn dir_move_from<'a>(
 	mode: super::SyncMode,
-	baseline: &'a HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &'a HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
-	sources: &[(&'a str, Uuid)],
+	sources: &[(String, Uuid)],
 	remote_dir_at: &HashMap<Uuid, &str>,
 	new_local_dirs: &mut Option<Vec<NewLocalDir<'a>>>,
 	from: &str,
@@ -2110,9 +2103,9 @@ fn dir_move_from<'a>(
 			return None;
 		}
 		// The same subtree vanished from somewhere else too: which of the two moved is a guess.
-		let twin = sources.iter().any(|&(other, _)| {
+		let twin = sources.iter().any(|(other, _)| {
 			other != from
-				&& !local.contains_key(other)
+				&& !local.contains_key(other.as_str())
 				&& baseline_dir_signature(baseline, other).as_ref() == Some(&signature)
 		});
 		let (to_parent, to_name) = (parent_path(to), leaf(to));
@@ -2136,11 +2129,9 @@ fn dir_move_from<'a>(
 	let clear = from_key != to_key
 		&& !is_under(&to_key, &from_key)
 		&& !is_under(&from_key, &to_key)
-		&& !occupied(baseline, to)
+		&& !baseline.occupied(to)
 		&& ![from, to].into_iter().any(|end| touches_held(end, held))
-		&& baseline
-			.iter()
-			.all(|(path, row)| !is_under(path, from) || row.state == BaselineState::Synced);
+		&& baseline.subtree_all_synced(from);
 	clear.then_some(action)
 }
 
@@ -2148,12 +2139,12 @@ fn dir_move_from<'a>(
 /// and — when a directory nested in it is a move of its own — what it holds without that one.
 struct NewLocalDir<'a> {
 	path: &'a str,
-	full: Signature<'a>,
-	without_nested_moves: Option<Signature<'a>>,
+	full: Signature,
+	without_nested_moves: Option<Signature>,
 }
 
-impl<'a> NewLocalDir<'a> {
-	fn matches(&self, signature: &Signature<'a>) -> bool {
+impl NewLocalDir<'_> {
+	fn matches(&self, signature: &Signature) -> bool {
 		self.full == *signature || self.without_nested_moves.as_ref() == Some(signature)
 	}
 }
@@ -2165,13 +2156,13 @@ impl<'a> NewLocalDir<'a> {
 /// to match. A directory whose full signature matches a gone one gets no reduced signature at all:
 /// the full match already explains it. Computed deepest first, so a chain of such moves reduces from the inside out.
 fn new_local_dir_signatures<'a>(
-	baseline: &'a HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &'a HashMap<String, LocalNode>,
-	sources: &[(&'a str, Uuid)],
+	sources: &[(String, Uuid)],
 ) -> Vec<NewLocalDir<'a>> {
-	let gone: Vec<Signature<'a>> = sources
+	let gone: Vec<Signature> = sources
 		.iter()
-		.filter(|(path, _)| !local.contains_key(*path))
+		.filter(|(path, _)| !local.contains_key(path.as_str()))
 		.filter_map(|(path, _)| baseline_dir_signature(baseline, path))
 		.collect();
 	let mut paths: Vec<&str> = local
@@ -2185,7 +2176,7 @@ fn new_local_dir_signatures<'a>(
 		let Some(full) = dir_signature(local, path) else {
 			continue;
 		};
-		let mut without_nested_moves: Option<Signature<'a>> = None;
+		let mut without_nested_moves: Option<Signature> = None;
 		// A directory whose whole tree already matches one gone locally is that move, its nested
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
 		let explained = gone.contains(&full);
@@ -2196,7 +2187,7 @@ fn new_local_dir_signatures<'a>(
 				// The only copy of the signature, made once per directory that holds a nested move.
 				without_nested_moves
 					.get_or_insert_with(|| full.clone())
-					.retain(|rel, _| *rel != inner_rel && !is_under(rel, inner_rel));
+					.retain(|rel, _| rel != inner_rel && !is_under(rel, inner_rel));
 			}
 		}
 		dirs.push(NewLocalDir {
@@ -2210,10 +2201,10 @@ fn new_local_dir_signatures<'a>(
 
 /// What a directory holds, relative to it: every path under it with its kind and, for a file, its
 /// content hash and size. Two directories with equal signatures hold the same tree.
-type Signature<'a> = BTreeMap<&'a str, (NodeKind, Option<Blake3Hash>, u64)>;
+type Signature = BTreeMap<String, (NodeKind, Option<Blake3Hash>, u64)>;
 
 /// The signature of the local directory at `root`; `None` when a file under it has no hash.
-fn dir_signature<'a>(local: &'a HashMap<String, LocalNode>, root: &str) -> Option<Signature<'a>> {
+fn dir_signature(local: &HashMap<String, LocalNode>, root: &str) -> Option<Signature> {
 	local
 		.iter()
 		.filter(|(path, _)| is_under(path, root))
@@ -2222,7 +2213,7 @@ fn dir_signature<'a>(local: &'a HashMap<String, LocalNode>, root: &str) -> Optio
 				NodeKind::File => (Some(node.content_hash?), node.size),
 				NodeKind::Dir => (None, 0),
 			};
-			Some((&path[root.len()..], (node.kind, hash, size)))
+			Some((path[root.len()..].to_string(), (node.kind, hash, size)))
 		})
 		.collect()
 }
@@ -2230,14 +2221,10 @@ fn dir_signature<'a>(local: &'a HashMap<String, LocalNode>, root: &str) -> Optio
 /// The signature the baseline recorded for the directory at `root` — `None` when it cannot vouch
 /// for the subtree: a row under it that is not `Synced`, a file row without a hash or a size, or no
 /// file at all.
-fn baseline_dir_signature<'a>(
-	baseline: &'a HashMap<String, BaselineEntry>,
-	root: &str,
-) -> Option<Signature<'a>> {
-	let signature: Signature<'a> = baseline
-		.iter()
-		.filter(|(path, _)| is_under(path, root))
-		.map(|(path, row)| {
+fn baseline_dir_signature(baseline: &Baseline, root: &str) -> Option<Signature> {
+	let signature: Signature = baseline
+		.subtree(root)
+		.map(|row| {
 			if row.state != BaselineState::Synced {
 				return None;
 			}
@@ -2245,7 +2232,10 @@ fn baseline_dir_signature<'a>(
 				NodeKind::File => (Some(row.content_hash?), row.size?),
 				NodeKind::Dir => (None, 0),
 			};
-			Some((&path[root.len()..], (row.kind, hash, size)))
+			Some((
+				row.rel_path[root.len()..].to_string(),
+				(row.kind, hash, size),
+			))
 		})
 		.collect::<Option<_>>()?;
 	signature
@@ -2261,7 +2251,7 @@ fn baseline_dir_signature<'a>(
 /// that needs them.
 fn parents_ready<T>(
 	side: &HashMap<String, T>,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	pending: &HashSet<String>,
 	to: &str,
 	is_dir: impl Fn(&T) -> bool,
@@ -2272,7 +2262,7 @@ fn parents_ready<T>(
 			// An existing directory stands on existing ones.
 			Some(node) => return is_dir(node),
 			None if occupied(side, parent)
-				|| occupied(baseline, parent)
+				|| baseline.occupied(parent)
 				|| pending.contains(&collision_key(parent)) =>
 			{
 				return false;
@@ -2348,7 +2338,7 @@ pub(crate) struct Plan {
 /// keyed by the same NFC-normalized relative path; `holds` is what the pass must leave alone.
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	holds: &PassHolds,
@@ -2361,11 +2351,12 @@ pub(crate) fn reconcile(
 		local.len(),
 		remote.len()
 	);
-	let keys: BTreeSet<&str> = baseline
-		.keys()
-		.chain(local.keys())
-		.chain(remote.keys())
-		.map(String::as_str)
+	// Still the union of all three sides: this pass reads and reconciles everything, and the
+	// change-scoped driver that replaces the union is Stage 5's second half.
+	let keys: BTreeSet<String> = baseline
+		.paths()
+		.chain(local.keys().cloned())
+		.chain(remote.keys().cloned())
 		.collect();
 
 	// Consume the paths the view could not resolve before anything else looks at them, so neither
@@ -2386,7 +2377,7 @@ pub(crate) fn reconcile(
 				tracing::debug!(
 					"reconcile: skipping {key:?} — the cache is listing that name twice, so the view cannot resolve it"
 				);
-				consumed.insert((*key).to_string());
+				consumed.insert(key.clone());
 				deferred_paths += 1;
 			}
 		}
@@ -2401,11 +2392,12 @@ pub(crate) fn reconcile(
 	// `delete_ok` gate below.
 	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
 
-	for key in keys {
+	for key in &keys {
 		if consumed.contains(key) {
 			continue;
 		}
 		let base = baseline.get(key);
+		let base = base.as_ref();
 		// A held conflict is never acted on until the caller resolves it — but it IS re-reported
 		// every pass, so a caller watching the reports keeps seeing what is outstanding. Its
 		// subtree is suppressed below, along with any conflict surfaced by this pass.
@@ -2615,7 +2607,7 @@ mod tests {
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		reconcile(mode, baseline, local, remote, &PassHolds::default()).actions
+		reconcile(mode, &tree(baseline), local, remote, &PassHolds::default()).actions
 	}
 
 	/// The pair the fold tests write as.
@@ -2631,8 +2623,9 @@ mod tests {
 		writes: &PendingWrites,
 	) -> Vec<SyncAction> {
 		let mut remote = remote.clone();
-		writes.fold_into(PAIR, baseline, &mut remote);
-		reconcile(mode, baseline, local, &remote, &PassHolds::default()).actions
+		let baseline = tree(baseline);
+		writes.fold_into(PAIR, &baseline, &mut remote);
+		reconcile(mode, &baseline, local, &remote, &PassHolds::default()).actions
 	}
 
 	/// What a pass plans once the case-only directory renames are folded into its inputs: the
@@ -2644,7 +2637,7 @@ mod tests {
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
 		let (mut baseline, mut local, mut remote) =
-			(Arc::new(baseline.clone()), local.clone(), remote.clone());
+			(Arc::new(tree(baseline)), local.clone(), remote.clone());
 		let mut actions = fold_dir_moves(
 			mode,
 			&mut baseline,
@@ -2652,7 +2645,7 @@ mod tests {
 			&mut remote,
 			&BTreeSet::new(),
 		);
-		actions.extend(plan(mode, &baseline, &local, &remote));
+		actions.extend(reconcile(mode, &baseline, &local, &remote, &PassHolds::default()).actions);
 		actions
 	}
 
@@ -2862,7 +2855,7 @@ mod tests {
 		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
 		let (mut baseline, mut local, mut remote) = case_tree("Docs", "docs", "Docs", dir, file);
 		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
-		let mut baseline = Arc::new(baseline);
+		let mut baseline = Arc::new(tree(&baseline));
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -3239,7 +3232,7 @@ mod tests {
 	fn a_dir_under_a_held_remote_path_is_not_moved() {
 		let (baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
 		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
-		let mut baseline = Arc::new(baseline);
+		let mut baseline = Arc::new(tree(&baseline));
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -3785,10 +3778,10 @@ mod tests {
 	#[test]
 	fn the_raw_snapshot_showing_our_version_advances_the_agreed_content() {
 		let uuid = Uuid::new_v4();
-		let mut baseline = map(vec![(
+		let mut baseline = tree(&map(vec![(
 			"a.txt",
 			base_file_pushed("a.txt", uuid, [1; 32], [0; 32]),
-		)]);
+		)]));
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [1; 32]))]);
 
 		let advanced = confirm_agreed_content(&mut baseline, &remote);
@@ -3801,7 +3794,7 @@ mod tests {
 			"the confirmed row is handed back to be persisted"
 		);
 		assert_eq!(
-			baseline["a.txt"].agreed_hash,
+			baseline.get("a.txt").unwrap().agreed_hash,
 			Some(Blake3Hash::from([1; 32])),
 			"the marker moved onto what the row records"
 		);
@@ -3822,10 +3815,10 @@ mod tests {
 			)]),
 			HashMap::new(),
 		] {
-			let mut baseline = map(vec![("a.txt", row.clone())]);
+			let mut baseline = tree(&map(vec![("a.txt", row.clone())]));
 			assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
 			assert_eq!(
-				baseline["a.txt"].agreed_hash,
+				baseline.get("a.txt").unwrap().agreed_hash,
 				Some(Blake3Hash::from([0; 32])),
 				"an unconfirmed push must not advance its own marker"
 			);
@@ -3837,13 +3830,13 @@ mod tests {
 	#[test]
 	fn a_conflicted_row_is_never_confirmed() {
 		let uuid = Uuid::new_v4();
-		let mut baseline = map(vec![(
+		let mut baseline = tree(&map(vec![(
 			"a.txt",
 			BaselineEntry {
 				state: BaselineState::Conflicted,
 				..base_file_pushed("a.txt", uuid, [1; 32], [0; 32])
 			},
-		)]);
+		)]));
 		let remote = map(vec![("a.txt", remote_file("a.txt", uuid, [1; 32]))]);
 		assert!(confirm_agreed_content(&mut baseline, &remote).is_empty());
 	}
@@ -3854,13 +3847,13 @@ mod tests {
 	#[test]
 	fn a_push_some_other_evidence_vouches_for_advances_the_agreed_content() {
 		let uuid = Uuid::new_v4();
-		let mut baseline = map(vec![
+		let mut baseline = tree(&map(vec![
 			("a.txt", base_file_pushed("a.txt", uuid, [1; 32], [0; 32])),
 			(
 				"b.txt",
 				base_file_pushed("b.txt", Uuid::new_v4(), [2; 32], [0; 32]),
 			),
-		]);
+		]));
 		let advanced = confirm_agreed_pushes(&mut baseline, &HashSet::from([uuid]));
 
 		assert_eq!(
@@ -3871,12 +3864,10 @@ mod tests {
 			vec!["a.txt"],
 			"only the vouched-for version's row moves"
 		);
+		let advanced_row = baseline.get("a.txt").unwrap();
+		assert_eq!(advanced_row.agreed_hash, advanced_row.content_hash);
 		assert_eq!(
-			baseline["a.txt"].agreed_hash,
-			baseline["a.txt"].content_hash
-		);
-		assert_eq!(
-			baseline["b.txt"].agreed_hash,
+			baseline.get("b.txt").unwrap().agreed_hash,
 			Some(Blake3Hash::from([0; 32])),
 			"a row nothing vouched for is left alone"
 		);
@@ -3897,9 +3888,9 @@ mod tests {
 			base_dir("a.txt", uuid),
 		] {
 			let agreed = row.agreed_hash;
-			let mut baseline = map(vec![("a.txt", row)]);
+			let mut baseline = tree(&map(vec![("a.txt", row)]));
 			assert!(confirm_agreed_pushes(&mut baseline, &HashSet::from([uuid])).is_empty());
-			assert_eq!(baseline["a.txt"].agreed_hash, agreed);
+			assert_eq!(baseline.get("a.txt").unwrap().agreed_hash, agreed);
 		}
 	}
 
@@ -4528,7 +4519,8 @@ mod tests {
 			),
 		]);
 
-		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let rows =
+			adopt_destination_rows(SyncMode::LocalToRemote, &tree(&baseline), &local, &remote);
 		let mut adopted: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
 		adopted.sort_unstable();
 		assert_eq!(
@@ -4546,7 +4538,7 @@ mod tests {
 		// The mirror image: with the REMOTE as the source, the local-only copy is the one adopted.
 		let rows = adopt_destination_rows(
 			SyncMode::RemoteToLocal,
-			&baseline,
+			&tree(&baseline),
 			&remote_as_local(),
 			&map(vec![]),
 		);
@@ -4579,7 +4571,8 @@ mod tests {
 			}]
 		);
 
-		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &remote);
+		let rows =
+			adopt_destination_rows(SyncMode::LocalToRemote, &tree(&baseline), &local, &remote);
 		assert_eq!(
 			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
 			vec!["theirs.txt"]
@@ -4595,7 +4588,9 @@ mod tests {
 
 		// Two-way needs no row: an untracked destination-only item already flows back on its own,
 		// and a row here would only take the path out of move detection.
-		assert!(adopt_destination_rows(SyncMode::TwoWay, &baseline, &local, &remote).is_empty());
+		assert!(
+			adopt_destination_rows(SyncMode::TwoWay, &tree(&baseline), &local, &remote).is_empty()
+		);
 		assert_eq!(
 			plan(SyncMode::TwoWay, &baseline, &local, &remote),
 			vec![SyncAction::DownloadFile {
@@ -4620,7 +4615,8 @@ mod tests {
 			}]
 		);
 
-		let rows = adopt_destination_rows(SyncMode::RemoteToLocal, &baseline, &local, &remote);
+		let rows =
+			adopt_destination_rows(SyncMode::RemoteToLocal, &tree(&baseline), &local, &remote);
 		assert_eq!(
 			rows.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
 			vec!["dropped.txt"]
@@ -4694,7 +4690,7 @@ mod tests {
 			SyncMode::LocalBackup,
 			SyncMode::RemoteBackup,
 		] {
-			let rows = adopt_destination_rows(mode, &baseline, &local, &remote);
+			let rows = adopt_destination_rows(mode, &tree(&baseline), &local, &remote);
 			assert!(rows.is_empty(), "{mode:?}: {rows:?}");
 		}
 
@@ -4704,7 +4700,12 @@ mod tests {
 			("secret.psd", remote_file("secret.psd", hidden, [1; 32])),
 			("theirs.psd", remote_file("theirs.psd", theirs, [2; 32])),
 		]);
-		let rows = adopt_destination_rows(SyncMode::LocalToRemote, &baseline, &local, &unfiltered);
+		let rows = adopt_destination_rows(
+			SyncMode::LocalToRemote,
+			&tree(&baseline),
+			&local,
+			&unfiltered,
+		);
 		let mut adopted: Vec<&str> = rows.iter().map(|r| r.rel_path.as_str()).collect();
 		adopted.sort_unstable();
 		assert_eq!(adopted, vec!["secret.psd", "theirs.psd"]);
@@ -5133,7 +5134,7 @@ mod tests {
 		assert!(
 			reconcile(
 				SyncMode::LocalToRemote,
-				&baseline,
+				&tree(&baseline),
 				&local,
 				&remote,
 				&PassHolds {
@@ -5159,7 +5160,7 @@ mod tests {
 		assert_eq!(
 			reconcile(
 				SyncMode::LocalToRemote,
-				&HashMap::new(),
+				&Baseline::default(),
 				&local,
 				&remote,
 				&PassHolds {
@@ -5451,7 +5452,7 @@ mod tests {
 				base_file("sub/c.txt", deep.uuid, [2; 32]),
 			),
 		]);
-		let (unknown, never_synced) = unknown_remote_paths(&baseline, &view.skipped);
+		let (unknown, never_synced) = unknown_remote_paths(&tree(&baseline), &view.skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([
@@ -5518,7 +5519,7 @@ mod tests {
 				reason: UnsyncableReason::RemoteUndecodable,
 			},
 		];
-		let (unknown, never_synced) = unknown_remote_paths(&baseline, &skipped);
+		let (unknown, never_synced) = unknown_remote_paths(&tree(&baseline), &skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([(
@@ -5567,7 +5568,7 @@ mod tests {
 			&[],
 			Some(ViewFilter {
 				rules: &rules,
-				baseline: &HashMap::new(),
+				baseline: &Baseline::default(),
 			}),
 		);
 
@@ -5593,7 +5594,7 @@ mod tests {
 			&[],
 			Some(ViewFilter {
 				rules: &rules,
-				baseline: &baseline,
+				baseline: &tree(&baseline),
 			}),
 		);
 
@@ -5642,7 +5643,7 @@ mod tests {
 			&undecodables,
 			Some(ViewFilter {
 				rules: &rules,
-				baseline: &HashMap::new(),
+				baseline: &Baseline::default(),
 			}),
 		);
 		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
@@ -5670,7 +5671,7 @@ mod tests {
 			}]
 		);
 		let baseline = HashMap::new();
-		let (_, never_synced) = unknown_remote_paths(&baseline, &view.skipped);
+		let (_, never_synced) = unknown_remote_paths(&tree(&baseline), &view.skipped);
 		assert_eq!(never_synced.len(), 1, "{never_synced:?}");
 	}
 
@@ -5697,7 +5698,7 @@ mod tests {
 			&[],
 			Some(ViewFilter {
 				rules: &root_rules("*"),
-				baseline: &HashMap::new(),
+				baseline: &Baseline::default(),
 			}),
 		);
 		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
@@ -5737,7 +5738,7 @@ mod tests {
 		let mut view = place_remote_items(root, &dirs, &files, &[]);
 		view.filter(Some(ViewFilter {
 			rules: &root_rules("bad*/"),
-			baseline: &HashMap::new(),
+			baseline: &Baseline::default(),
 		}));
 		assert!(
 			view.skipped.is_empty(),
@@ -5803,7 +5804,7 @@ mod tests {
 
 		view.filter(Some(ViewFilter {
 			rules: &root_rules("build/"),
-			baseline: &HashMap::new(),
+			baseline: &Baseline::default(),
 		}));
 		assert_eq!(
 			view.held_paths
@@ -6254,5 +6255,10 @@ mod tests {
 			view.nodes["sub/f.txt"].content_hash,
 			Some(Blake3Hash::from([5; 32]))
 		);
+	}
+
+	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
+	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
+		Baseline::from_rows(rows.values().cloned())
 	}
 }

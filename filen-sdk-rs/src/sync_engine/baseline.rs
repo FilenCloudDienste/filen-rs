@@ -20,7 +20,7 @@ use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, plan::is_under};
+use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, tree::Baseline};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`.
 ///
@@ -340,51 +340,6 @@ pub(crate) struct BaselineEntry {
 	pub(crate) agreed_hash: Option<Blake3Hash>,
 }
 
-/// Whether the baseline still tracks anything at or under a path, asked of one pass's baseline.
-///
-/// It decides whether an ignore rule's hit is a ROOT — recorded, reported, and untracked with its
-/// subtree — or an entry that is merely hidden: the built-in defaults hide a `.DS_Store` in every
-/// folder, and recording one root per folder makes every later filter scale with the directory
-/// count, to no end (the report leaves an untracked default hit out, and untracking it deletes no
-/// row).
-///
-/// A file's hit is one lookup. A directory's has to see its whole subtree, so the keys are sorted
-/// once, on the first such question — a tree whose only default hits are files never pays for it.
-pub(crate) struct Tracked<'a> {
-	baseline: &'a HashMap<String, BaselineEntry>,
-	sorted: Option<Vec<&'a str>>,
-}
-
-impl<'a> Tracked<'a> {
-	pub(crate) fn new(baseline: &'a HashMap<String, BaselineEntry>) -> Self {
-		Self {
-			baseline,
-			sorted: None,
-		}
-	}
-
-	/// Whether a row sits AT `rel_path`, or anywhere under it when `is_dir`.
-	pub(crate) fn covers(&mut self, rel_path: &str, is_dir: bool) -> bool {
-		if self.baseline.contains_key(rel_path) {
-			return true;
-		}
-		if !is_dir {
-			return false;
-		}
-		let baseline = self.baseline;
-		let sorted = self.sorted.get_or_insert_with(|| {
-			let mut keys: Vec<&str> = baseline.keys().map(String::as_str).collect();
-			keys.sort_unstable();
-			keys
-		});
-		// The first key at or after `rel_path/` is the only candidate: anything under the path sorts
-		// there, and a key that does not start with the prefix means nothing does.
-		let prefix = format!("{rel_path}/");
-		let at = sorted.partition_point(|key| *key < prefix.as_str());
-		sorted.get(at).is_some_and(|key| key.starts_with(&prefix))
-	}
-}
-
 /// One row of the persisted pending-write journal: a remote write this engine made, and when by
 /// the WALL clock (unix millis — the in-memory journal's `Instant` does not outlive its process).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,7 +397,7 @@ pub(crate) struct BaselineStore {
 	/// A [`RefCell`] because every write path takes `&self` — the connection is already the single
 	/// writer, serialized by the pair's store mutex, so there is no second borrower to race. The
 	/// store is `Send` and never `Sync`, exactly as the `Connection` inside it already makes it.
-	resident: RefCell<HashMap<PairId, Arc<HashMap<String, BaselineEntry>>>>,
+	resident: RefCell<HashMap<PairId, Arc<Baseline>>>,
 }
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
@@ -586,42 +541,6 @@ fn record_write<T>(
 			what()
 		);
 	})
-}
-
-/// Apply to a resident copy exactly what [`BaselineStore::write_changes`] applied to the DB.
-///
-/// `MoveSubtree` mirrors the two `UPDATE OR REPLACE` statements: every row at or under `from` is
-/// re-keyed under `to`, overwriting whatever sat at the destination. Every source is removed before
-/// any destination is written, so a case-only rename (`A` -> `a`, which shares no key with itself
-/// under a bytewise comparison but does under a lookup) cannot drop a row it has just written.
-fn apply_to_resident(rows: &mut HashMap<String, BaselineEntry>, changes: &[BaselineChange<'_>]) {
-	for change in changes {
-		match change {
-			BaselineChange::Upsert(entry) => {
-				rows.insert(entry.rel_path.clone(), (*entry).clone());
-			}
-			BaselineChange::Delete(rel_path) => {
-				rows.remove(*rel_path);
-			}
-			BaselineChange::MoveSubtree { from, to } => {
-				let moving: Vec<String> = rows
-					.keys()
-					.filter(|path| path.as_str() == *from || is_under(path, from))
-					.cloned()
-					.collect();
-				let moved: Vec<(String, BaselineEntry)> = moving
-					.into_iter()
-					.filter_map(|old| {
-						let mut entry = rows.remove(&old)?;
-						let new = format!("{to}{}", &old[from.len()..]);
-						entry.rel_path = new.clone();
-						Some((new, entry))
-					})
-					.collect();
-				rows.extend(moved);
-			}
-		}
-	}
 }
 
 /// The changes a failed [`apply_changes`](BaselineStore::apply_changes) or
@@ -830,7 +749,7 @@ impl BaselineStore {
 		if changed > 0 {
 			self.note_written(id, |rows| {
 				for entry in adopted {
-					rows.insert(entry.rel_path.clone(), entry.clone());
+					rows.upsert(entry);
 				}
 			});
 		}
@@ -982,9 +901,7 @@ impl BaselineStore {
 			|| self.upsert_entry_once(pair, entry),
 		)
 		.inspect(|()| {
-			self.note_written(pair, |rows| {
-				rows.insert(entry.rel_path.clone(), entry.clone());
-			});
+			self.note_written(pair, |rows| rows.upsert(entry));
 		})
 	}
 
@@ -1040,11 +957,11 @@ impl BaselineStore {
 			.collect()
 	}
 
-	/// `pair`'s rows keyed by path, read from the DB on the first call and kept in step by every
-	/// write path here afterwards.
+	/// `pair`'s rows as the resident [`Baseline`] tree, read from the DB on the first call and kept
+	/// in step by every write path here afterwards.
 	///
 	/// This is what a pass reconciles against, so it is read once per PAIR rather than once per
-	/// pass: at 100k rows the `SELECT` and the map build it replaces cost ~180 ms, which an idle
+	/// pass: at 100k rows the `SELECT` and the tree build it replaces cost ~180 ms, which an idle
 	/// pass would otherwise pay to find out that nothing changed.
 	///
 	/// This process's store is assumed to be the only writer of the pair's rows — it is, for every
@@ -1054,21 +971,13 @@ impl BaselineStore {
 	/// Handed out as an [`Arc`], and every write below applies itself through
 	/// [`Arc::make_mut`]: while a pass holds a copy, that pass's view stays exactly the one it read
 	/// — the pass reconciles against a fixed baseline and writes the rows it advances — and the
-	/// FIRST write of such a pass clones the map once, after which the store owns it alone again
+	/// FIRST write of such a pass clones the tree once, after which the store owns it alone again
 	/// and the rest of that pass's writes land in place. A pass that writes nothing clones nothing.
-	pub(crate) fn baseline(
-		&self,
-		pair: PairId,
-	) -> rusqlite::Result<Arc<HashMap<String, BaselineEntry>>> {
+	pub(crate) fn baseline(&self, pair: PairId) -> rusqlite::Result<Arc<Baseline>> {
 		if let Some(rows) = self.resident.borrow().get(&pair) {
 			return Ok(Arc::clone(rows));
 		}
-		let rows: Arc<HashMap<String, BaselineEntry>> = Arc::new(
-			self.entries(pair)?
-				.into_iter()
-				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect(),
-		);
+		let rows = Arc::new(Baseline::from_rows(self.entries(pair)?));
 		self.resident.borrow_mut().insert(pair, Arc::clone(&rows));
 		Ok(rows)
 	}
@@ -1079,7 +988,7 @@ impl BaselineStore {
 	///
 	/// A pair nothing has read yet has no resident copy, and gains one from the DB when something
 	/// asks: there is nothing to keep in step until then.
-	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut HashMap<String, BaselineEntry>)) {
+	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut Baseline)) {
 		if let Some(rows) = self.resident.borrow_mut().get_mut(&pair) {
 			apply(Arc::make_mut(rows));
 		}
@@ -1160,13 +1069,7 @@ impl BaselineStore {
 			}
 		}
 		tx.commit().inspect(|()| {
-			self.note_written(pair, |rows| {
-				rows.retain(|path, _| {
-					!roots
-						.iter()
-						.any(|root| path == root || is_under(path, root))
-				});
-			});
+			self.note_written(pair, |rows| rows.remove_subtrees(roots));
 		})
 	}
 
@@ -1202,7 +1105,7 @@ impl BaselineStore {
 			},
 			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes),
 		)
-		.inspect(|()| self.note_written(pair, |rows| apply_to_resident(rows, changes)))
+		.inspect(|()| self.note_written(pair, |rows| rows.apply(changes)))
 	}
 
 	fn record_pending_once(
@@ -1265,7 +1168,7 @@ impl BaselineStore {
 				tx.commit()
 			},
 		)
-		.inspect(|()| self.note_written(pair, |rows| apply_to_resident(rows, changes)))
+		.inspect(|()| self.note_written(pair, |rows| rows.apply(changes)))
 	}
 
 	/// Runs inside a transaction the caller opened, so every statement here is the non-retrying
@@ -2201,7 +2104,13 @@ mod tests {
 				.into_iter()
 				.map(|entry| (entry.rel_path.clone(), entry))
 				.collect();
-			assert_eq!(*store.baseline(pair).unwrap(), from_db, "after {what}");
+			let resident: HashMap<String, BaselineEntry> = store
+				.baseline(pair)
+				.unwrap()
+				.iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect();
+			assert_eq!(resident, from_db, "after {what}");
 		};
 
 		store
@@ -2292,7 +2201,15 @@ mod tests {
 		] {
 			store.upsert_entry(pair, &entry).unwrap();
 		}
-		let before = store.baseline(pair).unwrap();
+		let rows = |store: &BaselineStore| -> HashMap<String, BaselineEntry> {
+			store
+				.baseline(pair)
+				.unwrap()
+				.iter()
+				.map(|entry| (entry.rel_path.clone(), entry))
+				.collect()
+		};
+		let before = rows(&store);
 		assert_eq!(before.len(), 3);
 
 		store
@@ -2314,16 +2231,8 @@ mod tests {
 				.into_iter()
 				.map(|entry| (entry.rel_path.clone(), entry))
 				.collect();
-			assert_eq!(
-				*store.baseline(pair).unwrap(),
-				from_db,
-				"after a failed {what}"
-			);
-			assert_eq!(
-				*store.baseline(pair).unwrap(),
-				*before,
-				"after a failed {what}"
-			);
+			assert_eq!(rows(&store), from_db, "after a failed {what}");
+			assert_eq!(rows(&store), before, "after a failed {what}");
 		};
 
 		let boom = file_entry("boom.txt", [3; 32], 3);

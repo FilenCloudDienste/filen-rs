@@ -45,6 +45,7 @@ use super::{
 	ignore::{IgnoreRules, parse_user_ignore},
 	plan::{self, PassHolds, RemoteNode},
 	scan::{self, LocalNode, LocalScan, RuleFiles},
+	tree::Baseline,
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -492,7 +493,7 @@ pub fn run() -> String {
 	.expect("writing to a String never fails");
 
 	// The scan with nothing in the baseline: every file misses the fast path and is hashed.
-	let no_baseline = HashMap::new();
+	let no_baseline = Baseline::default();
 	let ((cold_scan, _), cold) =
 		timed(|| scan::scan_local(&fixture.root, &no_baseline, probe_rules(), RuleFiles::Read));
 	probe.record(
@@ -883,7 +884,7 @@ pub fn run() -> String {
 		"baseline_resident_cold",
 		first_read.len(),
 		resident_cold,
-		"baseline(), first read of the pair: the SELECT and the map build",
+		"baseline(), first read of the pair: the SELECT and the tree build",
 	);
 	drop(first_read);
 	let (baseline, resident_warm) = timed(|| store.baseline(pair).expect("reading the baseline"));
@@ -893,13 +894,25 @@ pub fn run() -> String {
 		resident_warm,
 		"baseline(), resident: an Arc clone",
 	);
+	// What the resident copy COSTS, which no timing shows: the bytes the tree holds for the life of
+	// the pair, summed from the structures themselves (see `Baseline::resident_bytes`).
+	let resident_bytes = baseline.resident_bytes();
+	probe.record(
+		"baseline_resident_bytes",
+		baseline.len(),
+		Duration::ZERO,
+		&format!(
+			"{:.1} MiB resident, {:.0} B/row computed from nodes + names + children + indexes",
+			resident_bytes as f64 / (1024.0 * 1024.0),
+			resident_bytes as f64 / baseline.len().max(1) as f64,
+		),
+	);
 
 	// And what it costs the pass that WRITES: the first row written while the pass holds the copy
 	// clones the whole map once (`Arc::make_mut`), every row after it lands in place. The row is
 	// one the pair already holds, written back unchanged, so the tree stays converged.
 	let first_row = baseline
 		.get(&rename_root)
-		.cloned()
 		.expect("the rename root has a baseline row");
 	let (written, first_write) = timed(|| store.upsert_entry(pair, &first_row));
 	written.expect("re-writing a row the pair already holds");
@@ -907,7 +920,7 @@ pub fn run() -> String {
 		"baseline_first_write",
 		baseline.len(),
 		first_write,
-		"upsert while a pass holds the copy: one Arc::make_mut clone of the whole map",
+		"upsert while a pass holds the copy: one Arc::make_mut clone of the whole tree",
 	);
 
 	let ((warm_scan, _), warm_time) =
