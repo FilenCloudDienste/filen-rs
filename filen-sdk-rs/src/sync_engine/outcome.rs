@@ -47,6 +47,7 @@ impl fmt::Display for PlannedNodeKind {
 
 /// What a planned action would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlannedActionKind {
 	/// Push a local file's content to the remote.
 	UploadFile,
@@ -74,6 +75,7 @@ pub enum PlannedActionKind {
 
 /// One action a pass would apply (or a held one it would not), in apply order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlannedAction {
 	pub kind: PlannedActionKind,
 	/// The item's path relative to both roots. For a move this is the SOURCE path; the destination
@@ -108,6 +110,7 @@ impl fmt::Display for PlannedAction {
 /// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a winner. The path
 /// and its subtree are excluded from planning while it is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlannedConflict {
 	pub rel_path: String,
 	/// What the local side holds, or `None` when the path is GONE locally — a delete-vs-modify
@@ -118,6 +121,25 @@ pub struct PlannedConflict {
 }
 
 impl PlannedConflict {
+	/// Build one. The struct is `#[non_exhaustive]`, so this is the only way to write one from
+	/// outside the crate — the engine produces these, a caller compares against them.
+	///
+	/// Hidden from the rendered docs for the same reason as
+	/// [`IgnoredPath::new`](super::IgnoredPath::new): it is here so the external test suite can
+	/// name an expected conflict without a wildcard, not so callers can mint one.
+	#[doc(hidden)]
+	pub fn new(
+		rel_path: impl Into<String>,
+		local: Option<PlannedNodeKind>,
+		remote: Option<PlannedNodeKind>,
+	) -> Self {
+		Self {
+			rel_path: rel_path.into(),
+			local,
+			remote,
+		}
+	}
+
 	fn side(kind: Option<PlannedNodeKind>) -> String {
 		kind.map_or_else(|| "absent".to_string(), |kind| kind.to_string())
 	}
@@ -137,6 +159,7 @@ impl fmt::Display for PlannedConflict {
 
 /// Why a path cannot be synced at all, so the engine stopped planning it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsyncableReason {
 	/// The local name is one the Filen backend rejects (a trailing dot or space, a reserved device
 	/// name, a forbidden character, an over-long name). No upload or remote create at this path can
@@ -207,9 +230,26 @@ impl fmt::Display for UnsyncableReason {
 
 /// One path a pass reported as unsyncable, reported once per pass for as long as it stays so.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UnsyncablePath {
 	pub rel_path: String,
 	pub reason: UnsyncableReason,
+}
+
+impl UnsyncablePath {
+	/// Build one. The struct is `#[non_exhaustive]`, so this is the only way to write one from
+	/// outside the crate — the engine produces these, a caller compares against them.
+	///
+	/// Hidden from the rendered docs for the same reason as
+	/// [`IgnoredPath::new`](super::IgnoredPath::new): it is here so the external test suite can
+	/// name an expected unsyncable path without a wildcard, not so callers can mint one.
+	#[doc(hidden)]
+	pub fn new(rel_path: impl Into<String>, reason: UnsyncableReason) -> Self {
+		Self {
+			rel_path: rel_path.into(),
+			reason,
+		}
+	}
 }
 
 impl fmt::Display for UnsyncablePath {
@@ -221,6 +261,7 @@ impl fmt::Display for UnsyncablePath {
 /// Why the engine refused to run a pass at all. Both cases make a 1:1 path mapping between the two
 /// sides impossible, so NOTHING is applied until the caller resolves the collision by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RefuseReason {
 	/// Two remote items resolve to the same case-insensitive path.
 	RemoteCollision,
@@ -241,6 +282,7 @@ impl fmt::Display for RefuseReason {
 /// those back, and the failure counts against no path's failure streak (see
 /// [`SyncReport::halted`](super::SyncReport::halted)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HaltReason {
 	/// The local disk has no room for another write (or a disk quota on it is used up).
 	LocalStorageFull,
@@ -279,6 +321,7 @@ impl fmt::Display for HaltReason {
 /// What a pass WOULD do, from [`SyncEngine::plan_pair`](super::SyncEngine::plan_pair) — a dry run
 /// that touches neither side and advances no baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlanOutcome {
 	/// Every action the pass would apply, in apply order. Empty when `refused` is set.
 	pub actions: Vec<PlannedAction>,
@@ -435,11 +478,11 @@ pub(super) fn planned_conflict(
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 ) -> PlannedConflict {
-	PlannedConflict {
-		rel_path: rel_path.to_string(),
-		local: local.get(rel_path).map(|node| node.kind.into()),
-		remote: remote.get(rel_path).map(|node| node.kind.into()),
-	}
+	PlannedConflict::new(
+		rel_path,
+		local.get(rel_path).map(|node| node.kind.into()),
+		remote.get(rel_path).map(|node| node.kind.into()),
+	)
 }
 
 #[cfg(test)]

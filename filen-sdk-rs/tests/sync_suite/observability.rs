@@ -1306,11 +1306,13 @@ async fn observ_add_plan_and_pass_report_the_same_ignored_paths() {
 	write_file(&sc.local, "build/out.bin", b"never uploaded");
 	write_file(&sc.local, "sub/.DS_Store", b"junk");
 	write_file(&sc.local, "sub/kept.txt", b"synced");
-	let ignored = |rel_path: &str, tracked: bool| IgnoredPath {
-		rel_path: rel_path.to_string(),
-		level: IgnoreLevel::File { dir: String::new() },
-		pattern: format!("{rel_path}/"),
-		tracked,
+	let ignored = |rel_path: &str, tracked: bool| {
+		IgnoredPath::new(
+			rel_path,
+			IgnoreLevel::File { dir: String::new() },
+			format!("{rel_path}/"),
+			tracked,
+		)
 	};
 
 	let plan = sc.engine.plan_pair(sc.pair).await.unwrap();
@@ -1734,11 +1736,11 @@ async fn observ_add_list_conflicts_reads_held_conflicts() {
 		"cache never observed the remote edit"
 	);
 	let r2 = sc.sync().await;
-	let expected = vec![PlannedConflict {
-		rel_path: "held.txt".to_string(),
-		local: Some(PlannedNodeKind::File),
-		remote: Some(PlannedNodeKind::File),
-	}];
+	let expected = vec![PlannedConflict::new(
+		"held.txt",
+		Some(PlannedNodeKind::File),
+		Some(PlannedNodeKind::File),
+	)];
 	assert_eq!(r2.conflicts, expected, "{r2:?}");
 	assert_eq!(sc.engine.list_conflicts(sc.pair).await.unwrap(), expected);
 	assert!(

@@ -803,10 +803,7 @@ async fn sec11_decryption_failure_surfaced_not_silent_empty() {
 		.unwrap();
 
 	// An item never synced is reported at the directory that holds it: the root.
-	let reported = vec![UnsyncablePath {
-		rel_path: String::new(),
-		reason: UnsyncableReason::RemoteUndecodable,
-	}];
+	let reported = vec![UnsyncablePath::new("", UnsyncableReason::RemoteUndecodable)];
 	let r1 = engine.sync_once(pair).await.unwrap();
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(
@@ -899,10 +896,10 @@ async fn sec12_undecryptable_item_never_reuploaded_as_plaintext() {
 		.add_pair(local.clone(), remote, SyncMode::TwoWay)
 		.await
 		.unwrap();
-	let reported = vec![UnsyncablePath {
-		rel_path: "report.txt".to_string(),
-		reason: UnsyncableReason::RemoteUndecodable,
-	}];
+	let reported = vec![UnsyncablePath::new(
+		"report.txt",
+		UnsyncableReason::RemoteUndecodable,
+	)];
 	for pass in 1..=2 {
 		let report = engine.sync_once(pair).await.unwrap();
 		assert!(report.errors.is_empty(), "pass {pass}: {report:?}");
@@ -1048,10 +1045,10 @@ async fn undecryptable_child_survives_a_remote_dir_move(tag: &str, new_parent: O
 		.add_pair(local.clone(), remote, SyncMode::TwoWay)
 		.await
 		.unwrap();
-	let reported = vec![UnsyncablePath {
-		rel_path: format!("{moved}/x.bin"),
-		reason: UnsyncableReason::RemoteUndecodable,
-	}];
+	let reported = vec![UnsyncablePath::new(
+		format!("{moved}/x.bin"),
+		UnsyncableReason::RemoteUndecodable,
+	)];
 	let mut tree: Vec<String> = new_parent.map(str::to_string).into_iter().collect();
 	tree.extend([
 		moved.clone(),

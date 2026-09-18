@@ -107,6 +107,7 @@ impl fmt::Display for Origin<'_> {
 
 /// The level the rule that ignores a path comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IgnoreLevel {
 	/// [`DEFAULT_IGNORE_PATTERNS`].
 	Default,
@@ -129,6 +130,7 @@ impl fmt::Display for IgnoreLevel {
 /// The top of a subtree the ignore rules hide: nothing at or under it is synced in either direction,
 /// and neither copy is touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IgnoredPath {
 	pub rel_path: String,
 	pub level: IgnoreLevel,
@@ -144,6 +146,30 @@ pub struct IgnoredPath {
 	/// pass stopped tracking it. Removing the rule later syncs it like a first sync. Only the pass
 	/// that drops the rows reports it so; a dry run reports it until a pass has run.
 	pub tracked: bool,
+}
+
+impl IgnoredPath {
+	/// Build one. The struct is `#[non_exhaustive]`, so this is the only way to write one from
+	/// outside the crate — the engine produces these, a caller compares against them.
+	///
+	/// Hidden from the rendered docs because comparing is all a caller should be doing with it:
+	/// it exists so the test suite, an external crate, can say what a pass should have reported
+	/// without a wildcard that would hide the next field. Code that MINTS these takes on the break
+	/// `#[non_exhaustive]` was added to prevent — a later field changes this signature.
+	#[doc(hidden)]
+	pub fn new(
+		rel_path: impl Into<String>,
+		level: IgnoreLevel,
+		pattern: impl Into<String>,
+		tracked: bool,
+	) -> Self {
+		Self {
+			rel_path: rel_path.into(),
+			level,
+			pattern: pattern.into(),
+			tracked,
+		}
+	}
 }
 
 impl fmt::Display for IgnoredPath {

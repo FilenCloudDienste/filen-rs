@@ -1173,6 +1173,7 @@ impl SyncEngine {
 /// [`SyncEngine::add_pair`] needing the network: a server error refuses the registration instead of
 /// registering a pair whose roots were never actually checked.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum PairOverlap {
 	/// Another pair already syncs this exact local folder.
 	#[error("sync pair {pair} already syncs the local root {existing:?}")]
@@ -1357,45 +1358,43 @@ impl Prepared {
 			.local_scan
 			.invalid_names
 			.iter()
-			.map(|(rel_path, detail)| UnsyncablePath {
-				rel_path: rel_path.clone(),
-				reason: UnsyncableReason::InvalidName {
-					detail: detail.clone(),
-				},
+			.map(|(rel_path, detail)| {
+				UnsyncablePath::new(
+					rel_path.clone(),
+					UnsyncableReason::InvalidName {
+						detail: detail.clone(),
+					},
+				)
 			});
-		let mut all: Vec<UnsyncablePath> = names
-			.chain(
-				self.failures
-					.iter()
-					.map(|(rel_path, failure)| UnsyncablePath {
-						rel_path: rel_path.clone(),
-						reason: UnsyncableReason::RepeatedFailure {
+		let mut all: Vec<UnsyncablePath> =
+			names
+				.chain(self.failures.iter().map(|(rel_path, failure)| {
+					UnsyncablePath::new(
+						rel_path.clone(),
+						UnsyncableReason::RepeatedFailure {
 							attempts: failure.attempts,
 							last_error: failure.last_error.clone(),
 						},
-					}),
-			)
-			.chain(
-				self.unknown_remote
-					.iter()
-					.map(|(rel_path, reason)| UnsyncablePath {
-						rel_path: rel_path.clone(),
-						reason: reason.clone(),
-					}),
-			)
-			.chain(self.never_synced_remote.iter().cloned())
-			.chain(
-				self.local_scan
-					.aliased_dirs
-					.iter()
-					.map(|(rel_path, target)| UnsyncablePath {
-						rel_path: rel_path.clone(),
-						reason: UnsyncableReason::LocalAlias {
-							target: target.clone(),
-						},
-					}),
-			)
-			.collect();
+					)
+				}))
+				.chain(self.unknown_remote.iter().map(|(rel_path, reason)| {
+					UnsyncablePath::new(rel_path.clone(), reason.clone())
+				}))
+				.chain(self.never_synced_remote.iter().cloned())
+				.chain(
+					self.local_scan
+						.aliased_dirs
+						.iter()
+						.map(|(rel_path, target)| {
+							UnsyncablePath::new(
+								rel_path.clone(),
+								UnsyncableReason::LocalAlias {
+									target: target.clone(),
+								},
+							)
+						}),
+				)
+				.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 		all
@@ -1513,11 +1512,13 @@ impl Prepared {
 		roots
 			.into_iter()
 			.filter(|(_, (decision, tracked))| *tracked || decision.level != IgnoreLevel::Default)
-			.map(|(path, (decision, tracked))| IgnoredPath {
-				rel_path: path.to_owned(),
-				level: decision.level.clone(),
-				pattern: decision.pattern.clone(),
-				tracked,
+			.map(|(path, (decision, tracked))| {
+				IgnoredPath::new(
+					path,
+					decision.level.clone(),
+					decision.pattern.clone(),
+					tracked,
+				)
 			})
 			.collect()
 	}
@@ -3465,10 +3466,12 @@ impl SyncEngine {
 			.await?
 			.map_err(|e| db_error(e, "loading the held conflicts"))?
 			.into_iter()
-			.map(|entry| PlannedConflict {
-				local: entry.local_kind.map(PlannedNodeKind::from),
-				remote: entry.remote_kind.map(PlannedNodeKind::from),
-				rel_path: entry.rel_path,
+			.map(|entry| {
+				PlannedConflict::new(
+					entry.rel_path,
+					entry.local_kind.map(PlannedNodeKind::from),
+					entry.remote_kind.map(PlannedNodeKind::from),
+				)
 			})
 			.collect())
 	}
