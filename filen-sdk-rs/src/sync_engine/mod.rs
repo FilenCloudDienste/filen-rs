@@ -35,6 +35,7 @@ mod plan;
 #[cfg(feature = "bench-internals")]
 pub mod probe;
 mod scan;
+mod tree;
 mod watch;
 
 pub use self::ignore::{DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath};
