@@ -2368,10 +2368,11 @@ pub(crate) fn reconcile(
 	// arm retires. So the tree is walked for it against one reused buffer and only a row in neither
 	// side is copied: a converged pair copies no path here (the set's own nodes aside).
 	//
-	// Still the union of all three sides. Driving the reconcile from a DIRTY SET instead needs
-	// change-scoped INPUTS — a local scan of the dirty paths and a remote view derived from the
-	// cache's delta — and this pass has neither: it reads both trees whole, so every path it read is
-	// a path it has to decide.
+	// Still the union of all three sides, on a change-scoped pass as much as on a whole one: the
+	// derived maps carry a node per baseline row, so every path is one this reconcile decides. The
+	// dirty set says which of those nodes were read FRESH this pass, not which ones are decided.
+	// Narrowing the reconcile itself to that set is a later change and needs more than the inputs:
+	// a stale node must still be visited, or a path nothing announced stops being reconciled.
 	let mut keys: BTreeSet<Cow<'_, str>> = local
 		.keys()
 		.chain(remote.keys())
