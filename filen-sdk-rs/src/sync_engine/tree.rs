@@ -205,6 +205,15 @@ impl Baseline {
 		for entry in rows {
 			baseline.upsert(&entry);
 		}
+		// The load is the one moment where the whole tree's size is known and nothing is about to
+		// grow. A `Vec` that doubled its way to a million nodes holds room for two million, and the
+		// resident copy keeps that slack for the life of the pair: 105 MiB of it at a million rows,
+		// which is a third of what the tree costs. The maps double the same way.
+		baseline.nodes.shrink_to_fit();
+		baseline.by_uuid.shrink_to_fit();
+		baseline.by_lineage.shrink_to_fit();
+		baseline.side.shrink_to_fit();
+		baseline.agreed.shrink_to_fit();
 		baseline
 	}
 
