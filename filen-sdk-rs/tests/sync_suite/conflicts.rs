@@ -15,7 +15,9 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::RemoteFile;
 use filen_sdk_rs::fs::{HasName, HasUUID};
-use filen_sdk_rs::sync_engine::{CONFIRM_TENURE, ConflictResolution, SyncEngine, SyncMode};
+use filen_sdk_rs::sync_engine::{
+	CONFIRM_TENURE, ConflictResolution, SyncEngine, SyncEvent, SyncMode,
+};
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1158,11 +1160,22 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 	// Now the remote changes, which is what pulls over the local path.
 	let v2 = upload_remote_single(&sc, "doc.txt", b"V2V2").await;
 	wait_cache_has(&sc, v2.uuid()).await;
-	let mut r2 = sc.sync().await;
+	// Observed: the report is not the only place the pass owes this path a word — a watch caller
+	// hears it as the copy is moved aside, before the download that took its place.
+	let mut events: Vec<SyncEvent> = Vec::new();
+	let mut r2 = sc
+		.engine
+		.sync_once_observed(sc.pair, &mut |e| events.push(e))
+		.await
+		.expect("sync_once_observed");
 	let deadline = std::time::Instant::now() + Duration::from_secs(30);
 	while !read_eq(&sc.local, "doc.txt", b"V2V2") && std::time::Instant::now() < deadline {
 		tokio::time::sleep(Duration::from_millis(500)).await;
-		r2 = sc.sync().await;
+		r2 = sc
+			.engine
+			.sync_once_observed(sc.pair, &mut |e| events.push(e))
+			.await
+			.expect("sync_once_observed");
 	}
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert!(
@@ -1180,6 +1193,20 @@ async fn conflict_15d_pull_over_a_size_and_mtime_preserving_edit_quarantines_it(
 		r2.quarantined,
 		vec!["doc.txt".to_string()],
 		"the pull must report the local copy it quarantined: {r2:?}"
+	);
+	// ... and said it live, pointing at the bytes it put in the bin.
+	let announced: Vec<&SyncEvent> = events
+		.iter()
+		.filter(|e| matches!(e, SyncEvent::Quarantined { .. }))
+		.collect();
+	let [SyncEvent::Quarantined { rel_path, bin_path }] = announced.as_slice() else {
+		panic!("exactly one Quarantined event must reach the observer, saw: {announced:?}");
+	};
+	assert_eq!(rel_path.as_str(), "doc.txt");
+	assert_eq!(
+		std::fs::read(bin_path).unwrap(),
+		b"EDIT",
+		"the event must point at the copy that was moved aside"
 	);
 
 	sc.cleanup();
