@@ -908,6 +908,54 @@ pub fn run() -> String {
 		),
 	);
 
+	// What ONE path-keyed lookup costs in each shape, over the same rows in the same run — the only
+	// comparison this machine's run-to-run spread cannot blur. The map hands back a reference and
+	// the tree builds the row it hands back, which is what the callers need either way, so this is
+	// what a caller pays for one path in each shape.
+	let paths: Vec<String> = baseline.paths().collect();
+	let map: HashMap<String, BaselineEntry> = store
+		.entries(pair)
+		.expect("reading the baseline")
+		.into_iter()
+		.map(|entry| (entry.rel_path.clone(), entry))
+		.collect();
+	let (_, map_lookups) = timed(|| {
+		for path in &paths {
+			std::hint::black_box(map.get(path));
+		}
+	});
+	probe.record(
+		"lookup_map",
+		paths.len(),
+		map_lookups,
+		"HashMap::get per path — the shape a pass read before the tree",
+	);
+	drop(map);
+	let (_, tree_lookups) = timed(|| {
+		for path in &paths {
+			std::hint::black_box(baseline.get(path));
+		}
+	});
+	probe.record(
+		"lookup_tree",
+		paths.len(),
+		tree_lookups,
+		"Baseline::get per path, resolved from the root every time",
+	);
+	let (_, cursor_lookups) = timed(|| {
+		let mut rows = baseline.cursor();
+		for path in &paths {
+			std::hint::black_box(rows.get(path));
+		}
+	});
+	probe.record(
+		"lookup_cursor",
+		paths.len(),
+		cursor_lookups,
+		"Baseline::cursor in path order — the shape the scan and the reconcile ask in",
+	);
+	drop(paths);
+
 	// And what it costs the pass that WRITES: the first row written while the pass holds the copy
 	// clones the whole map once (`Arc::make_mut`), every row after it lands in place. The row is
 	// one the pair already holds, written back unchanged, so the tree stays converged.

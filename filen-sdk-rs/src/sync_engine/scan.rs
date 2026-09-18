@@ -426,6 +426,9 @@ fn scan_local_watched(
 	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
 	// estimate worth having; a pair with none still gets a walk's worth of room up front.
 	let capacity = baseline.len().max(1024);
+	// The walk asks about one directory's entries at a time, so the lookup keeps that directory in
+	// hand instead of resolving every path from the root again.
+	let mut rows = baseline.cursor();
 	let mut nodes: HashMap<String, LocalNode> = HashMap::with_capacity(capacity);
 	let mut errors = Vec::new();
 	let mut invalid_names = BTreeMap::new();
@@ -547,7 +550,7 @@ fn scan_local_watched(
 				// otherwise read as deleted. A file synced as a link's copy is only that copy, and
 				// its deletion propagates like any other.
 				if !unfollowable_symlink(&err)
-					|| baseline
+					|| rows
 						.get(&rel_path)
 						.is_some_and(|entry| entry.kind == NodeKind::Dir)
 				{
@@ -671,7 +674,7 @@ fn scan_local_watched(
 			NodeKind::File => {
 				let size = metadata.len();
 				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
-				let reused = fast_path_hash(baseline.get(&rel_path).as_ref(), size, mtime);
+				let reused = fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime);
 				let content_hash = match reused {
 					Some(hash) => Some(hash),
 					None => match hash_file(entry.path()) {
