@@ -140,6 +140,17 @@ impl ConflictSides {
 /// `char::to_lowercase` expansion, not just the ASCII range — without materializing either folded
 /// form. Two names are `Equal` here exactly when their collision keys are equal.
 pub(super) fn fold_cmp(a: &str, b: &str) -> Ordering {
+	// Every comparison of a lookup runs through here, and almost every name on a real drive is
+	// ASCII, where folding a byte is one instruction and `char::to_lowercase` is a table lookup
+	// returning an iterator. The two agree on ASCII by construction — `to_lowercase` maps an ASCII
+	// char to exactly one ASCII char — so the fast path is the same answer, not an approximation.
+	if a.is_ascii() && b.is_ascii() {
+		return a
+			.as_bytes()
+			.iter()
+			.map(u8::to_ascii_lowercase)
+			.cmp(b.as_bytes().iter().map(u8::to_ascii_lowercase));
+	}
 	a.chars()
 		.flat_map(char::to_lowercase)
 		.cmp(b.chars().flat_map(char::to_lowercase))
@@ -164,9 +175,9 @@ pub(super) struct Baseline {
 	by_lineage: HashMap<StableUuid, NodeId>,
 	/// Conflicted rows only.
 	side: HashMap<NodeId, ConflictSides>,
-	/// Rows whose `agreed_hash` is NOT their `content_hash` — an unconfirmed push, and the only
-	/// shape [`plan::awaits_confirmation`](super::plan::awaits_confirmation) can hold. A row that is
-	/// not here agrees with itself, which is every row of a converged pair.
+	/// Rows whose `agreed_hash` is NOT their `content_hash` — the shape an unconfirmed push leaves
+	/// (see [`Baseline::awaits_confirmation`]). A row that is not here agrees with itself, which is
+	/// every row of a converged pair.
 	agreed: HashMap<NodeId, Option<Blake3Hash>>,
 	/// How many nodes are rows (see [`PRESENT`]).
 	rows: usize,
@@ -267,6 +278,15 @@ impl Baseline {
 		}
 		parts.reverse();
 		parts.join("/")
+	}
+
+	/// A lookup that remembers the directory it last looked in (see [`Cursor`]).
+	pub(super) fn cursor(&self) -> Cursor<'_> {
+		Cursor {
+			baseline: self,
+			dir: String::new(),
+			at: NodeId::ROOT,
+		}
 	}
 
 	/// The row at `rel_path`, rebuilt from its node.
@@ -737,6 +757,39 @@ impl Baseline {
 	}
 }
 
+/// A lookup that remembers the directory it last resolved, for a caller that asks about paths in
+/// tree order — the local scan, which walks a directory at a time, and the reconcile, which reads
+/// its keys sorted. Resolving `a/b/c/x.txt` from the root is a binary search per level, each one
+/// jumping to a random node of the arena; from the directory already in hand it is one.
+///
+/// A plain memo, not a cache: it holds the directory it was last asked for and nothing else, so it
+/// cannot go stale within the borrow it holds (the baseline is immutable for as long as it lives)
+/// and a miss costs one full resolve, exactly what every lookup used to cost.
+pub(super) struct Cursor<'a> {
+	baseline: &'a Baseline,
+	/// The parent path `at` stands for; `""` is the pair root, which `at` starts on.
+	dir: String,
+	at: NodeId,
+}
+
+impl Cursor<'_> {
+	/// The row at `rel_path`, as [`Baseline::get`] gives it.
+	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
+		let (parent, name) = rel_path
+			.rsplit_once('/')
+			.map_or(("", rel_path), |(parent, name)| (parent, name));
+		if parent != self.dir {
+			self.at = self.baseline.resolve(parent)?;
+			self.dir.clear();
+			self.dir.push_str(parent);
+		}
+		let id = self.baseline.child(self.at, name)?;
+		self.baseline
+			.is_row(id)
+			.then(|| self.baseline.entry_at(id, rel_path.to_string()))
+	}
+}
+
 /// Every row under one node, parent before child, with each row's path built as the walk descends
 /// (one `String` per row rather than one per node of the tree).
 struct Walk<'a> {
@@ -1147,6 +1200,36 @@ mod tests {
 
 		assert_eq!(paths(&baseline), vec!["b/new.txt", "c"]);
 		assert_eq!(baseline.len(), 2);
+	}
+
+	/// The cursor is a memo over [`Baseline::get`] and has to answer identically — for a path whose
+	/// directory it has never seen, for one that is no row, for a sibling that folds onto another
+	/// spelling, and after a miss, which must leave the directory it holds consistent.
+	#[test]
+	fn the_cursor_answers_exactly_what_a_fresh_lookup_answers() {
+		let baseline = Baseline::from_rows([
+			dir("a"),
+			file("a/x.txt", Uuid::new_v4(), [1; 32]),
+			file("a/X.txt", Uuid::new_v4(), [2; 32]),
+			file("a/deep/y.txt", Uuid::new_v4(), [3; 32]),
+			file("b.txt", Uuid::new_v4(), [4; 32]),
+		]);
+
+		let mut cursor = baseline.cursor();
+		for path in [
+			"a",
+			"a/x.txt",
+			"a/X.txt",
+			"a/deep",
+			"a/deep/y.txt",
+			"b.txt",
+			"missing",
+			"missing/deeper.txt",
+			"a/gone.txt",
+			"a/x.txt",
+		] {
+			assert_eq!(cursor.get(path), baseline.get(path), "{path}");
+		}
 	}
 
 	/// A row cannot be written for the pair root itself: the store's key includes a path, and a
