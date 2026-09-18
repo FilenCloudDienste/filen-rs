@@ -7,6 +7,7 @@
 //! to tell which side changed and surfaces a genuine both-sides-changed divergence as a conflict.
 
 use std::{
+	borrow::Cow,
 	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
 	sync::Arc,
@@ -2352,11 +2353,14 @@ pub(crate) fn reconcile(
 		remote.len()
 	);
 	// Still the union of all three sides: this pass reads and reconciles everything, and the
-	// change-scoped driver that replaces the union is Stage 5's second half.
-	let keys: BTreeSet<String> = baseline
+	// change-scoped driver that replaces the union is Stage 5's second half. The baseline's paths
+	// are walked out of the tree and so have to be owned; the two side maps are keyed by paths that
+	// already exist, and borrowing those is the difference between one allocation per row and three.
+	let keys: BTreeSet<Cow<'_, str>> = baseline
 		.paths()
-		.chain(local.keys().cloned())
-		.chain(remote.keys().cloned())
+		.map(Cow::Owned)
+		.chain(local.keys().map(|path| Cow::Borrowed(path.as_str())))
+		.chain(remote.keys().map(|path| Cow::Borrowed(path.as_str())))
 		.collect();
 
 	// Consume the paths the view could not resolve before anything else looks at them, so neither
@@ -2377,7 +2381,7 @@ pub(crate) fn reconcile(
 				tracing::debug!(
 					"reconcile: skipping {key:?} — the cache is listing that name twice, so the view cannot resolve it"
 				);
-				consumed.insert(key.clone());
+				consumed.insert(key.to_string());
 				deferred_paths += 1;
 			}
 		}
@@ -2392,11 +2396,15 @@ pub(crate) fn reconcile(
 	// `delete_ok` gate below.
 	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
 
+	// The keys come out of the set in path order, so siblings arrive together: the cursor resolves
+	// one directory and answers for everything under it.
+	let mut rows = baseline.cursor();
 	for key in &keys {
+		let key: &str = key;
 		if consumed.contains(key) {
 			continue;
 		}
-		let base = baseline.get(key);
+		let base = rows.get(key);
 		let base = base.as_ref();
 		// A held conflict is never acted on until the caller resolves it — but it IS re-reported
 		// every pass, so a caller watching the reports keeps seeing what is outstanding. Its
