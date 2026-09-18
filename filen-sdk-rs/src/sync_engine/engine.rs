@@ -37,6 +37,7 @@ use super::{
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	scan::{self, LocalScan, RuleFiles, ScanError},
+	tree::Baseline,
 };
 use crate::{
 	Error, ErrorKind,
@@ -588,17 +589,15 @@ fn observation_callback(
 /// ([`Observations::forget_pushes`]).
 fn observed_confirmations(
 	observed: &Observations,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	raw_remote: &HashMap<String, RemoteNode>,
 	now: Instant,
 ) -> (std::collections::HashSet<Uuid>, Vec<(String, Uuid, Uuid)>) {
 	let mut confirmed = std::collections::HashSet::new();
 	// rel_path is only for the log; the lookup runs on the foreign version sitting at it.
 	let mut ask_server = Vec::new();
-	for (rel_path, entry) in baseline.iter() {
-		if !plan::awaits_confirmation(entry) {
-			continue;
-		}
+	for entry in baseline.unconfirmed() {
+		let rel_path = &entry.rel_path;
 		let Some(ours) = entry.remote_uuid else {
 			continue;
 		};
@@ -768,7 +767,7 @@ impl PendingWrites {
 	fn strangers(
 		&self,
 		pair: PairId,
-		baseline: &HashMap<String, BaselineEntry>,
+		baseline: &Baseline,
 		nodes: &HashMap<String, RemoteNode>,
 	) -> Vec<(Uuid, String, Uuid, Uuid)> {
 		self.map()
@@ -778,7 +777,7 @@ impl PendingWrites {
 				let PendingKind::Created { path, replaced } = &write.kind else {
 					return None;
 				};
-				let ours = written_node(baseline.get(path))?;
+				let ours = written_node(baseline.get(path).as_ref())?;
 				let current = nodes.get(path)?;
 				if current.remote_uuid == ours.remote_uuid
 					|| current.remote_uuid == *uuid
@@ -813,7 +812,7 @@ impl PendingWrites {
 	pub(super) fn fold_into(
 		&self,
 		pair: PairId,
-		baseline: &HashMap<String, BaselineEntry>,
+		baseline: &Baseline,
 		nodes: &mut HashMap<String, RemoteNode>,
 	) -> usize {
 		let map = self.map();
@@ -911,12 +910,12 @@ fn place_node(
 fn fold_create(
 	nodes: &mut HashMap<String, RemoteNode>,
 	path_of: &mut HashMap<Uuid, String>,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	uuid: Uuid,
 	path: &str,
 	replaced: Option<Uuid>,
 ) -> bool {
-	let Some(node) = written_node(baseline.get(path)) else {
+	let Some(node) = written_node(baseline.get(path).as_ref()) else {
 		return false;
 	};
 	match nodes.get(path) {
@@ -948,7 +947,7 @@ fn fold_create(
 fn fold_move(
 	nodes: &mut HashMap<String, RemoteNode>,
 	path_of: &mut HashMap<Uuid, String>,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	uuid: Uuid,
 	from: &str,
 	to: &str,
@@ -976,8 +975,9 @@ fn fold_move(
 	let carries_subtree = vacated
 		.as_ref()
 		.is_some_and(|node| node.kind == NodeKind::Dir);
-	let node =
-		vacated.or_else(|| written_node(baseline.get(to)).filter(|node| node.remote_uuid == uuid));
+	let node = vacated.or_else(|| {
+		written_node(baseline.get(to).as_ref()).filter(|node| node.remote_uuid == uuid)
+	});
 	let Some(mut node) = node else {
 		return false;
 	};
@@ -1248,7 +1248,7 @@ fn remote_overlap(
 /// The read-only inputs to a pass, shared by planning and applying.
 struct Prepared {
 	record: PairRecord,
-	baseline: Arc<HashMap<String, BaselineEntry>>,
+	baseline: Arc<Baseline>,
 	/// The directory moves this pass makes, in the order they run (see [`plan::fold_dir_moves`]).
 	/// `baseline`, `local_scan` and `remote_view` are already keyed by the paths those subtrees
 	/// end up at.
@@ -1501,13 +1501,10 @@ impl Prepared {
 		for path in nested {
 			roots.remove(path);
 		}
-		// One lookup per row and ancestor, rather than a scan of the baseline per ignored path.
-		for row in self.baseline.keys() {
-			for path in parents(row).chain([row.as_str()]) {
-				if let Some((_, tracked)) = roots.get_mut(path) {
-					*tracked = true;
-				}
-			}
+		// One subtree probe per ignored root — the roots are a handful and the rows are the whole
+		// tree, so asking the baseline about each root beats walking every row and its ancestors.
+		for (path, (_, tracked)) in &mut roots {
+			*tracked = self.baseline.tracked(path, true);
 		}
 		roots
 			.into_iter()
@@ -1540,11 +1537,8 @@ fn rekey_ignored(map: &mut BTreeMap<String, IgnoreDecision>, from: &str, to: &st
 /// Whether the remote view is wholly empty while the baseline still tracks remote items: what a
 /// transient backend or cache fault looks like. Read from the view BEFORE ignored items are filtered
 /// out of it, or a root `.filenignore` of `*` would read as a vanished remote on every pass.
-fn remote_emptied(
-	nodes: &HashMap<String, RemoteNode>,
-	baseline: &HashMap<String, BaselineEntry>,
-) -> bool {
-	nodes.is_empty() && baseline.values().any(|e| e.remote_uuid.is_some())
+fn remote_emptied(nodes: &HashMap<String, RemoteNode>, baseline: &Baseline) -> bool {
+	nodes.is_empty() && baseline.has_remote_rows()
 }
 
 /// Re-key every path at or under `from` in `map` to the same place under `to`.
@@ -2391,7 +2385,7 @@ impl SyncEngine {
 	/// our version at its own path and would confirm every push against itself.
 	async fn confirm_pushes(
 		&self,
-		baseline: &mut HashMap<String, BaselineEntry>,
+		baseline: &mut Baseline,
 		raw_remote: &HashMap<String, RemoteNode>,
 	) -> Vec<BaselineEntry> {
 		let (mut confirmed, ask_server) =
@@ -2456,7 +2450,7 @@ impl SyncEngine {
 	async fn retire_superseded_creates(
 		&self,
 		pair: PairId,
-		baseline: &HashMap<String, BaselineEntry>,
+		baseline: &Baseline,
 		raw_remote: &HashMap<String, RemoteNode>,
 	) -> Result<(), Error> {
 		let candidates = self.pending.strangers(pair, baseline, raw_remote);
@@ -2526,7 +2520,7 @@ impl SyncEngine {
 		// A pair with nothing awaiting confirmation is the steady state, and the sweep runs in the
 		// stretches where no pass does: it must not copy the resident map to find that out. The
 		// gate `prepare` uses, and the filter all three confirmation steps already apply.
-		if !baseline.values().any(plan::awaits_confirmation) {
+		if !baseline.any_unconfirmed() {
 			return Ok(());
 		}
 		let advanced = self
@@ -2570,7 +2564,7 @@ impl SyncEngine {
 	async fn remote_rules(
 		&self,
 		record: &PairRecord,
-		baseline: &HashMap<String, BaselineEntry>,
+		baseline: &Baseline,
 		view: &RemoteView,
 		user: Option<IgnoreSource>,
 	) -> RemoteRules {
@@ -2678,7 +2672,7 @@ impl SyncEngine {
 		// left behind, and a pair with none — the steady state — must not copy the whole resident
 		// baseline to find that out.
 		let mut confirmed = Vec::new();
-		if baseline.values().any(plan::awaits_confirmation) {
+		if baseline.any_unconfirmed() {
 			let rows = Arc::make_mut(&mut baseline);
 			confirmed = plan::confirm_agreed_content(rows, &view.nodes);
 			confirmed.extend(self.confirm_pushes(rows, &view.nodes).await);
@@ -2709,11 +2703,10 @@ impl SyncEngine {
 			RuleFiles::Only(
 				baseline
 					.iter()
-					.filter(|(path, entry)| {
-						entry.kind == NodeKind::File && !view.nodes.contains_key(*path)
+					.filter(|entry| {
+						entry.kind == NodeKind::File && !view.nodes.contains_key(&entry.rel_path)
 					})
-					.filter_map(|(path, _)| rule_file_dir(path))
-					.map(str::to_owned)
+					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
 					.collect(),
 			)
 		};
@@ -4531,7 +4524,7 @@ mod tests {
 		);
 		let reconciled = plan::reconcile(
 			SyncMode::TwoWay,
-			&baseline,
+			&tree(&baseline),
 			&local,
 			&view.nodes,
 			&plan::PassHolds::default(),
@@ -4558,7 +4551,7 @@ mod tests {
 			"the guard alone lets that one delete through"
 		);
 
-		let (unknown, never_synced) = plan::unknown_remote_paths(&baseline, &view.skipped);
+		let (unknown, never_synced) = plan::unknown_remote_paths(&tree(&baseline), &view.skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([("doc.txt".to_string(), UnsyncableReason::RemoteUndecodable)])
@@ -4604,6 +4597,7 @@ mod tests {
 		remote_view: RemoteView,
 		failures: HashMap<String, PathFailure>,
 	) -> Prepared {
+		let baseline = Baseline::from_rows(baseline.into_values());
 		let (unknown_remote, never_synced_remote) =
 			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 		Prepared {
@@ -6102,9 +6096,9 @@ mod tests {
 			Vec::new(),
 			&[],
 		);
-		assert!(!remote_emptied(&raw.nodes, &docs.baseline()));
+		assert!(!remote_emptied(&raw.nodes, &tree(&docs.baseline())));
 		assert!(
-			remote_emptied(&HashMap::new(), &docs.baseline()),
+			remote_emptied(&HashMap::new(), &tree(&docs.baseline())),
 			"the filtered view alone would read as a vanished remote"
 		);
 		for mode in MODES {
@@ -6187,13 +6181,13 @@ mod tests {
 	) -> Vec<SyncAction> {
 		let (scan, _) = scan::scan_local(
 			root,
-			&HashMap::new(),
+			&Baseline::default(),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 		);
 		let plan = plan::reconcile(
 			SyncMode::TwoWay,
-			baseline,
+			&tree(baseline),
 			&scan.nodes,
 			remote,
 			&plan::PassHolds::default(),
@@ -6589,7 +6583,7 @@ mod tests {
 		assert!(fold_move(
 			&mut nodes,
 			&mut path_of,
-			&HashMap::new(),
+			&Baseline::default(),
 			dir,
 			"Docs",
 			"docs"
@@ -6686,7 +6680,7 @@ mod tests {
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
-				&baseline,
+				&tree(&baseline),
 				&local_map(hash(3)),
 				&remote_map(uuid, hash(3)),
 				&plan::PassHolds::default(),
@@ -6726,7 +6720,7 @@ mod tests {
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
-				&baseline,
+				&tree(&baseline),
 				&local_map(hash(3)),
 				&remote_map(uuid, hash(3)),
 				&plan::PassHolds::default(),
@@ -6762,7 +6756,7 @@ mod tests {
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
 		let actions = plan::reconcile(
 			SyncMode::TwoWay,
-			&baseline,
+			&tree(&baseline),
 			&local_map(hash(3)),
 			&remote_map(uuid, hash(9)),
 			&plan::PassHolds::default(),
@@ -6797,7 +6791,7 @@ mod tests {
 		let baseline = HashMap::from([("a.txt".to_string(), entry)]);
 		let actions = plan::reconcile(
 			SyncMode::TwoWay,
-			&baseline,
+			&tree(&baseline),
 			&local_map(hash(3)),
 			&remote_map(uuid, hash(9)),
 			&plan::PassHolds::default(),
@@ -6897,14 +6891,16 @@ mod tests {
 			.pending
 			.settle(pair, &engine.observed.snapshot(), &remote);
 		assert_eq!(
-			engine.pending.fold_into(pair, &baseline, &mut remote),
+			engine
+				.pending
+				.fold_into(pair, &tree(&baseline), &mut remote),
 			1,
 			"the reopened engine folds the write its predecessor made"
 		);
 
 		let actions = plan::reconcile(
 			SyncMode::LocalToRemote,
-			&baseline,
+			&tree(&baseline),
 			&local_map(hash(1)),
 			&remote,
 			&holds,
@@ -8105,11 +8101,11 @@ mod tests {
 		// The cache is behind: its snapshot has nothing at all under the root yet.
 		let mut remote = HashMap::new();
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		pending.fold_into(PAIR, &baseline, &mut remote);
+		pending.fold_into(PAIR, &tree(&baseline), &mut remote);
 
 		let actions = plan::reconcile(
 			SyncMode::LocalToRemote,
-			&baseline,
+			&tree(&baseline),
 			&local_map(hash(2)),
 			&remote,
 			&holds,
@@ -8140,7 +8136,7 @@ mod tests {
 		let mut remote = HashMap::new();
 		pending.settle(PAIR, &observed, &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &written_row(uuid, hash(1)), &mut remote),
+			pending.fold_into(PAIR, &tree(&written_row(uuid, hash(1))), &mut remote),
 			0,
 			"an announced uuid retires the write even with nothing left at the path"
 		);
@@ -8167,7 +8163,7 @@ mod tests {
 		let mut remote = HashMap::new();
 		pending.settle(PAIR, &observed, &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &written_row(uuid, hash(1)), &mut remote),
+			pending.fold_into(PAIR, &tree(&written_row(uuid, hash(1))), &mut remote),
 			1,
 			"only what was known before the snapshot may retire a write against it"
 		);
@@ -8192,7 +8188,7 @@ mod tests {
 		let mut remote = node_at("a.txt", uuid);
 		pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &baseline, &mut remote),
+			pending.fold_into(PAIR, &tree(&baseline), &mut remote),
 			1,
 			"the snapshot still shows the pre-move path and nothing new has been announced"
 		);
@@ -8201,7 +8197,7 @@ mod tests {
 		let mut remote = node_at("a.txt", uuid);
 		pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &baseline, &mut remote),
+			pending.fold_into(PAIR, &tree(&baseline), &mut remote),
 			0,
 			"an announcement made after the move retires it"
 		);
@@ -8222,7 +8218,7 @@ mod tests {
 		)]);
 		let mut remote = node_at("a.txt", uuid);
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
 
 		assert!(
 			!remote.contains_key("a.txt"),
@@ -8240,7 +8236,7 @@ mod tests {
 			},
 		)]);
 		assert!(
-			plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds)
+			plan::reconcile(SyncMode::TwoWay, &tree(&baseline), &local, &remote, &holds)
 				.actions
 				.is_empty(),
 			"both sides agree once the move is folded in: the pass has nothing to do"
@@ -8265,7 +8261,7 @@ mod tests {
 		let mut remote = node_at("a.txt", uuid);
 		remote.extend(node_at("b.txt", foreign));
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
 
 		assert!(
 			!remote.contains_key("a.txt"),
@@ -8285,8 +8281,14 @@ mod tests {
 				content_hash: Some(hash(3)),
 			},
 		)]);
-		let actions =
-			plan::reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote, &holds).actions;
+		let actions = plan::reconcile(
+			SyncMode::LocalToRemote,
+			&tree(&baseline),
+			&local,
+			&remote,
+			&holds,
+		)
+		.actions;
 		assert!(
 			!actions
 				.iter()
@@ -8335,7 +8337,7 @@ mod tests {
 		// Trashing dropped both baseline rows, and the local side is gone too.
 		let (baseline, local) = (HashMap::new(), HashMap::new());
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
 		assert!(
 			remote.is_empty(),
 			"the trashed directory takes its subtree with it"
@@ -8345,9 +8347,15 @@ mod tests {
 			"the deletion of that uuid is still suppressed, whatever a view shows"
 		);
 		assert!(
-			plan::reconcile(SyncMode::LocalToRemote, &baseline, &local, &remote, &holds)
-				.actions
-				.is_empty(),
+			plan::reconcile(
+				SyncMode::LocalToRemote,
+				&tree(&baseline),
+				&local,
+				&remote,
+				&holds
+			)
+			.actions
+			.is_empty(),
 			"nothing is trashed a second time"
 		);
 	}
@@ -8364,7 +8372,7 @@ mod tests {
 		let baseline = written_row(new, hash(1));
 		let mut remote = node_at("a.txt", old);
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
 		assert_eq!(
 			remote["a.txt"].remote_uuid, new,
 			"the pre-write occupant is what a lagging cache shows; ours supersedes it"
@@ -8374,7 +8382,7 @@ mod tests {
 		// A further local edit is then pushed rather than left alone.
 		let actions = plan::reconcile(
 			SyncMode::LocalToRemote,
-			&baseline,
+			&tree(&baseline),
 			&local_map(hash(2)),
 			&remote,
 			&holds,
@@ -8401,7 +8409,7 @@ mod tests {
 		let baseline = written_row(second, hash(2));
 		let mut remote = node_at("a.txt", old);
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
 		assert_eq!(
 			remote["a.txt"].remote_uuid, second,
 			"the latest write is what the path holds"
@@ -8409,7 +8417,7 @@ mod tests {
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
-				&baseline,
+				&tree(&baseline),
 				&local_map(hash(2)),
 				&remote,
 				&holds
@@ -8450,7 +8458,7 @@ mod tests {
 
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &baseline, &mut remote),
+			pending.fold_into(PAIR, &tree(&baseline), &mut remote),
 			1,
 			"the cache has announced nothing of ours, so what it shows is the version we replaced"
 		);
@@ -8458,7 +8466,7 @@ mod tests {
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
-				&baseline,
+				&tree(&baseline),
 				&local_map(hash(2)),
 				&remote,
 				&holds
@@ -8499,13 +8507,15 @@ mod tests {
 			HashMap::new(),
 		] {
 			assert!(
-				pending.strangers(PAIR, &baseline, &settled).is_empty(),
+				pending
+					.strangers(PAIR, &tree(&baseline), &settled)
+					.is_empty(),
 				"the record answers for this state on its own"
 			);
 		}
 
 		assert_eq!(
-			pending.strangers(PAIR, &baseline, &same_lineage(theirs)),
+			pending.strangers(PAIR, &tree(&baseline), &same_lineage(theirs)),
 			vec![("a.txt".to_string(), ours, theirs)]
 				.into_iter()
 				.map(|(path, ours_uuid, stranger)| (ours, path, ours_uuid, stranger))
@@ -8529,7 +8539,7 @@ mod tests {
 
 		pending.retire(ours);
 		assert_eq!(
-			pending.fold_into(PAIR, &baseline, &mut remote),
+			pending.fold_into(PAIR, &tree(&baseline), &mut remote),
 			0,
 			"with the record gone there is nothing left to paint over the snapshot"
 		);
@@ -8549,7 +8559,7 @@ mod tests {
 		let mut remote = node_at("a.txt", foreign);
 		pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
-			pending.fold_into(PAIR, &written_row(new, hash(1)), &mut remote),
+			pending.fold_into(PAIR, &tree(&written_row(new, hash(1))), &mut remote),
 			0,
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
 		);
@@ -8590,8 +8600,9 @@ mod tests {
 
 		let mut remote = HashMap::new();
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
-		assert_eq!(pending.fold_into(PAIR, &baseline, &mut remote), 1);
-		let actions = plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds).actions;
+		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
+		let actions =
+			plan::reconcile(SyncMode::TwoWay, &tree(&baseline), &local, &remote, &holds).actions;
 		assert_eq!(
 			actions.iter().map(describe).collect::<Vec<_>>(),
 			vec!["conflict \"d\"".to_string()],
@@ -8627,7 +8638,7 @@ mod tests {
 			"a pass holds nothing on behalf of another pair"
 		);
 		assert_eq!(
-			pending.fold_into(PAIR + 1, &HashMap::new(), &mut foreign.clone()),
+			pending.fold_into(PAIR + 1, &Baseline::default(), &mut foreign.clone()),
 			0,
 			"nor does it fold another pair's writes into its own view"
 		);
@@ -8644,7 +8655,7 @@ mod tests {
 			written_at("note.txt", created, NodeKind::File, Some(hash(1))),
 		)]);
 		assert_eq!(
-			pending.fold_into(PAIR, &baseline, &mut remote),
+			pending.fold_into(PAIR, &tree(&baseline), &mut remote),
 			2,
 			"and still has not caught up to either write"
 		);
@@ -8849,7 +8860,8 @@ mod tests {
 		let baseline = written_row(uuid, hash(1));
 		let ripe = Instant::now() + past_window();
 
-		let read = || observed_confirmations(&observations, &baseline, &HashMap::new(), ripe).0;
+		let read =
+			|| observed_confirmations(&observations, &tree(&baseline), &HashMap::new(), ripe).0;
 		assert_eq!(read(), std::collections::HashSet::from([uuid]));
 		assert_eq!(
 			read(),
@@ -8933,5 +8945,10 @@ mod tests {
 			PushVerdict::Unknown,
 			"the row moved on to the new version, so the old record answers for nothing"
 		);
+	}
+
+	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
+	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
+		Baseline::from_rows(rows.values().cloned())
 	}
 }
