@@ -13,11 +13,13 @@ mod formats;
 pub(crate) mod sink;
 mod source;
 
+use std::sync::atomic::Ordering;
+
 pub use sink::{BoxAccumulator, PixelSink, SmallImage};
 pub(crate) use source::SubSource;
 pub use source::{ByteSource, FileSource, MemSource, SeqReader};
 
-use crate::sink::accumulator_bytes;
+use crate::{sink::accumulator_bytes, source::BulkHintRelay};
 
 /// Default decode budget: what is realistically left of a 20 MB jetsam limit
 /// after the host process' own baseline.
@@ -488,7 +490,10 @@ pub fn generate(
 		target_height: spec.target_height.min(cap),
 		..*spec
 	};
-	let mut prepared = format.open(src, spec)?;
+	// `open` takes the source for good; the bulk hint below reaches it
+	// through the relay's flag instead.
+	let (src, bulk_read) = BulkHintRelay::new(src);
+	let mut prepared = format.open(Box::new(src), spec)?;
 	let orientation = prepared.orientation();
 
 	// A broken preview must not fail a decodable image — previews are an
@@ -523,6 +528,9 @@ pub fn generate(
 		return Ok(preview.map_or(ThumbOutcome::OverBudget, as_preview));
 	}
 
+	// From here the source is read front to back: a lazy source may stream
+	// ahead instead of fetching each chunk when the decoder stalls on it.
+	bulk_read.store(true, Ordering::Relaxed);
 	if let Some(image) = decode_bounded(prepared, spec)? {
 		return Ok(ThumbOutcome::Thumbnail(Thumbnail {
 			image: apply_orientation(image, orientation),

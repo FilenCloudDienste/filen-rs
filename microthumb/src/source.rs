@@ -14,6 +14,58 @@ pub trait ByteSource: Send {
 	fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
+
+	/// The pipeline has committed to reading this source front to back: no
+	/// embedded preview served the request, and a full decode is about to
+	/// start. A source that fetches on demand may switch to streaming with
+	/// read-ahead from here — a 20 MiB JPEG otherwise costs one network round
+	/// trip per chunk, each one stalling the decoder. A source with its bytes
+	/// already in hand ignores it. Raised at most once per decode, before the
+	/// decode's first read.
+	fn hint_bulk_sequential(&mut self) {}
+}
+
+/// Relays [`ByteSource::hint_bulk_sequential`] into a source the orchestrator
+/// no longer holds: [`generate`](crate::generate) hands its source to the
+/// format's `open`, which owns it from then on, so the hint travels through a
+/// shared flag and is delivered on the decode's first read.
+pub(crate) struct BulkHintRelay {
+	inner: Box<dyn ByteSource>,
+	// Shared with the orchestrator, which raises it after the preview phase.
+	raised: Arc<AtomicBool>,
+	delivered: bool,
+}
+
+impl BulkHintRelay {
+	pub(crate) fn new(inner: Box<dyn ByteSource>) -> (Self, Arc<AtomicBool>) {
+		let raised = Arc::new(AtomicBool::new(false));
+		let relay = BulkHintRelay {
+			inner,
+			raised: raised.clone(),
+			delivered: false,
+		};
+		(relay, raised)
+	}
+}
+
+impl ByteSource for BulkHintRelay {
+	fn len(&self) -> u64 {
+		self.inner.len()
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+		if !self.delivered && self.raised.load(Ordering::Relaxed) {
+			self.hint_bulk_sequential();
+		}
+		self.inner.read_at(offset, buf)
+	}
+
+	fn hint_bulk_sequential(&mut self) {
+		if !self.delivered {
+			self.delivered = true;
+			self.inner.hint_bulk_sequential();
+		}
+	}
 }
 
 /// A plain file on disk.
@@ -122,6 +174,10 @@ impl ByteSource for SubSource {
 		let available = self.len - offset;
 		let want = (buf.len() as u64).min(available) as usize;
 		self.inner.read_at(self.start + offset, &mut buf[..want])
+	}
+
+	fn hint_bulk_sequential(&mut self) {
+		self.inner.hint_bulk_sequential();
 	}
 }
 

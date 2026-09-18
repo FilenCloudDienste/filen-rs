@@ -7,7 +7,7 @@ use std::{
 	io::Cursor,
 	sync::{
 		Arc,
-		atomic::{AtomicBool, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
 
@@ -1038,6 +1038,98 @@ fn the_reported_source_distinguishes_the_two_paths() {
 		.thumbnail()
 		.expect("png must thumbnail");
 	assert_eq!(plain.source, microthumb::ThumbSource::Decoded);
+}
+
+/// Records when the bulk hint arrives relative to the reads: how many hints,
+/// and how far into the file the reads had reached when the first one came.
+struct HintRecorder {
+	inner: MemSource,
+	furthest: u64,
+	hints: Arc<AtomicU64>,
+	reach_at_hint: Arc<AtomicU64>,
+}
+
+impl HintRecorder {
+	fn new(bytes: Vec<u8>) -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+		let hints = Arc::new(AtomicU64::new(0));
+		let reach_at_hint = Arc::new(AtomicU64::new(0));
+		let recorder = HintRecorder {
+			inner: MemSource(bytes),
+			furthest: 0,
+			hints: hints.clone(),
+			reach_at_hint: reach_at_hint.clone(),
+		};
+		(recorder, hints, reach_at_hint)
+	}
+}
+
+impl ByteSource for HintRecorder {
+	fn len(&self) -> u64 {
+		self.inner.len()
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+		let n = self.inner.read_at(offset, buf)?;
+		self.furthest = self.furthest.max(offset + n as u64);
+		Ok(n)
+	}
+
+	fn hint_bulk_sequential(&mut self) {
+		if self.hints.fetch_add(1, Ordering::Relaxed) == 0 {
+			self.reach_at_hint.store(self.furthest, Ordering::Relaxed);
+		}
+	}
+}
+
+#[test]
+fn a_full_decode_hints_bulk_reading_once_before_it_reads_the_image() {
+	// An embedded thumbnail too small for the request: the preview phase runs
+	// and fails, and THEN the decode is committed to — which is when a lazy
+	// source should start streaming. The hint must land exactly once, and
+	// while the reads are still in the header region.
+	let bytes = jpeg_with_exif_thumbnail_sized(1, 1600, 1200);
+	let len = bytes.len() as u64;
+	let (source, hints, reach) = HintRecorder::new(bytes);
+	let result = generate(Box::new(source), &spec(512))
+		.unwrap()
+		.thumbnail()
+		.expect("the main image must decode");
+	assert_eq!(result.source, microthumb::ThumbSource::Decoded);
+	assert_eq!(hints.load(Ordering::Relaxed), 1);
+	let reach = reach.load(Ordering::Relaxed);
+	assert!(
+		reach * 4 < len,
+		"the hint came only after the decode had read to {reach} of {len} bytes"
+	);
+}
+
+#[test]
+fn a_served_embedded_preview_never_hints() {
+	let bytes = jpeg_with_exif_thumbnail(1);
+	let (source, hints, _) = HintRecorder::new(bytes);
+	let served = generate(Box::new(source), &spec(64))
+		.unwrap()
+		.thumbnail()
+		.expect("the embedded thumbnail must serve this");
+	assert_eq!(served.source, microthumb::ThumbSource::EmbeddedPreview);
+	assert_eq!(hints.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_preview_only_spec_never_hints() {
+	// The spec exists to keep a huge remote file from being streamed; a source
+	// told to stream ahead here would defeat it.
+	let bytes = encode(&checkerboard(600, 600), ImageFormat::Png);
+	let (source, hints, _) = HintRecorder::new(bytes);
+	assert_eq!(
+		generate(
+			Box::new(source),
+			&ThumbSpec::preview_only(64, 64, DEFAULT_MEM_BUDGET)
+		)
+		.unwrap(),
+		ThumbOutcome::OverBudget
+	);
+	assert_eq!(hints.load(Ordering::Relaxed), 0);
 }
 
 #[test]
