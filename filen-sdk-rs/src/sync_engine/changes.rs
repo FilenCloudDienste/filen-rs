@@ -113,6 +113,15 @@ pub enum FullPassReason {
 	RemoteOverflow,
 	/// The account was wiped (`GlobalEvent::DeleteAll`).
 	RemoteWiped,
+	/// Applying the announced changes left the derived remote view empty while the baseline still
+	/// records remote items. An emptied remote is the shape a backend fault takes, and the guard
+	/// weighs it against a whole-tree read (`remote_emptied`), never against a derivation.
+	RemoteEmptied,
+	/// An announced change named something the derived view cannot place: an item whose ancestry
+	/// the cache does not know, a tracked item renamed to a name no local path can hold, or a
+	/// directory displaced at its own path. Deriving a path for it would be a guess, and guessing
+	/// on this side ends in a deletion.
+	RemoteUnplaceable,
 	/// The filesystem watcher does not see every local change, for the life of the watch: it could
 	/// not start, could not cover the whole tree, or reported an error. Permanent, so every pass
 	/// stays full.
@@ -170,6 +179,8 @@ impl fmt::Display for FullPassReason {
 			Self::LocalOverflow => "too many local paths changed to track individually",
 			Self::RemoteOverflow => "too many remote changes arrived to track individually",
 			Self::RemoteWiped => "the account was wiped",
+			Self::RemoteEmptied => "the announced changes emptied the remote view",
+			Self::RemoteUnplaceable => "an announced remote change could not be placed at a path",
 			Self::LocalEventsDegraded => "the filesystem watcher does not see every local change",
 			Self::RemoteEventsDegraded => "no remote changes are announced for this pair",
 			Self::LocalEventsUnwatched => "no filesystem watcher is attached to this pair",
@@ -272,20 +283,23 @@ impl RemoteDelta {
 // callback runs, so the shape has to be right where it is captured, not where it is first read.
 // The allow goes with that pass.
 /// One announced remote change, as dispatched.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteDeltaEntry {
+pub(super) struct RemoteDeltaEntry {
 	/// The event's `drive_message_id`; `None` for a resync synthetic, which carries none. The
 	/// cache's snapshot watermark is the contiguous prefix of REAL ids only
 	/// (`SubtreeSnapshot::watermark`), so a synthetic can never be aligned by id.
-	id: Option<u64>,
-	change: RemoteChange,
+	///
+	/// Nothing reads it: a pass takes both changelists BEFORE it reads either side, which aligns
+	/// them without an id (see the module docs). It is kept for the id-based rebase a full pass
+	/// will do against its own snapshot watermark.
+	#[allow(dead_code)]
+	pub(super) id: Option<u64>,
+	pub(super) change: RemoteChange,
 }
 
 /// What one announced remote change does to the remote view.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RemoteChange {
+pub(super) enum RemoteChange {
 	/// The item is at this parent under this name with this content: a create, a move, or a content
 	/// change. Exactly the projection the remote view is built from.
 	Upsert(RemoteItem),
@@ -302,12 +316,11 @@ enum RemoteChange {
 }
 
 /// The content stamps a file's metadata patch carries.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileContent {
-	size: u64,
-	hash: Option<Blake3Hash>,
-	modified_millis: i64,
+pub(super) struct FileContent {
+	pub(super) size: u64,
+	pub(super) hash: Option<Blake3Hash>,
+	pub(super) modified_millis: i64,
 }
 
 /// Evidence that a remote item is GONE — trashed, removed or archived.
@@ -316,7 +329,6 @@ struct FileContent {
 /// removal event, can mint one. That is the type-level half of the rule that a change-scoped pass
 /// may MISS a change but must never fabricate an absence; the other half is that the local
 /// changelist cannot express absence at all.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Gone {
 	uuid: Uuid,
@@ -325,7 +337,6 @@ pub(super) struct Gone {
 	successor: Option<Uuid>,
 }
 
-#[allow(dead_code)]
 impl Gone {
 	pub(super) fn uuid(&self) -> Uuid {
 		self.uuid
@@ -645,6 +656,18 @@ impl PassScope {
 			.or((baseline_items == 0).then_some(FullPassReason::EmptyBaseline))
 	}
 
+	/// The remote changes this pass took, in dispatch order — the input to `remote::observe_remote`.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "read by `run_pass` with the rest of the change-scoped pass"
+		)
+	)]
+	pub(super) fn remote(&self) -> &[RemoteDeltaEntry] {
+		&self.remote
+	}
+
 	/// How many local paths and remote changes this pass took, for its log line.
 	pub(super) fn sizes(&self) -> (usize, usize) {
 		(self.local.len(), self.remote.len())
@@ -659,7 +682,7 @@ fn relative_key(root: &Path, path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
 	use std::{
 		borrow::Cow,
 		ffi::OsStr,
@@ -733,16 +756,16 @@ mod tests {
 		(scope.local.iter().cloned().collect(), scope.full)
 	}
 
-	fn dt(ms: i64) -> DateTime<Utc> {
+	pub(crate) fn dt(ms: i64) -> DateTime<Utc> {
 		DateTime::from_timestamp_millis(ms).expect("a valid timestamp")
 	}
 
-	fn file_key() -> FileKey {
+	pub(crate) fn file_key() -> FileKey {
 		FileKey::from_str_with_version(&"a".repeat(64), FileEncryptionVersion::V3)
 			.expect("a valid key")
 	}
 
-	fn cacheable_file(uuid: Uuid, parent: Uuid, name: &str) -> CacheableFile<'static> {
+	pub(crate) fn cacheable_file(uuid: Uuid, parent: Uuid, name: &str) -> CacheableFile<'static> {
 		CacheableFile {
 			uuid,
 			stable_uuid: StableUuid::new_for_test(uuid),
@@ -763,7 +786,7 @@ mod tests {
 		}
 	}
 
-	fn cacheable_dir(uuid: Uuid, parent: Uuid, name: &str) -> CacheableDir<'static> {
+	pub(crate) fn cacheable_dir(uuid: Uuid, parent: Uuid, name: &str) -> CacheableDir<'static> {
 		CacheableDir {
 			uuid,
 			parent,
@@ -775,7 +798,10 @@ mod tests {
 		}
 	}
 
-	fn cache_event(id: Option<u64>, event: CacheEventType<'static>) -> CacheEvent<'static> {
+	pub(crate) fn cache_event(
+		id: Option<u64>,
+		event: CacheEventType<'static>,
+	) -> CacheEvent<'static> {
 		CacheEvent { id, event }
 	}
 
