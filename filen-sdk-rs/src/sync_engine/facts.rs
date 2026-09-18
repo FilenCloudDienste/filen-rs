@@ -1,4 +1,5 @@
-//! The path-keyed facts a pass carries from one pass to the next.
+//! The path-keyed facts a pass carries from one pass to the next, and the set of paths the next
+//! pass owes a second look at.
 //!
 //! A whole-tree pass learns what it blocks by walking everything: a name the remote would reject, a
 //! symlink read under its real path, an ignored root, a remote item the view cannot place. A
@@ -35,7 +36,8 @@
 //!   costs the same on a change-scoped pass as on a whole one. Recomputed, not carried; the caller
 //!   unions them over [`PairFacts::ignore_blocked`], which holds only what a local walk found.
 //! - `failures`: `BaselineStore::failures` is one indexed read of a table the size of the pair's
-//!   failing paths, not a whole-tree read. It stays a per-pass read.
+//!   failing paths, not a whole-tree read. It stays a per-pass read — and it is an INPUT to
+//!   [`carry_over`] rather than carried state.
 //! - `ignored_default_untracked`: a count, logged and never reported.
 //!
 //! # Directory moves
@@ -45,13 +47,14 @@
 //! the same re-keying: the fields here are `pub(super)` exactly so the fold can re-key them in
 //! place, as it already does for the loose fields they replace.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
+	baseline::PathFailure,
 	ignore::IgnoreDecision,
 	observe::{LocalObservation, LocalObservations},
-	outcome::{UnsyncablePath, UnsyncableReason},
-	plan::{self, RemoteView},
+	outcome::{PlannedConflict, UnsyncablePath, UnsyncableReason},
+	plan::{self, RemoteView, SyncAction},
 	scan::LocalScan,
 	tree::Baseline,
 };
@@ -234,16 +237,71 @@ fn prune_reports(reports: &mut Vec<UnsyncablePath>, at: &str) {
 	reports.retain(|report| report.rel_path != at && !plan::is_under(&report.rel_path, at));
 }
 
+/// The paths the NEXT pass owes a look at whatever its changelists say — the carry-over set of the
+/// optimization plan's section 3.6.
+///
+/// Built at the end of every pass out of that pass's own plan, and consumed as an INPUT to the next
+/// pass's dirty set. What is in it:
+///
+/// - every path this pass's plan named, both endpoints of a move included, whether the action was
+///   applied, failed, held by the guard or never reached. A superset of the work left owing is the
+///   safe direction — re-observing a path that was applied costs a stat and plans nothing — and it
+///   is what lets an interrupted pass find its remainder, a failed action be re-planned, and a held
+///   deletion batch reproduce the token the caller was handed. An APPLIED path is in it for a
+///   reason of its own: a pass whose baseline write did not land (`store_failed`) carried the act
+///   out and has no row saying so, and only a fresh reading of that path corrects it.
+/// - every path this pass DEFERRED because the cache was mid-transition there (`held_remote`).
+/// - every path with a failure streak, expired or not. Not only the ones whose retry interval runs
+///   out next: the set is rebuilt from each pass's own read, so a path filtered out here is one no
+///   later pass would look at either, and its retry would never come. The set is bounded by the
+///   failing paths, which is why keeping them all is cheap.
+///
+/// What it deliberately does NOT walk is the baseline. A non-`Synced` row, and a row that records
+/// one side only, are already put in the dirty set by `derive::from_baseline`, in the same pass
+/// that cannot derive them — a second O(tree) walk here would only ask the same question again.
+///
+/// # How it must be consumed
+///
+/// It is not a changelist entry. Feeding it through the capped local list is the mistake the first
+/// attempt at this made: the cap is a quarter of the tree size as the pair last RECORDED it, which
+/// is zero before a pair's first sync, so a plan of any size collapsed the next pass to a
+/// whole-tree read and reported that pass as owing work it had in fact applied. The set is also not
+/// a reason on its own: the full-pass triggers of section 3.5 are unchanged by it, and an
+/// interrupted pass still forces the next one full in this round.
+pub(super) fn carry_over<'a>(
+	planned: impl IntoIterator<Item = &'a SyncAction>,
+	conflicts: &[PlannedConflict],
+	held_remote: &BTreeSet<String>,
+	failures: &HashMap<String, PathFailure>,
+) -> BTreeSet<String> {
+	let mut owed: BTreeSet<String> = BTreeSet::new();
+	for action in planned {
+		let (from, to) = action.endpoints();
+		owed.insert(from.to_owned());
+		owed.insert(to.to_owned());
+	}
+	owed.extend(
+		conflicts
+			.iter()
+			.map(|conflict| conflict.rel_path.clone())
+			.chain(held_remote.iter().cloned())
+			.chain(failures.keys().cloned()),
+	);
+	owed
+}
+
 #[cfg(test)]
 mod tests {
-	use std::{collections::HashMap, fs, path::Path};
+	use std::{fs, path::Path};
 
 	use uuid::Uuid;
 
 	use super::*;
 	use crate::sync_engine::{
+		baseline::NodeKind,
 		ignore::{FILENIGNORE, IgnoreLevel, IgnoreRules},
 		observe::observe_local,
+		outcome::PlannedNodeKind,
 		scan::{RuleFiles, scan_local},
 	};
 
@@ -528,6 +586,74 @@ mod tests {
 			keys(&facts.invalid_names),
 			vec!["a/x.txt"],
 			"a remote read is no evidence about the local path"
+		);
+	}
+
+	/// The carry-over set names every disposition a plan can leave behind, both endpoints of a move
+	/// included, plus the paths the pass deferred and every path carrying a failure streak.
+	#[test]
+	fn the_carry_over_set_names_every_disposition_of_a_plan() {
+		let applied = [
+			SyncAction::UploadFile {
+				rel_path: "up.txt".to_owned(),
+			},
+			SyncAction::MoveRemote {
+				from_path: "old/name.txt".to_owned(),
+				to_path: "new/name.txt".to_owned(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(7),
+			},
+		];
+		let held = [SyncAction::TrashRemote {
+			rel_path: "gone.txt".to_owned(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::from_u128(8),
+		}];
+		let conflicts = [PlannedConflict::new(
+			"clash.txt",
+			Some(PlannedNodeKind::File),
+			Some(PlannedNodeKind::File),
+		)];
+		let failures = HashMap::from([
+			(
+				"stuck.txt".to_owned(),
+				PathFailure {
+					attempts: 3,
+					last_error: "no".to_owned(),
+					last_failure_at: 0,
+				},
+			),
+			(
+				"flaky.txt".to_owned(),
+				PathFailure {
+					attempts: 1,
+					last_error: "no".to_owned(),
+					last_failure_at: 0,
+				},
+			),
+		]);
+
+		let owed = carry_over(
+			applied.iter().chain(&held),
+			&conflicts,
+			&BTreeSet::from(["midflight.txt".to_owned()]),
+			&failures,
+		);
+
+		assert_eq!(
+			listed(&owed),
+			vec![
+				"clash.txt",
+				"flaky.txt",
+				"gone.txt",
+				"midflight.txt",
+				"new/name.txt",
+				"old/name.txt",
+				"stuck.txt",
+				"up.txt",
+			],
+			"a move owes BOTH its endpoints, and a streak below the block threshold is owed too — \
+			 nothing else would ever look at it again"
 		);
 	}
 }
