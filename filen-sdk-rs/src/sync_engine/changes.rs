@@ -7,12 +7,13 @@
 //! either side, and [`PassScope::full_pass_reason`] says whether what it took describes every
 //! change since the last pass.
 //!
-//! Nothing consumes them yet: every pass still reads the whole tree, and the reason it had to is
-//! recorded on its [`SyncReport`](super::SyncReport). The changelists and the trigger table land
-//! first because the events are unrecoverable — they exist only for the instant the callback runs,
-//! and the cache's `events` table is a DRAINED queue (`commit_drain_batch` deletes every consumed
-//! row in the same transaction that advances the watermark, and a resync applies its synthetics
-//! straight from RAM), so nothing can replay them later.
+//! A pass with no reason to read everything narrows itself to what these lists name
+//! (`SyncEngine::prepare_scoped`); a pass with one reads both sides whole and records the reason on
+//! its [`SyncReport`](super::SyncReport). Either way the events behind the lists are unrecoverable
+//! — they exist only for the instant the callback runs, and the cache's `events` table is a DRAINED
+//! queue (`commit_drain_batch` deletes every consumed row in the same transaction that advances the
+//! watermark, and a resync applies its synthetics straight from RAM), so nothing can replay them
+//! later.
 //!
 //! # What may and may not be expressed here
 //!
@@ -44,8 +45,9 @@
 //! Two shapes cannot be recognized from the notification alone, and are the CONSUMING pass's to
 //! check: a removal (a cache removal event names a uuid and no name at all) and a rename or move
 //! AWAY from the rule file's name (the event carries the new name, not the old one). The pass holds
-//! the baseline, which is where that uuid's path is; until a pass narrows its read down, every
-//! pass reads both sides whole and the question does not arise.
+//! the baseline, which is where that uuid's path is: `RemoteObservation::touch` puts both the path
+//! an item left and the one it arrived at through `rule_file_dir`, so either shape lands in
+//! `rule_dirs` and `prepare_scoped` answers it with [`FullPassReason::RulesChanged`].
 //!
 //! # Bounds
 //!
@@ -291,11 +293,6 @@ impl RemoteDelta {
 	}
 }
 
-// The delta's payload is recorded here and read by the change-scoped pass that replaces the
-// whole-tree read; this commit only builds, bounds and aligns the changelists. Recording a
-// projection the consumer cannot use would be the worse trade: a cache event exists only while the
-// callback runs, so the shape has to be right where it is captured, not where it is first read.
-// The allow goes with that pass.
 /// One announced remote change, as dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RemoteDeltaEntry {
@@ -303,10 +300,10 @@ pub(super) struct RemoteDeltaEntry {
 	/// cache's snapshot watermark is the contiguous prefix of REAL ids only
 	/// (`SubtreeSnapshot::watermark`), so a synthetic can never be aligned by id.
 	///
-	/// Nothing reads it: a pass takes both changelists BEFORE it reads either side, which aligns
-	/// them without an id (see the module docs). It is kept for the id-based rebase a full pass
-	/// will do against its own snapshot watermark.
-	#[allow(dead_code)]
+	/// No pass reads it: both changelists are taken BEFORE either side is read, which aligns them
+	/// without an id (see the module docs). It is kept for the id-based rebase a full pass will do
+	/// against its own snapshot watermark, and needs no `dead_code` suppression to be kept — the
+	/// derived impls and this module's own tests read it.
 	pub(super) id: Option<u64>,
 	pub(super) change: RemoteChange,
 }
