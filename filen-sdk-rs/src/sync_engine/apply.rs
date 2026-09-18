@@ -143,6 +143,13 @@ pub struct SyncReport {
 	/// pass after it re-derives or redoes what the lost record described (see the baseline store's
 	/// `record_write`).
 	pub(super) store_failed: bool,
+	/// How many actions this pass planned and then DROPPED before applying anything: a path it may
+	/// not act on (`drop_blocked`) or a deletion over content it cannot reach
+	/// (`withhold_deletions_over_unreachable`). Making the plan consumed both changelists, so a
+	/// dropped action is named nowhere any more — the next pass reads both sides whole to find it
+	/// again (see `next_pass_scope`). Distinct from [`deferred_paths`](Self::deferred_paths),
+	/// which counts what the reconcile itself left alone, whether or not it planned anything there.
+	pub(super) dropped_actions: usize,
 	/// Set when a side ran out of room during the pass: the local disk or the account, whichever
 	/// was found full first. The action that ran into it — and any transfer already running that
 	/// did too — is in [`errors`](Self::errors) but counts against no path's failure streak, since

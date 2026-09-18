@@ -166,6 +166,14 @@ pub enum FullPassReason {
 	/// is re-anchored so the winning side reads as the changed one, which is a change neither a
 	/// filesystem event nor a cache announcement carries.
 	ConflictResolved,
+	/// A change-scoped pass could not read one of the paths it set out to re-observe. What that
+	/// path would have said is unknown, and the changelist that named it is drained, so the next
+	/// pass reads everything rather than leaving it to the safety net.
+	IncompleteObservation,
+	/// A change-scoped pass's assembled local map did not account for the rows and observations it
+	/// was built from (see `engine::assembly_accounted`). Deriving again from the same rows would
+	/// reproduce the miscount, so the next pass reads both sides.
+	AssemblyMismatch,
 }
 
 impl fmt::Display for FullPassReason {
@@ -191,6 +199,12 @@ impl fmt::Display for FullPassReason {
 			Self::RulesChanged => "the ignore patterns or the pair's mode changed",
 			Self::UnappliedWork => "the previous pass planned work it did not apply",
 			Self::ConflictResolved => "a conflict resolution has to be applied at its path",
+			Self::IncompleteObservation => {
+				"the previous pass could not re-observe every path it narrowed its read to"
+			}
+			Self::AssemblyMismatch => {
+				"the previous pass's derived maps did not account for what they were built from"
+			}
 		})
 	}
 }
@@ -479,6 +493,15 @@ struct ChangeState {
 	local_covered: bool,
 	/// Items the last full pass tracked — what [`dirty_cap`] scales with.
 	last_items: usize,
+	/// What the previous pass's plan left owing (`facts::carry_over`), unioned into the next pass's
+	/// local set by [`take`](PairChanges::take).
+	///
+	/// Deliberately NOT part of the capped local list: [`dirty_cap`] scales with the tree as the
+	/// pair last RECORDED it, which is 1 before a first sync, so feeding a plan's paths through the
+	/// cap would collapse the next pass to a whole-tree read and report work as owing that was in
+	/// fact applied. Replaced by every pass that made a plan, never accumulated: it is rebuilt from
+	/// that pass's own plan.
+	owed: BTreeSet<String>,
 }
 
 impl PairChanges {
@@ -589,6 +612,29 @@ impl PairChanges {
 		}
 	}
 
+	/// Record what the pass that just ran leaves the next one owing (see
+	/// [`carry_over`](super::facts::carry_over)). REPLACES the previous set rather than adding to
+	/// it: each pass rebuilds it from its own plan, so a path drops out as soon as a pass gets
+	/// through it.
+	pub(super) fn note_owed(&self, owed: BTreeSet<String>) {
+		self.state().owed = owed;
+	}
+
+	/// Whether something has ALREADY made the next pass a whole-tree one — the same table
+	/// [`take`](Self::take) reads, asked without taking anything.
+	///
+	/// A pass that narrowed its own read asks this before it trusts an absence: a reason recorded
+	/// while it was reading (a kernel-dropped event, a watcher that stopped) says the list it
+	/// narrowed itself with may be missing exactly what it is about to act on.
+	pub(super) fn full_pending(&self) -> bool {
+		let state = self.state();
+		state.degraded.is_some()
+			|| !state.local_covered
+			|| state.local.full.is_some()
+			|| state.remote.full.is_some()
+			|| state.forced.is_some()
+	}
+
 	/// Record that the NEXT pass must read both sides whole. Keeps the first reason recorded.
 	pub(super) fn force(&self, reason: FullPassReason) {
 		let mut state = self.state();
@@ -603,6 +649,9 @@ impl PairChanges {
 		let mut state = self.state();
 		let local = mem::take(&mut state.local);
 		let remote = mem::take(&mut state.remote);
+		// The previous pass's unfinished business: owed whatever the changelists hold, and not
+		// subject to their cap (see `ChangeState::owed`).
+		let owed = mem::take(&mut state.owed);
 		// Taken with the lists, so what is recorded from here on is the NEXT pass's (see `forced`).
 		let forced = mem::take(&mut state.forced);
 		// Most specific first: a permanently degraded source, then no watcher at all, then evidence
@@ -613,8 +662,10 @@ impl PairChanges {
 			.or(local.full)
 			.or(remote.full)
 			.or(forced);
+		let mut paths = local.paths;
+		paths.extend(owed);
 		PassScope {
-			local: local.paths,
+			local: paths,
 			remote: remote.entries,
 			full,
 		}
@@ -656,16 +707,30 @@ impl PassScope {
 			.or((baseline_items == 0).then_some(FullPassReason::EmptyBaseline))
 	}
 
-	/// The remote changes this pass took, in dispatch order — the input to `remote::observe_remote`.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "read by `run_pass` with the rest of the change-scoped pass"
-		)
-	)]
-	pub(super) fn remote(&self) -> &[RemoteDeltaEntry] {
-		&self.remote
+	/// The local paths this pass took, moved out — the input to
+	/// [`from_baseline`](super::derive::from_baseline), which owns the dirty set from there on and
+	/// grows it with the rows it cannot carry. Read [`sizes`](Self::sizes) first: what is taken
+	/// here is gone from the scope.
+	pub(super) fn take_local(&mut self) -> BTreeSet<String> {
+		mem::take(&mut self.local)
+	}
+
+	/// The remote changes this pass took, in dispatch order, moved out — the input to
+	/// [`observe_remote`](super::remote::observe_remote), which applies them to the derived view.
+	/// Moved for the same reason as [`take_local`](Self::take_local): the applier runs on a
+	/// blocking thread and owns what it is given.
+	pub(super) fn take_remote(&mut self) -> Vec<RemoteDeltaEntry> {
+		mem::take(&mut self.remote)
+	}
+
+	/// Whether this pass has nothing to look at: nothing announced on either side, nothing owed by
+	/// the last plan, and no reason forcing a whole read.
+	///
+	/// The one row of the trigger table it cannot see is the empty baseline, which is why a caller
+	/// that acts on this is deciding whether to READ the pair at all — a pair with an empty
+	/// baseline and nothing announced has nothing to do either.
+	pub(super) fn is_idle(&self) -> bool {
+		self.full.is_none() && self.local.is_empty() && self.remote.is_empty()
 	}
 
 	/// How many local paths and remote changes this pass took, for its log line.
@@ -748,6 +813,92 @@ pub(super) mod tests {
 			EventKind::Create(CreateKind::File),
 			&[&format!("{ROOT}/{name}")],
 		)
+	}
+
+	/// The carry-over set is not a changelist entry, and the cap must not touch it: [`dirty_cap`]
+	/// scales with the tree as the pair last RECORDED it, which is nothing before a first sync, so
+	/// a plan of any size would otherwise collapse the next pass to a whole-tree read and report
+	/// work as owing that the pass had in fact applied.
+	#[test]
+	fn the_carry_over_set_joins_the_next_pass_outside_the_cap() {
+		let changes = PairChanges::new();
+		changes.cover_local();
+		// Nothing recorded yet, so `dirty_cap` sits at its floor of one path.
+		let owed: BTreeSet<String> = (0..50).map(|i| format!("owed{i:02}.txt")).collect();
+		changes.note_owed(owed.clone());
+
+		let (paths, full) = taken(&changes);
+		assert_eq!(
+			paths.len(),
+			owed.len(),
+			"the cap swallowed the carry-over set"
+		);
+		assert_eq!(
+			full, None,
+			"paths the last plan owes are something to look at, not a reason to read everything"
+		);
+		// Taken with the lists, like everything else a pass consumes.
+		assert_eq!(taken(&changes), (Vec::<String>::new(), None));
+	}
+
+	/// A pass rebuilds the set from its own plan, so recording one REPLACES the last.
+	#[test]
+	fn each_pass_replaces_what_the_last_one_left_owing() {
+		let changes = sized_pair();
+		changes.note_owed(BTreeSet::from(["first.txt".to_string()]));
+		changes.note_owed(BTreeSet::from(["second.txt".to_string()]));
+		assert_eq!(taken(&changes).0, vec!["second.txt".to_string()]);
+	}
+
+	/// What a wake has to look at, and what the pass may therefore skip entirely.
+	#[test]
+	fn a_scope_with_nothing_announced_is_idle() {
+		let changes = sized_pair();
+		assert!(
+			changes.take().is_idle(),
+			"a quiet watched pair has nothing to look at"
+		);
+
+		note(&changes, &create("a.txt"));
+		assert!(
+			!changes.take().is_idle(),
+			"a changed path is something to look at"
+		);
+
+		changes.note_owed(BTreeSet::from(["owed.txt".to_string()]));
+		assert!(
+			!changes.take().is_idle(),
+			"a path the last plan left owing is something to look at"
+		);
+
+		changes.force(FullPassReason::SafetyNet);
+		assert!(!changes.take().is_idle(), "a forced whole read is not idle");
+
+		let unwatched = PairChanges::new();
+		assert!(
+			!unwatched.take().is_idle(),
+			"with no watcher an empty list is no evidence, so there is always something to read"
+		);
+	}
+
+	/// What a change-scoped pass asks before it trusts an absence: has anything already made the
+	/// next pass a whole-tree one, which would say its own narrowed read may be missing something.
+	#[test]
+	fn a_pending_whole_read_is_visible_while_a_pass_is_still_reading() {
+		let changes = sized_pair();
+		assert!(!changes.full_pending());
+
+		changes.force(FullPassReason::ConflictResolved);
+		assert!(changes.full_pending());
+		// Taken with the lists, so it belongs to the pass that took it and not to the one after.
+		let _ = changes.take();
+		assert!(!changes.full_pending());
+
+		changes.uncover_local();
+		assert!(
+			changes.full_pending(),
+			"with no watcher recording them, every pass reads the local side whole"
+		);
 	}
 
 	/// The local paths a pass would take, and the reason it cannot narrow down.

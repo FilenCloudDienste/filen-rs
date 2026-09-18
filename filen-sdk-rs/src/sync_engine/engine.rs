@@ -24,18 +24,22 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
 		PathFailure, PendingRow,
 	},
-	changes::{FullPassReason, PairChanges},
+	changes::{FullPassReason, PairChanges, PassScope},
+	derive::{self, Derived},
+	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
 		IgnoreDecision, IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules,
 		load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
+	observe::{self, LocalObservation, LocalObservations},
 	outcome::{
 		PlanOutcome, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 		UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
+	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	tree::Baseline,
 };
@@ -1138,6 +1142,11 @@ pub struct SyncEngine {
 	/// `Arc`: the watcher's own thread and the cache's worker thread each hold one, outside this
 	/// map's lock. Bounded by the pair count; an entry goes with its pair.
 	changes: Mutex<HashMap<PairId, Arc<PairChanges>>>,
+	/// What each pair's last pass left for the next one to read instead of deriving it again (see
+	/// [`PairCarry`]). Written only by a pass that got as far as a plan, so a dry run can neither
+	/// refresh it nor corrupt it. Bounded by the pair count and, within a pair, by the paths it
+	/// blocks rather than by the tree.
+	carried: Mutex<HashMap<PairId, PairCarry>>,
 	/// Bumped once [`set_user_ignore`](SyncEngine::set_user_ignore) has COMMITTED new patterns, so
 	/// every running watch loop runs a pass with them instead of waiting out its safety net. A
 	/// [`watch`](tokio::sync::watch) channel rather than a [`Notify`](tokio::sync::Notify): every
@@ -1245,10 +1254,155 @@ fn remote_overlap(
 	}
 }
 
+/// What a pass read, and why.
+///
+/// A pass either reads both trees WHOLE — the only read that can find a change nothing announced —
+/// or narrows itself to the paths its changelists named and derives the rest from the baseline
+/// rows (the optimization plan's section 3.4). Which it was is reported on
+/// [`SyncReport::full_pass`], so a caller can see why a pass cost what it cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassRead {
+	/// Both sides whole, for this reason. `None` is a dry run, which is always whole and reports
+	/// nothing (see [`SyncEngine::plan_pair`]).
+	Whole(Option<FullPassReason>),
+	/// Only what changed since the last pass.
+	Scoped,
+}
+
+impl PassRead {
+	/// Why this pass read everything, for its report: `None` when it narrowed itself down.
+	fn full_pass_reason(self) -> Option<FullPassReason> {
+		match self {
+			Self::Whole(reason) => reason,
+			Self::Scoped => None,
+		}
+	}
+
+	fn is_scoped(self) -> bool {
+		matches!(self, Self::Scoped)
+	}
+}
+
+/// Whether a pass with nothing announced on either side is worth running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WhenIdle {
+	/// Run it anyway: an explicit [`sync_once`](SyncEngine::sync_once) asked for a pass, and its
+	/// caller wants the report — including one that had a watcher running and beat its event.
+	Run,
+	/// Skip it entirely. A watch wake with nothing announced has nothing to do, and reading two
+	/// trees to discover that is the whole cost change-scoping exists to remove.
+	Skip,
+}
+
+/// The per-pair reads every pass makes before it looks at either tree.
+struct PassInputs {
+	record: PairRecord,
+	user_ignore: String,
+	store: SharedStore,
+	baseline: Arc<Baseline>,
+	/// The failure streaks that BLOCK planning this pass (see [`streak_blocks`]).
+	failures: HashMap<String, PathFailure>,
+	last_ignored: BTreeSet<String>,
+}
+
+/// What [`SyncEngine::prepare_scoped`] came back with.
+enum Scoped {
+	/// The pass narrowed its read and has everything it needs to plan.
+	Prepared(Box<Prepared>),
+	/// The derivation could not answer for something it was handed, so the inputs come back for a
+	/// whole read. Never a partial map: a map missing a path reads downstream as a deletion, which
+	/// is the one thing invariant I1 forbids.
+	Whole(Box<PassInputs>, FullPassReason),
+}
+
+/// What a pass leaves the next one, so a change-scoped pass need not derive it again.
+///
+/// Written only by [`run_pass`](SyncEngine::run_pass), and only by a pass that got as far as a
+/// plan: a dry run reads both sides and records nothing, so it can neither refresh this nor
+/// corrupt what the next pass believes.
+#[derive(Debug, Default, Clone)]
+struct PairCarry {
+	/// Everything that pass blocked, reported or withheld, keyed by path.
+	facts: PairFacts,
+	/// Whether the remote view had converged when it was last READ whole. A change-scoped pass
+	/// reads no snapshot and so has no watermark of its own; this is the judgement the guard is
+	/// still working from (plan 3.4).
+	remote_converged: bool,
+	/// Whether that read's local walk was complete — the other half of the same rule.
+	scan_complete: bool,
+}
+
+/// Whether the local map a change-scoped pass assembled accounts for the rows and observations it
+/// was built from.
+///
+/// The map is the baseline's rows, minus the rows each observation replaces, plus the nodes that
+/// observation found. Both ends are computable from the pieces themselves:
+///
+/// - a `Dir` walk that came back COMPLETE replaces the rows under its key, except those under a
+///   path it pruned and never looked at ([`LocalObservation::uncovered_roots`]); an incomplete one
+///   replaces nothing,
+/// - an `Absent` replaces every row at or under the path whose `stat` said so,
+/// - a `File` replaces nothing and a `Hidden` replaces nothing — both leave the rows standing,
+///
+/// so the assembled size has to land between "every replaceable row went" and "every one of them
+/// was replaced by an observed node". Outside those bounds the assembly dropped paths that no
+/// observation asked it to drop — risk #1 of the plan, and the shape that fabricates an absence —
+/// so the pass reads both sides instead of planning from it.
+fn assembly_accounted(
+	baseline: &Baseline,
+	derived: &Derived,
+	observed: &LocalObservations,
+	held: &BTreeSet<String>,
+) -> bool {
+	// Rows the observations replace, and the nodes they put back. A COMPLETE walk's contribution is
+	// exact — every row under its key goes, every node it found arrives, and the two sets cannot
+	// overlap, since a node it found is not a row it pruned. The slack is the observations that may
+	// land ON a row that is still carried: a file (whose row is usually still there) and an
+	// incomplete walk (which replaced nothing).
+	let mut replaced = 0usize;
+	let mut certain = 0usize;
+	let mut slack = 0usize;
+	for (at, observation) in &observed.observed {
+		let pruned: BTreeSet<String> = observation.uncovered_roots().cloned().collect();
+		// Rows the derivation CARRIED, and no others: a held row was never in the map to begin
+		// with, so counting it as one an observation replaced subtracts it a second time — `carried`
+		// below has already left it out — and puts the bound below the map the pass legitimately
+		// assembled.
+		let rows_at = |at: &str| {
+			let mut rows = usize::from(
+				baseline.contains_key(at) && !pruned.contains(at) && !held.contains(at),
+			);
+			baseline.visit_subtree_paths(at, |path| {
+				rows += usize::from(!plan::at_or_under_root(&pruned, path) && !held.contains(path));
+			});
+			rows
+		};
+		match observation {
+			LocalObservation::Dir(scan) if scan.complete => {
+				replaced += rows_at(at);
+				certain += scan.nodes.len();
+			}
+			LocalObservation::Dir(scan) => slack += scan.nodes.len(),
+			LocalObservation::Absent(absence) => replaced += rows_at(absence.path()),
+			LocalObservation::File { .. } => slack += 1,
+			LocalObservation::Hidden(_) => {}
+		}
+	}
+	// A row that records one side only is in neither map and is held instead (`derive::carried`),
+	// which is the one other way a row legitimately misses the map. Taken by the caller, which holds
+	// the set before the pass's view takes it — and subtracted HERE only, never again inside
+	// `rows_at`.
+	let carried = baseline.len().saturating_sub(held.len());
+	let lowest = carried.saturating_sub(replaced).saturating_add(certain);
+	(lowest..=lowest.saturating_add(slack)).contains(&derived.local.len())
+}
+
 /// The read-only inputs to a pass, shared by planning and applying.
 struct Prepared {
 	record: PairRecord,
 	baseline: Arc<Baseline>,
+	/// What this pass read, and why (see [`PassRead`]).
+	read: PassRead,
 	/// The directory moves this pass makes, in the order they run (see [`plan::fold_dir_moves`]).
 	/// `baseline`, `local_scan` and `remote_view` are already keyed by the paths those subtrees
 	/// end up at.
@@ -1269,19 +1423,16 @@ struct Prepared {
 	/// The per-path failure streaks that block planning this pass (see [`streak_blocks`]). A streak
 	/// below the threshold, or one whose retry interval has run out, is not here.
 	failures: HashMap<String, PathFailure>,
-	/// Synced paths whose remote item still exists but is out of the view (see
-	/// [`plan::unknown_remote_paths`]), with why. Blocked and reported, never read as deleted.
-	unknown_remote: BTreeMap<String, UnsyncableReason>,
-	/// Remote items out of the view that no baseline row names: reported only.
-	never_synced_remote: Vec<UnsyncablePath>,
-	/// The top-most local items the ignore rules hide, keyed like the local scan, with the rule that
-	/// hides each. Nothing is done at or under one, and the baseline rows there are dropped at the
-	/// end of the pass: the path stops syncing, and reads like a first sync once the rule goes away.
-	ignored_local: BTreeMap<String, IgnoreDecision>,
-	/// The same for the remote view, keyed like it.
-	ignored_remote: BTreeMap<String, IgnoreDecision>,
-	/// Subtrees whose ignore rules could not be read this pass: blocked, with their rows kept.
-	ignore_blocked: BTreeSet<String>,
+	/// Everything this pass blocks, reports or withholds, keyed by path: what a whole read found,
+	/// or — on a change-scoped pass — what the last read found, pruned and re-answered wherever
+	/// this one looked (see [`PairFacts`]).
+	facts: PairFacts,
+	/// Directories whose REMOTE rule file could not be used THIS pass.
+	///
+	/// Kept out of [`PairFacts::ignore_blocked`], which holds only what a local walk found: the
+	/// remote half is recomputed every pass from the rule files the baseline names, so carrying it
+	/// would leave a stale block with nothing left to prune it.
+	remote_blocked: BTreeSet<String>,
 	/// A report line per remote `.filenignore` that could not be used, or per bad line in one.
 	remote_rule_errors: Vec<String>,
 	/// The ignored roots the pair's previous pass recorded (see
@@ -1313,27 +1464,29 @@ impl Prepared {
 			// Keyed like the baseline rows they were read from. A park on the moved directory itself
 			// is cleared by its rename, as any rename clears one; carried along, it would hold back the
 			// very move that renames it.
-			rekey_paths(&mut self.unknown_remote, from, to);
+			rekey_paths(&mut self.facts.unknown_remote, from, to);
 			self.failures.remove(from);
 			rekey_paths(&mut self.failures, from, to);
-			self.ignore_blocked = mem::take(&mut self.ignore_blocked)
-				.into_iter()
-				.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
-				.collect();
+			for blocked in [&mut self.facts.ignore_blocked, &mut self.remote_blocked] {
+				*blocked = mem::take(blocked)
+					.into_iter()
+					.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
+					.collect();
+			}
 			if matches!(action, SyncAction::MoveRemote { .. }) {
 				// Keyed like the remote view, which only a remote move re-keys.
-				for report in &mut self.never_synced_remote {
+				for report in &mut self.facts.never_synced_remote {
 					if let Some(path) = plan::moved_path(&report.rel_path, from, to) {
 						report.rel_path = path;
 					}
 				}
-				rekey_ignored(&mut self.ignored_remote, from, to);
+				rekey_ignored(&mut self.facts.ignored_remote, from, to);
 			} else {
 				// Keyed like the local scan, which only a local move re-keys.
-				rekey_ignored(&mut self.ignored_local, from, to);
-				rekey_paths(&mut self.local_scan.invalid_names, from, to);
-				rekey_paths(&mut self.local_scan.aliased_dirs, from, to);
-				for target in self.local_scan.aliased_dirs.values_mut() {
+				rekey_ignored(&mut self.facts.ignored_local, from, to);
+				rekey_paths(&mut self.facts.invalid_names, from, to);
+				rekey_paths(&mut self.facts.aliased_dirs, from, to);
+				for target in self.facts.aliased_dirs.values_mut() {
 					if let Some(path) = plan::moved_path(target, from, to) {
 						*target = path;
 					}
@@ -1354,18 +1507,14 @@ impl Prepared {
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
-		let names = self
-			.local_scan
-			.invalid_names
-			.iter()
-			.map(|(rel_path, detail)| {
-				UnsyncablePath::new(
-					rel_path.clone(),
-					UnsyncableReason::InvalidName {
-						detail: detail.clone(),
-					},
-				)
-			});
+		let names = self.facts.invalid_names.iter().map(|(rel_path, detail)| {
+			UnsyncablePath::new(
+				rel_path.clone(),
+				UnsyncableReason::InvalidName {
+					detail: detail.clone(),
+				},
+			)
+		});
 		let mut all: Vec<UnsyncablePath> =
 			names
 				.chain(self.failures.iter().map(|(rel_path, failure)| {
@@ -1377,23 +1526,18 @@ impl Prepared {
 						},
 					)
 				}))
-				.chain(self.unknown_remote.iter().map(|(rel_path, reason)| {
+				.chain(self.facts.unknown_remote.iter().map(|(rel_path, reason)| {
 					UnsyncablePath::new(rel_path.clone(), reason.clone())
 				}))
-				.chain(self.never_synced_remote.iter().cloned())
-				.chain(
-					self.local_scan
-						.aliased_dirs
-						.iter()
-						.map(|(rel_path, target)| {
-							UnsyncablePath::new(
-								rel_path.clone(),
-								UnsyncableReason::LocalAlias {
-									target: target.clone(),
-								},
-							)
-						}),
-				)
+				.chain(self.facts.never_synced_remote.iter().cloned())
+				.chain(self.facts.aliased_dirs.iter().map(|(rel_path, target)| {
+					UnsyncablePath::new(
+						rel_path.clone(),
+						UnsyncableReason::LocalAlias {
+							target: target.clone(),
+						},
+					)
+				}))
 				.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1407,35 +1551,51 @@ impl Prepared {
 	fn blocked_paths(&self) -> BTreeSet<String> {
 		self.failures
 			.keys()
-			.chain(self.local_scan.blocked_paths())
-			.chain(self.unknown_remote.keys())
-			.chain(self.ignored_local.keys())
-			.chain(self.ignored_remote.keys())
-			.chain(&self.ignore_blocked)
+			.chain(self.facts.invalid_names.keys())
+			.chain(self.facts.aliased_dirs.keys())
+			.chain(self.facts.unknown_remote.keys())
+			.chain(self.facts.ignored_local.keys())
+			.chain(self.facts.ignored_remote.keys())
+			.chain(&self.facts.ignore_blocked)
+			.chain(&self.remote_blocked)
+			.cloned()
+			.collect()
+	}
+
+	/// Every directory whose ignore rules this pass could not use, from either side (see
+	/// [`remote_blocked`](Self::remote_blocked)).
+	fn blocked_rules(&self) -> BTreeSet<String> {
+		self.facts
+			.ignore_blocked
+			.iter()
+			.chain(&self.remote_blocked)
 			.cloned()
 			.collect()
 	}
 
 	/// The top-most ignored paths on either side: blocked, and untracked once the pass is done.
 	fn ignored_roots(&self) -> BTreeSet<String> {
-		self.ignored_local
+		self.facts
+			.ignored_local
 			.keys()
-			.chain(self.ignored_remote.keys())
+			.chain(self.facts.ignored_remote.keys())
 			.cloned()
 			.collect()
 	}
 
 	/// Whether `path` is at or under a root this pass ignores, or under rules it could not read.
 	fn hides(&self, path: &str) -> bool {
-		self.ignore_blocked.contains("")
+		self.facts.ignore_blocked.contains("")
+			|| self.remote_blocked.contains("")
 			|| path
 				.match_indices('/')
 				.map(|(i, _)| &path[..i])
 				.chain([path])
 				.any(|at| {
-					self.ignored_local.contains_key(at)
-						|| self.ignored_remote.contains_key(at)
-						|| self.ignore_blocked.contains(at)
+					self.facts.ignored_local.contains_key(at)
+						|| self.facts.ignored_remote.contains_key(at)
+						|| self.facts.ignore_blocked.contains(at)
+						|| self.remote_blocked.contains(at)
 				})
 	}
 
@@ -1486,7 +1646,12 @@ impl Prepared {
 			path.match_indices('/').map(|(i, _)| &path[..i])
 		}
 		let mut roots: BTreeMap<&str, (&IgnoreDecision, bool)> = BTreeMap::new();
-		for (path, decision) in self.ignored_local.iter().chain(&self.ignored_remote) {
+		for (path, decision) in self
+			.facts
+			.ignored_local
+			.iter()
+			.chain(&self.facts.ignored_remote)
+		{
 			roots.entry(path).or_insert((decision, false));
 		}
 		if roots.is_empty() {
@@ -1712,6 +1877,7 @@ impl SyncEngine {
 			reading: Mutex::new(HashMap::new()),
 			remote_rule_bodies: Mutex::new(HashMap::new()),
 			changes: Mutex::new(HashMap::new()),
+			carried: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
@@ -2064,7 +2230,7 @@ impl SyncEngine {
 		let adopted = match backlog {
 			Backlog::Propagate => Vec::new(),
 			Backlog::AdoptDestination => {
-				let prep = self.prepare(pair).await?;
+				let prep = self.prepare(pair, None).await?;
 				// The adoption rewrites baseline rows from this one read, and every row it writes is
 				// for a path it reads as GONE on the source side — so it needs the same evidence a
 				// pass needs before acting on an absence. Read through an incomplete scan or an
@@ -2603,8 +2769,9 @@ impl SyncEngine {
 		rules
 	}
 
-	/// Run the read-only half: load the baseline, scan, enumerate the remote, build the view.
-	async fn prepare(&self, pair: PairId) -> Result<Prepared, Error> {
+	/// The per-pair reads every pass makes before it looks at either tree, whichever way it then
+	/// reads them.
+	async fn pass_inputs(&self, pair: PairId) -> Result<PassInputs, Error> {
 		let (record, user_ignore) = {
 			// The registry row and the device-wide patterns: two point reads on the control
 			// connection, which no pass ever holds for longer than one statement.
@@ -2624,7 +2791,7 @@ impl SyncEngine {
 		// store's resident copy, which costs a `SELECT` over the whole pair the FIRST time anything
 		// asks for it and an `Arc` clone every time after (see [`BaselineStore::baseline`]); the
 		// other two ride along rather than paying for a hop each.
-		let (mut baseline, failures, last_ignored) = off_store(&store, move |store| {
+		let (baseline, failures, last_ignored) = off_store(&store, move |store| {
 			let baseline = store
 				.baseline(pair)
 				.map_err(|e| db_error(e, "loading the baseline"))?;
@@ -2638,6 +2805,337 @@ impl SyncEngine {
 			Ok::<_, Error>((baseline, failures, last_ignored))
 		})
 		.await??;
+		Ok(PassInputs {
+			record,
+			user_ignore,
+			store,
+			baseline,
+			failures,
+			last_ignored,
+		})
+	}
+
+	/// The read-only half of a pass: either both sides WHOLE — scan, enumerate the remote, build
+	/// the view — or only what changed since the last pass, with everything else derived from the
+	/// baseline rows (see [`PassRead`], and the optimization plan's section 3.4).
+	///
+	/// `scope` is the pass's changelists, taken before this runs. `None` is a dry run, which always
+	/// reads whole: it is rare, and its report has to show the whole picture (plan 3.5).
+	async fn prepare(
+		&self,
+		pair: PairId,
+		scope: Option<&mut PassScope>,
+	) -> Result<Prepared, Error> {
+		let inputs = self.pass_inputs(pair).await?;
+		// The changelists' own reasons, plus the one row of the trigger table that needs the
+		// baseline: an empty one is a first sync, and the whole tree is the evidence for it.
+		let forced = match &scope {
+			Some(scope) => scope.full_pass_reason(inputs.baseline.len()),
+			None => None,
+		};
+		if forced.is_none()
+			&& let Some(scope) = scope
+		{
+			match self.prepare_scoped(inputs, scope).await? {
+				Scoped::Prepared(prepared) => return Ok(*prepared),
+				// The derivation could not answer for something it was handed.
+				Scoped::Whole(inputs, reason) => {
+					return self
+						.prepare_whole(*inputs, PassRead::Whole(Some(reason)))
+						.await;
+				}
+			}
+		}
+		self.prepare_whole(inputs, PassRead::Whole(forced)).await
+	}
+
+	/// The change-scoped half of [`prepare`](Self::prepare): re-observe the paths the changelists
+	/// name, derive everything else from the rows the last pass wrote.
+	///
+	/// Every question it cannot answer is [`Scoped::Whole`] rather than a partial map. A path
+	/// missing from a derived map reads downstream as a deletion — invariant I1's failure mode —
+	/// so "derive what I can and leave the rest out" is not one of the options here.
+	async fn prepare_scoped(
+		&self,
+		mut inputs: PassInputs,
+		scope: &mut PassScope,
+	) -> Result<Scoped, Error> {
+		let pair = inputs.record.id;
+		// What the last pass left. Without it there is nothing to carry the blocked paths or the
+		// guard's two whole-tree judgements from — the state a pair is in until one pass has read
+		// it whole in this process.
+		let Some(carried) = self.carried.lock().await.get(&pair).cloned() else {
+			return Ok(Scoped::Whole(Box::new(inputs), FullPassReason::FirstPass));
+		};
+		// Copied before the derivation reads anything, for the reason the whole pass copies it
+		// before its snapshot: an announcement committed afterwards describes a state this pass
+		// did not read, so it must not retire a pending write here.
+		let announced = self.observed.snapshot();
+		let mut derived = derive::from_baseline(&inputs.baseline, scope.take_local());
+
+		// The remote half FIRST: every path its delta touched is a path the local half has to
+		// re-observe too, since a path dirty on either side is re-observed on both.
+		let Some(cache_db) = self.client.cache_slot.lock().await.db_path() else {
+			return Ok(Scoped::Whole(
+				Box::new(inputs),
+				FullPassReason::RemoteEventsDegraded,
+			));
+		};
+		let delta = scope.take_remote();
+		let root = inputs.record.remote_root;
+		let for_remote = Arc::clone(&inputs.baseline);
+		let nodes = mem::take(&mut derived.remote);
+		let observed = tokio::task::spawn_blocking(move || {
+			let mut ancestry = |uuid| cache_ancestry(&cache_db, uuid);
+			observe_remote(root, &for_remote, nodes, &delta, &mut ancestry)
+		})
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("deriving the remote view panicked: {e}"),
+			)
+		})?;
+		let observation = match observed {
+			RemoteObserved::Applied(observation) => *observation,
+			RemoteObserved::Full(reason) => return Ok(Scoped::Whole(Box::new(inputs), reason)),
+		};
+		// A remote rule file changed: what it hides below itself has no baseline row to derive
+		// from, so that subtree cannot be carried. The producer collapses such an event to a whole
+		// pass already, which makes this the belt to that braces.
+		if !observation.rule_dirs.is_empty() {
+			return Ok(Scoped::Whole(
+				Box::new(inputs),
+				FullPassReason::RulesChanged,
+			));
+		}
+		// TAKEN before the view's held set is built out of it. The assembly check needs the ROWS
+		// this pass holds — which rows, not how many, since it has to leave them out of both ends of
+		// its count — and reading the set afterwards would find none of them and fall back to a whole
+		// read at every held row nothing re-observed.
+		let held_rows = mem::take(&mut derived.held);
+		let mut view = RemoteView {
+			nodes: observation.nodes,
+			// A derived view places what the rows and the delta describe and nothing else: an item
+			// it cannot place asks for a whole read rather than being skipped, and two items at one
+			// path cannot arise from rows that are keyed by path.
+			has_collisions: false,
+			skipped: Vec::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+			// LOAD-BEARING: the rows that record one side only, and the paths the cache is showing
+			// mid-transition. Without them here — and so in `holds.held_remote` below — the missing
+			// side of such a row reads as a deletion in `reconcile` (see `derive::Derived::held`).
+			held_paths: held_rows
+				.iter()
+				.cloned()
+				.chain(observation.held_paths)
+				.collect(),
+		};
+		derived.dirty.extend(observation.touched.iter().cloned());
+
+		// The rules, from the same sources and in the same order a whole pass reads them.
+		let (user, user_error) = match parse_user_ignore(&inputs.user_ignore) {
+			Ok(source) => (Some(source), None),
+			Err(error) => (None, Some(error)),
+		};
+		let mut remote_rules = self
+			.remote_rules(&inputs.record, &inputs.baseline, &view, user)
+			.await;
+		if let Some(error) = user_error {
+			remote_rules.blocked.insert(String::new());
+			remote_rules.errors.push(error.to_string());
+		}
+		let rule_files = if inputs.record.mode.pushes() {
+			RuleFiles::Read
+		} else {
+			RuleFiles::Only(
+				inputs
+					.baseline
+					.iter()
+					.filter(|entry| {
+						entry.kind == NodeKind::File && !view.nodes.contains_key(&entry.rel_path)
+					})
+					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+					.collect(),
+			)
+		};
+
+		// The local half: one stat per dirty path and its ancestors, one subtree walk per dirty
+		// directory. The rules come back carrying only the `.filenignore` files this observation
+		// read — the branches it visited — which is why the carried `ignored_remote` facts still
+		// stand for everything it did not.
+		let local_root = PathBuf::from(&inputs.record.local_root);
+		let for_local = Arc::clone(&inputs.baseline);
+		let dirty = mem::take(&mut derived.dirty);
+		let pass_rules = remote_rules.rules;
+		let (observations, rules) = tokio::task::spawn_blocking(move || {
+			observe::observe_local(&local_root, &for_local, pass_rules, &rule_files, &dirty)
+		})
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("re-observing the local paths panicked: {e}"),
+			)
+		})?;
+		derive::merge_local(&mut derived.local, &inputs.baseline, &observations);
+
+		// Plan 3.6's self-check, before anything plans against these maps.
+		if !assembly_accounted(&inputs.baseline, &derived, &observations, &held_rows) {
+			tracing::warn!(
+				"sync_once[pair {pair}]: the derived local map ({} node(s)) does not account for \
+				 the {} baseline row(s) and {} observation(s) it was built from; reading both \
+				 sides instead",
+				derived.local.len(),
+				inputs.baseline.len(),
+				observations.observed.len(),
+			);
+			return Ok(Scoped::Whole(
+				Box::new(inputs),
+				FullPassReason::AssemblyMismatch,
+			));
+		}
+		// A path this pass set out to look at and could not read leaves ITS absences trustworthy —
+		// nothing is derived from a read that did not happen — and the NEXT pass blind, because the
+		// list that named the path is drained. So read everything then, rather than wait out the
+		// safety net.
+		if !observations.complete {
+			self.force_full_pass(pair, FullPassReason::IncompleteObservation)
+				.await;
+		}
+
+		view.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &inputs.baseline,
+		}));
+		// The facts: the remote half pruned at the paths the delta touched, the local half at the
+		// paths this pass observed, each replaced by what that evidence says now.
+		let mut facts = carried.facts;
+		facts.merge_remote_view(&observation.touched, &view, &inputs.baseline);
+		facts.observe_local(&observations);
+
+		// Tenure and the server's version chain ONLY, never `confirm_agreed_content`: that would
+		// confirm rows against a view derived from those very rows (I6). What this still costs is a
+		// confirmation delayed to the next whole pass, never one granted early — the verdicts come
+		// from announcements, and the view is only read to spot a FOREIGN version at a row's path.
+		let mut confirmed = Vec::new();
+		if inputs.baseline.any_unconfirmed() {
+			let rows = Arc::make_mut(&mut inputs.baseline);
+			confirmed = self.confirm_pushes(rows, &view.nodes).await;
+		}
+
+		let mut holds = {
+			let journal = locked(&inputs.store);
+			let before = self.pending.uuids();
+			// An EMPTY map, deliberately: `settle`'s third rule retires a write whose item the
+			// SNAPSHOT shows at its path, and this pass has no snapshot. The derived view shows our
+			// own write because the baseline row records it, so reading it there would retire the
+			// record against itself (I5). The announcement rule and the grace ceiling still apply.
+			let holds = self.pending.settle(pair, &announced, &HashMap::new());
+			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
+			if !retired.is_empty() {
+				journal
+					.delete_pending(pair, &retired)
+					.map_err(|e| db_error(e, "retiring pending writes"))?;
+			}
+			holds
+		};
+		self.retire_superseded_creates(pair, &inputs.baseline, &view.nodes)
+			.await?;
+		let folded = self
+			.pending
+			.fold_into(pair, &inputs.baseline, &mut view.nodes);
+		if folded > 0 {
+			tracing::debug!(
+				"sync_once[pair {pair}]: folding {folded} unacknowledged write(s) into the derived view"
+			);
+		}
+		holds.held_remote = view.held_paths.clone();
+		self.observed.prune_before(self.pending.oldest_stamp());
+
+		let LocalObservations {
+			siblings,
+			mut errors,
+			complete,
+			..
+		} = observations;
+		// The per-directory collision check a whole walk makes with its `claimed` set: two names in
+		// one directory that fold together have no 1:1 local mapping, and the pair is refused until
+		// the user resolves it. Narrower than the walk's on purpose — only names this pass holds a
+		// node for count — so a collision between two paths it never looked at cannot refuse a pass
+		// that is not touching them.
+		for (dir, folded) in &siblings {
+			for names in folded.values().filter(|names| names.len() > 1) {
+				let present: Vec<String> = names
+					.iter()
+					.map(|name| plan::join_path(dir, name))
+					.filter(|path| derived.local.contains_key(path))
+					.collect();
+				if let Some(rel_path) = present.get(1) {
+					errors.push(ScanError::DuplicateName {
+						rel_path: rel_path.clone(),
+					});
+				}
+			}
+		}
+
+		// Plan 3.4's composition: the last whole read's walk was complete, every dirty stat and
+		// walk of this one succeeded, and nothing has since made the next pass a whole-tree one —
+		// a reason recorded while this pass was reading says the list it narrowed itself with may
+		// be missing exactly what it is about to act on.
+		let narrowed_read_is_whole = match self.existing_pair_changes(pair).await {
+			Some(changes) => !changes.full_pending(),
+			None => false,
+		};
+		let local_scan = LocalScan {
+			nodes: mem::take(&mut derived.local),
+			complete: carried.scan_complete && complete && narrowed_read_is_whole,
+			errors,
+			// A change-scoped pass reads these off `facts`, which is where the carried ones live.
+			// The scan struct is only the shape the rest of the pass expects its nodes in.
+			invalid_names: BTreeMap::new(),
+			aliased_dirs: BTreeMap::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+			ignore_blocked: BTreeSet::new(),
+		};
+		let remote_emptied = remote_emptied(&view.nodes, &inputs.baseline);
+		let mut prepared = Prepared {
+			record: inputs.record,
+			baseline: inputs.baseline,
+			read: PassRead::Scoped,
+			dir_moves: Vec::new(),
+			local_scan,
+			remote_view: view,
+			// Neither judgement can be made from a derived view: both are what the last WHOLE read
+			// found, and every hold they cause re-forces a whole read anyway (plan 3.5).
+			remote_converged: carried.remote_converged,
+			remote_emptied,
+			holds,
+			failures: inputs.failures,
+			facts,
+			remote_blocked: remote_rules.blocked,
+			remote_rule_errors: remote_rules.errors,
+			last_ignored: inputs.last_ignored,
+			confirmed,
+		};
+		prepared.fold_dir_moves();
+		Ok(Scoped::Prepared(Box::new(prepared)))
+	}
+
+	/// The whole-tree half of [`prepare`](Self::prepare): read both sides entire, which is the only
+	/// read that can find a change nothing announced.
+	async fn prepare_whole(&self, inputs: PassInputs, read: PassRead) -> Result<Prepared, Error> {
+		let PassInputs {
+			record,
+			user_ignore,
+			store,
+			mut baseline,
+			failures,
+			last_ignored,
+		} = inputs;
+		let pair = record.id;
 
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
@@ -2715,10 +3213,20 @@ impl SyncEngine {
 		})
 		.await
 		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
-		// Kept on the pass, where directory moves re-key them along with everything else it blocks.
-		let ignored_local = mem::take(&mut local_scan.ignored);
-		let mut ignore_blocked = mem::take(&mut local_scan.ignore_blocked);
-		ignore_blocked.extend(remote_rules.blocked);
+		// This pass's facts, computed whole: `""` answers for every path, so the merge replaces
+		// whatever the previous pass carried (see `PairFacts::merge_local_scan`). Kept on the pass,
+		// where directory moves re-key them along with everything else it blocks.
+		let mut facts = PairFacts::default();
+		facts.merge_local_scan("", &local_scan);
+		// One copy only, on `facts`: a directory move re-keys that one (`Prepared::fold_dir_moves`)
+		// and nothing re-keys a second, so a reader of the scan's copy would get paths the pass has
+		// already moved on from. The change-scoped path builds its `LocalScan` with these empty for
+		// the same reason.
+		local_scan.invalid_names = BTreeMap::new();
+		local_scan.aliased_dirs = BTreeMap::new();
+		local_scan.ignored = BTreeMap::new();
+		local_scan.ignore_blocked = BTreeSet::new();
+		let remote_blocked = remote_rules.blocked;
 
 		// The reads that are about the remote AS IT IS come before anything is hidden: what the
 		// cache shows is evidence whatever the rules hide.
@@ -2753,7 +3261,6 @@ impl SyncEngine {
 			baseline: &baseline,
 		}));
 		let mut remote_view = view;
-		let ignored_remote = mem::take(&mut remote_view.ignored);
 		// Hidden on both sides, but carried as roots on neither: the `.DS_Store` in every folder
 		// that no row was ever written for. The report leaves them out and untracking them deletes
 		// nothing, so they only cost the pass the filters they scale.
@@ -2765,8 +3272,9 @@ impl SyncEngine {
 				 defaults with nothing synced at or under them, so not tracked as ignored roots"
 			);
 		}
-		let (unknown_remote, never_synced_remote) =
-			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
+		// The remote half, also whole: `[""]` clears every carried remote fact, and the merge runs
+		// the `unknown_remote_paths` read itself over what this view skipped.
+		facts.merge_remote_view(&BTreeSet::from([String::new()]), &remote_view, &baseline);
 
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
@@ -2784,6 +3292,7 @@ impl SyncEngine {
 		let mut prepared = Prepared {
 			record,
 			baseline,
+			read,
 			dir_moves: Vec::new(),
 			local_scan,
 			remote_view,
@@ -2791,11 +3300,8 @@ impl SyncEngine {
 			remote_emptied,
 			holds,
 			failures,
-			unknown_remote,
-			never_synced_remote,
-			ignored_local,
-			ignored_remote,
-			ignore_blocked,
+			facts,
+			remote_blocked,
 			remote_rule_errors: remote_rules.errors,
 			last_ignored,
 			confirmed,
@@ -2817,7 +3323,7 @@ impl SyncEngine {
 	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
 	/// any other.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair).await?;
+		let prep = self.prepare(pair, None).await?;
 		if let Some(reason) = refusal(&prep) {
 			return Ok(PlanOutcome {
 				refused: Some(reason),
@@ -2985,6 +3491,7 @@ impl SyncEngine {
 		// Nothing of the removed pair is left to narrow a pass with (a pair re-registered under the
 		// same id — sqlite reuses one — starts from an empty changelist and a forced first pass).
 		self.changes.lock().await.remove(&pair);
+		self.carried.lock().await.remove(&pair);
 		// The pair's connection goes with the pair. Last, so nothing above can reopen it, and the
 		// file handle closes as soon as the cascade above lets this function's own handle go.
 		self.stores.lock().await.remove(&pair);
@@ -3521,7 +4028,7 @@ impl SyncEngine {
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> Result<SyncReport, Error> {
-		self.sync_pass(pair, observer).await
+		self.sync_pass(pair, observer, WhenIdle::Run).await
 	}
 
 	/// [`sync_once_observed`](Self::sync_once_observed) plus what a finished pass owes the next one:
@@ -3531,10 +4038,11 @@ impl SyncEngine {
 		&self,
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
+		when_idle: WhenIdle,
 	) -> Result<SyncReport, Error> {
 		let mut contained = super::events::contain_panics(observer);
 		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
-		let result = self.run_pass(pair, observer).await;
+		let result = self.run_pass(pair, observer, when_idle).await;
 		// What this pass's outcome means for the NEXT one's scope, wherever it ended. A pass that
 		// failed outright took both changelists and applied nothing, so what it took is reflected
 		// nowhere and the next pass cannot rely on them.
@@ -3600,12 +4108,58 @@ impl SyncEngine {
 		}
 	}
 
+	/// What a pass that made a plan leaves the next one: the facts it blocked with, the two
+	/// whole-tree judgements only a whole read makes, and the paths its plan owes a second look at
+	/// (the optimization plan's section 3.4 step 7, and its carry-over set in 3.6).
+	///
+	/// Not called by a pass that REFUSED: a refusal forces the next pass whole, which rebuilds all
+	/// of this from a read of both sides.
+	async fn carry_forward(
+		&self,
+		pair: PairId,
+		prep: &Prepared,
+		report: &SyncReport,
+		decision: &guard::GuardDecision,
+	) {
+		// The UNFILTERED streaks, not `Prepared::failures`: a path whose attempts are below the
+		// blocking threshold is filtered out of the pass, and filtering it out here too would mean
+		// no later pass ever looks at it again and its retry never comes.
+		let failures = match self.pair_store(pair).await {
+			Ok(store) => off_store(&store, move |store| store.failures(pair))
+				.await
+				.ok()
+				.and_then(Result::ok)
+				.unwrap_or_default(),
+			Err(_) => HashMap::new(),
+		};
+		let owed = facts::carry_over(
+			decision.safe.iter().chain(&decision.held),
+			&report.conflicts,
+			&prep.holds.held_remote,
+			&failures,
+		);
+		if let Some(changes) = self.existing_pair_changes(pair).await {
+			changes.note_owed(owed);
+		}
+		self.carried.lock().await.insert(
+			pair,
+			PairCarry {
+				facts: prep.facts.clone(),
+				// A change-scoped pass makes neither judgement for itself; what it carries on is
+				// what the last whole read found, which is what it planned with.
+				remote_converged: prep.remote_converged,
+				scan_complete: prep.local_scan.complete,
+			},
+		);
+	}
+
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
 	/// already contained.
 	async fn run_pass(
 		&self,
 		pair: PairId,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
+		when_idle: WhenIdle,
 	) -> Result<SyncReport, Error> {
 		if self.is_paused(pair).await {
 			tracing::debug!("sync_once[pair {pair}]: paused — neither side was read");
@@ -3630,14 +4184,28 @@ impl SyncEngine {
 		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
 		let changes = self.pair_changes(pair).await;
-		let scope = changes.take();
+		let mut scope = changes.take();
+		let (dirty_local, dirty_remote) = scope.sizes();
+		// Nothing announced on either side, nothing owed by the last plan, and nothing forcing a
+		// whole read: there is no pass to run. A watch wake that lands here does nothing at all —
+		// no `PassStarted`, and the safety net goes on measuring from the last whole read — because
+		// reading two trees to discover there was nothing to do is the cost this scoping exists to
+		// remove. An explicit `sync_once` still runs: its caller asked for a pass and wants the
+		// report, and may well have beaten its own watcher's event.
+		if when_idle == WhenIdle::Skip && scope.is_idle() {
+			tracing::debug!(
+				"sync_once[pair {pair}]: nothing announced since the last pass — no pass run"
+			);
+			return Ok(SyncReport::default());
+		}
 		// What reading both sides costs this pair — measured over the read and nothing else, since
 		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`).
 		let read_started = Instant::now();
 		let Some((recording, prepared)) = gate
 			.guard(async move {
 				let recording = reading.lock_owned().await;
-				(recording, self.prepare(pair).await)
+				let prepared = self.prepare(pair, Some(&mut scope)).await;
+				(recording, prepared)
 			})
 			.await
 		else {
@@ -3686,21 +4254,25 @@ impl SyncEngine {
 		// knows. It is RECORDED, not yet acted on — the pass below reads and reconciles both sides
 		// whole whatever the answer is, and the change-scoped pass that consumes it comes next.
 		let mut report = SyncReport {
-			full_pass: scope.full_pass_reason(prep.baseline.len()),
+			full_pass: prep.read.full_pass_reason(),
 			read_cost,
 			..SyncReport::default()
 		};
-		let (dirty_local, dirty_remote) = scope.sizes();
 		tracing::debug!(
-			"sync_once[pair {pair}]: {dirty_local} local path(s) and {dirty_remote} remote change(s) announced since the last pass; this pass reads everything ({})",
-			report.full_pass.map_or_else(
-				|| "no whole-tree trigger".to_string(),
-				|reason| reason.to_string()
-			),
+			"sync_once[pair {pair}]: {dirty_local} local path(s) and {dirty_remote} remote change(s) announced since the last pass; {}",
+			match prep.read {
+				PassRead::Scoped => "this pass read only what changed".to_string(),
+				PassRead::Whole(reason) => format!(
+					"this pass read everything ({})",
+					reason.map_or_else(|| "a dry run".to_string(), |reason| reason.to_string())
+				),
+			},
 		);
-		// The whole tree IS read below, so the changelist caps re-scale to what the pair now
-		// tracks. The reason this pass runs full was taken with the lists above.
-		changes.note_tree_size(prep.baseline.len());
+		// Only a whole read measures the tree, so only a whole read re-scales the changelist caps
+		// to it; a change-scoped pass never saw all of it.
+		if !prep.read.is_scoped() {
+			changes.note_tree_size(prep.baseline.len());
+		}
 
 		tracing::debug!(
 			"sync_once[pair {pair}]: mode {:?} — local scan {} node(s) (complete={}), remote view {} node(s) (converged={})",
@@ -3761,6 +4333,7 @@ impl SyncEngine {
 		report.guard = decision.reason.clone();
 		report.deletion_token = screened.pass_token;
 		report.deferred_paths = screened.deferred_paths;
+		report.dropped_actions = screened.dropped;
 
 		for conflict in &report.conflicts {
 			let rel_path = &conflict.rel_path;
@@ -3816,6 +4389,9 @@ impl SyncEngine {
 		observer(SyncEvent::Planned {
 			actions: decision.safe.len(),
 		});
+		// Before the early return below: a pass with nothing to apply still made a plan, and still
+		// owes the next one everything that plan named.
+		self.carry_forward(pair, &prep, &report, &decision).await;
 
 		if decision.safe.is_empty() {
 			tracing::debug!(
@@ -3902,12 +4478,16 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	}
 	// A pass that planned work and did not apply it: the drive-write lock it could not take (its
 	// whole plan), a side that filled up (the transfers held behind it), a record of work already
-	// done that did not land (nothing more is admitted after it), or a single action that failed.
-	// Each leaves paths owed with nothing left holding them.
+	// done that did not land (nothing more is admitted after it), a single action that failed, or an
+	// action screened out before it ran (`drop_blocked`, `withhold_deletions_over_unreachable`).
+	// Each leaves paths owed with nothing left holding them: a dropped action's evidence was an
+	// observation or an announcement this pass consumed, and a derived map rebuilds neither — the
+	// baseline row it would derive from is the one that says the change never happened.
 	if report.lock_failed
 		|| report.store_failed
 		|| report.halted.is_some()
 		|| !report.failed_paths.is_empty()
+		|| report.dropped_actions > 0
 	{
 		return Some(FullPassReason::UnappliedWork);
 	}
@@ -3973,6 +4553,8 @@ struct Screened {
 	pass_token: Option<String>,
 	/// Paths this pass deliberately left alone (see [`SyncReport::deferred_paths`]).
 	deferred_paths: usize,
+	/// Actions this pass planned and then dropped (see [`SyncReport::dropped_actions`]).
+	dropped: usize,
 }
 
 /// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
@@ -3988,14 +4570,19 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
 	let mut actions = prep.dir_moves.clone();
 	actions.extend(plan.actions);
+	// Both filters only ever REMOVE actions, so the difference is what this pass planned and will
+	// not carry out. The next pass has to read everything to find those paths again: the evidence
+	// that planned them — a local observation, an announced remote change — was consumed here.
+	let planned = actions.len();
 	let actions = drop_blocked(actions, &prep.blocked_paths(), &prep.ignored_roots());
 	let (actions, over_ignored) = withhold_deletions_over_unreachable(
 		actions,
-		&prep.unknown_remote,
+		&prep.facts.unknown_remote,
 		&prep.holds.held_remote,
-		[&prep.ignored_local, &prep.ignored_remote],
-		&prep.ignore_blocked,
+		[&prep.facts.ignored_local, &prep.facts.ignored_remote],
+		&prep.blocked_rules(),
 	);
+	let dropped = planned - actions.len();
 	let deferred_paths = plan.deferred_paths + over_ignored;
 	let actions = creates_before_dir_moves(actions);
 	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
@@ -4048,6 +4635,7 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		decision,
 		pass_token,
 		deferred_paths,
+		dropped,
 	}
 }
 
@@ -4375,6 +4963,14 @@ mod tests {
 		);
 		assert_eq!(
 			next_pass_scope(&SyncReport {
+				dropped_actions: 1,
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::UnappliedWork),
+			"an action the pass planned and dropped is named in no changelist any more"
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
 				refused: Some(RefuseReason::LocalCollision),
 				..SyncReport::default()
 			}),
@@ -4601,6 +5197,7 @@ mod tests {
 		let (unknown_remote, never_synced_remote) =
 			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 		Prepared {
+			read: PassRead::Whole(Some(FullPassReason::SafetyNet)),
 			record: PairRecord {
 				id: PAIR,
 				local_root: String::new(),
@@ -4632,15 +5229,119 @@ mod tests {
 			remote_converged: true,
 			remote_emptied: false,
 			failures,
-			unknown_remote,
-			never_synced_remote,
-			ignored_local: BTreeMap::new(),
-			ignored_remote: BTreeMap::new(),
-			ignore_blocked: BTreeSet::new(),
+			facts: PairFacts {
+				unknown_remote,
+				never_synced_remote,
+				..PairFacts::default()
+			},
+			remote_blocked: BTreeSet::new(),
 			remote_rule_errors: Vec::new(),
 			last_ignored: BTreeSet::new(),
 			confirmed: Vec::new(),
 		}
+	}
+
+	/// The assembly self-check of plan 3.6: a map that accounts for the rows it carried and the
+	/// nodes its observations found is accepted, and one that lost a path NO observation covered —
+	/// the bookkeeping error that reads downstream as a deletion — is refused, which sends the
+	/// pass to a whole read instead.
+	#[test]
+	fn the_assembly_check_catches_a_path_no_observation_dropped() {
+		let hash = Blake3Hash::from([7u8; 32]);
+		let baseline = Baseline::from_rows([
+			dir_row("docs", Uuid::new_v4()),
+			file_row("docs/a.txt", Uuid::new_v4(), hash),
+			file_row("keep.txt", Uuid::new_v4(), hash),
+		]);
+		let file_node = |rel: &str| LocalNode {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			size: 4,
+			mtime_millis: 1,
+			content_hash: Some(hash),
+		};
+		// One observation: a COMPLETE walk of `docs`, which found both of its rows again.
+		let scan = LocalScan {
+			nodes: [local_dir("docs"), file_node("docs/a.txt")]
+				.into_iter()
+				.map(|node| (node.rel_path.clone(), node))
+				.collect(),
+			complete: true,
+			errors: Vec::new(),
+			invalid_names: BTreeMap::new(),
+			aliased_dirs: BTreeMap::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+			ignore_blocked: BTreeSet::new(),
+		};
+		let observed = LocalObservations {
+			observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+		let none = BTreeSet::new();
+		let held = BTreeSet::from(["keep.txt".to_string()]);
+		let assembled = |paths: &[&str]| Derived {
+			local: paths
+				.iter()
+				.map(|rel| ((*rel).to_string(), file_node(rel)))
+				.collect(),
+			remote: HashMap::new(),
+			dirty: BTreeSet::new(),
+			held: BTreeSet::new(),
+		};
+
+		assert!(
+			assembly_accounted(
+				&baseline,
+				&assembled(&["docs", "docs/a.txt", "keep.txt"]),
+				&observed,
+				&none
+			),
+			"the walk replaced its own two rows and the third was carried: that is the whole tree"
+		);
+		assert!(
+			!assembly_accounted(
+				&baseline,
+				&assembled(&["docs", "docs/a.txt"]),
+				&observed,
+				&none
+			),
+			"a row outside every observation went missing and the check passed it — that is the \
+			 shape that reads as a deletion"
+		);
+		// The same map, with `keep.txt` HELD instead: a held row is in no map on purpose, and the
+		// count of them is what tells the two apart. `keep.txt` gets no observation at all — the
+		// shape a hidden path or a path with no reading takes — so nothing else accounts for it.
+		assert!(
+			assembly_accounted(
+				&baseline,
+				&assembled(&["docs", "docs/a.txt"]),
+				&observed,
+				&held
+			),
+			"a row this pass holds is in neither map by design"
+		);
+		assert!(
+			!assembly_accounted(
+				&baseline,
+				&assembled(&["docs", "docs/a.txt", "keep.txt"]),
+				&observed,
+				&held
+			),
+			"a held row that is in the map anyway means the two do not describe the same tree"
+		);
+		assert!(
+			!assembly_accounted(
+				&baseline,
+				&assembled(&["docs", "docs/a.txt", "keep.txt", "invented.txt"]),
+				&observed,
+				&none
+			),
+			"a path no row and no observation named appeared in the map"
+		);
 	}
 
 	fn dir_row(rel: &str, uuid: Uuid) -> BaselineEntry {
@@ -5301,10 +6002,10 @@ mod tests {
 			&[],
 		);
 		let mut prep = prepared(SyncMode::TwoWay, baseline, local, remote, HashMap::new());
-		prep.local_scan
+		prep.facts
 			.invalid_names
 			.insert("docs/CON".to_string(), "reserved".to_string());
-		prep.local_scan
+		prep.facts
 			.aliased_dirs
 			.insert("docs/link".to_string(), "docs/sub".to_string());
 		let (actions, unsyncable) = run_prepared(prep);
@@ -5404,9 +6105,12 @@ mod tests {
 	/// `docs/` synced and now ignored by the root `.filenignore`, on both sides.
 	fn ignoring_docs(prep: &mut Prepared) {
 		let decision = by_root_file("docs/");
-		prep.ignored_local
+		prep.facts
+			.ignored_local
 			.insert("docs".to_string(), decision.clone());
-		prep.ignored_remote.insert("docs".to_string(), decision);
+		prep.facts
+			.ignored_remote
+			.insert("docs".to_string(), decision);
 	}
 
 	/// The baseline rows a pass that found `roots` ignored leaves behind.
@@ -5562,7 +6266,7 @@ mod tests {
 			view(Vec::new(), Vec::new(), &[]),
 			HashMap::new(),
 		);
-		prep.ignored_local.extend([
+		prep.facts.ignored_local.extend([
 			("docs".to_string(), by_root_file("docs/")),
 			("docs b".to_string(), hidden_by(IgnoreLevel::User, "docs ?")),
 			(
@@ -5570,7 +6274,7 @@ mod tests {
 				hidden_by(IgnoreLevel::Default, ".DS_Store"),
 			),
 		]);
-		prep.ignored_remote.extend([
+		prep.facts.ignored_remote.extend([
 			// The same path, hidden there by another line: the local side's is the one reported.
 			("docs".to_string(), hidden_by(IgnoreLevel::User, "*ocs")),
 			(
@@ -5637,7 +6341,7 @@ mod tests {
 				view(Vec::new(), Vec::new(), &[]),
 				HashMap::new(),
 			);
-			pulled.ignored_local.insert(
+			pulled.facts.ignored_local.insert(
 				"docs/node_modules".to_string(),
 				hidden_by(level.clone(), "node_modules/"),
 			);
@@ -5648,7 +6352,7 @@ mod tests {
 				remote_side,
 				HashMap::new(),
 			);
-			pushed.ignored_remote.insert(
+			pushed.facts.ignored_remote.insert(
 				"docs/node_modules".to_string(),
 				hidden_by(level.clone(), "node_modules/"),
 			);
@@ -5758,9 +6462,11 @@ mod tests {
 			let mut still = build();
 			still.last_ignored.insert("a.psd".to_string());
 			still
+				.facts
 				.ignored_local
 				.insert("a.psd".to_string(), hidden_by(IgnoreLevel::User, "*.psd"));
 			still
+				.facts
 				.ignored_remote
 				.insert("a.psd".to_string(), hidden_by(IgnoreLevel::User, "*.psd"));
 			let screened = reconcile_and_screen(&still, screen_state(&still));
@@ -5785,9 +6491,10 @@ mod tests {
 			view(Vec::new(), Vec::new(), &[]),
 			HashMap::new(),
 		);
-		prep.ignored_local
+		prep.facts
+			.ignored_local
 			.insert("build".to_string(), hidden_by(IgnoreLevel::User, "build/"));
-		prep.ignore_blocked.insert("locked".to_string());
+		prep.facts.ignore_blocked.insert("locked".to_string());
 		prep.last_ignored = ["build/cache", "locked/tmp", "held", "released"]
 			.map(String::from)
 			.into();
@@ -5879,7 +6586,7 @@ mod tests {
 			view(Vec::new(), Vec::new(), &[]),
 			HashMap::new(),
 		);
-		pulled.ignore_blocked.insert("docs/sub".to_string());
+		pulled.facts.ignore_blocked.insert("docs/sub".to_string());
 		let mut pushed = prepared(
 			SyncMode::TwoWay,
 			docs.baseline(),
@@ -5895,7 +6602,7 @@ mod tests {
 			),
 			HashMap::new(),
 		);
-		pushed.ignore_blocked.insert("docs/sub".to_string());
+		pushed.facts.ignore_blocked.insert("docs/sub".to_string());
 
 		for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
 			let screened = reconcile_and_screen(&prep, screen_state(&prep));
@@ -5913,6 +6620,11 @@ mod tests {
 			assert!(!deletes("docs"), "{side}: {actions:?}");
 			assert!(deletes("docs/a.txt"), "{side}: {actions:?}");
 			assert_eq!(screened.deferred_paths, 1, "{side}");
+			assert!(
+				screened.dropped > 0,
+				"{side}: the withheld deletion was planned and dropped, so the next pass has to \
+				 read everything to plan it again"
+			);
 		}
 	}
 
@@ -5947,7 +6659,8 @@ mod tests {
 				docs_remote(),
 				HashMap::new(),
 			);
-			prep.ignored_local
+			prep.facts
+				.ignored_local
 				.insert("docs".to_string(), hidden_by(IgnoreLevel::User, "docs/"));
 			let roots = prep.ignored_roots();
 			let (actions, _) = run_prepared(prep);
@@ -5979,7 +6692,8 @@ mod tests {
 				),
 				HashMap::new(),
 			);
-			prep.ignored_remote
+			prep.facts
+				.ignored_remote
 				.insert("docs".to_string(), hidden_by(IgnoreLevel::User, "docs/"));
 			let (actions, _) = run_prepared(prep);
 			assert!(actions.is_empty(), "{mode:?}: {actions:?}");
@@ -6022,11 +6736,15 @@ mod tests {
 			remote_at("documents"),
 			HashMap::new(),
 		);
-		prep.ignored_local
+		prep.facts
+			.ignored_local
 			.insert("docs/build".to_string(), in_docs("docs"));
-		prep.ignored_remote
+		prep.facts
+			.ignored_remote
 			.insert("documents/cache".to_string(), by_user());
-		prep.ignore_blocked.insert("docs/unreadable".to_string());
+		prep.facts
+			.ignore_blocked
+			.insert("docs/unreadable".to_string());
 		prep.fold_dir_moves();
 		assert_eq!(
 			prep.dir_moves,
@@ -6037,15 +6755,15 @@ mod tests {
 			}]
 		);
 		assert_eq!(
-			prep.ignored_local,
+			prep.facts.ignored_local,
 			BTreeMap::from([("documents/build".to_string(), in_docs("documents"))])
 		);
 		assert_eq!(
-			prep.ignored_remote,
+			prep.facts.ignored_remote,
 			BTreeMap::from([("documents/cache".to_string(), by_user())])
 		);
 		assert_eq!(
-			prep.ignore_blocked,
+			prep.facts.ignore_blocked,
 			BTreeSet::from(["documents/unreadable".to_string()])
 		);
 
@@ -6057,11 +6775,15 @@ mod tests {
 			remote_at("docs"),
 			HashMap::new(),
 		);
-		prep.ignored_local
+		prep.facts
+			.ignored_local
 			.insert("documents/build".to_string(), by_user());
-		prep.ignored_remote
+		prep.facts
+			.ignored_remote
 			.insert("docs/cache".to_string(), in_docs("docs"));
-		prep.ignore_blocked.insert("docs/unreadable".to_string());
+		prep.facts
+			.ignore_blocked
+			.insert("docs/unreadable".to_string());
 		prep.fold_dir_moves();
 		assert!(
 			matches!(&prep.dir_moves[..], [SyncAction::MoveRemote { to_path, .. }] if to_path == "documents"),
@@ -6069,15 +6791,15 @@ mod tests {
 			prep.dir_moves
 		);
 		assert_eq!(
-			prep.ignored_local,
+			prep.facts.ignored_local,
 			BTreeMap::from([("documents/build".to_string(), by_user())])
 		);
 		assert_eq!(
-			prep.ignored_remote,
+			prep.facts.ignored_remote,
 			BTreeMap::from([("documents/cache".to_string(), in_docs("documents"))])
 		);
 		assert_eq!(
-			prep.ignore_blocked,
+			prep.facts.ignore_blocked,
 			BTreeSet::from(["documents/unreadable".to_string()])
 		);
 	}
@@ -6194,7 +6916,9 @@ mod tests {
 		);
 		let ignored: BTreeSet<String> = scan.ignored.keys().cloned().collect();
 		let blocked = scan
-			.blocked_paths()
+			.invalid_names
+			.keys()
+			.chain(scan.aliased_dirs.keys())
 			.chain(&ignored)
 			.chain(&scan.ignore_blocked)
 			.cloned()
