@@ -316,8 +316,26 @@ impl Baseline {
 	}
 
 	/// Every row's path, parent before child.
+	///
+	/// No pass asks for this: what a pass wants is a question answered per path, which
+	/// [`visit_row_paths`](Self::visit_row_paths) does without the allocation. It stays for the probe,
+	/// which measures what materializing them costs, and for the tests, which compare against it.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(super) fn paths(&self) -> impl Iterator<Item = String> + '_ {
 		self.walk(NodeId::ROOT, String::new()).map(|(_, path)| path)
+	}
+
+	/// Every row's path, parent before child, handed to `visit` as a slice of the ONE buffer the
+	/// walk reuses — the borrowing form of [`paths`](Self::paths).
+	///
+	/// It is what a caller that only asks a QUESTION about each path uses: a whole-tree question then
+	/// costs no allocation at all, where `paths` costs one per row. A caller that needs to keep a
+	/// path still has to copy it, which is the point — the buffer is gone by the next row.
+	pub(super) fn visit_row_paths(&self, mut visit: impl FnMut(&str)) {
+		let mut walk = self.walk(NodeId::ROOT, String::new());
+		while walk.next_row().is_some() {
+			visit(&walk.path);
+		}
 	}
 
 	/// Every row STRICTLY under `root`.
@@ -808,10 +826,11 @@ struct Walk<'a> {
 	path: String,
 }
 
-impl Iterator for Walk<'_> {
-	type Item = (NodeId, String);
-
-	fn next(&mut self) -> Option<Self::Item> {
+impl Walk<'_> {
+	/// Advance to the next row, leaving its path in [`path`](Self::path): the borrowing form of
+	/// [`Iterator::next`], which clones that path out. One buffer for the whole walk rather than a
+	/// `String` per row, which is what lets a caller ask a question about every path for free.
+	fn next_row(&mut self) -> Option<NodeId> {
 		loop {
 			let &(id, visited, _) = self.stack.last()?;
 			let kids = self.baseline.kids(id);
@@ -832,9 +851,18 @@ impl Iterator for Walk<'_> {
 			self.path.push_str(self.baseline.name(child));
 			self.stack.push((child, 0, before));
 			if self.baseline.is_row(child) {
-				return Some((child, self.path.clone()));
+				return Some(child);
 			}
 		}
+	}
+}
+
+impl Iterator for Walk<'_> {
+	type Item = (NodeId, String);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let id = self.next_row()?;
+		Some((id, self.path.clone()))
 	}
 }
 
@@ -1239,6 +1267,40 @@ mod tests {
 		] {
 			assert_eq!(cursor.get(path), baseline.get(path), "{path}");
 		}
+	}
+
+	/// The borrowing walk is what a pass reads the tree with, so it has to hand out exactly the
+	/// paths the owning one does — in the same order, over a tree that holds a path-only node, two
+	/// siblings that fold together and nesting on both sides of them — and it has to do it again on a
+	/// second walk, since it reuses one buffer.
+	#[test]
+	fn visiting_the_paths_hands_out_what_collecting_them_does() {
+		let baseline = Baseline::from_rows([
+			dir("a"),
+			file("a/x.txt", Uuid::new_v4(), [1; 32]),
+			file("a/X.txt", Uuid::new_v4(), [2; 32]),
+			// Under `a/deep`, which is a path with no row of its own.
+			file("a/deep/y.txt", Uuid::new_v4(), [3; 32]),
+			file("a/deep/nested/z.txt", Uuid::new_v4(), [4; 32]),
+			file("b.txt", Uuid::new_v4(), [5; 32]),
+		]);
+		let owned: Vec<String> = baseline.paths().collect();
+
+		let mut visited = Vec::new();
+		baseline.visit_row_paths(|path| visited.push(path.to_string()));
+		assert_eq!(visited, owned);
+
+		let mut again = Vec::new();
+		baseline.visit_row_paths(|path| again.push(path.to_string()));
+		assert_eq!(
+			again, owned,
+			"the reused buffer must not leak between walks"
+		);
+
+		let empty = Baseline::default();
+		let mut none = Vec::new();
+		empty.visit_row_paths(|path| none.push(path.to_string()));
+		assert!(none.is_empty(), "a pair with no rows visits nothing");
 	}
 
 	/// A row cannot be written for the pair root itself: the store's key includes a path, and a
