@@ -180,7 +180,7 @@ impl LocalScan {
 }
 
 /// Log `error` and collect it.
-fn record(errors: &mut Vec<ScanError>, root: &Path, error: ScanError) {
+pub(super) fn record(errors: &mut Vec<ScanError>, root: &Path, error: ScanError) {
 	tracing::warn!("local scan of {}: {error}", root.display());
 	errors.push(error);
 }
@@ -199,9 +199,15 @@ fn unfollowable_symlink(err: &walkdir::Error) -> bool {
 }
 
 /// The root-relative path of the directory `entry` links to, if `entry` is a symlinked directory
-/// whose canonical target lies inside `canonical_root`.
-fn alias_target(entry: &walkdir::DirEntry, canonical_root: Option<&Path>) -> Option<String> {
-	if entry.depth() == 0 || !entry.path_is_symlink() || !entry.file_type().is_dir() {
+/// whose canonical target lies inside `canonical_root`. `depth` is the entry's depth below the PAIR
+/// ROOT, which is the one directory the rule does not apply to: a root reached through a symlink
+/// (macOS's `/var`) is the pair's anchor, not an alias of something else it syncs.
+fn alias_target(
+	entry: &walkdir::DirEntry,
+	canonical_root: Option<&Path>,
+	depth: usize,
+) -> Option<String> {
+	if depth == 0 || !entry.path_is_symlink() || !entry.file_type().is_dir() {
 		return None;
 	}
 	let target = std::fs::canonicalize(entry.path()).ok()?;
@@ -214,7 +220,7 @@ fn alias_target(entry: &walkdir::DirEntry, canonical_root: Option<&Path>) -> Opt
 /// than a second copy of the rules, so the scan can never disagree with what an upload does. Only
 /// the LAST component is checked: every ancestor is itself a scanned entry that was checked when
 /// the walk reached it.
-fn name_rejection(rel_path: &str) -> Option<String> {
+pub(super) fn name_rejection(rel_path: &str) -> Option<String> {
 	let name = rel_path.rsplit('/').next()?;
 	ValidatedName::try_from(name).err().map(|e| e.to_string())
 }
@@ -278,7 +284,11 @@ pub(super) fn hash_file(path: &Path) -> std::io::Result<Blake3Hash> {
 
 /// The fast-path: reuse the baseline's content hash when the file's `(size, mtime)` are unchanged,
 /// so an untouched file is never re-hashed. `None` means "diverged or unknown — must hash".
-fn fast_path_hash(baseline: Option<&BaselineEntry>, size: u64, mtime: i64) -> Option<Blake3Hash> {
+pub(super) fn fast_path_hash(
+	baseline: Option<&BaselineEntry>,
+	size: u64,
+	mtime: i64,
+) -> Option<Blake3Hash> {
 	let entry = baseline?;
 	if entry.kind == NodeKind::File && entry.size == Some(size) && entry.local_mtime == Some(mtime)
 	{
@@ -300,7 +310,7 @@ pub(crate) enum RuleFiles {
 }
 
 impl RuleFiles {
-	fn reads(&self, dir: &str) -> bool {
+	pub(super) fn reads(&self, dir: &str) -> bool {
 		match self {
 			Self::Read => true,
 			Self::Only(dirs) => dirs.contains(dir),
@@ -333,7 +343,7 @@ pub(crate) fn rule_file_metadata(dir_path: &Path) -> std::io::Result<Option<std:
 /// file is no rules. A file that cannot be read, that the remote side would refuse (see
 /// [`rule_file_text`]) or that does not compile at all blocks `dir`: guessing could push what the
 /// user meant to hide. A bad line is only reported.
-fn load_rule_file(
+pub(super) fn load_rule_file(
 	root: &Path,
 	dir: &str,
 	dir_path: &Path,
@@ -409,7 +419,7 @@ pub(crate) fn scan_local(
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
 ) -> (LocalScan, IgnoreRules) {
-	scan_local_watched(root, baseline, rules, rule_files, &mut |_| {})
+	scan_local_watched(root, "", baseline, rules, &rule_files, &mut |_| {})
 }
 
 /// [`scan_local`], with a hook called for every entry the walker lists, just before the scan reads
@@ -418,11 +428,26 @@ pub(crate) fn scan_local(
 /// to survive without calling the tree partial.
 fn scan_local_watched(
 	root: &Path,
+	start: &str,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
-	rule_files: RuleFiles,
+	rule_files: &RuleFiles,
 	on_listed: &mut dyn FnMut(&Path),
 ) -> (LocalScan, IgnoreRules) {
+	// Where the walk begins, and how far below the root that is. Every entry is keyed against the
+	// ROOT, so a subtree walk produces the very keys a whole-tree walk would; the two rules that go
+	// by depth — the pair's own quarantine directory and the alias rule's exemption for the anchor
+	// itself — are asked about the depth below the root rather than below the start.
+	let start_path = if start.is_empty() {
+		root.to_path_buf()
+	} else {
+		root.join(start)
+	};
+	let start_depth = if start.is_empty() {
+		0
+	} else {
+		start.split('/').count()
+	};
 	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
 	// estimate worth having; a pair with none still gets a walk's worth of room up front.
 	let capacity = baseline.len().max(1024);
@@ -454,7 +479,7 @@ fn scan_local_watched(
 	// targets. A root that does not resolve fails the walk below anyway.
 	let canonical_root = std::fs::canonicalize(root).ok();
 
-	if rule_files.reads("") {
+	if start_depth == 0 && rule_files.reads("") {
 		load_rule_file(
 			root,
 			"",
@@ -465,16 +490,17 @@ fn scan_local_watched(
 		);
 	}
 
-	let walker = walkdir::WalkDir::new(root)
+	let walker = walkdir::WalkDir::new(&start_path)
 		.follow_links(true)
 		.into_iter()
 		.filter_entry(|e| {
-			if e.depth() == 0 {
+			let depth = start_depth + e.depth();
+			if depth == 0 {
 				return true;
 			}
 			// The engine's own files come before every rule, so no pattern can re-include one.
 			// Never descend into our own quarantine dir (it holds locally-deleted items).
-			if e.depth() == 1 && e.file_name() == OsStr::new(QUARANTINE_DIR) {
+			if depth == 1 && e.file_name() == OsStr::new(QUARANTINE_DIR) {
 				return false;
 			}
 			// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this
@@ -508,7 +534,7 @@ fn scan_local_watched(
 				}
 				return false;
 			}
-			if let Some(target) = alias_target(e, canonical_root.as_deref()) {
+			if let Some(target) = alias_target(e, canonical_root.as_deref(), depth) {
 				// Only targets INSIDE the root have a real path that wins. Two links to one directory
 				// outside the root are both still walked, and upload it twice.
 				aliased_dirs.insert(rel_path, target);
@@ -572,8 +598,8 @@ fn scan_local_watched(
 
 		on_listed(entry.path());
 
-		// The root itself is the pair's anchor, not a synced item.
-		if entry.depth() == 0 {
+		// The root itself is the pair's anchor, not a synced item. A subtree walk's start IS one.
+		if start_depth + entry.depth() == 0 {
 			continue;
 		}
 
@@ -723,18 +749,18 @@ fn scan_local_watched(
 		nodes.insert(rel_path, node);
 	}
 
-	// A root that went away DURING the walk answers `NotFound` for every entry it had already
+	// A directory that went away DURING the walk answers `NotFound` for every entry it had already
 	// listed, and each of those was skipped just above as an entry that vanished — which on its own
 	// is indistinguishable from the tree being emptied one file at a time. One stat tells them
-	// apart: if the root itself is gone (a removed volume, a share that dropped, a lazily unmounted
-	// tree), nothing the walk listed is evidence that anything was deleted.
-	if let Err(source) = std::fs::metadata(root) {
+	// apart: if what the walk started from is gone (a removed volume, a share that dropped, a lazily
+	// unmounted tree), nothing the walk listed is evidence that anything was deleted.
+	if let Err(source) = std::fs::metadata(&start_path) {
 		complete = false;
 		record(
 			&mut errors,
 			root,
 			ScanError::Io {
-				rel_path: String::new(),
+				rel_path: start.to_owned(),
 				source,
 			},
 		);
@@ -1124,9 +1150,10 @@ mod tests {
 		let baseline = HashMap::new();
 		let (scan, _) = scan_local_watched(
 			&root,
+			"",
 			&tree(&baseline),
 			IgnoreRules::default(),
-			RuleFiles::Read,
+			&RuleFiles::Read,
 			// Removed the moment the walker hands the entry over, before the scan stats it.
 			&mut |path| {
 				if path.ends_with("temp.txt") {
@@ -1177,9 +1204,10 @@ mod tests {
 		let mut swept = false;
 		let (scan, _) = scan_local_watched(
 			&root,
+			"",
 			&tree(&baseline),
 			IgnoreRules::default(),
-			RuleFiles::Read,
+			&RuleFiles::Read,
 			// The first time a child of `outer` is listed, every child of `outer` goes — while the
 			// walk still holds that directory's open stream and has yet to descend into any of them.
 			&mut |path| {
@@ -1239,9 +1267,10 @@ mod tests {
 		let mut blocked = false;
 		let (scan, _) = scan_local_watched(
 			&root,
+			"",
 			&tree(&baseline),
 			IgnoreRules::default(),
-			RuleFiles::Read,
+			&RuleFiles::Read,
 			// Whichever of the two the walk lists FIRST is made unreadable before the scan hashes
 			// it, so it claims the folded name and then bails. Which one that is depends on the
 			// directory's order, and the answer must not.
@@ -1289,9 +1318,10 @@ mod tests {
 		let mut gone = false;
 		let (scan, _) = scan_local_watched(
 			&root,
+			"",
 			&tree(&baseline),
 			IgnoreRules::default(),
-			RuleFiles::Read,
+			&RuleFiles::Read,
 			&mut |path| {
 				if !gone && path.parent() == Some(root.as_path()) {
 					gone = true;
