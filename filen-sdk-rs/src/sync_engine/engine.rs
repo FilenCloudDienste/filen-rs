@@ -1299,7 +1299,7 @@ impl Prepared {
 	fn fold_dir_moves(&mut self) {
 		self.dir_moves = plan::fold_dir_moves(
 			self.record.mode,
-			Arc::make_mut(&mut self.baseline),
+			&mut self.baseline,
 			&mut self.local_scan.nodes,
 			&mut self.remote_view.nodes,
 			&self.holds.held_remote,
@@ -2520,14 +2520,18 @@ impl SyncEngine {
 	/// A pass does this itself; this is for the stretches where none runs.
 	async fn sweep_confirmations(&self, pair: PairId) -> Result<(), Error> {
 		let store = self.pair_store(pair).await?;
-		let mut baseline: HashMap<String, BaselineEntry> =
-			off_store(&store, move |store| store.entries(pair))
-				.await?
-				.map_err(|e| db_error(e, "loading the baseline"))?
-				.into_iter()
-				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect();
-		let advanced = self.confirm_pushes(&mut baseline, &HashMap::new()).await;
+		let mut baseline = off_store(&store, move |store| store.baseline(pair))
+			.await?
+			.map_err(|e| db_error(e, "loading the baseline"))?;
+		// A pair with nothing awaiting confirmation is the steady state, and the sweep runs in the
+		// stretches where no pass does: it must not copy the resident map to find that out. The
+		// gate `prepare` uses, and the filter all three confirmation steps already apply.
+		if !baseline.values().any(plan::awaits_confirmation) {
+			return Ok(());
+		}
+		let advanced = self
+			.confirm_pushes(Arc::make_mut(&mut baseline), &HashMap::new())
+			.await;
 		if advanced.is_empty() {
 			return Ok(());
 		}
@@ -2622,12 +2626,13 @@ impl SyncEngine {
 		};
 		let store = self.pair_store(pair).await?;
 		let now = Utc::now().timestamp_millis();
-		// The pair's three whole-tree reads in ONE hop off the runtime thread. The baseline is a
-		// row per tracked item and is the widest read of the pass; the other two ride along rather
-		// than paying for a hop each.
-		let (baseline_entries, failures, last_ignored) = off_store(&store, move |store| {
-			let entries = store
-				.entries(pair)
+		// The pair's three reads in ONE hop off the runtime thread. The baseline comes from the
+		// store's resident copy, which costs a `SELECT` over the whole pair the FIRST time anything
+		// asks for it and an `Arc` clone every time after (see [`BaselineStore::baseline`]); the
+		// other two ride along rather than paying for a hop each.
+		let (mut baseline, failures, last_ignored) = off_store(&store, move |store| {
+			let baseline = store
+				.baseline(pair)
 				.map_err(|e| db_error(e, "loading the baseline"))?;
 			let mut failures = store
 				.failures(pair)
@@ -2636,14 +2641,9 @@ impl SyncEngine {
 			let last_ignored = store
 				.ignored_roots(pair)
 				.map_err(|e| db_error(e, "loading the recorded ignored paths"))?;
-			Ok::<_, Error>((entries, failures, last_ignored))
+			Ok::<_, Error>((baseline, failures, last_ignored))
 		})
 		.await??;
-
-		let mut baseline_map: HashMap<String, BaselineEntry> = baseline_entries
-			.into_iter()
-			.map(|entry| (entry.rel_path.clone(), entry))
-			.collect();
 
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
@@ -2674,9 +2674,16 @@ impl SyncEngine {
 		// view — before this engine's own writes are folded into it, and before the baseline is
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
-		let mut confirmed = plan::confirm_agreed_content(&mut baseline_map, &view.nodes);
-		confirmed.extend(self.confirm_pushes(&mut baseline_map, &view.nodes).await);
-		let baseline: Arc<HashMap<String, BaselineEntry>> = Arc::new(baseline_map);
+		// Asked before the map is touched: the confirmation advances the rows an unconfirmed push
+		// left behind, and a pair with none — the steady state — must not copy the whole resident
+		// baseline to find that out.
+		let mut confirmed = Vec::new();
+		if baseline.values().any(plan::awaits_confirmation) {
+			let rows = Arc::make_mut(&mut baseline);
+			confirmed = plan::confirm_agreed_content(rows, &view.nodes);
+			confirmed.extend(self.confirm_pushes(rows, &view.nodes).await);
+		}
+		let baseline = baseline;
 
 		// `set_user_ignore` refuses a text that does not compile, so a stored one fails only if this
 		// build reads patterns differently from the one that stored it. Guessing what it hides could
