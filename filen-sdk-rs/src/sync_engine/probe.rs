@@ -42,7 +42,9 @@ use crate::{
 use super::{
 	SyncMode,
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
+	derive::{self, Derived},
 	ignore::{IgnoreRules, parse_user_ignore},
+	observe,
 	plan::{self, PassHolds, RemoteNode},
 	scan::{self, LocalNode, LocalScan, RuleFiles},
 	tree::Baseline,
@@ -284,6 +286,11 @@ struct Probe {
 
 impl Probe {
 	fn record(&mut self, phase: &str, items: usize, elapsed: Duration, detail: &str) {
+		debug_assert!(
+			!detail.contains(['\t', '\n']),
+			"a detail column with a tab or a newline in it splits the row into more columns than \
+			 the header names: {detail:?}"
+		);
 		let micros_per_item = if items == 0 {
 			0.0
 		} else {
@@ -442,6 +449,61 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 	let mut local = scan.nodes;
 	let mut remote = view.nodes;
 	let held = BTreeSet::new();
+	plan::fold_dir_moves(
+		SyncMode::TwoWay,
+		&mut baseline,
+		&mut local,
+		&mut remote,
+		&held,
+	);
+	plan::reconcile(
+		SyncMode::TwoWay,
+		&baseline,
+		&local,
+		&remote,
+		&PassHolds::default(),
+	)
+	.actions
+	.len()
+}
+
+/// What a CHANGE-SCOPED pass does locally, end to end: the resident baseline, the two maps derived
+/// from its rows, the re-observation of the dirty paths, the directory-move fold and the reconcile
+/// over the complete maps.
+///
+/// The fold is here because `prepare_scoped` ends with it exactly as `prepare_whole` does, and
+/// because [`pass_pure`] pays it: a phase that skipped it would credit change-scoping with the cost
+/// of a step the real pass still runs every time.
+///
+/// What a whole pass does and this does not: the cache snapshot, both view builds, and the walk of
+/// the tree. What it leaves out that a real pass does is applying the announced remote changes,
+/// which costs one map operation per announced change and nothing per tree node.
+///
+/// Returns the action count, so a phase that was supposed to plan something can say whether it did.
+fn pass_scoped(
+	fixture: &Fixture,
+	store: &BaselineStore,
+	pair: i64,
+	dirty: BTreeSet<String>,
+) -> usize {
+	let mut baseline = store.baseline(pair).expect("reading the baseline");
+	let mut derived = derive::from_baseline(&baseline, dirty.clone());
+	let (observations, _rules) = observe::observe_local(
+		&fixture.root,
+		&baseline,
+		probe_rules(),
+		&RuleFiles::Read,
+		&dirty,
+	);
+	derive::merge_local(&mut derived.local, &baseline, &observations);
+	let Derived {
+		mut local,
+		mut remote,
+		held,
+		..
+	} = derived;
+	// The held paths are the rows that record one side only, which is what the pass folds with too
+	// (they reach it as `PassHolds::held_remote`).
 	plan::fold_dir_moves(
 		SyncMode::TwoWay,
 		&mut baseline,
@@ -1095,6 +1157,53 @@ pub fn run() -> String {
 			"{actions} actions; baseline read + snapshot + both views + warm scan + fold + \
 			 reconcile, no network and no apply"
 		),
+	);
+
+	// The same tree read the other way: ONE file changed, and only that file's path in the dirty
+	// set. This is the phase the whole change-scoped design exists for, so it is measured against
+	// `pass_pure` directly above it, on the same fixture, in the same run.
+	let changed = store
+		.entries(pair)
+		.expect("reading the baseline")
+		.into_iter()
+		.find(|entry| entry.kind == NodeKind::File)
+		.expect("the probe tree holds files")
+		.rel_path;
+	fs::write(fixture.root.join(&changed), b"changed by the probe")
+		.expect("changing one probe file");
+	let dirty = BTreeSet::from([changed.clone()]);
+	let (scoped_actions, scoped) = timed(|| pass_scoped(&fixture, &store, pair, dirty.clone()));
+	probe.record(
+		"pass_one_file_changed",
+		nodes,
+		scoped,
+		&format!(
+			"{scoped_actions} action(s) for 1 changed file ({changed}); baseline + derived maps + \
+			 one re-observed path + fold + reconcile, no walk and no snapshot"
+		),
+	);
+	assert_eq!(
+		scoped_actions, 1,
+		"one changed file must plan exactly one action, or this phase is timing the wrong thing"
+	);
+
+	// The floor the same machinery costs with NOTHING dirty. The engine does not pay it — a wake
+	// with an empty change list returns before it reads anything — so this is the cost that
+	// skipping an idle wake avoids, not a cost any pass incurs.
+	let (idle_actions, idle) = timed(|| pass_scoped(&fixture, &store, pair, BTreeSet::new()));
+	probe.record(
+		"pass_scoped_idle_floor",
+		nodes,
+		idle,
+		&format!(
+			"{idle_actions} action(s); what a change-scoped pass over an EMPTY dirty set would \
+			 cost — `run_pass` skips it outright, so no pass pays this"
+		),
+	);
+	assert_eq!(
+		idle_actions, 0,
+		"a converged pair with nothing dirty must plan nothing, or this phase is timing a pass that \
+		 stopped deciding paths"
 	);
 
 	// What `untrack_ignored` pays per pass at the shape the built-in rules produce on macOS: a
