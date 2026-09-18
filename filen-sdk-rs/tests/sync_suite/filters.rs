@@ -136,12 +136,12 @@ fn clean(report: &SyncReport) {
 }
 
 fn by_root_file(rel_path: &str, pattern: &str, tracked: bool) -> IgnoredPath {
-	IgnoredPath {
-		rel_path: rel_path.to_string(),
-		level: IgnoreLevel::File { dir: String::new() },
-		pattern: pattern.to_string(),
+	IgnoredPath::new(
+		rel_path,
+		IgnoreLevel::File { dir: String::new() },
+		pattern,
 		tracked,
-	}
+	)
 }
 
 // ===========================================================================
@@ -272,13 +272,15 @@ async fn filter_remote_only_filenignore_applies() {
 
 	let hidden = || {
 		["x/a.tmp", "x/b.tmp"]
-			.map(|rel_path| IgnoredPath {
-				rel_path: rel_path.to_string(),
-				level: IgnoreLevel::File {
-					dir: "x".to_string(),
-				},
-				pattern: "*.tmp".to_string(),
-				tracked: false,
+			.map(|rel_path| {
+				IgnoredPath::new(
+					rel_path,
+					IgnoreLevel::File {
+						dir: "x".to_string(),
+					},
+					"*.tmp",
+					false,
+				)
 			})
 			.to_vec()
 	};
@@ -472,12 +474,7 @@ async fn filter_unignore_holds_a_mirror_deletion_like_a_first_sync() {
 	assert_eq!(hidden.remotely_trashed, 0, "{hidden:?}");
 	assert_eq!(
 		hidden.ignored,
-		vec![IgnoredPath {
-			rel_path: "a.psd".to_string(),
-			level: IgnoreLevel::User,
-			pattern: "*.psd".to_string(),
-			tracked: false,
-		}]
+		vec![IgnoredPath::new("a.psd", IgnoreLevel::User, "*.psd", false)]
 	);
 
 	sc.engine.set_user_ignore("").await.unwrap();
@@ -786,12 +783,7 @@ async fn filter_user_level_all_pairs() {
 	clean(&rep2);
 	assert_eq!(
 		rep1.ignored,
-		vec![IgnoredPath {
-			rel_path: "a.psd".to_string(),
-			level: IgnoreLevel::User,
-			pattern: "*.psd".to_string(),
-			tracked: false,
-		}]
+		vec![IgnoredPath::new("a.psd", IgnoreLevel::User, "*.psd", false)]
 	);
 	assert!(rep2.ignored.is_empty(), "{rep2:?}");
 

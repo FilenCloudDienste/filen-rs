@@ -950,11 +950,13 @@ async fn path_19_dot_and_dotdot_literal_entries() {
 
 	let reported: Vec<UnsyncablePath> = [".", ".."]
 		.into_iter()
-		.map(|name| UnsyncablePath {
-			rel_path: name.to_string(),
-			reason: UnsyncableReason::RemoteInvalidName {
-				name: name.to_string(),
-			},
+		.map(|name| {
+			UnsyncablePath::new(
+				name,
+				UnsyncableReason::RemoteInvalidName {
+					name: name.to_string(),
+				},
+			)
 		})
 		.collect();
 	for pass in 1..=2 {

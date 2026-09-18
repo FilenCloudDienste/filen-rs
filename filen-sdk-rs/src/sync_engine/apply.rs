@@ -60,6 +60,7 @@ use tokio::{sync::mpsc::UnboundedSender, time::Instant};
 
 /// Outcome of one apply pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SyncReport {
 	pub downloaded: usize,
 	pub uploaded: usize,
@@ -1580,11 +1581,11 @@ async fn apply_transfer(
 					))
 				});
 				return Ok(Transfer::Overwrote {
-					conflict: Box::new(PlannedConflict {
-						rel_path: rel_path.clone(),
-						local: local.map(|node| node.kind.into()),
-						remote: Some(PlannedNodeKind::File),
-					}),
+					conflict: Box::new(PlannedConflict::new(
+						rel_path.clone(),
+						local.map(|node| node.kind.into()),
+						Some(PlannedNodeKind::File),
+					)),
 					unrecorded,
 				});
 			}
