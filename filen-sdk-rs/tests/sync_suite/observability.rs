@@ -32,6 +32,10 @@ use crate::helpers::*;
 // ---------------------------------------------------------------------------
 
 /// True for the per-action in-progress events (the ones that should tick the progress numerator).
+///
+/// `Quarantined` is deliberately NOT one of them: it is not an applied action but a note riding
+/// along with the download or move that moved a local copy aside, so counting it would put the
+/// numerator above the `Planned` denominator.
 fn is_action_event(e: &SyncEvent) -> bool {
 	matches!(
 		e,

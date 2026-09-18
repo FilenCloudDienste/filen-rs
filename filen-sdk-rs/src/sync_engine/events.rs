@@ -7,7 +7,10 @@
 //! [`SyncEngine::sync_once_observed`](super::SyncEngine::sync_once_observed) (one-shot) or
 //! [`SyncEngine::watch_observed`](super::SyncEngine::watch_observed) (continuous).
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
+	path::PathBuf,
+};
 
 use super::{SyncMode, apply::SyncReport};
 
@@ -17,7 +20,9 @@ use super::{SyncMode, apply::SyncReport};
 /// [`Refused`](Self::Refused), or any number of [`Conflict`](Self::Conflict) /
 /// [`DeletionsHeld`](Self::DeletionsHeld) then [`Planned`](Self::Planned) followed by one
 /// in-progress event per applied action, each possibly trailed by
-/// [`ActionFailed`](Self::ActionFailed)) → [`PassCompleted`](Self::PassCompleted). A pass the pair's
+/// [`ActionFailed`](Self::ActionFailed) or accompanied by
+/// [`Quarantined`](Self::Quarantined) where the action moved a local copy aside)
+/// → [`PassCompleted`](Self::PassCompleted). A pass the pair's
 /// pause cut short, or that could not take the drive lock, reports one
 /// [`Interrupted`](Self::Interrupted) before it completes. A file
 /// transfer ticks [`Progress`](Self::Progress) while it runs.
@@ -80,6 +85,28 @@ pub enum SyncEvent {
 	MovingRemote { from: String, to: String },
 	/// Renaming a local file in place of a re-download (a detected remote move).
 	MovingLocal { from: String, to: String },
+	/// A local copy the pass moved into the pair's quarantine bin to clear the way for a write it
+	/// was about to make: a remote-wins download over a copy the baseline cannot vouch for, or a
+	/// move onto a destination that was occupied by the time the pass got there. `bin_path` is
+	/// where that copy went, under `.filen-sync-trash` in the pair's local root, and the bytes
+	/// stay there until somebody recovers them.
+	///
+	/// Nothing else the pass says names that path: no action failed, and the edit such a copy
+	/// holds is by definition one no scan could see — which is why the write was planned over it
+	/// at all. Without this the file simply reverts and the pass reads as a clean download.
+	///
+	/// Delivered with the action that moved it, always before the pass completes: ahead of a
+	/// transfer's own event where the transfer ran concurrently (like
+	/// [`Progress`](Self::Progress), since a transfer reports when it finishes), after the
+	/// action's event where one was applied serially, and ahead of an
+	/// [`ActionFailed`](Self::ActionFailed) where the write landed but the record of it did not.
+	/// Every path is also listed in
+	/// [`SyncReport::quarantined`](super::SyncReport::quarantined) — including that last case,
+	/// which is the one where nothing else the pass reports is about those bytes at all.
+	///
+	/// Not [`DeletingLocal`](Self::DeletingLocal): that is a propagated remote deletion the pass
+	/// carries out and counts, while this accompanies a WRITE to the same path.
+	Quarantined { rel_path: String, bin_path: PathBuf },
 	/// An individual action failed; the pass continues past it (the failure is also in the report),
 	/// and a failure no transfer to that side can get past — a full disk or a full account — also
 	/// holds back the transfers that write there (see
