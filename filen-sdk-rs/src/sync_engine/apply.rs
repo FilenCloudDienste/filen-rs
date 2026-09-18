@@ -42,6 +42,7 @@ use super::{
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
+	tree::Baseline,
 };
 use crate::{
 	auth::Client,
@@ -214,7 +215,7 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) store: &'a SharedStore,
 	pub(super) local: &'a HashMap<String, LocalNode>,
 	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
-	pub(super) baseline: &'a HashMap<String, BaselineEntry>,
+	pub(super) baseline: &'a Baseline,
 	pub(super) remote: &'a HashMap<String, RemoteNode>,
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
@@ -1475,7 +1476,7 @@ async fn apply_transfer(
 			// just renamed into place. Only when something is actually sitting at the target: an
 			// ordinary download onto free space has nothing to lose and skips the read.
 			let base = match ctx.baseline.get(rel_path) {
-				Some(base) => Some(base.clone()),
+				Some(base) => Some(base),
 				None if path.exists() => locked(ctx.store)
 					.entry(ctx.pair, rel_path)
 					.map_err(db_err)?,
@@ -1889,7 +1890,7 @@ async fn apply_one(
 			stash_move_target(
 				ctx.local_root,
 				to_path,
-				ctx.baseline.get(to_path),
+				ctx.baseline.get(to_path).as_ref(),
 				report,
 				&mut *observer,
 			)
@@ -1900,7 +1901,7 @@ async fn apply_one(
 			std::fs::rename(&from, &to).map_err(io_err)?;
 			let row = moved_file_row(
 				to_path,
-				ctx.baseline.get(from_path),
+				ctx.baseline.get(from_path).as_ref(),
 				ctx.remote.get(to_path),
 				local_mtime_of(&to),
 			);

@@ -33,11 +33,12 @@ use filen_types::crypto::Blake3Hash;
 use unicode_normalization::UnicodeNormalization;
 
 use super::{
-	baseline::{BaselineEntry, NodeKind, Tracked},
+	baseline::{BaselineEntry, NodeKind},
 	ignore::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
 	},
+	tree::Baseline,
 };
 use crate::{
 	fs::name::ValidatedName,
@@ -404,7 +405,7 @@ fn load_rule_file(
 /// matched. The rules come back as the scan used them, for the rest of the pass to match with.
 pub(crate) fn scan_local(
 	root: &Path,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
 ) -> (LocalScan, IgnoreRules) {
@@ -417,7 +418,7 @@ pub(crate) fn scan_local(
 /// to survive without calling the tree partial.
 fn scan_local_watched(
 	root: &Path,
-	baseline: &HashMap<String, BaselineEntry>,
+	baseline: &Baseline,
 	mut rules: IgnoreRules,
 	rule_files: RuleFiles,
 	on_listed: &mut dyn FnMut(&Path),
@@ -442,9 +443,6 @@ fn scan_local_watched(
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
 	let mut ignored_default_untracked = 0usize;
-	// Asked only of a default-rule hit, and it sorts the baseline's keys only if one ever hides a
-	// DIRECTORY — the everyday hit is a `.DS_Store`, which is one lookup.
-	let mut tracked = Tracked::new(baseline);
 	// Shared: the filter fills it, and the walk loop reads it for a rule file it cannot hash.
 	let ignore_blocked = RefCell::new(BTreeSet::new());
 	// Apart from `errors`, which the walk loop writes while the filter is alive.
@@ -500,7 +498,7 @@ fn scan_local_watched(
 				// through the pass costs every later filter its whole directory count. A user-level
 				// or `.filenignore` line makes a root whether or not anything was synced there — the
 				// user named that path, and the report says so.
-				if hit.origin == Origin::Default && !tracked.covers(&rel_path, is_dir) {
+				if hit.origin == Origin::Default && !baseline.tracked(&rel_path, is_dir) {
 					ignored_default_untracked += 1;
 				} else {
 					ignored.insert(rel_path, hit.into());
@@ -673,7 +671,7 @@ fn scan_local_watched(
 			NodeKind::File => {
 				let size = metadata.len();
 				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
-				let reused = fast_path_hash(baseline.get(&rel_path), size, mtime);
+				let reused = fast_path_hash(baseline.get(&rel_path).as_ref(), size, mtime);
 				let content_hash = match reused {
 					Some(hash) => Some(hash),
 					None => match hash_file(entry.path()) {
@@ -770,7 +768,13 @@ mod tests {
 
 	/// A scan with no user level, reading the `.filenignore` files on disk.
 	fn scan_plain(root: &Path, baseline: &HashMap<String, BaselineEntry>) -> LocalScan {
-		scan_local(root, baseline, IgnoreRules::default(), RuleFiles::Read).0
+		scan_local(
+			root,
+			&tree(baseline),
+			IgnoreRules::default(),
+			RuleFiles::Read,
+		)
+		.0
 	}
 
 	fn sorted_paths(scan: &LocalScan) -> Vec<&str> {
@@ -1117,7 +1121,7 @@ mod tests {
 		let baseline = HashMap::new();
 		let (scan, _) = scan_local_watched(
 			&root,
-			&baseline,
+			&tree(&baseline),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 			// Removed the moment the walker hands the entry over, before the scan stats it.
@@ -1170,7 +1174,7 @@ mod tests {
 		let mut swept = false;
 		let (scan, _) = scan_local_watched(
 			&root,
-			&baseline,
+			&tree(&baseline),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 			// The first time a child of `outer` is listed, every child of `outer` goes — while the
@@ -1232,7 +1236,7 @@ mod tests {
 		let mut blocked = false;
 		let (scan, _) = scan_local_watched(
 			&root,
-			&baseline,
+			&tree(&baseline),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 			// Whichever of the two the walk lists FIRST is made unreadable before the scan hashes
@@ -1282,7 +1286,7 @@ mod tests {
 		let mut gone = false;
 		let (scan, _) = scan_local_watched(
 			&root,
-			&baseline,
+			&tree(&baseline),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 			&mut |path| {
@@ -1526,7 +1530,7 @@ mod tests {
 
 		let (scan, rules) = scan_local(
 			&root,
-			&HashMap::new(),
+			&Baseline::default(),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 		);
@@ -1570,7 +1574,7 @@ mod tests {
 		// When the remote copies are the ones that count, the files on disk are ordinary items.
 		let (skipped, rules) = scan_local(
 			&root,
-			&HashMap::new(),
+			&Baseline::default(),
 			IgnoreRules::default(),
 			RuleFiles::Only(BTreeSet::new()),
 		);
@@ -1587,7 +1591,7 @@ mod tests {
 		// Except the ones named: a synced rule file the remote has lost still governs.
 		let (only, rules) = scan_local(
 			&root,
-			&HashMap::new(),
+			&Baseline::default(),
 			IgnoreRules::default(),
 			RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
 		);
@@ -1746,7 +1750,7 @@ mod tests {
 
 		let (scan, rules) = scan_local(
 			&root,
-			&HashMap::new(),
+			&Baseline::default(),
 			IgnoreRules::default(),
 			RuleFiles::Read,
 		);
@@ -1777,5 +1781,10 @@ mod tests {
 		);
 
 		fs::remove_dir_all(&root).ok();
+	}
+
+	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
+	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
+		Baseline::from_rows(rows.values().cloned())
 	}
 }
