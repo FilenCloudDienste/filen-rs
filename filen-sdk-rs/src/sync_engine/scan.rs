@@ -780,6 +780,27 @@ fn scan_local_watched(
 	(scan, rules)
 }
 
+/// [`scan_local`] started at the root-relative directory `start` instead of the pair root: the same
+/// walk over one subtree, producing the same ROOT-relative keys — the directory-level
+/// re-observation of a change-scoped pass (`observe::observe_local`).
+///
+/// `rules` must already carry the `.filenignore` files of `start`'s ancestors, and `start` must not
+/// itself be hidden by them: what a whole-tree walk would have had in force when it reached `start`
+/// is what decides the contents. `observe::observe_local` stats and loads the ancestors for exactly
+/// that reason.
+///
+/// `start` is a node of the scan like any other. Only the pair root is skipped, and only because it
+/// is the pair's anchor rather than a synced item.
+pub(crate) fn scan_subtree(
+	root: &Path,
+	start: &str,
+	baseline: &Baseline,
+	rules: IgnoreRules,
+	rule_files: &RuleFiles,
+) -> (LocalScan, IgnoreRules) {
+	scan_local_watched(root, start, baseline, rules, rule_files, &mut |_| {})
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
@@ -1811,6 +1832,42 @@ mod tests {
 			scan.ignored.is_empty(),
 			"an internal file is not an ignored item: {:?}",
 			scan.ignored
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A subtree walk keys against the pair ROOT and starts at its own directory. The rules that go
+	/// by depth still mean the root: the quarantine bin is the root's own child, so a user directory
+	/// of that name nested deeper is an ordinary item.
+	#[test]
+	fn a_subtree_walk_keys_against_the_root_and_starts_at_its_own_directory() {
+		let root = temp_root();
+		fs::write(root.join("top.txt"), b"t").unwrap();
+		fs::create_dir(root.join(QUARANTINE_DIR)).unwrap();
+		fs::write(root.join(QUARANTINE_DIR).join("trashed.txt"), b"old").unwrap();
+		let nested = root.join("sub").join(QUARANTINE_DIR);
+		fs::create_dir_all(&nested).unwrap();
+		fs::write(nested.join("mine.txt"), b"m").unwrap();
+
+		let (scan, _) = scan_subtree(
+			&root,
+			"sub",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+		);
+
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert_eq!(
+			sorted_paths(&scan),
+			vec![
+				"sub",
+				"sub/.filen-sync-trash",
+				"sub/.filen-sync-trash/mine.txt"
+			],
+			"the start directory is a node, its keys are root-relative, and only the ROOT's own \
+			 quarantine bin is the engine's"
 		);
 
 		fs::remove_dir_all(&root).ok();
