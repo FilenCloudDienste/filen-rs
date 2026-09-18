@@ -2131,6 +2131,13 @@ impl SyncEngine {
 	/// the remote's into the pair's `.filen-sync-trash` bin first: that edit was never uploaded, so
 	/// the download would otherwise destroy the only copy.
 	///
+	/// Returns where in the bin that copy went, so a caller can offer those bytes back without
+	/// walking `.filen-sync-trash` and guessing among ` (N)` siblings — the same thing
+	/// [`SyncEvent::Quarantined`](super::SyncEvent::Quarantined) does for a copy a PASS moved
+	/// aside. `None` when nothing was moved: the two sides held the same content, or the
+	/// resolution kept the local copy. [`KeepBoth`](ConflictResolution::KeepBoth) is `None` too —
+	/// the copy it renames aside stays in the tree, where the caller can already see it.
+	///
 	/// A resolution never interleaves with a pass: a pass still reading the pair, or recording the
 	/// conflicts it read, is waited for, since the rows it writes would overwrite this one. A
 	/// [`paused`](Self::pause_pair) pair stays resolvable — a pause parks a pass between actions,
@@ -2146,7 +2153,7 @@ impl SyncEngine {
 		pair: PairId,
 		rel_path: &str,
 		resolution: ConflictResolution,
-	) -> Result<(), Error> {
+	) -> Result<Option<PathBuf>, Error> {
 		// The gate (refusing an unknown pair) keeps a removal waiting for this call; the lock keeps
 		// it out of a pass's read. The retirement is read AFTER the lock, since a removal may start
 		// while this waits for it.
@@ -2180,12 +2187,15 @@ impl SyncEngine {
 		// A divergence this engine's own push created is resolved against the SERVER's version
 		// history rather than against what the remote holds now — our upload is what it holds.
 		if held.state == BaselineState::Overwritten {
-			self.resolve_overwritten(pair, &record, rel_path, &held, resolution)
+			let quarantined = self
+				.resolve_overwritten(pair, &record, rel_path, &held, resolution)
 				.await?;
 			self.note_resolution(pair).await;
-			return Ok(());
+			return Ok(quarantined);
 		}
 
+		// Where a local copy this resolution moved aside ended up, for the caller to offer back.
+		let mut quarantined = None;
 		let mut winner = resolution;
 		if winner == ConflictResolution::KeepBoth {
 			// Move the losing local copy out of the way FIRST, then resolve the path itself to the
@@ -2207,9 +2217,9 @@ impl SyncEngine {
 			// The losing local edit goes to the bin, as the `Overwritten` shape's does. Anchoring the
 			// row to it instead would let the next pass vouch for it and download straight over it.
 			// With the local side emptied the path resolves the way `KeepBoth` leaves it.
-			let bin = apply::quarantine_local(Path::new(&record.local_root), rel_path)?;
+			quarantined = apply::quarantine_local(Path::new(&record.local_root), rel_path)?;
 			tracing::debug!(
-				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {bin:?}"
+				"resolve_conflict[pair {pair}]: quarantined the local copy of {rel_path:?} as {quarantined:?}"
 			);
 			held.local_kind = None;
 		}
@@ -2225,7 +2235,7 @@ impl SyncEngine {
 		.await?
 		.map_err(|e| db_error(e, "resolving a conflict"))?;
 		self.note_resolution(pair).await;
-		Ok(())
+		Ok(quarantined)
 	}
 
 	/// Record that a resolution is waiting to be applied at a path, so the next pass reads both
@@ -2256,6 +2266,9 @@ impl SyncEngine {
 	/// - [`KeepBoth`](ConflictResolution::KeepBoth): fetch the buried version beside ours as
 	///   `<stem>.old.<ext>`. It has no baseline row, so the next pass uploads it — and both
 	///   clients end up holding both files instead of one of them silently losing an edit.
+	///
+	/// Returns where our own copy went in the bin — the `KeepRemote` branch, the only one that
+	/// moves one — for [`resolve_conflict`](Self::resolve_conflict) to hand on.
 	async fn resolve_overwritten(
 		&self,
 		pair: PairId,
@@ -2263,7 +2276,7 @@ impl SyncEngine {
 		rel_path: &str,
 		held: &BaselineEntry,
 		resolution: ConflictResolution,
-	) -> Result<(), Error> {
+	) -> Result<Option<PathBuf>, Error> {
 		let buried_uuid = held.remote_uuid.ok_or_else(|| {
 			Error::custom(
 				ErrorKind::InvalidState,
@@ -2271,6 +2284,7 @@ impl SyncEngine {
 			)
 		})?;
 		let local_root = Path::new(&record.local_root);
+		let mut quarantined = None;
 		match resolution {
 			ConflictResolution::KeepLocal => {}
 			ConflictResolution::KeepBoth => {
@@ -2315,9 +2329,9 @@ impl SyncEngine {
 				}
 				// Our own copy goes to the bin rather than under the download: the restored version
 				// is what this resolution asked for, and the bytes it replaces are not lost.
-				apply::quarantine_local(local_root, rel_path)?;
+				quarantined = apply::quarantine_local(local_root, rel_path)?;
 				tracing::debug!(
-					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy"
+					"resolve_conflict[pair {pair}]: restored the version buried at {rel_path:?} and quarantined the local copy as {quarantined:?}"
 				);
 			}
 		}
@@ -2327,7 +2341,8 @@ impl SyncEngine {
 		let resolving = rel_path.to_string();
 		off_store(&store, move |store| store.delete_entry(pair, &resolving))
 			.await?
-			.map_err(|e| db_error(e, "resolving a conflict"))
+			.map_err(|e| db_error(e, "resolving a conflict"))?;
+		Ok(quarantined)
 	}
 
 	/// The remote file objects for `uuids`, read whole out of the cache (see
@@ -7082,10 +7097,14 @@ mod tests {
 		let started = std::time::Instant::now();
 		engine.list_pairs().await.unwrap();
 		engine.pause_pair(pair_b).await.unwrap();
-		engine
-			.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
-			.await
-			.unwrap();
+		assert_eq!(
+			engine
+				.resolve_conflict(pair_b, "a.txt", ConflictResolution::KeepLocal)
+				.await
+				.unwrap(),
+			None,
+			"keeping the local side moves no copy into the bin"
+		);
 		let elapsed = started.elapsed();
 		assert!(
 			holding.load(Ordering::SeqCst),
@@ -7842,7 +7861,11 @@ mod tests {
 		// The offline pass fails in its read once it gets the slot, and lets the resolution through.
 		drop(slot);
 		assert!(pass.await.unwrap().is_err());
-		resolving.await.unwrap().unwrap();
+		assert_eq!(
+			resolving.await.unwrap().unwrap(),
+			None,
+			"keeping the local side moves no copy into the bin"
+		);
 		assert_eq!(
 			locked(&engine.pair_store(pair).await.unwrap())
 				.entry(pair, "a.txt")
@@ -7873,10 +7896,13 @@ mod tests {
 		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &converged_conflict(Uuid::new_v4()))
 			.unwrap();
-		engine
-			.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
-			.await
-			.expect("a paused pair must stay resolvable");
+		assert_eq!(
+			engine
+				.resolve_conflict(pair, "a.txt", ConflictResolution::KeepLocal)
+				.await
+				.expect("a paused pair must stay resolvable"),
+			None
+		);
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
@@ -7905,9 +7931,11 @@ mod tests {
 		std::fs::remove_file(&path).ok();
 	}
 
-	/// Keeping the remote side of an ordinary conflict moves the losing local edit to the bin. That
-	/// edit was never uploaded, so the download that follows would otherwise destroy the only copy.
-	/// A local copy that already holds the remote's content has nothing to lose and stays put.
+	/// Keeping the remote side of an ordinary conflict moves the losing local edit to the bin, and
+	/// the call NAMES where it put it: that edit was never uploaded, so the download that follows
+	/// would otherwise destroy the only copy, and a caller offering it back cannot be left to
+	/// guess among the bin's ` (N)` siblings. A local copy that already holds the remote's content
+	/// has nothing to lose, stays put, and there is no path to name.
 	#[tokio::test]
 	async fn keeping_remote_quarantines_a_local_edit_the_remote_never_had() {
 		let path =
@@ -7930,12 +7958,18 @@ mod tests {
 		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &diverged)
 			.unwrap();
-		engine
+		let quarantined = engine
 			.resolve_conflict(pair, "a.txt", ConflictResolution::KeepRemote)
 			.await
-			.unwrap();
+			.unwrap()
+			.expect("the resolution has to say where it put the copy it moved aside");
 		assert_eq!(
-			std::fs::read(root.join(scan::QUARANTINE_DIR).join("a.txt")).unwrap(),
+			quarantined,
+			root.join(scan::QUARANTINE_DIR).join("a.txt"),
+			"the path it named is not where the copy went"
+		);
+		assert_eq!(
+			std::fs::read(&quarantined).unwrap(),
 			b"LOCAL",
 			"the losing local edit must be recoverable from the bin"
 		);
@@ -7957,10 +7991,14 @@ mod tests {
 		locked(&engine.pair_store(pair).await.unwrap())
 			.upsert_entry(pair, &converged)
 			.unwrap();
-		engine
-			.resolve_conflict(pair, "b.txt", ConflictResolution::KeepRemote)
-			.await
-			.unwrap();
+		assert_eq!(
+			engine
+				.resolve_conflict(pair, "b.txt", ConflictResolution::KeepRemote)
+				.await
+				.unwrap(),
+			None,
+			"nothing was moved aside, so there is no path to name"
+		);
 		assert!(root.join("b.txt").exists());
 		assert!(!root.join(scan::QUARANTINE_DIR).join("b.txt").exists());
 

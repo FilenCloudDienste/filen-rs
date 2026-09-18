@@ -1752,10 +1752,14 @@ async fn observ_add_list_conflicts_reads_held_conflicts() {
 		"the held local edit was touched"
 	);
 
-	sc.engine
-		.resolve_conflict(sc.pair, "held.txt", ConflictResolution::KeepLocal)
-		.await
-		.unwrap();
+	assert_eq!(
+		sc.engine
+			.resolve_conflict(sc.pair, "held.txt", ConflictResolution::KeepLocal)
+			.await
+			.unwrap(),
+		None,
+		"keep-local moves no copy into the bin"
+	);
 	assert!(
 		sc.engine.list_conflicts(sc.pair).await.unwrap().is_empty(),
 		"a resolved conflict is still listed"
