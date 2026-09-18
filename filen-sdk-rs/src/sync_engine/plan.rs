@@ -235,7 +235,7 @@ impl SyncAction {
 /// `.`/`..`, and names containing a path separator or NUL — a remote name is untrusted input (a
 /// non-conforming client or, in future, a shared-folder peer could set one), and any of these
 /// would let a pull escape the sync root (path traversal) or corrupt the `/`-joined key.
-fn is_safe_name(name: &str) -> bool {
+pub(super) fn is_safe_name(name: &str) -> bool {
 	!name.is_empty()
 		&& name != "."
 		&& name != ".."
@@ -295,7 +295,7 @@ fn resolve_parent(
 	Ok(parts.join("/"))
 }
 
-fn join_path(parent_path: &str, name: &str) -> String {
+pub(super) fn join_path(parent_path: &str, name: &str) -> String {
 	if parent_path.is_empty() {
 		name.to_string()
 	} else {
@@ -306,7 +306,7 @@ fn join_path(parent_path: &str, name: &str) -> String {
 /// Whether `rel_path` is the local quarantine dir or inside it. The local scan never lists it, so
 /// the remote view leaves out a remote folder that happens to carry the name too — it is never
 /// mistaken for (or synced into) the quarantine area.
-fn in_quarantine(rel_path: &str) -> bool {
+pub(super) fn in_quarantine(rel_path: &str) -> bool {
 	rel_path == QUARANTINE_DIR || rel_path.starts_with(&format!("{QUARANTINE_DIR}/"))
 }
 
