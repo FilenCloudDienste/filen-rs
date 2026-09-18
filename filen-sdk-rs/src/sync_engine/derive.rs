@@ -392,7 +392,7 @@ mod tests {
 			let changes = PairChanges::new();
 			changes.note_tree_size(1_000);
 			changes.note_remote_batch(&mut delta.iter());
-			let scope = changes.take();
+			let mut scope = changes.take();
 			let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
 				panic!("no ancestry read was expected, but one was made for {uuid}")
 			};
@@ -400,7 +400,7 @@ mod tests {
 				REMOTE_ROOT,
 				baseline,
 				std::mem::take(&mut derived.remote),
-				scope.remote(),
+				&scope.take_remote(),
 				&mut ancestry,
 			) {
 				RemoteObserved::Applied(observation) => *observation,

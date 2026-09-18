@@ -117,13 +117,6 @@ pub(super) fn observe_remote(
 ///
 /// Two read connections per call, which is why it is only ever asked about an item whose parent
 /// chain neither the view nor the baseline knows — a subtree created or moved in out of view.
-#[cfg_attr(
-	test,
-	expect(
-		dead_code,
-		reason = "the reader `run_pass` passes; this module's own tests drive the applier with a fixture one"
-	)
-)]
 pub(super) fn cache_ancestry(db: &Path, uuid: Uuid) -> rusqlite::Result<Vec<RemoteItem>> {
 	let chain = read_ancestors(db, uuid)?;
 	Ok(hydrate_by_uuids(db, &chain)?.iter().map(as_item).collect())
@@ -625,12 +618,12 @@ mod tests {
 		let changes = PairChanges::new();
 		changes.note_tree_size(4_000);
 		changes.note_remote_batch(&mut events.iter());
-		let scope = changes.take();
+		let entries = changes.take().take_remote();
 		assert!(
-			!scope.remote().is_empty(),
+			!entries.is_empty(),
 			"the producer collapsed the batch instead of recording it"
 		);
-		scope.remote().to_vec()
+		entries
 	}
 
 	fn no_ancestry() -> impl FnMut(Uuid) -> rusqlite::Result<Vec<RemoteItem>> {

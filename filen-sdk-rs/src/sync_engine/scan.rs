@@ -162,12 +162,6 @@ pub(crate) struct LocalScan {
 }
 
 impl LocalScan {
-	/// The paths no action may be planned at or under: a name the remote would reject, and a
-	/// symlink to a directory the scan reads under its real path.
-	pub(crate) fn blocked_paths(&self) -> impl Iterator<Item = &String> {
-		self.invalid_names.keys().chain(self.aliased_dirs.keys())
-	}
-
 	/// One line per scan error a pass reports in [`SyncReport::errors`](super::SyncReport::errors):
 	/// every error but a [`DuplicateName`](ScanError::DuplicateName), which refuses the pass with
 	/// its own line instead.
@@ -1478,7 +1472,11 @@ mod tests {
 				("zlias".to_string(), "real".to_string()),
 			])
 		);
-		let mut blocked: Vec<&String> = scan.blocked_paths().collect();
+		let mut blocked: Vec<&String> = scan
+			.invalid_names
+			.keys()
+			.chain(scan.aliased_dirs.keys())
+			.collect();
 		blocked.sort();
 		assert_eq!(blocked, vec!["alias", "real/inner", "zlias"]);
 
