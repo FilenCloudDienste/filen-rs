@@ -264,13 +264,13 @@ async fn control_user_ignore_applies_from_the_next_pass() {
 	assert_eq!(first.uploaded, 1, "only b.txt may upload: {first:?}");
 	assert_eq!(
 		first.ignored,
-		vec![IgnoredPath {
-			rel_path: "a.psd".to_string(),
-			level: IgnoreLevel::User,
+		vec![IgnoredPath::new(
+			"a.psd",
+			IgnoreLevel::User,
 			// The line as it was written, not the folded text that matched.
-			pattern: "*.PSD".to_string(),
-			tracked: false,
-		}]
+			"*.PSD",
+			false,
+		)]
 	);
 	let (_, files) = list_remote(&resources).await;
 	assert!(has_file(&files, "b.txt"), "b.txt never uploaded");

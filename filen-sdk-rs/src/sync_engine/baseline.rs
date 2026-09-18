@@ -409,6 +409,7 @@ pub(crate) enum BaselineChange<'a> {
 
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PairRecord {
 	pub id: PairId,
 	/// The canonicalized local root the pair syncs.

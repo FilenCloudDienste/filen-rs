@@ -797,12 +797,12 @@ async fn race_19_symlink_and_loop_do_not_hang_scan() {
 	assert_eq!(r1.uploaded, 4, "{r1:?}");
 	assert_eq!(
 		r1.unsyncable,
-		vec![UnsyncablePath {
-			rel_path: "alias".to_string(),
-			reason: UnsyncableReason::LocalAlias {
+		vec![UnsyncablePath::new(
+			"alias",
+			UnsyncableReason::LocalAlias {
 				target: "real".to_string(),
 			},
-		}],
+		)],
 		"{r1:?}"
 	);
 

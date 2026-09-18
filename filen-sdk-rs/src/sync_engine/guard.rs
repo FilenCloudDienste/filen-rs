@@ -94,6 +94,7 @@ impl DeleteGuard {
 
 /// Why the guard held this pass's deletions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GuardReason {
 	/// The local scan did not complete, so apparent deletions may be phantom (an unmounted root,
 	/// an unreadable subtree). All deletions are held unconditionally.
