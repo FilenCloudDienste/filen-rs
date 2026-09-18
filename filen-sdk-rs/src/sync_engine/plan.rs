@@ -9,6 +9,7 @@
 use std::{
 	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
+	sync::Arc,
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
@@ -1871,7 +1872,7 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// in one pass; an index by collision key and uuid is the upgrade if mass moves show up.
 pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
-	baseline: &mut HashMap<String, BaselineEntry>,
+	baseline: &mut Arc<HashMap<String, BaselineEntry>>,
 	local: &mut HashMap<String, LocalNode>,
 	remote: &mut HashMap<String, RemoteNode>,
 	held: &BTreeSet<String>,
@@ -1890,7 +1891,9 @@ pub(crate) fn fold_dir_moves(
 				node.rel_path = path.to_string()
 			});
 		}
-		rekey_subtree(baseline, from, to, |entry, path| {
+		// Taken by value only once a move is actually being folded: the baseline the pass reads is
+		// the store's resident copy, and a pass that folds no directory move must not clone it.
+		rekey_subtree(Arc::make_mut(baseline), from, to, |entry, path| {
 			entry.rel_path = path.to_string()
 		});
 		tracing::debug!(
@@ -2641,7 +2644,7 @@ mod tests {
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
 		let (mut baseline, mut local, mut remote) =
-			(baseline.clone(), local.clone(), remote.clone());
+			(Arc::new(baseline.clone()), local.clone(), remote.clone());
 		let mut actions = fold_dir_moves(
 			mode,
 			&mut baseline,
@@ -2859,6 +2862,7 @@ mod tests {
 		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
 		let (mut baseline, mut local, mut remote) = case_tree("Docs", "docs", "Docs", dir, file);
 		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
+		let mut baseline = Arc::new(baseline);
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -3233,8 +3237,9 @@ mod tests {
 	/// A path the cache is holding at either end keeps the directory where it is.
 	#[test]
 	fn a_dir_under_a_held_remote_path_is_not_moved() {
-		let (mut baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		let (baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
 		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
+		let mut baseline = Arc::new(baseline);
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
