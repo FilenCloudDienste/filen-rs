@@ -91,6 +91,7 @@ fn dirty_cap(last_items: usize) -> usize {
 /// reported on the pass's [`SyncReport::full_pass`](super::SyncReport::full_pass), so a caller —
 /// and a test — can see why a pass cost what it cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FullPassReason {
 	/// The pair's first pass of this process (after `open`, `add_pair` or `resume_pair`): there is
 	/// no changelist yet, and a paused pair's events may have overflowed while it waited.

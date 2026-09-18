@@ -29,6 +29,7 @@ use super::{SyncMode, apply::SyncReport};
 // and compare through a `Box` for a variant delivered once per pass.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SyncEvent {
 	/// A pass began (after the read-only prepare), in this mode.
 	PassStarted { mode: SyncMode },

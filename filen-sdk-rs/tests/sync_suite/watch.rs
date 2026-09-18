@@ -1138,12 +1138,12 @@ async fn watch_user_ignore_wakes_a_running_loop() {
 	let ignored = log.ignored();
 	assert_eq!(
 		ignored.first(),
-		Some(&IgnoredPath {
-			rel_path: "art.psd".to_string(),
-			level: IgnoreLevel::User,
-			pattern: "*.psd".to_string(),
-			tracked: true,
-		}),
+		Some(&IgnoredPath::new(
+			"art.psd",
+			IgnoreLevel::User,
+			"*.psd",
+			true,
+		)),
 		"the pass the wake-up started must report what it stopped tracking"
 	);
 	assert!(
