@@ -2352,16 +2352,29 @@ pub(crate) fn reconcile(
 		local.len(),
 		remote.len()
 	);
-	// Still the union of all three sides: this pass reads and reconciles everything, and the
-	// change-scoped driver that replaces the union is Stage 5's second half. The baseline's paths
-	// are walked out of the tree and so have to be owned; the two side maps are keyed by paths that
-	// already exist, and borrowing those is the difference between one allocation per row and three.
-	let keys: BTreeSet<Cow<'_, str>> = baseline
-		.paths()
-		.map(Cow::Owned)
-		.chain(local.keys().map(|path| Cow::Borrowed(path.as_str())))
-		.chain(remote.keys().map(|path| Cow::Borrowed(path.as_str())))
+	// The paths this pass decides: every key either side holds, plus the baseline rows NEITHER side
+	// holds any more.
+	//
+	// That third set is the only part of the baseline whose paths the two side maps do not already
+	// carry — a row both sides still hold is keyed by a `String` that exists, and borrowing it is the
+	// difference between one allocation per row and three — and it is exactly the set the both-absent
+	// arm retires. So the tree is walked for it against one reused buffer and only a row in neither
+	// side is copied: a converged pair copies no path here (the set's own nodes aside).
+	//
+	// Still the union of all three sides. Driving the reconcile from a DIRTY SET instead needs
+	// change-scoped INPUTS — a local scan of the dirty paths and a remote view derived from the
+	// cache's delta — and this pass has neither: it reads both trees whole, so every path it read is
+	// a path it has to decide.
+	let mut keys: BTreeSet<Cow<'_, str>> = local
+		.keys()
+		.chain(remote.keys())
+		.map(|path| Cow::Borrowed(path.as_str()))
 		.collect();
+	baseline.visit_row_paths(|path| {
+		if !local.contains_key(path) && !remote.contains_key(path) {
+			keys.insert(Cow::Owned(path.to_string()));
+		}
+	});
 
 	// Consume the paths the view could not resolve before anything else looks at them, so neither
 	// move detection nor the per-path reconcile acts on a name the cache is showing twice. (A path
@@ -5958,6 +5971,57 @@ mod tests {
 				kind: NodeKind::File,
 				remote_uuid: uuid,
 			}]
+		);
+	}
+
+	/// The paths a pass decides are the union of all three sides, and the baseline's third of that
+	/// union is the one part the two side maps do not already carry: a row for a path NEITHER side
+	/// holds any more. Those rows are contributed by a walk of the tree rather than by materializing
+	/// every row's path, so it is worth pinning that such a row is still reached — at the top level
+	/// and nested under a directory both sides still hold — beside the keys the maps do carry.
+	#[test]
+	fn a_row_neither_side_holds_is_reconciled_beside_the_keys_the_sides_carry() {
+		let (dir, kept, nested, top) = (
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+			Uuid::new_v4(),
+		);
+		let baseline = map(vec![
+			("d", base_dir("d", dir)),
+			("d/kept.txt", base_file("d/kept.txt", kept, [1; 32])),
+			// Gone from both sides, under a directory both sides still hold ...
+			("d/gone.txt", base_file("d/gone.txt", nested, [2; 32])),
+			// ... and at the top level.
+			("gone.txt", base_file("gone.txt", top, [3; 32])),
+		]);
+		let local = map(vec![
+			("d", local_dir("d")),
+			("d/kept.txt", local_file("d/kept.txt", [1; 32])),
+			// A key only one side carries, which no baseline row names.
+			("d/fresh.txt", local_file("d/fresh.txt", [4; 32])),
+		]);
+		let remote = map(vec![
+			("d", remote_dir_node("d", dir)),
+			("d/kept.txt", remote_file("d/kept.txt", kept, [1; 32])),
+		]);
+
+		let mut actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		actions.sort_by(|a, b| a.rel_path().cmp(b.rel_path()));
+		assert_eq!(
+			actions,
+			vec![
+				SyncAction::UploadFile {
+					rel_path: "d/fresh.txt".to_string(),
+				},
+				SyncAction::AdoptBaseline {
+					rel_path: "d/gone.txt".to_string(),
+				},
+				SyncAction::AdoptBaseline {
+					rel_path: "gone.txt".to_string(),
+				},
+			],
+			"a row neither side holds is retired; a path both sides hold unchanged plans nothing"
 		);
 	}
 
