@@ -20,6 +20,16 @@
 mod apply;
 mod baseline;
 mod changes;
+// The maps a change-scoped pass reconciles from, carried out of the resident baseline. Nothing
+// calls it yet: `run_pass` assembles them with the step that replaces the whole-tree read.
+#[cfg_attr(
+	not(test),
+	expect(
+		dead_code,
+		reason = "wired into `run_pass` with the rest of the change-scoped pass"
+	)
+)]
+mod derive;
 mod engine;
 mod events;
 mod guard;
