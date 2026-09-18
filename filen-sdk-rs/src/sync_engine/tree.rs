@@ -386,6 +386,21 @@ impl Baseline {
 			.map(|(id, path)| self.entry_at(id, path))
 	}
 
+	/// Every path STRICTLY under `root`, handed to `visit` as a slice of the ONE buffer the walk
+	/// reuses — the subtree form of [`visit_row_paths`](Self::visit_row_paths).
+	///
+	/// What [`subtree`](Self::subtree) costs is a rebuilt row and a fresh `String` per row; a
+	/// caller that only counts what is down there, or asks a question of each path, pays neither.
+	pub(super) fn visit_subtree_paths(&self, root: &str, mut visit: impl FnMut(&str)) {
+		let Some(id) = self.resolve(root) else {
+			return;
+		};
+		let mut walk = self.walk(id, root.to_string());
+		while walk.next_row().is_some() {
+			visit(&walk.path);
+		}
+	}
+
 	/// The rows awaiting confirmation: this side's content is on record and is not what the two
 	/// sides last agreed on (see [`Baseline::agreed`]). The whole map is the candidate set, so a
 	/// converged pair answers "none" without touching a node.

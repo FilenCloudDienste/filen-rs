@@ -20,54 +20,21 @@
 mod apply;
 mod baseline;
 mod changes;
-// The maps a change-scoped pass reconciles from, carried out of the resident baseline. Nothing
-// calls it yet: `run_pass` assembles them with the step that replaces the whole-tree read.
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "wired into `run_pass` with the rest of the change-scoped pass"
-	)
-)]
+// The maps a change-scoped pass reconciles from, carried out of the resident baseline.
 mod derive;
 mod engine;
 mod events;
 // The path-keyed facts a pass carries between passes, and the paths the next one owes a look at.
-// Nothing calls it yet: `run_pass` carries them with the step that replaces the whole-tree read.
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "wired into `run_pass` with the rest of the change-scoped pass"
-	)
-)]
 mod facts;
 mod guard;
 mod ignore;
 mod mode;
-// The local half of a change-scoped pass. Nothing calls it yet: `run_pass` wires both halves in
-// with the step that replaces the whole-tree read, and this module is the piece that has to exist
-// first — building it inside that step would mean landing the pass and its evidence rules at once.
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "wired into `run_pass` with the rest of the change-scoped pass"
-	)
-)]
+// The local half of a change-scoped pass: re-observe the paths the changelist names.
 mod observe;
 mod outcome;
 mod pause;
 mod plan;
-// The remote half of the same pass. Nothing calls it yet either: it applies the announced changes
-// to the derived remote view, and `run_pass` wires the two halves in together.
-#[cfg_attr(
-	not(test),
-	expect(
-		dead_code,
-		reason = "wired into `run_pass` with the rest of the change-scoped pass"
-	)
-)]
+// The remote half: apply the announced changes to the derived remote view.
 mod remote;
 // The permanent per-phase cost probe, driven by `tests/sync_engine_probe.rs`. Gated on
 // `bench-internals` like `cache::bench_support`, and deliberately not on `cfg(test)`: the `tests/`

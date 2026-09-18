@@ -673,7 +673,10 @@ async fn run_pass(
 	pair: PairId,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> PassEnd {
-	match engine.sync_pass(pair, observer).await {
+	match engine
+		.sync_pass(pair, observer, super::engine::WhenIdle::Skip)
+		.await
+	{
 		Ok(report) => {
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
@@ -709,13 +712,12 @@ struct PassEnd {
 
 /// Whether this pass read both sides WHOLE — what the safety net measures from.
 ///
-/// Every pass that got as far as reading does today, whatever its
-/// [`full_pass`](SyncReport::full_pass) says: the change-scoped pass that narrows a read down to a
-/// dirty set does not exist yet, so the only pass that read nothing is one a pause cut short before
-/// it had a plan ([`paused`](SyncReport::paused)). When scoping lands, this becomes
-/// `report.full_pass.is_some()` and nothing else about the loop changes.
+/// Which is exactly the pass that recorded WHY it had to (see
+/// [`full_pass`](SyncReport::full_pass)): a pass with no reason narrowed its read to the paths its
+/// changelists named, an idle wake ran no pass at all, and a pause can still cut either short. All
+/// three leave the net owing the whole-tree read it exists to be the backstop for.
 fn read_both_sides_whole(report: &SyncReport) -> bool {
-	!report.paused
+	report.full_pass.is_some()
 }
 
 /// Whether the safety net is due: no pass has read both sides whole for a whole `every`.
@@ -1556,7 +1558,10 @@ mod tests {
 	/// is the retry timer, so no re-armed trigger is owed on top of it.
 	#[test]
 	fn a_pass_that_could_not_take_the_drive_lock_counts_as_a_failure() {
-		let mut report = SyncReport::default();
+		let mut report = SyncReport {
+			full_pass: Some(FullPassReason::SafetyNet),
+			..SyncReport::default()
+		};
 		let cause = Error::custom(ErrorKind::RetryFailed, "held by another device");
 		note_lock_failure(&mut report, 3, &cause, &mut |_| {});
 		let end = pass_outcome(report);
@@ -1609,17 +1614,21 @@ mod tests {
 		assert!(net_due(start, start + SAFETY_NET, SAFETY_NET));
 		assert!(net_due(start, start + SAFETY_NET * 3, SAFETY_NET));
 
-		// Every pass that gets as far as reading counts, whether or not it had a whole-tree
-		// trigger and whether or not its actions all landed.
-		assert!(read_both_sides_whole(&SyncReport::default()));
+		// A pass that READ BOTH SIDES counts, whether or not its actions all landed — and it is
+		// the one that recorded why it had to read them.
 		assert!(read_both_sides_whole(&SyncReport {
 			full_pass: Some(FullPassReason::SafetyNet),
 			..SyncReport::default()
 		}));
 		assert!(read_both_sides_whole(&SyncReport {
+			full_pass: Some(FullPassReason::FirstPass),
 			interrupted: 2,
 			..SyncReport::default()
 		}));
+		assert!(
+			!read_both_sides_whole(&SyncReport::default()),
+			"a change-scoped pass read one dirty set, not the tree the net is the backstop for"
+		);
 		assert!(
 			!read_both_sides_whole(&SyncReport {
 				paused: true,
@@ -1636,6 +1645,7 @@ mod tests {
 	#[test]
 	fn the_net_scales_by_the_read_not_by_the_whole_pass() {
 		let after_a_long_upload = pass_outcome(SyncReport {
+			full_pass: Some(FullPassReason::SafetyNet),
 			read_cost: Duration::from_millis(10),
 			uploaded: 1,
 			..SyncReport::default()
@@ -1649,6 +1659,7 @@ mod tests {
 
 		// A read that genuinely costs seconds is what scales the net out.
 		let big_tree = pass_outcome(SyncReport {
+			full_pass: Some(FullPassReason::SafetyNet),
 			read_cost: Duration::from_secs(30),
 			..SyncReport::default()
 		});
