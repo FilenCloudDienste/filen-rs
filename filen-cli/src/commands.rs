@@ -135,6 +135,8 @@ pub(crate) enum Commands {
 	},
 	/// Search for a file or directory interactively, or specify a query
 	Search { query: Option<String> },
+	/// List favorited items
+	ListFavorites,
 	/// Favorite a file or directory
 	Favorite {
 		/// File or directory to favorite
@@ -147,6 +149,8 @@ pub(crate) enum Commands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 	},
+	/// List recently accessed items
+	ListRecents,
 	/// List trashed items
 	ListTrash,
 	/// Restore a trashed item interactively
@@ -176,9 +180,9 @@ pub(crate) enum Commands {
 		/// Additional arguments to Rclone
 		rclone_args: Vec<String>,
 	},
-	/// Runs a WebDAV, FTP, SFTP or HTTP server exposing your Filen drive
+	/// Runs a WebDAV, S3, FTP, SFTP or HTTP server exposing your Filen drive
 	Serve {
-		/// The type of server to run: webdav, ftp, sftp, http
+		/// The type of server to run: webdav, s3, ftp, sftp, http
 		server: String,
 		/// IP and port for the server (`<ip>:<port>` or `:<port>`)
 		#[arg(long = "addr", default_value = ":80")]
@@ -206,7 +210,6 @@ pub(crate) enum Commands {
 		/// Additional arguments to Rclone
 		rclone_args: Vec<String>,
 	},
-	// todo: s3 server
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
 	/// View the documentation (same as --help) locally in a browser rendered as HTML
@@ -344,6 +347,10 @@ pub(crate) async fn execute_command(
 				search_cmd::search_cmd(ui, client, working_path).await?
 			}
 		}
+		Commands::ListFavorites => {
+			fs_cmds::list_favorites(ui, client).await?;
+			None
+		}
 		Commands::Favorite { file_or_directory } => {
 			fs_cmds::set_file_or_directory_favorite(
 				ui,
@@ -364,6 +371,10 @@ pub(crate) async fn execute_command(
 				false,
 			)
 			.await?;
+			None
+		}
+		Commands::ListRecents => {
+			fs_cmds::list_recents(ui, client).await?;
 			None
 		}
 		Commands::ListTrash => {

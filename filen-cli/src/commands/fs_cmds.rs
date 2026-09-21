@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{
 	auth::LazyClient,
 	ui::{self, UI},
@@ -9,7 +11,7 @@ use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID,
-		categories::{DirType, NonRootFileType, Normal, fs::CategoryFS},
+		categories::{DirType, NonRootFileType, NonRootItemType, Normal, fs::CategoryFS},
 		dir::meta::DirectoryMetaChanges,
 		file::{meta::FileMetaChanges, traits::HasFileInfo as _},
 	},
@@ -93,6 +95,24 @@ pub(crate) fn print_items_after_list(
 		})
 		.collect::<Vec<(String, u64)>>();
 	files.sort_by(|(a, _), (b, _)| a.cmp(b));
+	print_item_names(
+		ui,
+		directories,
+		files,
+		&format!("{} is empty", directory_label.unwrap_or("Directory")),
+		long,
+	)
+}
+
+/// Prints an already resolved listing: directory names (or paths) first, then file names (or
+/// paths) with their sizes. Both are expected to be sorted the way they should be printed.
+fn print_item_names(
+	ui: &mut UI,
+	directories: Vec<String>,
+	files: Vec<(String, u64)>,
+	empty_message: &str,
+	long: bool,
+) -> Result<()> {
 	let file_names = files
 		.iter()
 		.map(|(name, _)| name.clone())
@@ -105,10 +125,7 @@ pub(crate) fn print_items_after_list(
 		return Ok(());
 	}
 	if directories.is_empty() && files.is_empty() {
-		ui.print_muted(&format!(
-			"{} is empty",
-			directory_label.unwrap_or("Directory")
-		));
+		ui.print_muted(empty_message);
 		return Ok(());
 	}
 	if long {
@@ -789,6 +806,68 @@ pub(crate) async fn set_file_or_directory_favorite(
 		}
 	}
 	Ok(())
+}
+
+pub(crate) async fn list_favorites(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+	let client = client.get(ui).await?;
+	let (dirs, files) = client
+		.list_favorites(None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list favorites")?;
+	print_items_with_full_paths(ui, client, dirs, files, "No favorited items").await
+}
+
+pub(crate) async fn list_recents(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
+	let client = client.get(ui).await?;
+	let (dirs, files) = client
+		.list_recents(None::<&fn(u64, Option<u64>)>)
+		.await
+		.context("Failed to list recents")?;
+	print_items_with_full_paths(ui, client, dirs, files, "No recent items").await
+}
+
+/// Prints a listing whose items don't share a parent, so a bare name wouldn't identify them:
+/// every item is resolved to its absolute path first.
+async fn print_items_with_full_paths(
+	ui: &mut UI,
+	client: &Client,
+	dirs: Vec<RemoteDirectory>,
+	files: Vec<RemoteFile>,
+	empty_message: &str,
+) -> Result<()> {
+	// resolving a path walks up the tree, and `get_item_path` takes the drive lock for each
+	// walk — holding one here means those all share it instead of re-acquiring it per item
+	let _lock = client.lock_drive().await.context("Failed to lock drive")?;
+	let mut directories = Vec::with_capacity(dirs.len());
+	for dir in &dirs {
+		directories.push(full_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await);
+	}
+	directories.sort();
+	let mut files = {
+		let mut resolved = Vec::with_capacity(files.len());
+		for file in &files {
+			resolved.push((
+				full_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await,
+				file.size(),
+			));
+		}
+		resolved
+	};
+	files.sort_by(|(a, _), (b, _)| a.cmp(b));
+	print_item_names(ui, directories, files, empty_message, false)
+}
+
+/// The item's absolute path, with the trailing slash `get_item_path` puts on directories
+/// stripped (directories are already distinguished by color). Falls back to the UUID, like the
+/// name-only listings do, so one unresolvable item doesn't drop the rest of the listing.
+async fn full_path(client: &Client, item: &NonRootItemType<'_, Normal>) -> String {
+	match client.get_item_path(item).await {
+		Ok((path, _)) => format!("/{}", path.trim_end_matches('/')),
+		Err(e) => {
+			log::warn!("Failed to resolve path of item {}: {}", item.uuid(), e);
+			item.uuid().to_string()
+		}
+	}
 }
 
 pub(crate) async fn list_trash(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
