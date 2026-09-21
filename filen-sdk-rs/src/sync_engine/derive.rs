@@ -67,6 +67,16 @@ pub(super) struct Derived {
 	/// [`held_remote`](super::plan::PassHolds::held_remote), which is what makes the missing side a
 	/// deferral rather than an absence.
 	pub(super) held: BTreeSet<String>,
+	/// Every path the reconcile must DECIDE — what the pass hands it as
+	/// [`PassPaths::Changed`](super::plan::PassPaths::Changed).
+	///
+	/// Not [`dirty`](Self::dirty) under another name. `dirty` says what to LOOK AT and answers for
+	/// a whole subtree: one entry for a directory stands for the walk of everything under it. This
+	/// says what to DECIDE and is exact, because a path missing from it is a path the reconcile
+	/// does not visit — so it starts as the dirty set and grows by every key an observation
+	/// actually moved off the node its row carries ([`merge_local`], `remote::RemoteObservation`,
+	/// the cache-lag fold).
+	pub(super) decided: BTreeSet<String>,
 }
 
 /// Carry the baseline forward into the two maps, and grow `dirty` by every row that cannot be
@@ -79,6 +89,10 @@ pub(super) fn from_baseline(baseline: &Baseline, dirty: BTreeSet<String>) -> Der
 	let mut out = Derived {
 		local: HashMap::with_capacity(baseline.len()),
 		remote: HashMap::with_capacity(baseline.len()),
+		// The pass decides everything it set out to look at, whether or not it found a change
+		// there: a path the changelist named and the disk answered "unchanged" for costs one
+		// no-op decision, and leaving it out would need the observation to be consulted first.
+		decided: dirty.clone(),
 		dirty,
 		held: BTreeSet::new(),
 	};
@@ -92,6 +106,7 @@ pub(super) fn from_baseline(baseline: &Baseline, dirty: BTreeSet<String>) -> Der
 		None => {
 			out.dirty.insert(row.rel_path.clone());
 			out.held.insert(row.rel_path.clone());
+			out.decided.insert(row.rel_path.clone());
 		}
 	});
 	out
@@ -144,8 +159,11 @@ fn carried(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
 ///
 /// A dirty path with no observation is NOT absent — it is a path this pass got no evidence for —
 /// so its row stays carried, which is why this only ever acts on what was observed.
+///
+/// Every key it writes or drops goes into [`Derived::decided`] as it goes, which is what lets the
+/// reconcile skip the rest: the nodes it did not touch are still the ones their rows carry.
 pub(super) fn merge_local(
-	local: &mut HashMap<String, LocalNode>,
+	derived: &mut Derived,
 	baseline: &Baseline,
 	observed: &LocalObservations,
 ) {
@@ -155,7 +173,8 @@ pub(super) fn merge_local(
 			// path out through the scan's `invalid_names`, and dropping it here would read as a
 			// local deletion.
 			LocalObservation::File { node, .. } => {
-				local.insert(node.rel_path.clone(), node.clone());
+				derived.decided.insert(node.rel_path.clone());
+				derived.local.insert(node.rel_path.clone(), node.clone());
 			}
 			LocalObservation::Dir(scan) => {
 				// The walk of a directory is evidence for everything it reached — and only for
@@ -164,16 +183,17 @@ pub(super) fn merge_local(
 				// so both keep their rows.
 				if scan.complete {
 					let pruned: BTreeSet<String> = observation.uncovered_roots().cloned().collect();
-					drop_rows(local, baseline, at, &pruned);
+					drop_rows(derived, baseline, at, &pruned);
 				}
 				for (rel_path, node) in &scan.nodes {
-					local.insert(rel_path.clone(), node.clone());
+					derived.decided.insert(rel_path.clone());
+					derived.local.insert(rel_path.clone(), node.clone());
 				}
 			}
 			// The one construct that means deletion: a `stat` on this very path answered NotFound,
 			// so every row at or under it has no local node.
 			LocalObservation::Absent(absence) => {
-				drop_rows(local, baseline, absence.path(), &BTreeSet::new());
+				drop_rows(derived, baseline, absence.path(), &BTreeSet::new());
 			}
 			// The rules hide it. No local evidence and no deletion: what the rules hide is untracked
 			// by the untrack-on-ignore path, never deleted by this one.
@@ -190,18 +210,15 @@ pub(super) fn merge_local(
 /// answers for everything below its key, and `observe_local` files them in ancestor-first order —
 /// rewriting a dirty rule file onto its directory BEFORE it walks the set, so that directory is
 /// never filed after an entry it holds — so no two of them nest.
-fn drop_rows(
-	local: &mut HashMap<String, LocalNode>,
-	baseline: &Baseline,
-	at: &str,
-	pruned: &BTreeSet<String>,
-) {
-	if !at.is_empty() && !plan::at_or_under_root(pruned, at) {
-		local.remove(at);
+fn drop_rows(derived: &mut Derived, baseline: &Baseline, at: &str, pruned: &BTreeSet<String>) {
+	if !at.is_empty() && !plan::at_or_under_root(pruned, at) && derived.local.remove(at).is_some() {
+		derived.decided.insert(at.to_owned());
 	}
 	for row in baseline.subtree(at) {
-		if !plan::at_or_under_root(pruned, &row.rel_path) {
-			local.remove(&row.rel_path);
+		if !plan::at_or_under_root(pruned, &row.rel_path)
+			&& derived.local.remove(&row.rel_path).is_some()
+		{
+			derived.decided.insert(row.rel_path);
 		}
 	}
 }
@@ -417,7 +434,7 @@ mod tests {
 				&derived.dirty,
 			);
 			assert!(local.complete, "{:?}", local.errors);
-			merge_local(&mut derived.local, baseline, &local);
+			merge_local(&mut derived, baseline, &local);
 			derived
 		}
 	}
@@ -882,7 +899,7 @@ mod tests {
 		);
 		fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 		assert!(!observed.complete, "the walk could not read a subtree");
-		merge_local(&mut derived.local, &baseline, &observed);
+		merge_local(&mut derived, &baseline, &observed);
 
 		assert!(
 			derived.local.contains_key("docs/deep/inner.bin"),
@@ -906,7 +923,7 @@ mod tests {
 			errors: Vec::new(),
 		};
 
-		merge_local(&mut derived.local, &baseline, &observed);
+		merge_local(&mut derived, &baseline, &observed);
 
 		assert!(derived.local.contains_key("top.txt"));
 		assert!(derived.local.contains_key("docs/deep/inner.bin"));
