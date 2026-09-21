@@ -462,6 +462,7 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		&mut local,
 		&mut remote,
 		&held,
+		plan::PassPaths::Whole,
 	);
 	plan::reconcile(
 		SyncMode::TwoWay,
@@ -519,6 +520,7 @@ fn pass_scoped(
 		&mut local,
 		&mut remote,
 		&held,
+		plan::PassPaths::Changed(&decided),
 	);
 	// The decided set follows the fold, as `Prepared::fold_dir_moves` makes it follow for a pass.
 	for action in &moves {
@@ -1072,6 +1074,7 @@ pub fn run() -> String {
 			&mut local,
 			&mut remote,
 			&held,
+			plan::PassPaths::Whole,
 		)
 	});
 	probe.record(

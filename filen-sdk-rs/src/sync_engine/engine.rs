@@ -1484,6 +1484,7 @@ impl Prepared {
 			&mut self.local_scan.nodes,
 			&mut self.remote_view.nodes,
 			&self.holds.held_remote,
+			self.read.paths(),
 		);
 		// What this pass blocks and reports is keyed by path too, and has to follow the fold, or a
 		// block stays behind at a path nothing is keyed by any more while its item reads as absent at
