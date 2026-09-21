@@ -1506,6 +1506,57 @@ fn reconcile_two_way(
 	}
 }
 
+/// Hand `visit` every baseline row that could be the SOURCE of a move this pass detects.
+///
+/// On a change-scoped pass that is the rows at the paths it decides, and no others. A row it does
+/// not decide still carries BOTH its nodes, so the file sits at its recorded path on both sides,
+/// and the only endpoint such a row could match is its own path — which [`detect_moves`] refuses
+/// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
+/// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
+/// its source and the insert of its destination in a single transaction.
+fn visit_move_sources(
+	paths: PassPaths<'_>,
+	baseline: &Baseline,
+	mut visit: impl FnMut(&BaselineEntry),
+) {
+	match paths {
+		PassPaths::Whole => baseline.visit_rows(visit),
+		PassPaths::Changed(changed) => {
+			let mut rows = baseline.cursor();
+			for path in changed {
+				if let Some(row) = rows.get(path) {
+					visit(&row);
+				}
+			}
+		}
+	}
+}
+
+/// Hand `visit` every node of `map` a move this pass detects could END at, by the same argument as
+/// [`visit_move_sources`]: a node the pass did not re-read is the one its own row records, so it
+/// names no path but its own. A node with no row at all was necessarily observed, so it is in the
+/// set by construction (see [`PassPaths::Changed`]).
+fn visit_move_targets<'m, V>(
+	paths: PassPaths<'_>,
+	map: &'m HashMap<String, V>,
+	mut visit: impl FnMut(&'m String, &'m V),
+) {
+	match paths {
+		PassPaths::Whole => {
+			for (path, node) in map {
+				visit(path, node);
+			}
+		}
+		PassPaths::Changed(changed) => {
+			for path in changed {
+				if let Some((path, node)) = map.get_key_value(path) {
+					visit(path, node);
+				}
+			}
+		}
+	}
+}
+
 /// Detect file moves/renames so they apply as a single metadata op instead of a re-transfer, and
 /// return the set of paths they consume (excluded from the per-path reconcile). Files only.
 ///
@@ -1549,26 +1600,29 @@ fn detect_moves(
 	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
+	paths: PassPaths<'_>,
 	actions: &mut Vec<SyncAction>,
 	consumed: &mut HashSet<String>,
 ) {
 	if mode.pulls() {
-		let remote_path_of_uuid: HashMap<Uuid, &str> = remote
-			.iter()
-			.filter(|(_, node)| node.kind == NodeKind::File)
-			.map(|(path, node)| (node.remote_uuid, path.as_str()))
-			.collect();
-		// A file's uuid is re-minted by every content edit, so a move that CARRIED an edit inside
-		// one window is invisible to the index above — the uuid the baseline recorded no longer
-		// names anything live. The server-minted lineage id is not re-minted, so it still finds the
-		// file at its new path and the pass carries the item across instead of quarantining the old
-		// path and downloading the new one from scratch.
-		let remote_path_of_lineage: HashMap<StableUuid, &str> = remote
-			.iter()
-			.filter(|(_, node)| node.kind == NodeKind::File)
-			.filter_map(|(path, node)| Some((node.stable_uuid?, path.as_str())))
-			.collect();
-		baseline.visit_rows(|base| {
+		// One walk for both indexes. The second is there because a file's uuid is re-minted by
+		// every content edit, so a move that CARRIED an edit inside one window is invisible to the
+		// first — the uuid the baseline recorded no longer names anything live. The server-minted
+		// lineage id is not re-minted, so it still finds the file at its new path and the pass
+		// carries the item across instead of quarantining the old path and downloading the new one
+		// from scratch.
+		let mut remote_path_of_uuid: HashMap<Uuid, &str> = HashMap::new();
+		let mut remote_path_of_lineage: HashMap<StableUuid, &str> = HashMap::new();
+		visit_move_targets(paths, remote, |path, node| {
+			if node.kind != NodeKind::File {
+				return;
+			}
+			remote_path_of_uuid.insert(node.remote_uuid, path.as_str());
+			if let Some(lineage) = node.stable_uuid {
+				remote_path_of_lineage.insert(lineage, path.as_str());
+			}
+		});
+		visit_move_sources(paths, baseline, |base| {
 			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
@@ -1681,7 +1735,7 @@ fn detect_moves(
 		// Content hash -> the new local paths carrying it (not in baseline, not on the remote).
 		// Keyed by the raw bytes since `Blake3Hash` is not `std::hash::Hash`.
 		let mut created_by_hash: HashMap<[u8; 32], Vec<&str>> = HashMap::new();
-		for (path, node) in local {
+		visit_move_targets(paths, local, |path, node| {
 			if node.kind == NodeKind::File
 				&& !baseline.contains_key(path)
 				&& !remote.contains_key(path)
@@ -1692,8 +1746,8 @@ fn detect_moves(
 					.or_default()
 					.push(path.as_str());
 			}
-		}
-		baseline.visit_rows(|base| {
+		});
+		visit_move_sources(paths, baseline, |base| {
 			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
@@ -2333,6 +2387,44 @@ pub(crate) struct PassHolds {
 	pub(crate) held_remote: BTreeSet<String>,
 }
 
+/// Which paths one [`reconcile`] decides.
+///
+/// A pass that read both sides whole knows every path and decides every path. A change-scoped pass
+/// read only what its changelists named and DERIVED the rest from the baseline rows
+/// (see [`derive`](super::derive)), so almost every path in its maps is one whose two nodes came
+/// out of its own row — and the reconcile's answer at such a path is "the three inputs agree",
+/// which is no action at all. Deciding them again is what the reconcile costs at rest, and this is
+/// what takes that cost away.
+///
+/// # What [`Changed`](Self::Changed) requires of its caller
+///
+/// Every path where the local map, the remote map or the baseline row is not what
+/// [`derive::carried`](super::derive) put there must be in the set. That is not a convention a
+/// caller has to remember: `carried` hands back BOTH of a row's nodes or neither, and a row it
+/// cannot carry goes into the dirty set in the same statement — so a derivation's own set already
+/// names every path whose nodes are not its row's, and what the pass adds to it is every path its
+/// observations moved off that row (see `derive::Derived::decided`).
+///
+/// A path left out of the set is a path nothing decides. That can never INVENT an absence — a
+/// deletion is only ever planned at a path this loop visits — but it can DELAY one, which is
+/// invariant I1's safe direction, and the reason the requirement above is written in terms of
+/// evidence rather than of paths.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PassPaths<'a> {
+	/// Decide every path the three inputs hold.
+	Whole,
+	/// Decide only these, plus the rows under a held path (which cost their count and nothing
+	/// else — see [`reconcile_keys`]).
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the change-scoped pass hands this set over in the next commit of this series; 			          only the property test builds one so far"
+		)
+	)]
+	Changed(&'a BTreeSet<String>),
+}
+
 /// One reconciled pass.
 pub(crate) struct Plan {
 	pub(crate) actions: Vec<SyncAction>,
@@ -2342,14 +2434,76 @@ pub(crate) struct Plan {
 	pub(crate) deferred_paths: usize,
 }
 
+/// The paths [`reconcile`] decides, in path order — siblings together, so its baseline cursor
+/// resolves one directory and answers for everything in it.
+///
+/// [`Whole`](PassPaths::Whole) is every key either side holds, plus the baseline rows NEITHER side
+/// holds any more. That third set is the only part of the baseline whose paths the two side maps
+/// do not already carry — a row both sides still hold is keyed by a `String` that exists, and
+/// borrowing it is the difference between one allocation per row and three — and it is exactly the
+/// set the both-absent arm retires. So the tree is walked for it against one reused buffer and
+/// only a row in neither side is copied: a converged pair copies no path here.
+///
+/// [`Changed`](PassPaths::Changed) is that same union intersected with the pass's own set. Nothing
+/// is left unretired by the intersection: the both-absent arm retires a row whose path neither
+/// side holds any more, and a path this leaves out is one whose two nodes were CARRIED from its
+/// own row, which puts it on both sides. A row is retired by the pass that observes its absence,
+/// and observing that absence is what put the path in the set.
+fn reconcile_keys<'m>(
+	paths: PassPaths<'m>,
+	baseline: &Baseline,
+	local: &'m HashMap<String, LocalNode>,
+	remote: &'m HashMap<String, RemoteNode>,
+	held: &BTreeSet<String>,
+) -> BTreeSet<Cow<'m, str>> {
+	let PassPaths::Changed(changed) = paths else {
+		let mut keys: BTreeSet<Cow<'m, str>> = local
+			.keys()
+			.chain(remote.keys())
+			.map(|path| Cow::Borrowed(path.as_str()))
+			.collect();
+		baseline.visit_row_paths(|path| {
+			if !local.contains_key(path) && !remote.contains_key(path) {
+				keys.insert(Cow::Owned(path.to_string()));
+			}
+		});
+		return keys;
+	};
+	let mut keys: BTreeSet<Cow<'m, str>> = BTreeSet::new();
+	// Intersected with the three inputs, not taken as given: a path in none of them is a path the
+	// whole-tree key set does not hold either, and counting one as withheld under a held path
+	// would report a deferral a whole read never reports.
+	for path in changed {
+		if local.contains_key(path) || remote.contains_key(path) || baseline.contains_key(path) {
+			keys.insert(Cow::Borrowed(path.as_str()));
+		}
+	}
+	// A held path withholds its whole subtree, and every path withheld is COUNTED
+	// ([`Plan::deferred_paths`]). The rows under one are otherwise absent from this set — they are
+	// carried, so nothing observed them — and they are the only paths whose absence would change a
+	// number rather than an action. Held paths are the rows that record one side only and the ones
+	// the cache is showing twice: few, and their subtrees with them.
+	for root in held {
+		if local.contains_key(root) || remote.contains_key(root) || baseline.contains_key(root) {
+			keys.insert(Cow::Owned(root.clone()));
+		}
+		baseline.visit_subtree_paths(root, |path| {
+			keys.insert(Cow::Owned(path.to_string()));
+		});
+	}
+	keys
+}
+
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
-/// keyed by the same NFC-normalized relative path; `holds` is what the pass must leave alone.
+/// keyed by the same NFC-normalized relative path; `holds` is what the pass must leave alone, and
+/// `paths` which paths it decides (see [`PassPaths`]).
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
 	baseline: &Baseline,
 	local: &HashMap<String, LocalNode>,
 	remote: &HashMap<String, RemoteNode>,
 	holds: &PassHolds,
+	paths: PassPaths<'_>,
 ) -> Plan {
 	let mut actions = Vec::new();
 	let mut consumed = HashSet::new();
@@ -2359,30 +2513,7 @@ pub(crate) fn reconcile(
 		local.len(),
 		remote.len()
 	);
-	// The paths this pass decides: every key either side holds, plus the baseline rows NEITHER side
-	// holds any more.
-	//
-	// That third set is the only part of the baseline whose paths the two side maps do not already
-	// carry — a row both sides still hold is keyed by a `String` that exists, and borrowing it is the
-	// difference between one allocation per row and three — and it is exactly the set the both-absent
-	// arm retires. So the tree is walked for it against one reused buffer and only a row in neither
-	// side is copied: a converged pair copies no path here (the set's own nodes aside).
-	//
-	// Still the union of all three sides, on a change-scoped pass as much as on a whole one: the
-	// derived maps carry a node per baseline row, so every path is one this reconcile decides. The
-	// dirty set says which of those nodes were read FRESH this pass, not which ones are decided.
-	// Narrowing the reconcile itself to that set is a later change and needs more than the inputs:
-	// a stale node must still be visited, or a path nothing announced stops being reconciled.
-	let mut keys: BTreeSet<Cow<'_, str>> = local
-		.keys()
-		.chain(remote.keys())
-		.map(|path| Cow::Borrowed(path.as_str()))
-		.collect();
-	baseline.visit_row_paths(|path| {
-		if !local.contains_key(path) && !remote.contains_key(path) {
-			keys.insert(Cow::Owned(path.to_string()));
-		}
-	});
+	let keys = reconcile_keys(paths, baseline, local, remote, &holds.held_remote);
 
 	// Consume the paths the view could not resolve before anything else looks at them, so neither
 	// move detection nor the per-path reconcile acts on a name the cache is showing twice. (A path
@@ -2415,7 +2546,15 @@ pub(crate) fn reconcile(
 	// the new one forever. It does not weaken the backup guarantee — a move deletes nothing on the
 	// destination, and a real deletion (content that reappears nowhere) is still suppressed by the
 	// `delete_ok` gate below.
-	detect_moves(mode, baseline, local, remote, &mut actions, &mut consumed);
+	detect_moves(
+		mode,
+		baseline,
+		local,
+		remote,
+		paths,
+		&mut actions,
+		&mut consumed,
+	);
 
 	// The keys come out of the set in path order, so siblings arrive together: the cursor resolves
 	// one directory and answers for everything under it.
@@ -2636,7 +2775,15 @@ mod tests {
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		reconcile(mode, &tree(baseline), local, remote, &PassHolds::default()).actions
+		reconcile(
+			mode,
+			&tree(baseline),
+			local,
+			remote,
+			&PassHolds::default(),
+			PassPaths::Whole,
+		)
+		.actions
 	}
 
 	/// The pair the fold tests write as.
@@ -2654,7 +2801,15 @@ mod tests {
 		let mut remote = remote.clone();
 		let baseline = tree(baseline);
 		writes.fold_into(PAIR, &baseline, &mut remote);
-		reconcile(mode, &baseline, local, &remote, &PassHolds::default()).actions
+		reconcile(
+			mode,
+			&baseline,
+			local,
+			&remote,
+			&PassHolds::default(),
+			PassPaths::Whole,
+		)
+		.actions
 	}
 
 	/// What a pass plans once the case-only directory renames are folded into its inputs: the
@@ -2674,7 +2829,17 @@ mod tests {
 			&mut remote,
 			&BTreeSet::new(),
 		);
-		actions.extend(reconcile(mode, &baseline, &local, &remote, &PassHolds::default()).actions);
+		actions.extend(
+			reconcile(
+				mode,
+				&baseline,
+				&local,
+				&remote,
+				&PassHolds::default(),
+				PassPaths::Whole,
+			)
+			.actions,
+		);
 		actions
 	}
 
@@ -5170,6 +5335,7 @@ mod tests {
 					trashed: HashSet::from([uuid]),
 					..Default::default()
 				},
+				PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -5196,6 +5362,7 @@ mod tests {
 					trashed: HashSet::from([uuid]),
 					..Default::default()
 				},
+				PassPaths::Whole,
 			)
 			.actions,
 			vec![SyncAction::UploadFile {
@@ -6340,5 +6507,470 @@ mod tests {
 	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
 	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 		Baseline::from_rows(rows.values().cloned())
+	}
+
+	/// A dirty-set reconcile plans exactly what a whole-map reconcile plans.
+	///
+	/// Generated rather than illustrative, because the narrowing is only safe by virtue of what the
+	/// DERIVATION guarantees about the paths it leaves out. So the cases are built the way a pass
+	/// builds them: [`derive::from_baseline`] carries the rows into the two maps, then mutations
+	/// stand in for what the pass observed, each recording the paths it moved off their row — which
+	/// is the whole of [`PassPaths::Changed`]'s contract. The corpus carries the shapes that break a
+	/// naive narrowing: every row state the baseline can hold, sibling names that fold together,
+	/// paths that are prefixes of one another, held conflicts, pushes no snapshot confirmed, moves
+	/// on either side, and a directory rename for the fold to find.
+	mod scoped {
+		use rand::{Rng, SeedableRng, rngs::StdRng};
+
+		use super::*;
+		use crate::sync_engine::derive;
+
+		/// How many generated cases each property runs over.
+		const CASES: u64 = 400;
+
+		/// The paths a case is drawn from, `(path, is_dir)`: nesting, two pairs of names that fold
+		/// together (`a`/`A`, `a/b.txt`/`a/B.txt`), a name that is a string prefix of a sibling's
+		/// (`a/b` and `a/b.txt`) and of another directory's (`a`, `ab`), a file and a directory
+		/// sharing a stem (`z`, `z.txt`), a rule file, and a childless directory spelled two ways
+		/// (`empty`, `Empty`) for the directory-move fold to have something it can actually carry.
+		const TREE: &[(&str, bool)] = &[
+			("a", true),
+			("a/b", true),
+			("a/b/c.txt", false),
+			("a/b.txt", false),
+			("a/B.txt", false),
+			("a/c", true),
+			("a/c/d.txt", false),
+			("ab", true),
+			("ab/x.txt", false),
+			("A", true),
+			("A/y.txt", false),
+			("d", true),
+			("d/e", true),
+			("d/e/f", true),
+			("d/e/f/g.txt", false),
+			("d/.filenignore", false),
+			("top.txt", false),
+			("Top.txt", false),
+			("z", true),
+			("z/1.txt", false),
+			("z.txt", false),
+			("empty", true),
+			("Empty", true),
+		];
+
+		const MODES: [SyncMode; 5] = [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::LocalBackup,
+			SyncMode::RemoteToLocal,
+			SyncMode::RemoteBackup,
+		];
+
+		/// What a generated baseline row records. Every state a row can be in, plus the two
+		/// half-recorded shapes a resolution writes on purpose.
+		#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+		enum Shape {
+			/// No row at all: a path the baseline has never tracked.
+			NoRow,
+			Synced,
+			/// A push no snapshot has confirmed yet.
+			Unconfirmed,
+			/// What a `KeepLocal` resolution leaves: the remote half cleared.
+			NoRemoteHalf,
+			/// What a `KeepRemote` resolution leaves: the local half cleared.
+			NoLocalHalf,
+			Conflicted,
+			Overwritten,
+			Adopted,
+		}
+
+		const SHAPES: [Shape; 8] = [
+			Shape::NoRow,
+			Shape::Synced,
+			Shape::Unconfirmed,
+			Shape::NoRemoteHalf,
+			Shape::NoLocalHalf,
+			Shape::Conflicted,
+			Shape::Overwritten,
+			Shape::Adopted,
+		];
+
+		/// What a generated observation found — one path moved off the node its row carries.
+		#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+		enum Change {
+			LocalEdit,
+			LocalGone,
+			LocalNew,
+			LocalFlip,
+			RemoteEdit,
+			RemoteGone,
+			RemoteNew,
+			RemoteFlip,
+			LocalMove,
+			RemoteMove,
+		}
+
+		const CHANGES: [Change; 10] = [
+			Change::LocalEdit,
+			Change::LocalGone,
+			Change::LocalNew,
+			Change::LocalFlip,
+			Change::RemoteEdit,
+			Change::RemoteGone,
+			Change::RemoteNew,
+			Change::RemoteFlip,
+			Change::LocalMove,
+			Change::RemoteMove,
+		];
+
+		fn index_of(path: &str) -> usize {
+			TREE.iter()
+				.position(|(candidate, _)| *candidate == path)
+				.expect("the generated tree holds that path")
+		}
+
+		fn kind_at(index: usize) -> NodeKind {
+			if TREE[index].1 {
+				NodeKind::Dir
+			} else {
+				NodeKind::File
+			}
+		}
+
+		fn uuid_at(index: usize) -> Uuid {
+			Uuid::from_u128(1000 + index as u128)
+		}
+
+		fn hash_at(index: usize, version: u8) -> [u8; 32] {
+			[(index as u8).wrapping_mul(7).wrapping_add(version); 32]
+		}
+
+		/// The row a converged pass would have written for `index`, bent into `shape`.
+		fn row(index: usize, shape: Shape) -> Option<BaselineEntry> {
+			let (path, is_dir) = TREE[index];
+			let uuid = uuid_at(index);
+			let mut entry = if is_dir {
+				base_dir(path, uuid)
+			} else {
+				base_file(path, uuid, hash_at(index, 0))
+			};
+			match shape {
+				Shape::NoRow => return None,
+				Shape::Synced => {}
+				Shape::Unconfirmed => entry.agreed_hash = None,
+				Shape::NoRemoteHalf => {
+					entry.remote_uuid = None;
+					entry.remote_stable_uuid = None;
+				}
+				Shape::NoLocalHalf => {
+					entry.local_mtime = None;
+					entry.content_hash = None;
+				}
+				Shape::Conflicted => entry.state = BaselineState::Conflicted,
+				Shape::Overwritten => entry.state = BaselineState::Overwritten,
+				Shape::Adopted => entry.state = BaselineState::Adopted,
+			}
+			Some(entry)
+		}
+
+		fn local_node_at(index: usize, kind: NodeKind, version: u8) -> LocalNode {
+			let (path, _) = TREE[index];
+			match kind {
+				NodeKind::Dir => local_dir(path),
+				NodeKind::File => local_file(path, hash_at(index, version)),
+			}
+		}
+
+		fn remote_node_at(index: usize, kind: NodeKind, version: u8) -> RemoteNode {
+			let (path, _) = TREE[index];
+			match kind {
+				NodeKind::Dir => remote_dir_node(path, uuid_at(index)),
+				// A new version of the same lineage where `version` moved, which is what an edit
+				// announced on an existing file looks like.
+				NodeKind::File => remote_version(
+					path,
+					uuid_at(index),
+					Uuid::from_u128(9000 + index as u128 * 4 + u128::from(version)),
+					hash_at(index, version),
+				),
+			}
+		}
+
+		fn at(path: &str, mut node: LocalNode) -> LocalNode {
+			node.rel_path = path.to_string();
+			node
+		}
+
+		fn at_remote(path: &str, mut node: RemoteNode) -> RemoteNode {
+			node.rel_path = path.to_string();
+			node
+		}
+
+		/// Put one observed change into the maps, and the paths it is evidence about into the set.
+		fn observe(
+			change: Change,
+			index: usize,
+			elsewhere: usize,
+			local: &mut HashMap<String, LocalNode>,
+			remote: &mut HashMap<String, RemoteNode>,
+			decided: &mut BTreeSet<String>,
+		) {
+			let (path, _) = TREE[index];
+			let (other, _) = TREE[elsewhere];
+			let kind = kind_at(index);
+			let flipped = match kind {
+				NodeKind::Dir => NodeKind::File,
+				NodeKind::File => NodeKind::Dir,
+			};
+			decided.insert(path.to_string());
+			match change {
+				Change::LocalEdit => {
+					local.insert(path.to_string(), local_node_at(index, kind, 1));
+				}
+				Change::LocalGone => {
+					local.remove(path);
+				}
+				Change::LocalNew => {
+					local.insert(path.to_string(), local_node_at(index, kind, 0));
+				}
+				Change::LocalFlip => {
+					local.insert(path.to_string(), local_node_at(index, flipped, 1));
+				}
+				Change::RemoteEdit => {
+					remote.insert(path.to_string(), remote_node_at(index, kind, 1));
+				}
+				Change::RemoteGone => {
+					remote.remove(path);
+				}
+				Change::RemoteNew => {
+					remote.insert(path.to_string(), remote_node_at(index, kind, 0));
+				}
+				Change::RemoteFlip => {
+					remote.insert(path.to_string(), remote_node_at(index, flipped, 1));
+				}
+				// A rename carries what the row records to another path. Both ends are evidence, so
+				// both are decided — which is what the watcher's rename pair and the cache's
+				// `Renamed` entry each give the pass.
+				Change::LocalMove => {
+					decided.insert(other.to_string());
+					local.remove(path);
+					local.insert(other.to_string(), at(other, local_node_at(index, kind, 0)));
+				}
+				Change::RemoteMove => {
+					decided.insert(other.to_string());
+					remote.remove(path);
+					remote.insert(
+						other.to_string(),
+						at_remote(other, remote_node_at(index, kind, 0)),
+					);
+				}
+			}
+		}
+
+		/// One generated case: what a change-scoped pass holds when it reaches the reconcile.
+		struct Case {
+			baseline: Baseline,
+			local: HashMap<String, LocalNode>,
+			remote: HashMap<String, RemoteNode>,
+			decided: BTreeSet<String>,
+			holds: PassHolds,
+		}
+
+		/// What the corpus exercised, so a generator that degenerated cannot pass by proving
+		/// nothing.
+		#[derive(Default)]
+		struct Coverage {
+			shapes: BTreeSet<Shape>,
+			changes: BTreeSet<Change>,
+			actions: usize,
+			folds: usize,
+		}
+
+		fn generate(seed: u64, seen: &mut Coverage) -> Case {
+			let mut rng = StdRng::seed_from_u64(seed);
+			// Decided up front because it constrains the rows: a case-only directory rename is only
+			// ever folded where nothing at either end is withheld, and a row that records one side
+			// only withholds its path (`derive::Derived::held`). Drawn here, applied below.
+			let stage_rename = rng.random_range(0..3) == 0;
+			let renamed = [index_of("empty"), index_of("Empty")];
+			let mut rows = Vec::new();
+			for index in 0..TREE.len() {
+				let shape = if stage_rename && renamed.contains(&index) {
+					Shape::Synced
+				} else {
+					SHAPES[rng.random_range(0..SHAPES.len())]
+				};
+				seen.shapes.insert(shape);
+				if let Some(entry) = row(index, shape) {
+					rows.push(entry);
+				}
+			}
+			let baseline = Baseline::from_rows(rows);
+			// Exactly as a pass assembles them: the rows carried into both maps, and every row that
+			// cannot stand in for itself in the set and held.
+			let derive::Derived {
+				mut local,
+				mut remote,
+				dirty,
+				held,
+				..
+			} = derive::from_baseline(&baseline, BTreeSet::new());
+			let mut decided = dirty;
+			for _ in 0..rng.random_range(0..7) {
+				let change = CHANGES[rng.random_range(0..CHANGES.len())];
+				seen.changes.insert(change);
+				observe(
+					change,
+					rng.random_range(0..TREE.len()),
+					rng.random_range(0..TREE.len()),
+					&mut local,
+					&mut remote,
+					&mut decided,
+				);
+			}
+			// One directory spelled `empty` on disk and `Empty` on the remote, for the fold to
+			// find. Staged outright: hitting both halves of a case-only rename at random is rare,
+			// and the fold is one of the shapes this has to cover.
+			if stage_rename {
+				local.insert("empty".to_string(), local_dir("empty"));
+				local.remove("Empty");
+				remote.insert(
+					"Empty".to_string(),
+					remote_dir_node("Empty", uuid_at(index_of("Empty"))),
+				);
+				remote.remove("empty");
+				decided.insert("empty".to_string());
+				decided.insert("Empty".to_string());
+			}
+			let mut held_remote = held;
+			// The cache showing one name twice withholds that path. A pass always decides such a
+			// path: what withheld it was an announcement about it.
+			if rng.random_range(0..4) == 0 {
+				let path = TREE[rng.random_range(0..TREE.len())].0.to_string();
+				decided.insert(path.clone());
+				held_remote.insert(path);
+			}
+			// A path the set names that nothing sits on — a changelist entry for something created
+			// and deleted between two passes. Spurious dirt must change nothing.
+			if rng.random_range(0..3) == 0 {
+				decided.insert(format!(
+					"{}/never-synced",
+					TREE[rng.random_range(0..TREE.len())].0
+				));
+			}
+			Case {
+				baseline,
+				local,
+				remote,
+				decided,
+				holds: PassHolds {
+					held_remote,
+					..PassHolds::default()
+				},
+			}
+		}
+
+		/// Both reconciles over one case's inputs, asserted equal down to the deferral count.
+		fn assert_same_plan(seed: u64, mode: SyncMode, case: &Case, seen: &mut Coverage) {
+			let Case {
+				baseline,
+				local,
+				remote,
+				decided,
+				holds,
+			} = case;
+			let whole = reconcile(mode, baseline, local, remote, holds, PassPaths::Whole);
+			let scoped = reconcile(
+				mode,
+				baseline,
+				local,
+				remote,
+				holds,
+				PassPaths::Changed(decided),
+			);
+			assert_eq!(
+				whole.actions, scoped.actions,
+				"seed {seed}, {mode:?}: the narrowed reconcile planned something else"
+			);
+			assert_eq!(
+				whole.deferred_paths, scoped.deferred_paths,
+				"seed {seed}, {mode:?}: the narrowed reconcile counted different deferrals"
+			);
+			seen.actions += whole.actions.len();
+		}
+
+		#[test]
+		fn a_dirty_set_reconcile_plans_what_a_whole_map_reconcile_plans() {
+			let mut seen = Coverage::default();
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				for mode in MODES {
+					assert_same_plan(seed, mode, &case, &mut seen);
+				}
+			}
+			assert_eq!(seen.shapes.len(), SHAPES.len(), "{:?}", seen.shapes);
+			assert_eq!(seen.changes.len(), CHANGES.len(), "{:?}", seen.changes);
+			assert!(
+				seen.actions > 1_000,
+				"the corpus planned only {} action(s), so the two plans agreed on almost nothing",
+				seen.actions
+			);
+		}
+
+		/// The case as it stands once the directory-move fold has run over it, with the set re-keyed
+		/// exactly as `Prepared::fold_dir_moves` re-keys it, and how many moves that took.
+		fn fold(case: &Case, mode: SyncMode) -> (Case, usize) {
+			let mut baseline = Arc::new(case.baseline.clone());
+			let mut local = case.local.clone();
+			let mut remote = case.remote.clone();
+			let mut decided = case.decided.clone();
+			let moves = fold_dir_moves(
+				mode,
+				&mut baseline,
+				&mut local,
+				&mut remote,
+				&case.holds.held_remote,
+			);
+			for action in &moves {
+				let (from, to) = action.endpoints();
+				decided = decided
+					.into_iter()
+					.map(|path| moved_path(&path, from, to).unwrap_or(path))
+					.collect();
+			}
+			let folded = Case {
+				baseline: Arc::unwrap_or_clone(baseline),
+				local,
+				remote,
+				decided,
+				holds: PassHolds {
+					held_remote: case.holds.held_remote.clone(),
+					..PassHolds::default()
+				},
+			};
+			(folded, moves.len())
+		}
+
+		/// The same property after the directory-move fold a pass runs first. The fold re-keys the
+		/// maps and the baseline together, so the set has to follow them — which is what
+		/// `Prepared::fold_dir_moves` does for the real pass, and what this pins.
+		#[test]
+		fn a_dirty_set_reconcile_agrees_once_a_directory_move_is_folded() {
+			let mut seen = Coverage::default();
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				for mode in MODES {
+					let (after, moves) = fold(&case, mode);
+					seen.folds += moves;
+					assert_same_plan(seed, mode, &after, &mut seen);
+				}
+			}
+			assert!(
+				seen.folds > 100,
+				"only {} directory move(s) were folded, so this tested almost nothing",
+				seen.folds
+			);
+		}
 	}
 }

@@ -509,13 +509,21 @@ mod tests {
 			held_remote: derived.held.clone(),
 			..PassHolds::default()
 		};
-		let whole = plan::reconcile(SyncMode::TwoWay, baseline, local, remote, &holds);
+		let whole = plan::reconcile(
+			SyncMode::TwoWay,
+			baseline,
+			local,
+			remote,
+			&holds,
+			plan::PassPaths::Whole,
+		);
 		let scoped = plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
 			&derived.local,
 			&derived.remote,
 			&holds,
+			plan::PassPaths::Whole,
 		);
 		assert_eq!(
 			scoped.actions, whole.actions,
@@ -750,6 +758,7 @@ mod tests {
 			&derived.local,
 			&derived.remote,
 			&holds,
+			plan::PassPaths::Whole,
 		);
 		assert!(
 			!scoped.actions.iter().any(|action| matches!(
@@ -759,7 +768,14 @@ mod tests {
 			"a path in neither map is decided by nobody: {:?}",
 			scoped.actions
 		);
-		let whole = plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote.nodes, &holds);
+		let whole = plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote.nodes,
+			&holds,
+			plan::PassPaths::Whole,
+		);
 		assert!(
 			whole.actions.len() > scoped.actions.len(),
 			"the whole-tree pass is the one that picks it up: {:?}",
