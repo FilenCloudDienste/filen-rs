@@ -24,7 +24,7 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
 		PathFailure, PendingRow,
 	},
-	changes::{FullPassReason, PairChanges, PassScope},
+	changes::{FullPassReason, PairChanges, PassScope, RemoteDeltaEntry},
 	derive::{self, Derived},
 	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
@@ -1433,6 +1433,12 @@ struct Prepared {
 	baseline: Arc<Baseline>,
 	/// What this pass read, and why (see [`PassRead`]).
 	read: PassRead,
+	/// The announced remote changes this pass CONSUMED — kept so a pass cut short can hand them
+	/// back to the next one (see [`next_pass_scope`] and `changes`'s module docs).
+	///
+	/// Empty on a whole read: its remote evidence was the snapshot, which is in no changelist to
+	/// begin with and cannot be handed anywhere.
+	remote_delta: Vec<RemoteDeltaEntry>,
 	/// The directory moves this pass makes, in the order they run (see [`plan::fold_dir_moves`]).
 	/// `baseline`, `local_scan` and `remote_view` are already keyed by the paths those subtrees
 	/// end up at.
@@ -2924,9 +2930,12 @@ impl SyncEngine {
 		let root = inputs.record.remote_root;
 		let for_remote = Arc::clone(&inputs.baseline);
 		let nodes = mem::take(&mut derived.remote);
-		let observed = tokio::task::spawn_blocking(move || {
+		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
+		// pass cut short hands it to the next one (see `Prepared::remote_delta`).
+		let (observed, delta) = tokio::task::spawn_blocking(move || {
 			let mut ancestry = |uuid| cache_ancestry(&cache_db, uuid);
-			observe_remote(root, &for_remote, nodes, &delta, &mut ancestry)
+			let observed = observe_remote(root, &for_remote, nodes, &delta, &mut ancestry);
+			(observed, delta)
 		})
 		.await
 		.map_err(|e| {
@@ -3167,6 +3176,7 @@ impl SyncEngine {
 			record: inputs.record,
 			baseline: inputs.baseline,
 			read: PassRead::Scoped(mem::take(&mut derived.decided)),
+			remote_delta: delta,
 			dir_moves: Vec::new(),
 			local_scan,
 			remote_view: view,
@@ -3366,6 +3376,8 @@ impl SyncEngine {
 			record,
 			baseline,
 			read,
+			// A whole read derives nothing from the announced changes, so it has none to hand on.
+			remote_delta: Vec::new(),
 			dir_moves: Vec::new(),
 			local_scan,
 			remote_view,
@@ -4469,6 +4481,14 @@ impl SyncEngine {
 		// owes the next one everything that plan named.
 		self.carry_forward(pair, &prep, &report, &decision).await;
 
+		// The return below hands back the LOCAL half alone: `note_owed_remote` sits after the
+		// apply, since `report.interrupted` is what gates it and nothing has applied anything yet.
+		// That is the shape this stage's first attempt was reverted for, and it is safe here only
+		// because a pass with an empty `safe` list either planned nothing at all or had every
+		// action held or dropped — a hold sets `decision.reason`, which `next_pass_scope` reads as
+		// `DeletionHold`, and a drop counts in `dropped_actions`, which it reads as
+		// `UnappliedWork`. Both send the next pass to a whole read, which needs no hand-back. A
+		// change that let an action reach `held` without a reason would break that silently.
 		if decision.safe.is_empty() {
 			tracing::debug!(
 				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s), {} path(s) deferred)",
@@ -4511,6 +4531,17 @@ impl SyncEngine {
 			.collect();
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
 		self.note_path_outcomes(pair, &attempted, &mut report).await;
+		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
+		// above recorded the paths the plan named; this puts the announced changes back with them,
+		// and without them the next pass would derive those paths' remote side from baseline rows
+		// that still say the item is there — losing every action owed to a remote absence (see
+		// `next_pass_scope` and `changes`'s module docs). A whole read hands back an empty delta,
+		// and forces a whole read instead.
+		if report.interrupted > 0
+			&& let Some(changes) = self.existing_pair_changes(pair).await
+		{
+			changes.note_owed_remote(mem::take(&mut prep.remote_delta));
+		}
 		// After the apply, which carries rows along with the directory moves the roots were re-keyed by.
 		self.untrack_ignored(pair, &prep, &mut report).await;
 		tracing::debug!(
@@ -4542,14 +4573,25 @@ impl SyncEngine {
 ///
 /// Decided purely so the policy is unit-testable. The rule behind the rows: a pass consumed both
 /// changelists to make its plan, so anything it planned and did NOT carry out is in no list any
-/// more and only a whole-tree read finds it again.
+/// more and only a whole-tree read finds it again — unless the pass handed both lists back, which
+/// is the one row that reads `full_pass` rather than the outcome alone.
 fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	if report.refused.is_some() {
 		return Some(FullPassReason::PreviousRefusal);
 	}
-	// Either shape of a cut-short pass: one that took the changelists and was cancelled before it
-	// had a plan (`paused`), and one whose plan was abandoned part-way (`interrupted`).
-	if report.paused || report.interrupted > 0 {
+	// Either shape of a cut-short pass, and they part company here.
+	//
+	// A cancel that landed before there was a plan (`paused`) took both changelists and has
+	// nothing to show for them: no plan named the paths, and the lists went with the pass.
+	//
+	// A plan abandoned part-way (`interrupted`) does: `carry_forward` recorded the paths it named
+	// and the apply handed its announced changes back (`note_owed_remote`), so the next pass
+	// re-plans what this one did not reach from the same evidence. That holds only for a pass that
+	// PLANNED from its changelists — one that read both sides whole planned from a snapshot and a
+	// walk, which no list can hand back, so its remainder still wants a whole read. `full_pass` is
+	// exactly that question: `None` is a change-scoped pass (a dry run reads it too, and never
+	// reaches this).
+	if report.paused || (report.interrupted > 0 && report.full_pass.is_some()) {
 		return Some(FullPassReason::InterruptedPass);
 	}
 	// A pass that planned work and did not apply it: the drive-write lock it could not take (its
@@ -5028,9 +5070,9 @@ mod tests {
 	}
 
 	/// The rows of the full-pass trigger table that are facts about the PREVIOUS pass: a refusal is
-	/// whole-tree state, either shape of a cut-short pass took the changelists without applying
-	/// what it took, so did a pass that planned work it could not carry out, and so did every
-	/// deletion hold.
+	/// whole-tree state, a cut-short pass that read both sides whole planned from evidence no
+	/// changelist holds — a change-scoped one hands its two lists back instead — so did a pass
+	/// that planned work it could not carry out, and so did every deletion hold.
 	#[test]
 	fn a_passs_outcome_decides_whether_the_next_one_reads_everything() {
 		assert_eq!(
@@ -5064,9 +5106,28 @@ mod tests {
 		assert_eq!(
 			next_pass_scope(&SyncReport {
 				interrupted: 3,
+				full_pass: Some(FullPassReason::SafetyNet),
 				..SyncReport::default()
 			}),
-			Some(FullPassReason::InterruptedPass)
+			Some(FullPassReason::InterruptedPass),
+			"a whole read's evidence is in no changelist, so its remainder needs another one"
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				interrupted: 3,
+				..SyncReport::default()
+			}),
+			None,
+			"a change-scoped pass hands both its lists back, so the next one re-plans from them"
+		);
+		assert_eq!(
+			next_pass_scope(&SyncReport {
+				interrupted: 3,
+				failed_paths: vec![("a.txt".to_string(), "boom".to_string())],
+				..SyncReport::default()
+			}),
+			Some(FullPassReason::UnappliedWork),
+			"an action that FAILED is a debt of its own, and still wants a whole read"
 		);
 
 		// EVERY deletion hold: three want evidence only a whole-tree read supplies, and the other
@@ -5276,6 +5337,7 @@ mod tests {
 			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
 		Prepared {
 			read: PassRead::Whole(Some(FullPassReason::SafetyNet)),
+			remote_delta: Vec::new(),
 			record: PairRecord {
 				id: PAIR,
 				local_root: String::new(),

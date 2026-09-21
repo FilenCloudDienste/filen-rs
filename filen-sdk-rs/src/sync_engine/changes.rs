@@ -31,9 +31,23 @@
 //! the pass has it). What arrives after the take stays queued for the next pass, which is the same
 //! argument `Observations::snapshot` makes for the announcement map. Replaying a superset is
 //! harmless; replaying a SUBSET is the unsafe direction, and the take-before-read order rules it
-//! out — which is also why no observation counter is needed here: a pass that failed or was
-//! interrupted before it applied what it took forces the next one full
-//! ([`FullPassReason::InterruptedPass`]), so the drained entries are covered by a whole-tree read.
+//! out — which is also why no observation counter is needed here.
+//!
+//! # What an interrupted pass hands back
+//!
+//! A pass cut short part-way through its plan carried out only some of it, and the lists it
+//! drained to make that plan are gone. Both halves come back: the paths the plan named, through
+//! [`note_owed`](PairChanges::note_owed), and the announced changes it consumed, through
+//! [`note_owed_remote`](PairChanges::note_owed_remote). BOTH — or the hand-back loses the very
+//! action it exists for. The next pass derives the remote side of a locally-dirty path from that
+//! path's baseline row, which still says the item is on the server, so an action owed from a
+//! remote ABSENCE (the local delete answering a `Gone`, the local move answering a remote one)
+//! would go unplanned until the safety net. Replaying the delta is what puts the absence back,
+//! and replaying it a second time costs nothing, since every entry is idempotent.
+//!
+//! A pass that read both sides WHOLE has nothing to hand back that would do: its evidence was the
+//! snapshot, which no changelist can restore, so it forces the next pass full
+//! ([`FullPassReason::InterruptedPass`]).
 //!
 //! # Rule files
 //!
@@ -152,8 +166,13 @@ pub enum FullPassReason {
 	/// holding pass consumed. Until a carry-over set carries those paths, reading everything is
 	/// the only way to reproduce them.
 	DeletionHold,
-	/// The previous pass was cancelled or interrupted, so what it did not get to is unknown. The
-	/// conservative answer until a carry-over set exists.
+	/// The previous pass was cut short while reading both sides WHOLE, so what it did not get to
+	/// is evidence no changelist holds.
+	///
+	/// A change-scoped pass cut short is NOT this: it planned from its two lists and hands both of
+	/// them back on its way out (see the module docs), so the next pass re-plans what it missed
+	/// from the same evidence. A cancel that landed before there was a plan at all still is —
+	/// there was nothing to hand back, and the lists went with the pass.
 	InterruptedPass,
 	/// The device-wide ignore patterns or the pair's mode changed: what is hidden, or what an
 	/// action MEANS, changed for every path.
@@ -499,6 +518,13 @@ struct ChangeState {
 	/// fact applied. Replaced by every pass that made a plan, never accumulated: it is rebuilt from
 	/// that pass's own plan.
 	owed: BTreeSet<String>,
+	/// The other half of [`owed`](Self::owed): the announced changes the previous pass consumed,
+	/// handed back when it was cut short before it applied them (see the module docs).
+	///
+	/// Outside the tree-scaled cap for the same reason `owed` is, and REPLAYED IN FRONT of
+	/// whatever arrived since, which is the order the cache dispatched them in. Bounded all the
+	/// same — see [`note_owed_remote`](PairChanges::note_owed_remote).
+	owed_remote: Vec<RemoteDeltaEntry>,
 }
 
 impl PairChanges {
@@ -617,6 +643,25 @@ impl PairChanges {
 		self.state().owed = owed;
 	}
 
+	/// Record the announced changes a pass consumed and was cut short before it applied — the
+	/// remote half of [`note_owed`](Self::note_owed), and the half without which the next pass
+	/// derives those paths' remote side from rows that still say the item is there (see the module
+	/// docs). REPLACES what the last pass left, exactly as the local half does.
+	///
+	/// Bounded like the lists themselves: a RUN of cut-short passes hands the same changes on
+	/// again with whatever arrived between them, and a queue that only grows is the one thing a
+	/// changelist may not become. Against the absolute [`DIRTY_CAP`] rather than the tree-scaled
+	/// [`dirty_cap`] — one pass's delta is already under that, so this can only answer a run of
+	/// them, and never the first sync whose cap sits at its floor.
+	pub(super) fn note_owed_remote(&self, delta: Vec<RemoteDeltaEntry>) {
+		let mut state = self.state();
+		if delta.len() > DIRTY_CAP {
+			state.remote.collapse(FullPassReason::RemoteOverflow);
+			return;
+		}
+		state.owed_remote = delta;
+	}
+
 	/// Whether something has ALREADY made the next pass a whole-tree one — the same table
 	/// [`take`](Self::take) reads, asked without taking anything.
 	///
@@ -649,6 +694,7 @@ impl PairChanges {
 		// The previous pass's unfinished business: owed whatever the changelists hold, and not
 		// subject to their cap (see `ChangeState::owed`).
 		let owed = mem::take(&mut state.owed);
+		let owed_remote = mem::take(&mut state.owed_remote);
 		// Taken with the lists, so what is recorded from here on is the NEXT pass's (see `forced`).
 		let forced = mem::take(&mut state.forced);
 		// Most specific first: a permanently degraded source, then no watcher at all, then evidence
@@ -661,9 +707,18 @@ impl PairChanges {
 			.or(forced);
 		let mut paths = local.paths;
 		paths.extend(owed);
+		// Replayed FIRST: they were dispatched before anything that arrived while the pass ran,
+		// and the delta is applied in dispatch order.
+		let entries = if owed_remote.is_empty() {
+			remote.entries
+		} else {
+			let mut entries = owed_remote;
+			entries.extend(remote.entries);
+			entries
+		};
 		PassScope {
 			local: paths,
-			remote: remote.entries,
+			remote: entries,
 			full,
 		}
 	}
@@ -845,6 +900,97 @@ pub(super) mod tests {
 		changes.note_owed(BTreeSet::from(["first.txt".to_string()]));
 		changes.note_owed(BTreeSet::from(["second.txt".to_string()]));
 		assert_eq!(taken(&changes).0, vec!["second.txt".to_string()]);
+	}
+
+	/// A removal of `uuid`, as the cache announces one.
+	fn removed(uuid: u128) -> CacheEvent<'static> {
+		cache_event(
+			Some(uuid as u64),
+			CacheEventType::File(FileEvent::Removed(Uuid::from_u128(uuid))),
+		)
+	}
+
+	/// The delta entries a pass takes for those removals — minted the one way a `Gone` can be.
+	fn minted_delta(uuids: &[u128]) -> Vec<RemoteDeltaEntry> {
+		let changes = sized_pair();
+		let events: Vec<CacheEvent<'static>> = uuids.iter().copied().map(removed).collect();
+		changes.note_remote_batch(&mut events.iter());
+		changes.take().take_remote()
+	}
+
+	/// An interrupted pass hands BOTH lists back, and its announced changes lead the ones that
+	/// arrived while it ran — the order the cache dispatched them in, which is the order the next
+	/// pass applies them to its derived view.
+	#[test]
+	fn an_interrupted_passs_announced_changes_come_back_ahead_of_the_newer_ones() {
+		let handed = minted_delta(&[100, 101]);
+		let newer = [removed(102)];
+		let changes = sized_pair();
+		changes.note_owed(BTreeSet::from(["gone.txt".to_string()]));
+		changes.note_owed_remote(handed.clone());
+		changes.note_remote_batch(&mut newer.iter());
+
+		let mut scope = changes.take();
+		assert_eq!(
+			scope.full_pass_reason(10),
+			None,
+			"a hand-back is something to look at, not a reason to read everything"
+		);
+		assert_eq!(
+			scope.take_remote(),
+			[handed, minted_delta(&[102])].concat(),
+			"the replayed changes must lead the ones that arrived while the pass ran"
+		);
+		assert_eq!(
+			scope.take_local(),
+			BTreeSet::from(["gone.txt".to_string()]),
+			"and the paths that pass's plan owed come with them"
+		);
+		// Taken with the lists: they belong to the pass that took them now.
+		assert!(
+			changes.take().take_remote().is_empty(),
+			"a handed-back change was replayed to two passes"
+		);
+	}
+
+	/// And the cap does not touch them, for the reason it does not touch the owed paths: the
+	/// hand-back is the previous pass's own list, so collapsing on it would make an interrupted
+	/// first sync — where `dirty_cap` sits at its floor — read everything for ever.
+	#[test]
+	fn the_handed_back_changes_join_the_next_pass_outside_the_cap() {
+		let handed = minted_delta(&(200..250).collect::<Vec<u128>>());
+		let changes = PairChanges::new();
+		changes.cover_local();
+
+		changes.note_owed_remote(handed.clone());
+		let mut scope = changes.take();
+		assert_eq!(
+			scope.full_pass_reason(10),
+			None,
+			"the cap collapsed a pass onto its own hand-back"
+		);
+		assert_eq!(scope.take_remote().len(), handed.len());
+	}
+
+	/// A run of cut-short passes hands the same changes on with whatever arrived between them, so
+	/// the hand-back is bounded like the lists are: past the cap it collapses to a whole read
+	/// rather than growing a queue nothing drains.
+	#[test]
+	fn a_hand_back_past_the_cap_collapses_to_a_whole_read() {
+		let one = minted_delta(&[300]).remove(0);
+		let changes = sized_pair();
+
+		changes.note_owed_remote(vec![one; DIRTY_CAP + 1]);
+		let scope = changes.take();
+		assert_eq!(
+			scope.full_pass_reason(10),
+			Some(R::RemoteOverflow),
+			"a hand-back past the cap must collapse, not queue"
+		);
+		assert!(
+			scope.remote.is_empty(),
+			"a collapsed list hands the pass nothing to narrow itself with"
+		);
 	}
 
 	/// What a wake has to look at, and what the pass may therefore skip entirely.
