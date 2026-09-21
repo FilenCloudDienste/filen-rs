@@ -3202,27 +3202,31 @@ impl SyncEngine {
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
 		let observed = self.observed.snapshot();
-		let snapshot = self
-			.client
-			.enumerate_sync_root_snapshot(record.remote_root)
-			.await?;
 		// One view, built once and unfiltered at first: what the snapshot confirms, which remote
 		// rule files there are, which of this engine's own writes the cache has caught up to, and
 		// whether the remote reads as emptied are facts about the remote as it is, whatever the
 		// rules hide — and the rules cannot be known until the scan below has read the
 		// `.filenignore` files on disk. Those reads come first; then the very rules the scan
 		// matched with hide what they hide, in place (see `RemoteView::filter`).
-		let mut view = plan::place_remote_items(
-			record.remote_root,
-			&snapshot.dirs,
-			&snapshot.files,
-			&snapshot.undecodable,
-		);
-		// Every row of the snapshot the pass still needs is in the view now; the objects it ACTS
-		// on are read back whole by uuid, for the handful a plan names. So the payloads go here,
-		// before the local scan, rather than being carried to the end of the pass.
-		let remote_converged = snapshot.watermark.is_some();
-		drop(snapshot);
+		//
+		// Built from the cache's rows AS THEY ARRIVE. A materialized read hands back two `Vec`s
+		// of the whole subtree, and at a million items that is a second copy of the tree, alive
+		// beside the view built out of it at the widest point the pass ever reaches. The
+		// baseline's row count sizes the map, so a converged pair's view never grows one.
+		//
+		// A read that fails partway takes the builder with it (see `stream_sync_root_snapshot`):
+		// this pass gets an error, never a view with holes in it.
+		let (built, watermark) = self
+			.client
+			.stream_sync_root_snapshot(
+				record.remote_root,
+				plan::ViewBuilder::with_capacity(record.remote_root, baseline.len()),
+			)
+			.await?;
+		// Every row the pass still needs is in the view now; the objects it ACTS on are read back
+		// whole by uuid, for the handful a plan names.
+		let mut view = built.finish();
+		let remote_converged = watermark.is_some();
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
 		// view — before this engine's own writes are folded into it, and before the baseline is
