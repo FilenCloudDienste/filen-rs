@@ -24,6 +24,7 @@ use std::{
 	fmt::Write as _,
 	fs,
 	path::{Path, PathBuf},
+	sync::Arc,
 	time::{Duration, Instant},
 };
 
@@ -431,6 +432,43 @@ fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) -
 		changed.insert(node.rel_path.clone());
 	}
 	changed
+}
+
+/// Move every remote node at `from` or under it to the same place under `to`, which is what the
+/// view holds after somebody moved that directory on the remote — the input the directory-move
+/// fold is measured on.
+fn rekey_remote_subtree(remote: &mut HashMap<String, RemoteNode>, from: &str, to: &str) {
+	let moving: Vec<(String, String)> = remote
+		.keys()
+		.filter_map(|path| Some((path.clone(), plan::moved_path(path, from, to)?)))
+		.collect();
+	for (old, new) in moving {
+		let Some(mut node) = remote.remove(&old) else {
+			continue;
+		};
+		node.rel_path = new.clone();
+		remote.insert(new, node);
+	}
+}
+
+/// A synced file row, for a phase that needs rows to exist and nothing more of them.
+fn plain_row(rel_path: &str) -> BaselineEntry {
+	BaselineEntry {
+		rel_path: rel_path.to_string(),
+		kind: NodeKind::File,
+		remote_uuid: None,
+		content_hash: None,
+		size: Some(0),
+		local_mtime: Some(0),
+		remote_modified: Some(0),
+		state: BaselineState::Synced,
+		local_kind: None,
+		remote_kind: None,
+		remote_hash: None,
+		remote_size: None,
+		remote_stable_uuid: None,
+		agreed_hash: None,
+	}
 }
 
 /// Everything a pass does locally, end to end, on inputs it re-reads itself: the phases above in
@@ -1084,6 +1122,80 @@ pub fn run() -> String {
 		&format!("{} moves found", moves.len()),
 	);
 
+	// The same fold at the scope a change-scoped pass gives it. The pair is converged, so both find
+	// nothing — what the pair of lines says is what LOOKING costs, which is what every pass pays
+	// whether or not anything moved.
+	let idle_scope: BTreeSet<String> = local.keys().next().cloned().into_iter().collect();
+	let (scoped_moves, scoped_fold) = timed(|| {
+		plan::fold_dir_moves(
+			SyncMode::TwoWay,
+			&mut baseline,
+			&mut local,
+			&mut remote,
+			&held,
+			plan::PassPaths::Changed(&idle_scope),
+		)
+	});
+	probe.record(
+		"fold_dir_moves_scoped_zero",
+		idle_scope.len(),
+		scoped_fold,
+		&format!("{} moves found, one changed path", scoped_moves.len()),
+	);
+
+	// The widest single move a pass can fold: a whole top-level directory moved on the remote, so
+	// one action carries every row under it. Measured at both scopes over the same subtree in the
+	// same run — the remote's copy is moved to the other name before each, so the second fold
+	// carries the directory back and the three structures end where they started.
+	//
+	// The store held the other handle on the resident tree until `baseline_first_write` above took
+	// its own copy, so this detaching write is free; it is here so that a run which ever stops
+	// being true cannot charge a whole-tree clone to the fold.
+	let _ = Arc::make_mut(&mut baseline);
+	let moved_root = format!("{rename_root}-moved");
+	let move_scope = BTreeSet::from([rename_root.clone(), moved_root.clone()]);
+	let mut remote_at = rename_root.clone();
+	for (phase, scope) in [
+		("fold_dir_moves_dir_whole", plan::PassPaths::Whole),
+		(
+			"fold_dir_moves_dir_scoped",
+			plan::PassPaths::Changed(&move_scope),
+		),
+	] {
+		let to = if remote_at == rename_root {
+			moved_root.clone()
+		} else {
+			rename_root.clone()
+		};
+		rekey_remote_subtree(&mut remote, &remote_at, &to);
+		remote_at = to;
+		let (dir_moves, dir_fold) = timed(|| {
+			plan::fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut baseline,
+				&mut local,
+				&mut remote,
+				&held,
+				scope,
+			)
+		});
+		assert_eq!(
+			dir_moves.len(),
+			1,
+			"{phase}: the moved directory must fold as exactly one move"
+		);
+		probe.record(
+			phase,
+			rename_rows,
+			dir_fold,
+			"one directory move carrying a whole top-level subtree",
+		);
+	}
+	assert_eq!(
+		remote_at, rename_root,
+		"the two folds must leave the tree where they found it"
+	);
+
 	// Where the reconcile's time actually goes. The phase below times the whole of it, which cannot
 	// say whether the cost is the KEY SET it builds before deciding anything or the per-path
 	// decisions themselves — and those two are removed by different changes, so a run that cannot
@@ -1508,6 +1620,34 @@ pub fn run() -> String {
 		cascade,
 		"delete_pair: one DELETE and the ON DELETE CASCADE over the pair's rows",
 	);
+
+	// What a row costs in a directory that holds very many of them. A node's children are ONE `Vec`
+	// of ids kept sorted by the folding comparator, so writing a row memmoves every id that sorts
+	// after it. Nothing a converged pass does hits that, but a subtree move writes one row per row
+	// it carries into the destination directory, so a move into a flat directory pays this per row
+	// — which is the ceiling that answers "what if somebody keeps 100k files in one folder".
+	//
+	// Last in the run, and on a tree of its own, because every phase above reports the process's
+	// peak RSS: a structure built earlier would raise that high-water mark for all of them and make
+	// this run's memory column incomparable with the ones already recorded.
+	const FLAT_CHILDREN: usize = 100_000;
+	const FLAT_INSERTS: usize = 1_000;
+	let mut flat =
+		Baseline::from_rows((0..FLAT_CHILDREN).map(|index| plain_row(&format!("flat/{index:07}"))));
+	let (_, flat_inserts) = timed(|| {
+		// `!` sorts before every digit, so each of these lands at the FRONT of the child vector:
+		// the worst position, and the one a name-ordered walk into a full directory keeps hitting.
+		for index in 0..FLAT_INSERTS {
+			flat.upsert(&plain_row(&format!("flat/!{index:06}")));
+		}
+	});
+	probe.record(
+		"baseline_insert_flat_dir",
+		FLAT_INSERTS,
+		flat_inserts,
+		&format!("one row at the front of a directory holding {FLAT_CHILDREN} children"),
+	);
+	drop(flat);
 
 	drop(store);
 	fs::remove_dir_all(&fixture.dir).ok();
