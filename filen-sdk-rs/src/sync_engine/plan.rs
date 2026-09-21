@@ -370,96 +370,136 @@ pub(crate) struct SkippedRemote {
 	pub(crate) reason: UnsyncableReason,
 }
 
-/// Place every item of a cache subtree snapshot rooted at `root` at its path, BEFORE the ignore
-/// rules and the collision check. Names are NFC-normalized so they key 1:1 against the local scan.
+/// Builds a [`RemoteView`] out of a cache subtree snapshot's items AS THEY ARRIVE, so the whole
+/// subtree never exists as a `Vec` beside the view built from it. Names are NFC-normalized so
+/// they key 1:1 against the local scan.
 ///
 /// An item that cannot be placed — an unsafe name, a broken parent chain, or metadata the cache
-/// could not decode (`undecodable`, which may hold other roots' records too: only those whose
+/// could not decode (the undecodable records, which may hold other roots' too: only those whose
 /// parent resolves under `root` are this view's) — is left out of `nodes` and recorded in
 /// [`RemoteView::skipped`]. A descendant of a skipped directory is left out with it and recorded
 /// under that directory's path and reason: its own uuid is still what a synced item moved beneath
 /// the directory is found by (see [`unknown_remote_paths`]).
 ///
-/// This is the view a pass reads the remote AS IT IS from: what the snapshot confirms, which remote
-/// rule files there are, which of this engine's own writes the cache has caught up to, and whether
-/// the remote came back emptied are facts about the remote whatever the rules hide. Those reads
-/// come first of necessity — the rules are not known until the local scan has read the
+/// This is the view a pass reads the remote AS IT IS from: what the snapshot confirms, which
+/// remote rule files there are, which of this engine's own writes the cache has caught up to, and
+/// whether the remote came back emptied are facts about the remote whatever the rules hide. Those
+/// reads come first of necessity — the rules are not known until the local scan has read the
 /// `.filenignore` files on disk — and then [`RemoteView::filter`] hides what they hide IN PLACE,
 /// leaving the one map reconcile, the folds and apply act on.
-pub(crate) fn place_remote_items(
+///
+/// The rows may arrive in any order (the read's statement promises none). An item whose ancestry
+/// has not arrived yet is set aside and placed by [`finish`](Self::finish), when the index is
+/// complete and every answer is final — so the view does not depend on the order, and a read that
+/// happens to hand over parents first sets nothing aside at all.
+pub(crate) struct ViewBuilder {
 	root: Uuid,
-	dirs: &[RemoteItem],
-	files: &[RemoteItem],
-	undecodable: &[UndecodableItem],
-) -> RemoteView {
-	let dir_index: HashMap<Uuid, (String, Uuid)> = dirs
-		.iter()
-		.map(|d| (d.uuid, (d.name.nfc().collect::<String>(), d.parent)))
-		.collect();
-	let undecodable_dirs: HashSet<Uuid> = undecodable
-		.iter()
-		.filter(|item| item.stable_uuid.is_none())
-		.map(|item| item.uuid)
-		.collect();
+	/// uuid -> (NFC name, parent) for every directory seen so far, which is what resolves a path.
+	dir_index: HashMap<Uuid, (String, Uuid)>,
+	/// Held until [`finish`](Self::finish): resolving an undecodable record's path needs the
+	/// COMPLETE index, since the record is placed at the directory that holds it.
+	undecodable: Vec<UndecodableItem>,
+	/// The undecodable DIRECTORIES, which placement needs from the first item on: nothing under
+	/// one can be placed, and the read hands them over before any item.
+	undecodable_dirs: HashSet<Uuid>,
+	nodes: HashMap<String, RemoteNode>,
+	held_paths: BTreeSet<String>,
+	skipped: Skipped,
+	/// Items whose ancestry the index could not answer for when they arrived (see the type doc).
+	deferred: Vec<(bool, RemoteItem)>,
+}
 
-	let mut skipped = Skipped::default();
-	for item in undecodable {
-		match resolve_parent(item.parent, root, &dir_index, &undecodable_dirs) {
-			Ok(rel_path) => skipped.record(SkippedRemote {
-				remote_uuid: item.uuid,
-				stable_uuid: item.stable_uuid,
-				rel_path,
-				// The holding directory's path: an undecodable item's own name is what the cache
-				// could not read.
-				path_is_dir: true,
-				reason: UnsyncableReason::RemoteUndecodable,
-			}),
-			Err(Unresolved::UnderSkipped(ancestor)) => {
-				skipped.under(item.uuid, item.stable_uuid, ancestor);
-			}
-			// Not under this root at all: another root's record.
-			Err(Unresolved::BrokenParent) => {}
+impl ViewBuilder {
+	/// A builder for `root`'s subtree, sized for a tree of `items`. A pass knows its baseline's
+	/// row count, which is the size of a converged pair's view — and a map that never grows is
+	/// one that never holds its old table and its new one at once.
+	pub(crate) fn with_capacity(root: Uuid, items: usize) -> Self {
+		Self {
+			root,
+			dir_index: HashMap::new(),
+			undecodable: Vec::new(),
+			undecodable_dirs: HashSet::new(),
+			nodes: HashMap::with_capacity(items),
+			held_paths: BTreeSet::new(),
+			skipped: Skipped::default(),
+			deferred: Vec::new(),
 		}
 	}
-	// The path of an item named `name` under `parent`, or `None` with the reason recorded. `is_dir`
-	// is the item's own kind, which is what the record's path means where the record is the item's
-	// own would-be path — taken from the caller rather than inferred from `stable_uuid`, which a
-	// file is merely expected to carry.
-	let mut place = |name: &str,
-	                 parent: Uuid,
-	                 remote_uuid: Uuid,
-	                 stable_uuid: Option<StableUuid>,
-	                 is_dir: bool| {
-		let skip = match resolve_parent(parent, root, &dir_index, &undecodable_dirs) {
-			Ok(parent_path) if is_safe_name(name) => return Some(join_path(&parent_path, name)),
+
+	/// The records the cache could not decode, taken before the first item (see
+	/// [`SnapshotSink`](crate::cache::SnapshotSink)).
+	fn take_undecodable(&mut self, items: Vec<UndecodableItem>) {
+		self.undecodable_dirs = items
+			.iter()
+			.filter(|item| item.stable_uuid.is_none())
+			.map(|item| item.uuid)
+			.collect();
+		self.undecodable = items;
+	}
+
+	/// Index `item` if it is a directory, then place it at its path or record why it has none.
+	///
+	/// `defer` is set while the read is still running, where an unresolved chain means one of two
+	/// things the arriving item cannot tell apart: an ancestor the read has not reached, or an
+	/// ancestor that is genuinely missing, unsafely named or undecodable. So it is set aside, and
+	/// [`finish`](Self::finish) asks again with the index complete, where the answer is final. An
+	/// item the index CAN answer for is answered once: a later row adds entries to the index, and
+	/// adding entries cannot change a walk that already found every step it needed.
+	fn place(&mut self, is_dir: bool, item: &RemoteItem, defer: bool) {
+		let name = item.name.nfc().collect::<String>();
+		if is_dir {
+			self.dir_index
+				.insert(item.uuid, (name.clone(), item.parent));
+		}
+		// A whole-life id is a file's; a directory's own uuid already survives its renames. Taken
+		// from the KIND rather than from the field, which a directory is merely expected to leave
+		// empty.
+		let stable_uuid = if is_dir { None } else { item.stable_uuid };
+		let skip = match resolve_parent(
+			item.parent,
+			self.root,
+			&self.dir_index,
+			&self.undecodable_dirs,
+		) {
+			Ok(parent_path) if is_safe_name(&name) => {
+				self.insert(join_path(&parent_path, &name), is_dir, item, stable_uuid);
+				return;
+			}
 			Ok(parent_path) => SkippedRemote {
-				remote_uuid,
+				remote_uuid: item.uuid,
 				stable_uuid,
-				rel_path: join_path(&parent_path, name),
+				rel_path: join_path(&parent_path, &name),
 				path_is_dir: is_dir,
-				reason: UnsyncableReason::RemoteInvalidName {
-					name: name.to_string(),
-				},
+				reason: UnsyncableReason::RemoteInvalidName { name },
 			},
+			Err(_) if defer => {
+				self.deferred.push((is_dir, item.clone()));
+				return;
+			}
 			Err(Unresolved::UnderSkipped(ancestor)) => {
-				skipped.under(remote_uuid, stable_uuid, ancestor);
-				return None;
+				self.skipped.under(item.uuid, stable_uuid, ancestor);
+				return;
 			}
 			Err(Unresolved::BrokenParent) => SkippedRemote {
-				remote_uuid,
+				remote_uuid: item.uuid,
 				stable_uuid,
-				rel_path: name.to_string(),
+				rel_path: name,
 				path_is_dir: is_dir,
 				reason: UnsyncableReason::RemoteBrokenParent,
 			},
 		};
-		skipped.record(skip);
-		None
-	};
+		self.skipped.record(skip);
+	}
 
-	let mut nodes: HashMap<String, RemoteNode> = HashMap::with_capacity(dirs.len() + files.len());
-	let mut held_paths: BTreeSet<String> = BTreeSet::new();
-	let mut insert = |rel_path: String, node: RemoteNode| {
+	/// The node at `rel_path`, unless the path is the engine's own quarantine directory or a
+	/// second item has already claimed it.
+	fn insert(
+		&mut self,
+		rel_path: String,
+		is_dir: bool,
+		item: &RemoteItem,
+		stable_uuid: Option<StableUuid>,
+	) {
 		// The engine's own directory comes before every rule, and is never reported as ignored.
 		if in_quarantine(&rel_path) {
 			return;
@@ -468,64 +508,105 @@ pub(crate) fn place_remote_items(
 		// this exact path can only be the cache showing both halves of a re-upload at once: the
 		// successor has been applied and the predecessor's trash has not. Withhold that one path
 		// for this pass rather than refusing the whole one; the next snapshot has one of them.
-		if held_paths.contains(&rel_path) {
+		if self.held_paths.contains(&rel_path) {
 			return;
 		}
-		if nodes.insert(rel_path.clone(), node).is_some() {
+		let node = RemoteNode {
+			rel_path: rel_path.clone(),
+			kind: if is_dir {
+				NodeKind::Dir
+			} else {
+				NodeKind::File
+			},
+			remote_uuid: item.uuid,
+			stable_uuid,
+			content_hash: if is_dir { None } else { item.hash },
+			size: if is_dir { 0 } else { item.size },
+			modified_millis: item.modified_millis,
+		};
+		if self.nodes.insert(rel_path.clone(), node).is_some() {
 			tracing::debug!(
 				"remote view: holding {rel_path:?} — the cache is mid-transition, listing two items under that exact name"
 			);
-			nodes.remove(&rel_path);
-			held_paths.insert(rel_path);
+			self.nodes.remove(&rel_path);
+			self.held_paths.insert(rel_path);
 		}
-	};
+	}
 
+	/// The view, once everything that needed the WHOLE subtree has been answered: the undecodable
+	/// records, whose path is the directory that holds them, the items that arrived before their
+	/// ancestry, and the descendants of a skipped directory, which take that directory's record.
+	pub(crate) fn finish(mut self) -> RemoteView {
+		for item in std::mem::take(&mut self.undecodable) {
+			match resolve_parent(
+				item.parent,
+				self.root,
+				&self.dir_index,
+				&self.undecodable_dirs,
+			) {
+				Ok(rel_path) => self.skipped.record_first(SkippedRemote {
+					remote_uuid: item.uuid,
+					stable_uuid: item.stable_uuid,
+					rel_path,
+					// The holding directory's path: an undecodable item's own name is what the
+					// cache could not read.
+					path_is_dir: true,
+					reason: UnsyncableReason::RemoteUndecodable,
+				}),
+				Err(Unresolved::UnderSkipped(ancestor)) => {
+					self.skipped.under(item.uuid, item.stable_uuid, ancestor);
+				}
+				// Not under this root at all: another root's record.
+				Err(Unresolved::BrokenParent) => {}
+			}
+		}
+		for (is_dir, item) in std::mem::take(&mut self.deferred) {
+			self.place(is_dir, &item, false);
+		}
+		RemoteView {
+			nodes: self.nodes,
+			has_collisions: false,
+			held_paths: self.held_paths,
+			skipped: self.skipped.finish(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+		}
+	}
+}
+
+impl crate::cache::SnapshotSink for ViewBuilder {
+	fn undecodable(&mut self, items: Vec<UndecodableItem>) {
+		self.take_undecodable(items);
+	}
+
+	fn item(&mut self, is_dir: bool, item: RemoteItem) {
+		self.place(is_dir, &item, true);
+	}
+}
+
+/// [`ViewBuilder`] over a snapshot that is already materialized: the shape the tests and the
+/// probe read, and the one a pass read before it learned to place rows as they arrive. A pass
+/// itself no longer has the two slices to hand — it never builds them — so this is gated with
+/// the read that does.
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) fn place_remote_items(
+	root: Uuid,
+	dirs: &[RemoteItem],
+	files: &[RemoteItem],
+	undecodable: &[UndecodableItem],
+) -> RemoteView {
+	let mut builder = ViewBuilder::with_capacity(root, dirs.len() + files.len());
+	builder.take_undecodable(undecodable.to_vec());
+	// Set aside and answered at `finish` exactly as a streamed row is: these slices are in no
+	// more of an order than the read's rows are, and a directory that follows its own children
+	// must not read as one with no parent.
 	for dir in dirs {
-		let name = dir.name.nfc().collect::<String>();
-		let Some(rel_path) = place(&name, dir.parent, dir.uuid, None, true) else {
-			continue;
-		};
-		insert(
-			rel_path.clone(),
-			RemoteNode {
-				rel_path,
-				kind: NodeKind::Dir,
-				remote_uuid: dir.uuid,
-				stable_uuid: None,
-				content_hash: None,
-				size: 0,
-				modified_millis: dir.modified_millis,
-			},
-		);
+		builder.place(true, dir, true);
 	}
-
 	for file in files {
-		let name = file.name.nfc().collect::<String>();
-		let Some(rel_path) = place(&name, file.parent, file.uuid, file.stable_uuid, false) else {
-			continue;
-		};
-		insert(
-			rel_path.clone(),
-			RemoteNode {
-				rel_path,
-				kind: NodeKind::File,
-				remote_uuid: file.uuid,
-				stable_uuid: file.stable_uuid,
-				content_hash: file.hash,
-				size: file.size,
-				modified_millis: file.modified_millis,
-			},
-		);
+		builder.place(false, file, true);
 	}
-
-	RemoteView {
-		nodes,
-		has_collisions: false,
-		held_paths,
-		skipped: skipped.finish(),
-		ignored: BTreeMap::new(),
-		ignored_default_untracked: 0,
-	}
+	builder.finish()
 }
 
 impl RemoteView {
@@ -668,9 +749,12 @@ pub(crate) fn build_remote_view(
 /// ones under a skipped directory, which take that directory's record once every item is placed.
 #[derive(Default)]
 struct Skipped {
+	/// The records that belong at the HEAD of the answer: the undecodable ones, which a
+	/// materialized build resolved before it placed anything and a streamed build can only
+	/// resolve once every directory has arrived. Keeping them apart is what makes the two builds
+	/// answer identically, in the same order, however the rows came in.
+	first: Vec<SkippedRemote>,
 	recorded: Vec<SkippedRemote>,
-	/// uuid -> its index in `recorded`.
-	by_uuid: HashMap<Uuid, usize>,
 	/// Every item under a skipped directory: its uuid, whole-life id, and the nearest skipped
 	/// ancestor `resolve_parent` found.
 	under: Vec<(Uuid, Option<StableUuid>, Uuid)>,
@@ -683,8 +767,16 @@ impl Skipped {
 		if in_quarantine(&skip.rel_path) {
 			return;
 		}
-		self.by_uuid.insert(skip.remote_uuid, self.recorded.len());
 		self.recorded.push(skip);
+	}
+
+	/// [`record`](Self::record) for a record that belongs at the head of the answer (see
+	/// [`first`](Self::first)).
+	fn record_first(&mut self, skip: SkippedRemote) {
+		if in_quarantine(&skip.rel_path) {
+			return;
+		}
+		self.first.push(skip);
 	}
 
 	fn under(&mut self, remote_uuid: Uuid, stable_uuid: Option<StableUuid>, ancestor: Uuid) {
@@ -696,6 +788,16 @@ impl Skipped {
 	/// directory per step. An item whose chain ends in nothing recorded (the quarantine dir) stays
 	/// out unrecorded.
 	fn finish(mut self) -> Vec<SkippedRemote> {
+		let mut recorded = std::mem::take(&mut self.first);
+		recorded.append(&mut self.recorded);
+		// uuid -> its index in `recorded`, built once the two halves are in their final order.
+		// The records this loop appends are not in it, exactly as they were not before: an item
+		// under a skipped directory is not itself a directory anything sits under.
+		let by_uuid: HashMap<Uuid, usize> = recorded
+			.iter()
+			.enumerate()
+			.map(|(index, record)| (record.remote_uuid, index))
+			.collect();
 		let parent_of: HashMap<Uuid, Uuid> = self
 			.under
 			.iter()
@@ -704,10 +806,10 @@ impl Skipped {
 		for &(remote_uuid, stable_uuid, ancestor) in &self.under {
 			let mut at = ancestor;
 			for _ in 0..=MAX_REMOTE_DEPTH {
-				if let Some(&index) = self.by_uuid.get(&at) {
-					let record = &self.recorded[index];
+				if let Some(&index) = by_uuid.get(&at) {
+					let record = &recorded[index];
 					let (rel_path, reason) = (record.rel_path.clone(), record.reason.clone());
-					self.recorded.push(SkippedRemote {
+					recorded.push(SkippedRemote {
 						remote_uuid,
 						stable_uuid,
 						rel_path,
@@ -728,7 +830,7 @@ impl Skipped {
 				}
 			}
 		}
-		self.recorded
+		recorded
 	}
 }
 
@@ -5983,6 +6085,65 @@ mod tests {
 			view.ignored.keys().collect::<Vec<_>>(),
 			vec![".filenignore", "sub"]
 		);
+	}
+
+	/// The streamed build answers what the materialized one answers — the nodes, the held paths
+	/// and the records for everything that could not be placed — including when every item
+	/// arrives BEFORE the directory that holds it. That order is the one thing a read can do to a
+	/// builder that a pair of slices cannot, and the statement promises no other.
+	#[test]
+	fn a_streamed_view_is_the_view_the_slices_build() {
+		let root = Uuid::new_v4();
+		let a = remote_dir("A", root);
+		let deep = remote_dir("deep", a.uuid);
+		// Legal on the server, unusable as one local path component: placed nowhere, and nothing
+		// under it is placeable either.
+		let bad = remote_dir("bad\\x", root);
+		let leaf = cacheable_file(deep.uuid, "leaf.txt");
+		let under_bad = cacheable_file(bad.uuid, "file.txt");
+		let orphan = cacheable_file(Uuid::new_v4(), "orphan.txt");
+		let undecodable = [UndecodableItem {
+			uuid: Uuid::new_v4(),
+			parent: deep.uuid,
+			stable_uuid: None,
+		}];
+
+		let dirs = [a.clone(), deep.clone(), bad.clone()];
+		let files = [leaf.clone(), under_bad.clone(), orphan.clone()];
+		let materialized = place_remote_items(root, &dirs, &files, &undecodable);
+		assert!(
+			materialized.nodes.contains_key("A/deep/leaf.txt") && materialized.skipped.len() == 4,
+			"the fixture has to exercise placement AND every way of failing it: {:?} {:?}",
+			materialized.nodes.keys(),
+			materialized.skipped,
+		);
+
+		let mut builder = ViewBuilder::with_capacity(root, 0);
+		crate::cache::SnapshotSink::undecodable(&mut builder, undecodable.to_vec());
+		// Children first, every parent last: the worst order a read could hand these over in.
+		for (is_dir, item) in [
+			(false, &leaf),
+			(false, &under_bad),
+			(false, &orphan),
+			(true, &deep),
+			(true, &bad),
+			(true, &a),
+		] {
+			crate::cache::SnapshotSink::item(&mut builder, is_dir, item.clone());
+		}
+		let streamed = builder.finish();
+
+		assert_eq!(streamed.nodes, materialized.nodes, "the same node set");
+		assert_eq!(streamed.held_paths, materialized.held_paths);
+		// The records are the same set; only their ORDER follows the order the rows arrived in,
+		// and nothing reads them in order (`unknown_remote_paths` keys them by path).
+		let sorted = |mut skipped: Vec<SkippedRemote>| {
+			skipped.sort_by(|left, right| {
+				(&left.rel_path, left.remote_uuid).cmp(&(&right.rel_path, right.remote_uuid))
+			});
+			skipped
+		};
+		assert_eq!(sorted(streamed.skipped), sorted(materialized.skipped));
 	}
 
 	/// A file recorded under an unplaceable DIRECTORY takes that directory's path, so the rules have
