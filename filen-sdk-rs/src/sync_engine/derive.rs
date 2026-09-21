@@ -240,9 +240,10 @@ mod tests {
 		sync_engine::{
 			SyncMode,
 			changes::{
-				PairChanges,
+				PairChanges, RemoteDeltaEntry,
 				tests::{cache_event, cacheable_file},
 			},
+			facts::carry_over,
 			ignore::IgnoreRules,
 			observe::observe_local,
 			plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
@@ -401,23 +402,18 @@ mod tests {
 		fn derived(
 			&self,
 			baseline: &Baseline,
-			dirty: &[&str],
-			delta: &[CacheEvent<'static>],
+			dirty: BTreeSet<String>,
+			delta: &[RemoteDeltaEntry],
 		) -> Derived {
-			let seed: BTreeSet<String> = dirty.iter().map(|path| (*path).to_string()).collect();
-			let mut derived = from_baseline(baseline, seed);
-			let changes = PairChanges::new();
-			changes.note_tree_size(1_000);
-			changes.note_remote_batch(&mut delta.iter());
-			let mut scope = changes.take();
+			let mut derived = from_baseline(baseline, dirty);
 			let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
 				panic!("no ancestry read was expected, but one was made for {uuid}")
 			};
-			let observed = match observe_remote(
+			let mut observed = match observe_remote(
 				REMOTE_ROOT,
 				baseline,
 				std::mem::take(&mut derived.remote),
-				&scope.take_remote(),
+				delta,
 				&mut ancestry,
 			) {
 				RemoteObserved::Applied(observation) => *observation,
@@ -426,6 +422,9 @@ mod tests {
 			derived.remote = observed.nodes;
 			derived.held.extend(observed.held_paths);
 			derived.dirty.extend(observed.touched);
+			// The exact keys the delta moved, as `prepare_scoped` records them: what the pass
+			// DECIDES, where `dirty` says where to look.
+			derived.decided.append(&mut observed.changed);
 			let (local, _) = observe_local(
 				&self.root,
 				baseline,
@@ -443,6 +442,38 @@ mod tests {
 		fn drop(&mut self) {
 			fs::remove_dir_all(&self.root).ok();
 		}
+	}
+
+	/// The dirty set a pass starts from, in the shape [`from_baseline`] takes it.
+	fn dirty_paths(dirty: &[&str]) -> BTreeSet<String> {
+		dirty.iter().map(|path| (*path).to_string()).collect()
+	}
+
+	/// The delta a pass takes from its changelist for those events — minted through
+	/// `PairChanges`, which is the one way a `Gone` can exist at all.
+	fn delta_of(events: &[CacheEvent<'static>]) -> Vec<RemoteDeltaEntry> {
+		let changes = PairChanges::new();
+		changes.note_tree_size(1_000);
+		changes.note_remote_batch(&mut events.iter());
+		changes.take().take_remote()
+	}
+
+	/// What the reconcile makes of the maps a change-scoped pass derived — over the paths that
+	/// pass DECIDED, so a plan here is one a narrowed read really produces.
+	fn scoped_plan(baseline: &Baseline, derived: &Derived) -> Vec<SyncAction> {
+		let holds = PassHolds {
+			held_remote: derived.held.clone(),
+			..PassHolds::default()
+		};
+		plan::reconcile(
+			SyncMode::TwoWay,
+			baseline,
+			&derived.local,
+			&derived.remote,
+			&holds,
+			plan::PassPaths::Changed(&derived.decided),
+		)
+		.actions
 	}
 
 	fn sorted(keys: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -546,6 +577,15 @@ mod tests {
 			scoped.actions, whole.actions,
 			"the change-scoped maps planned something else"
 		);
+		// And at the scope the pass really hands the reconcile. The maps above are compared over
+		// every key they hold; this asks the narrower question the pass asks, so a producer that
+		// moved a key off the node its row carries and did NOT record it is a key nothing decides
+		// — which shows up here as a missing action and nowhere else.
+		assert_eq!(
+			scoped_plan(baseline, derived),
+			whole.actions,
+			"a key the producers moved is missing from the decided set"
+		);
 		whole.actions
 	}
 
@@ -556,7 +596,7 @@ mod tests {
 		let pair = Pair::converged();
 		let baseline = pair.baseline();
 
-		let derived = pair.derived(&baseline, &[], &[]);
+		let derived = pair.derived(&baseline, dirty_paths(&[]), &[]);
 		let (local, remote) = pair.whole_tree(&baseline);
 
 		assert!(
@@ -646,7 +686,7 @@ mod tests {
 		}
 		let baseline = pair.baseline();
 
-		let derived = pair.derived(&baseline, &[], &[]);
+		let derived = pair.derived(&baseline, dirty_paths(&[]), &[]);
 		let (local, remote) = pair.whole_tree(&baseline);
 
 		assert_eq!(
@@ -722,14 +762,14 @@ mod tests {
 
 		let derived = pair.derived(
 			&baseline,
-			&[
+			dirty_paths(&[
 				"top.txt",
 				"docs/notes.txt",
 				"fresh.txt",
 				"added",
 				"docs/deep",
-			],
-			&delta,
+			]),
+			&delta_of(&delta),
 		);
 		let (local, remote) = pair.whole_tree(&baseline);
 
@@ -739,6 +779,67 @@ mod tests {
 		assert!(
 			actions.len() >= 6,
 			"the change set plans a pass's worth of work: {actions:?}"
+		);
+	}
+
+	/// An interrupted pass hands the next one BOTH halves of what it took, and that pass re-plans
+	/// the same action from them without reading either side whole.
+	///
+	/// The action here is REMOTE-originated — the local delete answering a `Gone` — which is the
+	/// one the local half alone cannot reproduce: the baseline row a dirty path's remote side is
+	/// derived from still records the item, so a hand-back missing the delta plans nothing at all
+	/// and the deletion waits for the safety net. Both shapes are asserted, the broken one first.
+	#[test]
+	fn an_interrupted_passs_remote_action_is_re_planned_from_both_halves() {
+		let mut pair = Pair::converged();
+		let doomed = pair.uuids["docs/Ärger.txt"];
+		pair.items.retain(|item| item.uuid != doomed);
+		let baseline = pair.baseline();
+		let announced = delta_of(&[cache_event(
+			Some(1),
+			CacheEventType::File(FileEvent::Removed(doomed)),
+		)]);
+
+		// The pass that plans the delete: nothing announced locally, one removal announced
+		// remotely.
+		let first = pair.derived(&baseline, dirty_paths(&[]), &announced);
+		let planned = scoped_plan(&baseline, &first);
+		assert_eq!(planned.len(), 1, "{planned:?}");
+		assert!(
+			matches!(planned[0], SyncAction::DeleteLocal { .. })
+				&& planned[0].rel_path() == "docs/Ärger.txt",
+			"the announced removal plans the local delete: {planned:?}"
+		);
+
+		// It is cut short before applying it, so no row was written and the file is still on disk.
+		// What it owes is its plan's paths...
+		let owed = carry_over(&planned, &[], &BTreeSet::new(), &HashMap::new());
+		assert_eq!(owed, BTreeSet::from(["docs/Ärger.txt".to_string()]));
+
+		// ...and handing back that half ALONE — the shape this stage's first attempt shipped —
+		// plans nothing: the row the remote side is derived from still records the item.
+		let local_only = pair.derived(&baseline, owed.clone(), &[]);
+		assert!(
+			scoped_plan(&baseline, &local_only).is_empty(),
+			"the remote half is what carries the absence; without it the deletion is lost"
+		);
+
+		// Both halves, through the changelist the next pass takes from: the same action again.
+		let changes = PairChanges::new();
+		changes.cover_local();
+		changes.note_owed(owed);
+		changes.note_owed_remote(announced);
+		let mut scope = changes.take();
+		assert_eq!(
+			scope.full_pass_reason(baseline.len()),
+			None,
+			"a hand-back must not send the next pass back to a whole read"
+		);
+		let second = pair.derived(&baseline, scope.take_local(), &scope.take_remote());
+		assert_eq!(
+			scoped_plan(&baseline, &second),
+			planned,
+			"the next pass must re-plan what the interrupted one did not get to"
 		);
 	}
 
@@ -757,7 +858,7 @@ mod tests {
 			.collect();
 		let baseline = Baseline::from_rows(rows);
 
-		let derived = pair.derived(&baseline, &[], &[]);
+		let derived = pair.derived(&baseline, dirty_paths(&[]), &[]);
 		let (local, remote) = pair.whole_tree(&baseline);
 
 		assert!(
@@ -863,7 +964,7 @@ mod tests {
 		// Everything under `docs` is covered by the walk of it — except what the walk pruned.
 		fs::remove_file(pair.root.join("docs/notes.txt")).unwrap();
 
-		let derived = pair.derived(&baseline, &["docs"], &[]);
+		let derived = pair.derived(&baseline, dirty_paths(&["docs"]), &[]);
 
 		assert!(
 			!derived.local.contains_key("docs/notes.txt"),
