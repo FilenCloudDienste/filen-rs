@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ls --long` (`ls -l`) to list items one per line with human-readable file sizes
 - `export-notes` command to export all notes to a local directory
 - `list-favorites` and `list-recents` commands
+- `--working-path` global option
 
 ### Changed
 

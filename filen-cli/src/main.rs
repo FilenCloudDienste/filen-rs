@@ -124,7 +124,8 @@ pub(crate) struct CliArgs {
 	#[arg(long, hide = true)]
 	make_output_environment_agnostic_for_replay_testing: bool,
 
-	#[arg(long, hide = true)]
+	/// The initial working path for the REPL or non-interactive commands (defaults to "/")
+	#[arg(long)]
 	working_path: Option<String>,
 }
 
