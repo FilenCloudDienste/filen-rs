@@ -56,3 +56,17 @@ pub(crate) fn snapshot(
 ) -> rusqlite::Result<super::enumerate::SubtreeSnapshot> {
 	super::enumerate::read_subtree_snapshot(path, root)
 }
+
+/// The same read STREAMED into `sink` — what a pass does — so the probe can measure the two
+/// against each other on one tree. Returns the watermark, as the engine's own entrance does.
+#[cfg(all(
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) fn snapshot_into(
+	path: &Path,
+	root: Uuid,
+	sink: &mut dyn super::enumerate::SnapshotSink,
+) -> rusqlite::Result<Option<u64>> {
+	super::enumerate::read_subtree_snapshot_into(path, root, sink)
+}
