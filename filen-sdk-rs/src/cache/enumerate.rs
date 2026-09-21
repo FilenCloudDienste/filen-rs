@@ -4,6 +4,10 @@
 //! on, the full [`CacheableDir`]/[`CacheableFile`] payload read back by uuid
 //! ([`hydrate_by_uuids`], which shares the search engine's column contract).
 //!
+//! The read is STREAMED into a [`SnapshotSink`]: the engine places each row into its view as it
+//! arrives, so the whole subtree never exists as a second copy beside the view built from it.
+//! [`read_subtree_snapshot`] collects the same rows into `Vec`s for the probe and the tests.
+//!
 //! Pairing the snapshot with its watermark is the point: the sync engine subscribes to the root's
 //! event stream FIRST, then takes this snapshot, then discards buffered events whose
 //! `drive_message_id <= watermark` (already reflected here) and applies the rest — aligning the
@@ -40,6 +44,7 @@ use crate::{
 
 /// A consistent point-in-time view of one sync root's cached subtree: every descendant directory
 /// and file, plus the contiguous-prefix [`watermark`](Self::watermark) at the same instant.
+#[cfg(any(test, feature = "bench-internals"))]
 #[derive(Debug)]
 pub(crate) struct SubtreeSnapshot {
 	pub(crate) dirs: Vec<RemoteItem>,
@@ -124,25 +129,40 @@ fn slim_item(row: &Row<'_>) -> rusqlite::Result<(bool, RemoteItem)> {
 	))
 }
 
-/// Hydrate every descendant of `root` from `conn` into split dir/file vecs of the view's
-/// projection. The anchor itself is never returned.
-fn enumerate_subtree(
-	conn: &Connection,
+/// Where a streamed subtree read hands the rows it reads.
+///
+/// A sink that PLACES each item as it arrives (`sync_engine::plan::ViewBuilder`) is what keeps a
+/// million-item subtree from existing twice at the widest point of a full pass: once as this
+/// read's `Vec`s, once as the structure built out of them.
+pub(crate) trait SnapshotSink {
+	/// Every undecodable record, handed over BEFORE the first item: which directories the cache
+	/// could not decode governs where anything under them can be placed, so a sink that places on
+	/// arrival has to know them first.
+	fn undecodable(&mut self, items: Vec<UndecodableItem>);
+
+	/// One item of the subtree, and whether it is a directory. NOTHING here fixes the order the
+	/// rows arrive in — the statement carries no `ORDER BY`, and sorting a million rows to give one
+	/// would cost more than it saves — so a sink that needs an item's ancestry must be able to wait
+	/// for it.
+	fn item(&mut self, is_dir: bool, item: RemoteItem);
+}
+
+/// The undecodable records, then every descendant of `root`, then the watermark — all read
+/// through the one open transaction `tx`, so they describe the same committed instant. The anchor
+/// itself is never handed over.
+fn read_into(
+	tx: &Connection,
 	root: Uuid,
-) -> rusqlite::Result<(Vec<RemoteItem>, Vec<RemoteItem>)> {
-	let mut stmt = conn.prepare_cached(ENUMERATE_SUBTREE)?;
-	let mut dirs = Vec::new();
-	let mut files = Vec::new();
+	sink: &mut dyn SnapshotSink,
+) -> rusqlite::Result<Option<u64>> {
+	sink.undecodable(list_undecodable(tx)?);
+	let mut stmt = tx.prepare_cached(ENUMERATE_SUBTREE)?;
 	let rows = stmt.query_map(params![root], slim_item)?;
 	for row in rows {
 		let (is_dir, item) = row?;
-		if is_dir {
-			dirs.push(item);
-		} else {
-			files.push(item);
-		}
+		sink.item(is_dir, item);
 	}
-	Ok((dirs, files))
+	read_watermark(tx)
 }
 
 /// Read the contiguous-prefix watermark from `conn`, mirroring `CacheState::watermark` (the
@@ -160,20 +180,58 @@ fn read_watermark(conn: &Connection) -> rusqlite::Result<Option<u64>> {
 /// read-only connection (WAL-concurrent with the worker's writer) and reads the subtree AND the
 /// watermark inside ONE deferred read transaction, so the two describe the same committed instant.
 /// Synchronous SQLite work — async callers go through [`Client::enumerate_sync_root_snapshot`].
-pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result<SubtreeSnapshot> {
+pub(crate) fn read_subtree_snapshot_into(
+	path: &Path,
+	root: Uuid,
+	sink: &mut dyn SnapshotSink,
+) -> rusqlite::Result<Option<u64>> {
 	let mut conn = open_read_connection(path)?;
-	// One deferred read transaction = one stable snapshot for both reads, even mid-worker-write.
+	// One deferred read transaction = one stable snapshot for every read below, even
+	// mid-worker-write.
 	let tx = conn.transaction()?;
-	let (dirs, files) = enumerate_subtree(&tx, root)?;
-	let watermark = read_watermark(&tx)?;
-	let undecodable = list_undecodable(&tx)?;
+	let watermark = read_into(&tx, root, sink)?;
 	// Read-only: dropping the deferred transaction just ends the snapshot (nothing to commit).
 	drop(tx);
+	Ok(watermark)
+}
+
+/// The sink that materializes: the whole subtree as the two `Vec`s [`read_subtree_snapshot`]
+/// hands back.
+#[cfg(any(test, feature = "bench-internals"))]
+#[derive(Default)]
+struct Materialize {
+	dirs: Vec<RemoteItem>,
+	files: Vec<RemoteItem>,
+	undecodable: Vec<UndecodableItem>,
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl SnapshotSink for Materialize {
+	fn undecodable(&mut self, items: Vec<UndecodableItem>) {
+		self.undecodable = items;
+	}
+
+	fn item(&mut self, is_dir: bool, item: RemoteItem) {
+		if is_dir {
+			self.dirs.push(item);
+		} else {
+			self.files.push(item);
+		}
+	}
+}
+
+/// [`read_subtree_snapshot_into`] with the whole subtree collected into two `Vec`s. What a pass
+/// read before it learned to place rows as they arrive; the probe measures the two side by side
+/// and the tests below read it because a `Vec` is what an assertion can look at.
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result<SubtreeSnapshot> {
+	let mut sink = Materialize::default();
+	let watermark = read_subtree_snapshot_into(path, root, &mut sink)?;
 	Ok(SubtreeSnapshot {
-		dirs,
-		files,
+		dirs: sink.dirs,
+		files: sink.files,
 		watermark,
-		undecodable,
+		undecodable: sink.undecodable,
 	})
 }
 
@@ -286,35 +344,45 @@ impl Client {
 			})
 	}
 
-	/// Take a consistent [`SubtreeSnapshot`] of the cached subtree under sync root `root` — the
-	/// remote-state half the sync engine reconciles against. Errors if the cache was never
-	/// configured. The blocking SQLite read runs on a blocking thread so it never stalls the
-	/// async runtime.
-	pub(crate) async fn enumerate_sync_root_snapshot(
+	/// Stream a consistent snapshot of the cached subtree under sync root `root` into `sink` — the
+	/// remote-state half the sync engine reconciles against — and hand back the sink with the
+	/// contiguous-prefix watermark at the same instant. Errors if the cache was never configured.
+	/// The blocking SQLite read runs on a blocking thread so it never stalls the async runtime.
+	///
+	/// A read that fails partway takes the sink down with it: what it held is PART of a subtree,
+	/// which is not a view of one, and no caller can be handed a tree with holes.
+	pub(crate) async fn stream_sync_root_snapshot<S>(
 		&self,
 		root: Uuid,
-	) -> Result<SubtreeSnapshot, Error> {
+		mut sink: S,
+	) -> Result<(S, Option<u64>), Error>
+	where
+		S: SnapshotSink + Send + 'static,
+	{
 		let path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
 			Error::custom(
 				ErrorKind::InvalidState,
 				"cache is not configured; call configure_cache first",
 			)
 		})?;
-		tokio::task::spawn_blocking(move || read_subtree_snapshot(&path, root))
-			.await
-			.map_err(|e| {
-				Error::custom(
-					ErrorKind::Internal,
-					format!("snapshot read task failed: {e}"),
-				)
-			})?
-			.map_err(|e| {
-				Error::custom_with_source(
-					ErrorKind::Internal,
-					CacheError::db(e, format!("enumerating sync root {root}")),
-					Some("reading cache subtree snapshot".to_string()),
-				)
-			})
+		tokio::task::spawn_blocking(move || {
+			let watermark = read_subtree_snapshot_into(&path, root, &mut sink)?;
+			Ok::<_, rusqlite::Error>((sink, watermark))
+		})
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("snapshot read task failed: {e}"),
+			)
+		})?
+		.map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::Internal,
+				CacheError::db(e, format!("enumerating sync root {root}")),
+				Some("reading cache subtree snapshot".to_string()),
+			)
+		})
 	}
 }
 
@@ -425,6 +493,60 @@ mod tests {
 
 	fn uuids(items: impl IntoIterator<Item = Uuid>) -> std::collections::HashSet<Uuid> {
 		items.into_iter().collect()
+	}
+
+	/// Counts what a sink was handed, for the read that fails partway.
+	#[derive(Default)]
+	struct Counting {
+		items: usize,
+		/// Set if the undecodable records arrived AFTER an item, which the contract forbids: a
+		/// sink that places on arrival cannot place anything until it has them.
+		undecodable_late: bool,
+	}
+
+	impl SnapshotSink for Counting {
+		fn undecodable(&mut self, _items: Vec<UndecodableItem>) {
+			self.undecodable_late |= self.items > 0;
+		}
+
+		fn item(&mut self, _is_dir: bool, _item: RemoteItem) {
+			self.items += 1;
+		}
+	}
+
+	/// A read that fails partway returns the ERROR, and the part of the subtree the sink took is
+	/// all it ever gets: a streamed read can no more hand back a tree with holes than the
+	/// materialized one could. Forced the only way a row can fail on its own — an `items.type` the
+	/// projection does not know, which is what a corrupt row would look like in the field.
+	///
+	/// What is deliberately NOT asserted is how much the sink took: the corrupted row is one of
+	/// the fixture's seven, so no item count can tell a read that stopped at it from one that
+	/// streamed every other row and failed at the end.
+	#[test]
+	fn a_read_that_fails_partway_hands_back_the_error_and_no_subtree() {
+		let f = fixture();
+		f.state
+			.db
+			.execute(
+				"UPDATE items SET type = 0 WHERE uuid = ?1",
+				params![f.b1.uuid],
+			)
+			.unwrap();
+
+		let mut sink = Counting::default();
+		let error = read_subtree_snapshot_into(&f.path, f.root, &mut sink).unwrap_err();
+		assert!(
+			!sink.undecodable_late,
+			"the undecodable records come before the first item, failed read or not"
+		);
+		assert!(
+			matches!(error, rusqlite::Error::FromSqlConversionFailure(..)),
+			"the unreadable item type is what stopped the read: {error:?}"
+		);
+		assert!(
+			read_subtree_snapshot(&f.path, f.root).is_err(),
+			"and the materialized read over the same rows fails with it"
+		);
 	}
 
 	#[test]
