@@ -156,6 +156,35 @@ pub(super) fn fold_cmp(a: &str, b: &str) -> Ordering {
 		.cmp(b.chars().flat_map(char::to_lowercase))
 }
 
+/// Whether `path` IS `prefix`, or lies under it, folded the way [`fold_cmp`] folds — and, like it,
+/// without materializing either folded form.
+///
+/// The same question [`Baseline::occupied`] answers from a node's children, asked of a map that has
+/// no such order: the two side maps a directory move checks its destination against. Folding each
+/// key into a [`collision_key`](super::scan::collision_key) first allocates a `String` for every
+/// key of the whole tree, to learn — for all but a handful of them — that the very first character
+/// already differs. This stops at that character.
+pub(super) fn at_or_under_folded(path: &str, prefix: &str) -> bool {
+	// Same fast path, and same argument for it, as `fold_cmp`: on ASCII the two foldings are the
+	// same answer rather than an approximation.
+	if path.is_ascii() && prefix.is_ascii() {
+		let (path, prefix) = (path.as_bytes(), prefix.as_bytes());
+		return path.len() >= prefix.len()
+			&& path[..prefix.len()].eq_ignore_ascii_case(prefix)
+			&& path.get(prefix.len()).is_none_or(|&byte| byte == b'/');
+	}
+	// Comparing the two folded CHARACTER streams is comparing the two folded strings: a lowercase
+	// expansion never yields `/`, so the separator can only be matched by a real one, and a prefix
+	// that runs out mid-expansion leaves a character that is not `/` and is refused here.
+	let mut folded = path.chars().flat_map(char::to_lowercase);
+	for want in prefix.chars().flat_map(char::to_lowercase) {
+		if folded.next() != Some(want) {
+			return false;
+		}
+	}
+	matches!(folded.next(), None | Some('/'))
+}
+
 /// The order a directory's children are kept in: by folded name, then by the raw one. The store's
 /// primary key compares bytewise, so `A` and `a` are two rows of one directory; the tie-break is
 /// what keeps both of them addressable.
@@ -935,7 +964,7 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::{
-		super::{baseline::BaselineChange, scan::collision_key},
+		super::{baseline::BaselineChange, plan::is_under, scan::collision_key},
 		*,
 	};
 
@@ -1001,6 +1030,38 @@ mod tests {
 				fold_cmp(a, b),
 				collision_key(a).cmp(&collision_key(b)),
 				"{a:?} vs {b:?} order"
+			);
+		}
+	}
+
+	/// The streaming at-or-under test answers what folding both paths and asking [`is_under`]
+	/// answers — the form it replaces — including where a lowercase expansion makes the folded
+	/// path longer than the raw one, which is the case a byte-wise prefix test gets wrong.
+	#[test]
+	fn the_folded_at_or_under_test_agrees_with_folding_both_paths() {
+		let cases = [
+			("Docs", "docs"),
+			("docs", "Docs"),
+			("docs/a.txt", "Docs"),
+			("Docs/sub/a.txt", "docs/SUB"),
+			("docsx", "docs"),
+			("docs", "docs/a"),
+			("docs2/a", "docs"),
+			("ÄÖ/x", "äö"),
+			("ÄÖx", "äö"),
+			("İ/x", "İ"),
+			("İ/x", "i"),
+			("İ", "i"),
+			("ΣΊΣΥΦΟΣ/x", "σίσυφοσ"),
+			("a", ""),
+			("", ""),
+		];
+		for (path, prefix) in cases {
+			let (folded_path, folded_prefix) = (collision_key(path), collision_key(prefix));
+			assert_eq!(
+				at_or_under_folded(path, prefix),
+				folded_path == folded_prefix || is_under(&folded_path, &folded_prefix),
+				"{path:?} at or under {prefix:?}"
 			);
 		}
 	}
