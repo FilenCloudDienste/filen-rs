@@ -23,7 +23,7 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
-	tree::Baseline,
+	tree::{Baseline, at_or_under_folded},
 };
 use crate::cache::{RemoteItem, UndecodableItem};
 
@@ -2336,12 +2336,14 @@ fn parents_ready<T>(
 }
 
 /// Whether `map` holds `rel_path`, under any spelling, or anything under it.
+///
+/// A scan of the map, because a side map has no order to bisect — the baseline's own answer
+/// ([`Baseline::occupied`]) is a walk of one node's children, and this is the same question asked
+/// of the two maps, which hold paths no row tracks. What it no longer does is fold every key into
+/// a `String` to compare it: [`at_or_under_folded`] stops at the first character that differs,
+/// which for almost every key is the first one.
 fn occupied<T>(map: &HashMap<String, T>, rel_path: &str) -> bool {
-	let key = collision_key(rel_path);
-	map.keys().any(|path| {
-		let path = collision_key(path);
-		path == key || is_under(&path, &key)
-	})
+	map.keys().any(|path| at_or_under_folded(path, rel_path))
 }
 
 /// The last component of a `/`-joined relative path.
