@@ -462,6 +462,7 @@ fn pass_pure(fixture: &Fixture, store: &BaselineStore, pair: i64, rules: &Ignore
 		&local,
 		&remote,
 		&PassHolds::default(),
+		plan::PassPaths::Whole,
 	)
 	.actions
 	.len()
@@ -517,6 +518,7 @@ fn pass_scoped(
 		&local,
 		&remote,
 		&PassHolds::default(),
+		plan::PassPaths::Whole,
 	)
 	.actions
 	.len()
@@ -1099,8 +1101,16 @@ pub fn run() -> String {
 	);
 
 	let holds = PassHolds::default();
-	let (converged, reconcile_0) =
-		timed(|| plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds));
+	let (converged, reconcile_0) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Whole,
+		)
+	});
 	probe.record(
 		"reconcile_0pct",
 		nodes,
@@ -1115,8 +1125,16 @@ pub fn run() -> String {
 
 	let one_percent = fixture.files / 100;
 	dirty_local(&mut local, 0, one_percent);
-	let (plan_1, reconcile_1) =
-		timed(|| plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds));
+	let (plan_1, reconcile_1) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Whole,
+		)
+	});
 	probe.record(
 		"reconcile_1pct",
 		nodes,
@@ -1130,8 +1148,16 @@ pub fn run() -> String {
 
 	let ten_percent = fixture.files / 10;
 	dirty_local(&mut local, one_percent, ten_percent);
-	let (plan_10, reconcile_10) =
-		timed(|| plan::reconcile(SyncMode::TwoWay, &baseline, &local, &remote, &holds));
+	let (plan_10, reconcile_10) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Whole,
+		)
+	});
 	probe.record(
 		"reconcile_10pct",
 		nodes,

@@ -4565,6 +4565,7 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		&prep.local_scan.nodes,
 		&prep.remote_view.nodes,
 		&prep.holds,
+		plan::PassPaths::Whole,
 	);
 	// The directory moves run before everything else in the plan, which already names their
 	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
@@ -5124,6 +5125,7 @@ mod tests {
 			&local,
 			&view.nodes,
 			&plan::PassHolds::default(),
+			plan::PassPaths::Whole,
 		);
 		assert_eq!(
 			reconciled.actions,
@@ -6913,6 +6915,7 @@ mod tests {
 			&scan.nodes,
 			remote,
 			&plan::PassHolds::default(),
+			plan::PassPaths::Whole,
 		);
 		let ignored: BTreeSet<String> = scan.ignored.keys().cloned().collect();
 		let blocked = scan
@@ -7408,6 +7411,7 @@ mod tests {
 				&local_map(hash(3)),
 				&remote_map(uuid, hash(3)),
 				&plan::PassHolds::default(),
+				plan::PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -7448,6 +7452,7 @@ mod tests {
 				&local_map(hash(3)),
 				&remote_map(uuid, hash(3)),
 				&plan::PassHolds::default(),
+				plan::PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -7484,6 +7489,7 @@ mod tests {
 			&local_map(hash(3)),
 			&remote_map(uuid, hash(9)),
 			&plan::PassHolds::default(),
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert_eq!(
@@ -7519,6 +7525,7 @@ mod tests {
 			&local_map(hash(3)),
 			&remote_map(uuid, hash(9)),
 			&plan::PassHolds::default(),
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert_eq!(
@@ -7628,6 +7635,7 @@ mod tests {
 			&local_map(hash(1)),
 			&remote,
 			&holds,
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert!(
@@ -8833,6 +8841,7 @@ mod tests {
 			&local_map(hash(2)),
 			&remote,
 			&holds,
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert_eq!(
@@ -8960,9 +8969,16 @@ mod tests {
 			},
 		)]);
 		assert!(
-			plan::reconcile(SyncMode::TwoWay, &tree(&baseline), &local, &remote, &holds)
-				.actions
-				.is_empty(),
+			plan::reconcile(
+				SyncMode::TwoWay,
+				&tree(&baseline),
+				&local,
+				&remote,
+				&holds,
+				plan::PassPaths::Whole
+			)
+			.actions
+			.is_empty(),
 			"both sides agree once the move is folded in: the pass has nothing to do"
 		);
 	}
@@ -9011,6 +9027,7 @@ mod tests {
 			&local,
 			&remote,
 			&holds,
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert!(
@@ -9076,7 +9093,8 @@ mod tests {
 				&tree(&baseline),
 				&local,
 				&remote,
-				&holds
+				&holds,
+				plan::PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -9110,6 +9128,7 @@ mod tests {
 			&local_map(hash(2)),
 			&remote,
 			&holds,
+			plan::PassPaths::Whole,
 		)
 		.actions;
 		assert_eq!(
@@ -9144,7 +9163,8 @@ mod tests {
 				&tree(&baseline),
 				&local_map(hash(2)),
 				&remote,
-				&holds
+				&holds,
+				plan::PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -9193,7 +9213,8 @@ mod tests {
 				&tree(&baseline),
 				&local_map(hash(2)),
 				&remote,
-				&holds
+				&holds,
+				plan::PassPaths::Whole,
 			)
 			.actions
 			.is_empty(),
@@ -9325,8 +9346,15 @@ mod tests {
 		let mut remote = HashMap::new();
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(pending.fold_into(PAIR, &tree(&baseline), &mut remote), 1);
-		let actions =
-			plan::reconcile(SyncMode::TwoWay, &tree(&baseline), &local, &remote, &holds).actions;
+		let actions = plan::reconcile(
+			SyncMode::TwoWay,
+			&tree(&baseline),
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Whole,
+		)
+		.actions;
 		assert_eq!(
 			actions.iter().map(describe).collect::<Vec<_>>(),
 			vec!["conflict \"d\"".to_string()],
