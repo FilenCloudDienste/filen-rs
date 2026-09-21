@@ -25,8 +25,8 @@ use filen_sdk_rs::{
 		file::RemoteFile,
 	},
 	sync_engine::{
-		IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine, SyncEvent, SyncMode,
-		WatchConfig, WatchState,
+		FullPassReason, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine, SyncEvent,
+		SyncMode, SyncReport, WatchConfig, WatchState,
 	},
 };
 use filen_types::api::v3::dir::color::DirColor;
@@ -155,6 +155,18 @@ impl WatchLog {
 				_ => None,
 			})
 			.flatten()
+			.collect()
+	}
+	/// Every completed pass's report, in arrival order.
+	fn reports(&self) -> Vec<SyncReport> {
+		self.events
+			.lock()
+			.unwrap()
+			.iter()
+			.filter_map(|e| match e {
+				SyncEvent::PassCompleted { report } => Some(report.clone()),
+				_ => None,
+			})
 			.collect()
 	}
 	fn conflicts(&self) -> Vec<String> {
@@ -2308,6 +2320,204 @@ async fn watch_one_change_plans_one_action_and_an_idle_wake_runs_no_pass() {
 		passes_started(&log),
 		started_before,
 		"a wake with nothing announced on either side still ran a pass"
+	);
+
+	handle.stop().await;
+	sc.cleanup();
+}
+
+// ============================================================================
+// (add) — a pass cut short still owes the deletion a remote absence asked for
+// ============================================================================
+
+/// An interrupted pass hands the next one BOTH halves of what it took: the paths its plan named
+/// (`carry_forward`) and the announced remote changes it consumed (`note_owed_remote`). The action
+/// that needs the second half is the one a remote ABSENCE owes — the local delete answering a
+/// trash — which no local observation can reproduce, because the baseline row that path's remote
+/// side is derived from still records the item. `derive.rs`'s
+/// `an_interrupted_passs_remote_action_is_re_planned_from_both_halves` pins the derivation; this
+/// pins the engine around it, against the real cache and a real interruption.
+///
+/// The seed tree is not decoration: the changelist caps scale with the tree
+/// (`dirty_cap` = items / 4, floor 1), so a two-file pair can never narrow at all — its single
+/// entry of headroom is spent by the cache announcing the seed upload itself, and the pass reads
+/// whole for `RemoteOverflow`. Hence 40 files, and a quiesce that lets those announcements be
+/// consumed before the burst below.
+///
+/// What it does NOT pin, because the public API cannot reach it: that the pass after the
+/// interruption re-plans that action while STILL NARROWED. The only way to cut a pass short from
+/// outside is a cancelling pause, and `resume_pair` forces the pass after it to read both sides
+/// whole — asserted below, because that force is what keeps the hand-back off the critical path
+/// today. `sync_pass`'s own table leaves an interrupted change-scoped pass narrowed. So the moment
+/// an interruption can avoid the pause, the `full_pass` assertion at the end fails and everything
+/// above it becomes the real coverage of the hand-back.
+#[shared_test_runtime]
+async fn watch_add_an_interrupted_pass_still_owes_a_remote_deletion() {
+	/// Long enough that the remote trash and the local write below land in ONE burst — the quiet
+	/// window restarts on every event, and the two arrive a poll interval (200 ms) apart — and
+	/// shorter than `IDLE_QUIET`, so `quiesce` cannot read a pair with a pass pending as settled.
+	const BURST: Duration = Duration::from_secs(5);
+	/// Enough files that the changelist caps admit the burst below: see the doc comment.
+	const SEED: usize = 40;
+	/// Far enough away that no pass in this test can be the safety net's doing.
+	const NET: Duration = Duration::from_secs(900);
+	/// The remainder is the resume's to finish, and it carries a 48 MiB upload.
+	const AFTER_RESUME: Duration = Duration::from_secs(300);
+	/// Big enough that the upload is still running a moment after the pass reports its plan.
+	const BIG: usize = 48 * 1024 * 1024;
+
+	let sc = single_client(SyncMode::TwoWay).await;
+	write_file(&sc.local, "victim.txt", b"doomed");
+	for i in 0..SEED {
+		write_file(
+			&sc.local,
+			&format!("seed{i:02}.txt"),
+			format!("s{i}").as_bytes(),
+		);
+	}
+	let (engine, pair) = watch_engine(&sc, SyncMode::TwoWay).await;
+
+	let log = Arc::new(WatchLog::default());
+	let handle = engine
+		.clone()
+		.watch_with(
+			pair,
+			WatchConfig {
+				debounce: BURST,
+				safety_net: NET,
+			},
+			observer_for(log.clone()),
+		)
+		.await
+		.unwrap();
+
+	// The watch's first pass is the whole-tree one. It uploads the tree the deletion below is part
+	// of, and leaves behind the carried state a change-scoped pass needs.
+	assert!(
+		wait_until(WATCH_SETTLE, || log.uploaded() > SEED).await,
+		"the watch never uploaded the seed tree (passes={}, up={})",
+		log.passes(),
+		log.uploaded()
+	);
+	let (_dirs, files) = list_remote_root(&sc).await;
+	let mut victim = find_file(&files, "victim.txt")
+		.expect("the seed file is on the remote")
+		.clone();
+	// The cache has to know the item before its removal can be announced as one.
+	wait_cache_sees(&sc, victim.uuid()).await;
+	// And the announcements of the seed upload — one per file, far past the cap — have to be spent
+	// by the pass they force whole, or they would make the burst's pass a whole one too.
+	quiesce(&log, "the seed upload").await;
+	let uploaded_before = log.uploaded();
+	// Every pass plans, including one that plans nothing, so the burst's pass is counted from
+	// HERE rather than against a fixed number: pausing before it started would leave nothing for
+	// the cancel to reach, and this test would fail for a reason that is not its subject.
+	let planned_before = log.count(|e| matches!(e, SyncEvent::Planned { .. }));
+
+	// One burst, two changes: the remote item is trashed — the local delete answering it is what
+	// this test follows — and a big local file appears, whose upload is what the cancel
+	// interrupts. The write follows the cache's own application of the trash by one poll, so both
+	// sit well inside a single debounce window and ONE pass plans both.
+	sc.cache.client.trash_file(&mut victim).await.unwrap();
+	assert!(
+		poll_for_item_absent(sc.cache.db_path(), victim.uuid(), CACHE_CONVERGE_TIMEOUT).await,
+		"the cache never dropped the trashed file, so nothing announced the deletion"
+	);
+	write_file(&sc.local, "big.bin", &vec![0x5a_u8; BIG]);
+
+	// Cancel it as soon as it says what it planned: by then it is inside the upload, and the
+	// deletion — which the apply runs after every transfer — has not happened.
+	assert!(
+		wait_until(WATCH_SETTLE, || log
+			.count(|e| matches!(e, SyncEvent::Planned { .. }))
+			> planned_before)
+		.await,
+		"the pass carrying both changes never planned (passes={})",
+		log.passes()
+	);
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Cancel,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+	assert!(
+		wait_until(WATCH_SETTLE, || log
+			.count(|e| matches!(e, SyncEvent::Interrupted { .. }))
+			> 0)
+		.await,
+		"the pause never reached the pass in flight (passes={}, up={})",
+		log.passes(),
+		log.uploaded()
+	);
+
+	let cut_short = log
+		.reports()
+		.into_iter()
+		.find(|report| report.interrupted > 0)
+		.expect("no pass reported an interrupted action");
+	assert_eq!(
+		cut_short.full_pass, None,
+		"the interrupted pass read both sides whole, so it is not the case this test is about: \
+		 {cut_short:?}"
+	);
+	assert_eq!(
+		cut_short.uploaded, 0,
+		"the upload finished before the cancel could drop it — nothing was interrupted: \
+		 {cut_short:?}"
+	);
+	assert_eq!(
+		cut_short.locally_deleted, 0,
+		"the pass got as far as the deletion, so it owed nothing: {cut_short:?}"
+	);
+	assert!(
+		sc.local.join("victim.txt").exists(),
+		"the local copy is already gone, so the deletion was never the remainder"
+	);
+
+	// The remainder must land on the resume: the upload again, and the deletion that only the
+	// announced removal can plan.
+	engine.resume_pair(pair).await.unwrap();
+	assert!(
+		wait_until(AFTER_RESUME, || log.locally_deleted() >= 1
+			&& log.uploaded() > uploaded_before)
+		.await,
+		"the interrupted pass's remainder never landed (passes={}, up={}, del={})",
+		log.passes(),
+		log.uploaded(),
+		log.locally_deleted()
+	);
+	assert!(
+		!sc.local.join("victim.txt").exists(),
+		"the deletion the remote absence owed was never carried out"
+	);
+	let (_dirs, files) = list_remote_root(&sc).await;
+	assert!(
+		find_file(&files, "big.bin").is_some(),
+		"the interrupted upload was never re-planned"
+	);
+	assert!(
+		find_file(&files, "victim.txt").is_none(),
+		"the trashed file is back on the remote"
+	);
+
+	// And WHY that pass found the deletion: the resume forced it to read both sides whole. This is
+	// the assertion that keeps this test honest about what it covers — see the doc comment.
+	let after_resume = log
+		.reports()
+		.into_iter()
+		.skip_while(|report| report.interrupted == 0)
+		.nth(1)
+		.expect("no pass ran after the interrupted one");
+	assert_eq!(
+		after_resume.full_pass,
+		Some(FullPassReason::FirstPass),
+		"the pass after a resume must read both sides whole; the hand-back is belt to those \
+		 braces, and this test does not cover it while they hold: {after_resume:?}"
 	);
 
 	handle.stop().await;
