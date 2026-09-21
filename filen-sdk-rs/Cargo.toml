@@ -264,6 +264,10 @@ zip = { version = "5.1.1", default-features = false }
 imap = { version = "3.0.0-alpha.15", default-features = false, features = [
 	"rustls-tls",
 ] }
+# `imap`'s `ClientBuilder` exposes no connect/read timeout and its `connect_with` is private, so
+# `client_tests` builds the TLS connection by hand. This is the very connector `imap` enables for
+# its own `rustls-tls` feature, so it is already in Cargo.lock and costs no extra compilation.
+rustls-connector = "0.19.2"
 mail-parser = "0.11.1"
 reqwest = { version = "0.12.22", features = [
 	"cookies",

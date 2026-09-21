@@ -2,6 +2,7 @@ use core::panic;
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
+	net::{TcpStream, ToSocketAddrs},
 	time::Duration,
 };
 
@@ -21,6 +22,7 @@ use filen_sdk_rs::{
 use filen_types::traits::CowHelpersExt;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use regex::Regex;
+use rustls_connector::RustlsConnector;
 use scraper::{Html, Selector};
 use test_utils::await_event;
 
@@ -158,8 +160,22 @@ async fn test_2fa() {
 	client.disable_2fa(&recovery_key).await.unwrap();
 	res.unwrap();
 }
+const IMAP_DOMAIN: &str = "imappro.zoho.eu";
+const IMAP_PORT: u16 = 993;
+/// `imap`'s `ClientBuilder` sets no timeouts at all: its `TcpStream::connect` and its greeting read
+/// both block indefinitely. On the 2026-09-20 nightly one `.connect()` sat 3m41s after a completed
+/// TLS handshake before the peer's EOF finally surfaced.
+const IMAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const IMAP_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const IMAP_CONNECT_ATTEMPTS: u32 = 3;
+/// How many `Ok`-but-empty polls [`await_email`] tolerates before rebuilding the session.
+const EMPTY_POLLS_BEFORE_RECONNECT: usize = 5;
+
+type BoxedImapSession = imap::Session<std::boxed::Box<dyn imap::ImapConnection>>;
+
 struct ImapSession {
-	session: imap::Session<std::boxed::Box<dyn imap::ImapConnection>>,
+	session: BoxedImapSession,
+	imap_username: String,
 }
 
 impl Drop for ImapSession {
@@ -173,20 +189,99 @@ impl Drop for ImapSession {
 	}
 }
 
-fn imap_login(imap_username: &str) -> ImapSession {
-	let imap_email = format!("{}@filen.io", imap_username);
-	let imap_password = std::env::var("IMAP_EMAIL_PASSWORD").unwrap();
-
-	let client = imap::ClientBuilder::new("imappro.zoho.eu", 993)
-		.connect()
-		.unwrap();
-
-	let mut imap_session = client.login(&imap_email, &imap_password).unwrap();
-
-	imap_session.select("INBOX").unwrap();
-	ImapSession {
-		session: imap_session,
+impl ImapSession {
+	/// Best-effort replacement of the underlying session. Only `session` is swapped: dropping a
+	/// whole [`ImapSession`] would run the mailbox-wide `expunge` in [`Drop`] against a socket that
+	/// is, in the case this exists for, already dead.
+	fn reconnect(&mut self) {
+		let password = match std::env::var("IMAP_EMAIL_PASSWORD") {
+			Ok(password) => password,
+			Err(e) => {
+				tracing::debug!("IMAP reconnect skipped, no password in the environment: {e}");
+				return;
+			}
+		};
+		match imap_connect_once(&self.imap_username, &password) {
+			Ok(session) => {
+				tracing::debug!("Rebuilt the IMAP session");
+				self.session = session;
+			}
+			Err(e) => tracing::debug!("IMAP reconnect failed, keeping the old session: {e}"),
+		}
 	}
+}
+
+/// One connect + login + select, with an explicit connect timeout and I/O timeout.
+///
+/// [`imap::ClientBuilder::connect`] cannot do this: it exposes no timeout knob and its
+/// `connect_with` is private, so the TLS connection is built by hand the way the crate's own
+/// `examples/timeout.rs` does. The read timeout is set on the `TcpStream` before the TLS wrap, so
+/// it also bounds every later command on the returned session — including the `uid_search` loop in
+/// [`await_email`], which otherwise polls a dead socket for its full budget.
+fn imap_connect_once(
+	imap_username: &str,
+	imap_password: &str,
+) -> Result<BoxedImapSession, Box<dyn std::error::Error>> {
+	let imap_email = format!("{}@filen.io", imap_username);
+	let mut last_err: Option<Box<dyn std::error::Error>> = None;
+
+	for addr in (IMAP_DOMAIN, IMAP_PORT).to_socket_addrs()? {
+		let tcp = match TcpStream::connect_timeout(&addr, IMAP_CONNECT_TIMEOUT) {
+			Ok(tcp) => tcp,
+			Err(e) => {
+				last_err = Some(Box::new(e));
+				continue;
+			}
+		};
+		tcp.set_read_timeout(Some(IMAP_IO_TIMEOUT))?;
+		tcp.set_write_timeout(Some(IMAP_IO_TIMEOUT))?;
+
+		// Mirrors the crate's own `build_tls_rustls`, which builds its root store from
+		// `load_native_certs()`: keep the trust anchors identical to `ClientBuilder::connect`.
+		let tls = RustlsConnector::new_with_native_certs()?.connect(IMAP_DOMAIN, tcp)?;
+		let connection: std::boxed::Box<dyn imap::ImapConnection> = Box::new(tls);
+		let mut client = imap::Client::new(connection);
+		client.read_greeting()?;
+		let mut session = client
+			.login(&imap_email, imap_password)
+			.map_err(|(e, _)| e)?;
+		session.select("INBOX")?;
+		return Ok(session);
+	}
+
+	Err(last_err.unwrap_or_else(|| format!("no addresses resolved for {IMAP_DOMAIN}").into()))
+}
+
+fn imap_login(imap_username: &str) -> ImapSession {
+	let imap_password = std::env::var("IMAP_EMAIL_PASSWORD").unwrap();
+	let mut delay = Duration::from_secs(1);
+	let mut last_err = None;
+
+	for attempt in 1..=IMAP_CONNECT_ATTEMPTS {
+		match imap_connect_once(imap_username, &imap_password) {
+			Ok(session) => {
+				return ImapSession {
+					session,
+					imap_username: imap_username.to_owned(),
+				};
+			}
+			Err(e) => {
+				tracing::debug!(
+					"IMAP connect attempt {attempt}/{IMAP_CONNECT_ATTEMPTS} failed: {e}"
+				);
+				last_err = Some(e);
+				if attempt < IMAP_CONNECT_ATTEMPTS {
+					std::thread::sleep(delay);
+					delay *= 2;
+				}
+			}
+		}
+	}
+
+	panic!(
+		"IMAP login failed after {IMAP_CONNECT_ATTEMPTS} attempts: {}",
+		last_err.expect("at least one attempt ran")
+	);
 }
 
 struct MsgsResponse<'a> {
@@ -225,44 +320,80 @@ fn await_email(
 		subject, to
 	);
 
+	// Stays at trace: the query embeds the mailbox address.
 	tracing::trace!("Waiting for email with query: {}", query);
 
-	for _ in 0..retry_count {
-		if let Ok(msgs) = imap_session.session.uid_search(&query) {
-			// deletes all received messages on drop
-			tracing::trace!("Found {} emails", msgs.len());
-			let msgs = MsgsResponse {
-				ids: msgs,
-				session: imap_session,
-			};
+	let mut ok_empty = 0usize;
+	let mut search_errors = 0usize;
+	let mut empty_since_reconnect = 0usize;
+	let mut last_error: Option<String> = None;
 
-			let mut iter = msgs.ids.iter();
-			if let Some(msg) = iter.next() {
-				if iter.next().is_some() {
-					panic!("More than one email received from noreply@notifications.filen.io");
-				}
-				tracing::debug!("Found email with id {}", msg);
-				let msg = msgs
-					.session
-					.session
-					.uid_fetch(msg.to_string(), "RFC822")
-					.unwrap();
-				if let Some(msg) = msg.iter().next() {
-					let body = msg.body().expect("Email has no body");
-					let body = std::str::from_utf8(body).expect("Email body is not valid UTF-8");
-					return body.to_string();
+	for attempt in 1..=retry_count {
+		// Bound the search borrow before the `Ok` arm reborrows `imap_session` for `MsgsResponse`.
+		let search = imap_session.session.uid_search(&query);
+		match search {
+			Ok(msgs) => {
+				// deletes all received messages on drop
+				tracing::trace!("Found {} emails", msgs.len());
+				let msgs = MsgsResponse {
+					ids: msgs,
+					session: imap_session,
+				};
+
+				let mut iter = msgs.ids.iter();
+				if let Some(msg) = iter.next() {
+					if iter.next().is_some() {
+						panic!("More than one email received from noreply@notifications.filen.io");
+					}
+					tracing::debug!("Found email with id {}", msg);
+					let msg = msgs
+						.session
+						.session
+						.uid_fetch(msg.to_string(), "RFC822")
+						.unwrap();
+					if let Some(msg) = msg.iter().next() {
+						let body = msg.body().expect("Email has no body");
+						let body =
+							std::str::from_utf8(body).expect("Email body is not valid UTF-8");
+						return body.to_string();
+					} else {
+						tracing::warn!("Email disappeared");
+					}
 				} else {
-					tracing::warn!("Email disappeared");
+					ok_empty += 1;
+					empty_since_reconnect += 1;
+					// debug!, not trace!: CI captures at RUST_LOG=debug, so a trace line here is
+					// invisible in every nightly log ever recorded, and the panic below cannot be
+					// told apart from the dead-session case (2026-09-20 triage).
+					tracing::debug!("No email received ({attempt}/{retry_count}), retrying...");
 				}
-			} else {
-				tracing::trace!("No email received, retrying...");
 			}
-		} else {
-			tracing::trace!("Failed to search emails, retrying...");
+			Err(e) => {
+				search_errors += 1;
+				last_error = Some(e.to_string());
+				tracing::debug!(
+					"Failed to search emails ({attempt}/{retry_count}): {e}, retrying..."
+				);
+				// A session whose socket has died answers `Err` for every remaining poll.
+				imap_session.reconnect();
+				empty_since_reconnect = 0;
+			}
 		}
+
+		// A live session can also go blind to an already-delivered message: on a green run Zoho's
+		// SEARCH withheld one uid for ~90s while a later-delivered uid was already visible to a
+		// sibling session. An `Ok`-but-empty answer never takes the `Err` path above, so force a
+		// fresh SELECT periodically as well.
+		if empty_since_reconnect >= EMPTY_POLLS_BEFORE_RECONNECT {
+			imap_session.reconnect();
+			empty_since_reconnect = 0;
+		}
+
 		std::thread::sleep(retry_delay);
 	}
-	panic!("No email received");
+	panic!(
+		"No email received after {retry_count} polls ({ok_empty} empty, {search_errors} search errors, last error: {last_error:?})"
+	);
 }
 
 fn match_regex_in_email_body(body: &str, regex: &Regex) -> (String, Vec<String>) {
