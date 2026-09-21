@@ -411,9 +411,14 @@ fn baseline_rows(scan: &LocalScan, remote: &HashMap<String, RemoteNode>) -> Vec<
 }
 
 /// Diverge the local files in the half-open range `from..to` of the map's iteration order from
-/// their baseline rows, the way an edit would. The order is stable while nothing is inserted, so
-/// successive calls dirty successive files and the percentages accumulate.
-fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) {
+/// their baseline rows, the way an edit would, and return the paths it diverged. The order is
+/// stable while nothing is inserted, so successive calls dirty successive files and the
+/// percentages accumulate.
+///
+/// The paths are what a pass would hold in its changelist for those edits, which is the scope the
+/// change-scoped phases reconcile at.
+fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) -> BTreeSet<String> {
+	let mut changed = BTreeSet::new();
 	for (index, node) in local
 		.values_mut()
 		.filter(|node| node.kind == NodeKind::File)
@@ -423,7 +428,9 @@ fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) {
 	{
 		node.size += 1;
 		node.content_hash = Some(Blake3Hash::from([(index % 251) as u8; 32]));
+		changed.insert(node.rel_path.clone());
 	}
+	changed
 }
 
 /// Everything a pass does locally, end to end, on inputs it re-reads itself: the phases above in
@@ -1110,6 +1117,10 @@ pub fn run() -> String {
 	);
 
 	let holds = PassHolds::default();
+	// What a change-scoped pass would name as changed, growing with each `dirty_local` below. The
+	// twin phases reconcile the SAME maps at that scope, so the pair of lines is the whole claim:
+	// same inputs, same run, one deciding every path and one deciding what moved.
+	let mut changed_paths: BTreeSet<String> = BTreeSet::new();
 	let (converged, reconcile_0) = timed(|| {
 		plan::reconcile(
 			SyncMode::TwoWay,
@@ -1132,8 +1143,33 @@ pub fn run() -> String {
 		&converged.actions[..converged.actions.len().min(3)]
 	);
 
+	let (dirty_0, reconcile_dirty_0) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Changed(&changed_paths),
+		)
+	});
+	probe.record(
+		"reconcile_dirty_0pct",
+		nodes,
+		reconcile_dirty_0,
+		&format!(
+			"{} changed path(s), {} actions",
+			changed_paths.len(),
+			dirty_0.actions.len()
+		),
+	);
+	// No equality assertion here, deliberately: with an empty key set on a converged fixture both
+	// plans are empty whatever the reconcile does, so the assertion would be `[] == []` and could
+	// not fail. This phase is a timing floor — what an empty scope costs — and the 1 % and 10 %
+	// twins below are what carry the claim that a narrowed reconcile plans what a whole one plans.
+
 	let one_percent = fixture.files / 100;
-	dirty_local(&mut local, 0, one_percent);
+	changed_paths.extend(dirty_local(&mut local, 0, one_percent));
 	let (plan_1, reconcile_1) = timed(|| {
 		plan::reconcile(
 			SyncMode::TwoWay,
@@ -1155,8 +1191,33 @@ pub fn run() -> String {
 		),
 	);
 
+	let (dirty_1, reconcile_dirty_1) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Changed(&changed_paths),
+		)
+	});
+	probe.record(
+		"reconcile_dirty_1pct",
+		nodes,
+		reconcile_dirty_1,
+		&format!(
+			"{} changed path(s), {} actions",
+			changed_paths.len(),
+			dirty_1.actions.len()
+		),
+	);
+	assert_eq!(
+		dirty_1.actions, plan_1.actions,
+		"the narrowed reconcile must plan what the whole one plans, at this scale too"
+	);
+
 	let ten_percent = fixture.files / 10;
-	dirty_local(&mut local, one_percent, ten_percent);
+	changed_paths.extend(dirty_local(&mut local, one_percent, ten_percent));
 	let (plan_10, reconcile_10) = timed(|| {
 		plan::reconcile(
 			SyncMode::TwoWay,
@@ -1178,11 +1239,37 @@ pub fn run() -> String {
 		),
 	);
 
+	let (dirty_10, reconcile_dirty_10) = timed(|| {
+		plan::reconcile(
+			SyncMode::TwoWay,
+			&baseline,
+			&local,
+			&remote,
+			&holds,
+			plan::PassPaths::Changed(&changed_paths),
+		)
+	});
+	probe.record(
+		"reconcile_dirty_10pct",
+		nodes,
+		reconcile_dirty_10,
+		&format!(
+			"{} changed path(s), {} actions",
+			changed_paths.len(),
+			dirty_10.actions.len()
+		),
+	);
+	assert_eq!(
+		dirty_10.actions, plan_10.actions,
+		"the narrowed reconcile must plan what the whole one plans, at this scale too"
+	);
+
 	// The whole local half of a pass, on inputs it re-reads itself — so this line's peak RSS is a
 	// pass's peak, not the sum of the phases above.
 	drop((
 		converged, plan_1, plan_10, baseline, local, remote, snapshot,
 	));
+	drop((dirty_0, dirty_1, dirty_10, changed_paths));
 	let (actions, whole) = timed(|| pass_pure(&fixture, &store, pair, &rules));
 	probe.record(
 		"pass_pure",
@@ -1220,6 +1307,44 @@ pub fn run() -> String {
 	assert_eq!(
 		scoped_actions, 1,
 		"one changed file must plan exactly one action, or this phase is timing the wrong thing"
+	);
+
+	// The phase the one-per-cent target is read off: a real change-scoped pass, with one per cent
+	// of the files edited on disk and named in its dirty set. `pass_one_file_changed` above is the
+	// same machinery at its floor and `pass_pure` the whole-read yardstick — same fixture, same
+	// run, so the three numbers are comparable.
+	let percent_changed: Vec<String> = store
+		.entries(pair)
+		.expect("reading the baseline")
+		.into_iter()
+		.filter(|entry| entry.kind == NodeKind::File)
+		.take((fixture.files / 100).max(1))
+		.map(|entry| entry.rel_path)
+		.collect();
+	for rel_path in &percent_changed {
+		fs::write(
+			fixture.root.join(rel_path),
+			b"changed by the probe, one per cent of the tree",
+		)
+		.expect("changing a probe file");
+	}
+	let percent_dirty: BTreeSet<String> = percent_changed.iter().cloned().collect();
+	let (percent_actions, percent) =
+		timed(|| pass_scoped(&fixture, &store, pair, percent_dirty.clone()));
+	probe.record(
+		"pass_one_percent_changed",
+		nodes,
+		percent,
+		&format!(
+			"{percent_actions} action(s) for {} changed file(s); baseline + derived maps + \
+			 re-observation + fold + reconcile, no walk and no snapshot",
+			percent_changed.len()
+		),
+	);
+	assert_eq!(
+		percent_actions,
+		percent_changed.len(),
+		"one action per changed file, or this phase is timing the wrong thing"
 	);
 
 	// The floor the same machinery costs with NOTHING dirty. The engine does not pay it — a wake
