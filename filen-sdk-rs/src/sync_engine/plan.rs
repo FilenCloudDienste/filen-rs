@@ -2415,13 +2415,6 @@ pub(crate) enum PassPaths<'a> {
 	Whole,
 	/// Decide only these, plus the rows under a held path (which cost their count and nothing
 	/// else — see [`reconcile_keys`]).
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the change-scoped pass hands this set over in the next commit of this series; 			          only the property test builds one so far"
-		)
-	)]
 	Changed(&'a BTreeSet<String>),
 }
 
@@ -2800,7 +2793,7 @@ mod tests {
 	) -> Vec<SyncAction> {
 		let mut remote = remote.clone();
 		let baseline = tree(baseline);
-		writes.fold_into(PAIR, &baseline, &mut remote);
+		writes.fold_into(PAIR, &baseline, &mut remote, &mut BTreeSet::new());
 		reconcile(
 			mode,
 			&baseline,
@@ -6812,11 +6805,10 @@ mod tests {
 			let derive::Derived {
 				mut local,
 				mut remote,
-				dirty,
+				mut decided,
 				held,
 				..
 			} = derive::from_baseline(&baseline, BTreeSet::new());
-			let mut decided = dirty;
 			for _ in 0..rng.random_range(0..7) {
 				let change = CHANGES[rng.random_range(0..CHANGES.len())];
 				seen.changes.insert(change);

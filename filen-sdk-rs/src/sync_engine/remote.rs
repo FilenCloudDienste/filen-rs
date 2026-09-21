@@ -59,6 +59,15 @@ pub(super) struct RemoteObservation {
 	/// re-observed on both) and they are the prefixes the pass's carried facts are pruned by.
 	/// A directory carries its subtree, so only the root of a moved or removed subtree is listed.
 	pub(super) touched: BTreeSet<String>,
+	/// Every path whose node the delta actually added, replaced or removed — the EXACT keys, one
+	/// per node, where [`touched`](Self::touched) names only the root of a subtree.
+	///
+	/// The two answer different questions and cannot be one set. `touched` says where to LOOK, and
+	/// a subtree root says it for everything under it — expanding it would send the local half off
+	/// to re-stat every descendant of a removed directory. This says what to DECIDE, and the
+	/// reconcile needs every key that moved by name (see
+	/// [`PassPaths::Changed`](super::plan::PassPaths::Changed)).
+	pub(super) changed: BTreeSet<String>,
 	/// Paths withheld from this pass, in the sense [`RemoteView::held_paths`](super::plan::RemoteView::held_paths)
 	/// gives them: the cache is showing a transition at that path and no action may be planned on
 	/// it. Merged into the view's own held set by the caller.
@@ -160,6 +169,7 @@ impl RemoteObservation {
 			nodes,
 			path_of,
 			touched: BTreeSet::new(),
+			changed: BTreeSet::new(),
 			held_paths: BTreeSet::new(),
 			rule_dirs: BTreeSet::new(),
 			superseded: HashMap::new(),
@@ -343,9 +353,14 @@ impl RemoteObservation {
 	}
 
 	/// Take the node at `path` out of the view, keeping the uuid index in step.
+	///
+	/// One of the two places a node enters or leaves the view, which is why
+	/// [`changed`](Self::changed) is recorded here rather than at each of the callers that vacate,
+	/// drop or re-key a subtree.
 	fn detach(&mut self, path: &str) -> Option<RemoteNode> {
 		let node = self.nodes.remove(path)?;
 		self.path_of.remove(&node.remote_uuid);
+		self.changed.insert(path.to_owned());
 		Some(node)
 	}
 
@@ -387,9 +402,11 @@ impl RemoteObservation {
 		Ok(())
 	}
 
-	/// Put `node` at `path`, displacing whatever the view had there.
+	/// Put `node` at `path`, displacing whatever the view had there. The other half of
+	/// [`detach`](Self::detach), and the other place [`changed`](Self::changed) is recorded.
 	fn insert(&mut self, path: String, node: RemoteNode) {
 		let uuid = node.remote_uuid;
+		self.changed.insert(path.clone());
 		if let Some(previous) = self.nodes.insert(path.clone(), node) {
 			self.path_of.remove(&previous.remote_uuid);
 		}

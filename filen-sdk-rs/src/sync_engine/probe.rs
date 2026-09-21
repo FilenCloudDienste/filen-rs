@@ -496,29 +496,38 @@ fn pass_scoped(
 		&RuleFiles::Read,
 		&dirty,
 	);
-	derive::merge_local(&mut derived.local, &baseline, &observations);
+	derive::merge_local(&mut derived, &baseline, &observations);
 	let Derived {
 		mut local,
 		mut remote,
 		held,
+		mut decided,
 		..
 	} = derived;
 	// The held paths are the rows that record one side only, which is what the pass folds with too
 	// (they reach it as `PassHolds::held_remote`).
-	plan::fold_dir_moves(
+	let moves = plan::fold_dir_moves(
 		SyncMode::TwoWay,
 		&mut baseline,
 		&mut local,
 		&mut remote,
 		&held,
 	);
+	// The decided set follows the fold, as `Prepared::fold_dir_moves` makes it follow for a pass.
+	for action in &moves {
+		let (from, to) = action.endpoints();
+		decided = decided
+			.into_iter()
+			.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
+			.collect();
+	}
 	plan::reconcile(
 		SyncMode::TwoWay,
 		&baseline,
 		&local,
 		&remote,
 		&PassHolds::default(),
-		plan::PassPaths::Whole,
+		plan::PassPaths::Changed(&decided),
 	)
 	.actions
 	.len()
