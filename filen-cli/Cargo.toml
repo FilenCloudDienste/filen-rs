@@ -65,6 +65,8 @@ strum = { version = "0.28.0", features = ["derive"] }
 inquire = { git = "https://github.com/JupiterPi/inquire.git", branch = "async-autocomplete" }
 console = "0.16.4"
 ctrlc = "3.5.2"
+schemars = "1.2.2"
+rmcp = { version = "3.4.0", features = ["server", "transport-io"] }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

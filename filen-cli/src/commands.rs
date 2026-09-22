@@ -219,6 +219,8 @@ pub(crate) enum Commands {
 		/// Additional arguments to Rclone
 		rclone_args: Vec<String>,
 	},
+	/// Runs an MCP server that exposes tools for AI agents to interact with your Filen drive
+	Mcp,
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
 	/// View the documentation (same as --help) locally in a browser rendered as HTML
@@ -492,6 +494,10 @@ pub(crate) async fn execute_command(
 				rclone_args,
 			)
 			.await?;
+			None
+		}
+		Commands::Mcp => {
+			crate::mcp_server::server::run_mcp_server().await?;
 			None
 		}
 		Commands::ExportApiKey => {
