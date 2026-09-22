@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `export-notes` command to export all notes to a local directory
 - `list-favorites` and `list-recents` commands
 - `--working-path` global option
+- `list-public-links` and `public-link` commands to manage public links for files and directories
 
 ### Changed
 

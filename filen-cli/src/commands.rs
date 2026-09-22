@@ -15,6 +15,7 @@ use crate::{
 
 mod fs_cmds;
 mod notes_cmds;
+mod public_links_cmds;
 mod rclone_cmds;
 mod search_cmd;
 mod transfer_cmds;
@@ -159,6 +160,14 @@ pub(crate) enum Commands {
 	TrashDelete,
 	/// Permanently delete all trashed items
 	EmptyTrash,
+	/// List public links
+	ListPublicLinks,
+	/// Create, update or delete a public link for a file or directory
+	PublicLink {
+		/// File or directory to create, update or delete a public link for
+		#[arg(add = FilenCompleter::file_or_directory())]
+		file_or_directory: String,
+	},
 	/// Export an auth config (to be used with --auth-config-path option)
 	ExportAuthConfig,
 	/// Execute an Rclone command using the managed installation
@@ -391,6 +400,20 @@ pub(crate) async fn execute_command(
 		}
 		Commands::EmptyTrash => {
 			fs_cmds::empty_trash(ui, client).await?;
+			None
+		}
+		Commands::ListPublicLinks => {
+			public_links_cmds::list_public_links(ui, client).await?;
+			None
+		}
+		Commands::PublicLink { file_or_directory } => {
+			public_links_cmds::view_or_create_or_edit_public_link(
+				ui,
+				client,
+				working_path,
+				&file_or_directory,
+			)
+			.await?;
 			None
 		}
 		Commands::ExportAuthConfig => {

@@ -136,6 +136,14 @@ impl FilePublicLink {
 		self.link_uuid
 	}
 
+	pub fn expiration(&self) -> PublicLinkExpiration {
+		self.expiration
+	}
+
+	pub fn downloadable(&self) -> bool {
+		self.downloadable
+	}
+
 	pub fn set_password(&mut self, password: String) {
 		if let PasswordState::Known(ref current) = self.password
 			&& &password == current
@@ -278,6 +286,18 @@ impl DirPublicLinkRW {
 
 	pub fn key_string(&self) -> Option<String> {
 		self.link_key.as_ref().map(|k| k.to_string())
+	}
+
+	pub fn password(&self) -> &PasswordState {
+		&self.password
+	}
+
+	pub fn expiration(&self) -> PublicLinkExpiration {
+		self.expiration
+	}
+
+	pub fn download_enabled(&self) -> bool {
+		self.enable_download
 	}
 
 	pub fn set_password(&mut self, password: String) {

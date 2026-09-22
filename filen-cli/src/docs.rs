@@ -97,6 +97,8 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::CommandHelp("trash-restore"),
 				DocElement::CommandHelp("trash-delete"),
 				DocElement::CommandHelp("empty-trash"),
+				DocElement::CommandHelp("list-public-links"),
+				DocElement::CommandHelp("public-link"),
 			],
 		},
 		DocSection {

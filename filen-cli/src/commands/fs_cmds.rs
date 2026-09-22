@@ -828,7 +828,7 @@ pub(crate) async fn list_recents(ui: &mut UI, client: &mut LazyClient) -> Result
 
 /// Prints a listing whose items don't share a parent, so a bare name wouldn't identify them:
 /// every item is resolved to its absolute path first.
-async fn print_items_with_full_paths(
+pub(crate) async fn print_items_with_full_paths(
 	ui: &mut UI,
 	client: &Client,
 	dirs: Vec<RemoteDirectory>,
