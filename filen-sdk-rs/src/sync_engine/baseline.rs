@@ -340,6 +340,43 @@ pub(crate) struct BaselineEntry {
 	pub(crate) agreed_hash: Option<Blake3Hash>,
 }
 
+impl BaselineEntry {
+	/// Whether this row stands in for BOTH sides of a pass — the one rule that says what a
+	/// change-scoped pass may carry forward instead of re-reading.
+	///
+	/// It lives here, on the row it is about, because THREE readers need the same answer and a
+	/// second copy of the field list is how a new column comes to be carried by one of them and not
+	/// another: [`derive::carried`](super::derive) builds the two nodes from a row that passes,
+	/// [`Baseline`](super::tree::Baseline) indexes the rows that fail so a pass can find them all
+	/// without walking the tree, and a carried side answers "does this side hold the path" straight
+	/// off that index without building a node at all.
+	///
+	/// A row that fails this is not a defect. It is one the engine wrote one-sided on purpose — a
+	/// `KeepLocal`/`KeepRemote` resolution that cleared a half, an [`Adopted`](BaselineState::Adopted)
+	/// row, a divergence whose two halves describe a disagreement rather than an agreement — and a
+	/// pass re-observes it rather than deriving either side from it.
+	pub(crate) fn carryable(&self) -> bool {
+		// Anything but `Synced` describes a divergence or a standing one-sided copy, so neither side
+		// may be derived from it.
+		self.state == BaselineState::Synced
+			// Nothing on record for the remote item: there is no remote node to build.
+			&& self.remote_uuid.is_some()
+			&& match self.kind {
+				// A directory has no content and no stamp any part of a pass reads.
+				NodeKind::Dir => true,
+				// A file's every field IS read — the hash classifies it, `(size, mtime)` is the
+				// scanner's fast path, and the remote stamp is written into the rows an adopt writes.
+				// A row missing any of them describes no side fully, so it describes neither.
+				NodeKind::File => {
+					self.content_hash.is_some()
+						&& self.size.is_some()
+						&& self.local_mtime.is_some()
+						&& self.remote_modified.is_some()
+				}
+			}
+	}
+}
+
 /// One row of the persisted pending-write journal: a remote write this engine made, and when by
 /// the WALL clock (unix millis — the in-memory journal's `Instant` does not outlive its process).
 #[derive(Debug, Clone, PartialEq, Eq)]
