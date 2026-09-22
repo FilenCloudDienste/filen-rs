@@ -13,7 +13,10 @@
 //! when it records BOTH sides, and every row that does not is put in the dirty set (re-observed on
 //! disk) and in the held set (no action may be planned at it or under it) in the same breath. There
 //! is no path through this module that leaves a row out of a map without holding its path, so a
-//! half-recorded row cannot read downstream as a deletion.
+//! half-recorded row cannot read downstream as a deletion. A path the rules HIDE is the one other
+//! row a pass cannot answer for, and [`merge_local`] takes it out of the local map under the same
+//! rule: dropped so the two halves of a hidden path agree, held so the pair of absences over a
+//! live row is not read as a convergent delete.
 //!
 //! The rows that record one side only are the ones the engine writes that way on purpose: a
 //! `KeepLocal` resolution clears the local half and a `KeepRemote` one clears the remote half
@@ -63,7 +66,8 @@ pub(super) struct Derived {
 	/// stand in for itself.
 	pub(super) dirty: BTreeSet<String>,
 	/// Paths no action may be planned at or under, because no derived map describes them: the rows
-	/// that record one side only. Merged into the pass's
+	/// that record one side only, and the paths an observation found HIDDEN with a row still
+	/// carried there ([`merge_local`]). Merged into the pass's
 	/// [`held_remote`](super::plan::PassHolds::held_remote), which is what makes the missing side a
 	/// deferral rather than an absence.
 	pub(super) held: BTreeSet<String>,
@@ -195,32 +199,54 @@ pub(super) fn merge_local(
 			LocalObservation::Absent(absence) => {
 				drop_rows(derived, baseline, absence.path(), &BTreeSet::new());
 			}
-			// The rules hide it. No local evidence and no deletion: what the rules hide is untracked
-			// by the untrack-on-ignore path, never deleted by this one.
-			LocalObservation::Hidden(_) => {}
+			// The rules hide it, and a walk of the directory above it would have pruned it, so the
+			// local map must not go on carrying a node here: the view is filtered with the very same
+			// rules a few lines later (`engine::prepare_scoped`), and a path that reads
+			// local-present/remote-absent is a path the reconcile plans a local delete at.
+			//
+			// Dropped is not absent, though. Where a row was carried here the path is HELD as well:
+			// two absences over a live row read as a convergent delete and retire it, and what sits
+			// under a hidden root is the untrack-on-ignore path's to remove, which retries its own
+			// delete every pass. What the rules normally hide has no row at all — the pass that
+			// first hid it untracked what was there — and drops, holds and costs nothing here.
+			LocalObservation::Hidden(_) => {
+				if drop_rows(derived, baseline, at, &BTreeSet::new()) {
+					derived.held.insert(at.clone());
+				}
+			}
 		}
 	}
 }
 
 /// Take the rows at or under `at` out of the local map, except those at or under a path the walk
-/// pruned.
+/// pruned. Answers whether it took any, which is what tells a hidden path with rows still behind
+/// it from one the rules have always hidden.
 ///
 /// Driven by the baseline's own subtree rather than by the map, so it costs the dirty subtree and
 /// not the whole tree. Nodes an EARLIER observation inserted are never under `at`: an observation
 /// answers for everything below its key, and `observe_local` files them in ancestor-first order —
 /// rewriting a dirty rule file onto its directory BEFORE it walks the set, so that directory is
 /// never filed after an entry it holds — so no two of them nest.
-fn drop_rows(derived: &mut Derived, baseline: &Baseline, at: &str, pruned: &BTreeSet<String>) {
+fn drop_rows(
+	derived: &mut Derived,
+	baseline: &Baseline,
+	at: &str,
+	pruned: &BTreeSet<String>,
+) -> bool {
+	let mut dropped = false;
 	if !at.is_empty() && !plan::at_or_under_root(pruned, at) && derived.local.remove(at).is_some() {
 		derived.decided.insert(at.to_owned());
+		dropped = true;
 	}
 	for row in baseline.subtree(at) {
 		if !plan::at_or_under_root(pruned, &row.rel_path)
 			&& derived.local.remove(&row.rel_path).is_some()
 		{
 			derived.decided.insert(row.rel_path);
+			dropped = true;
 		}
 	}
+	dropped
 }
 
 #[cfg(test)]
@@ -244,7 +270,7 @@ mod tests {
 				tests::{cache_event, cacheable_file},
 			},
 			facts::carry_over,
-			ignore::IgnoreRules,
+			ignore::{FILENIGNORE, IgnoreRules},
 			observe::observe_local,
 			plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
 			remote::{RemoteObserved, observe_remote},
@@ -976,6 +1002,74 @@ mod tests {
 			sorted(derived.local.keys().cloned())
 		);
 		assert!(derived.local.contains_key("docs/deep/inner.bin"));
+	}
+
+	/// A path the rules hide is taken out of the LOCAL map as well as the remote one, and held
+	/// where a row was carried there, so the two halves agree and nothing is planned at it.
+	///
+	/// The shape that reaches this is an `untrack_ignored` whose `delete_subtrees` failed: rows
+	/// survive under a root the rules hide. Carrying the local node while the view's filter drops
+	/// the remote one reads as a remote deletion — a local delete planned on a file the user still
+	/// has, with only `drop_blocked` standing in front of it.
+	#[test]
+	fn a_hidden_path_with_a_carried_row_is_dropped_held_and_plans_nothing() {
+		let pair = Pair::converged();
+		let baseline = pair.baseline();
+		// The rule arrives after the rows: what it hides is tracked, and stayed tracked.
+		fs::write(pair.root.join(FILENIGNORE), "deep/\n").unwrap();
+
+		let mut derived = from_baseline(&baseline, dirty_paths(&["docs/deep"]));
+		let (observed, rules) = observe_local(
+			&pair.root,
+			&baseline,
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			&derived.dirty,
+		);
+		assert!(
+			matches!(observed.observed["docs/deep"], LocalObservation::Hidden(_)),
+			"the rule has to be what the observation reports: {:?}",
+			observed.observed
+		);
+		merge_local(&mut derived, &baseline, &observed);
+		// The remote half, filtered with the very rules the observation matched with — which is
+		// what `prepare_scoped` does a few lines after its own `merge_local`.
+		let mut view = RemoteView {
+			nodes: std::mem::take(&mut derived.remote),
+			has_collisions: false,
+			held_paths: BTreeSet::new(),
+			skipped: Vec::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+		};
+		view.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &baseline,
+		}));
+		derived.remote = view.nodes;
+
+		for path in ["docs/deep", "docs/deep/inner.bin"] {
+			assert!(
+				!derived.local.contains_key(path),
+				"the local half still describes {path:?}: {:?}",
+				sorted(derived.local.keys().cloned())
+			);
+			assert!(
+				!derived.remote.contains_key(path),
+				"the remote half still describes {path:?}"
+			);
+		}
+		assert!(
+			derived.held.contains("docs/deep"),
+			"a hidden path with rows behind it is withheld, or its two absences retire the row: \
+			 {:?}",
+			derived.held
+		);
+		let planned = scoped_plan(&baseline, &derived);
+		assert!(
+			planned.is_empty(),
+			"a hidden path is decided by nobody: {planned:?}"
+		);
 	}
 
 	/// An incomplete walk may have missed anything, so it drops nothing: an absence it seems to

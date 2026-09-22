@@ -1371,8 +1371,10 @@ struct PairCarry {
 /// - a `Dir` walk that came back COMPLETE replaces the rows under its key, except those under a
 ///   path it pruned and never looked at ([`LocalObservation::uncovered_roots`]); an incomplete one
 ///   replaces nothing,
-/// - an `Absent` replaces every row at or under the path whose `stat` said so,
-/// - a `File` replaces nothing and a `Hidden` replaces nothing — both leave the rows standing,
+/// - an `Absent` replaces every row at or under the path whose `stat` said so, and so does a
+///   `Hidden`: the rules hide that subtree, so `merge_local` takes those rows out of the map too
+///   — held rather than deleted, which is a fact about the plan and not about this count,
+/// - a `File` replaces nothing — it lands on a row that is still carried,
 ///
 /// so the assembled size has to land between "every replaceable row went" and "every one of them
 /// was replaced by an observed node". Outside those bounds the assembly dropped paths that no
@@ -1414,8 +1416,8 @@ fn assembly_accounted(
 			}
 			LocalObservation::Dir(scan) => slack += scan.nodes.len(),
 			LocalObservation::Absent(absence) => replaced += rows_at(absence.path()),
+			LocalObservation::Hidden(_) => replaced += rows_at(at),
 			LocalObservation::File { .. } => slack += 1,
-			LocalObservation::Hidden(_) => {}
 		}
 	}
 	// A row that records one side only is in neither map and is held instead (`derive::carried`),
@@ -2960,10 +2962,11 @@ impl SyncEngine {
 		// The exact keys the delta moved off their rows. `touched` below answers a different
 		// question — where to LOOK, a subtree at a time — and this one says what to DECIDE.
 		derived.decided.append(&mut observation.changed);
-		// TAKEN before the view's held set is built out of it. The assembly check needs the ROWS
-		// this pass holds — which rows, not how many, since it has to leave them out of both ends of
-		// its count — and reading the set afterwards would find none of them and fall back to a whole
-		// read at every held row nothing re-observed.
+		// TAKEN before the view's held set is built out of it, which is what leaves `derived.held`
+		// empty for `merge_local` to put the hidden paths into. The assembly check needs the ROWS this
+		// pass holds — which rows, not how many, since it has to leave them out of both ends of its
+		// count — and reading the set afterwards would find the hidden paths instead and fall back to
+		// a whole read at every held row nothing re-observed.
 		let held_rows = mem::take(&mut derived.held);
 		let mut view = RemoteView {
 			nodes: observation.nodes,
@@ -3057,26 +3060,32 @@ impl SyncEngine {
 		}
 
 		// The rules can take a node OUT of the view here, and what they remove is not recorded in
-		// the decided set. Not recording it only ever means "not decided", which is the safe
-		// direction — but it does leave the two halves of a hidden path disagreeing, because
-		// `merge_local` keeps the carried local node (`LocalObservation::Hidden`) while this drops
-		// the remote one, and a path that reads local-present/remote-absent is a path the
-		// reconcile plans `DeleteLocal` at.
+		// the decided set. It does not need to be, because the other half of a hidden path is gone
+		// too: `merge_local` drops the carried local node of anything it observed as hidden, with
+		// these same rules, so the two halves AGREE — neither side describes the path, and a path
+		// the reconcile finds on neither side plans nothing.
 		//
-		// Two things keep that from becoming a deletion. Every level of the rules forces a whole
-		// read when it CHANGES (`FullPassReason::RulesChanged`, from `set_user_ignore` and from a
-		// rule file on either side), so with the rules standing still what they hide normally has
-		// no row to be carried from — the pass that first hid it untracked those rows. And where
-		// it does — an `untrack_ignored` whose `delete_subtrees` failed leaves rows at hidden
-		// paths and forces nothing — the ignored roots are in `blocked_paths()` (from
+		// Which is what this pass rests on now, rather than on a screen. Every level of the rules
+		// forces a whole read when it CHANGES (`FullPassReason::RulesChanged`, from
+		// `set_user_ignore` and from a rule file on either side), so with the rules standing still
+		// what they hide normally has no row to be carried from — the pass that first hid it
+		// untracked those rows. Where it does — an `untrack_ignored` whose `delete_subtrees`
+		// failed leaves rows at hidden paths and forces nothing — the two absences would read as a
+		// convergent delete and retire a live row, so `merge_local` holds those paths as well and
+		// the reconcile decides nothing at them. `drop_blocked` still drops anything planned at or
+		// under an ignored root (they are all in `blocked_paths()`, from
 		// `facts.ignored_local`/`ignored_remote`, which this pass fills from this very filter and
-		// from `LocalObservation::Hidden`), so `drop_blocked` drops the action before the apply
-		// and the dropped count sends the NEXT pass whole. `drop_blocked` is the guarantee; the
-		// rule-change trigger is what makes it a rarity.
+		// from `LocalObservation::Hidden`) — it is the belt to this, not the thing standing
+		// between the user and a local delete.
 		view.filter(Some(plan::ViewFilter {
 			rules: &rules,
 			baseline: &inputs.baseline,
 		}));
+		// The paths the observation found hidden with a row still behind them, withheld for the
+		// same reason the half-written rows above are: no derived map describes them. Added AFTER
+		// the filter, so the collision check inside it does not claim a hidden path's folded name
+		// and refuse the pass over a name nothing is syncing.
+		view.held_paths.append(&mut derived.held);
 		// The facts: the remote half pruned at the paths the delta touched, the local half at the
 		// paths this pass observed, each replaced by what that evidence says now.
 		let mut facts = carried.facts;
@@ -5482,6 +5491,101 @@ mod tests {
 				&none
 			),
 			"a path no row and no observation named appeared in the map"
+		);
+	}
+
+	/// A hidden observation takes its rows out of the local map (`derive::merge_local`), so the
+	/// check has to expect them gone. Counting a `Hidden` as "replaces nothing" would send every
+	/// pass that re-observes a hidden path with rows still behind it to a whole read — and would
+	/// pass a map that kept them, which is the pair of maps that plans a delete there.
+	#[test]
+	fn the_assembly_check_expects_a_hidden_path_to_take_its_rows() {
+		let hash = Blake3Hash::from([7u8; 32]);
+		let baseline = Baseline::from_rows([
+			dir_row("logs", Uuid::new_v4()),
+			file_row("logs/a.txt", Uuid::new_v4(), hash),
+			file_row("keep.txt", Uuid::new_v4(), hash),
+		]);
+		let observed = LocalObservations {
+			observed: BTreeMap::from([(
+				"logs".to_string(),
+				LocalObservation::Hidden(IgnoreDecision {
+					level: IgnoreLevel::User,
+					pattern: "logs/".to_string(),
+				}),
+			)]),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+		let none = BTreeSet::new();
+		let assembled = |paths: &[&str]| Derived {
+			local: paths
+				.iter()
+				.map(|rel| ((*rel).to_string(), local_file(rel, hash)))
+				.collect(),
+			remote: HashMap::new(),
+			dirty: BTreeSet::new(),
+			decided: BTreeSet::new(),
+			held: BTreeSet::new(),
+		};
+
+		assert!(
+			assembly_accounted(&baseline, &assembled(&["keep.txt"]), &observed, &none),
+			"the hidden root took its own row and the one under it"
+		);
+		assert!(
+			!assembly_accounted(
+				&baseline,
+				&assembled(&["keep.txt", "logs/a.txt"]),
+				&observed,
+				&none
+			),
+			"a row under a hidden root that stayed in the map is a map the view no longer agrees \
+			 with"
+		);
+	}
+
+	/// A row this pass HOLDS under an observed path is not a row that observation replaced: it was
+	/// never in the map to be taken out of it. Counting it as both — held, and replaced — puts the
+	/// bound below the map the derivation legitimately assembled, and the pass falls back to a whole
+	/// read at every hidden root, dirty directory or absence with a half-written row under it.
+	#[test]
+	fn the_assembly_check_does_not_subtract_a_held_row_twice() {
+		let hash = Blake3Hash::from([7u8; 32]);
+		let baseline = Baseline::from_rows([
+			dir_row("logs", Uuid::new_v4()),
+			file_row("logs/a.txt", Uuid::new_v4(), hash),
+			file_row("keep.txt", Uuid::new_v4(), hash),
+		]);
+		// `logs/a.txt` records one side only, so `derive::carried` refused it: it is in neither map,
+		// it is held — and it sits under the root the observation below covers.
+		let held = BTreeSet::from(["logs/a.txt".to_string()]);
+		let observed = LocalObservations {
+			observed: BTreeMap::from([(
+				"logs".to_string(),
+				LocalObservation::Hidden(IgnoreDecision {
+					level: IgnoreLevel::User,
+					pattern: "logs/".to_string(),
+				}),
+			)]),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+		let assembled = Derived {
+			local: HashMap::from([("keep.txt".to_string(), local_file("keep.txt", hash))]),
+			remote: HashMap::new(),
+			dirty: BTreeSet::new(),
+			decided: BTreeSet::new(),
+			held: BTreeSet::new(),
+		};
+
+		assert!(
+			assembly_accounted(&baseline, &assembled, &observed, &held),
+			"the hidden root took the one row it had in the map, and the held row was never in one"
 		);
 	}
 
