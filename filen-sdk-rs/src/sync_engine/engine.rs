@@ -1429,6 +1429,41 @@ fn assembly_accounted(
 	(lowest..=lowest.saturating_add(slack)).contains(&derived.local.len())
 }
 
+/// The first key in the two maps a narrowed reconcile would never visit, if there is one — the
+/// decided set's half of plan 3.6's self-check.
+///
+/// [`derive::from_baseline`] only ever inserts at a baseline row's path, so a key in either map
+/// that is NOT a row path was put there by a producer — the local observation, the remote delta,
+/// the fold of this engine's own unacknowledged writes — and every one of them is supposed to
+/// record what it moved in [`Derived::decided`]. A key that got past all three is a key
+/// [`PassPaths::Changed`](plan::PassPaths::Changed) never visits: nothing is planned at it,
+/// whatever the three inputs say there.
+///
+/// One pass over the two maps, and the answer is the path itself so the assertion can name it.
+///
+/// Two mistakes are OUT of its reach, and the claim is only ever about keys no row names. A key a
+/// producer REMOVED without recording does not need to be seen: a path in neither map is decided by
+/// nobody, which delays an action and invents none (invariant I1's safe direction). A producer that
+/// REPLACED the node at a row's own path without recording it — a remote overwrite at a tracked
+/// path, the pending-write fold landing on a row — is invisible, because that key IS a row path and
+/// this cannot tell it from the node the row carried. Nothing here bounds that class; the producers'
+/// own funnels are the only record of it.
+///
+/// One `Baseline` path resolve per key, which is why the caller asserts it in debug builds only
+/// while the maps are still the whole tree (see `prepare_scoped`).
+fn unaccounted_key<'m>(
+	baseline: &Baseline,
+	local: &'m HashMap<String, scan::LocalNode>,
+	remote: &'m HashMap<String, RemoteNode>,
+	decided: &BTreeSet<String>,
+) -> Option<&'m str> {
+	local
+		.keys()
+		.chain(remote.keys())
+		.map(String::as_str)
+		.find(|path| !decided.contains(*path) && !baseline.contains_key(path))
+}
+
 /// The read-only inputs to a pass, shared by planning and applying.
 struct Prepared {
 	record: PairRecord,
@@ -3131,6 +3166,46 @@ impl SyncEngine {
 				"sync_once[pair {pair}]: folding {folded} unacknowledged write(s) into the derived view"
 			);
 		}
+		// The other half of plan 3.6's self-check, here because this is where the last producer has
+		// run: `assembly_accounted` above bounds what the maps HOLD, and this asks whether the pass
+		// would actually decide it.
+		//
+		// A DEBUG assert, which is the one thing here that was decided by measurement rather than
+		// by argument. The failure mode is silent and that argues for a loud release check — a pass
+		// that skips a key plans nothing at it and reports nothing about it, which reads exactly
+		// like a path where the three inputs agree. But the check is one `Baseline` path resolve
+		// per map key, and while the maps are still the whole tree that is not a rounding error: on
+		// the probe's 20,3,73 tree it took the one-file-changed pass from 34.2 ms to 162.3 ms at
+		// 100k and from 395.2 ms to 3191.7 ms at 1M, with `pass_pure` steady at 1232.9/1238.8 ms
+		// and 29.88/29.83 s across the two runs. Those figures were taken on the PRE-CORRECTION
+		// phase, which timed `from_baseline -> observe_local -> merge_local -> fold_dir_moves ->
+		// reconcile` and stopped. They stand as a RATIO — both halves measured the same phase —
+		// and must not be set beside the 50 ms target, which the docs read off the wider
+		// `prepare_scoped_*` rows: 395.2 is not comparable with the 2114.2 ms recorded there.
+		// Paying 7x the phase to re-derive what the producers already recorded is the wrong trade
+		// for a shipped pass.
+		//
+		// So it runs in every test binary this crate has — the unit tests, `sync_suite`, the
+		// blackbox and stress binaries, all debug builds exercising real passes — and in no
+		// release one. What changes that is plan 6.4: once the maps hold what the pass READ instead
+		// of the whole baseline, this is O(changed) and belongs in the release path.
+		debug_assert!(
+			unaccounted_key(
+				&inputs.baseline,
+				&derived.local,
+				&view.nodes,
+				&derived.decided
+			)
+			.is_none(),
+			"sync_once[pair {pair}]: a derived map holds a key that is no baseline row and that no \
+			 producer recorded, so the narrowed reconcile would never decide it: {:?}",
+			unaccounted_key(
+				&inputs.baseline,
+				&derived.local,
+				&view.nodes,
+				&derived.decided
+			)
+		);
 		holds.held_remote = view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -5586,6 +5661,58 @@ mod tests {
 		assert!(
 			assembly_accounted(&baseline, &assembled, &observed, &held),
 			"the hidden root took the one row it had in the map, and the held row was never in one"
+		);
+	}
+
+	/// The decided set's own check. A key in either map that no baseline row put there came from a
+	/// producer, and a producer that did not record it leaves a key the narrowed reconcile never
+	/// visits — no action at it, and nothing downstream that can tell that from agreement.
+	#[test]
+	fn the_decided_check_catches_a_key_no_producer_recorded() {
+		let hash = Blake3Hash::from([9u8; 32]);
+		let baseline = Baseline::from_rows([file_row("docs/a.txt", Uuid::new_v4(), hash)]);
+		// A local producer's key: the node the observation found, off the path its row records.
+		let moved = HashMap::from([(
+			"docs/moved.txt".to_string(),
+			local_file("docs/moved.txt", hash),
+		)]);
+		// And a remote one: a path the delta placed that no row names.
+		let placed = HashMap::from([(
+			"docs/new".to_string(),
+			remote_dir("docs/new", Uuid::new_v4()),
+		)]);
+		let empty_local: HashMap<String, LocalNode> = HashMap::new();
+		let empty_remote: HashMap<String, RemoteNode> = HashMap::new();
+
+		assert_eq!(
+			unaccounted_key(&baseline, &moved, &empty_remote, &BTreeSet::new()),
+			Some("docs/moved.txt"),
+			"a local key nothing recorded"
+		);
+		assert_eq!(
+			unaccounted_key(&baseline, &empty_local, &placed, &BTreeSet::new()),
+			Some("docs/new"),
+			"and the same on the remote side"
+		);
+		assert_eq!(
+			unaccounted_key(
+				&baseline,
+				&moved,
+				&placed,
+				&BTreeSet::from(["docs/moved.txt".to_string(), "docs/new".to_string()])
+			),
+			None,
+			"a producer that records what it moved is what the check is written for"
+		);
+		assert_eq!(
+			unaccounted_key(
+				&baseline,
+				&HashMap::from([("docs/a.txt".to_string(), local_file("docs/a.txt", hash))]),
+				&empty_remote,
+				&BTreeSet::new()
+			),
+			None,
+			"a carried row needs no record: `from_baseline` only ever inserts at a row's path"
 		);
 	}
 
