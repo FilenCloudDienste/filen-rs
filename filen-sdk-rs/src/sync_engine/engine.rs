@@ -5,6 +5,7 @@
 //! dry run) and `sync_once` (plan + guard + apply + baseline advance).
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	mem,
 	path::{Path, PathBuf},
@@ -41,6 +42,7 @@ use super::{
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalScan, RuleFiles, ScanError},
+	side::{Nodes, NodesAt},
 	tree::Baseline,
 };
 use crate::{
@@ -594,7 +596,7 @@ fn observation_callback(
 fn observed_confirmations(
 	observed: &Observations,
 	baseline: &Baseline,
-	raw_remote: &HashMap<String, RemoteNode>,
+	raw_remote: &impl NodesAt<Node = RemoteNode>,
 	now: Instant,
 ) -> (std::collections::HashSet<Uuid>, Vec<(String, Uuid, Uuid)>) {
 	let mut confirmed = std::collections::HashSet::new();
@@ -613,7 +615,7 @@ fn observed_confirmations(
 			// Nothing observed. Worth a round trip only where the answer changes this pass:
 			// a foreign version of the same file already sitting at the row's path.
 			PushVerdict::Unknown => {
-				if let Some(node) = raw_remote.get(rel_path)
+				if let Some(node) = raw_remote.at(rel_path)
 					&& node.remote_uuid != ours
 					&& node.stable_uuid.is_some()
 					&& node.stable_uuid == entry.remote_stable_uuid
@@ -702,7 +704,7 @@ impl PendingWrites {
 		&self,
 		pair: PairId,
 		observed: &HashMap<Uuid, u64>,
-		remote: &HashMap<String, RemoteNode>,
+		remote: &impl Nodes<Node = RemoteNode>,
 	) -> plan::PassHolds {
 		let now = Instant::now();
 		let mut map = self.map();
@@ -710,14 +712,15 @@ impl PendingWrites {
 		// pass that journalled none is the whole cost of this call on a large tree. The two rules
 		// above the pair check read the record by itself, so they still run — from an empty index —
 		// and still retire what the cache has demonstrably caught up to, whoever wrote it.
-		let snapshot_path: HashMap<Uuid, &str> = if map.values().any(|write| write.pair == pair) {
-			remote
-				.iter()
-				.map(|(path, node)| (node.remote_uuid, path.as_str()))
-				.collect()
-		} else {
-			HashMap::new()
-		};
+		let snapshot_path: HashMap<Uuid, Cow<'_, str>> =
+			if map.values().any(|write| write.pair == pair) {
+				remote
+					.iter()
+					.map(|(path, node)| (node.remote_uuid, path))
+					.collect()
+			} else {
+				HashMap::new()
+			};
 		map.retain(|uuid, write| {
 			// The cache announced this uuid after we wrote it: it has caught up, whether the item
 			// still exists, was superseded by a re-upload, or has since been trashed.
@@ -745,7 +748,7 @@ impl PendingWrites {
 				}
 				PendingKind::Moved { from, .. } => snapshot_path
 					.get(uuid)
-					.is_none_or(|path| *path == from.as_str()),
+					.is_none_or(|path| path.as_ref() == from.as_str()),
 				PendingKind::Trashed => snapshot_path.contains_key(uuid),
 			}
 		});
@@ -772,7 +775,7 @@ impl PendingWrites {
 		&self,
 		pair: PairId,
 		baseline: &Baseline,
-		nodes: &HashMap<String, RemoteNode>,
+		nodes: &impl NodesAt<Node = RemoteNode>,
 	) -> Vec<(Uuid, String, Uuid, Uuid)> {
 		self.map()
 			.iter()
@@ -782,7 +785,7 @@ impl PendingWrites {
 					return None;
 				};
 				let ours = written_node(baseline.get(path).as_ref())?;
-				let current = nodes.get(path)?;
+				let current = nodes.at(path)?;
 				if current.remote_uuid == ours.remote_uuid
 					|| current.remote_uuid == *uuid
 					|| Some(current.remote_uuid) == *replaced
@@ -1451,17 +1454,17 @@ fn assembly_accounted(
 ///
 /// One `Baseline` path resolve per key, which is why the caller asserts it in debug builds only
 /// while the maps are still the whole tree (see `prepare_scoped`).
-fn unaccounted_key<'m>(
+fn unaccounted_key(
 	baseline: &Baseline,
-	local: &'m HashMap<String, scan::LocalNode>,
-	remote: &'m HashMap<String, RemoteNode>,
+	local: &impl Nodes<Node = scan::LocalNode>,
+	remote: &impl Nodes<Node = RemoteNode>,
 	decided: &BTreeSet<String>,
-) -> Option<&'m str> {
+) -> Option<String> {
 	local
-		.keys()
-		.chain(remote.keys())
-		.map(String::as_str)
-		.find(|path| !decided.contains(*path) && !baseline.contains_key(path))
+		.paths()
+		.chain(remote.paths())
+		.find(|path| !decided.contains(path.as_ref()) && !baseline.contains_key(path))
+		.map(Cow::into_owned)
 }
 
 /// The read-only inputs to a pass, shared by planning and applying.
@@ -1784,7 +1787,7 @@ fn rekey_ignored(map: &mut BTreeMap<String, IgnoreDecision>, from: &str, to: &st
 /// Whether the remote view is wholly empty while the baseline still tracks remote items: what a
 /// transient backend or cache fault looks like. Read from the view BEFORE ignored items are filtered
 /// out of it, or a root `.filenignore` of `*` would read as a vanished remote on every pass.
-fn remote_emptied(nodes: &HashMap<String, RemoteNode>, baseline: &Baseline) -> bool {
+fn remote_emptied(nodes: &impl Nodes<Node = RemoteNode>, baseline: &Baseline) -> bool {
 	nodes.is_empty() && baseline.has_remote_rows()
 }
 
@@ -2634,7 +2637,7 @@ impl SyncEngine {
 	async fn confirm_pushes(
 		&self,
 		baseline: &mut Baseline,
-		raw_remote: &HashMap<String, RemoteNode>,
+		raw_remote: &impl NodesAt<Node = RemoteNode>,
 	) -> Vec<BaselineEntry> {
 		let (mut confirmed, ask_server) =
 			observed_confirmations(&self.observed, baseline, raw_remote, Instant::now());
@@ -2699,7 +2702,7 @@ impl SyncEngine {
 		&self,
 		pair: PairId,
 		baseline: &Baseline,
-		raw_remote: &HashMap<String, RemoteNode>,
+		raw_remote: &impl NodesAt<Node = RemoteNode>,
 	) -> Result<(), Error> {
 		let candidates = self.pending.strangers(pair, baseline, raw_remote);
 		// The standing strangers, read whole in one go: their whole-life id is what the lookup
@@ -3043,7 +3046,7 @@ impl SyncEngine {
 					.baseline
 					.iter()
 					.filter(|entry| {
-						entry.kind == NodeKind::File && !view.nodes.contains_key(&entry.rel_path)
+						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
 					})
 					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
 					.collect(),
@@ -3144,7 +3147,9 @@ impl SyncEngine {
 			// SNAPSHOT shows at its path, and this pass has no snapshot. The derived view shows our
 			// own write because the baseline row records it, so reading it there would retire the
 			// record against itself (I5). The announcement rule and the grace ceiling still apply.
-			let holds = self.pending.settle(pair, &announced, &HashMap::new());
+			let holds =
+				self.pending
+					.settle(pair, &announced, &HashMap::<String, RemoteNode>::new());
 			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
 			if !retired.is_empty() {
 				journal
@@ -3362,7 +3367,7 @@ impl SyncEngine {
 				baseline
 					.iter()
 					.filter(|entry| {
-						entry.kind == NodeKind::File && !view.nodes.contains_key(&entry.rel_path)
+						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
 					})
 					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
 					.collect(),
@@ -4531,8 +4536,8 @@ impl SyncEngine {
 				&store,
 				pair,
 				rel_path,
-				prep.local_scan.nodes.get(rel_path),
-				prep.remote_view.nodes.get(rel_path),
+				prep.local_scan.nodes.at(rel_path).as_deref(),
+				prep.remote_view.nodes.at(rel_path).as_deref(),
 			)
 			.await
 			{
@@ -5685,12 +5690,12 @@ mod tests {
 		let empty_remote: HashMap<String, RemoteNode> = HashMap::new();
 
 		assert_eq!(
-			unaccounted_key(&baseline, &moved, &empty_remote, &BTreeSet::new()),
+			unaccounted_key(&baseline, &moved, &empty_remote, &BTreeSet::new()).as_deref(),
 			Some("docs/moved.txt"),
 			"a local key nothing recorded"
 		);
 		assert_eq!(
-			unaccounted_key(&baseline, &empty_local, &placed, &BTreeSet::new()),
+			unaccounted_key(&baseline, &empty_local, &placed, &BTreeSet::new()).as_deref(),
 			Some("docs/new"),
 			"and the same on the remote side"
 		);
