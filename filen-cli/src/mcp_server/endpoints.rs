@@ -1,7 +1,9 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use anyhow::Result;
 
-mod add;
-mod subtract;
+mod read_directory;
 
 pub trait Endpoint {
 	type Input: serde::Serialize + serde::de::DeserializeOwned + schemars::JsonSchema;
@@ -21,7 +23,11 @@ pub trait Endpoint {
 	fn output_schema() -> schemars::Schema {
 		schemars::schema_for!(Self::Output)
 	}
-	fn handle(&self, input: Self::Input) -> Result<Self::Output>;
+	fn handle(
+		&self,
+		client: &filen_sdk_rs::auth::Client,
+		input: Self::Input,
+	) -> impl Future<Output = Result<Self::Output>> + Send;
 }
 
 pub trait AnyEndpoint: Send + Sync {
@@ -29,7 +35,11 @@ pub trait AnyEndpoint: Send + Sync {
 	fn description(&self) -> &'static str;
 	fn input_schema(&self) -> schemars::Schema;
 	fn output_schema(&self) -> schemars::Schema;
-	fn handle(&self, input: serde_json::Value) -> Result<serde_json::Value>;
+	fn handle<'a>(
+		&'a self,
+		client: &'a filen_sdk_rs::auth::Client,
+		input: serde_json::Value,
+	) -> Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send + 'a>>;
 }
 
 impl<T: Endpoint + Send + Sync> AnyEndpoint for T {
@@ -49,13 +59,19 @@ impl<T: Endpoint + Send + Sync> AnyEndpoint for T {
 		<T as Endpoint>::output_schema()
 	}
 
-	fn handle(&self, input: serde_json::Value) -> Result<serde_json::Value> {
-		let input = serde_json::from_value(input)?;
-		let output = <T as Endpoint>::handle(self, input)?;
-		Ok(serde_json::to_value(output)?)
+	fn handle<'a>(
+		&'a self,
+		client: &'a filen_sdk_rs::auth::Client,
+		input: serde_json::Value,
+	) -> Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send + 'a>> {
+		Box::pin(async move {
+			let input = serde_json::from_value(input)?;
+			let output = <T as Endpoint>::handle(self, client, input).await?;
+			Ok(serde_json::to_value(output)?)
+		})
 	}
 }
 
 pub fn all_endpoints() -> Vec<Box<dyn AnyEndpoint>> {
-	vec![Box::new(add::Add), Box::new(subtract::Subtract)]
+	vec![Box::new(read_directory::ReadDirectory)]
 }

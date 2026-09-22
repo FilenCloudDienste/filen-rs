@@ -57,7 +57,10 @@ fn tool_attr(endpoint: &dyn AnyEndpoint) -> Tool {
 /// `ToolRoute::new_dyn` is the untyped constructor: it takes the tool description
 /// plus a closure over the raw call context, so neither the parameter type nor the
 /// return type has to be known statically.
-fn endpoint_route(endpoint: Arc<dyn AnyEndpoint>) -> ToolRoute<EndpointServer> {
+fn endpoint_route(
+	client: Arc<filen_sdk_rs::auth::Client>,
+	endpoint: Arc<dyn AnyEndpoint>,
+) -> ToolRoute<EndpointServer> {
 	ToolRoute::new_dyn(
 		tool_attr(endpoint.as_ref()),
 		move |mut context: ToolCallContext<'_, EndpointServer>| {
@@ -65,9 +68,13 @@ fn endpoint_route(endpoint: Arc<dyn AnyEndpoint>) -> ToolRoute<EndpointServer> {
 			// them; here the endpoint does its own deserialization from JSON.
 			let arguments = context.arguments.take().unwrap_or_default();
 			let endpoint = endpoint.clone();
+			let client = client.clone();
 
 			Box::pin(async move {
-				match endpoint.handle(serde_json::Value::Object(arguments)) {
+				match endpoint
+					.handle(&client, serde_json::Value::Object(arguments))
+					.await
+				{
 					// Mirrors what `-> Json<T>` does in a macro tool: the value goes
 					// into `structuredContent`, with a text copy in `content` for
 					// clients that don't read structured output.
@@ -90,11 +97,11 @@ struct EndpointServer {
 }
 
 impl EndpointServer {
-	fn new() -> Self {
+	fn new(client: Arc<filen_sdk_rs::auth::Client>) -> Self {
 		// What `#[tool_router]` generates, as a loop over the registry.
 		let mut tool_router = ToolRouter::new();
 		for endpoint in all_endpoints() {
-			tool_router.add_route(endpoint_route(Arc::from(endpoint)));
+			tool_router.add_route(endpoint_route(client.clone(), Arc::from(endpoint)));
 		}
 		Self { tool_router }
 	}
@@ -129,8 +136,8 @@ impl ServerHandler for EndpointServer {
 	}
 }
 
-pub(crate) async fn run_mcp_server() -> Result<()> {
-	let service = rmcp::serve_server(EndpointServer::new(), rmcp::transport::stdio()).await?;
+pub(crate) async fn run_mcp_server(client: Arc<filen_sdk_rs::auth::Client>) -> Result<()> {
+	let service = rmcp::serve_server(EndpointServer::new(client), rmcp::transport::stdio()).await?;
 	service.waiting().await?;
 	Ok(())
 }
