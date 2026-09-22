@@ -42,6 +42,7 @@ use super::{
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
+	side::NodesAt,
 	tree::Baseline,
 };
 use crate::{
@@ -220,10 +221,14 @@ pub(super) struct ApplyContext<'a> {
 	/// runs on the caller's thread; the exception is a directory move's subtree re-key, which does
 	/// not (see [`commit_dir_move`]).
 	pub(super) store: &'a SharedStore,
-	pub(super) local: &'a HashMap<String, LocalNode>,
+	/// The pass's local side. A trait object rather than a type parameter: every read here is one
+	/// path per action, next to the network and disk work that action does, so the vtable call is
+	/// unmeasurable — and the alternative is two type parameters threaded through every function
+	/// in this module.
+	pub(super) local: &'a (dyn NodesAt<Node = LocalNode> + Send + Sync),
 	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
 	pub(super) baseline: &'a Baseline,
-	pub(super) remote: &'a HashMap<String, RemoteNode>,
+	pub(super) remote: &'a (dyn NodesAt<Node = RemoteNode> + Send + Sync),
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
 	/// Whether this pass's absence evidence is trustworthy (see
@@ -1116,7 +1121,7 @@ async fn resolve_folded_objects(
 		.copied()
 		.chain(missing_dirs.iter().filter_map(|path| {
 			ctx.remote
-				.get(*path)
+				.at(path)
 				.filter(|node| node.kind == NodeKind::Dir)
 				.map(|node| node.remote_uuid)
 		}))
@@ -1158,7 +1163,7 @@ async fn resolve_folded_objects(
 	for path in missing_dirs {
 		let Some(node) = ctx
 			.remote
-			.get(path)
+			.at(path)
 			.filter(|node| node.kind == NodeKind::Dir)
 		else {
 			continue;
@@ -1498,7 +1503,7 @@ async fn apply_transfer(
 					Some(progress_callback(
 						progress,
 						rel_path,
-						ctx.remote.get(rel_path).map_or(0, |node| node.size),
+						ctx.remote.at(rel_path).map_or(0, |node| node.size),
 					)),
 				))
 				.await
@@ -1519,7 +1524,8 @@ async fn apply_transfer(
 			// Set BEFORE the row this writes, which can fail — the copy is in the bin either way,
 			// and a failure that swallowed the only word of it is what this is out here for.
 			*quarantined = stashed.map(|bin| (rel_path.clone(), bin));
-			let remote = ctx.remote.get(rel_path);
+			let remote = ctx.remote.at(rel_path);
+			let remote = remote.as_deref();
 			// The row this writes has to carry a hash of what landed. Where the remote declares one
 			// it is that hash — the same one every later pass compares the path against. Where it
 			// declares NONE (a client that wrote no `blake3` in the file's metadata: the common
@@ -1580,7 +1586,7 @@ async fn apply_transfer(
 					Some(progress_callback(
 						progress,
 						rel_path,
-						ctx.local.get(rel_path).map_or(0, |node| node.size),
+						ctx.local.at(rel_path).map_or(0, |node| node.size),
 					)),
 				))
 				.await
@@ -1588,12 +1594,13 @@ async fn apply_transfer(
 				return Ok(Transfer::Interrupted);
 			};
 			let (uploaded, _file) = upload?;
-			let local = ctx.local.get(rel_path);
+			let local = ctx.local.at(rel_path);
+			let local = local.as_deref();
 			let new_uuid: Uuid = uploaded.uuid();
 			// A same-name upload versions whatever the path held: record that uuid, so the next
 			// pass can tell a cache that has not caught up (the old uuid still at the path) from
 			// someone ELSE having written there since (a third uuid).
-			let replaced = ctx.remote.get(rel_path).map(|node| node.remote_uuid);
+			let replaced = ctx.remote.at(rel_path).map(|node| node.remote_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
 				replaced,
@@ -1701,7 +1708,7 @@ async fn apply_one(
 		SyncAction::CreateLocalDir { rel_path } => {
 			let path = confined_local_target(ctx.local_root, rel_path)?;
 			std::fs::create_dir_all(&path).map_err(io_err)?;
-			let remote_uuid = ctx.remote.get(rel_path).map(|n| n.remote_uuid);
+			let remote_uuid = ctx.remote.at(rel_path).map(|n| n.remote_uuid);
 			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
 			report.local_dirs_created += 1;
 		}
@@ -1745,7 +1752,7 @@ async fn apply_one(
 				.clone();
 			let created = ctx
 				.local
-				.get(rel_path)
+				.at(rel_path)
 				.map(|n| millis_to_dt(n.mtime_millis))
 				.unwrap_or_else(Utc::now);
 			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
@@ -1758,7 +1765,7 @@ async fn apply_one(
 			writes.remote_uuids.insert(new_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
-				replaced: ctx.remote.get(rel_path).map(|node| node.remote_uuid),
+				replaced: ctx.remote.at(rel_path).map(|node| node.remote_uuid),
 			};
 			dir_by_path.insert(rel_path.clone(), new_dir);
 			let entry = dir_entry(rel_path, Some(new_uuid), None);
@@ -1854,7 +1861,8 @@ async fn apply_one(
 					.update_file_metadata(&mut remote_file, changes)
 					.await?;
 			}
-			let local = ctx.local.get(to_path);
+			let local = ctx.local.at(to_path);
+			let local = local.as_deref();
 			let kind = PendingKind::Moved {
 				from: from_path.clone(),
 				to: to_path.clone(),
@@ -1909,7 +1917,7 @@ async fn apply_one(
 			let row = moved_file_row(
 				to_path,
 				ctx.baseline.get(from_path).as_ref(),
-				ctx.remote.get(to_path),
+				ctx.remote.at(to_path).as_deref(),
 				local_mtime_of(&to),
 			);
 			// One transaction, delete before upsert: a crash between the two would leave the file
@@ -2029,8 +2037,8 @@ async fn apply_one(
 				ctx.store,
 				ctx.pair,
 				rel_path,
-				ctx.local.get(rel_path),
-				ctx.remote.get(rel_path),
+				ctx.local.at(rel_path).as_deref(),
+				ctx.remote.at(rel_path).as_deref(),
 			)
 			.await?;
 		}
@@ -2040,8 +2048,8 @@ async fn apply_one(
 			// only emits this when they do).
 			match adopt_outcome(
 				rel_path,
-				ctx.local.get(rel_path),
-				ctx.remote.get(rel_path),
+				ctx.local.at(rel_path).as_deref(),
+				ctx.remote.at(rel_path).as_deref(),
 				ctx.absence_trusted,
 			) {
 				AdoptOutcome::Record(entry) => upsert_baseline(ctx, &entry).await?,
