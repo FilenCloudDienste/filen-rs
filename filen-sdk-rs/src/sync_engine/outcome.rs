@@ -10,7 +10,7 @@
 //! [`Display`](std::fmt::Display) renders every type as the one-liner a CLI would print, so a
 //! caller that only wants text still gets it without matching the enums.
 
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 use super::{
 	baseline::NodeKind,
@@ -18,6 +18,7 @@ use super::{
 	ignore::IgnoredPath,
 	plan::{RemoteNode, SyncAction},
 	scan::LocalNode,
+	side::NodesAt,
 };
 
 /// Whether a planned action's item is a directory or a file.
@@ -393,12 +394,12 @@ impl fmt::Display for PlanOutcome {
 /// knows it (the local scan for a push, the remote view for a pull).
 pub(super) fn planned_action(
 	action: &SyncAction,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &impl NodesAt<Node = LocalNode>,
+	remote: &impl NodesAt<Node = RemoteNode>,
 ) -> PlannedAction {
 	let rel_path = action.endpoints().0.to_string();
-	let local_size = |path: &str| local.get(path).map(|node| node.size);
-	let remote_size = |path: &str| remote.get(path).map(|node| node.size);
+	let local_size = |path: &str| local.at(path).map(|node| node.size);
+	let remote_size = |path: &str| remote.at(path).map(|node| node.size);
 	let (kind, node, size) = match action {
 		SyncAction::UploadFile { rel_path } => (
 			PlannedActionKind::UploadFile,
@@ -457,9 +458,9 @@ pub(super) fn planned_action(
 		// a panic on a path the type system cannot rule out.
 		SyncAction::AdoptBaseline { rel_path } | SyncAction::Conflict { rel_path } => {
 			let node = local
-				.get(rel_path)
+				.at(rel_path)
 				.map(|n| n.kind)
-				.or_else(|| remote.get(rel_path).map(|n| n.kind))
+				.or_else(|| remote.at(rel_path).map(|n| n.kind))
 				.map_or(PlannedNodeKind::File, PlannedNodeKind::from);
 			(PlannedActionKind::AdoptBaseline, node, None)
 		}
@@ -475,18 +476,20 @@ pub(super) fn planned_action(
 /// The public view of one conflicted path, with what each side held when it was surfaced.
 pub(super) fn planned_conflict(
 	rel_path: &str,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &impl NodesAt<Node = LocalNode>,
+	remote: &impl NodesAt<Node = RemoteNode>,
 ) -> PlannedConflict {
 	PlannedConflict::new(
 		rel_path,
-		local.get(rel_path).map(|node| node.kind.into()),
-		remote.get(rel_path).map(|node| node.kind.into()),
+		local.at(rel_path).map(|node| node.kind.into()),
+		remote.at(rel_path).map(|node| node.kind.into()),
 	)
 }
 
 #[cfg(test)]
 mod tests {
+	use std::collections::HashMap;
+
 	use uuid::Uuid;
 
 	use super::*;

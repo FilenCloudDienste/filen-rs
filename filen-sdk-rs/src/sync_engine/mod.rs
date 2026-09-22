@@ -43,6 +43,8 @@ mod remote;
 #[cfg(feature = "bench-internals")]
 pub mod probe;
 mod scan;
+// The two sides a pass reconciles, behind the narrowest access each consumer needs.
+mod side;
 mod tree;
 mod watch;
 

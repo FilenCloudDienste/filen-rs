@@ -23,7 +23,8 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
-	tree::{Baseline, at_or_under_folded},
+	side::{Nodes, NodesAt},
+	tree::Baseline,
 };
 use crate::cache::{RemoteItem, UndecodableItem};
 
@@ -1214,7 +1215,7 @@ fn create_local(rel_path: &str, remote: &RemoteNode) -> SyncAction {
 /// folded view would confirm every push against itself and the marker would mean nothing.
 pub(super) fn confirm_agreed_content(
 	baseline: &mut Baseline,
-	raw_remote: &HashMap<String, RemoteNode>,
+	raw_remote: &impl NodesAt<Node = RemoteNode>,
 ) -> Vec<BaselineEntry> {
 	// The candidates first, since advancing one writes to the very structure they are read from.
 	// Only the rows that await confirmation are candidates, and the baseline indexes those, so a
@@ -1222,7 +1223,7 @@ pub(super) fn confirm_agreed_content(
 	let confirmed: Vec<BaselineEntry> = baseline
 		.unconfirmed()
 		.filter(|entry| {
-			raw_remote.get(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid
+			raw_remote.at(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid
 		})
 		.collect();
 	confirmed
@@ -1384,8 +1385,8 @@ pub(super) fn interleaved_version(
 pub(crate) fn adopt_destination_rows(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &impl Nodes<Node = LocalNode>,
+	remote: &impl Nodes<Node = RemoteNode>,
 ) -> Vec<BaselineEntry> {
 	let mut rows = Vec::new();
 	for base in baseline.iter() {
@@ -1393,7 +1394,8 @@ pub(crate) fn adopt_destination_rows(
 			continue;
 		}
 		let rel_path = &base.rel_path;
-		let (local_node, remote_node) = (local.get(rel_path), remote.get(rel_path));
+		let (local_at, remote_at) = (local.at(rel_path), remote.at(rel_path));
+		let (local_node, remote_node) = (local_at.as_deref(), remote_at.as_deref());
 		let row = match mode {
 			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => remote_node
 				.filter(|_| local_node.is_none())
@@ -1416,28 +1418,28 @@ pub(crate) fn adopt_destination_rows(
 			rows.push(row);
 		}
 	}
-	let untracked = |rel_path: &String| !baseline.contains_key(rel_path);
+	let untracked = |rel_path: &str| !baseline.contains_key(rel_path);
 	match mode {
 		super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
-			for (rel_path, node) in remote.iter().filter(|(p, _)| untracked(p)) {
-				if local.contains_key(rel_path) {
+			for (rel_path, node) in remote.iter().filter(|(path, _)| untracked(path)) {
+				if local.holds(&rel_path) {
 					continue;
 				}
 				tracing::debug!(
 					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
 				);
-				rows.push(adopted_from_remote(rel_path, node));
+				rows.push(adopted_from_remote(&rel_path, &node));
 			}
 		}
 		super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
-			for (rel_path, node) in local.iter().filter(|(p, _)| untracked(p)) {
-				if remote.contains_key(rel_path) {
+			for (rel_path, node) in local.iter().filter(|(path, _)| untracked(path)) {
+				if remote.holds(&rel_path) {
 					continue;
 				}
 				tracing::debug!(
 					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
 				);
-				rows.push(adopted_from_local(rel_path, node));
+				rows.push(adopted_from_local(&rel_path, &node));
 			}
 		}
 		super::SyncMode::TwoWay => {}
@@ -1638,21 +1640,21 @@ fn visit_move_sources(
 /// [`visit_move_sources`]: a node the pass did not re-read is the one its own row records, so it
 /// names no path but its own. A node with no row at all was necessarily observed, so it is in the
 /// set by construction (see [`PassPaths::Changed`]).
-fn visit_move_targets<'m, V>(
-	paths: PassPaths<'_>,
-	map: &'m HashMap<String, V>,
-	mut visit: impl FnMut(&'m String, &'m V),
+fn visit_move_targets<'m, N: Nodes>(
+	paths: PassPaths<'m>,
+	map: &'m N,
+	mut visit: impl FnMut(Cow<'m, str>, Cow<'m, N::Node>),
 ) {
 	match paths {
 		PassPaths::Whole => {
-			for (path, node) in map {
+			for (path, node) in map.iter() {
 				visit(path, node);
 			}
 		}
 		PassPaths::Changed(changed) => {
 			for path in changed {
-				if let Some((path, node)) = map.get_key_value(path) {
-					visit(path, node);
+				if let Some(node) = map.at(path) {
+					visit(Cow::Borrowed(path.as_str()), node);
 				}
 			}
 		}
@@ -1697,12 +1699,12 @@ fn visit_move_targets<'m, V>(
 /// [`Adopted`](BaselineState::Adopted) from a destination at a mode switch — it records one side's
 /// standing copy, not a synced pair, so matching it by uuid or by content would move an item the
 /// source never had. Both fall through to the reconcile loop, which knows what to do with them.
-fn detect_moves(
+fn detect_moves<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
-	paths: PassPaths<'_>,
+	local: &'m impl Nodes<Node = LocalNode>,
+	remote: &'m impl Nodes<Node = RemoteNode>,
+	paths: PassPaths<'m>,
 	actions: &mut Vec<SyncAction>,
 	consumed: &mut HashSet<String>,
 ) {
@@ -1713,16 +1715,16 @@ fn detect_moves(
 		// lineage id is not re-minted, so it still finds the file at its new path and the pass
 		// carries the item across instead of quarantining the old path and downloading the new one
 		// from scratch.
-		let mut remote_path_of_uuid: HashMap<Uuid, &str> = HashMap::new();
-		let mut remote_path_of_lineage: HashMap<StableUuid, &str> = HashMap::new();
+		let mut remote_path_of_uuid: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
+		let mut remote_path_of_lineage: HashMap<StableUuid, Cow<'m, str>> = HashMap::new();
 		visit_move_targets(paths, remote, |path, node| {
 			if node.kind != NodeKind::File {
 				return;
 			}
-			remote_path_of_uuid.insert(node.remote_uuid, path.as_str());
 			if let Some(lineage) = node.stable_uuid {
-				remote_path_of_lineage.insert(lineage, path.as_str());
+				remote_path_of_lineage.insert(lineage, path.clone());
 			}
+			remote_path_of_uuid.insert(node.remote_uuid, path);
 		});
 		visit_move_sources(paths, baseline, |base| {
 			let from = &base.rel_path;
@@ -1748,20 +1750,21 @@ fn detect_moves(
 			// evidence of a local change: carry the move across and let the pending push follow at
 			// the new name. The waiver is for the RENAME only — a move that also carried an EDIT is
 			// refused below, where the kept copy would end up under the download.
+			let local_at_from = local.at(from);
 			if base.content_hash.is_some()
-				&& classify_local(local.get(from), Some(base)) != Side::Unchanged
+				&& classify_local(local_at_from.as_deref(), Some(base)) != Side::Unchanged
 			{
 				return;
 			}
 			// `carries_edit`: the lineage moved AND changed version, so the local copy this move
 			// renames is the pre-edit one and still has to be refreshed.
 			let (to, carries_edit) = match remote_path_of_uuid.get(&uuid) {
-				Some(&to) => (to, false),
+				Some(to) => (to.as_ref(), false),
 				None => match base
 					.remote_stable_uuid
 					.and_then(|lineage| remote_path_of_lineage.get(&lineage))
 				{
-					Some(&to) => (to, true),
+					Some(to) => (to.as_ref(), true),
 					None => return,
 				},
 			};
@@ -1779,11 +1782,15 @@ fn detect_moves(
 			// excused from the local-change guard above is not agreement. The copy a `KeepLocal`
 			// resolution kept is diverged from what the remote holds by construction, so a remote
 			// change that renamed AND edited the file is the same divergence one rename away.
+			let remote_at_to = remote.at(to);
 			if carries_edit
 				&& mode.pushes()
 				&& (base.content_hash.is_none()
-					|| is_unconfirmed_concurrent_edit(local.get(from), remote.get(to), Some(base)))
-			{
+					|| is_unconfirmed_concurrent_edit(
+						local_at_from.as_deref(),
+						remote_at_to.as_deref(),
+						Some(base),
+					)) {
 				let action = SyncAction::Conflict {
 					rel_path: from.clone(),
 				};
@@ -1797,8 +1804,8 @@ fn detect_moves(
 			}
 			if to != from
 				&& !baseline.contains_key(to)
-				&& local.contains_key(from)
-				&& !local.contains_key(to)
+				&& local_at_from.is_some()
+				&& !local.holds(to)
 				&& !consumed.contains(to)
 			{
 				let action = SyncAction::MoveLocal {
@@ -1819,7 +1826,11 @@ fn detect_moves(
 					// pass would have to re-pull anyway.
 					let download = SyncAction::DownloadFile {
 						rel_path: to.to_string(),
-						remote_uuid: remote[to].remote_uuid,
+						// The lineage index named this path, so the node is there.
+						remote_uuid: remote_at_to
+							.as_deref()
+							.expect("the moved item's new path is in the remote side")
+							.remote_uuid,
 					};
 					tracing::debug!(
 						"plan: {} — the move carried a content edit",
@@ -1836,17 +1847,17 @@ fn detect_moves(
 	if mode.pushes() {
 		// Content hash -> the new local paths carrying it (not in baseline, not on the remote).
 		// Keyed by the raw bytes since `Blake3Hash` is not `std::hash::Hash`.
-		let mut created_by_hash: HashMap<[u8; 32], Vec<&str>> = HashMap::new();
+		let mut created_by_hash: HashMap<[u8; 32], Vec<Cow<'m, str>>> = HashMap::new();
 		visit_move_targets(paths, local, |path, node| {
 			if node.kind == NodeKind::File
-				&& !baseline.contains_key(path)
-				&& !remote.contains_key(path)
+				&& !baseline.contains_key(&path)
+				&& !remote.holds(&path)
 				&& let Some(hash) = node.content_hash
 			{
 				created_by_hash
 					.entry(*hash.as_ref())
 					.or_default()
-					.push(path.as_str());
+					.push(path);
 			}
 		});
 		visit_move_sources(paths, baseline, |base| {
@@ -1854,7 +1865,7 @@ fn detect_moves(
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
 				|| consumed.contains(from)
-				|| local.contains_key(from)
+				|| local.holds(from)
 			{
 				return;
 			}
@@ -1862,7 +1873,7 @@ fn detect_moves(
 				return;
 			};
 			// The remote must still hold the original file at `from` for there to be one to move.
-			if remote.get(from).map(|n| n.remote_uuid) != Some(uuid) {
+			if remote.at(from).map(|n| n.remote_uuid) != Some(uuid) {
 				return;
 			}
 			let Some(candidates) = created_by_hash.get(hash.as_ref()) else {
@@ -1870,8 +1881,8 @@ fn detect_moves(
 			};
 			let fresh: Vec<&str> = candidates
 				.iter()
-				.copied()
-				.filter(|to| !consumed.contains(*to) && !remote.contains_key(*to))
+				.map(Cow::as_ref)
+				.filter(|to| !consumed.contains(*to) && !remote.holds(to))
 				.collect();
 			// Only an UNAMBIGUOUS match is a move; otherwise fall back to delete + create.
 			if let [to] = fresh[..] {
@@ -2054,8 +2065,9 @@ pub(crate) fn fold_dir_moves(
 		let scope = changed
 			.as_deref()
 			.map_or(PassPaths::Whole, PassPaths::Changed);
-		let Some(action) = next_case_only_dir_rename(mode, baseline, local, remote, held, scope)
-			.or_else(|| next_dir_move(mode, baseline, local, remote, held, scope))
+		let Some(action) =
+			next_case_only_dir_rename(mode, baseline, &*local, &*remote, held, scope)
+				.or_else(|| next_dir_move(mode, baseline, &*local, &*remote, held, scope))
 		else {
 			break;
 		};
@@ -2092,49 +2104,50 @@ pub(crate) fn fold_dir_moves(
 }
 
 /// The shallowest case-only directory rename left in the inputs (see [`fold_dir_moves`]).
-fn next_case_only_dir_rename(
+fn next_case_only_dir_rename<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &'m impl Nodes<Node = LocalNode>,
+	remote: &'m impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
-	paths: PassPaths<'_>,
+	paths: PassPaths<'m>,
 ) -> Option<SyncAction> {
 	// Collision key -> the local directory no remote item holds under that exact spelling. The scan
 	// refuses two local entries with one key, so the map loses nothing.
-	let mut local_only: HashMap<String, &str> = HashMap::new();
+	let mut local_only: HashMap<String, Cow<'m, str>> = HashMap::new();
 	visit_move_targets(paths, local, |path, node| {
-		if node.kind == NodeKind::Dir && !remote.contains_key(path) {
-			local_only.insert(collision_key(path), path.as_str());
+		if node.kind == NodeKind::Dir && !remote.holds(&path) {
+			local_only.insert(collision_key(&path), path);
 		}
 	});
 	if local_only.is_empty() {
 		return None;
 	}
-	let mut candidates: Vec<(&str, &str, Uuid)> = Vec::new();
+	let mut candidates: Vec<(Cow<'m, str>, Cow<'m, str>, Uuid)> = Vec::new();
 	visit_move_targets(paths, remote, |remote_path, node| {
-		if node.kind != NodeKind::Dir || local.contains_key(remote_path) {
+		if node.kind != NodeKind::Dir || local.holds(&remote_path) {
 			return;
 		}
-		let Some(&local_path) = local_only.get(&collision_key(remote_path)) else {
+		let Some(local_path) = local_only.get(&collision_key(&remote_path)) else {
 			return;
 		};
-		if parent_path(local_path) == parent_path(remote_path) {
-			candidates.push((local_path, remote_path.as_str(), node.remote_uuid));
+		if parent_path(local_path) == parent_path(&remote_path) {
+			candidates.push((local_path.clone(), remote_path, node.remote_uuid));
 		}
 	});
-	candidates
-		.sort_unstable_by_key(|(local_path, ..)| (local_path.matches('/').count(), *local_path));
+	candidates.sort_unstable_by(|(a, ..), (b, ..)| {
+		(a.matches('/').count(), a.as_ref()).cmp(&(b.matches('/').count(), b.as_ref()))
+	});
 	candidates
 		.into_iter()
 		.find_map(|(local_path, remote_path, remote_uuid)| {
-			let at_local = baseline.get(local_path);
-			let at_remote = baseline.get(remote_path);
+			let at_local = baseline.get(&local_path);
+			let at_remote = baseline.get(&remote_path);
 			if at_local
 				.iter()
 				.chain(at_remote.iter())
 				.any(|row| row.state.is_conflict())
-				|| [local_path, remote_path]
+				|| [local_path.as_ref(), remote_path.as_ref()]
 					.into_iter()
 					.any(|end| touches_held(end, held))
 			{
@@ -2194,13 +2207,13 @@ fn next_case_only_dir_rename(
 ///   move, and one another move of this fold is headed to waits for that move;
 /// - on the remote, the path a directory passes through between its re-parent and its rename is
 ///   taken.
-fn next_dir_move(
+fn next_dir_move<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &'m impl Nodes<Node = LocalNode>,
+	remote: &'m impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
-	paths: PassPaths<'_>,
+	paths: PassPaths<'m>,
 ) -> Option<SyncAction> {
 	// Only a synced directory can be the source of a directory move, and at any ordinary shape the
 	// directories are a small fraction of the rows — so the visitor checks that against a row it did
@@ -2220,16 +2233,16 @@ fn next_dir_move(
 	sources.sort_unstable_by(|(a, _), (b, _)| {
 		(a.matches('/').count(), a.as_str()).cmp(&(b.matches('/').count(), b.as_str()))
 	});
-	let mut remote_dir_at: HashMap<Uuid, &str> = HashMap::new();
+	let mut remote_dir_at: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
 	if mode.pulls() {
 		visit_move_targets(paths, remote, |path, node| {
 			if node.kind == NodeKind::Dir {
-				remote_dir_at.insert(node.remote_uuid, path.as_str());
+				remote_dir_at.insert(node.remote_uuid, path);
 			}
 		});
 	}
 	// The new local directories and what each holds, built only once a pushed move is possible.
-	let mut new_local_dirs: Option<Vec<NewLocalDir<'_>>> = None;
+	let mut new_local_dirs: Option<Vec<NewLocalDir<'m>>> = None;
 
 	// Every move that holds up but for the parents of its destination. A missing parent another of
 	// them is moving into place is not one the pass creates: that move goes first, or this one would
@@ -2270,21 +2283,21 @@ fn next_dir_move(
 /// The directory move of the baseline directory `from` (remote uuid `uuid`), checked against
 /// everything [`next_dir_move`] requires except the parents of its destination.
 #[allow(clippy::too_many_arguments)] // the pass's inputs plus two indexes built once per call
-fn dir_move_from<'a>(
+fn dir_move_from<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &'a HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &'m impl Nodes<Node = LocalNode>,
+	remote: &impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
 	sources: &[(String, Uuid)],
-	remote_dir_at: &HashMap<Uuid, &str>,
-	new_local_dirs: &mut Option<Vec<NewLocalDir<'a>>>,
+	remote_dir_at: &HashMap<Uuid, Cow<'m, str>>,
+	new_local_dirs: &mut Option<Vec<NewLocalDir<'m>>>,
 	from: &str,
 	uuid: Uuid,
-	paths: PassPaths<'_>,
+	paths: PassPaths<'m>,
 ) -> Option<SyncAction> {
-	let action = if local.get(from).is_some_and(|n| n.kind == NodeKind::Dir) {
-		let to = *remote_dir_at.get(&uuid)?;
+	let action = if local.at(from).is_some_and(|n| n.kind == NodeKind::Dir) {
+		let to = remote_dir_at.get(&uuid)?.as_ref();
 		// The steady-state answer, before the scan that would reach it the slow way: the directory
 		// is where the baseline recorded it. `occupied(local, from)` is true whenever it is — the
 		// branch only runs with a local DIRECTORY at `from` — so this refuses exactly what it
@@ -2292,29 +2305,29 @@ fn dir_move_from<'a>(
 		if to == from {
 			return None;
 		}
-		(!occupied(local, to)).then(|| SyncAction::MoveLocal {
+		(!local.occupied(to)).then(|| SyncAction::MoveLocal {
 			from_path: from.to_string(),
 			to_path: to.to_string(),
 			kind: NodeKind::Dir,
 		})?
 	} else if mode.pushes()
 		&& remote
-			.get(from)
+			.at(from)
 			.is_some_and(|n| n.kind == NodeKind::Dir && n.remote_uuid == uuid)
-		&& !occupied(local, from)
+		&& !local.occupied(from)
 	{
 		let signature = baseline_dir_signature(baseline, from)?;
 		let new_dirs = new_local_dirs
 			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, sources, paths));
 		let mut matches = new_dirs.iter().filter(|dir| dir.matches(&signature));
-		let to = matches.next()?.path;
+		let to = matches.next()?.path.as_ref();
 		if matches.next().is_some() {
 			return None;
 		}
 		// The same subtree vanished from somewhere else too: which of the two moved is a guess.
 		let twin = sources.iter().any(|(other, _)| {
 			other != from
-				&& !local.contains_key(other.as_str())
+				&& !local.holds(other)
 				&& baseline_dir_signature(baseline, other).as_ref() == Some(&signature)
 		});
 		let (to_parent, to_name) = (parent_path(to), leaf(to));
@@ -2323,8 +2336,8 @@ fn dir_move_from<'a>(
 			false => format!("{to_parent}/{}", leaf(from)),
 		};
 		let passes_free =
-			parent_path(from) == to_parent || leaf(from) == to_name || !occupied(remote, &via);
-		(!twin && passes_free && !occupied(remote, to)).then(|| SyncAction::MoveRemote {
+			parent_path(from) == to_parent || leaf(from) == to_name || !remote.occupied(&via);
+		(!twin && passes_free && !remote.occupied(to)).then(|| SyncAction::MoveRemote {
 			from_path: from.to_string(),
 			to_path: to.to_string(),
 			kind: NodeKind::Dir,
@@ -2347,7 +2360,7 @@ fn dir_move_from<'a>(
 /// A new local directory and the signatures a pushed move into it is matched by: everything it holds,
 /// and — when a directory nested in it is a move of its own — what it holds without that one.
 struct NewLocalDir<'a> {
-	path: &'a str,
+	path: Cow<'a, str>,
 	full: Signature,
 	without_nested_moves: Option<Signature>,
 }
@@ -2364,27 +2377,27 @@ impl NewLocalDir<'_> {
 /// while a subdirectory that moved along inside its parent still leaves the parent's full signature
 /// to match. A directory whose full signature matches a gone one gets no reduced signature at all:
 /// the full match already explains it. Computed deepest first, so a chain of such moves reduces from the inside out.
-fn new_local_dir_signatures<'a>(
+fn new_local_dir_signatures<'m>(
 	baseline: &Baseline,
-	local: &'a HashMap<String, LocalNode>,
+	local: &'m impl Nodes<Node = LocalNode>,
 	sources: &[(String, Uuid)],
-	paths: PassPaths<'_>,
-) -> Vec<NewLocalDir<'a>> {
+	paths: PassPaths<'m>,
+) -> Vec<NewLocalDir<'m>> {
 	let gone: Vec<Signature> = sources
 		.iter()
-		.filter(|(path, _)| !local.contains_key(path.as_str()))
+		.filter(|(path, _)| !local.holds(path))
 		.filter_map(|(path, _)| baseline_dir_signature(baseline, path))
 		.collect();
-	let mut candidates: Vec<&'a str> = Vec::new();
+	let mut candidates: Vec<Cow<'m, str>> = Vec::new();
 	visit_move_targets(paths, local, |path, node| {
-		if node.kind == NodeKind::Dir && !baseline.contains_key(path.as_str()) {
-			candidates.push(path.as_str());
+		if node.kind == NodeKind::Dir && !baseline.contains_key(&path) {
+			candidates.push(path);
 		}
 	});
 	candidates.sort_unstable_by_key(|path| Reverse(path.matches('/').count()));
-	let mut dirs: Vec<NewLocalDir<'a>> = Vec::with_capacity(candidates.len());
+	let mut dirs: Vec<NewLocalDir<'m>> = Vec::with_capacity(candidates.len());
 	for path in candidates {
-		let Some(full) = dir_signature(local, path) else {
+		let Some(full) = dir_signature(local, &path) else {
 			continue;
 		};
 		let mut without_nested_moves: Option<Signature> = None;
@@ -2392,7 +2405,9 @@ fn new_local_dir_signatures<'a>(
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
 		let explained = gone.contains(&full);
 		for inner in &dirs {
-			if !explained && is_under(inner.path, path) && gone.iter().any(|sig| inner.matches(sig))
+			if !explained
+				&& is_under(&inner.path, &path)
+				&& gone.iter().any(|sig| inner.matches(sig))
 			{
 				let inner_rel = &inner.path[path.len()..];
 				// The only copy of the signature, made once per directory that holds a nested move.
@@ -2415,10 +2430,9 @@ fn new_local_dir_signatures<'a>(
 type Signature = BTreeMap<String, (NodeKind, Option<Blake3Hash>, u64)>;
 
 /// The signature of the local directory at `root`; `None` when a file under it has no hash.
-fn dir_signature(local: &HashMap<String, LocalNode>, root: &str) -> Option<Signature> {
+fn dir_signature(local: &impl Nodes<Node = LocalNode>, root: &str) -> Option<Signature> {
 	local
-		.iter()
-		.filter(|(path, _)| is_under(path, root))
+		.under(root)
 		.map(|(path, node)| {
 			let (hash, size) = match node.kind {
 				NodeKind::File => (Some(node.content_hash?), node.size),
@@ -2460,19 +2474,19 @@ fn baseline_dir_signature(baseline: &Baseline, root: &str) -> Option<Signature> 
 /// spelling, and no other directory move of this fold is headed there (`pending`, collision keys) —
 /// that one runs first and brings the parent. The engine runs those creates just before the move
 /// that needs them.
-fn parents_ready<T>(
-	side: &HashMap<String, T>,
+fn parents_ready<N: NodesAt>(
+	side: &N,
 	baseline: &Baseline,
 	pending: &HashSet<String>,
 	to: &str,
-	is_dir: impl Fn(&T) -> bool,
+	is_dir: impl Fn(&N::Node) -> bool,
 ) -> bool {
 	let mut parent = parent_path(to);
 	while !parent.is_empty() {
-		match side.get(parent) {
+		match side.at(parent) {
 			// An existing directory stands on existing ones.
-			Some(node) => return is_dir(node),
-			None if occupied(side, parent)
+			Some(node) => return is_dir(&node),
+			None if side.occupied(parent)
 				|| baseline.occupied(parent)
 				|| pending.contains(&collision_key(parent)) =>
 			{
@@ -2482,17 +2496,6 @@ fn parents_ready<T>(
 		}
 	}
 	true
-}
-
-/// Whether `map` holds `rel_path`, under any spelling, or anything under it.
-///
-/// A scan of the map, because a side map has no order to bisect — the baseline's own answer
-/// ([`Baseline::occupied`]) is a walk of one node's children, and this is the same question asked
-/// of the two maps, which hold paths no row tracks. What it no longer does is fold every key into
-/// a `String` to compare it: [`at_or_under_folded`] stops at the first character that differs,
-/// which for almost every key is the first one.
-fn occupied<T>(map: &HashMap<String, T>, rel_path: &str) -> bool {
-	map.keys().any(|path| at_or_under_folded(path, rel_path))
 }
 
 /// The last component of a `/`-joined relative path.
@@ -2596,18 +2599,14 @@ pub(crate) struct Plan {
 fn reconcile_keys<'m>(
 	paths: PassPaths<'m>,
 	baseline: &Baseline,
-	local: &'m HashMap<String, LocalNode>,
-	remote: &'m HashMap<String, RemoteNode>,
+	local: &'m impl Nodes<Node = LocalNode>,
+	remote: &'m impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
 ) -> BTreeSet<Cow<'m, str>> {
 	let PassPaths::Changed(changed) = paths else {
-		let mut keys: BTreeSet<Cow<'m, str>> = local
-			.keys()
-			.chain(remote.keys())
-			.map(|path| Cow::Borrowed(path.as_str()))
-			.collect();
+		let mut keys: BTreeSet<Cow<'m, str>> = local.paths().chain(remote.paths()).collect();
 		baseline.visit_row_paths(|path| {
-			if !local.contains_key(path) && !remote.contains_key(path) {
+			if !local.holds(path) && !remote.holds(path) {
 				keys.insert(Cow::Owned(path.to_string()));
 			}
 		});
@@ -2618,7 +2617,7 @@ fn reconcile_keys<'m>(
 	// whole-tree key set does not hold either, and counting one as withheld under a held path
 	// would report a deferral a whole read never reports.
 	for path in changed {
-		if local.contains_key(path) || remote.contains_key(path) || baseline.contains_key(path) {
+		if local.holds(path) || remote.holds(path) || baseline.contains_key(path) {
 			keys.insert(Cow::Borrowed(path.as_str()));
 		}
 	}
@@ -2628,7 +2627,7 @@ fn reconcile_keys<'m>(
 	// number rather than an action. Held paths are the rows that record one side only and the ones
 	// the cache is showing twice: few, and their subtrees with them.
 	for root in held {
-		if local.contains_key(root) || remote.contains_key(root) || baseline.contains_key(root) {
+		if local.holds(root) || remote.holds(root) || baseline.contains_key(root) {
 			keys.insert(Cow::Owned(root.clone()));
 		}
 		baseline.visit_subtree_paths(root, |path| {
@@ -2644,8 +2643,8 @@ fn reconcile_keys<'m>(
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &HashMap<String, LocalNode>,
-	remote: &HashMap<String, RemoteNode>,
+	local: &impl Nodes<Node = LocalNode>,
+	remote: &impl Nodes<Node = RemoteNode>,
 	holds: &PassHolds,
 	paths: PassPaths<'_>,
 ) -> Plan {
@@ -2719,8 +2718,9 @@ pub(crate) fn reconcile(
 			});
 			continue;
 		}
-		let local_node = local.get(key);
-		let remote_node = remote.get(key);
+		let local_at = local.at(key);
+		let remote_at = remote.at(key);
+		let (local_node, remote_node) = (local_at.as_deref(), remote_at.as_deref());
 
 		// A path adopted from the destination at a mode switch (see
 		// [`adopt_destination_rows`]). The row is never a baseline for classification — whatever
