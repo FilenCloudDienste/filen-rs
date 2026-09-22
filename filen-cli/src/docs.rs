@@ -126,6 +126,14 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::CommandHelp("export-api-key"),
 			],
 		},
+		DocSection {
+			id: "mcp",
+			title: "MCP Server",
+			elements: vec![
+				DocElement::DocFragment("mcp-server"),
+				DocElement::CommandHelp("mcp"),
+			],
+		},
 	];
 
 	// parse doc elements

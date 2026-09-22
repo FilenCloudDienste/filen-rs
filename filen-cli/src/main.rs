@@ -128,6 +128,9 @@ pub(crate) struct CliArgs {
 	/// The initial working path for the REPL or non-interactive commands (defaults to "/")
 	#[arg(long)]
 	working_path: Option<String>,
+
+	#[arg(long, hide = true, default_value_t = false)]
+	mcp_server: bool,
 }
 
 #[derive(Clone)]
@@ -291,6 +294,11 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		cli_args.auth_config_path,
 		client_config_args,
 	);
+
+	if cli_args.mcp_server {
+		let client = client.get(ui).await?;
+		return mcp_server::server::run_mcp_server(client.clone()).await;
+	}
 
 	let mut working_path = RemotePath::new(&cli_args.working_path.unwrap_or_default());
 
