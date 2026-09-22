@@ -139,6 +139,15 @@ impl Shape {
 	}
 }
 
+/// Where a pass reads its two sides from: the local tree, the cache DB the remote view is built
+/// out of, and the root that view is for. A [`Fixture`] hands one out, and so does the spec a
+/// child process is measured through — a pass needs these three and nothing else about the tree.
+struct PassPlace {
+	root: PathBuf,
+	cache_db: PathBuf,
+	remote_root: Uuid,
+}
+
 /// The temp tree, its cache DB and its baseline DB.
 struct Fixture {
 	dir: PathBuf,
@@ -153,6 +162,14 @@ struct Fixture {
 impl Fixture {
 	fn nodes(&self) -> usize {
 		self.dirs + self.files
+	}
+
+	fn place(&self) -> PassPlace {
+		PassPlace {
+			root: self.root.clone(),
+			cache_db: self.cache_db.clone(),
+			remote_root: self.remote_root,
+		}
 	}
 
 	/// Write the tree to disk AND the matching remote mirror into a cache DB, so the two sides are
@@ -308,6 +325,34 @@ impl Probe {
 	}
 }
 
+/// Bytes as mebibytes: the unit every memory figure in this harness is written in.
+fn mib(bytes: u64) -> f64 {
+	bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// One heap allocation of `bytes`, rounded the way an allocator hands out size classes — the same
+/// convention [`Baseline::resident_bytes`] counts in, so a pass's structures can be added up.
+fn heap(bytes: usize) -> usize {
+	bytes.div_ceil(16) * 16
+}
+
+/// What one path-keyed side of a pass costs: the table's slots, every key's own bytes, and
+/// whatever each node holds on the heap.
+///
+/// Counted from `capacity()` — the entries the map takes before it grows — because hashbrown's
+/// table is the next power of two above `capacity * 8 / 7`: this is a LOWER bound on the
+/// allocation rather than a guess at it, and at a million rows the real table is nearly twice
+/// this figure's slot term. Same convention as [`Baseline::resident_bytes`], which is what lets
+/// the three numbers be summed and compared against a resident set.
+fn side_bytes<V>(map: &HashMap<String, V>, node_heap: impl Fn(&V) -> usize) -> usize {
+	let slots = map.capacity() * (size_of::<String>() + size_of::<V>() + 1);
+	let owned: usize = map
+		.iter()
+		.map(|(path, node)| heap(path.len()) + node_heap(node))
+		.sum();
+	slots + owned
+}
+
 /// Peak resident set size of this process so far, in bytes.
 ///
 /// `getrusage(RUSAGE_SELF).ru_maxrss` is the kernel's own high-water mark: an external sampler
@@ -388,25 +433,133 @@ fn current_rss_bytes() -> u64 {
 		.map_or(0, |kib| kib * 1024)
 }
 
-/// What a process holding NOTHING BUT a loaded pair costs: this binary re-invokes itself with
-/// `SYNC_PROBE_STEADY` set, and the child opens the baseline DB at `baseline_db`, asks it for
-/// `pair` and writes its own resident set down. Answers `(resident bytes, rows)`.
+/// What a child process is asked to hold while it measures itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildAsk {
+	/// A LOADED PAIR and nothing else: the steady state an engine sits in between passes.
+	Pair,
+	/// ONE FULL PASS over the fixture and nothing else: the widest point an engine ever reaches,
+	/// in a process whose resident set IS that pass rather than a run's history.
+	FullPass,
+}
+
+impl ChildAsk {
+	fn tag(self) -> &'static str {
+		match self {
+			Self::Pair => "pair",
+			Self::FullPass => "pass",
+		}
+	}
+}
+
+/// One child's answer: the samples it took around the thing it was asked to hold, and what that
+/// thing computes its own size as.
+#[derive(Default)]
+struct ChildSample {
+	/// Before it opened anything: the binary, the runtime, the allocator's first pages. What is
+	/// left when every structure is subtracted, and the floor no engine change can move.
+	floor: u64,
+	/// With everything it was asked to hold alive.
+	widest: u64,
+	/// Its own high-water mark, which the transients of BUILDING that thing sit in — the gap
+	/// between this and `widest` is what was allocated and freed on the way.
+	peak: u64,
+	/// After dropping all of it, including the store: what the allocator kept and what the mapped
+	/// DB pages cost.
+	after: u64,
+	rows: usize,
+	elapsed_ms: f64,
+	baseline_bytes: usize,
+	view_bytes: usize,
+	scan_bytes: usize,
+	actions: usize,
+}
+
+impl ChildSample {
+	const FIELDS: usize = 10;
+
+	fn encode(&self) -> String {
+		format!(
+			"{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}",
+			self.floor,
+			self.widest,
+			self.peak,
+			self.after,
+			self.rows,
+			self.elapsed_ms,
+			self.baseline_bytes,
+			self.view_bytes,
+			self.scan_bytes,
+			self.actions,
+		)
+	}
+
+	fn decode(raw: &str) -> Option<Self> {
+		let fields: Vec<&str> = raw.trim().split('\t').collect();
+		if fields.len() != Self::FIELDS {
+			return None;
+		}
+		Some(Self {
+			floor: fields[0].parse().ok()?,
+			widest: fields[1].parse().ok()?,
+			peak: fields[2].parse().ok()?,
+			after: fields[3].parse().ok()?,
+			rows: fields[4].parse().ok()?,
+			elapsed_ms: fields[5].parse().ok()?,
+			baseline_bytes: fields[6].parse().ok()?,
+			view_bytes: fields[7].parse().ok()?,
+			scan_bytes: fields[8].parse().ok()?,
+			actions: fields[9].parse().ok()?,
+		})
+	}
+
+	/// The structures the child accounted for, and what is left over once they are subtracted from
+	/// what it actually held.
+	fn accounting(&self) -> String {
+		let structures = self.baseline_bytes + self.view_bytes + self.scan_bytes;
+		format!(
+			"baseline {:.1} + view {:.1} + scan {:.1} = {:.1} MiB computed, {:.1} MiB floor, \
+			 {:.1} MiB neither (allocator retention, mapped DB pages, table slack)",
+			mib(self.baseline_bytes as u64),
+			mib(self.view_bytes as u64),
+			mib(self.scan_bytes as u64),
+			mib(structures as u64),
+			mib(self.floor),
+			mib(self.widest.saturating_sub(self.floor + structures as u64)),
+		)
+	}
+}
+
+/// Ask a FRESH PROCESS what one thing costs: this binary re-invokes itself with `SYNC_PROBE_CHILD`
+/// set, the child holds what it was asked to hold, samples itself around it and writes the samples
+/// down.
 ///
-/// It exists because an in-process figure cannot answer the question. The resident set of THIS
-/// process is its whole history — every phase above has allocated and freed, and what the
-/// allocator has not returned to the kernel is still counted — so the most it can give is an
-/// upper bound and the DIFFERENCE one structure makes. A child that has done nothing else is the
-/// only honest absolute.
-fn steady_state_child(baseline_db: &Path, pair: i64) -> Option<(u64, usize)> {
-	let answer = std::env::temp_dir().join(format!("filen_probe_steady_{}", Uuid::new_v4()));
+/// It exists because an in-process figure cannot answer an ABSOLUTE question. The resident set of
+/// this process is its whole history — every phase has allocated and freed, and what the allocator
+/// has not returned to the kernel is still counted — so the most it can give is an upper bound and
+/// the DIFFERENCE one structure makes. The `pass_pure` phase makes that concrete: at a million rows
+/// it reads ~1.5 GiB resident, of which barely a third is the pass, and a pass that reuses pages
+/// the phases before it freed raises the figure by less than it holds. A child that has done
+/// nothing else is the only honest absolute.
+fn child_sample(
+	ask: ChildAsk,
+	baseline_db: &Path,
+	pair: i64,
+	place: &PassPlace,
+) -> Option<ChildSample> {
+	let answer = std::env::temp_dir().join(format!("filen_probe_child_{}", Uuid::new_v4()));
 	let spec = format!(
-		"{}\t{pair}\t{}",
+		"{}\t{}\t{pair}\t{}\t{}\t{}\t{}",
+		ask.tag(),
 		baseline_db.to_string_lossy(),
-		answer.to_string_lossy()
+		answer.to_string_lossy(),
+		place.root.to_string_lossy(),
+		place.cache_db.to_string_lossy(),
+		place.remote_root,
 	);
 	let ok = std::process::Command::new(std::env::current_exe().ok()?)
 		.args(["--ignored", "--exact", "sync_engine_phase_costs"])
-		.env("SYNC_PROBE_STEADY", spec)
+		.env("SYNC_PROBE_CHILD", spec)
 		.status()
 		.ok()?
 		.success();
@@ -415,31 +568,69 @@ fn steady_state_child(baseline_db: &Path, pair: i64) -> Option<(u64, usize)> {
 	if !ok {
 		return None;
 	}
-	let read = read?;
-	let (rss, rows) = read.split_once('\t')?;
-	Some((rss.parse().ok()?, rows.parse().ok()?))
+	ChildSample::decode(&read?)
 }
 
-/// The child half of [`steady_state_child`]: load the pair, sample, write the answer down. Runs
-/// INSTEAD of everything in [`run`], so the figure it reports is a process that has built no
-/// tree, read no snapshot and run no pass — one that holds a pair between passes and nothing
-/// else.
-fn answer_steady_state(spec: &str) {
+/// The child half of [`child_sample`]: sample the floor, hold what was asked for, sample again,
+/// drop it and sample once more. Runs INSTEAD of everything in [`run`], so its figures describe a
+/// process that has built no tree it was not asked to build.
+fn answer_child(spec: &str) {
 	let mut parts = spec.split('\t');
-	let baseline_db = parts.next().expect("the spec names a baseline DB");
+	let ask = parts.next().expect("the spec names what to measure");
+	let baseline_db = PathBuf::from(parts.next().expect("the spec names a baseline DB"));
 	let pair: i64 = parts
 		.next()
 		.expect("the spec names a pair")
 		.parse()
 		.expect("the pair id is a number");
-	let answer = parts.next().expect("the spec names an answer file");
-	let store = BaselineStore::open(Path::new(baseline_db)).expect("opening the baseline DB");
-	let resident = store.baseline(pair).expect("reading the baseline");
-	let rows = resident.len();
-	// Sampled with the pair still held, which is the state an idle engine sits in.
-	let rss = current_rss_bytes();
-	fs::write(answer, format!("{rss}\t{rows}")).expect("writing the answer");
-	drop(resident);
+	let answer = PathBuf::from(parts.next().expect("the spec names an answer file"));
+	let place = PassPlace {
+		root: PathBuf::from(parts.next().expect("the spec names a local root")),
+		cache_db: PathBuf::from(parts.next().expect("the spec names a cache DB")),
+		remote_root: parts
+			.next()
+			.expect("the spec names a remote root")
+			.parse()
+			.expect("the remote root is a uuid"),
+	};
+	// Taken before anything is opened: this is the process, not what it is about to hold.
+	let mut sample = ChildSample {
+		floor: current_rss_bytes(),
+		..ChildSample::default()
+	};
+	let store = BaselineStore::open(&baseline_db).expect("opening the baseline DB");
+	match ask {
+		"pair" => {
+			let (resident, elapsed) = timed(|| store.baseline(pair).expect("reading the baseline"));
+			sample.rows = resident.len();
+			sample.baseline_bytes = resident.resident_bytes();
+			sample.elapsed_ms = elapsed.as_secs_f64() * 1e3;
+			// Sampled with the pair still held, which is the state an idle engine sits in.
+			sample.widest = current_rss_bytes();
+			sample.peak = peak_rss_bytes();
+			// The store keeps its own copy of the pair, so both go — what is left is neither the
+			// pair nor the read that built it.
+			drop(resident);
+			drop(store);
+			sample.after = current_rss_bytes();
+		}
+		"pass" => {
+			let rules = probe_rules();
+			let (footprint, elapsed) = timed(|| pass_pure(&place, &store, pair, &rules));
+			sample.rows = footprint.rows;
+			sample.actions = footprint.actions;
+			sample.widest = footprint.widest;
+			sample.peak = footprint.peak;
+			sample.baseline_bytes = footprint.baseline_bytes;
+			sample.view_bytes = footprint.view_bytes;
+			sample.scan_bytes = footprint.scan_bytes;
+			sample.elapsed_ms = elapsed.as_secs_f64() * 1e3;
+			drop(store);
+			sample.after = current_rss_bytes();
+		}
+		other => panic!("SYNC_PROBE_CHILD asks for {other:?}, which is not a thing to measure"),
+	}
+	fs::write(answer, sample.encode()).expect("writing the answer");
 }
 
 /// The median and the best of a phase's samples: the median is the figure a run reports, the best
@@ -559,22 +750,42 @@ fn plain_row(rel_path: &str) -> BaselineEntry {
 	}
 }
 
+/// What one full pass holds at its widest point, and what the pieces of it cost.
+///
+/// The two RSS samples and the three computed figures answer different halves of the same
+/// question. `widest` is what the process actually holds with every structure of the pass alive;
+/// the computed figures say which structure holds it. What the two do not account for between
+/// them is the answer to "where is the rest" — table slack above `capacity`, the allocator's
+/// retention, and the cache DB's mapped pages.
+struct PassFootprint {
+	actions: usize,
+	rows: usize,
+	/// The process's resident set with every one of the pass's structures alive.
+	widest: u64,
+	/// The high-water mark the pass reached, which its build-and-drop transients sit in: the local
+	/// walk's collision digest, the rows of the baseline read, the plan's own churn.
+	peak: u64,
+	baseline_bytes: usize,
+	view_bytes: usize,
+	scan_bytes: usize,
+}
+
 /// Everything a pass does locally, end to end, on inputs it re-reads itself: the phases above in
-/// the order `prepare` runs them, minus the network and the apply. Returns the action count.
+/// the order `prepare` runs them, minus the network and the apply.
 fn pass_pure(
-	fixture: &Fixture,
+	place: &PassPlace,
 	store: &BaselineStore,
 	pair: i64,
 	rules: &IgnoreRules,
-) -> (usize, u64) {
+) -> PassFootprint {
 	let baseline = store.baseline(pair).expect("reading the baseline");
 	// Streamed into the view, as `prepare_whole` streams it: no `Vec` of the subtree in between.
-	let mut builder = plan::ViewBuilder::with_capacity(fixture.remote_root, baseline.len());
-	bench_support::snapshot_into(&fixture.cache_db, fixture.remote_root, &mut builder)
+	let mut builder = plan::ViewBuilder::with_capacity(place.remote_root, baseline.len());
+	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut builder)
 		.expect("streaming the cache snapshot");
 	let mut view = builder.finish();
 	let (scan, rules_used) =
-		scan::scan_local(&fixture.root, &baseline, probe_rules(), RuleFiles::Read);
+		scan::scan_local(&place.root, &baseline, probe_rules(), RuleFiles::Read);
 	drop(rules_used);
 	view.filter(Some(plan::ViewFilter {
 		rules,
@@ -605,7 +816,17 @@ fn pass_pure(
 	// high-water mark every phase before this one has already raised — and the CURRENT resident
 	// set can, at this one moment, before any of it is dropped.
 	let widest = current_rss_bytes();
-	(planned.actions.len(), widest)
+	PassFootprint {
+		actions: planned.actions.len(),
+		rows: baseline.len(),
+		widest,
+		peak: peak_rss_bytes(),
+		baseline_bytes: baseline.resident_bytes(),
+		// Each node carries its own path a SECOND time, beside the key it is filed under: two
+		// allocations per node, which is why both sides are counted the same way.
+		view_bytes: side_bytes(&remote, |node| heap(node.rel_path.len())),
+		scan_bytes: side_bytes(&local, |node| heap(node.rel_path.len())),
+	}
 }
 
 /// What a CHANGE-SCOPED pass does locally, end to end: the resident baseline, the two maps derived
@@ -678,10 +899,10 @@ fn pass_scoped(
 /// phase: `phase, n, items, ms, us_per_item, peak_rss_mib, detail`.
 #[must_use]
 pub fn run() -> String {
-	// A child asking only what a loaded pair costs (see `steady_state_child`). It answers before
-	// anything here builds a tree, which is the whole point of asking a second process.
-	if let Ok(spec) = std::env::var("SYNC_PROBE_STEADY") {
-		answer_steady_state(&spec);
+	// A child asked what one thing costs (see `child_sample`). It answers before anything here
+	// builds a tree, which is the whole point of asking a second process.
+	if let Ok(spec) = std::env::var("SYNC_PROBE_CHILD") {
+		answer_child(&spec);
 		return String::new();
 	}
 	let n = env_usize("SYNC_PROBE_N", DEFAULT_N);
@@ -1527,19 +1748,68 @@ pub fn run() -> String {
 	));
 	drop((dirty_0, dirty_1, dirty_10, changed_paths));
 	let before_pass = current_rss_bytes();
-	let ((actions, widest), whole) = timed(|| pass_pure(&fixture, &store, pair, &rules));
+	let (footprint, whole) = timed(|| pass_pure(&fixture.place(), &store, pair, &rules));
 	probe.record(
 		"pass_pure",
 		nodes,
 		whole,
 		&format!(
-			"{actions} actions; baseline read + streamed snapshot + view + warm scan + fold + \
-			 reconcile, no network and no apply; {:.1} MiB resident at its widest point, \
-			 {:.1} MiB of it this pass",
-			widest as f64 / (1024.0 * 1024.0),
-			widest.saturating_sub(before_pass) as f64 / (1024.0 * 1024.0),
+			"{} actions; baseline read + streamed snapshot + view + warm scan + fold + reconcile, \
+			 no network and no apply; {:.1} MiB resident at its widest point, {:.1} MiB of it this \
+			 pass; the structures alive there: baseline {:.1} + view {:.1} + scan {:.1} = {:.1} \
+			 MiB computed",
+			footprint.actions,
+			mib(footprint.widest),
+			mib(footprint.widest.saturating_sub(before_pass)),
+			mib(footprint.baseline_bytes as u64),
+			mib(footprint.view_bytes as u64),
+			mib(footprint.scan_bytes as u64),
+			mib((footprint.baseline_bytes + footprint.view_bytes + footprint.scan_bytes) as u64),
 		),
 	);
+
+	// The same pass, in a process that has done nothing else — the figure a memory target can
+	// honestly be read off. The phase above cannot be one: `before_pass` says most of this run's
+	// resident set is what the phases before it allocated and freed, and a pass that reuses those
+	// pages raises RSS by less than it holds, so the same run's number is at once too high to be
+	// the pass and too low to be its structures. The child's baseline read is COLD, which is what
+	// the first pass after a start pays and what the phase above — holding the pair already —
+	// leaves out.
+	//
+	// Measured HERE, before the phases below change a file on disk: a pass over a diverged tree
+	// plans actions, and a plan is another structure alive at the widest point.
+	let db_bytes = |path: &Path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+	match child_sample(
+		ChildAsk::FullPass,
+		&fixture.baseline_db,
+		pair,
+		&fixture.place(),
+	) {
+		Some(child) => probe.record(
+			"pass_pure_fresh",
+			child.rows,
+			Duration::from_secs_f64(child.elapsed_ms / 1e3),
+			&format!(
+				"{} action(s); {:.1} MiB resident at the widest point of a FRESH process, peak \
+				 {:.1} MiB, {:.1} MiB still resident once every structure and the store are \
+				 dropped; {}; cache.db {:.1} MiB (mapped up to 256 MiB, page cache 32 MiB), \
+				 baseline.db {:.1} MiB (no mmap, 2 MiB page cache)",
+				child.actions,
+				mib(child.widest),
+				mib(child.peak),
+				mib(child.after),
+				child.accounting(),
+				mib(db_bytes(&fixture.cache_db)),
+				mib(db_bytes(&fixture.baseline_db)),
+			),
+		),
+		None => probe.record(
+			"pass_pure_fresh",
+			0,
+			Duration::ZERO,
+			"the child process could not be asked; only the in-process figure above stands",
+		),
+	}
 
 	// The same tree read the other way: ONE file changed, and only that file's path in the dirty
 	// set. This is the phase the whole change-scoped design exists for, so it is measured against
@@ -1660,16 +1930,26 @@ pub fn run() -> String {
 	// And the same question asked of a process that has done nothing else, which is the only
 	// answer here that is not an upper bound. The pair's rows are on disk; the child opens them
 	// and reports what it then holds.
-	match steady_state_child(&fixture.baseline_db, pair) {
-		Some((rss, rows)) => probe.record(
+	match child_sample(ChildAsk::Pair, &fixture.baseline_db, pair, &fixture.place()) {
+		Some(child) => probe.record(
 			"steady_state_rss_fresh",
-			rows,
-			Duration::ZERO,
+			child.rows,
+			Duration::from_secs_f64(child.elapsed_ms / 1e3),
 			&format!(
 				"{:.1} MiB resident in a FRESH process holding the loaded pair and nothing else \
-				 ({:.0} B/row over the whole process, binary and SQLite included)",
-				rss as f64 / (1024.0 * 1024.0),
-				rss as f64 / rows.max(1) as f64,
+				 ({:.0} B/row over the whole process, binary and SQLite included); {:.1} MiB floor \
+				 before it opened anything, {:.1} MiB peak while reading the rows, {:.1} MiB left \
+				 after the pair and its store are dropped; the tree itself computes as {:.1} MiB, \
+				 leaving {:.1} MiB that is neither floor nor tree",
+				mib(child.widest),
+				child.widest as f64 / child.rows.max(1) as f64,
+				mib(child.floor),
+				mib(child.peak),
+				mib(child.after),
+				mib(child.baseline_bytes as u64),
+				mib(child
+					.widest
+					.saturating_sub(child.floor + child.baseline_bytes as u64)),
 			),
 		),
 		None => probe.record(
