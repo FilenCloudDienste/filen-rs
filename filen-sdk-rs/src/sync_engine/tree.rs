@@ -250,21 +250,36 @@ impl Default for Baseline {
 
 impl Baseline {
 	/// The rows as the store read them back, in any order.
+	///
+	/// The store's own read builds the tree row by row instead
+	/// ([`BaselineStore::baseline`](super::baseline::BaselineStore::baseline)), so what is left
+	/// here is the tests' way of writing a tree down and the probe's.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(super) fn from_rows(rows: impl IntoIterator<Item = BaselineEntry>) -> Self {
 		let mut baseline = Self::default();
 		for entry in rows {
 			baseline.upsert(&entry);
 		}
-		// The load is the one moment where the whole tree's size is known and nothing is about to
-		// grow. A `Vec` that doubled its way to a million nodes holds room for two million, and the
-		// resident copy keeps that slack for the life of the pair: 105 MiB of it at a million rows,
-		// which is a third of what the tree costs. The maps double the same way.
-		baseline.nodes.shrink_to_fit();
-		baseline.by_uuid.shrink_to_fit();
-		baseline.by_lineage.shrink_to_fit();
-		baseline.side.shrink_to_fit();
-		baseline.agreed.shrink_to_fit();
+		baseline.shrink_after_load();
 		baseline
+	}
+
+	/// Give back the room the load's doubling took but the tree will not use.
+	///
+	/// The end of a load is the one moment where the whole tree's size is known and nothing is
+	/// about to grow. A `Vec` that doubled its way to a million nodes holds room for two million,
+	/// and the resident copy keeps that slack for the life of the pair: 105 MiB of it at a million
+	/// rows, which is a third of what the tree costs. The maps double the same way.
+	///
+	/// Called by every path that loads a pair — `from_rows` and the store's own
+	/// row-at-a-time read — and by nothing else: on a tree a pass is still writing to, giving the
+	/// room back only means taking it again.
+	pub(super) fn shrink_after_load(&mut self) {
+		self.nodes.shrink_to_fit();
+		self.by_uuid.shrink_to_fit();
+		self.by_lineage.shrink_to_fit();
+		self.side.shrink_to_fit();
+		self.agreed.shrink_to_fit();
 	}
 
 	/// How many rows the pair tracks.

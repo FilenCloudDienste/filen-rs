@@ -930,7 +930,7 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	/// One baseline row by path (whole-pair snapshots go through [`Self::entries`]).
+	/// One baseline row by path (whole-pair snapshots go through `entries`).
 	pub(crate) fn entry(
 		&self,
 		pair: PairId,
@@ -948,6 +948,12 @@ impl BaselineStore {
 	}
 
 	/// Every baseline row for `pair`, ordered by path (parent-before-child for same-prefix paths).
+	///
+	/// The whole pair as a `Vec`, which nothing a pass does needs any more —
+	/// [`baseline`](Self::baseline) streams the rows into the tree instead, and that `Vec` at a
+	/// million rows is the widest thing an idle process used to build. What is left is the tests'
+	/// way of asking what the DB holds, and the probe's.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(crate) fn entries(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
 		self.conn
 			.prepare(&format!(
@@ -977,9 +983,34 @@ impl BaselineStore {
 		if let Some(rows) = self.resident.borrow().get(&pair) {
 			return Ok(Arc::clone(rows));
 		}
-		let rows = Arc::new(Baseline::from_rows(self.entries(pair)?));
+		let rows = Arc::new(self.read_tree(pair)?);
 		self.resident.borrow_mut().insert(pair, Arc::clone(&rows));
 		Ok(rows)
+	}
+
+	/// `pair`'s rows as a [`Baseline`] tree, built from them AS THEY ARRIVE.
+	///
+	/// Not `Baseline::from_rows(self.entries(pair)?)`, which is the same tree by way of a `Vec` of
+	/// every row the pair has. That `Vec` is the widest thing a process holding an idle pair ever
+	/// builds: at a million rows it is ~300 MiB of `BaselineEntry` and their paths, alive beside
+	/// the tree being built out of it — and once freed, the pages an allocator has not returned to
+	/// the kernel are still resident, so a pair loaded that way costs its own size twice over for
+	/// the life of the process. One row at a time costs one row.
+	///
+	/// The `ORDER BY` is `entries`'s, kept because the tree is built by `upsert`
+	/// per row: parent before child for same-prefix paths, which is the order a load is cheapest
+	/// in and the order both read paths agree on.
+	fn read_tree(&self, pair: PairId) -> rusqlite::Result<Baseline> {
+		let mut statement = self.conn.prepare(&format!(
+			"SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 ORDER BY rel_path"
+		))?;
+		let mut rows = statement.query(params![pair])?;
+		let mut tree = Baseline::default();
+		while let Some(row) = rows.next()? {
+			tree.upsert(&Self::row_to_entry(row)?);
+		}
+		tree.shrink_after_load();
+		Ok(tree)
 	}
 
 	/// Apply to the resident copy what a write that has just COMMITTED did to the DB. Called on the
@@ -1995,6 +2026,57 @@ mod tests {
 		);
 		drop(reopened);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// The resident tree is built from the rows as they arrive; the materialized read is the same
+	/// rows by way of a `Vec`. The two must be the same tree — same rows, same order, same
+	/// parents — or the read that a pass actually uses is not the one the tests cover.
+	///
+	/// Handed the rows in OPPOSITE orders on purpose. Both reads issue the same `ORDER BY
+	/// rel_path`, so comparing them as they come is comparing a loop with itself; reversing one
+	/// side puts every child before its own directory and every sibling backwards, which is the
+	/// only way to ask whether the tree a pass loads depends on the order its rows arrived in.
+	#[test]
+	fn the_streamed_load_builds_the_tree_the_materialized_read_builds() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		assert_eq!(
+			store.baseline(pair).unwrap().len(),
+			0,
+			"a pair with no rows loads an empty tree"
+		);
+
+		// Written out of path order, and with a child before its own directory — though the reads
+		// below both sort, so this is the DB's fidelity and not yet the question.
+		for entry in [
+			file_entry("a/deep/b.txt", [9u8; 32], 4242),
+			dir_entry("a"),
+			file_entry("c.txt", [1u8; 32], 7),
+			dir_entry("a/deep"),
+		] {
+			store.upsert_entry(pair, &entry).unwrap();
+		}
+		// The upserts above mirrored themselves into the copy the first read made, and this is a
+		// test of the READ: make the store go back to the DB for it.
+		store.forget_resident(pair);
+
+		let streamed = store.baseline(pair).unwrap();
+		let mut rows = store.entries(pair).unwrap();
+		rows.reverse();
+		let materialized = Baseline::from_rows(rows);
+		assert_eq!(streamed.len(), materialized.len(), "same row count");
+		assert_eq!(
+			streamed.iter().collect::<Vec<_>>(),
+			materialized.iter().collect::<Vec<_>>(),
+			"same rows, in the same walk order, from opposite arrival orders"
+		);
+		assert_eq!(
+			streamed.len(),
+			4,
+			"and it is the four rows that were written, not an empty tree both paths agree on"
+		);
 	}
 
 	#[test]
