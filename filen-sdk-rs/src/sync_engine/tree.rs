@@ -34,7 +34,7 @@
 
 use std::{
 	cmp::Ordering,
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeSet, HashMap, HashSet},
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
@@ -229,6 +229,16 @@ pub(super) struct Baseline {
 	/// (see [`Baseline::awaits_confirmation`]). A row that is not here agrees with itself, which is
 	/// every row of a converged pair.
 	agreed: HashMap<NodeId, Option<Blake3Hash>>,
+	/// The rows that stand in for NEITHER side of a pass
+	/// ([`BaselineEntry::carryable`]) — the ones a change-scoped pass has to re-observe instead of
+	/// carrying forward.
+	///
+	/// Indexed, rather than found by walking, because a pass needs the WHOLE list of them before it
+	/// reads anything: they go into its dirty set (re-observe) and its held set (plan nothing here).
+	/// Finding them by walking the tree is the one whole-tree cost a change-scoped pass could not
+	/// otherwise shed — at a million rows that walk IS the pass. Almost every row of a converged
+	/// pair is carryable, so this is empty in the steady state.
+	uncarryable: HashSet<NodeId>,
 	/// How many nodes are rows (see [`PRESENT`]).
 	rows: usize,
 }
@@ -243,6 +253,7 @@ impl Default for Baseline {
 			by_lineage: HashMap::new(),
 			side: HashMap::new(),
 			agreed: HashMap::new(),
+			uncarryable: HashSet::new(),
 			rows: 0,
 		}
 	}
@@ -280,6 +291,7 @@ impl Baseline {
 		self.by_lineage.shrink_to_fit();
 		self.side.shrink_to_fit();
 		self.agreed.shrink_to_fit();
+		self.uncarryable.shrink_to_fit();
 	}
 
 	/// How many rows the pair tracks.
@@ -529,6 +541,108 @@ impl Baseline {
 		self.is_row(id) || (is_dir && !self.kids(id).is_empty())
 	}
 
+	/// How many rows stand in for both sides — what a carried side holds before this pass's own
+	/// observations correct it (see [`BaselineEntry::carryable`]).
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
+		)
+	)]
+	pub(super) fn carryable_rows(&self) -> usize {
+		// Checked in EVERY build. A `debug_assert` beside a `saturating_sub` would state the
+		// invariant and then mask its violation exactly where it matters: this is a capacity hint,
+		// so an undercount silently reallocates a pass's way up instead of failing. A plain
+		// subtraction would be no better — this crate's release profile leaves overflow checks off,
+		// so the underflow would wrap to a capacity no allocation can serve.
+		assert!(
+			self.uncarryable.len() <= self.rows,
+			"every uncarryable id is a row: {} of {}",
+			self.uncarryable.len(),
+			self.rows
+		);
+		self.rows - self.uncarryable.len()
+	}
+
+	/// Whether the row at `rel_path` stands in for both sides.
+	///
+	/// Answered without building a row, which is the whole reason a carried side can say it holds a
+	/// path it has no node for: rebuilding the row to ask would allocate its path and both its
+	/// halves, per lookup.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
+		)
+	)]
+	pub(super) fn carryable(&self, rel_path: &str) -> bool {
+		self.resolve(rel_path)
+			.is_some_and(|id| self.is_row(id) && !self.uncarryable.contains(&id))
+	}
+
+	/// The path of every row that stands in for NEITHER side — what a change-scoped pass adds to
+	/// its dirty set and its held set before it reads anything.
+	///
+	/// From the index, not from a walk. This is the list that would otherwise cost a pass one visit
+	/// of every row in the tree just to discover that a converged pair has none.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
+		)
+	)]
+	pub(super) fn uncarryable_paths(&self) -> impl Iterator<Item = String> + '_ {
+		self.uncarryable.iter().map(|&id| self.path_of(id))
+	}
+
+	/// Whether any row at or under `rel_path`, under any spelling, satisfies `held` — the folded
+	/// subtree question [`occupied`](Self::occupied) asks, with the CALLER deciding which rows
+	/// count.
+	///
+	/// A carried side cannot use `occupied` itself: that counts every row, and every path a row
+	/// merely sits under, where such a side holds only the rows it can carry and has this pass's own
+	/// observations over them. So the walk is shared and the predicate is not.
+	///
+	/// ROWS ONLY, which is the half a caller must not forget: the predicate can subtract from this
+	/// walk and never add to it. A side that also holds paths NO row tracks — every create this
+	/// pass has seen and not yet written back — has to scan those itself first and use this for the
+	/// row half. Asked alone, it answers "nothing there" for a destination holding a brand-new
+	/// file, and the directory move that asked would land on top of it.
+	#[cfg_attr(
+		not(test),
+		expect(
+			dead_code,
+			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
+		)
+	)]
+	pub(super) fn any_folded_row_at_or_under(
+		&self,
+		rel_path: &str,
+		held: &mut impl FnMut(&str) -> bool,
+	) -> bool {
+		// `""` holds nothing, exactly as `occupied` answers for it.
+		if rel_path.is_empty() {
+			return false;
+		}
+		for id in self.folded_nodes(rel_path) {
+			let path = self.path_of(id);
+			if self.is_row(id) && held(&path) {
+				return true;
+			}
+			// The walk yields the node's DESCENDANTS only, so the node itself is asked above.
+			let mut walk = self.walk(id, path);
+			while walk.next_row().is_some() {
+				if held(&walk.path) {
+					return true;
+				}
+			}
+		}
+		false
+	}
+
 	/// Whether every row STRICTLY under `rel_path` is `Synced` — the gate a directory move takes
 	/// before it carries a subtree across as one move.
 	pub(super) fn subtree_all_synced(&self, rel_path: &str) -> bool {
@@ -569,6 +683,7 @@ impl Baseline {
 			+ table::<StableUuid, NodeId>(self.by_lineage.capacity())
 			+ table::<NodeId, ConflictSides>(self.side.capacity())
 			+ table::<NodeId, Option<Blake3Hash>>(self.agreed.capacity())
+			+ table::<NodeId, ()>(self.uncarryable.capacity())
 	}
 
 	fn walk(&self, root: NodeId, root_path: String) -> Walk<'_> {
@@ -697,6 +812,11 @@ impl Baseline {
 		}
 		if entry.agreed_hash != entry.content_hash {
 			self.agreed.insert(id, entry.agreed_hash);
+		}
+		// Asked of the ROW the store just wrote, which is the only place the whole field list is in
+		// hand. `clear_indexes` above has already taken the previous answer out.
+		if !entry.carryable() {
+			self.uncarryable.insert(id);
 		}
 	}
 
@@ -851,6 +971,7 @@ impl Baseline {
 		}
 		self.side.remove(&id);
 		self.agreed.remove(&id);
+		self.uncarryable.remove(&id);
 	}
 
 	/// Drop `id` and every ancestor of it that is left holding neither a row nor a child.
@@ -982,6 +1103,147 @@ mod tests {
 		super::{baseline::BaselineChange, plan::is_under, scan::collision_key},
 		*,
 	};
+
+	/// The index's answer and the row's must be the same answer, for every row the tree holds.
+	///
+	/// The only place the two halves of the contract meet. [`Baseline::carryable`] reads the
+	/// `uncarryable` set, recorded from the entry a caller handed [`Baseline::upsert`], while
+	/// `derive::carried` asks [`BaselineEntry::carryable`] of the row [`Baseline::fill_row`]
+	/// rebuilds out of the node's flag bits. They agree only while the store round-trips every
+	/// field the rule reads: narrow one column or drop one flag and the index would call a row
+	/// carryable that derives nothing — a path in neither map and in neither `dirty` nor `held`,
+	/// which is a pass planning over an agreement nobody recorded.
+	fn index_agrees_with_every_row(tree: &Baseline) {
+		let mut rows = Vec::new();
+		tree.visit_rows(|row| rows.push(row.clone()));
+		for row in rows {
+			assert_eq!(
+				tree.carryable(&row.rel_path),
+				row.carryable(),
+				"{}: the index and the row the store rebuilds disagree",
+				row.rel_path
+			);
+		}
+	}
+
+	/// The uncarryable index is what a change-scoped pass reads INSTEAD of walking the tree, so it
+	/// has to follow every write path: a row rewritten one-sided joins it, one rewritten whole
+	/// leaves it, a moved subtree takes its entries along, and a removed row stops answering for a
+	/// path that no longer has one. An index that fell behind on any of those would leave a pass
+	/// deriving both sides from a row that describes neither.
+	#[test]
+	fn the_uncarryable_index_follows_every_write_path() {
+		let uuid = Uuid::from_u128(9);
+		let whole = file("docs/a.txt", uuid, [1; 32]);
+		let one_sided = BaselineEntry {
+			state: BaselineState::Conflicted,
+			..whole.clone()
+		};
+
+		let mut tree = Baseline::from_rows([whole.clone()]);
+		assert_eq!(tree.carryable_rows(), 1);
+		assert!(tree.carryable("docs/a.txt"));
+		assert_eq!(tree.uncarryable_paths().count(), 0);
+		assert!(
+			!tree.carryable("docs"),
+			"a path with no row of its own carries nothing"
+		);
+		assert!(!tree.carryable("docs/missing.txt"));
+		index_agrees_with_every_row(&tree);
+
+		// Rewritten one-sided: indexed, and carryable no longer.
+		tree.upsert(&one_sided);
+		assert_eq!(tree.carryable_rows(), 0);
+		assert!(!tree.carryable("docs/a.txt"));
+		assert_eq!(
+			tree.uncarryable_paths().collect::<Vec<_>>(),
+			vec!["docs/a.txt".to_string()]
+		);
+		index_agrees_with_every_row(&tree);
+
+		// A move re-keys it with the row. Without this a pass would re-observe a path nothing is
+		// keyed by any more, and carry the row that moved.
+		tree.move_subtree("docs", "moved");
+		assert_eq!(
+			tree.uncarryable_paths().collect::<Vec<_>>(),
+			vec!["moved/a.txt".to_string()]
+		);
+		assert!(!tree.carryable("moved/a.txt"));
+		index_agrees_with_every_row(&tree);
+
+		// Rewritten whole: out of the index again.
+		tree.upsert(&BaselineEntry {
+			rel_path: "moved/a.txt".to_string(),
+			..whole.clone()
+		});
+		assert_eq!(tree.carryable_rows(), 1);
+		assert_eq!(tree.uncarryable_paths().count(), 0);
+		assert!(tree.carryable("moved/a.txt"));
+		index_agrees_with_every_row(&tree);
+
+		// A removed row leaves the index rather than answering for a path with no row.
+		tree.upsert(&BaselineEntry {
+			rel_path: "moved/b.txt".to_string(),
+			state: BaselineState::Adopted,
+			..whole.clone()
+		});
+		assert_eq!(
+			tree.uncarryable_paths().collect::<Vec<_>>(),
+			vec!["moved/b.txt".to_string()]
+		);
+		assert_eq!(tree.carryable_rows(), 1);
+		tree.remove("moved/b.txt");
+		assert_eq!(tree.uncarryable_paths().count(), 0);
+		assert_eq!(tree.carryable_rows(), 1);
+		index_agrees_with_every_row(&tree);
+
+		// And a subtree removal takes its entries with it.
+		tree.upsert(&BaselineEntry {
+			rel_path: "moved/deep/c.txt".to_string(),
+			state: BaselineState::Adopted,
+			..whole.clone()
+		});
+		assert_eq!(tree.uncarryable_paths().count(), 1);
+		tree.remove_subtrees(&BTreeSet::from(["moved/deep".to_string()]));
+		assert_eq!(tree.uncarryable_paths().count(), 0);
+		assert_eq!(tree.carryable_rows(), 1);
+		index_agrees_with_every_row(&tree);
+	}
+
+	/// The folded subtree walk answers the question `occupied` asks, with the caller saying which
+	/// rows count — so a carried side can ask it about rows the pass has observed away without the
+	/// walk knowing anything about observations.
+	#[test]
+	fn the_folded_subtree_walk_lets_the_caller_choose_which_rows_count() {
+		let tree = Baseline::from_rows([
+			file("Docs/a.txt", Uuid::from_u128(1), [1; 32]),
+			file("notes", Uuid::from_u128(2), [2; 32]),
+		]);
+		let mut anything = |_: &str| true;
+
+		assert!(
+			tree.any_folded_row_at_or_under("docs", &mut anything),
+			"a directory no row is keyed by is still occupied by what sits under it, folded"
+		);
+		assert!(tree.any_folded_row_at_or_under("DOCS/A.TXT", &mut anything));
+		assert!(tree.any_folded_row_at_or_under("notes", &mut anything));
+		assert!(
+			!tree.any_folded_row_at_or_under("note", &mut anything),
+			"a path a key merely starts with is not occupied"
+		);
+		assert!(!tree.any_folded_row_at_or_under("docs2", &mut anything));
+		assert!(
+			!tree.any_folded_row_at_or_under("", &mut anything),
+			"the pair root holds nothing, as `occupied` answers for it"
+		);
+
+		// The predicate is the point: refusing the one row under `docs` empties it.
+		let mut nothing = |_: &str| false;
+		assert!(!tree.any_folded_row_at_or_under("docs", &mut nothing));
+		let mut only_notes = |path: &str| path == "notes";
+		assert!(!tree.any_folded_row_at_or_under("docs", &mut only_notes));
+		assert!(tree.any_folded_row_at_or_under("NOTES", &mut only_notes));
+	}
 
 	fn file(rel_path: &str, uuid: Uuid, hash: [u8; 32]) -> BaselineEntry {
 		BaselineEntry {

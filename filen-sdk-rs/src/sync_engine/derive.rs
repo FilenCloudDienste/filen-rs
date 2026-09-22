@@ -20,11 +20,13 @@
 //!
 //! The rows that record one side only are the ones the engine writes that way on purpose: a
 //! `KeepLocal` resolution clears the local half and a `KeepRemote` one clears the remote half
-//! (`engine::resolution_entry`), an [`Adopted`](BaselineState::Adopted) row records whichever side
-//! the destination held, and a [`Conflicted`](BaselineState::Conflicted) /
-//! [`Overwritten`](BaselineState::Overwritten) row's two halves describe a divergence rather than
-//! an agreement — an `Overwritten` row's remote half names the version this engine BURIED, not what
-//! the remote holds now. Deriving either side from any of them would be a guess.
+//! (`engine::resolution_entry`), an [`Adopted`](super::baseline::BaselineState::Adopted) row
+//! records whichever side the destination held, and a
+//! [`Conflicted`](super::baseline::BaselineState::Conflicted) /
+//! [`Overwritten`](super::baseline::BaselineState::Overwritten) row's two halves describe a
+//! divergence rather than an agreement — an `Overwritten` row's remote half names the version this
+//! engine BURIED, not what the remote holds now. Deriving either side from any of them would be a
+//! guess.
 //!
 //! # What derivation cannot see
 //!
@@ -45,7 +47,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, NodeKind},
+	baseline::{BaselineEntry, NodeKind},
 	engine::written_node,
 	observe::{LocalObservation, LocalObservations},
 	plan::{self, RemoteNode},
@@ -122,9 +124,25 @@ pub(super) fn from_baseline(baseline: &Baseline, dirty: BTreeSet<String>) -> Der
 /// the shape that fabricates an absence on the other, and returning them as a pair means no caller
 /// can take the half it likes. See the module docs for which rows record one side only.
 fn carried(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
-	if row.state != BaselineState::Synced {
+	// The RULE is [`BaselineEntry::carryable`], on the row, because the resident tree indexes the
+	// rows that fail it and a carried side answers "does this side hold the path" off that index:
+	// three readers, one field list (see there). What is left is the EXTRACTION, below.
+	if !row.carryable() {
 		return None;
 	}
+	extracted(row)
+}
+
+/// The two nodes a row's FIELDS describe, with no judgement about whether they may be carried.
+///
+/// Split from the gate on purpose. Inlined behind it, every row the rule refuses would extract
+/// nothing BY CONSTRUCTION, so a test holding the rule and the extraction together could only
+/// assert `false == false` over most of its corpus — it would pass whatever either one did. Apart,
+/// the field half of the rule has a second implementation here, the `?`s, and
+/// `the_carryable_rule_and_the_extraction_agree_on_every_row_shape` can fail in BOTH directions: a
+/// rule grown looser than these fields, which would derive a side from a row that describes none,
+/// and a rule grown stricter, which would strand its path in `dirty` and `held` on every pass.
+fn extracted(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
 	// Names the remote item this row last recorded; `None` for a row whose remote half was cleared
 	// or never written.
 	let remote = written_node(Some(row))?;
@@ -265,6 +283,7 @@ mod tests {
 		cache::{CacheEvent, CacheEventType, FileEvent, RemoteItem},
 		sync_engine::{
 			SyncMode,
+			baseline::BaselineState,
 			changes::{
 				PairChanges, RemoteDeltaEntry,
 				tests::{cache_event, cacheable_file},
@@ -1100,6 +1119,118 @@ mod tests {
 			derived.local.contains_key("docs/deep/inner.bin"),
 			"an unreadable subtree's rows are carried, not deleted: {:?}",
 			sorted(derived.local.keys().cloned())
+		);
+	}
+
+	/// Every [`BaselineState`], listed once. [`state_index`] is what makes this exhaustive rather
+	/// than merely long enough: it has no wildcard arm, so a new variant does not compile until it
+	/// is named there, and the assertion in the test below then demands it be listed here too.
+	const ALL_STATES: [BaselineState; 4] = [
+		BaselineState::Synced,
+		BaselineState::Conflicted,
+		BaselineState::Overwritten,
+		BaselineState::Adopted,
+	];
+
+	/// Where each state sits in [`ALL_STATES`].
+	fn state_index(state: BaselineState) -> usize {
+		match state {
+			BaselineState::Synced => 0,
+			BaselineState::Conflicted => 1,
+			BaselineState::Overwritten => 2,
+			BaselineState::Adopted => 3,
+		}
+	}
+
+	/// [`BaselineEntry::carryable`] must be exactly "`Synced`, and the fields [`extracted`] reads
+	/// are all there" — checked against a second implementation of each half, over every row shape.
+	///
+	/// Both directions matter and both can fail here. A rule LOOSER than the extraction would have
+	/// the resident tree index a row as carryable that derives nothing: a path in neither map, held
+	/// by nobody, which is the shape invariant I1 forbids. A rule STRICTER than it fabricates no
+	/// absence, but [`from_baseline`] puts such a row in `dirty` AND `held` in one statement, so it
+	/// stalls its path on every pass rather than one. Every state, both kinds, and each optional
+	/// field the extraction reads cleared in turn — which is every way a row can fail to describe a
+	/// side.
+	#[test]
+	fn the_carryable_rule_and_the_extraction_agree_on_every_row_shape() {
+		let uuid = Uuid::from_u128(1);
+		let hash = Blake3Hash::from([1; 32]);
+		let whole = BaselineEntry {
+			rel_path: "x".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Some(uuid),
+			content_hash: Some(hash),
+			size: Some(3),
+			local_mtime: Some(10),
+			remote_modified: Some(20),
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			agreed_hash: Some(hash),
+		};
+		/// One way a row can fail to describe a side: what to call it in the failure message,
+		/// and the field it clears.
+		type Clear = (&'static str, fn(&mut BaselineEntry));
+		let clears: [Clear; 8] = [
+			("nothing", |_| {}),
+			("remote_uuid", |row| row.remote_uuid = None),
+			("content_hash", |row| row.content_hash = None),
+			("size", |row| row.size = None),
+			("local_mtime", |row| row.local_mtime = None),
+			("remote_modified", |row| row.remote_modified = None),
+			("remote_stable_uuid", |row| row.remote_stable_uuid = None),
+			("agreed_hash", |row| row.agreed_hash = None),
+		];
+		let mut checked = 0;
+		let mut carried_some = 0;
+		let mut extracted_some = 0;
+		for (at, state) in ALL_STATES.into_iter().enumerate() {
+			assert_eq!(
+				state_index(state),
+				at,
+				"{state:?} is not where the wildcard-free match puts it: the corpus has drifted \
+				 from the enum"
+			);
+			for kind in [NodeKind::File, NodeKind::Dir] {
+				for (what, clear) in &clears {
+					let mut row = BaselineEntry {
+						state,
+						kind,
+						..whole.clone()
+					};
+					clear(&mut row);
+					assert_eq!(
+						row.carryable(),
+						row.state == BaselineState::Synced && extracted(&row).is_some(),
+						"{state:?} {kind:?} with {what} cleared: the rule and the extraction disagree"
+					);
+					checked += 1;
+					carried_some += usize::from(carried(&row).is_some());
+					extracted_some += usize::from(extracted(&row).is_some());
+				}
+			}
+		}
+		assert_eq!(
+			checked,
+			ALL_STATES.len() * 2 * clears.len(),
+			"every state/kind/field combination is covered"
+		);
+		// Both halves of the assertion have to answer both ways over this corpus, or it could not
+		// have failed. The extraction succeeds for 10 rows of EVERY state — a directory needs only
+		// its remote uuid (7 of 8 clears), a file needs all four fields (3 of 8) — and the state
+		// term then keeps the `Synced` quarter of those.
+		assert_eq!(
+			extracted_some,
+			10 * ALL_STATES.len(),
+			"the extraction must answer both ways, or the state term alone would carry the test"
+		);
+		assert_eq!(
+			carried_some, 10,
+			"the corpus must exercise both answers, not just one"
 		);
 	}
 
