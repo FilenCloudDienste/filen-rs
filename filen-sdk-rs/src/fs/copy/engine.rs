@@ -472,9 +472,8 @@ where
 			return Ok(());
 		}
 		// Held while directories are being created, so the creates share one lock instead of
-		// each acquiring and releasing it; dropped while paused. It counts as in flight, so the
-		// job only reports itself paused once the lock is gone (the tuple drops the lock first).
-		let mut keep_warm: Option<(B::DriveLock, OpGuard)> = None;
+		// each acquiring and releasing it; dropped while paused.
+		let mut keep_warm: Option<HeldLock<B::DriveLock>> = None;
 		let mut in_flight = FuturesUnordered::new();
 
 		loop {
@@ -495,11 +494,11 @@ where
 				}
 			} else {
 				if keep_warm.is_none() && !ready.is_empty() {
-					let op = self.reporter.op();
-					match self.control.until_stopping(self.backend.lock_drive()).await {
-						Ok(Ok(lock)) => keep_warm = Some((lock, op)),
-						Ok(Err(error)) => return Err(self.stop_error(error)),
-						Err(Stopped) => continue,
+					match wait_for_lock(&*self.backend, &self.control, &self.reporter).await {
+						Ok(LockWait::Locked(held)) => keep_warm = Some(held),
+						// the loop reports the pause or the stop and waits it out
+						Ok(LockWait::Paused) | Err(Stopped) => continue,
+						Ok(LockWait::Failed(error)) => return Err(self.stop_error(error)),
 					}
 				}
 				while in_flight.len() < MAX_CONCURRENT_OPERATIONS
@@ -788,13 +787,20 @@ where
 				continue;
 			}
 			let items = self.created_items_in(destination);
-			let _op = self.reporter.op();
-			let _lock = match self.backend.lock_drive().await {
-				Ok(lock) => lock,
-				Err(error) => {
-					tracing::warn!("failed to lock the drive to propagate copied items: {error}");
-					continue;
+			let lock = loop {
+				match wait_for_lock(&*self.backend, &self.control, &self.reporter).await? {
+					LockWait::Locked(held) => break Some(held),
+					LockWait::Paused => self.checkpoint().await?,
+					LockWait::Failed(error) => {
+						tracing::warn!(
+							"failed to lock the drive to propagate copied items: {error}"
+						);
+						break None;
+					}
 				}
+			};
+			let Some(_lock) = lock else {
+				continue;
 			};
 			for item in &items {
 				for error in self.backend.propagate_tree(&added, item).await {
@@ -924,6 +930,46 @@ struct FileOutcome {
 struct ChunkReservation {
 	_permit: OwnedSemaphorePermit,
 	_op: OpGuard,
+}
+
+/// The drive lock, held as one of the job's in-flight operations. The lock is dropped before
+/// the operation ends, so the job is only reported paused once the lock is gone.
+struct HeldLock<L> {
+	_lock: L,
+	_op: OpGuard,
+}
+
+enum LockWait<L> {
+	Locked(HeldLock<L>),
+	/// A pause was requested while waiting; nothing is held.
+	Paused,
+	Failed(Error),
+}
+
+/// Waits for the drive lock, which another client may hold for a long time. A stop ends the
+/// wait (`Err`), and a pause requested meanwhile ends it or drops the lock just acquired, so a
+/// paused job holds no lock. After [`LockWait::Paused`] the caller waits out the pause before
+/// trying again.
+async fn wait_for_lock<B: CopyBackend>(
+	backend: &B,
+	control: &JobControl,
+	reporter: &MaybeArc<Reporter>,
+) -> Result<LockWait<B::DriveLock>, Stopped> {
+	let op = reporter.op();
+	let result = tokio::select! {
+		biased;
+		() = control.stopping() => return Err(Stopped),
+		() = control.pause_changed(false) => return Ok(LockWait::Paused),
+		result = backend.lock_drive() => result,
+	};
+	Ok(match result {
+		Ok(_) if control.is_pause_requested() => LockWait::Paused,
+		Ok(lock) => LockWait::Locked(HeldLock {
+			_lock: lock,
+			_op: op,
+		}),
+		Err(error) => LockWait::Failed(error),
+	})
 }
 
 /// Plaintext length of chunk `index` of a `size`-byte file.
@@ -1122,12 +1168,14 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 
 	// Registering the file is not started while paused, but once started it runs to the end
 	// even on cancel, so a file that exists is always reported.
-	control.checkpoint().await?;
-	let _op = reporter.op();
-	let _lock = backend
-		.lock_drive()
-		.await
-		.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
+	let _lock = loop {
+		control.checkpoint().await?;
+		match wait_for_lock(&*backend, &control, &reporter).await? {
+			LockWait::Locked(held) => break held,
+			LockWait::Paused => {}
+			LockWait::Failed(error) => return Err(FileError::Failed(CopyStage::Finalize, error)),
+		}
+	};
 	if top_level {
 		// Registering a file under a name the parent already holds would make the copy a new
 		// version of that file instead of a new file, so the name is checked again here, while
@@ -1272,6 +1320,8 @@ mod tests {
 		propagated_trees: Vec<Uuid>,
 		target_fetches: usize,
 		probes: Vec<String>,
+		/// Drive-lock acquisitions that had to wait for another holder.
+		lock_waits: usize,
 	}
 
 	struct FakeUpload {
@@ -1301,6 +1351,10 @@ mod tests {
 		/// writing without the drive lock took them at the last moment).
 		version_of: HashMap<String, Uuid>,
 		never: Notify,
+		lock_calls: AtomicUsize,
+		/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
+		/// until it is raised again; `usize::MAX` when the lock is free.
+		block_locks_from: AtomicUsize,
 	}
 
 	impl FakeBackend {
@@ -1324,6 +1378,8 @@ mod tests {
 				existing: Mutex::new(HashSet::new()),
 				version_of: HashMap::new(),
 				never: Notify::new(),
+				lock_calls: AtomicUsize::new(0),
+				block_locks_from: AtomicUsize::new(usize::MAX),
 			}
 		}
 
@@ -1345,6 +1401,13 @@ mod tests {
 		}
 
 		async fn lock_drive(&self) -> Result<FakeLock, Error> {
+			let call = self.lock_calls.fetch_add(1, Ordering::SeqCst);
+			if call >= self.block_locks_from.load(Ordering::SeqCst) {
+				self.log().lock_waits += 1;
+				while call >= self.block_locks_from.load(Ordering::SeqCst) {
+					tokio::time::sleep(Duration::from_millis(10)).await;
+				}
+			}
 			self.live_locks.fetch_add(1, Ordering::SeqCst);
 			Ok(FakeLock(Arc::clone(&self.live_locks)))
 		}
@@ -2400,6 +2463,125 @@ mod tests {
 				.iter()
 				.any(|u| u.phase == CopyPhase::Finishing)
 		);
+	}
+
+	fn unblock_locks(backend: &FakeBackend) {
+		backend.block_locks_from.store(usize::MAX, Ordering::SeqCst);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn cancel_ends_a_drive_lock_wait_before_a_file_is_registered() {
+		let destination = Uuid::new_v4();
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		backend.block_locks_from.store(0, Ordering::SeqCst);
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source_file("f", 10))]),
+			control,
+		);
+
+		wait_until("the file waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+			.await
+			.expect("a cancel ends a wait for the drive lock")
+			.unwrap();
+
+		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		assert_released(&backend, &reporter);
+		assert!(backend.log().finished.is_empty());
+		assert_eq!(outcome.report.counts.files_done, 0);
+		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn pause_ends_a_drive_lock_wait_before_a_file_is_registered() {
+		let destination = Uuid::new_v4();
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		backend.block_locks_from.store(0, Ordering::SeqCst);
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source_file("f", 10))]),
+			control,
+		);
+
+		wait_until("the file waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		assert_released(&backend, &reporter);
+
+		unblock_locks(&backend);
+		pause.send_replace(false);
+		running.await.unwrap().result.unwrap();
+		assert_eq!(backend.log().finished.len(), 1);
+		assert_released(&backend, &reporter);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(3);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		backend.block_locks_from.store(0, Ordering::SeqCst);
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("directory creation waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		assert_released(&backend, &reporter);
+		assert!(backend.log().created_dirs.is_empty());
+
+		unblock_locks(&backend);
+		pause.send_replace(false);
+		running.await.unwrap().result.unwrap();
+		assert_eq!(backend.log().created_dirs.len(), 4);
+		assert_eq!(backend.log().finished.len(), 3);
+		assert_released(&backend, &reporter);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn cancel_ends_a_drive_lock_wait_while_propagating_to_new_shares() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.later_targets = Some(ConnectedTargets::with_test_users(1));
+		// the file's registration takes the lock first; the propagation afterwards waits
+		backend.block_locks_from.store(1, Ordering::SeqCst);
+		let backend = Arc::new(backend);
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source_file("f", 10))]),
+			control,
+		);
+
+		wait_until("the propagation waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+			.await
+			.expect("a cancel ends a wait for the drive lock")
+			.unwrap();
+
+		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		assert_released(&backend, &reporter);
+		assert_eq!(outcome.report.top_level.len(), 1, "the copied file is kept");
+		assert!(backend.log().propagated_trees.is_empty());
+		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 	}
 
 	fn top_dir_and_file() -> (SourceDir, RemoteFileType<'static>, Vec<PlanSource>) {
