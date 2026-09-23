@@ -1,7 +1,7 @@
 pub mod cache;
 pub mod categories;
 pub mod client_impl;
-pub(crate) mod copy;
+pub mod copy;
 pub mod dir;
 pub mod enums;
 pub mod file;

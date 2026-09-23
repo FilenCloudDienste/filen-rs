@@ -103,7 +103,7 @@ impl Client {
 		)
 		.await?;
 		if response.uuid != uuid {
-			return Ok(CreatedDir::Merged(response.uuid));
+			return Ok(CreatedDir::Merged);
 		}
 		Ok(CreatedDir::Created(RemoteDirectory::new_from_parts(
 			uuid,

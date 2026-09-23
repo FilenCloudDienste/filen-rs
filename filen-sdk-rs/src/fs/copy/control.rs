@@ -41,7 +41,7 @@ struct Inner {
 /// Shared by all of a job's work. A dropped pause sender counts as "not paused" and a dropped
 /// cancel sender as "not cancelled": losing a controller must never pause or cancel the job.
 #[derive(Debug, Clone)]
-pub(crate) struct JobControl {
+pub struct JobControl {
 	inner: Arc<Inner>,
 }
 
@@ -52,7 +52,9 @@ impl Default for JobControl {
 }
 
 impl JobControl {
-	pub(crate) fn new(
+	/// A job paused while `pause` holds `true` and cancelled once `cancel` does. Either may be
+	/// `None` when the caller cannot pause or cancel.
+	pub fn new(
 		pause: Option<watch::Receiver<bool>>,
 		cancel: Option<watch::Receiver<bool>>,
 	) -> Self {
@@ -199,12 +201,6 @@ impl<T: MaybeSend + 'static> JobTasks<T> {
 		}
 		None
 	}
-
-	/// Aborts every running task and waits until all of them have dropped their work.
-	pub(crate) async fn abort_all(&mut self) {
-		self.kill.send_replace(true);
-		while self.tasks.next().await.is_some() {}
-	}
 }
 
 impl<T> Drop for JobTasks<T> {
@@ -216,7 +212,7 @@ impl<T> Drop for JobTasks<T> {
 #[cfg(test)]
 mod tests {
 	use std::{
-		sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+		sync::atomic::{AtomicBool, Ordering},
 		time::Duration,
 	};
 
@@ -352,28 +348,6 @@ mod tests {
 		outputs.sort();
 		assert_eq!(outputs, (0..10).map(|i| i * 2).collect::<Vec<_>>());
 		assert!(tasks.is_empty());
-	}
-
-	#[tokio::test]
-	async fn abort_all_drops_every_running_task() {
-		let mut tasks = JobTasks::<()>::new();
-		let dropped = Arc::new(AtomicUsize::new(0));
-		struct CountOnDrop(Arc<AtomicUsize>);
-		impl Drop for CountOnDrop {
-			fn drop(&mut self) {
-				self.0.fetch_add(1, Ordering::SeqCst);
-			}
-		}
-		for _ in 0..5 {
-			let marker = CountOnDrop(dropped.clone());
-			tasks.spawn(async move {
-				let _marker = marker;
-				std::future::pending::<()>().await;
-			});
-		}
-		tasks.abort_all().await;
-		assert_eq!(dropped.load(Ordering::SeqCst), 5);
-		assert!(tasks.next().await.is_none());
 	}
 
 	#[tokio::test]

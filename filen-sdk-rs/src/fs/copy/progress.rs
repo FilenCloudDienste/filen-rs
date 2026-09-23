@@ -1,5 +1,5 @@
-//! Progress plumbing for long-running jobs: batching events into throttled updates, keeping
-//! them in order across the FFI, and estimating throughput and time left.
+//! Progress plumbing for long-running jobs: batching events into throttled updates and
+//! estimating throughput and time left.
 //!
 //! Everything here takes the current time as an argument (time since the job started), so it
 //! is deterministic under test; the job reads its clock once per call.
@@ -68,11 +68,6 @@ impl<E> EventBatcher<E> {
 		self.last_update = Some(now);
 		self.urgent = false;
 		std::mem::take(&mut self.events)
-	}
-
-	/// When the next update falls due on the interval alone, for scheduling a timer.
-	pub(crate) fn next_due(&self) -> Option<Duration> {
-		self.last_update.map(|last| last + self.interval)
 	}
 }
 
@@ -187,56 +182,8 @@ impl RateEstimator {
 	}
 }
 
-/// Hands messages to a callback on a single consumer, in the order they were sent, without
-/// blocking the sender. Native: one blocking thread (foreign callbacks may block). Wasm: one
-/// task on the calling thread, which must be the thread that owns the JS callback.
-pub(crate) struct OrderedDelivery<T> {
-	sender: tokio::sync::mpsc::UnboundedSender<T>,
-}
-
-impl<T> Clone for OrderedDelivery<T> {
-	fn clone(&self) -> Self {
-		Self {
-			sender: self.sender.clone(),
-		}
-	}
-}
-
-impl<T: Send + 'static> OrderedDelivery<T> {
-	/// Must be called inside a tokio runtime.
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	pub(crate) fn blocking(mut callback: impl FnMut(T) + Send + 'static) -> Self {
-		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-		tokio::task::spawn_blocking(move || {
-			while let Some(message) = receiver.blocking_recv() {
-				callback(message);
-			}
-		});
-		Self { sender }
-	}
-
-	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	pub(crate) fn local(mut callback: impl FnMut(T) + 'static) -> Self {
-		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-		crate::runtime::spawn_local(async move {
-			while let Some(message) = receiver.recv().await {
-				callback(message);
-			}
-		});
-		Self { sender }
-	}
-
-	/// Queues `message`. After the consumer is gone (the caller dropped its side) messages are
-	/// discarded: progress must never fail the job.
-	pub(crate) fn send(&self, message: T) {
-		let _ = self.sender.send(message);
-	}
-}
-
 #[cfg(test)]
 mod tests {
-	use std::sync::{Arc, Mutex};
-
 	use super::*;
 
 	const MS: Duration = Duration::from_millis(1);
@@ -266,7 +213,6 @@ mod tests {
 			!batcher.is_due(1000 * MS, false),
 			"nothing changed, nothing to send"
 		);
-		assert_eq!(batcher.next_due(), Some(400 * MS));
 	}
 
 	#[test]
@@ -358,35 +304,5 @@ mod tests {
 		assert_eq!(work_units(0, 10), 10);
 		assert_eq!(work_units(2, 10), 10 + 2 * PER_FILE_WORK_UNITS);
 		assert_eq!(work_units(u64::MAX, u64::MAX), u64::MAX);
-	}
-
-	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-	async fn delivery_preserves_order_on_one_consumer() {
-		let received = Arc::new(Mutex::new(Vec::new()));
-		let (done_sender, done) = tokio::sync::oneshot::channel();
-		let mut done_sender = Some(done_sender);
-		let delivery = OrderedDelivery::blocking({
-			let received = received.clone();
-			move |message: u32| {
-				received.lock().unwrap().push(message);
-				if message == 9_999 {
-					let _ = done_sender.take().unwrap().send(());
-				}
-			}
-		});
-		let senders = delivery.clone();
-		for message in 0..10_000 {
-			senders.send(message);
-		}
-		done.await.unwrap();
-		assert_eq!(*received.lock().unwrap(), (0..10_000).collect::<Vec<_>>());
-	}
-
-	#[tokio::test]
-	async fn delivery_after_the_consumer_is_gone_is_discarded() {
-		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
-		drop(receiver);
-		let delivery = OrderedDelivery { sender };
-		delivery.send(1); // must not panic
 	}
 }

@@ -134,7 +134,7 @@ pub(crate) struct PlannedTopLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SkipReason {
+pub enum SkipReason {
 	/// The file's metadata could not be decrypted, so there is no key to read it with.
 	UndecryptableFile,
 	/// Listed entries whose parent is not reachable from the source directory (a malformed or
@@ -143,16 +143,16 @@ pub(crate) enum SkipReason {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SkippedEntry {
+pub struct SkippedEntry {
 	/// `None` for an aggregate over several entries.
-	pub(crate) source_uuid: Option<Uuid>,
-	pub(crate) source_path: String,
-	pub(crate) bytes: u64,
-	pub(crate) reason: SkipReason,
+	pub source_uuid: Option<Uuid>,
+	pub source_path: String,
+	pub bytes: u64,
+	pub reason: SkipReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RenameReason {
+pub enum RenameReason {
 	/// A sibling in the source already took the (case-insensitive) name.
 	DuplicateName,
 	/// The metadata could not be decrypted; the item is named after its uuid.
@@ -162,18 +162,18 @@ pub(crate) enum RenameReason {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct RenamedEntry {
-	pub(crate) source_uuid: Uuid,
-	pub(crate) source_path: String,
-	pub(crate) name: ValidatedName,
-	pub(crate) reason: RenameReason,
+pub struct RenamedEntry {
+	pub source_uuid: Uuid,
+	pub source_path: String,
+	pub name: ValidatedName,
+	pub reason: RenameReason,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PlanTotals {
-	pub(crate) dirs: u64,
-	pub(crate) files: u64,
-	pub(crate) bytes: u64,
+pub struct PlanTotals {
+	pub dirs: u64,
+	pub files: u64,
+	pub bytes: u64,
 }
 
 #[derive(Debug)]

@@ -30,6 +30,7 @@ impl TakenNames {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn contains(&self, name: &str) -> bool {
 		self.keys.contains(&collision_key(name))
 	}

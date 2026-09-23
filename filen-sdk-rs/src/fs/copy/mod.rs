@@ -1,19 +1,22 @@
 //! Copying drive items: there is no server-side copy (items are end-to-end encrypted), so a
-//! copy reads each decrypted source and writes a new encrypted item.
+//! copy reads each decrypted source and writes a new encrypted item. See
+//! [`Client::copy_items_to`](crate::auth::Client::copy_items_to).
 
-// The public copy API and its bindings arrive in later commits; until then only tests reach
-// the engine.
-#[allow(dead_code)]
-pub(crate) mod backend;
-#[allow(dead_code)]
-pub(crate) mod control;
-#[allow(dead_code)]
+mod backend;
+mod client_impl;
+mod control;
 pub(crate) mod engine;
-#[allow(dead_code)]
-pub(crate) mod naming;
-#[allow(dead_code)]
-pub(crate) mod plan;
-#[allow(dead_code)]
-pub(crate) mod progress;
-#[allow(dead_code)]
-pub(crate) mod report;
+mod naming;
+mod plan;
+mod progress;
+mod report;
+
+pub use client_impl::{CopyOptions, CopyRequest, CopySource, CopySourceDir};
+pub use control::JobControl;
+pub use engine::CopyOutcome;
+pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
+pub use report::{
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyFailure, CopyPhase,
+	CopyReport, CopyStage, CopyUpdate, FailedSource, FailureInfo, PlannedTopLevelItem,
+	ScanProgress,
+};

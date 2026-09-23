@@ -31,7 +31,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyPhase {
+pub enum CopyPhase {
 	/// Listing the sources and destinations.
 	Scanning,
 	CreatingDirectories,
@@ -47,41 +47,41 @@ pub(crate) enum CopyPhase {
 /// Running counts. Everything planned ends up done or failed, so
 /// `done + failed == totals` once the job is over; skipped entries are not part of the totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct CopyCounts {
-	pub(crate) dirs_created: u64,
+pub struct CopyCounts {
+	pub dirs_created: u64,
 	/// Includes the directories below a failed one, which are never attempted.
-	pub(crate) dirs_failed: u64,
-	pub(crate) files_done: u64,
+	pub dirs_failed: u64,
+	pub files_done: u64,
 	/// Includes the files below a failed directory, which are never attempted.
-	pub(crate) files_failed: u64,
-	pub(crate) bytes_done: u64,
-	pub(crate) bytes_failed: u64,
-	pub(crate) entries_skipped: u64,
-	pub(crate) bytes_skipped: u64,
+	pub files_failed: u64,
+	pub bytes_done: u64,
+	pub bytes_failed: u64,
+	pub entries_skipped: u64,
+	pub bytes_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ScanProgress {
-	pub(crate) sources_done: u64,
-	pub(crate) sources_total: u64,
+pub struct ScanProgress {
+	pub sources_done: u64,
+	pub sources_total: u64,
 	/// Bytes of listing responses received so far, and the expected total when known.
-	pub(crate) listing_bytes: u64,
-	pub(crate) listing_total_bytes: Option<u64>,
+	pub listing_bytes: u64,
+	pub listing_total_bytes: Option<u64>,
 }
 
 /// A file being copied right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ActiveFile {
-	pub(crate) source_uuid: Uuid,
-	pub(crate) dest_uuid: Uuid,
-	pub(crate) dest_parent: Uuid,
-	pub(crate) name: String,
-	pub(crate) size: u64,
-	pub(crate) bytes_done: u64,
+pub struct ActiveFile {
+	pub source_uuid: Uuid,
+	pub dest_uuid: Uuid,
+	pub dest_parent: Uuid,
+	pub name: String,
+	pub size: u64,
+	pub bytes_done: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyStage {
+pub enum CopyStage {
 	CreateDirectory,
 	Download,
 	Upload,
@@ -90,35 +90,35 @@ pub(crate) enum CopyStage {
 
 /// Why an item was not copied, with what is needed to show and retry it.
 #[derive(Debug, Clone)]
-pub(crate) struct FailureInfo {
-	pub(crate) source_uuid: Uuid,
-	pub(crate) source_path: String,
+pub struct FailureInfo {
+	pub source_uuid: Uuid,
+	pub source_path: String,
 	/// The directory the item was to be created in.
-	pub(crate) dest_parent: Uuid,
-	pub(crate) dest_name: String,
-	pub(crate) stage: CopyStage,
-	pub(crate) error: Arc<Error>,
+	pub dest_parent: Uuid,
+	pub dest_name: String,
+	pub stage: CopyStage,
+	pub error: Arc<Error>,
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
-	pub(crate) affected_files: u64,
-	pub(crate) affected_bytes: u64,
+	pub affected_files: u64,
+	pub affected_bytes: u64,
 }
 
 /// The source of a failed item: a file can be copied again as is; a directory is addressed
 /// through the handle the caller attached to it.
 #[derive(Debug, Clone)]
-pub(crate) enum FailedSource<D> {
+pub enum FailedSource<D> {
 	File(Box<RemoteFileType<'static>>),
 	Dir(D),
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CopyFailure<D> {
-	pub(crate) source: FailedSource<D>,
-	pub(crate) info: FailureInfo,
+pub struct CopyFailure<D> {
+	pub source: FailedSource<D>,
+	pub info: FailureInfo,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum CopyEvent {
+pub enum CopyEvent {
 	DirCreated {
 		source_uuid: Uuid,
 		dest_uuid: Uuid,
@@ -162,53 +162,53 @@ pub(crate) enum CopyEvent {
 
 /// One progress callback: the complete current state plus the events since the last one.
 #[derive(Debug, Clone)]
-pub(crate) struct CopyUpdate {
-	pub(crate) phase: CopyPhase,
+pub struct CopyUpdate {
+	pub phase: CopyPhase,
 	/// A pause was requested and in-flight work is still finishing.
-	pub(crate) pausing: bool,
+	pub pausing: bool,
 	/// Paused: nothing is running, and no memory or drive lock is held.
-	pub(crate) paused: bool,
-	pub(crate) cancelling: bool,
-	pub(crate) scan: ScanProgress,
-	pub(crate) totals: PlanTotals,
-	pub(crate) counts: CopyCounts,
-	pub(crate) active: Vec<ActiveFile>,
-	pub(crate) events: Vec<CopyEvent>,
-	pub(crate) bytes_per_second: Option<u64>,
-	pub(crate) eta: Option<Duration>,
+	pub paused: bool,
+	pub cancelling: bool,
+	pub scan: ScanProgress,
+	pub totals: PlanTotals,
+	pub counts: CopyCounts,
+	pub active: Vec<ActiveFile>,
+	pub events: Vec<CopyEvent>,
+	pub bytes_per_second: Option<u64>,
+	pub eta: Option<Duration>,
 	/// Time spent running, paused time left out.
-	pub(crate) active_time: Duration,
+	pub active_time: Duration,
 }
 
 /// A top-level item as planned, announced before anything is created so a caller can clean up
 /// even after an abrupt end.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedTopLevelItem {
-	pub(crate) request: usize,
-	pub(crate) source_uuid: Uuid,
-	pub(crate) dest_uuid: Uuid,
-	pub(crate) dest_parent: Uuid,
-	pub(crate) name: String,
-	pub(crate) is_dir: bool,
+pub struct PlannedTopLevelItem {
+	pub request: usize,
+	pub source_uuid: Uuid,
+	pub dest_uuid: Uuid,
+	pub dest_parent: Uuid,
+	pub name: String,
+	pub is_dir: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CopiedTopLevel {
-	pub(crate) request: usize,
-	pub(crate) source_uuid: Uuid,
-	pub(crate) item: NonRootItemType<'static, Normal>,
+pub struct CopiedTopLevel {
+	pub request: usize,
+	pub source_uuid: Uuid,
+	pub item: NonRootItemType<'static, Normal>,
 }
 
 /// The outcome of a copy, whether it completed, was cancelled or failed.
 #[derive(Debug)]
-pub(crate) struct CopyReport<D> {
+pub struct CopyReport<D> {
 	/// Top-level items created, in creation order.
-	pub(crate) top_level: Vec<CopiedTopLevel>,
-	pub(crate) failures: Vec<CopyFailure<D>>,
-	pub(crate) skipped: Vec<SkippedEntry>,
-	pub(crate) renamed: Vec<RenamedEntry>,
-	pub(crate) totals: PlanTotals,
-	pub(crate) counts: CopyCounts,
+	pub top_level: Vec<CopiedTopLevel>,
+	pub failures: Vec<CopyFailure<D>>,
+	pub skipped: Vec<SkippedEntry>,
+	pub renamed: Vec<RenamedEntry>,
+	pub totals: PlanTotals,
+	pub counts: CopyCounts,
 }
 
 impl<D> Default for CopyReport<D> {
@@ -225,10 +225,24 @@ impl<D> Default for CopyReport<D> {
 }
 
 /// Receives a copy's progress. All calls come from one [`Reporter`], in order.
-pub(crate) trait CopyCallback: MaybeSendSync + 'static {
+pub trait CopyCallback: MaybeSendSync + 'static {
 	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>);
 	fn top_level_created(&self, item: CopiedTopLevel);
 	fn update(&self, update: CopyUpdate);
+}
+
+impl<T: CopyCallback + ?Sized> CopyCallback for std::sync::Arc<T> {
+	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+		(**self).top_level_planned(items);
+	}
+
+	fn top_level_created(&self, item: CopiedTopLevel) {
+		(**self).top_level_created(item);
+	}
+
+	fn update(&self, update: CopyUpdate) {
+		(**self).update(update);
+	}
 }
 
 struct State {

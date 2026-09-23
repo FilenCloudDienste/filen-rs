@@ -74,8 +74,8 @@ const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
 #[derive(Debug)]
 pub(crate) enum CreatedDir {
 	Created(RemoteDirectory),
-	/// The server already had a directory with that name there and returned its uuid instead.
-	Merged(Uuid),
+	/// The server already had a directory with that name there and returned it instead.
+	Merged,
 }
 
 /// What a new file is created as.
@@ -151,10 +151,10 @@ pub(crate) trait CopyBackend: MaybeSendSync + 'static {
 
 /// A copy's report plus how it ended.
 #[derive(Debug)]
-pub(crate) struct CopyOutcome<D> {
-	pub(crate) report: CopyReport<D>,
+pub struct CopyOutcome<D> {
+	pub report: CopyReport<D>,
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
-	pub(crate) result: Result<(), Error>,
+	pub result: Result<(), Error>,
 }
 
 /// Errors after which nothing else can succeed either.
@@ -747,7 +747,7 @@ async fn create_dir<B: CopyBackend>(
 				dir = Some(created);
 				break;
 			}
-			CreatedDir::Merged(_) if top_level => {
+			CreatedDir::Merged if top_level => {
 				// Someone created the same name at the destination after it was listed: keep
 				// both by taking the next free name.
 				let taken = taken.get_or_insert_with(TakenNames::default);
@@ -756,7 +756,7 @@ async fn create_dir<B: CopyBackend>(
 					.allocate(name.as_ref(), true)
 					.map_err(|e| (stage, e.into()))?;
 			}
-			CreatedDir::Merged(_) => {
+			CreatedDir::Merged => {
 				return Err((
 					stage,
 					Error::custom(
@@ -1235,7 +1235,7 @@ mod tests {
 				return Err(Error::custom(ErrorKind::Server, "create failed"));
 			}
 			if self.merge_once.lock().unwrap().remove(name.as_ref()) {
-				return Ok(CreatedDir::Merged(Uuid::new_v4()));
+				return Ok(CreatedDir::Merged);
 			}
 			if !self.known_dirs.lock().unwrap().contains(&parent) {
 				self.log().out_of_order_dirs.push(name.as_ref().to_owned());
@@ -1367,7 +1367,7 @@ mod tests {
 		updates: Mutex<Vec<CopyUpdate>>,
 	}
 
-	impl CopyCallback for Arc<Recorder> {
+	impl CopyCallback for Recorder {
 		fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 			self.planned.lock().unwrap().extend(items);
 		}
