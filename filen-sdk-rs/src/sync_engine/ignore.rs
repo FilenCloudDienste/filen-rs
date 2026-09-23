@@ -17,6 +17,7 @@
 //! [`IgnoreRules::ignored_root`].
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeSet, HashMap},
 	fmt,
 	path::{Path, PathBuf},
@@ -35,6 +36,7 @@ use super::{
 	baseline::NodeKind,
 	plan::{RemoteNode, RemoteView},
 	scan::collision_key,
+	side::{Nodes, NodesAt},
 };
 use crate::Error;
 
@@ -439,10 +441,10 @@ where
 	// pass offers the resident index AND the paths its delta moved, and a rule file that moved is
 	// in both — without the file being read, reported or blocked twice.
 	let named: BTreeSet<String> = candidates.paths.into_iter().collect();
-	let mut candidates: Vec<(&str, &RemoteNode)> = named
+	let mut candidates: Vec<(&str, Cow<'_, RemoteNode>)> = named
 		.iter()
 		.filter_map(|rel_path| {
-			let node = view.nodes.get(rel_path)?;
+			let node = view.nodes.at(rel_path)?;
 			(node.kind == NodeKind::File).then_some((rule_file_dir(rel_path)?, node))
 		})
 		.collect();
@@ -454,7 +456,7 @@ where
 		let origin = Origin::File { dir };
 		let body = match cached.get(&node.remote_uuid) {
 			Some(body) => Arc::clone(body),
-			None => match fetch_rule_file(node, &mut fetch).await {
+			None => match fetch_rule_file(&node, &mut fetch).await {
 				Ok(body) => body,
 				Err(reason) => {
 					out.blocked.insert(dir.to_owned());
@@ -545,7 +547,7 @@ pub(crate) fn rule_file_paths(view: &RemoteView) -> Vec<String> {
 	view.nodes
 		.iter()
 		.filter(|(rel_path, node)| node.kind == NodeKind::File && rule_file_dir(rel_path).is_some())
-		.map(|(rel_path, _)| rel_path.clone())
+		.map(|(rel_path, _)| rel_path.into_owned())
 		.collect()
 }
 
@@ -949,10 +951,10 @@ mod tests {
 		bodies: &HashMap<&str, Vec<u8>>,
 		cached: &HashMap<Uuid, Arc<str>>,
 	) -> (RemoteRules, Vec<String>) {
-		let paths: HashMap<Uuid, &str> = view
+		let paths: HashMap<Uuid, String> = view
 			.nodes
-			.values()
-			.map(|node| (node.remote_uuid, node.rel_path.as_str()))
+			.iter()
+			.map(|(_, node)| (node.remote_uuid, node.rel_path.clone()))
 			.collect();
 		let mut fetched = Vec::new();
 		let rules = load_remote_rules(
@@ -966,7 +968,7 @@ mod tests {
 			|dir| tracked.contains(&dir),
 			cached,
 			|uuid| {
-				let path = paths[&uuid];
+				let path = paths[&uuid].as_str();
 				fetched.push(path.to_owned());
 				std::future::ready(
 					bodies

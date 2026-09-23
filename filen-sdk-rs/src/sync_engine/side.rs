@@ -19,7 +19,10 @@
 
 use std::{borrow::Cow, collections::HashMap};
 
-use super::{plan::is_under, tree::at_or_under_folded};
+use super::{
+	plan::{is_under, moved_path},
+	tree::at_or_under_folded,
+};
 
 /// One side of a pass, addressed by path.
 pub(super) trait NodesAt {
@@ -98,11 +101,252 @@ impl<V: Clone> Nodes for HashMap<String, V> {
 	}
 }
 
+/// One side of a pass, as the pass OWNS it: [`RemoteView::nodes`](super::plan::RemoteView::nodes),
+/// [`LocalScan::nodes`](super::scan::LocalScan::nodes) and the two halves of
+/// [`Derived`](super::derive::Derived).
+///
+/// Today it is the path-keyed map it replaces and nothing else, and it exists for what comes
+/// next: every read goes through [`NodesAt`] / [`Nodes`] and every EDIT is a method here, so a
+/// second backing — one that derives its nodes out of the resident baseline instead of holding
+/// them — can be added behind this one API without a consumer changing again.
+///
+/// Nothing hands out a borrow of a stored node (`&T`) or of a stored path (`&str`), which is the
+/// whole discipline: a backing that builds a node on demand has nothing to lend. Reads come back
+/// as [`Cow`], so a materialized side still lends what it holds and allocates nothing.
+#[derive(Clone)]
+pub(crate) struct Side<T> {
+	nodes: HashMap<String, T>,
+}
+
+impl<T> Side<T> {
+	/// A side sized for `items` nodes — a map that never grows is one that never holds its old
+	/// table and its new one at once.
+	pub(crate) fn with_capacity(items: usize) -> Self {
+		Self {
+			nodes: HashMap::with_capacity(items),
+		}
+	}
+
+	/// How many nodes this side has room for. Only the probe's memory accounting asks, and only
+	/// a materialized side can answer with a table's capacity — which is why it is gated with the
+	/// probe rather than sitting in a read trait every backing owes an answer to.
+	#[cfg(feature = "bench-internals")]
+	pub(crate) fn capacity(&self) -> usize {
+		self.nodes.capacity()
+	}
+
+	/// Put `node` at `path`, returning whatever was there.
+	pub(crate) fn insert(&mut self, path: String, node: T) -> Option<T> {
+		self.nodes.insert(path, node)
+	}
+
+	/// Take the node at `path` out of this side, returning it.
+	pub(crate) fn remove(&mut self, path: &str) -> Option<T> {
+		self.nodes.remove(path)
+	}
+
+	/// Keep the nodes `keep` answers `true` for.
+	///
+	/// A WHOLE-side edit by construction — it asks about every node — so a backing that derives
+	/// its nodes pays the tree for it, exactly as [`Nodes`] says in its own docs. A caller that
+	/// knows which paths it is about should say so instead ([`remove`](Self::remove)).
+	pub(crate) fn retain(&mut self, mut keep: impl FnMut(&str, &T) -> bool) {
+		self.nodes.retain(|path, node| keep(path, node));
+	}
+
+	/// Every path STRICTLY under `dir` (`dir/...`), with no node built.
+	///
+	/// Owned and collected rather than borrowed and lazy because every caller is about to MUTATE
+	/// this side with the answer — drop the subtree, re-key it, trash it — and the walk cannot
+	/// still be borrowing it by then.
+	pub(crate) fn subtree_paths(&self, dir: &str) -> Vec<String> {
+		self.nodes
+			.keys()
+			.filter(|path| is_under(path, dir))
+			.cloned()
+			.collect()
+	}
+
+	/// Move the subtree at `from` onto `to` — the node at `from` itself included — telling each
+	/// node its new path through `set_path`.
+	///
+	/// A method rather than a walk at the caller because the walk is the part a derived backing
+	/// would do differently: re-keying is one edit stated in terms of two paths, and a backing
+	/// that keeps its nodes by id can record it without visiting a node at all.
+	pub(crate) fn rekey_subtree(&mut self, from: &str, to: &str, set_path: impl Fn(&mut T, &str)) {
+		let moving: Vec<(String, String)> = self
+			.nodes
+			.keys()
+			.filter_map(|key| Some((key.clone(), moved_path(key, from, to)?)))
+			.collect();
+		for (old, new) in moving {
+			let Some(mut node) = self.nodes.remove(&old) else {
+				continue;
+			};
+			set_path(&mut node, &new);
+			self.nodes.insert(new, node);
+		}
+	}
+}
+
+impl<T> Default for Side<T> {
+	fn default() -> Self {
+		Self {
+			nodes: HashMap::new(),
+		}
+	}
+}
+
+impl<T> From<HashMap<String, T>> for Side<T> {
+	fn from(nodes: HashMap<String, T>) -> Self {
+		Self { nodes }
+	}
+}
+
+impl<T> FromIterator<(String, T)> for Side<T> {
+	fn from_iter<I: IntoIterator<Item = (String, T)>>(nodes: I) -> Self {
+		Self {
+			nodes: nodes.into_iter().collect(),
+		}
+	}
+}
+
+/// This side's nodes, taken by value: the one read that consumes rather than borrows, so a
+/// backing that derives its nodes hands over what it built instead of cloning it out from under
+/// itself.
+impl<T> IntoIterator for Side<T> {
+	type Item = (String, T);
+	type IntoIter = std::collections::hash_map::IntoIter<String, T>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.nodes.into_iter()
+	}
+}
+
+impl<T> Extend<(String, T)> for Side<T> {
+	fn extend<I: IntoIterator<Item = (String, T)>>(&mut self, nodes: I) {
+		self.nodes.extend(nodes);
+	}
+}
+
+/// Node for node, whatever backs either side.
+impl<T: Clone + PartialEq> PartialEq for Side<T> {
+	fn eq(&self, other: &Self) -> bool {
+		Nodes::len(self) == Nodes::len(other)
+			&& self
+				.iter()
+				.all(|(path, node)| other.at(&path).is_some_and(|theirs| *theirs == *node))
+	}
+}
+
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Side<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_map().entries(Nodes::iter(self)).finish()
+	}
+}
+
+impl<T: Clone> NodesAt for Side<T> {
+	type Node = T;
+
+	fn at(&self, path: &str) -> Option<Cow<'_, T>> {
+		self.nodes.at(path)
+	}
+
+	fn holds(&self, path: &str) -> bool {
+		self.nodes.holds(path)
+	}
+
+	fn occupied(&self, path: &str) -> bool {
+		self.nodes.occupied(path)
+	}
+}
+
+impl<T: Clone> Nodes for Side<T> {
+	fn len(&self) -> usize {
+		Nodes::len(&self.nodes)
+	}
+
+	fn is_empty(&self) -> bool {
+		Nodes::is_empty(&self.nodes)
+	}
+
+	fn paths(&self) -> impl Iterator<Item = Cow<'_, str>> {
+		self.nodes.paths()
+	}
+
+	fn iter(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, T>)> {
+		Nodes::iter(&self.nodes)
+	}
+
+	fn under(&self, dir: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, T>)> {
+		self.nodes.under(dir)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	/// The map shape both sides are, with a node type that is nothing but a marker.
+	/// The owning shape, over the same map: what it holds is what the traits answer for.
+	#[test]
+	fn a_side_is_the_map_it_holds() {
+		let mut side: Side<u32> = Side::with_capacity(4);
+		assert!(Nodes::is_empty(&side));
+		side.insert("docs".to_owned(), 0);
+		side.extend([("docs/a.txt".to_owned(), 1), ("docsx".to_owned(), 2)]);
+
+		assert_eq!(Nodes::len(&side), 3);
+		assert_eq!(side.at("docs/a.txt").as_deref(), Some(&1));
+		assert!(side.holds("docs"));
+		assert!(side.occupied("DOCS/A.TXT"));
+		assert_eq!(side.subtree_paths("docs"), vec!["docs/a.txt".to_owned()]);
+		assert_eq!(side.remove("docsx"), Some(2));
+		assert_eq!(side.remove("docsx"), None);
+
+		side.retain(|path, _| path != "docs/a.txt");
+		assert_eq!(side.paths().collect::<Vec<_>>(), vec!["docs"]);
+	}
+
+	/// Re-keying takes the subtree AND the directory itself, and tells each node where it landed.
+	#[test]
+	fn rekeying_a_subtree_moves_the_root_with_it() {
+		let mut side: Side<String> = ["docs", "docs/a.txt", "docs/deep/b.txt", "docsx", "other"]
+			.into_iter()
+			.map(|path| (path.to_owned(), path.to_owned()))
+			.collect();
+
+		side.rekey_subtree("docs", "notes", |node, path| *node = path.to_owned());
+
+		let mut paths: Vec<String> = side.paths().map(Cow::into_owned).collect();
+		paths.sort();
+		assert_eq!(
+			paths,
+			vec!["docsx", "notes", "notes/a.txt", "notes/deep/b.txt", "other"]
+		);
+		assert!(
+			side.iter().all(|(path, node)| *node == *path),
+			"every moved node was told its new path"
+		);
+	}
+
+	/// Two sides are equal when they hold the same nodes at the same paths — the property the
+	/// probe compares a streamed view against a materialized one with.
+	#[test]
+	fn sides_compare_node_for_node() {
+		let of = |paths: &[&str]| -> Side<u32> {
+			paths
+				.iter()
+				.enumerate()
+				.map(|(at, path)| ((*path).to_owned(), at as u32))
+				.collect()
+		};
+
+		assert_eq!(of(&["a", "b"]), of(&["a", "b"]));
+		assert_ne!(of(&["a", "b"]), of(&["a"]));
+		assert_ne!(of(&["a", "b"]), of(&["a", "c"]));
+	}
+
 	fn map(paths: &[&str]) -> HashMap<String, u32> {
 		paths
 			.iter()
