@@ -17,7 +17,7 @@ use crate::{
 	},
 	js::{
 		AnyDirWithContext, AnyFile, AnyLinkedDirWithContext, AnyNormalDir, AnySharedDirWithContext,
-		DirByCategoryWithContext, NonRootItemTagged,
+		DirByCategoryWithContext, NonRootNormalItemTagged,
 	},
 };
 
@@ -171,7 +171,7 @@ pub struct CopiedTopLevelItem {
 	/// Index of the item (or entry) in the call.
 	pub request: u64,
 	pub source_uuid: Uuid,
-	pub item: NonRootItemTagged,
+	pub item: NonRootNormalItemTagged,
 }
 
 #[js_type(export, no_deser)]
