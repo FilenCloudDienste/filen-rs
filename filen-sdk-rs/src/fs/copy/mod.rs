@@ -4,7 +4,7 @@
 
 mod backend;
 mod client_impl;
-mod control;
+pub(crate) mod control;
 pub(crate) mod engine;
 mod naming;
 mod plan;

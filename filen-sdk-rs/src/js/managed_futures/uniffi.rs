@@ -61,6 +61,11 @@ mod pausable {
 		{
 			runtime::do_with_pause_channel_on_commander((self.sender, self.receiver), fut_builder)
 		}
+
+		/// The pause requests, for a job that pauses itself instead of being stopped from polling.
+		pub(super) fn receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+			self.receiver.clone()
+		}
 	}
 }
 
@@ -182,7 +187,15 @@ mod managed {
 	use pin_project_lite::pin_project;
 	use std::{sync::Arc, task::Poll};
 
-	use crate::{Error, error::AbortedError, runtime::CommanderFutHandle};
+	use crate::{
+		Error,
+		error::AbortedError,
+		fs::copy::{
+			JobControl,
+			control::cancel_grace::{CANCEL_GRACE, CancelOnAbort, with_cancel_grace},
+		},
+		runtime::{self, CommanderFutHandle},
+	};
 
 	use super::{abortable::*, pausable::*};
 
@@ -216,6 +229,32 @@ mod managed {
 				main_fut: Some(pausable),
 				abort_fut,
 			}
+		}
+
+		/// Runs a job that observes pause and cancel itself through its [`JobControl`], so a
+		/// paused job can release what it holds and a cancelled one can report what it did.
+		/// An abort becomes a cancel; a job still running [`CANCEL_GRACE`] after that is dropped.
+		#[cfg_attr(not(test), expect(dead_code, reason = "used by the copy bindings"))]
+		pub(crate) fn into_js_managed_commander_job<F, Fut, T>(
+			self,
+			job: F,
+		) -> CancelOnAbort<CommanderFutHandle<Result<T, Error>>, impl Future<Output = AbortedError>>
+		where
+			F: FnOnce(JobControl) -> Fut + Send + 'static,
+			Fut: Future<Output = Result<T, Error>> + Send + 'static,
+			T: Send + 'static,
+		{
+			let abort_fut = match self.abort_signal {
+				Some(signal_arc) => Arc::unwrap_or_clone(signal_arc).into_future(),
+				None => AbortSignalFuture::None,
+			};
+			let pause = self.pause_signal.map(|signal| signal.receiver());
+			let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+			let handle = runtime::do_on_commander(move || {
+				let control = JobControl::new(pause, Some(cancel_rx.clone()));
+				with_cancel_grace(job(control), cancel_rx, CANCEL_GRACE)
+			});
+			CancelOnAbort::new(handle, abort_fut, cancel)
 		}
 	}
 
@@ -258,6 +297,57 @@ mod managed {
 			} else {
 				Poll::Pending
 			}
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::time::Duration;
+
+		use super::*;
+
+		// The outer future is driven by a plain executor, as the foreign one would drive it.
+		#[test]
+		fn pause_and_abort_reach_the_job_as_requests_it_observes() {
+			let controller = ManagedAbortController::new();
+			let pause = Arc::new(PauseSignal::new());
+			let managed = ManagedFuture {
+				abort_signal: Some(Arc::new(controller.signal())),
+				pause_signal: Some(pause.clone()),
+			};
+			let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+			let job = managed.into_js_managed_commander_job(move |control| async move {
+				control.pause_changed(false).await;
+				paused_tx.send(()).unwrap();
+				control.stopping().await;
+				Ok::<_, Error>(control.is_cancelled())
+			});
+
+			pause.pause();
+			paused_rx
+				.recv_timeout(Duration::from_secs(10))
+				.expect("the job saw the pause request");
+			controller.abort();
+
+			let cancelled =
+				futures::executor::block_on(job).expect("the job ends with its own result");
+			assert!(cancelled, "the abort reached the job as a cancel");
+		}
+
+		#[test]
+		fn a_job_without_signals_runs_to_completion() {
+			let managed = ManagedFuture {
+				abort_signal: None,
+				pause_signal: None,
+			};
+			let job = managed.into_js_managed_commander_job(|control| async move {
+				control
+					.checkpoint()
+					.await
+					.map_err(|_| Error::custom(crate::ErrorKind::Cancelled, "stopped"))?;
+				Ok::<_, Error>(7)
+			});
+			assert_eq!(futures::executor::block_on(job).unwrap(), 7);
 		}
 	}
 }

@@ -5,7 +5,13 @@
 //! job can finish (or drop) its in-flight chunks and release their memory reservations before
 //! it parks.
 
-use std::{future::Future, sync::Arc};
+use std::{
+	future::Future,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::watch;
@@ -36,10 +42,13 @@ struct Inner {
 	cancel: Option<watch::Receiver<bool>>,
 	/// Internal stop, for failures that end the whole job (e.g. no storage left).
 	stop: watch::Sender<bool>,
+	/// Set once a cancel has been seen: a cancel cannot be taken back.
+	cancelled: AtomicBool,
 }
 
 /// Shared by all of a job's work. A dropped pause sender counts as "not paused" and a dropped
 /// cancel sender as "not cancelled": losing a controller must never pause or cancel the job.
+/// Once seen, a cancel stays in effect even if the sender goes back to `false`.
 #[derive(Debug, Clone)]
 pub struct JobControl {
 	inner: Arc<Inner>,
@@ -64,12 +73,20 @@ impl JobControl {
 				pause,
 				cancel,
 				stop,
+				cancelled: AtomicBool::new(false),
 			}),
 		}
 	}
 
 	pub(crate) fn is_cancelled(&self) -> bool {
-		self.inner.cancel.as_ref().is_some_and(|c| *c.borrow())
+		if self.inner.cancelled.load(Ordering::SeqCst) {
+			return true;
+		}
+		let cancelled = self.inner.cancel.as_ref().is_some_and(|c| *c.borrow());
+		if cancelled {
+			self.inner.cancelled.store(true, Ordering::SeqCst);
+		}
+		cancelled
 	}
 
 	/// Ends the job from within, e.g. when the account runs out of storage.
@@ -82,11 +99,18 @@ impl JobControl {
 	}
 
 	pub(crate) fn is_pause_requested(&self) -> bool {
-		self.inner.pause.as_ref().is_some_and(|p| *p.borrow())
+		// the last value outlives a dropped sender, which must count as not paused
+		self.inner
+			.pause
+			.as_ref()
+			.is_some_and(|p| p.has_changed().is_ok() && *p.borrow())
 	}
 
 	/// Resolves once the job is cancelled or stopped; never, if neither can happen.
 	pub(crate) async fn stopping(&self) {
+		if self.is_stopping() {
+			return;
+		}
 		let mut stop = self.inner.stop.subscribe();
 		let stopped = async move {
 			// the sender lives in `inner`, which outlives this future
@@ -94,10 +118,12 @@ impl JobControl {
 		};
 		match self.inner.cancel.clone() {
 			Some(mut cancel) => {
+				let latch = &self.inner.cancelled;
 				let cancelled = async move {
 					if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
 						std::future::pending::<()>().await;
 					}
+					latch.store(true, Ordering::SeqCst);
 				};
 				tokio::select! {
 					() = cancelled => {},
@@ -112,8 +138,9 @@ impl JobControl {
 	pub(crate) async fn pause_changed(&self, paused: bool) {
 		match self.inner.pause.clone() {
 			Some(mut pause) => {
-				// a dropped sender leaves the job unpaused for good
-				if pause.wait_for(|current| *current != paused).await.is_err() && !paused {
+				let _ = pause.wait_for(|current| *current != paused).await;
+				// a dropped sender leaves the job unpaused for good, whatever its last value
+				if pause.has_changed().is_err() && !paused {
 					std::future::pending::<()>().await;
 				}
 			}
@@ -151,6 +178,160 @@ impl JobControl {
 			biased;
 			() = self.stopping() => Err(Stopped),
 			out = fut => Ok(out),
+		}
+	}
+}
+
+/// Adapts the bindings' abort signal to a job's cooperative cancel; only builds with bindings
+/// (and the tests) use it.
+#[cfg(any(feature = "uniffi", feature = "wasm-full", test))]
+pub(crate) mod cancel_grace {
+	use std::{
+		future::Future,
+		pin::Pin,
+		task::{Context, Poll},
+		time::Duration,
+	};
+
+	use pin_project_lite::pin_project;
+	use tokio::sync::watch;
+
+	use crate::{Error, ErrorKind};
+
+	/// How long a cancelled job may take to finish what cannot be interrupted (a directory create or
+	/// file registration already sent) and report it, before it is dropped as is.
+	#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+	pub(crate) const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+	/// Runs `job`, ending it with [`ErrorKind::Cancelled`] if it has not finished `grace` after
+	/// `cancel` turned `true`. The job sees the same cancel through its
+	/// [`JobControl`](super::JobControl) and normally ends on its own well within the grace period.
+	pub(crate) async fn with_cancel_grace<T>(
+		job: impl Future<Output = Result<T, Error>>,
+		mut cancel: watch::Receiver<bool>,
+		grace: Duration,
+	) -> Result<T, Error> {
+		let deadline = async move {
+			if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+				std::future::pending::<()>().await;
+			}
+			crate::util::sleep(grace).await;
+		};
+		tokio::select! {
+			biased;
+			result = job => result,
+			() = deadline => Err(Error::custom(
+				ErrorKind::Cancelled,
+				"cancelled job did not stop within its grace period",
+			)),
+		}
+	}
+
+	pin_project! {
+		/// Resolves with `job`, turning `abort` resolving into a cooperative cancel: it sets `cancel`
+		/// and keeps waiting for the job, which then winds down (see [`with_cancel_grace`]).
+		pub(crate) struct CancelOnAbort<J, A> {
+			#[pin]
+			job: J,
+			#[pin]
+			abort: A,
+			cancel: watch::Sender<bool>,
+			aborted: bool,
+		}
+	}
+
+	impl<J, A> CancelOnAbort<J, A> {
+		pub(crate) fn new(job: J, abort: A, cancel: watch::Sender<bool>) -> Self {
+			Self {
+				job,
+				abort,
+				cancel,
+				aborted: false,
+			}
+		}
+	}
+
+	impl<J: Future, A: Future> Future for CancelOnAbort<J, A> {
+		type Output = J::Output;
+
+		fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+			let this = self.project();
+			// an abort future must not be polled again once it has resolved
+			if !*this.aborted && this.abort.poll(cx).is_ready() {
+				*this.aborted = true;
+				this.cancel.send_replace(true);
+			}
+			this.job.poll(cx)
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		};
+
+		use super::*;
+		use crate::fs::copy::control::JobControl;
+
+		struct SetOnDrop(Arc<AtomicBool>);
+		impl Drop for SetOnDrop {
+			fn drop(&mut self) {
+				self.0.store(true, Ordering::SeqCst);
+			}
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn a_cancelled_job_that_finishes_in_time_keeps_its_result() {
+			let (cancel, cancel_rx) = watch::channel(false);
+			let job = async {
+				tokio::time::sleep(Duration::from_secs(2)).await;
+				Ok::<_, Error>("finished")
+			};
+			cancel.send_replace(true);
+			let result = with_cancel_grace(job, cancel_rx, Duration::from_secs(5)).await;
+			assert_eq!(result.unwrap(), "finished");
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn a_cancelled_job_is_dropped_after_its_grace_period() {
+			let (cancel, cancel_rx) = watch::channel(false);
+			let dropped = Arc::new(AtomicBool::new(false));
+			let marker = SetOnDrop(dropped.clone());
+			let job = async move {
+				let _marker = marker;
+				std::future::pending::<Result<(), Error>>().await
+			};
+			let run = tokio::spawn(with_cancel_grace(job, cancel_rx, Duration::from_secs(5)));
+			tokio::time::sleep(Duration::from_secs(60)).await;
+			assert!(!run.is_finished(), "no deadline without a cancel");
+			cancel.send_replace(true);
+			tokio::time::sleep(Duration::from_secs(4)).await;
+			assert!(!run.is_finished(), "the job gets its grace period");
+			let result = run.await.unwrap();
+			assert_eq!(result.unwrap_err().kind(), ErrorKind::Cancelled);
+			assert!(dropped.load(Ordering::SeqCst));
+		}
+
+		#[tokio::test(start_paused = true)]
+		async fn an_abort_becomes_a_cancel_the_job_sees() {
+			let (cancel, cancel_rx) = watch::channel(false);
+			let control = JobControl::new(None, Some(cancel_rx));
+			let (abort, abort_rx) = tokio::sync::oneshot::channel::<()>();
+			let job = {
+				let control = control.clone();
+				async move {
+					control.stopping().await;
+					Ok::<_, Error>("wound down")
+				}
+			};
+			let run = tokio::spawn(CancelOnAbort::new(job, abort_rx, cancel));
+			tokio::time::sleep(Duration::from_secs(1)).await;
+			assert!(!run.is_finished());
+			abort.send(()).unwrap();
+			assert_eq!(run.await.unwrap().unwrap(), "wound down");
+			assert!(control.is_cancelled());
 		}
 	}
 }
@@ -211,10 +392,7 @@ impl<T> Drop for JobTasks<T> {
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		sync::atomic::{AtomicBool, Ordering},
-		time::Duration,
-	};
+	use std::time::Duration;
 
 	use super::*;
 
@@ -296,6 +474,36 @@ mod tests {
 		});
 		drop(pause);
 		resumed.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_pause_sender_dropped_while_paused_resumes_the_job() {
+		let (pause, _cancel, control) = controlled();
+		pause.send_replace(true);
+		assert!(control.is_pause_requested());
+		drop(pause);
+		assert!(
+			!control.is_pause_requested(),
+			"a dropped pause sender is not a pause"
+		);
+		assert_eq!(control.checkpoint().await, Ok(()));
+		// a driver that last saw "not paused" must not be woken by the stale `true`
+		assert!(
+			futures::poll!(std::pin::pin!(control.pause_changed(false))).is_pending(),
+			"a dropped pause sender is no pause change"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_cancel_cannot_be_taken_back() {
+		let (_pause, cancel, control) = controlled();
+		cancel.send_replace(true);
+		assert!(control.is_cancelled());
+		cancel.send_replace(false);
+		assert!(control.is_cancelled());
+		assert!(control.is_stopping());
+		assert_eq!(control.checkpoint().await, Err(Stopped));
+		control.stopping().await;
 	}
 
 	#[tokio::test]

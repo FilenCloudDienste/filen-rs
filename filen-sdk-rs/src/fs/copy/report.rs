@@ -342,7 +342,7 @@ impl Reporter {
 		state.changed = false;
 		self.callback.update(CopyUpdate {
 			phase: state.phase,
-			pausing: state.pause_requested && !state.paused,
+			pausing: state.pause_requested && !state.paused && !state.cancelling,
 			paused: state.paused,
 			cancelling: state.cancelling,
 			scan: state.scan,
@@ -424,13 +424,18 @@ impl Reporter {
 		});
 	}
 
+	/// A cancel overrides a pause: the job winds down instead of pausing.
 	pub(crate) fn set_cancelling(&self) {
-		self.with_state(|state| {
-			if !state.cancelling {
-				state.cancelling = true;
-				state.batcher.mark_urgent();
-			}
-		});
+		let now = self.now();
+		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		if !state.cancelling {
+			state.cancelling = true;
+			state.batcher.mark_urgent();
+		}
+		self.update_paused(&mut state, now);
+		if state.batcher.is_due(now, state.changed) {
+			self.flush(&mut state, now);
+		}
 	}
 
 	pub(crate) fn set_scan(&self, scan: ScanProgress) {
@@ -599,6 +604,9 @@ impl Reporter {
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		state.phase = phase;
 		state.active.clear();
+		// a finished job is neither pausing nor paused, whatever was last requested
+		state.pause_requested = false;
+		state.paused = false;
 		state.clock.pause(now);
 		self.flush(&mut state, now);
 	}

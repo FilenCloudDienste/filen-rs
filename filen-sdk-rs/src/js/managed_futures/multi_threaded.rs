@@ -32,6 +32,23 @@ mod pausable {
 	pub struct PauseSignal(#[serde(with = "serde_wasm_bindgen::preserve")] JsValue);
 
 	impl PauseSignal {
+		/// The Rust side of the signal; `None` when the caller passed none.
+		fn rust_signal(&self) -> Result<Option<PauseSignalRust>, Error> {
+			if self.0.is_undefined() {
+				return Ok(None);
+			}
+			let pause_signal = PauseSignalRust::get_ref_from_js_value(&self.0).map_err(|e| {
+				let ty = JsValue::dyn_ref::<js_sys::JsString>(&e.js_typeof())
+					.map(|s| format!("{}", s))
+					.unwrap_or_else(|| "unknown".to_string());
+				Error::custom(
+					ErrorKind::Conversion,
+					format!("expected PauseSignal, got {}", ty),
+				)
+			})?;
+			Ok(Some(pause_signal.clone()))
+		}
+
 		pub(super) fn into_pausable_on_commander<F, Fut>(
 			self,
 			fut_builder: F,
@@ -41,24 +58,20 @@ mod pausable {
 			Fut: Future + 'static,
 			Fut::Output: Send + 'static,
 		{
-			if self.0.is_undefined() {
-				Ok(runtime::do_on_commander(fut_builder))
-			} else {
-				let pause_signal =
-					PauseSignalRust::get_ref_from_js_value(&self.0).map_err(|e| {
-						let ty = JsValue::dyn_ref::<js_sys::JsString>(&e.js_typeof())
-							.map(|s| format!("{}", s))
-							.unwrap_or_else(|| "unknown".to_string());
-						Error::custom(
-							ErrorKind::Conversion,
-							format!("expected PauseSignal, got {}", ty),
-						)
-					})?;
-				Ok(runtime::do_with_pause_channel_on_commander(
-					(pause_signal.sender.clone(), pause_signal.receiver.clone()),
+			Ok(match self.rust_signal()? {
+				Some(signal) => runtime::do_with_pause_channel_on_commander(
+					(signal.sender, signal.receiver),
 					fut_builder,
-				))
-			}
+				),
+				None => runtime::do_on_commander(fut_builder),
+			})
+		}
+
+		/// The pause requests, for a job that pauses itself instead of being stopped from polling.
+		pub(super) fn into_receiver(
+			self,
+		) -> Result<Option<tokio::sync::watch::Receiver<bool>>, Error> {
+			Ok(self.rust_signal()?.map(|signal| signal.receiver))
 		}
 	}
 
@@ -353,7 +366,15 @@ mod managed {
 	use tsify::Tsify;
 	use wasm_bindgen::prelude::wasm_bindgen;
 
-	use crate::{Error, error::AbortedError, runtime::CommanderFutHandle};
+	use crate::{
+		Error,
+		error::AbortedError,
+		fs::copy::{
+			JobControl,
+			control::cancel_grace::{CANCEL_GRACE, CancelOnAbort, with_cancel_grace},
+		},
+		runtime::{self, CommanderFutHandle},
+	};
 
 	use super::{abortable::*, pausable::*};
 
@@ -386,6 +407,32 @@ mod managed {
 				main_fut: Some(pausable),
 				abort_fut,
 			})
+		}
+
+		/// Runs a job that observes pause and cancel itself through its [`JobControl`], so a
+		/// paused job can release what it holds and a cancelled one can report what it did.
+		/// An abort becomes a cancel; a job still running [`CANCEL_GRACE`] after that is dropped.
+		#[cfg_attr(not(test), expect(dead_code, reason = "used by the copy bindings"))]
+		pub(crate) fn into_js_managed_commander_job<F, Fut, T>(
+			self,
+			job: F,
+		) -> Result<
+			CancelOnAbort<CommanderFutHandle<Result<T, Error>>, impl Future<Output = AbortedError>>,
+			Error,
+		>
+		where
+			F: FnOnce(JobControl) -> Fut + Send + 'static,
+			Fut: Future<Output = Result<T, Error>> + 'static,
+			T: Send + 'static,
+		{
+			let abort_fut = self.abort_signal.into_future()?;
+			let pause = self.pause_signal.into_receiver()?;
+			let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+			let handle = runtime::do_on_commander(move || {
+				let control = JobControl::new(pause, Some(cancel_rx.clone()));
+				with_cancel_grace(job(control), cancel_rx, CANCEL_GRACE)
+			});
+			Ok(CancelOnAbort::new(handle, abort_fut, cancel))
 		}
 	}
 

@@ -1797,7 +1797,7 @@ mod tests {
 		}
 		let backend = Arc::new(backend);
 		let (running, _recorder, reporter) = start(&backend, plan, JobControl::default());
-		let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+		let outcome = tokio::time::timeout(Duration::from_secs(30), running)
 			.await
 			.expect("the copy must not deadlock")
 			.unwrap();
@@ -1963,6 +1963,77 @@ mod tests {
 		pause.send_replace(false);
 		running.await.unwrap().result.unwrap();
 		assert_eq!(backend.log().finished.len(), 3);
+	}
+
+	// Real time on several threads, so a driver spinning on the stale pause fails the timeout
+	// instead of starving the test.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
+		let destination = Uuid::new_v4();
+		let sources: Vec<_> = (0..3)
+			.map(|i| source_file(&format!("f{i}"), 6 * CHUNK_SIZE_U64))
+			.collect();
+		let plan = plan(
+			destination,
+			sources.iter().cloned().map(PlanSource::File).collect(),
+		);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (pause, _cancel, control) = controls();
+		let (running, recorder, reporter) = start(&backend, plan, control);
+
+		wait_until("some chunks are uploaded", || {
+			backend.log().uploaded.len() >= 3
+		})
+		.await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		drop(pause);
+
+		let outcome = tokio::time::timeout(Duration::from_secs(30), running)
+			.await
+			.expect("a lost pause controller does not keep the job paused")
+			.unwrap();
+		outcome.result.unwrap();
+		assert_eq!(backend.log().uploaded.len(), 18);
+		assert_released(&backend, &reporter);
+		let last = recorder.last();
+		assert!(!last.paused && !last.pausing);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_cancel_while_paused_ends_the_pause() {
+		let destination = Uuid::new_v4();
+		let big = source_file("big", 6 * CHUNK_SIZE_U64);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (pause, cancel, control) = controls();
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(big)]),
+			control,
+		);
+
+		wait_until("a chunk is uploaded", || !backend.log().uploaded.is_empty()).await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		let updates_before_cancel = recorder.updates.lock().unwrap().len();
+		cancel.send_replace(true);
+		let outcome = running.await.unwrap();
+
+		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		assert_released(&backend, &reporter);
+		let updates = recorder.updates.lock().unwrap();
+		for update in &updates[updates_before_cancel..] {
+			assert!(
+				!(update.cancelling && (update.paused || update.pausing)),
+				"a cancelling job is shown as pausing or paused: {update:?}"
+			);
+		}
+		let last = updates.last().unwrap();
+		assert_eq!(last.phase, CopyPhase::Cancelled);
+		assert!(
+			!last.paused && !last.pausing,
+			"the final update is not paused"
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
