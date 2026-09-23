@@ -241,6 +241,10 @@ impl Client {
 		control: JobControl,
 	) -> CopyOutcome<CopySourceDir> {
 		let reporter = Reporter::new(callback);
+		let destination_dirs = requests
+			.iter()
+			.map(|request| (request.destination.uuid(), request.destination.clone()))
+			.collect();
 		let scanned = self.scan(requests, &reporter, &control).await;
 		let plan = scanned.and_then(|(planner, requests)| {
 			let plan = planner.plan(requests).map_err(ScanError::Failed)?;
@@ -275,7 +279,7 @@ impl Client {
 			}
 		};
 		let backend = Arc::new(ClientBackend::new(self));
-		run_copy(backend, plan, control, reporter).await
+		run_copy(backend, plan, destination_dirs, control, reporter).await
 	}
 
 	/// Lists every source directory and every destination.

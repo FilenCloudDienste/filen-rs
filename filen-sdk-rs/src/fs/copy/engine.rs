@@ -22,7 +22,12 @@
 //! finalized, so a dropped one leaves nothing behind) but lets in-flight directory creates and
 //! file finalizations finish, so every item that was created is known and reported.
 
-use std::{borrow::Cow, collections::VecDeque, future::Future, sync::Arc};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, VecDeque},
+	future::Future,
+	sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, crypto::Blake3Hash, fs::Uuid};
@@ -38,7 +43,7 @@ use crate::{
 	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA},
 	fs::{
 		HasName, HasUUID,
-		categories::{NonRootItemType, Normal},
+		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
 		file::{
 			RemoteFile,
@@ -248,6 +253,10 @@ struct Job<B: CopyBackend, D> {
 	reporter: MaybeArc<Reporter>,
 	plan: CopyPlan<D>,
 	dir_states: Vec<DirState>,
+	/// Each planned directory once created.
+	created_dirs: Vec<Option<RemoteDirectory>>,
+	/// The destinations the top-level items are created in, by uuid.
+	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	/// Planned subdirectories of each planned directory.
 	child_dirs: Vec<Vec<usize>>,
 	/// Connected targets of each request's destination.
@@ -262,10 +271,12 @@ struct Job<B: CopyBackend, D> {
 }
 
 /// Runs `plan`, reporting to `reporter`. The plan's totals, skips and renames are reported
-/// first, then the top-level items as planned.
+/// first, then the top-level items as planned. `destination_dirs` holds every destination of
+/// the plan, by uuid.
 pub(crate) async fn run_copy<B, D>(
 	backend: Arc<B>,
 	plan: CopyPlan<D>,
+	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
 ) -> CopyOutcome<D>
@@ -309,6 +320,8 @@ where
 		control,
 		reporter,
 		dir_states: vec![DirState::Pending; plan.dirs.len()],
+		created_dirs: vec![None; plan.dirs.len()],
+		destination_dirs,
 		child_dirs,
 		targets: Vec::new(),
 		destinations,
@@ -455,6 +468,23 @@ where
 		Ok(())
 	}
 
+	/// The directory a failed item was to be created in, so it can be retried there. It always
+	/// exists: the destinations are given, and nothing is attempted before its parent exists.
+	fn failed_item_parent(&self, parent: DestParent) -> DirType<'static, Normal> {
+		match parent {
+			DestParent::Existing(uuid) => self
+				.destination_dirs
+				.get(&uuid)
+				.expect("every destination is given")
+				.clone(),
+			DestParent::Planned(index) => DirType::Dir(Cow::Owned(
+				self.created_dirs[index]
+					.clone()
+					.expect("an item is only attempted once its parent exists"),
+			)),
+		}
+	}
+
 	fn dest_parent(&self, parent: DestParent) -> Option<Uuid> {
 		match parent {
 			DestParent::Existing(uuid) => Some(uuid),
@@ -581,6 +611,7 @@ where
 				}
 				let planned = &self.plan.dirs[index];
 				self.dir_states[index] = DirState::Created(dir.uuid());
+				self.created_dirs[index] = Some(dir.clone());
 				self.reporter.dir_created(
 					planned.source_uuid,
 					dir.uuid(),
@@ -604,11 +635,13 @@ where
 				let error = Arc::new(error);
 				self.note_error(&error);
 				self.fail_subtree(index);
+				let dest_parent_dir = self.failed_item_parent(self.plan.dirs[index].parent);
 				let planned = &self.plan.dirs[index];
 				let info = FailureInfo {
 					source_uuid: planned.source_uuid,
 					source_path: planned.source_path.clone(),
 					dest_parent: parent.unwrap_or_default(),
+					dest_parent_dir,
 					dest_name: planned.name.as_ref().to_owned(),
 					stage,
 					error,
@@ -754,11 +787,14 @@ where
 			// Not a copy the user can keep or trash: trashing it would trash the existing file.
 			// It counts as failed, so the counts still add up to the totals.
 			Err(FileError::RegisteredAsVersion(file)) => {
+				let dest_parent_dir =
+					self.failed_item_parent(self.plan.files[outcome.index].parent);
 				let planned = &self.plan.files[outcome.index];
 				let info = FailureInfo {
 					source_uuid: active.source_uuid,
 					source_path: planned.source_path.clone(),
 					dest_parent: outcome.parent,
+					dest_parent_dir,
 					dest_name: file.name().map_or(active.name, str::to_owned),
 					stage: CopyStage::RegisteredAsVersion,
 					error: Arc::new(Error::custom(
@@ -778,11 +814,14 @@ where
 			Err(FileError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
+				let dest_parent_dir =
+					self.failed_item_parent(self.plan.files[outcome.index].parent);
 				let planned = &self.plan.files[outcome.index];
 				let info = FailureInfo {
 					source_uuid: active.source_uuid,
 					source_path: planned.source_path.clone(),
 					dest_parent: outcome.parent,
+					dest_parent_dir,
 					dest_name: active.name.clone(),
 					stage,
 					error,
@@ -1770,9 +1809,23 @@ mod tests {
 	) -> (Running, Arc<Recorder>, MaybeArc<Reporter>) {
 		let recorder = Arc::new(Recorder::default());
 		let reporter = Reporter::new(Arc::clone(&recorder));
+		let destination_dirs = plan
+			.dirs
+			.iter()
+			.map(|dir| dir.parent)
+			.chain(plan.files.iter().map(|file| file.parent))
+			.filter_map(|parent| match parent {
+				DestParent::Existing(uuid) => Some((
+					uuid,
+					DirType::Root(Cow::Owned(crate::fs::dir::RootDirectory::new(uuid))),
+				)),
+				DestParent::Planned(_) => None,
+			})
+			.collect();
 		let running = tokio::spawn(run_copy(
 			Arc::clone(backend),
 			plan,
+			destination_dirs,
 			control,
 			MaybeArc::clone(&reporter),
 		));
@@ -2675,6 +2728,77 @@ mod tests {
 			counts.bytes_done + counts.bytes_failed,
 			outcome.report.totals.bytes
 		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let sub = source_dir("Sub");
+		let source = tree(
+			&top,
+			vec![listed(&top, sub.clone())],
+			vec![listed(&top, source_file("nested", 5))],
+		);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.fail_create.insert("Sub".to_owned());
+		backend
+			.fail_upload
+			.insert("nested".to_owned(), ErrorKind::Server);
+		backend
+			.fail_upload
+			.insert("loose".to_owned(), ErrorKind::Server);
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![source, PlanSource::File(source_file("loose", 5))],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+
+		let created_top = backend.log().created_dirs[0].0;
+		let parent_of = |name: &str| {
+			let failure = outcome
+				.report
+				.failures
+				.iter()
+				.find(|f| f.info.dest_name == name)
+				.unwrap_or_else(|| panic!("{name} failed"));
+			assert_eq!(
+				failure.info.dest_parent_dir.uuid(),
+				failure.info.dest_parent
+			);
+			failure.info.dest_parent_dir.clone()
+		};
+		let sub_parent = parent_of("Sub");
+		assert!(
+			matches!(&sub_parent, DirType::Dir(dir) if dir.uuid() == created_top),
+			"a nested directory's parent is the directory the copy created"
+		);
+		assert_eq!(parent_of("nested").uuid(), created_top);
+		assert_eq!(
+			parent_of("loose").uuid(),
+			destination,
+			"a top-level item's parent is the destination"
+		);
+		let failed_events = recorder
+			.events()
+			.into_iter()
+			.filter_map(|e| match e {
+				CopyEvent::DirFailed(info) | CopyEvent::FileFailed(info) => Some(info),
+				_ => None,
+			})
+			.count();
+		assert_eq!(failed_events, 3);
+		assert!(recorder.events().iter().all(|e| match e {
+			CopyEvent::DirFailed(info) | CopyEvent::FileFailed(info) =>
+				info.dest_parent_dir.uuid() == info.dest_parent,
+			_ => true,
+		}));
 	}
 
 	#[tokio::test(start_paused = true)]

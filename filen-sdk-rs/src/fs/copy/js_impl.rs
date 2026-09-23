@@ -65,6 +65,8 @@ pub struct CopyFailureInfo {
 	pub source_path: String,
 	/// The directory the item was to be created in.
 	pub dest_parent: Uuid,
+	/// The same directory, to retry the item in with `copyItemsTo`.
+	pub dest_parent_dir: AnyNormalDir,
 	pub dest_name: String,
 	pub stage: CopyStage,
 	pub error: CopyError,
@@ -297,6 +299,7 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 			source_uuid: info.source_uuid,
 			source_path: info.source_path.clone(),
 			dest_parent: info.dest_parent,
+			dest_parent_dir: info.dest_parent_dir.clone().into(),
 			dest_name: info.dest_name.clone(),
 			stage: info.stage,
 			error: CopyError::from(info.error.as_ref()),
@@ -802,12 +805,7 @@ mod wasm_impl {
 				Self::File(AnyFile::File(file)) => file.serialize(serializer),
 				Self::File(AnyFile::Shared(file)) => file.serialize(serializer),
 				Self::File(AnyFile::Linked(file)) => file.serialize(serializer),
-				Self::Dir(AnyDirWithContext::Normal(AnyNormalDir::Dir(dir))) => {
-					dir.serialize(serializer)
-				}
-				Self::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(root))) => {
-					root.serialize(serializer)
-				}
+				Self::Dir(AnyDirWithContext::Normal(dir)) => dir.serialize(serializer),
 				Self::Dir(AnyDirWithContext::Shared(shared)) => {
 					let mut state = serializer.serialize_struct("AnySharedDirWithContext", 2)?;
 					state.serialize_field("dir", &AnySharedDirTagged::from(shared.dir.clone()))?;
@@ -925,10 +923,12 @@ mod tests {
 
 	#[test]
 	fn an_update_reports_milliseconds_and_the_parts_of_its_errors() {
+		let parent = dir();
 		let failure = api::FailureInfo {
 			source_uuid: Uuid::new_v4(),
 			source_path: "/a.txt".to_owned(),
-			dest_parent: Uuid::new_v4(),
+			dest_parent: parent.uuid(),
+			dest_parent_dir: DirType::Dir(Cow::Owned(parent.clone())),
 			dest_name: "a.txt".to_owned(),
 			stage: CopyStage::Upload,
 			error: Arc::new(Error::custom(ErrorKind::MaxStorageReached, "full")),
@@ -956,6 +956,14 @@ mod tests {
 			panic!("one failed file");
 		};
 		assert_eq!(info.error.kind, ErrorKind::MaxStorageReached);
+		let AnyNormalDir::Dir(parent_dir) = &info.dest_parent_dir else {
+			panic!("the directory the file was to be created in");
+		};
+		assert_eq!(
+			DirType::<'static, Normal>::from(AnyNormalDir::Dir(parent_dir.clone())).uuid(),
+			parent.uuid(),
+			"a retry can target the parent without looking it up"
+		);
 		assert_eq!(info.source_uuid, failure.source_uuid);
 		assert_eq!(info.affected_bytes, 10);
 	}

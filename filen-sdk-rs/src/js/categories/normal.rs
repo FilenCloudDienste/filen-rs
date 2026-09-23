@@ -79,6 +79,18 @@ pub enum AnyNormalDir {
 	Root(Root),
 }
 
+/// Written in the shape it is read from (`Dir` or `Root`), so a directory the SDK hands out can
+/// be passed back as an `AnyNormalDir`.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl serde::Serialize for AnyNormalDir {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		match self {
+			AnyNormalDir::Dir(dir) => dir.serialize(serializer),
+			AnyNormalDir::Root(root) => root.serialize(serializer),
+		}
+	}
+}
+
 impl From<AnyNormalDir> for DirType<'static, Normal> {
 	fn from(value: AnyNormalDir) -> Self {
 		match value {
