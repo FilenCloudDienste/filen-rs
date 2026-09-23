@@ -20,9 +20,9 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt::Write as _,
-	fs,
+	fs, mem,
 	path::{Path, PathBuf},
 	sync::Arc,
 	time::{Duration, Instant},
@@ -44,10 +44,13 @@ use super::{
 	SyncMode,
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	derive::{self, Derived},
-	ignore::{IgnoreRules, parse_user_ignore},
+	engine::{PendingKind, PendingWrites, assembly_accounted},
+	ignore::{IgnoreRules, Origin, load_remote_rules, parse_user_ignore, rule_file_dir},
 	observe,
-	plan::{self, PassHolds, RemoteNode},
+	plan::{self, PassHolds, RemoteNode, RemoteView},
+	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalNode, LocalScan, RuleFiles},
+	side::NodesAt,
 	tree::Baseline,
 };
 
@@ -73,6 +76,12 @@ const COMPARE_REPS: usize = 3;
 /// The user-level rules the filtered view build is measured with — five patterns over the built-in
 /// defaults, the shape a real pair carries.
 const PROBE_RULES: &str = "*.log\nbuild/\n*.tmp\nnode_modules/\n*.bak\n";
+
+/// What `scoped_pull_one_file_changed` must plan: the probe edits one file locally, and on a
+/// `RemoteToLocal` pair the remote copy is authoritative, so the pass plans the one download that
+/// puts the file back. Written as a constant so the phase's assertion is a claim about the pass and
+/// not about whatever the pass happened to return.
+const PULL_ONE_FILE_ACTIONS: usize = 1;
 
 /// How many registry point reads the control-verb phase makes. One is too few to time on a
 /// microsecond clock; the cost is per read, and the phase reports the per-read figure.
@@ -829,46 +838,220 @@ fn pass_pure(
 	}
 }
 
-/// What a CHANGE-SCOPED pass does locally, end to end: the resident baseline, the two maps derived
-/// from its rows, the re-observation of the dirty paths, the directory-move fold and the reconcile
-/// over the complete maps.
+/// What a CHANGE-SCOPED pass does locally, end to end: every phase of
+/// [`SyncEngine::prepare_scoped`](super::SyncEngine) that runs without an account, in the order it
+/// runs them — derive both sides from the resident baseline, apply the remote delta, find the
+/// remote rule files, build the rule-file list the local half reads under, re-observe the dirty
+/// paths, check the assembly, filter the view, fold the pair's unacknowledged writes back into it —
+/// followed by the directory-move fold and the reconcile, which the pass runs on what
+/// `prepare_scoped` hands back.
+///
+/// `mode` is the pair's own, and it changes what this costs: a mode that does not push builds
+/// `RuleFiles::Only` out of every baseline row, which a pushing pair never pays. Both are measured,
+/// so neither mode is priced off the other's number.
+///
+/// Driving the real method would be better and is not possible here: it is an `async` method on a
+/// `SyncEngine`, which owns an authenticated `Client`, a registered pair, a cache sync-root
+/// subscription and the carried state of a previous whole pass. This module has no account, no
+/// network and no runtime by design, so the phases below are assembled by hand — which is exactly
+/// how this measurement drifted from the pass once before. What it leaves out is listed below, ALL
+/// of it, each with the cost class that says whether leaving it out can grow with the tree. EVERY
+/// per-node step a scoped pass runs is now inside the phase; nothing omitted here is one.
+///
+/// - `pass_inputs`' registry, failure and user-ignore reads, the carried-state lookup, the
+///   `Observations` snapshot and the cache-slot check — PER PAIR,
+/// - APPLYING a remote delta: the probe's is empty, so `observe_remote` here builds its whole-map
+///   `path_of` index and does nothing else — PER ANNOUNCED CHANGE, one map operation each,
+/// - READING a remote `.filenignore`. The scan that finds the candidates is timed (see below); the
+///   fetch and the parse are PER RULE FILE, and only where a directory has one,
+/// - `confirm_pushes` — PER UNCONFIRMED ROW (`Baseline::unconfirmed`, and only while the baseline
+///   holds one), plus one round trip per foreign version found at such a row's path,
+/// - `PendingWrites::settle`, `strangers` and `retire_superseded_creates` — PER PENDING WRITE,
+///   plus one round trip per stranger; the per-directory sibling collision check — PER OBSERVED
+///   DIRECTORY; `remote_emptied` (two O(1) checks) and `existing_pair_changes` — PER CHANGE,
+/// - the facts merge — `merge_remote_view` prunes PER TOUCHED PATH and `unknown_remote_paths`
+///   returns before it looks at a row when nothing was skipped, which a derived view guarantees;
+///   `facts::observe_local` is PER OBSERVATION,
+/// - `unaccounted_key`'s `debug_assert` — PER MAP KEY, so per node, and the one omission here that
+///   does grow with the tree. Deliberate: it is one `Baseline` path resolve per key and a shipped
+///   release pass does not run it (see `prepare_scoped`).
+///
+/// The three per-node steps this phase used to leave out are in it as of this round —
+/// `load_remote_rules`' candidate scan over the UNFILTERED view, `RuleFiles::Only`'s scan of every
+/// baseline row on a mode that does not push, and `PendingWrites::fold_into`'s whole-view `path_of`
+/// rebuild — which is why no figure here is comparable with one recorded before the rename.
 ///
 /// The fold is here because `prepare_scoped` ends with it exactly as `prepare_whole` does, and
 /// because [`pass_pure`] pays it: a phase that skipped it would credit change-scoping with the cost
 /// of a step the real pass still runs every time.
 ///
 /// What a whole pass does and this does not: the cache snapshot, both view builds, and the walk of
-/// the tree. What it leaves out that a real pass does is applying the announced remote changes,
-/// which costs one map operation per announced change and nothing per tree node.
+/// the tree.
 ///
 /// Returns the action count, so a phase that was supposed to plan something can say whether it did.
-fn pass_scoped(
+fn prepare_scoped(
 	fixture: &Fixture,
 	store: &BaselineStore,
 	pair: i64,
+	mode: SyncMode,
 	dirty: BTreeSet<String>,
 ) -> usize {
 	let mut baseline = store.baseline(pair).expect("reading the baseline");
-	let mut derived = derive::from_baseline(&baseline, dirty.clone());
-	let (observations, _rules) = observe::observe_local(
+	let mut derived = derive::from_baseline(&baseline, dirty);
+
+	// The remote half FIRST, as the pass runs it: every path the delta touched is a path the local
+	// half has to re-observe too. `RemoteObservation::new` indexes the whole derived map by uuid
+	// before a single change is applied, which is per-node work every scoped pass pays.
+	let nodes = mem::take(&mut derived.remote);
+	let mut ancestry = |uuid| cache_ancestry(&fixture.cache_db, uuid);
+	let observed = observe_remote(fixture.remote_root, &baseline, nodes, &[], &mut ancestry);
+	// A GUARD, and not a check that can fail on this fixture: with an EMPTY delta `observe_remote`
+	// never enters the loop that refuses a change, and its only other route to `Full` needs an
+	// emptied view over a baseline that still has remote rows, which a converged fixture cannot
+	// produce. It earns its place by catching a future `observe_remote` that learns to refuse on
+	// the empty path; it is not evidence that this phase measured a derivation.
+	let mut observation = match observed {
+		RemoteObserved::Applied(observation) => *observation,
+		RemoteObserved::Full(reason) => panic!(
+			"the probe's converged fixture must derive a remote view, not fall back to a whole \
+			 read: {reason:?}"
+		),
+	};
+	derived.decided.append(&mut observation.changed);
+	// TAKEN before the view's held set is built out of it, for the reason the pass takes it: the
+	// assembly check below needs the ROWS this pass holds, not the hidden paths `merge_local` puts
+	// back into `derived.held`.
+	let held_rows = mem::take(&mut derived.held);
+	let mut view = RemoteView {
+		nodes: observation.nodes,
+		has_collisions: false,
+		skipped: Vec::new(),
+		ignored: BTreeMap::new(),
+		ignored_default_untracked: 0,
+		held_paths: held_rows
+			.iter()
+			.cloned()
+			.chain(observation.held_paths)
+			.collect(),
+	};
+	derived.dirty.extend(observation.touched.iter().cloned());
+
+	// The remote rules, where the pass reads them: BEFORE `view.filter`, so the candidate scan runs
+	// over the UNFILTERED map. What is TIMED here is that scan — `load_remote_rules` opens by
+	// walking every node in the view to find the `.filenignore` files — and not the reads it would
+	// then make. The probe's fixture holds no rule file, so no candidate survives and the fetch
+	// closure is never called; it panics rather than returning a body, so a fixture that grows a
+	// rule file has to be told to serve it instead of quietly timing a network read in here.
+	let local_root = &fixture.root;
+	let cached: HashMap<Uuid, Arc<str>> = HashMap::new();
+	let remote_rules = futures::executor::block_on(load_remote_rules(
+		mode,
+		&view,
+		Some(parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile")),
+		|dir| scan::rule_file_metadata(&local_root.join(dir)).map_or(true, |found| found.is_some()),
+		|dir| baseline.contains_key(&Origin::File { dir }.to_string()),
+		&cached,
+		|_uuid| async move {
+			panic!(
+				"the probe's fixture holds no remote `.filenignore`, so this phase times the scan \
+				 that looks for one and never a fetch"
+			)
+		},
+	));
+	assert!(
+		remote_rules.blocked.is_empty() && remote_rules.errors.is_empty(),
+		"the scan must find no remote rule file to read on this fixture: blocked {:?}, errors {:?}",
+		remote_rules.blocked,
+		remote_rules.errors
+	);
+	// `RuleFiles::Only`, which a mode that does not push builds by iterating EVERY baseline row
+	// with a view lookup per row. A pushing pair never pays it, which is why this function takes a
+	// mode: both answers are measured rather than one being read off the other.
+	let rule_files = if mode.pushes() {
+		RuleFiles::Read
+	} else {
+		RuleFiles::Only(
+			baseline
+				.iter()
+				.filter(|entry| entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path))
+				.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+				.collect(),
+		)
+	};
+
+	// The local half: one stat per dirty path and its ancestors, one subtree walk per dirty
+	// directory. `derived.dirty` and not the caller's set, because `from_baseline` adds every row
+	// it could not carry to it.
+	let dirty = mem::take(&mut derived.dirty);
+	let (observations, rules) = observe::observe_local(
 		&fixture.root,
 		&baseline,
-		probe_rules(),
-		&RuleFiles::Read,
+		remote_rules.rules,
+		&rule_files,
 		&dirty,
 	);
 	derive::merge_local(&mut derived, &baseline, &observations);
+	// Plan 3.6's self-check, which the pass runs before anything plans against these maps.
+	assert!(
+		assembly_accounted(&baseline, &derived, &observations, &held_rows),
+		"the derived local map must account for the rows and observations it was built from; a \
+		 pass that fails this reads both sides whole instead, so the phase would be timing a pass \
+		 no engine would run"
+	);
+	// The rules, then the case-fold collision check — both over the WHOLE view, and both paid by
+	// every scoped pass.
+	view.filter(Some(plan::ViewFilter {
+		rules: &rules,
+		baseline: &baseline,
+	}));
+	// The paths an observation found hidden with a row still behind them, added AFTER the filter
+	// exactly as the pass adds them.
+	view.held_paths.append(&mut derived.held);
+
+	// `PendingWrites::fold_into`, which a pass pays whenever the pair holds an unacknowledged
+	// write — the pass after every apply that pushed something. ONE record, because what is per
+	// node here is the `path_of` index it rebuilds from the whole view before it reads any record;
+	// the loop after that index is per record.
+	let written = baseline
+		.iter()
+		.find(|entry| entry.kind == NodeKind::File && entry.remote_uuid.is_some())
+		.expect("the probe's baseline holds a synced file");
+	let pending = PendingWrites::default();
+	pending.restore(
+		pair,
+		written.remote_uuid.expect("filtered for above"),
+		PendingKind::Created {
+			path: written.rel_path.clone(),
+			replaced: None,
+		},
+		Duration::ZERO,
+	);
+	// FIRST, because `fold_into` returns 0 both for a record it could not apply and for a pair
+	// holding no record at all — and the second of those returns before it builds the index this
+	// phase exists to time.
+	assert_eq!(
+		pending.uuids().len(),
+		1,
+		"the fold must have a record to walk, or the 0 below is an early return and this phase is \
+		 timing nothing"
+	);
+	let folded = pending.fold_into(pair, &baseline, &mut view.nodes, &mut derived.decided);
+	assert_eq!(
+		folded, 0,
+		"the fixture's view already shows the row's own uuid at that path, so the fold has nothing \
+		 to correct; a fold that applied here would be editing the maps this phase goes on to time"
+	);
+
 	let Derived {
 		mut local,
-		mut remote,
-		held,
 		mut decided,
 		..
 	} = derived;
-	// The held paths are the rows that record one side only, which is what the pass folds with too
-	// (they reach it as `PassHolds::held_remote`).
+	let mut remote = view.nodes;
+	// What the pass folds and plans with is `holds.held_remote`, which is the view's held set.
+	let held = view.held_paths;
 	let moves = plan::fold_dir_moves(
-		SyncMode::TwoWay,
+		mode,
 		&mut baseline,
 		&mut local,
 		&mut remote,
@@ -884,7 +1067,7 @@ fn pass_scoped(
 			.collect();
 	}
 	plan::reconcile(
-		SyncMode::TwoWay,
+		mode,
 		&baseline,
 		&local,
 		&remote,
@@ -1824,14 +2007,17 @@ pub fn run() -> String {
 	fs::write(fixture.root.join(&changed), b"changed by the probe")
 		.expect("changing one probe file");
 	let dirty = BTreeSet::from([changed.clone()]);
-	let (scoped_actions, scoped) = timed(|| pass_scoped(&fixture, &store, pair, dirty.clone()));
+	let (scoped_actions, scoped) =
+		timed(|| prepare_scoped(&fixture, &store, pair, SyncMode::TwoWay, dirty.clone()));
 	probe.record(
-		"pass_one_file_changed",
+		"scoped_twoway_one_file_changed",
 		nodes,
 		scoped,
 		&format!(
 			"{scoped_actions} action(s) for 1 changed file ({changed}); baseline + derived maps + \
-			 one re-observed path + fold + reconcile, no walk and no snapshot"
+			 the remote observation + the rule-file scan + one re-observed path + the assembly \
+			 check + the view filter + the pending-write fold + dir-move fold + reconcile, no walk \
+			 and no snapshot"
 		),
 	);
 	assert_eq!(
@@ -1839,10 +2025,38 @@ pub fn run() -> String {
 		"one changed file must plan exactly one action, or this phase is timing the wrong thing"
 	);
 
+	// The same wake on a pair that only PULLS, which is the mode that pays `RuleFiles::Only` — a
+	// scan of every baseline row with a view lookup per row, built before the local half reads
+	// anything. No pushing pair pays it, so pricing those modes off the row above would understate
+	// them by a whole-tree scan.
+	let (pull_actions, pull) = timed(|| {
+		prepare_scoped(
+			&fixture,
+			&store,
+			pair,
+			SyncMode::RemoteToLocal,
+			dirty.clone(),
+		)
+	});
+	probe.record(
+		"scoped_pull_one_file_changed",
+		nodes,
+		pull,
+		&format!(
+			"{pull_actions} action(s) for the same 1 changed file on a `RemoteToLocal` pair; the \
+			 row above plus `RuleFiles::Only`, which iterates every baseline row"
+		),
+	);
+	assert_eq!(
+		pull_actions, PULL_ONE_FILE_ACTIONS,
+		"a local edit on a pull-only pair is the remote's to overwrite, so the count is fixed; a \
+		 different one means this phase is no longer timing that pass"
+	);
+
 	// The phase the one-per-cent target is read off: a real change-scoped pass, with one per cent
-	// of the files edited on disk and named in its dirty set. `pass_one_file_changed` above is the
-	// same machinery at its floor and `pass_pure` the whole-read yardstick — same fixture, same
-	// run, so the three numbers are comparable.
+	// of the files edited on disk and named in its dirty set.
+	// `scoped_twoway_one_file_changed` above is the same machinery at its floor and `pass_pure`
+	// the whole-read yardstick — same fixture, same run, so the three numbers are comparable.
 	let percent_changed: Vec<String> = store
 		.entries(pair)
 		.expect("reading the baseline")
@@ -1859,15 +2073,22 @@ pub fn run() -> String {
 		.expect("changing a probe file");
 	}
 	let percent_dirty: BTreeSet<String> = percent_changed.iter().cloned().collect();
-	let (percent_actions, percent) =
-		timed(|| pass_scoped(&fixture, &store, pair, percent_dirty.clone()));
+	let (percent_actions, percent) = timed(|| {
+		prepare_scoped(
+			&fixture,
+			&store,
+			pair,
+			SyncMode::TwoWay,
+			percent_dirty.clone(),
+		)
+	});
 	probe.record(
-		"pass_one_percent_changed",
+		"scoped_twoway_one_percent_changed",
 		nodes,
 		percent,
 		&format!(
-			"{percent_actions} action(s) for {} changed file(s); baseline + derived maps + \
-			 re-observation + fold + reconcile, no walk and no snapshot",
+			"{percent_actions} action(s) for {} changed file(s); the same steps as \
+			 `scoped_twoway_one_file_changed`, with one per cent of the files in the dirty set",
 			percent_changed.len()
 		),
 	);
@@ -1880,9 +2101,10 @@ pub fn run() -> String {
 	// The floor the same machinery costs with NOTHING dirty. The engine does not pay it — a wake
 	// with an empty change list returns before it reads anything — so this is the cost that
 	// skipping an idle wake avoids, not a cost any pass incurs.
-	let (idle_actions, idle) = timed(|| pass_scoped(&fixture, &store, pair, BTreeSet::new()));
+	let (idle_actions, idle) =
+		timed(|| prepare_scoped(&fixture, &store, pair, SyncMode::TwoWay, BTreeSet::new()));
 	probe.record(
-		"pass_scoped_idle_floor",
+		"scoped_twoway_idle_floor",
 		nodes,
 		idle,
 		&format!(
