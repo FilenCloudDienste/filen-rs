@@ -353,9 +353,11 @@ struct ScanCosts {
 	/// `RuleFiles::Only`'s scan of every baseline row. Zero on a mode that pushes, which never
 	/// builds it.
 	rule_files_only: Duration,
-	/// `RemoteView::filter` — `hide`'s whole-map `retain` and `resolve_collisions`' whole-map key
-	/// scan, which no seam separates from outside.
-	view_filter: Duration,
+	/// `RemoteView::hide`'s whole-map `retain`: one ignore decision per node.
+	view_hide: Duration,
+	/// `RemoteView::resolve_collisions`' whole-map key scan: one folded key and one digest per
+	/// node.
+	view_collisions: Duration,
 	/// `PendingWrites::fold_into`'s uuid index over the whole view.
 	pending_fold: Duration,
 }
@@ -386,9 +388,14 @@ impl ScanCosts {
 				"`RuleFiles::Only`'s scan of every baseline row; 0 on a mode that pushes",
 			),
 			(
-				"view_filter",
-				self.view_filter,
-				"`hide`'s whole-map retain plus `resolve_collisions`' whole-map key scan",
+				"view_hide",
+				self.view_hide,
+				"`hide`'s whole-map retain: one ignore decision per node",
+			),
+			(
+				"view_collisions",
+				self.view_collisions,
+				"`resolve_collisions`' whole-map key scan: one folded key and digest per node",
 			),
 			(
 				"pending_fold",
@@ -1087,13 +1094,18 @@ fn prepare_scoped(
 	);
 	// The rules, then the case-fold collision check — both over the WHOLE view, and both paid by
 	// every scoped pass.
+	// `RemoteView::filter`'s two halves, run in ITS order and timed apart: together they are the
+	// largest per-node cost of a change-scoped pass, and one figure for both cannot say which of
+	// them a narrowing moved.
 	let ((), elapsed) = timed(|| {
-		view.filter(Some(plan::ViewFilter {
+		view.hide(plan::ViewFilter {
 			rules: &rules,
 			baseline: &baseline,
-		}));
+		});
 	});
-	costs.view_filter = elapsed;
+	costs.view_hide = elapsed;
+	let ((), elapsed) = timed(|| view.resolve_collisions());
+	costs.view_collisions = elapsed;
 	// The paths an observation found hidden with a row still behind them, added AFTER the filter
 	// exactly as the pass adds them.
 	view.held_paths.append(&mut derived.held);

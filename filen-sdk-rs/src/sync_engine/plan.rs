@@ -617,6 +617,10 @@ impl RemoteView {
 	///
 	/// The rules come off first, so ignored case-twins never refuse a pass. With no filter nothing
 	/// is hidden and the view stays the remote as it is, collisions resolved.
+	///
+	/// The two halves are `pub(super)` so the probe can time them apart — they are the largest
+	/// per-node cost a change-scoped pass has, and one figure for both cannot say which of them a
+	/// narrowing moved. THIS is the order; a caller that runs them itself mirrors it.
 	pub(crate) fn filter(&mut self, filter: Option<ViewFilter<'_>>) {
 		if let Some(filter) = filter {
 			self.hide(filter);
@@ -634,7 +638,7 @@ impl RemoteView {
 	/// byte-identical, so a rule hides them together, and a path the rules hide is blocked from
 	/// every action anyway — holding it costs the pass nothing and it is untracked, with its rule
 	/// reported, by the pass that finds the cache no longer mid-transition there.
-	fn hide(&mut self, filter: ViewFilter<'_>) {
+	pub(super) fn hide(&mut self, filter: ViewFilter<'_>) {
 		let mut memo = HashMap::new();
 		let mut ignored = BTreeMap::new();
 		let mut untracked = 0usize;
@@ -692,7 +696,7 @@ impl RemoteView {
 	/// The collision half of [`filter`](Self::filter): two remote items whose paths fold together
 	/// case-insensitively have no 1:1 local mapping, so the loser leaves the view and the pass is
 	/// refused ([`has_collisions`](Self::has_collisions)).
-	fn resolve_collisions(&mut self) {
+	pub(super) fn resolve_collisions(&mut self) {
 		// A digest of every collision key taken so far. The keys themselves are not kept: a hit is
 		// rare and is resolved against the paths already placed, which is what tells a real
 		// case-twin from two keys that merely share a digest — a pass is never refused over that.
