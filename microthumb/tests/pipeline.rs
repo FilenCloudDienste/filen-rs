@@ -1357,6 +1357,43 @@ fn transformed_grids_place_their_tiles_where_the_whole_frame_decode_does() {
 	}
 }
 
+/// A HEIF decode is priced by its bit depth and chroma format, on top of a
+/// fixed setup cost and the compressed input it holds: the same 64x48-tile
+/// grid fits a budget in 8-bit 4:2:0, and in 10-bit 4:2:0, that it does not
+/// fit in 10-bit 4:2:2. The rates are mirrored from `formats/heif.rs` (1 MiB
+/// of setup; 20 B/px past 8 bits at 4:2:2 or 4:4:4, 12 B/px otherwise; the
+/// file once plus twice a tile's share of it) rather than read, so that a
+/// test of the charge cannot pass whatever the charge is.
+#[cfg(feature = "heif")]
+#[test]
+fn a_heif_decode_is_charged_its_setup_its_depth_and_its_chroma() {
+	const TILE_PIXELS: usize = 64 * 48;
+	let deep = include_bytes!("fixtures/heif/grid-irot0.heic");
+	let eight_bit = include_bytes!("fixtures/heif/grid-8bit.heic");
+	let deep_420 = include_bytes!("fixtures/heif/grid-10bit-420.heic");
+	// Whether it thumbnailed: the thumbnail itself is not the point, and on
+	// failure it would print every byte of the canvas.
+	let fits = |bytes: &[u8], mem_budget| match generate(
+		Box::new(MemSource(bytes.to_vec())),
+		&ThumbSpec::new(16, 16, mem_budget),
+	)
+	.unwrap()
+	{
+		ThumbOutcome::Thumbnail(_) => true,
+		ThumbOutcome::OverBudget => false,
+		ThumbOutcome::Unsupported => panic!("a HEIF grid must be recognised"),
+	};
+
+	// No room for the setup: even a tiny grid is refused.
+	assert!(!fits(eight_bit, 1024 * 1024));
+	// Room for one 8-bit tile and a scrap of canvas, short of a 10-bit one.
+	let between = 1024 * 1024 + TILE_PIXELS * 16 + eight_bit.len() * 3 / 2;
+	assert!(fits(eight_bit, between));
+	assert!(fits(deep_420, between));
+	assert!(!fits(deep, between));
+	assert!(fits(deep, 2 * 1024 * 1024));
+}
+
 /// Which of the grid fixtures' colours a pixel is closest to.
 #[cfg(feature = "heif")]
 fn nearest_grid_colour(px: &[u8]) -> &'static str {

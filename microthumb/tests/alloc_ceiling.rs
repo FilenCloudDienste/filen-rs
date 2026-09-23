@@ -759,6 +759,7 @@ impl microthumb::ByteSource for CountingSource {
 #[cfg(feature = "heif")]
 fn heif_cases() {
 	committed_codec_cases();
+	committed_grid_cases();
 
 	// `MICROTHUMB_HEIF_FIXTURE` is the fixture's whole availability story: no
 	// device HEIC is committed (a megabyte of HEVC, against this suite's
@@ -896,7 +897,7 @@ fn committed_codec_cases() {
 
 		// And at a small request, where the canvas is a rounding error, what
 		// is left IS the decode — which must stay under what it was charged.
-		let charged = heif_charge(px, bytes.len());
+		let charged = heif_charge(px, HEIF_BYTES_PER_PIXEL, bytes.len(), 1);
 		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(bytes)), &spec(64)));
 		result
 			.unwrap()
@@ -912,14 +913,59 @@ fn committed_codec_cases() {
 	}
 }
 
-/// What `formats::heif::peak_estimate` charges for a whole-frame decode.
-/// Mirrored rather than called: the estimate is crate-private, and a test
-/// that read the real number would pass however wrong the number was. Keep in
-/// step with `DECODE_SETUP_BYTES` / `DECODE_BYTES_PER_PIXEL`.
+/// The committed HEVC grids — 64x48 tiles, 10-bit 4:2:2 like a camera HIF,
+/// 8-bit 4:2:0 like a phone and 10-bit 4:2:0 — metered one tile at a time
+/// against the rate for their depth and chroma. Tiny tiles, so what this pins is mostly the
+/// setup charge; the per-pixel rates were fitted on camera files (see
+/// `formats::heif`), which are far too large to commit.
 #[cfg(feature = "heif")]
-fn heif_charge(pixels: usize, source_len: usize) -> usize {
-	1024 * 1024 + pixels * 12 + source_len
+fn committed_grid_cases() {
+	for (name, bytes, bytes_per_pixel) in [
+		(
+			"grid-irot1.heic",
+			&include_bytes!("fixtures/heif/grid-irot1.heic")[..],
+			HEIF_BYTES_PER_PIXEL_DEEP_CHROMA,
+		),
+		(
+			"grid-8bit.heic",
+			&include_bytes!("fixtures/heif/grid-8bit.heic")[..],
+			HEIF_BYTES_PER_PIXEL,
+		),
+		(
+			"grid-10bit-420.heic",
+			&include_bytes!("fixtures/heif/grid-10bit-420.heic")[..],
+			HEIF_BYTES_PER_PIXEL,
+		),
+	] {
+		let charged = heif_charge(64 * 48, bytes_per_pixel, bytes.len(), 4);
+		let copy = bytes.to_vec();
+		let (result, peak) = measured_peak(|| thumb(Box::new(MemSource(copy)), &spec(64)));
+		result
+			.unwrap()
+			.unwrap_or_else(|| panic!("committed {name} must thumbnail"));
+		eprintln!("{name} tile decode peak: {peak} bytes (charged {charged})");
+		assert!(
+			peak <= charged,
+			"{name} decode peaked at {peak} bytes, past the {charged} its estimate charges"
+		);
+	}
 }
+
+/// What `formats::heif::peak_estimate` charges for one decode of `pixels`
+/// out of a file of `source_len` bytes split into `units` decodes. Mirrored
+/// rather than called: the estimate is crate-private, and a test that read
+/// the real number would pass however wrong the number was. Keep in step with
+/// `DECODE_SETUP_BYTES` / `DECODE_BYTES_PER_PIXEL` /
+/// `DECODE_BYTES_PER_PIXEL_DEEP_CHROMA` / `input_bytes`.
+#[cfg(feature = "heif")]
+fn heif_charge(pixels: usize, bytes_per_pixel: usize, source_len: usize, units: usize) -> usize {
+	1024 * 1024 + pixels * bytes_per_pixel + source_len + 2 * source_len.div_ceil(units)
+}
+
+#[cfg(feature = "heif")]
+const HEIF_BYTES_PER_PIXEL: usize = 12;
+#[cfg(feature = "heif")]
+const HEIF_BYTES_PER_PIXEL_DEEP_CHROMA: usize = 20;
 
 /// Real camera RAW files, metered. Most of them now yield a thumbnail — the
 /// embedded preview, decoded through the JPEG path (see

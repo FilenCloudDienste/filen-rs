@@ -4,9 +4,9 @@
 //! costs a couple of container reads), then tile-wise decode of the grid
 //! (Apple encodes 512×512 tiles), each tile pushed into the sink and freed
 //! before the next. Un-tiled non-Apple HEIFs only offer a whole-frame decode,
-//! declared honestly (~8 B/px) and left to the budget check.
+//! priced like one big tile and left to the budget check.
 
-use heif_decoder::{HeifSession, HeifTiling};
+use heif_decoder::{ChromaFormat, HeifSession, HeifTiling};
 use image::RgbaImage;
 
 use crate::{
@@ -18,6 +18,28 @@ pub struct Heif;
 
 /// Embedded HEIF thumbnails are ~320 px; anything bigger is not a thumbnail.
 const MAX_PREVIEW_PIXELS: u64 = 1024 * 1024;
+
+/// A HEIF decode is charged three things: this setup, a rate per pixel of
+/// what is decoded in one go, and the compressed input libheif holds — see
+/// [`input_bytes`].
+///
+/// The setup is container state and the codec's own, its thread pool pinned
+/// to one worker (see `heif-decoder`'s `NATIVE_CODEC_THREADS`).
+const DECODE_SETUP_BYTES: usize = 1024 * 1024;
+/// Per pixel of what is decoded in one go — a tile, or the whole frame: the
+/// codec's picture, libheif's conversion to RGBA and the copy handed over —
+/// for any 8-bit image, and a deeper one whose chroma is 4:2:0 or absent.
+/// Measured on the peak of a whole `generate` call (macOS `malloc_logger`,
+/// the retained input taken out): 8.3-8.7 B/px for 8-bit 4:2:0 HEVC and AV1,
+/// 9.7 at 4:2:2, 10.7 at 4:4:4, 11.8 at 4:4:4 with alpha, and 8.8-9.2 for
+/// 10- and 12-bit 4:2:0: past 8 bits only the samples the codec and the
+/// conversion hold double in width, and at 4:2:0 those are half of luma.
+const DECODE_BYTES_PER_PIXEL: usize = 12;
+/// Past 8 bits with chroma at 4:2:2 or 4:4:4, or when the format is unknown:
+/// 13.6 B/px at 10-bit 4:2:2 (Fujifilm, Sony and Canon HIF tiles alike),
+/// about 16 on a rotated tile, which is turned in one more buffer, and
+/// 15.6-19.8 from 4:4:4 up to 4:4:4 with alpha.
+const DECODE_BYTES_PER_PIXEL_DEEP_CHROMA: usize = 20;
 
 /// HEVC-backed brands, decoded by the vendored libde265 on every target.
 ///
@@ -57,20 +79,26 @@ impl FormatDecoder for Heif {
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
 		let len = src.len();
-		let mut session = HeifSession::new(SeqReader::new(src), len).map_err(decode_err)?;
-		// The container's declared tile dims (our peak_estimate) and the HEVC
-		// bitstreams' actual picture sizes are unrelated — and libheif skips
-		// its own whole-image size check on the tile path. These context
-		// limits are the pre-allocation guard for a lying container: no
-		// decoded picture past what the budget could ever admit (~8 B/px of
-		// transient decode cost), no total past the budget itself.
-		session.set_decode_limits((spec.mem_budget / 8) as u64, spec.mem_budget as u64);
+		let session = HeifSession::new(SeqReader::new(src), len).map_err(decode_err)?;
+		let bytes_per_pixel = decode_bytes_per_pixel(
+			session.primary_bit_depth().map_err(decode_err)?,
+			session.primary_chroma().map_err(decode_err)?,
+		);
 		let dims = session.primary_dims().map_err(decode_err)?;
 		let tiling = session.tiling().map_err(decode_err)?;
+		let input_bytes = input_bytes(
+			usize::try_from(len).unwrap_or(usize::MAX),
+			tiling.map_or(1, |tiling| {
+				(tiling.num_columns as usize).saturating_mul(tiling.num_rows as usize)
+			}),
+		);
 		Ok(Box::new(PreparedHeif {
 			session,
 			dims,
 			tiling,
+			bytes_per_pixel,
+			input_bytes,
+			mem_budget: spec.mem_budget,
 		}))
 	}
 }
@@ -79,6 +107,12 @@ struct PreparedHeif {
 	session: HeifSession<SeqReader>,
 	dims: (u32, u32),
 	tiling: Option<HeifTiling>,
+	/// What each pixel decoded in one go costs, by the image's bit depth and
+	/// chroma format.
+	bytes_per_pixel: usize,
+	/// What libheif holds of the compressed input: see [`input_bytes`].
+	input_bytes: usize,
+	mem_budget: usize,
 }
 
 impl PreparedDecode for PreparedHeif {
@@ -97,16 +131,19 @@ impl PreparedDecode for PreparedHeif {
 	}
 
 	fn embedded_preview(&mut self, mem_budget: usize) -> Result<Option<SmallImage>, ThumbError> {
-		// libheif's own RGBA plus the copy `small_image` takes ownership of,
-		// 8 bytes per PREVIEW pixel, and the cap has to bind before libheif
-		// decodes, not after. What it does NOT price is the codec's transient
-		// cost of decoding that preview — `DECODE_SETUP_BYTES` plus
-		// `DECODE_BYTES_PER_PIXEL` per preview pixel, which `peak_estimate`
-		// charges the real decode. Real `thmb` items are ~320 px, so the
-		// transient is ~2.3 MB and this holds today; a container declaring
-		// the full `MAX_PREVIEW_PIXELS` would put ~13.6 MB behind it,
-		// unpriced.
-		let max_pixels = MAX_PREVIEW_PIXELS.min(mem_budget as u64 / 8);
+		// Priced like any other decode, and the cap has to bind before libheif
+		// decodes, not after. The thumbnail is charged at the deeper rate
+		// whatever its own depth: real `thmb` items are ~320 px, far below
+		// where that binds, and its compressed item is a few kilobytes.
+		let max_pixels = MAX_PREVIEW_PIXELS.min(
+			(mem_budget.saturating_sub(DECODE_SETUP_BYTES) / DECODE_BYTES_PER_PIXEL_DEEP_CHROMA)
+				as u64,
+		);
+		// libheif's limits bind every decode in the session, and the ones the
+		// primary image gets would refuse its thumbnail on a large file: each
+		// decode is handed its own.
+		self.session
+			.set_decode_limits(max_pixels, mem_budget as u64);
 		let rgba = self
 			.session
 			.embedded_thumbnail_rgba(max_pixels)
@@ -123,20 +160,32 @@ impl PreparedDecode for PreparedHeif {
 		// Saturating like simple.rs: these factors are container-declared —
 		// a wrapped multiply must saturate into a guaranteed refusal, never
 		// into a small estimate that passes the budget gate.
-		match &self.tiling {
-			// One tile decoded at a time: libheif's internal RGBA plus our
-			// copy, ~8 B/px of TILE, independent of image size.
-			Some(tiling) => (tiling.tile_width as usize)
-				.saturating_mul(tiling.tile_height as usize)
-				.saturating_mul(8),
-			// Whole frame, same 2× accounting.
-			None => (self.dims.0 as usize)
-				.saturating_mul(self.dims.1 as usize)
-				.saturating_mul(8),
-		}
+		let (width, height) = match &self.tiling {
+			// One tile decoded at a time, independent of image size.
+			Some(tiling) => (tiling.tile_width, tiling.tile_height),
+			None => self.dims,
+		};
+		(width as usize)
+			.saturating_mul(height as usize)
+			.saturating_mul(self.bytes_per_pixel)
+			.saturating_add(DECODE_SETUP_BYTES)
+			.saturating_add(self.input_bytes)
 	}
 
-	fn decode_into(self: Box<Self>, sink: &mut dyn PixelSink) -> Result<(), ThumbError> {
+	fn decode_into(mut self: Box<Self>, sink: &mut dyn PixelSink) -> Result<(), ThumbError> {
+		// The container's declared tile dims (our peak_estimate) and the HEVC
+		// bitstreams' actual picture sizes are unrelated — and libheif skips
+		// its own whole-image size check on the tile path. These limits are
+		// the pre-allocation guard for a lying container: no decoded picture
+		// past what the budget could ever admit at this rate, no total past
+		// the budget itself.
+		let max_pixels = self
+			.mem_budget
+			.saturating_sub(DECODE_SETUP_BYTES)
+			.saturating_sub(self.input_bytes)
+			/ self.bytes_per_pixel;
+		self.session
+			.set_decode_limits(max_pixels as u64, self.mem_budget as u64);
 		let Some(tiling) = self.tiling else {
 			let rgba = self.session.decode_primary_rgba().map_err(decode_err)?;
 			return push_clipped(sink, &rgba, Area::whole(self.dims));
@@ -243,6 +292,32 @@ fn push_clipped(sink: &mut dyn PixelSink, block: &RgbaImage, area: Area) -> Resu
 		sink.push(dst_x, dst_y + r, width, &data[start..start + row_bytes])?;
 	}
 	Ok(())
+}
+
+/// The per-pixel rate for a decode of this depth and chroma format; an image
+/// that declares neither is charged the deeper rate.
+fn decode_bytes_per_pixel(bit_depth: Option<u8>, chroma: Option<ChromaFormat>) -> usize {
+	match (bit_depth, chroma) {
+		(Some(depth), _) if depth <= 8 => DECODE_BYTES_PER_PIXEL,
+		(Some(_), Some(ChromaFormat::Yuv420 | ChromaFormat::Monochrome)) => DECODE_BYTES_PER_PIXEL,
+		_ => DECODE_BYTES_PER_PIXEL_DEEP_CHROMA,
+	}
+}
+
+/// What libheif holds of a file's compressed input while it decodes one unit
+/// of `units` — the tiles of a grid, or 1 for a whole frame. It reads each
+/// tile's bitstream into a buffer of its own and keeps it until the session
+/// ends, so a grid's peak grows by its whole bitstream as the tiles go by;
+/// and the unit being decoded is held twice more on its way to the codec. A
+/// whole frame is one unit the size of the file: measured at 3x the item on
+/// bitstream-heavy files, where it dwarfs the pixels.
+///
+/// The file's length stands in for its bitstream, so anything else it carries
+/// (a motion photo's video) is charged too, and a grid's bytes are assumed
+/// spread across its tiles. One that piles them into a single tile is caught
+/// by libheif's own block and total limits instead, set from the same budget.
+fn input_bytes(file_len: usize, units: usize) -> usize {
+	file_len.saturating_add(file_len.div_ceil(units.max(1)).saturating_mul(2))
 }
 
 fn small_image(rgba: RgbaImage) -> SmallImage {

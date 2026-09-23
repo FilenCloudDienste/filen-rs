@@ -552,6 +552,19 @@ pub struct HeifTiling {
 	pub top_offset: u32,
 }
 
+/// How a picture's chroma is sampled against its luma, as coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromaFormat {
+	/// Luma alone.
+	Monochrome,
+	/// Chroma at half the luma resolution both ways.
+	Yuv420,
+	/// Chroma at half the luma width.
+	Yuv422,
+	/// Chroma at full resolution.
+	Yuv444,
+}
+
 /// The overhang a transformed grid carries on its leading (left or top) edge:
 /// `0` when libheif flags none there, else how far the grid runs past the
 /// image along that axis. `None` when the grid's overrun is not a sliver of
@@ -628,7 +641,16 @@ impl<T: Read + Seek> HeifSession<T> {
 	/// The limits live on the context and apply to every later decode call;
 	/// the container parse in [`new`](Self::new) already happened under
 	/// libheif's global defaults.
+	///
+	/// No single allocation may pass `max_total_memory` either. libheif reads
+	/// an item's compressed data into a buffer before counting it against the
+	/// total, and the block limit is the one check it makes first.
+	///
+	/// A zero ceiling refuses everything. libheif reads 0 as "no limit", so
+	/// what it is handed is never below 1.
 	pub fn set_decode_limits(&mut self, max_image_pixels: u64, max_total_memory: u64) {
+		let (max_image_pixels, max_total_memory) =
+			(max_image_pixels.max(1), max_total_memory.max(1));
 		self.max_image_pixels = Some(max_image_pixels);
 		self.tiles_validated.set(false);
 		let limits = unsafe { heif_context_get_security_limits(self.context.inner) };
@@ -640,6 +662,7 @@ impl<T: Read + Seek> HeifSession<T> {
 		unsafe {
 			(*limits).max_image_size_pixels = max_image_pixels;
 			(*limits).max_total_memory = max_total_memory;
+			(*limits).max_memory_block_size = max_total_memory;
 		}
 	}
 
@@ -654,6 +677,65 @@ impl<T: Read + Seek> HeifSession<T> {
 			return Err(HeifError::invalid_decoded_image());
 		}
 		Ok((width as u32, height as u32))
+	}
+
+	/// The primary image's bit depth — the deeper of luma and chroma — or
+	/// `None` when libheif cannot tell without decoding. For a grid it is its
+	/// tiles' depth, read from the first tile's decoder configuration.
+	///
+	/// Deeper samples are wider in every buffer a decode fills, so this is what
+	/// a caller prices the decode by.
+	pub fn primary_bit_depth(&self) -> Result<Option<u8>, HeifError> {
+		let primary = self.primary()?;
+		// SAFETY: plain getters on a handle that lives until the end of this
+		// function; each answers -1 when the depth is not declared.
+		let (luma, chroma) = unsafe {
+			(
+				heif_image_handle_get_luma_bits_per_pixel(primary.inner),
+				heif_image_handle_get_chroma_bits_per_pixel(primary.inner),
+			)
+		};
+		Ok(u8::try_from(luma.max(chroma))
+			.ok()
+			.filter(|&depth| depth > 0))
+	}
+
+	/// How the primary image's chroma is coded, or `None` when libheif cannot
+	/// tell without decoding or it is coded as neither YCbCr nor monochrome.
+	/// For a grid it is its tiles', read from the first tile's decoder
+	/// configuration, like [`primary_bit_depth`](Self::primary_bit_depth).
+	///
+	/// Full-resolution chroma fills every buffer a decode fills as wide as
+	/// luma does, so this, with the depth, is what a caller prices a decode by.
+	pub fn primary_chroma(&self) -> Result<Option<ChromaFormat>, HeifError> {
+		let primary = self.primary()?;
+		let mut colorspace = heif_colorspace_heif_colorspace_undefined;
+		let mut chroma = heif_chroma_heif_chroma_undefined;
+		// SAFETY: a getter on a handle that lives until the end of this
+		// function, writing through two pointers to locals that outlive it.
+		let result = unsafe {
+			heif_image_handle_get_preferred_decoding_colorspace(
+				primary.inner,
+				&mut colorspace,
+				&mut chroma,
+			)
+		};
+		if result.code != heif_error_code_heif_error_Ok {
+			return Ok(None);
+		}
+		Ok(match (colorspace, chroma) {
+			(heif_colorspace_heif_colorspace_monochrome, _) => Some(ChromaFormat::Monochrome),
+			(heif_colorspace_heif_colorspace_YCbCr, heif_chroma_heif_chroma_420) => {
+				Some(ChromaFormat::Yuv420)
+			}
+			(heif_colorspace_heif_colorspace_YCbCr, heif_chroma_heif_chroma_422) => {
+				Some(ChromaFormat::Yuv422)
+			}
+			(heif_colorspace_heif_colorspace_YCbCr, heif_chroma_heif_chroma_444) => {
+				Some(ChromaFormat::Yuv444)
+			}
+			_ => None,
+		})
 	}
 
 	/// The embedded thumbnail, decoded — `None` when there is none or it is

@@ -2,9 +2,10 @@
 # Regenerates the HEIF fixtures in this directory.
 #
 # Nothing in the tree encodes HEVC, so unlike the rest of the suite these are
-# built once with standard tools and committed. Every tile is 10-bit 4:2:2
-# HEVC, the profile a Fujifilm HIF carries, at a quantiser low enough that the
-# solid colours survive for the tests' colour checks.
+# built once with standard tools and committed. Tiles are 10-bit 4:2:2 HEVC,
+# the profile a Fujifilm HIF carries, unless a fixture says otherwise, at a
+# quantiser low enough that the solid colours survive for the tests' colour
+# checks.
 #
 # Needs ffmpeg (with libx265) and MP4Box (gpac):
 #   brew install ffmpeg gpac
@@ -20,7 +21,8 @@ trap 'rm -rf "$work"' EXIT
 #
 # One solid HEVC tile. RIGHT/BOTTOM paint a magenta band over that many
 # columns/rows at the tile's far edge: the pixels a grid overhangs its image
-# by, which a correct decode crops away and a misplaced one shows.
+# by, which a correct decode crops away and a misplaced one shows. PIX_FMT and
+# PROFILE override the 10-bit 4:2:2 default.
 tile() {
 	local out=$1 w=$2 h=$3 colour=$4 right=$5 bottom=$6
 	local vf=null
@@ -32,7 +34,8 @@ tile() {
 		vf="${vf}drawbox=x=0:y=$((h - bottom)):w=$w:h=$bottom:color=magenta:t=fill"
 	fi
 	ffmpeg -loglevel error -y -f lavfi -i "color=c=$colour:s=${w}x$h" -vf "$vf" \
-		-frames:v 1 -c:v libx265 -pix_fmt yuv422p10le -profile:v main422-10 \
+		-frames:v 1 -c:v libx265 -pix_fmt "${PIX_FMT:-yuv422p10le}" \
+		-profile:v "${PROFILE:-main422-10}" \
 		-x265-params log-level=error:qp=4:keyint=1 -f hevc "$out"
 }
 
@@ -84,3 +87,11 @@ grid grid-irot2.heic 120 90 64 48 ":rotation=180"
 grid grid-irot3.heic 120 90 64 48 ":rotation=270"
 grid grid-imir0.heic 120 90 64 48 ":mirror-axis=vertical"
 grid grid-imir1.heic 120 90 64 48 ":mirror-axis=horizontal"
+
+# The same grid in 10-bit 4:2:0: deeper samples, but chroma subsampled both
+# ways, which costs barely more to decode than 8 bits.
+PIX_FMT=yuv420p10le PROFILE=main10 grid grid-10bit-420.heic 120 90 64 48 ""
+
+# The same grid in 8-bit 4:2:0, as an iPhone writes its HEICs: the decode
+# charge follows the bit depth.
+PIX_FMT=yuv420p PROFILE=main grid grid-8bit.heic 120 90 64 48 ""
