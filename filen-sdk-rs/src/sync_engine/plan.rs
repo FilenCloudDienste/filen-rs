@@ -333,6 +333,12 @@ pub(crate) struct RemoteView {
 	/// How many items only the BUILT-IN defaults hid with no baseline row at or under them — left
 	/// out of `ignored` for the reason [`LocalScan::ignored_default_untracked`](super::scan::LocalScan::ignored_default_untracked)
 	/// gives. Counted per item rather than per root, since it is logged and never reported.
+	///
+	/// A LOG LINE, not a fact about the tree, and the only field here that a change-scoped pass
+	/// under-reports on purpose: [`filter_changed`](RemoteView::filter_changed) asks the rules about
+	/// the decided paths alone, so it counts hits among those and not the whole view. Anything that
+	/// ever needs the real number has to ask the rules about every node, which is the scan that
+	/// narrowing removed.
 	pub(crate) ignored_default_untracked: usize,
 }
 
@@ -623,8 +629,38 @@ impl RemoteView {
 	/// narrowing moved. THIS is the order; a caller that runs them itself mirrors it.
 	pub(crate) fn filter(&mut self, filter: Option<ViewFilter<'_>>) {
 		if let Some(filter) = filter {
-			self.hide(filter);
+			self.hide(filter, PassPaths::Whole);
 		}
+		self.resolve_collisions();
+	}
+
+	/// [`filter`](Self::filter) for a view a change-scoped pass DERIVED, which asks the rules only
+	/// about the paths that pass decided.
+	///
+	/// The narrowing rests on the rules standing still. Every level of them forces a whole read
+	/// when it changes — a `.filenignore` on either side, the user patterns, the pair's mode, all
+	/// [`FullPassReason::RulesChanged`](super::changes::FullPassReason::RulesChanged) — so a
+	/// scoped pass runs under exactly the rules its predecessor ran under, and a node it CARRIED
+	/// from a baseline row is a node those same rules already let through. What is left to ask
+	/// about is what moved: `decided` is the exact set of keys this pass's producers put somewhere
+	/// other than the node its row carries, which is the same set the reconcile is driven from.
+	///
+	/// The rows that are the exception — rows left at hidden paths by an `untrack_ignored` whose
+	/// subtree delete failed — stay in the view here where the whole form would drop them. That is
+	/// the safe direction, and deliberately so: their LOCAL half is carried from the same row, so
+	/// the pair reads as converged and the narrowed reconcile, which visits only `decided`, plans
+	/// nothing at them. Dropping the remote half alone is what would read as a local deletion.
+	///
+	/// [`ignored`](Self::ignored) therefore comes back holding only the roots among `decided`. A
+	/// root an earlier pass found goes on being reported and untracked without this pass re-deriving
+	/// it, because `PairFacts::merge_remote_view` EXTENDS the carried ignored roots with this set
+	/// rather than replacing them. Its PRUNE is the half that needs the care, and the reason that
+	/// merge takes a baseline: it drops the whole subtree under each touched path, so a carried root
+	/// strictly under one would be dropped on the strength of a view that never looked there. It
+	/// re-supplies such a root where the baseline still names a row at or under it, and drops one
+	/// with no rows left under it exactly as it did before this narrowing.
+	pub(crate) fn filter_changed(&mut self, filter: ViewFilter<'_>, decided: &BTreeSet<String>) {
+		self.hide(filter, PassPaths::Changed(decided));
 		self.resolve_collisions();
 	}
 
@@ -638,7 +674,11 @@ impl RemoteView {
 	/// byte-identical, so a rule hides them together, and a path the rules hide is blocked from
 	/// every action anyway — holding it costs the pass nothing and it is untracked, with its rule
 	/// reported, by the pass that finds the cache no longer mid-transition there.
-	pub(super) fn hide(&mut self, filter: ViewFilter<'_>) {
+	///
+	/// `paths` says which nodes to ASK the rules about: every one of them
+	/// ([`PassPaths::Whole`], what a pass that read the remote whole owes), or only the keys a
+	/// change-scoped pass decided (see [`filter_changed`](Self::filter_changed)).
+	pub(super) fn hide(&mut self, filter: ViewFilter<'_>, paths: PassPaths<'_>) {
 		let mut memo = HashMap::new();
 		let mut ignored = BTreeMap::new();
 		let mut untracked = 0usize;
@@ -663,8 +703,35 @@ impl RemoteView {
 			}
 			true
 		};
-		self.nodes
-			.retain(|rel_path, node| !hidden(rel_path, node.kind == NodeKind::Dir));
+		match paths {
+			PassPaths::Whole => self
+				.nodes
+				.retain(|rel_path, node| !hidden(rel_path, node.kind == NodeKind::Dir)),
+			PassPaths::Changed(decided) => {
+				let roots: Vec<String> = decided
+					.iter()
+					.filter_map(|rel_path| {
+						let is_dir = self.nodes.at(rel_path)?.kind == NodeKind::Dir;
+						hidden(rel_path, is_dir).then(|| rel_path.clone())
+					})
+					.collect();
+				for root in roots {
+					// Everything under a hidden directory goes with it, exactly as the whole form
+					// drops it: nothing under an ignored directory can be re-included.
+					//
+					// That costs a subtree walk of the side per hit, where the whole form pays one
+					// walk for the pass. Only a decided path that the rules hide pays it, which is
+					// a remote create or move INTO an already-ignored directory and nothing else —
+					// a rule that newly hides a directory forces a whole read instead. If that ever
+					// stops being rare, the subtree is also named key-by-key in `decided` (every
+					// re-key records both ends), so the walk can be dropped for a scan of the set.
+					for under in self.nodes.subtree_paths(&root) {
+						self.nodes.remove(&under);
+					}
+					self.nodes.remove(&root);
+				}
+			}
+		}
 		self.ignored = ignored;
 		self.ignored_default_untracked = untracked;
 		// An unplaceable item's own record leaves with whatever hides it: the holding directory for
@@ -6048,6 +6115,82 @@ mod tests {
 		let baseline = HashMap::new();
 		let (_, never_synced) = unknown_remote_paths(&tree(&baseline), &view.skipped);
 		assert_eq!(never_synced.len(), 1, "{never_synced:?}");
+	}
+
+	/// The narrowed filter a change-scoped pass runs asks the rules about the keys that pass
+	/// DECIDED, and about nothing else.
+	///
+	/// Both directions have to hold or the narrowing is wrong in one of the two ways that matter. A
+	/// decided path the rules hide has to leave with everything under it, exactly as the whole form
+	/// drops it — otherwise a remote create inside an ignored directory would be reconciled and
+	/// pulled. A path NO producer moved has to stay, which is the saving itself: its local half is
+	/// carried from the same baseline row, so the pair reads as converged and the reconcile — which
+	/// visits only the decided set — plans nothing at it.
+	#[test]
+	fn the_narrowed_filter_hides_the_decided_paths_and_leaves_the_carried_ones() {
+		let root = Uuid::new_v4();
+		let build = remote_dir("build", root);
+		let deep = remote_dir("deep", build.uuid);
+		let dirs = [build.clone(), deep.clone()];
+		let files = [
+			cacheable_file(build.uuid, "o.bin"),
+			cacheable_file(deep.uuid, "x.bin"),
+			cacheable_file(root, "keep.txt"),
+		];
+		let rules = root_rules("build/");
+		let no_rows = Baseline::default();
+		let filter = || ViewFilter {
+			rules: &rules,
+			baseline: &no_rows,
+		};
+		let decided = |paths: &[&str]| -> BTreeSet<String> {
+			paths.iter().map(|path| (*path).to_string()).collect()
+		};
+		let sorted = |view: &RemoteView| {
+			let mut paths: Vec<String> = view.nodes.paths().map(Cow::into_owned).collect();
+			paths.sort_unstable();
+			paths
+		};
+		let all = [
+			"build",
+			"build/deep",
+			"build/deep/x.bin",
+			"build/o.bin",
+			"keep.txt",
+		];
+
+		// Nothing the rules hide was decided: the whole ignored subtree is still carried, and the
+		// pass reports no root of its own (the carried facts hold the ones earlier passes found).
+		let mut carried = place_remote_items(root, &dirs, &files, &[]);
+		carried.filter_changed(filter(), &decided(&["keep.txt"]));
+		assert_eq!(
+			sorted(&carried),
+			all,
+			"a node no producer moved must not cost the pass a rule match"
+		);
+		assert!(carried.ignored.is_empty(), "{:?}", carried.ignored);
+
+		// The directory itself decided — a remote move of it into view — takes its subtree with it.
+		let mut moved = place_remote_items(root, &dirs, &files, &[]);
+		moved.filter_changed(filter(), &decided(&["build"]));
+		assert_eq!(sorted(&moved), ["keep.txt"]);
+		assert_eq!(moved.ignored.keys().collect::<Vec<_>>(), vec!["build"]);
+
+		// One item created under an ALREADY ignored directory: only that key was decided, so only
+		// it leaves — and the root recorded is the directory the rule names, not the item.
+		let mut created = place_remote_items(root, &dirs, &files, &[]);
+		created.filter_changed(filter(), &decided(&["build/deep/x.bin"]));
+		assert_eq!(
+			sorted(&created),
+			["build", "build/deep", "build/o.bin", "keep.txt"]
+		);
+		assert_eq!(created.ignored.keys().collect::<Vec<_>>(), vec!["build"]);
+
+		// The same three inputs read WHOLE: every hidden node goes, whatever was decided. This is
+		// what the narrowed form is allowed to differ from, and the difference is the saving.
+		let mut whole = place_remote_items(root, &dirs, &files, &[]);
+		whole.filter(Some(filter()));
+		assert_eq!(sorted(&whole), ["keep.txt"]);
 	}
 
 	/// A root pattern of `*` empties the filtered view, rule file included, while the unfiltered one
