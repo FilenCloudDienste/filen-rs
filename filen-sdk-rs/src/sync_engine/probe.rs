@@ -334,6 +334,73 @@ impl Probe {
 	}
 }
 
+/// What each whole-tree scan of one change-scoped pass cost, timed INSIDE the phase that ran them.
+///
+/// In-run deltas are the only figures two builds can be compared on: step 1b found a binary-wide
+/// systematic worth ~3.5 % between two builds of code that had not changed, which swamps every scan
+/// here but the largest. A row recorded from these fields is one process's own accounting of the
+/// phase printed beside it, so `sum(scans) < phase` always holds within one run and the remainder
+/// is the per-change work the scans are not.
+#[derive(Default)]
+struct ScanCosts {
+	/// `derive::from_baseline`: two maps sized to the whole baseline, one visit per row.
+	from_baseline: Duration,
+	/// `RemoteObservation::new`'s uuid index over the whole derived map, plus applying the delta
+	/// (empty here, so what is left is the index).
+	observe_remote: Duration,
+	/// `load_remote_rules`' candidate scan over the UNFILTERED view.
+	rule_files_scan: Duration,
+	/// `RuleFiles::Only`'s scan of every baseline row. Zero on a mode that pushes, which never
+	/// builds it.
+	rule_files_only: Duration,
+	/// `RemoteView::filter` — `hide`'s whole-map `retain` and `resolve_collisions`' whole-map key
+	/// scan, which no seam separates from outside.
+	view_filter: Duration,
+	/// `PendingWrites::fold_into`'s uuid index over the whole view.
+	pending_fold: Duration,
+}
+
+impl ScanCosts {
+	/// One row per scan, named `<phase>__<scan>` so a TSV groups them under the phase they were
+	/// measured in.
+	fn record(&self, probe: &mut Probe, phase: &str, items: usize) {
+		for (scan, elapsed, detail) in [
+			(
+				"from_baseline",
+				self.from_baseline,
+				"two maps sized to the baseline, one visit per row",
+			),
+			(
+				"observe_remote",
+				self.observe_remote,
+				"`RemoteObservation::new`'s uuid index over the whole derived map",
+			),
+			(
+				"rule_files_scan",
+				self.rule_files_scan,
+				"`load_remote_rules`' candidate scan over the unfiltered view",
+			),
+			(
+				"rule_files_only",
+				self.rule_files_only,
+				"`RuleFiles::Only`'s scan of every baseline row; 0 on a mode that pushes",
+			),
+			(
+				"view_filter",
+				self.view_filter,
+				"`hide`'s whole-map retain plus `resolve_collisions`' whole-map key scan",
+			),
+			(
+				"pending_fold",
+				self.pending_fold,
+				"`PendingWrites::fold_into`'s uuid index over the whole view",
+			),
+		] {
+			probe.record(&format!("{phase}__{scan}"), items, elapsed, detail);
+		}
+	}
+}
+
 /// Bytes as mebibytes: the unit every memory figure in this harness is written in.
 fn mib(bytes: u64) -> f64 {
 	bytes as f64 / (1024.0 * 1024.0)
@@ -876,10 +943,14 @@ fn pass_pure(
 ///   does grow with the tree. Deliberate: it is one `Baseline` path resolve per key and a shipped
 ///   release pass does not run it (see `prepare_scoped`).
 ///
-/// The three per-node steps this phase used to leave out are in it as of this round —
+/// The three per-node steps this phase used to leave out are in it as of the previous round —
 /// `load_remote_rules`' candidate scan over the UNFILTERED view, `RuleFiles::Only`'s scan of every
 /// baseline row on a mode that does not push, and `PendingWrites::fold_into`'s whole-view `path_of`
 /// rebuild — which is why no figure here is comparable with one recorded before the rename.
+///
+/// Each whole-tree scan inside the phase is also timed on its own ([`ScanCosts`]) and reported as a
+/// `<phase>__<scan>` row. Those are in-run deltas and are what a narrowing is judged on: an
+/// absolute figure at a million rows is not trustworthy between two builds to better than ~10 %.
 ///
 /// The fold is here because `prepare_scoped` ends with it exactly as `prepare_whole` does, and
 /// because [`pass_pure`] pays it: a phase that skipped it would credit change-scoping with the cost
@@ -888,23 +959,28 @@ fn pass_pure(
 /// What a whole pass does and this does not: the cache snapshot, both view builds, and the walk of
 /// the tree.
 ///
-/// Returns the action count, so a phase that was supposed to plan something can say whether it did.
+/// Returns the action count, so a phase that was supposed to plan something can say whether it did,
+/// and what each whole-tree scan inside it cost ([`ScanCosts`]).
 fn prepare_scoped(
 	fixture: &Fixture,
 	store: &BaselineStore,
 	pair: i64,
 	mode: SyncMode,
 	dirty: BTreeSet<String>,
-) -> usize {
+) -> (usize, ScanCosts) {
+	let mut costs = ScanCosts::default();
 	let mut baseline = store.baseline(pair).expect("reading the baseline");
-	let mut derived = derive::from_baseline(&baseline, dirty);
+	let (mut derived, elapsed) = timed(|| derive::from_baseline(&baseline, dirty));
+	costs.from_baseline = elapsed;
 
 	// The remote half FIRST, as the pass runs it: every path the delta touched is a path the local
 	// half has to re-observe too. `RemoteObservation::new` indexes the whole derived map by uuid
 	// before a single change is applied, which is per-node work every scoped pass pays.
 	let nodes = mem::take(&mut derived.remote);
 	let mut ancestry = |uuid| cache_ancestry(&fixture.cache_db, uuid);
-	let observed = observe_remote(fixture.remote_root, &baseline, nodes, &[], &mut ancestry);
+	let (observed, elapsed) =
+		timed(|| observe_remote(fixture.remote_root, &baseline, nodes, &[], &mut ancestry));
+	costs.observe_remote = elapsed;
 	// A GUARD, and not a check that can fail on this fixture: with an EMPTY delta `observe_remote`
 	// never enters the loop that refuses a change, and its only other route to `Full` needs an
 	// emptied view over a baseline that still has remote rows, which a converged fixture cannot
@@ -944,20 +1020,26 @@ fn prepare_scoped(
 	// rule file has to be told to serve it instead of quietly timing a network read in here.
 	let local_root = &fixture.root;
 	let cached: HashMap<Uuid, Arc<str>> = HashMap::new();
-	let remote_rules = futures::executor::block_on(load_remote_rules(
-		mode,
-		&view,
-		Some(parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile")),
-		|dir| scan::rule_file_metadata(&local_root.join(dir)).map_or(true, |found| found.is_some()),
-		|dir| baseline.contains_key(&Origin::File { dir }.to_string()),
-		&cached,
-		|_uuid| async move {
-			panic!(
-				"the probe's fixture holds no remote `.filenignore`, so this phase times the scan \
-				 that looks for one and never a fetch"
-			)
-		},
-	));
+	let (remote_rules, elapsed) = timed(|| {
+		futures::executor::block_on(load_remote_rules(
+			mode,
+			&view,
+			Some(parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile")),
+			|dir| {
+				scan::rule_file_metadata(&local_root.join(dir))
+					.map_or(true, |found| found.is_some())
+			},
+			|dir| baseline.contains_key(&Origin::File { dir }.to_string()),
+			&cached,
+			|_uuid| async move {
+				panic!(
+					"the probe's fixture holds no remote `.filenignore`, so this phase times the \
+					 scan that looks for one and never a fetch"
+				)
+			},
+		))
+	});
+	costs.rule_files_scan = elapsed;
 	assert!(
 		remote_rules.blocked.is_empty() && remote_rules.errors.is_empty(),
 		"the scan must find no remote rule file to read on this fixture: blocked {:?}, errors {:?}",
@@ -967,17 +1049,22 @@ fn prepare_scoped(
 	// `RuleFiles::Only`, which a mode that does not push builds by iterating EVERY baseline row
 	// with a view lookup per row. A pushing pair never pays it, which is why this function takes a
 	// mode: both answers are measured rather than one being read off the other.
-	let rule_files = if mode.pushes() {
-		RuleFiles::Read
-	} else {
-		RuleFiles::Only(
-			baseline
-				.iter()
-				.filter(|entry| entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path))
-				.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
-				.collect(),
-		)
-	};
+	let (rule_files, elapsed) = timed(|| {
+		if mode.pushes() {
+			RuleFiles::Read
+		} else {
+			RuleFiles::Only(
+				baseline
+					.iter()
+					.filter(|entry| {
+						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
+					})
+					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+					.collect(),
+			)
+		}
+	});
+	costs.rule_files_only = elapsed;
 
 	// The local half: one stat per dirty path and its ancestors, one subtree walk per dirty
 	// directory. `derived.dirty` and not the caller's set, because `from_baseline` adds every row
@@ -1000,10 +1087,13 @@ fn prepare_scoped(
 	);
 	// The rules, then the case-fold collision check — both over the WHOLE view, and both paid by
 	// every scoped pass.
-	view.filter(Some(plan::ViewFilter {
-		rules: &rules,
-		baseline: &baseline,
-	}));
+	let ((), elapsed) = timed(|| {
+		view.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &baseline,
+		}));
+	});
+	costs.view_filter = elapsed;
 	// The paths an observation found hidden with a row still behind them, added AFTER the filter
 	// exactly as the pass adds them.
 	view.held_paths.append(&mut derived.held);
@@ -1035,7 +1125,9 @@ fn prepare_scoped(
 		"the fold must have a record to walk, or the 0 below is an early return and this phase is \
 		 timing nothing"
 	);
-	let folded = pending.fold_into(pair, &baseline, &mut view.nodes, &mut derived.decided);
+	let (folded, elapsed) =
+		timed(|| pending.fold_into(pair, &baseline, &mut view.nodes, &mut derived.decided));
+	costs.pending_fold = elapsed;
 	assert_eq!(
 		folded, 0,
 		"the fixture's view already shows the row's own uuid at that path, so the fold has nothing \
@@ -1066,7 +1158,7 @@ fn prepare_scoped(
 			.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
 			.collect();
 	}
-	plan::reconcile(
+	let actions = plan::reconcile(
 		mode,
 		&baseline,
 		&local,
@@ -1075,7 +1167,8 @@ fn prepare_scoped(
 		plan::PassPaths::Changed(&decided),
 	)
 	.actions
-	.len()
+	.len();
+	(actions, costs)
 }
 
 /// Run every phase once and return the TSV. One header comment naming the shape, then one line per
@@ -2007,7 +2100,7 @@ pub fn run() -> String {
 	fs::write(fixture.root.join(&changed), b"changed by the probe")
 		.expect("changing one probe file");
 	let dirty = BTreeSet::from([changed.clone()]);
-	let (scoped_actions, scoped) =
+	let ((scoped_actions, scoped_costs), scoped) =
 		timed(|| prepare_scoped(&fixture, &store, pair, SyncMode::TwoWay, dirty.clone()));
 	probe.record(
 		"scoped_twoway_one_file_changed",
@@ -2024,12 +2117,13 @@ pub fn run() -> String {
 		scoped_actions, 1,
 		"one changed file must plan exactly one action, or this phase is timing the wrong thing"
 	);
+	scoped_costs.record(&mut probe, "scoped_twoway_one_file_changed", nodes);
 
 	// The same wake on a pair that only PULLS, which is the mode that pays `RuleFiles::Only` — a
 	// scan of every baseline row with a view lookup per row, built before the local half reads
 	// anything. No pushing pair pays it, so pricing those modes off the row above would understate
 	// them by a whole-tree scan.
-	let (pull_actions, pull) = timed(|| {
+	let ((pull_actions, pull_costs), pull) = timed(|| {
 		prepare_scoped(
 			&fixture,
 			&store,
@@ -2052,6 +2146,7 @@ pub fn run() -> String {
 		"a local edit on a pull-only pair is the remote's to overwrite, so the count is fixed; a \
 		 different one means this phase is no longer timing that pass"
 	);
+	pull_costs.record(&mut probe, "scoped_pull_one_file_changed", nodes);
 
 	// The phase the one-per-cent target is read off: a real change-scoped pass, with one per cent
 	// of the files edited on disk and named in its dirty set.
@@ -2073,7 +2168,7 @@ pub fn run() -> String {
 		.expect("changing a probe file");
 	}
 	let percent_dirty: BTreeSet<String> = percent_changed.iter().cloned().collect();
-	let (percent_actions, percent) = timed(|| {
+	let ((percent_actions, _), percent) = timed(|| {
 		prepare_scoped(
 			&fixture,
 			&store,
@@ -2101,7 +2196,7 @@ pub fn run() -> String {
 	// The floor the same machinery costs with NOTHING dirty. The engine does not pay it — a wake
 	// with an empty change list returns before it reads anything — so this is the cost that
 	// skipping an idle wake avoids, not a cost any pass incurs.
-	let (idle_actions, idle) =
+	let ((idle_actions, _), idle) =
 		timed(|| prepare_scoped(&fixture, &store, pair, SyncMode::TwoWay, BTreeSet::new()));
 	probe.record(
 		"scoped_twoway_idle_floor",
