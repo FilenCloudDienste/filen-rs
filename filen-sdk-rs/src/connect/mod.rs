@@ -364,6 +364,11 @@ pub(crate) struct ConnectedTargets {
 }
 
 impl ConnectedTargets {
+	/// True when the directory has no usable link and no share, so nothing needs propagating.
+	pub(crate) fn is_empty(&self) -> bool {
+		self.links.is_empty() && self.users.is_empty()
+	}
+
 	/// One operation per (link, item) and (user, item) pair: links first, then users.
 	fn operations<'t, 'i, 'a>(
 		&'t self,
@@ -548,27 +553,31 @@ impl Client {
 	) -> Result<(), Error> {
 		let uuid = (*item.parent()).try_into()?;
 
-		let (targets, items_to_process) =
-			futures::try_join!(self.fetch_connected_targets(uuid), async move {
-				if let NonRootItemType::Dir(dir) = item {
-					let (dirs, files) = Normal::list_dir_recursive(
-						self,
-						&DirType::Dir(Cow::Borrowed(dir.as_ref())),
-						None::<&fn(u64, Option<u64>)>,
-						(),
-					)
-					.await?;
+		let targets = self.fetch_connected_targets(uuid).await?;
+		// Without a link or share there is nothing to add the item (or a directory's subtree) to,
+		// so skip the recursive listing entirely.
+		if targets.is_empty() {
+			return Ok(());
+		}
 
-					// not using the closure here causes a borrow checker error
-					#[allow(clippy::redundant_closure)]
-					Ok(std::iter::once(NonRootItemType::<Normal>::Dir(dir))
-						.chain(dirs.into_iter().map(|d| NonRootItemType::from(d)))
-						.chain(files.into_iter().map(|f| NonRootItemType::from(f)))
-						.collect::<Vec<NonRootItemType<'_, Normal>>>())
-				} else {
-					Ok(vec![item])
-				}
-			})?;
+		let items_to_process = if let NonRootItemType::Dir(dir) = item {
+			let (dirs, files) = Normal::list_dir_recursive(
+				self,
+				&DirType::Dir(Cow::Borrowed(dir.as_ref())),
+				None::<&fn(u64, Option<u64>)>,
+				(),
+			)
+			.await?;
+
+			// not using the closure here causes a borrow checker error
+			#[allow(clippy::redundant_closure)]
+			std::iter::once(NonRootItemType::<Normal>::Dir(dir))
+				.chain(dirs.into_iter().map(|d| NonRootItemType::from(d)))
+				.chain(files.into_iter().map(|f| NonRootItemType::from(f)))
+				.collect::<Vec<NonRootItemType<'_, Normal>>>()
+		} else {
+			vec![item]
+		};
 
 		let errors = self.propagate_to_targets(&targets, &items_to_process).await;
 		for error in &errors {
@@ -1227,6 +1236,21 @@ mod tests {
 			email: Cow::Owned(format!("user{id}@example.com")),
 			public_key: key.to_public_key(),
 		}
+	}
+
+	#[test]
+	fn targets_are_empty_only_without_links_and_users() {
+		assert!(ConnectedTargets::default().is_empty());
+		let with_link = ConnectedTargets {
+			links: vec![test_link()],
+			users: Vec::new(),
+		};
+		assert!(!with_link.is_empty());
+		let with_user = ConnectedTargets {
+			links: Vec::new(),
+			users: vec![test_user(1)],
+		};
+		assert!(!with_user.is_empty());
 	}
 
 	#[test]
