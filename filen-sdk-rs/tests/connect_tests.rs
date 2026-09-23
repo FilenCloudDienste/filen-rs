@@ -1,14 +1,25 @@
+use std::{borrow::Cow, sync::Arc};
+
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
+	auth::Client,
 	connect::{DirPublicLink, PublicLinkSharedClientExt},
+	consts::CHUNK_SIZE,
 	fs::{
-		HasName, HasUUID, categories::Shared, dir::meta::DirectoryMetaChanges,
+		HasName, HasUUID,
+		categories::{DirType, Shared},
+		copy::{CopyOptions, CopySource, CopySourceDir, JobControl},
+		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::meta::FileMetaChanges,
 	},
 	io::{HasFileInfo, client_impl::IoSharedClientExt},
 };
-use filen_types::api::v3::dir::link::PublicLinkExpiration;
+use filen_types::api::v3::{contacts::Contact, dir::link::PublicLinkExpiration};
+use tokio::sync::watch;
+
+mod copy_helpers;
+use copy_helpers::{PauseOnCreate, Recorder, contents, copy, data, upload, wait_until_paused};
 
 #[shared_test_runtime]
 async fn dir_public_link() {
@@ -790,6 +801,15 @@ async fn share_dir() {
 	assert_eq!(shared_files_in[0].name().unwrap(), "new_file_name.txt");
 
 	assert!(files.contains(&sub_file.clone().into_anonymous()));
+
+	copy_with_shares(
+		client,
+		share_client,
+		test_dir,
+		&share_resources.dir,
+		contact,
+	)
+	.await;
 }
 
 // #[shared_test_runtime]
@@ -952,3 +972,237 @@ async fn share_dir() {
 // 	assert_eq!(contacts.len(), 1);
 // 	assert_eq!(contacts[0].email, client.email());
 // }
+
+/// Copying with shares: shared-in files and directories as sources, a shared and linked
+/// destination, a destination below a shared one, and a destination shared while the copy
+/// runs. It runs inside `share_dir` to reuse that test's contact setup (a long wait, and a
+/// lock every CI leg contends for). Every fixture lives in the two accounts' per-test
+/// directories, which are deleted, with their shares and links, when the test ends.
+async fn copy_with_shares(
+	client: &Arc<Client>,
+	share_client: &Arc<Client>,
+	test_dir: &RemoteDirectory,
+	share_test_dir: &RemoteDirectory,
+	contact: &Contact<'_>,
+) {
+	let client = client.clone();
+	let share_client = share_client.clone();
+	// the main account's fixtures
+	let shared = client.create_dir(&test_dir.into(), "shared").await.unwrap();
+	let nested = client
+		.create_dir(&(&shared).into(), "nested")
+		.await
+		.unwrap();
+	let top = upload(&client, &shared, "top.txt", b"top of the share").await;
+	let deep = upload(&client, &nested, "deep.bin", &data(CHUNK_SIZE + 5, 3)).await;
+	let solo = upload(&client, test_dir, "solo.txt", b"a shared file").await;
+	let own = client.create_dir(&test_dir.into(), "own").await.unwrap();
+	let own_file = upload(&client, &own, "own.txt", b"copied into shares").await;
+	let dest = client.create_dir(&test_dir.into(), "dest").await.unwrap();
+	let inner = client.create_dir(&(&dest).into(), "inner").await.unwrap();
+	let later = client.create_dir(&test_dir.into(), "later").await.unwrap();
+
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&shared, contact, None)
+		.await
+		.unwrap();
+	client.share_file(&solo, contact).await.unwrap();
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&dest, contact, None)
+		.await
+		.unwrap();
+	let dest_link: DirPublicLink = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dest, None)
+		.await
+		.unwrap()
+		.try_into()
+		.unwrap();
+	// shares take a moment to show up on the other side
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+	// Shared-in sources: the share root, a directory and a file inside it, and a shared file.
+	let (in_dirs, in_files) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let shared_in = in_dirs
+		.iter()
+		.find(|d| d.get_dir().uuid() == shared.uuid())
+		.unwrap()
+		.clone();
+	let role = shared_in.sharing_role().clone();
+	let (sub_dirs, sub_files) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&DirType::Root(Cow::Borrowed(&shared_in)),
+			&role,
+			None,
+		)
+		.await
+		.unwrap();
+	let nested_in = sub_dirs
+		.iter()
+		.find(|d| d.get_dir().uuid() == nested.uuid())
+		.unwrap()
+		.clone();
+	let top_in = sub_files
+		.iter()
+		.find(|f| f.uuid() == top.uuid())
+		.unwrap()
+		.clone();
+	let solo_in = in_files
+		.iter()
+		.find(|f| f.uuid() == solo.uuid())
+		.unwrap()
+		.clone();
+	let outcome = copy(
+		&share_client,
+		vec![
+			CopySource::Dir(CopySourceDir::Shared(
+				DirType::Root(Cow::Owned(shared_in)),
+				role.clone(),
+			)),
+			CopySource::Dir(CopySourceDir::Shared(
+				DirType::Dir(Cow::Owned(nested_in)),
+				role,
+			)),
+			CopySource::File(top_in.into()),
+			CopySource::File(solo_in.into()),
+		],
+		share_test_dir,
+	)
+	.await;
+	outcome.result.unwrap();
+	assert!(outcome.report.failures.is_empty());
+	assert_eq!(outcome.report.top_level.len(), 4);
+	let (_, copied) = contents(&share_client, share_test_dir).await;
+	for path in [
+		"shared/top.txt",
+		"shared/nested/deep.bin",
+		"nested/deep.bin",
+		"top.txt",
+		"solo.txt",
+	] {
+		assert!(copied.iter().any(|(p, _)| p == path), "{path} was copied");
+	}
+	for (path, original) in [
+		("shared/nested/deep.bin", &deep),
+		("top.txt", &top),
+		("solo.txt", &solo),
+	] {
+		let (_, copy) = copied.iter().find(|(p, _)| p == path).unwrap();
+		assert_eq!(
+			share_client.download_file(copy).await.unwrap(),
+			client.download_file(original).await.unwrap(),
+			"{path} has the same contents"
+		);
+	}
+
+	// Shared (and linked) destinations: a copy into the shared directory and one into a
+	// directory below it both reach the other account and the public link.
+	for destination in [&dest, &inner] {
+		copy(
+			&client,
+			vec![CopySource::Dir(CopySourceDir::Normal(own.clone()))],
+			destination,
+		)
+		.await
+		.result
+		.unwrap();
+	}
+	let (in_dirs, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let dest_in = in_dirs
+		.iter()
+		.find(|d| d.get_dir().uuid() == dest.uuid())
+		.unwrap();
+	let (_, seen_files) = share_client
+		.list_shared_dir_recursive::<fn(u64, Option<u64>)>(
+			&dest_in.into(),
+			dest_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	let copies_seen = seen_files
+		.iter()
+		.filter(|f| f.name() == own_file.name())
+		.count();
+	assert_eq!(copies_seen, 2, "both copies are shared");
+	let link_info = client
+		.get_unauthed()
+		.get_dir_public_link_info(*dest_link.uuid(), &dest_link.key_string())
+		.await
+		.unwrap();
+	let (_, linked_files) = client
+		.get_unauthed()
+		.list_linked_dir_recursive::<fn(u64, Option<u64>)>(
+			&(&link_info.root).into(),
+			&link_info.link,
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		linked_files
+			.iter()
+			.filter(|f| f.name() == own_file.name())
+			.count(),
+		2,
+		"both copies are in the public link"
+	);
+
+	// A destination shared while the copy runs: paused once the copy's directory exists,
+	// shared, then resumed; the finished copy reaches the other account.
+	let recorder = Arc::new(Recorder::default());
+	let (pause, pause_rx) = watch::channel(false);
+	let running = tokio::spawn({
+		let client = client.clone();
+		let own = own.clone();
+		let later = later.clone();
+		let callback = PauseOnCreate {
+			recorder: recorder.clone(),
+			pause: pause.clone(),
+		};
+		async move {
+			client
+				.copy_items(
+					vec![CopySource::Dir(CopySourceDir::Normal(own))],
+					later.into(),
+					CopyOptions::default(),
+					callback,
+					JobControl::new(Some(pause_rx), None),
+				)
+				.await
+		}
+	});
+	wait_until_paused(&recorder).await;
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&later, contact, None)
+		.await
+		.unwrap();
+	pause.send_replace(false);
+	running.await.unwrap().result.unwrap();
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+	let (in_dirs, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let later_in = in_dirs
+		.iter()
+		.find(|d| d.get_dir().uuid() == later.uuid())
+		.unwrap();
+	let (_, seen_files) = share_client
+		.list_shared_dir_recursive::<fn(u64, Option<u64>)>(
+			&later_in.into(),
+			later_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert!(
+		seen_files.iter().any(|f| f.name() == own_file.name()),
+		"items copied before the share was added are shared too"
+	);
+}

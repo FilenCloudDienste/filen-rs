@@ -1,7 +1,4 @@
-use std::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
+use std::{borrow::Cow, sync::Arc};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
@@ -11,94 +8,21 @@ use filen_sdk_rs::{
 	consts::CHUNK_SIZE,
 	fs::{
 		HasName, HasUUID,
-		categories::{DirType, Normal, fs::CategoryFS},
+		categories::DirType,
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyOptions, CopyPhase, CopySource, CopySourceDir,
-			CopyUpdate, JobControl, PlannedTopLevelItem,
+			CopiedTopLevel, CopyCallback, CopyEvent, CopyOptions, CopyPhase, CopyRequest,
+			CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl, PlannedTopLevelItem,
 		},
 		dir::RemoteDirectory,
-		file::{RemoteFile, traits::HasFileInfo},
+		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
 	},
 	io::client_impl::IoSharedClientExt,
 };
 use filen_types::api::v3::dir::color::DirColor;
+use tokio::sync::watch;
 
-#[derive(Default)]
-struct Recorder {
-	planned: Mutex<Vec<PlannedTopLevelItem>>,
-	created: Mutex<Vec<CopiedTopLevel>>,
-	updates: Mutex<Vec<CopyUpdate>>,
-}
-
-impl CopyCallback for Recorder {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-		self.planned.lock().unwrap().extend(items);
-	}
-
-	fn top_level_created(&self, item: CopiedTopLevel) {
-		self.created.lock().unwrap().push(item);
-	}
-
-	fn update(&self, update: CopyUpdate) {
-		self.updates.lock().unwrap().push(update);
-	}
-}
-
-async fn upload(client: &Client, parent: &RemoteDirectory, name: &str, data: &[u8]) -> RemoteFile {
-	let builder = client.make_file_builder(name, parent.uuid()).unwrap();
-	client.upload_file(builder, data).await.unwrap()
-}
-
-fn data(len: usize, seed: u8) -> Vec<u8> {
-	(0..len)
-		.map(|i| (i as u8).wrapping_mul(31) ^ seed)
-		.collect()
-}
-
-/// `dir`'s recursive contents, keyed by the path below `dir`.
-async fn contents(
-	client: &Client,
-	dir: &RemoteDirectory,
-) -> (Vec<(String, RemoteDirectory)>, Vec<(String, RemoteFile)>) {
-	let (dirs, files) = Normal::list_dir_recursive(
-		client,
-		&DirType::Dir(Cow::Borrowed(dir)),
-		None::<&fn(u64, Option<u64>)>,
-		(),
-	)
-	.await
-	.unwrap();
-	let path_of = |uuid: filen_types::fs::Uuid| {
-		let mut parts = Vec::new();
-		let mut current = uuid;
-		while current != dir.uuid() {
-			let parent = dirs.iter().find(|d| d.uuid() == current).unwrap();
-			parts.push(parent.name().unwrap().to_owned());
-			current = (*parent.parent()).try_into().unwrap();
-		}
-		parts.reverse();
-		parts.join("/")
-	};
-	use filen_sdk_rs::fs::HasParent;
-	let dir_paths = dirs
-		.iter()
-		.map(|d| (path_of(d.uuid()), d.clone()))
-		.collect();
-	let file_paths = files
-		.iter()
-		.map(|f| {
-			let parent: filen_types::fs::Uuid = (*f.parent()).try_into().unwrap();
-			let prefix = path_of(parent);
-			let path = if prefix.is_empty() {
-				f.name().unwrap().to_owned()
-			} else {
-				format!("{prefix}/{}", f.name().unwrap())
-			};
-			(path, f.clone())
-		})
-		.collect();
-	(dir_paths, file_paths)
-}
+mod copy_helpers;
+use copy_helpers::{Recorder, assert_same_files, contents, copy, data, upload};
 
 #[shared_test_runtime]
 async fn copy_tree_keeps_contents_and_metadata() {
@@ -430,5 +354,720 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 	assert!(
 		files.len() < 3,
 		"the copy stopped before copying every file"
+	);
+}
+
+/// Deletes an item created outside the per-test directory when the test ends, pass or fail.
+struct DeleteOnDrop {
+	client: Arc<Client>,
+	file: Option<RemoteFile>,
+}
+
+impl Drop for DeleteOnDrop {
+	fn drop(&mut self) {
+		let (client, file) = (self.client.clone(), self.file.take());
+		let cleanup = async move {
+			if let Some(file) = file
+				&& let Err(e) = client.delete_file_permanently(file).await
+			{
+				eprintln!("failed to clean up a copy in the drive root: {e}");
+			}
+		};
+		match tokio::runtime::Handle::try_current() {
+			Ok(handle) => {
+				handle.spawn(cleanup);
+			}
+			Err(_) => test_utils::rt().block_on(cleanup),
+		}
+	}
+}
+
+// ── Public-link sources ─────────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn copies_from_public_links() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let unauthed = client.get_unauthed();
+
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	let sub = client.create_dir(&(&source).into(), "sub").await.unwrap();
+	let in_sub = upload(&client, &sub, "in-sub.txt", &data(2 * CHUNK_SIZE, 5)).await;
+	let file = upload(&client, test_dir, "linked.txt", b"a linked file").await;
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+
+	// a password-protected directory link
+	let password = "copy-password";
+	let mut link_rw = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&source, None)
+		.await
+		.unwrap();
+	link_rw.set_password(password.to_owned());
+	client.update_dir_link(&source, &link_rw).await.unwrap();
+	let link: DirPublicLink = link_rw.try_into().unwrap();
+	let info = unauthed
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+
+	// without the password the listing is refused and nothing is created
+	let outcome = copy(
+		&client,
+		vec![CopySource::Dir(CopySourceDir::Linked(
+			DirType::Root(Cow::Owned(info.root.clone())),
+			info.link.clone(),
+		))],
+		&destination,
+	)
+	.await;
+	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::WrongPassword);
+	let (dirs, files) = contents(&client, &destination).await;
+	assert!(dirs.is_empty() && files.is_empty());
+
+	// with it: a directory nested in the link, and a file link
+	let mut link = info.link;
+	link.set_password(password.to_owned());
+	let (linked_dirs, _) = unauthed
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &link, None)
+		.await
+		.unwrap();
+	let sub_linked = linked_dirs
+		.iter()
+		.find(|d| d.uuid() == sub.uuid())
+		.unwrap()
+		.clone();
+	let file_link = client.public_link_file(&file).await.unwrap();
+	let file_key = file.key().unwrap().to_str();
+	let linked_file = unauthed
+		.get_linked_file(file_link.uuid(), file_key.as_ref(), None)
+		.await
+		.unwrap();
+	let outcome = copy(
+		&client,
+		vec![
+			CopySource::Dir(CopySourceDir::Linked(
+				DirType::Dir(Cow::Owned(sub_linked)),
+				link,
+			)),
+			CopySource::File(linked_file.into()),
+		],
+		&destination,
+	)
+	.await;
+	outcome.result.unwrap();
+	assert!(outcome.report.failures.is_empty());
+	let (_, copied) = contents(&client, &destination).await;
+	assert_same_files(
+		&client,
+		&copied,
+		&[("sub/in-sub.txt", &in_sub), ("linked.txt", &file)],
+	)
+	.await;
+}
+
+// ── Requests, destinations and names ────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn copy_items_to_takes_a_destination_and_name_per_request() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	let file = upload(&client, test_dir, "f.txt", b"one file, many copies").await;
+	let dir = client.create_dir(&test_dir.into(), "d").await.unwrap();
+	upload(&client, &dir, "inside.txt", b"inside").await;
+	let first = client.create_dir(&test_dir.into(), "first").await.unwrap();
+	let second = client.create_dir(&test_dir.into(), "second").await.unwrap();
+	upload(&client, &second, "renamed.txt", b"already here").await;
+
+	let request =
+		|source: CopySource, destination: &RemoteDirectory, name: Option<&str>| CopyRequest {
+			source,
+			destination: destination.clone().into(),
+			name: name.map(str::to_owned),
+		};
+	let outcome = client
+		.clone()
+		.copy_items_to(
+			vec![
+				request(CopySource::File(file.clone().into()), &first, None),
+				request(
+					CopySource::File(file.clone().into()),
+					&second,
+					Some("renamed.txt"),
+				),
+				request(
+					CopySource::Dir(CopySourceDir::Normal(dir.clone())),
+					&second,
+					Some("dir copy"),
+				),
+				// the same source into the same place again
+				request(CopySource::File(file.clone().into()), &first, None),
+			],
+			CopyOptions::default(),
+			Arc::new(Recorder::default()),
+			JobControl::default(),
+		)
+		.await;
+	outcome.result.unwrap();
+	let name_of = |request: usize| {
+		outcome
+			.report
+			.top_level
+			.iter()
+			.find(|t| t.request == request)
+			.unwrap()
+			.item
+			.name()
+			.unwrap()
+			.to_owned()
+	};
+	assert_eq!(name_of(0), "f.txt");
+	assert_eq!(
+		name_of(1),
+		"renamed (1).txt",
+		"a given name is kept both too"
+	);
+	assert_eq!(name_of(2), "dir copy");
+	assert_eq!(name_of(3), "f (1).txt");
+	let (_, in_second) = contents(&client, &second).await;
+	assert!(in_second.iter().any(|(p, _)| p == "dir copy/inside.txt"));
+}
+
+#[shared_test_runtime]
+async fn copies_into_the_drive_root() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let name = format!("rs-copy-{}.txt", uuid::Uuid::new_v4());
+	let file = upload(&client, &resources.dir, &name, b"to the root").await;
+	let outcome = client
+		.clone()
+		.copy_items(
+			vec![CopySource::File(file.into())],
+			DirType::Root(Cow::Owned(client.root().clone())),
+			CopyOptions::default(),
+			Arc::new(Recorder::default()),
+			JobControl::default(),
+		)
+		.await;
+	let copied = outcome
+		.report
+		.top_level
+		.first()
+		.map(|t| client.get_file(t.item.uuid()));
+	let copied = match copied {
+		Some(copied) => Some(copied.await.unwrap()),
+		None => None,
+	};
+	let _cleanup = DeleteOnDrop {
+		client: client.clone(),
+		file: copied.clone(),
+	};
+	outcome.result.unwrap();
+	let copied = copied.expect("the copy was created");
+	assert_eq!(copied.name(), Some(name.as_str()));
+	assert_eq!(
+		filen_types::fs::Uuid::try_from(*filen_sdk_rs::fs::HasParent::parent(&copied)).unwrap(),
+		client.root().uuid()
+	);
+}
+
+#[shared_test_runtime]
+async fn names_clash_the_way_the_server_compares_them() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	let lower = upload(&client, &source, "a.txt", b"lower").await;
+	let umlaut = upload(&client, &source, "äbc.txt", b"umlaut").await;
+	let long_name = format!("{}.txt", "é".repeat(125)); // 254 bytes
+	let long = upload(&client, &source, &long_name, b"long").await;
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+	upload(&client, &destination, "A.TXT", b"upper").await;
+	upload(&client, &destination, "ÄBC.txt", b"upper umlaut").await;
+
+	let outcome = copy(
+		&client,
+		vec![
+			CopySource::File(lower.into()),
+			CopySource::File(umlaut.into()),
+		],
+		&destination,
+	)
+	.await;
+	outcome.result.unwrap();
+	let names: Vec<_> = outcome
+		.report
+		.top_level
+		.iter()
+		.map(|t| t.item.name().unwrap().to_owned())
+		.collect();
+	assert!(names.contains(&"a (1).txt".to_owned()), "{names:?}");
+	assert!(names.contains(&"äbc (1).txt".to_owned()), "{names:?}");
+
+	// a name at the byte limit, copied next to itself, is shortened to fit its counter
+	let outcome = copy(&client, vec![CopySource::File(long.into())], &source).await;
+	outcome.result.unwrap();
+	let copied = outcome.report.top_level[0].item.name().unwrap().to_owned();
+	assert_ne!(copied, long_name);
+	assert!(copied.len() <= 255, "{} bytes", copied.len());
+	assert!(copied.ends_with(" (1).txt"), "{copied}");
+}
+
+// ── Sizes and shapes ────────────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
+	use futures::{StreamExt, stream};
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	let sizes = [
+		("zero", 0),
+		("one", 1),
+		("chunk-minus-one", CHUNK_SIZE - 1),
+		("one-chunk", CHUNK_SIZE),
+		("chunk-plus-one", CHUNK_SIZE + 1),
+		("three-chunks", 3 * CHUNK_SIZE),
+		("two-chunks-plus-one", 2 * CHUNK_SIZE + 1),
+	];
+	let mut boundary_files = Vec::new();
+	for (i, (name, size)) in sizes.iter().enumerate() {
+		boundary_files.push((
+			*name,
+			upload(&client, &source, name, &data(*size, i as u8)).await,
+		));
+	}
+	let many = client.create_dir(&(&source).into(), "many").await.unwrap();
+	stream::iter(0..40)
+		.map(|i| {
+			let client = client.clone();
+			let many = many.clone();
+			async move { upload(&client, &many, &format!("small-{i}"), &data(i + 1, 9)).await }
+		})
+		.buffer_unordered(8)
+		.collect::<Vec<_>>()
+		.await;
+	let mut deepest = client.create_dir(&(&source).into(), "deep").await.unwrap();
+	for level in 0..12 {
+		deepest = client
+			.create_dir(&(&deepest).into(), &format!("level-{level}"))
+			.await
+			.unwrap();
+	}
+	upload(&client, &deepest, "bottom.txt", b"bottom").await;
+	let wide = client.create_dir(&(&source).into(), "wide").await.unwrap();
+	let wide_dirs = stream::iter(0..30)
+		.map(|i| {
+			let client = client.clone();
+			let wide = wide.clone();
+			async move {
+				let dir = client
+					.create_dir(&(&wide).into(), &format!("w{i}"))
+					.await
+					.unwrap();
+				upload(&client, &dir, "leaf", &[i as u8]).await;
+			}
+		})
+		.buffer_unordered(8)
+		.collect::<Vec<_>>()
+		.await;
+	assert_eq!(wide_dirs.len(), 30);
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+
+	let outcome = copy(
+		&client,
+		vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+		&destination,
+	)
+	.await;
+	outcome.result.unwrap();
+	assert!(outcome.report.failures.is_empty());
+	let (source_dirs, source_files) = contents(&client, &source).await;
+	let (copied_dirs, copied_files) = contents(&client, &destination).await;
+	let mut expected_dirs: Vec<String> = std::iter::once("source".to_owned())
+		.chain(source_dirs.iter().map(|(p, _)| format!("source/{p}")))
+		.collect();
+	let mut got_dirs: Vec<String> = copied_dirs.iter().map(|(p, _)| p.clone()).collect();
+	expected_dirs.sort();
+	got_dirs.sort();
+	assert_eq!(got_dirs, expected_dirs, "the tree is copied exactly");
+	let mut expected_files: Vec<(String, u64)> = source_files
+		.iter()
+		.map(|(p, f)| (format!("source/{p}"), f.size()))
+		.collect();
+	let mut got_files: Vec<(String, u64)> = copied_files
+		.iter()
+		.map(|(p, f)| (p.clone(), f.size()))
+		.collect();
+	expected_files.sort();
+	got_files.sort();
+	assert_eq!(got_files, expected_files, "every file, once, at its size");
+	let originals: Vec<(String, &RemoteFile)> = boundary_files
+		.iter()
+		.map(|(name, file)| (format!("source/{name}"), file))
+		.collect();
+	let originals: Vec<(&str, &RemoteFile)> =
+		originals.iter().map(|(p, f)| (p.as_str(), *f)).collect();
+	assert_same_files(&client, &copied_files, &originals).await;
+}
+
+// ── Pause, resume and cancel ────────────────────────────────────────────────
+
+#[shared_test_runtime]
+async fn a_copy_cancelled_before_it_starts_creates_nothing() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	upload(&client, &source, "a.txt", b"never copied").await;
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+	let (_cancel, cancel_rx) = watch::channel(true);
+	let recorder = Arc::new(Recorder::default());
+	let outcome = client
+		.clone()
+		.copy_items(
+			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			destination.clone().into(),
+			CopyOptions::default(),
+			recorder.clone(),
+			JobControl::new(None, Some(cancel_rx)),
+		)
+		.await;
+	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(
+		recorder.updates.lock().unwrap().last().unwrap().phase,
+		CopyPhase::Cancelled
+	);
+	let (dirs, files) = contents(&client, &destination).await;
+	assert!(dirs.is_empty() && files.is_empty());
+}
+
+#[shared_test_runtime]
+async fn pausing_and_resuming_many_times_copies_everything_once() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	let mut originals = Vec::new();
+	for i in 0..4 {
+		originals.push(
+			upload(
+				&client,
+				&source,
+				&format!("f{i}"),
+				&data(2 * CHUNK_SIZE + i, i as u8),
+			)
+			.await,
+		);
+	}
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+	let (pause, pause_rx) = watch::channel(false);
+	let running = tokio::spawn({
+		let client = client.clone();
+		let source = source.clone();
+		let destination = destination.clone();
+		async move {
+			client
+				.copy_items(
+					vec![CopySource::Dir(CopySourceDir::Normal(source))],
+					destination.into(),
+					CopyOptions::default(),
+					Arc::new(Recorder::default()),
+					JobControl::new(Some(pause_rx), None),
+				)
+				.await
+		}
+	});
+	for _ in 0..8 {
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		pause.send_replace(true);
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		pause.send_replace(false);
+	}
+	let outcome = running.await.unwrap();
+	outcome.result.unwrap();
+	let (_, copied) = contents(&client, &destination).await;
+	assert_eq!(copied.len(), 4, "no file is copied twice");
+	let paths: Vec<String> = (0..4).map(|i| format!("source/f{i}")).collect();
+	let originals: Vec<(&str, &RemoteFile)> = paths
+		.iter()
+		.map(String::as_str)
+		.zip(originals.iter())
+		.collect();
+	assert_same_files(&client, &copied, &originals).await;
+}
+
+// ── Failures, retry and the pre-flight check ────────────────────────────────
+
+/// A source file whose chunks do not exist fails at download without stopping the copy; the
+/// failure names the directory it was to be created in, and a retry through `copy_items_to`
+/// lands there under the failure's name.
+#[shared_test_runtime]
+async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
+	use filen_sdk_rs::fs::file::{AnonymousRemoteFile, traits::HasFileMeta};
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let kept = upload(&client, test_dir, "kept.txt", b"kept").await;
+	let real = upload(&client, test_dir, "gone.bin", &data(2 * CHUNK_SIZE, 7)).await;
+	// the same file under a uuid the server holds no chunks for
+	let missing: AnonymousRemoteFile = RemoteFile::from_meta(
+		filen_types::fs::Uuid::new_v4(),
+		(),
+		*filen_sdk_rs::fs::HasParent::parent(&real),
+		real.size(),
+		real.chunks(),
+		filen_sdk_rs::fs::file::traits::HasRemoteFileInfo::region(&real),
+		filen_sdk_rs::fs::file::traits::HasRemoteFileInfo::bucket(&real),
+		filen_sdk_rs::fs::HasRemoteInfo::timestamp(&real),
+		false,
+		filen_types::traits::CowHelpers::into_owned_cow(real.get_meta().clone()),
+	);
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+
+	let recorder = Arc::new(Recorder::default());
+	let outcome = client
+		.clone()
+		.copy_items(
+			vec![
+				CopySource::File(kept.clone().into()),
+				CopySource::File(RemoteFileType::File(Cow::Owned(missing))),
+			],
+			destination.clone().into(),
+			CopyOptions::default(),
+			recorder.clone(),
+			JobControl::default(),
+		)
+		.await;
+	outcome.result.as_ref().unwrap();
+	let [failure] = outcome.report.failures.as_slice() else {
+		panic!("one failure: {:?}", outcome.report.failures);
+	};
+	assert_eq!(failure.info.stage, CopyStage::Download);
+	assert_eq!(failure.info.error.kind(), ErrorKind::FileChunkNotFound);
+	assert_eq!(failure.info.dest_name, "gone.bin");
+	assert_eq!(failure.info.dest_parent, destination.uuid());
+	assert_eq!(failure.info.dest_parent_dir.uuid(), destination.uuid());
+	assert_eq!(
+		outcome.report.counts.files_done, 1,
+		"the other file is copied"
+	);
+	assert!(recorder.updates.lock().unwrap().iter().any(|u| {
+		u.events
+			.iter()
+			.any(|e| matches!(e, CopyEvent::FileFailed(info) if info.dest_name == "gone.bin"))
+	}));
+
+	// the failed source can never be read, so the retry copies the real file, into the
+	// failure's directory under the failure's name
+	let retry = client
+		.clone()
+		.copy_items_to(
+			vec![CopyRequest {
+				source: CopySource::File(real.clone().into()),
+				destination: failure.info.dest_parent_dir.clone(),
+				name: Some(failure.info.dest_name.clone()),
+			}],
+			CopyOptions::default(),
+			Arc::new(Recorder::default()),
+			JobControl::default(),
+		)
+		.await;
+	retry.result.unwrap();
+	let (_, copied) = contents(&client, &destination).await;
+	assert_same_files(
+		&client,
+		&copied,
+		&[("gone.bin", &real), ("kept.txt", &kept)],
+	)
+	.await;
+}
+
+#[shared_test_runtime]
+async fn max_bytes_is_checked_before_anything_is_written() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	upload(&client, &source, "a.bin", &data(1000, 1)).await;
+	upload(&client, &source, "b.bin", &data(24, 2)).await;
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+	let copy_with = |max_bytes: u64| {
+		client.clone().copy_items(
+			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+			destination.clone().into(),
+			CopyOptions {
+				max_bytes: Some(max_bytes),
+			},
+			Arc::new(Recorder::default()),
+			JobControl::default(),
+		)
+	};
+
+	let outcome = copy_with(1023).await;
+	assert_eq!(
+		outcome.result.unwrap_err().kind(),
+		ErrorKind::MaxStorageReached
+	);
+	let (dirs, files) = contents(&client, &destination).await;
+	assert!(dirs.is_empty() && files.is_empty(), "nothing was written");
+
+	copy_with(1024).await.result.unwrap();
+	let (_, files) = contents(&client, &destination).await;
+	assert_eq!(files.len(), 2);
+}
+
+#[shared_test_runtime]
+async fn missing_sources_and_destinations_fail_before_anything_is_created() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	client.delete_dir_permanently(source.clone()).await.unwrap();
+	let recorder = Arc::new(Recorder::default());
+	let outcome = client
+		.clone()
+		.copy_items(
+			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			destination.clone().into(),
+			CopyOptions::default(),
+			recorder.clone(),
+			JobControl::default(),
+		)
+		.await;
+	assert!(outcome.result.is_err(), "a deleted source fails the scan");
+	assert_eq!(
+		recorder.updates.lock().unwrap().last().unwrap().phase,
+		CopyPhase::Failed
+	);
+	let (dirs, files) = contents(&client, &destination).await;
+	assert!(dirs.is_empty() && files.is_empty());
+
+	let file = upload(&client, test_dir, "a.txt", b"nowhere to go").await;
+	let gone = client.create_dir(&test_dir.into(), "gone").await.unwrap();
+	client.delete_dir_permanently(gone.clone()).await.unwrap();
+	let outcome = copy(&client, vec![CopySource::File(file.into())], &gone).await;
+	assert!(
+		outcome.result.is_err(),
+		"a deleted destination fails the copy"
+	);
+	assert!(outcome.report.top_level.is_empty());
+}
+
+// ── Undecryptable entries (needs the `malformed` feature) ───────────────────
+
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn undecryptable_entries_are_renamed_or_skipped() {
+	use filen_sdk_rs::fs::copy::{RenameReason, SkipReason};
+
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+
+	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
+	let ok = upload(&client, &source, "ok.txt", b"readable").await;
+	client
+		.create_malformed_file(
+			&(&source).into(),
+			"unreadable.txt",
+			"not metadata",
+			"not a mime",
+			"not a size",
+		)
+		.await
+		.unwrap();
+	let hidden = client
+		.create_malformed_dir(&(&source).into(), "hidden", "not metadata")
+		.await
+		.unwrap();
+	let hidden_dir = client.get_dir(hidden).await.unwrap();
+	let inside = upload(&client, &hidden_dir, "inside.txt", b"kept").await;
+
+	let destination = client
+		.create_dir(&test_dir.into(), "destination")
+		.await
+		.unwrap();
+	// a destination entry whose name the listing cannot show still takes its name
+	client
+		.create_malformed_file(
+			&(&destination).into(),
+			"clash.txt",
+			"not metadata",
+			"not a mime",
+			"not a size",
+		)
+		.await
+		.unwrap();
+	let clash = upload(&client, test_dir, "clash.txt", b"clash").await;
+
+	let outcome = copy(
+		&client,
+		vec![
+			CopySource::Dir(CopySourceDir::Normal(source)),
+			CopySource::File(clash.into()),
+		],
+		&destination,
+	)
+	.await;
+	outcome.result.unwrap();
+	let report = &outcome.report;
+	assert_eq!(report.skipped.len(), 1);
+	assert_eq!(report.skipped[0].reason, SkipReason::UndecryptableFile);
+	let [renamed] = report.renamed.as_slice() else {
+		panic!("one rename: {:?}", report.renamed);
+	};
+	assert_eq!(renamed.reason, RenameReason::Undecryptable);
+	assert_eq!(renamed.source_uuid, hidden);
+	assert_eq!(renamed.name.as_ref(), hidden.to_string());
+	let (_, copied) = contents(&client, &destination).await;
+	assert_same_files(
+		&client,
+		&copied,
+		&[
+			("source/ok.txt", &ok),
+			(format!("source/{hidden}/inside.txt").as_str(), &inside),
+		],
+	)
+	.await;
+	assert!(
+		report
+			.top_level
+			.iter()
+			.any(|t| t.item.name() == Some("clash (1).txt")),
+		"the hidden name is found and kept"
 	);
 }

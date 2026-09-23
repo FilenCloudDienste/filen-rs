@@ -22,7 +22,9 @@ import init, {
 	type CacheSearchSnapshot,
 	type MakeThumbnailInMemoryResult,
 	type InMemoryThumbnail,
-	type EmbeddedPreviewResult
+	type EmbeddedPreviewResult,
+	type CopyUpdate,
+	type CopyItem
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -2135,6 +2137,182 @@ test("cache search", async () => {
 	expect(await search.isLive()).toBe(false)
 	window.free()
 	search.free()
+})
+
+/// Resolves once `condition` holds, polling; fails the test after `timeoutMs`.
+async function waitFor(what: string, condition: () => boolean, timeoutMs = cap(60_000)): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (!condition()) {
+		if (Date.now() > deadline) {
+			throw new Error(`timed out waiting until ${what}`)
+		}
+		await new Promise(resolve => setTimeout(resolve, 100))
+	}
+}
+
+function nameOf(item: { meta: FileMeta } | { meta: DirMeta }): string | undefined {
+	const meta = item.meta
+	return meta.type === "decoded" ? meta.data.name : undefined
+}
+
+/// A source tree for the copy tests: `source/top.txt` and `source/sub/big.bin` (3 chunks + 7).
+async function copySource(parent: Dir) {
+	const source = await state.createDir(parent, "source")
+	const sub = await state.createDir(source, "sub")
+	const top = await state.uploadFile(new TextEncoder().encode("top"), { parent: source, name: "top.txt" })
+	const big = await state.uploadFile(new Uint8Array(3 * 1024 * 1024 + 7).fill(7), { parent: sub, name: "big.bin" })
+	return { source, sub, top, big }
+}
+
+test("copyItems copies a tree and delivers every callback in order before it resolves", async () => {
+	const parent = await state.createDir(testDir, "copy-tree")
+	const { source, big } = await copySource(parent)
+	const destination = await state.createDir(parent, "destination")
+
+	const log: string[] = []
+	const updates: CopyUpdate[] = []
+	let resolved = false
+	let lateCallbacks = 0
+	const report = await state.copyItems({
+		items: [source],
+		destination,
+		onTopLevelPlanned: items => {
+			lateCallbacks += resolved ? 1 : 0
+			log.push(`planned:${items.length}`)
+		},
+		onTopLevelCreated: item => {
+			lateCallbacks += resolved ? 1 : 0
+			log.push(`created:${item.request}`)
+		},
+		onUpdate: update => {
+			lateCallbacks += resolved ? 1 : 0
+			updates.push(update)
+			log.push(`update:${update.phase}`)
+		}
+	})
+	resolved = true
+	await new Promise(resolve => setTimeout(resolve, 500))
+
+	expect(lateCallbacks).toBe(0)
+	expect(report.error).toBeUndefined()
+	expect(report.failures).toHaveLength(0)
+	expect(report.topLevel).toHaveLength(1)
+	expect(report.counts.filesDone).toBe(2n)
+	expect(report.counts.dirsCreated).toBe(2n)
+	// scanning updates come first; the plan is announced before anything is created
+	const planned = log.indexOf("planned:1")
+	expect(planned).toBeGreaterThan(-1)
+	expect(log.indexOf("created:0")).toBeGreaterThan(planned)
+	expect(log.indexOf("update:creatingDirectories")).toBeGreaterThan(planned)
+	expect(log[log.length - 1]).toBe("update:done")
+	const last = updates[updates.length - 1]
+	expect(last.counts).toStrictEqual(report.counts)
+	expect(last.etaMs).toBe(0n)
+	// every event arrives once, in a single ordered stream
+	const created = updates.flatMap(u => u.events).filter(e => e.type === "dirCreated")
+	expect(created.map(e => e.name)).toStrictEqual(["source", "sub"])
+
+	const { dirs } = await state.listDir(destination)
+	const copy = dirs.find(d => nameOf(d) === "source")
+	expect(copy?.uuid).toBe(report.topLevel[0].item.uuid)
+	const { dirs: copiedSubs } = await state.listDir(copy!)
+	const { files: copiedBig } = await state.listDir(copiedSubs[0])
+	expect(await state.downloadFile(copiedBig[0])).toStrictEqual(await state.downloadFile(big))
+})
+
+test("copyItemsTo copies into several destinations under their names", async () => {
+	const parent = await state.createDir(testDir, "copy-to")
+	const file = await state.uploadFile(new TextEncoder().encode("one file"), { parent, name: "x.txt" })
+	const first = await state.createDir(parent, "first")
+	const second = await state.createDir(parent, "second")
+	await state.uploadFile(new TextEncoder().encode("taken"), { parent: second, name: "y.txt" })
+
+	const report = await state.copyItemsTo({
+		entries: [
+			{ item: file, destination: first },
+			{ item: file, destination: second, name: "y.txt" }
+		]
+	})
+	expect(report.error).toBeUndefined()
+	const names = report.topLevel.map(t => [t.request, nameOf(t.item)])
+	expect(names).toContainEqual([0n, "x.txt"])
+	expect(names).toContainEqual([1n, "y (1).txt"])
+	const { files } = await state.listDir(second)
+	expect(files.map(f => nameOf(f)).sort()).toStrictEqual(["y (1).txt", "y.txt"])
+})
+
+test("copyItems pauses, resumes and cancels through managedFuture", async () => {
+	const parent = await state.createDir(testDir, "copy-controls")
+	const { source } = await copySource(parent)
+	for (let i = 0; i < 4; i++) {
+		await state.uploadFile(new Uint8Array(2 * 1024 * 1024).fill(i), { parent: source, name: `more-${i}.bin` })
+	}
+
+	// paused as soon as the copy's directory exists, then resumed
+	const pauseSignal = new PauseSignal()
+	const updates: CopyUpdate[] = []
+	const paused = state.copyItems({
+		items: [source],
+		destination: await state.createDir(parent, "paused"),
+		onTopLevelCreated: () => pauseSignal.pause(),
+		onUpdate: update => updates.push(update),
+		managedFuture: { pauseSignal }
+	})
+	await waitFor("the copy is paused", () => updates.some(u => u.paused))
+	const doneWhilePaused = updates[updates.length - 1].counts.filesDone
+	await new Promise(resolve => setTimeout(resolve, 2000))
+	expect(updates[updates.length - 1].counts.filesDone).toBe(doneWhilePaused)
+	pauseSignal.resume()
+	const resumed = await paused
+	expect(resumed.error).toBeUndefined()
+	expect(resumed.counts.filesDone).toBe(6n)
+
+	// aborted: the copy winds down and still reports what it created
+	const controller = new AbortController()
+	const cancelled = await state.copyItems({
+		items: [source],
+		destination: await state.createDir(parent, "cancelled"),
+		onTopLevelPlanned: () => controller.abort(),
+		managedFuture: { abortSignal: controller.signal }
+	})
+	expect(cancelled.error?.kind).toBe("Cancelled")
+	expect(cancelled.counts.filesDone + cancelled.counts.filesFailed + cancelled.counts.filesNotAttempted).toBe(cancelled.totals.files)
+})
+
+test("a copy failure's item and parent can be passed back to copyItemsTo", async () => {
+	const parent = await state.createDir(testDir, "copy-retry")
+	const real = await state.uploadFile(new TextEncoder().encode("real"), { parent, name: "real.txt" })
+	// the same file under a uuid the server holds no chunks for
+	const missing = { ...real, uuid: crypto.randomUUID() }
+	const destination = await state.createDir(parent, "destination")
+
+	const report = await state.copyItems({ items: [missing, real], destination })
+	expect(report.error).toBeUndefined()
+	expect(report.failures).toHaveLength(1)
+	const [failure] = report.failures
+	expect(failure.info.stage).toBe("download")
+	expect(failure.info.error.kind).toBe("FileChunkNotFound")
+	expect(failure.info.destParent).toBe(destination.uuid)
+	expect(failure.info.destParentDir.uuid).toBe(destination.uuid)
+	expect((failure.item as { uuid: string }).uuid).toBe(missing.uuid)
+
+	// the SDK reads back what it handed out: the retry fails the same way, at the same place
+	const retry = await state.copyItemsTo({
+		entries: [{ item: failure.item, destination: failure.info.destParentDir, name: "retried.txt" }]
+	})
+	expect(retry.error).toBeUndefined()
+	expect(retry.failures).toHaveLength(1)
+	expect(retry.failures[0].info.error.kind).toBe("FileChunkNotFound")
+	expect(retry.failures[0].info.destParent).toBe(destination.uuid)
+
+	// a created directory, as reported, is a copy source too
+	const dir = await state.createDir(parent, "dir")
+	const first = await state.copyItems({ items: [dir], destination })
+	const copied = first.topLevel[0].item
+	expect(copied.type).toBe("dir")
+	const again = await state.copyItems({ items: [copied as CopyItem], destination })
+	expect(again.error).toBeUndefined()
+	expect(nameOf(again.topLevel[0].item)).toBe("dir (1)")
 })
 
 afterAll(async () => {
