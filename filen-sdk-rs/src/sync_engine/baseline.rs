@@ -28,7 +28,13 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, tree::Basel
 /// else — older or newer — was not written by this engine, and reading it under these rules would
 /// misread its rows into deletes. Both directions are refused (see [`BaselineStore::init`]); the
 /// first released schema is what a migration path would start from.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// Moved to 2 when a `pending_writes` row of kind [`KIND_TRASHED`] gained a required `path`: a
+/// version-1 DB wrote that column NULL there, which [`BaselineStore::row_to_pending`] now refuses,
+/// and one such row fails the whole journal read and with it the engine's construction. A row's
+/// MEANING changing is exactly what this constant is for — the refusal above says what to do about
+/// the file, where the journal read would only say that a column was NULL.
+const SCHEMA_VERSION: i64 = 2;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -1163,7 +1169,7 @@ impl BaselineStore {
 				let what = match kind {
 					PendingKind::Created { path, .. } => format!("create at {path:?}"),
 					PendingKind::Moved { from, to } => format!("move {from:?} -> {to:?}"),
-					PendingKind::Trashed => "trash".to_string(),
+					PendingKind::Trashed { path } => format!("trash of {path:?}"),
 				};
 				format!(
 					"the journal row for the {what} of {uuid}, and the baseline change(s) it commits \
@@ -1196,7 +1202,7 @@ impl BaselineStore {
 				Some(from.as_str()),
 				Some(to.as_str()),
 			),
-			PendingKind::Trashed => (KIND_TRASHED, None, None, None, None),
+			PendingKind::Trashed { path } => (KIND_TRASHED, Some(path.as_str()), None, None, None),
 		};
 		self.conn.execute(
 			"INSERT OR REPLACE INTO pending_writes
@@ -1399,7 +1405,9 @@ impl BaselineStore {
 				from: text("from_path")?,
 				to: text("to_path")?,
 			},
-			KIND_TRASHED => PendingKind::Trashed,
+			KIND_TRASHED => PendingKind::Trashed {
+				path: text("path")?,
+			},
 			_ => return Err(corrupt("pending write kind", kind_raw)),
 		};
 		Ok(PendingRow {
@@ -2886,7 +2894,9 @@ mod tests {
 				from: "a.txt".to_string(),
 				to: "b.txt".to_string(),
 			},
-			PendingKind::Trashed,
+			PendingKind::Trashed {
+				path: "c.txt".to_string(),
+			},
 		];
 		let uuids: Vec<Uuid> = kinds.iter().map(|_| Uuid::new_v4()).collect();
 		for (uuid, kind) in uuids.iter().zip(&kinds) {
