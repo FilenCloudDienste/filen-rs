@@ -719,7 +719,7 @@ where
 			}
 			Err(FileError::Stopped) => self.reporter.file_abandoned(active.dest_uuid),
 			// Not a copy the user can keep or trash: trashing it would trash the existing file.
-			// It counts as failed, so done + failed still adds up to the totals.
+			// It counts as failed, so the counts still add up to the totals.
 			Err(FileError::RegisteredAsVersion(file)) => {
 				let planned = &self.plan.files[outcome.index];
 				let info = FailureInfo {
@@ -2353,6 +2353,135 @@ mod tests {
 		);
 		assert_eq!(outcome.report.counts.bytes_done, 10);
 		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
+	}
+
+	/// What a finished job reports: everything planned is done, failed or not attempted.
+	fn assert_counts_add_up(outcome: &CopyOutcome<()>, last: &CopyUpdate) {
+		let counts = outcome.report.counts;
+		let totals = outcome.report.totals;
+		assert_eq!(
+			counts.dirs_created + counts.dirs_failed + counts.dirs_not_attempted,
+			totals.dirs
+		);
+		assert_eq!(
+			counts.files_done + counts.files_failed + counts.files_not_attempted,
+			totals.files
+		);
+		assert_eq!(
+			counts.bytes_done + counts.bytes_failed + counts.bytes_not_attempted,
+			totals.bytes
+		);
+		assert_eq!(
+			last.counts, counts,
+			"the last update carries the final counts"
+		);
+		assert_eq!(
+			last.eta,
+			Some(Duration::ZERO),
+			"nothing is left to copy once the job is over"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
+		let destination = Uuid::new_v4();
+		let mut sources = vec![
+			source_file("small", 10),
+			source_file("big", 5 * CHUNK_SIZE_U64),
+		];
+		sources.extend((0..40).map(|i| source_file(&format!("later{i}"), 100)));
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.blocked_uploads.insert("big".to_owned());
+		backend.delay = Duration::from_secs(1);
+		let backend = Arc::new(backend);
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(
+				destination,
+				sources.iter().cloned().map(PlanSource::File).collect(),
+			),
+			control,
+		);
+
+		wait_until("the small file is copied", || {
+			!backend.log().finished.is_empty()
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = running.await.unwrap();
+		let updates = recorder.updates.lock().unwrap().clone();
+		let winding_down: Vec<_> = updates
+			.iter()
+			.filter(|u| u.cancelling && u.phase == CopyPhase::CopyingFiles)
+			.collect();
+		assert!(!winding_down.is_empty());
+		assert!(
+			winding_down.iter().all(|u| u.eta.is_none()),
+			"a cancelling job has no time left to estimate"
+		);
+
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
+		let counts = outcome.report.counts;
+		assert!(counts.files_done >= 1);
+		assert!(
+			counts.files_not_attempted >= 1,
+			"the interrupted file is not attempted"
+		);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_job_cancelled_during_directory_creation_counts_what_it_never_copied() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(200);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, _reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("some directories exist", || {
+			backend.log().created_dirs.len() >= 3
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = running.await.unwrap();
+
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
+		let counts = outcome.report.counts;
+		assert!(counts.dirs_not_attempted > 0);
+		assert_eq!(counts.files_not_attempted, 200);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_completed_job_has_nothing_left_unattempted() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(3);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let counts = outcome.report.counts;
+		assert_eq!(
+			(
+				counts.dirs_not_attempted,
+				counts.files_not_attempted,
+				counts.bytes_not_attempted
+			),
+			(0, 0, 0)
+		);
+		assert_counts_add_up(&outcome, &recorder.last());
 	}
 
 	#[tokio::test(start_paused = true)]

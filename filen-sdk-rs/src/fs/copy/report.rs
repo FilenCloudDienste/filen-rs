@@ -44,8 +44,9 @@ pub enum CopyPhase {
 	Failed,
 }
 
-/// Running counts. Everything planned ends up done or failed, so
-/// `done + failed == totals` once the job is over; skipped entries are not part of the totals.
+/// Running counts. Once the job is over, everything planned is done, failed or not attempted:
+/// `created + failed + not_attempted == totals` for directories, and likewise for files and
+/// bytes. Skipped entries are not part of the totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CopyCounts {
 	pub dirs_created: u64,
@@ -56,6 +57,11 @@ pub struct CopyCounts {
 	pub files_failed: u64,
 	pub bytes_done: u64,
 	pub bytes_failed: u64,
+	/// What a job that ended early (cancelled, or stopped by an error) never copied, including
+	/// files it had started: their partial uploads never become visible. Zero while running.
+	pub dirs_not_attempted: u64,
+	pub files_not_attempted: u64,
+	pub bytes_not_attempted: u64,
 	pub entries_skipped: u64,
 	pub bytes_skipped: u64,
 }
@@ -330,11 +336,20 @@ impl Reporter {
 
 	fn flush(&self, state: &mut State, now: Duration) {
 		let active_time = state.clock.active(now);
+		let counts = state.counts;
 		let done_units = work_units(
-			state.counts.files_done + state.counts.files_failed,
-			state.counts.bytes_done + state.counts.bytes_failed,
+			counts.files_done + counts.files_failed,
+			counts.bytes_done + counts.bytes_failed,
+		);
+		let settled_units = work_units(
+			counts.files_done + counts.files_failed + counts.files_not_attempted,
+			counts.bytes_done + counts.bytes_failed + counts.bytes_not_attempted,
 		);
 		let total_units = work_units(state.totals.files, state.totals.bytes);
+		let finished = matches!(
+			state.phase,
+			CopyPhase::Done | CopyPhase::Cancelled | CopyPhase::Failed
+		);
 		state
 			.rate
 			.record(active_time, state.counts.bytes_done, done_units);
@@ -351,7 +366,12 @@ impl Reporter {
 			active: state.active.clone(),
 			events,
 			bytes_per_second: state.rate.bytes_per_second(),
-			eta: state.rate.eta(total_units.saturating_sub(done_units)),
+			// a job winding down copies nothing more, so there is no time left to estimate
+			eta: if state.cancelling && !finished {
+				None
+			} else {
+				state.rate.eta(total_units.saturating_sub(settled_units))
+			},
 			active_time,
 		});
 	}
@@ -606,7 +626,21 @@ impl Reporter {
 		let now = self.now();
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		state.phase = phase;
-		state.active.clear();
+		for file in std::mem::take(&mut state.active) {
+			// normally already settled; a file still running now was never finished
+			state.counts.bytes_done -= file.bytes_done;
+		}
+		let totals = state.totals;
+		let counts = &mut state.counts;
+		counts.dirs_not_attempted = totals
+			.dirs
+			.saturating_sub(counts.dirs_created + counts.dirs_failed);
+		counts.files_not_attempted = totals
+			.files
+			.saturating_sub(counts.files_done + counts.files_failed);
+		counts.bytes_not_attempted = totals
+			.bytes
+			.saturating_sub(counts.bytes_done + counts.bytes_failed);
 		// a finished job is neither pausing nor paused, whatever was last requested
 		state.pause_requested = false;
 		state.paused = false;
