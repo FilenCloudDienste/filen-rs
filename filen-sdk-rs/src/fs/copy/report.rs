@@ -361,8 +361,11 @@ impl Reporter {
 		self.with_state(|_| {});
 	}
 
+	/// Counts an operation as in flight; taken before the operation holds anything.
 	pub(crate) fn op(self: &MaybeArc<Self>) -> OpGuard {
 		self.ops_in_flight.fetch_add(1, Ordering::SeqCst);
+		// a job reported paused stops being paused once anything starts
+		self.refresh_pause();
 		OpGuard(MaybeArc::clone(self))
 	}
 

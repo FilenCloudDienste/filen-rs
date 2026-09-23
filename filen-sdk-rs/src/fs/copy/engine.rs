@@ -1010,14 +1010,21 @@ async fn reserve_chunk(
 		.expect("a chunk fits in u32");
 	loop {
 		control.checkpoint().await?;
-		let permit = control
-			.until_stopping(Arc::clone(&memory).acquire_many_owned(bytes))
-			.await?
-			.expect("the memory semaphore is never closed");
+		// In flight before anything is held, so the job is never reported paused holding memory.
+		let op = reporter.op();
+		let permit = tokio::select! {
+			biased;
+			() = control.stopping() => return Err(Stopped),
+			// a waiting acquisition is handed free memory as it comes; dropping it gives that back
+			() = control.pause_changed(false) => continue,
+			permit = Arc::clone(&memory).acquire_many_owned(bytes) => {
+				permit.expect("the memory semaphore is never closed")
+			}
+		};
 		if !control.is_pause_requested() {
 			return Ok(ChunkReservation {
 				_permit: permit,
-				_op: reporter.op(),
+				_op: op,
 			});
 		}
 	}
@@ -2025,6 +2032,96 @@ mod tests {
 		assert_eq!(outcome.report.counts.bytes_done, 18 * CHUNK_SIZE_U64);
 		let last = recorder.last();
 		assert!(!last.paused && !last.pausing);
+	}
+
+	// The memory budget is shared with other transfers. A chunk waiting for memory is handed
+	// what is free while it waits for the rest, so a paused job must stop waiting.
+	#[tokio::test(start_paused = true)]
+	async fn a_paused_job_holds_no_memory_while_a_chunk_waited_for_it() {
+		let destination = Uuid::new_v4();
+		let backend = Arc::new(FakeBackend::new(1, &[destination]));
+		let free = 1024;
+		let elsewhere = Arc::clone(&backend.memory)
+			.try_acquire_many_owned(u32::try_from(backend.budget - free).unwrap())
+			.unwrap();
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![PlanSource::File(source_file("f", CHUNK_SIZE_U64))],
+			),
+			control,
+		);
+
+		tokio::time::sleep(Duration::from_secs(1)).await;
+		assert!(
+			backend.log().fetched.is_empty(),
+			"the chunk waits for memory"
+		);
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		assert_eq!(
+			backend.memory.available_permits(),
+			free,
+			"a paused job holds no memory"
+		);
+
+		drop(elsewhere);
+		pause.send_replace(false);
+		running.await.unwrap().result.unwrap();
+		assert_released(&backend, &reporter);
+		assert_eq!(backend.log().finished.len(), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn starting_an_operation_ends_a_reported_pause() {
+		let reporter = Reporter::new(Arc::new(Recorder::default()));
+		reporter.set_pause_requested(true);
+		assert!(reporter.is_paused());
+		let op = reporter.op();
+		assert!(
+			!reporter.is_paused(),
+			"a job with an operation in flight is not paused"
+		);
+		drop(op);
+		assert!(reporter.is_paused());
+	}
+
+	// Every time the job reports itself paused, it must hold nothing, on any thread.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_paused_job_holds_nothing_on_a_multi_threaded_runtime() {
+		let destination = Uuid::new_v4();
+		let sources: Vec<_> = (0..24)
+			.map(|i| source_file(&format!("f{i}"), 3 * CHUNK_SIZE_U64 / 2))
+			.collect();
+		let backend = Arc::new(FakeBackend::new(3, &[destination]));
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				sources.iter().cloned().map(PlanSource::File).collect(),
+			),
+			control,
+		);
+
+		for _ in 0..10 {
+			tokio::time::sleep(Duration::from_millis(15)).await;
+			pause.send_replace(true);
+			wait_until("the job is paused", || {
+				reporter.is_paused() || running.is_finished()
+			})
+			.await;
+			if reporter.is_paused() {
+				assert_released(&backend, &reporter);
+			}
+			pause.send_replace(false);
+		}
+		running.await.unwrap().result.unwrap();
+		assert_released(&backend, &reporter);
+		assert_eq!(backend.log().finished.len(), 24);
+		assert_each_chunk_once(&backend);
 	}
 
 	fn wide_tree(dirs: usize) -> (SourceDir, PlanSource) {
