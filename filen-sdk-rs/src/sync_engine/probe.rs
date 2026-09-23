@@ -1107,10 +1107,13 @@ fn prepare_scoped(
 	// largest per-node cost of a change-scoped pass, and one figure for both cannot say which of
 	// them a narrowing moved.
 	let ((), elapsed) = timed(|| {
-		view.hide(plan::ViewFilter {
-			rules: &rules,
-			baseline: &baseline,
-		});
+		view.hide(
+			plan::ViewFilter {
+				rules: &rules,
+				baseline: &baseline,
+			},
+			plan::PassPaths::Changed(&derived.decided),
+		);
 	});
 	costs.view_hide = elapsed;
 	let ((), elapsed) = timed(|| view.resolve_collisions());

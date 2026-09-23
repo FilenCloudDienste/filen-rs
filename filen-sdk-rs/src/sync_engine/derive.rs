@@ -1072,10 +1072,13 @@ mod tests {
 			ignored: BTreeMap::new(),
 			ignored_default_untracked: 0,
 		};
-		view.filter(Some(plan::ViewFilter {
-			rules: &rules,
-			baseline: &baseline,
-		}));
+		view.filter_changed(
+			plan::ViewFilter {
+				rules: &rules,
+				baseline: &baseline,
+			},
+			&derived.decided,
+		);
 		derived.remote = view.nodes;
 
 		for path in ["docs/deep", "docs/deep/inner.bin"] {
