@@ -86,6 +86,11 @@ pub enum CopyStage {
 	Download,
 	Upload,
 	Finalize,
+	/// The file was registered, but the server made it a new version of an existing file with
+	/// the same name instead of a new file (possible only if a client writing without the
+	/// drive lock took the name at the last moment). The existing file keeps its previous
+	/// content as a version; the copy itself does not exist as its own file.
+	RegisteredAsVersion,
 }
 
 /// Why an item was not copied, with what is needed to show and retry it.
@@ -101,6 +106,9 @@ pub struct FailureInfo {
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
 	pub affected_files: u64,
 	pub affected_bytes: u64,
+	/// For [`CopyStage::RegisteredAsVersion`]: the stable uuid of the file the copy became a
+	/// version of.
+	pub existing_file: Option<Uuid>,
 }
 
 /// The source of a failed item: a file can be copied again as is; a directory is addressed

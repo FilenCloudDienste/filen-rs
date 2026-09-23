@@ -66,9 +66,54 @@ use super::{
 /// files running, the memory budget is the bound.
 pub(crate) const CHUNKS_PER_FILE: usize = 4;
 
-/// How often a top-level directory is renamed and retried when a same-named one appears at the
-/// destination between listing it and creating the copy.
+/// How many names a top-level item tries when the ones it picks turn out to be taken at the
+/// destination (by an entry the listing could not name, or one created since the listing).
 const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
+
+/// The keep-both names a top-level item moves through when the destination turns out to hold
+/// the one it picked.
+struct NameRetry {
+	taken: TakenNames,
+	attempts: usize,
+	is_dir: bool,
+}
+
+impl NameRetry {
+	fn new(is_dir: bool) -> Self {
+		Self {
+			taken: TakenNames::default(),
+			attempts: 0,
+			is_dir,
+		}
+	}
+
+	/// The next name after `taken_name`, or an error once [`TOP_LEVEL_NAME_ATTEMPTS`] names
+	/// were tried.
+	fn next(&mut self, taken_name: &ValidatedName) -> Result<ValidatedName, Error> {
+		self.attempts += 1;
+		if self.attempts >= TOP_LEVEL_NAME_ATTEMPTS {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"could not find a free name for the copy at the destination",
+			));
+		}
+		self.taken.insert(taken_name.as_ref());
+		Ok(self.taken.allocate(taken_name.as_ref(), self.is_dir)?)
+	}
+
+	/// `name`, or the first following keep-both name the server reports free in `parent`.
+	async fn free_name<B: CopyBackend>(
+		&mut self,
+		backend: &B,
+		parent: Uuid,
+		mut name: ValidatedName,
+	) -> Result<ValidatedName, Error> {
+		while backend.name_exists(parent, &name).await? {
+			name = self.next(&name)?;
+		}
+		Ok(name)
+	}
+}
 
 /// Outcome of creating a directory.
 #[derive(Debug)]
@@ -140,10 +185,18 @@ pub(crate) trait CopyBackend: MaybeSendSync + 'static {
 		index: u64,
 		data: Vec<u8>,
 	) -> impl Future<Output = Result<RemoteFileInfo, Error>> + MaybeSend;
-	/// Registers the uploaded file. The caller holds the drive lock.
+	/// Whether a file or directory called `name` exists in `parent`, compared as the server
+	/// compares names.
+	fn name_exists(
+		&self,
+		parent: Uuid,
+		name: &ValidatedName,
+	) -> impl Future<Output = Result<bool, Error>> + MaybeSend;
+	/// Registers the uploaded file under `name`. The caller holds the drive lock.
 	fn finish_upload(
 		&self,
 		upload: &Self::Upload,
+		name: &ValidatedName,
 		completion: UploadCompletion,
 		info: RemoteFileInfo,
 	) -> impl Future<Output = Result<RemoteFile, Error>> + MaybeSend;
@@ -479,6 +532,7 @@ where
 			.dest_parent(dir.parent)
 			.expect("a directory is only created once its parent exists");
 		let top_level = matches!(dir.parent, DestParent::Existing(_));
+		let verify_name = top_level && self.plan.unverified_destinations.contains(&parent);
 		let name = dir.name.clone();
 		let uuid = dir.dest_uuid;
 		let created = dir.created.unwrap_or_else(Utc::now);
@@ -488,7 +542,16 @@ where
 		let reporter = MaybeArc::clone(&self.reporter);
 		Box::pin(async move {
 			let result = create_dir(
-				&*backend, &reporter, &targets, parent, uuid, name, created, color, top_level,
+				&*backend,
+				&reporter,
+				&targets,
+				parent,
+				uuid,
+				name,
+				created,
+				color,
+				top_level,
+				verify_name,
 			)
 			.await;
 			(index, result)
@@ -532,6 +595,7 @@ where
 					error,
 					affected_files: planned.descendant_files,
 					affected_bytes: planned.descendant_bytes,
+					existing_file: None,
 				};
 				self.reporter
 					.dir_failed(info.clone(), planned.descendant_dirs);
@@ -571,6 +635,11 @@ where
 					let Some(parent) = self.dest_parent(self.plan.files[index].parent) else {
 						continue;
 					};
+					let request = self.plan.files[index].request;
+					let top_level = matches!(
+						self.top_level_of.get(request),
+						Some(Some(PlannedItem::File(file))) if *file == index
+					);
 					tasks.spawn(copy_file(FileTask {
 						backend: Arc::clone(&self.backend),
 						control: self.control.clone(),
@@ -580,6 +649,9 @@ where
 						file: self.plan.files[index].clone(),
 						parent,
 						index,
+						top_level,
+						verify_name: top_level
+							&& self.plan.unverified_destinations.contains(&parent),
 					}));
 				}
 			}
@@ -621,6 +693,10 @@ where
 		);
 		match outcome.result {
 			Ok(file) => {
+				let active = ActiveFile {
+					name: file.name().map_or(active.name, str::to_owned),
+					..active
+				};
 				self.reporter.file_done(&active);
 				if top_level {
 					let item = CopiedTopLevel {
@@ -633,6 +709,30 @@ where
 				}
 			}
 			Err(FileError::Stopped) => self.reporter.file_abandoned(active.dest_uuid),
+			// Not a copy the user can keep or trash: trashing it would trash the existing file.
+			// It counts as failed, so done + failed still adds up to the totals.
+			Err(FileError::RegisteredAsVersion(file)) => {
+				let planned = &self.plan.files[outcome.index];
+				let info = FailureInfo {
+					source_uuid: active.source_uuid,
+					source_path: planned.source_path.clone(),
+					dest_parent: outcome.parent,
+					dest_name: file.name().map_or(active.name, str::to_owned),
+					stage: CopyStage::RegisteredAsVersion,
+					error: Arc::new(Error::custom(
+						ErrorKind::InvalidState,
+						"the copy was registered as a new version of an existing file",
+					)),
+					affected_files: 1,
+					affected_bytes: planned.size,
+					existing_file: Some(file.stable_uuid.into()),
+				};
+				self.reporter.file_failed(active.dest_uuid, info.clone());
+				self.report.failures.push(CopyFailure {
+					source: FailedSource::File(Box::new(planned.source.clone())),
+					info,
+				});
+			}
 			Err(FileError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
@@ -646,6 +746,7 @@ where
 					error,
 					affected_files: 1,
 					affected_bytes: planned.size,
+					existing_file: None,
 				};
 				self.reporter.file_failed(active.dest_uuid, info.clone());
 				self.report.failures.push(CopyFailure {
@@ -730,32 +831,29 @@ async fn create_dir<B: CopyBackend>(
 	created: DateTime<Utc>,
 	color: DirColor<'static>,
 	top_level: bool,
+	verify_name: bool,
 ) -> DirResult {
 	let _op = reporter.op();
 	let stage = CopyStage::CreateDirectory;
 	let _lock = backend.lock_drive().await.map_err(|e| (stage, e))?;
-	let mut taken: Option<TakenNames> = None;
+	let mut retry = NameRetry::new(true);
 	let mut name = name;
-	let mut dir = None;
-	for _ in 0..TOP_LEVEL_NAME_ATTEMPTS {
+	let mut dir = loop {
+		if verify_name {
+			name = retry
+				.free_name(backend, parent, name)
+				.await
+				.map_err(|e| (stage, e))?;
+		}
 		match backend
 			.create_dir(parent, uuid, &name, created)
 			.await
 			.map_err(|e| (stage, e))?
 		{
-			CreatedDir::Created(created) => {
-				dir = Some(created);
-				break;
-			}
-			CreatedDir::Merged if top_level => {
-				// Someone created the same name at the destination after it was listed: keep
-				// both by taking the next free name.
-				let taken = taken.get_or_insert_with(TakenNames::default);
-				taken.insert(name.as_ref());
-				name = taken
-					.allocate(name.as_ref(), true)
-					.map_err(|e| (stage, e.into()))?;
-			}
+			CreatedDir::Created(created) => break created,
+			// Someone created the same name at the destination after it was listed: keep both
+			// by taking the next free name.
+			CreatedDir::Merged if top_level => name = retry.next(&name).map_err(|e| (stage, e))?,
 			CreatedDir::Merged => {
 				return Err((
 					stage,
@@ -766,15 +864,6 @@ async fn create_dir<B: CopyBackend>(
 				));
 			}
 		}
-	}
-	let Some(mut dir) = dir else {
-		return Err((
-			stage,
-			Error::custom(
-				ErrorKind::InvalidState,
-				"could not find a free name for the directory at the destination",
-			),
-		));
 	};
 	if color != DirColor::Default
 		&& let Err(error) = backend.set_dir_color(&mut dir, color).await
@@ -807,11 +896,16 @@ struct FileTask<B> {
 	file: PlannedFile,
 	parent: Uuid,
 	index: usize,
+	top_level: bool,
+	/// Check the top-level name with the server before uploading.
+	verify_name: bool,
 }
 
 enum FileError {
 	Stopped,
 	Failed(CopyStage, Error),
+	/// Registered as a new version of the existing file it holds instead of as a new file.
+	RegisteredAsVersion(Box<RemoteFile>),
 }
 
 impl From<Stopped> for FileError {
@@ -884,6 +978,8 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 		targets,
 		file,
 		parent,
+		top_level,
+		verify_name,
 		..
 	} = task;
 	control.checkpoint().await?;
@@ -899,11 +995,19 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 			),
 		));
 	}
+	let mut retry = NameRetry::new(false);
+	let mut name = file.name.clone();
+	if verify_name {
+		name = retry
+			.free_name(&*backend, parent, name)
+			.await
+			.map_err(|e| FileError::Failed(CopyStage::Upload, e))?;
+	}
 	reporter.file_started(ActiveFile {
 		source_uuid: source.uuid(),
 		dest_uuid: file.dest_uuid,
 		dest_parent: parent,
-		name: file.name.as_ref().to_owned(),
+		name: name.as_ref().to_owned(),
 		size,
 		bytes_done: 0,
 	});
@@ -912,7 +1016,7 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 			.begin_upload(UploadSpec {
 				uuid: file.dest_uuid,
 				parent,
-				name: file.name.clone(),
+				name: name.clone(),
 				mime: source.mime().map(str::to_owned),
 			})
 			.map_err(|e| FileError::Failed(CopyStage::Upload, e))?,
@@ -1019,10 +1123,27 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 		.lock_drive()
 		.await
 		.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
+	if top_level {
+		// Registering a file under a name the parent already holds would make the copy a new
+		// version of that file instead of a new file, so the name is checked again here, while
+		// holding the drive lock: clients that write under the lock cannot take it in between.
+		name = retry
+			.free_name(&*backend, parent, name)
+			.await
+			.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
+	}
 	let remote = backend
-		.finish_upload(&upload, completion, info.unwrap_or_default())
+		.finish_upload(&upload, &name, completion, info.unwrap_or_default())
 		.await
 		.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
+	let registered_as_version = remote.stable_uuid != remote.uuid;
+	if registered_as_version {
+		tracing::error!(
+			"copied file {} was registered as a new version of the existing file {}",
+			remote.uuid,
+			Uuid::from(remote.stable_uuid)
+		);
+	}
 	if !targets.is_empty() {
 		for error in backend
 			.propagate(&targets, NonRootItemType::File(Cow::Borrowed(&remote)))
@@ -1033,6 +1154,9 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 				error: Arc::new(error),
 			});
 		}
+	}
+	if registered_as_version {
+		return Err(FileError::RegisteredAsVersion(Box::new(remote)));
 	}
 	Ok(remote)
 }
@@ -1137,6 +1261,7 @@ mod tests {
 		propagated: Vec<Uuid>,
 		propagated_trees: Vec<Uuid>,
 		target_fetches: usize,
+		probes: Vec<String>,
 	}
 
 	struct FakeUpload {
@@ -1160,6 +1285,11 @@ mod tests {
 		later_targets: Option<ConnectedTargets>,
 		/// Later chunks of a file download faster than earlier ones.
 		reverse_chunks: bool,
+		/// Lowercased names the destination holds without the listing having shown them.
+		existing: Mutex<HashSet<String>>,
+		/// Names the server registers as a new version of the given existing file (a client
+		/// writing without the drive lock took them at the last moment).
+		version_of: HashMap<String, Uuid>,
 		never: Notify,
 	}
 
@@ -1181,6 +1311,8 @@ mod tests {
 				targets: ConnectedTargets::default(),
 				later_targets: None,
 				reverse_chunks: false,
+				existing: Mutex::new(HashSet::new()),
+				version_of: HashMap::new(),
 				never: Notify::new(),
 			}
 		}
@@ -1234,7 +1366,13 @@ mod tests {
 			if self.fail_create.contains(name.as_ref()) {
 				return Err(Error::custom(ErrorKind::Server, "create failed"));
 			}
-			if self.merge_once.lock().unwrap().remove(name.as_ref()) {
+			if self.merge_once.lock().unwrap().remove(name.as_ref())
+				|| self
+					.existing
+					.lock()
+					.unwrap()
+					.contains(&name.as_ref().to_lowercase())
+			{
 				return Ok(CreatedDir::Merged);
 			}
 			if !self.known_dirs.lock().unwrap().contains(&parent) {
@@ -1323,9 +1461,19 @@ mod tests {
 			Ok(RemoteFileInfo::default())
 		}
 
+		async fn name_exists(&self, _parent: Uuid, name: &ValidatedName) -> Result<bool, Error> {
+			self.log().probes.push(name.as_ref().to_owned());
+			Ok(self
+				.existing
+				.lock()
+				.unwrap()
+				.contains(&name.as_ref().to_lowercase()))
+		}
+
 		async fn finish_upload(
 			&self,
 			upload: &FakeUpload,
+			name: &ValidatedName,
 			completion: UploadCompletion,
 			_info: RemoteFileInfo,
 		) -> Result<RemoteFile, Error> {
@@ -1333,13 +1481,25 @@ mod tests {
 				self.live_locks.load(Ordering::SeqCst) > 0,
 				"finalizing holds the drive lock"
 			);
-			self.log().finished.insert(
-				upload.spec.uuid,
-				(upload.spec.name.as_ref().to_owned(), completion),
+			assert!(
+				!self
+					.existing
+					.lock()
+					.unwrap()
+					.contains(&name.as_ref().to_lowercase()),
+				"a copy must never be registered under a name the destination holds"
 			);
+			self.log()
+				.finished
+				.insert(upload.spec.uuid, (name.as_ref().to_owned(), completion));
+			let stable_uuid = self
+				.version_of
+				.get(name.as_ref())
+				.copied()
+				.unwrap_or(upload.spec.uuid);
 			Ok(RemoteFile::from_meta(
 				upload.spec.uuid,
-				StableUuid::new_for_test(upload.spec.uuid),
+				StableUuid::new_for_test(stable_uuid),
 				upload.spec.parent.into(),
 				completion.written,
 				completion.num_chunks,
@@ -1348,7 +1508,7 @@ mod tests {
 				Utc::now(),
 				false,
 				FileMeta::Decoded(DecryptedFileMeta {
-					name: Cow::Owned(upload.spec.name.as_ref().to_owned()),
+					name: Cow::Owned(name.as_ref().to_owned()),
 					size: completion.written,
 					mime: Cow::Borrowed("text/plain"),
 					key: FileKey::V3(EncryptionKey::generate()),
@@ -1397,8 +1557,16 @@ mod tests {
 	}
 
 	fn plan(destination: Uuid, sources: Vec<PlanSource>) -> CopyPlan {
+		plan_with(destination, sources, false)
+	}
+
+	/// `unverified`: the destination listing had entries whose names it could not show.
+	fn plan_with(destination: Uuid, sources: Vec<PlanSource>, unverified: bool) -> CopyPlan {
 		let mut planner = CopyPlanner::default();
 		planner.add_destination(destination, std::iter::empty());
+		if unverified {
+			planner.mark_unverified(destination);
+		}
 		planner
 			.plan(
 				sources
@@ -2111,5 +2279,185 @@ mod tests {
 				.iter()
 				.any(|u| u.phase == CopyPhase::Finishing)
 		);
+	}
+
+	fn top_dir_and_file() -> (SourceDir, RemoteFileType<'static>, Vec<PlanSource>) {
+		let top = source_dir("Top");
+		let file = source_file("a.txt", 2 * CHUNK_SIZE_U64);
+		let sources = vec![
+			tree(&top, Vec::new(), Vec::new()),
+			PlanSource::File(file.clone()),
+		];
+		(top, file, sources)
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn names_are_checked_before_use_only_when_the_listing_hid_some() {
+		for unverified in [false, true] {
+			let destination = Uuid::new_v4();
+			let (_, _, sources) = top_dir_and_file();
+			let backend = Arc::new(FakeBackend::new(4, &[destination]));
+			let (running, _recorder, _reporter) = start(
+				&backend,
+				plan_with(destination, sources, unverified),
+				JobControl::default(),
+			);
+			running.await.unwrap().result.unwrap();
+			let probes = backend.log().probes.clone();
+			if unverified {
+				assert_eq!(
+					probes,
+					["Top", "a.txt", "a.txt"],
+					"the directory before it is created, the file before its upload and again \
+					 before it is registered"
+				);
+			} else {
+				assert_eq!(
+					probes,
+					["a.txt"],
+					"only the check right before a top-level file is registered"
+				);
+			}
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_taken_top_level_name_moves_to_the_next_keep_both_name() {
+		let destination = Uuid::new_v4();
+		let (_, _, sources) = top_dir_and_file();
+		let backend = FakeBackend::new(4, &[destination]);
+		backend
+			.existing
+			.lock()
+			.unwrap()
+			.extend(["top".to_owned(), "a.txt".to_owned()]);
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan_with(destination, sources, true),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+		let log = backend.log();
+		assert_eq!(log.created_dirs[0].1, "Top (1)");
+		assert_eq!(log.finished.values().next().unwrap().0, "a (1).txt");
+		let names: Vec<_> = outcome
+			.report
+			.top_level
+			.iter()
+			.map(|t| t.item.name().unwrap().to_owned())
+			.collect();
+		assert!(names.contains(&"Top (1)".to_owned()) && names.contains(&"a (1).txt".to_owned()));
+		assert!(
+			recorder
+				.events()
+				.iter()
+				.any(|e| matches!(e, CopyEvent::FileDone { name, .. } if name == "a (1).txt"))
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_name_taken_during_the_copy_is_caught_before_the_file_is_registered() {
+		let destination = Uuid::new_v4();
+		let file = source_file("big.bin", 4 * CHUNK_SIZE_U64);
+		let backend = Arc::new(FakeBackend::new(2, &[destination]));
+		let (running, _recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(file)]),
+			JobControl::default(),
+		);
+		wait_until("a chunk is uploaded", || !backend.log().uploaded.is_empty()).await;
+		// another client creates the same name while the copy runs
+		backend
+			.existing
+			.lock()
+			.unwrap()
+			.insert("big.bin".to_owned());
+		running.await.unwrap().result.unwrap();
+		let log = backend.log();
+		assert_eq!(log.finished.values().next().unwrap().0, "big (1).bin");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_file_gives_up_after_the_bounded_number_of_taken_names() {
+		let destination = Uuid::new_v4();
+		let file = source_file("a.txt", 10);
+		let backend = FakeBackend::new(4, &[destination]);
+		backend.existing.lock().unwrap().extend(
+			std::iter::once("a.txt".to_owned())
+				.chain((1..=TOP_LEVEL_NAME_ATTEMPTS).map(|n| format!("a ({n}).txt"))),
+		);
+		let backend = Arc::new(backend);
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan_with(destination, vec![PlanSource::File(file)], true),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+		assert_released(&backend, &reporter);
+		assert!(backend.log().finished.is_empty());
+		assert!(
+			backend.log().uploaded.is_empty(),
+			"nothing is uploaded without a free name"
+		);
+		let [failure] = outcome.report.failures.as_slice() else {
+			panic!("one failure");
+		};
+		assert_eq!(failure.info.error.kind(), ErrorKind::InvalidState);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() {
+		let destination = Uuid::new_v4();
+		let clashing = source_file("a.txt", CHUNK_SIZE_U64 + 5);
+		let other = source_file("b.txt", 10);
+		let existing = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.version_of.insert("a.txt".to_owned(), existing);
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![
+					PlanSource::File(clashing.clone()),
+					PlanSource::File(other.clone()),
+				],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+
+		outcome.result.unwrap();
+		assert_released(&backend, &reporter);
+		let [failure] = outcome.report.failures.as_slice() else {
+			panic!("one failure");
+		};
+		assert_eq!(failure.info.stage, CopyStage::RegisteredAsVersion);
+		assert_eq!(failure.info.existing_file, Some(existing));
+		assert_eq!(failure.info.dest_parent, destination);
+		assert_eq!(failure.info.dest_name, "a.txt");
+		assert!(matches!(&failure.source, FailedSource::File(f) if f.uuid() == clashing.uuid()));
+		assert_eq!(
+			outcome.report.top_level.len(),
+			1,
+			"only the real copy can be kept or trashed"
+		);
+		assert_eq!(outcome.report.top_level[0].source_uuid, other.uuid());
+
+		let counts = outcome.report.counts;
+		assert_eq!((counts.files_done, counts.files_failed), (1, 1));
+		assert_eq!(counts.bytes_failed, clashing.size());
+		assert_eq!(
+			counts.bytes_done + counts.bytes_failed,
+			outcome.report.totals.bytes
+		);
+		assert!(recorder.events().iter().any(|e| matches!(
+			e,
+			CopyEvent::FileFailed(info)
+				if info.stage == CopyStage::RegisteredAsVersion && info.existing_file == Some(existing)
+		)));
 	}
 }

@@ -7,7 +7,7 @@ use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
 use tokio::sync::Semaphore;
 
 use crate::{
-	Error,
+	Error, api,
 	auth::Client,
 	connect::ConnectedTargets,
 	crypto,
@@ -150,19 +150,33 @@ impl CopyBackend for ClientBackend {
 			.map(|(_, info)| info)
 	}
 
+	async fn name_exists(&self, parent: Uuid, name: &ValidatedName) -> Result<bool, Error> {
+		let name_hashed = self.client.hash_name(name.as_ref());
+		let file_request = api::v3::file::exists::Request {
+			name_hashed: name_hashed.clone(),
+			parent: parent.into(),
+		};
+		let dir_request = api::v3::dir::exists::Request {
+			name_hashed: Cow::Borrowed(&name_hashed),
+			parent,
+		};
+		let (file, dir) = futures::try_join!(
+			api::v3::file::exists::post(self.client.client(), &file_request),
+			api::v3::dir::exists::post(self.client.client(), &dir_request),
+		)?;
+		Ok(file.0.is_some() || dir.0.is_some())
+	}
+
 	async fn finish_upload(
 		&self,
 		upload: &Self::Upload,
+		name: &ValidatedName,
 		completion: UploadCompletion,
 		info: RemoteFileInfo,
 	) -> Result<RemoteFile, Error> {
-		let response =
-			complete_upload(&self.client, &upload.file, &upload.upload_key, completion).await?;
-		Ok(remote_file_from_upload(
-			upload.file.clone(),
-			response,
-			info,
-			completion,
-		))
+		let mut file = upload.file.clone();
+		file.root.name = name.clone();
+		let response = complete_upload(&self.client, &file, &upload.upload_key, completion).await?;
+		Ok(remote_file_from_upload(file, response, info, completion))
 	}
 }

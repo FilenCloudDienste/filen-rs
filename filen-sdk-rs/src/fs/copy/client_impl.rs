@@ -319,6 +319,9 @@ impl Client {
 				.filter_map(|d| d.name())
 				.chain(files.iter().filter_map(|f| f.name()));
 			planner.add_destination(destination.uuid(), names);
+			if dirs.iter().any(|d| d.name().is_none()) || files.iter().any(|f| f.name().is_none()) {
+				planner.mark_unverified(destination.uuid());
+			}
 			sources_done += 1;
 			report(sources_done);
 		}

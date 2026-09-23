@@ -187,6 +187,9 @@ pub(crate) struct CopyPlan<D = ()> {
 	/// course and are reported through [`CopyPlan::top_level`].
 	pub(crate) renamed: Vec<RenamedEntry>,
 	pub(crate) totals: PlanTotals,
+	/// Destinations whose listing had entries with undecryptable names: the top-level names
+	/// chosen for them are checked with the server before use, since they may be taken.
+	pub(crate) unverified_destinations: HashSet<Uuid>,
 }
 
 impl<D> Default for CopyPlan<D> {
@@ -198,6 +201,7 @@ impl<D> Default for CopyPlan<D> {
 			skipped: Vec::new(),
 			renamed: Vec::new(),
 			totals: PlanTotals::default(),
+			unverified_destinations: HashSet::new(),
 		}
 	}
 }
@@ -207,6 +211,7 @@ impl<D> Default for CopyPlan<D> {
 #[derive(Debug, Default)]
 pub(crate) struct CopyPlanner {
 	destinations: HashMap<Uuid, TakenNames>,
+	unverified_destinations: HashSet<Uuid>,
 }
 
 impl CopyPlanner {
@@ -217,6 +222,12 @@ impl CopyPlanner {
 	) {
 		self.destinations
 			.insert(uuid, TakenNames::new(existing_names));
+	}
+
+	/// Records that `uuid`'s listing had entries whose names could not be decrypted, so the
+	/// names it holds are not fully known.
+	pub(crate) fn mark_unverified(&mut self, uuid: Uuid) {
+		self.unverified_destinations.insert(uuid);
 	}
 
 	/// Validates every request before planning any: a directory cannot be copied into itself
@@ -240,7 +251,10 @@ impl CopyPlanner {
 			}
 		}
 
-		let mut plan = CopyPlan::default();
+		let mut plan = CopyPlan {
+			unverified_destinations: std::mem::take(&mut self.unverified_destinations),
+			..CopyPlan::default()
+		};
 		for (index, request) in requests.into_iter().enumerate() {
 			let taken = self
 				.destinations
@@ -669,6 +683,22 @@ mod tests {
 				bytes: 10
 			}
 		);
+	}
+
+	#[test]
+	fn destinations_with_hidden_names_are_carried_into_the_plan() {
+		let (verified, unverified) = (Uuid::new_v4(), Uuid::new_v4());
+		let mut planner = CopyPlanner::default();
+		planner.add_destination(verified, std::iter::empty());
+		planner.add_destination(unverified, std::iter::empty());
+		planner.mark_unverified(unverified);
+		let plan = planner
+			.plan(vec![
+				request(PlanSource::File(file("a", 1)), verified),
+				request(PlanSource::File(file("b", 1)), unverified),
+			])
+			.unwrap();
+		assert_eq!(plan.unverified_destinations, HashSet::from([unverified]));
 	}
 
 	#[test]
