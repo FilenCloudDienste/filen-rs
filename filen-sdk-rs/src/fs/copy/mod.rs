@@ -3,6 +3,10 @@
 
 // The copy engine that consumes these arrives in later commits; until then only tests do.
 #[allow(dead_code)]
+pub(crate) mod control;
+#[allow(dead_code)]
 pub(crate) mod naming;
 #[allow(dead_code)]
 pub(crate) mod plan;
+#[allow(dead_code)]
+pub(crate) mod progress;
