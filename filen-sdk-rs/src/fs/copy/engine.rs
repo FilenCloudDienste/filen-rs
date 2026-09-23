@@ -223,8 +223,14 @@ fn job_error(error: &Arc<Error>) -> Error {
 	Error::custom_with_source(error.kind(), Arc::clone(error), None::<&str>)
 }
 
-/// A created directory, or the stage and error it failed with.
-type DirResult = Result<RemoteDirectory, (CopyStage, Error)>;
+/// A created directory, or why it was not.
+type DirResult = Result<RemoteDirectory, DirError>;
+
+enum DirError {
+	/// Paused or stopped before anything was sent; the create is tried again after a pause.
+	NotStarted,
+	Failed(CopyStage, Error),
+}
 
 /// A downloaded chunk: its index, its plaintext, and the reservation it holds.
 type FetchedChunk = (u64, Result<Vec<u8>, Error>, ChunkReservation);
@@ -538,10 +544,12 @@ where
 		let color = dir.color.clone();
 		let targets = Arc::clone(&self.targets[dir.request]);
 		let backend = Arc::clone(&self.backend);
+		let control = self.control.clone();
 		let reporter = MaybeArc::clone(&self.reporter);
 		Box::pin(async move {
 			let result = create_dir(
 				&*backend,
+				&control,
 				&reporter,
 				&targets,
 				parent,
@@ -580,7 +588,9 @@ where
 					self.reporter.top_level_created(item);
 				}
 			}
-			Err((stage, error)) => {
+			// the loop waits out the pause or the stop before creating it again
+			Err(DirError::NotStarted) => ready.push_front(index),
+			Err(DirError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
 				self.fail_subtree(index);
@@ -829,6 +839,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn create_dir<B: CopyBackend>(
 	backend: &B,
+	control: &JobControl,
 	reporter: &MaybeArc<Reporter>,
 	targets: &ConnectedTargets,
 	parent: Uuid,
@@ -839,9 +850,15 @@ async fn create_dir<B: CopyBackend>(
 	top_level: bool,
 	verify_name: bool,
 ) -> DirResult {
-	let _op = reporter.op();
 	let stage = CopyStage::CreateDirectory;
-	let _lock = backend.lock_drive().await.map_err(|e| (stage, e))?;
+	// The shared lock the job holds is normally handed out at once; a fresh acquisition (its
+	// lease was lost) can wait long. Nothing is sent before the lock is held, so a pause or stop
+	// until then leaves the create to be tried again; once held, the create runs to the end.
+	let _lock = match wait_for_lock(backend, control, reporter).await {
+		Ok(LockWait::Locked(held)) => held,
+		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
+		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(stage, error)),
+	};
 	let mut retry = NameRetry::new(true);
 	let mut name = name;
 	let mut dir = loop {
@@ -849,19 +866,21 @@ async fn create_dir<B: CopyBackend>(
 			name = retry
 				.free_name(backend, parent, name)
 				.await
-				.map_err(|e| (stage, e))?;
+				.map_err(|e| DirError::Failed(stage, e))?;
 		}
 		match backend
 			.create_dir(parent, uuid, &name, created)
 			.await
-			.map_err(|e| (stage, e))?
+			.map_err(|e| DirError::Failed(stage, e))?
 		{
 			CreatedDir::Created(created) => break created,
 			// Someone created the same name at the destination after it was listed: keep both
 			// by taking the next free name.
-			CreatedDir::Merged if top_level => name = retry.next(&name).map_err(|e| (stage, e))?,
+			CreatedDir::Merged if top_level => {
+				name = retry.next(&name).map_err(|e| DirError::Failed(stage, e))?
+			}
 			CreatedDir::Merged => {
-				return Err((
+				return Err(DirError::Failed(
 					stage,
 					Error::custom(
 						ErrorKind::InvalidState,
@@ -2581,6 +2600,74 @@ mod tests {
 		assert_released(&backend, &reporter);
 		assert_eq!(outcome.report.top_level.len(), 1, "the copied file is kept");
 		assert!(backend.log().propagated_trees.is_empty());
+		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
+	}
+
+	// The first lock call is the shared one directory creation holds; blocking the next ones
+	// makes a create's own acquisition wait, as it does once the shared lock lost its lease.
+	#[tokio::test(start_paused = true)]
+	async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(3);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		backend.block_locks_from.store(1, Ordering::SeqCst);
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("a create waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		assert_released(&backend, &reporter);
+		assert!(backend.log().created_dirs.is_empty());
+
+		unblock_locks(&backend);
+		pause.send_replace(false);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+		let log = backend.log();
+		assert_eq!(
+			log.created_dirs.len(),
+			4,
+			"the interrupted create ran once resumed"
+		);
+		assert!(log.out_of_order_dirs.is_empty());
+		assert_eq!(log.finished.len(), 3);
+		assert_eq!(outcome.report.counts.dirs_created, 4);
+		assert_eq!(outcome.report.counts.dirs_failed, 0);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn cancel_ends_a_directory_create_waiting_for_a_fresh_lock() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(3);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		backend.block_locks_from.store(1, Ordering::SeqCst);
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("a create waits for the drive lock", || {
+			backend.log().lock_waits == 1
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+			.await
+			.expect("a cancel ends a create's wait for the drive lock")
+			.unwrap();
+
+		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		assert_released(&backend, &reporter);
+		assert!(backend.log().created_dirs.is_empty());
+		assert_eq!(
+			outcome.report.counts.dirs_failed, 0,
+			"a create that never started is not a failure"
+		);
+		assert!(outcome.report.failures.is_empty());
 		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 	}
 
