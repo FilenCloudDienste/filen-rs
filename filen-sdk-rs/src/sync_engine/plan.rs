@@ -23,7 +23,7 @@ use super::{
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
-	side::{Nodes, NodesAt},
+	side::{Nodes, NodesAt, Side},
 	tree::Baseline,
 };
 use crate::cache::{RemoteItem, UndecodableItem};
@@ -314,7 +314,7 @@ pub(super) fn in_quarantine(rel_path: &str) -> bool {
 /// The remote view of a sync root's subtree, plus whether it is safe to reconcile against.
 #[derive(Debug)]
 pub(crate) struct RemoteView {
-	pub(crate) nodes: HashMap<String, RemoteNode>,
+	pub(crate) nodes: Side<RemoteNode>,
 	/// `true` if two distinct remote items resolved to the same case-insensitive path but NOT the
 	/// same byte-identical one. The engine refuses to reconcile such a pair (a 1:1 local mapping is
 	/// impossible) until the user cleans it up.
@@ -403,7 +403,7 @@ pub(crate) struct ViewBuilder {
 	/// The undecodable DIRECTORIES, which placement needs from the first item on: nothing under
 	/// one can be placed, and the read hands them over before any item.
 	undecodable_dirs: HashSet<Uuid>,
-	nodes: HashMap<String, RemoteNode>,
+	nodes: Side<RemoteNode>,
 	held_paths: BTreeSet<String>,
 	skipped: Skipped,
 	/// Items whose ancestry the index could not answer for when they arrived (see the type doc).
@@ -420,7 +420,7 @@ impl ViewBuilder {
 			dir_index: HashMap::new(),
 			undecodable: Vec::new(),
 			undecodable_dirs: HashSet::new(),
-			nodes: HashMap::with_capacity(items),
+			nodes: Side::with_capacity(items),
 			held_paths: BTreeSet::new(),
 			skipped: Skipped::default(),
 			deferred: Vec::new(),
@@ -709,20 +709,18 @@ impl RemoteView {
 				.map(|path| collision_hash(&collision_key(path))),
 		);
 		let mut clashes: Vec<String> = Vec::new();
-		for rel_path in self.nodes.keys() {
-			if !claimed.insert(collision_hash(&collision_key(rel_path))) {
-				clashes.push(rel_path.clone());
+		for rel_path in self.nodes.paths() {
+			if !claimed.insert(collision_hash(&collision_key(&rel_path))) {
+				clashes.push(rel_path.into_owned());
 			}
 		}
 		for rel_path in clashes {
 			let key = collision_key(&rel_path);
 			// Which item already folded that way — asked on the error path only. A held path
 			// counts: both halves of such a name were taken back out of `nodes`.
-			let folds_onto = self
-				.nodes
-				.keys()
-				.chain(self.held_paths.iter())
-				.any(|taken| *taken != rel_path && collision_key(taken) == key);
+			let folds_like = |taken: &str| taken != rel_path && collision_key(taken) == key;
+			let folds_onto = self.nodes.paths().any(|taken| folds_like(&taken))
+				|| self.held_paths.iter().any(|taken| folds_like(taken));
 			if folds_onto {
 				tracing::debug!(
 					"remote view: {rel_path:?} folds onto another remote item's name, so no 1:1 local mapping exists"
@@ -2053,8 +2051,8 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
 	baseline: &mut Arc<Baseline>,
-	local: &mut HashMap<String, LocalNode>,
-	remote: &mut HashMap<String, RemoteNode>,
+	local: &mut Side<LocalNode>,
+	remote: &mut Side<RemoteNode>,
 	held: &BTreeSet<String>,
 	paths: PassPaths<'_>,
 ) -> Vec<SyncAction> {
@@ -2077,13 +2075,9 @@ pub(crate) fn fold_dir_moves(
 		};
 		let (from, to) = action.endpoints();
 		if matches!(action, SyncAction::MoveRemote { .. }) {
-			rekey_subtree(remote, from, to, |node, path| {
-				node.rel_path = path.to_string()
-			});
+			remote.rekey_subtree(from, to, |node, path| node.rel_path = path.to_string());
 		} else {
-			rekey_subtree(local, from, to, |node, path| {
-				node.rel_path = path.to_string()
-			});
+			local.rekey_subtree(from, to, |node, path| node.rel_path = path.to_string());
 		}
 		// Taken by value only once a move is actually being folded: the baseline the pass reads is
 		// the store's resident copy, and a pass that folds no directory move must not clone it.
@@ -2512,27 +2506,6 @@ fn parent_path(rel_path: &str) -> &str {
 	rel_path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
-/// Move every entry at `from` or under it to the same place under `to`, rewriting the path the
-/// entry carries with `set_path`.
-fn rekey_subtree<T>(
-	map: &mut HashMap<String, T>,
-	from: &str,
-	to: &str,
-	set_path: impl Fn(&mut T, &str),
-) {
-	let moving: Vec<(String, String)> = map
-		.keys()
-		.filter_map(|key| Some((key.clone(), moved_path(key, from, to)?)))
-		.collect();
-	for (old, new) in moving {
-		let Some(mut value) = map.remove(&old) else {
-			continue;
-		};
-		set_path(&mut value, &new);
-		map.insert(new, value);
-	}
-}
-
 /// What a pass must NOT act on, beyond what the three inputs themselves say.
 #[derive(Debug, Default)]
 pub(crate) struct PassHolds {
@@ -2946,7 +2919,7 @@ mod tests {
 		remote: &HashMap<String, RemoteNode>,
 		writes: &PendingWrites,
 	) -> Vec<SyncAction> {
-		let mut remote = remote.clone();
+		let mut remote = Side::from(remote.clone());
 		let baseline = tree(baseline);
 		writes.fold_into(PAIR, &baseline, &mut remote, &mut BTreeSet::new());
 		reconcile(
@@ -2968,8 +2941,11 @@ mod tests {
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		let (mut baseline, mut local, mut remote) =
-			(Arc::new(tree(baseline)), local.clone(), remote.clone());
+		let (mut baseline, mut local, mut remote) = (
+			Arc::new(tree(baseline)),
+			Side::from(local.clone()),
+			Side::from(remote.clone()),
+		);
 		let mut actions = fold_dir_moves(
 			mode,
 			&mut baseline,
@@ -3196,7 +3172,8 @@ mod tests {
 	#[test]
 	fn a_conflicted_dir_is_not_case_renamed() {
 		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
-		let (mut baseline, mut local, mut remote) = case_tree("Docs", "docs", "Docs", dir, file);
+		let (mut baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
+		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
 		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
 		let mut baseline = Arc::new(tree(&baseline));
 		assert!(
@@ -3574,7 +3551,8 @@ mod tests {
 	/// A path the cache is holding at either end keeps the directory where it is.
 	#[test]
 	fn a_dir_under_a_held_remote_path_is_not_moved() {
-		let (baseline, mut local, mut remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
 		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
 		let mut baseline = Arc::new(tree(&baseline));
 		assert!(
@@ -3597,10 +3575,16 @@ mod tests {
 	fn a_dir_move_is_carried_at_the_scope_a_pass_read() {
 		let (baseline, local, remote) = moved_tree(TreeIds::new(), "documents", "docs");
 		let scope = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
-		let (mut whole_baseline, mut whole_local, mut whole_remote) =
-			(Arc::new(tree(&baseline)), local.clone(), remote.clone());
-		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) =
-			(Arc::new(tree(&baseline)), local, remote);
+		let (mut whole_baseline, mut whole_local, mut whole_remote) = (
+			Arc::new(tree(&baseline)),
+			Side::from(local.clone()),
+			Side::from(remote.clone()),
+		);
+		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) = (
+			Arc::new(tree(&baseline)),
+			Side::from(local),
+			Side::from(remote),
+		);
 		let by_whole = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut whole_baseline,
@@ -5735,7 +5719,7 @@ mod tests {
 			&[],
 			None,
 		);
-		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["ok"]);
+		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["ok"]);
 		let record = |remote_uuid| SkippedRemote {
 			remote_uuid,
 			stable_uuid: None,
@@ -5770,7 +5754,7 @@ mod tests {
 			&[in_sub, garbled_dir, under_garbled, elsewhere],
 			None,
 		);
-		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["sub"]);
+		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["sub"]);
 		let recorded: Vec<(Uuid, &str)> = view
 			.skipped
 			.iter()
@@ -5811,7 +5795,11 @@ mod tests {
 			&[garbled, in_garbled],
 			None,
 		);
-		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
+		assert!(
+			view.nodes.is_empty(),
+			"{:?}",
+			view.nodes.paths().collect::<Vec<_>>()
+		);
 		let invalid = UnsyncableReason::RemoteInvalidName {
 			name: "..".to_string(),
 		};
@@ -5955,7 +5943,11 @@ mod tests {
 			}),
 		);
 
-		let mut paths: Vec<&str> = untracked.nodes.keys().map(String::as_str).collect();
+		let mut paths: Vec<String> = untracked
+			.nodes
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		paths.sort_unstable();
 		assert_eq!(paths, ["docs", "docs/keep.txt"], "both are still hidden");
 		assert!(
@@ -6029,7 +6021,7 @@ mod tests {
 				baseline: &Baseline::default(),
 			}),
 		);
-		assert_eq!(view.nodes.keys().collect::<Vec<_>>(), vec!["keep.txt"]);
+		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["keep.txt"]);
 		assert!(!view.has_collisions);
 		let by = |pattern: &str| IgnoreDecision {
 			level: IgnoreLevel::File { dir: String::new() },
@@ -6072,7 +6064,7 @@ mod tests {
 		let dirs = std::slice::from_ref(&sub);
 		let raw = build_remote_view(root, dirs, &files, &[], None);
 		assert_eq!(raw.nodes.len(), 3);
-		assert!(raw.nodes.contains_key(".filenignore"));
+		assert!(raw.nodes.holds(".filenignore"));
 
 		let view = build_remote_view(
 			root,
@@ -6084,7 +6076,11 @@ mod tests {
 				baseline: &Baseline::default(),
 			}),
 		);
-		assert!(view.nodes.is_empty(), "{:?}", view.nodes.keys());
+		assert!(
+			view.nodes.is_empty(),
+			"{:?}",
+			view.nodes.paths().collect::<Vec<_>>()
+		);
 		assert_eq!(
 			view.ignored.keys().collect::<Vec<_>>(),
 			vec![".filenignore", "sub"]
@@ -6116,9 +6112,9 @@ mod tests {
 		let files = [leaf.clone(), under_bad.clone(), orphan.clone()];
 		let materialized = place_remote_items(root, &dirs, &files, &undecodable);
 		assert!(
-			materialized.nodes.contains_key("A/deep/leaf.txt") && materialized.skipped.len() == 4,
+			materialized.nodes.holds("A/deep/leaf.txt") && materialized.skipped.len() == 4,
 			"the fixture has to exercise placement AND every way of failing it: {:?} {:?}",
-			materialized.nodes.keys(),
+			materialized.nodes.paths().collect::<Vec<_>>(),
 			materialized.skipped,
 		);
 
@@ -6164,7 +6160,11 @@ mod tests {
 		let files = [child];
 
 		let placed = place_remote_items(root, &dirs, &files, &[]);
-		assert!(placed.nodes.is_empty(), "{:?}", placed.nodes.keys());
+		assert!(
+			placed.nodes.is_empty(),
+			"{:?}",
+			placed.nodes.paths().collect::<Vec<_>>()
+		);
 		assert_eq!(
 			placed.skipped.len(),
 			2,
@@ -6204,7 +6204,7 @@ mod tests {
 		let files = [lower, upper];
 
 		let mut view = place_remote_items(root, &[], &files, &[]);
-		let mut placed: Vec<&str> = view.nodes.keys().map(String::as_str).collect();
+		let mut placed: Vec<String> = view.nodes.paths().map(|path| path.into_owned()).collect();
 		placed.sort_unstable();
 		assert_eq!(placed, vec!["Note.txt", "note.txt"]);
 		assert!(
@@ -6242,7 +6242,7 @@ mod tests {
 				.collect::<Vec<_>>(),
 			vec!["build/out.log"]
 		);
-		assert!(!view.nodes.contains_key("build/out.log"));
+		assert!(!view.nodes.holds("build/out.log"));
 
 		view.filter(Some(ViewFilter {
 			rules: &root_rules("build/"),
@@ -6628,11 +6628,12 @@ mod tests {
 		);
 		assert_eq!(view.held_paths, BTreeSet::from(["note.txt".to_string()]));
 		assert!(
-			!view.nodes.contains_key("note.txt"),
+			!view.nodes.holds("note.txt"),
 			"neither half of the transition may be reconciled against"
 		);
 		assert_eq!(
-			view.nodes["other.txt"].remote_uuid, sibling.uuid,
+			view.nodes.at("other.txt").unwrap().remote_uuid,
+			sibling.uuid,
 			"every other path still syncs"
 		);
 	}
@@ -6725,7 +6726,7 @@ mod tests {
 			None,
 		);
 		assert!(!view.has_collisions);
-		let mut paths: Vec<_> = view.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = view.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		assert_eq!(
 			paths,
@@ -6743,9 +6744,9 @@ mod tests {
 			}],
 			"the orphan is recorded, not silently dropped"
 		);
-		assert_eq!(view.nodes["sub/f.txt"].remote_uuid, file.uuid);
+		assert_eq!(view.nodes.at("sub/f.txt").unwrap().remote_uuid, file.uuid);
 		assert_eq!(
-			view.nodes["sub/f.txt"].content_hash,
+			view.nodes.at("sub/f.txt").unwrap().content_hash,
 			Some(Blake3Hash::from([5; 32]))
 		);
 	}
@@ -6958,8 +6959,8 @@ mod tests {
 			change: Change,
 			index: usize,
 			elsewhere: usize,
-			local: &mut HashMap<String, LocalNode>,
-			remote: &mut HashMap<String, RemoteNode>,
+			local: &mut Side<LocalNode>,
+			remote: &mut Side<RemoteNode>,
 			decided: &mut BTreeSet<String>,
 		) {
 			let (path, _) = TREE[index];
@@ -7017,8 +7018,8 @@ mod tests {
 		/// One generated case: what a change-scoped pass holds when it reaches the reconcile.
 		struct Case {
 			baseline: Baseline,
-			local: HashMap<String, LocalNode>,
-			remote: HashMap<String, RemoteNode>,
+			local: Side<LocalNode>,
+			remote: Side<RemoteNode>,
 			decided: BTreeSet<String>,
 			holds: PassHolds,
 		}

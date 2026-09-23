@@ -52,7 +52,7 @@ use super::{
 	plan::{self, PassHolds, RemoteNode, RemoteView},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalNode, LocalScan, RuleFiles},
-	side::NodesAt,
+	side::{Nodes, NodesAt, Side},
 	tree::Baseline,
 };
 
@@ -429,11 +429,11 @@ fn heap(bytes: usize) -> usize {
 /// allocation rather than a guess at it, and at a million rows the real table is nearly twice
 /// this figure's slot term. Same convention as [`Baseline::resident_bytes`], which is what lets
 /// the three numbers be summed and compared against a resident set.
-fn side_bytes<V>(map: &HashMap<String, V>, node_heap: impl Fn(&V) -> usize) -> usize {
-	let slots = map.capacity() * (size_of::<String>() + size_of::<V>() + 1);
-	let owned: usize = map
+fn side_bytes<V: Clone>(nodes: &Side<V>, node_heap: impl Fn(&V) -> usize) -> usize {
+	let slots = nodes.capacity() * (size_of::<String>() + size_of::<V>() + 1);
+	let owned: usize = nodes
 		.iter()
-		.map(|(path, node)| heap(path.len()) + node_heap(node))
+		.map(|(path, node)| heap(path.len()) + node_heap(&node))
 		.sum();
 	slots + owned
 }
@@ -750,11 +750,12 @@ fn probe_rules() -> IgnoreRules {
 
 /// A fully synced baseline for the scanned tree: what a pair looks like the pass after it
 /// converged, which is the state every steady-state measurement is taken in.
-fn baseline_rows(scan: &LocalScan, remote: &HashMap<String, RemoteNode>) -> Vec<BaselineEntry> {
+fn baseline_rows(scan: &LocalScan, remote: &Side<RemoteNode>) -> Vec<BaselineEntry> {
 	scan.nodes
-		.values()
-		.map(|node| {
-			let remote_node = remote.get(&node.rel_path);
+		.iter()
+		.map(|(_, node)| {
+			let at = remote.at(&node.rel_path);
+			let remote_node = at.as_deref();
 			BaselineEntry {
 				rel_path: node.rel_path.clone(),
 				kind: node.kind,
@@ -782,37 +783,29 @@ fn baseline_rows(scan: &LocalScan, remote: &HashMap<String, RemoteNode>) -> Vec<
 ///
 /// The paths are what a pass would hold in its changelist for those edits, which is the scope the
 /// change-scoped phases reconcile at.
-fn dirty_local(local: &mut HashMap<String, LocalNode>, from: usize, to: usize) -> BTreeSet<String> {
+fn dirty_local(local: &mut Side<LocalNode>, from: usize, to: usize) -> BTreeSet<String> {
 	let mut changed = BTreeSet::new();
-	for (index, node) in local
-		.values_mut()
-		.filter(|node| node.kind == NodeKind::File)
+	// Named first, then edited: a side lends no `&mut` to a node, so the walk cannot still be
+	// borrowing it while the edits land. Same order and same slice either way — re-filing a key
+	// the side already holds moves nothing.
+	let editing: Vec<String> = local
+		.iter()
+		.filter(|(_, node)| node.kind == NodeKind::File)
 		.skip(from)
 		.take(to.saturating_sub(from))
-		.enumerate()
-	{
+		.map(|(path, _)| path.into_owned())
+		.collect();
+	for (index, path) in editing.into_iter().enumerate() {
+		let mut node = local
+			.at(&path)
+			.expect("the side holds what it just named")
+			.into_owned();
 		node.size += 1;
 		node.content_hash = Some(Blake3Hash::from([(index % 251) as u8; 32]));
 		changed.insert(node.rel_path.clone());
+		local.insert(path, node);
 	}
 	changed
-}
-
-/// Move every remote node at `from` or under it to the same place under `to`, which is what the
-/// view holds after somebody moved that directory on the remote — the input the directory-move
-/// fold is measured on.
-fn rekey_remote_subtree(remote: &mut HashMap<String, RemoteNode>, from: &str, to: &str) {
-	let moving: Vec<(String, String)> = remote
-		.keys()
-		.filter_map(|path| Some((path.clone(), plan::moved_path(path, from, to)?)))
-		.collect();
-	for (old, new) in moving {
-		let Some(mut node) = remote.remove(&old) else {
-			continue;
-		};
-		node.rel_path = new.clone();
-		remote.insert(new, node);
-	}
 }
 
 /// A synced file row, for a phase that needs rows to exist and nothing more of them.
@@ -1791,7 +1784,12 @@ pub fn run() -> String {
 	// The same fold at the scope a change-scoped pass gives it. The pair is converged, so both find
 	// nothing — what the pair of lines says is what LOOKING costs, which is what every pass pays
 	// whether or not anything moved.
-	let idle_scope: BTreeSet<String> = local.keys().next().cloned().into_iter().collect();
+	let idle_scope: BTreeSet<String> = local
+		.paths()
+		.next()
+		.map(Cow::into_owned)
+		.into_iter()
+		.collect();
 	let (scoped_moves, scoped_fold) = timed(|| {
 		plan::fold_dir_moves(
 			SyncMode::TwoWay,
@@ -1833,7 +1831,9 @@ pub fn run() -> String {
 		} else {
 			rename_root.clone()
 		};
-		rekey_remote_subtree(&mut remote, &remote_at, &to);
+		remote.rekey_subtree(&remote_at, &to, |node, path| {
+			node.rel_path = path.to_string()
+		});
 		remote_at = to;
 		let (dir_moves, dir_fold) = timed(|| {
 			plan::fold_dir_moves(
@@ -1878,13 +1878,9 @@ pub fn run() -> String {
 		"visit_row_paths alone: every row's path against one reused buffer",
 	);
 	let (key_count, keys_built) = timed(|| {
-		let mut keys: BTreeSet<Cow<'_, str>> = local
-			.keys()
-			.chain(remote.keys())
-			.map(|path| Cow::Borrowed(path.as_str()))
-			.collect();
+		let mut keys: BTreeSet<Cow<'_, str>> = local.paths().chain(remote.paths()).collect();
 		baseline.visit_row_paths(|path| {
-			if !local.contains_key(path) && !remote.contains_key(path) {
+			if !local.holds(path) && !remote.holds(path) {
 				keys.insert(Cow::Owned(path.to_string()));
 			}
 		});

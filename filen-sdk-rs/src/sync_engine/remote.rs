@@ -33,6 +33,7 @@ use super::{
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry},
 	ignore::rule_file_dir,
 	plan::{self, RemoteNode, in_quarantine, is_safe_name, join_path},
+	side::{Nodes, NodesAt, Side},
 	tree::Baseline,
 };
 use crate::cache::{RemoteItem, SearchResult, hydrate_by_uuids, read_ancestors};
@@ -49,7 +50,7 @@ pub(super) type Ancestry<'a> = &'a mut dyn FnMut(Uuid) -> rusqlite::Result<Vec<R
 #[derive(Debug)]
 pub(super) struct RemoteObservation {
 	/// The view after the delta, keyed exactly as `plan::place_remote_items` keys it.
-	pub(super) nodes: HashMap<String, RemoteNode>,
+	pub(super) nodes: Side<RemoteNode>,
 	/// Where this delta PLACED each item it moved — the overlay
 	/// [`path_of`](Self::path_of) answers over, and nothing else.
 	///
@@ -107,7 +108,7 @@ pub(super) enum RemoteObserved {
 pub(super) fn observe_remote(
 	root: Uuid,
 	baseline: &Baseline,
-	nodes: HashMap<String, RemoteNode>,
+	nodes: Side<RemoteNode>,
 	delta: &[RemoteDeltaEntry],
 	ancestry: Ancestry<'_>,
 ) -> RemoteObserved {
@@ -164,7 +165,7 @@ fn as_item(result: &SearchResult) -> RemoteItem {
 }
 
 impl RemoteObservation {
-	fn new(nodes: HashMap<String, RemoteNode>) -> Self {
+	fn new(nodes: Side<RemoteNode>) -> Self {
 		Self {
 			nodes,
 			moved: HashMap::new(),
@@ -194,7 +195,7 @@ impl RemoteObservation {
 			None => baseline.path_by_uuid(uuid)?,
 		};
 		self.nodes
-			.get(&candidate)
+			.at(&candidate)
 			.is_some_and(|node| node.remote_uuid == uuid)
 			.then_some(candidate)
 	}
@@ -289,9 +290,9 @@ impl RemoteObservation {
 		if let Some(at) = self.path_of(baseline, uuid) {
 			let node = self
 				.nodes
-				.get(&at)
+				.at(&at)
 				.ok_or(FullPassReason::RemoteUnplaceable)?
-				.clone();
+				.into_owned();
 			return Ok((dir_of(&at).to_owned(), node));
 		}
 		let chain = read_chain(uuid, ancestry)?;
@@ -372,7 +373,7 @@ impl RemoteObservation {
 	/// it: the server re-mints a file's uuid on every content edit, and the whole-life id is what
 	/// says the new item is the same file.
 	fn displaced(&self, path: &str, uuid: Uuid, lineage: Option<StableUuid>) -> Option<NodeKind> {
-		let current = self.nodes.get(path)?;
+		let current = self.nodes.at(path)?;
 		let same_file = current.stable_uuid.is_some() && current.stable_uuid == lineage;
 		(current.remote_uuid != uuid && !same_file).then_some(current.kind)
 	}
@@ -419,9 +420,9 @@ impl RemoteObservation {
 		if let Some(from) = self.path_of(baseline, uuid) {
 			let carries_subtree = self
 				.nodes
-				.get(&from)
+				.at(&from)
 				.is_some_and(|node| node.kind == NodeKind::Dir)
-				&& self.nodes.keys().any(|key| plan::is_under(key, &from));
+				&& self.nodes.paths().any(|key| plan::is_under(&key, &from));
 			if carries_subtree {
 				return Err(FullPassReason::RemoteUnplaceable);
 			}
@@ -450,12 +451,7 @@ impl RemoteObservation {
 
 	/// Everything strictly under `path` leaves the view with it.
 	fn drop_subtree(&mut self, path: &str) {
-		let under: Vec<String> = self
-			.nodes
-			.keys()
-			.filter(|key| plan::is_under(key, path))
-			.cloned()
-			.collect();
+		let under = self.nodes.subtree_paths(path);
 		for key in under {
 			self.detach(&key);
 		}
@@ -463,12 +459,7 @@ impl RemoteObservation {
 
 	/// Re-key everything the cache still lists under `from` to sit under `to`.
 	fn rekey_subtree(&mut self, from: &str, to: &str) {
-		let under: Vec<String> = self
-			.nodes
-			.keys()
-			.filter(|key| plan::is_under(key, from))
-			.cloned()
-			.collect();
+		let under = self.nodes.subtree_paths(from);
 		for key in under {
 			let Some(mut node) = self.detach(&key) else {
 				continue;
@@ -622,7 +613,7 @@ mod tests {
 		placed(path, &item_dir(uuid, Uuid::nil(), path))
 	}
 
-	fn view(nodes: impl IntoIterator<Item = (String, RemoteNode)>) -> HashMap<String, RemoteNode> {
+	fn view(nodes: impl IntoIterator<Item = (String, RemoteNode)>) -> Side<RemoteNode> {
 		nodes.into_iter().collect()
 	}
 
@@ -635,9 +626,9 @@ mod tests {
 	/// alone. A map over a baseline that knows nothing about it is a shape no pass produces.
 	fn derived(
 		nodes: impl IntoIterator<Item = (String, RemoteNode)>,
-	) -> (Baseline, HashMap<String, RemoteNode>) {
+	) -> (Baseline, Side<RemoteNode>) {
 		let nodes = view(nodes);
-		let baseline = Baseline::from_rows(nodes.values().map(|node| {
+		let baseline = Baseline::from_rows(nodes.iter().map(|(_, node)| {
 			let mut entry = row(&node.rel_path, node.kind, Some(node.remote_uuid));
 			entry.remote_stable_uuid = node.stable_uuid;
 			entry
@@ -705,8 +696,8 @@ mod tests {
 		}
 	}
 
-	fn paths(out: &RemoteObservation) -> Vec<&str> {
-		let mut paths: Vec<&str> = out.nodes.keys().map(String::as_str).collect();
+	fn paths(out: &RemoteObservation) -> Vec<String> {
+		let mut paths: Vec<String> = out.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort_unstable();
 		paths
 	}
@@ -732,7 +723,7 @@ mod tests {
 		let out = applied(observe_remote(
 			root(),
 			&empty,
-			HashMap::new(),
+			Side::default(),
 			&delta(&[born(), died()]),
 			&mut no_ancestry(),
 		));
@@ -743,7 +734,7 @@ mod tests {
 		let out = applied(observe_remote(
 			root(),
 			&empty,
-			HashMap::new(),
+			Side::default(),
 			&delta(&[died(), born()]),
 			&mut no_ancestry(),
 		));
@@ -779,7 +770,7 @@ mod tests {
 		let out = applied(observe_remote(
 			root(),
 			&empty,
-			HashMap::new(),
+			Side::default(),
 			&delta(&events),
 			&mut ancestry,
 		));
@@ -888,7 +879,7 @@ mod tests {
 			&mut no_ancestry(),
 		));
 
-		assert_eq!(out.nodes["a.txt"].remote_uuid, new);
+		assert_eq!(out.nodes.at("a.txt").unwrap().remote_uuid, new);
 		assert!(out.path_of(&baseline, old).is_none());
 		assert_eq!(out.path_of(&baseline, new).as_deref(), Some("a.txt"));
 		assert!(out.held_paths.is_empty(), "{:?}", out.held_paths);
@@ -947,7 +938,7 @@ mod tests {
 			]),
 			&mut no_ancestry(),
 		));
-		assert_eq!(out.nodes["a.txt"].remote_uuid, new);
+		assert_eq!(out.nodes.at("a.txt").unwrap().remote_uuid, new);
 		assert!(out.held_paths.is_empty(), "{:?}", out.held_paths);
 	}
 
@@ -977,7 +968,7 @@ mod tests {
 
 		assert_eq!(paths(&out), vec!["top", "top/d", "top/d/a.txt"]);
 		assert_eq!(out.path_of(&baseline, file).as_deref(), Some("top/d/a.txt"));
-		assert_eq!(out.nodes["top/d/a.txt"].rel_path, "top/d/a.txt");
+		assert_eq!(out.nodes.at("top/d/a.txt").unwrap().rel_path, "top/d/a.txt");
 		assert_eq!(listed(&out.touched), vec!["d", "top/d"]);
 	}
 
@@ -1005,7 +996,7 @@ mod tests {
 		));
 
 		assert_eq!(listed(&out.rule_dirs), vec!["d"]);
-		assert!(out.nodes.contains_key(&format!("d/{FILENIGNORE}")));
+		assert!(out.nodes.holds(&format!("d/{FILENIGNORE}")));
 	}
 
 	/// A directory the derivation cannot place — the name it was renamed to is taken — cannot
@@ -1075,7 +1066,7 @@ mod tests {
 		match observe_remote(
 			root(),
 			&Baseline::default(),
-			HashMap::new(),
+			Side::default(),
 			&delta(&events),
 			&mut ancestry,
 		) {
