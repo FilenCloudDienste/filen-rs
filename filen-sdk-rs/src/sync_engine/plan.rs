@@ -886,7 +886,7 @@ pub(crate) fn unknown_remote_paths(
 
 /// How one side compares to the baseline at a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
+enum SideState {
 	/// Neither the side nor the baseline has the path.
 	Absent,
 	/// Present and matching the baseline.
@@ -899,28 +899,28 @@ enum Side {
 	Deleted,
 }
 
-impl Side {
+impl SideState {
 	fn changed(self) -> bool {
 		matches!(self, Self::Created | Self::Modified | Self::Deleted)
 	}
 }
 
-fn classify_local(node: Option<&LocalNode>, base: Option<&BaselineEntry>) -> Side {
+fn classify_local(node: Option<&LocalNode>, base: Option<&BaselineEntry>) -> SideState {
 	match (node, base) {
-		(None, None) => Side::Absent,
-		(Some(_), None) => Side::Created,
-		(None, Some(_)) => Side::Deleted,
+		(None, None) => SideState::Absent,
+		(Some(_), None) => SideState::Created,
+		(None, Some(_)) => SideState::Deleted,
 		(Some(node), Some(base)) => {
 			if node.kind != base.kind {
-				Side::Modified
+				SideState::Modified
 			} else {
 				match node.kind {
-					NodeKind::Dir => Side::Unchanged,
+					NodeKind::Dir => SideState::Unchanged,
 					NodeKind::File => {
 						if node.content_hash.is_some() && node.content_hash == base.content_hash {
-							Side::Unchanged
+							SideState::Unchanged
 						} else {
-							Side::Modified
+							SideState::Modified
 						}
 					}
 				}
@@ -939,18 +939,18 @@ pub(super) fn same_file_lineage(base: &BaselineEntry, node: &RemoteNode) -> bool
 	)
 }
 
-fn classify_remote(node: Option<&RemoteNode>, base: Option<&BaselineEntry>) -> Side {
+fn classify_remote(node: Option<&RemoteNode>, base: Option<&BaselineEntry>) -> SideState {
 	match (node, base) {
-		(None, None) => Side::Absent,
-		(Some(_), None) => Side::Created,
-		(None, Some(_)) => Side::Deleted,
+		(None, None) => SideState::Absent,
+		(Some(_), None) => SideState::Created,
+		(None, Some(_)) => SideState::Deleted,
 		(Some(node), Some(base)) => {
 			if node.kind != base.kind {
-				Side::Modified
+				SideState::Modified
 			} else {
 				match node.kind {
 					NodeKind::File => classify_remote_file(node, base),
-					NodeKind::Dir => Side::Unchanged,
+					NodeKind::Dir => SideState::Unchanged,
 				}
 			}
 		}
@@ -970,18 +970,18 @@ fn classify_remote(node: Option<&RemoteNode>, base: Option<&BaselineEntry>) -> S
 ///   whatever holds the path either way. Where the distinction is load-bearing is
 ///   [`PendingWrites::settle`](super::engine::PendingWrites): another client's edit of the file we
 ///   just pushed is a two-way conflict, its replacement of it is not.
-fn classify_remote_file(node: &RemoteNode, base: &BaselineEntry) -> Side {
+fn classify_remote_file(node: &RemoteNode, base: &BaselineEntry) -> SideState {
 	if base.remote_uuid == Some(node.remote_uuid) {
-		return Side::Unchanged;
+		return SideState::Unchanged;
 	}
 	let identical_content = matches!(
 		(base.content_hash, node.content_hash),
 		(Some(recorded), Some(current)) if recorded == current
 	);
 	if same_file_lineage(base, node) && identical_content {
-		Side::Unchanged
+		SideState::Unchanged
 	} else {
-		Side::Modified
+		SideState::Modified
 	}
 }
 
@@ -1756,7 +1756,7 @@ fn detect_moves<'m>(
 			// refused below, where the kept copy would end up under the download.
 			let local_at_from = local.at(from);
 			if base.content_hash.is_some()
-				&& classify_local(local_at_from.as_deref(), Some(base)) != Side::Unchanged
+				&& classify_local(local_at_from.as_deref(), Some(base)) != SideState::Unchanged
 			{
 				return;
 			}
