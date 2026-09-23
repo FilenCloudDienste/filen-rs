@@ -184,7 +184,8 @@ pub(crate) struct CopyPlan<D = ()> {
 	pub(crate) top_level: Vec<PlannedTopLevel>,
 	pub(crate) skipped: Vec<SkippedEntry>,
 	/// Renames below the top level. Top-level items are renamed by keep-both as a matter of
-	/// course and are reported through [`CopyPlan::top_level`].
+	/// course and are reported through [`CopyPlan::top_level`]; a name that changes again while
+	/// copying is reported by the job.
 	pub(crate) renamed: Vec<RenamedEntry>,
 	pub(crate) totals: PlanTotals,
 	/// Destinations whose listing had entries with undecryptable names: the top-level names

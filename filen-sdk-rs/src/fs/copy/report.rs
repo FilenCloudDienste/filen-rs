@@ -220,6 +220,9 @@ pub struct CopyReport<D> {
 	pub top_level: Vec<CopiedTopLevel>,
 	pub failures: Vec<CopyFailure<D>>,
 	pub skipped: Vec<SkippedEntry>,
+	/// Items created under a different name than their source's. A top-level item's planned
+	/// keep-both name is not listed; a later one, because the planned name was taken after the
+	/// destination was listed, is.
 	pub renamed: Vec<RenamedEntry>,
 	pub totals: PlanTotals,
 	pub counts: CopyCounts,

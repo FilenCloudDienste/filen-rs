@@ -55,7 +55,7 @@ use crate::{
 use super::{
 	control::{JobControl, JobTasks, MAX_CONCURRENT_OPERATIONS, Stopped},
 	naming::TakenNames,
-	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem},
+	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 	report::{
 		ActiveFile, CopiedTopLevel, CopyEvent, CopyFailure, CopyPhase, CopyReport, CopyStage,
 		FailedSource, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
@@ -223,8 +223,8 @@ fn job_error(error: &Arc<Error>) -> Error {
 	Error::custom_with_source(error.kind(), Arc::clone(error), None::<&str>)
 }
 
-/// A created directory, or why it was not.
-type DirResult = Result<RemoteDirectory, DirError>;
+/// A created directory with the name it got, or why it was not created.
+type DirResult = Result<(RemoteDirectory, ValidatedName), DirError>;
 
 enum DirError {
 	/// Paused or stopped before anything was sent; the create is tried again after a pause.
@@ -568,7 +568,17 @@ where
 	fn dir_finished(&mut self, index: usize, result: DirResult, ready: &mut VecDeque<usize>) {
 		let parent = self.dest_parent(self.plan.dirs[index].parent);
 		match result {
-			Ok(dir) => {
+			Ok((dir, name)) => {
+				let planned = &self.plan.dirs[index];
+				if let DestParent::Existing(_) = planned.parent {
+					let renamed = renamed_top_level(
+						planned.source_uuid,
+						&planned.source_path,
+						&planned.name,
+						name,
+					);
+					self.note_renamed(renamed);
+				}
 				let planned = &self.plan.dirs[index];
 				self.dir_states[index] = DirState::Created(dir.uuid());
 				self.reporter.dir_created(
@@ -614,6 +624,19 @@ where
 				});
 			}
 		}
+	}
+
+	fn note_renamed(&mut self, entry: Option<RenamedEntry>) {
+		let Some(entry) = entry else {
+			return;
+		};
+		self.reporter.event(CopyEvent::Renamed {
+			source_uuid: entry.source_uuid,
+			source_path: entry.source_path.clone(),
+			name: entry.name.as_ref().to_owned(),
+			reason: entry.reason,
+		});
+		self.report.renamed.push(entry);
 	}
 
 	fn fail_subtree(&mut self, root: usize) {
@@ -701,7 +724,17 @@ where
 			Some(Some(PlannedItem::File(index))) if *index == outcome.index
 		);
 		match outcome.result {
-			Ok(file) => {
+			Ok((file, name)) => {
+				if top_level {
+					let planned = &self.plan.files[outcome.index];
+					let renamed = renamed_top_level(
+						active.source_uuid,
+						&planned.source_path,
+						&planned.name,
+						name,
+					);
+					self.note_renamed(renamed);
+				}
 				let active = ActiveFile {
 					name: file.name().map_or(active.name, str::to_owned),
 					..active
@@ -836,6 +869,22 @@ where
 	}
 }
 
+/// A top-level name can be taken after the destination was listed; the item then gets the next
+/// keep-both name, which differs from the announced one and is reported as a rename.
+fn renamed_top_level(
+	source_uuid: Uuid,
+	source_path: &str,
+	planned: &ValidatedName,
+	name: ValidatedName,
+) -> Option<RenamedEntry> {
+	(name.as_ref() != planned.as_ref()).then(|| RenamedEntry {
+		source_uuid,
+		source_path: source_path.to_owned(),
+		name,
+		reason: RenameReason::DuplicateName,
+	})
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_dir<B: CopyBackend>(
 	backend: &B,
@@ -909,7 +958,7 @@ async fn create_dir<B: CopyBackend>(
 			});
 		}
 	}
-	Ok(dir)
+	Ok((dir, name))
 }
 
 struct FileTask<B> {
@@ -942,7 +991,8 @@ impl From<Stopped> for FileError {
 struct FileOutcome {
 	index: usize,
 	parent: Uuid,
-	result: Result<RemoteFile, FileError>,
+	/// The registered file and the name it got.
+	result: Result<(RemoteFile, ValidatedName), FileError>,
 }
 
 /// Memory reservation of one chunk, and its place among the job's in-flight operations.
@@ -1041,7 +1091,9 @@ async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
 	}
 }
 
-async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile, FileError> {
+async fn copy_file_inner<B: CopyBackend>(
+	task: FileTask<B>,
+) -> Result<(RemoteFile, ValidatedName), FileError> {
 	let FileTask {
 		backend,
 		control,
@@ -1237,7 +1289,7 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 	if registered_as_version {
 		return Err(FileError::RegisteredAsVersion(Box::new(remote)));
 	}
-	Ok(remote)
+	Ok((remote, name))
 }
 
 #[cfg(test)]
@@ -2644,6 +2696,72 @@ mod tests {
 			panic!("a directory");
 		};
 		assert_eq!(dir.name(), Some("Top (1)"));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let taken = source_file("a.txt", 10);
+		let untouched = source_file("b.txt", 10);
+		let backend = FakeBackend::new(4, &[destination]);
+		// taken after the destination was listed: the directory by a create that merges, the
+		// file by the check right before it is registered
+		backend.merge_once.lock().unwrap().insert("Top".to_owned());
+		backend.existing.lock().unwrap().insert("a.txt".to_owned());
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![
+					tree(&top, Vec::new(), Vec::new()),
+					PlanSource::File(taken.clone()),
+					PlanSource::File(untouched),
+				],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+
+		let renamed: Vec<_> = recorder
+			.events()
+			.into_iter()
+			.filter_map(|e| match e {
+				CopyEvent::Renamed {
+					source_uuid,
+					name,
+					reason,
+					..
+				} => Some((source_uuid, name, reason)),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			renamed,
+			[
+				(top.uuid, "Top (1)".to_owned(), RenameReason::DuplicateName),
+				(
+					taken.uuid(),
+					"a (1).txt".to_owned(),
+					RenameReason::DuplicateName
+				),
+			]
+		);
+		let report: Vec<_> = outcome
+			.report
+			.renamed
+			.iter()
+			.map(|r| (r.source_uuid, r.name.as_ref().to_owned()))
+			.collect();
+		assert_eq!(
+			report,
+			[
+				(top.uuid, "Top (1)".to_owned()),
+				(taken.uuid(), "a (1).txt".to_owned())
+			]
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
