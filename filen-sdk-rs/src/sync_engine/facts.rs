@@ -156,7 +156,28 @@ impl PairFacts {
 		baseline: &Baseline,
 	) {
 		for at in touched {
+			// A whole read answers for every path, so dropping `at`'s whole subtree is the whole of
+			// the truth. A change-scoped one answers only for the paths it DECIDED — `filter_changed`
+			// records a root among those and no other — while the prune still takes the subtree, so
+			// a carried root strictly under `at` would go on the strength of a reading that never
+			// looked there. What goes with it is the withholding that keeps a deletion off ignored
+			// content (`withhold_deletions_over_unreachable`) and the root's place in `last_ignored`.
+			//
+			// Re-supplied where the baseline still names a row at or under the root: those rows are
+			// the evidence that what the rule hides is still there and still untracked — the very
+			// rows `untrack_ignored` retries its `delete_subtrees` on. A root with NO row under it
+			// is dropped as before: nothing here says it still exists, and carrying it on would
+			// withhold its directory's deletion for as long as the pair lasted.
+			let carried: Vec<(String, IgnoreDecision)> = if at.is_empty() {
+				Vec::new()
+			} else {
+				plan::under_dir(&self.ignored_remote, at)
+					.filter(|(root, _)| baseline.tracked(root, true))
+					.map(|(root, decision)| (root.clone(), decision.clone()))
+					.collect()
+			};
 			self.prune_remote(at);
+			self.ignored_remote.extend(carried);
 		}
 		clone_into(&mut self.ignored_remote, &view.ignored);
 		// The same read a whole pass makes, over whatever this one skipped: a derived view skips
@@ -300,7 +321,7 @@ mod tests {
 
 	use super::*;
 	use crate::sync_engine::{
-		baseline::NodeKind,
+		baseline::{BaselineEntry, BaselineState, NodeKind},
 		ignore::{FILENIGNORE, IgnoreLevel, IgnoreRules},
 		observe::observe_local,
 		outcome::PlannedNodeKind,
@@ -588,6 +609,84 @@ mod tests {
 			keys(&facts.invalid_names),
 			vec!["a/x.txt"],
 			"a remote read is no evidence about the local path"
+		);
+	}
+
+	/// A carried ignored root strictly UNDER a touched path survives the prune for as long as the
+	/// baseline names a row at or under it, and goes with the prune once none is left.
+	///
+	/// The prune takes `at`'s whole subtree, but a change-scoped view re-derives the roots among the
+	/// paths that pass DECIDED and no others (`RemoteView::filter_changed`), so a root it never
+	/// looked at would be dropped on the strength of a reading that never covered it — and with it
+	/// the withholding that keeps a deletion off ignored content, and the root's place in
+	/// `last_ignored`. Rows at or under the root are the evidence that what the rule hides is still
+	/// there: they are what an `untrack_ignored` failed to delete, and what it retries.
+	#[test]
+	fn a_carried_ignored_root_under_a_touched_path_lives_while_rows_sit_under_it() {
+		let row = |rel_path: &str| BaselineEntry {
+			rel_path: rel_path.to_owned(),
+			kind: NodeKind::File,
+			remote_uuid: Some(Uuid::from_u128(11)),
+			content_hash: None,
+			size: None,
+			local_mtime: None,
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		};
+		// A derived view that re-derived NOTHING: the pass decided only `a`, so `filter_changed`
+		// recorded no root, and whatever survives here survives as a carried fact.
+		let derived_view = || RemoteView {
+			nodes: Side::default(),
+			has_collisions: false,
+			held_paths: BTreeSet::new(),
+			skipped: Vec::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+		};
+		let carried = || PairFacts {
+			ignored_remote: BTreeMap::from([
+				("a/keep".to_owned(), decision("keep")),
+				("a/gone".to_owned(), decision("gone")),
+			]),
+			..PairFacts::default()
+		};
+
+		// `a/keep` still has a row under it; `a/gone` has none.
+		let rows = Baseline::from_rows([row("a/keep/hidden.txt")]);
+		let mut scoped = carried();
+		scoped.merge_remote_view(&BTreeSet::from(["a".to_owned()]), &derived_view(), &rows);
+		assert_eq!(
+			keys(&scoped.ignored_remote),
+			vec!["a/keep"],
+			"the root with rows under it is re-supplied; the one with none is pruned as before"
+		);
+
+		// No rows at all: the prune stands exactly as it did before this was re-supplied at all.
+		let mut untracked = carried();
+		untracked.merge_remote_view(
+			&BTreeSet::from(["a".to_owned()]),
+			&derived_view(),
+			&Baseline::default(),
+		);
+		assert!(
+			untracked.ignored_remote.is_empty(),
+			"nothing here says ignored content with no row is still there: {:?}",
+			untracked.ignored_remote
+		);
+
+		// A whole read answers for every path, so its view REPLACES the carried roots, rows or not.
+		let mut whole = carried();
+		whole.merge_remote_view(&BTreeSet::from([String::new()]), &derived_view(), &rows);
+		assert!(
+			whole.ignored_remote.is_empty(),
+			"a whole read that found no ignored root means there is none: {:?}",
+			whole.ignored_remote
 		);
 	}
 
