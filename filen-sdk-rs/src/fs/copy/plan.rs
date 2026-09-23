@@ -671,6 +671,23 @@ mod tests {
 	}
 
 	#[test]
+	fn the_same_source_twice_gets_two_names() {
+		let destination = Uuid::new_v4();
+		let source = file("a.txt", 10);
+		let plan = planner(destination, &[])
+			.plan(vec![
+				request(PlanSource::File(source.clone()), destination),
+				request(PlanSource::File(source), destination),
+			])
+			.unwrap();
+		let names: Vec<&str> = plan.files.iter().map(|f| name(&f.name)).collect();
+		assert_eq!(names, ["a.txt", "a (1).txt"]);
+		assert_ne!(plan.files[0].dest_uuid, plan.files[1].dest_uuid);
+		assert_eq!(plan.top_level.len(), 2);
+		assert_eq!(plan.totals.bytes, 20);
+	}
+
+	#[test]
 	fn top_level_file_gets_a_keep_both_name() {
 		let destination = Uuid::new_v4();
 		let plan = planner(destination, &["a.txt"])

@@ -1439,6 +1439,8 @@ mod tests {
 		probes: Vec<String>,
 		/// Drive-lock acquisitions that had to wait for another holder.
 		lock_waits: usize,
+		/// Slow registrations that have started.
+		finishing: Vec<String>,
 	}
 
 	struct FakeUpload {
@@ -1456,7 +1458,21 @@ mod tests {
 		fail_fetch: HashMap<String, ErrorKind>,
 		fail_upload: HashMap<String, ErrorKind>,
 		blocked_uploads: HashSet<String>,
-		fail_create: HashSet<String>,
+		fail_create: HashMap<String, ErrorKind>,
+		/// Colors that cannot be set.
+		fail_color: bool,
+		/// Every propagation to a share or link fails.
+		fail_propagate: bool,
+		fail_finish: HashMap<String, ErrorKind>,
+		/// Registrations that take this long, logged in `finishing` when they start.
+		slow_finish: HashMap<String, Duration>,
+		/// Files whose last chunk comes back one byte short.
+		short_reads: HashSet<String>,
+		/// Fetching the destination's shares and links fails.
+		fail_targets: Option<ErrorKind>,
+		targets_delay: Duration,
+		/// Drive-lock acquisitions from this call index on fail with this kind.
+		fail_locks_from: Option<(usize, ErrorKind)>,
 		merge_once: Mutex<HashSet<String>>,
 		targets: ConnectedTargets,
 		later_targets: Option<ConnectedTargets>,
@@ -1487,7 +1503,15 @@ mod tests {
 				fail_fetch: HashMap::new(),
 				fail_upload: HashMap::new(),
 				blocked_uploads: HashSet::new(),
-				fail_create: HashSet::new(),
+				fail_create: HashMap::new(),
+				fail_color: false,
+				fail_propagate: false,
+				fail_finish: HashMap::new(),
+				slow_finish: HashMap::new(),
+				short_reads: HashSet::new(),
+				fail_targets: None,
+				targets_delay: Duration::ZERO,
+				fail_locks_from: None,
 				merge_once: Mutex::new(HashSet::new()),
 				targets: ConnectedTargets::default(),
 				later_targets: None,
@@ -1519,6 +1543,11 @@ mod tests {
 
 		async fn lock_drive(&self) -> Result<FakeLock, Error> {
 			let call = self.lock_calls.fetch_add(1, Ordering::SeqCst);
+			if let Some((from, kind)) = self.fail_locks_from
+				&& call >= from
+			{
+				return Err(Error::custom(kind, "lock failed"));
+			}
 			if call >= self.block_locks_from.load(Ordering::SeqCst) {
 				self.log().lock_waits += 1;
 				while call >= self.block_locks_from.load(Ordering::SeqCst) {
@@ -1535,6 +1564,10 @@ mod tests {
 				log.target_fetches += 1;
 				log.target_fetches
 			};
+			tokio::time::sleep(self.targets_delay).await;
+			if let Some(kind) = self.fail_targets {
+				return Err(Error::custom(kind, "targets failed"));
+			}
 			Ok(match (&self.later_targets, fetches) {
 				(Some(later), 2..) => later.clone(),
 				_ => self.targets.clone(),
@@ -1553,8 +1586,8 @@ mod tests {
 				"creates hold the drive lock"
 			);
 			self.wait(name.as_ref()).await;
-			if self.fail_create.contains(name.as_ref()) {
-				return Err(Error::custom(ErrorKind::Server, "create failed"));
+			if let Some(kind) = self.fail_create.get(name.as_ref()) {
+				return Err(Error::custom(*kind, "create failed"));
 			}
 			if self.merge_once.lock().unwrap().remove(name.as_ref())
 				|| self
@@ -1588,6 +1621,9 @@ mod tests {
 			dir: &mut RemoteDirectory,
 			_color: DirColor<'static>,
 		) -> Result<(), Error> {
+			if self.fail_color {
+				return Err(Error::custom(ErrorKind::Server, "color failed"));
+			}
 			self.log().colored.push(dir.uuid());
 			Ok(())
 		}
@@ -1597,6 +1633,9 @@ mod tests {
 			_targets: &ConnectedTargets,
 			item: NonRootItemType<'_, Normal>,
 		) -> Vec<Error> {
+			if self.fail_propagate {
+				return vec![Error::custom(ErrorKind::Server, "propagation failed")];
+			}
 			self.log().propagated.push(item.uuid());
 			Vec::new()
 		}
@@ -1629,7 +1668,12 @@ mod tests {
 				return Err(Error::custom(*kind, "fetch failed"));
 			}
 			self.log().fetched.push((file.uuid(), index));
-			Ok(chunk_data(file.uuid(), index, file.size()))
+			let mut data = chunk_data(file.uuid(), index, file.size());
+			if self.short_reads.contains(&name) && index + 1 == file.size().div_ceil(CHUNK_SIZE_U64)
+			{
+				data.pop();
+			}
+			Ok(data)
 		}
 
 		async fn upload_chunk(
@@ -1671,6 +1715,13 @@ mod tests {
 				self.live_locks.load(Ordering::SeqCst) > 0,
 				"finalizing holds the drive lock"
 			);
+			if let Some(delay) = self.slow_finish.get(name.as_ref()) {
+				self.log().finishing.push(name.as_ref().to_owned());
+				tokio::time::sleep(*delay).await;
+			}
+			if let Some(kind) = self.fail_finish.get(name.as_ref()) {
+				return Err(Error::custom(*kind, "registration failed"));
+			}
 			assert!(
 				!self
 					.existing
@@ -2693,7 +2744,9 @@ mod tests {
 			],
 		);
 		let mut backend = FakeBackend::new(4, &[destination]);
-		backend.fail_create.insert("Sub".to_owned());
+		backend
+			.fail_create
+			.insert("Sub".to_owned(), ErrorKind::Server);
 		let backend = Arc::new(backend);
 		let (running, _recorder, reporter) = start(
 			&backend,
@@ -2741,7 +2794,9 @@ mod tests {
 			vec![listed(&top, source_file("nested", 5))],
 		);
 		let mut backend = FakeBackend::new(4, &[destination]);
-		backend.fail_create.insert("Sub".to_owned());
+		backend
+			.fail_create
+			.insert("Sub".to_owned(), ErrorKind::Server);
 		backend
 			.fail_upload
 			.insert("nested".to_owned(), ErrorKind::Server);
@@ -3064,11 +3119,15 @@ mod tests {
 			.expect("a cancel ends a wait for the drive lock")
 			.unwrap();
 
-		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
 		assert_released(&backend, &reporter);
 		assert_eq!(outcome.report.top_level.len(), 1, "the copied file is kept");
 		assert!(backend.log().propagated_trees.is_empty());
 		assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
+		assert_counts_add_up(&outcome, &recorder.last());
 	}
 
 	// The first lock call is the shared one directory creation holds; blocking the next ones
@@ -3317,5 +3376,652 @@ mod tests {
 			CopyEvent::FileFailed(info)
 				if info.stage == CopyStage::RegisteredAsVersion && info.existing_file == Some(existing)
 		)));
+	}
+
+	/// A planned file whose metadata claims another file's hash.
+	fn source_file_with_wrong_hash(name: &str, size: u64) -> RemoteFileType<'static> {
+		let RemoteFileType::File(file) = source_file(name, size) else {
+			unreachable!("source_file builds a file of the user's drive");
+		};
+		let mut file = file.into_owned();
+		if let FileMeta::Decoded(meta) = &mut file.meta {
+			meta.hash = Some(Blake3Hash::from(blake3::hash(b"another file")));
+		}
+		RemoteFileType::File(Cow::Owned(file))
+	}
+
+	fn undecryptable_source_file(size: u64) -> RemoteFileType<'static> {
+		let file: crate::fs::file::AnonymousRemoteFile = RemoteFile::from_meta(
+			Uuid::new_v4(),
+			(),
+			Uuid::new_v4().into(),
+			size,
+			size.div_ceil(CHUNK_SIZE_U64),
+			"de-1",
+			"bucket",
+			Utc::now(),
+			false,
+			FileMeta::Encrypted(filen_types::crypto::EncryptedString(Cow::Borrowed(
+				"garbage",
+			))),
+		);
+		RemoteFileType::File(Cow::Owned(file))
+	}
+
+	fn only_failure(outcome: &CopyOutcome<()>) -> &FailureInfo {
+		let [failure] = outcome.report.failures.as_slice() else {
+			panic!("exactly one failure, got {:?}", outcome.report.failures);
+		};
+		&failure.info
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_deep_chain_is_created_parent_first() {
+		let destination = Uuid::new_v4();
+		let root = source_dir("root");
+		let mut chain = vec![root.clone()];
+		for depth in 0..500 {
+			chain.push(source_dir(&format!("d{depth}")));
+		}
+		let dirs = chain
+			.windows(2)
+			.map(|pair| listed(&pair[0], pair[1].clone()))
+			.collect();
+		let deepest = chain.last().unwrap();
+		let source = tree(&root, dirs, vec![listed(deepest, source_file("bottom", 3))]);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+
+		outcome.result.as_ref().unwrap();
+		assert_released(&backend, &reporter);
+		let log = backend.log();
+		assert_eq!(log.created_dirs.len(), 501);
+		assert!(log.out_of_order_dirs.is_empty());
+		assert_eq!(log.finished.len(), 1);
+		drop(log);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_empty_directory_is_created_alone() {
+		let destination = Uuid::new_v4();
+		let empty = source_dir("Empty");
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![tree(&empty, Vec::new(), Vec::new())]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		assert_eq!(backend.log().created_dirs.len(), 1);
+		assert_eq!(outcome.report.top_level.len(), 1);
+		assert_eq!(outcome.report.counts.dirs_created, 1);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
+		let destination = Uuid::new_v4();
+		let source = source_file_with_wrong_hash("a.txt", CHUNK_SIZE_U64 + 3);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, _recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source.clone())]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+		assert!(outcome.report.failures.is_empty());
+		let (_, completion) = backend.log().finished.values().next().unwrap().clone();
+		assert_eq!(
+			completion.hash,
+			file_hash(source.uuid(), source.size()),
+			"the copy is registered with the hash of what was read"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_inconsistent_chunk_count_fails_the_file() {
+		let destination = Uuid::new_v4();
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![PlanSource::File(source_file_with_chunks("bad", 10, 3))],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.stage, CopyStage::Download);
+		assert_eq!(info.error.kind(), ErrorKind::Response);
+		assert!(backend.log().fetched.is_empty(), "nothing is read");
+		assert_released(&backend, &reporter);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_short_file_fails_as_a_download() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.short_reads.insert("short".to_owned());
+		let backend = Arc::new(backend);
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![PlanSource::File(source_file(
+					"short",
+					2 * CHUNK_SIZE_U64 + 5,
+				))],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.stage, CopyStage::Download);
+		assert_eq!(info.error.kind(), ErrorKind::Response);
+		assert!(backend.log().finished.is_empty(), "nothing is registered");
+		assert_released(&backend, &reporter);
+		assert_eq!(outcome.report.counts.bytes_done, 0);
+		assert_eq!(outcome.report.counts.bytes_failed, 2 * CHUNK_SIZE_U64 + 5);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_upload_is_an_upload_failure() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend
+			.fail_upload
+			.insert("a.txt".to_owned(), ErrorKind::Server);
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![
+					PlanSource::File(source_file("a.txt", CHUNK_SIZE_U64 + 1)),
+					PlanSource::File(source_file("b.txt", 1)),
+				],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.stage, CopyStage::Upload);
+		assert_eq!(info.error.kind(), ErrorKind::Server);
+		assert_eq!(backend.log().finished.len(), 1);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_registration_is_a_finalize_failure() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend
+			.fail_finish
+			.insert("a.txt".to_owned(), ErrorKind::Server);
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(
+				destination,
+				vec![PlanSource::File(source_file("a.txt", 2 * CHUNK_SIZE_U64))],
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.stage, CopyStage::Finalize);
+		assert_eq!(backend.log().uploaded.len(), 2, "the chunks were uploaded");
+		assert!(backend.log().finished.is_empty());
+		assert_eq!(outcome.report.counts.bytes_done, 0);
+		assert_eq!(outcome.report.counts.bytes_failed, 2 * CHUNK_SIZE_U64);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_drive_lock_fails_the_file_at_finalize() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.fail_locks_from = Some((0, ErrorKind::Server));
+		let backend = Arc::new(backend);
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		assert_eq!(only_failure(&outcome).stage, CopyStage::Finalize);
+		assert_released(&backend, &reporter);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_drive_lock_ends_directory_creation() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(5);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.fail_locks_from = Some((0, ErrorKind::Server));
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Server
+		);
+		assert!(backend.log().created_dirs.is_empty());
+		assert_eq!(recorder.last().phase, CopyPhase::Failed);
+		assert_eq!(outcome.report.counts.files_not_attempted, 5);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_fatal_error_during_directory_creation_ends_the_job() {
+		let destination = Uuid::new_v4();
+		// more directories than run at once, so some are never started
+		let (_, source) = wide_tree(3 * MAX_CONCURRENT_OPERATIONS);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend
+			.fail_create
+			.insert("d3".to_owned(), ErrorKind::Unauthenticated);
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Unauthenticated
+		);
+		assert!(
+			backend.log().finished.is_empty(),
+			"no file is copied after it"
+		);
+		assert_eq!(recorder.last().phase, CopyPhase::Failed);
+		let counts = outcome.report.counts;
+		assert!(counts.dirs_not_attempted > 0);
+		assert_eq!(
+			counts.files_not_attempted + counts.files_failed,
+			3 * MAX_CONCURRENT_OPERATIONS as u64
+		);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_target_fetch_ends_the_job_before_anything_is_created() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(2);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.fail_targets = Some(ErrorKind::Server);
+		let backend = Arc::new(backend);
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Server
+		);
+		assert!(backend.log().created_dirs.is_empty());
+		assert!(outcome.report.top_level.is_empty());
+		assert_eq!(recorder.last().phase, CopyPhase::Failed);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_color_is_reported_and_the_directory_kept() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.fail_color = true;
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![tree(&top, Vec::new(), Vec::new())]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		assert!(outcome.report.failures.is_empty());
+		assert_eq!(outcome.report.counts.dirs_created, 1);
+		let created = outcome.report.top_level[0].item.uuid();
+		assert!(recorder.events().iter().any(
+			|e| matches!(e, CopyEvent::ColorFailed { dest_uuid, .. } if *dest_uuid == created)
+		));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_failed_propagation_is_reported_and_the_copy_continues() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(2);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.targets = ConnectedTargets::with_test_users(1);
+		backend.fail_propagate = true;
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		assert!(outcome.report.failures.is_empty());
+		let failed: HashSet<Uuid> = recorder
+			.events()
+			.iter()
+			.filter_map(|e| match e {
+				CopyEvent::PropagationFailed { dest_uuid, .. } => Some(*dest_uuid),
+				_ => None,
+			})
+			.collect();
+		let log = backend.log();
+		let created: HashSet<Uuid> = log
+			.created_dirs
+			.iter()
+			.map(|(uuid, _)| *uuid)
+			.chain(log.finished.keys().copied())
+			.collect();
+		assert_eq!(failed, created, "every created item reports its failure");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_nested_directory_that_merges_is_a_failure() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let sub = source_dir("Sub");
+		let source = tree(
+			&top,
+			vec![listed(&top, sub.clone())],
+			vec![listed(&sub, source_file("inside", 4))],
+		);
+		let backend = FakeBackend::new(4, &[destination]);
+		backend.merge_once.lock().unwrap().insert("Sub".to_owned());
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.source_uuid, sub.uuid);
+		assert_eq!(info.stage, CopyStage::CreateDirectory);
+		assert_eq!(info.error.kind(), ErrorKind::InvalidState);
+		assert!(backend.log().finished.is_empty());
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let backend = FakeBackend::new(4, &[destination]);
+		backend.existing.lock().unwrap().extend(
+			std::iter::once("top".to_owned())
+				.chain((1..=TOP_LEVEL_NAME_ATTEMPTS).map(|n| format!("top ({n})"))),
+		);
+		let backend = Arc::new(backend);
+		let (running, _recorder, reporter) = start(
+			&backend,
+			plan_with(
+				destination,
+				vec![tree(
+					&top,
+					Vec::new(),
+					vec![listed(&top, source_file("inside", 4))],
+				)],
+				true,
+			),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let info = only_failure(&outcome);
+		assert_eq!(info.stage, CopyStage::CreateDirectory);
+		assert_eq!(info.error.kind(), ErrorKind::InvalidState);
+		assert_eq!(info.affected_files, 1);
+		assert!(backend.log().created_dirs.is_empty());
+		assert!(backend.log().finished.is_empty());
+		assert_released(&backend, &reporter);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn renames_found_by_the_name_checks_are_reported() {
+		let destination = Uuid::new_v4();
+		let (top, file, sources) = top_dir_and_file();
+		let backend = FakeBackend::new(4, &[destination]);
+		backend
+			.existing
+			.lock()
+			.unwrap()
+			.extend(["top".to_owned(), "a.txt".to_owned()]);
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan_with(destination, sources, true),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.unwrap();
+		let renamed: HashMap<Uuid, String> = recorder
+			.events()
+			.into_iter()
+			.filter_map(|e| match e {
+				CopyEvent::Renamed {
+					source_uuid, name, ..
+				} => Some((source_uuid, name)),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(renamed.get(&top.uuid).map(String::as_str), Some("Top (1)"));
+		assert_eq!(
+			renamed.get(&file.uuid()).map(String::as_str),
+			Some("a (1).txt")
+		);
+		assert_eq!(outcome.report.renamed.len(), 2);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn pause_during_the_target_fetch_waits_and_resumes() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(2);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.targets_delay = Duration::from_secs(5);
+		let backend = Arc::new(backend);
+		let (pause, _cancel, control) = controls();
+		let (running, _recorder, reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("the targets are being fetched", || {
+			backend.log().target_fetches == 1
+		})
+		.await;
+		pause.send_replace(true);
+		tokio::time::sleep(Duration::from_secs(60)).await;
+		assert!(reporter.is_paused());
+		assert!(
+			backend.log().created_dirs.is_empty(),
+			"nothing starts while paused"
+		);
+		assert_released(&backend, &reporter);
+		pause.send_replace(false);
+		running.await.unwrap().result.unwrap();
+		assert_eq!(backend.log().created_dirs.len(), 3);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn pause_while_finishing_waits_and_resumes() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(2);
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend.later_targets = Some(ConnectedTargets::with_test_users(1));
+		backend.targets_delay = Duration::from_secs(5);
+		let backend = Arc::new(backend);
+		let (pause, _cancel, control) = controls();
+		let (running, recorder, reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+
+		wait_until("the copy is finishing", || {
+			recorder
+				.updates
+				.lock()
+				.unwrap()
+				.last()
+				.is_some_and(|u| u.phase == CopyPhase::Finishing)
+		})
+		.await;
+		pause.send_replace(true);
+		wait_until("the job is paused", || reporter.is_paused()).await;
+		tokio::time::sleep(Duration::from_secs(60)).await;
+		assert!(
+			backend.log().propagated_trees.is_empty(),
+			"nothing is propagated while paused"
+		);
+		assert_released(&backend, &reporter);
+		pause.send_replace(false);
+		running.await.unwrap().result.unwrap();
+		assert_eq!(backend.log().propagated_trees.len(), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_pause_controller_dropped_before_the_job_starts_lets_it_run() {
+		let destination = Uuid::new_v4();
+		let (_, source) = wide_tree(2);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (pause, _cancel, control) = controls();
+		pause.send_replace(true);
+		drop(pause);
+		let (running, _recorder, _reporter) =
+			start(&backend, plan(destination, vec![source]), control);
+		let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+			.await
+			.expect("a lost pause controller is no pause")
+			.unwrap();
+		outcome.result.unwrap();
+		assert_eq!(backend.log().finished.len(), 2);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
+		let destination = Uuid::new_v4();
+		let mut backend = FakeBackend::new(4, &[destination]);
+		backend
+			.slow_finish
+			.insert("a.txt".to_owned(), Duration::from_secs(3));
+		let backend = Arc::new(backend);
+		let (_pause, cancel, control) = controls();
+		let (running, recorder, reporter) = start(
+			&backend,
+			plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
+			control,
+		);
+		wait_until("the file is being registered", || {
+			!backend.log().finishing.is_empty()
+		})
+		.await;
+		cancel.send_replace(true);
+		let outcome = running.await.unwrap();
+
+		assert_eq!(
+			outcome.result.as_ref().unwrap_err().kind(),
+			ErrorKind::Cancelled
+		);
+		assert_eq!(backend.log().finished.len(), 1);
+		assert_eq!(
+			outcome.report.top_level.len(),
+			1,
+			"a file that exists is reported"
+		);
+		assert_eq!(outcome.report.counts.files_done, 1);
+		assert_released(&backend, &reporter);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn skips_and_renames_are_reported_before_anything_is_created() {
+		let destination = Uuid::new_v4();
+		let top = source_dir("Top");
+		let source = tree(
+			&top,
+			Vec::new(),
+			vec![
+				listed(&top, source_file("a.txt", 1)),
+				listed(&top, source_file("A.txt", 1)),
+				listed(&top, undecryptable_source_file(7)),
+			],
+		);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let (running, recorder, _reporter) = start(
+			&backend,
+			plan(destination, vec![source]),
+			JobControl::default(),
+		);
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let events = recorder.events();
+		let first = |matches: fn(&CopyEvent) -> bool| events.iter().position(matches).unwrap();
+		let created = first(|e| matches!(e, CopyEvent::DirCreated { .. }));
+		assert!(first(|e| matches!(e, CopyEvent::Skipped { .. })) < created);
+		assert!(first(|e| matches!(e, CopyEvent::Renamed { .. })) < created);
+		assert_eq!(outcome.report.counts.entries_skipped, 1);
+		assert_eq!(outcome.report.counts.bytes_skipped, 7);
+		assert_eq!(outcome.report.skipped.len(), 1);
+		assert_eq!(outcome.report.renamed.len(), 1);
+		assert_counts_add_up(&outcome, &recorder.last());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn the_estimate_counts_down_while_copying() {
+		let destination = Uuid::new_v4();
+		let sources: Vec<_> = (0..40)
+			.map(|i| PlanSource::File(source_file(&format!("f{i}"), CHUNK_SIZE_U64)))
+			.collect();
+		let mut backend = FakeBackend::new(2, &[destination]);
+		backend.delay = Duration::from_millis(100);
+		let backend = Arc::new(backend);
+		let (running, recorder, _reporter) =
+			start(&backend, plan(destination, sources), JobControl::default());
+		let outcome = running.await.unwrap();
+		outcome.result.as_ref().unwrap();
+		let etas: Vec<Duration> = recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.filter(|u| u.phase == CopyPhase::CopyingFiles)
+			.filter_map(|u| u.eta)
+			.collect();
+		assert!(etas.len() > 5, "the estimate is reported while copying");
+		let (first, last) = (etas[0], *etas.last().unwrap());
+		assert!(
+			last < first,
+			"the estimate falls as the copy advances: {first:?} then {last:?}"
+		);
+		assert_counts_add_up(&outcome, &recorder.last());
 	}
 }

@@ -334,6 +334,23 @@ mod managed {
 		}
 
 		#[test]
+		fn a_job_ignoring_its_cancel_is_dropped_after_the_grace_period() {
+			let controller = ManagedAbortController::new();
+			let managed = ManagedFuture {
+				abort_signal: Some(Arc::new(controller.signal())),
+				pause_signal: None,
+			};
+			let job = managed.into_js_managed_commander_job(|_control| async {
+				std::future::pending::<Result<(), Error>>().await
+			});
+			let started = std::time::Instant::now();
+			controller.abort();
+			let error = futures::executor::block_on(job).unwrap_err();
+			assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+			assert!(started.elapsed() >= CANCEL_GRACE);
+		}
+
+		#[test]
 		fn a_job_without_signals_runs_to_completion() {
 			let managed = ManagedFuture {
 				abort_signal: None,

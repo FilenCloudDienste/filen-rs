@@ -913,6 +913,58 @@ mod tests {
 	}
 
 	#[test]
+	fn a_failed_shared_or_linked_directory_is_a_copy_source_again() {
+		use crate::{
+			auth::MetaKey,
+			connect::{
+				DirPublicLink, PasswordState,
+				fs::{ShareInfo, SharedDirectory, SharingRole},
+			},
+			fs::dir::LinkedDirectory,
+		};
+		use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
+
+		let shared = dir();
+		let role = SharingRole::Receiver(ShareInfo {
+			email: "sharer@example.com".to_owned(),
+			id: 7,
+		});
+		let item = CopyItem::from(api::FailedSource::Dir(api::CopySourceDir::Shared(
+			DirType::Dir(Cow::Owned(SharedDirectory {
+				inner: shared.clone(),
+			})),
+			role.clone(),
+		)));
+		let api::CopySource::Dir(api::CopySourceDir::Shared(dir_back, role_back)) =
+			failure_source(item)
+		else {
+			panic!("a shared directory");
+		};
+		assert_eq!(dir_back.uuid(), shared.uuid());
+		assert_eq!(role_back, role);
+
+		let linked = dir();
+		let link = DirPublicLink {
+			link_uuid: Uuid::new_v4(),
+			link_key: MetaKey::V3(EncryptionKey::generate()),
+			password: PasswordState::None,
+			enable_download: true,
+			salt: LinkPasswordSalt::None,
+		};
+		let item = CopyItem::from(api::FailedSource::Dir(api::CopySourceDir::Linked(
+			DirType::Dir(Cow::Owned(LinkedDirectory(linked.clone()))),
+			link.clone(),
+		)));
+		let api::CopySource::Dir(api::CopySourceDir::Linked(dir_back, link_back)) =
+			failure_source(item)
+		else {
+			panic!("a directory in a public link");
+		};
+		assert_eq!(dir_back.uuid(), linked.uuid());
+		assert_eq!(link_back, link, "the link, with its key, comes back intact");
+	}
+
+	#[test]
 	fn the_root_directory_cannot_be_copied() {
 		let root = CopyItem::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(Root::from(
 			RootDirectory::new(Uuid::new_v4()),
