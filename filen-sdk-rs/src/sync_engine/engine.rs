@@ -3198,10 +3198,13 @@ impl SyncEngine {
 		// `facts.ignored_local`/`ignored_remote`, which this pass fills from this very filter and
 		// from `LocalObservation::Hidden`) — it is the belt to this, not the thing standing
 		// between the user and a local delete.
-		view.filter(Some(plan::ViewFilter {
-			rules: &rules,
-			baseline: &inputs.baseline,
-		}));
+		view.filter_changed(
+			plan::ViewFilter {
+				rules: &rules,
+				baseline: &inputs.baseline,
+			},
+			&derived.decided,
+		);
 		// The paths the observation found hidden with a row still behind them, withheld for the
 		// same reason the half-written rows above are: no derived map describes them. Added AFTER
 		// the filter, so the collision check inside it does not claim a hidden path's folded name
