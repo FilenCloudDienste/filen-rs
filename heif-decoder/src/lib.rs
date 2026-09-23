@@ -530,6 +530,10 @@ pub fn try_get_rgba_thumbnail_from_reader<T: Read + Seek>(
 
 /// The tile grid of a `grid`-encoded HEIF (every Apple HEIC): decode one
 /// 512²-ish tile at a time instead of the whole frame.
+///
+/// Everything is in display space, after the image's rotation and mirror.
+/// Tile `(col, row)` covers the image from
+/// `(col * tile_width - left_offset, row * tile_height - top_offset)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeifTiling {
 	pub num_columns: u32,
@@ -538,6 +542,27 @@ pub struct HeifTiling {
 	pub tile_height: u32,
 	pub image_width: u32,
 	pub image_height: u32,
+	/// How far left of the image the first tile column starts. A grid only
+	/// overhangs its image on the right and bottom as coded, but a rotation or
+	/// mirror carries that overhang to the left or top of the displayed image —
+	/// and each tile arrives already transformed, so the first column's
+	/// overhang is its leading pixels.
+	pub left_offset: u32,
+	/// The same for the first tile row.
+	pub top_offset: u32,
+}
+
+/// The overhang a transformed grid carries on its leading (left or top) edge:
+/// `0` when libheif flags none there, else how far the grid runs past the
+/// image along that axis. `None` when the grid's overrun is not a sliver of
+/// one tile, whichever edge it sits on — a grid that does not cover its image,
+/// or overruns it by a whole tile — which no placement can make sense of.
+fn leading_overhang(flagged: u32, count: u32, tile: u32, image: u32) -> Option<u32> {
+	let overhang = (u64::from(count) * u64::from(tile)).checked_sub(u64::from(image))?;
+	let overhang = u32::try_from(overhang)
+		.ok()
+		.filter(|&overhang| overhang < tile)?;
+	Some(if flagged == 0 { 0 } else { overhang })
 }
 
 /// A parsed HEIF whose reader stays open across calls, so the container can
@@ -644,8 +669,9 @@ impl<T: Read + Seek> HeifSession<T> {
 		OutImage::new(&thumb)?.make_rgba().map(Some)
 	}
 
-	/// The primary image's tile grid, or `None` when it is a single tile
-	/// (then only [`decode_primary_rgba`](Self::decode_primary_rgba) helps).
+	/// The primary image's tile grid, or `None` when it is a single tile, is
+	/// cropped, or its geometry does not add up (then only
+	/// [`decode_primary_rgba`](Self::decode_primary_rgba) helps).
 	/// Sizes are in the transformed (display) coordinate space, matching what
 	/// [`decode_tile_rgba`](Self::decode_tile_rgba) produces.
 	pub fn tiling(&self) -> Result<Option<HeifTiling>, HeifError> {
@@ -665,6 +691,37 @@ impl<T: Read + Seek> HeifSession<T> {
 		{
 			return Ok(None);
 		}
+		// A clean-aperture crop (`clap`) narrows the image libheif shows but
+		// not the tiling it reports, and a tile decode skips the crop, so tiles
+		// cannot be placed to honour it. The whole-frame decode crops.
+		if (i64::from(primary.width()), i64::from(primary.height()))
+			!= (i64::from(raw.image_width), i64::from(raw.image_height))
+		{
+			return Ok(None);
+		}
+		// libheif's own offsets say which leading edges the transformations
+		// carried the overhang to, but not how far it reaches: 1.23.1 stores
+		// the remainder `image % tile` where its header documents the overhang
+		// `tile - image % tile` (`image_item.cc`,
+		// `process_image_transformations_on_tiling`). So the edge comes from
+		// libheif and the size from the grid itself; once upstream stores the
+		// overhang, the two agree.
+		let (Some(left_offset), Some(top_offset)) = (
+			leading_overhang(
+				raw.left_offset,
+				raw.num_columns,
+				raw.tile_width,
+				raw.image_width,
+			),
+			leading_overhang(
+				raw.top_offset,
+				raw.num_rows,
+				raw.tile_height,
+				raw.image_height,
+			),
+		) else {
+			return Ok(None);
+		};
 		Ok(Some(HeifTiling {
 			num_columns: raw.num_columns,
 			num_rows: raw.num_rows,
@@ -672,6 +729,8 @@ impl<T: Read + Seek> HeifSession<T> {
 			tile_height: raw.tile_height,
 			image_width: raw.image_width,
 			image_height: raw.image_height,
+			left_offset,
+			top_offset,
 		}))
 	}
 

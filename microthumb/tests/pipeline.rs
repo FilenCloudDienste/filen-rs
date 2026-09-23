@@ -1,7 +1,7 @@
-//! End-to-end pipeline tests over fixtures generated at runtime, so no binary
-//! fixture files land here. The one exception is AVIF: nothing in the tree can
-//! encode AV1, so that case reads the browser suite's committed `parrot.avif`
-//! and says so at the test.
+//! End-to-end pipeline tests over fixtures generated at runtime. The exceptions
+//! are the formats nothing in the tree can encode: AVIF reads the browser
+//! suite's committed `parrot.avif`, and the HEIF cases read the small HEVC
+//! files under `tests/fixtures/heif/`, built by the `generate.sh` beside them.
 
 use std::{
 	io::Cursor,
@@ -1282,6 +1282,100 @@ fn avif_thumbnails_through_the_heif_path() {
 		result.rgba.iter().any(|&b| b != 0),
 		"decoded avif thumbnail is entirely zero"
 	);
+}
+
+/// A 2x2 grid of 64x48 tiles cropped to 120x90, each transformed so the
+/// grid's overhang lands on a different edge of the displayed image; the
+/// overhang pixels are magenta. Then the two grids tiles cannot be placed
+/// for, which go to the whole-frame decode: one with a clean-aperture crop,
+/// and one overrunning its image by a whole magenta tile, turned so that
+/// tile leads. See tests/fixtures/heif/generate.sh.
+#[cfg(feature = "heif")]
+const TRANSFORMED_GRIDS: [(&str, &[u8]); 8] = [
+	("irot0", include_bytes!("fixtures/heif/grid-irot0.heic")),
+	("irot1", include_bytes!("fixtures/heif/grid-irot1.heic")),
+	("irot2", include_bytes!("fixtures/heif/grid-irot2.heic")),
+	("irot3", include_bytes!("fixtures/heif/grid-irot3.heic")),
+	("imir0", include_bytes!("fixtures/heif/grid-imir0.heic")),
+	("imir1", include_bytes!("fixtures/heif/grid-imir1.heic")),
+	("clap", include_bytes!("fixtures/heif/grid-clap.heic")),
+	("overrun", include_bytes!("fixtures/heif/grid-overrun.heic")),
+];
+
+/// A grid whose rotation or mirror moves its overhang to the left or top edge
+/// must still come out as libheif composites the whole frame: a tile placed at
+/// its untransformed grid position shifts the picture and shows the overhang
+/// as a band along that edge.
+///
+/// Compared by which fixture colour each pixel is nearest to, not by value:
+/// the whole-frame decode smooths 4:2:2 chroma across tile seams and the
+/// tile-wise one cannot, so the two legitimately differ in shade along a seam.
+/// A misplaced tile moves whole bands of pixels to another colour.
+#[cfg(feature = "heif")]
+#[test]
+fn transformed_grids_place_their_tiles_where_the_whole_frame_decode_does() {
+	for (name, bytes) in TRANSFORMED_GRIDS {
+		let whole = heif_decoder::HeifSession::new(Cursor::new(bytes), bytes.len() as u64)
+			.unwrap()
+			.decode_primary_rgba()
+			.unwrap();
+
+		// A target past the image keeps the canvas at 1:1, so every pixel can
+		// be compared.
+		let spec = ThumbSpec::new(1024, 1024, APP_PROCESS_MEM_BUDGET);
+		let ThumbOutcome::Thumbnail(thumb) =
+			generate(Box::new(MemSource(bytes.to_vec())), &spec).unwrap()
+		else {
+			panic!("{name}: the grid must thumbnail");
+		};
+		assert_eq!(thumb.source, microthumb::ThumbSource::Decoded, "{name}");
+		assert_eq!(
+			(thumb.image.width, thumb.image.height),
+			whole.dimensions(),
+			"{name}"
+		);
+		for (i, (tiled, framed)) in thumb
+			.image
+			.rgba
+			.chunks_exact(4)
+			.zip(whole.pixels())
+			.enumerate()
+		{
+			let (x, y) = (i as u32 % whole.width(), i as u32 / whole.width());
+			let expected = nearest_grid_colour(&framed.0);
+			assert_ne!(
+				expected, "magenta",
+				"{name}: the fixture's own whole-frame decode shows its overhang at ({x}, {y})"
+			);
+			assert_eq!(
+				nearest_grid_colour(tiled),
+				expected,
+				"{name}: ({x}, {y}) is {tiled:?}, the whole frame has {:?}",
+				framed.0
+			);
+		}
+	}
+}
+
+/// Which of the grid fixtures' colours a pixel is closest to.
+#[cfg(feature = "heif")]
+fn nearest_grid_colour(px: &[u8]) -> &'static str {
+	[
+		("red", [255u8, 0, 0]),
+		("lime", [0, 255, 0]),
+		("blue", [0, 0, 255]),
+		("yellow", [255, 255, 0]),
+		("magenta", [255, 0, 255]),
+	]
+	.into_iter()
+	.min_by_key(|(_, rgb)| {
+		rgb.iter()
+			.zip(px)
+			.map(|(a, b)| u32::from(a.abs_diff(*b)).pow(2))
+			.sum::<u32>()
+	})
+	.map(|(name, _)| name)
+	.unwrap()
 }
 
 // ---- svg ----

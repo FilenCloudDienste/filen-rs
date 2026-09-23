@@ -139,48 +139,108 @@ impl PreparedDecode for PreparedHeif {
 	fn decode_into(self: Box<Self>, sink: &mut dyn PixelSink) -> Result<(), ThumbError> {
 		let Some(tiling) = self.tiling else {
 			let rgba = self.session.decode_primary_rgba().map_err(decode_err)?;
-			return push_clipped(sink, &rgba, 0, 0, self.dims.0, self.dims.1);
+			return push_clipped(sink, &rgba, Area::whole(self.dims));
 		};
 		for row in 0..tiling.num_rows {
 			for col in 0..tiling.num_columns {
-				let x0 = col * tiling.tile_width;
-				let y0 = row * tiling.tile_height;
-				if x0 >= tiling.image_width || y0 >= tiling.image_height {
-					// A grid may be wider than the image it crops to.
+				let area = Area {
+					x: Span {
+						start: u64::from(col) * u64::from(tiling.tile_width),
+						image_start: tiling.left_offset,
+						image_len: tiling.image_width,
+					},
+					y: Span {
+						start: u64::from(row) * u64::from(tiling.tile_height),
+						image_start: tiling.top_offset,
+						image_len: tiling.image_height,
+					},
+				};
+				// A grid may be wider than the image it crops to: a tile past its
+				// edge is never decoded.
+				if area.x.visible(tiling.tile_width).is_none()
+					|| area.y.visible(tiling.tile_height).is_none()
+				{
 					continue;
 				}
 				let tile = self
 					.session
 					.decode_tile_rgba(col, row)
 					.map_err(decode_err)?;
-				push_clipped(sink, &tile, x0, y0, tiling.image_width, tiling.image_height)?;
+				push_clipped(sink, &tile, area)?;
 			}
 		}
 		Ok(())
 	}
 }
 
-/// Pushes an RGBA block at (x0, y0), clipped to the image bounds — edge tiles
-/// overhang the true image size.
-fn push_clipped(
-	sink: &mut dyn PixelSink,
-	block: &RgbaImage,
-	x0: u32,
-	y0: u32,
-	image_w: u32,
-	image_h: u32,
-) -> Result<(), ThumbError> {
-	let visible_w = block.width().min(image_w.saturating_sub(x0));
-	let visible_h = block.height().min(image_h.saturating_sub(y0));
-	if visible_w == 0 || visible_h == 0 {
-		return Ok(());
+/// Where a decoded block lies, per axis, in the grid's coordinates — which
+/// start `image_start` before the image does when a rotation or mirror put
+/// the grid's overhang on the leading edge.
+#[derive(Clone, Copy)]
+struct Area {
+	x: Span,
+	y: Span,
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+	/// The block's first pixel.
+	start: u64,
+	/// The image's first pixel.
+	image_start: u32,
+	image_len: u32,
+}
+
+impl Area {
+	/// A block that is the image itself.
+	fn whole((width, height): (u32, u32)) -> Self {
+		let span = |image_len| Span {
+			start: 0,
+			image_start: 0,
+			image_len,
+		};
+		Area {
+			x: span(width),
+			y: span(height),
+		}
 	}
+}
+
+impl Span {
+	/// The part of a `len`-pixel block that lands on the image, as `(first
+	/// block pixel, first image pixel, count)`, or `None` when none does.
+	fn visible(&self, len: u32) -> Option<(usize, u32, u32)> {
+		let image_start = u64::from(self.image_start);
+		let from = self.start.max(image_start);
+		let to = (self.start + u64::from(len)).min(image_start + u64::from(self.image_len));
+		if from >= to {
+			return None;
+		}
+		// All three are bounded by `len` or `image_len`, both u32.
+		Some((
+			(from - self.start) as usize,
+			(from - image_start) as u32,
+			(to - from) as u32,
+		))
+	}
+}
+
+/// Pushes the part of an RGBA block that lies inside the image. A tile can
+/// overhang any edge: the right and bottom as coded, the left and top once
+/// the image is rotated or mirrored.
+fn push_clipped(sink: &mut dyn PixelSink, block: &RgbaImage, area: Area) -> Result<(), ThumbError> {
+	let (Some((src_x, dst_x, width)), Some((src_y, dst_y, height))) = (
+		area.x.visible(block.width()),
+		area.y.visible(block.height()),
+	) else {
+		return Ok(());
+	};
 	let stride = block.width() as usize * 4;
 	let data = block.as_raw();
-	let row_bytes = visible_w as usize * 4;
-	for r in 0..visible_h {
-		let start = r as usize * stride;
-		sink.push(x0, y0 + r, visible_w, &data[start..start + row_bytes])?;
+	let row_bytes = width as usize * 4;
+	for r in 0..height {
+		let start = (src_y + r as usize) * stride + src_x * 4;
+		sink.push(dst_x, dst_y + r, width, &data[start..start + row_bytes])?;
 	}
 	Ok(())
 }
