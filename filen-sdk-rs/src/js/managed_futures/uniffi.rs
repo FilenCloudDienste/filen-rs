@@ -234,7 +234,6 @@ mod managed {
 		/// Runs a job that observes pause and cancel itself through its [`JobControl`], so a
 		/// paused job can release what it holds and a cancelled one can report what it did.
 		/// An abort becomes a cancel; a job still running [`CANCEL_GRACE`] after that is dropped.
-		#[cfg_attr(not(test), expect(dead_code, reason = "used by the copy bindings"))]
 		pub(crate) fn into_js_managed_commander_job<F, Fut, T>(
 			self,
 			job: F,

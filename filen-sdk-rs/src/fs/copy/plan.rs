@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
 
 use crate::{
@@ -134,6 +135,13 @@ pub(crate) struct PlannedTopLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(tag = "type", rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SkipReason {
 	/// The file's metadata could not be decrypted, so there is no key to read it with.
 	UndecryptableFile,
@@ -152,6 +160,13 @@ pub struct SkippedEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RenameReason {
 	/// A sibling in the source already took the (case-insensitive) name.
 	DuplicateName,
@@ -170,6 +185,7 @@ pub struct RenamedEntry {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct PlanTotals {
 	pub dirs: u64,
 	pub files: u64,

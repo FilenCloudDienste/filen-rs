@@ -23,8 +23,8 @@ pub enum AnyDirWithContext {
 #[js_type(import, wasm_all)]
 pub struct AnySharedDirWithContext {
 	#[js_type_tagged]
-	dir: AnySharedDir,
-	share_info: SharingRole,
+	pub(crate) dir: AnySharedDir,
+	pub(crate) share_info: SharingRole,
 }
 
 #[js_type(import, wasm_all)]

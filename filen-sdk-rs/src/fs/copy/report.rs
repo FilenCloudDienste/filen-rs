@@ -14,6 +14,7 @@ use std::time::Instant;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasmtimer::std::Instant;
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::{
@@ -31,6 +32,13 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CopyPhase {
 	/// Listing the sources and destinations.
 	Scanning,
@@ -48,6 +56,7 @@ pub enum CopyPhase {
 /// `created + failed + not_attempted == totals` for directories, and likewise for files and
 /// bytes. Skipped entries are not part of the totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyCounts {
 	pub dirs_created: u64,
 	/// Includes the directories below a failed one, which are never attempted.
@@ -67,6 +76,7 @@ pub struct CopyCounts {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ScanProgress {
 	pub sources_done: u64,
 	pub sources_total: u64,
@@ -77,6 +87,7 @@ pub struct ScanProgress {
 
 /// A file being copied right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ActiveFile {
 	pub source_uuid: Uuid,
 	pub dest_uuid: Uuid,
@@ -87,6 +98,13 @@ pub struct ActiveFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CopyStage {
 	CreateDirectory,
 	Download,

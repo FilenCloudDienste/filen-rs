@@ -6,6 +6,8 @@ mod backend;
 mod client_impl;
 pub(crate) mod control;
 pub(crate) mod engine;
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+mod js_impl;
 mod naming;
 mod plan;
 mod progress;
