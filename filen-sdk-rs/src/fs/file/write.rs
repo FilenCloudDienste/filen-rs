@@ -30,8 +30,10 @@ use crate::{
 
 use super::{BaseFile, RemoteFile, meta::DecryptedFileMeta};
 
+/// Where the server stored an upload's chunks, as reported by the chunk-upload responses.
+/// A zero-byte file uploads no chunks and keeps the default.
 #[derive(Debug, Clone)]
-struct RemoteFileInfo {
+pub(crate) struct RemoteFileInfo {
 	region: String,
 	bucket: String,
 }
@@ -55,6 +57,155 @@ impl Future for DummyFuture {
 		_cx: &mut std::task::Context<'_>,
 	) -> std::task::Poll<Self::Output> {
 		std::task::Poll::Ready(Ok(()))
+	}
+}
+
+/// Encrypts the plaintext `chunk` in place and uploads it as chunk `chunk_idx` of `file`.
+///
+/// Returns the same buffer, cleared and still holding its memory reservation, together with
+/// where the server stored the chunk.
+pub(crate) async fn encrypt_and_upload_chunk<'a>(
+	client: &Client,
+	file: &BaseFile,
+	upload_key: &str,
+	chunk_idx: u64,
+	mut chunk: Chunk<'a>,
+) -> Result<(Chunk<'a>, RemoteFileInfo), Error> {
+	let len = chunk.as_ref().len() as u64;
+	debug_assert!(
+		len <= CHUNK_SIZE_U64,
+		"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
+	);
+	{
+		let _span = tracing::debug_span!("upload_encrypt_chunk", chunk_idx, len).entered();
+		file.key().blocking_encrypt_data(chunk.as_mut())?;
+	}
+
+	let (chunk_bytes, permit) = chunk.into_parts();
+	let chunk_bytes: Bytes = chunk_bytes.into();
+	let result = api::v3::upload::upload_file_chunk(
+		client.client(),
+		file,
+		upload_key,
+		chunk_idx,
+		chunk_bytes.clone(),
+	)
+	.await?;
+	let info = RemoteFileInfo {
+		region: result.region.into_owned(),
+		bucket: result.bucket.into_owned(),
+	};
+	let mut chunk_bytes: Vec<u8> = chunk_bytes.into();
+	chunk_bytes.clear();
+	Ok((Chunk::from_parts(chunk_bytes, permit), info))
+}
+
+/// Everything finalizing an upload needs once all of its chunks are on the server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UploadCompletion {
+	/// Plaintext bytes uploaded.
+	pub(crate) written: u64,
+	/// Chunks uploaded.
+	pub(crate) num_chunks: u64,
+	/// Blake3 hash of the plaintext, in chunk order.
+	pub(crate) hash: Blake3Hash,
+	/// `(created, modified)` stored in the file's metadata.
+	pub(crate) final_times: (DateTime<Utc>, DateTime<Utc>),
+}
+
+/// Registers an uploaded file with the server: `upload/empty` for a zero-byte file,
+/// `upload/done` otherwise. The caller must hold the drive lock.
+pub(crate) async fn complete_upload(
+	client: &Client,
+	file: &BaseFile,
+	upload_key: &str,
+	completion: UploadCompletion,
+) -> Result<filen_types::api::v3::upload::empty::Response, Error> {
+	let crypter = client.crypter();
+	let (final_created, final_modified) = completion.final_times;
+
+	let empty_request = do_cpu_intensive(move || {
+		let file_key = file.key().to_meta_key()?;
+		let (name, size, mime, metadata) = blocking_join!(
+			|| file_key.blocking_encrypt_meta(file.name()),
+			|| file_key.blocking_encrypt_meta(&completion.written.to_string()),
+			|| file_key.blocking_encrypt_meta(file.mime()),
+			|| Ok::<_, Error>(crypter.blocking_encrypt_meta(&serde_json::to_string(
+				&DecryptedFileMeta {
+					name: Cow::Borrowed(file.name()),
+					size: completion.written,
+					mime: Cow::Borrowed(file.mime()),
+					key: *file.key(),
+					created: Some(final_created),
+					last_modified: final_modified,
+					hash: Some(completion.hash),
+				},
+			)?))
+		);
+
+		Ok::<_, Error>(filen_types::api::v3::upload::empty::Request {
+			uuid: file.uuid(),
+			name,
+			name_hashed: Cow::Owned(client.hash_name(file.name())),
+			size,
+			parent: file.parent,
+			mime,
+			metadata: metadata?,
+			version: client.file_encryption_version(),
+		})
+	})
+	.await?;
+
+	if completion.written == 0 {
+		api::v3::upload::empty::post(client.client(), &empty_request).await
+	} else {
+		let rm = Cow::Owned(crypto::shared::generate_random_base64_values(
+			32,
+			&mut rand::rng(),
+		));
+		api::v3::upload::done::post(
+			client.client(),
+			&api::v3::upload::done::Request {
+				empty_request,
+				chunks: completion.num_chunks,
+				rm,
+				upload_key: Cow::Borrowed(upload_key),
+			},
+		)
+		.await
+	}
+}
+
+/// The [`RemoteFile`] an upload produced, from the local file, the server's registration
+/// response and the upload's completion data.
+pub(crate) fn remote_file_from_upload(
+	file: BaseFile,
+	response: filen_types::api::v3::upload::empty::Response,
+	remote_file_info: RemoteFileInfo,
+	completion: UploadCompletion,
+) -> RemoteFile {
+	let (final_created, final_modified) = completion.final_times;
+	RemoteFile {
+		uuid: response.uuid,
+		// The edit-vs-new signal: equal to `uuid` when this upload created
+		// a new file, the existing lineage's id when it edited one.
+		stable_uuid: response.stable_uuid,
+		parent: file.parent.into(),
+		size: response.size,
+		favorited: false,
+		region: remote_file_info.region,
+		bucket: remote_file_info.bucket,
+		timestamp: response.timestamp,
+		chunks: response.chunks,
+		meta: super::meta::FileMeta::Decoded(DecryptedFileMeta {
+			name: Cow::Owned(file.root.name.into()),
+			size: response.size,
+			mime: Cow::Owned(file.root.mime),
+			key: file.root.key,
+			last_modified: final_modified,
+			created: Some(final_created),
+			hash: Some(completion.hash),
+		}),
 	}
 }
 
@@ -154,7 +305,7 @@ where
 		}
 	}
 
-	fn push_upload_next_chunk(&mut self, mut out_data: Chunk<'a>) {
+	fn push_upload_next_chunk(&mut self, out_data: Chunk<'a>) {
 		let chunk_idx = self.next_chunk_idx;
 		self.next_chunk_idx += 1;
 		let client = self.client;
@@ -164,40 +315,15 @@ where
 		self.hasher.update_rayon(out_data.as_ref());
 		let remote_file_info = self.remote_file_info.clone();
 		self.futures.push(Box::pin(async move {
-			// encrypt the data
 			let len = out_data.as_ref().len() as u64;
-			debug_assert!(
-				len <= CHUNK_SIZE_U64,
-				"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
-			);
-			{
-				let _span = tracing::debug_span!("upload_encrypt_chunk", chunk_idx, len).entered();
-				file.key().blocking_encrypt_data(out_data.as_mut())?;
-			}
-
-			// upload the data
-			let (chunk_bytes, permit) = out_data.into_parts();
-
-			let chunk_bytes: Bytes = chunk_bytes.into();
-			let result = api::v3::upload::upload_file_chunk(
-				client.client(),
-				&file,
-				&upload_key,
-				chunk_idx,
-				chunk_bytes.clone(),
-			)
-			.await?;
+			let (chunk, info) =
+				encrypt_and_upload_chunk(client, &file, &upload_key, chunk_idx, out_data).await?;
 			if let Some(progress) = progress {
 				progress.report(len);
 			}
 			// don't care if this errors because that means another thread set it
-			let _ = remote_file_info.set(RemoteFileInfo {
-				region: result.region.into_owned(),
-				bucket: result.bucket.into_owned(),
-			});
-			let mut chunk_bytes: Vec<u8> = chunk_bytes.into();
-			chunk_bytes.clear();
-			Ok(Chunk::from_parts(chunk_bytes, permit))
+			let _ = remote_file_info.set(info);
+			Ok(chunk)
 		}));
 	}
 
@@ -421,77 +547,27 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		self,
 		drive_lock: Arc<ResourceLock>,
 	) -> Result<FileWriterCompletingState<'a>, Error> {
+		let completion = UploadCompletion {
+			written: self.written,
+			num_chunks: self.num_chunks,
+			hash: self.hash,
+			final_times: self
+				.final_times
+				.unwrap_or_else(|| (self.file.created(), self.file.last_modified())),
+		};
+		let client = self.client;
 		let file = self.file.clone();
-		let crypter = self.client.crypter();
-		let (final_created, final_modified) = self
-			.final_times
-			.unwrap_or_else(|| (file.created(), file.last_modified()));
-
-		let empty_request_future = do_cpu_intensive(move || {
-			let file_key = file.key().to_meta_key()?;
-			let (name, size, mime, metadata) = blocking_join!(
-				|| file_key.blocking_encrypt_meta(file.name()),
-				|| file_key.blocking_encrypt_meta(&self.written.to_string()),
-				|| file_key.blocking_encrypt_meta(file.as_ref().mime()),
-				|| Ok::<_, Error>(crypter.blocking_encrypt_meta(&serde_json::to_string(
-					&DecryptedFileMeta {
-						name: Cow::Borrowed(file.name()),
-						size: self.written,
-						mime: Cow::Borrowed(file.mime()),
-						key: *file.key(),
-						created: Some(final_created),
-						last_modified: final_modified,
-						hash: Some(self.hash),
-					},
-				)?))
-			);
-
-			Ok::<_, Error>(filen_types::api::v3::upload::empty::Request {
-				uuid: file.uuid(),
-				name,
-				name_hashed: Cow::Owned(self.client.hash_name(file.name())),
-				size,
-				parent: file.parent,
-				mime,
-				metadata: metadata?,
-				version: self.client.file_encryption_version(),
-			})
-		});
-
+		let upload_key = self.upload_key.clone();
 		let future: MaybeSendBoxFuture<
 			'a,
 			Result<filen_types::api::v3::upload::empty::Response, Error>,
-		> = if self.written == 0 {
-			Box::pin(async move {
-				api::v3::upload::empty::post(self.client.client(), &empty_request_future.await?)
-					.await
-			})
-		} else {
-			let upload_key = self.upload_key.clone();
-			Box::pin(async move {
-				let rm = Cow::Owned(crypto::shared::generate_random_base64_values(
-					32,
-					&mut rand::rng(),
-				));
-				api::v3::upload::done::post(
-					self.client.client(),
-					&api::v3::upload::done::Request {
-						empty_request: empty_request_future.await?,
-						chunks: self.num_chunks,
-						rm,
-						upload_key: Cow::Borrowed(&upload_key),
-					},
-				)
-				.await
-			})
-		};
+		> = Box::pin(async move { complete_upload(client, &file, &upload_key, completion).await });
 
 		Ok(FileWriterCompletingState {
 			file: self.file,
 			future,
-			hash: self.hash,
+			completion,
 			remote_file_info: self.remote_file_info,
-			final_times: (final_created, final_modified),
 			client: self.client,
 			drive_lock,
 		})
@@ -513,9 +589,8 @@ struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
 	drive_lock: Arc<ResourceLock>,
 	future: MaybeSendBoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
-	hash: Blake3Hash,
+	completion: UploadCompletion,
 	remote_file_info: RemoteFileInfo,
-	final_times: (DateTime<Utc>, DateTime<Utc>),
 	client: &'a Client,
 }
 
@@ -536,29 +611,12 @@ impl<'a> FileWriterCompletingState<'a> {
 		response: filen_types::api::v3::upload::empty::Response,
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
-		let (final_created, final_modified) = self.final_times;
-		let file = Arc::new(RemoteFile {
-			uuid: response.uuid,
-			// The edit-vs-new signal: equal to `uuid` when this upload created
-			// a new file, the existing lineage's id when it edited one.
-			stable_uuid: response.stable_uuid,
-			parent: file.parent.into(),
-			size: response.size,
-			favorited: false,
-			region: self.remote_file_info.region,
-			bucket: self.remote_file_info.bucket,
-			timestamp: response.timestamp,
-			chunks: response.chunks,
-			meta: super::meta::FileMeta::Decoded(DecryptedFileMeta {
-				name: Cow::Owned(file.root.name.into()),
-				size: response.size,
-				mime: Cow::Owned(file.root.mime),
-				key: file.root.key,
-				last_modified: final_modified,
-				created: Some(final_created),
-				hash: Some(self.hash),
-			}),
-		});
+		let file = Arc::new(remote_file_from_upload(
+			file,
+			response,
+			self.remote_file_info,
+			self.completion,
+		));
 		let futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<(), Error>>> =
 			FuturesUnordered::new();
 
@@ -853,7 +911,84 @@ where
 
 #[cfg(test)]
 mod tests {
-	use super::would_exceed_known_size;
+	use chrono::{TimeZone, Utc};
+	use filen_types::{
+		api::v3::upload::empty::Response,
+		crypto::Blake3Hash,
+		fs::{ParentUuid, StableUuid, Uuid},
+	};
+
+	use super::{
+		RemoteFileInfo, UploadCompletion, remote_file_from_upload, would_exceed_known_size,
+	};
+	use crate::{
+		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+		fs::{
+			HasUUID,
+			file::{
+				BaseFile, RootFile,
+				meta::FileMeta,
+				traits::{HasFileInfo, HasRemoteFileInfo},
+			},
+			name::ValidatedName,
+		},
+	};
+
+	#[test]
+	fn remote_file_from_upload_takes_server_fields_and_completion_metadata() {
+		let key = FileKey::V3(EncryptionKey::generate());
+		let parent = Uuid::new_v4();
+		let created = Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap();
+		let modified = Utc.with_ymd_and_hms(2021, 6, 7, 8, 9, 10).unwrap();
+		let base = BaseFile {
+			root: RootFile {
+				uuid: Uuid::new_v4(),
+				name: ValidatedName::try_from("a.txt").unwrap(),
+				mime: "text/plain".to_string(),
+				key,
+				created: Utc::now(),
+				modified: Utc::now(),
+			},
+			parent,
+		};
+		let uuid = Uuid::new_v4();
+		let response = Response {
+			uuid,
+			stable_uuid: StableUuid::new_for_test(uuid),
+			chunks: 2,
+			size: 1_500_000,
+			timestamp: Utc.with_ymd_and_hms(2022, 1, 1, 0, 0, 0).unwrap(),
+		};
+		let hash = Blake3Hash::from(blake3::hash(b"plaintext"));
+		let completion = UploadCompletion {
+			written: 1_500_000,
+			num_chunks: 2,
+			hash,
+			final_times: (created, modified),
+		};
+		let info = RemoteFileInfo {
+			region: "de-2".to_string(),
+			bucket: "bucket".to_string(),
+		};
+
+		let file = remote_file_from_upload(base, response.clone(), info, completion);
+
+		assert_eq!(file.uuid(), uuid);
+		assert_eq!(file.stable_uuid, response.stable_uuid);
+		assert_eq!(file.parent, ParentUuid::Uuid(parent));
+		assert_eq!(file.size(), 1_500_000);
+		assert_eq!(file.chunks, 2);
+		assert_eq!(file.region(), "de-2");
+		assert_eq!(file.bucket(), "bucket");
+		assert_eq!(file.timestamp, response.timestamp);
+		assert!(!file.favorited);
+		assert_eq!(file.created(), Some(created));
+		assert_eq!(file.last_modified(), Some(modified));
+		assert_eq!(file.hash(), Some(hash));
+		assert_eq!(file.key(), Some(&key));
+		assert_eq!(file.mime(), Some("text/plain"));
+		assert!(matches!(file.meta, FileMeta::Decoded(_)));
+	}
 
 	#[test]
 	fn unbounded_size_never_overflows() {

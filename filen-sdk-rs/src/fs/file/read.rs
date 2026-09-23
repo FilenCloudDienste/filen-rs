@@ -110,6 +110,49 @@ impl<'a> FileReaderBuilder<'a> {
 	}
 }
 
+/// Downloads chunk `chunk_idx` of `file` and decrypts it in place, charged to the memory
+/// reservation `out_data` holds (its buffer is not reused; the permits move to the result).
+///
+/// `progress` receives plaintext byte deltas while the chunk streams in, clamped to the chunk's
+/// plaintext length so the encryption overhead is never counted.
+pub(crate) async fn fetch_decrypted_chunk<'a>(
+	client: &UnauthClient,
+	file: &dyn File,
+	chunk_idx: u64,
+	out_data: Chunk<'a>,
+	progress: Option<MaybeSendCallback<'_, u64>>,
+) -> Result<Chunk<'a>, Error> {
+	let (_, permits) = out_data.into_parts();
+	let plaintext_len = file
+		.size()
+		.saturating_sub(chunk_idx * CHUNK_SIZE_U64)
+		.min(CHUNK_SIZE_U64);
+	// Report bytes as the chunk streams in (clamped, converted to deltas) instead of only
+	// at completion — otherwise a heavily-parallel download shows nothing for seconds while
+	// every in-flight chunk fills together, then jumps.
+	// High-water mark of bytes already reported for this chunk. A mid-body retry restarts
+	// `bytes_so_far` at 0, so we keep the max (not the latest) — `fetch_max` never lowers
+	// it — and only forward genuine forward progress, otherwise a retried chunk would
+	// re-report the bytes of every failed attempt.
+	let reported = std::sync::atomic::AtomicU64::new(0);
+	let on_bytes = |bytes_so_far: u64, _content_length: Option<u64>| {
+		if let Some(progress) = &progress {
+			let clamped = bytes_so_far.min(plaintext_len);
+			let prev = reported.fetch_max(clamped, std::sync::atomic::Ordering::Relaxed);
+			if clamped > prev {
+				progress(clamped - prev);
+			}
+		}
+	};
+	let data = api::download::download_file_chunk(client, file, chunk_idx, Some(&on_bytes)).await?;
+	let mut chunk = Chunk::from_parts(data, permits);
+	file.key()
+		.ok_or(MetadataWasNotDecryptedError)?
+		.decrypt_data(chunk.as_mut())
+		.await?;
+	Ok(chunk)
+}
+
 /// Whether a file's advertised chunk count can be produced from its advertised size: the last
 /// chunk must not start past the end of the file and its plaintext must fit within one chunk.
 /// Remote metadata violating this would drive the chunk-size math out of range, so such
@@ -232,38 +275,8 @@ impl<'a> FileReader<'a> {
 		let client = self.client;
 		let file = self.file;
 		let progress = self.progress.clone();
-		// Plaintext size of this chunk; reported bytes are clamped to it so the encrypted body's
-		// per-chunk overhead never over-counts past the (plaintext) file size.
-		let plaintext_len = file
-			.size()
-			.saturating_sub(chunk_idx * CHUNK_SIZE_U64)
-			.min(CHUNK_SIZE_U64);
 		self.futures.push_back(Box::pin(async move {
-			let (_, permits) = out_data.into_parts();
-			// Report bytes as the chunk streams in (clamped, converted to deltas) instead of only
-			// at completion — otherwise a heavily-parallel download shows nothing for seconds while
-			// every in-flight chunk fills together, then jumps.
-			// High-water mark of bytes already reported for this chunk. A mid-body retry restarts
-			// `bytes_so_far` at 0, so we keep the max (not the latest) — `fetch_max` never lowers
-			// it — and only forward genuine forward progress, otherwise a retried chunk would
-			// re-report the bytes of every failed attempt.
-			let reported = std::sync::atomic::AtomicU64::new(0);
-			let on_bytes = |bytes_so_far: u64, _content_length: Option<u64>| {
-				if let Some(progress) = &progress {
-					let clamped = bytes_so_far.min(plaintext_len);
-					let prev = reported.fetch_max(clamped, std::sync::atomic::Ordering::Relaxed);
-					if clamped > prev {
-						progress(clamped - prev);
-					}
-				}
-			};
-			let data = api::download::download_file_chunk(client, file, chunk_idx, Some(&on_bytes))
-				.await?;
-			let mut chunk = Chunk::from_parts(data, permits);
-			file.key()
-				.ok_or(MetadataWasNotDecryptedError)?
-				.decrypt_data(chunk.as_mut())
-				.await?;
+			let chunk = fetch_decrypted_chunk(client, file, chunk_idx, out_data, progress).await?;
 
 			Ok(if first_chunk {
 				let mut cursor = Cursor::new(chunk);
