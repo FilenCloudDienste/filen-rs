@@ -336,7 +336,12 @@ impl Probe {
 	}
 }
 
-/// What each whole-tree scan of one change-scoped pass cost, timed INSIDE the phase that ran them.
+/// What each step of one change-scoped pass that USED to scan the whole tree costs now, timed
+/// INSIDE the phase that ran them.
+///
+/// Only `from_baseline` still visits every row. The other six were narrowed to an index lookup, a
+/// per-decided-path decision or a lazily built index, and their rows are kept so that a build which
+/// re-introduces a scan shows up here and not only in the phase total.
 ///
 /// In-run deltas are the only figures two builds can be compared on: step 1b found a binary-wide
 /// systematic worth ~3.5 % between two builds of code that had not changed, which swamps every scan
@@ -347,20 +352,23 @@ impl Probe {
 struct ScanCosts {
 	/// `derive::from_baseline`: two maps sized to the whole baseline, one visit per row.
 	from_baseline: Duration,
-	/// `RemoteObservation::new`'s uuid index over the whole derived map, plus applying the delta
-	/// (empty here, so what is left is the index).
+	/// `RemoteObservation::new`, plus applying the delta (empty here). Its uuid lookups are
+	/// answered off the baseline, so no index over the derived map is built any more.
 	observe_remote: Duration,
-	/// `load_remote_rules`' candidate scan over the UNFILTERED view.
+	/// `load_remote_rules`' candidate set, read from the baseline's rule-file index. The scan of
+	/// the UNFILTERED view it replaced is what a whole read still pays.
 	rule_files_scan: Duration,
-	/// `RuleFiles::Only`'s scan of every baseline row. Zero on a mode that pushes, which never
-	/// builds it.
+	/// `RuleFiles::Only`, built from the same rule-file index rather than from a scan of every
+	/// baseline row. Zero on a mode that pushes, which never builds it.
 	rule_files_only: Duration,
-	/// `RemoteView::hide`'s whole-map `retain`: one ignore decision per node.
+	/// `RemoteView::hide`. A whole read's `retain` is one ignore decision per node; the scoped
+	/// phases run the narrowed form, which asks only about the paths the pass decided.
 	view_hide: Duration,
-	/// `RemoteView::resolve_collisions`' whole-map key scan: one folded key and one digest per
-	/// node.
+	/// `RemoteView::resolve_collisions`. A whole read folds one key per node; the scoped phases
+	/// run the narrowed form, which folds only the paths the pass decided.
 	view_collisions: Duration,
-	/// `PendingWrites::fold_into`'s uuid index over the whole view.
+	/// `PendingWrites::fold_into`. The view index is built only for a record that no path it names
+	/// can answer, which this fixture's record is not, so what is timed is the per-record half.
 	pending_fold: Duration,
 }
 
@@ -377,32 +385,32 @@ impl ScanCosts {
 			(
 				"observe_remote",
 				self.observe_remote,
-				"`RemoteObservation::new`'s uuid index over the whole derived map",
+				"`RemoteObservation::new`: uuid lookups answered off the baseline, plus the delta",
 			),
 			(
 				"rule_files_scan",
 				self.rule_files_scan,
-				"`load_remote_rules`' candidate scan over the unfiltered view",
+				"`load_remote_rules`' candidates, from the baseline's rule-file index",
 			),
 			(
 				"rule_files_only",
 				self.rule_files_only,
-				"`RuleFiles::Only`'s scan of every baseline row; 0 on a mode that pushes",
+				"`RuleFiles::Only`, from the same index; 0 on a mode that pushes",
 			),
 			(
 				"view_hide",
 				self.view_hide,
-				"`hide`'s whole-map retain: one ignore decision per node",
+				"`hide`: one decision per decided path (scoped) or per node (whole read)",
 			),
 			(
 				"view_collisions",
 				self.view_collisions,
-				"`resolve_collisions`' whole-map key scan: one folded key and digest per node",
+				"`resolve_collisions`: one folded key per decided path (scoped) or node (whole)",
 			),
 			(
 				"pending_fold",
 				self.pending_fold,
-				"`PendingWrites::fold_into`'s uuid index over the whole view",
+				"`PendingWrites::fold_into`; the index is built only for a record no path answers",
 			),
 		] {
 			probe.record(&format!("{phase}__{scan}"), items, elapsed, detail);
@@ -945,10 +953,12 @@ fn pass_pure(
 ///   does grow with the tree. Deliberate: it is one `Baseline` path resolve per key and a shipped
 ///   release pass does not run it (see `prepare_scoped`).
 ///
-/// The three per-node steps this phase used to leave out are in it as of the previous round —
-/// `load_remote_rules`' candidate scan over the UNFILTERED view, `RuleFiles::Only`'s scan of every
-/// baseline row on a mode that does not push, and `PendingWrites::fold_into`'s whole-view `path_of`
-/// rebuild — which is why no figure here is comparable with one recorded before the rename.
+/// The three per-node steps this phase used to leave out were brought into it in the previous
+/// round — `load_remote_rules`' candidate scan over the UNFILTERED view, `RuleFiles::Only`'s scan
+/// of every baseline row on a mode that does not push, and `PendingWrites::fold_into`'s whole-view
+/// `path_of` rebuild — which is why no figure here is comparable with one recorded before the
+/// rename. All three have since been narrowed, so they are still CALLED here but none of them is a
+/// tree scan any more; `derive::from_baseline` is the only whole-tree step left in the phase.
 ///
 /// Each whole-tree scan inside the phase is also timed on its own ([`ScanCosts`]) and reported as a
 /// `<phase>__<scan>` row. Those are in-run deltas and are what a narrowing is judged on: an
@@ -1058,15 +1068,20 @@ fn prepare_scoped(
 		))
 	});
 	costs.rule_files_scan = elapsed;
+	// A LABEL, and not a check that can fail if the step degenerates into nothing: this fixture
+	// plants no remote `.filenignore`, so empty `blocked`/`errors` is what the call returns whether
+	// it examined every candidate or none, and it is not evidence that this phase measured a scan.
+	// What it does pin is that the timing never reached the fetch closure, which panics.
 	assert!(
 		remote_rules.blocked.is_empty() && remote_rules.errors.is_empty(),
 		"the scan must find no remote rule file to read on this fixture: blocked {:?}, errors {:?}",
 		remote_rules.blocked,
 		remote_rules.errors
 	);
-	// `RuleFiles::Only`, which a mode that does not push builds by iterating EVERY baseline row
-	// with a view lookup per row. A pushing pair never pays it, which is why this function takes a
-	// mode: both answers are measured rather than one being read off the other.
+	// `RuleFiles::Only`, which only a mode that does not push builds. A pushing pair never pays it,
+	// which is why this function takes a mode: both answers are measured rather than one being read
+	// off the other. It reads the baseline's rule-file index instead of iterating every row, so
+	// the row it records is O(rule files) and not a tree scan.
 	let (rule_files, elapsed) = timed(|| {
 		if mode.pushes() {
 			RuleFiles::Read
@@ -1116,16 +1131,18 @@ fn prepare_scoped(
 		);
 	});
 	costs.view_hide = elapsed;
-	let ((), elapsed) = timed(|| view.resolve_collisions());
+	let ((), elapsed) = timed(|| view.resolve_collisions_changed(&baseline, &derived.decided));
 	costs.view_collisions = elapsed;
 	// The paths an observation found hidden with a row still behind them, added AFTER the filter
 	// exactly as the pass adds them.
 	view.held_paths.append(&mut derived.held);
 
 	// `PendingWrites::fold_into`, which a pass pays whenever the pair holds an unacknowledged
-	// write — the pass after every apply that pushed something. ONE record, because what is per
-	// node here is the `path_of` index it rebuilds from the whole view before it reads any record;
-	// the loop after that index is per record.
+	// write — the pass after every apply that pushed something. ONE record, which is the whole of
+	// what this costs now that the fold resolves a record from the paths the record itself names
+	// and builds a view index only for one no such path answers. A `Created`, which is what
+	// is planted below, is answered directly, so this row prices the per-record half and there is
+	// no whole-view rebuild left in it to time.
 	let written = baseline
 		.iter()
 		.find(|entry| entry.kind == NodeKind::File && entry.remote_uuid.is_some())
@@ -1141,8 +1158,10 @@ fn prepare_scoped(
 		Duration::ZERO,
 	);
 	// FIRST, because `fold_into` returns 0 both for a record it could not apply and for a pair
-	// holding no record at all — and the second of those returns before it builds the index this
-	// phase exists to time.
+	// holding no record at all, and the second of those returns before it does any work. This is
+	// the one check here that CAN fail if the step degenerates: with no record the phase times an
+	// early return. It says a record was walked; it does not say any per-node work ran, and none
+	// does for a `Created`.
 	assert_eq!(
 		pending.uuids().len(),
 		1,
@@ -1152,6 +1171,9 @@ fn prepare_scoped(
 	let (folded, elapsed) =
 		timed(|| pending.fold_into(pair, &baseline, &mut view.nodes, &mut derived.decided));
 	costs.pending_fold = elapsed;
+	// Also a LABEL rather than an anti-degeneracy guard: it asserts the fold applied NOTHING, which
+	// is what keeps the maps the phase goes on to time unedited, and it passes whether the fold did
+	// per-record work or returned early. The check above is the one that fails on a skipped step.
 	assert_eq!(
 		folded, 0,
 		"the fixture's view already shows the row's own uuid at that path, so the fold has nothing \
