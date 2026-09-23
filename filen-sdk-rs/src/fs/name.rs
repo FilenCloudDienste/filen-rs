@@ -22,7 +22,7 @@ const FORBIDDEN: [bool; 128] = {
 	table
 };
 
-const MAX_BYTES: usize = 255;
+pub(crate) const MAX_BYTES: usize = 255;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 #[error("invalid filename {name:?}: {kind}")]
