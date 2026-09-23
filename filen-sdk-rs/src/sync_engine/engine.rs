@@ -42,7 +42,7 @@ use super::{
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalScan, RuleFiles, ScanError},
-	side::{Nodes, NodesAt},
+	side::{Nodes, NodesAt, Side},
 	tree::Baseline,
 };
 use crate::{
@@ -829,7 +829,7 @@ impl PendingWrites {
 		&self,
 		pair: PairId,
 		baseline: &Baseline,
-		nodes: &mut HashMap<String, RemoteNode>,
+		nodes: &mut Side<RemoteNode>,
 		changed: &mut BTreeSet<String>,
 	) -> usize {
 		let map = self.map();
@@ -921,12 +921,12 @@ struct ViewIndex(Option<HashMap<Uuid, String>>);
 
 impl ViewIndex {
 	/// Where `nodes` holds `uuid`, building the index if it is not built yet.
-	fn at(&mut self, nodes: &HashMap<String, RemoteNode>, uuid: Uuid) -> Option<String> {
+	fn at(&mut self, nodes: &Side<RemoteNode>, uuid: Uuid) -> Option<String> {
 		self.0
 			.get_or_insert_with(|| {
 				nodes
 					.iter()
-					.map(|(path, node)| (node.remote_uuid, path.clone()))
+					.map(|(path, node)| (node.remote_uuid, path.into_owned()))
 					.collect()
 			})
 			.get(&uuid)
@@ -952,16 +952,13 @@ impl ViewIndex {
 /// every record but the one a foreign edit has moved out from under. `nodes` is read directly, so a
 /// hint is always current however much the fold has already edited.
 fn held_at(
-	nodes: &HashMap<String, RemoteNode>,
+	nodes: &Side<RemoteNode>,
 	path_of: &mut ViewIndex,
 	uuid: Uuid,
 	hints: &[&str],
 ) -> Option<String> {
 	for hint in hints {
-		if nodes
-			.get(*hint)
-			.is_some_and(|node| node.remote_uuid == uuid)
-		{
+		if nodes.at(hint).is_some_and(|node| node.remote_uuid == uuid) {
 			return Some((*hint).to_owned());
 		}
 	}
@@ -970,7 +967,7 @@ fn held_at(
 
 /// Put `node` at `path`, keeping the uuid index in step with whatever it displaces.
 fn place_node(
-	nodes: &mut HashMap<String, RemoteNode>,
+	nodes: &mut Side<RemoteNode>,
 	path_of: &mut ViewIndex,
 	path: String,
 	node: RemoteNode,
@@ -992,7 +989,7 @@ fn place_node(
 /// the row is where the latest write recorded itself, so both records fold the same node and the
 /// first one to run wins.
 fn fold_create(
-	nodes: &mut HashMap<String, RemoteNode>,
+	nodes: &mut Side<RemoteNode>,
 	path_of: &mut ViewIndex,
 	baseline: &Baseline,
 	uuid: Uuid,
@@ -1003,7 +1000,7 @@ fn fold_create(
 	let Some(node) = written_node(baseline.get(path).as_ref()) else {
 		return false;
 	};
-	match nodes.get(path) {
+	match nodes.at(path) {
 		// The cache is showing what our baseline records: it has caught up.
 		Some(current) if current.remote_uuid == node.remote_uuid => return false,
 		// Ours — the write itself, or the version it superseded — so the cache is behind on us.
@@ -1031,7 +1028,7 @@ fn fold_create(
 /// directory — see [`plan::fold_dir_moves`] — carries the subtree the cache still lists under its
 /// old path along with it.
 fn fold_move(
-	nodes: &mut HashMap<String, RemoteNode>,
+	nodes: &mut Side<RemoteNode>,
 	path_of: &mut ViewIndex,
 	baseline: &Baseline,
 	uuid: Uuid,
@@ -1057,7 +1054,7 @@ fn fold_move(
 	// flight, so leave the path showing what really sits on it. Vacating the pre-move path was
 	// still right — without it the reconciler reads the item we moved as an untracked remote entry
 	// and trashes it.
-	if nodes.get(to).is_some_and(|node| node.remote_uuid != uuid) {
+	if nodes.at(to).is_some_and(|node| node.remote_uuid != uuid) {
 		return vacated.is_some();
 	}
 	let carries_subtree = vacated
@@ -1073,11 +1070,7 @@ fn fold_move(
 	changed.insert(to.to_string());
 	place_node(nodes, path_of, to.to_string(), node);
 	if carries_subtree {
-		let children: Vec<String> = nodes
-			.keys()
-			.filter(|key| plan::is_under(key, from))
-			.cloned()
-			.collect();
+		let children = nodes.subtree_paths(from);
 		for old in children {
 			let Some(mut child) = nodes.remove(&old) else {
 				continue;
@@ -1095,7 +1088,7 @@ fn fold_move(
 /// Take the item we trashed out of the view — and, for a directory, everything under it, which the
 /// server trashed with it.
 fn fold_trash(
-	nodes: &mut HashMap<String, RemoteNode>,
+	nodes: &mut Side<RemoteNode>,
 	path_of: &mut ViewIndex,
 	uuid: Uuid,
 	at: &str,
@@ -1114,7 +1107,7 @@ fn fold_trash(
 			let keep = !plan::is_under(key, &path);
 			if !keep {
 				path_of.gone(node.remote_uuid);
-				changed.insert(key.clone());
+				changed.insert(key.to_owned());
 			}
 			keep
 		});
@@ -3320,7 +3313,7 @@ impl SyncEngine {
 				let present: Vec<String> = names
 					.iter()
 					.map(|name| plan::join_path(dir, name))
-					.filter(|path| derived.local.contains_key(path))
+					.filter(|path| derived.local.holds(path))
 					.collect();
 				if let Some(rel_path) = present.get(1) {
 					errors.push(ScanError::DuplicateName {
@@ -5607,7 +5600,7 @@ mod tests {
 				.iter()
 				.map(|rel| ((*rel).to_string(), file_node(rel)))
 				.collect(),
-			remote: HashMap::new(),
+			remote: Side::default(),
 			dirty: BTreeSet::new(),
 			decided: BTreeSet::new(),
 			held: BTreeSet::new(),
@@ -5695,7 +5688,7 @@ mod tests {
 				.iter()
 				.map(|rel| ((*rel).to_string(), local_file(rel, hash)))
 				.collect(),
-			remote: HashMap::new(),
+			remote: Side::default(),
 			dirty: BTreeSet::new(),
 			decided: BTreeSet::new(),
 			held: BTreeSet::new(),
@@ -5746,8 +5739,10 @@ mod tests {
 			errors: Vec::new(),
 		};
 		let assembled = Derived {
-			local: HashMap::from([("keep.txt".to_string(), local_file("keep.txt", hash))]),
-			remote: HashMap::new(),
+			local: [("keep.txt".to_string(), local_file("keep.txt", hash))]
+				.into_iter()
+				.collect(),
+			remote: Side::default(),
 			dirty: BTreeSet::new(),
 			decided: BTreeSet::new(),
 			held: BTreeSet::new(),
@@ -7366,7 +7361,7 @@ mod tests {
 	fn planned_over_scan(
 		root: &Path,
 		baseline: &HashMap<String, BaselineEntry>,
-		remote: &HashMap<String, RemoteNode>,
+		remote: &impl Nodes<Node = RemoteNode>,
 	) -> Vec<SyncAction> {
 		let (scan, _) = scan::scan_local(
 			root,
@@ -7460,7 +7455,7 @@ mod tests {
 		let other: Blake3Hash = blake3::hash(b"remote only").into();
 
 		let mut baseline = HashMap::new();
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		for dir in ["real", "link"] {
 			let uuid = Uuid::new_v4();
 			baseline.insert(
@@ -7761,13 +7756,15 @@ mod tests {
 			size: 0,
 			modified_millis: 0,
 		};
-		let mut nodes = HashMap::from([
+		let mut nodes: Side<RemoteNode> = [
 			("Docs".to_string(), node("Docs", dir, NodeKind::Dir)),
 			(
 				"Docs/a.txt".to_string(),
 				node("Docs/a.txt", child, NodeKind::File),
 			),
-		]);
+		]
+		.into_iter()
+		.collect();
 		let mut path_of = ViewIndex::default();
 		// Built BEFORE the fold, as it is for a fold that has already answered one record the two
 		// paths it names could not: the assertions below are then about the index being kept in
@@ -7783,10 +7780,10 @@ mod tests {
 			"docs",
 			&mut changed,
 		));
-		let mut paths: Vec<&str> = nodes.keys().map(String::as_str).collect();
+		let mut paths: Vec<String> = nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort_unstable();
 		assert_eq!(paths, ["docs", "docs/a.txt"]);
-		assert_eq!(nodes["docs/a.txt"].rel_path, "docs/a.txt");
+		assert_eq!(nodes.at("docs/a.txt").unwrap().rel_path, "docs/a.txt");
 		assert_eq!(path_of.at(&nodes, child).as_deref(), Some("docs/a.txt"));
 		assert_eq!(path_of.at(&nodes, dir).as_deref(), Some("docs"));
 		// And every key it moved, BY NAME: both ends for the directory and both for each child it
@@ -8010,8 +8007,8 @@ mod tests {
 		);
 	}
 	/// A remote node the snapshot holds at `path`.
-	fn node_at(path: &str, uuid: Uuid) -> HashMap<String, RemoteNode> {
-		HashMap::from([(
+	fn node_at(path: &str, uuid: Uuid) -> Side<RemoteNode> {
+		Side::from(HashMap::from([(
 			path.to_string(),
 			RemoteNode {
 				rel_path: path.to_string(),
@@ -8022,7 +8019,7 @@ mod tests {
 				size: 0,
 				modified_millis: 0,
 			},
-		)])
+		)]))
 	}
 
 	/// A baseline row as the apply layer writes it straight after a remote write.
@@ -8093,7 +8090,7 @@ mod tests {
 			.unwrap();
 
 		// The cache is still behind: its snapshot has nothing at all under the root yet.
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		let holds = engine
 			.pending
 			.settle(pair, &engine.observed.snapshot(), &remote);
@@ -9307,7 +9304,7 @@ mod tests {
 
 		let baseline = written_row(uuid, hash(1));
 		// The cache is behind: its snapshot has nothing at all under the root yet.
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new());
 
@@ -9342,7 +9339,7 @@ mod tests {
 		observations.note_uuids([uuid]);
 		let observed = observations.snapshot();
 
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		pending.settle(PAIR, &observed, &remote);
 		assert_eq!(
 			pending.fold_into(
@@ -9374,7 +9371,7 @@ mod tests {
 		let observed = observations.snapshot();
 		observations.note_uuids([uuid]);
 
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		pending.settle(PAIR, &observed, &remote);
 		assert_eq!(
 			pending.fold_into(
@@ -9386,7 +9383,7 @@ mod tests {
 			1,
 			"only what was known before the snapshot may retire a write against it"
 		);
-		assert_eq!(remote["a.txt"].remote_uuid, uuid);
+		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, uuid);
 	}
 
 	/// A move's uuid was necessarily announced earlier, when the item was created. Only an
@@ -9442,11 +9439,8 @@ mod tests {
 			1
 		);
 
-		assert!(
-			!remote.contains_key("a.txt"),
-			"the pre-move path is vacated"
-		);
-		assert_eq!(remote["b.txt"].remote_uuid, uuid);
+		assert!(!remote.holds("a.txt"), "the pre-move path is vacated");
+		assert_eq!(remote.at("b.txt").unwrap().remote_uuid, uuid);
 		let local = HashMap::from([(
 			"b.txt".to_string(),
 			LocalNode {
@@ -9496,11 +9490,12 @@ mod tests {
 		);
 
 		assert!(
-			!remote.contains_key("a.txt"),
+			!remote.holds("a.txt"),
 			"the pre-move path is vacated even though the destination is somebody else's"
 		);
 		assert_eq!(
-			remote["b.txt"].remote_uuid, foreign,
+			remote.at("b.txt").unwrap().remote_uuid,
+			foreign,
 			"and the destination is left showing what really sits there"
 		);
 		let local = HashMap::from([(
@@ -9548,7 +9543,7 @@ mod tests {
 			},
 		);
 
-		let mut remote = HashMap::from([
+		let mut remote = Side::from(HashMap::from([
 			(
 				"d".to_string(),
 				RemoteNode {
@@ -9573,7 +9568,7 @@ mod tests {
 					modified_millis: 0,
 				},
 			),
-		]);
+		]));
 		// Trashing dropped both baseline rows, and the local side is gone too.
 		let (baseline, local) = (HashMap::new(), HashMap::new());
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
@@ -9621,7 +9616,8 @@ mod tests {
 			1
 		);
 		assert_eq!(
-			remote["a.txt"].remote_uuid, new,
+			remote.at("a.txt").unwrap().remote_uuid,
+			new,
 			"the pre-write occupant is what a lagging cache shows; ours supersedes it"
 		);
 		assert_eq!(remote.len(), 1, "and does not leave the old one behind");
@@ -9662,7 +9658,8 @@ mod tests {
 			1
 		);
 		assert_eq!(
-			remote["a.txt"].remote_uuid, second,
+			remote.at("a.txt").unwrap().remote_uuid,
+			second,
 			"the latest write is what the path holds"
 		);
 		assert!(
@@ -9704,9 +9701,10 @@ mod tests {
 		// What the lagging cache shows: the other client's version of the SAME file, which landed
 		// first and which our upload went on top of.
 		let mut remote = node_at("a.txt", theirs);
-		let node = remote.get_mut("a.txt").unwrap();
+		let mut node = remote.at("a.txt").unwrap().into_owned();
 		node.stable_uuid = Some(lineage);
 		node.content_hash = Some(hash(1));
+		remote.insert("a.txt".to_string(), node);
 
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
@@ -9714,7 +9712,7 @@ mod tests {
 			1,
 			"the cache has announced nothing of ours, so what it shows is the version we replaced"
 		);
-		assert_eq!(remote["a.txt"].remote_uuid, ours);
+		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, ours);
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
@@ -9746,7 +9744,9 @@ mod tests {
 
 		let same_lineage = |uuid: Uuid| {
 			let mut nodes = node_at("a.txt", uuid);
-			nodes.get_mut("a.txt").unwrap().stable_uuid = Some(lineage);
+			let mut node = nodes.at("a.txt").unwrap().into_owned();
+			node.stable_uuid = Some(lineage);
+			nodes.insert("a.txt".to_string(), node);
 			nodes
 		};
 		for settled in [
@@ -9757,7 +9757,7 @@ mod tests {
 			// A different FILE has taken the path over — the fold refuses it outright.
 			node_at("a.txt", Uuid::new_v4()),
 			// Nothing at the path at all.
-			HashMap::new(),
+			Side::default(),
 		] {
 			assert!(
 				pending
@@ -9788,7 +9788,9 @@ mod tests {
 		let mut baseline = written_row(ours, hash(2));
 		baseline.get_mut("a.txt").unwrap().remote_stable_uuid = Some(lineage);
 		let mut remote = node_at("a.txt", theirs);
-		remote.get_mut("a.txt").unwrap().stable_uuid = Some(lineage);
+		let mut node = remote.at("a.txt").unwrap().into_owned();
+		node.stable_uuid = Some(lineage);
+		remote.insert("a.txt".to_string(), node);
 
 		pending.retire(ours);
 		assert_eq!(
@@ -9796,7 +9798,7 @@ mod tests {
 			0,
 			"with the record gone there is nothing left to paint over the snapshot"
 		);
-		assert_eq!(remote["a.txt"].remote_uuid, theirs);
+		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, theirs);
 	}
 
 	/// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
@@ -9822,7 +9824,8 @@ mod tests {
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
 		);
 		assert_eq!(
-			remote["a.txt"].remote_uuid, foreign,
+			remote.at("a.txt").unwrap().remote_uuid,
+			foreign,
 			"and it must stand, so the pass reconciles against it at once"
 		);
 	}
@@ -9856,7 +9859,7 @@ mod tests {
 			},
 		)]);
 
-		let mut remote = HashMap::new();
+		let mut remote = Side::default();
 		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
@@ -9939,8 +9942,8 @@ mod tests {
 			2,
 			"and still has not caught up to either write"
 		);
-		assert!(!remote.contains_key("gone.txt"), "the trash is folded out");
-		assert_eq!(remote["note.txt"].remote_uuid, created);
+		assert!(!remote.holds("gone.txt"), "the trash is folded out");
+		assert_eq!(remote.at("note.txt").unwrap().remote_uuid, created);
 	}
 
 	/// A pass indexes the snapshot only for writes of its own, and a pair that journalled none

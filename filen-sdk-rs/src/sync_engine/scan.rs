@@ -38,6 +38,7 @@ use super::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
 	},
+	side::Side,
 	tree::Baseline,
 };
 use crate::{
@@ -116,7 +117,7 @@ impl fmt::Display for ScanError {
 /// The result of scanning a local root.
 #[derive(Debug)]
 pub(crate) struct LocalScan {
-	pub(crate) nodes: HashMap<String, LocalNode>,
+	pub(crate) nodes: Side<LocalNode>,
 	/// `false` if the node set may be INCOMPLETE — a missing/unreadable root, an unreadable
 	/// subtree, a non-UTF-8 name, or a normalized-name collision. The mass-delete guard refuses to
 	/// propagate deletions from an incomplete scan (an empty/half-read source must not nuke the
@@ -762,7 +763,7 @@ fn scan_local_watched(
 
 	errors.extend(rule_errors);
 	let scan = LocalScan {
-		nodes,
+		nodes: nodes.into(),
 		complete,
 		errors,
 		invalid_names,
@@ -799,6 +800,8 @@ pub(crate) fn scan_subtree(
 mod tests {
 	use std::fs;
 
+	use super::super::side::{Nodes, NodesAt};
+
 	use uuid::Uuid;
 
 	use super::*;
@@ -821,8 +824,8 @@ mod tests {
 		.0
 	}
 
-	fn sorted_paths(scan: &LocalScan) -> Vec<&str> {
-		let mut paths: Vec<&str> = scan.nodes.keys().map(String::as_str).collect();
+	fn sorted_paths(scan: &LocalScan) -> Vec<String> {
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort_unstable();
 		paths
 	}
@@ -847,20 +850,20 @@ mod tests {
 			scan.errors
 		);
 
-		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		assert_eq!(paths, vec!["a.txt", "sub", "sub/b.txt"]);
 
-		let a = &scan.nodes["a.txt"];
+		let a = scan.nodes.at("a.txt").unwrap();
 		assert_eq!(a.kind, NodeKind::File);
 		assert_eq!(a.size, 5);
 		assert!(
 			a.content_hash.is_some(),
 			"files are hashed without a baseline"
 		);
-		assert_eq!(scan.nodes["sub"].kind, NodeKind::Dir);
+		assert_eq!(scan.nodes.at("sub").unwrap().kind, NodeKind::Dir);
 		assert!(
-			scan.nodes["sub"].content_hash.is_none(),
+			scan.nodes.at("sub").unwrap().content_hash.is_none(),
 			"dirs have no hash"
 		);
 
@@ -900,7 +903,7 @@ mod tests {
 
 		let scan = scan_plain(&root, &baseline);
 		assert_eq!(
-			scan.nodes["a.txt"].content_hash,
+			scan.nodes.at("a.txt").unwrap().content_hash,
 			Some(sentinel),
 			"unchanged (size, mtime) reuses the baseline hash — no re-hash"
 		);
@@ -915,7 +918,7 @@ mod tests {
 		)]);
 		let rescan = scan_plain(&root, &stale);
 		assert_ne!(
-			rescan.nodes["a.txt"].content_hash,
+			rescan.nodes.at("a.txt").unwrap().content_hash,
 			Some(sentinel),
 			"a diverged size triggers a fresh hash"
 		);
@@ -949,7 +952,7 @@ mod tests {
 		fs::create_dir(root.join("notes.filendl")).unwrap();
 
 		let scan = scan_plain(&root, &HashMap::new());
-		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		assert_eq!(
 			paths,
@@ -977,7 +980,7 @@ mod tests {
 		fs::write(root.join("bad.").join("deeper").join("x.txt"), b"deep").unwrap();
 
 		let scan = scan_plain(&root, &HashMap::new());
-		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		// The scan reports the disk as it is: a rejected name is unpushable, not invisible. Dropping
 		// it here would make a rename INTO such a name look like a local deletion one layer up.
@@ -993,7 +996,7 @@ mod tests {
 			]
 		);
 		assert!(
-			scan.nodes["CON"].content_hash.is_some(),
+			scan.nodes.at("CON").unwrap().content_hash.is_some(),
 			"a rejected name is hashed like any other file, so a rename of a synced file into one \
 			 is still recognized as that file"
 		);
@@ -1043,7 +1046,7 @@ mod tests {
 		fs::write(quarantine.join("trashed.txt"), b"old").unwrap();
 
 		let scan = scan_plain(&root, &HashMap::new());
-		let paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		assert_eq!(
 			paths,
 			vec!["keep.txt"],
@@ -1106,8 +1109,7 @@ mod tests {
 			"3 files and 1 directory"
 		);
 		assert!(
-			!untracked.nodes.contains_key("a/.DS_Store")
-				&& !untracked.nodes.contains_key("a/.Trashes"),
+			!untracked.nodes.holds("a/.DS_Store") && !untracked.nodes.holds("a/.Trashes"),
 			"they are still hidden, and still not descended into"
 		);
 
@@ -1356,7 +1358,7 @@ mod tests {
 	#[test]
 	fn a_name_collision_is_not_reported_as_an_error_line() {
 		let scan = LocalScan {
-			nodes: HashMap::new(),
+			nodes: Side::default(),
 			complete: false,
 			errors: vec![
 				ScanError::DuplicateName {
@@ -1408,7 +1410,7 @@ mod tests {
 			"a link that leads nowhere hides nothing, so deletions must not be held for it: {:?}",
 			scan.errors
 		);
-		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		assert_eq!(paths, vec!["cycle", "keep.txt"]);
 
@@ -1450,7 +1452,7 @@ mod tests {
 		let scan = scan_plain(&root, &HashMap::new());
 		assert!(scan.complete, "{:?}", scan.errors);
 		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
-		let mut paths: Vec<_> = scan.nodes.keys().cloned().collect();
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort();
 		assert_eq!(
 			paths,
@@ -1522,7 +1524,11 @@ mod tests {
 			scan.errors
 		);
 		assert_eq!(scan.reported_errors().count(), 1, "{:?}", scan.errors);
-		assert!(scan.nodes.is_empty(), "{:?}", scan.nodes.keys());
+		assert!(
+			scan.nodes.is_empty(),
+			"{:?}",
+			scan.nodes.paths().collect::<Vec<_>>()
+		);
 
 		fs::remove_dir_all(&root).ok();
 	}
@@ -1630,7 +1636,7 @@ mod tests {
 			IgnoreRules::default(),
 			RuleFiles::Only(BTreeSet::new()),
 		);
-		assert!(skipped.nodes.contains_key("build/deep/a.txt"));
+		assert!(skipped.nodes.holds("build/deep/a.txt"));
 		// With no rule file read, the built-in defaults are all that hides anything, and nothing was
 		// synced at the one entry they hide.
 		assert!(
@@ -1647,7 +1653,7 @@ mod tests {
 			IgnoreRules::default(),
 			RuleFiles::Only(BTreeSet::from(["sub".to_string()])),
 		);
-		assert!(only.nodes.contains_key("build/deep/a.txt"));
+		assert!(only.nodes.holds("build/deep/a.txt"));
 		assert_eq!(only.ignored.keys().collect::<Vec<_>>(), vec!["sub/tmp"]);
 		assert_eq!(only.ignored_default_untracked, 1);
 		assert!(rules.decide("x.log", false).is_none());
@@ -1705,9 +1711,9 @@ mod tests {
 		);
 		assert_eq!(scan.ignore_blocked, BTreeSet::from(["locked".to_string()]));
 		assert!(
-			scan.nodes.contains_key("locked/a.txt"),
+			scan.nodes.holds("locked/a.txt"),
 			"{:?}",
-			scan.nodes.keys()
+			scan.nodes.paths().collect::<Vec<_>>()
 		);
 		assert_eq!(scan.ignored.keys().collect::<Vec<_>>(), vec!["bad/x.o"]);
 		let reported: Vec<String> = scan.reported_errors().collect();

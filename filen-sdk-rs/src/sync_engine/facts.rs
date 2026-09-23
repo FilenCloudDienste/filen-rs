@@ -294,6 +294,8 @@ pub(super) fn carry_over<'a>(
 mod tests {
 	use std::{fs, path::Path};
 
+	use super::super::side::Side;
+
 	use uuid::Uuid;
 
 	use super::*;
@@ -558,7 +560,7 @@ mod tests {
 			..PairFacts::default()
 		};
 		let view = RemoteView {
-			nodes: HashMap::new(),
+			nodes: Side::default(),
 			has_collisions: false,
 			held_paths: BTreeSet::from(["c".to_owned()]),
 			skipped: Vec::new(),

@@ -512,6 +512,8 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 mod tests {
 	use std::fs;
 
+	use super::super::side::Nodes;
+
 	use filen_types::crypto::Blake3Hash;
 	use uuid::Uuid;
 
@@ -563,8 +565,8 @@ mod tests {
 		.0
 	}
 
-	fn sorted_nodes(scan: &LocalScan) -> Vec<&str> {
-		let mut paths: Vec<&str> = scan.nodes.keys().map(String::as_str).collect();
+	fn sorted_nodes(scan: &LocalScan) -> Vec<String> {
+		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
 		paths.sort_unstable();
 		paths
 	}
