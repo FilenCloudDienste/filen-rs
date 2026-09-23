@@ -661,7 +661,7 @@ impl RemoteView {
 	/// with no rows left under it exactly as it did before this narrowing.
 	pub(crate) fn filter_changed(&mut self, filter: ViewFilter<'_>, decided: &BTreeSet<String>) {
 		self.hide(filter, PassPaths::Changed(decided));
-		self.resolve_collisions();
+		self.resolve_collisions_changed(filter.baseline, decided);
 	}
 
 	/// The ignore half of [`filter`](Self::filter): an item the rules hide at or above its path
@@ -795,6 +795,73 @@ impl RemoteView {
 				self.has_collisions = true;
 				self.nodes.remove(&rel_path);
 			}
+		}
+	}
+
+	/// [`resolve_collisions`](Self::resolve_collisions) for a view a change-scoped pass DERIVED,
+	/// which folds only the keys that pass decided.
+	///
+	/// The pass's CARRIED keys are not folded against each other, and that is not a gap. A pass
+	/// that finds a collision REFUSES, and a refusal forces the next pass to read both sides whole
+	/// (`next_pass_scope`'s `FullPassReason::PreviousRefusal`). So every pass since the last whole
+	/// read folded exactly the keys it could itself have introduced — its decided set, which is
+	/// what this does — and by induction no two carried keys fold together undetected. The whole
+	/// read that starts the chain folded every one of them.
+	///
+	/// Each decided key is folded against three things, which together are every other key the view
+	/// can hold: the other decided keys, the held paths (a held path took its key when the view
+	/// held it), and the carried keys — asked of the BASELINE, whose rows are what a carried node
+	/// is, so the question costs the path's own depth instead of a scan
+	/// ([`Baseline::folded_row_paths`]).
+	///
+	/// A row the baseline names is only a collision where the view still HOLDS it: the delta may
+	/// have detached that node, and refusing a pass over a row nothing is reconciling against
+	/// would stall the pair for as long as the row lasted. Real keys are compared rather than
+	/// digests of them, which the whole form uses to keep one `u128` per node instead of a second
+	/// copy of every path — the decided set is a handful of paths, so there is nothing to save.
+	/// `pub(super)` for the same reason [`hide`](Self::hide) is: the probe times the two halves of
+	/// the scoped filter apart.
+	pub(super) fn resolve_collisions_changed(
+		&mut self,
+		baseline: &Baseline,
+		decided: &BTreeSet<String>,
+	) {
+		let mut claimed: HashMap<String, String> = HashMap::new();
+		let mut clashes: Vec<String> = Vec::new();
+		for rel_path in decided {
+			if !self.nodes.holds(rel_path) {
+				continue;
+			}
+			let key = collision_key(rel_path);
+			let folds_like = |taken: &str| taken != rel_path && collision_key(taken) == key;
+			let onto = claimed
+				.get(&key)
+				.filter(|taken| folds_like(taken))
+				.cloned()
+				.or_else(|| {
+					self.held_paths
+						.iter()
+						.find(|held| folds_like(held))
+						.cloned()
+				})
+				.or_else(|| {
+					baseline
+						.folded_row_paths(rel_path)
+						.into_iter()
+						.find(|row| folds_like(row) && self.nodes.holds(row))
+				});
+			if let Some(onto) = onto {
+				tracing::debug!(
+					"remote view: {rel_path:?} folds onto {onto:?}, so no 1:1 local mapping exists"
+				);
+				clashes.push(rel_path.clone());
+			} else {
+				claimed.insert(key, rel_path.clone());
+			}
+		}
+		for rel_path in clashes {
+			self.has_collisions = true;
+			self.nodes.remove(&rel_path);
 		}
 	}
 }
@@ -6191,6 +6258,67 @@ mod tests {
 		let mut whole = place_remote_items(root, &dirs, &files, &[]);
 		whole.filter(Some(filter()));
 		assert_eq!(sorted(&whole), ["keep.txt"]);
+	}
+
+	/// The narrowed collision check folds each decided key against the other decided keys, the held
+	/// paths and the CARRIED keys — the last asked of the baseline rather than by scanning the
+	/// view — and refuses the pass on any of the three.
+	///
+	/// The last case in this test is the one the narrowing deliberately does not check: two keys
+	/// the pass merely carried. A pass that finds a collision refuses, and a refusal forces the
+	/// next pass to read whole, so no such pair can reach a scoped pass undetected. Pinned here so
+	/// that reasoning has to be revisited if the refusal ever stops forcing a whole read.
+	#[test]
+	fn the_narrowed_collision_check_folds_every_key_a_decided_one_can_meet() {
+		let root = Uuid::new_v4();
+		let lower = cacheable_file(root, "note.txt");
+		let upper = RemoteItem {
+			uuid: Uuid::new_v4(),
+			name: "Note.txt".to_string(),
+			..lower.clone()
+		};
+		let no_rows = Baseline::default();
+		let decided = |paths: &[&str]| -> BTreeSet<String> {
+			paths.iter().map(|path| (*path).to_string()).collect()
+		};
+
+		// Against a CARRIED key: the row is what the carried node is, so the baseline answers.
+		let rows = HashMap::from([(
+			"note.txt".to_string(),
+			base_file("note.txt", lower.uuid, [3; 32]),
+		)]);
+		let carried_rows = tree(&rows);
+		let mut against_carried =
+			place_remote_items(root, &[], &[lower.clone(), upper.clone()], &[]);
+		against_carried.resolve_collisions_changed(&carried_rows, &decided(&["Note.txt"]));
+		assert!(against_carried.has_collisions);
+		assert!(
+			!against_carried.nodes.holds("Note.txt"),
+			"the decided key is the loser; the carried one the pass is not touching stays"
+		);
+		assert!(against_carried.nodes.holds("note.txt"));
+
+		// Against another DECIDED key, with no row behind either.
+		let mut both_decided = place_remote_items(root, &[], &[lower.clone(), upper.clone()], &[]);
+		both_decided.resolve_collisions_changed(&no_rows, &decided(&["Note.txt", "note.txt"]));
+		assert!(both_decided.has_collisions);
+		assert_eq!(both_decided.nodes.len(), 1, "one of the twins leaves");
+
+		// Against a HELD path, which took its key when the view held it.
+		let mut against_held = place_remote_items(root, &[], std::slice::from_ref(&upper), &[]);
+		against_held.held_paths = decided(&["note.txt"]);
+		against_held.resolve_collisions_changed(&no_rows, &decided(&["Note.txt"]));
+		assert!(against_held.has_collisions);
+		assert!(!against_held.nodes.holds("Note.txt"));
+
+		// Two keys the pass merely CARRIED: not folded, by the induction above.
+		let mut carried_only = place_remote_items(root, &[], &[lower, upper], &[]);
+		carried_only.resolve_collisions_changed(&carried_rows, &BTreeSet::new());
+		assert!(
+			!carried_only.has_collisions,
+			"a pass that found this pair would have refused and forced the next read whole"
+		);
+		assert_eq!(carried_only.nodes.len(), 2);
 	}
 
 	/// A root pattern of `*` empties the filtered view, rule file included, while the unfiltered one
