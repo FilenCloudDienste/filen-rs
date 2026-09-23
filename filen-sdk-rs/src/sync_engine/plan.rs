@@ -7070,6 +7070,12 @@ mod tests {
 			("d/.filenignore", false),
 			("top.txt", false),
 			("Top.txt", false),
+			// Two fold pairs an ASCII-only lowering would keep apart: `Ä`/`ä`, and
+			// `İ`, whose fold is a character LONGER than the name it came from.
+			("\u{c4}.txt", false),
+			("\u{e4}.txt", false),
+			("\u{130}.txt", false),
+			("i\u{307}.txt", false),
 			("z", true),
 			("z/1.txt", false),
 			("z.txt", false),
@@ -7530,6 +7536,562 @@ mod tests {
 				seen.folds > 100,
 				"only {} directory move(s) were folded, so this tested almost nothing",
 				seen.folds
+			);
+		}
+
+		/// The two names of every fold class [`TREE`] spells twice — what a case-only sibling
+		/// collision is generated out of, which is the one collision that loses user data (the
+		/// server dedups on the lowercased name hash, so the second spelling never lands).
+		///
+		/// The last two pairs fold together only under [`collision_key`]'s full-Unicode lowering.
+		/// An ASCII-only fold keeps both spellings apart, and the second pair's fold is LONGER
+		/// than the name it came from (`U+0130` lowers to two scalars), so a check written with
+		/// `to_ascii_lowercase` — or one that assumed a fold preserves length — stops refusing a
+		/// pass the server would have collapsed.
+		const TWINS: [(&str, &str); 6] = [
+			("a", "A"),
+			("a/b.txt", "a/B.txt"),
+			("top.txt", "Top.txt"),
+			("empty", "Empty"),
+			("\u{c4}.txt", "\u{e4}.txt"),
+			("\u{130}.txt", "i\u{307}.txt"),
+		];
+
+		/// The `.filenignore` bodies a view case is filtered with: the pair root's, and the one in
+		/// `d` — the directory [`TREE`] holds a rule-file path for, so a case can be hidden by a
+		/// level that is not the root's.
+		///
+		/// Set 3 is the nested pair: `d/e` and `d/e/f` both match a rule of their own, and only
+		/// the top-most is ever the root a hit is recorded under. Set 5 hides through the file at
+		/// depth alone, and nests inside it.
+		const RULE_SETS: [(&str, &str); 6] = [
+			("", ""),
+			("z/\n", ""),
+			("*.txt\n", ""),
+			("d/e\nd/e/f\n", ""),
+			("a\nab\n", ""),
+			("", "e/f\ne/f/g.txt\n"),
+		];
+
+		fn rules_of(set: usize) -> IgnoreRules {
+			let (at_root, at_d) = RULE_SETS[set];
+			let mut rules = IgnoreRules::default();
+			for (dir, text) in [("", at_root), ("d", at_d)] {
+				if text.is_empty() {
+					continue;
+				}
+				let (source, errors) = IgnoreSource::parse(text, Origin::File { dir })
+					.expect("the generated rule text compiles");
+				assert!(errors.is_empty(), "{errors:?}");
+				rules.insert_file(dir.to_owned(), source);
+			}
+			rules
+		}
+
+		/// What a change-scoped pass reaches [`RemoteView::filter_changed`] with, plus everything
+		/// the WHOLE form needs to be run over the very same input.
+		struct ViewCase {
+			nodes: Side<RemoteNode>,
+			held_paths: BTreeSet<String>,
+			skipped: Vec<SkippedRemote>,
+			decided: BTreeSet<String>,
+			rules: IgnoreRules,
+			baseline: Baseline,
+		}
+
+		impl ViewCase {
+			/// A fresh view over this case's input: each form is run over its own copy, so neither
+			/// can be handed what the other left.
+			fn view(&self) -> RemoteView {
+				RemoteView {
+					nodes: self.nodes.clone(),
+					has_collisions: false,
+					held_paths: self.held_paths.clone(),
+					skipped: self.skipped.clone(),
+					ignored: BTreeMap::new(),
+					ignored_default_untracked: 0,
+				}
+			}
+
+			fn filter(&self) -> ViewFilter<'_> {
+				ViewFilter {
+					rules: &self.rules,
+					baseline: &self.baseline,
+				}
+			}
+		}
+
+		/// What the view corpus provably reached, counted off the FINISHED cases rather than off
+		/// the generator's intentions — a shape that was staged and then scrubbed away again is
+		/// not a shape the properties tested.
+		#[derive(Debug, Default)]
+		struct ViewCoverage {
+			cases: usize,
+			/// Fold classes the view still holds more than one spelling of, with at least one of
+			/// them decided: the collision the narrowed check has to find.
+			fold_classes: usize,
+			/// Of those, the ones whose partner is NOT decided — answered out of the baseline's
+			/// rows instead of by scanning the view.
+			partner_not_decided: usize,
+			/// Of those, the ones where a spelling is HELD rather than in the view.
+			held_folds: usize,
+			/// Of those, the ones an ASCII-only fold would have kept apart.
+			non_ascii_folds: usize,
+			/// Decided nodes the rules hide.
+			hidden_decided: usize,
+			/// Of those, the directories with nodes under them — the subtree the narrowed form
+			/// drops without asking the rules about it.
+			hidden_subtrees: usize,
+			/// Of those, the ones that match a rule of their OWN and are still recorded under an
+			/// ancestor's root: nested ignored roots.
+			nested_roots: usize,
+			/// Of those, the ones decided by a `.filenignore` below the pair root.
+			depth_rule_hits: usize,
+			/// Carried nodes the rules hide, counted as [`scrub`] REMOVES them. Not a bound on
+			/// anything the properties saw: by construction they never see one.
+			scrubbed_under_hidden: usize,
+			/// Carried nodes folding onto a held path or onto another carried node, likewise
+			/// counted as the scrub removes them.
+			scrubbed_folded: usize,
+		}
+
+		impl ViewCoverage {
+			/// The bounds every one of the three properties is only worth running above. Each is a
+			/// shape the narrowing can be wrong at; a generator that stopped producing one would
+			/// otherwise let the property pass by proving nothing.
+			fn assert_reached(&self) {
+				assert!(self.cases == CASES as usize, "{self:?}");
+				assert!(self.fold_classes > 300, "{self:?}");
+				assert!(self.partner_not_decided > 100, "{self:?}");
+				assert!(self.held_folds > 70, "{self:?}");
+				assert!(self.non_ascii_folds > 80, "{self:?}");
+				assert!(self.hidden_decided > 350, "{self:?}");
+				assert!(self.hidden_subtrees > 70, "{self:?}");
+				assert!(self.nested_roots > 40, "{self:?}");
+				assert!(self.depth_rule_hits > 30, "{self:?}");
+				self.assert_scrub_stayed_active();
+			}
+
+			/// A different claim from the nine above, kept apart from them so it cannot be read as
+			/// a tenth: these two count what [`scrub`] took OUT of each case, so they say the
+			/// scrub is still doing its work — never that a property exercised either shape. The
+			/// two shapes it removes are covered by
+			/// [`a_scoped_filter_keeps_the_two_carried_shapes_a_whole_one_drops`] instead.
+			fn assert_scrub_stayed_active(&self) {
+				assert!(self.scrubbed_under_hidden > 350, "{self:?}");
+				assert!(self.scrubbed_folded > 70, "{self:?}");
+			}
+		}
+
+		/// Take the carried half of a view back to the state the narrowing's safety argument
+		/// ASSUMES, which is the state the pass before this one left.
+		///
+		/// Both removals are things an earlier whole read already did. A carried node came off a
+		/// baseline row, and a row only exists where the rules let the node through — the rules
+		/// stand still across a scoped pass, so no carried node is hidden by them. And a pass that
+		/// finds a fold REFUSES, which forces the next pass to read whole, so no two carried keys
+		/// fold together either. Without this the properties would be comparing the narrowed form
+		/// against inputs no pass can be handed, and the divergences they found would be the two
+		/// this module pins deliberately in
+		/// [`a_scoped_filter_keeps_the_two_carried_shapes_a_whole_one_drops`].
+		fn scrub(case: &mut ViewCase, seen: &mut ViewCoverage) {
+			let mut memo = HashMap::new();
+			let held_keys: HashSet<String> = case
+				.held_paths
+				.iter()
+				.map(|path| collision_key(path))
+				.collect();
+			let mut claimed: HashSet<String> = HashSet::new();
+			// Sorted, so which spelling of a carried pair survives the scrub is not the hash
+			// order of a map — the one thing the two forms are allowed to disagree about.
+			let mut carried: Vec<(String, bool)> = Nodes::iter(&case.nodes)
+				.filter(|(path, _)| !case.decided.contains(path.as_ref()))
+				.map(|(path, node)| (path.into_owned(), node.kind == NodeKind::Dir))
+				.collect();
+			carried.sort();
+			for (path, is_dir) in carried {
+				if case.rules.ignored_root(&path, is_dir, &mut memo).is_some() {
+					seen.scrubbed_under_hidden += 1;
+					case.nodes.remove(&path);
+					continue;
+				}
+				let key = collision_key(&path);
+				if held_keys.contains(&key) || !claimed.insert(key) {
+					seen.scrubbed_folded += 1;
+					case.nodes.remove(&path);
+				}
+			}
+		}
+
+		/// What the finished case actually holds, which is what the bounds above are read off.
+		fn measure(case: &ViewCase, seen: &mut ViewCoverage) {
+			seen.cases += 1;
+			let mut classes: HashMap<String, Vec<String>> = HashMap::new();
+			for path in case.nodes.paths() {
+				classes
+					.entry(collision_key(&path))
+					.or_default()
+					.push(path.into_owned());
+			}
+			// A held path took its key when the view held it, so it is part of its fold class.
+			for held in &case.held_paths {
+				classes
+					.entry(collision_key(held))
+					.or_default()
+					.push(held.clone());
+			}
+			for spellings in classes.into_values() {
+				let decided = spellings
+					.iter()
+					.filter(|path| case.decided.contains(*path))
+					.count();
+				if spellings.len() < 2 || decided == 0 {
+					continue;
+				}
+				seen.fold_classes += 1;
+				if decided < spellings.len() {
+					seen.partner_not_decided += 1;
+				}
+				if spellings.iter().any(|path| case.held_paths.contains(path)) {
+					seen.held_folds += 1;
+				}
+				if spellings
+					.iter()
+					.any(|path| !path.eq_ignore_ascii_case(&spellings[0]))
+				{
+					seen.non_ascii_folds += 1;
+				}
+			}
+			let mut memo = HashMap::new();
+			for (path, node) in Nodes::iter(&case.nodes) {
+				if !case.decided.contains(path.as_ref()) {
+					continue;
+				}
+				let is_dir = node.kind == NodeKind::Dir;
+				let Some((root, decision)) = case.rules.ignored_root(&path, is_dir, &mut memo)
+				else {
+					continue;
+				};
+				seen.hidden_decided += 1;
+				if is_dir && !case.nodes.subtree_paths(&path).is_empty() {
+					seen.hidden_subtrees += 1;
+				}
+				if root != path && case.rules.decide(&path, is_dir).is_some() {
+					seen.nested_roots += 1;
+				}
+				if matches!(decision.level, IgnoreLevel::File { ref dir } if !dir.is_empty()) {
+					seen.depth_rule_hits += 1;
+				}
+			}
+		}
+
+		/// The remote half of one generated case, as a view the two filter forms can be run over.
+		///
+		/// The fold class is STAGED rather than left to the draw: two spellings of one name reach
+		/// the collision check together far too rarely for a corpus this size to pin anything
+		/// about them, which is the same reason [`generate`] stages its directory rename.
+		fn view_case(seed: u64, case: &Case, seen: &mut ViewCoverage) -> ViewCase {
+			// Its own stream, so the case's draws do not shift when this one changes.
+			let mut rng = StdRng::seed_from_u64(seed ^ 0x7fff_ffff_0000_0001);
+			let mut out = ViewCase {
+				nodes: case.remote.clone(),
+				held_paths: BTreeSet::new(),
+				skipped: Vec::new(),
+				decided: case.decided.clone(),
+				rules: rules_of(rng.random_range(0..RULE_SETS.len())),
+				baseline: case.baseline.clone(),
+			};
+			let place = |nodes: &mut Side<RemoteNode>, path: &str| {
+				let index = index_of(path);
+				nodes.insert(path.to_owned(), remote_node_at(index, kind_at(index), 0));
+			};
+			let (lower, upper) = TWINS[rng.random_range(0..TWINS.len())];
+			match rng.random_range(0..4) {
+				// Both spellings decided: what one pass's worth of remote announcements can
+				// introduce on its own.
+				0 => {
+					for path in [lower, upper] {
+						place(&mut out.nodes, path);
+						out.decided.insert(path.to_owned());
+					}
+				}
+				// One decided, its partner CARRIED — the case the narrowed check answers out of
+				// the baseline's rows instead of by scanning the view, so the partner needs one.
+				// Its node is built rather than carried off that row: `hide` and the collision
+				// check read a node's path and its kind and nothing else, and both match the row.
+				1 => {
+					place(&mut out.nodes, lower);
+					place(&mut out.nodes, upper);
+					out.decided.insert(upper.to_owned());
+					out.decided.remove(lower);
+					out.baseline
+						.upsert(&row(index_of(lower), Shape::Synced).expect("a synced row"));
+				}
+				// One spelling HELD — the cache mid-transition — and the other decided. A held
+				// path is always decided: what withheld it was an announcement about it.
+				2 => {
+					place(&mut out.nodes, upper);
+					out.nodes.remove(lower);
+					for path in [lower, upper] {
+						out.decided.insert(path.to_owned());
+					}
+					out.held_paths.insert(lower.to_owned());
+				}
+				_ => {}
+			}
+			// A decided path the rules HIDE, and — where it is a directory — its whole subtree
+			// decided with it. That is the one shape a scoped pass ever pays a subtree walk for: a
+			// remote create or move INTO an already-ignored directory, whose re-key records every
+			// end. Left to the draw it happens too rarely to test the narrowed hide's own removal.
+			if rng.random_range(0..2) == 0 {
+				let mut memo = HashMap::new();
+				let hidden: Vec<&str> = TREE
+					.iter()
+					.filter(|(path, is_dir)| {
+						out.rules.ignored_root(path, *is_dir, &mut memo).is_some()
+					})
+					.map(|(path, _)| *path)
+					.collect();
+				if let Some(root) = hidden
+					.get(rng.random_range(0..hidden.len().max(1)))
+					.copied()
+				{
+					let under = format!("{root}/");
+					for (path, _) in TREE
+						.iter()
+						.filter(|(path, _)| *path == root || path.starts_with(&under))
+					{
+						place(&mut out.nodes, path);
+						out.decided.insert((*path).to_owned());
+					}
+				}
+			}
+			out.skipped = (0..rng.random_range(0..3u32))
+				.map(|n| {
+					let (path, is_dir) = TREE[rng.random_range(0..TREE.len())];
+					SkippedRemote {
+						remote_uuid: Uuid::from_u128(7000 + u128::from(n)),
+						stable_uuid: None,
+						rel_path: path.to_owned(),
+						path_is_dir: is_dir,
+						reason: match n % 3 {
+							0 => UnsyncableReason::RemoteUndecodable,
+							1 => UnsyncableReason::RemoteInvalidName {
+								name: path.to_owned(),
+							},
+							_ => UnsyncableReason::RemoteBrokenParent,
+						},
+					}
+				})
+				.collect();
+			scrub(&mut out, seen);
+			measure(&out, seen);
+			out
+		}
+
+		/// Every view case of the corpus, with the coverage the bounds are checked against.
+		fn view_cases() -> (Vec<(u64, ViewCase)>, ViewCoverage) {
+			let mut generated = Coverage::default();
+			let mut seen = ViewCoverage::default();
+			let cases = (0..CASES)
+				.map(|seed| {
+					(
+						seed,
+						view_case(seed, &generate(seed, &mut generated), &mut seen),
+					)
+				})
+				.collect();
+			(cases, seen)
+		}
+
+		fn sorted_paths(view: &RemoteView) -> Vec<String> {
+			let mut paths: Vec<String> = view.nodes.paths().map(Cow::into_owned).collect();
+			paths.sort();
+			paths
+		}
+
+		/// The names the surviving nodes CLAIM, folded the way the server dedups them. This is
+		/// what the two collision checks have to agree on even where they dropped different
+		/// spellings of one name.
+		fn claimed_keys(view: &RemoteView) -> BTreeSet<String> {
+			view.nodes
+				.paths()
+				.map(|path| collision_key(&path))
+				.collect()
+		}
+
+		/// Everything [`RemoteView::hide`] touches, at both scopes. Exact down to the path: the
+		/// rules answer per node, so nothing here is free to depend on an iteration order.
+		fn assert_same_hidden(seed: u64, whole: &RemoteView, scoped: &RemoteView) {
+			assert_eq!(
+				sorted_paths(whole),
+				sorted_paths(scoped),
+				"seed {seed}: the narrowed hide left another set of nodes"
+			);
+			assert_eq!(
+				whole.ignored, scoped.ignored,
+				"seed {seed}: the narrowed hide recorded other ignored roots"
+			);
+			assert_eq!(
+				whole.ignored_default_untracked, scoped.ignored_default_untracked,
+				"seed {seed}: the narrowed hide counted other untracked default hits"
+			);
+			assert_eq!(
+				whole.skipped, scoped.skipped,
+				"seed {seed}: the narrowed hide kept other unplaceable records"
+			);
+		}
+
+		/// Everything the two collision checks must agree on.
+		///
+		/// The REFUSAL is the contract at every case: a fold either leaves no 1:1 local mapping or
+		/// it does not, and [`has_collisions`](RemoteView::has_collisions) is the whole of what the
+		/// engine reads of this step. Where none fired, the two views must also be identical
+		/// outright — there is no licence to differ at all.
+		///
+		/// Where one DID fire, the pass is refused before it reconciles anything and the view is
+		/// dropped unread, so what a refused view still holds is not a contract — and the two forms
+		/// do differ there. The narrowed one can empty a whole fold class where the whole form keeps
+		/// a spelling: its losers leave only once the loop is over, so two decided twins each still
+		/// find the other's row and node and both are dropped. What is still owed in that case is
+		/// the direction a LOST refusal would show up in — the narrowed form never keeps a name the
+		/// whole one dropped.
+		fn assert_same_claimed(seed: u64, what: &str, whole: &RemoteView, scoped: &RemoteView) {
+			assert_eq!(
+				whole.has_collisions, scoped.has_collisions,
+				"seed {seed}, {what}: the two forms disagree about refusing the pass"
+			);
+			if whole.has_collisions {
+				assert!(
+					claimed_keys(scoped).is_subset(&claimed_keys(whole)),
+					"seed {seed}, {what}: the narrowed form kept a name the whole one dropped"
+				);
+				return;
+			}
+			assert_eq!(
+				sorted_paths(whole),
+				sorted_paths(scoped),
+				"seed {seed}, {what}: nothing was refused, so the two views must be identical"
+			);
+		}
+
+		/// The narrowed ignore step hides exactly what the whole one hides.
+		///
+		/// The expectation comes from [`RemoteView::hide`] at [`PassPaths::Whole`] — the form a
+		/// whole-read pass still runs in production, not a copy of it written here.
+		#[test]
+		fn a_scoped_hide_removes_what_a_whole_hide_removes() {
+			let (cases, seen) = view_cases();
+			for (seed, case) in &cases {
+				let mut whole = case.view();
+				whole.hide(case.filter(), PassPaths::Whole);
+				let mut scoped = case.view();
+				scoped.hide(case.filter(), PassPaths::Changed(&case.decided));
+				assert_same_hidden(*seed, &whole, &scoped);
+			}
+			seen.assert_reached();
+		}
+
+		/// The narrowed collision check refuses exactly what the whole one refuses, and leaves the
+		/// same names claimed.
+		#[test]
+		fn a_scoped_collision_check_refuses_what_a_whole_one_refuses() {
+			let (cases, seen) = view_cases();
+			for (seed, case) in &cases {
+				let mut whole = case.view();
+				whole.resolve_collisions();
+				let mut scoped = case.view();
+				scoped.resolve_collisions_changed(&case.baseline, &case.decided);
+				assert_same_claimed(*seed, "collisions", &whole, &scoped);
+			}
+			seen.assert_reached();
+		}
+
+		/// The two steps composed, in the order a pass runs them: the narrowed filter leaves the
+		/// view the whole filter leaves.
+		///
+		/// Not implied by the two properties above. They each run over the view as it arrives,
+		/// where this runs the collision check over whatever the ignore step left — and a
+		/// narrowing that hid the wrong node would hand the fold a different set of names to
+		/// resolve than the whole form ever sees.
+		#[test]
+		fn a_scoped_filter_leaves_the_view_a_whole_filter_leaves() {
+			let (cases, seen) = view_cases();
+			for (seed, case) in &cases {
+				let mut whole = case.view();
+				whole.filter(Some(case.filter()));
+				let mut scoped = case.view();
+				scoped.filter_changed(case.filter(), &case.decided);
+				assert_same_claimed(*seed, "filter", &whole, &scoped);
+				assert_eq!(
+					whole.ignored, scoped.ignored,
+					"seed {seed}: the narrowed filter recorded other ignored roots"
+				);
+				assert_eq!(
+					whole.ignored_default_untracked, scoped.ignored_default_untracked,
+					"seed {seed}: the narrowed filter counted other untracked default hits"
+				);
+				assert_eq!(
+					whole.skipped, scoped.skipped,
+					"seed {seed}: the narrowed filter kept other unplaceable records"
+				);
+			}
+			seen.assert_reached();
+		}
+
+		/// The two carried shapes the narrowed filter KEEPS where the whole one drops them — the
+		/// exact divergence [`scrub`] takes out of the corpus above, on the record rather than
+		/// left as a gap nobody wrote down.
+		///
+		/// Both are the safe direction. A carried node's LOCAL half comes off the same row, so the
+		/// pair reads as converged there and a reconcile driven by the decided set plans nothing
+		/// at it; dropping the remote half alone is what would read as a local deletion. The
+		/// second shape only DELAYS a refusal: the held path is decided, so the pass after the one
+		/// that unholds it folds it against the carried row and refuses then.
+		#[test]
+		fn a_scoped_filter_keeps_the_two_carried_shapes_a_whole_one_drops() {
+			let of = |path: &str| {
+				let index = index_of(path);
+				(path.to_owned(), remote_node_at(index, kind_at(index), 0))
+			};
+			let case = ViewCase {
+				nodes: ["z", "z/1.txt", "top.txt"].into_iter().map(of).collect(),
+				// `Top.txt` listed twice by a cache mid-transition, so the view holds neither copy.
+				held_paths: BTreeSet::from(["Top.txt".to_owned()]),
+				skipped: Vec::new(),
+				// Nothing moved off its row: every node here is one the pass CARRIED.
+				decided: BTreeSet::new(),
+				rules: rules_of(1),
+				baseline: Baseline::from_rows([
+					base_dir("z", uuid_at(index_of("z"))),
+					base_file("z/1.txt", uuid_at(index_of("z/1.txt")), hash_at(0, 0)),
+					base_file("top.txt", uuid_at(index_of("top.txt")), hash_at(1, 0)),
+				]),
+			};
+
+			let mut whole = case.view();
+			whole.filter(Some(case.filter()));
+			assert!(
+				sorted_paths(&whole).is_empty(),
+				"the whole form drops the rows left at a hidden path and refuses the folded one"
+			);
+			assert!(whole.has_collisions);
+			assert_eq!(whole.ignored.keys().collect::<Vec<_>>(), vec!["z"]);
+
+			let mut scoped = case.view();
+			scoped.filter_changed(case.filter(), &case.decided);
+			assert_eq!(
+				sorted_paths(&scoped),
+				["top.txt", "z", "z/1.txt"],
+				"a carried row at a hidden path, and one folding onto a held path, both stay"
+			);
+			assert!(
+				!scoped.has_collisions,
+				"the pass is not refused over a pair it is not reconciling"
+			);
+			assert!(
+				scoped.ignored.is_empty(),
+				"a root an earlier pass found is re-supplied by the carried facts, not re-derived"
 			);
 		}
 	}
