@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug, sync::Arc};
+use std::{borrow::Cow, fmt::Debug};
 
 use filen_macros::js_type;
 use filen_types::{
@@ -348,6 +348,52 @@ async fn drain_collecting_errors(
 	errors
 }
 
+/// A public link a directory belongs to, with its key decrypted.
+pub(crate) struct ConnectedLink {
+	link: ListedPublicLink<'static>,
+	crypter: MetaKey,
+}
+
+/// The public links and shared users that items created inside a directory must be
+/// propagated to. New items inherit their parent's links and shares, so one snapshot of the
+/// destination covers every item created below it.
+#[derive(Default)]
+pub(crate) struct ConnectedTargets {
+	links: Vec<ConnectedLink>,
+	users: Vec<SharedUser<'static>>,
+}
+
+impl ConnectedTargets {
+	/// One operation per (link, item) and (user, item) pair: links first, then users.
+	fn operations<'t, 'i, 'a>(
+		&'t self,
+		items: &'i [NonRootItemType<'a, Normal>],
+	) -> impl Iterator<Item = PropagationOp<'t, 'i, 'a>> {
+		let links = self.links.iter().flat_map(move |link| {
+			items
+				.iter()
+				.map(move |item| PropagationOp::Link { link, item })
+		});
+		let users = self.users.iter().flat_map(move |user| {
+			items
+				.iter()
+				.map(move |item| PropagationOp::Share { user, item })
+		});
+		links.chain(users)
+	}
+}
+
+enum PropagationOp<'t, 'i, 'a> {
+	Link {
+		link: &'t ConnectedLink,
+		item: &'i NonRootItemType<'a, Normal>,
+	},
+	Share {
+		user: &'t SharedUser<'static>,
+		item: &'i NonRootItemType<'a, Normal>,
+	},
+}
+
 impl Client {
 	async fn update_shared_item_meta<I>(&self, item: &I, user: &SharedUser<'_>) -> Result<(), Error>
 	where
@@ -438,22 +484,72 @@ impl Client {
 		Ok(())
 	}
 
+	/// Snapshot of the public links and shared users that items created inside `dir` must be
+	/// propagated to. A link whose key cannot be decrypted is skipped (with a warning) so it
+	/// cannot block propagation to the others.
+	pub(crate) async fn fetch_connected_targets(
+		&self,
+		dir: Uuid,
+	) -> Result<ConnectedTargets, Error> {
+		let linked_request = api::v3::item::linked::Request { uuid: dir };
+		let shared_request = api::v3::item::shared::Request { uuid: dir };
+		let (linked, shared) = futures::try_join!(
+			api::v3::item::linked::post(self.client(), &linked_request),
+			api::v3::item::shared::post(self.client(), &shared_request),
+		)?;
+
+		let mut links = Vec::with_capacity(linked.links.len());
+		for link in linked.links {
+			match self.decrypt_meta_key(&link.link_key).await {
+				Ok(crypter) => links.push(ConnectedLink { link, crypter }),
+				Err(error) => {
+					tracing::warn!(
+						"failed to decrypt link key for connected link {}, skipping: {error}",
+						link.link_uuid
+					);
+				}
+			}
+		}
+
+		Ok(ConnectedTargets {
+			links,
+			users: shared.users,
+		})
+	}
+
+	/// Adds every item to every link and shares it with every user in `targets`. Each item's
+	/// parent must already be propagated. All operations run to completion; the errors of the
+	/// failed ones are returned rather than aborting the rest.
+	pub(crate) async fn propagate_to_targets(
+		&self,
+		targets: &ConnectedTargets,
+		items: &[NonRootItemType<'_, Normal>],
+	) -> Vec<Error> {
+		let futures = targets
+			.operations(items)
+			.map(|op| match op {
+				PropagationOp::Link { link, item } => Box::pin(async move {
+					self.add_item_to_directory_link(item, &link.link, &link.crypter)
+						.await
+				})
+					as MaybeSendBoxFuture<'_, Result<(), Error>>,
+				PropagationOp::Share { user, item } => {
+					Box::pin(async move { self.inner_share_item(item, user).await })
+						as MaybeSendBoxFuture<'_, Result<(), Error>>
+				}
+			})
+			.collect::<FuturesUnordered<_>>();
+		drain_collecting_errors(futures).await
+	}
+
 	pub(crate) async fn update_item_with_maybe_connected_parent(
 		&self,
 		item: NonRootItemType<'_, Normal>,
 	) -> Result<(), Error> {
 		let uuid = (*item.parent()).try_into()?;
 
-		let (linked, shared, items_to_process) = futures::try_join!(
-			async {
-				api::v3::item::linked::post(self.client(), &api::v3::item::linked::Request { uuid })
-					.await
-			},
-			async {
-				api::v3::item::shared::post(self.client(), &api::v3::item::shared::Request { uuid })
-					.await
-			},
-			async move {
+		let (targets, items_to_process) =
+			futures::try_join!(self.fetch_connected_targets(uuid), async move {
 				if let NonRootItemType::Dir(dir) = item {
 					let (dirs, files) = Normal::list_dir_recursive(
 						self,
@@ -472,46 +568,9 @@ impl Client {
 				} else {
 					Ok(vec![item])
 				}
-			}
-		)?;
+			})?;
 
-		let futures = FuturesUnordered::new();
-
-		for link in linked.links {
-			// An undecryptable (corrupt/legacy) link key must not abort propagation to the
-			// remaining links and shared users: skip this link and keep going.
-			let crypter = match self.decrypt_meta_key(&link.link_key).await {
-				Ok(crypter) => Arc::new(crypter),
-				Err(error) => {
-					tracing::warn!(
-						"failed to decrypt link key for connected link {}, skipping: {error}",
-						link.link_uuid
-					);
-					continue;
-				}
-			};
-			let link = Arc::new(link);
-			for item in &items_to_process {
-				let link = link.clone();
-				let crypter = crypter.clone();
-				futures.push(Box::pin(async move {
-					self.add_item_to_directory_link(item, link.as_ref(), crypter.as_ref())
-						.await
-				}) as MaybeSendBoxFuture<'_, Result<(), Error>>);
-			}
-		}
-
-		for user in shared.users {
-			let user = Arc::new(user);
-			for item in &items_to_process {
-				let user = user.clone();
-				futures.push(Box::pin(
-					async move { self.inner_share_item(item, user.as_ref()).await },
-				) as MaybeSendBoxFuture<'_, Result<(), Error>>);
-			}
-		}
-
-		let errors = drain_collecting_errors(futures).await;
+		let errors = self.propagate_to_targets(&targets, &items_to_process).await;
 		for error in &errors {
 			tracing::warn!(
 				"failed to propagate a connected-parent update to a link or shared user: {error}"
@@ -1136,6 +1195,83 @@ mod tests {
 			Cow::Borrowed("deadbeefhash"),
 			"hashed credential must survive the conversion instead of deriving to \"empty\""
 		);
+	}
+
+	fn test_dir(name: &str) -> NonRootItemType<'static, Normal> {
+		let now = chrono::Utc::now();
+		let (uuid, meta) = RemoteDirectory::make_parts(name, now).unwrap();
+		NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
+			uuid,
+			meta,
+			Uuid::new_v4().into(),
+			now,
+		)))
+	}
+
+	fn test_link() -> ConnectedLink {
+		ConnectedLink {
+			link: ListedPublicLink {
+				link_uuid: Uuid::new_v4(),
+				link_key: filen_types::crypto::EncryptedMetaKey(
+					filen_types::crypto::EncryptedString(Cow::Borrowed("encrypted")),
+				),
+			},
+			crypter: test_meta_key(),
+		}
+	}
+
+	fn test_user(id: u64) -> SharedUser<'static> {
+		let key = rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap();
+		SharedUser {
+			id,
+			email: Cow::Owned(format!("user{id}@example.com")),
+			public_key: key.to_public_key(),
+		}
+	}
+
+	#[test]
+	fn no_targets_means_no_propagation_operations() {
+		let items = [test_dir("a"), test_dir("b")];
+		assert_eq!(ConnectedTargets::default().operations(&items).count(), 0);
+	}
+
+	#[test]
+	fn operations_cover_every_link_and_user_for_every_item() {
+		let items = [test_dir("a"), test_dir("b"), test_dir("c")];
+		let targets = ConnectedTargets {
+			links: vec![test_link(), test_link()],
+			users: vec![test_user(1)],
+		};
+
+		let ops = targets.operations(&items).collect::<Vec<_>>();
+		assert_eq!(ops.len(), (2 + 1) * items.len());
+
+		let mut pairs = Vec::new();
+		for op in &ops {
+			match op {
+				PropagationOp::Link { link, item } => {
+					pairs.push((Some(link.link.link_uuid), None, item.uuid()))
+				}
+				PropagationOp::Share { user, item } => {
+					pairs.push((None, Some(user.id), item.uuid()))
+				}
+			}
+		}
+		let expected = targets
+			.links
+			.iter()
+			.flat_map(|link| {
+				items
+					.iter()
+					.map(move |item| (Some(link.link.link_uuid), None, item.uuid()))
+			})
+			.chain(targets.users.iter().flat_map(|user| {
+				items
+					.iter()
+					.map(move |item| (None, Some(user.id), item.uuid()))
+			}))
+			.collect::<Vec<_>>();
+		assert_eq!(pairs, expected, "links first, then users; item order kept");
 	}
 
 	// A single failing propagation (e.g. one undecryptable link key) must not abort the
