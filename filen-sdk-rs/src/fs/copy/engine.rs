@@ -985,16 +985,21 @@ async fn copy_file_inner<B: CopyBackend>(task: FileTask<B>) -> Result<RemoteFile
 	control.checkpoint().await?;
 	let source = Arc::new(file.source);
 	let size = file.size;
-	let chunks = source.chunks();
-	if !chunks_consistent_with_size(chunks, size) {
+	let stored_chunks = source.chunks();
+	if !chunks_consistent_with_size(stored_chunks, size) {
 		return Err(FileError::Failed(
 			CopyStage::Download,
 			Error::custom(
 				ErrorKind::Response,
-				format!("file chunk count ({chunks}) is inconsistent with its size ({size})"),
+				format!(
+					"file chunk count ({stored_chunks}) is inconsistent with its size ({size})"
+				),
 			),
 		));
 	}
+	// A stored count may include a chunk without data (one for an empty file, or a trailing
+	// empty chunk); only the chunks holding data are copied.
+	let chunks = size.div_ceil(CHUNK_SIZE_U64);
 	let mut retry = NameRetry::new(false);
 	let mut name = file.name.clone();
 	if verify_name {
@@ -1208,6 +1213,11 @@ mod tests {
 	}
 
 	fn source_file(name: &str, size: u64) -> RemoteFileType<'static> {
+		source_file_with_chunks(name, size, size.div_ceil(CHUNK_SIZE_U64))
+	}
+
+	/// A source file whose stored chunk count is `chunks`.
+	fn source_file_with_chunks(name: &str, size: u64, chunks: u64) -> RemoteFileType<'static> {
 		let uuid = Uuid::new_v4();
 		let meta = FileMeta::Decoded(DecryptedFileMeta {
 			name: Cow::Owned(name.to_owned()),
@@ -1223,7 +1233,7 @@ mod tests {
 			(),
 			Uuid::new_v4().into(),
 			size,
-			size.div_ceil(CHUNK_SIZE_U64),
+			chunks,
 			"de-1",
 			"bucket",
 			Utc::now(),
@@ -1772,6 +1782,46 @@ mod tests {
 		assert_eq!(last.phase, CopyPhase::Done);
 		assert!(last.active.is_empty());
 		assert_eq!(last.counts, counts);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn stored_chunks_without_data_are_not_copied() {
+		let destination = Uuid::new_v4();
+		// chunk counts some clients store: one for an empty file, a trailing empty chunk
+		let empty = source_file_with_chunks("empty", 0, 1);
+		let full = source_file_with_chunks("full", CHUNK_SIZE_U64, 2);
+		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let plan = plan(
+			destination,
+			vec![
+				PlanSource::File(empty.clone()),
+				PlanSource::File(full.clone()),
+			],
+		);
+		let (running, _recorder, reporter) = start(&backend, plan, JobControl::default());
+		running.await.unwrap().result.unwrap();
+
+		assert_released(&backend, &reporter);
+		let log = backend.log();
+		assert_eq!(
+			log.fetched,
+			vec![(full.uuid(), 0)],
+			"only chunks holding data are read"
+		);
+		assert_eq!(
+			log.uploaded.len(),
+			1,
+			"only chunks holding data are written"
+		);
+		for (source, chunks) in [(&empty, 0), (&full, 1)] {
+			let (_, completion) = log
+				.finished
+				.values()
+				.find(|(name, _)| name == source.name().unwrap())
+				.unwrap();
+			assert_eq!(completion.num_chunks, chunks);
+			assert_eq!(completion.written, source.size());
+		}
 	}
 
 	async fn copy_many(memory_chunks: usize, files: usize, chunks_per_file: u64) {
