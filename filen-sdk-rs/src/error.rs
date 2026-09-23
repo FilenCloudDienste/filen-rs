@@ -70,7 +70,31 @@ impl From<filen_types::error::ConversionError> for Error {
 		crate::crypto::error::ConversionError::from(e).into()
 	}
 }
-impl_from!(std::io::Error, ErrorKind::IO);
+// `AsyncRead`/`AsyncWrite` impls (`FileReader`, `FileWriter`) can only surface `io::Error`, so
+// an SDK error crossing one travels inside it. Unwrap it here so it keeps its kind
+// (`MaxStorageReached`, `Reqwest`, ...) instead of collapsing to `IO`.
+impl From<std::io::Error> for Error {
+	fn from(e: std::io::Error) -> Self {
+		let wraps = |inner: &(dyn std::error::Error + Send + Sync + 'static)| {
+			inner.is::<FilenSdkError>() || inner.is::<std::io::Error>()
+		};
+		if !e.get_ref().is_some_and(wraps) {
+			return FilenSdkError {
+				kind: ErrorKind::IO,
+				inner: Some(Box::new(e)),
+				context: None,
+			};
+		}
+		let inner = e.into_inner().expect("checked by `wraps` above");
+		match inner.downcast::<FilenSdkError>() {
+			Ok(sdk_error) => *sdk_error,
+			Err(inner) => match inner.downcast::<std::io::Error>() {
+				Ok(io_error) => Self::from(*io_error),
+				Err(_) => unreachable!("checked by `wraps` above"),
+			},
+		}
+	}
+}
 impl_from!(serde_json::Error, ErrorKind::Response);
 impl_from!(rmp_serde::decode::Error, ErrorKind::Response);
 impl_from!(ImageError, ErrorKind::ImageError);
@@ -545,6 +569,33 @@ mod tests {
 			Err(io::Error::new(io::ErrorKind::NotFound, "not the SDK kind"));
 		let propagated = r.optional().unwrap_err();
 		assert_eq!(propagated.kind(), ErrorKind::IO);
+	}
+
+	#[test]
+	fn sdk_error_keeps_its_kind_through_an_io_error() {
+		let io = io::Error::other(Error::custom(ErrorKind::MaxStorageReached, "quota"));
+		assert_eq!(Error::from(io).kind(), ErrorKind::MaxStorageReached);
+	}
+
+	#[test]
+	fn sdk_error_keeps_its_kind_through_nested_io_errors() {
+		let inner = io::Error::other(Error::custom(ErrorKind::Reqwest, "network"));
+		let outer = io::Error::other(inner);
+		assert_eq!(Error::from(outer).kind(), ErrorKind::Reqwest);
+	}
+
+	#[test]
+	fn plain_io_error_maps_to_io_kind() {
+		let err = Error::from(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+		assert_eq!(err.kind(), ErrorKind::IO);
+		assert_eq!(
+			err.downcast_ref::<io::Error>().map(io::Error::kind),
+			Some(io::ErrorKind::PermissionDenied)
+		);
+		// A non-SDK payload stays wrapped, with its io kind intact.
+		let wrapped = Error::from(io::Error::other(std::fmt::Error));
+		assert_eq!(wrapped.kind(), ErrorKind::IO);
+		assert!(wrapped.downcast_ref::<io::Error>().is_some());
 	}
 
 	#[test]

@@ -320,9 +320,7 @@ where
 						}
 					}
 					std::task::Poll::Ready(Some(Err(e))) => {
-						break 'compute std::task::Poll::Ready(Err(std::io::Error::other(
-							e.to_string(),
-						)));
+						break 'compute std::task::Poll::Ready(Err(std::io::Error::other(e)));
 					}
 					std::task::Poll::Ready(None) => {
 						if should_pend && written == 0 {
@@ -365,7 +363,7 @@ where
 			match self.futures.poll_next_unpin(cx) {
 				std::task::Poll::Ready(Some(Ok(_))) => {}
 				std::task::Poll::Ready(Some(Err(e))) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())));
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
 				}
 				std::task::Poll::Ready(None) => break,
 				std::task::Poll::Pending => {
@@ -505,9 +503,7 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 	) -> std::task::Poll<std::io::Result<Arc<ResourceLock>>> {
 		match self.lock_and_confirm_upload_future.poll_unpin(cx) {
 			std::task::Poll::Ready(Ok((res, _))) => std::task::Poll::Ready(Ok(res)),
-			std::task::Poll::Ready(Err(e)) => {
-				std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
-			}
+			std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
 			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
 	}
@@ -529,9 +525,7 @@ impl<'a> FileWriterCompletingState<'a> {
 		cx: &mut std::task::Context<'_>,
 	) -> std::task::Poll<std::io::Result<filen_types::api::v3::upload::empty::Response>> {
 		match self.future.poll_unpin(cx) {
-			std::task::Poll::Ready(Err(e)) => {
-				std::task::Poll::Ready(Err(std::io::Error::other(e.to_string())))
-			}
+			std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
 			std::task::Poll::Ready(Ok(response)) => std::task::Poll::Ready(Ok(response)),
 			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
@@ -779,7 +773,7 @@ where
 						}
 					}
 					std::task::Poll::Ready(Err(e)) => {
-						return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+						return std::task::Poll::Ready(Err(e));
 					}
 					std::task::Poll::Pending => {
 						self.state = FileWriterState::Uploading(uploading);
@@ -799,7 +793,7 @@ where
 					}
 				}
 				std::task::Poll::Ready(Err(e)) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+					return std::task::Poll::Ready(Err(e));
 				}
 				std::task::Poll::Pending => {
 					self.state = FileWriterState::WaitingForDriveLock(waiting);
@@ -819,7 +813,7 @@ where
 					FileWriterState::Finalizing(completing.into_finalizing_state(response))
 				}
 				std::task::Poll::Ready(Err(e)) => {
-					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+					return std::task::Poll::Ready(Err(e));
 				}
 				std::task::Poll::Pending => {
 					self.state = FileWriterState::Completing(completing);
