@@ -1097,6 +1097,111 @@ async fn copy_with_shares(
 		);
 	}
 
+	// One call mixing every source kind, into one destination: the copier's own file and
+	// directory, a directory shared with it, and a directory read through a public link.
+	let mine = share_client
+		.create_dir(&share_test_dir.into(), "mine")
+		.await
+		.unwrap();
+	let mine_inside = upload(&share_client, &mine, "mine.txt", b"the copier's own").await;
+	let mine_file = upload(&share_client, share_test_dir, "mine-file.txt", b"own file").await;
+	let own_link: DirPublicLink = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&own, None)
+		.await
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let own_info = share_client
+		.get_unauthed()
+		.get_dir_public_link_info(*own_link.uuid(), &own_link.key_string())
+		.await
+		.unwrap();
+	let (in_dirs, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let shared_in = in_dirs
+		.iter()
+		.find(|d| d.get_dir().uuid() == shared.uuid())
+		.unwrap()
+		.clone();
+	let role = shared_in.sharing_role().clone();
+	let mixed = share_client
+		.create_dir(&share_test_dir.into(), "mixed")
+		.await
+		.unwrap();
+	let outcome = copy(
+		&share_client,
+		vec![
+			CopySource::File(mine_file.clone().into()),
+			CopySource::Dir(CopySourceDir::Normal(mine.clone())),
+			CopySource::Dir(CopySourceDir::Shared(
+				DirType::Root(Cow::Owned(shared_in)),
+				role,
+			)),
+			CopySource::Dir(CopySourceDir::Linked(
+				DirType::Root(Cow::Owned(own_info.root.clone())),
+				own_info.link.clone(),
+			)),
+		],
+		&mixed,
+	)
+	.await;
+	outcome.result.unwrap();
+	let report = &outcome.report;
+	assert!(report.failures.is_empty());
+	assert!(report.skipped.is_empty());
+	let mut top_names: Vec<&str> = report
+		.top_level
+		.iter()
+		.map(|t| t.item.name().unwrap())
+		.collect();
+	top_names.sort_unstable();
+	assert_eq!(top_names, ["mine", "mine-file.txt", "own", "shared"]);
+	let (counts, totals) = (report.counts, report.totals);
+	assert_eq!((counts.dirs_created, counts.dirs_failed), (totals.dirs, 0));
+	assert_eq!((counts.files_done, counts.files_failed), (totals.files, 0));
+	assert_eq!((counts.bytes_done, counts.bytes_failed), (totals.bytes, 0));
+	assert_eq!(
+		(
+			counts.dirs_not_attempted,
+			counts.files_not_attempted,
+			counts.bytes_not_attempted
+		),
+		(0, 0, 0)
+	);
+	// mine, shared, shared/nested, own
+	assert_eq!(totals.dirs, 4);
+	// mine-file.txt, mine/mine.txt, shared/top.txt, shared/nested/deep.bin, own/own.txt
+	assert_eq!(totals.files, 5);
+	let (_, copied) = contents(&share_client, &mixed).await;
+	let mut paths: Vec<&str> = copied.iter().map(|(p, _)| p.as_str()).collect();
+	paths.sort_unstable();
+	assert_eq!(
+		paths,
+		[
+			"mine-file.txt",
+			"mine/mine.txt",
+			"own/own.txt",
+			"shared/nested/deep.bin",
+			"shared/top.txt",
+		]
+	);
+	for (path, original, owner) in [
+		("mine-file.txt", &mine_file, &share_client),
+		("mine/mine.txt", &mine_inside, &share_client),
+		("own/own.txt", &own_file, &client),
+		("shared/nested/deep.bin", &deep, &client),
+		("shared/top.txt", &top, &client),
+	] {
+		let (_, copy) = copied.iter().find(|(p, _)| p == path).unwrap();
+		assert_eq!(
+			share_client.download_file(copy).await.unwrap(),
+			owner.download_file(original).await.unwrap(),
+			"{path} has the same contents"
+		);
+	}
+
 	// Shared (and linked) destinations: a copy into the shared directory and one into a
 	// directory below it both reach the other account and the public link.
 	for destination in [&dest, &inner] {
