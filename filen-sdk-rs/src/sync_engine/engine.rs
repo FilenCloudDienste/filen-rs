@@ -676,8 +676,9 @@ impl PendingWrites {
 		);
 	}
 
-	/// The uuids currently journalled, for diffing what a [`settle`](Self::settle) retired.
-	fn uuids(&self) -> std::collections::HashSet<Uuid> {
+	/// The uuids currently journalled, for diffing what a [`settle`](Self::settle) retired — and for
+	/// the probe, which has to show that the record it is timing a fold over is actually there.
+	pub(super) fn uuids(&self) -> std::collections::HashSet<Uuid> {
 		self.map().keys().copied().collect()
 	}
 
@@ -1383,7 +1384,7 @@ struct PairCarry {
 /// was replaced by an observed node". Outside those bounds the assembly dropped paths that no
 /// observation asked it to drop — risk #1 of the plan, and the shape that fabricates an absence —
 /// so the pass reads both sides instead of planning from it.
-fn assembly_accounted(
+pub(super) fn assembly_accounted(
 	baseline: &Baseline,
 	derived: &Derived,
 	observed: &LocalObservations,
@@ -3186,7 +3187,7 @@ impl SyncEngine {
 		// phase, which timed `from_baseline -> observe_local -> merge_local -> fold_dir_moves ->
 		// reconcile` and stopped. They stand as a RATIO — both halves measured the same phase —
 		// and must not be set beside the 50 ms target, which the docs read off the wider
-		// `prepare_scoped_*` rows: 395.2 is not comparable with the 2114.2 ms recorded there.
+		// `scoped_twoway_*` rows: 395.2 is not comparable with what those record.
 		// Paying 7x the phase to re-derive what the producers already recorded is the wrong trade
 		// for a shipped pass.
 		//
