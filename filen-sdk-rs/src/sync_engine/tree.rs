@@ -541,6 +541,23 @@ impl Baseline {
 		at
 	}
 
+	/// The path of every ROW whose path folds to `rel_path`, under whatever spelling — the
+	/// EXACT-key form of [`occupied`](Self::occupied), which answers for the subtree as well.
+	///
+	/// Normally empty or one path: more than one only where a directory on the way down holds two
+	/// spellings of the same name. What asks is the narrowed collision check of a change-scoped
+	/// pass, per path it decided, where scanning the view's every key is the cost being removed.
+	pub(super) fn folded_row_paths(&self, rel_path: &str) -> Vec<String> {
+		if rel_path.is_empty() {
+			return Vec::new();
+		}
+		self.folded_nodes(rel_path)
+			.into_iter()
+			.filter(|&id| self.is_row(id))
+			.map(|id| self.path_of(id))
+			.collect()
+	}
+
 	/// Whether the baseline still tracks anything at `rel_path`, or — for a directory — under it.
 	///
 	/// This is what decides whether an ignore rule's hit is a ROOT the pass records, reports and
