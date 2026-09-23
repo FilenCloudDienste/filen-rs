@@ -69,20 +69,35 @@ pub(crate) async fn encrypt_and_upload_chunk<'a>(
 	file: &BaseFile,
 	upload_key: &str,
 	chunk_idx: u64,
-	mut chunk: Chunk<'a>,
+	chunk: Chunk<'a>,
 ) -> Result<(Chunk<'a>, RemoteFileInfo), Error> {
-	let len = chunk.as_ref().len() as u64;
+	let (data, permit) = chunk.into_parts();
+	let (data, info) =
+		encrypt_and_upload_chunk_data(client, file, upload_key, chunk_idx, data).await?;
+	Ok((Chunk::from_parts(data, permit), info))
+}
+
+/// [`encrypt_and_upload_chunk`] for a caller that accounts for the chunk's memory itself.
+/// Encryption runs on the CPU pool.
+pub(crate) async fn encrypt_and_upload_chunk_data(
+	client: &Client,
+	file: &BaseFile,
+	upload_key: &str,
+	chunk_idx: u64,
+	mut data: Vec<u8>,
+) -> Result<(Vec<u8>, RemoteFileInfo), Error> {
+	let len = data.len() as u64;
 	debug_assert!(
 		len <= CHUNK_SIZE_U64,
 		"Chunk size exceeded {CHUNK_SIZE_U64}: {len}"
 	);
-	{
+	do_cpu_intensive(|| {
 		let _span = tracing::debug_span!("upload_encrypt_chunk", chunk_idx, len).entered();
-		file.key().blocking_encrypt_data(chunk.as_mut())?;
-	}
+		file.key().blocking_encrypt_data(&mut data)
+	})
+	.await?;
 
-	let (chunk_bytes, permit) = chunk.into_parts();
-	let chunk_bytes: Bytes = chunk_bytes.into();
+	let chunk_bytes: Bytes = data.into();
 	let result = api::v3::upload::upload_file_chunk(
 		client.client(),
 		file,
@@ -95,9 +110,9 @@ pub(crate) async fn encrypt_and_upload_chunk<'a>(
 		region: result.region.into_owned(),
 		bucket: result.bucket.into_owned(),
 	};
-	let mut chunk_bytes: Vec<u8> = chunk_bytes.into();
-	chunk_bytes.clear();
-	Ok((Chunk::from_parts(chunk_bytes, permit), info))
+	let mut data: Vec<u8> = chunk_bytes.into();
+	data.clear();
+	Ok((data, info))
 }
 
 /// Everything finalizing an upload needs once all of its chunks are on the server.

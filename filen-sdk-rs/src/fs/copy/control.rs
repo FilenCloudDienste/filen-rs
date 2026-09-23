@@ -8,7 +8,7 @@
 use std::{future::Future, sync::Arc};
 
 use futures::{StreamExt, stream::FuturesUnordered};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 
 use crate::{
 	consts::MAX_SMALL_PARALLEL_REQUESTS,
@@ -106,6 +106,19 @@ impl JobControl {
 		}
 	}
 
+	/// Resolves once the pause request is no longer `paused`; never, if it cannot change.
+	pub(crate) async fn pause_changed(&self, paused: bool) {
+		match self.inner.pause.clone() {
+			Some(mut pause) => {
+				// a dropped sender leaves the job unpaused for good
+				if pause.wait_for(|current| *current != paused).await.is_err() && !paused {
+					std::future::pending::<()>().await;
+				}
+			}
+			None => std::future::pending::<()>().await,
+		}
+	}
+
 	/// Resolves once no pause is requested; never, while paused forever.
 	async fn resumed(&self) {
 		if let Some(mut pause) = self.inner.pause.clone() {
@@ -137,43 +150,6 @@ impl JobControl {
 			() = self.stopping() => Err(Stopped),
 			out = fut => Ok(out),
 		}
-	}
-}
-
-/// Caps a job's concurrent operations. A permit is only handed out while the job is running.
-#[derive(Debug, Clone)]
-pub(crate) struct OperationLimiter {
-	semaphore: Arc<Semaphore>,
-}
-
-impl OperationLimiter {
-	pub(crate) fn new(max_operations: usize) -> Self {
-		Self {
-			semaphore: Arc::new(Semaphore::new(max_operations.max(1))),
-		}
-	}
-
-	/// Waits for a free slot and for the job to be running. A pause that starts while waiting
-	/// for a slot gives the slot back until the job resumes, so a paused job holds none.
-	pub(crate) async fn acquire(
-		&self,
-		control: &JobControl,
-	) -> Result<OwnedSemaphorePermit, Stopped> {
-		loop {
-			control.checkpoint().await?;
-			let permit = control
-				.until_stopping(self.semaphore.clone().acquire_owned())
-				.await?
-				.expect("the semaphore is never closed");
-			if !control.is_pause_requested() {
-				return Ok(permit);
-			}
-		}
-	}
-
-	#[cfg(test)]
-	pub(crate) fn available(&self) -> usize {
-		self.semaphore.available_permits()
 	}
 }
 
@@ -306,6 +282,26 @@ mod tests {
 		assert_eq!(waiter.await.unwrap(), Err(Stopped));
 	}
 
+	#[tokio::test(start_paused = true)]
+	async fn pause_changes_are_observed() {
+		let (pause, _cancel, control) = controlled();
+		let changed = tokio::spawn({
+			let control = control.clone();
+			async move { control.pause_changed(false).await }
+		});
+		tokio::time::sleep(Duration::from_secs(1)).await;
+		assert!(!changed.is_finished());
+		pause.send_replace(true);
+		changed.await.unwrap();
+
+		let resumed = tokio::spawn({
+			let control = control.clone();
+			async move { control.pause_changed(true).await }
+		});
+		drop(pause);
+		resumed.await.unwrap();
+	}
+
 	#[tokio::test]
 	async fn dropped_controllers_neither_pause_nor_cancel() {
 		let (pause, cancel, control) = controlled();
@@ -335,60 +331,6 @@ mod tests {
 		cancel.send_replace(true);
 		assert_eq!(run.await.unwrap(), Err(Stopped));
 		assert!(dropped.load(Ordering::SeqCst));
-	}
-
-	#[tokio::test]
-	async fn limiter_caps_concurrent_operations() {
-		let control = JobControl::default();
-		let limiter = OperationLimiter::new(2);
-		let first = limiter.acquire(&control).await.unwrap();
-		let _second = limiter.acquire(&control).await.unwrap();
-		assert_eq!(limiter.available(), 0);
-		let third = tokio::spawn({
-			let (limiter, control) = (limiter.clone(), control.clone());
-			async move { limiter.acquire(&control).await.map(|_| ()) }
-		});
-		tokio::task::yield_now().await;
-		assert!(!third.is_finished());
-		drop(first);
-		assert_eq!(third.await.unwrap(), Ok(()));
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn a_paused_job_waiting_for_a_slot_holds_none() {
-		let (pause, _cancel, control) = controlled();
-		let limiter = OperationLimiter::new(1);
-		let held = limiter.acquire(&control).await.unwrap();
-		let waiter = tokio::spawn({
-			let (limiter, control) = (limiter.clone(), control.clone());
-			async move { limiter.acquire(&control).await.map(|_| ()) }
-		});
-		tokio::task::yield_now().await;
-		pause.send_replace(true);
-		drop(held);
-		tokio::time::sleep(Duration::from_secs(1)).await;
-		assert!(!waiter.is_finished(), "no slot is handed out while paused");
-		assert_eq!(
-			limiter.available(),
-			1,
-			"the paused waiter gave its slot back"
-		);
-		pause.send_replace(false);
-		assert_eq!(waiter.await.unwrap(), Ok(()));
-	}
-
-	#[tokio::test]
-	async fn limiter_gives_up_when_stopped() {
-		let (_pause, cancel, control) = controlled();
-		let limiter = OperationLimiter::new(1);
-		let _held = limiter.acquire(&control).await.unwrap();
-		let waiter = tokio::spawn({
-			let (limiter, control) = (limiter.clone(), control.clone());
-			async move { limiter.acquire(&control).await.map(|_| ()) }
-		});
-		tokio::task::yield_now().await;
-		cancel.send_replace(true);
-		assert_eq!(waiter.await.unwrap(), Err(Stopped));
 	}
 
 	#[test]

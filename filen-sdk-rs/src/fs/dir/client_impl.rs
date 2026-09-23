@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use filen_types::traits::CowHelpers;
@@ -75,6 +75,42 @@ impl Client {
 		self.update_item_with_maybe_connected_parent((&dir).into())
 			.await?;
 		Ok(dir)
+	}
+
+	/// Creates `name` in `parent` under a caller-chosen `uuid`, without taking the drive lock
+	/// or propagating to the parent's links and shares (the copy engine does both itself).
+	pub(crate) async fn create_dir_for_copy(
+		&self,
+		parent: Uuid,
+		uuid: Uuid,
+		name: &ValidatedName,
+		created: DateTime<Utc>,
+	) -> Result<crate::fs::copy::engine::CreatedDir, Error> {
+		use crate::fs::copy::engine::CreatedDir;
+
+		let meta = super::meta::DecryptedDirectoryMeta {
+			name: Cow::Owned(name.as_ref().to_owned()),
+			created: Some(created.round_subsecs(3)),
+		};
+		let response = api::v3::dir::create::post(
+			self.client(),
+			&api::v3::dir::create::Request {
+				uuid,
+				parent,
+				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
+				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
+			},
+		)
+		.await?;
+		if response.uuid != uuid {
+			return Ok(CreatedDir::Merged(response.uuid));
+		}
+		Ok(CreatedDir::Created(RemoteDirectory::new_from_parts(
+			uuid,
+			meta,
+			parent.into(),
+			response.timestamp,
+		)))
 	}
 
 	pub async fn create_dir_with_created(

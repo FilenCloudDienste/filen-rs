@@ -26,25 +26,29 @@ use super::naming::{TakenNames, validated_name};
 
 /// A source directory, independent of the category it was listed from.
 #[derive(Debug, Clone)]
-pub(crate) struct SourceDir {
+pub(crate) struct SourceDir<D = ()> {
 	pub(crate) uuid: Uuid,
 	/// `None` when the metadata could not be decrypted.
 	pub(crate) name: Option<String>,
 	pub(crate) created: Option<DateTime<Utc>>,
 	/// Shared-in listings carry no color; they report [`DirColor::Default`].
 	pub(crate) color: DirColor<'static>,
+	/// Whatever the caller needs to address this directory again (to retry a failed copy).
+	pub(crate) handle: D,
 }
 
-impl SourceDir {
+impl<D> SourceDir<D> {
 	pub(crate) fn new(
 		dir: &(impl HasUUID + HasName + HasDirInfo),
 		color: DirColor<'static>,
+		handle: D,
 	) -> Self {
 		Self {
 			uuid: dir.uuid(),
 			name: dir.name().map(str::to_owned),
 			created: dir.created(),
 			color,
+			handle,
 		}
 	}
 }
@@ -57,18 +61,18 @@ pub(crate) struct Listed<T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum PlanSource {
+pub(crate) enum PlanSource<D = ()> {
 	File(RemoteFileType<'static>),
 	Dir {
-		root: SourceDir,
-		dirs: Vec<Listed<SourceDir>>,
+		root: SourceDir<D>,
+		dirs: Vec<Listed<SourceDir<D>>>,
 		files: Vec<Listed<RemoteFileType<'static>>>,
 	},
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlanRequest {
-	pub(crate) source: PlanSource,
+pub(crate) struct PlanRequest<D = ()> {
+	pub(crate) source: PlanSource<D>,
 	/// The existing directory the source is copied into.
 	pub(crate) destination: Uuid,
 	/// Name to use instead of the source's (still subject to keep-both).
@@ -84,7 +88,9 @@ pub(crate) enum DestParent {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedDir {
+pub(crate) struct PlannedDir<D = ()> {
+	/// Index of the request this directory belongs to.
+	pub(crate) request: usize,
 	pub(crate) source_uuid: Uuid,
 	/// Chosen up front so the item can be reported before it exists.
 	pub(crate) dest_uuid: Uuid,
@@ -98,10 +104,13 @@ pub(crate) struct PlannedDir {
 	pub(crate) descendant_dirs: u64,
 	pub(crate) descendant_files: u64,
 	pub(crate) descendant_bytes: u64,
+	pub(crate) handle: D,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedFile {
+	/// Index of the request this file belongs to.
+	pub(crate) request: usize,
 	pub(crate) source: RemoteFileType<'static>,
 	/// Chosen up front so the item can be reported before it exists.
 	pub(crate) dest_uuid: Uuid,
@@ -167,10 +176,10 @@ pub(crate) struct PlanTotals {
 	pub(crate) bytes: u64,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct CopyPlan {
+#[derive(Debug)]
+pub(crate) struct CopyPlan<D = ()> {
 	/// Parent first: every directory comes after the directory it is created in.
-	pub(crate) dirs: Vec<PlannedDir>,
+	pub(crate) dirs: Vec<PlannedDir<D>>,
 	pub(crate) files: Vec<PlannedFile>,
 	pub(crate) top_level: Vec<PlannedTopLevel>,
 	pub(crate) skipped: Vec<SkippedEntry>,
@@ -178,6 +187,19 @@ pub(crate) struct CopyPlan {
 	/// course and are reported through [`CopyPlan::top_level`].
 	pub(crate) renamed: Vec<RenamedEntry>,
 	pub(crate) totals: PlanTotals,
+}
+
+impl<D> Default for CopyPlan<D> {
+	fn default() -> Self {
+		Self {
+			dirs: Vec::new(),
+			files: Vec::new(),
+			top_level: Vec::new(),
+			skipped: Vec::new(),
+			renamed: Vec::new(),
+			totals: PlanTotals::default(),
+		}
+	}
 }
 
 /// Builds a [`CopyPlan`]. Every destination must be registered with the names it already holds
@@ -199,7 +221,7 @@ impl CopyPlanner {
 
 	/// Validates every request before planning any: a directory cannot be copied into itself
 	/// or one of its descendants.
-	pub(crate) fn plan(mut self, requests: Vec<PlanRequest>) -> Result<CopyPlan, Error> {
+	pub(crate) fn plan<D>(mut self, requests: Vec<PlanRequest<D>>) -> Result<CopyPlan<D>, Error> {
 		for request in &requests {
 			if !self.destinations.contains_key(&request.destination) {
 				return Err(Error::custom(
@@ -231,9 +253,15 @@ impl CopyPlanner {
 						.name()
 						.map(str::to_owned)
 						.unwrap_or_else(|| file.uuid().to_string());
-					if let Some(file) =
-						plan.plan_file(file, parent, request.name.as_deref(), taken, path, true)
-					{
+					if let Some(file) = plan.plan_file(
+						index,
+						file,
+						parent,
+						request.name.as_deref(),
+						taken,
+						path,
+						true,
+					) {
 						plan.top_level.push(PlannedTopLevel {
 							request: index,
 							item: PlannedItem::File(file),
@@ -241,8 +269,15 @@ impl CopyPlanner {
 					}
 				}
 				PlanSource::Dir { root, dirs, files } => {
-					let dir =
-						plan.plan_tree(root, dirs, files, parent, request.name.as_deref(), taken);
+					let dir = plan.plan_tree(
+						index,
+						root,
+						dirs,
+						files,
+						parent,
+						request.name.as_deref(),
+						taken,
+					);
 					plan.top_level.push(PlannedTopLevel {
 						request: index,
 						item: PlannedItem::Dir(dir),
@@ -303,10 +338,12 @@ fn report_rename(reason: Option<RenameReason>, top_level: bool) -> Option<Rename
 	reason.filter(|reason| !top_level || *reason != RenameReason::DuplicateName)
 }
 
-impl CopyPlan {
+impl<D> CopyPlan<D> {
 	/// Plans `file` into `parent`, or records it as skipped when it cannot be read.
+	#[allow(clippy::too_many_arguments)]
 	fn plan_file(
 		&mut self,
+		request: usize,
 		file: RemoteFileType<'static>,
 		parent: DestParent,
 		preferred: Option<&str>,
@@ -335,6 +372,7 @@ impl CopyPlan {
 			});
 		}
 		self.files.push(PlannedFile {
+			request,
 			size: file.size(),
 			source: file,
 			dest_uuid: Uuid::new_v4(),
@@ -345,9 +383,11 @@ impl CopyPlan {
 		Some(self.files.len() - 1)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn push_dir(
 		&mut self,
-		dir: SourceDir,
+		request: usize,
+		dir: SourceDir<D>,
 		parent: DestParent,
 		preferred: Option<&str>,
 		taken: &mut TakenNames,
@@ -365,6 +405,7 @@ impl CopyPlan {
 			});
 		}
 		self.dirs.push(PlannedDir {
+			request,
 			source_uuid: dir.uuid,
 			dest_uuid: Uuid::new_v4(),
 			parent,
@@ -375,16 +416,19 @@ impl CopyPlan {
 			descendant_dirs: 0,
 			descendant_files: 0,
 			descendant_bytes: 0,
+			handle: dir.handle,
 		});
 		self.dirs.len() - 1
 	}
 
 	/// Plans a source directory and everything reachable below it, breadth first so parents
 	/// always precede their children. Returns the index of the planned root.
+	#[allow(clippy::too_many_arguments)]
 	fn plan_tree(
 		&mut self,
-		root: SourceDir,
-		dirs: Vec<Listed<SourceDir>>,
+		request: usize,
+		root: SourceDir<D>,
+		dirs: Vec<Listed<SourceDir<D>>>,
 		files: Vec<Listed<RemoteFileType<'static>>>,
 		parent: DestParent,
 		preferred: Option<&str>,
@@ -394,7 +438,7 @@ impl CopyPlan {
 		let root_uuid = root.uuid;
 
 		// children by parent uuid, keeping listing order
-		let mut child_dirs: HashMap<Uuid, Vec<SourceDir>> = HashMap::new();
+		let mut child_dirs: HashMap<Uuid, Vec<SourceDir<D>>> = HashMap::new();
 		let total_listed_dirs = dirs.len();
 		for listed in dirs {
 			child_dirs
@@ -410,7 +454,7 @@ impl CopyPlan {
 				.push(listed.item);
 		}
 
-		let root_index = self.push_dir(root, parent, preferred, taken, root_path, true);
+		let root_index = self.push_dir(request, root, parent, preferred, taken, root_path, true);
 		let mut visited = HashSet::with_capacity(total_listed_dirs + 1);
 		visited.insert(root_uuid);
 		let mut queue = VecDeque::from([(root_uuid, root_index)]);
@@ -428,7 +472,8 @@ impl CopyPlan {
 					"{path}/{}",
 					dir.name.clone().unwrap_or_else(|| dir.uuid.to_string())
 				);
-				let index = self.push_dir(dir, parent, None, &mut taken, child_path, false);
+				let index =
+					self.push_dir(request, dir, parent, None, &mut taken, child_path, false);
 				queue.push_back((dir_uuid, index));
 			}
 			for file in child_files.remove(&source_uuid).unwrap_or_default() {
@@ -438,7 +483,7 @@ impl CopyPlan {
 						.map(str::to_owned)
 						.unwrap_or_else(|| file.uuid().to_string())
 				);
-				self.plan_file(file, parent, None, &mut taken, child_path, false);
+				self.plan_file(request, file, parent, None, &mut taken, child_path, false);
 			}
 		}
 
@@ -513,6 +558,7 @@ mod tests {
 			name: name.map(str::to_owned),
 			created: Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
 			color: DirColor::Blue,
+			handle: (),
 		}
 	}
 

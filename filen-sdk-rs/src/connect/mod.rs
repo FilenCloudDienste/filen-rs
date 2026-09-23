@@ -349,6 +349,7 @@ async fn drain_collecting_errors(
 }
 
 /// A public link a directory belongs to, with its key decrypted.
+#[derive(Clone)]
 pub(crate) struct ConnectedLink {
 	link: ListedPublicLink<'static>,
 	crypter: MetaKey,
@@ -357,7 +358,7 @@ pub(crate) struct ConnectedLink {
 /// The public links and shared users that items created inside a directory must be
 /// propagated to. New items inherit their parent's links and shares, so one snapshot of the
 /// destination covers every item created below it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ConnectedTargets {
 	links: Vec<ConnectedLink>,
 	users: Vec<SharedUser<'static>>,
@@ -367,6 +368,47 @@ impl ConnectedTargets {
 	/// True when the directory has no usable link and no share, so nothing needs propagating.
 	pub(crate) fn is_empty(&self) -> bool {
 		self.links.is_empty() && self.users.is_empty()
+	}
+
+	/// The links and users in `self` but not in `other`.
+	pub(crate) fn without(&self, other: &Self) -> Self {
+		Self {
+			links: self
+				.links
+				.iter()
+				.filter(|link| {
+					!other
+						.links
+						.iter()
+						.any(|o| o.link.link_uuid == link.link.link_uuid)
+				})
+				.cloned()
+				.collect(),
+			users: self
+				.users
+				.iter()
+				.filter(|user| !other.users.iter().any(|o| o.id == user.id))
+				.cloned()
+				.collect(),
+		}
+	}
+
+	/// Targets with `users` shared users (ids `1..=users`) and no links.
+	#[cfg(test)]
+	pub(crate) fn with_test_users(users: u64) -> Self {
+		let key = rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
+			.unwrap()
+			.to_public_key();
+		Self {
+			links: Vec::new(),
+			users: (1..=users)
+				.map(|id| SharedUser {
+					id,
+					email: Cow::Owned(format!("user{id}@example.com")),
+					public_key: key.clone(),
+				})
+				.collect(),
+		}
 	}
 
 	/// One operation per (link, item) and (user, item) pair: links first, then users.
@@ -1251,6 +1293,24 @@ mod tests {
 			users: vec![test_user(1)],
 		};
 		assert!(!with_user.is_empty());
+	}
+
+	#[test]
+	fn without_keeps_only_new_links_and_users() {
+		let link = test_link();
+		let old = ConnectedTargets {
+			links: vec![link.clone()],
+			users: vec![test_user(1)],
+		};
+		let new = ConnectedTargets {
+			links: vec![link, test_link()],
+			users: vec![test_user(1), test_user(2)],
+		};
+		let added = new.without(&old);
+		assert_eq!(added.links.len(), 1);
+		assert_eq!(added.links[0].link.link_uuid, new.links[1].link.link_uuid);
+		assert_eq!(added.users.iter().map(|u| u.id).collect::<Vec<_>>(), [2]);
+		assert!(old.without(&new).is_empty());
 	}
 
 	#[test]

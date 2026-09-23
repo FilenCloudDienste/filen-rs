@@ -123,6 +123,17 @@ pub(crate) async fn fetch_decrypted_chunk<'a>(
 	progress: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<Chunk<'a>, Error> {
 	let (_, permits) = out_data.into_parts();
+	let data = fetch_decrypted_chunk_data(client, file, chunk_idx, progress).await?;
+	Ok(Chunk::from_parts(data, permits))
+}
+
+/// [`fetch_decrypted_chunk`] for a caller that accounts for the chunk's memory itself.
+pub(crate) async fn fetch_decrypted_chunk_data(
+	client: &UnauthClient,
+	file: &dyn File,
+	chunk_idx: u64,
+	progress: Option<MaybeSendCallback<'_, u64>>,
+) -> Result<Vec<u8>, Error> {
 	let plaintext_len = file
 		.size()
 		.saturating_sub(chunk_idx * CHUNK_SIZE_U64)
@@ -144,13 +155,13 @@ pub(crate) async fn fetch_decrypted_chunk<'a>(
 			}
 		}
 	};
-	let data = api::download::download_file_chunk(client, file, chunk_idx, Some(&on_bytes)).await?;
-	let mut chunk = Chunk::from_parts(data, permits);
+	let mut data =
+		api::download::download_file_chunk(client, file, chunk_idx, Some(&on_bytes)).await?;
 	file.key()
 		.ok_or(MetadataWasNotDecryptedError)?
-		.decrypt_data(chunk.as_mut())
+		.decrypt_data(&mut data)
 		.await?;
-	Ok(chunk)
+	Ok(data)
 }
 
 /// Whether a file's advertised chunk count can be produced from its advertised size: the last
@@ -158,7 +169,7 @@ pub(crate) async fn fetch_decrypted_chunk<'a>(
 /// Remote metadata violating this would drive the chunk-size math out of range, so such
 /// readers refuse to read. A chunk count of zero is only consistent with a zero size (legacy
 /// empty files); with a nonzero size it would silently read as truncated-to-empty.
-fn chunks_consistent_with_size(chunks: u64, size: u64) -> bool {
+pub(crate) fn chunks_consistent_with_size(chunks: u64, size: u64) -> bool {
 	match chunks.checked_sub(1) {
 		None => size == 0,
 		Some(last_chunk_idx) => last_chunk_idx
