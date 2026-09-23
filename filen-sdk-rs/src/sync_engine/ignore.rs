@@ -409,7 +409,7 @@ pub(crate) struct RemoteRules {
 /// the view holds back as listed twice, unless a mode that only pulls ignores its directory anyway.
 pub(crate) async fn load_remote_rules<Fetch, Fut>(
 	mode: SyncMode,
-	view: &RemoteView,
+	candidates: RuleCandidates<'_>,
 	user: Option<IgnoreSource>,
 	local_has_file: impl Fn(&str) -> bool,
 	tracked: impl Fn(&str) -> bool,
@@ -420,6 +420,7 @@ where
 	Fetch: FnMut(Uuid) -> Fut,
 	Fut: Future<Output = Result<Vec<u8>, Error>>,
 {
+	let view = candidates.view;
 	let mut out = RemoteRules {
 		rules: IgnoreRules::new(user),
 		..RemoteRules::default()
@@ -434,11 +435,16 @@ where
 	let under_ignored = |rules: &IgnoreRules, dir: &str| {
 		!mode.pushes() && rules.ignored_root(dir, true, &mut HashMap::new()).is_some()
 	};
-	let mut candidates: Vec<(&str, &RemoteNode)> = view
-		.nodes
-		.values()
-		.filter(|node| node.kind == NodeKind::File)
-		.filter_map(|node| Some((rule_file_dir(&node.rel_path)?, node)))
+	// Deduplicated and ordered by the set, so a caller may name a path twice — a change-scoped
+	// pass offers the resident index AND the paths its delta moved, and a rule file that moved is
+	// in both — without the file being read, reported or blocked twice.
+	let named: BTreeSet<String> = candidates.paths.into_iter().collect();
+	let mut candidates: Vec<(&str, &RemoteNode)> = named
+		.iter()
+		.filter_map(|rel_path| {
+			let node = view.nodes.get(rel_path)?;
+			(node.kind == NodeKind::File).then_some((rule_file_dir(rel_path)?, node))
+		})
 		.collect();
 	candidates.sort_by_key(|(dir, _)| dir.matches('/').count() + usize::from(!dir.is_empty()));
 	for (dir, node) in candidates {
@@ -520,6 +526,29 @@ fn too_large() -> String {
 
 /// The root-relative directory a `.filenignore` at `rel_path` belongs to, or `None` for any other
 /// path.
+/// The `.filenignore` files a pass offers [`load_remote_rules`], and the view they sit in.
+///
+/// The two travel together because neither answers alone: the paths say WHICH nodes to consider,
+/// and only the caller knows the cheap way to name them; the view is what says whether each is
+/// still there, and what else the pass is holding back.
+pub(crate) struct RuleCandidates<'a> {
+	pub(crate) view: &'a RemoteView,
+	pub(crate) paths: Vec<String>,
+}
+
+/// Every path in `view` that IS a `.filenignore`, which is what a pass that read the remote WHOLE
+/// offers [`load_remote_rules`] as its candidate set: it has the map in hand and no index of it, so
+/// finding them costs the scan of a map it just built. A change-scoped pass has the opposite — no
+/// map worth scanning and an index that answers — and names them from
+/// [`Baseline::rule_file_rows`](super::tree::Baseline::rule_file_rows) instead.
+pub(crate) fn rule_file_paths(view: &RemoteView) -> Vec<String> {
+	view.nodes
+		.iter()
+		.filter(|(rel_path, node)| node.kind == NodeKind::File && rule_file_dir(rel_path).is_some())
+		.map(|(rel_path, _)| rel_path.clone())
+		.collect()
+}
+
 pub(crate) fn rule_file_dir(rel_path: &str) -> Option<&str> {
 	match rel_path.strip_suffix(FILENIGNORE)? {
 		"" => Some(""),
@@ -928,7 +957,10 @@ mod tests {
 		let mut fetched = Vec::new();
 		let rules = load_remote_rules(
 			mode,
-			view,
+			RuleCandidates {
+				view,
+				paths: rule_file_paths(view),
+			},
 			None,
 			|dir| on_disk.contains(&dir),
 			|dir| tracked.contains(&dir),

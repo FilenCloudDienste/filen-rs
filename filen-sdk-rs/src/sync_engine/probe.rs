@@ -45,7 +45,9 @@ use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	derive::{self, Derived},
 	engine::{PendingKind, PendingWrites, assembly_accounted},
-	ignore::{IgnoreRules, Origin, load_remote_rules, parse_user_ignore, rule_file_dir},
+	ignore::{
+		IgnoreRules, Origin, RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir,
+	},
 	observe,
 	plan::{self, PassHolds, RemoteNode, RemoteView},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
@@ -1028,9 +1030,25 @@ fn prepare_scoped(
 	let local_root = &fixture.root;
 	let cached: HashMap<Uuid, Arc<str>> = HashMap::new();
 	let (remote_rules, elapsed) = timed(|| {
+		// The candidate set the pass names: the resident index plus the rule files among the paths
+		// it decided (see `prepare_scoped`). What used to be timed here was `load_remote_rules`
+		// finding them by scanning the unfiltered view.
+		let rule_files: Vec<String> = baseline
+			.rule_file_rows()
+			.chain(
+				derived
+					.decided
+					.iter()
+					.filter(|path| rule_file_dir(path).is_some())
+					.cloned(),
+			)
+			.collect();
 		futures::executor::block_on(load_remote_rules(
 			mode,
-			&view,
+			RuleCandidates {
+				view: &view,
+				paths: rule_files,
+			},
 			Some(parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile")),
 			|dir| {
 				scan::rule_file_metadata(&local_root.join(dir))
@@ -1062,11 +1080,9 @@ fn prepare_scoped(
 		} else {
 			RuleFiles::Only(
 				baseline
-					.iter()
-					.filter(|entry| {
-						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
-					})
-					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+					.rule_file_rows()
+					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
 		}
