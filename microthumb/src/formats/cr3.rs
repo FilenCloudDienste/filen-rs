@@ -743,4 +743,69 @@ mod tests {
 		far.resize(80 * 1024, 0);
 		assert_eq!(orientation_of(cr3(Some(&far))), 1);
 	}
+
+	/// A source whose reads fail once they reach past `limit`, the way a
+	/// remote file's later chunks do when the network drops mid-file.
+	struct FailsPast(MemSource, u64);
+
+	impl ByteSource for FailsPast {
+		fn len(&self) -> u64 {
+			self.0.len()
+		}
+
+		fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+			if offset + buf.len() as u64 > self.1 {
+				return Err(std::io::Error::other("the network dropped"));
+			}
+			self.0.read_at(offset, buf)
+		}
+	}
+
+	/// A read that fails while the preview decodes says nothing about the
+	/// file: it has to reach the caller as the io error it is, which the SDK
+	/// retries, not as `OverBudget`, which it caches as "no thumbnail". The
+	/// preview is noise, so its entropy data runs well past the 8 KiB the JPEG
+	/// decoder reads up front, and the walk and the header reads all succeed.
+	#[test]
+	fn a_read_failure_in_the_preview_is_an_error_not_a_verdict() {
+		let mut state = 1u32;
+		let noise: Vec<u8> = (0..640 * 480 * 3)
+			.map(|_| {
+				state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+				(state >> 16) as u8
+			})
+			.collect();
+		let mut preview = Vec::new();
+		jpeg_encoder::Encoder::new(&mut preview, 80)
+			.encode(&noise, 640, 480, jpeg_encoder::ColorType::Rgb)
+			.expect("encode");
+		let mut prvw = vec![0u8; 16];
+		prvw.extend_from_slice(&preview);
+		let mut versioned = vec![0u8; 16];
+		versioned.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+		versioned.extend_from_slice(&boxed(b"PRVW", &prvw));
+		let mut file = boxed(b"ftyp", b"crx iso");
+		file.extend_from_slice(&boxed(b"uuid", &versioned));
+		let preview_at = (file.len() - preview.len()) as u64;
+		assert!(
+			preview.len() > 4 * 8192,
+			"the preview must outrun the reads ahead of the decode"
+		);
+
+		for allow_full_decode in [true, false] {
+			let spec = ThumbSpec {
+				allow_full_decode,
+				..ThumbSpec::new(256, 256, crate::DEFAULT_MEM_BUDGET)
+			};
+			let source = FailsPast(MemSource(file.clone()), preview_at + 8192);
+			match crate::generate(Box::new(source), &spec) {
+				Err(crate::ThumbError::Io(_)) => {}
+				Err(e) => panic!("full decode {allow_full_decode}: {e}"),
+				Ok(outcome) => panic!(
+					"full decode {allow_full_decode}: answered {:?} for a failed read",
+					outcome.thumbnail().map(|thumb| thumb.source)
+				),
+			}
+		}
+	}
 }

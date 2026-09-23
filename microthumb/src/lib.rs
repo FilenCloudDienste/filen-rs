@@ -500,9 +500,13 @@ pub fn generate(
 	// optimisation, the real decode is the contract. On a preview-only spec
 	// there IS no real decode behind it, and swallowing there would answer a
 	// settled `OverBudget` — "this file has no thumbnail", which callers cache
-	// as final — for what may be a transient read failure.
+	// as final — for what may be a transient read failure. A failed read is
+	// never swallowed at all: it says nothing about the image, and where the
+	// preview is all there is (a RAW's embedded JPEG) swallowing it answers
+	// that same settled `OverBudget`.
 	let preview = match prepared.embedded_preview(spec.mem_budget) {
 		Ok(preview) => preview,
+		Err(e @ ThumbError::Io(_)) => return Err(e),
 		Err(_) if spec.allow_full_decode => None,
 		Err(e) => return Err(e),
 	};
