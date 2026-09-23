@@ -95,3 +95,15 @@ PIX_FMT=yuv420p10le PROFILE=main10 grid grid-10bit-420.heic 120 90 64 48 ""
 # The same grid in 8-bit 4:2:0, as an iPhone writes its HEICs: the decode
 # charge follows the bit depth.
 PIX_FMT=yuv420p PROFILE=main grid grid-8bit.heic 120 90 64 48 ""
+
+# A container that lies: four tiles declared 64x64 whose bitstreams decode at
+# 1024x1024.
+tile "$work/big.hevc" 1024 1024 red 0 0
+rm -f "$here/lying-tiles.heic"
+MP4Box -quiet \
+	-add-image "$work/big.hevc:id=1:hidden:image-size=64x64" \
+	-add-image "$work/big.hevc:id=2:hidden:image-size=64x64" \
+	-add-image "$work/big.hevc:id=3:hidden:image-size=64x64" \
+	-add-image "$work/big.hevc:id=4:hidden:image-size=64x64" \
+	-add-derived-image ":type=grid:image-grid-size=2x2:ref=dimg,1:ref=dimg,2:ref=dimg,3:ref=dimg,4:image-size=128x128:id=5:primary" \
+	"$here/lying-tiles.heic"

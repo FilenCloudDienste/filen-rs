@@ -1394,6 +1394,30 @@ fn a_heif_decode_is_charged_its_setup_its_depth_and_its_chroma() {
 	assert!(fits(deep, 2 * 1024 * 1024));
 }
 
+/// Tiles that decode far larger than their container declares (64x64
+/// declared, 1024x1024 coded) are refused by a libheif security limit
+/// mid-decode, at any budget. That is a verdict about the file, so it stays a
+/// decode error — which callers settle as corrupt — rather than an
+/// `OverBudget` inviting a retry with more memory that could never succeed.
+#[cfg(feature = "heif")]
+#[test]
+fn tiles_larger_than_declared_are_a_decode_error_at_any_budget() {
+	let bytes = include_bytes!("fixtures/heif/lying-tiles.heic");
+	for mem_budget in [DEFAULT_MEM_BUDGET, APP_PROCESS_MEM_BUDGET, 1 << 30] {
+		match generate(
+			Box::new(MemSource(bytes.to_vec())),
+			&ThumbSpec::new(256, 256, mem_budget),
+		) {
+			Err(ThumbError::Decode(_)) => {}
+			Err(e) => panic!("at {mem_budget}: {e}"),
+			Ok(ThumbOutcome::Thumbnail(thumb)) => {
+				panic!("at {mem_budget}: thumbnailed from {}", thumb.source)
+			}
+			Ok(outcome) => panic!("at {mem_budget}: answered {outcome:?}"),
+		}
+	}
+}
+
 /// Which of the grid fixtures' colours a pixel is closest to.
 #[cfg(feature = "heif")]
 fn nearest_grid_colour(px: &[u8]) -> &'static str {

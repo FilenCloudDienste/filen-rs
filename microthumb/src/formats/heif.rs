@@ -336,5 +336,13 @@ fn decode_err(e: heif_decoder::HeifError) -> ThumbError {
 	// distinguishable here from corrupt bytes, and settles as a verdict about
 	// the file rather than staying retryable. Fixing that means teaching
 	// `heif-decoder` to carry the reader's error out.
+	//
+	// A libheif security limit tripping mid-decode is `Decode` too, and is
+	// not an over-budget answer. libheif counts two things against its
+	// ceilings, the decoded planes and the compressed input it holds, and
+	// `peak_estimate` charges more than it for each, so nothing the charge
+	// admits reaches them honestly. A trip means the bitstream decodes larger
+	// than its container declared — libheif caps a tile at its grid's
+	// declared size — and no budget would ever admit that file.
 	ThumbError::Decode(format!("{e}"))
 }
