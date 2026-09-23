@@ -31,7 +31,7 @@ use super::{
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
 		IgnoreDecision, IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules,
-		load_remote_rules, parse_user_ignore, rule_file_dir,
+		RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
 	},
 	observe::{self, LocalObservation, LocalObservations},
 	outcome::{
@@ -2818,6 +2818,7 @@ impl SyncEngine {
 		record: &PairRecord,
 		baseline: &Baseline,
 		view: &RemoteView,
+		rule_files: Vec<String>,
 		user: Option<IgnoreSource>,
 	) -> RemoteRules {
 		// Taken rather than copied: a pass on the same pair running alongside only downloads again.
@@ -2831,7 +2832,10 @@ impl SyncEngine {
 		let client = &self.client;
 		let mut rules = load_remote_rules(
 			record.mode,
-			view,
+			RuleCandidates {
+				view,
+				paths: rule_files,
+			},
 			user,
 			// Asked only where a two-way pair, or a pushing pair's synced rule file, could read the
 			// remote copy: a stat, and a listing where one is found. A file on disk the scan cannot read
@@ -3032,8 +3036,24 @@ impl SyncEngine {
 			Ok(source) => (Some(source), None),
 			Err(error) => (None, Some(error)),
 		};
+		// Which paths could hold a rule file: the resident index, plus any path this pass moved a
+		// node onto. The index answers for every row, and a scan of the view would answer for the
+		// same rows plus one shape it cannot — a directory move carrying a `.filenignore` to a path
+		// no row sits on yet, which `decided` names (`RemoteObservation::changed` was drained into
+		// it above). Naming a path twice costs nothing: the loader takes them as a set.
+		let rule_files: Vec<String> = inputs
+			.baseline
+			.rule_file_rows()
+			.chain(
+				derived
+					.decided
+					.iter()
+					.filter(|path| rule_file_dir(path).is_some())
+					.cloned(),
+			)
+			.collect();
 		let mut remote_rules = self
-			.remote_rules(&inputs.record, &inputs.baseline, &view, user)
+			.remote_rules(&inputs.record, &inputs.baseline, &view, rule_files, user)
 			.await;
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
@@ -3045,11 +3065,9 @@ impl SyncEngine {
 			RuleFiles::Only(
 				inputs
 					.baseline
-					.iter()
-					.filter(|entry| {
-						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
-					})
-					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+					.rule_file_rows()
+					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
 		};
@@ -3350,7 +3368,9 @@ impl SyncEngine {
 			Ok(source) => (Some(source), None),
 			Err(error) => (None, Some(error)),
 		};
-		let mut remote_rules = self.remote_rules(&record, &baseline, &view, user).await;
+		let mut remote_rules = self
+			.remote_rules(&record, &baseline, &view, rule_file_paths(&view), user)
+			.await;
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
@@ -3366,11 +3386,9 @@ impl SyncEngine {
 		} else {
 			RuleFiles::Only(
 				baseline
-					.iter()
-					.filter(|entry| {
-						entry.kind == NodeKind::File && !view.nodes.holds(&entry.rel_path)
-					})
-					.filter_map(|entry| rule_file_dir(&entry.rel_path).map(str::to_owned))
+					.rule_file_rows()
+					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
 		};

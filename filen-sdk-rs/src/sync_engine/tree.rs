@@ -40,7 +40,10 @@ use std::{
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use uuid::Uuid;
 
-use super::baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind};
+use super::{
+	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind},
+	ignore::FILENIGNORE,
+};
 
 /// A node's index in [`Baseline::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -239,6 +242,14 @@ pub(super) struct Baseline {
 	/// otherwise shed — at a million rows that walk IS the pass. Almost every row of a converged
 	/// pair is carryable, so this is empty in the steady state.
 	uncarryable: HashSet<NodeId>,
+	/// The rows that ARE a `.filenignore` — a file whose leaf name is [`FILENIGNORE`].
+	///
+	/// Indexed for the same reason [`uncarryable`](Self::uncarryable) is: two steps of every
+	/// change-scoped pass need the whole list of them before either side is read — the candidate
+	/// set `load_remote_rules` reads the remote copies from, and the `RuleFiles::Only` set a mode
+	/// that does not push hands the local scan. Both used to find them by walking every row, which
+	/// at a million rows is two whole-tree scans to discover that a pair has one rule file or none.
+	rule_files: HashSet<NodeId>,
 	/// How many nodes are rows (see [`PRESENT`]).
 	rows: usize,
 }
@@ -254,6 +265,7 @@ impl Default for Baseline {
 			side: HashMap::new(),
 			agreed: HashMap::new(),
 			uncarryable: HashSet::new(),
+			rule_files: HashSet::new(),
 			rows: 0,
 		}
 	}
@@ -292,6 +304,7 @@ impl Baseline {
 		self.side.shrink_to_fit();
 		self.agreed.shrink_to_fit();
 		self.uncarryable.shrink_to_fit();
+		self.rule_files.shrink_to_fit();
 	}
 
 	/// How many rows the pair tracks.
@@ -582,6 +595,15 @@ impl Baseline {
 			.is_some_and(|id| self.is_row(id) && !self.uncarryable.contains(&id))
 	}
 
+	/// The path of every `.filenignore` row, in no order.
+	///
+	/// From the index, not from a walk. A pass asks this before it reads either side, and the
+	/// answer for almost every pair is one path or none — which is exactly the shape that must not
+	/// cost a visit of every row in the tree.
+	pub(super) fn rule_file_rows(&self) -> impl Iterator<Item = String> + '_ {
+		self.rule_files.iter().map(|&id| self.path_of(id))
+	}
+
 	/// The path of every row that stands in for NEITHER side — what a change-scoped pass adds to
 	/// its dirty set and its held set before it reads anything.
 	///
@@ -684,6 +706,7 @@ impl Baseline {
 			+ table::<NodeId, ConflictSides>(self.side.capacity())
 			+ table::<NodeId, Option<Blake3Hash>>(self.agreed.capacity())
 			+ table::<NodeId, ()>(self.uncarryable.capacity())
+			+ table::<NodeId, ()>(self.rule_files.capacity())
 	}
 
 	fn walk(&self, root: NodeId, root_path: String) -> Walk<'_> {
@@ -817,6 +840,11 @@ impl Baseline {
 		// hand. `clear_indexes` above has already taken the previous answer out.
 		if !entry.carryable() {
 			self.uncarryable.insert(id);
+		}
+		// The leaf name, not the path: a row's node carries only its own name, and that is the
+		// whole of what makes a path a rule file (see `ignore::rule_file_dir`).
+		if entry.kind == NodeKind::File && self.name(id) == FILENIGNORE {
+			self.rule_files.insert(id);
 		}
 	}
 
@@ -972,6 +1000,7 @@ impl Baseline {
 		self.side.remove(&id);
 		self.agreed.remove(&id);
 		self.uncarryable.remove(&id);
+		self.rule_files.remove(&id);
 	}
 
 	/// Drop `id` and every ancestor of it that is left holding neither a row nor a child.
