@@ -336,85 +336,60 @@ impl Probe {
 	}
 }
 
-/// What each step of one change-scoped pass that USED to scan the whole tree costs now, timed
-/// INSIDE the phase that ran them.
+/// What each step of one change-scoped pass costs, timed INSIDE the phase that ran them, in the
+/// order the phase runs them.
 ///
-/// Only `from_baseline` still visits every row. The other six were narrowed to an index lookup, a
-/// per-decided-path decision or a lazily built index, and their rows are kept so that a build which
-/// re-introduces a scan shows up here and not only in the phase total.
+/// Every statement of [`prepare_scoped`] worth a clock is a step here, not only the scans that
+/// used to be: the phase total MINUS the steps is emitted as its own `__unattributed` row, so the
+/// table a run prints sums to the figure printed beside it and a term nobody has looked at cannot
+/// hide in the difference. That row is what found this phase's largest non-scan cost — the two
+/// whole-tree maps being FREED after the last scan had been timed, which no scan's own timer covers
+/// and which a phase-level figure cannot separate from the work.
+///
+/// Only `from_baseline` still visits every row. The scans beside it were narrowed to an index
+/// lookup, a per-decided-path decision or a lazily built index, and their rows are kept so that a
+/// build which re-introduces a scan shows up here and not only in the phase total.
 ///
 /// In-run deltas are the only figures two builds can be compared on: step 1b found a binary-wide
-/// systematic worth ~3.5 % between two builds of code that had not changed, which swamps every scan
-/// here but the largest. A row recorded from these fields is one process's own accounting of the
-/// phase printed beside it, so `sum(scans) < phase` always holds within one run and the remainder
-/// is the per-change work the scans are not.
+/// systematic worth ~3.5 % between two builds of code that had not changed, which swamps every step
+/// here but the largest. A row recorded from these steps is one process's own accounting of the
+/// phase printed beside it.
 #[derive(Default)]
 struct ScanCosts {
-	/// `derive::from_baseline`: two maps sized to the whole baseline, one visit per row.
-	from_baseline: Duration,
-	/// `RemoteObservation::new`, plus applying the delta (empty here). Its uuid lookups are
-	/// answered off the baseline, so no index over the derived map is built any more.
-	observe_remote: Duration,
-	/// `load_remote_rules`' candidate set, read from the baseline's rule-file index. The scan of
-	/// the UNFILTERED view it replaced is what a whole read still pays.
-	rule_files_scan: Duration,
-	/// `RuleFiles::Only`, built from the same rule-file index rather than from a scan of every
-	/// baseline row. Zero on a mode that pushes, which never builds it.
-	rule_files_only: Duration,
-	/// `RemoteView::hide`. A whole read's `retain` is one ignore decision per node; the scoped
-	/// phases run the narrowed form, which asks only about the paths the pass decided.
-	view_hide: Duration,
-	/// `RemoteView::resolve_collisions`. A whole read folds one key per node; the scoped phases
-	/// run the narrowed form, which folds only the paths the pass decided.
-	view_collisions: Duration,
-	/// `PendingWrites::fold_into`. The view index is built only for a record that no path it names
-	/// can answer, which this fixture's record is not, so what is timed is the per-record half.
-	pending_fold: Duration,
+	/// One `(name, elapsed, detail)` per step, in the order the phase ran them.
+	steps: Vec<(&'static str, Duration, &'static str)>,
 }
 
 impl ScanCosts {
-	/// One row per scan, named `<phase>__<scan>` so a TSV groups them under the phase they were
-	/// measured in.
-	fn record(&self, probe: &mut Probe, phase: &str, items: usize) {
-		for (scan, elapsed, detail) in [
-			(
-				"from_baseline",
-				self.from_baseline,
-				"two maps sized to the baseline, one visit per row",
-			),
-			(
-				"observe_remote",
-				self.observe_remote,
-				"`RemoteObservation::new`: uuid lookups answered off the baseline, plus the delta",
-			),
-			(
-				"rule_files_scan",
-				self.rule_files_scan,
-				"`load_remote_rules`' candidates, from the baseline's rule-file index",
-			),
-			(
-				"rule_files_only",
-				self.rule_files_only,
-				"`RuleFiles::Only`, from the same index; 0 on a mode that pushes",
-			),
-			(
-				"view_hide",
-				self.view_hide,
-				"`hide`: one decision per decided path (scoped) or per node (whole read)",
-			),
-			(
-				"view_collisions",
-				self.view_collisions,
-				"`resolve_collisions`: one folded key per decided path (scoped) or node (whole)",
-			),
-			(
-				"pending_fold",
-				self.pending_fold,
-				"`PendingWrites::fold_into`; the index is built only for a record no path answers",
-			),
-		] {
-			probe.record(&format!("{phase}__{scan}"), items, elapsed, detail);
+	/// Record a step timed at the call site.
+	///
+	/// Timed there rather than around a closure here because most of these steps are several
+	/// statements with their own reasoning between them: wrapping each one would reindent the
+	/// argument this file is mostly made of, and an `Instant` mark reads the same clock.
+	fn push(&mut self, name: &'static str, elapsed: Duration, detail: &'static str) {
+		self.steps.push((name, elapsed, detail));
+	}
+
+	/// One row per step, named `<phase>__<step>` so a TSV groups them under the phase they were
+	/// measured in, then one `<phase>__unattributed` row for whatever the steps do not account for.
+	///
+	/// `total` is the phase's own measured time, from the caller's clock around the whole call. The
+	/// remainder is a `saturating_sub`: every step is timed inside that clock, so it cannot go
+	/// negative unless a caller passes the total of a DIFFERENT call, which this reports as zero
+	/// rather than as a wrapped figure.
+	fn record(&self, probe: &mut Probe, phase: &str, items: usize, total: Duration) {
+		let mut summed = Duration::ZERO;
+		for (step, elapsed, detail) in &self.steps {
+			summed += *elapsed;
+			probe.record(&format!("{phase}__{step}"), items, *elapsed, detail);
 		}
+		probe.record(
+			&format!("{phase}__unattributed"),
+			items,
+			total.saturating_sub(summed),
+			"the phase total minus every step above: the O(1) moves between them, the implicit drops \
+			 of what no step took, and this harness's own clock calls",
+		);
 	}
 }
 
@@ -960,9 +935,12 @@ fn pass_pure(
 /// rename. All three have since been narrowed, so they are still CALLED here but none of them is a
 /// tree scan any more; `derive::from_baseline` is the only whole-tree step left in the phase.
 ///
-/// Each whole-tree scan inside the phase is also timed on its own ([`ScanCosts`]) and reported as a
-/// `<phase>__<scan>` row. Those are in-run deltas and are what a narrowing is judged on: an
-/// absolute figure at a million rows is not trustworthy between two builds to better than ~10 %.
+/// EVERY step inside the phase is timed on its own ([`ScanCosts`]) and reported as a
+/// `<phase>__<step>` row, with a `<phase>__unattributed` row for the remainder, so the rows sum
+/// to the phase printed beside them. Those are in-run deltas and are what a narrowing is judged
+/// on: an absolute figure at a million rows is not trustworthy between two builds to better than
+/// ~10 %. The drops are steps too — the phase frees two whole-tree maps at its end, and that is
+/// work a figure for the phase includes and no scan's timer covers.
 ///
 /// The fold is here because `prepare_scoped` ends with it exactly as `prepare_whole` does, and
 /// because [`pass_pure`] pays it: a phase that skipped it would credit change-scoping with the cost
@@ -972,7 +950,7 @@ fn pass_pure(
 /// the tree.
 ///
 /// Returns the action count, so a phase that was supposed to plan something can say whether it did,
-/// and what each whole-tree scan inside it cost ([`ScanCosts`]).
+/// and what each step inside it cost ([`ScanCosts`]).
 fn prepare_scoped(
 	fixture: &Fixture,
 	store: &BaselineStore,
@@ -981,9 +959,21 @@ fn prepare_scoped(
 	dirty: BTreeSet<String>,
 ) -> (usize, ScanCosts) {
 	let mut costs = ScanCosts::default();
-	let mut baseline = store.baseline(pair).expect("reading the baseline");
+	// Timed because it is the phase's first statement and a reader of this table would
+	// otherwise have to take on trust that it is free. It is: an earlier phase has already read
+	// this pair, so the store answers with an `Arc` clone and no row is read from SQLite here.
+	let (mut baseline, elapsed) = timed(|| store.baseline(pair).expect("reading the baseline"));
+	costs.push(
+		"baseline_load",
+		elapsed,
+		"`BaselineStore::baseline`: an `Arc` clone of the already-resident tree",
+	);
 	let (mut derived, elapsed) = timed(|| derive::from_baseline(&baseline, dirty));
-	costs.from_baseline = elapsed;
+	costs.push(
+		"from_baseline",
+		elapsed,
+		"two maps sized to the baseline, one visit per row",
+	);
 
 	// The remote half FIRST, as the pass runs it: every path the delta touched is a path the local
 	// half has to re-observe too. `RemoteObservation::new` indexes the whole derived map by uuid
@@ -992,7 +982,11 @@ fn prepare_scoped(
 	let mut ancestry = |uuid| cache_ancestry(&fixture.cache_db, uuid);
 	let (observed, elapsed) =
 		timed(|| observe_remote(fixture.remote_root, &baseline, nodes, &[], &mut ancestry));
-	costs.observe_remote = elapsed;
+	costs.push(
+		"observe_remote",
+		elapsed,
+		"`RemoteObservation::new`: uuid lookups answered off the baseline, plus the delta",
+	);
 	// A GUARD, and not a check that can fail on this fixture: with an EMPTY delta `observe_remote`
 	// never enters the loop that refuses a change, and its only other route to `Full` needs an
 	// emptied view over a baseline that still has remote rows, which a converged fixture cannot
@@ -1005,6 +999,7 @@ fn prepare_scoped(
 			 read: {reason:?}"
 		),
 	};
+	let mark = Instant::now();
 	derived.decided.append(&mut observation.changed);
 	// TAKEN before the view's held set is built out of it, for the reason the pass takes it: the
 	// assembly check below needs the ROWS this pass holds, not the hidden paths `merge_local` puts
@@ -1023,6 +1018,11 @@ fn prepare_scoped(
 			.collect(),
 	};
 	derived.dirty.extend(observation.touched.iter().cloned());
+	costs.push(
+		"view_assembly",
+		mark.elapsed(),
+		"the decided keys, the held rows and the `RemoteView` the observation hands over",
+	);
 
 	// The remote rules, where the pass reads them: BEFORE `view.filter`, so the candidate scan runs
 	// over the UNFILTERED map. What is TIMED here is that scan — `load_remote_rules` opens by
@@ -1067,7 +1067,11 @@ fn prepare_scoped(
 			},
 		))
 	});
-	costs.rule_files_scan = elapsed;
+	costs.push(
+		"rule_files_scan",
+		elapsed,
+		"`load_remote_rules`' candidates, from the baseline's rule-file index",
+	);
 	// A LABEL, and not a check that can fail if the step degenerates into nothing: this fixture
 	// plants no remote `.filenignore`, so empty `blocked`/`errors` is what the call returns whether
 	// it examined every candidate or none, and it is not evidence that this phase measured a scan.
@@ -1095,11 +1099,16 @@ fn prepare_scoped(
 			)
 		}
 	});
-	costs.rule_files_only = elapsed;
+	costs.push(
+		"rule_files_only",
+		elapsed,
+		"`RuleFiles::Only`, from the same index; 0 on a mode that pushes",
+	);
 
 	// The local half: one stat per dirty path and its ancestors, one subtree walk per dirty
 	// directory. `derived.dirty` and not the caller's set, because `from_baseline` adds every row
 	// it could not carry to it.
+	let mark = Instant::now();
 	let dirty = mem::take(&mut derived.dirty);
 	let (observations, rules) = observe::observe_local(
 		&fixture.root,
@@ -1108,10 +1117,28 @@ fn prepare_scoped(
 		&rule_files,
 		&dirty,
 	);
+	costs.push(
+		"observe_local",
+		mark.elapsed(),
+		"one stat per dirty path and its ancestors, one subtree walk per dirty directory",
+	);
+	let mark = Instant::now();
 	derive::merge_local(&mut derived, &baseline, &observations);
+	costs.push(
+		"merge_local",
+		mark.elapsed(),
+		"correcting the derived local map with what was observed: per observation",
+	);
 	// Plan 3.6's self-check, which the pass runs before anything plans against these maps.
+	let (accounted, elapsed) =
+		timed(|| assembly_accounted(&baseline, &derived, &observations, &held_rows));
+	costs.push(
+		"assembly_check",
+		elapsed,
+		"`assembly_accounted`: per observation, plus the rows under each one it replaced",
+	);
 	assert!(
-		assembly_accounted(&baseline, &derived, &observations, &held_rows),
+		accounted,
 		"the derived local map must account for the rows and observations it was built from; a \
 		 pass that fails this reads both sides whole instead, so the phase would be timing a pass \
 		 no engine would run"
@@ -1130,12 +1157,25 @@ fn prepare_scoped(
 			plan::PassPaths::Changed(&derived.decided),
 		);
 	});
-	costs.view_hide = elapsed;
+	costs.push(
+		"view_hide",
+		elapsed,
+		"`hide`: one decision per decided path (scoped) or per node (whole read)",
+	);
 	let ((), elapsed) = timed(|| view.resolve_collisions_changed(&baseline, &derived.decided));
-	costs.view_collisions = elapsed;
+	costs.push(
+		"view_collisions",
+		elapsed,
+		"`resolve_collisions`: one folded key per decided path (scoped) or node (whole)",
+	);
 	// The paths an observation found hidden with a row still behind them, added AFTER the filter
 	// exactly as the pass adds them.
-	view.held_paths.append(&mut derived.held);
+	let ((), elapsed) = timed(|| view.held_paths.append(&mut derived.held));
+	costs.push(
+		"held_append",
+		elapsed,
+		"the hidden paths with a row still behind them, merged into the view's held set",
+	);
 
 	// `PendingWrites::fold_into`, which a pass pays whenever the pair holds an unacknowledged
 	// write — the pass after every apply that pushed something. ONE record, which is the whole of
@@ -1143,6 +1183,7 @@ fn prepare_scoped(
 	// and builds a view index only for one no such path answers. A `Created`, which is what
 	// is planted below, is answered directly, so this row prices the per-record half and there is
 	// no whole-view rebuild left in it to time.
+	let mark = Instant::now();
 	let written = baseline
 		.iter()
 		.find(|entry| entry.kind == NodeKind::File && entry.remote_uuid.is_some())
@@ -1157,6 +1198,12 @@ fn prepare_scoped(
 		},
 		Duration::ZERO,
 	);
+	costs.push(
+		"pending_plant",
+		mark.elapsed(),
+		"this harness planting the record the fold walks; `baseline.iter().find` stops at the \
+		 first synced file, and no pass pays it",
+	);
 	// FIRST, because `fold_into` returns 0 both for a record it could not apply and for a pair
 	// holding no record at all, and the second of those returns before it does any work. This is
 	// the one check here that CAN fail if the step degenerates: with no record the phase times an
@@ -1170,7 +1217,11 @@ fn prepare_scoped(
 	);
 	let (folded, elapsed) =
 		timed(|| pending.fold_into(pair, &baseline, &mut view.nodes, &mut derived.decided));
-	costs.pending_fold = elapsed;
+	costs.push(
+		"pending_fold",
+		elapsed,
+		"`PendingWrites::fold_into`; the index is built only for a record no path answers",
+	);
 	// Also a LABEL rather than an anti-degeneracy guard: it asserts the fold applied NOTHING, which
 	// is what keeps the maps the phase goes on to time unedited, and it passes whether the fold did
 	// per-record work or returned early. The check above is the one that fails on a skipped step.
@@ -1188,6 +1239,7 @@ fn prepare_scoped(
 	let mut remote = view.nodes;
 	// What the pass folds and plans with is `holds.held_remote`, which is the view's held set.
 	let held = view.held_paths;
+	let mark = Instant::now();
 	let moves = plan::fold_dir_moves(
 		mode,
 		&mut baseline,
@@ -1204,6 +1256,12 @@ fn prepare_scoped(
 			.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
 			.collect();
 	}
+	costs.push(
+		"dir_move_fold",
+		mark.elapsed(),
+		"`fold_dir_moves` and the rekey of the decided set it forces: per decided path",
+	);
+	let mark = Instant::now();
 	let actions = plan::reconcile(
 		mode,
 		&baseline,
@@ -1214,6 +1272,47 @@ fn prepare_scoped(
 	)
 	.actions
 	.len();
+	costs.push(
+		"reconcile",
+		mark.elapsed(),
+		"`reconcile` over the decided keys, intersected with the three inputs",
+	);
+	// The two whole-tree maps FREED. `from_baseline` builds them inside its own timer and nothing
+	// times their release, so before this row their deallocation sat inside the phase total and
+	// inside no step — which is exactly where it hid: at a million rows it is the second-largest
+	// term of a scoped pass, behind `from_baseline` and ahead of everything else by four orders of
+	// magnitude. Per node, and two allocations per node on each side, since every node carries its
+	// own path beside the key it is filed under.
+	//
+	// WHERE THE REAL PASS PAYS IT, which this row's position does not say: `prepare_scoped` hands
+	// both maps on rather than dropping them — `derived.local` becomes `LocalScan::nodes` and the
+	// view moves into `Prepared::remote_view` — so the engine frees them when `run_pass` drops the
+	// `Prepared`, after the apply. The work is the same and the pass pays it either way; only the
+	// point in the pass differs. So this belongs in a figure for what a scoped pass COSTS, which is
+	// what the `scoped_twoway_*` rows and the 50 ms target are, and not in one for what
+	// `SyncEngine::prepare_scoped` returns in.
+	let mark = Instant::now();
+	drop((local, remote));
+	costs.push(
+		"drop_sides",
+		mark.elapsed(),
+		"freeing the two path-keyed maps `from_baseline` built: per node, on both sides",
+	);
+	let mark = Instant::now();
+	drop((
+		decided,
+		held,
+		held_rows,
+		moves,
+		rules,
+		observations,
+		baseline,
+	));
+	costs.push(
+		"drop_rest",
+		mark.elapsed(),
+		"freeing what the phase still holds beside the two sides: the sets, the rows, the rules",
+	);
 	(actions, costs)
 }
 
@@ -2166,7 +2265,7 @@ pub fn run() -> String {
 		scoped_actions, 1,
 		"one changed file must plan exactly one action, or this phase is timing the wrong thing"
 	);
-	scoped_costs.record(&mut probe, "scoped_twoway_one_file_changed", nodes);
+	scoped_costs.record(&mut probe, "scoped_twoway_one_file_changed", nodes, scoped);
 
 	// The same wake on a pair that only PULLS, which is the mode that pays `RuleFiles::Only` — a
 	// scan of every baseline row with a view lookup per row, built before the local half reads
@@ -2195,7 +2294,7 @@ pub fn run() -> String {
 		"a local edit on a pull-only pair is the remote's to overwrite, so the count is fixed; a \
 		 different one means this phase is no longer timing that pass"
 	);
-	pull_costs.record(&mut probe, "scoped_pull_one_file_changed", nodes);
+	pull_costs.record(&mut probe, "scoped_pull_one_file_changed", nodes, pull);
 
 	// The phase the one-per-cent target is read off: a real change-scoped pass, with one per cent
 	// of the files edited on disk and named in its dirty set.
@@ -2217,7 +2316,7 @@ pub fn run() -> String {
 		.expect("changing a probe file");
 	}
 	let percent_dirty: BTreeSet<String> = percent_changed.iter().cloned().collect();
-	let ((percent_actions, _), percent) = timed(|| {
+	let ((percent_actions, percent_costs), percent) = timed(|| {
 		prepare_scoped(
 			&fixture,
 			&store,
@@ -2241,11 +2340,17 @@ pub fn run() -> String {
 		percent_changed.len(),
 		"one action per changed file, or this phase is timing the wrong thing"
 	);
+	percent_costs.record(
+		&mut probe,
+		"scoped_twoway_one_percent_changed",
+		nodes,
+		percent,
+	);
 
 	// The floor the same machinery costs with NOTHING dirty. The engine does not pay it — a wake
 	// with an empty change list returns before it reads anything — so this is the cost that
 	// skipping an idle wake avoids, not a cost any pass incurs.
-	let ((idle_actions, _), idle) =
+	let ((idle_actions, idle_costs), idle) =
 		timed(|| prepare_scoped(&fixture, &store, pair, SyncMode::TwoWay, BTreeSet::new()));
 	probe.record(
 		"scoped_twoway_idle_floor",
@@ -2261,6 +2366,7 @@ pub fn run() -> String {
 		"a converged pair with nothing dirty must plan nothing, or this phase is timing a pass that \
 		 stopped deciding paths"
 	);
+	idle_costs.record(&mut probe, "scoped_twoway_idle_floor", nodes, idle);
 
 	// The memory figure the targets are written in and nothing here has answered: what a process
 	// holding a LOADED PAIR costs between passes. Every other number in this run is either the
