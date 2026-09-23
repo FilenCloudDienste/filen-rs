@@ -1827,7 +1827,9 @@ async fn apply_one(
 			commit_remote_write(
 				ctx,
 				*remote_uuid,
-				PendingKind::Trashed,
+				PendingKind::Trashed {
+					path: (*rel_path).to_string(),
+				},
 				&[BaselineChange::Delete(rel_path)],
 			)
 			.await?;

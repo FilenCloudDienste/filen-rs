@@ -132,10 +132,14 @@ pub(super) enum PendingKind {
 	/// reconciled at once rather than waited out; the destination is where the view has to show it
 	/// in the meantime.
 	Moved { from: String, to: String },
-	/// An item this engine sent to the remote trash. Its baseline row is gone, so a snapshot that
-	/// has not applied the trash yet reads as "present remotely, untracked, absent locally" — a
-	/// deletion to make, which would trash it a second time.
-	Trashed,
+	/// An item this engine sent to the remote trash, and the path it emptied. Its baseline row is
+	/// gone, so a snapshot that has not applied the trash yet reads as "present remotely,
+	/// untracked, absent locally" — a deletion to make, which would trash it a second time.
+	///
+	/// `path` is carried for the same reason a move carries `from`: it is where a cache that has
+	/// not applied the trash still lists the item, so the fold can find it without indexing the
+	/// whole view (see [`ViewIndex`]).
+	Trashed { path: String },
 }
 
 /// How long a push of ours must stand as the remote head before the engine takes its content as
@@ -750,14 +754,14 @@ impl PendingWrites {
 				PendingKind::Moved { from, .. } => snapshot_path
 					.get(uuid)
 					.is_none_or(|path| path.as_ref() == from.as_str()),
-				PendingKind::Trashed => snapshot_path.contains_key(uuid),
+				PendingKind::Trashed { .. } => snapshot_path.contains_key(uuid),
 			}
 		});
 		plan::PassHolds {
 			trashed: map
 				.iter()
 				.filter(|(_, write)| {
-					write.pair == pair && matches!(write.kind, PendingKind::Trashed)
+					write.pair == pair && matches!(write.kind, PendingKind::Trashed { .. })
 				})
 				.map(|(uuid, _)| *uuid)
 				.collect(),
@@ -817,6 +821,10 @@ impl PendingWrites {
 	/// the write it describes, so the row IS the post-write truth. A record only survives
 	/// [`settle`](Self::settle) while the cache demonstrably still shows the pre-write state, so a
 	/// fold never paints over somebody else's write.
+	///
+	/// Nothing about the view is indexed up front: every record names where it expects its item to
+	/// be, and [`ViewIndex`] falls back to the whole-view index only for the one record shape that
+	/// cannot be answered that way.
 	pub(super) fn fold_into(
 		&self,
 		pair: PairId,
@@ -833,12 +841,7 @@ impl PendingWrites {
 		// Oldest first: two writes can name one path (a re-upload on the very next pass), and the
 		// later one has to land on top.
 		writes.sort_unstable_by_key(|(_, write)| write.at);
-		// uuid -> where the view holds it, kept current as the fold edits the view; a scan per
-		// record would be quadratic on a large tree right after a large pass.
-		let mut path_of: HashMap<Uuid, String> = nodes
-			.iter()
-			.map(|(path, node)| (node.remote_uuid, path.clone()))
-			.collect();
+		let mut path_of = ViewIndex::default();
 		let mut folded = 0;
 		for (uuid, write) in writes {
 			let applied = match &write.kind {
@@ -854,7 +857,9 @@ impl PendingWrites {
 				PendingKind::Moved { from, to } => {
 					fold_move(nodes, &mut path_of, baseline, *uuid, from, to, changed)
 				}
-				PendingKind::Trashed => fold_trash(nodes, &mut path_of, *uuid, changed),
+				PendingKind::Trashed { path } => {
+					fold_trash(nodes, &mut path_of, *uuid, path, changed)
+				}
 			};
 			folded += usize::from(applied);
 		}
@@ -899,18 +904,82 @@ pub(super) fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> 
 	})
 }
 
+/// Where the view holds each uuid — built only when a record cannot be answered from the paths it
+/// names itself.
+///
+/// Every record says where it expects its item to be: a move its two ends, a trash the path it
+/// emptied, a create its own path (which it looks up directly, and never asks this). That is where
+/// a cache merely lagging shows the item, so in the ordinary case this stays empty. Indexing the
+/// view up front is one `String` clone and one hash per node of the WHOLE tree, and a pass pays the
+/// fold every time the previous one pushed anything.
+///
+/// Only a foreign edit puts the item on a third path. Then the index is built, once, and kept in
+/// step by [`place_node`] and by the removals for the rest of the fold — a scan per record would be
+/// quadratic on a large tree right after a large pass.
+#[derive(Default)]
+struct ViewIndex(Option<HashMap<Uuid, String>>);
+
+impl ViewIndex {
+	/// Where `nodes` holds `uuid`, building the index if it is not built yet.
+	fn at(&mut self, nodes: &HashMap<String, RemoteNode>, uuid: Uuid) -> Option<String> {
+		self.0
+			.get_or_insert_with(|| {
+				nodes
+					.iter()
+					.map(|(path, node)| (node.remote_uuid, path.clone()))
+					.collect()
+			})
+			.get(&uuid)
+			.cloned()
+	}
+
+	fn placed(&mut self, uuid: Uuid, path: &str) {
+		if let Some(index) = self.0.as_mut() {
+			index.insert(uuid, path.to_owned());
+		}
+	}
+
+	fn gone(&mut self, uuid: Uuid) {
+		if let Some(index) = self.0.as_mut() {
+			index.remove(&uuid);
+		}
+	}
+}
+
+/// Where the view holds `uuid`, asked of the paths the record names before the view is indexed.
+///
+/// A hint hits whenever the cache is simply behind on our write or has caught up with it, which is
+/// every record but the one a foreign edit has moved out from under. `nodes` is read directly, so a
+/// hint is always current however much the fold has already edited.
+fn held_at(
+	nodes: &HashMap<String, RemoteNode>,
+	path_of: &mut ViewIndex,
+	uuid: Uuid,
+	hints: &[&str],
+) -> Option<String> {
+	for hint in hints {
+		if nodes
+			.get(*hint)
+			.is_some_and(|node| node.remote_uuid == uuid)
+		{
+			return Some((*hint).to_owned());
+		}
+	}
+	path_of.at(nodes, uuid)
+}
+
 /// Put `node` at `path`, keeping the uuid index in step with whatever it displaces.
 fn place_node(
 	nodes: &mut HashMap<String, RemoteNode>,
-	path_of: &mut HashMap<Uuid, String>,
+	path_of: &mut ViewIndex,
 	path: String,
 	node: RemoteNode,
 ) {
 	let uuid = node.remote_uuid;
 	if let Some(previous) = nodes.insert(path.clone(), node) {
-		path_of.remove(&previous.remote_uuid);
+		path_of.gone(previous.remote_uuid);
 	}
-	path_of.insert(uuid, path);
+	path_of.placed(uuid, &path);
 }
 
 /// Show what we wrote at `path`, over the version it superseded there — and decide, for a path
@@ -924,7 +993,7 @@ fn place_node(
 /// first one to run wins.
 fn fold_create(
 	nodes: &mut HashMap<String, RemoteNode>,
-	path_of: &mut HashMap<Uuid, String>,
+	path_of: &mut ViewIndex,
 	baseline: &Baseline,
 	uuid: Uuid,
 	path: &str,
@@ -963,20 +1032,20 @@ fn fold_create(
 /// old path along with it.
 fn fold_move(
 	nodes: &mut HashMap<String, RemoteNode>,
-	path_of: &mut HashMap<Uuid, String>,
+	path_of: &mut ViewIndex,
 	baseline: &Baseline,
 	uuid: Uuid,
 	from: &str,
 	to: &str,
 	changed: &mut BTreeSet<String>,
 ) -> bool {
-	let vacated = match path_of.get(&uuid).map(String::as_str) {
+	let vacated = match held_at(nodes, path_of, uuid, &[to, from]).as_deref() {
 		// Already where we moved it.
 		Some(at) if at == to => return false,
 		// The pre-move path the cache still shows: take the node off it, whatever the destination
 		// turns out to hold — the one thing this move makes certain is that the item is not here.
 		Some(at) if at == from => {
-			path_of.remove(&uuid);
+			path_of.gone(uuid);
 			changed.insert(from.to_string());
 			nodes.remove(from)
 		}
@@ -1027,13 +1096,15 @@ fn fold_move(
 /// server trashed with it.
 fn fold_trash(
 	nodes: &mut HashMap<String, RemoteNode>,
-	path_of: &mut HashMap<Uuid, String>,
+	path_of: &mut ViewIndex,
 	uuid: Uuid,
+	at: &str,
 	changed: &mut BTreeSet<String>,
 ) -> bool {
-	let Some(path) = path_of.remove(&uuid) else {
+	let Some(path) = held_at(nodes, path_of, uuid, &[at]) else {
 		return false;
 	};
+	path_of.gone(uuid);
 	let Some(node) = nodes.remove(&path) else {
 		return false;
 	};
@@ -1042,7 +1113,7 @@ fn fold_trash(
 		nodes.retain(|key, node| {
 			let keep = !plan::is_under(key, &path);
 			if !keep {
-				path_of.remove(&node.remote_uuid);
+				path_of.gone(node.remote_uuid);
 				changed.insert(key.clone());
 			}
 			keep
@@ -7697,10 +7768,11 @@ mod tests {
 				node("Docs/a.txt", child, NodeKind::File),
 			),
 		]);
-		let mut path_of: HashMap<Uuid, String> = nodes
-			.iter()
-			.map(|(path, node)| (node.remote_uuid, path.clone()))
-			.collect();
+		let mut path_of = ViewIndex::default();
+		// Built BEFORE the fold, as it is for a fold that has already answered one record the two
+		// paths it names could not: the assertions below are then about the index being kept in
+		// step, which is what they were about when it was built unconditionally.
+		assert!(path_of.at(&nodes, Uuid::new_v4()).is_none());
 		let mut changed = BTreeSet::new();
 		assert!(fold_move(
 			&mut nodes,
@@ -7715,8 +7787,8 @@ mod tests {
 		paths.sort_unstable();
 		assert_eq!(paths, ["docs", "docs/a.txt"]);
 		assert_eq!(nodes["docs/a.txt"].rel_path, "docs/a.txt");
-		assert_eq!(path_of[&child], "docs/a.txt");
-		assert_eq!(path_of[&dir], "docs");
+		assert_eq!(path_of.at(&nodes, child).as_deref(), Some("docs/a.txt"));
+		assert_eq!(path_of.at(&nodes, dir).as_deref(), Some("docs"));
 		// And every key it moved, BY NAME: both ends for the directory and both for each child it
 		// carried. A key the fold leaves out here is a key a change-scoped reconcile never visits,
 		// so the re-key would be invisible to the very pass that made it.
@@ -9467,7 +9539,14 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (dir, child) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record(&observations, PAIR, dir, PendingKind::Trashed);
+		pending.record(
+			&observations,
+			PAIR,
+			dir,
+			PendingKind::Trashed {
+				path: "d".to_string(),
+			},
+		);
 
 		let mut remote = HashMap::from([
 			(
@@ -9807,7 +9886,14 @@ mod tests {
 		let observations = Observations::default();
 		let pending = PendingWrites::default();
 		let (trashed, created) = (Uuid::new_v4(), Uuid::new_v4());
-		pending.record(&observations, PAIR, trashed, PendingKind::Trashed);
+		pending.record(
+			&observations,
+			PAIR,
+			trashed,
+			PendingKind::Trashed {
+				path: "t.txt".to_string(),
+			},
+		);
 		pending.record(
 			&observations,
 			PAIR,
