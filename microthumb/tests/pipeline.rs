@@ -1342,13 +1342,13 @@ fn transformed_grids_place_their_tiles_where_the_whole_frame_decode_does() {
 			.enumerate()
 		{
 			let (x, y) = (i as u32 % whole.width(), i as u32 / whole.width());
-			let expected = nearest_grid_colour(&framed.0);
+			let expected = nearest(&framed.0, GRID_COLOURS);
 			assert_ne!(
 				expected, "magenta",
 				"{name}: the fixture's own whole-frame decode shows its overhang at ({x}, {y})"
 			);
 			assert_eq!(
-				nearest_grid_colour(tiled),
+				nearest(tiled, GRID_COLOURS),
 				expected,
 				"{name}: ({x}, {y}) is {tiled:?}, the whole frame has {:?}",
 				framed.0
@@ -1418,25 +1418,185 @@ fn tiles_larger_than_declared_are_a_decode_error_at_any_budget() {
 	}
 }
 
-/// Which of the grid fixtures' colours a pixel is closest to.
+/// The HEVC grids' tile colours, and their overhang's magenta.
 #[cfg(feature = "heif")]
-fn nearest_grid_colour(px: &[u8]) -> &'static str {
-	[
-		("red", [255u8, 0, 0]),
-		("lime", [0, 255, 0]),
-		("blue", [0, 0, 255]),
-		("yellow", [255, 255, 0]),
-		("magenta", [255, 0, 255]),
-	]
-	.into_iter()
-	.min_by_key(|(_, rgb)| {
-		rgb.iter()
-			.zip(px)
-			.map(|(a, b)| u32::from(a.abs_diff(*b)).pow(2))
-			.sum::<u32>()
+const GRID_COLOURS: &[(&str, [u8; 3])] = &[
+	("red", [255, 0, 0]),
+	("lime", [0, 255, 0]),
+	("blue", [0, 0, 255]),
+	("yellow", [255, 255, 0]),
+	("magenta", [255, 0, 255]),
+];
+
+/// The quadrants of the large JPEG in the Fujifilm-shaped fixtures, and the
+/// grey and black of the letterboxed one beside it.
+#[cfg(feature = "heif")]
+const CAMERA_JPEG_COLOURS: &[(&str, [u8; 3])] = &[
+	("white", [255, 255, 255]),
+	("black", [0, 0, 0]),
+	("cyan", [0, 255, 255]),
+	("orange", [255, 165, 0]),
+	("grey", [128, 128, 128]),
+];
+
+/// libheif's limits bind every decode in its session. Sized for the primary
+/// image — whose charge includes the compressed input libheif holds — they
+/// would refuse the embedded thumbnail of a large file at a small budget, so
+/// each decode gets its own. The budget here covers the thumbnail's own charge
+/// (1 MiB of setup and 20 B/px, mirrored from `formats/heif.rs`) with a
+/// kilobyte to spare, and no more: take the grid's input charge out of it as
+/// well and the thumbnail no longer fits. Its 160x106 is coded as 160x112 —
+/// HEVC rounds the height up to whole 8-row coding blocks — and the coded size
+/// is what libheif holds to the limit.
+#[cfg(feature = "heif")]
+#[test]
+fn an_embedded_thumbnail_is_not_held_to_the_primary_images_limits() {
+	let bytes = include_bytes!("fixtures/heif/hevc-thumb.heic");
+	let budget = 1024 * 1024 + 160 * 112 * 20 + 1024;
+	let spec = ThumbSpec::preview_only(64, 64, budget);
+	let ThumbOutcome::Thumbnail(thumb) = generate(Box::new(MemSource(bytes.to_vec())), &spec)
+		.unwrap_or_else(|e| panic!("the thumbnail must decode: {e}"))
+	else {
+		panic!("the thumbnail must serve");
+	};
+	assert_eq!(thumb.source, microthumb::ThumbSource::EmbeddedPreview);
+}
+
+/// Which of `palette` a pixel is closest to.
+#[cfg(feature = "heif")]
+fn nearest(px: &[u8], palette: &[(&'static str, [u8; 3])]) -> &'static str {
+	palette
+		.iter()
+		.min_by_key(|(_, rgb)| {
+			rgb.iter()
+				.zip(px)
+				.map(|(a, b)| u32::from(a.abs_diff(*b)).pow(2))
+				.sum::<u32>()
+		})
+		.map(|(name, _)| *name)
+		.unwrap()
+}
+
+/// The palette colours at an image's four corners (a tenth of the way in),
+/// in reading order.
+#[cfg(feature = "heif")]
+fn corners(
+	image: &microthumb::SmallImage,
+	palette: &[(&'static str, [u8; 3])],
+) -> [&'static str; 4] {
+	let (w, h) = (image.width as usize, image.height as usize);
+	[(1, 1), (9, 1), (1, 9), (9, 9)].map(|(x, y)| {
+		let at = (y * h / 10 * w + x * w / 10) * 4;
+		nearest(&image.rgba[at..at + 4], palette)
 	})
-	.map(|(name, _)| name)
-	.unwrap()
+}
+
+/// Fujifilm-shaped: an HEVC grid with the three JPEG thumbnail items a HIF
+/// carries, landscape and portrait. See tests/fixtures/heif/generate.sh.
+#[cfg(feature = "heif")]
+const FUJI: &[u8] = include_bytes!("fixtures/heif/fuji.heic");
+#[cfg(feature = "heif")]
+const FUJI_PORTRAIT: &[u8] = include_bytes!("fixtures/heif/fuji-irot1.heic");
+
+/// A Fujifilm HIF thumbnails from the camera's own JPEG of the shot — the
+/// large one in the frame's aspect, not the letterboxed 4:3 one — without
+/// libheif ever decoding its HEVC, and on a preview-only spec as well: the
+/// JPEG is the preview.
+#[cfg(feature = "heif")]
+#[test]
+fn a_fujifilm_hif_thumbnails_from_its_camera_jpeg() {
+	for spec in [
+		spec(256),
+		ThumbSpec::preview_only(256, 256, DEFAULT_MEM_BUDGET),
+	] {
+		let ThumbOutcome::Thumbnail(thumb) =
+			generate(Box::new(MemSource(FUJI.to_vec())), &spec).unwrap()
+		else {
+			panic!("the camera JPEG must serve");
+		};
+		assert_eq!(thumb.source, microthumb::ThumbSource::EmbeddedPreview);
+		// 3:2, like the frame and unlike the letterboxed 4:3.
+		assert_eq!(thumb.image.width * 2, thumb.image.height * 3);
+		assert_eq!(
+			corners(&thumb.image, CAMERA_JPEG_COLOURS),
+			["white", "black", "cyan", "orange"]
+		);
+	}
+}
+
+/// A portrait shot's JPEG is stored as coded, sideways, with no orientation
+/// of its own; the primary image's quarter turn puts it upright.
+#[cfg(feature = "heif")]
+#[test]
+fn a_portrait_fujifilm_hif_turns_its_camera_jpeg_upright() {
+	let ThumbOutcome::Thumbnail(thumb) =
+		generate(Box::new(MemSource(FUJI_PORTRAIT.to_vec())), &spec(256)).unwrap()
+	else {
+		panic!("the camera JPEG must serve");
+	};
+	assert_eq!(thumb.source, microthumb::ThumbSource::EmbeddedPreview);
+	assert_eq!(thumb.image.width * 3, thumb.image.height * 2);
+	// A quarter turn counter-clockwise of white / black / cyan / orange.
+	assert_eq!(
+		corners(&thumb.image, CAMERA_JPEG_COLOURS),
+		["black", "orange", "white", "cyan"]
+	);
+}
+
+/// The same JPEG is what `locate_preview` hands a viewer, untouched: the
+/// item's exact bytes, with the orientation it needs for a portrait shot.
+#[cfg(feature = "heif")]
+#[test]
+fn a_fujifilm_hif_offers_its_camera_jpeg_as_the_preview() {
+	for (bytes, orientation) in [(FUJI, 1), (FUJI_PORTRAIT, 8)] {
+		let located = microthumb::locate_preview(&mut MemSource(bytes.to_vec()))
+			.unwrap()
+			.expect("the camera JPEG is the preview");
+		assert_eq!((located.width, located.height), (768, 512));
+		assert_eq!(located.orientation, orientation);
+		// Bare, like Fujifilm's: nothing ahead of its tables, no EXIF.
+		assert_eq!(located.exif_insert_at, Some(2));
+		assert_eq!(located.stream_orientation, None);
+		let jpeg = &bytes[located.offset as usize..(located.offset + located.len) as usize];
+		assert_eq!(jpeg[..2], [0xFF, 0xD8]);
+		assert_eq!(jpeg[jpeg.len() - 2..], [0xFF, 0xD9]);
+	}
+}
+
+/// JPEG thumbnails that cannot stand in for the shot — only a letterboxed
+/// 4:3 one and a stamp — leave the file to libheif: the HEVC grid decodes,
+/// and there is no preview to offer. So does an HEVC thumbnail, which
+/// libheif serves as it always has.
+#[cfg(feature = "heif")]
+#[test]
+fn a_heif_without_a_usable_camera_jpeg_goes_through_libheif() {
+	let unusable = include_bytes!("fixtures/heif/jpeg-thumbs-unusable.heic");
+	let ThumbOutcome::Thumbnail(thumb) =
+		generate(Box::new(MemSource(unusable.to_vec())), &spec(256)).unwrap()
+	else {
+		panic!("the grid must decode");
+	};
+	assert_eq!(thumb.source, microthumb::ThumbSource::Decoded);
+	assert_eq!(
+		corners(&thumb.image, GRID_COLOURS),
+		["red", "lime", "blue", "yellow"]
+	);
+
+	let hevc_thumb = include_bytes!("fixtures/heif/hevc-thumb.heic");
+	let ThumbOutcome::Thumbnail(thumb) =
+		generate(Box::new(MemSource(hevc_thumb.to_vec())), &spec(64)).unwrap()
+	else {
+		panic!("the HEVC thumbnail must serve");
+	};
+	assert_eq!(thumb.source, microthumb::ThumbSource::EmbeddedPreview);
+	assert_eq!((thumb.image.width, thumb.image.height), (160, 106));
+
+	for bytes in [&unusable[..], hevc_thumb, TRANSFORMED_GRIDS[1].1] {
+		assert_eq!(
+			microthumb::locate_preview(&mut MemSource(bytes.to_vec())).unwrap(),
+			None
+		);
+	}
 }
 
 // ---- svg ----

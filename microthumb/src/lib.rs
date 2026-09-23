@@ -127,9 +127,9 @@ impl ThumbSpec {
 }
 
 /// A complete JPEG living inside another container — the camera's own
-/// rendering of the shot beside the sensor mosaic — found by
-/// [`locate_preview`] and never decoded: the point is that these bytes can go
-/// to a viewer untouched.
+/// rendering of the shot beside the sensor mosaic of a RAW, or beside the
+/// HEVC of a Fujifilm HIF — found by [`locate_preview`] and never decoded: the
+/// point is that these bytes can go to a viewer untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocatedPreview {
 	/// Absolute offset of the SOI in the source.
@@ -267,7 +267,8 @@ pub trait FormatDecoder: Send + Sync {
 	fn detect(&self, prefix: &[u8]) -> bool;
 
 	/// The large JPEG this container embeds, located but not decoded. The
-	/// default is the honest answer for every format that IS the image.
+	/// default is the honest answer for every format that IS the image; HEIF
+	/// overrides it for the files that carry a JPEG rendering beside it.
 	fn locate_preview(
 		&self,
 		_src: &mut dyn ByteSource,

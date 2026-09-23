@@ -2231,7 +2231,8 @@ mod js_impls {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 	impl JsClient {
 		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
-		/// shot — into `writer`, as stored. See [`EmbeddedPreviewResult`].
+		/// shot or a Fujifilm HIF — into `writer`, as stored. See
+		/// [`EmbeddedPreviewResult`].
 		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreview")]
 		pub async fn write_embedded_preview(
 			&self,
@@ -2276,7 +2277,8 @@ mod js_impls {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
 	impl UnauthJsClient {
 		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
-		/// shot — into `writer`, as stored. See [`EmbeddedPreviewResult`].
+		/// shot or a Fujifilm HIF — into `writer`, as stored. See
+		/// [`EmbeddedPreviewResult`].
 		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "writeEmbeddedPreview")]
 		pub async fn write_embedded_preview(
 			&self,
@@ -2498,7 +2500,8 @@ mod js_impls {
 	#[uniffi::export]
 	impl JsClient {
 		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
-		/// shot — to `file_path`, as stored. See [`EmbeddedPreviewResult`].
+		/// shot or a Fujifilm HIF — to `file_path`, as stored. See
+		/// [`EmbeddedPreviewResult`].
 		///
 		/// Written beside the destination and renamed into place, so nothing
 		/// a viewer might cache ever sits at the path half-finished; on
@@ -2568,7 +2571,8 @@ mod js_impls {
 	#[uniffi::export]
 	impl UnauthJsClient {
 		/// Writes a file's embedded preview — the camera's own JPEG of a RAW
-		/// shot — to `file_path`, as stored. See [`EmbeddedPreviewResult`].
+		/// shot or a Fujifilm HIF — to `file_path`, as stored. See
+		/// [`EmbeddedPreviewResult`].
 		///
 		/// Written beside the destination and renamed into place, so nothing
 		/// a viewer might cache ever sits at the path half-finished; on
@@ -3419,6 +3423,33 @@ mod tests {
 		let (preview, _) = write(raw_with(&plain, 3, plain.len() as u32));
 		assert!(preview.app1.is_some());
 		assert_eq!(preview.viewer_orientation(), 3);
+	}
+
+	/// A Fujifilm HIF's camera JPEG is its preview. A portrait shot's is bare
+	/// and stored sideways, so the HIF's quarter turn is spliced in; every
+	/// other byte is the item's own.
+	#[cfg(feature = "heif-decoder")]
+	#[test]
+	fn a_portrait_fujifilm_hifs_camera_jpeg_goes_out_turned_upright() {
+		use image::{ImageDecoder, metadata::Orientation};
+
+		let hif = include_bytes!("../../microthumb/tests/fixtures/heif/fuji-irot1.heic");
+		let (preview, out) = write(hif.to_vec());
+		let start = preview.located.offset as usize;
+		let jpeg = &hif[start..start + preview.located.len as usize];
+		let at = usize::from(preview.located.exif_insert_at.expect("a splice point"));
+		assert_eq!(at, 2, "nothing ahead of a bare JPEG's tables");
+		assert_eq!(out.len(), jpeg.len() + ORIENTATION_APP1_LEN);
+		assert_eq!(&out[..at], &jpeg[..at]);
+		assert_eq!(&out[at + ORIENTATION_APP1_LEN..], &jpeg[at..]);
+
+		let mut decoder = image::ImageReader::new(std::io::Cursor::new(&out))
+			.with_guessed_format()
+			.unwrap()
+			.into_decoder()
+			.unwrap();
+		assert_eq!(decoder.dimensions(), (768, 512));
+		assert_eq!(decoder.orientation().unwrap(), Orientation::Rotate270);
 	}
 
 	/// A source that hands out a fixed prefix and claims to be much longer:

@@ -160,7 +160,7 @@ struct Walk {
 /// One box header at `at`, as `(kind, body, body_end)`, or `None` when it
 /// does not fit inside `end` — a tree that is forged or truncated, where the
 /// caller stops rather than guessing where the next box starts.
-fn read_box(src: &mut dyn ByteSource, at: u64, end: u64) -> Option<([u8; 4], u64, u64)> {
+pub(super) fn read_box(src: &mut dyn ByteSource, at: u64, end: u64) -> Option<([u8; 4], u64, u64)> {
 	let header = raw::read_exact_at(src, at, BOX_HEADER)?;
 	let kind: [u8; 4] = header[4..8].try_into().expect("four bytes");
 	let mut size = u64::from(u32::from_be_bytes(

@@ -1,18 +1,28 @@
 //! HEIC/HEIF via the vendored libheif, and AVIF too where its AV1 backend
-//! exists (native — see `AV1_BRANDS`). Two memory-bounded paths, in order:
-//! the embedded `thmb` item (every iPhone HEIC carries one — the whole probe
-//! costs a couple of container reads), then tile-wise decode of the grid
-//! (Apple encodes 512×512 tiles), each tile pushed into the sink and freed
-//! before the next. Un-tiled non-Apple HEIFs only offer a whole-frame decode,
-//! priced like one big tile and left to the budget check.
+//! exists (native — see `AV1_BRANDS`).
+//!
+//! A file carrying a JPEG thumbnail item that can stand in for the whole shot
+//! — every Fujifilm HIF does — is served from that JPEG alone, found by the
+//! walk in [`meta`] and decoded by the JPEG path; libheif, built without a
+//! JPEG decoder, never sees it. Everything else takes two memory-bounded
+//! paths through libheif, in order: the embedded `thmb` item (every iPhone
+//! HEIC carries one — the whole probe costs a couple of container reads),
+//! then tile-wise decode of the grid (Apple encodes 512×512 tiles), each tile
+//! pushed into the sink and freed before the next. Un-tiled non-Apple HEIFs
+//! only offer a whole-frame decode, priced like one big tile and left to the
+//! budget check.
+
+mod meta;
 
 use heif_decoder::{ChromaFormat, HeifSession, HeifTiling};
 use image::RgbaImage;
 
 use crate::{
-	ByteSource, FormatDecoder, PixelSink, PreparedDecode, SeqReader, SmallImage, ThumbError,
-	ThumbSpec,
+	ByteSource, FormatDecoder, LocatedPreview, MIN_PREVIEW_LONG_SIDE, PixelSink, PreparedDecode,
+	SeqReader, SmallImage, ThumbError, ThumbSpec,
 };
+
+use super::raw::{self, Index, Preview};
 
 pub struct Heif;
 
@@ -73,11 +83,31 @@ impl FormatDecoder for Heif {
 				.any(|brand| &prefix[8..12] == *brand)
 	}
 
+	fn locate_preview(
+		&self,
+		src: &mut dyn ByteSource,
+	) -> Result<Option<LocatedPreview>, ThumbError> {
+		Ok(camera_jpeg(src).and_then(|(preview, orientation)| {
+			raw::locate(Index {
+				orientation,
+				preview: Some(preview),
+				jpeg: Some(preview),
+			})
+		}))
+	}
+
 	fn open(
 		&self,
-		src: Box<dyn ByteSource>,
+		mut src: Box<dyn ByteSource>,
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
+		// The camera's own JPEG of the shot beats the HEVC outright: it is
+		// 1600 px or more on its long side on every Fujifilm body, as large as
+		// any canvas this crate fills, and decoding it costs a few megabytes
+		// where one HIF tile costs tens.
+		if let Some((preview, orientation)) = camera_jpeg(&mut *src) {
+			return raw::prepare(src, preview, orientation, spec);
+		}
 		let len = src.len();
 		let session = HeifSession::new(SeqReader::new(src), len).map_err(decode_err)?;
 		let bytes_per_pixel = decode_bytes_per_pixel(
@@ -292,6 +322,38 @@ fn push_clipped(sink: &mut dyn PixelSink, block: &RgbaImage, area: Area) -> Resu
 		sink.push(dst_x, dst_y + r, width, &data[start..start + row_bytes])?;
 	}
 	Ok(())
+}
+
+/// The largest JPEG thumbnail item that can stand in for the primary image,
+/// with the orientation to show it in: verified as a JPEG by its own SOF, at
+/// least [`MIN_PREVIEW_LONG_SIDE`] on its long side, and in the primary's own
+/// aspect ratio.
+///
+/// The aspect check is what keeps the other two Fujifilm thumbnails out. Only
+/// the largest (1920x1280 on X bodies, 1600x1200 on GFX) follows the frame;
+/// the 640x480 and 160x120 are 4:3 whatever the frame, letterboxed onto every
+/// 3:2 shot.
+fn camera_jpeg(src: &mut dyn ByteSource) -> Option<(Preview, u8)> {
+	let meta = meta::read(src)?;
+	meta.jpeg_thumbnails
+		.iter()
+		.filter_map(|thumbnail| {
+			let preview = raw::jpeg_window(src, thumbnail.offset, thumbnail.len)?;
+			Some((preview, thumbnail.orientation))
+		})
+		.filter(|(preview, _)| {
+			let (width, height) = preview.dims();
+			width.max(height) >= MIN_PREVIEW_LONG_SIDE
+				&& same_aspect((width, height), meta.primary_size)
+		})
+		.max_by_key(|(preview, _)| preview.area())
+}
+
+/// Whether two sizes share an aspect ratio, to within the rounding of a
+/// downscaled rendering: 1%.
+fn same_aspect((w1, h1): (u32, u32), (w2, h2): (u32, u32)) -> bool {
+	let (a, b) = (u64::from(w1) * u64::from(h2), u64::from(h1) * u64::from(w2));
+	a.abs_diff(b) * 100 <= a.max(b)
 }
 
 /// The per-pixel rate for a decode of this depth and chroma format; an image
