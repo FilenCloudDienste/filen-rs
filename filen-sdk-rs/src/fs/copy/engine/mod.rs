@@ -749,21 +749,25 @@ where
 	}
 
 	fn file_finished(&mut self, outcome: FileOutcome) {
-		let planned = &self.plan.files[outcome.index];
+		let FileOutcome {
+			index,
+			parent,
+			top_level,
+			result,
+		} = outcome;
+		let planned = &self.plan.files[index];
 		let request = planned.request;
 		let active = ActiveFile {
 			source_uuid: planned.source.uuid(),
 			dest_uuid: planned.dest_uuid,
-			dest_parent: outcome.parent,
+			dest_parent: parent,
 			name: planned.name.as_ref().to_owned(),
 			size: planned.size,
 			bytes_done: 0,
 		};
-		let top_level = outcome.top_level;
-		match outcome.result {
+		match result {
 			Ok((file, name)) => {
 				if top_level {
-					let planned = &self.plan.files[outcome.index];
 					let renamed = renamed_top_level(
 						active.source_uuid,
 						&planned.source_path,
@@ -790,56 +794,53 @@ where
 			Err(FileError::Stopped) => self.reporter.file_abandoned(active.dest_uuid),
 			// Not a copy the user can keep or trash: trashing it would trash the existing file.
 			// It counts as failed, so the counts still add up to the totals.
-			Err(FileError::RegisteredAsVersion(file)) => {
-				let dest_parent_dir =
-					self.failed_item_parent(self.plan.files[outcome.index].parent);
-				let planned = &self.plan.files[outcome.index];
-				let info = FailureInfo {
-					source_uuid: active.source_uuid,
-					source_path: planned.source_path.clone(),
-					dest_parent: outcome.parent,
-					dest_parent_dir,
-					dest_name: file.name().map_or(active.name, str::to_owned),
-					stage: CopyStage::RegisteredAsVersion,
-					error: Arc::new(Error::custom(
-						ErrorKind::InvalidState,
-						"the copy was registered as a new version of an existing file",
-					)),
-					affected_files: 1,
-					affected_bytes: planned.size,
-					existing_file: Some(file.stable_uuid.into()),
-				};
-				self.reporter.file_failed(active.dest_uuid, info.clone());
-				self.report.failures.push(CopyFailure {
-					source: FailedSource::File(Box::new(planned.source.clone())),
-					info,
-				});
-			}
+			Err(FileError::RegisteredAsVersion(file)) => self.record_file_failure(
+				index,
+				parent,
+				file.name().map_or(active.name, str::to_owned),
+				CopyStage::RegisteredAsVersion,
+				Arc::new(Error::custom(
+					ErrorKind::InvalidState,
+					"the copy was registered as a new version of an existing file",
+				)),
+				Some(file.stable_uuid.into()),
+			),
 			Err(FileError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
-				let dest_parent_dir =
-					self.failed_item_parent(self.plan.files[outcome.index].parent);
-				let planned = &self.plan.files[outcome.index];
-				let info = FailureInfo {
-					source_uuid: active.source_uuid,
-					source_path: planned.source_path.clone(),
-					dest_parent: outcome.parent,
-					dest_parent_dir,
-					dest_name: active.name.clone(),
-					stage,
-					error,
-					affected_files: 1,
-					affected_bytes: planned.size,
-					existing_file: None,
-				};
-				self.reporter.file_failed(active.dest_uuid, info.clone());
-				self.report.failures.push(CopyFailure {
-					source: FailedSource::File(Box::new(planned.source.clone())),
-					info,
-				});
+				self.record_file_failure(index, parent, active.name, stage, error, None);
 			}
 		}
+	}
+
+	/// Reports planned file `index` as failed and records it in the report.
+	fn record_file_failure(
+		&mut self,
+		index: usize,
+		dest_parent: Uuid,
+		dest_name: String,
+		stage: CopyStage,
+		error: Arc<Error>,
+		existing_file: Option<Uuid>,
+	) {
+		let planned = &self.plan.files[index];
+		let info = FailureInfo {
+			source_uuid: planned.source.uuid(),
+			source_path: planned.source_path.clone(),
+			dest_parent,
+			dest_parent_dir: self.failed_item_parent(planned.parent),
+			dest_name,
+			stage,
+			error,
+			affected_files: 1,
+			affected_bytes: planned.size,
+			existing_file,
+		};
+		self.reporter.file_failed(planned.dest_uuid, info.clone());
+		self.report.failures.push(CopyFailure {
+			source: FailedSource::File(Box::new(planned.source.clone())),
+			info,
+		});
 	}
 
 	/// A destination may have been shared or linked while the copy ran; items created before
