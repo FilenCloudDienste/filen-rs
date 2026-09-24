@@ -24,7 +24,7 @@ use crate::{
 
 use super::{
 	ActiveFile, CopyCounts, CopyPhase, CopyStage, PlanTotals, RenameReason, RunState, ScanProgress,
-	SkipReason,
+	SkippedEntry,
 };
 
 /// One item to copy into its own destination, optionally under another name.
@@ -85,13 +85,6 @@ pub struct CopyFileDone {
 }
 
 #[js_type(export, no_deser)]
-pub struct CopySkippedEntry {
-	pub source_path: String,
-	pub bytes: u64,
-	pub reason: SkipReason,
-}
-
-#[js_type(export, no_deser)]
 pub struct CopyRenamedEntry {
 	pub source_uuid: Uuid,
 	pub source_path: String,
@@ -114,7 +107,7 @@ pub enum CopyEvent {
 	FileStarted(ActiveFile),
 	FileDone(CopyFileDone),
 	FileFailed(CopyFailureInfo),
-	Skipped(CopySkippedEntry),
+	Skipped(SkippedEntry),
 	Renamed(CopyRenamedEntry),
 	PropagationFailed(CopyItemError),
 	ColorFailed(CopyItemError),
@@ -171,7 +164,7 @@ pub struct CopyReport {
 	/// Top-level items created, in creation order.
 	pub top_level: Vec<CopiedTopLevelItem>,
 	pub failures: Vec<CopyFailure>,
-	pub skipped: Vec<CopySkippedEntry>,
+	pub skipped: Vec<SkippedEntry>,
 	pub renamed: Vec<CopyRenamedEntry>,
 	pub totals: PlanTotals,
 	pub counts: CopyCounts,
@@ -293,16 +286,6 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 	}
 }
 
-impl From<&api::SkippedEntry> for CopySkippedEntry {
-	fn from(entry: &api::SkippedEntry) -> Self {
-		Self {
-			source_path: entry.source_path.clone(),
-			bytes: entry.bytes,
-			reason: entry.reason,
-		}
-	}
-}
-
 impl From<&api::RenamedEntry> for CopyRenamedEntry {
 	fn from(entry: &api::RenamedEntry) -> Self {
 		Self {
@@ -344,15 +327,7 @@ impl From<api::CopyEvent> for CopyEvent {
 				size,
 			}),
 			api::CopyEvent::FileFailed(info) => Self::FileFailed((&info).into()),
-			api::CopyEvent::Skipped(api::SkippedEntry {
-				source_path,
-				bytes,
-				reason,
-			}) => Self::Skipped(CopySkippedEntry {
-				source_path,
-				bytes,
-				reason,
-			}),
+			api::CopyEvent::Skipped(entry) => Self::Skipped(entry),
 			api::CopyEvent::Renamed(api::RenamedEntry {
 				source_uuid,
 				source_path,
@@ -434,7 +409,7 @@ impl From<api::CopyReport> for CopyReport {
 					item: failure.source.into(),
 				})
 				.collect(),
-			skipped: report.skipped.iter().map(Into::into).collect(),
+			skipped: report.skipped,
 			renamed: report.renamed.iter().map(Into::into).collect(),
 			totals: report.totals,
 			counts: report.counts,

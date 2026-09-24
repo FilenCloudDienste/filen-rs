@@ -154,7 +154,7 @@ pub enum SkipReason {
 	Unreachable { count: u64 },
 }
 
-#[derive(Debug, Clone)]
+#[js_type(export, no_deser)]
 pub struct SkippedEntry {
 	pub source_path: String,
 	pub bytes: u64,
