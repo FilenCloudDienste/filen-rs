@@ -273,6 +273,31 @@ impl<D> Default for CopyReport<D> {
 	}
 }
 
+/// A copy that ended early: cancelled, or stopped by an error that affects the whole job.
+#[derive(Debug, thiserror::Error)]
+#[error("the copy ended early: {error}")]
+pub struct CopyFailed<D> {
+	/// What the copy did before it ended.
+	pub report: CopyReport<D>,
+	/// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) after a cancel, or the error that
+	/// ended the copy. Shared with the failure it came from when one item's error ended the
+	/// whole copy, since [`Error`] is not `Clone`.
+	#[source]
+	pub error: Arc<Error>,
+}
+
+impl<D> From<CopyFailed<D>> for Error {
+	/// The error that ended the copy: the original once nothing else holds it, or else an error
+	/// of the same kind wrapping the shared one.
+	fn from(failed: CopyFailed<D>) -> Self {
+		let CopyFailed { report, error } = failed;
+		// the report may hold the error too, in the failure it came from
+		drop(report);
+		Arc::try_unwrap(error)
+			.unwrap_or_else(|shared| Error::custom_with_source(shared.kind(), shared, None::<&str>))
+	}
+}
+
 /// Receives a copy's progress. All calls come from one [`Reporter`], in order.
 pub trait CopyCallback: MaybeSendSync + 'static {
 	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>);

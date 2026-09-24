@@ -31,9 +31,9 @@ use crate::{
 
 use super::{
 	backend::ClientBackend,
-	engine::{CopyOutcome, run_copy},
+	engine::run_copy,
 	plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
-	report::{CopyCallback, CopyPhase, CopyReport, Reporter, ScanProgress},
+	report::{CopyCallback, CopyFailed, CopyPhase, CopyReport, Reporter, ScanProgress},
 };
 
 /// A directory to copy, with what is needed to list it.
@@ -173,7 +173,7 @@ impl Client {
 		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
-	) -> CopyOutcome<CopySourceDir> {
+	) -> Result<CopyReport<CopySourceDir>, CopyFailed<CopySourceDir>> {
 		let requests = sources
 			.into_iter()
 			.map(|source| CopyRequest {
@@ -195,16 +195,16 @@ impl Client {
 	/// and can be paused, resumed and cancelled through `control` in every phase. A failed item
 	/// does not stop the others; running out of storage stops the copy.
 	///
-	/// The outcome always carries the report (what was created, what failed, what was skipped);
-	/// its result is `Err` with [`ErrorKind::Cancelled`] after a cancel, or the error that ended
-	/// the copy.
+	/// Returns the report (what was created, what failed, what was skipped). A copy that ended
+	/// early fails with the report so far, and [`ErrorKind::Cancelled`] after a cancel or the
+	/// error that ended it.
 	pub async fn copy_items_to(
 		self: Arc<Self>,
 		requests: Vec<CopyRequest>,
 		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
-	) -> CopyOutcome<CopySourceDir> {
+	) -> Result<CopyReport<CopySourceDir>, CopyFailed<CopySourceDir>> {
 		let reporter = Reporter::new(callback);
 		let destination_dirs = requests
 			.iter()
@@ -237,10 +237,10 @@ impl Client {
 					ScanError::Failed(error) => (CopyPhase::Failed, error),
 				};
 				reporter.finish(phase);
-				return CopyOutcome {
+				return Err(CopyFailed {
 					report: CopyReport::default(),
-					result: Err(error),
-				};
+					error: Arc::new(error),
+				});
 			}
 		};
 		let backend = Arc::new(ClientBackend::new(self));

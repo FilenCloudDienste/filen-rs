@@ -65,8 +65,8 @@ use super::{
 	naming::TakenNames,
 	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 	report::{
-		ActiveFile, CopiedTopLevel, CopyEvent, CopyFailure, CopyPhase, CopyReport, CopyStage,
-		FailedSource, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
+		ActiveFile, CopiedTopLevel, CopyEvent, CopyFailed, CopyFailure, CopyPhase, CopyReport,
+		CopyStage, FailedSource, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
 	},
 };
 
@@ -215,25 +215,12 @@ pub(crate) trait CopyBackend: MaybeSendSync + 'static {
 	) -> impl Future<Output = Result<RemoteFile, Error>> + MaybeSend;
 }
 
-/// A copy's report plus how it ended.
-#[derive(Debug)]
-pub struct CopyOutcome<D> {
-	pub report: CopyReport<D>,
-	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
-	pub result: Result<(), Error>,
-}
-
 /// Errors after which nothing else can succeed either.
 fn ends_job(error: &Error) -> bool {
 	matches!(
 		error.kind(),
 		ErrorKind::MaxStorageReached | ErrorKind::Unauthenticated
 	)
-}
-
-/// A copy of `error` for returning while the original stays in the failure records.
-fn job_error(error: &Arc<Error>) -> Error {
-	Error::custom_with_source(error.kind(), Arc::clone(error), None::<&str>)
 }
 
 /// A created directory with the name it got, or why it was not created.
@@ -301,7 +288,7 @@ pub(crate) async fn run_copy<B, D>(
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
-) -> CopyOutcome<D>
+) -> Result<CopyReport<D>, CopyFailed<D>>
 where
 	B: CopyBackend,
 	D: Clone + MaybeSendSync + 'static,
@@ -333,9 +320,12 @@ where
 	};
 	let result = job.run().await;
 	job.report.counts = job.reporter.counts();
-	CopyOutcome {
-		report: job.report,
-		result,
+	match result {
+		Ok(()) => Ok(job.report),
+		Err(error) => Err(CopyFailed {
+			report: job.report,
+			error,
+		}),
 	}
 }
 
@@ -344,7 +334,8 @@ where
 	B: CopyBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
-	async fn run(&mut self) -> Result<(), Error> {
+	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
+	async fn run(&mut self) -> Result<(), Arc<Error>> {
 		self.reporter
 			.set_plan(self.plan.totals, &self.report.skipped, &self.report.renamed);
 		self.reporter.top_level_planned(self.planned_top_level());
@@ -361,14 +352,17 @@ where
 		.await;
 
 		let (phase, result) = match (outcome, &self.fatal) {
-			(_, Some(error)) => (CopyPhase::Failed, Err(job_error(error))),
+			(_, Some(error)) => (CopyPhase::Failed, Err(Arc::clone(error))),
 			(Err(Stopped), None) if self.control.is_cancelled() => (
 				CopyPhase::Cancelled,
-				Err(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
+				Err(Arc::new(Error::custom(
+					ErrorKind::Cancelled,
+					"copy cancelled",
+				))),
 			),
 			(Err(Stopped), None) => (
 				CopyPhase::Failed,
-				Err(Error::custom(ErrorKind::Internal, "copy stopped")),
+				Err(Arc::new(Error::custom(ErrorKind::Internal, "copy stopped"))),
 			),
 			(Ok(()), None) => (CopyPhase::Done, Ok(())),
 		};

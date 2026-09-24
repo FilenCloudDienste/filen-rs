@@ -14,10 +14,9 @@ mod report;
 
 pub use crate::job::{JobControl, JobController};
 pub use client_impl::{CopyConfig, CopyRequest, CopySource, CopySourceDir};
-pub use engine::CopyOutcome;
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
 pub use report::{
-	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyFailure, CopyPhase,
-	CopyReport, CopyStage, CopyUpdate, FailedSource, FailureInfo, PlannedTopLevelItem, RunState,
-	ScanProgress,
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyFailed, CopyFailure,
+	CopyPhase, CopyReport, CopyStage, CopyUpdate, FailedSource, FailureInfo, PlannedTopLevelItem,
+	RunState, ScanProgress,
 };

@@ -10,9 +10,9 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		categories::DirType,
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyConfig, CopyEvent, CopyPhase, CopyRequest,
-			CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl, JobController,
-			PlannedTopLevelItem,
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyEvent, CopyFailed, CopyPhase,
+			CopyRequest, CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl,
+			JobController, PlannedTopLevelItem,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
@@ -45,7 +45,7 @@ async fn copy_tree_keeps_contents_and_metadata() {
 		.unwrap();
 
 	let recorder = Arc::new(Recorder::default());
-	let outcome = client
+	let report = client
 		.clone()
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
@@ -54,16 +54,16 @@ async fn copy_tree_keeps_contents_and_metadata() {
 			recorder.clone(),
 			JobControl::default(),
 		)
-		.await;
-	outcome.result.unwrap();
-	assert!(outcome.report.failures.is_empty());
-	assert_eq!(outcome.report.counts.files_done, 3);
-	assert_eq!(outcome.report.counts.dirs_created, 2);
-	assert_eq!(outcome.report.top_level.len(), 1);
+		.await
+		.unwrap();
+	assert!(report.failures.is_empty());
+	assert_eq!(report.counts.files_done, 3);
+	assert_eq!(report.counts.dirs_created, 2);
+	assert_eq!(report.top_level.len(), 1);
 	assert_eq!(recorder.created.lock().unwrap().len(), 1);
 	assert_eq!(
 		recorder.planned.lock().unwrap()[0].dest_uuid,
-		outcome.report.top_level[0].item.uuid()
+		report.top_level[0].item.uuid()
 	);
 	assert_eq!(
 		recorder.updates.lock().unwrap().last().unwrap().phase,
@@ -104,7 +104,7 @@ async fn copying_into_the_same_parent_keeps_both() {
 	let file = upload(&client, test_dir, "a.txt", b"content").await;
 
 	for expected in ["a (1).txt", "a (2).txt"] {
-		let outcome = client
+		let report = client
 			.clone()
 			.copy_items(
 				vec![CopySource::File(file.clone().into())],
@@ -113,10 +113,10 @@ async fn copying_into_the_same_parent_keeps_both() {
 				Arc::new(Recorder::default()),
 				JobControl::default(),
 			)
-			.await;
-		outcome.result.unwrap();
+			.await
+			.unwrap();
 		assert_eq!(
-			outcome.report.top_level[0].item.name(),
+			report.top_level[0].item.name(),
 			Some(expected),
 			"the copy gets the next free name"
 		);
@@ -132,7 +132,7 @@ async fn copying_a_directory_into_itself_is_rejected() {
 	let sub = client.create_dir(&(&source).into(), "sub").await.unwrap();
 
 	for destination in [&source, &sub] {
-		let outcome = client
+		let CopyFailed { error, .. } = client
 			.clone()
 			.copy_items(
 				vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
@@ -141,8 +141,9 @@ async fn copying_a_directory_into_itself_is_rejected() {
 				Arc::new(Recorder::default()),
 				JobControl::default(),
 			)
-			.await;
-		assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::InvalidState);
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 	let (dirs, files) = contents(&client, &source).await;
 	assert_eq!((dirs.len(), files.len()), (1, 0), "nothing was created");
@@ -174,7 +175,7 @@ async fn copy_completes_on_a_small_memory_budget() {
 		.await
 		.unwrap();
 
-	let outcome = client
+	client
 		.clone()
 		.copy_items(
 			originals
@@ -187,8 +188,8 @@ async fn copy_completes_on_a_small_memory_budget() {
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
-		.await;
-	outcome.result.unwrap();
+		.await
+		.unwrap();
 
 	let (_, files) = contents(&client, &destination).await;
 	assert_eq!(files.len(), 4);
@@ -240,7 +241,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 	};
 
 	// copying it into itself is rejected
-	let outcome = client
+	let CopyFailed { error, .. } = client
 		.clone()
 		.copy_items(
 			vec![linked_source()],
@@ -249,8 +250,9 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
-		.await;
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::InvalidState);
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
 
 	// the destination: a directory inside another public link, so the copy must be added to
 	// that link too
@@ -261,7 +263,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 		.unwrap();
 	let destination_link = link_info(&client, &linked).await;
 
-	let outcome = client
+	let report = client
 		.clone()
 		.copy_items(
 			vec![linked_source()],
@@ -270,9 +272,9 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
-		.await;
-	outcome.result.unwrap();
-	let copied_root = outcome.report.top_level[0].item.uuid();
+		.await
+		.unwrap();
+	let copied_root = report.top_level[0].item.uuid();
 
 	let (dirs, _) = unauthed
 		.list_linked_dir::<fn(u64, Option<u64>)>(
@@ -329,7 +331,7 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 		}
 	}
 	let recorder = Arc::new(Recorder::default());
-	let outcome = client
+	let CopyFailed { report, error } = client
 		.clone()
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
@@ -338,10 +340,11 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 			CancelOnCreate(recorder.clone(), controller),
 			control,
 		)
-		.await;
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_eq!(
-		outcome.report.top_level.len(),
+		report.top_level.len(),
 		1,
 		"the created directory is reported"
 	);
@@ -415,7 +418,7 @@ async fn copies_from_public_links() {
 		.unwrap();
 
 	// without the password the listing is refused and nothing is created
-	let outcome = copy(
+	let CopyFailed { error, .. } = copy(
 		&client,
 		vec![CopySource::Dir(CopySourceDir::Linked(
 			DirType::Root(Cow::Owned(info.root.clone())),
@@ -423,8 +426,9 @@ async fn copies_from_public_links() {
 		))],
 		&destination,
 	)
-	.await;
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::WrongPassword);
+	.await
+	.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WrongPassword);
 	let (dirs, files) = contents(&client, &destination).await;
 	assert!(dirs.is_empty() && files.is_empty());
 
@@ -446,7 +450,7 @@ async fn copies_from_public_links() {
 		.get_linked_file(file_link.uuid(), file_key.as_ref(), None)
 		.await
 		.unwrap();
-	let outcome = copy(
+	let report = copy(
 		&client,
 		vec![
 			CopySource::Dir(CopySourceDir::Linked(
@@ -457,9 +461,9 @@ async fn copies_from_public_links() {
 		],
 		&destination,
 	)
-	.await;
-	outcome.result.unwrap();
-	assert!(outcome.report.failures.is_empty());
+	.await
+	.unwrap();
+	assert!(report.failures.is_empty());
 	let (_, copied) = contents(&client, &destination).await;
 	assert_same_files(
 		&client,
@@ -490,7 +494,7 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 			destination: destination.clone().into(),
 			name: name.map(str::to_owned),
 		};
-	let outcome = client
+	let report = client
 		.clone()
 		.copy_items_to(
 			vec![
@@ -512,11 +516,10 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
-		.await;
-	outcome.result.unwrap();
+		.await
+		.unwrap();
 	let name_of = |request: usize| {
-		outcome
-			.report
+		report
 			.top_level
 			.iter()
 			.find(|t| t.request == request)
@@ -544,7 +547,7 @@ async fn copies_into_the_drive_root() {
 	let client = resources.client.clone();
 	let name = format!("rs-copy-{}.txt", uuid::Uuid::new_v4());
 	let file = upload(&client, &resources.dir, &name, b"to the root").await;
-	let outcome = client
+	let result = client
 		.clone()
 		.copy_items(
 			vec![CopySource::File(file.into())],
@@ -554,8 +557,12 @@ async fn copies_into_the_drive_root() {
 			JobControl::default(),
 		)
 		.await;
-	let copied = outcome
-		.report
+	// whatever was created is cleaned up, even when the copy failed
+	let report = match &result {
+		Ok(report) => report,
+		Err(failed) => &failed.report,
+	};
+	let copied = report
 		.top_level
 		.first()
 		.map(|t| client.get_file(t.item.uuid()));
@@ -567,7 +574,7 @@ async fn copies_into_the_drive_root() {
 		client: client.clone(),
 		file: copied.clone(),
 	};
-	outcome.result.unwrap();
+	result.unwrap();
 	let copied = copied.expect("the copy was created");
 	assert_eq!(copied.name(), Some(name.as_str()));
 	assert_eq!(
@@ -594,7 +601,7 @@ async fn names_clash_the_way_the_server_compares_them() {
 	upload(&client, &destination, "A.TXT", b"upper").await;
 	upload(&client, &destination, "ÄBC.txt", b"upper umlaut").await;
 
-	let outcome = copy(
+	let report = copy(
 		&client,
 		vec![
 			CopySource::File(lower.into()),
@@ -602,10 +609,9 @@ async fn names_clash_the_way_the_server_compares_them() {
 		],
 		&destination,
 	)
-	.await;
-	outcome.result.unwrap();
-	let names: Vec<_> = outcome
-		.report
+	.await
+	.unwrap();
+	let names: Vec<_> = report
 		.top_level
 		.iter()
 		.map(|t| t.item.name().unwrap().to_owned())
@@ -614,9 +620,10 @@ async fn names_clash_the_way_the_server_compares_them() {
 	assert!(names.contains(&"äbc (1).txt".to_owned()), "{names:?}");
 
 	// a name at the byte limit, copied next to itself, is shortened to fit its counter
-	let outcome = copy(&client, vec![CopySource::File(long.into())], &source).await;
-	outcome.result.unwrap();
-	let copied = outcome.report.top_level[0].item.name().unwrap().to_owned();
+	let report = copy(&client, vec![CopySource::File(long.into())], &source)
+		.await
+		.unwrap();
+	let copied = report.top_level[0].item.name().unwrap().to_owned();
 	assert_ne!(copied, long_name);
 	assert!(copied.len() <= 255, "{} bytes", copied.len());
 	assert!(copied.ends_with(" (1).txt"), "{copied}");
@@ -689,14 +696,14 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 		.await
 		.unwrap();
 
-	let outcome = copy(
+	let report = copy(
 		&client,
 		vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
 		&destination,
 	)
-	.await;
-	outcome.result.unwrap();
-	assert!(outcome.report.failures.is_empty());
+	.await
+	.unwrap();
+	assert!(report.failures.is_empty());
 	let (source_dirs, source_files) = contents(&client, &source).await;
 	let (copied_dirs, copied_files) = contents(&client, &destination).await;
 	let mut expected_dirs: Vec<String> = std::iter::once("source".to_owned())
@@ -742,7 +749,7 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 	let (control, controller) = JobControl::new();
 	controller.cancel();
 	let recorder = Arc::new(Recorder::default());
-	let outcome = client
+	let CopyFailed { error, .. } = client
 		.clone()
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
@@ -751,8 +758,9 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 			recorder.clone(),
 			control,
 		)
-		.await;
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_eq!(
 		recorder.updates.lock().unwrap().last().unwrap().phase,
 		CopyPhase::Cancelled
@@ -806,8 +814,7 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 		controller.resume();
 	}
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	running.await.unwrap().unwrap();
 	let (_, copied) = contents(&client, &destination).await;
 	assert_eq!(copied.len(), 4, "no file is copied twice");
 	let paths: Vec<String> = (0..4).map(|i| format!("source/f{i}")).collect();
@@ -852,7 +859,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 		.unwrap();
 
 	let recorder = Arc::new(Recorder::default());
-	let outcome = client
+	let report = client
 		.clone()
 		.copy_items(
 			vec![
@@ -864,19 +871,16 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 			recorder.clone(),
 			JobControl::default(),
 		)
-		.await;
-	outcome.result.as_ref().unwrap();
-	let [failure] = outcome.report.failures.as_slice() else {
-		panic!("one failure: {:?}", outcome.report.failures);
+		.await
+		.unwrap();
+	let [failure] = report.failures.as_slice() else {
+		panic!("one failure: {:?}", report.failures);
 	};
 	assert_eq!(failure.info.stage, CopyStage::Download);
 	assert_eq!(failure.info.error.kind(), ErrorKind::FileChunkNotFound);
 	assert_eq!(failure.info.dest_name, "gone.bin");
 	assert_eq!(failure.info.dest_parent_dir.uuid(), destination.uuid());
-	assert_eq!(
-		outcome.report.counts.files_done, 1,
-		"the other file is copied"
-	);
+	assert_eq!(report.counts.files_done, 1, "the other file is copied");
 	assert!(recorder.updates.lock().unwrap().iter().any(|u| {
 		u.events
 			.iter()
@@ -885,7 +889,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 
 	// the failed source can never be read, so the retry copies the real file, into the
 	// failure's directory under the failure's name
-	let retry = client
+	client
 		.clone()
 		.copy_items_to(
 			vec![CopyRequest {
@@ -897,8 +901,8 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
-		.await;
-	retry.result.unwrap();
+		.await
+		.unwrap();
 	let (_, copied) = contents(&client, &destination).await;
 	assert_same_files(
 		&client,
@@ -932,15 +936,12 @@ async fn max_bytes_is_checked_before_anything_is_written() {
 		)
 	};
 
-	let outcome = copy_with(1023).await;
-	assert_eq!(
-		outcome.result.unwrap_err().kind(),
-		ErrorKind::MaxStorageReached
-	);
+	let CopyFailed { error, .. } = copy_with(1023).await.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
 	let (dirs, files) = contents(&client, &destination).await;
 	assert!(dirs.is_empty() && files.is_empty(), "nothing was written");
 
-	copy_with(1024).await.result.unwrap();
+	copy_with(1024).await.unwrap();
 	let (_, files) = contents(&client, &destination).await;
 	assert_eq!(files.len(), 2);
 }
@@ -958,7 +959,7 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
 	client.delete_dir_permanently(source.clone()).await.unwrap();
 	let recorder = Arc::new(Recorder::default());
-	let outcome = client
+	client
 		.clone()
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
@@ -967,8 +968,8 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 			recorder.clone(),
 			JobControl::default(),
 		)
-		.await;
-	assert!(outcome.result.is_err(), "a deleted source fails the scan");
+		.await
+		.expect_err("a deleted source fails the scan");
 	assert_eq!(
 		recorder.updates.lock().unwrap().last().unwrap().phase,
 		CopyPhase::Failed
@@ -979,12 +980,10 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 	let file = upload(&client, test_dir, "a.txt", b"nowhere to go").await;
 	let gone = client.create_dir(&test_dir.into(), "gone").await.unwrap();
 	client.delete_dir_permanently(gone.clone()).await.unwrap();
-	let outcome = copy(&client, vec![CopySource::File(file.into())], &gone).await;
-	assert!(
-		outcome.result.is_err(),
-		"a deleted destination fails the copy"
-	);
-	assert!(outcome.report.top_level.is_empty());
+	let failed = copy(&client, vec![CopySource::File(file.into())], &gone)
+		.await
+		.expect_err("a deleted destination fails the copy");
+	assert!(failed.report.top_level.is_empty());
 }
 
 // ── Undecryptable entries (needs the `malformed` feature) ───────────────────
@@ -1035,7 +1034,7 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 	let clash = upload(&client, test_dir, "clash.txt", b"clash").await;
 	let clash_uuid = clash.uuid();
 
-	let outcome = copy(
+	let report = copy(
 		&client,
 		vec![
 			CopySource::Dir(CopySourceDir::Normal(source)),
@@ -1043,9 +1042,8 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 		],
 		&destination,
 	)
-	.await;
-	outcome.result.unwrap();
-	let report = &outcome.report;
+	.await
+	.unwrap();
 	assert_eq!(report.skipped.len(), 1);
 	assert_eq!(
 		report.skipped[0].reason,

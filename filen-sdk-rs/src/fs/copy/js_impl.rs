@@ -431,9 +431,8 @@ impl From<api::CopiedTopLevel> for CopiedTopLevelItem {
 	}
 }
 
-impl From<api::CopyOutcome<api::CopySourceDir>> for CopyReport {
-	fn from(outcome: api::CopyOutcome<api::CopySourceDir>) -> Self {
-		let report = outcome.report;
+impl From<api::CopyReport<api::CopySourceDir>> for CopyReport {
+	fn from(report: api::CopyReport<api::CopySourceDir>) -> Self {
 		Self {
 			top_level: report.top_level.into_iter().map(Into::into).collect(),
 			failures: report
@@ -448,7 +447,16 @@ impl From<api::CopyOutcome<api::CopySourceDir>> for CopyReport {
 			renamed: report.renamed.iter().map(Into::into).collect(),
 			totals: report.totals,
 			counts: report.counts,
-			error: outcome.result.err().as_ref().map(CopyError::from),
+			error: None,
+		}
+	}
+}
+
+impl From<api::CopyFailed<api::CopySourceDir>> for CopyReport {
+	fn from(failed: api::CopyFailed<api::CopySourceDir>) -> Self {
+		Self {
+			error: Some(CopyError::from(failed.error.as_ref())),
+			..failed.report.into()
 		}
 	}
 }
@@ -489,7 +497,7 @@ fn copy_job(
 ) -> impl FnOnce(api::JobControl) -> CopyJobFuture + Send + 'static {
 	move |control| {
 		Box::pin(async move {
-			let outcome = client
+			let result = client
 				.copy_items_to(
 					requests,
 					api::CopyConfig { max_bytes },
@@ -497,7 +505,11 @@ fn copy_job(
 					control,
 				)
 				.await;
-			Ok(CopyReport::from(outcome))
+			// a copy that ended early still resolves, with the report of what it did
+			Ok(match result {
+				Ok(report) => report.into(),
+				Err(failed) => failed.into(),
+			})
 		})
 	}
 }
@@ -1006,15 +1018,12 @@ mod tests {
 
 	#[test]
 	fn a_report_carries_why_the_copy_ended() {
-		let cancelled = CopyReport::from(api::CopyOutcome::<api::CopySourceDir> {
+		let cancelled = CopyReport::from(api::CopyFailed::<api::CopySourceDir> {
 			report: api::CopyReport::default(),
-			result: Err(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
+			error: Arc::new(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
 		});
 		assert_eq!(cancelled.error.map(|e| e.kind), Some(ErrorKind::Cancelled));
-		let done = CopyReport::from(api::CopyOutcome::<api::CopySourceDir> {
-			report: api::CopyReport::default(),
-			result: Ok(()),
-		});
+		let done = CopyReport::from(api::CopyReport::<api::CopySourceDir>::default());
 		assert!(done.error.is_none());
 	}
 

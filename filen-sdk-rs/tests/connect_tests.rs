@@ -1056,7 +1056,7 @@ async fn copy_with_shares(
 		.find(|f| f.uuid() == solo.uuid())
 		.unwrap()
 		.clone();
-	let outcome = copy(
+	let report = copy(
 		&share_client,
 		vec![
 			CopySource::Dir(CopySourceDir::Shared(
@@ -1072,10 +1072,10 @@ async fn copy_with_shares(
 		],
 		share_test_dir,
 	)
-	.await;
-	outcome.result.unwrap();
-	assert!(outcome.report.failures.is_empty());
-	assert_eq!(outcome.report.top_level.len(), 4);
+	.await
+	.unwrap();
+	assert!(report.failures.is_empty());
+	assert_eq!(report.top_level.len(), 4);
 	let (_, copied) = contents(&share_client, share_test_dir).await;
 	for path in [
 		"shared/top.txt",
@@ -1132,7 +1132,7 @@ async fn copy_with_shares(
 		.create_dir(&share_test_dir.into(), "mixed")
 		.await
 		.unwrap();
-	let outcome = copy(
+	let report = copy(
 		&share_client,
 		vec![
 			CopySource::File(mine_file.clone().into()),
@@ -1148,9 +1148,8 @@ async fn copy_with_shares(
 		],
 		&mixed,
 	)
-	.await;
-	outcome.result.unwrap();
-	let report = &outcome.report;
+	.await
+	.unwrap();
 	assert!(report.failures.is_empty());
 	assert!(report.skipped.is_empty());
 	let mut top_names: Vec<&str> = report
@@ -1213,7 +1212,6 @@ async fn copy_with_shares(
 			destination,
 		)
 		.await
-		.result
 		.unwrap();
 	}
 	let (in_dirs, _) = share_client
@@ -1290,7 +1288,7 @@ async fn copy_with_shares(
 		.await
 		.unwrap();
 	controller.resume();
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 	let (in_dirs, _) = share_client
 		.list_in_shared_root::<fn(u64, Option<u64>)>(None)

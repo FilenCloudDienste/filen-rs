@@ -515,7 +515,7 @@ fn controls() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
 	)
 }
 
-type Running = tokio::task::JoinHandle<CopyOutcome<()>>;
+type Running = tokio::task::JoinHandle<Result<CopyReport<()>, CopyFailed<()>>>;
 
 fn start(
 	backend: &Arc<FakeBackend>,
@@ -620,9 +620,8 @@ async fn copies_a_tree_parent_first_with_every_chunk_once() {
 	);
 	let backend = Arc::new(FakeBackend::new(4, &[destination]));
 	let (running, recorder, reporter) = start(&backend, plan, JobControl::default());
-	let outcome = running.await.unwrap();
+	let report = running.await.unwrap().unwrap();
 
-	outcome.result.unwrap();
 	assert_released(&backend, &reporter);
 	assert_each_chunk_once(&backend);
 	{
@@ -656,12 +655,12 @@ async fn copies_a_tree_parent_first_with_every_chunk_once() {
 		);
 	}
 
-	let counts = outcome.report.counts;
+	let counts = report.counts;
 	assert_eq!(counts.dirs_created, 2);
 	assert_eq!(counts.files_done, 4);
-	assert_eq!(counts.bytes_done, outcome.report.totals.bytes);
+	assert_eq!(counts.bytes_done, report.totals.bytes);
 	assert_eq!(counts.files_failed + counts.dirs_failed, 0);
-	assert_eq!(outcome.report.top_level.len(), 2);
+	assert_eq!(report.top_level.len(), 2);
 
 	let planned = recorder.planned.lock().unwrap().clone();
 	let created = recorder.created.lock().unwrap().clone();
@@ -708,7 +707,7 @@ async fn stored_chunks_without_data_are_not_copied() {
 		],
 	);
 	let (running, _recorder, reporter) = start(&backend, plan, JobControl::default());
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 
 	assert_released(&backend, &reporter);
 	let log = backend.log();
@@ -756,11 +755,11 @@ async fn copy_many(memory_chunks: usize, files: usize, chunks_per_file: u64) {
 	}
 	let backend = Arc::new(backend);
 	let (running, _recorder, reporter) = start(&backend, plan, JobControl::default());
-	let outcome = tokio::time::timeout(Duration::from_secs(30), running)
+	tokio::time::timeout(Duration::from_secs(30), running)
 		.await
 		.expect("the copy must not deadlock")
+		.unwrap()
 		.unwrap();
-	outcome.result.unwrap();
 	assert_released(&backend, &reporter);
 	assert_each_chunk_once(&backend);
 	let log = backend.log();
@@ -800,7 +799,7 @@ async fn hashes_chunks_in_order_when_they_complete_out_of_order() {
 	let backend = Arc::new(backend);
 	let plan = plan(destination, vec![PlanSource::File(source.clone())]);
 	let (running, _recorder, _reporter) = start(&backend, plan, JobControl::default());
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	let log = backend.log();
 	let order: Vec<u64> = log.fetched.iter().map(|(_, index)| *index).collect();
 	assert_ne!(
@@ -858,12 +857,11 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 	);
 
 	pause.send_replace(false);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	assert_released(&backend, &reporter);
 	assert_each_chunk_once(&backend);
 	assert_eq!(backend.log().uploaded.len(), 18);
-	assert_eq!(outcome.report.counts.bytes_done, 18 * CHUNK_SIZE_U64);
+	assert_eq!(report.counts.bytes_done, 18 * CHUNK_SIZE_U64);
 	assert_eq!(recorder.last().run_state, RunState::Running);
 }
 
@@ -902,7 +900,7 @@ async fn a_paused_job_holds_no_memory_while_a_chunk_waited_for_it() {
 
 	drop(elsewhere);
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_released(&backend, &reporter);
 	assert_eq!(backend.log().finished.len(), 1);
 }
@@ -951,7 +949,7 @@ async fn a_paused_job_holds_nothing_on_a_multi_threaded_runtime() {
 		}
 		pause.send_replace(false);
 	}
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_released(&backend, &reporter);
 	assert_eq!(backend.log().finished.len(), 24);
 	assert_each_chunk_once(&backend);
@@ -1001,7 +999,7 @@ async fn pause_during_directory_creation_holds_no_lock_and_resumes() {
 	);
 
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 201);
 	assert_eq!(backend.log().finished.len(), 200);
 	assert!(backend.log().out_of_order_dirs.is_empty());
@@ -1021,7 +1019,7 @@ async fn a_job_paused_before_it_starts_waits() {
 	assert!(backend.log().created_dirs.is_empty());
 	assert!(reporter.is_paused());
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().finished.len(), 3);
 }
 
@@ -1049,11 +1047,11 @@ async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
 	wait_until("the job is paused", || reporter.is_paused()).await;
 	drop(pause);
 
-	let outcome = tokio::time::timeout(Duration::from_secs(30), running)
+	tokio::time::timeout(Duration::from_secs(30), running)
 		.await
 		.expect("a lost pause controller does not keep the job paused")
+		.unwrap()
 		.unwrap();
-	outcome.result.unwrap();
 	assert_eq!(backend.log().uploaded.len(), 18);
 	assert_released(&backend, &reporter);
 	assert_eq!(recorder.last().run_state, RunState::Running);
@@ -1076,9 +1074,9 @@ async fn a_cancel_while_paused_ends_the_pause() {
 	wait_until("the job is paused", || reporter.is_paused()).await;
 	let updates_before_cancel = recorder.updates.lock().unwrap().len();
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { error, .. } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	let updates = recorder.updates.lock().unwrap();
 	let states: Vec<RunState> = updates[updates_before_cancel..]
@@ -1118,9 +1116,9 @@ async fn cancel_during_directory_creation_reports_what_was_created() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	assert!(
 		backend.log().finished.is_empty(),
@@ -1132,18 +1130,17 @@ async fn cancel_during_directory_creation_reports_what_was_created() {
 		.iter()
 		.map(|(uuid, _)| *uuid)
 		.collect();
-	for item in &outcome.report.top_level {
+	for item in &report.top_level {
 		assert!(created_uuids.contains(&item.item.uuid()));
 	}
 	assert!(
-		outcome
-			.report
+		report
 			.top_level
 			.iter()
 			.any(|item| item.source_uuid == first_root.uuid)
 	);
 	assert_eq!(
-		outcome.report.top_level.len(),
+		report.top_level.len(),
 		recorder.created.lock().unwrap().len(),
 		"every created top-level item was reported as it was created"
 	);
@@ -1173,30 +1170,30 @@ async fn cancel_during_file_copies_drops_transfers_and_keeps_finished_files() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	assert_eq!(
 		backend.log().finished.len(),
 		1,
 		"the interrupted file never becomes visible"
 	);
-	assert_eq!(outcome.report.top_level.len(), 1);
-	assert_eq!(outcome.report.top_level[0].source_uuid, small.uuid());
-	assert_eq!(outcome.report.counts.files_done, 1);
+	assert_eq!(report.top_level.len(), 1);
+	assert_eq!(report.top_level[0].source_uuid, small.uuid());
+	assert_eq!(report.counts.files_done, 1);
 	assert_eq!(
-		outcome.report.counts.files_failed, 0,
+		report.counts.files_failed, 0,
 		"an interrupted file is not a failure"
 	);
-	assert_eq!(outcome.report.counts.bytes_done, 10);
+	assert_eq!(report.counts.bytes_done, 10);
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 }
 
 /// What a finished job reports: everything planned is done, failed or not attempted.
-fn assert_counts_add_up(outcome: &CopyOutcome<()>, last: &CopyUpdate) {
-	let counts = outcome.report.counts;
-	let totals = outcome.report.totals;
+fn assert_counts_add_up(report: &CopyReport<()>, last: &CopyUpdate) {
+	let counts = report.counts;
+	let totals = report.totals;
 	assert_eq!(
 		counts.dirs_created + counts.dirs_failed + counts.dirs_not_attempted,
 		totals.dirs
@@ -1247,7 +1244,7 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 	let updates = recorder.updates.lock().unwrap().clone();
 	let winding_down: Vec<_> = updates
 		.iter()
@@ -1259,17 +1256,14 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 		"a cancelling job has no time left to estimate"
 	);
 
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Cancelled
-	);
-	let counts = outcome.report.counts;
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
+	let counts = report.counts;
 	assert!(counts.files_done >= 1);
 	assert!(
 		counts.files_not_attempted >= 1,
 		"the interrupted file is not attempted"
 	);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1285,16 +1279,13 @@ async fn a_job_cancelled_during_directory_creation_counts_what_it_never_copied()
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Cancelled
-	);
-	let counts = outcome.report.counts;
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
+	let counts = report.counts;
 	assert!(counts.dirs_not_attempted > 0);
 	assert_eq!(counts.files_not_attempted, 200);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1307,9 +1298,8 @@ async fn a_completed_job_has_nothing_left_unattempted() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let counts = outcome.report.counts;
+	let report = running.await.unwrap().unwrap();
+	let counts = report.counts;
 	assert_eq!(
 		(
 			counts.dirs_not_attempted,
@@ -1318,7 +1308,7 @@ async fn a_completed_job_has_nothing_left_unattempted() {
 		),
 		(0, 0, 0)
 	);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1344,33 +1334,35 @@ async fn running_out_of_storage_ends_the_job() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(
-		outcome.result.unwrap_err().kind(),
-		ErrorKind::MaxStorageReached
-	);
+	assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
 	assert_released(&backend, &reporter);
 	assert!(
 		backend.log().finished.is_empty(),
 		"the other files are stopped, not finished"
 	);
-	assert_eq!(outcome.report.failures.len(), 1);
+	assert_eq!(report.failures.len(), 1);
 	assert_eq!(
-		outcome.report.failures[0].info.error.kind(),
+		report.failures[0].info.error.kind(),
 		ErrorKind::MaxStorageReached
+	);
+	assert!(
+		Arc::ptr_eq(&error, &only_failure(&report).info.error),
+		"the copy returns the failure's own error"
 	);
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
 }
 
-#[test]
-fn a_job_error_keeps_the_server_error_readable() {
-	let error = Arc::new(Error::from(filen_types::error::ResponseError::ApiError {
+fn max_storage_error() -> Arc<Error> {
+	Arc::new(Error::from(filen_types::error::ResponseError::ApiError {
 		message: Some("Max storage reached".into()),
 		code: Some("max_storage_reached".into()),
-	}));
-	let returned = job_error(&error);
-	assert_eq!(returned.kind(), error.kind());
+	}))
+}
+
+fn assert_server_error_readable(returned: &Error) {
+	assert_eq!(returned.kind(), ErrorKind::MaxStorageReached);
 	assert_eq!(
 		returned.server_code().as_deref(),
 		Some("max_storage_reached")
@@ -1378,6 +1370,53 @@ fn a_job_error_keeps_the_server_error_readable() {
 	assert_eq!(
 		returned.server_message().as_deref(),
 		Some("Max storage reached")
+	);
+}
+
+#[test]
+fn a_failed_copy_gives_back_its_original_error() {
+	let error = max_storage_error();
+	let failed = CopyFailed::<()> {
+		report: CopyReport {
+			failures: vec![CopyFailure {
+				source: FailedSource::Dir(()),
+				info: FailureInfo {
+					source_uuid: Uuid::new_v4(),
+					source_path: "/a".to_owned(),
+					dest_parent_dir: DirType::Root(Cow::Owned(crate::fs::dir::RootDirectory::new(
+						Uuid::new_v4(),
+					))),
+					dest_name: "a".to_owned(),
+					stage: CopyStage::Upload,
+					error: Arc::clone(&error),
+					affected_files: 1,
+					affected_bytes: 1,
+				},
+			}],
+			..CopyReport::default()
+		},
+		error,
+	};
+	let returned = Error::from(failed);
+	assert_server_error_readable(&returned);
+	assert!(
+		returned.downcast_ref::<Arc<Error>>().is_none(),
+		"the report's copy of the error is dropped first, so the original comes back unwrapped"
+	);
+}
+
+#[test]
+fn a_failed_copy_whose_error_is_still_shared_keeps_it_readable() {
+	let error = max_storage_error();
+	let _elsewhere = Arc::clone(&error);
+	let returned = Error::from(CopyFailed::<()> {
+		report: CopyReport::default(),
+		error,
+	});
+	assert_server_error_readable(&returned);
+	assert!(
+		returned.downcast_ref::<Arc<Error>>().is_some(),
+		"an error still held elsewhere comes back wrapped"
 	);
 }
 
@@ -1399,12 +1438,11 @@ async fn a_failed_file_does_not_stop_the_others() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
+	let report = running.await.unwrap().unwrap();
 
-	outcome.result.unwrap();
 	assert_released(&backend, &reporter);
 	assert_eq!(backend.log().finished.len(), 1);
-	let [failure] = outcome.report.failures.as_slice() else {
+	let [failure] = report.failures.as_slice() else {
 		panic!("exactly one failure");
 	};
 	assert!(matches!(&failure.source, FailedSource::File(file) if file.uuid() == bad.uuid()));
@@ -1412,13 +1450,10 @@ async fn a_failed_file_does_not_stop_the_others() {
 	assert_eq!(failure.info.dest_parent_dir.uuid(), destination);
 	assert_eq!(failure.info.dest_name, "bad");
 	assert_eq!(failure.info.error.kind(), ErrorKind::FileChunkNotFound);
-	let counts = outcome.report.counts;
+	let counts = report.counts;
 	assert_eq!((counts.files_done, counts.files_failed), (1, 1));
 	assert_eq!(counts.bytes_failed, 3 * CHUNK_SIZE_U64);
-	assert_eq!(
-		counts.bytes_done + counts.bytes_failed,
-		outcome.report.totals.bytes
-	);
+	assert_eq!(counts.bytes_done + counts.bytes_failed, report.totals.bytes);
 	assert!(
 		recorder
 			.events()
@@ -1452,9 +1487,8 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
+	let report = running.await.unwrap().unwrap();
 
-	outcome.result.unwrap();
 	assert_released(&backend, &reporter);
 	let log = backend.log();
 	assert_eq!(
@@ -1463,7 +1497,7 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 		"nothing below the failed directory is attempted"
 	);
 	assert_eq!(log.finished.len(), 1);
-	let [failure] = outcome.report.failures.as_slice() else {
+	let [failure] = report.failures.as_slice() else {
 		panic!("one failure for the whole subtree");
 	};
 	assert!(matches!(failure.source, FailedSource::Dir(())));
@@ -1473,13 +1507,10 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 		(failure.info.affected_files, failure.info.affected_bytes),
 		(2, 18)
 	);
-	let counts = outcome.report.counts;
+	let counts = report.counts;
 	assert_eq!((counts.dirs_created, counts.dirs_failed), (1, 2));
 	assert_eq!((counts.files_done, counts.files_failed), (1, 2));
-	assert_eq!(
-		counts.bytes_done + counts.bytes_failed,
-		outcome.report.totals.bytes
-	);
+	assert_eq!(counts.bytes_done + counts.bytes_failed, report.totals.bytes);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1511,13 +1542,11 @@ async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 
 	let created_top = backend.log().created_dirs[0].0;
 	let parent_of = |name: &str| {
-		let failure = outcome
-			.report
+		let failure = report
 			.failures
 			.iter()
 			.find(|f| f.info.dest_name == name)
@@ -1563,10 +1592,9 @@ async fn a_top_level_name_taken_after_listing_gets_the_next_name() {
 		plan(destination, vec![tree(&top, Vec::new(), Vec::new())]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs[0].1, "Top (1)");
-	let NonRootItemType::Dir(dir) = &outcome.report.top_level[0].item else {
+	let NonRootItemType::Dir(dir) = &report.top_level[0].item else {
 		panic!("a directory");
 	};
 	assert_eq!(dir.name(), Some("Top (1)"));
@@ -1596,8 +1624,7 @@ async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 
 	let renamed: Vec<_> = recorder
 		.events()
@@ -1623,14 +1650,13 @@ async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
 			),
 		]
 	);
-	let report: Vec<_> = outcome
-		.report
+	let in_report: Vec<_> = report
 		.renamed
 		.iter()
 		.map(|r| (r.source_uuid, r.name.as_ref().to_owned()))
 		.collect();
 	assert_eq!(
-		report,
+		in_report,
 		[
 			(top.uuid, "Top (1)".to_owned()),
 			(taken.uuid(), "a (1).txt".to_owned())
@@ -1650,7 +1676,7 @@ async fn propagates_every_created_item_into_a_connected_destination() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	let log = backend.log();
 	let created: HashSet<Uuid> = log
 		.created_dirs
@@ -1680,16 +1706,10 @@ async fn a_destination_shared_during_the_copy_gets_the_copied_trees() {
 		plan(destination, vec![source, PlanSource::File(file)]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	let log = backend.log();
 	assert!(log.propagated.is_empty());
-	let top_level: HashSet<Uuid> = outcome
-		.report
-		.top_level
-		.iter()
-		.map(|t| t.item.uuid())
-		.collect();
+	let top_level: HashSet<Uuid> = report.top_level.iter().map(|t| t.item.uuid()).collect();
 	let trees: HashSet<Uuid> = log.propagated_trees.iter().copied().collect();
 	assert_eq!(trees, top_level);
 	assert!(
@@ -1723,15 +1743,16 @@ async fn cancel_ends_a_drive_lock_wait_before_a_file_is_registered() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+	let CopyFailed { report, error } = tokio::time::timeout(Duration::from_secs(600), running)
 		.await
 		.expect("a cancel ends a wait for the drive lock")
-		.unwrap();
+		.unwrap()
+		.unwrap_err();
 
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	assert!(backend.log().finished.is_empty());
-	assert_eq!(outcome.report.counts.files_done, 0);
+	assert_eq!(report.counts.files_done, 0);
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 }
 
@@ -1757,7 +1778,7 @@ async fn pause_ends_a_drive_lock_wait_before_a_file_is_registered() {
 
 	unblock_locks(&backend);
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().finished.len(), 1);
 	assert_released(&backend, &reporter);
 }
@@ -1782,7 +1803,7 @@ async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
 
 	unblock_locks(&backend);
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 4);
 	assert_eq!(backend.log().finished.len(), 3);
 	assert_released(&backend, &reporter);
@@ -1808,20 +1829,18 @@ async fn cancel_ends_a_drive_lock_wait_while_propagating_to_new_shares() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+	let CopyFailed { report, error } = tokio::time::timeout(Duration::from_secs(600), running)
 		.await
 		.expect("a cancel ends a wait for the drive lock")
-		.unwrap();
+		.unwrap()
+		.unwrap_err();
 
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Cancelled
-	);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
-	assert_eq!(outcome.report.top_level.len(), 1, "the copied file is kept");
+	assert_eq!(report.top_level.len(), 1, "the copied file is kept");
 	assert!(backend.log().propagated_trees.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 // The first lock call is the shared one directory creation holds; blocking the next ones
@@ -1846,8 +1865,7 @@ async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it()
 
 	unblock_locks(&backend);
 	pause.send_replace(false);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	let log = backend.log();
 	assert_eq!(
 		log.created_dirs.len(),
@@ -1856,8 +1874,8 @@ async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it()
 	);
 	assert!(log.out_of_order_dirs.is_empty());
 	assert_eq!(log.finished.len(), 3);
-	assert_eq!(outcome.report.counts.dirs_created, 4);
-	assert_eq!(outcome.report.counts.dirs_failed, 0);
+	assert_eq!(report.counts.dirs_created, 4);
+	assert_eq!(report.counts.dirs_failed, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1874,19 +1892,20 @@ async fn cancel_ends_a_directory_create_waiting_for_a_fresh_lock() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+	let CopyFailed { report, error } = tokio::time::timeout(Duration::from_secs(600), running)
 		.await
 		.expect("a cancel ends a create's wait for the drive lock")
-		.unwrap();
+		.unwrap()
+		.unwrap_err();
 
-	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	assert!(backend.log().created_dirs.is_empty());
 	assert_eq!(
-		outcome.report.counts.dirs_failed, 0,
+		report.counts.dirs_failed, 0,
 		"a create that never started is not a failure"
 	);
-	assert!(outcome.report.failures.is_empty());
+	assert!(report.failures.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 }
 
@@ -1911,7 +1930,7 @@ async fn names_are_checked_before_use_only_when_the_listing_hid_some() {
 			plan_with(destination, sources, unverified),
 			JobControl::default(),
 		);
-		running.await.unwrap().result.unwrap();
+		running.await.unwrap().unwrap();
 		let probes = backend.log().probes.clone();
 		if unverified {
 			assert_eq!(
@@ -1946,13 +1965,11 @@ async fn a_taken_top_level_name_moves_to_the_next_keep_both_name() {
 		plan_with(destination, sources, true),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	let log = backend.log();
 	assert_eq!(log.created_dirs[0].1, "Top (1)");
 	assert_eq!(log.finished.values().next().unwrap().0, "a (1).txt");
-	let names: Vec<_> = outcome
-		.report
+	let names: Vec<_> = report
 		.top_level
 		.iter()
 		.map(|t| t.item.name().unwrap().to_owned())
@@ -1983,7 +2000,7 @@ async fn a_name_taken_during_the_copy_is_caught_before_the_file_is_registered() 
 		.lock()
 		.unwrap()
 		.insert("big.bin".to_owned());
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	let log = backend.log();
 	assert_eq!(log.finished.values().next().unwrap().0, "big (1).bin");
 }
@@ -2003,15 +2020,14 @@ async fn a_file_gives_up_after_the_bounded_number_of_taken_names() {
 		plan_with(destination, vec![PlanSource::File(file)], true),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	assert_released(&backend, &reporter);
 	assert!(backend.log().finished.is_empty());
 	assert!(
 		backend.log().uploaded.is_empty(),
 		"nothing is uploaded without a free name"
 	);
-	let [failure] = outcome.report.failures.as_slice() else {
+	let [failure] = report.failures.as_slice() else {
 		panic!("one failure");
 	};
 	assert_eq!(failure.info.error.kind(), ErrorKind::InvalidState);
@@ -2037,11 +2053,10 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
+	let report = running.await.unwrap().unwrap();
 
-	outcome.result.unwrap();
 	assert_released(&backend, &reporter);
-	let [failure] = outcome.report.failures.as_slice() else {
+	let [failure] = report.failures.as_slice() else {
 		panic!("one failure");
 	};
 	assert_eq!(
@@ -2054,19 +2069,16 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	assert_eq!(failure.info.dest_name, "a.txt");
 	assert!(matches!(&failure.source, FailedSource::File(f) if f.uuid() == clashing.uuid()));
 	assert_eq!(
-		outcome.report.top_level.len(),
+		report.top_level.len(),
 		1,
 		"only the real copy can be kept or trashed"
 	);
-	assert_eq!(outcome.report.top_level[0].source_uuid, other.uuid());
+	assert_eq!(report.top_level[0].source_uuid, other.uuid());
 
-	let counts = outcome.report.counts;
+	let counts = report.counts;
 	assert_eq!((counts.files_done, counts.files_failed), (1, 1));
 	assert_eq!(counts.bytes_failed, clashing.size());
-	assert_eq!(
-		counts.bytes_done + counts.bytes_failed,
-		outcome.report.totals.bytes
-	);
+	assert_eq!(counts.bytes_done + counts.bytes_failed, report.totals.bytes);
 	assert!(recorder.events().iter().any(|e| matches!(
 		e,
 		CopyEvent::FileFailed(info)
@@ -2104,9 +2116,9 @@ fn undecryptable_source_file(size: u64) -> RemoteFileType<'static> {
 	RemoteFileType::File(Cow::Owned(file))
 }
 
-fn only_failure(outcome: &CopyOutcome<()>) -> &FailureInfo {
-	let [failure] = outcome.report.failures.as_slice() else {
-		panic!("exactly one failure, got {:?}", outcome.report.failures);
+fn only_failure(report: &CopyReport<()>) -> &FailureInfo {
+	let [failure] = report.failures.as_slice() else {
+		panic!("exactly one failure, got {:?}", report.failures);
 	};
 	&failure.info
 }
@@ -2131,16 +2143,15 @@ async fn a_deep_chain_is_created_parent_first() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
+	let report = running.await.unwrap().unwrap();
 
-	outcome.result.as_ref().unwrap();
 	assert_released(&backend, &reporter);
 	let log = backend.log();
 	assert_eq!(log.created_dirs.len(), 501);
 	assert!(log.out_of_order_dirs.is_empty());
 	assert_eq!(log.finished.len(), 1);
 	drop(log);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2153,12 +2164,11 @@ async fn an_empty_directory_is_created_alone() {
 		plan(destination, vec![tree(&empty, Vec::new(), Vec::new())]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
+	let report = running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 1);
-	assert_eq!(outcome.report.top_level.len(), 1);
-	assert_eq!(outcome.report.counts.dirs_created, 1);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_eq!(report.top_level.len(), 1);
+	assert_eq!(report.counts.dirs_created, 1);
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2171,9 +2181,8 @@ async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
 		plan(destination, vec![PlanSource::File(source.clone())]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
-	assert!(outcome.report.failures.is_empty());
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty());
 	let (_, completion) = backend.log().finished.values().next().unwrap().clone();
 	assert_eq!(
 		completion.hash,
@@ -2194,9 +2203,8 @@ async fn an_inconsistent_chunk_count_fails_the_file() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().fetched.is_empty(), "nothing is read");
@@ -2220,15 +2228,14 @@ async fn a_short_file_fails_as_a_download() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().finished.is_empty(), "nothing is registered");
 	assert_released(&backend, &reporter);
-	assert_eq!(outcome.report.counts.bytes_done, 0);
-	assert_eq!(outcome.report.counts.bytes_failed, 2 * CHUNK_SIZE_U64 + 5);
+	assert_eq!(report.counts.bytes_done, 0);
+	assert_eq!(report.counts.bytes_failed, 2 * CHUNK_SIZE_U64 + 5);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2250,14 +2257,13 @@ async fn a_failed_upload_is_an_upload_failure() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.stage, CopyStage::Upload);
 	assert_eq!(info.error.kind(), ErrorKind::Server);
 	assert_eq!(backend.log().finished.len(), 1);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2276,16 +2282,15 @@ async fn a_failed_registration_is_a_finalize_failure() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.stage, CopyStage::Finalize);
 	assert_eq!(backend.log().uploaded.len(), 2, "the chunks were uploaded");
 	assert!(backend.log().finished.is_empty());
-	assert_eq!(outcome.report.counts.bytes_done, 0);
-	assert_eq!(outcome.report.counts.bytes_failed, 2 * CHUNK_SIZE_U64);
+	assert_eq!(report.counts.bytes_done, 0);
+	assert_eq!(report.counts.bytes_failed, 2 * CHUNK_SIZE_U64);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2299,9 +2304,8 @@ async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 		plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	assert_eq!(only_failure(&outcome).stage, CopyStage::Finalize);
+	let report = running.await.unwrap().unwrap();
+	assert_eq!(only_failure(&report).stage, CopyStage::Finalize);
 	assert_released(&backend, &reporter);
 }
 
@@ -2317,16 +2321,13 @@ async fn a_failed_drive_lock_ends_directory_creation() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Server
-	);
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Server);
 	assert!(backend.log().created_dirs.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
-	assert_eq!(outcome.report.counts.files_not_attempted, 5);
+	assert_eq!(report.counts.files_not_attempted, 5);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2344,24 +2345,21 @@ async fn a_fatal_error_during_directory_creation_ends_the_job() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Unauthenticated
-	);
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Unauthenticated);
 	assert!(
 		backend.log().finished.is_empty(),
 		"no file is copied after it"
 	);
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
-	let counts = outcome.report.counts;
+	let counts = report.counts;
 	assert!(counts.dirs_not_attempted > 0);
 	assert_eq!(
 		counts.files_not_attempted + counts.files_failed,
 		3 * MAX_SMALL_PARALLEL_REQUESTS as u64
 	);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2376,16 +2374,13 @@ async fn a_failed_target_fetch_ends_the_job_before_anything_is_created() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Server
-	);
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::Server);
 	assert!(backend.log().created_dirs.is_empty());
-	assert!(outcome.report.top_level.is_empty());
+	assert!(report.top_level.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2400,11 +2395,10 @@ async fn a_failed_color_is_reported_and_the_directory_kept() {
 		plan(destination, vec![tree(&top, Vec::new(), Vec::new())]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	assert!(outcome.report.failures.is_empty());
-	assert_eq!(outcome.report.counts.dirs_created, 1);
-	let created = outcome.report.top_level[0].item.uuid();
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty());
+	assert_eq!(report.counts.dirs_created, 1);
+	let created = report.top_level[0].item.uuid();
 	assert!(
 		recorder.events().iter().any(
 			|e| matches!(e, CopyEvent::ColorFailed { dest_uuid, .. } if *dest_uuid == created)
@@ -2425,9 +2419,8 @@ async fn a_failed_propagation_is_reported_and_the_copy_continues() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	assert!(outcome.report.failures.is_empty());
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty());
 	let failed: HashSet<Uuid> = recorder
 		.events()
 		.iter()
@@ -2464,14 +2457,13 @@ async fn a_nested_directory_that_merges_is_a_failure() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.source_uuid, sub.uuid);
 	assert_eq!(info.stage, CopyStage::CreateDirectory);
 	assert_eq!(info.error.kind(), ErrorKind::InvalidState);
 	assert!(backend.log().finished.is_empty());
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2497,9 +2489,8 @@ async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
 		),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
-	let info = only_failure(&outcome);
+	let report = running.await.unwrap().unwrap();
+	let info = only_failure(&report);
 	assert_eq!(info.stage, CopyStage::CreateDirectory);
 	assert_eq!(info.error.kind(), ErrorKind::InvalidState);
 	assert_eq!(info.affected_files, 1);
@@ -2524,8 +2515,7 @@ async fn renames_found_by_the_name_checks_are_reported() {
 		plan_with(destination, sources, true),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.unwrap();
+	let report = running.await.unwrap().unwrap();
 	let renamed: HashMap<Uuid, String> = recorder
 		.events()
 		.into_iter()
@@ -2541,7 +2531,7 @@ async fn renames_found_by_the_name_checks_are_reported() {
 		renamed.get(&file.uuid()).map(String::as_str),
 		Some("a (1).txt")
 	);
-	assert_eq!(outcome.report.renamed.len(), 2);
+	assert_eq!(report.renamed.len(), 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2567,7 +2557,7 @@ async fn pause_during_the_target_fetch_waits_and_resumes() {
 	);
 	assert_released(&backend, &reporter);
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 3);
 }
 
@@ -2600,7 +2590,7 @@ async fn pause_while_finishing_waits_and_resumes() {
 	);
 	assert_released(&backend, &reporter);
 	pause.send_replace(false);
-	running.await.unwrap().result.unwrap();
+	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().propagated_trees.len(), 1);
 }
 
@@ -2613,11 +2603,11 @@ async fn a_pause_controller_dropped_before_the_job_starts_lets_it_run() {
 	pause.send_replace(true);
 	drop(pause);
 	let (running, _recorder, _reporter) = start(&backend, plan(destination, vec![source]), control);
-	let outcome = tokio::time::timeout(Duration::from_secs(600), running)
+	tokio::time::timeout(Duration::from_secs(600), running)
 		.await
 		.expect("a lost pause controller is no pause")
+		.unwrap()
 		.unwrap();
-	outcome.result.unwrap();
 	assert_eq!(backend.log().finished.len(), 2);
 }
 
@@ -2640,21 +2630,14 @@ async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
 	})
 	.await;
 	cancel.send_replace(true);
-	let outcome = running.await.unwrap();
+	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
-	assert_eq!(
-		outcome.result.as_ref().unwrap_err().kind(),
-		ErrorKind::Cancelled
-	);
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
 	assert_eq!(backend.log().finished.len(), 1);
-	assert_eq!(
-		outcome.report.top_level.len(),
-		1,
-		"a file that exists is reported"
-	);
-	assert_eq!(outcome.report.counts.files_done, 1);
+	assert_eq!(report.top_level.len(), 1, "a file that exists is reported");
+	assert_eq!(report.counts.files_done, 1);
 	assert_released(&backend, &reporter);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2676,18 +2659,17 @@ async fn skips_and_renames_are_reported_before_anything_is_created() {
 		plan(destination, vec![source]),
 		JobControl::default(),
 	);
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
+	let report = running.await.unwrap().unwrap();
 	let events = recorder.events();
 	let first = |matches: fn(&CopyEvent) -> bool| events.iter().position(matches).unwrap();
 	let created = first(|e| matches!(e, CopyEvent::DirCreated { .. }));
 	assert!(first(|e| matches!(e, CopyEvent::Skipped(_))) < created);
 	assert!(first(|e| matches!(e, CopyEvent::Renamed(_))) < created);
-	assert_eq!(outcome.report.counts.entries_skipped, 1);
-	assert_eq!(outcome.report.counts.bytes_skipped, 7);
-	assert_eq!(outcome.report.skipped.len(), 1);
-	assert_eq!(outcome.report.renamed.len(), 1);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_eq!(report.counts.entries_skipped, 1);
+	assert_eq!(report.counts.bytes_skipped, 7);
+	assert_eq!(report.skipped.len(), 1);
+	assert_eq!(report.renamed.len(), 1);
+	assert_counts_add_up(&report, &recorder.last());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2701,8 +2683,7 @@ async fn the_estimate_counts_down_while_copying() {
 	let backend = Arc::new(backend);
 	let (running, recorder, _reporter) =
 		start(&backend, plan(destination, sources), JobControl::default());
-	let outcome = running.await.unwrap();
-	outcome.result.as_ref().unwrap();
+	let report = running.await.unwrap().unwrap();
 	let etas: Vec<Duration> = recorder
 		.updates
 		.lock()
@@ -2717,5 +2698,5 @@ async fn the_estimate_counts_down_while_copying() {
 		last < first,
 		"the estimate falls as the copy advances: {first:?} then {last:?}"
 	);
-	assert_counts_add_up(&outcome, &recorder.last());
+	assert_counts_add_up(&report, &recorder.last());
 }
