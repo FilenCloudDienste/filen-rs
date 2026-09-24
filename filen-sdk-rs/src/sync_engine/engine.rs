@@ -1266,6 +1266,127 @@ impl SyncEngine {
 	}
 }
 
+/// What a benchmarked pass did, for the harness that timed it (see [`bench`](super::bench)).
+///
+/// Deliberately not a [`Prepared`]: a benchmark needs to know WHICH pass ran and what it decided,
+/// and handing out the pass's internals would make the harness able to assemble one, which is the
+/// drift this seam exists to make impossible.
+#[cfg(feature = "bench-internals")]
+pub(super) struct BenchPass {
+	/// Whether the pass narrowed its read. A benchmark that believed it was timing a change-scoped
+	/// pass while the engine fell back to a whole one would report a plausible figure for the wrong
+	/// function, which has happened here before.
+	pub(super) scoped: bool,
+	/// Why it read both sides whole, when it did.
+	pub(super) full_reason: Option<FullPassReason>,
+	/// What an approved pass would execute — the guard-screened plan, as [`Self::plan_pair`]
+	/// reports it.
+	pub(super) actions: usize,
+	pub(super) rows: usize,
+}
+
+/// The seam the benchmark harness drives a REAL pass through.
+///
+/// Everything here is either a local DB write the harness cannot reach (`self.control` and
+/// `self.carried` are private to this module) or a wrapper around [`Self::prepare`]. What it
+/// deliberately does NOT offer is a way to assemble a pass out of pieces: the harness can register
+/// a pair, seed its rows and its carried state, and then only ASK the engine to run, so a step the
+/// engine stops running stops being timed and a step it gains is timed the day it lands.
+#[cfg(feature = "bench-internals")]
+impl SyncEngine {
+	/// Register a pair by writing its registry row, with none of [`Self::add_pair`]'s overlap
+	/// checks — those are what need the network.
+	pub(super) fn bench_create_pair(
+		&self,
+		local_root: &str,
+		remote_root: Uuid,
+		mode: SyncMode,
+	) -> Result<PairId, Error> {
+		let (pair, _) = locked(&self.control)
+			.create_pair(local_root, remote_root, mode)
+			.map_err(|e| db_error(e, "registering the benchmark pair"))?;
+		Ok(pair)
+	}
+
+	/// Seed a converged baseline in ONE transaction, so a million rows is one commit rather than a
+	/// million.
+	pub(super) async fn bench_seed_rows(
+		&self,
+		pair: PairId,
+		rows: &[BaselineEntry],
+	) -> Result<(), Error> {
+		let store = self.pair_store(pair).await?;
+		let changes: Vec<super::baseline::BaselineChange<'_>> = rows
+			.iter()
+			.map(super::baseline::BaselineChange::Upsert)
+			.collect();
+		locked(&store)
+			.apply_changes(pair, &changes)
+			.map_err(|e| db_error(e, "seeding the benchmark baseline"))
+	}
+
+	/// Put the pair in the state one whole pass leaves it in, which is the only state a
+	/// change-scoped pass runs from at all: without it every pass returns
+	/// [`FullPassReason::FirstPass`].
+	pub(super) async fn bench_seed_carry(&self, pair: PairId) {
+		self.carried.lock().await.insert(
+			pair,
+			PairCarry {
+				facts: PairFacts::default(),
+				remote_converged: true,
+				scan_complete: true,
+			},
+		);
+	}
+
+	/// Run a change-scoped pass over `scope`.
+	pub(super) async fn bench_prepare(
+		&self,
+		pair: PairId,
+		scope: &mut PassScope,
+	) -> Result<BenchPass, Error> {
+		self.bench_pass(pair, Some(scope)).await
+	}
+
+	/// Run a WHOLE pass — the yardstick every benchmark run records beside its own figure.
+	pub(super) async fn bench_prepare_whole(&self, pair: PairId) -> Result<BenchPass, Error> {
+		self.bench_pass(pair, None).await
+	}
+
+	/// # What this does NOT run
+	///
+	/// The pass BODY is the engine's own [`Self::prepare`], so nothing there can drift. The tail is
+	/// hand-written, and it is shorter than [`Self::sync_once`]'s: this omits `refusal`,
+	/// `Prepared::unsyncable`, `Prepared::ignored` and `Prepared::planned` over the held list. On
+	/// every scenario in the matrix those are O(scan errors) plus a bool — the held list is empty
+	/// except in the mass-delete row, and the safe list never goes through `planned` in a real pass
+	/// either — but a scenario that grew a large held list would under-report, so the omission is
+	/// stated here rather than left to be discovered.
+	async fn bench_pass(
+		&self,
+		pair: PairId,
+		scope: Option<&mut PassScope>,
+	) -> Result<BenchPass, Error> {
+		let prep = self.prepare(pair, scope).await?;
+		super::step("prepare_tail");
+		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		super::step("reconcile_and_screen");
+		let pass = BenchPass {
+			scoped: prep.read.is_scoped(),
+			full_reason: prep.read.full_pass_reason(),
+			actions: screened.decision.safe.len(),
+			rows: prep.baseline.len(),
+		};
+		// Dropped inside a NAMED step rather than at the end of the function. Freeing what a pass
+		// built was once the second-largest term of a change-scoped pass at a million rows, and it
+		// sat inside the phase total and inside no step — which is exactly where it hid.
+		drop(screened);
+		drop(prep);
+		super::step("drop_pass");
+		Ok(pass)
+	}
+}
+
 /// Why [`SyncEngine::add_pair`] refused to register a pair: its roots overlap one already
 /// registered, so the two pairs would fight over the same items — each reading the other's writes
 /// as foreign changes, re-uploading and re-deleting them without ever converging.
@@ -3003,6 +3124,9 @@ impl SyncEngine {
 		scope: Option<&mut PassScope>,
 	) -> Result<Prepared, Error> {
 		let inputs = self.pass_inputs(pair).await?;
+		// The per-pass DB prologue, bounded on its own: five statements and a `spawn_blocking` hop,
+		// which read as part of the first phase inside `prepare_scoped` until this mark existed.
+		super::step("pass_inputs");
 		// The changelists' own reasons, plus the one row of the trigger table that needs the
 		// baseline: an empty one is a first sync, and the whole tree is the evidence for it.
 		let forced = match &scope {
@@ -3048,6 +3172,7 @@ impl SyncEngine {
 		// did not read, so it must not retire a pending write here.
 		let announced = self.observed.snapshot();
 		let mut derived = derive::from_baseline(&inputs.baseline, scope.take_local());
+		super::step("from_baseline");
 
 		// The remote half FIRST: every path its delta touched is a path the local half has to
 		// re-observe too, since a path dirty on either side is re-observed on both.
@@ -3079,6 +3204,7 @@ impl SyncEngine {
 			RemoteObserved::Applied(observation) => *observation,
 			RemoteObserved::Full(reason) => return Ok(Scoped::Whole(Box::new(inputs), reason)),
 		};
+		super::step("observe_remote");
 		// A remote rule file changed: what it hides below itself has no baseline row to derive
 		// from, so that subtree cannot be carried. The producer collapses such an event to a whole
 		// pass already, which makes this the belt to that braces.
@@ -3116,6 +3242,7 @@ impl SyncEngine {
 				.collect(),
 		};
 		derived.dirty.extend(observation.touched.iter().cloned());
+		super::step("view_assembly");
 
 		// The rules, from the same sources and in the same order a whole pass reads them.
 		let (user, user_error) = match parse_user_ignore(&inputs.user_ignore) {
@@ -3141,6 +3268,7 @@ impl SyncEngine {
 		let mut remote_rules = self
 			.remote_rules(&inputs.record, &inputs.baseline, &view, rule_files, user)
 			.await;
+		super::step("remote_rules");
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
@@ -3157,6 +3285,8 @@ impl SyncEngine {
 					.collect(),
 			)
 		};
+
+		super::step("rule_files_only");
 
 		// The local half: one stat per dirty path and its ancestors, one subtree walk per dirty
 		// directory. The rules come back carrying only the `.filenignore` files this observation
@@ -3176,7 +3306,9 @@ impl SyncEngine {
 				format!("re-observing the local paths panicked: {e}"),
 			)
 		})?;
+		super::step("observe_local");
 		derive::merge_local(&mut derived, &inputs.baseline, &observations);
+		super::step("merge_local");
 
 		// Plan 3.6's self-check, before anything plans against these maps.
 		if !assembly_accounted(&inputs.baseline, &derived, &observations, &held_rows) {
@@ -3193,6 +3325,7 @@ impl SyncEngine {
 				FullPassReason::AssemblyMismatch,
 			));
 		}
+		super::step("assembly_check");
 		// A path this pass set out to look at and could not read leaves ITS absences trustworthy —
 		// nothing is derived from a read that did not happen — and the NEXT pass blind, because the
 		// list that named the path is drained. So read everything then, rather than wait out the
@@ -3227,6 +3360,7 @@ impl SyncEngine {
 			},
 			&derived.decided,
 		);
+		super::step("view_filter");
 		// The paths the observation found hidden with a row still behind them, withheld for the
 		// same reason the half-written rows above are: no derived map describes them. Added AFTER
 		// the filter, so the collision check inside it does not claim a hidden path's folded name
@@ -3237,6 +3371,7 @@ impl SyncEngine {
 		let mut facts = carried.facts;
 		facts.merge_remote_view(&observation.touched, &view, &inputs.baseline);
 		facts.observe_local(&observations);
+		super::step("facts_merge");
 
 		// Tenure and the server's version chain ONLY, never `confirm_agreed_content`: that would
 		// confirm rows against a view derived from those very rows (I6). What this still costs is a
@@ -3264,6 +3399,7 @@ impl SyncEngine {
 			let rows = Arc::make_mut(&mut inputs.baseline);
 			confirmed = self.confirm_pushes(rows, &at_unconfirmed).await;
 		}
+		super::step("confirm_pushes");
 
 		let mut holds = {
 			let journal = locked(&inputs.store);
@@ -3296,6 +3432,7 @@ impl SyncEngine {
 				"sync_once[pair {pair}]: folding {folded} unacknowledged write(s) into the derived view"
 			);
 		}
+		super::step("pending_settle_and_fold");
 		// The other half of plan 3.6's self-check, here because this is where the last producer has
 		// run: `assembly_accounted` above bounds what the maps HOLD, and this asks whether the pass
 		// would actually decide it.
@@ -3344,6 +3481,7 @@ impl SyncEngine {
 				FullPassReason::AssemblyMismatch,
 			));
 		}
+		super::step("decided_check");
 		holds.held_remote = view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -3414,7 +3552,9 @@ impl SyncEngine {
 			last_ignored: inputs.last_ignored,
 			confirmed,
 		};
+		super::step("local_scan_assembly");
 		prepared.fold_dir_moves();
+		super::step("fold_dir_moves");
 		Ok(Scoped::Prepared(Box::new(prepared)))
 	}
 

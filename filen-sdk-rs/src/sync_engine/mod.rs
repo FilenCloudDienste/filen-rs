@@ -19,6 +19,11 @@
 
 mod apply;
 mod baseline;
+// The named-scenario cost harness, driven by `tests/sync_engine_bench.rs`. Unlike `probe` below it
+// drives `SyncEngine::prepare` itself rather than a hand-assembled copy of it, which is why the
+// engine carries `step` marks: they are the real pass's own phase boundaries.
+#[cfg(feature = "bench-internals")]
+pub mod bench;
 mod changes;
 // The maps a change-scoped pass reconciles from, carried out of the resident baseline.
 mod derive;
@@ -47,6 +52,18 @@ mod scan;
 mod side;
 mod tree;
 mod watch;
+
+/// Close the pass step ending here, for the benchmark harness.
+///
+/// Compiles to nothing without `bench-internals`: a shipping build carries neither the call nor a
+/// function to call. That is what lets the engine's own code carry the phase boundaries a benchmark
+/// times, instead of a second copy of the pass existing somewhere to drift from this one.
+#[cfg(feature = "bench-internals")]
+use bench::mark as step;
+
+#[cfg(not(feature = "bench-internals"))]
+#[inline(always)]
+fn step(_name: &'static str) {}
 
 pub use self::ignore::{DEFAULT_IGNORE_PATTERNS, IgnoreLevel, IgnoredPath};
 pub use apply::SyncReport;
