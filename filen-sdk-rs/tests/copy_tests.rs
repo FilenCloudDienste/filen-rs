@@ -403,10 +403,9 @@ async fn copies_from_public_links() {
 		.await
 		.unwrap();
 	let sub_linked = linked_dirs
-		.iter()
+		.into_iter()
 		.find(|d| d.uuid() == sub.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
 	let file_link = client.public_link_file(&file).await.unwrap();
 	let file_key = file.key().unwrap().to_str();
 	let linked_file = unauthed

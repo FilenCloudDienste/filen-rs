@@ -1028,34 +1028,27 @@ async fn copy_with_shares(
 		.await
 		.unwrap();
 	let shared_in = in_dirs
-		.iter()
+		.into_iter()
 		.find(|d| d.get_dir().uuid() == shared.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
+	// both sources below need the role, and the share root is moved into the first
 	let role = shared_in.sharing_role().clone();
 	let (sub_dirs, sub_files) = share_client
-		.list_shared_dir::<fn(u64, Option<u64>)>(
-			&DirType::Root(Cow::Borrowed(&shared_in)),
-			&role,
-			None,
-		)
+		.list_shared_dir::<fn(u64, Option<u64>)>(&(&shared_in).into(), &role, None)
 		.await
 		.unwrap();
 	let nested_in = sub_dirs
-		.iter()
+		.into_iter()
 		.find(|d| d.get_dir().uuid() == nested.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
 	let top_in = sub_files
-		.iter()
+		.into_iter()
 		.find(|f| f.uuid() == top.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
 	let solo_in = in_files
-		.iter()
+		.into_iter()
 		.find(|f| f.uuid() == solo.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
 	let report = copy(
 		&share_client,
 		vec![
@@ -1123,10 +1116,10 @@ async fn copy_with_shares(
 		.await
 		.unwrap();
 	let shared_in = in_dirs
-		.iter()
+		.into_iter()
 		.find(|d| d.get_dir().uuid() == shared.uuid())
-		.unwrap()
-		.clone();
+		.unwrap();
+	// the source takes the share root and its role as separate values
 	let role = shared_in.sharing_role().clone();
 	let mixed = share_client
 		.create_dir(&share_test_dir.into(), "mixed")
@@ -1136,14 +1129,14 @@ async fn copy_with_shares(
 		&share_client,
 		vec![
 			CopySource::File(mine_file.clone().into()),
-			CopySource::Dir(CopySourceDir::Normal(mine.clone())),
+			CopySource::Dir(CopySourceDir::Normal(mine)),
 			CopySource::Dir(CopySourceDir::Shared(
 				DirType::Root(Cow::Owned(shared_in)),
 				role,
 			)),
 			CopySource::Dir(CopySourceDir::Linked(
-				DirType::Root(Cow::Owned(own_info.root.clone())),
-				own_info.link.clone(),
+				DirType::Root(Cow::Owned(own_info.root)),
+				own_info.link,
 			)),
 		],
 		&mixed,
