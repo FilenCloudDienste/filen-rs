@@ -288,7 +288,7 @@ struct Job<B: CopyBackend, D> {
 	/// Each request's destination, filled in by [`Job::fetch_targets`].
 	requests: Vec<RequestState>,
 	report: CopyReport<D>,
-	/// The error that ended the job early.
+	/// The error that ended the job early, shared with the failure it came from.
 	fatal: Option<Arc<Error>>,
 }
 

@@ -153,6 +153,8 @@ pub struct FailureInfo {
 	pub dest_parent_dir: DirType<'static, Normal>,
 	pub dest_name: String,
 	pub stage: CopyStage,
+	/// Shared because [`Error`] is not `Clone`, and one failure goes both into an event and
+	/// into the report.
 	pub error: Arc<Error>,
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
 	pub affected_files: u64,
@@ -206,11 +208,13 @@ pub enum CopyEvent {
 	/// or shares.
 	PropagationFailed {
 		dest_uuid: Uuid,
+		/// Shared because [`Error`] is not `Clone` and events are.
 		error: Arc<Error>,
 	},
 	/// A created directory's color could not be set.
 	ColorFailed {
 		dest_uuid: Uuid,
+		/// Shared because [`Error`] is not `Clone` and events are.
 		error: Arc<Error>,
 	},
 }
