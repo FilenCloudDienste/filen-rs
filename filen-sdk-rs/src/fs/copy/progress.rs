@@ -109,17 +109,28 @@ pub(crate) fn work_units(files: u64, bytes: u64) -> u64 {
 	bytes.saturating_add(files.saturating_mul(PER_FILE_WORK_UNITS))
 }
 
+/// The active time the rate is measured over.
+const RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Progress at a point in active time (see [`ActiveClock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sample {
+	active: Duration,
+	bytes_done: u64,
+	units_done: u64,
+}
+
 /// Throughput over a sliding window of active time, and the time left at that rate.
 #[derive(Debug)]
 pub(crate) struct RateEstimator {
 	window: Duration,
-	/// `(active time, bytes done, work units done)`, oldest first.
-	samples: VecDeque<(Duration, u64, u64)>,
+	/// Oldest first.
+	samples: VecDeque<Sample>,
 }
 
 impl Default for RateEstimator {
 	fn default() -> Self {
-		Self::new(Duration::from_secs(10))
+		Self::new(RATE_WINDOW)
 	}
 }
 
@@ -133,38 +144,46 @@ impl RateEstimator {
 
 	/// Records progress at `active` (see [`ActiveClock`]). Samples must not go back in time.
 	pub(crate) fn record(&mut self, active: Duration, bytes_done: u64, units_done: u64) {
-		if self.samples.back().is_some_and(|&(last, bytes, units)| {
-			last == active && bytes == bytes_done && units == units_done
-		}) {
+		let sample = Sample {
+			active,
+			bytes_done,
+			units_done,
+		};
+		if self.samples.back() == Some(&sample) {
 			return;
 		}
-		self.samples.push_back((active, bytes_done, units_done));
+		self.samples.push_back(sample);
 		// keep one sample at or before the window start so the window stays fully covered
 		while self.samples.len() > 2
 			&& self
 				.samples
 				.get(1)
-				.is_some_and(|&(t, ..)| active.saturating_sub(t) >= self.window)
+				.is_some_and(|s| active.saturating_sub(s.active) >= self.window)
 		{
 			self.samples.pop_front();
 		}
 	}
 
-	fn span(&self) -> Option<(Duration, u64, u64)> {
-		let &(first_t, first_b, first_u) = self.samples.front()?;
-		let &(last_t, last_b, last_u) = self.samples.back()?;
-		let elapsed = last_t.checked_sub(first_t).filter(|e| !e.is_zero())?;
-		Some((
-			elapsed,
-			last_b.saturating_sub(first_b),
-			last_u.saturating_sub(first_u),
-		))
+	/// The progress made across the window: its newest sample less its oldest. `None` while the
+	/// samples span no active time.
+	fn span(&self) -> Option<Sample> {
+		let first = self.samples.front()?;
+		let last = self.samples.back()?;
+		let active = last
+			.active
+			.checked_sub(first.active)
+			.filter(|e| !e.is_zero())?;
+		Some(Sample {
+			active,
+			bytes_done: last.bytes_done.saturating_sub(first.bytes_done),
+			units_done: last.units_done.saturating_sub(first.units_done),
+		})
 	}
 
 	/// Bytes per second over the window, or `None` until two samples span some active time.
 	pub(crate) fn bytes_per_second(&self) -> Option<u64> {
-		let (elapsed, bytes, _) = self.span()?;
-		Some((bytes as f64 / elapsed.as_secs_f64()) as u64)
+		let span = self.span()?;
+		Some((span.bytes_done as f64 / span.active.as_secs_f64()) as u64)
 	}
 
 	/// Time left to process `remaining_units` at the windowed rate, or `None` while there is no
@@ -173,11 +192,11 @@ impl RateEstimator {
 		if remaining_units == 0 {
 			return Some(Duration::ZERO);
 		}
-		let (elapsed, _, units) = self.span()?;
-		if units == 0 {
+		let span = self.span()?;
+		if span.units_done == 0 {
 			return None;
 		}
-		let seconds = remaining_units as f64 * elapsed.as_secs_f64() / units as f64;
+		let seconds = remaining_units as f64 * span.active.as_secs_f64() / span.units_done as f64;
 		Duration::try_from_secs_f64(seconds).ok()
 	}
 }
