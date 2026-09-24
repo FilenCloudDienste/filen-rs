@@ -1603,12 +1603,12 @@ async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
 		.events()
 		.into_iter()
 		.filter_map(|e| match e {
-			CopyEvent::Renamed {
+			CopyEvent::Renamed(RenamedEntry {
 				source_uuid,
 				name,
 				reason,
 				..
-			} => Some((source_uuid, name, reason)),
+			}) => Some((source_uuid, String::from(name), reason)),
 			_ => None,
 		})
 		.collect();
@@ -2530,9 +2530,9 @@ async fn renames_found_by_the_name_checks_are_reported() {
 		.events()
 		.into_iter()
 		.filter_map(|e| match e {
-			CopyEvent::Renamed {
+			CopyEvent::Renamed(RenamedEntry {
 				source_uuid, name, ..
-			} => Some((source_uuid, name)),
+			}) => Some((source_uuid, String::from(name))),
 			_ => None,
 		})
 		.collect();
@@ -2681,8 +2681,8 @@ async fn skips_and_renames_are_reported_before_anything_is_created() {
 	let events = recorder.events();
 	let first = |matches: fn(&CopyEvent) -> bool| events.iter().position(matches).unwrap();
 	let created = first(|e| matches!(e, CopyEvent::DirCreated { .. }));
-	assert!(first(|e| matches!(e, CopyEvent::Skipped { .. })) < created);
-	assert!(first(|e| matches!(e, CopyEvent::Renamed { .. })) < created);
+	assert!(first(|e| matches!(e, CopyEvent::Skipped(_))) < created);
+	assert!(first(|e| matches!(e, CopyEvent::Renamed(_))) < created);
 	assert_eq!(outcome.report.counts.entries_skipped, 1);
 	assert_eq!(outcome.report.counts.bytes_skipped, 7);
 	assert_eq!(outcome.report.skipped.len(), 1);

@@ -676,12 +676,8 @@ where
 		let Some(entry) = entry else {
 			return;
 		};
-		self.reporter.event(CopyEvent::Renamed {
-			source_uuid: entry.source_uuid,
-			source_path: entry.source_path.clone(),
-			name: entry.name.as_ref().to_owned(),
-			reason: entry.reason,
-		});
+		// the report keeps the entry too
+		self.reporter.event(CopyEvent::Renamed(entry.clone()));
 		self.report.renamed.push(entry);
 	}
 

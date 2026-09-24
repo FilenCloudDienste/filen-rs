@@ -353,24 +353,24 @@ impl From<api::CopyEvent> for CopyEvent {
 				size,
 			}),
 			api::CopyEvent::FileFailed(info) => Self::FileFailed((&info).into()),
-			api::CopyEvent::Skipped {
+			api::CopyEvent::Skipped(api::SkippedEntry {
 				source_path,
 				bytes,
 				reason,
-			} => Self::Skipped(CopySkippedEntry {
+			}) => Self::Skipped(CopySkippedEntry {
 				source_path,
 				bytes,
 				reason,
 			}),
-			api::CopyEvent::Renamed {
+			api::CopyEvent::Renamed(api::RenamedEntry {
 				source_uuid,
 				source_path,
 				name,
 				reason,
-			} => Self::Renamed(CopyRenamedEntry {
+			}) => Self::Renamed(CopyRenamedEntry {
 				source_uuid,
 				source_path,
-				name,
+				name: name.into(),
 				reason,
 			}),
 			api::CopyEvent::PropagationFailed { dest_uuid, error } => {

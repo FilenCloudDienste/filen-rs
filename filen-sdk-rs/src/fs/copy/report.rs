@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-	plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
+	plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry},
 	progress::{ActiveClock, EventBatcher, RateEstimator, work_units},
 };
 
@@ -193,17 +193,8 @@ pub enum CopyEvent {
 		size: u64,
 	},
 	FileFailed(FailureInfo),
-	Skipped {
-		source_path: String,
-		bytes: u64,
-		reason: SkipReason,
-	},
-	Renamed {
-		source_uuid: Uuid,
-		source_path: String,
-		name: String,
-		reason: RenameReason,
-	},
+	Skipped(SkippedEntry),
+	Renamed(RenamedEntry),
 	/// The item was created but could not be added to one of the destination's public links
 	/// or shares.
 	PropagationFailed {
@@ -525,19 +516,11 @@ impl Reporter {
 					SkipReason::Unreachable { count } => count,
 				};
 				state.counts.bytes_skipped += entry.bytes;
-				state.batcher.push(CopyEvent::Skipped {
-					source_path: entry.source_path.clone(),
-					bytes: entry.bytes,
-					reason: entry.reason,
-				});
+				// the report keeps the entry too
+				state.batcher.push(CopyEvent::Skipped(entry.clone()));
 			}
 			for entry in renamed {
-				state.batcher.push(CopyEvent::Renamed {
-					source_uuid: entry.source_uuid,
-					source_path: entry.source_path.clone(),
-					name: entry.name.as_ref().to_owned(),
-					reason: entry.reason,
-				});
+				state.batcher.push(CopyEvent::Renamed(entry.clone()));
 			}
 			state.changed = true;
 			state.batcher.mark_urgent();
