@@ -33,6 +33,13 @@
 //! three 1M rows) or `all`; it defaults to `default`. `SYNC_BENCH_SAMPLES` defaults to 3, and
 //! `SYNC_BENCH_OUT` to the temp directory. Each run writes ONE fresh JSON file and never appends to
 //! an existing one.
+//!
+//! `SYNC_BENCH_MEM_SAMPLES` (default 2, `0` to skip) is how many FRESH PROCESSES each scenario's
+//! memory figures are taken in. Each one re-invokes this binary on the tree its parent already
+//! built, holds what a pass holds and samples its own resident set; budget about one extra cold
+//! pass apiece. They are the only memory figures worth quoting — an in-process one carries the
+//! whole run's history — and they land in the same result file, under the same scenario name and
+//! definition hash, as the timing figures beside them.
 
 use filen_sdk_rs::sync_engine::bench;
 

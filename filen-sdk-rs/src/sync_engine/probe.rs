@@ -416,7 +416,7 @@ impl TreeBuilder<'_> {
 /// Mint the fixture's stable ids through serde, the sanctioned entrance: `StableUuid` has no
 /// constructor outside the `test-seams` feature, which only dev-dependencies enable — and this
 /// module is part of the library.
-fn stable_uuid(uuid: Uuid) -> StableUuid {
+pub(super) fn stable_uuid(uuid: Uuid) -> StableUuid {
 	serde_json::from_value(serde_json::Value::String(uuid.to_string()))
 		.expect("a uuid string deserializes as a stable uuid")
 }
@@ -516,7 +516,7 @@ impl ScanCosts {
 }
 
 /// Bytes as mebibytes: the unit every memory figure in this harness is written in.
-fn mib(bytes: u64) -> f64 {
+pub(super) fn mib(bytes: u64) -> f64 {
 	bytes as f64 / (1024.0 * 1024.0)
 }
 
@@ -534,14 +534,57 @@ fn heap(bytes: usize) -> usize {
 /// allocation rather than a guess at it, and at a million rows the real table is nearly twice
 /// this figure's slot term. Same convention as [`Baseline::resident_bytes`], which is what lets
 /// the three numbers be summed and compared against a resident set.
-fn side_bytes<V: FromRow>(nodes: &Side<V>, node_heap: impl Fn(&V) -> usize) -> usize {
-	let slots = nodes.capacity() * (size_of::<String>() + size_of::<V>() + 1);
-	let owned: usize = nodes
-		.whole()
-		.iter()
-		.map(|(path, node)| heap(path.len()) + node_heap(&node))
+///
+/// What it counts is what the side OWNS, through [`Side::own_keys`], and that is the whole reason
+/// it is not a walk of every path the side can answer for. A CARRIED side — the two halves of a
+/// change-scoped pass — holds only what the pass observed and derives the rest from the baseline
+/// rows, so walking it whole would charge the side for a tree the baseline is already charged for,
+/// and would report a scoped pass holding two more copies of the tree it exists not to hold.
+///
+/// Two things it cannot see, both small and both named rather than folded in: an overlay's
+/// TOMBSTONES (a path observed absent) cost a key each and are not among its own keys, and a
+/// carried slot holds `Option<V>` where a whole one holds `V`, which is the only reason the slot
+/// width is chosen per backing here.
+fn side_owned_bytes<V: FromRow>(
+	side: &Side<V>,
+	baseline: &Baseline,
+	node_heap: impl Fn(&V) -> usize,
+) -> usize {
+	let value = match side {
+		Side::Whole(_) => size_of::<V>(),
+		Side::Carried(_) => size_of::<Option<V>>(),
+	};
+	let slots = side.capacity() * (size_of::<String>() + value + 1);
+	let read = side.of(baseline);
+	let owned: usize = side
+		.own_keys()
+		.map(|path| heap(path.len()) + read.at(path).map_or(0, |node| node_heap(&node)))
 		.sum();
 	slots + owned
+}
+
+/// What the three structures a pass holds at its widest point compute their OWN size as.
+///
+/// The same convention as [`Baseline::resident_bytes`] and [`side_owned_bytes`] — capacities and heap
+/// allocations summed by the structures themselves — which is what lets the three be added up and
+/// set against a resident set. It is an ATTRIBUTION and not a measurement of the process: it
+/// cannot see table slack above `capacity`, the allocator's retention or the cache DB's mapped
+/// pages, and those are exactly the remainder a memory table has to print beside it rather than
+/// fold in.
+///
+/// O(nodes): every path of both sides is visited. Called only where nothing is being timed.
+pub(super) fn pass_structures_bytes(
+	baseline: &Baseline,
+	remote: &Side<RemoteNode>,
+	local: &Side<LocalNode>,
+) -> (usize, usize, usize) {
+	(
+		baseline.resident_bytes(),
+		// Each node carries its own path a SECOND time, beside the key it is filed under: two
+		// allocations per node, which is why both sides are counted the same way.
+		side_owned_bytes(remote, baseline, |node| heap(node.rel_path.len())),
+		side_owned_bytes(local, baseline, |node| heap(node.rel_path.len())),
+	)
 }
 
 /// Peak resident set size of this process so far, in bytes.
@@ -550,7 +593,7 @@ fn side_bytes<V: FromRow>(nodes: &Side<V>, node_heap: impl Fn(&V) -> usize) -> u
 /// misses every spike shorter than its interval, and the peak of a pass is exactly such a spike.
 /// macOS reports bytes, Linux kibibytes. Returns 0 where the call is unavailable.
 #[cfg(unix)]
-fn peak_rss_bytes() -> u64 {
+pub(super) fn peak_rss_bytes() -> u64 {
 	// The real `struct rusage` is two `timeval`s (16 bytes each on every 64-bit target: macOS pads
 	// its 32-bit `suseconds_t` up, Linux has a 64-bit one) followed by 14 `c_long`s, of which
 	// `ru_maxrss` is the first. The trailing array is only here so the struct cannot be smaller
@@ -586,7 +629,7 @@ fn peak_rss_bytes() -> u64 {
 }
 
 #[cfg(not(unix))]
-fn peak_rss_bytes() -> u64 {
+pub(super) fn peak_rss_bytes() -> u64 {
 	0
 }
 
@@ -598,7 +641,7 @@ fn peak_rss_bytes() -> u64 {
 /// Linux reads `/proc/self/statm`; everything else asks `ps`, which is a fork and a pipe and so
 /// belongs nowhere inside a timed phase. Returns 0 where neither answers.
 #[cfg(target_os = "linux")]
-fn current_rss_bytes() -> u64 {
+pub(super) fn current_rss_bytes() -> u64 {
 	// Field 2 is the resident page count. 4 KiB is the page size on every target this runs on;
 	// a wrong guess here would scale the figure, not invent one.
 	fs::read_to_string("/proc/self/statm")
@@ -613,7 +656,7 @@ fn current_rss_bytes() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn current_rss_bytes() -> u64 {
+pub(super) fn current_rss_bytes() -> u64 {
 	std::process::Command::new("ps")
 		.args(["-o", "rss=", "-p", &std::process::id().to_string()])
 		.output()
@@ -1012,8 +1055,8 @@ fn pass_pure(
 		baseline_bytes: baseline.resident_bytes(),
 		// Each node carries its own path a SECOND time, beside the key it is filed under: two
 		// allocations per node, which is why both sides are counted the same way.
-		view_bytes: side_bytes(&remote, |node| heap(node.rel_path.len())),
-		scan_bytes: side_bytes(&local, |node| heap(node.rel_path.len())),
+		view_bytes: side_owned_bytes(&remote, &baseline, |node| heap(node.rel_path.len())),
+		scan_bytes: side_owned_bytes(&local, &baseline, |node| heap(node.rel_path.len())),
 	}
 }
 
