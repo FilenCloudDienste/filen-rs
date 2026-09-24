@@ -257,6 +257,21 @@ impl<T> Side<T> {
 		self.of(EMPTY.get_or_init(Baseline::default))
 	}
 
+	/// The paths this side holds that no baseline row put there — what THIS pass's own producers
+	/// added: the local observation, the remote delta, the fold of unacknowledged writes.
+	///
+	/// A whole side answers with every path it holds, which is all it has. A carried one answers
+	/// with its OVERLAY alone, and that is exact rather than a shortcut:
+	/// [`derive::from_baseline`](super::derive::from_baseline) places nothing, so every other path
+	/// such a side holds IS a baseline row answering for itself. That is what lets the assembly
+	/// check cost the change rather than the tree.
+	pub(super) fn own_keys(&self) -> OwnKeys<'_, T> {
+		match self {
+			Self::Whole(map) => OwnKeys::Whole(map.keys()),
+			Self::Carried(overlay) => OwnKeys::Carried(overlay.edits.iter()),
+		}
+	}
+
 	/// This side's nodes by value, for a test that owns a WHOLE one and wants to feed them
 	/// somewhere. Asserts the backing for the reason [`whole`](Self::whole) does: a carried side's
 	/// nodes are not held anywhere to be handed over.
@@ -472,6 +487,31 @@ impl<T> Extend<(String, T)> for Side<T> {
 			Self::Carried(overlay) => overlay
 				.edits
 				.extend(nodes.into_iter().map(|(path, node)| (path, Some(node)))),
+		}
+	}
+}
+
+/// The keys a side holds that no baseline row placed there (see [`Side::own_keys`]).
+pub(super) enum OwnKeys<'a, T> {
+	Whole(hash_map::Keys<'a, String, T>),
+	Carried(hash_map::Iter<'a, String, Option<T>>),
+}
+
+impl<'a, T> Iterator for OwnKeys<'a, T> {
+	type Item = &'a str;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self {
+			Self::Whole(keys) => keys.next().map(String::as_str),
+			// A tombstone holds nothing, so it is not a key this side has.
+			Self::Carried(edits) => {
+				for (path, edit) in edits.by_ref() {
+					if edit.is_some() {
+						return Some(path.as_str());
+					}
+				}
+				None
+			}
 		}
 	}
 }
