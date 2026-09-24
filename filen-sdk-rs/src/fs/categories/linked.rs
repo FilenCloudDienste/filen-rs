@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use filen_types::api::v3::dir::color::DirColor;
 #[cfg(feature = "multi-threaded-crypto")]
 use rayon::iter::ParallelIterator;
 
@@ -135,8 +136,9 @@ impl CategoryFS for Linked {
 								None => return None,
 								Some(parent) => parent,
 							},
-							response_dir.color,
-							response_dir.favorited,
+							// link rows carry no color or favorited
+							DirColor::Default,
+							false,
 							response_dir.timestamp,
 							response_dir.meta,
 							crypter,
@@ -159,7 +161,7 @@ impl CategoryFS for Linked {
 							f.region,
 							f.bucket,
 							f.timestamp,
-							f.favorited,
+							false,
 							meta,
 						))
 					})
