@@ -2139,17 +2139,6 @@ test("cache search", async () => {
 	search.free()
 })
 
-/// Resolves once `condition` holds, polling; fails the test after `timeoutMs`.
-async function waitFor(what: string, condition: () => boolean, timeoutMs = cap(60_000)): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (!condition()) {
-		if (Date.now() > deadline) {
-			throw new Error(`timed out waiting until ${what}`)
-		}
-		await new Promise(resolve => setTimeout(resolve, 100))
-	}
-}
-
 function nameOf(item: { meta: FileMeta } | { meta: DirMeta }): string | undefined {
 	const meta = item.meta
 	return meta.type === "decoded" ? meta.data.name : undefined
@@ -2213,7 +2202,7 @@ test("copyItems copies a tree and delivers every callback in order before it res
 	expect(created.map(e => e.name)).toStrictEqual(["source", "sub"])
 
 	const { dirs } = await state.listDir(destination)
-	const copy = dirs.find(d => nameOf(d) === "source")
+	const copy = dirs.find(d => getDirMeta(d.meta)?.name === "source")
 	expect(copy?.uuid).toBe(report.topLevel[0].item.uuid)
 	const { dirs: copiedSubs } = await state.listDir(copy!)
 	const { files: copiedBig } = await state.listDir(copiedSubs[0])
@@ -2238,7 +2227,7 @@ test("copyItemsTo copies into several destinations under their names", async () 
 	expect(names).toContainEqual([0n, "x.txt"])
 	expect(names).toContainEqual([1n, "y (1).txt"])
 	const { files } = await state.listDir(second)
-	expect(files.map(f => nameOf(f)).sort()).toStrictEqual(["y (1).txt", "y.txt"])
+	expect(files.map(f => getFileMeta(f.meta)?.name).sort()).toStrictEqual(["y (1).txt", "y.txt"])
 })
 
 test("copyItems pauses, resumes and cancels through managedFuture", async () => {
@@ -2258,7 +2247,12 @@ test("copyItems pauses, resumes and cancels through managedFuture", async () => 
 		onUpdate: update => updates.push(update),
 		managedFuture: { pauseSignal }
 	})
-	await waitFor("the copy is paused", () => updates.some(u => u.runState === "paused"))
+	await vi.waitFor(
+		() => {
+			expect(updates.some(u => u.runState === "paused")).toBe(true)
+		},
+		{ timeout: cap(60_000), interval: 100 }
+	)
 	const doneWhilePaused = updates[updates.length - 1].counts.filesDone
 	await new Promise(resolve => setTimeout(resolve, 2000))
 	expect(updates[updates.length - 1].counts.filesDone).toBe(doneWhilePaused)
