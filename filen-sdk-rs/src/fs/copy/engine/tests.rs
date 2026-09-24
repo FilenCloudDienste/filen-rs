@@ -7,6 +7,7 @@ use std::{
 	time::Duration,
 };
 
+use filen_types::{crypto::EncryptedString, fs::StableUuid};
 use tokio::sync::watch;
 
 use super::*;
@@ -23,7 +24,6 @@ use crate::{
 	},
 	job::test_support::controls,
 };
-use filen_types::fs::StableUuid;
 
 fn budget(chunks: usize) -> usize {
 	chunks * (CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE)
@@ -1349,9 +1349,8 @@ async fn running_out_of_storage_ends_the_job() {
 		backend.log().finished.is_empty(),
 		"the other files are stopped, not finished"
 	);
-	assert_eq!(report.failures.len(), 1);
 	assert_eq!(
-		report.failures[0].info.error.kind(),
+		only_failure(&report).info.error.kind(),
 		ErrorKind::MaxStorageReached
 	);
 	assert!(
@@ -1449,9 +1448,7 @@ async fn a_failed_file_does_not_stop_the_others() {
 
 	assert_released(&backend, &reporter);
 	assert_eq!(backend.log().finished.len(), 1);
-	let [failure] = report.failures.as_slice() else {
-		panic!("exactly one failure");
-	};
+	let failure = only_failure(&report);
 	assert!(matches!(&failure.source, FailedSource::File(file) if file.uuid() == bad.uuid()));
 	assert_eq!(failure.info.stage, CopyStage::Download);
 	assert_eq!(failure.info.dest_parent_dir.uuid(), destination);
@@ -1504,9 +1501,7 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 		"nothing below the failed directory is attempted"
 	);
 	assert_eq!(log.finished.len(), 1);
-	let [failure] = report.failures.as_slice() else {
-		panic!("one failure for the whole subtree");
-	};
+	let failure = only_failure(&report);
 	assert!(matches!(failure.source, FailedSource::Dir(())));
 	assert_eq!(failure.info.stage, CopyStage::CreateDirectory);
 	assert_eq!(failure.info.source_uuid, sub.uuid);
@@ -2034,9 +2029,7 @@ async fn a_file_gives_up_after_the_bounded_number_of_taken_names() {
 		backend.log().uploaded.is_empty(),
 		"nothing is uploaded without a free name"
 	);
-	let [failure] = report.failures.as_slice() else {
-		panic!("one failure");
-	};
+	let failure = only_failure(&report);
 	assert_eq!(failure.info.error.kind(), ErrorKind::InvalidState);
 }
 
@@ -2063,9 +2056,7 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	let report = running.await.unwrap().unwrap();
 
 	assert_released(&backend, &reporter);
-	let [failure] = report.failures.as_slice() else {
-		panic!("one failure");
-	};
+	let failure = only_failure(&report);
 	assert_eq!(
 		failure.info.stage,
 		CopyStage::RegisteredAsVersion {
@@ -2105,29 +2096,21 @@ fn source_file_with_wrong_hash(name: &str, size: u64) -> RemoteFileType<'static>
 	RemoteFileType::File(Cow::Owned(file))
 }
 
+/// A planned file whose metadata cannot be decrypted, so it has no name.
 fn undecryptable_source_file(size: u64) -> RemoteFileType<'static> {
-	let file: crate::fs::file::AnonymousRemoteFile = RemoteFile::from_meta(
-		Uuid::new_v4(),
-		(),
-		Uuid::new_v4().into(),
-		size,
-		size.div_ceil(CHUNK_SIZE_U64),
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		FileMeta::Encrypted(filen_types::crypto::EncryptedString(Cow::Borrowed(
-			"garbage",
-		))),
-	);
+	let RemoteFileType::File(file) = source_file("", size) else {
+		unreachable!("source_file builds a file of the user's drive");
+	};
+	let mut file = file.into_owned();
+	file.meta = FileMeta::Encrypted(EncryptedString(Cow::Borrowed("garbage")));
 	RemoteFileType::File(Cow::Owned(file))
 }
 
-fn only_failure(report: &CopyReport<()>) -> &FailureInfo {
+fn only_failure(report: &CopyReport<()>) -> &CopyFailure<()> {
 	let [failure] = report.failures.as_slice() else {
 		panic!("exactly one failure, got {:?}", report.failures);
 	};
-	&failure.info
+	failure
 }
 
 #[tokio::test(start_paused = true)]
@@ -2211,7 +2194,7 @@ async fn an_inconsistent_chunk_count_fails_the_file() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().fetched.is_empty(), "nothing is read");
@@ -2236,7 +2219,7 @@ async fn a_short_file_fails_as_a_download() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().finished.is_empty(), "nothing is registered");
@@ -2265,7 +2248,7 @@ async fn a_failed_upload_is_an_upload_failure() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.stage, CopyStage::Upload);
 	assert_eq!(info.error.kind(), ErrorKind::Server);
 	assert_eq!(backend.log().finished.len(), 1);
@@ -2290,7 +2273,7 @@ async fn a_failed_registration_is_a_finalize_failure() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.stage, CopyStage::Finalize);
 	assert_eq!(backend.log().uploaded.len(), 2, "the chunks were uploaded");
 	assert!(backend.log().finished.is_empty());
@@ -2312,7 +2295,7 @@ async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	assert_eq!(only_failure(&report).stage, CopyStage::Finalize);
+	assert_eq!(only_failure(&report).info.stage, CopyStage::Finalize);
 	assert_released(&backend, &reporter);
 }
 
@@ -2465,7 +2448,7 @@ async fn a_nested_directory_that_merges_is_a_failure() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.source_uuid, sub.uuid);
 	assert_eq!(info.stage, CopyStage::CreateDirectory);
 	assert_eq!(info.error.kind(), ErrorKind::InvalidState);
@@ -2497,7 +2480,7 @@ async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	let info = only_failure(&report);
+	let info = &only_failure(&report).info;
 	assert_eq!(info.stage, CopyStage::CreateDirectory);
 	assert_eq!(info.error.kind(), ErrorKind::InvalidState);
 	assert_eq!(info.affected_files, 1);

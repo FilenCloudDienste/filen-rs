@@ -924,16 +924,10 @@ mod tests {
 			affected_bytes: 10,
 		};
 		let update = CopyUpdate::from(copy::CopyUpdate {
-			phase: CopyPhase::CopyingFiles,
-			run_state: RunState::Running,
-			scan: ScanProgress::default(),
-			totals: PlanTotals::default(),
-			counts: CopyCounts::default(),
-			active: Vec::new(),
 			events: vec![copy::CopyEvent::FileFailed(failure.clone())],
 			bytes_per_second: Some(100),
 			eta: Some(Duration::from_millis(1500)),
-			active_time: Duration::from_secs_f64(2.5),
+			..update(2500)
 		});
 		assert_eq!(update.eta_ms, Some(1500));
 		assert_eq!(update.active_time_ms, 2500);
