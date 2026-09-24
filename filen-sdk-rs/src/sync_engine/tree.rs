@@ -573,13 +573,6 @@ impl Baseline {
 
 	/// How many rows stand in for both sides — what a carried side holds before this pass's own
 	/// observations correct it (see [`BaselineEntry::carryable`]).
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
-		)
-	)]
 	pub(super) fn carryable_rows(&self) -> usize {
 		// Checked in EVERY build. A `debug_assert` beside a `saturating_sub` would state the
 		// invariant and then mask its violation exactly where it matters: this is a capacity hint,
@@ -600,13 +593,6 @@ impl Baseline {
 	/// Answered without building a row, which is the whole reason a carried side can say it holds a
 	/// path it has no node for: rebuilding the row to ask would allocate its path and both its
 	/// halves, per lookup.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
-		)
-	)]
 	pub(super) fn carryable(&self, rel_path: &str) -> bool {
 		self.resolve(rel_path)
 			.is_some_and(|id| self.is_row(id) && !self.uncarryable.contains(&id))
@@ -626,13 +612,6 @@ impl Baseline {
 	///
 	/// From the index, not from a walk. This is the list that would otherwise cost a pass one visit
 	/// of every row in the tree just to discover that a converged pair has none.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
-		)
-	)]
 	pub(super) fn uncarryable_paths(&self) -> impl Iterator<Item = String> + '_ {
 		self.uncarryable.iter().map(|&id| self.path_of(id))
 	}
@@ -650,13 +629,6 @@ impl Baseline {
 	/// pass has seen and not yet written back — has to scan those itself first and use this for the
 	/// row half. Asked alone, it answers "nothing there" for a destination holding a brand-new
 	/// file, and the directory move that asked would land on top of it.
-	#[cfg_attr(
-		not(test),
-		expect(
-			dead_code,
-			reason = "the switch-over that answers a side off the baseline instead of a materialized map is the caller"
-		)
-	)]
 	pub(super) fn any_folded_row_at_or_under(
 		&self,
 		rel_path: &str,

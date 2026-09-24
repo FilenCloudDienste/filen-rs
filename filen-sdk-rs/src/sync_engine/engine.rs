@@ -858,7 +858,7 @@ impl PendingWrites {
 					fold_move(nodes, &mut path_of, baseline, *uuid, from, to, changed)
 				}
 				PendingKind::Trashed { path } => {
-					fold_trash(nodes, &mut path_of, *uuid, path, changed)
+					fold_trash(nodes, baseline, &mut path_of, *uuid, path, changed)
 				}
 			};
 			folded += usize::from(applied);
@@ -921,10 +921,11 @@ struct ViewIndex(Option<HashMap<Uuid, String>>);
 
 impl ViewIndex {
 	/// Where `nodes` holds `uuid`, building the index if it is not built yet.
-	fn at(&mut self, nodes: &Side<RemoteNode>, uuid: Uuid) -> Option<String> {
+	fn at(&mut self, nodes: &Side<RemoteNode>, baseline: &Baseline, uuid: Uuid) -> Option<String> {
 		self.0
 			.get_or_insert_with(|| {
 				nodes
+					.of(baseline)
 					.iter()
 					.map(|(path, node)| (node.remote_uuid, path.into_owned()))
 					.collect()
@@ -953,29 +954,37 @@ impl ViewIndex {
 /// hint is always current however much the fold has already edited.
 fn held_at(
 	nodes: &Side<RemoteNode>,
+	baseline: &Baseline,
 	path_of: &mut ViewIndex,
 	uuid: Uuid,
 	hints: &[&str],
 ) -> Option<String> {
 	for hint in hints {
-		if nodes.at(hint).is_some_and(|node| node.remote_uuid == uuid) {
+		if nodes
+			.of(baseline)
+			.at(hint)
+			.is_some_and(|node| node.remote_uuid == uuid)
+		{
 			return Some((*hint).to_owned());
 		}
 	}
-	path_of.at(nodes, uuid)
+	path_of.at(nodes, baseline, uuid)
 }
 
 /// Put `node` at `path`, keeping the uuid index in step with whatever it displaces.
 fn place_node(
 	nodes: &mut Side<RemoteNode>,
+	baseline: &Baseline,
 	path_of: &mut ViewIndex,
 	path: String,
 	node: RemoteNode,
 ) {
 	let uuid = node.remote_uuid;
-	if let Some(previous) = nodes.insert(path.clone(), node) {
-		path_of.gone(previous.remote_uuid);
+	let displaced = nodes.of(baseline).at(&path).map(|node| node.remote_uuid);
+	if let Some(previous) = displaced {
+		path_of.gone(previous);
 	}
+	nodes.insert(path.clone(), node);
 	path_of.placed(uuid, &path);
 }
 
@@ -1000,7 +1009,7 @@ fn fold_create(
 	let Some(node) = written_node(baseline.get(path).as_ref()) else {
 		return false;
 	};
-	match nodes.at(path) {
+	match nodes.of(baseline).at(path) {
 		// The cache is showing what our baseline records: it has caught up.
 		Some(current) if current.remote_uuid == node.remote_uuid => return false,
 		// Ours — the write itself, or the version it superseded — so the cache is behind on us.
@@ -1020,7 +1029,7 @@ fn fold_create(
 		Some(_) => return false,
 	}
 	changed.insert(path.to_string());
-	place_node(nodes, path_of, path.to_string(), node);
+	place_node(nodes, baseline, path_of, path.to_string(), node);
 	true
 }
 
@@ -1036,7 +1045,7 @@ fn fold_move(
 	to: &str,
 	changed: &mut BTreeSet<String>,
 ) -> bool {
-	let vacated = match held_at(nodes, path_of, uuid, &[to, from]).as_deref() {
+	let vacated = match held_at(nodes, baseline, path_of, uuid, &[to, from]).as_deref() {
 		// Already where we moved it.
 		Some(at) if at == to => return false,
 		// The pre-move path the cache still shows: take the node off it, whatever the destination
@@ -1044,7 +1053,7 @@ fn fold_move(
 		Some(at) if at == from => {
 			path_of.gone(uuid);
 			changed.insert(from.to_string());
-			nodes.remove(from)
+			nodes.remove(baseline, from)
 		}
 		// Somewhere else entirely — not our move lagging, so the snapshot stands.
 		Some(_) => return false,
@@ -1054,7 +1063,11 @@ fn fold_move(
 	// flight, so leave the path showing what really sits on it. Vacating the pre-move path was
 	// still right — without it the reconciler reads the item we moved as an untracked remote entry
 	// and trashes it.
-	if nodes.at(to).is_some_and(|node| node.remote_uuid != uuid) {
+	if nodes
+		.of(baseline)
+		.at(to)
+		.is_some_and(|node| node.remote_uuid != uuid)
+	{
 		return vacated.is_some();
 	}
 	let carries_subtree = vacated
@@ -1068,18 +1081,18 @@ fn fold_move(
 	};
 	node.rel_path = to.to_string();
 	changed.insert(to.to_string());
-	place_node(nodes, path_of, to.to_string(), node);
+	place_node(nodes, baseline, path_of, to.to_string(), node);
 	if carries_subtree {
-		let children = nodes.subtree_paths(from);
+		let children = nodes.subtree_paths(baseline, from);
 		for old in children {
-			let Some(mut child) = nodes.remove(&old) else {
+			let Some(mut child) = nodes.remove(baseline, &old) else {
 				continue;
 			};
 			let new = format!("{to}{}", &old[from.len()..]);
 			child.rel_path = new.clone();
 			changed.insert(old);
 			changed.insert(new.clone());
-			place_node(nodes, path_of, new, child);
+			place_node(nodes, baseline, path_of, new, child);
 		}
 	}
 	true
@@ -1089,28 +1102,30 @@ fn fold_move(
 /// server trashed with it.
 fn fold_trash(
 	nodes: &mut Side<RemoteNode>,
+	baseline: &Baseline,
 	path_of: &mut ViewIndex,
 	uuid: Uuid,
 	at: &str,
 	changed: &mut BTreeSet<String>,
 ) -> bool {
-	let Some(path) = held_at(nodes, path_of, uuid, &[at]) else {
+	let Some(path) = held_at(nodes, baseline, path_of, uuid, &[at]) else {
 		return false;
 	};
 	path_of.gone(uuid);
-	let Some(node) = nodes.remove(&path) else {
+	let Some(node) = nodes.remove(baseline, &path) else {
 		return false;
 	};
 	changed.insert(path.clone());
 	if node.kind == NodeKind::Dir {
-		nodes.retain(|key, node| {
-			let keep = !plan::is_under(key, &path);
-			if !keep {
-				path_of.gone(node.remote_uuid);
-				changed.insert(key.to_owned());
-			}
-			keep
-		});
+		// The subtree NAMED rather than filtered out of the whole side: a `retain` asks about
+		// every node, which on a carried side is a walk of the tree to trash one directory.
+		for key in nodes.subtree_paths(baseline, &path) {
+			let Some(child) = nodes.remove(baseline, &key) else {
+				continue;
+			};
+			path_of.gone(child.remote_uuid);
+			changed.insert(key);
+		}
 	}
 	true
 }
@@ -1480,9 +1495,9 @@ pub(super) fn assembly_accounted(
 		match observation {
 			LocalObservation::Dir(scan) if scan.complete => {
 				replaced += rows_at(at);
-				certain += scan.nodes.len();
+				certain += scan.nodes.of(baseline).len();
 			}
-			LocalObservation::Dir(scan) => slack += scan.nodes.len(),
+			LocalObservation::Dir(scan) => slack += scan.nodes.of(baseline).len(),
 			LocalObservation::Absent(absence) => replaced += rows_at(absence.path()),
 			LocalObservation::Hidden(_) => replaced += rows_at(at),
 			LocalObservation::File { .. } => slack += 1,
@@ -1494,7 +1509,7 @@ pub(super) fn assembly_accounted(
 	// `rows_at`.
 	let carried = baseline.len().saturating_sub(held.len());
 	let lowest = carried.saturating_sub(replaced).saturating_add(certain);
-	(lowest..=lowest.saturating_add(slack)).contains(&derived.local.len())
+	(lowest..=lowest.saturating_add(slack)).contains(&derived.local.of(baseline).len())
 }
 
 /// The first key in the two maps a narrowed reconcile would never visit, if there is one — the
@@ -1650,7 +1665,13 @@ impl Prepared {
 	fn planned(&self, actions: &[SyncAction]) -> Vec<PlannedAction> {
 		actions
 			.iter()
-			.map(|action| planned_action(action, &self.local_scan.nodes, &self.remote_view.nodes))
+			.map(|action| {
+				planned_action(
+					action,
+					&self.local_scan.nodes.of(&self.baseline),
+					&self.remote_view.nodes.of(&self.baseline),
+				)
+			})
 			.collect()
 	}
 
@@ -2398,8 +2419,8 @@ impl SyncEngine {
 				plan::adopt_destination_rows(
 					mode,
 					&prep.baseline,
-					&prep.local_scan.nodes,
-					&prep.remote_view.nodes,
+					&prep.local_scan.nodes.of(&prep.baseline),
+					&prep.remote_view.nodes.of(&prep.baseline),
 				)
 			}
 		};
@@ -2898,6 +2919,7 @@ impl SyncEngine {
 			record.mode,
 			RuleCandidates {
 				view,
+				baseline,
 				paths: rule_files,
 			},
 			user,
@@ -3130,7 +3152,7 @@ impl SyncEngine {
 				inputs
 					.baseline
 					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter(|rel_path| !view.nodes.of(&inputs.baseline).holds(rel_path))
 					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
@@ -3162,7 +3184,7 @@ impl SyncEngine {
 				"sync_once[pair {pair}]: the derived local map ({} node(s)) does not account for \
 				 the {} baseline row(s) and {} observation(s) it was built from; reading both \
 				 sides instead",
-				derived.local.len(),
+				derived.local.of(&inputs.baseline).len(),
 				inputs.baseline.len(),
 				observations.observed.len(),
 			);
@@ -3222,8 +3244,25 @@ impl SyncEngine {
 		// from announcements, and the view is only read to spot a FOREIGN version at a row's path.
 		let mut confirmed = Vec::new();
 		if inputs.baseline.any_unconfirmed() {
+			// Read BEFORE the rows are borrowed mutably: a change-scoped view derives its nodes
+			// from those very rows, so it cannot be read across the `make_mut`. Only the
+			// unconfirmed rows' own paths are looked up — `observed_confirmations` asks about no
+			// other — so this is the per-push work the confirmation already was, never the tree.
+			// Cloning the `Arc` instead would deep-copy the whole tree on every pass after a push.
+			let at_unconfirmed: HashMap<String, RemoteNode> = {
+				let nodes = view.nodes.of(&inputs.baseline);
+				inputs
+					.baseline
+					.unconfirmed()
+					.filter_map(|row| {
+						nodes
+							.at(&row.rel_path)
+							.map(|node| (row.rel_path.clone(), node.into_owned()))
+					})
+					.collect()
+			};
 			let rows = Arc::make_mut(&mut inputs.baseline);
-			confirmed = self.confirm_pushes(rows, &view.nodes).await;
+			confirmed = self.confirm_pushes(rows, &at_unconfirmed).await;
 		}
 
 		let mut holds = {
@@ -3244,7 +3283,7 @@ impl SyncEngine {
 			}
 			holds
 		};
-		self.retire_superseded_creates(pair, &inputs.baseline, &view.nodes)
+		self.retire_superseded_creates(pair, &inputs.baseline, &view.nodes.of(&inputs.baseline))
 			.await?;
 		let folded = self.pending.fold_into(
 			pair,
@@ -3283,8 +3322,8 @@ impl SyncEngine {
 		debug_assert!(
 			unaccounted_key(
 				&inputs.baseline,
-				&derived.local,
-				&view.nodes,
+				&derived.local.of(&inputs.baseline),
+				&view.nodes.of(&inputs.baseline),
 				&derived.decided
 			)
 			.is_none(),
@@ -3292,8 +3331,8 @@ impl SyncEngine {
 			 producer recorded, so the narrowed reconcile would never decide it: {:?}",
 			unaccounted_key(
 				&inputs.baseline,
-				&derived.local,
-				&view.nodes,
+				&derived.local.of(&inputs.baseline),
+				&view.nodes.of(&inputs.baseline),
 				&derived.decided
 			)
 		);
@@ -3316,7 +3355,7 @@ impl SyncEngine {
 				let present: Vec<String> = names
 					.iter()
 					.map(|name| plan::join_path(dir, name))
-					.filter(|path| derived.local.holds(path))
+					.filter(|path| derived.local.of(&inputs.baseline).holds(path))
 					.collect();
 				if let Some(rel_path) = present.get(1) {
 					errors.push(ScanError::DuplicateName {
@@ -3346,7 +3385,7 @@ impl SyncEngine {
 			ignored_default_untracked: 0,
 			ignore_blocked: BTreeSet::new(),
 		};
-		let remote_emptied = remote_emptied(&view.nodes, &inputs.baseline);
+		let remote_emptied = remote_emptied(&view.nodes.of(&inputs.baseline), &inputs.baseline);
 		let mut prepared = Prepared {
 			record: inputs.record,
 			baseline: inputs.baseline,
@@ -3422,9 +3461,13 @@ impl SyncEngine {
 		// baseline to find that out.
 		let mut confirmed = Vec::new();
 		if baseline.any_unconfirmed() {
+			// A WHOLE view, whose backing derives nothing — so reading it against an empty tree is
+			// exact, and leaves the rows free to be borrowed mutably beside it.
+			let no_rows = Baseline::default();
+			let raw = view.nodes.of(&no_rows);
 			let rows = Arc::make_mut(&mut baseline);
-			confirmed = plan::confirm_agreed_content(rows, &view.nodes);
-			confirmed.extend(self.confirm_pushes(rows, &view.nodes).await);
+			confirmed = plan::confirm_agreed_content(rows, &raw);
+			confirmed.extend(self.confirm_pushes(rows, &raw).await);
 		}
 		let baseline = baseline;
 
@@ -3436,7 +3479,13 @@ impl SyncEngine {
 			Err(error) => (None, Some(error)),
 		};
 		let mut remote_rules = self
-			.remote_rules(&record, &baseline, &view, rule_file_paths(&view), user)
+			.remote_rules(
+				&record,
+				&baseline,
+				&view,
+				rule_file_paths(&view, &baseline),
+				user,
+			)
 			.await;
 		if let Some(error) = user_error {
 			remote_rules.blocked.insert(String::new());
@@ -3454,7 +3503,7 @@ impl SyncEngine {
 			RuleFiles::Only(
 				baseline
 					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter(|rel_path| !view.nodes.of(&baseline).holds(rel_path))
 					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
@@ -3481,7 +3530,7 @@ impl SyncEngine {
 
 		// The reads that are about the remote AS IT IS come before anything is hidden: what the
 		// cache shows is evidence whatever the rules hide.
-		let remote_emptied = remote_emptied(&view.nodes, &baseline);
+		let remote_emptied = remote_emptied(&view.nodes.of(&baseline), &baseline);
 		// The rows `settle` retires have to leave the DB too, or a restart would fold writes the
 		// cache has demonstrably caught up to. Diffed around the call so `settle` itself stays a
 		// pure in-memory operation, and the two halves — the in-memory retirement and the DELETE
@@ -3491,7 +3540,9 @@ impl SyncEngine {
 		let mut holds = {
 			let journal = locked(&store);
 			let before = self.pending.uuids();
-			let holds = self.pending.settle(pair, &observed, &view.nodes);
+			let holds = self
+				.pending
+				.settle(pair, &observed, &view.nodes.of(&baseline));
 			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
 			if !retired.is_empty() {
 				journal
@@ -3502,7 +3553,7 @@ impl SyncEngine {
 		};
 		// A create whose path shows another version of the same file is the one thing the fold
 		// cannot settle on its own; ask the server before it paints over a stranger.
-		self.retire_superseded_creates(pair, &baseline, &view.nodes)
+		self.retire_superseded_creates(pair, &baseline, &view.nodes.of(&baseline))
 			.await?;
 
 		// Hidden with exactly the rules the scan matched with, so both sides hide the same paths.
@@ -4540,9 +4591,9 @@ impl SyncEngine {
 		tracing::debug!(
 			"sync_once[pair {pair}]: mode {:?} — local scan {} node(s) (complete={}), remote view {} node(s) (converged={})",
 			prep.record.mode,
-			prep.local_scan.nodes.len(),
+			prep.local_scan.nodes.of(&prep.baseline).len(),
 			prep.local_scan.complete,
-			prep.remote_view.nodes.len(),
+			prep.remote_view.nodes.of(&prep.baseline).len(),
 			prep.remote_converged,
 		);
 		observer(SyncEvent::PassStarted {
@@ -4622,8 +4673,16 @@ impl SyncEngine {
 				&store,
 				pair,
 				rel_path,
-				prep.local_scan.nodes.at(rel_path).as_deref(),
-				prep.remote_view.nodes.at(rel_path).as_deref(),
+				prep.local_scan
+					.nodes
+					.of(&prep.baseline)
+					.at(rel_path)
+					.as_deref(),
+				prep.remote_view
+					.nodes
+					.of(&prep.baseline)
+					.at(rel_path)
+					.as_deref(),
 			)
 			.await
 			{
@@ -4689,9 +4748,9 @@ impl SyncEngine {
 			pair,
 			mode: prep.record.mode,
 			store: &store,
-			local: &prep.local_scan.nodes,
+			local: &prep.local_scan.nodes.of(&prep.baseline),
 			baseline: &prep.baseline,
-			remote: &prep.remote_view.nodes,
+			remote: &prep.remote_view.nodes.of(&prep.baseline),
 			root_remote,
 			absence_trusted: state.absence_trusted(),
 			pending: &self.pending,
@@ -4855,8 +4914,8 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 	let plan = plan::reconcile(
 		prep.record.mode,
 		&prep.baseline,
-		&prep.local_scan.nodes,
-		&prep.remote_view.nodes,
+		&prep.local_scan.nodes.of(&prep.baseline),
+		&prep.remote_view.nodes.of(&prep.baseline),
 		&prep.holds,
 		prep.read.paths(),
 	);
@@ -4887,8 +4946,8 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		.map(|a| {
 			planned_conflict(
 				a.rel_path(),
-				&prep.local_scan.nodes,
-				&prep.remote_view.nodes,
+				&prep.local_scan.nodes.of(&prep.baseline),
+				&prep.remote_view.nodes.of(&prep.baseline),
 			)
 		})
 		.collect();
@@ -5435,7 +5494,7 @@ mod tests {
 			SyncMode::TwoWay,
 			&tree(&baseline),
 			&local,
-			&view.nodes,
+			&view.nodes.whole(),
 			&plan::PassHolds::default(),
 			plan::PassPaths::Whole,
 		);
@@ -7283,7 +7342,7 @@ mod tests {
 			Vec::new(),
 			&[],
 		);
-		assert!(!remote_emptied(&raw.nodes, &tree(&docs.baseline())));
+		assert!(!remote_emptied(&raw.nodes.whole(), &tree(&docs.baseline())));
 		assert!(
 			remote_emptied(&HashMap::new(), &tree(&docs.baseline())),
 			"the filtered view alone would read as a vanished remote"
@@ -7296,7 +7355,7 @@ mod tests {
 				view(Vec::new(), Vec::new(), &[]),
 				HashMap::new(),
 			);
-			prep.remote_emptied = remote_emptied(&raw.nodes, &prep.baseline);
+			prep.remote_emptied = remote_emptied(&raw.nodes.whole(), &prep.baseline);
 			ignoring_docs(&mut prep);
 			assert!(screen_state(&prep).absence_trusted(), "{mode:?}");
 			let (actions, _) = run_prepared(prep);
@@ -7375,7 +7434,7 @@ mod tests {
 		let plan = plan::reconcile(
 			SyncMode::TwoWay,
 			&tree(baseline),
-			&scan.nodes,
+			&scan.nodes.whole(),
 			remote,
 			&plan::PassHolds::default(),
 			plan::PassPaths::Whole,
@@ -7492,7 +7551,7 @@ mod tests {
 			remote_file("link/new.txt", Uuid::new_v4(), other, 11),
 		);
 
-		let actions = planned_over_scan(&root, &baseline, &remote);
+		let actions = planned_over_scan(&root, &baseline, &remote.whole());
 		assert!(
 			actions.is_empty(),
 			"no deletion of the link's synced copy, no download through the link: {actions:?}"
@@ -7772,7 +7831,11 @@ mod tests {
 		// Built BEFORE the fold, as it is for a fold that has already answered one record the two
 		// paths it names could not: the assertions below are then about the index being kept in
 		// step, which is what they were about when it was built unconditionally.
-		assert!(path_of.at(&nodes, Uuid::new_v4()).is_none());
+		assert!(
+			path_of
+				.at(&nodes, &Baseline::default(), Uuid::new_v4())
+				.is_none()
+		);
 		let mut changed = BTreeSet::new();
 		assert!(fold_move(
 			&mut nodes,
@@ -7783,12 +7846,25 @@ mod tests {
 			"docs",
 			&mut changed,
 		));
-		let mut paths: Vec<String> = nodes.paths().map(|path| path.into_owned()).collect();
+		let mut paths: Vec<String> = nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		paths.sort_unstable();
 		assert_eq!(paths, ["docs", "docs/a.txt"]);
-		assert_eq!(nodes.at("docs/a.txt").unwrap().rel_path, "docs/a.txt");
-		assert_eq!(path_of.at(&nodes, child).as_deref(), Some("docs/a.txt"));
-		assert_eq!(path_of.at(&nodes, dir).as_deref(), Some("docs"));
+		assert_eq!(
+			nodes.whole().at("docs/a.txt").unwrap().rel_path,
+			"docs/a.txt"
+		);
+		assert_eq!(
+			path_of.at(&nodes, &Baseline::default(), child).as_deref(),
+			Some("docs/a.txt")
+		);
+		assert_eq!(
+			path_of.at(&nodes, &Baseline::default(), dir).as_deref(),
+			Some("docs")
+		);
 		// And every key it moved, BY NAME: both ends for the directory and both for each child it
 		// carried. A key the fold leaves out here is a key a change-scoped reconcile never visits,
 		// so the re-key would be invisible to the very pass that made it.
@@ -8096,7 +8172,7 @@ mod tests {
 		let mut remote = Side::default();
 		let holds = engine
 			.pending
-			.settle(pair, &engine.observed.snapshot(), &remote);
+			.settle(pair, &engine.observed.snapshot(), &remote.whole());
 		assert_eq!(
 			engine
 				.pending
@@ -8109,7 +8185,7 @@ mod tests {
 			SyncMode::LocalToRemote,
 			&tree(&baseline),
 			&local_map(hash(1)),
-			&remote,
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -9308,14 +9384,14 @@ mod tests {
 		let baseline = written_row(uuid, hash(1));
 		// The cache is behind: its snapshot has nothing at all under the root yet.
 		let mut remote = Side::default();
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new());
 
 		let actions = plan::reconcile(
 			SyncMode::LocalToRemote,
 			&tree(&baseline),
 			&local_map(hash(2)),
-			&remote,
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -9343,7 +9419,7 @@ mod tests {
 		let observed = observations.snapshot();
 
 		let mut remote = Side::default();
-		pending.settle(PAIR, &observed, &remote);
+		pending.settle(PAIR, &observed, &remote.whole());
 		assert_eq!(
 			pending.fold_into(
 				PAIR,
@@ -9355,7 +9431,7 @@ mod tests {
 			"an announced uuid retires the write even with nothing left at the path"
 		);
 		assert!(
-			remote.is_empty(),
+			remote.whole().is_empty(),
 			"and the snapshot is believed again: the item really is gone"
 		);
 	}
@@ -9375,7 +9451,7 @@ mod tests {
 		observations.note_uuids([uuid]);
 
 		let mut remote = Side::default();
-		pending.settle(PAIR, &observed, &remote);
+		pending.settle(PAIR, &observed, &remote.whole());
 		assert_eq!(
 			pending.fold_into(
 				PAIR,
@@ -9386,7 +9462,7 @@ mod tests {
 			1,
 			"only what was known before the snapshot may retire a write against it"
 		);
-		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, uuid);
+		assert_eq!(remote.whole().at("a.txt").unwrap().remote_uuid, uuid);
 	}
 
 	/// A move's uuid was necessarily announced earlier, when the item was created. Only an
@@ -9405,7 +9481,7 @@ mod tests {
 			written_at("b.txt", uuid, NodeKind::File, Some(hash(1))),
 		)]);
 		let mut remote = node_at("a.txt", uuid);
-		pending.settle(PAIR, &observations.snapshot(), &remote);
+		pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1,
@@ -9414,7 +9490,7 @@ mod tests {
 
 		observations.note_uuids([uuid]);
 		let mut remote = node_at("a.txt", uuid);
-		pending.settle(PAIR, &observations.snapshot(), &remote);
+		pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			0,
@@ -9436,14 +9512,17 @@ mod tests {
 			written_at("b.txt", uuid, NodeKind::File, Some(hash(3))),
 		)]);
 		let mut remote = node_at("a.txt", uuid);
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
 		);
 
-		assert!(!remote.holds("a.txt"), "the pre-move path is vacated");
-		assert_eq!(remote.at("b.txt").unwrap().remote_uuid, uuid);
+		assert!(
+			!remote.whole().holds("a.txt"),
+			"the pre-move path is vacated"
+		);
+		assert_eq!(remote.whole().at("b.txt").unwrap().remote_uuid, uuid);
 		let local = HashMap::from([(
 			"b.txt".to_string(),
 			LocalNode {
@@ -9459,7 +9538,7 @@ mod tests {
 				SyncMode::TwoWay,
 				&tree(&baseline),
 				&local,
-				&remote,
+				&remote.whole(),
 				&holds,
 				plan::PassPaths::Whole
 			)
@@ -9485,19 +9564,19 @@ mod tests {
 			written_at("b.txt", uuid, NodeKind::File, Some(hash(3))),
 		)]);
 		let mut remote = node_at("a.txt", uuid);
-		remote.extend(node_at("b.txt", foreign));
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		remote.extend(node_at("b.txt", foreign).into_whole());
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
 		);
 
 		assert!(
-			!remote.holds("a.txt"),
+			!remote.whole().holds("a.txt"),
 			"the pre-move path is vacated even though the destination is somebody else's"
 		);
 		assert_eq!(
-			remote.at("b.txt").unwrap().remote_uuid,
+			remote.whole().at("b.txt").unwrap().remote_uuid,
 			foreign,
 			"and the destination is left showing what really sits there"
 		);
@@ -9515,7 +9594,7 @@ mod tests {
 			SyncMode::LocalToRemote,
 			&tree(&baseline),
 			&local,
-			&remote,
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -9574,13 +9653,13 @@ mod tests {
 		]));
 		// Trashing dropped both baseline rows, and the local side is gone too.
 		let (baseline, local) = (HashMap::new(), HashMap::new());
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
 		);
 		assert!(
-			remote.is_empty(),
+			remote.whole().is_empty(),
 			"the trashed directory takes its subtree with it"
 		);
 		assert!(
@@ -9592,7 +9671,7 @@ mod tests {
 				SyncMode::LocalToRemote,
 				&tree(&baseline),
 				&local,
-				&remote,
+				&remote.whole(),
 				&holds,
 				plan::PassPaths::Whole,
 			)
@@ -9613,24 +9692,28 @@ mod tests {
 
 		let baseline = written_row(new, hash(1));
 		let mut remote = node_at("a.txt", old);
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
 		);
 		assert_eq!(
-			remote.at("a.txt").unwrap().remote_uuid,
+			remote.whole().at("a.txt").unwrap().remote_uuid,
 			new,
 			"the pre-write occupant is what a lagging cache shows; ours supersedes it"
 		);
-		assert_eq!(remote.len(), 1, "and does not leave the old one behind");
+		assert_eq!(
+			remote.whole().len(),
+			1,
+			"and does not leave the old one behind"
+		);
 
 		// A further local edit is then pushed rather than left alone.
 		let actions = plan::reconcile(
 			SyncMode::LocalToRemote,
 			&tree(&baseline),
 			&local_map(hash(2)),
-			&remote,
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -9655,13 +9738,13 @@ mod tests {
 
 		let baseline = written_row(second, hash(2));
 		let mut remote = node_at("a.txt", old);
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
 		);
 		assert_eq!(
-			remote.at("a.txt").unwrap().remote_uuid,
+			remote.whole().at("a.txt").unwrap().remote_uuid,
 			second,
 			"the latest write is what the path holds"
 		);
@@ -9670,7 +9753,7 @@ mod tests {
 				SyncMode::TwoWay,
 				&tree(&baseline),
 				&local_map(hash(2)),
-				&remote,
+				&remote.whole(),
 				&holds,
 				plan::PassPaths::Whole,
 			)
@@ -9704,24 +9787,24 @@ mod tests {
 		// What the lagging cache shows: the other client's version of the SAME file, which landed
 		// first and which our upload went on top of.
 		let mut remote = node_at("a.txt", theirs);
-		let mut node = remote.at("a.txt").unwrap().into_owned();
+		let mut node = remote.whole().at("a.txt").unwrap().into_owned();
 		node.stable_uuid = Some(lineage);
 		node.content_hash = Some(hash(1));
 		remote.insert("a.txt".to_string(), node);
 
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1,
 			"the cache has announced nothing of ours, so what it shows is the version we replaced"
 		);
-		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, ours);
+		assert_eq!(remote.whole().at("a.txt").unwrap().remote_uuid, ours);
 		assert!(
 			plan::reconcile(
 				SyncMode::TwoWay,
 				&tree(&baseline),
 				&local_map(hash(2)),
-				&remote,
+				&remote.whole(),
 				&holds,
 				plan::PassPaths::Whole,
 			)
@@ -9747,7 +9830,7 @@ mod tests {
 
 		let same_lineage = |uuid: Uuid| {
 			let mut nodes = node_at("a.txt", uuid);
-			let mut node = nodes.at("a.txt").unwrap().into_owned();
+			let mut node = nodes.whole().at("a.txt").unwrap().into_owned();
 			node.stable_uuid = Some(lineage);
 			nodes.insert("a.txt".to_string(), node);
 			nodes
@@ -9764,14 +9847,14 @@ mod tests {
 		] {
 			assert!(
 				pending
-					.strangers(PAIR, &tree(&baseline), &settled)
+					.strangers(PAIR, &tree(&baseline), &settled.whole())
 					.is_empty(),
 				"the record answers for this state on its own"
 			);
 		}
 
 		assert_eq!(
-			pending.strangers(PAIR, &tree(&baseline), &same_lineage(theirs)),
+			pending.strangers(PAIR, &tree(&baseline), &same_lineage(theirs).whole()),
 			vec![("a.txt".to_string(), ours, theirs)]
 				.into_iter()
 				.map(|(path, ours_uuid, stranger)| (ours, path, ours_uuid, stranger))
@@ -9791,7 +9874,7 @@ mod tests {
 		let mut baseline = written_row(ours, hash(2));
 		baseline.get_mut("a.txt").unwrap().remote_stable_uuid = Some(lineage);
 		let mut remote = node_at("a.txt", theirs);
-		let mut node = remote.at("a.txt").unwrap().into_owned();
+		let mut node = remote.whole().at("a.txt").unwrap().into_owned();
 		node.stable_uuid = Some(lineage);
 		remote.insert("a.txt".to_string(), node);
 
@@ -9801,7 +9884,7 @@ mod tests {
 			0,
 			"with the record gone there is nothing left to paint over the snapshot"
 		);
-		assert_eq!(remote.at("a.txt").unwrap().remote_uuid, theirs);
+		assert_eq!(remote.whole().at("a.txt").unwrap().remote_uuid, theirs);
 	}
 
 	/// A third uuid at the path is not our write lagging: somebody else wrote there after us, and
@@ -9815,7 +9898,7 @@ mod tests {
 
 		let foreign = Uuid::new_v4();
 		let mut remote = node_at("a.txt", foreign);
-		pending.settle(PAIR, &observations.snapshot(), &remote);
+		pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(
 				PAIR,
@@ -9827,7 +9910,7 @@ mod tests {
 			"a uuid that is neither ours nor the one we replaced is a foreign write"
 		);
 		assert_eq!(
-			remote.at("a.txt").unwrap().remote_uuid,
+			remote.whole().at("a.txt").unwrap().remote_uuid,
 			foreign,
 			"and it must stand, so the pass reconciles against it at once"
 		);
@@ -9863,7 +9946,7 @@ mod tests {
 		)]);
 
 		let mut remote = Side::default();
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			pending.fold_into(PAIR, &tree(&baseline), &mut remote, &mut BTreeSet::new()),
 			1
@@ -9872,7 +9955,7 @@ mod tests {
 			SyncMode::TwoWay,
 			&tree(&baseline),
 			&local,
-			&remote,
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -9913,7 +9996,7 @@ mod tests {
 		// root — and never lists the trashed uuid at all.
 		let foreign = node_at("note.txt", Uuid::new_v4());
 
-		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &foreign);
+		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &foreign.whole());
 		assert!(
 			holds.trashed.is_empty(),
 			"a pass holds nothing on behalf of another pair"
@@ -9930,7 +10013,7 @@ mod tests {
 		);
 
 		let mut remote = node_at("gone.txt", trashed);
-		let holds = pending.settle(PAIR, &observations.snapshot(), &remote);
+		let holds = pending.settle(PAIR, &observations.snapshot(), &remote.whole());
 		assert_eq!(
 			holds.trashed,
 			HashSet::from([trashed]),
@@ -9945,8 +10028,8 @@ mod tests {
 			2,
 			"and still has not caught up to either write"
 		);
-		assert!(!remote.holds("gone.txt"), "the trash is folded out");
-		assert_eq!(remote.at("note.txt").unwrap().remote_uuid, created);
+		assert!(!remote.whole().holds("gone.txt"), "the trash is folded out");
+		assert_eq!(remote.whole().at("note.txt").unwrap().remote_uuid, created);
 	}
 
 	/// A pass indexes the snapshot only for writes of its own, and a pair that journalled none

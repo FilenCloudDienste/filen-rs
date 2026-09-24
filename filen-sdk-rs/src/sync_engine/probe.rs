@@ -52,7 +52,7 @@ use super::{
 	plan::{self, PassHolds, RemoteNode, RemoteView},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	scan::{self, LocalNode, LocalScan, RuleFiles},
-	side::{Nodes, NodesAt, Side},
+	side::{FromRow, Nodes, NodesAt, Side},
 	tree::Baseline,
 };
 
@@ -412,9 +412,10 @@ fn heap(bytes: usize) -> usize {
 /// allocation rather than a guess at it, and at a million rows the real table is nearly twice
 /// this figure's slot term. Same convention as [`Baseline::resident_bytes`], which is what lets
 /// the three numbers be summed and compared against a resident set.
-fn side_bytes<V: Clone>(nodes: &Side<V>, node_heap: impl Fn(&V) -> usize) -> usize {
+fn side_bytes<V: FromRow>(nodes: &Side<V>, node_heap: impl Fn(&V) -> usize) -> usize {
 	let slots = nodes.capacity() * (size_of::<String>() + size_of::<V>() + 1);
 	let owned: usize = nodes
+		.whole()
 		.iter()
 		.map(|(path, node)| heap(path.len()) + node_heap(&node))
 		.sum();
@@ -734,10 +735,12 @@ fn probe_rules() -> IgnoreRules {
 /// A fully synced baseline for the scanned tree: what a pair looks like the pass after it
 /// converged, which is the state every steady-state measurement is taken in.
 fn baseline_rows(scan: &LocalScan, remote: &Side<RemoteNode>) -> Vec<BaselineEntry> {
+	let remote_nodes = remote.whole();
 	scan.nodes
+		.whole()
 		.iter()
 		.map(|(_, node)| {
-			let at = remote.at(&node.rel_path);
+			let at = remote_nodes.at(&node.rel_path);
 			let remote_node = at.as_deref();
 			BaselineEntry {
 				rel_path: node.rel_path.clone(),
@@ -772,6 +775,7 @@ fn dirty_local(local: &mut Side<LocalNode>, from: usize, to: usize) -> BTreeSet<
 	// borrowing it while the edits land. Same order and same slice either way — re-filing a key
 	// the side already holds moves nothing.
 	let editing: Vec<String> = local
+		.whole()
 		.iter()
 		.filter(|(_, node)| node.kind == NodeKind::File)
 		.skip(from)
@@ -780,6 +784,7 @@ fn dirty_local(local: &mut Side<LocalNode>, from: usize, to: usize) -> BTreeSet<
 		.collect();
 	for (index, path) in editing.into_iter().enumerate() {
 		let mut node = local
+			.whole()
 			.at(&path)
 			.expect("the side holds what it just named")
 			.into_owned();
@@ -867,8 +872,8 @@ fn pass_pure(
 	let planned = plan::reconcile(
 		SyncMode::TwoWay,
 		&baseline,
-		&local,
-		&remote,
+		&local.whole(),
+		&remote.whole(),
 		&PassHolds::default(),
 		plan::PassPaths::Whole,
 	);
@@ -1050,6 +1055,7 @@ fn prepare_scoped(
 			mode,
 			RuleCandidates {
 				view: &view,
+				baseline: &baseline,
 				paths: rule_files,
 			},
 			Some(parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile")),
@@ -1093,7 +1099,7 @@ fn prepare_scoped(
 			RuleFiles::Only(
 				baseline
 					.rule_file_rows()
-					.filter(|rel_path| !view.nodes.holds(rel_path))
+					.filter(|rel_path| !view.nodes.of(&baseline).holds(rel_path))
 					.filter_map(|rel_path| rule_file_dir(&rel_path).map(str::to_owned))
 					.collect(),
 			)
@@ -1265,8 +1271,8 @@ fn prepare_scoped(
 	let actions = plan::reconcile(
 		mode,
 		&baseline,
-		&local,
-		&remote,
+		&local.of(&baseline),
+		&remote.of(&baseline),
 		&PassHolds::default(),
 		plan::PassPaths::Changed(&decided),
 	)
@@ -1909,6 +1915,7 @@ pub fn run() -> String {
 	// nothing — what the pair of lines says is what LOOKING costs, which is what every pass pays
 	// whether or not anything moved.
 	let idle_scope: BTreeSet<String> = local
+		.whole()
 		.paths()
 		.next()
 		.map(Cow::into_owned)
@@ -1955,7 +1962,7 @@ pub fn run() -> String {
 		} else {
 			rename_root.clone()
 		};
-		remote.rekey_subtree(&remote_at, &to, |node, path| {
+		remote.rekey_subtree(&baseline, &remote_at, &to, |node, path| {
 			node.rel_path = path.to_string()
 		});
 		remote_at = to;
@@ -2002,9 +2009,11 @@ pub fn run() -> String {
 		"visit_row_paths alone: every row's path against one reused buffer",
 	);
 	let (key_count, keys_built) = timed(|| {
-		let mut keys: BTreeSet<Cow<'_, str>> = local.paths().chain(remote.paths()).collect();
+		let (local_nodes, remote_nodes) = (local.whole(), remote.whole());
+		let mut keys: BTreeSet<Cow<'_, str>> =
+			local_nodes.paths().chain(remote_nodes.paths()).collect();
 		baseline.visit_row_paths(|path| {
-			if !local.holds(path) && !remote.holds(path) {
+			if !local_nodes.holds(path) && !remote_nodes.holds(path) {
 				keys.insert(Cow::Owned(path.to_string()));
 			}
 		});
@@ -2026,8 +2035,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -2048,8 +2057,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Changed(&changed_paths),
 		)
@@ -2075,8 +2084,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -2096,8 +2105,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Changed(&changed_paths),
 		)
@@ -2123,8 +2132,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		)
@@ -2144,8 +2153,8 @@ pub fn run() -> String {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Changed(&changed_paths),
 		)
