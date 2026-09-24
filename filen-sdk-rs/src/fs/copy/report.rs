@@ -299,7 +299,7 @@ impl<D> From<CopyFailed<D>> for Error {
 	}
 }
 
-/// Receives a copy's progress. All calls come from one [`Reporter`], in order.
+/// Receives a copy's progress. All calls come from the one job, in order.
 pub trait CopyCallback: MaybeSendSync + 'static {
 	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>);
 	fn on_top_level_created(&self, item: CopiedTopLevel);

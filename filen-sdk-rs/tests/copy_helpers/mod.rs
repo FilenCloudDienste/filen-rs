@@ -90,7 +90,7 @@ pub async fn contents(
 	)
 }
 
-/// Copies `sources` into `destination` with default options and no pause or cancel.
+/// Copies `sources` into `destination` with the default config and no pause or cancel.
 pub async fn copy(
 	client: &Arc<Client>,
 	sources: Vec<CopySource>,

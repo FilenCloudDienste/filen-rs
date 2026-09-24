@@ -272,7 +272,7 @@ struct Job<B: CopyBackend, D> {
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	/// Planned subdirectories of each planned directory.
 	child_dirs: Vec<Vec<usize>>,
-	/// Each request's destination, filled in by [`Job::fetch_targets`].
+	/// Each request's destination and its targets, filled in by [`Job::fetch_targets`].
 	requests: Vec<RequestState>,
 	report: CopyReport<D>,
 	/// The error that ended the job early, shared with the failure it came from.

@@ -388,8 +388,8 @@ impl FilenSdkError {
 		}
 		let nested: &FilenSdkError = match inner.downcast_ref::<FilenSdkError>() {
 			Some(nested) => nested,
-			// An error shared between several owners, like a copy job's fatal error, which is
-			// both returned and kept in the job's report.
+			// An error shared between several owners, like a failed copy's error turned into an
+			// `Error` while a copy event still holds it.
 			None => inner.downcast_ref::<Arc<FilenSdkError>>()?,
 		};
 		nested.downcast_ref::<T>()
