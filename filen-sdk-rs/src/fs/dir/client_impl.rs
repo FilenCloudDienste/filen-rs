@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use chrono::{DateTime, SubsecRound, Utc};
+use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
 use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use filen_types::traits::CowHelpers;
@@ -18,7 +18,7 @@ use crate::{
 			fs::{CategoryFS, ObjectMatch, find_item_in_dirs, find_item_in_files},
 		},
 		dir::{
-			meta::{DirectoryMeta, DirectoryMetaChanges},
+			meta::{DecryptedDirectoryMeta, DirectoryMeta, DirectoryMetaChanges},
 			traits::HasDirMeta,
 		},
 		file::RemoteFile,
@@ -29,6 +29,14 @@ use crate::{
 };
 
 use super::{RemoteDirectory, traits::UpdateDirMeta};
+
+/// What the server did with a create-directory request.
+pub(crate) enum CreateDirOutcome {
+	Created(RemoteDirectory),
+	/// It merged the request into the existing directory with the same name hash, which has
+	/// this uuid.
+	Merged(Uuid),
+}
 
 impl Client {
 	pub async fn create_dir(
@@ -49,49 +57,29 @@ impl Client {
 		let _lock = self.lock_drive().await?;
 		let (uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
-		let response = api::v3::dir::create::post(
-			self.client(),
-			&api::v3::dir::create::Request {
-				uuid,
-				parent: parent.uuid(),
-				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
-				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
-			},
-		)
-		.await?;
-
-		if uuid != response.uuid {
+		let dir = match self.post_create_dir(parent, uuid, meta).await? {
+			CreateDirOutcome::Created(dir) => dir,
 			// The server deduplicated against a pre-existing directory with the same
 			// (case-insensitive) name hash and returned its uuid. Our locally built meta
 			// carries the caller's casing and created=now, which do not match the existing
 			// directory; adopt its real metadata instead of pushing fabricated meta into
 			// the share/link mirrors.
-			return self.get_dir(response.uuid).await;
-		}
-
-		let dir: RemoteDirectory =
-			RemoteDirectory::new_from_parts(uuid, meta, (parent.uuid()).into(), response.timestamp);
+			CreateDirOutcome::Merged(existing) => return self.get_dir(existing).await,
+		};
 
 		self.update_item_with_maybe_connected_parent((&dir).into())
 			.await?;
 		Ok(dir)
 	}
 
-	/// Creates `name` in `parent` under a caller-chosen `uuid`, without taking the drive lock
-	/// or propagating to the parent's links and shares (the copy engine does both itself).
-	pub(crate) async fn create_dir_for_copy(
+	/// Creates the directory `uuid` with `meta` in `parent`, without taking the drive lock or
+	/// propagating to the parent's links and shares; the caller does both.
+	pub(crate) async fn post_create_dir(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,
-		name: &ValidatedName,
-		created: DateTime<Utc>,
-	) -> Result<crate::fs::copy::engine::CreatedDir, Error> {
-		use crate::fs::copy::engine::CreatedDir;
-
-		let meta = super::meta::DecryptedDirectoryMeta {
-			name: Cow::Owned(name.as_ref().to_owned()),
-			created: Some(created.round_subsecs(3)),
-		};
+		meta: DecryptedDirectoryMeta<'static>,
+	) -> Result<CreateDirOutcome, Error> {
 		let response = api::v3::dir::create::post(
 			self.client(),
 			&api::v3::dir::create::Request {
@@ -102,10 +90,11 @@ impl Client {
 			},
 		)
 		.await?;
-		if response.uuid != uuid {
-			return Ok(CreatedDir::Merged);
+
+		if uuid != response.uuid {
+			return Ok(CreateDirOutcome::Merged(response.uuid));
 		}
-		Ok(CreatedDir::Created(RemoteDirectory::new_from_parts(
+		Ok(CreateDirOutcome::Created(RemoteDirectory::new_from_parts(
 			uuid,
 			meta,
 			parent.into(),

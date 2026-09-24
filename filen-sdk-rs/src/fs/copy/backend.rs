@@ -3,7 +3,7 @@
 use std::{borrow::Cow, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
+use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpers};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -12,8 +12,8 @@ use crate::{
 	connect::ConnectedTargets,
 	crypto,
 	fs::{
-		categories::{DirType, NonRootItemType, Normal, fs::CategoryFS},
-		dir::RemoteDirectory,
+		categories::{NonRootItemType, Normal},
+		dir::{RemoteDirectory, client_impl::CreateDirOutcome},
 		file::{
 			BaseFile, RemoteFile,
 			enums::RemoteFileType,
@@ -68,9 +68,14 @@ impl CopyBackend for ClientBackend {
 		name: &ValidatedName,
 		created: DateTime<Utc>,
 	) -> Result<CreatedDir, Error> {
-		self.client
-			.create_dir_for_copy(parent, uuid, name, created)
-			.await
+		// The meta owns its name, and the trait lends the engine's.
+		let meta = RemoteDirectory::make_meta(name.clone(), created);
+		Ok(
+			match self.client.post_create_dir(parent, uuid, meta).await? {
+				CreateDirOutcome::Created(dir) => CreatedDir::Created(dir),
+				CreateDirOutcome::Merged(_) => CreatedDir::Merged,
+			},
+		)
 	}
 
 	async fn set_dir_color(
@@ -96,23 +101,10 @@ impl CopyBackend for ClientBackend {
 		targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
 	) -> Vec<Error> {
-		let mut items = vec![item.clone()];
-		if let NonRootItemType::Dir(dir) = item {
-			match Normal::list_dir_recursive(
-				&*self.client,
-				&DirType::Dir(Cow::Borrowed(dir.as_ref())),
-				None::<&fn(u64, Option<u64>)>,
-				(),
-			)
-			.await
-			{
-				Ok((dirs, files)) => {
-					items.extend(dirs.into_iter().map(NonRootItemType::from));
-					items.extend(files.into_iter().map(NonRootItemType::from));
-				}
-				Err(error) => return vec![error],
-			}
-		}
+		let items = match self.client.items_with_subtree(item.as_borrowed_cow()).await {
+			Ok(items) => items,
+			Err(error) => return vec![error],
+		};
 		self.client.propagate_to_targets(targets, &items).await
 	}
 

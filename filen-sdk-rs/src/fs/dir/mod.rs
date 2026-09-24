@@ -193,11 +193,18 @@ impl RemoteDirectory {
 	) -> Result<(Uuid, DecryptedDirectoryMeta<'static>), EntryNameError> {
 		Ok((
 			Uuid::new_v4(),
-			DecryptedDirectoryMeta {
-				name: Cow::Owned(ValidatedName::try_from(name)?.into()),
-				created: Some(created.round_subsecs(3)),
-			},
+			Self::make_meta(ValidatedName::try_from(name)?, created),
 		))
+	}
+
+	pub(crate) fn make_meta(
+		name: ValidatedName,
+		created: DateTime<Utc>,
+	) -> DecryptedDirectoryMeta<'static> {
+		DecryptedDirectoryMeta {
+			name: Cow::Owned(name.into()),
+			created: Some(created.round_subsecs(3)),
+		}
 	}
 
 	pub fn new_from_parts(

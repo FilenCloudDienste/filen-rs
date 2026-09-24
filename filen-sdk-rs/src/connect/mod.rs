@@ -602,25 +602,7 @@ impl Client {
 			return Ok(());
 		}
 
-		let items_to_process = if let NonRootItemType::Dir(dir) = item {
-			let (dirs, files) = Normal::list_dir_recursive(
-				self,
-				&DirType::Dir(Cow::Borrowed(dir.as_ref())),
-				None::<&fn(u64, Option<u64>)>,
-				(),
-			)
-			.await?;
-
-			// not using the closure here causes a borrow checker error
-			#[allow(clippy::redundant_closure)]
-			std::iter::once(NonRootItemType::<Normal>::Dir(dir))
-				.chain(dirs.into_iter().map(|d| NonRootItemType::from(d)))
-				.chain(files.into_iter().map(|f| NonRootItemType::from(f)))
-				.collect::<Vec<NonRootItemType<'_, Normal>>>()
-		} else {
-			vec![item]
-		};
-
+		let items_to_process = self.items_with_subtree(item).await?;
 		let errors = self.propagate_to_targets(&targets, &items_to_process).await;
 		for error in &errors {
 			tracing::warn!(
@@ -628,6 +610,30 @@ impl Client {
 			);
 		}
 		Ok(())
+	}
+
+	/// `item`, followed for a directory by every directory and then every file below it.
+	pub(crate) async fn items_with_subtree<'a>(
+		&self,
+		item: NonRootItemType<'a, Normal>,
+	) -> Result<Vec<NonRootItemType<'a, Normal>>, Error> {
+		let NonRootItemType::Dir(dir) = item else {
+			return Ok(vec![item]);
+		};
+		let (dirs, files) = Normal::list_dir_recursive(
+			self,
+			&DirType::Dir(Cow::Borrowed(dir.as_ref())),
+			None::<&fn(u64, Option<u64>)>,
+			(),
+		)
+		.await?;
+
+		// not using the closure here causes a borrow checker error
+		#[allow(clippy::redundant_closure)]
+		Ok(std::iter::once(NonRootItemType::<Normal>::Dir(dir))
+			.chain(dirs.into_iter().map(|d| NonRootItemType::from(d)))
+			.chain(files.into_iter().map(|f| NonRootItemType::from(f)))
+			.collect())
 	}
 
 	pub(crate) async fn add_item_to_directory_link(
