@@ -75,22 +75,15 @@ impl From<filen_types::error::ConversionError> for Error {
 // (`MaxStorageReached`, `Reqwest`, ...) instead of collapsing to `IO`.
 impl From<std::io::Error> for Error {
 	fn from(e: std::io::Error) -> Self {
-		let wraps = |inner: &(dyn std::error::Error + Send + Sync + 'static)| {
-			inner.is::<FilenSdkError>() || inner.is::<std::io::Error>()
-		};
-		if !e.get_ref().is_some_and(wraps) {
-			return FilenSdkError {
-				kind: ErrorKind::IO,
-				inner: Some(Box::new(e)),
-				context: None,
-			};
-		}
-		let inner = e.into_inner().expect("checked by `wraps` above");
-		match inner.downcast::<FilenSdkError>() {
-			Ok(sdk_error) => *sdk_error,
-			Err(inner) => match inner.downcast::<std::io::Error>() {
-				Ok(io_error) => Self::from(*io_error),
-				Err(_) => unreachable!("checked by `wraps` above"),
+		match e.downcast::<FilenSdkError>() {
+			Ok(sdk_error) => sdk_error,
+			Err(e) => match e.downcast::<std::io::Error>() {
+				Ok(io_error) => Self::from(io_error),
+				Err(e) => FilenSdkError {
+					kind: ErrorKind::IO,
+					inner: Some(Box::new(e)),
+					context: None,
+				},
 			},
 		}
 	}
