@@ -1277,15 +1277,6 @@ mod tests {
 		}
 	}
 
-	fn test_user(id: u64) -> SharedUser<'static> {
-		let key = rsa::RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap();
-		SharedUser {
-			id,
-			email: Cow::Owned(format!("user{id}@example.com")),
-			public_key: key.to_public_key(),
-		}
-	}
-
 	#[test]
 	fn targets_are_empty_only_without_links_and_users() {
 		assert!(ConnectedTargets::default().is_empty());
@@ -1294,11 +1285,7 @@ mod tests {
 			users: Vec::new(),
 		};
 		assert!(!with_link.is_empty());
-		let with_user = ConnectedTargets {
-			links: Vec::new(),
-			users: vec![test_user(1)],
-		};
-		assert!(!with_user.is_empty());
+		assert!(!ConnectedTargets::with_test_users(1).is_empty());
 	}
 
 	#[test]
@@ -1306,11 +1293,11 @@ mod tests {
 		let link = test_link();
 		let old = ConnectedTargets {
 			links: vec![link.clone()],
-			users: vec![test_user(1)],
+			users: ConnectedTargets::with_test_users(1).users,
 		};
 		let new = ConnectedTargets {
 			links: vec![link, test_link()],
-			users: vec![test_user(1), test_user(2)],
+			users: ConnectedTargets::with_test_users(2).users,
 		};
 		let added = new.without(&old);
 		assert_eq!(added.links.len(), 1);
@@ -1328,40 +1315,37 @@ mod tests {
 	#[test]
 	fn operations_cover_every_link_and_user_for_every_item() {
 		let items = [test_dir("a"), test_dir("b"), test_dir("c")];
+		let [a, b, c] = items.each_ref().map(HasUUID::uuid);
 		let targets = ConnectedTargets {
 			links: vec![test_link(), test_link()],
-			users: vec![test_user(1)],
+			users: ConnectedTargets::with_test_users(1).users,
 		};
+		let [l0, l1] = [0, 1].map(|i| Some(targets.links[i].link.link_uuid));
 
-		let ops = targets.operations(&items).collect::<Vec<_>>();
-		assert_eq!(ops.len(), (2 + 1) * items.len());
-
-		let mut pairs = Vec::new();
-		for op in &ops {
-			match op {
+		let pairs = targets
+			.operations(&items)
+			.map(|op| match op {
 				PropagationOp::Link { link, item } => {
-					pairs.push((Some(link.link.link_uuid), None, item.uuid()))
+					(Some(link.link.link_uuid), None, item.uuid())
 				}
-				PropagationOp::Share { user, item } => {
-					pairs.push((None, Some(user.id), item.uuid()))
-				}
-			}
-		}
-		let expected = targets
-			.links
-			.iter()
-			.flat_map(|link| {
-				items
-					.iter()
-					.map(move |item| (Some(link.link.link_uuid), None, item.uuid()))
+				PropagationOp::Share { user, item } => (None, Some(user.id), item.uuid()),
 			})
-			.chain(targets.users.iter().flat_map(|user| {
-				items
-					.iter()
-					.map(move |item| (None, Some(user.id), item.uuid()))
-			}))
 			.collect::<Vec<_>>();
-		assert_eq!(pairs, expected, "links first, then users; item order kept");
+		assert_eq!(
+			pairs,
+			[
+				(l0, None, a),
+				(l0, None, b),
+				(l0, None, c),
+				(l1, None, a),
+				(l1, None, b),
+				(l1, None, c),
+				(None, Some(1), a),
+				(None, Some(1), b),
+				(None, Some(1), c),
+			],
+			"links first, then users; item order kept"
+		);
 	}
 
 	// A single failing propagation (e.g. one undecryptable link key) must not abort the
