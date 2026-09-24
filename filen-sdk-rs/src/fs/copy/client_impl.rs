@@ -9,20 +9,20 @@ use std::{
 	},
 };
 
-use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
+use filen_types::{fs::Uuid, traits::CowHelpers};
 
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
-	connect::{
-		DirPublicLink,
-		fs::{SharedDirectory, SharedRootDirectory, SharingRole},
-	},
+	connect::{DirPublicLink, fs::SharingRole},
 	consts::CALLBACK_INTERVAL,
 	fs::{
 		HasName, HasParent, HasUUID,
 		categories::{DirType, Linked, Normal, Shared, fs::CategoryFS},
-		dir::{LinkedDirectory, RemoteDirectory, RootDirectoryWithMeta, traits::HasDirInfo},
+		dir::{
+			RemoteDirectory,
+			traits::{HasDirInfo, HasRemoteDirInfo},
+		},
 		file::enums::RemoteFileType,
 	},
 	util::MaybeArc,
@@ -71,41 +71,6 @@ pub struct CopyOptions {
 	pub max_bytes: Option<u64>,
 }
 
-/// The color a copy of a source directory gets. Shared-in listings carry none.
-trait SourceColor {
-	fn source_color(&self) -> DirColor<'static>;
-}
-
-impl SourceColor for RemoteDirectory {
-	fn source_color(&self) -> DirColor<'static> {
-		self.color.clone()
-	}
-}
-
-impl SourceColor for SharedDirectory {
-	fn source_color(&self) -> DirColor<'static> {
-		self.inner.color.clone()
-	}
-}
-
-impl SourceColor for SharedRootDirectory {
-	fn source_color(&self) -> DirColor<'static> {
-		self.dir.color.clone()
-	}
-}
-
-impl SourceColor for LinkedDirectory {
-	fn source_color(&self) -> DirColor<'static> {
-		self.0.color.clone()
-	}
-}
-
-impl SourceColor for RootDirectoryWithMeta {
-	fn source_color(&self) -> DirColor<'static> {
-		self.color.clone()
-	}
-}
-
 /// The source directory for the root of a listing that can start at a category root.
 fn root_source_dir<Cat>(
 	dir: &DirType<'static, Cat>,
@@ -113,12 +78,12 @@ fn root_source_dir<Cat>(
 ) -> SourceDir<CopySourceDir>
 where
 	Cat: CategoryFS,
-	Cat::Root: HasName + HasDirInfo + SourceColor,
-	Cat::Dir: SourceColor,
+	Cat::Root: HasName + HasDirInfo + HasRemoteDirInfo,
+	Cat::Dir: HasRemoteDirInfo,
 {
 	match dir {
-		DirType::Root(root) => SourceDir::new(root.as_ref(), root.source_color(), handle),
-		DirType::Dir(dir) => SourceDir::new(dir.as_ref(), dir.source_color(), handle),
+		DirType::Root(root) => SourceDir::new(root.as_ref(), root.color().into_owned_cow(), handle),
+		DirType::Dir(dir) => SourceDir::new(dir.as_ref(), dir.color().into_owned_cow(), handle),
 	}
 }
 
@@ -163,7 +128,7 @@ async fn list_source<Cat>(
 ) -> Result<PlanSource<CopySourceDir>, Error>
 where
 	Cat: CategoryFS,
-	Cat::Dir: SourceColor,
+	Cat::Dir: HasRemoteDirInfo,
 	RemoteFileType<'static>: From<Cat::File>,
 {
 	let progress = |received: u64, total: Option<u64>| {
@@ -177,7 +142,7 @@ where
 		.into_iter()
 		.filter_map(|dir| {
 			let parent = Uuid::try_from(*dir.parent()).ok()?;
-			let item = SourceDir::new(&dir, dir.source_color(), handle_of(&dir));
+			let item = SourceDir::new(&dir, dir.color().into_owned_cow(), handle_of(&dir));
 			Some(Listed { parent, item })
 		})
 		.collect();
@@ -363,8 +328,11 @@ impl Client {
 		match dir {
 			CopySourceDir::Normal(dir) => {
 				let root = DirType::Dir(Cow::Owned(dir.clone()));
-				let root_dir =
-					SourceDir::new(&dir, dir.source_color(), CopySourceDir::Normal(dir.clone()));
+				let root_dir = SourceDir::new(
+					&dir,
+					dir.color().into_owned_cow(),
+					CopySourceDir::Normal(dir.clone()),
+				);
 				list_source::<Normal>(
 					self,
 					&root,

@@ -23,7 +23,7 @@ use crate::{
 		dir::{
 			RemoteDirectory, RootDirectoryWithMeta,
 			meta::DirectoryMeta,
-			traits::{HasDirInfo, HasDirMeta},
+			traits::{HasDirInfo, HasDirMeta, HasRemoteDirInfo},
 		},
 		file::{
 			RemoteRootFile,
@@ -77,6 +77,12 @@ impl HasUUID for SharedDirectory {
 impl HasDirInfo for SharedDirectory {
 	fn created(&self) -> Option<DateTime<Utc>> {
 		self.inner.created()
+	}
+}
+
+impl HasRemoteDirInfo for SharedDirectory {
+	fn color(&self) -> DirColor<'_> {
+		self.inner.color()
 	}
 }
 
@@ -243,6 +249,12 @@ impl HasUUID for SharedRootDirectory {
 impl HasDirInfo for SharedRootDirectory {
 	fn created(&self) -> Option<DateTime<Utc>> {
 		self.dir.created()
+	}
+}
+
+impl HasRemoteDirInfo for SharedRootDirectory {
+	fn color(&self) -> DirColor<'_> {
+		self.dir.color()
 	}
 }
 

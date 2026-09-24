@@ -135,6 +135,12 @@ impl HasRemoteInfo for RootDirectoryWithMeta {
 	}
 }
 
+impl HasRemoteDirInfo for RootDirectoryWithMeta {
+	fn color(&self) -> DirColor<'_> {
+		self.color.as_borrowed_cow()
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteDirectory {
 	pub uuid: Uuid,
