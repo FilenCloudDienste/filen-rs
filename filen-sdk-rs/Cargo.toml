@@ -63,6 +63,12 @@ required-features = ["sync-engine"]
 name = "sync_engine_probe"
 required-features = ["sync-engine", "bench-internals"]
 
+# The named-scenario cost harness (`src/sync_engine/bench.rs`), which drives the engine's own
+# `prepare` rather than a copy of it.
+[[test]]
+name = "sync_engine_bench"
+required-features = ["sync-engine", "bench-internals"]
+
 [[bench]]
 name = "cache_insertion"
 harness = false
