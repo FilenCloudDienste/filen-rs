@@ -71,7 +71,7 @@ mod pausable {
 
 mod abortable {
 	use pin_project_lite::pin_project;
-	use std::task::Poll;
+	use std::{sync::Arc, task::Poll};
 
 	use crate::error::AbortedError;
 
@@ -137,6 +137,16 @@ mod abortable {
 		}
 	}
 
+	/// Resolves once `signal` aborts; never, without a signal.
+	pub(super) fn abort_future(
+		signal: Option<Arc<ManagedAbortSignal>>,
+	) -> AbortSignalFuture<impl Future<Output = AbortedError>> {
+		match signal {
+			Some(signal) => Arc::unwrap_or_clone(signal).into_future(),
+			None => AbortSignalFuture::None,
+		}
+	}
+
 	pin_project! {
 		#[project = AbortSignalFutureProj]
 		pub(super) enum AbortSignalFuture<F> {
@@ -185,7 +195,7 @@ mod abortable {
 
 mod managed {
 	use pin_project_lite::pin_project;
-	use std::{sync::Arc, task::Poll};
+	use std::{sync::Arc, task::Poll, time::Duration};
 
 	use crate::{
 		Error,
@@ -215,10 +225,7 @@ mod managed {
 			Fut: Future + Send + 'static,
 			Fut::Output: Send + 'static,
 		{
-			let abort_fut = match self.abort_signal {
-				Some(signal_arc) => Arc::unwrap_or_clone(signal_arc).into_future(),
-				None => AbortSignalFuture::None,
-			};
+			let abort_fut = abort_future(self.abort_signal);
 			let pausable = match self.pause_signal {
 				Some(signal_arc) => {
 					Arc::unwrap_or_clone(signal_arc).into_pausable_on_commander(fut_builder)
@@ -243,15 +250,27 @@ mod managed {
 			Fut: Future<Output = Result<T, Error>> + Send + 'static,
 			T: Send + 'static,
 		{
-			let abort_fut = match self.abort_signal {
-				Some(signal_arc) => Arc::unwrap_or_clone(signal_arc).into_future(),
-				None => AbortSignalFuture::None,
-			};
+			self.into_job_with_grace(job, CANCEL_GRACE)
+		}
+
+		/// [`into_js_managed_commander_job`](Self::into_js_managed_commander_job) with the grace
+		/// period as a parameter, so a test need not wait out the real one.
+		fn into_job_with_grace<F, Fut, T>(
+			self,
+			job: F,
+			grace: Duration,
+		) -> CancelOnAbort<CommanderFutHandle<Result<T, Error>>, impl Future<Output = AbortedError>>
+		where
+			F: FnOnce(JobControl) -> Fut + Send + 'static,
+			Fut: Future<Output = Result<T, Error>> + Send + 'static,
+			T: Send + 'static,
+		{
+			let abort_fut = abort_future(self.abort_signal);
 			let pause = self.pause_signal.map(|signal| signal.receiver());
 			let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
 			let handle = runtime::do_on_commander(move || {
 				let control = JobControl::from_receivers(pause, Some(cancel_rx.clone()));
-				with_cancel_grace(job(control), cancel_rx, CANCEL_GRACE)
+				with_cancel_grace(job(control), cancel_rx, grace)
 			});
 			CancelOnAbort::new(handle, abort_fut, cancel)
 		}
@@ -340,14 +359,16 @@ mod managed {
 				abort_signal: Some(Arc::new(controller.signal())),
 				pause_signal: None,
 			};
-			let job = managed.into_js_managed_commander_job(|_control| async {
-				std::future::pending::<Result<(), Error>>().await
-			});
+			let grace = Duration::from_millis(50);
+			let job = managed.into_job_with_grace(
+				|_control| async { std::future::pending::<Result<(), Error>>().await },
+				grace,
+			);
 			let started = std::time::Instant::now();
 			controller.abort();
 			let error = futures::executor::block_on(job).unwrap_err();
 			assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
-			assert!(started.elapsed() >= CANCEL_GRACE);
+			assert!(started.elapsed() >= grace);
 		}
 
 		#[test]
