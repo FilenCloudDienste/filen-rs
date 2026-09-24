@@ -26,6 +26,7 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
 	future::Future,
+	iter,
 	sync::Arc,
 };
 
@@ -258,6 +259,16 @@ impl DirState {
 	}
 }
 
+/// Where a request's top-level item goes.
+#[derive(Default)]
+struct RequestState {
+	/// The existing directory the top-level item is created in; `None` when nothing of the
+	/// request was planned.
+	destination: Option<Uuid>,
+	/// Shares and links of the destination, which every item of the request is added to.
+	targets: Arc<ConnectedTargets>,
+}
+
 struct Job<B: CopyBackend, D> {
 	backend: Arc<B>,
 	control: JobControl,
@@ -269,12 +280,8 @@ struct Job<B: CopyBackend, D> {
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	/// Planned subdirectories of each planned directory.
 	child_dirs: Vec<Vec<usize>>,
-	/// Connected targets of each request's destination.
-	targets: Vec<Arc<ConnectedTargets>>,
-	/// The destination of each request, when it has a planned item.
-	destinations: Vec<Option<Uuid>>,
-	/// Top-level plan item of each request.
-	top_level_of: Vec<Option<PlannedItem>>,
+	/// Each request's destination, filled in by [`Job::fetch_targets`].
+	requests: Vec<RequestState>,
 	report: CopyReport<D>,
 	/// The error that ended the job early.
 	fatal: Option<Arc<Error>>,
@@ -294,24 +301,6 @@ where
 	B: CopyBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
-	let requests = plan
-		.top_level
-		.iter()
-		.map(|t| t.request + 1)
-		.max()
-		.unwrap_or(0);
-	let mut destinations = vec![None; requests];
-	let mut top_level_of = vec![None; requests];
-	for top in &plan.top_level {
-		let parent = match top.item {
-			PlannedItem::Dir(index) => plan.dirs[index].parent,
-			PlannedItem::File(index) => plan.files[index].parent,
-		};
-		if let DestParent::Existing(destination) = parent {
-			destinations[top.request] = Some(destination);
-		}
-		top_level_of[top.request] = Some(top.item);
-	}
 	let mut child_dirs = vec![Vec::new(); plan.dirs.len()];
 	for (index, dir) in plan.dirs.iter().enumerate() {
 		if let DestParent::Planned(parent) = dir.parent {
@@ -332,9 +321,7 @@ where
 		dir_states: vec![DirState::Pending; plan.dirs.len()],
 		destination_dirs,
 		child_dirs,
-		targets: Vec::new(),
-		destinations,
-		top_level_of,
+		requests: Vec::new(),
 		plan,
 		report,
 		fatal: None,
@@ -388,9 +375,9 @@ where
 		self.plan
 			.top_level
 			.iter()
-			.filter_map(|top| {
-				let destination = self.destinations[top.request]?;
-				Some(match top.item {
+			.map(|top| {
+				let destination = self.top_level_destination(top.item);
+				match top.item {
 					PlannedItem::Dir(index) => {
 						let dir = &self.plan.dirs[index];
 						PlannedTopLevelItem {
@@ -413,9 +400,21 @@ where
 							is_dir: false,
 						}
 					}
-				})
+				}
 			})
 			.collect()
+	}
+
+	/// The existing directory the top-level `item` is created in.
+	fn top_level_destination(&self, item: PlannedItem) -> Uuid {
+		let parent = match item {
+			PlannedItem::Dir(index) => self.plan.dirs[index].parent,
+			PlannedItem::File(index) => self.plan.files[index].parent,
+		};
+		let DestParent::Existing(destination) = parent else {
+			panic!("a top-level item is created in an existing directory");
+		};
+		destination
 	}
 
 	/// Records `error` as ending the job when it is that kind of error.
@@ -449,31 +448,43 @@ where
 		result
 	}
 
+	/// Fills in [`Job::requests`], fetching each destination's targets once.
 	async fn fetch_targets(&mut self) -> Result<(), Stopped> {
-		let mut by_destination: Vec<(Uuid, Arc<ConnectedTargets>)> = Vec::new();
-		let mut targets = Vec::with_capacity(self.destinations.len());
-		for destination in self.destinations.clone() {
-			let Some(destination) = destination else {
-				targets.push(Arc::new(ConnectedTargets::default()));
-				continue;
+		let count = self
+			.plan
+			.top_level
+			.iter()
+			.map(|top| top.request + 1)
+			.max()
+			.unwrap_or(0);
+		let mut requests: Vec<RequestState> = iter::repeat_with(RequestState::default)
+			.take(count)
+			.collect();
+		// in request order, one top-level item per request
+		for top in &self.plan.top_level {
+			let destination = self.top_level_destination(top.item);
+			let known = requests
+				.iter()
+				.find(|request| request.destination == Some(destination));
+			let targets = if let Some(known) = known {
+				Arc::clone(&known.targets)
+			} else {
+				self.checkpoint().await?;
+				let fetched = self
+					.control
+					.until_stopping(self.backend.connected_targets(destination))
+					.await?;
+				match fetched {
+					Ok(fetched) => Arc::new(fetched),
+					Err(error) => return Err(self.stop_error(error)),
+				}
 			};
-			if let Some((_, known)) = by_destination.iter().find(|(d, _)| *d == destination) {
-				targets.push(Arc::clone(known));
-				continue;
-			}
-			self.checkpoint().await?;
-			let fetched = self
-				.control
-				.until_stopping(self.backend.connected_targets(destination))
-				.await?;
-			let fetched = match fetched {
-				Ok(fetched) => Arc::new(fetched),
-				Err(error) => return Err(self.stop_error(error)),
+			requests[top.request] = RequestState {
+				destination: Some(destination),
+				targets,
 			};
-			by_destination.push((destination, Arc::clone(&fetched)));
-			targets.push(fetched);
 		}
-		self.targets = targets;
+		self.requests = requests;
 		Ok(())
 	}
 
@@ -579,7 +590,7 @@ where
 		let uuid = dir.dest_uuid;
 		let created = dir.created.unwrap_or_else(Utc::now);
 		let color = dir.color.clone();
-		let targets = Arc::clone(&self.targets[dir.request]);
+		let targets = Arc::clone(&self.requests[dir.request].targets);
 		let backend = Arc::clone(&self.backend);
 		let control = self.control.clone();
 		let reporter = MaybeArc::clone(&self.reporter);
@@ -706,22 +717,19 @@ where
 				while tasks.len() < MAX_SMALL_PARALLEL_REQUESTS && next < self.plan.files.len() {
 					let index = next;
 					next += 1;
+					let file = &self.plan.files[index];
 					// files below a failed directory were counted with it
-					let Some(parent) = self.dest_parent(self.plan.files[index].parent) else {
+					let Some(parent) = self.dest_parent(file.parent) else {
 						continue;
 					};
-					let request = self.plan.files[index].request;
-					let top_level = matches!(
-						self.top_level_of.get(request),
-						Some(Some(PlannedItem::File(file))) if *file == index
-					);
+					let top_level = matches!(file.parent, DestParent::Existing(_));
 					tasks.spawn(copy_file(FileTask {
 						backend: Arc::clone(&self.backend),
 						control: self.control.clone(),
 						reporter: MaybeArc::clone(&self.reporter),
 						memory: Arc::clone(&memory),
-						targets: Arc::clone(&self.targets[self.plan.files[index].request]),
-						file: self.plan.files[index].clone(),
+						targets: Arc::clone(&self.requests[file.request].targets),
+						file: file.clone(),
 						parent,
 						index,
 						top_level,
@@ -762,10 +770,7 @@ where
 			size: planned.size,
 			bytes_done: 0,
 		};
-		let top_level = matches!(
-			self.top_level_of.get(request),
-			Some(Some(PlannedItem::File(index))) if *index == outcome.index
-		);
+		let top_level = outcome.top_level;
 		match outcome.result {
 			Ok((file, name)) => {
 				if top_level {
@@ -851,10 +856,10 @@ where
 	/// A destination may have been shared or linked while the copy ran; items created before
 	/// that were propagated to the old targets only. Propagate everything created (each
 	/// top-level item with its subtree) to the new ones.
-	async fn recheck_targets(&mut self) -> Result<(), Stopped> {
+	async fn recheck_targets(&self) -> Result<(), Stopped> {
 		let mut checked: Vec<Uuid> = Vec::new();
-		for (request, destination) in self.destinations.clone().into_iter().enumerate() {
-			let Some(destination) = destination else {
+		'requests: for request in &self.requests {
+			let Some(destination) = request.destination else {
 				continue;
 			};
 			if checked.contains(&destination) {
@@ -874,47 +879,38 @@ where
 					continue;
 				}
 			};
-			let added = current.without(&self.targets[request]);
+			let added = current.without(&request.targets);
 			if added.is_empty() {
 				continue;
 			}
-			let items = self.created_items_in(destination);
-			let lock = loop {
+			let _lock = loop {
 				match wait_for_lock(&*self.backend, &self.control, &self.reporter).await? {
-					LockWait::Locked(held) => break Some(held),
+					LockWait::Locked(held) => break held,
 					LockWait::Paused => self.checkpoint().await?,
 					LockWait::Failed(error) => {
 						tracing::warn!(
 							"failed to lock the drive to propagate copied items: {error}"
 						);
-						break None;
+						continue 'requests;
 					}
 				}
 			};
-			let Some(_lock) = lock else {
-				continue;
-			};
-			for item in &items {
-				for error in self.backend.propagate_tree(&added, item).await {
+			// the top-level items this copy created in the destination
+			let created = self
+				.report
+				.top_level
+				.iter()
+				.filter(|top| self.requests[top.request].destination == Some(destination));
+			for top in created {
+				for error in self.backend.propagate_tree(&added, &top.item).await {
 					self.reporter.event(CopyEvent::PropagationFailed {
-						dest_uuid: item.uuid(),
+						dest_uuid: top.item.uuid(),
 						error: Arc::new(error),
 					});
 				}
 			}
 		}
 		Ok(())
-	}
-
-	/// The top-level items this copy created in `destination`.
-	fn created_items_in(&self, destination: Uuid) -> Vec<NonRootItemType<'static, Normal>> {
-		let mut items = Vec::new();
-		for top in &self.report.top_level {
-			if self.destinations[top.request] == Some(destination) {
-				items.push(top.item.clone());
-			}
-		}
-		items
 	}
 }
 
@@ -1040,6 +1036,7 @@ impl From<Stopped> for FileError {
 struct FileOutcome {
 	index: usize,
 	parent: Uuid,
+	top_level: bool,
 	/// The registered file and the name it got.
 	result: Result<(RemoteFile, ValidatedName), FileError>,
 }
@@ -1127,10 +1124,12 @@ async fn reserve_chunk(
 async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
 	let index = task.index;
 	let parent = task.parent;
+	let top_level = task.top_level;
 	let result = copy_file_inner(task).await;
 	FileOutcome {
 		index,
 		parent,
+		top_level,
 		result,
 	}
 }
