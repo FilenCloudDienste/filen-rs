@@ -1,28 +1,34 @@
 use std::{borrow::Cow, sync::Arc};
 
 use filen_macros::shared_test_runtime;
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::fs::copy::{RenameReason, SkipReason};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
-	connect::{DirPublicLink, PublicLinkSharedClientExt},
-	consts::CHUNK_SIZE,
+	connect::{DirPublicInfo, DirPublicLink, PublicLinkSharedClientExt},
+	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
 	fs::{
-		HasName, HasUUID,
+		HasName, HasParent, HasRemoteInfo, HasUUID,
 		categories::DirType,
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyConfig, CopyEvent, CopyFailed, CopyPhase,
-			CopyRequest, CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl,
-			JobController, PlannedTopLevelItem,
+			CopyConfig, CopyEvent, CopyFailed, CopyPhase, CopyRequest, CopySource, CopySourceDir,
+			CopyStage, JobControl,
 		},
 		dir::RemoteDirectory,
-		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
+		file::{
+			AnonymousRemoteFile, RemoteFile,
+			enums::RemoteFileType,
+			traits::{HasFileInfo, HasFileMeta, HasRemoteFileInfo},
+		},
 	},
 	io::client_impl::IoSharedClientExt,
 };
-use filen_types::api::v3::dir::color::DirColor;
+use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpersExt};
+use futures::{StreamExt, stream};
 
 mod copy_helpers;
-use copy_helpers::{Recorder, assert_same_files, contents, copy, data, upload};
+use copy_helpers::{Recorder, SignalOnCreate, assert_same_files, contents, copy, data, upload};
 
 #[shared_test_runtime]
 async fn copy_tree_keeps_contents_and_metadata() {
@@ -104,17 +110,13 @@ async fn copying_into_the_same_parent_keeps_both() {
 	let file = upload(&client, test_dir, "a.txt", b"content").await;
 
 	for expected in ["a (1).txt", "a (2).txt"] {
-		let report = client
-			.clone()
-			.copy_items(
-				vec![CopySource::File(file.clone().into())],
-				test_dir.clone().into(),
-				CopyConfig::default(),
-				Arc::new(Recorder::default()),
-				JobControl::default(),
-			)
-			.await
-			.unwrap();
+		let report = copy(
+			&client,
+			vec![CopySource::File(file.clone().into())],
+			test_dir,
+		)
+		.await
+		.unwrap();
 		assert_eq!(
 			report.top_level[0].item.name(),
 			Some(expected),
@@ -132,17 +134,13 @@ async fn copying_a_directory_into_itself_is_rejected() {
 	let sub = client.create_dir(&(&source).into(), "sub").await.unwrap();
 
 	for destination in [&source, &sub] {
-		let CopyFailed { error, .. } = client
-			.clone()
-			.copy_items(
-				vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
-				destination.clone().into(),
-				CopyConfig::default(),
-				Arc::new(Recorder::default()),
-				JobControl::default(),
-			)
-			.await
-			.unwrap_err();
+		let CopyFailed { error, .. } = copy(
+			&client,
+			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+			destination,
+		)
+		.await
+		.unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 	let (dirs, files) = contents(&client, &source).await;
@@ -155,7 +153,8 @@ async fn copy_completes_on_a_small_memory_budget() {
 	let test_dir = &resources.dir;
 	let (email, password, two_factor) = test_utils::RESOURCES.get_credentials();
 	// two encrypted chunks: the smallest budget every build accepts
-	let config = ClientConfig::default().with_memory_budget(2 * (CHUNK_SIZE + 28));
+	let config =
+		ClientConfig::default().with_memory_budget(2 * (CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE));
 	let client = Arc::new(
 		UnauthClient::from_config(config)
 			.unwrap()
@@ -175,34 +174,26 @@ async fn copy_completes_on_a_small_memory_budget() {
 		.await
 		.unwrap();
 
-	client
-		.clone()
-		.copy_items(
-			originals
-				.iter()
-				.cloned()
-				.map(|f| CopySource::File(f.into()))
-				.collect(),
-			destination.clone().into(),
-			CopyConfig::default(),
-			Arc::new(Recorder::default()),
-			JobControl::default(),
-		)
-		.await
-		.unwrap();
+	copy(
+		&client,
+		originals
+			.iter()
+			.cloned()
+			.map(|f| CopySource::File(f.into()))
+			.collect(),
+		&destination,
+	)
+	.await
+	.unwrap();
 
 	let (_, files) = contents(&client, &destination).await;
 	assert_eq!(files.len(), 4);
-	for original in &originals {
-		let (_, copy) = files
-			.iter()
-			.find(|(_, f)| f.name() == original.name())
-			.unwrap();
-		assert_eq!(
-			client.download_file(copy).await.unwrap(),
-			client.download_file(original).await.unwrap()
-		);
-	}
+	assert_same_files(
+		&client,
+		&files,
+		originals.iter().map(|f| (f.name().unwrap(), f)),
+	)
+	.await;
 }
 
 #[shared_test_runtime]
@@ -212,10 +203,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 	let test_dir = &resources.dir;
 	let unauthed = client.get_unauthed();
 
-	async fn link_info(
-		client: &Client,
-		dir: &RemoteDirectory,
-	) -> filen_sdk_rs::connect::DirPublicInfo {
+	async fn link_info(client: &Client, dir: &RemoteDirectory) -> DirPublicInfo {
 		let link: DirPublicLink = client
 			.public_link_dir::<fn(u64, Option<u64>)>(dir, None)
 			.await
@@ -241,15 +229,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 	};
 
 	// copying it into itself is rejected
-	let CopyFailed { error, .. } = client
-		.clone()
-		.copy_items(
-			vec![linked_source()],
-			source.clone().into(),
-			CopyConfig::default(),
-			Arc::new(Recorder::default()),
-			JobControl::default(),
-		)
+	let CopyFailed { error, .. } = copy(&client, vec![linked_source()], &source)
 		.await
 		.unwrap_err();
 	assert_eq!(error.kind(), ErrorKind::InvalidState);
@@ -263,15 +243,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 		.unwrap();
 	let destination_link = link_info(&client, &linked).await;
 
-	let report = client
-		.clone()
-		.copy_items(
-			vec![linked_source()],
-			destination.clone().into(),
-			CopyConfig::default(),
-			Arc::new(Recorder::default()),
-			JobControl::default(),
-		)
+	let report = copy(&client, vec![linked_source()], &destination)
 		.await
 		.unwrap();
 	let copied_root = report.top_level[0].item.uuid();
@@ -317,19 +289,6 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 		.unwrap();
 
 	let (control, controller) = JobControl::new();
-	struct CancelOnCreate(Arc<Recorder>, JobController);
-	impl CopyCallback for CancelOnCreate {
-		fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-			self.0.on_top_level_planned(items);
-		}
-		fn on_top_level_created(&self, item: CopiedTopLevel) {
-			self.0.on_top_level_created(item);
-			self.1.cancel();
-		}
-		fn on_update(&self, update: CopyUpdate) {
-			self.0.on_update(update);
-		}
-	}
 	let recorder = Arc::new(Recorder::default());
 	let CopyFailed { report, error } = client
 		.clone()
@@ -337,7 +296,10 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
 			destination.clone().into(),
 			CopyConfig::default(),
-			CancelOnCreate(recorder.clone(), controller),
+			SignalOnCreate {
+				recorder: recorder.clone(),
+				signal: move || controller.cancel(),
+			},
 			control,
 		)
 		.await
@@ -468,7 +430,7 @@ async fn copies_from_public_links() {
 	assert_same_files(
 		&client,
 		&copied,
-		&[("sub/in-sub.txt", &in_sub), ("linked.txt", &file)],
+		[("sub/in-sub.txt", &in_sub), ("linked.txt", &file)],
 	)
 	.await;
 }
@@ -633,8 +595,6 @@ async fn names_clash_the_way_the_server_compares_them() {
 
 #[shared_test_runtime]
 async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
-	use futures::{StreamExt, stream};
-
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
@@ -675,7 +635,7 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 	}
 	upload(&client, &deepest, "bottom.txt", b"bottom").await;
 	let wide = client.create_dir(&(&source).into(), "wide").await.unwrap();
-	let wide_dirs = stream::iter(0..30)
+	stream::iter(0..30)
 		.map(|i| {
 			let client = client.clone();
 			let wide = wide.clone();
@@ -690,7 +650,6 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 		.buffer_unordered(8)
 		.collect::<Vec<_>>()
 		.await;
-	assert_eq!(wide_dirs.len(), 30);
 	let destination = client
 		.create_dir(&test_dir.into(), "destination")
 		.await
@@ -724,13 +683,14 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 	expected_files.sort();
 	got_files.sort();
 	assert_eq!(got_files, expected_files, "every file, once, at its size");
-	let originals: Vec<(String, &RemoteFile)> = boundary_files
-		.iter()
-		.map(|(name, file)| (format!("source/{name}"), file))
-		.collect();
-	let originals: Vec<(&str, &RemoteFile)> =
-		originals.iter().map(|(p, f)| (p.as_str(), *f)).collect();
-	assert_same_files(&client, &copied_files, &originals).await;
+	assert_same_files(
+		&client,
+		&copied_files,
+		boundary_files
+			.iter()
+			.map(|(name, file)| (format!("source/{name}"), file)),
+	)
+	.await;
 }
 
 // ── Pause, resume and cancel ────────────────────────────────────────────────
@@ -817,13 +777,15 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 	running.await.unwrap().unwrap();
 	let (_, copied) = contents(&client, &destination).await;
 	assert_eq!(copied.len(), 4, "no file is copied twice");
-	let paths: Vec<String> = (0..4).map(|i| format!("source/f{i}")).collect();
-	let originals: Vec<(&str, &RemoteFile)> = paths
-		.iter()
-		.map(String::as_str)
-		.zip(originals.iter())
-		.collect();
-	assert_same_files(&client, &copied, &originals).await;
+	assert_same_files(
+		&client,
+		&copied,
+		originals
+			.iter()
+			.enumerate()
+			.map(|(i, original)| (format!("source/f{i}"), original)),
+	)
+	.await;
 }
 
 // ── Failures, retry and the pre-flight check ────────────────────────────────
@@ -833,8 +795,6 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 /// lands there under the failure's name.
 #[shared_test_runtime]
 async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
-	use filen_sdk_rs::fs::file::{AnonymousRemoteFile, traits::HasFileMeta};
-
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
@@ -842,16 +802,16 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 	let real = upload(&client, test_dir, "gone.bin", &data(2 * CHUNK_SIZE, 7)).await;
 	// the same file under a uuid the server holds no chunks for
 	let missing: AnonymousRemoteFile = RemoteFile::from_meta(
-		filen_types::fs::Uuid::new_v4(),
+		Uuid::new_v4(),
 		(),
-		*filen_sdk_rs::fs::HasParent::parent(&real),
+		*real.parent(),
 		real.size(),
 		real.chunks(),
-		filen_sdk_rs::fs::file::traits::HasRemoteFileInfo::region(&real),
-		filen_sdk_rs::fs::file::traits::HasRemoteFileInfo::bucket(&real),
-		filen_sdk_rs::fs::HasRemoteInfo::timestamp(&real),
+		real.region(),
+		real.bucket(),
+		real.timestamp(),
 		false,
-		filen_types::traits::CowHelpers::into_owned_cow(real.get_meta().clone()),
+		real.get_meta().to_owned_cow(),
 	);
 	let destination = client
 		.create_dir(&test_dir.into(), "destination")
@@ -904,12 +864,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 		.await
 		.unwrap();
 	let (_, copied) = contents(&client, &destination).await;
-	assert_same_files(
-		&client,
-		&copied,
-		&[("gone.bin", &real), ("kept.txt", &kept)],
-	)
-	.await;
+	assert_same_files(&client, &copied, [("gone.bin", &real), ("kept.txt", &kept)]).await;
 }
 
 #[shared_test_runtime]
@@ -991,8 +946,6 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 #[cfg(feature = "malformed")]
 #[shared_test_runtime]
 async fn undecryptable_entries_are_renamed_or_skipped() {
-	use filen_sdk_rs::fs::copy::{RenameReason, SkipReason};
-
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
@@ -1069,9 +1022,9 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 	assert_same_files(
 		&client,
 		&copied,
-		&[
-			("source/ok.txt", &ok),
-			(format!("source/{hidden}/inside.txt").as_str(), &inside),
+		[
+			("source/ok.txt".to_owned(), &ok),
+			(format!("source/{hidden}/inside.txt"), &inside),
 		],
 	)
 	.await;

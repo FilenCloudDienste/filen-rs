@@ -18,7 +18,7 @@ use filen_sdk_rs::{
 use filen_types::api::v3::{contacts::Contact, dir::link::PublicLinkExpiration};
 
 mod copy_helpers;
-use copy_helpers::{PauseOnCreate, Recorder, contents, copy, data, upload, wait_until_paused};
+use copy_helpers::{Recorder, SignalOnCreate, contents, copy, data, upload, wait_until_paused};
 
 #[shared_test_runtime]
 async fn dir_public_link() {
@@ -1266,9 +1266,12 @@ async fn copy_with_shares(
 		let client = client.clone();
 		let own = own.clone();
 		let later = later.clone();
-		let callback = PauseOnCreate {
+		let callback = SignalOnCreate {
 			recorder: recorder.clone(),
-			controller: controller.clone(),
+			signal: {
+				let controller = controller.clone();
+				move || controller.pause()
+			},
 		};
 		async move {
 			client

@@ -2,7 +2,10 @@
 // binary compiles its own copy and uses a subset.
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
+use std::{
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use filen_sdk_rs::{
 	ErrorKind,
@@ -12,7 +15,7 @@ use filen_sdk_rs::{
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopySource,
-			CopyUpdate, JobControl, JobController, PlannedTopLevelItem, RunState,
+			CopyUpdate, JobControl, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
@@ -106,12 +109,13 @@ pub async fn copy(
 }
 
 /// Asserts that every file at `path` in `copied` has the bytes of the matching original.
-pub async fn assert_same_files(
+pub async fn assert_same_files<'a>(
 	client: &Client,
 	copied: &[(String, RemoteFile)],
-	originals: &[(&str, &RemoteFile)],
+	originals: impl IntoIterator<Item = (impl AsRef<str>, &'a RemoteFile)>,
 ) {
 	for (path, original) in originals {
+		let path = path.as_ref();
 		let (_, copy) = copied
 			.iter()
 			.find(|(p, _)| p == path)
@@ -120,45 +124,47 @@ pub async fn assert_same_files(
 		assert_eq!(copy.size(), original.size(), "{path} has the same size");
 		assert_eq!(
 			client.download_file(copy).await.unwrap(),
-			client.download_file(*original).await.unwrap(),
+			client.download_file(original).await.unwrap(),
 			"{path} has the same contents"
 		);
 	}
 }
 
-/// Pauses the job as soon as its first top-level item exists, so the test can change the
-/// world in a known state before resuming it.
-pub struct PauseOnCreate {
+/// Runs `signal` as soon as the job's first top-level item exists, so the test can pause or
+/// cancel the job in a known state.
+pub struct SignalOnCreate<F> {
 	pub recorder: Arc<Recorder>,
-	pub controller: JobController,
+	pub signal: F,
 }
 
-impl CopyCallback for PauseOnCreate {
+impl<F: Fn() + Send + Sync + 'static> CopyCallback for SignalOnCreate<F> {
 	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		self.recorder.on_top_level_planned(items);
 	}
 	fn on_top_level_created(&self, item: CopiedTopLevel) {
 		self.recorder.on_top_level_created(item);
-		self.controller.pause();
+		(self.signal)();
 	}
 	fn on_update(&self, update: CopyUpdate) {
 		self.recorder.on_update(update);
 	}
 }
 
-/// Waits (real time, bounded) until the job reports itself paused.
+/// Waits (real time, at most a minute) until the job reports itself paused.
 pub async fn wait_until_paused(recorder: &Recorder) {
-	for _ in 0..600 {
-		if recorder
+	let paused = || {
+		recorder
 			.updates
 			.lock()
 			.unwrap()
 			.iter()
 			.any(|u| u.run_state == RunState::Paused)
-		{
-			return;
+	};
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while !paused() {
+			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-	}
-	panic!("the copy never reported itself paused");
+	})
+	.await
+	.expect("the copy never reported itself paused");
 }
