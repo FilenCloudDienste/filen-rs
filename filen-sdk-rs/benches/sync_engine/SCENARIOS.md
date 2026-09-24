@@ -37,7 +37,27 @@ Every scenario records, in ONE process and ONE run:
   taking its expectation on trust.
 
 A single step's cost is only meaningful as an IN-RUN delta between phases of one
-process. Sub-0.01 ms steps move ±24 % run to run; do not read a percentage on one.
+process. Sub-0.01 ms steps move far more between runs than between builds; do not
+read a percentage on one. `BASELINE.md` carries the measured run-to-run resolution
+of every published column, taken from two whole runs at one commit.
+
+`compare`'s `(within spread)` marker is a NOISE-FLOOR annotation and not a gate: it
+asks whether two medians sit inside each other's in-run range, which at three
+samples most rows do, including rows whose medians are tens of per cent apart. The
+gate is the line above it — a scenario whose whole-pass yardstick moved more than
+ten per cent between the two runs is marked `MACHINE MOVED`, and every percentage
+under it carries the machine as well as the code.
+
+`compare`'s header prints both runs' `mark_overhead_ns`: one step mark timed through
+`mark` itself, so it is a second, free reading of how fast the machine was answering
+at all. It GATES nothing — the gate is the yardstick above it — and it carries no
+calibrated threshold, because the figure has not been pinned down: two whole sweeps
+of one binary sat 4.9 % apart (25.2 and 26.4 ns), five back-to-back runs
+of one binary on an idle machine spanned 5.8 % (23.5 to 24.9 ns), and observations
+taken during review of this harness spanned 12 % and 16 %. Read a LARGE gap as a
+reason to distrust a diff the yardstick passed; do not read a small one as a reason to
+trust it, and do not threshold on it until someone measures what quiet looks like on
+the machine in question.
 
 ## How to read any memory row
 
@@ -52,14 +72,25 @@ the allocator kept is still resident — so no memory figure is taken here.
 The names say whose process a figure is and how it was arrived at, because the
 misquoting these replace came from names that did not:
 
-- `mem:fresh_process_floor_rss` — the child before it opened anything: binary,
-  runtime, the allocator's first pages. Subtract it to talk about the engine.
+- `mem:fresh_process_floor_rss` — the child before it opened anything: the binary
+  and the allocator's first pages. The tokio runtime is built AFTER this is taken,
+  so its resident cost is part of what the next figure adds, not part of this one.
+  Subtract the floor to talk about the engine.
 - `mem:fresh_process_pair_loaded_rss` — the pair's baseline loaded into the store
-  the engine keeps it in, and NOTHING else. This is the steady state between
-  passes, and the figure a steady-state target is read off.
+  the engine keeps it in. This is the steady state between passes, and the figure a
+  steady-state target is read off. "And nothing else" is not quite true and the
+  difference is unmeasured: the child opens its engine on a registry that already
+  holds the pair, so `SyncEngine::open` tries to subscribe it to the cache, which
+  starts a cache worker and a second connection to the fixture's cache DB before
+  the subscription is refused. The parent never does this — it opened on an empty
+  registry — so that cost sits inside this child's `pair_loaded − floor` and inside
+  every figure taken after it.
 - `mem:fresh_process_pass_widest_rss` — the widest of the engine's own step
-  boundaries during the pass. It is not a continuous sampler: a spike inside one
-  step is not in it.
+  boundaries during the pass, excluding `drop_pass`, which is marked once the plan
+  and both sides are already freed. It is not a continuous sampler: a spike inside
+  one step is not in it. At small sizes this, `peak` and `after_pass` can print the
+  same number — that is the finding (a resident set that does not fall), not a
+  formatting artefact.
 - `mem:fresh_process_pass_widest_over_floor_rss` and
   `mem:fresh_process_pass_widest_over_pair_loaded_rss` — that same widest point,
   measured from the two floors worth measuring it from. The first includes
@@ -75,13 +106,23 @@ misquoting these replace came from names that did not:
 - `mem:fresh_process_after_everything_dropped_rss` — engine and store gone too.
   The gap from `floor` is retention, not a structure.
 - `mem:fresh_process_rss_at_step:<step>` — the resident set at each boundary the
-  engine marked, in order, so the memory profile and the timing profile are of
-  one pass.
+  engine marked, in order. It is the same pass in the sense that matters — the same
+  `one_pass`, the same read kind, the same plan and the same ordered step list — but
+  not the same EXECUTION: the timing figures come from a hot process after warmups
+  and up to 32 reps, and this is one cold pass in a fresh one. Read the two profiles
+  as the same shape, not as one run.
 - `mem:pair_baseline_computed_bytes`, `mem:pass_{baseline,view,scan}_computed_bytes`
-  and their sum `mem:pass_structures_computed_bytes` — what those structures say
-  they cost, summed from their own capacities. A COMPUTED figure, never a
-  measured one: it can exceed a resident set, because capacity is allocated
-  without necessarily being faulted in.
+  and `mem:pass_sides_computed_bytes` (view + scan) — what those structures say they
+  cost, summed from their own capacities. A COMPUTED figure, never a measured one:
+  it can exceed a resident set, because capacity is allocated without necessarily
+  being faulted in. There is deliberately no `baseline + view + scan` total: the
+  baseline term is the pair's own tree, resident before the pass began and the same
+  `Arc` the pair figure reports (a run asserts the two are equal), so a sum
+  including it reads as the pass's own cost while being almost entirely not that.
+  `pass_view` is zero for every scenario whose remote changelist is empty, which is
+  every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
+  it was not told about. Zero is an answer, which is why that column is printed in
+  kibibytes — in mebibytes 411 B and 0 B both print `0.000`.
 
 `summarize` prints TWO attribution ratios, because one answered neither
 question. `pair_attributed` is what the resident baseline computes itself as
@@ -107,8 +148,18 @@ the only honest thing to publish until something accounts for it.
 
 Every RSS figure is the allocator's answer as much as the engine's, so each run
 stamps which one it used, and `widest_spread` (that row's max over its min across
-its memory samples) is the resolution the row has. Two runs whose figures differ
-by less than the spread do not differ.
+its memory samples) is the resolution the row has WITHIN that run. At the default
+two memory samples that is a max over a min of two, which can say whether a figure
+moves and cannot describe a distribution; and a figure's movement between two runs
+is larger than its movement inside one. `BASELINE.md` carries the measured
+run-to-run figure, and that is the one to compare against.
+
+## What the harness cannot run on
+
+Windows. `PairChanges::new` marks a pair `LocalEventsDegraded` there, so every pass
+falls back to a whole read and every change-scoped scenario fails its read-kind
+assertion — in the parent and in the memory children alike. Nothing in the harness
+checks for this; it simply fails. Every figure published here was taken on macOS.
 
 ## Why every scenario asserts a plan
 
@@ -125,6 +176,26 @@ cannot see the difference between:
 `validate()` runs on every scenario a run chooses, not only under `cargo test`,
 and rejects any definition that a pass planning nothing whatsoever would satisfy.
 The idle floor is the single exemption, and it must expect exactly nothing.
+
+`validate_fixture` then checks the tree ON DISK, at every end the change class has:
+each edited file at the declared size, each announced deletion actually gone, both
+ends of each rename (the source gone, the destination there and — for a file — at
+the declared size), and ONE file the class did not touch, also at the declared size.
+That last one is the population a pass spends most of itself on, and it used to be
+checked by node count alone.
+
+One untouched file rather than all of them, deliberately: a stat per node is a walk
+of the whole tree per scenario, which at a million rows costs more than the pass
+being measured, and every file the generator writes comes off one `content()` call —
+so one wrong size is all of them. What remains unchecked is the tree's GEOMETRY on
+disk (depth, names, files per leaf are checked as a node count, not walked) and the
+file CONTENT: `fixture_hash` covers the shape and the declared sizes, not the bytes,
+so a change to the padding byte moves every file and every baseline hash while two
+runs still diff as one fixture.
+
+A run writes its result file again after EVERY scenario, so an assertion firing in
+the thirtieth scenario of a sweep no longer throws away the twenty-nine already
+measured.
 
 ## Group 1 — change classes (balanced 20/3/73 ASCII tree)
 
