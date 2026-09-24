@@ -1,5 +1,5 @@
-//! Cooperative control of a long-running job: pause, cancel, an internal stop, a cap on
-//! concurrent operations, and background tasks that cannot outlive the job.
+//! Cooperative control of a long-running job: pause, cancel, an internal stop, and background
+//! tasks that cannot outlive the job.
 //!
 //! Pause and cancel are observed by the job's own work instead of by stopping to poll it, so a
 //! job can finish (or drop) its in-flight chunks and release their memory reservations before
@@ -17,18 +17,9 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::watch;
 
 use crate::{
-	consts::MAX_SMALL_PARALLEL_REQUESTS,
 	runtime::{SpawnTaskHandle, spawn_task_maybe_send},
 	util::MaybeSend,
 };
-
-/// Upper bound on a job's concurrent operations (creates, chunk transfers, finalizations).
-///
-/// Memory is bounded separately by the client's memory semaphore; this only stops thousands of
-/// tiny files from fanning out into thousands of simultaneous operations. It mirrors the bound
-/// the recursive upload puts on its in-flight entries, and every request still passes the
-/// client-wide concurrency and rate limits.
-pub(crate) const MAX_CONCURRENT_OPERATIONS: usize = MAX_SMALL_PARALLEL_REQUESTS;
 
 /// Returned when a job was cancelled or stopped while waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,11 +526,6 @@ mod tests {
 		cancel.send_replace(true);
 		assert_eq!(run.await.unwrap(), Err(Stopped));
 		assert!(dropped.load(Ordering::SeqCst));
-	}
-
-	#[test]
-	fn max_concurrent_operations_mirrors_the_recursive_upload_bound() {
-		assert_eq!(MAX_CONCURRENT_OPERATIONS, MAX_SMALL_PARALLEL_REQUESTS);
 	}
 
 	#[tokio::test]

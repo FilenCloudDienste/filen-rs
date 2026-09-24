@@ -83,7 +83,8 @@ pub const FILE_CHUNK_SIZE_EXTRA: NonZeroU32 = NonZeroU32::new(28).unwrap(); // a
 pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as usize;
 
 /// Bound on concurrent small operations: in-flight entries of a recursive upload, cache
-/// fetches, and a copy's concurrent operations.
+/// fetches, and a copy's concurrent operations. Memory is bounded separately by the client's
+/// memory semaphore; this stops thousands of tiny items from fanning out at once.
 pub(crate) const MAX_SMALL_PARALLEL_REQUESTS: usize = 64;
 pub(crate) const MAX_OPEN_FILES: usize = 64;
 

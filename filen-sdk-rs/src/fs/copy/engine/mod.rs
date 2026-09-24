@@ -40,7 +40,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
-	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA},
+	consts::{
+		CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA, MAX_SMALL_PARALLEL_REQUESTS,
+	},
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -58,7 +60,7 @@ use crate::{
 };
 
 use super::{
-	control::{JobControl, JobTasks, MAX_CONCURRENT_OPERATIONS, Stopped},
+	control::{JobControl, JobTasks, Stopped},
 	naming::TakenNames,
 	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 	report::{
@@ -537,7 +539,7 @@ where
 						Ok(LockWait::Failed(error)) => return Err(self.stop_error(error)),
 					}
 				}
-				while in_flight.len() < MAX_CONCURRENT_OPERATIONS
+				while in_flight.len() < MAX_SMALL_PARALLEL_REQUESTS
 					&& let Some(index) = ready.pop_front()
 				{
 					in_flight.push(self.create_dir_future(index));
@@ -693,7 +695,7 @@ where
 				self.reporter.set_cancelling();
 			}
 			if !stopping && !pause_requested {
-				while tasks.len() < MAX_CONCURRENT_OPERATIONS && next < self.plan.files.len() {
+				while tasks.len() < MAX_SMALL_PARALLEL_REQUESTS && next < self.plan.files.len() {
 					let index = next;
 					next += 1;
 					// files below a failed directory were counted with it

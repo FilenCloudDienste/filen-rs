@@ -2313,7 +2313,7 @@ async fn a_failed_drive_lock_ends_directory_creation() {
 async fn a_fatal_error_during_directory_creation_ends_the_job() {
 	let destination = Uuid::new_v4();
 	// more directories than run at once, so some are never started
-	let (_, source) = wide_tree(3 * MAX_CONCURRENT_OPERATIONS);
+	let (_, source) = wide_tree(3 * MAX_SMALL_PARALLEL_REQUESTS);
 	let mut backend = FakeBackend::new(4, &[destination]);
 	backend
 		.fail_create
@@ -2338,7 +2338,7 @@ async fn a_fatal_error_during_directory_creation_ends_the_job() {
 	assert!(counts.dirs_not_attempted > 0);
 	assert_eq!(
 		counts.files_not_attempted + counts.files_failed,
-		3 * MAX_CONCURRENT_OPERATIONS as u64
+		3 * MAX_SMALL_PARALLEL_REQUESTS as u64
 	);
 	assert_released(&backend, &reporter);
 	assert_counts_add_up(&outcome, &recorder.last());
