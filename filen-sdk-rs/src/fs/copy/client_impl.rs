@@ -25,12 +25,12 @@ use crate::{
 		},
 		file::enums::RemoteFileType,
 	},
+	job::{JobControl, Stopped},
 	util::MaybeArc,
 };
 
 use super::{
 	backend::ClientBackend,
-	control::{JobControl, Stopped},
 	engine::{CopyOutcome, run_copy},
 	plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
 	report::{CopyCallback, CopyPhase, CopyReport, Reporter, ScanProgress},

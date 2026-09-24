@@ -4,7 +4,6 @@
 
 mod backend;
 mod client_impl;
-pub(crate) mod control;
 mod engine;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod js_impl;
@@ -13,8 +12,8 @@ mod plan;
 mod progress;
 mod report;
 
+pub use crate::job::JobControl;
 pub use client_impl::{CopyOptions, CopyRequest, CopySource, CopySourceDir};
-pub use control::JobControl;
 pub use engine::CopyOutcome;
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
 pub use report::{

@@ -57,11 +57,11 @@ use crate::{
 		},
 		name::ValidatedName,
 	},
+	job::{JobControl, JobTasks, Stopped},
 	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::{
-	control::{JobControl, JobTasks, Stopped},
 	naming::TakenNames,
 	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 	report::{

@@ -187,7 +187,7 @@ pub(crate) mod cancel_grace {
 	use pin_project_lite::pin_project;
 	use tokio::sync::watch;
 
-	use crate::{Error, ErrorKind};
+	use crate::{Error, ErrorKind, util::sleep};
 
 	/// How long a cancelled job may take to finish what cannot be interrupted (a directory create or
 	/// file registration already sent) and report it, before it is dropped as is.
@@ -206,7 +206,7 @@ pub(crate) mod cancel_grace {
 			if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
 				std::future::pending::<()>().await;
 			}
-			crate::util::sleep(grace).await;
+			sleep(grace).await;
 		};
 		tokio::select! {
 			biased;
@@ -264,7 +264,7 @@ pub(crate) mod cancel_grace {
 		};
 
 		use super::*;
-		use crate::fs::copy::control::JobControl;
+		use crate::job::JobControl;
 
 		struct SetOnDrop(Arc<AtomicBool>);
 		impl Drop for SetOnDrop {
@@ -328,8 +328,8 @@ pub(crate) mod cancel_grace {
 }
 
 /// Background tasks owned by a job. Each runs on the SDK runtime (`spawn_task_maybe_send`:
-/// a tokio task natively, a `spawn_local` task on the current worker on wasm), and is aborted
-/// when the job aborts them or drops this set, so no task outlives the job.
+/// a tokio task natively, a `spawn_local` task on the current worker on wasm), and is stopped
+/// when this set is dropped, so no task outlives the job.
 pub(crate) struct JobTasks<T> {
 	kill: watch::Sender<bool>,
 	tasks: FuturesUnordered<SpawnTaskHandle<Option<T>>>,

@@ -190,9 +190,9 @@ mod managed {
 	use crate::{
 		Error,
 		error::AbortedError,
-		fs::copy::{
+		job::{
 			JobControl,
-			control::cancel_grace::{CANCEL_GRACE, CancelOnAbort, with_cancel_grace},
+			cancel_grace::{CANCEL_GRACE, CancelOnAbort, with_cancel_grace},
 		},
 		runtime::{self, CommanderFutHandle},
 	};

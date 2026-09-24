@@ -27,6 +27,7 @@ pub mod fs;
 #[cfg(feature = "http-provider")]
 pub mod http_provider;
 pub mod io;
+pub(crate) mod job;
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 pub mod js;
 pub mod notes;
