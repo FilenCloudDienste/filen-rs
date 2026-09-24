@@ -189,7 +189,6 @@ pub enum CopyEvent {
 	},
 	FileFailed(FailureInfo),
 	Skipped {
-		source_uuid: Option<Uuid>,
 		source_path: String,
 		bytes: u64,
 		reason: SkipReason,
@@ -529,12 +528,11 @@ impl Reporter {
 			state.totals = totals;
 			for entry in skipped {
 				state.counts.entries_skipped += match entry.reason {
-					SkipReason::UndecryptableFile => 1,
+					SkipReason::UndecryptableFile { .. } => 1,
 					SkipReason::Unreachable { count } => count,
 				};
 				state.counts.bytes_skipped += entry.bytes;
 				state.batcher.push(CopyEvent::Skipped {
-					source_uuid: entry.source_uuid,
 					source_path: entry.source_path.clone(),
 					bytes: entry.bytes,
 					reason: entry.reason,

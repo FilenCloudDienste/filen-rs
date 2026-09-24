@@ -144,7 +144,7 @@ pub(crate) struct PlannedTopLevel {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SkipReason {
 	/// The file's metadata could not be decrypted, so there is no key to read it with.
-	UndecryptableFile,
+	UndecryptableFile { uuid: Uuid },
 	/// Listed entries whose parent is not reachable from the source directory (a malformed or
 	/// cyclic listing).
 	Unreachable { count: u64 },
@@ -152,8 +152,6 @@ pub enum SkipReason {
 
 #[derive(Debug, Clone)]
 pub struct SkippedEntry {
-	/// `None` for an aggregate over several entries.
-	pub source_uuid: Option<Uuid>,
 	pub source_path: String,
 	pub bytes: u64,
 	pub reason: SkipReason,
@@ -388,10 +386,9 @@ impl<D> CopyPlan<D> {
 		let source_uuid = file.uuid();
 		if file.name().is_none() || file.key().is_none() {
 			self.skipped.push(SkippedEntry {
-				source_uuid: Some(source_uuid),
 				source_path,
 				bytes: file.size(),
-				reason: SkipReason::UndecryptableFile,
+				reason: SkipReason::UndecryptableFile { uuid: source_uuid },
 			});
 			return None;
 		}
@@ -536,7 +533,6 @@ impl<D> CopyPlan<D> {
 		let count = unreachable_dirs as u64 + unreachable_files;
 		if count > 0 {
 			self.skipped.push(SkippedEntry {
-				source_uuid: None,
 				source_path: self.dirs[root_index].source_path.clone(),
 				bytes: unreachable_bytes,
 				reason: SkipReason::Unreachable { count },
@@ -956,6 +952,7 @@ mod tests {
 		let hidden = undecryptable_file(9);
 		let hidden_uuid = hidden.uuid();
 		let top = undecryptable_file(3);
+		let top_uuid = top.uuid();
 		let plan = planner(destination, &[])
 			.plan(vec![
 				request(
@@ -972,11 +969,16 @@ mod tests {
 
 		assert!(plan.files.is_empty());
 		assert_eq!(plan.skipped.len(), 2);
-		assert_eq!(plan.skipped[0].source_uuid, Some(hidden_uuid));
 		assert_eq!(plan.skipped[0].bytes, 9);
-		assert_eq!(plan.skipped[0].reason, SkipReason::UndecryptableFile);
+		assert_eq!(
+			plan.skipped[0].reason,
+			SkipReason::UndecryptableFile { uuid: hidden_uuid }
+		);
 		assert_eq!(plan.skipped[0].source_path, format!("root/{hidden_uuid}"));
-		assert_eq!(plan.skipped[1].reason, SkipReason::UndecryptableFile);
+		assert_eq!(
+			plan.skipped[1].reason,
+			SkipReason::UndecryptableFile { uuid: top_uuid }
+		);
 		// a skipped top-level file has no planned top-level item
 		assert_eq!(plan.top_level.len(), 1);
 		assert_eq!(plan.totals.bytes, 0);
@@ -1005,7 +1007,6 @@ mod tests {
 		assert_eq!(plan.dirs.len(), 1);
 		assert_eq!(plan.files.len(), 1);
 		assert_eq!(plan.skipped.len(), 1);
-		assert_eq!(plan.skipped[0].source_uuid, None);
 		assert_eq!(plan.skipped[0].reason, SkipReason::Unreachable { count: 2 });
 		assert_eq!(plan.skipped[0].bytes, 6);
 	}

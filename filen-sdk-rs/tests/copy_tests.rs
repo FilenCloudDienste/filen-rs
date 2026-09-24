@@ -1001,7 +1001,7 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 
 	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
 	let ok = upload(&client, &source, "ok.txt", b"readable").await;
-	client
+	let unreadable = client
 		.create_malformed_file(
 			&(&source).into(),
 			"unreadable.txt",
@@ -1048,7 +1048,10 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 	outcome.result.unwrap();
 	let report = &outcome.report;
 	assert_eq!(report.skipped.len(), 1);
-	assert_eq!(report.skipped[0].reason, SkipReason::UndecryptableFile);
+	assert_eq!(
+		report.skipped[0].reason,
+		SkipReason::UndecryptableFile { uuid: unreadable }
+	);
 	assert_eq!(report.renamed.len(), 2, "renames: {:?}", report.renamed);
 	let hidden_rename = report
 		.renamed

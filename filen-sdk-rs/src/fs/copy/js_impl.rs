@@ -96,8 +96,6 @@ pub struct CopyFileDone {
 
 #[js_type(export, no_deser)]
 pub struct CopySkippedEntry {
-	/// `undefined` for an aggregate over several entries.
-	pub source_uuid: Option<Uuid>,
 	pub source_path: String,
 	pub bytes: u64,
 	pub reason: SkipReason,
@@ -309,7 +307,6 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 impl From<&api::SkippedEntry> for CopySkippedEntry {
 	fn from(entry: &api::SkippedEntry) -> Self {
 		Self {
-			source_uuid: entry.source_uuid,
 			source_path: entry.source_path.clone(),
 			bytes: entry.bytes,
 			reason: entry.reason,
@@ -359,12 +356,10 @@ impl From<api::CopyEvent> for CopyEvent {
 			}),
 			api::CopyEvent::FileFailed(info) => Self::FileFailed((&info).into()),
 			api::CopyEvent::Skipped {
-				source_uuid,
 				source_path,
 				bytes,
 				reason,
 			} => Self::Skipped(CopySkippedEntry {
-				source_uuid,
 				source_path,
 				bytes,
 				reason,
