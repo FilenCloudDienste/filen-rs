@@ -154,6 +154,7 @@ impl CopyBackend for ClientBackend {
 		completion: UploadCompletion,
 		info: RemoteFileInfo,
 	) -> Result<RemoteFile, Error> {
+		// the upload is shared with its chunk uploads; register a copy that carries the final name
 		let mut file = upload.file.clone();
 		file.root.name = name.clone();
 		let response = complete_upload(&self.client, &file, &upload.upload_key, completion).await?;
