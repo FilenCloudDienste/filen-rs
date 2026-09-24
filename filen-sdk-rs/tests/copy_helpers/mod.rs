@@ -28,15 +28,15 @@ pub struct Recorder {
 }
 
 impl CopyCallback for Recorder {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		self.planned.lock().unwrap().extend(items);
 	}
 
-	fn top_level_created(&self, item: CopiedTopLevel) {
+	fn on_top_level_created(&self, item: CopiedTopLevel) {
 		self.created.lock().unwrap().push(item);
 	}
 
-	fn update(&self, update: CopyUpdate) {
+	fn on_update(&self, update: CopyUpdate) {
 		self.updates.lock().unwrap().push(update);
 	}
 }
@@ -135,15 +135,15 @@ pub struct PauseOnCreate {
 }
 
 impl CopyCallback for PauseOnCreate {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-		self.recorder.top_level_planned(items);
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+		self.recorder.on_top_level_planned(items);
 	}
-	fn top_level_created(&self, item: CopiedTopLevel) {
-		self.recorder.top_level_created(item);
+	fn on_top_level_created(&self, item: CopiedTopLevel) {
+		self.recorder.on_top_level_created(item);
 		self.controller.pause();
 	}
-	fn update(&self, update: CopyUpdate) {
-		self.recorder.update(update);
+	fn on_update(&self, update: CopyUpdate) {
+		self.recorder.on_update(update);
 	}
 }
 

@@ -465,17 +465,17 @@ enum Delivery {
 struct DeliveryChannel(tokio::sync::mpsc::UnboundedSender<Delivery>);
 
 impl api::CopyCallback for DeliveryChannel {
-	fn top_level_planned(&self, items: Vec<api::PlannedTopLevelItem>) {
+	fn on_top_level_planned(&self, items: Vec<api::PlannedTopLevelItem>) {
 		let _ = self.0.send(Delivery::TopLevelPlanned(
 			items.into_iter().map(Into::into).collect(),
 		));
 	}
 
-	fn top_level_created(&self, item: api::CopiedTopLevel) {
+	fn on_top_level_created(&self, item: api::CopiedTopLevel) {
 		let _ = self.0.send(Delivery::TopLevelCreated(item.into()));
 	}
 
-	fn update(&self, update: api::CopyUpdate) {
+	fn on_update(&self, update: api::CopyUpdate) {
 		let _ = self.0.send(Delivery::Update(update.into()));
 	}
 }
@@ -1078,9 +1078,9 @@ mod tests {
 		let mut expected = Vec::new();
 		for i in 0..300 {
 			match i % 3 {
-				0 => channel.top_level_planned(vec![planned(i)]),
-				1 => channel.update(update(i)),
-				_ => channel.top_level_created(api::CopiedTopLevel {
+				0 => channel.on_top_level_planned(vec![planned(i)]),
+				1 => channel.on_update(update(i)),
+				_ => channel.on_top_level_created(api::CopiedTopLevel {
 					request: i as usize,
 					source_uuid: Uuid::new_v4(),
 					item: crate::fs::categories::NonRootItemType::Dir(Cow::Owned(dir())),

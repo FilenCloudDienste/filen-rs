@@ -433,15 +433,15 @@ struct Recorder {
 }
 
 impl CopyCallback for Recorder {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		self.planned.lock().unwrap().extend(items);
 	}
 
-	fn top_level_created(&self, item: CopiedTopLevel) {
+	fn on_top_level_created(&self, item: CopiedTopLevel) {
 		self.created.lock().unwrap().push(item);
 	}
 
-	fn update(&self, update: CopyUpdate) {
+	fn on_update(&self, update: CopyUpdate) {
 		self.updates.lock().unwrap().push(update);
 	}
 }

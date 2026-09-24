@@ -317,15 +317,15 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 	let (control, controller) = JobControl::new();
 	struct CancelOnCreate(Arc<Recorder>, JobController);
 	impl CopyCallback for CancelOnCreate {
-		fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-			self.0.top_level_planned(items);
+		fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+			self.0.on_top_level_planned(items);
 		}
-		fn top_level_created(&self, item: CopiedTopLevel) {
-			self.0.top_level_created(item);
+		fn on_top_level_created(&self, item: CopiedTopLevel) {
+			self.0.on_top_level_created(item);
 			self.1.cancel();
 		}
-		fn update(&self, update: CopyUpdate) {
-			self.0.update(update);
+		fn on_update(&self, update: CopyUpdate) {
+			self.0.on_update(update);
 		}
 	}
 	let recorder = Arc::new(Recorder::default());

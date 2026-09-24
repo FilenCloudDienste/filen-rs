@@ -437,9 +437,9 @@ mod tests {
 	struct Updates(Mutex<Vec<CopyUpdate>>);
 
 	impl CopyCallback for Updates {
-		fn top_level_planned(&self, _: Vec<PlannedTopLevelItem>) {}
-		fn top_level_created(&self, _: CopiedTopLevel) {}
-		fn update(&self, update: CopyUpdate) {
+		fn on_top_level_planned(&self, _: Vec<PlannedTopLevelItem>) {}
+		fn on_top_level_created(&self, _: CopiedTopLevel) {}
+		fn on_update(&self, update: CopyUpdate) {
 			self.0.lock().unwrap().push(update);
 		}
 	}

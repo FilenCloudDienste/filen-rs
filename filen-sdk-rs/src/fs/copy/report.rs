@@ -284,22 +284,22 @@ impl<D> Default for CopyReport<D> {
 
 /// Receives a copy's progress. All calls come from one [`Reporter`], in order.
 pub trait CopyCallback: MaybeSendSync + 'static {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>);
-	fn top_level_created(&self, item: CopiedTopLevel);
-	fn update(&self, update: CopyUpdate);
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>);
+	fn on_top_level_created(&self, item: CopiedTopLevel);
+	fn on_update(&self, update: CopyUpdate);
 }
 
 impl<T: CopyCallback + ?Sized> CopyCallback for std::sync::Arc<T> {
-	fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-		(**self).top_level_planned(items);
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
+		(**self).on_top_level_planned(items);
 	}
 
-	fn top_level_created(&self, item: CopiedTopLevel) {
-		(**self).top_level_created(item);
+	fn on_top_level_created(&self, item: CopiedTopLevel) {
+		(**self).on_top_level_created(item);
 	}
 
-	fn update(&self, update: CopyUpdate) {
-		(**self).update(update);
+	fn on_update(&self, update: CopyUpdate) {
+		(**self).on_update(update);
 	}
 }
 
@@ -415,7 +415,7 @@ impl Reporter {
 			.record(active_time, state.counts.bytes_done, done_units);
 		let events = state.batcher.take(now);
 		state.changed = false;
-		self.callback.update(CopyUpdate {
+		self.callback.on_update(CopyUpdate {
 			phase: state.phase,
 			run_state: state.run_state(),
 			scan: state.scan,
@@ -546,7 +546,7 @@ impl Reporter {
 
 	pub(crate) fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		self.callback.top_level_planned(items);
+		self.callback.on_top_level_planned(items);
 	}
 
 	/// Delivered at once, after an update carrying everything that happened before it.
@@ -554,7 +554,7 @@ impl Reporter {
 		let now = self.now();
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		self.flush(&mut state, now);
-		self.callback.top_level_created(item);
+		self.callback.on_top_level_created(item);
 	}
 
 	pub(crate) fn dir_created(
