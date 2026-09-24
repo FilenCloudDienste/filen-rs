@@ -7,7 +7,7 @@ use std::{
 	time::Duration,
 };
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use super::*;
 use crate::{
@@ -149,21 +149,24 @@ struct FakeBackend {
 	/// Names the server registers as a new version of the given existing file (a client
 	/// writing without the drive lock took them at the last moment).
 	version_of: HashMap<String, Uuid>,
-	never: Notify,
 	lock_calls: AtomicUsize,
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
-	/// until it is raised again; `usize::MAX` when the lock is free.
-	block_locks_from: AtomicUsize,
+	/// until it is cleared; `None` while the lock is free.
+	block_locks_from: watch::Sender<Option<usize>>,
 }
 
+/// Chunks of memory a [`FakeBackend`] has unless a test asks for [`FakeBackend::with_memory`].
+const DEFAULT_MEMORY_CHUNKS: usize = 4;
+
 impl FakeBackend {
-	fn new(memory_chunks: usize, destinations: &[Uuid]) -> Self {
+	/// A backend copying into `destination`, the one directory that exists before the copy.
+	fn new(destination: Uuid) -> Self {
 		Self {
-			memory: Arc::new(Semaphore::new(budget(memory_chunks))),
-			budget: budget(memory_chunks),
+			memory: Arc::new(Semaphore::new(budget(DEFAULT_MEMORY_CHUNKS))),
+			budget: budget(DEFAULT_MEMORY_CHUNKS),
 			live_locks: Arc::new(AtomicUsize::new(0)),
 			log: Mutex::new(FakeLog::default()),
-			known_dirs: Mutex::new(destinations.iter().copied().collect()),
+			known_dirs: Mutex::new(HashSet::from([destination])),
 			delay: Duration::from_millis(10),
 			slow: HashMap::new(),
 			fail_fetch: HashMap::new(),
@@ -184,10 +187,16 @@ impl FakeBackend {
 			reverse_chunks: false,
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
-			never: Notify::new(),
 			lock_calls: AtomicUsize::new(0),
-			block_locks_from: AtomicUsize::new(usize::MAX),
+			block_locks_from: watch::Sender::new(None),
 		}
+	}
+
+	/// Room for `chunks` chunks in flight instead of [`DEFAULT_MEMORY_CHUNKS`].
+	fn with_memory(mut self, chunks: usize) -> Self {
+		self.memory = Arc::new(Semaphore::new(budget(chunks)));
+		self.budget = budget(chunks);
+		self
 	}
 
 	fn log(&self) -> std::sync::MutexGuard<'_, FakeLog> {
@@ -214,11 +223,18 @@ impl CopyBackend for FakeBackend {
 		{
 			return Err(Error::custom(kind, "lock failed"));
 		}
-		if call >= self.block_locks_from.load(Ordering::SeqCst) {
+		if self
+			.block_locks_from
+			.borrow()
+			.is_some_and(|from| call >= from)
+		{
 			self.log().lock_waits += 1;
-			while call >= self.block_locks_from.load(Ordering::SeqCst) {
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			}
+			// the sender lives in `self`, which outlives this wait
+			let _ = self
+				.block_locks_from
+				.subscribe()
+				.wait_for(|from| from.is_none_or(|from| call < from))
+				.await;
 		}
 		self.live_locks.fetch_add(1, Ordering::SeqCst);
 		Ok(FakeLock(Arc::clone(&self.live_locks)))
@@ -349,7 +365,7 @@ impl CopyBackend for FakeBackend {
 	) -> Result<RemoteFileInfo, Error> {
 		let name = upload.spec.name.as_ref();
 		if self.blocked_uploads.contains(name) {
-			self.never.notified().await;
+			std::future::pending::<()>().await;
 		}
 		self.wait(name).await;
 		if let Some(kind) = self.fail_upload.get(name) {
@@ -609,7 +625,7 @@ async fn copies_a_tree_parent_first_with_every_chunk_once() {
 			PlanSource::File(sources[3].clone()),
 		],
 	);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, recorder, reporter) = start(&backend, plan, JobControl::default());
 	let report = running.await.unwrap().unwrap();
 
@@ -689,7 +705,7 @@ async fn stored_chunks_without_data_are_not_copied() {
 	// chunk counts some clients store: one for an empty file, a trailing empty chunk
 	let empty = source_file_with_chunks("empty", 0, 1);
 	let full = source_file_with_chunks("full", CHUNK_SIZE_U64, 2);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let plan = plan(
 		destination,
 		vec![
@@ -737,7 +753,7 @@ async fn copy_many(memory_chunks: usize, files: usize, chunks_per_file: u64) {
 		destination,
 		sources.iter().cloned().map(PlanSource::File).collect(),
 	);
-	let mut backend = FakeBackend::new(memory_chunks, &[destination]);
+	let mut backend = FakeBackend::new(destination).with_memory(memory_chunks);
 	for (i, source) in sources.iter().enumerate() {
 		backend.slow.insert(
 			source.name().unwrap().to_owned(),
@@ -785,7 +801,7 @@ async fn never_deadlocks_on_a_multi_threaded_runtime() {
 async fn hashes_chunks_in_order_when_they_complete_out_of_order() {
 	let destination = Uuid::new_v4();
 	let source = source_file("f", 6 * CHUNK_SIZE_U64);
-	let mut backend = FakeBackend::new(8, &[destination]);
+	let mut backend = FakeBackend::new(destination).with_memory(8);
 	backend.reverse_chunks = true;
 	let backend = Arc::new(backend);
 	let plan = plan(destination, vec![PlanSource::File(source.clone())]);
@@ -812,7 +828,7 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 		destination,
 		sources.iter().cloned().map(PlanSource::File).collect(),
 	);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, _cancel, control) = controls();
 	let (running, recorder, reporter) = start(&backend, plan, control);
 
@@ -861,7 +877,7 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 #[tokio::test(start_paused = true)]
 async fn a_paused_job_holds_no_memory_while_a_chunk_waited_for_it() {
 	let destination = Uuid::new_v4();
-	let backend = Arc::new(FakeBackend::new(1, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination).with_memory(1));
 	let free = 1024;
 	let elsewhere = Arc::clone(&backend.memory)
 		.try_acquire_many_owned(u32::try_from(backend.budget - free).unwrap())
@@ -917,7 +933,7 @@ async fn a_paused_job_holds_nothing_on_a_multi_threaded_runtime() {
 	let sources: Vec<_> = (0..24)
 		.map(|i| source_file(&format!("f{i}"), 3 * CHUNK_SIZE_U64 / 2))
 		.collect();
-	let backend = Arc::new(FakeBackend::new(3, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination).with_memory(3));
 	let (pause, _cancel, control) = controls();
 	let (running, _recorder, reporter) = start(
 		&backend,
@@ -969,7 +985,7 @@ fn wide_tree(dirs: usize) -> (SourceDir<()>, PlanSource<()>) {
 async fn pause_during_directory_creation_holds_no_lock_and_resumes() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(200);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, _cancel, control) = controls();
 	let (running, _recorder, reporter) = start(&backend, plan(destination, vec![source]), control);
 
@@ -1001,7 +1017,7 @@ async fn pause_during_directory_creation_holds_no_lock_and_resumes() {
 async fn a_job_paused_before_it_starts_waits() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, _cancel, control) = controls();
 	pause.send_replace(true);
 	let (running, _recorder, reporter) = start(&backend, plan(destination, vec![source]), control);
@@ -1026,7 +1042,7 @@ async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
 		destination,
 		sources.iter().cloned().map(PlanSource::File).collect(),
 	);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, _cancel, control) = controls();
 	let (running, recorder, reporter) = start(&backend, plan, control);
 
@@ -1052,7 +1068,7 @@ async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
 async fn a_cancel_while_paused_ends_the_pause() {
 	let destination = Uuid::new_v4();
 	let big = source_file("big", 6 * CHUNK_SIZE_U64);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(
 		&backend,
@@ -1097,7 +1113,7 @@ async fn cancel_during_directory_creation_reports_what_was_created() {
 	let destination = Uuid::new_v4();
 	let (first_root, first) = wide_tree(200);
 	let (_, second) = wide_tree(1);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) =
 		start(&backend, plan(destination, vec![first, second]), control);
@@ -1143,7 +1159,7 @@ async fn cancel_during_file_copies_drops_transfers_and_keeps_finished_files() {
 	let destination = Uuid::new_v4();
 	let small = source_file("small", 10);
 	let big = source_file("big", 5 * CHUNK_SIZE_U64);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.blocked_uploads.insert("big".to_owned());
 	let backend = Arc::new(backend);
 	let (_pause, cancel, control) = controls();
@@ -1216,7 +1232,7 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 		source_file("big", 5 * CHUNK_SIZE_U64),
 	];
 	sources.extend((0..40).map(|i| source_file(&format!("later{i}"), 100)));
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.blocked_uploads.insert("big".to_owned());
 	backend.delay = Duration::from_secs(1);
 	let backend = Arc::new(backend);
@@ -1261,7 +1277,7 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 async fn a_job_cancelled_during_directory_creation_counts_what_it_never_copied() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(200);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, _reporter) = start(&backend, plan(destination, vec![source]), control);
 
@@ -1283,7 +1299,7 @@ async fn a_job_cancelled_during_directory_creation_counts_what_it_never_copied()
 async fn a_completed_job_has_nothing_left_unattempted() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, recorder, _reporter) = start(
 		&backend,
 		plan(destination, vec![source]),
@@ -1308,7 +1324,7 @@ async fn running_out_of_storage_ends_the_job() {
 	let sources: Vec<_> = (0..10)
 		.map(|i| source_file(&format!("f{i}"), 100))
 		.collect();
-	let mut backend = FakeBackend::new(16, &[destination]);
+	let mut backend = FakeBackend::new(destination).with_memory(16);
 	backend.delay = Duration::from_secs(10);
 	backend
 		.slow
@@ -1416,7 +1432,7 @@ async fn a_failed_file_does_not_stop_the_others() {
 	let destination = Uuid::new_v4();
 	let good = source_file("good", 2 * CHUNK_SIZE_U64);
 	let bad = source_file("bad", 3 * CHUNK_SIZE_U64);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_fetch
 		.insert("bad".to_owned(), ErrorKind::FileChunkNotFound);
@@ -1468,7 +1484,7 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 			listed(&deep, source_file("lost2", 11)),
 		],
 	);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_create
 		.insert("Sub".to_owned(), ErrorKind::Server);
@@ -1514,7 +1530,7 @@ async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
 		vec![listed(&top, sub.clone())],
 		vec![listed(&top, source_file("nested", 5))],
 	);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_create
 		.insert("Sub".to_owned(), ErrorKind::Server);
@@ -1575,7 +1591,7 @@ async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
 async fn a_top_level_name_taken_after_listing_gets_the_next_name() {
 	let destination = Uuid::new_v4();
 	let top = source_dir("Top");
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend.merge_once.lock().unwrap().insert("Top".to_owned());
 	let backend = Arc::new(backend);
 	let (running, _recorder, _reporter) = start(
@@ -1597,7 +1613,7 @@ async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
 	let top = source_dir("Top");
 	let taken = source_file("a.txt", 10);
 	let untouched = source_file("b.txt", 10);
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	// taken after the destination was listed: the directory by a create that merges, the
 	// file by the check right before it is registered
 	backend.merge_once.lock().unwrap().insert("Top".to_owned());
@@ -1659,7 +1675,7 @@ async fn a_top_level_item_renamed_during_the_copy_is_reported_as_renamed() {
 async fn propagates_every_created_item_into_a_connected_destination() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.targets = ConnectedTargets::with_test_users(2);
 	let backend = Arc::new(backend);
 	let (running, _recorder, _reporter) = start(
@@ -1689,7 +1705,7 @@ async fn a_destination_shared_during_the_copy_gets_the_copied_trees() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
 	let file = source_file("f", 1);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.later_targets = Some(ConnectedTargets::with_test_users(1));
 	let backend = Arc::new(backend);
 	let (running, recorder, _reporter) = start(
@@ -1714,14 +1730,14 @@ async fn a_destination_shared_during_the_copy_gets_the_copied_trees() {
 }
 
 fn unblock_locks(backend: &FakeBackend) {
-	backend.block_locks_from.store(usize::MAX, Ordering::SeqCst);
+	backend.block_locks_from.send_replace(None);
 }
 
 #[tokio::test(start_paused = true)]
 async fn cancel_ends_a_drive_lock_wait_before_a_file_is_registered() {
 	let destination = Uuid::new_v4();
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
-	backend.block_locks_from.store(0, Ordering::SeqCst);
+	let backend = Arc::new(FakeBackend::new(destination));
+	backend.block_locks_from.send_replace(Some(0));
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(
 		&backend,
@@ -1750,8 +1766,8 @@ async fn cancel_ends_a_drive_lock_wait_before_a_file_is_registered() {
 #[tokio::test(start_paused = true)]
 async fn pause_ends_a_drive_lock_wait_before_a_file_is_registered() {
 	let destination = Uuid::new_v4();
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
-	backend.block_locks_from.store(0, Ordering::SeqCst);
+	let backend = Arc::new(FakeBackend::new(destination));
+	backend.block_locks_from.send_replace(Some(0));
 	let (pause, _cancel, control) = controls();
 	let (running, _recorder, reporter) = start(
 		&backend,
@@ -1778,8 +1794,8 @@ async fn pause_ends_a_drive_lock_wait_before_a_file_is_registered() {
 async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
-	backend.block_locks_from.store(0, Ordering::SeqCst);
+	let backend = Arc::new(FakeBackend::new(destination));
+	backend.block_locks_from.send_replace(Some(0));
 	let (pause, _cancel, control) = controls();
 	let (running, _recorder, reporter) = start(&backend, plan(destination, vec![source]), control);
 
@@ -1803,10 +1819,10 @@ async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
 #[tokio::test(start_paused = true)]
 async fn cancel_ends_a_drive_lock_wait_while_propagating_to_new_shares() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.later_targets = Some(ConnectedTargets::with_test_users(1));
 	// the file's registration takes the lock first; the propagation afterwards waits
-	backend.block_locks_from.store(1, Ordering::SeqCst);
+	backend.block_locks_from.send_replace(Some(1));
 	let backend = Arc::new(backend);
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(
@@ -1840,8 +1856,8 @@ async fn cancel_ends_a_drive_lock_wait_while_propagating_to_new_shares() {
 async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
-	backend.block_locks_from.store(1, Ordering::SeqCst);
+	let backend = Arc::new(FakeBackend::new(destination));
+	backend.block_locks_from.send_replace(Some(1));
 	let (pause, _cancel, control) = controls();
 	let (running, _recorder, reporter) = start(&backend, plan(destination, vec![source]), control);
 
@@ -1873,8 +1889,8 @@ async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it()
 async fn cancel_ends_a_directory_create_waiting_for_a_fresh_lock() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
-	backend.block_locks_from.store(1, Ordering::SeqCst);
+	let backend = Arc::new(FakeBackend::new(destination));
+	backend.block_locks_from.send_replace(Some(1));
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(&backend, plan(destination, vec![source]), control);
 
@@ -1915,7 +1931,7 @@ async fn names_are_checked_before_use_only_when_the_listing_hid_some() {
 	for unverified in [false, true] {
 		let destination = Uuid::new_v4();
 		let (_, _, sources) = top_dir_and_file();
-		let backend = Arc::new(FakeBackend::new(4, &[destination]));
+		let backend = Arc::new(FakeBackend::new(destination));
 		let (running, _recorder, _reporter) = start(
 			&backend,
 			plan_with(destination, sources, unverified),
@@ -1944,7 +1960,7 @@ async fn names_are_checked_before_use_only_when_the_listing_hid_some() {
 async fn a_taken_top_level_name_moves_to_the_next_keep_both_name() {
 	let destination = Uuid::new_v4();
 	let (_, _, sources) = top_dir_and_file();
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend
 		.existing
 		.lock()
@@ -1978,7 +1994,7 @@ async fn a_taken_top_level_name_moves_to_the_next_keep_both_name() {
 async fn a_name_taken_during_the_copy_is_caught_before_the_file_is_registered() {
 	let destination = Uuid::new_v4();
 	let file = source_file("big.bin", 4 * CHUNK_SIZE_U64);
-	let backend = Arc::new(FakeBackend::new(2, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination).with_memory(2));
 	let (running, _recorder, _reporter) = start(
 		&backend,
 		plan(destination, vec![PlanSource::File(file)]),
@@ -2000,7 +2016,7 @@ async fn a_name_taken_during_the_copy_is_caught_before_the_file_is_registered() 
 async fn a_file_gives_up_after_the_bounded_number_of_taken_names() {
 	let destination = Uuid::new_v4();
 	let file = source_file("a.txt", 10);
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend.existing.lock().unwrap().extend(
 		std::iter::once("a.txt".to_owned())
 			.chain((1..=TOP_LEVEL_NAME_ATTEMPTS).map(|n| format!("a ({n}).txt"))),
@@ -2030,7 +2046,7 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	let clashing = source_file("a.txt", CHUNK_SIZE_U64 + 5);
 	let other = source_file("b.txt", 10);
 	let existing = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.version_of.insert("a.txt".to_owned(), existing);
 	let backend = Arc::new(backend);
 	let (running, recorder, reporter) = start(
@@ -2128,7 +2144,7 @@ async fn a_deep_chain_is_created_parent_first() {
 		.collect();
 	let deepest = chain.last().unwrap();
 	let source = tree(&root, dirs, vec![listed(deepest, source_file("bottom", 3))]);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, recorder, reporter) = start(
 		&backend,
 		plan(destination, vec![source]),
@@ -2149,7 +2165,7 @@ async fn a_deep_chain_is_created_parent_first() {
 async fn an_empty_directory_is_created_alone() {
 	let destination = Uuid::new_v4();
 	let empty = source_dir("Empty");
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, recorder, _reporter) = start(
 		&backend,
 		plan(destination, vec![tree(&empty, Vec::new(), Vec::new())]),
@@ -2166,7 +2182,7 @@ async fn an_empty_directory_is_created_alone() {
 async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
 	let destination = Uuid::new_v4();
 	let source = source_file_with_wrong_hash("a.txt", CHUNK_SIZE_U64 + 3);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, _recorder, _reporter) = start(
 		&backend,
 		plan(destination, vec![PlanSource::File(source.clone())]),
@@ -2185,7 +2201,7 @@ async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
 #[tokio::test(start_paused = true)]
 async fn an_inconsistent_chunk_count_fails_the_file() {
 	let destination = Uuid::new_v4();
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, _recorder, reporter) = start(
 		&backend,
 		plan(
@@ -2205,7 +2221,7 @@ async fn an_inconsistent_chunk_count_fails_the_file() {
 #[tokio::test(start_paused = true)]
 async fn a_short_file_fails_as_a_download() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.short_reads.insert("short".to_owned());
 	let backend = Arc::new(backend);
 	let (running, _recorder, reporter) = start(
@@ -2232,7 +2248,7 @@ async fn a_short_file_fails_as_a_download() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_upload_is_an_upload_failure() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_upload
 		.insert("a.txt".to_owned(), ErrorKind::Server);
@@ -2260,7 +2276,7 @@ async fn a_failed_upload_is_an_upload_failure() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_registration_is_a_finalize_failure() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_finish
 		.insert("a.txt".to_owned(), ErrorKind::Server);
@@ -2287,7 +2303,7 @@ async fn a_failed_registration_is_a_finalize_failure() {
 #[tokio::test(start_paused = true)]
 async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.fail_locks_from = Some((0, ErrorKind::Server));
 	let backend = Arc::new(backend);
 	let (running, _recorder, reporter) = start(
@@ -2304,7 +2320,7 @@ async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 async fn a_failed_drive_lock_ends_directory_creation() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(5);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.fail_locks_from = Some((0, ErrorKind::Server));
 	let backend = Arc::new(backend);
 	let (running, recorder, reporter) = start(
@@ -2326,7 +2342,7 @@ async fn a_fatal_error_during_directory_creation_ends_the_job() {
 	let destination = Uuid::new_v4();
 	// more directories than run at once, so some are never started
 	let (_, source) = wide_tree(3 * MAX_SMALL_PARALLEL_REQUESTS);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.fail_create
 		.insert("d3".to_owned(), ErrorKind::Unauthenticated);
@@ -2357,7 +2373,7 @@ async fn a_fatal_error_during_directory_creation_ends_the_job() {
 async fn a_failed_target_fetch_ends_the_job_before_anything_is_created() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.fail_targets = Some(ErrorKind::Server);
 	let backend = Arc::new(backend);
 	let (running, recorder, reporter) = start(
@@ -2378,7 +2394,7 @@ async fn a_failed_target_fetch_ends_the_job_before_anything_is_created() {
 async fn a_failed_color_is_reported_and_the_directory_kept() {
 	let destination = Uuid::new_v4();
 	let top = source_dir("Top");
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.fail_color = true;
 	let backend = Arc::new(backend);
 	let (running, recorder, _reporter) = start(
@@ -2401,7 +2417,7 @@ async fn a_failed_color_is_reported_and_the_directory_kept() {
 async fn a_failed_propagation_is_reported_and_the_copy_continues() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.targets = ConnectedTargets::with_test_users(1);
 	backend.fail_propagate = true;
 	let backend = Arc::new(backend);
@@ -2440,7 +2456,7 @@ async fn a_nested_directory_that_merges_is_a_failure() {
 		vec![listed(&top, sub.clone())],
 		vec![listed(&sub, source_file("inside", 4))],
 	);
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend.merge_once.lock().unwrap().insert("Sub".to_owned());
 	let backend = Arc::new(backend);
 	let (running, recorder, _reporter) = start(
@@ -2461,7 +2477,7 @@ async fn a_nested_directory_that_merges_is_a_failure() {
 async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
 	let destination = Uuid::new_v4();
 	let top = source_dir("Top");
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend.existing.lock().unwrap().extend(
 		std::iter::once("top".to_owned())
 			.chain((1..=TOP_LEVEL_NAME_ATTEMPTS).map(|n| format!("top ({n})"))),
@@ -2494,7 +2510,7 @@ async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
 async fn renames_found_by_the_name_checks_are_reported() {
 	let destination = Uuid::new_v4();
 	let (top, file, sources) = top_dir_and_file();
-	let backend = FakeBackend::new(4, &[destination]);
+	let backend = FakeBackend::new(destination);
 	backend
 		.existing
 		.lock()
@@ -2529,7 +2545,7 @@ async fn renames_found_by_the_name_checks_are_reported() {
 async fn pause_during_the_target_fetch_waits_and_resumes() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.targets_delay = Duration::from_secs(5);
 	let backend = Arc::new(backend);
 	let (pause, _cancel, control) = controls();
@@ -2556,7 +2572,7 @@ async fn pause_during_the_target_fetch_waits_and_resumes() {
 async fn pause_while_finishing_waits_and_resumes() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend.later_targets = Some(ConnectedTargets::with_test_users(1));
 	backend.targets_delay = Duration::from_secs(5);
 	let backend = Arc::new(backend);
@@ -2589,7 +2605,7 @@ async fn pause_while_finishing_waits_and_resumes() {
 async fn a_pause_controller_dropped_before_the_job_starts_lets_it_run() {
 	let destination = Uuid::new_v4();
 	let (_, source) = wide_tree(2);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (pause, _cancel, control) = controls();
 	pause.send_replace(true);
 	drop(pause);
@@ -2605,7 +2621,7 @@ async fn a_pause_controller_dropped_before_the_job_starts_lets_it_run() {
 #[tokio::test(start_paused = true)]
 async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(4, &[destination]);
+	let mut backend = FakeBackend::new(destination);
 	backend
 		.slow_finish
 		.insert("a.txt".to_owned(), Duration::from_secs(3));
@@ -2644,7 +2660,7 @@ async fn skips_and_renames_are_reported_before_anything_is_created() {
 			listed(&top, undecryptable_source_file(7)),
 		],
 	);
-	let backend = Arc::new(FakeBackend::new(4, &[destination]));
+	let backend = Arc::new(FakeBackend::new(destination));
 	let (running, recorder, _reporter) = start(
 		&backend,
 		plan(destination, vec![source]),
@@ -2669,7 +2685,7 @@ async fn the_estimate_counts_down_while_copying() {
 	let sources: Vec<_> = (0..40)
 		.map(|i| PlanSource::File(source_file(&format!("f{i}"), CHUNK_SIZE_U64)))
 		.collect();
-	let mut backend = FakeBackend::new(2, &[destination]);
+	let mut backend = FakeBackend::new(destination).with_memory(2);
 	backend.delay = Duration::from_millis(100);
 	let backend = Arc::new(backend);
 	let (running, recorder, _reporter) =
