@@ -140,7 +140,7 @@ pub(crate) struct PlannedTopLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	feature = "wasm-full",
 	derive(serde::Serialize, tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints),
 	serde(tag = "type", rename_all = "camelCase")
@@ -163,7 +163,7 @@ pub struct SkippedEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	feature = "wasm-full",
 	derive(serde::Serialize, tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")

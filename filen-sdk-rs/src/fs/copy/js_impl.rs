@@ -32,11 +32,7 @@ use super::{
 pub struct CopyEntry {
 	pub item: AnyItemWithContext,
 	pub destination: AnyNormalDir,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
-		serde(default),
-		tsify(optional)
-	)]
+	#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub name: Option<String>,
 }
@@ -580,7 +576,7 @@ mod uniffi_impl {
 	}
 }
 
-#[cfg(all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"))]
+#[cfg(feature = "wasm-full")]
 mod wasm_impl {
 	use std::sync::Arc;
 

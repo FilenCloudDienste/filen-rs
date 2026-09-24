@@ -34,7 +34,7 @@ use super::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	feature = "wasm-full",
 	derive(serde::Serialize, tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -56,7 +56,7 @@ pub enum CopyPhase {
 /// Whether a copy is running, and how far a pause or cancel has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	feature = "wasm-full",
 	derive(serde::Serialize, tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints),
 	serde(rename_all = "camelCase")
@@ -119,7 +119,7 @@ pub struct ActiveFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
-	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	feature = "wasm-full",
 	derive(serde::Serialize, tsify::Tsify),
 	tsify(into_wasm_abi, large_number_types_as_bigints),
 	serde(
