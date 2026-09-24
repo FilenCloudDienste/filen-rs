@@ -7,16 +7,27 @@
 //!
 //! `#[ignore]`d: a scenario builds (and deletes) its whole tree on disk.
 //!
-//! Run one scenario, or all of them:
+//! Run one scenario, a list of them, or a named set. `--exact` is not optional: cargo's test filter
+//! is a SUBSTRING match, so a bare `sync_engine_bench` also selects `sync_engine_bench_compare`.
 //!
 //! ```sh
 //! SYNC_BENCH_SCENARIO=twoway_one_file_10k SYNC_BENCH_OUT=/tmp/bench \
 //!   cargo test -p filen-sdk-rs -F sync-engine,bench-internals \
-//!   --test sync_engine_bench -- --ignored --nocapture sync_engine_bench
+//!   --test sync_engine_bench -- --ignored --nocapture --exact sync_engine_bench
 //! ```
 //!
-//! `SYNC_BENCH_SCENARIO` defaults to `all`, `SYNC_BENCH_SAMPLES` to 3, and `SYNC_BENCH_OUT` to the
-//! temp directory. Each run writes ONE fresh JSON file and never appends to an existing one.
+//! Compare two runs:
+//!
+//! ```sh
+//! SYNC_BENCH_COMPARE=/tmp/bench/before.json,/tmp/bench/after.json \
+//!   cargo test -p filen-sdk-rs -F sync-engine,bench-internals \
+//!   --test sync_engine_bench -- --ignored --nocapture --exact sync_engine_bench_compare
+//! ```
+//!
+//! `SYNC_BENCH_SCENARIO` takes one name, a comma-separated list, `default` (every scenario but the
+//! three 1M rows) or `all`; it defaults to `default`. `SYNC_BENCH_SAMPLES` defaults to 3, and
+//! `SYNC_BENCH_OUT` to the temp directory. Each run writes ONE fresh JSON file and never appends to
+//! an existing one.
 
 use filen_sdk_rs::sync_engine::bench;
 
@@ -24,6 +35,29 @@ use filen_sdk_rs::sync_engine::bench;
 #[ignore = "cost harness: builds a tree on disk; run it explicitly"]
 fn sync_engine_bench() {
 	match bench::run() {
+		Ok(report) => println!("{report}"),
+		Err(error) => panic!("{error}"),
+	}
+}
+
+#[test]
+#[ignore = "reads two result files named by SYNC_BENCH_COMPARE"]
+fn sync_engine_bench_compare() {
+	// Skipped rather than failed when nothing named two files. This test gets SELECTED
+	// incidentally — cargo's filter is a substring match, so `-- ... sync_engine_bench` picks it up
+	// alongside the run above — and panicking here failed a run whose measurement had already been
+	// written to disk, taking any CI job wired to the documented command red on every good run.
+	let Ok(raw) = std::env::var("SYNC_BENCH_COMPARE") else {
+		println!(
+			"SYNC_BENCH_COMPARE is unset, so there are no two files to diff; set it to \
+			 <before.json>,<after.json> to run this."
+		);
+		return;
+	};
+	let (before, after) = raw
+		.split_once(',')
+		.expect("SYNC_BENCH_COMPARE is <before.json>,<after.json>");
+	match bench::compare(before.trim().as_ref(), after.trim().as_ref()) {
 		Ok(report) => println!("{report}"),
 		Err(error) => panic!("{error}"),
 	}
