@@ -37,6 +37,7 @@ use super::{
 	plan::{RemoteNode, RemoteView},
 	scan::collision_key,
 	side::{Nodes, NodesAt},
+	tree::Baseline,
 };
 use crate::Error;
 
@@ -423,6 +424,8 @@ where
 	Fut: Future<Output = Result<Vec<u8>, Error>>,
 {
 	let view = candidates.view;
+	// Captured before `candidates.paths` is moved out below, which partially moves `candidates`.
+	let rule_baseline = candidates.baseline;
 	let mut out = RemoteRules {
 		rules: IgnoreRules::new(user),
 		..RemoteRules::default()
@@ -441,10 +444,13 @@ where
 	// pass offers the resident index AND the paths its delta moved, and a rule file that moved is
 	// in both — without the file being read, reported or blocked twice.
 	let named: BTreeSet<String> = candidates.paths.into_iter().collect();
+	// BOUND, not read through a temporary: each node comes back as a `Cow` borrowed from the
+	// reader, and a carried side builds those on the spot.
+	let view_nodes = view.nodes.of(rule_baseline);
 	let mut candidates: Vec<(&str, Cow<'_, RemoteNode>)> = named
 		.iter()
 		.filter_map(|rel_path| {
-			let node = view.nodes.at(rel_path)?;
+			let node = view_nodes.at(rel_path)?;
 			(node.kind == NodeKind::File).then_some((rule_file_dir(rel_path)?, node))
 		})
 		.collect();
@@ -535,6 +541,9 @@ fn too_large() -> String {
 /// still there, and what else the pass is holding back.
 pub(crate) struct RuleCandidates<'a> {
 	pub(crate) view: &'a RemoteView,
+	/// The tree the view's carried half derives its nodes from (see
+	/// [`Side::of`](super::side::Side::of)).
+	pub(crate) baseline: &'a Baseline,
 	pub(crate) paths: Vec<String>,
 }
 
@@ -543,8 +552,9 @@ pub(crate) struct RuleCandidates<'a> {
 /// finding them costs the scan of a map it just built. A change-scoped pass has the opposite — no
 /// map worth scanning and an index that answers — and names them from
 /// [`Baseline::rule_file_rows`](super::tree::Baseline::rule_file_rows) instead.
-pub(crate) fn rule_file_paths(view: &RemoteView) -> Vec<String> {
+pub(crate) fn rule_file_paths(view: &RemoteView, baseline: &Baseline) -> Vec<String> {
 	view.nodes
+		.of(baseline)
 		.iter()
 		.filter(|(rel_path, node)| node.kind == NodeKind::File && rule_file_dir(rel_path).is_some())
 		.map(|(rel_path, _)| rel_path.into_owned())
@@ -951,8 +961,11 @@ mod tests {
 		bodies: &HashMap<&str, Vec<u8>>,
 		cached: &HashMap<Uuid, Arc<str>>,
 	) -> (RemoteRules, Vec<String>) {
+		// A whole-read view: its backing never consults a baseline, so an empty one is exact.
+		let no_baseline = Baseline::default();
 		let paths: HashMap<Uuid, String> = view
 			.nodes
+			.of(&no_baseline)
 			.iter()
 			.map(|(_, node)| (node.remote_uuid, node.rel_path.clone()))
 			.collect();
@@ -961,7 +974,8 @@ mod tests {
 			mode,
 			RuleCandidates {
 				view,
-				paths: rule_file_paths(view),
+				baseline: &no_baseline,
+				paths: rule_file_paths(view, &no_baseline),
 			},
 			None,
 			|dir| on_disk.contains(&dir),

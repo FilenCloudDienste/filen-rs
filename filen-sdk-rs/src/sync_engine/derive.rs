@@ -52,7 +52,7 @@ use super::{
 	observe::{LocalObservation, LocalObservations},
 	plan::{self, RemoteNode},
 	scan::LocalNode,
-	side::{Nodes, Side},
+	side::{FromRow, Nodes, Side},
 	tree::Baseline,
 };
 
@@ -94,8 +94,10 @@ pub(super) struct Derived {
 /// dirty set" rule a property of this function instead of a check every caller has to remember.
 pub(super) fn from_baseline(baseline: &Baseline, dirty: BTreeSet<String>) -> Derived {
 	let mut out = Derived {
-		local: Side::with_capacity(baseline.len()),
-		remote: Side::with_capacity(baseline.len()),
+		// Nothing is carried INTO anything: a path no producer touches is answered from its own
+		// row when it is asked about, so the pass starts with no per-tree data at all.
+		local: Side::carried(),
+		remote: Side::carried(),
 		// The pass decides everything it set out to look at, whether or not it found a change
 		// there: a path the changelist named and the disk answered "unchanged" for costs one
 		// no-op decision, and leaving it out would need the observation to be consulted first.
@@ -103,20 +105,36 @@ pub(super) fn from_baseline(baseline: &Baseline, dirty: BTreeSet<String>) -> Der
 		dirty,
 		held: BTreeSet::new(),
 	};
-	// One walk, one classification: the maps and the dirty set come out of the same decision per
-	// row, so a row can never be left out of a map without its path being held.
-	baseline.visit_rows(|row| match carried(row) {
-		Some((local, remote)) => {
-			out.local.insert(row.rel_path.clone(), local);
-			out.remote.insert(row.rel_path.clone(), remote);
-		}
-		None => {
-			out.dirty.insert(row.rel_path.clone());
-			out.held.insert(row.rel_path.clone());
-			out.decided.insert(row.rel_path.clone());
-		}
-	});
+	// The rows that stand in for NEITHER side, from the tree's own index
+	// ([`Baseline::uncarryable_paths`]) rather than from a visit of every row. Each is re-observed
+	// on disk (dirty), decided, and held — the three in ONE statement, so a row cannot come to be
+	// left out of a side without its path being held, which is what keeps a half-recorded row from
+	// reading downstream as a deletion. The rows that CAN be carried are not touched at all: they
+	// answer for themselves when a consumer asks about them.
+	for path in baseline.uncarryable_paths() {
+		out.dirty.insert(path.clone());
+		out.held.insert(path.clone());
+		out.decided.insert(path);
+	}
 	out
+}
+
+/// The two sides derive their halves from one row through [`carried`], so neither can come to
+/// carry a row the other does not.
+///
+/// Both halves are built to hand one back, which is deliberate: the pair is what makes the rule
+/// un-splittable. The cost is per LOOKUP rather than per row, and a change-scoped pass looks at
+/// the paths it decided — where materializing the tree cost one of these per row in it.
+impl FromRow for LocalNode {
+	fn from_row(row: &BaselineEntry) -> Option<Self> {
+		carried(row).map(|(local, _)| local)
+	}
+}
+
+impl FromRow for RemoteNode {
+	fn from_row(row: &BaselineEntry) -> Option<Self> {
+		carried(row).map(|(_, remote)| remote)
+	}
 }
 
 /// The two nodes a row stands in for, or `None` when it stands in for neither.
@@ -208,7 +226,7 @@ pub(super) fn merge_local(
 					let pruned: BTreeSet<String> = observation.uncovered_roots().cloned().collect();
 					drop_rows(derived, baseline, at, &pruned);
 				}
-				for (rel_path, node) in scan.nodes.iter() {
+				for (rel_path, node) in scan.nodes.of(baseline).iter() {
 					derived.decided.insert(rel_path.to_string());
 					derived
 						.local
@@ -255,13 +273,16 @@ fn drop_rows(
 	pruned: &BTreeSet<String>,
 ) -> bool {
 	let mut dropped = false;
-	if !at.is_empty() && !plan::at_or_under_root(pruned, at) && derived.local.remove(at).is_some() {
+	if !at.is_empty()
+		&& !plan::at_or_under_root(pruned, at)
+		&& derived.local.remove(baseline, at).is_some()
+	{
 		derived.decided.insert(at.to_owned());
 		dropped = true;
 	}
 	for row in baseline.subtree(at) {
 		if !plan::at_or_under_root(pruned, &row.rel_path)
-			&& derived.local.remove(&row.rel_path).is_some()
+			&& derived.local.remove(baseline, &row.rel_path).is_some()
 		{
 			derived.decided.insert(row.rel_path);
 			dropped = true;
@@ -369,6 +390,7 @@ mod tests {
 			.cloned()
 			.partition(|item| item.stable_uuid.is_none());
 		let mut view = place_remote_items(REMOTE_ROOT, &dirs, &files, &[]);
+		// A whole-read view: its backing never consults a baseline, so an empty one is exact.
 		view.filter(None);
 		view
 	}
@@ -410,6 +432,7 @@ mod tests {
 			assert!(scanned.complete, "{:?}", scanned.errors);
 			let mut paths: Vec<String> = scanned
 				.nodes
+				.whole()
 				.paths()
 				.map(|path| path.into_owned())
 				.collect();
@@ -421,15 +444,18 @@ mod tests {
 				.collect();
 			let items: Vec<RemoteItem> = scanned
 				.nodes
+				.whole()
 				.iter()
 				.map(|(_, node)| item_of(&node, &uuids))
 				.collect();
 			let remote = view(&items);
+			let remote_nodes = remote.nodes.whole();
 			let rows = scanned
 				.nodes
+				.whole()
 				.iter()
 				.map(|(_, node)| {
-					let at = remote.nodes.at(&node.rel_path).expect("the view holds it");
+					let at = remote_nodes.at(&node.rel_path).expect("the view holds it");
 					synced_row(&node, &at)
 				})
 				.collect();
@@ -524,8 +550,8 @@ mod tests {
 		plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
-			&derived.local,
-			&derived.remote,
+			&derived.local.of(baseline),
+			&derived.remote.of(baseline),
 			&holds,
 			plan::PassPaths::Changed(&derived.decided),
 		)
@@ -542,14 +568,25 @@ mod tests {
 	/// difference derivation cannot avoid named rather than skipped: a directory row records no
 	/// remote stamp, so a derived directory carries `0` where the view carries the server's created
 	/// stamp (see the module docs).
-	fn assert_same_maps(derived: &Derived, local: &Side<LocalNode>, remote: &Side<RemoteNode>) {
+	fn assert_same_maps(
+		baseline: &Baseline,
+		derived: &Derived,
+		local: &Side<LocalNode>,
+		remote: &Side<RemoteNode>,
+	) {
+		// Bound once: each reader hands back a `Cow` borrowed from itself, which a carried side
+		// builds on the spot, so a reader made fresh per statement dies under the value it lent.
+		let derived_local = derived.local.of(baseline);
+		let derived_remote = derived.remote.of(baseline);
+		let local_nodes = local.whole();
+		let remote_nodes = remote.whole();
 		assert_eq!(
-			sorted(derived.local.paths().map(|path| path.into_owned())),
-			sorted(local.paths().map(|path| path.into_owned())),
+			sorted(derived_local.paths().map(|path| path.into_owned())),
+			sorted(local_nodes.paths().map(|path| path.into_owned())),
 			"the derived local map holds exactly the paths a whole-tree scan does"
 		);
-		for (path, node) in local.iter() {
-			let at = derived.local.at(&path).expect("the derived map holds it");
+		for (path, node) in local_nodes.iter() {
+			let at = derived_local.at(&path).expect("the derived map holds it");
 			let (derived_node, node) = (&*at, &*node);
 			if node.kind == NodeKind::Dir {
 				assert_eq!(
@@ -564,18 +601,18 @@ mod tests {
 				assert_eq!(derived_node, node, "local node at {path:?}");
 			}
 		}
-		let visible: Vec<String> = remote
+		let visible: Vec<String> = remote_nodes
 			.paths()
 			.filter(|path| !derived.held.contains(path.as_ref()))
 			.map(|path| path.into_owned())
 			.collect();
 		assert_eq!(
-			sorted(derived.remote.paths().map(|path| path.into_owned())),
+			sorted(derived_remote.paths().map(|path| path.into_owned())),
 			sorted(visible),
 			"the derived remote map holds every path the view does, bar the withheld ones"
 		);
-		for (path, node) in remote.iter() {
-			let Some(at) = derived.remote.at(&path) else {
+		for (path, node) in remote_nodes.iter() {
+			let Some(at) = derived_remote.at(&path) else {
 				continue;
 			};
 			let (derived_node, node) = (&*at, &*node);
@@ -614,16 +651,16 @@ mod tests {
 		let whole = plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
-			local,
-			remote,
+			&local.whole(),
+			&remote.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		);
 		let scoped = plan::reconcile(
 			SyncMode::TwoWay,
 			baseline,
-			&derived.local,
-			&derived.remote,
+			&derived.local.of(baseline),
+			&derived.remote.of(baseline),
 			&holds,
 			plan::PassPaths::Whole,
 		);
@@ -658,7 +695,7 @@ mod tests {
 			"every row records both sides: {:?}",
 			derived.held
 		);
-		assert_same_maps(&derived, &local, &remote.nodes);
+		assert_same_maps(&baseline, &derived, &local, &remote.nodes);
 		let actions = assert_same_plan(&baseline, &derived, &local, &remote.nodes);
 		assert!(
 			actions.is_empty(),
@@ -688,16 +725,18 @@ mod tests {
 			"kept-local.txt",
 			"kept-remote.txt",
 		];
+		let scanned_nodes = scanned.nodes.whole();
 		for (at, path) in anomalies.iter().enumerate() {
 			let uuid = Uuid::from_u128(900 + at as u128);
 			pair.uuids.insert((*path).to_string(), uuid);
-			let node = scanned.nodes.at(path).expect("the scan holds it");
+			let node = scanned_nodes.at(path).expect("the scan holds it");
 			pair.items.push(item_of(&node, &pair.uuids));
 		}
 		let remote_view = view(&pair.items);
+		let view_nodes = remote_view.nodes.whole();
 		for path in anomalies {
-			let node = scanned.nodes.at(path).expect("the scan holds it");
-			let at = remote_view.nodes.at(path).expect("the view holds it");
+			let node = scanned_nodes.at(path).expect("the scan holds it");
+			let at = view_nodes.at(path).expect("the view holds it");
 			let row = synced_row(&node, &at);
 			pair.rows.push(match path {
 				"conflict.txt" => BaselineEntry {
@@ -756,12 +795,14 @@ mod tests {
 			derived.dirty
 		);
 		assert!(
-			anomalies.iter().all(|path| !derived.remote.holds(path)),
+			anomalies
+				.iter()
+				.all(|path| !derived.remote.of(&baseline).holds(path)),
 			"nothing is derived from a half-written row"
 		);
 		// The local side is not derived from them either — it is observed, which is why the map is
 		// still whole.
-		assert_same_maps(&derived, &local, &remote.nodes);
+		assert_same_maps(&baseline, &derived, &local, &remote.nodes);
 		let actions = assert_same_plan(&baseline, &derived, &local, &remote.nodes);
 		assert!(
 			!actions.iter().any(|action| matches!(
@@ -828,7 +869,7 @@ mod tests {
 		let (local, remote) = pair.whole_tree(&baseline);
 
 		assert!(derived.held.is_empty(), "{:?}", derived.held);
-		assert_same_maps(&derived, &local, &remote.nodes);
+		assert_same_maps(&baseline, &derived, &local, &remote.nodes);
 		let actions = assert_same_plan(&baseline, &derived, &local, &remote.nodes);
 		assert!(
 			actions.len() >= 6,
@@ -921,16 +962,19 @@ mod tests {
 		let (local, remote) = pair.whole_tree(&baseline);
 
 		assert!(
-			local.holds("docs") && !derived.local.holds("docs"),
+			local.whole().holds("docs") && !derived.local.of(&baseline).holds("docs"),
 			"a whole-tree scan sees the directory; derivation has no row to carry"
 		);
-		assert!(!derived.remote.holds("docs"), "and no remote node either");
+		assert!(
+			!derived.remote.of(&baseline).holds("docs"),
+			"and no remote node either"
+		);
 		let holds = PassHolds::default();
 		let scoped = plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&derived.local,
-			&derived.remote,
+			&derived.local.of(&baseline),
+			&derived.remote.of(&baseline),
 			&holds,
 			plan::PassPaths::Whole,
 		);
@@ -945,8 +989,8 @@ mod tests {
 		let whole = plan::reconcile(
 			SyncMode::TwoWay,
 			&baseline,
-			&local,
-			&remote.nodes,
+			&local.whole(),
+			&remote.nodes.whole(),
 			&holds,
 			plan::PassPaths::Whole,
 		);
@@ -985,15 +1029,34 @@ mod tests {
 		let derived = from_baseline(&baseline, BTreeSet::new());
 
 		assert_eq!(
-			sorted(derived.local.paths().map(|path| path.into_owned())),
+			sorted(
+				derived
+					.local
+					.of(&baseline)
+					.paths()
+					.map(|path| path.into_owned())
+			),
 			vec!["A.txt", "a.txt"]
 		);
 		assert_eq!(
-			derived.remote.at("A.txt").unwrap().remote_uuid,
+			derived
+				.remote
+				.of(&baseline)
+				.at("A.txt")
+				.unwrap()
+				.remote_uuid,
 			uuid(1),
 			"the folded name is not the key"
 		);
-		assert_eq!(derived.remote.at("a.txt").unwrap().remote_uuid, uuid(2));
+		assert_eq!(
+			derived
+				.remote
+				.of(&baseline)
+				.at("a.txt")
+				.unwrap()
+				.remote_uuid,
+			uuid(2)
+		);
 	}
 
 	/// What a walk PRUNED it never looked at: the rows under an ignored entry stay, while the rows
@@ -1023,15 +1086,21 @@ mod tests {
 		let derived = pair.derived(&baseline, dirty_paths(&["docs"]), &[]);
 
 		assert!(
-			!derived.local.holds("docs/notes.txt"),
+			!derived.local.of(&baseline).holds("docs/notes.txt"),
 			"the walk covered it and did not find it"
 		);
 		assert!(
-			derived.local.holds("docs/.DS_Store"),
+			derived.local.of(&baseline).holds("docs/.DS_Store"),
 			"the walk pruned it, so its row is not evidence of absence: {:?}",
-			sorted(derived.local.paths().map(|path| path.into_owned()))
+			sorted(
+				derived
+					.local
+					.of(&baseline)
+					.paths()
+					.map(|path| path.into_owned())
+			)
 		);
-		assert!(derived.local.holds("docs/deep/inner.bin"));
+		assert!(derived.local.of(&baseline).holds("docs/deep/inner.bin"));
 	}
 
 	/// A path the rules hide is taken out of the LOCAL map as well as the remote one, and held
@@ -1083,12 +1152,18 @@ mod tests {
 
 		for path in ["docs/deep", "docs/deep/inner.bin"] {
 			assert!(
-				!derived.local.holds(path),
+				!derived.local.of(&baseline).holds(path),
 				"the local half still describes {path:?}: {:?}",
-				sorted(derived.local.paths().map(|path| path.into_owned()))
+				sorted(
+					derived
+						.local
+						.of(&baseline)
+						.paths()
+						.map(|path| path.into_owned())
+				)
 			);
 			assert!(
-				!derived.remote.holds(path),
+				!derived.remote.of(&baseline).holds(path),
 				"the remote half still describes {path:?}"
 			);
 		}
@@ -1130,9 +1205,15 @@ mod tests {
 		merge_local(&mut derived, &baseline, &observed);
 
 		assert!(
-			derived.local.holds("docs/deep/inner.bin"),
+			derived.local.of(&baseline).holds("docs/deep/inner.bin"),
 			"an unreadable subtree's rows are carried, not deleted: {:?}",
-			sorted(derived.local.paths().map(|path| path.into_owned()))
+			sorted(
+				derived
+					.local
+					.of(&baseline)
+					.paths()
+					.map(|path| path.into_owned())
+			)
 		);
 	}
 
@@ -1265,7 +1346,7 @@ mod tests {
 
 		merge_local(&mut derived, &baseline, &observed);
 
-		assert!(derived.local.holds("top.txt"));
-		assert!(derived.local.holds("docs/deep/inner.bin"));
+		assert!(derived.local.of(&baseline).holds("top.txt"));
+		assert!(derived.local.of(&baseline).holds("docs/deep/inner.bin"));
 	}
 }
