@@ -104,13 +104,27 @@ const CONTENDING_READ: Duration = Duration::from_millis(500);
 const CONTENDED_WRITE: Duration = Duration::from_millis(5_000);
 
 /// The tree's shape, as `SYNC_PROBE_SHAPE` gives it.
-struct Shape {
+pub(super) struct Shape {
 	files_per_leaf: usize,
 	depth: usize,
 	file_bytes: usize,
 }
 
 impl Shape {
+	/// A shape named outright, for a caller that has one rather than an environment to read it
+	/// from (the named scenarios in [`bench`](super::bench)).
+	pub(super) fn new(files_per_leaf: usize, depth: usize, file_bytes: usize) -> Self {
+		assert!(
+			depth > 0 && files_per_leaf > 0,
+			"a shape needs at least one level and one file per leaf"
+		);
+		Self {
+			files_per_leaf,
+			depth,
+			file_bytes,
+		}
+	}
+
 	fn from_env() -> Self {
 		let raw = std::env::var("SYNC_PROBE_SHAPE").unwrap_or_else(|_| DEFAULT_SHAPE.to_owned());
 		let mut parts = raw.split(',').map(|part| {
@@ -160,7 +174,7 @@ struct PassPlace {
 }
 
 /// The temp tree, its cache DB and its baseline DB.
-struct Fixture {
+pub(super) struct Fixture {
 	dir: PathBuf,
 	root: PathBuf,
 	cache_db: PathBuf,
@@ -171,8 +185,24 @@ struct Fixture {
 }
 
 impl Fixture {
-	fn nodes(&self) -> usize {
+	pub(super) fn nodes(&self) -> usize {
 		self.dirs + self.files
+	}
+
+	pub(super) fn root(&self) -> &Path {
+		&self.root
+	}
+
+	pub(super) fn cache_db(&self) -> &Path {
+		&self.cache_db
+	}
+
+	pub(super) fn baseline_db(&self) -> &Path {
+		&self.baseline_db
+	}
+
+	pub(super) fn remote_root(&self) -> Uuid {
+		self.remote_root
 	}
 
 	fn place(&self) -> PassPlace {
@@ -185,7 +215,7 @@ impl Fixture {
 
 	/// Write the tree to disk AND the matching remote mirror into a cache DB, so the two sides are
 	/// converged by construction and a pass over them plans nothing.
-	fn build(n: usize, shape: &Shape) -> Self {
+	pub(super) fn build(n: usize, shape: &Shape) -> Self {
 		let dir = std::env::temp_dir().join(format!("filen_sync_probe_{}", Uuid::new_v4()));
 		let root = dir.join("root");
 		fs::create_dir_all(&root).expect("creating the probe root");
@@ -222,6 +252,17 @@ impl Fixture {
 			files: files.len(),
 			dir,
 		}
+	}
+}
+
+/// The whole temp tree goes when the fixture does — on a panic as much as on the way out.
+///
+/// A benchmark's assertions are its point, and every one of them fires BEFORE the end of the
+/// function that built the fixture. Cleaning up by hand at the end of that function meant any
+/// assertion doing its job left the tree behind — up to ~4.7 GB of it at a million rows.
+impl Drop for Fixture {
+	fn drop(&mut self) {
+		fs::remove_dir_all(&self.dir).ok();
 	}
 }
 
@@ -734,7 +775,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 		.unwrap_or(default)
 }
 
-fn probe_rules() -> IgnoreRules {
+pub(super) fn probe_rules() -> IgnoreRules {
 	IgnoreRules::new(Some(
 		parse_user_ignore(PROBE_RULES).expect("the probe's user patterns compile"),
 	))
@@ -742,7 +783,7 @@ fn probe_rules() -> IgnoreRules {
 
 /// A fully synced baseline for the scanned tree: what a pair looks like the pass after it
 /// converged, which is the state every steady-state measurement is taken in.
-fn baseline_rows(scan: &LocalScan, remote: &Side<RemoteNode>) -> Vec<BaselineEntry> {
+pub(super) fn baseline_rows(scan: &LocalScan, remote: &Side<RemoteNode>) -> Vec<BaselineEntry> {
 	let remote_nodes = remote.whole();
 	scan.nodes
 		.whole()
