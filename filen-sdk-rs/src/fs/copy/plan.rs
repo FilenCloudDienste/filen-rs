@@ -7,7 +7,10 @@
 //! decrypted is created under its uuid so its readable contents are still copied. A file
 //! whose metadata cannot be decrypted has no key to read it with, so it is skipped.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, HashSet, VecDeque},
+};
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
@@ -27,7 +30,7 @@ use super::naming::{SourceName, TakenNames};
 
 /// A source directory, independent of the category it was listed from.
 #[derive(Debug, Clone)]
-pub(crate) struct SourceDir<D = ()> {
+pub(crate) struct SourceDir<D> {
 	pub(crate) uuid: Uuid,
 	/// `None` when the metadata could not be decrypted.
 	pub(crate) name: Option<String>,
@@ -62,7 +65,7 @@ pub(crate) struct Listed<T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum PlanSource<D = ()> {
+pub(crate) enum PlanSource<D> {
 	File(RemoteFileType<'static>),
 	Dir {
 		root: SourceDir<D>,
@@ -72,7 +75,7 @@ pub(crate) enum PlanSource<D = ()> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlanRequest<D = ()> {
+pub(crate) struct PlanRequest<D> {
 	pub(crate) source: PlanSource<D>,
 	/// The existing directory the source is copied into.
 	pub(crate) destination: Uuid,
@@ -89,7 +92,7 @@ pub(crate) enum DestParent {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedDir<D = ()> {
+pub(crate) struct PlannedDir<D> {
 	/// Index of the request this directory belongs to.
 	pub(crate) request: usize,
 	pub(crate) source_uuid: Uuid,
@@ -191,7 +194,7 @@ pub struct PlanTotals {
 }
 
 #[derive(Debug)]
-pub(crate) struct CopyPlan<D = ()> {
+pub(crate) struct CopyPlan<D> {
 	/// Parent first: every directory comes after the directory it is created in.
 	pub(crate) dirs: Vec<PlannedDir<D>>,
 	pub(crate) files: Vec<PlannedFile>,
@@ -267,7 +270,7 @@ impl CopyPlanner {
 		}
 
 		let mut plan = CopyPlan {
-			unverified_destinations: std::mem::take(&mut self.unverified_destinations),
+			unverified_destinations: self.unverified_destinations,
 			..CopyPlan::default()
 		};
 		for (index, request) in requests.into_iter().enumerate() {
@@ -278,10 +281,7 @@ impl CopyPlanner {
 			let parent = DestParent::Existing(request.destination);
 			match request.source {
 				PlanSource::File(file) => {
-					let path = file
-						.name()
-						.map(str::to_owned)
-						.unwrap_or_else(|| file.uuid().to_string());
+					let path = path_segment(file.name(), file.uuid()).into_owned();
 					if let Some(file) = plan.plan_file(
 						index,
 						file,
@@ -364,13 +364,37 @@ fn allocate_name(
 	(allocated, reason)
 }
 
-/// Whether a rename is worth reporting. At the top level keep-both renames are expected and
-/// visible through the planned name, so only the other reasons are reported there.
-fn report_rename(reason: Option<RenameReason>, top_level: bool) -> Option<RenameReason> {
-	reason.filter(|reason| !top_level || *reason != RenameReason::DuplicateName)
+/// An item's segment of a source path: its name, or its uuid when its metadata could not be
+/// decrypted.
+fn path_segment(name: Option<&str>, uuid: Uuid) -> Cow<'_, str> {
+	name.map_or_else(|| Cow::Owned(uuid.to_string()), Cow::Borrowed)
 }
 
 impl<D> CopyPlan<D> {
+	/// Records a rename worth reporting. At the top level keep-both renames are expected and
+	/// visible through the planned name, so only the other reasons are reported there.
+	fn note_rename(
+		&mut self,
+		source_uuid: Uuid,
+		source_path: &str,
+		name: &ValidatedName,
+		reason: Option<RenameReason>,
+		top_level: bool,
+	) {
+		let Some(reason) =
+			reason.filter(|reason| !top_level || *reason != RenameReason::DuplicateName)
+		else {
+			return;
+		};
+		// the planned item keeps its own path and name
+		self.renamed.push(RenamedEntry {
+			source_uuid,
+			source_path: source_path.to_owned(),
+			name: name.clone(),
+			reason,
+		});
+	}
+
 	/// Plans `file` into `parent`, or records it as skipped when it cannot be read.
 	#[allow(clippy::too_many_arguments)]
 	fn plan_file(
@@ -392,16 +416,8 @@ impl<D> CopyPlan<D> {
 			});
 			return None;
 		}
-		let name = preferred.or(file.name()).map(str::to_owned);
-		let (name, reason) = allocate_name(taken, source_uuid, name.as_deref(), false);
-		if let Some(reason) = report_rename(reason, top_level) {
-			self.renamed.push(RenamedEntry {
-				source_uuid,
-				source_path: source_path.clone(),
-				name: name.clone(),
-				reason,
-			});
-		}
+		let (name, reason) = allocate_name(taken, source_uuid, preferred.or(file.name()), false);
+		self.note_rename(source_uuid, &source_path, &name, reason, top_level);
 		self.files.push(PlannedFile {
 			request,
 			size: file.size(),
@@ -425,16 +441,9 @@ impl<D> CopyPlan<D> {
 		source_path: String,
 		top_level: bool,
 	) -> usize {
-		let name = preferred.map(str::to_owned).or(dir.name);
-		let (name, reason) = allocate_name(taken, dir.uuid, name.as_deref(), true);
-		if let Some(reason) = report_rename(reason, top_level) {
-			self.renamed.push(RenamedEntry {
-				source_uuid: dir.uuid,
-				source_path: source_path.clone(),
-				name: name.clone(),
-				reason,
-			});
-		}
+		let (name, reason) =
+			allocate_name(taken, dir.uuid, preferred.or(dir.name.as_deref()), true);
+		self.note_rename(dir.uuid, &source_path, &name, reason, top_level);
 		self.dirs.push(PlannedDir {
 			request,
 			source_uuid: dir.uuid,
@@ -465,7 +474,7 @@ impl<D> CopyPlan<D> {
 		preferred: Option<&str>,
 		taken: &mut TakenNames,
 	) -> usize {
-		let root_path = root.name.clone().unwrap_or_else(|| root.uuid.to_string());
+		let root_path = path_segment(root.name.as_deref(), root.uuid).into_owned();
 		let root_uuid = root.uuid;
 
 		// children by parent uuid, keeping listing order
@@ -491,6 +500,7 @@ impl<D> CopyPlan<D> {
 		let mut queue = VecDeque::from([(root_uuid, root_index)]);
 		while let Some((source_uuid, planned_index)) = queue.pop_front() {
 			let parent = DestParent::Planned(planned_index);
+			// owned: `self.dirs` grows while the children are planned
 			let path = self.dirs[planned_index].source_path.clone();
 			let mut taken = TakenNames::default();
 			for dir in child_dirs.remove(&source_uuid).unwrap_or_default() {
@@ -499,21 +509,13 @@ impl<D> CopyPlan<D> {
 					continue;
 				}
 				let dir_uuid = dir.uuid;
-				let child_path = format!(
-					"{path}/{}",
-					dir.name.clone().unwrap_or_else(|| dir.uuid.to_string())
-				);
+				let child_path = format!("{path}/{}", path_segment(dir.name.as_deref(), dir.uuid));
 				let index =
 					self.push_dir(request, dir, parent, None, &mut taken, child_path, false);
 				queue.push_back((dir_uuid, index));
 			}
 			for file in child_files.remove(&source_uuid).unwrap_or_default() {
-				let child_path = format!(
-					"{path}/{}",
-					file.name()
-						.map(str::to_owned)
-						.unwrap_or_else(|| file.uuid().to_string())
-				);
+				let child_path = format!("{path}/{}", path_segment(file.name(), file.uuid()));
 				self.plan_file(request, file, parent, None, &mut taken, child_path, false);
 			}
 		}
@@ -578,11 +580,12 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		consts::CHUNK_SIZE_U64,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 		fs::file::{AnonymousRemoteFile, meta::DecryptedFileMeta, meta::FileMeta},
 	};
 
-	fn dir(name: Option<&str>) -> SourceDir {
+	fn dir(name: Option<&str>) -> SourceDir<()> {
 		SourceDir {
 			uuid: Uuid::new_v4(),
 			name: name.map(str::to_owned),
@@ -598,7 +601,7 @@ mod tests {
 			(),
 			Uuid::new_v4().into(),
 			size,
-			size.div_ceil(1024 * 1024),
+			size.div_ceil(CHUNK_SIZE_U64),
 			"de-1",
 			"bucket",
 			Utc::now(),
@@ -630,7 +633,7 @@ mod tests {
 		)
 	}
 
-	fn listed<T>(parent: &SourceDir, item: T) -> Listed<T> {
+	fn listed<T>(parent: &SourceDir<()>, item: T) -> Listed<T> {
 		Listed {
 			parent: parent.uuid,
 			item,
@@ -643,7 +646,7 @@ mod tests {
 		planner
 	}
 
-	fn request(source: PlanSource, destination: Uuid) -> PlanRequest {
+	fn request(source: PlanSource<()>, destination: Uuid) -> PlanRequest<()> {
 		PlanRequest {
 			source,
 			destination,
@@ -656,7 +659,7 @@ mod tests {
 	}
 
 	/// Every item comes after the directory it is created in.
-	fn assert_parent_first(plan: &CopyPlan) {
+	fn assert_parent_first(plan: &CopyPlan<()>) {
 		for (index, dir) in plan.dirs.iter().enumerate() {
 			if let DestParent::Planned(parent) = dir.parent {
 				assert!(parent < index, "dir {index} precedes its parent {parent}");

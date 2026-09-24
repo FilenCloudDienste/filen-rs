@@ -73,7 +73,7 @@ fn source_file_with_chunks(name: &str, size: u64, chunks: u64) -> RemoteFileType
 	RemoteFileType::File(Cow::Owned(file))
 }
 
-fn source_dir(name: &str) -> SourceDir {
+fn source_dir(name: &str) -> SourceDir<()> {
 	SourceDir {
 		uuid: Uuid::new_v4(),
 		name: Some(name.to_owned()),
@@ -461,12 +461,12 @@ impl Recorder {
 	}
 }
 
-fn plan(destination: Uuid, sources: Vec<PlanSource>) -> CopyPlan {
+fn plan(destination: Uuid, sources: Vec<PlanSource<()>>) -> CopyPlan<()> {
 	plan_with(destination, sources, false)
 }
 
 /// `unverified`: the destination listing had entries whose names it could not show.
-fn plan_with(destination: Uuid, sources: Vec<PlanSource>, unverified: bool) -> CopyPlan {
+fn plan_with(destination: Uuid, sources: Vec<PlanSource<()>>, unverified: bool) -> CopyPlan<()> {
 	let mut planner = CopyPlanner::default();
 	planner.add_destination(destination, std::iter::empty());
 	if unverified {
@@ -487,10 +487,10 @@ fn plan_with(destination: Uuid, sources: Vec<PlanSource>, unverified: bool) -> C
 }
 
 fn tree(
-	root: &SourceDir,
-	dirs: Vec<Listed<SourceDir>>,
+	root: &SourceDir<()>,
+	dirs: Vec<Listed<SourceDir<()>>>,
 	files: Vec<Listed<RemoteFileType<'static>>>,
-) -> PlanSource {
+) -> PlanSource<()> {
 	PlanSource::Dir {
 		root: root.clone(),
 		dirs,
@@ -498,7 +498,7 @@ fn tree(
 	}
 }
 
-fn listed<T>(parent: &SourceDir, item: T) -> Listed<T> {
+fn listed<T>(parent: &SourceDir<()>, item: T) -> Listed<T> {
 	Listed {
 		parent: parent.uuid,
 		item,
@@ -519,7 +519,7 @@ type Running = tokio::task::JoinHandle<CopyOutcome<()>>;
 
 fn start(
 	backend: &Arc<FakeBackend>,
-	plan: CopyPlan,
+	plan: CopyPlan<()>,
 	control: JobControl,
 ) -> (Running, Arc<Recorder>, MaybeArc<Reporter>) {
 	let recorder = Arc::new(Recorder::default());
@@ -957,7 +957,7 @@ async fn a_paused_job_holds_nothing_on_a_multi_threaded_runtime() {
 	assert_each_chunk_once(&backend);
 }
 
-fn wide_tree(dirs: usize) -> (SourceDir, PlanSource) {
+fn wide_tree(dirs: usize) -> (SourceDir<()>, PlanSource<()>) {
 	let root = source_dir("Root");
 	let children: Vec<_> = (0..dirs).map(|i| source_dir(&format!("d{i}"))).collect();
 	let files = children
@@ -1890,7 +1890,7 @@ async fn cancel_ends_a_directory_create_waiting_for_a_fresh_lock() {
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
 }
 
-fn top_dir_and_file() -> (SourceDir, RemoteFileType<'static>, Vec<PlanSource>) {
+fn top_dir_and_file() -> (SourceDir<()>, RemoteFileType<'static>, Vec<PlanSource<()>>) {
 	let top = source_dir("Top");
 	let file = source_file("a.txt", 2 * CHUNK_SIZE_U64);
 	let sources = vec![
