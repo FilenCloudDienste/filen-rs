@@ -30,10 +30,11 @@ use crate::{
 };
 
 use super::{
+	CopyFailed, CopyReport,
 	backend::ClientBackend,
 	engine::run_copy,
 	plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
-	report::{CopyCallback, CopyFailed, CopyPhase, CopyReport, Reporter, ScanProgress},
+	report::{CopyCallback, CopyPhase, Reporter, ScanProgress},
 };
 
 /// A directory to copy, with what is needed to list it.
@@ -173,7 +174,7 @@ impl Client {
 		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
-	) -> Result<CopyReport<CopySourceDir>, CopyFailed<CopySourceDir>> {
+	) -> Result<CopyReport, CopyFailed> {
 		let requests = sources
 			.into_iter()
 			.map(|source| CopyRequest {
@@ -204,7 +205,7 @@ impl Client {
 		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
-	) -> Result<CopyReport<CopySourceDir>, CopyFailed<CopySourceDir>> {
+	) -> Result<CopyReport, CopyFailed> {
 		let reporter = Reporter::new(callback);
 		let destination_dirs = requests
 			.iter()

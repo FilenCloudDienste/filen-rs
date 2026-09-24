@@ -216,8 +216,8 @@ impl TryFrom<CopyItem> for api::CopySource {
 	}
 }
 
-impl From<api::FailedSource<api::CopySourceDir>> for CopyItem {
-	fn from(source: api::FailedSource<api::CopySourceDir>) -> Self {
+impl From<api::FailedSource> for CopyItem {
+	fn from(source: api::FailedSource) -> Self {
 		match source {
 			api::FailedSource::File(file) => Self::File(AnyFile::from(*file)),
 			api::FailedSource::Dir(dir) => Self::Dir(match dir {
@@ -431,8 +431,8 @@ impl From<api::CopiedTopLevel> for CopiedTopLevelItem {
 	}
 }
 
-impl From<api::CopyReport<api::CopySourceDir>> for CopyReport {
-	fn from(report: api::CopyReport<api::CopySourceDir>) -> Self {
+impl From<api::CopyReport> for CopyReport {
+	fn from(report: api::CopyReport) -> Self {
 		Self {
 			top_level: report.top_level.into_iter().map(Into::into).collect(),
 			failures: report
@@ -452,8 +452,8 @@ impl From<api::CopyReport<api::CopySourceDir>> for CopyReport {
 	}
 }
 
-impl From<api::CopyFailed<api::CopySourceDir>> for CopyReport {
-	fn from(failed: api::CopyFailed<api::CopySourceDir>) -> Self {
+impl From<api::CopyFailed> for CopyReport {
+	fn from(failed: api::CopyFailed) -> Self {
 		Self {
 			error: Some(CopyError::from(failed.error.as_ref())),
 			..failed.report.into()
@@ -1018,12 +1018,12 @@ mod tests {
 
 	#[test]
 	fn a_report_carries_why_the_copy_ended() {
-		let cancelled = CopyReport::from(api::CopyFailed::<api::CopySourceDir> {
+		let cancelled = CopyReport::from(api::CopyFailed {
 			report: api::CopyReport::default(),
 			error: Arc::new(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
 		});
 		assert_eq!(cancelled.error.map(|e| e.kind), Some(ErrorKind::Cancelled));
-		let done = CopyReport::from(api::CopyReport::<api::CopySourceDir>::default());
+		let done = CopyReport::from(api::CopyReport::default());
 		assert!(done.error.is_none());
 	}
 

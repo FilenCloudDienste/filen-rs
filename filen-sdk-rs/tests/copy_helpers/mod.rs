@@ -12,7 +12,7 @@ use filen_sdk_rs::{
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopySource,
-			CopySourceDir, CopyUpdate, JobControl, JobController, PlannedTopLevelItem, RunState,
+			CopyUpdate, JobControl, JobController, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
@@ -93,7 +93,7 @@ pub async fn copy(
 	client: &Arc<Client>,
 	sources: Vec<CopySource>,
 	destination: &RemoteDirectory,
-) -> Result<CopyReport<CopySourceDir>, CopyFailed<CopySourceDir>> {
+) -> Result<CopyReport, CopyFailed> {
 	client
 		.clone()
 		.copy_items(
