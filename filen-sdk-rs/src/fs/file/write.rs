@@ -64,7 +64,7 @@ impl Future for DummyFuture {
 ///
 /// Returns the same buffer, cleared and still holding its memory reservation, together with
 /// where the server stored the chunk.
-pub(crate) async fn encrypt_and_upload_chunk<'a>(
+async fn encrypt_and_upload_chunk<'a>(
 	client: &Client,
 	file: &BaseFile,
 	upload_key: &str,

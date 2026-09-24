@@ -111,7 +111,7 @@ impl<'a> FileReaderBuilder<'a> {
 ///
 /// `progress` receives plaintext byte deltas while the chunk streams in, clamped to the chunk's
 /// plaintext length so the encryption overhead is never counted.
-pub(crate) async fn fetch_decrypted_chunk<'a>(
+async fn fetch_decrypted_chunk<'a>(
 	client: &UnauthClient,
 	file: &dyn File,
 	chunk_idx: u64,
