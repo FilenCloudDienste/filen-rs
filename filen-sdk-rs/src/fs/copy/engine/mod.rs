@@ -242,11 +242,20 @@ enum DirError {
 /// A downloaded chunk: its index, its plaintext, and the reservation it holds.
 type FetchedChunk = (u64, Result<Vec<u8>, Error>, ChunkReservation);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum DirState {
 	Pending,
-	Created(Uuid),
+	Created(RemoteDirectory),
 	Failed,
+}
+
+impl DirState {
+	fn created(&self) -> Option<&RemoteDirectory> {
+		match self {
+			Self::Created(dir) => Some(dir),
+			Self::Pending | Self::Failed => None,
+		}
+	}
 }
 
 struct Job<B: CopyBackend, D> {
@@ -254,9 +263,8 @@ struct Job<B: CopyBackend, D> {
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
 	plan: CopyPlan<D>,
+	/// Where each planned directory stands.
 	dir_states: Vec<DirState>,
-	/// Each planned directory once created.
-	created_dirs: Vec<Option<RemoteDirectory>>,
 	/// The destinations the top-level items are created in, by uuid.
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	/// Planned subdirectories of each planned directory.
@@ -322,7 +330,6 @@ where
 		control,
 		reporter,
 		dir_states: vec![DirState::Pending; plan.dirs.len()],
-		created_dirs: vec![None; plan.dirs.len()],
 		destination_dirs,
 		child_dirs,
 		targets: Vec::new(),
@@ -480,9 +487,10 @@ where
 				.expect("every destination is given")
 				.clone(),
 			DestParent::Planned(index) => DirType::Dir(Cow::Owned(
-				self.created_dirs[index]
-					.clone()
-					.expect("an item is only attempted once its parent exists"),
+				self.dir_states[index]
+					.created()
+					.expect("an item is only attempted once its parent exists")
+					.clone(),
 			)),
 		}
 	}
@@ -490,10 +498,7 @@ where
 	fn dest_parent(&self, parent: DestParent) -> Option<Uuid> {
 		match parent {
 			DestParent::Existing(uuid) => Some(uuid),
-			DestParent::Planned(index) => match self.dir_states[index] {
-				DirState::Created(uuid) => Some(uuid),
-				DirState::Pending | DirState::Failed => None,
-			},
+			DestParent::Planned(index) => self.dir_states[index].created().map(HasUUID::uuid),
 		}
 	}
 
@@ -598,11 +603,14 @@ where
 	}
 
 	fn dir_finished(&mut self, index: usize, result: DirResult, ready: &mut VecDeque<usize>) {
-		let parent = self.dest_parent(self.plan.dirs[index].parent);
+		let parent = self
+			.dest_parent(self.plan.dirs[index].parent)
+			.expect("a directory is only created once its parent exists");
+		let top_level = matches!(self.plan.dirs[index].parent, DestParent::Existing(_));
 		match result {
 			Ok((dir, name)) => {
-				let planned = &self.plan.dirs[index];
-				if let DestParent::Existing(_) = planned.parent {
+				if top_level {
+					let planned = &self.plan.dirs[index];
 					let renamed = renamed_top_level(
 						planned.source_uuid,
 						&planned.source_path,
@@ -612,24 +620,24 @@ where
 					self.note_renamed(renamed);
 				}
 				let planned = &self.plan.dirs[index];
-				self.dir_states[index] = DirState::Created(dir.uuid());
-				self.created_dirs[index] = Some(dir.clone());
 				self.reporter.dir_created(
 					planned.source_uuid,
 					dir.uuid(),
-					parent.unwrap_or_default(),
+					parent,
 					dir.name().unwrap_or(planned.name.as_ref()),
 				);
 				ready.extend(self.child_dirs[index].iter().copied());
-				if let DestParent::Existing(_) = planned.parent {
+				if top_level {
 					let item = CopiedTopLevel {
 						request: planned.request,
 						source_uuid: planned.source_uuid,
-						item: NonRootItemType::Dir(Cow::Owned(dir)),
+						// the job keeps its own copy to create the subtree in
+						item: NonRootItemType::Dir(Cow::Owned(dir.clone())),
 					};
 					self.report.top_level.push(item.clone());
 					self.reporter.top_level_created(item);
 				}
+				self.dir_states[index] = DirState::Created(dir);
 			}
 			// the loop waits out the pause or the stop before creating it again
 			Err(DirError::NotStarted) => ready.push_front(index),
@@ -642,7 +650,7 @@ where
 				let info = FailureInfo {
 					source_uuid: planned.source_uuid,
 					source_path: planned.source_path.clone(),
-					dest_parent: parent.unwrap_or_default(),
+					dest_parent: parent,
 					dest_parent_dir,
 					dest_name: planned.name.as_ref().to_owned(),
 					stage,
