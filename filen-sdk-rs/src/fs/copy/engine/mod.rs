@@ -585,32 +585,21 @@ where
 			.dest_parent(dir.parent)
 			.expect("a directory is only created once its parent exists");
 		let top_level = matches!(dir.parent, DestParent::Existing(_));
-		let verify_name = top_level && self.plan.unverified_destinations.contains(&parent);
-		let name = dir.name.clone();
-		let uuid = dir.dest_uuid;
-		let created = dir.created.unwrap_or_else(Utc::now);
-		let color = dir.color.clone();
-		let targets = Arc::clone(&self.requests[dir.request].targets);
-		let backend = Arc::clone(&self.backend);
-		let control = self.control.clone();
-		let reporter = MaybeArc::clone(&self.reporter);
-		Box::pin(async move {
-			let result = create_dir(
-				&*backend,
-				&control,
-				&reporter,
-				&targets,
-				parent,
-				uuid,
-				name,
-				created,
-				color,
-				top_level,
-				verify_name,
-			)
-			.await;
-			(index, result)
-		})
+		let task = DirTask {
+			backend: Arc::clone(&self.backend),
+			control: self.control.clone(),
+			reporter: MaybeArc::clone(&self.reporter),
+			targets: Arc::clone(&self.requests[dir.request].targets),
+			parent,
+			uuid: dir.dest_uuid,
+			// the plan keeps the planned name to tell a later rename from it
+			name: dir.name.clone(),
+			created: dir.created.unwrap_or_else(Utc::now),
+			color: dir.color.clone(),
+			top_level,
+			verify_name: top_level && self.plan.unverified_destinations.contains(&parent),
+		};
+		Box::pin(async move { (index, create_dir(task).await) })
 	}
 
 	fn dir_finished(&mut self, index: usize, result: DirResult, ready: &mut VecDeque<usize>) {
@@ -930,31 +919,46 @@ fn renamed_top_level(
 	})
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_dir<B: CopyBackend>(
-	backend: &B,
-	control: &JobControl,
-	reporter: &MaybeArc<Reporter>,
-	targets: &ConnectedTargets,
+struct DirTask<B> {
+	backend: Arc<B>,
+	control: JobControl,
+	reporter: MaybeArc<Reporter>,
+	targets: Arc<ConnectedTargets>,
 	parent: Uuid,
 	uuid: Uuid,
 	name: ValidatedName,
 	created: DateTime<Utc>,
 	color: DirColor<'static>,
 	top_level: bool,
+	/// Check the top-level name with the server before creating the directory.
 	verify_name: bool,
-) -> DirResult {
+}
+
+async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
+	let DirTask {
+		backend,
+		control,
+		reporter,
+		targets,
+		parent,
+		uuid,
+		mut name,
+		created,
+		color,
+		top_level,
+		verify_name,
+	} = task;
+	let backend = &*backend;
 	let stage = CopyStage::CreateDirectory;
 	// The shared lock the job holds is normally handed out at once; a fresh acquisition (its
 	// lease was lost) can wait long. Nothing is sent before the lock is held, so a pause or stop
 	// until then leaves the create to be tried again; once held, the create runs to the end.
-	let _lock = match wait_for_lock(backend, control, reporter).await {
+	let _lock = match wait_for_lock(backend, &control, &reporter).await {
 		Ok(LockWait::Locked(held)) => held,
 		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
 		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(stage, error)),
 	};
 	let mut retry = NameRetry::new(true);
-	let mut name = name;
 	let mut dir = loop {
 		if verify_name {
 			name = retry
@@ -994,7 +998,7 @@ async fn create_dir<B: CopyBackend>(
 	}
 	if !targets.is_empty() {
 		for error in backend
-			.propagate(targets, NonRootItemType::Dir(Cow::Borrowed(&dir)))
+			.propagate(&targets, NonRootItemType::Dir(Cow::Borrowed(&dir)))
 			.await
 		{
 			reporter.event(CopyEvent::PropagationFailed {
