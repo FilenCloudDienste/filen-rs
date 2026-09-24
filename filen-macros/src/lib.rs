@@ -1271,7 +1271,8 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream 
 
 	// Scan fields for #[js_type(tagged)] and build the Tagged struct if needed.
 	// We also strip the attribute from the real struct's fields.
-	let tagged_struct = if !state.into_abi.is_empty() && any_tagged {
+	let has_tagged_struct = !state.into_abi.is_empty() && any_tagged;
+	let tagged_struct = if has_tagged_struct {
 		{
 			let name = &item_struct.ident;
 			let tagged_name = format_ident!("{}Tagged", name);
@@ -1354,7 +1355,15 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream 
 		quote! { derive(serde::Serialize), }
 	};
 
-	let into_abi = if any_tagged {
+	let into_abi = if has_tagged_struct && !state.no_ser {
+		// Written out as its Tagged twin, so the struct serializes in the shape the SDK hands out
+		// and still reads back as itself.
+		let tagged_name = format!("{name}Tagged");
+		quote! {
+			derive(serde::Serialize),
+			serde(into = #tagged_name),
+		}
+	} else if any_tagged {
 		quote! {}
 	} else {
 		quote! {
