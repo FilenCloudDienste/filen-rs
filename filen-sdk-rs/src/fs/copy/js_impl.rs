@@ -579,6 +579,7 @@ mod wasm_impl {
 	use std::sync::Arc;
 
 	use filen_macros::js_type;
+	use serde::Serialize;
 	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 	use web_sys::js_sys;
 
@@ -647,33 +648,26 @@ mod wasm_impl {
 
 	impl Callbacks {
 		fn deliver(&self, delivery: Delivery) {
-			let serializer = serde_wasm_bindgen::Serializer::new()
-				.serialize_maps_as_objects(true)
-				.serialize_large_number_types_as_bigints(true);
-			let (callback, value) = match &delivery {
-				Delivery::TopLevelPlanned(items) => (
-					&self.on_top_level_planned,
-					serde::Serialize::serialize(items, &serializer),
-				),
-				Delivery::TopLevelCreated(item) => (
-					&self.on_top_level_created,
-					serde::Serialize::serialize(item, &serializer),
-				),
-				Delivery::Update(update) => (
-					&self.on_update,
-					serde::Serialize::serialize(update, &serializer),
-				),
-			};
-			if callback.is_undefined() {
-				return;
-			}
-			match value {
-				Ok(value) => {
-					let _ = callback.call1(&JsValue::UNDEFINED, &value);
-				}
-				Err(error) => tracing::error!("failed to convert a copy callback: {error}"),
+			match delivery {
+				Delivery::TopLevelPlanned(items) => call(&self.on_top_level_planned, &items),
+				Delivery::TopLevelCreated(item) => call(&self.on_top_level_created, &item),
+				Delivery::Update(update) => call(&self.on_update, &update),
 			}
 		}
+	}
+
+	/// Calls `callback` with `value`, if the caller passed one.
+	fn call(callback: &js_sys::Function, value: &impl Serialize) {
+		if callback.is_undefined() {
+			return;
+		}
+		let serializer = serde_wasm_bindgen::Serializer::new()
+			.serialize_maps_as_objects(true)
+			.serialize_large_number_types_as_bigints(true);
+		let value = value
+			.serialize(&serializer)
+			.expect("failed to serialize a copy callback (should be impossible)");
+		let _ = callback.call1(&JsValue::UNDEFINED, &value);
 	}
 
 	async fn run(
