@@ -42,17 +42,18 @@ pub(crate) struct SourceDir<D> {
 }
 
 impl<D> SourceDir<D> {
-	pub(crate) fn new(
-		dir: &(impl HasUUID + HasName + HasDirInfo),
+	/// `handle` takes `dir` once its fields are read, so the handle can own it.
+	pub(crate) fn new<T: HasUUID + HasName + HasDirInfo>(
+		dir: T,
 		color: DirColor<'static>,
-		handle: D,
+		handle: impl FnOnce(T) -> D,
 	) -> Self {
 		Self {
 			uuid: dir.uuid(),
 			name: dir.name().map(str::to_owned),
 			created: dir.created(),
 			color,
-			handle,
+			handle: handle(dir),
 		}
 	}
 }

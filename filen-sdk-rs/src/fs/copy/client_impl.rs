@@ -9,7 +9,10 @@ use std::{
 	},
 };
 
-use filen_types::{fs::Uuid, traits::CowHelpers};
+use filen_types::{
+	fs::{ParentUuid, Uuid},
+	traits::CowHelpers,
+};
 
 use crate::{
 	Error, ErrorKind,
@@ -72,19 +75,30 @@ pub struct CopyConfig {
 	pub max_bytes: Option<u64>,
 }
 
-/// The source directory for the root of a listing that can start at a category root.
+/// The source directory for the root of a listing that can start at a category root; `handle`
+/// takes the root to address it again.
 fn root_source_dir<Cat>(
-	dir: &DirType<'static, Cat>,
-	handle: CopySourceDir,
+	root: DirType<'static, Cat>,
+	handle: impl FnOnce(DirType<'static, Cat>) -> CopySourceDir,
 ) -> SourceDir<CopySourceDir>
 where
 	Cat: CategoryFS,
 	Cat::Root: HasName + HasDirInfo + HasRemoteDirInfo,
 	Cat::Dir: HasRemoteDirInfo,
 {
-	match dir {
-		DirType::Root(root) => SourceDir::new(root.as_ref(), root.color().into_owned_cow(), handle),
-		DirType::Dir(dir) => SourceDir::new(dir.as_ref(), dir.color().into_owned_cow(), handle),
+	match root {
+		DirType::Root(root) => {
+			let color = root.color().into_owned_cow();
+			SourceDir::new(root.into_owned(), color, |root| {
+				handle(DirType::Root(Cow::Owned(root)))
+			})
+		}
+		DirType::Dir(dir) => {
+			let color = dir.color().into_owned_cow();
+			SourceDir::new(dir.into_owned(), color, |dir| {
+				handle(DirType::Dir(Cow::Owned(dir)))
+			})
+		}
 	}
 }
 
@@ -117,16 +131,33 @@ impl ListingBytes {
 	}
 }
 
-/// Lists `root` recursively into a plan source. `handle_of` addresses a listed directory again
-/// for a retry.
+/// The directories and files below a source directory.
+type Listing = (
+	Vec<Listed<SourceDir<CopySourceDir>>>,
+	Vec<Listed<RemoteFileType<'static>>>,
+);
+
+/// The directory a listed entry is in. The planner keys entries by directory uuid; an entry
+/// listed under anything else is left out, and logged.
+fn listed_parent(uuid: Uuid, parent: ParentUuid) -> Option<Uuid> {
+	let ParentUuid::Uuid(parent) = parent else {
+		tracing::warn!(
+			"copy: leaving out listed entry {uuid}, whose parent {parent:?} is not a directory"
+		);
+		return None;
+	};
+	Some(parent)
+}
+
+/// Lists `root` recursively. `handle_of` takes a listed directory to address it again for a
+/// retry.
 async fn list_source<Cat>(
 	client: &Cat::Client,
-	root: &DirType<'static, Cat>,
+	root: &DirType<'_, Cat>,
 	context: Cat::ListDirContext<'_>,
-	root_dir: SourceDir<CopySourceDir>,
-	handle_of: impl Fn(&Cat::Dir) -> CopySourceDir,
+	handle_of: impl Fn(Cat::Dir) -> CopySourceDir,
 	bytes: &ListingBytes,
-) -> Result<PlanSource<CopySourceDir>, Error>
+) -> Result<Listing, Error>
 where
 	Cat: CategoryFS,
 	Cat::Dir: HasRemoteDirInfo,
@@ -142,26 +173,23 @@ where
 	let dirs = dirs
 		.into_iter()
 		.filter_map(|dir| {
-			let parent = Uuid::try_from(*dir.parent()).ok()?;
-			let item = SourceDir::new(&dir, dir.color().into_owned_cow(), handle_of(&dir));
+			let parent = listed_parent(dir.uuid(), *dir.parent())?;
+			let color = dir.color().into_owned_cow();
+			let item = SourceDir::new(dir, color, &handle_of);
 			Some(Listed { parent, item })
 		})
 		.collect();
 	let files = files
 		.into_iter()
 		.filter_map(|file| {
-			let parent = Uuid::try_from(*file.parent()).ok()?;
+			let parent = listed_parent(file.uuid(), *file.parent())?;
 			Some(Listed {
 				parent,
 				item: RemoteFileType::from(file),
 			})
 		})
 		.collect();
-	Ok(PlanSource::Dir {
-		root: root_dir,
-		dirs,
-		files,
-	})
+	Ok((dirs, files))
 }
 
 impl Client {
@@ -326,47 +354,47 @@ impl Client {
 		dir: CopySourceDir,
 		bytes: &ListingBytes,
 	) -> Result<PlanSource<CopySourceDir>, Error> {
-		match dir {
+		let (root, (dirs, files)) = match dir {
 			CopySourceDir::Normal(dir) => {
-				let root = DirType::Dir(Cow::Owned(dir.clone()));
-				let root_dir = SourceDir::new(
-					&dir,
-					dir.color().into_owned_cow(),
-					CopySourceDir::Normal(dir.clone()),
-				);
-				list_source::<Normal>(
+				let listing = list_source::<Normal>(
 					self,
-					&root,
+					&DirType::Dir(Cow::Borrowed(&dir)),
 					(),
-					root_dir,
-					|d| CopySourceDir::Normal(d.clone()),
+					CopySourceDir::Normal,
 					bytes,
 				)
-				.await
+				.await?;
+				let color = dir.color().into_owned_cow();
+				(SourceDir::new(dir, color, CopySourceDir::Normal), listing)
 			}
 			CopySourceDir::Shared(root, role) => {
-				list_source::<Shared>(
+				// every listed directory's handle owns the role it is listed again with on retry
+				let listing = list_source::<Shared>(
 					self,
 					&root,
 					&role,
-					root_source_dir(&root, CopySourceDir::Shared(root.clone(), role.clone())),
-					|d| CopySourceDir::Shared(DirType::Dir(Cow::Owned(d.clone())), role.clone()),
+					|dir| CopySourceDir::Shared(DirType::Dir(Cow::Owned(dir)), role.clone()),
 					bytes,
 				)
-				.await
+				.await?;
+				let root = root_source_dir(root, |root| CopySourceDir::Shared(root, role));
+				(root, listing)
 			}
 			CopySourceDir::Linked(root, link) => {
-				list_source::<Linked>(
+				// every listed directory's handle owns the link it is listed again with on retry
+				let listing = list_source::<Linked>(
 					self.unauthed(),
 					&root,
 					Cow::Borrowed(&link),
-					root_source_dir(&root, CopySourceDir::Linked(root.clone(), link.clone())),
-					|d| CopySourceDir::Linked(DirType::Dir(Cow::Owned(d.clone())), link.clone()),
+					|dir| CopySourceDir::Linked(DirType::Dir(Cow::Owned(dir)), link.clone()),
 					bytes,
 				)
-				.await
+				.await?;
+				let root = root_source_dir(root, |root| CopySourceDir::Linked(root, link));
+				(root, listing)
 			}
-		}
+		};
+		Ok(PlanSource::Dir { root, dirs, files })
 	}
 }
 
