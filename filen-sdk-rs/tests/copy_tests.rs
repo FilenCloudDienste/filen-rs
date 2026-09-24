@@ -1033,6 +1033,7 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 		.await
 		.unwrap();
 	let clash = upload(&client, test_dir, "clash.txt", b"clash").await;
+	let clash_uuid = clash.uuid();
 
 	let outcome = copy(
 		&client,
@@ -1047,12 +1048,22 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 	let report = &outcome.report;
 	assert_eq!(report.skipped.len(), 1);
 	assert_eq!(report.skipped[0].reason, SkipReason::UndecryptableFile);
-	let [renamed] = report.renamed.as_slice() else {
-		panic!("one rename: {:?}", report.renamed);
-	};
-	assert_eq!(renamed.reason, RenameReason::Undecryptable);
-	assert_eq!(renamed.source_uuid, hidden);
-	assert_eq!(renamed.name.as_ref(), hidden.to_string());
+	assert_eq!(report.renamed.len(), 2, "renames: {:?}", report.renamed);
+	let hidden_rename = report
+		.renamed
+		.iter()
+		.find(|r| r.reason == RenameReason::Undecryptable)
+		.expect("the undecryptable directory is renamed");
+	assert_eq!(hidden_rename.source_uuid, hidden);
+	assert_eq!(hidden_rename.name.as_ref(), hidden.to_string());
+	// the destination's unreadable clash.txt still takes its name, so the copy is renamed too
+	let clash_rename = report
+		.renamed
+		.iter()
+		.find(|r| r.reason == RenameReason::DuplicateName)
+		.expect("the clashing file is renamed");
+	assert_eq!(clash_rename.source_uuid, clash_uuid);
+	assert_eq!(clash_rename.name.as_ref(), "clash (1).txt");
 	let (_, copied) = contents(&client, &destination).await;
 	assert_same_files(
 		&client,
