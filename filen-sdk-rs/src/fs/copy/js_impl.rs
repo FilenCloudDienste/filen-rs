@@ -6,6 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
 	Error, ErrorKind,
@@ -13,7 +14,6 @@ use crate::{
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
-		copy as api,
 		file::enums::RemoteFileType,
 	},
 	js::{
@@ -22,8 +22,12 @@ use crate::{
 	},
 };
 
+// The core types this module mirrors under the same name (CopyEvent, CopyUpdate, CopyReport,
+// CopyFailure) are written out as `super::X`.
 use super::{
-	ActiveFile, CopyCounts, CopyPhase, CopyStage, PlanTotals, RenameReason, RunState, ScanProgress,
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyConfig, CopyCounts, CopyFailed, CopyPhase,
+	CopyRequest, CopySource, CopySourceDir, CopyStage, FailedSource, FailureInfo, JobControl,
+	PlanTotals, PlannedTopLevelItem, RenameReason, RenamedEntry, RunState, ScanProgress,
 	SkippedEntry,
 };
 
@@ -169,7 +173,7 @@ pub struct CopyReport {
 	pub error: Option<CopyError>,
 }
 
-impl TryFrom<AnyItemWithContext> for api::CopySource {
+impl TryFrom<AnyItemWithContext> for CopySource {
 	type Error = Error;
 
 	fn try_from(item: AnyItemWithContext) -> Result<Self, Error> {
@@ -177,7 +181,7 @@ impl TryFrom<AnyItemWithContext> for api::CopySource {
 			AnyItemWithContext::File(file) => Self::File(RemoteFileType::try_from(file)?),
 			AnyItemWithContext::Dir(dir) => Self::Dir(match DirByCategoryWithContext::from(dir) {
 				DirByCategoryWithContext::Normal(DirType::Dir(dir)) => {
-					api::CopySourceDir::Normal(dir.into_owned())
+					CopySourceDir::Normal(dir.into_owned())
 				}
 				DirByCategoryWithContext::Normal(DirType::Root(_)) => {
 					return Err(Error::custom(
@@ -185,32 +189,30 @@ impl TryFrom<AnyItemWithContext> for api::CopySource {
 						"the root directory cannot be copied",
 					));
 				}
-				DirByCategoryWithContext::Shared(dir, role) => {
-					api::CopySourceDir::Shared(dir, role)
-				}
+				DirByCategoryWithContext::Shared(dir, role) => CopySourceDir::Shared(dir, role),
 				DirByCategoryWithContext::Linked(dir, link) => {
-					api::CopySourceDir::Linked(dir, link.try_into()?)
+					CopySourceDir::Linked(dir, link.try_into()?)
 				}
 			}),
 		})
 	}
 }
 
-impl From<api::FailedSource> for AnyItemWithContext {
-	fn from(source: api::FailedSource) -> Self {
+impl From<FailedSource> for AnyItemWithContext {
+	fn from(source: FailedSource) -> Self {
 		match source {
-			api::FailedSource::File(file) => Self::File(AnyFile::from(*file)),
-			api::FailedSource::Dir(dir) => Self::Dir(match dir {
-				api::CopySourceDir::Normal(dir) => {
+			FailedSource::File(file) => Self::File(AnyFile::from(*file)),
+			FailedSource::Dir(dir) => Self::Dir(match dir {
+				CopySourceDir::Normal(dir) => {
 					AnyDirWithContext::Normal(AnyNormalDir::Dir(dir.into()))
 				}
-				api::CopySourceDir::Shared(dir, role) => {
+				CopySourceDir::Shared(dir, role) => {
 					AnyDirWithContext::Shared(AnySharedDirWithContext {
 						dir: dir.into(),
 						share_info: role,
 					})
 				}
-				api::CopySourceDir::Linked(dir, link) => {
+				CopySourceDir::Linked(dir, link) => {
 					AnyDirWithContext::Linked(AnyLinkedDirWithContext {
 						dir: dir.into(),
 						link: link.into(),
@@ -221,7 +223,7 @@ impl From<api::FailedSource> for AnyItemWithContext {
 	}
 }
 
-impl TryFrom<CopyEntry> for api::CopyRequest {
+impl TryFrom<CopyEntry> for CopyRequest {
 	type Error = Error;
 
 	fn try_from(entry: CopyEntry) -> Result<Self, Error> {
@@ -237,12 +239,12 @@ impl TryFrom<CopyEntry> for api::CopyRequest {
 fn requests_into(
 	items: Vec<AnyItemWithContext>,
 	destination: AnyNormalDir,
-) -> Result<Vec<api::CopyRequest>, Error> {
+) -> Result<Vec<CopyRequest>, Error> {
 	let destination = DirType::<'static, Normal>::from(destination);
 	items
 		.into_iter()
 		.map(|item| {
-			Ok(api::CopyRequest {
+			Ok(CopyRequest {
 				source: item.try_into()?,
 				destination: destination.clone(),
 				name: None,
@@ -251,7 +253,7 @@ fn requests_into(
 		.collect()
 }
 
-fn requests_to(entries: Vec<CopyEntry>) -> Result<Vec<api::CopyRequest>, Error> {
+fn requests_to(entries: Vec<CopyEntry>) -> Result<Vec<CopyRequest>, Error> {
 	entries.into_iter().map(TryFrom::try_from).collect()
 }
 
@@ -266,8 +268,8 @@ impl From<&Error> for CopyError {
 	}
 }
 
-impl From<api::FailureInfo> for CopyFailureInfo {
-	fn from(info: api::FailureInfo) -> Self {
+impl From<FailureInfo> for CopyFailureInfo {
+	fn from(info: FailureInfo) -> Self {
 		Self {
 			source_uuid: info.source_uuid,
 			source_path: info.source_path,
@@ -282,8 +284,8 @@ impl From<api::FailureInfo> for CopyFailureInfo {
 	}
 }
 
-impl From<api::RenamedEntry> for CopyRenamedEntry {
-	fn from(entry: api::RenamedEntry) -> Self {
+impl From<RenamedEntry> for CopyRenamedEntry {
+	fn from(entry: RenamedEntry) -> Self {
 		Self {
 			source_uuid: entry.source_uuid,
 			source_path: entry.source_path,
@@ -293,8 +295,8 @@ impl From<api::RenamedEntry> for CopyRenamedEntry {
 	}
 }
 
-impl From<api::CopyFailure> for CopyFailure {
-	fn from(failure: api::CopyFailure) -> Self {
+impl From<super::CopyFailure> for CopyFailure {
+	fn from(failure: super::CopyFailure) -> Self {
 		Self {
 			item: failure.source.into(),
 			info: failure.info.into(),
@@ -302,10 +304,10 @@ impl From<api::CopyFailure> for CopyFailure {
 	}
 }
 
-impl From<api::CopyEvent> for CopyEvent {
-	fn from(event: api::CopyEvent) -> Self {
+impl From<super::CopyEvent> for CopyEvent {
+	fn from(event: super::CopyEvent) -> Self {
 		match event {
-			api::CopyEvent::DirCreated {
+			super::CopyEvent::DirCreated {
 				source_uuid,
 				dest_uuid,
 				dest_parent,
@@ -316,9 +318,9 @@ impl From<api::CopyEvent> for CopyEvent {
 				dest_parent,
 				name,
 			}),
-			api::CopyEvent::DirFailed(info) => Self::DirFailed(info.into()),
-			api::CopyEvent::FileStarted(file) => Self::FileStarted(file),
-			api::CopyEvent::FileDone {
+			super::CopyEvent::DirFailed(info) => Self::DirFailed(info.into()),
+			super::CopyEvent::FileStarted(file) => Self::FileStarted(file),
+			super::CopyEvent::FileDone {
 				source_uuid,
 				dest_uuid,
 				dest_parent,
@@ -331,19 +333,21 @@ impl From<api::CopyEvent> for CopyEvent {
 				name,
 				size,
 			}),
-			api::CopyEvent::FileFailed(info) => Self::FileFailed(info.into()),
-			api::CopyEvent::Skipped(entry) => Self::Skipped(entry),
-			api::CopyEvent::Renamed(entry) => Self::Renamed(entry.into()),
-			api::CopyEvent::PropagationFailed { dest_uuid, error } => {
+			super::CopyEvent::FileFailed(info) => Self::FileFailed(info.into()),
+			super::CopyEvent::Skipped(entry) => Self::Skipped(entry),
+			super::CopyEvent::Renamed(entry) => Self::Renamed(entry.into()),
+			super::CopyEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(CopyItemError {
 					dest_uuid,
 					error: CopyError::from(error.as_ref()),
 				})
 			}
-			api::CopyEvent::ColorFailed { dest_uuid, error } => Self::ColorFailed(CopyItemError {
-				dest_uuid,
-				error: CopyError::from(error.as_ref()),
-			}),
+			super::CopyEvent::ColorFailed { dest_uuid, error } => {
+				Self::ColorFailed(CopyItemError {
+					dest_uuid,
+					error: CopyError::from(error.as_ref()),
+				})
+			}
 		}
 	}
 }
@@ -352,8 +356,8 @@ fn millis(duration: Duration) -> u64 {
 	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-impl From<api::CopyUpdate> for CopyUpdate {
-	fn from(update: api::CopyUpdate) -> Self {
+impl From<super::CopyUpdate> for CopyUpdate {
+	fn from(update: super::CopyUpdate) -> Self {
 		Self {
 			phase: update.phase,
 			run_state: update.run_state,
@@ -369,8 +373,8 @@ impl From<api::CopyUpdate> for CopyUpdate {
 	}
 }
 
-impl From<api::PlannedTopLevelItem> for CopyPlannedItem {
-	fn from(item: api::PlannedTopLevelItem) -> Self {
+impl From<PlannedTopLevelItem> for CopyPlannedItem {
+	fn from(item: PlannedTopLevelItem) -> Self {
 		Self {
 			request: item.request as u64,
 			source_uuid: item.source_uuid,
@@ -382,8 +386,8 @@ impl From<api::PlannedTopLevelItem> for CopyPlannedItem {
 	}
 }
 
-impl From<api::CopiedTopLevel> for CopiedTopLevelItem {
-	fn from(item: api::CopiedTopLevel) -> Self {
+impl From<CopiedTopLevel> for CopiedTopLevelItem {
+	fn from(item: CopiedTopLevel) -> Self {
 		Self {
 			request: item.request as u64,
 			source_uuid: item.source_uuid,
@@ -392,8 +396,8 @@ impl From<api::CopiedTopLevel> for CopiedTopLevelItem {
 	}
 }
 
-impl From<api::CopyReport> for CopyReport {
-	fn from(report: api::CopyReport) -> Self {
+impl From<super::CopyReport> for CopyReport {
+	fn from(report: super::CopyReport) -> Self {
 		Self {
 			top_level: report.top_level.into_iter().map(Into::into).collect(),
 			failures: report.failures.into_iter().map(Into::into).collect(),
@@ -406,8 +410,8 @@ impl From<api::CopyReport> for CopyReport {
 	}
 }
 
-impl From<api::CopyFailed> for CopyReport {
-	fn from(failed: api::CopyFailed) -> Self {
+impl From<CopyFailed> for CopyReport {
+	fn from(failed: CopyFailed) -> Self {
 		Self {
 			error: Some(CopyError::from(failed.error.as_ref())),
 			..failed.report.into()
@@ -424,51 +428,46 @@ enum Delivery {
 
 /// Passes the job's callbacks to the binding's delivery task over one channel, which keeps
 /// their order.
-struct DeliveryChannel(tokio::sync::mpsc::UnboundedSender<Delivery>);
+struct DeliveryChannel(UnboundedSender<Delivery>);
 
-impl api::CopyCallback for DeliveryChannel {
-	fn on_top_level_planned(&self, items: Vec<api::PlannedTopLevelItem>) {
+impl CopyCallback for DeliveryChannel {
+	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		let _ = self.0.send(Delivery::TopLevelPlanned(
 			items.into_iter().map(Into::into).collect(),
 		));
 	}
 
-	fn on_top_level_created(&self, item: api::CopiedTopLevel) {
+	fn on_top_level_created(&self, item: CopiedTopLevel) {
 		let _ = self.0.send(Delivery::TopLevelCreated(item.into()));
 	}
 
-	fn on_update(&self, update: api::CopyUpdate) {
+	fn on_update(&self, update: super::CopyUpdate) {
 		let _ = self.0.send(Delivery::Update(update.into()));
 	}
 }
 
-/// Runs the copy as the job of `managed_future`, its callbacks going to `sender`.
-fn copy_job(
+/// Runs the copy as the job of a managed future, its callbacks going to `sender`.
+async fn copy_job(
 	client: Arc<Client>,
-	requests: Vec<api::CopyRequest>,
+	requests: Vec<CopyRequest>,
 	max_bytes: Option<u64>,
-	sender: tokio::sync::mpsc::UnboundedSender<Delivery>,
-) -> impl FnOnce(api::JobControl) -> CopyJobFuture + Send + 'static {
-	move |control| {
-		Box::pin(async move {
-			let result = client
-				.copy_items_to(
-					requests,
-					api::CopyConfig { max_bytes },
-					DeliveryChannel(sender),
-					control,
-				)
-				.await;
-			// a copy that ended early still resolves, with the report of what it did
-			Ok(match result {
-				Ok(report) => report.into(),
-				Err(failed) => failed.into(),
-			})
-		})
-	}
+	sender: UnboundedSender<Delivery>,
+	control: JobControl,
+) -> Result<CopyReport, Error> {
+	let result = client
+		.copy_items_to(
+			requests,
+			CopyConfig { max_bytes },
+			DeliveryChannel(sender),
+			control,
+		)
+		.await;
+	// a copy that ended early still resolves, with the report of what it did
+	Ok(match result {
+		Ok(report) => report.into(),
+		Err(failed) => failed.into(),
+	})
 }
-
-type CopyJobFuture = crate::util::MaybeSendBoxFuture<'static, Result<CopyReport, Error>>;
 
 #[cfg(feature = "uniffi")]
 mod uniffi_impl {
@@ -481,8 +480,8 @@ mod uniffi_impl {
 	};
 
 	use super::{
-		CopiedTopLevelItem, CopyEntry, CopyPlannedItem, CopyReport, CopyUpdate, Delivery, copy_job,
-		requests_into, requests_to,
+		Client, CopiedTopLevelItem, CopyEntry, CopyPlannedItem, CopyReport, CopyRequest,
+		CopyUpdate, Delivery, copy_job, requests_into, requests_to,
 	};
 
 	/// Receives a copy's progress, in the order the copy made it, before the call returns.
@@ -519,19 +518,18 @@ mod uniffi_impl {
 	}
 
 	async fn run(
-		client: Arc<crate::auth::Client>,
-		requests: Vec<crate::fs::copy::CopyRequest>,
+		client: Arc<Client>,
+		requests: Vec<CopyRequest>,
 		config: CopyItemsConfig,
 		callback: Arc<dyn CopyItemsCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-		let job = copy_job(client, requests, config.max_bytes, sender);
 		managed_future
 			.into_js_managed_commander_job(move |control| async move {
 				let delivery =
 					tokio::task::spawn_blocking(move || deliver(receiver, callback.as_ref()));
-				let result = job(control).await;
+				let result = copy_job(client, requests, config.max_bytes, sender, control).await;
 				// the job has ended and dropped its sender: this returns once everything it
 				// reported was delivered
 				let _ = delivery.await;
@@ -590,7 +588,9 @@ mod wasm_impl {
 		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
 	};
 
-	use super::{CopyEntry, CopyReport, Delivery, copy_job, requests_into, requests_to};
+	use super::{
+		Client, CopyEntry, CopyReport, CopyRequest, Delivery, copy_job, requests_into, requests_to,
+	};
 
 	#[js_type(import, no_ser, no_default)]
 	pub struct CopyItemsParams {
@@ -677,8 +677,8 @@ mod wasm_impl {
 	}
 
 	async fn run(
-		client: Arc<crate::auth::Client>,
-		requests: Vec<crate::fs::copy::CopyRequest>,
+		client: Arc<Client>,
+		requests: Vec<CopyRequest>,
 		max_bytes: Option<u64>,
 		callbacks: Callbacks,
 		managed_future: ManagedFuture,
@@ -693,11 +693,11 @@ mod wasm_impl {
 			}
 			let _ = drained.send(());
 		});
-		let job = copy_job(client, requests, max_bytes, sender);
-		let result = match managed_future.into_js_managed_commander_job(job) {
-			Ok(running) => running.await,
-			Err(error) => Err(error),
-		};
+		let result = managed_future
+			.into_js_managed_commander_job(move |control| {
+				copy_job(client, requests, max_bytes, sender, control)
+			})?
+			.await;
 		// the job has ended and dropped its sender: everything it reported reaches its
 		// callback before the result does
 		let _ = drained_receiver.await;
@@ -762,6 +762,7 @@ mod tests {
 	use super::{uniffi_impl::CopyItemsCallback, *};
 	use crate::{
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+		fs::copy,
 		fs::file::traits::HasFileInfo,
 		fs::{
 			dir::{
@@ -814,15 +815,15 @@ mod tests {
 		)
 	}
 
-	fn failure_source(item: AnyItemWithContext) -> api::CopySource {
-		api::CopySource::try_from(item).expect("a failed item is a copy source again")
+	fn failure_source(item: AnyItemWithContext) -> CopySource {
+		CopySource::try_from(item).expect("a failed item is a copy source again")
 	}
 
 	#[test]
 	fn a_failed_file_is_a_copy_source_again() {
 		let source = file();
-		let item = AnyItemWithContext::from(api::FailedSource::File(Box::new(source.clone())));
-		let api::CopySource::File(copied) = failure_source(item) else {
+		let item = AnyItemWithContext::from(FailedSource::File(Box::new(source.clone())));
+		let CopySource::File(copied) = failure_source(item) else {
 			panic!("a file");
 		};
 		assert_eq!(copied.uuid(), source.uuid());
@@ -832,10 +833,9 @@ mod tests {
 	#[test]
 	fn a_failed_directory_is_a_copy_source_again() {
 		let source = dir();
-		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Normal(
-			source.clone(),
-		)));
-		let api::CopySource::Dir(api::CopySourceDir::Normal(copied)) = failure_source(item) else {
+		let item =
+			AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Normal(source.clone())));
+		let CopySource::Dir(CopySourceDir::Normal(copied)) = failure_source(item) else {
 			panic!("a directory of the user's drive");
 		};
 		assert_eq!(copied.uuid(), source.uuid());
@@ -858,14 +858,13 @@ mod tests {
 			email: "sharer@example.com".to_owned(),
 			id: 7,
 		});
-		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Shared(
+		let item = AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Shared(
 			DirType::Dir(Cow::Owned(SharedDirectory {
 				inner: shared.clone(),
 			})),
 			role.clone(),
 		)));
-		let api::CopySource::Dir(api::CopySourceDir::Shared(dir_back, role_back)) =
-			failure_source(item)
+		let CopySource::Dir(CopySourceDir::Shared(dir_back, role_back)) = failure_source(item)
 		else {
 			panic!("a shared directory");
 		};
@@ -880,12 +879,11 @@ mod tests {
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		};
-		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Linked(
+		let item = AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Linked(
 			DirType::Dir(Cow::Owned(LinkedDirectory(linked.clone()))),
 			link.clone(),
 		)));
-		let api::CopySource::Dir(api::CopySourceDir::Linked(dir_back, link_back)) =
-			failure_source(item)
+		let CopySource::Dir(CopySourceDir::Linked(dir_back, link_back)) = failure_source(item)
 		else {
 			panic!("a directory in a public link");
 		};
@@ -898,14 +896,14 @@ mod tests {
 		let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(
 			Root::from(RootDirectory::new(Uuid::new_v4())),
 		)));
-		let error = api::CopySource::try_from(root).unwrap_err();
+		let error = CopySource::try_from(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 
 	#[test]
 	fn an_update_reports_milliseconds_and_the_parts_of_its_errors() {
 		let parent = dir();
-		let failure = api::FailureInfo {
+		let failure = FailureInfo {
 			source_uuid: Uuid::new_v4(),
 			source_path: "/a.txt".to_owned(),
 			dest_parent_dir: DirType::Dir(Cow::Owned(parent.clone())),
@@ -915,14 +913,14 @@ mod tests {
 			affected_files: 1,
 			affected_bytes: 10,
 		};
-		let update = CopyUpdate::from(api::CopyUpdate {
+		let update = CopyUpdate::from(copy::CopyUpdate {
 			phase: CopyPhase::CopyingFiles,
 			run_state: RunState::Running,
 			scan: ScanProgress::default(),
 			totals: PlanTotals::default(),
 			counts: CopyCounts::default(),
 			active: Vec::new(),
-			events: vec![api::CopyEvent::FileFailed(failure.clone())],
+			events: vec![copy::CopyEvent::FileFailed(failure.clone())],
 			bytes_per_second: Some(100),
 			eta: Some(Duration::from_millis(1500)),
 			active_time: Duration::from_secs_f64(2.5),
@@ -948,12 +946,12 @@ mod tests {
 
 	#[test]
 	fn a_report_carries_why_the_copy_ended() {
-		let cancelled = CopyReport::from(api::CopyFailed {
-			report: api::CopyReport::default(),
+		let cancelled = CopyReport::from(CopyFailed {
+			report: copy::CopyReport::default(),
 			error: Arc::new(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
 		});
 		assert_eq!(cancelled.error.map(|e| e.kind), Some(ErrorKind::Cancelled));
-		let done = CopyReport::from(api::CopyReport::default());
+		let done = CopyReport::from(copy::CopyReport::default());
 		assert!(done.error.is_none());
 	}
 
@@ -977,8 +975,8 @@ mod tests {
 		}
 	}
 
-	fn planned(request: u64) -> api::PlannedTopLevelItem {
-		api::PlannedTopLevelItem {
+	fn planned(request: u64) -> PlannedTopLevelItem {
+		PlannedTopLevelItem {
 			request: request as usize,
 			source_uuid: Uuid::new_v4(),
 			dest_uuid: Uuid::new_v4(),
@@ -988,8 +986,8 @@ mod tests {
 		}
 	}
 
-	fn update(millis: u64) -> api::CopyUpdate {
-		api::CopyUpdate {
+	fn update(millis: u64) -> copy::CopyUpdate {
+		copy::CopyUpdate {
 			phase: CopyPhase::CopyingFiles,
 			run_state: RunState::Running,
 			scan: ScanProgress::default(),
@@ -1005,8 +1003,6 @@ mod tests {
 
 	#[test]
 	fn callbacks_are_delivered_in_order_until_the_job_lets_go() {
-		use api::CopyCallback;
-
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 		let recorder = Arc::new(Recorder::default());
 		let delivering = {
@@ -1019,7 +1015,7 @@ mod tests {
 			match i % 3 {
 				0 => channel.on_top_level_planned(vec![planned(i)]),
 				1 => channel.on_update(update(i)),
-				_ => channel.on_top_level_created(api::CopiedTopLevel {
+				_ => channel.on_top_level_created(CopiedTopLevel {
 					request: i as usize,
 					source_uuid: Uuid::new_v4(),
 					item: crate::fs::categories::NonRootItemType::Dir(Cow::Owned(dir())),
