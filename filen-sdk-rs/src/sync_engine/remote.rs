@@ -119,7 +119,7 @@ pub(super) fn observe_remote(
 		}
 	}
 	out.settle_superseded(baseline);
-	if out.nodes.is_empty() && baseline.has_remote_rows() {
+	if out.nodes.of(baseline).is_empty() && baseline.has_remote_rows() {
 		return RemoteObserved::Full(FullPassReason::RemoteEmptied);
 	}
 	RemoteObserved::Applied(Box::new(out))
@@ -195,6 +195,7 @@ impl RemoteObservation {
 			None => baseline.path_by_uuid(uuid)?,
 		};
 		self.nodes
+			.of(baseline)
 			.at(&candidate)
 			.is_some_and(|node| node.remote_uuid == uuid)
 			.then_some(candidate)
@@ -235,10 +236,10 @@ impl RemoteObservation {
 				let Some(path) = self.path_of(baseline, uuid) else {
 					return Ok(());
 				};
-				let removed = self.detach(&path);
+				let removed = self.detach(baseline, &path);
 				// The server takes a directory's subtree with it, and so does the view.
 				if removed.is_some_and(|node| node.kind == NodeKind::Dir) {
-					self.drop_subtree(&path);
+					self.drop_subtree(baseline, &path);
 				}
 				self.touch(&path);
 				if let Some(successor) = gone.successor() {
@@ -290,6 +291,7 @@ impl RemoteObservation {
 		if let Some(at) = self.path_of(baseline, uuid) {
 			let node = self
 				.nodes
+				.of(baseline)
 				.at(&at)
 				.ok_or(FullPassReason::RemoteUnplaceable)?
 				.into_owned();
@@ -338,7 +340,7 @@ impl RemoteObservation {
 		if self.held_paths.contains(&path) {
 			return self.vacate_unplaced(baseline, uuid);
 		}
-		if let Some(occupant) = self.displaced(&path, uuid, node.stable_uuid) {
+		if let Some(occupant) = self.displaced(baseline, &path, uuid, node.stable_uuid) {
 			if occupant == NodeKind::Dir {
 				// A directory displaced at its own path takes a subtree's worth of rows with it,
 				// and nothing announced here says where they went.
@@ -347,17 +349,17 @@ impl RemoteObservation {
 			// Two byte-identical names under one parent cannot both exist on the server, so what
 			// the cache is showing is a transition. Withhold that one path for this pass, exactly
 			// as the view withholds it, and let the pass run.
-			self.hold(&path);
+			self.hold(baseline, &path);
 			return self.vacate_unplaced(baseline, uuid);
 		}
 		match self.path_of(baseline, uuid) {
 			Some(from) if from != path => {
-				let moved = self.detach(&from);
+				let moved = self.detach(baseline, &from);
 				// A directory's subtree moved with it; the cache lists the children under the old
 				// path until it catches up, so the view re-keys them here (`fold_move` does the
 				// same for this engine's own moves).
 				if moved.is_some_and(|node| node.kind == NodeKind::Dir) {
-					self.rekey_subtree(&from, &path);
+					self.rekey_subtree(baseline, &from, &path);
 				}
 				self.touch(&from);
 			}
@@ -372,8 +374,17 @@ impl RemoteObservation {
 	/// What sits at `path` when it is NOT the item being placed there and not another version of
 	/// it: the server re-mints a file's uuid on every content edit, and the whole-life id is what
 	/// says the new item is the same file.
-	fn displaced(&self, path: &str, uuid: Uuid, lineage: Option<StableUuid>) -> Option<NodeKind> {
-		let current = self.nodes.at(path)?;
+	fn displaced(
+		&self,
+		baseline: &Baseline,
+		path: &str,
+		uuid: Uuid,
+		lineage: Option<StableUuid>,
+	) -> Option<NodeKind> {
+		// The side is BOUND rather than read through a temporary: `at` hands back a `Cow` borrowed
+		// from the reader, which a carried side builds on the spot.
+		let nodes = self.nodes.of(baseline);
+		let current = nodes.at(path)?;
 		let same_file = current.stable_uuid.is_some() && current.stable_uuid == lineage;
 		(current.remote_uuid != uuid && !same_file).then_some(current.kind)
 	}
@@ -387,8 +398,8 @@ impl RemoteObservation {
 	/// Nothing is taken out of [`moved`](Self::moved): a stale entry there names a path the view no
 	/// longer holds this item at, and [`path_of`](Self::path_of) checks every candidate against
 	/// `nodes` before it answers.
-	fn detach(&mut self, path: &str) -> Option<RemoteNode> {
-		let node = self.nodes.remove(path)?;
+	fn detach(&mut self, baseline: &Baseline, path: &str) -> Option<RemoteNode> {
+		let node = self.nodes.remove(baseline, path)?;
 		self.changed.insert(path.to_owned());
 		Some(node)
 	}
@@ -404,10 +415,10 @@ impl RemoteObservation {
 			return;
 		};
 		if self
-			.detach(&from)
+			.detach(baseline, &from)
 			.is_some_and(|node| node.kind == NodeKind::Dir)
 		{
-			self.drop_subtree(&from);
+			self.drop_subtree(baseline, &from);
 		}
 		self.touch(&from);
 	}
@@ -420,9 +431,14 @@ impl RemoteObservation {
 		if let Some(from) = self.path_of(baseline, uuid) {
 			let carries_subtree = self
 				.nodes
+				.of(baseline)
 				.at(&from)
 				.is_some_and(|node| node.kind == NodeKind::Dir)
-				&& self.nodes.paths().any(|key| plan::is_under(&key, &from));
+				&& self
+					.nodes
+					.of(baseline)
+					.paths()
+					.any(|key| plan::is_under(&key, &from));
 			if carries_subtree {
 				return Err(FullPassReason::RemoteUnplaceable);
 			}
@@ -443,25 +459,25 @@ impl RemoteObservation {
 	}
 
 	/// Withhold `path` for this pass: nothing stays on it, and nothing may be planned for it.
-	fn hold(&mut self, path: &str) {
-		self.detach(path);
+	fn hold(&mut self, baseline: &Baseline, path: &str) {
+		self.detach(baseline, path);
 		self.held_paths.insert(path.to_owned());
 		self.touch(path);
 	}
 
 	/// Everything strictly under `path` leaves the view with it.
-	fn drop_subtree(&mut self, path: &str) {
-		let under = self.nodes.subtree_paths(path);
+	fn drop_subtree(&mut self, baseline: &Baseline, path: &str) {
+		let under = self.nodes.subtree_paths(baseline, path);
 		for key in under {
-			self.detach(&key);
+			self.detach(baseline, &key);
 		}
 	}
 
 	/// Re-key everything the cache still lists under `from` to sit under `to`.
-	fn rekey_subtree(&mut self, from: &str, to: &str) {
-		let under = self.nodes.subtree_paths(from);
+	fn rekey_subtree(&mut self, baseline: &Baseline, from: &str, to: &str) {
+		let under = self.nodes.subtree_paths(baseline, from);
 		for key in under {
-			let Some(mut node) = self.detach(&key) else {
+			let Some(mut node) = self.detach(baseline, &key) else {
 				continue;
 			};
 			let Some(moved) = plan::moved_path(&key, from, to) else {
@@ -490,7 +506,7 @@ impl RemoteObservation {
 			if self.path_of(baseline, successor).is_some() {
 				continue;
 			}
-			self.hold(&path);
+			self.hold(baseline, &path);
 		}
 	}
 }
@@ -628,7 +644,7 @@ mod tests {
 		nodes: impl IntoIterator<Item = (String, RemoteNode)>,
 	) -> (Baseline, Side<RemoteNode>) {
 		let nodes = view(nodes);
-		let baseline = Baseline::from_rows(nodes.iter().map(|(_, node)| {
+		let baseline = Baseline::from_rows(nodes.whole().iter().map(|(_, node)| {
 			let mut entry = row(&node.rel_path, node.kind, Some(node.remote_uuid));
 			entry.remote_stable_uuid = node.stable_uuid;
 			entry
@@ -697,7 +713,12 @@ mod tests {
 	}
 
 	fn paths(out: &RemoteObservation) -> Vec<String> {
-		let mut paths: Vec<String> = out.nodes.paths().map(|path| path.into_owned()).collect();
+		let mut paths: Vec<String> = out
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		paths.sort_unstable();
 		paths
 	}
@@ -727,7 +748,7 @@ mod tests {
 			&delta(&[born(), died()]),
 			&mut no_ancestry(),
 		));
-		assert!(out.nodes.is_empty(), "{:?}", out.nodes);
+		assert!(out.nodes.whole().is_empty(), "{:?}", out.nodes);
 		assert!(out.path_of(&empty, file).is_none());
 		assert_eq!(listed(&out.touched), vec!["a.txt"]);
 
@@ -879,7 +900,7 @@ mod tests {
 			&mut no_ancestry(),
 		));
 
-		assert_eq!(out.nodes.at("a.txt").unwrap().remote_uuid, new);
+		assert_eq!(out.nodes.whole().at("a.txt").unwrap().remote_uuid, new);
 		assert!(out.path_of(&baseline, old).is_none());
 		assert_eq!(out.path_of(&baseline, new).as_deref(), Some("a.txt"));
 		assert!(out.held_paths.is_empty(), "{:?}", out.held_paths);
@@ -938,7 +959,7 @@ mod tests {
 			]),
 			&mut no_ancestry(),
 		));
-		assert_eq!(out.nodes.at("a.txt").unwrap().remote_uuid, new);
+		assert_eq!(out.nodes.whole().at("a.txt").unwrap().remote_uuid, new);
 		assert!(out.held_paths.is_empty(), "{:?}", out.held_paths);
 	}
 
@@ -968,7 +989,10 @@ mod tests {
 
 		assert_eq!(paths(&out), vec!["top", "top/d", "top/d/a.txt"]);
 		assert_eq!(out.path_of(&baseline, file).as_deref(), Some("top/d/a.txt"));
-		assert_eq!(out.nodes.at("top/d/a.txt").unwrap().rel_path, "top/d/a.txt");
+		assert_eq!(
+			out.nodes.whole().at("top/d/a.txt").unwrap().rel_path,
+			"top/d/a.txt"
+		);
 		assert_eq!(listed(&out.touched), vec!["d", "top/d"]);
 	}
 
@@ -996,7 +1020,7 @@ mod tests {
 		));
 
 		assert_eq!(listed(&out.rule_dirs), vec!["d"]);
-		assert!(out.nodes.holds(&format!("d/{FILENIGNORE}")));
+		assert!(out.nodes.whole().holds(&format!("d/{FILENIGNORE}")));
 	}
 
 	/// A directory the derivation cannot place — the name it was renamed to is taken — cannot
