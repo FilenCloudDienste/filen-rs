@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
-		categories::DirType,
+		categories::{DirType, NonRootItemType},
 		copy::{
 			CopyConfig, CopyEvent, CopyFailed, CopyPhase, CopyRequest, CopySource, CopySourceDir,
 			CopyStage, JobControl,
@@ -322,18 +322,19 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 	);
 }
 
-/// Deletes an item created outside the per-test directory when the test ends, pass or fail.
+/// Deletes a directory created outside the per-test directory when the test ends, pass or fail.
+/// Should that fail, its `rs-` name lets the drive's test-directory sweep remove it later.
 struct DeleteOnDrop {
 	client: Arc<Client>,
-	file: Option<RemoteFile>,
+	dir: Option<RemoteDirectory>,
 }
 
 impl Drop for DeleteOnDrop {
 	fn drop(&mut self) {
-		let (client, file) = (self.client.clone(), self.file.take());
+		let (client, dir) = (self.client.clone(), self.dir.take());
 		let cleanup = async move {
-			if let Some(file) = file
-				&& let Err(e) = client.delete_file_permanently(file).await
+			if let Some(dir) = dir
+				&& let Err(e) = client.delete_dir_permanently(dir).await
 			{
 				eprintln!("failed to clean up a copy in the drive root: {e}");
 			}
@@ -507,13 +508,16 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 async fn copies_into_the_drive_root() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.clone();
-	let name = format!("rs-copy-{}.txt", uuid::Uuid::new_v4());
-	let file = upload(&client, &resources.dir, &name, b"to the root").await;
+	let name = format!("rs-copy-{}", Uuid::new_v4());
+	let source = client
+		.create_dir(&(&resources.dir).into(), &name)
+		.await
+		.unwrap();
 	let result = client
 		.clone()
 		.copy_items(
-			vec![CopySource::File(file.into())],
-			DirType::Root(Cow::Owned(client.root().clone())),
+			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			client.root().clone().into(),
 			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
@@ -524,23 +528,22 @@ async fn copies_into_the_drive_root() {
 		Ok(report) => report,
 		Err(failed) => &failed.report,
 	};
-	let copied = report
-		.top_level
-		.first()
-		.map(|t| client.get_file(t.item.uuid()));
-	let copied = match copied {
-		Some(copied) => Some(copied.await.unwrap()),
-		None => None,
-	};
+	// the report stays in `result` to be unwrapped below, so the guard gets its own copy
 	let _cleanup = DeleteOnDrop {
 		client: client.clone(),
-		file: copied.clone(),
+		dir: report.top_level.first().and_then(|t| match &t.item {
+			NonRootItemType::Dir(dir) => Some(RemoteDirectory::clone(dir)),
+			NonRootItemType::File(_) => None,
+		}),
 	};
-	result.unwrap();
-	let copied = copied.expect("the copy was created");
+	let report = result.unwrap();
+	let copied = client
+		.get_dir(report.top_level[0].item.uuid())
+		.await
+		.unwrap();
 	assert_eq!(copied.name(), Some(name.as_str()));
 	assert_eq!(
-		filen_types::fs::Uuid::try_from(*filen_sdk_rs::fs::HasParent::parent(&copied)).unwrap(),
+		Uuid::try_from(*copied.parent()).unwrap(),
 		client.root().uuid()
 	);
 }
