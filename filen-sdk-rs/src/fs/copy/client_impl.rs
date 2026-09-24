@@ -447,10 +447,11 @@ mod tests {
 		time::Duration,
 	};
 
-	use tokio::sync::watch;
-
 	use super::*;
-	use crate::fs::copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem};
+	use crate::{
+		fs::copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
+		job::test_support::{SetOnDrop, controls},
+	};
 
 	#[derive(Default)]
 	struct Updates(Mutex<Vec<CopyUpdate>>);
@@ -461,16 +462,6 @@ mod tests {
 		fn on_update(&self, update: CopyUpdate) {
 			self.0.lock().unwrap().push(update);
 		}
-	}
-
-	fn controls() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
-		let (pause, pause_rx) = watch::channel(false);
-		let (cancel, cancel_rx) = watch::channel(false);
-		(
-			pause,
-			cancel,
-			JobControl::from_receivers(Some(pause_rx), Some(cancel_rx)),
-		)
 	}
 
 	/// The bindings run the copy on the SDK's multi-threaded runtime, which needs a `Send`
@@ -546,12 +537,6 @@ mod tests {
 		let reporter = Reporter::new(Updates::default());
 		let (_pause, cancel, control) = controls();
 		let dropped = Arc::new(AtomicBool::new(false));
-		struct SetOnDrop(Arc<AtomicBool>);
-		impl Drop for SetOnDrop {
-			fn drop(&mut self) {
-				self.0.store(true, Ordering::SeqCst);
-			}
-		}
 		let marker = SetOnDrop(Arc::clone(&dropped));
 		let listing = async move {
 			let _marker = marker;

@@ -7,7 +7,7 @@ use std::{
 	time::Duration,
 };
 
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 use super::*;
 use crate::{
@@ -21,6 +21,7 @@ use crate::{
 		dir::meta::DecryptedDirectoryMeta,
 		file::meta::{DecryptedFileMeta, FileMeta},
 	},
+	job::test_support::controls,
 };
 use filen_types::fs::StableUuid;
 
@@ -503,16 +504,6 @@ fn listed<T>(parent: &SourceDir<()>, item: T) -> Listed<T> {
 		parent: parent.uuid,
 		item,
 	}
-}
-
-fn controls() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
-	let (pause, pause_rx) = watch::channel(false);
-	let (cancel, cancel_rx) = watch::channel(false);
-	(
-		pause,
-		cancel,
-		JobControl::from_receivers(Some(pause_rx), Some(cancel_rx)),
-	)
 }
 
 type Running = tokio::task::JoinHandle<Result<CopyReport<()>, CopyFailed<()>>>;

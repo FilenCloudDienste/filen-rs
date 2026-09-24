@@ -299,14 +299,7 @@ pub(crate) mod cancel_grace {
 		};
 
 		use super::*;
-		use crate::job::JobControl;
-
-		struct SetOnDrop(Arc<AtomicBool>);
-		impl Drop for SetOnDrop {
-			fn drop(&mut self) {
-				self.0.store(true, Ordering::SeqCst);
-			}
-		}
+		use crate::job::{JobControl, test_support::SetOnDrop};
 
 		#[tokio::test(start_paused = true)]
 		async fn a_cancelled_job_that_finishes_in_time_keeps_its_result() {
@@ -417,12 +410,19 @@ impl<T> Drop for JobTasks<T> {
 }
 
 #[cfg(test)]
-mod tests {
-	use std::time::Duration;
+pub(crate) mod test_support {
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	};
 
-	use super::*;
+	use tokio::sync::watch;
 
-	fn controlled() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
+	use super::JobControl;
+
+	/// A job control with its pause and cancel senders, so a test can drop one without the other
+	/// (a [`JobController`](super::JobController) only drops both).
+	pub(crate) fn controls() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
 		let (pause, pause_rx) = watch::channel(false);
 		let (cancel, cancel_rx) = watch::channel(false);
 		(
@@ -432,13 +432,24 @@ mod tests {
 		)
 	}
 
-	/// Sets its flag when dropped, which a task's future is when the task is aborted.
-	struct SetOnDrop(Arc<AtomicBool>);
+	/// Sets its flag when dropped, which a future is when the task running it is aborted.
+	pub(crate) struct SetOnDrop(pub(crate) Arc<AtomicBool>);
+
 	impl Drop for SetOnDrop {
 		fn drop(&mut self) {
 			self.0.store(true, Ordering::SeqCst);
 		}
 	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use super::{
+		test_support::{SetOnDrop, controls},
+		*,
+	};
 
 	#[tokio::test]
 	async fn a_controller_pauses_resumes_and_cancels_its_job() {
@@ -466,7 +477,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn checkpoint_passes_while_running_and_fails_once_stopping() {
-		let (_pause, cancel, control) = controlled();
+		let (_pause, cancel, control) = controls();
 		assert_eq!(control.checkpoint().await, Ok(()));
 		cancel.send_replace(true);
 		assert!(control.is_cancelled());
@@ -481,7 +492,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn checkpoint_waits_out_a_pause() {
-		let (pause, _cancel, control) = controlled();
+		let (pause, _cancel, control) = controls();
 		pause.send_replace(true);
 		let waiter = tokio::spawn({
 			let control = control.clone();
@@ -495,7 +506,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn cancel_ends_a_paused_checkpoint() {
-		let (pause, cancel, control) = controlled();
+		let (pause, cancel, control) = controls();
 		pause.send_replace(true);
 		let waiter = tokio::spawn({
 			let control = control.clone();
@@ -508,7 +519,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn pause_changes_are_observed() {
-		let (pause, _cancel, control) = controlled();
+		let (pause, _cancel, control) = controls();
 		let changed = tokio::spawn({
 			let control = control.clone();
 			async move { control.pause_changed(false).await }
@@ -528,7 +539,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_pause_sender_dropped_while_paused_resumes_the_job() {
-		let (pause, _cancel, control) = controlled();
+		let (pause, _cancel, control) = controls();
 		pause.send_replace(true);
 		assert!(control.is_pause_requested());
 		drop(pause);
@@ -546,7 +557,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_cancel_cannot_be_taken_back() {
-		let (_pause, cancel, control) = controlled();
+		let (_pause, cancel, control) = controls();
 		cancel.send_replace(true);
 		assert!(control.is_cancelled());
 		cancel.send_replace(false);
@@ -558,7 +569,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn dropped_controllers_neither_pause_nor_cancel() {
-		let (pause, cancel, control) = controlled();
+		let (pause, cancel, control) = controls();
 		pause.send_replace(true);
 		drop(pause);
 		drop(cancel);
@@ -568,7 +579,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn until_stopping_drops_the_work_when_stopped() {
-		let (_pause, cancel, control) = controlled();
+		let (_pause, cancel, control) = controls();
 		let dropped = Arc::new(AtomicBool::new(false));
 		let work = {
 			let marker = SetOnDrop(dropped.clone());
