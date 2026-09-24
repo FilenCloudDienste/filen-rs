@@ -11,10 +11,27 @@ fn collision_key(name: &str) -> String {
 	name.to_lowercase()
 }
 
-/// A name that passes validation: the name itself when it is valid, otherwise its
-/// reversible encoding (legacy clients stored names today's rules reject).
-pub(crate) fn validated_name(name: &str) -> Result<ValidatedName, EntryNameError> {
-	ValidatedName::try_from(name).or_else(|_| encode_name(name))
+/// A source item's name made valid: the name itself when it is valid, otherwise its reversible
+/// encoding (legacy clients stored names today's rules reject).
+#[derive(Debug, PartialEq)]
+pub(crate) enum SourceName {
+	Valid(ValidatedName),
+	Encoded(ValidatedName),
+}
+
+impl SourceName {
+	pub(crate) fn parse(name: &str) -> Result<Self, EntryNameError> {
+		match ValidatedName::try_from(name) {
+			Ok(valid) => Ok(Self::Valid(valid)),
+			Err(_) => encode_name(name).map(Self::Encoded),
+		}
+	}
+
+	pub(crate) fn into_name(self) -> ValidatedName {
+		match self {
+			Self::Valid(name) | Self::Encoded(name) => name,
+		}
+	}
 }
 
 /// The names taken in one destination directory, compared case-insensitively.
@@ -40,18 +57,17 @@ impl TakenNames {
 		self.keys.insert(collision_key(name))
 	}
 
-	/// Picks and takes a free name for an item called `name`: the (validated) name itself when
-	/// free, otherwise `stem (n).ext` with the smallest free `n`. A name that already ends in
+	/// Picks and takes a free name for an item called `name`: the name itself when free,
+	/// otherwise `stem (n).ext` with the smallest free `n`. A name that already ends in
 	/// ` (n)` continues from `n + 1`; a counter that cannot grow any further is treated as part
 	/// of the stem, so it gets a counter of its own. Only a file's last extension is kept apart
 	/// (`a.tar.gz` → `a.tar (1).gz`); directories have no extension. Candidates are trimmed at
 	/// a character boundary to fit the name length limit.
 	pub(crate) fn allocate(
 		&mut self,
-		name: &str,
+		name: ValidatedName,
 		is_dir: bool,
 	) -> Result<ValidatedName, EntryNameError> {
-		let name = validated_name(name)?;
 		if self.insert(name.as_ref()) {
 			return Ok(name);
 		}
@@ -116,7 +132,7 @@ fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, En
 	};
 	let mut budget = MAX_BYTES - suffix.len() - ext.len();
 	loop {
-		let trimmed = truncate_at_char_boundary(&base, budget);
+		let trimmed = &base[..base.floor_char_boundary(budget)];
 		let candidate = format!("{trimmed}{suffix}{ext}");
 		match ValidatedName::try_from(candidate.as_str()) {
 			// NFC normalization can lengthen a name slightly; trim further and retry.
@@ -130,24 +146,17 @@ fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, En
 	}
 }
 
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
-	if s.len() <= max_bytes {
-		return s;
-	}
-	let mut end = max_bytes;
-	while !s.is_char_boundary(end) {
-		end -= 1;
-	}
-	&s[..end]
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
+	fn source_name(name: &str) -> ValidatedName {
+		SourceName::parse(name).unwrap().into_name()
+	}
+
 	fn allocate(taken: &[&str], name: &str, is_dir: bool) -> String {
 		let mut names = TakenNames::new(taken.iter().copied());
-		names.allocate(name, is_dir).unwrap().into()
+		names.allocate(source_name(name), is_dir).unwrap().into()
 	}
 
 	#[test]
@@ -177,8 +186,9 @@ mod tests {
 			allocate(&["a (1).TXT", "a.txt"], "A.txt", false),
 			"A (2).txt"
 		);
-		// the key is exactly `to_lowercase`, which `hash_name` uses
-		assert_eq!(collision_key("İstanbul"), "İstanbul".to_lowercase());
+		// the key is exactly `to_lowercase`, which `hash_name` uses: it maps `İ` to `i` plus a
+		// combining dot, where a simple case fold would give a plain `i`
+		assert_eq!(collision_key("İstanbul"), "i\u{307}stanbul");
 	}
 
 	#[test]
@@ -219,9 +229,9 @@ mod tests {
 	#[test]
 	fn each_allocation_takes_its_name() {
 		let mut names = TakenNames::default();
-		let first: String = names.allocate("a.txt", false).unwrap().into();
-		let second: String = names.allocate("a.txt", false).unwrap().into();
-		let third: String = names.allocate("A.TXT", false).unwrap().into();
+		let first: String = names.allocate(source_name("a.txt"), false).unwrap().into();
+		let second: String = names.allocate(source_name("a.txt"), false).unwrap().into();
+		let third: String = names.allocate(source_name("A.TXT"), false).unwrap().into();
 		assert_eq!(
 			[first.as_str(), second.as_str(), third.as_str()],
 			["a.txt", "a (1).txt", "A (2).TXT"]
@@ -238,11 +248,22 @@ mod tests {
 
 	#[test]
 	fn invalid_legacy_names_are_encoded() {
-		let encoded: String = encode_name("a:b.txt").unwrap().into();
-		assert_eq!(allocate(&[], "a:b.txt", false), encoded);
+		let encoded = encode_name("a:b.txt").unwrap();
+		assert_eq!(
+			SourceName::parse("a:b.txt").unwrap(),
+			SourceName::Encoded(encoded.clone())
+		);
+		assert_eq!(
+			SourceName::parse("a.txt").unwrap(),
+			SourceName::Valid(ValidatedName::try_from("a.txt").unwrap())
+		);
+		assert_eq!(allocate(&[], "a:b.txt", false), String::from(encoded));
 		let mut names = TakenNames::default();
-		names.allocate("a:b.txt", false).unwrap();
-		let second: String = names.allocate("a:b.txt", false).unwrap().into();
+		names.allocate(source_name("a:b.txt"), false).unwrap();
+		let second: String = names
+			.allocate(source_name("a:b.txt"), false)
+			.unwrap()
+			.into();
 		assert!(second.ends_with(" (1).txt"), "{second}");
 		assert!(ValidatedName::try_from(second.as_str()).is_ok());
 	}
@@ -269,6 +290,6 @@ mod tests {
 
 	#[test]
 	fn empty_names_are_rejected() {
-		assert!(TakenNames::default().allocate("", false).is_err());
+		assert!(SourceName::parse("").is_err());
 	}
 }

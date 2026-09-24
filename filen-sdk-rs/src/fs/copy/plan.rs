@@ -23,7 +23,7 @@ use crate::{
 	},
 };
 
-use super::naming::{TakenNames, validated_name};
+use super::naming::{SourceName, TakenNames};
 
 /// A source directory, independent of the category it was listed from.
 #[derive(Debug, Clone)]
@@ -340,22 +340,25 @@ fn allocate_name(
 		|| ValidatedName::try_from(uuid.to_string().as_str()).expect("a uuid is a valid name");
 	let by_uuid = |taken: &mut TakenNames| {
 		taken
-			.allocate(uuid_name().as_ref(), is_dir)
+			.allocate(uuid_name(), is_dir)
 			.unwrap_or_else(|_| uuid_name())
 	};
 	let Some(name) = name else {
 		return (by_uuid(taken), Some(RenameReason::Undecryptable));
 	};
 	// Only an empty name, or one whose encoding exceeds the length limit, fails here.
-	let Ok(valid) = validated_name(name) else {
+	let Ok(source_name) = SourceName::parse(name) else {
 		return (by_uuid(taken), Some(RenameReason::InvalidName));
 	};
-	let Ok(allocated) = taken.allocate(valid.as_ref(), is_dir) else {
+	let encoded = matches!(source_name, SourceName::Encoded(_));
+	let valid = source_name.into_name();
+	// Kept to tell a keep-both rename from the name itself.
+	let Ok(allocated) = taken.allocate(valid.clone(), is_dir) else {
 		return (by_uuid(taken), Some(RenameReason::InvalidName));
 	};
 	let reason = if allocated != valid {
 		Some(RenameReason::DuplicateName)
-	} else if ValidatedName::try_from(name).is_err() {
+	} else if encoded {
 		Some(RenameReason::InvalidName)
 	} else {
 		None

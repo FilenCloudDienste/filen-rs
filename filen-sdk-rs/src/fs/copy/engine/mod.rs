@@ -94,7 +94,7 @@ impl NameRetry {
 
 	/// The next name after `taken_name`, or an error once [`TOP_LEVEL_NAME_ATTEMPTS`] names
 	/// were tried.
-	fn next(&mut self, taken_name: &ValidatedName) -> Result<ValidatedName, Error> {
+	fn next(&mut self, taken_name: ValidatedName) -> Result<ValidatedName, Error> {
 		self.attempts += 1;
 		if self.attempts >= TOP_LEVEL_NAME_ATTEMPTS {
 			return Err(Error::custom(
@@ -103,7 +103,7 @@ impl NameRetry {
 			));
 		}
 		self.taken.insert(taken_name.as_ref());
-		Ok(self.taken.allocate(taken_name.as_ref(), self.is_dir)?)
+		Ok(self.taken.allocate(taken_name, self.is_dir)?)
 	}
 
 	/// `name`, or the first following keep-both name the server reports free in `parent`.
@@ -114,7 +114,7 @@ impl NameRetry {
 		mut name: ValidatedName,
 	) -> Result<ValidatedName, Error> {
 		while backend.name_exists(parent, &name).await? {
-			name = self.next(&name)?;
+			name = self.next(name)?;
 		}
 		Ok(name)
 	}
@@ -965,7 +965,7 @@ async fn create_dir<B: CopyBackend>(
 			// Someone created the same name at the destination after it was listed: keep both
 			// by taking the next free name.
 			CreatedDir::Merged if top_level => {
-				name = retry.next(&name).map_err(|e| DirError::Failed(stage, e))?
+				name = retry.next(name).map_err(|e| DirError::Failed(stage, e))?
 			}
 			CreatedDir::Merged => {
 				return Err(DirError::Failed(
