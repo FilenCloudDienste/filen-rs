@@ -42,7 +42,8 @@ impl TakenNames {
 
 	/// Picks and takes a free name for an item called `name`: the (validated) name itself when
 	/// free, otherwise `stem (n).ext` with the smallest free `n`. A name that already ends in
-	/// ` (n)` continues from `n + 1`. Only a file's last extension is kept apart
+	/// ` (n)` continues from `n + 1`; a counter that cannot grow any further is treated as part
+	/// of the stem, so it gets a counter of its own. Only a file's last extension is kept apart
 	/// (`a.tar.gz` → `a.tar (1).gz`); directories have no extension. Candidates are trimmed at
 	/// a character boundary to fit the name length limit.
 	pub(crate) fn allocate(
@@ -56,18 +57,21 @@ impl TakenNames {
 		}
 
 		let (stem, ext) = split_extension(name.as_ref(), is_dir);
-		let (base, mut n) = match strip_counter(stem) {
-			Some((base, n)) => (base, n.saturating_add(1)),
-			None => (stem, 1),
-		};
+		let (mut base, mut n) = strip_counter(stem)
+			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
+			.unwrap_or((stem, 1));
 		loop {
 			let candidate = numbered_candidate(base, n, ext)?;
 			if self.insert(candidate.as_ref()) {
 				return Ok(candidate);
 			}
 			// Every iteration either returns or skips a taken name, and only finitely many
-			// names are taken, so this terminates.
-			n = n.saturating_add(1);
+			// names are taken, so counting up from 1 terminates. Only a continued counter can
+			// run out of numbers; the whole stem then starts over at 1.
+			(base, n) = match n.checked_add(1) {
+				Some(next) => (base, next),
+				None => (stem, 1),
+			};
 		}
 	}
 }
@@ -188,6 +192,20 @@ mod tests {
 		);
 		assert_eq!(allocate(&["(1).txt"], "(1).txt", false), "(1) (1).txt");
 		assert_eq!(allocate(&["a(1).txt"], "a(1).txt", false), "a(1) (1).txt");
+	}
+
+	#[test]
+	fn a_counter_that_cannot_grow_becomes_part_of_the_stem() {
+		let max = format!("a ({}).txt", u64::MAX);
+		assert_eq!(
+			allocate(&[max.as_str()], &max, false),
+			format!("a ({}) (1).txt", u64::MAX)
+		);
+		let below_max = format!("a ({}).txt", u64::MAX - 1);
+		assert_eq!(
+			allocate(&[below_max.as_str(), max.as_str()], &below_max, false),
+			format!("a ({}) (1).txt", u64::MAX - 1)
+		);
 	}
 
 	#[test]
