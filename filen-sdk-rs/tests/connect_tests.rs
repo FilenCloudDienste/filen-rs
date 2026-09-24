@@ -377,11 +377,13 @@ async fn file_public_link() {
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
+	assert!(linked_file.downloadable());
 
 	let password = "some_password";
 
 	link.set_password(password.to_string());
 	link.set_expiration(PublicLinkExpiration::OneHour);
+	link.set_downloadable(false);
 	client.update_file_link(&file, &link).await.unwrap();
 	let found_link = client.get_file_link_status(&file).await.unwrap().unwrap();
 	let mut cloned_found_link = found_link.clone();
@@ -393,6 +395,7 @@ async fn file_public_link() {
 		.await
 		.unwrap();
 	assert_eq!(linked_file, file);
+	assert!(!linked_file.downloadable());
 	drop(file_key);
 
 	client

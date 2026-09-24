@@ -821,9 +821,15 @@ pub struct LinkedFile {
 	pub(crate) version: FileEncryptionVersion,
 	pub(crate) timestamp: DateTime<Utc>,
 	pub(crate) file_key: FileKey,
+	pub(crate) downloadable: bool,
 }
 
 impl LinkedFile {
+	/// Whether the link owner allows downloading the file.
+	pub fn downloadable(&self) -> bool {
+		self.downloadable
+	}
+
 	pub(crate) fn blocking_from_response(
 		file_key: FileKey,
 		response: filen_types::api::v3::file::link::info::Response<'static>,
@@ -861,6 +867,7 @@ impl LinkedFile {
 			version: response.version,
 			timestamp: response.timestamp,
 			file_key,
+			downloadable: response.download_btn,
 		})
 	}
 }
@@ -1003,3 +1010,46 @@ impl PartialEq<RemoteFile> for LinkedFile {
 // 		self.mime().map(|s| s.to_string())
 // 	}
 // }
+
+#[cfg(test)]
+mod tests {
+	use crate::crypto::{shared::CreateRandom, v2};
+
+	use super::*;
+
+	/// A file link info response as the API sends it, with the metadata encrypted under
+	/// `file_key` so `blocking_from_response` can decrypt it.
+	fn link_info_response(
+		file_key: FileKey,
+		download_btn: bool,
+	) -> filen_types::api::v3::file::link::info::Response<'static> {
+		let meta_key = file_key.to_meta_key().unwrap();
+		serde_json::from_value(serde_json::json!({
+			"uuid": Uuid::new_v4(),
+			"name": meta_key.blocking_encrypt_meta("a.txt"),
+			"mime": meta_key.blocking_encrypt_meta("text/plain"),
+			"size": meta_key.blocking_encrypt_meta("13"),
+			"chunks": 1,
+			"region": "de-1",
+			"bucket": "filen-1",
+			"version": 2,
+			"timestamp": 1_700_000_000_000u64,
+			"downloadBtn": download_btn,
+		}))
+		.unwrap()
+	}
+
+	#[test]
+	fn linked_file_maps_download_btn_to_downloadable() {
+		for download_btn in [true, false] {
+			let file_key = FileKey::V2(v2::FileKey::generate());
+			let linked = LinkedFile::blocking_from_response(
+				file_key,
+				link_info_response(file_key, download_btn),
+			)
+			.unwrap();
+			assert_eq!(linked.name(), Some("a.txt"));
+			assert_eq!(linked.downloadable(), download_btn);
+		}
+	}
+}

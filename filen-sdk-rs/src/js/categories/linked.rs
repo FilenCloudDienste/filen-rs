@@ -43,6 +43,7 @@ pub struct LinkedFile {
 	)]
 	timestamp: DateTime<Utc>,
 	file_key: String,
+	downloadable: bool,
 	__linked_tag: bool,
 	// JS only field, indicates if the file can have a thumbnail generated;
 	// the same gate `File.canMakeThumbnail` answers, so a caller never has to
@@ -64,6 +65,7 @@ impl From<LinkedFileRS> for LinkedFile {
 			version: value.version,
 			timestamp: value.timestamp,
 			file_key: value.file_key.to_string(),
+			downloadable: value.downloadable,
 			__linked_tag: true,
 		}
 	}
@@ -84,6 +86,7 @@ impl TryFrom<LinkedFile> for LinkedFileRS {
 			version: value.version,
 			timestamp: value.timestamp,
 			file_key: FileKey::from_str_with_version(&value.file_key, value.version)?,
+			downloadable: value.downloadable,
 		})
 	}
 }
@@ -314,6 +317,34 @@ mod tests {
 			converted.link_key.is_some(),
 			"key must be preserved when the version is supplied"
 		);
+	}
+
+	// `downloadable` must survive the trip out to JS and back in, since a JS `LinkedFile` is
+	// handed back to the SDK for downloads and copies.
+	#[test]
+	fn linked_file_round_trips_downloadable() {
+		for downloadable in [true, false] {
+			let rs = LinkedFileRS {
+				uuid: Uuid::new_v4(),
+				name: MaybeEncrypted::Decrypted(Cow::Borrowed("a.txt")),
+				mime: MaybeEncrypted::Decrypted(Cow::Borrowed("text/plain")),
+				size: 13,
+				chunks: 1,
+				region: "de-1".to_string(),
+				bucket: "filen-1".to_string(),
+				version: FileEncryptionVersion::V2,
+				timestamp: DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap(),
+				file_key: FileKey::from_str_with_version(
+					&"a".repeat(32),
+					FileEncryptionVersion::V2,
+				)
+				.unwrap(),
+				downloadable,
+			};
+			let js = LinkedFile::from(rs.clone());
+			assert_eq!(js.downloadable, downloadable);
+			assert_eq!(LinkedFileRS::try_from(js).unwrap(), rs);
+		}
 	}
 
 	#[test]
