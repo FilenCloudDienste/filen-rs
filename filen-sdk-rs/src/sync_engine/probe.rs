@@ -103,17 +103,86 @@ const CONTENDING_READ: Duration = Duration::from_millis(500);
 /// UNCONTENDED cost (0.7 ms, seen once) as though it were the wait it exists to find.
 const CONTENDED_WRITE: Duration = Duration::from_millis(5_000);
 
+/// How long a padded name segment is, for [`NameStyle::Long`]. Well under APFS's 255-byte
+/// `NAME_MAX`, and long enough that a three-level path runs past 300 characters — where a path no
+/// longer fits the small-string cases and every per-path `String` starts costing a real allocation.
+const LONG_SEGMENT: usize = 100;
+
+/// How a fixture names its directories and files.
+///
+/// A name is not decoration here: it decides what the scan's NFC pass, the case fold and every
+/// materialised path actually cost. [`collision_key`](super::scan::collision_key) is
+/// `char::to_lowercase` over the whole path, which is nearly free for lowercase ASCII and allocates
+/// per character for anything else — so a tree named one way and a tree named the other are two
+/// different measurements of the same engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameStyle {
+	/// Short lowercase ASCII: `dir_000001`, `file_000001.dat`. The shape every figure recorded
+	/// before this existed was taken on.
+	Ascii,
+	/// The same names padded to [`LONG_SEGMENT`] bytes a piece.
+	Long,
+	/// Mixed-case non-ASCII, including the upper/lower pairs the case fold exists for. Every name is
+	/// distinct AFTER folding: a fixture whose names collided would measure the collision path
+	/// instead of the one it claims to.
+	Unicode,
+}
+
+impl NameStyle {
+	fn dir_name(self, index: usize) -> String {
+		match self {
+			Self::Ascii => format!("dir_{index:06}"),
+			Self::Long => {
+				let mut name = format!("dir_{index:06}_");
+				name.extend(std::iter::repeat_n(
+					'd',
+					LONG_SEGMENT.saturating_sub(name.len()),
+				));
+				name
+			}
+			Self::Unicode => {
+				format!("Ordner_\u{00c4}{index:06}_\u{03a9}\u{03bc}\u{03ad}\u{03b3}\u{03b1}")
+			}
+		}
+	}
+
+	fn file_name(self, index: usize) -> String {
+		match self {
+			Self::Ascii => format!("file_{index:06}.dat"),
+			Self::Long => {
+				let mut name = format!("file_{index:06}_");
+				name.extend(std::iter::repeat_n(
+					'f',
+					LONG_SEGMENT.saturating_sub(name.len() + ".dat".len()),
+				));
+				name.push_str(".dat");
+				name
+			}
+			Self::Unicode => {
+				format!("Datei_\u{00dc}{index:06}_\u{0424}\u{0430}\u{0439}\u{043b}.dat")
+			}
+		}
+	}
+}
+
 /// The tree's shape, as `SYNC_PROBE_SHAPE` gives it.
 pub(super) struct Shape {
 	files_per_leaf: usize,
 	depth: usize,
 	file_bytes: usize,
+	/// How its directories and files are named (see [`NameStyle`]).
+	names: NameStyle,
 }
 
 impl Shape {
 	/// A shape named outright, for a caller that has one rather than an environment to read it
 	/// from (the named scenarios in [`bench`](super::bench)).
-	pub(super) fn new(files_per_leaf: usize, depth: usize, file_bytes: usize) -> Self {
+	pub(super) fn new(
+		files_per_leaf: usize,
+		depth: usize,
+		file_bytes: usize,
+		names: NameStyle,
+	) -> Self {
 		assert!(
 			depth > 0 && files_per_leaf > 0,
 			"a shape needs at least one level and one file per leaf"
@@ -122,6 +191,7 @@ impl Shape {
 			files_per_leaf,
 			depth,
 			file_bytes,
+			names,
 		}
 	}
 
@@ -136,6 +206,9 @@ impl Shape {
 			files_per_leaf: parts.next().unwrap_or(20),
 			depth: parts.next().unwrap_or(3),
 			file_bytes: parts.next().unwrap_or(73),
+			// The probe's own runs stay on the names every figure it recorded was taken on; the
+			// named scenarios in `bench` are where the other styles are measured.
+			names: NameStyle::Ascii,
 		};
 		assert!(
 			shape.depth > 0 && shape.files_per_leaf > 0,
@@ -283,7 +356,7 @@ impl TreeBuilder<'_> {
 			return;
 		}
 		for index in 0..self.branching {
-			let name = format!("dir_{index:06}");
+			let name = self.shape.names.dir_name(index);
 			let child = path.join(&name);
 			fs::create_dir(&child).expect("creating a probe directory");
 			let uuid = Uuid::new_v4();
@@ -302,7 +375,7 @@ impl TreeBuilder<'_> {
 
 	fn leaf_files(&mut self, path: &Path, parent: Uuid) {
 		for index in 0..self.shape.files_per_leaf {
-			let name = format!("file_{index:06}.dat");
+			let name = self.shape.names.file_name(index);
 			let content = self.content();
 			fs::write(path.join(&name), &content).expect("writing a probe file");
 			let uuid = Uuid::new_v4();

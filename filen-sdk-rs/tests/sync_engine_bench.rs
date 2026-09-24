@@ -7,6 +7,11 @@
 //!
 //! `#[ignore]`d: a scenario builds (and deletes) its whole tree on disk.
 //!
+//! macOS and Linux only. On Windows `PairChanges::new` marks every pair
+//! `LocalEventsDegraded`, so every pass falls back to a whole read and every change-scoped
+//! scenario fails its read-kind assertion — in this process and in the memory children alike.
+//! Nothing here checks for it; it simply fails. Every figure in `BASELINE.md` was taken on macOS.
+//!
 //! Run one scenario, a list of them, or a named set. `--exact` is not optional: cargo's test filter
 //! is a SUBSTRING match, so a bare `sync_engine_bench` also selects `sync_engine_bench_compare`.
 //!

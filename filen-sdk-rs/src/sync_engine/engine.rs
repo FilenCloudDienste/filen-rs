@@ -1282,6 +1282,16 @@ pub(super) struct BenchPass {
 	/// What an approved pass would execute — the guard-screened plan, as [`Self::plan_pair`]
 	/// reports it.
 	pub(super) actions: usize,
+	/// What the guard held back. Without it a benchmark cannot tell a pass whose deletions were all
+	/// held — the whole point of a mass-delete scenario — from a pass that planned nothing at all,
+	/// and both report `actions: 0`.
+	pub(super) held: usize,
+	/// Paths surfaced as two-way conflicts rather than actions.
+	pub(super) conflicts: usize,
+	/// Directory moves folded out of the plan, each carrying its whole subtree (see
+	/// [`plan::fold_dir_moves`]). A scenario that moves a directory and folds no move measured a
+	/// re-upload of the subtree instead, which is a different pass at a very different price.
+	pub(super) dir_moves: usize,
 	pub(super) rows: usize,
 }
 
@@ -1375,6 +1385,9 @@ impl SyncEngine {
 			scoped: prep.read.is_scoped(),
 			full_reason: prep.read.full_pass_reason(),
 			actions: screened.decision.safe.len(),
+			held: screened.decision.held.len(),
+			conflicts: screened.conflicts.len(),
+			dir_moves: prep.dir_moves.len(),
 			rows: prep.baseline.len(),
 		};
 		// Dropped inside a NAMED step rather than at the end of the function. Freeing what a pass
