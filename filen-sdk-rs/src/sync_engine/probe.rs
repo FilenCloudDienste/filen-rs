@@ -44,7 +44,7 @@ use super::{
 	SyncMode,
 	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	derive::{self, Derived},
-	engine::{PendingKind, PendingWrites, assembly_accounted},
+	engine::{PendingKind, PendingWrites, assembly_accounted, unaccounted_key},
 	ignore::{
 		IgnoreRules, Origin, RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
@@ -373,16 +373,24 @@ impl ScanCosts {
 	/// One row per step, named `<phase>__<step>` so a TSV groups them under the phase they were
 	/// measured in, then one `<phase>__unattributed` row for whatever the steps do not account for.
 	///
-	/// `total` is the phase's own measured time, from the caller's clock around the whole call. The
-	/// remainder is a `saturating_sub`: every step is timed inside that clock, so it cannot go
-	/// negative unless a caller passes the total of a DIFFERENT call, which this reports as zero
-	/// rather than as a wrapped figure.
+	/// `total` is the phase's own measured time, from the caller's clock around the whole call.
+	/// Every step is timed inside that clock and no two of them overlap, so the steps can only sum
+	/// to LESS than it — ASSERTED here rather than assumed, because the remainder is a
+	/// `saturating_sub` and would otherwise report a perfectly balanced table for a phase that
+	/// double-counted an overlapped region. What the balance is evidence of is therefore the
+	/// assert; what the remainder's SIZE is evidence of is that no material term sits outside
+	/// every step.
 	fn record(&self, probe: &mut Probe, phase: &str, items: usize, total: Duration) {
 		let mut summed = Duration::ZERO;
 		for (step, elapsed, detail) in &self.steps {
 			summed += *elapsed;
 			probe.record(&format!("{phase}__{step}"), items, *elapsed, detail);
 		}
+		assert!(
+			summed <= total,
+			"{phase}: the steps sum to {summed:?}, past the {total:?} the caller timed — two step \
+			 timers overlap and the phase is counting a region twice"
+		);
 		probe.record(
 			&format!("{phase}__unattributed"),
 			items,
@@ -929,9 +937,14 @@ fn pass_pure(
 /// - the facts merge — `merge_remote_view` prunes PER TOUCHED PATH and `unknown_remote_paths`
 ///   returns before it looks at a row when nothing was skipped, which a derived view guarantees;
 ///   `facts::observe_local` is PER OBSERVATION,
-/// - `unaccounted_key`'s `debug_assert` — PER MAP KEY, so per node, and the one omission here that
-///   does grow with the tree. Deliberate: it is one `Baseline` path resolve per key and a shipped
-///   release pass does not run it (see `prepare_scoped`).
+///
+/// What the phase ADDS that no pass pays, and that is inside the total the 50 ms target is read
+/// off: `pending_plant`, this harness planting the unacknowledged write the fold then walks
+/// (0.003 ms at 1M, and its own row). Nothing else here is harness work.
+///
+/// `unaccounted_key` was the one omission that grew with the tree, back when it was a
+/// `debug_assert` over two whole-tree maps. It is in every build now and costs the change rather
+/// than the tree, so it is a timed step of this phase (`decided_check`) like any other.
 ///
 /// The three per-node steps this phase used to leave out were brought into it in the previous
 /// round — `load_remote_rules`' candidate scan over the UNFILTERED view, `RuleFiles::Only`'s scan
@@ -977,7 +990,8 @@ fn prepare_scoped(
 	costs.push(
 		"from_baseline",
 		elapsed,
-		"two maps sized to the baseline, one visit per row",
+		"the uncarryable rows, from the tree's own index; a row either side can carry is not \
+		 visited and no map is sized to the tree",
 	);
 
 	// The remote half FIRST, as the pass runs it: every path the delta touched is a path the local
@@ -1237,6 +1251,25 @@ fn prepare_scoped(
 		 to correct; a fold that applied here would be editing the maps this phase goes on to time"
 	);
 
+	// The decided set's half of the same self-check, which `sync_once` runs HERE — after the last
+	// producer, the fold above, has run. It was a `debug_assert` while the two sides were the whole
+	// tree and is in every build since the check was promoted out of `debug_assert`, so a shipped
+	// pass pays it and the phase that
+	// prices a shipped pass has to run it: one `Baseline` resolve per key a producer placed.
+	let (unaccounted, elapsed) =
+		timed(|| unaccounted_key(&baseline, &derived.local, &view.nodes, &derived.decided));
+	costs.push(
+		"decided_check",
+		elapsed,
+		"`unaccounted_key`: one baseline resolve per key this pass's producers placed",
+	);
+	// A GUARD that can fail: a key neither a row nor the decided set accounts for sends the real
+	// pass to a whole read, so a phase that produced one would be timing a pass no engine runs.
+	assert_eq!(
+		unaccounted, None,
+		"every key the derived sides hold must be a baseline row or a decided path"
+	);
+
 	let Derived {
 		mut local,
 		mut decided,
@@ -1283,15 +1316,16 @@ fn prepare_scoped(
 		mark.elapsed(),
 		"`reconcile` over the decided keys, intersected with the three inputs",
 	);
-	// The two whole-tree maps FREED. `from_baseline` builds them inside its own timer and nothing
-	// times their release, so before this row their deallocation sat inside the phase total and
-	// inside no step — which is exactly where it hid: at a million rows it is the second-largest
-	// term of a scoped pass, behind `from_baseline` and ahead of everything else by four orders of
-	// magnitude. Per node, and two allocations per node on each side, since every node carries its
-	// own path beside the key it is filed under.
+	// The two sides FREED. This row exists because the release used to be the second-largest term
+	// of a scoped pass at a million rows and sat inside the phase total and inside no step, which
+	// is exactly where it hid: `from_baseline` built two path-keyed whole-tree maps inside its own
+	// timer and nothing timed their deallocation. Both sides are carried now — an
+	// overlay of what this pass observed over rows the resident tree owns — so what is freed here
+	// is per OBSERVED PATH and the tree outlives it. The row is kept, at its old name, because a
+	// term that once hid here is a term worth going on measuring.
 	//
 	// WHERE THE REAL PASS PAYS IT, which this row's position does not say: `prepare_scoped` hands
-	// both maps on rather than dropping them — `derived.local` becomes `LocalScan::nodes` and the
+	// both sides on rather than dropping them — `derived.local` becomes `LocalScan::nodes` and the
 	// view moves into `Prepared::remote_view` — so the engine frees them when `run_pass` drops the
 	// `Prepared`, after the apply. The work is the same and the pass pays it either way; only the
 	// point in the pass differs. So this belongs in a figure for what a scoped pass COSTS, which is
@@ -1302,7 +1336,7 @@ fn prepare_scoped(
 	costs.push(
 		"drop_sides",
 		mark.elapsed(),
-		"freeing the two path-keyed maps `from_baseline` built: per node, on both sides",
+		"freeing the two sides: per path this pass observed, not per node in the tree",
 	);
 	let mark = Instant::now();
 	drop((

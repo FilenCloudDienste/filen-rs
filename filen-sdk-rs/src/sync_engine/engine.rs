@@ -1532,19 +1532,19 @@ pub(super) fn assembly_accounted(
 /// this cannot tell it from the node the row carried. Nothing here bounds that class; the producers'
 /// own funnels are the only record of it.
 ///
-/// One `Baseline` path resolve per key, which is why the caller asserts it in debug builds only
-/// while the maps are still the whole tree (see `prepare_scoped`).
-fn unaccounted_key(
+/// One `Baseline` path resolve per key a PRODUCER placed, which is what makes this affordable in
+/// every build: the two sides hold what this pass read, not the tree ([`Side::own_keys`]).
+pub(super) fn unaccounted_key(
 	baseline: &Baseline,
-	local: &impl Nodes<Node = scan::LocalNode>,
-	remote: &impl Nodes<Node = RemoteNode>,
+	local: &Side<scan::LocalNode>,
+	remote: &Side<RemoteNode>,
 	decided: &BTreeSet<String>,
 ) -> Option<String> {
 	local
-		.paths()
-		.chain(remote.paths())
-		.find(|path| !decided.contains(path.as_ref()) && !baseline.contains_key(path))
-		.map(Cow::into_owned)
+		.own_keys()
+		.chain(remote.own_keys())
+		.find(|path| !decided.contains(*path) && !baseline.contains_key(path))
+		.map(str::to_owned)
 }
 
 /// The read-only inputs to a pass, shared by planning and applying.
@@ -3319,23 +3319,31 @@ impl SyncEngine {
 		// blackbox and stress binaries, all debug builds exercising real passes — and in no
 		// release one. What changes that is plan 6.4: once the maps hold what the pass READ instead
 		// of the whole baseline, this is O(changed) and belongs in the release path.
-		debug_assert!(
-			unaccounted_key(
-				&inputs.baseline,
-				&derived.local.of(&inputs.baseline),
-				&view.nodes.of(&inputs.baseline),
-				&derived.decided
-			)
-			.is_none(),
-			"sync_once[pair {pair}]: a derived map holds a key that is no baseline row and that no \
-			 producer recorded, so the narrowed reconcile would never decide it: {:?}",
-			unaccounted_key(
-				&inputs.baseline,
-				&derived.local.of(&inputs.baseline),
-				&view.nodes.of(&inputs.baseline),
-				&derived.decided
-			)
-		);
+		// In EVERY build now, where this was a `debug_assert` while the two sides were still the
+		// whole tree. It costs one baseline resolve per key a producer placed — the change, not
+		// the tree — so the failure it catches is worth a whole read rather than a silent skip: a
+		// key the reconcile never visits is one nothing is planned or reported at.
+		//
+		// What the fallback re-does: `pending.settle` and `retire_superseded_creates` have already
+		// run, and the `confirmed` rows this pass advanced are dropped. A whole pass redoes all
+		// three against a real snapshot, which is the stricter evidence anyway — the cost is one
+		// wasted settle/retire round trip and a confirmation deferred by a pass.
+		if let Some(key) = unaccounted_key(
+			&inputs.baseline,
+			&derived.local,
+			&view.nodes,
+			&derived.decided,
+		) {
+			tracing::warn!(
+				"sync_once[pair {pair}]: a derived side holds {key:?}, which is no baseline row and \
+				 which no producer recorded, so the narrowed reconcile would never decide it; \
+				 reading both sides instead"
+			);
+			return Ok(Scoped::Whole(
+				Box::new(inputs),
+				FullPassReason::AssemblyMismatch,
+			));
+		}
 		holds.held_remote = view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -5824,17 +5832,17 @@ mod tests {
 		let hash = Blake3Hash::from([9u8; 32]);
 		let baseline = Baseline::from_rows([file_row("docs/a.txt", Uuid::new_v4(), hash)]);
 		// A local producer's key: the node the observation found, off the path its row records.
-		let moved = HashMap::from([(
+		let moved: Side<LocalNode> = Side::from(HashMap::from([(
 			"docs/moved.txt".to_string(),
 			local_file("docs/moved.txt", hash),
-		)]);
+		)]));
 		// And a remote one: a path the delta placed that no row names.
-		let placed = HashMap::from([(
+		let placed: Side<RemoteNode> = Side::from(HashMap::from([(
 			"docs/new".to_string(),
 			remote_dir("docs/new", Uuid::new_v4()),
-		)]);
-		let empty_local: HashMap<String, LocalNode> = HashMap::new();
-		let empty_remote: HashMap<String, RemoteNode> = HashMap::new();
+		)]));
+		let empty_local: Side<LocalNode> = Side::default();
+		let empty_remote: Side<RemoteNode> = Side::default();
 
 		assert_eq!(
 			unaccounted_key(&baseline, &moved, &empty_remote, &BTreeSet::new()).as_deref(),
@@ -5859,12 +5867,36 @@ mod tests {
 		assert_eq!(
 			unaccounted_key(
 				&baseline,
-				&HashMap::from([("docs/a.txt".to_string(), local_file("docs/a.txt", hash))]),
+				&Side::from(HashMap::from([(
+					"docs/a.txt".to_string(),
+					local_file("docs/a.txt", hash)
+				)])),
 				&empty_remote,
 				&BTreeSet::new()
 			),
 			None,
 			"a carried row needs no record: `from_baseline` only ever inserts at a row's path"
+		);
+
+		// And the same asked of a CARRIED side, which is where this check now runs. Only the
+		// overlay is walked: the rows such a side derives answer for themselves and are no
+		// producer's doing, which is what makes the check cost the change and not the tree.
+		let mut produced: Side<LocalNode> = Side::carried();
+		produced.insert(
+			"docs/moved.txt".to_string(),
+			local_file("docs/moved.txt", hash),
+		);
+		assert_eq!(
+			unaccounted_key(&baseline, &produced, &empty_remote, &BTreeSet::new()).as_deref(),
+			Some("docs/moved.txt"),
+			"the overlay is where every producer writes, so that is where an unrecorded key is"
+		);
+		let mut at_a_row: Side<LocalNode> = Side::carried();
+		at_a_row.insert("docs/a.txt".to_string(), local_file("docs/a.txt", hash));
+		assert_eq!(
+			unaccounted_key(&baseline, &at_a_row, &empty_remote, &BTreeSet::new()),
+			None,
+			"a key at a row's own path is no invention, whichever side holds it"
 		);
 	}
 
