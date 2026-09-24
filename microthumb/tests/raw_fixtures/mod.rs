@@ -1,10 +1,11 @@
-//! Fetch-and-verify for the pinned RAW samples in [`pins`].
+//! Fetch-and-verify for the pinned sample files: the RAW samples in [`pins`]
+//! and the real HEIF files in [`heif_pins`].
 //!
 //! Three properties this module exists to guarantee:
 //!
 //! * **Only pinned URLs are requested.** There is no directory listing and no
-//!   scraping. The set of bytes these tests can ever see is exactly the table
-//!   in `pins.rs`.
+//!   scraping. The set of bytes these tests can ever see is exactly the tables
+//!   in `pins.rs` and `heif_pins.rs`.
 //! * **The hash is checked on every run**, not only after a download. A cached
 //!   file that no longer matches its pin is a hard error, so the tests can
 //!   never quietly run against bytes we do not recognise.
@@ -29,6 +30,7 @@
 
 #![allow(dead_code)]
 
+pub mod heif_pins;
 pub mod pins;
 
 use std::fs;
@@ -36,6 +38,36 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub use pins::{RAW_FIXTURES, RawFixture};
+
+/// What fetching and verifying needs of a pinned file, whichever table pins it.
+pub trait Pinned {
+	/// Exact URL the file is fetched from.
+	fn url(&self) -> &'static str;
+	/// BLAKE3 of the whole file, verified on every run.
+	fn blake3(&self) -> &'static str;
+	/// Exact byte length.
+	fn byte_len(&self) -> u64;
+	/// File name inside the fixture cache directory.
+	fn cache_name(&self) -> &'static str;
+}
+
+impl Pinned for RawFixture {
+	fn url(&self) -> &'static str {
+		self.url
+	}
+
+	fn blake3(&self) -> &'static str {
+		self.blake3
+	}
+
+	fn byte_len(&self) -> u64 {
+		self.len
+	}
+
+	fn cache_name(&self) -> &'static str {
+		self.cache_name
+	}
+}
 
 /// Where the pinned samples are kept. Deliberately outside `target/` so
 /// `cargo clean` does not force a ~1 GiB re-download, and gitignored so the
@@ -92,19 +124,19 @@ pub enum Fixture {
 ///
 /// Panics on any mismatch, by design: an unrecognised file is never something
 /// to skip past.
-fn verify(fixture: &RawFixture, path: &Path) {
+fn verify(fixture: &impl Pinned, path: &Path) {
 	let len = fs::metadata(path)
 		.unwrap_or_else(|e| panic!("cannot stat pinned fixture {}: {e}", path.display()))
 		.len();
 	assert_eq!(
 		len,
-		fixture.len,
+		fixture.byte_len(),
 		"pinned fixture {} has the wrong length ({len} bytes, pinned {}). \
 		 Delete it to re-download; if a fresh download still mismatches, the \
-		 pin in pins.rs no longer describes what {} serves.",
+		 pin no longer describes what {} serves.",
 		path.display(),
-		fixture.len,
-		fixture.url,
+		fixture.byte_len(),
+		fixture.url(),
 	);
 
 	let mut hasher = blake3::Hasher::new();
@@ -118,7 +150,7 @@ fn verify(fixture: &RawFixture, path: &Path) {
 	let got = hasher.finalize().to_hex();
 	assert_eq!(
 		got.as_str(),
-		fixture.blake3,
+		fixture.blake3(),
 		"pinned fixture {} does not match its BLAKE3 pin. Refusing to run \
 		 against unrecognised bytes.",
 		path.display(),
@@ -127,11 +159,12 @@ fn verify(fixture: &RawFixture, path: &Path) {
 
 /// Downloads to `dest`. `Err` means "could not fetch", which is a skip; it is
 /// never used for a content mismatch.
-fn fetch(fixture: &RawFixture, dest: &Path) -> Result<(), String> {
+fn fetch(fixture: &impl Pinned, dest: &Path) -> Result<(), String> {
 	if offline() {
 		return Err(format!(
 			"{} is not cached and MICROTHUMB_RAW_FIXTURES=offline ({})",
-			fixture.cache_name, fixture.url
+			fixture.cache_name(),
+			fixture.url()
 		));
 	}
 	let out = Command::new("curl")
@@ -146,19 +179,20 @@ fn fetch(fixture: &RawFixture, dest: &Path) -> Result<(), String> {
 			"-o",
 		])
 		.arg(dest)
-		.arg(fixture.url)
+		.arg(fixture.url())
 		.output()
 		.map_err(|e| {
 			format!(
 				"cannot run curl for {}: {e} ({})",
-				fixture.cache_name, fixture.url
+				fixture.cache_name(),
+				fixture.url()
 			)
 		})?;
 	if !out.status.success() {
 		return Err(format!(
 			"could not download {} from {}: curl {} {}",
-			fixture.cache_name,
-			fixture.url,
+			fixture.cache_name(),
+			fixture.url(),
 			out.status,
 			String::from_utf8_lossy(&out.stderr).trim(),
 		));
@@ -167,8 +201,8 @@ fn fetch(fixture: &RawFixture, dest: &Path) -> Result<(), String> {
 }
 
 /// Returns a verified local path for `fixture`, downloading it if needed.
-pub fn locate(fixture: &RawFixture) -> Fixture {
-	let path = cache_dir().join(fixture.cache_name);
+pub fn locate(fixture: &impl Pinned) -> Fixture {
+	let path = cache_dir().join(fixture.cache_name());
 	if path.exists() {
 		// Verified on every run, not just after downloading: that is the
 		// tamper-evident part.
@@ -185,7 +219,7 @@ pub fn locate(fixture: &RawFixture) -> Fixture {
 
 	// Download to a sibling and verify before it is allowed to become the
 	// cached copy, so an interrupted download cannot poison a later run.
-	let part = cache_dir().join(format!("{}.part", fixture.cache_name));
+	let part = cache_dir().join(format!("{}.part", fixture.cache_name()));
 	if let Err(why) = fetch(fixture, &part) {
 		let _ = fs::remove_file(&part);
 		return Fixture::Unavailable(why);
@@ -200,16 +234,16 @@ pub fn locate(fixture: &RawFixture) -> Fixture {
 
 /// Calls `run` for every fixture that could be obtained, printing a line for
 /// each one that could not. Returns the number skipped.
-pub fn for_each_available(
-	fixtures: &'static [RawFixture],
-	mut run: impl FnMut(&'static RawFixture, &Path),
+pub fn for_each_available<F: Pinned>(
+	fixtures: &'static [F],
+	mut run: impl FnMut(&'static F, &Path),
 ) -> usize {
 	let mut skipped = 0;
 	for fixture in fixtures {
 		match locate(fixture) {
 			Fixture::Ready(path) => run(fixture, &path),
 			Fixture::Unavailable(why) => {
-				eprintln!("SKIP {}: {why}", fixture.cache_name);
+				eprintln!("SKIP {}: {why}", fixture.cache_name());
 				skipped += 1;
 			}
 		}
@@ -223,8 +257,8 @@ pub fn for_each_available(
 ///
 /// Still verifies: a cached file that does not match its pin is a hard error
 /// here too.
-pub fn cached(fixture: &RawFixture) -> Option<PathBuf> {
-	let path = cache_dir().join(fixture.cache_name);
+pub fn cached(fixture: &impl Pinned) -> Option<PathBuf> {
+	let path = cache_dir().join(fixture.cache_name());
 	path.exists().then(|| {
 		verify(fixture, &path);
 		path

@@ -59,3 +59,51 @@ outside `target/`, so `cargo clean` does not cost a 1 GiB re-download.
 Gitignored; the samples are never committed. Override with
 `MICROTHUMB_RAW_FIXTURE_DIR`. `MICROTHUMB_RAW_FIXTURES=offline` uses only what
 is already cached.
+
+# How `heif_pins.rs` was built
+
+The HEIF files come from the test corpora of open-source projects, not from a
+sample library: no library like raw.pixls.us collects HEIF (its index holds
+none — it is a RAW library). This repository is AGPL-3.0, so a file is usable
+when the project that commits it licenses it under AGPL-3.0 or anything
+compatible with it: GPL-2.0-or-later, LGPL, MIT, BSD, Apache-2.0, CC0, CC-BY,
+CC-BY-SA. A file with no licence at all (an attachment on an issue) or under
+non-commercial terms is not.
+
+1. **Search.** Photo managers (immich, PhotoPrism, Nextcloud, memories,
+   LibrePhotos, Lychee), image libraries (libheif, pillow_heif, libvips,
+   libavif, ImageMagick, kimageformats), metadata libraries (Exiv2, exiftool,
+   metadata-extractor, exif-samples, nom-exif) and raw/camera tools, plus
+   repository and code search, for camera- or phone-original `.hif`, `.heic`,
+   `.heif` and `.avif` files.
+
+2. **Check the licence where the file lives.** The repository's LICENSE covers
+   its committed test data unless a README beside the files says otherwise —
+   and some do: PhotoPrism's `assets/` is under separate terms, and
+   pillow_heif's `heif_other/nokia/` is Nokia's. Both were excluded. Every
+   pinned file's licence is the document at the same commit as the file,
+   recorded as `licence_source`.
+
+3. **Check the content.** Make, model and software from the EXIF; the item
+   structure from the `meta` box. Converted and encoder-generated files were
+   dropped wherever a device original covered the same case; the one exception
+   is the AVIF, where none exists (its EXIF is a phone's, its bitstream a
+   re-encode).
+
+4. **Pin to a commit.** `raw.githubusercontent.com/<owner>/<repo>/<commit>/...`,
+   so the bytes cannot move under the pin, with the length and BLAKE3 taken from
+   a fresh download.
+
+The set covers Sony and Canon HIF, a Sony portrait whose JPEG thumbnail
+inherits the primary's rotation, two iPhone generations, a Samsung motion photo
+and a phone AVIF, about 11 MB in all.
+
+**No Fujifilm HIF is pinned, because none could be found under a usable
+licence.** The real ones in circulation are issue attachments with no licence.
+The camera-JPEG path Fujifilm files take is pinned by the synthetic
+`tests/fixtures/heif/fuji*.heic` instead; a licensed Fujifilm file belongs here
+as soon as one exists.
+
+`heif_pins_are_well_formed_and_usably_licensed` checks the table without the
+bytes: the commit in every URL, the licence document at that same commit, a
+licence from the usable list, and a baseline row for each file.
