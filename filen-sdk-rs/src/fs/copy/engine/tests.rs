@@ -31,7 +31,7 @@ fn budget(chunks: usize) -> usize {
 /// The plaintext of chunk `index` of the source file `uuid`.
 fn chunk_data(uuid: Uuid, index: u64, size: u64) -> Vec<u8> {
 	let fill = (uuid.as_u128() as u8) ^ (index as u8);
-	vec![fill; chunk_len(size, index) as usize]
+	vec![fill; chunk_plaintext_len(size, index) as usize]
 }
 
 fn file_hash(uuid: Uuid, size: u64) -> Blake3Hash {

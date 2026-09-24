@@ -48,7 +48,7 @@ use crate::{
 		file::{
 			RemoteFile,
 			enums::RemoteFileType,
-			read::chunks_consistent_with_size,
+			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
@@ -1080,12 +1080,6 @@ async fn wait_for_lock<B: CopyBackend>(
 	})
 }
 
-/// Plaintext length of chunk `index` of a `size`-byte file.
-fn chunk_len(size: u64, index: u64) -> u64 {
-	size.saturating_sub(index * CHUNK_SIZE_U64)
-		.min(CHUNK_SIZE_U64)
-}
-
 /// Waits for the job to be running and for memory for chunk `index`. A pause that starts while
 /// waiting hands the memory back until the job resumes, so a paused job holds none.
 async fn reserve_chunk(
@@ -1095,8 +1089,9 @@ async fn reserve_chunk(
 	size: u64,
 	index: u64,
 ) -> Result<ChunkReservation, Stopped> {
-	let bytes = u32::try_from(chunk_len(size, index) + u64::from(FILE_CHUNK_SIZE_EXTRA.get()))
-		.expect("a chunk fits in u32");
+	let bytes =
+		u32::try_from(chunk_plaintext_len(size, index) + u64::from(FILE_CHUNK_SIZE_EXTRA.get()))
+			.expect("a chunk fits in u32");
 	loop {
 		control.checkpoint().await?;
 		// In flight before anything is held, so the job is never reported paused holding memory.
@@ -1148,18 +1143,8 @@ async fn copy_file_inner<B: CopyBackend>(
 	control.checkpoint().await?;
 	let source = Arc::new(file.source);
 	let size = file.size;
-	let stored_chunks = source.chunks();
-	if !chunks_consistent_with_size(stored_chunks, size) {
-		return Err(FileError::Failed(
-			CopyStage::Download,
-			Error::custom(
-				ErrorKind::Response,
-				format!(
-					"file chunk count ({stored_chunks}) is inconsistent with its size ({size})"
-				),
-			),
-		));
-	}
+	check_chunks_consistent(source.chunks(), size)
+		.map_err(|error| FileError::Failed(CopyStage::Download, error))?;
 	// A stored count may include a chunk without data (one for an empty file, or a trailing
 	// empty chunk); only the chunks holding data are copied.
 	let chunks = size.div_ceil(CHUNK_SIZE_U64);
@@ -1224,7 +1209,7 @@ async fn copy_file_inner<B: CopyBackend>(
 			Some((chunk, result, reservation)) = fetches.next() => match result {
 				Ok(data) => {
 					let data: Vec<u8> = data;
-					hasher.update(&data);
+					hasher.update_rayon(&data);
 					written += data.len() as u64;
 					let backend = Arc::clone(&backend);
 					let upload = Arc::clone(&upload);

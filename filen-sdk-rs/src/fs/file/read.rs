@@ -30,9 +30,6 @@ pub struct FileReader<'a> {
 	// download concurrently, and the ordered reader would otherwise hold completed chunks behind a
 	// slow head-of-line chunk and release them in a burst. See `push_fetch_next_chunk`.
 	progress: Option<MaybeSendCallback<'a, u64>>,
-	// Set at build time. When false, the advertised size/chunk count cannot describe a real
-	// file and every read yields an error instead of attempting the chunk-size math.
-	chunks_consistent: bool,
 }
 
 pub struct FileReaderBuilder<'a> {
@@ -95,7 +92,6 @@ impl<'a> FileReaderBuilder<'a> {
 			allocate_chunk_future: None,
 			max_buffer_size: self.max_buffer_size.unwrap_or(size),
 			progress: self.progress,
-			chunks_consistent,
 		};
 
 		if chunks_consistent {
@@ -134,10 +130,7 @@ pub(crate) async fn fetch_decrypted_chunk_data(
 	chunk_idx: u64,
 	progress: Option<MaybeSendCallback<'_, u64>>,
 ) -> Result<Vec<u8>, Error> {
-	let plaintext_len = file
-		.size()
-		.saturating_sub(chunk_idx * CHUNK_SIZE_U64)
-		.min(CHUNK_SIZE_U64);
+	let plaintext_len = chunk_plaintext_len(file.size(), chunk_idx);
 	// Report bytes as the chunk streams in (clamped, converted to deltas) instead of only
 	// at completion — otherwise a heavily-parallel download shows nothing for seconds while
 	// every in-flight chunk fills together, then jumps.
@@ -177,6 +170,23 @@ pub(crate) fn chunks_consistent_with_size(chunks: u64, size: u64) -> bool {
 			.and_then(|last_chunk_start| size.checked_sub(last_chunk_start))
 			.is_some_and(|last_chunk_len| last_chunk_len <= CHUNK_SIZE_U64),
 	}
+}
+
+/// [`chunks_consistent_with_size`], as the error to report for a file that fails it.
+pub(crate) fn check_chunks_consistent(chunks: u64, size: u64) -> Result<(), Error> {
+	if chunks_consistent_with_size(chunks, size) {
+		return Ok(());
+	}
+	Err(Error::custom(
+		ErrorKind::Response,
+		format!("file chunk count ({chunks}) is inconsistent with file size ({size})"),
+	))
+}
+
+/// Plaintext length of chunk `index` of a `size`-byte file.
+pub(crate) fn chunk_plaintext_len(size: u64, index: u64) -> u64 {
+	size.saturating_sub(index * CHUNK_SIZE_U64)
+		.min(CHUNK_SIZE_U64)
 }
 
 impl<'a> FileReader<'a> {
@@ -336,15 +346,8 @@ impl futures::io::AsyncRead for FileReader<'_> {
 		cx: &mut std::task::Context<'_>,
 		buf: &mut [u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
-		if !self.chunks_consistent {
-			return std::task::Poll::Ready(Err(std::io::Error::other(Error::custom(
-				ErrorKind::Response,
-				format!(
-					"file chunk count ({}) is inconsistent with file size ({})",
-					self.file.chunks(),
-					self.file.size()
-				),
-			))));
+		if let Err(error) = check_chunks_consistent(self.file.chunks(), self.file.size()) {
+			return std::task::Poll::Ready(Err(std::io::Error::other(error)));
 		}
 
 		// first try to queue more chunks
