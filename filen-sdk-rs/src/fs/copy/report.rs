@@ -306,7 +306,7 @@ pub trait CopyCallback: MaybeSendSync + 'static {
 	fn on_update(&self, update: CopyUpdate);
 }
 
-impl<T: CopyCallback + ?Sized> CopyCallback for std::sync::Arc<T> {
+impl<T: CopyCallback + ?Sized> CopyCallback for Arc<T> {
 	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 		(**self).on_top_level_planned(items);
 	}

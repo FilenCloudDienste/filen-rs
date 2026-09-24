@@ -1,14 +1,14 @@
 use std::{
 	collections::{HashMap, HashSet},
 	sync::{
-		Mutex,
+		Mutex, MutexGuard,
 		atomic::{AtomicUsize, Ordering},
 	},
 	time::Duration,
 };
 
-use filen_types::{crypto::EncryptedString, fs::StableUuid};
-use tokio::sync::watch;
+use filen_types::{crypto::EncryptedString, error::ResponseError, fs::StableUuid};
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
 use crate::{
@@ -19,8 +19,11 @@ use crate::{
 			plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
 			report::{CopyCallback, CopyUpdate, RunState},
 		},
-		dir::meta::DecryptedDirectoryMeta,
-		file::meta::{DecryptedFileMeta, FileMeta},
+		dir::{RootDirectory, meta::DecryptedDirectoryMeta},
+		file::{
+			AnonymousRemoteFile,
+			meta::{DecryptedFileMeta, FileMeta},
+		},
 	},
 	job::test_support::controls,
 };
@@ -59,7 +62,7 @@ fn source_file_with_chunks(name: &str, size: u64, chunks: u64) -> RemoteFileType
 		created: None,
 		hash: Some(file_hash(uuid, size)),
 	});
-	let file: crate::fs::file::AnonymousRemoteFile = RemoteFile::from_meta(
+	let file: AnonymousRemoteFile = RemoteFile::from_meta(
 		uuid,
 		(),
 		Uuid::new_v4().into(),
@@ -199,7 +202,7 @@ impl FakeBackend {
 		self
 	}
 
-	fn log(&self) -> std::sync::MutexGuard<'_, FakeLog> {
+	fn log(&self) -> MutexGuard<'_, FakeLog> {
 		self.log.lock().unwrap()
 	}
 
@@ -522,7 +525,7 @@ fn listed<T>(parent: &SourceDir<()>, item: T) -> Listed<T> {
 	}
 }
 
-type Running = tokio::task::JoinHandle<Result<CopyReport<()>, CopyFailed<()>>>;
+type Running = JoinHandle<Result<CopyReport<()>, CopyFailed<()>>>;
 
 fn start(
 	backend: &Arc<FakeBackend>,
@@ -537,10 +540,9 @@ fn start(
 		.map(|dir| dir.parent)
 		.chain(plan.files.iter().map(|file| file.parent))
 		.filter_map(|parent| match parent {
-			DestParent::Existing(uuid) => Some((
-				uuid,
-				DirType::Root(Cow::Owned(crate::fs::dir::RootDirectory::new(uuid))),
-			)),
+			DestParent::Existing(uuid) => {
+				Some((uuid, DirType::Root(Cow::Owned(RootDirectory::new(uuid)))))
+			}
 			DestParent::Planned(_) => None,
 		})
 		.collect();
@@ -1361,7 +1363,7 @@ async fn running_out_of_storage_ends_the_job() {
 }
 
 fn max_storage_error() -> Arc<Error> {
-	Arc::new(Error::from(filen_types::error::ResponseError::ApiError {
+	Arc::new(Error::from(ResponseError::ApiError {
 		message: Some("Max storage reached".into()),
 		code: Some("max_storage_reached".into()),
 	}))
@@ -1389,9 +1391,7 @@ fn a_failed_copy_gives_back_its_original_error() {
 				info: FailureInfo {
 					source_uuid: Uuid::new_v4(),
 					source_path: "/a".to_owned(),
-					dest_parent_dir: DirType::Root(Cow::Owned(crate::fs::dir::RootDirectory::new(
-						Uuid::new_v4(),
-					))),
+					dest_parent_dir: DirType::Root(Cow::Owned(RootDirectory::new(Uuid::new_v4()))),
 					dest_name: "a".to_owned(),
 					stage: CopyStage::Upload,
 					error: Arc::clone(&error),

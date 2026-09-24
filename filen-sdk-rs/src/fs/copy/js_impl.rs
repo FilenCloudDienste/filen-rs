@@ -767,28 +767,36 @@ mod tests {
 	use std::{borrow::Cow, sync::Mutex};
 
 	use chrono::Utc;
-	use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid};
+	use filen_types::{
+		api::v3::dir::{color::DirColor, link::info::LinkPasswordSalt},
+		fs::ParentUuid,
+	};
 
 	use super::{uniffi_impl::CopyItemsCallback, *};
 	use crate::{
+		auth::MetaKey,
+		connect::{
+			DirPublicLink, PasswordState,
+			fs::{ShareInfo, SharedDirectory, SharingRole},
+		},
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
-		fs::copy,
-		fs::file::traits::HasFileInfo,
 		fs::{
+			copy,
 			dir::{
-				RemoteDirectory, RootDirectory,
+				LinkedDirectory, RemoteDirectory, RootDirectory,
 				meta::{DecryptedDirectoryMeta, DirectoryMeta},
 			},
 			file::{
-				RemoteFile,
+				AnonymousRemoteFile, RemoteFile,
 				meta::{DecryptedFileMeta, FileMeta},
+				traits::HasFileInfo,
 			},
 		},
 		js::{Root, spawn_ordered_dispatch},
 	};
 
 	fn file() -> RemoteFileType<'static> {
-		let file: crate::fs::file::AnonymousRemoteFile = RemoteFile::from_meta(
+		let file: AnonymousRemoteFile = RemoteFile::from_meta(
 			Uuid::new_v4(),
 			(),
 			Uuid::new_v4().into(),
@@ -853,16 +861,6 @@ mod tests {
 
 	#[test]
 	fn a_failed_shared_or_linked_directory_is_a_copy_source_again() {
-		use crate::{
-			auth::MetaKey,
-			connect::{
-				DirPublicLink, PasswordState,
-				fs::{ShareInfo, SharedDirectory, SharingRole},
-			},
-			fs::dir::LinkedDirectory,
-		};
-		use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
-
 		let shared = dir();
 		let role = SharingRole::Receiver(ShareInfo {
 			email: "sharer@example.com".to_owned(),

@@ -583,7 +583,13 @@ mod tests {
 	use crate::{
 		consts::CHUNK_SIZE_U64,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
-		fs::file::{AnonymousRemoteFile, meta::DecryptedFileMeta, meta::FileMeta},
+		fs::{
+			file::{
+				AnonymousRemoteFile, RemoteFile,
+				meta::{DecryptedFileMeta, FileMeta},
+			},
+			name::encode_name,
+		},
 	};
 
 	fn dir(name: Option<&str>) -> SourceDir<()> {
@@ -597,7 +603,7 @@ mod tests {
 	}
 
 	fn file_with_meta(meta: FileMeta<'static>, size: u64) -> RemoteFileType<'static> {
-		let anonymous: AnonymousRemoteFile = crate::fs::file::RemoteFile::from_meta(
+		let anonymous: AnonymousRemoteFile = RemoteFile::from_meta(
 			Uuid::new_v4(),
 			(),
 			Uuid::new_v4().into(),
@@ -1029,7 +1035,7 @@ mod tests {
 				destination,
 			)])
 			.unwrap();
-		let encoded = crate::fs::name::encode_name("a:b.txt").unwrap();
+		let encoded = encode_name("a:b.txt").unwrap();
 		assert_eq!(plan.files[0].name, encoded);
 		assert_eq!(plan.renamed.len(), 1);
 		assert_eq!(plan.renamed[0].reason, RenameReason::InvalidName);
