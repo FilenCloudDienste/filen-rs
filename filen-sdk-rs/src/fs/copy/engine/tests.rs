@@ -2048,8 +2048,12 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	let [failure] = outcome.report.failures.as_slice() else {
 		panic!("one failure");
 	};
-	assert_eq!(failure.info.stage, CopyStage::RegisteredAsVersion);
-	assert_eq!(failure.info.existing_file, Some(existing));
+	assert_eq!(
+		failure.info.stage,
+		CopyStage::RegisteredAsVersion {
+			existing_file: existing
+		}
+	);
 	assert_eq!(failure.info.dest_parent, destination);
 	assert_eq!(failure.info.dest_name, "a.txt");
 	assert!(matches!(&failure.source, FailedSource::File(f) if f.uuid() == clashing.uuid()));
@@ -2070,7 +2074,7 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	assert!(recorder.events().iter().any(|e| matches!(
 		e,
 		CopyEvent::FileFailed(info)
-			if info.stage == CopyStage::RegisteredAsVersion && info.existing_file == Some(existing)
+			if info.stage == CopyStage::RegisteredAsVersion { existing_file: existing }
 	)));
 }
 

@@ -73,8 +73,6 @@ pub struct CopyFailureInfo {
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
 	pub affected_files: u64,
 	pub affected_bytes: u64,
-	/// With stage `registeredAsVersion`: the file the copy became a version of.
-	pub existing_file: Option<Uuid>,
 }
 
 #[js_type(export, no_deser)]
@@ -299,7 +297,6 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 			error: CopyError::from(info.error.as_ref()),
 			affected_files: info.affected_files,
 			affected_bytes: info.affected_bytes,
-			existing_file: info.existing_file,
 		}
 	}
 }
@@ -975,7 +972,6 @@ mod tests {
 			error: Arc::new(Error::custom(ErrorKind::MaxStorageReached, "full")),
 			affected_files: 1,
 			affected_bytes: 10,
-			existing_file: None,
 		};
 		let update = CopyUpdate::from(api::CopyUpdate {
 			phase: CopyPhase::CopyingFiles,

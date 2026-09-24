@@ -662,7 +662,6 @@ where
 					error,
 					affected_files: planned.descendant_files,
 					affected_bytes: planned.descendant_bytes,
-					existing_file: None,
 				};
 				self.reporter
 					.dir_failed(info.clone(), planned.descendant_dirs);
@@ -803,17 +802,18 @@ where
 				index,
 				parent,
 				file.name().map_or(active.name, str::to_owned),
-				CopyStage::RegisteredAsVersion,
+				CopyStage::RegisteredAsVersion {
+					existing_file: file.stable_uuid.into(),
+				},
 				Arc::new(Error::custom(
 					ErrorKind::InvalidState,
 					"the copy was registered as a new version of an existing file",
 				)),
-				Some(file.stable_uuid.into()),
 			),
 			Err(FileError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
-				self.record_file_failure(index, parent, active.name, stage, error, None);
+				self.record_file_failure(index, parent, active.name, stage, error);
 			}
 		}
 	}
@@ -826,7 +826,6 @@ where
 		dest_name: String,
 		stage: CopyStage,
 		error: Arc<Error>,
-		existing_file: Option<Uuid>,
 	) {
 		let planned = &self.plan.files[index];
 		let info = FailureInfo {
@@ -839,7 +838,6 @@ where
 			error,
 			affected_files: 1,
 			affected_bytes: planned.size,
-			existing_file,
 		};
 		self.reporter.file_failed(planned.dest_uuid, info.clone());
 		self.report.failures.push(CopyFailure {

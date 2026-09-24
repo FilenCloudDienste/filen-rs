@@ -2290,7 +2290,7 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	expect(report.error).toBeUndefined()
 	expect(report.failures).toHaveLength(1)
 	const [failure] = report.failures
-	expect(failure.info.stage).toBe("download")
+	expect(failure.info.stage.type).toBe("download")
 	expect(failure.info.error.kind).toBe("FileChunkNotFound")
 	expect(failure.info.destParent).toBe(destination.uuid)
 	expect(failure.info.destParentDir.uuid).toBe(destination.uuid)
