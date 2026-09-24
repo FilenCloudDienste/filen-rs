@@ -73,22 +73,11 @@ impl From<Dir> for RemoteDirectory {
 	}
 }
 
-#[js_type(import, wasm_all)]
+/// Untagged both ways, so a directory the SDK hands out can be passed back as it is.
+#[js_type(import, untagged, wasm_all)]
 pub enum AnyNormalDir {
 	Dir(Dir),
 	Root(Root),
-}
-
-/// Written in the shape it is read from (`Dir` or `Root`), so a directory the SDK hands out can
-/// be passed back as an `AnyNormalDir`.
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-impl serde::Serialize for AnyNormalDir {
-	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-		match self {
-			AnyNormalDir::Dir(dir) => dir.serialize(serializer),
-			AnyNormalDir::Root(root) => root.serialize(serializer),
-		}
-	}
 }
 
 impl From<AnyNormalDir> for DirType<'static, Normal> {
