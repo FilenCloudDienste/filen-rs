@@ -168,11 +168,19 @@ impl Client {
 	) -> Result<Option<Uuid>, Error> {
 		// Hash the NFC-normalized name (as create_dir does via ValidatedName) so an
 		// NFD-decomposed query still matches a directory stored under its NFC form.
-		let name = ValidatedName::try_from(name)?;
+		self.inner_dir_exists(parent.uuid(), &ValidatedName::try_from(name)?)
+			.await
+	}
+
+	pub(crate) async fn inner_dir_exists(
+		&self,
+		parent: Uuid,
+		name: &ValidatedName,
+	) -> Result<Option<Uuid>, Error> {
 		api::v3::dir::exists::post(
 			self.client(),
 			&api::v3::dir::exists::Request {
-				parent: parent.uuid(),
+				parent,
 				name_hashed: Cow::Borrowed(&self.hash_name(name.as_ref())),
 			},
 		)

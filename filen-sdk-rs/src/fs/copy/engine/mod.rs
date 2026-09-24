@@ -176,7 +176,7 @@ pub(crate) trait CopyBackend: MaybeSendSync + 'static {
 		targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
 	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	fn begin_upload(&self, spec: UploadSpec) -> Result<Self::Upload, Error>;
+	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload;
 	/// Downloads and decrypts chunk `index` of `file`.
 	fn fetch_chunk(
 		&self,
@@ -1179,16 +1179,12 @@ async fn copy_file_inner<B: CopyBackend>(
 		size,
 		bytes_done: 0,
 	});
-	let upload = Arc::new(
-		backend
-			.begin_upload(UploadSpec {
-				uuid: file.dest_uuid,
-				parent,
-				name: name.clone(),
-				mime: source.mime().map(str::to_owned),
-			})
-			.map_err(|e| FileError::Failed(CopyStage::Upload, e))?,
-	);
+	let upload = Arc::new(backend.begin_upload(UploadSpec {
+		uuid: file.dest_uuid,
+		parent,
+		name: name.clone(),
+		mime: source.mime().map(str::to_owned),
+	}));
 
 	let mut hasher = blake3::Hasher::new();
 	let mut written = 0u64;

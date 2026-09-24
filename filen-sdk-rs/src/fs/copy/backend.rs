@@ -1,13 +1,13 @@
 //! The copy engine's drive operations, on a logged-in client.
 
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpers};
 use tokio::sync::Semaphore;
 
 use crate::{
-	Error, api,
+	Error,
 	auth::Client,
 	connect::ConnectedTargets,
 	crypto,
@@ -15,7 +15,7 @@ use crate::{
 		categories::{NonRootItemType, Normal},
 		dir::{RemoteDirectory, client_impl::CreateDirOutcome},
 		file::{
-			BaseFile, RemoteFile,
+			BaseFile, FileBuilder, RemoteFile,
 			enums::RemoteFileType,
 			read::fetch_decrypted_chunk_data,
 			write::{
@@ -108,19 +108,16 @@ impl CopyBackend for ClientBackend {
 		self.client.propagate_to_targets(targets, &items).await
 	}
 
-	fn begin_upload(&self, spec: UploadSpec) -> Result<Self::Upload, Error> {
-		let mut builder = self
-			.client
-			.make_file_builder(spec.name.as_ref(), spec.parent)?
-			.uuid(spec.uuid)
-			.no_exif();
+	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload {
+		let mut builder =
+			FileBuilder::new_valid_name(spec.name, spec.uuid, spec.parent, &self.client).no_exif();
 		if let Some(mime) = spec.mime {
 			builder = builder.mime(mime);
 		}
-		Ok(ClientUpload {
+		ClientUpload {
 			file: builder.build(),
 			upload_key: crypto::shared::generate_random_base64_values(32, &mut rand::rng()),
-		})
+		}
 	}
 
 	async fn fetch_chunk(
@@ -143,20 +140,11 @@ impl CopyBackend for ClientBackend {
 	}
 
 	async fn name_exists(&self, parent: Uuid, name: &ValidatedName) -> Result<bool, Error> {
-		let name_hashed = self.client.hash_name(name.as_ref());
-		let file_request = api::v3::file::exists::Request {
-			name_hashed: name_hashed.clone(),
-			parent: parent.into(),
-		};
-		let dir_request = api::v3::dir::exists::Request {
-			name_hashed: Cow::Borrowed(&name_hashed),
-			parent,
-		};
 		let (file, dir) = futures::try_join!(
-			api::v3::file::exists::post(self.client.client(), &file_request),
-			api::v3::dir::exists::post(self.client.client(), &dir_request),
+			self.client.inner_file_exists(name, parent),
+			self.client.inner_dir_exists(parent, name),
 		)?;
-		Ok(file.0.is_some() || dir.0.is_some())
+		Ok(file.is_some() || dir.is_some())
 	}
 
 	async fn finish_upload(

@@ -70,7 +70,12 @@ impl FileBuilder {
 		))
 	}
 
-	fn new_valid_name(name: ValidatedName, uuid: Uuid, parent_uuid: Uuid, client: &Client) -> Self {
+	pub(crate) fn new_valid_name(
+		name: ValidatedName,
+		uuid: Uuid,
+		parent_uuid: Uuid,
+		client: &Client,
+	) -> Self {
 		Self {
 			uuid,
 			name,

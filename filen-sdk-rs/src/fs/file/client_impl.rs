@@ -269,12 +269,20 @@ impl Client {
 	) -> Result<Option<Uuid>, Error> {
 		// Hash the NFC-normalized name (as the upload path does via ValidatedName) so an
 		// NFD-decomposed query still matches a file stored under its NFC form.
-		let name = ValidatedName::try_from(name)?;
+		self.inner_file_exists(&ValidatedName::try_from(name)?, parent.uuid())
+			.await
+	}
+
+	pub(crate) async fn inner_file_exists(
+		&self,
+		name: &ValidatedName,
+		parent: Uuid,
+	) -> Result<Option<Uuid>, Error> {
 		api::v3::file::exists::post(
 			self.client(),
 			&api::v3::file::exists::Request {
 				name_hashed: self.hash_name(name.as_ref()),
-				parent: (parent.uuid()).into(),
+				parent: parent.into(),
 			},
 		)
 		.await

@@ -314,8 +314,8 @@ impl CopyBackend for FakeBackend {
 		Vec::new()
 	}
 
-	fn begin_upload(&self, spec: UploadSpec) -> Result<FakeUpload, Error> {
-		Ok(FakeUpload { spec })
+	fn begin_upload(&self, spec: UploadSpec) -> FakeUpload {
+		FakeUpload { spec }
 	}
 
 	async fn fetch_chunk(
