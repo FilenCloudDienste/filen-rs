@@ -279,8 +279,8 @@ impl CacheSearch {
 		// Ordered dispatch: snapshots reach the foreign listener in the engine's emission order.
 		// Per-snapshot spawn_blocking could deliver a stale snapshot last, showing outdated
 		// results as final.
-		let sender =
-			crate::cache::js_impl::spawn_ordered_dispatch(move |snapshot: CacheSearchSnapshot| {
+		let (sender, _) =
+			crate::js::spawn_ordered_dispatch(move |snapshot: CacheSearchSnapshot| {
 				listener.on_snapshot(snapshot);
 			});
 		let (snapshot, handle) = self

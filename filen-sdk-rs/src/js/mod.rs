@@ -38,6 +38,8 @@ pub(crate) use categories::{
 	normal::NonRootNormalItemTagged,
 };
 
+#[cfg(feature = "uniffi")]
+pub(crate) use self::uniffi::spawn_ordered_dispatch;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
 pub use meta_changes::*;

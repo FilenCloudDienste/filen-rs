@@ -499,7 +499,7 @@ mod uniffi_impl {
 	use crate::{
 		Error,
 		auth::JsClient,
-		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
+		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture, spawn_ordered_dispatch},
 	};
 
 	use super::{
@@ -525,18 +525,11 @@ mod uniffi_impl {
 		pub max_bytes: Option<u64>,
 	}
 
-	/// Delivers every callback in order; the foreign callbacks may block, so this runs on a
-	/// blocking thread. Returns once the job has dropped its sender and all is delivered.
-	pub(super) fn deliver(
-		mut receiver: tokio::sync::mpsc::UnboundedReceiver<Delivery>,
-		callback: &dyn CopyItemsCallback,
-	) {
-		while let Some(delivery) = receiver.blocking_recv() {
-			match delivery {
-				Delivery::TopLevelPlanned(items) => callback.on_top_level_planned(items),
-				Delivery::TopLevelCreated(item) => callback.on_top_level_created(item),
-				Delivery::Update(update) => callback.on_update(update),
-			}
+	pub(super) fn dispatch(callback: &dyn CopyItemsCallback, delivery: Delivery) {
+		match delivery {
+			Delivery::TopLevelPlanned(items) => callback.on_top_level_planned(items),
+			Delivery::TopLevelCreated(item) => callback.on_top_level_created(item),
+			Delivery::Update(update) => callback.on_update(update),
 		}
 	}
 
@@ -547,15 +540,15 @@ mod uniffi_impl {
 		callback: Arc<dyn CopyItemsCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
-		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 		managed_future
 			.into_js_managed_commander_job(move |control| async move {
-				let delivery =
-					tokio::task::spawn_blocking(move || deliver(receiver, callback.as_ref()));
+				// the foreign callbacks may block: they run on the dispatch thread, in order
+				let (sender, delivered) =
+					spawn_ordered_dispatch(move |delivery| dispatch(callback.as_ref(), delivery));
 				let result = copy_job(client, requests, config.max_bytes, sender, control).await;
 				// the job has ended and dropped its sender: this returns once everything it
 				// reported was delivered
-				let _ = delivery.await;
+				let _ = delivered.await;
 				result
 			})
 			.await
@@ -791,7 +784,7 @@ mod tests {
 				meta::{DecryptedFileMeta, FileMeta},
 			},
 		},
-		js::Root,
+		js::{Root, spawn_ordered_dispatch},
 	};
 
 	fn file() -> RemoteFileType<'static> {
@@ -1023,11 +1016,12 @@ mod tests {
 
 	#[test]
 	fn callbacks_are_delivered_in_order_until_the_job_lets_go() {
-		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 		let recorder = Arc::new(Recorder::default());
-		let delivering = {
+		let (sender, delivered) = {
 			let recorder = Arc::clone(&recorder);
-			std::thread::spawn(move || uniffi_impl::deliver(receiver, recorder.as_ref()))
+			spawn_ordered_dispatch(move |delivery| {
+				uniffi_impl::dispatch(recorder.as_ref(), delivery)
+			})
 		};
 		let channel = DeliveryChannel(sender);
 		let mut expected = Vec::new();
@@ -1044,8 +1038,7 @@ mod tests {
 			expected.push(i);
 		}
 		drop(channel);
-		delivering
-			.join()
+		futures::executor::block_on(delivered)
 			.expect("delivery ends once the job drops its sender");
 		assert_eq!(*recorder.0.lock().unwrap(), expected);
 	}
