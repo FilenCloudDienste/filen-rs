@@ -43,7 +43,7 @@ use std::{
 	collections::BTreeMap,
 	fmt::Write as _,
 	fs,
-	path::PathBuf,
+	path::{Path, PathBuf},
 	sync::{Arc, Mutex, PoisonError},
 	time::{Duration, Instant},
 };
@@ -895,6 +895,93 @@ fn summarize(run: &RunFile) -> String {
 		.expect("writing to a String never fails");
 	}
 	out
+}
+
+/// Diff two result files, with each scenario's yardstick beside it.
+///
+/// A scenario whose `definition_hash` differs between the two files is reported as INCOMPARABLE and
+/// is not diffed: it was redefined, so the two figures are not two measurements of one thing.
+///
+/// # Errors
+///
+/// When either file cannot be read or decoded.
+pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
+	let read = |path: &Path| -> Result<RunFile, String> {
+		let raw =
+			fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+		serde_json::from_str(&raw).map_err(|e| format!("decoding {}: {e}", path.display()))
+	};
+	let (before, after) = (read(before)?, read(after)?);
+	let mut out = String::new();
+	if before.harness_version != after.harness_version {
+		return Err(format!(
+			"these files were written by different harnesses (v{} and v{}); their fields do not \
+			 mean the same thing",
+			before.harness_version, after.harness_version
+		));
+	}
+	writeln!(
+		out,
+		"# before {} ({})\n# after  {} ({})",
+		before.commit.get(..12).unwrap_or(&before.commit),
+		before.profile,
+		after.commit.get(..12).unwrap_or(&after.commit),
+		after.profile,
+	)
+	.expect("writing to a String never fails");
+	if before.profile != after.profile || before.toolchain != after.toolchain {
+		writeln!(
+			out,
+			"# WARNING: different build profile or toolchain — these figures are not comparable"
+		)
+		.expect("writing to a String never fails");
+	}
+
+	let (mut old, mut new) = (grouped(&before), grouped(&after));
+	// Which definition each side measured, so a redefinition is caught even where a metric happens
+	// to exist on both sides.
+	let hashes = |run: &BTreeMap<(String, u64, String), Vec<f64>>| -> BTreeMap<String, u64> {
+		run.keys()
+			.map(|(scenario, hash, _)| (scenario.clone(), *hash))
+			.collect()
+	};
+	let (old_hashes, new_hashes) = (hashes(&old), hashes(&new));
+	for (scenario, old_hash) in &old_hashes {
+		if let Some(new_hash) = new_hashes.get(scenario)
+			&& new_hash != old_hash
+		{
+			writeln!(
+				out,
+				"{scenario}\tINCOMPARABLE\tthe scenario was redefined ({old_hash:016x} -> \
+				 {new_hash:016x}); rows from the two definitions are not two measurements of one \
+				 thing"
+			)
+			.expect("writing to a String never fails");
+		}
+	}
+
+	writeln!(out, "scenario\tmetric\tbefore_ms\tafter_ms\tchange")
+		.expect("writing to a String never fails");
+	let keys: Vec<(String, u64, String)> = new.keys().cloned().collect();
+	for key in keys {
+		let Some(mut after_samples) = new.remove(&key) else {
+			continue;
+		};
+		let (scenario, hash, metric) = key;
+		// The hash is part of the key, so a redefined scenario simply finds nothing to diff against.
+		let Some(mut before_samples) = old.remove(&(scenario.clone(), hash, metric.clone())) else {
+			continue;
+		};
+		let (was, now) = (median(&mut before_samples), median(&mut after_samples));
+		let change = if was > 0.0 {
+			format!("{:+.1}%", (now - was) / was * 100.0)
+		} else {
+			"n/a".to_owned()
+		};
+		writeln!(out, "{scenario}\t{metric}\t{was:.4}\t{now:.4}\t{change}")
+			.expect("writing to a String never fails");
+	}
+	Ok(out)
 }
 
 #[cfg(test)]
