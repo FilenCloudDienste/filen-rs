@@ -206,7 +206,7 @@ impl CopyBackend for FakeBackend {
 		Arc::clone(&self.memory)
 	}
 
-	async fn lock_drive(&self) -> Result<FakeLock, Error> {
+	async fn acquire_drive_lock(&self) -> Result<FakeLock, Error> {
 		let call = self.lock_calls.fetch_add(1, Ordering::SeqCst);
 		if let Some((from, kind)) = self.fail_locks_from
 			&& call >= from
@@ -239,7 +239,7 @@ impl CopyBackend for FakeBackend {
 		})
 	}
 
-	async fn create_dir(
+	async fn create_copy_dir(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,

@@ -53,7 +53,7 @@ impl CopyBackend for ClientBackend {
 		Arc::clone(self.client.client().state().memory_semaphore())
 	}
 
-	async fn lock_drive(&self) -> Result<Self::DriveLock, Error> {
+	async fn acquire_drive_lock(&self) -> Result<Self::DriveLock, Error> {
 		self.client.lock_drive().await
 	}
 
@@ -61,7 +61,7 @@ impl CopyBackend for ClientBackend {
 		self.client.fetch_connected_targets(dir).await
 	}
 
-	async fn create_dir(
+	async fn create_copy_dir(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,

@@ -148,13 +148,18 @@ pub(crate) trait CopyBackend: MaybeSendSync + 'static {
 
 	/// The client's file-IO memory semaphore, in bytes.
 	fn memory(&self) -> Arc<Semaphore>;
-	fn lock_drive(&self) -> impl Future<Output = Result<Self::DriveLock, Error>> + MaybeSend;
+	/// Acquires the drive lock, waiting while another client holds it.
+	fn acquire_drive_lock(
+		&self,
+	) -> impl Future<Output = Result<Self::DriveLock, Error>> + MaybeSend;
 	fn connected_targets(
 		&self,
 		dir: Uuid,
 	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
 	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
-	fn create_dir(
+	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
+	/// the directory, and reports a merge into an existing one instead of returning it.
+	fn create_copy_dir(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,
@@ -968,7 +973,7 @@ async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
 				.map_err(|e| DirError::Failed(stage, e))?;
 		}
 		match backend
-			.create_dir(parent, uuid, &name, created)
+			.create_copy_dir(parent, uuid, &name, created)
 			.await
 			.map_err(|e| DirError::Failed(stage, e))?
 		{
@@ -1080,7 +1085,7 @@ async fn wait_for_lock<B: CopyBackend>(
 		biased;
 		() = control.stopping() => return Err(Stopped),
 		() = control.pause_changed(false) => return Ok(LockWait::Paused),
-		result = backend.lock_drive() => result,
+		result = backend.acquire_drive_lock() => result,
 	};
 	Ok(match result {
 		Ok(_) if control.is_pause_requested() => LockWait::Paused,
