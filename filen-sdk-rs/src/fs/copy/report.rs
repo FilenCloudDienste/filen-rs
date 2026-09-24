@@ -148,9 +148,8 @@ pub enum CopyStage {
 pub struct FailureInfo {
 	pub source_uuid: Uuid,
 	pub source_path: String,
-	/// The directory the item was to be created in.
-	pub dest_parent: Uuid,
-	/// The same directory, to retry the item in with [`Client::copy_items_to`](crate::auth::Client::copy_items_to).
+	/// The directory the item was to be created in, to retry it in with
+	/// [`Client::copy_items_to`](crate::auth::Client::copy_items_to).
 	pub dest_parent_dir: DirType<'static, Normal>,
 	pub dest_name: String,
 	pub stage: CopyStage,

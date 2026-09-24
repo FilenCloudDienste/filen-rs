@@ -1409,7 +1409,7 @@ async fn a_failed_file_does_not_stop_the_others() {
 	};
 	assert!(matches!(&failure.source, FailedSource::File(file) if file.uuid() == bad.uuid()));
 	assert_eq!(failure.info.stage, CopyStage::Download);
-	assert_eq!(failure.info.dest_parent, destination);
+	assert_eq!(failure.info.dest_parent_dir.uuid(), destination);
 	assert_eq!(failure.info.dest_name, "bad");
 	assert_eq!(failure.info.error.kind(), ErrorKind::FileChunkNotFound);
 	let counts = outcome.report.counts;
@@ -1522,10 +1522,6 @@ async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
 			.iter()
 			.find(|f| f.info.dest_name == name)
 			.unwrap_or_else(|| panic!("{name} failed"));
-		assert_eq!(
-			failure.info.dest_parent_dir.uuid(),
-			failure.info.dest_parent
-		);
 		failure.info.dest_parent_dir.clone()
 	};
 	let sub_parent = parent_of("Sub");
@@ -1550,7 +1546,7 @@ async fn a_failure_carries_the_directory_it_was_to_be_created_in() {
 	assert_eq!(failed_events, 3);
 	assert!(recorder.events().iter().all(|e| match e {
 		CopyEvent::DirFailed(info) | CopyEvent::FileFailed(info) =>
-			info.dest_parent_dir.uuid() == info.dest_parent,
+			info.dest_parent_dir.uuid() == parent_of(&info.dest_name).uuid(),
 		_ => true,
 	}));
 }
@@ -2054,7 +2050,7 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 			existing_file: existing
 		}
 	);
-	assert_eq!(failure.info.dest_parent, destination);
+	assert_eq!(failure.info.dest_parent_dir.uuid(), destination);
 	assert_eq!(failure.info.dest_name, "a.txt");
 	assert!(matches!(&failure.source, FailedSource::File(f) if f.uuid() == clashing.uuid()));
 	assert_eq!(

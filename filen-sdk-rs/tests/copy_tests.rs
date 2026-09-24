@@ -872,7 +872,6 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 	assert_eq!(failure.info.stage, CopyStage::Download);
 	assert_eq!(failure.info.error.kind(), ErrorKind::FileChunkNotFound);
 	assert_eq!(failure.info.dest_name, "gone.bin");
-	assert_eq!(failure.info.dest_parent, destination.uuid());
 	assert_eq!(failure.info.dest_parent_dir.uuid(), destination.uuid());
 	assert_eq!(
 		outcome.report.counts.files_done, 1,

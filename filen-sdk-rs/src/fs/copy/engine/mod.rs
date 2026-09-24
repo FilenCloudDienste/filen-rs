@@ -655,7 +655,6 @@ where
 				let info = FailureInfo {
 					source_uuid: planned.source_uuid,
 					source_path: planned.source_path.clone(),
-					dest_parent: parent,
 					dest_parent_dir,
 					dest_name: planned.name.as_ref().to_owned(),
 					stage,
@@ -800,7 +799,6 @@ where
 			// It counts as failed, so the counts still add up to the totals.
 			Err(FileError::RegisteredAsVersion(file)) => self.record_file_failure(
 				index,
-				parent,
 				file.name().map_or(active.name, str::to_owned),
 				CopyStage::RegisteredAsVersion {
 					existing_file: file.stable_uuid.into(),
@@ -813,7 +811,7 @@ where
 			Err(FileError::Failed(stage, error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
-				self.record_file_failure(index, parent, active.name, stage, error);
+				self.record_file_failure(index, active.name, stage, error);
 			}
 		}
 	}
@@ -822,7 +820,6 @@ where
 	fn record_file_failure(
 		&mut self,
 		index: usize,
-		dest_parent: Uuid,
 		dest_name: String,
 		stage: CopyStage,
 		error: Arc<Error>,
@@ -831,7 +828,6 @@ where
 		let info = FailureInfo {
 			source_uuid: planned.source.uuid(),
 			source_path: planned.source_path.clone(),
-			dest_parent,
 			dest_parent_dir: self.failed_item_parent(planned.parent),
 			dest_name,
 			stage,

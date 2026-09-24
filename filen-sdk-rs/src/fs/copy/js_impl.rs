@@ -11,6 +11,7 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::{
+		HasUUID,
 		categories::{DirType, Normal},
 		copy as api,
 		file::enums::RemoteFileType,
@@ -290,7 +291,7 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 		Self {
 			source_uuid: info.source_uuid,
 			source_path: info.source_path.clone(),
-			dest_parent: info.dest_parent,
+			dest_parent: info.dest_parent_dir.uuid(),
 			dest_parent_dir: info.dest_parent_dir.clone().into(),
 			dest_name: info.dest_name.clone(),
 			stage: info.stage,
@@ -819,7 +820,7 @@ mod tests {
 	use super::{uniffi_impl::CopyItemsCallback, *};
 	use crate::{
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
-		fs::{HasUUID, file::traits::HasFileInfo},
+		fs::file::traits::HasFileInfo,
 		fs::{
 			dir::{
 				RemoteDirectory, RootDirectory,
@@ -965,7 +966,6 @@ mod tests {
 		let failure = api::FailureInfo {
 			source_uuid: Uuid::new_v4(),
 			source_path: "/a.txt".to_owned(),
-			dest_parent: parent.uuid(),
 			dest_parent_dir: DirType::Dir(Cow::Owned(parent.clone())),
 			dest_name: "a.txt".to_owned(),
 			stage: CopyStage::Upload,
@@ -999,6 +999,7 @@ mod tests {
 			parent.uuid(),
 			"a retry can target the parent without looking it up"
 		);
+		assert_eq!(info.dest_parent, parent.uuid());
 		assert_eq!(info.source_uuid, failure.source_uuid);
 		assert_eq!(info.affected_bytes, 10);
 	}
