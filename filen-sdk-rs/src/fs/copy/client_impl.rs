@@ -26,7 +26,7 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	job::{JobControl, Stopped},
-	util::MaybeArc,
+	util::{MaybeArc, sleep},
 };
 
 use super::{
@@ -382,7 +382,7 @@ async fn watch_listing<T>(
 	let listing = std::pin::pin!(control.until_stopping(listing));
 	let ticker = async {
 		loop {
-			crate::util::sleep(CALLBACK_INTERVAL).await;
+			sleep(CALLBACK_INTERVAL).await;
 			reporter.set_pause_requested(control.is_pause_requested());
 			report();
 		}
@@ -447,8 +447,7 @@ mod tests {
 
 	/// The bindings run the copy on the SDK's multi-threaded runtime, which needs a `Send`
 	/// future.
-	#[allow(dead_code)]
-	fn copy_future_is_send(client: Arc<Client>) {
+	fn _copy_future_is_send(client: Arc<Client>) {
 		fn assert_send<T: Send>(_: T) {}
 		assert_send(client.copy_items_to(
 			Vec::new(),
