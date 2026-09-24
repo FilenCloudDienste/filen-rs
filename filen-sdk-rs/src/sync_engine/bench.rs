@@ -35,6 +35,15 @@
 //!   the step AFTER the one it closes rather than in the remainder — and the run records
 //!   `mark_overhead_ns`, measured through [`mark`] itself, so a reader can bound the total rather
 //!   than take it on trust.
+//! - **A memory figure that is really the process's history.** Every memory number is taken in a
+//!   FRESH CHILD (see [`measure_memory`]) that opens the tree this process built and runs one pass
+//!   over it — not literally nothing else, and `SCENARIOS.md` says where the difference lands: a
+//!   child opening an engine on a registry that already holds the pair starts a cache worker the
+//!   parent never started. An in-process resident set is the whole run's history — the warmups, every sample and
+//!   three whole yardstick passes, minus whatever the allocator has not handed back — and it has
+//!   been quoted as the cost of a phase. Each figure is named for whose process it measured
+//!   (`mem:fresh_process_*_rss`) or for having been summed from a structure's own capacities
+//!   (`*_computed_bytes`), so the two kinds cannot be read as one.
 //! - **A phase that quietly moved.** Every pass asserts the exact ORDERED list of steps the engine
 //!   marked against [`SCOPED_STEPS`] / [`WHOLE_STEPS`]. Timing what the engine marks stops a step
 //!   being timed for work the engine no longer does; it does not, on its own, tell anyone that a
@@ -75,8 +84,9 @@ use super::{
 	FullPassReason, SyncEngine, SyncMode,
 	baseline::{BaselineEntry, NodeKind, PairId},
 	changes::{PassScope, RemoteChange, RemoteDeltaEntry},
+	engine::PassStructures,
 	plan,
-	probe::{Fixture, NameStyle, Shape, baseline_rows, probe_rules},
+	probe::{self, Fixture, NameStyle, Shape, baseline_rows, probe_rules},
 	scan::{self, RuleFiles},
 	tree::Baseline,
 };
@@ -87,7 +97,7 @@ use crate::{
 
 /// The record format's own version. Bumped when a field's MEANING changes, so a reader can refuse a
 /// file it would misread rather than silently misreading it.
-const HARNESS_VERSION: u32 = 2;
+const HARNESS_VERSION: u32 = 4;
 
 /// Passes run and discarded before the first recorded sample of a scenario. The first pass over a
 /// fresh fixture reads a cold page cache and a cold baseline (the store's resident copy is built on
@@ -97,6 +107,14 @@ const WARMUPS: usize = 2;
 /// Samples per scenario when `SYNC_BENCH_SAMPLES` is unset. Three is the floor a median means
 /// anything over, and every one of them is recorded — a median alone hides a bimodal distribution.
 const DEFAULT_SAMPLES: usize = 3;
+
+/// Memory children per scenario when `SYNC_BENCH_MEM_SAMPLES` is unset.
+///
+/// Two, not three: every one is a whole extra process that opens the pair and runs a cold pass,
+/// which at a million rows is a minute apiece. Two is the fewest that can say how far a figure
+/// MOVES between runs, and a figure whose movement is unknown is not a figure. `0` skips the
+/// memory measurement outright, for an edit-test loop.
+const DEFAULT_MEM_SAMPLES: usize = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Step marks: the engine's own phase boundaries, timed from inside the real pass.
@@ -108,6 +126,25 @@ tokio::task_local! {
 	/// `spawn_blocking` threads, and a thread-local would lose every mark either side of those
 	/// awaits the moment the runtime resumed the task somewhere else.
 	static STEPS: Arc<Mutex<Vec<(&'static str, Instant)>>>;
+}
+
+tokio::task_local! {
+	/// Where [`mark`] ALSO writes, for the duration of a memory child's one pass: the process's
+	/// resident set at each boundary the engine marks.
+	///
+	/// Scoped by nothing else. `current_rss_bytes` forks `ps` on macOS, which belongs nowhere
+	/// inside a timed region — so this is set in a memory child and in no recorded timing sample,
+	/// and [`measuring_memory`] is how the engine's own tail knows which it is running in.
+	static STEP_RSS: Arc<Mutex<Vec<(&'static str, u64)>>>;
+}
+
+/// Whether this task is a MEMORY child's measured pass rather than a timed one.
+///
+/// Read by the engine's benchmark tail to decide whether to sum what its structures cost — an
+/// O(nodes) walk that no timed pass may pay. One seam and one tail, so the pass a memory child
+/// measures is the pass a timing sample measures.
+pub(super) fn measuring_memory() -> bool {
+	STEP_RSS.try_with(|_| ()).is_ok()
 }
 
 /// Close the step ending here, if a measured pass is running.
@@ -123,6 +160,15 @@ pub(super) fn mark(name: &'static str) {
 		log.lock()
 			.unwrap_or_else(PoisonError::into_inner)
 			.push((name, now));
+	});
+	// A memory child samples the resident set at the same boundaries, so its table and the timing
+	// table describe one pass rather than two. Unset in every timed sample, where this costs the
+	// task-local probe [`mark_overhead_ns`] already measures and nothing else.
+	let _ = STEP_RSS.try_with(|log| {
+		let rss = probe::current_rss_bytes();
+		log.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.push((name, rss));
 	});
 }
 
@@ -1117,9 +1163,10 @@ pub struct Record {
 	/// `total`, `unattributed`, `step:<name>`, `yardstick_whole_pass`, ...
 	pub metric: String,
 	pub ms: f64,
-	/// For a metric that counts rather than times. A count encoded as a duration reads as
-	/// `0.000013 ms` in a column headed milliseconds, which is exactly the kind of figure this
-	/// harness exists to stop anyone quoting.
+	/// For a metric that counts rather than times: a plan's actions, a pass's marks, and BYTES for
+	/// every `mem:` metric. A count encoded as a duration reads as `0.000013 ms` in a column headed
+	/// milliseconds, which is exactly the kind of figure this harness exists to stop anyone
+	/// quoting. [`unit`] says which unit a metric is in, and every table prints it.
 	pub count: Option<u64>,
 	/// Nodes the fixture actually held, so a figure is never read per-node against the wrong tree.
 	pub nodes: usize,
@@ -1141,6 +1188,8 @@ pub struct RunFile {
 	pub machine: String,
 	/// `debug` or `release`. A figure from one says nothing about the other.
 	pub profile: String,
+	/// What allocator every RSS figure in this file was taken through (see [`allocator`]).
+	pub allocator: String,
 	/// What one step mark costs, measured on this machine in this run.
 	pub mark_overhead_ns: f64,
 	pub records: Vec<Record>,
@@ -1194,6 +1243,36 @@ fn run_meta() -> (String, String, String, String) {
 		"no_debug_assertions".to_owned()
 	};
 	(commit, toolchain, machine, profile)
+}
+
+/// What allocator this run's memory figures were taken through.
+///
+/// Every RSS figure is an allocator's answer as much as the engine's: what it returns to the
+/// kernel and what it holds as free pages is its policy, and that is most of the difference
+/// between a pass's widest point and what stays resident after it. This crate declares no
+/// `#[global_allocator]`, so it is the platform's — stamped on the run rather than assumed,
+/// because a build that added one would move every memory figure and nothing else here would say
+/// so.
+fn allocator() -> String {
+	format!(
+		"system {} (filen-sdk-rs declares no #[global_allocator])",
+		std::env::consts::OS
+	)
+}
+
+/// A `usize` from the environment, or `default`.
+///
+/// Panics on a value it cannot parse rather than falling back: a mistyped `SYNC_BENCH_SAMPLES`
+/// that silently ran the default is a run nobody knows the sample count of.
+fn env_usize(key: &str, default: usize) -> usize {
+	std::env::var(key)
+		.ok()
+		.map(|raw| {
+			raw.trim()
+				.parse()
+				.unwrap_or_else(|e| panic!("{key} must be a number: {raw:?} ({e})"))
+		})
+		.unwrap_or(default)
 }
 
 /// What one [`mark`] costs here, so a reader can bound what the instrumentation contributed to the
@@ -1292,8 +1371,9 @@ struct Applied {
 	renamed: Vec<(String, String)>,
 	/// The remote half, for a class that diverges BOTH sides. Announced through the pair's own
 	/// `note_owed_remote`, which is a real entrance a pass's remote delta arrives by — nothing here
-	/// forges a scope.
-	remote: Vec<RemoteDeltaEntry>,
+	/// forges a scope. Held as [`RemoteLine`]s so a memory child can be told what its parent
+	/// announced.
+	remote: Vec<RemoteLine>,
 	/// How many files (or directories) the class touched — what the scenario's [`Expect`] is read
 	/// against.
 	changed: usize,
@@ -1312,11 +1392,29 @@ impl Applied {
 	}
 }
 
+/// Where a bed's pass reads from, with no [`Fixture`] behind it.
+///
+/// Split out because a MEMORY child opens the fixture its parent built rather than building one of
+/// its own: a child that built a tree would carry the whole construction in the resident set it
+/// was spawned to report, which is the one figure it exists to get away from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BedPlace {
+	root: PathBuf,
+	cache_db: PathBuf,
+	baseline_db: PathBuf,
+	/// The remote root, as a string: written to a handover file, and this crate's `uuid` carries no
+	/// serde.
+	remote_root: String,
+}
+
 /// A fixture with a real engine open on it, converged, with one pair registered and its carried
 /// state seeded — the state a pair is in after one whole pass, which is the only state from which a
 /// change-scoped pass runs at all.
 struct Bed {
-	fixture: Fixture,
+	place: BedPlace,
+	/// The tree this bed OWNS, whose `Drop` removes it. `None` in a memory child, which was handed
+	/// a tree its parent still owns and must not delete out from under it.
+	_fixture: Option<Fixture>,
 	engine: SyncEngine,
 	pair: PairId,
 	/// Baseline rows seeded. ZERO for a first sync, which is what makes it one.
@@ -1439,8 +1537,15 @@ async fn prepare_bed(scenario: &Scenario) -> Bed {
 	validate_fixture(scenario, fixture.root(), nodes, &rows, &applied);
 	drop(rows);
 
+	let place = BedPlace {
+		root: fixture.root().to_path_buf(),
+		cache_db: fixture.cache_db().to_path_buf(),
+		baseline_db: fixture.baseline_db().to_path_buf(),
+		remote_root: fixture.remote_root().to_string(),
+	};
 	Bed {
-		fixture,
+		place,
+		_fixture: Some(fixture),
 		engine,
 		pair,
 		rows: seeded,
@@ -1499,6 +1604,53 @@ fn prefixed(rel_path: &str, prefix: &str) -> String {
 	}
 }
 
+/// One announced remote upsert, in scalars a handover file can carry.
+///
+/// [`RemoteDeltaEntry`] cannot be written to one: it carries a `Blake3Hash` and a `StableUuid`,
+/// neither of which anything here may construct except through the entrances they have. So the
+/// parent records what it announced as these, a memory child reads the same lines back, and
+/// [`remote_delta`] is the ONE place either of them turns a line into an entry — two processes
+/// announcing different things is not a failure a benchmark would notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RemoteLine {
+	uuid: String,
+	parent: String,
+	name: String,
+	stable_uuid: Option<String>,
+	/// The byte every lane of the announced content hash is filled with — a hash that matches
+	/// neither the baseline row nor what the harness wrote locally.
+	hash_fill: u8,
+	size: u64,
+	modified_millis: i64,
+}
+
+/// The announced remote delta `lines` describe. The only construction site, for parent and child
+/// alike.
+fn remote_delta(lines: &[RemoteLine]) -> Vec<RemoteDeltaEntry> {
+	let uuid = |raw: &str| {
+		raw.parse()
+			.unwrap_or_else(|e| panic!("this harness wrote {raw:?} as a uuid: {e}"))
+	};
+	lines
+		.iter()
+		.map(|line| RemoteDeltaEntry {
+			id: None,
+			change: RemoteChange::Upsert(RemoteItem {
+				uuid: uuid(&line.uuid),
+				parent: uuid(&line.parent),
+				name: line.name.clone(),
+				stable_uuid: line
+					.stable_uuid
+					.as_deref()
+					.map(|raw| probe::stable_uuid(uuid(raw))),
+				hash: Some(Blake3Hash::from([line.hash_fill; 32])),
+				size: line.size,
+				modified_millis: line.modified_millis,
+			}),
+		})
+		.collect()
+}
+
 /// One announced remote change per picked file, carrying content matching NEITHER the baseline row
 /// nor what the harness just wrote locally — so each path is a genuine both-sides-changed conflict
 /// rather than one side agreeing with the row.
@@ -1506,7 +1658,7 @@ fn remote_edits(
 	fixture: &Fixture,
 	rows: &[BaselineEntry],
 	picked: &[&BaselineEntry],
-) -> Vec<RemoteDeltaEntry> {
+) -> Vec<RemoteLine> {
 	// A baseline row carries its own remote uuid but not its parent's, and an announced change
 	// names both.
 	let by_path: HashMap<&str, &BaselineEntry> = rows
@@ -1526,17 +1678,14 @@ fn remote_edits(
 			} else {
 				by_path.get(dir)?.remote_uuid?
 			};
-			Some(RemoteDeltaEntry {
-				id: None,
-				change: RemoteChange::Upsert(RemoteItem {
-					uuid: row.remote_uuid?,
-					parent,
-					name: name.to_owned(),
-					stable_uuid: row.remote_stable_uuid,
-					hash: Some(Blake3Hash::from([(index % 251) as u8; 32])),
-					size: row.size.unwrap_or_default().saturating_add(1),
-					modified_millis: row.remote_modified.unwrap_or_default().saturating_add(1),
-				}),
+			Some(RemoteLine {
+				uuid: row.remote_uuid?.to_string(),
+				parent: parent.to_string(),
+				name: name.to_owned(),
+				stable_uuid: row.remote_stable_uuid.map(|id| id.to_string()),
+				hash_fill: (index % 251) as u8,
+				size: row.size.unwrap_or_default().saturating_add(1),
+				modified_millis: row.remote_modified.unwrap_or_default().saturating_add(1),
 			})
 		})
 		.collect()
@@ -1658,7 +1807,7 @@ fn apply_change(fixture: &Fixture, rows: &[BaselineEntry], scenario: &Scenario) 
 /// watcher could ever have produced.
 async fn announce(bed: &Bed) -> PassScope {
 	let changes = bed.engine.pair_changes(bed.pair).await;
-	let root = bed.fixture.root();
+	let root = bed.place.root.as_path();
 	for rel_path in &bed.applied.touched {
 		let event = Event::new(bed.applied.touched_kind).add_path(root.join(rel_path));
 		changes.note_local_event(root, &event, |_| false);
@@ -1670,7 +1819,7 @@ async fn announce(bed: &Bed) -> PassScope {
 		changes.note_local_event(root, &event, |_| false);
 	}
 	if !bed.applied.remote.is_empty() {
-		changes.note_owed_remote(bed.applied.remote.clone());
+		changes.note_owed_remote(remote_delta(&bed.applied.remote));
 	}
 	changes.take()
 }
@@ -1703,7 +1852,10 @@ struct Plan {
 }
 
 /// One measured pass: announce, run the REAL `prepare` under a step log, and split what it cost.
-async fn one_pass(bed: &Bed, scenario: &Scenario) -> (Timing, Plan) {
+///
+/// The third value is what the pass's structures computed their own size as, which the engine's
+/// tail fills in for a MEMORY child and leaves `None` for every timed sample.
+async fn one_pass(bed: &Bed, scenario: &Scenario) -> (Timing, Plan, Option<PassStructures>) {
 	let mut scope = announce(bed).await;
 	let log: Arc<Mutex<Vec<(&'static str, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
 	let start = Instant::now();
@@ -1808,7 +1960,413 @@ async fn one_pass(bed: &Bed, scenario: &Scenario) -> (Timing, Plan) {
 			conflicts: pass.conflicts,
 			dir_moves: pass.dir_moves,
 		},
+		pass.structures,
 	)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Memory: what a pass costs in a process that has done nothing else
+// ---------------------------------------------------------------------------------------------
+
+/// What a memory child is told to measure. Written by the parent, read by the child, deleted after.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Handover {
+	scenario: String,
+	place: BedPlace,
+	pair: PairId,
+	rows: usize,
+	nodes: usize,
+	fixture_hash: u64,
+	touched: Vec<String>,
+	/// `edit` or `remove`: which of the two kinds a change class announces its touched paths under.
+	touched_kind: String,
+	renamed: Vec<(String, String)>,
+	remote: Vec<RemoteLine>,
+	changed: usize,
+	/// Where the child writes its answer.
+	answer: PathBuf,
+}
+
+fn kind_tag(kind: EventKind) -> &'static str {
+	match kind {
+		EDIT => "edit",
+		EventKind::Remove(RemoveKind::File) => "remove",
+		other => panic!("no change class announces {other:?}"),
+	}
+}
+
+fn kind_of(tag: &str) -> EventKind {
+	match tag {
+		"edit" => EDIT,
+		"remove" => EventKind::Remove(RemoveKind::File),
+		other => panic!("a handover named the event kind {other:?}"),
+	}
+}
+
+/// One child's answer: every figure taken in a process whose whole history is what it was asked to
+/// measure.
+///
+/// Every RSS field here is that process's resident set — never this run's, which is what made the
+/// earlier figures quotable as something they were not. The names they are RECORDED under say so
+/// outright (see [`MemAnswer::metrics`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MemAnswer {
+	/// Before it opened anything: the binary and the allocator's first pages. The runtime is built
+	/// AFTER this is taken, so its resident cost is part of what loading the pair is measured to
+	/// add rather than part of the floor it is measured from.
+	floor_rss: u64,
+	/// With the pair's baseline loaded into the engine's store and NOTHING else — the state an idle
+	/// engine sits in between passes.
+	pair_loaded_rss: u64,
+	/// The widest of the engine's own step boundaries during the pass. Not a continuous sampler: a
+	/// spike inside one step is not here, and `peak_rss` is the bound that catches it.
+	pass_widest_rss: u64,
+	/// After the pass and everything it built are dropped, with the engine still open.
+	after_pass_rss: u64,
+	/// After the engine and its store go too.
+	after_everything_dropped_rss: u64,
+	/// `getrusage`'s high-water mark for the whole child: the transients of BUILDING what the pass
+	/// held sit between this and `pass_widest_rss`.
+	peak_rss: u64,
+	rows: usize,
+	actions: usize,
+	/// What the resident baseline computes its own size as, with nothing else alive.
+	pair_baseline_computed_bytes: u64,
+	/// `(baseline, view, scan)` as the structures compute themselves at the pass's widest point.
+	///
+	/// Deliberately not an `Option`: a child that reached the engine's tail without a sum is a child
+	/// whose two attribution columns would print `NaN` while every other assertion passed, so it
+	/// fails where the sum is taken instead.
+	structures: (u64, u64, u64),
+	/// The resident set at each boundary the engine marked, in order.
+	at_step: Vec<(String, u64)>,
+}
+
+impl MemAnswer {
+	/// Every figure under a name that says WHOSE process it is and HOW it was arrived at.
+	///
+	/// `rss` is always a measured resident set of the fresh child; `computed` is always a structure
+	/// summing its own capacities, which is a different kind of number and cannot be quoted as the
+	/// other. Nothing here is called `peak_rss` on its own: that name meant "this process since it
+	/// started" and was quoted as the cost of a phase.
+	fn metrics(&self) -> Vec<(String, u64)> {
+		let mut out = vec![
+			("mem:fresh_process_floor_rss".to_owned(), self.floor_rss),
+			(
+				"mem:fresh_process_pair_loaded_rss".to_owned(),
+				self.pair_loaded_rss,
+			),
+			(
+				"mem:fresh_process_pass_widest_rss".to_owned(),
+				self.pass_widest_rss,
+			),
+			(
+				"mem:fresh_process_pass_widest_over_floor_rss".to_owned(),
+				self.pass_widest_rss.saturating_sub(self.floor_rss),
+			),
+			(
+				// What the PASS added, over a process already holding the pair. The figure a
+				// per-pass memory target is read off: `over_floor` above includes opening the
+				// engine and reading the tree, which no pass pays again.
+				"mem:fresh_process_pass_widest_over_pair_loaded_rss".to_owned(),
+				self.pass_widest_rss.saturating_sub(self.pair_loaded_rss),
+			),
+			(
+				"mem:fresh_process_after_pass_rss".to_owned(),
+				self.after_pass_rss,
+			),
+			(
+				"mem:fresh_process_after_everything_dropped_rss".to_owned(),
+				self.after_everything_dropped_rss,
+			),
+			("mem:fresh_process_peak_rss".to_owned(), self.peak_rss),
+			(
+				"mem:pair_baseline_computed_bytes".to_owned(),
+				self.pair_baseline_computed_bytes,
+			),
+		];
+		let (baseline, view, scan) = self.structures;
+		out.push(("mem:pass_baseline_computed_bytes".to_owned(), baseline));
+		out.push(("mem:pass_view_computed_bytes".to_owned(), view));
+		out.push(("mem:pass_scan_computed_bytes".to_owned(), scan));
+		// The two SIDES, and not a sum with the baseline in it. That sum shipped once: at ten thousand
+		// rows it was 98 % the pair's own baseline — resident before the pass began, and deliberately
+		// excluded from the attribution ratio the same run prints — under a name that reads as what
+		// the pass itself built.
+		out.push(("mem:pass_sides_computed_bytes".to_owned(), view + scan));
+		for (step, rss) in &self.at_step {
+			out.push((format!("mem:fresh_process_rss_at_step:{step}"), *rss));
+		}
+		out
+	}
+}
+
+/// Ask a FRESH PROCESS what this bed's pass costs in memory, `samples` times.
+///
+/// It exists because an in-process figure cannot answer an absolute question: this process has run
+/// warmups, three samples and three whole yardstick passes, and what the allocator has not returned
+/// to the kernel is still in its resident set. The child opens the tree THIS process built — it
+/// builds nothing, because building a million-node fixture would put the construction in the very
+/// figure it was spawned to report.
+///
+/// Blocking on purpose, inside an async fn: nothing else is running on this runtime, and a child
+/// that overlapped the parent's own passes would measure a machine under a load the parent put
+/// there.
+fn measure_memory(bed: &Bed, scenario: &Scenario, samples: usize) -> Vec<MemAnswer> {
+	(0..samples)
+		.map(|sample| {
+			let dir = std::env::temp_dir();
+			let tag = uuid::Uuid::new_v4();
+			let spec = dir.join(format!("filen_bench_mem_{tag}.json"));
+			let answer = dir.join(format!("filen_bench_mem_answer_{tag}.json"));
+			let handover = Handover {
+				scenario: scenario.name.to_owned(),
+				place: bed.place.clone(),
+				pair: bed.pair,
+				rows: bed.rows,
+				nodes: bed.nodes,
+				fixture_hash: bed.fixture_hash,
+				touched: bed.applied.touched.clone(),
+				touched_kind: kind_tag(bed.applied.touched_kind).to_owned(),
+				renamed: bed.applied.renamed.clone(),
+				remote: bed.applied.remote.clone(),
+				changed: bed.applied.changed,
+				answer: answer.clone(),
+			};
+			fs::write(
+				&spec,
+				serde_json::to_string(&handover).expect("a handover encodes"),
+			)
+			.expect("writing the handover");
+			let exe = std::env::current_exe().expect("a test binary knows its own path");
+			let status = std::process::Command::new(exe)
+				.args(["--ignored", "--exact", "sync_engine_bench"])
+				.env("SYNC_BENCH_MEM_CHILD", &spec)
+				.status()
+				.expect("spawning the memory child");
+			let raw = fs::read_to_string(&answer);
+			fs::remove_file(&spec).ok();
+			fs::remove_file(&answer).ok();
+			// LOUD. A child runs the same assertions this process does, so a failed one is a failed
+			// scenario — and a memory number that quietly went missing is how a table comes to be
+			// read as covering a row it never measured.
+			assert!(
+				status.success(),
+				"{}: memory sample {sample} exited {status}; its assertions are this harness's own",
+				scenario.name
+			);
+			let raw = raw.expect("the memory child wrote no answer");
+			serde_json::from_str(&raw).expect("decoding the memory child's answer")
+		})
+		.collect()
+}
+
+/// The child half of [`measure_memory`]: open the tree it was handed, hold what a pass holds, and
+/// sample itself around it. Runs INSTEAD of everything in [`run`].
+fn answer_memory_child(spec: &Path) {
+	// The process before it holds anything: the binary and the allocator's first pages. The runtime
+	// is built three lines below and is NOT in this figure — it is part of what loading the pair is
+	// then measured to add.
+	let floor = probe::current_rss_bytes();
+	// Zero is what `current_rss_bytes` answers where it cannot ask (`ps` missing, `/proc` absent),
+	// and nothing downstream would notice: the table would print a complete-looking row of zeroes
+	// and divide by one of them.
+	assert!(
+		floor > 0,
+		"this platform answered no resident set at all, so every memory figure here would be zero"
+	);
+	let raw = fs::read_to_string(spec).expect("reading the handover");
+	let handover: Handover = serde_json::from_str(&raw).expect("decoding the handover");
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()
+		.expect("building the memory child's runtime");
+	let answer = runtime.block_on(measure_in_child(floor, &handover));
+	fs::write(
+		&handover.answer,
+		serde_json::to_string(&answer).expect("an answer encodes"),
+	)
+	.expect("writing the answer");
+}
+
+/// Hold what one pass holds, in a process whose history is that pass and the opening of an engine
+/// over the fixture — NOT a process that has done nothing else. `SyncEngine::open` here runs
+/// against a registry that already holds the pair, which starts a cache worker and a second DB
+/// connection the parent never started, and all of it is resident before `pair_loaded_rss` is
+/// sampled. It therefore sits inside `pair_loaded - floor`, the denominator of `pair_attributed`.
+async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
+	let scenario = scenario(&handover.scenario)
+		.unwrap_or_else(|| panic!("no scenario named {:?}", handover.scenario));
+	let client = offline_client();
+	client
+		.configure_cache(handover.place.cache_db.clone(), |_| {})
+		.await
+		.expect("configuring the cache slot writes a path and nothing else");
+	let engine = SyncEngine::open(client, handover.place.baseline_db.clone())
+		.await
+		.expect("opening an engine on the baseline DB its parent wrote");
+	// Opening on a registry that ALREADY holds the pair tries to subscribe it to the cache, and a
+	// fixture's synthetic remote root is refused — which marks the pair degraded for good and makes
+	// every pass a whole read. The parent has no subscription either; it simply never asked for
+	// one. See `bench_reset_changes`.
+	engine.bench_reset_changes(handover.pair).await;
+	// The pair, loaded and nothing else. Measured BEFORE the pass, because a figure taken after one
+	// is a figure that has held a pass's structures.
+	let (rows, pair_baseline_computed_bytes) = engine
+		.bench_load_pair(handover.pair)
+		.await
+		.expect("loading the pair's baseline");
+	assert_eq!(
+		rows, handover.rows,
+		"the child loaded {rows} row(s) where its parent seeded {}: it is not reading the tree the 		 scenario built",
+		handover.rows
+	);
+	let pair_loaded_rss = probe::current_rss_bytes();
+
+	// The in-memory half of `prepare_bed`, which no DB carries: the carried state of a previous
+	// whole pass, and a watched pair's changelist caps.
+	engine.bench_seed_carry(handover.pair).await;
+	let changes = engine.pair_changes(handover.pair).await;
+	changes.cover_local();
+	changes.note_tree_size(handover.rows);
+	// No assertion that the pair is UNdegraded here, deliberately: `bench_reset_changes` dropped the
+	// changelist entry two lines above and `pair_changes` built a fresh one, so the flag is `None` by
+	// construction and an assertion on it could not fail. What holds this honest is `one_pass`, which
+	// asserts WHICH read the pass performed — a degraded pair reads both sides whole, and that fails
+	// the scenario rather than publishing a whole pass under a scoped row's name.
+	drop(changes);
+
+	let bed = Bed {
+		place: handover.place.clone(),
+		_fixture: None,
+		engine,
+		pair: handover.pair,
+		rows: handover.rows,
+		nodes: handover.nodes,
+		applied: Applied {
+			touched: handover.touched.clone(),
+			touched_kind: kind_of(&handover.touched_kind),
+			renamed: handover.renamed.clone(),
+			remote: handover.remote.clone(),
+			changed: handover.changed,
+		},
+		fixture_hash: handover.fixture_hash,
+	};
+
+	// The SAME `one_pass` a timing sample runs, with every one of its assertions: the read kind, the
+	// four plan numbers and the ordered step list. A memory figure for a pass that was not the
+	// scenario's pass is the same lie a timing figure for one would be.
+	let log: Arc<Mutex<Vec<(&'static str, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+	let (_, plan, structures) = STEP_RSS
+		.scope(Arc::clone(&log), one_pass(&bed, scenario))
+		.await;
+	let after_pass_rss = probe::current_rss_bytes();
+	let at_step: Vec<(String, u64)> = log
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner)
+		.iter()
+		.map(|(step, rss)| ((*step).to_owned(), *rss))
+		.collect();
+	assert!(
+		!at_step.is_empty(),
+		"the pass sampled no step: the memory child is not reaching the engine's own marks"
+	);
+	// The widest point DURING the pass, which is not the sample after it: `drop_pass` is marked once
+	// the plan and both sides are freed, and a resident set that does not fall at these sizes made
+	// that last sample the maximum — so `widest`, `peak` and `after_pass` printed one number three
+	// times, and a reader could not tell that from "the pass returned nothing to the kernel".
+	let pass_widest_rss = at_step
+		.iter()
+		.filter(|(step, _)| step.as_str() != "drop_pass")
+		.map(|(_, rss)| *rss)
+		.max()
+		.expect("the pass marked a boundary other than the one after the drop");
+	let structures = structures.expect(
+		"the pass reported no structure sizes: the memory task-local did not reach the engine's own \
+		 tail, and this child's two attribution columns would be NaN",
+	);
+	let structures = (
+		structures.baseline_bytes as u64,
+		structures.view_bytes as u64,
+		structures.scan_bytes as u64,
+	);
+	// A pass does not COPY the tree: `pass_inputs` hands it the store's resident `Arc<Baseline>`,
+	// the very object this child sized before the pass began. One that started copying it would be
+	// the finding, and it would otherwise surface only as two columns that happened to disagree.
+	//
+	// Except when the pass FOLDS a directory move. `Prepared::fold_dir_moves` takes
+	// `&mut self.baseline` and re-keys the moved subtree to the paths it ends up at, so that
+	// pass's tree is a different object from the store's by construction — and a different SIZE,
+	// since every re-keyed name grows by the move's prefix. Asserting through that case would be
+	// asserting something untrue; asserting nowhere would drop the guard for the twenty-nine
+	// scenarios of the default set where it does hold.
+	if plan.dir_moves == 0 {
+		assert_eq!(
+			structures.0, pair_baseline_computed_bytes as u64,
+			"the pass's baseline computes itself as {} byte(s) where the loaded pair's computes \
+			 {} and this pass folded no directory move — the pass is not reading the baseline the \
+			 store holds",
+			structures.0, pair_baseline_computed_bytes,
+		);
+	}
+	drop(bed);
+	// A high-water mark cannot sit BELOW a sample of the same process's resident set. Zero is what
+	// `peak_rss_bytes` answers where it cannot ask — `getrusage` failing, or a target that has none
+	// — and nothing downstream would notice: `peak_MiB` would print 0.0 beside a widest of 24.0 and
+	// read as a formatting glitch rather than as the figure never having been taken.
+	let peak_rss = probe::peak_rss_bytes();
+	let after_everything_dropped_rss = probe::current_rss_bytes();
+	// EVERY figure this child publishes, and not the floor alone. `current_rss_bytes` answers zero
+	// wherever it cannot ask, and it is asked once per sample and once per step — so a reader that
+	// works at the floor and stops working afterwards (a `ps` that fails after its first call is
+	// enough) leaves the floor assertion satisfied and every later figure zero. A run with this
+	// hole open exits 0 and prints `widest 0.0`, `after_pass 0.0` and `pass_added 0.00` beside a
+	// real peak and a plausible `pair_attributed`, which reads as a pass that cost no memory
+	// rather than as figures nobody took.
+	for (what, rss) in [
+		("the pair loaded", pair_loaded_rss),
+		("the widest point of the pass", pass_widest_rss),
+		("the sample after the pass", after_pass_rss),
+		(
+			"the sample after everything was dropped",
+			after_everything_dropped_rss,
+		),
+	] {
+		assert!(
+			rss > 0,
+			"{what} reads 0 byte(s): this process stopped answering its own resident set part way \
+			 through, and every memory row here would carry that zero as a measurement"
+		);
+	}
+	let unsampled: Vec<&str> = at_step
+		.iter()
+		.filter(|(_, rss)| *rss == 0)
+		.map(|(step, _)| step.as_str())
+		.collect();
+	assert!(
+		unsampled.is_empty(),
+		"the resident set was never taken at {}: a step row of zeroes is published under the \
+		 engine's own step name, where it reads as a phase that held nothing",
+		unsampled.join(", ")
+	);
+	assert!(
+		peak_rss >= pass_widest_rss,
+		"this process's high-water mark reads {peak_rss} byte(s) against a resident set sampled at \
+		 {pass_widest_rss}: the peak was never measured, and every memory row here would carry it"
+	);
+	MemAnswer {
+		floor_rss: floor,
+		pair_loaded_rss,
+		pass_widest_rss,
+		after_pass_rss,
+		after_everything_dropped_rss,
+		peak_rss,
+		rows,
+		actions: plan.actions,
+		pair_baseline_computed_bytes: pair_baseline_computed_bytes as u64,
+		structures,
+		at_step,
+	}
 }
 
 /// Run `scenario` `samples` times and return every record it produced.
@@ -1843,6 +2401,23 @@ pub async fn run_scenario(scenario: &Scenario, samples: usize) -> Vec<Record> {
 			fixture_hash,
 			reps,
 		};
+	let make_bytes = |sample: usize, metric: String, bytes: u64| Record {
+		scenario: scenario.name.to_owned(),
+		scenario_version: scenario.version,
+		definition_hash: hash,
+		sample: Some(sample),
+		metric,
+		// Zero, and meant: the value is in `count` and `unit` calls it bytes. A memory figure
+		// printed in a column headed milliseconds is the shape of mistake this harness exists to
+		// stop.
+		ms: 0.0,
+		count: Some(bytes),
+		nodes,
+		fixture_hash,
+		// One pass, undivided: a memory child runs the scenario's pass once and reports what it
+		// held, so the scenario's `reps` is not a divisor of anything here.
+		reps: 1,
+	};
 
 	// Discarded: the page cache, the store's resident baseline (the store builds it on the pair's
 	// FIRST read) and the branch predictors every recorded figure — the yardstick included — is
@@ -1869,7 +2444,7 @@ pub async fn run_scenario(scenario: &Scenario, samples: usize) -> Vec<Record> {
 		let mut marks = 0usize;
 		let wall = Instant::now();
 		for _ in 0..reps {
-			let (timing, planned) = one_pass(&bed, scenario).await;
+			let (timing, planned, _) = one_pass(&bed, scenario).await;
 			for (step, elapsed) in &timing.steps {
 				match per_step.iter_mut().find(|(name, _)| name == step) {
 					Some((_, total)) => *total += *elapsed,
@@ -2018,6 +2593,30 @@ pub async fn run_scenario(scenario: &Scenario, samples: usize) -> Vec<Record> {
 		 number of times in the same state",
 		scenario.name
 	);
+	// And what the SAME pass costs in memory, in fresh processes that run one pass and little else
+	// (`measure_in_child` says what else). Taken after every timed sample, so no child's work sits
+	// inside a figure this process timed.
+	let mem_samples = env_usize("SYNC_BENCH_MEM_SAMPLES", DEFAULT_MEM_SAMPLES);
+	for (sample, answer) in measure_memory(&bed, scenario, mem_samples)
+		.into_iter()
+		.enumerate()
+	{
+		// The child's pass is the same pass or the two tables are of different things. Its own
+		// assertions cover the read kind and the step sequence; this is the one comparison only
+		// the parent can make.
+		if let Some(planned) = expected {
+			assert_eq!(
+				answer.actions, planned,
+				"{}: memory sample {sample} planned {} action(s) where this process planned \
+				 {planned}; the memory and timing figures are not two views of one pass",
+				scenario.name, answer.actions,
+			);
+		}
+		for (metric, bytes) in answer.metrics() {
+			records.push(make_bytes(sample, metric, bytes));
+		}
+	}
+
 	// The fixture goes with the `Bed`: `Fixture`'s `Drop` removes the tree on the way out and on a
 	// panic alike, which is the only way an assertion doing its job does not cost the machine its
 	// disk.
@@ -2078,12 +2677,15 @@ fn select(wanted: &str) -> Result<Vec<&'static Scenario>, String> {
 /// When `SYNC_BENCH_SCENARIO` names something that is not a scenario, or the result file cannot be
 /// written.
 pub fn run() -> Result<String, String> {
+	// A MEMORY child, spawned by `measure_memory`. It answers before anything here builds a tree:
+	// a child that built one would carry the whole construction in the resident set it was spawned
+	// to report.
+	if let Ok(spec) = std::env::var("SYNC_BENCH_MEM_CHILD") {
+		answer_memory_child(Path::new(&spec));
+		return Ok(String::new());
+	}
 	let wanted = std::env::var("SYNC_BENCH_SCENARIO").unwrap_or_else(|_| "default".to_owned());
-	let samples = std::env::var("SYNC_BENCH_SAMPLES")
-		.ok()
-		.and_then(|raw| raw.trim().parse::<usize>().ok())
-		.unwrap_or(DEFAULT_SAMPLES)
-		.max(1);
+	let samples = env_usize("SYNC_BENCH_SAMPLES", DEFAULT_SAMPLES).max(1);
 	let chosen = select(&wanted)?;
 
 	let (commit, toolchain, machine, profile) = run_meta();
@@ -2100,6 +2702,7 @@ pub fn run() -> Result<String, String> {
 		toolchain,
 		machine,
 		profile,
+		allocator: allocator(),
 		mark_overhead_ns: overhead,
 		records: Vec::new(),
 	};
@@ -2175,9 +2778,14 @@ fn headline(run: &RunFile) -> String {
 	let mut reps: BTreeMap<&str, usize> = BTreeMap::new();
 	for record in &run.records {
 		nodes.insert(&record.scenario, record.nodes);
-		reps.insert(&record.scenario, record.reps);
 		match record.metric.as_str() {
-			"total" => passes.entry(&record.scenario).or_default().push(record.ms),
+			"total" => {
+				// From a TIMING record only. A memory record divides by nothing and carries
+				// `reps: 1`, and taking this from whichever record came last would print that
+				// beside a figure divided by 32.
+				reps.insert(&record.scenario, record.reps);
+				passes.entry(&record.scenario).or_default().push(record.ms);
+			}
 			"yardstick_whole_pass" => yardsticks
 				.entry(&record.scenario)
 				.or_default()
@@ -2222,7 +2830,33 @@ fn headline(run: &RunFile) -> String {
 	out
 }
 
-/// Every metric of a run as `(scenario, definition_hash, metric) -> samples`.
+/// What a metric's numbers are IN.
+///
+/// Three units share one record shape. Printing them all in a column headed `ms` is how a plan of
+/// 102 actions came to read as `0.0001 ms`, and it is why the memory figures below are not simply
+/// more `ms` rows: every table here prints this beside the number, and [`compare`] diffs a metric
+/// in its own unit instead of diffing a zero against a zero.
+fn unit(metric: &str) -> &'static str {
+	if metric.starts_with("mem:") {
+		"bytes"
+	} else if metric.starts_with("plan:") || metric == "marks" {
+		"count"
+	} else {
+		"ms"
+	}
+}
+
+/// One record's number, in its own unit.
+fn value(record: &Record) -> f64 {
+	if unit(&record.metric) == "ms" {
+		record.ms
+	} else {
+		record.count.unwrap_or_default() as f64
+	}
+}
+
+/// Every metric of a run as `(scenario, definition_hash, metric) -> samples`, each sample in the
+/// metric's own [`unit`].
 fn grouped(run: &RunFile) -> BTreeMap<(String, u64, String), Vec<f64>> {
 	let mut out: BTreeMap<(String, u64, String), Vec<f64>> = BTreeMap::new();
 	for record in &run.records {
@@ -2232,7 +2866,110 @@ fn grouped(run: &RunFile) -> BTreeMap<(String, u64, String), Vec<f64>> {
 			record.metric.clone(),
 		))
 		.or_default()
-		.push(record.ms);
+		.push(value(record));
+	}
+	out
+}
+
+/// What a pass costs in MEMORY, one row per scenario, from the fresh-process children.
+///
+/// Every figure here was taken in a child process that ran one pass and little else (see
+/// [`measure_in_child`] for what "little else" covers), and every column is a median over that
+/// scenario's memory samples. `widest_spread` is that row's widest max over its min WITHIN one
+/// run: a range and not this row's resolution, the same caveat [`headline`]'s `spread` carries.
+/// The samples run back to back in one parent and the children are not independent of the machine
+/// they land on, so the figure is systematically tighter than the same row's movement between two
+/// runs. `BASELINE.md` carries that one, measured from two sweeps of one binary at one commit.
+///
+/// There are TWO attribution ratios here and not one, because a single one answered neither
+/// question. A process that has loaded a pair has also opened SQLite, built a runtime and a client
+/// and read a tree; a process running a pass over an already-loaded pair has done none of that
+/// again. Dividing the pass's structures by everything since the floor charged the engine's
+/// one-time cost to the pass and reported 2 % where the pass's own structures were simply small.
+///
+/// - `pair_attributed` is what the resident baseline COMPUTES itself as, over what loading it
+///   actually added (`pair_loaded` minus `floor`). The remainder is the engine's fixed cost:
+///   SQLite's page cache and its mapped pages, the tokio runtime, the client, the store's own
+///   row decoding. At a thousand rows that remainder IS the figure — the tree is a quarter of a
+///   mebibyte and the process grew by ten.
+/// - `pass_attributed` is what the pass's two SIDES compute themselves as, over what the pass
+///   added on top of the loaded pair (`widest` minus `pair_loaded`). The baseline is deliberately
+///   not in this ratio: it was resident before the pass began. For a CHANGE-SCOPED pass the sides
+///   are carried and hold only what the pass observed, so a small numerator here is the design
+///   working rather than an accounting failure — what is left is the plan, the facts, the
+///   overlays' transients and whatever the allocator kept.
+///
+/// Neither is expected to reach 100 %, in either direction: a map's `capacity` is allocated
+/// without necessarily being faulted in, so a computed figure can exceed a resident one. What the
+/// columns are for is the SIZE of what nobody has accounted for, which is the only honest thing to
+/// publish until something accounts for it.
+///
+/// The computed columns carry three decimals and the ratios one, because they span five orders of
+/// magnitude: a change-scoped pass's two sides at a thousand rows are about 2.6 kB, and at two
+/// decimals that printed `0.00 MiB` and `0%` — which reads as "nothing could be attributed" rather
+/// than "the sides are two kilobytes", and is the exact misreading this whole table exists to
+/// stop. The per-metric table below carries every one of these figures in bytes regardless.
+fn memory_table(run: &RunFile) -> String {
+	let mut by: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+	for record in &run.records {
+		if record.metric.starts_with("mem:") {
+			by.entry((record.scenario.clone(), record.metric.clone()))
+				.or_default()
+				.push(value(record));
+		}
+	}
+	if by.is_empty() {
+		return "# no memory samples in this run (SYNC_BENCH_MEM_SAMPLES=0)\n".to_owned();
+	}
+	let scenarios: BTreeSet<String> = by.keys().map(|(scenario, _)| scenario.clone()).collect();
+	let mut out = String::new();
+	writeln!(
+		out,
+		"scenario\tn\tfloor_MiB\tpair_loaded_MiB\twidest_MiB\tpeak_MiB\tafter_pass_MiB\t\
+		 after_drop_MiB\tpair_computed_MiB\tpair_attributed\tpass_added_MiB\t\
+		 sides_computed_KiB\tpass_attributed\twidest_spread"
+	)
+	.expect("writing to a String never fails");
+	for name in scenarios {
+		let samples = |metric: &str| by.get(&(name.clone(), format!("mem:{metric}"))).cloned();
+		let med = |metric: &str| -> f64 {
+			samples(metric).map_or(f64::NAN, |mut values| {
+				median(&mut values) / (1024.0 * 1024.0)
+			})
+		};
+		let widest = samples("fresh_process_pass_widest_rss").unwrap_or_default();
+		let (low, high) = widest
+			.iter()
+			.fold((f64::MAX, f64::MIN), |(low, high), value| {
+				(low.min(*value), high.max(*value))
+			});
+		let pair_added = med("fresh_process_pair_loaded_rss") - med("fresh_process_floor_rss");
+		let pair_computed = med("pair_baseline_computed_bytes");
+		let pass_added = med("fresh_process_pass_widest_over_pair_loaded_rss");
+		// In KIBIBYTES, alone among the columns here. A change-scoped pass's two sides are a few
+		// hundred bytes at a thousand rows, and in mebibytes to three decimals 411 B and 0 B both
+		// print `0.000` — and zero is a real answer here, since a scoped pass whose remote changelist
+		// was empty owns nothing on that side. The two have to be tellable apart.
+		let sides_computed = med("pass_sides_computed_bytes") * 1024.0;
+		writeln!(
+			out,
+			"{name}\t{}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.1}%\t{:.2}\t\
+			 {:.3}\t{:.1}%\t{:.2}x",
+			widest.len(),
+			med("fresh_process_floor_rss"),
+			med("fresh_process_pair_loaded_rss"),
+			med("fresh_process_pass_widest_rss"),
+			med("fresh_process_peak_rss"),
+			med("fresh_process_after_pass_rss"),
+			med("fresh_process_after_everything_dropped_rss"),
+			pair_computed,
+			pair_computed / pair_added * 100.0,
+			pass_added,
+			sides_computed,
+			sides_computed / pass_added * 100.0,
+			if low > 0.0 { high / low } else { f64::NAN },
+		)
+		.expect("writing to a String never fails");
 	}
 	out
 }
@@ -2243,25 +2980,20 @@ fn summarize(run: &RunFile) -> String {
 	let mut out = String::new();
 	writeln!(
 		out,
-		"# {} {} {} ({}), mark {:.0} ns",
+		"# {} {} {} ({}, {}), mark {:.0} ns",
 		run.commit.get(..12).unwrap_or(&run.commit),
 		run.toolchain,
 		run.machine,
 		run.profile,
+		run.allocator,
 		run.mark_overhead_ns,
 	)
 	.expect("writing to a String never fails");
 	out.push_str(&headline(run));
-	writeln!(out, "scenario\tmetric\tn\tmedian_ms\tmin_ms\tmax_ms\tcount")
+	out.push_str(&memory_table(run));
+	writeln!(out, "scenario\tmetric\tunit\tn\tmedian\tmin\tmax")
 		.expect("writing to a String never fails");
 	for ((scenario, _, metric), mut samples) in grouped(run) {
-		let count = run
-			.records
-			.iter()
-			.find(|record| {
-				record.scenario == scenario && record.metric == metric && record.count.is_some()
-			})
-			.and_then(|record| record.count);
 		let (min, max) = samples
 			.iter()
 			.fold((f64::MAX, f64::MIN), |(lo, hi), value| {
@@ -2269,12 +3001,12 @@ fn summarize(run: &RunFile) -> String {
 			});
 		writeln!(
 			out,
-			"{scenario}\t{metric}\t{}\t{:.4}\t{:.4}\t{:.4}\t{}",
+			"{scenario}\t{metric}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}",
+			unit(&metric),
 			samples.len(),
 			median(&mut samples),
 			min,
 			max,
-			count.map_or_else(|| "-".to_owned(), |n| n.to_string()),
 		)
 		.expect("writing to a String never fails");
 	}
@@ -2343,11 +3075,12 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 	if before.profile != after.profile
 		|| before.toolchain != after.toolchain
 		|| before.machine != after.machine
+		|| before.allocator != after.allocator
 	{
 		writeln!(
 			out,
-			"# WARNING: different build profile, toolchain or MACHINE — these figures are not \
-			 comparable"
+			"# WARNING: different build profile, toolchain, MACHINE or allocator — these figures \
+			 are not comparable"
 		)
 		.expect("writing to a String never fails");
 	}
@@ -2437,7 +3170,7 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 	}
 	writeln!(
 		out,
-		"scenario\tmetric\tn_before\tn_after\tbefore_ms\tafter_ms\tchange"
+		"scenario\tmetric\tunit\tn_before\tn_after\tbefore\tafter\tchange"
 	)
 	.expect("writing to a String never fails");
 	let range = |samples: &[f64]| -> (f64, f64) {
@@ -2457,8 +3190,12 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 			continue;
 		}
 		let Some(mut before_samples) = old.remove(&(scenario.clone(), hash, metric.clone())) else {
-			writeln!(out, "{scenario}\t{metric}\tONLY IN AFTER\t-\t-\t-\t-")
-				.expect("writing to a String never fails");
+			writeln!(
+				out,
+				"{scenario}\t{metric}\t{}\tONLY IN AFTER\t-\t-\t-\t-",
+				unit(&metric)
+			)
+			.expect("writing to a String never fails");
 			continue;
 		};
 		let (was, now) = (median(&mut before_samples), median(&mut after_samples));
@@ -2483,7 +3220,8 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 		};
 		writeln!(
 			out,
-			"{scenario}\t{metric}\t{}\t{}\t{was:.4}\t{now:.4}\t{change}",
+			"{scenario}\t{metric}\t{}\t{}\t{}\t{was:.4}\t{now:.4}\t{change}",
+			unit(&metric),
 			before_samples.len(),
 			after_samples.len(),
 		)
@@ -2495,8 +3233,12 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 		if incomparable.contains(&scenario) {
 			continue;
 		}
-		writeln!(out, "{scenario}\t{metric}\tONLY IN BEFORE\t-\t-\t-\t-")
-			.expect("writing to a String never fails");
+		writeln!(
+			out,
+			"{scenario}\t{metric}\t{}\tONLY IN BEFORE\t-\t-\t-\t-",
+			unit(&metric)
+		)
+		.expect("writing to a String never fails");
 	}
 	Ok(out)
 }
@@ -2690,6 +3432,181 @@ mod tests {
 		assert_eq!(Change::Files(100).count(4_096), 100);
 	}
 
+	/// Every memory metric's NAME says whose process it measured and how the figure was arrived at.
+	///
+	/// The structural answer to the way every memory number in this effort was misquoted: a figure
+	/// called `peak_rss` silently meant "this process since it started" and was read as the cost of
+	/// a phase. A name here is either a `fresh_process_*` — a figure from a process whose whole
+	/// history IS this measurement — or a `*_computed_bytes`, which is a structure summing its own
+	/// capacities and a different kind of number entirely.
+	#[test]
+	fn every_memory_metric_names_whose_process_it_measured() {
+		let answer = MemAnswer {
+			floor_rss: 1,
+			pair_loaded_rss: 2,
+			pass_widest_rss: 5,
+			after_pass_rss: 3,
+			after_everything_dropped_rss: 2,
+			peak_rss: 9,
+			rows: 10,
+			actions: 1,
+			pair_baseline_computed_bytes: 100,
+			// Distinct on purpose: a metric carrying `baseline + view + scan` is then a value no
+			// other metric has, and the assertion below can refuse it by arithmetic rather than by
+			// name.
+			structures: (100, 20, 3),
+			at_step: vec![("from_baseline".to_owned(), 4)],
+		};
+		let names: Vec<String> = answer.metrics().into_iter().map(|(name, _)| name).collect();
+		for name in &names {
+			let tail = name
+				.strip_prefix("mem:")
+				.unwrap_or_else(|| panic!("{name} is not marked as a memory metric"));
+			assert!(
+				tail.starts_with("fresh_process_") || tail.ends_with("_computed_bytes"),
+				"{name} says neither whose process it measured nor that it was computed rather \
+				 than observed"
+			);
+			assert_eq!(
+				unit(name),
+				"bytes",
+				"{name} would be printed in the wrong unit"
+			);
+		}
+		// The SIDES, and no total with the pair's baseline folded into it. That sum shipped once,
+		// as `mem:pass_structures_computed_bytes`: at ten thousand rows it was 98 % the baseline —
+		// resident before the pass began, and excluded from the attribution ratio the same run
+		// prints — under a name that reads as what the pass itself built. A name alone cannot
+		// refuse its return, so the arithmetic does.
+		let by_name = |wanted: &str| {
+			answer
+				.metrics()
+				.into_iter()
+				.find(|(name, _)| name == wanted)
+				.map(|(_, value)| value)
+		};
+		assert_eq!(
+			by_name("mem:pass_sides_computed_bytes"),
+			Some(23),
+			"the sides metric is the view and the scan, and nothing else"
+		);
+		for (name, value) in answer.metrics() {
+			assert_ne!(
+				value, 123,
+				"{name} publishes the pair's baseline summed with the pass's two sides, under a \
+				 name that reads as the pass's own cost"
+			);
+		}
+		// The four kinds the definition calls for, each under its own name rather than one figure
+		// serving as all of them.
+		for wanted in [
+			"mem:fresh_process_pair_loaded_rss",
+			"mem:fresh_process_pass_widest_rss",
+			"mem:fresh_process_peak_rss",
+			"mem:pass_sides_computed_bytes",
+		] {
+			assert!(
+				names.iter().any(|name| name == wanted),
+				"{wanted} is not among the memory metrics"
+			);
+		}
+		// And the profile is keyed by the engine's own marks, so it lines up with the timing table.
+		assert!(
+			names
+				.iter()
+				.any(|name| name == "mem:fresh_process_rss_at_step:from_baseline"),
+			"the per-step resident set is not recorded under the engine's own step name"
+		);
+	}
+
+	/// The resident-set readers answer something on the platform a run would be taken on.
+	///
+	/// Both of them map a failure to ZERO — `current_rss_bytes` where `ps` is missing or `/proc`
+	/// absent, `peak_rss_bytes` where `getrusage` fails or the target has none — and a memory table
+	/// of plausible zeroes is worse than no table at all: `pair_attributed` divides by one of them,
+	/// every column prints `0.0`, and nothing in a run says the figure was never taken. A child
+	/// asserts this for itself at its floor, at every sample it publishes and at its peak; this
+	/// says it at `cargo test` time, which is where someone porting the harness to a target with
+	/// neither reader will meet it.
+	///
+	/// This test covers the target that never answers. The reader that answers and then STOPS is a
+	/// different failure and is not reachable from here — it is caught in the child, where the
+	/// figures are published.
+	#[test]
+	fn the_resident_set_readers_answer_something() {
+		let current = probe::current_rss_bytes();
+		assert!(
+			current > 0,
+			"this platform answered no resident set at all, so every memory figure a run published \
+			 here would be zero"
+		);
+		let peak = probe::peak_rss_bytes();
+		assert!(
+			peak >= current,
+			"the high-water mark reads {peak} byte(s) against a resident set of {current}: a peak \
+			 below a sample of the same process was never measured"
+		);
+	}
+
+	/// A memory child announces exactly what its parent announced.
+	///
+	/// The announcement is the one thing the child cannot re-derive: `RemoteDeltaEntry` carries a
+	/// hash and a stable id neither process may construct freely, so the parent writes lines and
+	/// both build the delta through [`remote_delta`]. Two processes announcing different things is
+	/// not a failure any assertion here would catch.
+	#[test]
+	fn a_remote_line_survives_the_trip_to_a_child() {
+		let uuid = uuid::Uuid::new_v4();
+		let parent = uuid::Uuid::new_v4();
+		let line = RemoteLine {
+			uuid: uuid.to_string(),
+			parent: parent.to_string(),
+			name: "file_000001.dat".to_owned(),
+			stable_uuid: Some(uuid::Uuid::new_v4().to_string()),
+			hash_fill: 7,
+			size: 74,
+			modified_millis: 1_700_000_000_000,
+		};
+		let encoded = serde_json::to_string(std::slice::from_ref(&line)).expect("a line encodes");
+		let decoded: Vec<RemoteLine> = serde_json::from_str(&encoded).expect("a line decodes");
+		assert_eq!(decoded, vec![line.clone()]);
+		assert_eq!(remote_delta(&[line]), remote_delta(&decoded));
+		match &remote_delta(&decoded)[0].change {
+			RemoteChange::Upsert(item) => {
+				assert_eq!(item.uuid, uuid);
+				assert_eq!(item.parent, parent);
+				assert_eq!(item.hash, Some(Blake3Hash::from([7u8; 32])));
+			}
+			other => panic!("a remote line is an upsert, not {other:?}"),
+		}
+	}
+
+	/// Counts and bytes are not milliseconds, and nothing here prints them as though they were.
+	#[test]
+	fn a_metric_knows_what_unit_it_is_in() {
+		assert_eq!(unit("total"), "ms");
+		assert_eq!(unit("step:from_baseline"), "ms");
+		assert_eq!(unit("yardstick_whole_pass"), "ms");
+		assert_eq!(unit("plan:actions"), "count");
+		assert_eq!(unit("marks"), "count");
+		assert_eq!(unit("mem:fresh_process_peak_rss"), "bytes");
+		// A count reads back as its count rather than as the zero sitting in its `ms` column, which
+		// is what left `plan:*` — and would have left every memory figure — invisible to a diff.
+		let record = Record {
+			scenario: "s".to_owned(),
+			scenario_version: 1,
+			definition_hash: 0,
+			sample: Some(0),
+			metric: "plan:actions".to_owned(),
+			ms: 0.0,
+			count: Some(102),
+			nodes: 1,
+			fixture_hash: 0,
+			reps: 1,
+		};
+		assert!((value(&record) - 102.0).abs() < f64::EPSILON);
+	}
+
 	/// A machine that moved is not a speedup, and the marks say the machine moved.
 	///
 	/// `compare`'s only guard used to be each run's INTERNAL spread, which cannot see between-run
@@ -2718,6 +3635,7 @@ mod tests {
 			toolchain: "nightly".to_owned(),
 			machine: "here macos/aarch64".to_owned(),
 			profile: "debug_assertions".to_owned(),
+			allocator: "system".to_owned(),
 			mark_overhead_ns: mark,
 			records: vec![
 				record("total", total),

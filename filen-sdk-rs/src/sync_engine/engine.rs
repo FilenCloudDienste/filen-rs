@@ -1293,6 +1293,23 @@ pub(super) struct BenchPass {
 	/// re-upload of the subtree instead, which is a different pass at a very different price.
 	pub(super) dir_moves: usize,
 	pub(super) rows: usize,
+	/// What the pass's own structures computed their size as at its widest point.
+	///
+	/// `None` in every TIMED pass: summing them visits every node of both sides, and no timed
+	/// region may pay that. [`bench::measuring_memory`](super::bench::measuring_memory) — true only
+	/// inside a memory child — is what decides, so the one tail below serves both without a second
+	/// copy of it existing to drift.
+	pub(super) structures: Option<PassStructures>,
+}
+
+/// What the structures a pass holds at its widest point compute their own size as. An
+/// ATTRIBUTION, not a measurement of the process: see [`probe::pass_structures_bytes`].
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PassStructures {
+	pub(super) baseline_bytes: usize,
+	pub(super) view_bytes: usize,
+	pub(super) scan_bytes: usize,
 }
 
 /// The seam the benchmark harness drives a REAL pass through.
@@ -1349,6 +1366,45 @@ impl SyncEngine {
 		);
 	}
 
+	/// Load the pair's baseline into the store the engine keeps it in, and answer how many rows it
+	/// holds and what the tree computes its own size as.
+	///
+	/// The steady state a memory child reports is an engine holding this pair and NOTHING else, and
+	/// running a pass is not a way to reach it: the figure afterwards would be one that had held a
+	/// whole pass's structures. This offers no way to assemble a pass — it hands back two numbers —
+	/// and what it leaves behind is the resident copy an idle engine sits on between passes.
+	pub(super) async fn bench_load_pair(&self, pair: PairId) -> Result<(usize, usize), Error> {
+		let store = self.pair_store(pair).await?;
+		let baseline = locked(&store)
+			.baseline(pair)
+			.map_err(|e| db_error(e, "loading the benchmark pair's baseline"))?;
+		Ok((baseline.len(), baseline.resident_bytes()))
+	}
+
+	/// Put a pair's changelist back in the state a freshly registered pair's is in.
+	///
+	/// A memory child opens an engine on a baseline DB that ALREADY holds the pair, and
+	/// [`Self::open`] subscribes every registered pair to the cache's notifications
+	/// ([`Self::observe_pair`]). A benchmark fixture's remote root is synthetic, so that
+	/// subscription is refused and the pair is marked
+	/// [`FullPassReason::RemoteEventsDegraded`] — permanently, by design: a degraded source forces
+	/// every later pass to read both sides whole.
+	///
+	/// The parent process never reaches that state, and not because it has a subscription: its
+	/// engine opened on an EMPTY registry and registered the pair afterwards through
+	/// [`Self::bench_create_pair`], which subscribes nothing. Neither process ends up with cache
+	/// notifications for this fixture, but they do not differ in the flag ALONE: the child's refused
+	/// attempt also started a cache worker and a second connection to the fixture's cache DB, and
+	/// both are inside the resident set it goes on to report. So this drops the changelist
+	/// entry and lets the next [`Self::pair_changes`] build a fresh one, and the child measures the
+	/// pass its parent timed instead of a whole read wearing that pass's name.
+	///
+	/// What holds it honest is that `one_pass` asserts WHICH read ran on every pass, in the child
+	/// as in the parent: a scenario whose pass fell back fails rather than reporting a figure.
+	pub(super) async fn bench_reset_changes(&self, pair: PairId) {
+		self.changes.lock().await.remove(&pair);
+	}
+
 	/// Run a change-scoped pass over `scope`.
 	pub(super) async fn bench_prepare(
 		&self,
@@ -1381,6 +1437,21 @@ impl SyncEngine {
 		super::step("prepare_tail");
 		let screened = reconcile_and_screen(&prep, screen_state(&prep));
 		super::step("reconcile_and_screen");
+		// Summed HERE, at the pass's widest point: every structure it built is still alive and the
+		// drop below is what frees them. Only a memory child asks — the sum is O(nodes), and it is
+		// taken AFTER the step mark above so a timed pass could not pay for it even if it did.
+		let structures = super::bench::measuring_memory().then(|| {
+			let (baseline_bytes, view_bytes, scan_bytes) = super::probe::pass_structures_bytes(
+				&prep.baseline,
+				&prep.remote_view.nodes,
+				&prep.local_scan.nodes,
+			);
+			PassStructures {
+				baseline_bytes,
+				view_bytes,
+				scan_bytes,
+			}
+		});
 		let pass = BenchPass {
 			scoped: prep.read.is_scoped(),
 			full_reason: prep.read.full_pass_reason(),
@@ -1389,6 +1460,7 @@ impl SyncEngine {
 			conflicts: screened.conflicts.len(),
 			dir_moves: prep.dir_moves.len(),
 			rows: prep.baseline.len(),
+			structures,
 		};
 		// Dropped inside a NAMED step rather than at the end of the function. Freeing what a pass
 		// built was once the second-largest term of a change-scoped pass at a million rows, and it

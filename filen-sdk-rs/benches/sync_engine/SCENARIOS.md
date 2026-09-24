@@ -39,6 +39,77 @@ Every scenario records, in ONE process and ONE run:
 A single step's cost is only meaningful as an IN-RUN delta between phases of one
 process. Sub-0.01 ms steps move ±24 % run to run; do not read a percentage on one.
 
+## How to read any memory row
+
+Every scenario also records what its pass costs in MEMORY, measured in FRESH
+PROCESSES (`SYNC_BENCH_MEM_SAMPLES`, default 2, `0` skips). A child opens the
+tree its parent already built, loads the pair, runs the scenario's own pass under
+the same assertions, and samples its own resident set. An in-process figure
+cannot answer an absolute question — by the time the timing samples are done this
+process has run warmups, three samples and three whole yardstick passes, and what
+the allocator kept is still resident — so no memory figure is taken here.
+
+The names say whose process a figure is and how it was arrived at, because the
+misquoting these replace came from names that did not:
+
+- `mem:fresh_process_floor_rss` — the child before it opened anything: binary,
+  runtime, the allocator's first pages. Subtract it to talk about the engine.
+- `mem:fresh_process_pair_loaded_rss` — the pair's baseline loaded into the store
+  the engine keeps it in, and NOTHING else. This is the steady state between
+  passes, and the figure a steady-state target is read off.
+- `mem:fresh_process_pass_widest_rss` — the widest of the engine's own step
+  boundaries during the pass. It is not a continuous sampler: a spike inside one
+  step is not in it.
+- `mem:fresh_process_pass_widest_over_floor_rss` and
+  `mem:fresh_process_pass_widest_over_pair_loaded_rss` — that same widest point,
+  measured from the two floors worth measuring it from. The first includes
+  opening the engine and reading the tree, neither of which a pass pays again;
+  the second is what the PASS added on top of an already-loaded pair, and is the
+  figure a per-pass memory target is read off.
+- `mem:fresh_process_peak_rss` — `getrusage`'s high-water mark for the whole
+  child. The transients of BUILDING what the pass held sit between this and
+  `widest`, which is why the two differ and neither is the other.
+- `mem:fresh_process_after_pass_rss` — the pass dropped, the engine still open:
+  what an idle engine sits on, including pages the allocator kept rather than
+  returned.
+- `mem:fresh_process_after_everything_dropped_rss` — engine and store gone too.
+  The gap from `floor` is retention, not a structure.
+- `mem:fresh_process_rss_at_step:<step>` — the resident set at each boundary the
+  engine marked, in order, so the memory profile and the timing profile are of
+  one pass.
+- `mem:pair_baseline_computed_bytes`, `mem:pass_{baseline,view,scan}_computed_bytes`
+  and their sum `mem:pass_structures_computed_bytes` — what those structures say
+  they cost, summed from their own capacities. A COMPUTED figure, never a
+  measured one: it can exceed a resident set, because capacity is allocated
+  without necessarily being faulted in.
+
+`summarize` prints TWO attribution ratios, because one answered neither
+question. `pair_attributed` is what the resident baseline computes itself as
+over what LOADING it added (`pair_loaded − floor`); the remainder is the
+engine's fixed cost — SQLite's page cache and mapped pages, the runtime, the
+client. `pass_attributed` is what the pass's two SIDES compute themselves as
+over what the PASS added on top of an already-loaded pair
+(`widest − pair_loaded`); the baseline is not in it, because it was resident
+before the pass began.
+
+A change-scoped pass's sides are CARRIED — they hold only what the pass
+observed and derive the rest from the baseline rows — so a small
+`sides_computed` is the design working, not an accounting failure. Sizing them
+as though they were materialised trees would charge a scoped pass for two more
+copies of a tree it exists not to hold.
+
+Neither ratio is expected to reach 100 %, in either direction: a map's
+`capacity` is allocated without necessarily being faulted in, so a computed
+figure can exceed a resident one. What is left over is the plan, the facts, the
+overlays' transients and whatever the allocator kept rather than returned. The
+columns are there to show the SIZE of what nobody has accounted for, which is
+the only honest thing to publish until something accounts for it.
+
+Every RSS figure is the allocator's answer as much as the engine's, so each run
+stamps which one it used, and `widest_spread` (that row's max over its min across
+its memory samples) is the resolution the row has. Two runs whose figures differ
+by less than the spread do not differ.
+
 ## Why every scenario asserts a plan
 
 Each row pins four numbers — `actions`, `held`, `conflicts`, `dir_moves` — plus
