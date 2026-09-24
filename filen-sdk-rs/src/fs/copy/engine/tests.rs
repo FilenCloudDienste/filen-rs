@@ -16,7 +16,7 @@ use crate::{
 	fs::{
 		copy::{
 			plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
-			report::{CopyCallback, CopyUpdate},
+			report::{CopyCallback, CopyUpdate, RunState},
 		},
 		dir::meta::DecryptedDirectoryMeta,
 		file::meta::{DecryptedFileMeta, FileMeta},
@@ -840,8 +840,22 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 		uploaded,
 		"nothing moves while paused"
 	);
-	assert!(recorder.updates.lock().unwrap().iter().any(|u| u.paused));
-	assert!(recorder.updates.lock().unwrap().iter().any(|u| u.pausing));
+	assert!(
+		recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.any(|u| u.run_state == RunState::Paused)
+	);
+	assert!(
+		recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.any(|u| u.run_state == RunState::Pausing)
+	);
 
 	pause.send_replace(false);
 	let outcome = running.await.unwrap();
@@ -850,8 +864,7 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 	assert_each_chunk_once(&backend);
 	assert_eq!(backend.log().uploaded.len(), 18);
 	assert_eq!(outcome.report.counts.bytes_done, 18 * CHUNK_SIZE_U64);
-	let last = recorder.last();
-	assert!(!last.paused && !last.pausing);
+	assert_eq!(recorder.last().run_state, RunState::Running);
 }
 
 // The memory budget is shared with other transfers. A chunk waiting for memory is handed
@@ -1043,8 +1056,7 @@ async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
 	outcome.result.unwrap();
 	assert_eq!(backend.log().uploaded.len(), 18);
 	assert_released(&backend, &reporter);
-	let last = recorder.last();
-	assert!(!last.paused && !last.pausing);
+	assert_eq!(recorder.last().run_state, RunState::Running);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1069,16 +1081,24 @@ async fn a_cancel_while_paused_ends_the_pause() {
 	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
 	assert_released(&backend, &reporter);
 	let updates = recorder.updates.lock().unwrap();
-	for update in &updates[updates_before_cancel..] {
-		assert!(
-			!(update.cancelling && (update.paused || update.pausing)),
-			"a cancelling job is shown as pausing or paused: {update:?}"
-		);
-	}
+	let states: Vec<RunState> = updates[updates_before_cancel..]
+		.iter()
+		.map(|u| u.run_state)
+		.collect();
+	let cancelling = states
+		.iter()
+		.position(|s| *s == RunState::Cancelling)
+		.expect("the cancel is reported");
+	assert!(
+		states[cancelling..]
+			.iter()
+			.all(|s| *s == RunState::Cancelling),
+		"a cancelling job is shown as pausing or paused: {states:?}"
+	);
 	let last = updates.last().unwrap();
 	assert_eq!(last.phase, CopyPhase::Cancelled);
 	assert!(
-		!last.paused && !last.pausing,
+		!matches!(last.run_state, RunState::Paused | RunState::Pausing),
 		"the final update is not paused"
 	);
 }
@@ -1231,7 +1251,7 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 	let updates = recorder.updates.lock().unwrap().clone();
 	let winding_down: Vec<_> = updates
 		.iter()
-		.filter(|u| u.cancelling && u.phase == CopyPhase::CopyingFiles)
+		.filter(|u| u.run_state == RunState::Cancelling && u.phase == CopyPhase::CopyingFiles)
 		.collect();
 	assert!(!winding_down.is_empty());
 	assert!(

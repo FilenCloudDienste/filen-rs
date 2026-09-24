@@ -18,6 +18,6 @@ pub use engine::CopyOutcome;
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
 pub use report::{
 	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyFailure, CopyPhase,
-	CopyReport, CopyStage, CopyUpdate, FailedSource, FailureInfo, PlannedTopLevelItem,
+	CopyReport, CopyStage, CopyUpdate, FailedSource, FailureInfo, PlannedTopLevelItem, RunState,
 	ScanProgress,
 };

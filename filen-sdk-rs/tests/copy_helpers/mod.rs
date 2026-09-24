@@ -12,7 +12,7 @@ use filen_sdk_rs::{
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyOptions, CopyOutcome, CopySource, CopySourceDir,
-			CopyUpdate, JobControl, JobController, PlannedTopLevelItem,
+			CopyUpdate, JobControl, JobController, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
@@ -150,7 +150,13 @@ impl CopyCallback for PauseOnCreate {
 /// Waits (real time, bounded) until the job reports itself paused.
 pub async fn wait_until_paused(recorder: &Recorder) {
 	for _ in 0..600 {
-		if recorder.updates.lock().unwrap().iter().any(|u| u.paused) {
+		if recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.any(|u| u.run_state == RunState::Paused)
+		{
 			return;
 		}
 		tokio::time::sleep(std::time::Duration::from_millis(100)).await;

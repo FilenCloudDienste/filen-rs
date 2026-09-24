@@ -2258,7 +2258,7 @@ test("copyItems pauses, resumes and cancels through managedFuture", async () => 
 		onUpdate: update => updates.push(update),
 		managedFuture: { pauseSignal }
 	})
-	await waitFor("the copy is paused", () => updates.some(u => u.paused))
+	await waitFor("the copy is paused", () => updates.some(u => u.runState === "paused"))
 	const doneWhilePaused = updates[updates.length - 1].counts.filesDone
 	await new Promise(resolve => setTimeout(resolve, 2000))
 	expect(updates[updates.length - 1].counts.filesDone).toBe(doneWhilePaused)

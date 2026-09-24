@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-	ActiveFile, CopyCounts, CopyPhase, CopyStage, PlanTotals, RenameReason, ScanProgress,
+	ActiveFile, CopyCounts, CopyPhase, CopyStage, PlanTotals, RenameReason, RunState, ScanProgress,
 	SkipReason,
 };
 
@@ -136,11 +136,7 @@ pub enum CopyEvent {
 #[js_type(export, no_deser)]
 pub struct CopyUpdate {
 	pub phase: CopyPhase,
-	/// A pause was requested and in-flight work is still finishing.
-	pub pausing: bool,
-	/// Paused: nothing is running, and no memory or drive lock is held.
-	pub paused: bool,
-	pub cancelling: bool,
+	pub run_state: RunState,
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
 	pub counts: CopyCounts,
@@ -406,9 +402,7 @@ impl From<api::CopyUpdate> for CopyUpdate {
 	fn from(update: api::CopyUpdate) -> Self {
 		Self {
 			phase: update.phase,
-			pausing: update.pausing,
-			paused: update.paused,
-			cancelling: update.cancelling,
+			run_state: update.run_state,
 			scan: update.scan,
 			totals: update.totals,
 			counts: update.counts,
@@ -990,9 +984,7 @@ mod tests {
 		};
 		let update = CopyUpdate::from(api::CopyUpdate {
 			phase: CopyPhase::CopyingFiles,
-			pausing: false,
-			paused: false,
-			cancelling: false,
+			run_state: RunState::Running,
 			scan: ScanProgress::default(),
 			totals: PlanTotals::default(),
 			counts: CopyCounts::default(),
@@ -1068,9 +1060,7 @@ mod tests {
 	fn update(millis: u64) -> api::CopyUpdate {
 		api::CopyUpdate {
 			phase: CopyPhase::CopyingFiles,
-			pausing: false,
-			paused: false,
-			cancelling: false,
+			run_state: RunState::Running,
 			scan: ScanProgress::default(),
 			totals: PlanTotals::default(),
 			counts: CopyCounts::default(),

@@ -52,6 +52,25 @@ pub enum CopyPhase {
 	Failed,
 }
 
+/// Whether a copy is running, and how far a pause or cancel has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum RunState {
+	Running,
+	/// A pause was requested and in-flight work is still finishing.
+	Pausing,
+	/// Paused: nothing is running, and no memory or drive lock is held.
+	Paused,
+	/// Cancelled and winding down; a cancel overrides a pause.
+	Cancelling,
+}
+
 /// Running counts. Once the job is over, everything planned is done, failed or not attempted:
 /// `created + failed + not_attempted == totals` for directories, and likewise for files and
 /// bytes. Skipped entries are not part of the totals.
@@ -198,11 +217,7 @@ pub enum CopyEvent {
 #[derive(Debug, Clone)]
 pub struct CopyUpdate {
 	pub phase: CopyPhase,
-	/// A pause was requested and in-flight work is still finishing.
-	pub pausing: bool,
-	/// Paused: nothing is running, and no memory or drive lock is held.
-	pub paused: bool,
-	pub cancelling: bool,
+	pub run_state: RunState,
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
 	pub counts: CopyCounts,
@@ -297,6 +312,20 @@ struct State {
 	rate: RateEstimator,
 }
 
+impl State {
+	fn run_state(&self) -> RunState {
+		if self.cancelling {
+			RunState::Cancelling
+		} else if self.paused {
+			RunState::Paused
+		} else if self.pause_requested {
+			RunState::Pausing
+		} else {
+			RunState::Running
+		}
+	}
+}
+
 /// Turns job state changes into callbacks. Every callback is made while holding the state lock,
 /// so the callback sees them in the order the job produced them.
 pub(crate) struct Reporter {
@@ -380,9 +409,7 @@ impl Reporter {
 		state.changed = false;
 		self.callback.update(CopyUpdate {
 			phase: state.phase,
-			pausing: state.pause_requested && !state.paused && !state.cancelling,
-			paused: state.paused,
-			cancelling: state.cancelling,
+			run_state: state.run_state(),
 			scan: state.scan,
 			totals: state.totals,
 			counts: state.counts,
