@@ -270,14 +270,14 @@ impl From<&Error> for CopyError {
 	}
 }
 
-impl From<&api::FailureInfo> for CopyFailureInfo {
-	fn from(info: &api::FailureInfo) -> Self {
+impl From<api::FailureInfo> for CopyFailureInfo {
+	fn from(info: api::FailureInfo) -> Self {
 		Self {
 			source_uuid: info.source_uuid,
-			source_path: info.source_path.clone(),
+			source_path: info.source_path,
 			dest_parent: info.dest_parent_dir.uuid(),
-			dest_parent_dir: info.dest_parent_dir.clone().into(),
-			dest_name: info.dest_name.clone(),
+			dest_parent_dir: info.dest_parent_dir.into(),
+			dest_name: info.dest_name,
 			stage: info.stage,
 			error: CopyError::from(info.error.as_ref()),
 			affected_files: info.affected_files,
@@ -286,13 +286,22 @@ impl From<&api::FailureInfo> for CopyFailureInfo {
 	}
 }
 
-impl From<&api::RenamedEntry> for CopyRenamedEntry {
-	fn from(entry: &api::RenamedEntry) -> Self {
+impl From<api::RenamedEntry> for CopyRenamedEntry {
+	fn from(entry: api::RenamedEntry) -> Self {
 		Self {
 			source_uuid: entry.source_uuid,
-			source_path: entry.source_path.clone(),
-			name: entry.name.as_ref().to_owned(),
+			source_path: entry.source_path,
+			name: entry.name.into(),
 			reason: entry.reason,
+		}
+	}
+}
+
+impl From<api::CopyFailure> for CopyFailure {
+	fn from(failure: api::CopyFailure) -> Self {
+		Self {
+			item: failure.source.into(),
+			info: failure.info.into(),
 		}
 	}
 }
@@ -311,7 +320,7 @@ impl From<api::CopyEvent> for CopyEvent {
 				dest_parent,
 				name,
 			}),
-			api::CopyEvent::DirFailed(info) => Self::DirFailed((&info).into()),
+			api::CopyEvent::DirFailed(info) => Self::DirFailed(info.into()),
 			api::CopyEvent::FileStarted(file) => Self::FileStarted(file),
 			api::CopyEvent::FileDone {
 				source_uuid,
@@ -326,19 +335,9 @@ impl From<api::CopyEvent> for CopyEvent {
 				name,
 				size,
 			}),
-			api::CopyEvent::FileFailed(info) => Self::FileFailed((&info).into()),
+			api::CopyEvent::FileFailed(info) => Self::FileFailed(info.into()),
 			api::CopyEvent::Skipped(entry) => Self::Skipped(entry),
-			api::CopyEvent::Renamed(api::RenamedEntry {
-				source_uuid,
-				source_path,
-				name,
-				reason,
-			}) => Self::Renamed(CopyRenamedEntry {
-				source_uuid,
-				source_path,
-				name: name.into(),
-				reason,
-			}),
+			api::CopyEvent::Renamed(entry) => Self::Renamed(entry.into()),
 			api::CopyEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(CopyItemError {
 					dest_uuid,
@@ -401,16 +400,9 @@ impl From<api::CopyReport> for CopyReport {
 	fn from(report: api::CopyReport) -> Self {
 		Self {
 			top_level: report.top_level.into_iter().map(Into::into).collect(),
-			failures: report
-				.failures
-				.into_iter()
-				.map(|failure| CopyFailure {
-					info: (&failure.info).into(),
-					item: failure.source.into(),
-				})
-				.collect(),
+			failures: report.failures.into_iter().map(Into::into).collect(),
 			skipped: report.skipped,
-			renamed: report.renamed.iter().map(Into::into).collect(),
+			renamed: report.renamed.into_iter().map(Into::into).collect(),
 			totals: report.totals,
 			counts: report.counts,
 			error: None,
