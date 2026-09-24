@@ -16,7 +16,6 @@ use filen_sdk_rs::{
 	io::{HasFileInfo, client_impl::IoSharedClientExt},
 };
 use filen_types::api::v3::{contacts::Contact, dir::link::PublicLinkExpiration};
-use tokio::sync::watch;
 
 mod copy_helpers;
 use copy_helpers::{PauseOnCreate, Recorder, contents, copy, data, upload, wait_until_paused};
@@ -1264,14 +1263,14 @@ async fn copy_with_shares(
 	// A destination shared while the copy runs: paused once the copy's directory exists,
 	// shared, then resumed; the finished copy reaches the other account.
 	let recorder = Arc::new(Recorder::default());
-	let (pause, pause_rx) = watch::channel(false);
+	let (control, controller) = JobControl::new();
 	let running = tokio::spawn({
 		let client = client.clone();
 		let own = own.clone();
 		let later = later.clone();
 		let callback = PauseOnCreate {
 			recorder: recorder.clone(),
-			pause: pause.clone(),
+			controller: controller.clone(),
 		};
 		async move {
 			client
@@ -1280,7 +1279,7 @@ async fn copy_with_shares(
 					later.into(),
 					CopyOptions::default(),
 					callback,
-					JobControl::new(Some(pause_rx), None),
+					control,
 				)
 				.await
 		}
@@ -1290,7 +1289,7 @@ async fn copy_with_shares(
 		.share_dir::<fn(u64, Option<u64>)>(&later, contact, None)
 		.await
 		.unwrap();
-	pause.send_replace(false);
+	controller.resume();
 	running.await.unwrap().result.unwrap();
 	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 	let (in_dirs, _) = share_client

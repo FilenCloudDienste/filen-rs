@@ -12,7 +12,7 @@ mod plan;
 mod progress;
 mod report;
 
-pub use crate::job::JobControl;
+pub use crate::job::{JobControl, JobController};
 pub use client_impl::{CopyOptions, CopyRequest, CopySource, CopySourceDir};
 pub use engine::CopyOutcome;
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};

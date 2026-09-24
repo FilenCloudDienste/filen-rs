@@ -12,14 +12,13 @@ use filen_sdk_rs::{
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyOptions, CopyOutcome, CopySource, CopySourceDir,
-			CopyUpdate, JobControl, PlannedTopLevelItem,
+			CopyUpdate, JobControl, JobController, PlannedTopLevelItem,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
 	},
 	io::client_impl::IoSharedClientExt,
 };
-use tokio::sync::watch;
 
 #[derive(Default)]
 pub struct Recorder {
@@ -132,7 +131,7 @@ pub async fn assert_same_files(
 /// world in a known state before resuming it.
 pub struct PauseOnCreate {
 	pub recorder: Arc<Recorder>,
-	pub pause: watch::Sender<bool>,
+	pub controller: JobController,
 }
 
 impl CopyCallback for PauseOnCreate {
@@ -141,7 +140,7 @@ impl CopyCallback for PauseOnCreate {
 	}
 	fn top_level_created(&self, item: CopiedTopLevel) {
 		self.recorder.top_level_created(item);
-		self.pause.send_replace(true);
+		self.controller.pause();
 	}
 	fn update(&self, update: CopyUpdate) {
 		self.recorder.update(update);

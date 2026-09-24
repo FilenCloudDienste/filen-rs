@@ -11,7 +11,8 @@ use filen_sdk_rs::{
 		categories::DirType,
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyEvent, CopyOptions, CopyPhase, CopyRequest,
-			CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl, PlannedTopLevelItem,
+			CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl, JobController,
+			PlannedTopLevelItem,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
@@ -19,7 +20,6 @@ use filen_sdk_rs::{
 	io::client_impl::IoSharedClientExt,
 };
 use filen_types::api::v3::dir::color::DirColor;
-use tokio::sync::watch;
 
 mod copy_helpers;
 use copy_helpers::{Recorder, assert_same_files, contents, copy, data, upload};
@@ -314,15 +314,15 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 		.await
 		.unwrap();
 
-	let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
-	struct CancelOnCreate(Arc<Recorder>, tokio::sync::watch::Sender<bool>);
+	let (control, controller) = JobControl::new();
+	struct CancelOnCreate(Arc<Recorder>, JobController);
 	impl CopyCallback for CancelOnCreate {
 		fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
 			self.0.top_level_planned(items);
 		}
 		fn top_level_created(&self, item: CopiedTopLevel) {
 			self.0.top_level_created(item);
-			self.1.send_replace(true);
+			self.1.cancel();
 		}
 		fn update(&self, update: CopyUpdate) {
 			self.0.update(update);
@@ -335,8 +335,8 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
 			destination.clone().into(),
 			CopyOptions::default(),
-			CancelOnCreate(recorder.clone(), cancel),
-			JobControl::new(None, Some(cancel_rx)),
+			CancelOnCreate(recorder.clone(), controller),
+			control,
 		)
 		.await;
 	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
@@ -739,7 +739,8 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 		.create_dir(&test_dir.into(), "destination")
 		.await
 		.unwrap();
-	let (_cancel, cancel_rx) = watch::channel(true);
+	let (control, controller) = JobControl::new();
+	controller.cancel();
 	let recorder = Arc::new(Recorder::default());
 	let outcome = client
 		.clone()
@@ -748,7 +749,7 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 			destination.clone().into(),
 			CopyOptions::default(),
 			recorder.clone(),
-			JobControl::new(None, Some(cancel_rx)),
+			control,
 		)
 		.await;
 	assert_eq!(outcome.result.unwrap_err().kind(), ErrorKind::Cancelled);
@@ -782,7 +783,7 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 		.create_dir(&test_dir.into(), "destination")
 		.await
 		.unwrap();
-	let (pause, pause_rx) = watch::channel(false);
+	let (control, controller) = JobControl::new();
 	let running = tokio::spawn({
 		let client = client.clone();
 		let source = source.clone();
@@ -794,16 +795,16 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 					destination.into(),
 					CopyOptions::default(),
 					Arc::new(Recorder::default()),
-					JobControl::new(Some(pause_rx), None),
+					control,
 				)
 				.await
 		}
 	});
 	for _ in 0..8 {
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-		pause.send_replace(true);
+		controller.pause();
 		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-		pause.send_replace(false);
+		controller.resume();
 	}
 	let outcome = running.await.unwrap();
 	outcome.result.unwrap();

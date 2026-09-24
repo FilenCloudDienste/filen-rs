@@ -250,7 +250,7 @@ mod managed {
 			let pause = self.pause_signal.map(|signal| signal.receiver());
 			let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
 			let handle = runtime::do_on_commander(move || {
-				let control = JobControl::new(pause, Some(cancel_rx.clone()));
+				let control = JobControl::from_receivers(pause, Some(cancel_rx.clone()));
 				with_cancel_grace(job(control), cancel_rx, CANCEL_GRACE)
 			});
 			CancelOnAbort::new(handle, abort_fut, cancel)

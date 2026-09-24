@@ -46,15 +46,50 @@ pub struct JobControl {
 }
 
 impl Default for JobControl {
+	/// A job that cannot be paused or cancelled.
 	fn default() -> Self {
-		Self::new(None, None)
+		Self::from_receivers(None, None)
+	}
+}
+
+/// Pauses, resumes and cancels the job of the [`JobControl`] it came with. Once every clone is
+/// dropped the job runs unpaused, and can no longer be paused or cancelled.
+#[derive(Debug, Clone)]
+pub struct JobController {
+	pause: watch::Sender<bool>,
+	cancel: watch::Sender<bool>,
+}
+
+impl JobController {
+	/// The job finishes what is in flight and then waits, holding nothing, until resumed.
+	pub fn pause(&self) {
+		self.pause.send_replace(true);
+	}
+
+	pub fn resume(&self) {
+		self.pause.send_replace(false);
+	}
+
+	/// The job winds down and reports what it did. A cancel cannot be taken back.
+	pub fn cancel(&self) {
+		self.cancel.send_replace(true);
 	}
 }
 
 impl JobControl {
+	/// A job that the returned [`JobController`] pauses, resumes and cancels.
+	pub fn new() -> (Self, JobController) {
+		let (pause, pause_rx) = watch::channel(false);
+		let (cancel, cancel_rx) = watch::channel(false);
+		(
+			Self::from_receivers(Some(pause_rx), Some(cancel_rx)),
+			JobController { pause, cancel },
+		)
+	}
+
 	/// A job paused while `pause` holds `true` and cancelled once `cancel` does. Either may be
 	/// `None` when the caller cannot pause or cancel.
-	pub fn new(
+	pub(crate) fn from_receivers(
 		pause: Option<watch::Receiver<bool>>,
 		cancel: Option<watch::Receiver<bool>>,
 	) -> Self {
@@ -308,7 +343,7 @@ pub(crate) mod cancel_grace {
 		#[tokio::test(start_paused = true)]
 		async fn an_abort_becomes_a_cancel_the_job_sees() {
 			let (cancel, cancel_rx) = watch::channel(false);
-			let control = JobControl::new(None, Some(cancel_rx));
+			let control = JobControl::from_receivers(None, Some(cancel_rx));
 			let (abort, abort_rx) = tokio::sync::oneshot::channel::<()>();
 			let job = {
 				let control = control.clone();
@@ -393,7 +428,7 @@ mod tests {
 		(
 			pause,
 			cancel,
-			JobControl::new(Some(pause_rx), Some(cancel_rx)),
+			JobControl::from_receivers(Some(pause_rx), Some(cancel_rx)),
 		)
 	}
 
@@ -403,6 +438,30 @@ mod tests {
 		fn drop(&mut self) {
 			self.0.store(true, Ordering::SeqCst);
 		}
+	}
+
+	#[tokio::test]
+	async fn a_controller_pauses_resumes_and_cancels_its_job() {
+		let (control, controller) = JobControl::new();
+		assert!(!control.is_pause_requested());
+		controller.pause();
+		assert!(control.is_pause_requested());
+		controller.resume();
+		assert!(!control.is_pause_requested());
+		assert_eq!(control.checkpoint().await, Ok(()));
+		controller.cancel();
+		assert!(control.is_cancelled());
+		assert_eq!(control.checkpoint().await, Err(Stopped));
+	}
+
+	#[tokio::test]
+	async fn a_dropped_controller_leaves_its_job_running() {
+		let (control, controller) = JobControl::new();
+		controller.pause();
+		drop(controller);
+		assert!(!control.is_pause_requested());
+		assert!(!control.is_stopping());
+		assert_eq!(control.checkpoint().await, Ok(()));
 	}
 
 	#[tokio::test]

@@ -511,7 +511,7 @@ fn controls() -> (watch::Sender<bool>, watch::Sender<bool>, JobControl) {
 	(
 		pause,
 		cancel,
-		JobControl::new(Some(pause_rx), Some(cancel_rx)),
+		JobControl::from_receivers(Some(pause_rx), Some(cancel_rx)),
 	)
 }
 
