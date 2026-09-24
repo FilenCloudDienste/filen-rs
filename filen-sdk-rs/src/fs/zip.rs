@@ -614,31 +614,17 @@ mod client_impl {
 }
 
 /// JS/WASM bindings for cross-category zip downloads.
-#[cfg(any(
-	feature = "wasm-full",
-	feature = "uniffi",
-	feature = "service-worker",
-	all(target_family = "wasm", target_os = "unknown")
-))]
+#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 pub(crate) mod js_impl {
-	use filen_macros::js_type;
-
-	use crate::js::{AnyDirWithContext, AnyFile};
-
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use std::{
 		borrow::Cow,
 		sync::{Arc, Mutex as StdMutex},
 	};
 
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use async_zip::base::write::ZipFileWriter;
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use futures::{AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use tokio::sync::Mutex;
 
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	use crate::{
 		Error,
 		auth::Client,
@@ -650,19 +636,12 @@ pub(crate) mod js_impl {
 				helpers::{download_dir_to_zip, download_file_to_zip},
 			},
 		},
-		js::DirByCategoryWithContext,
+		js::{AnyItemWithContext, DirByCategoryWithContext},
 		util::{MaybeSendBoxFuture, MaybeSendSync},
 	};
 
-	#[js_type(import, wasm_all)]
-	pub enum ZipItem {
-		File(AnyFile),
-		Dir(AnyDirWithContext),
-	}
-
 	/// Dispatches a directory zip download based on its runtime category.
 	/// Handles Normal, Shared, and Linked directories uniformly.
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	#[allow(private_bounds)]
 	async fn download_dir_by_category_to_zip<T>(
 		client: &Client,
@@ -716,11 +695,10 @@ pub(crate) mod js_impl {
 	}
 
 	/// Downloads a list of mixed-category items to a zip writer.
-	#[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 	#[allow(private_bounds)]
 	pub(crate) async fn download_zip_items<T>(
 		client: &Client,
-		items: Vec<ZipItem>,
+		items: Vec<AnyItemWithContext>,
 		writer: T,
 		progress_callback: Option<&impl ZipProgressCallback>,
 	) -> Result<T, Error>
@@ -730,7 +708,9 @@ pub(crate) mod js_impl {
 		let initial_file_bytes: u64 = items
 			.iter()
 			.filter_map(|i| match i {
-				ZipItem::File(f) => RemoteFileType::try_from(f.clone()).ok().map(|f| f.size()),
+				AnyItemWithContext::File(f) => {
+					RemoteFileType::try_from(f.clone()).ok().map(|f| f.size())
+				}
 				_ => None,
 			})
 			.sum();
@@ -750,7 +730,7 @@ pub(crate) mod js_impl {
 				let state = state.clone();
 				Box::pin(async move {
 					match item {
-						ZipItem::Dir(dir) => {
+						AnyItemWithContext::Dir(dir) => {
 							let dir = DirByCategoryWithContext::from(dir);
 							download_dir_by_category_to_zip(
 								client,
@@ -762,7 +742,7 @@ pub(crate) mod js_impl {
 							)
 							.await
 						}
-						ZipItem::File(file) => {
+						AnyItemWithContext::File(file) => {
 							let file = RemoteFileType::try_from(file)?;
 							download_file_to_zip(
 								client,
@@ -806,9 +786,9 @@ mod js_client_impl {
 		auth::JsClient,
 		fs::{
 			file::service_worker::{StreamWriter, WriteFrame},
-			zip::js_impl::{ZipItem, download_zip_items},
+			zip::js_impl::download_zip_items,
 		},
-		js::{ManagedFuture, spawn_buffered_write_future},
+		js::{AnyItemWithContext, ManagedFuture, spawn_buffered_write_future},
 	};
 
 	#[wasm_bindgen(js_class = "Client")]
@@ -816,7 +796,7 @@ mod js_client_impl {
 		#[wasm_bindgen(js_name = "downloadItemsToZip")]
 		pub async fn download_items_to_zip(
 			&self,
-			items: Vec<ZipItem>,
+			items: Vec<AnyItemWithContext>,
 			#[wasm_bindgen(unchecked_param_type = "WritableStream<Uint8Array>")]
 			writable_stream: web_sys::WritableStream,
 			#[wasm_bindgen(
@@ -890,9 +870,9 @@ mod service_worker_impl {
 		Error, ErrorKind,
 		fs::{
 			file::service_worker::{StreamWriter, WriteFrame},
-			zip::js_impl::{ZipItem, download_zip_items},
+			zip::js_impl::download_zip_items,
 		},
-		js::{ManagedFuture, ServiceWorkerClient, spawn_buffered_write_future},
+		js::{AnyItemWithContext, ManagedFuture, ServiceWorkerClient, spawn_buffered_write_future},
 	};
 
 	#[wasm_bindgen(js_class = "Client")]
@@ -900,7 +880,7 @@ mod service_worker_impl {
 		#[wasm_bindgen(js_name = "downloadItemsToZip")]
 		pub async fn download_items_to_zip(
 			&self,
-			items: Vec<ZipItem>,
+			items: Vec<AnyItemWithContext>,
 			#[wasm_bindgen(unchecked_param_type = "WritableStream<Uint8Array>")]
 			writable_stream: web_sys::WritableStream,
 			#[wasm_bindgen(

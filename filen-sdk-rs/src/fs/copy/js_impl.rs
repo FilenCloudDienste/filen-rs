@@ -17,8 +17,8 @@ use crate::{
 		file::enums::RemoteFileType,
 	},
 	js::{
-		AnyDirWithContext, AnyFile, AnyLinkedDirWithContext, AnyNormalDir, AnySharedDirWithContext,
-		DirByCategoryWithContext, NonRootNormalItemTagged,
+		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
+		AnySharedDirWithContext, DirByCategoryWithContext, NonRootNormalItemTagged,
 	},
 };
 
@@ -27,19 +27,10 @@ use super::{
 	SkipReason,
 };
 
-/// An item to copy: a file, or a directory with what is needed to list it (its share or
-/// public link). A copy's failures hand their items back in this form, so they can be passed
-/// to `copyItemsTo` again.
-#[js_type(import)]
-pub enum CopyItem {
-	File(AnyFile),
-	Dir(AnyDirWithContext),
-}
-
 /// One item to copy into its own destination, optionally under another name.
 #[js_type(import, no_ser)]
 pub struct CopyEntry {
-	pub item: CopyItem,
+	pub item: AnyItemWithContext,
 	pub destination: AnyNormalDir,
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
@@ -170,7 +161,7 @@ pub struct CopiedTopLevelItem {
 #[js_type(export, no_deser)]
 pub struct CopyFailure {
 	/// The failed source, as it can be passed to `copyItemsTo` again.
-	pub item: CopyItem,
+	pub item: AnyItemWithContext,
 	pub info: CopyFailureInfo,
 }
 
@@ -189,13 +180,13 @@ pub struct CopyReport {
 	pub error: Option<CopyError>,
 }
 
-impl TryFrom<CopyItem> for api::CopySource {
+impl TryFrom<AnyItemWithContext> for api::CopySource {
 	type Error = Error;
 
-	fn try_from(item: CopyItem) -> Result<Self, Error> {
+	fn try_from(item: AnyItemWithContext) -> Result<Self, Error> {
 		Ok(match item {
-			CopyItem::File(file) => Self::File(RemoteFileType::try_from(file)?),
-			CopyItem::Dir(dir) => Self::Dir(match DirByCategoryWithContext::from(dir) {
+			AnyItemWithContext::File(file) => Self::File(RemoteFileType::try_from(file)?),
+			AnyItemWithContext::Dir(dir) => Self::Dir(match DirByCategoryWithContext::from(dir) {
 				DirByCategoryWithContext::Normal(DirType::Dir(dir)) => {
 					api::CopySourceDir::Normal(dir.into_owned())
 				}
@@ -216,7 +207,7 @@ impl TryFrom<CopyItem> for api::CopySource {
 	}
 }
 
-impl From<api::FailedSource> for CopyItem {
+impl From<api::FailedSource> for AnyItemWithContext {
 	fn from(source: api::FailedSource) -> Self {
 		match source {
 			api::FailedSource::File(file) => Self::File(AnyFile::from(*file)),
@@ -255,7 +246,7 @@ impl TryFrom<CopyEntry> for api::CopyRequest {
 
 /// The requests of `copyItems`: every item into the same destination.
 fn requests_into(
-	items: Vec<CopyItem>,
+	items: Vec<AnyItemWithContext>,
 	destination: AnyNormalDir,
 ) -> Result<Vec<api::CopyRequest>, Error> {
 	let destination = DirType::<'static, Normal>::from(destination);
@@ -520,11 +511,15 @@ type CopyJobFuture = crate::util::MaybeSendBoxFuture<'static, Result<CopyReport,
 mod uniffi_impl {
 	use std::sync::Arc;
 
-	use crate::{Error, auth::JsClient, js::AnyNormalDir, js::ManagedFuture};
+	use crate::{
+		Error,
+		auth::JsClient,
+		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
+	};
 
 	use super::{
-		CopiedTopLevelItem, CopyEntry, CopyItem, CopyPlannedItem, CopyReport, CopyUpdate, Delivery,
-		copy_job, requests_into, requests_to,
+		CopiedTopLevelItem, CopyEntry, CopyPlannedItem, CopyReport, CopyUpdate, Delivery, copy_job,
+		requests_into, requests_to,
 	};
 
 	/// Receives a copy's progress, in the order the copy made it, before the call returns.
@@ -593,7 +588,7 @@ mod uniffi_impl {
 		/// to `copy_items_to` to try them again.
 		pub async fn copy_items(
 			&self,
-			items: Vec<CopyItem>,
+			items: Vec<AnyItemWithContext>,
 			destination: AnyNormalDir,
 			config: CopyItemsConfig,
 			callback: Arc<dyn CopyItemsCallback>,
@@ -629,17 +624,14 @@ mod wasm_impl {
 	use crate::{
 		Error,
 		auth::JsClient,
-		js::{AnyLinkedDirTagged, AnyNormalDir, AnySharedDirTagged, ManagedFuture},
+		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
 	};
 
-	use super::{
-		AnyDirWithContext, AnyFile, CopyEntry, CopyItem, CopyReport, Delivery, copy_job,
-		requests_into, requests_to,
-	};
+	use super::{CopyEntry, CopyReport, Delivery, copy_job, requests_into, requests_to};
 
 	#[js_type(import, no_ser, no_default)]
 	pub struct CopyItemsParams {
-		pub items: Vec<CopyItem>,
+		pub items: Vec<AnyItemWithContext>,
 		pub destination: AnyNormalDir,
 		/// Storage still free on the account, if known: a larger copy fails before anything is
 		/// written.
@@ -795,31 +787,6 @@ mod wasm_impl {
 			.await
 		}
 	}
-
-	/// The shape `CopyItem` is read from, so a failure's item can be passed back as it is.
-	impl serde::Serialize for CopyItem {
-		fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-			use serde::ser::SerializeStruct;
-			match self {
-				Self::File(AnyFile::File(file)) => file.serialize(serializer),
-				Self::File(AnyFile::Shared(file)) => file.serialize(serializer),
-				Self::File(AnyFile::Linked(file)) => file.serialize(serializer),
-				Self::Dir(AnyDirWithContext::Normal(dir)) => dir.serialize(serializer),
-				Self::Dir(AnyDirWithContext::Shared(shared)) => {
-					let mut state = serializer.serialize_struct("AnySharedDirWithContext", 2)?;
-					state.serialize_field("dir", &AnySharedDirTagged::from(shared.dir.clone()))?;
-					state.serialize_field("shareInfo", &shared.share_info)?;
-					state.end()
-				}
-				Self::Dir(AnyDirWithContext::Linked(linked)) => {
-					let mut state = serializer.serialize_struct("AnyLinkedDirWithContext", 2)?;
-					state.serialize_field("dir", &AnyLinkedDirTagged::from(linked.dir.clone()))?;
-					state.serialize_field("link", &linked.link)?;
-					state.end()
-				}
-			}
-		}
-	}
 }
 
 #[cfg(all(test, feature = "uniffi"))]
@@ -884,14 +851,14 @@ mod tests {
 		)
 	}
 
-	fn failure_source(item: CopyItem) -> api::CopySource {
+	fn failure_source(item: AnyItemWithContext) -> api::CopySource {
 		api::CopySource::try_from(item).expect("a failed item is a copy source again")
 	}
 
 	#[test]
 	fn a_failed_file_is_a_copy_source_again() {
 		let source = file();
-		let item = CopyItem::from(api::FailedSource::File(Box::new(source.clone())));
+		let item = AnyItemWithContext::from(api::FailedSource::File(Box::new(source.clone())));
 		let api::CopySource::File(copied) = failure_source(item) else {
 			panic!("a file");
 		};
@@ -902,7 +869,7 @@ mod tests {
 	#[test]
 	fn a_failed_directory_is_a_copy_source_again() {
 		let source = dir();
-		let item = CopyItem::from(api::FailedSource::Dir(api::CopySourceDir::Normal(
+		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Normal(
 			source.clone(),
 		)));
 		let api::CopySource::Dir(api::CopySourceDir::Normal(copied)) = failure_source(item) else {
@@ -928,7 +895,7 @@ mod tests {
 			email: "sharer@example.com".to_owned(),
 			id: 7,
 		});
-		let item = CopyItem::from(api::FailedSource::Dir(api::CopySourceDir::Shared(
+		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Shared(
 			DirType::Dir(Cow::Owned(SharedDirectory {
 				inner: shared.clone(),
 			})),
@@ -950,7 +917,7 @@ mod tests {
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		};
-		let item = CopyItem::from(api::FailedSource::Dir(api::CopySourceDir::Linked(
+		let item = AnyItemWithContext::from(api::FailedSource::Dir(api::CopySourceDir::Linked(
 			DirType::Dir(Cow::Owned(LinkedDirectory(linked.clone()))),
 			link.clone(),
 		)));
@@ -965,9 +932,9 @@ mod tests {
 
 	#[test]
 	fn the_root_directory_cannot_be_copied() {
-		let root = CopyItem::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(Root::from(
-			RootDirectory::new(Uuid::new_v4()),
-		))));
+		let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(
+			Root::from(RootDirectory::new(Uuid::new_v4())),
+		)));
 		let error = api::CopySource::try_from(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}

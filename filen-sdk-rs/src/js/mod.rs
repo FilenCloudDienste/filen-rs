@@ -18,7 +18,7 @@ pub(crate) use categories::{
 	common::{
 		dir::{color::DirColor, meta::DirMeta},
 		enums::{
-			NonRootItem,
+			AnyItemWithContext, NonRootItem,
 			dir::{
 				AnyDirWithContext, AnyLinkedDirWithContext, AnySharedDirWithContext,
 				DirByCategoryWithContext, NonRootDir,
@@ -37,9 +37,6 @@ pub(crate) use categories::{
 	common::enums::{NonRootItemTagged, dir::NonRootDirTagged},
 	normal::NonRootNormalItemTagged,
 };
-
-#[cfg(all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"))]
-pub(crate) use categories::{linked::AnyLinkedDirTagged, shared::AnySharedDirTagged};
 
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;

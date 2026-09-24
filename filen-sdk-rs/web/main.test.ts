@@ -24,7 +24,7 @@ import init, {
 	type InMemoryThumbnail,
 	type EmbeddedPreviewResult,
 	type CopyUpdate,
-	type CopyItem
+	type AnyItemWithContext
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -2310,7 +2310,7 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	const first = await state.copyItems({ items: [dir], destination })
 	const copied = first.topLevel[0].item
 	expect(copied.type).toBe("dir")
-	const again = await state.copyItems({ items: [copied as CopyItem], destination })
+	const again = await state.copyItems({ items: [copied as AnyItemWithContext], destination })
 	expect(again.error).toBeUndefined()
 	expect(nameOf(again.topLevel[0].item)).toBe("dir (1)")
 })

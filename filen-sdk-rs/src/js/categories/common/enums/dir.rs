@@ -12,22 +12,25 @@ use crate::{
 		categories::linked::DirPublicLink,
 	},
 };
+// The fields of the Tagged twins `js_type` generates for the `*WithContext` structs.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::js::categories::{linked::AnyLinkedDirTagged, shared::AnySharedDirTagged};
 
-#[js_type(import, wasm_all)]
+#[js_type(import, untagged, wasm_all)]
 pub enum AnyDirWithContext {
 	Shared(AnySharedDirWithContext),
 	Linked(AnyLinkedDirWithContext),
 	Normal(AnyNormalDir),
 }
 
-#[js_type(import, wasm_all)]
+#[js_type(import, export, wasm_all)]
 pub struct AnySharedDirWithContext {
 	#[js_type_tagged]
 	pub(crate) dir: AnySharedDir,
 	pub(crate) share_info: SharingRole,
 }
 
-#[js_type(import, wasm_all)]
+#[js_type(import, export, wasm_all)]
 pub struct AnyLinkedDirWithContext {
 	#[js_type_tagged]
 	pub(crate) dir: AnyLinkedDir,
