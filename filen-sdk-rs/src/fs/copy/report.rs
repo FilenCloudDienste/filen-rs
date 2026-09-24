@@ -344,7 +344,7 @@ pub(crate) struct OpGuard(MaybeArc<Reporter>);
 impl Drop for OpGuard {
 	fn drop(&mut self) {
 		self.0.ops_in_flight.fetch_sub(1, Ordering::SeqCst);
-		self.0.refresh_pause();
+		self.0.tick();
 	}
 }
 
@@ -378,11 +378,13 @@ impl Reporter {
 		self.start.elapsed()
 	}
 
-	/// Applies `change` and sends an update when one is due.
+	/// Applies `change`, settles whether the job counts as paused, and sends an update when one
+	/// is due.
 	fn with_state(&self, change: impl FnOnce(&mut State)) {
 		let now = self.now();
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		change(&mut state);
+		self.update_paused(&mut state, now);
 		if state.batcher.is_due(now, state.changed) {
 			self.flush(&mut state, now);
 		}
@@ -428,7 +430,8 @@ impl Reporter {
 		});
 	}
 
-	/// Sends an update when the throttle interval has passed.
+	/// Settles whether the job counts as paused, and sends an update when one is due (the
+	/// throttle interval has passed, or the pause state changed).
 	pub(crate) fn tick(&self) {
 		self.with_state(|_| {});
 	}
@@ -437,7 +440,7 @@ impl Reporter {
 	pub(crate) fn op(self: &MaybeArc<Self>) -> OpGuard {
 		self.ops_in_flight.fetch_add(1, Ordering::SeqCst);
 		// a job reported paused stops being paused once anything starts
-		self.refresh_pause();
+		self.tick();
 		OpGuard(MaybeArc::clone(self))
 	}
 
@@ -449,25 +452,12 @@ impl Reporter {
 	/// Records whether a pause is requested; the job counts as paused once no operation is in
 	/// flight.
 	pub(crate) fn set_pause_requested(&self, requested: bool) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		if state.pause_requested != requested {
-			state.pause_requested = requested;
-			state.batcher.mark_urgent();
-		}
-		self.update_paused(&mut state, now);
-		if state.batcher.is_due(now, state.changed) {
-			self.flush(&mut state, now);
-		}
-	}
-
-	fn refresh_pause(&self) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		self.update_paused(&mut state, now);
-		if state.batcher.is_due(now, state.changed) {
-			self.flush(&mut state, now);
-		}
+		self.with_state(|state| {
+			if state.pause_requested != requested {
+				state.pause_requested = requested;
+				state.batcher.mark_urgent();
+			}
+		});
 	}
 
 	fn update_paused(&self, state: &mut State, now: Duration) {
@@ -501,16 +491,12 @@ impl Reporter {
 
 	/// A cancel overrides a pause: the job winds down instead of pausing.
 	pub(crate) fn set_cancelling(&self) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		if !state.cancelling {
-			state.cancelling = true;
-			state.batcher.mark_urgent();
-		}
-		self.update_paused(&mut state, now);
-		if state.batcher.is_due(now, state.changed) {
-			self.flush(&mut state, now);
-		}
+		self.with_state(|state| {
+			if !state.cancelling {
+				state.cancelling = true;
+				state.batcher.mark_urgent();
+			}
+		});
 	}
 
 	pub(crate) fn set_scan(&self, scan: ScanProgress) {
