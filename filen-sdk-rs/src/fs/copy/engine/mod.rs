@@ -26,7 +26,7 @@ use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
 	future::Future,
-	iter,
+	iter, mem,
 	sync::Arc,
 };
 
@@ -57,7 +57,7 @@ use crate::{
 		},
 		name::ValidatedName,
 	},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync},
+	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::{
@@ -72,7 +72,7 @@ use super::{
 
 /// Chunks of one file in flight at once. More only helps a single large file; with several
 /// files running, the memory budget is the bound.
-pub(crate) const CHUNKS_PER_FILE: usize = 4;
+const CHUNKS_PER_FILE: usize = 4;
 
 /// How many names a top-level item tries when the ones it picks turn out to be taken at the
 /// destination (by an entry the listing could not name, or one created since the listing).
@@ -292,7 +292,7 @@ struct Job<B: CopyBackend, D> {
 /// the plan, by uuid.
 pub(crate) async fn run_copy<B, D>(
 	backend: Arc<B>,
-	plan: CopyPlan<D>,
+	mut plan: CopyPlan<D>,
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
@@ -309,8 +309,8 @@ where
 	}
 
 	let report = CopyReport {
-		skipped: plan.skipped.clone(),
-		renamed: plan.renamed.clone(),
+		skipped: mem::take(&mut plan.skipped),
+		renamed: mem::take(&mut plan.renamed),
 		totals: plan.totals,
 		..CopyReport::default()
 	};
@@ -341,7 +341,7 @@ where
 {
 	async fn run(&mut self) -> Result<(), Error> {
 		self.reporter
-			.set_plan(self.plan.totals, &self.plan.skipped, &self.plan.renamed);
+			.set_plan(self.plan.totals, &self.report.skipped, &self.report.renamed);
 		self.reporter.top_level_planned(self.planned_top_level());
 		self.reporter.set_phase(CopyPhase::CreatingDirectories);
 
@@ -574,7 +574,7 @@ where
 				}
 				() = self.control.pause_changed(pause_requested) => {},
 				() = self.control.stopping(), if !stopping => {},
-				() = crate::util::sleep(CALLBACK_INTERVAL) => self.reporter.tick(),
+				() = sleep(CALLBACK_INTERVAL) => self.reporter.tick(),
 			}
 		}
 	}
@@ -743,7 +743,7 @@ where
 				Some(outcome) = tasks.next() => self.file_finished(outcome),
 				() = self.control.pause_changed(pause_requested) => {},
 				() = self.control.stopping(), if !stopping => {},
-				() = crate::util::sleep(CALLBACK_INTERVAL) => self.reporter.tick(),
+				() = sleep(CALLBACK_INTERVAL) => self.reporter.tick(),
 			}
 		}
 	}
@@ -1163,7 +1163,7 @@ async fn copy_file_inner<B: CopyBackend>(
 	// empty chunk); only the chunks holding data are copied.
 	let chunks = size.div_ceil(CHUNK_SIZE_U64);
 	let mut retry = NameRetry::new(false);
-	let mut name = file.name.clone();
+	let mut name = file.name;
 	if verify_name {
 		name = retry
 			.free_name(&*backend, parent, name)
@@ -1181,6 +1181,7 @@ async fn copy_file_inner<B: CopyBackend>(
 	let upload = Arc::new(backend.begin_upload(UploadSpec {
 		uuid: file.dest_uuid,
 		parent,
+		// the upload owns its name; the file may be renamed again before it is registered
 		name: name.clone(),
 		mime: source.mime().map(str::to_owned),
 	}));
@@ -1222,7 +1223,6 @@ async fn copy_file_inner<B: CopyBackend>(
 			},
 			Some((chunk, result, reservation)) = fetches.next() => match result {
 				Ok(data) => {
-					let data: Vec<u8> = data;
 					hasher.update_rayon(&data);
 					written += data.len() as u64;
 					let backend = Arc::clone(&backend);
@@ -1236,7 +1236,12 @@ async fn copy_file_inner<B: CopyBackend>(
 				}
 				Err(error) => return Err(FileError::Failed(CopyStage::Download, error)),
 			},
-			reservation = async { reserving.as_mut().expect("guarded").await }, if reserving.is_some() => {
+			reservation = async {
+				reserving
+					.as_mut()
+					.expect("the select arm is guarded by `reserving.is_some()`")
+					.await
+			}, if reserving.is_some() => {
 				reserving = None;
 				let reservation = reservation?;
 				let chunk = next;
@@ -1250,7 +1255,6 @@ async fn copy_file_inner<B: CopyBackend>(
 			}
 		}
 	}
-	drop(reserving);
 
 	if written != size {
 		return Err(FileError::Failed(
