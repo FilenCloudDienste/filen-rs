@@ -409,7 +409,9 @@ pub(crate) struct ViewBuilder {
 	/// The undecodable DIRECTORIES, which placement needs from the first item on: nothing under
 	/// one can be placed, and the read hands them over before any item.
 	undecodable_dirs: HashSet<Uuid>,
-	nodes: Side<RemoteNode>,
+	/// A plain map, not a [`Side`]: a builder is what a WHOLE read produces, so there is no
+	/// baseline to derive from and every placement has to know what it displaced.
+	nodes: HashMap<String, RemoteNode>,
 	held_paths: BTreeSet<String>,
 	skipped: Skipped,
 	/// Items whose ancestry the index could not answer for when they arrived (see the type doc).
@@ -426,7 +428,7 @@ impl ViewBuilder {
 			dir_index: HashMap::new(),
 			undecodable: Vec::new(),
 			undecodable_dirs: HashSet::new(),
-			nodes: Side::with_capacity(items),
+			nodes: HashMap::with_capacity(items),
 			held_paths: BTreeSet::new(),
 			skipped: Skipped::default(),
 			deferred: Vec::new(),
@@ -571,7 +573,7 @@ impl ViewBuilder {
 			self.place(is_dir, &item, false);
 		}
 		RemoteView {
-			nodes: self.nodes,
+			nodes: self.nodes.into(),
 			has_collisions: false,
 			held_paths: self.held_paths,
 			skipped: self.skipped.finish(),
@@ -628,10 +630,20 @@ impl RemoteView {
 	/// per-node cost a change-scoped pass has, and one figure for both cannot say which of them a
 	/// narrowing moved. THIS is the order; a caller that runs them itself mirrors it.
 	pub(crate) fn filter(&mut self, filter: Option<ViewFilter<'_>>) {
-		if let Some(filter) = filter {
-			self.hide(filter, PassPaths::Whole);
+		// ONE tree for both halves. The ignore half reads the side through `filter.baseline` and
+		// the collision half walks the rows of the tree it is handed; taking them from two places
+		// would let a caller derive the ignore decisions from one tree and the collision keys from
+		// another, and the view would be one neither tree describes. `filter_changed` has always
+		// read both off the filter, and this now does too.
+		match filter {
+			Some(filter) => {
+				self.hide(filter, PassPaths::Whole);
+				self.resolve_collisions(filter.baseline);
+			}
+			// No rules, so nothing to hide and no carried side to read: the collision check has
+			// only the placed nodes to fold, and an empty tree is the whole of what it needs.
+			None => self.resolve_collisions(&Baseline::default()),
 		}
-		self.resolve_collisions();
 	}
 
 	/// [`filter`](Self::filter) for a view a change-scoped pass DERIVED, which asks the rules only
@@ -704,14 +716,15 @@ impl RemoteView {
 			true
 		};
 		match paths {
-			PassPaths::Whole => self
-				.nodes
-				.retain(|rel_path, node| !hidden(rel_path, node.kind == NodeKind::Dir)),
+			PassPaths::Whole => self.nodes.retain(filter.baseline, |rel_path, node| {
+				!hidden(rel_path, node.kind == NodeKind::Dir)
+			}),
 			PassPaths::Changed(decided) => {
 				let roots: Vec<String> = decided
 					.iter()
 					.filter_map(|rel_path| {
-						let is_dir = self.nodes.at(rel_path)?.kind == NodeKind::Dir;
+						let is_dir =
+							self.nodes.of(filter.baseline).at(rel_path)?.kind == NodeKind::Dir;
 						hidden(rel_path, is_dir).then(|| rel_path.clone())
 					})
 					.collect();
@@ -725,10 +738,10 @@ impl RemoteView {
 					// a rule that newly hides a directory forces a whole read instead. If that ever
 					// stops being rare, the subtree is also named key-by-key in `decided` (every
 					// re-key records both ends), so the walk can be dropped for a scan of the set.
-					for under in self.nodes.subtree_paths(&root) {
-						self.nodes.remove(&under);
+					for under in self.nodes.subtree_paths(filter.baseline, &root) {
+						self.nodes.remove(filter.baseline, &under);
 					}
-					self.nodes.remove(&root);
+					self.nodes.remove(filter.baseline, &root);
 				}
 			}
 		}
@@ -763,12 +776,12 @@ impl RemoteView {
 	/// The collision half of [`filter`](Self::filter): two remote items whose paths fold together
 	/// case-insensitively have no 1:1 local mapping, so the loser leaves the view and the pass is
 	/// refused ([`has_collisions`](Self::has_collisions)).
-	pub(super) fn resolve_collisions(&mut self) {
+	pub(super) fn resolve_collisions(&mut self, baseline: &Baseline) {
 		// A digest of every collision key taken so far. The keys themselves are not kept: a hit is
 		// rare and is resolved against the paths already placed, which is what tells a real
 		// case-twin from two keys that merely share a digest — a pass is never refused over that.
 		let mut claimed: HashSet<u128> =
-			HashSet::with_capacity(self.nodes.len() + self.held_paths.len());
+			HashSet::with_capacity(self.nodes.of(baseline).len() + self.held_paths.len());
 		// A held path took its key when the view held it, so a case-variant of one still collides.
 		claimed.extend(
 			self.held_paths
@@ -776,7 +789,7 @@ impl RemoteView {
 				.map(|path| collision_hash(&collision_key(path))),
 		);
 		let mut clashes: Vec<String> = Vec::new();
-		for rel_path in self.nodes.paths() {
+		for rel_path in self.nodes.of(baseline).paths() {
 			if !claimed.insert(collision_hash(&collision_key(&rel_path))) {
 				clashes.push(rel_path.into_owned());
 			}
@@ -786,14 +799,18 @@ impl RemoteView {
 			// Which item already folded that way — asked on the error path only. A held path
 			// counts: both halves of such a name were taken back out of `nodes`.
 			let folds_like = |taken: &str| taken != rel_path && collision_key(taken) == key;
-			let folds_onto = self.nodes.paths().any(|taken| folds_like(&taken))
+			let folds_onto = self
+				.nodes
+				.of(baseline)
+				.paths()
+				.any(|taken| folds_like(&taken))
 				|| self.held_paths.iter().any(|taken| folds_like(taken));
 			if folds_onto {
 				tracing::debug!(
 					"remote view: {rel_path:?} folds onto another remote item's name, so no 1:1 local mapping exists"
 				);
 				self.has_collisions = true;
-				self.nodes.remove(&rel_path);
+				self.nodes.remove(baseline, &rel_path);
 			}
 		}
 	}
@@ -829,7 +846,7 @@ impl RemoteView {
 		let mut claimed: HashMap<String, String> = HashMap::new();
 		let mut clashes: Vec<String> = Vec::new();
 		for rel_path in decided {
-			if !self.nodes.holds(rel_path) {
+			if !self.nodes.of(baseline).holds(rel_path) {
 				continue;
 			}
 			let key = collision_key(rel_path);
@@ -848,7 +865,7 @@ impl RemoteView {
 					baseline
 						.folded_row_paths(rel_path)
 						.into_iter()
-						.find(|row| folds_like(row) && self.nodes.holds(row))
+						.find(|row| folds_like(row) && self.nodes.of(baseline).holds(row))
 				});
 			if let Some(onto) = onto {
 				tracing::debug!(
@@ -861,7 +878,7 @@ impl RemoteView {
 		}
 		for rel_path in clashes {
 			self.has_collisions = true;
-			self.nodes.remove(&rel_path);
+			self.nodes.remove(baseline, &rel_path);
 		}
 	}
 }
@@ -2201,17 +2218,26 @@ pub(crate) fn fold_dir_moves(
 		let scope = changed
 			.as_deref()
 			.map_or(PassPaths::Whole, PassPaths::Changed);
-		let Some(action) =
-			next_case_only_dir_rename(mode, baseline, &*local, &*remote, held, scope)
-				.or_else(|| next_dir_move(mode, baseline, &*local, &*remote, held, scope))
-		else {
+		// An immutable reborrow, scoped so it is dead before `Arc::make_mut` below wants the
+		// mutable one back. A carried side reads its nodes off these very rows, which is why the
+		// re-key and the row move that follows it cannot be reordered (see `Side::rekey_subtree`).
+		let action = {
+			let bl: &Baseline = baseline;
+			let (local_ref, remote_ref) = (local.of(bl), remote.of(bl));
+			next_case_only_dir_rename(mode, bl, &local_ref, &remote_ref, held, scope)
+				.or_else(|| next_dir_move(mode, bl, &local_ref, &remote_ref, held, scope))
+		};
+		let Some(action) = action else {
 			break;
 		};
 		let (from, to) = action.endpoints();
-		if matches!(action, SyncAction::MoveRemote { .. }) {
-			remote.rekey_subtree(from, to, |node, path| node.rel_path = path.to_string());
-		} else {
-			local.rekey_subtree(from, to, |node, path| node.rel_path = path.to_string());
+		{
+			let bl: &Baseline = baseline;
+			if matches!(action, SyncAction::MoveRemote { .. }) {
+				remote.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
+			} else {
+				local.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
+			}
 		}
 		// Taken by value only once a move is actually being folded: the baseline the pass reads is
 		// the store's resident copy, and a pass that folds no directory move must not clone it.
@@ -3060,7 +3086,7 @@ mod tests {
 			mode,
 			&baseline,
 			local,
-			&remote,
+			&remote.of(&baseline),
 			&PassHolds::default(),
 			PassPaths::Whole,
 		)
@@ -3092,8 +3118,8 @@ mod tests {
 			reconcile(
 				mode,
 				&baseline,
-				&local,
-				&remote,
+				&local.of(&baseline),
+				&remote.of(&baseline),
 				&PassHolds::default(),
 				PassPaths::Whole,
 			)
@@ -5853,7 +5879,7 @@ mod tests {
 			&[],
 			None,
 		);
-		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["ok"]);
+		assert_eq!(view.nodes.whole().paths().collect::<Vec<_>>(), vec!["ok"]);
 		let record = |remote_uuid| SkippedRemote {
 			remote_uuid,
 			stable_uuid: None,
@@ -5888,7 +5914,7 @@ mod tests {
 			&[in_sub, garbled_dir, under_garbled, elsewhere],
 			None,
 		);
-		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["sub"]);
+		assert_eq!(view.nodes.whole().paths().collect::<Vec<_>>(), vec!["sub"]);
 		let recorded: Vec<(Uuid, &str)> = view
 			.skipped
 			.iter()
@@ -5930,9 +5956,9 @@ mod tests {
 			None,
 		);
 		assert!(
-			view.nodes.is_empty(),
+			view.nodes.whole().is_empty(),
 			"{:?}",
-			view.nodes.paths().collect::<Vec<_>>()
+			view.nodes.whole().paths().collect::<Vec<_>>()
 		);
 		let invalid = UnsyncableReason::RemoteInvalidName {
 			name: "..".to_string(),
@@ -6079,6 +6105,7 @@ mod tests {
 
 		let mut paths: Vec<String> = untracked
 			.nodes
+			.whole()
 			.paths()
 			.map(|path| path.into_owned())
 			.collect();
@@ -6155,7 +6182,10 @@ mod tests {
 				baseline: &Baseline::default(),
 			}),
 		);
-		assert_eq!(view.nodes.paths().collect::<Vec<_>>(), vec!["keep.txt"]);
+		assert_eq!(
+			view.nodes.whole().paths().collect::<Vec<_>>(),
+			vec!["keep.txt"]
+		);
 		assert!(!view.has_collisions);
 		let by = |pattern: &str| IgnoreDecision {
 			level: IgnoreLevel::File { dir: String::new() },
@@ -6214,7 +6244,7 @@ mod tests {
 			paths.iter().map(|path| (*path).to_string()).collect()
 		};
 		let sorted = |view: &RemoteView| {
-			let mut paths: Vec<String> = view.nodes.paths().map(Cow::into_owned).collect();
+			let mut paths: Vec<String> = view.nodes.whole().paths().map(Cow::into_owned).collect();
 			paths.sort_unstable();
 			paths
 		};
@@ -6293,23 +6323,27 @@ mod tests {
 		against_carried.resolve_collisions_changed(&carried_rows, &decided(&["Note.txt"]));
 		assert!(against_carried.has_collisions);
 		assert!(
-			!against_carried.nodes.holds("Note.txt"),
+			!against_carried.nodes.whole().holds("Note.txt"),
 			"the decided key is the loser; the carried one the pass is not touching stays"
 		);
-		assert!(against_carried.nodes.holds("note.txt"));
+		assert!(against_carried.nodes.whole().holds("note.txt"));
 
 		// Against another DECIDED key, with no row behind either.
 		let mut both_decided = place_remote_items(root, &[], &[lower.clone(), upper.clone()], &[]);
 		both_decided.resolve_collisions_changed(&no_rows, &decided(&["Note.txt", "note.txt"]));
 		assert!(both_decided.has_collisions);
-		assert_eq!(both_decided.nodes.len(), 1, "one of the twins leaves");
+		assert_eq!(
+			both_decided.nodes.whole().len(),
+			1,
+			"one of the twins leaves"
+		);
 
 		// Against a HELD path, which took its key when the view held it.
 		let mut against_held = place_remote_items(root, &[], std::slice::from_ref(&upper), &[]);
 		against_held.held_paths = decided(&["note.txt"]);
 		against_held.resolve_collisions_changed(&no_rows, &decided(&["Note.txt"]));
 		assert!(against_held.has_collisions);
-		assert!(!against_held.nodes.holds("Note.txt"));
+		assert!(!against_held.nodes.whole().holds("Note.txt"));
 
 		// Two keys the pass merely CARRIED: not folded, by the induction above.
 		let mut carried_only = place_remote_items(root, &[], &[lower, upper], &[]);
@@ -6318,7 +6352,7 @@ mod tests {
 			!carried_only.has_collisions,
 			"a pass that found this pair would have refused and forced the next read whole"
 		);
-		assert_eq!(carried_only.nodes.len(), 2);
+		assert_eq!(carried_only.nodes.whole().len(), 2);
 	}
 
 	/// A root pattern of `*` empties the filtered view, rule file included, while the unfiltered one
@@ -6334,8 +6368,8 @@ mod tests {
 		];
 		let dirs = std::slice::from_ref(&sub);
 		let raw = build_remote_view(root, dirs, &files, &[], None);
-		assert_eq!(raw.nodes.len(), 3);
-		assert!(raw.nodes.holds(".filenignore"));
+		assert_eq!(raw.nodes.whole().len(), 3);
+		assert!(raw.nodes.whole().holds(".filenignore"));
 
 		let view = build_remote_view(
 			root,
@@ -6348,9 +6382,9 @@ mod tests {
 			}),
 		);
 		assert!(
-			view.nodes.is_empty(),
+			view.nodes.whole().is_empty(),
 			"{:?}",
-			view.nodes.paths().collect::<Vec<_>>()
+			view.nodes.whole().paths().collect::<Vec<_>>()
 		);
 		assert_eq!(
 			view.ignored.keys().collect::<Vec<_>>(),
@@ -6383,9 +6417,9 @@ mod tests {
 		let files = [leaf.clone(), under_bad.clone(), orphan.clone()];
 		let materialized = place_remote_items(root, &dirs, &files, &undecodable);
 		assert!(
-			materialized.nodes.holds("A/deep/leaf.txt") && materialized.skipped.len() == 4,
+			materialized.nodes.whole().holds("A/deep/leaf.txt") && materialized.skipped.len() == 4,
 			"the fixture has to exercise placement AND every way of failing it: {:?} {:?}",
-			materialized.nodes.paths().collect::<Vec<_>>(),
+			materialized.nodes.whole().paths().collect::<Vec<_>>(),
 			materialized.skipped,
 		);
 
@@ -6432,9 +6466,9 @@ mod tests {
 
 		let placed = place_remote_items(root, &dirs, &files, &[]);
 		assert!(
-			placed.nodes.is_empty(),
+			placed.nodes.whole().is_empty(),
 			"{:?}",
-			placed.nodes.paths().collect::<Vec<_>>()
+			placed.nodes.whole().paths().collect::<Vec<_>>()
 		);
 		assert_eq!(
 			placed.skipped.len(),
@@ -6475,7 +6509,12 @@ mod tests {
 		let files = [lower, upper];
 
 		let mut view = place_remote_items(root, &[], &files, &[]);
-		let mut placed: Vec<String> = view.nodes.paths().map(|path| path.into_owned()).collect();
+		let mut placed: Vec<String> = view
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		placed.sort_unstable();
 		assert_eq!(placed, vec!["Note.txt", "note.txt"]);
 		assert!(
@@ -6486,7 +6525,7 @@ mod tests {
 
 		view.filter(None);
 		assert!(view.has_collisions, "the filter is what refuses the pass");
-		assert_eq!(view.nodes.len(), 1, "the loser leaves the view");
+		assert_eq!(view.nodes.whole().len(), 1, "the loser leaves the view");
 	}
 
 	/// A path the cache lists twice byte-identically is HELD, and stays held where a rule hides it:
@@ -6513,7 +6552,7 @@ mod tests {
 				.collect::<Vec<_>>(),
 			vec!["build/out.log"]
 		);
-		assert!(!view.nodes.holds("build/out.log"));
+		assert!(!view.nodes.whole().holds("build/out.log"));
 
 		view.filter(Some(ViewFilter {
 			rules: &root_rules("build/"),
@@ -6540,7 +6579,7 @@ mod tests {
 		let trash = remote_dir(QUARANTINE_DIR, root);
 		let view = build_remote_view(root, std::slice::from_ref(&trash), &[], &[], None);
 		assert!(
-			view.nodes.is_empty(),
+			view.nodes.whole().is_empty(),
 			"a remote folder named like the quarantine dir must be excluded from the view"
 		);
 	}
@@ -6899,11 +6938,11 @@ mod tests {
 		);
 		assert_eq!(view.held_paths, BTreeSet::from(["note.txt".to_string()]));
 		assert!(
-			!view.nodes.holds("note.txt"),
+			!view.nodes.whole().holds("note.txt"),
 			"neither half of the transition may be reconciled against"
 		);
 		assert_eq!(
-			view.nodes.at("other.txt").unwrap().remote_uuid,
+			view.nodes.whole().at("other.txt").unwrap().remote_uuid,
 			sibling.uuid,
 			"every other path still syncs"
 		);
@@ -6997,7 +7036,12 @@ mod tests {
 			None,
 		);
 		assert!(!view.has_collisions);
-		let mut paths: Vec<String> = view.nodes.paths().map(|path| path.into_owned()).collect();
+		let mut paths: Vec<String> = view
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		paths.sort();
 		assert_eq!(
 			paths,
@@ -7015,9 +7059,12 @@ mod tests {
 			}],
 			"the orphan is recorded, not silently dropped"
 		);
-		assert_eq!(view.nodes.at("sub/f.txt").unwrap().remote_uuid, file.uuid);
 		assert_eq!(
-			view.nodes.at("sub/f.txt").unwrap().content_hash,
+			view.nodes.whole().at("sub/f.txt").unwrap().remote_uuid,
+			file.uuid
+		);
+		assert_eq!(
+			view.nodes.whole().at("sub/f.txt").unwrap().content_hash,
 			Some(Blake3Hash::from([5; 32]))
 		);
 	}
@@ -7236,6 +7283,7 @@ mod tests {
 			change: Change,
 			index: usize,
 			elsewhere: usize,
+			baseline: &Baseline,
 			local: &mut Side<LocalNode>,
 			remote: &mut Side<RemoteNode>,
 			decided: &mut BTreeSet<String>,
@@ -7253,7 +7301,7 @@ mod tests {
 					local.insert(path.to_string(), local_node_at(index, kind, 1));
 				}
 				Change::LocalGone => {
-					local.remove(path);
+					local.remove(baseline, path);
 				}
 				Change::LocalNew => {
 					local.insert(path.to_string(), local_node_at(index, kind, 0));
@@ -7265,7 +7313,7 @@ mod tests {
 					remote.insert(path.to_string(), remote_node_at(index, kind, 1));
 				}
 				Change::RemoteGone => {
-					remote.remove(path);
+					remote.remove(baseline, path);
 				}
 				Change::RemoteNew => {
 					remote.insert(path.to_string(), remote_node_at(index, kind, 0));
@@ -7278,12 +7326,12 @@ mod tests {
 				// `Renamed` entry each give the pass.
 				Change::LocalMove => {
 					decided.insert(other.to_string());
-					local.remove(path);
+					local.remove(baseline, path);
 					local.insert(other.to_string(), at(other, local_node_at(index, kind, 0)));
 				}
 				Change::RemoteMove => {
 					decided.insert(other.to_string());
-					remote.remove(path);
+					remote.remove(baseline, path);
 					remote.insert(
 						other.to_string(),
 						at_remote(other, remote_node_at(index, kind, 0)),
@@ -7347,6 +7395,7 @@ mod tests {
 					change,
 					rng.random_range(0..TREE.len()),
 					rng.random_range(0..TREE.len()),
+					&baseline,
 					&mut local,
 					&mut remote,
 					&mut decided,
@@ -7357,12 +7406,12 @@ mod tests {
 			// and the fold is one of the shapes this has to cover.
 			if stage_rename {
 				local.insert("empty".to_string(), local_dir("empty"));
-				local.remove("Empty");
+				local.remove(&baseline, "Empty");
 				remote.insert(
 					"Empty".to_string(),
 					remote_dir_node("Empty", uuid_at(index_of("Empty"))),
 				);
-				remote.remove("empty");
+				remote.remove(&baseline, "empty");
 				decided.insert("empty".to_string());
 				decided.insert("Empty".to_string());
 			}
@@ -7403,12 +7452,20 @@ mod tests {
 				decided,
 				holds,
 			} = case;
-			let whole = reconcile(mode, baseline, local, remote, holds, PassPaths::Whole);
+			let (local_ref, remote_ref) = (local.of(baseline), remote.of(baseline));
+			let whole = reconcile(
+				mode,
+				baseline,
+				&local_ref,
+				&remote_ref,
+				holds,
+				PassPaths::Whole,
+			);
 			let scoped = reconcile(
 				mode,
 				baseline,
-				local,
-				remote,
+				&local_ref,
+				&remote_ref,
 				holds,
 				PassPaths::Changed(decided),
 			);
@@ -7704,7 +7761,7 @@ mod tests {
 			let mut claimed: HashSet<String> = HashSet::new();
 			// Sorted, so which spelling of a carried pair survives the scrub is not the hash
 			// order of a map — the one thing the two forms are allowed to disagree about.
-			let mut carried: Vec<(String, bool)> = Nodes::iter(&case.nodes)
+			let mut carried: Vec<(String, bool)> = Nodes::iter(&case.nodes.of(&case.baseline))
 				.filter(|(path, _)| !case.decided.contains(path.as_ref()))
 				.map(|(path, node)| (path.into_owned(), node.kind == NodeKind::Dir))
 				.collect();
@@ -7712,13 +7769,13 @@ mod tests {
 			for (path, is_dir) in carried {
 				if case.rules.ignored_root(&path, is_dir, &mut memo).is_some() {
 					seen.scrubbed_under_hidden += 1;
-					case.nodes.remove(&path);
+					case.nodes.remove(&case.baseline, &path);
 					continue;
 				}
 				let key = collision_key(&path);
 				if held_keys.contains(&key) || !claimed.insert(key) {
 					seen.scrubbed_folded += 1;
-					case.nodes.remove(&path);
+					case.nodes.remove(&case.baseline, &path);
 				}
 			}
 		}
@@ -7727,7 +7784,7 @@ mod tests {
 		fn measure(case: &ViewCase, seen: &mut ViewCoverage) {
 			seen.cases += 1;
 			let mut classes: HashMap<String, Vec<String>> = HashMap::new();
-			for path in case.nodes.paths() {
+			for path in case.nodes.of(&case.baseline).paths() {
 				classes
 					.entry(collision_key(&path))
 					.or_default()
@@ -7763,7 +7820,7 @@ mod tests {
 				}
 			}
 			let mut memo = HashMap::new();
-			for (path, node) in Nodes::iter(&case.nodes) {
+			for (path, node) in Nodes::iter(&case.nodes.of(&case.baseline)) {
 				if !case.decided.contains(path.as_ref()) {
 					continue;
 				}
@@ -7773,7 +7830,7 @@ mod tests {
 					continue;
 				};
 				seen.hidden_decided += 1;
-				if is_dir && !case.nodes.subtree_paths(&path).is_empty() {
+				if is_dir && !case.nodes.subtree_paths(&case.baseline, &path).is_empty() {
 					seen.hidden_subtrees += 1;
 				}
 				if root != path && case.rules.decide(&path, is_dir).is_some() {
@@ -7831,7 +7888,7 @@ mod tests {
 				// path is always decided: what withheld it was an announcement about it.
 				2 => {
 					place(&mut out.nodes, upper);
-					out.nodes.remove(lower);
+					out.nodes.remove(&out.baseline, lower);
 					for path in [lower, upper] {
 						out.decided.insert(path.to_owned());
 					}
@@ -7904,8 +7961,13 @@ mod tests {
 			(cases, seen)
 		}
 
-		fn sorted_paths(view: &RemoteView) -> Vec<String> {
-			let mut paths: Vec<String> = view.nodes.paths().map(Cow::into_owned).collect();
+		fn sorted_paths(baseline: &Baseline, view: &RemoteView) -> Vec<String> {
+			let mut paths: Vec<String> = view
+				.nodes
+				.of(baseline)
+				.paths()
+				.map(Cow::into_owned)
+				.collect();
 			paths.sort();
 			paths
 		}
@@ -7913,8 +7975,9 @@ mod tests {
 		/// The names the surviving nodes CLAIM, folded the way the server dedups them. This is
 		/// what the two collision checks have to agree on even where they dropped different
 		/// spellings of one name.
-		fn claimed_keys(view: &RemoteView) -> BTreeSet<String> {
+		fn claimed_keys(baseline: &Baseline, view: &RemoteView) -> BTreeSet<String> {
 			view.nodes
+				.of(baseline)
 				.paths()
 				.map(|path| collision_key(&path))
 				.collect()
@@ -7922,10 +7985,15 @@ mod tests {
 
 		/// Everything [`RemoteView::hide`] touches, at both scopes. Exact down to the path: the
 		/// rules answer per node, so nothing here is free to depend on an iteration order.
-		fn assert_same_hidden(seed: u64, whole: &RemoteView, scoped: &RemoteView) {
+		fn assert_same_hidden(
+			seed: u64,
+			baseline: &Baseline,
+			whole: &RemoteView,
+			scoped: &RemoteView,
+		) {
 			assert_eq!(
-				sorted_paths(whole),
-				sorted_paths(scoped),
+				sorted_paths(baseline, whole),
+				sorted_paths(baseline, scoped),
 				"seed {seed}: the narrowed hide left another set of nodes"
 			);
 			assert_eq!(
@@ -7956,21 +8024,27 @@ mod tests {
 		/// find the other's row and node and both are dropped. What is still owed in that case is
 		/// the direction a LOST refusal would show up in — the narrowed form never keeps a name the
 		/// whole one dropped.
-		fn assert_same_claimed(seed: u64, what: &str, whole: &RemoteView, scoped: &RemoteView) {
+		fn assert_same_claimed(
+			seed: u64,
+			baseline: &Baseline,
+			what: &str,
+			whole: &RemoteView,
+			scoped: &RemoteView,
+		) {
 			assert_eq!(
 				whole.has_collisions, scoped.has_collisions,
 				"seed {seed}, {what}: the two forms disagree about refusing the pass"
 			);
 			if whole.has_collisions {
 				assert!(
-					claimed_keys(scoped).is_subset(&claimed_keys(whole)),
+					claimed_keys(baseline, scoped).is_subset(&claimed_keys(baseline, whole)),
 					"seed {seed}, {what}: the narrowed form kept a name the whole one dropped"
 				);
 				return;
 			}
 			assert_eq!(
-				sorted_paths(whole),
-				sorted_paths(scoped),
+				sorted_paths(baseline, whole),
+				sorted_paths(baseline, scoped),
 				"seed {seed}, {what}: nothing was refused, so the two views must be identical"
 			);
 		}
@@ -7987,7 +8061,7 @@ mod tests {
 				whole.hide(case.filter(), PassPaths::Whole);
 				let mut scoped = case.view();
 				scoped.hide(case.filter(), PassPaths::Changed(&case.decided));
-				assert_same_hidden(*seed, &whole, &scoped);
+				assert_same_hidden(*seed, &case.baseline, &whole, &scoped);
 			}
 			seen.assert_reached();
 		}
@@ -7999,10 +8073,10 @@ mod tests {
 			let (cases, seen) = view_cases();
 			for (seed, case) in &cases {
 				let mut whole = case.view();
-				whole.resolve_collisions();
+				whole.resolve_collisions(&case.baseline);
 				let mut scoped = case.view();
 				scoped.resolve_collisions_changed(&case.baseline, &case.decided);
-				assert_same_claimed(*seed, "collisions", &whole, &scoped);
+				assert_same_claimed(*seed, &case.baseline, "collisions", &whole, &scoped);
 			}
 			seen.assert_reached();
 		}
@@ -8022,7 +8096,7 @@ mod tests {
 				whole.filter(Some(case.filter()));
 				let mut scoped = case.view();
 				scoped.filter_changed(case.filter(), &case.decided);
-				assert_same_claimed(*seed, "filter", &whole, &scoped);
+				assert_same_claimed(*seed, &case.baseline, "filter", &whole, &scoped);
 				assert_eq!(
 					whole.ignored, scoped.ignored,
 					"seed {seed}: the narrowed filter recorded other ignored roots"
@@ -8072,7 +8146,7 @@ mod tests {
 			let mut whole = case.view();
 			whole.filter(Some(case.filter()));
 			assert!(
-				sorted_paths(&whole).is_empty(),
+				sorted_paths(&case.baseline, &whole).is_empty(),
 				"the whole form drops the rows left at a hidden path and refuses the folded one"
 			);
 			assert!(whole.has_collisions);
@@ -8081,7 +8155,7 @@ mod tests {
 			let mut scoped = case.view();
 			scoped.filter_changed(case.filter(), &case.decided);
 			assert_eq!(
-				sorted_paths(&scoped),
+				sorted_paths(&case.baseline, &scoped),
 				["top.txt", "z", "z/1.txt"],
 				"a carried row at a hidden path, and one folding onto a held path, both stay"
 			);

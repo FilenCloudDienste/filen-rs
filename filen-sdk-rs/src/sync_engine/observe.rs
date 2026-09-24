@@ -566,7 +566,12 @@ mod tests {
 	}
 
 	fn sorted_nodes(scan: &LocalScan) -> Vec<String> {
-		let mut paths: Vec<String> = scan.nodes.paths().map(|path| path.into_owned()).collect();
+		let mut paths: Vec<String> = scan
+			.nodes
+			.whole()
+			.paths()
+			.map(|path| path.into_owned())
+			.collect();
 		paths.sort_unstable();
 		paths
 	}
