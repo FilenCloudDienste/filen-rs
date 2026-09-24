@@ -9,7 +9,7 @@ use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, Shared},
-		copy::{CopyOptions, CopySource, CopySourceDir, JobControl},
+		copy::{CopyConfig, CopySource, CopySourceDir, JobControl},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::meta::FileMetaChanges,
 	},
@@ -1277,7 +1277,7 @@ async fn copy_with_shares(
 				.copy_items(
 					vec![CopySource::Dir(CopySourceDir::Normal(own))],
 					later.into(),
-					CopyOptions::default(),
+					CopyConfig::default(),
 					callback,
 					control,
 				)

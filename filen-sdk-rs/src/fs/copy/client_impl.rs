@@ -65,7 +65,7 @@ pub struct CopyRequest {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CopyOptions {
+pub struct CopyConfig {
 	/// Storage still free on the account, if the caller knows it: a copy larger than this fails
 	/// with [`ErrorKind::MaxStorageReached`] before anything is written.
 	pub max_bytes: Option<u64>,
@@ -170,7 +170,7 @@ impl Client {
 		self: Arc<Self>,
 		sources: Vec<CopySource>,
 		destination: DirType<'static, Normal>,
-		options: CopyOptions,
+		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
 	) -> CopyOutcome<CopySourceDir> {
@@ -182,7 +182,7 @@ impl Client {
 				name: None,
 			})
 			.collect();
-		self.copy_items_to(requests, options, callback, control)
+		self.copy_items_to(requests, config, callback, control)
 			.await
 	}
 
@@ -201,7 +201,7 @@ impl Client {
 	pub async fn copy_items_to(
 		self: Arc<Self>,
 		requests: Vec<CopyRequest>,
-		options: CopyOptions,
+		config: CopyConfig,
 		callback: impl CopyCallback,
 		control: JobControl,
 	) -> CopyOutcome<CopySourceDir> {
@@ -213,7 +213,7 @@ impl Client {
 		let scanned = self.scan(requests, &reporter, &control).await;
 		let plan = scanned.and_then(|(planner, requests)| {
 			let plan = planner.plan(requests).map_err(ScanError::Failed)?;
-			match options.max_bytes {
+			match config.max_bytes {
 				Some(max_bytes) if plan.totals.bytes > max_bytes => {
 					Err(ScanError::Failed(Error::custom(
 						ErrorKind::MaxStorageReached,
@@ -461,7 +461,7 @@ mod tests {
 		fn assert_send<T: Send>(_: T) {}
 		assert_send(client.copy_items_to(
 			Vec::new(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Updates::default(),
 			JobControl::default(),
 		));

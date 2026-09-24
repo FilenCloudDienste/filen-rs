@@ -11,7 +11,7 @@ use filen_sdk_rs::{
 		HasUUID,
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyOptions, CopyOutcome, CopySource, CopySourceDir,
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyOutcome, CopySource, CopySourceDir,
 			CopyUpdate, JobControl, JobController, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
@@ -99,7 +99,7 @@ pub async fn copy(
 		.copy_items(
 			sources,
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)

@@ -492,7 +492,7 @@ fn copy_job(
 			let outcome = client
 				.copy_items_to(
 					requests,
-					api::CopyOptions { max_bytes },
+					api::CopyConfig { max_bytes },
 					DeliveryChannel(sender),
 					control,
 				)
@@ -526,7 +526,7 @@ mod uniffi_impl {
 	}
 
 	#[derive(uniffi::Record, Default)]
-	pub struct CopyItemsOptions {
+	pub struct CopyItemsConfig {
 		/// Storage still free on the account, if known: a larger copy fails before anything is
 		/// written.
 		#[uniffi(default = None)]
@@ -551,12 +551,12 @@ mod uniffi_impl {
 	async fn run(
 		client: Arc<crate::auth::Client>,
 		requests: Vec<crate::fs::copy::CopyRequest>,
-		options: CopyItemsOptions,
+		config: CopyItemsConfig,
 		callback: Arc<dyn CopyItemsCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
 		let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-		let job = copy_job(client, requests, options.max_bytes, sender);
+		let job = copy_job(client, requests, config.max_bytes, sender);
 		managed_future
 			.into_js_managed_commander_job(move |control| async move {
 				let delivery =
@@ -583,12 +583,12 @@ mod uniffi_impl {
 			&self,
 			items: Vec<CopyItem>,
 			destination: AnyNormalDir,
-			options: CopyItemsOptions,
+			config: CopyItemsConfig,
 			callback: Arc<dyn CopyItemsCallback>,
 			managed_future: ManagedFuture,
 		) -> Result<CopyReport, Error> {
 			let requests = requests_into(items, destination)?;
-			run(self.inner(), requests, options, callback, managed_future).await
+			run(self.inner(), requests, config, callback, managed_future).await
 		}
 
 		/// [`copy_items`](Self::copy_items), with a destination (and optionally a name) for
@@ -596,12 +596,12 @@ mod uniffi_impl {
 		pub async fn copy_items_to(
 			&self,
 			entries: Vec<CopyEntry>,
-			options: CopyItemsOptions,
+			config: CopyItemsConfig,
 			callback: Arc<dyn CopyItemsCallback>,
 			managed_future: ManagedFuture,
 		) -> Result<CopyReport, Error> {
 			let requests = requests_to(entries)?;
-			run(self.inner(), requests, options, callback, managed_future).await
+			run(self.inner(), requests, config, callback, managed_future).await
 		}
 	}
 }

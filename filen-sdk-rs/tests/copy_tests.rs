@@ -10,7 +10,7 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		categories::DirType,
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyEvent, CopyOptions, CopyPhase, CopyRequest,
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyEvent, CopyPhase, CopyRequest,
 			CopySource, CopySourceDir, CopyStage, CopyUpdate, JobControl, JobController,
 			PlannedTopLevelItem,
 		},
@@ -50,7 +50,7 @@ async fn copy_tree_keeps_contents_and_metadata() {
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			recorder.clone(),
 			JobControl::default(),
 		)
@@ -109,7 +109,7 @@ async fn copying_into_the_same_parent_keeps_both() {
 			.copy_items(
 				vec![CopySource::File(file.clone().into())],
 				test_dir.clone().into(),
-				CopyOptions::default(),
+				CopyConfig::default(),
 				Arc::new(Recorder::default()),
 				JobControl::default(),
 			)
@@ -137,7 +137,7 @@ async fn copying_a_directory_into_itself_is_rejected() {
 			.copy_items(
 				vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
 				destination.clone().into(),
-				CopyOptions::default(),
+				CopyConfig::default(),
 				Arc::new(Recorder::default()),
 				JobControl::default(),
 			)
@@ -183,7 +183,7 @@ async fn copy_completes_on_a_small_memory_budget() {
 				.map(|f| CopySource::File(f.into()))
 				.collect(),
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -245,7 +245,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 		.copy_items(
 			vec![linked_source()],
 			source.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -266,7 +266,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 		.copy_items(
 			vec![linked_source()],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -334,7 +334,7 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			CancelOnCreate(recorder.clone(), controller),
 			control,
 		)
@@ -508,7 +508,7 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 				// the same source into the same place again
 				request(CopySource::File(file.clone().into()), &first, None),
 			],
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -549,7 +549,7 @@ async fn copies_into_the_drive_root() {
 		.copy_items(
 			vec![CopySource::File(file.into())],
 			DirType::Root(Cow::Owned(client.root().clone())),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -747,7 +747,7 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			recorder.clone(),
 			control,
 		)
@@ -793,7 +793,7 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 				.copy_items(
 					vec![CopySource::Dir(CopySourceDir::Normal(source))],
 					destination.into(),
-					CopyOptions::default(),
+					CopyConfig::default(),
 					Arc::new(Recorder::default()),
 					control,
 				)
@@ -860,7 +860,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 				CopySource::File(RemoteFileType::File(Cow::Owned(missing))),
 			],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			recorder.clone(),
 			JobControl::default(),
 		)
@@ -893,7 +893,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 				destination: failure.info.dest_parent_dir.clone(),
 				name: Some(failure.info.dest_name.clone()),
 			}],
-			CopyOptions::default(),
+			CopyConfig::default(),
 			Arc::new(Recorder::default()),
 			JobControl::default(),
 		)
@@ -924,7 +924,7 @@ async fn max_bytes_is_checked_before_anything_is_written() {
 		client.clone().copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
 			destination.clone().into(),
-			CopyOptions {
+			CopyConfig {
 				max_bytes: Some(max_bytes),
 			},
 			Arc::new(Recorder::default()),
@@ -963,7 +963,7 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 		.copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source))],
 			destination.clone().into(),
-			CopyOptions::default(),
+			CopyConfig::default(),
 			recorder.clone(),
 			JobControl::default(),
 		)
