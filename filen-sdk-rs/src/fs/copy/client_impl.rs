@@ -276,7 +276,7 @@ impl Client {
 
 		let mut planner = CopyPlanner::default();
 		for destination in destinations {
-			checkpoint(reporter, control).await?;
+			reporter.checkpoint(control).await?;
 			let listed = watch_listing(
 				Normal::list_dir(self, &destination, None::<&fn(u64, Option<u64>)>, ()),
 				reporter,
@@ -301,7 +301,7 @@ impl Client {
 			let source = match request.source {
 				CopySource::File(file) => PlanSource::File(file),
 				CopySource::Dir(dir) => {
-					checkpoint(reporter, control).await?;
+					reporter.checkpoint(control).await?;
 					bytes.next_source();
 					let listing = self.list_dir_source(dir, &bytes);
 					let source = watch_listing(listing, reporter, control, || report(sources_done))
@@ -402,21 +402,11 @@ enum ScanError {
 	Failed(Error),
 }
 
+/// For a stop the reporter was already told about, as [`Reporter::checkpoint`] does.
 impl From<Stopped> for ScanError {
 	fn from(_: Stopped) -> Self {
 		Self::Stopped
 	}
-}
-
-/// Waits out a pause before starting the next listing; `Err` once the copy is stopping.
-async fn checkpoint(reporter: &MaybeArc<Reporter>, control: &JobControl) -> Result<(), ScanError> {
-	reporter.set_pause_requested(control.is_pause_requested());
-	let result = control.checkpoint().await;
-	reporter.set_pause_requested(control.is_pause_requested());
-	result.map_err(|Stopped| {
-		reporter.set_cancelling();
-		ScanError::Stopped
-	})
 }
 
 #[cfg(test)]
@@ -575,7 +565,7 @@ mod tests {
 		let next = tokio::spawn({
 			let reporter = MaybeArc::clone(&reporter);
 			let control = control.clone();
-			async move { checkpoint(&reporter, &control).await.is_ok() }
+			async move { reporter.checkpoint(&control).await.is_ok() }
 		});
 		tokio::time::sleep(Duration::from_secs(60)).await;
 		assert!(!next.is_finished(), "the next listing waits while paused");

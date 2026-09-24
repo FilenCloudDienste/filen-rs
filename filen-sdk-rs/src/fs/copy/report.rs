@@ -23,6 +23,7 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		file::enums::RemoteFileType,
 	},
+	job::{JobControl, Stopped},
 	util::{MaybeArc, MaybeSendSync},
 };
 
@@ -467,6 +468,17 @@ impl Reporter {
 	#[cfg(test)]
 	pub(crate) fn ops_in_flight(&self) -> u64 {
 		self.ops_in_flight.load(Ordering::SeqCst)
+	}
+
+	/// Waits out a pause, reporting it; `Err` once the job is stopping.
+	pub(crate) async fn checkpoint(&self, control: &JobControl) -> Result<(), Stopped> {
+		self.set_pause_requested(control.is_pause_requested());
+		let result = control.checkpoint().await;
+		self.set_pause_requested(control.is_pause_requested());
+		if result.is_err() {
+			self.set_cancelling();
+		}
+		result
 	}
 
 	/// Records whether a pause is requested; the job counts as paused once no operation is in

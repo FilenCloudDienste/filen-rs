@@ -434,19 +434,6 @@ where
 		Stopped
 	}
 
-	/// Waits out a pause, reporting it; `Err` once the job is stopping.
-	async fn checkpoint(&self) -> Result<(), Stopped> {
-		self.reporter
-			.set_pause_requested(self.control.is_pause_requested());
-		let result = self.control.checkpoint().await;
-		self.reporter
-			.set_pause_requested(self.control.is_pause_requested());
-		if result.is_err() {
-			self.reporter.set_cancelling();
-		}
-		result
-	}
-
 	/// Fills in [`Job::requests`], fetching each destination's targets once.
 	async fn fetch_targets(&mut self) -> Result<(), Stopped> {
 		let count = self
@@ -468,7 +455,7 @@ where
 			let targets = if let Some(known) = known {
 				Arc::clone(&known.targets)
 			} else {
-				self.checkpoint().await?;
+				self.reporter.checkpoint(&self.control).await?;
 				let fetched = self
 					.control
 					.until_stopping(self.backend.connected_targets(destination))
@@ -542,7 +529,7 @@ where
 					if stopping {
 						return Err(Stopped);
 					}
-					self.checkpoint().await?;
+					self.reporter.checkpoint(&self.control).await?;
 					continue;
 				}
 			} else {
@@ -728,7 +715,7 @@ where
 					return Ok(());
 				}
 				// paused with nothing in flight
-				self.checkpoint().await?;
+				self.reporter.checkpoint(&self.control).await?;
 				continue;
 			}
 
@@ -845,7 +832,7 @@ where
 				continue;
 			}
 			checked.push(destination);
-			self.checkpoint().await?;
+			self.reporter.checkpoint(&self.control).await?;
 			let current = match self
 				.control
 				.until_stopping(self.backend.connected_targets(destination))
@@ -865,7 +852,7 @@ where
 			let _lock = loop {
 				match wait_for_lock(&*self.backend, &self.control, &self.reporter).await? {
 					LockWait::Locked(held) => break held,
-					LockWait::Paused => self.checkpoint().await?,
+					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
 					LockWait::Failed(error) => {
 						tracing::warn!(
 							"failed to lock the drive to propagate copied items: {error}"
