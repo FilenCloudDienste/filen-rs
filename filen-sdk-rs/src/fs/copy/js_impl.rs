@@ -41,7 +41,16 @@ pub struct CopyEntry {
 	pub name: Option<String>,
 }
 
-/// An error in a copy's progress or report.
+/// An error in a copy's progress or report. On uniffi it is the SDK error itself, as in the
+/// other uniffi records that carry one (`UploadError`, `DownloadError`).
+#[cfg(feature = "uniffi")]
+pub type CopyError = Arc<Error>;
+
+/// An error in a copy's progress or report: the parts of the SDK error, not the error itself. A
+/// tsify record cannot hold the wasm_bindgen `FilenSdkError` class, and the `JsValue` that
+/// could carry one cannot be made on the commander thread, where the copy builds its updates and
+/// its report.
+#[cfg(not(feature = "uniffi"))]
 #[js_type(export, no_deser)]
 pub struct CopyError {
 	pub kind: ErrorKind,
@@ -49,9 +58,12 @@ pub struct CopyError {
 	/// The server's message, for errors the server returned.
 	pub server_message: Option<String>,
 	pub server_code: Option<String>,
+	/// The wrapped error's message, without the `Error of kind ...` of `message`.
+	pub inner_message: Option<String>,
 }
 
-#[js_type(export, no_deser)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyFailureInfo {
 	pub source_uuid: Uuid,
 	pub source_path: String,
@@ -94,13 +106,15 @@ pub struct CopyRenamedEntry {
 
 /// A created item that could not get its color, or could not be added to one of the
 /// destination's public links or shares.
-#[js_type(export, no_deser)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyItemError {
 	pub dest_uuid: Uuid,
 	pub error: CopyError,
 }
 
-#[js_type(export, no_deser, tagged)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, tagged, no_default)]
 pub enum CopyEvent {
 	DirCreated(CopyDirCreated),
 	DirFailed(CopyFailureInfo),
@@ -114,7 +128,8 @@ pub enum CopyEvent {
 }
 
 /// One progress callback: the complete current state plus the events since the last one.
-#[js_type(export, no_deser)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyUpdate {
 	pub phase: CopyPhase,
 	pub run_state: RunState,
@@ -151,7 +166,8 @@ pub struct CopiedTopLevelItem {
 	pub item: NonRootNormalItemTagged,
 }
 
-#[js_type(export, no_deser)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyFailure {
 	/// The failed source, as it can be passed to `copyItemsTo` again.
 	pub item: AnyItemWithContext,
@@ -159,7 +175,8 @@ pub struct CopyFailure {
 }
 
 /// The outcome of a copy, whether it completed, was cancelled or failed.
-#[js_type(export, no_deser)]
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct CopyReport {
 	/// Top-level items created, in creation order.
 	pub top_level: Vec<CopiedTopLevelItem>,
@@ -257,14 +274,20 @@ fn requests_to(entries: Vec<CopyEntry>) -> Result<Vec<CopyRequest>, Error> {
 	entries.into_iter().map(TryFrom::try_from).collect()
 }
 
-impl From<&Error> for CopyError {
-	fn from(error: &Error) -> Self {
-		Self {
-			kind: error.kind(),
-			message: error.to_string(),
-			server_message: error.server_message(),
-			server_code: error.server_code(),
-		}
+#[cfg(feature = "uniffi")]
+fn copy_error(error: Arc<Error>) -> CopyError {
+	error
+}
+
+// Takes the Arc, though it only reads the error, to share its signature with the uniffi twin.
+#[cfg(not(feature = "uniffi"))]
+fn copy_error(error: Arc<Error>) -> CopyError {
+	CopyError {
+		kind: error.kind(),
+		message: error.message(),
+		server_message: error.server_message(),
+		server_code: error.server_code(),
+		inner_message: error.inner_message(),
 	}
 }
 
@@ -277,7 +300,7 @@ impl From<FailureInfo> for CopyFailureInfo {
 			dest_parent_dir: info.dest_parent_dir.into(),
 			dest_name: info.dest_name,
 			stage: info.stage,
-			error: CopyError::from(info.error.as_ref()),
+			error: copy_error(info.error),
 			affected_files: info.affected_files,
 			affected_bytes: info.affected_bytes,
 		}
@@ -339,13 +362,13 @@ impl From<super::CopyEvent> for CopyEvent {
 			super::CopyEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(CopyItemError {
 					dest_uuid,
-					error: CopyError::from(error.as_ref()),
+					error: copy_error(error),
 				})
 			}
 			super::CopyEvent::ColorFailed { dest_uuid, error } => {
 				Self::ColorFailed(CopyItemError {
 					dest_uuid,
-					error: CopyError::from(error.as_ref()),
+					error: copy_error(error),
 				})
 			}
 		}
@@ -413,7 +436,7 @@ impl From<super::CopyReport> for CopyReport {
 impl From<CopyFailed> for CopyReport {
 	fn from(failed: CopyFailed) -> Self {
 		Self {
-			error: Some(CopyError::from(failed.error.as_ref())),
+			error: Some(copy_error(failed.error)),
 			..failed.report.into()
 		}
 	}
@@ -924,7 +947,7 @@ mod tests {
 		let [CopyEvent::FileFailed(info)] = update.events.as_slice() else {
 			panic!("one failed file");
 		};
-		assert_eq!(info.error.kind, ErrorKind::MaxStorageReached);
+		assert_eq!(info.error.kind(), ErrorKind::MaxStorageReached);
 		let AnyNormalDir::Dir(parent_dir) = &info.dest_parent_dir else {
 			panic!("the directory the file was to be created in");
 		};
@@ -940,11 +963,14 @@ mod tests {
 
 	#[test]
 	fn a_report_carries_why_the_copy_ended() {
+		let error = Arc::new(Error::custom(ErrorKind::Cancelled, "copy cancelled"));
 		let cancelled = CopyReport::from(CopyFailed {
 			report: copy::CopyReport::default(),
-			error: Arc::new(Error::custom(ErrorKind::Cancelled, "copy cancelled")),
+			error: Arc::clone(&error),
 		});
-		assert_eq!(cancelled.error.map(|e| e.kind), Some(ErrorKind::Cancelled));
+		let reported = cancelled.error.expect("a cancelled copy says why it ended");
+		assert!(Arc::ptr_eq(&reported, &error), "the SDK error itself");
+		assert_eq!(reported.kind(), ErrorKind::Cancelled);
 		let done = CopyReport::from(copy::CopyReport::default());
 		assert!(done.error.is_none());
 	}
