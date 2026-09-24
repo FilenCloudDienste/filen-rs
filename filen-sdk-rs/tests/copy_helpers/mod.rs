@@ -2,16 +2,14 @@
 // binary compiles its own copy and uses a subset.
 #![allow(dead_code)]
 
-use std::{
-	borrow::Cow,
-	sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use filen_sdk_rs::{
+	ErrorKind,
 	auth::Client,
 	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Normal, fs::CategoryFS},
+		HasUUID,
+		categories::{Normal, fs::CategoryFSExt},
 		copy::{
 			CopiedTopLevel, CopyCallback, CopyOptions, CopyOutcome, CopySource, CopySourceDir,
 			CopyUpdate, JobControl, PlannedTopLevelItem,
@@ -60,49 +58,35 @@ pub fn data(len: usize, seed: u8) -> Vec<u8> {
 		.collect()
 }
 
-/// `dir`'s recursive contents, keyed by the path below `dir`.
+/// `dir`'s recursive contents, keyed by the path below `dir`. Entries whose metadata cannot be
+/// decrypted have no name, so no path: they are left out, along with everything below them.
 pub async fn contents(
-	client: &Client,
+	client: &Arc<Client>,
 	dir: &RemoteDirectory,
 ) -> (Vec<(String, RemoteDirectory)>, Vec<(String, RemoteFile)>) {
-	let (dirs, files) = Normal::list_dir_recursive(
-		client,
-		&DirType::Dir(Cow::Borrowed(dir)),
+	let (dirs, files) = Normal::list_dir_recursive_with_paths(
+		Arc::clone(client),
+		dir.into(),
 		None::<&fn(u64, Option<u64>)>,
+		&mut |errors| {
+			for error in errors {
+				assert!(
+					error.kind() == ErrorKind::Walk
+						&& error
+							.inner_message()
+							.is_some_and(|m| m.starts_with("encrypted metadata could not be read")),
+					"unexpected listing error: {error}"
+				);
+			}
+		},
 		(),
 	)
 	.await
 	.unwrap();
-	let path_of = |uuid: filen_types::fs::Uuid| {
-		let mut parts = Vec::new();
-		let mut current = uuid;
-		while current != dir.uuid() {
-			let parent = dirs.iter().find(|d| d.uuid() == current).unwrap();
-			parts.push(parent.name().unwrap().to_owned());
-			current = (*parent.parent()).try_into().unwrap();
-		}
-		parts.reverse();
-		parts.join("/")
-	};
-	use filen_sdk_rs::fs::HasParent;
-	let dir_paths = dirs
-		.iter()
-		.map(|d| (path_of(d.uuid()), d.clone()))
-		.collect();
-	let file_paths = files
-		.iter()
-		.map(|f| {
-			let parent: filen_types::fs::Uuid = (*f.parent()).try_into().unwrap();
-			let prefix = path_of(parent);
-			let path = if prefix.is_empty() {
-				f.name().unwrap().to_owned()
-			} else {
-				format!("{prefix}/{}", f.name().unwrap())
-			};
-			(path, f.clone())
-		})
-		.collect();
-	(dir_paths, file_paths)
+	(
+		dirs.into_iter().map(|(d, path)| (path, d)).collect(),
+		files.into_iter().map(|(f, path)| (path, f)).collect(),
+	)
 }
 
 /// Copies `sources` into `destination` with default options and no pause or cancel.
