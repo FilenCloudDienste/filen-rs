@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 use filen_types::fs::ObjectType;
 use image::ImageError;
@@ -345,43 +345,61 @@ impl FilenSdkError {
 	fn downcast_inner<T: std::error::Error + Send + Sync + 'static>(
 		mut self,
 	) -> Result<(T, Vec<Cow<'static, str>>), Self> {
-		match self.inner {
-			Some(inner) => match inner.downcast::<T>() {
-				Ok(inner) => Ok((*inner, self.context.into_iter().collect())),
-				Err(inner) => match inner.downcast::<FilenSdkError>() {
-					Ok(inner) => match inner.downcast_inner::<T>() {
-						Ok((inner, mut context)) => {
-							if let Some(ctx) = self.context {
-								context.push(ctx);
-							}
-							Ok((inner, context))
-						}
-						Err(inner) => {
-							self.inner = Some(Box::new(inner));
-							Err(self)
-						}
-					},
-					Err(inner) => {
-						self.inner = Some(inner);
-						Err(self)
+		let Some(inner) = self.inner.take() else {
+			return Err(self);
+		};
+		let inner = match inner.downcast::<T>() {
+			Ok(inner) => return Ok((*inner, self.context.into_iter().collect())),
+			Err(inner) => inner,
+		};
+		let (nested, was_shared) = match inner.downcast::<FilenSdkError>() {
+			Ok(nested) => (*nested, false),
+			// A shared error can only be taken apart once nothing else holds it.
+			Err(inner) => match inner.downcast::<Arc<FilenSdkError>>() {
+				Ok(shared) => match Arc::try_unwrap(*shared) {
+					Ok(nested) => (nested, true),
+					Err(shared) => {
+						self.inner = Some(Box::new(shared));
+						return Err(self);
 					}
 				},
+				Err(inner) => {
+					self.inner = Some(inner);
+					return Err(self);
+				}
 			},
-			None => Err(self),
+		};
+		match nested.downcast_inner::<T>() {
+			Ok((inner, mut context)) => {
+				if let Some(ctx) = self.context {
+					context.push(ctx);
+				}
+				Ok((inner, context))
+			}
+			Err(nested) => {
+				// Hand the source back in the shape it came in.
+				self.inner = Some(if was_shared {
+					Box::new(Arc::new(nested))
+				} else {
+					Box::new(nested)
+				});
+				Err(self)
+			}
 		}
 	}
 
 	pub fn downcast_ref<T: std::error::Error + Send + Sync + 'static>(&self) -> Option<&T> {
-		match &self.inner {
-			Some(inner) => match inner.downcast_ref::<T>() {
-				Some(inner) => Some(inner),
-				None => match inner.downcast_ref::<FilenSdkError>() {
-					Some(inner) => inner.downcast_ref::<T>(),
-					None => None,
-				},
-			},
-			None => None,
+		let inner = self.inner.as_deref()?;
+		if let Some(inner) = inner.downcast_ref::<T>() {
+			return Some(inner);
 		}
+		let nested: &FilenSdkError = match inner.downcast_ref::<FilenSdkError>() {
+			Some(nested) => nested,
+			// An error shared between several owners, like a copy job's fatal error, which is
+			// both returned and kept in the job's report.
+			None => inner.downcast_ref::<Arc<FilenSdkError>>()?,
+		};
+		nested.downcast_ref::<T>()
 	}
 }
 
@@ -702,6 +720,63 @@ mod tests {
 	fn downcast_ref_returns_none_when_no_inner() {
 		let err = Error::custom(ErrorKind::Server, "nothing");
 		assert!(err.downcast_ref::<io::Error>().is_none());
+	}
+
+	#[test]
+	fn downcast_ref_looks_through_a_shared_error() {
+		let shared = Arc::new(Error::custom_with_source(
+			ErrorKind::IO,
+			make_io_error(),
+			None::<&'static str>,
+		));
+		let outer = Error::custom_with_source(ErrorKind::IO, shared, None::<&'static str>);
+		let inner = outer.downcast_ref::<io::Error>().unwrap();
+		assert_eq!(inner.to_string(), "leaf io error");
+	}
+
+	#[test]
+	fn downcast_takes_apart_a_shared_error_it_alone_holds() {
+		let shared = Arc::new(Error::custom_with_source(
+			ErrorKind::IO,
+			make_io_error(),
+			Some("leaf_ctx"),
+		));
+		let outer = Error::custom_with_source(ErrorKind::IO, shared, Some("outer_ctx"));
+		let (inner, ctxs) = outer.downcast::<io::Error>().unwrap();
+		assert_eq!(inner.to_string(), "leaf io error");
+		assert_eq!(
+			ctxs,
+			vec![Cow::Borrowed("outer_ctx"), Cow::Borrowed("leaf_ctx")]
+		);
+	}
+
+	#[test]
+	fn downcast_returns_self_while_a_shared_error_has_other_owners() {
+		let shared = Arc::new(Error::custom_with_source(
+			ErrorKind::IO,
+			make_io_error(),
+			None::<&'static str>,
+		));
+		let outer =
+			Error::custom_with_source(ErrorKind::IO, Arc::clone(&shared), None::<&'static str>);
+		let returned = outer.downcast::<io::Error>().unwrap_err();
+		assert!(returned.downcast_ref::<io::Error>().is_some());
+		drop(shared);
+		assert!(returned.downcast::<io::Error>().is_ok());
+	}
+
+	#[test]
+	fn downcast_puts_a_shared_error_back_as_shared_when_the_type_is_missing() {
+		let shared = Arc::new(Error::custom_with_source(
+			ErrorKind::IO,
+			make_io_error(),
+			None::<&'static str>,
+		));
+		let outer = Error::custom_with_source(ErrorKind::IO, shared, None::<&'static str>);
+		let returned = outer.downcast::<std::fmt::Error>().unwrap_err();
+		let source = returned.inner.as_deref().unwrap();
+		assert!(source.downcast_ref::<Arc<Error>>().is_some());
+		assert!(returned.downcast_ref::<io::Error>().is_some());
 	}
 
 	#[test]

@@ -2682,6 +2682,24 @@ mod tests {
 		assert_eq!(recorder.last().phase, CopyPhase::Failed);
 	}
 
+	#[test]
+	fn a_job_error_keeps_the_server_error_readable() {
+		let error = Arc::new(Error::from(filen_types::error::ResponseError::ApiError {
+			message: Some("Max storage reached".into()),
+			code: Some("max_storage_reached".into()),
+		}));
+		let returned = job_error(&error);
+		assert_eq!(returned.kind(), error.kind());
+		assert_eq!(
+			returned.server_code().as_deref(),
+			Some("max_storage_reached")
+		);
+		assert_eq!(
+			returned.server_message().as_deref(),
+			Some("Max storage reached")
+		);
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn a_failed_file_does_not_stop_the_others() {
 		let destination = Uuid::new_v4();
