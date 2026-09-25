@@ -45,6 +45,8 @@
 //! side pays the tree for it, exactly as [`Nodes`] says in its own docs. A caller that knows which
 //! paths it is about should say so instead ([`Side::remove`], [`Side::subtree_paths`]).
 
+#[cfg(feature = "bench-internals")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
 	borrow::Cow,
 	collections::{HashMap, hash_map},
@@ -516,6 +518,70 @@ impl<'a, T> Iterator for OwnKeys<'a, T> {
 	}
 }
 
+/// How often a CARRIED side has been walked whole, and over how many rows.
+///
+/// A carried side exists so that a change-scoped pass holds per-pass data instead of a second copy
+/// of the tree. [`SideRef::entries`] gives that up: on a carried backing it walks every row and
+/// builds a `Vec` sized to [`Baseline::carryable_rows`], so one call on a converged million-row
+/// pair materializes the very tree the backing exists not to materialize. Whether a scoped pass
+/// reaches it is not a thing a reading of ten thousand lines of engine settles — every whole-set
+/// caller is supposed to be gated on `PassPaths::Whole`, and "supposed to" is what a counter is
+/// for.
+///
+/// Process-global and never reset by itself: a memory child runs one pass, so its figures are that
+/// pass's. Counted under `bench-internals` only — a shipping build has neither the counter nor the
+/// `fetch_add`.
+#[cfg(feature = "bench-internals")]
+static CARRIED_WHOLE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static CARRIED_WHOLE_ROWS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static CARRIED_SUBTREE_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static CARRIED_SUBTREE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// What a carried side was asked to materialize (see [`CARRIED_WHOLE_CALLS`]).
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CarriedWalks {
+	/// Calls to [`SideRef::entries`] on a carried side — each one O(tree).
+	pub(super) whole_calls: u64,
+	/// The carryable rows those calls walked, summed — each call sizes its `Vec` to exactly this,
+	/// so it is an UPPER bound on what was pushed rather than a count of it: a row that derives
+	/// nothing for this side, or one the pass already observed, is walked and skipped. It is the
+	/// figure that says whether a pass materialized a tree, which is a question an upper bound
+	/// answers: zero means it did not.
+	pub(super) whole_rows: u64,
+	/// Calls to [`SideRef::entries_under`] on a carried side — each one O(subtree), which is what
+	/// a scoped pass is entitled to.
+	pub(super) subtree_calls: u64,
+	pub(super) subtree_rows: u64,
+}
+
+/// What carried sides have materialized in this process so far.
+#[cfg(feature = "bench-internals")]
+pub(super) fn carried_walks() -> CarriedWalks {
+	CarriedWalks {
+		whole_calls: CARRIED_WHOLE_CALLS.load(Ordering::Relaxed),
+		whole_rows: CARRIED_WHOLE_ROWS.load(Ordering::Relaxed),
+		subtree_calls: CARRIED_SUBTREE_CALLS.load(Ordering::Relaxed),
+		subtree_rows: CARRIED_SUBTREE_ROWS.load(Ordering::Relaxed),
+	}
+}
+
+/// Zero the counters, so what follows is measured on its own.
+#[cfg(feature = "bench-internals")]
+pub(super) fn reset_carried_walks() {
+	for counter in [
+		&CARRIED_WHOLE_CALLS,
+		&CARRIED_WHOLE_ROWS,
+		&CARRIED_SUBTREE_CALLS,
+		&CARRIED_SUBTREE_ROWS,
+	] {
+		counter.store(0, Ordering::Relaxed);
+	}
+}
+
 /// A side plus the baseline its carried half derives from — what every consumer actually reads
 /// (see [`Side::of`]).
 #[derive(Clone, Copy)]
@@ -535,6 +601,12 @@ impl<T: FromRow> SideRef<'_, T> {
 			Side::Whole(map) => Entries::Whole(map.iter()),
 			Side::Carried(overlay) => {
 				let mut out: Vec<(String, T)> = Vec::with_capacity(self.baseline.carryable_rows());
+				#[cfg(feature = "bench-internals")]
+				{
+					CARRIED_WHOLE_CALLS.fetch_add(1, Ordering::Relaxed);
+					CARRIED_WHOLE_ROWS
+						.fetch_add(self.baseline.carryable_rows() as u64, Ordering::Relaxed);
+				}
 				self.baseline.visit_rows(|row| {
 					// A path the pass observed is answered from the overlay below, whichever way.
 					if overlay.get(&row.rel_path).is_some() {
@@ -559,6 +631,8 @@ impl<T: FromRow> SideRef<'_, T> {
 			Side::Whole(map) => Entries::Whole(map.iter()),
 			Side::Carried(overlay) => {
 				let mut out: Vec<(String, T)> = Vec::new();
+				#[cfg(feature = "bench-internals")]
+				CARRIED_SUBTREE_CALLS.fetch_add(1, Ordering::Relaxed);
 				for row in self.baseline.subtree(dir) {
 					if overlay.get(&row.rel_path).is_some() {
 						continue;
@@ -567,6 +641,8 @@ impl<T: FromRow> SideRef<'_, T> {
 						out.push((row.rel_path.clone(), node));
 					}
 				}
+				#[cfg(feature = "bench-internals")]
+				CARRIED_SUBTREE_ROWS.fetch_add(out.len() as u64, Ordering::Relaxed);
 				out.extend(overlay.iter().filter_map(|(path, edit)| {
 					(is_under(path, dir))
 						.then(|| edit.as_ref().map(|node| (path.clone(), node.clone())))
@@ -1272,6 +1348,49 @@ mod tests {
 		let mut row = row_at(index, Shape::Synced).expect("a synced row");
 		row.rel_path = path.to_owned();
 		row
+	}
+
+	/// The carried-walk counters move when a carried side really is walked whole.
+	///
+	/// Every benchmark row publishes zero for these, and so would a counter that is never
+	/// incremented at all: a WHOLE pass takes the [`Side::Whole`] arm, so no scenario in the
+	/// harness can tell a correct zero from a mis-wired one. The published zeros are evidence that
+	/// a change-scoped pass holds no second copy of the tree ONLY if this fires.
+	///
+	/// Asserted as DELTAS rather than absolutes: the counters are process-global and the tests
+	/// around this one walk carried sides of their own, on other threads, in the same process. A
+	/// delta cannot be fooled in the direction that matters — a counter that never moves fails this
+	/// however the rest of the suite is scheduled — where an equality would be flaky, which is its
+	/// own bug.
+	#[cfg(feature = "bench-internals")]
+	#[test]
+	fn a_carried_side_walked_whole_is_counted() {
+		let baseline =
+			Baseline::from_rows([row_named(0, "a"), row_named(1, "b"), row_named(2, "c")]);
+		let rows = baseline.carryable_rows() as u64;
+		assert!(
+			rows > 0,
+			"the fixture carries no rows, so walking it would count nothing and this test could \
+			 not fail"
+		);
+		let mut side: Side<u32> = Side::carried();
+		side.insert("placed.txt".to_owned(), 7);
+
+		let before = carried_walks();
+		let walked: Vec<String> = side.of(&baseline).paths().map(Cow::into_owned).collect();
+		let after = carried_walks();
+
+		assert!(
+			after.whole_calls > before.whole_calls,
+			"a carried side was walked whole and the call went uncounted"
+		);
+		assert!(
+			after.whole_rows >= before.whole_rows + rows,
+			"a carried side walked {rows} row(s) and the row counter did not move by them"
+		);
+		// And the walk actually ran to the end: a marker node derives nothing from a row, so the
+		// overlay entry is the one path such a side holds.
+		assert_eq!(walked, vec!["placed.txt".to_string()]);
 	}
 
 	/// A subtree moving onto a path this pass already recorded something at: the TOMBSTONES there
