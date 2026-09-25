@@ -81,7 +81,7 @@ pub(crate) struct PlanRequest<D> {
 	/// The existing directory the source is copied into.
 	pub(crate) destination: Uuid,
 	/// Name to use instead of the source's (still subject to keep-both).
-	pub(crate) name: Option<String>,
+	pub(crate) name: Option<ValidatedName>,
 }
 
 /// Where a planned item goes: an existing directory, or one the plan creates.
@@ -174,7 +174,7 @@ pub enum RenameReason {
 	DuplicateName,
 	/// The metadata could not be decrypted; the item is named after its uuid.
 	Undecryptable,
-	/// The name is invalid under today's rules and was encoded.
+	/// The source's name is invalid under today's rules and was encoded.
 	InvalidName,
 }
 
@@ -287,7 +287,7 @@ impl CopyPlanner {
 						index,
 						file,
 						parent,
-						request.name.as_deref(),
+						request.name.as_ref().map(AsRef::as_ref),
 						taken,
 						path,
 						true,
@@ -305,7 +305,7 @@ impl CopyPlanner {
 						dirs,
 						files,
 						parent,
-						request.name.as_deref(),
+						request.name.as_ref().map(AsRef::as_ref),
 						taken,
 					);
 					plan.top_level.push(PlannedTopLevel {
@@ -748,7 +748,7 @@ mod tests {
 	fn requests_into_one_destination_share_its_names() {
 		let destination = Uuid::new_v4();
 		let mut second = request(PlanSource::File(file("b.txt", 1)), destination);
-		second.name = Some("a.txt".to_string());
+		second.name = Some(ValidatedName::try_from("a.txt").unwrap());
 		let plan = planner(destination, &[])
 			.plan(vec![
 				request(PlanSource::File(file("a.txt", 1)), destination),

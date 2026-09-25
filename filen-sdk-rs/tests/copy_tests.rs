@@ -21,6 +21,7 @@ use filen_sdk_rs::{
 			enums::RemoteFileType,
 			traits::{HasFileInfo, HasFileMeta, HasRemoteFileInfo},
 		},
+		name::ValidatedName,
 	},
 	io::client_impl::IoSharedClientExt,
 };
@@ -454,7 +455,7 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 		|source: CopySource, destination: &RemoteDirectory, name: Option<&str>| CopyRequest {
 			source,
 			destination: destination.clone().into(),
-			name: name.map(str::to_owned),
+			name: name.map(|name| ValidatedName::try_from(name).unwrap()),
 		};
 	let report = client
 		.clone()
@@ -857,7 +858,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 			vec![CopyRequest {
 				source: CopySource::File(real.clone().into()),
 				destination: failure.info.dest_parent_dir.clone(),
-				name: Some(failure.info.dest_name.clone()),
+				name: Some(ValidatedName::try_from(failure.info.dest_name.as_str()).unwrap()),
 			}],
 			CopyConfig::default(),
 			Arc::new(Recorder::default()),

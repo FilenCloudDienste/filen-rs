@@ -27,6 +27,7 @@ use crate::{
 			traits::{HasDirInfo, HasRemoteDirInfo},
 		},
 		file::enums::RemoteFileType,
+		name::ValidatedName,
 	},
 	job::{JobControl, Stopped},
 	util::{MaybeArc, sleep},
@@ -65,7 +66,7 @@ pub struct CopyRequest {
 	pub destination: DirType<'static, Normal>,
 	/// The name to give the copy instead of the source's. Either way, a name already taken at
 	/// the destination is kept and the copy gets `name (1)`, `name (2)`, ...
-	pub name: Option<String>,
+	pub name: Option<ValidatedName>,
 }
 
 #[derive(Debug, Clone, Default)]

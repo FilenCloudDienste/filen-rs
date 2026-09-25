@@ -15,6 +15,7 @@ use crate::{
 		HasUUID,
 		categories::{DirType, Normal},
 		file::enums::RemoteFileType,
+		name::ValidatedName,
 	},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
@@ -240,6 +241,8 @@ impl From<FailedSource> for AnyItemWithContext {
 	}
 }
 
+// CopyEntry carries the name unvalidated because neither tsify's from_wasm_abi nor uniffi's
+// record lifting can report an error; an invalid name fails the call here, before the copy starts.
 impl TryFrom<CopyEntry> for CopyRequest {
 	type Error = Error;
 
@@ -247,7 +250,11 @@ impl TryFrom<CopyEntry> for CopyRequest {
 		Ok(Self {
 			source: entry.item.try_into()?,
 			destination: DirType::from(entry.destination),
-			name: entry.name,
+			name: entry
+				.name
+				.as_deref()
+				.map(ValidatedName::try_from)
+				.transpose()?,
 		})
 	}
 }
@@ -906,6 +913,19 @@ mod tests {
 		)));
 		let error = CopySource::try_from(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
+	}
+
+	#[test]
+	fn a_name_given_for_a_copy_must_be_valid() {
+		let entry = |name: &str| CopyEntry {
+			item: AnyItemWithContext::from(FailedSource::File(Box::new(file()))),
+			destination: AnyNormalDir::Dir(dir().into()),
+			name: Some(name.to_owned()),
+		};
+		let error = CopyRequest::try_from(entry("a/b.txt")).unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::InvalidName);
+		let request = CopyRequest::try_from(entry("b.txt")).unwrap();
+		assert_eq!(request.name.as_ref().map(AsRef::as_ref), Some("b.txt"));
 	}
 
 	#[test]
