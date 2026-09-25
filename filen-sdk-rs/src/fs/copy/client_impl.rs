@@ -37,7 +37,7 @@ use super::{
 	CopyFailed, CopyReport,
 	backend::ClientBackend,
 	engine::run_copy,
-	plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
+	plan::{CopyPlan, CopyPlanner, Listed, PlanRequest, PlanSource, PlanTotals, SourceDir},
 	report::{CopyCallback, CopyPhase, Reporter, ScanProgress},
 };
 
@@ -72,7 +72,9 @@ pub struct CopyRequest {
 #[derive(Debug, Clone, Default)]
 pub struct CopyConfig {
 	/// Storage still free on the account, if the caller knows it: a copy larger than this fails
-	/// with [`ErrorKind::MaxStorageReached`] before anything is written.
+	/// with [`ErrorKind::MaxStorageReached`] before anything is written. Its report still
+	/// carries the totals, counted as not attempted, so the caller can tell how much storage the
+	/// copy needs.
 	pub max_bytes: Option<u64>,
 }
 
@@ -241,38 +243,9 @@ impl Client {
 			.map(|request| (request.destination.uuid(), request.destination.clone()))
 			.collect();
 		let scanned = self.scan(requests, &reporter, &control).await;
-		let plan = scanned.and_then(|(planner, requests)| {
-			let plan = planner.plan(requests).map_err(ScanError::Failed)?;
-			match config.max_bytes {
-				Some(max_bytes) if plan.totals.bytes > max_bytes => {
-					Err(ScanError::Failed(Error::custom(
-						ErrorKind::MaxStorageReached,
-						format!(
-							"the copy needs {} bytes but only {max_bytes} are free",
-							plan.totals.bytes
-						),
-					)))
-				}
-				_ => Ok(plan),
-			}
-		});
-		let plan = match plan {
-			Ok(plan) => plan,
-			Err(error) => {
-				let (phase, error) = match error {
-					ScanError::Stopped => (
-						CopyPhase::Cancelled,
-						Error::custom(ErrorKind::Cancelled, "copy cancelled"),
-					),
-					ScanError::Failed(error) => (CopyPhase::Failed, error),
-				};
-				reporter.finish(phase);
-				return Err(CopyFailed {
-					report: CopyReport::default(),
-					error: Arc::new(error),
-				});
-			}
-		};
+		let plan = scanned
+			.and_then(|(planner, requests)| planner.plan(requests).map_err(ScanError::Failed));
+		let plan = plan_to_run(plan, config.max_bytes, &reporter).map_err(|failed| *failed)?;
 		let backend = Arc::new(ClientBackend::new(self));
 		run_copy(backend, plan, destination_dirs, control, reporter).await
 	}
@@ -438,6 +411,48 @@ impl From<Stopped> for ScanError {
 	}
 }
 
+/// The plan to run, or the end of a copy that never starts: its scan was cancelled or failed,
+/// or it needs more than `max_bytes`. A copy refused for `max_bytes` still reports the plan's
+/// totals, none of them attempted, so the caller can tell how much storage it needs; its skips
+/// and renames stay out, since it never starts.
+fn plan_to_run(
+	plan: Result<CopyPlan<CopySourceDir>, ScanError>,
+	max_bytes: Option<u64>,
+	reporter: &Reporter,
+) -> Result<CopyPlan<CopySourceDir>, Box<CopyFailed>> {
+	let (phase, error, totals) = match plan {
+		Ok(plan) => match max_bytes {
+			Some(max_bytes) if plan.totals.bytes > max_bytes => (
+				CopyPhase::Failed,
+				Error::custom(
+					ErrorKind::MaxStorageReached,
+					format!(
+						"the copy needs {} bytes but only {max_bytes} are free",
+						plan.totals.bytes
+					),
+				),
+				plan.totals,
+			),
+			_ => return Ok(plan),
+		},
+		Err(ScanError::Stopped) => (
+			CopyPhase::Cancelled,
+			Error::custom(ErrorKind::Cancelled, "copy cancelled"),
+			PlanTotals::default(),
+		),
+		Err(ScanError::Failed(error)) => (CopyPhase::Failed, error, PlanTotals::default()),
+	};
+	reporter.finish_unstarted(phase, totals);
+	Err(Box::new(CopyFailed {
+		report: CopyReport {
+			totals,
+			counts: reporter.counts(),
+			..CopyReport::default()
+		},
+		error: Arc::new(error),
+	}))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -450,7 +465,10 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		fs::copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
+		fs::copy::{
+			plan::{SkipReason, SkippedEntry},
+			report::{CopiedTopLevel, CopyCounts, CopyUpdate, PlannedTopLevelItem},
+		},
 		job::test_support::{SetOnDrop, controls},
 	};
 
@@ -475,6 +493,97 @@ mod tests {
 			Updates::default(),
 			JobControl::default(),
 		));
+	}
+
+	impl Updates {
+		fn last(&self) -> CopyUpdate {
+			self.0.lock().unwrap().last().unwrap().clone()
+		}
+	}
+
+	#[test]
+	fn a_copy_larger_than_max_bytes_is_refused_with_its_totals_not_attempted() {
+		let needs = PlanTotals {
+			dirs: 1,
+			files: 2,
+			bytes: 1024,
+		};
+		let plan = || CopyPlan {
+			skipped: vec![SkippedEntry {
+				source_path: "/Top/secret".to_owned(),
+				bytes: 7,
+				reason: SkipReason::UndecryptableFile {
+					uuid: Uuid::new_v4(),
+				},
+			}],
+			totals: needs,
+			..CopyPlan::default()
+		};
+		let updates = Arc::new(Updates::default());
+		let reporter = Reporter::new(Arc::clone(&updates));
+
+		let CopyFailed { report, error } =
+			*plan_to_run(Ok(plan()), Some(needs.bytes - 1), &reporter).unwrap_err();
+
+		assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
+		assert_eq!(report.totals, needs, "the report says what the copy needs");
+		let not_attempted = CopyCounts {
+			dirs_not_attempted: needs.dirs,
+			files_not_attempted: needs.files,
+			bytes_not_attempted: needs.bytes,
+			..CopyCounts::default()
+		};
+		assert_eq!(report.counts, not_attempted);
+		assert!(
+			report.skipped.is_empty() && report.renamed.is_empty(),
+			"a copy that never starts skips and renames nothing"
+		);
+		assert!(report.top_level.is_empty() && report.failures.is_empty());
+		let last = updates.last();
+		assert_eq!(
+			(last.phase, last.totals, last.counts),
+			(CopyPhase::Failed, needs, not_attempted),
+			"the last update says what the copy needs"
+		);
+		assert!(last.events.is_empty());
+
+		for max_bytes in [Some(needs.bytes), None] {
+			let updates = Arc::new(Updates::default());
+			let reporter = Reporter::new(Arc::clone(&updates));
+			let plan = plan_to_run(Ok(plan()), max_bytes, &reporter).unwrap();
+			assert_eq!(plan.totals, needs, "a copy that fits runs");
+			assert!(updates.0.lock().unwrap().is_empty(), "and has not ended");
+		}
+	}
+
+	#[test]
+	fn a_copy_whose_scan_ended_reports_nothing() {
+		let scans = [
+			(
+				ScanError::Stopped,
+				CopyPhase::Cancelled,
+				ErrorKind::Cancelled,
+			),
+			(
+				ScanError::Failed(Error::custom(ErrorKind::Server, "listing failed")),
+				CopyPhase::Failed,
+				ErrorKind::Server,
+			),
+		];
+		for (scan, phase, kind) in scans {
+			let updates = Arc::new(Updates::default());
+			let reporter = Reporter::new(Arc::clone(&updates));
+			let CopyFailed { report, error } =
+				*plan_to_run(Err(scan), Some(0), &reporter).unwrap_err();
+			assert_eq!(error.kind(), kind);
+			assert_eq!(report.totals, PlanTotals::default());
+			assert_eq!(report.counts, CopyCounts::default());
+			let last = updates.last();
+			assert_eq!(
+				(last.phase, last.totals, last.counts),
+				(phase, PlanTotals::default(), CopyCounts::default())
+			);
+		}
 	}
 
 	#[test]

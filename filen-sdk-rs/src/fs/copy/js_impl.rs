@@ -527,7 +527,8 @@ mod uniffi_impl {
 	#[derive(uniffi::Record, Default)]
 	pub struct CopyItemsConfig {
 		/// Storage still free on the account, if known: a larger copy fails before anything is
-		/// written.
+		/// written. Its report still carries `totals`, counted as not attempted, so the caller
+		/// can tell how much storage the copy needs.
 		#[uniffi(default = None)]
 		pub max_bytes: Option<u64>,
 	}
@@ -621,7 +622,8 @@ mod wasm_impl {
 		pub items: Vec<AnyItemWithContext>,
 		pub destination: AnyNormalDir,
 		/// Storage still free on the account, if known: a larger copy fails before anything is
-		/// written.
+		/// written. Its report still carries `totals`, counted as not attempted, so the caller
+		/// can tell how much storage the copy needs.
 		#[serde(default)]
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
@@ -644,7 +646,8 @@ mod wasm_impl {
 	pub struct CopyItemsToParams {
 		pub entries: Vec<CopyEntry>,
 		/// Storage still free on the account, if known: a larger copy fails before anything is
-		/// written.
+		/// written. Its report still carries `totals`, counted as not attempted, so the caller
+		/// can tell how much storage the copy needs.
 		#[serde(default)]
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
@@ -978,6 +981,41 @@ mod tests {
 		assert_eq!(reported.kind(), ErrorKind::Cancelled);
 		let done = CopyReport::from(copy::CopyReport::default());
 		assert!(done.error.is_none());
+	}
+
+	#[test]
+	fn a_refused_copy_keeps_its_totals_and_counts() {
+		let totals = PlanTotals {
+			dirs: 1,
+			files: 2,
+			bytes: 1024,
+		};
+		let counts = CopyCounts {
+			dirs_not_attempted: 1,
+			files_not_attempted: 2,
+			bytes_not_attempted: 1024,
+			..CopyCounts::default()
+		};
+		let refused = CopyReport::from(CopyFailed {
+			report: copy::CopyReport {
+				totals,
+				counts,
+				..copy::CopyReport::default()
+			},
+			error: Arc::new(Error::custom(ErrorKind::MaxStorageReached, "full")),
+		});
+		assert_eq!((refused.totals, refused.counts), (totals, counts));
+		assert_eq!(
+			refused.error.map(|error| error.kind()),
+			Some(ErrorKind::MaxStorageReached)
+		);
+		let update = CopyUpdate::from(copy::CopyUpdate {
+			phase: CopyPhase::Failed,
+			totals,
+			counts,
+			..update(0)
+		});
+		assert_eq!((update.totals, update.counts), (totals, counts));
 	}
 
 	#[derive(Default)]

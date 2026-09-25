@@ -13,7 +13,7 @@ use filen_sdk_rs::{
 		categories::{DirType, NonRootItemType},
 		copy::{
 			CopyConfig, CopyEvent, CopyFailed, CopyPhase, CopyRequest, CopySource, CopySourceDir,
-			CopyStage, JobControl,
+			CopyStage, JobControl, PlanTotals,
 		},
 		dir::RemoteDirectory,
 		file::{
@@ -882,24 +882,46 @@ async fn max_bytes_is_checked_before_anything_is_written() {
 		.create_dir(&test_dir.into(), "destination")
 		.await
 		.unwrap();
-	let copy_with = |max_bytes: u64| {
+	let copy_with = |max_bytes: u64, recorder: Arc<Recorder>| {
 		client.clone().copy_items(
 			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
 			destination.clone().into(),
 			CopyConfig {
 				max_bytes: Some(max_bytes),
 			},
-			Arc::new(Recorder::default()),
+			recorder,
 			JobControl::default(),
 		)
 	};
 
-	let CopyFailed { error, .. } = copy_with(1023).await.unwrap_err();
+	let recorder = Arc::new(Recorder::default());
+	let CopyFailed { report, error } = copy_with(1023, recorder.clone()).await.unwrap_err();
 	assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
+	let needs = PlanTotals {
+		dirs: 1,
+		files: 2,
+		bytes: 1024,
+	};
+	assert_eq!(report.totals, needs, "the refusal says what the copy needs");
+	assert_eq!(
+		(
+			report.counts.dirs_not_attempted,
+			report.counts.files_not_attempted,
+			report.counts.bytes_not_attempted
+		),
+		(needs.dirs, needs.files, needs.bytes)
+	);
+	let last = recorder.updates.lock().unwrap().last().unwrap().clone();
+	assert_eq!(
+		(last.phase, last.totals, last.counts),
+		(CopyPhase::Failed, needs, report.counts)
+	);
 	let (dirs, files) = contents(&client, &destination).await;
 	assert!(dirs.is_empty() && files.is_empty(), "nothing was written");
 
-	copy_with(1024).await.unwrap();
+	copy_with(1024, Arc::new(Recorder::default()))
+		.await
+		.unwrap();
 	let (_, files) = contents(&client, &destination).await;
 	assert_eq!(files.len(), 2);
 }

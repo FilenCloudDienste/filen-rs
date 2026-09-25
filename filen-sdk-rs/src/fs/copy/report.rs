@@ -686,6 +686,19 @@ impl Reporter {
 	pub(crate) fn finish(&self, phase: CopyPhase) {
 		let now = self.now();
 		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		self.end(&mut state, phase, now);
+	}
+
+	/// The last update of a job that ends before it starts: it carries the `totals` the job
+	/// would have copied, none of them attempted.
+	pub(crate) fn finish_unstarted(&self, phase: CopyPhase, totals: PlanTotals) {
+		let now = self.now();
+		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+		state.totals = totals;
+		self.end(&mut state, phase, now);
+	}
+
+	fn end(&self, state: &mut State, phase: CopyPhase, now: Duration) {
 		state.phase = phase;
 		for file in std::mem::take(&mut state.active) {
 			// normally already settled; a file still running now was never finished
@@ -706,6 +719,6 @@ impl Reporter {
 		state.pause_requested = false;
 		state.paused = false;
 		state.clock.pause(now);
-		self.flush(&mut state, now);
+		self.flush(state, now);
 	}
 }
