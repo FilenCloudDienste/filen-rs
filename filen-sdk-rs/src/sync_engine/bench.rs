@@ -2038,6 +2038,24 @@ struct MemAnswer {
 	/// whose two attribution columns would print `NaN` while every other assertion passed, so it
 	/// fails where the sum is taken instead.
 	structures: (u64, u64, u64),
+	/// The runtime is built before anything else this child holds, so this minus `floor_rss` is
+	/// what a tokio multi-thread runtime costs and nothing else.
+	rss_after_runtime: u64,
+	/// After the client and its cache slot, before any engine exists.
+	rss_after_client: u64,
+	/// After `SyncEngine::open` and the changelist reset — the store's connection, the cache
+	/// worker, and no pair loaded. The gap between this and `pair_loaded_rss` is the tree, the row
+	/// decode that built it, and SQLite's own pages: the three the published table folded into one
+	/// unattributed "fixed cost".
+	rss_after_engine_open: u64,
+	/// The loaded pair's resident tree, TERM BY TERM (`Baseline::resident_terms`), in the order a
+	/// table should print them. Sums to `pair_baseline_computed_bytes`.
+	pair_baseline_terms: Vec<(String, u64)>,
+	/// What a CARRIED side materialized during the measured pass:
+	/// `(whole_calls, whole_rows, subtree_calls, subtree_rows)`. A change-scoped pass exists so as
+	/// not to hold a second copy of the tree, and `whole_rows` is the figure that says whether it
+	/// held one anyway.
+	carried_walks: (u64, u64, u64, u64),
 	/// The resident set at each boundary the engine marked, in order.
 	at_step: Vec<(String, u64)>,
 }
@@ -2084,7 +2102,37 @@ impl MemAnswer {
 				"mem:pair_baseline_computed_bytes".to_owned(),
 				self.pair_baseline_computed_bytes,
 			),
+			(
+				"mem:fresh_process_rss_after_runtime".to_owned(),
+				self.rss_after_runtime,
+			),
+			(
+				"mem:fresh_process_rss_after_client".to_owned(),
+				self.rss_after_client,
+			),
+			(
+				"mem:fresh_process_rss_after_engine_open".to_owned(),
+				self.rss_after_engine_open,
+			),
 		];
+		// Each term under its own name, and `_computed_bytes` like the total they sum to: these are
+		// structures summing their own capacities, not a resident set anyone observed.
+		for (term, bytes) in &self.pair_baseline_terms {
+			out.push((
+				format!("mem:pair_baseline_term_{term}_computed_bytes"),
+				*bytes,
+			));
+		}
+		// COUNTS, under a prefix of their own, because they are not bytes and a `mem:` name would
+		// be printed as though they were.
+		let (whole_calls, whole_rows, subtree_calls, subtree_rows) = self.carried_walks;
+		out.push(("walk:carried_entries_whole_calls".to_owned(), whole_calls));
+		out.push(("walk:carried_entries_whole_rows".to_owned(), whole_rows));
+		out.push((
+			"walk:carried_entries_subtree_calls".to_owned(),
+			subtree_calls,
+		));
+		out.push(("walk:carried_entries_subtree_rows".to_owned(), subtree_rows));
 		let (baseline, view, scan) = self.structures;
 		out.push(("mem:pass_baseline_computed_bytes".to_owned(), baseline));
 		out.push(("mem:pass_view_computed_bytes".to_owned(), view));
@@ -2195,6 +2243,13 @@ fn answer_memory_child(spec: &Path) {
 /// connection the parent never started, and all of it is resident before `pair_loaded_rss` is
 /// sampled. It therefore sits inside `pair_loaded - floor`, the denominator of `pair_attributed`.
 async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
+	// The runtime is already built — this function runs on it — and nothing else is. Every stage
+	// sample below is taken the same way, so the four of them telescope to `pair_loaded_rss`
+	// ARITHMETICALLY. That is all it means: a resident set is not additive across stages — a stage
+	// that frees what it borrowed hands pages back that an earlier sample was charged for — so a
+	// delta between two of them is what the process grew by there, never what that stage costs.
+	// `accounting_table` attributes against the floor for exactly this reason.
+	let rss_after_runtime = probe::current_rss_bytes();
 	let scenario = scenario(&handover.scenario)
 		.unwrap_or_else(|| panic!("no scenario named {:?}", handover.scenario));
 	let client = offline_client();
@@ -2202,6 +2257,7 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		.configure_cache(handover.place.cache_db.clone(), |_| {})
 		.await
 		.expect("configuring the cache slot writes a path and nothing else");
+	let rss_after_client = probe::current_rss_bytes();
 	let engine = SyncEngine::open(client, handover.place.baseline_db.clone())
 		.await
 		.expect("opening an engine on the baseline DB its parent wrote");
@@ -2210,12 +2266,29 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	// every pass a whole read. The parent has no subscription either; it simply never asked for
 	// one. See `bench_reset_changes`.
 	engine.bench_reset_changes(handover.pair).await;
+	// The engine open and no pair loaded: the store's connection, the cache worker and the second
+	// DB connection this child starts. What separates it from `pair_loaded_rss` below is the tree
+	// and the read that built it, which is the term the published table could not name.
+	let rss_after_engine_open = probe::current_rss_bytes();
 	// The pair, loaded and nothing else. Measured BEFORE the pass, because a figure taken after one
 	// is a figure that has held a pass's structures.
-	let (rows, pair_baseline_computed_bytes) = engine
+	let (rows, pair_baseline_computed_bytes, pair_terms) = engine
 		.bench_load_pair(handover.pair)
 		.await
 		.expect("loading the pair's baseline");
+	let pair_baseline_terms: Vec<(String, u64)> = pair_terms
+		.named()
+		.iter()
+		.map(|&(term, bytes)| (term.to_owned(), bytes as u64))
+		.collect();
+	assert_eq!(
+		pair_baseline_terms
+			.iter()
+			.map(|&(_, bytes)| bytes)
+			.sum::<u64>(),
+		pair_baseline_computed_bytes as u64,
+		"the resident tree's terms do not sum to the total published beside them"
+	);
 	assert_eq!(
 		rows, handover.rows,
 		"the child loaded {rows} row(s) where its parent seeded {}: it is not reading the tree the 		 scenario built",
@@ -2256,11 +2329,20 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	// The SAME `one_pass` a timing sample runs, with every one of its assertions: the read kind, the
 	// four plan numbers and the ordered step list. A memory figure for a pass that was not the
 	// scenario's pass is the same lie a timing figure for one would be.
+	// Zeroed HERE, so what comes back describes the measured pass and not the engine's opening.
+	super::side::reset_carried_walks();
 	let log: Arc<Mutex<Vec<(&'static str, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 	let (_, plan, structures) = STEP_RSS
 		.scope(Arc::clone(&log), one_pass(&bed, scenario))
 		.await;
 	let after_pass_rss = probe::current_rss_bytes();
+	let walks = super::side::carried_walks();
+	let carried_walks = (
+		walks.whole_calls,
+		walks.whole_rows,
+		walks.subtree_calls,
+		walks.subtree_rows,
+	);
 	let at_step: Vec<(String, u64)> = log
 		.lock()
 		.unwrap_or_else(PoisonError::into_inner)
@@ -2365,6 +2447,11 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		actions: plan.actions,
 		pair_baseline_computed_bytes: pair_baseline_computed_bytes as u64,
 		structures,
+		rss_after_runtime,
+		rss_after_client,
+		rss_after_engine_open,
+		pair_baseline_terms,
+		carried_walks,
 		at_step,
 	}
 }
@@ -2839,7 +2926,7 @@ fn headline(run: &RunFile) -> String {
 fn unit(metric: &str) -> &'static str {
 	if metric.starts_with("mem:") {
 		"bytes"
-	} else if metric.starts_with("plan:") || metric == "marks" {
+	} else if metric.starts_with("plan:") || metric.starts_with("walk:") || metric == "marks" {
 		"count"
 	} else {
 		"ms"
@@ -2974,6 +3061,166 @@ fn memory_table(run: &RunFile) -> String {
 	out
 }
 
+/// What a process holding a LOADED PAIR is made of, as a table that SUMS to the resident set it
+/// was measured at.
+///
+/// The memory table above prints `floor` and `pair_loaded` and leaves everything between them as
+/// one number nobody had split. At a million rows that number is ~406 MiB, of which the resident
+/// tree computes as ~212 — so about 194 MiB was attributed to nothing at all, and an optimisation
+/// aimed at the tree would have been aimed at less than half the problem.
+///
+/// Every stage column is a DELTA between two stage samples of the same child, so the five of them
+/// add up to the measured `steady_state` — arithmetically, and that is ALL that says. A resident
+/// set is not additive across stages: the row decode hands whole blocks back as it tears down, and
+/// the allocator returns them to the kernel, so `pair_stage` is what the process grew by while
+/// loading the pair and NOT what the pair costs. At a million rows it reads about 7 MiB BELOW the
+/// tree the pair is holding, which is how this was found — after a round had published the
+/// resulting negative remainder as a finding about the engine.
+///
+/// So the attribution is taken against `floor`, the one sample nothing can have been freed after:
+/// `unattributed` is `steady_state - floor - tree_computed`, over the same denominator
+/// [`memory_table`]'s `pair_attributed` divides by, so the two tables cannot print opposite-signed
+/// readings of one fact. It is what a loaded process holds that the tree does not account for:
+/// SQLite's pages, the row decode's retained allocations, the runtime and the client, and whatever
+/// the allocator has not handed back.
+///
+/// The remainder is printed, never folded in. A term nobody can attribute is a term with a size
+/// and a name, which is the only honest thing to publish until something accounts for it. A
+/// remainder below ZERO is a different thing — the tree is live inside the process that was
+/// measured, so there is no reading of it that is about the engine — and it fails the run here
+/// rather than publishing. The run file is already on disk when this renders (`run` rewrites it
+/// after every scenario), so nothing measured is lost.
+fn accounting_table(run: &RunFile) -> String {
+	let mut by: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+	for record in &run.records {
+		if record.metric.starts_with("mem:") || record.metric.starts_with("walk:") {
+			by.entry((record.scenario.clone(), record.metric.clone()))
+				.or_default()
+				.push(value(record));
+		}
+	}
+	if by.is_empty() {
+		return String::new();
+	}
+	let scenarios: BTreeSet<String> = by.keys().map(|(scenario, _)| scenario.clone()).collect();
+	// Whatever terms this run published, rather than a list here that could fall behind
+	// `ResidentTerms::named`.
+	let terms: Vec<String> = by
+		.keys()
+		.filter_map(|(_, metric)| {
+			metric
+				.strip_prefix("mem:pair_baseline_term_")?
+				.strip_suffix("_computed_bytes")
+				.map(str::to_owned)
+		})
+		.collect::<BTreeSet<String>>()
+		.into_iter()
+		.collect();
+	let mut out = String::new();
+	writeln!(
+		out,
+		"# what a process holding the loaded pair is made of (MiB, columns sum to steady_state)"
+	)
+	.expect("writing to a String never fails");
+	writeln!(
+		out,
+		"scenario\tn\tfloor\truntime\tclient\tengine_open\tpair_stage\tsteady_state\t\
+		 tree_computed\tunattributed\tunattributed_pct"
+	)
+	.expect("writing to a String never fails");
+	for name in &scenarios {
+		let med = |metric: &str| -> f64 {
+			by.get(&(name.clone(), metric.to_owned()))
+				.cloned()
+				.map_or(f64::NAN, |mut values| {
+					median(&mut values) / (1024.0 * 1024.0)
+				})
+		};
+		let n = by
+			.get(&(name.clone(), "mem:fresh_process_floor_rss".to_owned()))
+			.map_or(0, Vec::len);
+		let floor = med("mem:fresh_process_floor_rss");
+		let runtime = med("mem:fresh_process_rss_after_runtime");
+		let client = med("mem:fresh_process_rss_after_client");
+		let engine = med("mem:fresh_process_rss_after_engine_open");
+		let loaded = med("mem:fresh_process_pair_loaded_rss");
+		let tree = med("mem:pair_baseline_computed_bytes");
+		// What the process grew by since its floor — the only span here that nothing has been
+		// freed after, and the denominator `memory_table`'s `pair_attributed` already uses.
+		let since_floor = loaded - floor;
+		let unattributed = since_floor - tree;
+		// In every build. A process cannot hold less than the live tree inside it, so a negative
+		// remainder says the measurement has stopped meaning what the column says — which is
+		// exactly what happened, silently, for a whole round.
+		assert!(
+			!since_floor.is_finite() || !tree.is_finite() || unattributed >= 0.0,
+			"{name}: the loaded process grew {since_floor:.3} MiB over its floor while holding a \
+			 tree that computes {tree:.3} MiB"
+		);
+		writeln!(
+			out,
+			"{name}\t{n}\t{floor:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{loaded:.1}\t{tree:.3}\t\
+			 {unattributed:.1}\t{:.1}%",
+			runtime - floor,
+			client - runtime,
+			engine - client,
+			loaded - engine,
+			unattributed / since_floor * 100.0,
+		)
+		.expect("writing to a String never fails");
+	}
+	if !terms.is_empty() {
+		writeln!(out, "# the resident tree, term by term (MiB)")
+			.expect("writing to a String never fails");
+		writeln!(out, "scenario\t{}\ttotal", terms.join("\t"))
+			.expect("writing to a String never fails");
+		for name in &scenarios {
+			write!(out, "{name}").expect("writing to a String never fails");
+			let mut total = 0.0;
+			for term in &terms {
+				let metric = format!("mem:pair_baseline_term_{term}_computed_bytes");
+				let value = by
+					.get(&(name.clone(), metric))
+					.cloned()
+					.map_or(f64::NAN, |mut values| {
+						median(&mut values) / (1024.0 * 1024.0)
+					});
+				total += value;
+				write!(out, "\t{value:.3}").expect("writing to a String never fails");
+			}
+			writeln!(out, "\t{total:.3}").expect("writing to a String never fails");
+		}
+	}
+	writeln!(
+		out,
+		"# what a CARRIED side materialized during the pass (counts; whole_rows > 0 on a scoped \
+		 row means the pass built the whole tree)"
+	)
+	.expect("writing to a String never fails");
+	writeln!(
+		out,
+		"scenario\twhole_calls\twhole_rows\tsubtree_calls\tsubtree_rows"
+	)
+	.expect("writing to a String never fails");
+	for name in &scenarios {
+		let count = |metric: &str| -> f64 {
+			by.get(&(name.clone(), metric.to_owned()))
+				.cloned()
+				.map_or(f64::NAN, |mut values| median(&mut values))
+		};
+		writeln!(
+			out,
+			"{name}\t{:.0}\t{:.0}\t{:.0}\t{:.0}",
+			count("walk:carried_entries_whole_calls"),
+			count("walk:carried_entries_whole_rows"),
+			count("walk:carried_entries_subtree_calls"),
+			count("walk:carried_entries_subtree_rows"),
+		)
+		.expect("writing to a String never fails");
+	}
+	out
+}
+
 /// A human table of one run: median, min and max per metric, so a bimodal sample set is visible
 /// rather than averaged away.
 fn summarize(run: &RunFile) -> String {
@@ -2991,6 +3238,7 @@ fn summarize(run: &RunFile) -> String {
 	.expect("writing to a String never fails");
 	out.push_str(&headline(run));
 	out.push_str(&memory_table(run));
+	out.push_str(&accounting_table(run));
 	writeln!(out, "scenario\tmetric\tunit\tn\tmedian\tmin\tmax")
 		.expect("writing to a String never fails");
 	for ((scenario, _, metric), mut samples) in grouped(run) {
@@ -3279,6 +3527,66 @@ mod tests {
 		);
 	}
 
+	/// One memory child's stage samples, as a run file the accounting table can be asked to render.
+	fn accounting_run(loaded_mib: f64, tree_mib: f64) -> RunFile {
+		let mib = |value: f64| (value * 1024.0 * 1024.0) as u64;
+		let record = |metric: &str, bytes: u64| Record {
+			scenario: "twoway_idle_1m".to_owned(),
+			scenario_version: 1,
+			definition_hash: 7,
+			sample: Some(0),
+			metric: metric.to_owned(),
+			ms: 0.0,
+			// BYTES, as every `mem:` metric is: a memory figure read off `ms` is a table of zeroes.
+			count: Some(bytes),
+			nodes: 1_065_236,
+			fixture_hash: 9,
+			reps: 1,
+		};
+		RunFile {
+			harness_version: HARNESS_VERSION,
+			started: "2026-01-01T00:00:00Z".to_owned(),
+			commit: "abcdef123456".to_owned(),
+			toolchain: "nightly".to_owned(),
+			machine: "here macos/aarch64".to_owned(),
+			profile: "debug_assertions".to_owned(),
+			allocator: "system".to_owned(),
+			mark_overhead_ns: 25.0,
+			records: vec![
+				record("mem:fresh_process_floor_rss", mib(6.8)),
+				record("mem:fresh_process_rss_after_runtime", mib(7.9)),
+				record("mem:fresh_process_rss_after_client", mib(9.5)),
+				record("mem:fresh_process_rss_after_engine_open", mib(16.0)),
+				record("mem:fresh_process_pair_loaded_rss", mib(loaded_mib)),
+				record("mem:pair_baseline_computed_bytes", mib(tree_mib)),
+			],
+		}
+	}
+
+	/// A process that holds less than the live tree inside it fails the run.
+	///
+	/// The table published `-7.0 MiB` unattributed at a million rows for a whole round, under a
+	/// column headed "what the pair holds that the tree does not account for", and a later round
+	/// built a mechanism on the drop it appeared in. Nothing objected, because the remainder was
+	/// taken from a stage delta rather than from a span a resident set can be read across.
+	#[test]
+	#[should_panic(expected = "while holding a tree that computes")]
+	fn an_impossible_accounting_row_fails_the_run() {
+		// The shape of the 1M row as it was published: a steady state below floor + tree.
+		let _ = accounting_table(&accounting_run(130.0, 128.743));
+	}
+
+	/// And the row that IS possible still renders — the real 1M figures clear the check by ~2 MiB,
+	/// so an assertion one step tighter would fail every million-row run instead of publishing one.
+	#[test]
+	fn a_possible_accounting_row_publishes() {
+		let table = accounting_table(&accounting_run(137.64, 128.743));
+		assert!(
+			table.contains("twoway_idle_1m"),
+			"the accounting table skipped the only scenario in the run: {table}"
+		);
+	}
+
 	/// The step table closes: the steps and the remainder sum to the total the caller timed.
 	#[test]
 	fn a_step_table_accounts_for_the_whole_pass() {
@@ -3455,23 +3763,39 @@ mod tests {
 			// other metric has, and the assertion below can refuse it by arithmetic rather than by
 			// name.
 			structures: (100, 20, 3),
+			rss_after_runtime: 1,
+			rss_after_client: 1,
+			rss_after_engine_open: 1,
+			pair_baseline_terms: vec![("nodes".to_owned(), 60), ("names".to_owned(), 40)],
+			carried_walks: (7, 8, 9, 11),
 			at_step: vec![("from_baseline".to_owned(), 4)],
 		};
 		let names: Vec<String> = answer.metrics().into_iter().map(|(name, _)| name).collect();
 		for name in &names {
-			let tail = name
-				.strip_prefix("mem:")
-				.unwrap_or_else(|| panic!("{name} is not marked as a memory metric"));
-			assert!(
-				tail.starts_with("fresh_process_") || tail.ends_with("_computed_bytes"),
-				"{name} says neither whose process it measured nor that it was computed rather \
-				 than observed"
-			);
-			assert_eq!(
-				unit(name),
-				"bytes",
-				"{name} would be printed in the wrong unit"
-			);
+			// A child publishes two kinds of figure. A `mem:` one is BYTES and must say whose
+			// process it measured or that it was computed; a `walk:` one is a COUNT of what a
+			// carried side materialized, and printing it in mebibytes is the same misreading under
+			// a different name.
+			if let Some(tail) = name.strip_prefix("mem:") {
+				assert!(
+					tail.starts_with("fresh_process_") || tail.ends_with("_computed_bytes"),
+					"{name} says neither whose process it measured nor that it was computed rather \
+					 than observed"
+				);
+				assert_eq!(
+					unit(name),
+					"bytes",
+					"{name} would be printed in the wrong unit"
+				);
+			} else if name.starts_with("walk:") {
+				assert_eq!(
+					unit(name),
+					"count",
+					"{name} counts walks and would be printed as bytes"
+				);
+			} else {
+				panic!("{name} is marked as neither a memory figure nor a walk count");
+			}
 		}
 		// The SIDES, and no total with the pair's baseline folded into it. That sum shipped once,
 		// as `mem:pass_structures_computed_bytes`: at ten thousand rows it was 98 % the baseline —
@@ -3590,6 +3914,7 @@ mod tests {
 		assert_eq!(unit("plan:actions"), "count");
 		assert_eq!(unit("marks"), "count");
 		assert_eq!(unit("mem:fresh_process_peak_rss"), "bytes");
+		assert_eq!(unit("walk:carried_entries_whole_rows"), "count");
 		// A count reads back as its count rather than as the zero sitting in its `ms` column, which
 		// is what left `plan:*` — and would have left every memory figure — invisible to a diff.
 		let record = Record {
