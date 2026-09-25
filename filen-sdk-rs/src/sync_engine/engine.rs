@@ -23,7 +23,7 @@ use super::{
 	apply::{self, ApplyContext, SyncReport},
 	baseline::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
-		PathFailure, PendingRow,
+		PathFailure, PendingRow, SyncedPaths,
 	},
 	changes::{FullPassReason, PairChanges, PassScope, RemoteDeltaEntry},
 	derive::{self, Derived},
@@ -40,7 +40,7 @@ use super::{
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
-	remote::{RemoteObserved, cache_ancestry, observe_remote},
+	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	side::{Nodes, NodesAt, Side},
 	tree::Baseline,
@@ -1375,7 +1375,7 @@ impl SyncEngine {
 	/// and what it leaves behind is the resident copy an idle engine sits on between passes.
 	///
 	/// The terms come back BESIDE the total rather than instead of it: the total is what every
-	/// published figure has always been, and the split is what says which of eleven structures to
+	/// published figure has always been, and the split is what says which of nine structures to
 	/// go after. A hand estimate of the parts reached only ~175 MiB of the 211.6 measured at a
 	/// million rows, so the split was not known.
 	pub(super) async fn bench_load_pair(
@@ -3285,9 +3285,19 @@ impl SyncEngine {
 		let nodes = mem::take(&mut derived.remote);
 		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
 		// pass cut short hands it to the next one (see `Prepared::remote_delta`).
+		let pair_store = Arc::clone(&inputs.store);
 		let (observed, delta) = tokio::task::spawn_blocking(move || {
 			let mut ancestry = |uuid| cache_ancestry(&cache_db, uuid);
-			let observed = observe_remote(root, &for_remote, nodes, &delta, &mut ancestry);
+			// Where the baseline records every item this delta can name, resolved off the store's
+			// `(pair_id, remote_uuid)` index in ONE hold of the pair's lock, on the blocking thread
+			// the derivation already runs on. The resident `Uuid -> row` map this replaces cost
+			// 36.75 MiB at a million rows and answered exactly these lookups; an empty delta names
+			// no id and runs no statement at all, which is the idle pass's shape.
+			let observed = locked(&pair_store)
+				.synced_paths(pair, &delta_uuids(&delta), &[])
+				.map(|placed| {
+					observe_remote(root, &for_remote, nodes, &delta, placed, &mut ancestry)
+				});
 			(observed, delta)
 		})
 		.await
@@ -3297,6 +3307,8 @@ impl SyncEngine {
 				format!("deriving the remote view panicked: {e}"),
 			)
 		})?;
+		let observed =
+			observed.map_err(|e| db_error(e, "resolving where the delta's items are recorded"))?;
 		let mut observation = match observed {
 			RemoteObserved::Applied(observation) => *observation,
 			RemoteObserved::Full(reason) => return Ok(Scoped::Whole(Box::new(inputs), reason)),
@@ -3466,7 +3478,24 @@ impl SyncEngine {
 		// The facts: the remote half pruned at the paths the delta touched, the local half at the
 		// paths this pass observed, each replaced by what that evidence says now.
 		let mut facts = carried.facts;
-		facts.merge_remote_view(&observation.touched, &view, &inputs.baseline);
+		// A derived view SKIPS nothing (`skipped` is empty by construction above), so
+		// `unknown_remote_paths` returns before it looks anything up and there is nothing to
+		// resolve for it. Asserted in EVERY build rather than left to the comment: a skipped item
+		// arriving here would be looked up in an empty `SyncedPaths`, which answers "no row records
+		// this" for an item whose row is right there — and that answer plans a local delete over a
+		// remote item that still exists.
+		assert!(
+			view.skipped.is_empty(),
+			"a change-scoped view skipped {} remote item(s), with nothing resolved to match them \
+			 against the rows that record them",
+			view.skipped.len()
+		);
+		facts.merge_remote_view(
+			&observation.touched,
+			&view,
+			&inputs.baseline,
+			&SyncedPaths::default(),
+		);
 		facts.observe_local(&observations);
 		super::step("facts_merge");
 
@@ -3821,7 +3850,27 @@ impl SyncEngine {
 		}
 		// The remote half, also whole: `[""]` clears every carried remote fact, and the merge runs
 		// the `unknown_remote_paths` read itself over what this view skipped.
-		facts.merge_remote_view(&BTreeSet::from([String::new()]), &remote_view, &baseline);
+		//
+		// A skipped item has to be matched against the row that records it, or its absence from the
+		// view reads as a deletion of a path whose item is still there. The ids come off the
+		// store's own indexes now; a view that skipped nothing — the usual shape, and the only one
+		// a derived view can have — resolves nothing and runs no statement.
+		let (skipped_uuids, skipped_lineages) = plan::skipped_ids(&remote_view.skipped);
+		let synced = if skipped_uuids.is_empty() && skipped_lineages.is_empty() {
+			SyncedPaths::default()
+		} else {
+			off_store(&store, move |store| {
+				store.synced_paths(pair, &skipped_uuids, &skipped_lineages)
+			})
+			.await?
+			.map_err(|e| db_error(e, "resolving where the skipped remote items are recorded"))?
+		};
+		facts.merge_remote_view(
+			&BTreeSet::from([String::new()]),
+			&remote_view,
+			&baseline,
+			&synced,
+		);
 
 		// Correct the view with what this engine wrote and the cache has not shown yet, BEFORE
 		// anything reconciles or detects moves against it.
@@ -5765,7 +5814,9 @@ mod tests {
 			"the guard alone lets that one delete through"
 		);
 
-		let (unknown, never_synced) = plan::unknown_remote_paths(&tree(&baseline), &view.skipped);
+		let rows = tree(&baseline);
+		let (unknown, never_synced) =
+			plan::unknown_remote_paths(&synced_for(&rows, &view.skipped), &view.skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([("doc.txt".to_string(), UnsyncableReason::RemoteUndecodable)])
@@ -5812,8 +5863,10 @@ mod tests {
 		failures: HashMap<String, PathFailure>,
 	) -> Prepared {
 		let baseline = Baseline::from_rows(baseline.into_values());
-		let (unknown_remote, never_synced_remote) =
-			plan::unknown_remote_paths(&baseline, &remote_view.skipped);
+		let (unknown_remote, never_synced_remote) = plan::unknown_remote_paths(
+			&synced_for(&baseline, &remote_view.skipped),
+			&remote_view.skipped,
+		);
 		Prepared {
 			read: PassRead::Whole(Some(FullPassReason::SafetyNet)),
 			remote_delta: Vec::new(),
@@ -10586,6 +10639,12 @@ mod tests {
 	}
 
 	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
+	/// Where the rows record each skipped item, as the engine resolves it off the store.
+	fn synced_for(baseline: &Baseline, skipped: &[plan::SkippedRemote]) -> SyncedPaths {
+		let (uuids, lineages) = plan::skipped_ids(skipped);
+		baseline.synced_paths(&uuids, &lineages)
+	}
+
 	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 		Baseline::from_rows(rows.values().cloned())
 	}

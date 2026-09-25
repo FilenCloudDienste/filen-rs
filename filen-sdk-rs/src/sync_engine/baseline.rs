@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 /// walk of every row of the pair — a walk that runs under the pair's store mutex.
 const ADDITIVE_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS baseline_state ON baseline (pair_id, state);
+CREATE INDEX IF NOT EXISTS baseline_remote_uuid ON baseline (pair_id, remote_uuid);
+CREATE INDEX IF NOT EXISTS baseline_remote_stable_uuid ON baseline (pair_id, remote_stable_uuid);
 ";
 
 const ENTRY_COLUMNS: &str = "rel_path, kind, remote_uuid, content_hash, size, local_mtime,
@@ -162,6 +164,21 @@ const UPSERT_ENTRY: &str = "INSERT OR REPLACE INTO baseline
 	  remote_stable_uuid, agreed_hash)
 	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
 const DELETE_ENTRY: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
+
+/// The id seek [`BaselineStore::synced_paths`] runs against `column`: one `IN` list of exactly
+/// [`SYNCED_CHUNK`] placeholders, so the text is the same on every call and `prepare_cached` plans
+/// it once. Two texts exist, one per indexed column, and building either is a handful of pushes
+/// against the two statements a pass runs at most.
+fn synced_by(column: &str) -> String {
+	let binds = (2..=SYNCED_CHUNK + 1)
+		.map(|at| format!("?{at}"))
+		.collect::<Vec<_>>()
+		.join(", ");
+	format!(
+		"SELECT rel_path, remote_uuid, remote_stable_uuid FROM baseline
+		 WHERE pair_id = ?1 AND {column} IN ({binds})"
+	)
+}
 
 /// The two statements a directory move runs, in this order: the row AT `?2`, then every row under
 /// it, each swapping that prefix for `?3` over the same bytewise ranges the deletes above use.
@@ -429,6 +446,117 @@ pub struct PairRecord {
 
 /// A registered pair's id, handed back by [`SyncEngine::add_pair`](super::SyncEngine::add_pair).
 pub type PairId = i64;
+
+/// Where the baseline records each of the remote items a pass is about to ask about.
+///
+/// This replaces two resident `HashMap`s the tree used to carry for the life of a pair — one
+/// `Uuid -> row`, one `StableUuid -> row` — which at a million rows cost 73.5 MiB, a third of the
+/// whole resident tree, to answer a handful of point lookups per pass. The same question is now a
+/// seek of the store's own `(pair_id, remote_uuid)` index, asked ONCE for every id the pass can
+/// name before it reads either side (see [`BaselineStore::synced_paths`]).
+///
+/// It distinguishes "asked, and no row records it" from "never asked": a pass that looked up an id
+/// it did not resolve would read the answer as an absence, and an absence this side did not observe
+/// is the one thing a change-scoped pass must never invent. So an unasked id is a BUG, and
+/// [`path_by_uuid`](Self::path_by_uuid) says so rather than answering `None` quietly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SyncedPaths {
+	by_uuid: HashMap<Uuid, Option<String>>,
+	by_lineage: HashMap<StableUuid, Option<String>>,
+}
+
+impl SyncedPaths {
+	/// The set of ids to resolve, every one of them still unanswered.
+	pub(crate) fn asking(uuids: &[Uuid], lineages: &[StableUuid]) -> Self {
+		Self {
+			by_uuid: uuids.iter().map(|&uuid| (uuid, None)).collect(),
+			by_lineage: lineages.iter().map(|&id| (id, None)).collect(),
+		}
+	}
+
+	/// Record one row against whichever of the asked ids it carries.
+	///
+	/// The lexicographically first path wins where two rows claim one id. The store constrains
+	/// neither id and no writer produces a duplicate — a move commits the delete of its source and
+	/// the insert of its destination together — so a second claim is a bug and is logged. What it
+	/// is NOT is the old map's behaviour: that was last-writer-wins over the load order, which
+	/// could leave the id answering for whichever row happened to be rewritten last, or for
+	/// nothing at all once that row lost the id. A seek finds every claimant, so this picks one
+	/// deterministically instead.
+	pub(crate) fn offer(
+		&mut self,
+		rel_path: &str,
+		uuid: Option<Uuid>,
+		lineage: Option<StableUuid>,
+	) {
+		if let Some(uuid) = uuid
+			&& let Some(slot) = self.by_uuid.get_mut(&uuid)
+		{
+			keep_first(slot, rel_path, &format!("remote uuid {uuid}"));
+		}
+		if let Some(lineage) = lineage
+			&& let Some(slot) = self.by_lineage.get_mut(&lineage)
+		{
+			keep_first(slot, rel_path, "a whole-life id");
+		}
+	}
+
+	/// Where the row recording `uuid` sits, of the ids this was asked to resolve.
+	pub(crate) fn path_by_uuid(&self, uuid: Uuid) -> Option<String> {
+		self.answer(self.by_uuid.get(&uuid), &uuid)
+	}
+
+	/// Where the row recording the file with this whole-life id sits.
+	pub(crate) fn path_by_lineage(&self, lineage: StableUuid) -> Option<String> {
+		self.answer(self.by_lineage.get(&lineage), &lineage)
+	}
+
+	/// One resolved slot as an answer — and a loud refusal for an id nobody resolved.
+	///
+	/// `debug_assert` so the test suite fails outright on an enumeration that missed an id, and a
+	/// logged error in release, where answering `None` silently is what would turn the gap into a
+	/// fabricated absence.
+	fn answer(&self, slot: Option<&Option<String>>, id: &dyn std::fmt::Display) -> Option<String> {
+		match slot {
+			Some(found) => found.clone(),
+			None => {
+				debug_assert!(
+					false,
+					"the baseline was asked where {id} sits without that id having been resolved"
+				);
+				tracing::error!(
+					"baseline: asked where {id} sits, but that id was never resolved for this \
+					 pass; answering that nothing records it"
+				);
+				None
+			}
+		}
+	}
+}
+
+/// Keep the lexicographically first of two paths claiming one id, saying so when there are two.
+fn keep_first(slot: &mut Option<String>, rel_path: &str, what: &str) {
+	match slot {
+		None => *slot = Some(rel_path.to_owned()),
+		Some(held) => {
+			tracing::error!(
+				"baseline: {rel_path:?} and {held:?} both record {what}; answering with the first \
+				 of the two by path"
+			);
+			if rel_path < held.as_str() {
+				*held = rel_path.to_owned();
+			}
+		}
+	}
+}
+
+/// How many ids one [`BaselineStore::synced_paths`] statement binds.
+///
+/// Fixed so the statement TEXT is fixed, which is what lets it go through `prepare_cached`: a
+/// per-call `IN` list of the exact length would be a fresh parse and plan every time. The last
+/// chunk is padded by repeating an id it already holds, which matches the same rows and costs one
+/// extra seek rather than a second statement shape.
+const SYNCED_CHUNK: usize = 64;
 
 /// The baseline DB handle (sole owner / single writer).
 pub(crate) struct BaselineStore {
@@ -1004,6 +1132,69 @@ impl BaselineStore {
 			))?
 			.query_map(params![pair], Self::row_to_entry)?
 			.collect()
+	}
+
+	/// Where `pair` records each of `uuids` and `lineages` — the point lookups the resident tree
+	/// used to answer from two `HashMap`s of its own (see [`SyncedPaths`]).
+	///
+	/// Index seeks, not a scan: `ADDITIVE_SCHEMA` carries `(pair_id, remote_uuid)` and
+	/// `(pair_id, remote_stable_uuid)` for exactly this. The ids are deduplicated first, which is
+	/// most of the work on a real delta — a directory holding a hundred changed children names one
+	/// parent a hundred times — and then bound [`SYNCED_CHUNK`] at a time.
+	///
+	/// An empty ask runs no statement at all, which is the idle pass's shape.
+	pub(crate) fn synced_paths(
+		&self,
+		pair: PairId,
+		uuids: &[Uuid],
+		lineages: &[StableUuid],
+	) -> rusqlite::Result<SyncedPaths> {
+		let mut out = SyncedPaths::asking(uuids, lineages);
+		let uuids: Vec<Uuid> = out.by_uuid.keys().copied().collect();
+		let lineages: Vec<StableUuid> = out.by_lineage.keys().copied().collect();
+		self.seek_ids(pair, &uuids, &synced_by("remote_uuid"), &mut out)?;
+		self.seek_ids(pair, &lineages, &synced_by("remote_stable_uuid"), &mut out)?;
+		Ok(out)
+	}
+
+	/// Run `statement` over `ids`, [`SYNCED_CHUNK`] at a time, offering every row it finds.
+	fn seek_ids<T>(
+		&self,
+		pair: PairId,
+		ids: &[T],
+		statement: &str,
+		out: &mut SyncedPaths,
+	) -> rusqlite::Result<()>
+	where
+		T: rusqlite::ToSql + Copy,
+	{
+		if ids.is_empty() {
+			return Ok(());
+		}
+		let mut prepared = self.conn.prepare_cached(statement)?;
+		for chunk in ids.chunks(SYNCED_CHUNK) {
+			let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(SYNCED_CHUNK + 1);
+			bound.push(&pair);
+			for id in chunk {
+				bound.push(id);
+			}
+			// The pad repeats a member of this chunk, so it matches rows the chunk already matches
+			// and the statement keeps one shape. `chunk` is never empty.
+			let pad = &chunk[0];
+			for _ in chunk.len()..SYNCED_CHUNK {
+				bound.push(pad);
+			}
+			let mut rows = prepared.query(bound.as_slice())?;
+			while let Some(row) = rows.next()? {
+				let rel_path: String = row.get("rel_path")?;
+				out.offer(
+					&rel_path,
+					row.get("remote_uuid")?,
+					row.get("remote_stable_uuid")?,
+				);
+			}
+		}
+		Ok(())
 	}
 
 	/// `pair`'s rows as the resident [`Baseline`] tree, read from the DB on the first call and kept
@@ -2613,6 +2804,110 @@ mod tests {
 		);
 	}
 
+	/// A row with a CHOSEN uuid and whole-life id, so a lookup can be aimed at it.
+	fn identified(rel_path: &str, uuid: Uuid) -> BaselineEntry {
+		BaselineEntry {
+			remote_uuid: Some(uuid),
+			remote_stable_uuid: Some(StableUuid::new_for_test(uuid)),
+			..file_entry(rel_path, [7u8; 32], 3)
+		}
+	}
+
+	/// The id lookup answers off the store's own indexes, for both columns, for more ids than one
+	/// statement binds, and for this pair only.
+	///
+	/// Past [`SYNCED_CHUNK`] on purpose: the statement is a fixed-width `IN` list whose last chunk
+	/// is padded by repeating one of its own members, so a padding bug either loses the tail or
+	/// answers for a row nobody asked about. The pair filter matters just as much — an id is unique
+	/// to the server, not to a pair's rows, and a stranger's row answering here would place an item
+	/// at a path in a tree it has nothing to do with.
+	#[test]
+	fn synced_paths_answers_by_uuid_and_lineage_past_one_chunk() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let (other, _) = store
+			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let ids: Vec<Uuid> = (0..SYNCED_CHUNK + 5)
+			.map(|n| Uuid::from_u128(n as u128 + 1))
+			.collect();
+		for (n, &uuid) in ids.iter().enumerate() {
+			store
+				.upsert_entry(pair, &identified(&format!("f{n}.txt"), uuid))
+				.unwrap();
+		}
+		let stranger = Uuid::from_u128(9_000);
+		store
+			.upsert_entry(other, &identified("elsewhere.txt", stranger))
+			.unwrap();
+
+		let lineages: Vec<StableUuid> = ids.iter().copied().map(StableUuid::new_for_test).collect();
+		let mut asked = ids.clone();
+		asked.push(stranger);
+		let found = store.synced_paths(pair, &asked, &lineages).unwrap();
+
+		for (n, &uuid) in ids.iter().enumerate() {
+			let want = format!("f{n}.txt");
+			assert_eq!(found.path_by_uuid(uuid).as_deref(), Some(want.as_str()));
+			assert_eq!(
+				found
+					.path_by_lineage(StableUuid::new_for_test(uuid))
+					.as_deref(),
+				Some(want.as_str())
+			);
+		}
+		assert_eq!(
+			found.path_by_uuid(stranger),
+			None,
+			"another pair's row must answer for nothing here"
+		);
+	}
+
+	/// Two rows claiming one uuid: the seek finds BOTH and answers with the first by path.
+	///
+	/// This is a deliberate change from the resident map it replaces. That map was
+	/// last-writer-wins over the load order, so the id answered for whichever row was rewritten
+	/// last — and answered `None` as soon as that row lost the id, even though another row still
+	/// carried it. `None` is the dangerous answer here: `unknown_remote_paths` reads it as an item
+	/// that was never synced, which drops the protection that keeps a pass from deleting the local
+	/// copy of a remote item that is still there. Deterministic, and never absent while some row
+	/// carries the id, is what this pins.
+	#[test]
+	fn two_rows_claiming_one_uuid_answer_with_the_first_by_path() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let shared = Uuid::from_u128(77);
+		store
+			.upsert_entry(pair, &identified("b.txt", shared))
+			.unwrap();
+		store
+			.upsert_entry(pair, &identified("a.txt", shared))
+			.unwrap();
+
+		let found = store.synced_paths(pair, &[shared], &[]).unwrap();
+		assert_eq!(
+			found.path_by_uuid(shared).as_deref(),
+			Some("a.txt"),
+			"of two claimants the first by path answers, rather than neither"
+		);
+	}
+
+	/// An id nobody resolved is a BUG, not an absence.
+	///
+	/// The whole safety of resolving ids up front rests on the enumeration being exhaustive
+	/// (`remote::delta_uuids`, `plan::skipped_ids`). An id that slipped through it would otherwise
+	/// read as "no row records this", and on the remote side that is a move whose source is never
+	/// vacated — the item left sitting at two paths in a view the pass then plans against.
+	#[test]
+	#[should_panic(expected = "without that id having been resolved")]
+	fn asking_where_an_unresolved_id_sits_is_refused() {
+		let _ = SyncedPaths::default().path_by_uuid(Uuid::from_u128(1));
+	}
+
 	#[test]
 	fn delete_subtrees_takes_each_root_and_everything_under_it_only() {
 		let store = BaselineStore::open_in_memory().unwrap();
@@ -2718,11 +3013,15 @@ mod tests {
 			!walked.iter().any(|step| step.contains("baseline_state")),
 			"the control plan must not name an index that is gone: {walked:?}"
 		);
+		// Without it the read is a walk of every row the pair holds, whichever index carries it
+		// there. The primary key is no longer the only candidate: `baseline_remote_uuid` and
+		// `baseline_remote_stable_uuid` are `(pair_id, ...)` indexes too, so the planner may seek
+		// one of THEM on `pair_id` alone and filter the state out of the rows it finds — the same
+		// row count the primary-key walk had, and the cost `baseline_state` exists to remove. What
+		// must not survive is a seek that narrows by state.
 		assert!(
-			walked
-				.iter()
-				.any(|step| step.contains("sqlite_autoindex_baseline_1")),
-			"without it the read walks the pair's rows on the primary key: {walked:?}"
+			walked.iter().any(|step| step.contains("(pair_id=?)")),
+			"without it the read walks the pair's rows on pair_id alone: {walked:?}"
 		);
 	}
 

@@ -10,8 +10,14 @@
 //! What that buys, besides the bytes: the questions a pass asks about a SUBTREE stop being scans of
 //! every row. "Is anything at or under this path, under any spelling" ([`Baseline::occupied`]),
 //! "does the baseline still track anything here" ([`Baseline::tracked`]), "is every row under this
-//! directory synced" ([`Baseline::subtree_all_synced`]) and "where is the row with this uuid"
-//! ([`Baseline::path_by_uuid`]) are all answered from the node's own children or from an index.
+//! directory synced" ([`Baseline::subtree_all_synced`]) are all answered from the node's own
+//! children or from an index.
+//!
+//! "Where is the row with this uuid" is NOT one of them any more. It used to be a resident
+//! `HashMap` per id — 73.5 MiB of the 211.6 a million-row pair cost, to answer a handful of point
+//! lookups per pass — and it is now a seek of the store's own index
+//! ([`BaselineStore::synced_paths`](super::baseline::BaselineStore::synced_paths)), resolved for
+//! the items a pass names before it reads either side.
 //!
 //! # Siblings are ordered by their FOLDED name, folded on the fly
 //!
@@ -224,8 +230,6 @@ pub(super) struct Baseline {
 	free: Vec<NodeId>,
 	/// Each directory's children, sorted by [`sibling_cmp`]. A node with no entry here has none.
 	children: HashMap<NodeId, Vec<NodeId>>,
-	by_uuid: HashMap<Uuid, NodeId>,
-	by_lineage: HashMap<StableUuid, NodeId>,
 	/// Conflicted rows only.
 	side: HashMap<NodeId, ConflictSides>,
 	/// Rows whose `agreed_hash` is NOT their `content_hash` — the shape an unconfirmed push leaves
@@ -252,6 +256,12 @@ pub(super) struct Baseline {
 	rule_files: HashSet<NodeId>,
 	/// How many nodes are rows (see [`PRESENT`]).
 	rows: usize,
+	/// How many of those rows record a remote item — a `remote_uuid` on record.
+	///
+	/// A COUNT, where a `HashMap<Uuid, NodeId>` used to stand: the only whole-set question that map
+	/// answered is [`has_remote_rows`](Self::has_remote_rows), and answering it needs how many
+	/// rather than which. The per-item lookups it also served are the store's now.
+	remote_rows: usize,
 }
 
 impl Default for Baseline {
@@ -260,13 +270,12 @@ impl Default for Baseline {
 			nodes: vec![Node::empty(NodeId::ROOT, "")],
 			free: Vec::new(),
 			children: HashMap::new(),
-			by_uuid: HashMap::new(),
-			by_lineage: HashMap::new(),
 			side: HashMap::new(),
 			agreed: HashMap::new(),
 			uncarryable: HashSet::new(),
 			rule_files: HashSet::new(),
 			rows: 0,
+			remote_rows: 0,
 		}
 	}
 }
@@ -290,8 +299,6 @@ pub(super) struct ResidentTerms {
 	pub(super) children_vecs: usize,
 	/// The table those vectors are filed in, which is a separate cost from the vectors.
 	pub(super) children_table: usize,
-	pub(super) by_uuid: usize,
-	pub(super) by_lineage: usize,
 	/// Conflicted rows only, so empty on a converged pair.
 	pub(super) side: usize,
 	/// Unconfirmed pushes only, so empty on a converged pair.
@@ -308,15 +315,13 @@ impl ResidentTerms {
 	/// added to the struct and forgotten here would be missing from the total as well — which the
 	/// accounting would show as a remainder rather than hide, and which
 	/// `every_resident_term_is_named` fails on outright.
-	pub(super) fn named(&self) -> [(&'static str, usize); 11] {
+	pub(super) fn named(&self) -> [(&'static str, usize); 9] {
 		[
 			("nodes", self.nodes),
 			("names", self.names),
 			("free", self.free),
 			("children_vecs", self.children_vecs),
 			("children_table", self.children_table),
-			("by_uuid", self.by_uuid),
-			("by_lineage", self.by_lineage),
 			("side", self.side),
 			("agreed", self.agreed),
 			("uncarryable", self.uncarryable),
@@ -358,8 +363,6 @@ impl Baseline {
 	/// room back only means taking it again.
 	pub(super) fn shrink_after_load(&mut self) {
 		self.nodes.shrink_to_fit();
-		self.by_uuid.shrink_to_fit();
-		self.by_lineage.shrink_to_fit();
 		self.side.shrink_to_fit();
 		self.agreed.shrink_to_fit();
 		self.uncarryable.shrink_to_fit();
@@ -556,17 +559,28 @@ impl Baseline {
 	/// Whether any row records a remote item: what tells a remote view that came back empty apart
 	/// from a pair that never had anything on the remote.
 	pub(super) fn has_remote_rows(&self) -> bool {
-		!self.by_uuid.is_empty()
+		self.remote_rows > 0
 	}
 
-	/// Where the row recording `uuid` sits.
-	pub(super) fn path_by_uuid(&self, uuid: Uuid) -> Option<String> {
-		self.by_uuid.get(&uuid).map(|&id| self.path_of(id))
-	}
-
-	/// Where the row recording the file with this whole-life id sits.
-	pub(super) fn path_by_lineage(&self, lineage: StableUuid) -> Option<String> {
-		self.by_lineage.get(&lineage).map(|&id| self.path_of(id))
+	/// Where this tree records each of `uuids` and `lineages`, found by ONE walk of every row.
+	///
+	/// The test and probe stand-in for
+	/// [`BaselineStore::synced_paths`](super::baseline::BaselineStore::synced_paths), which answers
+	/// the same question off the DB's `(pair_id, remote_uuid)` index. No pass calls this: it is
+	/// O(tree) by construction, which is the cost that moving the two resident uuid maps into SQL
+	/// was about. Same tie-break as the store's — the lexicographically first path wins — so a
+	/// baseline the tests build and one the store holds answer a duplicated id identically.
+	#[cfg(test)]
+	pub(super) fn synced_paths(
+		&self,
+		uuids: &[Uuid],
+		lineages: &[StableUuid],
+	) -> super::baseline::SyncedPaths {
+		let mut out = super::baseline::SyncedPaths::asking(uuids, lineages);
+		self.visit_rows(|row| {
+			out.offer(&row.rel_path, row.remote_uuid, row.remote_stable_uuid);
+		});
+		out
 	}
 
 	/// Whether a row sits at `rel_path` under ANY spelling, or anywhere under it — the question the
@@ -740,7 +754,7 @@ impl Baseline {
 	/// Same convention, same arithmetic — `resident_bytes` is this summed, so a reader cannot come
 	/// to disagree with the total it is set against. It exists because the sum alone cannot be
 	/// acted on: "the resident tree is 211.6 MiB at a million rows" says nothing about which of
-	/// eleven structures to go after, and a hand estimate of the parts reached only ~175 of that
+	/// nine structures to go after, and a hand estimate of the parts reached only ~175 of that
 	/// figure — so the split was not known, and guessing at it is how three rounds of this effort
 	/// came to optimise the wrong structure.
 	#[cfg(feature = "bench-internals")]
@@ -762,8 +776,6 @@ impl Baseline {
 				.map(|kids| heap(kids.capacity() * size_of::<NodeId>()))
 				.sum(),
 			children_table: table::<NodeId, Vec<NodeId>>(self.children.capacity()),
-			by_uuid: table::<Uuid, NodeId>(self.by_uuid.capacity()),
-			by_lineage: table::<StableUuid, NodeId>(self.by_lineage.capacity()),
 			side: table::<NodeId, ConflictSides>(self.side.capacity()),
 			agreed: table::<NodeId, Option<Blake3Hash>>(self.agreed.capacity()),
 			uncarryable: table::<NodeId, ()>(self.uncarryable.capacity()),
@@ -837,6 +849,9 @@ impl Baseline {
 		}
 		let id = self.ensure(&entry.rel_path);
 		self.clear_indexes(id);
+		// Read before the node is overwritten: what this row recorded a moment ago is what says
+		// whether `remote_rows` moves.
+		let had_remote_uuid = self.nodes[id.index()].has(HAS_REMOTE_UUID);
 		let node = &mut self.nodes[id.index()];
 		if !node.has(PRESENT) {
 			self.rows += 1;
@@ -866,31 +881,20 @@ impl Baseline {
 			node.remote_modified = modified;
 		}
 		node.flags = flags;
-		// Each index answers for ONE row. The store constrains neither id, and a second row
-		// claiming one leaves the first answering nothing as soon as the claimant is rewritten —
-		// where the per-pass map these replaced would still have found it, and a path whose
-		// deletion should have been withheld would not be. No writer produces that (a move deletes
-		// the old row before it writes the new one), so a displaced claim is a bug, and `insert`
-		// hands the previous one back anyway — saying so costs nothing.
-		if let Some(uuid) = entry.remote_uuid
-			&& let Some(prior) = self.by_uuid.insert(uuid, id)
-			&& prior != id
-		{
-			tracing::error!(
-				"baseline: {:?} claims remote uuid {uuid}, recorded at {:?}",
-				entry.rel_path,
-				self.path_of(prior)
+		// Checked in EVERY build, like `carryable_rows`: this crate's release profile leaves
+		// overflow checks off, so a decrement that should never run would wrap to a count no
+		// tree could have and `has_remote_rows` would answer yes for a pair with no remote row
+		// at all — which reads as a vanished remote and holds a pass's deletions back forever.
+		let has_remote_uuid = flags & HAS_REMOTE_UUID != 0;
+		if has_remote_uuid && !had_remote_uuid {
+			self.remote_rows += 1;
+		} else if had_remote_uuid && !has_remote_uuid {
+			assert!(
+				self.remote_rows > 0,
+				"a row is losing a remote uuid the tree never counted: {:?}",
+				entry.rel_path
 			);
-		}
-		if let Some(lineage) = entry.remote_stable_uuid
-			&& let Some(prior) = self.by_lineage.insert(lineage, id)
-			&& prior != id
-		{
-			tracing::error!(
-				"baseline: {:?} claims the whole-life id already recorded at {:?}",
-				entry.rel_path,
-				self.path_of(prior)
-			);
+			self.remote_rows -= 1;
 		}
 		if let Some(sides) = ConflictSides::of(entry) {
 			self.side.insert(id, sides);
@@ -1040,25 +1044,20 @@ impl Baseline {
 			return;
 		}
 		self.clear_indexes(id);
+		if self.nodes[id.index()].has(HAS_REMOTE_UUID) {
+			// In every build, for the reason `upsert` gives.
+			assert!(
+				self.remote_rows > 0,
+				"a row recording a remote item was never counted as one"
+			);
+			self.remote_rows -= 1;
+		}
 		self.nodes[id.index()].flags = 0;
 		self.rows -= 1;
 	}
 
-	/// Take `id` out of every index that names it — the uuid and lineage entries only when they
-	/// still point AT it, since a later row may have taken the id over.
+	/// Take `id` out of every index that names it.
 	fn clear_indexes(&mut self, id: NodeId) {
-		let node = &self.nodes[id.index()];
-		if node.has(HAS_REMOTE_UUID) {
-			let uuid = node.remote_uuid;
-			if self.by_uuid.get(&uuid) == Some(&id) {
-				self.by_uuid.remove(&uuid);
-			}
-		}
-		if let Some(lineage) = self.nodes[id.index()].stable_uuid
-			&& self.by_lineage.get(&lineage) == Some(&id)
-		{
-			self.by_lineage.remove(&lineage);
-		}
 		self.side.remove(&id);
 		self.agreed.remove(&id);
 		self.uncarryable.remove(&id);
@@ -1240,8 +1239,6 @@ mod tests {
 			free,
 			children_vecs,
 			children_table,
-			by_uuid,
-			by_lineage,
 			side,
 			agreed,
 			uncarryable,
@@ -1251,7 +1248,6 @@ mod tests {
 			+ names + free
 			+ children_vecs
 			+ children_table
-			+ by_uuid + by_lineage
 			+ side + agreed
 			+ uncarryable
 			+ rule_files;
@@ -1274,8 +1270,6 @@ mod tests {
 			("names", names),
 			("children_vecs", children_vecs),
 			("children_table", children_table),
-			("by_uuid", by_uuid),
-			("by_lineage", by_lineage),
 		] {
 			assert!(
 				bytes > 0,
@@ -1530,10 +1524,14 @@ mod tests {
 		assert_eq!(paths(&baseline), vec!["a", "a/b/c.txt", "a/pushed.bin"]);
 	}
 
-	/// The indexes name the row that holds the id NOW: a row rewritten with another uuid, a row
-	/// deleted, and a row moved all have to leave the index describing where things are.
+	/// A lookup names the row that holds the id NOW: a row rewritten with another uuid, a row
+	/// deleted, and a row moved all have to leave the answer describing where things are.
+	///
+	/// The tree no longer indexes either id — the store does — so this asks the way a pass asks,
+	/// through [`Baseline::synced_paths`], which is the walking twin of
+	/// [`BaselineStore::synced_paths`](super::baseline::BaselineStore::synced_paths).
 	#[test]
-	fn the_uuid_and_lineage_indexes_follow_the_rows() {
+	fn the_uuid_and_lineage_lookups_follow_the_rows() {
 		let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
 		let held_by_the_dir = Uuid::new_v4();
 		let mut baseline = Baseline::from_rows([
@@ -1543,28 +1541,31 @@ mod tests {
 			},
 			file("d/x.txt", first, [1; 32]),
 		]);
-		assert_eq!(baseline.path_by_uuid(first).as_deref(), Some("d/x.txt"));
+		let lineage = StableUuid::new_for_test(first);
+		let at = |tree: &Baseline, uuid: Uuid| tree.synced_paths(&[uuid], &[]).path_by_uuid(uuid);
+		assert_eq!(at(&baseline, first).as_deref(), Some("d/x.txt"));
 		assert_eq!(
 			baseline
-				.path_by_lineage(StableUuid::new_for_test(first))
+				.synced_paths(&[], &[lineage])
+				.path_by_lineage(lineage)
 				.as_deref(),
 			Some("d/x.txt")
 		);
 
 		// A new version at the same path: the old uuid names nothing any more.
 		baseline.upsert(&file("d/x.txt", second, [2; 32]));
-		assert_eq!(baseline.path_by_uuid(first), None);
-		assert_eq!(baseline.path_by_uuid(second).as_deref(), Some("d/x.txt"));
+		assert_eq!(at(&baseline, first), None);
+		assert_eq!(at(&baseline, second).as_deref(), Some("d/x.txt"));
 
 		baseline.move_subtree("d", "e");
-		assert_eq!(baseline.path_by_uuid(second).as_deref(), Some("e/x.txt"));
+		assert_eq!(at(&baseline, second).as_deref(), Some("e/x.txt"));
 
 		baseline.remove("e/x.txt");
-		assert_eq!(baseline.path_by_uuid(second), None);
-		// The row that is still there still answers, so the index did not simply empty itself: the
+		assert_eq!(at(&baseline, second), None);
+		// The row that is still there still answers, so the lookup did not simply empty itself: the
 		// directory's own claim was re-keyed by the move above.
 		assert!(baseline.has_remote_rows());
-		assert_eq!(baseline.path_by_uuid(held_by_the_dir).as_deref(), Some("e"));
+		assert_eq!(at(&baseline, held_by_the_dir).as_deref(), Some("e"));
 	}
 
 	/// `occupied` is the server's own name dedup asked of the baseline: any spelling, at the path or
@@ -1684,9 +1685,18 @@ mod tests {
 		baseline.remove_subtrees(&BTreeSet::from(["build".to_string()]));
 		assert_eq!(paths(&baseline), vec!["builder.txt"]);
 		assert_eq!(baseline.len(), 1);
-		// The dropped rows leave the indexes with the subtree; the sibling's claim stays.
-		assert_eq!(baseline.path_by_uuid(dropped), None);
-		assert_eq!(baseline.path_by_uuid(kept).as_deref(), Some("builder.txt"));
+		// The dropped rows leave the lookup with the subtree; the sibling's claim stays.
+		assert_eq!(
+			baseline.synced_paths(&[dropped], &[]).path_by_uuid(dropped),
+			None
+		);
+		assert_eq!(
+			baseline
+				.synced_paths(&[kept], &[])
+				.path_by_uuid(kept)
+				.as_deref(),
+			Some("builder.txt")
+		);
 		assert!(baseline.has_remote_rows());
 	}
 
@@ -1712,10 +1722,19 @@ mod tests {
 		baseline.upsert(&file("after.txt", Uuid::new_v4(), [3; 32]));
 		assert_eq!(paths(&baseline), vec!["after.txt", "d", "d/x.txt"]);
 
-		// A second row claiming a uuid the tree already records: the later row answers, exactly as
-		// the per-pass map this index replaced answered, and the displacement is logged.
+		// A second row claiming a uuid the tree already records. The resident map this replaced was
+		// last-writer-wins and answered `d/twin.txt`; a seek finds BOTH claimants and answers with
+		// the first by path, which is the deliberate difference — deterministic, and never `None`
+		// for an id some row still carries.
 		baseline.upsert(&file("d/twin.txt", shared, [2; 32]));
-		assert_eq!(baseline.path_by_uuid(shared).as_deref(), Some("d/twin.txt"));
+		assert_eq!(
+			baseline
+				.synced_paths(&[shared], &[])
+				.path_by_uuid(shared)
+				.as_deref(),
+			Some("d/twin.txt"),
+			"of two rows claiming one uuid the first by path answers"
+		);
 	}
 
 	/// The unconfirmed index holds exactly the rows a push left behind — a file, synced, with

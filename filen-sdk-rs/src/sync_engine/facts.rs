@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
-	baseline::PathFailure,
+	baseline::{PathFailure, SyncedPaths},
 	ignore::IgnoreDecision,
 	observe::{LocalObservation, LocalObservations},
 	outcome::{PlannedConflict, UnsyncablePath, UnsyncableReason},
@@ -154,6 +154,7 @@ impl PairFacts {
 		touched: &BTreeSet<String>,
 		view: &RemoteView,
 		baseline: &Baseline,
+		synced: &SyncedPaths,
 	) {
 		for at in touched {
 			// A whole read answers for every path, so dropping `at`'s whole subtree is the whole of
@@ -183,7 +184,7 @@ impl PairFacts {
 		// The same read a whole pass makes, over whatever this one skipped: a derived view skips
 		// nothing (it asks for a full pass instead), so on a change-scoped pass this adds nothing
 		// and the prune above is the whole of the update.
-		let (unknown, never_synced) = plan::unknown_remote_paths(baseline, &view.skipped);
+		let (unknown, never_synced) = plan::unknown_remote_paths(synced, &view.skipped);
 		self.unknown_remote.extend(unknown);
 		for report in never_synced {
 			if !self.never_synced_remote.contains(&report) {
@@ -593,6 +594,7 @@ mod tests {
 			&BTreeSet::from(["a".to_owned()]),
 			&view,
 			&Baseline::default(),
+			&SyncedPaths::default(),
 		);
 
 		assert_eq!(keys(&facts.ignored_remote), vec!["a2", "c"]);
@@ -660,7 +662,12 @@ mod tests {
 		// `a/keep` still has a row under it; `a/gone` has none.
 		let rows = Baseline::from_rows([row("a/keep/hidden.txt")]);
 		let mut scoped = carried();
-		scoped.merge_remote_view(&BTreeSet::from(["a".to_owned()]), &derived_view(), &rows);
+		scoped.merge_remote_view(
+			&BTreeSet::from(["a".to_owned()]),
+			&derived_view(),
+			&rows,
+			&SyncedPaths::default(),
+		);
 		assert_eq!(
 			keys(&scoped.ignored_remote),
 			vec!["a/keep"],
@@ -673,6 +680,7 @@ mod tests {
 			&BTreeSet::from(["a".to_owned()]),
 			&derived_view(),
 			&Baseline::default(),
+			&SyncedPaths::default(),
 		);
 		assert!(
 			untracked.ignored_remote.is_empty(),
@@ -682,7 +690,12 @@ mod tests {
 
 		// A whole read answers for every path, so its view REPLACES the carried roots, rows or not.
 		let mut whole = carried();
-		whole.merge_remote_view(&BTreeSet::from([String::new()]), &derived_view(), &rows);
+		whole.merge_remote_view(
+			&BTreeSet::from([String::new()]),
+			&derived_view(),
+			&rows,
+			&SyncedPaths::default(),
+		);
 		assert!(
 			whole.ignored_remote.is_empty(),
 			"a whole read that found no ignored root means there is none: {:?}",
