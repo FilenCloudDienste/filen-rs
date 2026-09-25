@@ -317,7 +317,7 @@ mod tests {
 			ignore::{FILENIGNORE, IgnoreRules},
 			observe::observe_local,
 			plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
-			remote::{RemoteObserved, observe_remote},
+			remote::{RemoteObserved, delta_uuids, observe_remote},
 			scan::{LocalScan, RuleFiles, scan_local},
 		},
 	};
@@ -491,11 +491,13 @@ mod tests {
 			let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
 				panic!("no ancestry read was expected, but one was made for {uuid}")
 			};
+			let placed = baseline.synced_paths(&delta_uuids(delta), &[]);
 			let mut observed = match observe_remote(
 				REMOTE_ROOT,
 				baseline,
 				std::mem::take(&mut derived.remote),
 				delta,
+				placed,
 				&mut ancestry,
 			) {
 				RemoteObserved::Applied(observation) => *observation,
