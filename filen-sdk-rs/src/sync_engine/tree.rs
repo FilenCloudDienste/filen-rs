@@ -77,7 +77,7 @@ impl NodeId {
 		self.0 as usize
 	}
 
-	/// A `u32` id is what makes the node 112 bytes rather than 120; a pair with four billion rows
+	/// A `u32` id is what makes the node 104 bytes rather than 112; a pair with four billion rows
 	/// has lost long before this panics (the store's own row cap is the disk).
 	fn from_index(index: usize) -> Self {
 		Self(u32::try_from(index).expect("a sync pair holds fewer than 4 billion baseline rows"))
