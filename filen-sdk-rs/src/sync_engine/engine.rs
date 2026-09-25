@@ -1373,12 +1373,24 @@ impl SyncEngine {
 	/// running a pass is not a way to reach it: the figure afterwards would be one that had held a
 	/// whole pass's structures. This offers no way to assemble a pass — it hands back two numbers —
 	/// and what it leaves behind is the resident copy an idle engine sits on between passes.
-	pub(super) async fn bench_load_pair(&self, pair: PairId) -> Result<(usize, usize), Error> {
+	///
+	/// The terms come back BESIDE the total rather than instead of it: the total is what every
+	/// published figure has always been, and the split is what says which of eleven structures to
+	/// go after. A hand estimate of the parts reached only ~175 MiB of the 211.6 measured at a
+	/// million rows, so the split was not known.
+	pub(super) async fn bench_load_pair(
+		&self,
+		pair: PairId,
+	) -> Result<(usize, usize, super::tree::ResidentTerms), Error> {
 		let store = self.pair_store(pair).await?;
 		let baseline = locked(&store)
 			.baseline(pair)
 			.map_err(|e| db_error(e, "loading the benchmark pair's baseline"))?;
-		Ok((baseline.len(), baseline.resident_bytes()))
+		Ok((
+			baseline.len(),
+			baseline.resident_bytes(),
+			baseline.resident_terms(),
+		))
 	}
 
 	/// Put a pair's changelist back in the state a freshly registered pair's is in.
