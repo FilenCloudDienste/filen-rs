@@ -271,6 +271,65 @@ impl Default for Baseline {
 	}
 }
 
+/// What [`Baseline::resident_bytes`] is made of, one field per structure it counts.
+///
+/// Reported per term rather than summed because the sum cannot be acted on. Every field is in
+/// BYTES and counted the way `resident_bytes` counts — a heap allocation rounded to the 16-byte
+/// size class macOS and glibc both use, and a map's own `capacity` rather than its live entries,
+/// which is where a `HashMap`'s slack lives.
+#[cfg(feature = "bench-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResidentTerms {
+	/// The node array's own allocation: `capacity`, not `len`.
+	pub(super) nodes: usize,
+	/// Every leaf name's heap allocation. Not the paths — no node holds one.
+	pub(super) names: usize,
+	/// The removed-slot free list.
+	pub(super) free: usize,
+	/// Every directory's children vector.
+	pub(super) children_vecs: usize,
+	/// The table those vectors are filed in, which is a separate cost from the vectors.
+	pub(super) children_table: usize,
+	pub(super) by_uuid: usize,
+	pub(super) by_lineage: usize,
+	/// Conflicted rows only, so empty on a converged pair.
+	pub(super) side: usize,
+	/// Unconfirmed pushes only, so empty on a converged pair.
+	pub(super) agreed: usize,
+	pub(super) uncarryable: usize,
+	pub(super) rule_files: usize,
+}
+
+#[cfg(feature = "bench-internals")]
+impl ResidentTerms {
+	/// Every term under its own name, in the order a table should print them.
+	///
+	/// The ONE place the field list lives for a reader: [`total`](Self::total) sums THIS, so a term
+	/// added to the struct and forgotten here would be missing from the total as well — which the
+	/// accounting would show as a remainder rather than hide, and which
+	/// `every_resident_term_is_named` fails on outright.
+	pub(super) fn named(&self) -> [(&'static str, usize); 11] {
+		[
+			("nodes", self.nodes),
+			("names", self.names),
+			("free", self.free),
+			("children_vecs", self.children_vecs),
+			("children_table", self.children_table),
+			("by_uuid", self.by_uuid),
+			("by_lineage", self.by_lineage),
+			("side", self.side),
+			("agreed", self.agreed),
+			("uncarryable", self.uncarryable),
+			("rule_files", self.rule_files),
+		]
+	}
+
+	/// What the tree holds for the life of the pair: every term added up.
+	pub(super) fn total(&self) -> usize {
+		self.named().iter().map(|&(_, bytes)| bytes).sum()
+	}
+}
+
 impl Baseline {
 	/// The rows as the store read them back, in any order.
 	///
@@ -673,6 +732,19 @@ impl Baseline {
 	/// where a `HashMap`'s slack lives.
 	#[cfg(feature = "bench-internals")]
 	pub(super) fn resident_bytes(&self) -> usize {
+		self.resident_terms().total()
+	}
+
+	/// The same figure [`resident_bytes`](Self::resident_bytes) sums, TERM BY TERM.
+	///
+	/// Same convention, same arithmetic — `resident_bytes` is this summed, so a reader cannot come
+	/// to disagree with the total it is set against. It exists because the sum alone cannot be
+	/// acted on: "the resident tree is 211.6 MiB at a million rows" says nothing about which of
+	/// eleven structures to go after, and a hand estimate of the parts reached only ~175 of that
+	/// figure — so the split was not known, and guessing at it is how three rounds of this effort
+	/// came to optimise the wrong structure.
+	#[cfg(feature = "bench-internals")]
+	pub(super) fn resident_terms(&self) -> ResidentTerms {
 		fn heap(bytes: usize) -> usize {
 			bytes.div_ceil(16) * 16
 		}
@@ -680,22 +752,23 @@ impl Baseline {
 			// Key, value and one control byte per slot — hashbrown's layout.
 			capacity * (size_of::<K>() + size_of::<V>() + 1)
 		}
-		let names: usize = self.nodes.iter().map(|node| heap(node.name.len())).sum();
-		let children: usize = self
-			.children
-			.values()
-			.map(|kids| heap(kids.capacity() * size_of::<NodeId>()))
-			.sum();
-		self.nodes.capacity() * size_of::<Node>()
-			+ names + heap(self.free.capacity() * size_of::<NodeId>())
-			+ children
-			+ table::<NodeId, Vec<NodeId>>(self.children.capacity())
-			+ table::<Uuid, NodeId>(self.by_uuid.capacity())
-			+ table::<StableUuid, NodeId>(self.by_lineage.capacity())
-			+ table::<NodeId, ConflictSides>(self.side.capacity())
-			+ table::<NodeId, Option<Blake3Hash>>(self.agreed.capacity())
-			+ table::<NodeId, ()>(self.uncarryable.capacity())
-			+ table::<NodeId, ()>(self.rule_files.capacity())
+		ResidentTerms {
+			nodes: self.nodes.capacity() * size_of::<Node>(),
+			names: self.nodes.iter().map(|node| heap(node.name.len())).sum(),
+			free: heap(self.free.capacity() * size_of::<NodeId>()),
+			children_vecs: self
+				.children
+				.values()
+				.map(|kids| heap(kids.capacity() * size_of::<NodeId>()))
+				.sum(),
+			children_table: table::<NodeId, Vec<NodeId>>(self.children.capacity()),
+			by_uuid: table::<Uuid, NodeId>(self.by_uuid.capacity()),
+			by_lineage: table::<StableUuid, NodeId>(self.by_lineage.capacity()),
+			side: table::<NodeId, ConflictSides>(self.side.capacity()),
+			agreed: table::<NodeId, Option<Blake3Hash>>(self.agreed.capacity()),
+			uncarryable: table::<NodeId, ()>(self.uncarryable.capacity()),
+			rule_files: table::<NodeId, ()>(self.rule_files.capacity()),
+		}
 	}
 
 	fn walk(&self, root: NodeId, root_path: String) -> Walk<'_> {
@@ -1140,6 +1213,73 @@ mod tests {
 				row.carryable(),
 				"{}: the index and the row the store rebuilds disagree",
 				row.rel_path
+			);
+		}
+	}
+
+	/// Every term of [`ResidentTerms`] is in the total, and the total is what
+	/// [`Baseline::resident_bytes`] answers.
+	///
+	/// The struct is destructured EXHAUSTIVELY here on purpose: a term added to it and left out of
+	/// [`ResidentTerms::named`] would otherwise be missing from every total silently, and a
+	/// resident figure that quietly stopped counting a structure is exactly the kind of number this
+	/// round exists to stop anyone quoting. A new field fails this at COMPILE time, before it can
+	/// fail an assertion.
+	#[cfg(feature = "bench-internals")]
+	#[test]
+	fn every_resident_term_is_in_the_total() {
+		let tree = Baseline::from_rows([
+			file("docs/a.txt", Uuid::from_u128(1), [1; 32]),
+			file("docs/b.txt", Uuid::from_u128(2), [2; 32]),
+			dir("docs"),
+		]);
+		let terms = tree.resident_terms();
+		let ResidentTerms {
+			nodes,
+			names,
+			free,
+			children_vecs,
+			children_table,
+			by_uuid,
+			by_lineage,
+			side,
+			agreed,
+			uncarryable,
+			rule_files,
+		} = terms;
+		let by_hand = nodes
+			+ names + free
+			+ children_vecs
+			+ children_table
+			+ by_uuid + by_lineage
+			+ side + agreed
+			+ uncarryable
+			+ rule_files;
+		assert_eq!(
+			by_hand,
+			terms.total(),
+			"a term of the resident tree is not in the total: {:?}",
+			terms
+		);
+		assert_eq!(
+			terms.total(),
+			tree.resident_bytes(),
+			"the split and the sum it is set against disagree"
+		);
+		// The terms a loaded tree must charge something for, so the split cannot be all zeroes and
+		// still pass. `side` and `agreed` are deliberately absent: a converged pair has neither a
+		// conflict nor an unconfirmed push, which is the steady state being accounted for.
+		for (what, bytes) in [
+			("nodes", nodes),
+			("names", names),
+			("children_vecs", children_vecs),
+			("children_table", children_table),
+			("by_uuid", by_uuid),
+			("by_lineage", by_lineage),
+		] {
+			assert!(
+				bytes > 0,
+				"{what} costs nothing on a tree holding three rows"
 			);
 		}
 	}
