@@ -3,8 +3,8 @@
 What each scenario is for, and what its number means.
 
 This document is definitional — it should stay true whatever the numbers do.
-There are no published figures to set beside it at present: `BASELINE.md` says
-why the previous ones were withdrawn rather than patched.
+The figures to set beside it live in `BASELINE.md`, which carries the landing
+sweep of the memory round and says which of its older rows are dead.
 
 ## How to read any row
 
