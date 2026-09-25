@@ -29,7 +29,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-	baseline::NodeKind,
+	baseline::{NodeKind, SyncedPaths},
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry},
 	ignore::rule_file_dir,
 	plan::{self, RemoteNode, in_quarantine, is_safe_name, join_path},
@@ -57,7 +57,8 @@ pub(super) struct RemoteObservation {
 	/// The whole index used to be built here, from the derived map, before a single change was
 	/// applied: one `String` clone and one hash per node of the tree, to answer a handful of
 	/// lookups. The derived map is the baseline's own rows keyed by the path each row sits on, so
-	/// [`Baseline::path_by_uuid`] already answers for every item this delta has not touched.
+	/// [`placed`](Self::placed) — the store's own index, seeked once for the ids this delta names
+	/// — already answers for every item this delta has not touched.
 	moved: HashMap<Uuid, String>,
 	/// Every path the delta touched, including the ones it vacated. These are the remote side's
 	/// dirty paths: they go into the local observation's dirty set (a path dirty on either side is
@@ -87,6 +88,14 @@ pub(super) struct RemoteObservation {
 	/// A removal that named a successor, by that successor's uuid: the path it left behind, until
 	/// something puts the successor somewhere (see [`settle_superseded`](Self::settle_superseded)).
 	superseded: HashMap<Uuid, String>,
+	/// Where the baseline records each item this delta can name, resolved BEFORE the first entry
+	/// is applied (see [`delta_uuids`]).
+	///
+	/// Owned rather than borrowed so that every method reaching [`path_of`](Self::path_of) keeps
+	/// the signature it had. It holds one entry per id the delta names, not one per row of the
+	/// pair, which is the whole point: the resident `Uuid -> row` map this replaces cost 36.75 MiB
+	/// at a million rows and was consulted a handful of times a pass.
+	placed: SyncedPaths,
 }
 
 /// The outcome of applying a delta: the derived view, or the reason this pass has to read the
@@ -95,6 +104,39 @@ pub(super) struct RemoteObservation {
 pub(super) enum RemoteObserved {
 	Applied(Box<RemoteObservation>),
 	Full(FullPassReason),
+}
+
+/// Every remote id applying `delta` can ask the baseline about, for the caller to resolve first
+/// (see [`SyncedPaths`]).
+///
+/// The ONE place that enumeration lives, and it has to be exhaustive: [`RemoteObservation::path_of`]
+/// reads an unresolved id as "held nowhere", and a move whose source reads as held nowhere is a
+/// move whose source is never vacated — the item then sits at two paths in the view, and the pass
+/// plans against a tree that does not exist. Every id here is one an entry NAMES:
+///
+/// - an upsert's own uuid and its PARENT's, which `parent_path` resolves before it will place it,
+/// - a rename's uuid, which is all a metadata event carries,
+/// - a removal's uuid, and the successor a versioning edit names, which `settle_superseded` asks
+///   about after every entry has been applied.
+///
+/// Duplicates are left in: the store deduplicates before it binds anything, and a directory whose
+/// hundred children changed names one parent a hundred times.
+pub(super) fn delta_uuids(delta: &[RemoteDeltaEntry]) -> Vec<Uuid> {
+	let mut out = Vec::with_capacity(delta.len() * 2);
+	for entry in delta {
+		match &entry.change {
+			RemoteChange::Upsert(item) => {
+				out.push(item.uuid);
+				out.push(item.parent);
+			}
+			RemoteChange::Renamed { uuid, .. } => out.push(*uuid),
+			RemoteChange::Gone(gone) => {
+				out.push(gone.uuid());
+				out.extend(gone.successor());
+			}
+		}
+	}
+	out
 }
 
 /// Apply `delta` to `nodes` — the remote view derived from the baseline rows — in dispatch order.
@@ -110,9 +152,10 @@ pub(super) fn observe_remote(
 	baseline: &Baseline,
 	nodes: Side<RemoteNode>,
 	delta: &[RemoteDeltaEntry],
+	placed: SyncedPaths,
 	ancestry: Ancestry<'_>,
 ) -> RemoteObserved {
-	let mut out = RemoteObservation::new(nodes);
+	let mut out = RemoteObservation::new(nodes, placed);
 	for entry in delta {
 		if let Err(reason) = out.apply(root, baseline, &entry.change, &mut *ancestry) {
 			return RemoteObserved::Full(reason);
@@ -165,7 +208,7 @@ fn as_item(result: &SearchResult) -> RemoteItem {
 }
 
 impl RemoteObservation {
-	fn new(nodes: Side<RemoteNode>) -> Self {
+	fn new(nodes: Side<RemoteNode>, placed: SyncedPaths) -> Self {
 		Self {
 			nodes,
 			moved: HashMap::new(),
@@ -174,15 +217,16 @@ impl RemoteObservation {
 			held_paths: BTreeSet::new(),
 			rule_dirs: BTreeSet::new(),
 			superseded: HashMap::new(),
+			placed,
 		}
 	}
 
 	/// Where the view holds `uuid`, or `None` when it holds it nowhere.
 	///
-	/// Asked of two sources in turn: what this delta placed ([`moved`](Self::moved)), then the
-	/// resident baseline, whose rows ARE the derived map — `observe_remote` is only ever handed the
-	/// map `derive::from_baseline` built from the very tree it is passed, and each of those nodes
-	/// carries its row's uuid at its row's path.
+	/// Asked of two sources in turn: what this delta placed ([`moved`](Self::moved)), then where
+	/// the baseline rows record it ([`placed`](Self::placed)), whose rows ARE the derived map —
+	/// `observe_remote` is only ever handed the map `derive::from_baseline` built from the very
+	/// tree it is passed, and each of those nodes carries its row's uuid at its row's path.
 	///
 	/// Either candidate is then checked against `nodes`, which is what makes the second source
 	/// safe rather than a guess. A row the derivation could not carry, a node the delta has since
@@ -192,7 +236,7 @@ impl RemoteObservation {
 	fn path_of(&self, baseline: &Baseline, uuid: Uuid) -> Option<String> {
 		let candidate = match self.moved.get(&uuid) {
 			Some(path) => path.clone(),
-			None => baseline.path_by_uuid(uuid)?,
+			None => self.placed.path_by_uuid(uuid)?,
 		};
 		self.nodes
 			.of(baseline)
@@ -271,7 +315,7 @@ impl RemoteObservation {
 		}
 		// A row the derived map left out (a conflicted row, a row whose path the rules hide) still
 		// says where its item sits, and asking it costs no read.
-		if let Some(path) = baseline.path_by_uuid(item.parent) {
+		if let Some(path) = self.placed.path_by_uuid(item.parent) {
 			return Ok(path);
 		}
 		let chain = read_chain(item.uuid, ancestry)?;
@@ -703,6 +747,24 @@ mod tests {
 		}
 	}
 
+	/// `observe_remote` as a pass reaches it: the ids the delta names resolved off the baseline
+	/// first, exactly as the engine resolves them off the store.
+	///
+	/// `also` is for the ids a test goes on to ASK about itself (`out.path_of(..)`), which a real
+	/// pass would only ask about because the delta named them.
+	fn observed_with(
+		baseline: &Baseline,
+		nodes: Side<RemoteNode>,
+		delta: &[RemoteDeltaEntry],
+		also: &[Uuid],
+		ancestry: Ancestry<'_>,
+	) -> RemoteObserved {
+		let mut uuids = delta_uuids(delta);
+		uuids.extend_from_slice(also);
+		let placed = baseline.synced_paths(&uuids, &[]);
+		observe_remote(root(), baseline, nodes, delta, placed, ancestry)
+	}
+
 	fn applied(observed: RemoteObserved) -> RemoteObservation {
 		match observed {
 			RemoteObserved::Applied(observation) => *observation,
@@ -741,22 +803,22 @@ mod tests {
 		let died = || cache_event(Some(2), CacheEventType::File(FileEvent::Removed(file)));
 
 		let empty = Baseline::default();
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&empty,
 			Side::default(),
 			&delta(&[born(), died()]),
+			&[file],
 			&mut no_ancestry(),
 		));
 		assert!(out.nodes.whole().is_empty(), "{:?}", out.nodes);
 		assert!(out.path_of(&empty, file).is_none());
 		assert_eq!(listed(&out.touched), vec!["a.txt"]);
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&empty,
 			Side::default(),
 			&delta(&[died(), born()]),
+			&[file],
 			&mut no_ancestry(),
 		));
 		assert_eq!(paths(&out), vec!["a.txt"], "the create is the last word");
@@ -788,11 +850,11 @@ mod tests {
 			Ok(chain.clone())
 		};
 		let empty = Baseline::default();
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&empty,
 			Side::default(),
 			&delta(&events),
+			&[],
 			&mut ancestry,
 		));
 
@@ -820,11 +882,11 @@ mod tests {
 			CacheEventType::Dir(DirEvent::Removed(dir)),
 		)];
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&events),
+			&[keep, dir, sub],
 			&mut no_ancestry(),
 		));
 
@@ -859,11 +921,11 @@ mod tests {
 			}),
 		)];
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&events),
+			&[],
 			&mut no_ancestry(),
 		));
 
@@ -892,11 +954,11 @@ mod tests {
 			CacheEventType::File(FileEvent::New(successor)),
 		)];
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&events),
+			&[old],
 			&mut no_ancestry(),
 		));
 
@@ -932,11 +994,11 @@ mod tests {
 		};
 
 		let (baseline, nodes) = pair();
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&[trashed()]),
+			&[],
 			&mut no_ancestry(),
 		));
 		assert_eq!(paths(&out), vec!["keep.txt"]);
@@ -949,14 +1011,14 @@ mod tests {
 			..cacheable_file(new, root(), "a.txt")
 		};
 		let (baseline, nodes) = pair();
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&[
 				trashed(),
 				cache_event(Some(2), CacheEventType::File(FileEvent::New(successor))),
 			]),
+			&[],
 			&mut no_ancestry(),
 		));
 		assert_eq!(out.nodes.whole().at("a.txt").unwrap().remote_uuid, new);
@@ -979,11 +1041,11 @@ mod tests {
 			CacheEventType::Dir(DirEvent::Move(cacheable_dir(dir, top, "d"))),
 		)];
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&delta(&events),
+			&[file],
 			&mut no_ancestry(),
 		));
 
@@ -1011,11 +1073,11 @@ mod tests {
 			change: RemoteChange::Upsert(item_file(rule, dir, FILENIGNORE)),
 		}];
 
-		let out = applied(observe_remote(
-			root(),
+		let out = applied(observed_with(
 			&baseline,
 			nodes,
 			&entries,
+			&[],
 			&mut no_ancestry(),
 		));
 
@@ -1043,7 +1105,7 @@ mod tests {
 			},
 		}];
 
-		match observe_remote(root(), &baseline, nodes, &entries, &mut no_ancestry()) {
+		match observed_with(&baseline, nodes, &entries, &[], &mut no_ancestry()) {
 			RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteUnplaceable),
 			RemoteObserved::Applied(out) => {
 				panic!("a subtree was dropped instead: {:?}", out.nodes)
@@ -1063,13 +1125,7 @@ mod tests {
 			CacheEventType::File(FileEvent::Removed(file)),
 		)];
 
-		match observe_remote(
-			root(),
-			&baseline,
-			nodes,
-			&delta(&events),
-			&mut no_ancestry(),
-		) {
+		match observed_with(&baseline, nodes, &delta(&events), &[], &mut no_ancestry()) {
 			RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteEmptied),
 			RemoteObserved::Applied(out) => panic!("{:?}", out.nodes),
 		}
@@ -1087,11 +1143,11 @@ mod tests {
 		)];
 		let mut ancestry = |_: Uuid| Ok(Vec::new());
 
-		match observe_remote(
-			root(),
+		match observed_with(
 			&Baseline::default(),
 			Side::default(),
 			&delta(&events),
+			&[],
 			&mut ancestry,
 		) {
 			RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteUnplaceable),

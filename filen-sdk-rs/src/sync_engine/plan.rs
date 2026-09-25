@@ -18,7 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineEntry, BaselineState, NodeKind},
+	baseline::{BaselineEntry, BaselineState, NodeKind, SyncedPaths},
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
@@ -988,6 +988,20 @@ impl Skipped {
 	}
 }
 
+/// The remote ids [`unknown_remote_paths`] will ask about, for the caller to resolve against the
+/// store first (see [`SyncedPaths`]).
+///
+/// The ONE place that enumeration lives. A caller that resolved a smaller set would hand
+/// `unknown_remote_paths` an id it cannot answer for, and an unanswerable id reads as "never
+/// synced" — which drops the path's protection and lets the pass plan a local delete over a remote
+/// item that is still there.
+pub(crate) fn skipped_ids(skipped: &[SkippedRemote]) -> (Vec<Uuid>, Vec<StableUuid>) {
+	(
+		skipped.iter().map(|item| item.remote_uuid).collect(),
+		skipped.iter().filter_map(|item| item.stable_uuid).collect(),
+	)
+}
+
 /// Split the view's skipped items into the SYNCED paths they make unknown and the reports for items
 /// never synced.
 ///
@@ -999,7 +1013,7 @@ impl Skipped {
 /// with its reason, for the pass to leave that path and its subtree alone and report it. A skipped
 /// item no baseline row names is only reported, under its would-be path.
 pub(crate) fn unknown_remote_paths(
-	baseline: &Baseline,
+	synced: &SyncedPaths,
 	skipped: &[SkippedRemote],
 ) -> (BTreeMap<String, UnsyncableReason>, Vec<UnsyncablePath>) {
 	// Nothing was skipped, so nothing is looked up at all.
@@ -1011,9 +1025,9 @@ pub(crate) fn unknown_remote_paths(
 	for item in skipped {
 		// The baseline's own uuid and lineage indexes, rather than two maps built over every row
 		// of the pair to answer one question per skipped item.
-		let synced_at = baseline.path_by_uuid(item.remote_uuid).or_else(|| {
+		let synced_at = synced.path_by_uuid(item.remote_uuid).or_else(|| {
 			item.stable_uuid
-				.and_then(|lineage| baseline.path_by_lineage(lineage))
+				.and_then(|lineage| synced.path_by_lineage(lineage))
 		});
 		if let Some(path) = synced_at {
 			unknown.insert(path, item.reason.clone());
@@ -5983,7 +5997,9 @@ mod tests {
 				base_file("sub/c.txt", deep.uuid, [2; 32]),
 			),
 		]);
-		let (unknown, never_synced) = unknown_remote_paths(&tree(&baseline), &view.skipped);
+		let rows = tree(&baseline);
+		let (unknown, never_synced) =
+			unknown_remote_paths(&synced_for(&rows, &view.skipped), &view.skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([
@@ -6050,7 +6066,8 @@ mod tests {
 				reason: UnsyncableReason::RemoteUndecodable,
 			},
 		];
-		let (unknown, never_synced) = unknown_remote_paths(&tree(&baseline), &skipped);
+		let rows = tree(&baseline);
+		let (unknown, never_synced) = unknown_remote_paths(&synced_for(&rows, &skipped), &skipped);
 		assert_eq!(
 			unknown,
 			BTreeMap::from([(
@@ -6210,7 +6227,9 @@ mod tests {
 			}]
 		);
 		let baseline = HashMap::new();
-		let (_, never_synced) = unknown_remote_paths(&tree(&baseline), &view.skipped);
+		let rows = tree(&baseline);
+		let (_, never_synced) =
+			unknown_remote_paths(&synced_for(&rows, &view.skipped), &view.skipped);
 		assert_eq!(never_synced.len(), 1, "{never_synced:?}");
 	}
 
@@ -7070,6 +7089,12 @@ mod tests {
 	}
 
 	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.
+	/// Where the rows record each skipped item, as a pass resolves it off the store before it asks.
+	fn synced_for(baseline: &Baseline, skipped: &[SkippedRemote]) -> SyncedPaths {
+		let (uuids, lineages) = skipped_ids(skipped);
+		baseline.synced_paths(&uuids, &lineages)
+	}
+
 	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 		Baseline::from_rows(rows.values().cloned())
 	}

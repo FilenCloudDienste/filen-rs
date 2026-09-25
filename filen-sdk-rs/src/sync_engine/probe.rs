@@ -42,7 +42,9 @@ use crate::{
 
 use super::{
 	SyncMode,
-	baseline::{BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind},
+	baseline::{
+		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, SyncedPaths,
+	},
 	derive::{self, Derived},
 	engine::{PendingKind, PendingWrites, assembly_accounted, unaccounted_key},
 	ignore::{
@@ -1156,8 +1158,16 @@ fn prepare_scoped(
 	// before a single change is applied, which is per-node work every scoped pass pays.
 	let nodes = mem::take(&mut derived.remote);
 	let mut ancestry = |uuid| cache_ancestry(&fixture.cache_db, uuid);
-	let (observed, elapsed) =
-		timed(|| observe_remote(fixture.remote_root, &baseline, nodes, &[], &mut ancestry));
+	let (observed, elapsed) = timed(|| {
+		observe_remote(
+			fixture.remote_root,
+			&baseline,
+			nodes,
+			&[],
+			SyncedPaths::default(),
+			&mut ancestry,
+		)
+	});
 	costs.push(
 		"observe_remote",
 		elapsed,
