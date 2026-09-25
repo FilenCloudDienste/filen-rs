@@ -29,6 +29,20 @@
 //! store can hold because its primary key compares bytewise — are broken by the raw name. So a
 //! lookup by exact name and a lookup by folded name are both a binary search of the one vector.
 //!
+//! # Every leaf name lives in ONE allocation
+//!
+//! A node does not own its name: it holds a `(offset, length)` into [`Baseline::names`], one
+//! `String` the whole tree's leaf names are appended to. That is 8 bytes a node instead of 16, and
+//! — the part that costs more than the 8 — it is ONE heap block for a million names rather than a
+//! million blocks an allocator has to keep pages resident for. Cloning the tree, which
+//! `Arc::make_mut` does on the first write of every pass that writes, copies two buffers instead
+//! of walking a million allocations.
+//!
+//! Names are never edited in place: a rename is a remove and an insert, so the old bytes are
+//! simply left behind and [`Baseline::maybe_compact_names`] rebuilds the arena once most of it is
+//! dead. That is the one structure here whose size could otherwise follow the pair's HISTORY
+//! rather than its tree.
+//!
 //! # A path with no row of its own
 //!
 //! A row can sit under a directory that has no row (a destination-only item adopted at a mode
@@ -88,8 +102,11 @@ const HAS_REMOTE_MODIFIED: u8 = 1 << 5;
 #[derive(Debug, Clone)]
 struct Node {
 	parent: NodeId,
-	/// The leaf name — NFC, exactly as the row's path spells it. Never the path.
-	name: Box<str>,
+	/// Where this node's leaf name sits in [`Baseline::names`]: a byte offset and a byte length,
+	/// NFC and exactly as the row's path spells it. Never the path, and never an allocation of its
+	/// own (see the module doc).
+	name_at: u32,
+	name_len: u32,
 	kind: NodeKind,
 	state: BaselineState,
 	flags: u8,
@@ -102,10 +119,13 @@ struct Node {
 }
 
 impl Node {
-	fn empty(parent: NodeId, name: &str) -> Self {
+	/// A node with no name yet: [`Baseline::insert_node`] puts one in the arena and points the node
+	/// at it, so the arena stays the only place a name is ever written.
+	fn empty(parent: NodeId) -> Self {
 		Self {
 			parent,
-			name: name.into(),
+			name_at: 0,
+			name_len: 0,
 			kind: NodeKind::Dir,
 			state: BaselineState::Synced,
 			flags: 0,
@@ -226,6 +246,13 @@ fn blank_row() -> BaselineEntry {
 #[derive(Debug, Clone)]
 pub(super) struct Baseline {
 	nodes: Vec<Node>,
+	/// Every leaf name in the tree, appended end to end; a node addresses its own by offset and
+	/// length (see the module doc). Never indexed by anything but a node's own pair, so the
+	/// boundaries between names are the nodes and this needs no separators.
+	names: String,
+	/// How many bytes of [`names`](Self::names) no node points at any more — what
+	/// [`maybe_compact_names`](Self::maybe_compact_names) weighs against the live ones.
+	dead_names: usize,
 	/// Slots whose node was removed, handed back out before the `Vec` grows again.
 	free: Vec<NodeId>,
 	/// Each directory's children, sorted by [`sibling_cmp`]. A node with no entry here has none.
@@ -267,7 +294,9 @@ pub(super) struct Baseline {
 impl Default for Baseline {
 	fn default() -> Self {
 		Self {
-			nodes: vec![Node::empty(NodeId::ROOT, "")],
+			nodes: vec![Node::empty(NodeId::ROOT)],
+			names: String::new(),
+			dead_names: 0,
 			free: Vec::new(),
 			children: HashMap::new(),
 			side: HashMap::new(),
@@ -291,7 +320,9 @@ impl Default for Baseline {
 pub(super) struct ResidentTerms {
 	/// The node array's own allocation: `capacity`, not `len`.
 	pub(super) nodes: usize,
-	/// Every leaf name's heap allocation. Not the paths — no node holds one.
+	/// The name arena: the ONE allocation every leaf name lives in, the bytes no node points at
+	/// any more included (see [`Baseline::maybe_compact_names`]). Not the paths — no node holds
+	/// one.
 	pub(super) names: usize,
 	/// The removed-slot free list.
 	pub(super) free: usize,
@@ -363,6 +394,9 @@ impl Baseline {
 	/// room back only means taking it again.
 	pub(super) fn shrink_after_load(&mut self) {
 		self.nodes.shrink_to_fit();
+		// The arena doubled its way up like the rest, and a load writes no dead bytes, so this is
+		// the one moment it is exactly as big as the tree needs.
+		self.names.shrink_to_fit();
 		self.side.shrink_to_fit();
 		self.agreed.shrink_to_fit();
 		self.uncarryable.shrink_to_fit();
@@ -379,7 +413,8 @@ impl Baseline {
 	}
 
 	fn name(&self, id: NodeId) -> &str {
-		&self.nodes[id.index()].name
+		let node = &self.nodes[id.index()];
+		&self.names[node.name_at as usize..][..node.name_len as usize]
 	}
 
 	fn is_row(&self, id: NodeId) -> bool {
@@ -768,7 +803,7 @@ impl Baseline {
 		}
 		ResidentTerms {
 			nodes: self.nodes.capacity() * size_of::<Node>(),
-			names: self.nodes.iter().map(|node| heap(node.name.len())).sum(),
+			names: heap(self.names.capacity()),
 			free: heap(self.free.capacity() * size_of::<NodeId>()),
 			children_vecs: self
 				.children
@@ -921,6 +956,7 @@ impl Baseline {
 		};
 		self.clear_row(id);
 		self.prune(id);
+		self.maybe_compact_names();
 	}
 
 	/// Drop every row at or under each of `roots` — the ignore untracking, mirrored.
@@ -949,6 +985,7 @@ impl Baseline {
 			self.free_subtree(id);
 			self.prune(parent);
 		}
+		self.maybe_compact_names();
 	}
 
 	/// Re-key the row at `from` and everything under it to sit under `to`, overwriting whatever
@@ -1019,7 +1056,8 @@ impl Baseline {
 	}
 
 	fn insert_node(&mut self, parent: NodeId, name: &str) -> NodeId {
-		let node = Node::empty(parent, name);
+		let mut node = Node::empty(parent);
+		(node.name_at, node.name_len) = self.push_name(name);
 		let id = match self.free.pop() {
 			Some(id) => {
 				self.nodes[id.index()] = node;
@@ -1030,12 +1068,100 @@ impl Baseline {
 				NodeId::from_index(self.nodes.len() - 1)
 			}
 		};
+		// Three DISJOINT fields borrowed at once: the child list is grown while the arena and the
+		// node array say what each sibling is called. Spelled out as field accesses for exactly
+		// that reason — `self.name(other)` borrows the whole of `self`, which the entry below
+		// already holds mutably.
+		let (names, nodes) = (&self.names, &self.nodes);
 		let kids = self.children.entry(parent).or_default();
 		let at = kids
-			.binary_search_by(|&other| sibling_cmp(&self.nodes[other.index()].name, name))
+			.binary_search_by(|&other| {
+				let other = &nodes[other.index()];
+				let other = &names[other.name_at as usize..][..other.name_len as usize];
+				sibling_cmp(other, name)
+			})
 			.unwrap_or_else(|at| at);
 		kids.insert(at, id);
 		id
+	}
+
+	/// Append `name` to the arena and say where it landed.
+	///
+	/// The cap is the arena's, not one name's: a `u32` offset puts 4 GiB of leaf names out of
+	/// reach, which at the ~15 bytes a real name costs is a pair of a quarter of a billion rows —
+	/// well past the point [`NodeId::from_index`]'s own cap and the disk have given up.
+	fn push_name(&mut self, name: &str) -> (u32, u32) {
+		let at = u32::try_from(self.names.len())
+			.expect("a sync pair's leaf names come to under 4 GiB in total");
+		let len = u32::try_from(name.len()).expect("a leaf name is under 4 GiB");
+		self.names.push_str(name);
+		(at, len)
+	}
+
+	/// Hand `id`'s slot back, and write off its name with it.
+	///
+	/// The bytes stay in the arena — nothing can be taken out of the middle of it — and are counted
+	/// dead so that [`maybe_compact_names`](Self::maybe_compact_names) can weigh them.
+	fn free_node(&mut self, id: NodeId) {
+		self.dead_names += self.nodes[id.index()].name_len as usize;
+		self.free.push(id);
+	}
+
+	/// Rebuild the name arena once most of it is names no node points at.
+	///
+	/// A rename is a remove and an insert, so a pair that renames all day appends a name for every
+	/// one it orphans: without this the arena is the one structure here sized by the pair's
+	/// HISTORY rather than by its tree, and a long-lived pair would grow without bound.
+	///
+	/// Amortised O(1) a name, by construction: a rebuild costs one walk of the live nodes and can
+	/// only run once the dead bytes have caught up with the live ones, which takes as much
+	/// removing again as the walk costs. The floor keeps a small tree from walking itself at all —
+	/// half of a 64 KiB arena is not worth the visit, and a pair whose names never reach it never
+	/// compacts.
+	fn maybe_compact_names(&mut self) {
+		/// Below this the arena is not worth a walk, however much of it is dead.
+		const FLOOR: usize = 64 * 1024;
+		// In EVERY build: this crate's release profile leaves overflow checks off, so a dead count
+		// that had run past the arena would wrap the live figure below to something enormous and
+		// this would never compact again — the unbounded growth it exists to stop, arrived at
+		// silently.
+		assert!(
+			self.dead_names <= self.names.len(),
+			"more of the name arena is written off ({}) than was ever written ({})",
+			self.dead_names,
+			self.names.len()
+		);
+		let live = self.names.len() - self.dead_names;
+		if self.dead_names < FLOOR || self.dead_names < live {
+			return;
+		}
+		let mut arena = String::with_capacity(live);
+		// Every live node is reachable from the root through `children`: a node is only ever
+		// created into its parent's list, and one taken out of it is freed in the same breath.
+		let mut stack = vec![NodeId::ROOT];
+		while let Some(id) = stack.pop() {
+			let node = &self.nodes[id.index()];
+			let (at, len) = (node.name_at as usize, node.name_len as usize);
+			let moved_to =
+				u32::try_from(arena.len()).expect("the live names fit where they already fit");
+			arena.push_str(&self.names[at..at + len]);
+			self.nodes[id.index()].name_at = moved_to;
+			if let Some(kids) = self.children.get(&id) {
+				stack.extend(kids);
+			}
+		}
+		// In EVERY build, for the same reason the dead count above is checked in every build: a
+		// live node the walk did not reach keeps its old offset into an arena that no longer holds
+		// it, and `name()` then slices some other node's bytes out as this node's leaf name — a
+		// silently wrong path, which is the worst thing this tree can produce. One comparison per
+		// compaction, against a compaction that is amortised O(1) a name.
+		assert_eq!(
+			arena.len(),
+			live,
+			"the walk reached every live name and no other"
+		);
+		self.names = arena;
+		self.dead_names = 0;
 	}
 
 	/// Take the row off `id`, leaving the node standing for whatever sits under it.
@@ -1071,7 +1197,7 @@ impl Baseline {
 			let parent = self.nodes[at.index()].parent;
 			self.detach(at);
 			self.children.remove(&at);
-			self.free.push(at);
+			self.free_node(at);
 			at = parent;
 		}
 	}
@@ -1097,7 +1223,7 @@ impl Baseline {
 			if let Some(kids) = self.children.remove(&at) {
 				stack.extend(kids);
 			}
-			self.free.push(at);
+			self.free_node(at);
 		}
 	}
 }
@@ -1491,6 +1617,86 @@ mod tests {
 				at_or_under_folded(path, prefix),
 				folded_path == folded_prefix || is_under(&folded_path, &folded_prefix),
 				"{path:?} at or under {prefix:?}"
+			);
+		}
+	}
+
+	/// A node is 104 bytes, and which 104 is the whole design of this module.
+	///
+	/// Pinned because the cost is per ROW: eight bytes here is eight megabytes on a million-row
+	/// pair, and a field added without a thought for the width would spend that much without
+	/// anything saying so. A failure here is not a bug — it is this test asking which is worth
+	/// more, the new field or the megabytes, and asking it while the field is still easy to move.
+	///
+	/// The arithmetic, for whoever it asks: parent 4, the name's offset and length 4 + 4, kind,
+	/// state and flags 1 each, `remote_uuid` 16, `stable_uuid` 17 (`Uuid` aligns to 1, so an
+	/// `Option` of one costs a single byte more), `content_hash` 32, and three 8-byte integers.
+	#[test]
+	fn a_node_is_104_bytes() {
+		assert_eq!(
+			size_of::<Node>(),
+			104,
+			"the per-row width of the resident tree moved"
+		);
+	}
+
+	/// The name arena is sized by the TREE, never by the pair's history.
+	///
+	/// A rename is a remove and an insert, so every renamed name is appended and the one it
+	/// replaced is left behind. Without compaction a pair that renames all day grows one structure
+	/// for as long as it lives, which is not a leak the way Rust counts leaks and is unbounded
+	/// memory all the same.
+	///
+	/// The second half is what makes the first half safe: compaction rewrites the offset of every
+	/// live node, and one left behind would have a node answering to some other node's name — a
+	/// silently wrong path, which is the worst thing this tree can produce. So the survivors are
+	/// read back BY PATH after the arena has been rebuilt under them.
+	#[test]
+	fn renaming_forever_does_not_grow_the_name_arena_forever() {
+		let keepers: Vec<String> = (0..50).map(|i| format!("keep/k{i}.txt")).collect();
+		let mut tree = Baseline::from_rows(
+			std::iter::once(dir("keep")).chain(
+				keepers
+					.iter()
+					.enumerate()
+					.map(|(i, path)| file(path, Uuid::from_u128(i as u128 + 1), [1; 32])),
+			),
+		);
+		let live = tree.names.len();
+
+		// Long names so the floor is reached in a test-sized number of rounds; the churn is a
+		// create and a delete, which is what a rename is to the arena.
+		let long = "n".repeat(1024);
+		let mut widest = 0;
+		for round in 0..400u128 {
+			let path = format!("keep/{long}{round}.txt");
+			tree.upsert(&file(&path, Uuid::from_u128(round + 1000), [2; 32]));
+			tree.remove(&path);
+			widest = widest.max(tree.names.len());
+		}
+
+		assert!(
+			widest < 200 * 1024,
+			"the arena followed the pair's history rather than its tree: {widest} bytes at its \
+			 widest, against {live} of live names"
+		);
+		assert!(
+			tree.dead_names <= tree.names.len(),
+			"more of the arena is written off than was written"
+		);
+		let mut expected: Vec<String> = keepers.clone();
+		expected.push("keep".to_owned());
+		expected.sort();
+		assert_eq!(
+			paths(&tree),
+			expected,
+			"the churn left the tree it started with"
+		);
+		for path in &keepers {
+			assert_eq!(
+				tree.get(path).map(|row| row.rel_path).as_deref(),
+				Some(path.as_str()),
+				"{path:?} does not resolve to itself after the arena was rebuilt under it"
 			);
 		}
 	}
