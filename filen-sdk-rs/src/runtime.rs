@@ -717,9 +717,18 @@ mod wasm_threading {
 		// A worker that dies without unwinding (panic=abort traps, script-fetch failures) leaks
 		// every channel sender it owns, so its consumers see SILENCE, not errors — this log is
 		// the only direct evidence of the death (it pairs with the cache's init-ack timeout).
-		let onerror = Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(|e: web_sys::ErrorEvent| {
-			tracing::error!("worker startup/runtime error: {}", e.message());
-		});
+		// Not always an ErrorEvent: a worker whose script fails to load fires a plain Event (Firefox), and
+		// reading `message` off that hands undefined to wasm, throwing inside the handler and losing the log.
+		let onerror =
+			Closure::<dyn FnMut(web_sys::Event)>::new(|e: web_sys::Event| match e
+				.dyn_ref::<web_sys::ErrorEvent>()
+			{
+				Some(error) => tracing::error!("worker startup/runtime error: {}", error.message()),
+				None => tracing::error!(
+					"worker startup/runtime error: {} event without details",
+					e.type_()
+				),
+			});
 		worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 		// The handler must outlive the worker; one small leaked closure per spawn is acceptable.
 		onerror.forget();
