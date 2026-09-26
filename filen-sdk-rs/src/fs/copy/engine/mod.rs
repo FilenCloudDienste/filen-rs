@@ -25,7 +25,6 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
-	future::Future,
 	iter, mem,
 	sync::Arc,
 };
@@ -48,9 +47,9 @@ use crate::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
+		drive_job::backend::{CreatedDir, DriveBackend, UploadSpec},
 		file::{
 			RemoteFile,
-			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
@@ -58,7 +57,7 @@ use crate::{
 		name::{ValidatedName, keep_both::TakenNames},
 	},
 	job::{JobControl, JobTasks, Stopped},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
+	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::{
@@ -109,7 +108,7 @@ impl NameRetry {
 	}
 
 	/// `name`, or the first following keep-both name the server reports free in `parent`.
-	async fn free_name<B: CopyBackend>(
+	async fn free_name<B: DriveBackend>(
 		&mut self,
 		backend: &B,
 		parent: Uuid,
@@ -120,98 +119,6 @@ impl NameRetry {
 		}
 		Ok(name)
 	}
-}
-
-/// Outcome of creating a directory.
-#[derive(Debug)]
-pub(crate) enum CreatedDir {
-	Created(RemoteDirectory),
-	/// The server already had a directory with that name there and returned it instead.
-	Merged,
-}
-
-/// What a new file is created as.
-#[derive(Debug, Clone)]
-pub(crate) struct UploadSpec {
-	pub(crate) uuid: Uuid,
-	pub(crate) parent: Uuid,
-	pub(crate) name: ValidatedName,
-	pub(crate) mime: Option<String>,
-}
-
-/// The drive operations a copy needs. The production implementation is the client; tests use
-/// a fake with the real memory semaphore.
-pub(crate) trait CopyBackend: MaybeSendSync + 'static {
-	type DriveLock: MaybeSendSync + 'static;
-	type Upload: MaybeSendSync + 'static;
-
-	/// The client's file-IO memory semaphore, in bytes.
-	fn memory(&self) -> Arc<Semaphore>;
-	/// Acquires the drive lock, waiting while another client holds it.
-	fn acquire_drive_lock(
-		&self,
-	) -> impl Future<Output = Result<Self::DriveLock, Error>> + MaybeSend;
-	fn connected_targets(
-		&self,
-		dir: Uuid,
-	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
-	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
-	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
-	/// the directory, and reports a merge into an existing one instead of returning it.
-	fn create_copy_dir(
-		&self,
-		parent: Uuid,
-		uuid: Uuid,
-		name: &ValidatedName,
-		created: DateTime<Utc>,
-	) -> impl Future<Output = Result<CreatedDir, Error>> + MaybeSend;
-	fn set_dir_color(
-		&self,
-		dir: &mut RemoteDirectory,
-		color: DirColor<'static>,
-	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
-	/// Adds a new item to `targets`; returns the operations that failed.
-	fn propagate(
-		&self,
-		targets: &ConnectedTargets,
-		item: NonRootItemType<'_, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	/// Adds a created top-level item, and for a directory everything below it, to `targets`;
-	/// returns the operations that failed.
-	fn propagate_tree(
-		&self,
-		targets: &ConnectedTargets,
-		item: &NonRootItemType<'static, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload;
-	/// Downloads and decrypts chunk `index` of `file`.
-	fn fetch_chunk(
-		&self,
-		file: &RemoteFileType<'static>,
-		index: u64,
-	) -> impl Future<Output = Result<Vec<u8>, Error>> + MaybeSend;
-	/// Encrypts and uploads the plaintext `data` as chunk `index` of `upload`.
-	fn upload_chunk(
-		&self,
-		upload: &Self::Upload,
-		index: u64,
-		data: Vec<u8>,
-	) -> impl Future<Output = Result<RemoteFileInfo, Error>> + MaybeSend;
-	/// Whether a file or directory called `name` exists in `parent`, compared as the server
-	/// compares names.
-	fn name_exists(
-		&self,
-		parent: Uuid,
-		name: &ValidatedName,
-	) -> impl Future<Output = Result<bool, Error>> + MaybeSend;
-	/// Registers the uploaded file under `name`. The caller holds the drive lock.
-	fn finish_upload(
-		&self,
-		upload: &Self::Upload,
-		name: &ValidatedName,
-		completion: UploadCompletion,
-		info: RemoteFileInfo,
-	) -> impl Future<Output = Result<RemoteFile, Error>> + MaybeSend;
 }
 
 /// Errors after which nothing else can succeed either.
@@ -260,7 +167,7 @@ struct RequestState {
 	targets: Arc<ConnectedTargets>,
 }
 
-struct Job<B: CopyBackend, D> {
+struct Job<B: DriveBackend, D> {
 	backend: Arc<B>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
@@ -289,7 +196,7 @@ pub(crate) async fn run_copy<B, D>(
 	reporter: MaybeArc<Reporter>,
 ) -> Result<CopyReport<D>, CopyFailed<D>>
 where
-	B: CopyBackend,
+	B: DriveBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
 	let mut child_dirs = vec![Vec::new(); plan.dirs.len()];
@@ -330,7 +237,7 @@ where
 
 impl<B, D> Job<B, D>
 where
-	B: CopyBackend,
+	B: DriveBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
@@ -910,7 +817,7 @@ struct DirTask<B> {
 	verify_name: bool,
 }
 
-async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
+async fn create_dir<B: DriveBackend>(task: DirTask<B>) -> DirResult {
 	let DirTask {
 		backend,
 		control,
@@ -943,7 +850,7 @@ async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
 				.map_err(|e| DirError::Failed(stage, e))?;
 		}
 		match backend
-			.create_copy_dir(parent, uuid, &name, created)
+			.create_dir_unpropagated(parent, uuid, &name, created)
 			.await
 			.map_err(|e| DirError::Failed(stage, e))?
 		{
@@ -1045,7 +952,7 @@ enum LockWait<L> {
 /// wait (`Err`), and a pause requested meanwhile ends it or drops the lock just acquired, so a
 /// paused job holds no lock. After [`LockWait::Paused`] the caller waits out the pause before
 /// trying again.
-async fn wait_for_lock<B: CopyBackend>(
+async fn wait_for_lock<B: DriveBackend>(
 	backend: &B,
 	control: &JobControl,
 	reporter: &MaybeArc<Reporter>,
@@ -1101,7 +1008,7 @@ async fn reserve_chunk(
 	}
 }
 
-async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
+async fn copy_file<B: DriveBackend>(task: FileTask<B>) -> FileOutcome {
 	let index = task.index;
 	let parent = task.parent;
 	let top_level = task.top_level;
@@ -1114,7 +1021,7 @@ async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
 	}
 }
 
-async fn copy_file_inner<B: CopyBackend>(
+async fn copy_file_inner<B: DriveBackend>(
 	task: FileTask<B>,
 ) -> Result<(RemoteFile, ValidatedName), FileError> {
 	let FileTask {
