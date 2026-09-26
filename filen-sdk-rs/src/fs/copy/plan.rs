@@ -22,11 +22,12 @@ use crate::{
 		HasName, HasUUID,
 		dir::traits::HasDirInfo,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
-		name::ValidatedName,
+		name::{
+			ValidatedName,
+			keep_both::{SourceName, TakenNames},
+		},
 	},
 };
-
-use super::naming::{SourceName, TakenNames};
 
 /// A source directory, independent of the category it was listed from.
 #[derive(Debug, Clone)]

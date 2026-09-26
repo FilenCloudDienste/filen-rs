@@ -1,9 +1,11 @@
-//! "Keep both" naming for copies: every copied item gets a name that is free in its
-//! destination directory, `name (1).ext` style.
+//! "Keep both" naming: an item written into a directory gets a name that is free there,
+//! `name (1).ext` style, instead of replacing (or, on the server, versioning) what is already
+//! there. Used wherever the SDK creates items from other items: copies, compressed archives and
+//! extracted entries.
 
 use std::{borrow::Cow, collections::HashSet};
 
-use crate::fs::name::{EntryNameError, EntryNameErrorKind, MAX_BYTES, ValidatedName, encode_name};
+use super::{EntryNameError, EntryNameErrorKind, MAX_BYTES, ValidatedName, encode_name};
 
 /// The key two names collide on. The server compares names through `hash_name`, which
 /// lowercases with [`str::to_lowercase`], so this must use exactly the same folding.

@@ -7,7 +7,6 @@ mod client_impl;
 mod engine;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod js_impl;
-mod naming;
 mod plan;
 mod report;
 
