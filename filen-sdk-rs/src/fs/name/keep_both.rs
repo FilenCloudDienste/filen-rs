@@ -3,7 +3,10 @@
 //! there. Used wherever the SDK creates items from other items: copies, compressed archives and
 //! extracted entries.
 
-use std::{borrow::Cow, collections::HashSet};
+use std::{
+	borrow::Cow,
+	collections::{HashMap, HashSet},
+};
 
 use super::{EntryNameError, EntryNameErrorKind, MAX_BYTES, ValidatedName, encode_name};
 
@@ -40,12 +43,17 @@ impl SourceName {
 #[derive(Debug, Default)]
 pub(crate) struct TakenNames {
 	keys: HashSet<String>,
+	/// Per `(stem, extension)` collision key, a counter below which every candidate is known to
+	/// be taken, so the `k`-th duplicate of one name does not retry the `k - 1` before it.
+	/// Names are only ever added, so a candidate once seen taken stays taken.
+	next_counter: HashMap<(String, String), u64>,
 }
 
 impl TakenNames {
 	pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
 		Self {
 			keys: names.into_iter().map(collision_key).collect(),
+			next_counter: HashMap::new(),
 		}
 	}
 
@@ -78,17 +86,30 @@ impl TakenNames {
 		let (mut base, mut n) = strip_counter(stem)
 			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
 			.unwrap_or((stem, 1));
+		let mut key = (collision_key(base), collision_key(ext));
+		let known_taken_below = self.next_counter.get(&key).copied().unwrap_or(1);
+		// the hint may only be raised when every counter below this start is known taken
+		let mut contiguous = n <= known_taken_below;
+		n = n.max(known_taken_below);
 		loop {
 			let candidate = numbered_candidate(base, n, ext)?;
 			if self.insert(candidate.as_ref()) {
+				if contiguous && let Some(next) = n.checked_add(1) {
+					self.next_counter.insert(key, next);
+				}
 				return Ok(candidate);
 			}
 			// Every iteration either returns or skips a taken name, and only finitely many
-			// names are taken, so counting up from 1 terminates. Only a continued counter can
-			// run out of numbers; the whole stem then starts over at 1.
+			// names are taken, so counting up terminates. Only a continued counter can run out
+			// of numbers; the whole stem then starts over at 1, with its own hint.
 			(base, n) = match n.checked_add(1) {
 				Some(next) => (base, next),
-				None => (stem, 1),
+				None => {
+					key = (collision_key(stem), key.1);
+					let start = self.next_counter.get(&key).copied().unwrap_or(1);
+					contiguous = true;
+					(stem, start)
+				}
 			};
 		}
 	}
@@ -288,6 +309,38 @@ mod tests {
 		assert!(renamed.len() <= MAX_BYTES, "{} bytes", renamed.len());
 		assert!(renamed.starts_with("a."), "{renamed}");
 		assert!(renamed.ends_with(" (1)"), "{renamed}");
+	}
+
+	#[test]
+	fn many_duplicates_are_allocated_in_linear_time() {
+		// names from an archive are attacker-chosen: the k-th duplicate must not retry every
+		// counter before it, or 20k duplicates of one name (and of its case variants) would
+		// take hundreds of millions of candidate checks
+		let mut names = TakenNames::default();
+		let start = std::time::Instant::now();
+		let mut last = String::new();
+		for i in 0..20_000 {
+			let spelling = if i % 2 == 0 {
+				"report.pdf"
+			} else {
+				"REPORT.pdf"
+			};
+			last = names.allocate(source_name(spelling), false).unwrap().into();
+		}
+		assert_eq!(last, "REPORT (19999).pdf");
+		assert!(
+			start.elapsed() < std::time::Duration::from_secs(1),
+			"{:?}",
+			start.elapsed()
+		);
+		// the hint never skips a free counter, even one below a counter taken out of order
+		let mut names = TakenNames::new(["a.txt", "a (2).txt"]);
+		let first: String = names.allocate(source_name("a.txt"), false).unwrap().into();
+		let second: String = names.allocate(source_name("a.txt"), false).unwrap().into();
+		assert_eq!(
+			[first.as_str(), second.as_str()],
+			["a (1).txt", "a (3).txt"]
+		);
 	}
 
 	#[test]
