@@ -5,6 +5,8 @@
 //! job can finish (or drop) its in-flight chunks and release their memory reservations before
 //! it parks.
 
+pub(crate) mod progress;
+
 use std::{
 	future::Future,
 	sync::{

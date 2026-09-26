@@ -3,6 +3,9 @@
 //!
 //! Everything here takes the current time as an argument (time since the job started), so it
 //! is deterministic under test; the job reads its clock once per call.
+//!
+//! Unlike [`crate::progress`], which throttles one transfer's byte callback, this serves jobs made
+//! of many items that report batched events alongside their counters.
 
 use std::{collections::VecDeque, time::Duration};
 

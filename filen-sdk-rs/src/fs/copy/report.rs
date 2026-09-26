@@ -23,14 +23,14 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		file::enums::RemoteFileType,
 	},
-	job::{JobControl, Stopped},
+	job::{
+		JobControl, Stopped,
+		progress::{ActiveClock, EventBatcher, RateEstimator, work_units},
+	},
 	util::{MaybeArc, MaybeSendSync},
 };
 
-use super::{
-	plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry},
-	progress::{ActiveClock, EventBatcher, RateEstimator, work_units},
-};
+use super::plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
