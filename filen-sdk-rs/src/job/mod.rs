@@ -5,6 +5,9 @@
 //! job can finish (or drop) its in-flight chunks and release their memory reservations before
 //! it parks.
 
+pub(crate) mod progress;
+pub(crate) mod report;
+
 use std::{
 	future::Future,
 	sync::{
@@ -61,7 +64,9 @@ pub struct JobController {
 }
 
 impl JobController {
-	/// The job finishes what is in flight and then waits, holding nothing, until resumed.
+	/// The job finishes what is in flight and then waits until resumed, holding no drive lock and
+	/// no reservation from the client's memory budget. What a job keeps resident while paused, if
+	/// anything, is stated in that job's docs.
 	pub fn pause(&self) {
 		self.pause.send_replace(true);
 	}

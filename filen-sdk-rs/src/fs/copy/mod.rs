@@ -9,7 +9,6 @@ mod engine;
 mod js_impl;
 mod naming;
 mod plan;
-mod progress;
 mod report;
 
 pub use crate::job::{JobControl, JobController};

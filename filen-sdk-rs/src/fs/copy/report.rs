@@ -1,18 +1,7 @@
 //! What a copy reports while it runs and when it ends, and the [`Reporter`] that turns job
 //! state changes into throttled, ordered callbacks.
 
-use std::{
-	sync::{
-		Arc, Mutex,
-		atomic::{AtomicU64, Ordering},
-	},
-	time::Duration,
-};
-
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use std::time::Instant;
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-use wasmtimer::std::Instant;
+use std::{sync::Arc, time::Duration};
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -23,14 +12,18 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		file::enums::RemoteFileType,
 	},
-	job::{JobControl, Stopped},
+	job::{
+		self,
+		progress::work_units,
+		report::{JobFailed, JobPhase, JobReport, JobState, Progress, RunCore, Snapshot, Units},
+	},
 	util::{MaybeArc, MaybeSendSync},
 };
 
-use super::{
-	plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry},
-	progress::{ActiveClock, EventBatcher, RateEstimator, work_units},
-};
+pub(crate) use crate::job::report::OpGuard;
+pub use crate::job::report::RunState;
+
+use super::plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
@@ -51,25 +44,6 @@ pub enum CopyPhase {
 	Cancelled,
 	/// Ended early by an error that affects the whole job (e.g. no storage left).
 	Failed,
-}
-
-/// Whether a copy is running, and how far a pause or cancel has got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, tsify::Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints),
-	serde(rename_all = "camelCase")
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum RunState {
-	Running,
-	/// A pause was requested and in-flight work is still finishing.
-	Pausing,
-	/// Paused: nothing is running, and no memory or drive lock is held.
-	Paused,
-	/// Cancelled and winding down; a cancel overrides a pause.
-	Cancelling,
 }
 
 /// Running counts. Once the job is over, everything planned is done, failed or not attempted:
@@ -274,29 +248,12 @@ impl<D> Default for CopyReport<D> {
 	}
 }
 
-/// A copy that ended early: cancelled, or stopped by an error that affects the whole job.
-#[derive(Debug, thiserror::Error)]
-#[error("the copy ended early: {error}")]
-pub struct CopyFailed<D> {
-	/// What the copy did before it ended.
-	pub report: CopyReport<D>,
-	/// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) after a cancel, or the error that
-	/// ended the copy. Shared with the failure it came from when one item's error ended the
-	/// whole copy, since [`Error`] is not `Clone`.
-	#[source]
-	pub error: Arc<Error>,
+impl<D: std::fmt::Debug> JobReport for CopyReport<D> {
+	const NAME: &'static str = "copy";
 }
 
-impl<D> From<CopyFailed<D>> for Error {
-	/// The error that ended the copy: the original once nothing else holds it, or else an error
-	/// of the same kind wrapping the shared one.
-	fn from(failed: CopyFailed<D>) -> Self {
-		let CopyFailed { report, error } = failed;
-		// the report may hold the error too, in the failure it came from
-		drop(report);
-		Error::unshared(error)
-	}
-}
+/// A copy that ended early: cancelled, or stopped by an error that affects the whole job.
+pub type CopyFailed<D> = JobFailed<CopyReport<D>>;
 
 /// Receives a copy's progress. All calls come from the one job, in order.
 pub trait CopyCallback: MaybeSendSync + 'static {
@@ -319,224 +276,114 @@ impl<T: CopyCallback + ?Sized> CopyCallback for Arc<T> {
 	}
 }
 
-// `pause_requested`, `paused` and `cancelling` can hold together (`run_state` ranks them);
-// `changed` marks unsent progress.
-#[allow(clippy::struct_excessive_bools)]
-struct State {
-	phase: CopyPhase,
-	pause_requested: bool,
-	paused: bool,
-	cancelling: bool,
+/// What a copy counts, next to the job-agnostic [`RunCore`].
+pub(crate) struct CopyState {
+	core: RunCore<CopyEvent, CopyPhase>,
 	scan: ScanProgress,
 	totals: PlanTotals,
 	counts: CopyCounts,
 	active: Vec<ActiveFile>,
-	batcher: EventBatcher<CopyEvent>,
-	changed: bool,
-	clock: ActiveClock,
-	rate: RateEstimator,
 }
 
-impl State {
-	fn run_state(&self) -> RunState {
-		if self.cancelling {
-			RunState::Cancelling
-		} else if self.paused {
-			RunState::Paused
-		} else if self.pause_requested {
-			RunState::Pausing
-		} else {
-			RunState::Running
+impl JobPhase for CopyPhase {
+	fn is_terminal(self) -> bool {
+		matches!(self, Self::Done | Self::Cancelled | Self::Failed)
+	}
+}
+
+impl JobState for CopyState {
+	type Phase = CopyPhase;
+	type Event = CopyEvent;
+	type Callback = dyn CopyCallback;
+
+	fn core(&mut self) -> &mut RunCore<CopyEvent, CopyPhase> {
+		&mut self.core
+	}
+
+	fn progress(&self) -> Progress {
+		let counts = self.counts;
+		Progress {
+			bytes_done: counts.bytes_done,
+			units: Units {
+				done: work_units(
+					counts.files_done + counts.files_failed,
+					counts.bytes_done + counts.bytes_failed,
+				),
+				settled: work_units(
+					counts.files_done + counts.files_failed + counts.files_not_attempted,
+					counts.bytes_done + counts.bytes_failed + counts.bytes_not_attempted,
+				),
+				total: work_units(self.totals.files, self.totals.bytes),
+			},
+		}
+	}
+
+	fn deliver(&mut self, callback: &dyn CopyCallback, snapshot: Snapshot<CopyEvent, CopyPhase>) {
+		callback.on_update(CopyUpdate {
+			phase: snapshot.phase,
+			run_state: snapshot.run_state,
+			scan: self.scan,
+			totals: self.totals,
+			counts: self.counts,
+			active: self.active.clone(),
+			events: snapshot.events,
+			bytes_per_second: snapshot.bytes_per_second,
+			eta: snapshot.eta,
+			active_time: snapshot.active_time,
+		});
+	}
+
+	fn settle(&mut self) {
+		for file in std::mem::take(&mut self.active) {
+			// normally already settled; a file still running now was never finished
+			self.counts.bytes_done -= file.bytes_done;
+		}
+		let totals = self.totals;
+		let counts = &mut self.counts;
+		counts.dirs_not_attempted = totals
+			.dirs
+			.saturating_sub(counts.dirs_created + counts.dirs_failed);
+		counts.files_not_attempted = totals
+			.files
+			.saturating_sub(counts.files_done + counts.files_failed);
+		counts.bytes_not_attempted = totals
+			.bytes
+			.saturating_sub(counts.bytes_done + counts.bytes_failed);
+	}
+}
+
+impl CopyState {
+	fn remove_active(&mut self, dest_uuid: Uuid) -> u64 {
+		match self.active.iter().position(|f| f.dest_uuid == dest_uuid) {
+			Some(index) => self.active.remove(index).bytes_done,
+			None => 0,
 		}
 	}
 }
 
-/// Turns job state changes into callbacks. Every callback is made while holding the state lock,
-/// so the callback sees them in the order the job produced them.
-pub(crate) struct Reporter {
-	state: Mutex<State>,
-	callback: Box<dyn CopyCallback>,
-	start: Instant,
-	ops_in_flight: AtomicU64,
-}
-
-/// Counts an operation (chunk transfer, create, finalize) as in flight until dropped; a pause is
-/// only complete once none are.
-pub(crate) struct OpGuard(MaybeArc<Reporter>);
-
-impl Drop for OpGuard {
-	fn drop(&mut self) {
-		self.0.ops_in_flight.fetch_sub(1, Ordering::SeqCst);
-		self.0.tick();
-	}
-}
+/// A copy's reporter: the job-agnostic [`job::report::Reporter`] over a [`CopyState`].
+pub(crate) type Reporter = job::report::Reporter<CopyState>;
 
 impl Reporter {
 	pub(crate) fn new(callback: impl CopyCallback) -> MaybeArc<Self> {
-		let start = Instant::now();
-		let mut clock = ActiveClock::default();
-		clock.resume(Duration::ZERO);
-		MaybeArc::new(Self {
-			state: Mutex::new(State {
-				phase: CopyPhase::Scanning,
-				pause_requested: false,
-				paused: false,
-				cancelling: false,
+		Self::from_parts(
+			CopyState {
+				core: RunCore::new(CopyPhase::Scanning),
 				scan: ScanProgress::default(),
 				totals: PlanTotals::default(),
 				counts: CopyCounts::default(),
 				active: Vec::new(),
-				batcher: EventBatcher::default(),
-				changed: true,
-				clock,
-				rate: RateEstimator::default(),
-			}),
-			callback: Box::new(callback),
-			start,
-			ops_in_flight: AtomicU64::new(0),
-		})
-	}
-
-	fn now(&self) -> Duration {
-		self.start.elapsed()
-	}
-
-	/// Applies `change`, settles whether the job counts as paused, and sends an update when one
-	/// is due.
-	fn with_state(&self, change: impl FnOnce(&mut State)) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		change(&mut state);
-		self.update_paused(&mut state, now);
-		if state.batcher.is_due(now, state.changed) {
-			self.flush(&mut state, now);
-		}
-	}
-
-	fn flush(&self, state: &mut State, now: Duration) {
-		let active_time = state.clock.active(now);
-		let counts = state.counts;
-		let done_units = work_units(
-			counts.files_done + counts.files_failed,
-			counts.bytes_done + counts.bytes_failed,
-		);
-		let settled_units = work_units(
-			counts.files_done + counts.files_failed + counts.files_not_attempted,
-			counts.bytes_done + counts.bytes_failed + counts.bytes_not_attempted,
-		);
-		let total_units = work_units(state.totals.files, state.totals.bytes);
-		let finished = matches!(
-			state.phase,
-			CopyPhase::Done | CopyPhase::Cancelled | CopyPhase::Failed
-		);
-		state
-			.rate
-			.record(active_time, state.counts.bytes_done, done_units);
-		let events = state.batcher.take(now);
-		state.changed = false;
-		self.callback.on_update(CopyUpdate {
-			phase: state.phase,
-			run_state: state.run_state(),
-			scan: state.scan,
-			totals: state.totals,
-			counts: state.counts,
-			active: state.active.clone(),
-			events,
-			bytes_per_second: state.rate.bytes_per_second(),
-			// a job winding down copies nothing more, so there is no time left to estimate
-			eta: if state.cancelling && !finished {
-				None
-			} else {
-				state.rate.eta(total_units.saturating_sub(settled_units))
 			},
-			active_time,
-		});
-	}
-
-	/// Settles whether the job counts as paused, and sends an update when one is due (the
-	/// throttle interval has passed, or the pause state changed).
-	pub(crate) fn tick(&self) {
-		self.with_state(|_| {});
-	}
-
-	/// Counts an operation as in flight; taken before the operation holds anything.
-	pub(crate) fn op(self: &MaybeArc<Self>) -> OpGuard {
-		self.ops_in_flight.fetch_add(1, Ordering::SeqCst);
-		// a job reported paused stops being paused once anything starts
-		self.tick();
-		OpGuard(MaybeArc::clone(self))
-	}
-
-	#[cfg(test)]
-	pub(crate) fn ops_in_flight(&self) -> u64 {
-		self.ops_in_flight.load(Ordering::SeqCst)
-	}
-
-	/// Waits out a pause, reporting it; `Err` once the job is stopping.
-	pub(crate) async fn checkpoint(&self, control: &JobControl) -> Result<(), Stopped> {
-		self.set_pause_requested(control.is_pause_requested());
-		let result = control.checkpoint().await;
-		self.set_pause_requested(control.is_pause_requested());
-		if result.is_err() {
-			self.set_cancelling();
-		}
-		result
-	}
-
-	/// Records whether a pause is requested; the job counts as paused once no operation is in
-	/// flight.
-	pub(crate) fn set_pause_requested(&self, requested: bool) {
-		self.with_state(|state| {
-			if state.pause_requested != requested {
-				state.pause_requested = requested;
-				state.batcher.mark_urgent();
-			}
-		});
-	}
-
-	fn update_paused(&self, state: &mut State, now: Duration) {
-		let paused = state.pause_requested
-			&& !state.cancelling
-			&& self.ops_in_flight.load(Ordering::SeqCst) == 0;
-		if paused != state.paused {
-			state.paused = paused;
-			if paused {
-				state.clock.pause(now);
-			} else {
-				state.clock.resume(now);
-			}
-			state.batcher.mark_urgent();
-		}
-	}
-
-	#[cfg(test)]
-	pub(crate) fn is_paused(&self) -> bool {
-		self.state.lock().unwrap_or_else(|e| e.into_inner()).paused
-	}
-
-	pub(crate) fn set_phase(&self, phase: CopyPhase) {
-		self.with_state(|state| {
-			if state.phase != phase {
-				state.phase = phase;
-				state.batcher.mark_urgent();
-			}
-		});
-	}
-
-	/// A cancel overrides a pause: the job winds down instead of pausing.
-	pub(crate) fn set_cancelling(&self) {
-		self.with_state(|state| {
-			if !state.cancelling {
-				state.cancelling = true;
-				state.batcher.mark_urgent();
-			}
-		});
+			Box::new(callback),
+		)
 	}
 
 	pub(crate) fn set_scan(&self, scan: ScanProgress) {
 		self.with_state(|state| {
-			state.changed |= state.scan != scan;
-			state.scan = scan;
+			if state.scan != scan {
+				state.scan = scan;
+				state.core.mark_changed();
+			}
 		});
 	}
 
@@ -556,27 +403,23 @@ impl Reporter {
 				};
 				state.counts.bytes_skipped += entry.bytes;
 				// the report keeps the entry too
-				state.batcher.push(CopyEvent::Skipped(entry.clone()));
+				state.core.push(CopyEvent::Skipped(entry.clone()));
 			}
 			for entry in renamed {
-				state.batcher.push(CopyEvent::Renamed(entry.clone()));
+				state.core.push(CopyEvent::Renamed(entry.clone()));
 			}
-			state.changed = true;
-			state.batcher.mark_urgent();
+			state.core.mark_changed();
+			state.core.mark_urgent();
 		});
 	}
 
 	pub(crate) fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-		let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		self.callback.on_top_level_planned(items);
+		self.call(|callback| callback.on_top_level_planned(items));
 	}
 
 	/// Delivered at once, after an update carrying everything that happened before it.
 	pub(crate) fn top_level_created(&self, item: CopiedTopLevel) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		self.flush(&mut state, now);
-		self.callback.on_top_level_created(item);
+		self.flush_then_call(|callback| callback.on_top_level_created(item));
 	}
 
 	pub(crate) fn dir_created(
@@ -588,8 +431,7 @@ impl Reporter {
 	) {
 		self.with_state(|state| {
 			state.counts.dirs_created += 1;
-			state.changed = true;
-			state.batcher.push(CopyEvent::DirCreated {
+			state.core.push(CopyEvent::DirCreated {
 				source_uuid,
 				dest_uuid,
 				dest_parent,
@@ -605,16 +447,14 @@ impl Reporter {
 			state.counts.dirs_failed += 1 + descendant_dirs;
 			state.counts.files_failed += info.affected_files;
 			state.counts.bytes_failed += info.affected_bytes;
-			state.changed = true;
-			state.batcher.push(CopyEvent::DirFailed(info));
+			state.core.push(CopyEvent::DirFailed(info));
 		});
 	}
 
 	pub(crate) fn file_started(&self, file: ActiveFile) {
 		self.with_state(|state| {
 			state.active.push(file.clone());
-			state.changed = true;
-			state.batcher.push(CopyEvent::FileStarted(file));
+			state.core.push(CopyEvent::FileStarted(file));
 		});
 	}
 
@@ -624,25 +464,17 @@ impl Reporter {
 			if let Some(file) = state.active.iter_mut().find(|f| f.dest_uuid == dest_uuid) {
 				file.bytes_done += bytes;
 			}
-			state.changed = true;
+			state.core.mark_changed();
 		});
-	}
-
-	fn remove_active(state: &mut State, dest_uuid: Uuid) -> u64 {
-		match state.active.iter().position(|f| f.dest_uuid == dest_uuid) {
-			Some(index) => state.active.remove(index).bytes_done,
-			None => 0,
-		}
 	}
 
 	pub(crate) fn file_done(&self, file: &ActiveFile) {
 		self.with_state(|state| {
-			let counted = Self::remove_active(state, file.dest_uuid);
+			let counted = state.remove_active(file.dest_uuid);
 			// a file whose chunks were counted as they uploaded ends with exactly its size
 			state.counts.bytes_done = state.counts.bytes_done - counted + file.size;
 			state.counts.files_done += 1;
-			state.changed = true;
-			state.batcher.push(CopyEvent::FileDone {
+			state.core.push(CopyEvent::FileDone {
 				source_uuid: file.source_uuid,
 				dest_uuid: file.dest_uuid,
 				dest_parent: file.dest_parent,
@@ -655,72 +487,34 @@ impl Reporter {
 	/// A failed file; the bytes it already uploaded move from done to failed.
 	pub(crate) fn file_failed(&self, dest_uuid: Uuid, info: FailureInfo) {
 		self.with_state(|state| {
-			let counted = Self::remove_active(state, dest_uuid);
+			let counted = state.remove_active(dest_uuid);
 			state.counts.bytes_done -= counted;
 			state.counts.bytes_failed += info.affected_bytes;
 			state.counts.files_failed += info.affected_files;
-			state.changed = true;
-			state.batcher.push(CopyEvent::FileFailed(info));
+			state.core.push(CopyEvent::FileFailed(info));
 		});
 	}
 
 	/// A file that was running when the job stopped: it is neither done nor failed.
 	pub(crate) fn file_abandoned(&self, dest_uuid: Uuid) {
 		self.with_state(|state| {
-			let counted = Self::remove_active(state, dest_uuid);
+			let counted = state.remove_active(dest_uuid);
 			state.counts.bytes_done -= counted;
-			state.changed = true;
+			state.core.mark_changed();
 		});
 	}
 
 	pub(crate) fn event(&self, event: CopyEvent) {
-		self.with_state(|state| {
-			state.changed = true;
-			state.batcher.push(event);
-		});
+		self.with_state(|state| state.core.push(event));
 	}
 
 	pub(crate) fn counts(&self) -> CopyCounts {
-		self.state.lock().unwrap_or_else(|e| e.into_inner()).counts
-	}
-
-	/// The last update of a job, sent at once.
-	pub(crate) fn finish(&self, phase: CopyPhase) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		self.end(&mut state, phase, now);
+		self.read(|state| state.counts)
 	}
 
 	/// The last update of a job that ends before it starts: it carries the `totals` the job
 	/// would have copied, none of them attempted.
 	pub(crate) fn finish_unstarted(&self, phase: CopyPhase, totals: PlanTotals) {
-		let now = self.now();
-		let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-		state.totals = totals;
-		self.end(&mut state, phase, now);
-	}
-
-	fn end(&self, state: &mut State, phase: CopyPhase, now: Duration) {
-		state.phase = phase;
-		for file in std::mem::take(&mut state.active) {
-			// normally already settled; a file still running now was never finished
-			state.counts.bytes_done -= file.bytes_done;
-		}
-		let totals = state.totals;
-		let counts = &mut state.counts;
-		counts.dirs_not_attempted = totals
-			.dirs
-			.saturating_sub(counts.dirs_created + counts.dirs_failed);
-		counts.files_not_attempted = totals
-			.files
-			.saturating_sub(counts.files_done + counts.files_failed);
-		counts.bytes_not_attempted = totals
-			.bytes
-			.saturating_sub(counts.bytes_done + counts.bytes_failed);
-		// a finished job is neither pausing nor paused, whatever was last requested
-		state.pause_requested = false;
-		state.paused = false;
-		state.clock.pause(now);
-		self.flush(state, now);
+		self.finish_with(phase, |state| state.totals = totals);
 	}
 }
