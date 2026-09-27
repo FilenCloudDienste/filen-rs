@@ -1217,6 +1217,67 @@ async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
 	assert!(config.floor_is_free());
 }
 
+/// Asserts a paused job holds nothing it gives back: memory, its floor, a drive lock, an
+/// operation in flight.
+fn assert_paused_holding_nothing(setup: &Setup, job: &Job, config: &ArchiveConfig) {
+	assert!(job.reporter.is_paused());
+	assert_eq!(
+		setup.backend.memory.available_permits(),
+		setup.backend.budget,
+		"a paused job holds no memory"
+	);
+	assert!(config.floor_is_free(), "a paused job holds no floor");
+	assert_eq!(
+		setup.backend.live_locks.load(Ordering::SeqCst),
+		0,
+		"a paused job holds no drive lock"
+	);
+	assert_eq!(job.reporter.ops_in_flight(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_a_registration_waits_for_the_lock_holds_nothing() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		// another client holds the drive lock from the registration on (the folder's create
+		// is the first acquisition)
+		backend.block_locks_from.send_replace(Some(1));
+	});
+	let config = test_config();
+	let (pause, _cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+	);
+	wait_until("a.txt's registration waits for the lock", || {
+		setup.backend.log().lock_waits == 1
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_paused_holding_nothing(&setup, &job, &config);
+	assert!(finished(&setup).is_empty());
+
+	setup.backend.block_locks_from.send_replace(None);
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle/a.txt"]);
+	assert_eq!(report.counts.files_done, 1);
+	assert_eq!(
+		job.recorder.run_states(),
+		[
+			RunState::Running,
+			RunState::Pausing,
+			RunState::Paused,
+			RunState::Running
+		]
+	);
+	assert_released(&setup, &job.reporter);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 	// b.txt's registration runs long; a.bin's upload ends while the pause is requested, and the

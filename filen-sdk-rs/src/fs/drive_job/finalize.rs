@@ -22,7 +22,7 @@ use crate::{
 
 use super::{
 	backend::DriveBackend,
-	lock::{LockWait, wait_for_lock},
+	lock::{HeldLock, LockWait, wait_for_lock},
 	name_retry::NameRetry,
 };
 
@@ -73,10 +73,46 @@ impl From<Stopped> for FinalizeError {
 pub(crate) async fn finalize_new_file<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
 ) -> Result<Finalized, FinalizeError> {
+	let lock = loop {
+		task.control.checkpoint().await?;
+		match wait_for_lock(task.backend, task.control, task.ops).await? {
+			LockWait::Locked(held) => break held,
+			LockWait::Paused => {}
+			LockWait::Failed(error) => return Err(FinalizeError::Failed(error)),
+		}
+	};
+	register(task, lock).await
+}
+
+/// Registers an uploaded file like [`finalize_new_file`], except that a pause requested before
+/// the drive lock is held ends it with nothing sent (`None`) instead of being waited out, for
+/// the caller to start it again once resumed: a job that pauses once its registrations are
+/// over is never kept from pausing by one waiting for the lock.
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub(crate) async fn finalize_new_file_unless_paused<B: DriveBackend>(
+	task: FinalizeTask<'_, B>,
+) -> Option<Result<Finalized, FinalizeError>> {
+	let lock = match wait_for_lock(task.backend, task.control, task.ops).await {
+		Ok(LockWait::Locked(held)) => held,
+		Ok(LockWait::Paused) => return None,
+		Ok(LockWait::Failed(error)) => return Some(Err(FinalizeError::Failed(error))),
+		Err(Stopped) => return Some(Err(FinalizeError::Stopped)),
+	};
+	Some(register(task, lock).await)
+}
+
+/// Registers the file under the drive lock `_lock`.
+async fn register<B: DriveBackend>(
+	task: FinalizeTask<'_, B>,
+	_lock: HeldLock<B::DriveLock>,
+) -> Result<Finalized, FinalizeError> {
 	let FinalizeTask {
 		backend,
-		control,
-		ops,
+		control: _,
+		ops: _,
 		upload,
 		parent,
 		mut name,
@@ -85,14 +121,6 @@ pub(crate) async fn finalize_new_file<B: DriveBackend>(
 		info,
 		targets,
 	} = task;
-	let _lock = loop {
-		control.checkpoint().await?;
-		match wait_for_lock(backend, control, ops).await? {
-			LockWait::Locked(held) => break held,
-			LockWait::Paused => {}
-			LockWait::Failed(error) => return Err(FinalizeError::Failed(error)),
-		}
-	};
 	if let Some(retry) = recheck {
 		// Registering a file under a name the parent already holds would make it a new version
 		// of that file instead of a new file, so the name is checked again here, while holding

@@ -64,7 +64,7 @@ use crate::{
 			counts::ItemCounts,
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			ends_job,
-			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
+			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
 			lock::{LockWait, wait_for_lock},
 			name_retry::NameRetry,
 		},
@@ -187,6 +187,10 @@ type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard)
 /// An uploaded chunk of a file, by the file's ordinal.
 type UploadedChunk = (u64, u64, Result<RemoteFileInfo, Error>);
 
+/// A file's registration, by the file's ordinal; `None` when a pause came first, to be started
+/// again on resume.
+type Registration = (u64, Option<Result<Finalized, FinalizeError>>);
+
 struct Driver<B: DriveBackend> {
 	backend: Arc<B>,
 	control: JobControl,
@@ -239,8 +243,7 @@ struct Driver<B: DriveBackend> {
 	/// The file receiving data.
 	current: Option<u64>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, UploadedChunk>>,
-	finalizes:
-		FuturesUnordered<MaybeSendBoxFuture<'static, (u64, Result<Finalized, FinalizeError>)>>,
+	finalizes: FuturesUnordered<MaybeSendBoxFuture<'static, Registration>>,
 	/// An event the driver cannot take on yet, and so the last it took: while it waits, the
 	/// codec parks.
 	held: Option<WorkerEvent>,
@@ -1519,7 +1522,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let targets = Arc::clone(&self.targets);
 		self.finalizes.push(Box::pin(async move {
 			let mut retry = NameRetry::new(NameShape::File);
-			let result = finalize_new_file(FinalizeTask {
+			let result = finalize_new_file_unless_paused(FinalizeTask {
 				backend: &*backend,
 				control: &control,
 				ops: &ops,
@@ -1537,7 +1540,18 @@ impl<B: DisposalBackend> Driver<B> {
 		}) as MaybeSendBoxFuture<'static, _>);
 	}
 
-	fn finalize_finished(&mut self, ordinal: u64, result: Result<Finalized, FinalizeError>) {
+	fn finalize_finished(
+		&mut self,
+		ordinal: u64,
+		result: Option<Result<Finalized, FinalizeError>>,
+	) {
+		let Some(result) = result else {
+			// a pause came before the drive lock: started again on resume
+			if let Some(file) = self.files.get_mut(&ordinal) {
+				file.finalizing = false;
+			}
+			return;
+		};
 		let Some(file) = self.files.remove(&ordinal) else {
 			return;
 		};
