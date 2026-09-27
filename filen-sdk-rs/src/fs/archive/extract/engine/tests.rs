@@ -1017,7 +1017,7 @@ async fn directories_are_planned_only_as_fast_as_they_are_created() {
 		_ => dir_entry(ordinal as u64, &format!("blocked/d{ordinal:04}")),
 	};
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	// longer than a silent codec is given, which a waiting one must not be taken for
@@ -1085,7 +1085,7 @@ async fn files_are_read_only_as_fast_as_they_are_registered() {
 	let (events, result, link) = worker::scripted::<CodecResult>();
 	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	let count = MAX_OPEN_FILES + 10;
@@ -2244,7 +2244,7 @@ async fn a_pause_while_the_archive_opens_holds_nothing() {
 		Box::new(move || Ok(link)),
 	);
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	// chunks are prefetched (their memory taken) before the event is, and wait meanwhile
@@ -2309,7 +2309,7 @@ async fn a_pause_leaves_no_directory_uncreated() {
 		Box::new(move || Ok(link)),
 	);
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	for ordinal in 0..count {
@@ -2353,7 +2353,7 @@ async fn a_cancel_leaves_the_directories_not_created_yet_not_attempted() {
 		Box::new(move || Ok(link)),
 	);
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	for ordinal in 0..count {
@@ -2538,7 +2538,7 @@ async fn a_pause_while_finishing_gives_back_the_input_and_the_lock() {
 	// more top-level items than are propagated at once
 	let count = MAX_SMALL_PARALLEL_REQUESTS + 6;
 	events
-		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
 	for ordinal in 0..count {

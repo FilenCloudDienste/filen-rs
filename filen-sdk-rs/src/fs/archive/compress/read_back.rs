@@ -22,11 +22,9 @@ use crate::{
 		archive::{
 			config::ArchiveConfig,
 			extract::codec::{ArchiveEnd, CodecLimits, StreamJob, extract_stream},
+			format::ArchiveFormat,
 			password::ArchivePassword,
-			worker::{
-				self, ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, StreamLayout, WorkerEvent,
-				WorkerLink,
-			},
+			worker::{self, ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, WorkerEvent, WorkerLink},
 		},
 		drive_job::backend::DriveBackend,
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
@@ -164,7 +162,7 @@ impl Check {
 		match event {
 			WorkerEvent::Ask { .. } => unreachable!("the reader's asks are answered first"),
 			WorkerEvent::Opened(layout) => {
-				self.single = matches!(layout, StreamLayout::Single { .. });
+				self.single = matches!(layout, ArchiveFormat::Single { .. });
 			}
 			WorkerEvent::Entry(EntryHead { path, kind, .. }) => {
 				let path = path

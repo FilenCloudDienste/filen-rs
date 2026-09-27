@@ -37,7 +37,7 @@ const LIMITS: CodecLimits = CodecLimits {
 /// What the driver saw, with a file's data joined up.
 #[derive(Debug, PartialEq)]
 enum Seen {
-	Opened(StreamLayout),
+	Opened(ArchiveFormat),
 	Dir(u64, String),
 	File {
 		ordinal: u64,
@@ -238,7 +238,7 @@ fn kind(result: Result<ArchiveEnd, Error>) -> ErrorKind {
 #[test]
 fn a_bare_tar_is_sent_member_by_member() {
 	let (seen, end) = run(&sample_tar(), "sample.tar");
-	let mut expected = vec![Seen::Opened(StreamLayout::Tar { codec: None })];
+	let mut expected = vec![Seen::Opened(ArchiveFormat::Tar { codec: None })];
 	expected.extend(sample_seen());
 	assert_eq!(seen, expected);
 	assert_eq!(
@@ -275,7 +275,7 @@ fn a_hard_link_carrying_data_is_extracted_as_a_file() {
 	assert_eq!(
 		seen,
 		[
-			Seen::Opened(StreamLayout::Tar { codec: None }),
+			Seen::Opened(ArchiveFormat::Tar { codec: None }),
 			file(0, "a.txt", b"alpha"),
 			file(1, "b.txt", b"alpha"),
 		]
@@ -292,7 +292,7 @@ fn a_file_is_sent_in_whole_chunks() {
 	assert_eq!(
 		seen,
 		[
-			Seen::Opened(StreamLayout::Tar { codec: None }),
+			Seen::Opened(ArchiveFormat::Tar { codec: None }),
 			file(0, "big.bin", &data),
 		]
 	);
@@ -307,7 +307,7 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 	let mut archive = gzip(&sample_tar());
 	archive.extend_from_slice(b"junk");
 	let (seen, end) = run(&archive, "sample.tgz");
-	let mut expected = vec![Seen::Opened(StreamLayout::Tar {
+	let mut expected = vec![Seen::Opened(ArchiveFormat::Tar {
 		codec: Some(StreamCodec::Gzip),
 	})];
 	expected.extend(sample_seen());
@@ -332,12 +332,12 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 		duplicates: None,
 	};
 	let (seen, end) = run(&empty, "e.tar");
-	assert_eq!(seen, [Seen::Opened(StreamLayout::Tar { codec: None })]);
+	assert_eq!(seen, [Seen::Opened(ArchiveFormat::Tar { codec: None })]);
 	assert_eq!(end.unwrap(), nothing);
 	let (seen, end) = run(&gzip(&empty), "e.tar.gz");
 	assert_eq!(
 		seen,
-		[Seen::Opened(StreamLayout::Tar {
+		[Seen::Opened(ArchiveFormat::Tar {
 			codec: Some(StreamCodec::Gzip)
 		})]
 	);
@@ -346,7 +346,7 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 	let (seen, _) = run(&gzip(&empty), "zeros.gz");
 	assert_eq!(
 		seen[0],
-		Seen::Opened(StreamLayout::Single {
+		Seen::Opened(ArchiveFormat::Single {
 			codec: StreamCodec::Gzip
 		})
 	);
@@ -367,7 +367,7 @@ fn a_zstd_tar_is_read_through_its_frames() {
 	let mut archive = vec![0x50, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, 1, 2];
 	archive.extend(encoder.finish().unwrap());
 	let (seen, end) = run(&archive, "sample.tar.zst");
-	let mut expected = vec![Seen::Opened(StreamLayout::Tar {
+	let mut expected = vec![Seen::Opened(ArchiveFormat::Tar {
 		codec: Some(StreamCodec::Zstd),
 	})];
 	expected.extend(sample_seen());
@@ -403,7 +403,7 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 	assert_eq!(
 		seen,
 		[
-			Seen::Opened(StreamLayout::Single {
+			Seen::Opened(ArchiveFormat::Single {
 				codec: StreamCodec::Gzip
 			}),
 			Seen::File {
@@ -532,7 +532,7 @@ fn zip_sample() -> (Vec<u8>, Vec<Seen>) {
 		None,
 	);
 	let seen = vec![
-		Seen::Opened(StreamLayout::Zip),
+		Seen::Opened(ArchiveFormat::Zip),
 		Seen::Dir(0, "docs".into()),
 		file(1, "docs/a.txt", b"alpha"),
 		file(2, "docs/big.bin", &big),
@@ -592,7 +592,7 @@ fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
 	assert_eq!(
 		seen,
 		[
-			Seen::Opened(StreamLayout::Zip),
+			Seen::Opened(ArchiveFormat::Zip),
 			file(0, "secret.txt", b"secret")
 		]
 	);
@@ -626,7 +626,7 @@ fn zip_duplicates_symlinks_and_bombs() {
 	assert_eq!(
 		seen,
 		[
-			Seen::Opened(StreamLayout::Zip),
+			Seen::Opened(ArchiveFormat::Zip),
 			Seen::Skipped(
 				0,
 				"link".into(),
@@ -667,7 +667,7 @@ fn a_zip_bomb_that_understates_its_size_is_stopped_at_it() {
 	let (seen, end) = run(&zip, "z.zip");
 	assert_eq!(kind(end), ErrorKind::ArchiveCorrupt);
 	let [
-		Seen::Opened(StreamLayout::Zip),
+		Seen::Opened(ArchiveFormat::Zip),
 		Seen::File { data, ended, .. },
 	] = &seen[..]
 	else {
@@ -705,7 +705,7 @@ fn a_7z_is_sent_entry_by_entry() {
 		assert_eq!(
 			seen,
 			vec![
-				Seen::Opened(StreamLayout::SevenZ),
+				Seen::Opened(ArchiveFormat::SevenZ),
 				file(0, "docs/a.txt", b"alpha"),
 				Seen::File {
 					ordinal: 1,
@@ -757,7 +757,7 @@ fn an_encrypted_7z_needs_the_right_password_before_anything_is_sent() {
 		assert_eq!(
 			seen,
 			vec![
-				Seen::Opened(StreamLayout::SevenZ),
+				Seen::Opened(ArchiveFormat::SevenZ),
 				file(0, "secret.txt", b"secret"),
 			]
 		);
@@ -787,7 +787,7 @@ fn sevenz_symlinks_and_anti_items_are_skipped() {
 	assert_eq!(
 		seen,
 		vec![
-			Seen::Opened(StreamLayout::SevenZ),
+			Seen::Opened(ArchiveFormat::SevenZ),
 			Seen::Skipped(
 				0,
 				"link".into(),
@@ -861,7 +861,7 @@ fn a_7z_reparse_point_is_a_link_only_when_its_data_says_so() {
 	assert_eq!(
 		seen,
 		vec![
-			Seen::Opened(StreamLayout::SevenZ),
+			Seen::Opened(ArchiveFormat::SevenZ),
 			link(0, "link", &symlink, r"C:\data\file.txt"),
 			// a junction without a print name shows its substitute name, less the NT prefix
 			link(1, "junction", &junction, r"C:\data"),

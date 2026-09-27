@@ -36,6 +36,31 @@ pub enum StreamCodec {
 	Zstd,
 }
 
+/// What an archive is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ArchiveFormat {
+	/// A tar, bare or inside a compressed stream.
+	Tar { codec: Option<StreamCodec> },
+	/// A zip, read from its central directory; every entry's data is checked against its
+	/// CRC-32 or authentication code.
+	Zip,
+	/// A 7z, read from its header; entries are checked against the CRC-32s it lists.
+	SevenZ,
+	/// One compressed file.
+	Single { codec: StreamCodec },
+}
+
 /// What a file turned out to hold, as far as its first bytes tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Detected {

@@ -52,11 +52,10 @@ use crate::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
 				SourceDisposition, Tree, dir_digest, dispose_file, file_digest, kept_on_early_end,
 			},
-			format::extract_folder_name,
+			format::{ArchiveFormat, extract_folder_name},
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
-				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, SkippedMember, StreamLayout,
-				WorkerEvent, WorkerLink,
+				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerLink,
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
@@ -259,7 +258,7 @@ struct Driver<B: DriveBackend> {
 	/// The codec read the archive front to back, once: `archive_hasher` covers it all.
 	sequential: bool,
 	/// What the archive turned out to hold.
-	layout: Option<StreamLayout>,
+	layout: Option<ArchiveFormat>,
 	dispose: Option<(SourceDisposal, Uuid)>,
 	disposal_requested: bool,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
@@ -979,7 +978,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Sets up where entries go, once the codec has told what the archive holds.
-	async fn open(&mut self, layout: StreamLayout) -> Result<(), Stopped> {
+	async fn open(&mut self, layout: ArchiveFormat) -> Result<(), Stopped> {
 		let destination = self.destination.uuid();
 		let listed = self
 			.control
@@ -1002,9 +1001,9 @@ impl<B: DisposalBackend> Driver<B> {
 		let new_folder = match (&self.root, layout) {
 			(
 				ExtractRoot::NewFolder { name },
-				StreamLayout::Tar { .. } | StreamLayout::Zip | StreamLayout::SevenZ,
+				ArchiveFormat::Tar { .. } | ArchiveFormat::Zip | ArchiveFormat::SevenZ,
 			) => Some(name.clone()),
-			(_, StreamLayout::Single { .. }) | (ExtractRoot::Destination, _) => None,
+			(_, ArchiveFormat::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
 		let root_uuid = match new_folder {
 			None => {
@@ -1757,7 +1756,10 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.unchecked_entries > 0 {
 			return kept(KeptReason::Unconfirmed);
 		}
-		if !matches!(self.layout, Some(StreamLayout::Zip | StreamLayout::SevenZ)) {
+		if !matches!(
+			self.layout,
+			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ)
+		) {
 			// A streaming archive's entries carry no checksum of their own (a tar's) or share
 			// one for the whole stream: the whole archive, read front to back, has to match the
 			// hash in its metadata. A zip's or a 7z's entries were each checked as they were

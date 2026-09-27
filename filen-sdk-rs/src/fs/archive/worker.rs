@@ -31,7 +31,7 @@ use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
 };
 
-use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
+use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::ArchiveFormat};
 
 /// How long the codec may go without taking input or handing over an event, while the driver
 /// owes it nothing, before it is given up on as dead. Far above any single step a healthy codec
@@ -48,8 +48,8 @@ pub(crate) enum WorkerEvent {
 		index: u64,
 		reply: oneshot::Sender<io::Result<Vec<u8>>>,
 	},
-	/// What a streaming archive turned out to hold; sent before any entry.
-	Opened(StreamLayout),
+	/// What the archive turned out to be; sent before any entry.
+	Opened(ArchiveFormat),
 	Entry(EntryHead),
 	/// Output: when extracting, the next data of the file entry sent last; when compressing,
 	/// the next chunk of the archive. [`CHUNK_SIZE`] bytes, except for the last chunk.
@@ -62,20 +62,6 @@ pub(crate) enum WorkerEvent {
 	/// When compressing into a format whose start is written last (a 7z): the archive's first
 	/// chunk, sent after all the others.
 	Head(Vec<u8>),
-}
-
-/// What a streaming archive holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StreamLayout {
-	/// A tar, bare or inside a compressed stream.
-	Tar { codec: Option<StreamCodec> },
-	/// A zip, read from its central directory; every entry's data is checked against its
-	/// CRC-32 or authentication code.
-	Zip,
-	/// A 7z, read from its header; entries are checked against the CRC-32s it lists.
-	SevenZ,
-	/// One compressed file.
-	Single { codec: StreamCodec },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,7 +710,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_codec_that_panics_ends_its_events_and_fails_with_the_message() {
 		let mut link = start(|port| -> Result<(), Error> {
-			port.send(WorkerEvent::Opened(StreamLayout::Zip))?;
+			port.send(WorkerEvent::Opened(ArchiveFormat::Zip))?;
 			panic!("a header of {} bytes", 7);
 		})
 		.unwrap();
@@ -733,7 +719,7 @@ mod tests {
 			events.push(event);
 		}
 		assert!(
-			matches!(events[..], [WorkerEvent::Opened(StreamLayout::Zip)]),
+			matches!(events[..], [WorkerEvent::Opened(ArchiveFormat::Zip)]),
 			"{events:?}"
 		);
 		let error = (&mut link.done).await.unwrap().unwrap_err();

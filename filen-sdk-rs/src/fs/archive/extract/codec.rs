@@ -13,8 +13,8 @@ use super::{
 		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{
-			DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_stem, detect, extension_format,
-			is_end_marker, is_tar_header,
+			ArchiveFormat, DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_stem, detect,
+			extension_format, is_end_marker, is_tar_header,
 		},
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		limits::display_path,
@@ -30,7 +30,7 @@ use super::{
 		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarMember, TarReader},
 		worker::{
 			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, SourceFailed,
-			StreamLayout, WorkerEvent, WorkerPort, read_full, send_file_data,
+			WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
 			crypto::{AES_AUTH_CODE_LEN, AES_VERIFIER_LEN, CryptoError, ZIP_CRYPTO_HEADER_LEN},
@@ -97,7 +97,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 	let source = Cursor::new(head).chain(input);
 	match detect(head, &job.name) {
 		Some(Detected::Tar) => {
-			port.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+			port.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 				.map_err(failure)?;
 			let walked = walk_tar(port, source, job.limits.max_members)?;
 			Ok(ArchiveEnd {
@@ -127,7 +127,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 						Some(ExtensionFormat::CompressedTar(_))
 					);
 			if tar {
-				port.send(WorkerEvent::Opened(StreamLayout::Tar {
+				port.send(WorkerEvent::Opened(ArchiveFormat::Tar {
 					codec: Some(codec),
 				}))
 				.map_err(failure)?;
@@ -146,7 +146,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 					unchecked_entries: unchecked(end.check, walked.files),
 				})
 			} else {
-				port.send(WorkerEvent::Opened(StreamLayout::Single { codec }))
+				port.send(WorkerEvent::Opened(ArchiveFormat::Single { codec }))
 					.map_err(failure)?;
 				extract_single(port, &job.name, Cursor::new(block).chain(decoded))
 			}
@@ -288,7 +288,7 @@ fn extract_zip(
 		}
 	}
 
-	port.send(WorkerEvent::Opened(StreamLayout::Zip))
+	port.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 		.map_err(failure)?;
 	for entry in &index.overlapping {
 		port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
@@ -480,7 +480,7 @@ fn extract_sevenz(
 		}
 	}
 
-	port.send(WorkerEvent::Opened(StreamLayout::SevenZ))
+	port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(failure)?;
 	let mut unchecked_entries = 0;
 	// while the password is unchecked, damage in encrypted data is likelier a wrong password
