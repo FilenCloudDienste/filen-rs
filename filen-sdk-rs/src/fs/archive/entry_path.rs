@@ -16,8 +16,11 @@ pub(crate) struct ArchivePath {
 	/// Whether any segment differs from what the archive stored: a stripped absolute or drive
 	/// prefix, or a name encoded or shortened to be valid.
 	pub(crate) rewritten: bool,
-	/// Whether the path holds characters that are easily misread when shown (controls, bidi
-	/// overrides, zero-width marks). They are kept, since the drive accepts them.
+	/// Whether the path holds characters that make it read as something it is not (see
+	/// [`is_suspicious`]), such as a right-to-left override showing `invoice\u{202E}fdp.exe` as
+	/// `invoiceexe.pdf`. The drive forbids C0 controls and DEL, so a segment holding one is
+	/// encoded as well (and the path counts as rewritten); C1 controls and the format
+	/// characters are allowed there and kept as they are.
 	pub(crate) suspicious: bool,
 }
 
