@@ -300,10 +300,18 @@ fn disposal<D>(
 			}
 		});
 	}
+	let mut hashed = vec![true; targets.len()];
+	for file in plan
+		.files
+		.iter()
+		.filter(|file| file.source.hash().is_none())
+	{
+		hashed[file.request] = false;
+	}
 	Ok(CompressDisposal {
 		how,
 		targets,
-		all_hashed: plan.files.iter().all(|file| file.source.hash().is_some()),
+		hashed,
 	})
 }
 
@@ -377,6 +385,7 @@ fn archive_entries<D>(
 		sources.push(Source {
 			file: file.source.clone(),
 			path,
+			request: file.request,
 		});
 	}
 	Ok((entries, sources))
@@ -627,7 +636,11 @@ mod tests {
 			Uuid::new_v4(),
 		)
 		.unwrap();
-		assert!(!disposal.all_hashed, "the plan's files carry no hash");
+		assert_eq!(
+			disposal.hashed,
+			[false, false],
+			"the plan's files carry no hash"
+		);
 		let [
 			DisposalTarget::Dir { uuid, read },
 			DisposalTarget::File(file),

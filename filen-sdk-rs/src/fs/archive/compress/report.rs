@@ -1,9 +1,9 @@
 //! What compressing reports while it runs and when it ends, and the [`Reporter`] that turns job
 //! state changes into throttled, ordered callbacks.
 
-use filen_macros::js_type;
 use std::{sync::Arc, time::Duration};
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::{

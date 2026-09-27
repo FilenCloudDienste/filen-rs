@@ -214,6 +214,8 @@ fn start_disposing(
 			.map(|(path, file)| Source {
 				file: file.clone(),
 				path: path.clone(),
+				// the directory `docs` is the first top-level source, `top.txt` the second
+				request: usize::from(!path.starts_with("docs/")),
 			})
 			.collect(),
 		max_bytes,
@@ -503,14 +505,14 @@ fn targets(setup: &Setup, placed: &Placed) -> Vec<DisposalTarget> {
 async fn compress_disposing(
 	setup: &Setup,
 	how: SourceDisposal,
-	all_hashed: bool,
+	hashed: [bool; 2],
 	report: CompressReport,
 ) -> CompressReport {
 	let placed = place(setup);
 	let disposal = CompressDisposal {
 		how,
 		targets: targets(setup, &placed),
-		all_hashed,
+		hashed: hashed.to_vec(),
 	};
 	let job = CompressJob {
 		format: CompressFormat::Tar { compression: None },
@@ -556,7 +558,7 @@ async fn verified_sources_are_trashed() {
 	let report = compress_disposing(
 		&setup,
 		SourceDisposal::Trash,
-		true,
+		[true; 2],
 		CompressReport::default(),
 	)
 	.await;
@@ -581,7 +583,7 @@ async fn a_permanent_removal_deletes_what_was_read_and_trashes_the_emptied_direc
 	let report = compress_disposing(
 		&setup,
 		SourceDisposal::DeletePermanently,
-		true,
+		[true; 2],
 		CompressReport::default(),
 	)
 	.await;
@@ -616,7 +618,7 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	let disposal = CompressDisposal {
 		how: SourceDisposal::DeletePermanently,
 		targets: targets(&setup, &placed),
-		all_hashed: true,
+		hashed: vec![true, true],
 	};
 	let job = CompressJob {
 		format: CompressFormat::Tar { compression: None },
@@ -660,18 +662,56 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	let report = compress_disposing(
 		&setup_mismatch,
 		SourceDisposal::Trash,
-		true,
+		[true; 2],
 		CompressReport::default(),
 	)
 	.await;
-	all_kept_for(&report, |reason| matches!(reason, KeptReason::HashMismatch));
+	// only the source the mismatching file belongs to is kept
+	let [docs, top] = &outcomes(&report)[..] else {
+		panic!("two sources");
+	};
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(
+		matches!(
+			top,
+			DisposalOutcome::Kept {
+				reason: KeptReason::HashMismatch
+			}
+		),
+		"{top:?}"
+	);
+	assert_eq!(setup_mismatch.backend.log().trashed_dirs.len(), 1);
+	assert!(setup_mismatch.backend.log().trashed_files.is_empty());
+
+	// a source without hashes is kept on its own under a permanent removal
+	let setup_half = setup(|_, _| {});
+	let report = compress_disposing(
+		&setup_half,
+		SourceDisposal::DeletePermanently,
+		[true, false],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = &outcomes(&report)[..] else {
+		panic!("two sources");
+	};
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(
+		matches!(
+			top,
+			DisposalOutcome::Kept {
+				reason: KeptReason::HashUnavailable
+			}
+		),
+		"{top:?}"
+	);
 
 	// no hash to check a permanent deletion against
 	let setup_unhashed = setup(|_, _| {});
 	let report = compress_disposing(
 		&setup_unhashed,
 		SourceDisposal::DeletePermanently,
-		false,
+		[false; 2],
 		CompressReport::default(),
 	)
 	.await;
@@ -691,7 +731,8 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 		}],
 		..CompressReport::default()
 	};
-	let report = compress_disposing(&setup_skipped, SourceDisposal::Trash, true, skipped).await;
+	let report =
+		compress_disposing(&setup_skipped, SourceDisposal::Trash, [true; 2], skipped).await;
 	all_kept_for(&report, |reason| matches!(reason, KeptReason::Incomplete));
 
 	// the archive is not in the drive as it was registered
@@ -699,13 +740,13 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	let report = compress_disposing(
 		&setup_gone,
 		SourceDisposal::Trash,
-		true,
+		[true; 2],
 		CompressReport::default(),
 	)
 	.await;
 	all_kept_for(&report, |reason| matches!(reason, KeptReason::Unconfirmed));
 
-	for setup in [setup_mismatch, setup_unhashed, setup_skipped, setup_gone] {
+	for setup in [setup_unhashed, setup_skipped, setup_gone] {
 		let log = setup.backend.log();
 		assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
 		assert!(log.trashed_dirs.is_empty());

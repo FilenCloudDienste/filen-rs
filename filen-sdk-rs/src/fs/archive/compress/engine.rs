@@ -7,7 +7,11 @@
 //! for one input and one output chunk, more only from the client's budget when it is free right
 //! now, and a pause that gives back the floor and prefetched chunks once in-flight work is done.
 
-use std::{collections::VecDeque, io, sync::Arc};
+use std::{
+	collections::{BTreeSet, VecDeque},
+	io,
+	sync::Arc,
+};
 
 use chrono::Utc;
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
@@ -70,6 +74,8 @@ pub(crate) struct Source {
 	pub(crate) file: RemoteFileType<'static>,
 	/// Its path in the archive, for reporting.
 	pub(crate) path: String,
+	/// The top-level source (the job's request) it was listed under.
+	pub(crate) request: usize,
 }
 
 /// What [`run_compress`] needs.
@@ -99,8 +105,8 @@ pub(crate) struct CompressTask<B> {
 pub(crate) struct CompressDisposal {
 	pub(crate) how: SourceDisposal,
 	pub(crate) targets: Vec<DisposalTarget>,
-	/// Every file read had a hash in its metadata to check it against.
-	pub(crate) all_hashed: bool,
+	/// Per target: every file read below it had a hash in its metadata to check it against.
+	pub(crate) hashed: Vec<bool>,
 }
 
 #[derive(Debug)]
@@ -130,6 +136,7 @@ type FetchedChunk = (
 struct SourceState {
 	file: Arc<RemoteFileType<'static>>,
 	path: String,
+	request: usize,
 	chunks: u64,
 	/// Chunks handed to the codec, which asks for them in order.
 	served: u64,
@@ -177,8 +184,8 @@ struct Driver<B: DriveBackend> {
 	max_bytes: Option<u64>,
 	stamp: u64,
 	stalled_ticks: u32,
-	/// A source's data did not match the hash in its metadata.
-	hash_mismatch: bool,
+	/// The top-level sources a file of which did not match the hash in its metadata.
+	mismatched: BTreeSet<usize>,
 	fatal: Option<Arc<Error>>,
 }
 
@@ -260,6 +267,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			chunks: source.file.size().div_ceil(CHUNK_SIZE_U64),
 			file: Arc::new(source.file),
 			path: source.path,
+			request: source.request,
 			served: 0,
 			hasher: blake3::Hasher::new(),
 		})
@@ -298,7 +306,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		max_bytes,
 		stamp: 0,
 		stalled_ticks: 0,
-		hash_mismatch: false,
+		mismatched: BTreeSet::new(),
 		fatal: None,
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -522,7 +530,7 @@ impl<B: DisposalBackend> Driver<B> {
 				"source {} of an archive does not match the hash in its metadata",
 				state.file.uuid()
 			);
-			self.hash_mismatch = true;
+			self.mismatched.insert(state.request);
 			let event = CompressEvent::SourceHashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
@@ -667,14 +675,23 @@ impl<B: DisposalBackend> Driver<B> {
 		let CompressDisposal {
 			how,
 			targets,
-			all_hashed,
+			hashed,
 		} = disposal;
-		let held_back = if incomplete {
+		// a source whose own files could not be checked is kept on its own; anything wrong
+		// with the archive keeps them all
+		let own_reason = |request: usize| {
+			if self.mismatched.contains(&request) {
+				Some(KeptReason::HashMismatch)
+			} else if how == SourceDisposal::DeletePermanently && !hashed[request] {
+				Some(KeptReason::HashUnavailable)
+			} else {
+				None
+			}
+		};
+		let archive_reason = if incomplete {
 			Some(KeptReason::Incomplete)
-		} else if self.hash_mismatch {
-			Some(KeptReason::HashMismatch)
-		} else if how == SourceDisposal::DeletePermanently && !all_hashed {
-			Some(KeptReason::HashUnavailable)
+		} else if (0..targets.len()).all(|request| own_reason(request).is_some()) {
+			None
 		} else {
 			// the archive as the server holds it
 			match self.backend.file_state(archive.uuid()).await {
@@ -690,7 +707,8 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 		};
 		let mut dispositions = Vec::with_capacity(targets.len());
-		for target in targets {
+		for (request, target) in targets.into_iter().enumerate() {
+			let held_back = archive_reason.clone().or_else(|| own_reason(request));
 			let (uuid, outcome) = match (&held_back, target) {
 				(Some(reason), target) => (
 					target.uuid(),
