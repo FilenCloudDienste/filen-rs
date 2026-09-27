@@ -253,10 +253,19 @@ fn a_bare_tar_is_sent_member_by_member() {
 fn a_hard_link_carrying_data_is_extracted_as_a_file() {
 	let mut builder = tar::Builder::new(Vec::new());
 	append(&mut builder, tar::EntryType::Regular, "a.txt", b"alpha");
-	// a pax hard link may carry the file's data, which is extracted like a file's
-	let mut hard = header(tar::EntryType::Link, 5);
+	// a hard link in a pax archive may carry the file's data, which is extracted like a file's
+	let record = b"15 mtime=17000\n";
+	let mut pax = tar::Header::new_ustar();
+	pax.set_entry_type(tar::EntryType::XHeader);
+	pax.set_size(record.len() as u64);
+	builder
+		.append_data(&mut pax, "PaxHeader", &record[..])
+		.unwrap();
+	let mut hard = tar::Header::new_ustar();
+	hard.set_entry_type(tar::EntryType::Link);
+	hard.set_size(5);
+	hard.set_mode(0o644);
 	hard.set_link_name("a.txt").unwrap();
-	hard.set_cksum();
 	builder
 		.append_data(&mut hard, "b.txt", &b"alpha"[..])
 		.unwrap();
