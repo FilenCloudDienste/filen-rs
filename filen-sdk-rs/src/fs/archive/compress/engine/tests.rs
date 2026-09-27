@@ -34,7 +34,10 @@ use crate::{
 			worker,
 		},
 		dir::RootDirectory,
-		drive_job::{backend::ListedNames, test_support::FakeBackend},
+		drive_job::{
+			backend::ListedNames,
+			test_support::{FakeBackend, wait_until},
+		},
 		file::{
 			AnonymousRemoteFile, RemoteFile,
 			meta::{DecryptedFileMeta, FileMeta},
@@ -1183,4 +1186,182 @@ async fn an_early_end_tells_the_callback_of_every_kept_source() {
 		.filter(|event| matches!(event, CompressEvent::SourceDisposition(_)))
 		.count();
 	assert_eq!(told, 2);
+}
+
+/// The dispositions the callback was told of, in order.
+fn told(recorder: &Recorder) -> Vec<SourceDisposition> {
+	recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			CompressEvent::SourceDisposition(disposition) => Some(disposition),
+			_ => None,
+		})
+		.collect()
+}
+
+fn hold(setup: &Setup, uuid: Uuid) {
+	setup.backend.held.send_modify(|held| {
+		held.insert(uuid);
+	});
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_dropped_past_its_cancel_grace_has_told_of_what_it_removed() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	let top = setup.sources[2].1.uuid();
+	// the folder goes first; the top file's deletion is sent and never answered
+	hold(&setup, top);
+	let (_pause, cancel, control) = controls();
+	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
+	wait_until("the top file's deletion is sent", || {
+		setup.backend.log().held.contains(&top)
+	})
+	.await;
+	cancel.send_replace(true);
+	// the bindings drop a job that has not ended within its cancel grace
+	job.running.abort();
+	assert!(job.running.await.unwrap_err().is_cancelled());
+	let told = told(&job.recorder);
+	assert_eq!(told.len(), 1, "{told:?}");
+	assert_eq!(told[0].uuid, placed.docs);
+	let folder_bytes = setup.contents[0].len() + setup.contents[1].len();
+	assert!(
+		matches!(
+			told[0].outcome,
+			DisposalOutcome::Disposed {
+				how: SourceDisposal::DeletePermanently,
+				bytes_freed,
+			} if bytes_freed == folder_bytes as u64
+		),
+		"{told:?}"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	// the top file goes first; the folder's listing never answers
+	let targets = targets(&setup, &placed).into_iter().rev().collect();
+	hold(&setup, placed.docs);
+	let (_pause, cancel, control) = controls();
+	let job = run_permanent_disposal(&setup, targets, control);
+	wait_until("the folder is being listed", || {
+		setup.backend.log().held.contains(&placed.docs)
+	})
+	.await;
+	cancel.send_replace(true);
+	let report = tokio::time::timeout(Duration::from_secs(30), job.running)
+		.await
+		.expect("the cancel ends the job")
+		.unwrap()
+		.unwrap();
+	let top = &setup.sources[2].1;
+	let [removed, kept] = &report.dispositions[..] else {
+		panic!("{:?}", report.dispositions);
+	};
+	assert_eq!(removed.uuid, top.uuid());
+	assert!(
+		matches!(
+			removed.outcome,
+			DisposalOutcome::Disposed { bytes_freed, .. } if bytes_freed == top.size()
+		),
+		"{removed:?}"
+	);
+	assert_eq!(kept.uuid, placed.docs);
+	assert!(
+		matches!(
+			kept.outcome,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Interrupted,
+				bytes_freed: 0,
+			}
+		),
+		"{kept:?}"
+	);
+	assert_eq!(told(&job.recorder).len(), 2);
+	assert_eq!(setup.backend.log().deleted_files, [top.uuid()]);
+	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	// the folder's files are deleted in uuid order: the cancel comes while the first is
+	let (_, first) = setup.sources[..2]
+		.iter()
+		.min_by_key(|(_, file)| file.uuid())
+		.unwrap();
+	hold(&setup, first.uuid());
+	let (_pause, cancel, control) = controls();
+	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
+	wait_until("the first file's deletion is sent", || {
+		setup.backend.log().held.contains(&first.uuid())
+	})
+	.await;
+	cancel.send_replace(true);
+	setup.backend.held.send_modify(|held| held.clear());
+	let report = job.running.await.unwrap().unwrap();
+	let outcomes = outcomes(&report);
+	assert!(
+		matches!(
+			outcomes[..],
+			[
+				DisposalOutcome::Kept {
+					reason: KeptReason::Interrupted,
+					bytes_freed,
+				},
+				DisposalOutcome::Kept {
+					reason: KeptReason::Interrupted,
+					bytes_freed: 0,
+				},
+			] if bytes_freed == first.size()
+		),
+		"{outcomes:?}"
+	);
+	assert_eq!(setup.backend.log().deleted_files, [first.uuid()]);
+	assert!(setup.backend.log().trashed_dirs.is_empty());
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_compressing_keeps_every_source() {
+	let setup = setup(|backend, _| {
+		backend.blocked_uploads.insert("b.tar".to_owned());
+	});
+	let placed = place(&setup);
+	let (_pause, cancel, control) = controls();
+	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
+	let total: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
+	// every source is read, and the archive's first chunk is stuck uploading
+	wait_until("every source is read", || {
+		job.reporter.counts().bytes_read == total
+	})
+	.await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	let expected = [placed.docs, setup.sources[2].1.uuid()];
+	for dispositions in [failed.report.dispositions, told(&job.recorder)] {
+		let uuids: Vec<Uuid> = dispositions.iter().map(|d| d.uuid).collect();
+		assert_eq!(uuids, expected);
+		for disposition in dispositions {
+			assert!(
+				matches!(
+					disposition.outcome,
+					DisposalOutcome::Kept {
+						reason: KeptReason::Interrupted,
+						bytes_freed: 0,
+					}
+				),
+				"{disposition:?}"
+			);
+		}
+	}
+	assert!(setup.backend.log().deleted_files.is_empty());
+	assert_released(&setup, &job.reporter);
 }

@@ -238,9 +238,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		} else {
 			KeptReason::Incomplete
 		});
-		for disposition in &report.dispositions {
-			reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
-		}
+		reporter.dispositions(&report.dispositions);
 		reporter.finish(phase);
 		report.counts = reporter.counts();
 		CompressFailed {
@@ -368,23 +366,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			driver.reporter.set_phase(CompressPhase::DisposingSources);
 			dispositions = match driver.reporter.checkpoint(&driver.control).await {
 				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
-				Err(Stopped) => disposal
-					.targets
-					.iter()
-					.map(|target| {
-						let disposition = SourceDisposition {
-							uuid: target.uuid(),
-							outcome: DisposalOutcome::Kept {
-								reason: KeptReason::Interrupted,
-								bytes_freed: 0,
-							},
-						};
-						driver
-							.reporter
-							.event(CompressEvent::SourceDisposition(disposition.clone()));
-						disposition
-					})
-					.collect(),
+				Err(Stopped) => {
+					let kept = kept_all(KeptReason::Interrupted);
+					driver.reporter.dispositions(&kept);
+					kept
+				}
 			};
 		}
 		Ok(archive)
@@ -423,12 +409,10 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			(CompressPhase::Done, Ok(()))
 		}
 	};
-	// a finished disposal told of each source as it went; the kept ones an early end reports
-	// are told here
+	// a disposal told of each source as soon as its outcome was final; the sources an early end
+	// keeps are told of here
 	if result.is_err() {
-		for disposition in &report.dispositions {
-			reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
-		}
+		reporter.dispositions(&report.dispositions);
 	}
 	reporter.finish(phase);
 	report.counts = reporter.counts();
@@ -844,17 +828,24 @@ impl<B: DisposalBackend> Driver<B> {
 		{
 			*within = None;
 		}
-		let nested_uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
-		let nested_files: Vec<bool> = targets
+		// the outermost source each one goes with (itself, if none): the chains are acyclic, the
+		// cycles were cut above
+		let outermost: Vec<usize> = (0..within.len())
+			.map(|mut outer| {
+				while let Some(next) = within[outer] {
+					outer = next;
+				}
+				outer
+			})
+			.collect();
+		let uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
+		let files: Vec<bool> = targets
 			.iter()
 			.map(|target| matches!(target, DisposalTarget::File(_)))
 			.collect();
-		let mut outcomes: Vec<Option<(Uuid, DisposalOutcome)>> = Vec::with_capacity(targets.len());
-		// the files each folder's permanent removal deleted, even when it stopped part way
-		let mut deleted = vec![BTreeSet::new(); targets.len()];
+		let mut dispositions: Vec<Option<SourceDisposition>> = vec![None; targets.len()];
 		for (request, target) in targets.into_iter().enumerate() {
-			if within[request].is_some() {
-				outcomes.push(None);
+			if outermost[request] != request {
 				continue;
 			}
 			let held_back = if cyclic[request] {
@@ -862,62 +853,47 @@ impl<B: DisposalBackend> Driver<B> {
 			} else {
 				archive_reason.clone().or_else(|| own_reason(request))
 			};
-			let (uuid, outcome) = match (&held_back, target) {
-				(Some(reason), target) => (
-					target.uuid(),
-					DisposalOutcome::Kept {
-						reason: reason.clone(),
-						bytes_freed: 0,
-					},
-				),
-				(None, DisposalTarget::File(file)) => (
-					file.uuid,
-					dispose_file(&*self.backend, file, how, &self.control).await,
-				),
-				(None, DisposalTarget::Dir { uuid, read }) => (
-					uuid,
+			// the files the folder's permanent removal deleted, even when it stopped part way
+			let mut deleted = BTreeSet::new();
+			let outcome = match (held_back, target) {
+				(Some(reason), _) => DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+				(None, DisposalTarget::File(file)) => {
+					dispose_file(&*self.backend, file, how, &self.control).await
+				}
+				(None, DisposalTarget::Dir { uuid, read }) => {
 					dispose_dir(
 						&*self.backend,
 						uuid,
 						&read,
 						how,
 						&self.control,
-						&mut deleted[request],
+						&mut deleted,
 					)
-					.await,
-				),
-				(None, DisposalTarget::Unavailable { uuid }) => (
-					uuid,
-					DisposalOutcome::Kept {
-						reason: KeptReason::Changed,
-						bytes_freed: 0,
-					},
-				),
-			};
-			outcomes.push(Some((uuid, outcome)));
-		}
-		let resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
-			.map(|request| {
-				let mut outer = request;
-				// the chains are acyclic: cycles were cut above
-				while let Some(next) = within[outer] {
-					outer = next;
+					.await
 				}
-				let (_, outcome) = outcomes[outer].clone().expect("an outermost source");
-				let uuid = match &outcomes[request] {
-					Some((uuid, _)) => *uuid,
-					None => nested_uuids[request],
-				};
-				let outcome = match outcome {
-					_ if outer == request => outcome,
+				(None, DisposalTarget::Unavailable { .. }) => DisposalOutcome::Kept {
+					reason: KeptReason::Changed,
+					bytes_freed: 0,
+				},
+			};
+			// the source and those that go with it are told of as soon as its outcome is final
+			let told: Vec<usize> = (0..uuids.len())
+				.filter(|&nested| outermost[nested] == request)
+				.collect();
+			for &nested in &told {
+				let outcome = match &outcome {
+					_ if nested == request => outcome.clone(),
 					DisposalOutcome::Disposed { how, .. } => DisposalOutcome::Disposed {
-						how,
+						how: *how,
 						bytes_freed: 0,
 					},
 					// a folder removed for good only in part may have taken a file given on
 					// its own too
 					DisposalOutcome::Kept { .. }
-						if nested_files[request] && deleted[outer].contains(&uuid) =>
+						if files[nested] && deleted.contains(&uuids[nested]) =>
 					{
 						DisposalOutcome::Disposed {
 							how: SourceDisposal::DeletePermanently,
@@ -925,21 +901,24 @@ impl<B: DisposalBackend> Driver<B> {
 						}
 					}
 					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::Kept {
-						reason,
+						reason: reason.clone(),
 						bytes_freed: 0,
 					},
 				};
-				(uuid, outcome)
-			})
-			.collect();
-		resolved
+				dispositions[nested] = Some(SourceDisposition {
+					uuid: uuids[nested],
+					outcome,
+				});
+			}
+			let told: Vec<SourceDisposition> = told
+				.iter()
+				.filter_map(|&nested| dispositions[nested].clone())
+				.collect();
+			self.reporter.dispositions(&told);
+		}
+		dispositions
 			.into_iter()
-			.map(|(uuid, outcome)| {
-				let disposition = SourceDisposition { uuid, outcome };
-				self.reporter
-					.event(CompressEvent::SourceDisposition(disposition.clone()));
-				disposition
-			})
+			.map(|disposition| disposition.expect("every source goes with an outermost one"))
 			.collect()
 	}
 

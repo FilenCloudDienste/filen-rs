@@ -281,6 +281,20 @@ impl Reporter {
 		self.with_state(|state| state.core.push(event));
 	}
 
+	/// Tells of what became of sources in an update sent at once: a job dropped before its last
+	/// update (the bindings drop one that outlives its cancel grace) has still told of every
+	/// source it removed.
+	pub(crate) fn dispositions(&self, dispositions: &[SourceDisposition]) {
+		self.with_state(|state| {
+			for disposition in dispositions {
+				state
+					.core
+					.push(CompressEvent::SourceDisposition(disposition.clone()));
+			}
+			state.core.mark_urgent();
+		});
+	}
+
 	pub(crate) fn counts(&self) -> CompressCounts {
 		self.read(|state| state.counts)
 	}

@@ -28,7 +28,7 @@ use crate::{
 		drive_job::backend::{ClientBackend, DriveBackend},
 		file::traits::HasFileInfo,
 	},
-	job::JobControl,
+	job::{JobControl, Stopped},
 	util::MaybeSend,
 };
 
@@ -290,30 +290,36 @@ fn failed(error: Error) -> DisposalOutcome {
 	})
 }
 
-/// Removes one file source if it is still what the job read. `control` says whether the job was
-/// cancelled, which ends the removal before its next request.
+/// Removes one file source if it is still what the job read. A cancel through `control` drops
+/// the check in flight, or ends the removal before its next request; a removal already sent is
+/// waited for, so its outcome is known.
 pub(crate) async fn dispose_file<B: DisposalBackend>(
 	backend: &B,
 	file: ExpectedFile,
 	how: SourceDisposal,
 	control: &JobControl,
 ) -> DisposalOutcome {
-	if control.is_stopping() {
-		return kept(KeptReason::Interrupted);
-	}
-	let state = match backend.file_state(file.uuid).await {
-		Ok(state) => state,
-		Err(error) => return failed(error),
+	let state = match control.until_stopping(backend.file_state(file.uuid)).await {
+		Ok(Ok(state)) => state,
+		Ok(Err(error)) => return failed(error),
+		Err(Stopped) => return kept(KeptReason::Interrupted),
 	};
 	if !file.matches(&state) {
 		return kept(KeptReason::Changed);
 	}
 	if how == SourceDisposal::DeletePermanently {
-		match backend.has_older_versions(file.uuid).await {
-			Ok(false) => {}
-			Ok(true) => return kept(KeptReason::HasVersions),
-			Err(error) => return failed(error),
+		match control
+			.until_stopping(backend.has_older_versions(file.uuid))
+			.await
+		{
+			Ok(Ok(false)) => {}
+			Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+			Ok(Err(error)) => return failed(error),
+			Err(Stopped) => return kept(KeptReason::Interrupted),
 		}
+	}
+	if control.is_stopping() {
+		return kept(KeptReason::Interrupted);
 	}
 	let removed = match how {
 		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
@@ -331,9 +337,9 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	}
 }
 
-/// Removes one directory source if everything below it is still what the job read.
-/// `control` says whether the job was cancelled, which ends the removal before its next
-/// request.
+/// Removes one directory source if everything below it is still what the job read. A cancel
+/// through `control` drops the check or listing in flight, or ends the removal before its next
+/// request; a removal already sent is waited for, so what it freed is known.
 pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	backend: &B,
 	dir: Uuid,
@@ -342,26 +348,25 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	control: &JobControl,
 	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
-	if control.is_stopping() {
-		return kept(KeptReason::Interrupted);
-	}
-	match backend.list_tree(dir).await {
-		Ok(listed) if listed == *read => {}
-		Ok(_) => return kept(KeptReason::Changed),
-		Err(error) => return failed(error),
+	match control.until_stopping(backend.list_tree(dir)).await {
+		Ok(Ok(listed)) if listed == *read => {}
+		Ok(Ok(_)) => return kept(KeptReason::Changed),
+		Ok(Err(error)) => return failed(error),
+		Err(Stopped) => return kept(KeptReason::Interrupted),
 	}
 	let mut bytes_freed = 0;
 	if how == SourceDisposal::DeletePermanently {
 		// every file is checked before any is deleted: a directory is removed whole or not at
 		// all for this reason
 		for &uuid in read.files.keys() {
-			if control.is_stopping() {
-				return kept(KeptReason::Interrupted);
-			}
-			match backend.has_older_versions(uuid).await {
-				Ok(false) => {}
-				Ok(true) => return kept(KeptReason::HasVersions),
-				Err(error) => return failed(error),
+			match control
+				.until_stopping(backend.has_older_versions(uuid))
+				.await
+			{
+				Ok(Ok(false)) => {}
+				Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+				Ok(Err(error)) => return failed(error),
+				Err(Stopped) => return kept(KeptReason::Interrupted),
 			}
 		}
 		// from here on, what stops the removal leaves files deleted: every outcome says how many
@@ -385,10 +390,10 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 			deleted.insert(uuid);
 		}
 		// only a directory the job emptied is trashed: anything that arrived since stays
-		match backend.list_tree(dir).await {
-			Ok(left) if left.files.is_empty() => {}
-			Ok(_) => return partly(KeptReason::Changed, bytes_freed),
-			Err(error) => {
+		match control.until_stopping(backend.list_tree(dir)).await {
+			Ok(Ok(left)) if left.files.is_empty() => {}
+			Ok(Ok(_)) => return partly(KeptReason::Changed, bytes_freed),
+			Ok(Err(error)) => {
 				return partly(
 					KeptReason::Failed {
 						error: Arc::new(error),
@@ -396,7 +401,14 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 					bytes_freed,
 				);
 			}
+			Err(Stopped) => return partly(KeptReason::Interrupted, bytes_freed),
 		}
+	}
+	if control.is_stopping() {
+		return DisposalOutcome::Kept {
+			reason: KeptReason::Interrupted,
+			bytes_freed,
+		};
 	}
 	match backend.trash_dir(dir).await {
 		Ok(()) => DisposalOutcome::Disposed { how, bytes_freed },

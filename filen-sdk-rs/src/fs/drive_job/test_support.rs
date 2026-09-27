@@ -86,6 +86,8 @@ pub(crate) struct FakeLog {
 	pub(crate) lock_waits: usize,
 	/// Slow registrations that have started.
 	pub(crate) finishing: Vec<String>,
+	/// Items a request about which waited in [`FakeBackend::held`].
+	pub(crate) held: Vec<Uuid>,
 }
 
 pub(crate) struct FakeUpload {
@@ -125,6 +127,9 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
+	/// Directories whose listing and files whose permanent deletion wait while they are in the
+	/// set, each wait logged in [`FakeLog::held`].
+	pub(crate) held: watch::Sender<HashSet<Uuid>>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
 	/// Lowercased names the destination holds without the listing having shown them.
@@ -177,6 +182,7 @@ impl FakeBackend {
 			later_targets: None,
 			versioned_files: HashSet::new(),
 			fail_deletes_of: HashSet::new(),
+			held: watch::Sender::new(HashSet::new()),
 			reverse_chunks: false,
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
@@ -203,6 +209,30 @@ impl FakeBackend {
 	async fn wait(&self, name: &str) {
 		tokio::time::sleep(*self.slow.get(name).unwrap_or(&self.delay)).await;
 	}
+
+	/// Waits while `uuid` is held.
+	async fn hold(&self, uuid: Uuid) {
+		if self.held.borrow().contains(&uuid) {
+			self.log().held.push(uuid);
+			// the sender lives in `self`, which outlives this wait
+			let _ = self
+				.held
+				.subscribe()
+				.wait_for(|held| !held.contains(&uuid))
+				.await;
+		}
+	}
+}
+
+/// Waits until `condition` holds, panicking once a generous time has passed without it.
+pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+	for _ in 0..100_000 {
+		if condition() {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	panic!("timed out waiting until {what}");
 }
 
 impl DriveBackend for FakeBackend {
@@ -533,6 +563,7 @@ mod disposal {
 		}
 
 		async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
+			self.hold(dir).await;
 			tokio::time::sleep(self.delay).await;
 			let log = self.log();
 			let mut tree = Tree::default();
@@ -560,6 +591,7 @@ mod disposal {
 		}
 
 		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
+			self.hold(uuid).await;
 			if self.fail_deletes_of.contains(&uuid) {
 				return Err(Error::custom(ErrorKind::Server, "delete failed"));
 			}
