@@ -27,13 +27,21 @@ fn read_all(
 	zip: &[u8],
 	password: Option<&[u8]>,
 ) -> Result<Vec<(String, ZipKind, Vec<u8>)>, ZipError> {
-	let mut source = Cursor::new(zip);
-	let index = read_index(&mut source, zip.len() as u64, LIMITS)?;
+	read_source(&mut Cursor::new(zip), zip.len() as u64, password)
+}
+
+/// [`read_all`] of a zip that is the `len` bytes of `source`.
+fn read_source<R: Read + Seek>(
+	source: &mut R,
+	len: u64,
+	password: Option<&[u8]>,
+) -> Result<Vec<(String, ZipKind, Vec<u8>)>, ZipError> {
+	let index = read_index(source, len, LIMITS)?;
 	let mut out = Vec::new();
 	for entry in &index.entries {
 		let mut data = Vec::new();
 		if entry.kind == ZipKind::File {
-			open_entry(&mut source, index.shift, entry, password, ENTRY)?
+			open_entry(source, index.shift, entry, password, ENTRY)?
 				.read_to_end(&mut data)
 				.map_err(
 					|e| match e.into_inner().map(|inner| inner.downcast::<ZipError>()) {
@@ -53,7 +61,16 @@ fn ours(
 	method: ZipMethod,
 	password: Option<(&[u8], AesStrength)>,
 ) -> Vec<u8> {
-	let mut writer = ZipWriter::new(Vec::new());
+	written_by(ZipWriter::new(Vec::new()), entries, method, password)
+}
+
+/// `entries` added to `writer`, and what it wrote.
+fn written_by(
+	mut writer: ZipWriter<Vec<u8>>,
+	entries: &[(&str, Option<&[u8]>)],
+	method: ZipMethod,
+	password: Option<(&[u8], AesStrength)>,
+) -> Vec<u8> {
 	let when = Some(Utc.with_ymd_and_hms(2024, 5, 6, 7, 8, 10).unwrap());
 	for (path, data) in entries {
 		match data {
@@ -416,4 +433,115 @@ fn bytes_between_entries_belong_to_nothing() {
 			.collect::<Vec<_>>(),
 		["a.txt", "c.txt"]
 	);
+}
+
+/// A file of `skipped` zero bytes and then `data`, without the zeros taking memory: the whole of
+/// an archive written by [`ZipWriter::past`].
+struct Past {
+	skipped: u64,
+	data: Vec<u8>,
+	pos: u64,
+}
+
+impl Past {
+	fn new(skipped: u64, data: Vec<u8>) -> Self {
+		Self {
+			skipped,
+			data,
+			pos: 0,
+		}
+	}
+
+	fn len(&self) -> u64 {
+		self.skipped + self.data.len() as u64
+	}
+}
+
+impl Read for Past {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let n = if self.pos < self.skipped {
+			let n = buf.len().min((self.skipped - self.pos) as usize);
+			buf[..n].fill(0);
+			n
+		} else {
+			let at = ((self.pos - self.skipped) as usize).min(self.data.len());
+			let n = buf.len().min(self.data.len() - at);
+			buf[..n].copy_from_slice(&self.data[at..at + n]);
+			n
+		};
+		self.pos += n as u64;
+		Ok(n)
+	}
+}
+
+impl Seek for Past {
+	fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+		let (base, delta) = match to {
+			SeekFrom::Start(at) => (at, 0),
+			SeekFrom::End(delta) => (self.len(), delta),
+			SeekFrom::Current(delta) => (self.pos, delta),
+		};
+		self.pos = base
+			.checked_add_signed(delta)
+			.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+		Ok(self.pos)
+	}
+}
+
+/// Past 4 GiB: every offset is a zip64 one.
+const PAST_4_GIB: u64 = 5 << 30;
+
+#[test]
+fn zip64_sizes_and_offsets_read_back() {
+	let sample = sample();
+	for (method, encryption) in [
+		(ZipMethod::Stored, None),
+		(ZipMethod::Deflate { level: 6 }, Some(AesStrength::Aes256)),
+		(ZipMethod::Bzip2 { level: 1 }, None),
+	] {
+		let password = encryption.map(|_| &b"pw"[..]);
+		// (past 4 GiB, whether every file is written with zip64 sizes)
+		for (skipped, threshold) in [(0, 0), (PAST_4_GIB, u64::MAX), (PAST_4_GIB, 0)] {
+			let case = format!("{method:?} {encryption:?} {skipped} {threshold}");
+			let zip = written_by(
+				ZipWriter::past(Vec::new(), skipped, threshold),
+				&borrowed(&sample),
+				method,
+				encryption.map(|strength| (&b"pw"[..], strength)),
+			);
+			let mut source = Past::new(skipped, zip);
+			let len = source.len();
+			let index = read_index(&mut source, len, LIMITS).unwrap();
+			assert_eq!(index.prefix_bytes, skipped, "{case}");
+			for entry in &index.entries {
+				// a zip64 data descriptor is no gap either
+				assert_eq!(
+					unaccounted_after(&mut source, index.shift, entry),
+					0,
+					"{} {case}",
+					entry.name
+				);
+			}
+			assert_eq!(
+				read_source(&mut source, len, password).unwrap(),
+				expected(&sample),
+				"{case}"
+			);
+
+			let mut archive = zip8::ZipArchive::new(source).unwrap();
+			for (path, data) in &sample {
+				let Some(data) = data else {
+					assert!(archive.by_name(&format!("{path}/")).unwrap().is_dir());
+					continue;
+				};
+				let mut file = match password {
+					None => archive.by_name(path).unwrap(),
+					Some(password) => archive.by_name_decrypt(path, password).unwrap(),
+				};
+				let mut read = Vec::new();
+				file.read_to_end(&mut read).unwrap();
+				assert_eq!(&read, data, "{path} {case}");
+			}
+		}
+	}
 }

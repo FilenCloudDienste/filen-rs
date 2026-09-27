@@ -111,6 +111,8 @@ impl<W: Write> Write for Counting<W> {
 pub(crate) struct ZipWriter<W> {
 	out: Counting<W>,
 	entries: Vec<CentralEntry>,
+	/// [`ZIP64_ENTRY_THRESHOLD`], but for the tests, which cannot write 4 GiB to reach it.
+	zip64_entry_threshold: u64,
 }
 
 impl<W: Write> ZipWriter<W> {
@@ -121,6 +123,22 @@ impl<W: Write> ZipWriter<W> {
 				written: 0,
 			},
 			entries: Vec::new(),
+			zip64_entry_threshold: ZIP64_ENTRY_THRESHOLD,
+		}
+	}
+
+	/// A writer whose archive already holds `written` bytes that `out` never sees, and which
+	/// writes an entry of `zip64_entry_threshold` bytes or more with zip64 sizes: the zip64
+	/// records of an archive past 4 GiB, without writing 4 GiB.
+	#[cfg(test)]
+	pub(crate) fn past(out: W, written: u64, zip64_entry_threshold: u64) -> Self {
+		Self {
+			out: Counting {
+				inner: out,
+				written,
+			},
+			entries: Vec::new(),
+			zip64_entry_threshold,
 		}
 	}
 
@@ -158,7 +176,7 @@ impl<W: Write> ZipWriter<W> {
 		encryption: Option<Encryption<'_>>,
 		data: &mut dyn Read,
 	) -> io::Result<u64> {
-		let zip64 = size >= ZIP64_ENTRY_THRESHOLD;
+		let zip64 = size >= self.zip64_entry_threshold;
 		let mut entry = CentralEntry {
 			name: path.as_bytes().to_vec(),
 			flags: FLAG_UTF8
