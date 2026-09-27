@@ -24,18 +24,21 @@ mod defaults {
 	pub(crate) const CODEC_MEM_BUDGET: u64 = 128 << 20;
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 250_000;
+	pub(crate) const MAX_INDEX_BYTES: u64 = 16 << 20;
 }
 #[cfg(target_os = "ios")]
 mod defaults {
 	pub(crate) const CODEC_MEM_BUDGET: u64 = 128 << 20;
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
+	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
 }
 #[cfg(target_os = "android")]
 mod defaults {
 	pub(crate) const CODEC_MEM_BUDGET: u64 = 192 << 20;
 	pub(crate) const JOB_CONCURRENCY: usize = 1;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
+	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
 }
 #[cfg(not(any(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -46,6 +49,7 @@ mod defaults {
 	pub(crate) const CODEC_MEM_BUDGET: u64 = 256 << 20;
 	pub(crate) const JOB_CONCURRENCY: usize = 2;
 	pub(crate) const MAX_MEMBERS: u64 = 1_000_000;
+	pub(crate) const MAX_INDEX_BYTES: u64 = 32 << 20;
 }
 
 pub(crate) use defaults::{CODEC_MEM_BUDGET, JOB_CONCURRENCY};
@@ -74,6 +78,8 @@ pub struct ArchiveConfig {
 	/// Most members an archive may have, every tar record counted, and most directories an
 	/// extraction plans, those only implied by the paths below them counted too.
 	pub max_members: u64,
+	/// Most bytes of an archive's index (a zip's central directory) read into memory.
+	pub max_index_bytes: u64,
 	gate: Arc<Semaphore>,
 	/// [`FLOOR_CHUNKS`] chunks per concurrent job.
 	floor: Arc<Semaphore>,
@@ -100,6 +106,7 @@ impl ArchiveConfig {
 			codec_mem_budget: codec_mem_budget.max(MIN_CODEC_MEM_BUDGET),
 			job_concurrency,
 			max_members: defaults::MAX_MEMBERS,
+			max_index_bytes: defaults::MAX_INDEX_BYTES,
 			gate,
 			floor: Arc::new(Semaphore::new(job_concurrency * FLOOR_CHUNKS * CHUNK_BYTES)),
 		}

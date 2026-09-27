@@ -15,7 +15,6 @@ use crate::{
 	consts::CHUNK_SIZE,
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
-		archive::dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			entry_path::entry_path,
@@ -25,6 +24,14 @@ use crate::{
 				codec::{CodecLimits, StreamJob, extract_stream},
 			},
 			worker,
+		},
+		archive::{
+			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
+			password::ArchivePassword,
+			zip::{
+				crypto::AesStrength,
+				write::{Encryption, ZipMethod, ZipWriter},
+			},
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -190,6 +197,7 @@ struct Options {
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
 	dispose: Option<(SourceDisposal, Uuid)>,
+	password: Option<ArchivePassword>,
 	/// Shared between jobs that compete for its slots.
 	config: ArchiveConfig,
 }
@@ -202,6 +210,7 @@ impl Default for Options {
 			max_bytes: None,
 			max_items: None,
 			dispose: None,
+			password: None,
 			config: test_config(),
 		}
 	}
@@ -249,7 +258,9 @@ fn start(setup: &Setup, options: Options) -> Job {
 			decoder_memory: CODEC_MEM_BUDGET,
 			max_members: options.config.max_members,
 			expansion: Some(ExpansionLimit::DEFAULT),
+			max_index_bytes: 32 << 20,
 		},
+		password: options.password.clone(),
 	};
 	start_with(
 		setup,
@@ -1071,6 +1082,106 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	assert!(setup.backend.log().deleted_files.is_empty());
 }
 
+fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
+	let mut writer = ZipWriter::new(Vec::new());
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None).unwrap(),
+			Some(data) => {
+				let encryption = password.map(|password| Encryption {
+					password,
+					strength: AesStrength::Aes128,
+					salt: vec![1; 8],
+				});
+				writer
+					.add_file(
+						path,
+						None,
+						data.len() as u64,
+						ZipMethod::Deflate { level: 6 },
+						encryption,
+						&mut &data[..],
+					)
+					.unwrap();
+			}
+		}
+	}
+	writer.finish().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_an_encrypted_zip_and_removes_it() {
+	let big = pattern(2 * CHUNK_SIZE + 5, 6);
+	let zip = zip_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("docs/big.bin", Some(&big)),
+		],
+		Some(b"pw"),
+	);
+	// a zip's entries are checked one by one, so no hash of the whole archive is needed
+	let (setup, parent) = disposable(zip, None, |_| {});
+	let options = Options {
+		dispose: Some((SourceDisposal::DeletePermanently, parent)),
+		password: Some(ArchivePassword::new("pw".into()).unwrap()),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(created_dirs(&setup), ["bundle", "docs"]);
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([
+			("bundle/docs/a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			(
+				"bundle/docs/big.bin".to_owned(),
+				(big.len() as u64, 3, hash(&big))
+			),
+		])
+	);
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_without_its_password_creates_nothing() {
+	let zip = zip_of(&[("a.txt", Some(b"a"))], Some(b"pw"));
+	let setup = setup("s.zip", zip, |_| {});
+	let failed = start(&setup, Options::default())
+		.running
+		.await
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchivePasswordRequired);
+	assert!(created_dirs(&setup).is_empty());
+	let options = Options {
+		password: Some(ArchivePassword::new("nope".into()).unwrap()),
+		..Options::default()
+	};
+	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(created_dirs(&setup).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_with_duplicate_names_is_kept() {
+	let zip = zip_of(&[("same", Some(b"1")), ("same", Some(b"2"))], None);
+	let (setup, parent) = disposable(zip, None, |_| {});
+	let options = Options {
+		dispose: Some((SourceDisposal::Trash, parent)),
+		..Options::default()
+	};
+	let report = start(&setup, options).running.await.unwrap().unwrap();
+	assert_eq!(report.duplicates.as_ref().map(|d| d.count), Some(1));
+	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn top_level_items_arrive_in_bounded_batches() {
 	let names: Vec<String> = (0..300).map(|i| format!("f{i:03}.txt")).collect();
@@ -1133,6 +1244,58 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 			.chain(&beyond)
 			.all(|uuid| propagated.contains(uuid)),
 		"every top-level item reaches the new share"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
+	// too large (incompressible, so compressed too) to check the password on up front: it
+	// shows once the entry is opened
+	let mut state = 0x9E37_79B9_7F4A_7C15u64;
+	let big: Vec<u8> = (0..17 << 20)
+		.map(|_| {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state.to_le_bytes()[0]
+		})
+		.collect();
+	let zip = zip_of(
+		&[("docs", None), ("docs/big.bin", Some(&big))],
+		Some(b"right"),
+	);
+	// the entry's first chunk comes slowest, long after the folder is created
+	let setup = setup("bundle.zip", zip, |backend| {
+		backend.quirks.insert(Quirk::ReverseChunks);
+	});
+	let options = Options {
+		password: Some(ArchivePassword::new("wrong".into()).unwrap()),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(finished(&setup).is_empty());
+	let log = setup.backend.log();
+	let root = log
+		.created_dirs
+		.iter()
+		.find(|(_, name)| name == "bundle")
+		.map(|(uuid, _)| *uuid)
+		.expect("the new folder was created before the password showed wrong");
+	assert_eq!(
+		log.trashed_dirs,
+		[root],
+		"the folder, with everything in it, is trashed"
+	);
+	assert_eq!(
+		job.recorder.top_level.lock().unwrap().len(),
+		1,
+		"the callback got the folder"
+	);
+	assert!(
+		failed.report.top_level.is_empty(),
+		"the report no longer lists it as created"
 	);
 }
 
@@ -1329,6 +1492,7 @@ fn file_entry(ordinal: u64, path: &str, size: u64) -> WorkerEvent {
 fn read_in_full() -> CodecResult {
 	Ok(ArchiveEnd {
 		unaccounted_bytes: 0,
+		duplicates: None,
 	})
 }
 

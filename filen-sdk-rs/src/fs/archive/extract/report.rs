@@ -21,7 +21,7 @@ use crate::{
 
 pub use crate::job::report::RunState;
 
-use super::ExtractSkipReason;
+use super::{DuplicateEntries, ExtractSkipReason};
 use crate::fs::archive::dispose::SourceDisposition;
 
 /// Where an extraction is. The last three are where it ended.
@@ -269,7 +269,8 @@ pub struct ExtractUpdate {
 }
 
 /// The outcome of an extraction, whether it completed, was cancelled or failed. Directories
-/// and files it created stay; a file it was writing when it stopped never becomes visible.
+/// and files it created stay, except the folders a late wrong password sends to the trash (see
+/// `top_level`); a file it was writing when it stopped never becomes visible.
 ///
 /// An extraction knows no totals up front: an entry is only known once it is read. What one
 /// that ended early leaves [not attempted](ItemCounts::files_not_attempted) is what it had
@@ -279,7 +280,11 @@ pub struct ExtractReport {
 	/// Items created directly in the destination (the new folder, or with
 	/// [`ExtractRoot::Destination`](super::ExtractRoot::Destination) every item at the top of
 	/// the archive), in creation order, up to [`MAX_REPORT_RECORDS`]; the callback receives all
-	/// of them.
+	/// of them, as they are created. An extraction that failed with
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind) before extracting any file tried
+	/// to move the folders it had created to the trash, for a retry to start clean: those it
+	/// moved are left out here, though the callback received them, and `counts.dirs_created`
+	/// still counts them, and the directories in them, as created.
 	pub top_level: Vec<ExtractedTopLevel>,
 	/// The entries that were not extracted because something went wrong, up to 1000.
 	pub failures: Vec<ExtractFailure>,
@@ -292,8 +297,11 @@ pub struct ExtractReport {
 	pub totals: ArchiveTotals,
 	pub counts: ItemCounts,
 	/// Bytes in the archive after its last entry that belong to none (another archive appended
-	/// to it, say), counted from the first non-zero one; zero padding is not counted.
+	/// to it, say), counted from the first non-zero one; zero padding is not counted. For a zip,
+	/// the bytes before its first entry (a self-extracting stub, say).
 	pub unaccounted_bytes: u64,
+	/// Names a zip lists more than once; the last entry of each was extracted.
+	pub duplicates: Option<DuplicateEntries>,
 	/// What became of the archive, when it was to be removed.
 	pub dispositions: Vec<SourceDisposition>,
 }

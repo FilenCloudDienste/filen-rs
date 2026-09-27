@@ -13,7 +13,16 @@ use std::{
 use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
-	fs::archive::{extract::ExpansionLimit, format::StreamCodec, worker},
+	fs::archive::{
+		extract::ExpansionLimit,
+		format::StreamCodec,
+		password::ArchivePassword,
+		worker,
+		zip::{
+			crypto::AesStrength,
+			write::{Encryption, ZipMethod, ZipWriter},
+		},
+	},
 };
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -23,6 +32,7 @@ const LIMITS: CodecLimits = CodecLimits {
 		ratio: 1000,
 		floor: 256 << 20,
 	}),
+	max_index_bytes: 32 << 20,
 };
 
 /// What the driver saw, with a file's data joined up.
@@ -55,10 +65,20 @@ fn run_with(
 	name: &str,
 	limits: CodecLimits,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
+	run_full(archive, name, limits, None)
+}
+
+fn run_full(
+	archive: &[u8],
+	name: &str,
+	limits: CodecLimits,
+	password: Option<&str>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
 	let job = StreamJob {
 		name: name.to_owned(),
 		len: archive.len() as u64,
 		limits,
+		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
 	};
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
@@ -219,7 +239,8 @@ fn a_bare_tar_is_sent_member_by_member() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 0
+			unaccounted_bytes: 0,
+			duplicates: None,
 		}
 	);
 }
@@ -290,7 +311,8 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 4
+			unaccounted_bytes: 4,
+			duplicates: None,
 		}
 	);
 }
@@ -301,6 +323,7 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 	let empty = vec![0u8; 10 * 1024];
 	let nothing = ArchiveEnd {
 		unaccounted_bytes: 0,
+		duplicates: None,
 	};
 	let (seen, end) = run(&empty, "e.tar");
 	assert_eq!(seen, [Seen::Opened(StreamLayout::Tar { codec: None })]);
@@ -346,15 +369,21 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 0
+			unaccounted_bytes: 0,
+			duplicates: None,
 		}
 	);
 }
 
 #[test]
 fn what_the_codec_cannot_read_is_refused() {
+	// zip magic without a zip behind it
 	assert_eq!(
 		kind(run(b"PK\x03\x04rest", "a.zip").1),
+		ErrorKind::ArchiveCorrupt
+	);
+	assert_eq!(
+		kind(run(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4], "a.7z").1),
 		ErrorKind::ArchiveUnsupported
 	);
 	assert_eq!(
@@ -415,6 +444,7 @@ fn the_codec_stops_once_its_driver_is_gone() {
 					name: "sample.tar".into(),
 					len,
 					limits: LIMITS,
+					password: None,
 				},
 			);
 			exited.store(true, Ordering::SeqCst);
@@ -432,6 +462,150 @@ fn the_codec_stops_once_its_driver_is_gone() {
 		assert!(Instant::now() < deadline, "the codec thread kept running");
 		std::thread::sleep(Duration::from_millis(5));
 	}
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+	(0..len)
+		.map(|i| (i % 251).to_le_bytes()[0] ^ seed)
+		.collect()
+}
+
+fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
+	let mut writer = ZipWriter::new(Vec::new());
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None).unwrap(),
+			Some(data) => {
+				let encryption = password.map(|password| Encryption {
+					password,
+					strength: AesStrength::Aes256,
+					salt: vec![9; 16],
+				});
+				writer
+					.add_file(
+						path,
+						None,
+						data.len() as u64,
+						ZipMethod::Deflate { level: 6 },
+						encryption,
+						&mut &data[..],
+					)
+					.unwrap();
+			}
+		}
+	}
+	writer.finish().unwrap()
+}
+
+fn zip_sample() -> (Vec<u8>, Vec<Seen>) {
+	let big = pattern(CHUNK_SIZE + 99, 4);
+	let zip = zip_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("docs/big.bin", Some(&big)),
+			("../evil", Some(b"x")),
+		],
+		None,
+	);
+	let seen = vec![
+		Seen::Opened(StreamLayout::Zip),
+		Seen::Dir(0, "docs".into()),
+		file(1, "docs/a.txt", b"alpha"),
+		file(2, "docs/big.bin", &big),
+		Seen::Skipped(3, "../evil".into(), 1, ExtractSkipReason::UnsafePath),
+	];
+	(zip, seen)
+}
+
+#[test]
+fn a_zip_is_sent_entry_by_entry() {
+	let (zip, expected) = zip_sample();
+	let (seen, end) = run(&zip, "bundle.zip");
+	assert_eq!(seen, expected);
+	assert_eq!(
+		end.unwrap(),
+		ArchiveEnd {
+			unaccounted_bytes: 0,
+			duplicates: None,
+		}
+	);
+}
+
+#[test]
+fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
+	let zip = zip_of(&[("secret.txt", Some(b"secret"))], Some(b"right"));
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, None);
+	assert!(seen.is_empty());
+	assert_eq!(kind(end), ErrorKind::ArchivePasswordRequired);
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, Some("wrong"));
+	assert!(seen.is_empty());
+	assert_eq!(kind(end), ErrorKind::ArchiveWrongPassword);
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, Some("right"));
+	end.unwrap();
+	assert_eq!(
+		seen,
+		[
+			Seen::Opened(StreamLayout::Zip),
+			file(0, "secret.txt", b"secret")
+		]
+	);
+}
+
+#[test]
+fn zip_duplicates_symlinks_and_bombs() {
+	let zip = zip_of(&[("same", Some(b"one")), ("same", Some(b"two"))], None);
+	let (seen, end) = run(&zip, "d.zip");
+	let end = end.unwrap();
+	assert_eq!(
+		end.duplicates,
+		Some(DuplicateEntries {
+			names: vec!["same".into()],
+			count: 1
+		})
+	);
+	assert_eq!(seen[1], file(1, "same", b"two"), "the last one listed wins");
+
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	writer
+		.add_symlink(
+			"link",
+			"target/file",
+			zip8::write::SimpleFileOptions::default(),
+		)
+		.unwrap();
+	let linked = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&linked, "l.zip");
+	end.unwrap();
+	assert_eq!(
+		seen,
+		[
+			Seen::Opened(StreamLayout::Zip),
+			Seen::Skipped(
+				0,
+				"link".into(),
+				11,
+				ExtractSkipReason::Symlink {
+					target: "target/file".into()
+				}
+			),
+		]
+	);
+
+	let zeros = zip_of(&[("zeros", Some(&vec![0u8; 4 << 20]))], None);
+	let bomb = CodecLimits {
+		expansion: Some(ExpansionLimit {
+			ratio: 10,
+			floor: 1 << 20,
+		}),
+		..LIMITS
+	};
+	let (seen, end) = run_with(&zeros, "z.zip", bomb);
+	assert!(
+		seen.is_empty(),
+		"refused on its stated sizes, before anything is sent"
+	);
+	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
 }
 
 #[test]
@@ -453,4 +627,149 @@ fn data_under_a_tar_directory_is_unaccounted() {
 	let (seen, end) = run(&tar, "sample.tar");
 	assert_eq!(seen[1], Seen::Dir(0, "docs".into()));
 	assert_eq!(end.unwrap().unaccounted_bytes, 17);
+}
+
+/// A zip written by the `zip` crate, directories stored as "files" named with a trailing slash,
+/// deflated, as `java.util.zip` and Python write them.
+fn zip_with_deflated_dirs(dir_data: &[u8]) -> Vec<u8> {
+	use zip8::{CompressionMethod, write::SimpleFileOptions};
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+	writer.start_file("docs/", options).unwrap();
+	writer.write_all(dir_data).unwrap();
+	writer.start_file("docs/a.txt", options).unwrap();
+	writer.write_all(b"alpha").unwrap();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn an_empty_deflated_directory_is_no_hidden_data() {
+	let zip = zip_with_deflated_dirs(b"");
+	let mut source = std::io::Cursor::new(&zip[..]);
+	let index = crate::fs::archive::zip::read::read_index(
+		&mut source,
+		zip.len() as u64,
+		crate::fs::archive::zip::read::ZipLimits {
+			max_index_bytes: 1 << 20,
+			max_entries: 10,
+		},
+	)
+	.unwrap();
+	assert!(
+		index.entries[0].compressed_size > 0,
+		"the directory is stored as a deflate stream, as Java writes it"
+	);
+	let (seen, end) = run(&zip, "java.zip");
+	assert_eq!(end.unwrap().unaccounted_bytes, 0, "{seen:?}");
+	// a "directory" that stores data hides it
+	let (_, end) = run(&zip_with_deflated_dirs(b"not a directory's"), "java.zip");
+	assert!(end.unwrap().unaccounted_bytes > 0);
+}
+
+/// A zip of stored, ZipCrypto-encrypted files (no data descriptors, so each check byte is the
+/// high byte of its CRC-32), built by hand: no writer the tests have writes ZipCrypto.
+fn zip_crypto_zip(files: &[(&str, &[u8])], password: &[u8]) -> Vec<u8> {
+	use crate::fs::archive::zip::crypto::test_support::zip_crypto_encrypt;
+	let mut zip = Vec::new();
+	let mut central = Vec::new();
+	for (name, data) in files {
+		let crc = crc32fast::hash(data);
+		let stored = zip_crypto_encrypt(password, (crc >> 24) as u8, data);
+		let offset = u32::try_from(zip.len()).unwrap();
+		// version needed, flags (encrypted), method (stored), time, date
+		let common = [
+			&20u16.to_le_bytes()[..],
+			&1u16.to_le_bytes(),
+			&0u16.to_le_bytes(),
+			&0u16.to_le_bytes(),
+			&0x21u16.to_le_bytes(),
+			&crc.to_le_bytes(),
+			&u32::try_from(stored.len()).unwrap().to_le_bytes(),
+			&u32::try_from(data.len()).unwrap().to_le_bytes(),
+			&u16::try_from(name.len()).unwrap().to_le_bytes(),
+			&0u16.to_le_bytes(),
+		]
+		.concat();
+		zip.extend(0x0403_4b50u32.to_le_bytes());
+		zip.extend(&common);
+		zip.extend(name.as_bytes());
+		zip.extend(&stored);
+		central.extend(0x0201_4b50u32.to_le_bytes());
+		central.extend(20u16.to_le_bytes());
+		central.extend(&common);
+		// comment length, disk, internal and external attributes, local header offset
+		central.extend([0u8; 10]);
+		central.extend(offset.to_le_bytes());
+		central.extend(name.as_bytes());
+	}
+	let central_at = u32::try_from(zip.len()).unwrap();
+	let count = u16::try_from(files.len()).unwrap().to_le_bytes();
+	zip.extend(&central);
+	zip.extend(0x0605_4b50u32.to_le_bytes());
+	zip.extend([0u8; 4]);
+	zip.extend(count);
+	zip.extend(count);
+	zip.extend(u32::try_from(central.len()).unwrap().to_le_bytes());
+	zip.extend(central_at.to_le_bytes());
+	zip.extend([0u8; 2]);
+	zip
+}
+
+#[test]
+fn an_empty_zip_crypto_entry_proves_no_password() {
+	use crate::fs::archive::zip::crypto::{ZipCryptoReader, test_support::zip_crypto_encrypt};
+	// the one file with data is too large to probe, so the entries themselves decide
+	let data = pattern((16 << 20) + 1, 7);
+	let zip = zip_crypto_zip(&[("empty.txt", b""), ("data.bin", &data)], b"right");
+	// a wrong password that both check bytes let through (1 in 65536)
+	let passes = |password: &[u8], data: &[u8]| {
+		let check = (crc32fast::hash(data) >> 24) as u8;
+		let header = zip_crypto_encrypt(b"right", check, &[]);
+		ZipCryptoReader::new(&header[..], password, check).is_ok()
+	};
+	let wrong = (0u32..)
+		.map(|attempt| format!("wrong{attempt}"))
+		.find(|password| passes(password.as_bytes(), b"") && passes(password.as_bytes(), &data))
+		.unwrap();
+	let (seen, end) = run_full(&zip, "crypto.zip", LIMITS, Some(&wrong));
+	assert_eq!(
+		end.map(|_| ()).map_err(|error| error.kind()),
+		Err(ErrorKind::ArchiveWrongPassword),
+		"{:?}",
+		seen.len()
+	);
+	let (_, end) = run_full(&zip, "crypto.zip", LIMITS, Some("right"));
+	end.unwrap();
+}
+
+/// A zip whose directory entry is encrypted with AES, as the `zip` crate writes one started as a
+/// file named with a trailing slash.
+fn zip_with_encrypted_dir(method: zip8::CompressionMethod, dir_data: &[u8]) -> Vec<u8> {
+	use zip8::{AesMode, write::SimpleFileOptions};
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let options = SimpleFileOptions::default()
+		.compression_method(method)
+		.with_aes_encryption(AesMode::Aes256, "pw");
+	writer.start_file("docs/", options).unwrap();
+	writer.write_all(dir_data).unwrap();
+	writer.start_file("docs/a.txt", options).unwrap();
+	writer.write_all(b"alpha").unwrap();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn an_encrypted_directory_is_judged_by_its_length() {
+	use zip8::CompressionMethod;
+	for method in [
+		CompressionMethod::Stored,
+		CompressionMethod::Deflated,
+		CompressionMethod::Bzip2,
+	] {
+		let zip = zip_with_encrypted_dir(method, b"");
+		let (seen, end) = run_full(&zip, "aes.zip", LIMITS, Some("pw"));
+		assert_eq!(end.unwrap().unaccounted_bytes, 0, "{method:?}: {seen:?}");
+		let zip = zip_with_encrypted_dir(method, b"not a directory's");
+		let (_, end) = run_full(&zip, "aes.zip", LIMITS, Some("pw"));
+		assert!(end.unwrap().unaccounted_bytes > 0, "{method:?}");
+	}
 }

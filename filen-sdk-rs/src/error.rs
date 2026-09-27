@@ -181,6 +181,10 @@ pub enum ErrorKind {
 	/// The worker running an archive's codec stopped responding or died. It is not retried: an
 	/// archive that crashed its codec once would crash it again.
 	ArchiveWorkerDied,
+	/// An archive's entries are encrypted, and no password was given.
+	ArchivePasswordRequired,
+	/// The password given does not open the archive's entries.
+	ArchiveWrongPassword,
 }
 
 /// Custom error type for the SDK

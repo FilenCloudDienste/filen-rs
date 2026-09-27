@@ -10,7 +10,9 @@ use crate::{Error, ErrorKind};
 use super::{
 	super::{
 		encode::{StreamEncoder, open_encoder},
+		password::ArchivePassword,
 		worker::{ChunkInput, ChunkSink, JobEnded, WorkerEvent, WorkerPort},
+		zip::write::{Encryption, ZipWriter},
 	},
 	CompressFormat,
 };
@@ -36,6 +38,8 @@ pub(crate) enum ArchiveEntry {
 pub(crate) struct CompressJob {
 	pub(crate) format: CompressFormat,
 	pub(crate) entries: Vec<ArchiveEntry>,
+	/// For an encrypted format.
+	pub(crate) password: Option<ArchivePassword>,
 }
 
 /// Writes the archive through `port`; returns its length. An error the driver caused (it went
@@ -57,6 +61,50 @@ pub(crate) fn compress(port: &WorkerPort, job: CompressJob) -> Result<u64, Error
 			write_tar(port, &mut tar, job.entries)?;
 			let encoder = tar.into_inner().map_err(failure)?;
 			encoder.finish().map_err(failure)?.finish().map_err(failure)
+		}
+		CompressFormat::Zip { method, encryption } => {
+			let password = match (encryption, &job.password) {
+				(None, _) => None,
+				(Some(strength), Some(password)) => Some((strength, password.as_bytes())),
+				(Some(_), None) => {
+					return Err(Error::custom(
+						ErrorKind::ArchivePasswordRequired,
+						"an encrypted zip needs a password",
+					));
+				}
+			};
+			let mut zip = ZipWriter::new(sink);
+			for entry in job.entries {
+				match entry {
+					ArchiveEntry::Dir { path, modified } => {
+						zip.add_dir(&path, modified).map_err(failure)?;
+					}
+					ArchiveEntry::File {
+						source,
+						path,
+						size,
+						modified,
+					} => {
+						let encryption = password.map(|(strength, password)| {
+							// a fresh salt per entry, so no two entries share a key
+							let mut salt = vec![0u8; strength.salt_len()];
+							rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
+							Encryption {
+								password,
+								strength,
+								salt,
+							}
+						});
+						let mut data = ChunkInput::new(port, source, size);
+						let read = zip
+							.add_file(&path, modified, size, method, encryption, &mut data)
+							.map_err(failure)?;
+						check_length(read, size)?;
+						port.send(WorkerEvent::FileEnd).map_err(failure)?;
+					}
+				}
+			}
+			zip.finish().map_err(failure)?.finish().map_err(failure)
 		}
 		CompressFormat::Single { compression } => {
 			let [ArchiveEntry::File { source, size, .. }] = job.entries[..] else {

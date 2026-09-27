@@ -35,7 +35,7 @@ use crate::{
 };
 
 use super::{
-	CompressFormat, CompressSources,
+	ArchivePassword, CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
 	engine::{
 		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
@@ -68,6 +68,8 @@ pub struct CompressConfig {
 	/// Reaching it counts: an archive exactly as large as the free storage is refused, as the
 	/// server refuses an upload that would fill the account.
 	pub max_bytes: Option<u64>,
+	/// For an encrypted format, and only then.
+	pub password: Option<ArchivePassword>,
 }
 
 impl Client {
@@ -115,6 +117,7 @@ impl Client {
 			.format
 			.check_name(name.as_ref())
 			.and_then(|extension_len| {
+				config.format.check(config.password.is_some())?;
 				let memory = config.format.encoder_memory()?;
 				if memory > archives.codec_mem_budget {
 					return Err(Error::custom(
@@ -211,6 +214,7 @@ impl Client {
 		let job = CompressJob {
 			format: config.format,
 			entries,
+			password: config.password,
 		};
 		run_compress(CompressTask {
 			backend: Arc::new(ClientBackend::new(self)),
@@ -482,6 +486,7 @@ mod tests {
 			CompressConfig {
 				format: CompressFormat::Tar { compression: None },
 				max_bytes: None,
+				password: None,
 			},
 			Ignore,
 			JobControl::default(),

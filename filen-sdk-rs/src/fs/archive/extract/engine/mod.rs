@@ -26,7 +26,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeMap, VecDeque},
+	collections::{BTreeMap, HashSet, VecDeque},
 	io,
 	sync::Arc,
 };
@@ -257,8 +257,11 @@ struct Driver<B: DriveBackend> {
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
 	served: u64,
-	/// The archive's plaintext as the codec read it, in order.
-	archive_hasher: blake3::Hasher,
+	/// The archive's plaintext as the codec read it, in order; `None` once the codec jumped (a
+	/// zip is read from its end), as it then no longer covers the whole archive once.
+	archive_hasher: Option<blake3::Hasher>,
+	/// What the archive turned out to hold.
+	layout: Option<StreamLayout>,
 	dispose: Option<ArchiveDisposal>,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
 
@@ -333,6 +336,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		totals,
 		counts: Default::default(),
 		unaccounted_bytes: 0,
+		duplicates: None,
 		dispositions: Vec::new(),
 	};
 	let archive_uuid = archive.uuid();
@@ -401,7 +405,8 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		ready: VecDeque::new(),
 		reading: None,
 		served: 0,
-		archive_hasher: blake3::Hasher::new(),
+		archive_hasher: Some(blake3::Hasher::new()),
+		layout: None,
 		dispose: match dispose {
 			Some((how, parent)) => Some(ArchiveDisposal::Remove { how, parent }),
 			None if disposal_requested => Some(ArchiveDisposal::Unavailable),
@@ -569,8 +574,66 @@ impl<B: DisposalBackend> Driver<B> {
 				.count();
 			self.reporter.dirs_not_attempted(unattempted as u64);
 		}
+		if let Err(error) = &result
+			&& error.kind() == ErrorKind::ArchiveWrongPassword
+			&& self.reporter.counts().files_done == 0
+		{
+			self.trash_created_dirs().await;
+		}
 		self.reporter.finish(phase);
 		result
+	}
+
+	/// A wrong password that only showed once entries were read (no entry was small enough to
+	/// check it on first) leaves the directories created so far and no file: they go to the
+	/// trash, so a retry with the right password starts clean, and out of the report's top-level
+	/// items. Trashed, never deleted: they can be restored.
+	async fn trash_created_dirs(&mut self) {
+		let dirs = self
+			.report
+			.top_level
+			.iter()
+			.filter_map(|top| match &top.item {
+				NonRootItemType::Dir(dir) => Some(dir.uuid()),
+				NonRootItemType::File(_) => None,
+			})
+			.chain(
+				self.top_level_beyond
+					.iter()
+					.filter(|(_, is_dir)| *is_dir)
+					.map(|(uuid, _)| *uuid),
+			)
+			.collect::<Vec<_>>();
+		let mut trashed = HashSet::new();
+		for uuid in dirs {
+			// the job created no file: one in there now is someone else's, and keeps the folder
+			match self.backend.list_tree(uuid).await {
+				Ok(tree) if tree.files.is_empty() => {}
+				Ok(_) => continue,
+				Err(error) => {
+					tracing::warn!(
+						"archive {}: failed to list a directory before trashing it: {error}",
+						self.archive.uuid()
+					);
+					continue;
+				}
+			}
+			match self.backend.trash_dir(uuid).await {
+				Ok(()) => {
+					trashed.insert(uuid);
+				}
+				Err(error) => tracing::warn!(
+					"archive {}: failed to trash a directory created before the wrong password \
+					 showed: {error}",
+					self.archive.uuid()
+				),
+			}
+		}
+		self.report
+			.top_level
+			.retain(|top| !trashed.contains(&top.item.uuid()));
+		self.top_level_beyond
+			.retain(|(uuid, _)| !trashed.contains(uuid));
 	}
 
 	/// Records `error` as ending the job when it is that kind of error.
@@ -788,7 +851,9 @@ impl<B: DisposalBackend> Driver<B> {
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
-		self.archive_hasher.update_rayon(&data);
+		if let Some(hasher) = &mut self.archive_hasher {
+			hasher.update_rayon(&data);
+		}
 		let _ = reply.send(Ok(data));
 		// progress follows the archive read, not only the idle ticks, which a busy job skips
 		self.reporter
@@ -843,7 +908,10 @@ impl<B: DisposalBackend> Driver<B> {
 		// the codec holds no chunk any more
 		self.reading = None;
 		match &result {
-			Ok(end) => self.report.unaccounted_bytes = end.unaccounted_bytes,
+			Ok(end) => {
+				self.report.unaccounted_bytes = end.unaccounted_bytes;
+				self.report.duplicates = end.duplicates.clone();
+			}
 			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
 			Err(error) if self.fatal.is_some() || self.control.is_stopping() => {
 				tracing::debug!("archive codec ended after the job did: {error}");
@@ -875,13 +943,23 @@ impl<B: DisposalBackend> Driver<B> {
 				index,
 				reply,
 			} => {
-				// asking for the next chunk means the codec is done with the one before
+				// asking for another chunk means the codec is done with the one before
 				self.reading = None;
-				debug_assert_eq!(index, self.served, "the codec reads the archive in order");
+				if index != self.served {
+					// a jump (a zip is read from its end): what was fetched ahead is of no use
+					self.archive_hasher = None;
+					self.fetches = FuturesOrdered::new();
+					self.ready.clear();
+					self.next_fetch = index;
+					self.served = index;
+				}
 				self.ask = Some((index, reply));
 				self.serve_ask();
 			}
-			WorkerEvent::Opened(layout) => self.open(layout).await?,
+			WorkerEvent::Opened(layout) => {
+				self.layout = Some(layout);
+				self.open(layout).await?
+			}
 			WorkerEvent::Entry(head) => self.on_entry(head),
 			WorkerEvent::Skipped(member) => self.on_skipped(member),
 			event @ (WorkerEvent::Data(_) | WorkerEvent::FileEnd) => self.retry_held(event),
@@ -911,7 +989,9 @@ impl<B: DisposalBackend> Driver<B> {
 		self.unverified = listed.unverified;
 		let root_entry = self.entry_id(0);
 		let new_folder = match (&self.root, layout) {
-			(ExtractRoot::NewFolder { name }, StreamLayout::Tar { .. }) => Some(name.clone()),
+			(ExtractRoot::NewFolder { name }, StreamLayout::Tar { .. } | StreamLayout::Zip) => {
+				Some(name.clone())
+			}
 			(_, StreamLayout::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
 		let root_uuid = match new_folder {
@@ -1656,17 +1736,24 @@ impl<B: DisposalBackend> Driver<B> {
 				bytes: self.report.unaccounted_bytes,
 			});
 		}
-		// every chunk was read, so the hash covers the whole archive
-		if self.served != self.chunks {
-			return kept(KeptReason::Unconfirmed);
+		if self.report.duplicates.is_some() {
+			return kept(KeptReason::Incomplete);
 		}
-		let read = Blake3Hash::from(self.archive_hasher.finalize());
-		match self.archive.hash() {
-			Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
-			None if how == SourceDisposal::DeletePermanently => {
-				return kept(KeptReason::HashUnavailable);
+		if self.layout != Some(StreamLayout::Zip) {
+			// A streaming archive's entries carry no checksum of their own (a tar's) or share
+			// one for the whole stream: the whole archive, read front to back, has to match the
+			// hash in its metadata. A zip's entries were each checked as they were read.
+			let read = match &self.archive_hasher {
+				Some(hasher) if self.served == self.chunks => Blake3Hash::from(hasher.finalize()),
+				_ => return kept(KeptReason::Unconfirmed),
+			};
+			match self.archive.hash() {
+				Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
+				None if how == SourceDisposal::DeletePermanently => {
+					return kept(KeptReason::HashUnavailable);
+				}
+				_ => {}
 			}
-			_ => {}
 		}
 		if !self.output_confirmed(counts).await {
 			return kept(if self.control.is_stopping() {

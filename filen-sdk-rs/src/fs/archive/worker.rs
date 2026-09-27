@@ -62,6 +62,9 @@ pub(crate) enum WorkerEvent {
 pub(crate) enum StreamLayout {
 	/// A tar, bare or inside a compressed stream.
 	Tar { codec: Option<StreamCodec> },
+	/// A zip, read from its central directory; every entry's data is checked against its
+	/// CRC-32 or authentication code.
+	Zip,
 	/// One compressed file.
 	Single { codec: StreamCodec },
 }
@@ -307,6 +310,82 @@ impl Read for ChunkInput<'_> {
 			.input_bytes
 			.fetch_add(n as u64, Ordering::Relaxed);
 		Ok(n)
+	}
+}
+
+/// An input's plaintext with random access, for formats read from their end (zip): chunks are
+/// fetched through the driver as they are needed, and the last two stay cached, so a record that
+/// straddles a chunk boundary, or a header read before its data, costs no second fetch.
+pub(crate) struct SeekInput<'p> {
+	port: &'p WorkerPort,
+	source: u32,
+	len: u64,
+	pos: u64,
+	/// The two most recent chunks, most recent first.
+	cache: [Option<(u64, Vec<u8>)>; 2],
+}
+
+impl<'p> SeekInput<'p> {
+	pub(crate) fn new(port: &'p WorkerPort, source: u32, len: u64) -> Self {
+		Self {
+			port,
+			source,
+			len,
+			pos: 0,
+			cache: [None, None],
+		}
+	}
+
+	fn chunk(&mut self, index: u64) -> io::Result<&[u8]> {
+		if self.cache[1]
+			.as_ref()
+			.is_some_and(|(cached, _)| *cached == index)
+		{
+			self.cache.swap(0, 1);
+		} else if self.cache[0]
+			.as_ref()
+			.is_none_or(|(cached, _)| *cached != index)
+		{
+			let data = self.port.fetch(self.source, index)?;
+			self.port
+				.shared
+				.input_bytes
+				.fetch_add(data.len() as u64, Ordering::Relaxed);
+			self.cache[1] = self.cache[0].replace((index, data));
+		}
+		Ok(&self.cache[0].as_ref().expect("just filled").1)
+	}
+}
+
+impl Read for SeekInput<'_> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		if buf.is_empty() || self.pos >= self.len {
+			return Ok(0);
+		}
+		let index = self.pos / CHUNK_SIZE_U64;
+		let within = (self.pos % CHUNK_SIZE_U64) as usize;
+		let chunk = self.chunk(index)?;
+		if within >= chunk.len() {
+			return Err(io::ErrorKind::UnexpectedEof.into());
+		}
+		let n = buf.len().min(chunk.len() - within);
+		buf[..n].copy_from_slice(&chunk[within..within + n]);
+		self.pos += n as u64;
+		Ok(n)
+	}
+}
+
+impl std::io::Seek for SeekInput<'_> {
+	fn seek(&mut self, to: std::io::SeekFrom) -> io::Result<u64> {
+		let target = match to {
+			std::io::SeekFrom::Start(offset) => Some(offset),
+			std::io::SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+			std::io::SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+		};
+		self.pos = target.ok_or_else(|| {
+			io::Error::new(io::ErrorKind::InvalidInput, "a seek before the start")
+		})?;
+		Ok(self.pos)
 	}
 }
 
