@@ -50,6 +50,7 @@ use crate::{
 		drive_job::{
 			backend::{CreatedDir, DriveBackend, UploadSpec},
 			ends_job,
+			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
 			lock::{HeldLock, LockWait, wait_for_lock},
 			name_retry::NameRetry,
 		},
@@ -1072,52 +1073,47 @@ async fn copy_file_inner<B: DriveBackend>(
 		final_times: (source.created().unwrap_or(modified), modified),
 	};
 
-	// Registering the file is not started while paused, but once started it runs to the end
-	// even on cancel, so a file that exists is always reported.
-	let _lock = loop {
-		control.checkpoint().await?;
-		match wait_for_lock(&*backend, &control, &reporter.ops()).await? {
-			LockWait::Locked(held) => break held,
-			LockWait::Paused => {}
-			LockWait::Failed(error) => return Err(FileError::Failed(CopyStage::Finalize, error)),
+	let finalized = finalize_new_file(FinalizeTask {
+		backend: &*backend,
+		control: &control,
+		ops: &reporter.ops(),
+		upload: &upload,
+		parent,
+		name,
+		recheck: top_level.then_some(&mut retry),
+		completion,
+		info: info.unwrap_or_default(),
+		targets: &targets,
+	})
+	.await;
+	match finalized {
+		Ok(Finalized {
+			file,
+			name,
+			propagation_errors,
+		}) => {
+			report_propagation_errors(&reporter, file.uuid(), propagation_errors);
+			Ok((file, name))
 		}
-	};
-	if top_level {
-		// Registering a file under a name the parent already holds would make the copy a new
-		// version of that file instead of a new file, so the name is checked again here, while
-		// holding the drive lock: clients that write under the lock cannot take it in between.
-		name = retry
-			.free_name(&*backend, parent, name)
-			.await
-			.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
-	}
-	let remote = backend
-		.finish_upload(&upload, &name, completion, info.unwrap_or_default())
-		.await
-		.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
-	let registered_as_version = remote.stable_uuid != remote.uuid;
-	if registered_as_version {
-		tracing::error!(
-			"copied file {} was registered as a new version of the existing file {}",
-			remote.uuid,
-			Uuid::from(remote.stable_uuid)
-		);
-	}
-	if !targets.is_empty() {
-		for error in backend
-			.propagate(&targets, NonRootItemType::File(Cow::Borrowed(&remote)))
-			.await
-		{
-			reporter.event(CopyEvent::PropagationFailed {
-				dest_uuid: remote.uuid(),
-				error: Arc::new(error),
-			});
+		Err(FinalizeError::RegisteredAsVersion {
+			file,
+			propagation_errors,
+		}) => {
+			report_propagation_errors(&reporter, file.uuid(), propagation_errors);
+			Err(FileError::RegisteredAsVersion(file))
 		}
+		Err(FinalizeError::Stopped) => Err(FileError::Stopped),
+		Err(FinalizeError::Failed(error)) => Err(FileError::Failed(CopyStage::Finalize, error)),
 	}
-	if registered_as_version {
-		return Err(FileError::RegisteredAsVersion(Box::new(remote)));
+}
+
+fn report_propagation_errors(reporter: &Reporter, dest_uuid: Uuid, errors: Vec<Error>) {
+	for error in errors {
+		reporter.event(CopyEvent::PropagationFailed {
+			dest_uuid,
+			error: Arc::new(error),
+		});
 	}
-	Ok((remote, name))
 }
 
 #[cfg(test)]

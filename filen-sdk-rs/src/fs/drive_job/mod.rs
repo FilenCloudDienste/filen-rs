@@ -2,6 +2,7 @@
 //! archives and extracted entries.
 
 pub(crate) mod backend;
+pub(crate) mod finalize;
 pub(crate) mod lock;
 pub(crate) mod name_retry;
 
