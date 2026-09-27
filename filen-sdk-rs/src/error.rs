@@ -170,6 +170,14 @@ pub enum ErrorKind {
 	/// drive operation. Files listed from a public link or a shared-in folder
 	/// never carry one — only read operations accept them.
 	MissingStableUuid,
+	/// An archive's data is damaged: a checksum does not match, a header is malformed, or the
+	/// archive ends early.
+	ArchiveCorrupt,
+	/// An archive uses a format or feature the SDK cannot read.
+	ArchiveUnsupported,
+	/// An archive exceeds what the SDK allows: more entries, more decoded data per byte read, or
+	/// more decoder memory than the limits permit.
+	ArchiveTooLarge,
 }
 
 /// Custom error type for the SDK

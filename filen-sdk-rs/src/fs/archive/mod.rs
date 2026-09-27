@@ -8,7 +8,9 @@
 
 pub(crate) mod decode;
 pub(crate) mod entry_path;
+pub mod extract;
 pub(crate) mod format;
 pub(crate) mod limits;
 pub(crate) mod names;
 pub(crate) mod tar_iter;
+pub(crate) mod worker;
