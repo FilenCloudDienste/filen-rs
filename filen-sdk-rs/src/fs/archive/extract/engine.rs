@@ -35,6 +35,7 @@ use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, crypto::Blake3Hash, fs::Uuid};
 use futures::{
 	StreamExt,
+	future::join_all,
 	stream::{FuturesOrdered, FuturesUnordered},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -1747,7 +1748,9 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Whether the server holds exactly what the counts say was created: every file at its size
-	/// and every directory, listed again below the items created in the destination.
+	/// and every directory, listed again below the items created in the destination. Listed
+	/// as many at once as other small requests; a pause is waited out between them, holding
+	/// nothing, and a cancel ends the check unconfirmed.
 	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
 		let mut found = Tree::default();
 		if !self.into_destination {
@@ -1758,55 +1761,34 @@ impl<B: DisposalBackend> Driver<B> {
 			// the folder itself
 			found.dirs.insert(self.dirs[ROOT].uuid);
 		}
-		for top in &self.report.top_level {
-			// one request per item: a cancel is not kept waiting for all of them
-			if self.control.is_stopping() {
+		// the new folder is listed whole above; the items past the report's records are
+		// checked as recheck_targets goes through them
+		let items: Vec<(Uuid, bool)> = self
+			.report
+			.top_level
+			.iter()
+			.filter(|top| top.key != ExtractTopLevelKey::Root)
+			.map(|top| (top.item.uuid(), matches!(top.item, NonRootItemType::Dir(_))))
+			.chain(self.top_level_beyond.iter().copied())
+			.collect();
+		for batch in items.chunks(MAX_SMALL_PARALLEL_REQUESTS) {
+			if self.reporter.checkpoint(&self.control).await.is_err() {
 				return false;
 			}
-			// the new folder, listed whole above
-			if top.key == ExtractTopLevelKey::Root {
-				continue;
+			let listed = join_all(
+				batch
+					.iter()
+					.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
+			)
+			.await;
+			for tree in listed {
+				let Some(tree) = tree else {
+					return false;
+				};
+				found.dirs.extend(tree.dirs);
+				found.files.extend(tree.files);
 			}
-			match &top.item {
-				NonRootItemType::File(file) => match self.backend.file_state(file.uuid()).await {
-					Ok(state) if !state.trash => {
-						found.files.insert(file.uuid(), state.size);
-					}
-					_ => return false,
-				},
-				NonRootItemType::Dir(dir) => match self.backend.list_tree(dir.uuid()).await {
-					Ok(tree) => {
-						found.dirs.insert(dir.uuid());
-						found.dirs.extend(tree.dirs);
-						found.files.extend(tree.files);
-					}
-					Err(_) => return false,
-				},
-			}
-		}
-		// the top-level items the report keeps no record of, as recheck_targets goes through them
-		for &(uuid, is_dir) in &self.top_level_beyond {
-			// one request per item: a cancel is not kept waiting for all of them
-			if self.control.is_stopping() {
-				return false;
-			}
-			if is_dir {
-				match self.backend.list_tree(uuid).await {
-					Ok(tree) => {
-						found.dirs.insert(uuid);
-						found.dirs.extend(tree.dirs);
-						found.files.extend(tree.files);
-					}
-					Err(_) => return false,
-				}
-			} else {
-				match self.backend.file_state(uuid).await {
-					Ok(state) if !state.trash => {
-						found.files.insert(uuid, state.size);
-					}
-					_ => return false,
-				}
-			}
+			self.reporter.tick();
 		}
 		// the very items the job created, each file at the size it wrote
 		found.files.len() as u64 == counts.files_done
@@ -1817,7 +1799,8 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// The destination may have been shared or linked while the extraction ran; items created
 	/// before that were propagated to the old targets only. Propagate everything created (each
-	/// top-level item with its subtree) to the new ones.
+	/// top-level item with its subtree) to the new ones, as many items at once as other small
+	/// requests, under the drive lock, which a pause gives back until it is over.
 	async fn recheck_targets(&mut self) -> Result<(), Stopped> {
 		self.reporter.checkpoint(&self.control).await?;
 		let destination = self.destination.uuid();
@@ -1837,50 +1820,93 @@ impl<B: DisposalBackend> Driver<B> {
 		if added.is_empty() || self.report.top_level.is_empty() {
 			return Ok(());
 		}
-		let _lock = loop {
-			match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
-				LockWait::Locked(held) => break held,
-				LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
-				LockWait::Failed(error) => {
-					tracing::warn!(
-						"failed to lock the drive to propagate extracted items: {error}"
-					);
-					return Ok(());
+		let items = self.report.top_level.len() + self.top_level_beyond.len();
+		let mut next = 0;
+		while next < items {
+			let _lock = loop {
+				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
+					LockWait::Locked(held) => break held,
+					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
+					LockWait::Failed(error) => {
+						tracing::warn!(
+							"failed to lock the drive to propagate extracted items: {error}"
+						);
+						return Ok(());
+					}
 				}
-			}
-		};
-		for top in &self.report.top_level {
-			// one request per item: a cancel is not kept waiting for all of them
-			if self.control.is_stopping() {
-				return Err(Stopped);
-			}
-			for error in self.backend.propagate_tree(&added, &top.item).await {
-				self.reporter.event(ExtractEvent::PropagationFailed {
-					dest_uuid: top.item.uuid(),
-					error: Arc::new(error),
-				});
-			}
-		}
-		// the items the report keeps no record of, fetched again: only when the destination
-		// changed, which is rare, rather than holding every one of them for the whole job
-		for &(uuid, is_dir) in &self.top_level_beyond {
-			// one request per item: a cancel is not kept waiting for all of them
-			if self.control.is_stopping() {
-				return Err(Stopped);
-			}
-			let errors = match self.backend.normal_item(uuid, is_dir).await {
-				Ok(item) => self.backend.propagate_tree(&added, &item).await,
-				Err(error) => vec![error],
 			};
-			for error in errors {
-				self.reporter.event(ExtractEvent::PropagationFailed {
-					dest_uuid: uuid,
-					error: Arc::new(error),
-				});
+			while next < items && !self.control.is_pause_requested() {
+				// a cancel is not kept waiting for every item
+				if self.control.is_stopping() {
+					return Err(Stopped);
+				}
+				let end = (next + MAX_SMALL_PARALLEL_REQUESTS).min(items);
+				let propagated = join_all((next..end).map(|index| {
+					propagate_top_level(
+						&*self.backend,
+						&self.report.top_level,
+						&self.top_level_beyond,
+						index,
+						&added,
+					)
+				}))
+				.await;
+				for (dest_uuid, errors) in propagated {
+					for error in errors {
+						self.reporter.event(ExtractEvent::PropagationFailed {
+							dest_uuid,
+							error: Arc::new(error),
+						});
+					}
+				}
+				next = end;
+				self.reporter.tick();
 			}
 		}
 		Ok(())
 	}
+}
+
+/// Propagates top-level item `index` of `kept` followed by `beyond` (those past the report's
+/// records, fetched again: only when the destination changed, which is rare, rather than
+/// holding every one of them for the whole job) with its subtree to `added`; its uuid, and
+/// what failed.
+async fn propagate_top_level<B: DisposalBackend>(
+	backend: &B,
+	kept: &[ExtractedTopLevel],
+	beyond: &[(Uuid, bool)],
+	index: usize,
+	added: &ConnectedTargets,
+) -> (Uuid, Vec<Error>) {
+	if let Some(top) = kept.get(index) {
+		return (
+			top.item.uuid(),
+			backend.propagate_tree(added, &top.item).await,
+		);
+	}
+	let (uuid, is_dir) = beyond[index - kept.len()];
+	let errors = match backend.normal_item(uuid, is_dir).await {
+		Ok(item) => backend.propagate_tree(added, &item).await,
+		Err(error) => vec![error],
+	};
+	(uuid, errors)
+}
+
+/// What the server holds of a top-level item the job created: itself, and everything below a
+/// directory; `None` if it could not be listed, or is a file in the trash.
+async fn created_tree<B: DisposalBackend>(backend: &B, uuid: Uuid, is_dir: bool) -> Option<Tree> {
+	let mut tree = Tree::default();
+	if is_dir {
+		tree = backend.list_tree(uuid).await.ok()?;
+		tree.dirs.insert(uuid);
+	} else {
+		let state = backend.file_state(uuid).await.ok()?;
+		if state.trash {
+			return None;
+		}
+		tree.files.insert(uuid, state.size);
+	}
+	Some(tree)
 }
 
 #[cfg(test)]

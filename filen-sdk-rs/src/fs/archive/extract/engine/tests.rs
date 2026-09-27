@@ -1337,6 +1337,55 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_the_output_is_checked_is_waited_out() {
+	// more top-level items than are checked at once
+	let names: Vec<String> = (0..2 * MAX_SMALL_PARALLEL_REQUESTS + 2)
+		.map(|i| format!("f{i:03}.txt"))
+		.collect();
+	let members: Vec<(&str, &[u8])> = names
+		.iter()
+		.map(|name| (name.as_str(), &b"x"[..]))
+		.collect();
+	let tar = tar_of(&members);
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+		backend.delay = Duration::from_millis(50);
+	});
+	let (pause, _cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			root: ExtractRoot::Destination,
+			control,
+			dispose: Some((SourceDisposal::Trash, parent)),
+			..Options::default()
+		},
+	);
+	wait_until("the output is checked", || {
+		let updates = job.recorder.updates.lock().unwrap();
+		updates
+			.last()
+			.is_some_and(|update| update.phase == ExtractPhase::DisposingSources)
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert!(!job.running.is_finished());
+	assert!(
+		setup.backend.log().trashed_files.is_empty(),
+		"the archive is not removed while paused"
+	);
+
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+	assert_eq!(setup.backend.log().trashed_files, [setup.archive.uuid()]);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let tar = good_tar();
 	// moved elsewhere while it was extracted
