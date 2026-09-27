@@ -9,12 +9,15 @@ mod js_impl;
 mod plan;
 mod report;
 
-pub use crate::job::{JobControl, JobController};
+pub use crate::{
+	fs::drive_job::counts::ItemCounts,
+	job::{JobControl, JobController},
+};
 pub use client_impl::{CopyConfig, CopyRequest, CopySource, CopySourceDir};
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
 pub use report::{
-	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyPhase, CopyStage,
-	CopyUpdate, FailureInfo, PlannedTopLevelItem, RunState, ScanProgress,
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyEvent, CopyPhase, CopyStage, CopyUpdate,
+	FailureInfo, PlannedTopLevelItem, RunState, ScanProgress,
 };
 
 // The report types are generic over how a failed directory is addressed again, which keeps the

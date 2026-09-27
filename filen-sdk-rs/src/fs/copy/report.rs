@@ -10,6 +10,7 @@ use crate::{
 	Error,
 	fs::{
 		categories::{DirType, NonRootItemType, Normal},
+		drive_job::counts::ItemCounts,
 		file::enums::RemoteFileType,
 	},
 	job::{
@@ -44,29 +45,6 @@ pub enum CopyPhase {
 	Cancelled,
 	/// Ended early by an error that affects the whole job (e.g. no storage left).
 	Failed,
-}
-
-/// Running counts. Once the job is over, everything planned is done, failed or not attempted:
-/// `created + failed + not_attempted == totals` for directories, and likewise for files and
-/// bytes. Skipped entries are not part of the totals.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default)]
-pub struct CopyCounts {
-	pub dirs_created: u64,
-	/// Includes the directories below a failed one, which are never attempted.
-	pub dirs_failed: u64,
-	pub files_done: u64,
-	/// Includes the files below a failed directory, which are never attempted.
-	pub files_failed: u64,
-	pub bytes_done: u64,
-	pub bytes_failed: u64,
-	/// What a job that ended early (cancelled, or stopped by an error) never copied, including
-	/// files it had started: their partial uploads never become visible. Zero while running.
-	pub dirs_not_attempted: u64,
-	pub files_not_attempted: u64,
-	pub bytes_not_attempted: u64,
-	pub entries_skipped: u64,
-	pub bytes_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -192,7 +170,7 @@ pub struct CopyUpdate {
 	pub run_state: RunState,
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
-	pub counts: CopyCounts,
+	pub counts: ItemCounts,
 	pub active: Vec<ActiveFile>,
 	pub events: Vec<CopyEvent>,
 	pub bytes_per_second: Option<u64>,
@@ -232,7 +210,7 @@ pub struct CopyReport<D> {
 	/// destination was listed, is.
 	pub renamed: Vec<RenamedEntry>,
 	pub totals: PlanTotals,
-	pub counts: CopyCounts,
+	pub counts: ItemCounts,
 }
 
 impl<D> Default for CopyReport<D> {
@@ -243,7 +221,7 @@ impl<D> Default for CopyReport<D> {
 			skipped: Vec::new(),
 			renamed: Vec::new(),
 			totals: PlanTotals::default(),
-			counts: CopyCounts::default(),
+			counts: ItemCounts::default(),
 		}
 	}
 }
@@ -281,7 +259,7 @@ pub(crate) struct CopyState {
 	core: RunCore<CopyEvent, CopyPhase>,
 	scan: ScanProgress,
 	totals: PlanTotals,
-	counts: CopyCounts,
+	counts: ItemCounts,
 	active: Vec<ActiveFile>,
 }
 
@@ -371,7 +349,7 @@ impl Reporter {
 				core: RunCore::new(CopyPhase::Scanning),
 				scan: ScanProgress::default(),
 				totals: PlanTotals::default(),
-				counts: CopyCounts::default(),
+				counts: ItemCounts::default(),
 				active: Vec::new(),
 			},
 			Box::new(callback),
@@ -508,7 +486,7 @@ impl Reporter {
 		self.with_state(|state| state.core.push(event));
 	}
 
-	pub(crate) fn counts(&self) -> CopyCounts {
+	pub(crate) fn counts(&self) -> ItemCounts {
 		self.read(|state| state.counts)
 	}
 
