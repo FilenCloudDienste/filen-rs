@@ -20,7 +20,10 @@ use super::{
 	from_source,
 	header::*,
 };
-use crate::fs::archive::decode::clamp_lzma_dict;
+use crate::fs::archive::{
+	decode::{clamp_lzma_dict, open_stream},
+	format::StreamCodec,
+};
 
 /// Most coders in one folder; 7-Zip writes at most four (BCJ2 with its three LZMA coders).
 const MAX_CODERS: u64 = 8;
@@ -37,6 +40,12 @@ const KDF_ROUNDS_BUDGET: u64 = 4 << super::crypto::MAX_CYCLES_POWER;
 const INPUT_BUFFER: usize = 64 * 1024;
 /// Most distinct keys (salts and round counts) one archive may use; 7-Zip uses one.
 const MAX_KEYS: usize = 16;
+/// The zstd coder's id, as 7-Zip ZS (the zstd fork of 7-Zip) and p7zip's zstd plugin write it.
+const ZSTD_ID: u64 = 0x04F7_1101;
+/// What a zstd coder is charged up front: its decoder's state and a small window. A larger
+/// window is charged against what the folder's other coders leave of the budget once its
+/// frame's header is read, as a zstd stream carries it nowhere else.
+const ZSTD_BASE_BYTES: u64 = 4 << 20;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SevenZLimits {
@@ -67,6 +76,9 @@ pub(crate) enum Method {
 	Bzip2,
 	Deflate,
 	Deflate64,
+	/// 7-Zip ZS's zstd, whose properties (the version and level that wrote it) decoding needs
+	/// none of.
+	Zstd,
 	Bcj(Branch),
 	Bcj2,
 	Delta,
@@ -93,6 +105,7 @@ impl Method {
 			0x04_0108 => Self::Deflate,
 			0x04_0109 => Self::Deflate64,
 			0x04_0202 => Self::Bzip2,
+			ZSTD_ID => Self::Zstd,
 			AES_ID => Self::Aes,
 			_ => return None,
 		})
@@ -117,6 +130,7 @@ impl Method {
 			Self::Deflate => 0x04_0108,
 			Self::Deflate64 => 0x04_0109,
 			Self::Bzip2 => 0x04_0202,
+			Self::Zstd => ZSTD_ID,
 			Self::Aes => AES_ID,
 		}
 	}
@@ -1124,6 +1138,7 @@ fn coder_memory(folder: &Folder, coder: usize) -> Result<u64, SevenZError> {
 			Method::Deflate64 => 256 << 10,
 			// its four stream buffers, 256 KiB each
 			Method::Bcj2 => 1 << 20,
+			Method::Zstd => ZSTD_BASE_BYTES,
 			Method::Copy | Method::Deflate | Method::Bcj(_) | Method::Delta | Method::Aes => 0,
 		})
 }
@@ -1202,12 +1217,18 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 			"a 7z folder's decoders are over the codec budget",
 		));
 	}
+	let zstd_coders = folder
+		.coders
+		.iter()
+		.filter(|coder| coder.method == Some(Method::Zstd))
+		.count() as u64;
 	let mut builder = Builder {
 		source,
 		folder,
 		offsets,
 		sizes,
 		keys,
+		zstd_memory: ZSTD_BASE_BYTES + (decoder_memory - memory) / zstd_coders.max(1),
 	};
 	builder.output(folder.main)
 }
@@ -1218,6 +1239,8 @@ struct Builder<'b, 'k, 'p, R> {
 	offsets: &'b [u64],
 	sizes: &'b [u64],
 	keys: &'k mut Keys<'p>,
+	/// The budget of each zstd coder's decoder: its base and its share of what is left.
+	zstd_memory: u64,
 }
 
 impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
@@ -1310,6 +1333,8 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 					Method::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(input)),
 					Method::Deflate => Box::new(flate2::read::DeflateDecoder::new(input)),
 					Method::Deflate64 => Box::new(deflate64::Deflate64Decoder::new(input)),
+					Method::Zstd => open_stream(StreamCodec::Zstd, input, self.zstd_memory)
+						.map_err(|error| SevenZError::Read(error.into()))?,
 					Method::Bcj(branch) => {
 						use lzma_rust2::filter::bcj::BcjReader;
 						let start = branch_start(props)?;

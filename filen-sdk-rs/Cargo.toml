@@ -32,6 +32,7 @@ wasm-full = [
 	"dep:sha1",
 	"dep:zeroize",
 	"dep:deflate64",
+	"dep:ruzstd",
 ]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
@@ -219,10 +220,10 @@ walkdir = "2.5.0"
 # Archive codecs for compress/extract (fs::archive), all written in Rust: no C code or C
 # toolchain, so they build for wasm as they are. Written in Rust is not free of `unsafe`:
 # ppmd-rust (7z PPMd) and libbz2-rs-sys (under bzip2) are translations of C and use it
-# throughout, on archive data an attacker may have made; the SDK checks PPMd's properties
-# against the crate's bounds before building its decoder. Always on natively; on wasm only
-# with `wasm-full`, so the service-worker build (where fs::archive doesn't exist) never
-# compiles them.
+# throughout, and ruzstd's ring buffer uses it too, all on archive data an attacker may have
+# made; the SDK checks PPMd's properties against the crate's bounds before building its
+# decoder. Always on natively; on wasm only with `wasm-full`, so the service-worker build
+# (where fs::archive doesn't exist) never compiles them.
 tar = { version = "0.4.46", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = [
 	"rust_backend",
@@ -255,6 +256,8 @@ sha1 = "0.10"
 zeroize = "1"
 deflate64 = "0.1"
 ppmd-rust = "1.4"
+# zstd, both ways; `hash` writes and checks the frames' content checksums
+ruzstd = { version = "0.9", default-features = false, features = ["std", "hash"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -334,6 +337,10 @@ sha1 = { version = "0.10", optional = true }
 zeroize = { version = "1", optional = true }
 deflate64 = { version = "0.1", optional = true }
 ppmd-rust = { version = "1.4", optional = true }
+ruzstd = { version = "0.9", default-features = false, features = [
+	"std",
+	"hash",
+], optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
