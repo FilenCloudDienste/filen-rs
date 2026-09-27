@@ -376,7 +376,8 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 			.is_some_and(|stream| index.folders[stream.folder].encrypted())
 	};
 	// an encrypted header only decodes with the right password; encrypted data is checked on
-	// the entry cheapest to reach that has a CRC-32, before anything is created
+	// the entry cheapest to reach that has a CRC-32, before anything is created. An empty entry
+	// proves nothing: decoding nothing matches its CRC-32 under any key
 	let mut verified = index.headers_encrypted || !index.entries.iter().any(encrypted);
 	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
 	if !verified {
@@ -388,6 +389,7 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 			.iter()
 			.filter(|entry| {
 				encrypted(entry)
+					&& entry.size > 0
 					&& entry.crc.is_some()
 					&& index.folders[entry.stream.expect("encrypted").folder].supported()
 			})
@@ -464,7 +466,7 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 				.map_err(sevenz_failure)
 				.and_then(|mut data| send_file_data(port, &mut data).map_err(sevenz_io_failure));
 			match sent {
-				Ok(_) => verified |= checked && encrypted(entry),
+				Ok(_) => verified |= checked && encrypted(entry) && entry.size > 0,
 				// while the password is unchecked, damage in encrypted data is likelier a
 				// wrong password than a damaged archive
 				Err(error)

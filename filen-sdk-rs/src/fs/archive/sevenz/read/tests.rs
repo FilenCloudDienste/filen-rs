@@ -660,3 +660,35 @@ fn a_wrong_password_under_lzma_reads_as_one() {
 	}
 	assert!(read_all(&archive, Some("secret")).is_ok());
 }
+
+#[test]
+fn aes_data_of_a_partial_block_is_damage_whatever_the_key() {
+	let folder = |packed: u64| {
+		let folder = Folder {
+			coders: vec![Coder {
+				method: Some(Method::Aes),
+				props: Box::new([]),
+				inputs: 1,
+			}],
+			bind_pairs: Vec::new(),
+			packed: vec![0],
+			unpack_sizes: vec![packed],
+			crc: None,
+			first_pack: 0,
+			main: 0,
+		};
+		let source = Rc::new(RefCell::new(Cursor::new(vec![0u8; 64])));
+		let mut keys = Keys::new(None);
+		open_folder(&source, &folder, &[0], &[packed], 1 << 20, &mut keys).map(|_| ())
+	};
+	// told before any key is asked for
+	assert!(matches!(
+		folder(17),
+		Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK))
+	));
+	// whole blocks pass on to the key (which this archive cannot give)
+	assert!(!matches!(
+		folder(32),
+		Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK))
+	));
+}

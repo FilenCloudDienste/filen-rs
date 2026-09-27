@@ -816,3 +816,43 @@ fn a_wrong_password_on_lzma_entries_reads_as_one() {
 		assert!(seen.is_empty());
 	}
 }
+
+#[test]
+fn an_empty_7z_entry_proves_no_password() {
+	use sevenz_rust2::{
+		ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod,
+		encoder_options::AesEncoderOptions,
+	};
+	// sevenz-rust2 gives an empty file added with a reader a data stream of its own; decoding
+	// nothing matches its CRC-32 under any key, and LZMA2 reads nothing before its first output
+	let data = pattern(64 << 10, 5);
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	writer.set_content_methods(vec![
+		AesEncoderOptions::new("right".into()).into(),
+		EncoderMethod::LZMA2.into(),
+	]);
+	writer.set_encrypt_header(false);
+	writer
+		.push_archive_entry(SevenZEntry::new_file("empty.txt"), Some(&b""[..]))
+		.unwrap();
+	writer
+		.push_archive_entry(SevenZEntry::new_file("data.bin"), Some(&data[..]))
+		.unwrap();
+	let archive = writer.finish().unwrap().into_inner();
+	for wrong in ["wrong", "also wrong"] {
+		let (seen, end) = run_full(&archive, "empty.7z", LIMITS, Some(wrong));
+		assert_eq!(
+			end.map(|_| ()).map_err(|error| error.kind()),
+			Err(ErrorKind::ArchiveWrongPassword),
+			"{seen:?}"
+		);
+		assert!(seen.is_empty(), "nothing is created: {seen:?}");
+	}
+	let (seen, end) = run_full(&archive, "empty.7z", LIMITS, Some("right"));
+	end.unwrap();
+	assert!(
+		seen.iter()
+			.any(|seen| matches!(seen, Seen::File { data: read, .. } if *read == data)),
+		"{seen:?}"
+	);
+}

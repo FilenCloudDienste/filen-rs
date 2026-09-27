@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 
 use super::{
 	SevenZError,
-	crypto::{AES_ID, AesCbcReader, AesProps, Key, derive_key},
+	crypto::{AES_ID, AES_PARTIAL_BLOCK, AesCbcReader, AesProps, BLOCK, Key, derive_key},
 	from_source,
 	header::*,
 };
@@ -164,6 +164,29 @@ impl Folder {
 
 	fn first_input(&self, coder: usize) -> usize {
 		self.coders[..coder].iter().map(|c| c.inputs).sum()
+	}
+
+	/// Whether every AES coder is fed whole cipher blocks, which needs no key to see: a stream
+	/// of another length is the archive's damage, never the password's. `pack_sizes` are the
+	/// archive's, which `first_pack` indexes.
+	pub(crate) fn aes_blocks_whole(&self, pack_sizes: &[u64]) -> bool {
+		self.coders
+			.iter()
+			.enumerate()
+			.filter(|(_, coder)| coder.method == Some(Method::Aes))
+			.all(|(coder, _)| {
+				let input = self.first_input(coder);
+				let size = match self.bind_pairs.iter().find(|(i, _)| *i == input) {
+					Some(&(_, output)) => self.unpack_sizes.get(output),
+					None => self
+						.packed
+						.iter()
+						.position(|&packed| packed == input)
+						.and_then(|packed| pack_sizes.get(self.first_pack + packed)),
+				};
+				// a stream that is missing is reported where it is looked up
+				size.is_none_or(|size| size % BLOCK as u64 == 0)
+			})
 	}
 }
 
@@ -395,6 +418,14 @@ pub(crate) fn read_index<R: Read + Seek>(
 			.map(|(&at, &size)| (at, at + size)),
 	);
 	index.unaccounted_bytes = unaccounted(covered, len)?;
+	// checked before any key is tried on a folder, so a wrong password never hides it
+	if !index
+		.folders
+		.iter()
+		.all(|folder| folder.aes_blocks_whole(&index.pack_sizes))
+	{
+		return Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK));
+	}
 	// a folder no file takes its data from holds bytes nothing extracts
 	let mut used = vec![false; index.folders.len()];
 	for stream in index.entries.iter().filter_map(|entry| entry.stream) {
@@ -1159,6 +1190,9 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 ) -> Result<Box<dyn Read + 's>, SevenZError> {
 	if !folder.supported() {
 		return Err(SevenZError::Unsupported("a 7z coder"));
+	}
+	if !folder.aes_blocks_whole(sizes) {
+		return Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK));
 	}
 	let memory = (0..folder.coders.len()).try_fold(0u64, |total, coder| {
 		Ok::<_, SevenZError>(total.saturating_add(coder_memory(folder, coder)?))
