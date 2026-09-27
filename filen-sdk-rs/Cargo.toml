@@ -216,8 +216,12 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
 uniffi = { version = "0.29.4", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
-# Archive codecs for compress/extract (fs::archive), all pure Rust. Always on natively; on wasm
-# only with `wasm-full`, so the service-worker build (where fs::archive doesn't exist) never
+# Archive codecs for compress/extract (fs::archive), all written in Rust: no C code or C
+# toolchain, so they build for wasm as they are. Written in Rust is not free of `unsafe`:
+# ppmd-rust (7z PPMd) and libbz2-rs-sys (under bzip2) are translations of C and use it
+# throughout, on archive data an attacker may have made; the SDK checks PPMd's properties
+# against the crate's bounds before building its decoder. Always on natively; on wasm only
+# with `wasm-full`, so the service-worker build (where fs::archive doesn't exist) never
 # compiles them.
 tar = { version = "0.4.46", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = [
