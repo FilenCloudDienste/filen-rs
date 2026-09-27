@@ -207,28 +207,49 @@ fn numbered_candidate(
 	ext: &str,
 ) -> Result<(ValidatedName, Option<CounterKey>), EntryNameError> {
 	let suffix = format!(" ({n})");
-	// An extension so long that no base character fits is folded into the base, so trimming
-	// eats into it instead of producing an empty base.
-	let (base, ext) = if ext.len() + suffix.len() >= MAX_BYTES {
-		(Cow::Owned(format!("{base}{ext}")), "")
-	} else {
-		(Cow::Borrowed(base), ext)
+	// The base keeps at least its first character: an extension that leaves no room for it is
+	// folded into the base, so trimming eats into the extension instead. A candidate starting
+	// with the suffix's space would have to be encoded, which lengthens it past the limit.
+	let (base, ext, mut budget) = match MAX_BYTES
+		.checked_sub(suffix.len() + ext.len())
+		.filter(|&budget| base.floor_char_boundary(budget) > 0)
+	{
+		Some(budget) => (Cow::Borrowed(base), ext, budget),
+		None => (
+			Cow::Owned(format!("{base}{ext}")),
+			"",
+			MAX_BYTES - suffix.len(),
+		),
 	};
-	let mut budget = MAX_BYTES - suffix.len() - ext.len();
 	loop {
 		let trimmed = &base[..base.floor_char_boundary(budget)];
 		let candidate = format!("{trimmed}{suffix}{ext}");
-		match ValidatedName::try_from(candidate.as_str()) {
-			// NFC normalization can lengthen a name slightly; trim further and retry.
-			Err(EntryNameError {
-				kind: EntryNameErrorKind::TooLong { .. },
-				..
-			}) if budget > 1 => budget -= 1,
-			Err(_) => return Ok((encode_name(&candidate)?, None)),
+		let too_long = match ValidatedName::try_from(candidate.as_str()) {
 			Ok(name) => {
 				let key = (collision_key(trimmed), collision_key(ext), suffix.len());
 				return Ok((name, Some(key)));
 			}
+			Err(
+				error @ EntryNameError {
+					kind: EntryNameErrorKind::TooLong { .. },
+					..
+				},
+			) => error,
+			Err(_) => match encode_name(&candidate) {
+				Ok(name) => return Ok((name, None)),
+				Err(
+					error @ EntryNameError {
+						kind: EntryNameErrorKind::TooLong { .. },
+						..
+					},
+				) => error,
+				Err(error) => return Err(error),
+			},
+		};
+		// NFC normalization or encoding lengthened it: trim further, keeping the first character
+		budget = trimmed.len() - 1;
+		if base.floor_char_boundary(budget) == 0 {
+			return Err(too_long);
 		}
 	}
 }
@@ -449,6 +470,139 @@ mod tests {
 		assert!(renamed.len() <= MAX_BYTES, "{} bytes", renamed.len());
 		assert!(renamed.starts_with("a."), "{renamed}");
 		assert!(renamed.ends_with(" (1)"), "{renamed}");
+	}
+
+	#[test]
+	fn an_extension_leaving_no_room_for_the_first_character_is_trimmed_instead() {
+		// numbered, the 4-byte first character would not fit before this extension: a candidate
+		// without it starts with a space, which only encoding makes valid, and the encoding
+		// outgrew the limit by the 100th duplicate
+		let name = format!("\u{1F600}.{}", "a".repeat(247));
+		let mut names = TakenNames::new([name.as_str()]);
+		let allocated: Vec<String> = (0..150)
+			.map(|_| {
+				names
+					.allocate(source_name(&name), NameShape::File)
+					.unwrap()
+					.into()
+			})
+			.collect();
+		assert_eq!(allocated[0], format!("\u{1F600}.{} (1)", "a".repeat(246)));
+		assert_eq!(
+			allocated[99],
+			format!("\u{1F600}.{} (100)", "a".repeat(244))
+		);
+		assert!(allocated.iter().all(|name| name.len() <= MAX_BYTES));
+	}
+
+	/// What [`TakenNames::allocate`] must pick, found without its hint: every counter from the
+	/// first, in turn.
+	fn allocate_by_trying_every_counter(
+		taken: &mut SeededSet<String>,
+		name: &ValidatedName,
+		shape: NameShape,
+	) -> String {
+		if taken.insert(collision_key(name.as_ref())) {
+			return name.clone().into();
+		}
+		let (stem, ext) = split_extension(name.as_ref(), shape);
+		let (mut base, mut n) = strip_counter(stem)
+			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
+			.unwrap_or((stem, 1));
+		loop {
+			let (candidate, _) = numbered_candidate(base, n, ext).unwrap();
+			if taken.insert(collision_key(candidate.as_ref())) {
+				return candidate.into();
+			}
+			(base, n) = n.checked_add(1).map_or((stem, 1), |next| (base, next));
+		}
+	}
+
+	#[test]
+	fn long_and_encoded_names_get_what_trying_every_counter_would_give() {
+		use rand::{Rng, SeedableRng, rngs::StdRng};
+
+		// characters of every UTF-8 length, ones whose case changes their length, and ones a
+		// name gets encoded for
+		const ALPHABET: &[&str] = &[
+			"a",
+			"A",
+			".",
+			" ",
+			"(",
+			"1)",
+			"\u{e9}",
+			"\u{c9}",
+			"\u{130}",
+			"i\u{307}",
+			"\u{1F600}",
+			":",
+			"\u{3a3}",
+		];
+		// counters a name already ends in, so numbering starts at every length up to the last
+		const COUNTERS: &[&str] = &["", "", " (9)", " (99)", " (999)", " (18446744073709551614)"];
+		let mut rng = StdRng::seed_from_u64(0x6b65_6570_626f_7468);
+		// an extension holds no dot, and nothing encoding would lengthen past the limit
+		let text = |rng: &mut StdRng, bytes: usize, ext: bool| {
+			let mut text = String::new();
+			while text.len() < bytes {
+				let piece = ALPHABET[rng.random_range(0..ALPHABET.len())];
+				if !ext || ![".", ":"].contains(&piece) {
+					text.push_str(piece);
+				}
+			}
+			text.truncate(text.floor_char_boundary(bytes));
+			text
+		};
+		for _ in 0..300 {
+			let pool: Vec<ValidatedName> = (0..3)
+				.filter_map(|_| {
+					// a long stem, or a long extension: then counters leave the base little room
+					let long_ext = rng.random_bool(0.5);
+					let stem = if long_ext {
+						// a character or two, which may leave the base no room at all
+						let pieces = rng.random_range(1..=2);
+						(0..pieces)
+							.map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())])
+							.collect()
+					} else {
+						let bytes = rng.random_range(1..=250);
+						text(&mut rng, bytes, false)
+					};
+					let counter = COUNTERS[rng.random_range(0..COUNTERS.len())];
+					let room = MAX_BYTES.saturating_sub(stem.len() + counter.len() + 1);
+					let bytes = if long_ext {
+						room.saturating_sub(rng.random_range(0..4))
+					} else {
+						rng.random_range(0..=room.min(10))
+					};
+					let ext = text(&mut rng, bytes, true);
+					SourceName::parse(&format!("{stem}{counter}.{ext}"))
+						.ok()
+						.map(SourceName::into_name)
+				})
+				.collect();
+			if pool.is_empty() {
+				continue;
+			}
+			let shape = if rng.random_bool(0.5) {
+				NameShape::File
+			} else {
+				NameShape::Dir
+			};
+			let mut names = TakenNames::default();
+			let mut oracle = SeededSet::default();
+			for _ in 0..40 {
+				let name = &pool[rng.random_range(0..pool.len())];
+				let allocated: String = names.allocate(name.clone(), shape).unwrap().into();
+				assert_eq!(
+					allocated,
+					allocate_by_trying_every_counter(&mut oracle, name, shape),
+					"allocating {name:?}"
+				);
+				assert!(ValidatedName::try_from(allocated.as_str()).is_ok());
+			}
+		}
 	}
 
 	#[test]
