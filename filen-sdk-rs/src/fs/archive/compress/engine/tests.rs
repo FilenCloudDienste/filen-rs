@@ -936,3 +936,65 @@ async fn a_permanent_removal_cut_short_says_what_it_deleted() {
 		"the file deleted before the failure is reported gone"
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_inside_another_goes_with_it() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	// docs, top.txt, docs/a.txt given on its own too, and top.txt given twice
+	let a = &setup.sources[0].1;
+	let top = &setup.sources[2].1;
+	let mut targets = targets(&setup, &placed);
+	targets.push(DisposalTarget::File(ExpectedFile::of(
+		a,
+		a.uuid(),
+		placed.docs,
+	)));
+	targets.push(DisposalTarget::File(ExpectedFile::of(
+		top,
+		top.uuid(),
+		placed.parent,
+	)));
+	let disposal = CompressDisposal {
+		how: SourceDisposal::DeletePermanently,
+		targets,
+		hashed: vec![true; 4],
+	};
+	let job = CompressJob {
+		format: CompressFormat::Tar { compression: None },
+		entries: setup.entries.clone(),
+		password: None,
+	};
+	let job = start_disposing(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+		Some(disposal),
+		CompressReport::default(),
+	);
+	let report = job.running.await.unwrap().unwrap();
+	let outcomes = outcomes(&report);
+	assert!(
+		outcomes
+			.iter()
+			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+		"{outcomes:?}"
+	);
+	// each file deleted once, its bytes counted once
+	let freed: u64 = outcomes
+		.iter()
+		.map(|outcome| match outcome {
+			DisposalOutcome::Disposed { bytes_freed, .. } => *bytes_freed,
+			_ => 0,
+		})
+		.sum();
+	let total: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
+	assert_eq!(freed, total);
+	let mut deleted = setup.backend.log().deleted_files.clone();
+	deleted.sort();
+	deleted.dedup();
+	assert_eq!(deleted.len(), 3);
+}

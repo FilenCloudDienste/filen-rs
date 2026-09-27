@@ -215,7 +215,29 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		disposal,
 	} = task;
 	let shape = NameShape::FileWithExtension { len: extension_len };
+	// every source a disposal was asked for is reported, however the job ends
+	let requested: Vec<Uuid> = disposal
+		.as_ref()
+		.map(|disposal| disposal.targets.iter().map(DisposalTarget::uuid).collect())
+		.unwrap_or_default();
+	let kept_all = |reason: KeptReason| -> Vec<SourceDisposition> {
+		requested
+			.iter()
+			.map(|&uuid| SourceDisposition {
+				uuid,
+				outcome: DisposalOutcome::Kept {
+					reason: reason.clone(),
+					bytes_freed: 0,
+				},
+			})
+			.collect()
+	};
 	let fail = |mut report: CompressReport, phase, error: Error| {
+		report.dispositions = kept_all(if phase == CompressPhase::Cancelled {
+			KeptReason::Interrupted
+		} else {
+			KeptReason::Incomplete
+		});
 		reporter.finish(phase);
 		report.counts = reporter.counts();
 		CompressFailed {
@@ -368,17 +390,24 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	} = driver;
 	report.hash_mismatches = hash_mismatches;
 	let (phase, result) = match (outcome, fatal) {
-		(_, Some(error)) => (CompressPhase::Failed, Err(error)),
+		(_, Some(error)) => {
+			report.dispositions = kept_all(KeptReason::Incomplete);
+			(CompressPhase::Failed, Err(error))
+		}
 		(Err(Stopped), None) if control.is_cancelled() => {
+			report.dispositions = kept_all(KeptReason::Interrupted);
 			(CompressPhase::Cancelled, Err(Arc::new(cancelled())))
 		}
-		(Err(Stopped), None) => (
-			CompressPhase::Failed,
-			Err(Arc::new(Error::custom(
-				ErrorKind::Internal,
-				"compression stopped",
-			))),
-		),
+		(Err(Stopped), None) => {
+			report.dispositions = kept_all(KeptReason::Incomplete);
+			(
+				CompressPhase::Failed,
+				Err(Arc::new(Error::custom(
+					ErrorKind::Internal,
+					"compression stopped",
+				))),
+			)
+		}
 		(Ok(archive), None) => {
 			report.archive = Some(archive);
 			report.dispositions = dispositions;
@@ -762,7 +791,9 @@ impl<B: DisposalBackend> Driver<B> {
 			.map(|(index, target)| {
 				targets.iter().enumerate().position(|(other, outer)| {
 					other != index
-						&& match (target, outer) {
+						// the same item given twice goes with its first
+						&& (other < index && outer.uuid() == target.uuid()
+							|| match (target, outer) {
 							(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
 								read.files.contains_key(&file.uuid)
 							}
@@ -772,11 +803,15 @@ impl<B: DisposalBackend> Driver<B> {
 								DisposalTarget::Dir { read, .. },
 							) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
 							_ => false,
-						}
+						})
 				})
 			})
 			.collect();
 		let nested_uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
+		let nested_files: Vec<bool> = targets
+			.iter()
+			.map(|target| matches!(target, DisposalTarget::File(_)))
+			.collect();
 		let mut outcomes: Vec<Option<(Uuid, DisposalOutcome)>> = Vec::with_capacity(targets.len());
 		for (request, target) in targets.into_iter().enumerate() {
 			if within[request].is_some() {
@@ -810,7 +845,7 @@ impl<B: DisposalBackend> Driver<B> {
 			};
 			outcomes.push(Some((uuid, outcome)));
 		}
-		let resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
+		let mut resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
 			.map(|request| {
 				let mut outer = request;
 				// containment is strict, so the chain ends
@@ -836,6 +871,36 @@ impl<B: DisposalBackend> Driver<B> {
 				(uuid, outcome)
 			})
 			.collect();
+		// a folder removed for good only in part may have taken a file given on its own too
+		for (request, (uuid, outcome)) in resolved.iter_mut().enumerate() {
+			let partly_removed = matches!(
+				outcome,
+				DisposalOutcome::Kept { bytes_freed, .. } if *bytes_freed == 0
+			) && within[request].is_some()
+				&& nested_files[request];
+			if partly_removed {
+				let mut outer = request;
+				while let Some(next) = within[outer] {
+					outer = next;
+				}
+				let outer_freed = matches!(
+					outcomes[outer],
+					Some((_, DisposalOutcome::Kept { bytes_freed, .. })) if bytes_freed > 0
+				);
+				if outer_freed
+					&& self
+						.backend
+						.file_state(*uuid)
+						.await
+						.map_or(true, |state| state.trash)
+				{
+					*outcome = DisposalOutcome::Disposed {
+						how: SourceDisposal::DeletePermanently,
+						bytes_freed: 0,
+					};
+				}
+			}
+		}
 		resolved
 			.into_iter()
 			.map(|(uuid, outcome)| {

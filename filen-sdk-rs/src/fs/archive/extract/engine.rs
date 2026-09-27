@@ -468,9 +468,13 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		// the archive to remove was not touched: say so, rather than leave its disposition out
 		if self.disposal_requested && self.report.dispositions.is_empty() {
-			let reason = if result.is_ok() {
+			let counts = self.reporter.counts();
+			let complete = counts.files_failed + counts.dirs_failed + counts.entries_skipped == 0;
+			let reason = if result.is_ok() && complete {
 				// only an archive in the trash is not removed after a complete extraction
 				KeptReason::Changed
+			} else if result.is_ok() {
+				KeptReason::Incomplete
 			} else if self.control.is_cancelled() {
 				KeptReason::Interrupted
 			} else {
@@ -1664,6 +1668,10 @@ impl<B: DisposalBackend> Driver<B> {
 			if self.control.is_stopping() {
 				return false;
 			}
+			// the new folder, listed whole above
+			if top.key == ExtractTopLevelKey::Root {
+				continue;
+			}
 			match &top.item {
 				NonRootItemType::File(file) => match self.backend.file_state(file.uuid()).await {
 					Ok(state) if !state.trash => {
@@ -1749,7 +1757,7 @@ impl<B: DisposalBackend> Driver<B> {
 		for top in &self.report.top_level {
 			// one request per item: a cancel is not kept waiting for all of them
 			if self.control.is_stopping() {
-				return Ok(());
+				return Err(Stopped);
 			}
 			for error in self.backend.propagate_tree(&added, &top.item).await {
 				self.reporter.event(ExtractEvent::PropagationFailed {
@@ -1763,7 +1771,7 @@ impl<B: DisposalBackend> Driver<B> {
 		for &(uuid, is_dir) in &self.top_level_beyond {
 			// one request per item: a cancel is not kept waiting for all of them
 			if self.control.is_stopping() {
-				return Ok(());
+				return Err(Stopped);
 			}
 			let errors = match self.backend.normal_item(uuid, is_dir).await {
 				Ok(item) => self.backend.propagate_tree(&added, &item).await,
