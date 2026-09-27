@@ -39,9 +39,9 @@ use super::{
 	dispose::{self, SourceDisposal},
 	extract::{
 		self, ArchiveEntryId, ArchiveSource, ArchiveTotals, DuplicateEntries, ExpansionLimit,
-		ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractPhase, ExtractRenamedEntry,
-		ExtractRequest, ExtractRoot, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-		OmittedRecords,
+		ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName, ExtractPhase,
+		ExtractRenamedEntry, ExtractRequest, ExtractRoot, ExtractSkippedEntry, ExtractStage,
+		ExtractTopLevelKey, OmittedRecords,
 	},
 	password::ArchivePassword,
 };
@@ -186,6 +186,7 @@ pub enum ExtractEvent {
 	FileFailed(ExtractFailureInfo),
 	Skipped(ExtractSkippedEntry),
 	Renamed(ExtractRenamedEntry),
+	MisleadingName(ExtractMisleadingName),
 	SourceDisposition(ArchiveSourceDisposition),
 	PropagationFailed(ArchiveItemError),
 }
@@ -393,6 +394,7 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 			Event::FileFailed(failure) => Self::FileFailed(failure.into()),
 			Event::Skipped(entry) => Self::Skipped(entry),
 			Event::Renamed(entry) => Self::Renamed(entry),
+			Event::MisleadingName(entry) => Self::MisleadingName(entry),
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ArchiveItemError {
@@ -1362,6 +1364,7 @@ mod tests {
 			failures: Vec::new(),
 			skipped: Vec::new(),
 			renamed: Vec::new(),
+			misleading_names: Vec::new(),
 			omitted: OmittedRecords::default(),
 			totals: ArchiveTotals::Streaming { archive_bytes: 0 },
 			counts: ItemCounts::default(),

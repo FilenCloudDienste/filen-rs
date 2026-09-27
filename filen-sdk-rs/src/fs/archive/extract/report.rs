@@ -178,6 +178,18 @@ pub struct ExtractRenamedEntry {
 	pub reason: ExtractRenameReason,
 }
 
+/// An entry whose path holds characters that make it read as something it is not: a bidi
+/// override showing `invoice\u{202E}fdp.exe` as `invoiceexe.pdf`, a zero-width or other
+/// invisible character, or a control character. Its name is kept as the archive gives it (the
+/// drive allows these characters); an app may want to warn before the item is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractMisleadingName {
+	pub entry: ArchiveEntryId,
+	/// The entry's path in the archive, as drive names.
+	pub path: String,
+}
+
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(
@@ -211,6 +223,7 @@ pub struct ExtractedTopLevel {
 pub struct OmittedRecords {
 	pub skipped: u64,
 	pub renamed: u64,
+	pub misleading_names: u64,
 	pub failures: u64,
 	pub top_level: u64,
 }
@@ -234,6 +247,8 @@ pub enum ExtractEvent {
 	FileFailed(ExtractFailure),
 	Skipped(ExtractSkippedEntry),
 	Renamed(ExtractRenamedEntry),
+	/// An entry is being extracted under a name that reads as something it is not.
+	MisleadingName(ExtractMisleadingName),
 	/// What became of the archive, when it was to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
@@ -283,6 +298,7 @@ pub struct ExtractReport {
 	pub failures: Vec<ExtractFailure>,
 	pub skipped: Vec<ExtractSkippedEntry>,
 	pub renamed: Vec<ExtractRenamedEntry>,
+	pub misleading_names: Vec<ExtractMisleadingName>,
 	/// What the lists above only count.
 	pub omitted: OmittedRecords,
 	pub totals: ArchiveTotals,
