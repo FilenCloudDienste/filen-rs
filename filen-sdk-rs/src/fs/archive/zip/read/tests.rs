@@ -1099,6 +1099,7 @@ fn real_tools_zips_read_back() {
 		fixture!("lzma.zip"),
 		fixture!("lzma-no-eos.zip"),
 		fixture!("xz.zip"),
+		fixture!("zstd-python.zip"),
 		fixture!("descriptor-infozip.zip"),
 	] {
 		let read = read_all(zip, None).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1199,6 +1200,61 @@ fn real_tools_encrypted_zips_read_back() {
 			"{name}"
 		);
 	}
+}
+
+/// `frames` as the one entry, `z.bin` stating `size` bytes, of an AES-256 zip whose method is
+/// zstd (93), which no tool at hand writes encrypted: the SDK's writer stores the frames, then
+/// the method in the AES extra field and the size in the central record are set to a zstd
+/// entry's. AE-2 keeps no CRC-32, so the authentication code over the stored bytes still holds.
+fn aes_zstd_zip(frames: &[u8], size: u32) -> Vec<u8> {
+	let mut zip = ours(
+		&[("z.bin", Some(frames))],
+		ZipMethod::Stored,
+		Some((b"pw", AesStrength::Aes256)),
+	);
+	// the extra field's header and length, its version and vendor; the method follows the
+	// strength byte
+	let extra = |at: usize, zip: &[u8]| {
+		zip[at..].starts_with(&[0x01, 0x99, 0x07, 0x00]) && &zip[at + 6..at + 8] == b"AE"
+	};
+	let fields: Vec<usize> = (0..zip.len() - 11).filter(|&at| extra(at, &zip)).collect();
+	assert_eq!(fields.len(), 2, "a local and a central extra field");
+	for at in fields {
+		zip[at + 9..at + 11].copy_from_slice(&93u16.to_le_bytes());
+	}
+	let central = (0..zip.len() - 4)
+		.find(|&at| u32_at(&zip, at) == CENTRAL_HEADER_SIG)
+		.unwrap();
+	zip[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+	zip
+}
+
+#[test]
+fn an_encrypted_zstd_entry_reads_back_and_data_after_its_frames_is_damage() {
+	let data = pattern(200_000, 5);
+	let frames =
+		ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
+	let zip = aes_zstd_zip(&frames, u32::try_from(data.len()).unwrap());
+	let read = read_all(&zip, Some(b"pw")).unwrap();
+	assert_eq!(read, [("z.bin".to_owned(), ZipKind::File, data.clone())]);
+
+	// bytes after the last frame are none of the entry's data: the entry is damaged
+	let zip = aes_zstd_zip(
+		&[&frames[..], b"junk"].concat(),
+		u32::try_from(data.len()).unwrap(),
+	);
+	assert!(matches!(
+		read_all(&zip, Some(b"pw")),
+		Err(ZipError::Corrupt(
+			"an entry holds data after its compressed stream"
+		))
+	));
+	// zero bytes there are padding, as behind a zstd file
+	let zip = aes_zstd_zip(
+		&[&frames[..], &[0; 8]].concat(),
+		u32::try_from(data.len()).unwrap(),
+	);
+	assert_eq!(read_all(&zip, Some(b"pw")).unwrap()[0].2, data);
 }
 
 #[test]

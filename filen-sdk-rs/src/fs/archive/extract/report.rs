@@ -180,6 +180,19 @@ pub struct ExtractRenamedEntry {
 	pub reason: ExtractRenameReason,
 }
 
+/// An entry whose path holds characters that make it read as something it is not: a bidi
+/// override showing `invoice\u{202E}fdp.exe` as `invoiceexe.pdf`, a zero-width or other
+/// invisible character, or a control character. Its name is kept as the archive gives it (the
+/// drive allows these characters); an app may want to warn before the item is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractMisleadingName {
+	/// The entry with that name.
+	pub entry: ArchiveEntryId,
+	/// The entry's path in the archive, as drive names.
+	pub path: String,
+}
+
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
@@ -211,6 +224,9 @@ pub struct OmittedRecords {
 	pub skipped: u64,
 	/// Renamed entries left out of `renamed`.
 	pub renamed: u64,
+	/// Misleading names left out of `misleading_names`.
+	pub misleading_names: u64,
+	/// Failures left out of `failures`.
 	pub failures: u64,
 	/// Top-level items left out of `top_level`.
 	pub top_level: u64,
@@ -251,6 +267,8 @@ pub enum ExtractEvent {
 	Skipped(ExtractSkippedEntry),
 	/// An entry was created under another name than the archive gives it.
 	Renamed(ExtractRenamedEntry),
+	/// An entry is being extracted under a name that reads as something it is not.
+	MisleadingName(ExtractMisleadingName),
 	/// What became of the archive, when it was to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
@@ -313,6 +331,8 @@ pub struct ExtractReport {
 	pub skipped: Vec<ExtractSkippedEntry>,
 	/// The entries created under another name than the archive gives them, up to 1000.
 	pub renamed: Vec<ExtractRenamedEntry>,
+	/// The entries whose names read as something they are not, up to 1000.
+	pub misleading_names: Vec<ExtractMisleadingName>,
 	/// What the lists above only count.
 	pub omitted: OmittedRecords,
 	pub totals: ArchiveTotals,

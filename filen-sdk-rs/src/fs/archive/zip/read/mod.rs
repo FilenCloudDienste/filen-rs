@@ -21,7 +21,14 @@ use super::{
 	cp437,
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
 };
-use crate::{fs::archive::limits::exceeds_limit, util::SeededMap};
+use crate::{
+	fs::archive::{
+		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
+		format::StreamCodec,
+		limits::exceeds_limit,
+	},
+	util::SeededMap,
+};
 
 pub(crate) const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
 pub(crate) const CENTRAL_HEADER_SIG: u32 = 0x0201_4b50;
@@ -730,14 +737,8 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 			return Err(ZipError::Unsupported("an encrypted LZMA or XZ entry"));
 		}
 		14 => lzma_entry(Box::new(decrypted), entry, limits)?,
-		95 => Box::new(
-			crate::fs::archive::decode::open_stream(
-				crate::fs::archive::format::StreamCodec::Xz,
-				decrypted,
-				limits.decoder_memory,
-			)
-			.map_err(|e| ZipError::Read(e.into()))?,
-		),
+		93 => stream_entry(StreamCodec::Zstd, decrypted, limits)?,
+		95 => stream_entry(StreamCodec::Xz, decrypted, limits)?,
 		_ => return Err(ZipError::Unsupported("a compression method")),
 	};
 	let check_crc = !matches!(
@@ -772,6 +773,35 @@ impl Read for Shared<'_> {
 	}
 }
 
+/// An entry stored as a whole stream of `codec` (XZ, zstd), decoded within the codec budget.
+fn stream_entry<'s>(
+	codec: StreamCodec,
+	input: Shared<'s>,
+	limits: EntryLimits,
+) -> Result<Box<dyn Read + 's>, ZipError> {
+	let decoder =
+		open_stream(codec, input, limits.decoder_memory).map_err(|e| ZipError::Read(e.into()))?;
+	Ok(Box::new(WholeStream(decoder)))
+}
+
+/// A stream decoder whose input is the entry's stored data and nothing else: bytes after its
+/// stream, which the decoder reads to its end, belong to no data, and damage the entry. Zero
+/// bytes there are padding, as behind a standalone stream.
+struct WholeStream<'s>(Box<dyn StreamDecoder + 's>);
+
+impl Read for WholeStream<'_> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let n = self.0.read(buf)?;
+		if n == 0 && !buf.is_empty() && self.0.end().is_some_and(|end| end.unaccounted_bytes > 0) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				ZipError::Corrupt("an entry holds data after its compressed stream"),
+			));
+		}
+		Ok(n)
+	}
+}
+
 /// Zip's LZMA: a version, the properties' length and the properties, then the raw stream.
 fn lzma_entry<'s>(
 	mut input: Box<dyn Read + 's>,
@@ -790,7 +820,7 @@ fn lzma_entry<'s>(
 	} else {
 		entry.size
 	};
-	let dict_size = crate::fs::archive::decode::clamp_lzma_dict(dict_size, Some(entry.size));
+	let dict_size = clamp_lzma_dict(dict_size, Some(entry.size));
 	let kib = lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props)
 		.map_err(|_| ZipError::Corrupt("invalid LZMA properties"))?;
 	if u64::from(kib) * 1024 > limits.decoder_memory {

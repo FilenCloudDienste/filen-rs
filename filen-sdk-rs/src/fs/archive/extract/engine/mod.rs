@@ -89,8 +89,9 @@ use super::{
 	codec::ArchiveEnd,
 	report::{
 		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractFailure,
-		ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractSkippedEntry,
-		ExtractStage, ExtractTopLevelKey, ExtractedTopLevel, OmittedRecords, Reporter, keep,
+		ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
+		ExtractReport, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractedTopLevel,
+		OmittedRecords, Reporter, keep,
 	},
 };
 
@@ -336,6 +337,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		failures: Vec::new(),
 		skipped: Vec::new(),
 		renamed: Vec::new(),
+		misleading_names: Vec::new(),
 		omitted: OmittedRecords::default(),
 		totals,
 		counts: Default::default(),
@@ -1216,6 +1218,19 @@ impl<B: DisposalBackend> Driver<B> {
 				name,
 				ExtractRenameReason::PathRewritten,
 			);
+		}
+		if head.path.suspicious {
+			let record = ExtractMisleadingName {
+				entry,
+				path: path.clone(),
+			};
+			if keep(
+				&mut self.report.misleading_names,
+				&mut self.report.omitted.misleading_names,
+				record.clone(),
+			) {
+				self.reporter.event(ExtractEvent::MisleadingName(record));
+			}
 		}
 		match head.kind {
 			EntryKind::Dir => {

@@ -141,7 +141,8 @@ pub enum ErrorKind {
 	/// Internal logic error
 	Internal,
 	/// Not enough memory to complete the operation
-	/// might be returned by WASM targets when parsing a large response (eg dir/download)
+	/// might be returned by WASM targets when parsing a large response (eg dir/download), and by
+	/// a compression whose format's encoder needs more than the client's archive codec budget
 	InsufficientMemory,
 	/// Error occurred when walking through a directory structure:
 	Walk,
@@ -183,7 +184,12 @@ pub enum ErrorKind {
 	ArchiveWorkerDied,
 	/// An archive's entries are encrypted, and no password was given.
 	ArchivePasswordRequired,
-	/// The password given does not open the archive's entries.
+	/// The password given does not open the archive's entries. Usually found before anything is
+	/// created. An extraction that finds it only later, before any file was extracted, tries to
+	/// move the folders it created to the trash, so a retry with the right password starts
+	/// clean. It keeps any folder that now holds a file, or that it could not list or trash, and
+	/// all of them when it cannot get the drive lock in time; its report's top-level items list
+	/// the folders it kept.
 	ArchiveWrongPassword,
 }
 

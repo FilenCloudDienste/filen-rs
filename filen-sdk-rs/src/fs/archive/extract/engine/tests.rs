@@ -544,6 +544,58 @@ async fn extracting_into_the_destination_keeps_both() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn names_that_read_as_something_else_are_kept_and_reported() {
+	let tar = tar_of(&[
+		("plain.txt", b"plain"),
+		("invoice\u{202E}fdp.exe", b"not a pdf"),
+		("hidden\u{200B}/x.txt", b"x"),
+	]);
+	let setup = setup("bundle.tar", tar, |_| {});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+
+	assert_eq!(
+		finished_paths(&setup),
+		[
+			"bundle/hidden\u{200B}/x.txt",
+			"bundle/invoice\u{202E}fdp.exe",
+			"bundle/plain.txt"
+		]
+	);
+	let entry = |index| ArchiveEntryId {
+		archive: setup.archive.uuid(),
+		index,
+	};
+	let expected = [
+		ExtractMisleadingName {
+			entry: entry(1),
+			path: "invoice\u{202E}fdp.exe".to_owned(),
+		},
+		ExtractMisleadingName {
+			entry: entry(2),
+			path: "hidden\u{200B}/x.txt".to_owned(),
+		},
+	];
+	assert_eq!(report.misleading_names, expected);
+	let events: Vec<ExtractMisleadingName> = job
+		.recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| &update.events)
+		.filter_map(|event| match event {
+			ExtractEvent::MisleadingName(name) => Some(name.clone()),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(events, expected);
+	// kept as they are: nothing was renamed
+	assert!(report.renamed.is_empty());
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
 	let tar = tar_of(&[("docs/x.txt", b"x"), ("docs/sub/y.txt", b"y")]);
 	let setup = setup("bundle.tar", tar, |backend| {

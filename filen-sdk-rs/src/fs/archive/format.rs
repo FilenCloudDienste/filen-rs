@@ -252,9 +252,10 @@ pub(crate) fn extension_format(name: &str) -> Option<ExtensionFormat> {
 	match_extension(name).map(|(_, format)| format)
 }
 
-/// The name an archive's contents are extracted under by default: its name without the archive
-/// and codec extensions (`photos.tar.gz` → `photos`), or the whole name when it has none of them.
-pub fn archive_default_name(name: &str) -> &str {
+/// An archive's name without its archive and codec extensions (`photos.tar.gz` → `photos`), or
+/// the whole name when it has none of them. Never empty when `name` is not, but not always a name
+/// an item may have (`..zip` → `.`).
+pub(crate) fn archive_stem(name: &str) -> &str {
 	match match_extension(name) {
 		Some((extension, _)) => name.get(..name.len() - extension.len()).expect(
 			"match_extension found the extension at a char boundary (should be impossible)",
@@ -263,12 +264,19 @@ pub fn archive_default_name(name: &str) -> &str {
 	}
 }
 
-/// The folder an archive named `name` is extracted into by default: [`archive_default_name`],
-/// made into a valid name, or `Archive` when nothing of it is left.
-pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
-	SourceName::parse(name.map(archive_default_name).unwrap_or(""))
+/// The folder an archive named `name` is extracted into by default: its name without the archive
+/// and codec extensions (`photos.tar.gz` → `photos`), or the whole name when it has none of them.
+/// A stem no item may be called is encoded as a listed name would be (`..zip` → `．`), and one
+/// that cannot be even so (too long) is replaced with `Archive`.
+pub fn archive_default_name(name: &str) -> ValidatedName {
+	SourceName::parse(archive_stem(name))
 		.map(SourceName::into_name)
 		.unwrap_or_else(|_| ValidatedName::try_from("Archive").expect("a valid name"))
+}
+
+/// [`archive_default_name`] for an archive whose name may be unknown: `Archive` then.
+pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
+	archive_default_name(name.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -442,19 +450,32 @@ mod tests {
 	}
 
 	#[test]
-	fn default_names_drop_archive_extensions() {
-		assert_eq!(archive_default_name("photos.tar.gz"), "photos");
-		assert_eq!(archive_default_name("photos.TGZ"), "photos");
-		assert_eq!(archive_default_name("backup.2024.zip"), "backup.2024");
-		assert_eq!(archive_default_name("notes.txt.gz"), "notes.txt");
-		assert_eq!(archive_default_name("data.tar.lz4"), "data");
-		assert_eq!(archive_default_name("data.tar.lz"), "data");
-		assert_eq!(archive_default_name("data.tar.zst"), "data");
-		assert_eq!(archive_default_name("data.TZST"), "data");
-		assert_eq!(archive_default_name("notes.txt.zst"), "notes.txt");
-		assert_eq!(archive_default_name("report.pdf"), "report.pdf");
+	fn stems_drop_archive_extensions() {
+		assert_eq!(archive_stem("photos.tar.gz"), "photos");
+		assert_eq!(archive_stem("photos.TGZ"), "photos");
+		assert_eq!(archive_stem("backup.2024.zip"), "backup.2024");
+		assert_eq!(archive_stem("notes.txt.gz"), "notes.txt");
+		assert_eq!(archive_stem("data.tar.lz4"), "data");
+		assert_eq!(archive_stem("data.tar.lz"), "data");
+		assert_eq!(archive_stem("data.tar.zst"), "data");
+		assert_eq!(archive_stem("data.TZST"), "data");
+		assert_eq!(archive_stem("notes.txt.zst"), "notes.txt");
+		assert_eq!(archive_stem("report.pdf"), "report.pdf");
 		// a name that is only an extension keeps it
-		assert_eq!(archive_default_name(".zip"), ".zip");
-		assert_eq!(archive_default_name("ünïcödé.7z"), "ünïcödé");
+		assert_eq!(archive_stem(".zip"), ".zip");
+		assert_eq!(archive_stem("ünïcödé.7z"), "ünïcödé");
+	}
+
+	#[test]
+	fn an_archives_default_name_is_always_a_valid_one() {
+		let name = |archive: &str| String::from(archive_default_name(archive));
+		assert_eq!(name("photos.tar.gz"), "photos");
+		assert_eq!(name("report.pdf"), "report.pdf");
+		// a stem no item may be called is encoded, as a listed name would be
+		assert_eq!(name("..zip"), "\u{FF0E}");
+		assert_eq!(name("CON.7z"), "\u{FF23}ON");
+		// one that cannot be even so is replaced
+		assert_eq!(name(&format!("{}.zip", "a".repeat(300))), "Archive");
+		assert_eq!(String::from(extract_folder_name(None)), "Archive");
 	}
 }

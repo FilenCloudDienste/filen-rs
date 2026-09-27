@@ -29,12 +29,12 @@ impl Client {
 	/// encrypted and uploaded as a new item.
 	///
 	/// Reads:
-	/// - tars, bare or compressed with gzip, bzip2, xz, LZMA, lzip, lz4 or brotli, and single
-	///   compressed files: front to back, each entry extracted as it is read, none known before
-	///   it is reached;
-	/// - zips (stored, Deflate, Deflate64, bzip2, LZMA, XZ; ZipCrypto or AES encrypted) and 7z
-	///   archives (LZMA, LZMA2, PPMd, bzip2, Deflate(64), the branch and delta filters; AES
-	///   encrypted, headers included): from their index, entry by entry, each checked against
+	/// - tars, bare or compressed with gzip, bzip2, xz, LZMA, lzip, lz4, brotli or zstd, and
+	///   single compressed files: front to back, each entry extracted as it is read, none known
+	///   before it is reached;
+	/// - zips (stored, Deflate, Deflate64, bzip2, LZMA, XZ, zstd; ZipCrypto or AES encrypted) and
+	///   7z archives (LZMA, LZMA2, PPMd, bzip2, Deflate(64), zstd, the branch and delta filters;
+	///   AES encrypted, headers included): from their index, entry by entry, each checked against
 	///   the checksum the archive lists for it.
 	///
 	/// Links, devices and entries whose paths climb out of the destination are skipped and

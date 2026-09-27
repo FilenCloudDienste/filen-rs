@@ -1286,6 +1286,34 @@ fn sevenz_fixtures_extract_to_their_manifest() {
 }
 
 #[test]
+fn a_zip_of_zstd_entries_is_extracted() {
+	let zip = std::fs::read(
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/archives/zip/zstd-python.zip"),
+	)
+	.unwrap();
+	let (seen, end) = run(&zip, "zstd-python.zip");
+	assert_eq!(end.unwrap().unaccounted_bytes, 0);
+	let files: Vec<(String, usize, bool)> = seen
+		.into_iter()
+		.filter_map(|seen| match seen {
+			Seen::File {
+				path, data, ended, ..
+			} => Some((path, data.len(), ended)),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(
+		files,
+		[
+			("hello.txt".to_owned(), 27, true),
+			("sub/far.bin".to_owned(), 36_000, true),
+			("sub/lines.txt".to_owned(), 4390, true),
+		]
+	);
+}
+
+#[test]
 fn stream_fixtures_extract_to_their_manifest() {
 	check_fixtures("streams");
 }
