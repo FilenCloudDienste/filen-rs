@@ -25,14 +25,16 @@ use crate::{
 			compress::{
 				CompressFormat, CompressUpdate, RunState,
 				codec::{ArchiveEntry, CompressJob, compress},
-				read_back::ReadBack,
+				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
 			},
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			decode::open_stream,
 			dispose::{DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree},
 			encode::Compression,
-			format::StreamCodec,
+			entry_path::entry_path,
+			extract::{PasswordCheck, codec::ArchiveEnd},
+			format::{ArchiveFormat, StreamCodec},
 			password::ArchivePassword,
 			sevenz::{
 				read::{FolderCursor, Keys, SevenZLimits, read_index},
@@ -40,7 +42,7 @@ use crate::{
 			},
 			tar_iter::TarReader,
 			test_support::pattern,
-			worker,
+			worker::{self, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
 		dir::RootDirectory,
@@ -163,6 +165,8 @@ struct Setup {
 	hold_after_registering: Vec<(Request, Uuid)>,
 	/// The archive settings the job runs under, whose slots jobs sharing them share.
 	config: ArchiveConfig,
+	/// Reads the archive back in place of the extracting codec, for the first job that does.
+	reader: Mutex<Option<StartReadBack>>,
 }
 
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
@@ -210,6 +214,7 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 		hold_archive: false,
 		hold_after_registering: Vec::new(),
 		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		reader: Mutex::new(None),
 	}
 }
 
@@ -262,9 +267,14 @@ fn start_disposing(
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
 	let config = setup.config.clone();
-	let read_back = disposal
-		.as_ref()
-		.map(|_| ReadBack::as_extracting(&setup.entries, &config, setup.password.clone()));
+	let read_back = disposal.as_ref().map(|_| {
+		let mut read_back =
+			ReadBack::as_extracting(&setup.entries, &config, setup.password.clone());
+		if let Some(start) = setup.reader.lock().unwrap().take() {
+			read_back.start = start;
+		}
+		read_back
+	});
 	let running = tokio::spawn(run_compress(CompressTask {
 		backend: Arc::clone(&setup.backend),
 		control,
@@ -1852,10 +1862,18 @@ async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 	damaged[data] ^= 1;
 
 	let setup = setup(|_, _| {});
-	let placed = place(&setup);
+	let job = dispose_scripted(&setup, &damaged).await;
+	let report = job.running.await.unwrap().unwrap();
+	assert_kept_unconfirmed(&setup, &job.reporter, &report);
+}
+
+/// Starts a permanent disposal of the setup under a codec that reads every source whole and
+/// writes `archive`, and plays that codec to its end.
+async fn dispose_scripted(setup: &Setup, archive: &[u8]) -> Job {
+	let placed = place(setup);
 	let (events, result, link) = worker::scripted::<CodecResult>();
 	let job = start_disposing(
-		&setup,
+		setup,
 		"b.tar",
 		CompressFormat::Tar { compression: None },
 		JobControl::default(),
@@ -1863,13 +1881,13 @@ async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 		Box::new(move || Ok(link)),
 		Some(CompressDisposal {
 			how: SourceDisposal::DeletePermanently,
-			targets: targets(&setup, &placed),
+			targets: targets(setup, &placed),
 			hashed: vec![true; 2],
 		}),
 		CompressReport::default(),
 	);
-	// a codec that reads every source whole and writes the damaged archive
-	for (source, index) in [(0, 0), (1, 0), (1, 1), (2, 0)] {
+	// each source's chunks, and whether it is the source's last
+	for (source, index, last) in [(0, 0, true), (1, 0, false), (1, 1, true), (2, 0, true)] {
 		let (reply, answer) = oneshot::channel();
 		events
 			.send(WorkerEvent::Ask {
@@ -1880,23 +1898,149 @@ async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 			.await
 			.unwrap();
 		answer.await.unwrap().unwrap();
-		events.send(WorkerEvent::FileEnd).await.ok();
+		if last {
+			events.send(WorkerEvent::FileEnd).await.unwrap();
+		}
 	}
-	for chunk in damaged.chunks(CHUNK_SIZE) {
+	for chunk in archive.chunks(CHUNK_SIZE) {
 		events
 			.send(WorkerEvent::Data(chunk.to_vec()))
 			.await
 			.unwrap();
 	}
 	drop(events);
-	result.send(Ok(damaged.len() as u64)).unwrap();
+	result.send(Ok(archive.len() as u64)).unwrap();
+	job
+}
 
-	let report = job.running.await.unwrap().unwrap();
+/// The archive stays, and every source is kept because the archive was not confirmed.
+fn assert_kept_unconfirmed(setup: &Setup, reporter: &Reporter, report: &CompressReport) {
 	assert!(report.archive.is_some(), "the archive stays");
-	all_kept_for(&report, |reason| matches!(reason, KeptReason::Unconfirmed));
+	all_kept_for(report, |reason| matches!(reason, KeptReason::Unconfirmed));
 	assert!(setup.backend.log().deleted_files.is_empty());
 	assert!(setup.backend.log().trashed_dirs.is_empty());
+	assert_released(setup, reporter);
+}
+
+/// A scripted reader for the setup's archive: what it sends, how it ends, and its progress.
+struct Reader {
+	events: mpsc::Sender<WorkerEvent>,
+	result: oneshot::Sender<ReadBackResult>,
+	shared: Arc<worker::WorkerShared>,
+}
+
+impl Reader {
+	/// Reads the setup's archive back in place of the extracting codec.
+	fn reading(setup: &Setup) -> Self {
+		let (events, result, link) = worker::scripted::<ReadBackResult>();
+		let shared = Arc::clone(&link.shared);
+		*setup.reader.lock().unwrap() = Some(Box::new(move |_, _| Ok(link)));
+		Self {
+			events,
+			result,
+			shared,
+		}
+	}
+
+	/// Sends `event`, noting the progress a real reader notes with it.
+	async fn send(&self, event: WorkerEvent) {
+		self.events.send(event).await.unwrap();
+		self.shared.note_scripted_progress();
+	}
+}
+
+/// What reading the setup's archive back finds, in order: its directory, then each file's
+/// entry, data and end.
+fn found_in_the_archive(setup: &Setup) -> Vec<WorkerEvent> {
+	let entry = |ordinal: usize, path: &str, kind| {
+		WorkerEvent::Entry(EntryHead {
+			ordinal: ordinal as u64,
+			path: entry_path(path).unwrap(),
+			modified: None,
+			kind,
+		})
+	};
+	let mut found = vec![
+		WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }),
+		entry(0, "docs", EntryKind::Dir),
+	];
+	for (ordinal, ((path, _), data)) in setup.sources.iter().zip(&setup.contents).enumerate() {
+		found.extend([
+			entry(
+				ordinal + 1,
+				path,
+				EntryKind::File {
+					size: Some(data.len() as u64),
+				},
+			),
+			WorkerEvent::Data(data.clone()),
+			WorkerEvent::FileEnd,
+		]);
+	}
+	found
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_read_back_is_not_given_up_on() {
+	let mut setup = setup(|_, _| {});
+	setup.hold_archive = true;
+	let reader = Reader::reading(&setup);
+	let job = dispose_scripted(&setup, b"the archive the reader reads back").await;
+	// the reader waits longer for its first chunk than a silent one is given
+	let (reply, answer) = oneshot::channel();
+	reader
+		.send(WorkerEvent::Ask {
+			source: 0,
+			index: 0,
+			reply,
+		})
+		.await;
+	tokio::time::sleep(2 * ARCHIVE_STALL_TIMEOUT).await;
+	setup.backend.release_all();
+	answer.await.unwrap().unwrap();
+	reader.shared.note_scripted_progress();
+	// and takes longer over the entries than a silent one is given, never as long over one
+	for found in found_in_the_archive(&setup) {
+		tokio::time::sleep(ARCHIVE_STALL_TIMEOUT * 3 / 4).await;
+		reader.send(found).await;
+	}
+	let Reader { events, result, .. } = reader;
+	drop(events);
+	result
+		.send(Ok(ArchiveEnd {
+			unaccounted_bytes: 0,
+			duplicates: None,
+			unchecked_entries: 0,
+			password: PasswordCheck::NotNeeded,
+		}))
+		.unwrap();
+
+	let report = job.running.await.unwrap().unwrap();
+	assert!(
+		outcomes(&report)
+			.iter()
+			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+		"{:?}",
+		report.dispositions
+	);
 	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_read_back_keeps_the_sources() {
+	let setup = setup(|_, _| {});
+	let reader = Reader::reading(&setup);
+	let job = dispose_scripted(&setup, b"an archive nothing reads back").await;
+	let waiting = tokio::time::Instant::now();
+	let report = tokio::time::timeout(4 * ARCHIVE_STALL_TIMEOUT, job.running)
+		.await
+		.expect("a silent reader is given up on")
+		.unwrap()
+		.unwrap();
+	assert!(waiting.elapsed() >= ARCHIVE_STALL_TIMEOUT);
+	assert_kept_unconfirmed(&setup, &job.reporter, &report);
+	// the reader's ends were held open all along
+	drop(reader);
 }
 
 /// Starts a permanent disposal of the setup whose archive's read back waits at its first chunk,

@@ -142,6 +142,12 @@ impl WorkerShared {
 	fn note_progress(&self) {
 		self.progress.fetch_add(1, Ordering::Relaxed);
 	}
+
+	/// What a real codec's port notes on each exchange, for a [`scripted`] one to note it too.
+	#[cfg(test)]
+	pub(crate) fn note_scripted_progress(&self) {
+		self.note_progress();
+	}
 }
 
 /// The error a job ends with when its codec stopped responding.

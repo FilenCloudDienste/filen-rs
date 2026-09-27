@@ -13,10 +13,14 @@
 //! the fetch in flight finishes, the floor is given back, and the reader's state, with the chunk
 //! it holds, stays resident; nothing of the client's memory budget is held.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+	collections::{HashMap, HashSet},
+	pin::pin,
+};
 
 use crate::{
 	Error,
+	consts::CALLBACK_INTERVAL,
 	fs::{
 		HasName, HasUUID,
 		archive::{
@@ -24,7 +28,10 @@ use crate::{
 			extract::codec::{ArchiveEnd, CodecLimits, StreamJob, Task, extract_stream},
 			format::ArchiveFormat,
 			password::ArchivePassword,
-			worker::{self, ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, WorkerEvent, WorkerLink},
+			worker::{
+				self, EntryHead, EntryKind, StallWatch, WorkerEvent, WorkerLink, WorkerShared,
+				worker_died,
+			},
 		},
 		drive_job::backend::DriveBackend,
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
@@ -249,16 +256,16 @@ async fn read<B: DriveBackend>(
 	let mut floor = Some(control.until_stopping(config.floor()).await?);
 	// a zip or 7z reader may ask for a chunk again; progress counts each once
 	let mut fetched = HashSet::new();
+	let mut watch = Watch {
+		control,
+		reporter,
+		stall: StallWatch::default(),
+		answered: false,
+	};
 	loop {
-		// a codec that neither asks nor tells anything for this long is given up on
-		let event = tokio::select! {
-			biased;
-			() = control.stopping() => return Err(Stopped),
-			event = link.events.recv() => event,
-			() = sleep(ARCHIVE_STALL_TIMEOUT) => {
-				link.retire();
-				return Ok(Err("its reader stopped responding".to_owned()));
-			}
+		let Some(event) = watch.until(&link.shared, link.events.recv()).await? else {
+			link.retire();
+			return Ok(Err(worker_died().to_string()));
 		};
 		let Some(event) = event else {
 			break;
@@ -285,24 +292,58 @@ async fn read<B: DriveBackend>(
 				}
 				Err(error) => return Ok(Err(format!("reading it failed: {error}"))),
 			}
+			watch.answered = true;
 			continue;
 		}
 		if let Err(why) = check.take(event) {
 			return Ok(Err(why));
 		}
 	}
-	let ended = tokio::select! {
-		biased;
-		() = control.stopping() => return Err(Stopped),
-		ended = &mut link.done => ended,
-		() = sleep(ARCHIVE_STALL_TIMEOUT) => {
-			link.retire();
-			return Ok(Err("its reader stopped responding".to_owned()));
-		}
+	let Some(ended) = watch.until(&link.shared, &mut link.done).await? else {
+		link.retire();
+		return Ok(Err(worker_died().to_string()));
 	};
 	Ok(match ended {
 		Ok(Ok(end)) => check.complete(&end),
 		Ok(Err(error)) => Err(error.to_string()),
 		Err(_) => Err("its reader died".to_owned()),
 	})
+}
+
+/// Watches the reader while the read waits on it, as the other archive drivers watch their
+/// codecs: one that makes no progress for [`ARCHIVE_STALL_TIMEOUT`] is given up on. While the
+/// read fetches a chunk or waits out a pause it owes the reader, and does not tick.
+///
+/// [`ARCHIVE_STALL_TIMEOUT`]: crate::fs::archive::worker::ARCHIVE_STALL_TIMEOUT
+struct Watch<'a> {
+	control: &'a JobControl,
+	reporter: &'a MaybeArc<Reporter>,
+	stall: StallWatch,
+	/// A chunk was handed over since the last tick: the reader was owed it until then.
+	answered: bool,
+}
+
+impl Watch<'_> {
+	/// `next`, or `None` once the reader stopped moving; `Err` once the job stops.
+	async fn until<T>(
+		&mut self,
+		shared: &WorkerShared,
+		next: impl Future<Output = T>,
+	) -> Result<Option<T>, Stopped> {
+		let mut next = pin!(next);
+		loop {
+			tokio::select! {
+				biased;
+				() = self.control.stopping() => return Err(Stopped),
+				value = &mut next => return Ok(Some(value)),
+				() = sleep(CALLBACK_INTERVAL) => {
+					self.reporter.tick();
+					let owed = std::mem::take(&mut self.answered);
+					if self.stall.stalled(shared, owed) {
+						return Ok(None);
+					}
+				}
+			}
+		}
+	}
 }
