@@ -138,14 +138,19 @@ impl Client {
 	/// it with `config` would do with it (skip it, and why). `max_bytes` and `max_items` are not
 	/// checked: a listing creates nothing.
 	///
-	/// A zip's or 7z's index says it all: only the index is read, and the smallest encrypted
-	/// entry, as an extraction reads it, to check the password (see
-	/// [`ArchiveListing::password`]). A tar's members, or what a single compressed file decodes
-	/// to, are only known by reading it all, which takes as long as downloading it; that is
-	/// reported as it goes, and can be paused and cancelled.
+	/// A zip's or 7z's index says nearly all: the index is read, and besides it only the
+	/// smallest encrypted entry, as an extraction reads it, to check the password (see
+	/// [`ArchiveListing::password`]), and what tells a link's target: each zip symlink's data (at
+	/// most 4096 bytes, unencrypted ones only), and a 7z symlink's or reparse point's when it is
+	/// within the first 16 MiB of its folder and the archive states no more than the
+	/// [`ExpansionLimit`](super::ExpansionLimit) allows; past that, a 7z link is listed without
+	/// its target and a reparse point as a file. A tar's members, or what a single compressed
+	/// file decodes to, are only known by reading it all, which takes as long as downloading it;
+	/// that is reported as it goes, and can be paused and cancelled.
 	///
 	/// Entries are delivered to `callback` in batches as they are read, and the listing keeps the
-	/// first [`MAX_LISTED_ENTRIES`](super::MAX_LISTED_ENTRIES) of them: see [`ArchiveListing`].
+	/// first [`MAX_LISTED_ENTRIES`](super::MAX_LISTED_ENTRIES) of them within
+	/// [`MAX_LISTED_BYTES`](super::MAX_LISTED_BYTES): see [`ArchiveListing`].
 	/// A listing takes one of the [`ArchiveConfig::job_concurrency`] archive jobs.
 	///
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::config::ArchiveConfig::job_concurrency

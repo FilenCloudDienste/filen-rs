@@ -20,7 +20,7 @@ use crate::{
 		format::StreamCodec,
 		password::ArchivePassword,
 		sevenz::write::{SevenZEncryption, SevenZMethod},
-		test_support::{gzip, pattern, sevenz_of, tar_of, zip_of},
+		test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
 		worker,
 	},
 	fs::name::ValidatedName,
@@ -1463,8 +1463,9 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 					target: "a.txt".into()
 				},
 				Some(0),
+				// the target is the kind's
 				Some(ExtractSkipReason::Symlink {
-					target: "a.txt".into()
+					target: String::new()
 				}),
 			),
 			// extracted as a copy of the file it names, at that file's size
@@ -1499,10 +1500,15 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 		job_of(&tar, "h.tar", true, Task::List { archive: LISTED }),
 	);
 	assert_eq!(
-		entries[0].skip,
-		Some(ExtractSkipReason::Hardlink {
-			target: "gone.txt".into()
-		})
+		(&entries[0].kind, &entries[0].skip),
+		(
+			&ArchiveEntryKind::Hardlink {
+				target: "gone.txt".into()
+			},
+			&Some(ExtractSkipReason::Hardlink {
+				target: String::new()
+			})
+		)
 	);
 
 	// an AppleDouble member is told by its data, and marked whether it is left out or not
@@ -1559,14 +1565,9 @@ fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 			[
 				(Some("docs"), false, None, false, None),
 				(Some("docs/a.txt"), true, Some("Deflate"), false, None),
-				// told by its name alone: a listing reads no entry's data
-				(
-					Some("._a.txt"),
-					true,
-					Some("Deflate"),
-					true,
-					Some(&ExtractSkipReason::MacMetadata)
-				),
+				// told by its name alone: a listing reads no entry's data, and an extraction
+				// checks it
+				(Some("._a.txt"), true, Some("Deflate"), true, None),
 			]
 		);
 	}
@@ -1718,4 +1719,103 @@ fn a_partial_extraction_sends_what_was_chosen_below_its_base() {
 	let (seen, end, _) = run_job(&zip, job_of(&zip, "z.zip", true, chosen(&[1], &[])));
 	end.unwrap();
 	assert_eq!(outline(&seen), ["file docs/a.txt 1", "dir docs"]);
+}
+
+/// A solid 7z of a file of `before` zero bytes, then a symlink to `target`.
+fn sevenz_link_after(before: usize, target: &[u8]) -> Vec<u8> {
+	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, SourceReader};
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut link = SevenZEntry::new_file("link");
+	link.has_windows_attributes = true;
+	link.windows_attributes = 0x8000 | (0o120_777 << 16);
+	let zeros = vec![0u8; before];
+	writer
+		.push_archive_entries(
+			vec![SevenZEntry::new_file("zeros"), link],
+			vec![
+				SourceReader::new(Box::new(&zeros[..]) as Box<dyn Read>),
+				SourceReader::new(Box::new(target) as Box<dyn Read>),
+			],
+		)
+		.unwrap();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_7z_link_is_listed_unread_past_what_a_listing_decodes() {
+	let target = |archive: &[u8]| {
+		let (entries, end) = listed(
+			archive,
+			job_of(archive, "l.7z", true, Task::List { archive: LISTED }),
+		);
+		end.unwrap();
+		entries[1].kind.clone()
+	};
+	assert_eq!(
+		target(&sevenz_link_after(10, b"there")),
+		ArchiveEntryKind::Symlink {
+			target: "there".into()
+		}
+	);
+	// past 16 MiB into its solid block, the link would cost decoding all that first
+	assert_eq!(
+		target(&sevenz_link_after(17 << 20, b"there")),
+		ArchiveEntryKind::Symlink {
+			target: String::new()
+		}
+	);
+}
+
+#[test]
+fn a_7z_listing_says_whether_the_password_opens_its_entries() {
+	let entries = [("a.txt", Some(&b"alpha"[..]))];
+	let sevenz = sevenz_of(
+		&entries,
+		SevenZMethod::Lzma2 { level: 1 },
+		true,
+		Some((SevenZEncryption::Entries, "pw")),
+	);
+	let big = incompressible(17 << 20, 0x3);
+	// the only encrypted entry is too large to check the password on
+	let unchecked = sevenz_of(
+		&[("big.bin", Some(&big[..]))],
+		SevenZMethod::Copy,
+		true,
+		Some((SevenZEncryption::Entries, "pw")),
+	);
+	for (archive, password, check) in [
+		(&sevenz, "pw", PasswordCheck::Right),
+		(&sevenz, "nope", PasswordCheck::Wrong),
+		(&unchecked, "pw", PasswordCheck::Unchecked),
+	] {
+		let job = StreamJob {
+			password: Some(ArchivePassword::new(password.to_owned()).unwrap()),
+			..job_of(archive, "s.7z", true, Task::List { archive: LISTED })
+		};
+		let (entries, end) = listed(archive, job);
+		assert_eq!(end.unwrap().password, check, "{password}");
+		assert_eq!(entries.len(), 1);
+		assert!(entries[0].encrypted);
+	}
+}
+
+#[test]
+fn a_file_chosen_at_the_base_is_refused_before_anything_is_sent() {
+	let zip = zip_of(&[("docs", Some(b"a file named as the base"))], None);
+	let (seen, end, _) = run_job(&zip, job_of(&zip, "z.zip", true, chosen(&[0], &["docs"])));
+	assert!(seen.is_empty(), "{seen:?}");
+	assert_eq!(kind(end), ErrorKind::InvalidState);
+}
+
+#[test]
+fn a_tar_directory_chosen_brings_what_is_stored_after_it() {
+	// a file stored before its directory is gone by the time the directory is reached
+	let tar = tar_of(&[
+		("docs/early.txt", b"e"),
+		("docs/", b""),
+		("docs/late.txt", b"l"),
+	]);
+	let (seen, end, _) = run_job(&tar, job_of(&tar, "t.tar", true, chosen(&[1], &[])));
+	end.unwrap();
+	assert_eq!(outline(&seen), ["dir docs", "file docs/late.txt 1"]);
 }

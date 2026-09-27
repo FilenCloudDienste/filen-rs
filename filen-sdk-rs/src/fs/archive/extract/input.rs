@@ -81,6 +81,8 @@ pub(super) struct ArchiveInput<B> {
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
 	served: u64,
+	/// Chunks served one after another since the codec last jumped.
+	run: u64,
 	/// The archive's plaintext as the codec read it, in order.
 	hasher: blake3::Hasher,
 	/// The codec read the archive front to back, once: `hasher` covers it all.
@@ -104,6 +106,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 			ready: VecDeque::new(),
 			reading: None,
 			served: 0,
+			run: 0,
 			hasher: blake3::Hasher::new(),
 			sequential: true,
 			ask: None,
@@ -126,6 +129,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 			self.ready.clear();
 			self.next_fetch = index;
 			self.served = index;
+			self.run = 0;
 		}
 		self.ask = Some((index, reply));
 		self.serve_ask();
@@ -154,13 +158,15 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	/// now; `ops` counts the fetches in flight.
 	pub(super) fn advance(&mut self, ops: &Ops) {
 		self.serve_ask();
-		// Nothing is fetched ahead of what the codec asks for until it has read two chunks in a
-		// row: a zip or 7z reads its head, then its index at the end, and chunks fetched after
-		// the head would go unread (all of them, when only the index is listed).
-		let ahead = if self.served >= 2 { PREFETCH_CHUNKS } else { 1 };
+		// Nothing is fetched ahead of what the codec asks for until it has read two chunks one
+		// after the other, since it started or last jumped: a zip or 7z reads its head, then its
+		// index at the end, then entries anywhere, and chunks fetched ahead of a read that jumps
+		// go unread (all of them, when only the index is listed).
+		let ahead = if self.run >= 2 { PREFETCH_CHUNKS } else { 1 };
 		while self.fetches.len() + self.ready.len() < ahead
 			&& self.next_fetch < self.chunks
-			&& (ahead > 1 || self.next_fetch <= self.served)
+			// short of a run, only the chunk the codec waits for
+			&& (ahead > 1 || self.ask.is_some() && self.next_fetch <= self.served)
 		{
 			let Some(permit) = take_memory(&self.slot, &self.memory) else {
 				break;
@@ -199,6 +205,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
+		self.run += 1;
 		self.hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
 	}
@@ -252,5 +259,74 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	pub(super) fn read_whole(&self) -> Option<Blake3Hash> {
 		(self.sequential && self.served == self.chunks)
 			.then(|| Blake3Hash::from(self.hasher.finalize()))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use filen_types::fs::Uuid;
+
+	use super::*;
+	use crate::{
+		consts::CHUNK_SIZE,
+		fs::{
+			archive::{
+				extract::{ArchiveTotals, ExtractCallback, ExtractUpdate, ExtractedTopLevel},
+				test_support::{pattern, remote_file},
+			},
+			drive_job::test_support::FakeBackend,
+		},
+	};
+
+	struct Ignore;
+
+	impl ExtractCallback for Ignore {
+		fn on_top_level_created(&self, _: Vec<ExtractedTopLevel>) {}
+		fn on_update(&self, _: ExtractUpdate) {}
+	}
+
+	/// Answers the codec asking for chunk `index`, then lets `input` fetch ahead; the chunk it
+	/// fetches next.
+	async fn read(input: &mut ArchiveInput<FakeBackend>, ops: &Ops, index: u64) -> u64 {
+		let (reply, answer) = oneshot::channel();
+		input.ask(index, reply);
+		while input.owes_codec() {
+			input.advance(ops);
+			let fetched = input
+				.fetched()
+				.await
+				.expect("the chunk asked for is fetched");
+			input.fetch_finished(fetched).unwrap();
+		}
+		answer.await.unwrap().unwrap();
+		input.advance(ops);
+		input.next_fetch
+	}
+
+	#[tokio::test]
+	async fn chunks_are_fetched_ahead_only_after_two_read_one_after_the_other() {
+		let bytes = pattern(20 * CHUNK_SIZE, 1);
+		let archive = remote_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"a.zip",
+			&bytes,
+			None,
+		);
+		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
+		backend.contents.insert(archive.uuid(), bytes);
+		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive));
+		let reporter = crate::fs::archive::extract::report::Reporter::new(
+			Ignore,
+			ArchiveTotals::Streaming { archive_bytes: 0 },
+		);
+		let ops = reporter.ops();
+		// a zip's head, then its index at the end: nothing fetched ahead of either
+		assert_eq!(read(&mut input, &ops, 0).await, 1);
+		assert_eq!(read(&mut input, &ops, 18).await, 19);
+		// two in a row: four ahead
+		assert_eq!(read(&mut input, &ops, 19).await, 20);
+		assert_eq!(read(&mut input, &ops, 3).await, 4);
+		assert_eq!(read(&mut input, &ops, 4).await, 9);
 	}
 }

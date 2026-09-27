@@ -111,6 +111,10 @@ impl ArchiveEnd {
 /// is created; a larger smallest one is checked as it is extracted.
 const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 
+/// Most a listing decodes of a 7z folder to read a symlink's target, or tell whether a reparse
+/// point is a link: a link past it (at the end of a solid block, say) is listed unread.
+const LIST_READ_BYTES: u64 = 16 << 20;
+
 /// Reads a streaming archive through `port`, sending its entries. An error the driver caused
 /// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
 /// [`ErrorKind::IO`]; the driver knows the real one.
@@ -756,7 +760,25 @@ fn extract_sevenz(
 		let checked = check_sevenz_password(&mut cursor, &index, &mut keys, password.is_some())?;
 		port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 			.map_err(failure)?;
+		// a listing reads the index: a link's data is read only where little has to be decoded
+		// to reach it, and never when the archive states more than it may decode to
+		let stated = index
+			.entries
+			.iter()
+			.fold(0u64, |total, entry| total.saturating_add(entry.size));
+		let within_limit = job
+			.limits
+			.expansion
+			.is_none_or(|limit| stated <= limit.floor.max(job.len.saturating_mul(limit.ratio)));
 		for entry in &index.entries {
+			let cheap = entry
+				.stream
+				.is_some_and(|stream| stream.offset.saturating_add(entry.size) <= LIST_READ_BYTES);
+			if !(within_limit && cheap) {
+				walk.list(sevenz_unread(&index, entry), None)
+					.map_err(failure)?;
+				continue;
+			}
 			// a link's data unread for a wrong password leaves it listed as a link without its
 			// target
 			let found = match sevenz_found(&mut cursor, &index, entry, &mut keys) {

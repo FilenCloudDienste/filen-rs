@@ -29,7 +29,7 @@ pub use crate::fs::{
 };
 pub use list::{
 	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListFailed, ListPhase,
-	ListTotals, ListUpdate, MAX_LISTED_ENTRIES, PasswordCheck,
+	ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
@@ -85,8 +85,15 @@ pub enum ExtractRequest {
 	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
 	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
 	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. An id of another
-	/// archive, or of an entry not below `base`, fails the job: a zip's or 7z's before anything
-	/// is created, a tar's (only known as it is read) once it is read to its end.
+	/// archive fails the job before anything runs. A zip's or 7z's ids are checked against its
+	/// index before anything is created: an id it does not hold, of an entry not below `base`, or
+	/// of a file at `base` itself fails the job. A tar's members are only known as it is read: a
+	/// member chosen that is not below `base` fails the job when it is reached, and an id the tar
+	/// does not hold once it is read to its end, what was extracted until then staying.
+	///
+	/// A chosen directory of a tar brings what the tar stores after it below it: every tool
+	/// stores a directory before its contents, and what came before is gone by the time the
+	/// directory is reached. A zip's or 7z's brings everything below it, wherever it is stored.
 	///
 	/// The archive is never removed afterwards: part of it is not extracted.
 	Entries {

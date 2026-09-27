@@ -88,7 +88,9 @@ pub struct ArchiveEntry {
 	/// `method 98`); `None` for an entry without data, and for a tar's members or a single file,
 	/// which the archive's own compression covers (see [`ArchiveListing::format`]).
 	pub method: Option<String>,
-	/// Why extracting it would skip it; `None` for an entry an extraction creates.
+	/// Why extracting it would skip it; `None` for an entry an extraction creates (or may: an
+	/// AppleDouble file told by its name alone). A link's target is in `kind`, and left empty
+	/// here.
 	pub skip: Option<ExtractSkipReason>,
 	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
 	/// [`ExtractRenameReason::PathRewritten`](super::ExtractRenameReason::PathRewritten)).
@@ -96,8 +98,10 @@ pub struct ArchiveEntry {
 	/// Its path reads as something it is not (see
 	/// [`ExtractMisleadingName`](super::ExtractMisleadingName)).
 	pub misleading_name: bool,
-	/// macOS metadata: inside a `__MACOSX` folder, or an AppleDouble `._` file, told by its data
-	/// in a tar and by its name alone in a zip or 7z. See
+	/// macOS metadata: inside a `__MACOSX` folder, or an AppleDouble `._` file. A tar's `._`
+	/// file is told by its data, which a listing reads; a zip's, 7z's or single file's by its
+	/// name alone, so `skip` leaves it out: an extraction checks its data, and extracts it when
+	/// it is an ordinary file after all. See
 	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata).
 	pub mac_metadata: bool,
 }
@@ -169,12 +173,18 @@ impl ListTotals {
 /// Most entries an [`ArchiveListing`] keeps; the callback receives every one.
 pub const MAX_LISTED_ENTRIES: usize = 10_000;
 
+/// Most bytes of text (paths, targets, methods) the entries an [`ArchiveListing`] keeps may hold
+/// in all, as one entry can hold 8 KiB of paths: once they would pass it, the rest are only
+/// counted.
+pub const MAX_LISTED_BYTES: usize = 16 << 20;
+
 /// What a listing found: the archive, and its entries in the order of its index (a tar's in the
 /// order it stores them).
 ///
-/// An archive may hold a million entries: the listing keeps the first [`MAX_LISTED_ENTRIES`] and
-/// counts the rest, which the callback receives in batches as they are read, so an app keeps
-/// what it shows without the SDK building every entry up front.
+/// An archive may hold a million entries: the listing keeps the first [`MAX_LISTED_ENTRIES`], as
+/// long as their text fits [`MAX_LISTED_BYTES`], and counts the rest, which the callback
+/// receives in batches as they are read, so an app keeps what it shows without the SDK building
+/// every entry up front.
 #[derive(Debug, Clone)]
 pub struct ArchiveListing {
 	/// `None` when the listing ended before it could tell.
@@ -355,14 +365,39 @@ impl ListReporter {
 	}
 }
 
-/// Adds `entry` to `listing`: kept while it holds fewer than [`MAX_LISTED_ENTRIES`], counted
-/// either way.
-pub(crate) fn add_entry(listing: &mut ArchiveListing, entry: &ArchiveEntry) {
+/// Adds `entry` to `listing`: kept while it holds fewer than [`MAX_LISTED_ENTRIES`] whose text,
+/// `kept_bytes` so far, fits [`MAX_LISTED_BYTES`]; counted either way.
+pub(crate) fn add_entry(
+	listing: &mut ArchiveListing,
+	kept_bytes: &mut usize,
+	entry: &ArchiveEntry,
+) {
 	listing.totals.count(entry);
-	if listing.entries.len() < MAX_LISTED_ENTRIES {
+	let bytes = entry.text_bytes();
+	if listing.omitted_entries == 0
+		&& listing.entries.len() < MAX_LISTED_ENTRIES
+		&& *kept_bytes + bytes <= MAX_LISTED_BYTES
+	{
+		*kept_bytes += bytes;
 		listing.entries.push(entry.clone());
 	} else {
 		listing.omitted_entries += 1;
+	}
+}
+
+impl ArchiveEntry {
+	/// The bytes of text it holds.
+	fn text_bytes(&self) -> usize {
+		let target = match &self.kind {
+			ArchiveEntryKind::Symlink { target } | ArchiveEntryKind::Hardlink { target } => {
+				target.len()
+			}
+			_ => 0,
+		};
+		self.stored_path.len()
+			+ self.path.as_ref().map_or(0, String::len)
+			+ self.method.as_ref().map_or(0, String::len)
+			+ target
 	}
 }
 
@@ -425,6 +460,7 @@ pub(crate) async fn run_list<B: DriveBackend>(
 	};
 	let mut lister = Lister {
 		input: ArchiveInput::new(backend, Arc::new(archive)),
+		kept_bytes: 0,
 		floor: Some((floor, reporter.op())),
 		control,
 		reporter,
@@ -462,6 +498,8 @@ pub(crate) async fn run_list<B: DriveBackend>(
 /// The async driver of a listing's codec: it only ever reads the archive, and creates nothing.
 struct Lister<B> {
 	input: ArchiveInput<B>,
+	/// The text of the entries the listing keeps.
+	kept_bytes: usize,
 	floor: Option<Floor>,
 	control: JobControl,
 	reporter: MaybeArc<ListReporter>,
@@ -542,7 +580,7 @@ impl<B: DriveBackend> Lister<B> {
 			}
 			WorkerEvent::Opened(format) => listing.format = Some(format),
 			WorkerEvent::Listed(entry) => {
-				add_entry(listing, &entry);
+				add_entry(listing, &mut self.kept_bytes, &entry);
 				self.reporter.listed(*entry);
 			}
 			other => debug_assert!(false, "a listing codec sent {other:?}"),

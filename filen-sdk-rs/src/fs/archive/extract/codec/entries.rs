@@ -2,7 +2,10 @@
 //! whether a partial extraction chose it, whether it is skipped (for its kind, its path, or as
 //! macOS metadata), and what a listing says of it.
 
-use std::io::{self, Read};
+use std::{
+	collections::HashSet,
+	io::{self, Read},
+};
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::Uuid;
@@ -192,7 +195,10 @@ impl<'p> Walk<'p> {
 			if let Ok(path) = entry_path(stored) {
 				let keys = chooser.below_base(&path)?;
 				if is_dir {
-					chooser.dirs.push(keys);
+					chooser.dirs.insert(path_digest(&keys));
+				} else if keys.len() == chooser.base.len() {
+					// a file where the base is: nothing to extract it into
+					return Err(not_held());
 				}
 			}
 		}
@@ -246,16 +252,27 @@ impl<'p> Walk<'p> {
 			// the archive's own root, which no extraction creates
 			return Ok(false);
 		}
-		let mac_metadata = match found.mac_shape() {
-			Some(MacShape::InMacFolder) => true,
-			Some(MacShape::AppleDoubleName) => apple_double.unwrap_or(true),
-			None => false,
+		// an extraction reads a `._` file's data to tell whether it is AppleDouble: where a
+		// listing did not, it marks the entry by its name, and does not say it is skipped
+		let (mac_metadata, left_out) = match found.mac_shape() {
+			Some(MacShape::InMacFolder) => (true, true),
+			Some(MacShape::AppleDoubleName) => {
+				(apple_double.unwrap_or(true), apple_double == Some(true))
+			}
+			None => (false, false),
 		};
-		let skip = found
-			.unreadable
-			.clone()
-			.or_else(|| found.path.as_ref().err().map(|e| path_skip_reason(*e)))
-			.or((mac_metadata && self.skip_mac_metadata).then_some(ExtractSkipReason::MacMetadata));
+		let skip = match &found.unreadable {
+			// the target is the kind's already
+			Some(ExtractSkipReason::Symlink { .. }) => Some(ExtractSkipReason::Symlink {
+				target: String::new(),
+			}),
+			Some(ExtractSkipReason::Hardlink { .. }) => Some(ExtractSkipReason::Hardlink {
+				target: String::new(),
+			}),
+			other => other.clone(),
+		}
+		.or_else(|| found.path.as_ref().err().map(|e| path_skip_reason(*e)))
+		.or((left_out && self.skip_mac_metadata).then_some(ExtractSkipReason::MacMetadata));
 		let (stored_path, stored_path_truncated) = display_path(found.stored);
 		let path = found.path.as_ref().ok();
 		let entry = ArchiveEntry {
@@ -381,14 +398,36 @@ fn not_held() -> Error {
 	)
 }
 
+/// The digest of a path of collision keys, in 16 bytes.
+fn path_digest(keys: &[String]) -> u128 {
+	prefix_digests(keys).last().unwrap_or_default()
+}
+
+/// The digests of every path from the first of `keys` to each one in turn, shortest first:
+/// hashed as one pass over them, so looking up every ancestor of a path costs its length.
+fn prefix_digests(keys: &[String]) -> impl Iterator<Item = u128> {
+	let mut hasher = blake3::Hasher::new();
+	keys.iter().map(move |key| {
+		// a length before each key keeps `a/bc` and `ab/c` apart
+		hasher.update(&(key.len() as u64).to_le_bytes());
+		hasher.update(key.as_bytes());
+		u128::from_le_bytes(
+			hasher.finalize().as_bytes()[..16]
+				.try_into()
+				.expect("16 bytes"),
+		)
+	})
+}
+
 /// Which entries a partial extraction takes, and where they land.
 #[derive(Clone)]
 struct Chooser {
 	selection: Selection,
 	/// The collision keys of the base's segments.
 	base: Vec<String>,
-	/// The paths of the directories chosen, as collision keys: what is below one is chosen too.
-	dirs: Vec<Vec<String>>,
+	/// The digests ([`path_digest`]) of the directories chosen: what is below one is chosen
+	/// too, told by looking up each of its ancestors.
+	dirs: HashSet<u128>,
 	/// Chosen entries met so far.
 	met: usize,
 }
@@ -402,7 +441,7 @@ impl Chooser {
 				.map(|segment| collision_key(segment.as_ref()))
 				.collect(),
 			selection,
-			dirs: Vec::new(),
+			dirs: HashSet::new(),
 			met: 0,
 		}
 	}
@@ -444,14 +483,14 @@ impl Chooser {
 			.iter()
 			.map(|segment| collision_key(segment.as_ref()))
 			.collect();
-		let in_chosen_dir = self.dirs.iter().any(|dir| keys.starts_with(dir));
+		let in_chosen_dir = prefix_digests(&keys).any(|digest| self.dirs.contains(&digest));
 		if !chosen && !in_chosen_dir {
 			return Ok(None);
 		}
 		let keys = self.below_base(path)?;
 		let at_base = keys.len() == self.base.len();
 		if chosen && is_dir && !in_chosen_dir {
-			self.dirs.push(keys);
+			self.dirs.insert(path_digest(&keys));
 		}
 		if at_base {
 			// the base itself, which the entries below it land in

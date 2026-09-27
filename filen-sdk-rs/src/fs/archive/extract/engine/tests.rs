@@ -12,8 +12,7 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
 use crate::{
-	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	consts::CHUNK_SIZE,
 	fs::{
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
@@ -21,7 +20,8 @@ use crate::{
 			extract::{
 				ArchiveEntry, ArchiveListing, ArchiveTotals, ExpansionLimit, ExtractCallback,
 				ExtractEvent, ExtractSkipReason, ExtractUpdate, ListCallback, ListFailed,
-				ListPhase, ListTotals, ListUpdate, MAX_LISTED_ENTRIES, PasswordCheck, RunState,
+				ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,
+				PasswordCheck, RunState,
 				codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
 				list::{ListReporter, ListTask, run_list},
 				report::CALLBACK_BATCH,
@@ -34,7 +34,7 @@ use crate::{
 			format::StreamCodec,
 			password::ArchivePassword,
 			sevenz::write::{SevenZEncryption, SevenZMethod},
-			test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
+			test_support::{gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, zip_of},
 			worker::LinkHead,
 		},
 		dir::RootDirectory,
@@ -42,10 +42,6 @@ use crate::{
 			backend::ListedNames,
 			counts::ItemCounts,
 			test_support::{FakeBackend, Request, wait_until},
-		},
-		file::{
-			AnonymousRemoteFile, RemoteFile,
-			meta::{DecryptedFileMeta, FileMeta},
 		},
 	},
 	job::test_support::controls,
@@ -125,29 +121,7 @@ fn archive_file_with(
 	bytes: &[u8],
 	hash: Option<Blake3Hash>,
 ) -> RemoteFileType<'static> {
-	let size = bytes.len() as u64;
-	let meta = FileMeta::Decoded(DecryptedFileMeta {
-		name: Cow::Owned(name.to_owned()),
-		size,
-		mime: Cow::Borrowed("application/octet-stream"),
-		key: FileKey::V3(EncryptionKey::generate()),
-		last_modified: Utc::now(),
-		created: None,
-		hash,
-	});
-	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		ARCHIVE,
-		(),
-		ARCHIVE_PARENT.into(),
-		size,
-		size.div_ceil(CHUNK_SIZE_U64),
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		meta,
-	);
-	RemoteFileType::File(Cow::Owned(file))
+	remote_file(ARCHIVE, ARCHIVE_PARENT, name, bytes, hash)
 }
 
 fn hash(data: &[u8]) -> Blake3Hash {
@@ -3172,21 +3146,40 @@ async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 		.map(|i| format!("f{i:05}"))
 		.collect();
 	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
-	let setup = setup("many.tar", tar_of(&members), |_| {});
+	let many = setup("many.tar", tar_of(&members), |_| {});
 	let mut config = test_config();
 	config.max_members = 2 * MAX_LISTED_ENTRIES as u64;
-	let listing = list(&setup, JobControl::default(), config);
+	let listing = list(&many, JobControl::default(), config);
 	let listed = listing.running.await.unwrap().unwrap();
 
 	assert_eq!(listed.entries.len(), MAX_LISTED_ENTRIES);
 	assert_eq!(listed.omitted_entries, 3);
 	assert_eq!(listed.totals.files, names.len() as u64);
 	assert_eq!(listing.recorder.entries.lock().unwrap().len(), names.len());
-	let batches = listing.recorder.batches.lock().unwrap();
+	let batches = listing.recorder.batches.lock().unwrap().clone();
 	assert!(
 		batches.iter().all(|&batch| batch <= CALLBACK_BATCH),
 		"{batches:?}"
 	);
+
+	// long paths fill the listing's bytes before its count
+	let dir = vec!["d".repeat(250); 16].join("/");
+	let names: Vec<String> = (0..2200).map(|i| format!("{dir}/f{i:04}")).collect();
+	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+	let long = setup("long.tar", tar_of(&members), |_| {});
+	// a GNU long-name record before each
+	let mut config = test_config();
+	config.max_members = 3 * names.len() as u64;
+	let listing = list(&long, JobControl::default(), config);
+	let listed = listing.running.await.unwrap().unwrap();
+	// each keeps its stored path and its drive path, some 8 KB in all
+	let kept = listed.entries.len();
+	assert!(
+		kept < names.len() && kept > MAX_LISTED_BYTES / (3 * names[0].len()),
+		"{kept}"
+	);
+	assert_eq!(kept as u64 + listed.omitted_entries, names.len() as u64);
+	assert_eq!(listing.recorder.entries.lock().unwrap().len(), names.len());
 }
 
 /// A bare tar of the file `a.bin` holding `data`, then `links` hard links to it.

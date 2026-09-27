@@ -1,7 +1,20 @@
 //! Data and archives the archive tests share: bytes that compress and bytes that do not, and
 //! small archives made by the SDK's own writers and the `tar` crate.
 
-use std::io::Write;
+use std::{borrow::Cow, io::Write};
+
+use chrono::Utc;
+use filen_types::{crypto::Blake3Hash, fs::Uuid};
+
+use crate::{
+	consts::CHUNK_SIZE_U64,
+	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	fs::file::{
+		AnonymousRemoteFile, RemoteFile,
+		enums::RemoteFileType,
+		meta::{DecryptedFileMeta, FileMeta},
+	},
+};
 
 use super::{
 	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
@@ -10,6 +23,39 @@ use super::{
 		write::{Encryption, ZipMethod, ZipWriter},
 	},
 };
+
+/// A file `name` in `parent` holding `bytes`, with `hash` in its metadata.
+pub(crate) fn remote_file(
+	uuid: Uuid,
+	parent: Uuid,
+	name: &str,
+	bytes: &[u8],
+	hash: Option<Blake3Hash>,
+) -> RemoteFileType<'static> {
+	let size = bytes.len() as u64;
+	let meta = FileMeta::Decoded(DecryptedFileMeta {
+		name: Cow::Owned(name.to_owned()),
+		size,
+		mime: Cow::Borrowed("application/octet-stream"),
+		key: FileKey::V3(EncryptionKey::generate()),
+		last_modified: Utc::now(),
+		created: None,
+		hash,
+	});
+	let file: AnonymousRemoteFile = RemoteFile::from_meta(
+		uuid,
+		(),
+		parent.into(),
+		size,
+		size.div_ceil(CHUNK_SIZE_U64),
+		"de-1",
+		"bucket",
+		Utc::now(),
+		false,
+		meta,
+	);
+	RemoteFileType::File(Cow::Owned(file))
+}
 
 /// Bytes that compress well, told apart by `seed`: a ramp over 251 values, a prime, so its
 /// period lines up with no chunk or block size.
