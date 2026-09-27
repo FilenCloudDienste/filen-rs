@@ -113,10 +113,21 @@ pub enum ExtractRequest {
 /// bound, compressed or not: what they copy in all may not pass it either, so a small tar of
 /// one file and many links to it fails with
 /// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind) rather than upload that file each time.
+///
+/// Only ever passed in, so the bindings take either number type for both, as they do for
+/// their other sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(import, export, no_default)]
+#[js_type(import, no_default)]
 pub struct ExpansionLimit {
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		tsify(type = "number | bigint")
+	)]
 	pub ratio: u64,
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		tsify(type = "number | bigint")
+	)]
 	pub floor: u64,
 }
 
