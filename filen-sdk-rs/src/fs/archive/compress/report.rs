@@ -54,9 +54,9 @@ pub enum CompressPhase {
 }
 
 impl JobPhase for CompressPhase {
-	fn is_terminal(self) -> bool {
-		matches!(self, Self::Done | Self::Cancelled | Self::Failed)
-	}
+	const DONE: Self = Self::Done;
+	const CANCELLED: Self = Self::Cancelled;
+	const FAILED: Self = Self::Failed;
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -50,9 +50,9 @@ pub enum ExtractPhase {
 }
 
 impl JobPhase for ExtractPhase {
-	fn is_terminal(self) -> bool {
-		matches!(self, Self::Done | Self::Cancelled | Self::Failed)
-	}
+	const DONE: Self = Self::Done;
+	const CANCELLED: Self = Self::Cancelled;
+	const FAILED: Self = Self::Failed;
 }
 
 /// An archive entry. Only meaningful with the archive it came from.

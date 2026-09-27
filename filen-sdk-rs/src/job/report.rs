@@ -49,7 +49,14 @@ pub enum RunState {
 
 /// A job's phase. A terminal phase ends the job: no time is left to estimate once it is reached.
 pub(crate) trait JobPhase: Copy + PartialEq + MaybeSend + 'static {
-	fn is_terminal(self) -> bool;
+	/// The terminal phases: every job ends in one of these three.
+	const DONE: Self;
+	const CANCELLED: Self;
+	const FAILED: Self;
+
+	fn is_terminal(self) -> bool {
+		self == Self::DONE || self == Self::CANCELLED || self == Self::FAILED
+	}
 }
 
 /// How much of a job's work is done, in the units its rate and time left are estimated in.
