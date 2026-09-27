@@ -18,6 +18,9 @@ const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 const FLAG_UTF8: u16 = 0x0800;
+const METHOD_STORED: u16 = 0;
+const METHOD_DEFLATE: u16 = 8;
+const METHOD_BZIP2: u16 = 12;
 const METHOD_AES: u16 = 99;
 /// Unix (3), zip specification 6.3.
 const VERSION_MADE_BY: u16 = 0x033F;
@@ -62,9 +65,9 @@ impl ZipMethod {
 
 	fn code(self) -> u16 {
 		match self {
-			Self::Stored => 0,
-			Self::Deflate { .. } => 8,
-			Self::Bzip2 { .. } => 12,
+			Self::Stored => METHOD_STORED,
+			Self::Deflate { .. } => METHOD_DEFLATE,
+			Self::Bzip2 { .. } => METHOD_BZIP2,
 		}
 	}
 }
@@ -151,7 +154,7 @@ impl<W: Write> ZipWriter<W> {
 		let entry = CentralEntry {
 			name: format!("{path}/").into_bytes(),
 			flags: FLAG_UTF8,
-			method: 0,
+			method: METHOD_STORED,
 			aes: None,
 			dos: dos_datetime(modified),
 			unix_time: unix_time(modified),
@@ -290,7 +293,7 @@ impl<W: Write> ZipWriter<W> {
 			// the record's size, less its first 12 bytes
 			out.write_all(&44u64.to_le_bytes())?;
 			out.write_all(&VERSION_MADE_BY.to_le_bytes())?;
-			out.write_all(&45u16.to_le_bytes())?;
+			out.write_all(&VERSION_ZIP64.to_le_bytes())?;
 			out.write_all(&0u32.to_le_bytes())?;
 			out.write_all(&0u32.to_le_bytes())?;
 			out.write_all(&count.to_le_bytes())?;
@@ -346,16 +349,23 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 	extra
 }
 
+/// The zip specification version (4.4.3.2) that deflate and directories need.
+const VERSION_DEFLATE: u16 = 20;
+const VERSION_ZIP64: u16 = 45;
+const VERSION_BZIP2: u16 = 46;
+const VERSION_AES: u16 = 51;
+
+/// The highest version any of the entry's features needs: a bzip2 entry with zip64 sizes needs
+/// bzip2's, not zip64's.
 fn version_needed(entry: &CentralEntry, zip64: bool) -> u16 {
-	if entry.aes.is_some() {
-		51
-	} else if zip64 {
-		45
-	} else if entry.method == 12 {
-		46
-	} else {
-		20
-	}
+	[
+		(zip64, VERSION_ZIP64),
+		(entry.method == METHOD_BZIP2, VERSION_BZIP2),
+		(entry.aes.is_some(), VERSION_AES),
+	]
+	.into_iter()
+	.filter(|&(needed, _)| needed)
+	.fold(VERSION_DEFLATE, |version, (_, needed)| version.max(needed))
 }
 
 fn write_local_header<W: Write>(out: &mut W, entry: &CentralEntry, zip64: bool) -> io::Result<()> {
@@ -521,5 +531,41 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 		Self: 'a,
 	{
 		(*self).finish()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_version_needed_meets_every_requirement() {
+		let entry = |method: ZipMethod, aes: bool| CentralEntry {
+			name: b"a".to_vec(),
+			flags: 0,
+			method: if aes { METHOD_AES } else { method.code() },
+			aes: aes.then_some((AesStrength::Aes256, method.code())),
+			dos: dos_datetime(None),
+			unix_time: None,
+			crc: 0,
+			compressed_size: 0,
+			size: 0,
+			offset: 0,
+			dir: false,
+		};
+		// (method, AES, zip64, version): deflate 2.0, zip64 4.5, bzip2 4.6, AES 5.1
+		for (method, aes, zip64, version) in [
+			(ZipMethod::Stored, false, false, 20),
+			(ZipMethod::Deflate { level: 6 }, false, true, 45),
+			(ZipMethod::Bzip2 { level: 9 }, false, false, 46),
+			(ZipMethod::Bzip2 { level: 9 }, false, true, 46),
+			(ZipMethod::Bzip2 { level: 9 }, true, true, 51),
+		] {
+			assert_eq!(
+				version_needed(&entry(method, aes), zip64),
+				version,
+				"{method:?} {aes} {zip64}"
+			);
+		}
 	}
 }
