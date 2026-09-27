@@ -51,3 +51,5 @@ pub use returned_types::*;
 pub(crate) use service_worker::impls::*;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use service_worker::shared::*;
+#[cfg(feature = "wasm-full")]
+pub(crate) use wasm::optional_function;

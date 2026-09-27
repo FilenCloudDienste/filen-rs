@@ -628,15 +628,15 @@ mod wasm_impl {
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
 		#[tsify(type = "(update: CopyUpdate) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_update: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_update: Option<js_sys::Function>,
 		/// The top-level items, before any of them is created.
 		#[tsify(type = "(items: CopyPlannedItem[]) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_top_level_planned: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_top_level_planned: Option<js_sys::Function>,
 		#[tsify(type = "(item: CopiedTopLevelItem) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_top_level_created: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_top_level_created: Option<js_sys::Function>,
 		// A direct (never flattened) field, so the abort and pause signals stay live JS values.
 		#[serde(default)]
 		pub managed_future: ManagedFuture,
@@ -652,41 +652,43 @@ mod wasm_impl {
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
 		#[tsify(type = "(update: CopyUpdate) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_update: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_update: Option<js_sys::Function>,
 		/// The top-level items, before any of them is created.
 		#[tsify(type = "(items: CopyPlannedItem[]) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_top_level_planned: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_top_level_planned: Option<js_sys::Function>,
 		#[tsify(type = "(item: CopiedTopLevelItem) => void", optional)]
-		#[serde(default, with = "serde_wasm_bindgen::preserve")]
-		pub on_top_level_created: js_sys::Function,
+		#[serde(default, deserialize_with = "crate::js::optional_function")]
+		pub on_top_level_created: Option<js_sys::Function>,
 		// A direct (never flattened) field, so the abort and pause signals stay live JS values.
 		#[serde(default)]
 		pub managed_future: ManagedFuture,
 	}
 
 	struct Callbacks {
-		on_update: js_sys::Function,
-		on_top_level_planned: js_sys::Function,
-		on_top_level_created: js_sys::Function,
+		on_update: Option<js_sys::Function>,
+		on_top_level_planned: Option<js_sys::Function>,
+		on_top_level_created: Option<js_sys::Function>,
 	}
 
 	impl Callbacks {
 		fn deliver(&self, delivery: Delivery) {
 			match delivery {
-				Delivery::TopLevelPlanned(items) => call(&self.on_top_level_planned, &items),
-				Delivery::TopLevelCreated(item) => call(&self.on_top_level_created, &item),
-				Delivery::Update(update) => call(&self.on_update, &update),
+				Delivery::TopLevelPlanned(items) => {
+					call(self.on_top_level_planned.as_ref(), &items)
+				}
+				Delivery::TopLevelCreated(item) => call(self.on_top_level_created.as_ref(), &item),
+				Delivery::Update(update) => call(self.on_update.as_ref(), &update),
 			}
 		}
 	}
 
 	/// Calls `callback` with `value`, if the caller passed one.
-	fn call(callback: &js_sys::Function, value: &impl Serialize) {
-		if callback.is_undefined() {
+	fn call(callback: Option<&js_sys::Function>, value: &impl Serialize) {
+		let Some(callback) = callback else {
 			return;
-		}
+		};
 		let serializer = serde_wasm_bindgen::Serializer::new()
 			.serialize_maps_as_objects(true)
 			.serialize_large_number_types_as_bigints(true);
