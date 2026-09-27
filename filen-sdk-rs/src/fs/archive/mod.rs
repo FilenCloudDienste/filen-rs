@@ -23,6 +23,8 @@ pub(crate) mod names;
 pub(crate) mod password;
 pub(crate) mod sevenz;
 pub(crate) mod tar_iter;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod worker;
 pub(crate) mod zip;
 

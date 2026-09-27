@@ -77,7 +77,9 @@ pub struct ArchiveConfig {
 	/// state stays resident); a job paused before it got one waits without taking it.
 	pub job_concurrency: usize,
 	/// Most members an archive may have, every tar record counted, and most directories an
-	/// extraction plans, those only implied by the paths below them counted too.
+	/// extraction plans, those only implied by the paths below them counted too. Extracting or
+	/// listing a tar keeps up to 96 bytes per file for the hard links after it that may name it
+	/// (96 MB for a million files), outside the codec's memory.
 	pub max_members: u64,
 	/// Most bytes of an archive's index (a zip's central directory) read into memory.
 	pub max_index_bytes: u64,

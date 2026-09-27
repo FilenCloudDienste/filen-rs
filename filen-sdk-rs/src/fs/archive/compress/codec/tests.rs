@@ -16,6 +16,7 @@ use crate::{
 		encode::Compression,
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
+		test_support::pattern,
 		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
@@ -150,12 +151,6 @@ fn read_tar(archive: &[u8], codec: Option<StreamCodec>) -> Vec<Member> {
 
 fn when(secs: i64) -> Option<DateTime<Utc>> {
 	Some(Utc.timestamp_opt(secs, 0).unwrap())
-}
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len)
-		.map(|i| (i % 253).to_le_bytes()[0] ^ seed)
-		.collect()
 }
 
 /// A tree with a long path, an empty file and a file over a chunk.

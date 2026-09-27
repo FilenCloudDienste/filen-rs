@@ -111,6 +111,8 @@ pub(crate) struct FakeLog {
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
 	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
 	pub(crate) fetched_items: Vec<Uuid>,
+	/// Most items fetched by uuid at once.
+	pub(crate) peak_item_fetches: usize,
 	pub(crate) out_of_order_dirs: Vec<String>,
 	pub(crate) colored: Vec<Uuid>,
 	pub(crate) propagated: Vec<Uuid>,
@@ -200,6 +202,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) lock_calls: AtomicUsize,
 	/// Registrations running now.
 	finishes: Arc<AtomicUsize>,
+	/// Items fetched by uuid now.
+	item_fetches: Arc<AtomicUsize>,
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
 	/// until it is cleared; `None` while the lock is free.
 	pub(crate) block_locks_from: watch::Sender<Option<usize>>,
@@ -245,6 +249,7 @@ impl FakeBackend {
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
 			finishes: Arc::default(),
+			item_fetches: Arc::default(),
 			block_locks_from: watch::Sender::new(None),
 			listed: ListedNames::default(),
 			quirks: HashSet::new(),
@@ -706,7 +711,19 @@ mod disposal {
 			uuid: Uuid,
 			is_dir: bool,
 		) -> Result<NonRootItemType<'static, Normal>, Error> {
-			self.log().fetched_items.push(uuid);
+			let _running = Running::start(&self.item_fetches, |running| {
+				let mut log = self.log();
+				log.peak_item_fetches = log.peak_item_fetches.max(running);
+			});
+			tokio::time::sleep(self.delay).await;
+			// a file in the fake drive is fetched at its size; any other is one byte
+			let (size, chunks) = {
+				let mut log = self.log();
+				log.fetched_items.push(uuid);
+				log.file_parents
+					.get(&uuid)
+					.map_or((1, 1), |&(_, size, chunks)| (size, chunks))
+			};
 			Ok(if is_dir {
 				NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
 					uuid,
@@ -722,15 +739,15 @@ mod disposal {
 					uuid,
 					StableUuid::new_for_test(uuid),
 					Uuid::new_v4().into(),
-					1,
-					1,
+					size,
+					chunks,
 					"de-1",
 					"bucket",
 					Utc::now(),
 					false,
 					FileMeta::Decoded(DecryptedFileMeta {
 						name: Cow::Borrowed("fetched"),
-						size: 1,
+						size,
 						mime: Cow::Borrowed("text/plain"),
 						key: FileKey::V3(EncryptionKey::generate()),
 						last_modified: Utc::now(),

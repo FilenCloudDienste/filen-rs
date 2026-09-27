@@ -119,6 +119,27 @@ pub enum ExtractStage {
 	},
 }
 
+/// Where to extract an entry that failed again, for it to land where it was meant to:
+/// [`ExtractRequest::Entries`](super::ExtractRequest::Entries) with the entry's id, this
+/// `destination` (fetched by its uuid), this `base`, and
+/// [`ExtractRoot::Destination`](super::ExtractRoot::Destination). Failures that share a retry
+/// go again in one request.
+///
+/// A tar's hard link that failed does not go again this way: it is a copy of a file stored
+/// before it, and a tar is read front to back, so a request that does not take that file too
+/// has nothing to copy, and skips the link as
+/// [`ExtractSkipReason::Hardlink`](super::ExtractSkipReason::Hardlink); taking the file too
+/// extracts it a second time. The file is in the drive by then, where it can be copied.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractRetry {
+	/// The directory nearest the entry that the extraction created (or extracted into): its
+	/// parent, unless that failed too.
+	pub destination: Uuid,
+	/// That directory's path in the archive, as drive names.
+	pub base: String,
+}
+
 /// An entry that was not extracted because something went wrong.
 #[derive(Debug, Clone)]
 pub struct ExtractFailure {
@@ -132,6 +153,7 @@ pub struct ExtractFailure {
 	pub dest_name: String,
 	/// What failed.
 	pub stage: ExtractStage,
+	pub retry: ExtractRetry,
 	/// Shared because [`Error`] is not `Clone`, and one failure goes both into an event and into
 	/// the report.
 	pub error: Arc<Error>,
@@ -347,6 +369,25 @@ pub struct ExtractReport {
 	pub dispositions: Vec<SourceDisposition>,
 }
 
+impl ExtractReport {
+	/// The report of an extraction that has done nothing yet.
+	pub(crate) fn new(totals: ArchiveTotals) -> Self {
+		Self {
+			top_level: Vec::new(),
+			failures: Vec::new(),
+			skipped: Vec::new(),
+			renamed: Vec::new(),
+			misleading_names: Vec::new(),
+			omitted: OmittedRecords::default(),
+			totals,
+			counts: ItemCounts::default(),
+			unaccounted_bytes: 0,
+			duplicates: None,
+			dispositions: Vec::new(),
+		}
+	}
+}
+
 impl JobReport for ExtractReport {
 	const NAME: &'static str = "extraction";
 }
@@ -386,8 +427,8 @@ pub(crate) struct ExtractState {
 	ended: bool,
 }
 
-/// Most top-level items one `on_top_level_created` call carries.
-const TOP_LEVEL_BATCH: usize = 256;
+/// Most items one callback of a batch (`on_top_level_created`, `on_entries`) carries.
+pub(crate) const CALLBACK_BATCH: usize = 256;
 
 impl JobState for ExtractState {
 	type Phase = ExtractPhase;
@@ -490,7 +531,7 @@ impl Reporter {
 		});
 	}
 
-	/// Delivered in a batch of up to [`TOP_LEVEL_BATCH`] items right before the next update
+	/// Delivered in a batch of up to [`CALLBACK_BATCH`] items right before the next update
 	/// (every job ends with one), so a caller holds every item the job created by the time the
 	/// job returns.
 	pub(crate) fn top_level_created(&self, item: ExtractedTopLevel) {
@@ -498,7 +539,7 @@ impl Reporter {
 		self.with_state(|state| {
 			state.pending_top_level.push(item);
 			state.core.mark_changed();
-			full = state.pending_top_level.len() >= TOP_LEVEL_BATCH;
+			full = state.pending_top_level.len() >= CALLBACK_BATCH;
 		});
 		if full {
 			self.flush_then_call(|_| {});
@@ -588,6 +629,16 @@ impl Reporter {
 			state.counts.bytes_done -= counted;
 			state.counts.files_not_attempted += 1;
 			state.counts.bytes_not_attempted += bytes;
+			state.core.mark_changed();
+		});
+	}
+
+	/// Files, `bytes` in all, taken on that a job which ended early never started.
+	pub(crate) fn files_not_attempted(&self, count: u64, bytes: u64) {
+		self.with_state(|state| {
+			state.counts.files_not_attempted += count;
+			state.counts.bytes_not_attempted =
+				state.counts.bytes_not_attempted.saturating_add(bytes);
 			state.core.mark_changed();
 		});
 	}

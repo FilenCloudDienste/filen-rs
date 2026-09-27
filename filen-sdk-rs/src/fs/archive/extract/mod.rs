@@ -4,6 +4,8 @@
 mod client_impl;
 pub(crate) mod codec;
 mod engine;
+mod input;
+mod list;
 mod report;
 
 use filen_macros::js_type;
@@ -19,14 +21,21 @@ use crate::{
 };
 
 pub use crate::fs::{
-	archive::{format::archive_default_name, password::ArchivePassword},
+	archive::{
+		format::{ArchiveFormat, archive_default_name},
+		password::ArchivePassword,
+	},
 	drive_job::counts::ItemCounts,
+};
+pub use list::{
+	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListFailed, ListPhase,
+	ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
-	ExtractReport, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractUpdate,
-	ExtractedTopLevel, OmittedRecords, RunState,
+	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
+	ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
 };
 
 /// Where an archive's entries are created.
@@ -70,11 +79,42 @@ pub enum ExtractRequest {
 		destination: DirType<'static, Normal>,
 		root: ExtractRoot,
 	},
+	/// Some of the archive's entries into `destination`: those `ids` names (from
+	/// [`Client::list_archive`](crate::auth::Client::list_archive), or a failure's
+	/// [`ExtractRetry`]), everything below a directory among them, and the directories that hold
+	/// them.
+	///
+	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
+	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
+	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. An id of another
+	/// archive fails the job before anything runs. A zip's or 7z's ids are checked against its
+	/// index before anything is created: an id it does not hold, of an entry not below `base`, or
+	/// of a file at `base` itself fails the job. A tar's members are only known as it is read: a
+	/// member chosen that is not below `base` fails the job when it is reached, and an id the tar
+	/// does not hold once it is read to its end, what was extracted until then staying.
+	///
+	/// A chosen directory of a tar brings what the tar stores after it below it: every tool
+	/// stores a directory before its contents, and what came before is gone by the time the
+	/// directory is reached. A zip's or 7z's brings everything below it, wherever it is stored.
+	///
+	/// The archive is never removed afterwards: part of it is not extracted.
+	Entries {
+		archive: RemoteFileType<'static>,
+		ids: Vec<ArchiveEntryId>,
+		base: String,
+		destination: DirType<'static, Normal>,
+		root: ExtractRoot,
+	},
 }
 
 /// How much more than it reads a compressed archive may decode to: at most `ratio` times the
 /// compressed bytes read so far, but always at least `floor` bytes. Stops a decompression bomb
 /// before it costs its full output in time and storage.
+///
+/// A tar's hard links, each extracted as a copy of the file it names, are held to the same
+/// bound, compressed or not: what they copy in all may not pass it either, so a small tar of
+/// one file and many links to it fails with
+/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind) rather than upload that file each time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(import, export, no_default)]
 pub struct ExpansionLimit {
@@ -113,6 +153,13 @@ pub struct ExtractConfig {
 	/// then, the folders created so far go to the trash (a folder holding a file someone else put
 	/// there meanwhile stays).
 	pub password: Option<ArchivePassword>,
+	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them: the
+	/// `__MACOSX` folders of Finder's zips and AppleDouble files (named `._name` or kept in such
+	/// a folder, told by the four bytes they start with), reported skipped as
+	/// [`ExtractSkipReason::MacMetadata`]. Left out on purpose, they keep nothing from removing
+	/// the archive once the rest is extracted. `true` by default; `false` extracts them as
+	/// ordinary files.
+	pub skip_mac_metadata: bool,
 }
 
 impl Default for ExtractConfig {
@@ -122,6 +169,7 @@ impl Default for ExtractConfig {
 			max_items: None,
 			expansion_limit: Some(ExpansionLimit::DEFAULT),
 			password: None,
+			skip_mac_metadata: true,
 		}
 	}
 }
@@ -150,7 +198,8 @@ pub enum ExtractSkipReason {
 		target: String,
 	},
 	/// A tar hard link, a second name for the earlier entry at `target` (its path as stored, cut
-	/// to at most 4096 bytes), with no data of its own.
+	/// to at most 4096 bytes), with no data of its own, when no file was extracted for `target`
+	/// to copy: it was skipped or failed, or is no file of this archive.
 	Hardlink {
 		/// The path of the entry it names, as stored, at most 4096 bytes.
 		target: String,
@@ -176,6 +225,8 @@ pub enum ExtractSkipReason {
 	UnsupportedMethod,
 	/// A 7z deletion marker, which an update archive carries for a file it removed.
 	AntiItem,
+	/// macOS metadata left out (see [`ExtractConfig::skip_mac_metadata`]).
+	MacMetadata,
 }
 
 /// Names a zip lists more than once; the last entry of each name is extracted, as other zip

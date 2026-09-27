@@ -868,6 +868,8 @@ mod uniffi_impl {
 					.expansion_limit
 					.or(ExtractConfig::default().expansion_limit),
 				password,
+				// the bindings do not expose the option yet: the SDK's default
+				skip_mac_metadata: ExtractConfig::default().skip_mac_metadata,
 			};
 			let client = self.inner();
 			// the foreign callbacks run on the dispatch thread, in order; waiting for them is no
@@ -1127,6 +1129,8 @@ mod wasm_impl {
 					.expansion_limit
 					.or(ExtractConfig::default().expansion_limit),
 				password,
+				// the bindings do not expose the option yet: the SDK's default
+				skip_mac_metadata: ExtractConfig::default().skip_mac_metadata,
 			};
 			run_extract(
 				self.inner(),
