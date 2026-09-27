@@ -11,10 +11,17 @@ sequence of a block into its ring buffer and decodes a literals section's full s
 crafted frame of a few KiB makes a single block allocate gigabytes, far past the window the SDK
 charges its codec budget for, and a block of enough sequences overflows a `u32` sum and panics.
 
+## Where it comes from
+
+The published crate: `ruzstd-0.9.0.crate`, sha256
+`a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888` (the checksum in
+`Cargo.lock`), cut from upstream commit `f833802b674e6b9360a259d25c20940e25a54e79`
+(`.cargo_vcs_info.json`, path `ruzstd`).
+
 ## What is ours
 
-Only `src/` differs from the published crate, by the patch in the commit that follows the one
-adding this directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
+`src/` differs from the published crate by the patch in the commits after the one adding this
+directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
 
 - a literals section may regenerate at most 128 KiB;
 - a block's literals and 3 bytes per sequence (a match copies at least 3) may come to at most
@@ -25,9 +32,11 @@ adding this directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
   to its end (up to 8 literals per byte) before the count was checked;
 - the per-block sum is counted in `usize`, so it cannot overflow.
 
-`Cargo.toml` is the published (normalized) one, less the dev-dependencies, benches and examples
-of the crate's own test suite, which a dependency never builds; those tests and their fixtures
-are not vendored. `rustfmt.toml` keeps upstream's default formatting.
+Besides `src/`: `Cargo.toml` is the published (normalized) one, less the dev-dependencies,
+benches and examples of the crate's own test suite, which a dependency never builds; those
+tests' fixtures, the benches, the examples, `Cargo.toml.orig`, `Cargo.lock` and
+`.cargo_vcs_info.json` are left out. `rustfmt.toml` (keeping upstream's default formatting) and
+this file are ours. The patch's tests live in the SDK (`fs/archive/decode/tests.rs`).
 
 ## Leaving
 
