@@ -40,6 +40,19 @@ pub(crate) enum CreatedDir {
 	Merged,
 }
 
+/// The names a directory holds.
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ListedNames {
+	pub(crate) names: Vec<String>,
+	/// Some items' names could not be decrypted, so a name picked to be free among `names` may
+	/// still be taken.
+	pub(crate) unverified: bool,
+}
+
 /// What a new file is created as.
 #[derive(Debug, Clone)]
 pub(crate) struct UploadSpec {
@@ -65,6 +78,15 @@ pub(crate) trait DriveBackend: MaybeSendSync + 'static {
 		&self,
 		dir: Uuid,
 	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
+	/// The names of the items in `dir`.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	fn list_dir_names(
+		&self,
+		dir: &crate::fs::categories::DirType<'static, Normal>,
+	) -> impl Future<Output = Result<ListedNames, Error>> + MaybeSend;
 	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
 	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
 	/// the directory, and reports a merge into an existing one instead of returning it.
@@ -153,6 +175,32 @@ impl DriveBackend for ClientBackend {
 
 	async fn connected_targets(&self, dir: Uuid) -> Result<ConnectedTargets, Error> {
 		self.client.fetch_connected_targets(dir).await
+	}
+
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	async fn list_dir_names(
+		&self,
+		dir: &crate::fs::categories::DirType<'static, Normal>,
+	) -> Result<ListedNames, Error> {
+		use crate::fs::{HasName, categories::fs::CategoryFS};
+
+		let (dirs, files) =
+			Normal::list_dir(&self.client, dir, None::<&fn(u64, Option<u64>)>, ()).await?;
+		let mut listed = ListedNames::default();
+		for name in dirs
+			.iter()
+			.map(|d| d.name())
+			.chain(files.iter().map(|f| f.name()))
+		{
+			match name {
+				Some(name) => listed.names.push(name.to_owned()),
+				None => listed.unverified = true,
+			}
+		}
+		Ok(listed)
 	}
 
 	async fn create_dir_unpropagated(

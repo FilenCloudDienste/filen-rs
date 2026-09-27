@@ -42,8 +42,9 @@ pub(crate) enum WorkerEvent {
 	/// The next data of the file entry sent last: [`CHUNK_SIZE`] bytes, except for a file's last
 	/// chunk.
 	Data(Vec<u8>),
-	/// The end of the file entry sent last.
-	FileEnd(Integrity),
+	/// The end of the file entry sent last. Its data was checked against whatever checksum the
+	/// archive carries for it: a mismatch fails the codec instead.
+	FileEnd,
 	Skipped(SkippedMember),
 }
 
@@ -73,13 +74,6 @@ pub(crate) enum EntryKind {
 	File {
 		size: Option<u64>,
 	},
-}
-
-/// Whether a file's data was checked against a checksum the archive carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Integrity {
-	Verified,
-	Unverifiable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,12 +167,12 @@ pub(crate) struct WorkerLink<T> {
 
 impl<T> WorkerLink<T> {
 	/// Gives up on a codec that stopped moving. A stalled thread is never killed (it could hold
-	/// the allocator's lock); natively it is left to exit at its next exchange, and on wasm the
-	/// worker is retired so the next job gets a fresh one.
-	pub(crate) fn abandon(self) {
+	/// the allocator's lock): natively it is left to exit at its next exchange once the link is
+	/// dropped, and on wasm the worker is retired so the next job gets a fresh one.
+	pub(crate) fn retire(&self) {
+		self.shared.cancelled.store(true, Ordering::Relaxed);
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		ARCHIVE_CODECS.retire(self.generation);
-		drop(self);
 	}
 }
 

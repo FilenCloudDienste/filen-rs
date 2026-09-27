@@ -10,17 +10,17 @@ use crate::{Error, ErrorKind};
 
 use super::{
 	super::{
-		decode::{CodecError, StreamCheck, StreamDecoder, codec_error, open_stream},
+		decode::{CodecError, StreamDecoder, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{DETECT_HEAD_LEN, Detected, archive_default_name, detect, is_tar_header},
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{
-			ChunkInput, EntryHead, EntryKind, Integrity, JobEnded, SkippedMember, StreamLayout,
-			WorkerEvent, WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryHead, EntryKind, JobEnded, SkippedMember, StreamLayout, WorkerEvent,
+			WorkerPort, read_full, send_file_data,
 		},
 	},
-	ExtractSkipReason,
+	ExpansionLimit, ExtractSkipReason,
 };
 
 /// Bytes of a tar header block.
@@ -34,15 +34,6 @@ pub(crate) struct CodecLimits {
 	/// Most tar headers read, every record counted.
 	pub(crate) max_members: u64,
 	pub(crate) expansion: Option<ExpansionLimit>,
-}
-
-/// How much more than it reads a compressed stream may decode to: at most `ratio` times the
-/// compressed bytes read so far, but always at least `floor` bytes. Stops decompression bombs
-/// before they cost their full output in time and storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExpansionLimit {
-	pub(crate) ratio: u64,
-	pub(crate) floor: u64,
 }
 
 /// A streaming archive to extract.
@@ -147,12 +138,7 @@ fn extract_single(
 	.map_err(failure)?;
 	send_file_data(port, &mut decoded).map_err(failure)?;
 	let end = decoded.into_inner().1.inner.end().expect("read to the end");
-	let integrity = match end.check {
-		StreamCheck::Verified => Integrity::Verified,
-		StreamCheck::Unverifiable => Integrity::Unverifiable,
-	};
-	port.send(WorkerEvent::FileEnd(integrity))
-		.map_err(failure)?;
+	port.send(WorkerEvent::FileEnd).map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: end.unaccounted_bytes,
 	})
@@ -220,9 +206,7 @@ fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<R
 		.map_err(failure)?;
 		if !is_dir {
 			send_file_data(port, &mut TarBody(&mut tar)).map_err(failure)?;
-			// tar stores no checksum of a member's data
-			port.send(WorkerEvent::FileEnd(Integrity::Unverifiable))
-				.map_err(failure)?;
+			port.send(WorkerEvent::FileEnd).map_err(failure)?;
 		}
 	}
 	Ok(tar.into_inner())

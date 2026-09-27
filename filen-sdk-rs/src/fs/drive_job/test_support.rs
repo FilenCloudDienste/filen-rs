@@ -25,7 +25,7 @@ use crate::{
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
-		categories::{NonRootItemType, Normal},
+		categories::{DirType, NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 		file::{
 			RemoteFile,
@@ -39,7 +39,7 @@ use crate::{
 	},
 };
 
-use super::backend::{CreatedDir, DriveBackend, UploadSpec};
+use super::backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec};
 
 /// Bytes of memory semaphore that hold `chunks` chunks.
 pub(crate) fn budget(chunks: usize) -> usize {
@@ -121,6 +121,10 @@ pub(crate) struct FakeBackend {
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
 	/// until it is cleared; `None` while the lock is free.
 	pub(crate) block_locks_from: watch::Sender<Option<usize>>,
+	/// What listing any directory returns.
+	pub(crate) listed: ListedNames,
+	/// Files whose chunks are these bytes instead of [`chunk_data`].
+	pub(crate) contents: HashMap<Uuid, Vec<u8>>,
 }
 
 /// Chunks of memory a [`FakeBackend`] has unless a test asks for [`FakeBackend::with_memory`].
@@ -157,6 +161,8 @@ impl FakeBackend {
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
 			block_locks_from: watch::Sender::new(None),
+			listed: ListedNames::default(),
+			contents: HashMap::new(),
 		}
 	}
 
@@ -222,6 +228,11 @@ impl DriveBackend for FakeBackend {
 			(Some(later), 2..) => later.clone(),
 			_ => self.targets.clone(),
 		})
+	}
+
+	async fn list_dir_names(&self, _dir: &DirType<'static, Normal>) -> Result<ListedNames, Error> {
+		tokio::time::sleep(self.delay).await;
+		Ok(self.listed.clone())
 	}
 
 	async fn create_dir_unpropagated(
@@ -318,6 +329,10 @@ impl DriveBackend for FakeBackend {
 			return Err(Error::custom(*kind, "fetch failed"));
 		}
 		self.log().fetched.push((file.uuid(), index));
+		if let Some(contents) = self.contents.get(&file.uuid()) {
+			let start = (index * CHUNK_SIZE_U64) as usize;
+			return Ok(contents[start..(start + CHUNK_SIZE).min(contents.len())].to_vec());
+		}
 		let mut data = chunk_data(file.uuid(), index, file.size());
 		if self.short_reads.contains(&name) && index + 1 == file.size().div_ceil(CHUNK_SIZE_U64) {
 			data.pop();

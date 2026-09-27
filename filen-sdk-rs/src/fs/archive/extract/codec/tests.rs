@@ -13,7 +13,7 @@ use std::{
 use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
-	fs::archive::{format::StreamCodec, worker},
+	fs::archive::{extract::ExpansionLimit, format::StreamCodec, worker},
 };
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -36,7 +36,7 @@ enum Seen {
 		size: Option<u64>,
 		chunks: Vec<usize>,
 		data: Vec<u8>,
-		integrity: Option<Integrity>,
+		ended: bool,
 	},
 	Skipped(u64, String, u64, ExtractSkipReason),
 }
@@ -78,7 +78,7 @@ fn run_with(
 					size,
 					chunks: Vec::new(),
 					data: Vec::new(),
-					integrity: None,
+					ended: false,
 				},
 			}),
 			WorkerEvent::Data(data) => {
@@ -91,11 +91,11 @@ fn run_with(
 				chunks.push(data.len());
 				all.extend_from_slice(&data);
 			}
-			WorkerEvent::FileEnd(end) => {
-				let Some(Seen::File { integrity, .. }) = seen.last_mut() else {
+			WorkerEvent::FileEnd => {
+				let Some(Seen::File { ended, .. }) = seen.last_mut() else {
 					panic!("a file end outside a file");
 				};
-				*integrity = Some(end);
+				*ended = true;
 			}
 			WorkerEvent::Skipped(member) => seen.push(Seen::Skipped(
 				member.ordinal,
@@ -124,14 +124,14 @@ fn run(archive: &[u8], name: &str) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
 	run_with(archive, name, LIMITS)
 }
 
-fn file(ordinal: u64, path: &str, data: &[u8], integrity: Integrity) -> Seen {
+fn file(ordinal: u64, path: &str, data: &[u8]) -> Seen {
 	Seen::File {
 		ordinal,
 		path: path.to_owned(),
 		size: Some(data.len() as u64),
 		chunks: data.chunks(CHUNK_SIZE).map(<[u8]>::len).collect(),
 		data: data.to_vec(),
-		integrity: Some(integrity),
+		ended: true,
 	}
 }
 
@@ -179,7 +179,7 @@ fn sample_tar() -> Vec<u8> {
 fn sample_seen() -> Vec<Seen> {
 	vec![
 		Seen::Dir(0, "docs".into()),
-		file(1, "docs/a.txt", b"alpha", Integrity::Unverifiable),
+		file(1, "docs/a.txt", b"alpha"),
 		Seen::Skipped(
 			2,
 			"docs/link".into(),
@@ -227,7 +227,7 @@ fn a_file_is_sent_in_whole_chunks() {
 		seen,
 		[
 			Seen::Opened(StreamLayout::Tar { codec: None }),
-			file(0, "big.bin", &data, Integrity::Unverifiable),
+			file(0, "big.bin", &data),
 		]
 	);
 	let Seen::File { chunks, .. } = &seen[1] else {
@@ -270,7 +270,7 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 				size: None,
 				chunks: vec![data.len()],
 				data: data.clone(),
-				integrity: Some(Integrity::Verified),
+				ended: true,
 			},
 		]
 	);

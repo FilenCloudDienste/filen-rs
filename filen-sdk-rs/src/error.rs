@@ -178,6 +178,9 @@ pub enum ErrorKind {
 	/// An archive exceeds what the SDK allows: more entries, more decoded data per byte read, or
 	/// more decoder memory than the limits permit.
 	ArchiveTooLarge,
+	/// The worker running an archive's codec stopped responding or died. It is not retried: an
+	/// archive that crashed its codec once would crash it again.
+	ArchiveWorkerDied,
 }
 
 /// Custom error type for the SDK

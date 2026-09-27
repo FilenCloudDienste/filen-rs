@@ -99,9 +99,44 @@ pub struct ClientConfig {
 	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
 	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`.
 	thumbnail_decode_concurrency: usize,
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	/// See [`ClientConfig::with_archive_codec_mem_budget`].
+	archive_codec_mem_budget: u64,
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	/// See [`ClientConfig::with_archive_job_concurrency`].
+	archive_job_concurrency: usize,
 }
 
 impl ClientConfig {
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	/// Memory for one archive job's codec state (a decoder's dictionary or window). An archive
+	/// whose codec needs more is refused with
+	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind::ArchiveTooLarge).
+	pub fn with_archive_codec_mem_budget(mut self, archive_codec_mem_budget: u64) -> Self {
+		self.archive_codec_mem_budget = archive_codec_mem_budget;
+		self
+	}
+
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	/// How many archive jobs (extracting, compressing) run at once; later ones wait. Ignored on
+	/// wasm, where one runs at a time per page.
+	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
+		self.archive_job_concurrency = archive_job_concurrency;
+		self
+	}
+
 	pub fn with_concurrency(mut self, concurrency: usize) -> Self {
 		self.concurrency = concurrency;
 		self
@@ -212,6 +247,16 @@ impl Default for ClientConfig {
 			thumbnail_mem_budget: APP_PROCESS_MEM_BUDGET,
 			thumbnail_max_source_bytes: MAX_THUMBNAIL_SOURCE_BYTES,
 			thumbnail_decode_concurrency: 2,
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			archive_codec_mem_budget: crate::fs::archive::config::CODEC_MEM_BUDGET,
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			archive_job_concurrency: crate::fs::archive::config::JOB_CONCURRENCY,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
 				{
@@ -453,6 +498,11 @@ pub(crate) struct SharedClientState {
 	#[cfg(feature = "http-provider")]
 	file_io_memory_budget: usize,
 	thumbnails: ThumbnailConfig,
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	archives: crate::fs::archive::config::ArchiveConfig,
 }
 
 impl SharedClientState {
@@ -493,6 +543,14 @@ impl SharedClientState {
 
 		// Built before `config.log_level` is moved out below.
 		let thumbnails = ThumbnailConfig::new(&config);
+		#[cfg(any(
+			not(all(target_family = "wasm", target_os = "unknown")),
+			feature = "wasm-full"
+		))]
+		let archives = crate::fs::archive::config::ArchiveConfig::new(
+			config.archive_codec_mem_budget,
+			config.archive_job_concurrency,
+		);
 
 		// Apply this client's level to the (host- or SDK-installed) global tracing filter only if
 		// one was explicitly set. A default-config client leaves this `None` so routine client
@@ -542,6 +600,11 @@ impl SharedClientState {
 			#[cfg(feature = "http-provider")]
 			file_io_memory_budget: config.file_io_memory_budget,
 			thumbnails,
+			#[cfg(any(
+				not(all(target_family = "wasm", target_os = "unknown")),
+				feature = "wasm-full"
+			))]
+			archives,
 		})
 	}
 
@@ -551,6 +614,14 @@ impl SharedClientState {
 
 	pub(crate) fn thumbnails(&self) -> &ThumbnailConfig {
 		&self.thumbnails
+	}
+
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	pub(crate) fn archives(&self) -> &crate::fs::archive::config::ArchiveConfig {
+		&self.archives
 	}
 
 	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). Used by the
