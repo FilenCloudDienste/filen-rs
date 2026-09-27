@@ -856,3 +856,107 @@ fn an_empty_7z_entry_proves_no_password() {
 		"{seen:?}"
 	);
 }
+
+/// A zip of stored, ZipCrypto-encrypted files (no data descriptors, so each check byte is the
+/// high byte of its CRC-32), built by hand: no writer the tests have writes ZipCrypto.
+fn zip_crypto_zip(files: &[(&str, &[u8])], password: &[u8]) -> Vec<u8> {
+	use crate::fs::archive::zip::crypto::zip_crypto_encrypt;
+	let mut zip = Vec::new();
+	let mut central = Vec::new();
+	for (name, data) in files {
+		let crc = crc32fast::hash(data);
+		let stored = zip_crypto_encrypt(password, (crc >> 24) as u8, data);
+		let offset = zip.len() as u32;
+		// version needed, flags (encrypted), method (stored), time, date
+		let common = [
+			&20u16.to_le_bytes()[..],
+			&1u16.to_le_bytes(),
+			&0u16.to_le_bytes(),
+			&0u16.to_le_bytes(),
+			&0x21u16.to_le_bytes(),
+			&crc.to_le_bytes(),
+			&(stored.len() as u32).to_le_bytes(),
+			&(data.len() as u32).to_le_bytes(),
+			&(name.len() as u16).to_le_bytes(),
+			&0u16.to_le_bytes(),
+		]
+		.concat();
+		zip.extend(0x0403_4b50u32.to_le_bytes());
+		zip.extend(&common);
+		zip.extend(name.as_bytes());
+		zip.extend(&stored);
+		central.extend(0x0201_4b50u32.to_le_bytes());
+		central.extend(20u16.to_le_bytes());
+		central.extend(&common);
+		// comment length, disk, internal and external attributes, local header offset
+		central.extend([0u8; 10]);
+		central.extend(offset.to_le_bytes());
+		central.extend(name.as_bytes());
+	}
+	let central_at = zip.len() as u32;
+	let count = (files.len() as u16).to_le_bytes();
+	zip.extend(&central);
+	zip.extend(0x0605_4b50u32.to_le_bytes());
+	zip.extend([0u8; 4]);
+	zip.extend(count);
+	zip.extend(count);
+	zip.extend((central.len() as u32).to_le_bytes());
+	zip.extend(central_at.to_le_bytes());
+	zip.extend([0u8; 2]);
+	zip
+}
+
+#[test]
+fn an_empty_zip_crypto_entry_proves_no_password() {
+	use crate::fs::archive::zip::crypto::{ZipCryptoReader, zip_crypto_encrypt};
+	// the one file with data is too large to probe, so the entries themselves decide
+	let data = pattern((16 << 20) + 1, 7);
+	let zip = zip_crypto_zip(&[("empty.txt", b""), ("data.bin", &data)], b"right");
+	// a wrong password that both check bytes let through (1 in 65536)
+	let passes = |password: &[u8], data: &[u8]| {
+		let check = (crc32fast::hash(data) >> 24) as u8;
+		let header = zip_crypto_encrypt(b"right", check, &[]);
+		ZipCryptoReader::new(&header[..], password, check).is_ok()
+	};
+	let wrong = (0u32..)
+		.map(|attempt| format!("wrong{attempt}"))
+		.find(|password| passes(password.as_bytes(), b"") && passes(password.as_bytes(), &data))
+		.unwrap();
+	let (seen, end) = run_full(&zip, "crypto.zip", LIMITS, Some(&wrong));
+	assert_eq!(
+		end.map(|_| ()).map_err(|error| error.kind()),
+		Err(ErrorKind::ArchiveWrongPassword),
+		"{:?}",
+		seen.len()
+	);
+	let (_, end) = run_full(&zip, "crypto.zip", LIMITS, Some("right"));
+	end.unwrap();
+}
+
+/// A zip whose directory entry is encrypted with AES, as the `zip` crate writes one started as a
+/// file named with a trailing slash.
+fn zip_with_encrypted_dir(dir_data: &[u8]) -> Vec<u8> {
+	use zip8::{AesMode, CompressionMethod, write::SimpleFileOptions};
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let options = SimpleFileOptions::default()
+		.compression_method(CompressionMethod::Deflated)
+		.with_aes_encryption(AesMode::Aes256, "pw");
+	writer.start_file("docs/", options).unwrap();
+	writer.write_all(dir_data).unwrap();
+	writer.start_file("docs/a.txt", options).unwrap();
+	writer.write_all(b"alpha").unwrap();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn an_encrypted_directory_is_judged_by_its_length() {
+	let (seen, end) = run_full(&zip_with_encrypted_dir(b""), "aes.zip", LIMITS, Some("pw"));
+	assert_eq!(end.unwrap().unaccounted_bytes, 0, "{seen:?}");
+	let (_, end) = run_full(
+		&zip_with_encrypted_dir(b"not a directory's"),
+		"aes.zip",
+		LIMITS,
+		Some("pw"),
+	);
+	assert!(end.unwrap().unaccounted_bytes > 0);
+}

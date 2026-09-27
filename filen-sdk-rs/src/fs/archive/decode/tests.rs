@@ -358,7 +358,22 @@ fn lz4_frames() {
 	bytes.extend_from_slice(&[0; 2]);
 	assert_eq!(
 		decode(StreamCodec::Lz4, &bytes, BUDGET).unwrap(),
-		([data.clone(), small].concat(), VERIFIED)
+		(
+			[data.clone(), small].concat(),
+			StreamEnd {
+				unaccounted_bytes: 11,
+				..VERIFIED
+			}
+		)
+	);
+	// skippable frames alone hold no lz4 data
+	assert_eq!(
+		corrupt(decode(
+			StreamCodec::Lz4,
+			&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3],
+			BUDGET
+		)),
+		"not an lz4 stream"
 	);
 }
 

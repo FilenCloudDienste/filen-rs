@@ -6,7 +6,8 @@
 //! checksum, block checksums, content checksum and content size are checked when present;
 //! blocks may be linked (referring back to the previous 64 KiB of the frame's output); no block
 //! may exceed the frame's block size, at most 4 MiB, which is what the budget is charged for;
-//! skippable frames are skipped. Frames that need an external dictionary and the legacy format
+//! skippable frames are skipped, their bytes counted as unaccounted (no reader of the data sees
+//! them), and a stream of nothing else is no lz4 stream. Frames that need an external dictionary and the legacy format
 //! are refused.
 
 use std::{
@@ -31,8 +32,10 @@ pub(super) struct Lz4Decoder<R> {
 	input: Input<R>,
 	budget: Budget,
 	frame: Option<Frame>,
-	/// Frames read so far, skippable ones included.
+	/// Frames read so far, skippable ones not included.
 	frames: u64,
+	/// Bytes of skippable frames, headers included.
+	skipped: u64,
 	compressed: Vec<u8>,
 	/// The current block's decoded bytes; `block[pos..len]` are still to be handed out.
 	block: Vec<u8>,
@@ -61,6 +64,7 @@ impl<R: Read> Lz4Decoder<R> {
 			budget,
 			frame: None,
 			frames: 0,
+			skipped: 0,
 			compressed: Vec::new(),
 			block: Vec::new(),
 			pos: 0,
@@ -98,7 +102,7 @@ impl<R: Read> Lz4Decoder<R> {
 				self.input.consume(4);
 				let size = u32::from_le_bytes(self.input.read_array()?);
 				self.input.skip(u64::from(size))?;
-				self.frames += 1;
+				self.skipped = self.skipped.saturating_add(8 + u64::from(size));
 			}
 			Some(LEGACY_MAGIC) => {
 				return Err(CodecError::Unsupported("the legacy lz4 format").into());
@@ -109,7 +113,7 @@ impl<R: Read> Lz4Decoder<R> {
 			_ => {
 				self.end = Some(StreamEnd {
 					check: self.check,
-					unaccounted_bytes: self.input.drain_trailing(&[])?,
+					unaccounted_bytes: self.input.drain_trailing(&[])?.saturating_add(self.skipped),
 				});
 			}
 		}

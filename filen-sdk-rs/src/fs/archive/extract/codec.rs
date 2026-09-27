@@ -29,7 +29,7 @@ use super::{
 			StreamLayout, WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
-			crypto::CryptoError,
+			crypto::{AES_AUTH_CODE_LEN, AES_VERIFIER_LEN, CryptoError, ZIP_CRYPTO_HEADER_LEN},
 			read::{
 				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipKind, ZipLimits, open_entry,
 				read_index, unaccounted_after,
@@ -318,7 +318,12 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		port.send(WorkerEvent::Entry(head)).map_err(failure)?;
 		let encrypted = entry.encryption != ZipEncryption::None;
 		match send_file_data(port, &mut reader).map_err(zip_io_failure) {
-			Ok(_) => verified |= encrypted,
+			// an empty ZipCrypto entry matches its CRC-32 under any key; AES's authentication
+			// code rejects a wrong one even over nothing
+			Ok(_) => {
+				verified |= encrypted
+					&& (entry.size > 0 || matches!(entry.encryption, ZipEncryption::Aes { .. }))
+			}
 			// while no entry proved the password, damage in ZipCrypto data is likelier a wrong
 			// password than a damaged archive (its check byte passes 1 wrong one in 256; AES's
 			// verifier, which already passed, 1 in 65536)
@@ -580,11 +585,29 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	password: Option<&[u8]>,
 	limits: EntryLimits,
 ) -> bool {
-	entry.size == 0
-		&& zip_supported(entry)
-		&& open_entry(source, shift, entry, password, limits)
-			.and_then(|mut data| io::copy(&mut data, &mut io::sink()).map_err(ZipError::Read))
-			.is_ok_and(|read| read == 0)
+	if entry.size != 0 || !zip_supported(entry) {
+		return false;
+	}
+	// an encrypted one is judged by its length: decrypting each would cost a key derivation per
+	// directory, for directories that may never be created
+	let overhead = match entry.encryption {
+		ZipEncryption::None => {
+			return open_entry(source, shift, entry, password, limits)
+				.and_then(|mut data| io::copy(&mut data, &mut io::sink()).map_err(ZipError::Read))
+				.is_ok_and(|read| read == 0);
+		}
+		ZipEncryption::ZipCrypto { .. } => ZIP_CRYPTO_HEADER_LEN,
+		ZipEncryption::Aes { strength, .. } => {
+			strength.salt_len() as u64 + AES_VERIFIER_LEN + AES_AUTH_CODE_LEN
+		}
+	};
+	let data = entry.compressed_size.checked_sub(overhead);
+	match entry.method {
+		0 => data == Some(0),
+		// an empty deflate stream takes 2 bytes, too few for any literal and its block's end
+		8 => data.is_some_and(|data| data <= 2),
+		_ => false,
+	}
 }
 
 /// A symlink entry's target, for reporting: its data, when small and readable.
