@@ -29,7 +29,6 @@ use crate::{
 	Error, ErrorKind,
 	blocking::send_catching_panic,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
-	util::SeededSet,
 };
 
 use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
@@ -407,8 +406,10 @@ pub(crate) struct SeekInput<'p> {
 	/// The most recent chunks, most recent first.
 	cache: Vec<(u64, Vec<u8>)>,
 	slots: usize,
-	/// Every chunk fetched so far, so one fetched again counts as read once.
-	fetched: SeededSet<u64>,
+	/// One bit per chunk, set once it was fetched, so one fetched again counts as read once: 16
+	/// KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
+	/// length the archive does not have never sizes it.
+	fetched: Vec<u64>,
 }
 
 impl<'p> SeekInput<'p> {
@@ -420,7 +421,7 @@ impl<'p> SeekInput<'p> {
 			pos: 0,
 			cache: Vec::new(),
 			slots: 2,
-			fetched: SeededSet::default(),
+			fetched: Vec::new(),
 		}
 	}
 
@@ -436,7 +437,7 @@ impl<'p> SeekInput<'p> {
 			Some(at) => self.cache[..=at].rotate_right(1),
 			None => {
 				let data = self.port.fetch(self.source, index)?;
-				if self.fetched.insert(index) {
+				if self.first_fetch(index) {
 					self.port
 						.shared
 						.input_bytes
@@ -447,6 +448,19 @@ impl<'p> SeekInput<'p> {
 			}
 		}
 		Ok(&self.cache[0].1)
+	}
+
+	/// Marks chunk `index` fetched; whether it was not yet.
+	fn first_fetch(&mut self, index: u64) -> bool {
+		let word = usize::try_from(index / u64::BITS as u64)
+			.expect("an archive has fewer chunks than 64 times the address space");
+		let bit = 1 << (index % u64::BITS as u64);
+		if word >= self.fetched.len() {
+			self.fetched.resize(word + 1, 0);
+		}
+		let first = self.fetched[word] & bit == 0;
+		self.fetched[word] |= bit;
+		first
 	}
 }
 
