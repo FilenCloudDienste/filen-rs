@@ -548,18 +548,19 @@ mod uniffi_impl {
 		callback: Arc<dyn CopyItemsCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
-		managed_future
-			.into_js_managed_commander_job(move |control| async move {
-				// the foreign callbacks may block: they run on the dispatch thread, in order
-				let (sender, delivered) =
-					spawn_ordered_dispatch(move |delivery| dispatch(callback.as_ref(), delivery));
-				let result = copy_job(client, requests, config.max_bytes, sender, control).await;
-				// the job has ended and dropped its sender: this returns once everything it
-				// reported was delivered
-				let _ = delivered.await;
-				result
+		// the foreign callbacks may block: they run on the dispatch thread, in order. Waiting for
+		// them is no part of the job, so a cancel's grace never cuts off a report already made
+		let (sender, delivered) =
+			spawn_ordered_dispatch(move |delivery| dispatch(callback.as_ref(), delivery));
+		let result = managed_future
+			.into_js_managed_commander_job(move |control| {
+				copy_job(client, requests, config.max_bytes, sender, control)
 			})
-			.await
+			.await;
+		// the job has ended and dropped its sender: this returns once everything it reported
+		// was delivered
+		let _ = delivered.await;
+		result
 	}
 
 	#[uniffi::export]
