@@ -29,8 +29,8 @@ use std::{
 	sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
-use filen_types::{api::v3::dir::color::DirColor, crypto::Blake3Hash, fs::Uuid};
+use chrono::Utc;
+use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use futures::{
 	StreamExt,
 	stream::{FuturesOrdered, FuturesUnordered},
@@ -48,7 +48,8 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
 		drive_job::{
-			backend::{CreatedDir, DriveBackend, UploadSpec},
+			backend::{DriveBackend, UploadSpec},
+			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			ends_job,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
 			lock::{HeldLock, LockWait, wait_for_lock},
@@ -79,13 +80,7 @@ use super::{
 const CHUNKS_PER_FILE: usize = 4;
 
 /// A created directory with the name it got, or why it was not created.
-type DirResult = Result<(RemoteDirectory, ValidatedName), DirError>;
-
-enum DirError {
-	/// Paused or stopped before anything was sent; the create is tried again after a pause.
-	NotStarted,
-	Failed(CopyStage, Error),
-}
+type DirResult = Result<CreatedDirOutcome, DirError>;
 
 /// A downloaded chunk: its index, its plaintext, and the reservation it holds.
 type FetchedChunk = (u64, Result<Vec<u8>, Error>, ChunkReservation);
@@ -429,7 +424,7 @@ where
 		let task = DirTask {
 			backend: Arc::clone(&self.backend),
 			control: self.control.clone(),
-			reporter: MaybeArc::clone(&self.reporter),
+			ops: self.reporter.ops(),
 			targets: Arc::clone(&self.requests[dir.request].targets),
 			parent,
 			uuid: dir.dest_uuid,
@@ -449,7 +444,19 @@ where
 			.expect("a directory is only created once its parent exists");
 		let top_level = matches!(self.plan.dirs[index].parent, DestParent::Existing(_));
 		match result {
-			Ok((dir, name)) => {
+			Ok(CreatedDirOutcome {
+				dir,
+				name,
+				color_error,
+				propagation_errors,
+			}) => {
+				if let Some(error) = color_error {
+					self.reporter.event(CopyEvent::ColorFailed {
+						dest_uuid: dir.uuid(),
+						error: Arc::new(error),
+					});
+				}
+				report_propagation_errors(&self.reporter, dir.uuid(), propagation_errors);
 				if top_level {
 					let planned = &self.plan.dirs[index];
 					let renamed = renamed_top_level(
@@ -482,7 +489,8 @@ where
 			}
 			// the loop waits out the pause or the stop before creating it again
 			Err(DirError::NotStarted) => ready.push_front(index),
-			Err(DirError::Failed(stage, error)) => {
+			Err(DirError::Failed(error)) => {
+				let stage = CopyStage::CreateDirectory;
 				let error = Arc::new(error);
 				self.note_error(&error);
 				self.fail_subtree(index);
@@ -749,97 +757,6 @@ fn renamed_top_level(
 		name,
 		reason: RenameReason::DuplicateName,
 	})
-}
-
-struct DirTask<B> {
-	backend: Arc<B>,
-	control: JobControl,
-	reporter: MaybeArc<Reporter>,
-	targets: Arc<ConnectedTargets>,
-	parent: Uuid,
-	uuid: Uuid,
-	name: ValidatedName,
-	created: DateTime<Utc>,
-	color: DirColor<'static>,
-	top_level: bool,
-	/// Check the top-level name with the server before creating the directory.
-	verify_name: bool,
-}
-
-async fn create_dir<B: DriveBackend>(task: DirTask<B>) -> DirResult {
-	let DirTask {
-		backend,
-		control,
-		reporter,
-		targets,
-		parent,
-		uuid,
-		mut name,
-		created,
-		color,
-		top_level,
-		verify_name,
-	} = task;
-	let backend = &*backend;
-	let stage = CopyStage::CreateDirectory;
-	// The shared lock the job holds is normally handed out at once; a fresh acquisition (its
-	// lease was lost) can wait long. Nothing is sent before the lock is held, so a pause or stop
-	// until then leaves the create to be tried again; once held, the create runs to the end.
-	let _lock = match wait_for_lock(backend, &control, &reporter.ops()).await {
-		Ok(LockWait::Locked(held)) => held,
-		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
-		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(stage, error)),
-	};
-	let mut retry = NameRetry::new(true);
-	let mut dir = loop {
-		if verify_name {
-			name = retry
-				.free_name(backend, parent, name)
-				.await
-				.map_err(|e| DirError::Failed(stage, e))?;
-		}
-		match backend
-			.create_dir_unpropagated(parent, uuid, &name, created)
-			.await
-			.map_err(|e| DirError::Failed(stage, e))?
-		{
-			CreatedDir::Created(created) => break created,
-			// Someone created the same name at the destination after it was listed: keep both
-			// by taking the next free name.
-			CreatedDir::Merged if top_level => {
-				name = retry.next(name).map_err(|e| DirError::Failed(stage, e))?
-			}
-			CreatedDir::Merged => {
-				return Err(DirError::Failed(
-					stage,
-					Error::custom(
-						ErrorKind::InvalidState,
-						"a directory with this name already exists in the new directory",
-					),
-				));
-			}
-		}
-	};
-	if color != DirColor::Default
-		&& let Err(error) = backend.set_dir_color(&mut dir, color).await
-	{
-		reporter.event(CopyEvent::ColorFailed {
-			dest_uuid: dir.uuid(),
-			error: Arc::new(error),
-		});
-	}
-	if !targets.is_empty() {
-		for error in backend
-			.propagate(&targets, NonRootItemType::Dir(Cow::Borrowed(&dir)))
-			.await
-		{
-			reporter.event(CopyEvent::PropagationFailed {
-				dest_uuid: dir.uuid(),
-				error: Arc::new(error),
-			});
-		}
-	}
-	Ok((dir, name))
 }
 
 struct FileTask<B> {

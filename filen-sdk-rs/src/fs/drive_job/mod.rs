@@ -3,6 +3,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod counts;
+pub(crate) mod dir;
 pub(crate) mod finalize;
 pub(crate) mod lock;
 pub(crate) mod name_retry;

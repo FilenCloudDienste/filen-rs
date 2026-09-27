@@ -7,7 +7,10 @@ use std::{
 	time::Duration,
 };
 
-use filen_types::{crypto::EncryptedString, error::ResponseError, fs::StableUuid};
+use chrono::DateTime;
+use filen_types::{
+	api::v3::dir::color::DirColor, crypto::EncryptedString, error::ResponseError, fs::StableUuid,
+};
 use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
@@ -20,7 +23,7 @@ use crate::{
 			report::{CopyCallback, CopyUpdate, RunState},
 		},
 		dir::{RootDirectory, meta::DecryptedDirectoryMeta},
-		drive_job::name_retry::TOP_LEVEL_NAME_ATTEMPTS,
+		drive_job::{backend::CreatedDir, name_retry::TOP_LEVEL_NAME_ATTEMPTS},
 		file::{
 			AnonymousRemoteFile,
 			enums::RemoteFileType,
