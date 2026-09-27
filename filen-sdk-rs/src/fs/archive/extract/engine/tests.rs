@@ -38,7 +38,7 @@ use crate::{
 		drive_job::{
 			backend::ListedNames,
 			counts::ItemCounts,
-			test_support::{FakeBackend, wait_until},
+			test_support::{FakeBackend, Request, wait_until},
 		},
 		file::{
 			AnonymousRemoteFile, RemoteFile,
@@ -1459,14 +1459,14 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 		!setup.backend.log().finished.is_empty()
 	})
 	.await;
-	let first: HashSet<Uuid> = setup.backend.log().finished.keys().copied().collect();
-	setup.backend.held.send_replace(first);
+	let first: Vec<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.hold_requests(Request::State, first);
 	wait_until("the output is checked", || {
 		!setup.backend.log().held.is_empty()
 	})
 	.await;
 	pause.send_replace(true);
-	setup.backend.held.send_replace(HashSet::new());
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert_paused_holding_nothing(&setup, &job, &config);
 	assert!(
@@ -2487,8 +2487,8 @@ async fn a_pause_while_finishing_gives_back_the_input_and_the_lock() {
 	})
 	.await;
 	// the first batch propagated waits
-	let registered: HashSet<Uuid> = setup.backend.log().finished.keys().copied().collect();
-	setup.backend.held.send_replace(registered);
+	let registered: Vec<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.hold_requests(Request::Propagate, registered);
 	drop(events);
 	let _ = result.send(read_in_full());
 	wait_until("the first batch propagates", || {
@@ -2496,7 +2496,7 @@ async fn a_pause_while_finishing_gives_back_the_input_and_the_lock() {
 	})
 	.await;
 	pause.send_replace(true);
-	setup.backend.held.send_replace(HashSet::new());
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert_paused_holding_nothing(&setup, &job, &config);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Finishing);

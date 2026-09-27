@@ -42,7 +42,7 @@ use crate::{
 		dir::RootDirectory,
 		drive_job::{
 			backend::ListedNames,
-			test_support::{FakeBackend, wait_until},
+			test_support::{FakeBackend, Request, wait_until},
 		},
 		file::{
 			AnonymousRemoteFile, RemoteFile,
@@ -60,20 +60,27 @@ struct Recorder {
 	memory: Option<Arc<Semaphore>>,
 	/// The budget's free permits at each update reading paused.
 	free_when_paused: Mutex<Vec<usize>>,
-	/// What to hold in this drive once the archive is registered, the sources having been
-	/// read: these items, and the archive's own chunks if asked.
-	hold_when_created: Option<(Arc<FakeBackend>, Vec<Uuid>, bool)>,
+	/// What to hold once the archive is registered, the sources having been read.
+	hold_when_created: Option<HoldWhenCreated>,
+}
+
+/// Requests a [`Recorder`] holds in a drive once the archive is registered.
+struct HoldWhenCreated {
+	backend: Arc<FakeBackend>,
+	requests: Vec<(Request, Uuid)>,
+	/// Fetching the archive's own chunks too.
+	archive_fetches: bool,
 }
 
 impl CompressCallback for Recorder {
 	fn on_archive_created(&self, archive: RemoteFile) {
-		if let Some((backend, items, and_archive)) = &self.hold_when_created {
-			backend.held.send_modify(|held| {
-				held.extend(items);
-				if *and_archive {
-					held.insert(archive.uuid());
-				}
-			});
+		if let Some(hold) = &self.hold_when_created {
+			for &(request, uuid) in &hold.requests {
+				hold.backend.hold_requests(request, [uuid]);
+			}
+			if hold.archive_fetches {
+				hold.backend.hold_requests(Request::Fetch, [archive.uuid()]);
+			}
 		}
 		self.created.lock().unwrap().push(archive);
 	}
@@ -151,8 +158,8 @@ struct Setup {
 	password: Option<ArchivePassword>,
 	/// Reading the archive back waits from its first chunk until the test releases it.
 	hold_archive: bool,
-	/// Items held once the archive is registered (a source's fetches are never held).
-	hold_after_registering: Vec<Uuid>,
+	/// Requests held once the archive is registered (a source's fetches are never held).
+	hold_after_registering: Vec<(Request, Uuid)>,
 }
 
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
@@ -241,11 +248,11 @@ fn start_disposing(
 ) -> Job {
 	let recorder = Arc::new(Recorder {
 		memory: Some(Arc::clone(&setup.backend.memory)),
-		hold_when_created: Some((
-			Arc::clone(&setup.backend),
-			setup.hold_after_registering.clone(),
-			setup.hold_archive,
-		)),
+		hold_when_created: Some(HoldWhenCreated {
+			backend: Arc::clone(&setup.backend),
+			requests: setup.hold_after_registering.clone(),
+			archive_fetches: setup.hold_archive,
+		}),
 		..Recorder::default()
 	});
 	let reporter = Reporter::new(Arc::clone(&recorder));
@@ -1283,23 +1290,17 @@ fn told(recorder: &Recorder) -> Vec<SourceDisposition> {
 		.collect()
 }
 
-fn hold(setup: &Setup, uuid: Uuid) {
-	setup.backend.held.send_modify(|held| {
-		held.insert(uuid);
-	});
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_dropped_past_its_cancel_grace_has_told_of_what_it_removed() {
 	let mut setup = setup(|_, _| {});
 	let placed = place(&setup);
 	let top = setup.sources[2].1.uuid();
 	// the folder goes first; the top file's deletion is sent and never answered
-	setup.hold_after_registering.push(top);
+	setup.hold_after_registering.push((Request::Delete, top));
 	let (_pause, cancel, control) = controls();
 	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
 	wait_until("the top file's deletion is sent", || {
-		setup.backend.log().held.contains(&top)
+		setup.backend.log().held.contains(&(Request::Delete, top))
 	})
 	.await;
 	cancel.send_replace(true);
@@ -1328,11 +1329,15 @@ async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
 	let placed = place(&setup);
 	// the top file goes first; the folder's listing never answers
 	let targets = targets(&setup, &placed).into_iter().rev().collect();
-	hold(&setup, placed.docs);
+	setup.backend.hold_requests(Request::List, [placed.docs]);
 	let (_pause, cancel, control) = controls();
 	let job = run_permanent_disposal(&setup, targets, control);
 	wait_until("the folder is being listed", || {
-		setup.backend.log().held.contains(&placed.docs)
+		setup
+			.backend
+			.log()
+			.held
+			.contains(&(Request::List, placed.docs))
 	})
 	.await;
 	cancel.send_replace(true);
@@ -1385,15 +1390,21 @@ async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
 		.min_by_key(|(_, file)| file.uuid())
 		.unwrap();
 	let first = first.clone();
-	setup.hold_after_registering.push(first.uuid());
+	setup
+		.hold_after_registering
+		.push((Request::Delete, first.uuid()));
 	let (_pause, cancel, control) = controls();
 	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
 	wait_until("the first file's deletion is sent", || {
-		setup.backend.log().held.contains(&first.uuid())
+		setup
+			.backend
+			.log()
+			.held
+			.contains(&(Request::Delete, first.uuid()))
 	})
 	.await;
 	cancel.send_replace(true);
-	setup.backend.held.send_modify(|held| held.clear());
+	setup.backend.release_all();
 	let report = job.running.await.unwrap().unwrap();
 	let outcomes = outcomes(&report);
 	assert!(
@@ -1812,7 +1823,7 @@ async fn held_at_the_read_back(setup: &mut Setup, control: JobControl) -> (Job, 
 		!setup.backend.log().held.is_empty()
 	})
 	.await;
-	let archive = setup.backend.log().held[0];
+	let (_, archive) = setup.backend.log().held[0];
 	assert_eq!(job.recorder.last().phase, CompressPhase::Verifying);
 	(job, archive)
 }
@@ -1841,7 +1852,7 @@ async fn a_cancel_while_reading_the_archive_back_keeps_the_sources() {
 		.unwrap();
 	all_kept_for(&report, |reason| matches!(reason, KeptReason::Interrupted));
 	assert_eq!(told(&job.recorder).len(), 2);
-	setup.backend.held.send_modify(|held| held.clear());
+	setup.backend.release_all();
 	assert_eq!(
 		archive_fetches(&setup, archive),
 		0,
@@ -1863,7 +1874,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	let (job, archive) = held_at_the_read_back(&mut setup, control).await;
 	pause.send_replace(true);
 	// the fetch in flight finishes; the pause is seen when the reader asks again
-	setup.backend.held.send_modify(|held| held.clear());
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	let last = job.recorder.last();
 	assert_eq!(

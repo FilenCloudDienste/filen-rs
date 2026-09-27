@@ -120,8 +120,23 @@ pub(crate) struct FakeLog {
 	pub(crate) lock_waits: usize,
 	/// Slow registrations that have started.
 	pub(crate) finishing: Vec<String>,
-	/// Items a request about which waited in [`FakeBackend::held`].
-	pub(crate) held: Vec<Uuid>,
+	/// Requests that waited while held ([`FakeBackend::hold_requests`]), in the order they came.
+	pub(crate) held: Vec<(Request, Uuid)>,
+}
+
+/// A request to a [`FakeBackend`] that a test can hold, to stop a job at that step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Request {
+	/// Fetching one of a file's chunks.
+	Fetch,
+	/// Asking for a file's state.
+	State,
+	/// Listing a directory's tree.
+	List,
+	/// Deleting a file permanently.
+	Delete,
+	/// Propagating an item's tree to the destination's shares and links.
+	Propagate,
 }
 
 pub(crate) struct FakeUpload {
@@ -161,10 +176,10 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
-	/// Items whose requests wait while they are in the set, each wait logged in
-	/// [`FakeLog::held`]: a directory's listing, a file's fetches, state and permanent deletion,
-	/// and propagating either.
-	pub(crate) held: watch::Sender<HashSet<Uuid>>,
+	/// Requests about an item that wait while they are in the set, each wait logged in
+	/// [`FakeLog::held`]. Held by kind as well as item, as one job sends several kinds about
+	/// the same item and a test means to stop it at one of them.
+	held: watch::Sender<HashSet<(Request, Uuid)>>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
 	/// Lowercased names the destination holds without the listing having shown them.
@@ -248,15 +263,27 @@ impl FakeBackend {
 		tokio::time::sleep(*self.slow.get(name).unwrap_or(&self.delay)).await;
 	}
 
-	/// Waits while `uuid` is held.
-	async fn hold(&self, uuid: Uuid) {
-		if self.held.borrow().contains(&uuid) {
-			self.log().held.push(uuid);
+	/// Holds each `request` about any of `items` until [`Self::release_all`].
+	pub(crate) fn hold_requests(&self, request: Request, items: impl IntoIterator<Item = Uuid>) {
+		self.held
+			.send_modify(|held| held.extend(items.into_iter().map(|uuid| (request, uuid))));
+	}
+
+	/// Lets every held request go on, and holds none from now on.
+	pub(crate) fn release_all(&self) {
+		self.held.send_replace(HashSet::new());
+	}
+
+	/// Waits while `request` about `uuid` is held.
+	async fn hold(&self, request: Request, uuid: Uuid) {
+		let key = (request, uuid);
+		if self.held.borrow().contains(&key) {
+			self.log().held.push(key);
 			// the sender lives in `self`, which outlives this wait
 			let _ = self
 				.held
 				.subscribe()
-				.wait_for(|held| !held.contains(&uuid))
+				.wait_for(|held| !held.contains(&key))
 				.await;
 		}
 	}
@@ -387,7 +414,7 @@ impl DriveBackend for FakeBackend {
 		_targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
 	) -> Vec<Error> {
-		self.hold(item.uuid()).await;
+		self.hold(Request::Propagate, item.uuid()).await;
 		self.log().propagated_trees.push(item.uuid());
 		Vec::new()
 	}
@@ -401,7 +428,7 @@ impl DriveBackend for FakeBackend {
 		file: &RemoteFileType<'static>,
 		index: u64,
 	) -> Result<Vec<u8>, Error> {
-		self.hold(file.uuid()).await;
+		self.hold(Request::Fetch, file.uuid()).await;
 		let name = file.name().unwrap_or_default().to_owned();
 		if self.reverse_chunks {
 			tokio::time::sleep(Duration::from_millis(10 * (file.chunks() - index))).await;
@@ -587,7 +614,7 @@ mod disposal {
 
 	impl DisposalBackend for FakeBackend {
 		async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
-			self.hold(uuid).await;
+			self.hold(Request::State, uuid).await;
 			tokio::time::sleep(self.delay).await;
 			let log = self.log();
 			match log.file_parents.get(&uuid) {
@@ -606,7 +633,7 @@ mod disposal {
 		}
 
 		async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
-			self.hold(dir).await;
+			self.hold(Request::List, dir).await;
 			tokio::time::sleep(self.delay).await;
 			let log = self.log();
 			let mut tree = Tree::default();
@@ -634,7 +661,7 @@ mod disposal {
 		}
 
 		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
-			self.hold(uuid).await;
+			self.hold(Request::Delete, uuid).await;
 			if self.fail_deletes_of.contains(&uuid) {
 				return Err(Error::custom(ErrorKind::Server, "delete failed"));
 			}
