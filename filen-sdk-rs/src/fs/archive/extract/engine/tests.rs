@@ -906,7 +906,10 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 		}
 	);
 	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
-	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	let last = job.recorder.last();
+	assert_eq!(last.phase, ExtractPhase::Failed);
+	// what the job did not read it never will: no time is left
+	assert_eq!(last.eta, Some(Duration::ZERO));
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
@@ -1124,7 +1127,9 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 			..ItemCounts::default()
 		}
 	);
-	assert_eq!(job.recorder.last().phase, ExtractPhase::Cancelled);
+	let last = job.recorder.last();
+	assert_eq!(last.phase, ExtractPhase::Cancelled);
+	assert_eq!(last.eta, Some(Duration::ZERO));
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
