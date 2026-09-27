@@ -65,6 +65,13 @@ pub struct CompressItemsConfig {
 
 #[uniffi::export]
 impl JsClient {
+	/// The memory for one archive job's codec state in effect, in bytes (see
+	/// `JsClientConfig.archive_codec_mem_budget`): pass it to `archive_max_level`, or compare
+	/// `archive_encoder_memory` with it, to offer only what this device runs.
+	pub fn archive_codec_mem_budget(&self) -> u64 {
+		self.inner_ref().archive_config().codec_mem_budget
+	}
+
 	/// Extracts `archive` (zip, 7z, tar and its compressed forms, or one compressed file)
 	/// into `destination`, entirely on this device: the archive is downloaded, decrypted and
 	/// decoded as a stream, and every entry uploaded as a new item. A name taken at the

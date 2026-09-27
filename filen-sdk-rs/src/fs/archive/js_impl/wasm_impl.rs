@@ -132,6 +132,14 @@ async fn run_compress(
 
 #[wasm_bindgen(js_class = "Client")]
 impl JsClient {
+	/// The memory for one archive job's codec state in effect, in bytes (see
+	/// `JsClientConfig.archiveCodecMemBudget`): pass it to `archiveMaxLevel`, or compare
+	/// `archiveEncoderMemory` with it, to offer only what this device runs.
+	#[wasm_bindgen(js_name = "archiveCodecMemBudget")]
+	pub fn archive_codec_mem_budget(&self) -> u64 {
+		self.inner_ref().archive_config().codec_mem_budget
+	}
+
 	/// Extracts an archive (zip, 7z, tar and its compressed forms, or one compressed file)
 	/// into a directory, entirely in this browser: the archive is downloaded, decrypted and
 	/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
