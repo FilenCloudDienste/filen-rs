@@ -63,6 +63,8 @@ impl Drop for FakeLock {
 pub(crate) struct FakeLog {
 	pub(crate) fetched: Vec<(Uuid, u64)>,
 	pub(crate) uploaded: Vec<(Uuid, u64)>,
+	/// The bytes of each uploaded chunk, when [`FakeBackend::keep_uploads`] is set.
+	pub(crate) uploaded_data: HashMap<(Uuid, u64), Vec<u8>>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
 	pub(crate) out_of_order_dirs: Vec<String>,
@@ -125,6 +127,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) listed: ListedNames,
 	/// Files whose chunks are these bytes instead of [`chunk_data`].
 	pub(crate) contents: HashMap<Uuid, Vec<u8>>,
+	/// Keep every uploaded chunk's bytes in [`FakeLog::uploaded_data`].
+	pub(crate) keep_uploads: bool,
 }
 
 /// Chunks of memory a [`FakeBackend`] has unless a test asks for [`FakeBackend::with_memory`].
@@ -163,6 +167,7 @@ impl FakeBackend {
 			block_locks_from: watch::Sender::new(None),
 			listed: ListedNames::default(),
 			contents: HashMap::new(),
+			keep_uploads: false,
 		}
 	}
 
@@ -355,7 +360,11 @@ impl DriveBackend for FakeBackend {
 			return Err(Error::custom(*kind, "upload failed"));
 		}
 		assert!(data.len() <= CHUNK_SIZE);
-		self.log().uploaded.push((upload.spec.uuid, index));
+		let mut log = self.log();
+		log.uploaded.push((upload.spec.uuid, index));
+		if self.keep_uploads {
+			log.uploaded_data.insert((upload.spec.uuid, index), data);
+		}
 		Ok(RemoteFileInfo::default())
 	}
 

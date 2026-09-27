@@ -28,7 +28,6 @@ use std::{
 	collections::{HashMap, VecDeque},
 	io,
 	sync::Arc,
-	time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -49,7 +48,10 @@ use crate::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			format::archive_default_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
-			worker::{EntryHead, EntryKind, SkippedMember, StreamLayout, WorkerEvent, WorkerLink},
+			worker::{
+				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, SkippedMember, StreamLayout,
+				WorkerEvent, WorkerLink,
+			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
@@ -68,7 +70,7 @@ use crate::{
 		},
 		name::{
 			ValidatedName,
-			keep_both::{SourceName, TakenNames},
+			keep_both::{NameShape, SourceName, TakenNames},
 		},
 	},
 	job::{JobControl, Stopped, report::OpGuard},
@@ -90,11 +92,6 @@ const CHUNKS_PER_FILE: usize = 4;
 
 /// Chunks of the archive fetched ahead of the codec, memory permitting.
 const PREFETCH_CHUNKS: usize = 4;
-
-/// How long the codec may go without taking input or handing over an event, while the driver
-/// owes it nothing, before it is given up on as dead. Far above any single step a healthy codec
-/// takes between two exchanges; all it has to buy is turning a hang into an error.
-pub(crate) const ARCHIVE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What the codec returns.
 pub(crate) type CodecResult = Result<ArchiveEnd, Error>;
@@ -668,7 +665,11 @@ impl<B: DriveBackend> Driver<B> {
 
 	async fn on_event(&mut self, event: WorkerEvent) -> Result<(), Stopped> {
 		match event {
-			WorkerEvent::Ask { index, reply } => {
+			WorkerEvent::Ask {
+				source: _,
+				index,
+				reply,
+			} => {
 				// asking for the next chunk means the codec is done with the one before
 				self.reading = None;
 				debug_assert_eq!(index, self.served, "the codec reads the archive in order");
@@ -720,7 +721,7 @@ impl<B: DriveBackend> Driver<B> {
 					None => self.default_folder_name(),
 				};
 				let mut taken = TakenNames::new(listed.names.iter().map(String::as_str));
-				let name = match taken.allocate(wanted, true) {
+				let name = match taken.allocate(wanted, NameShape::Dir) {
 					Ok(name) => name,
 					Err(error) => {
 						self.stop_with(error.into());
@@ -1341,7 +1342,7 @@ impl<B: DriveBackend> Driver<B> {
 		let ops = self.reporter.ops();
 		let targets = Arc::clone(&self.targets);
 		self.finalizes.push(Box::pin(async move {
-			let mut retry = NameRetry::new(false);
+			let mut retry = NameRetry::new(NameShape::File);
 			let result = finalize_new_file(FinalizeTask {
 				backend: &*backend,
 				control: &control,

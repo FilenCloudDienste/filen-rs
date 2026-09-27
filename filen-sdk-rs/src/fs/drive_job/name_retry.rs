@@ -4,7 +4,10 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	Error, ErrorKind,
-	fs::name::{ValidatedName, keep_both::TakenNames},
+	fs::name::{
+		ValidatedName,
+		keep_both::{NameShape, TakenNames},
+	},
 };
 
 use super::backend::DriveBackend;
@@ -19,15 +22,15 @@ pub(crate) const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
 pub(crate) struct NameRetry {
 	taken: TakenNames,
 	attempts: usize,
-	is_dir: bool,
+	shape: NameShape,
 }
 
 impl NameRetry {
-	pub(crate) fn new(is_dir: bool) -> Self {
+	pub(crate) fn new(shape: NameShape) -> Self {
 		Self {
 			taken: TakenNames::default(),
 			attempts: 0,
-			is_dir,
+			shape,
 		}
 	}
 
@@ -42,7 +45,7 @@ impl NameRetry {
 			));
 		}
 		self.taken.insert(taken_name.as_ref());
-		Ok(self.taken.allocate(taken_name, self.is_dir)?)
+		Ok(self.taken.allocate(taken_name, self.shape)?)
 	}
 
 	/// `name`, or the first following keep-both name the server reports free in `parent`.

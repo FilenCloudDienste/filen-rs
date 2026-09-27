@@ -24,6 +24,7 @@ wasm-full = [
 	"dep:twox-hash",
 	"dep:brotli-decompressor",
 	"dep:crc32fast",
+	"dep:brotli",
 ]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
@@ -219,17 +220,21 @@ lzma-rust2 = { version = "0.21", default-features = false, features = [
 	"std",
 	"optimization",
 	"lzip",
+	"encoder",
+	"xz",
 ] }
 lz4_flex = { version = "0.14", default-features = false, features = [
 	"std",
 	"safe-decode",
 	"safe-encode",
+	"frame",
 ] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
 brotli-decompressor = { version = "6", default-features = false, features = [
 	"std",
 ] }
 crc32fast = "1.5"
+brotli = { version = "9", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -283,11 +288,14 @@ lzma-rust2 = { version = "0.21", default-features = false, features = [
 	"std",
 	"optimization",
 	"lzip",
+	"encoder",
+	"xz",
 ], optional = true }
 lz4_flex = { version = "0.14", default-features = false, features = [
 	"std",
 	"safe-decode",
 	"safe-encode",
+	"frame",
 ], optional = true }
 twox-hash = { version = "2", default-features = false, features = [
 	"xxhash32",
@@ -296,6 +304,9 @@ brotli-decompressor = { version = "6", default-features = false, features = [
 	"std",
 ], optional = true }
 crc32fast = { version = "1.5", optional = true }
+brotli = { version = "9", default-features = false, features = [
+	"std",
+], optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
@@ -344,7 +355,6 @@ lz4_flex = { version = "0.14", default-features = false, features = [
 	"std",
 	"frame",
 ] }
-brotli = { version = "9", default-features = false, features = ["std"] }
 
 # wasm only dev-dependencies
 [target.'cfg(all(target_family="wasm", target_os= "unknown"))'.dev-dependencies]

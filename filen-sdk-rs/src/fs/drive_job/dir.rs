@@ -9,6 +9,7 @@ use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
 use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
+	fs::name::keep_both::NameShape,
 	fs::{categories::NonRootItemType, dir::RemoteDirectory, name::ValidatedName},
 	job::{JobControl, Stopped, report::Ops},
 };
@@ -79,7 +80,7 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
 		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(error)),
 	};
-	let mut retry = NameRetry::new(true);
+	let mut retry = NameRetry::new(NameShape::Dir);
 	let mut dir = loop {
 		if verify_name {
 			name = retry

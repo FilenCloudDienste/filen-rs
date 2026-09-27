@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use crate::fs::name::{
 	EntryNameError, ValidatedName,
-	keep_both::{TakenNames, collision_key},
+	keep_both::{NameShape, TakenNames, collision_key},
 };
 
 /// A directory the resolver planned; the root (the directory entries land in) is [`ROOT`].
@@ -67,7 +67,9 @@ impl PathResolver {
 				current = child;
 				continue;
 			}
-			let name = self.dirs[current].taken.allocate(segment.clone(), true)?;
+			let name = self.dirs[current]
+				.taken
+				.allocate(segment.clone(), NameShape::Dir)?;
 			let id = self.dirs.len();
 			self.dirs.push(Node {
 				taken: TakenNames::default(),
@@ -91,7 +93,7 @@ impl PathResolver {
 		dir: DirId,
 		name: ValidatedName,
 	) -> Result<ValidatedName, EntryNameError> {
-		self.dirs[dir].taken.allocate(name, false)
+		self.dirs[dir].taken.allocate(name, NameShape::File)
 	}
 }
 

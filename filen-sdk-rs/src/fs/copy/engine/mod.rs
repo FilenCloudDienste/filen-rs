@@ -43,6 +43,7 @@ use crate::{
 	consts::{
 		CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA, MAX_SMALL_PARALLEL_REQUESTS,
 	},
+	fs::name::keep_both::NameShape,
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -871,7 +872,7 @@ async fn copy_file_inner<B: DriveBackend>(
 	// A stored count may include a chunk without data (one for an empty file, or a trailing
 	// empty chunk); only the chunks holding data are copied.
 	let chunks = size.div_ceil(CHUNK_SIZE_U64);
-	let mut retry = NameRetry::new(false);
+	let mut retry = NameRetry::new(NameShape::File);
 	let mut name = file.name;
 	if verify_name {
 		name = retry

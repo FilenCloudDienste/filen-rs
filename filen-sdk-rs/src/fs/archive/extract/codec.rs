@@ -57,7 +57,7 @@ pub(crate) struct ArchiveEnd {
 /// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
 /// [`ErrorKind::IO`]; the driver knows the real one.
 pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut input = ChunkInput::new(port, job.len);
+	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
 	let head_len = read_full(&mut input, &mut head).map_err(failure)?;
 	let head = &head[..head_len];
