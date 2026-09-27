@@ -34,7 +34,10 @@ use crate::{
 			encode::Compression,
 			format::StreamCodec,
 			password::ArchivePassword,
-			sevenz::write::{SevenZEncryption, SevenZMethod},
+			sevenz::{
+				read::{FolderCursor, Keys, SevenZLimits, read_index},
+				write::{SevenZEncryption, SevenZMethod},
+			},
 			tar_iter::TarReader,
 			worker,
 			zip::{crypto::AesStrength, write::ZipMethod},
@@ -42,6 +45,7 @@ use crate::{
 		dir::RootDirectory,
 		drive_job::{
 			backend::ListedNames,
+			plan::{PlanTotals, SkipReason, SkippedEntry},
 			test_support::{FakeBackend, Request, wait_until},
 		},
 		file::{
@@ -809,10 +813,10 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	// an entry that was skipped while planning
 	let setup_skipped = setup(|_, _| {});
 	let skipped = CompressReport {
-		skipped: vec![crate::fs::drive_job::plan::SkippedEntry {
+		skipped: vec![SkippedEntry {
 			source_path: "docs/secret".into(),
 			bytes: 1,
-			reason: crate::fs::drive_job::plan::SkipReason::UndecryptableFile {
+			reason: SkipReason::UndecryptableFile {
 				uuid: Uuid::new_v4(),
 			},
 		}],
@@ -842,7 +846,6 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 
 /// The entries of a 7z read back through the SDK's reader, every CRC-32 checked.
 fn sevenz_entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
-	use crate::fs::archive::sevenz::read::{FolderCursor, Keys, SevenZLimits, read_index};
 	let limits = SevenZLimits {
 		max_index_bytes: 1 << 20,
 		max_entries: 100,
@@ -1890,7 +1893,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	);
 	// the plan's totals, which the engine is handed with its report
 	let sources: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
-	let totals = crate::fs::drive_job::plan::PlanTotals {
+	let totals = PlanTotals {
 		dirs: 1,
 		files: 3,
 		bytes: sources,

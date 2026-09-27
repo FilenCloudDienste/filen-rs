@@ -280,7 +280,10 @@ mod tests {
 	use std::io::Read;
 
 	use super::*;
-	use crate::fs::archive::decode::{StreamCheck, open_stream};
+	use crate::fs::archive::{
+		alloc_meter::peak_bytes,
+		decode::{StreamCheck, open_stream},
+	};
 
 	const CODECS: [StreamCodec; 8] = [
 		StreamCodec::Gzip,
@@ -404,7 +407,7 @@ mod tests {
 		for &level in levels {
 			let compression = Compression { codec, level };
 			let stated = compression.encoder_memory().unwrap();
-			let (_, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+			let (_, peak) = peak_bytes(|| {
 				let mut encoder = open_encoder(compression, io::sink()).unwrap();
 				encoder.write_all(&input).unwrap();
 				encoder.finish().unwrap();
@@ -461,7 +464,7 @@ mod tests {
 				(state >> 24) as u8
 			})
 			.collect();
-		let ((), peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		let ((), peak) = peak_bytes(|| {
 			let mut encoder = open_encoder(compression, io::sink()).unwrap();
 			encoder.write_all(&noise).unwrap();
 			encoder.finish().unwrap();

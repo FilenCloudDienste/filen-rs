@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+	auth::Client,
 	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
 	job::{JobControl, Stopped, report::Ops},
 };
@@ -78,6 +79,13 @@ pub struct ArchiveConfig {
 	gate: Arc<Semaphore>,
 	/// [`FLOOR_CHUNKS`] chunks per concurrent job.
 	floor: Arc<Semaphore>,
+}
+
+impl Client {
+	/// The archive settings in effect (after clamping): codec memory, jobs at once, limits.
+	pub fn archive_config(&self) -> &ArchiveConfig {
+		self.client().state().archives()
+	}
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

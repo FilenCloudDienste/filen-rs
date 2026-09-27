@@ -430,10 +430,13 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		consts::CHUNK_SIZE_U64,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 		fs::{
-			archive::compress::{CompressUpdate, report::CompressCallback},
-			dir::RemoteDirectory,
+			archive::compress::{
+				CompressUpdate, Compression, StreamCodec, report::CompressCallback,
+			},
+			dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 			drive_job::plan::{Listed, SourceDir},
 			file::{
 				AnonymousRemoteFile, RemoteFile,
@@ -447,7 +450,7 @@ mod tests {
 	struct Ignore;
 
 	impl CompressCallback for Ignore {
-		fn on_archive_created(&self, _: crate::fs::file::RemoteFile) {}
+		fn on_archive_created(&self, _: RemoteFile) {}
 		fn on_update(&self, _: CompressUpdate) {}
 	}
 
@@ -485,7 +488,7 @@ mod tests {
 			(),
 			Uuid::new_v4().into(),
 			size,
-			size.div_ceil(crate::consts::CHUNK_SIZE_U64),
+			size.div_ceil(CHUNK_SIZE_U64),
 			"de-1",
 			"bucket",
 			chrono::Utc::now(),
@@ -588,8 +591,8 @@ mod tests {
 			archive_entries(
 				plan(),
 				CompressFormat::Single {
-					compression: crate::fs::archive::compress::Compression {
-						codec: crate::fs::archive::format::StreamCodec::Gzip,
+					compression: Compression {
+						codec: StreamCodec::Gzip,
 						level: None,
 					},
 				},
@@ -707,7 +710,7 @@ mod tests {
 		};
 		let photos_dir = RemoteDirectory::new_from_parts(
 			photos.source_uuid,
-			crate::fs::dir::meta::DecryptedDirectoryMeta {
+			DecryptedDirectoryMeta {
 				name: Cow::Borrowed("Photos"),
 				created: None,
 			},
