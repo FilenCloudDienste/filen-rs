@@ -7,7 +7,9 @@
 //! for one input and one output chunk, more only from the client's budget when it is free right
 //! now, and a pause that gives back the floor, the prefetched chunks and every reservation from
 //! the client's budget once in-flight work is done. A paused job keeps its codec's state and the
-//! source chunk the codec is reading resident.
+//! source chunk the codec is reading resident. Once the codec is done the floor is given back;
+//! reading the archive back before a permanent disposal takes it again, and pauses the same way
+//! (see [`read_back`](super::read_back)).
 
 use std::{
 	collections::{BTreeSet, VecDeque},
@@ -331,6 +333,9 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		if driver.fatal.is_some() {
 			return Err(Stopped);
 		}
+		// the codec is done: registering and removing the sources hold no memory floor, and
+		// reading the archive back takes its own
+		driver.floor = None;
 		driver.reporter.set_phase(CompressPhase::Finishing);
 		// the destination may have been shared or linked since the job started
 		let refetched = driver

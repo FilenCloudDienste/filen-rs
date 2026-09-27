@@ -71,6 +71,9 @@ pub struct CompressCounts {
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
 	pub bytes_done: u64,
+	/// Bytes of the archive read back to check it before the sources are deleted for good (see
+	/// [`CompressPhase::Verifying`]); up to `bytes_done`, and 0 when nothing is read back.
+	pub bytes_verified: u64,
 }
 
 /// The source file being read into the archive right now, shaped like the copy and extract
@@ -184,6 +187,8 @@ pub(crate) struct CompressState {
 	totals: PlanTotals,
 	counts: CompressCounts,
 	active: Option<CompressActiveFile>,
+	/// Bytes of the archive to read back, once reading it back started.
+	verify_total: u64,
 	/// The job ended: whatever it did not read, it never will.
 	ended: bool,
 }
@@ -198,16 +203,15 @@ impl JobState for CompressState {
 	}
 
 	fn progress(&self) -> Progress {
+		// the sources read, then the archive read back if it is
+		let done = self.counts.bytes_read + self.counts.bytes_verified;
+		let total = self.totals.bytes + self.verify_total;
 		Progress {
-			bytes_done: self.counts.bytes_read,
+			bytes_done: done,
 			units: Units {
-				done: self.counts.bytes_read,
-				settled: if self.ended {
-					self.totals.bytes
-				} else {
-					self.counts.bytes_read
-				},
-				total: self.totals.bytes,
+				done,
+				settled: if self.ended { total } else { done },
+				total,
 			},
 		}
 	}
@@ -248,6 +252,7 @@ impl Reporter {
 				totals: PlanTotals::default(),
 				counts: CompressCounts::default(),
 				active: None,
+				verify_total: 0,
 				ended: false,
 			},
 			Box::new(callback),
@@ -311,6 +316,21 @@ impl Reporter {
 		self.with_state(|state| {
 			state.counts.files_done += 1;
 			state.active = None;
+			state.core.mark_changed();
+		});
+	}
+
+	/// Reading the `len` bytes of the archive back started.
+	pub(crate) fn verifying(&self, len: u64) {
+		self.with_state(|state| {
+			state.verify_total = len;
+			state.core.mark_changed();
+		});
+	}
+
+	pub(crate) fn archive_verified(&self, bytes: u64) {
+		self.with_state(|state| {
+			state.counts.bytes_verified += bytes;
 			state.core.mark_changed();
 		});
 	}

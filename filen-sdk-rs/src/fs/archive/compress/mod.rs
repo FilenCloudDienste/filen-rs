@@ -47,8 +47,9 @@ pub enum CompressSources {
 	/// are kept and the report says why. The archive cannot be written into one of them.
 	///
 	/// Before deleting anything for good, the archive is read back from the server as
-	/// extracting would read it ([`CompressPhase::Verifying`]), which downloads it once more:
-	/// every entry has to be its source's data. Trashed sources can be restored, so trashing
+	/// extracting would read it ([`CompressPhase::Verifying`], its progress in
+	/// [`CompressCounts::bytes_verified`]), which downloads it once more: every entry has to be
+	/// its source's data. Trashed sources can be restored, so trashing
 	/// reads nothing back. The read back uses the password the archive was written with, so it
 	/// cannot tell a mistyped one: with an encrypted format, have the user confirm the password
 	/// before removing anything for good.

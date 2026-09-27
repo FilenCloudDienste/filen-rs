@@ -3,10 +3,15 @@
 //! from, byte for byte, with nothing missing, skipped or left over.
 //!
 //! The encoders are the SDK's own and a defect in one would otherwise go unnoticed until the
-//! archive is extracted, by which time a permanent deletion has left the data nowhere else. The
-//! read goes through the same reader and limits as extracting, one chunk at a time, so its
-//! memory is the codec's budget and the chunk it is reading. Trashed sources can be restored,
-//! so a disposal to the trash is not read back.
+//! archive is extracted, by which time a permanent deletion has left the data nowhere else.
+//! Trashed sources can be restored, so a disposal to the trash is not read back.
+//!
+//! The read goes through the same reader and limits as extracting, one chunk at a time. Its
+//! memory is the codec's budget and the job's two-chunk floor: the chunk being fetched and the
+//! one the reader holds. A zip's or 7z's reader also keeps up to two chunks it read before, part
+//! of its own state as when extracting. A pause is seen when the reader asks for its next chunk:
+//! the fetch in flight finishes, the floor is given back, and the reader's state, with the chunk
+//! it holds, stays resident; nothing of the client's memory budget is held.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,7 +32,7 @@ use crate::{
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
 	},
 	job::{JobControl, Stopped},
-	util::sleep,
+	util::{MaybeArc, sleep},
 };
 
 use super::{codec::ArchiveEntry, report::Reporter};
@@ -44,6 +49,8 @@ pub(crate) struct ReadBack {
 	/// The archive's directories, by path.
 	pub(crate) dirs: Vec<String>,
 	pub(crate) start: StartReadBack,
+	/// Where the reader's memory floor comes from.
+	pub(crate) config: ArchiveConfig,
 }
 
 impl ReadBack {
@@ -81,22 +88,27 @@ impl ReadBack {
 				};
 				worker::start(move |port| extract_stream(&port, job))
 			}),
+			config: config.clone(),
 		}
 	}
 }
 
 /// Whether `archive` reads back as exactly `files` (each by its path, with the BLAKE3 of what was
 /// read of its source) and the directories of `read_back`. `Err` once the job stops; a pause
-/// holds the read between two chunks.
+/// holds the read between two chunks, holding no floor.
 pub(crate) async fn reads_back<B: DriveBackend>(
 	backend: &B,
 	control: &JobControl,
-	reporter: &Reporter,
+	reporter: &MaybeArc<Reporter>,
 	archive: &RemoteFile,
 	read_back: ReadBack,
 	files: HashMap<String, blake3::Hash>,
 ) -> Result<bool, Stopped> {
-	let ReadBack { dirs, start } = read_back;
+	let ReadBack {
+		dirs,
+		start,
+		config,
+	} = read_back;
 	let checked = Check {
 		files,
 		dirs: dirs.into_iter().collect(),
@@ -115,7 +127,14 @@ pub(crate) async fn reads_back<B: DriveBackend>(
 			));
 		}
 	};
-	match read(backend, control, reporter, archive, link, checked).await? {
+	reporter.verifying(archive.size());
+	let reading = Reading {
+		backend,
+		control,
+		reporter,
+		config: &config,
+	};
+	match read(reading, archive, link, checked).await? {
 		Ok(()) => Ok(true),
 		Err(why) => Ok(differs(archive, &why)),
 	}
@@ -200,17 +219,31 @@ impl Check {
 	}
 }
 
+/// What serving the reader takes from its job.
+struct Reading<'a, B> {
+	backend: &'a B,
+	control: &'a JobControl,
+	reporter: &'a MaybeArc<Reporter>,
+	config: &'a ArchiveConfig,
+}
+
 /// Serves the reading codec the archive's chunks and checks what it reads; the outer `Err` once
 /// the job stops, the inner one with why the archive differs.
 async fn read<B: DriveBackend>(
-	backend: &B,
-	control: &JobControl,
-	reporter: &Reporter,
+	Reading {
+		backend,
+		control,
+		reporter,
+		config,
+	}: Reading<'_, B>,
 	archive: &RemoteFile,
 	mut link: WorkerLink<ReadBackResult>,
 	mut check: Check,
 ) -> Result<Result<(), String>, Stopped> {
 	let file = RemoteFileType::from(archive.clone());
+	let mut floor = Some(control.until_stopping(config.floor()).await?);
+	// a zip or 7z reader may ask for a chunk again; progress counts each once
+	let mut fetched = HashSet::new();
 	loop {
 		// a codec that neither asks nor tells anything for this long is given up on
 		let event = tokio::select! {
@@ -226,12 +259,23 @@ async fn read<B: DriveBackend>(
 			break;
 		};
 		if let WorkerEvent::Ask { index, reply, .. } = event {
+			// the reader waits for its chunk, so a pause holds nothing in flight
+			if control.is_pause_requested() {
+				floor = None;
+			}
 			reporter.checkpoint(control).await?;
+			if floor.is_none() {
+				floor = Some(control.until_stopping(config.floor()).await?);
+			}
+			let _op = reporter.op();
 			match control
 				.until_stopping(backend.fetch_chunk(&file, index))
 				.await?
 			{
 				Ok(chunk) => {
+					if fetched.insert(index) {
+						reporter.archive_verified(chunk.len() as u64);
+					}
 					let _ = reply.send(Ok(chunk));
 				}
 				Err(error) => return Ok(Err(format!("reading it failed: {error}"))),

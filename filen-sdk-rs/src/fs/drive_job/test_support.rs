@@ -161,8 +161,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
-	/// Directories whose listing and files whose permanent deletion wait while they are in the
-	/// set, each wait logged in [`FakeLog::held`].
+	/// Directories whose listing and files whose fetches or permanent deletion wait while they
+	/// are in the set, each wait logged in [`FakeLog::held`].
 	pub(crate) held: watch::Sender<HashSet<Uuid>>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
@@ -399,6 +399,7 @@ impl DriveBackend for FakeBackend {
 		file: &RemoteFileType<'static>,
 		index: u64,
 	) -> Result<Vec<u8>, Error> {
+		self.hold(file.uuid()).await;
 		let name = file.name().unwrap_or_default().to_owned();
 		if self.reverse_chunks {
 			tokio::time::sleep(Duration::from_millis(10 * (file.chunks() - index))).await;
