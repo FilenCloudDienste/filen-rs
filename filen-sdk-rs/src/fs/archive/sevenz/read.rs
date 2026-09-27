@@ -781,21 +781,35 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 	Ok(folder)
 }
 
-/// Every coder has to be reachable from the folder's output without going round in a circle.
+/// Every coder has to be reachable from the folder's output without going round in a circle:
+/// one that is not would still be charged for and judged supported, for nothing.
 fn check_acyclic(folder: &Folder) -> Result<(), SevenZError> {
-	fn visit(folder: &Folder, coder: usize, depth: usize) -> Result<(), SevenZError> {
+	fn visit(
+		folder: &Folder,
+		coder: usize,
+		depth: usize,
+		reached: &mut [bool],
+	) -> Result<(), SevenZError> {
 		if depth > folder.coders.len() {
 			return Err(SevenZError::Corrupt("7z coders bound in a circle"));
 		}
+		reached[coder] = true;
 		let first = folder.first_input(coder);
 		for input in first..first + folder.coders[coder].inputs {
 			if let Some(&(_, output)) = folder.bind_pairs.iter().find(|(i, _)| *i == input) {
-				visit(folder, output, depth + 1)?;
+				visit(folder, output, depth + 1, reached)?;
 			}
 		}
 		Ok(())
 	}
-	visit(folder, folder.main, 0)
+	let mut reached = vec![false; folder.coders.len()];
+	visit(folder, folder.main, 0, &mut reached)?;
+	if reached.contains(&false) {
+		return Err(SevenZError::Corrupt(
+			"a 7z coder feeds nothing the folder decodes to",
+		));
+	}
+	Ok(())
 }
 
 fn read_substreams(

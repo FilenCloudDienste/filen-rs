@@ -692,3 +692,33 @@ fn aes_data_of_a_partial_block_is_damage_whatever_the_key() {
 		Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK))
 	));
 }
+
+#[test]
+fn every_coder_has_to_feed_the_folders_output() {
+	let coder = |method| Coder {
+		method: Some(method),
+		props: Box::default(),
+		inputs: 1,
+	};
+	let folder = |bind_pairs, packed| Folder {
+		coders: vec![
+			coder(Method::Copy),
+			coder(Method::Copy),
+			coder(Method::Copy),
+		],
+		bind_pairs,
+		packed,
+		unpack_sizes: vec![1, 1, 1],
+		crc: None,
+		first_pack: 0,
+		main: 0,
+	};
+	// a chain: coder 0 reads coder 1, which reads coder 2
+	check_acyclic(&folder(vec![(0, 1), (1, 2)], vec![2])).unwrap();
+	// coders 1 and 2 feed each other and nothing else: every stream is bound once, but the
+	// folder's output never reaches them
+	assert!(matches!(
+		check_acyclic(&folder(vec![(1, 2), (2, 1)], vec![0])),
+		Err(SevenZError::Corrupt(_))
+	));
+}
