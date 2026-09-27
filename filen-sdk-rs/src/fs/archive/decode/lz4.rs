@@ -13,16 +13,17 @@
 use std::{
 	hash::Hasher,
 	io::{self, BufRead, Read},
-	ops::RangeInclusive,
 };
 
 use lz4_flex::block::{decompress_into, decompress_into_with_dict};
 use twox_hash::XxHash32;
 
-use super::{Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd};
+use super::{
+	Budget, CodecError, Describe, Input, SKIPPABLE_FRAME_MAGIC, StreamCheck, StreamDecoder,
+	StreamEnd, skip_skippable_frame,
+};
 
 const MAGIC: u32 = 0x184D_2204;
-const SKIPPABLE_MAGIC: RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
 const LEGACY_MAGIC: u32 = 0x184C_2102;
 
 /// How far back a linked block may refer.
@@ -98,11 +99,9 @@ impl<R: Read> Lz4Decoder<R> {
 				self.input.consume(4);
 				self.read_frame_descriptor()?;
 			}
-			Some(magic) if SKIPPABLE_MAGIC.contains(&magic) => {
-				self.input.consume(4);
-				let size = u32::from_le_bytes(self.input.read_array()?);
-				self.input.skip(u64::from(size))?;
-				self.skipped = self.skipped.saturating_add(8 + u64::from(size));
+			Some(magic) if SKIPPABLE_FRAME_MAGIC.contains(&magic) => {
+				let skipped = skip_skippable_frame(&mut self.input)?;
+				self.skipped = self.skipped.saturating_add(skipped);
 			}
 			Some(LEGACY_MAGIC) => {
 				return Err(CodecError::Unsupported("the legacy lz4 format").into());

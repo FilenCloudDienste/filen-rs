@@ -14,7 +14,7 @@ use filen_macros::js_type;
 
 use crate::fs::name::{ValidatedName, keep_both::SourceName};
 
-use super::tar_iter::TAR_BLOCK_LEN;
+use super::{decode::SKIPPABLE_FRAME_MAGIC, tar_iter::TAR_BLOCK_LEN};
 
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
@@ -35,6 +35,8 @@ pub enum StreamCodec {
 	Lz4,
 	/// Brotli (`.br`).
 	Brotli,
+	/// Zstandard (`.zst`).
+	Zstd,
 }
 
 /// What a file turned out to hold, as far as its first bytes tell.
@@ -54,6 +56,7 @@ pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK_LEN;
 const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Tells the format of a file from its first bytes (up to [`DETECT_HEAD_LEN`]) and its name.
 pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
@@ -75,8 +78,25 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(&XZ_MAGIC) {
 		return Some(Detected::Stream(StreamCodec::Xz));
 	}
-	if head.starts_with(&LZ4_MAGIC) {
-		return Some(Detected::Stream(StreamCodec::Lz4));
+	match after_skippable_frames(head) {
+		Some(rest) if rest.starts_with(&LZ4_MAGIC) => {
+			return Some(Detected::Stream(StreamCodec::Lz4));
+		}
+		Some(rest) if rest.starts_with(&ZSTD_MAGIC) => {
+			return Some(Detected::Stream(StreamCodec::Zstd));
+		}
+		// lz4 and zstd share their skippable frames: past the head, only the name tells them
+		// apart
+		None => {
+			return match extension_format(name)? {
+				ExtensionFormat::Stream(codec @ (StreamCodec::Lz4 | StreamCodec::Zstd))
+				| ExtensionFormat::CompressedTar(codec @ (StreamCodec::Lz4 | StreamCodec::Zstd)) => {
+					Some(Detected::Stream(codec))
+				}
+				_ => None,
+			};
+		}
+		Some(_) => {}
 	}
 	if head.starts_with(b"LZIP") {
 		return Some(Detected::Stream(StreamCodec::Lzip));
@@ -98,6 +118,21 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 			Some(Detected::Stream(codec))
 		}
 		_ => None,
+	}
+}
+
+/// `head` past the skippable frames lz4 and zstd streams may start with, or `None` when it ends
+/// inside one.
+fn after_skippable_frames(mut head: &[u8]) -> Option<&[u8]> {
+	loop {
+		let Some((magic, rest)) = head.split_first_chunk::<4>() else {
+			return Some(head);
+		};
+		if !SKIPPABLE_FRAME_MAGIC.contains(&u32::from_le_bytes(*magic)) {
+			return Some(head);
+		}
+		let (size, rest) = rest.split_first_chunk::<4>()?;
+		head = rest.get(usize::try_from(u32::from_le_bytes(*size)).ok()?..)?;
 	}
 }
 
@@ -178,11 +213,16 @@ const EXTENSIONS: &[(&str, ExtensionFormat)] = &[
 		".tar.br",
 		ExtensionFormat::CompressedTar(StreamCodec::Brotli),
 	),
+	(
+		".tar.zst",
+		ExtensionFormat::CompressedTar(StreamCodec::Zstd),
+	),
 	(".tgz", ExtensionFormat::CompressedTar(StreamCodec::Gzip)),
 	(".tbz2", ExtensionFormat::CompressedTar(StreamCodec::Bzip2)),
 	(".tbz", ExtensionFormat::CompressedTar(StreamCodec::Bzip2)),
 	(".txz", ExtensionFormat::CompressedTar(StreamCodec::Xz)),
 	(".tlz", ExtensionFormat::CompressedTar(StreamCodec::Lzip)),
+	(".tzst", ExtensionFormat::CompressedTar(StreamCodec::Zstd)),
 	(".zip", ExtensionFormat::Zip),
 	(".7z", ExtensionFormat::SevenZ),
 	(".tar", ExtensionFormat::Tar),
@@ -193,6 +233,7 @@ const EXTENSIONS: &[(&str, ExtensionFormat)] = &[
 	(".lz4", ExtensionFormat::Stream(StreamCodec::Lz4)),
 	(".lz", ExtensionFormat::Stream(StreamCodec::Lzip)),
 	(".br", ExtensionFormat::Stream(StreamCodec::Brotli)),
+	(".zst", ExtensionFormat::Stream(StreamCodec::Zstd)),
 ];
 
 /// The recognised extension `name` ends in, with what it says the file holds.
@@ -275,6 +316,10 @@ mod tests {
 			detect(b"LZIP\x01\x0c", "x"),
 			Some(Detected::Stream(StreamCodec::Lzip))
 		);
+		assert_eq!(
+			detect(&[0x28, 0xB5, 0x2F, 0xFD, 0x04], "x"),
+			Some(Detected::Stream(StreamCodec::Zstd))
+		);
 		assert_eq!(detect(&tar_header("a.txt"), "x"), Some(Detected::Tar));
 	}
 
@@ -288,6 +333,42 @@ mod tests {
 			detect(&[0x1F, 0x8B, 8, 0], "notes.7z"),
 			Some(Detected::Stream(StreamCodec::Gzip))
 		);
+	}
+
+	#[test]
+	fn skippable_frames_are_looked_past() {
+		let skippable = |len: u8| {
+			[
+				&[0x5E, 0x2A, 0x4D, 0x18, len, 0, 0, 0][..],
+				&[7; 255][..len as usize],
+			]
+			.concat()
+		};
+		let head = [
+			skippable(3),
+			skippable(0),
+			vec![0x28, 0xB5, 0x2F, 0xFD, 0x04],
+		]
+		.concat();
+		assert_eq!(
+			detect(&head, "x"),
+			Some(Detected::Stream(StreamCodec::Zstd))
+		);
+		let head = [skippable(9), vec![0x04, 0x22, 0x4D, 0x18, 0x64]].concat();
+		assert_eq!(detect(&head, "x"), Some(Detected::Stream(StreamCodec::Lz4)));
+		// frames longer than the head leave the name to decide
+		let long = [0x50, 0x2A, 0x4D, 0x18, 0, 0, 1, 0];
+		assert_eq!(
+			detect(&long, "a.tar.zst"),
+			Some(Detected::Stream(StreamCodec::Zstd))
+		);
+		assert_eq!(
+			detect(&long, "a.lz4"),
+			Some(Detected::Stream(StreamCodec::Lz4))
+		);
+		assert_eq!(detect(&long, "a.gz"), None);
+		// a skippable frame before anything else is no stream
+		assert_eq!(detect(&skippable(2), "x"), None);
 	}
 
 	#[test]
@@ -368,6 +449,9 @@ mod tests {
 		assert_eq!(archive_default_name("notes.txt.gz"), "notes.txt");
 		assert_eq!(archive_default_name("data.tar.lz4"), "data");
 		assert_eq!(archive_default_name("data.tar.lz"), "data");
+		assert_eq!(archive_default_name("data.tar.zst"), "data");
+		assert_eq!(archive_default_name("data.TZST"), "data");
+		assert_eq!(archive_default_name("notes.txt.zst"), "notes.txt");
 		assert_eq!(archive_default_name("report.pdf"), "report.pdf");
 		// a name that is only an extension keeps it
 		assert_eq!(archive_default_name(".zip"), ".zip");

@@ -352,6 +352,29 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 }
 
 #[test]
+fn a_zstd_tar_is_read_through_its_frames() {
+	let mut encoder = crate::fs::archive::encode::open_encoder(
+		crate::fs::archive::encode::Compression {
+			codec: StreamCodec::Zstd,
+			level: None,
+		},
+		Vec::new(),
+	)
+	.unwrap();
+	encoder.write_all(&sample_tar()).unwrap();
+	// a skippable frame ahead of the data, as some writers put metadata there
+	let mut archive = vec![0x50, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, 1, 2];
+	archive.extend(encoder.finish().unwrap());
+	let (seen, end) = run(&archive, "sample.tar.zst");
+	let mut expected = vec![Seen::Opened(StreamLayout::Tar {
+		codec: Some(StreamCodec::Zstd),
+	})];
+	expected.extend(sample_seen());
+	assert_eq!(seen, expected);
+	assert_eq!(end.unwrap().unaccounted_bytes, 10);
+}
+
+#[test]
 fn a_single_compressed_file_is_named_after_the_archive() {
 	let data = b"a single file, compressed on its own".repeat(100);
 	let (seen, end) = run(&gzip(&data), "notes.txt.gz");

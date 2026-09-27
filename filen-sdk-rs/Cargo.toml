@@ -32,6 +32,7 @@ wasm-full = [
 	"dep:sha1",
 	"dep:zeroize",
 	"dep:deflate64",
+	"dep:ruzstd",
 ]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
@@ -221,8 +222,8 @@ walkdir = "2.5.0"
 # Archive codecs for compress/extract (fs::archive), all written in Rust: no C code or C
 # toolchain, so they build for wasm as they are. Written in Rust is not free of `unsafe`:
 # ppmd-rust (7z PPMd) and libbz2-rs-sys (under bzip2) are translations of C and use it
-# throughout, on archive data an attacker may have made; the SDK checks PPMd's properties
-# against the crate's bounds before building its decoder.
+# throughout and ruzstd's ring buffer uses it, all on archive data an attacker may have made;
+# the SDK checks PPMd's properties against the crate's bounds before building its decoder.
 # lzma-rust2's `optimization` feature (on below, for speed) adds 14 sites: two in its range
 # decoder (inline assembly reading direct bits), which reads archive data, and the rest in its
 # encoder's match finders, which see only the user's own files. Always on natively; on wasm
@@ -260,6 +261,13 @@ sha1 = "0.10"
 zeroize = "1"
 deflate64 = "0.1"
 ppmd-rust = "1.4"
+# zstd, both ways; `hash` writes and checks the frames' content checksums. A fork of 0.9.0
+# that refuses a block decoding past its maximum (128 KiB, or the window if smaller), which the
+# codec budget rests on, until a release does: https://github.com/KillingSpark/zstd-rs/pull/124.
+ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
+	"std",
+	"hash",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -339,6 +347,10 @@ sha1 = { version = "0.10", optional = true }
 zeroize = { version = "1", optional = true }
 deflate64 = { version = "0.1", optional = true }
 ppmd-rust = { version = "1.4", optional = true }
+ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
+	"std",
+	"hash",
+], optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value

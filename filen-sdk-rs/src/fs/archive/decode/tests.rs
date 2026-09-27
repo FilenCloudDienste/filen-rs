@@ -95,6 +95,42 @@ fn lz4(data: &[u8], info: FrameInfo) -> Vec<u8> {
 	encoder.finish().unwrap()
 }
 
+fn zstd(data: &[u8]) -> Vec<u8> {
+	ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
+/// A zstd frame of raw blocks, written by hand: a window of `1 << window_log` bytes, the content
+/// size in the header when `states_size`, and a dictionary id when `dictionary` is given.
+fn zstd_raw_frame(
+	data: &[u8],
+	window_log: u8,
+	states_size: bool,
+	dictionary: Option<u8>,
+) -> Vec<u8> {
+	let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+	// FCS_flag 2 (4 bytes) when stating the size, Dictionary_ID_flag 1 (1 byte) with one
+	let descriptor = if states_size { 2 << 6 } else { 0 } | u8::from(dictionary.is_some());
+	frame.push(descriptor);
+	frame.push((window_log - 10) << 3);
+	frame.extend(dictionary);
+	if states_size {
+		frame.extend_from_slice(&(u32::try_from(data.len()).unwrap()).to_le_bytes());
+	}
+	let block_max = (1usize << window_log).min(128 << 10);
+	let mut blocks = data.chunks(block_max).peekable();
+	if blocks.peek().is_none() {
+		frame.extend_from_slice(&[1, 0, 0]);
+	}
+	while let Some(block) = blocks.next() {
+		// raw blocks: the last-block bit, type 0, and the size above them
+		let header =
+			u32::from(blocks.peek().is_none()) | (u32::try_from(block.len()).unwrap()) << 3;
+		frame.extend_from_slice(&header.to_le_bytes()[..3]);
+		frame.extend_from_slice(block);
+	}
+	frame
+}
+
 fn brotli(data: &[u8]) -> Vec<u8> {
 	let mut writer = ::brotli::CompressorWriter::new(Vec::new(), 4096, 9, 22);
 	writer.write_all(data).unwrap();
@@ -501,6 +537,172 @@ fn a_damaged_lz4_never_panics() {
 }
 
 #[test]
+fn zstd_frames() {
+	let data = sample(300_000);
+	assert_eq!(
+		decode(StreamCodec::Zstd, &zstd(&data), BUDGET).unwrap(),
+		(data.clone(), VERIFIED)
+	);
+	// a skippable frame ahead of the data, one between frames, a frame without a checksum
+	// that states its size, and zero padding
+	let small = sample(10);
+	let mut bytes = vec![0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3];
+	bytes.extend(zstd(&data));
+	bytes.extend_from_slice(&[0x5F, 0x2A, 0x4D, 0x18, 0, 0, 0, 0]);
+	bytes.extend(zstd_raw_frame(&small, 17, true, None));
+	bytes.extend_from_slice(&[0; 2]);
+	assert_eq!(
+		decode(StreamCodec::Zstd, &bytes, BUDGET).unwrap(),
+		(
+			[data.clone(), small].concat(),
+			StreamEnd {
+				unaccounted_bytes: 19,
+				..UNVERIFIABLE
+			}
+		)
+	);
+	// data after the last frame
+	let mut junk = zstd(&data);
+	junk.extend_from_slice(b"junk");
+	assert_eq!(
+		decode(StreamCodec::Zstd, &junk, BUDGET).unwrap().1,
+		StreamEnd {
+			unaccounted_bytes: 4,
+			..VERIFIED
+		}
+	);
+	// skippable frames alone hold no zstd data, and neither does nothing
+	assert_eq!(
+		corrupt(decode(
+			StreamCodec::Zstd,
+			&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3],
+			BUDGET
+		)),
+		"not a zstd stream"
+	);
+	assert_eq!(
+		corrupt(decode(StreamCodec::Zstd, &[], BUDGET)),
+		"not a zstd stream"
+	);
+}
+
+#[test]
+fn zstd_damage() {
+	let data = sample(100_000);
+	let bytes = zstd(&data);
+	assert_eq!(
+		corrupt(decode(StreamCodec::Zstd, &bytes[..bytes.len() - 2], BUDGET)),
+		TRUNCATED
+	);
+	assert_eq!(
+		corrupt(decode(StreamCodec::Zstd, &bytes[..bytes.len() / 2], BUDGET)),
+		TRUNCATED
+	);
+	let mut bad_checksum = bytes.clone();
+	*bad_checksum.last_mut().unwrap() ^= 1;
+	assert_eq!(
+		corrupt(decode(StreamCodec::Zstd, &bad_checksum, BUDGET)),
+		"zstd content checksum mismatch"
+	);
+	// a header stating a size the frame does not decode to
+	let mut wrong_size = zstd_raw_frame(&data[..100], 17, true, None);
+	wrong_size[6] += 1;
+	assert_eq!(
+		corrupt(decode(StreamCodec::Zstd, &wrong_size, BUDGET)),
+		"a zstd frame's size differs from its header"
+	);
+	assert!(matches!(
+		codec_err(decode(
+			StreamCodec::Zstd,
+			&zstd_raw_frame(b"x", 17, false, Some(7)),
+			BUDGET
+		)),
+		CodecError::Unsupported("a zstd frame that needs a dictionary")
+	));
+}
+
+#[test]
+fn a_zstd_window_is_charged_before_it_is_allocated() {
+	// a 64 MiB window's ring needs 192 MiB at its peak: refused under a 64 MiB budget, without
+	// allocating for it
+	let frame = zstd_raw_frame(b"small", 26, false, None);
+	let (result, peak) =
+		crate::fs::archive::alloc_meter::peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
+	assert!(matches!(
+		codec_err(result),
+		CodecError::OverBudget { limit } if limit == BUDGET
+	));
+	assert!(peak < MIB, "took {peak} bytes");
+	assert_eq!(
+		decode(StreamCodec::Zstd, &frame, 256 * MIB).unwrap().0,
+		b"small"
+	);
+}
+
+/// Whether what is written to it is `expected`, without keeping it.
+struct Matches<'a> {
+	expected: &'a [u8],
+	matched: bool,
+}
+
+impl Write for Matches<'_> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		match self.expected.split_at_checked(buf.len()) {
+			Some((head, rest)) if head == buf => self.expected = rest,
+			_ => self.matched = false,
+		}
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+/// Decodes `bytes` under the heap meter: whether it decoded to `data`, and the decoder's peak.
+fn zstd_peak(bytes: &[u8], data: &[u8]) -> (bool, u64) {
+	let mut matches = Matches {
+		expected: data,
+		matched: true,
+	};
+	let (_, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		let mut decoder = open_stream(StreamCodec::Zstd, bytes, 512 * MIB).unwrap();
+		io::copy(&mut decoder, &mut matches).unwrap();
+	});
+	(matches.matched && matches.expected.is_empty(), peak)
+}
+
+#[test]
+fn a_zstd_decoder_stays_within_what_its_window_is_charged() {
+	// what `max_window` holds a budget to: the ring at its peak (the power of two above a window
+	// and a block, and the half-size one before it) and the decoder's state
+	let charged = |window: u64| (window + 128 * 1024).next_power_of_two() * 3 / 2 + 2 * MIB;
+	for (window_log, len) in [(23, 9 * MIB_USIZE), (17, 2 * MIB_USIZE)] {
+		let data = sample(len);
+		let (decoded, peak) = zstd_peak(&zstd_raw_frame(&data, window_log, true, None), &data);
+		assert!(decoded);
+		assert!(
+			peak <= charged(1 << window_log),
+			"a {window_log}-bit window took {peak} bytes"
+		);
+	}
+	// compressed blocks fill the literal, sequence and table buffers the state is charged for
+	let data = sample(4 * MIB_USIZE);
+	let (decoded, peak) = zstd_peak(&zstd(&data), &data);
+	assert!(decoded);
+	assert!(peak <= charged(128 * 1024), "took {peak} bytes");
+}
+
+#[test]
+fn a_damaged_zstd_never_panics() {
+	let data = sample(3_000);
+	let mut bytes = vec![0x5F, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, 7, 7];
+	bytes.extend(zstd(&data));
+	bytes.extend(zstd_raw_frame(&data[..100], 17, true, None));
+	damage_never_panics(StreamCodec::Zstd, &bytes);
+}
+
+#[test]
 fn input_errors_pass_through_unchanged() {
 	/// Hands out a valid stream's first bytes, then fails.
 	struct FailsAfter<'a>(&'a [u8]);
@@ -524,6 +726,7 @@ fn input_errors_pass_through_unchanged() {
 		(StreamCodec::Xz, xz(&data, |_| {})),
 		(StreamCodec::Lz4, lz4(&data, FrameInfo::new())),
 		(StreamCodec::Brotli, brotli(&data)),
+		(StreamCodec::Zstd, zstd(&data)),
 	] {
 		let mut decoder =
 			open_stream(codec, FailsAfter(&bytes[..bytes.len() / 2]), BUDGET).unwrap();

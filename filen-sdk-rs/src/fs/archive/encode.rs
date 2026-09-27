@@ -37,6 +37,8 @@ impl StreamCodec {
 			// lz4_flex has a single level
 			Self::Lz4 => (1..=1, 1),
 			Self::Brotli => (0..=11, 9),
+			// ruzstd's encoder has a single level, about zstd's 1
+			Self::Zstd => (1..=1, 1),
 		}
 	}
 }
@@ -46,6 +48,9 @@ const BROTLI_LGWIN: u32 = 22;
 
 /// lz4 blocks are written 256 KiB at a time, which decoders at any setting accept.
 const LZ4_BLOCK_BYTES: u64 = 256 << 10;
+
+/// zstd is written a frame per this much input (see [`ZstdEncoder`]).
+const ZSTD_FRAME_BYTES: usize = 1 << 20;
 
 /// Room for what a crate's own formula leaves out (buffers, block bookkeeping).
 const ENCODER_SLACK_BYTES: u64 = 1 << 20;
@@ -83,6 +88,9 @@ impl Compression {
 			// The ring buffer and hash tables of a 4 MiB window, measured over the qualities
 			// (see the test): at most 29 MiB up to 8, 48 MiB at 9 and 64 MiB at 10 and 11,
 			// stated with a quarter or more to spare.
+			// a frame's input and its output, and ruzstd's match finder and tables, measured
+			// at under 3 MiB (see the tests)
+			StreamCodec::Zstd => 2 * ZSTD_FRAME_BYTES as u64 + 4 * ENCODER_SLACK_BYTES,
 			StreamCodec::Brotli => {
 				let window = 1u64 << BROTLI_LGWIN;
 				match level {
@@ -153,6 +161,67 @@ impl<W: Write> StreamEncoder<W> for brotli::CompressorWriter<W> {
 	}
 }
 
+/// zstd, written with ruzstd, whose compressor reads its input from a reader to the end rather
+/// than being written to: the input is gathered a frame at a time and each frame compressed on
+/// its own, with its content checksum. Frames one after another are one zstd stream to every
+/// decoder (RFC 8878 §3.1), and past its first 128 KiB window a frame loses no matches.
+pub(crate) struct ZstdEncoder<W> {
+	sink: W,
+	input: Vec<u8>,
+	output: Vec<u8>,
+	frames: u64,
+}
+
+impl<W: Write> ZstdEncoder<W> {
+	fn new(sink: W) -> Self {
+		Self {
+			sink,
+			input: Vec::with_capacity(ZSTD_FRAME_BYTES),
+			// data that does not compress is stored in raw blocks: 3 bytes more per 128 KiB,
+			// and the frame's header and checksum
+			output: Vec::with_capacity(ZSTD_FRAME_BYTES + ZSTD_FRAME_BYTES / 1024 + 64),
+			frames: 0,
+		}
+	}
+
+	fn write_frame(&mut self) -> io::Result<()> {
+		self.output.clear();
+		ruzstd::encoding::compress(
+			self.input.as_slice(),
+			&mut self.output,
+			ruzstd::encoding::CompressionLevel::Fastest,
+		);
+		self.input.clear();
+		self.frames += 1;
+		self.sink.write_all(&self.output)
+	}
+}
+
+impl<W: Write> Write for ZstdEncoder<W> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if self.input.len() == ZSTD_FRAME_BYTES {
+			self.write_frame()?;
+		}
+		let taken = buf.len().min(ZSTD_FRAME_BYTES - self.input.len());
+		self.input.extend_from_slice(&buf[..taken]);
+		Ok(taken)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		self.sink.flush()
+	}
+}
+
+impl<W: Write> StreamEncoder<W> for ZstdEncoder<W> {
+	fn finish(mut self: Box<Self>) -> io::Result<W> {
+		// an empty input is still one (empty) frame: no frames at all is no zstd stream
+		if !self.input.is_empty() || self.frames == 0 {
+			self.write_frame()?;
+		}
+		Ok(self.sink)
+	}
+}
+
 /// Opens an encoder for `compression` over `sink`.
 pub(crate) fn open_encoder<'a, W: Write + 'a>(
 	compression: Compression,
@@ -192,6 +261,7 @@ pub(crate) fn open_encoder<'a, W: Write + 'a>(
 			level,
 			BROTLI_LGWIN,
 		)),
+		StreamCodec::Zstd => Box::new(ZstdEncoder::new(sink)),
 	})
 }
 
@@ -202,7 +272,7 @@ mod tests {
 	use super::*;
 	use crate::fs::archive::decode::{StreamCheck, open_stream};
 
-	const CODECS: [StreamCodec; 7] = [
+	const CODECS: [StreamCodec; 8] = [
 		StreamCodec::Gzip,
 		StreamCodec::Bzip2,
 		StreamCodec::Xz,
@@ -210,6 +280,7 @@ mod tests {
 		StreamCodec::Lzip,
 		StreamCodec::Lz4,
 		StreamCodec::Brotli,
+		StreamCodec::Zstd,
 	];
 
 	fn encode(compression: Compression, data: &[u8]) -> Vec<u8> {
@@ -258,6 +329,7 @@ mod tests {
 			(StreamCodec::Xz, 10),
 			(StreamCodec::Lz4, 2),
 			(StreamCodec::Brotli, 12),
+			(StreamCodec::Zstd, 2),
 		] {
 			let compression = Compression {
 				codec,
@@ -343,6 +415,51 @@ mod tests {
 		check_encoder_memory(StreamCodec::Gzip, &levels(1..=9));
 		check_encoder_memory(StreamCodec::Bzip2, &levels(1..=9));
 		check_encoder_memory(StreamCodec::Lz4, &[None]);
+		check_encoder_memory(StreamCodec::Zstd, &[None]);
+	}
+
+	#[test]
+	fn zstd_writes_a_frame_per_mebibyte_and_one_for_nothing() {
+		let compression = Compression {
+			codec: StreamCodec::Zstd,
+			level: None,
+		};
+		let frames = |encoded: &[u8]| {
+			encoded
+				.windows(4)
+				.filter(|window| window == &[0x28, 0xB5, 0x2F, 0xFD])
+				.count()
+		};
+		let empty = encode(compression, b"");
+		assert_eq!(frames(&empty), 1);
+		let mut decoded = Vec::new();
+		open_stream(StreamCodec::Zstd, &empty[..], 64 << 20)
+			.unwrap()
+			.read_to_end(&mut decoded)
+			.unwrap();
+		assert!(decoded.is_empty());
+		// the magic may turn up inside compressed data too, but not in this much of it
+		let data = mixed_input(ZSTD_FRAME_BYTES * 2 + 5);
+		assert_eq!(frames(&encode(compression, &data)), 3);
+		// data that does not compress costs no more than what is stated
+		let mut state = 0x9E37_79B9_7F4A_7C15u64;
+		let noise: Vec<u8> = (0..ZSTD_FRAME_BYTES * 2)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				(state >> 24).to_le_bytes()[0]
+			})
+			.collect();
+		let ((), peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+			let mut encoder = open_encoder(compression, io::sink()).unwrap();
+			encoder.write_all(&noise).unwrap();
+			encoder.finish().unwrap();
+		});
+		assert!(
+			peak <= compression.encoder_memory().unwrap(),
+			"took {peak} bytes"
+		);
 	}
 
 	#[test]

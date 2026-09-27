@@ -123,6 +123,7 @@ impl StreamCodec {
 			Self::Lzip => ".lz",
 			Self::Lz4 => ".lz4",
 			Self::Brotli => ".br",
+			Self::Zstd => ".zst",
 		}
 	}
 }
@@ -559,6 +560,7 @@ mod tests {
 			StreamCodec::Lzip,
 			StreamCodec::Lz4,
 			StreamCodec::Brotli,
+			StreamCodec::Zstd,
 		];
 		let mut formats: Vec<CompressFormat> = codecs
 			.iter()

@@ -16,7 +16,8 @@
 //!
 //! The container formats of xz and lz4 are parsed here rather than by their crates, over the
 //! crates' block decoders: the crates' readers trust the index sizes and frame boundaries that
-//! these parsers check (see `xz.rs` and `lz4.rs`).
+//! these parsers check (see `xz.rs` and `lz4.rs`). zstd's sequence of frames is read here too,
+//! over ruzstd's frame decoder, which reads one frame (see `zstd.rs`).
 
 mod brotli;
 mod input;
@@ -24,13 +25,21 @@ mod lz4;
 mod lzma;
 mod members;
 mod xz;
+mod zstd;
 
-use std::io::{self, Read};
+use std::{
+	io::{self, Read},
+	ops::RangeInclusive,
+};
 
 use super::format::StreamCodec;
 pub(crate) use input::Trailing;
 use input::{Input, TRUNCATED};
 pub(crate) use lzma::clamp_dict as clamp_lzma_dict;
+
+/// The magic numbers of the skippable frames lz4 and zstd share: a little-endian magic and
+/// length, then that many bytes no decoder reads.
+pub(crate) const SKIPPABLE_FRAME_MAGIC: RangeInclusive<u32> = 0x184D_2A50..=0x184D_2A5F;
 
 /// How a decoded stream ended, once its decoder has returned `Ok(0)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +53,8 @@ pub(crate) struct StreamEnd {
 /// Whether the decoded bytes were checked against a checksum the stream carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamCheck {
-	/// Every member carried a check and each one matched: gzip, bzip2 and lzip always do, xz
-	/// and lz4 when their headers ask for one.
+	/// Every member carried a check and each one matched: gzip, bzip2 and lzip always do, xz,
+	/// lz4 and zstd when their headers ask for one.
 	Verified,
 	/// At least one member carried no check this decoder can verify. Brotli and LZMA-alone
 	/// have none at all.
@@ -90,6 +99,15 @@ pub(crate) fn codec_error(error: &io::Error) -> Option<&CodecError> {
 	error.get_ref()?.downcast_ref()
 }
 
+/// Skips the skippable frame `input` is at (see [`SKIPPABLE_FRAME_MAGIC`]), a truncated stream
+/// when it ends first; the frame's bytes, header included.
+fn skip_skippable_frame<R: Read>(input: &mut Input<R>) -> io::Result<u64> {
+	let header: [u8; 8] = input.read_array()?;
+	let size = u32::from_le_bytes(header[4..].try_into().expect("4 bytes"));
+	input.skip(u64::from(size))?;
+	Ok(8 + u64::from(size))
+}
+
 /// Memory a decoder's input buffer takes, on top of what [`open_stream`] charges per codec.
 const INPUT_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -111,6 +129,7 @@ pub(crate) fn open_stream<'a, R: Read + 'a>(
 		StreamCodec::Lzip => Box::new(Settled(lzma::LzipDecoder::new(input, budget))),
 		StreamCodec::Lz4 => Box::new(Settled(lz4::Lz4Decoder::new(input, budget))),
 		StreamCodec::Brotli => Box::new(Settled(brotli::BrotliDecoder::new(input, budget))),
+		StreamCodec::Zstd => Box::new(Settled(zstd::ZstdDecoder::new(input, budget))),
 	})
 }
 
