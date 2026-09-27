@@ -141,7 +141,8 @@ pub enum ErrorKind {
 	/// Internal logic error
 	Internal,
 	/// Not enough memory to complete the operation
-	/// might be returned by WASM targets when parsing a large response (eg dir/download)
+	/// might be returned by WASM targets when parsing a large response (eg dir/download), and by
+	/// a compression whose format's encoder needs more than the client's archive codec budget
 	InsufficientMemory,
 	/// Error occurred when walking through a directory structure:
 	Walk,
