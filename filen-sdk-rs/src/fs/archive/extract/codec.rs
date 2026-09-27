@@ -660,7 +660,7 @@ fn key_unproven(entry: &ZipEntry) -> bool {
 /// Whether the SDK reads the entry's compression method under its encryption.
 fn zip_supported(entry: &ZipEntry) -> bool {
 	match entry.method {
-		0 | 8 | 9 | 12 => true,
+		0 | 8 | 9 | 12 | 93 => true,
 		14 | 95 => entry.encryption == ZipEncryption::None,
 		_ => false,
 	}

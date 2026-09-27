@@ -2,7 +2,7 @@
 
 Zips made by the tools people actually use, which the SDK's own writer and the `zip` crate
 never produce: methods 9 (Deflate64), 12 (bzip2), 14 (LZMA, with and without an end marker),
-95 (XZ) and 98 (PPMd, unsupported), ZipCrypto from three writers (Info-ZIP's with the data
+93 (zstd), 95 (XZ) and 98 (PPMd, unsupported), ZipCrypto from three writers (Info-ZIP's with the data
 descriptor check byte), WinZip AES as AE-1 (libarchive) and AE-2 (7-Zip), a Finder-style
 zip with unflagged UTF-8 names, a symlink and `__MACOSX` entries, streamed data descriptors,
 Info-ZIP's zip64 records, and an archive comment followed by trailing bytes.
@@ -13,7 +13,8 @@ the script itself: the password is `pw` wherever there is one. None of these too
 OS X (19) version-made-by host, so the tests patch that into the Info-ZIP symlink's record.
 
 Made on macOS 26.5 with Info-ZIP Zip 3.0 (`/usr/bin/zip`), `ditto`, bsdtar 3.5.3 (libarchive
-3.7.4) and 7-Zip 26.01 (`7zz`, Homebrew). Running the script again gives the same contents,
+3.7.4), 7-Zip 26.01 (`7zz`, Homebrew) and, for zstd, which 7-Zip does not write into a zip,
+CPython 3.14's `zipfile` (Homebrew, over libzstd; frames without a content checksum). Running the script again gives the same contents,
 not the same bytes: encryption salts and headers are random, `ditto` stamps `__MACOSX`
 directories with the current time, and Info-ZIP stamps the entry it reads from stdin (the one in
 `zip64-infozip.zip`) with it too.
@@ -48,6 +49,10 @@ for method in Deflate64 BZip2 XZ PPMd; do
 	7zz a -tzip -mm=$method $O/$(echo $method | tr '[:upper:]' '[:lower:]').zip hello.txt sub
 done
 7zz a -tzip -mm=LZMA $O/lzma.zip hello.txt sub
+python3.14 -c 'import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_ZSTANDARD) as z:
+    for path in sys.argv[2:]:
+        z.write(path)' $O/zstd-python.zip hello.txt sub sub/far.bin sub/lines.txt
 7zz a -tzip -mm=LZMA:eos=off $O/lzma-no-eos.zip hello.txt sub
 zip -r -e -P pw $O/zipcrypto-infozip.zip hello.txt sub
 7zz a -tzip -mem=ZipCrypto -ppw $O/zipcrypto-7zip.zip hello.txt sub
