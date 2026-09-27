@@ -28,8 +28,8 @@ use filen_sdk_rs::{
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpersExt};
 use futures::{StreamExt, stream};
 
-mod copy_helpers;
-use copy_helpers::{Recorder, SignalOnCreate, assert_same_files, contents, copy, data, upload};
+mod drive_helpers;
+use drive_helpers::{Recorder, SignalOnCreate, assert_same_files, contents, copy, data, upload};
 
 #[shared_test_runtime]
 async fn copy_tree_keeps_contents_and_metadata() {

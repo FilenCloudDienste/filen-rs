@@ -29,8 +29,8 @@ use filen_sdk_rs::{
 	},
 };
 
-mod copy_helpers;
-use copy_helpers::{assert_same_files, contents, data, upload};
+mod drive_helpers;
+use drive_helpers::{assert_same_files, contents, data, upload};
 
 #[derive(Default)]
 struct CompressRecorder {
