@@ -128,9 +128,12 @@ pub enum ExtractSkipReason {
 	UnsafePath,
 	/// A zip entry whose data overlaps another's, which a well-formed zip never has.
 	OverlappingData,
-	/// Data compressed or encrypted in a way the SDK does not read (zip PPMd, or encrypted LZMA
-	/// and XZ entries).
+	/// Data compressed or encrypted in a way the SDK does not read (zip PPMd, encrypted LZMA
+	/// and XZ zip entries, or a 7z coder other than LZMA, LZMA2, PPMd, BZip2, Deflate(64),
+	/// the branch and delta filters and AES).
 	UnsupportedMethod,
+	/// A 7z deletion marker, which an update archive carries for a file it removed.
+	AntiItem,
 }
 
 /// Names a zip lists more than once; the last entry of each name is extracted, as other zip

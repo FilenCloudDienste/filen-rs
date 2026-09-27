@@ -29,6 +29,7 @@ use crate::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
 				SourceDisposition, Tree, dispose_dir, dispose_file,
 			},
+			hash::HeadLastHasher,
 			worker::{ARCHIVE_STALL_TIMEOUT, WorkerEvent, WorkerLink},
 		},
 		categories::{DirType, Normal},
@@ -84,6 +85,8 @@ pub(crate) struct CompressTask<B> {
 	pub(crate) sources: Vec<Source>,
 	pub(crate) max_bytes: Option<u64>,
 	pub(crate) config: ArchiveConfig,
+	/// The codec sends the archive's first chunk last ([`WorkerEvent::Head`]).
+	pub(crate) head_last: bool,
 	/// Starts the codec; called once the job holds its lease and memory floor.
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 	/// The report so far: the plan's totals, skips and renames.
@@ -158,12 +161,17 @@ struct Driver<B: DriveBackend> {
 	upload: Arc<B::Upload>,
 	archive_uuid: Uuid,
 	hasher: blake3::Hasher,
+	/// Hashes the archive when its first chunk comes last; `None` once it has.
+	head_last: Option<HeadLastHasher>,
+	/// The archive's hash, once the first chunk came last.
+	head_last_hash: Option<blake3::Hash>,
 	written: u64,
 	next_index: u64,
 	info: Option<RemoteFileInfo>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, (u64, Result<RemoteFileInfo, Error>)>>,
-	/// An archive chunk waiting for memory or for an upload slot; the codec parks meanwhile.
-	held: Option<Vec<u8>>,
+	/// An archive chunk waiting for memory or for an upload slot, and whether it is the
+	/// first chunk sent last; the codec parks meanwhile.
+	held: Option<(Vec<u8>, bool)>,
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
 	max_bytes: Option<u64>,
@@ -189,6 +197,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		sources,
 		max_bytes,
 		config,
+		head_last,
 		start,
 		mut report,
 		disposal,
@@ -276,8 +285,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		upload: Arc::new(upload),
 		archive_uuid,
 		hasher: blake3::Hasher::new(),
+		head_last: head_last.then(HeadLastHasher::new),
+		head_last_hash: None,
 		written: 0,
-		next_index: 0,
+		// the first chunk's index is kept for when it comes
+		next_index: u64::from(head_last),
 		info: None,
 		uploads: FuturesUnordered::new(),
 		held: None,
@@ -455,8 +467,8 @@ impl<B: DisposalBackend> Driver<B> {
 				((source as u32, index), result, permit, op)
 			}) as MaybeSendBoxFuture<'static, _>);
 		}
-		if let Some(data) = self.held.take() {
-			self.take_data(data);
+		if let Some((data, head)) = self.held.take() {
+			self.take_data(data, head);
 		}
 	}
 
@@ -537,22 +549,24 @@ impl<B: DisposalBackend> Driver<B> {
 				self.ask = Some(((source, index), reply));
 				self.serve_ask();
 			}
-			WorkerEvent::Data(data) => self.take_data(data),
+			WorkerEvent::Data(data) => self.take_data(data, false),
+			WorkerEvent::Head(data) => self.take_data(data, true),
 			WorkerEvent::FileEnd => self.reporter.file_done(),
 			// the compressing codec sends nothing else
 			WorkerEvent::Opened(_) | WorkerEvent::Entry(_) | WorkerEvent::Skipped(_) => {}
 		}
 	}
 
-	/// Uploads an archive chunk, or holds it until memory or an upload slot is free.
-	fn take_data(&mut self, data: Vec<u8>) {
+	/// Uploads an archive chunk (the first one when `head`), or holds it until memory or an
+	/// upload slot is free.
+	fn take_data(&mut self, data: Vec<u8>, head: bool) {
 		let permit = if self.uploads.len() < UPLOADS_AT_ONCE {
 			self.take_memory(&self.output_slot)
 		} else {
 			None
 		};
 		let Some(permit) = permit else {
-			self.held = Some(data);
+			self.held = Some((data, head));
 			return;
 		};
 		let len = data.len() as u64;
@@ -565,10 +579,31 @@ impl<B: DisposalBackend> Driver<B> {
 			));
 			return;
 		}
-		self.hasher.update_rayon(&data);
+		let index = match (&mut self.head_last, head) {
+			(None, false) => {
+				self.hasher.update_rayon(&data);
+				self.next_index += 1;
+				self.next_index - 1
+			}
+			(Some(hasher), false) => {
+				hasher.update(&data);
+				self.next_index += 1;
+				self.next_index - 1
+			}
+			(Some(_), true) => {
+				let hasher = self.head_last.take().expect("matched above");
+				self.head_last_hash = Some(hasher.finalize(&data));
+				0
+			}
+			(None, true) => {
+				self.stop_with(Error::custom(
+					ErrorKind::ArchiveCorrupt,
+					"the codec sent the archive's first chunk twice",
+				));
+				return;
+			}
+		};
 		self.written += len;
-		let index = self.next_index;
-		self.next_index += 1;
 		let backend = Arc::clone(&self.backend);
 		let upload = Arc::clone(&self.upload);
 		let op = self.reporter.op();
@@ -695,7 +730,10 @@ impl<B: DisposalBackend> Driver<B> {
 		let completion = UploadCompletion {
 			written: self.written,
 			num_chunks: self.next_index,
-			hash: Blake3Hash::from(self.hasher.finalize()),
+			hash: Blake3Hash::from(
+				self.head_last_hash
+					.unwrap_or_else(|| self.hasher.finalize()),
+			),
 			final_times: (now, now),
 		};
 		let mut retry = NameRetry::new(shape);

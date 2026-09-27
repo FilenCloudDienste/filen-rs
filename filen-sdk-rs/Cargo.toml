@@ -24,6 +24,7 @@ wasm-full = [
 	"dep:twox-hash",
 	"dep:brotli-decompressor",
 	"dep:crc32fast",
+	"dep:ppmd-rust",
 	"dep:brotli",
 	"dep:aes",
 	"dep:ctr",
@@ -248,6 +249,7 @@ hmac = "0.12"
 sha1 = "0.10"
 zeroize = "1"
 deflate64 = "0.1"
+ppmd-rust = "1.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -326,6 +328,7 @@ hmac = { version = "0.12", optional = true }
 sha1 = { version = "0.10", optional = true }
 zeroize = { version = "1", optional = true }
 deflate64 = { version = "0.1", optional = true }
+ppmd-rust = { version = "1.4", optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
@@ -380,6 +383,15 @@ zip8 = { package = "zip", version = "8.6", default-features = false, features = 
 	"deflate64",
 	"bzip2",
 	"aes-crypto",
+] }
+# Reads the 7z archives the SDK writes and writes ones it reads, in the interop tests.
+sevenz-rust2 = { version = "0.23", default-features = false, features = [
+	"aes256",
+	"bzip2",
+	"compress",
+	"ppmd",
+	"deflate",
+	"util",
 ] }
 
 # wasm only dev-dependencies

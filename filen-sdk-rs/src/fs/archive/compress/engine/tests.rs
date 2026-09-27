@@ -29,6 +29,7 @@ use crate::{
 			dispose::{DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree},
 			encode::Compression,
 			format::StreamCodec,
+			sevenz::write::SevenZMethod,
 			tar_iter::TarReader,
 			worker,
 		},
@@ -217,6 +218,7 @@ fn start_disposing(
 			.collect(),
 		max_bytes,
 		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		head_last: matches!(format, CompressFormat::SevenZ { .. }),
 		start,
 		report,
 		disposal,
@@ -707,5 +709,88 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 		let log = setup.backend.log();
 		assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
 		assert!(log.trashed_dirs.is_empty());
+	}
+}
+
+/// The entries of a 7z read back through the SDK's reader, every CRC-32 checked.
+fn sevenz_entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
+	use crate::fs::archive::sevenz::read::{FolderCursor, Keys, SevenZLimits, read_index};
+	let limits = SevenZLimits {
+		max_index_bytes: 1 << 20,
+		max_entries: 100,
+		decoder_memory: 64 << 20,
+	};
+	let mut keys = Keys::new(None);
+	let mut source = std::io::Cursor::new(archive);
+	let index = read_index(&mut source, archive.len() as u64, limits, &mut keys).unwrap();
+	assert_eq!(index.unaccounted_bytes, 0);
+	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
+	index
+		.entries
+		.iter()
+		.map(|entry| {
+			let mut data = Vec::new();
+			if entry.stream.is_some() {
+				cursor
+					.open(&index, entry, &mut keys)
+					.unwrap()
+					.read_to_end(&mut data)
+					.unwrap();
+			}
+			(entry.name.clone(), data)
+		})
+		.collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_7z_uploads_its_first_chunk_last() {
+	for (method, solid) in [
+		(SevenZMethod::Copy, false),
+		(SevenZMethod::Lzma2 { level: 1 }, true),
+	] {
+		let setup = setup(|_, _| {});
+		let format = CompressFormat::SevenZ {
+			method,
+			solid,
+			encryption: None,
+		};
+		let job = start(&setup, "bundle.7z", format, JobControl::default(), None);
+		let report = job.running.await.unwrap().unwrap();
+		let archive = report.archive.as_ref().expect("the archive is registered");
+		let (_, completion) = setup.backend.log().finished[&archive.uuid()].clone();
+		let bytes = uploaded(&setup, archive.uuid());
+		assert_eq!(completion.written, bytes.len() as u64, "{method:?}");
+		assert_eq!(
+			completion.num_chunks,
+			(bytes.len() as u64).div_ceil(CHUNK_SIZE as u64),
+			"{method:?}"
+		);
+		// the hash merged around the late first chunk is the whole archive's
+		assert_eq!(
+			completion.hash,
+			Blake3Hash::from(blake3::hash(&bytes)),
+			"{method:?}"
+		);
+		let order: Vec<u64> = setup
+			.backend
+			.log()
+			.uploaded
+			.iter()
+			.filter(|(file, _)| *file == archive.uuid())
+			.map(|(_, index)| *index)
+			.collect();
+		assert_eq!(order.last(), Some(&0), "{method:?}: chunk 0 goes up last");
+		assert_eq!(
+			sevenz_entries(&bytes),
+			[
+				("docs/a.txt".to_owned(), setup.contents[0].clone()),
+				("docs/big.bin".to_owned(), setup.contents[1].clone()),
+				("top.txt".to_owned(), setup.contents[2].clone()),
+				("docs".to_owned(), Vec::new()),
+			],
+			"{method:?}"
+		);
+		assert_eq!(report.counts.files_done, 3);
+		assert_released(&setup, &job.reporter);
 	}
 }

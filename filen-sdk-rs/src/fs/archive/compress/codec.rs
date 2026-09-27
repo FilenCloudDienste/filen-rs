@@ -11,6 +11,7 @@ use super::{
 	super::{
 		encode::{StreamEncoder, open_encoder},
 		password::ArchivePassword,
+		sevenz::write::SevenZWriter,
 		worker::{ChunkInput, ChunkSink, JobEnded, WorkerEvent, WorkerPort},
 		zip::write::{Encryption, ZipWriter},
 	},
@@ -105,6 +106,53 @@ pub(crate) fn compress(port: &WorkerPort, job: CompressJob) -> Result<u64, Error
 				}
 			}
 			zip.finish().map_err(failure)?.finish().map_err(failure)
+		}
+		CompressFormat::SevenZ {
+			method,
+			solid,
+			encryption,
+		} => {
+			// a 7z's start points at its header, so its first chunk is sent last
+			drop(sink);
+			let password = match (encryption, &job.password) {
+				(None, _) => None,
+				(Some(what), Some(password)) => Some((what, password.utf16le())),
+				(Some(_), None) => {
+					return Err(Error::custom(
+						ErrorKind::ArchivePasswordRequired,
+						"an encrypted 7z needs a password",
+					));
+				}
+			};
+			let mut writer = SevenZWriter::new(
+				ChunkSink::holding_head(port),
+				method,
+				solid,
+				password
+					.as_ref()
+					.map(|(what, password)| (*what, &password[..])),
+			)
+			.map_err(failure)?;
+			for entry in job.entries {
+				match entry {
+					ArchiveEntry::Dir { path, modified } => writer.add_dir(&path, modified),
+					ArchiveEntry::File {
+						source,
+						path,
+						size,
+						modified,
+					} => {
+						let mut data = ChunkInput::new(port, source, size);
+						let read = writer
+							.add_file(&path, modified, size, &mut data)
+							.map_err(failure)?;
+						check_length(read, size)?;
+						port.send(WorkerEvent::FileEnd).map_err(failure)?;
+					}
+				}
+			}
+			let (sink, start) = writer.finish().map_err(failure)?;
+			sink.finish_with_head(&start).map_err(failure)
 		}
 		CompressFormat::Single { compression } => {
 			let [ArchiveEntry::File { source, size, .. }] = job.entries[..] else {

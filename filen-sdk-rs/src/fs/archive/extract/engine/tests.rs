@@ -26,6 +26,7 @@ use crate::{
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 			password::ArchivePassword,
+			sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 			zip::{
 				crypto::AesStrength,
 				write::{Encryption, ZipMethod, ZipWriter},
@@ -850,4 +851,83 @@ async fn a_zip_with_duplicate_names_is_kept() {
 	assert_eq!(report.duplicates.as_ref().map(|d| d.count), Some(1));
 	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
 	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+fn sevenz_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) -> Vec<u8> {
+	let password: Option<Vec<u8>> =
+		password.map(|password| password.encode_utf16().flat_map(u16::to_le_bytes).collect());
+	let mut writer = SevenZWriter::with_cycles_power(
+		Vec::new(),
+		SevenZMethod::Lzma2 { level: 1 },
+		true,
+		password
+			.as_deref()
+			.map(|password| (SevenZEncryption::EntriesAndHeaders, password)),
+		4,
+	)
+	.unwrap();
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None),
+			Some(data) => {
+				writer
+					.add_file(path, None, data.len() as u64, &mut &data[..])
+					.unwrap();
+			}
+		}
+	}
+	let (mut archive, start) = writer.finish().unwrap();
+	archive[..32].copy_from_slice(&start);
+	archive
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_an_encrypted_7z_and_removes_it() {
+	let big = pattern(2 * CHUNK_SIZE + 5, 6);
+	let archive = sevenz_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("docs/big.bin", Some(&big)),
+		],
+		Some("pw"),
+	);
+	// a 7z's entries are checked one by one, so no hash of the whole archive is needed
+	let (setup, parent) = disposable(archive, None, |_| {});
+	let options = Options {
+		dispose: Some((SourceDisposal::DeletePermanently, parent)),
+		password: Some(ArchivePassword::new("pw".into()).unwrap()),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	// the files come before their directory's own entry, which then merges with it
+	assert_eq!(created_dirs(&setup), ["bundle", "docs"]);
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([
+			("a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			("big.bin".to_owned(), (big.len() as u64, 3, hash(&big))),
+		])
+	);
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_7z_with_a_wrong_password_creates_nothing() {
+	let archive = sevenz_of(&[("a.txt", Some(b"a"))], Some("pw"));
+	let setup = setup("s.7z", archive, |_| {});
+	let options = Options {
+		password: Some(ArchivePassword::new("nope".into()).unwrap()),
+		..Options::default()
+	};
+	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(created_dirs(&setup).is_empty());
+	assert!(finished(&setup).is_empty());
 }

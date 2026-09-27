@@ -241,6 +241,8 @@ struct Driver<B: DriveBackend> {
 	held: Option<WorkerEvent>,
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
+	/// Entries the archive holds no checksum for, which were extracted unverified.
+	unchecked_entries: u64,
 	/// Plaintext bytes committed to uploads, for `max_bytes`.
 	committed: u64,
 	items: u64,
@@ -354,6 +356,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		held: None,
 		events_closed: false,
 		codec_result: None,
+		unchecked_entries: 0,
 		committed: 0,
 		items: 0,
 		stamp: 0,
@@ -677,6 +680,7 @@ impl<B: DisposalBackend> Driver<B> {
 			Ok(end) => {
 				self.report.unaccounted_bytes = end.unaccounted_bytes;
 				self.report.duplicates = end.duplicates.clone();
+				self.unchecked_entries = end.unchecked_entries;
 			}
 			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
 			Err(error) if self.fatal.is_some() || self.control.is_stopping() => {
@@ -728,6 +732,8 @@ impl<B: DisposalBackend> Driver<B> {
 			WorkerEvent::Entry(head) => self.on_entry(head),
 			WorkerEvent::Skipped(member) => self.on_skipped(member),
 			event @ (WorkerEvent::Data(_) | WorkerEvent::FileEnd) => self.retry_held(event),
+			// only a compressing codec sends a head
+			WorkerEvent::Head(_) => debug_assert!(false, "an extracting codec sent a head"),
 		}
 		Ok(())
 	}
@@ -754,9 +760,10 @@ impl<B: DisposalBackend> Driver<B> {
 		self.unverified = listed.unverified;
 		let root_entry = self.entry_id(0);
 		let new_folder = match (&self.root, layout) {
-			(ExtractRoot::NewFolder { name }, StreamLayout::Tar { .. } | StreamLayout::Zip) => {
-				Some(name.clone())
-			}
+			(
+				ExtractRoot::NewFolder { name },
+				StreamLayout::Tar { .. } | StreamLayout::Zip | StreamLayout::SevenZ,
+			) => Some(name.clone()),
 			(_, StreamLayout::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
 		let root_uuid = match new_folder {
@@ -1486,10 +1493,14 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.report.duplicates.is_some() {
 			return kept(KeptReason::Incomplete);
 		}
-		if self.layout != Some(StreamLayout::Zip) {
+		if self.unchecked_entries > 0 {
+			return kept(KeptReason::Unconfirmed);
+		}
+		if !matches!(self.layout, Some(StreamLayout::Zip | StreamLayout::SevenZ)) {
 			// A streaming archive's entries carry no checksum of their own (a tar's) or share
 			// one for the whole stream: the whole archive, read front to back, has to match the
-			// hash in its metadata. A zip's entries were each checked as they were read.
+			// hash in its metadata. A zip's or a 7z's entries were each checked as they were
+			// read.
 			if !self.sequential || self.served != self.chunks {
 				return kept(KeptReason::Unconfirmed);
 			}
