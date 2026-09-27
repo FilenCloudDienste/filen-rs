@@ -161,8 +161,9 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
-	/// Directories whose listing and files whose fetches or permanent deletion wait while they
-	/// are in the set, each wait logged in [`FakeLog::held`].
+	/// Items whose requests wait while they are in the set, each wait logged in
+	/// [`FakeLog::held`]: a directory's listing, a file's fetches, state and permanent deletion,
+	/// and propagating either.
 	pub(crate) held: watch::Sender<HashSet<Uuid>>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
@@ -191,7 +192,7 @@ pub(crate) struct FakeBackend {
 pub(crate) const DEFAULT_MEMORY_CHUNKS: usize = 4;
 
 impl FakeBackend {
-	/// A backend copying into `destination`, the one directory that exists before the copy.
+	/// A backend for a job writing into `destination`, the one directory that exists before it.
 	pub(crate) fn new(destination: Uuid) -> Self {
 		Self {
 			memory: Arc::new(Semaphore::new(budget(DEFAULT_MEMORY_CHUNKS))),
@@ -386,6 +387,7 @@ impl DriveBackend for FakeBackend {
 		_targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
 	) -> Vec<Error> {
+		self.hold(item.uuid()).await;
 		self.log().propagated_trees.push(item.uuid());
 		Vec::new()
 	}
@@ -488,7 +490,7 @@ impl DriveBackend for FakeBackend {
 				.lock()
 				.unwrap()
 				.contains(&name.as_ref().to_lowercase()),
-			"a copy must never be registered under a name the destination holds"
+			"a file must never be registered under a name the destination holds"
 		);
 		let mut log = self.log();
 		// the server's rules for finishing an upload: every chunk index once, and nothing past
@@ -585,6 +587,7 @@ mod disposal {
 
 	impl DisposalBackend for FakeBackend {
 		async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
+			self.hold(uuid).await;
 			tokio::time::sleep(self.delay).await;
 			let log = self.log();
 			match log.file_parents.get(&uuid) {

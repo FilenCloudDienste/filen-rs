@@ -48,12 +48,28 @@ use crate::{
 	job::test_support::controls,
 };
 
+/// What a job held when an update reported it paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldWhilePaused {
+	/// Whether the client's memory budget was all free.
+	memory_free: bool,
+	/// Whether every job's floor was free (the job's own, when no other runs).
+	floor_free: bool,
+	drive_locks: usize,
+}
+
+/// Tells what a job holds right now.
+type Probe = Box<dyn Fn() -> HeldWhilePaused + Send + Sync>;
+
 #[derive(Default)]
 struct Recorder {
 	top_level: Mutex<Vec<ExtractedTopLevel>>,
 	/// The size of each `on_top_level_created` batch.
 	batches: Mutex<Vec<usize>>,
 	updates: Mutex<Vec<ExtractUpdate>>,
+	probe: Option<Probe>,
+	/// What the job held at each update reporting it paused, told by `probe`.
+	held_while_paused: Mutex<Vec<HeldWhilePaused>>,
 }
 
 impl ExtractCallback for Recorder {
@@ -63,6 +79,11 @@ impl ExtractCallback for Recorder {
 	}
 
 	fn on_update(&self, update: ExtractUpdate) {
+		if update.run_state == RunState::Paused
+			&& let Some(probe) = &self.probe
+		{
+			self.held_while_paused.lock().unwrap().push(probe());
+		}
 		self.updates.lock().unwrap().push(update);
 	}
 }
@@ -220,7 +241,21 @@ fn start_with(
 	options: Options,
 	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 ) -> Job {
-	let recorder = Arc::new(Recorder::default());
+	let probe: Probe = {
+		let memory = Arc::clone(&setup.backend.memory);
+		let budget = setup.backend.budget;
+		let config = options.config.clone();
+		let live_locks = Arc::clone(&setup.backend.live_locks);
+		Box::new(move || HeldWhilePaused {
+			memory_free: memory.available_permits() == budget,
+			floor_free: config.floor_is_free(),
+			drive_locks: live_locks.load(Ordering::SeqCst),
+		})
+	};
+	let recorder = Arc::new(Recorder {
+		probe: Some(probe),
+		..Recorder::default()
+	});
 	let reporter = Reporter::new(
 		Arc::clone(&recorder),
 		ArchiveTotals::Streaming {
@@ -275,7 +310,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 }
 
 /// Everything a finished job must have given back.
-fn assert_released(setup: &Setup, reporter: &Reporter) {
+fn assert_released(setup: &Setup, reporter: &Reporter, recorder: &Recorder) {
 	assert_eq!(
 		setup.backend.memory.available_permits(),
 		setup.backend.budget,
@@ -287,6 +322,15 @@ fn assert_released(setup: &Setup, reporter: &Reporter) {
 		"no drive lock is held"
 	);
 	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
+	assert!(
+		recorder
+			.held_while_paused
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|held| held.memory_free && held.drive_locks == 0),
+		"no update reports the job paused while it holds memory or a lock"
+	);
 	let log = setup.backend.log();
 	let uploaded: HashSet<_> = log.uploaded.iter().copied().collect();
 	assert_eq!(
@@ -412,7 +456,7 @@ async fn extracts_a_compressed_tar_into_a_new_folder() {
 		"the callback got the root too"
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Done);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// The report's renames as path, name and reason, sorted: they are recorded as entries finish.
@@ -494,7 +538,7 @@ async fn extracting_into_the_destination_keeps_both() {
 		top[1..].iter().copied().collect::<HashSet<_>>(),
 		HashSet::from([id(1), id(2)])
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,7 +583,7 @@ async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
 			),
 		]
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// The failure events the updates carried: whether of a directory, path, stage, error kind.
@@ -630,7 +674,7 @@ async fn a_directory_that_fails_takes_its_subtree_and_nothing_else() {
 			),
 		]
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// The uuid of the directory the job created as `name`.
@@ -729,7 +773,7 @@ async fn a_file_that_fails_is_recorded_once_and_the_rest_extract() {
 			..ItemCounts::default()
 		}
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -765,7 +809,7 @@ async fn a_file_registered_as_a_version_is_a_failure() {
 	);
 	let top: Vec<Uuid> = report.top_level.iter().map(|top| top.item.uuid()).collect();
 	assert_eq!(top.len(), 1, "only the new file is reported created");
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -780,7 +824,7 @@ async fn a_failed_archive_fetch_or_lock_ends_the_job() {
 	assert_eq!(failed.error.kind(), ErrorKind::Server);
 	assert!(created_dirs(&setup_fetch).is_empty());
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
-	assert_released(&setup_fetch, &job.reporter);
+	assert_released(&setup_fetch, &job.reporter, &job.recorder);
 
 	// the drive lock is lost after the folder was created: its entries fail, and the job with
 	// the first error that ends it
@@ -795,7 +839,7 @@ async fn a_failed_archive_fetch_or_lock_ends_the_job() {
 	assert_eq!(created_dirs(&setup_lock), ["bundle"]);
 	assert!(finished(&setup_lock).is_empty());
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
-	assert_released(&setup_lock, &job.reporter);
+	assert_released(&setup_lock, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -808,7 +852,7 @@ async fn a_new_folder_whose_name_was_taken_since_gets_the_next() {
 	assert_eq!(finished_paths(&setup), ["bundle (1)/a.txt"]);
 	let top: Vec<ExtractTopLevelKey> = report.top_level.iter().map(|top| top.key).collect();
 	assert_eq!(top, [ExtractTopLevelKey::Root]);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -833,7 +877,7 @@ async fn a_single_compressed_file_lands_in_the_destination() {
 			}
 		}]
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -852,7 +896,7 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 	assert_eq!(failed.report.counts.files_done, 1);
 	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -868,7 +912,7 @@ async fn the_limits_end_the_job() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
 	assert!(finished(&setup_bytes).is_empty());
-	assert_released(&setup_bytes, &job.reporter);
+	assert_released(&setup_bytes, &job.reporter, &job.recorder);
 
 	let setup_items = setup("a.tar", tar, |_| {});
 	let options = Options {
@@ -878,7 +922,7 @@ async fn the_limits_end_the_job() {
 	let job = start(&setup_items, options);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
-	assert_released(&setup_items, &job.reporter);
+	assert_released(&setup_items, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -902,7 +946,7 @@ async fn directories_implied_past_the_member_cap_end_the_job() {
 		created_dirs(&setup).len() <= MAX_MEMBERS as usize + 1,
 		"no more directories than the cap, besides the new folder"
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(start_paused = true)]
@@ -946,7 +990,7 @@ async fn directories_are_planned_only_as_fast_as_they_are_created() {
 	let _ = result.send(read_in_full());
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.dirs_created, below as u64 + 2);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -970,7 +1014,7 @@ async fn registrations_run_bounded() {
 		MAX_SMALL_PARALLEL_REQUESTS,
 		"as many at once as other small requests, and no more"
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1011,7 +1055,7 @@ async fn files_are_read_only_as_fast_as_they_are_registered() {
 	let _ = result.send(read_in_full());
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, count as u64);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1055,7 +1099,7 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 		}
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Cancelled);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1066,7 +1110,7 @@ async fn a_silent_codec_is_given_up_on() {
 	let failed = job.running.await.unwrap().unwrap_err();
 
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWorkerDied);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 	// the codec's ends were held open all along
 	drop((events, result));
 }
@@ -1116,7 +1160,7 @@ async fn extract_disposing(
 	};
 	let job = start(&setup, options);
 	let report = job.running.await.unwrap().unwrap();
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 	(setup, report)
 }
 
@@ -1330,7 +1374,7 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 	let events = disposition_events(&job.recorder);
 	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
 	assert!(setup.backend.log().deleted_files.is_empty());
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 
 	// cancelled while it waits for a slot
 	let config = one_slot();
@@ -1371,29 +1415,34 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 		.map(|name| (name.as_str(), &b"x"[..]))
 		.collect();
 	let tar = tar_of(&members);
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
-		backend.delay = Duration::from_millis(50);
-	});
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let config = test_config();
 	let (pause, _cancel, control) = controls();
 	let job = start(
 		&setup,
 		Options {
 			root: ExtractRoot::Destination,
 			control,
+			config: config.clone(),
 			dispose: Some((SourceDisposal::Trash, parent)),
 			..Options::default()
 		},
 	);
+	// the files registered first are in the first batch checked: their checks wait
+	wait_until("a file is registered", || {
+		!setup.backend.log().finished.is_empty()
+	})
+	.await;
+	let first: HashSet<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.held.send_replace(first);
 	wait_until("the output is checked", || {
-		let updates = job.recorder.updates.lock().unwrap();
-		updates
-			.last()
-			.is_some_and(|update| update.phase == ExtractPhase::DisposingSources)
+		!setup.backend.log().held.is_empty()
 	})
 	.await;
 	pause.send_replace(true);
+	setup.backend.held.send_replace(HashSet::new());
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert!(!job.running.is_finished());
+	assert_paused_holding_nothing(&setup, &job, &config);
 	assert!(
 		setup.backend.log().trashed_files.is_empty(),
 		"the archive is not removed while paused"
@@ -1406,7 +1455,7 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 		DisposalOutcome::Disposed { .. }
 	));
 	assert_eq!(setup.backend.log().trashed_files, [setup.archive.uuid()]);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1511,7 +1560,7 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 		DisposalOutcome::Disposed { .. }
 	));
 	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1613,7 +1662,7 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 		DisposalOutcome::Disposed { .. }
 	));
 	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1897,7 +1946,7 @@ async fn a_job_paused_before_it_starts_takes_no_slot() {
 		paused.recorder.run_states(),
 		[RunState::Paused, RunState::Running]
 	);
-	assert_released(&setup_paused, &paused.reporter);
+	assert_released(&setup_paused, &paused.reporter, &paused.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1958,7 +2007,7 @@ async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
 	pause.send_replace(false);
 	let report = queued.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, 1);
-	assert_released(&setup_queued, &queued.reporter);
+	assert_released(&setup_queued, &queued.reporter, &queued.recorder);
 	assert_eq!(config.free_slots(), 1);
 	assert!(config.floor_is_free());
 }
@@ -1967,6 +2016,16 @@ async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
 /// operation in flight.
 fn assert_paused_holding_nothing(setup: &Setup, job: &Job, config: &ArchiveConfig) {
 	assert!(job.reporter.is_paused());
+	let held = job.recorder.held_while_paused.lock().unwrap().clone();
+	let nothing = HeldWhilePaused {
+		memory_free: true,
+		floor_free: true,
+		drive_locks: 0,
+	};
+	assert!(
+		!held.is_empty() && held.iter().all(|held| *held == nothing),
+		"every update reporting the job paused found it holding nothing: {held:?}"
+	);
 	assert_eq!(
 		setup.backend.memory.available_permits(),
 		setup.backend.budget,
@@ -2021,7 +2080,7 @@ async fn a_pause_while_a_registration_waits_for_the_lock_holds_nothing() {
 			RunState::Running
 		]
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// A file entry at `path`, as the codec sends it.
@@ -2093,7 +2152,7 @@ async fn a_pause_while_the_archive_opens_holds_nothing() {
 		[RunState::Running, RunState::Paused, RunState::Running],
 		"the pause is taken up once the archive is opened, with nothing left in flight"
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 /// Operations in flight while directories are created as many at once as they can be: those
@@ -2152,7 +2211,7 @@ async fn a_pause_leaves_no_directory_uncreated() {
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.dirs_created, count as u64 + 1);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2260,7 +2319,7 @@ async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
 			RunState::Running
 		]
 	);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2288,7 +2347,7 @@ async fn the_archive_read_to_its_end_holds_no_memory() {
 		.await
 		.expect("the last chunk is given back once the codec ended");
 	job.running.await.unwrap().unwrap();
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2330,7 +2389,73 @@ async fn a_cancel_while_paused_winds_down() {
 		]
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Cancelled);
-	assert_released(&setup, &job.reporter);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_while_finishing_gives_back_the_input_and_the_lock() {
+	// larger than the floor, and never asked for in full by the codec: chunks prefetched past
+	// its last read, as a zip's index chunks fetched again for its entries
+	let setup = setup("bundle.tar", pattern(3 * CHUNK_SIZE, 3), |backend| {
+		// the destination is shared while the job runs: every item is propagated again
+		backend.later_targets = Some(crate::connect::ConnectedTargets::with_test_users(1));
+	});
+	let config = test_config();
+	let (pause, _cancel, control) = controls();
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		Options {
+			root: ExtractRoot::Destination,
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	// more top-level items than are propagated at once
+	let count = MAX_SMALL_PARALLEL_REQUESTS + 6;
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	for ordinal in 0..count {
+		for event in [
+			file_entry(ordinal as u64, &format!("f{ordinal:03}"), 1),
+			WorkerEvent::Data(vec![ordinal as u8]),
+			WorkerEvent::FileEnd,
+		] {
+			events.send(event).await.unwrap();
+		}
+	}
+	wait_until("every file is registered", || {
+		setup.backend.log().finished.len() == count
+	})
+	.await;
+	// the first batch propagated waits
+	let registered: HashSet<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.held.send_replace(registered);
+	drop(events);
+	let _ = result.send(read_in_full());
+	wait_until("the first batch propagates", || {
+		setup.backend.log().held.len() == MAX_SMALL_PARALLEL_REQUESTS
+	})
+	.await;
+	pause.send_replace(true);
+	setup.backend.held.send_replace(HashSet::new());
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Finishing);
+	assert_eq!(
+		setup.backend.log().propagated_trees.len(),
+		MAX_SMALL_PARALLEL_REQUESTS,
+		"the batch in flight finished, then the lock was given back"
+	);
+
+	pause.send_replace(false);
+	job.running.await.unwrap().unwrap();
+	assert_eq!(setup.backend.log().propagated_trees.len(), count);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
