@@ -65,7 +65,7 @@ impl ItemError {
 
 // The names these records went by when only a copy had them, so TypeScript written against those
 // keeps compiling.
-#[cfg(all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"))]
+#[cfg(feature = "wasm-full")]
 #[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
 const TS_COPY_ALIASES: &str = r#"
 export type CopyError = JobError;

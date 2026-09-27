@@ -85,7 +85,7 @@ pub struct ArchiveEntry {
 	pub size: Option<u64>,
 	/// When it was last changed, as the archive states it.
 	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		feature = "wasm-full",
 		tsify(type = "bigint", optional),
 		serde(
 			with = "filen_types::serde::time::optional",

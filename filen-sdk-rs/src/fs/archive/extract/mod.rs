@@ -119,15 +119,9 @@ pub enum ExtractRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(import, no_default)]
 pub struct ExpansionLimit {
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
-		tsify(type = "number | bigint")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "number | bigint"))]
 	pub ratio: u64,
-	#[cfg_attr(
-		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
-		tsify(type = "number | bigint")
-	)]
+	#[cfg_attr(feature = "wasm-full", tsify(type = "number | bigint"))]
 	pub floor: u64,
 }
 
