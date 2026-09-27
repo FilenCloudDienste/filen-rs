@@ -158,10 +158,9 @@ impl Client {
 					reporter.checkpoint(control).await?;
 					bytes.next_source();
 					let listing = self.list_item_source(dir, &bytes);
-					let source =
-						watch_listing(listing, &reporter.ops(), control, || report(sources_done))
-							.await?
-							.map_err(ScanError::Failed)?;
+					let source = watch_listing(listing, &ops, control, || report(sources_done))
+						.await?
+						.map_err(ScanError::Failed)?;
 					sources_done += 1;
 					report(sources_done);
 					source
