@@ -1593,6 +1593,10 @@ async fn a_pause_while_the_archive_opens_holds_nothing() {
 	assert_released(&setup, &job.reporter);
 }
 
+/// Operations in flight while directories are created as many at once as they can be: those
+/// creates, and the archive's one chunk, which a scripted codec never asks for.
+const CREATING_WITH_THE_ARCHIVE: u64 = MAX_SMALL_PARALLEL_REQUESTS as u64 + 1;
+
 /// A directory entry at `path`, as the codec sends it.
 fn dir_entry(ordinal: u64, path: &str) -> WorkerEvent {
 	WorkerEvent::Entry(EntryHead {
@@ -1633,7 +1637,7 @@ async fn a_pause_leaves_no_directory_uncreated() {
 	drop(events);
 	let _ = result.send(read_in_full());
 	wait_until("the first directories are being created", || {
-		job.reporter.ops_in_flight() == MAX_SMALL_PARALLEL_REQUESTS as u64
+		job.reporter.ops_in_flight() == CREATING_WITH_THE_ARCHIVE
 	})
 	.await;
 	// a moment of the creates' ten seconds, for the driver to take the archive's end
@@ -1678,7 +1682,7 @@ async fn a_cancel_leaves_the_directories_not_created_yet_not_attempted() {
 		"every directory is planned, the first being created",
 		|| {
 			events.capacity() == events.max_capacity()
-				&& job.reporter.ops_in_flight() == MAX_SMALL_PARALLEL_REQUESTS as u64
+				&& job.reporter.ops_in_flight() == CREATING_WITH_THE_ARCHIVE
 		},
 	)
 	.await;

@@ -239,7 +239,9 @@ struct Driver<B: DriveBackend> {
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
-	ready: VecDeque<(u64, Vec<u8>, OwnedSemaphorePermit)>,
+	/// Fetched chunks the codec has not asked for yet, each counted in flight while it holds
+	/// memory, so the job is only reported paused once a pause dropped them.
+	ready: VecDeque<(u64, Vec<u8>, OwnedSemaphorePermit, OpGuard)>,
 	/// The chunk the codec is reading, released when it asks for the next.
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
@@ -825,7 +827,7 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.ready.front().is_none_or(|(ready, ..)| ready != index) {
 			return;
 		}
-		let (_, data, permit) = self.ready.pop_front().expect("just checked");
+		let (_, data, permit, _op) = self.ready.pop_front().expect("just checked");
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
@@ -836,11 +838,11 @@ impl<B: DisposalBackend> Driver<B> {
 			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
 	}
 
-	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) {
+	fn fetch_finished(&mut self, (index, result, permit, op): FetchedChunk) {
 		let expected = chunk_plaintext_len(self.archive.size(), index);
 		match result {
 			Ok(data) if data.len() as u64 == expected => {
-				self.ready.push_back((index, data, permit));
+				self.ready.push_back((index, data, permit, op));
 				self.serve_ask();
 			}
 			Ok(data) => self.stop_with(Error::custom(
