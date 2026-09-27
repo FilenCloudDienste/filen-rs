@@ -109,10 +109,9 @@ async fn register<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
 	_lock: HeldLock<B::DriveLock>,
 ) -> Result<Finalized, FinalizeError> {
+	// the control and ops were for waiting for the lock, which is held
 	let FinalizeTask {
 		backend,
-		control: _,
-		ops: _,
 		upload,
 		parent,
 		mut name,
@@ -120,6 +119,7 @@ async fn register<B: DriveBackend>(
 		completion,
 		info,
 		targets,
+		..
 	} = task;
 	if let Some(retry) = recheck {
 		// Registering a file under a name the parent already holds would make it a new version

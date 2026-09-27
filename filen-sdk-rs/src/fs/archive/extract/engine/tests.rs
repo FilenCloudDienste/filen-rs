@@ -1035,6 +1035,11 @@ async fn registrations_run_bounded() {
 		MAX_SMALL_PARALLEL_REQUESTS,
 		"as many at once as other small requests, and no more"
 	);
+	assert_eq!(
+		setup.backend.log().finishing,
+		names,
+		"registered in archive order"
+	);
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 

@@ -26,7 +26,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashSet, VecDeque},
 	io,
 	sync::Arc,
 };
@@ -272,7 +272,8 @@ struct Driver<B: DriveBackend> {
 	ready_dirs: VecDeque<DirId>,
 	dir_creates:
 		FuturesUnordered<MaybeSendBoxFuture<'static, (DirId, Result<CreatedDirOutcome, DirError>)>>,
-	files: HashMap<u64, FileSlot<B::Upload>>,
+	/// Open file entries by ordinal, so ready ones register in archive order.
+	files: BTreeMap<u64, FileSlot<B::Upload>>,
 	/// The file receiving data.
 	current: Option<u64>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, UploadedChunk>>,
@@ -414,7 +415,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		uncreated_dirs: 0,
 		ready_dirs: VecDeque::new(),
 		dir_creates: FuturesUnordered::new(),
-		files: HashMap::new(),
+		files: BTreeMap::new(),
 		current: None,
 		uploads: FuturesUnordered::new(),
 		finalizes: FuturesUnordered::new(),
