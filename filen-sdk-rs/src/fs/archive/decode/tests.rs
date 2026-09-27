@@ -95,6 +95,9 @@ fn lz4(data: &[u8], info: FrameInfo) -> Vec<u8> {
 	encoder.finish().unwrap()
 }
 
+/// What the zstd decoder reports damaged data as.
+const ZSTD_INVALID: &str = "invalid zstd data";
+
 fn zstd(data: &[u8]) -> Vec<u8> {
 	ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
 }
@@ -639,18 +642,17 @@ fn a_zstd_window_is_charged_before_it_is_allocated() {
 	);
 }
 
-/// Whether what is written to it is `expected`, without keeping it.
-struct Matches<'a> {
-	expected: &'a [u8],
-	matched: bool,
+/// Hashes what is written to it, without keeping it.
+#[derive(Default)]
+struct Hashed {
+	len: u64,
+	crc: crc32fast::Hasher,
 }
 
-impl Write for Matches<'_> {
+impl Write for Hashed {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		match self.expected.split_at_checked(buf.len()) {
-			Some((head, rest)) if head == buf => self.expected = rest,
-			_ => self.matched = false,
-		}
+		self.len += buf.len() as u64;
+		self.crc.update(buf);
 		Ok(buf.len())
 	}
 
@@ -659,17 +661,14 @@ impl Write for Matches<'_> {
 	}
 }
 
-/// Decodes `bytes` under the heap meter: whether it decoded to `data`, and the decoder's peak.
-fn zstd_peak(bytes: &[u8], data: &[u8]) -> (bool, u64) {
-	let mut matches = Matches {
-		expected: data,
-		matched: true,
-	};
-	let (_, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+/// Decodes `bytes` under the heap meter: the decoded length and CRC-32, and the decoder's peak.
+fn zstd_peak(bytes: &[u8]) -> ((u64, u32), u64) {
+	let mut hashed = Hashed::default();
+	let ((), peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
 		let mut decoder = open_stream(StreamCodec::Zstd, bytes, 512 * MIB).unwrap();
-		io::copy(&mut decoder, &mut matches).unwrap();
+		io::copy(&mut decoder, &mut hashed).unwrap();
 	});
-	(matches.matched && matches.expected.is_empty(), peak)
+	((hashed.len, hashed.crc.finalize()), peak)
 }
 
 #[test]
@@ -679,8 +678,8 @@ fn a_zstd_decoder_stays_within_what_its_window_is_charged() {
 	let charged = |window: u64| (window + 128 * 1024).next_power_of_two() * 3 / 2 + 2 * MIB;
 	for (window_log, len) in [(23, 9 * MIB_USIZE), (17, 2 * MIB_USIZE)] {
 		let data = sample(len);
-		let (decoded, peak) = zstd_peak(&zstd_raw_frame(&data, window_log, true, None), &data);
-		assert!(decoded);
+		let (decoded, peak) = zstd_peak(&zstd_raw_frame(&data, window_log, true, None));
+		assert_eq!(decoded, (len as u64, crc32fast::hash(&data)));
 		assert!(
 			peak <= charged(1 << window_log),
 			"a {window_log}-bit window took {peak} bytes"
@@ -688,9 +687,141 @@ fn a_zstd_decoder_stays_within_what_its_window_is_charged() {
 	}
 	// compressed blocks fill the literal, sequence and table buffers the state is charged for
 	let data = sample(4 * MIB_USIZE);
-	let (decoded, peak) = zstd_peak(&zstd(&data), &data);
-	assert!(decoded);
+	let (decoded, peak) = zstd_peak(&zstd(&data));
+	assert_eq!(decoded, (data.len() as u64, crc32fast::hash(&data)));
 	assert!(peak <= charged(128 * 1024), "took {peak} bytes");
+	// the most sequences a block holds, 43690 matches of 3 bytes: the sequence buffer at its
+	// largest, in a frame of the smallest window a full block fits
+	let count: u32 = 128 * 1024 / 3;
+	let mut block = vec![0, 255];
+	block.extend_from_slice(&u16::try_from(count - 0x7F00).unwrap().to_le_bytes());
+	block.extend_from_slice(&[0b0101_0100, 0, 0, 0, 1]);
+	let ((decoded, _), peak) = zstd_peak(&zstd_crafted_frame(17, &block));
+	assert_eq!(decoded, 8 + 3 * u64::from(count));
+	assert!(peak <= charged(1 << 17), "took {peak} bytes");
+}
+
+/// A zstd frame of a 1 KiB window (`window_log` 10) or larger, without checksum or size: an
+/// 8-byte raw block for matches to copy from, then `block`, a compressed block's content.
+fn zstd_crafted_frame(window_log: u8, block: &[u8]) -> Vec<u8> {
+	let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0, (window_log - 10) << 3];
+	frame.extend_from_slice(&[8 << 3, 0, 0]);
+	frame.extend_from_slice(b"12345678");
+	// the last block, compressed (type 2), of the content's size
+	let header = 1 | 2 << 1 | u32::try_from(block.len()).unwrap() << 3;
+	frame.extend_from_slice(&header.to_le_bytes()[..3]);
+	frame.extend_from_slice(block);
+	frame
+}
+
+/// A compressed block's content of no literals and `count` sequences, all alike in RLE mode:
+/// literal length 0, the second repeated offset, and a match length of `131_074 - spare`
+/// (match length code 52, whose 16 extra bits are all ones but for `spare`).
+fn zstd_sequences_block(count: u32, spare: u16) -> Vec<u8> {
+	// raw literals of size 0
+	let mut block = vec![0];
+	match count {
+		0..128 => block.push(u8::try_from(count).unwrap()),
+		128..0x7F00 => {
+			let [low, high] = u16::try_from(count).unwrap().to_le_bytes();
+			block.extend_from_slice(&[high + 128, low]);
+		}
+		_ => {
+			let [low, high] = u16::try_from(count - 0x7F00).unwrap().to_le_bytes();
+			block.extend_from_slice(&[255, low, high]);
+		}
+	}
+	// literal lengths, offsets and match lengths each in RLE mode, then their one symbol
+	block.extend_from_slice(&[0b0101_0100, 0, 0, 52]);
+	// each sequence reads its 16 extra bits, backwards from the end, after a marker bit
+	let extra = u16::MAX - spare;
+	let mut bits = Vec::with_capacity(count as usize * 2 + 1);
+	for _ in 0..count {
+		bits.extend_from_slice(&extra.to_le_bytes());
+	}
+	bits.push(1);
+	block.extend(bits);
+	block
+}
+
+#[test]
+fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
+	// 1000 sequences of 131074 bytes each in one block: 131 MB from a 2 KiB frame, where a block
+	// may decode to 128 KiB at most
+	let frame = zstd_crafted_frame(10, &zstd_sequences_block(1000, 0));
+	assert_eq!(frame.len(), 2028);
+	let (result, peak) =
+		crate::fs::archive::alloc_meter::peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
+	assert_eq!(corrupt(result), ZSTD_INVALID);
+	assert!(peak < 4 * MIB, "took {peak} bytes");
+
+	// past 32768 of them the lengths' sum overflowed a u32 and ruzstd panicked
+	let frame = zstd_crafted_frame(10, &zstd_sequences_block(33_000, 0));
+	let result =
+		std::panic::catch_unwind(|| decode(StreamCodec::Zstd, &frame, BUDGET)).expect("no panic");
+	assert_eq!(corrupt(result), ZSTD_INVALID);
+
+	// more sequences than a block has room for, each copying the least a match can (3 bytes)
+	let mut many = vec![0, 255, 0xAB, 0x2A, 0b0101_0100, 0, 0, 0, 1];
+	many[2..4]
+		.copy_from_slice(&(u16::try_from(128 * 1024 / 3 + 1 - 0x7F00).unwrap()).to_le_bytes());
+	assert_eq!(
+		corrupt(decode(
+			StreamCodec::Zstd,
+			&zstd_crafted_frame(10, &many),
+			BUDGET
+		)),
+		ZSTD_INVALID
+	);
+
+	// literals stated at 1 MiB, the most their header holds: RLE, a 3-byte size of 2^20 - 1
+	let size = (1u32 << 20) - 1;
+	let rle = 1 | 0b11 << 2 | (size << 4);
+	let mut block = rle.to_le_bytes()[..3].to_vec();
+	block.extend_from_slice(&[b'x', 0]);
+	let (result, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET)
+	});
+	assert_eq!(corrupt(result), ZSTD_INVALID);
+	assert!(peak < MIB, "took {peak} bytes");
+}
+
+#[test]
+fn zstd_huffman_literals_stop_at_their_stated_size() {
+	// 4 literal words stated, then 4 streams of ones under a 1-bit Huffman table: each bit is a
+	// literal, nearly a million of them in a block
+	const STREAM: usize = 29_998;
+	let tree = [0x80, 0x10];
+	let compressed = tree.len() + 6 + 4 * STREAM;
+	// compressed literals (type 2), 18-bit sizes (format 3): regenerated, then compressed
+	let header = 2 | 3 << 2 | 4u64 << 4 | (compressed as u64) << 22;
+	let mut block = header.to_le_bytes()[..5].to_vec();
+	block.extend_from_slice(&tree);
+	for _ in 0..3 {
+		block.extend_from_slice(&u16::try_from(STREAM).unwrap().to_le_bytes());
+	}
+	block.extend(std::iter::repeat_n(0xFF, 4 * STREAM));
+	// no sequences
+	block.push(0);
+	let (result, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET)
+	});
+	assert_eq!(corrupt(result), ZSTD_INVALID);
+	assert!(peak < 512 * 1024, "took {peak} bytes");
+}
+
+#[test]
+fn a_zstd_block_of_exactly_its_maximum_decodes() {
+	// literals and matches of 128 KiB in all: 131074 - 2
+	let frame = zstd_crafted_frame(17, &zstd_sequences_block(1, 2));
+	let (decoded, _) = decode(StreamCodec::Zstd, &frame, BUDGET).unwrap();
+	assert_eq!(decoded.len(), 8 + 128 * 1024);
+	// the second repeated offset starts as 4: the raw block's last four bytes, over and over
+	assert!(
+		decoded[8..]
+			.chunks(4)
+			.all(|chunk| chunk == &b"5678"[..chunk.len()])
+	);
 }
 
 #[test]

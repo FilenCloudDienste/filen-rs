@@ -264,6 +264,7 @@ ppmd-rust = "1.4"
 # zstd, both ways; `hash` writes and checks the frames' content checksums. A fork of 0.9.0
 # that refuses a block decoding past its maximum (128 KiB, or the window if smaller), which the
 # codec budget rests on, until a release does: https://github.com/KillingSpark/zstd-rs/pull/124.
+# decode/zstd.rs fails the build against a ruzstd without that check.
 ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
 	"std",
 	"hash",
