@@ -1738,6 +1738,24 @@ test("favorites", async () => {
 	expect(file).toMatchObject(foundFile as File)
 })
 
+test("getFileByStableUuidOptional follows a lineage across edits", async () => {
+	const name = "stable-lineage.txt"
+	const first = await state.uploadFile(new TextEncoder().encode("v1"), { parent: testDir, name })
+	// backend timestamps have a resolution of one second
+	await new Promise(resolve => setTimeout(resolve, 2000))
+	const edited = await state.uploadFile(new TextEncoder().encode("edited"), { parent: testDir, name })
+	expect(edited.uuid).not.toBe(first.uuid)
+	expect(edited.stableUUID).toBe(first.stableUUID)
+
+	const head = await state.getFileByStableUuidOptional(first.stableUUID!)
+	expect(head?.uuid).toBe(edited.uuid)
+	expect(head?.stableUUID).toBe(first.stableUUID)
+	expect(new TextDecoder().decode(await state.downloadFile(head!))).toBe("edited")
+
+	await state.deleteFilePermanently(edited)
+	expect(await state.getFileByStableUuidOptional(first.stableUUID!)).toBeUndefined()
+})
+
 test("service worker", async () => {
 	if (!("serviceWorker" in navigator)) {
 		throw new Error("Service workers are not supported in this environment")

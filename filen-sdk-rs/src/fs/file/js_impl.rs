@@ -19,7 +19,7 @@ use crate::{
 	},
 	runtime::do_on_commander,
 };
-use filen_types::fs::UuidStr;
+use filen_types::fs::{StableUuid, UuidStr};
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use futures::{AsyncRead, AsyncReadExt};
@@ -201,6 +201,27 @@ impl JsClient {
 	)]
 	pub async fn get_file_optional(&self, uuid: UuidStr) -> Result<Option<File>, Error> {
 		self.get_file(uuid).await.optional()
+	}
+
+	/// The current head of a file's lineage, which carries a new `uuid` after every content
+	/// edit. `undefined` only when the server does not know the lineage (permanently deleted);
+	/// a trashed head still resolves, with a `trash` parent.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "getFileByStableUuidOptional")
+	)]
+	pub async fn get_file_by_stable_uuid_optional(
+		&self,
+		stable_uuid: StableUuid,
+	) -> Result<Option<File>, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.get_file_by_stable_uuid(stable_uuid)
+				.await
+				.map(File::from)
+				.optional()
+		})
+		.await
 	}
 
 	#[cfg_attr(

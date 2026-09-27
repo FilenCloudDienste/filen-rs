@@ -4,10 +4,11 @@
 //! constructable: no `new`, no `From<Uuid>`, no `FromStr`, private field. A
 //! value can only come into existence at the sanctioned deserialization
 //! boundaries — serde for wire payloads, `rusqlite` for reading back rows that
-//! persisted a wire value, and the FFI lift for values a foreign caller
-//! previously received from us. If code appears to need to mint one from a
-//! plain [`Uuid`], the surrounding types are modeling the domain wrong; adjust
-//! the types instead of smuggling a uuid into the stable slot.
+//! persisted a wire value, and the FFI lift (uniffi and wasm-bindgen) for
+//! values a foreign caller previously received from us. If code appears to
+//! need to mint one from a plain [`Uuid`], the surrounding types are modeling
+//! the domain wrong; adjust the types instead of smuggling a uuid into the
+//! stable slot.
 
 use std::fmt;
 
@@ -82,6 +83,29 @@ uniffi::custom_type!(StableUuid, String, {
 			.map_err(|_| uniffi::deps::anyhow::anyhow!("invalid stable UUID string: {}", s))
 	},
 });
+
+// The wasm counterpart of the uniffi lift above: same string ABI as `UuidStr`.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl wasm_bindgen::describe::WasmDescribe for StableUuid {
+	fn describe() {
+		<str as wasm_bindgen::describe::WasmDescribe>::describe();
+	}
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+impl wasm_bindgen::convert::FromWasmAbi for StableUuid {
+	type Abi = <str as wasm_bindgen::convert::RefFromWasmAbi>::Abi;
+
+	unsafe fn from_abi(abi: Self::Abi) -> Self {
+		let s = unsafe { <str as wasm_bindgen::convert::RefFromWasmAbi>::ref_from_abi(abi) };
+		// throw_str, not panic, for the reason (and trade-offs) documented on `UuidStr`'s impl.
+		std::str::FromStr::from_str(&s)
+			.map(StableUuid)
+			.unwrap_or_else(|_| {
+				wasm_bindgen::throw_str(&format!("invalid stable UUID string passed from JS: {s}"))
+			})
+	}
+}
 
 // Reading a row back is deserialization of a persisted wire value; both impls
 // delegate to `Uuid`'s so the stored form stays byte-identical to a plain uuid
