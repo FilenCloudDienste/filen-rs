@@ -38,11 +38,12 @@ use super::{
 	},
 	dispose::{self, SourceDisposal},
 	extract::{
-		self, ArchiveEntryId, ArchiveSource, ArchiveTotals, DuplicateEntries, ExpansionLimit,
-		ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName, ExtractPhase,
-		ExtractRenamedEntry, ExtractRequest, ExtractRoot, ExtractSkippedEntry, ExtractStage,
-		ExtractTopLevelKey, OmittedRecords,
+		self, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals, DuplicateEntries,
+		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
+		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRoot, ExtractSkippedEntry,
+		ExtractStage, ExtractTopLevelKey, OmittedRecords,
 	},
+	format::{ExtensionFormat, extension_format},
 	password::ArchivePassword,
 };
 
@@ -625,28 +626,26 @@ struct CompressCall {
 }
 
 impl CompressCall {
+	/// The call's arguments, checked against the format's own rules and the client's
+	/// `codec_mem_budget` for its encoder: a call breaking them is refused, as an invalid
+	/// argument, rather than started as a job that fails.
 	fn new(
 		items: Vec<AnyItemWithContext>,
 		destination: AnyNormalDir,
 		name: &str,
-		format: CompressFormat,
-		max_bytes: Option<u64>,
+		config: CompressConfig,
 		dispose: Option<SourceDisposal>,
-		password: Option<ArchivePassword>,
+		codec_mem_budget: u64,
 	) -> Result<Self, Error> {
-		// the format's own rules reject the call, as an invalid argument, rather than end in a
-		// failed job
-		format.check_name(name)?;
-		format.check(password.is_some())?;
+		config.format.check_name(name)?;
+		config
+			.format
+			.check_within(config.password.is_some(), codec_mem_budget)?;
 		Ok(Self {
 			sources: compress_sources(items, dispose)?,
 			destination: DirType::from(destination),
 			name: ValidatedName::try_from(name)?,
-			config: CompressConfig {
-				format,
-				max_bytes,
-				password,
-			},
+			config,
 		})
 	}
 }
@@ -685,6 +684,7 @@ pub fn archive_extension(format: CompressFormat) -> String {
 }
 
 /// The memory `format`'s encoder needs, in bytes; fails for a level the format does not take.
+/// `compressItems` refuses a format needing more than the client's `archiveCodecMemBudget`.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",
@@ -694,16 +694,72 @@ pub fn archive_encoder_memory(format: CompressFormat) -> Result<u64, Error> {
 	format.encoder_memory()
 }
 
+/// The levels a format's codec or method takes, both ends included.
+#[js_type(export, no_deser)]
+pub struct ArchiveLevels {
+	pub min: u32,
+	pub max: u32,
+}
+
+/// The levels `format` takes (its own level ignored), for a UI to offer; `undefined` for a
+/// format without levels (a bare tar, a stored zip, a 7z copy). Which of them this device runs
+/// is `archiveMaxLevel`.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveFormatLevels")
+)]
+pub fn archive_format_levels(format: CompressFormat) -> Option<ArchiveLevels> {
+	format.levels().map(|levels| ArchiveLevels {
+		min: *levels.start(),
+		max: *levels.end(),
+	})
+}
+
+/// The highest of `format`'s levels whose encoder fits `budget` bytes (the client's
+/// `archiveCodecMemBudget`); `undefined` when the format has no levels, or not even its lowest
+/// fits.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveMaxLevel")
+)]
+pub fn archive_max_level(format: CompressFormat, budget: u64) -> Option<u32> {
+	format.max_level_within(budget)
+}
+
+/// What a file named `name` holds as far as its extension tells (`.tar.gz` and `.tgz` a gzip
+/// tar, `.gz` one gzip-compressed file), matched case-insensitively; `undefined` for a name
+/// with no archive extension. For an app to offer extracting a file, and to know that a single
+/// compressed file extracts into the destination itself, never a new folder.
+///
+/// The file's own bytes decide once it is extracted or listed: a `.zip` that is really a tar
+/// is read as a tar, and a tar named without an extension is read too.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveFormatOfName")
+)]
+pub fn archive_format_of_name(name: String) -> Option<ArchiveFormat> {
+	Some(match extension_format(&name)? {
+		ExtensionFormat::Zip => ArchiveFormat::Zip,
+		ExtensionFormat::SevenZ => ArchiveFormat::SevenZ,
+		ExtensionFormat::Tar => ArchiveFormat::Tar { codec: None },
+		ExtensionFormat::CompressedTar(codec) => ArchiveFormat::Tar { codec: Some(codec) },
+		ExtensionFormat::Stream(codec) => ArchiveFormat::Single { codec },
+	})
+}
+
 /// The name of the folder an archive extracts to by default: its name without its archive
-/// extension (`photos.tar.gz` → `photos`), made into a valid name (`Archive` when nothing is
-/// left).
+/// extension (`photos.tar.gz` → `photos`), made into a valid name (`Archive` when it cannot
+/// be).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveDefaultName")
 )]
 pub fn archive_default_name(name: String) -> String {
-	super::format::extract_folder_name(Some(&name)).into()
+	extract::archive_default_name(&name).into()
 }
 
 #[cfg(feature = "uniffi")]

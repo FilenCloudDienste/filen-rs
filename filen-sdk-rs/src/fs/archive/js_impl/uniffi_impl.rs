@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-	CompressCall, CompressDelivery, CompressFormat, CompressReport, CompressUpdate, ExpansionLimit,
-	ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractUpdate,
+	CompressCall, CompressConfig, CompressDelivery, CompressFormat, CompressReport, CompressUpdate,
+	ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractUpdate,
 	ExtractedTopLevelItem, SourceDisposal, compress_job, extract_job, extract_request, password,
 };
 
@@ -150,10 +150,13 @@ impl JsClient {
 			items,
 			destination,
 			&name,
-			config.format,
-			config.max_bytes,
+			CompressConfig {
+				format: config.format,
+				max_bytes: config.max_bytes,
+				password: self::password(password)?,
+			},
 			config.dispose,
-			self::password(password)?,
+			self.inner_ref().archive_config().codec_mem_budget,
 		)?;
 		let client = self.inner();
 		let (sender, delivered) = spawn_ordered_dispatch(move |delivery| match delivery {

@@ -7,7 +7,8 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			compress::{SevenZMethod, ZipMethod},
+			compress::{SevenZMethod, StreamCodec, ZipMethod},
+			config::CODEC_MEM_BUDGET,
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
 			zip::crypto::AesStrength,
 		},
@@ -114,19 +115,42 @@ fn names_and_passwords_are_checked_at_the_edge() {
 		ErrorKind::InvalidState
 	);
 	assert!(password(None).unwrap().is_none());
-	let call = CompressCall::new(
-		Vec::new(),
-		destination(),
-		"a/b.zip",
-		CompressFormat::Zip {
-			method: ZipMethod::Stored,
-			encryption: None,
-		},
-		None,
-		None,
-		None,
+	let call = |name, format, budget| {
+		CompressCall::new(
+			Vec::new(),
+			destination(),
+			name,
+			CompressConfig {
+				format,
+				max_bytes: None,
+				password: None,
+			},
+			None,
+			budget,
+		)
+	};
+	let stored = CompressFormat::Zip {
+		method: ZipMethod::Stored,
+		encryption: None,
+	};
+	assert_eq!(
+		call("a/b.zip", stored, CODEC_MEM_BUDGET)
+			.err()
+			.unwrap()
+			.kind(),
+		ErrorKind::InvalidName
 	);
-	assert_eq!(call.err().unwrap().kind(), ErrorKind::InvalidName);
+	// the encoder has to fit the client's budget: 7z PPMd 8 needs 129 MiB
+	let ppmd = CompressFormat::SevenZ {
+		method: SevenZMethod::Ppmd { level: 8 },
+		solid: false,
+		encryption: None,
+	};
+	assert_eq!(
+		call("a.7z", ppmd, 128 << 20).err().unwrap().kind(),
+		ErrorKind::InsufficientMemory
+	);
+	assert!(call("a.7z", ppmd, 256 << 20).is_ok());
 }
 
 #[test]
@@ -180,6 +204,58 @@ fn helpers_name_the_formats() {
 		ErrorKind::InvalidState
 	);
 	assert_eq!(archive_default_name("photos.tar.gz".into()), "photos");
+	assert_eq!(
+		archive_default_name("..zip".into()),
+		String::from(extract::archive_default_name("..zip")),
+		"the name extraction gives the folder"
+	);
+}
+
+#[test]
+fn helpers_tell_a_formats_levels_and_what_fits() {
+	let deflate = CompressFormat::Zip {
+		method: ZipMethod::Deflate { level: 6 },
+		encryption: None,
+	};
+	assert_eq!(
+		archive_format_levels(deflate),
+		Some(ArchiveLevels { min: 1, max: 9 })
+	);
+	assert_eq!(
+		archive_format_levels(CompressFormat::Tar { compression: None }),
+		None
+	);
+	let lzma2 = CompressFormat::SevenZ {
+		method: SevenZMethod::Lzma2 { level: 1 },
+		solid: true,
+		encryption: None,
+	};
+	// levels up to 6 need 97 MiB, 7 193 MiB, 8 385 MiB
+	assert_eq!(archive_max_level(lzma2, 128 << 20), Some(6));
+	assert_eq!(archive_max_level(lzma2, 256 << 20), Some(7));
+	assert_eq!(archive_max_level(lzma2, 1 << 20), None);
+}
+
+#[test]
+fn a_names_extension_tells_what_it_holds() {
+	let tar = |codec| Some(ArchiveFormat::Tar { codec });
+	for (name, format) in [
+		("photos.TGZ", tar(Some(StreamCodec::Gzip))),
+		("photos.tar.zst", tar(Some(StreamCodec::Zstd))),
+		("photos.tar", tar(None)),
+		(
+			"notes.txt.gz",
+			Some(ArchiveFormat::Single {
+				codec: StreamCodec::Gzip,
+			}),
+		),
+		("a.zip", Some(ArchiveFormat::Zip)),
+		("a.7z", Some(ArchiveFormat::SevenZ)),
+		("notes.txt", None),
+		(".zip", None),
+	] {
+		assert_eq!(archive_format_of_name(name.into()), format, "{name}");
+	}
 }
 
 #[test]

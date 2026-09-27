@@ -14,9 +14,9 @@ use crate::{
 };
 
 use super::{
-	Client, CompressCall, CompressDelivery, CompressFormat, CompressReport, ExpansionLimit,
-	ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractRequest, SourceDisposal,
-	compress_job, extract_job, extract_request, password,
+	Client, CompressCall, CompressConfig, CompressDelivery, CompressFormat, CompressReport,
+	ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractRequest,
+	SourceDisposal, compress_job, extract_job, extract_request, password,
 };
 
 #[js_type(import, no_ser, no_default)]
@@ -202,10 +202,13 @@ impl JsClient {
 			params.items,
 			params.destination,
 			&params.name,
-			params.format,
-			params.max_bytes,
+			CompressConfig {
+				format: params.format,
+				max_bytes: params.max_bytes,
+				password: self::password(password)?,
+			},
 			params.dispose,
-			self::password(password)?,
+			self.inner_ref().archive_config().codec_mem_budget,
 		)?;
 		run_compress(
 			self.inner(),
