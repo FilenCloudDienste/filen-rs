@@ -11,6 +11,7 @@ use std::{
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
+	connect::{DirPublicInfo, DirPublicLink, PublicLinkSharedClientExt},
 	fs::{
 		HasUUID,
 		categories::{Normal, fs::CategoryFSExt},
@@ -19,7 +20,7 @@ use filen_sdk_rs::{
 			ItemSource, JobControl, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
-		file::{RemoteFile, traits::HasFileInfo},
+		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
 	},
 	io::client_impl::IoSharedClientExt,
 };
@@ -58,6 +59,44 @@ pub async fn upload(
 /// `len` bytes that repeat every 251 bytes, so no two chunks of a file are alike.
 pub fn data(len: usize, seed: u8) -> Vec<u8> {
 	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+/// `len` bytes no codec can shrink, the same for the same `seed`: an archive of them is as large
+/// as they are, so it spans as many chunks.
+pub fn noise(len: usize, seed: u8) -> Vec<u8> {
+	let mut bytes = vec![0; len];
+	blake3::Hasher::new()
+		.update(&[seed])
+		.finalize_xof()
+		.fill(&mut bytes);
+	bytes
+}
+
+/// A new public link to `dir`, as someone given it reads it.
+pub async fn dir_link_info(client: &Client, dir: &RemoteDirectory) -> DirPublicInfo {
+	let link: DirPublicLink = client
+		.public_link_dir::<fn(u64, Option<u64>)>(dir, None)
+		.await
+		.unwrap()
+		.try_into()
+		.unwrap();
+	client
+		.get_unauthed()
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap()
+}
+
+/// `file` read through a new public link to it.
+pub async fn linked_file(client: &Client, file: &RemoteFile) -> RemoteFileType<'static> {
+	let link = client.public_link_file(file).await.unwrap();
+	let key = file.key().unwrap().to_str();
+	client
+		.get_unauthed()
+		.get_linked_file(link.uuid(), key.as_ref(), None)
+		.await
+		.unwrap()
+		.into()
 }
 
 /// `dir`'s recursive contents, keyed by the path below `dir`. Entries whose metadata cannot be
