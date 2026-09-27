@@ -299,9 +299,9 @@ impl Reporter {
 		self.read(|state| state.counts)
 	}
 
-	/// The last update of a job that ends before it starts, carrying the `totals` it would have
-	/// compressed.
-	pub(crate) fn finish_unstarted(&self, phase: CompressPhase, totals: PlanTotals) {
+	/// The last update of a job that ends early, carrying the `totals` it would have compressed
+	/// (a job refused before it planned was never told them).
+	pub(crate) fn finish_early(&self, phase: CompressPhase, totals: PlanTotals) {
 		self.finish_with(phase, |state| state.totals = totals);
 	}
 }

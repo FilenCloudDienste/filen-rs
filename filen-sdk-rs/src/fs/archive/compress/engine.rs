@@ -31,7 +31,7 @@ use crate::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			dispose::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
-				SourceDisposition, Tree, dispose_dir, dispose_file,
+				SourceDisposition, Tree, dispose_dir, dispose_file, kept_on_early_end,
 			},
 			hash::HeadLastHasher,
 			limits::MAX_REPORT_RECORDS,
@@ -220,35 +220,10 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		.as_ref()
 		.map(|disposal| disposal.targets.iter().map(DisposalTarget::uuid).collect())
 		.unwrap_or_default();
-	let kept_all = |reason: KeptReason| -> Vec<SourceDisposition> {
-		requested
-			.iter()
-			.map(|&uuid| SourceDisposition {
-				uuid,
-				outcome: DisposalOutcome::Kept {
-					reason: reason.clone(),
-					bytes_freed: 0,
-				},
-			})
-			.collect()
-	};
-	let fail = |mut report: CompressReport, phase, error: Error| {
-		report.dispositions = kept_all(if phase == CompressPhase::Cancelled {
-			KeptReason::Interrupted
-		} else {
-			KeptReason::Incomplete
-		});
-		reporter.dispositions(&report.dispositions);
-		reporter.finish(phase);
-		report.counts = reporter.counts();
-		CompressFailed {
-			report,
-			error: Arc::new(error),
-		}
-	};
+	let fail = |report, phase, error| end_early(&reporter, report, &requested, phase, error);
 	for source in &sources {
 		if let Err(error) = check_chunks_consistent(source.file.chunks(), source.file.size()) {
-			return Err(fail(report, CompressPhase::Failed, error));
+			return Err(fail(report, CompressPhase::Failed, Arc::new(error)));
 		}
 	}
 
@@ -263,7 +238,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	};
 	let (name, targets) = match control.until_stopping(prepared).await {
 		Ok(Ok(prepared)) => prepared,
-		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, error)),
+		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
 		Err(Stopped) => return Err(fail(report, CompressPhase::Cancelled, cancelled())),
 	};
 
@@ -278,7 +253,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	reporter.set_phase(CompressPhase::Compressing);
 	let link = match start() {
 		Ok(link) => link,
-		Err(error) => return Err(fail(report, CompressPhase::Failed, error)),
+		Err(error) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
 	};
 
 	let archive_uuid = Uuid::new_v4();
@@ -367,7 +342,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			dispositions = match driver.reporter.checkpoint(&driver.control).await {
 				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
 				Err(Stopped) => {
-					let kept = kept_all(KeptReason::Interrupted);
+					let kept = kept_on_early_end(&requested, true);
 					driver.reporter.dispositions(&kept);
 					kept
 				}
@@ -384,46 +359,60 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		..
 	} = driver;
 	report.hash_mismatches = hash_mismatches;
-	let (phase, result) = match (outcome, fatal) {
-		(_, Some(error)) => {
-			report.dispositions = kept_all(KeptReason::Incomplete);
-			(CompressPhase::Failed, Err(error))
-		}
-		(Err(Stopped), None) if control.is_cancelled() => {
-			report.dispositions = kept_all(KeptReason::Interrupted);
-			(CompressPhase::Cancelled, Err(Arc::new(cancelled())))
-		}
-		(Err(Stopped), None) => {
-			report.dispositions = kept_all(KeptReason::Incomplete);
-			(
-				CompressPhase::Failed,
-				Err(Arc::new(Error::custom(
-					ErrorKind::Internal,
-					"compression stopped",
-				))),
-			)
-		}
+	match (outcome, fatal) {
 		(Ok(archive), None) => {
 			report.archive = Some(archive);
 			report.dispositions = dispositions;
-			(CompressPhase::Done, Ok(()))
+			reporter.finish(CompressPhase::Done);
+			report.counts = reporter.counts();
+			Ok(report)
 		}
-	};
-	// a disposal told of each source as soon as its outcome was final; the sources an early end
-	// keeps are told of here
-	if result.is_err() {
-		reporter.dispositions(&report.dispositions);
-	}
-	reporter.finish(phase);
-	report.counts = reporter.counts();
-	match result {
-		Ok(()) => Ok(report),
-		Err(error) => Err(CompressFailed { report, error }),
+		(_, Some(error)) => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Failed,
+			error,
+		)),
+		(Err(Stopped), None) if control.is_cancelled() => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Cancelled,
+			cancelled(),
+		)),
+		(Err(Stopped), None) => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Failed,
+			Arc::new(Error::custom(ErrorKind::Internal, "compression stopped")),
+		)),
 	}
 }
 
-fn cancelled() -> Error {
-	Error::custom(ErrorKind::Cancelled, "compression cancelled")
+/// Ends a job early, before it removed any source: every source a disposal was asked for is
+/// kept, and told of.
+pub(crate) fn end_early(
+	reporter: &Reporter,
+	mut report: CompressReport,
+	requested: &[Uuid],
+	phase: CompressPhase,
+	error: Arc<Error>,
+) -> CompressFailed {
+	let cancelled = phase == CompressPhase::Cancelled;
+	report.dispositions = kept_on_early_end(requested, cancelled);
+	reporter.dispositions(&report.dispositions);
+	if cancelled {
+		reporter.set_cancelling();
+	}
+	reporter.finish_early(phase, report.totals);
+	report.counts = reporter.counts();
+	CompressFailed { report, error }
+}
+
+pub(crate) fn cancelled() -> Arc<Error> {
+	Arc::new(Error::custom(ErrorKind::Cancelled, "compression cancelled"))
 }
 
 fn worker_died() -> Error {

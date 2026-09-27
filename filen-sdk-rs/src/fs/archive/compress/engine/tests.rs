@@ -20,7 +20,7 @@ use crate::{
 		HasName,
 		archive::{
 			compress::{
-				CompressFormat, CompressUpdate,
+				CompressFormat, CompressUpdate, RunState,
 				codec::{ArchiveEntry, CompressJob, compress},
 				report::CompressCallback,
 			},
@@ -1363,5 +1363,28 @@ async fn a_cancel_while_compressing_keeps_every_source() {
 		}
 	}
 	assert!(setup.backend.log().deleted_files.is_empty());
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::Cancelled, RunState::Cancelling)
+	);
 	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	let (_pause, cancel, control) = controls();
+	cancel.send_replace(true);
+	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::Cancelled, RunState::Cancelling)
+	);
+	assert_eq!(told(&job.recorder).len(), 2);
+	assert!(setup.backend.log().uploaded.is_empty());
 }

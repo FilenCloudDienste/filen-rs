@@ -11,9 +11,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			dispose::{
-				DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, SourceDisposition, Tree,
-			},
+			dispose::{ExpectedFile, SourceDisposal, Tree},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
 		},
@@ -39,10 +37,10 @@ use crate::{
 use super::{
 	ArchivePassword, CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
-	engine::{CompressDisposal, CompressTask, DisposalTarget, Source, run_compress},
-	report::{
-		CompressCallback, CompressEvent, CompressFailed, CompressPhase, CompressReport, Reporter,
+	engine::{
+		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
 	},
+	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
 };
 
 #[derive(Debug, Clone)]
@@ -92,34 +90,8 @@ impl Client {
 				items.iter().map(|item| item.uuid()).collect()
 			}
 		};
-		let refuse = |mut report: CompressReport, phase, error: Error| {
-			let reason = if phase == CompressPhase::Cancelled {
-				KeptReason::Interrupted
-			} else {
-				KeptReason::Incomplete
-			};
-			report.dispositions = requested
-				.iter()
-				.map(|&uuid| SourceDisposition {
-					uuid,
-					outcome: DisposalOutcome::Kept {
-						reason: reason.clone(),
-						bytes_freed: 0,
-					},
-				})
-				.collect();
-			for disposition in &report.dispositions {
-				reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
-			}
-			reporter.finish_unstarted(phase, report.totals);
-			CompressFailed {
-				report: CompressReport {
-					counts: reporter.counts(),
-					..report
-				},
-				error: Arc::new(error),
-			}
-		};
+		let refuse =
+			|report, phase, error| end_early(&reporter, report, &requested, phase, Arc::new(error));
 		let checked = config
 			.format
 			.check_name(name.as_ref())
@@ -160,11 +132,12 @@ impl Client {
 		let mut plan = match self.plan_sources(sources, &reporter, &control).await {
 			Ok(plan) => plan,
 			Err(ScanError::Stopped) => {
-				let error = Error::custom(ErrorKind::Cancelled, "compression cancelled");
-				return Err(refuse(
+				return Err(end_early(
+					&reporter,
 					CompressReport::default(),
+					&requested,
 					CompressPhase::Cancelled,
-					error,
+					cancelled(),
 				));
 			}
 			Err(ScanError::Failed(error)) => {

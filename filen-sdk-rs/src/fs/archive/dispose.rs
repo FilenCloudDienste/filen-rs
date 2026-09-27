@@ -277,6 +277,23 @@ impl ExpectedFile {
 	}
 }
 
+/// Every one of `sources` kept by a job that ended before removing them: as interrupted when it
+/// was cancelled, as incomplete otherwise.
+pub(crate) fn kept_on_early_end(sources: &[Uuid], cancelled: bool) -> Vec<SourceDisposition> {
+	let reason = if cancelled {
+		KeptReason::Interrupted
+	} else {
+		KeptReason::Incomplete
+	};
+	sources
+		.iter()
+		.map(|&uuid| SourceDisposition {
+			uuid,
+			outcome: kept(reason.clone()),
+		})
+		.collect()
+}
+
 fn kept(reason: KeptReason) -> DisposalOutcome {
 	DisposalOutcome::Kept {
 		reason,
