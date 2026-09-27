@@ -1032,3 +1032,51 @@ fn real_tools_symlinks_are_recognised() {
 		);
 	}
 }
+
+#[test]
+fn a_damaged_byte_never_panics() {
+	let sample = sample();
+	let small = &borrowed(&sample)[..2];
+	// (bytes before the zip, never held in memory; the zip)
+	let archives = [
+		(0, ours(small, ZipMethod::Deflate { level: 6 }, None)),
+		(
+			0,
+			ours(
+				&small[1..],
+				ZipMethod::Bzip2 { level: 1 },
+				Some((&b"pw"[..], AesStrength::Aes128)),
+			),
+		),
+		(
+			PAST_4_GIB,
+			written_by(
+				ZipWriter::past(Vec::new(), PAST_4_GIB, 0),
+				small,
+				ZipMethod::Stored,
+				None,
+			),
+		),
+		(0, fixture!("finder-ditto.zip").1.to_vec()),
+		(0, fixture!("zip64-infozip.zip").1.to_vec()),
+		(0, fixture!("zipcrypto-infozip.zip").1.to_vec()),
+		(0, fixture!("lzma.zip").1.to_vec()),
+		(0, fixture!("xz.zip").1.to_vec()),
+	];
+	for (skipped, zip) in archives {
+		// the central directory and end records are at the end, the first local header at the
+		// start: every length, offset and signature in them is damaged in turn
+		let tail = zip.len().saturating_sub(1024);
+		for at in (0..64).chain(tail..zip.len()) {
+			for damage in [|b: u8| b ^ 0x01, |b: u8| b ^ 0x80, |_| 0xFF] {
+				let mut damaged = zip.clone();
+				damaged[at] = damage(damaged[at]);
+				let mut source = Past::new(skipped, damaged);
+				let len = source.len();
+				let _ =
+					std::panic::catch_unwind(move || read_source(&mut source, len, Some(b"pw")))
+						.unwrap_or_else(|_| panic!("damage at {at} of a {len}-byte zip panicked"));
+			}
+		}
+	}
+}
