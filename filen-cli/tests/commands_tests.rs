@@ -82,7 +82,7 @@ async fn cmd_list_trash_empty_trash() {
 	// shared account have sitting in trash mid-restore (nightly 2026-08-14), so serialize on the
 	// trash lock the sdk's own trash tests use.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 
@@ -132,7 +132,7 @@ async fn cmd_export_notes() {
 
 	// delete existing notes and lock
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 	for note in client.list_notes().await.unwrap() {

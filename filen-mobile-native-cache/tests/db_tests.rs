@@ -711,7 +711,7 @@ pub async fn test_versioning_disabled_edit_ghost_is_not_adopted() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
@@ -1059,7 +1059,7 @@ pub async fn test_trash_item_file_restore() {
 	// (nightly 2026-08-14), so hold the trash lock across the trash -> restore window.
 	let _trash_lock = rss
 		.client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 
@@ -5911,7 +5911,7 @@ pub async fn test_a_versioning_disabled_edit_is_one_update_and_no_retirement() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
@@ -6195,7 +6195,7 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 	// the lineage deletes further down) observe it.
 	let _trash_lock = rss
 		.client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	rss.client.trash_file(&mut file).await.unwrap();
@@ -6241,7 +6241,7 @@ pub async fn test_update_and_query_item_follows_a_versioning_disabled_edit() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
@@ -6591,7 +6591,7 @@ pub async fn test_the_stable_namespace_reaches_restore_and_download_after_an_edi
 	// cannot permanently delete the file inside the window.
 	let _trash_lock = rss
 		.client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	db.trash_item(file_path).await.unwrap();
@@ -7212,7 +7212,7 @@ pub async fn test_a_remote_trash_of_a_held_file_trashes_the_row() {
 	// empty-trash (serialized on this lock) would permanently delete the file mid-poll.
 	let _trash_lock = rss
 		.client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	rss.client.trash_file(&mut file).await.unwrap();

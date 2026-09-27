@@ -238,7 +238,7 @@ async fn get_item_path_trashed_file_from_list_trash() {
 	let _trash_lock = test_utils::RESOURCES
 		.client()
 		.await
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
@@ -325,7 +325,7 @@ async fn get_item_path_trashed_dir_from_list_trash() {
 	let _trash_lock = test_utils::RESOURCES
 		.client()
 		.await
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;

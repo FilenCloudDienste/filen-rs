@@ -68,11 +68,11 @@ async fn get_contact(
 ) {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 	let lock1 = client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let lock2 = share_client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 
@@ -164,11 +164,11 @@ async fn prep_shared_compat_tests(client: &Client, language: &str, shortened: &s
 	let share_client = &test_utils::SHARE_RESOURCES.client().await;
 
 	let _lock1 = client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let _lock2 = share_client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 

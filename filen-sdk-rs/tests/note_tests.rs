@@ -5,7 +5,7 @@ use filen_types::api::v3::notes::NoteType;
 async fn note_creation() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -19,7 +19,7 @@ async fn note_creation() {
 async fn note_favoriting() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -44,7 +44,7 @@ async fn note_favoriting() {
 async fn note_pinning() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -67,7 +67,7 @@ async fn note_pinning() {
 async fn note_typing() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -98,7 +98,7 @@ async fn note_typing() {
 async fn note_removing() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -125,7 +125,7 @@ async fn note_removing() {
 async fn note_archiving() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -160,7 +160,7 @@ async fn note_archiving() {
 async fn note_titling() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -201,7 +201,7 @@ async fn note_titling() {
 async fn note_listing() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 	let _lock = client.lock_notes().await.unwrap();
@@ -234,7 +234,7 @@ async fn note_listing() {
 async fn note_content_editing() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -274,7 +274,7 @@ async fn note_content_editing() {
 async fn note_duplication() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -300,7 +300,7 @@ async fn note_duplication() {
 async fn note_history() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -357,7 +357,7 @@ async fn note_history() {
 async fn note_tag_manipulation() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -413,7 +413,7 @@ async fn note_tag_manipulation() {
 async fn note_tagging() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 
@@ -438,15 +438,15 @@ async fn note_sharing() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 
 	let _lock1 = client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let _lock2 = share_client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let _lock = client
-		.acquire_lock_with_default("test:notes")
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 

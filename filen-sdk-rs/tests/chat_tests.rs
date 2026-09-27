@@ -101,7 +101,7 @@ async fn conversation_muting() {
 /// 2026-09-03: every field equal but `avatar`). Refreshing here is what makes the lock enough.
 async fn lock_chat(client: &Client) -> Arc<ResourceLock> {
 	let lock = client
-		.acquire_lock_with_default("test:chats")
+		.acquire_lock_with_default(test_utils::locks::CHATS)
 		.await
 		.unwrap();
 	client.get_user_info().await.unwrap();

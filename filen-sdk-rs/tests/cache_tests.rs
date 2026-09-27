@@ -797,7 +797,7 @@ async fn test_cache_file_restore_via_socket() {
 	// account-global empty-trash (serialized on this lock) would permanently delete the file
 	// out from under the later call.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
@@ -881,7 +881,7 @@ async fn test_cache_file_deleted_permanently_via_socket() {
 	// account-global empty-trash (serialized on this lock) would permanently delete the file
 	// out from under the later call.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
@@ -921,7 +921,7 @@ async fn test_cache_dir_restore_via_socket() {
 
 	// Trash lock: see the file restore test above.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
@@ -1026,7 +1026,7 @@ async fn test_cache_dir_deleted_permanently_via_socket() {
 
 	// Trash lock: see the file restore test above.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
@@ -1589,12 +1589,12 @@ async fn test_cache_file_sync_root_follows_a_versioning_disabled_edit() {
 	// versioning-flag lock.
 	let _version_lock = resources
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	let _versioning_lock = resources
 		.client
-		.acquire_lock_with_default("test:user-versioning")
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 	resources
@@ -1726,7 +1726,7 @@ async fn test_cache_file_root_trashed_while_offline_is_removed_on_reopen() {
 	// empty-trash from permanently deleting it before session 2 observes it and the final
 	// delete_file_permanently below runs.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();

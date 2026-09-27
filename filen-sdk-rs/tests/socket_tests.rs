@@ -128,7 +128,7 @@ async fn test_websocket_file_events() {
 	let client = &resources.client;
 
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	client.set_versioning_enabled(true).await.unwrap();
@@ -176,7 +176,7 @@ async fn test_websocket_file_events() {
 	// Hold the trash lock across trash -> restore: another leg's account-global empty-trash
 	// (serialized on this lock) would permanently delete the file mid-window.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file_a).await.unwrap();
@@ -426,11 +426,11 @@ async fn test_websocket_file_edit_versioning_disabled() {
 	// Same order as user_tests::versioning_creates_versions_on_duplicate_upload:
 	// version-chain lock first, then the account-wide versioning-flag lock.
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	let _versioning_lock = client
-		.acquire_lock_with_default("test:user-versioning")
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 
@@ -653,7 +653,7 @@ async fn test_websocket_folder_events() {
 
 	// Trash lock: see the file restore test above.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_dir(&mut dir_a).await.unwrap();
@@ -825,7 +825,7 @@ async fn chat() {
 	// leaked conversations feed the server's `conversations/create` rate limit (see
 	// chat_tests.rs for the same guard).
 	let _chat_lock = client
-		.acquire_lock_with_default("test:chats")
+		.acquire_lock_with_default(test_utils::locks::CHATS)
 		.await
 		.unwrap();
 	if let Ok(chats) = client.list_chats().await {

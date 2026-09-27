@@ -98,7 +98,7 @@ async fn file_trash() {
 	);
 
 	let _lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
@@ -332,7 +332,7 @@ async fn get_trashed_file() {
 	// guard against a concurrent file_trash_empty: empty_trash() is account-global and would
 	// permanently delete this file between the trash and the asserts below
 	let _lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 
@@ -365,7 +365,7 @@ async fn get_replaced_file() {
 	// replace-archives-a-version semantics require account-wide versioning to be ON; don't
 	// rely on ambient state (user_tests pins the versioning-off behavior)
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	client.set_versioning_enabled(true).await.unwrap();
@@ -515,7 +515,7 @@ async fn file_trash_empty() {
 		Some(NonRootFileType::File(Cow::Borrowed(&file)))
 	);
 	let _lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_file(&mut file).await.unwrap();
@@ -638,7 +638,7 @@ async fn file_versions() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	client.set_versioning_enabled(true).await.unwrap();
@@ -1775,7 +1775,7 @@ async fn restore_file_version_reports_a_raced_head_as_stale() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	client.set_versioning_enabled(true).await.unwrap();
@@ -1833,7 +1833,7 @@ async fn restore_file_version_does_not_report_a_deleted_version_as_stale() {
 	let client = &resources.client;
 	let test_dir = &resources.dir;
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	client.set_versioning_enabled(true).await.unwrap();
