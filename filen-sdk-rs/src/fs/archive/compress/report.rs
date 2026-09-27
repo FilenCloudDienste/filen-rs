@@ -64,7 +64,7 @@ pub struct CompressCounts {
 	pub bytes_skipped: u64,
 	/// Bytes of the sources read.
 	pub bytes_read: u64,
-	/// Bytes of the archive written (uploaded or uploading).
+	/// Bytes of the archive uploaded so far.
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
 	pub bytes_done: u64,
@@ -161,6 +161,8 @@ pub(crate) struct CompressState {
 	scan: ScanProgress,
 	totals: PlanTotals,
 	counts: CompressCounts,
+	/// The job ended: whatever it did not read, it never will.
+	ended: bool,
 }
 
 impl JobState for CompressState {
@@ -177,7 +179,11 @@ impl JobState for CompressState {
 			bytes_done: self.counts.bytes_read,
 			units: Units {
 				done: self.counts.bytes_read,
-				settled: self.counts.bytes_read,
+				settled: if self.ended {
+					self.totals.bytes
+				} else {
+					self.counts.bytes_read
+				},
 				total: self.totals.bytes,
 			},
 		}
@@ -201,7 +207,9 @@ impl JobState for CompressState {
 		});
 	}
 
-	fn settle(&mut self) {}
+	fn settle(&mut self) {
+		self.ended = true;
+	}
 }
 
 pub(crate) type Reporter = job::report::Reporter<CompressState>;
@@ -214,6 +222,7 @@ impl Reporter {
 				scan: ScanProgress::default(),
 				totals: PlanTotals::default(),
 				counts: CompressCounts::default(),
+				ended: false,
 			},
 			Box::new(callback),
 		)
@@ -303,5 +312,46 @@ impl Reporter {
 	/// (a job refused before it planned was never told them).
 	pub(crate) fn finish_early(&self, phase: CompressPhase, totals: PlanTotals) {
 		self.finish_with(phase, |state| state.totals = totals);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Mutex;
+
+	use super::*;
+
+	#[derive(Default)]
+	struct Updates(Mutex<Vec<CompressUpdate>>);
+
+	impl CompressCallback for Updates {
+		fn on_archive_created(&self, _: RemoteFile) {}
+
+		fn on_update(&self, update: CompressUpdate) {
+			self.0.lock().unwrap().push(update);
+		}
+	}
+
+	#[test]
+	fn a_job_that_ended_has_no_time_left() {
+		for phase in [
+			CompressPhase::Done,
+			CompressPhase::Cancelled,
+			CompressPhase::Failed,
+		] {
+			let updates = Arc::new(Updates::default());
+			let reporter = Reporter::new(Arc::clone(&updates));
+			let totals = PlanTotals {
+				dirs: 0,
+				files: 2,
+				bytes: 100,
+			};
+			reporter.set_plan(totals, &[], &[]);
+			reporter.source_read(30);
+			reporter.finish(phase);
+			let last = updates.0.lock().unwrap().last().cloned().unwrap();
+			assert_eq!(last.phase, phase);
+			assert_eq!(last.eta, Some(Duration::ZERO), "{phase:?}");
+		}
 	}
 }
