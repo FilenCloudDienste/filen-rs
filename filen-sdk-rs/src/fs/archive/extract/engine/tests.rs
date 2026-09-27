@@ -19,8 +19,8 @@ use crate::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			entry_path::entry_path,
 			extract::{
-				ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractSkipReason, ExtractUpdate,
-				RunState,
+				ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractEvent, ExtractSkipReason,
+				ExtractUpdate, RunState,
 				codec::{CodecLimits, StreamJob, extract_stream},
 			},
 			worker,
@@ -534,6 +534,275 @@ async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
 			),
 		]
 	);
+	assert_released(&setup, &job.reporter);
+}
+
+/// The failure events the updates carried: whether of a directory, path, stage, error kind.
+fn failure_events(recorder: &Recorder) -> Vec<(bool, String, ExtractStage, ErrorKind)> {
+	let mut events: Vec<_> = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| &update.events)
+		.filter_map(|event| match event {
+			ExtractEvent::DirFailed(f) => Some((true, f.path.clone(), f.stage, f.error.kind())),
+			ExtractEvent::FileFailed(f) => Some((false, f.path.clone(), f.stage, f.error.kind())),
+			_ => None,
+		})
+		.collect();
+	events.sort_by(|a, b| a.1.cmp(&b.1));
+	events
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_that_fails_takes_its_subtree_and_nothing_else() {
+	let tar = tar_of(&[
+		("a/b/c/x.txt", b"x below"),
+		("a/b/y.txt", b"y"),
+		("a/z.txt", b"z beside"),
+	]);
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend.fail_create.insert("b".into(), ErrorKind::Server);
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+
+	assert_eq!(finished_paths(&setup), ["bundle/a/z.txt"]);
+	assert_eq!(created_dirs(&setup), ["bundle", "a"]);
+	let log = setup.backend.log();
+	assert!(
+		log.upload_starts
+			.iter()
+			.all(|(uuid, _)| log.finished.contains_key(uuid)),
+		"nothing below the failed directory is uploaded"
+	);
+	drop(log);
+	assert_eq!(
+		report.counts,
+		ItemCounts {
+			dirs_created: 2,
+			// b, and c below it, never attempted
+			dirs_failed: 2,
+			files_done: 1,
+			files_failed: 2,
+			bytes_done: 8,
+			bytes_failed: 8,
+			..ItemCounts::default()
+		}
+	);
+	let a = log_dir(&setup, "a");
+	assert_eq!(report.failures.len(), 3);
+	let dir = report
+		.failures
+		.iter()
+		.find(|f| f.path == "a/b")
+		.expect("the directory's own failure");
+	assert_eq!(
+		(dir.dest_parent, dir.dest_name.as_str(), dir.stage),
+		(a, "b", ExtractStage::CreateDirectory)
+	);
+	assert_eq!(
+		failure_events(&job.recorder),
+		[
+			(
+				true,
+				"a/b".into(),
+				ExtractStage::CreateDirectory,
+				ErrorKind::Server
+			),
+			(
+				false,
+				"a/b/c/x.txt".into(),
+				ExtractStage::CreateDirectory,
+				ErrorKind::Server
+			),
+			(
+				false,
+				"a/b/y.txt".into(),
+				ExtractStage::CreateDirectory,
+				ErrorKind::Server
+			),
+		]
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+/// The uuid of the directory the job created as `name`.
+fn log_dir(setup: &Setup, name: &str) -> Uuid {
+	setup
+		.backend
+		.log()
+		.created_dirs
+		.iter()
+		.find(|(_, created)| created == name)
+		.map(|(uuid, _)| *uuid)
+		.expect("the directory was created")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_that_fails_is_recorded_once_and_the_rest_extract() {
+	let tar = tar_of(&[
+		("docs/up.txt", b"fails uploading"),
+		("docs/reg.txt", b"fails registering"),
+		("docs/ok.txt", b"fine"),
+	]);
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend
+			.fail_upload
+			.insert("up.txt".into(), ErrorKind::Server);
+		backend
+			.fail_finish
+			.insert("reg.txt".into(), ErrorKind::Server);
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+
+	assert_eq!(finished_paths(&setup), ["bundle/docs/ok.txt"]);
+	let docs = log_dir(&setup, "docs");
+	let recorded: Vec<_> = {
+		let mut recorded: Vec<_> = report
+			.failures
+			.iter()
+			.map(|f| {
+				(
+					f.path.as_str(),
+					f.dest_parent,
+					f.dest_name.as_str(),
+					f.stage,
+					f.error.kind(),
+				)
+			})
+			.collect();
+		recorded.sort_by_key(|(path, ..)| *path);
+		recorded
+	};
+	assert_eq!(
+		recorded,
+		[
+			(
+				"docs/reg.txt",
+				docs,
+				"reg.txt",
+				ExtractStage::Finalize,
+				ErrorKind::Server
+			),
+			(
+				"docs/up.txt",
+				docs,
+				"up.txt",
+				ExtractStage::Upload,
+				ErrorKind::Server
+			),
+		]
+	);
+	assert_eq!(
+		failure_events(&job.recorder),
+		[
+			(
+				false,
+				"docs/reg.txt".into(),
+				ExtractStage::Finalize,
+				ErrorKind::Server
+			),
+			(
+				false,
+				"docs/up.txt".into(),
+				ExtractStage::Upload,
+				ErrorKind::Server
+			),
+		]
+	);
+	assert_eq!(
+		report.counts,
+		ItemCounts {
+			dirs_created: 2,
+			files_done: 1,
+			files_failed: 2,
+			bytes_done: 4,
+			bytes_failed: 15 + 17,
+			..ItemCounts::default()
+		}
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_registered_as_a_version_is_a_failure() {
+	let existing = Uuid::new_v4();
+	let setup = setup(
+		"bundle.tar",
+		tar_of(&[("a.txt", b"a"), ("b.txt", b"b")]),
+		|backend| {
+			backend.version_of.insert("a.txt".into(), existing);
+		},
+	);
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(
+		failures(&report),
+		[(
+			"a.txt",
+			"a.txt",
+			ExtractStage::RegisteredAsVersion {
+				existing_file: existing
+			},
+			ErrorKind::InvalidState
+		)]
+	);
+	assert_eq!(
+		(report.counts.files_done, report.counts.files_failed),
+		(1, 1)
+	);
+	let top: Vec<Uuid> = report.top_level.iter().map(|top| top.item.uuid()).collect();
+	assert_eq!(top.len(), 1, "only the new file is reported created");
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_archive_fetch_or_lock_ends_the_job() {
+	let setup_fetch = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		backend
+			.fail_fetch
+			.insert("bundle.tar".into(), ErrorKind::Server);
+	});
+	let job = start(&setup_fetch, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Server);
+	assert!(created_dirs(&setup_fetch).is_empty());
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup_fetch, &job.reporter);
+
+	// the drive lock is lost after the folder was created: its entries fail, and the job with
+	// the first error that ends it
+	let setup_lock = setup(
+		"bundle.tar",
+		tar_of(&[("a.txt", b"a"), ("d/b.txt", b"b")]),
+		|backend| backend.fail_locks_from = Some((1, ErrorKind::Unauthenticated)),
+	);
+	let job = start(&setup_lock, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Unauthenticated);
+	assert_eq!(created_dirs(&setup_lock), ["bundle"]);
+	assert!(finished(&setup_lock).is_empty());
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup_lock, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_folder_whose_name_was_taken_since_gets_the_next() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		backend.merge_once.lock().unwrap().insert("bundle".into());
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle (1)/a.txt"]);
+	let top: Vec<ExtractTopLevelKey> = report.top_level.iter().map(|top| top.key).collect();
+	assert_eq!(top, [ExtractTopLevelKey::Root]);
 	assert_released(&setup, &job.reporter);
 }
 
