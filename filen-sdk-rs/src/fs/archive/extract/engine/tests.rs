@@ -642,7 +642,7 @@ async fn directories_are_planned_only_as_fast_as_they_are_created() {
 			.slow
 			.insert("blocked".to_owned(), Duration::from_secs(3600));
 	});
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
 	let below = MAX_UNCREATED_DIRS + 10;
 	let entry = |ordinal: usize| match ordinal {
@@ -715,7 +715,7 @@ async fn files_are_read_only_as_fast_as_they_are_registered() {
 		// create is the first acquisition)
 		backend.block_locks_from.send_replace(Some(1));
 	});
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
 	events
 		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
@@ -798,7 +798,7 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 #[tokio::test(start_paused = true)]
 async fn a_silent_codec_is_given_up_on() {
 	let setup = setup("silent.tar", tar_of(&[("a.txt", b"a")]), |_| {});
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
 	let failed = job.running.await.unwrap().unwrap_err();
 
@@ -1589,7 +1589,7 @@ async fn a_pause_while_the_archive_opens_holds_nothing() {
 	});
 	let config = test_config();
 	let (pause, _cancel, control) = controls();
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(
 		&setup,
 		Options {
@@ -1655,7 +1655,7 @@ async fn a_pause_leaves_no_directory_uncreated() {
 		backend.delay = Duration::from_secs(10);
 	});
 	let (pause, _cancel, control) = controls();
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(
 		&setup,
 		Options {
@@ -1699,7 +1699,7 @@ async fn a_cancel_leaves_the_directories_not_created_yet_not_attempted() {
 		backend.delay = Duration::from_secs(10);
 	});
 	let (_pause, cancel, control) = controls();
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(
 		&setup,
 		Options {

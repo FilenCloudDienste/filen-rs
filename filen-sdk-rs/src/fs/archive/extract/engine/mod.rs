@@ -923,7 +923,12 @@ impl<B: DisposalBackend> Driver<B> {
 			// The archive is damaged from here on, but what came before it is whole: the files
 			// whose data is complete still finish, and only the one being read is dropped.
 			Err(error) => {
-				tracing::warn!("archive {}: {error}", self.archive.uuid());
+				// a dead codec is a bug to hear of, where a damaged archive is only the user's
+				if error.kind() == ErrorKind::ArchiveWorkerDied {
+					tracing::error!("archive {}: {error}", self.archive.uuid());
+				} else {
+					tracing::warn!("archive {}: {error}", self.archive.uuid());
+				}
 				if self.fatal.is_none() {
 					self.fatal = Some(Arc::new(Error::custom(error.kind(), error.to_string())));
 				}

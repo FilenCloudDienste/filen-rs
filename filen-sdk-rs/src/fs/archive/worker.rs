@@ -25,7 +25,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE};
+use crate::{
+	Error, ErrorKind,
+	blocking::send_catching_panic,
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+};
 
 use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
 
@@ -112,7 +116,9 @@ pub(crate) struct WorkerShared {
 	/// Moved whenever the codec takes input or hands over an event: the driver's evidence that
 	/// the codec is alive.
 	progress: AtomicU64,
-	/// Bytes of the archive the codec has read.
+	/// Bytes of its input the codec has read, each counted once however often it is read (a
+	/// chunk evicted from a [`SeekInput`]'s cache and fetched again, an entry read for a password
+	/// probe and then again for real), so it never exceeds the input's length.
 	input_bytes: AtomicU64,
 }
 
@@ -194,10 +200,42 @@ impl WorkerPort {
 	}
 }
 
+/// The codec's events. They end when the codec does: when it returned, or when it panicked, which
+/// on wasm traps its thread without closing its end of the channel.
+pub(crate) struct WorkerEvents {
+	events: mpsc::Receiver<WorkerEvent>,
+	/// Answered when the codec panicked; closed unanswered once it can no longer panic.
+	panicked: Option<oneshot::Receiver<()>>,
+}
+
+impl WorkerEvents {
+	fn new(events: mpsc::Receiver<WorkerEvent>, panicked: Option<oneshot::Receiver<()>>) -> Self {
+		Self { events, panicked }
+	}
+
+	pub(crate) async fn recv(&mut self) -> Option<WorkerEvent> {
+		if let Some(panicked) = &mut self.panicked {
+			tokio::select! {
+				biased;
+				event = self.events.recv() => return event,
+				answer = panicked => {
+					self.panicked = None;
+					if answer.is_ok() {
+						// an event already sent is still taken; then the channel reads as ended
+						self.events.close();
+					}
+				}
+			}
+		}
+		self.events.recv().await
+	}
+}
+
 /// The driver's end of the exchange with a started codec.
 pub(crate) struct WorkerLink<T> {
-	pub(crate) events: mpsc::Receiver<WorkerEvent>,
-	/// The codec's result; closed without one when the codec died.
+	pub(crate) events: WorkerEvents,
+	/// The codec's result. A codec that dies without a panic to report (on wasm, a trap outside
+	/// Rust) leaks its sender, so this stays pending: the driver's stall deadline ends the wait.
 	pub(crate) done: oneshot::Receiver<T>,
 	pub(crate) shared: Arc<WorkerShared>,
 	/// The wasm worker generation that took the job, to retire if it stalls.
@@ -240,18 +278,32 @@ static ARCHIVE_CODECS: crate::blocking::WorkerSlot = crate::blocking::WorkerSlot
 
 /// Runs `job` on a codec worker: a thread of its own natively, the archive worker on wasm. The
 /// caller holds the archive job lease, so on wasm no other job is queued on the worker.
-pub(crate) fn start<T: Send + 'static>(
-	job: impl FnOnce(WorkerPort) -> T + Send + 'static,
-) -> Result<WorkerLink<T>, crate::Error> {
+///
+/// A codec that panics (a parser bug an archive ran into) ends its events and fails with the
+/// panic's message: natively the panic would otherwise reach only stderr, lost on mobile, and on
+/// wasm the driver would wait out [`ARCHIVE_STALL_TIMEOUT`] first.
+pub(crate) fn start<R: Send + 'static>(
+	job: impl FnOnce(WorkerPort) -> Result<R, Error> + Send + 'static,
+) -> Result<WorkerLink<Result<R, Error>>, Error> {
 	let (port, events, shared) = channels();
+	let (result, done) = oneshot::channel();
+	let (panicked_tx, panicked) = oneshot::channel();
+	// runs inside the panic hook on wasm, so it logs nothing (the panic may have struck while
+	// the log's lock was held); the driver logs the error it fails the job with
+	let on_panic = move |message: String| {
+		let _ = panicked_tx.send(());
+		Err(Error::custom(
+			ErrorKind::ArchiveWorkerDied,
+			format!("the archive's codec panicked: {message}"),
+		))
+	};
+	let run = move || send_catching_panic(move || job(port), result, on_panic);
+	let events = WorkerEvents::new(events, Some(panicked));
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
-		let (result, done) = oneshot::channel();
 		std::thread::Builder::new()
 			.name("filen-archive-codec".to_owned())
-			.spawn(move || {
-				let _ = result.send(job(port));
-			})?;
+			.spawn(run)?;
 		Ok(WorkerLink {
 			events,
 			done,
@@ -260,7 +312,8 @@ pub(crate) fn start<T: Send + 'static>(
 	}
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
-		let (generation, done) = ARCHIVE_CODECS.submit(move || job(port));
+		// the result goes through the channel above, which a panicking codec still answers
+		let (generation, _) = ARCHIVE_CODECS.submit(run);
 		Ok(WorkerLink {
 			events,
 			done,
@@ -268,22 +321,6 @@ pub(crate) fn start<T: Send + 'static>(
 			generation,
 		})
 	}
-}
-
-/// A link driven by a test instead of a codec: events are sent with the async `send`, and the
-/// result through the returned sender.
-#[cfg(test)]
-pub(crate) fn scripted<T>() -> (mpsc::Sender<WorkerEvent>, oneshot::Sender<T>, WorkerLink<T>) {
-	let (port, events, shared) = channels();
-	let (result, done) = oneshot::channel();
-	let link = WorkerLink {
-		events,
-		done,
-		shared,
-		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		generation: 0,
-	};
-	(port.events, result, link)
 }
 
 /// An input's plaintext, fetched through the driver one chunk at a time.
@@ -348,6 +385,10 @@ pub(crate) struct SeekInput<'p> {
 	/// The most recent chunks, most recent first.
 	cache: Vec<(u64, Vec<u8>)>,
 	slots: usize,
+	/// One bit per chunk, set once it was fetched, so one fetched again counts as read once: 16
+	/// KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
+	/// length the archive does not have never sizes it.
+	fetched: Vec<u64>,
 }
 
 impl<'p> SeekInput<'p> {
@@ -359,6 +400,7 @@ impl<'p> SeekInput<'p> {
 			pos: 0,
 			cache: Vec::new(),
 			slots: 2,
+			fetched: Vec::new(),
 		}
 	}
 
@@ -374,15 +416,30 @@ impl<'p> SeekInput<'p> {
 			Some(at) => self.cache[..=at].rotate_right(1),
 			None => {
 				let data = self.port.fetch(self.source, index)?;
-				self.port
-					.shared
-					.input_bytes
-					.fetch_add(data.len() as u64, Ordering::Relaxed);
+				if self.first_fetch(index) {
+					self.port
+						.shared
+						.input_bytes
+						.fetch_add(data.len() as u64, Ordering::Relaxed);
+				}
 				self.cache.truncate(self.slots - 1);
 				self.cache.insert(0, (index, data));
 			}
 		}
 		Ok(&self.cache[0].1)
+	}
+
+	/// Marks chunk `index` fetched; whether it was not yet.
+	fn first_fetch(&mut self, index: u64) -> bool {
+		let word = usize::try_from(index / u64::BITS as u64)
+			.expect("an archive has fewer chunks than 64 times the address space");
+		let bit = 1 << (index % u64::BITS as u64);
+		if word >= self.fetched.len() {
+			self.fetched.resize(word + 1, 0);
+		}
+		let first = self.fetched[word] & bit == 0;
+		self.fetched[word] |= bit;
+		first
 	}
 }
 
@@ -558,4 +615,115 @@ pub(crate) fn read_full(reader: &mut (impl Read + ?Sized), buf: &mut [u8]) -> io
 		}
 	}
 	Ok(filled)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use tokio::sync::{mpsc, oneshot};
+
+	use super::{WorkerEvent, WorkerEvents, WorkerLink, channels};
+
+	/// A link driven by a test instead of a codec: events are sent with the async `send`, and
+	/// the result through the returned sender.
+	pub(crate) fn scripted<T>() -> (mpsc::Sender<WorkerEvent>, oneshot::Sender<T>, WorkerLink<T>) {
+		let (port, events, shared) = channels();
+		let (result, done) = oneshot::channel();
+		let link = WorkerLink {
+			events: WorkerEvents::new(events, None),
+			done,
+			shared,
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			generation: 0,
+		};
+		(port.events, result, link)
+	}
+
+	impl WorkerEvents {
+		/// Natively a panic unwinds through the codec's end of the channel, closing it.
+		pub(crate) fn blocking_recv(&mut self) -> Option<WorkerEvent> {
+			self.events.blocking_recv()
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::io::{Seek, SeekFrom};
+
+	use super::*;
+
+	/// Runs `read` on a codec worker over a source of `len` bytes, answering every ask; the chunk
+	/// indices asked for, and what `read` returned.
+	async fn with_source<R: Send + 'static>(
+		len: u64,
+		read: impl FnOnce(&WorkerPort) -> Result<R, Error> + Send + 'static,
+	) -> (Vec<u64>, Result<R, Error>) {
+		let mut link = start(move |port| read(&port)).unwrap();
+		let mut asked = Vec::new();
+		while let Some(event) = link.events.recv().await {
+			let WorkerEvent::Ask { index, reply, .. } = event else {
+				panic!("the reader only asks, sent {event:?}");
+			};
+			asked.push(index);
+			let start = index * CHUNK_SIZE_U64;
+			let end = (start + CHUNK_SIZE_U64).min(len);
+			let _ = reply.send(Ok((start..end).map(|at| (at % 251) as u8).collect()));
+		}
+		(asked, (&mut link.done).await.unwrap())
+	}
+
+	#[tokio::test]
+	async fn a_chunk_fetched_again_counts_once_toward_the_bytes_read() {
+		let len = 2 * CHUNK_SIZE_U64 + 100;
+		let (asked, read) = with_source(len, move |port| {
+			let mut source = SeekInput::new(port, 0, len);
+			let mut byte = [0u8];
+			// the first two chunks evict the last one from the cache of two before it is read again
+			for at in [len - 1, 0, CHUNK_SIZE_U64, len - 1] {
+				source.seek(SeekFrom::Start(at))?;
+				source.read_exact(&mut byte)?;
+			}
+			Ok(port.shared().input_bytes())
+		})
+		.await;
+		assert_eq!(asked, [2, 0, 1, 2]);
+		assert_eq!(read.unwrap(), len);
+	}
+
+	#[tokio::test]
+	async fn a_codec_that_panics_ends_its_events_and_fails_with_the_message() {
+		let mut link = start(|port| -> Result<(), Error> {
+			port.send(WorkerEvent::Opened(StreamLayout::Zip))?;
+			panic!("a header of {} bytes", 7);
+		})
+		.unwrap();
+		let mut events = Vec::new();
+		while let Some(event) = link.events.recv().await {
+			events.push(event);
+		}
+		assert!(
+			matches!(events[..], [WorkerEvent::Opened(StreamLayout::Zip)]),
+			"{events:?}"
+		);
+		let error = (&mut link.done).await.unwrap().unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::ArchiveWorkerDied);
+		assert!(
+			error.to_string().contains("panicked: a header of 7 bytes"),
+			"{error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_panic_ends_the_events_even_while_the_channel_stays_open() {
+		// what a trapped wasm worker leaves behind: its end of the channel never drops
+		let (sender, events) = mpsc::channel(1);
+		let (panicked_tx, panicked) = oneshot::channel();
+		let mut events = WorkerEvents::new(events, Some(panicked));
+		sender.send(WorkerEvent::FileEnd).await.unwrap();
+		panicked_tx.send(()).unwrap();
+		assert!(matches!(events.recv().await, Some(WorkerEvent::FileEnd)));
+		let end = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
+		assert!(matches!(end, Ok(None)), "the events did not end");
+		drop(sender);
+	}
 }

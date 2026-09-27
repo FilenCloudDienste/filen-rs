@@ -478,7 +478,7 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 #[tokio::test(start_paused = true)]
 async fn a_silent_codec_is_given_up_on() {
 	let setup = setup(|_, _| {});
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let job = start_with(
 		&setup,
 		"b.tar",
@@ -1470,7 +1470,7 @@ async fn read_into_the_second_source(events: &mpsc::Sender<WorkerEvent>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	let setup = setup(|_, _| {});
-	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let (pause, cancel, control) = controls();
 	let job = start_with(
 		&setup,

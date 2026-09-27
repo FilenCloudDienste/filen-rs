@@ -398,3 +398,18 @@ impl BuildHasher for SeededState {
 
 pub(crate) type SeededMap<K, V> = HashMap<K, V, SeededState>;
 pub(crate) type SeededSet<K> = HashSet<K, SeededState>;
+
+/// A panic's message, when its payload is text (what `panic!` makes).
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(s) = payload.downcast_ref::<&str>() {
+		(*s).to_string()
+	} else if let Some(s) = payload.downcast_ref::<String>() {
+		s.clone()
+	} else {
+		"non-string panic payload".to_string()
+	}
+}
