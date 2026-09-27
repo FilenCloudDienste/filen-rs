@@ -860,8 +860,18 @@ impl<B: DisposalBackend> Driver<B> {
 		self.archive_hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
 		// progress follows the archive read, not only the idle ticks, which a busy job skips
-		self.reporter
-			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
+		self.report_bytes_read();
+	}
+
+	/// Reports the bytes of the archive the codec has read, which its inputs count once each.
+	fn report_bytes_read(&self) {
+		let read = self.link.shared.input_bytes();
+		debug_assert!(
+			read <= self.archive.size(),
+			"the codec read {read} bytes of a {}-byte archive",
+			self.archive.size()
+		);
+		self.reporter.set_bytes_read(read);
 	}
 
 	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) {
@@ -883,8 +893,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn tick(&mut self, pause_requested: bool) {
-		self.reporter
-			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
+		self.report_bytes_read();
 		self.reporter.tick();
 		let stamp = self.link.shared.progress();
 		// frozen while the driver owes the codec something: an answer, room for an event, or
