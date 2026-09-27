@@ -261,17 +261,6 @@ impl FakeBackend {
 	}
 }
 
-/// Waits until `condition` holds, panicking once a generous time has passed without it.
-pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-	for _ in 0..100_000 {
-		if condition() {
-			return;
-		}
-		tokio::time::sleep(Duration::from_millis(1)).await;
-	}
-	panic!("timed out waiting until {what}");
-}
-
 impl DriveBackend for FakeBackend {
 	type DriveLock = FakeLock;
 	type Upload = FakeUpload;
