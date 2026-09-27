@@ -1317,14 +1317,14 @@ fn a_damaged_byte_never_panics() {
 		(0, fixture!("finder-ditto.zip").1.to_vec()),
 		(0, fixture!("zip64-infozip.zip").1.to_vec()),
 		(0, fixture!("zipcrypto-infozip.zip").1.to_vec()),
+		// the LZMA entries' own headers (version, properties, dictionary size) are damaged too
 		(0, fixture!("lzma.zip").1.to_vec()),
+		(0, fixture!("lzma-no-eos.zip").1.to_vec()),
 		(0, fixture!("xz.zip").1.to_vec()),
 	];
 	for (skipped, zip) in archives {
-		// the central directory and end records are at the end, the first local header at the
-		// start: every length, offset and signature in them is damaged in turn
-		let tail = zip.len().saturating_sub(1024);
-		for at in (0..64).chain(tail..zip.len()) {
+		// every header, record, length and offset, and every entry's data, in turn
+		for at in 0..zip.len() {
 			for damage in [|b: u8| b ^ 0x01, |b: u8| b ^ 0x80, |_| 0xFF] {
 				let mut damaged = zip.clone();
 				damaged[at] = damage(damaged[at]);
