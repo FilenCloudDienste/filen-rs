@@ -106,9 +106,8 @@ pub enum ArchiveKeptReason {
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
-	/// The job was cancelled while removing it: `bytes_freed` of its files were already deleted
-	/// for good, the rest is still there.
-	Interrupted { bytes_freed: u64 },
+	/// The job was cancelled while removing it.
+	Interrupted,
 	/// Removing it failed.
 	Failed { error: JobError },
 }
@@ -133,6 +132,9 @@ pub enum ArchiveDisposalOutcome {
 	},
 	Kept {
 		reason: ArchiveKeptReason,
+		/// Bytes of its files already deleted for good when a permanent removal stopped part
+		/// way (0 otherwise): those files are gone, and only the job's output still holds them.
+		bytes_freed: u64,
 	},
 }
 
@@ -319,7 +321,7 @@ impl From<dispose::KeptReason> for ArchiveKeptReason {
 			Kept::Changed => Self::Changed,
 			Kept::Unconfirmed => Self::Unconfirmed,
 			Kept::HasVersions => Self::HasVersions,
-			Kept::Interrupted { bytes_freed } => Self::Interrupted { bytes_freed },
+			Kept::Interrupted => Self::Interrupted,
 			Kept::Failed { error } => Self::Failed {
 				error: job_error(error),
 			},
@@ -335,8 +337,12 @@ impl From<dispose::SourceDisposition> for ArchiveSourceDisposition {
 				dispose::DisposalOutcome::Disposed { how, bytes_freed } => {
 					ArchiveDisposalOutcome::Disposed { how, bytes_freed }
 				}
-				dispose::DisposalOutcome::Kept { reason } => ArchiveDisposalOutcome::Kept {
+				dispose::DisposalOutcome::Kept {
+					reason,
+					bytes_freed,
+				} => ArchiveDisposalOutcome::Kept {
 					reason: reason.into(),
+					bytes_freed,
 				},
 			},
 		}
@@ -833,7 +839,9 @@ mod uniffi_impl {
 		/// created. A wrong one is found before anything is created too when the archive has an
 		/// encrypted entry small enough to check it on (16 MiB), else as the first encrypted entry
 		/// is read; folders created by then go to the trash. The report is returned whether the extract
-		/// completed, was cancelled or failed.
+		/// completed, was cancelled or failed. Only an abort through `managed_future` gets
+		/// that report: cancelling the calling coroutine or task drops the call, and with it the
+		/// report (the job is stopped at once).
 		#[allow(clippy::too_many_arguments)]
 		pub async fn extract_archive(
 			&self,
@@ -880,7 +888,9 @@ mod uniffi_impl {
 		///
 		/// `password` is required exactly when the format is encrypted. The report is returned
 		/// whether the compress completed, was cancelled or failed; a compress that did not
-		/// complete leaves nothing in the drive.
+		/// complete leaves nothing in the drive. Only an abort through `managed_future` gets
+		/// that report: cancelling the calling coroutine or task drops the call, and with it the
+		/// report (the job is stopped at once).
 		#[allow(clippy::too_many_arguments)]
 		pub async fn compress_items(
 			&self,
@@ -947,11 +957,11 @@ mod wasm_impl {
 		/// anything is written; a streaming archive (tar, one compressed file) fails once it has
 		/// written that much, keeping what it extracted.
 		#[serde(default)]
-		#[tsify(optional)]
+		#[tsify(type = "number | bigint", optional)]
 		pub max_bytes: Option<u64>,
 		/// Most items to create.
 		#[serde(default)]
-		#[tsify(optional)]
+		#[tsify(type = "number | bigint", optional)]
 		pub max_items: Option<u64>,
 		/// The guard against decompression bombs; when left out, the SDK's (1000 times the
 		/// archive, at least 256 MiB).
@@ -984,7 +994,7 @@ mod wasm_impl {
 		pub format: CompressFormat,
 		/// Storage still free on the account, if known.
 		#[serde(default)]
-		#[tsify(optional)]
+		#[tsify(type = "number | bigint", optional)]
 		pub max_bytes: Option<u64>,
 		/// Removes the items once the archive is registered and verified. The archive is not read
 		/// back first: with an encrypted format, have the user confirm the password (type it twice)
@@ -1364,6 +1374,7 @@ mod tests {
 						reason: KeptReason::Failed {
 							error: Arc::clone(&removal),
 						},
+						bytes_freed: 3,
 					},
 				},
 				SourceDisposition {
@@ -1386,6 +1397,7 @@ mod tests {
 		};
 		let ArchiveDisposalOutcome::Kept {
 			reason: ArchiveKeptReason::Failed { error },
+			bytes_freed: 3,
 		} = &first.outcome
 		else {
 			panic!("{:?}", first.outcome);

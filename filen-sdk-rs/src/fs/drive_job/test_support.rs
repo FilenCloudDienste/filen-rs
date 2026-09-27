@@ -123,6 +123,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) later_targets: Option<ConnectedTargets>,
 	/// Files with older versions.
 	pub(crate) versioned_files: HashSet<Uuid>,
+	/// Files whose permanent deletion fails.
+	pub(crate) fail_deletes_of: HashSet<Uuid>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
 	/// Lowercased names the destination holds without the listing having shown them.
@@ -174,6 +176,7 @@ impl FakeBackend {
 			targets: ConnectedTargets::default(),
 			later_targets: None,
 			versioned_files: HashSet::new(),
+			fail_deletes_of: HashSet::new(),
 			reverse_chunks: false,
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
@@ -557,6 +560,9 @@ mod disposal {
 		}
 
 		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
+			if self.fail_deletes_of.contains(&uuid) {
+				return Err(Error::custom(ErrorKind::Server, "delete failed"));
+			}
 			let mut log = self.log();
 			log.file_parents.remove(&uuid);
 			log.deleted_files.push(uuid);

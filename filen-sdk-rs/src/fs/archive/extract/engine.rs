@@ -443,6 +443,24 @@ impl<B: DisposalBackend> Driver<B> {
 			),
 			(Ok(()), None) => (ExtractPhase::Done, Ok(())),
 		};
+		// the archive to remove was not touched: say so, rather than leave its disposition out
+		if result.is_err() && self.dispose.is_some() && self.report.dispositions.is_empty() {
+			let reason = if self.control.is_cancelled() {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Incomplete
+			};
+			let disposition = SourceDisposition {
+				uuid: self.archive.uuid(),
+				outcome: DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+			};
+			self.reporter
+				.event(ExtractEvent::SourceDisposition(disposition.clone()));
+			self.report.dispositions.push(disposition);
+		}
 		if let Err(error) = &result
 			&& error.kind() == ErrorKind::ArchiveWrongPassword
 			&& self.reporter.counts().files_done == 0
@@ -665,6 +683,9 @@ impl<B: DisposalBackend> Driver<B> {
 		if let Some(event) = self.held.take() {
 			self.retry_held(event);
 		}
+		// files held back while a pause was requested: a pause lifted before the job went idle
+		// has no resume of its own to start them
+		self.finalize_ready();
 	}
 
 	/// Memory for one chunk: the floor's slot when free, else the client's budget if it has
@@ -691,7 +712,8 @@ impl<B: DisposalBackend> Driver<B> {
 		self.archive_hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
 		// progress follows the archive read, not only the idle ticks, which a busy job skips
-		self.reporter.set_bytes_read(self.link.shared.input_bytes());
+		self.reporter
+			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
 	}
 
 	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) {
@@ -713,7 +735,8 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn tick(&mut self, pause_requested: bool) {
-		self.reporter.set_bytes_read(self.link.shared.input_bytes());
+		self.reporter
+			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
 		self.reporter.tick();
 		let stamp = self.link.shared.progress();
 		// frozen while the driver owes the codec something: an answer, room for an event, or
@@ -1551,7 +1574,10 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Removes the archive if the extraction is verified; what became of it.
 	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
-		let kept = |reason| DisposalOutcome::Kept { reason };
+		let kept = |reason| DisposalOutcome::Kept {
+			reason,
+			bytes_freed: 0,
+		};
 		let counts = self.reporter.counts();
 		if counts.files_failed + counts.dirs_failed + counts.entries_skipped > 0 {
 			return kept(KeptReason::Incomplete);
@@ -1594,9 +1620,6 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Whether the server holds exactly what the counts say was created: every file at its size
 	/// and every directory, listed again below the items created in the destination.
 	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
-		if self.report.omitted.top_level > 0 {
-			return false;
-		}
 		let mut found = Tree::default();
 		if !self.into_destination {
 			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
@@ -1622,6 +1645,26 @@ impl<B: DisposalBackend> Driver<B> {
 					}
 					Err(_) => return false,
 				},
+			}
+		}
+		// the top-level items the report keeps no record of, as recheck_targets goes through them
+		for &(uuid, is_dir) in &self.top_level_beyond {
+			if is_dir {
+				match self.backend.list_tree(uuid).await {
+					Ok(tree) => {
+						found.dirs.insert(uuid);
+						found.dirs.extend(tree.dirs);
+						found.files.extend(tree.files);
+					}
+					Err(_) => return false,
+				}
+			} else {
+				match self.backend.file_state(uuid).await {
+					Ok(state) if !state.trash => {
+						found.files.insert(uuid, state.size);
+					}
+					_ => return false,
+				}
 			}
 		}
 		// the very items the job created, each file at the size it wrote

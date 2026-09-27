@@ -15,7 +15,7 @@ use crate::fs::{
 	name::ValidatedName,
 };
 
-pub use crate::fs::archive::password::ArchivePassword;
+pub use crate::fs::archive::{format::archive_default_name, password::ArchivePassword};
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport,

@@ -70,9 +70,8 @@ pub enum KeptReason {
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
-	/// The job was cancelled while removing it: `bytes_freed` of its files were already deleted
-	/// for good, the rest is still there.
-	Interrupted { bytes_freed: u64 },
+	/// The job was cancelled while removing it.
+	Interrupted,
 	/// Removing it failed.
 	Failed { error: Arc<Error> },
 }
@@ -86,6 +85,9 @@ pub enum DisposalOutcome {
 	},
 	Kept {
 		reason: KeptReason,
+		/// Bytes of its files already deleted for good when a permanent removal stopped part
+		/// way (0 otherwise): those files are gone, and only the job's output still holds them.
+		bytes_freed: u64,
 	},
 }
 
@@ -275,7 +277,10 @@ impl ExpectedFile {
 }
 
 fn kept(reason: KeptReason) -> DisposalOutcome {
-	DisposalOutcome::Kept { reason }
+	DisposalOutcome::Kept {
+		reason,
+		bytes_freed: 0,
+	}
 }
 
 fn failed(error: Error) -> DisposalOutcome {
@@ -293,7 +298,7 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	control: &JobControl,
 ) -> DisposalOutcome {
 	if control.is_stopping() {
-		return kept(KeptReason::Interrupted { bytes_freed: 0 });
+		return kept(KeptReason::Interrupted);
 	}
 	let state = match backend.file_state(file.uuid).await {
 		Ok(state) => state,
@@ -336,7 +341,7 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	control: &JobControl,
 ) -> DisposalOutcome {
 	if control.is_stopping() {
-		return kept(KeptReason::Interrupted { bytes_freed: 0 });
+		return kept(KeptReason::Interrupted);
 	}
 	match backend.list_tree(dir).await {
 		Ok(listed) if listed == *read => {}
@@ -349,7 +354,7 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 		// all for this reason
 		for &uuid in read.files.keys() {
 			if control.is_stopping() {
-				return kept(KeptReason::Interrupted { bytes_freed: 0 });
+				return kept(KeptReason::Interrupted);
 			}
 			match backend.has_older_versions(uuid).await {
 				Ok(false) => {}
@@ -357,24 +362,46 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 				Err(error) => return failed(error),
 			}
 		}
+		// from here on, what stops the removal leaves files deleted: every outcome says how many
+		let partly = |reason, bytes_freed| DisposalOutcome::Kept {
+			reason,
+			bytes_freed,
+		};
 		for (&uuid, &size) in &read.files {
 			if control.is_stopping() {
-				return kept(KeptReason::Interrupted { bytes_freed });
+				return partly(KeptReason::Interrupted, bytes_freed);
 			}
 			if let Err(error) = backend.delete_file_permanently(uuid).await {
-				return failed(error);
+				return partly(
+					KeptReason::Failed {
+						error: Arc::new(error),
+					},
+					bytes_freed,
+				);
 			}
 			bytes_freed += size;
 		}
 		// only a directory the job emptied is trashed: anything that arrived since stays
 		match backend.list_tree(dir).await {
 			Ok(left) if left.files.is_empty() => {}
-			Ok(_) => return kept(KeptReason::Changed),
-			Err(error) => return failed(error),
+			Ok(_) => return partly(KeptReason::Changed, bytes_freed),
+			Err(error) => {
+				return partly(
+					KeptReason::Failed {
+						error: Arc::new(error),
+					},
+					bytes_freed,
+				);
+			}
 		}
 	}
 	match backend.trash_dir(dir).await {
 		Ok(()) => DisposalOutcome::Disposed { how, bytes_freed },
-		Err(error) => failed(error),
+		Err(error) => DisposalOutcome::Kept {
+			reason: KeptReason::Failed {
+				error: Arc::new(error),
+			},
+			bytes_freed,
+		},
 	}
 }

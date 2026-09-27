@@ -589,7 +589,7 @@ mod wasm_impl {
 		/// written. Its report still carries `totals`, counted as not attempted, so the caller
 		/// can tell how much storage the copy needs.
 		#[serde(default)]
-		#[tsify(optional)]
+		#[tsify(type = "number | bigint", optional)]
 		pub max_bytes: Option<u64>,
 		#[tsify(type = "(update: CopyUpdate) => void", optional)]
 		#[serde(default, deserialize_with = "crate::js::optional_function")]
@@ -613,7 +613,7 @@ mod wasm_impl {
 		/// written. Its report still carries `totals`, counted as not attempted, so the caller
 		/// can tell how much storage the copy needs.
 		#[serde(default)]
-		#[tsify(optional)]
+		#[tsify(type = "number | bigint", optional)]
 		pub max_bytes: Option<u64>,
 		#[tsify(type = "(update: CopyUpdate) => void", optional)]
 		#[serde(default, deserialize_with = "crate::js::optional_function")]

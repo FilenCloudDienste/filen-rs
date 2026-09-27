@@ -403,6 +403,17 @@ pub(crate) fn read_index<R: Read + Seek>(
 			.map(|(&at, &size)| (at, at + size)),
 	);
 	index.unaccounted_bytes = unaccounted(covered, len)?;
+	// a folder no file takes its data from holds bytes nothing extracts
+	let mut used = vec![false; index.folders.len()];
+	for stream in index.entries.iter().filter_map(|entry| entry.stream) {
+		used[stream.folder] = true;
+	}
+	for (folder, _) in index.folders.iter().zip(used).filter(|(_, used)| !used) {
+		let packed = &index.pack_sizes[folder.first_pack..folder.first_pack + folder.packed.len()];
+		index.unaccounted_bytes = packed.iter().fold(index.unaccounted_bytes, |total, &size| {
+			total.saturating_add(size)
+		});
+	}
 	Ok(index)
 }
 

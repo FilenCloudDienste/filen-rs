@@ -558,7 +558,7 @@ fn disposition(report: &ExtractReport) -> DisposalOutcome {
 
 fn kept(outcome: DisposalOutcome) -> KeptReason {
 	match outcome {
-		DisposalOutcome::Kept { reason } => reason,
+		DisposalOutcome::Kept { reason, .. } => reason,
 		other => panic!("expected the archive kept, got {other:?}"),
 	}
 }
@@ -1064,4 +1064,39 @@ async fn a_paused_extract_finishes_once_resumed() {
 	assert_eq!(report.counts.files_done, 3);
 	assert_eq!(finished(&setup).len(), 3);
 	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
+	// b.txt's registration runs long; a.bin's upload ends while the pause is requested, and the
+	// pause is lifted while b.txt still registers, so the job never went idle
+	let big = pattern(CHUNK_SIZE + 3, 5);
+	let tar = tar_of(&[("b.txt", b"b"), ("a.bin", &big[..])]);
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend
+			.slow_finish
+			.insert("b.txt".into(), Duration::from_secs(2));
+		backend
+			.slow
+			.insert("a.bin".into(), Duration::from_millis(600));
+	});
+	let (pause, _cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+	);
+	tokio::time::sleep(Duration::from_millis(250)).await;
+	pause.send_replace(true);
+	tokio::time::sleep(Duration::from_millis(800)).await;
+	pause.send_replace(false);
+	let report = tokio::time::timeout(Duration::from_secs(20), job.running)
+		.await
+		.expect("the job finishes")
+		.unwrap()
+		.unwrap();
+	assert_eq!(report.counts.files_done, 2);
+	assert_eq!(finished(&setup).len(), 2);
 }

@@ -546,7 +546,7 @@ fn all_kept_for(report: &CompressReport, expected: fn(&KeptReason) -> bool) {
 	assert_eq!(report.dispositions.len(), 2);
 	for outcome in outcomes(report) {
 		match outcome {
-			DisposalOutcome::Kept { reason } => assert!(expected(&reason), "{reason:?}"),
+			DisposalOutcome::Kept { reason, .. } => assert!(expected(&reason), "{reason:?}"),
 			other => panic!("expected the source kept, got {other:?}"),
 		}
 	}
@@ -640,7 +640,8 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	assert!(matches!(
 		&outcomes[0],
 		DisposalOutcome::Kept {
-			reason: KeptReason::Changed
+			reason: KeptReason::Changed,
+			..
 		}
 	));
 	assert!(matches!(&outcomes[1], DisposalOutcome::Disposed { .. }));
@@ -675,7 +676,8 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 		matches!(
 			top,
 			DisposalOutcome::Kept {
-				reason: KeptReason::HashMismatch
+				reason: KeptReason::HashMismatch,
+				..
 			}
 		),
 		"{top:?}"
@@ -700,7 +702,8 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 		matches!(
 			top,
 			DisposalOutcome::Kept {
-				reason: KeptReason::HashUnavailable
+				reason: KeptReason::HashUnavailable,
+				..
 			}
 		),
 		"{top:?}"
@@ -857,7 +860,8 @@ async fn a_permanent_removal_keeps_what_has_older_versions() {
 		matches!(
 			top,
 			DisposalOutcome::Kept {
-				reason: KeptReason::HasVersions
+				reason: KeptReason::HasVersions,
+				..
 			}
 		),
 		"{top:?}"
@@ -881,7 +885,8 @@ async fn a_permanent_removal_keeps_what_has_older_versions() {
 		matches!(
 			docs,
 			DisposalOutcome::Kept {
-				reason: KeptReason::HasVersions
+				reason: KeptReason::HasVersions,
+				..
 			}
 		),
 		"{docs:?}"
@@ -894,4 +899,40 @@ async fn a_permanent_removal_keeps_what_has_older_versions() {
 			.all(|uuid| !folder_files.contains(uuid))
 	);
 	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permanent_removal_cut_short_says_what_it_deleted() {
+	// the folder's files are deleted in uuid order: the second one fails
+	let setup = setup(|backend, files| {
+		let last = files[..2].iter().map(HasUUID::uuid).max().unwrap();
+		backend.fail_deletes_of.insert(last);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, _] = &outcomes(&report)[..] else {
+		panic!("two sources");
+	};
+	let first = setup.sources[..2]
+		.iter()
+		.min_by_key(|(_, file)| file.uuid())
+		.unwrap()
+		.1
+		.size();
+	let DisposalOutcome::Kept {
+		reason: KeptReason::Failed { .. },
+		bytes_freed,
+	} = docs
+	else {
+		panic!("{docs:?}");
+	};
+	assert_eq!(
+		*bytes_freed, first,
+		"the file deleted before the failure is reported gone"
+	);
 }

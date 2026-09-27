@@ -24,6 +24,11 @@ use super::{
 };
 
 impl Client {
+	/// The archive settings in effect (after clamping): codec memory, jobs at once, limits.
+	pub fn archive_config(&self) -> &crate::fs::archive::ArchiveConfig {
+		self.client().state().archives()
+	}
+
 	/// Extracts an archive into the user's drive. Nothing can decode on the server (items are
 	/// end-to-end encrypted), so the archive is downloaded and decoded here, and every entry is
 	/// encrypted and uploaded as a new item.

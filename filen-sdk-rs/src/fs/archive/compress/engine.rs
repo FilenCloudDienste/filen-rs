@@ -325,6 +325,14 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			return Err(Stopped);
 		}
 		driver.reporter.set_phase(CompressPhase::Finishing);
+		// the destination may have been shared or linked since the job started
+		let targets = match driver.backend.connected_targets(driver.destination).await {
+			Ok(current) => current,
+			Err(error) => {
+				tracing::warn!("failed to re-check the archive destination's shares: {error}");
+				targets
+			}
+		};
 		let archive = driver.register(name, shape, targets).await?;
 		// the archive exists from here on: a cancel now keeps the sources, but the job is done
 		if let Some(disposal) = disposal {
@@ -337,7 +345,8 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 					.map(|target| SourceDisposition {
 						uuid: target.uuid(),
 						outcome: DisposalOutcome::Kept {
-							reason: KeptReason::Interrupted { bytes_freed: 0 },
+							reason: KeptReason::Interrupted,
+							bytes_freed: 0,
 						},
 					})
 					.collect(),
@@ -718,6 +727,13 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		let archive_reason = if incomplete {
 			Some(KeptReason::Incomplete)
+		} else if self
+			.sources
+			.iter()
+			.any(|source| source.served != source.chunks)
+		{
+			// a source not read to its end had its hash never checked
+			Some(KeptReason::Unconfirmed)
 		} else if (0..targets.len()).all(|request| own_reason(request).is_some()) {
 			None
 		} else {
@@ -742,6 +758,7 @@ impl<B: DisposalBackend> Driver<B> {
 					target.uuid(),
 					DisposalOutcome::Kept {
 						reason: reason.clone(),
+						bytes_freed: 0,
 					},
 				),
 				(None, DisposalTarget::File(file)) => (
@@ -756,6 +773,7 @@ impl<B: DisposalBackend> Driver<B> {
 					uuid,
 					DisposalOutcome::Kept {
 						reason: KeptReason::Changed,
+						bytes_freed: 0,
 					},
 				),
 			};
