@@ -529,6 +529,11 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		.await;
 		let (phase, result) = self.fatal.end(outcome, &self.control, ExtractReport::NAME);
+		// a cancel once everything was extracted keeps the archive, but the job is done; it still
+		// ends as cancelled jobs do, however late it was seen
+		if result.is_ok() && self.control.is_cancelled() {
+			self.reporter.set_cancelling();
+		}
 		// the archive to remove was not touched: say so, rather than leave its disposition out
 		if self.disposal_requested && self.report.dispositions.is_empty() {
 			let dispositions = if result.is_ok() {
@@ -1783,15 +1788,19 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Whether the server holds exactly what the counts say was created: every file at its size
 	/// and every directory, listed again below the items created in the destination. Listed
 	/// as many at once as other small requests; a pause is waited out between them, holding
-	/// nothing, and a cancel ends the check unconfirmed.
+	/// nothing, and a cancel drops those in flight and ends the check unconfirmed.
 	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
 		let mut found = Tree::default();
 		if !self.into_destination {
 			// each request counts in flight, so a pause is only reported once it is over
 			let _listing = self.reporter.op();
-			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
-				Ok(tree) => found = tree,
-				Err(_) => return false,
+			let listed = self
+				.control
+				.until_stopping(self.backend.list_tree(self.dirs[ROOT].uuid))
+				.await;
+			match listed {
+				Ok(Ok(tree)) => found = tree,
+				Ok(Err(_)) | Err(Stopped) => return false,
 			}
 			// the folder itself
 			found.dirs.insert(self.dirs[ROOT].uuid);
@@ -1811,13 +1820,19 @@ impl<B: DisposalBackend> Driver<B> {
 				return false;
 			}
 			let listing = self.reporter.op();
-			let listed = join_all(
-				batch
-					.iter()
-					.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
-			)
-			.await;
+			// a listing removes nothing: a cancel drops the ones in flight
+			let listed = self
+				.control
+				.until_stopping(join_all(
+					batch
+						.iter()
+						.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
+				))
+				.await;
 			drop(listing);
+			let Ok(listed) = listed else {
+				return false;
+			};
 			for tree in listed {
 				let Some(tree) = tree else {
 					return false;
