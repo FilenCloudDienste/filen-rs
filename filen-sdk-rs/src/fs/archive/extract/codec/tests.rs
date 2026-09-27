@@ -364,6 +364,27 @@ fn a_zstd_tar_is_read_through_its_frames() {
 }
 
 #[test]
+fn what_a_codec_without_a_checksum_decodes_is_unchecked() {
+	let brotli = |data: &[u8]| {
+		let mut writer = ::brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+		writer.write_all(data).unwrap();
+		writer.into_inner()
+	};
+	// brotli carries no checksum: its one file, or every file of its tar, is unchecked
+	let (_, end) = run(&brotli(b"a note"), "note.txt.br");
+	assert_eq!(end.unwrap().unchecked_entries, 1);
+	let (_, end) = run(&brotli(&sample_tar()), "sample.tar.br");
+	assert_eq!(
+		end.unwrap().unchecked_entries,
+		1,
+		"docs/a.txt is its one file"
+	);
+	// gzip's CRC-32 checks all of it
+	let (_, end) = run(&gzip(&sample_tar()), "sample.tgz");
+	assert_eq!(end.unwrap().unchecked_entries, 0);
+}
+
+#[test]
 fn a_single_compressed_file_is_named_after_the_archive() {
 	let data = b"a single file, compressed on its own".repeat(100);
 	let (seen, end) = run(&gzip(&data), "notes.txt.gz");
