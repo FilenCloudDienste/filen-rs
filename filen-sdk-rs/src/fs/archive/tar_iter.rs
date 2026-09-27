@@ -9,9 +9,11 @@
 //!
 //! A hard link's size is honoured as libarchive honours it: POSIX lets a hard link in a pax
 //! archive carry the file's data, while older writers put the target's size on a hard link and
-//! no data after it. So it holds once the archive is known to be pax (a PAX header was seen and
-//! no GNU header since), never on a GNU or pre-POSIX header, and on a plain ustar one only when
-//! what follows is not a header.
+//! no data after it. So the header's size holds only once the archive is known to be pax (a PAX
+//! header was seen, and no GNU or pre-POSIX header since), and is 0 on any other; a PAX `size`
+//! record for the link itself always holds. GNU tar reads it the same way, but for ignoring the
+//! header's size in a pax archive too. Reading a stated size as data anywhere else would let a
+//! link hide members from both tools inside what they take for headers.
 
 use std::io::{self, Read};
 
@@ -112,8 +114,24 @@ enum Flavor {
 	Pax,
 }
 
+impl Flavor {
+	/// What the archive is after `header`, when it was `self` before.
+	fn after(self, header: &Header) -> Self {
+		match header.entry_type().as_byte() {
+			// PAX extended and global headers, Sun's and Solaris ACLs, as libarchive has them
+			b'x' | b'g' | b'X' | b'A' => Self::Pax,
+			// GNU long names and links and volume headers change nothing
+			b'L' | b'K' | b'V' => self,
+			_ if header.as_gnu().is_some() => Self::Gnu,
+			_ if header.as_ustar().is_some() && self == Self::Pax => Self::Pax,
+			_ if header.as_ustar().is_some() => Self::Ustar,
+			_ => Self::Old,
+		}
+	}
+}
+
 pub(crate) struct TarReader<R> {
-	inner: Lookahead<R>,
+	inner: R,
 	flavor: Flavor,
 	/// Unread bytes of the current member's data, then its padding to the next block.
 	remaining: u64,
@@ -128,11 +146,7 @@ impl<R: Read> TarReader<R> {
 	/// is refused.
 	pub(crate) fn new(inner: R, max_members: u64) -> Self {
 		Self {
-			inner: Lookahead {
-				inner,
-				block: Vec::new(),
-				at: 0,
-			},
+			inner,
 			flavor: Flavor::Old,
 			remaining: 0,
 			padding: 0,
@@ -163,13 +177,7 @@ impl<R: Read> TarReader<R> {
 			let size = header
 				.entry_size()
 				.map_err(|_| TarError::Corrupt("a member's size field is invalid"))?;
-			self.flavor = match header.entry_type() {
-				EntryType::XHeader | EntryType::XGlobalHeader => Flavor::Pax,
-				_ if header.as_gnu().is_some() => Flavor::Gnu,
-				_ if header.as_ustar().is_some() && self.flavor == Flavor::Pax => Flavor::Pax,
-				_ if header.as_ustar().is_some() => Flavor::Ustar,
-				_ => Flavor::Old,
-			};
+			self.flavor = self.flavor.after(header);
 			match header.entry_type() {
 				EntryType::GNULongName => {
 					let name = self.read_record(size, MAX_LONG_NAME)?;
@@ -203,7 +211,13 @@ impl<R: Read> TarReader<R> {
 			.path
 			.or(pending.long_name)
 			.unwrap_or_else(|| header.path_bytes().into_owned());
-		let mut size = pax.size.unwrap_or(stored_size);
+		let entry_type = header.entry_type();
+		// a hard link's own header states data only in a pax archive; its PAX record always
+		let stored_size = match entry_type {
+			EntryType::Link if self.flavor != Flavor::Pax => 0,
+			_ => stored_size,
+		};
+		let size = pax.size.unwrap_or(stored_size);
 		let modified = pax.modified.or_else(|| {
 			header.mtime().ok().and_then(|secs| {
 				Some(MemberTime {
@@ -212,21 +226,15 @@ impl<R: Read> TarReader<R> {
 				})
 			})
 		});
-		let entry_type = header.entry_type();
 		let mut kind = match entry_type {
 			EntryType::Regular | EntryType::Continuous => MemberKind::File,
 			EntryType::Directory => MemberKind::Dir,
 			EntryType::Symlink => MemberKind::Symlink {
 				target: link_target(pax.link_path, pending.long_link, header),
 			},
-			EntryType::Link => {
-				if size > 0 && !self.link_has_data()? {
-					size = 0;
-				}
-				MemberKind::Hardlink {
-					target: link_target(pax.link_path, pending.long_link, header),
-				}
-			}
+			EntryType::Link => MemberKind::Hardlink {
+				target: link_target(pax.link_path, pending.long_link, header),
+			},
 			EntryType::Char | EntryType::Block => MemberKind::Device,
 			EntryType::Fifo => MemberKind::Fifo,
 			EntryType::GNUSparse => {
@@ -254,24 +262,6 @@ impl<R: Read> TarReader<R> {
 		})
 	}
 
-	/// Whether a hard link that states a size carries that much data (see the module doc).
-	fn link_has_data(&mut self) -> Result<bool, TarError> {
-		Ok(match self.flavor {
-			Flavor::Pax => true,
-			Flavor::Gnu | Flavor::Old => false,
-			// what libarchive's bid takes for the next header: a checksum that matches and a
-			// ustar or GNU magic
-			Flavor::Ustar => {
-				let next = self.inner.peek(TAR_BLOCK as usize)?;
-				let is_header = is_tar_header(next) && {
-					let header = Header::from_byte_slice(next);
-					header.as_ustar().is_some() || header.as_gnu().is_some()
-				};
-				!is_header
-			}
-		})
-	}
-
 	/// Reads the current member's data; `Ok(0)` once all of it was read.
 	pub(crate) fn read_body(&mut self, buf: &mut [u8]) -> Result<usize, TarError> {
 		if self.remaining == 0 || buf.is_empty() {
@@ -291,10 +281,7 @@ impl<R: Read> TarReader<R> {
 	/// The stream after the end-of-archive marker, to drain (whatever follows is not part of any
 	/// member).
 	pub(crate) fn into_inner(self) -> R {
-		// what a hard link peeked at is its data or the next header, and either is read before
-		// the marker is
-		debug_assert!(self.inner.at == self.inner.block.len());
-		self.inner.inner
+		self.inner
 	}
 
 	fn skip_rest(&mut self) -> Result<(), TarError> {
@@ -376,39 +363,6 @@ impl<R: Read> TarReader<R> {
 			extended = block[504] != 0;
 		}
 		Ok(())
-	}
-}
-
-/// The tar stream, with a block read ahead of where the reader is when a hard link needs to see
-/// what follows it.
-struct Lookahead<R> {
-	inner: R,
-	block: Vec<u8>,
-	/// Bytes of `block` already read.
-	at: usize,
-}
-
-impl<R: Read> Lookahead<R> {
-	/// The next `len` bytes (fewer at the end of the stream), left to be read.
-	fn peek(&mut self, len: usize) -> io::Result<&[u8]> {
-		debug_assert_eq!(self.at, self.block.len(), "one peek at a time");
-		self.block.resize(len, 0);
-		let read = read_full(&mut self.inner, &mut self.block)?;
-		self.block.truncate(read);
-		self.at = 0;
-		Ok(&self.block)
-	}
-}
-
-impl<R: Read> Read for Lookahead<R> {
-	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		if self.at < self.block.len() {
-			let n = buf.len().min(self.block.len() - self.at);
-			buf[..n].copy_from_slice(&self.block[self.at..self.at + n]);
-			self.at += n;
-			return Ok(n);
-		}
-		self.inner.read(buf)
 	}
 }
 
@@ -716,68 +670,100 @@ mod tests {
 		);
 	}
 
-	/// A tar of a hard link stating `data`'s size, with `data` after it or not, then a file.
-	fn hard_link_then_file(link: [u8; 512], data: Option<&[u8]>) -> Vec<(String, Vec<u8>)> {
-		let mut archive = link.to_vec();
-		archive.extend(data.map(padded).unwrap_or_default());
-		member(&mut archive, b"after", b'0', b"z");
-		read_all(&mut TarReader::new(archive.as_slice(), 100))
-			.into_iter()
-			.map(|(member, data)| (member.path, data))
+	/// Every member of `archive` with its size, and the error that ended the walk, if one did.
+	fn walk(archive: &[u8]) -> (Vec<(String, u64)>, Option<String>) {
+		let mut reader = TarReader::new(archive, 100);
+		let mut members = Vec::new();
+		loop {
+			match reader.next_member() {
+				Ok(Some(member)) => members.push((member.path, member.size)),
+				Ok(None) => return (members, None),
+				Err(error) => return (members, Some(error.to_string())),
+			}
+		}
+	}
+
+	fn sized(members: &[(&str, u64)]) -> Vec<(String, u64)> {
+		members
+			.iter()
+			.map(|&(path, size)| (path.to_owned(), size))
 			.collect()
 	}
 
+	/// `block` checksummed again after an edit.
+	fn resum(mut block: [u8; 512]) -> [u8; 512] {
+		block[148..156].fill(b' ');
+		let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+		block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+		block
+	}
+
 	#[test]
-	fn a_hard_links_size_counts_only_where_libarchive_counts_it() {
-		let named = |members: &[(&str, &[u8])]| -> Vec<(String, Vec<u8>)> {
-			members
-				.iter()
-				.map(|(path, data)| (path.to_string(), data.to_vec()))
-				.collect()
-		};
-		let data = b"its own copy";
-		let size = data.len() as u64;
-		// old writers put the target's size on a GNU or pre-POSIX hard link and no data after it
-		let gnu = gnu_header(b"link", b'1', size);
-		assert_eq!(
-			hard_link_then_file(gnu, None),
-			named(&[("link", b""), ("after", b"z")])
-		);
-		let mut old = header(b"link", b'1', size);
+	fn a_hard_links_size_counts_only_in_a_pax_archive() {
+		// old writers put the target's size on a hard link and no data after it: libarchive and
+		// GNU tar read it as 0 on a GNU, pre-POSIX or ustar header, whatever follows
+		let mut old = header(b"link", b'1', 2048);
 		old[257..265].fill(0);
-		old[148..156].fill(b' ');
-		let sum: u32 = old.iter().map(|&b| u32::from(b)).sum();
-		old[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		assert_eq!(
-			hard_link_then_file(old, None),
-			named(&[("link", b""), ("after", b"z")])
-		);
-		// a ustar one keeps its size when data follows, not when the next header does
-		let ustar = header(b"link", b'1', size);
-		assert_eq!(
-			hard_link_then_file(ustar, Some(data)),
-			named(&[("link", data), ("after", b"z")])
-		);
-		assert_eq!(
-			hard_link_then_file(ustar, None),
-			named(&[("link", b""), ("after", b"z")])
-		);
-		// once a PAX header was seen the archive is pax, where the size always holds
+		for link in [
+			gnu_header(b"link", b'1', 2048),
+			resum(old),
+			header(b"link", b'1', 2048),
+		] {
+			let mut archive = link.to_vec();
+			member(&mut archive, b"after", b'0', b"z");
+			assert_eq!(walk(&archive), (sized(&[("link", 0), ("after", 1)]), None));
+		}
+		// so a stated size cannot hide a member from them as the link's data: what follows the
+		// link is read as a header, and junk there is damage
 		let mut archive = Vec::new();
-		member(
-			&mut archive,
-			b"PaxHeader",
-			b'x',
-			pax_record("mtime", "1").as_bytes(),
+		member(&mut archive, b"target", b'0', b"t");
+		archive.extend_from_slice(&header(b"link", b'1', 4 * 512));
+		archive.extend_from_slice(&[b'j'; 512]);
+		member(&mut archive, b"hidden", b'0', b"hidden");
+		member(&mut archive, b"after", b'0', b"a");
+		assert_eq!(
+			walk(&archive),
+			(
+				sized(&[("target", 1), ("link", 0)]),
+				Some("corrupt tar archive: a header's checksum does not match".to_owned())
+			)
 		);
+		// nor can the end-of-archive marker right after a link be taken for its data
+		let mut archive = header(b"link", b'1', 512).to_vec();
+		archive.extend([0u8; 1024]);
+		assert_eq!(walk(&archive), (sized(&[("link", 0)]), None));
+	}
+
+	#[test]
+	fn a_hard_link_in_a_pax_archive_keeps_its_size() {
+		let pax = |archive: &mut Vec<u8>, record: &str| {
+			member(archive, b"PaxHeader", b'x', record.as_bytes());
+		};
+		// a PAX header makes the archive pax, and ustar headers after it keep it so; GNU long
+		// name and link records leave it as it was
+		let mut archive = Vec::new();
+		pax(&mut archive, &pax_record("mtime", "1"));
 		member(&mut archive, b"first", b'0', b"a");
-		archive.extend_from_slice(&header(b"link", b'1', 512));
-		archive.extend_from_slice(&header(b"inside", b'0', 0));
+		member(&mut archive, b"././@LongLink", b'K', b"target\0");
+		member(&mut archive, b"link", b'1', &[5u8; 512]);
 		member(&mut archive, b"after", b'0', b"z");
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
-		let paths: Vec<&str> = members.iter().map(|(m, _)| m.path.as_str()).collect();
-		assert_eq!(paths, ["first", "link", "after"]);
-		assert_eq!(members[1].1, header(b"inside", b'0', 0));
+		assert_eq!(
+			walk(&archive),
+			(sized(&[("first", 1), ("link", 512), ("after", 1)]), None)
+		);
+		// a GNU header after it makes the archive GNU again
+		let mut archive = Vec::new();
+		pax(&mut archive, &pax_record("mtime", "1"));
+		archive.extend_from_slice(&gnu_header(b"link", b'1', 512));
+		member(&mut archive, b"after", b'0', b"z");
+		assert_eq!(walk(&archive), (sized(&[("link", 0), ("after", 1)]), None));
+		// but a link's own PAX `size` holds on any header, as libarchive applies it last
+		let mut archive = Vec::new();
+		pax(&mut archive, &pax_record("size", "3"));
+		archive.extend_from_slice(&gnu_header(b"link", b'1', 0));
+		archive.extend(padded(b"abc"));
+		member(&mut archive, b"after", b'0', b"z");
+		assert_eq!(walk(&archive), (sized(&[("link", 3), ("after", 1)]), None));
 	}
 
 	#[test]
