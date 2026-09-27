@@ -36,7 +36,8 @@ pub use crate::job::report::RunState;
 pub enum CompressPhase {
 	/// Listing the sources. A job paused before it starts waits here, having listed nothing.
 	Scanning,
-	/// Waiting for another archive job to finish; nothing is held meanwhile.
+	/// Waiting for another archive job to finish; nothing is held meanwhile, and the destination
+	/// is only checked once the wait is over.
 	WaitingForWorker,
 	Compressing,
 	/// Registering the archive in the destination.

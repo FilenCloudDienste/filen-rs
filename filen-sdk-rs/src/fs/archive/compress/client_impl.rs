@@ -73,10 +73,11 @@ impl Client {
 	///
 	/// The archive only becomes visible once all of it is uploaded, so a job that ends early
 	/// leaves nothing behind. Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once;
-	/// a later one waits, reporting [`CompressPhase::WaitingForWorker`]. It reports its progress
-	/// to `callback` and can be paused, resumed and cancelled through `control`; a job paused
-	/// before it starts waits in [`CompressPhase::Scanning`], having listed nothing, until it is
-	/// resumed or cancelled.
+	/// a later one waits, reporting [`CompressPhase::WaitingForWorker`]. The destination is only
+	/// listed once the job runs, so a missing or trashed one fails it then, after any such wait.
+	/// It reports its progress to `callback` and can be paused, resumed and cancelled through
+	/// `control`; a job paused before it starts waits in [`CompressPhase::Scanning`], having
+	/// listed nothing, until it is resumed or cancelled.
 	///
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn compress_items(
