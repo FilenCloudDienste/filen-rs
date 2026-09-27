@@ -1253,6 +1253,89 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 	assert!(setup.backend.log().trashed_files.is_empty());
 }
 
+/// The archive's dispositions the updates carried.
+fn disposition_events(recorder: &Recorder) -> Vec<DisposalOutcome> {
+	recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| &update.events)
+		.filter_map(|event| match event {
+			ExtractEvent::SourceDisposition(disposition) => Some(disposition.outcome.clone()),
+			_ => None,
+		})
+		.collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
+	let interrupted = |outcome: &DisposalOutcome| {
+		matches!(
+			outcome,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Interrupted,
+				bytes_freed: 0
+			}
+		)
+	};
+	let tar = tar_of(&[("done.txt", b"done"), ("stuck.bin", b"stuck")]);
+
+	// cancelled while it extracts
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+		backend.blocked_uploads.insert("stuck.bin".to_owned());
+	});
+	let (_pause, cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			dispose: Some((SourceDisposal::DeletePermanently, parent)),
+			..Options::default()
+		},
+	);
+	wait_until("stuck.bin uploads", || {
+		job.reporter
+			.read(|state| state.active_names() == ["stuck.bin"])
+	})
+	.await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert!(interrupted(&disposition(&failed.report)));
+	let events = disposition_events(&job.recorder);
+	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+	assert!(setup.backend.log().deleted_files.is_empty());
+	assert_released(&setup, &job.reporter);
+
+	// cancelled while it waits for a slot
+	let config = one_slot();
+	// another job holds the slot
+	let other = Reporter::new(
+		Recorder::default(),
+		ArchiveTotals::Streaming { archive_bytes: 0 },
+	);
+	let _running = config.admit(&JobControl::default(), &other.ops()).await;
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let (_pause, cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			config: config.clone(),
+			dispose: Some((SourceDisposal::Trash, parent)),
+			..Options::default()
+		},
+	);
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert!(interrupted(&disposition(&failed.report)));
+	let events = disposition_events(&job.recorder);
+	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let tar = good_tar();
