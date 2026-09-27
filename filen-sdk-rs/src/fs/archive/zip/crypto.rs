@@ -1,5 +1,8 @@
 //! Zip encryption: WinZip AES (read and written) and the legacy "traditional PKWARE"
 //! encryption (ZipCrypto, read only: it is broken, and the SDK never writes it).
+//!
+//! The key material this module holds itself, the PBKDF2 output and ZipCrypto's keys, is wiped
+//! when dropped; the AES and HMAC states are their crates' to wipe.
 
 use std::io::{self, Read, Take, Write};
 
@@ -10,7 +13,7 @@ use ctr::{
 };
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// PBKDF2 rounds WinZip AES derives its keys with, fixed by the format.
 const AES_KDF_ROUNDS: u32 = 1000;
@@ -257,8 +260,14 @@ impl<W: Write> Write for AesWriter<W> {
 	}
 }
 
-/// The three keys of ZipCrypto.
+/// The three keys of ZipCrypto, which are the password to anyone holding them.
 struct CryptoKeys([u32; 3]);
+
+impl Drop for CryptoKeys {
+	fn drop(&mut self) {
+		self.0.zeroize();
+	}
+}
 
 impl CryptoKeys {
 	fn new(password: &[u8]) -> Self {
