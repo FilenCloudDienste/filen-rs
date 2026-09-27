@@ -12,6 +12,11 @@
 
 pub(crate) mod api;
 pub mod auth;
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+pub(crate) mod blocking;
 // Compiles on native AND wasm32-unknown-unknown (rusqlite ≥0.38 bundles a wasm SQLite). On wasm
 // the cache additionally requires `wasm-full` (worker/socket hosting) and the DB is the wasm
 // VFS's named in-memory store — per-session, repopulated by the startup resync; OPFS persistence
