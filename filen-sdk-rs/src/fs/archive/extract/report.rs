@@ -57,7 +57,7 @@ impl JobPhase for ExtractPhase {
 
 /// An archive entry. Only meaningful with the archive it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[js_type(export, no_deser, no_default)]
+#[js_type(import, export, no_default)]
 pub struct ArchiveEntryId {
 	pub archive: Uuid,
 	/// The entry's position among the archive's members.

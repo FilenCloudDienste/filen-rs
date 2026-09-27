@@ -40,14 +40,14 @@ use super::{
 	extract::{
 		self, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals, DuplicateEntries,
 		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
-		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry, ExtractRoot,
-		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, OmittedRecords,
+		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry, ExtractSkippedEntry,
+		ExtractStage, ExtractTopLevelKey, OmittedRecords,
 	},
 	format::{ExtensionFormat, extension_format},
 	password::ArchivePassword,
 };
 
-/// Where an archive's entries land in the destination.
+/// Where an archive's entries are created in the destination.
 #[derive(Debug, Clone)]
 #[cfg_attr(
 	feature = "wasm-full",
@@ -60,14 +60,17 @@ use super::{
 	)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum ExtractInto {
-	/// A new folder holding every entry, named `name`, or after the archive without its
-	/// extension.
+pub enum ExtractRoot {
+	/// In a new folder in the destination, called `name`, or by default what
+	/// `archiveDefaultName` makes of the archive's name (`photos.tar.gz` → `photos`); a name the
+	/// destination holds gets the next keep-both name. A single compressed file ignores this and
+	/// is always written straight into the destination (`archiveFormatOfName` tells one by its
+	/// name; the report's `topLevel` holds what was created).
 	NewFolder {
 		#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 		name: Option<String>,
 	},
-	/// The destination itself.
+	/// Straight into the destination; entries whose names it holds get keep-both names.
 	Destination,
 }
 
@@ -519,11 +522,27 @@ fn password(password: Option<String>) -> Result<Option<ArchivePassword>, Error> 
 	password.map(ArchivePassword::new).transpose()
 }
 
+// ExtractRoot carries the folder name unvalidated because neither tsify's from_wasm_abi nor
+// uniffi's enum lifting can report an error; an invalid name fails the call here, before the
+// extract starts.
+impl TryFrom<ExtractRoot> for extract::ExtractRoot {
+	type Error = Error;
+
+	fn try_from(root: ExtractRoot) -> Result<Self, Error> {
+		Ok(match root {
+			ExtractRoot::NewFolder { name } => Self::NewFolder {
+				name: name.as_deref().map(ValidatedName::try_from).transpose()?,
+			},
+			ExtractRoot::Destination => Self::Destination,
+		})
+	}
+}
+
 /// What `extractArchive` extracts, where, and whether the archive goes afterwards.
 fn extract_request(
 	archive: AnyFile,
 	destination: AnyNormalDir,
-	into: ExtractInto,
+	root: ExtractRoot,
 	dispose: Option<SourceDisposal>,
 ) -> Result<ExtractRequest, Error> {
 	let archive = match (dispose, archive) {
@@ -539,17 +558,53 @@ fn extract_request(
 			));
 		}
 	};
-	let root = match into {
-		ExtractInto::NewFolder { name } => ExtractRoot::NewFolder {
-			name: name.as_deref().map(ValidatedName::try_from).transpose()?,
-		},
-		ExtractInto::Destination => ExtractRoot::Destination,
-	};
 	Ok(ExtractRequest::All {
 		archive,
 		destination: DirType::from(destination),
-		root,
+		root: root.try_into()?,
 	})
+}
+
+/// What `extractArchiveEntries` extracts, and where. The entries and `base` are checked by the
+/// extract itself, which fails with the report of what it did.
+fn entries_request(
+	archive: AnyFile,
+	entries: Vec<ArchiveEntryId>,
+	base: String,
+	destination: AnyNormalDir,
+	root: ExtractRoot,
+) -> Result<ExtractRequest, Error> {
+	Ok(ExtractRequest::Entries {
+		archive: RemoteFileType::try_from(archive)?,
+		ids: entries,
+		base,
+		destination: DirType::from(destination),
+		root: root.try_into()?,
+	})
+}
+
+/// An extract's (or a listing's) config from the call's arguments: what the call leaves out is
+/// the SDK's default.
+fn extract_config(
+	max_bytes: Option<u64>,
+	max_items: Option<u64>,
+	expansion_limit: Option<ExpansionLimit>,
+	skip_mac_metadata: Option<bool>,
+	password: Option<ArchivePassword>,
+) -> ExtractConfig {
+	let mut config = ExtractConfig {
+		max_bytes,
+		max_items,
+		password,
+		..ExtractConfig::default()
+	};
+	if let Some(limit) = expansion_limit {
+		config.expansion_limit = Some(limit);
+	}
+	if let Some(skip) = skip_mac_metadata {
+		config.skip_mac_metadata = skip;
+	}
+	config
 }
 
 /// What `compressItems` compresses, and whether the items go afterwards.

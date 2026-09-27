@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use crate::{
-	Error,
-	auth::JsClient,
+	Error, ErrorKind,
+	auth::{Client, JsClient},
 	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture, spawn_ordered_dispatch},
 };
 
 use super::{
-	CompressCall, CompressConfig, CompressDelivery, CompressFormat, CompressReport, CompressUpdate,
-	ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractUpdate,
-	ExtractedTopLevelItem, SourceDisposal, compress_job, extract_job, extract_request, password,
+	ArchiveEntryId, CompressCall, CompressConfig, CompressDelivery, CompressFormat, CompressReport,
+	CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport, ExtractRequest,
+	ExtractRoot, ExtractUpdate, ExtractedTopLevelItem, SourceDisposal, compress_job,
+	entries_request, extract_config, extract_job, extract_request, password,
 };
 
 /// Receives an extract's progress, in the order the extract made it, before the call
@@ -39,14 +40,23 @@ pub struct ExtractArchiveConfig {
 	/// checked as it is read, keeping what was extracted so far.
 	#[uniffi(default = None)]
 	pub max_bytes: Option<u64>,
-	/// Most items to create.
+	/// Most directories and files to create; an archive with more fails with
+	/// `ArchiveTooLarge`.
 	#[uniffi(default = None)]
 	pub max_items: Option<u64>,
 	/// The guard against decompression bombs; `None` keeps the SDK's (1000 times the
 	/// archive, at least 256 MiB).
 	#[uniffi(default = None)]
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// Removes the archive once everything in it was extracted and verified.
+	/// Leaves out the metadata macOS writes beside files: everything in a `__MACOSX` folder
+	/// and AppleDouble `._name` files, reported skipped for `MacMetadata`. Left out on purpose,
+	/// they keep nothing from removing the archive afterwards. `true` when `None`; `false`
+	/// extracts them as ordinary files.
+	#[uniffi(default = None)]
+	pub skip_mac_metadata: Option<bool>,
+	/// Removes the archive once everything in it was extracted and verified. Only for
+	/// `extract_archive`: `extract_archive_entries` extracts part of the archive, which is never
+	/// removed.
 	#[uniffi(default = None)]
 	pub dispose: Option<SourceDisposal>,
 }
@@ -69,6 +79,42 @@ pub struct CompressItemsConfig {
 	pub dispose: Option<SourceDisposal>,
 }
 
+pub(super) fn deliver_extract(callback: &dyn ExtractArchiveCallback, delivery: ExtractDelivery) {
+	match delivery {
+		ExtractDelivery::TopLevelCreated(items) => callback.on_top_level_created(items),
+		ExtractDelivery::Update(update) => callback.on_update(update),
+	}
+}
+
+pub(super) fn deliver_compress(callback: &dyn CompressItemsCallback, delivery: CompressDelivery) {
+	match delivery {
+		CompressDelivery::ArchiveCreated(archive) => callback.on_archive_created(archive),
+		CompressDelivery::Update(update) => callback.on_update(update),
+	}
+}
+
+async fn run_extract(
+	client: Arc<Client>,
+	request: ExtractRequest,
+	config: ExtractConfig,
+	callback: Arc<dyn ExtractArchiveCallback>,
+	managed_future: ManagedFuture,
+) -> Result<ExtractReport, Error> {
+	// the foreign callbacks may block: they run on the dispatch thread, in order. Waiting for
+	// them is no part of the job, so a cancel's grace never cuts off a report already made
+	let (sender, delivered) =
+		spawn_ordered_dispatch(move |delivery| deliver_extract(callback.as_ref(), delivery));
+	let result = managed_future
+		.into_js_managed_commander_job(move |control| {
+			extract_job(client, request, config, sender, control)
+		})
+		.await;
+	// the job has ended and dropped its sender: this returns once everything it reported was
+	// delivered
+	let _ = delivered.await;
+	result
+}
+
 #[uniffi::export]
 impl JsClient {
 	/// The memory for one archive job's codec state in effect, in bytes (see
@@ -86,8 +132,8 @@ impl JsClient {
 	/// `password` opens an encrypted archive; without one the extract fails before anything is
 	/// created. A wrong one is found before anything is created too when the archive has an
 	/// encrypted entry small enough to check it on (16 MiB), else as the first encrypted entry
-	/// is read; folders created by then go to the trash. The report is returned whether the extract
-	/// completed, was cancelled or failed. Only an abort through `managed_future` gets
+	/// is read; folders created by then go to the trash. The report is returned whether the
+	/// extract completed, was cancelled or failed. Only an abort through `managed_future` gets
 	/// that report: cancelling the calling coroutine or task drops the call, and with it the
 	/// report (the job is stopped at once).
 	#[allow(clippy::too_many_arguments)]
@@ -95,7 +141,7 @@ impl JsClient {
 		&self,
 		archive: AnyFile,
 		destination: AnyNormalDir,
-		into: ExtractInto,
+		root: ExtractRoot,
 		config: ExtractArchiveConfig,
 		password: Option<String>,
 		callback: Arc<dyn ExtractArchiveCallback>,
@@ -103,42 +149,67 @@ impl JsClient {
 	) -> Result<ExtractReport, Error> {
 		// wrapped first, so an argument refused below still drops it wiped
 		let password = self::password(password)?;
-		let request = extract_request(archive, destination, into, config.dispose)?;
-		let config = ExtractConfig {
-			max_bytes: config.max_bytes,
-			max_items: config.max_items,
-			expansion_limit: config
-				.expansion_limit
-				.or(ExtractConfig::default().expansion_limit),
+		let request = extract_request(archive, destination, root, config.dispose)?;
+		let config = extract_config(
+			config.max_bytes,
+			config.max_items,
+			config.expansion_limit,
+			config.skip_mac_metadata,
 			password,
-			// the bindings do not expose the option yet: the SDK's default
-			skip_mac_metadata: ExtractConfig::default().skip_mac_metadata,
-		};
-		let client = self.inner();
-		// the foreign callbacks run on the dispatch thread, in order; waiting for them is no
-		// part of the job, so a cancel's grace never cuts off a report already made
-		let (sender, delivered) = spawn_ordered_dispatch(move |delivery| match delivery {
-			ExtractDelivery::TopLevelCreated(items) => callback.on_top_level_created(items),
-			ExtractDelivery::Update(update) => callback.on_update(update),
-		});
-		let result = managed_future
-			.into_js_managed_commander_job(move |control| {
-				extract_job(client, request, config, sender, control)
-			})
-			.await;
-		// the job has ended and dropped its sender: this returns once all it reported was
-		// delivered
-		let _ = delivered.await;
-		result
+		);
+		run_extract(self.inner(), request, config, callback, managed_future).await
+	}
+
+	/// [`extract_archive`](Self::extract_archive) for some of the archive's entries: those
+	/// `entries` names (from `list_archive`, or a failure's `entry`), everything below a
+	/// directory among them, and the directories that hold them.
+	///
+	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
+	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
+	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. A failure's `retry`
+	/// gives the `base` and destination that put it where it was meant to land. An entry of
+	/// another archive, or not below `base`, fails the extract: a zip's or 7z's before anything
+	/// is created, a tar's once it is read to its end. The archive is never removed afterwards,
+	/// so a `config.dispose` is refused.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn extract_archive_entries(
+		&self,
+		archive: AnyFile,
+		entries: Vec<ArchiveEntryId>,
+		base: String,
+		destination: AnyNormalDir,
+		root: ExtractRoot,
+		config: ExtractArchiveConfig,
+		password: Option<String>,
+		callback: Arc<dyn ExtractArchiveCallback>,
+		managed_future: ManagedFuture,
+	) -> Result<ExtractReport, Error> {
+		let password = self::password(password)?;
+		if config.dispose.is_some() {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"an archive extracted in part is never removed",
+			));
+		}
+		let request = entries_request(archive, entries, base, destination, root)?;
+		let config = extract_config(
+			config.max_bytes,
+			config.max_items,
+			config.expansion_limit,
+			config.skip_mac_metadata,
+			password,
+		);
+		run_extract(self.inner(), request, config, callback, managed_future).await
 	}
 
 	/// Compresses `items` into a new archive `name` in `destination`, entirely on this
 	/// device. `name` has to end in the format's extension (see `archive_extension`); a name
 	/// taken at the destination is kept, and the archive is named `name (1).ext`, ...
 	///
-	/// `password` is required exactly when the format is encrypted. The report is returned
-	/// whether the compress completed, was cancelled or failed; a compress that did not
-	/// complete leaves nothing in the drive. Only an abort through `managed_future` gets
+	/// `password` is required exactly when the format is encrypted. A format whose encoder
+	/// needs more than `archive_codec_mem_budget` is refused, as an invalid argument. The report
+	/// is returned whether the compress completed, was cancelled or failed; a compress that did
+	/// not complete leaves nothing in the drive. Only an abort through `managed_future` gets
 	/// that report: cancelling the calling coroutine or task drops the call, and with it the
 	/// report (the job is stopped at once).
 	#[allow(clippy::too_many_arguments)]
@@ -165,10 +236,8 @@ impl JsClient {
 			self.inner_ref().archive_config().codec_mem_budget,
 		)?;
 		let client = self.inner();
-		let (sender, delivered) = spawn_ordered_dispatch(move |delivery| match delivery {
-			CompressDelivery::ArchiveCreated(archive) => callback.on_archive_created(archive),
-			CompressDelivery::Update(update) => callback.on_update(update),
-		});
+		let (sender, delivered) =
+			spawn_ordered_dispatch(move |delivery| deliver_compress(callback.as_ref(), delivery));
 		let result = managed_future
 			.into_js_managed_commander_job(move |control| {
 				compress_job(client, call, sender, control)

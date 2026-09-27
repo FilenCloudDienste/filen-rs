@@ -69,7 +69,7 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 	let request = extract_request(
 		AnyFile::File(file.clone().into()),
 		destination(),
-		ExtractInto::NewFolder { name: None },
+		ExtractRoot::NewFolder { name: None },
 		Some(SourceDisposal::Trash),
 	)
 	.unwrap();
@@ -78,7 +78,7 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 			file: disposed,
 			how,
 		},
-		root: ExtractRoot::NewFolder { name: None },
+		root: extract::ExtractRoot::NewFolder { name: None },
 		..
 	} = request
 	else {
@@ -89,7 +89,7 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 	let error = extract_request(
 		AnyFile::File(remote_file().into()),
 		destination(),
-		ExtractInto::NewFolder {
+		ExtractRoot::NewFolder {
 			name: Some(String::new()),
 		},
 		Some(SourceDisposal::DeletePermanently),
@@ -99,11 +99,82 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 }
 
 #[test]
+fn chosen_entries_go_to_the_extract_as_given() {
+	let file = remote_file();
+	let entries = vec![
+		ArchiveEntryId {
+			archive: file.uuid(),
+			index: 4,
+		},
+		ArchiveEntryId {
+			archive: file.uuid(),
+			index: 1,
+		},
+	];
+	let request = entries_request(
+		AnyFile::File(file.clone().into()),
+		entries.clone(),
+		"photos/2024".into(),
+		destination(),
+		ExtractRoot::Destination,
+	)
+	.unwrap();
+	let ExtractRequest::Entries {
+		archive,
+		ids,
+		base,
+		root: extract::ExtractRoot::Destination,
+		..
+	} = request
+	else {
+		panic!("some entries, into the destination itself");
+	};
+	assert_eq!(
+		(archive.uuid(), ids, base.as_str()),
+		(file.uuid(), entries, "photos/2024")
+	);
+}
+
+#[test]
+fn what_a_call_leaves_out_is_the_sdks_default() {
+	let defaults = ExtractConfig::default();
+	let config = extract_config(None, None, None, None, None);
+	assert_eq!(
+		(
+			config.max_bytes,
+			config.max_items,
+			config.expansion_limit,
+			config.skip_mac_metadata
+		),
+		(
+			None,
+			None,
+			defaults.expansion_limit,
+			defaults.skip_mac_metadata
+		)
+	);
+	let limit = ExpansionLimit {
+		ratio: 10,
+		floor: 1 << 20,
+	};
+	let config = extract_config(Some(5), Some(7), Some(limit), Some(false), None);
+	assert_eq!(
+		(
+			config.max_bytes,
+			config.max_items,
+			config.expansion_limit,
+			config.skip_mac_metadata
+		),
+		(Some(5), Some(7), Some(limit), false)
+	);
+}
+
+#[test]
 fn names_and_passwords_are_checked_at_the_edge() {
 	let error = extract_request(
 		AnyFile::File(remote_file().into()),
 		destination(),
-		ExtractInto::NewFolder {
+		ExtractRoot::NewFolder {
 			name: Some("a/b".into()),
 		},
 		None,
