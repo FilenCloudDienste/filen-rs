@@ -33,9 +33,10 @@ pub trait CompressItemsCallback: Send + Sync {
 
 #[derive(uniffi::Record, Default)]
 pub struct ExtractArchiveConfig {
-	/// Storage still free on the account, if known: a zip or 7z stating more fails before
-	/// anything is written; a streaming archive (tar, one compressed file) fails once it has
-	/// written that much, keeping what it extracted.
+	/// Storage still free on the account, if known: an extraction whose files would reach it
+	/// fails with `MaxStorageReached`. A zip or 7z states its files' sizes in its index, so one
+	/// stating that much fails before anything is created; a tar or single compressed file is
+	/// checked as it is read, keeping what was extracted so far.
 	#[uniffi(default = None)]
 	pub max_bytes: Option<u64>,
 	/// Most items to create.
@@ -53,12 +54,17 @@ pub struct ExtractArchiveConfig {
 #[derive(uniffi::Record)]
 pub struct CompressItemsConfig {
 	pub format: CompressFormat,
-	/// Storage still free on the account, if known.
+	/// Storage still free on the account, if known: a bare tar that would reach it is refused
+	/// up front with `MaxStorageReached`, its size in the report's `neededBytes`; any other
+	/// format as soon as its written bytes would, leaving nothing behind.
 	#[uniffi(default = None)]
 	pub max_bytes: Option<u64>,
-	/// Removes the items once the archive is registered and verified. The archive is not read
-	/// back first: with an encrypted format, have the user confirm the password (type it twice)
-	/// before removing anything for good, as a mistyped one leaves an archive nobody can open.
+	/// Removes the items once the archive is registered and verified. Before anything is
+	/// deleted for good, the archive is read back from the server as extracting would read it
+	/// (phase `verifying`, its progress in `counts.bytesVerified`); trashing reads nothing back.
+	/// The read back uses the password the archive was written with, so it cannot tell a
+	/// mistyped one: with an encrypted format, have the user confirm the password (type it
+	/// twice) before removing anything for good.
 	#[uniffi(default = None)]
 	pub dispose: Option<SourceDisposal>,
 }

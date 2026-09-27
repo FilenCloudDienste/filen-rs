@@ -33,15 +33,15 @@ use crate::{
 
 use super::{
 	compress::{
-		self, CompressCallback, CompressConfig, CompressCounts, CompressFormat, CompressPhase,
-		CompressSources, HashMismatch,
+		self, CompressActiveFile, CompressCallback, CompressConfig, CompressCounts, CompressFormat,
+		CompressPhase, CompressSources, HashMismatch,
 	},
 	dispose::{self, SourceDisposal},
 	extract::{
 		self, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals, DuplicateEntries,
 		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
-		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRoot, ExtractSkippedEntry,
-		ExtractStage, ExtractTopLevelKey, OmittedRecords,
+		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry, ExtractRoot,
+		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, OmittedRecords,
 	},
 	format::{ExtensionFormat, extension_format},
 	password::ArchivePassword,
@@ -87,15 +87,20 @@ pub enum ExtractInto {
 pub enum ArchiveKeptReason {
 	/// Something was not carried over: an entry failed or was skipped.
 	Incomplete,
-	/// The archive holds data that belongs to no entry.
+	/// The archive holds data after its last entry that belongs to none.
 	UnaccountedData { bytes: u64 },
 	/// What was read does not match the hash in the source's metadata.
 	HashMismatch,
-	/// The source's metadata holds no hash, which a permanent deletion requires.
+	/// The source's metadata holds no hash to check what was read against, which a permanent
+	/// deletion requires.
 	HashUnavailable,
-	/// The source changed since the job read it.
+	/// The source changed since the job read it: it moved, was trashed, got a new version, or
+	/// holds other items now.
 	Changed,
-	/// The job's output could not be confirmed with the server.
+	/// The job's output could not be confirmed: the server did not hold what was created, the
+	/// archive was not read in full, or something the job extracted was checked by nothing (a
+	/// 7z entry without a CRC-32, or the files of a brotli or LZMA-alone stream, or of an lz4,
+	/// xz or zstd stream written without its optional checksum).
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
@@ -127,11 +132,14 @@ pub enum ArchiveDisposalOutcome {
 		reason: ArchiveKeptReason,
 		/// Bytes of its files already deleted for good when a permanent removal stopped part
 		/// way (0 otherwise): those files are gone, and only the job's output still holds them.
+		/// Empty files may be gone too while this is 0.
 		bytes_freed: u64,
 	},
 }
 
-/// What became of one source of a job that was to remove its sources.
+/// What became of one source of a job that was to remove its sources. A source inside another
+/// one the job was given (or given twice) shares that one's outcome with a `bytesFreed` of 0:
+/// what the outer removal freed is counted once, on the outer source.
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, no_default)]
 pub struct ArchiveSourceDisposition {
@@ -149,6 +157,10 @@ pub struct ExtractFailureInfo {
 	pub dest_parent: Uuid,
 	pub dest_name: String,
 	pub stage: ExtractStage,
+	/// Where to extract the entry again for it to land where it was meant to: pass its `entry`
+	/// to `extractArchiveEntries` with this `base`, the directory `destination` names as the
+	/// destination, and the root `destination`. Failures sharing a retry go again in one call.
+	pub retry: ExtractRetry,
 	pub error: JobError,
 }
 
@@ -217,16 +229,24 @@ pub struct ExtractedTopLevelItem {
 #[js_type(export, no_deser, no_default)]
 pub struct ExtractReport {
 	/// Top-level items created, up to 1000; `omitted.topLevel` counts the rest, which the
-	/// callback delivered.
+	/// callback delivered. An extract that failed with `ArchiveWrongPassword` before extracting
+	/// any file moved the folders it had created to the trash, for a retry to start clean: they
+	/// are left out here, though the callback delivered them.
 	pub top_level: Vec<ExtractedTopLevelItem>,
 	pub failures: Vec<ExtractFailureInfo>,
 	pub skipped: Vec<ExtractSkippedEntry>,
 	pub renamed: Vec<ExtractRenamedEntry>,
+	/// Entries extracted under names that read as something they are not, for the app to warn
+	/// about before they are opened (up to 1000).
+	pub misleading_names: Vec<ExtractMisleadingName>,
+	/// What the lists above only count.
 	pub omitted: OmittedRecords,
 	pub totals: ArchiveTotals,
 	pub counts: ItemCounts,
-	/// Bytes of the archive that belong to no entry.
+	/// Bytes of the archive that belong to no entry: after its last one (another archive
+	/// appended to it, say), or before a zip's first (a self-extracting stub).
 	pub unaccounted_bytes: u64,
+	/// Names a zip lists more than once; the last entry of each was extracted.
 	pub duplicates: Option<DuplicateEntries>,
 	/// What became of the archive, when it was to be removed.
 	pub dispositions: Vec<ArchiveSourceDisposition>,
@@ -256,6 +276,9 @@ pub struct CompressUpdate {
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
 	pub counts: CompressCounts,
+	/// The source being read, as the copy and extract updates list theirs: at most one, since
+	/// an archive is written one file at a time.
+	pub active: Vec<CompressActiveFile>,
 	pub events: Vec<CompressEvent>,
 	pub bytes_per_second: Option<u64>,
 	/// Estimated time left, in milliseconds.
@@ -332,6 +355,7 @@ impl From<extract::ExtractFailure> for ExtractFailureInfo {
 			dest_parent: failure.dest_parent,
 			dest_name: failure.dest_name,
 			stage: failure.stage,
+			retry: failure.retry,
 			error: job_error(failure.error),
 		}
 	}
@@ -410,6 +434,7 @@ impl From<extract::ExtractReport> for ExtractReport {
 			failures: report.failures.into_iter().map(Into::into).collect(),
 			skipped: report.skipped,
 			renamed: report.renamed,
+			misleading_names: report.misleading_names,
 			omitted: report.omitted,
 			totals: report.totals,
 			counts: report.counts,
@@ -455,6 +480,7 @@ impl From<compress::CompressUpdate> for CompressUpdate {
 			scan: update.scan,
 			totals: update.totals,
 			counts: update.counts,
+			active: update.active,
 			events: update.events.into_iter().map(Into::into).collect(),
 			bytes_per_second: update.bytes_per_second,
 			eta_ms: update.eta.map(millis),
