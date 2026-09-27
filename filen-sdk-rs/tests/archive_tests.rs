@@ -40,11 +40,6 @@ use filen_sdk_rs::{
 mod drive_helpers;
 use drive_helpers::{assert_same_files, contents, data, dir_link_info, linked_file, noise, upload};
 
-/// The locks every test reading a file's version chain, or switching the account's versioning,
-/// takes, in this order.
-const LOCK_VERSIONS: &str = "test:versions";
-const LOCK_VERSIONING: &str = "test:user-versioning";
-
 #[derive(Default)]
 struct CompressRecorder {
 	archives: Mutex<Vec<RemoteFile>>,
@@ -441,11 +436,11 @@ async fn deleting_sources_for_good_keeps_a_file_with_versions() {
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
 	let _versions_lock = client
-		.acquire_lock_with_default(LOCK_VERSIONS)
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	let _versioning_lock = client
-		.acquire_lock_with_default(LOCK_VERSIONING)
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 	let versioning = client.get_user_info().await.unwrap().versioning_enabled;

@@ -438,11 +438,11 @@ async fn note_sharing() {
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 
 	let _lock1 = client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let _lock2 = share_client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(test_utils::locks::CONTACT)
 		.await
 		.unwrap();
 	let _lock = client

@@ -20,6 +20,8 @@ use filen_sdk_rs::{
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::OnceCell;
 
+pub mod locks;
+
 pub struct Resources {
 	client: OnceCell<Arc<Client>>,
 	account_prefix: &'static str,
@@ -166,11 +168,11 @@ pub async fn set_up_contact_no_add<'a>(
 	share_client: &'a Client,
 ) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
 	let lock1 = client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(locks::CONTACT)
 		.await
 		.unwrap();
 	let lock2 = share_client
-		.acquire_lock_with_default("test:contact")
+		.acquire_lock_with_default(locks::CONTACT)
 		.await
 		.unwrap();
 

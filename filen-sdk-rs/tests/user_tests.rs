@@ -46,7 +46,7 @@ async fn upload_avatar() {
 	// so a snapshot taken before queueing for the lock is stale after this rotates it.
 	// Held across before-fetch → upload → after-fetch.
 	let _lock = client
-		.acquire_lock_with_default("test:chats")
+		.acquire_lock_with_default(test_utils::locks::CHATS)
 		.await
 		.unwrap();
 	let before = client.get_user_info().await.unwrap();
@@ -76,9 +76,6 @@ async fn upload_avatar() {
 	);
 }
 
-// Resource name shared by every test that mutates the versioning flag —
-// concurrent runs would otherwise race on this account-wide setting.
-const LOCK_VERSIONING: &str = "test:user-versioning";
 const LOCK_LOGIN_ALERTS: &str = "test:user-login-alerts";
 const LOCK_PERSONAL_INFO: &str = "test:user-personal-info";
 
@@ -86,7 +83,7 @@ const LOCK_PERSONAL_INFO: &str = "test:user-personal-info";
 async fn versioning_toggle_round_trip() {
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
-		.acquire_lock_with_default(LOCK_VERSIONING)
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 	let original = client.get_user_info().await.unwrap().versioning_enabled;
@@ -128,12 +125,12 @@ async fn versioning_creates_versions_on_duplicate_upload() {
 	let test_dir = &resources.dir;
 
 	let _version_lock = client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 
 	let _lock = client
-		.acquire_lock_with_default(LOCK_VERSIONING)
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 	let original_versioning = client.get_user_info().await.unwrap().versioning_enabled;
@@ -378,7 +375,7 @@ async fn events_file_upload_trash_restore_delete() {
 	// (commands_tests / file_tests, both serialized on this lock) would permanently delete the
 	// file mid-window.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 
@@ -513,7 +510,7 @@ async fn events_file_versioned_on_duplicate_upload() {
 	let since = chrono::Utc::now();
 
 	let _lock = client
-		.acquire_lock_with_default(LOCK_VERSIONING)
+		.acquire_lock_with_default(test_utils::locks::USER_VERSIONING)
 		.await
 		.unwrap();
 	let original_versioning = client.get_user_info().await.unwrap().versioning_enabled;
@@ -641,7 +638,7 @@ async fn events_folder_trash_restore_move_delete() {
 
 	// Trash lock: see the file trash-cycle test above.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 

@@ -423,11 +423,11 @@ async fn file_public_link() {
 // 	let share_client = &share_resources.client;
 
 // 	let _lock = client
-// 		.acquire_lock_with_default("test:contact")
+// 		.acquire_lock_with_default(test_utils::locks::CONTACT)
 // 		.await
 // 		.unwrap();
 // 	let _lock = share_client
-// 		.acquire_lock_with_default("test:contact")
+// 		.acquire_lock_with_default(test_utils::locks::CONTACT)
 // 		.await
 // 		.unwrap();
 
@@ -505,11 +505,11 @@ async fn file_public_link() {
 // 	share_client: &'a Client,
 // ) -> (Arc<ResourceLock>, Arc<ResourceLock>, usize, usize) {
 // 	let lock1 = client
-// 		.acquire_lock_with_default("test:contact")
+// 		.acquire_lock_with_default(test_utils::locks::CONTACT)
 // 		.await
 // 		.unwrap();
 // 	let lock2 = share_client
-// 		.acquire_lock_with_default("test:contact")
+// 		.acquire_lock_with_default(test_utils::locks::CONTACT)
 // 		.await
 // 		.unwrap();
 

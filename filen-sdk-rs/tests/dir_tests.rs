@@ -57,7 +57,7 @@ async fn create_list_trash() {
 	// empty-trash (serialized on this lock) would permanently delete the dir before the
 	// listing finds it.
 	let _trash_lock = client
-		.acquire_lock_with_default("test:rs:trash")
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
 	client.trash_dir(&mut dir).await.unwrap();
