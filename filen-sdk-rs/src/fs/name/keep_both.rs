@@ -57,17 +57,27 @@ pub(crate) enum NameShape {
 #[derive(Debug, Default)]
 pub(crate) struct TakenNames {
 	keys: SeededSet<String>,
-	/// Per `(stem, extension)` collision key, a counter below which every candidate is known to
-	/// be taken, so the `k`-th duplicate of one name does not retry the `k - 1` before it.
-	/// Names are only ever added, so a candidate once seen taken stays taken.
-	next_counter: SeededMap<(String, String), u64>,
+	/// Per [`CounterKey`], a counter below which every candidate of that suffix length is known
+	/// to be taken, so the `k`-th duplicate of one name (or of its case variants) does not retry
+	/// the `k - 1` before it. Names are only ever added, so a candidate once seen taken stays
+	/// taken.
+	next_counter: SeededMap<CounterKey, u64>,
 }
+
+/// What a numbered candidate's hint is kept under: the collision keys of the base and extension
+/// it is built from, as trimmed to fit, and the length of its ` (n)` suffix, which decides how
+/// much is trimmed. Names with one key get colliding candidates at every counter of that length
+/// (the suffix separates the parts with a space and a parenthesis, so neither lowercases
+/// differently next to it). Keying on the untrimmed name instead would let two case variants
+/// share a hint although a lowercase that changes a name's length in bytes trims them at
+/// different characters, so their candidates need not collide.
+type CounterKey = (String, String, usize);
 
 impl TakenNames {
 	pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
 		Self {
 			keys: names.into_iter().map(collision_key).collect(),
-			next_counter: SeededMap::default(),
+			..Self::default()
 		}
 	}
 
@@ -92,6 +102,17 @@ impl TakenNames {
 		name: ValidatedName,
 		shape: NameShape,
 	) -> Result<ValidatedName, EntryNameError> {
+		self.allocate_counting(name, shape, &mut 0)
+	}
+
+	/// [`allocate`](Self::allocate), adding the numbered candidates it builds, the work it costs,
+	/// to `built`.
+	fn allocate_counting(
+		&mut self,
+		name: ValidatedName,
+		shape: NameShape,
+		built: &mut u64,
+	) -> Result<ValidatedName, EntryNameError> {
 		if self.insert(name.as_ref()) {
 			return Ok(name);
 		}
@@ -100,33 +121,50 @@ impl TakenNames {
 		let (mut base, mut n) = strip_counter(stem)
 			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
 			.unwrap_or((stem, 1));
-		let mut key = (collision_key(base), collision_key(ext));
-		let known_taken_below = self.next_counter.get(&key).copied().unwrap_or(1);
-		// the hint may only be raised when every counter below this start is known taken
-		let mut contiguous = n <= known_taken_below;
-		n = n.max(known_taken_below);
+		// the hint may only be raised when every counter of this length below `n` is known taken
+		let mut contiguous = first_of_its_length(n);
 		loop {
-			let candidate = numbered_candidate(base, n, ext)?;
+			let (candidate, key) = numbered_candidate(base, n, ext)?;
+			*built += 1;
+			if let Some(known_taken_below) = key.as_ref().and_then(|key| self.next_counter.get(key))
+				&& *known_taken_below >= n
+			{
+				contiguous = true;
+				if *known_taken_below > n {
+					n = *known_taken_below;
+					continue;
+				}
+			}
 			if self.insert(candidate.as_ref()) {
-				if contiguous && let Some(next) = n.checked_add(1) {
+				if contiguous
+					&& let Some(key) = key
+					&& let Some(next) = n.checked_add(1)
+				{
 					self.next_counter.insert(key, next);
 				}
 				return Ok(candidate);
 			}
-			// Every iteration either returns or skips a taken name, and only finitely many
-			// names are taken, so counting up terminates. Only a continued counter can run out
-			// of numbers; the whole stem then starts over at 1, with its own hint.
+			// Every iteration either returns, skips a taken name, or jumps forward, and only
+			// finitely many names are taken, so counting up terminates. Only a continued counter
+			// can run out of numbers; the whole stem then starts over at 1.
 			(base, n) = match n.checked_add(1) {
-				Some(next) => (base, next),
+				Some(next) => {
+					contiguous |= first_of_its_length(next);
+					(base, next)
+				}
 				None => {
-					key = (collision_key(stem), key.1);
-					let start = self.next_counter.get(&key).copied().unwrap_or(1);
 					contiguous = true;
-					(stem, start)
+					(stem, 1)
 				}
 			};
 		}
 	}
+}
+
+/// Whether `n` is the smallest counter of its number of digits.
+fn first_of_its_length(n: u64) -> bool {
+	n.checked_ilog10()
+		.is_some_and(|digits| 10u64.pow(digits) == n)
 }
 
 /// `(stem, ext)` with `ext` including its dot. A leading dot (`.bashrc`) is part of the stem,
@@ -164,8 +202,13 @@ fn strip_counter(stem: &str) -> Option<(&str, u64)> {
 }
 
 /// `base (n)ext`, with `base` (and, if even that is not enough, `ext`) trimmed at a character
-/// boundary so the result fits [`MAX_BYTES`].
-fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, EntryNameError> {
+/// boundary so the result fits [`MAX_BYTES`]; and the key of its hint, which a candidate that had
+/// to be encoded has none of, since it is not built from its parts.
+fn numbered_candidate(
+	base: &str,
+	n: u64,
+	ext: &str,
+) -> Result<(ValidatedName, Option<CounterKey>), EntryNameError> {
 	let suffix = format!(" ({n})");
 	// The base keeps at least its first character: an extension that leaves no room for it is
 	// folded into the base, so trimming eats into the extension instead. A candidate starting
@@ -187,7 +230,10 @@ fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, En
 		let trimmed = &base[..base.floor_char_boundary(budget)];
 		let candidate = format!("{trimmed}{suffix}{ext}");
 		let too_long = match ValidatedName::try_from(candidate.as_str()) {
-			Ok(name) => return Ok(name),
+			Ok(name) => {
+				let key = (collision_key(trimmed), collision_key(ext), suffix.len());
+				return Ok((name, Some(key)));
+			}
 			Err(
 				error @ EntryNameError {
 					kind: EntryNameErrorKind::TooLong { .. },
@@ -195,7 +241,7 @@ fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, En
 				},
 			) => error,
 			Err(_) => match encode_name(&candidate) {
-				Ok(name) => return Ok(name),
+				Ok(name) => return Ok((name, None)),
 				Err(
 					error @ EntryNameError {
 						kind: EntryNameErrorKind::TooLong { .. },
@@ -287,6 +333,46 @@ mod tests {
 		assert_eq!(
 			allocate(&[below_max.as_str(), max.as_str()], &below_max, false),
 			format!("a ({}) (1).txt", u64::MAX - 1)
+		);
+	}
+
+	#[test]
+	fn a_stem_that_ran_out_of_counters_keeps_counting_where_it_left_off() {
+		let below_max = format!("a ({}).txt", u64::MAX - 1);
+		let max = format!("a ({}).txt", u64::MAX);
+		let numbered = format!("a ({}) (1).txt", u64::MAX - 1);
+		let mut names =
+			TakenNames::new(["a.txt", below_max.as_str(), max.as_str(), numbered.as_str()]);
+		let allocated = [below_max.as_str(), below_max.as_str(), "a.txt"]
+			.map(|name| String::from(names.allocate(source_name(name), NameShape::File).unwrap()));
+		assert_eq!(
+			allocated,
+			[
+				format!("a ({}) (2).txt", u64::MAX - 1),
+				format!("a ({}) (3).txt", u64::MAX - 1),
+				// the stem's counters are its own: the plain name's first one is still free
+				"a (1).txt".to_owned(),
+			]
+		);
+	}
+
+	#[test]
+	fn a_case_variant_trimmed_elsewhere_still_gets_the_smallest_free_counter() {
+		// `İ` lowercases to `i` and a combining dot, so these two names collide although one is
+		// 255 bytes and the other 170: numbered, only the first is trimmed, and the two `(1)`s
+		// no longer collide
+		let decomposed = "i\u{307}".repeat(85);
+		let composed = "\u{130}".repeat(85);
+		assert_eq!(collision_key(&composed), decomposed);
+		let mut names = TakenNames::new([decomposed.as_str()]);
+		let allocated = [&decomposed, &composed]
+			.map(|name| String::from(names.allocate(source_name(name), NameShape::Dir).unwrap()));
+		assert_eq!(
+			allocated,
+			[
+				format!("{}i (1)", "i\u{307}".repeat(83)),
+				format!("{composed} (1)"),
+			]
 		);
 	}
 
@@ -414,31 +500,158 @@ mod tests {
 		assert!(allocated.iter().all(|name| name.len() <= MAX_BYTES));
 	}
 
+	/// What [`TakenNames::allocate`] must pick, found without its hint: every counter from the
+	/// first, in turn.
+	fn allocate_by_trying_every_counter(
+		taken: &mut SeededSet<String>,
+		name: &ValidatedName,
+		shape: NameShape,
+	) -> String {
+		if taken.insert(collision_key(name.as_ref())) {
+			return name.clone().into();
+		}
+		let (stem, ext) = split_extension(name.as_ref(), shape);
+		let (mut base, mut n) = strip_counter(stem)
+			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
+			.unwrap_or((stem, 1));
+		loop {
+			let (candidate, _) = numbered_candidate(base, n, ext).unwrap();
+			if taken.insert(collision_key(candidate.as_ref())) {
+				return candidate.into();
+			}
+			(base, n) = n.checked_add(1).map_or((stem, 1), |next| (base, next));
+		}
+	}
+
+	#[test]
+	fn long_and_encoded_names_get_what_trying_every_counter_would_give() {
+		use rand::{Rng, SeedableRng, rngs::StdRng};
+
+		// characters of every UTF-8 length, ones whose case changes their length, and ones a
+		// name gets encoded for
+		const ALPHABET: &[&str] = &[
+			"a",
+			"A",
+			".",
+			" ",
+			"(",
+			"1)",
+			"\u{e9}",
+			"\u{c9}",
+			"\u{130}",
+			"i\u{307}",
+			"\u{1F600}",
+			":",
+			"\u{3a3}",
+		];
+		// counters a name already ends in, so numbering starts at every length up to the last
+		const COUNTERS: &[&str] = &["", "", " (9)", " (99)", " (999)", " (18446744073709551614)"];
+		let mut rng = StdRng::seed_from_u64(0x6b65_6570_626f_7468);
+		// an extension holds no dot, and nothing encoding would lengthen past the limit
+		let text = |rng: &mut StdRng, bytes: usize, ext: bool| {
+			let mut text = String::new();
+			while text.len() < bytes {
+				let piece = ALPHABET[rng.random_range(0..ALPHABET.len())];
+				if !ext || ![".", ":"].contains(&piece) {
+					text.push_str(piece);
+				}
+			}
+			text.truncate(text.floor_char_boundary(bytes));
+			text
+		};
+		for _ in 0..300 {
+			let pool: Vec<ValidatedName> = (0..3)
+				.filter_map(|_| {
+					// a long stem, or a long extension: then counters leave the base little room
+					let long_ext = rng.random_bool(0.5);
+					let stem = if long_ext {
+						// a character or two, which may leave the base no room at all
+						let pieces = rng.random_range(1..=2);
+						(0..pieces)
+							.map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())])
+							.collect()
+					} else {
+						let bytes = rng.random_range(1..=250);
+						text(&mut rng, bytes, false)
+					};
+					let counter = COUNTERS[rng.random_range(0..COUNTERS.len())];
+					let room = MAX_BYTES.saturating_sub(stem.len() + counter.len() + 1);
+					let bytes = if long_ext {
+						room.saturating_sub(rng.random_range(0..4))
+					} else {
+						rng.random_range(0..=room.min(10))
+					};
+					let ext = text(&mut rng, bytes, true);
+					SourceName::parse(&format!("{stem}{counter}.{ext}"))
+						.ok()
+						.map(SourceName::into_name)
+				})
+				.collect();
+			if pool.is_empty() {
+				continue;
+			}
+			let shape = if rng.random_bool(0.5) {
+				NameShape::File
+			} else {
+				NameShape::Dir
+			};
+			let mut names = TakenNames::default();
+			let mut oracle = SeededSet::default();
+			for _ in 0..40 {
+				let name = &pool[rng.random_range(0..pool.len())];
+				let allocated: String = names.allocate(name.clone(), shape).unwrap().into();
+				assert_eq!(
+					allocated,
+					allocate_by_trying_every_counter(&mut oracle, name, shape),
+					"allocating {name:?}"
+				);
+				assert!(ValidatedName::try_from(allocated.as_str()).is_ok());
+			}
+		}
+	}
+
 	#[test]
 	fn many_duplicates_are_allocated_in_linear_time() {
 		// names from an archive are attacker-chosen: the k-th duplicate must not retry every
 		// counter before it, or 20k duplicates of one name (and of its case variants) would
 		// take hundreds of millions of candidate checks
+		const DUPLICATES: u64 = 20_000;
+		// hints are kept per counter length, so a duplicate builds one candidate for each length
+		// (1 to 5 digits here) on its way to the free one
+		const MOST_BUILT_EACH: u64 = DUPLICATES.ilog10() as u64 + 2;
 		let mut names = TakenNames::default();
-		let start = std::time::Instant::now();
+		let mut built = 0;
 		let mut last = String::new();
-		for i in 0..20_000 {
+		for i in 0..DUPLICATES {
 			let spelling = if i % 2 == 0 {
 				"report.pdf"
 			} else {
 				"REPORT.pdf"
 			};
 			last = names
-				.allocate(source_name(spelling), NameShape::File)
+				.allocate_counting(source_name(spelling), NameShape::File, &mut built)
 				.unwrap()
 				.into();
 		}
 		assert_eq!(last, "REPORT (19999).pdf");
-		assert!(
-			start.elapsed() < std::time::Duration::from_secs(1),
-			"{:?}",
-			start.elapsed()
-		);
+		assert!(built <= MOST_BUILT_EACH * DUPLICATES);
+		// and so must one long enough that every candidate is trimmed
+		built = 0;
+		let long = "x".repeat(250);
+		let long_upper = long.to_uppercase();
+		for i in 0..DUPLICATES {
+			let spelling = if i % 2 == 0 { &long } else { &long_upper };
+			last = names
+				.allocate_counting(
+					source_name(&format!("{spelling}.pdf")),
+					NameShape::File,
+					&mut built,
+				)
+				.unwrap()
+				.into();
+		}
+		assert_eq!(last, format!("{} (19999).pdf", "X".repeat(243)));
+		assert!(built <= MOST_BUILT_EACH * DUPLICATES);
 		// the hint never skips a free counter, even one below a counter taken out of order
 		let mut names = TakenNames::new(["a.txt", "a (2).txt"]);
 		let first: String = names
