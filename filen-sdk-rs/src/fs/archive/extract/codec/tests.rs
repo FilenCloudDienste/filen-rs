@@ -1047,3 +1047,72 @@ fn an_encrypted_directory_is_judged_by_its_length() {
 		assert!(end.unwrap().unaccounted_bytes > 0, "{method:?}");
 	}
 }
+
+/// The password of every fixture whose name starts with `encrypted`.
+const FIXTURE_PASSWORD: &str = "fixture password";
+
+/// Extracts every archive in `tests/fixtures/archives/<dir>`, made by real tools (see the README
+/// there), and checks what the codec sends against the directory's `manifest.tsv`, which was
+/// written from the inputs rather than from what the SDK reads.
+fn check_fixtures(dir: &str) {
+	let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/archives")
+		.join(dir);
+	let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
+	let mut expected = std::collections::BTreeMap::<&str, Vec<String>>::new();
+	for line in manifest.lines().filter(|line| !line.starts_with('#')) {
+		let (archive, row) = line.split_once('\t').unwrap();
+		expected.entry(archive).or_default().push(row.to_owned());
+	}
+	for (archive, mut rows) in expected {
+		let bytes = std::fs::read(root.join(archive)).unwrap();
+		let password = archive.starts_with("encrypted").then_some(FIXTURE_PASSWORD);
+		let (seen, end) = run_full(&bytes, archive, LIMITS, password);
+		let end = end.unwrap_or_else(|error| panic!("{archive}: {error}"));
+		let mut found: Vec<String> = seen
+			.into_iter()
+			.filter_map(|seen| match seen {
+				Seen::Opened(_) => None,
+				Seen::Dir(_, path) => Some(format!("dir\t{path}")),
+				Seen::File {
+					path, data, ended, ..
+				} => {
+					assert!(ended, "{archive}: {path} did not end");
+					Some(format!(
+						"file\t{path}\t{}\t{:08x}",
+						data.len(),
+						crc32fast::hash(&data)
+					))
+				}
+				Seen::Skipped(_, path, _, ExtractSkipReason::Symlink { target }) => {
+					Some(format!("symlink\t{path}\t{target}"))
+				}
+				Seen::Skipped(_, path, _, ExtractSkipReason::Hardlink { target }) => {
+					Some(format!("hardlink\t{path}\t{target}"))
+				}
+				Seen::Skipped(_, path, _, reason) => Some(format!("skip\t{path}\t{reason:?}")),
+			})
+			.collect();
+		if end.unaccounted_bytes > 0 {
+			found.push(format!("unaccounted\t\t{}", end.unaccounted_bytes));
+		}
+		rows.sort();
+		found.sort();
+		assert_eq!(found, rows, "{archive}");
+	}
+}
+
+#[test]
+fn tar_fixtures_extract_to_their_manifest() {
+	check_fixtures("tar");
+}
+
+#[test]
+fn sevenz_fixtures_extract_to_their_manifest() {
+	check_fixtures("7z");
+}
+
+#[test]
+fn stream_fixtures_extract_to_their_manifest() {
+	check_fixtures("streams");
+}
