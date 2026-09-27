@@ -59,23 +59,27 @@ pub enum ZipMethod {
 }
 
 impl ZipMethod {
-	/// The levels the method takes; `None` for [`ZipMethod::Stored`], which has none.
-	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+	/// The method's name, its level and the levels it takes; `None` for [`ZipMethod::Stored`],
+	/// which has none.
+	fn leveled(self) -> Option<(&'static str, u32, RangeInclusive<u32>)> {
 		match self {
 			Self::Stored => None,
-			Self::Deflate { .. } | Self::Bzip2 { .. } => Some(1..=9),
+			Self::Deflate { level } => Some(("zip Deflate", level, 1..=9)),
+			Self::Bzip2 { level } => Some(("zip BZip2", level, 1..=9)),
 		}
+	}
+
+	/// The levels the method takes; `None` for [`ZipMethod::Stored`], which has none.
+	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+		self.leveled().map(|(_, _, levels)| levels)
 	}
 
 	/// The method's level, checked against its [levels](ZipMethod::levels).
 	pub(crate) fn check(self) -> Result<(), Error> {
-		let (level, name) = match self {
-			Self::Stored => return Ok(()),
-			Self::Deflate { level } => (level, "zip Deflate"),
-			Self::Bzip2 { level } => (level, "zip BZip2"),
-		};
-		let levels = self.levels().expect("a method with a level has levels");
-		check_level(name, levels, level).map(drop)
+		match self.leveled() {
+			None => Ok(()),
+			Some((name, level, levels)) => check_level(name, levels, level).map(drop),
+		}
 	}
 
 	fn code(self) -> u16 {

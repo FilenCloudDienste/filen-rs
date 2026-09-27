@@ -69,27 +69,30 @@ pub enum SevenZMethod {
 }
 
 impl SevenZMethod {
-	/// The levels the method takes; `None` for [`SevenZMethod::Copy`], which has none.
-	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+	/// The method's name, its level and the levels it takes; `None` for
+	/// [`SevenZMethod::Copy`], which has none.
+	fn leveled(self) -> Option<(&'static str, u32, RangeInclusive<u32>)> {
 		match self {
 			Self::Copy => None,
-			Self::Lzma2 { .. } | Self::Lzma { .. } => Some(0..=9),
-			Self::Ppmd { .. } | Self::Bzip2 { .. } | Self::Deflate { .. } => Some(1..=9),
+			Self::Lzma2 { level } => Some(("7z LZMA2", level, 0..=9)),
+			Self::Lzma { level } => Some(("7z LZMA", level, 0..=9)),
+			Self::Ppmd { level } => Some(("7z PPMd", level, 1..=9)),
+			Self::Bzip2 { level } => Some(("7z BZip2", level, 1..=9)),
+			Self::Deflate { level } => Some(("7z Deflate", level, 1..=9)),
 		}
+	}
+
+	/// The levels the method takes; `None` for [`SevenZMethod::Copy`], which has none.
+	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+		self.leveled().map(|(_, _, levels)| levels)
 	}
 
 	/// The method's level, checked against its [levels](SevenZMethod::levels).
 	pub(crate) fn check(self) -> Result<(), Error> {
-		let (level, name) = match self {
-			Self::Copy => return Ok(()),
-			Self::Lzma2 { level } => (level, "7z LZMA2"),
-			Self::Lzma { level } => (level, "7z LZMA"),
-			Self::Ppmd { level } => (level, "7z PPMd"),
-			Self::Bzip2 { level } => (level, "7z BZip2"),
-			Self::Deflate { level } => (level, "7z Deflate"),
-		};
-		let levels = self.levels().expect("a method with a level has levels");
-		check_level(name, levels, level).map(drop)
+		match self.leveled() {
+			None => Ok(()),
+			Some((name, level, levels)) => check_level(name, levels, level).map(drop),
+		}
 	}
 
 	/// The encoder's memory, in bytes, for a level already checked.
