@@ -353,6 +353,8 @@ pub(crate) struct ChunkInput<'p> {
 	next: u64,
 	chunk: Vec<u8>,
 	pos: usize,
+	/// Bytes read and counted: the source's first ones, as it is read in order.
+	read: u64,
 }
 
 impl<'p> ChunkInput<'p> {
@@ -364,6 +366,7 @@ impl<'p> ChunkInput<'p> {
 			next: 0,
 			chunk: Vec::new(),
 			pos: 0,
+			read: 0,
 		}
 	}
 }
@@ -388,6 +391,7 @@ impl Read for ChunkInput<'_> {
 		let n = buf.len().min(self.chunk.len() - self.pos);
 		buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
 		self.pos += n;
+		self.read += n as u64;
 		self.port
 			.shared
 			.input_bytes
@@ -411,6 +415,8 @@ pub(crate) struct SeekInput<'p> {
 	/// KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
 	/// length the archive does not have never sizes it.
 	fetched: Vec<u64>,
+	/// Bytes at the source's start already counted by the reader before this one.
+	counted_prefix: u64,
 }
 
 impl<'p> SeekInput<'p> {
@@ -423,6 +429,17 @@ impl<'p> SeekInput<'p> {
 			cache: Vec::new(),
 			slots: 2,
 			fetched: Vec::new(),
+			counted_prefix: 0,
+		}
+	}
+
+	/// Reads `input`'s source again from its start, as a zip or 7z told by the head a stream
+	/// reader read. The bytes `input` counted are not counted again when their chunks are
+	/// fetched here, which would take the bytes read past the source's length.
+	pub(crate) fn rereading(input: ChunkInput<'p>) -> Self {
+		Self {
+			counted_prefix: input.read,
+			..Self::new(input.port, input.source, input.len)
 		}
 	}
 
@@ -439,10 +456,15 @@ impl<'p> SeekInput<'p> {
 			None => {
 				let data = self.port.fetch(self.source, index)?;
 				if self.first_fetch(index) {
+					let len = data.len() as u64;
+					let counted = self
+						.counted_prefix
+						.saturating_sub(index * CHUNK_SIZE_U64)
+						.min(len);
 					self.port
 						.shared
 						.input_bytes
-						.fetch_add(data.len() as u64, Ordering::Relaxed);
+						.fetch_add(len - counted, Ordering::Relaxed);
 				}
 				self.cache.truncate(self.slots - 1);
 				self.cache.insert(0, (index, data));
@@ -680,6 +702,22 @@ mod tests {
 		})
 		.await;
 		assert_eq!(asked, [2, 0, 1, 2]);
+		assert_eq!(read.unwrap(), len);
+	}
+
+	#[tokio::test]
+	async fn a_source_read_again_from_its_start_counts_once_toward_the_bytes_read() {
+		let len = 2 * CHUNK_SIZE_U64 + 100;
+		let (asked, read) = with_source(len, move |port| {
+			// into the second chunk, then read again from the start and to the end
+			let mut input = ChunkInput::new(port, 0, len);
+			input.read_exact(&mut vec![0u8; CHUNK_SIZE + 7])?;
+			let mut source = SeekInput::rereading(input);
+			source.read_to_end(&mut Vec::new())?;
+			Ok(port.shared().input_bytes())
+		})
+		.await;
+		assert_eq!(asked, [0, 1, 0, 1, 2]);
 		assert_eq!(read.unwrap(), len);
 	}
 

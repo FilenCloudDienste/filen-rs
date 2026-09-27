@@ -151,8 +151,10 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				extract_single(port, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
-		Some(Detected::Zip) => extract_zip(port, &job),
-		Some(Detected::SevenZ) => extract_sevenz(port, &job),
+		Some(Detected::Zip) => extract_zip(port, SeekInput::rereading(source.into_inner().1), &job),
+		Some(Detected::SevenZ) => {
+			extract_sevenz(port, SeekInput::rereading(source.into_inner().1), &job)
+		}
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
 			"the file is not an archive the SDK can extract",
@@ -198,10 +200,13 @@ fn unchecked(check: StreamCheck, files: u64) -> u64 {
 	}
 }
 
-/// A zip: its entries in local-header order, each checked against its CRC-32 or authentication
-/// code.
-fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut source = SeekInput::new(port, 0, job.len);
+/// A zip read from `source`: its entries in local-header order, each checked against its CRC-32
+/// or authentication code.
+fn extract_zip(
+	port: &WorkerPort,
+	mut source: SeekInput<'_>,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
 	let limits = ZipLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
@@ -387,10 +392,13 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 	})
 }
 
-/// A 7z: its entries in header order, folder by folder, each checked against its CRC-32 when the
-/// header lists one.
-fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut source = SeekInput::new(port, 0, job.len);
+/// A 7z read from `source`: its entries in header order, folder by folder, each checked against
+/// its CRC-32 when the header lists one.
+fn extract_sevenz(
+	port: &WorkerPort,
+	mut source: SeekInput<'_>,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
 	let password = job.password.as_ref().map(ArchivePassword::utf16le);
 	// a derivation exchanges nothing with the driver for up to a minute: without this it would
 	// be given up on as a dead codec, and a cancel would wait it out

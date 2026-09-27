@@ -76,6 +76,17 @@ fn run_full(
 	limits: CodecLimits,
 	password: Option<&str>,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
+	let (seen, result, _) = run_counting(archive, name, limits, password);
+	(seen, result)
+}
+
+/// As [`run_full`], and the bytes of the archive the codec counted as read.
+fn run_counting(
+	archive: &[u8],
+	name: &str,
+	limits: CodecLimits,
+	password: Option<&str>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let job = StreamJob {
 		name: name.to_owned(),
 		len: archive.len() as u64,
@@ -140,7 +151,7 @@ fn run_full(
 			Err(tokio::sync::oneshot::error::TryRecvError::Closed) => panic!("the codec died"),
 		}
 	};
-	(seen, result)
+	(seen, result, link.shared.input_bytes())
 }
 
 fn run(archive: &[u8], name: &str) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
@@ -583,6 +594,28 @@ fn a_zip_is_sent_entry_by_entry() {
 			duplicates: None,
 		}
 	);
+}
+
+#[test]
+fn every_byte_of_an_archive_counts_once_toward_the_bytes_read() {
+	let (zip, _) = zip_sample();
+	let sevenz = sevenz_of(
+		&[("big.bin", Some(&pattern(CHUNK_SIZE + 99, 4)))],
+		SevenZMethod::Lzma2 { level: 1 },
+		false,
+		None,
+	);
+	// a zip or 7z is told by its head, read as a stream's is, then read again from its start
+	for (archive, name) in [
+		(sample_tar(), "sample.tar"),
+		(gzip(&sample_tar()), "sample.tar.gz"),
+		(zip, "bundle.zip"),
+		(sevenz, "sample.7z"),
+	] {
+		let (_, end, read) = run_counting(&archive, name, LIMITS, None);
+		end.unwrap();
+		assert_eq!(read, archive.len() as u64, "{name}");
+	}
 }
 
 #[test]
