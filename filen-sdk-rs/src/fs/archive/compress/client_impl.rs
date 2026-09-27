@@ -124,17 +124,9 @@ impl Client {
 			.format
 			.check_name(name.as_ref())
 			.and_then(|extension_len| {
-				config.format.check(config.password.is_some())?;
-				let memory = config.format.encoder_memory()?;
-				if memory > archives.codec_mem_budget {
-					return Err(Error::custom(
-						ErrorKind::InsufficientMemory,
-						format!(
-							"this format needs {memory} bytes of codec memory, over the {} allowed",
-							archives.codec_mem_budget
-						),
-					));
-				}
+				config
+					.format
+					.check_within(config.password.is_some(), archives.codec_mem_budget)?;
 				Ok(extension_len)
 			});
 		let extension_len = match checked {
