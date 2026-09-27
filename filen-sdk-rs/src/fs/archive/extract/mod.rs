@@ -12,6 +12,7 @@ use crate::fs::{
 	file::{RemoteFile, enums::RemoteFileType},
 	name::ValidatedName,
 };
+use filen_macros::js_type;
 
 pub use crate::fs::archive::password::ArchivePassword;
 pub use report::{
@@ -63,6 +64,7 @@ pub enum ExtractRequest {
 /// compressed bytes read so far, but always at least `floor` bytes. Stops a decompression bomb
 /// before it costs its full output in time and storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub struct ExpansionLimit {
 	pub ratio: u64,
 	pub floor: u64,
@@ -106,6 +108,17 @@ impl Default for ExtractConfig {
 
 /// Why an archive entry was not extracted.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ExtractSkipReason {
 	/// A symbolic link, which the drive cannot hold; `target` is the stored target, cut to at most
 	/// 4096 bytes.
@@ -139,6 +152,7 @@ pub enum ExtractSkipReason {
 /// Names a zip lists more than once; the last entry of each name is extracted, as other zip
 /// tools do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct DuplicateEntries {
 	/// Up to 100 of the names.
 	pub names: Vec<String>,

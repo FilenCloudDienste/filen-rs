@@ -29,6 +29,13 @@ use crate::{
 
 /// What to do with a job's sources once its result is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SourceDisposal {
 	/// Move them to the trash, where they can be restored. Frees no storage until the trash is
 	/// emptied.

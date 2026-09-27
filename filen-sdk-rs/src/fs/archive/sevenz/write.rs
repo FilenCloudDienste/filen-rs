@@ -26,6 +26,17 @@ const PPMD_ORDERS: [u32; 10] = [3, 4, 4, 5, 5, 6, 8, 16, 24, 32];
 
 /// How a 7z's files are compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SevenZMethod {
 	/// Stored as they are.
 	Copy,
@@ -86,6 +97,13 @@ fn ppmd_memory(level: u32) -> u32 {
 
 /// What a 7z's encryption covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum SevenZEncryption {
 	/// The files' data; names, sizes and CRCs stay readable.
 	Entries,

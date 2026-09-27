@@ -5,8 +5,15 @@
 //! job can finish (or drop) its in-flight chunks and release their memory reservations before
 //! it parks.
 
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+mod js;
 pub(crate) mod progress;
 pub(crate) mod report;
+
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+pub use js::JobError;
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+pub(crate) use js::job_error;
 
 use std::{
 	future::Future,

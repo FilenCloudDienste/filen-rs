@@ -27,6 +27,17 @@ const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 
 /// How a zip entry's data is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ZipMethod {
 	Stored,
 	/// Levels 1 to 9; zip has no level 0 deflate (use [`ZipMethod::Stored`]).
@@ -40,6 +51,15 @@ pub enum ZipMethod {
 }
 
 impl ZipMethod {
+	/// The method's level, checked against its range.
+	pub(crate) fn check(self) -> Result<(), &'static str> {
+		match self {
+			Self::Stored => Ok(()),
+			Self::Deflate { level } | Self::Bzip2 { level } if (1..=9).contains(&level) => Ok(()),
+			Self::Deflate { .. } | Self::Bzip2 { .. } => Err("zip compression takes levels 1 to 9"),
+		}
+	}
+
 	fn code(self) -> u16 {
 		match self {
 			Self::Stored => 0,

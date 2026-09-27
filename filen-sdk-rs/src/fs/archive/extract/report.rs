@@ -1,6 +1,7 @@
 //! What an extraction reports while it runs and when it ends, and the [`Reporter`] that turns
 //! job state changes into throttled, ordered callbacks.
 
+use filen_macros::js_type;
 use std::{sync::Arc, time::Duration};
 
 use filen_types::fs::Uuid;
@@ -25,6 +26,13 @@ use super::{DuplicateEntries, ExtractSkipReason};
 use crate::fs::archive::dispose::SourceDisposition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ExtractPhase {
 	/// Waiting for another archive job to finish; nothing is held meanwhile.
 	WaitingForWorker,
@@ -49,6 +57,7 @@ impl JobPhase for ExtractPhase {
 
 /// An archive entry. Only meaningful with the archive it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[js_type(export, no_deser, no_default)]
 pub struct ArchiveEntryId {
 	pub archive: Uuid,
 	/// The entry's position among the archive's members.
@@ -57,6 +66,17 @@ pub struct ArchiveEntryId {
 
 /// How much there is to extract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ArchiveTotals {
 	/// An archive read front to back, whose entries are only known as they come: progress is
 	/// how much of the archive has been read.
@@ -65,6 +85,7 @@ pub enum ArchiveTotals {
 
 /// A file being extracted right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractActiveFile {
 	pub entry: ArchiveEntryId,
 	pub dest_uuid: Uuid,
@@ -76,6 +97,17 @@ pub struct ExtractActiveFile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ExtractStage {
 	CreateDirectory,
 	Upload,
@@ -105,6 +137,7 @@ pub struct ExtractFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractSkippedEntry {
 	pub entry: ArchiveEntryId,
 	/// The path as the archive stores it, cut to at most 4096 bytes.
@@ -116,6 +149,13 @@ pub struct ExtractSkippedEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ExtractRenameReason {
 	/// The name was taken in its directory (by another entry, or an item already there), so
 	/// the entry got the next keep-both name.
@@ -126,6 +166,7 @@ pub enum ExtractRenameReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractRenamedEntry {
 	pub entry: ArchiveEntryId,
 	/// The entry's path in the archive, as drive names.
@@ -137,6 +178,17 @@ pub struct ExtractRenamedEntry {
 
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ExtractTopLevelKey {
 	/// The folder the archive was extracted into.
 	Root,
@@ -153,6 +205,7 @@ pub struct ExtractedTopLevel {
 
 /// Records a report only counts, past [`MAX_REPORT_RECORDS`] of each kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct OmittedRecords {
 	pub skipped: u64,
 	pub renamed: u64,

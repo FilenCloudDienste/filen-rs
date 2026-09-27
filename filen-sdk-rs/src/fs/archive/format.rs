@@ -8,6 +8,13 @@
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum StreamCodec {
 	Gzip,
 	Bzip2,

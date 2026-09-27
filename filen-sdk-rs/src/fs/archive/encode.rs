@@ -3,6 +3,7 @@
 //! encoder's memory is known before it is built, so a job can refuse a level its budget cannot
 //! hold instead of running out of memory.
 
+use filen_macros::js_type;
 use std::{
 	io::{self, Write},
 	ops::RangeInclusive,
@@ -17,8 +18,10 @@ use super::format::StreamCodec;
 
 /// A codec and its level; `None` is the codec's default level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub struct Compression {
 	pub codec: StreamCodec,
+	#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 	pub level: Option<u32>,
 }
 

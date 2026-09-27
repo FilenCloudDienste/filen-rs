@@ -17,6 +17,7 @@ use crate::{
 		file::enums::RemoteFileType,
 		name::ValidatedName,
 	},
+	job::{JobError, job_error},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
 		AnySharedDirWithContext, DirByCategoryWithContext, NonRootNormalItemTagged,
@@ -42,27 +43,6 @@ pub struct CopyEntry {
 	pub name: Option<String>,
 }
 
-/// An error in a copy's progress or report. On uniffi it is the SDK error itself, as in the
-/// other uniffi records that carry one (`UploadError`, `DownloadError`).
-#[cfg(feature = "uniffi")]
-pub type CopyError = Arc<Error>;
-
-/// An error in a copy's progress or report: the parts of the SDK error, not the error itself. A
-/// tsify record cannot hold the wasm_bindgen `FilenSdkError` class, and the `JsValue` that
-/// could carry one cannot be made on the commander thread, where the copy builds its updates and
-/// its report.
-#[cfg(not(feature = "uniffi"))]
-#[js_type(export, no_deser)]
-pub struct CopyError {
-	pub kind: ErrorKind,
-	pub message: String,
-	/// The server's message, for errors the server returned.
-	pub server_message: Option<String>,
-	pub server_code: Option<String>,
-	/// The wrapped error's message, without the `Error of kind ...` of `message`.
-	pub inner_message: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, no_default)]
 pub struct CopyFailureInfo {
@@ -74,7 +54,7 @@ pub struct CopyFailureInfo {
 	pub dest_parent_dir: AnyNormalDir,
 	pub dest_name: String,
 	pub stage: CopyStage,
-	pub error: CopyError,
+	pub error: JobError,
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
 	pub affected_files: u64,
 	pub affected_bytes: u64,
@@ -111,7 +91,7 @@ pub struct CopyRenamedEntry {
 #[js_type(export, no_deser, no_default)]
 pub struct CopyItemError {
 	pub dest_uuid: Uuid,
-	pub error: CopyError,
+	pub error: JobError,
 }
 
 #[derive(Debug, Clone)]
@@ -188,7 +168,7 @@ pub struct CopyReport {
 	pub counts: ItemCounts,
 	/// Why the copy ended early: kind `Cancelled` when cancelled, or the error that stopped it.
 	/// `undefined` when it ran to the end, failures of single items included.
-	pub error: Option<CopyError>,
+	pub error: Option<JobError>,
 }
 
 impl TryFrom<AnyItemWithContext> for ItemSource {
@@ -281,23 +261,6 @@ fn requests_to(entries: Vec<CopyEntry>) -> Result<Vec<CopyRequest>, Error> {
 	entries.into_iter().map(TryFrom::try_from).collect()
 }
 
-#[cfg(feature = "uniffi")]
-fn copy_error(error: Arc<Error>) -> CopyError {
-	error
-}
-
-// Takes the Arc, though it only reads the error, to share its signature with the uniffi twin.
-#[cfg(not(feature = "uniffi"))]
-fn copy_error(error: Arc<Error>) -> CopyError {
-	CopyError {
-		kind: error.kind(),
-		message: error.message(),
-		server_message: error.server_message(),
-		server_code: error.server_code(),
-		inner_message: error.inner_message(),
-	}
-}
-
 impl From<FailureInfo> for CopyFailureInfo {
 	fn from(info: FailureInfo) -> Self {
 		Self {
@@ -307,7 +270,7 @@ impl From<FailureInfo> for CopyFailureInfo {
 			dest_parent_dir: info.dest_parent_dir.into(),
 			dest_name: info.dest_name,
 			stage: info.stage,
-			error: copy_error(info.error),
+			error: job_error(info.error),
 			affected_files: info.affected_files,
 			affected_bytes: info.affected_bytes,
 		}
@@ -369,13 +332,13 @@ impl From<super::CopyEvent> for CopyEvent {
 			super::CopyEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(CopyItemError {
 					dest_uuid,
-					error: copy_error(error),
+					error: job_error(error),
 				})
 			}
 			super::CopyEvent::ColorFailed { dest_uuid, error } => {
 				Self::ColorFailed(CopyItemError {
 					dest_uuid,
-					error: copy_error(error),
+					error: job_error(error),
 				})
 			}
 		}
@@ -443,7 +406,7 @@ impl From<super::CopyReport> for CopyReport {
 impl From<CopyFailed> for CopyReport {
 	fn from(failed: CopyFailed) -> Self {
 		Self {
-			error: Some(copy_error(failed.error)),
+			error: Some(job_error(failed.error)),
 			..failed.report.into()
 		}
 	}

@@ -47,15 +47,30 @@ pub enum CompressSources {
 
 /// What an archive is written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CompressFormat {
 	/// A tar of the items, bare or compressed as a whole.
-	Tar { compression: Option<Compression> },
+	Tar {
+		#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
+		compression: Option<Compression>,
+	},
 	/// One file, compressed on its own.
 	Single { compression: Compression },
 	/// A zip of the items, each entry compressed on its own, and encrypted with WinZip AES when
 	/// `encryption` is set (names stay readable: zip encrypts data only).
 	Zip {
 		method: ZipMethod,
+		#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 		encryption: Option<AesStrength>,
 	},
 	/// A 7z of the items: each file compressed on its own, or `solid` (files together in blocks
@@ -64,6 +79,7 @@ pub enum CompressFormat {
 	SevenZ {
 		method: SevenZMethod,
 		solid: bool,
+		#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 		encryption: Option<SevenZEncryption>,
 	},
 }
@@ -101,27 +117,8 @@ impl CompressFormat {
 	/// Checks the format's levels, and that a password comes exactly with encryption.
 	pub(crate) fn check(self, has_password: bool) -> Result<(), Error> {
 		let encrypted = match self {
-			Self::Zip { method, encryption } => {
-				let level = match method {
-					ZipMethod::Stored => None,
-					ZipMethod::Deflate { level } | ZipMethod::Bzip2 { level } => Some(level),
-				};
-				if level.is_some_and(|level| !(1..=9).contains(&level)) {
-					return Err(Error::custom(
-						ErrorKind::InvalidState,
-						"zip compression takes levels 1 to 9",
-					));
-				}
-				encryption.is_some()
-			}
-			Self::SevenZ {
-				method, encryption, ..
-			} => {
-				method
-					.check()
-					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
-				encryption.is_some()
-			}
+			Self::Zip { encryption, .. } => encryption.is_some(),
+			Self::SevenZ { encryption, .. } => encryption.is_some(),
 			Self::Tar { .. } | Self::Single { .. } => false,
 		};
 		match (encrypted, has_password) {
@@ -145,19 +142,24 @@ impl CompressFormat {
 				compression: Some(compression),
 			}
 			| Self::Single { compression } => compression.encoder_memory(),
-			Self::Zip { method, .. } => Ok(match method {
-				ZipMethod::Stored => 0,
-				ZipMethod::Deflate { .. } => Compression {
-					codec: StreamCodec::Gzip,
-					level: None,
-				}
-				.encoder_memory()?,
-				ZipMethod::Bzip2 { level } => Compression {
-					codec: StreamCodec::Bzip2,
-					level: Some(level),
-				}
-				.encoder_memory()?,
-			}),
+			Self::Zip { method, .. } => {
+				method
+					.check()
+					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
+				Ok(match method {
+					ZipMethod::Stored => 0,
+					ZipMethod::Deflate { .. } => Compression {
+						codec: StreamCodec::Gzip,
+						level: None,
+					}
+					.encoder_memory()?,
+					ZipMethod::Bzip2 { level } => Compression {
+						codec: StreamCodec::Bzip2,
+						level: Some(level),
+					}
+					.encoder_memory()?,
+				})
+			}
 			Self::SevenZ { method, .. } => {
 				method
 					.check()

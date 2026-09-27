@@ -1,6 +1,7 @@
 //! What compressing reports while it runs and when it ends, and the [`Reporter`] that turns job
 //! state changes into throttled, ordered callbacks.
 
+use filen_macros::js_type;
 use std::{sync::Arc, time::Duration};
 
 use filen_types::fs::Uuid;
@@ -25,6 +26,13 @@ use crate::{
 pub use crate::job::report::RunState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CompressPhase {
 	/// Listing the sources.
 	Scanning,
@@ -48,6 +56,7 @@ impl JobPhase for CompressPhase {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct CompressCounts {
 	/// Files written into the archive.
 	pub files_done: u64,

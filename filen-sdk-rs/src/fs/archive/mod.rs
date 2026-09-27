@@ -11,6 +11,8 @@ pub(crate) mod entry_path;
 pub mod extract;
 pub(crate) mod format;
 pub(crate) mod hash;
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+mod js_impl;
 pub(crate) mod limits;
 pub(crate) mod names;
 pub(crate) mod password;

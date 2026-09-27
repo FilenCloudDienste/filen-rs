@@ -26,6 +26,13 @@ pub(crate) const ZIP_CRYPTO_HEADER_LEN: u64 = 12;
 
 /// The key size of a WinZip AES entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, serde::Deserialize, tsify::Tsify),
+	tsify(into_wasm_abi, from_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum AesStrength {
 	Aes128,
 	Aes192,
