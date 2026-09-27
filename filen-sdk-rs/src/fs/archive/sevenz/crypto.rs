@@ -7,7 +7,7 @@ use aes::{
 	Aes256,
 	cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray},
 };
-use sha2::{Digest, Sha256};
+use sha2_v11::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::SevenZError;
@@ -300,6 +300,15 @@ mod tests {
 		});
 		assert!(matches!(stopped, Err(SevenZError::Read(_))));
 		assert_eq!(rounds, 1, "the derivation stops at once");
+	}
+
+	#[test]
+	fn key_material_is_wiped_when_dropped() {
+		// the AES key schedule the coders hold, and the hash state a derivation leaves, which
+		// holds the password's last bytes
+		fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+		wiped::<Aes256>();
+		wiped::<Sha256>();
 	}
 
 	#[test]
