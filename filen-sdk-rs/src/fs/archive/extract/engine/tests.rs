@@ -3505,3 +3505,89 @@ async fn a_cancel_while_the_archive_is_read_ends_with_no_time_left() {
 		(ExtractPhase::Cancelled, Some(Duration::ZERO))
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_with_hundreds_of_links_is_copied_for_each_within_bounds() {
+	const LINKS: usize = 300;
+	let data = incompressible(4096, 0x0F);
+	let setup = setup("fan.tar", tar_with_links(&data, LINKS), |backend| {
+		backend.keep_uploads = true;
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+
+	let files = finished(&setup);
+	assert_eq!(files.len(), LINKS + 1);
+	let expected = (data.len() as u64, 1, hash(&data));
+	assert!(
+		files.values().all(|file| *file == expected),
+		"every copy holds the file's data"
+	);
+	assert_eq!(
+		report.counts,
+		ItemCounts {
+			dirs_created: 1,
+			files_done: LINKS as u64 + 1,
+			bytes_done: (LINKS as u64 + 1) * data.len() as u64,
+			..ItemCounts::default()
+		}
+	);
+	let log = setup.backend.log();
+	assert_eq!(log.fetched_items.len(), LINKS);
+	assert!(
+		log.peak_item_fetches <= MAX_SMALL_PARALLEL_REQUESTS,
+		"{} targets fetched at once",
+		log.peak_item_fetches
+	);
+	assert!(
+		log.peak_finishes <= MAX_SMALL_PARALLEL_REQUESTS,
+		"{} registered at once",
+		log.peak_finishes
+	);
+	drop(log);
+	// every memory reservation given back, and none reported paused holding one
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn links_past_a_tight_limit_end_the_job_with_what_they_created() {
+	const LINKS: usize = 300;
+	let data = incompressible(64 << 10, 0x1F);
+	let setup = setup("fan.tar", tar_with_links(&data, LINKS), |backend| {
+		backend.keep_uploads = true;
+	});
+	// the archive is far smaller: the floor bounds the copies, sixteen of the file's size
+	let limit = ExpansionLimit {
+		ratio: 1,
+		floor: 16 * data.len() as u64,
+	};
+	let job = start(
+		&setup,
+		Options {
+			expansion: Some(limit),
+			..Options::default()
+		},
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
+
+	let files = finished(&setup);
+	let expected = (data.len() as u64, 1, hash(&data));
+	assert!(files.values().all(|file| *file == expected));
+	assert!(files.len() <= 17, "{} files", files.len());
+	let counts = failed.report.counts;
+	// what the report says was created is what was, and the file and the sixteen links taken on
+	// are each done, failed or not attempted
+	assert_eq!(counts.files_done, files.len() as u64);
+	assert_eq!(counts.bytes_done, files.len() as u64 * data.len() as u64);
+	assert_eq!(
+		counts.files_done + counts.files_failed + counts.files_not_attempted,
+		17
+	);
+	assert_eq!(
+		counts.bytes_done + counts.bytes_failed + counts.bytes_not_attempted,
+		17 * data.len() as u64
+	);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
