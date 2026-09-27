@@ -2,7 +2,7 @@
 //! real time on a multi-threaded runtime; the stall test scripts a silent codec on paused time.
 
 use std::{
-	collections::{BTreeMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	io::Write,
 	sync::{Mutex, atomic::Ordering},
 	time::Duration,
@@ -19,6 +19,7 @@ use crate::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			extract::{
 				ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractSkipReason, ExtractUpdate,
+				RunState,
 				codec::{CodecLimits, StreamJob, extract_stream},
 			},
 			worker,
@@ -33,7 +34,11 @@ use crate::{
 			},
 		},
 		dir::RootDirectory,
-		drive_job::{backend::ListedNames, counts::ItemCounts, test_support::FakeBackend},
+		drive_job::{
+			backend::ListedNames,
+			counts::ItemCounts,
+			test_support::{FakeBackend, wait_until},
+		},
 		file::{
 			AnonymousRemoteFile, RemoteFile,
 			meta::{DecryptedFileMeta, FileMeta},
@@ -64,6 +69,19 @@ impl ExtractCallback for Recorder {
 impl Recorder {
 	fn last(&self) -> ExtractUpdate {
 		self.updates.lock().unwrap().last().unwrap().clone()
+	}
+
+	/// Every run state the updates went through, each once per stretch.
+	fn run_states(&self) -> Vec<RunState> {
+		let mut states: Vec<RunState> = self
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|update| update.run_state)
+			.collect();
+		states.dedup();
+		states
 	}
 }
 
@@ -161,6 +179,16 @@ struct Job {
 	reporter: MaybeArc<Reporter>,
 }
 
+/// Members a test archive may have, for the codec and the driver alike.
+const MAX_MEMBERS: u64 = 2000;
+
+/// The archive settings of a test job, with [`MAX_MEMBERS`].
+fn test_config() -> ArchiveConfig {
+	let mut config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
+	config.max_members = MAX_MEMBERS;
+	config
+}
+
 struct Options {
 	root: ExtractRoot,
 	control: JobControl,
@@ -168,6 +196,8 @@ struct Options {
 	max_items: Option<u64>,
 	dispose: Option<(SourceDisposal, Uuid)>,
 	password: Option<ArchivePassword>,
+	/// Shared between jobs that compete for its slots.
+	config: ArchiveConfig,
 }
 
 impl Default for Options {
@@ -179,6 +209,7 @@ impl Default for Options {
 			max_items: None,
 			dispose: None,
 			password: None,
+			config: test_config(),
 		}
 	}
 }
@@ -204,7 +235,7 @@ fn start_with(
 		root: options.root,
 		max_bytes: options.max_bytes,
 		max_items: options.max_items,
-		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		config: options.config,
 		start,
 		dispose: options.dispose,
 		disposal_requested: options.dispose.is_some(),
@@ -223,7 +254,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 		len: setup.archive.size(),
 		limits: CodecLimits {
 			decoder_memory: CODEC_MEM_BUDGET,
-			max_members: 2000,
+			max_members: options.config.max_members,
 			expansion: Some(ExpansionLimit::DEFAULT),
 			max_index_bytes: 32 << 20,
 		},
@@ -262,20 +293,36 @@ fn assert_released(setup: &Setup, reporter: &Reporter) {
 	);
 }
 
-/// The registered files by name: size, chunks and hash.
+/// The registered files by their path below the destination: size, chunks and hash.
 fn finished(setup: &Setup) -> BTreeMap<String, (u64, u64, Blake3Hash)> {
-	setup
-		.backend
-		.log()
-		.finished
-		.values()
-		.map(|(name, completion)| {
+	let log = setup.backend.log();
+	let dir_names: HashMap<Uuid, &str> = log
+		.created_dirs
+		.iter()
+		.map(|(uuid, name)| (*uuid, name.as_str()))
+		.collect();
+	log.finished
+		.iter()
+		.map(|(uuid, (name, completion))| {
+			let mut segments = vec![name.as_str()];
+			let mut dir = log.registered_in[uuid];
+			// up to the destination, which the job did not create
+			while let Some(parent) = log.dir_parents.get(&dir) {
+				segments.push(dir_names[&dir]);
+				dir = *parent;
+			}
+			segments.reverse();
 			(
-				name.clone(),
+				segments.join("/"),
 				(completion.written, completion.num_chunks, completion.hash),
 			)
 		})
 		.collect()
+}
+
+/// The registered files' paths below the destination.
+fn finished_paths(setup: &Setup) -> Vec<String> {
+	finished(setup).into_keys().collect()
 }
 
 fn created_dirs(setup: &Setup) -> Vec<String> {
@@ -296,6 +343,8 @@ async fn extracts_a_compressed_tar_into_a_new_folder() {
 		("docs/a.txt", b"alpha"),
 		("docs/sub/big.bin", &big),
 		("empty.txt", b""),
+		// the same name in another folder
+		("other/a.txt", b"another alpha"),
 	]);
 	// a symlink the extraction skips, written into a second tar and joined on
 	let mut builder = tar::Builder::new(Vec::new());
@@ -314,21 +363,28 @@ async fn extracts_a_compressed_tar_into_a_new_folder() {
 	let job = start(&setup, Options::default());
 	let report = job.running.await.unwrap().unwrap();
 
-	assert_eq!(created_dirs(&setup), ["sample", "docs", "sub"]);
+	assert_eq!(created_dirs(&setup), ["sample", "docs", "sub", "other"]);
 	assert_eq!(
 		finished(&setup),
 		BTreeMap::from([
-			("a.txt".to_owned(), (5, 1, hash(b"alpha"))),
-			("big.bin".to_owned(), (big.len() as u64, 3, hash(&big))),
-			("empty.txt".to_owned(), (0, 0, hash(b""))),
+			("sample/docs/a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			(
+				"sample/docs/sub/big.bin".to_owned(),
+				(big.len() as u64, 3, hash(&big))
+			),
+			("sample/empty.txt".to_owned(), (0, 0, hash(b""))),
+			(
+				"sample/other/a.txt".to_owned(),
+				(13, 1, hash(b"another alpha"))
+			),
 		])
 	);
 	assert_eq!(
 		report.counts,
 		ItemCounts {
-			dirs_created: 3,
-			files_done: 3,
-			bytes_done: 5 + big.len() as u64,
+			dirs_created: 4,
+			files_done: 4,
+			bytes_done: 5 + big.len() as u64 + 13,
 			entries_skipped: 1,
 			..ItemCounts::default()
 		}
@@ -373,8 +429,10 @@ async fn extracting_into_the_destination_keeps_both() {
 	let report = job.running.await.unwrap().unwrap();
 
 	assert_eq!(created_dirs(&setup), ["docs (1)"]);
-	let names: Vec<String> = finished(&setup).into_keys().collect();
-	assert_eq!(names, ["other.txt", "readme (1).txt", "x.txt"]);
+	assert_eq!(
+		finished_paths(&setup),
+		["docs (1)/x.txt", "other.txt", "readme (1).txt"]
+	);
 	let renamed: Vec<(&str, &str, ExtractRenameReason)> = report
 		.renamed
 		.iter()
@@ -447,10 +505,7 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
 	assert_eq!(failed.report.counts.files_done, 1);
-	assert_eq!(
-		finished(&setup).into_keys().collect::<Vec<_>>(),
-		["first.txt"]
-	);
+	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter);
 }
@@ -498,16 +553,13 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 			..Options::default()
 		},
 	);
-	for _ in 0..1000 {
-		if finished(&setup).contains_key("done.txt")
+	wait_until("done.txt is registered and stuck.bin uploading", || {
+		finished(&setup).contains_key("c/done.txt")
 			&& job
 				.reporter
 				.read(|state| state.active_names().contains(&"stuck.bin".to_owned()))
-		{
-			break;
-		}
-		tokio::time::sleep(Duration::from_millis(10)).await;
-	}
+	})
+	.await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 
@@ -811,8 +863,11 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 	assert_eq!(
 		finished(&setup),
 		BTreeMap::from([
-			("a.txt".to_owned(), (5, 1, hash(b"alpha"))),
-			("big.bin".to_owned(), (big.len() as u64, 3, hash(&big))),
+			("bundle/docs/a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			(
+				"bundle/docs/big.bin".to_owned(),
+				(big.len() as u64, 3, hash(&big))
+			),
 		])
 	);
 	assert!(matches!(
@@ -910,8 +965,11 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 	assert_eq!(
 		finished(&setup),
 		BTreeMap::from([
-			("a.txt".to_owned(), (5, 1, hash(b"alpha"))),
-			("big.bin".to_owned(), (big.len() as u64, 3, hash(&big))),
+			("bundle/docs/a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			(
+				"bundle/docs/big.bin".to_owned(),
+				(big.len() as u64, 3, hash(&big))
+			),
 		])
 	);
 	assert!(matches!(
@@ -1070,7 +1128,7 @@ async fn a_paused_extract_finishes_once_resumed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 	// b.txt's registration runs long; a.bin's upload ends while the pause is requested, and the
-	// pause is lifted while b.txt still registers, so the job never went idle
+	// pause is lifted while b.txt still registers, so the job never goes idle
 	let big = pattern(CHUNK_SIZE + 3, 5);
 	let tar = tar_of(&[("b.txt", b"b"), ("a.bin", &big[..])]);
 	let setup = setup("bundle.tar", tar, |backend| {
@@ -1089,9 +1147,20 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 			..Options::default()
 		},
 	);
-	tokio::time::sleep(Duration::from_millis(250)).await;
+	wait_until("b.txt registers and a.bin's chunks upload", || {
+		let log = setup.backend.log();
+		log.finishing.contains(&"b.txt".to_owned()) && log.upload_starts.len() == 3
+	})
+	.await;
 	pause.send_replace(true);
-	tokio::time::sleep(Duration::from_millis(800)).await;
+	wait_until("a.bin's chunks are uploaded", || {
+		setup.backend.log().uploaded.len() == 3
+	})
+	.await;
+	assert!(
+		!finished(&setup).contains_key("bundle/b.txt"),
+		"b.txt still registers: the job has not gone idle"
+	);
 	pause.send_replace(false);
 	let report = tokio::time::timeout(Duration::from_secs(20), job.running)
 		.await
@@ -1100,4 +1169,9 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 		.unwrap();
 	assert_eq!(report.counts.files_done, 2);
 	assert_eq!(finished(&setup).len(), 2);
+	assert_eq!(
+		job.recorder.run_states(),
+		[RunState::Running, RunState::Pausing, RunState::Running],
+		"never paused: a registration was in flight all along"
+	);
 }

@@ -16,7 +16,7 @@ use crate::{
 		dir::RootDirectory,
 		drive_job::{
 			name_retry::TOP_LEVEL_NAME_ATTEMPTS,
-			test_support::{FakeBackend, chunk_data},
+			test_support::{FakeBackend, chunk_data, wait_until},
 		},
 		file::{
 			AnonymousRemoteFile,
@@ -185,16 +185,6 @@ fn start(
 		MaybeArc::clone(&reporter),
 	));
 	(running, recorder, reporter)
-}
-
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-	for _ in 0..100_000 {
-		if condition() {
-			return;
-		}
-		tokio::time::sleep(Duration::from_millis(1)).await;
-	}
-	panic!("timed out waiting until {what}");
 }
 
 /// Everything a finished job must have given back.

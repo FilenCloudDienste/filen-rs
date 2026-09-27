@@ -52,6 +52,34 @@ pub(crate) fn chunk_data(uuid: Uuid, index: u64, size: u64) -> Vec<u8> {
 	vec![fill; chunk_plaintext_len(size, index) as usize]
 }
 
+/// Waits until `condition` holds, panicking with `what` if it does not within a generous time.
+pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+	for _ in 0..100_000 {
+		if condition() {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	panic!("timed out waiting until {what}");
+}
+
+/// Counts one of several calls running at once, for as long as it lives.
+struct Running(Arc<AtomicUsize>);
+
+impl Running {
+	/// Counts a call in `running`, handing `peak` how many run now.
+	fn start(running: &Arc<AtomicUsize>, peak: impl FnOnce(usize)) -> Self {
+		peak(running.fetch_add(1, Ordering::SeqCst) + 1);
+		Self(Arc::clone(running))
+	}
+}
+
+impl Drop for Running {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
 pub(crate) struct FakeLock(Arc<AtomicUsize>);
 impl Drop for FakeLock {
 	fn drop(&mut self) {
@@ -73,6 +101,12 @@ pub(crate) struct FakeLog {
 	/// The bytes of each uploaded chunk, when [`FakeBackend::keep_uploads`] is set.
 	pub(crate) uploaded_data: HashMap<(Uuid, u64), Vec<u8>>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
+	/// The directory each file was registered in, kept when the file is removed later.
+	pub(crate) registered_in: HashMap<Uuid, Uuid>,
+	/// Chunk uploads that started, in order.
+	pub(crate) upload_starts: Vec<(Uuid, u64)>,
+	/// Most registrations that ran at once.
+	pub(crate) peak_finishes: usize,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
 	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
 	pub(crate) fetched_items: Vec<Uuid>,
@@ -138,6 +172,8 @@ pub(crate) struct FakeBackend {
 	/// writing without the drive lock took them at the last moment).
 	pub(crate) version_of: HashMap<String, Uuid>,
 	pub(crate) lock_calls: AtomicUsize,
+	/// Registrations running now.
+	finishes: Arc<AtomicUsize>,
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
 	/// until it is cleared; `None` while the lock is free.
 	pub(crate) block_locks_from: watch::Sender<Option<usize>>,
@@ -187,6 +223,7 @@ impl FakeBackend {
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
+			finishes: Arc::default(),
 			block_locks_from: watch::Sender::new(None),
 			listed: ListedNames::default(),
 			contents: HashMap::new(),
@@ -407,6 +444,7 @@ impl DriveBackend for FakeBackend {
 		data: Vec<u8>,
 	) -> Result<RemoteFileInfo, Error> {
 		let name = upload.spec.name.as_ref();
+		self.log().upload_starts.push((upload.spec.uuid, index));
 		if self.blocked_uploads.contains(name) {
 			std::future::pending::<()>().await;
 		}
@@ -443,6 +481,10 @@ impl DriveBackend for FakeBackend {
 			self.live_locks.load(Ordering::SeqCst) > 0,
 			"finalizing holds the drive lock"
 		);
+		let _running = Running::start(&self.finishes, |running| {
+			let mut log = self.log();
+			log.peak_finishes = log.peak_finishes.max(running);
+		});
 		if let Some(delay) = self.slow_finish.get(name.as_ref()) {
 			self.log().finishing.push(name.as_ref().to_owned());
 			tokio::time::sleep(*delay).await;
@@ -487,6 +529,8 @@ impl DriveBackend for FakeBackend {
 		}
 		log.finished
 			.insert(upload.spec.uuid, (name.as_ref().to_owned(), completion));
+		log.registered_in
+			.insert(upload.spec.uuid, upload.spec.parent);
 		if !self.forget_registered {
 			log.file_parents.insert(
 				upload.spec.uuid,
