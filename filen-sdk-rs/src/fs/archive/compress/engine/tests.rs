@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::Utc;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use super::*;
 use crate::{
@@ -441,7 +441,12 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 		control,
 		None,
 	);
-	tokio::time::sleep(Duration::from_millis(200)).await;
+	// every source is read, and the archive's first chunk is stuck uploading
+	let total: u64 = setup_cancel.contents.iter().map(|c| c.len() as u64).sum();
+	wait_until("every source is read", || {
+		job.reporter.counts().bytes_read == total
+	})
+	.await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
@@ -1003,6 +1008,15 @@ async fn a_source_inside_another_goes_with_it() {
 }
 
 fn run_permanent_disposal(setup: &Setup, targets: Vec<DisposalTarget>, control: JobControl) -> Job {
+	run_disposal(setup, SourceDisposal::DeletePermanently, targets, control)
+}
+
+fn run_disposal(
+	setup: &Setup,
+	how: SourceDisposal,
+	targets: Vec<DisposalTarget>,
+	control: JobControl,
+) -> Job {
 	let hashed = vec![true; targets.len()];
 	let job = CompressJob {
 		format: CompressFormat::Tar { compression: None },
@@ -1017,7 +1031,7 @@ fn run_permanent_disposal(setup: &Setup, targets: Vec<DisposalTarget>, control: 
 		None,
 		Box::new(move || worker::start(move |port| compress(&port, job))),
 		Some(CompressDisposal {
-			how: SourceDisposal::DeletePermanently,
+			how,
 			targets,
 			hashed,
 		}),
@@ -1387,4 +1401,157 @@ async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
 	);
 	assert_eq!(told(&job.recorder).len(), 2);
 	assert!(setup.backend.log().uploaded.is_empty());
+}
+
+/// The run states the callback saw, each change once; a pause may be complete before an update
+/// shows it pausing, so pausing is left out.
+fn run_states(recorder: &Recorder) -> Vec<RunState> {
+	let mut states: Vec<RunState> = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|update| update.run_state)
+		.filter(|state| *state != RunState::Pausing)
+		.collect();
+	states.dedup();
+	states
+}
+
+/// Plays a codec that reads the first source and the first chunk of the second, and then keeps
+/// reading that chunk.
+async fn read_into_the_second_source(events: &mpsc::Sender<WorkerEvent>) {
+	for (source, index) in [(0, 0), (1, 0)] {
+		let (reply, answer) = oneshot::channel();
+		events
+			.send(WorkerEvent::Ask {
+				source,
+				index,
+				reply,
+			})
+			.await
+			.unwrap();
+		answer.await.unwrap().unwrap();
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (pause, cancel, control) = controls();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		control,
+		None,
+		Box::new(move || Ok(link)),
+	);
+	// the first source's chunk takes the job's own slot, the chunk being read the client's
+	// budget
+	read_into_the_second_source(&events).await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_released(&setup, &job.reporter);
+	assert_eq!(job.recorder.last().run_state, RunState::Paused);
+
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert_eq!(
+		run_states(&job.recorder),
+		[RunState::Running, RunState::Paused, RunState::Cancelling]
+	);
+	assert!(setup.backend.log().finished.is_empty());
+	assert_released(&setup, &job.reporter);
+	drop((events, result));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_compress_writes_the_archive_it_would_have() {
+	let setup_paused = setup(|backend, _| {
+		// the job is still reading when the pause comes
+		backend
+			.slow
+			.insert("big.bin".to_owned(), Duration::from_millis(300));
+	});
+	let (pause, _cancel, control) = controls();
+	let format = CompressFormat::Tar { compression: None };
+	let job = start(&setup_paused, "b.tar", format, control, None);
+	wait_until("the first source is read", || {
+		job.reporter.counts().bytes_read > 0
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_released(&setup_paused, &job.reporter);
+	assert!(setup_paused.backend.log().finished.is_empty());
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	let paused = uploaded(&setup_paused, report.archive.unwrap().uuid());
+	assert_eq!(
+		run_states(&job.recorder),
+		[RunState::Running, RunState::Paused, RunState::Running]
+	);
+
+	let setup_straight = setup(|_, _| {});
+	let job = start(
+		&setup_straight,
+		"b.tar",
+		format,
+		JobControl::default(),
+		None,
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(
+		paused,
+		uploaded(&setup_straight, report.archive.unwrap().uuid()),
+		"a pause changes nothing in the archive"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_registering_holds_the_disposal_back() {
+	let setup = setup(|backend, _| {
+		backend
+			.slow_finish
+			.insert("b.tar".to_owned(), Duration::from_millis(300));
+	});
+	let placed = place(&setup);
+	let (pause, _cancel, control) = controls();
+	let job = run_disposal(
+		&setup,
+		SourceDisposal::Trash,
+		targets(&setup, &placed),
+		control,
+	);
+	wait_until("the archive is being registered", || {
+		!setup.backend.log().finishing.is_empty()
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_eq!(
+		job.recorder.created.lock().unwrap().len(),
+		1,
+		"the registration under way finished"
+	);
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::DisposingSources, RunState::Paused)
+	);
+	assert!(setup.backend.log().trashed_files.is_empty());
+	assert_released(&setup, &job.reporter);
+
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(
+		outcomes(&report)
+			.iter()
+			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+		"{:?}",
+		report.dispositions
+	);
 }

@@ -5,7 +5,9 @@
 //!
 //! Memory, pause and cancel work as in extraction (see the extract engine): a two-chunk floor
 //! for one input and one output chunk, more only from the client's budget when it is free right
-//! now, and a pause that gives back the floor and prefetched chunks once in-flight work is done.
+//! now, and a pause that gives back the floor, the prefetched chunks and every reservation from
+//! the client's budget once in-flight work is done. A paused job keeps its codec's state and the
+//! source chunk the codec is reading resident.
 
 use std::{
 	collections::{BTreeSet, VecDeque},
@@ -499,12 +501,21 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Waits out a pause, giving back the floor and every prefetched chunk. The chunk the codec
-	/// is reading stays (with its permit): the codec holds that data until it asks again.
+	/// is reading stays resident until it asks again, held against the job's own input slot
+	/// instead of the client's memory budget.
 	async fn pause(&mut self) -> Result<(), Stopped> {
 		self.fetches = FuturesOrdered::new();
 		self.ready.clear();
 		self.next_fetch = self.next_served;
 		self.floor = None;
+		if self.reading.take().is_some() {
+			// nothing else holds the slot once the prefetched chunks are dropped
+			self.reading = Arc::clone(&self.input_slot).try_acquire_owned().ok();
+			debug_assert!(
+				self.reading.is_some(),
+				"the input slot is free while pausing"
+			);
+		}
 		self.reporter.checkpoint(&self.control).await?;
 		let floor = self.control.until_stopping(self.config.floor()).await?;
 		self.floor = Some(floor);
@@ -711,6 +722,8 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn codec_finished(&mut self, result: CodecResult) {
+		// the codec reads nothing more
+		self.reading = None;
 		match &result {
 			Ok(len) if *len != self.written => self.stop_with(Error::custom(
 				ErrorKind::Internal,
