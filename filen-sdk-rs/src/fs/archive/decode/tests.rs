@@ -781,6 +781,30 @@ fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
 }
 
 #[test]
+fn zstd_huffman_literals_stop_at_their_stated_size() {
+	// 4 literal words stated, then 4 streams of ones under a 1-bit Huffman table: each bit is a
+	// literal, nearly a million of them in a block
+	const STREAM: usize = 29_998;
+	let tree = [0x80, 0x10];
+	let compressed = tree.len() + 6 + 4 * STREAM;
+	// compressed literals (type 2), 18-bit sizes (format 3): regenerated, then compressed
+	let header = 2 | 3 << 2 | 4u64 << 4 | (compressed as u64) << 22;
+	let mut block = header.to_le_bytes()[..5].to_vec();
+	block.extend_from_slice(&tree);
+	for _ in 0..3 {
+		block.extend_from_slice(&(STREAM as u16).to_le_bytes());
+	}
+	block.extend(std::iter::repeat_n(0xFF, 4 * STREAM));
+	// no sequences
+	block.push(0);
+	let (result, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET)
+	});
+	assert_eq!(corrupt(result), ZSTD_INVALID);
+	assert!(peak < 512 * 1024, "took {peak} bytes");
+}
+
+#[test]
 fn a_zstd_block_of_exactly_its_maximum_decodes() {
 	// literals and matches of 128 KiB in all: 131074 - 2
 	let frame = zstd_crafted_frame(17, &zstd_sequences_block(1, 2));

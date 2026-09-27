@@ -21,6 +21,8 @@ adding this directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
   128 KiB, checked before the sequences are decoded into a buffer of that many;
 - a block's literals and matches together may decode to at most 128 KiB, checked before any of
   it is written to the ring;
+- Huffman-coded literals stop at their stated count, where a bitstream holding more was decoded
+  to its end (up to 8 literals per byte) before the count was checked;
 - the per-block sum is counted in `usize`, so it cannot overflow.
 
 `Cargo.toml` is the published (normalized) one, less the dev-dependencies, benches and examples

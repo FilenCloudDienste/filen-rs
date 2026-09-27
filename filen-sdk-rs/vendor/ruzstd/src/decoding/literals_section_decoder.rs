@@ -49,6 +49,9 @@ fn decompress_literals(
     let num_streams = section.num_streams.ok_or(err::MissingNumStreams)?;
 
     target.reserve(section.regenerated_size as usize);
+    // The streams hold exactly this many literals. A bitstream that holds more would otherwise
+    // be decoded to its end first, up to 8 literals per byte of it, before the count is checked.
+    let end = target.len() + section.regenerated_size as usize;
     let source = &source[0..compressed_size];
     let mut bytes_read = 0;
 
@@ -110,6 +113,12 @@ fn decompress_literals(
             decoder.init_state(&mut br);
 
             while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
+                if target.len() == end {
+                    return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                        decoded: end + 1,
+                        expected: section.regenerated_size as usize,
+                    });
+                }
                 target.push(decoder.decode_symbol());
                 decoder.next_state(&mut br);
             }
@@ -141,6 +150,12 @@ fn decompress_literals(
         }
         decoder.init_state(&mut br);
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
+            if target.len() == end {
+                return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                    decoded: end + 1,
+                    expected: section.regenerated_size as usize,
+                });
+            }
             target.push(decoder.decode_symbol());
             decoder.next_state(&mut br);
         }

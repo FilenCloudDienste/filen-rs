@@ -29,7 +29,8 @@ const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 
 /// The decoder's state besides its window: the literals and block buffers (a block each), the
 /// sequences of a block (at most 43690 of 12 bytes, a match copying 3 bytes at least), and the
-/// entropy tables. Measured under 1 MiB with the most sequences a block holds (see the tests).
+/// entropy tables. The most measured, 0.99 MB with the ring of a 1 KiB window, is for the block
+/// holding the most sequences; Huffman literals stop at their stated size (see the tests).
 const STATE_BYTES: u64 = 2 * 1024 * 1024;
 
 pub(super) struct ZstdDecoder<R> {
