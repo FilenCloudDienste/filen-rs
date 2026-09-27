@@ -107,7 +107,9 @@ pub(crate) struct ZipEntry {
 	/// Its position in the central directory, which identifies it.
 	pub(crate) ordinal: u64,
 	pub(crate) name: String,
-	/// The stored name was not valid UTF-8 where it claimed to be.
+	/// The stored name may not read as its writer meant: it claimed to be UTF-8 and was not, or
+	/// it came from a Unix host, which writes its own character set, and was not UTF-8. Either
+	/// way it was read as CP437, a guess.
 	pub(crate) name_rewritten: bool,
 	pub(crate) kind: ZipKind,
 	/// The compression method, after any encryption.
@@ -535,11 +537,13 @@ fn parse_central_header(
 			Err(_) => (cp437::decode(raw_name), true),
 		}
 	} else {
-		// macOS Archive Utility, ditto and Info-ZIP on Unix store UTF-8 names without flagging
-		// them; one that reads as UTF-8 is taken as that, as 7-Zip does
-		match std::str::from_utf8(raw_name) {
-			Ok(name) if made_by_unix => (name.to_owned(), false),
-			_ => (cp437::decode(raw_name), false),
+		// macOS Archive Utility, ditto and Info-ZIP on Unix store names in the system's
+		// character set without saying so, UTF-8 by now: one that reads as UTF-8 is taken as
+		// that, as 7-Zip does, and one that does not is in a set nothing records
+		match (std::str::from_utf8(raw_name), made_by_unix) {
+			(Ok(name), true) => (name.to_owned(), false),
+			(Err(_), true) => (cp437::decode(raw_name), true),
+			(_, false) => (cp437::decode(raw_name), false),
 		}
 	};
 	let encryption = if flags & FLAG_ENCRYPTED == 0 {

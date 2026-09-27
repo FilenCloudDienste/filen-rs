@@ -881,6 +881,18 @@ fn names_are_decoded_as_their_writers_meant() {
 		// macOS Archive Utility, ditto and Info-ZIP on Unix store UTF-8 without saying so
 		(HOST_UNIX, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
 		(HOST_OS_X, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
+		// decomposed, as macOS may store it, and passed on as it is
+		(
+			HOST_OS_X,
+			0,
+			"Cafe\u{301}.txt".as_bytes(),
+			Vec::new(),
+			"Cafe\u{301}.txt",
+			false,
+		),
+		// a Unix name that is not UTF-8 is in some local character set: CP437 is a guess, so
+		// the name is said to be rewritten, as a tar's is
+		(HOST_UNIX, 0, cp437, Vec::new(), "Café/Résumé.txt", true),
 		// a DOS name that happens to be valid UTF-8 stays CP437 ("├⌐" is 0xC3 0xA9)
 		(HOST_DOS, 0, utf8, Vec::new(), "Caf├⌐/R├⌐sum├⌐.txt", false),
 		// the Unicode path field wins while it matches the raw name
