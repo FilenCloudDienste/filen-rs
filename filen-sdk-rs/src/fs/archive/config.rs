@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE};
+use crate::{
+	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
+	job::{JobControl, Stopped, report::Ops},
+};
 
 /// Bytes one chunk takes in memory, with its encryption overhead.
 pub(crate) const CHUNK_BYTES: usize = CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE;
@@ -64,7 +67,8 @@ const MIN_CODEC_MEM_BUDGET: u64 = 16 << 20;
 pub struct ArchiveConfig {
 	/// Memory for one job's codec state.
 	pub codec_mem_budget: u64,
-	/// Archive jobs that run at once.
+	/// Archive jobs that run at once. A running job keeps its slot while paused (its codec
+	/// state stays resident); a job paused before it got one waits without taking it.
 	pub job_concurrency: usize,
 	/// Most members an archive may have, every tar record counted.
 	pub max_members: u64,
@@ -102,8 +106,35 @@ impl ArchiveConfig {
 		}
 	}
 
+	/// Waits for a job slot and then its memory floor, both held until dropped. A pause stops
+	/// the wait: the job waits the pause out reported paused, holding neither, and gives back a
+	/// slot granted as the pause came, so a paused job never keeps a later one from running.
+	/// `Err` once the job is stopping.
+	pub(crate) async fn admit(
+		&self,
+		control: &JobControl,
+		ops: &Ops,
+	) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), Stopped> {
+		loop {
+			ops.set_pause_requested(control.is_pause_requested());
+			control.checkpoint().await?;
+			ops.set_pause_requested(false);
+			let admitted = tokio::select! {
+				biased;
+				() = control.stopping() => return Err(Stopped),
+				() = control.pause_changed(false) => None,
+				admitted = async { (self.lease().await, self.floor().await) } => Some(admitted),
+			};
+			if let Some(admitted) = admitted
+				&& !control.is_pause_requested()
+			{
+				return Ok(admitted);
+			}
+		}
+	}
+
 	/// Waits for a job slot.
-	pub(crate) async fn lease(&self) -> OwnedSemaphorePermit {
+	async fn lease(&self) -> OwnedSemaphorePermit {
 		Arc::clone(&self.gate)
 			.acquire_owned()
 			.await
@@ -117,6 +148,19 @@ impl ArchiveConfig {
 			.acquire_many_owned((FLOOR_CHUNKS * CHUNK_BYTES) as u32)
 			.await
 			.expect("the archive memory floor is never closed")
+	}
+}
+
+#[cfg(test)]
+impl ArchiveConfig {
+	/// Job slots no job holds.
+	pub(crate) fn free_slots(&self) -> usize {
+		self.gate.available_permits()
+	}
+
+	/// Whether no job holds its memory floor.
+	pub(crate) fn floor_is_free(&self) -> bool {
+		self.floor.available_permits() == self.job_concurrency * FLOOR_CHUNKS * CHUNK_BYTES
 	}
 }
 

@@ -1099,30 +1099,122 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	);
 }
 
+/// Settings with one job slot, for jobs that compete for it.
+fn one_slot() -> ArchiveConfig {
+	let mut config = ArchiveConfig::new(CODEC_MEM_BUDGET, 1);
+	config.max_members = MAX_MEMBERS;
+	config
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_paused_extract_finishes_once_resumed() {
-	let big = pattern(3 * CHUNK_SIZE, 1);
-	let tar = tar_of(&[("a.bin", &big[..]), ("b.txt", b"b"), ("c.txt", b"c")]);
-	let setup = setup("bundle.tar", tar, |_| {});
+async fn a_job_paused_before_it_starts_takes_no_slot() {
+	let config = one_slot();
+	let setup_paused = setup("paused.tar", tar_of(&[("a.txt", b"a")]), |_| {});
 	let (pause, _cancel, control) = controls();
 	pause.send_replace(true);
-	let job = start(
-		&setup,
+	let paused = start(
+		&setup_paused,
 		Options {
 			control,
+			config: config.clone(),
 			..Options::default()
 		},
 	);
-	tokio::time::sleep(Duration::from_millis(300)).await;
-	assert!(
-		finished(&setup).is_empty(),
-		"nothing is registered while paused"
+	wait_until("the job reports itself paused", || {
+		paused.reporter.is_paused()
+	})
+	.await;
+
+	// the only slot is free for a job started later
+	let setup_other = setup("other.tar", tar_of(&[("b.txt", b"b")]), |_| {});
+	let other = start(
+		&setup_other,
+		Options {
+			config: config.clone(),
+			..Options::default()
+		},
 	);
+	tokio::time::timeout(Duration::from_secs(20), other.running)
+		.await
+		.expect("the unpaused job runs")
+		.unwrap()
+		.unwrap();
+	assert!(setup_paused.backend.log().fetched.is_empty());
+	assert!(created_dirs(&setup_paused).is_empty());
+	assert!(paused.reporter.is_paused());
+	assert_eq!(config.free_slots(), 1);
+
 	pause.send_replace(false);
-	let report = job.running.await.unwrap().unwrap();
-	assert_eq!(report.counts.files_done, 3);
-	assert_eq!(finished(&setup).len(), 3);
-	assert_released(&setup, &job.reporter);
+	let report = paused.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 1);
+	assert_eq!(
+		paused.recorder.run_states(),
+		[RunState::Paused, RunState::Running]
+	);
+	assert_released(&setup_paused, &paused.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
+	let config = one_slot();
+	let setup_first = setup("first.tar", tar_of(&[("stuck.bin", b"stuck")]), |backend| {
+		backend.blocked_uploads.insert("stuck.bin".to_owned());
+	});
+	let (_pause, cancel_first, control) = controls();
+	let first = start(
+		&setup_first,
+		Options {
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+	);
+	wait_until("the first job holds the slot", || {
+		first
+			.reporter
+			.read(|state| state.active_names() == ["stuck.bin"])
+	})
+	.await;
+
+	let setup_queued = setup("queued.tar", tar_of(&[("a.txt", b"a")]), |_| {});
+	let (pause, _cancel, control) = controls();
+	let queued = start(
+		&setup_queued,
+		Options {
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+	);
+	pause.send_replace(true);
+	wait_until("the queued job reports itself paused", || {
+		queued.reporter.is_paused()
+	})
+	.await;
+	cancel_first.send_replace(true);
+	first.running.await.unwrap().unwrap_err();
+
+	let setup_next = setup("next.tar", tar_of(&[("b.txt", b"b")]), |_| {});
+	let next = start(
+		&setup_next,
+		Options {
+			config: config.clone(),
+			..Options::default()
+		},
+	);
+	tokio::time::timeout(Duration::from_secs(20), next.running)
+		.await
+		.expect("the slot the paused job waited for is free")
+		.unwrap()
+		.unwrap();
+	assert!(setup_queued.backend.log().fetched.is_empty());
+
+	pause.send_replace(false);
+	let report = queued.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 1);
+	assert_released(&setup_queued, &queued.reporter);
+	assert_eq!(config.free_slots(), 1);
+	assert!(config.floor_is_free());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

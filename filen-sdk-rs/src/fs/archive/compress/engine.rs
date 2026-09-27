@@ -253,10 +253,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	};
 
 	reporter.set_phase(CompressPhase::WaitingForWorker);
-	let admitted = control
-		.until_stopping(async { (config.lease().await, config.floor().await) })
-		.await;
-	let Ok((_lease, floor)) = admitted else {
+	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
 		reporter.set_cancelling();
 		return Err(fail(report, CompressPhase::Cancelled, cancelled()));
 	};

@@ -17,7 +17,8 @@
 //! Pausing stops everything new: no chunk fetched or uploaded, no directory created, no event
 //! taken from the codec, which parks. In-flight work finishes; then the job gives back its floor
 //! and prefetched chunks and reports itself paused, holding no drive lock and no memory
-//! reservation. The codec keeps its own state resident while paused.
+//! reservation. The codec keeps its own state resident while paused, and so the job keeps its
+//! slot; a job paused before it got one waits without taking it.
 //!
 //! Cancelling drops the transfers in flight at once (a file only becomes visible when it is
 //! registered) but lets directory creates and registrations in flight finish, so every item
@@ -329,10 +330,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		return Err(fail(report, ExtractPhase::Failed, error));
 	}
 	// Leased and floored before the codec starts, so a waiting job holds nothing.
-	let admitted = control
-		.until_stopping(async { (config.lease().await, config.floor().await) })
-		.await;
-	let Ok((_lease, floor)) = admitted else {
+	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
 		reporter.set_cancelling();
 		return Err(fail(report, ExtractPhase::Cancelled, cancelled()));
 	};
