@@ -1,9 +1,18 @@
+use std::{sync::Mutex, time::Duration};
+
 use chrono::Utc;
 use filen_types::fs::ParentUuid;
 
-use super::*;
+use super::{
+	uniffi_impl::{
+		CompressItemsCallback, ExtractArchiveCallback, ListArchiveCallback, deliver_compress,
+		deliver_extract, deliver_list,
+	},
+	*,
+};
 use crate::{
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	fs::drive_job::plan::RenameReason,
 	fs::{
 		HasUUID,
 		archive::{
@@ -16,18 +25,22 @@ use crate::{
 			RemoteDirectory, RootDirectory,
 			meta::{DecryptedDirectoryMeta, DirectoryMeta},
 		},
-		file::meta::{DecryptedFileMeta, FileMeta},
+		file::{
+			meta::{DecryptedFileMeta, FileMeta},
+			traits::HasFileInfo,
+		},
 	},
 	job::report::JobFailed,
-	js::Root,
+	js::{Root, spawn_ordered_dispatch},
 };
 
-fn remote_file() -> RemoteFile {
+/// An archive of `size` bytes in the user's drive.
+fn remote_file_of(size: u64) -> RemoteFile {
 	RemoteFile::from_meta(
 		Uuid::new_v4(),
 		filen_types::fs::StableUuid::new_for_test(Uuid::new_v4()),
 		Uuid::new_v4().into(),
-		10,
+		size,
 		1,
 		"de-1",
 		"bucket",
@@ -35,7 +48,7 @@ fn remote_file() -> RemoteFile {
 		false,
 		FileMeta::Decoded(DecryptedFileMeta {
 			name: Cow::Borrowed("a.zip"),
-			size: 10,
+			size,
 			mime: Cow::Borrowed("application/zip"),
 			key: FileKey::V3(EncryptionKey::generate()),
 			last_modified: Utc::now(),
@@ -43,6 +56,10 @@ fn remote_file() -> RemoteFile {
 			hash: None,
 		}),
 	)
+}
+
+fn remote_file() -> RemoteFile {
+	remote_file_of(10)
 }
 
 fn dir() -> RemoteDirectory {
@@ -332,12 +349,16 @@ fn a_names_extension_tells_what_it_holds() {
 #[test]
 fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 	let removal = Arc::new(Error::custom(ErrorKind::Server, "no"));
+	let misleading = ExtractMisleadingName {
+		entry: entry_id(2),
+		path: "invoice\u{202E}fdp.exe".into(),
+	};
 	let report = extract::ExtractReport {
 		top_level: Vec::new(),
-		failures: Vec::new(),
+		failures: vec![failure(ErrorKind::MaxStorageReached)],
 		skipped: Vec::new(),
 		renamed: Vec::new(),
-		misleading_names: Vec::new(),
+		misleading_names: vec![misleading.clone()],
 		omitted: OmittedRecords::default(),
 		totals: ArchiveTotals::Streaming { archive_bytes: 0 },
 		counts: ItemCounts::default(),
@@ -368,6 +389,18 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 		error: Arc::clone(&ended),
 	});
 	assert!(Arc::ptr_eq(report.error.as_ref().unwrap(), &ended));
+	assert_eq!(report.misleading_names, [misleading]);
+	let [failed] = report.failures.as_slice() else {
+		panic!("one failure");
+	};
+	assert_eq!(
+		(failed.retry.clone(), failed.error.kind()),
+		(
+			failure(ErrorKind::Server).retry,
+			ErrorKind::MaxStorageReached
+		),
+		"a failure keeps where to retry it"
+	);
 	let [first, second] = report.dispositions.as_slice() else {
 		panic!("two dispositions");
 	};
@@ -387,5 +420,363 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 		CompressReport::from(compress::CompressReport::default())
 			.error
 			.is_none()
+	);
+}
+
+const ARCHIVE: Uuid = Uuid::from_u128(0xa);
+
+fn entry_id(index: u32) -> ArchiveEntryId {
+	ArchiveEntryId {
+		archive: ARCHIVE,
+		index,
+	}
+}
+
+fn failure(kind: ErrorKind) -> extract::ExtractFailure {
+	extract::ExtractFailure {
+		entry: entry_id(3),
+		path: "docs/a.txt".into(),
+		dest_parent: Uuid::from_u128(0xd),
+		dest_name: "a.txt".into(),
+		stage: ExtractStage::Upload,
+		retry: ExtractRetry {
+			destination: Uuid::from_u128(0xd),
+			base: "docs".into(),
+		},
+		error: Arc::new(Error::custom(kind, "failed")),
+	}
+}
+
+fn extract_update(millis: u64) -> extract::ExtractUpdate {
+	extract::ExtractUpdate {
+		phase: ExtractPhase::Extracting,
+		run_state: RunState::Running,
+		totals: ArchiveTotals::Streaming { archive_bytes: 100 },
+		counts: ItemCounts::default(),
+		bytes_read: 40,
+		active: Vec::new(),
+		events: Vec::new(),
+		bytes_per_second: None,
+		eta: None,
+		active_time: Duration::from_millis(millis),
+	}
+}
+
+fn compress_update(millis: u64) -> compress::CompressUpdate {
+	compress::CompressUpdate {
+		phase: CompressPhase::Compressing,
+		run_state: RunState::Running,
+		scan: ScanProgress::default(),
+		totals: PlanTotals::default(),
+		counts: CompressCounts::default(),
+		active: Vec::new(),
+		events: Vec::new(),
+		bytes_per_second: None,
+		eta: None,
+		active_time: Duration::from_millis(millis),
+	}
+}
+
+fn list_update(millis: u64) -> extract::ListUpdate {
+	extract::ListUpdate {
+		phase: ListPhase::Reading,
+		run_state: RunState::Running,
+		bytes_read: 40,
+		archive_bytes: 100,
+		entries: 1,
+		bytes_per_second: None,
+		eta: None,
+		active_time: Duration::from_millis(millis),
+	}
+}
+
+fn archive_entry(index: u32) -> ArchiveEntry {
+	ArchiveEntry {
+		id: entry_id(index),
+		stored_path: format!("docs/{index}.txt"),
+		stored_path_truncated: false,
+		path: Some(format!("docs/{index}.txt")),
+		kind: extract::ArchiveEntryKind::File,
+		size: Some(u64::from(index) * 3),
+		modified: None,
+		encrypted: false,
+		method: Some("Deflate".into()),
+		skip: None,
+		path_rewritten: false,
+		misleading_name: false,
+		mac_metadata: false,
+	}
+}
+
+#[test]
+fn an_extract_update_reports_milliseconds_and_the_parts_of_its_events() {
+	let dest_uuid = Uuid::from_u128(0xe);
+	let error = Arc::new(Error::custom(ErrorKind::Server, "link"));
+	let update = ExtractUpdate::from(extract::ExtractUpdate {
+		events: vec![
+			extract::ExtractEvent::DirCreated {
+				dest_uuid,
+				dest_parent: Uuid::from_u128(0xd),
+				name: "docs".into(),
+			},
+			extract::ExtractEvent::FileFailed(failure(ErrorKind::MaxStorageReached)),
+			extract::ExtractEvent::PropagationFailed {
+				dest_uuid,
+				error: Arc::clone(&error),
+			},
+		],
+		bytes_per_second: Some(100),
+		eta: Some(Duration::from_millis(1500)),
+		..extract_update(2500)
+	});
+	assert_eq!(
+		(update.eta_ms, update.active_time_ms, update.bytes_read),
+		(Some(1500), 2500, 40)
+	);
+	let [
+		ExtractEvent::DirCreated(created),
+		ExtractEvent::FileFailed(failed),
+		ExtractEvent::PropagationFailed(propagation),
+	] = update.events.as_slice()
+	else {
+		panic!("{:?}", update.events);
+	};
+	assert_eq!(
+		(created.dest_uuid, created.name.as_str()),
+		(dest_uuid, "docs")
+	);
+	assert_eq!(
+		(
+			failed.entry,
+			failed.dest_parent,
+			failed.retry.base.as_str(),
+			failed.error.kind()
+		),
+		(
+			entry_id(3),
+			Uuid::from_u128(0xd),
+			"docs",
+			ErrorKind::MaxStorageReached
+		)
+	);
+	assert_eq!(propagation.dest_uuid, dest_uuid);
+	assert!(
+		Arc::ptr_eq(&propagation.error, &error),
+		"the SDK error itself"
+	);
+}
+
+#[test]
+fn a_compress_update_carries_its_active_file_and_events() {
+	let source_uuid = Uuid::from_u128(0x5);
+	let active = compress::CompressActiveFile {
+		source_uuid,
+		name: "a.txt".into(),
+		path: "docs/a.txt".into(),
+		size: 30,
+		bytes_done: 12,
+	};
+	let update = CompressUpdate::from(compress::CompressUpdate {
+		phase: CompressPhase::Verifying,
+		active: vec![active.clone()],
+		events: vec![
+			compress::CompressEvent::SourceHashMismatch {
+				source_uuid,
+				path: "docs/a.txt".into(),
+			},
+			compress::CompressEvent::Renamed(RenamedEntry {
+				source_uuid,
+				source_path: "/docs/A.txt".into(),
+				name: ValidatedName::try_from("A (1).txt").unwrap(),
+				reason: RenameReason::DuplicateName,
+			}),
+		],
+		eta: Some(Duration::from_millis(700)),
+		..compress_update(900)
+	});
+	assert_eq!(
+		(update.phase, update.eta_ms, update.active_time_ms),
+		(CompressPhase::Verifying, Some(700), 900)
+	);
+	assert_eq!(update.active, [active]);
+	let [
+		CompressEvent::SourceHashMismatch(mismatch),
+		CompressEvent::Renamed(renamed),
+	] = update.events.as_slice()
+	else {
+		panic!("{:?}", update.events);
+	};
+	assert_eq!(
+		*mismatch,
+		HashMismatch {
+			source_uuid,
+			path: "docs/a.txt".into(),
+		},
+		"the event carries the report's record"
+	);
+	assert_eq!(renamed.name.as_ref(), "A (1).txt");
+}
+
+#[test]
+fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
+	let update = ListUpdate::from(extract::ListUpdate {
+		eta: Some(Duration::from_millis(300)),
+		..list_update(1200)
+	});
+	assert_eq!(
+		(update.eta_ms, update.active_time_ms, update.entries),
+		(Some(300), 1200, 1)
+	);
+	let listing = extract::ArchiveListing {
+		format: Some(ArchiveFormat::Zip),
+		password: PasswordCheck::Wrong,
+		entries: vec![archive_entry(0), archive_entry(1)],
+		omitted_entries: 4,
+		totals: ListTotals::default(),
+		unaccounted_bytes: 9,
+		duplicates: None,
+	};
+	let ended = Arc::new(Error::custom(ErrorKind::ArchiveWrongPassword, "wrong"));
+	let failed = ArchiveListing::from(JobFailed {
+		report: listing.clone(),
+		error: Arc::clone(&ended),
+	});
+	assert!(Arc::ptr_eq(failed.error.as_ref().unwrap(), &ended));
+	assert_eq!(
+		(
+			failed.format,
+			failed.password,
+			failed.entries,
+			failed.omitted_entries,
+			failed.unaccounted_bytes
+		),
+		(
+			Some(ArchiveFormat::Zip),
+			PasswordCheck::Wrong,
+			vec![archive_entry(0), archive_entry(1)],
+			4,
+			9
+		)
+	);
+	assert!(ArchiveListing::from(listing).error.is_none());
+}
+
+/// Records what a job delivered, each callback by a number it carries, in the order it came.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<u64>>);
+
+impl Recorder {
+	fn push(&self, value: u64) {
+		self.0.lock().unwrap().push(value);
+	}
+}
+
+impl ExtractArchiveCallback for Recorder {
+	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>) {
+		for item in items {
+			let ExtractTopLevelKey::Entry { id } = item.key else {
+				panic!("an entry at the top");
+			};
+			self.push(u64::from(id.index));
+		}
+	}
+
+	fn on_update(&self, update: ExtractUpdate) {
+		self.push(update.active_time_ms);
+	}
+}
+
+impl CompressItemsCallback for Recorder {
+	fn on_archive_created(&self, archive: File) {
+		let archive: RemoteFile = archive
+			.try_into()
+			.expect("the archive is a file of the drive");
+		self.push(archive.size());
+	}
+
+	fn on_update(&self, update: CompressUpdate) {
+		self.push(update.active_time_ms);
+	}
+}
+
+impl ListArchiveCallback for Recorder {
+	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
+		for entry in entries {
+			self.push(u64::from(entry.id.index));
+		}
+	}
+
+	fn on_update(&self, update: ListUpdate) {
+		self.push(update.active_time_ms);
+	}
+}
+
+/// Delivers what `send` sends, through `deliver` on the shared ordered dispatch, and checks it
+/// all reached the callback, in order, once the sender is dropped (as a job drops it when it
+/// ends).
+fn delivered_in_order<T: Send + 'static>(
+	deliver: fn(&Recorder, T),
+	send: impl FnOnce(UnboundedSender<T>) -> Vec<u64>,
+) {
+	let recorder = Arc::new(Recorder::default());
+	let (sender, delivered) = {
+		let recorder = Arc::clone(&recorder);
+		spawn_ordered_dispatch(move |delivery| deliver(&recorder, delivery))
+	};
+	let expected = send(sender);
+	futures::executor::block_on(delivered).expect("delivery ends once the job drops its sender");
+	assert_eq!(*recorder.0.lock().unwrap(), expected);
+}
+
+#[test]
+fn extract_callbacks_are_delivered_in_order_until_the_job_lets_go() {
+	delivered_in_order(
+		|recorder, delivery| deliver_extract(recorder, delivery),
+		|sender| {
+			let channel = ExtractChannel(sender);
+			(0..300)
+				.inspect(|&i| match i % 2 {
+					0 => channel.on_top_level_created(vec![extract::ExtractedTopLevel {
+						key: ExtractTopLevelKey::Entry {
+							id: entry_id(i as u32),
+						},
+						item: NonRootItemType::Dir(Cow::Owned(dir())),
+					}]),
+					_ => channel.on_update(extract_update(i)),
+				})
+				.collect()
+		},
+	);
+}
+
+#[test]
+fn compress_callbacks_are_delivered_in_order_until_the_job_lets_go() {
+	delivered_in_order(
+		|recorder, delivery| deliver_compress(recorder, delivery),
+		|sender| {
+			let channel = CompressChannel(sender);
+			(0..300)
+				.inspect(|&i| match i % 3 {
+					0 => channel.on_archive_created(remote_file_of(i)),
+					_ => channel.on_update(compress_update(i)),
+				})
+				.collect()
+		},
+	);
+}
+
+#[test]
+fn list_callbacks_are_delivered_in_order_until_the_job_lets_go() {
+	delivered_in_order(
+		|recorder, delivery| deliver_list(recorder, delivery),
+		|sender| {
+			let channel = ListChannel(sender);
+			(0..300)
+				.inspect(|&i| match i % 2 {
+					0 => channel.on_entries(vec![archive_entry(i as u32)]),
+					_ => channel.on_update(list_update(i)),
+				})
+				.collect()
+		},
 	);
 }
