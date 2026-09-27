@@ -28,11 +28,8 @@ use crate::{
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 			password::ArchivePassword,
-			sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
-			zip::{
-				crypto::AesStrength,
-				write::{Encryption, ZipMethod, ZipWriter},
-			},
+			sevenz::write::{SevenZEncryption, SevenZMethod},
+			test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -107,6 +104,12 @@ impl Recorder {
 	}
 }
 
+/// The archive every test extracts, the directory it is in, and the one it is extracted into:
+/// fixed, so a failing test runs the same way again.
+const ARCHIVE: Uuid = Uuid::from_u128(0xA);
+const ARCHIVE_PARENT: Uuid = Uuid::from_u128(0xA0);
+const DESTINATION: Uuid = Uuid::from_u128(0xD);
+
 fn archive_file(name: &str, bytes: &[u8]) -> RemoteFileType<'static> {
 	archive_file_with(name, bytes, None)
 }
@@ -127,9 +130,9 @@ fn archive_file_with(
 		hash,
 	});
 	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		Uuid::new_v4(),
+		ARCHIVE,
 		(),
-		Uuid::new_v4().into(),
+		ARCHIVE_PARENT.into(),
 		size,
 		size.div_ceil(CHUNK_SIZE_U64),
 		"de-1",
@@ -139,35 +142,6 @@ fn archive_file_with(
 		meta,
 	);
 	RemoteFileType::File(Cow::Owned(file))
-}
-
-fn tar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
-	let mut builder = tar::Builder::new(Vec::new());
-	for (path, data) in members {
-		let mut header = tar::Header::new_gnu();
-		header.set_mtime(1_700_000_000);
-		header.set_mode(0o644);
-		if path.ends_with('/') {
-			header.set_entry_type(tar::EntryType::Directory);
-			header.set_size(0);
-			builder.append_data(&mut header, path, &b""[..]).unwrap();
-		} else {
-			header.set_entry_type(tar::EntryType::Regular);
-			header.set_size(data.len() as u64);
-			builder.append_data(&mut header, path, *data).unwrap();
-		}
-	}
-	builder.into_inner().unwrap()
-}
-
-fn gzip(data: &[u8]) -> Vec<u8> {
-	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-	encoder.write_all(data).unwrap();
-	encoder.finish().unwrap()
-}
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
 }
 
 fn hash(data: &[u8]) -> Blake3Hash {
@@ -181,7 +155,7 @@ struct Setup {
 }
 
 fn setup(name: &str, bytes: Vec<u8>, configure: impl FnOnce(&mut FakeBackend)) -> Setup {
-	let destination = Uuid::new_v4();
+	let destination = DESTINATION;
 	let archive = archive_file(name, &bytes);
 	let mut backend = FakeBackend::new(destination);
 	backend.contents.insert(archive.uuid(), bytes);
@@ -200,6 +174,9 @@ struct Job {
 	recorder: Arc<Recorder>,
 	reporter: MaybeArc<Reporter>,
 }
+
+/// The method the tests' 7z archives are compressed with.
+const LZMA2: SevenZMethod = SevenZMethod::Lzma2 { level: 1 };
 
 /// Members a test archive may have, for the codec and the driver alike.
 const MAX_MEMBERS: u64 = 2000;
@@ -830,7 +807,7 @@ async fn a_file_that_fails_is_recorded_once_and_the_rest_extract() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_registered_as_a_version_is_a_failure() {
-	let existing = Uuid::new_v4();
+	let existing = Uuid::from_u128(0xE);
 	let setup = setup(
 		"bundle.tar",
 		tar_of(&[("a.txt", b"a"), ("b.txt", b"b")]),
@@ -1204,7 +1181,7 @@ fn disposable(
 	hash: Option<Blake3Hash>,
 	configure: impl FnOnce(&mut FakeBackend),
 ) -> (Setup, Uuid) {
-	let parent = Uuid::new_v4();
+	let parent = ARCHIVE_PARENT;
 	let mut s = setup("bundle.tar", bytes.clone(), configure);
 	let archive = archive_file_with("bundle.tar", &bytes, hash);
 	let backend = Arc::get_mut(&mut s.backend).unwrap();
@@ -1625,7 +1602,7 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	setup
 		.backend
-		.place_file(setup.archive.uuid(), Uuid::new_v4(), tar.len() as u64);
+		.place_file(setup.archive.uuid(), Uuid::from_u128(0xF), tar.len() as u64);
 	let job = start(
 		&setup,
 		Options {
@@ -1655,33 +1632,6 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 		KeptReason::Unconfirmed
 	));
 	assert!(setup.backend.log().deleted_files.is_empty());
-}
-
-fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
-	let mut writer = ZipWriter::new(Vec::new());
-	for (path, data) in entries {
-		match data {
-			None => writer.add_dir(path, None).unwrap(),
-			Some(data) => {
-				let encryption = password.map(|password| Encryption {
-					password,
-					strength: AesStrength::Aes128,
-					salt: vec![1; 8],
-				});
-				writer
-					.add_file(
-						path,
-						None,
-						data.len() as u64,
-						ZipMethod::Deflate { level: 6 },
-						encryption,
-						&mut &data[..],
-					)
-					.unwrap();
-			}
-		}
-	}
-	writer.finish().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1757,34 +1707,6 @@ async fn a_zip_with_duplicate_names_is_kept() {
 	assert!(setup.backend.log().trashed_files.is_empty());
 }
 
-fn sevenz_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) -> Vec<u8> {
-	let password: Option<Vec<u8>> =
-		password.map(|password| password.encode_utf16().flat_map(u16::to_le_bytes).collect());
-	let mut writer = SevenZWriter::with_cycles_power(
-		Vec::new(),
-		SevenZMethod::Lzma2 { level: 1 },
-		true,
-		password
-			.as_deref()
-			.map(|password| (SevenZEncryption::EntriesAndHeaders, password)),
-		4,
-	)
-	.unwrap();
-	for (path, data) in entries {
-		match data {
-			None => writer.add_dir(path, None),
-			Some(data) => {
-				writer
-					.add_file(path, None, data.len() as u64, &mut &data[..])
-					.unwrap();
-			}
-		}
-	}
-	let (mut archive, start) = writer.finish().unwrap();
-	archive[..32].copy_from_slice(&start);
-	archive
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracts_an_encrypted_7z_and_removes_it() {
 	let big = pattern(2 * CHUNK_SIZE + 5, 6);
@@ -1794,7 +1716,9 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 			("docs/a.txt", Some(b"alpha")),
 			("docs/big.bin", Some(&big)),
 		],
-		Some("pw"),
+		LZMA2,
+		true,
+		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
 	);
 	// a 7z's entries are checked one by one, so no hash of the whole archive is needed
 	let (setup, parent) = disposable(archive, None, |_| {});
@@ -1834,7 +1758,7 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 	];
 	for (name, archive) in [
 		("s.zip", zip_of(&entries, None)),
-		("s.7z", sevenz_of(&entries, None)),
+		("s.7z", sevenz_of(&entries, LZMA2, true, None)),
 	] {
 		// what the index states, 9 bytes, reaches the limit
 		let refused = setup(name, archive.clone(), |_| {});
@@ -1863,7 +1787,7 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 	];
 	for (name, archive) in [
 		("u.zip", zip_of(&with_unsafe, None)),
-		("u.7z", sevenz_of(&with_unsafe, None)),
+		("u.7z", sevenz_of(&with_unsafe, LZMA2, true, None)),
 	] {
 		let setup = setup(name, archive, |_| {});
 		let options = Options {
@@ -1878,7 +1802,12 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_7z_with_a_wrong_password_creates_nothing() {
-	let archive = sevenz_of(&[("a.txt", Some(b"a"))], Some("pw"));
+	let archive = sevenz_of(
+		&[("a.txt", Some(b"a"))],
+		LZMA2,
+		true,
+		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
+	);
 	let setup = setup("s.7z", archive, |_| {});
 	let options = Options {
 		password: Some(ArchivePassword::new("nope".into()).unwrap()),
@@ -1895,7 +1824,12 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 	// the longest password there is, in UTF-16 surrogate pairs: 4 KiB hashed 2^22 times, most of
 	// a minute on wasm and seconds here
 	let password = "\u{1F600}".repeat(1024);
-	let mut archive = sevenz_of(&[("a.txt", Some(b"a"))], Some(&password));
+	let mut archive = sevenz_of(
+		&[("a.txt", Some(b"a"))],
+		LZMA2,
+		true,
+		Some((SevenZEncryption::EntriesAndHeaders, &password)),
+	);
 	// written at 2^4 rounds to be quick to make; the header key is read at 2^22. Its AES coder's
 	// properties sit in the plain part of the header: the rounds, then salt and IV
 	let aes = [0x06, 0xF1, 0x07, 0x01, 34, 0xC0 | 4, 0xFF];
@@ -2035,15 +1969,7 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	// too large (incompressible, so compressed too) to check the password on up front: it
 	// shows once the entry is opened
-	let mut state = 0x9E37_79B9_7F4A_7C15u64;
-	let big: Vec<u8> = (0..17 << 20)
-		.map(|_| {
-			state ^= state << 13;
-			state ^= state >> 7;
-			state ^= state << 17;
-			state as u8
-		})
-		.collect();
+	let big = incompressible(17 << 20, 0x9E37_79B9_7F4A_7C15);
 	let zip = zip_of(
 		&[("docs", None), ("docs/big.bin", Some(&big))],
 		Some(b"right"),

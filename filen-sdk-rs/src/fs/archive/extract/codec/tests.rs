@@ -17,12 +17,9 @@ use crate::{
 		extract::ExpansionLimit,
 		format::StreamCodec,
 		password::ArchivePassword,
-		sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+		sevenz::write::{SevenZEncryption, SevenZMethod},
+		test_support::{gzip, pattern, sevenz_of, zip_of},
 		worker,
-		zip::{
-			crypto::AesStrength,
-			write::{Encryption, ZipMethod, ZipWriter},
-		},
 	},
 };
 
@@ -232,12 +229,6 @@ fn sample_seen() -> Vec<Seen> {
 		),
 		Seen::Skipped(4, "../evil".into(), 4, ExtractSkipReason::UnsafePath),
 	]
-}
-
-fn gzip(data: &[u8]) -> Vec<u8> {
-	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-	encoder.write_all(data).unwrap();
-	encoder.finish().unwrap()
 }
 
 fn kind(result: Result<ArchiveEnd, Error>) -> ErrorKind {
@@ -529,37 +520,6 @@ fn the_codec_stops_once_its_driver_is_gone() {
 	}
 }
 
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
-}
-
-fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
-	let mut writer = ZipWriter::new(Vec::new());
-	for (path, data) in entries {
-		match data {
-			None => writer.add_dir(path, None).unwrap(),
-			Some(data) => {
-				let encryption = password.map(|password| Encryption {
-					password,
-					strength: AesStrength::Aes256,
-					salt: vec![9; 16],
-				});
-				writer
-					.add_file(
-						path,
-						None,
-						data.len() as u64,
-						ZipMethod::Deflate { level: 6 },
-						encryption,
-						&mut &data[..],
-					)
-					.unwrap();
-			}
-		}
-	}
-	writer.finish().unwrap()
-}
-
 fn zip_sample() -> (Vec<u8>, Vec<Seen>) {
 	let big = pattern(CHUNK_SIZE + 99, 4);
 	let zip = zip_of(
@@ -723,38 +683,6 @@ fn bytes_after_a_zips_end_record_are_unaccounted() {
 	let (seen, end) = run(&zip, "padded.zip");
 	assert_eq!(seen, expected);
 	assert_eq!(end.unwrap().unaccounted_bytes, 100);
-}
-
-/// A 7z of `entries` (a `None` is a directory), with keys cheap to derive.
-fn sevenz_of(
-	entries: &[(&str, Option<&[u8]>)],
-	method: SevenZMethod,
-	solid: bool,
-	encryption: Option<(SevenZEncryption, &str)>,
-) -> Vec<u8> {
-	let password: Option<Vec<u8>> = encryption
-		.map(|(_, password)| password.encode_utf16().flat_map(u16::to_le_bytes).collect());
-	let mut writer = SevenZWriter::with_cycles_power(
-		Vec::new(),
-		method,
-		solid,
-		encryption.map(|(what, _)| (what, &password.as_ref().unwrap()[..])),
-		4,
-	)
-	.unwrap();
-	for (path, data) in entries {
-		match data {
-			None => writer.add_dir(path, None),
-			Some(data) => {
-				writer
-					.add_file(path, None, data.len() as u64, &mut &data[..])
-					.unwrap();
-			}
-		}
-	}
-	let (mut archive, start) = writer.finish().unwrap();
-	archive[..32].copy_from_slice(&start);
-	archive
 }
 
 #[test]

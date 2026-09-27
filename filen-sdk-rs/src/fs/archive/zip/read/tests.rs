@@ -10,7 +10,10 @@ use chrono::TimeZone;
 use zip8::{AesMode, CompressionMethod, write::SimpleFileOptions};
 
 use super::*;
-use crate::fs::archive::zip::write::{Encryption, ZipMethod, ZipWriter};
+use crate::fs::archive::{
+	test_support::pattern,
+	zip::write::{Encryption, ZipMethod, ZipWriter},
+};
 
 const LIMITS: ZipLimits = ZipLimits {
 	max_index_bytes: 32 << 20,
@@ -20,10 +23,6 @@ const LIMITS: ZipLimits = ZipLimits {
 const ENTRY: EntryLimits = EntryLimits {
 	decoder_memory: 64 << 20,
 };
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
-}
 
 /// Every entry of `zip`, read through the reader: name, kind and data.
 fn read_all(

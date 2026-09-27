@@ -9,17 +9,16 @@ use sevenz_rust2::{
 };
 
 use super::*;
-use crate::fs::archive::sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter};
+use crate::fs::archive::{
+	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+	test_support::pattern,
+};
 
 const LIMITS: SevenZLimits = SevenZLimits {
 	max_index_bytes: 32 << 20,
 	max_entries: 1_000_000,
 	decoder_memory: 256 << 20,
 };
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| ((i * 7) % 251) as u8 ^ seed).collect()
-}
 
 fn utf16(password: &str) -> Vec<u8> {
 	password.encode_utf16().flat_map(u16::to_le_bytes).collect()

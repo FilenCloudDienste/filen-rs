@@ -11,6 +11,7 @@ use lzma_rust2::{
 };
 
 use super::*;
+use crate::fs::archive::test_support::gzip;
 
 const MIB: u64 = 1024 * 1024;
 const BUDGET: u64 = 64 * MIB;
@@ -67,12 +68,6 @@ const UNVERIFIABLE: StreamEnd = StreamEnd {
 	check: StreamCheck::Unverifiable,
 	unaccounted_bytes: 0,
 };
-
-fn gzip(data: &[u8]) -> Vec<u8> {
-	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-	encoder.write_all(data).unwrap();
-	encoder.finish().unwrap()
-}
 
 fn bzip2(data: &[u8]) -> Vec<u8> {
 	let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
