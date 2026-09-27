@@ -18,7 +18,10 @@ use crate::{
 	},
 };
 
-pub use crate::fs::archive::{format::archive_default_name, password::ArchivePassword};
+pub use crate::fs::{
+	archive::{format::archive_default_name, password::ArchivePassword},
+	drive_job::counts::ItemCounts,
+};
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport,

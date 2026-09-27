@@ -34,7 +34,10 @@ use crate::{
 			encode::Compression,
 			format::StreamCodec,
 			password::ArchivePassword,
-			sevenz::write::{SevenZEncryption, SevenZMethod},
+			sevenz::{
+				read::{FolderCursor, Keys, SevenZLimits, read_index},
+				write::{SevenZEncryption, SevenZMethod},
+			},
 			tar_iter::TarReader,
 			worker,
 			zip::{crypto::AesStrength, write::ZipMethod},
@@ -42,6 +45,7 @@ use crate::{
 		dir::RootDirectory,
 		drive_job::{
 			backend::ListedNames,
+			plan::{PlanTotals, SkipReason, SkippedEntry},
 			test_support::{FakeBackend, Quirk, Request, wait_until},
 		},
 		file::{
@@ -162,6 +166,8 @@ struct Setup {
 	hold_archive: bool,
 	/// Requests held once the archive is registered (a source's fetches are never held).
 	hold_after_registering: Vec<(Request, Uuid)>,
+	/// The archive settings the job runs under, whose slots jobs sharing them share.
+	config: ArchiveConfig,
 }
 
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
@@ -208,6 +214,7 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 		password: None,
 		hold_archive: false,
 		hold_after_registering: Vec::new(),
+		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 	}
 }
 
@@ -259,7 +266,7 @@ fn start_disposing(
 	});
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
-	let config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
+	let config = setup.config.clone();
 	let read_back = disposal
 		.as_ref()
 		.map(|_| ReadBack::as_extracting(&setup.entries, &config, setup.password.clone()));
@@ -811,10 +818,10 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	// an entry that was skipped while planning
 	let setup_skipped = setup(|_, _| {});
 	let skipped = CompressReport {
-		skipped: vec![crate::fs::drive_job::plan::SkippedEntry {
+		skipped: vec![SkippedEntry {
 			source_path: "docs/secret".into(),
 			bytes: 1,
-			reason: crate::fs::drive_job::plan::SkipReason::UndecryptableFile {
+			reason: SkipReason::UndecryptableFile {
 				uuid: Uuid::new_v4(),
 			},
 		}],
@@ -846,7 +853,6 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 
 /// The entries of a 7z read back through the SDK's reader, every CRC-32 checked.
 fn sevenz_entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
-	use crate::fs::archive::sevenz::read::{FolderCursor, Keys, SevenZLimits, read_index};
 	let limits = SevenZLimits {
 		max_index_bytes: 1 << 20,
 		max_entries: 100,
@@ -1574,6 +1580,52 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compress_paused_before_it_starts_takes_no_slot() {
+	let mut setup_paused = setup(|_, _| {});
+	setup_paused.config = ArchiveConfig::new(CODEC_MEM_BUDGET, 1);
+	let (pause, _cancel, control) = controls();
+	pause.send_replace(true);
+	let paused = start(&setup_paused, "paused.tgz", gzip_tar(), control, None);
+	wait_until("the job reports itself paused", || {
+		paused.reporter.is_paused()
+	})
+	.await;
+
+	// the only slot is free for a job started later
+	let mut setup_other = setup(|_, _| {});
+	setup_other.config = setup_paused.config.clone();
+	let other = start(
+		&setup_other,
+		"other.tgz",
+		gzip_tar(),
+		JobControl::default(),
+		None,
+	);
+	tokio::time::timeout(Duration::from_secs(20), other.running)
+		.await
+		.expect("the unpaused job runs")
+		.unwrap()
+		.unwrap();
+	assert!(setup_paused.backend.log().fetched.is_empty());
+	assert!(paused.reporter.is_paused());
+	assert_eq!(
+		paused.recorder.last().phase,
+		CompressPhase::WaitingForWorker
+	);
+	assert_eq!(setup_paused.config.free_slots(), 1);
+
+	pause.send_replace(false);
+	let report = paused.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 3);
+	assert_eq!(
+		run_states(&paused.recorder),
+		[RunState::Paused, RunState::Running]
+	);
+	assert_released(&setup_paused, &paused.reporter);
+	assert!(setup_paused.config.floor_is_free());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	let setup_paused = setup(|backend, _| {
 		// the job is still reading when the pause comes
@@ -1899,7 +1951,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	);
 	// the plan's totals, which the engine is handed with its report
 	let sources: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
-	let totals = crate::fs::drive_job::plan::PlanTotals {
+	let totals = PlanTotals {
 		dirs: 1,
 		files: 3,
 		bytes: sources,

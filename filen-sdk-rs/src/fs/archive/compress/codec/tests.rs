@@ -16,10 +16,10 @@ use crate::{
 		encode::Compression,
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
-		worker,
+		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
-			read::{EntryLimits, ZipKind, ZipLimits, open_entry, read_index},
+			read::{EntryLimits, ZipEntry, ZipKind, ZipLimits, open_entry, read_index},
 			write::ZipMethod,
 		},
 	},
@@ -55,7 +55,20 @@ fn run_with(
 		entries,
 		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
 	};
-	let mut link = worker::start(move |port| compress(&port, job)).unwrap();
+	drive(
+		worker::start(move |port| compress(&port, job)).unwrap(),
+		sources,
+		short,
+	)
+}
+
+/// Answers the codec's asks from `sources` until it returns; `short` sources answer one byte
+/// short.
+fn drive(
+	mut link: WorkerLink<Result<u64, Error>>,
+	sources: &HashMap<u32, Vec<u8>>,
+	short: Option<u32>,
+) -> Written {
 	let mut written = Written {
 		archive: Vec::new(),
 		chunks: Vec::new(),
@@ -466,6 +479,132 @@ fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
 				"{case}"
 			);
 		}
+	}
+}
+
+/// A zip entry's records around its data, as its local header and data descriptor state them.
+#[derive(Debug, PartialEq)]
+struct EntryRecords {
+	/// The local header's compressed size and size fields.
+	local_sizes: (u32, u32),
+	/// The data of the local header's zip64 extra field, if it has one.
+	local_zip64: Option<Vec<u8>>,
+	/// The data descriptor's compressed size and size, and whether they are 8 bytes each.
+	descriptor: (u64, u64, bool),
+}
+
+/// The records of the file `entry` of `archive`, reading its descriptor as zip64 when `zip64`.
+fn entry_records(archive: &[u8], entry: &ZipEntry, zip64: bool) -> EntryRecords {
+	const ZIP64_EXTRA_ID: u16 = 0x0001;
+	const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
+	let u16_at = |at: usize| u16::from_le_bytes(archive[at..at + 2].try_into().unwrap());
+	let u32_at = |at: usize| u32::from_le_bytes(archive[at..at + 4].try_into().unwrap());
+	let u64_at = |at: usize| u64::from_le_bytes(archive[at..at + 8].try_into().unwrap());
+	let at = usize::try_from(entry.header_offset).unwrap();
+	let name_len = usize::from(u16_at(at + 26));
+	let extra_len = usize::from(u16_at(at + 28));
+	let mut extra = &archive[at + 30 + name_len..at + 30 + name_len + extra_len];
+	let mut local_zip64 = None;
+	while !extra.is_empty() {
+		let (id, len) = (
+			u16::from_le_bytes([extra[0], extra[1]]),
+			usize::from(u16::from_le_bytes([extra[2], extra[3]])),
+		);
+		if id == ZIP64_EXTRA_ID {
+			local_zip64 = Some(extra[4..4 + len].to_vec());
+		}
+		extra = &extra[4 + len..];
+	}
+	let descriptor =
+		at + 30 + name_len + extra_len + usize::try_from(entry.compressed_size).unwrap();
+	assert_eq!(u32_at(descriptor), DATA_DESCRIPTOR_SIG, "{}", entry.name);
+	EntryRecords {
+		local_sizes: (u32_at(at + 18), u32_at(at + 22)),
+		local_zip64,
+		descriptor: if zip64 {
+			(u64_at(descriptor + 8), u64_at(descriptor + 16), true)
+		} else {
+			(
+				u64::from(u32_at(descriptor + 8)),
+				u64::from(u32_at(descriptor + 12)),
+				false,
+			)
+		},
+	}
+}
+
+#[test]
+fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
+	// lowered from 4 GiB, so the sample's file over a chunk is written as an entry that large
+	// is, and its small files as they are
+	const ZIP64_FROM: u64 = CHUNK_SIZE_U64;
+	for (method, encryption) in [
+		(ZipMethod::Stored, None),
+		(ZipMethod::Deflate { level: 6 }, Some(AesStrength::Aes256)),
+		(ZipMethod::Bzip2 { level: 1 }, None),
+	] {
+		let (entries, sources, members) = sample();
+		let password = encryption.map(|_| ArchivePassword::new("zip64".to_owned()).unwrap());
+		let job = CompressJob {
+			format: CompressFormat::Zip { method, encryption },
+			entries,
+			password: password.clone(),
+		};
+		let written = drive(
+			worker::start(move |port| {
+				compress_with(&port, job, |sink| ZipWriter::past(sink, 0, ZIP64_FROM))
+			})
+			.unwrap(),
+			&sources,
+			None,
+		);
+		let case = format!("{method:?} {encryption:?}");
+		assert_eq!(
+			written.result.unwrap(),
+			written.archive.len() as u64,
+			"{case}"
+		);
+		assert_eq!(written.file_ends, 4, "{case}");
+
+		// a zip64 entry's local header leaves its sizes to its zip64 data descriptor, and
+		// carries the zip64 field that says so; every other entry's leaves them at 0
+		let mut source = std::io::Cursor::new(&written.archive[..]);
+		let index = read_index(
+			&mut source,
+			written.archive.len() as u64,
+			ZipLimits {
+				max_index_bytes: 1 << 20,
+				max_entries: 100,
+			},
+		)
+		.unwrap();
+		let mut zip64_entries = Vec::new();
+		for entry in index.entries.iter().filter(|e| e.kind == ZipKind::File) {
+			let zip64 = entry.size >= ZIP64_FROM;
+			if zip64 {
+				zip64_entries.push(entry.name.as_str());
+			}
+			assert_eq!(
+				entry_records(&written.archive, entry, zip64),
+				EntryRecords {
+					local_sizes: if zip64 { (u32::MAX, u32::MAX) } else { (0, 0) },
+					local_zip64: zip64.then(|| vec![0; 16]),
+					descriptor: (entry.compressed_size, entry.size, zip64),
+				},
+				"{} {case}",
+				entry.name
+			);
+		}
+		assert_eq!(zip64_entries, ["big.bin"], "{case}");
+
+		let expected = members_as_entries(&members);
+		let password = password.as_ref().map(ArchivePassword::as_bytes);
+		assert_eq!(our_entries(&written.archive, password), expected, "{case}");
+		assert_eq!(
+			zip_crate_entries(&written.archive, password),
+			expected,
+			"{case}"
+		);
 	}
 }
 

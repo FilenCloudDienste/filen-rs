@@ -4,6 +4,7 @@
 //! hold instead of running out of memory.
 
 use std::{
+	fmt,
 	io::{self, Write},
 	ops::RangeInclusive,
 };
@@ -43,6 +44,26 @@ impl StreamCodec {
 	}
 }
 
+/// `level`, refused with [`ErrorKind::InvalidState`] when outside `levels`, the levels `what`
+/// takes.
+pub(super) fn check_level(
+	what: impl fmt::Display,
+	levels: RangeInclusive<u32>,
+	level: u32,
+) -> Result<u32, Error> {
+	if levels.contains(&level) {
+		return Ok(level);
+	}
+	Err(Error::custom(
+		ErrorKind::InvalidState,
+		format!(
+			"{what} takes levels {} to {}, not {level}",
+			levels.start(),
+			levels.end()
+		),
+	))
+}
+
 /// The brotli window: 4 MiB, a common default that keeps the encoder's memory modest.
 const BROTLI_LGWIN: u32 = 22;
 
@@ -61,16 +82,7 @@ impl Compression {
 		let (levels, default) = self.codec.levels();
 		match self.level {
 			None => Ok(default),
-			Some(level) if levels.contains(&level) => Ok(level),
-			Some(level) => Err(Error::custom(
-				ErrorKind::InvalidState,
-				format!(
-					"{:?} takes levels {} to {}, not {level}",
-					self.codec,
-					levels.start(),
-					levels.end()
-				),
-			)),
+			Some(level) => check_level(format_args!("{:?}", self.codec), levels, level),
 		}
 	}
 
@@ -270,7 +282,10 @@ mod tests {
 	use std::io::Read;
 
 	use super::*;
-	use crate::fs::archive::decode::{StreamCheck, open_stream};
+	use crate::fs::archive::{
+		alloc_meter::peak_bytes,
+		decode::{StreamCheck, open_stream},
+	};
 
 	const CODECS: [StreamCodec; 8] = [
 		StreamCodec::Gzip,
@@ -394,7 +409,7 @@ mod tests {
 		for &level in levels {
 			let compression = Compression { codec, level };
 			let stated = compression.encoder_memory().unwrap();
-			let (_, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+			let (_, peak) = peak_bytes(|| {
 				let mut encoder = open_encoder(compression, io::sink()).unwrap();
 				encoder.write_all(&input).unwrap();
 				encoder.finish().unwrap();
@@ -451,7 +466,7 @@ mod tests {
 				(state >> 24).to_le_bytes()[0]
 			})
 			.collect();
-		let ((), peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+		let ((), peak) = peak_bytes(|| {
 			let mut encoder = open_encoder(compression, io::sink()).unwrap();
 			encoder.write_all(&noise).unwrap();
 			encoder.finish().unwrap();

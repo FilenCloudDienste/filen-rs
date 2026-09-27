@@ -29,9 +29,10 @@ pub use crate::job::report::RunState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub enum CompressPhase {
-	/// Listing the sources.
+	/// Listing the sources. A job paused before it starts waits here, having listed nothing.
 	Scanning,
-	/// Waiting for another archive job to finish; nothing is held meanwhile.
+	/// Waiting for another archive job to finish; nothing is held meanwhile, and the destination
+	/// is only checked once the wait is over.
 	WaitingForWorker,
 	/// Reading the sources into the archive and uploading it.
 	Compressing,

@@ -4,10 +4,18 @@
 //! at the end: [`SevenZWriter::finish`] returns it for the caller to patch over the 32 zero bytes
 //! the archive starts with.
 
-use std::io::{self, Read, Write};
+use std::{
+	io::{self, Read, Write},
+	ops::RangeInclusive,
+};
 
 use chrono::{DateTime, Utc};
 use filen_macros::js_type;
+
+use crate::{
+	Error,
+	fs::archive::encode::{check_level, lzma_encoder_memory},
+};
 
 use super::{
 	crypto::{AesCbcWriter, AesProps, Key, WRITE_CYCLES_POWER, derive_key},
@@ -26,8 +34,6 @@ const HEADER_LEVEL: u32 = 6;
 
 /// The memory compressing a packed header takes, as [`lzma_encoder_memory`] states it for its
 /// dictionary.
-///
-/// [`lzma_encoder_memory`]: crate::fs::archive::encode::lzma_encoder_memory
 pub(crate) fn header_encoder_memory() -> u64 {
 	12 * u64::from(HEADER_DICT_BYTES) + (1 << 20)
 }
@@ -69,21 +75,29 @@ pub enum SevenZMethod {
 }
 
 impl SevenZMethod {
-	/// The method's level, checked against its range.
-	pub(crate) fn check(self) -> Result<(), &'static str> {
-		let (level, range) = match self {
-			Self::Copy => return Ok(()),
-			Self::Lzma2 { level } | Self::Lzma { level } => (level, 0..=9),
-			Self::Ppmd { level } | Self::Bzip2 { level } | Self::Deflate { level } => {
-				(level, 1..=9)
-			}
-		};
-		if range.contains(&level) {
-			Ok(())
-		} else if range.start() == &0 {
-			Err("7z LZMA and LZMA2 take levels 0 to 9")
-		} else {
-			Err("7z PPMd, BZip2 and Deflate take levels 1 to 9")
+	/// The method's name, its level and the levels it takes; `None` for
+	/// [`SevenZMethod::Copy`], which has none.
+	fn leveled(self) -> Option<(&'static str, u32, RangeInclusive<u32>)> {
+		match self {
+			Self::Copy => None,
+			Self::Lzma2 { level } => Some(("7z LZMA2", level, 0..=9)),
+			Self::Lzma { level } => Some(("7z LZMA", level, 0..=9)),
+			Self::Ppmd { level } => Some(("7z PPMd", level, 1..=9)),
+			Self::Bzip2 { level } => Some(("7z BZip2", level, 1..=9)),
+			Self::Deflate { level } => Some(("7z Deflate", level, 1..=9)),
+		}
+	}
+
+	/// The levels the method takes; `None` for [`SevenZMethod::Copy`], which has none.
+	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+		self.leveled().map(|(_, _, levels)| levels)
+	}
+
+	/// The method's level, checked against its [levels](SevenZMethod::levels).
+	pub(crate) fn check(self) -> Result<(), Error> {
+		match self.leveled() {
+			None => Ok(()),
+			Some((name, level, levels)) => check_level(name, levels, level).map(drop),
 		}
 	}
 
@@ -91,9 +105,7 @@ impl SevenZMethod {
 	pub(crate) fn encoder_memory(self) -> u64 {
 		match self {
 			Self::Copy => 0,
-			Self::Lzma2 { level } | Self::Lzma { level } => {
-				crate::fs::archive::encode::lzma_encoder_memory(level)
-			}
+			Self::Lzma2 { level } | Self::Lzma { level } => lzma_encoder_memory(level),
 			Self::Ppmd { level } => u64::from(ppmd_memory(level)) + (1 << 20),
 			// bzip2's documented compression memory: 400 kB + 8 × the block size
 			Self::Bzip2 { level } => 400_000 + 8 * u64::from(level) * 100_000,
@@ -765,6 +777,8 @@ fn write_streams(
 
 #[cfg(test)]
 mod tests {
+	use crate::ErrorKind;
+
 	use super::*;
 
 	#[test]
@@ -778,12 +792,33 @@ mod tests {
 	}
 
 	#[test]
-	fn levels_are_checked() {
-		assert!(SevenZMethod::Copy.check().is_ok());
-		assert!(SevenZMethod::Lzma2 { level: 0 }.check().is_ok());
-		assert!(SevenZMethod::Lzma2 { level: 10 }.check().is_err());
-		assert!(SevenZMethod::Ppmd { level: 0 }.check().is_err());
-		assert!(SevenZMethod::Deflate { level: 9 }.check().is_ok());
+	fn levels_are_stated_and_checked() {
+		assert_eq!(SevenZMethod::Copy.levels(), None);
+		SevenZMethod::Copy.check().unwrap();
+		// each method at a level, and the levels it takes
+		type AtLevel = fn(u32) -> SevenZMethod;
+		let methods: [(AtLevel, _); 5] = [
+			(|level| SevenZMethod::Lzma2 { level }, 0..=9),
+			(|level| SevenZMethod::Lzma { level }, 0..=9),
+			(|level| SevenZMethod::Ppmd { level }, 1..=9),
+			(|level| SevenZMethod::Bzip2 { level }, 1..=9),
+			(|level| SevenZMethod::Deflate { level }, 1..=9),
+		];
+		for (method, levels) in methods {
+			assert_eq!(method(5).levels(), Some(levels.clone()), "{:?}", method(5));
+			// both ends are taken, one past either is refused
+			method(*levels.start()).check().unwrap();
+			method(*levels.end()).check().unwrap();
+			let below = levels.start().checked_sub(1);
+			for outside in below.into_iter().chain([levels.end() + 1]) {
+				assert_eq!(
+					method(outside).check().unwrap_err().kind(),
+					ErrorKind::InvalidState,
+					"{:?}",
+					method(outside)
+				);
+			}
+		}
 		assert!(
 			SevenZMethod::Lzma2 { level: 9 }.encoder_memory()
 				> SevenZMethod::Lzma2 { level: 1 }.encoder_memory()
