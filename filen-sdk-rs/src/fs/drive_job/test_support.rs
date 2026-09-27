@@ -94,6 +94,8 @@ pub(crate) struct FakeLog {
 	pub(crate) uploaded: Vec<(Uuid, u64)>,
 	/// The parent of every created directory.
 	pub(crate) dir_parents: HashMap<Uuid, Uuid>,
+	/// The bytes of each uploaded chunk, when [`Quirk::KeepUploads`] is set.
+	pub(crate) uploaded_data: HashMap<(Uuid, u64), Vec<u8>>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
 	/// The directory each file was registered in, kept when the file is removed later.
 	pub(crate) registered_in: HashMap<Uuid, Uuid>,
@@ -127,6 +129,8 @@ pub(crate) enum Quirk {
 	FailPropagate,
 	/// Later chunks of a file download faster than earlier ones.
 	ReverseChunks,
+	/// Keep every uploaded chunk's bytes in [`FakeLog::uploaded_data`].
+	KeepUploads,
 }
 
 pub(crate) struct FakeBackend {
@@ -402,7 +406,11 @@ impl DriveBackend for FakeBackend {
 			return Err(Error::custom(*kind, "upload failed"));
 		}
 		assert!(data.len() <= CHUNK_SIZE);
-		self.log().uploaded.push((upload.spec.uuid, index));
+		let mut log = self.log();
+		log.uploaded.push((upload.spec.uuid, index));
+		if self.quirks.contains(&Quirk::KeepUploads) {
+			log.uploaded_data.insert((upload.spec.uuid, index), data);
+		}
 		Ok(RemoteFileInfo::default())
 	}
 

@@ -191,7 +191,7 @@ const EXTENSIONS: &[(&str, ExtensionFormat)] = &[
 ];
 
 /// The recognised extension `name` ends in, with what it says the file holds.
-fn match_extension(name: &str) -> Option<(&'static str, ExtensionFormat)> {
+pub(crate) fn match_extension(name: &str) -> Option<(&'static str, ExtensionFormat)> {
 	EXTENSIONS.iter().copied().find(|(extension, _)| {
 		name.len()
 			.checked_sub(extension.len())

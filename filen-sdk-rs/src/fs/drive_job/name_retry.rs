@@ -4,7 +4,10 @@ use filen_types::fs::Uuid;
 
 use crate::{
 	Error, ErrorKind,
-	fs::name::{ValidatedName, keep_both::TakenNames},
+	fs::name::{
+		ValidatedName,
+		keep_both::{NameShape, TakenNames},
+	},
 };
 
 use super::backend::DriveBackend;
@@ -19,15 +22,19 @@ pub(crate) const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
 pub(crate) struct NameRetry {
 	taken: TakenNames,
 	attempts: usize,
-	is_dir: bool,
+	shape: NameShape,
+	subject: &'static str,
 }
 
 impl NameRetry {
-	pub(crate) fn new(is_dir: bool) -> Self {
+	/// `subject` is what the error giving up calls the item: a copy says "copy", as it always
+	/// has.
+	pub(crate) fn new(shape: NameShape, subject: &'static str) -> Self {
 		Self {
 			taken: TakenNames::default(),
 			attempts: 0,
-			is_dir,
+			shape,
+			subject,
 		}
 	}
 
@@ -38,11 +45,14 @@ impl NameRetry {
 		if self.attempts >= TOP_LEVEL_NAME_ATTEMPTS {
 			return Err(Error::custom(
 				ErrorKind::InvalidState,
-				"could not find a free name for the copy at the destination",
+				format!(
+					"could not find a free name for the {} at the destination",
+					self.subject
+				),
 			));
 		}
 		self.taken.insert(taken_name.as_ref());
-		Ok(self.taken.allocate(taken_name, self.is_dir)?)
+		Ok(self.taken.allocate(taken_name, self.shape)?)
 	}
 
 	/// `name`, or the first following keep-both name the server reports free in `parent`.
@@ -65,7 +75,7 @@ mod tests {
 
 	#[test]
 	fn a_copy_that_runs_out_of_names_says_so_as_it_always_has() {
-		let mut retry = NameRetry::new(false);
+		let mut retry = NameRetry::new(NameShape::File, "copy");
 		let mut name = ValidatedName::try_from("a.txt").unwrap();
 		for _ in 1..TOP_LEVEL_NAME_ATTEMPTS {
 			name = retry.next(name).unwrap();

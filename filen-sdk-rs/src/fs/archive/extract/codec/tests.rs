@@ -64,7 +64,7 @@ fn run_with(
 	let mut seen = Vec::new();
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
-			WorkerEvent::Ask { index, reply } => {
+			WorkerEvent::Ask { index, reply, .. } => {
 				let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
 				let end = (start + CHUNK_SIZE).min(archive.len());
 				let _ = reply.send(Ok(archive[start..end].to_vec()));

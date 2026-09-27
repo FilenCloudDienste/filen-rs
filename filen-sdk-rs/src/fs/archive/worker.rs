@@ -14,11 +14,12 @@
 //! destructor, and would leave any lock it held locked.
 
 use std::{
-	io::{self, Read},
+	io::{self, Read, Write},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
+	time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -28,22 +29,30 @@ use crate::consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE};
 
 use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
 
+/// How long the codec may go without taking input or handing over an event, while the driver
+/// owes it nothing, before it is given up on as dead. Far above any single step a healthy codec
+/// takes between two exchanges; all it has to buy is turning a hang into an error.
+pub(crate) const ARCHIVE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// What the codec tells the driver, in archive order.
 #[derive(Debug)]
 pub(crate) enum WorkerEvent {
-	/// The codec needs chunk `index` of the archive's plaintext.
+	/// The codec needs chunk `index` of the plaintext of its input `source`: the archive when
+	/// extracting (always 0), a source file by its place in the job's entries when compressing.
 	Ask {
+		source: u32,
 		index: u64,
 		reply: oneshot::Sender<io::Result<Vec<u8>>>,
 	},
 	/// What a streaming archive turned out to hold; sent before any entry.
 	Opened(StreamLayout),
 	Entry(EntryHead),
-	/// The next data of the file entry sent last: [`CHUNK_SIZE`] bytes, except for a file's last
-	/// chunk.
+	/// Output: when extracting, the next data of the file entry sent last; when compressing,
+	/// the next chunk of the archive. [`CHUNK_SIZE`] bytes, except for the last chunk.
 	Data(Vec<u8>),
-	/// The end of the file entry sent last. Its data was checked against whatever checksum the
-	/// archive carries for it: a mismatch fails the codec instead.
+	/// The current file entry ended. When extracting, its data was checked against whatever
+	/// checksum the archive carries for it (a mismatch fails the codec instead); when
+	/// compressing, it is in the archive.
 	FileEnd,
 	Skipped(SkippedMember),
 }
@@ -140,10 +149,14 @@ impl WorkerPort {
 		Ok(())
 	}
 
-	/// Chunk `index` of the archive's plaintext, parking until the driver has fetched it.
-	pub(crate) fn fetch(&self, index: u64) -> io::Result<Vec<u8>> {
+	/// Chunk `index` of `source`'s plaintext, parking until the driver has fetched it.
+	pub(crate) fn fetch(&self, source: u32, index: u64) -> io::Result<Vec<u8>> {
 		let (reply, answer) = oneshot::channel();
-		self.send(WorkerEvent::Ask { index, reply })?;
+		self.send(WorkerEvent::Ask {
+			source,
+			index,
+			reply,
+		})?;
 		let chunk = answer.blocking_recv().map_err(|_| ended())??;
 		self.shared.note_progress();
 		Ok(chunk)
@@ -246,9 +259,10 @@ pub(crate) fn scripted<T>() -> (mpsc::Sender<WorkerEvent>, oneshot::Sender<T>, W
 	(port.events, result, link)
 }
 
-/// The archive's plaintext, fetched through the driver one chunk at a time.
+/// An input's plaintext, fetched through the driver one chunk at a time.
 pub(crate) struct ChunkInput<'p> {
 	port: &'p WorkerPort,
+	source: u32,
 	len: u64,
 	next: u64,
 	chunk: Vec<u8>,
@@ -256,9 +270,10 @@ pub(crate) struct ChunkInput<'p> {
 }
 
 impl<'p> ChunkInput<'p> {
-	pub(crate) fn new(port: &'p WorkerPort, len: u64) -> Self {
+	pub(crate) fn new(port: &'p WorkerPort, source: u32, len: u64) -> Self {
 		Self {
 			port,
+			source,
 			len,
 			next: 0,
 			chunk: Vec::new(),
@@ -276,7 +291,7 @@ impl Read for ChunkInput<'_> {
 			if self.next * CHUNK_SIZE_U64 >= self.len {
 				return Ok(0);
 			}
-			self.chunk = self.port.fetch(self.next)?;
+			self.chunk = self.port.fetch(self.source, self.next)?;
 			self.next += 1;
 			self.pos = 0;
 			if self.chunk.is_empty() {
@@ -295,13 +310,78 @@ impl Read for ChunkInput<'_> {
 	}
 }
 
+/// What the codec writes, handed to the driver in whole chunks. Flushing does nothing: only
+/// [`ChunkSink::finish`] sends a last, short chunk.
+///
+/// An error sticks: once a chunk could not be handed over, every later write fails too, and so
+/// does [`ChunkSink::finish`], whatever a writer in front of the sink did with the first error
+/// (a writer that finalizes its format when dropped, or one that swallows errors on finishing,
+/// can never make a failed archive look complete).
+pub(crate) struct ChunkSink<'p> {
+	port: &'p WorkerPort,
+	chunk: Vec<u8>,
+	written: u64,
+	failed: bool,
+}
+
+impl<'p> ChunkSink<'p> {
+	pub(crate) fn new(port: &'p WorkerPort) -> Self {
+		Self {
+			port,
+			chunk: new_chunk(),
+			written: 0,
+			failed: false,
+		}
+	}
+
+	/// Sends what is left; the bytes written in all.
+	pub(crate) fn finish(mut self) -> io::Result<u64> {
+		if self.failed {
+			return Err(ended());
+		}
+		if !self.chunk.is_empty() {
+			let last = std::mem::take(&mut self.chunk);
+			self.port.send(WorkerEvent::Data(last))?;
+		}
+		Ok(self.written)
+	}
+}
+
+impl Write for ChunkSink<'_> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		if self.failed {
+			return Err(ended());
+		}
+		let n = buf.len().min(CHUNK_SIZE - self.chunk.len());
+		self.chunk.extend_from_slice(&buf[..n]);
+		self.written += n as u64;
+		if self.chunk.len() == CHUNK_SIZE {
+			let full = std::mem::replace(&mut self.chunk, new_chunk());
+			if let Err(e) = self.port.send(WorkerEvent::Data(full)) {
+				self.failed = true;
+				return Err(e);
+			}
+		}
+		Ok(n)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+/// An empty chunk with room for the chunk's encryption overhead, so encrypting it in place never
+/// reallocates.
+fn new_chunk() -> Vec<u8> {
+	Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE)
+}
+
 /// Hands the driver everything `reader` yields as the current file's data, in whole chunks;
 /// returns how many bytes that was.
 pub(crate) fn send_file_data(port: &WorkerPort, reader: &mut dyn Read) -> io::Result<u64> {
 	let mut total = 0;
 	loop {
-		// room for the chunk's encryption overhead, so encrypting it in place never reallocates
-		let mut chunk = Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE);
+		let mut chunk = new_chunk();
 		chunk.resize(CHUNK_SIZE, 0);
 		let filled = read_full(reader, &mut chunk)?;
 		chunk.truncate(filled);

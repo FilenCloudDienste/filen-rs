@@ -25,7 +25,7 @@ use crate::{
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 		name::{
 			ValidatedName,
-			keep_both::{SourceName, TakenNames},
+			keep_both::{NameShape, SourceName, TakenNames},
 		},
 	},
 };
@@ -341,7 +341,7 @@ fn allocate_name(
 		|| ValidatedName::try_from(uuid.to_string().as_str()).expect("a uuid is a valid name");
 	let by_uuid = |taken: &mut TakenNames| {
 		taken
-			.allocate(uuid_name(), is_dir)
+			.allocate(uuid_name(), shape(is_dir))
 			.unwrap_or_else(|_| uuid_name())
 	};
 	let Some(name) = name else {
@@ -354,7 +354,7 @@ fn allocate_name(
 	let encoded = matches!(source_name, SourceName::Encoded(_));
 	let valid = source_name.into_name();
 	// Kept to tell a keep-both rename from the name itself.
-	let Ok(allocated) = taken.allocate(valid.clone(), is_dir) else {
+	let Ok(allocated) = taken.allocate(valid.clone(), shape(is_dir)) else {
 		return (by_uuid(taken), Some(RenameReason::InvalidName));
 	};
 	let reason = if allocated != valid {
@@ -369,6 +369,14 @@ fn allocate_name(
 
 /// An item's segment of a source path: its name, or its uuid when its metadata could not be
 /// decrypted.
+fn shape(is_dir: bool) -> NameShape {
+	if is_dir {
+		NameShape::Dir
+	} else {
+		NameShape::File
+	}
+}
+
 fn path_segment(name: Option<&str>, uuid: Uuid) -> Cow<'_, str> {
 	name.map_or_else(|| Cow::Owned(uuid.to_string()), Cow::Borrowed)
 }

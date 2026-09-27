@@ -9,6 +9,7 @@ use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
 use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
+	fs::name::keep_both::NameShape,
 	fs::{categories::NonRootItemType, dir::RemoteDirectory, name::ValidatedName},
 	job::{JobControl, Stopped, report::Ops},
 };
@@ -36,6 +37,8 @@ pub(crate) struct DirTask<B> {
 	pub(crate) top_level: bool,
 	/// Check the name with the server before creating the directory.
 	pub(crate) verify_name: bool,
+	/// What the error giving up on a free name calls the directory (see [`NameRetry::new`]).
+	pub(crate) subject: &'static str,
 }
 
 /// A created directory with the name it got, and what went wrong around it without undoing it.
@@ -72,6 +75,7 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 		color,
 		top_level,
 		verify_name,
+		subject,
 	} = task;
 	let backend = &*backend;
 	let _lock = match wait_for_lock(backend, &control, &ops).await {
@@ -79,7 +83,7 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
 		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(error)),
 	};
-	let mut retry = NameRetry::new(true);
+	let mut retry = NameRetry::new(NameShape::Dir, subject);
 	let mut dir = loop {
 		if verify_name {
 			name = retry

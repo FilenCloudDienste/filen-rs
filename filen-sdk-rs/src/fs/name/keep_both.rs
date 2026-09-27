@@ -37,6 +37,22 @@ impl SourceName {
 	}
 }
 
+/// Which part of a name keep-both numbers, and which it keeps apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameShape {
+	/// A directory: the whole name is numbered (`docs` → `docs (1)`).
+	Dir,
+	/// A file: its last extension is kept apart (`a.txt` → `a (1).txt`).
+	File,
+	/// A file whose last `len` bytes are one extension, kept apart whole (`a.tar.gz` →
+	/// `a (1).tar.gz`, where [`NameShape::File`] would give `a.tar (1).gz`).
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	FileWithExtension { len: usize },
+}
+
 /// The names taken in one destination directory, compared case-insensitively.
 #[derive(Debug, Default)]
 pub(crate) struct TakenNames {
@@ -68,19 +84,19 @@ impl TakenNames {
 	/// Picks and takes a free name for an item called `name`: the name itself when free,
 	/// otherwise `stem (n).ext` with the smallest free `n`. A name that already ends in
 	/// ` (n)` continues from `n + 1`; a counter that cannot grow any further is treated as part
-	/// of the stem, so it gets a counter of its own. Only a file's last extension is kept apart
-	/// (`a.tar.gz` → `a.tar (1).gz`); directories have no extension. Candidates are trimmed at
-	/// a character boundary to fit the name length limit.
+	/// of the stem, so it gets a counter of its own. What is kept apart from the counter depends
+	/// on the name's [`NameShape`]. Candidates are trimmed at a character boundary to fit the
+	/// name length limit.
 	pub(crate) fn allocate(
 		&mut self,
 		name: ValidatedName,
-		is_dir: bool,
+		shape: NameShape,
 	) -> Result<ValidatedName, EntryNameError> {
 		if self.insert(name.as_ref()) {
 			return Ok(name);
 		}
 
-		let (stem, ext) = split_extension(name.as_ref(), is_dir);
+		let (stem, ext) = split_extension(name.as_ref(), shape);
 		let (mut base, mut n) = strip_counter(stem)
 			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
 			.unwrap_or((stem, 1));
@@ -115,13 +131,22 @@ impl TakenNames {
 
 /// `(stem, ext)` with `ext` including its dot. A leading dot (`.bashrc`) is part of the stem,
 /// not an extension.
-fn split_extension(name: &str, is_dir: bool) -> (&str, &str) {
-	if is_dir {
-		return (name, "");
-	}
-	match name.rfind('.') {
-		Some(dot) if dot > 0 => name.split_at(dot),
-		_ => (name, ""),
+fn split_extension(name: &str, shape: NameShape) -> (&str, &str) {
+	match shape {
+		NameShape::Dir => (name, ""),
+		#[cfg(any(
+			not(all(target_family = "wasm", target_os = "unknown")),
+			feature = "wasm-full"
+		))]
+		NameShape::FileWithExtension { len }
+			if len < name.len() && name.is_char_boundary(name.len() - len) =>
+		{
+			name.split_at(name.len() - len)
+		}
+		_ => match name.rfind('.') {
+			Some(dot) if dot > 0 => name.split_at(dot),
+			_ => (name, ""),
+		},
 	}
 }
 
@@ -197,8 +222,13 @@ mod tests {
 	}
 
 	fn allocate(taken: &[&str], name: &str, is_dir: bool) -> String {
+		let shape = if is_dir {
+			NameShape::Dir
+		} else {
+			NameShape::File
+		};
 		let mut names = TakenNames::new(taken.iter().copied());
-		names.allocate(source_name(name), is_dir).unwrap().into()
+		names.allocate(source_name(name), shape).unwrap().into()
 	}
 
 	#[test]
@@ -261,6 +291,26 @@ mod tests {
 	}
 
 	#[test]
+	fn a_known_compound_extension_is_kept_apart_whole() {
+		let mut names = TakenNames::new(["photos.tar.gz"]);
+		let shape = NameShape::FileWithExtension {
+			len: ".tar.gz".len(),
+		};
+		let name: String = names
+			.allocate(source_name("photos.tar.gz"), shape)
+			.unwrap()
+			.into();
+		assert_eq!(name, "photos (1).tar.gz");
+		// an extension as long as the whole name falls back to the last one
+		let mut names = TakenNames::new(["x.gz"]);
+		let name: String = names
+			.allocate(source_name("x.gz"), NameShape::FileWithExtension { len: 4 })
+			.unwrap()
+			.into();
+		assert_eq!(name, "x (1).gz");
+	}
+
+	#[test]
 	fn only_a_files_last_extension_is_kept_apart() {
 		assert_eq!(allocate(&["a.tar.gz"], "a.tar.gz", false), "a.tar (1).gz");
 		assert_eq!(allocate(&["Makefile"], "Makefile", false), "Makefile (1)");
@@ -271,9 +321,18 @@ mod tests {
 	#[test]
 	fn each_allocation_takes_its_name() {
 		let mut names = TakenNames::default();
-		let first: String = names.allocate(source_name("a.txt"), false).unwrap().into();
-		let second: String = names.allocate(source_name("a.txt"), false).unwrap().into();
-		let third: String = names.allocate(source_name("A.TXT"), false).unwrap().into();
+		let first: String = names
+			.allocate(source_name("a.txt"), NameShape::File)
+			.unwrap()
+			.into();
+		let second: String = names
+			.allocate(source_name("a.txt"), NameShape::File)
+			.unwrap()
+			.into();
+		let third: String = names
+			.allocate(source_name("A.TXT"), NameShape::File)
+			.unwrap()
+			.into();
 		assert_eq!(
 			[first.as_str(), second.as_str(), third.as_str()],
 			["a.txt", "a (1).txt", "A (2).TXT"]
@@ -301,9 +360,11 @@ mod tests {
 		);
 		assert_eq!(allocate(&[], "a:b.txt", false), String::from(encoded));
 		let mut names = TakenNames::default();
-		names.allocate(source_name("a:b.txt"), false).unwrap();
+		names
+			.allocate(source_name("a:b.txt"), NameShape::File)
+			.unwrap();
 		let second: String = names
-			.allocate(source_name("a:b.txt"), false)
+			.allocate(source_name("a:b.txt"), NameShape::File)
 			.unwrap()
 			.into();
 		assert!(second.ends_with(" (1).txt"), "{second}");
@@ -338,7 +399,12 @@ mod tests {
 		let name = format!("\u{1F600}.{}", "a".repeat(247));
 		let mut names = TakenNames::new([name.as_str()]);
 		let allocated: Vec<String> = (0..150)
-			.map(|_| names.allocate(source_name(&name), false).unwrap().into())
+			.map(|_| {
+				names
+					.allocate(source_name(&name), NameShape::File)
+					.unwrap()
+					.into()
+			})
 			.collect();
 		assert_eq!(allocated[0], format!("\u{1F600}.{} (1)", "a".repeat(246)));
 		assert_eq!(
@@ -362,7 +428,10 @@ mod tests {
 			} else {
 				"REPORT.pdf"
 			};
-			last = names.allocate(source_name(spelling), false).unwrap().into();
+			last = names
+				.allocate(source_name(spelling), NameShape::File)
+				.unwrap()
+				.into();
 		}
 		assert_eq!(last, "REPORT (19999).pdf");
 		assert!(
@@ -372,8 +441,14 @@ mod tests {
 		);
 		// the hint never skips a free counter, even one below a counter taken out of order
 		let mut names = TakenNames::new(["a.txt", "a (2).txt"]);
-		let first: String = names.allocate(source_name("a.txt"), false).unwrap().into();
-		let second: String = names.allocate(source_name("a.txt"), false).unwrap().into();
+		let first: String = names
+			.allocate(source_name("a.txt"), NameShape::File)
+			.unwrap()
+			.into();
+		let second: String = names
+			.allocate(source_name("a.txt"), NameShape::File)
+			.unwrap()
+			.into();
 		assert_eq!(
 			[first.as_str(), second.as_str()],
 			["a (1).txt", "a (3).txt"]

@@ -43,6 +43,7 @@ use crate::{
 	consts::{
 		CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA, MAX_SMALL_PARALLEL_REQUESTS,
 	},
+	fs::name::keep_both::NameShape,
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -436,6 +437,7 @@ where
 			color: dir.color.clone(),
 			top_level,
 			verify_name: top_level && self.plan.unverified_destinations.contains(&parent),
+			subject: "copy",
 		};
 		Box::pin(async move { (index, create_dir(task).await) })
 	}
@@ -872,7 +874,7 @@ async fn copy_file_inner<B: DriveBackend>(
 	// A stored count may include a chunk without data (one for an empty file, or a trailing
 	// empty chunk); only the chunks holding data are copied.
 	let chunks = size.div_ceil(CHUNK_SIZE_U64);
-	let mut retry = NameRetry::new(false);
+	let mut retry = NameRetry::new(NameShape::File, "copy");
 	let mut name = file.name;
 	if verify_name {
 		name = retry

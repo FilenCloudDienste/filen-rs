@@ -1,0 +1,442 @@
+//! The driver against the fake drive, with the real codec on its thread; the archive the fake
+//! received is put back together and read with the SDK's own decoders.
+
+use std::{
+	borrow::Cow,
+	collections::BTreeMap,
+	io::Read,
+	sync::{Mutex, atomic::Ordering},
+	time::Duration,
+};
+
+use chrono::Utc;
+use tokio::task::JoinHandle;
+
+use super::*;
+use crate::{
+	consts::CHUNK_SIZE,
+	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	fs::{
+		HasName,
+		archive::{
+			compress::{
+				CompressFormat, CompressUpdate,
+				codec::{ArchiveEntry, CompressJob, compress},
+				report::CompressCallback,
+			},
+			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			decode::open_stream,
+			encode::Compression,
+			format::StreamCodec,
+			tar_iter::TarReader,
+			worker,
+		},
+		dir::RootDirectory,
+		drive_job::{
+			backend::ListedNames,
+			test_support::{FakeBackend, Quirk},
+		},
+		file::{
+			AnonymousRemoteFile, RemoteFile,
+			meta::{DecryptedFileMeta, FileMeta},
+		},
+	},
+	job::test_support::controls,
+};
+
+#[derive(Default)]
+struct Recorder {
+	created: Mutex<Vec<RemoteFile>>,
+	updates: Mutex<Vec<CompressUpdate>>,
+}
+
+impl CompressCallback for Recorder {
+	fn on_archive_created(&self, archive: RemoteFile) {
+		self.created.lock().unwrap().push(archive);
+	}
+
+	fn on_update(&self, update: CompressUpdate) {
+		self.updates.lock().unwrap().push(update);
+	}
+}
+
+impl Recorder {
+	fn events(&self) -> Vec<CompressEvent> {
+		self.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.flat_map(|update| update.events.clone())
+			.collect()
+	}
+
+	fn last(&self) -> CompressUpdate {
+		self.updates.lock().unwrap().last().unwrap().clone()
+	}
+}
+
+fn source_file(name: &str, bytes: &[u8], hash: Option<Blake3Hash>) -> RemoteFileType<'static> {
+	let size = bytes.len() as u64;
+	let meta = FileMeta::Decoded(DecryptedFileMeta {
+		name: Cow::Owned(name.to_owned()),
+		size,
+		mime: Cow::Borrowed("application/octet-stream"),
+		key: FileKey::V3(EncryptionKey::generate()),
+		last_modified: Utc::now(),
+		created: None,
+		hash,
+	});
+	let file: AnonymousRemoteFile = RemoteFile::from_meta(
+		Uuid::new_v4(),
+		(),
+		Uuid::new_v4().into(),
+		size,
+		size.div_ceil(CHUNK_SIZE_U64),
+		"de-1",
+		"bucket",
+		Utc::now(),
+		false,
+		meta,
+	);
+	RemoteFileType::File(Cow::Owned(file))
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+	(0..len)
+		.map(|i| (i % 241).to_le_bytes()[0] ^ seed)
+		.collect()
+}
+
+fn hash_of(data: &[u8]) -> Option<Blake3Hash> {
+	Some(Blake3Hash::from(blake3::hash(data)))
+}
+
+/// A directory with two files, one over a chunk, and a file at the top.
+struct Setup {
+	backend: Arc<FakeBackend>,
+	destination: Uuid,
+	entries: Vec<ArchiveEntry>,
+	sources: Vec<(String, RemoteFileType<'static>)>,
+	contents: Vec<Vec<u8>>,
+}
+
+fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
+	let destination = Uuid::new_v4();
+	let contents = vec![
+		b"alpha".to_vec(),
+		pattern(CHUNK_SIZE + 77, 3),
+		b"top".to_vec(),
+	];
+	let paths = ["docs/a.txt", "docs/big.bin", "top.txt"];
+	let files: Vec<RemoteFileType<'static>> = contents
+		.iter()
+		.zip(paths)
+		.map(|(data, path)| source_file(path.rsplit('/').next().unwrap(), data, hash_of(data)))
+		.collect();
+	let mut backend = FakeBackend::new(destination);
+	backend.quirks.insert(Quirk::KeepUploads);
+	for (file, data) in files.iter().zip(&contents) {
+		backend.contents.insert(file.uuid(), data.clone());
+	}
+	configure(&mut backend, &files);
+	let mut entries = vec![ArchiveEntry::Dir {
+		path: "docs".into(),
+		modified: None,
+	}];
+	entries.extend(
+		paths
+			.iter()
+			.zip(&contents)
+			.enumerate()
+			.map(|(source, (path, data))| ArchiveEntry::File {
+				source: u32::try_from(source).unwrap(),
+				path: (*path).to_owned(),
+				size: data.len() as u64,
+				modified: None,
+			}),
+	);
+	Setup {
+		backend: Arc::new(backend),
+		destination,
+		entries,
+		sources: paths.iter().map(|p| (*p).to_owned()).zip(files).collect(),
+		contents,
+	}
+}
+
+struct Job {
+	running: JoinHandle<Result<CompressReport, CompressFailed>>,
+	recorder: Arc<Recorder>,
+	reporter: MaybeArc<Reporter>,
+}
+
+fn start_with(
+	setup: &Setup,
+	name: &str,
+	format: CompressFormat,
+	control: JobControl,
+	max_bytes: Option<u64>,
+	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+) -> Job {
+	let recorder = Arc::new(Recorder::default());
+	let reporter = Reporter::new(Arc::clone(&recorder));
+	let extension_len = format.check_name(name).unwrap();
+	let running = tokio::spawn(run_compress(CompressTask {
+		backend: Arc::clone(&setup.backend),
+		control,
+		reporter: MaybeArc::clone(&reporter),
+		destination: DirType::Root(Cow::Owned(RootDirectory::new(setup.destination))),
+		name: ValidatedName::try_from(name).unwrap(),
+		extension_len,
+		sources: setup
+			.sources
+			.iter()
+			.map(|(path, file)| Source {
+				file: file.clone(),
+				path: path.clone(),
+			})
+			.collect(),
+		max_bytes,
+		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		start,
+		report: CompressReport::default(),
+	}));
+	Job {
+		running,
+		recorder,
+		reporter,
+	}
+}
+
+fn start(
+	setup: &Setup,
+	name: &str,
+	format: CompressFormat,
+	control: JobControl,
+	max_bytes: Option<u64>,
+) -> Job {
+	let job = CompressJob {
+		format,
+		entries: setup.entries.clone(),
+	};
+	start_with(
+		setup,
+		name,
+		format,
+		control,
+		max_bytes,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+	)
+}
+
+fn gzip_tar() -> CompressFormat {
+	CompressFormat::Tar {
+		compression: Some(Compression {
+			codec: StreamCodec::Gzip,
+			level: None,
+		}),
+	}
+}
+
+/// The uploaded archive, chunk by chunk in order.
+fn uploaded(setup: &Setup, uuid: Uuid) -> Vec<u8> {
+	let log = setup.backend.log();
+	let mut chunks: BTreeMap<u64, &Vec<u8>> = BTreeMap::new();
+	for ((file, index), data) in &log.uploaded_data {
+		if *file == uuid {
+			chunks.insert(*index, data);
+		}
+	}
+	chunks.into_values().flatten().copied().collect()
+}
+
+fn members(archive: &[u8], codec: Option<StreamCodec>) -> Vec<(String, Vec<u8>)> {
+	let reader: Box<dyn Read> = match codec {
+		None => Box::new(archive),
+		Some(codec) => Box::new(open_stream(codec, archive, 64 << 20).unwrap()),
+	};
+	let mut tar = TarReader::new(reader, 100);
+	let mut members = Vec::new();
+	while let Some(member) = tar.next_member().unwrap() {
+		let mut data = Vec::new();
+		let mut buf = [0u8; 4096];
+		loop {
+			let n = tar.read_body(&mut buf).unwrap();
+			if n == 0 {
+				break;
+			}
+			data.extend_from_slice(&buf[..n]);
+		}
+		members.push((member.path, data));
+	}
+	members
+}
+
+fn assert_released(setup: &Setup, reporter: &Reporter) {
+	assert_eq!(
+		setup.backend.memory.available_permits(),
+		setup.backend.budget,
+		"every memory reservation is released"
+	);
+	assert_eq!(
+		setup.backend.live_locks.load(Ordering::SeqCst),
+		0,
+		"no drive lock is held"
+	);
+	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compresses_the_sources_into_one_new_file() {
+	let setup = setup(|backend, _| {
+		backend.listed = ListedNames {
+			names: vec!["bundle.tar.gz".into()],
+			unverified: false,
+		};
+	});
+	let job = start(
+		&setup,
+		"bundle.tar.gz",
+		gzip_tar(),
+		JobControl::default(),
+		None,
+	);
+	let report = job.running.await.unwrap().unwrap();
+
+	let archive = report.archive.as_ref().expect("the archive is registered");
+	assert_eq!(
+		archive.name(),
+		Some("bundle (1).tar.gz"),
+		"keep-both keeps .tar.gz whole"
+	);
+	let finished = setup.backend.log().finished.clone();
+	assert_eq!(finished.len(), 1, "one file is registered: the archive");
+	let (name, completion) = &finished[&archive.uuid()];
+	assert_eq!(name, "bundle (1).tar.gz");
+	let bytes = uploaded(&setup, archive.uuid());
+	assert_eq!(completion.written, bytes.len() as u64);
+	assert_eq!(completion.hash, Blake3Hash::from(blake3::hash(&bytes)));
+	assert_eq!(
+		members(&bytes, Some(StreamCodec::Gzip)),
+		[
+			("docs/".to_owned(), Vec::new()),
+			("docs/a.txt".to_owned(), setup.contents[0].clone()),
+			("docs/big.bin".to_owned(), setup.contents[1].clone()),
+			("top.txt".to_owned(), setup.contents[2].clone()),
+		]
+	);
+	let total: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
+	assert_eq!(report.counts.files_done, 3);
+	assert_eq!(report.counts.bytes_read, total);
+	assert_eq!(report.counts.bytes_done, bytes.len() as u64);
+	assert_eq!(job.recorder.created.lock().unwrap().len(), 1);
+	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
+	assert!(
+		job.recorder.events().is_empty(),
+		"every source matched its hash"
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_that_does_not_match_its_hash_is_reported() {
+	let setup = setup(|backend, files| {
+		// the fake serves other bytes than the ones the metadata's hash is of
+		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
+	});
+	let job = start(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(report.archive.is_some());
+	let mismatched: Vec<String> = job
+		.recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			CompressEvent::SourceHashMismatch { path, .. } => Some(path),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(mismatched, ["top.txt"]);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_that_ends_early_leaves_nothing_behind() {
+	// running out of storage while writing
+	let setup_storage = setup(|_, _| {});
+	let job = start(
+		&setup_storage,
+		"b.tar.gz",
+		gzip_tar(),
+		JobControl::default(),
+		Some(100),
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
+	assert!(failed.report.archive.is_none());
+	assert!(setup_storage.backend.log().finished.is_empty());
+	assert_released(&setup_storage, &job.reporter);
+
+	// a source that cannot be read
+	let setup_fetch = setup(|backend, _| {
+		backend
+			.fail_fetch
+			.insert("big.bin".to_owned(), ErrorKind::Server);
+	});
+	let job = start(
+		&setup_fetch,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Server);
+	assert!(setup_fetch.backend.log().finished.is_empty());
+	assert_released(&setup_fetch, &job.reporter);
+
+	// a cancel while the archive is uploading
+	let setup_cancel = setup(|backend, _| {
+		backend.blocked_uploads.insert("b.tar".to_owned());
+	});
+	let (_pause, cancel, control) = controls();
+	let job = start(
+		&setup_cancel,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		control,
+		None,
+	);
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert!(setup_cancel.backend.log().finished.is_empty());
+	assert_eq!(job.recorder.last().phase, CompressPhase::Cancelled);
+	assert_released(&setup_cancel, &job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silent_codec_is_given_up_on() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWorkerDied);
+	assert!(setup.backend.log().finished.is_empty());
+	assert_released(&setup, &job.reporter);
+	drop((events, result));
+}

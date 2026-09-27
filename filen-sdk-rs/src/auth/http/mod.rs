@@ -118,9 +118,14 @@ impl ClientConfig {
 		not(all(target_family = "wasm", target_os = "unknown")),
 		feature = "wasm-full"
 	))]
-	/// Memory for one archive job's codec state (a decoder's dictionary or window). An archive
-	/// whose codec needs more is refused with
-	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind::ArchiveTooLarge).
+	/// Memory for one archive job's codec state (a dictionary, window or model). Extracting an
+	/// archive whose decoder needs more fails with
+	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind::ArchiveTooLarge); compressing into a
+	/// format whose encoder needs more is refused up front with
+	/// [`ErrorKind::InsufficientMemory`](crate::ErrorKind::InsufficientMemory)
+	/// ([`CompressFormat::max_level_within`] finds the highest level that fits).
+	///
+	/// [`CompressFormat::max_level_within`]: crate::fs::archive::CompressFormat::max_level_within
 	pub fn with_archive_codec_mem_budget(mut self, archive_codec_mem_budget: u64) -> Self {
 		self.archive_codec_mem_budget = archive_codec_mem_budget;
 		self
