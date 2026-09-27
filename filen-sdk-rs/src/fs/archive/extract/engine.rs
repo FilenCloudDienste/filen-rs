@@ -629,7 +629,9 @@ impl<B: DisposalBackend> Driver<B> {
 		if stopping {
 			return settled;
 		}
+		// a directory can be left to start only while a pause is requested, which starts none
 		settled
+			&& self.ready_dirs.is_empty()
 			&& self.uploads.is_empty()
 			&& self.held.is_none()
 			&& self.files.is_empty()
@@ -646,6 +648,13 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Waits out a pause holding nothing: prefetched chunks and the floor are given back.
 	async fn pause(&mut self) -> Result<(), Stopped> {
 		self.drop_prefetched();
+		// The chunk the codec is reading stays with it, part of its state. Nothing else holds
+		// the floor's input slot now, so it moves there if it took from the client's budget.
+		if self.reading.is_some()
+			&& let Ok(slot) = Arc::clone(&self.input_slot).try_acquire_owned()
+		{
+			self.reading = Some(slot);
+		}
 		self.floor = None;
 		self.reporter.checkpoint(&self.control).await?;
 		let floor = self.control.until_stopping(self.config.floor()).await?;
@@ -925,7 +934,15 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Creates the folder entries are extracted into.
 	async fn create_root(&mut self, name: ValidatedName) -> Result<Uuid, Stopped> {
 		loop {
-			self.reporter.checkpoint(&self.control).await?;
+			// No entry is read yet, so only prefetched chunks are in flight: waited out holding
+			// nothing, as between entries.
+			if self.control.is_pause_requested() {
+				self.pause().await?;
+			}
+			if self.control.is_stopping() {
+				self.reporter.set_cancelling();
+				return Err(Stopped);
+			}
 			let task = DirTask {
 				backend: Arc::clone(&self.backend),
 				control: self.control.clone(),

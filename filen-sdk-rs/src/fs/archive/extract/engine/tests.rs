@@ -17,6 +17,7 @@ use crate::{
 	fs::{
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			entry_path::entry_path,
 			extract::{
 				ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractSkipReason, ExtractUpdate,
 				RunState,
@@ -1275,6 +1276,235 @@ async fn a_pause_while_a_registration_waits_for_the_lock_holds_nothing() {
 			RunState::Running
 		]
 	);
+	assert_released(&setup, &job.reporter);
+}
+
+/// A file entry at `path`, as the codec sends it.
+fn file_entry(ordinal: u64, path: &str, size: u64) -> WorkerEvent {
+	WorkerEvent::Entry(EntryHead {
+		ordinal,
+		path: entry_path(path).unwrap(),
+		modified: None,
+		kind: EntryKind::File { size: Some(size) },
+	})
+}
+
+/// How a scripted codec ends an archive it read in full.
+fn read_in_full() -> CodecResult {
+	Ok(ArchiveEnd {
+		unaccounted_bytes: 0,
+		duplicates: None,
+		unchecked_entries: 0,
+	})
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_while_the_archive_opens_holds_nothing() {
+	// larger than the floor, so chunks are prefetched on the client's budget
+	let setup = setup("bundle.tar", pattern(3 * CHUNK_SIZE, 2), |backend| {
+		// the destination's shares take long to fetch, so the pause comes while opening
+		backend.targets_delay = Duration::from_secs(30);
+	});
+	let config = test_config();
+	let (pause, _cancel, control) = controls();
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		Options {
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	// chunks are prefetched (their memory taken) before the event is, and wait meanwhile
+	wait_until("the job opens the archive", || {
+		setup.backend.log().target_fetches == 1
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_paused_holding_nothing(&setup, &job, &config);
+	assert!(created_dirs(&setup).is_empty(), "the folder waits too");
+
+	pause.send_replace(false);
+	for event in [
+		file_entry(0, "a.txt", 1),
+		WorkerEvent::Data(b"a".to_vec()),
+		WorkerEvent::FileEnd,
+	] {
+		events.send(event).await.unwrap();
+	}
+	drop(events);
+	let _ = result.send(read_in_full());
+	job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle/a.txt"]);
+	assert_eq!(
+		job.recorder.run_states(),
+		[RunState::Running, RunState::Paused, RunState::Running],
+		"the pause is taken up once the archive is opened, with nothing left in flight"
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+/// A directory entry at `path`, as the codec sends it.
+fn dir_entry(ordinal: u64, path: &str) -> WorkerEvent {
+	WorkerEvent::Entry(EntryHead {
+		ordinal,
+		path: entry_path(path).unwrap(),
+		modified: None,
+		kind: EntryKind::Dir,
+	})
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_leaves_no_directory_uncreated() {
+	// more directories than are created at once, the rest waiting their turn
+	let count = MAX_SMALL_PARALLEL_REQUESTS + 10;
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		backend.delay = Duration::from_secs(10);
+	});
+	let (pause, _cancel, control) = controls();
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	for ordinal in 0..count {
+		events
+			.send(dir_entry(ordinal as u64, &format!("d{ordinal:03}")))
+			.await
+			.unwrap();
+	}
+	drop(events);
+	let _ = result.send(read_in_full());
+	wait_until("the first directories are being created", || {
+		job.reporter.ops_in_flight() == MAX_SMALL_PARALLEL_REQUESTS as u64
+	})
+	.await;
+	// a moment of the creates' ten seconds, for the driver to take the archive's end
+	tokio::time::sleep(Duration::from_secs(1)).await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert!(!job.running.is_finished(), "the rest are created on resume");
+
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.dirs_created, count as u64 + 1);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
+	let files: Vec<(String, Vec<u8>)> = (0..3)
+		.map(|i| (format!("f{i}.bin"), pattern(2 * CHUNK_SIZE + i, i as u8)))
+		.collect();
+	let members: Vec<(&str, &[u8])> = files
+		.iter()
+		.map(|(name, data)| (name.as_str(), &data[..]))
+		.collect();
+	let setup = setup("bundle.tar", tar_of(&members), |backend| {
+		backend
+			.slow
+			.insert("f1.bin".to_owned(), Duration::from_millis(300));
+	});
+	let config = test_config();
+	let (pause, _cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			config: config.clone(),
+			..Options::default()
+		},
+	);
+	wait_until("f1.bin's first chunk uploads", || {
+		setup.backend.log().upload_starts.len() > 2
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_paused_holding_nothing(&setup, &job, &config);
+
+	pause.send_replace(false);
+	job.running.await.unwrap().unwrap();
+	let expected: BTreeMap<String, (u64, u64, Blake3Hash)> = files
+		.iter()
+		.map(|(name, data)| {
+			(
+				format!("bundle/{name}"),
+				(
+					data.len() as u64,
+					data.len().div_ceil(CHUNK_SIZE) as u64,
+					hash(data),
+				),
+			)
+		})
+		.collect();
+	assert_eq!(finished(&setup), expected);
+	assert_eq!(
+		job.recorder.run_states(),
+		[
+			RunState::Running,
+			RunState::Pausing,
+			RunState::Paused,
+			RunState::Running
+		]
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_paused_winds_down() {
+	let setup = setup(
+		"bundle.tar",
+		tar_of(&[("a.bin", &pattern(3 * CHUNK_SIZE, 4))]),
+		|backend| {
+			backend
+				.slow
+				.insert("a.bin".to_owned(), Duration::from_millis(300));
+		},
+	);
+	let (pause, cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+	);
+	wait_until("a chunk uploads", || {
+		!setup.backend.log().upload_starts.is_empty()
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert!(finished(&setup).is_empty());
+	assert_eq!(
+		job.recorder.run_states(),
+		[
+			RunState::Running,
+			RunState::Pausing,
+			RunState::Paused,
+			RunState::Cancelling
+		]
+	);
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Cancelled);
 	assert_released(&setup, &job.reporter);
 }
 
