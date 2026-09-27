@@ -13,8 +13,8 @@ use super::{
 		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{
-			DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_default_name, detect,
-			extension_format, is_end_marker, is_tar_header,
+			DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_stem, detect, extension_format,
+			is_end_marker, is_tar_header,
 		},
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		limits::display_path,
@@ -168,7 +168,7 @@ fn extract_single(
 	archive_name: &str,
 	mut decoded: io::Chain<Cursor<&[u8]>, Expanding<'_, Box<dyn StreamDecoder + '_>>>,
 ) -> Result<ArchiveEnd, Error> {
-	let path = entry_path(archive_default_name(archive_name)).map_err(|_| {
+	let path = entry_path(archive_stem(archive_name)).map_err(|_| {
 		Error::custom(
 			ErrorKind::ArchiveUnsupported,
 			"the archive's name cannot be made into a file name",
