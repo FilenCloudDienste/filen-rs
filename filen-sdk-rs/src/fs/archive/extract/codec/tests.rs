@@ -210,7 +210,14 @@ fn sample_seen() -> Vec<Seen> {
 				target: "a.txt".into(),
 			},
 		),
-		Seen::Skipped(3, "docs/hard".into(), 0, ExtractSkipReason::Hardlink),
+		Seen::Skipped(
+			3,
+			"docs/hard".into(),
+			0,
+			ExtractSkipReason::Hardlink {
+				target: "docs/a.txt".into(),
+			},
+		),
 		Seen::Skipped(4, "../evil".into(), 4, ExtractSkipReason::UnsafePath),
 	]
 }
@@ -239,6 +246,29 @@ fn a_bare_tar_is_sent_member_by_member() {
 			duplicates: None,
 		}
 	);
+}
+
+#[test]
+fn a_hard_link_carrying_data_is_extracted_as_a_file() {
+	let mut builder = tar::Builder::new(Vec::new());
+	append(&mut builder, tar::EntryType::Regular, "a.txt", b"alpha");
+	// a pax hard link may carry the file's data, which is extracted like a file's
+	let mut hard = header(tar::EntryType::Link, 5);
+	hard.set_link_name("a.txt").unwrap();
+	hard.set_cksum();
+	builder
+		.append_data(&mut hard, "b.txt", &b"alpha"[..])
+		.unwrap();
+	let (seen, end) = run(&builder.into_inner().unwrap(), "links.tar");
+	assert_eq!(
+		seen,
+		[
+			Seen::Opened(StreamLayout::Tar { codec: None }),
+			file(0, "a.txt", b"alpha"),
+			file(1, "b.txt", b"alpha"),
+		]
+	);
+	assert_eq!(end.unwrap().unaccounted_bytes, 0);
 }
 
 #[test]

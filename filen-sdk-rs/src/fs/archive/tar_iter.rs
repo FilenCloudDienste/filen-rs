@@ -33,7 +33,12 @@ pub(crate) enum MemberKind {
 		/// The link target as stored, decoded like a path.
 		target: String,
 	},
-	Hardlink,
+	/// A second name for a member stored earlier, whose own data (when `size` is not 0: POSIX
+	/// lets a pax hard link carry it) [`TarReader::read_body`] reads.
+	Hardlink {
+		/// The earlier member's path as stored, decoded like a path.
+		target: String,
+	},
 	Device,
 	Fifo,
 	/// Stored with holes left out; skipped, since only its stored data could be written.
@@ -181,17 +186,12 @@ impl<R: Read> TarReader<R> {
 		let mut kind = match entry_type {
 			EntryType::Regular | EntryType::Continuous => MemberKind::File,
 			EntryType::Directory => MemberKind::Dir,
-			EntryType::Symlink => {
-				let target = pax
-					.link_path
-					.or(pending.long_link)
-					.or_else(|| header.link_name_bytes().map(|link| link.into_owned()))
-					.unwrap_or_default();
-				MemberKind::Symlink {
-					target: decode_path(&target).0,
-				}
-			}
-			EntryType::Link => MemberKind::Hardlink,
+			EntryType::Symlink => MemberKind::Symlink {
+				target: link_target(pax.link_path, pending.long_link, header),
+			},
+			EntryType::Link => MemberKind::Hardlink {
+				target: link_target(pax.link_path, pending.long_link, header),
+			},
 			EntryType::Char | EntryType::Block => MemberKind::Device,
 			EntryType::Fifo => MemberKind::Fifo,
 			EntryType::GNUSparse => {
@@ -356,6 +356,16 @@ fn trim_nuls(mut bytes: Vec<u8>) -> Vec<u8> {
 		bytes.pop();
 	}
 	bytes
+}
+
+/// A link member's target: its PAX `linkpath`, else its GNU long link, else the header's own
+/// field.
+fn link_target(pax: Option<Vec<u8>>, long_link: Option<Vec<u8>>, header: &Header) -> String {
+	let target = pax
+		.or(long_link)
+		.or_else(|| header.link_name_bytes().map(|link| link.into_owned()))
+		.unwrap_or_default();
+	decode_path(&target).0
 }
 
 /// A stored path as text: UTF-8 when it is, otherwise each byte as the Latin-1 character of the
@@ -567,6 +577,53 @@ mod tests {
 			MemberKind::Symlink {
 				target: "target/of/link".to_owned()
 			}
+		);
+	}
+
+	#[test]
+	fn hard_links_keep_their_target_however_it_is_stored() {
+		let long = "t/".repeat(80) + "target.txt";
+		let mut archive = Vec::new();
+		let mut link = header(b"short", b'1', 0);
+		link[157..167].copy_from_slice(b"docs/a.txt");
+		link[148..156].fill(b' ');
+		let sum: u32 = link.iter().map(|&b| u32::from(b)).sum();
+		link[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+		archive.extend_from_slice(&link);
+		member(
+			&mut archive,
+			b"././@LongLink",
+			b'K',
+			format!("{long}\0").as_bytes(),
+		);
+		member(&mut archive, b"long", b'1', b"");
+		member(
+			&mut archive,
+			b"PaxHeader",
+			b'x',
+			pax_record("linkpath", "p\u{e4}x/target").as_bytes(),
+		);
+		// POSIX lets a pax hard link carry the file's data
+		member(&mut archive, b"with-data", b'1', b"its own copy");
+		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let links: Vec<(&str, &MemberKind, &[u8])> = members
+			.iter()
+			.map(|(m, d)| (m.path.as_str(), &m.kind, d.as_slice()))
+			.collect();
+		let hardlink = |target: &str| MemberKind::Hardlink {
+			target: target.to_owned(),
+		};
+		assert_eq!(
+			links,
+			[
+				("short", &hardlink("docs/a.txt"), &b""[..]),
+				("long", &hardlink(&long), &b""[..]),
+				(
+					"with-data",
+					&hardlink("p\u{e4}x/target"),
+					&b"its own copy"[..]
+				),
+			]
 		);
 	}
 

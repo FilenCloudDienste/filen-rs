@@ -123,10 +123,10 @@ impl Default for ExtractConfig {
 pub enum ExtractSkipReason {
 	/// A symbolic link, which the drive cannot hold; `target` is the stored target, cut to at most
 	/// 4096 bytes.
-	Symlink {
-		target: String,
-	},
-	Hardlink,
+	Symlink { target: String },
+	/// A tar hard link, a second name for the earlier entry at `target` (its path as stored, cut
+	/// to at most 4096 bytes), with no data of its own.
+	Hardlink { target: String },
 	/// A device node or FIFO.
 	Device,
 	/// A sparse file, stored with its holes left out.

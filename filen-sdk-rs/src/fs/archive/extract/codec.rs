@@ -713,7 +713,9 @@ fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<(
 		let this = ordinal;
 		ordinal += 1;
 		let is_dir = match &member.kind {
+			// a hard link with data of its own holds the file, as for libarchive
 			MemberKind::File => false,
+			MemberKind::Hardlink { .. } if member.size > 0 => false,
 			MemberKind::Dir => {
 				unread = unread.saturating_add(member.size);
 				true
@@ -727,7 +729,9 @@ fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<(
 			}
 			other => {
 				let reason = match other {
-					MemberKind::Hardlink => ExtractSkipReason::Hardlink,
+					MemberKind::Hardlink { target } => ExtractSkipReason::Hardlink {
+						target: display_path(target).0.to_owned(),
+					},
 					MemberKind::Device | MemberKind::Fifo => ExtractSkipReason::Device,
 					MemberKind::Sparse => ExtractSkipReason::Sparse,
 					_ => ExtractSkipReason::UnsupportedType,
