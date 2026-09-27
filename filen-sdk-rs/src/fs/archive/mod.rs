@@ -9,3 +9,4 @@
 pub(crate) mod entry_path;
 pub(crate) mod format;
 pub(crate) mod limits;
+pub(crate) mod tar_iter;

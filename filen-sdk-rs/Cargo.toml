@@ -158,6 +158,9 @@ heif-decoder = { path = "../heif-decoder", optional = true }
 # is added only by the native target section below, so wasm builds keep
 # refusing SVG instead of carrying a rasteriser.
 microthumb = { path = "../microthumb" }
+# Archive codecs for compress/extract (fs::archive). All pure Rust, so they build for every target;
+# the service-worker build compiles them but never links them (fs::archive is cfg'd out there).
+tar = { version = "0.4.46", default-features = false }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
