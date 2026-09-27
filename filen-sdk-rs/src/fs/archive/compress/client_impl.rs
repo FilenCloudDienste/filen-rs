@@ -320,7 +320,9 @@ fn disposal<D>(
 }
 
 /// Top-level items the planner gave keep-both names, since two sources had the same name. The
-/// planner reports the other renames of top-level items itself.
+/// planner reports the other renames of top-level items itself. An item is reported once, for
+/// the reason the planner gave it: a legacy name encoded to be valid that then also collided is
+/// a keep-both rename, under the name it ended up with.
 fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
 	let reported: HashSet<Uuid> = plan
 		.renamed
@@ -644,6 +646,48 @@ mod tests {
 				.collect::<Vec<_>>(),
 			[("x.txt", "x (1).txt", RenameReason::DuplicateName)]
 		);
+	}
+
+	#[test]
+	fn a_legacy_name_that_also_collides_is_reported_once() {
+		let root = Uuid::new_v4();
+		let mut planner = ItemPlanner::default();
+		planner.add_destination(root, std::iter::empty());
+		let request = |source: PlanSource<()>| PlanRequest {
+			source,
+			destination: root,
+			name: None,
+		};
+		let plan = planner
+			.plan(vec![
+				request(PlanSource::File(file("a:b.txt", 1))),
+				request(PlanSource::File(file("a:b.txt", 2))),
+			])
+			.unwrap();
+		let [first, second] = [0, 1].map(|index| &plan.files[index]);
+		let mut renamed = plan.renamed.clone();
+		renamed.extend(top_level_renames(&plan));
+		let renamed: Vec<_> = renamed
+			.iter()
+			.map(|renamed| (renamed.source_uuid, renamed.name.clone(), renamed.reason))
+			.collect();
+		assert_eq!(
+			renamed,
+			[
+				(
+					first.source.uuid(),
+					first.name.clone(),
+					RenameReason::InvalidName
+				),
+				(
+					second.source.uuid(),
+					second.name.clone(),
+					RenameReason::DuplicateName
+				),
+			],
+			"each once, under the name it got"
+		);
+		assert_ne!(first.name, second.name);
 	}
 
 	#[test]
