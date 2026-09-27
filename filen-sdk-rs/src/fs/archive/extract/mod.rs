@@ -7,8 +7,9 @@ mod engine;
 mod report;
 
 use crate::fs::{
+	archive::dispose::SourceDisposal,
 	categories::{DirType, Normal},
-	file::enums::RemoteFileType,
+	file::{RemoteFile, enums::RemoteFileType},
 	name::ValidatedName,
 };
 
@@ -31,13 +32,27 @@ pub enum ExtractRoot {
 	Destination,
 }
 
+/// The archive to extract, and whether to remove it afterwards.
+#[derive(Debug, Clone)]
+pub enum ArchiveSource {
+	/// Any file the client can read: the user's own, shared, or in a link.
+	Keep(RemoteFileType<'static>),
+	/// One of the user's own files, removed once the extraction is verified: completed with
+	/// nothing failed, skipped or unaccounted, the archive read in full and matching the hash in
+	/// its metadata, and every extracted item confirmed with the server. Otherwise it is kept
+	/// and the report says why.
+	Dispose {
+		file: RemoteFile,
+		how: SourceDisposal,
+	},
+}
+
 /// What to extract, and where to.
 #[derive(Debug, Clone)]
 pub enum ExtractRequest {
-	/// Every entry of `archive` into `destination`, an existing directory of the user's drive.
-	/// The archive may be any file the client can read: the user's own, shared, or in a link.
+	/// Every entry of the archive into `destination`, an existing directory of the user's drive.
 	All {
-		archive: RemoteFileType<'static>,
+		archive: ArchiveSource,
 		destination: DirType<'static, Normal>,
 		root: ExtractRoot,
 	},

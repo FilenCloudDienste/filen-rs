@@ -2,14 +2,22 @@
 
 use std::sync::Arc;
 
+use filen_types::fs::Uuid;
+
 use crate::{
 	auth::Client,
-	fs::{HasName, archive::worker, drive_job::backend::ClientBackend, file::traits::HasFileInfo},
+	fs::{
+		HasName,
+		archive::worker,
+		drive_job::backend::ClientBackend,
+		file::{enums::RemoteFileType, traits::HasFileInfo},
+	},
 	job::JobControl,
 };
 
 use super::{
-	ArchiveTotals, ExtractCallback, ExtractConfig, ExtractFailed, ExtractReport, ExtractRequest,
+	ArchiveSource, ArchiveTotals, ExtractCallback, ExtractConfig, ExtractFailed, ExtractReport,
+	ExtractRequest,
 	codec::{CodecLimits, StreamJob, extract_stream},
 	engine::{ExtractTask, run_extract},
 	report::Reporter,
@@ -47,6 +55,14 @@ impl Client {
 			destination,
 			root,
 		} = request;
+		let (archive, dispose) = match archive {
+			ArchiveSource::Keep(archive) => (archive, None),
+			ArchiveSource::Dispose { file, how } => {
+				// a file in the trash has no directory to confirm it is still in, and is kept
+				let dispose = Uuid::try_from(file.parent).ok().map(|parent| (how, parent));
+				(RemoteFileType::from(file), dispose)
+			}
+		};
 		let archives = self.client().state().archives().clone();
 		let reporter = Reporter::new(
 			callback,
@@ -74,6 +90,7 @@ impl Client {
 			max_items: config.max_items,
 			config: archives,
 			start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
+			dispose,
 		})
 		.await
 	}
@@ -102,7 +119,7 @@ mod tests {
 		fn assert_send<T: Send>(_: T) {}
 		assert_send(client.extract_archive(
 			ExtractRequest::All {
-				archive,
+				archive: ArchiveSource::Keep(archive),
 				destination,
 				root: ExtractRoot::Destination,
 			},

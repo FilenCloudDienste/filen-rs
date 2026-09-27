@@ -15,6 +15,7 @@ use crate::{
 	consts::CHUNK_SIZE,
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
+		archive::dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			extract::{
@@ -56,6 +57,14 @@ impl Recorder {
 }
 
 fn archive_file(name: &str, bytes: &[u8]) -> RemoteFileType<'static> {
+	archive_file_with(name, bytes, None)
+}
+
+fn archive_file_with(
+	name: &str,
+	bytes: &[u8],
+	hash: Option<Blake3Hash>,
+) -> RemoteFileType<'static> {
 	let size = bytes.len() as u64;
 	let meta = FileMeta::Decoded(DecryptedFileMeta {
 		name: Cow::Owned(name.to_owned()),
@@ -64,7 +73,7 @@ fn archive_file(name: &str, bytes: &[u8]) -> RemoteFileType<'static> {
 		key: FileKey::V3(EncryptionKey::generate()),
 		last_modified: Utc::now(),
 		created: None,
-		hash: None,
+		hash,
 	});
 	let file: AnonymousRemoteFile = RemoteFile::from_meta(
 		Uuid::new_v4(),
@@ -146,6 +155,7 @@ struct Options {
 	control: JobControl,
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
+	dispose: Option<(SourceDisposal, Uuid)>,
 }
 
 impl Default for Options {
@@ -155,6 +165,7 @@ impl Default for Options {
 			control: JobControl::default(),
 			max_bytes: None,
 			max_items: None,
+			dispose: None,
 		}
 	}
 }
@@ -182,6 +193,7 @@ fn start_with(
 		max_items: options.max_items,
 		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 		start,
+		dispose: options.dispose,
 	}));
 	Job {
 		running,
@@ -504,4 +516,230 @@ async fn a_silent_codec_is_given_up_on() {
 	assert_released(&setup, &job.reporter);
 	// the codec's ends were held open all along
 	drop((events, result));
+}
+
+/// An archive with a hash in its metadata, placed in the fake drive in `parent`.
+fn disposable(
+	bytes: Vec<u8>,
+	hash: Option<Blake3Hash>,
+	configure: impl FnOnce(&mut FakeBackend),
+) -> (Setup, Uuid) {
+	let parent = Uuid::new_v4();
+	let mut s = setup("bundle.tar", bytes.clone(), configure);
+	let archive = archive_file_with("bundle.tar", &bytes, hash);
+	let backend = Arc::get_mut(&mut s.backend).unwrap();
+	let data = backend.contents.remove(&s.archive.uuid()).unwrap();
+	backend.contents.insert(archive.uuid(), data);
+	s.archive = archive;
+	s.backend
+		.place_file(s.archive.uuid(), parent, bytes.len() as u64);
+	(s, parent)
+}
+
+fn disposition(report: &ExtractReport) -> DisposalOutcome {
+	assert_eq!(report.dispositions.len(), 1);
+	report.dispositions[0].outcome.clone()
+}
+
+fn kept(outcome: DisposalOutcome) -> KeptReason {
+	match outcome {
+		DisposalOutcome::Kept { reason } => reason,
+		other => panic!("expected the archive kept, got {other:?}"),
+	}
+}
+
+async fn extract_disposing(
+	bytes: Vec<u8>,
+	hash: Option<Blake3Hash>,
+	how: SourceDisposal,
+	root: ExtractRoot,
+	configure: impl FnOnce(&mut FakeBackend),
+) -> (Setup, ExtractReport) {
+	let (setup, parent) = disposable(bytes, hash, configure);
+	let options = Options {
+		root,
+		dispose: Some((how, parent)),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_released(&setup, &job.reporter);
+	(setup, report)
+}
+
+fn good_tar() -> Vec<u8> {
+	tar_of(&[
+		("docs/", b""),
+		("docs/a.txt", b"alpha"),
+		("top.txt", b"top"),
+	])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_verified_archive_is_trashed_or_deleted() {
+	let tar = good_tar();
+	for how in [SourceDisposal::Trash, SourceDisposal::DeletePermanently] {
+		for root in [
+			ExtractRoot::NewFolder { name: None },
+			ExtractRoot::Destination,
+		] {
+			let (setup, report) =
+				extract_disposing(tar.clone(), Some(hash(&tar)), how, root.clone(), |_| {}).await;
+			let freed = match how {
+				SourceDisposal::Trash => 0,
+				SourceDisposal::DeletePermanently => tar.len() as u64,
+			};
+			match disposition(&report) {
+				DisposalOutcome::Disposed {
+					how: done,
+					bytes_freed,
+				} => assert_eq!((done, bytes_freed), (how, freed), "{how:?} {root:?}"),
+				other => panic!("{how:?} {root:?}: {other:?}"),
+			}
+			let log = setup.backend.log();
+			let removed = match how {
+				SourceDisposal::Trash => &log.trashed_files,
+				SourceDisposal::DeletePermanently => &log.deleted_files,
+			};
+			assert_eq!(removed, &[setup.archive.uuid()], "{how:?} {root:?}");
+		}
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_that_cannot_be_verified_is_kept() {
+	let tar = good_tar();
+	let new_folder = || ExtractRoot::NewFolder { name: None };
+
+	// no hash to check the read against, which only a permanent deletion needs
+	let (_, report) = extract_disposing(
+		tar.clone(),
+		None,
+		SourceDisposal::DeletePermanently,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::HashUnavailable
+	));
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		None,
+		SourceDisposal::Trash,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+	assert_eq!(setup.backend.log().trashed_files.len(), 1);
+
+	// a hash that does not match what was read
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(b"something else")),
+		SourceDisposal::Trash,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::HashMismatch
+	));
+	assert!(setup.backend.log().trashed_files.is_empty());
+
+	// data behind the tar
+	let mut junk = tar.clone();
+	junk.extend_from_slice(b"junk");
+	let (_, report) = extract_disposing(
+		junk.clone(),
+		Some(hash(&junk)),
+		SourceDisposal::Trash,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::UnaccountedData { bytes: 4 }
+	));
+
+	// an entry that was skipped
+	let mut builder = tar::Builder::new(Vec::new());
+	let mut link = tar::Header::new_gnu();
+	link.set_entry_type(tar::EntryType::Symlink);
+	link.set_size(0);
+	builder.append_link(&mut link, "link", "x").unwrap();
+	let linked = builder.into_inner().unwrap();
+	let (_, report) = extract_disposing(
+		linked.clone(),
+		Some(hash(&linked)),
+		SourceDisposal::Trash,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
+
+	// a file that failed to upload
+	let (setup, report) = {
+		let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+			backend
+				.fail_upload
+				.insert("a.txt".to_owned(), ErrorKind::Server);
+		});
+		let options = Options {
+			dispose: Some((SourceDisposal::Trash, parent)),
+			..Options::default()
+		};
+		let job = start(&setup, options);
+		let report = job.running.await.unwrap().unwrap();
+		(setup, report)
+	};
+	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
+	let tar = good_tar();
+	// moved elsewhere while it was extracted
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	setup
+		.backend
+		.place_file(setup.archive.uuid(), Uuid::new_v4(), tar.len() as u64);
+	let job = start(
+		&setup,
+		Options {
+			dispose: Some((SourceDisposal::Trash, parent)),
+			..Options::default()
+		},
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(matches!(kept(disposition(&report)), KeptReason::Changed));
+	assert!(setup.backend.log().trashed_files.is_empty());
+
+	// the extracted folder lost a file before the check: the fake drive forgets every file
+	// registered from now on, so the re-listing finds fewer than were created
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+		backend.forget_registered = true;
+	});
+	let job = start(
+		&setup,
+		Options {
+			dispose: Some((SourceDisposal::DeletePermanently, parent)),
+			..Options::default()
+		},
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::Unconfirmed
+	));
+	assert!(setup.backend.log().deleted_files.is_empty());
 }

@@ -46,6 +46,10 @@ use crate::{
 		HasName, HasUUID,
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
+			dispose::{
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
+				SourceDisposition, Tree, dispose_file,
+			},
 			format::archive_default_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
@@ -56,6 +60,7 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			backend::{DriveBackend, UploadSpec},
+			counts::ItemCounts,
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			ends_job,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
@@ -65,7 +70,7 @@ use crate::{
 		file::{
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
-			traits::HasFileInfo,
+			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
 		name::{
@@ -109,6 +114,8 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	/// How to remove the archive once the extraction is verified, and the directory it is in.
+	pub(crate) dispose: Option<(SourceDisposal, Uuid)>,
 }
 
 enum DirState {
@@ -203,6 +210,9 @@ struct Driver<B: DriveBackend> {
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
 	served: u64,
+	/// The archive's plaintext as the codec read it, in order.
+	archive_hasher: blake3::Hasher,
+	dispose: Option<(SourceDisposal, Uuid)>,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
 
 	/// Set up when the codec reports what the archive holds.
@@ -239,7 +249,7 @@ struct Driver<B: DriveBackend> {
 }
 
 /// Runs an extraction: waits for a job slot, starts the codec, and drives it to the end.
-pub(crate) async fn run_extract<B: DriveBackend>(
+pub(crate) async fn run_extract<B: DisposalBackend>(
 	task: ExtractTask<B>,
 ) -> Result<ExtractReport, ExtractFailed> {
 	let ExtractTask {
@@ -253,6 +263,7 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		max_items,
 		config,
 		start,
+		dispose,
 	} = task;
 	let totals = super::ArchiveTotals::Streaming {
 		archive_bytes: archive.size(),
@@ -266,6 +277,7 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		totals,
 		counts: Default::default(),
 		unaccounted_bytes: 0,
+		dispositions: Vec::new(),
 	};
 	let fail = |report: ExtractReport, phase, error: Error| {
 		reporter.finish(phase);
@@ -319,6 +331,8 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		ready: VecDeque::new(),
 		reading: None,
 		served: 0,
+		archive_hasher: blake3::Hasher::new(),
+		dispose,
 		ask: None,
 		resolver: None,
 		into_destination: false,
@@ -372,7 +386,7 @@ fn joined(segments: &[ValidatedName]) -> String {
 		.join("/")
 }
 
-impl<B: DriveBackend> Driver<B> {
+impl<B: DisposalBackend> Driver<B> {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
 		let outcome = async {
@@ -381,7 +395,20 @@ impl<B: DriveBackend> Driver<B> {
 				return Ok(());
 			}
 			self.reporter.set_phase(ExtractPhase::Finishing);
-			self.recheck_targets().await
+			self.recheck_targets().await?;
+			if let Some((how, parent)) = self.dispose {
+				self.reporter.set_phase(ExtractPhase::DisposingSources);
+				self.reporter.checkpoint(&self.control).await?;
+				let outcome = self.dispose_archive(how, parent).await;
+				let disposition = SourceDisposition {
+					uuid: self.archive.uuid(),
+					outcome,
+				};
+				self.reporter
+					.event(ExtractEvent::SourceDisposition(disposition.clone()));
+				self.report.dispositions.push(disposition);
+			}
+			Ok(())
 		}
 		.await;
 		let (phase, result) = match (outcome, &self.fatal) {
@@ -592,6 +619,7 @@ impl<B: DriveBackend> Driver<B> {
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
+		self.archive_hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
 	}
 
@@ -1419,6 +1447,75 @@ impl<B: DriveBackend> Driver<B> {
 				self.files.remove(&ordinal);
 			}
 		}
+	}
+
+	/// Removes the archive if the extraction is verified; what became of it.
+	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
+		let kept = |reason| DisposalOutcome::Kept { reason };
+		let counts = self.reporter.counts();
+		if counts.files_failed + counts.dirs_failed + counts.entries_skipped > 0 {
+			return kept(KeptReason::Incomplete);
+		}
+		if self.report.unaccounted_bytes > 0 {
+			return kept(KeptReason::UnaccountedData {
+				bytes: self.report.unaccounted_bytes,
+			});
+		}
+		// every chunk was read, so the hash covers the whole archive
+		if self.served != self.chunks {
+			return kept(KeptReason::Unconfirmed);
+		}
+		let read = Blake3Hash::from(self.archive_hasher.finalize());
+		match self.archive.hash() {
+			Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
+			None if how == SourceDisposal::DeletePermanently => {
+				return kept(KeptReason::HashUnavailable);
+			}
+			_ => {}
+		}
+		if !self.output_confirmed(counts).await {
+			return kept(KeptReason::Unconfirmed);
+		}
+		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
+		dispose_file(&*self.backend, archive, how).await
+	}
+
+	/// Whether the server holds exactly what the counts say was created: every file at its size
+	/// and every directory, listed again below the items created in the destination.
+	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
+		if self.report.omitted.top_level > 0 {
+			return false;
+		}
+		let mut found = Tree::default();
+		if !self.into_destination {
+			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
+				Ok(tree) => found = tree,
+				Err(_) => return false,
+			}
+			// the folder itself
+			found.dirs.insert(self.dirs[ROOT].uuid);
+		}
+		for top in &self.report.top_level {
+			match &top.item {
+				NonRootItemType::File(file) => match self.backend.file_state(file.uuid()).await {
+					Ok(state) if !state.trash => {
+						found.files.insert(file.uuid(), state.size);
+					}
+					_ => return false,
+				},
+				NonRootItemType::Dir(dir) => match self.backend.list_tree(dir.uuid()).await {
+					Ok(tree) => {
+						found.dirs.insert(dir.uuid());
+						found.dirs.extend(tree.dirs);
+						found.files.extend(tree.files);
+					}
+					Err(_) => return false,
+				},
+			}
+		}
+		found.files.len() as u64 == counts.files_done
+			&& found.files.values().sum::<u64>() == counts.bytes_done
+			&& found.dirs.len() as u64 == counts.dirs_created
 	}
 
 	/// The destination may have been shared or linked while the extraction ran; items created

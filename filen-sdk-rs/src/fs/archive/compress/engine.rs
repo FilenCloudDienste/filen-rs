@@ -25,6 +25,10 @@ use crate::{
 		HasUUID,
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
+			dispose::{
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
+				SourceDisposition, Tree, dispose_dir, dispose_file,
+			},
 			worker::{ARCHIVE_STALL_TIMEOUT, WorkerEvent, WorkerLink},
 		},
 		categories::{DirType, Normal},
@@ -84,6 +88,29 @@ pub(crate) struct CompressTask<B> {
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
+	pub(crate) disposal: Option<CompressDisposal>,
+}
+
+/// How to remove the sources once the archive is verified, and what the job read of them.
+#[derive(Debug)]
+pub(crate) struct CompressDisposal {
+	pub(crate) how: SourceDisposal,
+	pub(crate) targets: Vec<DisposalTarget>,
+	/// Every file read had a hash in its metadata to check it against.
+	pub(crate) all_hashed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum DisposalTarget {
+	File(ExpectedFile),
+	Dir {
+		uuid: Uuid,
+		read: Tree,
+	},
+	/// A source whose state the job cannot compare against (it is in the trash).
+	Unavailable {
+		uuid: Uuid,
+	},
 }
 
 /// A chunk of a source: its source number and index.
@@ -142,12 +169,14 @@ struct Driver<B: DriveBackend> {
 	max_bytes: Option<u64>,
 	stamp: u64,
 	stalled_ticks: u32,
+	/// A source's data did not match the hash in its metadata.
+	hash_mismatch: bool,
 	fatal: Option<Arc<Error>>,
 }
 
 /// Runs a compression: waits for a job slot, starts the codec, uploads the archive and
 /// registers it.
-pub(crate) async fn run_compress<B: DriveBackend>(
+pub(crate) async fn run_compress<B: DisposalBackend>(
 	task: CompressTask<B>,
 ) -> Result<CompressReport, CompressFailed> {
 	let CompressTask {
@@ -162,6 +191,7 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 		config,
 		start,
 		mut report,
+		disposal,
 	} = task;
 	let shape = NameShape::FileWithExtension { len: extension_len };
 	let fail = |mut report: CompressReport, phase, error: Error| {
@@ -256,8 +286,11 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 		max_bytes,
 		stamp: 0,
 		stalled_ticks: 0,
+		hash_mismatch: false,
 		fatal: None,
 	};
+	let incomplete = !report.skipped.is_empty();
+	let mut dispositions = Vec::new();
 	driver.next_fetch = driver.first_chunk_from(0);
 	driver.next_served = driver.next_fetch;
 	let outcome = async {
@@ -266,7 +299,13 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 			return Err(Stopped);
 		}
 		driver.reporter.set_phase(CompressPhase::Finishing);
-		driver.register(name, shape, targets).await
+		let archive = driver.register(name, shape, targets).await?;
+		if let Some(disposal) = disposal {
+			driver.reporter.set_phase(CompressPhase::DisposingSources);
+			driver.reporter.checkpoint(&driver.control).await?;
+			dispositions = driver.dispose(disposal, &archive, incomplete).await;
+		}
+		Ok(archive)
 	}
 	.await;
 	let Driver {
@@ -289,6 +328,7 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 		),
 		(Ok(archive), None) => {
 			report.archive = Some(archive);
+			report.dispositions = dispositions;
 			(CompressPhase::Done, Ok(()))
 		}
 	};
@@ -311,7 +351,7 @@ fn worker_died() -> Error {
 	)
 }
 
-impl<B: DriveBackend> Driver<B> {
+impl<B: DisposalBackend> Driver<B> {
 	/// The first chunk of the first source with data at or after `source`, or the end.
 	fn first_chunk_from(&self, mut source: usize) -> (usize, u64) {
 		while source < self.sources.len() && self.sources[source].chunks == 0 {
@@ -470,6 +510,7 @@ impl<B: DriveBackend> Driver<B> {
 				"source {} of an archive does not match the hash in its metadata",
 				state.file.uuid()
 			);
+			self.hash_mismatch = true;
 			let event = CompressEvent::SourceHashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
@@ -581,6 +622,68 @@ impl<B: DriveBackend> Driver<B> {
 		self.codec_result = Some(result);
 	}
 
+	/// Removes the sources if the archive is verified; what became of each.
+	async fn dispose(
+		&mut self,
+		disposal: CompressDisposal,
+		archive: &crate::fs::file::RemoteFile,
+		incomplete: bool,
+	) -> Vec<SourceDisposition> {
+		let CompressDisposal {
+			how,
+			targets,
+			all_hashed,
+		} = disposal;
+		let held_back = if incomplete {
+			Some(KeptReason::Incomplete)
+		} else if self.hash_mismatch {
+			Some(KeptReason::HashMismatch)
+		} else if how == SourceDisposal::DeletePermanently && !all_hashed {
+			Some(KeptReason::HashUnavailable)
+		} else {
+			// the archive as the server holds it
+			match self.backend.file_state(archive.uuid()).await {
+				Ok(state)
+					if !state.trash
+						&& !state.versioned
+						&& state.size == self.written
+						&& state.chunks == self.next_index =>
+				{
+					None
+				}
+				_ => Some(KeptReason::Unconfirmed),
+			}
+		};
+		let mut dispositions = Vec::with_capacity(targets.len());
+		for target in targets {
+			let (uuid, outcome) = match (&held_back, target) {
+				(Some(reason), target) => (
+					target.uuid(),
+					DisposalOutcome::Kept {
+						reason: reason.clone(),
+					},
+				),
+				(None, DisposalTarget::File(file)) => {
+					(file.uuid, dispose_file(&*self.backend, file, how).await)
+				}
+				(None, DisposalTarget::Dir { uuid, read }) => {
+					(uuid, dispose_dir(&*self.backend, uuid, &read, how).await)
+				}
+				(None, DisposalTarget::Unavailable { uuid }) => (
+					uuid,
+					DisposalOutcome::Kept {
+						reason: KeptReason::Changed,
+					},
+				),
+			};
+			let disposition = SourceDisposition { uuid, outcome };
+			self.reporter
+				.event(CompressEvent::SourceDisposition(disposition.clone()));
+			dispositions.push(disposition);
+		}
+		dispositions
+	}
+
 	/// Registers the uploaded archive in the destination.
 	async fn register(
 		&mut self,
@@ -640,6 +743,15 @@ impl<B: DriveBackend> Driver<B> {
 				self.fatal = Some(Arc::new(error));
 				Err(Stopped)
 			}
+		}
+	}
+}
+
+impl DisposalTarget {
+	fn uuid(&self) -> Uuid {
+		match self {
+			Self::File(file) => file.uuid,
+			Self::Dir { uuid, .. } | Self::Unavailable { uuid } => *uuid,
 		}
 	}
 }

@@ -28,13 +28,15 @@ mod xz;
 use std::io::{self, Read};
 
 use super::format::StreamCodec;
+pub(crate) use input::Trailing;
 use input::{Input, TRUNCATED};
 
 /// How a decoded stream ended, once its decoder has returned `Ok(0)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamEnd {
 	pub(crate) check: StreamCheck,
-	/// Bytes after the last member that belong to none, or 0 when all of them are zero (padding).
+	/// Bytes after the last member that belong to none, counted from the first non-zero one: zero
+	/// bytes before it are padding.
 	pub(crate) unaccounted_bytes: u64,
 }
 

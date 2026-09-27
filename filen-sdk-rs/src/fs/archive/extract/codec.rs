@@ -10,7 +10,7 @@ use crate::{Error, ErrorKind};
 
 use super::{
 	super::{
-		decode::{CodecError, StreamDecoder, codec_error, open_stream},
+		decode::{CodecError, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{DETECT_HEAD_LEN, Detected, archive_default_name, detect, is_tar_header},
 		limits::display_path,
@@ -262,17 +262,16 @@ impl<D: Read> Read for Expanding<'_, D> {
 	}
 }
 
-/// Reads `reader` to its end; how many bytes that was, or 0 when all of them are zero.
+/// Reads `reader` to its end; the bytes from the first non-zero one on (see [`Trailing`]).
 fn drain_trailing(mut reader: impl Read) -> io::Result<u64> {
 	let mut buf = [0u8; 8192];
-	let (mut total, mut non_zero) = (0u64, false);
+	let mut trailing = Trailing::default();
 	loop {
 		let n = read_full(&mut reader, &mut buf)?;
 		if n == 0 {
-			return Ok(if non_zero { total } else { 0 });
+			return Ok(trailing.unaccounted());
 		}
-		total += n as u64;
-		non_zero |= buf[..n].iter().any(|&b| b != 0);
+		trailing.push(&buf[..n]);
 	}
 }
 

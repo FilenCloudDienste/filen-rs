@@ -80,22 +80,21 @@ impl<R: Read> Input<R> {
 		Ok(())
 	}
 
-	/// Reads the input to its end and returns how many bytes that was, or 0 if all of them (and
-	/// `prefix`, bytes a decoder took from the input but didn't use) are zero.
+	/// Reads the input to its end and returns how many bytes there were from the first non-zero
+	/// one on (`prefix`, bytes a decoder took from the input but did not use, comes first):
+	/// zero bytes before any data are padding, not data.
 	pub(super) fn drain_trailing(&mut self, prefix: &[u8]) -> io::Result<u64> {
-		let mut total = prefix.len() as u64;
-		let mut non_zero = prefix.iter().any(|&b| b != 0);
+		let mut trailing = Trailing::default();
+		trailing.push(prefix);
 		loop {
 			let buffered = self.fill_buf()?;
 			if buffered.is_empty() {
-				break;
+				return Ok(trailing.unaccounted());
 			}
-			non_zero |= buffered.iter().any(|&b| b != 0);
 			let len = buffered.len();
-			total += len as u64;
+			trailing.push(buffered);
 			self.consume(len);
 		}
-		Ok(if non_zero { total } else { 0 })
 	}
 
 	fn read_inner(&mut self) -> io::Result<usize> {
@@ -109,6 +108,28 @@ impl<R: Read> Input<R> {
 				Err(e) => return Err(io::Error::new(e.kind(), SourceError(e))),
 			}
 		}
+	}
+}
+
+/// Counts the bytes after the end of what a reader understood: from the first non-zero one to
+/// the end, since zero bytes before any data are padding.
+#[derive(Debug, Default)]
+pub(crate) struct Trailing {
+	/// Bytes since the first non-zero one, once there was one.
+	since_data: Option<u64>,
+}
+
+impl Trailing {
+	pub(crate) fn push(&mut self, bytes: &[u8]) {
+		match (&mut self.since_data, bytes.iter().position(|&b| b != 0)) {
+			(Some(count), _) => *count += bytes.len() as u64,
+			(None, Some(first)) => self.since_data = Some((bytes.len() - first) as u64),
+			(None, None) => {}
+		}
+	}
+
+	pub(crate) fn unaccounted(&self) -> u64 {
+		self.since_data.unwrap_or(0)
 	}
 }
 
@@ -187,7 +208,8 @@ mod tests {
 		let mut data = [0u8; 100];
 		data[70] = 1;
 		let mut input = Input::new(&data[..], 16);
-		assert_eq!(input.drain_trailing(&[0, 0]).unwrap(), 102);
+		// from the first non-zero byte on
+		assert_eq!(input.drain_trailing(&[0, 0]).unwrap(), 30);
 
 		let mut input = Input::new(&[0u8; 4][..], 16);
 		assert_eq!(input.drain_trailing(&[9]).unwrap(), 5);

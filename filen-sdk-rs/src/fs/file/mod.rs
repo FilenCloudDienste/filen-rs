@@ -752,6 +752,8 @@ pub(crate) fn make_mime(name: &str, mime: Option<String>) -> String {
 pub struct FileWithInfo {
 	pub file: RemoteFile,
 	pub versioned: bool,
+	/// The file is in the trash.
+	pub trash: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

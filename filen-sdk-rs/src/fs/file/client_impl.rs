@@ -202,10 +202,15 @@ impl Client {
 	pub async fn get_file_with_info(&self, uuid: Uuid) -> Result<FileWithInfo, Error> {
 		let response = api::v3::file::post(self.client(), &api::v3::file::Request { uuid }).await?;
 		let versioned = response.versioned;
+		let trash = response.trash;
 		// The requested uuid, not `response.uuid`: for a superseded (archived) uuid the
 		// caller asked about THAT row, and the response's stable id is the lineage's.
 		let file = self.decrypt_file_response(uuid, response).await?;
-		Ok(FileWithInfo { file, versioned })
+		Ok(FileWithInfo {
+			file,
+			versioned,
+			trash,
+		})
 	}
 
 	/// Fetch the CURRENT head of a file's lineage by its whole-life id. A file's `uuid` is

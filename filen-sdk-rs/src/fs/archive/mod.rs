@@ -5,6 +5,7 @@
 pub mod compress;
 pub(crate) mod config;
 pub(crate) mod decode;
+pub(crate) mod dispose;
 pub(crate) mod encode;
 pub(crate) mod entry_path;
 pub mod extract;
@@ -15,3 +16,4 @@ pub(crate) mod tar_iter;
 pub(crate) mod worker;
 
 pub use config::ArchiveConfig;
+pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};

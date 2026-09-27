@@ -26,6 +26,7 @@ use crate::{
 			},
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			decode::open_stream,
+			dispose::{DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree},
 			encode::Compression,
 			format::StreamCodec,
 			tar_iter::TarReader,
@@ -173,6 +174,29 @@ fn start_with(
 	max_bytes: Option<u64>,
 	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 ) -> Job {
+	start_disposing(
+		setup,
+		name,
+		format,
+		control,
+		max_bytes,
+		start,
+		None,
+		CompressReport::default(),
+	)
+}
+
+#[expect(clippy::too_many_arguments)]
+fn start_disposing(
+	setup: &Setup,
+	name: &str,
+	format: CompressFormat,
+	control: JobControl,
+	max_bytes: Option<u64>,
+	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	disposal: Option<CompressDisposal>,
+	report: CompressReport,
+) -> Job {
 	let recorder = Arc::new(Recorder::default());
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
@@ -194,7 +218,8 @@ fn start_with(
 		max_bytes,
 		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 		start,
-		report: CompressReport::default(),
+		report,
+		disposal,
 	}));
 	Job {
 		running,
@@ -434,4 +459,250 @@ async fn a_silent_codec_is_given_up_on() {
 	assert!(setup.backend.log().finished.is_empty());
 	assert_released(&setup, &job.reporter);
 	drop((events, result));
+}
+
+/// The sources as placed in the fake drive: `docs` (holding the first two files) in `parent`,
+/// and the third file next to it.
+struct Placed {
+	parent: Uuid,
+	docs: Uuid,
+}
+
+fn place(setup: &Setup) -> Placed {
+	let parent = Uuid::new_v4();
+	let docs = Uuid::new_v4();
+	setup.backend.place_dir(docs, parent);
+	for (index, (_, file)) in setup.sources.iter().enumerate() {
+		let at = if index < 2 { docs } else { parent };
+		setup.backend.place_file(file.uuid(), at, file.size());
+	}
+	Placed { parent, docs }
+}
+
+fn targets(setup: &Setup, placed: &Placed) -> Vec<DisposalTarget> {
+	let read = Tree {
+		files: setup.sources[..2]
+			.iter()
+			.map(|(_, file)| (file.uuid(), file.size()))
+			.collect(),
+		dirs: Default::default(),
+	};
+	let top = &setup.sources[2].1;
+	vec![
+		DisposalTarget::Dir {
+			uuid: placed.docs,
+			read,
+		},
+		DisposalTarget::File(ExpectedFile::of(top, top.uuid(), placed.parent)),
+	]
+}
+
+async fn compress_disposing(
+	setup: &Setup,
+	how: SourceDisposal,
+	all_hashed: bool,
+	report: CompressReport,
+) -> CompressReport {
+	let placed = place(setup);
+	let disposal = CompressDisposal {
+		how,
+		targets: targets(setup, &placed),
+		all_hashed,
+	};
+	let job = CompressJob {
+		format: CompressFormat::Tar { compression: None },
+		entries: setup.entries.clone(),
+	};
+	let job = start_disposing(
+		setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+		Some(disposal),
+		report,
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert_released(setup, &job.reporter);
+	report
+}
+
+fn outcomes(report: &CompressReport) -> Vec<DisposalOutcome> {
+	report
+		.dispositions
+		.iter()
+		.map(|disposition| disposition.outcome.clone())
+		.collect()
+}
+
+fn all_kept_for(report: &CompressReport, expected: fn(&KeptReason) -> bool) {
+	assert_eq!(report.dispositions.len(), 2);
+	for outcome in outcomes(report) {
+		match outcome {
+			DisposalOutcome::Kept { reason } => assert!(expected(&reason), "{reason:?}"),
+			other => panic!("expected the source kept, got {other:?}"),
+		}
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verified_sources_are_trashed() {
+	let setup = setup(|_, _| {});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::Trash,
+		true,
+		CompressReport::default(),
+	)
+	.await;
+	for outcome in outcomes(&report) {
+		assert!(matches!(
+			outcome,
+			DisposalOutcome::Disposed {
+				how: SourceDisposal::Trash,
+				bytes_freed: 0
+			}
+		));
+	}
+	let log = setup.backend.log();
+	assert_eq!(log.trashed_files, [setup.sources[2].1.uuid()]);
+	assert_eq!(log.trashed_dirs.len(), 1);
+	assert!(log.deleted_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permanent_removal_deletes_what_was_read_and_trashes_the_emptied_directory() {
+	let setup = setup(|_, _| {});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::DeletePermanently,
+		true,
+		CompressReport::default(),
+	)
+	.await;
+	let freed: Vec<u64> = outcomes(&report)
+		.into_iter()
+		.map(|outcome| match outcome {
+			DisposalOutcome::Disposed { bytes_freed, .. } => bytes_freed,
+			other => panic!("{other:?}"),
+		})
+		.collect();
+	let sizes: Vec<u64> = setup.contents.iter().map(|c| c.len() as u64).collect();
+	assert_eq!(freed, [sizes[0] + sizes[1], sizes[2]]);
+	let log = setup.backend.log();
+	let mut deleted = log.deleted_files.clone();
+	deleted.sort();
+	let mut expected: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
+	expected.sort();
+	assert_eq!(deleted, expected);
+	assert_eq!(
+		log.trashed_dirs.len(),
+		1,
+		"the emptied directory is trashed, never purged"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_that_changed_is_kept_on_its_own() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	// a file arrived in the directory after it was read
+	setup.backend.place_file(Uuid::new_v4(), placed.docs, 10);
+	let disposal = CompressDisposal {
+		how: SourceDisposal::DeletePermanently,
+		targets: targets(&setup, &placed),
+		all_hashed: true,
+	};
+	let job = CompressJob {
+		format: CompressFormat::Tar { compression: None },
+		entries: setup.entries.clone(),
+	};
+	let job = start_disposing(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+		Some(disposal),
+		CompressReport::default(),
+	);
+	let report = job.running.await.unwrap().unwrap();
+	let outcomes = outcomes(&report);
+	assert!(matches!(
+		&outcomes[0],
+		DisposalOutcome::Kept {
+			reason: KeptReason::Changed
+		}
+	));
+	assert!(matches!(&outcomes[1], DisposalOutcome::Disposed { .. }));
+	let log = setup.backend.log();
+	assert_eq!(
+		log.deleted_files,
+		[setup.sources[2].1.uuid()],
+		"nothing in the directory"
+	);
+	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
+	// a source whose data did not match its hash
+	let setup_mismatch = setup(|backend, files| {
+		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
+	});
+	let report = compress_disposing(
+		&setup_mismatch,
+		SourceDisposal::Trash,
+		true,
+		CompressReport::default(),
+	)
+	.await;
+	all_kept_for(&report, |reason| matches!(reason, KeptReason::HashMismatch));
+
+	// no hash to check a permanent deletion against
+	let setup_unhashed = setup(|_, _| {});
+	let report = compress_disposing(
+		&setup_unhashed,
+		SourceDisposal::DeletePermanently,
+		false,
+		CompressReport::default(),
+	)
+	.await;
+	all_kept_for(&report, |reason| {
+		matches!(reason, KeptReason::HashUnavailable)
+	});
+
+	// an entry that was skipped while planning
+	let setup_skipped = setup(|_, _| {});
+	let skipped = CompressReport {
+		skipped: vec![crate::fs::drive_job::plan::SkippedEntry {
+			source_path: "docs/secret".into(),
+			bytes: 1,
+			reason: crate::fs::drive_job::plan::SkipReason::UndecryptableFile {
+				uuid: Uuid::new_v4(),
+			},
+		}],
+		..CompressReport::default()
+	};
+	let report = compress_disposing(&setup_skipped, SourceDisposal::Trash, true, skipped).await;
+	all_kept_for(&report, |reason| matches!(reason, KeptReason::Incomplete));
+
+	// the archive is not in the drive as it was registered
+	let setup_gone = setup(|backend, _| backend.forget_registered = true);
+	let report = compress_disposing(
+		&setup_gone,
+		SourceDisposal::Trash,
+		true,
+		CompressReport::default(),
+	)
+	.await;
+	all_kept_for(&report, |reason| matches!(reason, KeptReason::Unconfirmed));
+
+	for setup in [setup_mismatch, setup_unhashed, setup_skipped, setup_gone] {
+		let log = setup.backend.log();
+		assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
+		assert!(log.trashed_dirs.is_empty());
+	}
 }

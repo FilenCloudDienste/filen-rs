@@ -8,6 +8,7 @@ use filen_types::fs::Uuid;
 use crate::{
 	Error,
 	fs::{
+		archive::dispose::SourceDisposition,
 		drive_job::{
 			listing::ScanProgress,
 			plan::{PlanTotals, RenamedEntry, SkippedEntry},
@@ -32,6 +33,8 @@ pub enum CompressPhase {
 	Compressing,
 	/// Registering the archive in the destination.
 	Finishing,
+	/// Removing the sources, once the archive is verified.
+	DisposingSources,
 	Done,
 	Cancelled,
 	/// Ended early by an error that affects the whole job.
@@ -68,6 +71,8 @@ pub enum CompressEvent {
 		source_uuid: Uuid,
 		path: String,
 	},
+	/// What became of a source, when the sources were to be removed.
+	SourceDisposition(SourceDisposition),
 	/// The archive was registered but could not be added to one of the destination's public
 	/// links or shares.
 	PropagationFailed {
@@ -103,6 +108,8 @@ pub struct CompressReport {
 	pub counts: CompressCounts,
 	/// For a job refused up front for `max_bytes`: the archive's exact size.
 	pub needed_bytes: Option<u64>,
+	/// What became of each source, when the sources were to be removed.
+	pub dispositions: Vec<SourceDisposition>,
 }
 
 impl JobReport for CompressReport {
