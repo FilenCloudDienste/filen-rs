@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Heavier checks that run before every push.
 # Mirrors .github/workflows/ci.yml: the Linux job's clippy configurations + unit
-# tests, plus both of the ci-wasm job's clippy passes on the feature sets that
-# job uses. This is where the heif-decoder passes live — pre-commit runs the
-# same wasm configurations without heif-decoder so committing stays fast.
+# tests (with and without uniffi), plus both of the ci-wasm job's clippy passes
+# on the feature sets that job uses. This is where the heif-decoder passes live
+# — pre-commit runs the same wasm configurations without heif-decoder so
+# committing stays fast.
 #
 # Tools this hook needs beyond cargo, all of them for heif-decoder's vendored
 # C++ (see the Git Hooks section of CLAUDE.md):
@@ -210,6 +211,12 @@ fi
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
 	run "cargo test${heif_scope:+ $heif_scope} --lib --no-fail-fast" \
 		cargo test $heif_scope --lib --no-fail-fast
+	# The binding layers' tests (fs/*/js_impl.rs, js/uniffi.rs) are gated on
+	# `uniffi`, which no workspace member turns on, so the run above never builds
+	# them. Package-scoped, so heif-decoder is not built whatever SKIP_HEAVY_CLIPPY
+	# says; the features are the mobile bindings' minus heif-decoder (matches CI).
+	run "cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache --no-fail-fast" \
+		cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache --no-fail-fast
 else
 	printf '%sSKIP_TESTS=1, skipping cargo test --lib%s\n' "$yellow" "$reset"
 fi

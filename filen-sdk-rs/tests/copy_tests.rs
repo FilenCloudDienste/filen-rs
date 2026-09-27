@@ -6,7 +6,7 @@ use filen_sdk_rs::fs::copy::{RenameReason, SkipReason};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::{Client, http::ClientConfig, unauth::UnauthClient},
-	connect::{DirPublicInfo, DirPublicLink, PublicLinkSharedClientExt},
+	connect::{DirPublicLink, PublicLinkSharedClientExt},
 	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
 	fs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
@@ -28,8 +28,11 @@ use filen_sdk_rs::{
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpersExt};
 use futures::{StreamExt, stream};
 
-mod copy_helpers;
-use copy_helpers::{Recorder, SignalOnCreate, assert_same_files, contents, copy, data, upload};
+mod drive_helpers;
+use drive_helpers::{
+	Recorder, SignalOnCreate, assert_same_files, contents, copy, data, dir_link_info, linked_file,
+	upload,
+};
 
 #[shared_test_runtime]
 async fn copy_tree_keeps_contents_and_metadata() {
@@ -204,24 +207,10 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 	let test_dir = &resources.dir;
 	let unauthed = client.get_unauthed();
 
-	async fn link_info(client: &Client, dir: &RemoteDirectory) -> DirPublicInfo {
-		let link: DirPublicLink = client
-			.public_link_dir::<fn(u64, Option<u64>)>(dir, None)
-			.await
-			.unwrap()
-			.try_into()
-			.unwrap();
-		client
-			.get_unauthed()
-			.get_dir_public_link_info(*link.uuid(), &link.key_string())
-			.await
-			.unwrap()
-	}
-
 	// the source: a directory read through its public link
 	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
 	upload(&client, &source, "inside.txt", b"linked content").await;
-	let source_link = link_info(&client, &source).await;
+	let source_link = dir_link_info(&client, &source).await;
 	let linked_source = || {
 		CopySource::Dir(CopySourceDir::Linked(
 			DirType::Root(Cow::Owned(source_link.root.clone())),
@@ -242,7 +231,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 		.create_dir(&(&linked).into(), "copies")
 		.await
 		.unwrap();
-	let destination_link = link_info(&client, &linked).await;
+	let destination_link = dir_link_info(&client, &linked).await;
 
 	let report = copy(&client, vec![linked_source()], &destination)
 		.await
@@ -407,12 +396,7 @@ async fn copies_from_public_links() {
 		.into_iter()
 		.find(|d| d.uuid() == sub.uuid())
 		.unwrap();
-	let file_link = client.public_link_file(&file).await.unwrap();
-	let file_key = file.key().unwrap().to_str();
-	let linked_file = unauthed
-		.get_linked_file(file_link.uuid(), file_key.as_ref(), None)
-		.await
-		.unwrap();
+	let linked_file = linked_file(&client, &file).await;
 	let report = copy(
 		&client,
 		vec![
@@ -420,7 +404,7 @@ async fn copies_from_public_links() {
 				DirType::Dir(Cow::Owned(sub_linked)),
 				link,
 			)),
-			CopySource::File(linked_file.into()),
+			CopySource::File(linked_file),
 		],
 		&destination,
 	)

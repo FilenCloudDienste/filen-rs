@@ -82,6 +82,17 @@ jobs:
           TEST_SHARE_EMAIL: 'test_share@filen.io'
           TEST_SHARE_PASSWORD: 'test_share_password'
           RUST_LOG: debug
+      # The binding layers' tests (fs/*/js_impl.rs, js/uniffi.rs) are gated on
+      # `uniffi`, which no workspace member turns on, so the step above never
+      # builds them. The mobile bindings' features, minus heif-decoder.
+      - name: Run unit tests with uniffi
+        run: cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache --no-fail-fast
+        env:
+          TEST_EMAIL: 'test@filen.io'
+          TEST_PASSWORD: 'testpassword'
+          TEST_SHARE_EMAIL: 'test_share@filen.io'
+          TEST_SHARE_PASSWORD: 'test_share_password'
+          RUST_LOG: debug
 
   ci-windows:
     runs-on: windows-latest

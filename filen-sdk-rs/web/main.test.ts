@@ -2176,31 +2176,21 @@ test("copyItems copies a tree and delivers every callback in order before it res
 	const { source, big } = await copySource(parent)
 	const destination = await state.createDir(parent, "destination")
 
-	const log: string[] = []
+	const copied = callbackLog()
+	const { log } = copied
 	const updates: CopyUpdate[] = []
-	let resolved = false
-	let lateCallbacks = 0
 	const report = await state.copyItems({
 		items: [source],
 		destination,
-		onTopLevelPlanned: items => {
-			lateCallbacks += resolved ? 1 : 0
-			log.push(`planned:${items.length}`)
-		},
-		onTopLevelCreated: item => {
-			lateCallbacks += resolved ? 1 : 0
-			log.push(`created:${item.request}`)
-		},
+		onTopLevelPlanned: items => copied.note(`planned:${items.length}`),
+		onTopLevelCreated: item => copied.note(`created:${item.request}`),
 		onUpdate: update => {
-			lateCallbacks += resolved ? 1 : 0
 			updates.push(update)
-			log.push(`update:${update.phase}`)
+			copied.note(`update:${update.phase}`)
 		}
 	})
-	resolved = true
-	await new Promise(resolve => setTimeout(resolve, 500))
 
-	expect(lateCallbacks).toBe(0)
+	expect(await copied.resolved()).toBe(0)
 	expect(report.error).toBeUndefined()
 	expect(report.failures).toHaveLength(0)
 	expect(report.topLevel).toHaveLength(1)
@@ -2336,6 +2326,29 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	expect(again.error).toBeUndefined()
 	expect(nameOf(again.topLevel[0].item)).toBe("dir (1)")
 })
+
+/// The callbacks of one job, in the order they came, and how many came after its call
+/// resolved (there must be none: the SDK delivers everything a job reported first).
+function callbackLog() {
+	const log: string[] = []
+	let resolved = false
+	let late = 0
+	return {
+		log,
+		note(entry: string) {
+			late += resolved ? 1 : 0
+			log.push(entry)
+		},
+		/// Marks the call resolved, then makes one more round trip through the SDK's worker: its
+		/// answer reaches this thread after anything the job posted before it, so a callback
+		/// still on its way has landed, and been counted, by the time this returns.
+		async resolved() {
+			resolved = true
+			await state.isSocketConnected()
+			return late
+		}
+	}
+}
 
 afterAll(async () => {
 	if (state && testDir) {
