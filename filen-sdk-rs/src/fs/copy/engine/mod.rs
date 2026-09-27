@@ -1,4 +1,4 @@
-//! Runs a [`ItemPlan`]: creates the directories parent first, then copies the files, each
+//! Runs an [`ItemPlan`]: creates the directories parent first, then copies the files, each
 //! through a chunk pipeline.
 //!
 //! # Memory and deadlock-freedom
