@@ -270,6 +270,26 @@ mod tests {
 	}
 
 	#[test]
+	fn a_stem_that_ran_out_of_counters_keeps_counting_where_it_left_off() {
+		let below_max = format!("a ({}).txt", u64::MAX - 1);
+		let max = format!("a ({}).txt", u64::MAX);
+		let numbered = format!("a ({}) (1).txt", u64::MAX - 1);
+		let mut names =
+			TakenNames::new(["a.txt", below_max.as_str(), max.as_str(), numbered.as_str()]);
+		let allocated = [below_max.as_str(), below_max.as_str(), "a.txt"]
+			.map(|name| String::from(names.allocate(source_name(name), NameShape::File).unwrap()));
+		assert_eq!(
+			allocated,
+			[
+				format!("a ({}) (2).txt", u64::MAX - 1),
+				format!("a ({}) (3).txt", u64::MAX - 1),
+				// the stem's counters are its own: the plain name's first one is still free
+				"a (1).txt".to_owned(),
+			]
+		);
+	}
+
+	#[test]
 	fn a_known_compound_extension_is_kept_apart_whole() {
 		let mut names = TakenNames::new(["photos.tar.gz"]);
 		let shape = NameShape::FileWithExtension {
