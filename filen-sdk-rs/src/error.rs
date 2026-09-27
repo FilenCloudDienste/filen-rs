@@ -183,7 +183,9 @@ pub enum ErrorKind {
 	ArchiveWorkerDied,
 	/// An archive's entries are encrypted, and no password was given.
 	ArchivePasswordRequired,
-	/// The password given does not open the archive's entries.
+	/// The password given does not open the archive's entries. Usually found before anything is
+	/// created; an extraction that finds it only later, before any file was extracted, moves the
+	/// folders it created to the trash, so a retry with the right password starts clean.
 	ArchiveWrongPassword,
 }
 
