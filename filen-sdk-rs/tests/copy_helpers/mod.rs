@@ -14,8 +14,8 @@ use filen_sdk_rs::{
 		HasUUID,
 		categories::{Normal, fs::CategoryFSExt},
 		copy::{
-			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopySource,
-			CopyUpdate, JobControl, PlannedTopLevelItem, RunState,
+			CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyReport, CopyUpdate,
+			ItemSource, JobControl, PlannedTopLevelItem, RunState,
 		},
 		dir::RemoteDirectory,
 		file::{RemoteFile, traits::HasFileInfo},
@@ -93,7 +93,7 @@ pub async fn contents(
 /// Copies `sources` into `destination` with the default config and no pause or cancel.
 pub async fn copy(
 	client: &Arc<Client>,
-	sources: Vec<CopySource>,
+	sources: Vec<ItemSource>,
 	destination: &RemoteDirectory,
 ) -> Result<CopyReport, CopyFailed> {
 	client

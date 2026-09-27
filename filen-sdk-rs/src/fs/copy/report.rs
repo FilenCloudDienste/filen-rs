@@ -11,7 +11,6 @@ use crate::{
 	fs::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::counts::ItemCounts,
-		file::enums::RemoteFileType,
 	},
 	job::{
 		self,
@@ -24,7 +23,10 @@ use crate::{
 pub(crate) use crate::job::report::OpGuard;
 pub use crate::job::report::RunState;
 
-use super::plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry};
+use crate::fs::drive_job::{
+	listing::{FailedSource, ScanProgress},
+	plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
@@ -45,16 +47,6 @@ pub enum CopyPhase {
 	Cancelled,
 	/// Ended early by an error that affects the whole job (e.g. no storage left).
 	Failed,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default)]
-pub struct ScanProgress {
-	pub sources_done: u64,
-	pub sources_total: u64,
-	/// Bytes of listing responses received so far, and the expected total when known.
-	pub listing_bytes: u64,
-	pub listing_total_bytes: Option<u64>,
 }
 
 /// A file being copied right now.
@@ -112,14 +104,6 @@ pub struct FailureInfo {
 	/// Files and bytes not copied because of this failure (a directory's whole subtree).
 	pub affected_files: u64,
 	pub affected_bytes: u64,
-}
-
-/// The source of a failed item: a file can be copied again as is; a directory is addressed
-/// through the handle the caller attached to it.
-#[derive(Debug, Clone)]
-pub enum FailedSource<D> {
-	File(Box<RemoteFileType<'static>>),
-	Dir(D),
 }
 
 #[derive(Debug, Clone)]

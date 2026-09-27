@@ -10,11 +10,9 @@ use tokio::task::JoinHandle;
 use super::*;
 use crate::{
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	fs::drive_job::plan::{ItemPlanner, Listed, PlanRequest, PlanSource, SourceDir},
 	fs::{
-		copy::{
-			plan::{CopyPlanner, Listed, PlanRequest, PlanSource, SourceDir},
-			report::{CopyCallback, CopyUpdate, RunState},
-		},
+		copy::report::{CopyCallback, CopyUpdate, RunState},
 		dir::RootDirectory,
 		drive_job::{
 			name_retry::TOP_LEVEL_NAME_ATTEMPTS,
@@ -114,13 +112,13 @@ impl Recorder {
 	}
 }
 
-fn plan(destination: Uuid, sources: Vec<PlanSource<()>>) -> CopyPlan<()> {
+fn plan(destination: Uuid, sources: Vec<PlanSource<()>>) -> ItemPlan<()> {
 	plan_with(destination, sources, false)
 }
 
 /// `unverified`: the destination listing had entries whose names it could not show.
-fn plan_with(destination: Uuid, sources: Vec<PlanSource<()>>, unverified: bool) -> CopyPlan<()> {
-	let mut planner = CopyPlanner::default();
+fn plan_with(destination: Uuid, sources: Vec<PlanSource<()>>, unverified: bool) -> ItemPlan<()> {
+	let mut planner = ItemPlanner::default();
 	planner.add_destination(destination, std::iter::empty());
 	if unverified {
 		planner.mark_unverified(destination);
@@ -162,7 +160,7 @@ type Running = JoinHandle<Result<CopyReport<()>, CopyFailed<()>>>;
 
 fn start(
 	backend: &Arc<FakeBackend>,
-	plan: CopyPlan<()>,
+	plan: ItemPlan<()>,
 	control: JobControl,
 ) -> (Running, Arc<Recorder>, MaybeArc<Reporter>) {
 	let recorder = Arc::new(Recorder::default());

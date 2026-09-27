@@ -9,7 +9,7 @@ use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, Shared},
-		copy::{CopyConfig, CopySource, CopySourceDir, JobControl},
+		copy::{CopyConfig, ItemSource, ItemSourceDir, JobControl},
 		dir::{RemoteDirectory, meta::DirectoryMetaChanges},
 		file::meta::FileMetaChanges,
 	},
@@ -1052,16 +1052,16 @@ async fn copy_with_shares(
 	let report = copy(
 		&share_client,
 		vec![
-			CopySource::Dir(CopySourceDir::Shared(
+			ItemSource::Dir(ItemSourceDir::Shared(
 				DirType::Root(Cow::Owned(shared_in)),
 				role.clone(),
 			)),
-			CopySource::Dir(CopySourceDir::Shared(
+			ItemSource::Dir(ItemSourceDir::Shared(
 				DirType::Dir(Cow::Owned(nested_in)),
 				role,
 			)),
-			CopySource::File(top_in.into()),
-			CopySource::File(solo_in.into()),
+			ItemSource::File(top_in.into()),
+			ItemSource::File(solo_in.into()),
 		],
 		share_test_dir,
 	)
@@ -1128,13 +1128,13 @@ async fn copy_with_shares(
 	let report = copy(
 		&share_client,
 		vec![
-			CopySource::File(mine_file.clone().into()),
-			CopySource::Dir(CopySourceDir::Normal(mine)),
-			CopySource::Dir(CopySourceDir::Shared(
+			ItemSource::File(mine_file.clone().into()),
+			ItemSource::Dir(ItemSourceDir::Normal(mine)),
+			ItemSource::Dir(ItemSourceDir::Shared(
 				DirType::Root(Cow::Owned(shared_in)),
 				role,
 			)),
-			CopySource::Dir(CopySourceDir::Linked(
+			ItemSource::Dir(ItemSourceDir::Linked(
 				DirType::Root(Cow::Owned(own_info.root)),
 				own_info.link,
 			)),
@@ -1201,7 +1201,7 @@ async fn copy_with_shares(
 	for destination in [&dest, &inner] {
 		copy(
 			&client,
-			vec![CopySource::Dir(CopySourceDir::Normal(own.clone()))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(own.clone()))],
 			destination,
 		)
 		.await
@@ -1269,7 +1269,7 @@ async fn copy_with_shares(
 		async move {
 			client
 				.copy_items(
-					vec![CopySource::Dir(CopySourceDir::Normal(own))],
+					vec![ItemSource::Dir(ItemSourceDir::Normal(own))],
 					later.into(),
 					CopyConfig::default(),
 					callback,

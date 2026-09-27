@@ -6,23 +6,25 @@ mod client_impl;
 mod engine;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod js_impl;
-mod plan;
 mod report;
 
 pub use crate::{
-	fs::drive_job::counts::ItemCounts,
+	fs::drive_job::{
+		counts::ItemCounts,
+		listing::{ItemSource, ItemSourceDir, ScanProgress},
+		plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
+	},
 	job::{JobControl, JobController},
 };
-pub use client_impl::{CopyConfig, CopyRequest, CopySource, CopySourceDir};
-pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
+pub use client_impl::{CopyConfig, CopyRequest};
 pub use report::{
 	ActiveFile, CopiedTopLevel, CopyCallback, CopyEvent, CopyPhase, CopyStage, CopyUpdate,
-	FailureInfo, PlannedTopLevelItem, RunState, ScanProgress,
+	FailureInfo, PlannedTopLevelItem, RunState,
 };
 
 // The report types are generic over how a failed directory is addressed again, which keeps the
-// planner and engine independent of the client; callers only ever see them with CopySourceDir.
-pub type CopyReport = report::CopyReport<CopySourceDir>;
-pub type CopyFailed = report::CopyFailed<CopySourceDir>;
-pub type CopyFailure = report::CopyFailure<CopySourceDir>;
-pub type FailedSource = report::FailedSource<CopySourceDir>;
+// planner and engine independent of the client; callers only ever see them with ItemSourceDir.
+pub type CopyReport = report::CopyReport<ItemSourceDir>;
+pub type CopyFailed = report::CopyFailed<ItemSourceDir>;
+pub type CopyFailure = report::CopyFailure<ItemSourceDir>;
+pub type FailedSource = crate::fs::drive_job::listing::FailedSource<ItemSourceDir>;

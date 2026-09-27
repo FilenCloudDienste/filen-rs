@@ -1,8 +1,9 @@
-//! Turns the sources of a copy (files, and directories with their recursive listings) into
-//! the directories to create, parent first, and the files to copy into them.
+//! Turns the sources of a job that recreates drive items (files, and directories with their
+//! recursive listings) into the directories to create, parent first, and the files to write into
+//! them: a copy's new items, or a compressed archive's entries.
 //!
 //! Nothing below the top level can collide with an existing item, since it lands in a
-//! directory the copy creates. Sibling names that collide in the source (case-insensitive
+//! directory the job creates. Sibling names that collide in the source (case-insensitive
 //! duplicates) are renamed rather than dropped, and a directory whose metadata cannot be
 //! decrypted is created under its uuid so its readable contents are still copied. A file
 //! whose metadata cannot be decrypted has no key to read it with, so it is skipped.
@@ -89,7 +90,7 @@ pub(crate) struct PlanRequest<D> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DestParent {
 	Existing(Uuid),
-	/// Index into [`CopyPlan::dirs`], always lower than the index of anything placed in it.
+	/// Index into [`ItemPlan::dirs`], always lower than the index of anything placed in it.
 	Planned(usize),
 }
 
@@ -196,14 +197,14 @@ pub struct PlanTotals {
 }
 
 #[derive(Debug)]
-pub(crate) struct CopyPlan<D> {
+pub(crate) struct ItemPlan<D> {
 	/// Parent first: every directory comes after the directory it is created in.
 	pub(crate) dirs: Vec<PlannedDir<D>>,
 	pub(crate) files: Vec<PlannedFile>,
 	pub(crate) top_level: Vec<PlannedTopLevel>,
 	pub(crate) skipped: Vec<SkippedEntry>,
 	/// Renames below the top level. Top-level items are renamed by keep-both as a matter of
-	/// course and are reported through [`CopyPlan::top_level`]; a name that changes again while
+	/// course and are reported through [`ItemPlan::top_level`]; a name that changes again while
 	/// copying is reported by the job.
 	pub(crate) renamed: Vec<RenamedEntry>,
 	pub(crate) totals: PlanTotals,
@@ -212,7 +213,7 @@ pub(crate) struct CopyPlan<D> {
 	pub(crate) unverified_destinations: HashSet<Uuid>,
 }
 
-impl<D> Default for CopyPlan<D> {
+impl<D> Default for ItemPlan<D> {
 	fn default() -> Self {
 		Self {
 			dirs: Vec::new(),
@@ -226,15 +227,15 @@ impl<D> Default for CopyPlan<D> {
 	}
 }
 
-/// Builds a [`CopyPlan`]. Every destination must be registered with the names it already holds
+/// Builds a [`ItemPlan`]. Every destination must be registered with the names it already holds
 /// before the plan is built, so top-level names are chosen against them.
 #[derive(Debug, Default)]
-pub(crate) struct CopyPlanner {
+pub(crate) struct ItemPlanner {
 	destinations: HashMap<Uuid, TakenNames>,
 	unverified_destinations: HashSet<Uuid>,
 }
 
-impl CopyPlanner {
+impl ItemPlanner {
 	pub(crate) fn add_destination<'a>(
 		&mut self,
 		uuid: Uuid,
@@ -252,7 +253,7 @@ impl CopyPlanner {
 
 	/// Validates every request before planning any: a directory cannot be copied into itself
 	/// or one of its descendants.
-	pub(crate) fn plan<D>(mut self, requests: Vec<PlanRequest<D>>) -> Result<CopyPlan<D>, Error> {
+	pub(crate) fn plan<D>(mut self, requests: Vec<PlanRequest<D>>) -> Result<ItemPlan<D>, Error> {
 		for request in &requests {
 			if !self.destinations.contains_key(&request.destination) {
 				return Err(Error::custom(
@@ -271,9 +272,9 @@ impl CopyPlanner {
 			}
 		}
 
-		let mut plan = CopyPlan {
+		let mut plan = ItemPlan {
 			unverified_destinations: self.unverified_destinations,
-			..CopyPlan::default()
+			..ItemPlan::default()
 		};
 		for (index, request) in requests.into_iter().enumerate() {
 			let taken = self
@@ -372,7 +373,7 @@ fn path_segment(name: Option<&str>, uuid: Uuid) -> Cow<'_, str> {
 	name.map_or_else(|| Cow::Owned(uuid.to_string()), Cow::Borrowed)
 }
 
-impl<D> CopyPlan<D> {
+impl<D> ItemPlan<D> {
 	/// Records a rename worth reporting. At the top level keep-both renames are expected and
 	/// visible through the planned name, so only the other reasons are reported there.
 	fn note_rename(
@@ -648,8 +649,8 @@ mod tests {
 		}
 	}
 
-	fn planner(destination: Uuid, existing: &[&str]) -> CopyPlanner {
-		let mut planner = CopyPlanner::default();
+	fn planner(destination: Uuid, existing: &[&str]) -> ItemPlanner {
+		let mut planner = ItemPlanner::default();
 		planner.add_destination(destination, existing.iter().copied());
 		planner
 	}
@@ -667,7 +668,7 @@ mod tests {
 	}
 
 	/// Every item comes after the directory it is created in.
-	fn assert_parent_first(plan: &CopyPlan<()>) {
+	fn assert_parent_first(plan: &ItemPlan<()>) {
 		for (index, dir) in plan.dirs.iter().enumerate() {
 			if let DestParent::Planned(parent) = dir.parent {
 				assert!(parent < index, "dir {index} precedes its parent {parent}");
@@ -732,7 +733,7 @@ mod tests {
 	#[test]
 	fn destinations_with_hidden_names_are_carried_into_the_plan() {
 		let (verified, unverified) = (Uuid::new_v4(), Uuid::new_v4());
-		let mut planner = CopyPlanner::default();
+		let mut planner = ItemPlanner::default();
 		planner.add_destination(verified, std::iter::empty());
 		planner.add_destination(unverified, std::iter::empty());
 		planner.mark_unverified(unverified);
