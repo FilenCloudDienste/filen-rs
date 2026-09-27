@@ -111,6 +111,31 @@ impl Method {
 		})
 	}
 
+	/// Its name, for display, as 7-Zip shows it.
+	pub(crate) fn name(self) -> &'static str {
+		match self {
+			Self::Copy => "Copy",
+			Self::Lzma => "LZMA",
+			Self::Lzma2 => "LZMA2",
+			Self::Ppmd => "PPMd",
+			Self::Bzip2 => "BZip2",
+			Self::Deflate => "Deflate",
+			Self::Deflate64 => "Deflate64",
+			Self::Zstd => "ZSTD",
+			Self::Bcj(Branch::X86) => "BCJ",
+			Self::Bcj(Branch::Arm) => "ARM",
+			Self::Bcj(Branch::ArmThumb) => "ARMT",
+			Self::Bcj(Branch::Arm64) => "ARM64",
+			Self::Bcj(Branch::Ppc) => "PPC",
+			Self::Bcj(Branch::Sparc) => "SPARC",
+			Self::Bcj(Branch::Ia64) => "IA64",
+			Self::Bcj(Branch::RiscV) => "RISCV",
+			Self::Bcj2 => "BCJ2",
+			Self::Delta => "Delta",
+			Self::Aes => "7zAES",
+		}
+	}
+
 	pub(crate) fn id(self) -> u64 {
 		match self {
 			Self::Copy => 0x00,

@@ -702,7 +702,14 @@ mod disposal {
 			uuid: Uuid,
 			is_dir: bool,
 		) -> Result<NonRootItemType<'static, Normal>, Error> {
-			self.log().fetched_items.push(uuid);
+			// a file in the fake drive is fetched at its size; any other is one byte
+			let (size, chunks) = {
+				let mut log = self.log();
+				log.fetched_items.push(uuid);
+				log.file_parents
+					.get(&uuid)
+					.map_or((1, 1), |&(_, size, chunks)| (size, chunks))
+			};
 			Ok(if is_dir {
 				NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
 					uuid,
@@ -718,15 +725,15 @@ mod disposal {
 					uuid,
 					StableUuid::new_for_test(uuid),
 					Uuid::new_v4().into(),
-					1,
-					1,
+					size,
+					chunks,
 					"de-1",
 					"bucket",
 					Utc::now(),
 					false,
 					FileMeta::Decoded(DecryptedFileMeta {
 						name: Cow::Borrowed("fetched"),
-						size: 1,
+						size,
 						mime: Cow::Borrowed("text/plain"),
 						key: FileKey::V3(EncryptionKey::generate()),
 						last_modified: Utc::now(),

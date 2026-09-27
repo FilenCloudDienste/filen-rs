@@ -1,0 +1,464 @@
+//! What becomes of each entry a format reader finds, decided in one place for every format:
+//! whether a partial extraction chose it, whether it is skipped (for its kind, its path, or as
+//! macOS metadata), and what a listing says of it.
+
+use std::io::{self, Read};
+
+use chrono::{DateTime, Utc};
+use filen_types::fs::Uuid;
+
+use crate::{
+	Error, ErrorKind,
+	fs::{
+		archive::{
+			entry_path::{ArchivePath, PathRejection, entry_path},
+			limits::display_path,
+			worker::{SkippedMember, WorkerEvent, WorkerPort, read_full},
+		},
+		name::{ValidatedName, keep_both::collision_key},
+	},
+};
+
+use super::super::{
+	ExtractSkipReason,
+	list::{ArchiveEntry, ArchiveEntryKind},
+	report::ArchiveEntryId,
+};
+
+/// What the codec does with the entries it reads.
+#[derive(Debug, Clone)]
+pub(crate) enum Task {
+	/// Sends the entries with their data: every one, or those a [`Selection`] chooses.
+	Extract(Option<Selection>),
+	/// Sends what every entry of the archive `archive` is, and none of their data.
+	List { archive: Uuid },
+}
+
+/// The entries a partial extraction takes, and the directory they are extracted relative to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Selection {
+	/// The chosen entries' ordinals, sorted, each once. A chosen directory brings everything
+	/// below it.
+	ordinals: Vec<u64>,
+	/// The directory, as drive names, whose contents the chosen entries are extracted as: an
+	/// entry at `base/x` lands at `x`. Empty for the archive's top.
+	base: Vec<ValidatedName>,
+}
+
+impl Selection {
+	pub(crate) fn new(ordinals: impl IntoIterator<Item = u64>, base: Vec<ValidatedName>) -> Self {
+		let mut ordinals: Vec<u64> = ordinals.into_iter().collect();
+		ordinals.sort_unstable();
+		ordinals.dedup();
+		Self { ordinals, base }
+	}
+}
+
+/// The directory Finder's zips keep macOS metadata in, beside the files it belongs to.
+const MAC_METADATA_DIR: &str = "__MACOSX";
+
+/// What an AppleDouble file starts with: the resource fork and attributes macOS keeps for a
+/// file `x`, stored beside it as `._x` where the file system cannot hold them.
+const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
+
+/// How an entry's path marks it as macOS metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MacShape {
+	/// In a `__MACOSX` folder: its path says it all.
+	InMacFolder,
+	/// A file named `._name`, which an ordinary file may be too: an AppleDouble file when its
+	/// first bytes say so.
+	AppleDoubleName,
+}
+
+/// An entry as its format's reader tells of it.
+pub(super) struct Found<'a> {
+	pub(super) ordinal: u64,
+	/// Its path as stored.
+	pub(super) stored: &'a str,
+	/// Its path as drive names, or why it has none.
+	pub(super) path: Result<ArchivePath, PathRejection>,
+	pub(super) kind: ArchiveEntryKind,
+	/// Why its kind or data keeps it from being extracted, whatever its path.
+	pub(super) unreadable: Option<ExtractSkipReason>,
+	/// The bytes it holds, as the archive states them.
+	pub(super) size: u64,
+	pub(super) modified: Option<DateTime<Utc>>,
+	pub(super) encrypted: bool,
+	pub(super) method: Option<String>,
+}
+
+impl Found<'_> {
+	fn is_dir(&self) -> bool {
+		self.kind == ArchiveEntryKind::Dir
+	}
+
+	/// How its path marks it as macOS metadata, if it does.
+	pub(super) fn mac_shape(&self) -> Option<MacShape> {
+		let path = self.path.as_ref().ok()?;
+		if path
+			.segments
+			.first()
+			.is_some_and(|first| first.as_ref() == MAC_METADATA_DIR)
+		{
+			return Some(MacShape::InMacFolder);
+		}
+		let apple_double = self.kind == ArchiveEntryKind::File
+			&& path.segments.last().is_some_and(|name| {
+				let name: &str = name.as_ref();
+				name.len() > 2 && name.starts_with("._")
+			});
+		apple_double.then_some(MacShape::AppleDoubleName)
+	}
+
+	/// The skip record for it.
+	pub(super) fn skipped(&self, reason: ExtractSkipReason) -> WorkerEvent {
+		let (path, path_truncated) = display_path(self.stored);
+		WorkerEvent::Skipped(SkippedMember {
+			ordinal: self.ordinal,
+			path: path.to_owned(),
+			path_truncated,
+			bytes: self.size,
+			reason,
+		})
+	}
+}
+
+/// What an extraction does with an entry.
+#[derive(Debug)]
+pub(super) enum Verdict {
+	/// Nothing: a partial extraction did not choose the entry, and nothing of it is read.
+	Ignore,
+	/// Nothing to create: the directory is the root the others land in.
+	Root,
+	Skip(ExtractSkipReason),
+	/// Extracted at `path`, below the extraction's root. `apple_double` when its name makes it
+	/// one, which its first bytes decide (see [`apple_double`]).
+	Take {
+		path: ArchivePath,
+		apple_double: bool,
+	},
+}
+
+/// The one place the task, the selection and the macOS metadata option apply to the entries of
+/// every format.
+pub(super) struct Walk<'p> {
+	pub(super) port: &'p WorkerPort,
+	skip_mac_metadata: bool,
+	/// The archive, when listing it.
+	listing: Option<Uuid>,
+	chooser: Option<Chooser>,
+}
+
+impl<'p> Walk<'p> {
+	pub(super) fn new(port: &'p WorkerPort, task: &Task, skip_mac_metadata: bool) -> Self {
+		let (listing, chooser) = match task {
+			Task::Extract(selection) => (None, selection.clone().map(Chooser::new)),
+			Task::List { archive } => (Some(*archive), None),
+		};
+		Self {
+			port,
+			skip_mac_metadata,
+			listing,
+			chooser,
+		}
+	}
+
+	pub(super) fn listing(&self) -> bool {
+		self.listing.is_some()
+	}
+
+	/// Checks, before anything is created, a partial extraction of an archive whose entries are
+	/// all known up front (a zip's or 7z's): that it holds every entry chosen, each below the
+	/// base. Directories chosen are noted, so what is below one is chosen wherever it is stored.
+	pub(super) fn check_selection<'e>(
+		&mut self,
+		entries: impl Iterator<Item = (u64, &'e str, bool)>,
+	) -> Result<(), Error> {
+		let Some(chooser) = &mut self.chooser else {
+			return Ok(());
+		};
+		let mut found = 0;
+		for (ordinal, stored, is_dir) in entries {
+			if chooser.selection.ordinals.binary_search(&ordinal).is_err() {
+				continue;
+			}
+			found += 1;
+			if let Ok(path) = entry_path(stored) {
+				let keys = chooser.below_base(&path)?;
+				if is_dir {
+					chooser.dirs.push(keys);
+				}
+			}
+		}
+		if found < chooser.selection.ordinals.len() {
+			return Err(not_held());
+		}
+		Ok(())
+	}
+
+	/// What an extraction does with `found`.
+	pub(super) fn judge(&mut self, found: &Found) -> Result<Verdict, Error> {
+		let is_dir = found.is_dir();
+		let path = match &mut self.chooser {
+			None => found.path.clone(),
+			Some(chooser) => match chooser.choose(found.ordinal, &found.path, is_dir)? {
+				Some(path) => path,
+				None => return Ok(Verdict::Ignore),
+			},
+		};
+		if let Some(reason) = &found.unreadable {
+			return Ok(Verdict::Skip(reason.clone()));
+		}
+		let path = match path {
+			Ok(path) => path,
+			Err(PathRejection::Empty) if is_dir => return Ok(Verdict::Root),
+			Err(rejection) => return Ok(Verdict::Skip(path_skip_reason(rejection))),
+		};
+		let apple_double = match found.mac_shape() {
+			Some(MacShape::InMacFolder) if self.skip_mac_metadata => {
+				return Ok(Verdict::Skip(ExtractSkipReason::MacMetadata));
+			}
+			Some(MacShape::AppleDoubleName) => self.skip_mac_metadata,
+			_ => false,
+		};
+		Ok(Verdict::Take { path, apple_double })
+	}
+
+	/// Once every entry was read: a partial extraction of a tar has met every entry it chose.
+	pub(super) fn finish(&self) -> Result<(), Error> {
+		match &self.chooser {
+			Some(chooser) if chooser.met < chooser.selection.ordinals.len() => Err(not_held()),
+			_ => Ok(()),
+		}
+	}
+
+	/// Sends what a listing says of `found`; whether an extraction creates it. `apple_double` is
+	/// what its data told, when read; otherwise its name decides.
+	pub(super) fn list(&self, found: Found, apple_double: Option<bool>) -> io::Result<bool> {
+		let archive = self.listing.expect("only a listing lists");
+		if found.is_dir() && matches!(found.path, Err(PathRejection::Empty)) {
+			// the archive's own root, which no extraction creates
+			return Ok(false);
+		}
+		let mac_metadata = match found.mac_shape() {
+			Some(MacShape::InMacFolder) => true,
+			Some(MacShape::AppleDoubleName) => apple_double.unwrap_or(true),
+			None => false,
+		};
+		let skip = found
+			.unreadable
+			.clone()
+			.or_else(|| found.path.as_ref().err().map(|e| path_skip_reason(*e)))
+			.or((mac_metadata && self.skip_mac_metadata).then_some(ExtractSkipReason::MacMetadata));
+		let (stored_path, stored_path_truncated) = display_path(found.stored);
+		let path = found.path.as_ref().ok();
+		let entry = ArchiveEntry {
+			id: ArchiveEntryId {
+				archive,
+				// the member cap keeps ordinals far below u32::MAX
+				index: u32::try_from(found.ordinal).unwrap_or(u32::MAX),
+			},
+			stored_path: stored_path.to_owned(),
+			stored_path_truncated,
+			path: path.map(joined),
+			size: (found.kind != ArchiveEntryKind::Dir).then_some(found.size),
+			modified: found.modified,
+			encrypted: found.encrypted,
+			method: found.method,
+			skip,
+			path_rewritten: path.is_some_and(|path| path.rewritten),
+			misleading_name: path.is_some_and(|path| path.suspicious),
+			mac_metadata,
+			kind: found.kind,
+		};
+		let extracted = entry.skip.is_none();
+		self.port.send(WorkerEvent::Listed(Box::new(entry)))?;
+		Ok(extracted)
+	}
+
+	/// The verdict on an entry `first` took into the job, once its data told more of it than its
+	/// header did (a 7z link's target, or whether a reparse point is a link at all).
+	pub(super) fn judge_again(&self, found: &Found, first: Verdict) -> Verdict {
+		match (first, &found.unreadable) {
+			(first @ (Verdict::Ignore | Verdict::Root), _) => first,
+			// what its kind skips it for comes first, as in `judge`
+			(_, Some(reason)) => Verdict::Skip(reason.clone()),
+			(first, None) => first,
+		}
+	}
+
+	/// `path`, of the file a hard link names, below the base: where the job extracts it; `None`
+	/// when it is not below the base, so not extracted.
+	pub(super) fn within_base(&self, path: ArchivePath) -> Option<ArchivePath> {
+		let Some(chooser) = &self.chooser else {
+			return Some(path);
+		};
+		let keys = chooser.below_base(&path).ok()?;
+		(keys.len() > chooser.base.len()).then(|| ArchivePath {
+			segments: path.segments[chooser.base.len()..].to_vec(),
+			..path
+		})
+	}
+
+	/// Bytes of the `files` (by ordinal, path as stored and size) the job extracts: every one
+	/// with a usable path, or those a partial extraction chose. What is known to be left out as
+	/// macOS metadata by its path does not count.
+	pub(super) fn extracted_bytes<'e>(
+		&self,
+		files: impl Iterator<Item = (u64, &'e str, u64)>,
+	) -> u64 {
+		let mut chooser = self.chooser.clone();
+		files
+			.filter(|&(ordinal, stored, _)| {
+				let found = Found {
+					ordinal,
+					stored,
+					path: entry_path(stored),
+					kind: ArchiveEntryKind::File,
+					unreadable: None,
+					size: 0,
+					modified: None,
+					encrypted: false,
+					method: None,
+				};
+				let chosen = match &mut chooser {
+					None => found.path.is_ok(),
+					Some(chooser) => chooser
+						.choose(ordinal, &found.path, false)
+						.is_ok_and(|path| path.is_some_and(|path| path.is_ok())),
+				};
+				chosen
+					&& !(self.skip_mac_metadata && found.mac_shape() == Some(MacShape::InMacFolder))
+			})
+			.fold(0u64, |total, (_, _, size)| total.saturating_add(size))
+	}
+}
+
+/// Whether an entry that may be AppleDouble (see [`Verdict::Take`]) is one, by the first bytes
+/// of its `data`; those bytes, which the data sent has to start with.
+pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
+	let mut head = vec![0u8; APPLE_DOUBLE_MAGIC.len()];
+	let read = read_full(data, &mut head)?;
+	head.truncate(read);
+	Ok((head == APPLE_DOUBLE_MAGIC, head))
+}
+
+/// What a hard link's target is looked up by among the files extracted before it: its path, as
+/// the archive stores the file's (case and all), in 16 bytes, so a million files cost 16 MB of
+/// keys rather than their paths.
+pub(crate) fn link_key(path: &ArchivePath) -> u128 {
+	let digest = blake3::hash(joined(path).as_bytes());
+	u128::from_le_bytes(digest.as_bytes()[..16].try_into().expect("16 bytes"))
+}
+
+/// A path's segments joined with `/`.
+pub(crate) fn joined(path: &ArchivePath) -> String {
+	path.segments
+		.iter()
+		.map(AsRef::as_ref)
+		.collect::<Vec<&str>>()
+		.join("/")
+}
+
+pub(super) fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {
+	match rejection {
+		PathRejection::TooLong => ExtractSkipReason::PathTooLong,
+		PathRejection::TooDeep => ExtractSkipReason::PathTooDeep,
+		PathRejection::Unsafe | PathRejection::Empty => ExtractSkipReason::UnsafePath,
+	}
+}
+
+fn not_held() -> Error {
+	Error::custom(
+		ErrorKind::InvalidState,
+		"an entry chosen to extract is not in the archive, or not below the base",
+	)
+}
+
+/// Which entries a partial extraction takes, and where they land.
+#[derive(Clone)]
+struct Chooser {
+	selection: Selection,
+	/// The collision keys of the base's segments.
+	base: Vec<String>,
+	/// The paths of the directories chosen, as collision keys: what is below one is chosen too.
+	dirs: Vec<Vec<String>>,
+	/// Chosen entries met so far.
+	met: usize,
+}
+
+impl Chooser {
+	fn new(selection: Selection) -> Self {
+		Self {
+			base: selection
+				.base
+				.iter()
+				.map(|segment| collision_key(segment.as_ref()))
+				.collect(),
+			selection,
+			dirs: Vec::new(),
+			met: 0,
+		}
+	}
+
+	/// The collision keys of `path`, which has to be below the base: two spellings of a directory
+	/// that differ only in case are one directory to an extraction.
+	fn below_base(&self, path: &ArchivePath) -> Result<Vec<String>, Error> {
+		let keys: Vec<String> = path
+			.segments
+			.iter()
+			.map(|segment| collision_key(segment.as_ref()))
+			.collect();
+		if keys.starts_with(&self.base) {
+			Ok(keys)
+		} else {
+			Err(not_held())
+		}
+	}
+
+	/// The path below the base that entry `ordinal`, at `path`, is extracted at when it was
+	/// chosen or is below a directory that was; `None` when it is not extracted.
+	fn choose(
+		&mut self,
+		ordinal: u64,
+		path: &Result<ArchivePath, PathRejection>,
+		is_dir: bool,
+	) -> Result<Option<Result<ArchivePath, PathRejection>>, Error> {
+		let chosen = self.selection.ordinals.binary_search(&ordinal).is_ok();
+		if chosen {
+			self.met += 1;
+		}
+		let path = match path {
+			Ok(path) => path,
+			// chosen, it is skipped for its path; otherwise nothing tells where it would be
+			Err(rejection) => return Ok(chosen.then_some(Err(*rejection))),
+		};
+		let keys: Vec<String> = path
+			.segments
+			.iter()
+			.map(|segment| collision_key(segment.as_ref()))
+			.collect();
+		let in_chosen_dir = self.dirs.iter().any(|dir| keys.starts_with(dir));
+		if !chosen && !in_chosen_dir {
+			return Ok(None);
+		}
+		let keys = self.below_base(path)?;
+		let at_base = keys.len() == self.base.len();
+		if chosen && is_dir && !in_chosen_dir {
+			self.dirs.push(keys);
+		}
+		if at_base {
+			// the base itself, which the entries below it land in
+			return if is_dir {
+				Ok(Some(Err(PathRejection::Empty)))
+			} else {
+				Err(not_held())
+			};
+		}
+		Ok(Some(Ok(ArchivePath {
+			segments: path.segments[self.base.len()..].to_vec(),
+			..path.clone()
+		})))
+	}
+}

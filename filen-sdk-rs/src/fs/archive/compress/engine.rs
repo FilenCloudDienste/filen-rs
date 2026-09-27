@@ -656,7 +656,11 @@ impl<B: DisposalBackend> Driver<B> {
 			WorkerEvent::Head(data) => self.take_data(data, true),
 			WorkerEvent::FileEnd => self.reporter.file_done(),
 			// the compressing codec sends nothing else
-			WorkerEvent::Opened(_) | WorkerEvent::Entry(_) | WorkerEvent::Skipped(_) => {}
+			WorkerEvent::Opened(_)
+			| WorkerEvent::Entry(_)
+			| WorkerEvent::Skipped(_)
+			| WorkerEvent::Link(_)
+			| WorkerEvent::Listed(_) => {}
 		}
 	}
 

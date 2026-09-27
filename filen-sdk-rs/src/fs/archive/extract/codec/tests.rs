@@ -10,17 +10,20 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use filen_types::fs::Uuid;
+
 use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::archive::{
-		extract::ExpansionLimit,
+		extract::{ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, PasswordCheck},
 		format::StreamCodec,
 		password::ArchivePassword,
 		sevenz::write::{SevenZEncryption, SevenZMethod},
-		test_support::{gzip, pattern, sevenz_of, zip_of},
+		test_support::{gzip, pattern, sevenz_of, tar_of, zip_of},
 		worker,
 	},
+	fs::name::ValidatedName,
 };
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -48,6 +51,9 @@ enum Seen {
 		ended: bool,
 	},
 	Skipped(u64, String, u64, ExtractSkipReason),
+	/// A hard link at a path, to the file at another.
+	Link(u64, String, String),
+	Listed(ArchiveEntry),
 }
 
 fn path_of(head: &EntryHead) -> String {
@@ -84,12 +90,22 @@ fn run_counting(
 	limits: CodecLimits,
 	password: Option<&str>,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
-	let job = StreamJob {
-		name: name.to_owned(),
-		len: archive.len() as u64,
-		limits,
-		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
-	};
+	run_job(
+		archive,
+		StreamJob {
+			name: name.to_owned(),
+			len: archive.len() as u64,
+			limits,
+			password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+			skip_mac_metadata: false,
+			task: Task::Extract(None),
+		},
+	)
+}
+
+/// `archive` through the codec running `job`: what it sent, how it ended, and the bytes of the
+/// archive it counted as read.
+fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
 	while let Some(event) = link.events.blocking_recv() {
@@ -133,6 +149,12 @@ fn run_counting(
 				member.bytes,
 				member.reason,
 			)),
+			WorkerEvent::Link(link) => seen.push(Seen::Link(
+				link.ordinal,
+				joined(&link.path),
+				joined(&link.target),
+			)),
+			WorkerEvent::Listed(entry) => seen.push(Seen::Listed(*entry)),
 			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
 		}
 	}
@@ -219,14 +241,8 @@ fn sample_seen() -> Vec<Seen> {
 				target: "a.txt".into(),
 			},
 		),
-		Seen::Skipped(
-			3,
-			"docs/hard".into(),
-			0,
-			ExtractSkipReason::Hardlink {
-				target: "docs/a.txt".into(),
-			},
-		),
+		// the driver copies the file it names
+		Seen::Link(3, "docs/hard".into(), "docs/a.txt".into()),
 		Seen::Skipped(4, "../evil".into(), 4, ExtractSkipReason::UnsafePath),
 	]
 }
@@ -247,6 +263,7 @@ fn a_bare_tar_is_sent_member_by_member() {
 			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
+			password: PasswordCheck::NotNeeded,
 		}
 	);
 }
@@ -318,6 +335,7 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 			unchecked_entries: 0,
 			unaccounted_bytes: 4,
 			duplicates: None,
+			password: PasswordCheck::NotNeeded,
 		}
 	);
 }
@@ -330,6 +348,7 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 		unchecked_entries: 0,
 		unaccounted_bytes: 0,
 		duplicates: None,
+		password: PasswordCheck::NotNeeded,
 	};
 	let (seen, end) = run(&empty, "e.tar");
 	assert_eq!(seen, [Seen::Opened(ArchiveFormat::Tar { codec: None })]);
@@ -422,6 +441,7 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
+			password: PasswordCheck::NotNeeded,
 		}
 	);
 }
@@ -501,6 +521,8 @@ fn the_codec_stops_once_its_driver_is_gone() {
 					len,
 					limits: LIMITS,
 					password: None,
+					skip_mac_metadata: false,
+					task: Task::Extract(None),
 				},
 			);
 			exited.store(true, Ordering::SeqCst);
@@ -552,6 +574,7 @@ fn a_zip_is_sent_entry_by_entry() {
 			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
+			password: PasswordCheck::NotNeeded,
 		}
 	);
 }
@@ -726,6 +749,7 @@ fn a_7z_is_sent_entry_by_entry() {
 				unchecked_entries: 0,
 				unaccounted_bytes: 0,
 				duplicates: None,
+				password: PasswordCheck::NotNeeded,
 			}
 		);
 	}
@@ -1185,6 +1209,9 @@ fn check_fixtures(dir: &str) {
 					Some(format!("hardlink\t{path}\t{target}"))
 				}
 				Seen::Skipped(_, path, _, reason) => Some(format!("skip\t{path}\t{reason:?}")),
+				// the driver extracts it as a copy of its target
+				Seen::Link(_, path, target) => Some(format!("hardlink\t{path}\t{target}")),
+				Seen::Listed(entry) => panic!("{archive}: an extraction listed {entry:?}"),
 			})
 			.collect();
 		if end.unaccounted_bytes > 0 {
@@ -1240,4 +1267,455 @@ fn a_zip_of_zstd_entries_is_extracted() {
 #[test]
 fn stream_fixtures_extract_to_their_manifest() {
 	check_fixtures("streams");
+}
+
+/// A `task` over `archive`, named `name`, leaving macOS metadata out when `skip_mac_metadata`.
+fn job_of(archive: &[u8], name: &str, skip_mac_metadata: bool, task: Task) -> StreamJob {
+	StreamJob {
+		name: name.to_owned(),
+		len: archive.len() as u64,
+		limits: LIMITS,
+		password: None,
+		skip_mac_metadata,
+		task,
+	}
+}
+
+/// What the codec sent, one line each: what the driver creates or skips, and the links it copies.
+fn outline(seen: &[Seen]) -> Vec<String> {
+	seen.iter()
+		.filter_map(|seen| match seen {
+			Seen::Opened(_) => None,
+			Seen::Dir(_, path) => Some(format!("dir {path}")),
+			Seen::File { path, data, .. } => Some(format!("file {path} {}", data.len())),
+			Seen::Skipped(_, path, _, reason) => Some(format!("skip {path} {reason:?}")),
+			Seen::Link(_, path, target) => Some(format!("link {path} -> {target}")),
+			Seen::Listed(entry) => panic!("an extraction listed {entry:?}"),
+		})
+		.collect()
+}
+
+fn fixture(dir: &str, name: &str) -> Vec<u8> {
+	std::fs::read(
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/archives")
+			.join(dir)
+			.join(name),
+	)
+	.unwrap()
+}
+
+/// An AppleDouble file's first bytes, then whatever it holds.
+fn apple_double_data() -> Vec<u8> {
+	[
+		&[0x00, 0x05, 0x16, 0x07][..],
+		b"\x00\x02\x00\x00Mac OS X        ",
+	]
+	.concat()
+}
+
+#[test]
+fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
+	// bsdtar's AppleDouble member, ahead of the file it belongs to
+	let tar = fixture("tar", "appledouble.tar");
+	for (skip, expected) in [
+		(true, ["skip ._note.txt MacMetadata", "file note.txt 39"]),
+		(false, ["file ._note.txt 197", "file note.txt 39"]),
+	] {
+		let (seen, end, _) = run_job(
+			&tar,
+			job_of(&tar, "appledouble.tar", skip, Task::Extract(None)),
+		);
+		end.unwrap();
+		assert_eq!(outline(&seen), expected, "{skip}");
+	}
+
+	// a `._` name alone is no AppleDouble: the file is sent whole, the bytes read to tell
+	// included
+	let tar = tar_of(&[("._notes.txt", b"just text")]);
+	let (seen, end, _) = run_job(&tar, job_of(&tar, "a.tar", true, Task::Extract(None)));
+	end.unwrap();
+	assert_eq!(seen[1..], [file(0, "._notes.txt", b"just text")]);
+
+	// the same in a zip and a 7z, whose data is read to tell
+	let data = apple_double_data();
+	let entries = [
+		("a.txt", Some(&b"a"[..])),
+		("._a.txt", Some(&data[..])),
+		("._b.txt", Some(&b"b"[..])),
+	];
+	for (name, archive) in [
+		("m.zip", zip_of(&entries, None)),
+		(
+			"m.7z",
+			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
+		),
+	] {
+		let (seen, end, _) = run_job(&archive, job_of(&archive, name, true, Task::Extract(None)));
+		end.unwrap();
+		assert_eq!(
+			outline(&seen),
+			["file a.txt 1", "skip ._a.txt MacMetadata", "file ._b.txt 1"],
+			"{name}"
+		);
+	}
+
+	// Finder's __MACOSX folder, every entry in it
+	let zip = fixture("zip", "finder-ditto.zip");
+	let (seen, end, _) = run_job(&zip, job_of(&zip, "finder.zip", true, Task::Extract(None)));
+	end.unwrap();
+	let outline = outline(&seen);
+	let (mac, rest): (Vec<&String>, Vec<&String>) =
+		outline.iter().partition(|line| line.contains("__MACOSX"));
+	assert_eq!(mac.len(), 8);
+	assert!(
+		mac.iter().all(|line| line.ends_with("MacMetadata")),
+		"{mac:?}"
+	);
+	assert!(
+		rest.iter().all(|line| !line.ends_with("MacMetadata")),
+		"{rest:?}"
+	);
+}
+
+/// What a listing of `archive` sent: its entries, and how it ended.
+fn listed(archive: &[u8], job: StreamJob) -> (Vec<ArchiveEntry>, Result<ArchiveEnd, Error>) {
+	let (seen, end, _) = run_job(archive, job);
+	let entries = seen
+		.into_iter()
+		.filter_map(|seen| match seen {
+			Seen::Opened(_) => None,
+			Seen::Listed(entry) => Some(entry),
+			other => panic!("a listing sent {other:?}"),
+		})
+		.collect();
+	(entries, end)
+}
+
+/// The archive the listing tests list.
+const LISTED: Uuid = Uuid::from_u128(0x15);
+
+/// An entry of [`LISTED`], extracted to `path` (none when it cannot be), with no flag set.
+fn listed_entry(
+	index: u32,
+	stored: &str,
+	path: Option<&str>,
+	kind: ArchiveEntryKind,
+	size: Option<u64>,
+	skip: Option<ExtractSkipReason>,
+) -> ArchiveEntry {
+	ArchiveEntry {
+		id: ArchiveEntryId {
+			archive: LISTED,
+			index,
+		},
+		stored_path: stored.to_owned(),
+		stored_path_truncated: false,
+		path: path.map(str::to_owned),
+		kind,
+		size,
+		modified: None,
+		encrypted: false,
+		method: None,
+		skip,
+		path_rewritten: false,
+		misleading_name: false,
+		mac_metadata: false,
+	}
+}
+
+#[test]
+fn a_tar_is_listed_member_by_member_without_its_data() {
+	let tar = sample_tar();
+	let (entries, end) = listed(
+		&tar,
+		job_of(&tar, "s.tar", true, Task::List { archive: LISTED }),
+	);
+	assert_eq!(end.unwrap().password, PasswordCheck::NotNeeded);
+	let modified = DateTime::from_timestamp(1_700_000_000, 0);
+	let entries: Vec<ArchiveEntry> = entries
+		.into_iter()
+		.map(|entry| {
+			assert_eq!(entry.modified, modified, "{entry:?}");
+			ArchiveEntry {
+				modified: None,
+				..entry
+			}
+		})
+		.collect();
+	assert_eq!(
+		entries,
+		[
+			listed_entry(0, "docs/", Some("docs"), ArchiveEntryKind::Dir, None, None),
+			listed_entry(
+				1,
+				"docs/a.txt",
+				Some("docs/a.txt"),
+				ArchiveEntryKind::File,
+				Some(5),
+				None
+			),
+			listed_entry(
+				2,
+				"docs/link",
+				Some("docs/link"),
+				ArchiveEntryKind::Symlink {
+					target: "a.txt".into()
+				},
+				Some(0),
+				Some(ExtractSkipReason::Symlink {
+					target: "a.txt".into()
+				}),
+			),
+			// extracted as a copy of the file it names, at that file's size
+			listed_entry(
+				3,
+				"docs/hard",
+				Some("docs/hard"),
+				ArchiveEntryKind::Hardlink {
+					target: "docs/a.txt".into()
+				},
+				Some(5),
+				None,
+			),
+			listed_entry(
+				4,
+				"../evil",
+				None,
+				ArchiveEntryKind::File,
+				Some(4),
+				Some(ExtractSkipReason::UnsafePath),
+			),
+		]
+	);
+
+	// a hard link to a file that is not extracted has nothing to be a copy of
+	let mut builder = tar::Builder::new(Vec::new());
+	let mut hard = header(tar::EntryType::Link, 0);
+	builder.append_link(&mut hard, "hard", "gone.txt").unwrap();
+	let tar = builder.into_inner().unwrap();
+	let (entries, _) = listed(
+		&tar,
+		job_of(&tar, "h.tar", true, Task::List { archive: LISTED }),
+	);
+	assert_eq!(
+		entries[0].skip,
+		Some(ExtractSkipReason::Hardlink {
+			target: "gone.txt".into()
+		})
+	);
+
+	// an AppleDouble member is told by its data, and marked whether it is left out or not
+	let tar = fixture("tar", "appledouble.tar");
+	for skip in [true, false] {
+		let (entries, _) = listed(
+			&tar,
+			job_of(&tar, "a.tar", skip, Task::List { archive: LISTED }),
+		);
+		assert!(entries[0].mac_metadata && !entries[1].mac_metadata);
+		assert_eq!(
+			entries[0].skip,
+			skip.then_some(ExtractSkipReason::MacMetadata)
+		);
+	}
+}
+
+#[test]
+fn a_zip_is_listed_from_its_index_with_its_password_checked() {
+	let data = apple_double_data();
+	let zip = zip_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("._a.txt", Some(&data)),
+		],
+		Some(b"pw"),
+	);
+	for (password, check) in [
+		(Some("pw"), PasswordCheck::Right),
+		(Some("nope"), PasswordCheck::Wrong),
+		(None, PasswordCheck::Required),
+	] {
+		let job = StreamJob {
+			password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+			..job_of(&zip, "z.zip", true, Task::List { archive: LISTED })
+		};
+		let (entries, end) = listed(&zip, job);
+		assert_eq!(end.unwrap().password, check, "{password:?}");
+		let shown: Vec<_> = entries
+			.iter()
+			.map(|entry| {
+				(
+					entry.path.as_deref(),
+					entry.encrypted,
+					entry.method.as_deref(),
+					entry.mac_metadata,
+					entry.skip.as_ref(),
+				)
+			})
+			.collect();
+		assert_eq!(
+			shown,
+			[
+				(Some("docs"), false, None, false, None),
+				(Some("docs/a.txt"), true, Some("Deflate"), false, None),
+				// told by its name alone: a listing reads no entry's data
+				(
+					Some("._a.txt"),
+					true,
+					Some("Deflate"),
+					true,
+					Some(&ExtractSkipReason::MacMetadata)
+				),
+			]
+		);
+	}
+
+	let (entries, _) = listed(
+		&fixture("zip", "ppmd.zip"),
+		job_of(
+			&fixture("zip", "ppmd.zip"),
+			"p.zip",
+			true,
+			Task::List { archive: LISTED },
+		),
+	);
+	// 7-Zip stores what PPMd would not shrink
+	let methods: Vec<(&str, Option<&ExtractSkipReason>)> = entries
+		.iter()
+		.filter_map(|entry| Some((entry.method.as_deref()?, entry.skip.as_ref())))
+		.collect();
+	assert!(methods.contains(&("PPMd", Some(&ExtractSkipReason::UnsupportedMethod))));
+	assert!(methods.contains(&("Stored", None)));
+}
+
+#[test]
+fn a_7z_is_listed_from_its_index() {
+	let entries = [("docs", None), ("docs/a.txt", Some(&b"alpha"[..]))];
+	let sevenz = sevenz_of(
+		&entries,
+		SevenZMethod::Lzma2 { level: 1 },
+		true,
+		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
+	);
+	let job = |password: Option<&str>| StreamJob {
+		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+		..job_of(&sevenz, "s.7z", true, Task::List { archive: LISTED })
+	};
+	let (listed_entries, end) = listed(&sevenz, job(Some("pw")));
+	assert_eq!(end.unwrap().password, PasswordCheck::Right);
+	assert_eq!(
+		listed_entries
+			.iter()
+			.map(|entry| (entry.path.as_deref(), entry.encrypted, entry.size))
+			.collect::<Vec<_>>(),
+		// in the index's order, which the SDK's writer gives files first
+		[
+			(Some("docs/a.txt"), true, Some(5)),
+			(Some("docs"), false, None)
+		]
+	);
+	assert!(
+		listed_entries[0]
+			.method
+			.as_deref()
+			.is_some_and(|method| method.contains("LZMA2") && method.contains("7zAES")),
+		"{:?}",
+		listed_entries[0].method
+	);
+	// an encrypted index names nothing without the password
+	let (listed_entries, end) = listed(&sevenz, job(None));
+	assert!(listed_entries.is_empty());
+	assert_eq!(kind(end), ErrorKind::ArchivePasswordRequired);
+}
+
+#[test]
+fn a_single_compressed_file_is_listed_at_the_size_it_decodes_to() {
+	let data = pattern(3 * CHUNK_SIZE / 2, 2);
+	let gz = gzip(&data);
+	let (entries, end) = listed(
+		&gz,
+		job_of(&gz, "note.txt.gz", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert_eq!(
+		entries,
+		[listed_entry(
+			0,
+			"note.txt",
+			Some("note.txt"),
+			ArchiveEntryKind::File,
+			Some(data.len() as u64),
+			None
+		)]
+	);
+}
+
+/// A partial extraction of the entries at `ordinals`, relative to `base`.
+fn chosen(ordinals: &[u64], base: &[&str]) -> Task {
+	Task::Extract(Some(Selection::new(
+		ordinals.iter().copied(),
+		base.iter()
+			.map(|segment| ValidatedName::try_from(*segment).unwrap())
+			.collect(),
+	)))
+}
+
+#[test]
+fn a_partial_extraction_sends_what_was_chosen_below_its_base() {
+	let tar = sample_tar();
+	for (task, expected) in [
+		// a file alone: the directories holding it are the driver's to create
+		(chosen(&[1], &[]), vec!["file docs/a.txt 5"]),
+		// a directory with everything below it
+		(
+			chosen(&[0], &[]),
+			vec![
+				"dir docs",
+				"file docs/a.txt 5",
+				"skip docs/link Symlink { target: \"a.txt\" }",
+				"link docs/hard -> docs/a.txt",
+			],
+		),
+		// what is in a directory, as the root's
+		(
+			chosen(&[0], &["docs"]),
+			vec![
+				"file a.txt 5",
+				"skip docs/link Symlink { target: \"a.txt\" }",
+				"link hard -> a.txt",
+			],
+		),
+		// a chosen entry skipped for its path is reported so
+		(chosen(&[4], &[]), vec!["skip ../evil UnsafePath"]),
+	] {
+		let (seen, end, _) = run_job(&tar, job_of(&tar, "s.tar", true, task.clone()));
+		end.unwrap();
+		assert_eq!(outline(&seen), expected, "{task:?}");
+	}
+
+	// an entry the archive does not hold is only found missing at a tar's end
+	let (seen, end, _) = run_job(&tar, job_of(&tar, "s.tar", true, chosen(&[1, 99], &[])));
+	assert_eq!(outline(&seen), ["file docs/a.txt 5"]);
+	assert_eq!(kind(end), ErrorKind::InvalidState);
+
+	// a zip's entries are known up front: nothing is sent, not even what it is
+	let (zip, _) = zip_sample();
+	for task in [chosen(&[1, 99], &[]), chosen(&[1], &["other"])] {
+		let (seen, end, _) = run_job(&zip, job_of(&zip, "z.zip", true, task.clone()));
+		assert!(seen.is_empty(), "{task:?}: {seen:?}");
+		assert_eq!(kind(end), ErrorKind::InvalidState, "{task:?}");
+	}
+	// and what is below a chosen directory is chosen wherever the zip stores it
+	let zip = zip_of(
+		&[
+			("docs/a.txt", Some(b"a")),
+			("docs", None),
+			("b.txt", Some(b"b")),
+		],
+		None,
+	);
+	let (seen, end, _) = run_job(&zip, job_of(&zip, "z.zip", true, chosen(&[1], &[])));
+	end.unwrap();
+	assert_eq!(outline(&seen), ["file docs/a.txt 1", "dir docs"]);
 }

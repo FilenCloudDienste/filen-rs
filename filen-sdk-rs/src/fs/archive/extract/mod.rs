@@ -4,6 +4,8 @@
 mod client_impl;
 pub(crate) mod codec;
 mod engine;
+mod input;
+mod list;
 mod report;
 
 use filen_macros::js_type;
@@ -19,14 +21,21 @@ use crate::{
 };
 
 pub use crate::fs::{
-	archive::{format::archive_default_name, password::ArchivePassword},
+	archive::{
+		format::{ArchiveFormat, archive_default_name},
+		password::ArchivePassword,
+	},
 	drive_job::counts::ItemCounts,
+};
+pub use list::{
+	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListFailed, ListPhase,
+	ListTotals, ListUpdate, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
-	ExtractReport, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractUpdate,
-	ExtractedTopLevel, OmittedRecords, RunState,
+	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
+	ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
 };
 
 /// Where an archive's entries are created.
@@ -65,6 +74,25 @@ pub enum ExtractRequest {
 	/// Every entry of the archive into `destination`, an existing directory of the user's drive.
 	All {
 		archive: ArchiveSource,
+		destination: DirType<'static, Normal>,
+		root: ExtractRoot,
+	},
+	/// Some of the archive's entries into `destination`: those `ids` names (from
+	/// [`Client::list_archive`](crate::auth::Client::list_archive), or a failure's
+	/// [`ExtractRetry`]), everything below a directory among them, and the directories that hold
+	/// them.
+	///
+	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
+	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
+	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. An id of another
+	/// archive, or of an entry not below `base`, fails the job: a zip's or 7z's before anything
+	/// is created, a tar's (only known as it is read) once it is read to its end.
+	///
+	/// The archive is never removed afterwards: part of it is not extracted.
+	Entries {
+		archive: RemoteFileType<'static>,
+		ids: Vec<ArchiveEntryId>,
+		base: String,
 		destination: DirType<'static, Normal>,
 		root: ExtractRoot,
 	},
@@ -111,6 +139,13 @@ pub struct ExtractConfig {
 	/// then, the folders created so far go to the trash (a folder holding a file someone else put
 	/// there meanwhile stays).
 	pub password: Option<ArchivePassword>,
+	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them:
+	/// everything in a `__MACOSX` folder (Finder's zips) and AppleDouble files (`._name`, told by
+	/// the four bytes they start with), reported skipped as
+	/// [`ExtractSkipReason::MacMetadata`]. Left out on purpose, they keep nothing from removing
+	/// the archive once the rest is extracted. `true` by default; `false` extracts them as
+	/// ordinary files.
+	pub skip_mac_metadata: bool,
 }
 
 impl Default for ExtractConfig {
@@ -120,6 +155,7 @@ impl Default for ExtractConfig {
 			max_items: None,
 			expansion_limit: Some(ExpansionLimit::DEFAULT),
 			password: None,
+			skip_mac_metadata: true,
 		}
 	}
 }
@@ -155,7 +191,8 @@ pub enum ExtractSkipReason {
 	/// 4096 bytes.
 	Symlink { target: String },
 	/// A tar hard link, a second name for the earlier entry at `target` (its path as stored, cut
-	/// to at most 4096 bytes), with no data of its own.
+	/// to at most 4096 bytes), with no data of its own, when no file was extracted for `target`
+	/// to copy: it was skipped or failed, or is no file of this archive.
 	Hardlink { target: String },
 	/// A device node or FIFO.
 	Device,
@@ -178,6 +215,8 @@ pub enum ExtractSkipReason {
 	UnsupportedMethod,
 	/// A 7z deletion marker, which an update archive carries for a file it removed.
 	AntiItem,
+	/// macOS metadata left out (see [`ExtractConfig::skip_mac_metadata`]).
+	MacMetadata,
 }
 
 /// Names a zip lists more than once; the last entry of each name is extracted, as other zip

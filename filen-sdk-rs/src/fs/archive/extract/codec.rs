@@ -1,17 +1,20 @@
 //! The codec side of extracting an archive (a tar, a compressed tar, one compressed file, a zip or
 //! 7z): runs on the codec worker, reads the archive through the driver chunk by chunk, and hands
-//! the driver its entries in archive order.
+//! the driver its entries in archive order. A listing runs the same readers, sending what each
+//! entry is instead of its data.
 
-use std::io::{self, Cursor, Read};
+mod entries;
+
+use std::io::{self, Cursor, Read, Seek};
 
 use chrono::DateTime;
 
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, util::SeededMap};
 
 use super::{
 	super::{
 		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
-		entry_path::{PathRejection, entry_path},
+		entry_path::{ArchivePath, entry_path},
 		format::{
 			ArchiveFormat, DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_stem, detect,
 			extension_format, is_end_marker, is_tar_header,
@@ -27,21 +30,25 @@ use super::{
 				wrong_key,
 			},
 		},
-		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarMember, TarReader},
+		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarReader},
 		worker::{
-			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, SourceFailed,
-			WorkerEvent, WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryHead, EntryKind, JobEnded, LinkHead, SeekInput, SkippedMember,
+			SourceFailed, WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
 			crypto::{AES_AUTH_CODE_LEN, AES_VERIFIER_LEN, CryptoError, ZIP_CRYPTO_HEADER_LEN},
 			read::{
-				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipKind, ZipLimits, open_entry,
-				read_index, unaccounted_after,
+				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipIndex, ZipKind, ZipLimits,
+				open_entry, read_index, unaccounted_after,
 			},
 		},
 	},
-	DuplicateEntries, ExpansionLimit, ExtractSkipReason, storage_exceeded,
+	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
+	list::{ArchiveEntryKind, PasswordCheck},
+	storage_exceeded,
 };
+use entries::{Found, MacShape, Verdict, Walk, apple_double};
+pub(crate) use entries::{Selection, Task, joined, link_key};
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +73,10 @@ pub(crate) struct StreamJob {
 	pub(crate) len: u64,
 	pub(crate) limits: CodecLimits,
 	pub(crate) password: Option<ArchivePassword>,
+	/// Leaves macOS metadata out (see
+	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata)).
+	pub(crate) skip_mac_metadata: bool,
+	pub(crate) task: Task,
 }
 
 /// How an archive ended.
@@ -80,6 +91,20 @@ pub(crate) struct ArchiveEnd {
 	/// and lz4, xz or zstd written without one). A bare tar's data is stored rather than
 	/// decoded, and is checked by the archive's own hash instead.
 	pub(crate) unchecked_entries: u64,
+	/// What checking the password up front found.
+	pub(crate) password: PasswordCheck,
+}
+
+impl ArchiveEnd {
+	/// The end of an archive nothing in which needs a password.
+	fn plain(unaccounted_bytes: u64, unchecked_entries: u64) -> Self {
+		Self {
+			unaccounted_bytes,
+			duplicates: None,
+			unchecked_entries,
+			password: PasswordCheck::NotNeeded,
+		}
+	}
 }
 
 /// Encrypted zip entries up to this size are read in full to check the password before anything
@@ -90,6 +115,7 @@ const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 /// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
 /// [`ErrorKind::IO`]; the driver knows the real one.
 pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
+	let mut walk = Walk::new(port, &job.task, job.skip_mac_metadata);
 	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
 	let head_len = read_full(&mut input, &mut head).map_err(failure)?;
@@ -99,12 +125,11 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 		Some(Detected::Tar) => {
 			port.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 				.map_err(failure)?;
-			let walked = walk_tar(port, source, job.limits.max_members)?;
-			Ok(ArchiveEnd {
-				unaccounted_bytes: walked.unread + drain_trailing(walked.rest).map_err(failure)?,
-				duplicates: None,
-				unchecked_entries: 0,
-			})
+			let walked = walk_tar(&mut walk, source, job.limits.max_members)?;
+			Ok(ArchiveEnd::plain(
+				walked.unread + drain_trailing(walked.rest).map_err(failure)?,
+				0,
+			))
 		}
 		Some(Detected::Stream(codec)) => {
 			let decoder = open_stream(codec, source, job.limits.decoder_memory)
@@ -132,7 +157,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				}))
 				.map_err(failure)?;
 				let walked = walk_tar(
-					port,
+					&mut walk,
 					Cursor::new(block).chain(decoded),
 					job.limits.max_members,
 				)?;
@@ -140,20 +165,21 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				// zero blocks after the end-of-archive marker are the usual record padding
 				let tar_trailing = drain_trailing(&mut decoded).map_err(failure)?;
 				let end = decoded.inner.end().expect("drained to the end");
-				Ok(ArchiveEnd {
-					unaccounted_bytes: walked.unread + tar_trailing + end.unaccounted_bytes,
-					duplicates: None,
-					unchecked_entries: unchecked(end.check, walked.files),
-				})
+				Ok(ArchiveEnd::plain(
+					walked.unread + tar_trailing + end.unaccounted_bytes,
+					unchecked(end.check, walked.files),
+				))
 			} else {
 				port.send(WorkerEvent::Opened(ArchiveFormat::Single { codec }))
 					.map_err(failure)?;
-				extract_single(port, &job.name, Cursor::new(block).chain(decoded))
+				extract_single(&mut walk, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
-		Some(Detected::Zip) => extract_zip(port, SeekInput::rereading(source.into_inner().1), &job),
+		Some(Detected::Zip) => {
+			extract_zip(&mut walk, SeekInput::rereading(source.into_inner().1), &job)
+		}
 		Some(Detected::SevenZ) => {
-			extract_sevenz(port, SeekInput::rereading(source.into_inner().1), &job)
+			extract_sevenz(&mut walk, SeekInput::rereading(source.into_inner().1), &job)
 		}
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
@@ -164,7 +190,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 
 /// A single compressed file: one entry, named after the archive without its codec extension.
 fn extract_single(
-	port: &WorkerPort,
+	walk: &mut Walk,
 	archive_name: &str,
 	mut decoded: io::Chain<Cursor<&[u8]>, Expanding<'_, Box<dyn StreamDecoder + '_>>>,
 ) -> Result<ArchiveEnd, Error> {
@@ -174,21 +200,77 @@ fn extract_single(
 			"the archive's name cannot be made into a file name",
 		)
 	})?;
-	port.send(WorkerEvent::Entry(EntryHead {
+	let stored = joined(&path);
+	let mut found = Found {
 		ordinal: 0,
-		path,
+		stored: &stored,
+		path: Ok(path),
+		kind: ArchiveEntryKind::File,
+		unreadable: None,
+		size: 0,
 		modified: None,
-		kind: EntryKind::File { size: None },
-	}))
-	.map_err(failure)?;
-	send_file_data(port, &mut decoded).map_err(failure)?;
+		encrypted: false,
+		method: None,
+	};
+	let files = if walk.listing() {
+		// what it decodes to is only known once it is decoded
+		found.size = io::copy(&mut decoded, &mut io::sink()).map_err(failure)?;
+		walk.list(found, None).map_err(failure)?;
+		0
+	} else {
+		match walk.judge(&found)? {
+			Verdict::Take { path, apple_double } => {
+				take_file(walk, &found, path, None, apple_double, &mut decoded).map_err(failure)?
+			}
+			Verdict::Skip(reason) => {
+				walk.port.send(found.skipped(reason)).map_err(failure)?;
+				0
+			}
+			Verdict::Ignore | Verdict::Root => 0,
+		}
+	};
+	// read to the end whatever became of the file, for the stream's own checks
+	io::copy(&mut decoded, &mut io::sink()).map_err(failure)?;
+	walk.finish()?;
 	let end = decoded.into_inner().1.inner.end().expect("read to the end");
-	port.send(WorkerEvent::FileEnd).map_err(failure)?;
-	Ok(ArchiveEnd {
-		unaccounted_bytes: end.unaccounted_bytes,
-		duplicates: None,
-		unchecked_entries: unchecked(end.check, 1),
-	})
+	Ok(ArchiveEnd::plain(
+		end.unaccounted_bytes,
+		unchecked(end.check, files),
+	))
+}
+
+/// Sends the file `found` at `path`, `size` bytes if its archive states it, its data read from
+/// `data`, unless its first bytes show it AppleDouble when `apple_double` asks for that to be
+/// checked: then it is sent as skipped.
+/// Whether it was sent as a file (1) or not (0), to count.
+fn take_file(
+	walk: &Walk,
+	found: &Found,
+	path: ArchivePath,
+	size: Option<u64>,
+	apple_double: bool,
+	data: &mut dyn Read,
+) -> io::Result<u64> {
+	let head = if apple_double {
+		let (is_apple_double, head) = self::apple_double(data)?;
+		if is_apple_double {
+			walk.port
+				.send(found.skipped(ExtractSkipReason::MacMetadata))?;
+			return Ok(0);
+		}
+		head
+	} else {
+		Vec::new()
+	};
+	walk.port.send(WorkerEvent::Entry(EntryHead {
+		ordinal: found.ordinal,
+		path,
+		modified: found.modified,
+		kind: EntryKind::File { size },
+	}))?;
+	send_file_data(walk.port, &mut Cursor::new(head).chain(data))?;
+	walk.port.send(WorkerEvent::FileEnd)?;
+	Ok(1)
 }
 
 /// The `files` a stream decoded to that are unchecked: all of them when its codec verified
@@ -200,10 +282,114 @@ fn unchecked(check: StreamCheck, files: u64) -> u64 {
 	}
 }
 
+/// How a zip entry's data is compressed, for display.
+fn zip_method(entry: &ZipEntry) -> Option<String> {
+	if entry.kind == ZipKind::Dir {
+		return None;
+	}
+	Some(match entry.method {
+		0 => "Stored".to_owned(),
+		8 => "Deflate".to_owned(),
+		9 => "Deflate64".to_owned(),
+		12 => "BZip2".to_owned(),
+		14 => "LZMA".to_owned(),
+		93 => "Zstd".to_owned(),
+		95 => "XZ".to_owned(),
+		98 => "PPMd".to_owned(),
+		other => format!("method {other}"),
+	})
+}
+
+/// What a zip entry is, before anything is read of it but its record. A symlink's target is
+/// only read for a listing, which reports it with the entry's kind; an extraction reads it when
+/// it reports the link skipped.
+fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: String) -> Found<'e> {
+	let (kind, unreadable) = match entry.kind {
+		ZipKind::Symlink => (
+			ArchiveEntryKind::Symlink {
+				target: target.clone(),
+			},
+			Some(ExtractSkipReason::Symlink { target }),
+		),
+		ZipKind::Dir => (ArchiveEntryKind::Dir, None),
+		ZipKind::File => (
+			ArchiveEntryKind::File,
+			(!zip_supported(entry)).then_some(ExtractSkipReason::UnsupportedMethod),
+		),
+	};
+	Found {
+		ordinal: entry.ordinal,
+		stored: &entry.name,
+		path: entry_path(&entry.name).map(|mut path| {
+			path.rewritten |= entry.name_rewritten;
+			path
+		}),
+		kind,
+		unreadable: if overlapping {
+			Some(ExtractSkipReason::OverlappingData)
+		} else {
+			unreadable
+		},
+		size: entry.size,
+		modified: entry.modified,
+		encrypted: entry.encryption != ZipEncryption::None,
+		method: zip_method(entry),
+	}
+}
+
+/// What checking the password up front finds for a zip: whether it needs one, and whether
+/// `password` opens the encrypted entry quickest to read in full, when one is small enough.
+fn check_zip_password<R: Read + Seek>(
+	source: &mut R,
+	index: &ZipIndex,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+) -> Result<PasswordCheck, Error> {
+	let mut encrypted = index
+		.entries
+		.iter()
+		.filter(|entry| entry.kind == ZipKind::File && entry.encryption != ZipEncryption::None)
+		.peekable();
+	if encrypted.peek().is_none() {
+		return Ok(PasswordCheck::NotNeeded);
+	}
+	let Some(password) = password else {
+		return Ok(PasswordCheck::Required);
+	};
+	// a password verifier alone lets a wrong password through now and then; reading the smallest
+	// entry in full checks it against the CRC-32 or authentication code too. An empty entry
+	// proves little (ZipCrypto's check byte lets 1 in 256 wrong passwords through, and its CRC
+	// matches whatever the key), so one with data goes first
+	let Some(probe) = encrypted
+		.filter(|entry| zip_supported(entry))
+		.min_by_key(|entry| (entry.size == 0, entry.compressed_size))
+		.filter(|probe| probe.compressed_size <= PASSWORD_PROBE_BYTES)
+	else {
+		return Ok(PasswordCheck::Unchecked);
+	};
+	match open_entry(source, index.shift, probe, Some(password), limits) {
+		Ok(mut reader) => match io::copy(&mut reader, &mut io::sink()).map_err(zip_io_failure) {
+			Ok(_) => Ok(PasswordCheck::Right),
+			// damage in ZipCrypto data is likelier a wrong password than a damaged archive
+			Err(error) if key_unproven(probe) && error.kind() == ErrorKind::ArchiveCorrupt => {
+				Ok(PasswordCheck::Wrong)
+			}
+			Err(error) if error.kind() == ErrorKind::ArchiveWrongPassword => {
+				Ok(PasswordCheck::Wrong)
+			}
+			Err(error) => Err(error),
+		},
+		// skipped when its turn comes; the password is checked on the entries read
+		Err(ZipError::Overlapping) => Ok(PasswordCheck::Unchecked),
+		Err(ZipError::WrongPassword) => Ok(PasswordCheck::Wrong),
+		Err(error) => Err(zip_failure(error)),
+	}
+}
+
 /// A zip read from `source`: its entries in local-header order, each checked against its CRC-32
 /// or authentication code.
 fn extract_zip(
-	port: &WorkerPort,
+	walk: &mut Walk,
 	mut source: SeekInput<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
@@ -215,6 +401,52 @@ fn extract_zip(
 	let entry_limits = EntryLimits {
 		decoder_memory: job.limits.decoder_memory,
 	};
+	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
+	let duplicates = (index.duplicate_count > 0).then(|| DuplicateEntries {
+		names: index.duplicate_names.clone(),
+		count: index.duplicate_count,
+	});
+	if walk.listing() {
+		let checked = check_zip_password(&mut source, &index, password, entry_limits)?;
+		walk.port
+			.send(WorkerEvent::Opened(ArchiveFormat::Zip))
+			.map_err(failure)?;
+		let mut listed: Vec<(&ZipEntry, bool)> = index
+			.entries
+			.iter()
+			.map(|entry| (entry, false))
+			.chain(index.overlapping.iter().map(|entry| (entry, true)))
+			.collect();
+		listed.sort_unstable_by_key(|(entry, _)| entry.ordinal);
+		for (entry, overlapping) in listed {
+			let target = if entry.kind == ZipKind::Symlink {
+				zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
+			} else {
+				String::new()
+			};
+			walk.list(zip_found(entry, overlapping, target), None)
+				.map_err(failure)?;
+		}
+		// what the index shows: the bytes around and between entries would take reading every
+		// entry's local header, the whole archive
+		let unaccounted_bytes = index
+			.prefix_bytes
+			.saturating_add(index.directory_slack)
+			.saturating_add(index.trailing_bytes);
+		return Ok(ArchiveEnd {
+			unaccounted_bytes,
+			duplicates,
+			unchecked_entries: 0,
+			password: checked,
+		});
+	}
+	walk.check_selection(index.entries.iter().chain(&index.overlapping).map(|entry| {
+		(
+			entry.ordinal,
+			entry.name.as_str(),
+			entry.kind == ZipKind::Dir,
+		)
+	}))?;
 	if let Some(limit) = job.limits.expansion {
 		// the sizes a zip states are known up front, so a bomb is refused before it is decoded
 		let stated = index
@@ -225,80 +457,45 @@ fn extract_zip(
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
 	}
-	let extracted = index
-		.entries
-		.iter()
-		.filter(|entry| {
-			entry.kind == ZipKind::File && zip_supported(entry) && entry_path(&entry.name).is_ok()
-		})
-		.fold(0u64, |total, entry| total.saturating_add(entry.size));
-	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
-		return Err(error);
-	}
-	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
-	let encrypted = || {
+	let extracted = walk.extracted_bytes(
 		index
 			.entries
 			.iter()
-			.filter(|entry| entry.kind == ZipKind::File && entry.encryption != ZipEncryption::None)
-	};
-	// set once an encrypted entry read back whole against its CRC-32 or authentication code
-	let mut verified = encrypted().next().is_none();
-	if !verified {
-		let Some(password) = password else {
-			return Err(zip_failure(ZipError::PasswordRequired));
-		};
-		// a password verifier alone lets a wrong password through now and then; reading the
-		// smallest entry in full checks it against the CRC-32 or authentication code too. An
-		// empty entry proves little (ZipCrypto's check byte lets 1 in 256 wrong passwords
-		// through, and its CRC matches whatever the key), so one with data goes first
-		if let Some(probe) = encrypted()
-			.filter(|entry| zip_supported(entry))
-			.min_by_key(|entry| (entry.size == 0, entry.compressed_size))
-			&& probe.compressed_size <= PASSWORD_PROBE_BYTES
-		{
-			match open_entry(
-				&mut source,
-				index.shift,
-				probe,
-				Some(password),
-				entry_limits,
-			) {
-				Ok(mut reader) => {
-					io::copy(&mut reader, &mut io::sink()).map_err(
-						|error| match zip_io_failure(error) {
-							error
-								if key_unproven(probe)
-									&& error.kind() == ErrorKind::ArchiveCorrupt =>
-							{
-								Error::custom(
-									ErrorKind::ArchiveWrongPassword,
-									"the password is likely wrong",
-								)
-							}
-							error => error,
-						},
-					)?;
-					verified = true;
-				}
-				// skipped when its turn comes; the password is checked on the entries read
-				Err(ZipError::Overlapping) => {}
-				Err(error) => return Err(zip_failure(error)),
-			}
-		}
+			.filter(|entry| entry.kind == ZipKind::File && zip_supported(entry))
+			.map(|entry| (entry.ordinal, entry.name.as_str(), entry.size)),
+	);
+	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
+		return Err(error);
 	}
+	// set once an encrypted entry read back whole against its CRC-32 or authentication code
+	let mut verified = match check_zip_password(&mut source, &index, password, entry_limits)? {
+		PasswordCheck::NotNeeded | PasswordCheck::Right => true,
+		PasswordCheck::Unchecked => false,
+		PasswordCheck::Required => return Err(zip_failure(ZipError::PasswordRequired)),
+		PasswordCheck::Wrong => return Err(zip_failure(ZipError::WrongPassword)),
+	};
 
-	port.send(WorkerEvent::Opened(ArchiveFormat::Zip))
+	walk.port
+		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 		.map_err(failure)?;
 	for entry in &index.overlapping {
-		port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
-			.map_err(failure)?;
+		let found = zip_found(entry, true, String::new());
+		if let Verdict::Skip(reason) = walk.judge(&found)? {
+			walk.port.send(found.skipped(reason)).map_err(failure)?;
+		}
 	}
 	let mut unaccounted_bytes = index
 		.prefix_bytes
 		.saturating_add(index.directory_slack)
 		.saturating_add(index.trailing_bytes);
 	for entry in &index.entries {
+		let found = zip_found(entry, false, String::new());
+		let verdict = walk.judge(&found)?;
+		// what a partial extraction leaves out is not read at all, its local header included: a
+		// zip extracted in part reports the bytes around what it read only
+		if matches!(verdict, Verdict::Ignore) {
+			continue;
+		}
 		unaccounted_bytes =
 			unaccounted_bytes.saturating_add(unaccounted_after(&mut source, index.shift, entry));
 		if entry.kind == ZipKind::Dir
@@ -308,58 +505,57 @@ fn extract_zip(
 			// a directory holds no data: anything stored under one is extracted nowhere
 			unaccounted_bytes = unaccounted_bytes.saturating_add(entry.compressed_size);
 		}
-		if entry.kind == ZipKind::Symlink {
-			let target =
-				zip_symlink_target(&mut source, index.shift, entry, password, entry_limits);
-			port.send(zip_skipped(entry, ExtractSkipReason::Symlink { target }))
-				.map_err(failure)?;
-			continue;
-		}
-		if entry.kind == ZipKind::File && !zip_supported(entry) {
-			port.send(zip_skipped(entry, ExtractSkipReason::UnsupportedMethod))
-				.map_err(failure)?;
-			continue;
-		}
-		let is_dir = entry.kind == ZipKind::Dir;
-		let mut path = match entry_path(&entry.name) {
-			Ok(path) => path,
-			Err(PathRejection::Empty) if is_dir => continue,
-			Err(rejection) => {
-				port.send(zip_skipped(entry, path_skip_reason(rejection)))
+		let (path, apple_double) = match verdict {
+			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Skip(ExtractSkipReason::Symlink { .. }) => {
+				let target =
+					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits);
+				walk.port
+					.send(found.skipped(ExtractSkipReason::Symlink { target }))
 					.map_err(failure)?;
 				continue;
 			}
+			Verdict::Skip(reason) => {
+				walk.port.send(found.skipped(reason)).map_err(failure)?;
+				continue;
+			}
+			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
-		path.rewritten |= entry.name_rewritten;
-		let head = EntryHead {
-			ordinal: entry.ordinal,
-			path,
-			modified: entry.modified,
-			kind: if is_dir {
-				EntryKind::Dir
-			} else {
-				EntryKind::File {
-					size: Some(entry.size),
-				}
-			},
-		};
-		if is_dir {
-			port.send(WorkerEvent::Entry(head)).map_err(failure)?;
+		if entry.kind == ZipKind::Dir {
+			walk.port
+				.send(WorkerEvent::Entry(EntryHead {
+					ordinal: entry.ordinal,
+					path,
+					modified: entry.modified,
+					kind: EntryKind::Dir,
+				}))
+				.map_err(failure)?;
 			continue;
 		}
 		// opened before it is announced: its local header may show it overlapping the next
 		let mut reader = match open_entry(&mut source, index.shift, entry, password, entry_limits) {
 			Ok(reader) => reader,
 			Err(ZipError::Overlapping) => {
-				port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
+				walk.port
+					.send(found.skipped(ExtractSkipReason::OverlappingData))
 					.map_err(failure)?;
 				continue;
 			}
 			Err(error) => return Err(zip_failure(error)),
 		};
-		port.send(WorkerEvent::Entry(head)).map_err(failure)?;
 		let encrypted = entry.encryption != ZipEncryption::None;
-		match send_file_data(port, &mut reader).map_err(zip_io_failure) {
+		match take_file(
+			walk,
+			&found,
+			path,
+			Some(entry.size),
+			apple_double,
+			&mut reader,
+		)
+		.map_err(zip_io_failure)
+		{
+			// an AppleDouble file left out was not read to its end: it proves nothing
+			Ok(0) => {}
 			// an empty ZipCrypto entry matches its CRC-32 under any key; AES's authentication
 			// code rejects a wrong one even over nothing
 			Ok(_) => {
@@ -380,25 +576,166 @@ fn extract_zip(
 			}
 			Err(error) => return Err(error),
 		}
-		port.send(WorkerEvent::FileEnd).map_err(failure)?;
 	}
 	Ok(ArchiveEnd {
 		unaccounted_bytes,
-		duplicates: (index.duplicate_count > 0).then(|| DuplicateEntries {
-			names: index.duplicate_names.clone(),
-			count: index.duplicate_count,
-		}),
+		duplicates,
 		unchecked_entries: 0,
+		password: PasswordCheck::NotNeeded,
 	})
+}
+
+/// How a 7z entry's data is compressed, for display: its folder's coders, outermost first.
+fn sevenz_method(index: &SevenZIndex, entry: &SevenZEntry) -> Option<String> {
+	let stream = entry.stream?;
+	Some(
+		index.folders[stream.folder]
+			.coders
+			.iter()
+			.map(|coder| coder.method.map_or("unknown", |method| method.name()))
+			.collect::<Vec<&str>>()
+			.join("+"),
+	)
+}
+
+/// What checking the password up front finds for a 7z: an encrypted header only decodes with the
+/// right password; encrypted data is checked on the entry cheapest to reach that has a CRC-32,
+/// when that takes at most [`PASSWORD_PROBE_BYTES`]. An empty entry proves nothing: decoding
+/// nothing matches its CRC-32 under any key.
+fn check_sevenz_password<'s, R: Read + Seek + 's>(
+	cursor: &mut FolderCursor<'s, R>,
+	index: &SevenZIndex,
+	keys: &mut Keys<'_>,
+	has_password: bool,
+) -> Result<PasswordCheck, Error> {
+	let encrypted = |entry: &SevenZEntry| {
+		entry
+			.stream
+			.is_some_and(|stream| index.folders[stream.folder].encrypted())
+	};
+	if index.headers_encrypted {
+		return Ok(PasswordCheck::Right);
+	}
+	if !index.entries.iter().any(encrypted) {
+		return Ok(PasswordCheck::NotNeeded);
+	}
+	if !has_password {
+		return Ok(PasswordCheck::Required);
+	}
+	let Some(probe) = index
+		.entries
+		.iter()
+		.filter(|entry| {
+			encrypted(entry)
+				&& entry.size > 0
+				&& entry.crc.is_some()
+				&& index.folders[entry.stream.expect("encrypted").folder].supported()
+		})
+		.min_by_key(|entry| entry.stream.expect("encrypted").offset + entry.size)
+		.filter(|entry| {
+			entry.stream.expect("encrypted").offset + entry.size <= PASSWORD_PROBE_BYTES
+		})
+	else {
+		return Ok(PasswordCheck::Unchecked);
+	};
+	// setting the folder up fails for the archive's reasons; what decodes wrong under the key
+	// (skipping to the entry, or the entry itself) is the key's
+	let probed = cursor
+		.open(index, probe, keys)
+		.map_err(|error| match error {
+			SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
+			SevenZError::Corrupt(FOLDER_ENDS_EARLY) => SevenZError::WrongPassword,
+			error => error,
+		})
+		.and_then(|mut data| {
+			io::copy(&mut data, &mut io::sink()).map_err(|error| wrong_key(read_error(error)))
+		});
+	match probed {
+		Ok(_) => Ok(PasswordCheck::Right),
+		Err(SevenZError::WrongPassword) => Ok(PasswordCheck::Wrong),
+		Err(error) => Err(sevenz_failure(error)),
+	}
+}
+
+/// What a 7z entry is. A symlink's target, and a reparse point's data (which says whether it is
+/// a link), are read from the archive; a reparse point that is a file's data comes back with it.
+fn sevenz_found<'e, 's, R: Read + Seek + 's>(
+	cursor: &mut FolderCursor<'s, R>,
+	index: &SevenZIndex,
+	entry: &'e SevenZEntry,
+	keys: &mut Keys<'_>,
+) -> Result<(Found<'e>, Option<Vec<u8>>), SevenZError> {
+	let supported = entry
+		.stream
+		.is_none_or(|stream| index.folders[stream.folder].supported());
+	let mut held = None;
+	let (kind, unreadable) = match entry.kind {
+		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
+		SevenZKind::Symlink => {
+			let target = sevenz_symlink_target(cursor, index, entry, keys);
+			(
+				ArchiveEntryKind::Symlink {
+					target: target.clone(),
+				},
+				Some(ExtractSkipReason::Symlink { target }),
+			)
+		}
+		SevenZKind::Dir => (ArchiveEntryKind::Dir, None),
+		_ if !supported => (
+			ArchiveEntryKind::File,
+			Some(ExtractSkipReason::UnsupportedMethod),
+		),
+		SevenZKind::Reparse => {
+			let mut data = Vec::new();
+			cursor
+				.open(index, entry, keys)?
+				.read_to_end(&mut data)
+				.map_err(read_error)?;
+			match windows_link_target(&data) {
+				Some(target) => {
+					let target = display_path(&target).0.to_owned();
+					(
+						ArchiveEntryKind::Symlink {
+							target: target.clone(),
+						},
+						Some(ExtractSkipReason::Symlink { target }),
+					)
+				}
+				None => {
+					held = Some(data);
+					(ArchiveEntryKind::File, None)
+				}
+			}
+		}
+		SevenZKind::File => (ArchiveEntryKind::File, None),
+	};
+	let found = Found {
+		ordinal: entry.ordinal,
+		stored: &entry.name,
+		path: entry_path(&entry.name).map(|mut path| {
+			path.rewritten |= entry.name_rewritten;
+			path
+		}),
+		kind,
+		unreadable,
+		size: entry.size,
+		modified: entry.modified,
+		encrypted: entry
+			.stream
+			.is_some_and(|stream| index.folders[stream.folder].encrypted()),
+		method: sevenz_method(index, entry),
+	};
+	Ok((found, held))
 }
 
 /// A 7z read from `source`: its entries in header order, folder by folder, each checked against
 /// its CRC-32 when the header lists one.
 fn extract_sevenz(
-	port: &WorkerPort,
+	walk: &mut Walk,
 	mut source: SeekInput<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
+	let port = walk.port;
 	let password = job.password.as_ref().map(ArchivePassword::utf16le);
 	// a derivation exchanges nothing with the driver for up to a minute: without this it would
 	// be given up on as a dead codec, and a cancel would wait it out
@@ -414,6 +751,37 @@ fn extract_sevenz(
 	// a folder's packed streams are read in turns (BCJ2 has four)
 	// (at most 5 chunks: a folder of several BCJ2 coders refetches rather than hold more)
 	source.set_slots((index.max_packed_streams() + 1).min(5));
+	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
+	if walk.listing() {
+		let checked = check_sevenz_password(&mut cursor, &index, &mut keys, password.is_some())?;
+		port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
+			.map_err(failure)?;
+		for entry in &index.entries {
+			// a link's data unread for a wrong password leaves it listed as a link without its
+			// target
+			let found = match sevenz_found(&mut cursor, &index, entry, &mut keys) {
+				Ok((found, _)) => found,
+				Err(_) if checked == PasswordCheck::Wrong || password.is_none() => {
+					sevenz_unread(&index, entry)
+				}
+				Err(error) => return Err(sevenz_failure(error)),
+			};
+			walk.list(found, None).map_err(failure)?;
+		}
+		return Ok(ArchiveEnd {
+			unaccounted_bytes: index.unaccounted_bytes,
+			duplicates: None,
+			unchecked_entries: 0,
+			password: checked,
+		});
+	}
+	walk.check_selection(index.entries.iter().map(|entry| {
+		(
+			entry.ordinal,
+			entry.name.as_str(),
+			entry.kind == SevenZKind::Dir,
+		)
+	}))?;
 	if let Some(limit) = job.limits.expansion {
 		let stated = index
 			.entries
@@ -423,17 +791,18 @@ fn extract_sevenz(
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
 	}
-	let extracted = index
-		.entries
-		.iter()
-		.filter(|entry| {
-			entry.kind == SevenZKind::File
-				&& entry
-					.stream
-					.is_none_or(|stream| index.folders[stream.folder].supported())
-				&& entry_path(&entry.name).is_ok()
-		})
-		.fold(0u64, |total, entry| total.saturating_add(entry.size));
+	let extracted = walk.extracted_bytes(
+		index
+			.entries
+			.iter()
+			.filter(|entry| {
+				entry.kind == SevenZKind::File
+					&& entry
+						.stream
+						.is_none_or(|stream| index.folders[stream.folder].supported())
+			})
+			.map(|entry| (entry.ordinal, entry.name.as_str(), entry.size)),
+	);
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
@@ -442,43 +811,13 @@ fn extract_sevenz(
 			.stream
 			.is_some_and(|stream| index.folders[stream.folder].encrypted())
 	};
-	// an encrypted header only decodes with the right password; encrypted data is checked on
-	// the entry cheapest to reach that has a CRC-32, before anything is created. An empty entry
-	// proves nothing: decoding nothing matches its CRC-32 under any key
-	let mut verified = index.headers_encrypted || !index.entries.iter().any(encrypted);
-	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
-	if !verified {
-		if password.is_none() {
-			return Err(sevenz_failure(SevenZError::PasswordRequired));
-		}
-		let probe = index
-			.entries
-			.iter()
-			.filter(|entry| {
-				encrypted(entry)
-					&& entry.size > 0
-					&& entry.crc.is_some()
-					&& index.folders[entry.stream.expect("encrypted").folder].supported()
-			})
-			.min_by_key(|entry| entry.stream.expect("encrypted").offset + entry.size)
-			.filter(|entry| {
-				entry.stream.expect("encrypted").offset + entry.size <= PASSWORD_PROBE_BYTES
-			});
-		if let Some(probe) = probe {
-			// setting the folder up fails for the archive's reasons; what decodes wrong under
-			// the key (skipping to the entry, or the entry itself) is the key's
-			let mut data = cursor.open(&index, probe, &mut keys).map_err(|error| {
-				sevenz_failure(match error {
-					SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
-					SevenZError::Corrupt(FOLDER_ENDS_EARLY) => SevenZError::WrongPassword,
-					error => error,
-				})
-			})?;
-			io::copy(&mut data, &mut io::sink())
-				.map_err(|error| sevenz_failure(wrong_key(read_error(error))))?;
-			verified = true;
-		}
-	}
+	let mut verified =
+		match check_sevenz_password(&mut cursor, &index, &mut keys, password.is_some())? {
+			PasswordCheck::NotNeeded | PasswordCheck::Right => true,
+			PasswordCheck::Unchecked => false,
+			PasswordCheck::Required => return Err(sevenz_failure(SevenZError::PasswordRequired)),
+			PasswordCheck::Wrong => return Err(sevenz_failure(SevenZError::WrongPassword)),
+		};
 
 	port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(failure)?;
@@ -498,95 +837,119 @@ fn extract_sevenz(
 	// whether reading an entry whole against its CRC-32 proved the password
 	let proves = |entry: &SevenZEntry| entry.crc.is_some() && encrypted(entry) && entry.size > 0;
 	for entry in &index.entries {
-		let supported = entry
-			.stream
-			.is_none_or(|stream| index.folders[stream.folder].supported());
+		// what is left out is not read: its name decides whether it is chosen
+		let verdict = walk.judge(&sevenz_unread(&index, entry))?;
+		if matches!(verdict, Verdict::Ignore) {
+			continue;
+		}
 		// a reparse point's data says whether it is a link, so it is read before anything is
 		// sent, and sent from here when it is a file's
-		let mut held = None;
-		let skip = match entry.kind {
-			SevenZKind::Anti => Some(ExtractSkipReason::AntiItem),
-			SevenZKind::Symlink => Some(ExtractSkipReason::Symlink {
-				target: sevenz_symlink_target(&mut cursor, &index, entry, &mut keys),
-			}),
-			_ if !supported => Some(ExtractSkipReason::UnsupportedMethod),
-			SevenZKind::Reparse => {
-				let data = cursor
-					.open(&index, entry, &mut keys)
-					.map_err(sevenz_failure)
-					.and_then(|mut data| {
-						let mut bytes = Vec::new();
-						data.read_to_end(&mut bytes).map_err(sevenz_io_failure)?;
-						Ok(bytes)
-					})
-					.map_err(|error| judged(error, entry, verified))?;
-				verified |= proves(entry);
-				match windows_link_target(&data) {
-					Some(target) => Some(ExtractSkipReason::Symlink {
-						target: display_path(&target).0.to_owned(),
-					}),
-					None => {
-						held = Some(data);
-						None
-					}
-				}
-			}
-			SevenZKind::File | SevenZKind::Dir => None,
-		};
-		if let Some(reason) = skip {
-			port.send(sevenz_skipped(entry, reason)).map_err(failure)?;
-			continue;
+		let (found, held) = sevenz_found(&mut cursor, &index, entry, &mut keys)
+			.map_err(|error| judged(sevenz_failure(error), entry, verified))?;
+		if entry.kind == SevenZKind::Reparse {
+			verified |= proves(entry);
 		}
-		let is_dir = entry.kind == SevenZKind::Dir;
-		let mut path = match entry_path(&entry.name) {
-			Ok(path) => path,
-			Err(PathRejection::Empty) if is_dir => continue,
-			Err(rejection) => {
-				port.send(sevenz_skipped(entry, path_skip_reason(rejection)))
-					.map_err(failure)?;
+		let (path, apple_double) = match walk.judge_again(&found, verdict) {
+			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Skip(reason) => {
+				port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
 			}
+			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
-		path.rewritten |= entry.name_rewritten;
-		port.send(WorkerEvent::Entry(EntryHead {
-			ordinal: entry.ordinal,
-			path,
-			modified: entry.modified,
-			kind: if is_dir {
-				EntryKind::Dir
-			} else {
-				EntryKind::File {
-					size: Some(entry.size),
-				}
-			},
-		}))
-		.map_err(failure)?;
-		if is_dir {
+		if entry.kind == SevenZKind::Dir {
+			port.send(WorkerEvent::Entry(EntryHead {
+				ordinal: entry.ordinal,
+				path,
+				modified: entry.modified,
+				kind: EntryKind::Dir,
+			}))
+			.map_err(failure)?;
 			continue;
 		}
-		if entry.stream.is_some() {
-			let sent = match held {
-				Some(data) => send_file_data(port, &mut data.as_slice()).map_err(failure),
-				None => cursor
-					.open(&index, entry, &mut keys)
-					.map_err(sevenz_failure)
-					.and_then(|mut data| {
-						send_file_data(port, &mut data).map_err(sevenz_io_failure)
-					}),
-			};
-			sent.map_err(|error| judged(error, entry, verified))?;
+		let sent = match (entry.stream, held) {
+			(Some(_), Some(data)) => take_file(
+				walk,
+				&found,
+				path,
+				Some(entry.size),
+				apple_double,
+				&mut data.as_slice(),
+			)
+			.map_err(failure),
+			(Some(_), None) => cursor
+				.open(&index, entry, &mut keys)
+				.map_err(sevenz_failure)
+				.and_then(|mut data| {
+					take_file(
+						walk,
+						&found,
+						path,
+						Some(entry.size),
+						apple_double,
+						&mut data,
+					)
+					.map_err(sevenz_io_failure)
+				}),
+			(None, _) => {
+				take_file(walk, &found, path, Some(0), false, &mut io::empty()).map_err(failure)
+			}
+		};
+		let sent = sent.map_err(|error| judged(error, entry, verified))?;
+		if sent > 0 && entry.stream.is_some() {
 			verified |= proves(entry);
 			if entry.crc.is_none() {
 				unchecked_entries += 1;
 			}
 		}
-		port.send(WorkerEvent::FileEnd).map_err(failure)?;
 	}
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,
 		unchecked_entries,
+		password: PasswordCheck::NotNeeded,
 	})
+}
+
+/// What a 7z entry is by its header alone: before its data is read, or when it cannot be (a
+/// link's under a wrong password).
+fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
+	let supported = entry
+		.stream
+		.is_none_or(|stream| index.folders[stream.folder].supported());
+	let (kind, unreadable) = match entry.kind {
+		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
+		SevenZKind::Symlink => (
+			ArchiveEntryKind::Symlink {
+				target: String::new(),
+			},
+			Some(ExtractSkipReason::Symlink {
+				target: String::new(),
+			}),
+		),
+		SevenZKind::Dir => (ArchiveEntryKind::Dir, None),
+		_ if !supported => (
+			ArchiveEntryKind::File,
+			Some(ExtractSkipReason::UnsupportedMethod),
+		),
+		SevenZKind::Reparse | SevenZKind::File => (ArchiveEntryKind::File, None),
+	};
+	Found {
+		ordinal: entry.ordinal,
+		stored: &entry.name,
+		path: entry_path(&entry.name).map(|mut path| {
+			path.rewritten |= entry.name_rewritten;
+			path
+		}),
+		kind,
+		unreadable,
+		size: entry.size,
+		modified: entry.modified,
+		encrypted: entry
+			.stream
+			.is_some_and(|stream| index.folders[stream.folder].encrypted()),
+		method: sevenz_method(index, entry),
+	}
 }
 
 /// A symlink entry's target, for reporting: its data, when small and readable.
@@ -610,17 +973,6 @@ fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 		Ok(Ok(_)) => display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
 		_ => String::new(),
 	}
-}
-
-fn sevenz_skipped(entry: &SevenZEntry, reason: ExtractSkipReason) -> WorkerEvent {
-	let (path, path_truncated) = display_path(&entry.name);
-	WorkerEvent::Skipped(SkippedMember {
-		ordinal: entry.ordinal,
-		path: path.to_owned(),
-		path_truncated,
-		bytes: entry.size,
-		reason,
-	})
 }
 
 fn sevenz_failure(error: SevenZError) -> Error {
@@ -728,25 +1080,6 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	}
 }
 
-fn zip_skipped(entry: &ZipEntry, reason: ExtractSkipReason) -> WorkerEvent {
-	let (path, path_truncated) = display_path(&entry.name);
-	WorkerEvent::Skipped(SkippedMember {
-		ordinal: entry.ordinal,
-		path: path.to_owned(),
-		path_truncated,
-		bytes: entry.size,
-		reason,
-	})
-}
-
-fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {
-	match rejection {
-		PathRejection::TooLong => ExtractSkipReason::PathTooLong,
-		PathRejection::TooDeep => ExtractSkipReason::PathTooDeep,
-		PathRejection::Unsafe | PathRejection::Empty => ExtractSkipReason::UnsafePath,
-	}
-}
-
 fn zip_failure(error: ZipError) -> Error {
 	let kind = match &error {
 		ZipError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
@@ -791,92 +1124,158 @@ struct Walked<R> {
 	files: u64,
 }
 
-/// Sends every member of the tar in `reader`.
-fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<Walked<R>, Error> {
+/// Sends every member of the tar in `reader`, or what each is when listing.
+fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Walked<R>, Error> {
 	let mut tar = TarReader::new(reader, max_members);
 	let mut ordinal = 0;
 	let mut unread = 0u64;
 	let mut files = 0u64;
+	// what a listing resolves hard links against: the files it says are extracted, by path, with
+	// their sizes. An extraction's driver resolves them against the files it created
+	let mut listed_files = SeededMap::<u128, u64>::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
-		let is_dir = match &member.kind {
+		let (kind, unreadable) = match &member.kind {
+			MemberKind::File => (ArchiveEntryKind::File, None),
 			// a hard link with data of its own holds the file, as for libarchive
-			MemberKind::File => false,
-			MemberKind::Hardlink { .. } if member.size > 0 => false,
+			MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
 			MemberKind::Dir => {
 				unread = unread.saturating_add(member.size);
-				true
+				(ArchiveEntryKind::Dir, None)
 			}
 			MemberKind::Symlink { target } => {
-				let reason = ExtractSkipReason::Symlink {
-					target: display_path(target).0.to_owned(),
-				};
-				port.send(skipped(this, &member, reason)).map_err(failure)?;
-				continue;
-			}
-			other => {
-				let reason = match other {
-					MemberKind::Hardlink { target } => ExtractSkipReason::Hardlink {
-						target: display_path(target).0.to_owned(),
+				let target = display_path(target).0.to_owned();
+				(
+					ArchiveEntryKind::Symlink {
+						target: target.clone(),
 					},
-					MemberKind::Device | MemberKind::Fifo => ExtractSkipReason::Device,
-					MemberKind::Sparse => ExtractSkipReason::Sparse,
-					_ => ExtractSkipReason::UnsupportedType,
-				};
-				port.send(skipped(this, &member, reason)).map_err(failure)?;
-				continue;
+					Some(ExtractSkipReason::Symlink { target }),
+				)
 			}
-		};
-		let mut path = match entry_path(&member.path) {
-			Ok(path) => path,
-			// the archive's own root
-			Err(PathRejection::Empty) if is_dir => continue,
-			Err(rejection) => {
-				port.send(skipped(this, &member, path_skip_reason(rejection)))
-					.map_err(failure)?;
-				continue;
+			MemberKind::Hardlink { target } => (
+				ArchiveEntryKind::Hardlink {
+					target: display_path(target).0.to_owned(),
+				},
+				None,
+			),
+			MemberKind::Device | MemberKind::Fifo => {
+				(ArchiveEntryKind::Device, Some(ExtractSkipReason::Device))
 			}
+			MemberKind::Sparse => (ArchiveEntryKind::File, Some(ExtractSkipReason::Sparse)),
+			MemberKind::Unsupported(_) => (
+				ArchiveEntryKind::Other,
+				Some(ExtractSkipReason::UnsupportedType),
+			),
 		};
-		path.rewritten |= member.path_rewritten;
-		let modified = member
-			.modified
-			.and_then(|time| DateTime::from_timestamp(time.secs, time.nanos));
-		let kind = if is_dir {
-			EntryKind::Dir
-		} else {
-			EntryKind::File {
-				size: Some(member.size),
-			}
-		};
-		port.send(WorkerEvent::Entry(EntryHead {
+		let mut found = Found {
 			ordinal: this,
-			path,
-			modified,
+			stored: &member.path,
+			path: entry_path(&member.path).map(|mut path| {
+				path.rewritten |= member.path_rewritten;
+				path
+			}),
 			kind,
-		}))
-		.map_err(failure)?;
-		if !is_dir {
-			send_file_data(port, &mut TarBody(&mut tar)).map_err(failure)?;
-			port.send(WorkerEvent::FileEnd).map_err(failure)?;
-			files += 1;
+			unreadable,
+			size: member.size,
+			modified: member
+				.modified
+				.and_then(|time| DateTime::from_timestamp(time.secs, time.nanos)),
+			encrypted: false,
+			method: None,
+		};
+		// a hard link names an earlier file, the same whatever else it is stored with
+		let link_target = match (&member.kind, &found.kind) {
+			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown }) => {
+				Some((entry_path(target), shown.clone()))
+			}
+			_ => None,
+		};
+		if walk.listing() {
+			if let Some((target, shown)) = link_target {
+				match target
+					.ok()
+					.and_then(|target| listed_files.get(&link_key(&target)))
+				{
+					Some(&size) => found.size = size,
+					None => {
+						found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
+					}
+				}
+			}
+			// a listing reads a tar through: an AppleDouble member is told by its data here
+			let apple_double = match found.mac_shape() {
+				Some(MacShape::AppleDoubleName) => {
+					Some(apple_double(&mut TarBody(&mut tar)).map_err(failure)?.0)
+				}
+				_ => None,
+			};
+			let key = found.path.as_ref().ok().map(link_key);
+			let size = found.size;
+			let is_file = found.kind == ArchiveEntryKind::File;
+			if walk.list(found, apple_double).map_err(failure)?
+				&& is_file && let Some(key) = key
+			{
+				listed_files.insert(key, size);
+			}
+			continue;
 		}
+		let (path, apple_double) = match walk.judge(&found)? {
+			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Skip(reason) => {
+				walk.port.send(found.skipped(reason)).map_err(failure)?;
+				continue;
+			}
+			Verdict::Take { path, apple_double } => (path, apple_double),
+		};
+		if let Some((target, shown)) = link_target {
+			let unresolved = SkippedMember {
+				ordinal: this,
+				path: display_path(&member.path).0.to_owned(),
+				path_truncated: display_path(&member.path).1,
+				bytes: 0,
+				reason: ExtractSkipReason::Hardlink { target: shown },
+			};
+			// the file it names, where this job extracts it
+			let event = match target.ok().and_then(|target| walk.within_base(target)) {
+				Some(target) => WorkerEvent::Link(Box::new(LinkHead {
+					ordinal: this,
+					path,
+					modified: found.modified,
+					target,
+					unresolved,
+				})),
+				None => WorkerEvent::Skipped(unresolved),
+			};
+			walk.port.send(event).map_err(failure)?;
+			continue;
+		}
+		if found.kind == ArchiveEntryKind::Dir {
+			walk.port
+				.send(WorkerEvent::Entry(EntryHead {
+					ordinal: this,
+					path,
+					modified: found.modified,
+					kind: EntryKind::Dir,
+				}))
+				.map_err(failure)?;
+			continue;
+		}
+		files += take_file(
+			walk,
+			&found,
+			path,
+			Some(found.size),
+			apple_double,
+			&mut TarBody(&mut tar),
+		)
+		.map_err(failure)?;
 	}
+	walk.finish()?;
 	Ok(Walked {
 		rest: tar.into_inner(),
 		unread,
 		files,
-	})
-}
-
-fn skipped(ordinal: u64, member: &TarMember, reason: ExtractSkipReason) -> WorkerEvent {
-	let (path, path_truncated) = display_path(&member.path);
-	WorkerEvent::Skipped(SkippedMember {
-		ordinal,
-		path: path.to_owned(),
-		path_truncated,
-		bytes: member.size,
-		reason,
 	})
 }
 

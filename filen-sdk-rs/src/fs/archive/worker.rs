@@ -28,10 +28,14 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
 	Error, ErrorKind,
 	blocking::send_catching_panic,
-	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+	consts::{CALLBACK_INTERVAL, CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
 };
 
-use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::ArchiveFormat};
+use super::{
+	entry_path::ArchivePath,
+	extract::{ArchiveEntry, ExtractSkipReason},
+	format::ArchiveFormat,
+};
 
 /// How long the codec may go without taking input or handing over an event, while the driver
 /// owes it nothing, before it is given up on as dead. Far above any single step a healthy codec
@@ -59,6 +63,10 @@ pub(crate) enum WorkerEvent {
 	/// compressing, it is in the archive.
 	FileEnd,
 	Skipped(SkippedMember),
+	/// When extracting a tar: a hard link to a file sent before, to extract as a copy of it.
+	Link(Box<LinkHead>),
+	/// When listing: what an entry is, and what extracting it would do.
+	Listed(Box<ArchiveEntry>),
 	/// When compressing into a format whose start is written last (a 7z): the archive's first
 	/// chunk, sent after all the others.
 	Head(Vec<u8>),
@@ -81,6 +89,20 @@ pub(crate) enum EntryKind {
 	File {
 		size: Option<u64>,
 	},
+}
+
+/// A tar hard link: a second name for a file the archive stored before it, which the driver
+/// extracts as a copy of the file it created for that one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkHead {
+	pub(crate) ordinal: u64,
+	pub(crate) path: ArchivePath,
+	pub(crate) modified: Option<DateTime<Utc>>,
+	/// The path of the file it names, as sent with that file's entry.
+	pub(crate) target: ArchivePath,
+	/// What it is reported as when no file was created for its target (it was skipped, failed,
+	/// or never came): skipped, as a hard link.
+	pub(crate) unresolved: SkippedMember,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +141,38 @@ impl WorkerShared {
 
 	fn note_progress(&self) {
 		self.progress.fetch_add(1, Ordering::Relaxed);
+	}
+}
+
+/// The error a job ends with when its codec stopped responding.
+pub(crate) fn worker_died() -> Error {
+	Error::custom(
+		ErrorKind::ArchiveWorkerDied,
+		"the archive's codec stopped responding",
+	)
+}
+
+/// Tells a codec that stopped moving from one waiting on its driver, over the driver's ticks.
+#[derive(Debug, Default)]
+pub(crate) struct StallWatch {
+	/// The codec's progress stamp last seen, and for how many ticks it has not moved.
+	stamp: u64,
+	still_ticks: u32,
+}
+
+impl StallWatch {
+	/// One tick, every [`CALLBACK_INTERVAL`]; whether the codec has made no progress for
+	/// [`ARCHIVE_STALL_TIMEOUT`] while its driver `owed` it nothing (an answer, room for an
+	/// event, the end of a pause: all of which leave it rightly still).
+	pub(crate) fn stalled(&mut self, shared: &WorkerShared, owed: bool) -> bool {
+		let stamp = shared.progress();
+		if owed || stamp != self.stamp {
+			self.stamp = stamp;
+			self.still_ticks = 0;
+			return false;
+		}
+		self.still_ticks += 1;
+		CALLBACK_INTERVAL * self.still_ticks >= ARCHIVE_STALL_TIMEOUT
 	}
 }
 

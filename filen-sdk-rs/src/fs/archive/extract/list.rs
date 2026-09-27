@@ -1,0 +1,589 @@
+//! Listing an archive's entries without extracting any. See
+//! [`Client::list_archive`](crate::auth::Client::list_archive).
+
+use std::{sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+
+use crate::{
+	Error, ErrorKind,
+	consts::CALLBACK_INTERVAL,
+	fs::{
+		HasUUID,
+		archive::{
+			config::ArchiveConfig,
+			format::ArchiveFormat,
+			worker::{ARCHIVE_STALL_TIMEOUT, StallWatch, WorkerEvent, WorkerLink, worker_died},
+		},
+		drive_job::{Fatal, backend::DriveBackend, cancelled},
+		file::{enums::RemoteFileType, read::check_chunks_consistent, traits::HasFileInfo},
+	},
+	job::{
+		self, JobControl, Stopped,
+		report::{JobFailed, JobPhase, JobReport, JobState, Progress, RunCore, Snapshot, Units},
+	},
+	util::{MaybeArc, MaybeSendSync, sleep},
+};
+
+use super::{
+	DuplicateEntries, ExtractSkipReason,
+	codec::ArchiveEnd,
+	engine::CodecResult,
+	input::{ArchiveInput, Floor},
+	report::{ArchiveEntryId, CALLBACK_BATCH, RunState},
+};
+
+/// What kind of item an archive entry is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ArchiveEntryKind {
+	File,
+	Dir,
+	/// A symbolic link to `target`, as stored and cut to at most 4096 bytes.
+	Symlink {
+		target: String,
+	},
+	/// A tar hard link: a second name for the earlier file at `target`, as stored and cut to at
+	/// most 4096 bytes. Extracted as a copy of that file, when it was extracted.
+	Hardlink {
+		target: String,
+	},
+	/// A device node or FIFO.
+	Device,
+	/// Something else the SDK does not extract: a tar multivolume continuation or vendor type, or
+	/// a 7z deletion marker.
+	Other,
+}
+
+/// An entry of an archive, and what extracting it would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveEntry {
+	/// What [`ExtractRequest::Entries`](super::ExtractRequest::Entries) takes to extract it.
+	pub id: ArchiveEntryId,
+	/// Its path as the archive stores it, cut to at most 4096 bytes.
+	pub stored_path: String,
+	pub stored_path_truncated: bool,
+	/// Where extracting it puts it below the extraction's root, as drive names: before the
+	/// keep-both names a collision (with another entry, or an item in the destination) calls
+	/// for. `None` when its path cannot be extracted (see `skip`).
+	pub path: Option<String>,
+	pub kind: ArchiveEntryKind,
+	/// The size of the file it extracts to: as the archive states it, for a hard link its
+	/// target's, and for a single compressed file what it decodes to. `None` for a directory.
+	pub size: Option<u64>,
+	pub modified: Option<DateTime<Utc>>,
+	/// Its data is encrypted.
+	pub encrypted: bool,
+	/// How a zip's or 7z's entry is compressed, for display (`Deflate`, `LZMA2`, `BCJ+LZMA`,
+	/// `method 98`); `None` for an entry without data, and for a tar's members or a single file,
+	/// which the archive's own compression covers (see [`ArchiveListing::format`]).
+	pub method: Option<String>,
+	/// Why extracting it would skip it; `None` for an entry an extraction creates.
+	pub skip: Option<ExtractSkipReason>,
+	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
+	/// [`ExtractRenameReason::PathRewritten`](super::ExtractRenameReason::PathRewritten)).
+	pub path_rewritten: bool,
+	/// Its path reads as something it is not (see
+	/// [`ExtractMisleadingName`](super::ExtractMisleadingName)).
+	pub misleading_name: bool,
+	/// macOS metadata: inside a `__MACOSX` folder, or an AppleDouble `._` file, told by its data
+	/// in a tar and by its name alone in a zip or 7z. See
+	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata).
+	pub mac_metadata: bool,
+}
+
+/// What a listing found out about the archive's password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PasswordCheck {
+	/// Nothing in the archive is encrypted.
+	NotNeeded,
+	/// Entries are encrypted, and no password was given.
+	Required,
+	/// The password given opened an encrypted entry, or the encrypted index.
+	Right,
+	/// The password given does not open the entries.
+	Wrong,
+	/// A password was given, and no encrypted entry was small enough to check it on up front:
+	/// an extraction checks it as it reads them.
+	Unchecked,
+}
+
+/// What a listing counts, over every entry of the archive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ListTotals {
+	pub entries: u64,
+	/// Directory entries an extraction creates (those only implied by the paths below them are
+	/// left out).
+	pub dirs: u64,
+	/// Files an extraction creates.
+	pub files: u64,
+	/// Bytes of the files an extraction creates, as the archive states them.
+	pub bytes: u64,
+	/// Entries an extraction skips, and the bytes the archive stores for them.
+	pub skipped: u64,
+	pub bytes_skipped: u64,
+}
+
+impl ListTotals {
+	fn count(&mut self, entry: &ArchiveEntry) {
+		self.entries += 1;
+		let size = entry.size.unwrap_or(0);
+		match (&entry.skip, &entry.kind) {
+			(Some(_), _) => {
+				self.skipped += 1;
+				self.bytes_skipped += size;
+			}
+			(None, ArchiveEntryKind::Dir) => self.dirs += 1,
+			(None, _) => {
+				self.files += 1;
+				self.bytes += size;
+			}
+		}
+	}
+}
+
+/// Most entries an [`ArchiveListing`] keeps; the callback receives every one.
+pub const MAX_LISTED_ENTRIES: usize = 10_000;
+
+/// What a listing found: the archive, and its entries in the order of its index (a tar's in the
+/// order it stores them).
+///
+/// An archive may hold a million entries: the listing keeps the first [`MAX_LISTED_ENTRIES`] and
+/// counts the rest, which the callback receives in batches as they are read, so an app keeps
+/// what it shows without the SDK building every entry up front.
+#[derive(Debug, Clone)]
+pub struct ArchiveListing {
+	/// `None` when the listing ended before it could tell.
+	pub format: Option<ArchiveFormat>,
+	pub password: PasswordCheck,
+	pub entries: Vec<ArchiveEntry>,
+	/// Entries the callback received that `entries` leaves out.
+	pub omitted_entries: u64,
+	pub totals: ListTotals,
+	/// Bytes of the archive that belong to no entry (see
+	/// [`ExtractReport::unaccounted_bytes`](super::ExtractReport::unaccounted_bytes)).
+	pub unaccounted_bytes: u64,
+	/// Names a zip lists more than once: only the last entry of each is listed, and extracted.
+	pub duplicates: Option<DuplicateEntries>,
+}
+
+impl JobReport for ArchiveListing {
+	const NAME: &'static str = "listing";
+}
+
+/// A listing that ended early: cancelled, or stopped by an error (a damaged archive, a wrong
+/// password for a 7z whose index is encrypted); it holds the entries read until then.
+pub type ListFailed = JobFailed<ArchiveListing>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi),
+	serde(rename_all = "camelCase")
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum ListPhase {
+	/// Waiting for another archive job to finish; nothing is held meanwhile.
+	WaitingForWorker,
+	/// Reading the archive: a zip's or 7z's index, or the whole of a tar or compressed file.
+	Reading,
+	Done,
+	Cancelled,
+	Failed,
+}
+
+impl JobPhase for ListPhase {
+	const DONE: Self = Self::Done;
+	const CANCELLED: Self = Self::Cancelled;
+	const FAILED: Self = Self::Failed;
+}
+
+/// One progress callback of a listing.
+#[derive(Debug, Clone)]
+pub struct ListUpdate {
+	pub phase: ListPhase,
+	pub run_state: RunState,
+	/// Bytes of the archive read so far, of `archive_bytes`.
+	pub bytes_read: u64,
+	pub archive_bytes: u64,
+	/// Entries listed so far.
+	pub entries: u64,
+	pub bytes_per_second: Option<u64>,
+	pub eta: Option<Duration>,
+	/// Time spent running, paused time left out.
+	pub active_time: Duration,
+}
+
+/// Receives a listing's entries and progress. All calls come from the one job, in order.
+pub trait ListCallback: MaybeSendSync + 'static {
+	/// Entries, in batches as they are read, each batch before the update that counts it.
+	fn on_entries(&self, entries: Vec<ArchiveEntry>);
+	fn on_update(&self, update: ListUpdate);
+}
+
+impl<T: ListCallback + ?Sized> ListCallback for Arc<T> {
+	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
+		(**self).on_entries(entries);
+	}
+
+	fn on_update(&self, update: ListUpdate) {
+		(**self).on_update(update);
+	}
+}
+
+/// What a listing counts, next to the job-agnostic [`RunCore`].
+pub(crate) struct ListState {
+	core: RunCore<(), ListPhase>,
+	archive_bytes: u64,
+	bytes_read: u64,
+	entries: u64,
+	/// Entries not delivered yet: they go out in batches, each before the next update.
+	pending: Vec<ArchiveEntry>,
+	/// The job ended: whatever it did not read, it never will.
+	ended: bool,
+}
+
+impl JobState for ListState {
+	type Phase = ListPhase;
+	type Event = ();
+	type Callback = dyn ListCallback;
+
+	fn core(&mut self) -> &mut RunCore<(), ListPhase> {
+		&mut self.core
+	}
+
+	fn progress(&self) -> Progress {
+		Progress {
+			bytes_done: self.bytes_read,
+			units: Units {
+				done: self.bytes_read,
+				settled: if self.ended {
+					self.archive_bytes
+				} else {
+					self.bytes_read
+				},
+				total: self.archive_bytes,
+			},
+		}
+	}
+
+	fn deliver(&mut self, callback: &dyn ListCallback, snapshot: Snapshot<(), ListPhase>) {
+		if !self.pending.is_empty() {
+			callback.on_entries(std::mem::take(&mut self.pending));
+		}
+		callback.on_update(ListUpdate {
+			phase: snapshot.phase,
+			run_state: snapshot.run_state,
+			bytes_read: self.bytes_read,
+			archive_bytes: self.archive_bytes,
+			entries: self.entries,
+			bytes_per_second: snapshot.bytes_per_second,
+			eta: snapshot.eta,
+			active_time: snapshot.active_time,
+		});
+	}
+
+	fn settle(&mut self) {
+		self.ended = true;
+	}
+}
+
+/// A listing's reporter: the job-agnostic [`job::report::Reporter`] over a [`ListState`].
+pub(crate) type ListReporter = job::report::Reporter<ListState>;
+
+impl ListReporter {
+	pub(crate) fn new(callback: impl ListCallback, archive_bytes: u64) -> MaybeArc<Self> {
+		Self::from_parts(
+			ListState {
+				core: RunCore::new(ListPhase::WaitingForWorker),
+				archive_bytes,
+				bytes_read: 0,
+				entries: 0,
+				pending: Vec::new(),
+				ended: false,
+			},
+			Box::new(callback),
+		)
+	}
+
+	pub(crate) fn set_bytes_read(&self, bytes_read: u64) {
+		self.with_state(|state| {
+			if state.bytes_read != bytes_read {
+				state.bytes_read = bytes_read;
+				state.core.mark_changed();
+			}
+		});
+	}
+
+	/// Delivered in a batch of up to [`CALLBACK_BATCH`] entries right before the next update.
+	pub(crate) fn listed(&self, entry: ArchiveEntry) {
+		let mut full = false;
+		self.with_state(|state| {
+			state.entries += 1;
+			state.pending.push(entry);
+			state.core.mark_changed();
+			full = state.pending.len() >= CALLBACK_BATCH;
+		});
+		if full {
+			self.flush_then_call(|_| {});
+		}
+	}
+}
+
+/// Adds `entry` to `listing`: kept while it holds fewer than [`MAX_LISTED_ENTRIES`], counted
+/// either way.
+pub(crate) fn add_entry(listing: &mut ArchiveListing, entry: &ArchiveEntry) {
+	listing.totals.count(entry);
+	if listing.entries.len() < MAX_LISTED_ENTRIES {
+		listing.entries.push(entry.clone());
+	} else {
+		listing.omitted_entries += 1;
+	}
+}
+
+/// What [`run_list`] needs.
+pub(crate) struct ListTask<B> {
+	pub(crate) backend: Arc<B>,
+	pub(crate) control: JobControl,
+	pub(crate) reporter: MaybeArc<ListReporter>,
+	pub(crate) archive: RemoteFileType<'static>,
+	pub(crate) config: ArchiveConfig,
+	/// Starts the codec; called once the job holds its lease and memory floor.
+	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+}
+
+/// Runs a listing: waits for a job slot, starts the codec, and serves it the archive, collecting
+/// the entries it lists.
+pub(crate) async fn run_list<B: DriveBackend>(
+	task: ListTask<B>,
+) -> Result<ArchiveListing, ListFailed> {
+	let ListTask {
+		backend,
+		control,
+		reporter,
+		archive,
+		config,
+		start,
+	} = task;
+	let mut listing = ArchiveListing {
+		format: None,
+		password: PasswordCheck::NotNeeded,
+		entries: Vec::new(),
+		omitted_entries: 0,
+		totals: ListTotals::default(),
+		unaccounted_bytes: 0,
+		duplicates: None,
+	};
+	let fail = |listing, phase, error| {
+		reporter.finish(phase);
+		ListFailed {
+			report: listing,
+			error,
+		}
+	};
+	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
+		return Err(fail(listing, ListPhase::Failed, Arc::new(error)));
+	}
+	// leased and floored before the codec starts, so a waiting job holds nothing
+	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
+		reporter.set_cancelling();
+		return Err(fail(
+			listing,
+			ListPhase::Cancelled,
+			cancelled(ArchiveListing::NAME),
+		));
+	};
+	reporter.set_phase(ListPhase::Reading);
+	let link = match start() {
+		Ok(link) => link,
+		Err(error) => return Err(fail(listing, ListPhase::Failed, Arc::new(error))),
+	};
+	let mut lister = Lister {
+		input: ArchiveInput::new(backend, Arc::new(archive)),
+		floor: Some((floor, reporter.op())),
+		control,
+		reporter,
+		config,
+		link,
+		events_closed: false,
+		end: None,
+		stall: StallWatch::default(),
+		fatal: Fatal::default(),
+	};
+	let outcome = lister.run(&mut listing).await;
+	let Lister {
+		control,
+		reporter,
+		fatal,
+		end,
+		..
+	} = lister;
+	if let Some(end) = end {
+		listing.password = end.password;
+		listing.unaccounted_bytes = end.unaccounted_bytes;
+		listing.duplicates = end.duplicates;
+	}
+	let (phase, result) = fatal.end(outcome, &control, ArchiveListing::NAME);
+	reporter.finish(phase);
+	match result {
+		Ok(()) => Ok(listing),
+		Err(error) => Err(ListFailed {
+			report: listing,
+			error,
+		}),
+	}
+}
+
+/// The async driver of a listing's codec: it only ever reads the archive, and creates nothing.
+struct Lister<B> {
+	input: ArchiveInput<B>,
+	floor: Option<Floor>,
+	control: JobControl,
+	reporter: MaybeArc<ListReporter>,
+	config: ArchiveConfig,
+	link: WorkerLink<CodecResult>,
+	events_closed: bool,
+	/// How the archive ended, once the codec returned it.
+	end: Option<ArchiveEnd>,
+	stall: StallWatch,
+	fatal: Fatal,
+}
+
+impl<B: DriveBackend> Lister<B> {
+	/// Serves the codec until it has returned; `Err` when stopped.
+	async fn run(&mut self, listing: &mut ArchiveListing) -> Result<(), Stopped> {
+		loop {
+			let pause_requested = self.control.is_pause_requested();
+			self.reporter.set_pause_requested(pause_requested);
+			if self.control.is_stopping() {
+				// nothing a listing does has to finish
+				self.input.drop_all();
+				self.reporter.set_cancelling();
+				return Err(Stopped);
+			}
+			if self.events_closed && (self.end.is_some() || self.fatal.error().is_some()) {
+				self.input.release();
+				self.floor = None;
+				return Ok(());
+			}
+			if pause_requested {
+				if !self.input.fetching() {
+					self.input
+						.wait_out_pause(
+							&mut self.floor,
+							&self.reporter,
+							&self.control,
+							&self.config,
+						)
+						.await?;
+					continue;
+				}
+			} else {
+				self.input.advance(&self.reporter.ops());
+				self.report_bytes_read();
+			}
+			let take_events = !pause_requested && !self.events_closed;
+			tokio::select! {
+				biased;
+				() = self.control.stopping() => {},
+				() = self.control.pause_changed(pause_requested) => {},
+				Some(fetched) = self.input.fetched(), if self.input.fetching() => {
+					if let Err(error) = self.input.fetch_finished(fetched) {
+						self.fatal.stop(Arc::new(error), &self.control, &*self.reporter);
+					}
+					self.report_bytes_read();
+				}
+				event = self.link.events.recv(), if take_events => match event {
+					Some(event) => self.on_event(event, listing),
+					None => self.events_closed = true,
+				},
+				result = &mut self.link.done, if self.events_closed => {
+					self.codec_finished(result.unwrap_or_else(|_| Err(worker_died())));
+				}
+				() = sleep(CALLBACK_INTERVAL) => self.tick(pause_requested),
+			}
+		}
+	}
+
+	fn on_event(&mut self, event: WorkerEvent, listing: &mut ArchiveListing) {
+		match event {
+			WorkerEvent::Ask {
+				source: _,
+				index,
+				reply,
+			} => {
+				self.input.ask(index, reply);
+				self.report_bytes_read();
+			}
+			WorkerEvent::Opened(format) => listing.format = Some(format),
+			WorkerEvent::Listed(entry) => {
+				add_entry(listing, &entry);
+				self.reporter.listed(*entry);
+			}
+			other => debug_assert!(false, "a listing codec sent {other:?}"),
+		}
+	}
+
+	fn codec_finished(&mut self, result: CodecResult) {
+		self.input.codec_done();
+		match result {
+			Ok(end) => self.end = Some(end),
+			// an error the driver caused (it failed a fetch) is already the job's
+			Err(error) if self.fatal.error().is_some() => {
+				tracing::debug!("archive codec ended after the listing did: {error}");
+			}
+			Err(error) => {
+				if error.kind() == ErrorKind::ArchiveWorkerDied {
+					tracing::error!("archive {}: {error}", self.input.archive().uuid());
+				}
+				self.fatal.record(Arc::new(error));
+			}
+		}
+	}
+
+	/// Reports the bytes of the archive the codec has read.
+	fn report_bytes_read(&self) {
+		self.reporter.set_bytes_read(self.link.shared.input_bytes());
+	}
+
+	fn tick(&mut self, pause_requested: bool) {
+		self.report_bytes_read();
+		self.reporter.tick();
+		let owed = self.input.owes_codec() || pause_requested || self.events_closed;
+		if self.stall.stalled(&self.link.shared, owed) {
+			tracing::error!(
+				"archive {}: the codec made no progress for {ARCHIVE_STALL_TIMEOUT:?}",
+				self.input.archive().uuid()
+			);
+			self.link.retire();
+			self.events_closed = true;
+			self.fatal
+				.stop(Arc::new(worker_died()), &self.control, &*self.reporter);
+		}
+	}
+}
