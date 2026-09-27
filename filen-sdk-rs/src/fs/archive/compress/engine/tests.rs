@@ -370,6 +370,24 @@ async fn compresses_the_sources_into_one_new_file() {
 	assert_eq!(report.counts.bytes_done, bytes.len() as u64);
 	assert_eq!(job.recorder.created.lock().unwrap().len(), 1);
 	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
+	// each file with data was the active one while it was read, named as in the archive
+	let mut active: Vec<(String, String)> = job
+		.recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| update.active.clone())
+		.map(|file| (file.name, file.path))
+		.collect();
+	active.dedup();
+	assert!(
+		active
+			.iter()
+			.all(|(name, path)| path.ends_with(name.as_str())),
+		"{active:?}"
+	);
+	assert!(job.recorder.last().active.is_empty());
 	assert!(
 		job.recorder.events().is_empty(),
 		"every source matched its hash"

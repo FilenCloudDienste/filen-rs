@@ -73,15 +73,19 @@ pub struct CompressCounts {
 	pub bytes_done: u64,
 }
 
-/// The source file being read into the archive right now.
+/// The source file being read into the archive right now, shaped like the copy and extract
+/// jobs' active files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct CompressActiveFile {
 	pub source_uuid: Uuid,
-	/// Its path in the archive.
+	/// Its name in the archive.
+	pub name: String,
+	/// Its whole path in the archive.
 	pub path: String,
 	pub size: u64,
-	pub bytes_read: u64,
+	/// Bytes of it read so far.
+	pub bytes_done: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -113,9 +117,10 @@ pub struct CompressUpdate {
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
 	pub counts: CompressCounts,
-	/// The source being read: an archive is written one file at a time, in its order. `None`
-	/// between files, and for an empty one.
-	pub active: Option<CompressActiveFile>,
+	/// The source being read, as the copy and extract updates list theirs. An archive is
+	/// written one file at a time, in its order, so this holds at most one: none between files,
+	/// or for an empty one.
+	pub active: Vec<CompressActiveFile>,
 	pub events: Vec<CompressEvent>,
 	pub bytes_per_second: Option<u64>,
 	pub eta: Option<Duration>,
@@ -218,7 +223,7 @@ impl JobState for CompressState {
 			scan: self.scan,
 			totals: self.totals,
 			counts: self.counts,
-			active: self.active.clone(),
+			active: self.active.iter().cloned().collect(),
 			events: snapshot.events,
 			bytes_per_second: snapshot.bytes_per_second,
 			eta: snapshot.eta,
@@ -290,10 +295,10 @@ impl Reporter {
 		self.with_state(|state| {
 			state.counts.bytes_read += bytes;
 			match &mut state.active {
-				Some(active) if active.source_uuid == source_uuid => active.bytes_read += bytes,
+				Some(active) if active.source_uuid == source_uuid => active.bytes_done += bytes,
 				active => {
 					*active = Some(CompressActiveFile {
-						bytes_read: bytes,
+						bytes_done: bytes,
 						..file()
 					});
 				}
@@ -372,9 +377,10 @@ mod tests {
 	fn starting(source_uuid: Uuid, path: &str) -> CompressActiveFile {
 		CompressActiveFile {
 			source_uuid,
+			name: path.to_owned(),
 			path: path.to_owned(),
 			size: 5,
-			bytes_read: 0,
+			bytes_done: 0,
 		}
 	}
 
@@ -388,7 +394,7 @@ mod tests {
 		assert_eq!(
 			active(),
 			Some(CompressActiveFile {
-				bytes_read: 5,
+				bytes_done: 5,
 				..starting(a, "a")
 			})
 		);
@@ -398,7 +404,7 @@ mod tests {
 		assert_eq!(
 			active(),
 			Some(CompressActiveFile {
-				bytes_read: 1,
+				bytes_done: 1,
 				..starting(b, "b")
 			})
 		);

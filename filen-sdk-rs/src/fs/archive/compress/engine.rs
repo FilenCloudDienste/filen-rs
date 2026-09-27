@@ -631,9 +631,14 @@ impl<B: DisposalBackend> Driver<B> {
 		self.reporter
 			.source_read(source_uuid, len, || CompressActiveFile {
 				source_uuid,
+				name: state
+					.path
+					.rsplit_once('/')
+					.map_or(&*state.path, |(_, name)| name)
+					.to_owned(),
 				path: state.path.clone(),
 				size,
-				bytes_read: 0,
+				bytes_done: 0,
 			});
 		let _ = reply.send(Ok(data));
 	}
