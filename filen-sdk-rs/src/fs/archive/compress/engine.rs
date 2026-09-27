@@ -39,7 +39,7 @@ use crate::{
 			},
 			hash::HeadLastHasher,
 			limits::MAX_REPORT_RECORDS,
-			worker::{ARCHIVE_STALL_TIMEOUT, WorkerEvent, WorkerLink},
+			worker::{ARCHIVE_STALL_TIMEOUT, StallWatch, WorkerEvent, WorkerLink, worker_died},
 		},
 		categories::{DirType, Normal},
 		drive_job::{
@@ -200,8 +200,7 @@ struct Driver<B: DriveBackend> {
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
 	max_bytes: Option<u64>,
-	stamp: u64,
-	stalled_ticks: u32,
+	stall: StallWatch,
 	/// The top-level sources a file of which did not match the hash in its metadata.
 	mismatched: BTreeSet<usize>,
 	/// The files behind `mismatched`, for the report.
@@ -325,8 +324,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		events_closed: false,
 		codec_result: None,
 		max_bytes,
-		stamp: 0,
-		stalled_ticks: 0,
+		stall: StallWatch::default(),
 		mismatched: BTreeSet::new(),
 		hash_mismatches: Vec::new(),
 		read_back,
@@ -428,13 +426,6 @@ pub(crate) fn end_early(
 
 pub(crate) fn cancelled() -> Arc<Error> {
 	drive_job::cancelled(CompressReport::NAME)
-}
-
-fn worker_died() -> Error {
-	Error::custom(
-		ErrorKind::ArchiveWorkerDied,
-		"the archive's codec stopped responding",
-	)
 }
 
 impl<B: DisposalBackend> Driver<B> {
@@ -723,15 +714,11 @@ impl<B: DisposalBackend> Driver<B> {
 
 	fn tick(&mut self, pause_requested: bool) {
 		self.reporter.tick();
-		let stamp = self.link.shared.progress();
-		let owed = self.ask.is_some() || self.held.is_some() || pause_requested;
-		if owed || stamp != self.stamp || self.codec_result.is_some() {
-			self.stamp = stamp;
-			self.stalled_ticks = 0;
-			return;
-		}
-		self.stalled_ticks += 1;
-		if CALLBACK_INTERVAL * self.stalled_ticks >= ARCHIVE_STALL_TIMEOUT {
+		let owed = self.ask.is_some()
+			|| self.held.is_some()
+			|| pause_requested
+			|| self.codec_result.is_some();
+		if self.stall.stalled(&self.link.shared, owed) {
 			tracing::error!(
 				"archive {}: the codec made no progress for {ARCHIVE_STALL_TIMEOUT:?}",
 				self.archive_uuid

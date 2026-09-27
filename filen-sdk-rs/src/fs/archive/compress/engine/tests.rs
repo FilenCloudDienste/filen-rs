@@ -557,6 +557,43 @@ async fn a_silent_codec_is_given_up_on() {
 	drop((events, result));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
+	let setup = setup(|backend, files| {
+		backend.hold_requests(Request::Fetch, [files[0].uuid()]);
+	});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let (_pause, cancel, control) = controls();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		control,
+		None,
+		Box::new(move || Ok(link)),
+	);
+	let (reply, answer) = oneshot::channel();
+	events
+		.send(WorkerEvent::Ask {
+			source: 0,
+			index: 0,
+			reply,
+		})
+		.await
+		.unwrap();
+	// longer than a silent codec is given, which one owed its chunk must not be taken for
+	tokio::time::sleep(2 * ARCHIVE_STALL_TIMEOUT).await;
+	assert!(!job.running.is_finished());
+	setup.backend.release_all();
+	assert_eq!(answer.await.unwrap().unwrap(), setup.contents[0]);
+
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert_released(&setup, &job.reporter);
+	drop((events, result));
+}
+
 /// The sources as placed in the fake drive: `docs` (holding the first two files) in `parent`,
 /// and the third file next to it.
 struct Placed {
