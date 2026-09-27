@@ -22,14 +22,17 @@ use filen_sdk_rs::{
 				CompressUpdate, Compression, ItemSource, ItemSourceDir, StreamCodec, ZipMethod,
 			},
 			extract::{
-				ArchiveSource, ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport,
-				ExtractRequest, ExtractRoot, ExtractUpdate, ExtractedTopLevel,
+				ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveListing, ArchiveSource,
+				ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport, ExtractRequest,
+				ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractedTopLevel, ListCallback,
+				ListTotals, ListUpdate, PasswordCheck,
 			},
 		},
 		categories::{DirType, NonRootItemType},
 		dir::RemoteDirectory,
 		file::{
 			RemoteFile,
+			enums::RemoteFileType,
 			traits::{HasFileInfo, HasRemoteFileInfo},
 		},
 		name::ValidatedName,
@@ -128,23 +131,124 @@ async fn extract_into(
 	root: ExtractRoot,
 	password: Option<&str>,
 ) -> Result<ExtractReport, ErrorKind> {
+	run_extract(
+		client,
+		ExtractRequest::All {
+			archive,
+			destination: destination.clone().into(),
+			root,
+		},
+		with_password(password),
+	)
+	.await
+}
+
+async fn run_extract(
+	client: &Arc<Client>,
+	request: ExtractRequest,
+	config: ExtractConfig,
+) -> Result<ExtractReport, ErrorKind> {
 	client
 		.clone()
 		.extract_archive(
-			ExtractRequest::All {
-				archive,
-				destination: destination.clone().into(),
-				root,
-			},
-			ExtractConfig {
-				password: password.map(|p| ArchivePassword::new(p.into()).unwrap()),
-				..ExtractConfig::default()
-			},
+			request,
+			config,
 			ExtractRecorder::default(),
 			JobControl::default(),
 		)
 		.await
 		.map_err(|failed| failed.error.kind())
+}
+
+fn with_password(password: Option<&str>) -> ExtractConfig {
+	ExtractConfig {
+		password: password.map(|p| ArchivePassword::new(p.into()).unwrap()),
+		..ExtractConfig::default()
+	}
+}
+
+#[derive(Default)]
+struct ListRecorder {
+	entries: Mutex<Vec<ArchiveEntry>>,
+}
+
+impl ListCallback for ListRecorder {
+	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
+		self.entries.lock().unwrap().extend(entries);
+	}
+
+	fn on_update(&self, _: ListUpdate) {}
+}
+
+/// Lists `archive` under `config`, checking the callback was handed the entries the listing
+/// keeps.
+async fn list(
+	client: &Arc<Client>,
+	archive: RemoteFileType<'static>,
+	config: ExtractConfig,
+) -> Result<ArchiveListing, ErrorKind> {
+	let recorder = Arc::new(ListRecorder::default());
+	let listing = client
+		.clone()
+		.list_archive(
+			archive,
+			config,
+			Arc::clone(&recorder),
+			JobControl::default(),
+		)
+		.await
+		.map_err(|failed| failed.error.kind())?;
+	assert_eq!(*recorder.entries.lock().unwrap(), listing.entries);
+	Ok(listing)
+}
+
+/// Each listed entry's extracted path and kind, sorted by path.
+fn outline(listing: &ArchiveListing) -> Vec<(&str, &ArchiveEntryKind)> {
+	let mut outline: Vec<_> = listing
+		.entries
+		.iter()
+		.map(|entry| (entry.path.as_deref().unwrap_or_default(), &entry.kind))
+		.collect();
+	outline.sort_unstable_by_key(|(path, _)| *path);
+	outline
+}
+
+/// The listed entry at `path`.
+fn entry<'l>(listing: &'l ArchiveListing, path: &str) -> &'l ArchiveEntry {
+	listing
+		.entries
+		.iter()
+		.find(|entry| entry.path.as_deref() == Some(path))
+		.unwrap_or_else(|| panic!("{path} is listed"))
+}
+
+/// The paths of the files an extraction with the listing's config creates, sorted.
+fn listed_files(listing: &ArchiveListing) -> Vec<&str> {
+	let mut files: Vec<&str> = listing
+		.entries
+		.iter()
+		.filter(|entry| entry.kind == ArchiveEntryKind::File && entry.skip.is_none())
+		.filter_map(|entry| entry.path.as_deref())
+		.collect();
+	files.sort_unstable();
+	files
+}
+
+/// The paths of the files in `dir`'s tree, sorted.
+fn file_paths(files: &[(String, RemoteFile)]) -> Vec<&str> {
+	let mut paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+	paths.sort_unstable();
+	paths
+}
+
+/// An archive made by a real tool, from `tests/fixtures/archives` (see the READMEs there).
+fn fixture(path: &str) -> Vec<u8> {
+	std::fs::read(
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("tests/fixtures/archives")
+			.join(path),
+	)
+	.unwrap()
 }
 
 /// The folder an extract created in `destination`.
@@ -757,4 +861,445 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 		],
 	)
 	.await;
+}
+
+/// A listing names each entry as an extraction would place it and says whether the password
+/// given opens the encrypted ones, creating nothing; a 7z whose index is encrypted lists nothing
+/// without the right one.
+#[shared_test_runtime]
+async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let (source, files) = tree(&client, test_dir).await;
+	let destination = client.create_dir(&test_dir.into(), "listed").await.unwrap();
+	let big = files[0].size();
+	let expected = [
+		("source", &ArchiveEntryKind::Dir),
+		("source/big.bin", &ArchiveEntryKind::File),
+		("source/notes.txt", &ArchiveEntryKind::File),
+		("source/sub", &ArchiveEntryKind::Dir),
+		("source/sub/empty", &ArchiveEntryKind::File),
+	];
+	let totals = ListTotals {
+		entries: 5,
+		dirs: 2,
+		files: 3,
+		bytes: big + files[1].size(),
+		skipped: 0,
+		bytes_skipped: 0,
+	};
+	let compress_source = async |name, format, password| -> RemoteFileType<'static> {
+		compress(
+			&client,
+			CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))]),
+			&destination,
+			name,
+			format,
+			password,
+		)
+		.await
+		.archive
+		.expect("the archive is registered")
+		.into()
+	};
+	let formats: [(&str, CompressFormat, Option<&str>, ArchiveFormat); 3] = [
+		(
+			"listed.tar.gz",
+			CompressFormat::Tar {
+				compression: Some(Compression {
+					codec: StreamCodec::Gzip,
+					level: None,
+				}),
+			},
+			None,
+			ArchiveFormat::Tar {
+				codec: Some(StreamCodec::Gzip),
+			},
+		),
+		(
+			"listed.zip",
+			CompressFormat::Zip {
+				method: ZipMethod::Deflate { level: 6 },
+				encryption: Some(AesStrength::Aes256),
+			},
+			Some("zip password"),
+			ArchiveFormat::Zip,
+		),
+		(
+			"listed.7z",
+			CompressFormat::SevenZ {
+				method: SevenZMethod::Lzma2 { level: 5 },
+				solid: true,
+				encryption: Some(SevenZEncryption::Entries),
+			},
+			Some("7z password"),
+			ArchiveFormat::SevenZ,
+		),
+	];
+	for (name, format, password, listed_as) in formats {
+		let archive = compress_source(name, format, password).await;
+		let listing = list(&client, archive.clone(), ExtractConfig::default())
+			.await
+			.unwrap_or_else(|kind| panic!("listing {name}: {kind:?}"));
+		assert_eq!(listing.format, Some(listed_as), "{name}");
+		assert_eq!(outline(&listing), expected, "{name}");
+		assert_eq!(entry(&listing, "source/big.bin").size, Some(big), "{name}");
+		assert_eq!(listing.totals, totals, "{name}");
+		assert_eq!(listing.omitted_entries, 0, "{name}");
+		let Some(password) = password else {
+			assert_eq!(listing.password, PasswordCheck::NotNeeded, "{name}");
+			continue;
+		};
+		assert_eq!(listing.password, PasswordCheck::Required, "{name}");
+		assert!(entry(&listing, "source/big.bin").encrypted, "{name}");
+		for (given, check) in [
+			("wrong", PasswordCheck::Wrong),
+			(password, PasswordCheck::Right),
+		] {
+			let listing = list(&client, archive.clone(), with_password(Some(given)))
+				.await
+				.unwrap_or_else(|kind| panic!("listing {name} with {given}: {kind:?}"));
+			assert_eq!(listing.password, check, "{name} with {given}");
+			assert_eq!(outline(&listing), expected, "{name} with {given}");
+		}
+	}
+
+	let hidden = compress_source(
+		"hidden.7z",
+		CompressFormat::SevenZ {
+			method: SevenZMethod::Lzma2 { level: 5 },
+			solid: true,
+			encryption: Some(SevenZEncryption::EntriesAndHeaders),
+		},
+		Some("7z password"),
+	)
+	.await;
+	for (given, kind) in [
+		(None, ErrorKind::ArchivePasswordRequired),
+		(Some("wrong"), ErrorKind::ArchiveWrongPassword),
+	] {
+		assert_eq!(
+			list(&client, hidden.clone(), with_password(given))
+				.await
+				.unwrap_err(),
+			kind,
+			"{given:?}"
+		);
+	}
+	let listing = list(&client, hidden, with_password(Some("7z password")))
+		.await
+		.unwrap();
+	assert_eq!(listing.password, PasswordCheck::Right);
+	assert_eq!(outline(&listing), expected);
+
+	// the archives, and nothing a listing made
+	let (dirs, archives) = contents(&client, &destination).await;
+	assert!(dirs.is_empty(), "{:?}", dirs.len());
+	assert_eq!(
+		file_paths(&archives),
+		["hidden.7z", "listed.7z", "listed.tar.gz", "listed.zip"]
+	);
+}
+
+/// Part of an archive extracts below the directory named as its base. An entry gone from where
+/// an extraction put it lands there again when extracted the way a failure's retry says: its id,
+/// into the directory it was created in, with that directory's path in the archive as the base.
+/// (No entry of an extraction can be made to fail against the real server, so the retry target
+/// is taken from the drive instead.)
+#[shared_test_runtime]
+async fn part_of_an_archive_extracts_below_its_base() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let (source, files) = tree(&client, test_dir).await;
+	let archives = client
+		.create_dir(&test_dir.into(), "archives")
+		.await
+		.unwrap();
+	let archive: RemoteFileType<'static> = compress(
+		&client,
+		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
+		&archives,
+		"bundle.zip",
+		CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		},
+		None,
+	)
+	.await
+	.archive
+	.expect("the archive is registered")
+	.into();
+	let listing = list(&client, archive.clone(), ExtractConfig::default())
+		.await
+		.unwrap();
+	let id = |path| entry(&listing, path).id;
+	let entries = |ids, base: &str, destination: &RemoteDirectory| ExtractRequest::Entries {
+		archive: archive.clone(),
+		ids,
+		base: base.to_owned(),
+		destination: destination.clone().into(),
+		root: ExtractRoot::Destination,
+	};
+
+	// the subfolder and a file beside it, below `source`
+	let part = client.create_dir(&test_dir.into(), "part").await.unwrap();
+	let report = run_extract(
+		&client,
+		entries(
+			vec![id("source/notes.txt"), id("source/sub")],
+			"source",
+			&part,
+		),
+		ExtractConfig::default(),
+	)
+	.await
+	.unwrap();
+	assert_eq!(report.failures.len(), 0);
+	let (dirs, extracted) = contents(&client, &part).await;
+	let dirs: Vec<&str> = dirs.iter().map(|(path, _)| path.as_str()).collect();
+	assert_eq!(dirs, ["sub"]);
+	assert_eq!(file_paths(&extracted), ["notes.txt", "sub/empty"]);
+	assert_same_files(
+		&client,
+		&extracted,
+		[("notes.txt", &files[1]), ("sub/empty", &files[2])],
+	)
+	.await;
+
+	// the whole archive, then one file again where it was created
+	let whole = client.create_dir(&test_dir.into(), "whole").await.unwrap();
+	let report = extract(&client, ArchiveSource::Keep(archive.clone()), &whole, None)
+		.await
+		.unwrap();
+	let folder = created_folder(&report);
+	let (dirs, extracted) = contents(&client, &folder).await;
+	let (_, lost) = extracted
+		.iter()
+		.find(|(path, _)| path == "source/notes.txt")
+		.expect("notes.txt is extracted");
+	client.delete_file_permanently(lost.clone()).await.unwrap();
+	let (_, created_in) = dirs
+		.iter()
+		.find(|(path, _)| path == "source")
+		.expect("source is extracted");
+	let report = run_extract(
+		&client,
+		entries(vec![id("source/notes.txt")], "source", created_in),
+		ExtractConfig::default(),
+	)
+	.await
+	.unwrap();
+	assert_eq!(report.renamed.len(), 0, "the name is free again");
+	let (_, extracted) = contents(&client, &folder).await;
+	assert_eq!(
+		file_paths(&extracted),
+		["source/big.bin", "source/notes.txt", "source/sub/empty"]
+	);
+	assert_same_files(&client, &extracted, [("source/notes.txt", &files[1])]).await;
+}
+
+/// A tar's hard link is extracted as a copy of the file it names, a file of its own with the same
+/// bytes and hash. bsdtar's pax fixture also holds a symlink, which the drive cannot hold.
+#[shared_test_runtime]
+async fn a_tar_hard_link_is_extracted_as_a_copy_of_its_target() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let links = client.create_dir(&test_dir.into(), "links").await.unwrap();
+	let archive = upload(&client, &links, "pax.tar", &fixture("tar/pax.tar")).await;
+	let symlink = ExtractSkipReason::Symlink {
+		target: "text.txt".to_owned(),
+	};
+
+	let listing = list(&client, archive.clone().into(), ExtractConfig::default())
+		.await
+		.unwrap();
+	assert_eq!(listing.format, Some(ArchiveFormat::Tar { codec: None }));
+	assert_eq!(listing.password, PasswordCheck::NotNeeded);
+	let hard = entry(&listing, "tree/dir/hard");
+	assert_eq!(
+		hard.kind,
+		ArchiveEntryKind::Hardlink {
+			target: "tree/dir/text.txt".to_owned()
+		}
+	);
+	assert_eq!(hard.size, Some(2110), "as large as the file it names");
+	assert_eq!(hard.skip, None);
+	assert_eq!(entry(&listing, "tree/dir/link").skip, Some(symlink.clone()));
+
+	let report = extract(&client, ArchiveSource::Keep(archive.into()), &links, None)
+		.await
+		.unwrap();
+	let skipped: Vec<_> = report
+		.skipped
+		.iter()
+		.map(|skipped| (skipped.path.as_str(), &skipped.reason))
+		.collect();
+	assert_eq!(skipped, [("tree/dir/link", &symlink)]);
+	let (_, extracted) = contents(&client, &created_folder(&report)).await;
+	assert_eq!(
+		file_paths(&extracted),
+		[
+			"tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt",
+			"tree/café.txt",
+			"tree/dir/bin.dat",
+			"tree/dir/hard",
+			"tree/dir/text.txt",
+		]
+	);
+	let file = |path: &str| {
+		&extracted
+			.iter()
+			.find(|(p, _)| p == path)
+			.unwrap_or_else(|| panic!("{path} is extracted"))
+			.1
+	};
+	let (hard, text) = (file("tree/dir/hard"), file("tree/dir/text.txt"));
+	assert_ne!(hard.uuid(), text.uuid());
+	assert_eq!(hard.size(), 2110);
+	assert!(hard.hash().is_some());
+	assert_eq!(hard.hash(), text.hash());
+	assert_eq!(
+		client.download_file(hard).await.unwrap(),
+		client.download_file(text).await.unwrap()
+	);
+}
+
+/// Finder's zips hold a `__MACOSX` folder of AppleDouble files beside the real ones: left out by
+/// default, as a listing says, and extracted as ordinary files with `skip_mac_metadata` off.
+#[shared_test_runtime]
+async fn a_finder_zips_mac_metadata_is_left_out_unless_asked_for() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let mac = client.create_dir(&test_dir.into(), "mac").await.unwrap();
+	let archive: RemoteFileType<'static> = upload(
+		&client,
+		&mac,
+		"finder-ditto.zip",
+		&fixture("zip/finder-ditto.zip"),
+	)
+	.await
+	.into();
+	let keep_metadata = ExtractConfig {
+		skip_mac_metadata: false,
+		..ExtractConfig::default()
+	};
+	for config in [ExtractConfig::default(), keep_metadata] {
+		let skip = config.skip_mac_metadata;
+		let listing = list(&client, archive.clone(), config.clone())
+			.await
+			.unwrap();
+		let metadata: Vec<&ArchiveEntry> = listing
+			.entries
+			.iter()
+			.filter(|entry| entry.mac_metadata)
+			.collect();
+		assert!(!metadata.is_empty());
+		assert!(
+			metadata
+				.iter()
+				.all(|entry| entry.stored_path.starts_with("__MACOSX/")
+					&& (entry.skip == Some(ExtractSkipReason::MacMetadata)) == skip),
+			"skip {skip}: {metadata:?}"
+		);
+		let expected = listed_files(&listing);
+		assert!(
+			expected.contains(&"finder/naïve.txt") && expected.contains(&"finder/Café/Résumé.txt"),
+			"{expected:?}"
+		);
+		assert_eq!(
+			expected.iter().any(|path| path.starts_with("__MACOSX/")),
+			!skip,
+			"{expected:?}"
+		);
+
+		let destination = client
+			.create_dir(&(&mac).into(), if skip { "skipped" } else { "kept" })
+			.await
+			.unwrap();
+		let report = run_extract(
+			&client,
+			ExtractRequest::All {
+				archive: ArchiveSource::Keep(archive.clone()),
+				destination: destination.clone().into(),
+				root: ExtractRoot::NewFolder { name: None },
+			},
+			config,
+		)
+		.await
+		.unwrap();
+		let mut left_out: Vec<&str> = report
+			.skipped
+			.iter()
+			.filter(|skipped| skipped.reason == ExtractSkipReason::MacMetadata)
+			.map(|skipped| skipped.path.as_str())
+			.collect();
+		left_out.sort_unstable();
+		let mut listed_out: Vec<&str> = metadata
+			.iter()
+			.filter(|_| skip)
+			.map(|entry| entry.stored_path.as_str())
+			.collect();
+		listed_out.sort_unstable();
+		assert_eq!(left_out, listed_out, "skip {skip}");
+		let (_, extracted) = contents(&client, &created_folder(&report)).await;
+		assert_eq!(file_paths(&extracted), expected, "skip {skip}");
+	}
+}
+
+/// A zip whose entries are compressed with zstd (method 93), as CPython's `zipfile` writes it.
+#[shared_test_runtime]
+async fn a_zip_of_zstd_entries_extracts() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let dir = client.create_dir(&test_dir.into(), "zstd").await.unwrap();
+	let archive = upload(
+		&client,
+		&dir,
+		"zstd-python.zip",
+		&fixture("zip/zstd-python.zip"),
+	)
+	.await;
+
+	let report = extract(&client, ArchiveSource::Keep(archive.into()), &dir, None)
+		.await
+		.unwrap();
+	assert_eq!(report.skipped.len(), 0);
+	assert_eq!(report.failures.len(), 0);
+	let (_, extracted) = contents(&client, &created_folder(&report)).await;
+	let far = [
+		fixture_noise(1, 1000),
+		vec![0; 34_000],
+		fixture_noise(1, 1000),
+	]
+	.concat();
+	let lines: Vec<u8> = (0..500)
+		.flat_map(|i| format!("line {i}\n").into_bytes())
+		.collect();
+	let expected: [(&str, &[u8]); 3] = [
+		("hello.txt", b"hello from a real zip tool\n"),
+		("sub/far.bin", &far),
+		("sub/lines.txt", &lines),
+	];
+	assert_eq!(file_paths(&extracted), expected.map(|(path, _)| path));
+	for (path, data) in expected {
+		let (_, file) = extracted.iter().find(|(p, _)| p == path).unwrap();
+		assert_eq!(client.download_file(file).await.unwrap(), data, "{path}");
+	}
+}
+
+/// What the zip fixtures' script (`tests/fixtures/archives/zip/README.md`) calls `noise(seed, n)`:
+/// the high bits of a C `rand`-style linear congruential generator.
+fn fixture_noise(mut seed: u32, len: usize) -> Vec<u8> {
+	(0..len)
+		.map(|_| {
+			seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345) & 0x7FFF_FFFF;
+			(seed >> 16) as u8
+		})
+		.collect()
 }
