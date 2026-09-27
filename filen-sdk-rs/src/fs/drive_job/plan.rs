@@ -253,7 +253,7 @@ impl ItemPlanner {
 		self.unverified_destinations.insert(uuid);
 	}
 
-	/// Validates every request before planning any: a directory cannot be recreated inside
+	/// Validates every request before planning any: a directory cannot be placed inside
 	/// itself or one of its descendants.
 	pub(crate) fn plan<D>(mut self, requests: Vec<PlanRequest<D>>) -> Result<ItemPlan<D>, Error> {
 		for request in &requests {
@@ -269,7 +269,7 @@ impl ItemPlanner {
 			{
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
-					"cannot recreate a directory inside itself or one of its subdirectories",
+					"cannot place a directory inside itself or one of its subdirectories",
 				));
 			}
 		}
