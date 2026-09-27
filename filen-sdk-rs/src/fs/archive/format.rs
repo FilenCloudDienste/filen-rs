@@ -7,6 +7,8 @@
 
 use crate::fs::name::{ValidatedName, keep_both::SourceName};
 
+use super::tar_iter::TAR_BLOCK;
+
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,9 +42,7 @@ pub(crate) enum Detected {
 }
 
 /// Bytes of the head of a file that [`detect`] looks at: enough for a tar header's checksum.
-pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK;
-
-const TAR_BLOCK: usize = 512;
+pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK as usize;
 
 const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
@@ -71,7 +71,7 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(b"LZIP") {
 		return Some(Detected::Stream(StreamCodec::Lzip));
 	}
-	if head.len() >= TAR_BLOCK && is_tar_header(&head[..TAR_BLOCK]) {
+	if head.len() >= DETECT_HEAD_LEN && is_tar_header(&head[..DETECT_HEAD_LEN]) {
 		return Some(Detected::Tar);
 	}
 	// no magic: the name is all there is to go by
@@ -91,7 +91,7 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 /// its bytes with that field counted as spaces. Old tars summed signed bytes, so both sums are
 /// accepted, as GNU tar does. An all-zero block (the end-of-archive marker) is not a header.
 pub(crate) fn is_tar_header(block: &[u8]) -> bool {
-	let Ok(block) = <&[u8; TAR_BLOCK]>::try_from(block) else {
+	let Ok(block) = <&[u8; TAR_BLOCK as usize]>::try_from(block) else {
 		return false;
 	};
 	let Some(stored) = parse_octal(&block[148..156]) else {
@@ -210,8 +210,8 @@ pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
 mod tests {
 	use super::*;
 
-	fn tar_header(name: &str) -> [u8; TAR_BLOCK] {
-		let mut block = [0u8; TAR_BLOCK];
+	fn tar_header(name: &str) -> [u8; DETECT_HEAD_LEN] {
+		let mut block = [0u8; DETECT_HEAD_LEN];
 		block[..name.len()].copy_from_slice(name.as_bytes());
 		block[100..108].copy_from_slice(b"0000644\0");
 		block[124..136].copy_from_slice(b"00000000005\0");
@@ -295,7 +295,7 @@ mod tests {
 		corrupted[0] ^= 1;
 		assert!(!is_tar_header(&corrupted));
 		// the end-of-archive marker is not a header
-		assert!(!is_tar_header(&[0u8; TAR_BLOCK]));
+		assert!(!is_tar_header(&[0u8; DETECT_HEAD_LEN]));
 		// a block of the wrong size is not a header
 		assert!(!is_tar_header(&header[..511]));
 	}

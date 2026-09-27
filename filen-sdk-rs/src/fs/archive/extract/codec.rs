@@ -23,7 +23,7 @@ use super::{
 				SevenZLimits, read_error, read_index as read_sevenz_index, wrong_key,
 			},
 		},
-		tar_iter::{MemberKind, TarError, TarMember, TarReader},
+		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarMember, TarReader},
 		worker::{
 			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, SourceFailed,
 			StreamLayout, WorkerEvent, WorkerPort, read_full, send_file_data,
@@ -38,9 +38,6 @@ use super::{
 	},
 	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
 };
-
-/// Bytes of a tar header block.
-const TAR_BLOCK: usize = 512;
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -108,10 +105,10 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				limit: job.limits.expansion,
 				decoded: 0,
 			};
-			let mut block = [0u8; TAR_BLOCK];
+			let mut block = [0u8; TAR_BLOCK as usize];
 			let block_len = read_full(&mut decoded, &mut block).map_err(failure)?;
 			let block = &block[..block_len];
-			if block_len == TAR_BLOCK && is_tar_header(block) {
+			if block_len == block.len() && is_tar_header(block) {
 				port.send(WorkerEvent::Opened(StreamLayout::Tar {
 					codec: Some(codec),
 				}))

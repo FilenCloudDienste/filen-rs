@@ -13,7 +13,10 @@ use tar::{EntryType, Header};
 
 use super::format::is_tar_header;
 
-const BLOCK: u64 = 512;
+/// Bytes of a tar block: headers, and member data padded to a whole number of them.
+pub(crate) const TAR_BLOCK: u64 = 512;
+/// Bytes of a ustar header's name field; a longer path needs a GNU long-name or PAX record.
+pub(crate) const USTAR_NAME_LEN: usize = 100;
 /// Largest GNU long name or long link record read.
 const MAX_LONG_NAME: u64 = 64 * 1024;
 /// Largest PAX extended header record read.
@@ -256,8 +259,8 @@ impl<R: Read> TarReader<R> {
 
 	/// The next header block, or `None` at the end-of-archive marker or a stream that ends at a
 	/// block boundary.
-	fn read_header_block(&mut self) -> Result<Option<[u8; BLOCK as usize]>, TarError> {
-		let mut block = [0u8; BLOCK as usize];
+	fn read_header_block(&mut self) -> Result<Option<[u8; TAR_BLOCK as usize]>, TarError> {
+		let mut block = [0u8; TAR_BLOCK as usize];
 		let read = read_full(&mut self.inner, &mut block)?;
 		if read == 0 {
 			return Ok(None);
@@ -309,7 +312,7 @@ impl<R: Read> TarReader<R> {
 			if blocks > MAX_SPARSE_BLOCKS {
 				return Err(TarError::Corrupt("a sparse member's map is too long"));
 			}
-			let mut block = [0u8; BLOCK as usize];
+			let mut block = [0u8; TAR_BLOCK as usize];
 			if read_full(&mut self.inner, &mut block)? != block.len() {
 				return Err(TarError::Corrupt("a sparse member's map ends early"));
 			}
@@ -335,7 +338,7 @@ fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn padding(size: u64) -> u64 {
-	(BLOCK - size % BLOCK) % BLOCK
+	(TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), TarError> {

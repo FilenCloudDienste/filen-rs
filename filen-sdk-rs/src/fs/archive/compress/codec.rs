@@ -12,6 +12,7 @@ use super::{
 		encode::{StreamEncoder, open_encoder},
 		password::ArchivePassword,
 		sevenz::write::SevenZWriter,
+		tar_iter::{TAR_BLOCK, USTAR_NAME_LEN},
 		worker::{ChunkInput, ChunkSink, JobEnded, WorkerEvent, WorkerPort},
 		zip::write::{Encryption, ZipWriter},
 	},
@@ -208,10 +209,9 @@ fn write_tar<W: Write>(
 /// a GNU long-name record (a header block and the name with its NUL, in whole blocks) for a
 /// stored path over 100 bytes, file data in whole blocks, and the two end-of-archive blocks.
 pub(crate) fn tar_size(entries: &[ArchiveEntry]) -> u64 {
-	const BLOCK: u64 = 512;
 	let long_name = |stored: usize| {
-		if stored > 100 {
-			BLOCK + (stored as u64 + 1).div_ceil(BLOCK) * BLOCK
+		if stored > USTAR_NAME_LEN {
+			TAR_BLOCK + (stored as u64 + 1).div_ceil(TAR_BLOCK) * TAR_BLOCK
 		} else {
 			0
 		}
@@ -219,13 +219,13 @@ pub(crate) fn tar_size(entries: &[ArchiveEntry]) -> u64 {
 	let members: u64 = entries
 		.iter()
 		.map(|entry| match entry {
-			ArchiveEntry::Dir { path, .. } => BLOCK + long_name(path.len() + 1),
+			ArchiveEntry::Dir { path, .. } => TAR_BLOCK + long_name(path.len() + 1),
 			ArchiveEntry::File { path, size, .. } => {
-				BLOCK + long_name(path.len()) + size.div_ceil(BLOCK) * BLOCK
+				TAR_BLOCK + long_name(path.len()) + size.div_ceil(TAR_BLOCK) * TAR_BLOCK
 			}
 		})
 		.sum();
-	members + 2 * BLOCK
+	members + 2 * TAR_BLOCK
 }
 
 fn header(
