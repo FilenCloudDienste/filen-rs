@@ -74,12 +74,13 @@ impl AesProps {
 	}
 }
 
-/// Derives the key for `password` (UTF-16LE) under `props`; `on_round` is called every 2^16
-/// rounds, for long derivations to show they are progressing.
+/// Derives the key for `password` (UTF-16LE) under `props`. `on_round` is called every 2^16
+/// rounds, so a long derivation (2^22 rounds of a long password take a minute on wasm) can show
+/// it is progressing and be stopped: its error ends the derivation.
 pub(crate) fn derive_key(
 	password: &[u8],
 	props: &AesProps,
-	on_round: &mut dyn FnMut(),
+	on_round: &mut dyn FnMut() -> io::Result<()>,
 ) -> Result<Key, SevenZError> {
 	let mut key = Zeroizing::new([0u8; 32]);
 	if props.cycles_power == RAW_KEY_POWER {
@@ -104,7 +105,7 @@ pub(crate) fn derive_key(
 		round[counter_at..].copy_from_slice(&counter.to_le_bytes());
 		sha.update(&round);
 		if counter & 0xFFFF == 0xFFFF {
-			on_round();
+			on_round()?;
 		}
 	}
 	key.copy_from_slice(&sha.finalize());
@@ -268,8 +269,7 @@ mod tests {
 	fn derivation_matches_a_straight_sha256_over_the_rounds() {
 		let password = b"p\0w\0";
 		let props = props(4);
-		let mut rounds = 0;
-		let key = derive_key(password, &props, &mut || rounds += 1).unwrap();
+		let key = derive_key(password, &props, &mut || Ok(())).unwrap();
 		let mut sha = Sha256::new();
 		for counter in 0u64..16 {
 			sha.update(&props.salt);
@@ -278,9 +278,28 @@ mod tests {
 		}
 		assert_eq!(key[..], sha.finalize()[..]);
 		assert!(matches!(
-			derive_key(password, &self::props(MAX_CYCLES_POWER + 1), &mut || {}),
+			derive_key(password, &self::props(MAX_CYCLES_POWER + 1), &mut || Ok(())),
 			Err(SevenZError::Unsupported(_))
 		));
+	}
+
+	#[test]
+	fn a_long_derivation_reports_its_rounds_and_stops_when_told() {
+		let mut rounds = 0;
+		derive_key(b"pw", &props(18), &mut || {
+			rounds += 1;
+			Ok(())
+		})
+		.unwrap();
+		// every 2^16 rounds
+		assert_eq!(rounds, 4);
+		let mut rounds = 0;
+		let stopped = derive_key(b"pw", &props(MAX_CYCLES_POWER), &mut || {
+			rounds += 1;
+			Err(io::Error::other("the job ended"))
+		});
+		assert!(matches!(stopped, Err(SevenZError::Read(_))));
+		assert_eq!(rounds, 1, "the derivation stops at once");
 	}
 
 	#[test]

@@ -367,7 +367,10 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
 	let mut source = SeekInput::new(port, 0, job.len);
 	let password = job.password.as_ref().map(ArchivePassword::utf16le);
-	let mut keys = Keys::new(password.as_ref().map(|password| &password[..]));
+	// a derivation exchanges nothing with the driver for up to a minute: without this it would
+	// be given up on as a dead codec, and a cancel would wait it out
+	let keep_alive = || port.keep_alive();
+	let mut keys = Keys::new(password.as_ref().map(|password| &password[..])).on_round(&keep_alive);
 	let limits = SevenZLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,

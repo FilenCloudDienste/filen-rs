@@ -186,6 +186,16 @@ impl WorkerPort {
 		Ok(chunk)
 	}
 
+	/// Shows the driver the codec is alive through work that exchanges nothing with it (a long
+	/// key derivation); fails as an exchange would once the driver is gone.
+	pub(crate) fn keep_alive(&self) -> io::Result<()> {
+		if self.shared.cancelled.load(Ordering::Relaxed) {
+			return Err(ended());
+		}
+		self.shared.note_progress();
+		Ok(())
+	}
+
 	pub(crate) fn shared(&self) -> &WorkerShared {
 		&self.shared
 	}

@@ -305,7 +305,8 @@ impl<W: Write> SevenZWriter<W> {
 					salt: salt.to_vec(),
 					iv: [0; 16],
 				};
-				let key = derive_key(password, &props, &mut || {}).map_err(io::Error::other)?;
+				// 2^19 rounds take about a second: nothing to show progress for
+				let key = derive_key(password, &props, &mut || Ok(())).map_err(io::Error::other)?;
 				Some(Encryption {
 					key,
 					salt,

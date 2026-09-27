@@ -279,6 +279,7 @@ pub(crate) struct Keys<'p> {
 	password: Option<&'p [u8]>,
 	derived: Vec<(AesProps, Key)>,
 	rounds_left: u64,
+	on_round: Option<&'p dyn Fn() -> io::Result<()>>,
 }
 
 impl<'p> Keys<'p> {
@@ -288,6 +289,16 @@ impl<'p> Keys<'p> {
 			password,
 			derived: Vec::new(),
 			rounds_left: KDF_ROUNDS_BUDGET,
+			on_round: None,
+		}
+	}
+
+	/// Calls `on_round` as a key derivation progresses (see [`derive_key`]); its error stops
+	/// the derivation, which fails with it.
+	pub(crate) fn on_round(self, on_round: &'p dyn Fn() -> io::Result<()>) -> Self {
+		Self {
+			on_round: Some(on_round),
+			..self
 		}
 	}
 
@@ -318,7 +329,10 @@ impl<'p> Keys<'p> {
 			.ok_or(SevenZError::Unsupported(
 				"7z keys that together take too long to derive",
 			))?;
-		let key = derive_key(password, props, &mut || {})?;
+		let on_round = self.on_round;
+		let key = derive_key(password, props, &mut || {
+			on_round.map_or(Ok(()), |on_round| on_round())
+		})?;
 		self.derived.push((props.clone(), key.clone()));
 		Ok(key)
 	}
