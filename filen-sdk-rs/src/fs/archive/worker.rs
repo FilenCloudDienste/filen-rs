@@ -240,8 +240,8 @@ impl WorkerEvents {
 /// The driver's end of the exchange with a started codec.
 pub(crate) struct WorkerLink<T> {
 	pub(crate) events: WorkerEvents,
-	/// The codec's result; closed without one when the codec died without a panic to report
-	/// (a wasm trap outside Rust).
+	/// The codec's result. A codec that dies without a panic to report (on wasm, a trap outside
+	/// Rust) leaks its sender, so this stays pending: the driver's stall deadline ends the wait.
 	pub(crate) done: oneshot::Receiver<T>,
 	pub(crate) shared: Arc<WorkerShared>,
 	/// The wasm worker generation that took the job, to retire if it stalls.
@@ -286,16 +286,17 @@ static ARCHIVE_CODECS: crate::blocking::WorkerSlot = crate::blocking::WorkerSlot
 /// caller holds the archive job lease, so on wasm no other job is queued on the worker.
 ///
 /// A codec that panics (a parser bug an archive ran into) ends its events and fails with the
-/// panic's message, which is logged too: natively the panic would otherwise reach only stderr,
-/// lost on mobile, and on wasm the driver would wait out [`ARCHIVE_STALL_TIMEOUT`] first.
+/// panic's message: natively the panic would otherwise reach only stderr, lost on mobile, and on
+/// wasm the driver would wait out [`ARCHIVE_STALL_TIMEOUT`] first.
 pub(crate) fn start<R: Send + 'static>(
 	job: impl FnOnce(WorkerPort) -> Result<R, Error> + Send + 'static,
 ) -> Result<WorkerLink<Result<R, Error>>, Error> {
 	let (port, events, shared) = channels();
 	let (result, done) = oneshot::channel();
 	let (panicked_tx, panicked) = oneshot::channel();
+	// runs inside the panic hook on wasm, so it logs nothing (the panic may have struck while
+	// the log's lock was held); the driver logs the error it fails the job with
 	let on_panic = move |message: String| {
-		tracing::error!("the archive's codec panicked: {message}");
 		let _ = panicked_tx.send(());
 		Err(Error::custom(
 			ErrorKind::ArchiveWorkerDied,
@@ -714,7 +715,8 @@ mod tests {
 		sender.send(WorkerEvent::FileEnd).await.unwrap();
 		panicked_tx.send(()).unwrap();
 		assert!(matches!(events.recv().await, Some(WorkerEvent::FileEnd)));
-		assert!(events.recv().await.is_none());
+		let end = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
+		assert!(matches!(end, Ok(None)), "the events did not end");
 		drop(sender);
 	}
 }

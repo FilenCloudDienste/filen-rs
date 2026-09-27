@@ -750,7 +750,12 @@ impl<B: DisposalBackend> Driver<B> {
 				tracing::debug!("archive codec ended after the job did: {error}");
 			}
 			Err(error) => {
-				tracing::warn!("archive {}: {error}", self.archive_uuid);
+				// a dead codec is a bug to hear of, where a damaged archive is only the user's
+				if error.kind() == ErrorKind::ArchiveWorkerDied {
+					tracing::error!("archive {}: {error}", self.archive_uuid);
+				} else {
+					tracing::warn!("archive {}: {error}", self.archive_uuid);
+				}
 				self.stop_with(Error::custom(error.kind(), error.to_string()));
 			}
 		}
