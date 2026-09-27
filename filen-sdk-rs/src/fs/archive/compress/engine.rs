@@ -379,6 +379,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		(Ok(archive), None) => {
 			report.archive = Some(archive);
 			report.dispositions = dispositions;
+			// a cancel once the archive exists keeps the sources, but the job is done; it still
+			// ends as cancelled jobs do, however late it was seen
+			if control.is_cancelled() {
+				reporter.set_cancelling();
+			}
 			reporter.finish(CompressPhase::Done);
 			report.counts = reporter.counts();
 			Ok(report)

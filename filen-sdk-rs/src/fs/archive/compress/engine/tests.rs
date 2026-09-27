@@ -1308,7 +1308,12 @@ async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
 	);
 	assert_eq!(told(&job.recorder).len(), 2);
 	assert_eq!(setup.backend.log().deleted_files, [top.uuid()]);
-	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
+	// the archive exists, so the job is done; it still ends as a cancelled one winds down
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::Done, RunState::Cancelling)
+	);
 	assert_released(&setup, &job.reporter);
 }
 
