@@ -154,6 +154,14 @@ impl ClientBackend {
 	pub(crate) fn new(client: Arc<Client>) -> Self {
 		Self { client }
 	}
+
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	pub(crate) fn client(&self) -> &Client {
+		&self.client
+	}
 }
 
 pub(crate) struct ClientUpload {

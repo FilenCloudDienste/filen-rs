@@ -22,6 +22,7 @@ use crate::{
 pub use crate::job::report::RunState;
 
 use super::ExtractSkipReason;
+use crate::fs::archive::dispose::SourceDisposition;
 
 /// Where an extraction is. The last three are where it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub enum ExtractPhase {
 	Extracting,
 	/// Checking whether the destination became shared or linked during the extraction.
 	Finishing,
+	/// Removing the archive, once the extraction is verified.
+	DisposingSources,
+	/// Ran to its end.
 	Done,
 	/// Ended early by a cancel.
 	Cancelled,
@@ -226,6 +230,8 @@ pub enum ExtractEvent {
 	Skipped(ExtractSkippedEntry),
 	/// An entry was created under another name than the archive gives it.
 	Renamed(ExtractRenamedEntry),
+	/// What became of the archive, when it was to be removed.
+	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
 	/// shares.
 	PropagationFailed {
@@ -286,8 +292,10 @@ pub struct ExtractReport {
 	pub totals: ArchiveTotals,
 	pub counts: ItemCounts,
 	/// Bytes in the archive after its last entry that belong to none (another archive appended
-	/// to it, say), or 0.
+	/// to it, say), counted from the first non-zero one; zero padding is not counted.
 	pub unaccounted_bytes: u64,
+	/// What became of the archive, when it was to be removed.
+	pub dispositions: Vec<SourceDisposition>,
 }
 
 impl JobReport for ExtractReport {

@@ -13,17 +13,47 @@ pub(crate) mod codec;
 mod engine;
 mod report;
 
+pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use client_impl::{CompressConfig, CompressRequest};
 pub use report::{
 	CompressCallback, CompressCounts, CompressEvent, CompressFailed, CompressPhase, CompressReport,
-	CompressUpdate, RunState,
+	CompressUpdate, HashMismatch, RunState,
 };
 
-use crate::{Error, ErrorKind};
+use crate::{
+	Error, ErrorKind,
+	fs::categories::{NonRootItemType, Normal},
+};
 
-pub use super::encode::Compression;
+pub use super::{encode::Compression, format::StreamCodec};
+pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
 
-use super::format::{ExtensionFormat, StreamCodec, match_extension};
+use super::format::{ExtensionFormat, match_extension};
+
+/// What to compress, and whether to remove it afterwards.
+#[derive(Debug, Clone)]
+pub enum CompressSources {
+	/// Any items the client can read: the user's own, shared, or in a link.
+	Keep(Vec<ItemSource>),
+	/// Items of the user's own drive, removed once the archive is verified: completed with
+	/// nothing skipped, every source's data matching the hash in its metadata, the archive
+	/// confirmed with the server, and each source still exactly as it was read. Otherwise they
+	/// are kept and the report says why. The archive cannot be written into one of them.
+	///
+	/// The archive is not read back first. With an encrypted format, have the user confirm the
+	/// password before removing anything for good: a mistyped one leaves an archive nobody can
+	/// open.
+	///
+	/// An item given twice, or inside another given folder, shares that one's outcome, its bytes
+	/// counted there; a file of it that the folder's permanent removal deleted before stopping
+	/// is reported removed.
+	Dispose {
+		/// How the sources are removed.
+		how: SourceDisposal,
+		/// The items to compress and then remove.
+		items: Vec<NonRootItemType<'static, Normal>>,
+	},
+}
 
 /// What an archive is written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

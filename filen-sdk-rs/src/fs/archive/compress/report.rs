@@ -8,6 +8,7 @@ use filen_types::fs::Uuid;
 use crate::{
 	Error,
 	fs::{
+		archive::dispose::SourceDisposition,
 		drive_job::{
 			listing::ScanProgress,
 			plan::{PlanTotals, RenamedEntry, SkippedEntry},
@@ -34,6 +35,9 @@ pub enum CompressPhase {
 	Compressing,
 	/// Registering the archive in the destination.
 	Finishing,
+	/// Removing the sources, once the archive is verified.
+	DisposingSources,
+	/// Ran to its end.
 	Done,
 	/// Ended early by a cancel.
 	Cancelled,
@@ -72,6 +76,8 @@ pub enum CompressEvent {
 	/// A source's data does not match the hash in its metadata. It is in the archive as it was
 	/// read; the source itself may be damaged.
 	SourceHashMismatch { source_uuid: Uuid, path: String },
+	/// What became of a source, when the sources were to be removed.
+	SourceDisposition(SourceDisposition),
 	/// The archive was registered but could not be added to one of the destination's public
 	/// links or shares.
 	PropagationFailed {
@@ -120,6 +126,20 @@ pub struct CompressReport {
 	pub counts: CompressCounts,
 	/// For a job refused up front for `max_bytes`: the archive's exact size.
 	pub needed_bytes: Option<u64>,
+	/// What became of each source, when the sources were to be removed.
+	pub dispositions: Vec<SourceDisposition>,
+	/// Source files whose data did not match the hash in their metadata: they went into the
+	/// archive as they were read (up to 1000 are listed).
+	pub hash_mismatches: Vec<HashMismatch>,
+}
+
+/// A source file whose data did not match the hash in its metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashMismatch {
+	/// The source file's uuid.
+	pub source_uuid: Uuid,
+	/// Its path in the archive.
+	pub path: String,
 }
 
 impl JobReport for CompressReport {
@@ -281,13 +301,27 @@ impl Reporter {
 		self.with_state(|state| state.core.push(event));
 	}
 
+	/// Tells of what became of sources in an update sent at once: a job dropped before its last
+	/// update (the bindings drop one that outlives its cancel grace) has still told of every
+	/// source it removed.
+	pub(crate) fn dispositions(&self, dispositions: &[SourceDisposition]) {
+		self.with_state(|state| {
+			for disposition in dispositions {
+				state
+					.core
+					.push(CompressEvent::SourceDisposition(disposition.clone()));
+			}
+			state.core.mark_urgent();
+		});
+	}
+
 	pub(crate) fn counts(&self) -> CompressCounts {
 		self.read(|state| state.counts)
 	}
 
-	/// The last update of a job that ends before it starts, carrying the `totals` it would have
-	/// compressed.
-	pub(crate) fn finish_unstarted(&self, phase: CompressPhase, totals: PlanTotals) {
+	/// The last update of a job that ends early, carrying the `totals` it would have compressed
+	/// (a job refused before it planned was never told them).
+	pub(crate) fn finish_early(&self, phase: CompressPhase, totals: PlanTotals) {
 		self.finish_with(phase, |state| state.totals = totals);
 	}
 }

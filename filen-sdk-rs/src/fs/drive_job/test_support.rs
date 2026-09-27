@@ -92,8 +92,13 @@ impl Drop for FakeLock {
 pub(crate) struct FakeLog {
 	pub(crate) fetched: Vec<(Uuid, u64)>,
 	pub(crate) uploaded: Vec<(Uuid, u64)>,
-	/// The parent of every created directory.
+	/// Where every created directory and registered file is: parent, and a file's size and
+	/// chunks. Trashing or deleting an item removes it.
 	pub(crate) dir_parents: HashMap<Uuid, Uuid>,
+	pub(crate) file_parents: HashMap<Uuid, (Uuid, u64, u64)>,
+	pub(crate) trashed_files: Vec<Uuid>,
+	pub(crate) deleted_files: Vec<Uuid>,
+	pub(crate) trashed_dirs: Vec<Uuid>,
 	/// The bytes of each uploaded chunk, when [`Quirk::KeepUploads`] is set.
 	pub(crate) uploaded_data: HashMap<(Uuid, u64), Vec<u8>>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
@@ -104,6 +109,8 @@ pub(crate) struct FakeLog {
 	/// Most registrations that ran at once.
 	pub(crate) peak_finishes: usize,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
+	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
+	pub(crate) fetched_items: Vec<Uuid>,
 	pub(crate) out_of_order_dirs: Vec<String>,
 	pub(crate) colored: Vec<Uuid>,
 	pub(crate) propagated: Vec<Uuid>,
@@ -114,6 +121,8 @@ pub(crate) struct FakeLog {
 	pub(crate) lock_waits: usize,
 	/// Slow registrations that have started.
 	pub(crate) finishing: Vec<String>,
+	/// Items a request about which waited in [`FakeBackend::held`].
+	pub(crate) held: Vec<Uuid>,
 }
 
 pub(crate) struct FakeUpload {
@@ -131,6 +140,8 @@ pub(crate) enum Quirk {
 	ReverseChunks,
 	/// Keep every uploaded chunk's bytes in [`FakeLog::uploaded_data`].
 	KeepUploads,
+	/// Registered files are not remembered as being in the drive, as if removed at once.
+	ForgetRegistered,
 }
 
 pub(crate) struct FakeBackend {
@@ -158,6 +169,13 @@ pub(crate) struct FakeBackend {
 	pub(crate) merge_once: Mutex<HashSet<String>>,
 	pub(crate) targets: ConnectedTargets,
 	pub(crate) later_targets: Option<ConnectedTargets>,
+	/// Files with older versions.
+	pub(crate) versioned_files: HashSet<Uuid>,
+	/// Files whose permanent deletion fails.
+	pub(crate) fail_deletes_of: HashSet<Uuid>,
+	/// Directories whose listing and files whose permanent deletion wait while they are in the
+	/// set, each wait logged in [`FakeLog::held`].
+	pub(crate) held: watch::Sender<HashSet<Uuid>>,
 	/// Lowercased names the destination holds without the listing having shown them.
 	pub(crate) existing: Mutex<HashSet<String>>,
 	/// Names the server registers as a new version of the given existing file (a client
@@ -204,6 +222,9 @@ impl FakeBackend {
 			merge_once: Mutex::new(HashSet::new()),
 			targets: ConnectedTargets::default(),
 			later_targets: None,
+			versioned_files: HashSet::new(),
+			fail_deletes_of: HashSet::new(),
+			held: watch::Sender::new(HashSet::new()),
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
@@ -228,6 +249,19 @@ impl FakeBackend {
 
 	async fn wait(&self, name: &str) {
 		tokio::time::sleep(*self.slow.get(name).unwrap_or(&self.delay)).await;
+	}
+
+	/// Waits while `uuid` is held.
+	async fn hold(&self, uuid: Uuid) {
+		if self.held.borrow().contains(&uuid) {
+			self.log().held.push(uuid);
+			// the sender lives in `self`, which outlives this wait
+			let _ = self
+				.held
+				.subscribe()
+				.wait_for(|held| !held.contains(&uuid))
+				.await;
+		}
 	}
 }
 
@@ -453,12 +487,22 @@ impl DriveBackend for FakeBackend {
 				.contains(&name.as_ref().to_lowercase()),
 			"a copy must never be registered under a name the destination holds"
 		);
-		self.log()
-			.finished
+		let mut log = self.log();
+		log.finished
 			.insert(upload.spec.uuid, (name.as_ref().to_owned(), completion));
-		self.log()
-			.registered_in
+		log.registered_in
 			.insert(upload.spec.uuid, upload.spec.parent);
+		if !self.quirks.contains(&Quirk::ForgetRegistered) {
+			log.file_parents.insert(
+				upload.spec.uuid,
+				(
+					upload.spec.parent,
+					completion.written,
+					completion.num_chunks,
+				),
+			);
+		}
+		drop(log);
 		let stable_uuid = self
 			.version_of
 			.get(name.as_ref())
@@ -484,5 +528,154 @@ impl DriveBackend for FakeBackend {
 				hash: Some(completion.hash),
 			}),
 		))
+	}
+}
+
+#[cfg(any(
+	not(all(target_family = "wasm", target_os = "unknown")),
+	feature = "wasm-full"
+))]
+mod disposal {
+	use super::*;
+	use crate::fs::archive::dispose::{DisposalBackend, FileState, Tree};
+	use filen_types::fs::ParentUuid;
+
+	impl FakeBackend {
+		/// Places an existing file in the fake drive, as a source a job may remove.
+		pub(crate) fn place_file(&self, uuid: Uuid, parent: Uuid, size: u64) {
+			self.log()
+				.file_parents
+				.insert(uuid, (parent, size, size.div_ceil(CHUNK_SIZE_U64)));
+		}
+
+		/// Places an existing directory in the fake drive.
+		pub(crate) fn place_dir(&self, uuid: Uuid, parent: Uuid) {
+			self.log().dir_parents.insert(uuid, parent);
+		}
+	}
+
+	impl DisposalBackend for FakeBackend {
+		async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
+			tokio::time::sleep(self.delay).await;
+			let log = self.log();
+			match log.file_parents.get(&uuid) {
+				Some(&(parent, size, chunks)) => Ok(FileState {
+					size,
+					chunks,
+					parent: ParentUuid::Uuid(parent),
+					versioned: false,
+					trash: false,
+				}),
+				None if log.trashed_files.contains(&uuid) => {
+					Err(Error::custom(ErrorKind::FileNotFound, "trashed"))
+				}
+				None => Err(Error::custom(ErrorKind::FileNotFound, "no such file")),
+			}
+		}
+
+		async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
+			self.hold(dir).await;
+			tokio::time::sleep(self.delay).await;
+			let log = self.log();
+			let mut tree = Tree::default();
+			let mut below = vec![dir];
+			while let Some(parent) = below.pop() {
+				for (&child, &of) in &log.dir_parents {
+					if of == parent && tree.dirs.insert(child) {
+						below.push(child);
+					}
+				}
+			}
+			for (&file, &(parent, size, _)) in &log.file_parents {
+				if parent == dir || tree.dirs.contains(&parent) {
+					tree.files.insert(file, size);
+				}
+			}
+			Ok(tree)
+		}
+
+		async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
+			let mut log = self.log();
+			log.file_parents.remove(&uuid);
+			log.trashed_files.push(uuid);
+			Ok(())
+		}
+
+		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
+			self.hold(uuid).await;
+			if self.fail_deletes_of.contains(&uuid) {
+				return Err(Error::custom(ErrorKind::Server, "delete failed"));
+			}
+			let mut log = self.log();
+			log.file_parents.remove(&uuid);
+			log.deleted_files.push(uuid);
+			Ok(())
+		}
+
+		async fn trash_dir(&self, uuid: Uuid) -> Result<(), Error> {
+			let mut log = self.log();
+			// the whole subtree goes with it
+			let mut gone = vec![uuid];
+			let mut index = 0;
+			while index < gone.len() {
+				let parent = gone[index];
+				gone.extend(
+					log.dir_parents
+						.iter()
+						.filter(|(_, of)| **of == parent)
+						.map(|(child, _)| *child),
+				);
+				index += 1;
+			}
+			log.dir_parents.retain(|dir, _| !gone.contains(dir));
+			log.file_parents
+				.retain(|_, (parent, ..)| !gone.contains(parent));
+			log.trashed_dirs.push(uuid);
+			Ok(())
+		}
+
+		async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
+			Ok(self.versioned_files.contains(&uuid))
+		}
+
+		async fn normal_item(
+			&self,
+			uuid: Uuid,
+			is_dir: bool,
+		) -> Result<NonRootItemType<'static, Normal>, Error> {
+			self.log().fetched_items.push(uuid);
+			Ok(if is_dir {
+				NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
+					uuid,
+					DecryptedDirectoryMeta {
+						name: Cow::Borrowed("fetched"),
+						created: None,
+					},
+					Uuid::new_v4().into(),
+					Utc::now(),
+				)))
+			} else {
+				NonRootItemType::File(Cow::Owned(RemoteFile::from_meta(
+					uuid,
+					StableUuid::new_for_test(uuid),
+					Uuid::new_v4().into(),
+					1,
+					1,
+					"de-1",
+					"bucket",
+					Utc::now(),
+					false,
+					FileMeta::Decoded(DecryptedFileMeta {
+						name: Cow::Borrowed("fetched"),
+						size: 1,
+						mime: Cow::Borrowed("text/plain"),
+						key: FileKey::V3(EncryptionKey::generate()),
+						last_modified: Utc::now(),
+						created: None,
+						hash: None,
+					}),
+				)))
+			})
+		}
 	}
 }

@@ -9,7 +9,11 @@
 //! the client's budget once in-flight work is done. A paused job keeps its codec's state and the
 //! source chunk the codec is reading resident.
 
-use std::{collections::VecDeque, io, sync::Arc};
+use std::{
+	collections::{BTreeSet, VecDeque},
+	io,
+	sync::Arc,
+};
 
 use chrono::Utc;
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
@@ -27,6 +31,11 @@ use crate::{
 		HasUUID,
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
+			dispose::{
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
+				SourceDisposition, Tree, dispose_dir, dispose_file, kept_on_early_end,
+			},
+			limits::MAX_REPORT_RECORDS,
 			worker::{ARCHIVE_STALL_TIMEOUT, WorkerEvent, WorkerLink},
 		},
 		categories::{DirType, Normal},
@@ -36,6 +45,7 @@ use crate::{
 			name_retry::NameRetry,
 		},
 		file::{
+			RemoteFile,
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
@@ -50,7 +60,9 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
-use super::report::{CompressEvent, CompressFailed, CompressPhase, CompressReport, Reporter};
+use super::report::{
+	CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch, Reporter,
+};
 
 /// Archive chunks uploading at once.
 const UPLOADS_AT_ONCE: usize = 4;
@@ -67,6 +79,8 @@ pub(crate) struct Source {
 	pub(crate) file: RemoteFileType<'static>,
 	/// Its path in the archive, for reporting.
 	pub(crate) path: String,
+	/// The top-level source (the job's request) it was listed under.
+	pub(crate) request: usize,
 }
 
 /// What [`run_compress`] needs.
@@ -86,6 +100,29 @@ pub(crate) struct CompressTask<B> {
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
+	pub(crate) disposal: Option<CompressDisposal>,
+}
+
+/// How to remove the sources once the archive is verified, and what the job read of them.
+#[derive(Debug)]
+pub(crate) struct CompressDisposal {
+	pub(crate) how: SourceDisposal,
+	pub(crate) targets: Vec<DisposalTarget>,
+	/// Per target: every file read below it had a hash in its metadata to check it against.
+	pub(crate) hashed: Vec<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DisposalTarget {
+	File(ExpectedFile),
+	Dir {
+		uuid: Uuid,
+		read: Tree,
+	},
+	/// A source whose state the job cannot compare against (it is in the trash).
+	Unavailable {
+		uuid: Uuid,
+	},
 }
 
 /// A chunk of a source: its source number and index.
@@ -102,6 +139,7 @@ type FetchedChunk = (
 struct SourceState {
 	file: Arc<RemoteFileType<'static>>,
 	path: String,
+	request: usize,
 	chunks: u64,
 	/// Chunks handed to the codec, which asks for them in order.
 	served: u64,
@@ -146,12 +184,16 @@ struct Driver<B: DriveBackend> {
 	max_bytes: Option<u64>,
 	stamp: u64,
 	stalled_ticks: u32,
+	/// The top-level sources a file of which did not match the hash in its metadata.
+	mismatched: BTreeSet<usize>,
+	/// The files behind `mismatched`, for the report.
+	hash_mismatches: Vec<HashMismatch>,
 	fatal: Option<Arc<Error>>,
 }
 
 /// Runs a compression: waits for a job slot, starts the codec, uploads the archive and
 /// registers it.
-pub(crate) async fn run_compress<B: DriveBackend>(
+pub(crate) async fn run_compress<B: DisposalBackend>(
 	task: CompressTask<B>,
 ) -> Result<CompressReport, CompressFailed> {
 	let CompressTask {
@@ -166,19 +208,18 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 		config,
 		start,
 		mut report,
+		disposal,
 	} = task;
 	let shape = NameShape::FileWithExtension { len: extension_len };
-	let fail = |mut report: CompressReport, phase, error: Error| {
-		reporter.finish(phase);
-		report.counts = reporter.counts();
-		CompressFailed {
-			report,
-			error: Arc::new(error),
-		}
-	};
+	// every source a disposal was asked for is reported, however the job ends
+	let requested: Vec<Uuid> = disposal
+		.as_ref()
+		.map(|disposal| disposal.targets.iter().map(DisposalTarget::uuid).collect())
+		.unwrap_or_default();
+	let fail = |report, phase, error| end_early(&reporter, report, &requested, phase, error);
 	for source in &sources {
 		if let Err(error) = check_chunks_consistent(source.file.chunks(), source.file.size()) {
-			return Err(fail(report, CompressPhase::Failed, error));
+			return Err(fail(report, CompressPhase::Failed, Arc::new(error)));
 		}
 	}
 
@@ -193,7 +234,7 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 	};
 	let (name, targets) = match control.until_stopping(prepared).await {
 		Ok(Ok(prepared)) => prepared,
-		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, error)),
+		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
 		Err(Stopped) => return Err(fail(report, CompressPhase::Cancelled, cancelled())),
 	};
 
@@ -205,7 +246,7 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 	reporter.set_phase(CompressPhase::Compressing);
 	let link = match start() {
 		Ok(link) => link,
-		Err(error) => return Err(fail(report, CompressPhase::Failed, error)),
+		Err(error) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
 	};
 
 	let archive_uuid = Uuid::new_v4();
@@ -222,6 +263,7 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 			chunks: source.file.size().div_ceil(CHUNK_SIZE_U64),
 			file: Arc::new(source.file),
 			path: source.path,
+			request: source.request,
 			served: 0,
 			hasher: blake3::Hasher::new(),
 		})
@@ -257,8 +299,12 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 		max_bytes,
 		stamp: 0,
 		stalled_ticks: 0,
+		mismatched: BTreeSet::new(),
+		hash_mismatches: Vec::new(),
 		fatal: None,
 	};
+	let incomplete = !report.skipped.is_empty();
+	let mut dispositions = Vec::new();
 	driver.next_fetch = driver.first_chunk_from(0);
 	driver.next_served = driver.next_fetch;
 	let outcome = async {
@@ -279,42 +325,90 @@ pub(crate) async fn run_compress<B: DriveBackend>(
 				targets
 			}
 		};
-		driver.register(name, shape, targets).await
+		let archive = driver.register(name, shape, targets).await?;
+		// the archive exists from here on: a cancel now keeps the sources, but the job is done
+		if let Some(disposal) = disposal {
+			driver.reporter.set_phase(CompressPhase::DisposingSources);
+			dispositions = match driver.reporter.checkpoint(&driver.control).await {
+				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
+				Err(Stopped) => {
+					let kept = kept_on_early_end(&requested, true);
+					driver.reporter.dispositions(&kept);
+					kept
+				}
+			};
+		}
+		Ok(archive)
 	}
 	.await;
 	let Driver {
 		reporter,
 		fatal,
 		control,
+		hash_mismatches,
 		..
 	} = driver;
-	let (phase, result) = match (outcome, fatal) {
-		(_, Some(error)) => (CompressPhase::Failed, Err(error)),
-		(Err(Stopped), None) if control.is_cancelled() => {
-			(CompressPhase::Cancelled, Err(Arc::new(cancelled())))
-		}
-		(Err(Stopped), None) => (
-			CompressPhase::Failed,
-			Err(Arc::new(Error::custom(
-				ErrorKind::Internal,
-				"compression stopped",
-			))),
-		),
+	report.hash_mismatches = hash_mismatches;
+	match (outcome, fatal) {
 		(Ok(archive), None) => {
 			report.archive = Some(archive);
-			(CompressPhase::Done, Ok(()))
+			report.dispositions = dispositions;
+			// a cancel once the archive exists keeps the sources, but the job is done; it still
+			// ends as cancelled jobs do, however late it was seen
+			if control.is_cancelled() {
+				reporter.set_cancelling();
+			}
+			reporter.finish(CompressPhase::Done);
+			report.counts = reporter.counts();
+			Ok(report)
 		}
-	};
-	reporter.finish(phase);
-	report.counts = reporter.counts();
-	match result {
-		Ok(()) => Ok(report),
-		Err(error) => Err(CompressFailed { report, error }),
+		(_, Some(error)) => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Failed,
+			error,
+		)),
+		(Err(Stopped), None) if control.is_cancelled() => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Cancelled,
+			cancelled(),
+		)),
+		(Err(Stopped), None) => Err(end_early(
+			&reporter,
+			report,
+			&requested,
+			CompressPhase::Failed,
+			Arc::new(Error::custom(ErrorKind::Internal, "compression stopped")),
+		)),
 	}
 }
 
-fn cancelled() -> Error {
-	Error::custom(ErrorKind::Cancelled, "compression cancelled")
+/// Ends a job early, before it removed any source: every source a disposal was asked for is
+/// kept, and told of.
+pub(crate) fn end_early(
+	reporter: &Reporter,
+	mut report: CompressReport,
+	requested: &[Uuid],
+	phase: CompressPhase,
+	error: Arc<Error>,
+) -> CompressFailed {
+	let cancelled = phase == CompressPhase::Cancelled;
+	// before the dispositions go out, so their update reads as cancelling
+	if cancelled {
+		reporter.set_cancelling();
+	}
+	report.dispositions = kept_on_early_end(requested, cancelled);
+	reporter.dispositions(&report.dispositions);
+	reporter.finish_early(phase, report.totals);
+	report.counts = reporter.counts();
+	CompressFailed { report, error }
+}
+
+pub(crate) fn cancelled() -> Arc<Error> {
+	Arc::new(Error::custom(ErrorKind::Cancelled, "compression cancelled"))
 }
 
 fn worker_died() -> Error {
@@ -324,7 +418,7 @@ fn worker_died() -> Error {
 	)
 }
 
-impl<B: DriveBackend> Driver<B> {
+impl<B: DisposalBackend> Driver<B> {
 	/// The first chunk of the first source with data at or after `source`, or the end.
 	fn first_chunk_from(&self, mut source: usize) -> (usize, u64) {
 		while source < self.sources.len() && self.sources[source].chunks == 0 {
@@ -502,6 +596,13 @@ impl<B: DriveBackend> Driver<B> {
 				"source {} of an archive does not match the hash in its metadata",
 				state.file.uuid()
 			);
+			self.mismatched.insert(state.request);
+			if self.hash_mismatches.len() < MAX_REPORT_RECORDS {
+				self.hash_mismatches.push(HashMismatch {
+					source_uuid: state.file.uuid(),
+					path: state.path.clone(),
+				});
+			}
 			let event = CompressEvent::SourceHashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
@@ -615,13 +716,200 @@ impl<B: DriveBackend> Driver<B> {
 		self.codec_result = Some(result);
 	}
 
+	/// Removes the sources if the archive is verified; what became of each.
+	async fn dispose(
+		&mut self,
+		disposal: CompressDisposal,
+		archive: &RemoteFile,
+		incomplete: bool,
+	) -> Vec<SourceDisposition> {
+		let CompressDisposal {
+			how,
+			targets,
+			hashed,
+		} = disposal;
+		// a source whose own files could not be checked is kept on its own; anything wrong
+		// with the archive keeps them all
+		let own_reason = |request: usize| {
+			if self.mismatched.contains(&request) {
+				Some(KeptReason::HashMismatch)
+			} else if how == SourceDisposal::DeletePermanently && !hashed[request] {
+				Some(KeptReason::HashUnavailable)
+			} else {
+				None
+			}
+		};
+		let archive_reason = if incomplete {
+			Some(KeptReason::Incomplete)
+		} else if self
+			.sources
+			.iter()
+			.any(|source| source.served != source.chunks)
+		{
+			// a source not read to its end had its hash never checked
+			Some(KeptReason::Unconfirmed)
+		} else if (0..targets.len()).all(|request| own_reason(request).is_some()) {
+			None
+		} else {
+			// the archive as the server holds it
+			match self.backend.file_state(archive.uuid()).await {
+				Ok(state)
+					if !state.trash
+						&& !state.versioned
+						&& state.size == self.written
+						&& state.chunks == self.next_index =>
+				{
+					None
+				}
+				_ => Some(KeptReason::Unconfirmed),
+			}
+		};
+		// a source inside another (a file and its folder both given) goes with that one: its
+		// removal removes it, and its own attempt would only find it gone
+		let mut within: Vec<Option<usize>> = targets
+			.iter()
+			.enumerate()
+			.map(|(index, target)| {
+				targets.iter().enumerate().position(|(other, outer)| {
+					other != index
+						// the same item given twice goes with its first
+						&& (other < index && outer.uuid() == target.uuid()
+							|| match (target, outer) {
+							(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
+								read.files.contains_key(&file.uuid)
+							}
+							(
+								DisposalTarget::Dir { uuid, .. }
+								| DisposalTarget::Unavailable { uuid },
+								DisposalTarget::Dir { read, .. },
+							) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
+							_ => false,
+						})
+				})
+			})
+			.collect();
+		// a move between two folders' listings can leave each read holding the other: a chain
+		// like that has no outermost source, so every source on or behind it is kept as changed
+		let cyclic: Vec<bool> = (0..within.len())
+			.map(|request| {
+				let mut outer = request;
+				for _ in 0..within.len() {
+					match within[outer] {
+						Some(next) => outer = next,
+						None => return false,
+					}
+				}
+				true
+			})
+			.collect();
+		for (within, _) in within
+			.iter_mut()
+			.zip(&cyclic)
+			.filter(|(_, cyclic)| **cyclic)
+		{
+			*within = None;
+		}
+		// the outermost source each one goes with (itself, if none): the chains are acyclic, the
+		// cycles were cut above
+		let outermost: Vec<usize> = (0..within.len())
+			.map(|mut outer| {
+				while let Some(next) = within[outer] {
+					outer = next;
+				}
+				outer
+			})
+			.collect();
+		let uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
+		let files: Vec<bool> = targets
+			.iter()
+			.map(|target| matches!(target, DisposalTarget::File(_)))
+			.collect();
+		let mut dispositions: Vec<Option<SourceDisposition>> = vec![None; targets.len()];
+		for (request, target) in targets.into_iter().enumerate() {
+			if outermost[request] != request {
+				continue;
+			}
+			let held_back = if cyclic[request] {
+				Some(KeptReason::Changed)
+			} else {
+				archive_reason.clone().or_else(|| own_reason(request))
+			};
+			// the files the folder's permanent removal deleted, even when it stopped part way
+			let mut deleted = BTreeSet::new();
+			let outcome = match (held_back, target) {
+				(Some(reason), _) => DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+				(None, DisposalTarget::File(file)) => {
+					dispose_file(&*self.backend, file, how, &self.control).await
+				}
+				(None, DisposalTarget::Dir { uuid, read }) => {
+					dispose_dir(
+						&*self.backend,
+						uuid,
+						&read,
+						how,
+						&self.control,
+						&mut deleted,
+					)
+					.await
+				}
+				(None, DisposalTarget::Unavailable { .. }) => DisposalOutcome::Kept {
+					reason: KeptReason::Changed,
+					bytes_freed: 0,
+				},
+			};
+			// the source and those that go with it are told of as soon as its outcome is final
+			let told: Vec<usize> = (0..uuids.len())
+				.filter(|&nested| outermost[nested] == request)
+				.collect();
+			for &nested in &told {
+				let outcome = match &outcome {
+					_ if nested == request => outcome.clone(),
+					DisposalOutcome::Disposed { how, .. } => DisposalOutcome::Disposed {
+						how: *how,
+						bytes_freed: 0,
+					},
+					// a folder removed for good only in part may have taken a file given on
+					// its own too
+					DisposalOutcome::Kept { .. }
+						if files[nested] && deleted.contains(&uuids[nested]) =>
+					{
+						DisposalOutcome::Disposed {
+							how: SourceDisposal::DeletePermanently,
+							bytes_freed: 0,
+						}
+					}
+					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::Kept {
+						reason: reason.clone(),
+						bytes_freed: 0,
+					},
+				};
+				dispositions[nested] = Some(SourceDisposition {
+					uuid: uuids[nested],
+					outcome,
+				});
+			}
+			let told: Vec<SourceDisposition> = told
+				.iter()
+				.filter_map(|&nested| dispositions[nested].clone())
+				.collect();
+			self.reporter.dispositions(&told);
+		}
+		dispositions
+			.into_iter()
+			.map(|disposition| disposition.expect("every source goes with an outermost one"))
+			.collect()
+	}
+
 	/// Registers the uploaded archive in the destination.
 	async fn register(
 		&mut self,
 		name: ValidatedName,
 		shape: NameShape,
 		targets: ConnectedTargets,
-	) -> Result<crate::fs::file::RemoteFile, Stopped> {
+	) -> Result<RemoteFile, Stopped> {
 		let now = Utc::now();
 		let completion = UploadCompletion {
 			written: self.written,
@@ -674,6 +962,15 @@ impl<B: DriveBackend> Driver<B> {
 				self.fatal = Some(Arc::new(error));
 				Err(Stopped)
 			}
+		}
+	}
+}
+
+impl DisposalTarget {
+	fn uuid(&self) -> Uuid {
+		match self {
+			Self::File(file) => file.uuid,
+			Self::Dir { uuid, .. } | Self::Unavailable { uuid } => *uuid,
 		}
 	}
 }

@@ -1,7 +1,7 @@
 //! The public compress API on [`Client`]: lists and plans the sources, checks the archive can be
 //! written and extracted again, and runs the job.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use filen_types::fs::Uuid;
 
@@ -11,37 +11,43 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
+			dispose::{ExpectedFile, SourceDisposal, Tree},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
 		},
-		categories::{DirType, Normal},
+		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			backend::ClientBackend,
-			listing::{ItemSource, ListingBytes, ScanError, watch_listing},
+			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
 			plan::{
-				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, RenameReason,
-				RenamedEntry,
+				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlannedItem,
+				RenameReason, RenamedEntry,
 			},
 		},
-		file::traits::HasFileInfo,
-		name::ValidatedName,
+		file::{
+			enums::RemoteFileType,
+			traits::{HasFileInfo, HasRemoteFileInfo},
+		},
+		name::{ValidatedName, keep_both::SourceName},
 	},
 	job::JobControl,
 	util::MaybeArc,
 };
 
 use super::{
-	CompressFormat,
+	CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
-	engine::{CompressTask, Source, run_compress},
+	engine::{
+		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
+	},
 	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
 };
 
 /// What to compress, and where the archive goes.
 #[derive(Debug, Clone)]
 pub struct CompressRequest {
-	/// The items to compress.
-	pub sources: Vec<ItemSource>,
+	/// The items, and whether to remove them afterwards.
+	pub sources: CompressSources,
 	/// The directory of the user's drive the archive is created in.
 	pub destination: DirType<'static, Normal>,
 	/// The archive's whole name, ending in the format's extension (see
@@ -84,25 +90,27 @@ impl Client {
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn compress_items(
 		self: Arc<Self>,
-		sources: Vec<ItemSource>,
-		destination: DirType<'static, Normal>,
-		name: ValidatedName,
+		request: CompressRequest,
 		config: CompressConfig,
 		callback: impl CompressCallback,
 		control: JobControl,
 	) -> Result<CompressReport, CompressFailed> {
+		let CompressRequest {
+			sources,
+			destination,
+			name,
+		} = request;
 		let reporter = Reporter::new(callback);
 		let archives = self.client().state().archives().clone();
-		let refuse = |report: CompressReport, phase, error: Error| {
-			reporter.finish_unstarted(phase, report.totals);
-			CompressFailed {
-				report: CompressReport {
-					counts: reporter.counts(),
-					..report
-				},
-				error: Arc::new(error),
+		// every source a disposal was asked for is reported, however early the job ends
+		let requested: Vec<Uuid> = match &sources {
+			CompressSources::Keep(_) => Vec::new(),
+			CompressSources::Dispose { items, .. } => {
+				items.iter().map(|item| item.uuid()).collect()
 			}
 		};
+		let refuse =
+			|report, phase, error| end_early(&reporter, report, &requested, phase, Arc::new(error));
 		let checked = config
 			.format
 			.check_name(name.as_ref())
@@ -130,14 +138,32 @@ impl Client {
 			}
 		};
 
-		let plan = match self.plan_sources(sources, &reporter, &control).await {
+		let (sources, dispose) = match sources {
+			CompressSources::Keep(sources) => (sources, None),
+			CompressSources::Dispose { how, items } => {
+				let sources = items
+					.iter()
+					.map(|item| match item {
+						NonRootItemType::File(file) => {
+							ItemSource::File(RemoteFileType::from(file.clone().into_owned()))
+						}
+						NonRootItemType::Dir(dir) => {
+							ItemSource::Dir(ItemSourceDir::Normal(dir.clone().into_owned()))
+						}
+					})
+					.collect();
+				(sources, Some((how, items)))
+			}
+		};
+		let mut plan = match self.plan_sources(sources, &reporter, &control).await {
 			Ok(plan) => plan,
 			Err(ScanError::Stopped) => {
-				let error = Error::custom(ErrorKind::Cancelled, "compression cancelled");
-				return Err(refuse(
+				return Err(end_early(
+					&reporter,
 					CompressReport::default(),
+					&requested,
 					CompressPhase::Cancelled,
-					error,
+					cancelled(),
 				));
 			}
 			Err(ScanError::Failed(error)) => {
@@ -148,14 +174,22 @@ impl Client {
 				));
 			}
 		};
+		let top_level_renamed = top_level_renames(&plan);
+		// the plan's records move into the report; nothing reads them in the plan again
 		let mut report = CompressReport {
-			skipped: plan.skipped.clone(),
-			renamed: plan.renamed.clone(),
+			skipped: std::mem::take(&mut plan.skipped),
+			renamed: std::mem::take(&mut plan.renamed),
 			totals: plan.totals,
 			..CompressReport::default()
 		};
-		report.renamed.extend(top_level_renames(&plan));
-		let (entries, sources) = match archive_entries(&plan, config.format) {
+		report.renamed.extend(top_level_renamed);
+		let disposal =
+			match dispose.map(|(how, items)| disposal(&plan, how, items, destination.uuid())) {
+				None => None,
+				Some(Ok(disposal)) => Some(disposal),
+				Some(Err(error)) => return Err(refuse(report, CompressPhase::Failed, error)),
+			};
+		let (entries, sources) = match archive_entries(plan, config.format) {
 			Ok(entries) => entries,
 			Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
 		};
@@ -172,7 +206,7 @@ impl Client {
 				return Err(refuse(report, CompressPhase::Failed, error));
 			}
 		}
-		reporter.set_plan(plan.totals, &report.skipped, &report.renamed);
+		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
 		let job = CompressJob {
 			format: config.format,
@@ -190,6 +224,7 @@ impl Client {
 			config: archives,
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
+			disposal,
 		})
 		.await
 	}
@@ -200,7 +235,7 @@ impl Client {
 		sources: Vec<ItemSource>,
 		reporter: &MaybeArc<Reporter>,
 		control: &JobControl,
-	) -> Result<ItemPlan<crate::fs::drive_job::listing::ItemSourceDir>, ScanError> {
+	) -> Result<ItemPlan<ItemSourceDir>, ScanError> {
 		let sources_total = sources
 			.iter()
 			.filter(|source| matches!(source, ItemSource::Dir(_)))
@@ -241,22 +276,95 @@ impl Client {
 	}
 }
 
-/// Top-level items the planner gave keep-both names, since two sources had the same name.
+/// What removing `items`, the job's sources in request order, has to find unchanged: a file as
+/// it was listed, a directory holding exactly the files and directories the plan read below it.
+fn disposal<D>(
+	plan: &ItemPlan<D>,
+	how: SourceDisposal,
+	items: Vec<NonRootItemType<'static, Normal>>,
+	destination: Uuid,
+) -> Result<CompressDisposal, Error> {
+	let mut targets = Vec::with_capacity(items.len());
+	for (request, item) in items.into_iter().enumerate() {
+		targets.push(match item {
+			NonRootItemType::File(file) => match Uuid::try_from(file.parent) {
+				Ok(parent) => DisposalTarget::File(ExpectedFile::of(&*file, file.uuid(), parent)),
+				Err(_) => DisposalTarget::Unavailable { uuid: file.uuid() },
+			},
+			NonRootItemType::Dir(dir) => {
+				let uuid = dir.uuid();
+				let below: Vec<Uuid> = plan
+					.dirs
+					.iter()
+					.filter(|planned| planned.request == request && planned.source_uuid != uuid)
+					.map(|planned| planned.source_uuid)
+					.collect();
+				// trashing the directory would take the archive with it
+				if destination == uuid || below.contains(&destination) {
+					return Err(Error::custom(
+						ErrorKind::InvalidState,
+						"the archive cannot be written into a source that is removed afterwards",
+					));
+				}
+				let files = plan
+					.files
+					.iter()
+					.filter(|planned| planned.request == request)
+					.map(|planned| (planned.source.uuid(), planned.size))
+					.collect();
+				DisposalTarget::Dir {
+					uuid,
+					read: Tree {
+						files,
+						dirs: below.into_iter().collect(),
+					},
+				}
+			}
+		});
+	}
+	let mut hashed = vec![true; targets.len()];
+	for file in plan
+		.files
+		.iter()
+		.filter(|file| file.source.hash().is_none())
+	{
+		hashed[file.request] = false;
+	}
+	Ok(CompressDisposal {
+		how,
+		targets,
+		hashed,
+	})
+}
+
+/// Top-level items the planner gave keep-both names, since two sources had the same name. The
+/// planner reports the other renames of top-level items itself. An item is reported once, for
+/// the reason the planner gave it: a legacy name encoded to be valid that then also collided is
+/// a keep-both rename, under the name it ended up with.
 fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
+	let reported: HashSet<Uuid> = plan
+		.renamed
+		.iter()
+		.map(|renamed| renamed.source_uuid)
+		.collect();
 	plan.top_level
 		.iter()
 		.filter_map(|top| {
 			let (source_uuid, source_path, name) = match top.item {
-				crate::fs::drive_job::plan::PlannedItem::Dir(index) => {
+				PlannedItem::Dir(index) => {
 					let dir = &plan.dirs[index];
 					(dir.source_uuid, &dir.source_path, &dir.name)
 				}
-				crate::fs::drive_job::plan::PlannedItem::File(index) => {
+				PlannedItem::File(index) => {
 					let file = &plan.files[index];
 					(file.source.uuid(), &file.source_path, &file.name)
 				}
 			};
-			(source_path != name.as_ref()).then(|| RenamedEntry {
+			// an item's own name, as the planner made it valid (NFC, legacy names encoded)
+			let own = SourceName::parse(source_path).map(SourceName::into_name);
+			let kept_both = !reported.contains(&source_uuid)
+				&& own.is_ok_and(|own| own.as_ref() != name.as_ref());
+			kept_both.then(|| RenamedEntry {
 				source_uuid,
 				source_path: source_path.clone(),
 				name: name.clone(),
@@ -269,7 +377,7 @@ fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
 /// The archive's entries (directories parent first, then files) and the files the codec reads,
 /// with every path checked against what extracting accepts.
 fn archive_entries<D>(
-	plan: &ItemPlan<D>,
+	plan: ItemPlan<D>,
 	format: CompressFormat,
 ) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
 	if matches!(format, CompressFormat::Single { .. })
@@ -297,7 +405,7 @@ fn archive_entries<D>(
 		});
 	}
 	let mut sources = Vec::with_capacity(plan.files.len());
-	for (index, file) in plan.files.iter().enumerate() {
+	for (index, file) in plan.files.into_iter().enumerate() {
 		let path = path_in(file.parent, &file.name, &dir_paths);
 		check_path(&path, 0)?;
 		entries.push(ArchiveEntry::File {
@@ -309,8 +417,9 @@ fn archive_entries<D>(
 			modified: file.source.last_modified(),
 		});
 		sources.push(Source {
-			file: file.source.clone(),
+			file: file.source,
 			path,
+			request: file.request,
 		});
 	}
 	Ok((entries, sources))
@@ -342,6 +451,7 @@ mod tests {
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 		fs::{
 			archive::compress::{CompressUpdate, report::CompressCallback},
+			dir::RemoteDirectory,
 			drive_job::plan::{Listed, SourceDir},
 			file::{
 				AnonymousRemoteFile, RemoteFile,
@@ -364,9 +474,11 @@ mod tests {
 	fn _compress_future_is_send(client: Arc<Client>, destination: DirType<'static, Normal>) {
 		fn assert_send<T: Send>(_: T) {}
 		assert_send(client.compress_items(
-			Vec::new(),
-			destination,
-			ValidatedName::try_from("a.tar").unwrap(),
+			CompressRequest {
+				sources: CompressSources::Keep(Vec::new()),
+				destination,
+				name: ValidatedName::try_from("a.tar").unwrap(),
+			},
 			CompressConfig {
 				format: CompressFormat::Tar { compression: None },
 				max_bytes: None,
@@ -453,9 +565,14 @@ mod tests {
 
 	#[test]
 	fn a_plan_becomes_entries_with_joined_paths() {
-		let plan = plan();
+		let renamed = top_level_renames(&plan());
+		assert_eq!(renamed.len(), 1);
+		assert_eq!(
+			(renamed[0].source_path.as_str(), renamed[0].name.as_ref()),
+			("Photos", "Photos (1)")
+		);
 		let (entries, sources) =
-			archive_entries(&plan, CompressFormat::Tar { compression: None }).unwrap();
+			archive_entries(plan(), CompressFormat::Tar { compression: None }).unwrap();
 		let paths: Vec<(&str, Option<u64>)> = entries
 			.iter()
 			.map(|entry| match entry {
@@ -485,16 +602,10 @@ mod tests {
 				assert_eq!(&sources[*source as usize].path, path);
 			}
 		}
-		let renamed = top_level_renames(&plan);
-		assert_eq!(renamed.len(), 1);
-		assert_eq!(
-			(renamed[0].source_path.as_str(), renamed[0].name.as_ref()),
-			("Photos", "Photos (1)")
-		);
 
 		assert_eq!(
 			archive_entries(
-				&plan,
+				plan(),
 				CompressFormat::Single {
 					compression: crate::fs::archive::compress::Compression {
 						codec: crate::fs::archive::format::StreamCodec::Gzip,
@@ -507,6 +618,199 @@ mod tests {
 			ErrorKind::InvalidState,
 			"a single compressed file is exactly one file"
 		);
+	}
+
+	#[test]
+	fn only_a_keep_both_rename_at_the_top_is_reported_as_one() {
+		let root = Uuid::new_v4();
+		let mut planner = ItemPlanner::default();
+		planner.add_destination(root, std::iter::empty());
+		let request = |source| PlanRequest {
+			source,
+			destination: root,
+			name: None,
+		};
+		// a name only valid once encoded, a name in NFD, and two files of the same name
+		let nfd = source_dir("Cafe\u{301}");
+		let plan = planner
+			.plan(vec![
+				request(PlanSource::File(file("a:b.txt", 1))),
+				request(PlanSource::Dir {
+					root: nfd.clone(),
+					dirs: Vec::new(),
+					files: Vec::new(),
+				}),
+				request(PlanSource::File(file("x.txt", 2))),
+				request(PlanSource::File(file("x.txt", 3))),
+			])
+			.unwrap();
+		let legacy = plan.files[0].source.uuid();
+		assert_eq!(
+			plan.renamed
+				.iter()
+				.map(|renamed| (renamed.source_uuid, renamed.reason))
+				.collect::<Vec<_>>(),
+			[(legacy, RenameReason::InvalidName)],
+			"the planner reports the encoded name"
+		);
+		let renamed = top_level_renames(&plan);
+		assert_eq!(
+			renamed
+				.iter()
+				.map(|renamed| (
+					renamed.source_path.as_str(),
+					renamed.name.as_ref(),
+					renamed.reason
+				))
+				.collect::<Vec<_>>(),
+			[("x.txt", "x (1).txt", RenameReason::DuplicateName)]
+		);
+	}
+
+	#[test]
+	fn a_legacy_name_that_also_collides_is_reported_once() {
+		let root = Uuid::new_v4();
+		let mut planner = ItemPlanner::default();
+		planner.add_destination(root, std::iter::empty());
+		let request = |source: PlanSource<()>| PlanRequest {
+			source,
+			destination: root,
+			name: None,
+		};
+		let plan = planner
+			.plan(vec![
+				request(PlanSource::File(file("a:b.txt", 1))),
+				request(PlanSource::File(file("a:b.txt", 2))),
+			])
+			.unwrap();
+		let [first, second] = [0, 1].map(|index| &plan.files[index]);
+		let mut renamed = plan.renamed.clone();
+		renamed.extend(top_level_renames(&plan));
+		let renamed: Vec<_> = renamed
+			.iter()
+			.map(|renamed| (renamed.source_uuid, renamed.name.clone(), renamed.reason))
+			.collect();
+		assert_eq!(
+			renamed,
+			[
+				(
+					first.source.uuid(),
+					first.name.clone(),
+					RenameReason::InvalidName
+				),
+				(
+					second.source.uuid(),
+					second.name.clone(),
+					RenameReason::DuplicateName
+				),
+			],
+			"each once, under the name it got"
+		);
+		assert_ne!(first.name, second.name);
+	}
+
+	#[test]
+	fn disposal_targets_hold_exactly_what_was_read() {
+		let plan = plan();
+		let photos = &plan.dirs[0];
+		let year = &plan.dirs[1];
+		let top = plan
+			.files
+			.iter()
+			.find(|file| file.request == 1)
+			.unwrap()
+			.source
+			.clone();
+		let RemoteFileType::File(top_file) = &top else {
+			unreachable!()
+		};
+		let photos_dir = RemoteDirectory::new_from_parts(
+			photos.source_uuid,
+			crate::fs::dir::meta::DecryptedDirectoryMeta {
+				name: Cow::Borrowed("Photos"),
+				created: None,
+			},
+			Uuid::new_v4().into(),
+			chrono::Utc::now(),
+		);
+		let mut normal_top = RemoteFile::from_meta(
+			top.uuid(),
+			filen_types::fs::StableUuid::new_for_test(top.uuid()),
+			Uuid::new_v4().into(),
+			top_file.size(),
+			top_file.chunks(),
+			"de-1",
+			"bucket",
+			chrono::Utc::now(),
+			false,
+			top_file.meta.clone(),
+		);
+		let parent = Uuid::try_from(normal_top.parent).unwrap();
+		let items = |top: &RemoteFile| {
+			vec![
+				NonRootItemType::Dir(Cow::Owned(photos_dir.clone())),
+				NonRootItemType::File(Cow::Owned(top.clone())),
+			]
+		};
+		let disposal = disposal(
+			&plan,
+			SourceDisposal::Trash,
+			items(&normal_top),
+			Uuid::new_v4(),
+		)
+		.unwrap();
+		assert_eq!(
+			disposal.hashed,
+			[false, false],
+			"the plan's files carry no hash"
+		);
+		let [
+			DisposalTarget::Dir { uuid, read },
+			DisposalTarget::File(file),
+		] = &disposal.targets[..]
+		else {
+			panic!("{:?}", disposal.targets);
+		};
+		assert_eq!(*uuid, photos.source_uuid);
+		assert_eq!(read.dirs, [year.source_uuid].into_iter().collect());
+		let sizes: Vec<u64> = read.files.values().copied().collect();
+		assert_eq!(read.files.len(), 2);
+		assert_eq!(sizes.iter().sum::<u64>(), 7);
+		assert_eq!(
+			*file,
+			ExpectedFile {
+				uuid: top.uuid(),
+				size: 5,
+				chunks: 1,
+				parent,
+			}
+		);
+
+		// the archive would land in a source that is removed afterwards
+		for inside in [photos.source_uuid, year.source_uuid] {
+			assert_eq!(
+				disposal_of(&plan, items(&normal_top), inside)
+					.unwrap_err()
+					.kind(),
+				ErrorKind::InvalidState
+			);
+		}
+
+		// a file in the trash is left alone
+		normal_top.parent = filen_types::fs::ParentUuid::Trash(parent);
+		let disposal = disposal_of(&plan, items(&normal_top), Uuid::new_v4()).unwrap();
+		assert!(matches!(
+			disposal.targets[1],
+			DisposalTarget::Unavailable { .. }
+		));
+	}
+
+	fn disposal_of(
+		plan: &ItemPlan<()>,
+		items: Vec<NonRootItemType<'static, Normal>>,
+		destination: Uuid,
+	) -> Result<CompressDisposal, Error> {
+		disposal(plan, SourceDisposal::Trash, items, destination)
 	}
 
 	#[test]

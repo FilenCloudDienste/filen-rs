@@ -35,6 +35,7 @@ use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, crypto::Blake3Hash, fs::Uuid};
 use futures::{
 	StreamExt,
+	future::join_all,
 	stream::{FuturesOrdered, FuturesUnordered},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -47,6 +48,10 @@ use crate::{
 		HasName, HasUUID,
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
+			dispose::{
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
+				SourceDisposition, Tree, dir_digest, dispose_file, file_digest,
+			},
 			format::archive_default_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
@@ -57,6 +62,7 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			backend::{DriveBackend, UploadSpec},
+			counts::ItemCounts,
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			ends_job,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
@@ -66,7 +72,7 @@ use crate::{
 		file::{
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
-			traits::HasFileInfo,
+			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
 		name::{
@@ -119,6 +125,21 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	/// How to remove the archive once the extraction is verified, and the directory it is in.
+	pub(crate) dispose: Option<(SourceDisposal, Uuid)>,
+	/// Whether the caller asked for the archive to be removed, which `dispose` leaves out for an
+	/// archive in the trash: every way the job ends reports what became of it.
+	pub(crate) disposal_requested: bool,
+}
+
+/// What to do with the archive once the extraction is verified.
+#[derive(Clone, Copy, Debug)]
+enum ArchiveDisposal {
+	/// Remove it this way, if it is still in `parent`.
+	Remove { how: SourceDisposal, parent: Uuid },
+	/// It was in the trash when the job started, so there is no directory to confirm it is
+	/// still in: it is kept.
+	Unavailable,
 }
 
 enum DirState {
@@ -236,6 +257,9 @@ struct Driver<B: DriveBackend> {
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
 	served: u64,
+	/// The archive's plaintext as the codec read it, in order.
+	archive_hasher: blake3::Hasher,
+	dispose: Option<ArchiveDisposal>,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
 
 	/// Set up when the codec reports what the archive holds.
@@ -262,6 +286,12 @@ struct Driver<B: DriveBackend> {
 	held: Option<WorkerEvent>,
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
+	/// The order-free digest of the files and directories the job created, which the output
+	/// has to hold exactly before the archive is removed.
+	created_digest: u128,
+	/// Top-level items past the report's records, by uuid and whether each is a directory:
+	/// what propagating them to targets the destination gains takes.
+	top_level_beyond: Vec<(Uuid, bool)>,
 	/// Plaintext bytes committed to uploads, for `max_bytes`.
 	committed: u64,
 	items: u64,
@@ -274,7 +304,7 @@ struct Driver<B: DriveBackend> {
 }
 
 /// Runs an extraction: waits for a job slot, starts the codec, and drives it to the end.
-pub(crate) async fn run_extract<B: DriveBackend>(
+pub(crate) async fn run_extract<B: DisposalBackend>(
 	task: ExtractTask<B>,
 ) -> Result<ExtractReport, ExtractFailed> {
 	let ExtractTask {
@@ -288,6 +318,8 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		max_items,
 		config,
 		start,
+		dispose,
+		disposal_requested,
 	} = task;
 	let totals = super::ArchiveTotals::Streaming {
 		archive_bytes: archive.size(),
@@ -301,8 +333,26 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		totals,
 		counts: Default::default(),
 		unaccounted_bytes: 0,
+		dispositions: Vec::new(),
 	};
-	let fail = |report: ExtractReport, phase, error: Error| {
+	let archive_uuid = archive.uuid();
+	let fail = |mut report: ExtractReport, phase, error: Error| {
+		if disposal_requested {
+			let reason = if phase == ExtractPhase::Cancelled {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Incomplete
+			};
+			let disposition = SourceDisposition {
+				uuid: archive_uuid,
+				outcome: DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+			};
+			reporter.event(ExtractEvent::SourceDisposition(disposition.clone()));
+			report.dispositions.push(disposition);
+		}
 		reporter.finish(phase);
 		ExtractFailed {
 			report: ExtractReport {
@@ -351,6 +401,12 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		ready: VecDeque::new(),
 		reading: None,
 		served: 0,
+		archive_hasher: blake3::Hasher::new(),
+		dispose: match dispose {
+			Some((how, parent)) => Some(ArchiveDisposal::Remove { how, parent }),
+			None if disposal_requested => Some(ArchiveDisposal::Unavailable),
+			None => None,
+		},
 		ask: None,
 		resolver: None,
 		into_destination: false,
@@ -366,6 +422,8 @@ pub(crate) async fn run_extract<B: DriveBackend>(
 		held: None,
 		events_closed: false,
 		codec_result: None,
+		top_level_beyond: Vec::new(),
+		created_digest: 0,
 		committed: 0,
 		items: 0,
 		stamp: 0,
@@ -438,7 +496,7 @@ fn joined(segments: &[ValidatedName]) -> String {
 		.join("/")
 }
 
-impl<B: DriveBackend> Driver<B> {
+impl<B: DisposalBackend> Driver<B> {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
 		let outcome = async {
@@ -447,7 +505,20 @@ impl<B: DriveBackend> Driver<B> {
 				return Ok(());
 			}
 			self.reporter.set_phase(ExtractPhase::Finishing);
-			self.recheck_targets().await
+			self.recheck_targets().await?;
+			if let Some(ArchiveDisposal::Remove { how, parent }) = self.dispose {
+				self.reporter.set_phase(ExtractPhase::DisposingSources);
+				self.reporter.checkpoint(&self.control).await?;
+				let outcome = self.dispose_archive(how, parent).await;
+				let disposition = SourceDisposition {
+					uuid: self.archive.uuid(),
+					outcome,
+				};
+				self.reporter
+					.event(ExtractEvent::SourceDisposition(disposition.clone()));
+				self.report.dispositions.push(disposition);
+			}
+			Ok(())
 		}
 		.await;
 		let (phase, result) = match (outcome, &self.fatal) {
@@ -464,6 +535,31 @@ impl<B: DriveBackend> Driver<B> {
 			),
 			(Ok(()), None) => (ExtractPhase::Done, Ok(())),
 		};
+		// the archive to remove was not touched: say so, rather than leave its disposition out
+		if self.dispose.is_some() && self.report.dispositions.is_empty() {
+			let counts = self.reporter.counts();
+			let complete = counts.files_failed + counts.dirs_failed + counts.entries_skipped == 0;
+			let reason = if result.is_ok() && complete {
+				// only an archive in the trash is not removed after a complete extraction
+				KeptReason::Changed
+			} else if result.is_ok() {
+				KeptReason::Incomplete
+			} else if self.control.is_cancelled() {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Incomplete
+			};
+			let disposition = SourceDisposition {
+				uuid: self.archive.uuid(),
+				outcome: DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+			};
+			self.reporter
+				.event(ExtractEvent::SourceDisposition(disposition.clone()));
+			self.report.dispositions.push(disposition);
+		}
 		if result.is_err() {
 			// planned and never started: a job that ends early leaves them
 			let unattempted = self
@@ -692,6 +788,7 @@ impl<B: DriveBackend> Driver<B> {
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
+		self.archive_hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
 		// progress follows the archive read, not only the idle ticks, which a busy job skips
 		self.reporter
@@ -897,6 +994,7 @@ impl<B: DriveBackend> Driver<B> {
 						self.destination.uuid(),
 						outcome.name.as_ref(),
 					);
+					self.created_digest = self.created_digest.wrapping_add(dir_digest(dir.uuid()));
 					let uuid = dir.uuid();
 					self.top_level_created(
 						ExtractTopLevelKey::Root,
@@ -918,12 +1016,15 @@ impl<B: DriveBackend> Driver<B> {
 		key: ExtractTopLevelKey,
 		item: NonRootItemType<'static, Normal>,
 	) {
+		let is_dir = matches!(item, NonRootItemType::Dir(_));
 		let top = ExtractedTopLevel { key, item };
-		keep(
+		if !keep(
 			&mut self.report.top_level,
 			&mut self.report.omitted.top_level,
 			top.clone(),
-		);
+		) {
+			self.top_level_beyond.push((top.item.uuid(), is_dir));
+		}
 		self.reporter.top_level_created(top);
 	}
 
@@ -1152,6 +1253,7 @@ impl<B: DriveBackend> Driver<B> {
 				}
 				self.reporter
 					.dir_created(created.uuid(), parent, name.as_ref());
+				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
 				self.dirs[dir].state = DirState::Created(created.uuid());
 				self.uncreated_dirs -= 1;
 				self.ready_dirs
@@ -1498,6 +1600,9 @@ impl<B: DriveBackend> Driver<B> {
 					..file.active
 				};
 				self.reporter.file_done(&active, file.written);
+				self.created_digest = self
+					.created_digest
+					.wrapping_add(file_digest(active.dest_uuid, file.written));
 				if file.parent == ROOT && self.into_destination {
 					self.top_level_created(
 						ExtractTopLevelKey::Entry { id: file.entry },
@@ -1536,9 +1641,98 @@ impl<B: DriveBackend> Driver<B> {
 		}
 	}
 
+	/// Removes the archive if the extraction is verified; what became of it.
+	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
+		let kept = |reason| DisposalOutcome::Kept {
+			reason,
+			bytes_freed: 0,
+		};
+		let counts = self.reporter.counts();
+		if counts.files_failed + counts.dirs_failed + counts.entries_skipped > 0 {
+			return kept(KeptReason::Incomplete);
+		}
+		if self.report.unaccounted_bytes > 0 {
+			return kept(KeptReason::UnaccountedData {
+				bytes: self.report.unaccounted_bytes,
+			});
+		}
+		// every chunk was read, so the hash covers the whole archive
+		if self.served != self.chunks {
+			return kept(KeptReason::Unconfirmed);
+		}
+		let read = Blake3Hash::from(self.archive_hasher.finalize());
+		match self.archive.hash() {
+			Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
+			None if how == SourceDisposal::DeletePermanently => {
+				return kept(KeptReason::HashUnavailable);
+			}
+			_ => {}
+		}
+		if !self.output_confirmed(counts).await {
+			return kept(if self.control.is_stopping() {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Unconfirmed
+			});
+		}
+		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
+		dispose_file(&*self.backend, archive, how, &self.control).await
+	}
+
+	/// Whether the server holds exactly what the counts say was created: every file at its size
+	/// and every directory, listed again below the items created in the destination. Listed
+	/// as many at once as other small requests; a pause is waited out between them, holding
+	/// nothing, and a cancel ends the check unconfirmed.
+	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
+		let mut found = Tree::default();
+		if !self.into_destination {
+			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
+				Ok(tree) => found = tree,
+				Err(_) => return false,
+			}
+			// the folder itself
+			found.dirs.insert(self.dirs[ROOT].uuid);
+		}
+		// the new folder is listed whole above; the items past the report's records are
+		// checked as recheck_targets goes through them
+		let items: Vec<(Uuid, bool)> = self
+			.report
+			.top_level
+			.iter()
+			.filter(|top| top.key != ExtractTopLevelKey::Root)
+			.map(|top| (top.item.uuid(), matches!(top.item, NonRootItemType::Dir(_))))
+			.chain(self.top_level_beyond.iter().copied())
+			.collect();
+		for batch in items.chunks(MAX_SMALL_PARALLEL_REQUESTS) {
+			if self.reporter.checkpoint(&self.control).await.is_err() {
+				return false;
+			}
+			let listed = join_all(
+				batch
+					.iter()
+					.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
+			)
+			.await;
+			for tree in listed {
+				let Some(tree) = tree else {
+					return false;
+				};
+				found.dirs.extend(tree.dirs);
+				found.files.extend(tree.files);
+			}
+			self.reporter.tick();
+		}
+		// the very items the job created, each file at the size it wrote
+		found.files.len() as u64 == counts.files_done
+			&& found.files.values().sum::<u64>() == counts.bytes_done
+			&& found.dirs.len() as u64 == counts.dirs_created
+			&& found.digest() == self.created_digest
+	}
+
 	/// The destination may have been shared or linked while the extraction ran; items created
 	/// before that were propagated to the old targets only. Propagate everything created (each
-	/// top-level item with its subtree) to the new ones.
+	/// top-level item with its subtree) to the new ones, as many items at once as other small
+	/// requests, under the drive lock, which a pause gives back until it is over.
 	async fn recheck_targets(&mut self) -> Result<(), Stopped> {
 		self.reporter.checkpoint(&self.control).await?;
 		let destination = self.destination.uuid();
@@ -1558,32 +1752,93 @@ impl<B: DriveBackend> Driver<B> {
 		if added.is_empty() || self.report.top_level.is_empty() {
 			return Ok(());
 		}
-		let _lock = loop {
-			match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
-				LockWait::Locked(held) => break held,
-				LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
-				LockWait::Failed(error) => {
-					tracing::warn!(
-						"failed to lock the drive to propagate extracted items: {error}"
-					);
-					return Ok(());
+		let items = self.report.top_level.len() + self.top_level_beyond.len();
+		let mut next = 0;
+		while next < items {
+			let _lock = loop {
+				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
+					LockWait::Locked(held) => break held,
+					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
+					LockWait::Failed(error) => {
+						tracing::warn!(
+							"failed to lock the drive to propagate extracted items: {error}"
+						);
+						return Ok(());
+					}
 				}
-			}
-		};
-		for top in &self.report.top_level {
-			// one request per item: a cancel is not kept waiting for all of them
-			if self.control.is_stopping() {
-				return Err(Stopped);
-			}
-			for error in self.backend.propagate_tree(&added, &top.item).await {
-				self.reporter.event(ExtractEvent::PropagationFailed {
-					dest_uuid: top.item.uuid(),
-					error: Arc::new(error),
-				});
+			};
+			while next < items && !self.control.is_pause_requested() {
+				// a cancel is not kept waiting for every item
+				if self.control.is_stopping() {
+					return Err(Stopped);
+				}
+				let end = (next + MAX_SMALL_PARALLEL_REQUESTS).min(items);
+				let propagated = join_all((next..end).map(|index| {
+					propagate_top_level(
+						&*self.backend,
+						&self.report.top_level,
+						&self.top_level_beyond,
+						index,
+						&added,
+					)
+				}))
+				.await;
+				for (dest_uuid, errors) in propagated {
+					for error in errors {
+						self.reporter.event(ExtractEvent::PropagationFailed {
+							dest_uuid,
+							error: Arc::new(error),
+						});
+					}
+				}
+				next = end;
+				self.reporter.tick();
 			}
 		}
 		Ok(())
 	}
+}
+
+/// Propagates top-level item `index` of `kept` followed by `beyond` (those past the report's
+/// records, fetched again: only when the destination changed, which is rare, rather than
+/// holding every one of them for the whole job) with its subtree to `added`; its uuid, and
+/// what failed.
+async fn propagate_top_level<B: DisposalBackend>(
+	backend: &B,
+	kept: &[ExtractedTopLevel],
+	beyond: &[(Uuid, bool)],
+	index: usize,
+	added: &ConnectedTargets,
+) -> (Uuid, Vec<Error>) {
+	if let Some(top) = kept.get(index) {
+		return (
+			top.item.uuid(),
+			backend.propagate_tree(added, &top.item).await,
+		);
+	}
+	let (uuid, is_dir) = beyond[index - kept.len()];
+	let errors = match backend.normal_item(uuid, is_dir).await {
+		Ok(item) => backend.propagate_tree(added, &item).await,
+		Err(error) => vec![error],
+	};
+	(uuid, errors)
+}
+
+/// What the server holds of a top-level item the job created: itself, and everything below a
+/// directory; `None` if it could not be listed, or is a file in the trash.
+async fn created_tree<B: DisposalBackend>(backend: &B, uuid: Uuid, is_dir: bool) -> Option<Tree> {
+	let mut tree = Tree::default();
+	if is_dir {
+		tree = backend.list_tree(uuid).await.ok()?;
+		tree.dirs.insert(uuid);
+	} else {
+		let state = backend.file_state(uuid).await.ok()?;
+		if state.trash {
+			return None;
+		}
+		tree.files.insert(uuid, state.size);
+	}
+	Some(tree)
 }
 
 #[cfg(test)]
