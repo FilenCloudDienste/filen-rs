@@ -1812,15 +1812,23 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	// and stops deriving once the job ended: its thread lets go of what it shared
-	let stopped = tokio::time::Instant::now();
+	// and stops deriving once the job ended, whatever the hashing speed: its thread lets go of
+	// what it shared (a derivation run to its end would too, eventually), having shown progress
+	// at most once more, for the 2^16 rounds under way when the job ended
+	let at_end = shared.progress();
+	let ended = tokio::time::Instant::now();
 	while Arc::strong_count(&shared) > 1 {
 		assert!(
-			stopped.elapsed() < Duration::from_secs(2),
-			"the codec is still deriving the key"
+			ended.elapsed() < Duration::from_secs(120),
+			"the codec never stopped"
 		);
 		tokio::time::sleep(Duration::from_millis(5)).await;
 	}
+	assert!(
+		shared.progress() - at_end <= 1,
+		"the codec derived on for {} more checks",
+		shared.progress() - at_end
+	);
 	assert!(created_dirs(&setup).is_empty());
 }
 
