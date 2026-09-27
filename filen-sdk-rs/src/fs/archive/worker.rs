@@ -25,7 +25,11 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE};
+use crate::{
+	Error, ErrorKind,
+	blocking::send_catching_panic,
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+};
 
 use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
 
@@ -184,10 +188,48 @@ impl WorkerPort {
 	}
 }
 
+/// The codec's events. They end when the codec does: when it returned, or when it panicked, which
+/// on wasm traps its thread without closing its end of the channel.
+pub(crate) struct WorkerEvents {
+	events: mpsc::Receiver<WorkerEvent>,
+	/// Answered when the codec panicked; closed unanswered once it can no longer panic.
+	panicked: Option<oneshot::Receiver<()>>,
+}
+
+impl WorkerEvents {
+	fn new(events: mpsc::Receiver<WorkerEvent>, panicked: Option<oneshot::Receiver<()>>) -> Self {
+		Self { events, panicked }
+	}
+
+	pub(crate) async fn recv(&mut self) -> Option<WorkerEvent> {
+		if let Some(panicked) = &mut self.panicked {
+			tokio::select! {
+				biased;
+				event = self.events.recv() => return event,
+				answer = panicked => {
+					self.panicked = None;
+					if answer.is_ok() {
+						// an event already sent is still taken; then the channel reads as ended
+						self.events.close();
+					}
+				}
+			}
+		}
+		self.events.recv().await
+	}
+
+	/// Natively a panic unwinds through the codec's end of the channel, closing it.
+	#[cfg(test)]
+	pub(crate) fn blocking_recv(&mut self) -> Option<WorkerEvent> {
+		self.events.blocking_recv()
+	}
+}
+
 /// The driver's end of the exchange with a started codec.
 pub(crate) struct WorkerLink<T> {
-	pub(crate) events: mpsc::Receiver<WorkerEvent>,
-	/// The codec's result; closed without one when the codec died.
+	pub(crate) events: WorkerEvents,
+	/// The codec's result; closed without one when the codec died without a panic to report
+	/// (a wasm trap outside Rust).
 	pub(crate) done: oneshot::Receiver<T>,
 	pub(crate) shared: Arc<WorkerShared>,
 	/// The wasm worker generation that took the job, to retire if it stalls.
@@ -230,18 +272,31 @@ static ARCHIVE_CODECS: crate::blocking::WorkerSlot = crate::blocking::WorkerSlot
 
 /// Runs `job` on a codec worker: a thread of its own natively, the archive worker on wasm. The
 /// caller holds the archive job lease, so on wasm no other job is queued on the worker.
-pub(crate) fn start<T: Send + 'static>(
-	job: impl FnOnce(WorkerPort) -> T + Send + 'static,
-) -> Result<WorkerLink<T>, crate::Error> {
+///
+/// A codec that panics (a parser bug an archive ran into) ends its events and fails with the
+/// panic's message, which is logged too: natively the panic would otherwise reach only stderr,
+/// lost on mobile, and on wasm the driver would wait out [`ARCHIVE_STALL_TIMEOUT`] first.
+pub(crate) fn start<R: Send + 'static>(
+	job: impl FnOnce(WorkerPort) -> Result<R, Error> + Send + 'static,
+) -> Result<WorkerLink<Result<R, Error>>, Error> {
 	let (port, events, shared) = channels();
+	let (result, done) = oneshot::channel();
+	let (panicked_tx, panicked) = oneshot::channel();
+	let on_panic = move |message: String| {
+		tracing::error!("the archive's codec panicked: {message}");
+		let _ = panicked_tx.send(());
+		Err(Error::custom(
+			ErrorKind::ArchiveWorkerDied,
+			format!("the archive's codec panicked: {message}"),
+		))
+	};
+	let run = move || send_catching_panic(move || job(port), result, on_panic);
+	let events = WorkerEvents::new(events, Some(panicked));
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
-		let (result, done) = oneshot::channel();
 		std::thread::Builder::new()
 			.name("filen-archive-codec".to_owned())
-			.spawn(move || {
-				let _ = result.send(job(port));
-			})?;
+			.spawn(run)?;
 		Ok(WorkerLink {
 			events,
 			done,
@@ -250,7 +305,8 @@ pub(crate) fn start<T: Send + 'static>(
 	}
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
-		let (generation, done) = ARCHIVE_CODECS.submit(move || job(port));
+		// the result goes through the channel above, which a panicking codec still answers
+		let (generation, _) = ARCHIVE_CODECS.submit(run);
 		Ok(WorkerLink {
 			events,
 			done,
@@ -267,7 +323,7 @@ pub(crate) fn scripted<T>() -> (mpsc::Sender<WorkerEvent>, oneshot::Sender<T>, W
 	let (port, events, shared) = channels();
 	let (result, done) = oneshot::channel();
 	let link = WorkerLink {
-		events,
+		events: WorkerEvents::new(events, None),
 		done,
 		shared,
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -548,4 +604,45 @@ pub(crate) fn read_full(reader: &mut (impl Read + ?Sized), buf: &mut [u8]) -> io
 		}
 	}
 	Ok(filled)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn a_codec_that_panics_ends_its_events_and_fails_with_the_message() {
+		let mut link = start(|port| -> Result<(), Error> {
+			port.send(WorkerEvent::Opened(StreamLayout::Zip))?;
+			panic!("a header of {} bytes", 7);
+		})
+		.unwrap();
+		let mut events = Vec::new();
+		while let Some(event) = link.events.recv().await {
+			events.push(event);
+		}
+		assert!(
+			matches!(events[..], [WorkerEvent::Opened(StreamLayout::Zip)]),
+			"{events:?}"
+		);
+		let error = (&mut link.done).await.unwrap().unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::ArchiveWorkerDied);
+		assert!(
+			error.to_string().contains("panicked: a header of 7 bytes"),
+			"{error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_panic_ends_the_events_even_while_the_channel_stays_open() {
+		// what a trapped wasm worker leaves behind: its end of the channel never drops
+		let (sender, events) = mpsc::channel(1);
+		let (panicked_tx, panicked) = oneshot::channel();
+		let mut events = WorkerEvents::new(events, Some(panicked));
+		sender.send(WorkerEvent::FileEnd).await.unwrap();
+		panicked_tx.send(()).unwrap();
+		assert!(matches!(events.recv().await, Some(WorkerEvent::FileEnd)));
+		assert!(events.recv().await.is_none());
+		drop(sender);
+	}
 }

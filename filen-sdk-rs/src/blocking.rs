@@ -1,8 +1,117 @@
 //! Synchronous work that has to park its thread (a decoder that reads remote bytes chunk by chunk
 //! and waits for each), taken off the threads that drive the async runtime.
 
+use std::{any::Any, cell::Cell, rc::Rc};
+
+use tokio::sync::oneshot;
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use wasm_worker::WorkerSlot;
+
+/// Runs `job` and sends what it returns through `result`; should it panic, sends what
+/// `on_panic` makes of the panic's message instead, so the waiting side learns why the job
+/// ended rather than only that it is gone.
+pub(crate) fn send_catching_panic<T: 'static>(
+	job: impl FnOnce() -> T,
+	result: oneshot::Sender<T>,
+	on_panic: impl FnOnce(String) -> T + 'static,
+) {
+	// shared with the report, which on wasm sends from inside the panic hook, never returning here
+	let result = Rc::new(Cell::new(Some(result)));
+	let report = {
+		let result = Rc::clone(&result);
+		move |message| {
+			if let Some(result) = result.take() {
+				let _ = result.send(on_panic(message));
+			}
+		}
+	};
+	if let Some(value) = catch_panic(job, report)
+		&& let Some(result) = result.take()
+	{
+		let _ = result.send(value);
+	}
+}
+
+/// Runs `job`; should it panic, hands the panic's message to `report` and returns `None`.
+///
+/// Natively the panic is caught once it unwound out of `job`, whose state went with it, so
+/// nothing it left half-done is looked at again. The wasm build is `panic=abort`: nothing
+/// unwinds, and the thread traps right after the panic hook ran, so the hook calls `report`
+/// (see [`panic_reports`]) and this never returns `None` there.
+fn catch_panic<T>(job: impl FnOnce() -> T, report: impl FnOnce(String) + 'static) -> Option<T> {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	{
+		std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+			.map_err(|payload| report(panic_message(payload.as_ref())))
+			.ok()
+	}
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	{
+		panic_reports::push(Box::new(report));
+		let value = job();
+		panic_reports::pop();
+		Some(value)
+	}
+}
+
+/// A panic's message, when its payload is text (what `panic!` makes).
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+	payload
+		.downcast_ref::<&str>()
+		.map(|message| (*message).to_owned())
+		.or_else(|| payload.downcast_ref::<String>().cloned())
+		.unwrap_or_else(|| "a panic without a message".to_owned())
+}
+
+/// The reports [`catch_panic`] leaves for the panic hook on wasm, where a panic traps its thread
+/// instead of unwinding to a caller that could catch it.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod panic_reports {
+	use std::{cell::RefCell, sync::Once};
+
+	type Report = Box<dyn FnOnce(String)>;
+
+	thread_local! {
+		/// The reports of the calls running on this thread, outermost first.
+		static REPORTS: RefCell<Vec<Report>> = const { RefCell::new(Vec::new()) };
+	}
+
+	static HOOK: Once = Once::new();
+
+	pub(super) fn push(report: Report) {
+		// chained in front of the hook in place (the console logger `main_js` installs), which
+		// still runs after the reports
+		HOOK.call_once(|| {
+			let previous = std::panic::take_hook();
+			std::panic::set_hook(Box::new(move |info| {
+				let reports = REPORTS
+					.try_with(|reports| {
+						reports
+							.try_borrow_mut()
+							.map(|mut r| std::mem::take(&mut *r))
+					})
+					.ok()
+					.and_then(Result::ok)
+					.unwrap_or_default();
+				if !reports.is_empty() {
+					let message = super::panic_message(info.payload());
+					// outermost first: a worker is retired before its job's driver hears of the
+					// panic, so a job the driver submits next never reaches the dying worker
+					for report in reports {
+						report(message.clone());
+					}
+				}
+				previous(info);
+			}));
+		});
+		REPORTS.with(|reports| reports.borrow_mut().push(report));
+	}
+
+	pub(super) fn pop() {
+		REPORTS.with(|reports| reports.borrow_mut().pop());
+	}
+}
 
 /// One long-lived dedicated wasm worker per purpose (thumbnail decodes, archive codecs), which
 /// runs that purpose's jobs one after another.
@@ -121,15 +230,20 @@ mod wasm_worker {
 			});
 			// Succeeds whether or not anything is still draining the channel (see `jobs`). A dead
 			// worker is detected by the driver's deadline, never by this send.
+			let generation = *generation;
 			let _ = jobs.send(Box::new(move || {
-				let _ = result_tx.send(job());
+				// a panic traps this worker: retired, the next job gets a fresh one instead of
+				// waiting out a stall deadline behind it
+				if let Some(value) = super::catch_panic(job, move |_| self.retire(generation)) {
+					let _ = result_tx.send(value);
+				}
 				// Not about speed: chunk traffic already covers a job that is merely slow. This is
 				// the only event a job that asks for no chunk at all produces, so bumping here is
 				// what makes the invariant total: every job the worker takes and returns from
 				// moves the stamp at least once.
 				self.note_activity();
 			}));
-			(*generation, result_rx)
+			(generation, result_rx)
 		}
 
 		/// Drops `generation`'s sender, so the next [`submit`](Self::submit) spawns a fresh worker
