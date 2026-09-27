@@ -71,8 +71,11 @@ impl Client {
 	/// is written, so every archive the SDK writes can be extracted by it again.
 	///
 	/// The archive only becomes visible once all of it is uploaded, so a job that ends early
-	/// leaves nothing behind. It reports its progress to `callback` and can be paused, resumed
-	/// and cancelled through `control`.
+	/// leaves nothing behind. Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once;
+	/// a later one waits, reporting [`CompressPhase::WaitingForWorker`]. It reports its progress
+	/// to `callback` and can be paused, resumed and cancelled through `control`.
+	///
+	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn compress_items(
 		self: Arc<Self>,
 		sources: CompressSources,

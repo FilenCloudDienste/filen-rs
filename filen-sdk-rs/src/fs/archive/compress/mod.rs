@@ -1,5 +1,12 @@
 //! Compressing drive items into an archive in the drive. See
 //! [`Client::compress_items`](crate::auth::Client::compress_items).
+//!
+//! A compression is an archive job: up to [`ArchiveConfig::job_concurrency`] run at once, a later
+//! one waiting in [`CompressPhase::WaitingForWorker`]. A job paused while it runs keeps its slot,
+//! since its codec's state stays resident; one paused before it got a slot waits the pause out
+//! without taking one, so it never keeps a later job from running.
+//!
+//! [`ArchiveConfig::job_concurrency`]: super::ArchiveConfig::job_concurrency
 
 mod client_impl;
 pub(crate) mod codec;
