@@ -164,6 +164,8 @@ struct Setup {
 	hold_archive: bool,
 	/// Requests held once the archive is registered (a source's fetches are never held).
 	hold_after_registering: Vec<(Request, Uuid)>,
+	/// The archive settings the job runs under, whose slots jobs sharing them share.
+	config: ArchiveConfig,
 }
 
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
@@ -210,6 +212,7 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 		password: None,
 		hold_archive: false,
 		hold_after_registering: Vec::new(),
+		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 	}
 }
 
@@ -261,7 +264,7 @@ fn start_disposing(
 	});
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
-	let config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
+	let config = setup.config.clone();
 	let read_back = disposal
 		.as_ref()
 		.map(|_| ReadBack::as_extracting(&setup.entries, &config, setup.password.clone()));
@@ -1565,6 +1568,54 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	assert!(setup.backend.log().finished.is_empty());
 	assert_released(&setup, &job.reporter);
 	drop((events, result));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compress_paused_before_it_starts_takes_no_slot() {
+	let mut setup_paused = setup(|_, _| {});
+	setup_paused.config = ArchiveConfig::new(CODEC_MEM_BUDGET, 1);
+	let (pause, _cancel, control) = controls();
+	pause.send_replace(true);
+	let paused = start(&setup_paused, "paused.tgz", gzip_tar(), control, None);
+	wait_until("the job reports itself paused", || {
+		paused.reporter.is_paused()
+	})
+	.await;
+
+	// the only slot is free for a job started later
+	let mut setup_other = setup(|_, _| {});
+	setup_other.config = setup_paused.config.clone();
+	let other = start(
+		&setup_other,
+		"other.tgz",
+		gzip_tar(),
+		JobControl::default(),
+		None,
+	);
+	tokio::time::timeout(Duration::from_secs(20), other.running)
+		.await
+		.expect("the unpaused job runs")
+		.unwrap()
+		.unwrap();
+	assert!(setup_paused.backend.log().fetched.is_empty());
+	assert!(paused.reporter.is_paused());
+	assert_eq!(
+		paused.recorder.last().phase,
+		CompressPhase::WaitingForWorker
+	);
+	assert_eq!(setup_paused.config.free_slots(), 1);
+
+	pause.send_replace(false);
+	let report = paused.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 3);
+	// updates before it reached the slot's queue read running: the pause is taken up there
+	let states = run_states(&paused.recorder);
+	assert!(
+		states.ends_with(&[RunState::Paused, RunState::Running]),
+		"{states:?}"
+	);
+	assert_released(&setup_paused, &paused.reporter);
+	assert!(setup_paused.config.floor_is_free());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
