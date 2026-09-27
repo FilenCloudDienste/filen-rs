@@ -14,7 +14,10 @@
 
 use std::io::{self, Read};
 
-use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder, errors::FrameDecoderError};
+use ruzstd::decoding::{
+	BlockDecodingStrategy, FrameDecoder,
+	errors::{DecompressBlockError, FrameDecoderError},
+};
 
 use super::{
 	Budget, CodecError, Describe, Input, SKIPPABLE_FRAME_MAGIC, StreamCheck, StreamDecoder,
@@ -32,6 +35,11 @@ const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 /// entropy tables. The most measured, 0.99 MB with the ring of a 1 KiB window, is for the block
 /// holding the most sequences; Huffman literals stop at their stated size (see the tests).
 const STATE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Fails the build against a ruzstd without the vendored patch that bounds what a block decodes
+/// to, which nothing else here would notice: the budget above rests on that bound.
+const _: fn(u64) -> DecompressBlockError =
+	|at_least| DecompressBlockError::DecompressedSizeTooLarge { at_least };
 
 pub(super) struct ZstdDecoder<R> {
 	input: Input<R>,
