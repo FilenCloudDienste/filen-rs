@@ -24,7 +24,20 @@ import init, {
 	type InMemoryThumbnail,
 	type EmbeddedPreviewResult,
 	type CopyUpdate,
-	type AnyItemWithContext
+	type AnyItemWithContext,
+	type ArchiveEntry,
+	type CompressFormat,
+	type CompressUpdate,
+	type ExtractedTopLevelItem,
+	type ExtractRetry,
+	type ExtractUpdate,
+	type ListUpdate,
+	archiveDefaultName,
+	archiveEncoderMemory,
+	archiveExtension,
+	archiveFormatLevels,
+	archiveFormatOfName,
+	archiveMaxLevel
 } from "./sdk-rs.js"
 import { expect, beforeAll, test, afterAll, afterEach, vi } from "vitest"
 import { ZipReader, Uint8ArrayWriter, type Entry } from "@zip.js/zip.js"
@@ -2307,6 +2320,492 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	const again = await state.copyItems({ items: [copied as AnyItemWithContext], destination })
 	expect(again.error).toBeUndefined()
 	expect(nameOf(again.topLevel[0].item)).toBe("dir (1)")
+})
+
+/// Bytes no codec shrinks to nothing, different for every `seed`, so an archive's entries can
+/// only come back right if every byte made it through.
+function fixtureBytes(length: number, seed: number): Uint8Array<ArrayBuffer> {
+	const bytes = new Uint8Array(length)
+	let x = (seed * 2654435761 + 1) >>> 0
+	for (let i = 0; i < length; i++) {
+		x ^= x << 13
+		x ^= x >>> 17
+		x ^= x << 5
+		x >>>= 0
+		bytes[i] = x & 0xff
+	}
+	return bytes
+}
+
+/// A tree for the archive tests: `archived/notes.txt`, `archived/sub/data.bin` (a chunk and a
+/// bit) and the empty `archived/empty`.
+async function archiveSource(parent: Dir, seed: number) {
+	const root = await state.createDir(parent, "archived")
+	const sub = await state.createDir(root, "sub")
+	await state.createDir(root, "empty")
+	const notes = new TextEncoder().encode(`notes for archive ${seed}`)
+	const data = fixtureBytes(1024 * 1024 + 13, seed)
+	await state.uploadFile(notes, { parent: root, name: "notes.txt" })
+	await state.uploadFile(data, { parent: sub, name: "data.bin" })
+	return { root, notes, data }
+}
+
+type ArchiveSource = Awaited<ReturnType<typeof archiveSource>>
+
+async function childDir(parent: Dir, name: string): Promise<Dir> {
+	const dir = (await state.listDir(parent)).dirs.find(d => nameOf(d) === name)
+	if (!dir) {
+		throw new Error(`no directory ${name} in ${nameOf(parent)}`)
+	}
+	return dir
+}
+
+async function childFile(parent: Dir, name: string): Promise<File> {
+	const file = (await state.listDir(parent)).files.find(f => nameOf(f) === name)
+	if (!file) {
+		throw new Error(`no file ${name} in ${nameOf(parent)}`)
+	}
+	return file
+}
+
+/// `folder` holds `source` as extracted: its directories, and its files byte for byte.
+async function expectExtracted(folder: Dir, source: ArchiveSource) {
+	const root = await childDir(folder, "archived")
+	expect(await state.downloadFile(await childFile(root, "notes.txt"))).toStrictEqual(source.notes)
+	expect(await state.downloadFile(await childFile(await childDir(root, "sub"), "data.bin"))).toStrictEqual(source.data)
+	expect(await state.listDir(await childDir(root, "empty"))).toMatchObject({ dirs: [], files: [] })
+}
+
+async function expectRejectedWith(call: Promise<unknown>, kind: string) {
+	let error: unknown
+	try {
+		await call
+	} catch (e) {
+		error = e
+	}
+	expect(error).toBeInstanceOf(FilenSdkError)
+	expect((error as FilenSdkError).kind).toBe(kind)
+}
+
+/// The callbacks of one job, in the order they came, and how many came after its call
+/// resolved (there must be none: the SDK delivers everything a job reported first).
+function callbackLog() {
+	const log: string[] = []
+	let resolved = false
+	let late = 0
+	return {
+		log,
+		note(entry: string) {
+			late += resolved ? 1 : 0
+			log.push(entry)
+		},
+		/// Marks the call resolved, and gives a late callback the task it would run in.
+		async resolved() {
+			resolved = true
+			await new Promise(resolve => setTimeout(resolve, 0))
+			return late
+		}
+	}
+}
+
+const tarGz: CompressFormat = { type: "tar", compression: { codec: "gzip", level: 6 } }
+
+const ROUND_TRIPS: { label: string; name: string; format: CompressFormat; password?: string }[] = [
+	{ label: "tar.gz", name: "photos.tar.gz", format: tarGz },
+	{
+		label: "AES-256 zip",
+		name: "photos.zip",
+		format: { type: "zip", method: { type: "deflate", level: 6 }, encryption: "aes256" },
+		password: "zip pässword"
+	},
+	{
+		label: "7z with encrypted headers",
+		name: "photos.7z",
+		format: { type: "sevenZ", method: { type: "lzma2", level: 5 }, solid: true, encryption: "entriesAndHeaders" },
+		password: "7z password"
+	},
+	{ label: "tar.zst", name: "photos.tar.zst", format: { type: "tar", compression: { codec: "zstd" } } }
+]
+
+for (const [seed, trip] of ROUND_TRIPS.entries()) {
+	test(`${trip.label} round-trips through compressItems and extractArchive, every callback before it resolves`, async () => {
+		const parent = await state.createDir(testDir, `archive-${trip.label.replace(/\W+/g, "-")}`)
+		const source = await archiveSource(parent, seed)
+		expect(trip.name.endsWith(archiveExtension(trip.format))).toBe(true)
+
+		const compressed = callbackLog()
+		const compressUpdates: CompressUpdate[] = []
+		const report = await state.compressItems(
+			{
+				items: [source.root],
+				destination: parent,
+				name: trip.name,
+				format: trip.format,
+				onUpdate: update => {
+					compressed.note(`update:${update.phase}`)
+					compressUpdates.push(update)
+				},
+				onArchiveCreated: archive => compressed.note(`created:${nameOf(archive)}`)
+			},
+			trip.password
+		)
+		expect(await compressed.resolved()).toBe(0)
+		expect(report.error).toBeUndefined()
+		expect(report.counts.filesDone).toBe(2n)
+		const archive = report.archive!
+		expect(nameOf(archive)).toBe(trip.name)
+		// the archive is announced once it is registered, after the updates of writing it
+		const created = compressed.log.indexOf(`created:${trip.name}`)
+		expect(created).toBeGreaterThan(compressed.log.indexOf("update:compressing"))
+		expect(compressed.log.at(-1)).toBe("update:done")
+		expect(compressUpdates.at(-1)!.counts).toStrictEqual(report.counts)
+
+		const extracted = callbackLog()
+		const topLevel: ExtractedTopLevelItem[] = []
+		const extractUpdates: ExtractUpdate[] = []
+		const extractReport = await state.extractArchive(
+			{
+				archive,
+				destination: parent,
+				root: { type: "newFolder" },
+				onTopLevelCreated: items => {
+					extracted.note("topLevel")
+					topLevel.push(...items)
+				},
+				onUpdate: update => {
+					extracted.note(`update:${update.counts.dirsCreated}`)
+					extractUpdates.push(update)
+				}
+			},
+			trip.password
+		)
+		expect(await extracted.resolved()).toBe(0)
+		expect(extractReport.error).toBeUndefined()
+		expect(extractReport.failures).toHaveLength(0)
+		expect(extractReport.counts.filesDone).toBe(2n)
+		// the new folder is named after the archive, and announced before an update counts it
+		const [folder] = extractReport.topLevel
+		expect(folder.key).toStrictEqual({ type: "root" })
+		expect(nameOf(folder.item)).toBe(archiveDefaultName(trip.name))
+		expect(topLevel.map(item => item.item.uuid)).toStrictEqual([folder.item.uuid])
+		expect(extracted.log.indexOf("topLevel")).toBeLessThan(
+			extracted.log.findIndex(entry => entry !== "update:0" && entry !== "topLevel")
+		)
+		expect(extractUpdates.at(-1)!.phase).toBe("done")
+		expect(extractUpdates.at(-1)!.counts).toStrictEqual(extractReport.counts)
+		await expectExtracted(await state.getDir(folder.item.uuid), source)
+	})
+}
+
+test("an encrypted archive needs its password: none and a wrong one fail before anything is created", async () => {
+	const parent = await state.createDir(testDir, "archive-password")
+	const source = await archiveSource(parent, 11)
+	const format: CompressFormat = { type: "zip", method: { type: "deflate", level: 1 }, encryption: "aes128" }
+	// an encrypted format refuses a call without a password before anything runs
+	await expectRejectedWith(
+		state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format }),
+		"ArchivePasswordRequired"
+	)
+	// and an unencrypted one a call with a password
+	await expectRejectedWith(
+		state.compressItems({ items: [source.root], destination: parent, name: "open.tar.gz", format: tarGz }, "a password"),
+		"InvalidState"
+	)
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format }, "right horse")
+
+	const into = await state.createDir(parent, "into")
+	const missing = await state.extractArchive({ archive: archive!, destination: into, root: { type: "destination" } })
+	expect(missing.error?.kind).toBe("ArchivePasswordRequired")
+	const wrong = await state.extractArchive({ archive: archive!, destination: into, root: { type: "destination" } }, "wrong horse")
+	expect(wrong.error?.kind).toBe("ArchiveWrongPassword")
+	for (const refused of [missing, wrong]) {
+		expect(refused.topLevel).toHaveLength(0)
+		expect(refused.counts.dirsCreated + refused.counts.filesDone).toBe(0n)
+	}
+	expect(await state.listDir(into)).toMatchObject({ dirs: [], files: [] })
+
+	const right = await state.extractArchive({ archive: archive!, destination: into, root: { type: "destination" } }, "right horse")
+	expect(right.error).toBeUndefined()
+	await expectExtracted(into, source)
+})
+
+test("listArchive lists an archive's entries and checks its password", async () => {
+	const parent = await state.createDir(testDir, "archive-list")
+	const source = await archiveSource(parent, 12)
+	const format: CompressFormat = { type: "zip", method: { type: "bzip2", level: 9 }, encryption: "aes192" }
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "listed.zip", format }, "list me")
+
+	// a zip's index is readable without the password, which is checked only when given
+	const required = await state.listArchive({ archive: archive! })
+	expect(required.error).toBeUndefined()
+	expect([required.format, required.password]).toStrictEqual([{ type: "zip" }, "required"])
+	expect((await state.listArchive({ archive: archive! }, "not me")).password).toBe("wrong")
+
+	const batches: ArchiveEntry[][] = []
+	const updates: ListUpdate[] = []
+	const listed = callbackLog()
+	const listing = await state.listArchive(
+		{
+			archive: archive!,
+			onEntries: entries => {
+				listed.note("entries")
+				batches.push(entries)
+			},
+			onUpdate: update => {
+				listed.note("update")
+				updates.push(update)
+			}
+		},
+		"list me"
+	)
+	expect(await listed.resolved()).toBe(0)
+	expect(listing.password).toBe("right")
+	expect(listing.omittedEntries).toBe(0n)
+	// every entry the listing keeps came through the callback, before the update counting it
+	expect(batches.flat()).toStrictEqual(listing.entries)
+	expect(listed.log.indexOf("entries")).toBeLessThan(listed.log.lastIndexOf("update"))
+	expect(updates.at(-1)).toMatchObject({ phase: "done", entries: BigInt(listing.entries.length) })
+	const files = listing.entries.filter(entry => entry.kind.type === "file").sort((a, b) => a.storedPath.localeCompare(b.storedPath))
+	expect(files.map(entry => [entry.path, entry.size, entry.encrypted, entry.skip])).toStrictEqual([
+		["archived/notes.txt", BigInt(source.notes.length), true, undefined],
+		["archived/sub/data.bin", BigInt(source.data.length), true, undefined]
+	])
+	expect(listing.totals).toMatchObject({ files: 2n, bytes: BigInt(source.notes.length + source.data.length), skipped: 0n })
+	expect(listing.entries.every(entry => entry.id.archive === archive!.uuid)).toBe(true)
+})
+
+test("extractArchiveEntries extracts the entries chosen below a base, and one again where a failure's retry puts it", async () => {
+	const parent = await state.createDir(testDir, "archive-entries")
+	const source = await archiveSource(parent, 13)
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "chosen.tar.gz", format: tarGz })
+	const { entries } = await state.listArchive({ archive: archive! })
+	const entry = (path: string) => entries.find(e => e.path === path)!
+
+	// the chosen directory and what is below it, at its path less the base
+	const into = await state.createDir(parent, "into")
+	const report = await state.extractArchiveEntries({
+		archive: archive!,
+		entries: [entry("archived/sub").id],
+		base: "archived",
+		destination: into,
+		root: { type: "destination" }
+	})
+	expect(report.error).toBeUndefined()
+	const { dirs, files } = await state.listDir(into)
+	expect([dirs.map(nameOf), files]).toStrictEqual([["sub"], []])
+	expect(await state.downloadFile(await childFile(dirs[0], "data.bin"))).toStrictEqual(source.data)
+
+	// a failure's retry names the directory nearest it that the extract created, and that
+	// directory's path in the archive: the entry lands there again, beside what is in its way
+	const retry: ExtractRetry = { destination: dirs[0].uuid, base: "archived/sub" }
+	const again = await state.extractArchiveEntries({
+		archive: archive!,
+		entries: [entry("archived/sub/data.bin").id],
+		base: retry.base,
+		destination: await state.getDir(retry.destination),
+		root: { type: "destination" }
+	})
+	expect(again.error).toBeUndefined()
+	expect(again.renamed.map(renamed => [renamed.name, renamed.reason])).toStrictEqual([["data (1).bin", "duplicateName"]])
+
+	// a tar's entry not below the base fails the extract once it is reached, with its report
+	const outside = await state.extractArchiveEntries({
+		archive: archive!,
+		entries: [entry("archived/notes.txt").id],
+		base: "archived/sub",
+		destination: into,
+		root: { type: "destination" }
+	})
+	expect(outside.error).toBeDefined()
+	expect(outside.counts.filesDone).toBe(0n)
+})
+
+test("compressItems and extractArchive pause, resume and cancel through managedFuture", async () => {
+	const parent = await state.createDir(testDir, "archive-controls")
+	const source = await state.createDir(parent, "big")
+	for (let i = 0; i < 4; i++) {
+		await state.uploadFile(fixtureBytes(2 * 1024 * 1024, 20 + i), { parent: source, name: `part-${i}.bin` })
+	}
+	const format: CompressFormat = { type: "tar" }
+
+	// paused once it compresses, then resumed
+	const pauseSignal = new PauseSignal()
+	let pausedOnce = false
+	const updates: CompressUpdate[] = []
+	const paused = state.compressItems({
+		items: [source],
+		destination: parent,
+		name: "paused.tar",
+		format,
+		onUpdate: update => {
+			updates.push(update)
+			if (update.phase === "compressing" && !pausedOnce) {
+				pausedOnce = true
+				pauseSignal.pause()
+			}
+		},
+		managedFuture: { pauseSignal }
+	})
+	await vi.waitFor(
+		() => {
+			expect(updates.some(update => update.runState === "paused")).toBe(true)
+		},
+		{ timeout: cap(60_000), interval: 100 }
+	)
+	pauseSignal.resume()
+	const resumed = await paused
+	expect(resumed.error).toBeUndefined()
+	expect(resumed.counts.filesDone).toBe(4n)
+	// a paused job reads nothing: every update while it was paused counts the same bytes
+	const whilePaused = updates.filter(update => update.runState === "paused")
+	expect(new Set(whilePaused.map(update => update.counts.bytesRead)).size).toBe(1)
+
+	// aborted while it compresses: nothing is left behind, and the report says why it ended
+	const controller = new AbortController()
+	const cancelled = await state.compressItems({
+		items: [source],
+		destination: parent,
+		name: "cancelled.tar",
+		format,
+		onUpdate: update => {
+			if (update.phase === "compressing") {
+				controller.abort()
+			}
+		},
+		managedFuture: { abortSignal: controller.signal }
+	})
+	expect(cancelled.error?.kind).toBe("Cancelled")
+	expect(cancelled.archive).toBeUndefined()
+	expect((await state.listDir(parent)).files.map(nameOf)).toStrictEqual(["paused.tar"])
+
+	// an extract aborted once its folder exists keeps what it created, and counts the rest
+	const extractController = new AbortController()
+	const extractUpdates: ExtractUpdate[] = []
+	const stopped = await state.extractArchive({
+		archive: resumed.archive!,
+		destination: parent,
+		root: { type: "newFolder", name: "stopped" },
+		onTopLevelCreated: () => extractController.abort(),
+		onUpdate: update => extractUpdates.push(update),
+		managedFuture: { abortSignal: extractController.signal }
+	})
+	expect(stopped.error?.kind).toBe("Cancelled")
+	expect(stopped.topLevel.map(item => nameOf(item.item))).toStrictEqual(["stopped"])
+	expect(extractUpdates.at(-1)!.phase).toBe("cancelled")
+	expect(extractUpdates.at(-1)!.counts).toStrictEqual(stopped.counts)
+})
+
+test("sources go to the trash once their archive is verified, an extracted archive for good", async () => {
+	const parent = await state.createDir(testDir, "archive-dispose")
+	const source = await archiveSource(parent, 14)
+	const updates: CompressUpdate[] = []
+	const report = await state.compressItems({
+		items: [source.root],
+		destination: parent,
+		name: "disposed.tar.gz",
+		format: tarGz,
+		dispose: "trash",
+		onUpdate: update => updates.push(update)
+	})
+	expect(report.error).toBeUndefined()
+	const trashed = { uuid: source.root.uuid, outcome: { type: "disposed", how: "trash", bytesFreed: 0n } }
+	expect(report.dispositions).toStrictEqual([trashed])
+	expect(updates.flatMap(update => update.events).filter(event => event.type === "sourceDisposition")).toStrictEqual([
+		{ type: "sourceDisposition", ...trashed }
+	])
+	// trashing reads nothing back: the sources can be restored
+	expect(report.counts.bytesVerified).toBe(0n)
+	expect((await state.getDir(source.root.uuid)).parent).toBe("trash")
+
+	// the archive, extracted and verified, is deleted for good
+	const archive = report.archive!
+	const extracted = await state.extractArchive({
+		archive,
+		destination: parent,
+		root: { type: "newFolder" },
+		dispose: "deletePermanently"
+	})
+	expect(extracted.error).toBeUndefined()
+	expect(extracted.dispositions).toStrictEqual([
+		{ uuid: archive.uuid, outcome: { type: "disposed", how: "deletePermanently", bytesFreed: archive.size } }
+	])
+	await expectExtracted(await state.getDir(extracted.topLevel[0].item.uuid), source)
+
+	// a brotli stream carries no checksum, so nothing confirms what it held and it is kept; a
+	// single compressed file ignores newFolder and lands in the destination itself
+	const note = await state.uploadFile(new TextEncoder().encode("a note on its own"), { parent, name: "note.txt" })
+	const { archive: single } = await state.compressItems({
+		items: [note],
+		destination: parent,
+		name: "note.txt.br",
+		format: { type: "single", compression: { codec: "brotli" } }
+	})
+	expect(archiveFormatOfName("note.txt.br")).toStrictEqual({ type: "single", codec: "brotli" })
+	const kept = await state.extractArchive({
+		archive: single!,
+		destination: parent,
+		root: { type: "newFolder", name: "Notes" },
+		dispose: "trash"
+	})
+	expect(kept.error).toBeUndefined()
+	expect(kept.dispositions).toStrictEqual([
+		{ uuid: single!.uuid, outcome: { type: "kept", reason: { type: "unconfirmed" }, bytesFreed: 0n } }
+	])
+	expect(kept.topLevel.map(item => [item.item.type, nameOf(item.item)])).toStrictEqual([["file", "note (1).txt"]])
+})
+
+test("extractArchive reads an archive from a public link, called without a single callback", async () => {
+	const parent = await state.createDir(testDir, "archive-link")
+	const source = await archiveSource(parent, 15)
+	const { archive } = await state.compressItems({
+		items: [source.root],
+		destination: parent,
+		name: "linked.tar.xz",
+		format: { type: "tar", compression: { codec: "xz", level: 1 } }
+	})
+	const link = await state.publicLinkFile(archive!)
+	const linked = await unauthClient.getLinkedFile(link.linkUuid, getFileMeta(archive!.meta)!.key, null)
+
+	const listing = await state.listArchive({ archive: linked })
+	expect(listing.format).toStrictEqual({ type: "tar", codec: "xz" })
+	const report = await state.extractArchive({ archive: linked, destination: parent, root: { type: "newFolder", name: "from-link" } })
+	expect(report.error).toBeUndefined()
+	expect(nameOf(report.topLevel[0].item)).toBe("from-link")
+	await expectExtracted(await state.getDir(report.topLevel[0].item.uuid), source)
+	// a linked archive is not the user's to remove
+	await expectRejectedWith(
+		state.extractArchive({ archive: linked, destination: parent, root: { type: "destination" }, dispose: "trash" }),
+		"InvalidState"
+	)
+})
+
+test("the archive helpers name formats, their levels, what fits and what a name holds", () => {
+	const zip: CompressFormat = { type: "zip", method: { type: "deflate", level: 6 }, encryption: "aes256" }
+	expect(archiveExtension(zip)).toBe(".zip")
+	expect(archiveExtension({ type: "tar", compression: { codec: "zstd" } })).toBe(".tar.zst")
+	expect(archiveExtension({ type: "single", compression: { codec: "gzip" } })).toBe(".gz")
+	expect(archiveFormatLevels(zip)).toStrictEqual({ min: 1, max: 9 })
+	expect(archiveFormatLevels({ type: "tar", compression: { codec: "zstd" } })).toStrictEqual({ min: 1, max: 1 })
+	expect(archiveFormatLevels({ type: "tar" })).toBeUndefined()
+	expect(archiveEncoderMemory({ type: "tar" })).toBe(0n)
+	// a level the format does not take is refused
+	expect(() => archiveEncoderMemory({ type: "zip", method: { type: "deflate", level: 10 } })).toThrow()
+
+	// the web's default budget runs LZMA2 up to level 6 (level 7 needs about 193 MiB)
+	const budget = state.archiveCodecMemBudget()
+	expect(budget).toBe(128n << 20n)
+	const lzma2 = (level: number): CompressFormat => ({ type: "sevenZ", method: { type: "lzma2", level }, solid: true })
+	const max = archiveMaxLevel(lzma2(9), budget)
+	expect(max).toBe(6)
+	expect(archiveEncoderMemory(lzma2(max!))).toBeLessThanOrEqual(budget)
+	expect(archiveEncoderMemory(lzma2(max! + 1))).toBeGreaterThan(budget)
+
+	expect(archiveDefaultName("photos.tar.gz")).toBe("photos")
+	expect(archiveDefaultName("photos.TGZ")).toBe("photos")
+	expect(archiveFormatOfName("photos.tgz")).toStrictEqual({ type: "tar", codec: "gzip" })
+	expect(archiveFormatOfName("photos.tar")?.type).toBe("tar")
+	expect(archiveFormatOfName("photos.7z")).toStrictEqual({ type: "sevenZ" })
+	expect(archiveFormatOfName("notes.txt")).toBeUndefined()
 })
 
 afterAll(async () => {
