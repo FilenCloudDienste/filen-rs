@@ -99,6 +99,11 @@ const CHUNKS_PER_FILE: usize = 4;
 /// Chunks of the archive fetched ahead of the codec, memory permitting.
 const PREFETCH_CHUNKS: usize = 4;
 
+/// Directories planned and not created yet past which the codec is kept waiting: an archive
+/// naming directories faster than they are created (each entry can imply 256) has them planned
+/// only as fast as they are created.
+const MAX_UNCREATED_DIRS: usize = 16 * MAX_SMALL_PARALLEL_REQUESTS;
+
 /// What the codec returns.
 pub(crate) type CodecResult = Result<ArchiveEnd, Error>;
 
@@ -236,6 +241,8 @@ struct Driver<B: DriveBackend> {
 	/// The destination listing could not name every item.
 	unverified: bool,
 	dirs: Vec<DirSlot>,
+	/// Directories planned and neither created nor failed.
+	uncreated_dirs: usize,
 	ready_dirs: VecDeque<DirId>,
 	dir_creates:
 		FuturesUnordered<MaybeSendBoxFuture<'static, (DirId, Result<CreatedDirOutcome, DirError>)>>,
@@ -377,6 +384,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		into_destination: false,
 		unverified: false,
 		dirs: Vec::new(),
+		uncreated_dirs: 0,
 		ready_dirs: VecDeque::new(),
 		dir_creates: FuturesUnordered::new(),
 		files: HashMap::new(),
@@ -590,8 +598,11 @@ impl<B: DisposalBackend> Driver<B> {
 				self.finalize_ready();
 				continue;
 			}
-			let take_events =
-				!stopping && !pause_requested && self.held.is_none() && !self.events_closed;
+			let take_events = !stopping
+				&& !pause_requested
+				&& self.held.is_none()
+				&& !self.backlogged()
+				&& !self.events_closed;
 			let await_result = self.events_closed && self.codec_result.is_none() && !stopping;
 
 			tokio::select! {
@@ -636,6 +647,11 @@ impl<B: DisposalBackend> Driver<B> {
 			&& self.held.is_none()
 			&& self.files.is_empty()
 			&& self.codec_result.is_some()
+	}
+
+	/// Whether the codec waits for what it sent so far to be worked off first.
+	fn backlogged(&self) -> bool {
+		self.uncreated_dirs >= MAX_UNCREATED_DIRS
 	}
 
 	fn idle(&self) -> bool {
@@ -781,7 +797,8 @@ impl<B: DisposalBackend> Driver<B> {
 		let stamp = self.link.shared.progress();
 		// frozen while the driver owes the codec something: an answer, room for an event, or
 		// the end of a pause
-		let owed = self.ask.is_some() || self.held.is_some() || pause_requested;
+		let owed =
+			self.ask.is_some() || self.held.is_some() || self.backlogged() || pause_requested;
 		if owed || stamp != self.stamp || self.codec_result.is_some() {
 			self.stamp = stamp;
 			self.stalled_ticks = 0;
@@ -1133,6 +1150,18 @@ impl<B: DisposalBackend> Driver<B> {
 			if !self.count_item() {
 				return None;
 			}
+			// every planned directory is kept for the whole job, and one entry can imply 256:
+			// they are capped like members, before they cost more
+			if self.dirs.len() as u64 > self.config.max_members {
+				self.stop_with(Error::custom(
+					ErrorKind::ArchiveTooLarge,
+					format!(
+						"the archive names more than {} directories",
+						self.config.max_members
+					),
+				));
+				return None;
+			}
 			debug_assert_eq!(id, self.dirs.len());
 			if renamed {
 				let path = joined(&segments[..self.depth(parent) + 1]);
@@ -1146,8 +1175,9 @@ impl<B: DisposalBackend> Driver<B> {
 				}
 				DirState::Planned | DirState::Creating => DirState::Planned,
 			};
-			if let DirState::Failed(_) = state {
-				self.reporter.dir_failed(None);
+			match state {
+				DirState::Failed(_) => self.reporter.dir_failed(None),
+				_ => self.uncreated_dirs += 1,
 			}
 			self.dirs[parent].children.push(id);
 			self.dirs.push(DirSlot {
@@ -1223,6 +1253,7 @@ impl<B: DisposalBackend> Driver<B> {
 					.dir_created(created.uuid(), parent, name.as_ref());
 				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
 				self.dirs[dir].state = DirState::Created(created.uuid());
+				self.uncreated_dirs -= 1;
 				self.ready_dirs
 					.extend(self.dirs[dir].children.iter().copied());
 				if self.dirs[dir].parent == ROOT && self.into_destination {
@@ -1266,6 +1297,9 @@ impl<B: DisposalBackend> Driver<B> {
 		while let Some(dir) = stack.pop() {
 			if dir != root {
 				self.reporter.dir_failed(None);
+			}
+			if matches!(self.dirs[dir].state, DirState::Planned | DirState::Creating) {
+				self.uncreated_dirs -= 1;
 			}
 			self.dirs[dir].state = DirState::Failed(Arc::clone(error));
 			stack.extend(self.dirs[dir].children.iter().copied());

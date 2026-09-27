@@ -538,6 +538,74 @@ async fn the_limits_end_the_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directories_implied_past_the_member_cap_end_the_job() {
+	// few directory members, each deep below a path of its own: far more directories than
+	// members
+	let depth = 25;
+	let paths: Vec<String> = (0..100)
+		.map(|member| {
+			(0..depth)
+				.map(|level| format!("m{member}l{level}/"))
+				.collect()
+		})
+		.collect();
+	let members: Vec<(&str, &[u8])> = paths.iter().map(|path| (path.as_str(), &b""[..])).collect();
+	let setup = setup("bomb.tar", tar_of(&members), |_| {});
+	let job = start(&setup, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
+	assert!(
+		created_dirs(&setup).len() <= MAX_MEMBERS as usize + 1,
+		"no more directories than the cap, besides the new folder"
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn directories_are_planned_only_as_fast_as_they_are_created() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		backend
+			.slow
+			.insert("blocked".to_owned(), Duration::from_secs(3600));
+	});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	let below = MAX_UNCREATED_DIRS + 10;
+	let entry = |ordinal: usize| match ordinal {
+		0 => dir_entry(0, "blocked"),
+		_ => dir_entry(ordinal as u64, &format!("blocked/d{ordinal:04}")),
+	};
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	// longer than a silent codec is given, which a waiting one must not be taken for
+	let wait = 2 * ARCHIVE_STALL_TIMEOUT;
+	let mut taken = None;
+	for ordinal in 0..=below {
+		if tokio::time::timeout(wait, events.send(entry(ordinal)))
+			.await
+			.is_err()
+		{
+			taken.get_or_insert(ordinal);
+			// once `blocked` is created, the rest are taken as they are created
+			events.send(entry(ordinal)).await.unwrap();
+		}
+	}
+	// `blocked` and the directories below it up to the backlog, and one more in the channel
+	assert_eq!(
+		taken,
+		Some(MAX_UNCREATED_DIRS + 1),
+		"the codec waits for the directories"
+	);
+	drop(events);
+	let _ = result.send(read_in_full());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.dirs_created, below as u64 + 2);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 	let tar = tar_of(&[
 		("done.txt", b"done"),
