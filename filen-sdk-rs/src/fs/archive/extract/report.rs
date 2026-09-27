@@ -165,6 +165,8 @@ pub enum ExtractRenameReason {
 	PathRewritten,
 }
 
+/// An entry created under another name than the archive gives it; recorded once it is created,
+/// with the name it got then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct ExtractRenamedEntry {

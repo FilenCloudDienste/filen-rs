@@ -27,8 +27,8 @@ pub(crate) struct PlannedDir {
 	pub(crate) id: DirId,
 	pub(crate) parent: DirId,
 	pub(crate) name: ValidatedName,
-	/// Whether `name` is a keep-both name rather than the one the archive gave it.
-	pub(crate) renamed: bool,
+	/// The name the archive gave it, when `name` is a keep-both name instead.
+	pub(crate) archive_name: Option<ValidatedName>,
 }
 
 struct Node {
@@ -80,7 +80,7 @@ impl PathResolver {
 			planned.push(PlannedDir {
 				id,
 				parent: current,
-				renamed: name.as_ref() != segment.as_ref(),
+				archive_name: (name.as_ref() != segment.as_ref()).then(|| segment.clone()),
 				name,
 			});
 			current = id;
@@ -190,14 +190,17 @@ mod tests {
 	}
 
 	#[test]
-	fn a_rename_is_flagged() {
+	fn a_renamed_directory_keeps_the_archives_name() {
 		let mut resolver = PathResolver::new(["a"]);
 		let mut planned = Vec::new();
 		resolver.resolve_dirs(&names("a"), &mut planned).unwrap();
 		resolver.resolve_dirs(&names("b"), &mut planned).unwrap();
 		assert_eq!(
-			planned.iter().map(|p| p.renamed).collect::<Vec<_>>(),
-			[true, false]
+			planned
+				.iter()
+				.map(|p| p.archive_name.as_ref().map(AsRef::as_ref))
+				.collect::<Vec<_>>(),
+			[Some("a"), None]
 		);
 	}
 }

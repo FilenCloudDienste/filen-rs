@@ -410,6 +410,35 @@ async fn extracts_a_compressed_tar_into_a_new_folder() {
 	assert_released(&setup, &job.reporter);
 }
 
+/// The report's renames as path, name and reason, sorted: they are recorded as entries finish.
+fn renames(report: &ExtractReport) -> Vec<(&str, &str, ExtractRenameReason)> {
+	let mut renames: Vec<_> = report
+		.renamed
+		.iter()
+		.map(|r| (r.path.as_str(), r.name.as_str(), r.reason))
+		.collect();
+	renames.sort_by_key(|(path, ..)| *path);
+	renames
+}
+
+/// The report's failures as path, name it was to get, stage and error kind, sorted.
+fn failures(report: &ExtractReport) -> Vec<(&str, &str, ExtractStage, ErrorKind)> {
+	let mut failures: Vec<_> = report
+		.failures
+		.iter()
+		.map(|f| {
+			(
+				f.path.as_str(),
+				f.dest_name.as_str(),
+				f.stage,
+				f.error.kind(),
+			)
+		})
+		.collect();
+	failures.sort_by_key(|(path, ..)| *path);
+	failures
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracting_into_the_destination_keeps_both() {
 	let tar = tar_of(&[
@@ -435,13 +464,8 @@ async fn extracting_into_the_destination_keeps_both() {
 		finished_paths(&setup),
 		["docs (1)/x.txt", "other.txt", "readme (1).txt"]
 	);
-	let renamed: Vec<(&str, &str, ExtractRenameReason)> = report
-		.renamed
-		.iter()
-		.map(|r| (r.path.as_str(), r.name.as_str(), r.reason))
-		.collect();
 	assert_eq!(
-		renamed,
+		renames(&report),
 		[
 			("docs", "docs (1)", ExtractRenameReason::DuplicateName),
 			(
@@ -464,6 +488,51 @@ async fn extracting_into_the_destination_keeps_both() {
 	assert_eq!(
 		top[1..].iter().copied().collect::<HashSet<_>>(),
 		HashSet::from([id(1), id(2)])
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
+	let tar = tar_of(&[("docs/x.txt", b"x"), ("docs/sub/y.txt", b"y")]);
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend.listed = ListedNames {
+			names: vec!["docs".into()],
+			unverified: false,
+		};
+		// the keep-both name picked from the listing was taken since
+		backend.merge_once.lock().unwrap().insert("docs (1)".into());
+		backend.fail_create.insert("sub".into(), ErrorKind::Server);
+	});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+
+	assert_eq!(finished_paths(&setup), ["docs (2)/x.txt"]);
+	assert_eq!(
+		renames(&report),
+		[("docs", "docs (2)", ExtractRenameReason::DuplicateName)]
+	);
+	// by where they are in the archive, not the names they were to be created under
+	assert_eq!(
+		failures(&report),
+		[
+			(
+				"docs/sub",
+				"sub",
+				ExtractStage::CreateDirectory,
+				ErrorKind::Server
+			),
+			(
+				"docs/sub/y.txt",
+				"y.txt",
+				ExtractStage::CreateDirectory,
+				ErrorKind::Server
+			),
+		]
 	);
 	assert_released(&setup, &job.reporter);
 }

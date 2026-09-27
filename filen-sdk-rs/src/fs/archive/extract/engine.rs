@@ -142,7 +142,10 @@ enum DirState {
 struct DirSlot {
 	uuid: Uuid,
 	parent: DirId,
+	/// The name it is created under.
 	name: ValidatedName,
+	/// The name the archive gave it, when `name` is a keep-both name instead.
+	archive_name: Option<ValidatedName>,
 	created: DateTime<Utc>,
 	/// The entry that named it first.
 	entry: ArchiveEntryId,
@@ -177,6 +180,15 @@ struct FileSlot<U> {
 	ended: bool,
 	finalizing: bool,
 	failed: bool,
+}
+
+impl<U> FileSlot<U> {
+	/// The name the archive gives it: the last segment of its path.
+	fn archive_name(&self) -> &str {
+		self.path
+			.rsplit_once('/')
+			.map_or(&*self.path, |(_, name)| name)
+	}
 }
 
 /// A file entry, as [`Driver::open_file`] takes it.
@@ -430,6 +442,40 @@ fn worker_died() -> Error {
 		ErrorKind::ArchiveWorkerDied,
 		"the archive's codec stopped responding",
 	)
+}
+
+/// Records `failure` in `report`; the event's copy of it, while the report keeps records.
+fn record_failure(report: &mut ExtractReport, failure: ExtractFailure) -> Option<ExtractFailure> {
+	keep(
+		&mut report.failures,
+		&mut report.omitted.failures,
+		failure.clone(),
+	)
+	.then_some(failure)
+}
+
+/// Records `file` as failed at `stage`, in `report` and as an event.
+fn report_file_failure<U>(
+	report: &mut ExtractReport,
+	reporter: &Reporter,
+	file: &FileSlot<U>,
+	stage: ExtractStage,
+	error: Arc<Error>,
+) {
+	let failure = ExtractFailure {
+		entry: file.entry,
+		path: file.path.clone(),
+		dest_parent: file.active.dest_parent,
+		dest_name: file.name.as_ref().to_owned(),
+		stage,
+		error,
+	};
+	let bytes = file.active.size.unwrap_or(file.written);
+	reporter.file_failed(
+		Some(file.active.dest_uuid),
+		bytes,
+		record_failure(report, failure),
+	);
 }
 
 fn joined(segments: &[ValidatedName]) -> String {
@@ -939,6 +985,7 @@ impl<B: DisposalBackend> Driver<B> {
 			uuid: root_uuid,
 			parent: ROOT,
 			name: ValidatedName::try_from("root").expect("a valid name"),
+			archive_name: None,
 			created: Utc::now(),
 			entry: root_entry,
 			state: DirState::Created(root_uuid),
@@ -1148,7 +1195,7 @@ impl<B: DisposalBackend> Driver<B> {
 			id,
 			parent,
 			name,
-			renamed,
+			archive_name,
 		} in planned
 		{
 			if !self.count_item() {
@@ -1167,10 +1214,6 @@ impl<B: DisposalBackend> Driver<B> {
 				return None;
 			}
 			debug_assert_eq!(id, self.dirs.len());
-			if renamed {
-				let path = joined(&segments[..self.depth(parent) + 1]);
-				self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
-			}
 			let state = match &self.dirs[parent].state {
 				DirState::Failed(error) => DirState::Failed(Arc::clone(error)),
 				DirState::Created(_) => {
@@ -1188,6 +1231,7 @@ impl<B: DisposalBackend> Driver<B> {
 				uuid: Uuid::new_v4(),
 				parent,
 				name,
+				archive_name,
 				// Filen directories keep a creation time only; the archive's modification time
 				// is the closest it has
 				created: if id == dir {
@@ -1201,16 +1245,6 @@ impl<B: DisposalBackend> Driver<B> {
 			});
 		}
 		Some(dir)
-	}
-
-	/// How many directories below the root `dir` is.
-	fn depth(&self, mut dir: DirId) -> usize {
-		let mut depth = 0;
-		while dir != ROOT {
-			dir = self.dirs[dir].parent;
-			depth += 1;
-		}
-		depth
 	}
 
 	fn start_dir(&mut self, dir: DirId) {
@@ -1247,10 +1281,12 @@ impl<B: DisposalBackend> Driver<B> {
 				propagation_errors,
 			}) => {
 				self.report_propagation(created.uuid(), propagation_errors);
+				// one record, with the name it got in the end (a keep-both name the resolver
+				// picked, then possibly another the destination turned out to need)
 				let slot = &self.dirs[dir];
-				let (entry, planned) = (slot.entry, slot.name.clone());
-				if name.as_ref() != planned.as_ref() {
-					let path = self.dir_path(dir);
+				let entry = slot.entry;
+				if name.as_ref() != slot.archive_name.as_ref().unwrap_or(&slot.name).as_ref() {
+					let path = self.archive_path(dir);
 					self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
 				}
 				self.reporter
@@ -1278,18 +1314,14 @@ impl<B: DisposalBackend> Driver<B> {
 				self.note_error(&error);
 				let failure = ExtractFailure {
 					entry: self.dirs[dir].entry,
-					path: self.dir_path(dir),
+					path: self.archive_path(dir),
 					dest_parent: parent,
 					dest_name: self.dirs[dir].name.as_ref().to_owned(),
 					stage: ExtractStage::CreateDirectory,
 					error: Arc::clone(&error),
 				};
-				let kept = keep(
-					&mut self.report.failures,
-					&mut self.report.omitted.failures,
-					failure.clone(),
-				);
-				self.reporter.dir_failed(kept.then_some(failure));
+				self.reporter
+					.dir_failed(record_failure(&mut self.report, failure));
 				self.fail_subtree(dir, &error);
 			}
 		}
@@ -1323,12 +1355,13 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	/// A directory's path, as the names it is created under.
-	fn dir_path(&self, mut dir: DirId) -> String {
+	/// A directory's path in the archive, as drive names.
+	fn archive_path(&self, mut dir: DirId) -> String {
 		let mut names = Vec::new();
 		while dir != ROOT {
-			names.push(self.dirs[dir].name.as_ref());
-			dir = self.dirs[dir].parent;
+			let slot = &self.dirs[dir];
+			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).as_ref());
+			dir = slot.parent;
 		}
 		names.reverse();
 		names.join("/")
@@ -1349,18 +1382,9 @@ impl<B: DisposalBackend> Driver<B> {
 			.as_mut()
 			.expect("entries follow the archive's layout")
 			.file_name(parent, name.clone());
+		// a keep-both name is reported once the file is registered, under the name it got then
 		let name = match allocated {
-			Ok(allocated) => {
-				if allocated.as_ref() != name.as_ref() {
-					self.renamed(
-						entry,
-						path.clone(),
-						&allocated,
-						ExtractRenameReason::DuplicateName,
-					);
-				}
-				allocated
-			}
+			Ok(allocated) => allocated,
 			Err(error) => {
 				self.stop_with(error.into());
 				return;
@@ -1499,23 +1523,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.get_mut(&ordinal)
 			.expect("a failed file is known");
 		file.failed = true;
-		let failure = ExtractFailure {
-			entry: file.entry,
-			path: file.path.clone(),
-			dest_parent: file.active.dest_parent,
-			dest_name: file.name.as_ref().to_owned(),
-			stage,
-			error,
-		};
-		let dest_uuid = file.active.dest_uuid;
-		let bytes = file.active.size.unwrap_or(file.written);
-		let kept = keep(
-			&mut self.report.failures,
-			&mut self.report.omitted.failures,
-			failure.clone(),
-		);
-		self.reporter
-			.file_failed(Some(dest_uuid), bytes, kept.then_some(failure));
+		report_file_failure(&mut self.report, &self.reporter, file, stage, error);
 	}
 
 	/// Registers the files whose data is all up and whose directory exists, as many at once as
@@ -1612,7 +1620,7 @@ impl<B: DisposalBackend> Driver<B> {
 				propagation_errors,
 			}) => {
 				self.report_propagation(registered.uuid(), propagation_errors);
-				if name.as_ref() != file.name.as_ref() {
+				if name.as_ref() != file.archive_name() {
 					self.renamed(
 						file.entry,
 						file.path.clone(),
@@ -1641,25 +1649,25 @@ impl<B: DisposalBackend> Driver<B> {
 				propagation_errors,
 			}) => {
 				self.report_propagation(registered.uuid(), propagation_errors);
-				self.files.insert(ordinal, file);
-				self.fail_file(
-					ordinal,
-					ExtractStage::RegisteredAsVersion {
-						existing_file: registered.stable_uuid.into(),
-					},
-					Arc::new(Error::custom(
-						ErrorKind::InvalidState,
-						"the entry was registered as a new version of an existing file",
-					)),
+				let error = Error::custom(
+					ErrorKind::InvalidState,
+					"the entry was registered as a new version of an existing file",
 				);
-				self.files.remove(&ordinal);
+				let stage = ExtractStage::RegisteredAsVersion {
+					existing_file: registered.stable_uuid.into(),
+				};
+				report_file_failure(&mut self.report, &self.reporter, &file, stage, error.into());
 			}
 			Err(FinalizeError::Failed(error)) => {
 				let error = Arc::new(error);
 				self.note_error(&error);
-				self.files.insert(ordinal, file);
-				self.fail_file(ordinal, ExtractStage::Finalize, error);
-				self.files.remove(&ordinal);
+				report_file_failure(
+					&mut self.report,
+					&self.reporter,
+					&file,
+					ExtractStage::Finalize,
+					error,
+				);
 			}
 		}
 	}
