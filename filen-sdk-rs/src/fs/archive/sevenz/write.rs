@@ -305,7 +305,10 @@ impl<W: Write> SevenZWriter<W> {
 					salt: salt.to_vec(),
 					iv: [0; 16],
 				};
-				// 2^19 rounds take about a second: nothing to show progress for
+				// 2^19 rounds hash the salted password that many times: 13 MiB for a short one,
+				// 2 GiB for the longest (1024 characters outside the BMP, 4 KiB of UTF-16), a
+				// second or two natively and some 15 s on wasm. That stays well inside the stall
+				// timeout, so no progress is shown, and a cancel waits for the key
 				let key = derive_key(password, &props, &mut || Ok(())).map_err(io::Error::other)?;
 				Some(Encryption {
 					key,

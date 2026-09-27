@@ -248,9 +248,9 @@ fn start_with(
 	}
 }
 
-/// Runs the real codec on its own thread.
-fn start(setup: &Setup, options: Options) -> Job {
-	let job = StreamJob {
+/// What the real codec is given for `setup`'s archive.
+fn stream_job(setup: &Setup, password: Option<ArchivePassword>) -> StreamJob {
+	StreamJob {
 		name: setup.archive.name().unwrap().to_owned(),
 		len: setup.archive.size(),
 		limits: CodecLimits {
@@ -260,8 +260,13 @@ fn start(setup: &Setup, options: Options) -> Job {
 			max_index_bytes: 32 << 20,
 			max_bytes: options.max_bytes,
 		},
-		password: options.password.clone(),
-	};
+		password,
+	}
+}
+
+/// Runs the real codec on its own thread.
+fn start(setup: &Setup, options: Options) -> Job {
+	let job = stream_job(setup, options.password.clone());
 	start_with(
 		setup,
 		options,
@@ -1636,6 +1641,72 @@ async fn a_7z_with_a_wrong_password_creates_nothing() {
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
 	assert!(created_dirs(&setup).is_empty());
 	assert!(finished(&setup).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
+	// the longest password there is, in UTF-16 surrogate pairs: 4 KiB hashed 2^22 times, most of
+	// a minute on wasm and seconds here
+	let password = "\u{1F600}".repeat(1024);
+	let mut archive = sevenz_of(&[("a.txt", Some(b"a"))], Some(&password));
+	// written at 2^4 rounds to be quick to make; the header key is read at 2^22. Its AES coder's
+	// properties sit in the plain part of the header: the rounds, then salt and IV
+	let aes = [0x06, 0xF1, 0x07, 0x01, 34, 0xC0 | 4, 0xFF];
+	let at = archive
+		.windows(aes.len())
+		.rposition(|window| window == aes)
+		.expect("the header's AES coder");
+	archive[at + 5] = 0xC0 | crate::fs::archive::sevenz::crypto::MAX_CYCLES_POWER;
+	// the start header's CRC-32 of the header, then its own
+	let next = 32 + u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
+	let len = u64::from_le_bytes(archive[20..28].try_into().unwrap()) as usize;
+	let crc = crc32fast::hash(&archive[next..next + len]);
+	archive[28..32].copy_from_slice(&crc.to_le_bytes());
+	let crc = crc32fast::hash(&archive[12..32]);
+	archive[8..12].copy_from_slice(&crc.to_le_bytes());
+
+	let setup = setup("slow.7z", archive, |_| {});
+	let (_pause, cancel, control) = controls();
+	let codec = Arc::new(Mutex::new(None));
+	let job = {
+		let codec = Arc::clone(&codec);
+		let job = stream_job(&setup, Some(ArchivePassword::new(password).unwrap()));
+		start_with(
+			&setup,
+			Options {
+				control,
+				..Options::default()
+			},
+			Box::new(move || {
+				let link = worker::start(move |port| extract_stream(&port, job))?;
+				*codec.lock().unwrap() = Some(Arc::clone(&link.shared));
+				Ok(link)
+			}),
+		)
+	};
+	let shared = loop {
+		if let Some(shared) = codec.lock().unwrap().take() {
+			break shared;
+		}
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	};
+	// the codec shows it is alive while it derives, which exchanges nothing with the driver
+	while shared.progress() < 10 {
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	// and stops deriving once the job ended: its thread lets go of what it shared
+	let stopped = tokio::time::Instant::now();
+	while Arc::strong_count(&shared) > 1 {
+		assert!(
+			stopped.elapsed() < Duration::from_secs(2),
+			"the codec is still deriving the key"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	assert!(created_dirs(&setup).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
