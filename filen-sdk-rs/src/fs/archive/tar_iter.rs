@@ -239,7 +239,12 @@ impl<R: Read> TarReader<R> {
 	}
 
 	fn skip_rest(&mut self) -> Result<(), TarError> {
-		let rest = self.remaining + self.padding;
+		// a member size near u64::MAX (PAX, or GNU base-256) must not wrap to a short skip,
+		// which would read the member's data as headers other tools never see
+		let rest = self
+			.remaining
+			.checked_add(self.padding)
+			.ok_or(TarError::Corrupt("a member's size is out of range"))?;
 		self.remaining = 0;
 		self.padding = 0;
 		let skipped = io::copy(&mut (&mut self.inner).take(rest), &mut io::sink())?;

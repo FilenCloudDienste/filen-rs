@@ -39,15 +39,15 @@ const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ZipMethod {
+	/// The data as it is. Every entry ends in a data descriptor (its CRC-32 is only known once
+	/// the data is written), which readers that go through a zip front to back without its
+	/// central directory refuse for stored entries, such as `java.util.zip.ZipInputStream`;
+	/// `ZipFile` and every other central-directory reader take it.
 	Stored,
 	/// Levels 1 to 9; zip has no level 0 deflate (use [`ZipMethod::Stored`]).
-	Deflate {
-		level: u32,
-	},
+	Deflate { level: u32 },
 	/// Levels 1 to 9.
-	Bzip2 {
-		level: u32,
-	},
+	Bzip2 { level: u32 },
 }
 
 impl ZipMethod {

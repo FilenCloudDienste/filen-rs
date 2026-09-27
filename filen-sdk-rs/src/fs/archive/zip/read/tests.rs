@@ -350,3 +350,70 @@ fn many_entries_use_zip64_end_records() {
 		70_000
 	);
 }
+
+/// `zip` with its `drop`-th central directory record left out, as an in-place edit that
+/// forgot an entry leaves it: the entry's local header and data stay where they were.
+fn without_central_record(zip: &[u8], drop: usize) -> Vec<u8> {
+	let eocd = zip.len() - 22;
+	assert_eq!(u32_at(zip, eocd), EOCD_SIG, "no zip64 or comment here");
+	let cd_size = u32_at(zip, eocd + 12) as usize;
+	let cd_start = u32_at(zip, eocd + 16) as usize;
+	let mut records = Vec::new();
+	let mut at = cd_start;
+	while at < cd_start + cd_size {
+		let len = 46
+			+ usize::from(u16_at(zip, at + 28))
+			+ usize::from(u16_at(zip, at + 30))
+			+ usize::from(u16_at(zip, at + 32));
+		records.push(&zip[at..at + len]);
+		at += len;
+	}
+	let kept: Vec<u8> = records
+		.iter()
+		.enumerate()
+		.filter(|&(i, _)| i != drop)
+		.flat_map(|(_, record)| record.iter().copied())
+		.collect();
+	let mut out = zip[..cd_start].to_vec();
+	out.extend_from_slice(&kept);
+	let mut end = zip[eocd..].to_vec();
+	let count = (records.len() - 1) as u16;
+	end[8..10].copy_from_slice(&count.to_le_bytes());
+	end[10..12].copy_from_slice(&count.to_le_bytes());
+	end[12..16].copy_from_slice(&(kept.len() as u32).to_le_bytes());
+	out.extend_from_slice(&end);
+	out
+}
+
+#[test]
+fn bytes_between_entries_belong_to_nothing() {
+	let entries = [
+		("a.txt", Some(&b"alpha"[..])),
+		("hidden.bin", Some(&[7u8; 300][..])),
+		("c.txt", Some(&b"gamma"[..])),
+	];
+	let zip = ours(&entries, ZipMethod::Stored, None);
+	let unaccounted = |zip: &[u8]| {
+		let mut source = Cursor::new(zip);
+		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		index
+			.entries
+			.iter()
+			.map(|entry| unaccounted_after(&mut source, index.shift, entry))
+			.sum::<u64>()
+	};
+	// our entries end in data descriptors, which are no gap
+	assert_eq!(unaccounted(&zip), 0);
+	let hidden = without_central_record(&zip, 1);
+	let gap = unaccounted(&hidden);
+	// the forgotten entry's local header, name, data and descriptor
+	assert!(gap >= 30 + 10 + 300, "{gap}");
+	assert_eq!(
+		read_all(&hidden, None)
+			.unwrap()
+			.into_iter()
+			.map(|(name, ..)| name)
+			.collect::<Vec<_>>(),
+		["a.txt", "c.txt"]
+	);
+}

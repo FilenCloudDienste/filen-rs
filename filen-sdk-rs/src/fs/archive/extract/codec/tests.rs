@@ -742,3 +742,24 @@ fn a_filtered_7z_spanning_chunks_decodes() {
 	};
 	assert_eq!(*read, data);
 }
+
+#[test]
+fn data_under_a_tar_directory_is_unaccounted() {
+	let mut builder = tar::Builder::new(Vec::new());
+	append(
+		&mut builder,
+		tar::EntryType::Directory,
+		"docs/",
+		b"not a directory's",
+	);
+	append(
+		&mut builder,
+		tar::EntryType::Regular,
+		"docs/a.txt",
+		b"alpha",
+	);
+	let tar = builder.into_inner().unwrap();
+	let (seen, end) = run(&tar, "sample.tar");
+	assert_eq!(seen[1], Seen::Dir(0, "docs".into()));
+	assert_eq!(end.unwrap().unaccounted_bytes, 17);
+}

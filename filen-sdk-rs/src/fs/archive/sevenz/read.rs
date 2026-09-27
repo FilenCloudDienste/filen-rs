@@ -35,6 +35,8 @@ const HEAP_PER_INDEX_BYTE: u64 = 3;
 const KDF_ROUNDS_BUDGET: u64 = 4 << super::crypto::MAX_CYCLES_POWER;
 /// A decoder's input buffer.
 const INPUT_BUFFER: usize = 64 * 1024;
+/// Most distinct keys (salts and round counts) one archive may use; 7-Zip uses one.
+const MAX_KEYS: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SevenZLimits {
@@ -209,9 +211,11 @@ pub(crate) struct SevenZIndex {
 }
 
 impl SevenZIndex {
+	/// The most packed streams a folder reads in turns, over the folders that can be read.
 	pub(crate) fn max_packed_streams(&self) -> usize {
 		self.folders
 			.iter()
+			.filter(|folder| folder.supported())
 			.map(|folder| folder.packed.len())
 			.max()
 			.unwrap_or(1)
@@ -258,8 +262,12 @@ impl<'p> Keys<'p> {
 		}) {
 			return Ok(key.clone());
 		}
+		if self.derived.len() >= MAX_KEYS {
+			return Err(SevenZError::Unsupported("a 7z archive with too many keys"));
+		}
 		let rounds = match props.cycles_power {
-			0x3F => 0,
+			// every key costs at least a round, so salts alone cannot make keys without end
+			0x3F => 1,
 			power if power <= super::crypto::MAX_CYCLES_POWER => 1u64 << power,
 			_ => {
 				return Err(SevenZError::Unsupported(
@@ -333,6 +341,7 @@ pub(crate) fn read_index<R: Read + Seek>(
 	let mut covered = vec![(0, START_HEADER_LEN), (header_at, header_at + next_size)];
 
 	let mut reader = HeaderReader::new(&header);
+	let mut header_checked = false;
 	let (header, headers_encrypted) = match reader.property()? {
 		K_HEADER => (header, false),
 		K_ENCODED_HEADER => {
@@ -353,6 +362,8 @@ pub(crate) fn read_index<R: Read + Seek>(
 					.map(|(&at, &size)| (at, at + size)),
 			);
 			let encrypted = folder.encrypted();
+			// a CRC proves the key decoded it: what fails after that is the header's own damage
+			header_checked = folder.crc.is_some();
 			let decoded =
 				decode_header(source, folder, &offsets, &streams.pack_sizes, limits, keys)
 					.map_err(|error| match error {
@@ -378,7 +389,9 @@ pub(crate) fn read_index<R: Read + Seek>(
 	reader.byte()?;
 	let mut index =
 		read_header(&mut reader, limits, &mut heap, len).map_err(|error| match error {
-			SevenZError::Corrupt(_) if headers_encrypted => SevenZError::WrongPassword,
+			SevenZError::Corrupt(_) if headers_encrypted && !header_checked => {
+				SevenZError::WrongPassword
+			}
 			error => error,
 		})?;
 	index.headers_encrypted = headers_encrypted;
@@ -597,6 +610,11 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 			return Err(SevenZError::Unsupported(
 				"a 7z coder with other than one output",
 			));
+		}
+		// only BCJ2 takes several streams, and exactly four: anything else would only make the
+		// reader keep more of the archive at hand
+		if inputs != 1 && !(Method::from_id(id) == Some(Method::Bcj2) && inputs == 4) {
+			return Err(SevenZError::Unsupported("a 7z coder with several inputs"));
 		}
 		let props: Box<[u8]> = if flags & 0x20 != 0 {
 			let len = reader.length()?;
@@ -1043,7 +1061,8 @@ fn coder_memory(folder: &Folder, coder: usize) -> Result<u64, SevenZError> {
 			// bzip2's worst case (-9) is under 4 MiB
 			Method::Bzip2 => 4 << 20,
 			Method::Deflate64 => 256 << 10,
-			Method::Bcj2 => 256 << 10,
+			// its four stream buffers, 256 KiB each
+			Method::Bcj2 => 1 << 20,
 			Method::Copy | Method::Deflate | Method::Bcj(_) | Method::Delta | Method::Aes => 0,
 		})
 }
@@ -1176,6 +1195,12 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 			Method::Bcj2 => {
 				if inputs.len() != 4 {
 					return Err(SevenZError::Corrupt("a 7z BCJ2 coder without four inputs"));
+				}
+				// the filter keeps its size as a usize
+				if usize::try_from(size).is_err() {
+					return Err(SevenZError::Unsupported(
+						"a 7z BCJ2 folder over what this platform can address",
+					));
 				}
 				let inputs = inputs.into_iter().map(buffered).collect();
 				Box::new(lzma_rust2::filter::bcj2::Bcj2Reader::new(inputs, size))

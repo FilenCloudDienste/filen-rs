@@ -10,7 +10,6 @@
 
 use std::{
 	cell::RefCell,
-	collections::HashMap,
 	io::{self, BufReader, Read, Seek, SeekFrom},
 	rc::Rc,
 };
@@ -21,6 +20,7 @@ use super::{
 	cp437,
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
 };
+use crate::util::SeededMap;
 
 pub(crate) const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
 pub(crate) const CENTRAL_HEADER_SIG: u32 = 0x0201_4b50;
@@ -53,6 +53,8 @@ pub(crate) enum ZipError {
 	PasswordRequired,
 	#[error("the password does not open the entry")]
 	WrongPassword,
+	#[error("the entry's data runs into the next entry's")]
+	Overlapping,
 	#[error(transparent)]
 	Read(#[from] io::Error),
 }
@@ -100,11 +102,17 @@ pub(crate) struct ZipEntry {
 	pub(crate) encryption: ZipEncryption,
 	/// General-purpose flag bit 1 for LZMA: the stream ends with an end marker.
 	pub(crate) lzma_end_marker: bool,
+	/// General-purpose flag bit 3: a data descriptor follows the data.
+	pub(crate) has_descriptor: bool,
 	pub(crate) crc: u32,
 	pub(crate) compressed_size: u64,
 	pub(crate) size: u64,
 	/// Where the local header is, relative to the start of the zip (prepended data excluded).
 	pub(crate) header_offset: u64,
+	/// Where its data has to end by, relative like `header_offset`: the next local header,
+	/// or the central directory. Its local header's name and extra field, whose lengths only
+	/// that header gives, sit between the two.
+	pub(crate) data_limit: u64,
 	pub(crate) modified: Option<DateTime<Utc>>,
 }
 
@@ -254,7 +262,9 @@ pub(crate) fn read_index<R: Read + Seek>(
 	let directory = find_directory(source, len, limits)?;
 	let bytes = read_at(source, directory.start, directory.size as usize)?;
 	let mut entries: Vec<ZipEntry> = Vec::with_capacity(directory.entries as usize);
-	let mut by_name: HashMap<String, usize> = HashMap::new();
+	// names are the archive's to choose: a map with fixed keys (std's on the web) could be made
+	// to collide on every insert
+	let mut by_name: SeededMap<String, usize> = SeededMap::default();
 	let mut duplicate_names = Vec::new();
 	let mut duplicate_count = 0;
 	// every listed entry's data is accounted for, a replaced duplicate's included
@@ -299,6 +309,16 @@ pub(crate) fn read_index<R: Read + Seek>(
 		}
 		end = data_end;
 		kept.push(entry);
+	}
+	let directory_start = directory.start - directory.shift;
+	let limits: Vec<u64> = kept
+		.iter()
+		.skip(1)
+		.map(|entry| entry.header_offset)
+		.chain([directory_start])
+		.collect();
+	for (entry, limit) in kept.iter_mut().zip(limits) {
+		entry.data_limit = limit;
 	}
 	Ok(ZipIndex {
 		entries: kept,
@@ -465,10 +485,12 @@ fn parse_central_header(
 			method,
 			encryption,
 			lzma_end_marker: flags & 0x0002 != 0,
+			has_descriptor: flags & 0x0008 != 0,
 			crc,
 			compressed_size,
 			size,
 			header_offset,
+			data_limit: 0,
 			modified,
 		},
 		next,
@@ -501,6 +523,37 @@ fn dos_datetime(date: u16, time: u16) -> Option<DateTime<Utc>> {
 		.map(|time| time.with_timezone(&Utc))
 }
 
+/// Bytes between the end of `entry` (its local header, name, extra field and data) and its
+/// `data_limit` that belong to nothing: anything but the data descriptor an entry flagged for one
+/// ends with (12 to 24 bytes, with or without its signature and zip64 sizes). A local header that
+/// cannot be read counts as a whole.
+pub(crate) fn unaccounted_after<R: Read + Seek>(
+	source: &mut R,
+	shift: u64,
+	entry: &ZipEntry,
+) -> u64 {
+	let whole = entry.data_limit.saturating_sub(entry.header_offset);
+	let Ok(header) = read_at(
+		source,
+		shift + entry.header_offset,
+		LOCAL_HEADER_LEN as usize,
+	) else {
+		return whole;
+	};
+	if u32_at(&header, 0) != LOCAL_HEADER_SIG {
+		return whole;
+	}
+	let skip = u64::from(u16_at(&header, 26)) + u64::from(u16_at(&header, 28));
+	let end = entry
+		.header_offset
+		.saturating_add(LOCAL_HEADER_LEN + skip)
+		.saturating_add(entry.compressed_size);
+	match entry.data_limit.saturating_sub(end) {
+		12 | 16 | 20 | 24 if entry.has_descriptor => 0,
+		gap => gap,
+	}
+}
+
 /// Memory a zip entry's decoder may use.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EntryLimits {
@@ -528,6 +581,16 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 		));
 	}
 	let skip = u64::from(u16_at(&header, 26)) + u64::from(u16_at(&header, 28));
+	// the lengths of the local name and extra field are only known now: data they push into
+	// the next entry's is data two entries share
+	if entry
+		.header_offset
+		.saturating_add(LOCAL_HEADER_LEN + skip)
+		.saturating_add(entry.compressed_size)
+		> entry.data_limit
+	{
+		return Err(ZipError::Overlapping);
+	}
 	source.seek(SeekFrom::Current(skip as i64))?;
 	let stored = (&mut *source).take(entry.compressed_size);
 
@@ -579,7 +642,7 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 		}
 	);
 	Ok(Box::new(Checked {
-		inner: decoded.take(entry.size + 1),
+		inner: decoded.take(entry.size.saturating_add(1)),
 		rest,
 		crc: crc32fast::Hasher::new(),
 		expected_crc: check_crc.then_some(entry.crc),
