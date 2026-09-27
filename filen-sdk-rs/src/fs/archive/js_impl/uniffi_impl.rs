@@ -7,10 +7,11 @@ use crate::{
 };
 
 use super::{
-	ArchiveEntryId, CompressCall, CompressConfig, CompressDelivery, CompressFormat, CompressReport,
-	CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport, ExtractRequest,
-	ExtractRoot, ExtractUpdate, ExtractedTopLevelItem, SourceDisposal, compress_job,
-	entries_request, extract_config, extract_job, extract_request, password,
+	ArchiveEntry, ArchiveEntryId, ArchiveListing, CompressCall, CompressConfig, CompressDelivery,
+	CompressFormat, CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery,
+	ExtractReport, ExtractRequest, ExtractRoot, ExtractUpdate, ExtractedTopLevelItem, ListDelivery,
+	ListUpdate, RemoteFileType, SourceDisposal, compress_job, entries_request, extract_config,
+	extract_job, extract_request, list_job, password,
 };
 
 /// Receives an extract's progress, in the order the extract made it, before the call
@@ -21,6 +22,16 @@ pub trait ExtractArchiveCallback: Send + Sync {
 	/// keeps.
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>);
 	fn on_update(&self, update: ExtractUpdate);
+}
+
+/// Receives a listing's entries and progress, in the order the listing made them, before the
+/// call returns.
+#[uniffi::export(with_foreign)]
+pub trait ListArchiveCallback: Send + Sync {
+	/// Entries, in batches as they are read, each batch before the update that counts it:
+	/// every one of them, also past the 10 000 the listing keeps.
+	fn on_entries(&self, entries: Vec<ArchiveEntry>);
+	fn on_update(&self, update: ListUpdate);
 }
 
 /// Receives a compress's progress, in the order the compress made it, before the call
@@ -61,6 +72,20 @@ pub struct ExtractArchiveConfig {
 	pub dispose: Option<SourceDisposal>,
 }
 
+/// What a listing reports an extraction would do: the settings of `ExtractArchiveConfig` that
+/// decide which entries it skips.
+#[derive(uniffi::Record, Default)]
+pub struct ListArchiveConfig {
+	/// The guard against decompression bombs; `None` keeps the SDK's (1000 times the
+	/// archive, at least 256 MiB).
+	#[uniffi(default = None)]
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// Lists macOS metadata as an extraction with the same setting skips it (see
+	/// `ExtractArchiveConfig.skip_mac_metadata`); `true` when `None`.
+	#[uniffi(default = None)]
+	pub skip_mac_metadata: Option<bool>,
+}
+
 #[derive(uniffi::Record)]
 pub struct CompressItemsConfig {
 	pub format: CompressFormat,
@@ -83,6 +108,13 @@ pub(super) fn deliver_extract(callback: &dyn ExtractArchiveCallback, delivery: E
 	match delivery {
 		ExtractDelivery::TopLevelCreated(items) => callback.on_top_level_created(items),
 		ExtractDelivery::Update(update) => callback.on_update(update),
+	}
+}
+
+pub(super) fn deliver_list(callback: &dyn ListArchiveCallback, delivery: ListDelivery) {
+	match delivery {
+		ListDelivery::Entries(entries) => callback.on_entries(entries),
+		ListDelivery::Update(update) => callback.on_update(update),
 	}
 }
 
@@ -200,6 +232,48 @@ impl JsClient {
 			password,
 		);
 		run_extract(self.inner(), request, config, callback, managed_future).await
+	}
+
+	/// Lists `archive`'s entries without extracting any: what each one is, and what extracting
+	/// it with the same settings would do with it (skip it, and why).
+	///
+	/// A zip's or 7z's index says it all: only the index is read, and the smallest encrypted
+	/// entry, as an extraction reads it, to check `password` (see the listing's `password`). A
+	/// tar's members, or what a single compressed file decodes to, are only known by reading it
+	/// all, which takes as long as downloading it; that is reported as it goes, and can be
+	/// paused and cancelled through `managed_future`. A listing takes one of the archive job
+	/// slots, as an extract does.
+	///
+	/// The listing is returned whether it completed, was cancelled or failed, with the entries
+	/// read until then. Only an abort through `managed_future` gets it: cancelling the calling
+	/// coroutine or task drops the call, and with it the listing.
+	pub async fn list_archive(
+		&self,
+		archive: AnyFile,
+		config: ListArchiveConfig,
+		password: Option<String>,
+		callback: Arc<dyn ListArchiveCallback>,
+		managed_future: ManagedFuture,
+	) -> Result<ArchiveListing, Error> {
+		let password = self::password(password)?;
+		let archive = RemoteFileType::try_from(archive)?;
+		let config = extract_config(
+			None,
+			None,
+			config.expansion_limit,
+			config.skip_mac_metadata,
+			password,
+		);
+		let client = self.inner();
+		let (sender, delivered) =
+			spawn_ordered_dispatch(move |delivery| deliver_list(callback.as_ref(), delivery));
+		let result = managed_future
+			.into_js_managed_commander_job(move |control| {
+				list_job(client, archive, config, sender, control)
+			})
+			.await;
+		let _ = delivered.await;
+		result
 	}
 
 	/// Compresses `items` into a new archive `name` in `destination`, entirely on this

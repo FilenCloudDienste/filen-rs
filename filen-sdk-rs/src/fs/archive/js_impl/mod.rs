@@ -1,7 +1,9 @@
-//! `extractArchive` / `compressItems` for the wasm and uniffi bindings, and the archive helpers
-//! (`archiveExtension`, `archiveEncoderMemory`, `archiveDefaultName`). Both platforms take the
-//! same arguments and report the same types; a job's callbacks reach the caller in the order the
-//! job made them, all before the call returns.
+//! `extractArchive` / `extractArchiveEntries` / `listArchive` / `compressItems` for the wasm and
+//! uniffi bindings, and the archive helpers (`archiveExtension`, `archiveEncoderMemory`,
+//! `archiveFormatLevels`, `archiveMaxLevel`, `archiveFormatOfName`, `archiveDefaultName`). Both
+//! platforms take the same arguments and report the same types; a job's callbacks reach the
+//! caller in the order the job made them, all before the call returns, and the call resolves
+//! with the job's report even when the job failed or was cancelled.
 //!
 //! A password is always an argument of its own, never a field of a record: uniffi prints a
 //! record's fields in the foreign `toString`, and a record could end up serialized.
@@ -38,10 +40,11 @@ use super::{
 	},
 	dispose::{self, SourceDisposal},
 	extract::{
-		self, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals, DuplicateEntries,
-		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
-		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry, ExtractSkippedEntry,
-		ExtractStage, ExtractTopLevelKey, OmittedRecords,
+		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
+		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
+		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry,
+		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
+		OmittedRecords, PasswordCheck,
 	},
 	format::{ExtensionFormat, extension_format},
 	password::ArchivePassword,
@@ -258,6 +261,47 @@ pub struct ExtractReport {
 	pub error: Option<JobError>,
 }
 
+/// One progress callback of a listing.
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct ListUpdate {
+	pub phase: ListPhase,
+	pub run_state: RunState,
+	/// Bytes of the archive read so far, of `archive_bytes`.
+	pub bytes_read: u64,
+	pub archive_bytes: u64,
+	/// Entries listed so far.
+	pub entries: u64,
+	pub bytes_per_second: Option<u64>,
+	/// Estimated time left, in milliseconds.
+	pub eta_ms: Option<u64>,
+	/// Time spent running, paused time left out, in milliseconds.
+	pub active_time_ms: u64,
+}
+
+/// What a listing found, whether it completed, was cancelled or failed: the archive, and its
+/// entries in the order of its index (a tar's in the order it stores them).
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct ArchiveListing {
+	/// What the archive is; `undefined` when the listing ended before it could tell.
+	pub format: Option<ArchiveFormat>,
+	pub password: PasswordCheck,
+	/// The first 10 000 entries; the callback received every one.
+	pub entries: Vec<ArchiveEntry>,
+	/// Entries the callback received that `entries` leaves out.
+	pub omitted_entries: u64,
+	pub totals: ListTotals,
+	/// Bytes of the archive that belong to no entry (see the extract report's).
+	pub unaccounted_bytes: u64,
+	/// Names a zip lists more than once: only the last entry of each is listed, and extracted.
+	pub duplicates: Option<DuplicateEntries>,
+	/// Why the listing ended early: kind `Cancelled` when cancelled, or the error that stopped
+	/// it (a damaged archive, a wrong password for a 7z whose index is encrypted). `undefined`
+	/// when it read the archive to its end.
+	pub error: Option<JobError>,
+}
+
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, tagged, no_default)]
 pub enum CompressEvent {
@@ -451,6 +495,45 @@ impl From<extract::ExtractReport> for ExtractReport {
 
 impl From<extract::ExtractFailed> for ExtractReport {
 	fn from(failed: extract::ExtractFailed) -> Self {
+		Self {
+			error: Some(job_error(failed.error)),
+			..failed.report.into()
+		}
+	}
+}
+
+impl From<extract::ListUpdate> for ListUpdate {
+	fn from(update: extract::ListUpdate) -> Self {
+		Self {
+			phase: update.phase,
+			run_state: update.run_state,
+			bytes_read: update.bytes_read,
+			archive_bytes: update.archive_bytes,
+			entries: update.entries,
+			bytes_per_second: update.bytes_per_second,
+			eta_ms: update.eta.map(millis),
+			active_time_ms: millis(update.active_time),
+		}
+	}
+}
+
+impl From<extract::ArchiveListing> for ArchiveListing {
+	fn from(listing: extract::ArchiveListing) -> Self {
+		Self {
+			format: listing.format,
+			password: listing.password,
+			entries: listing.entries,
+			omitted_entries: listing.omitted_entries,
+			totals: listing.totals,
+			unaccounted_bytes: listing.unaccounted_bytes,
+			duplicates: listing.duplicates,
+			error: None,
+		}
+	}
+}
+
+impl From<extract::ListFailed> for ArchiveListing {
+	fn from(failed: extract::ListFailed) -> Self {
 		Self {
 			error: Some(job_error(failed.error)),
 			..failed.report.into()
@@ -674,6 +757,44 @@ async fn extract_job(
 	// an extract that ended early still resolves, with the report of what it did
 	Ok(match result {
 		Ok(report) => report.into(),
+		Err(failed) => failed.into(),
+	})
+}
+
+/// A listing's callback, converted for the bindings.
+enum ListDelivery {
+	Entries(Vec<ArchiveEntry>),
+	Update(ListUpdate),
+}
+
+/// Passes a listing's callbacks to the binding's delivery task over one channel, which keeps
+/// their order.
+struct ListChannel(UnboundedSender<ListDelivery>);
+
+impl ListCallback for ListChannel {
+	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
+		let _ = self.0.send(ListDelivery::Entries(entries));
+	}
+
+	fn on_update(&self, update: extract::ListUpdate) {
+		let _ = self.0.send(ListDelivery::Update(update.into()));
+	}
+}
+
+/// Runs the listing as the job of a managed future, its callbacks going to `sender`.
+async fn list_job(
+	client: Arc<Client>,
+	archive: RemoteFileType<'static>,
+	config: ExtractConfig,
+	sender: UnboundedSender<ListDelivery>,
+	control: JobControl,
+) -> Result<ArchiveListing, Error> {
+	let result = client
+		.list_archive(archive, config, ListChannel(sender), control)
+		.await;
+	// a listing that ended early still resolves, with the entries it read
+	Ok(match result {
+		Ok(listing) => listing.into(),
 		Err(failed) => failed.into(),
 	})
 }

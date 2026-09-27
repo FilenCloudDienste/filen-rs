@@ -14,10 +14,10 @@ use crate::{
 };
 
 use super::{
-	ArchiveEntryId, Client, CompressCall, CompressConfig, CompressDelivery, CompressFormat,
-	CompressReport, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport, ExtractRequest,
-	ExtractRoot, SourceDisposal, compress_job, entries_request, extract_config, extract_job,
-	extract_request, password,
+	ArchiveEntryId, ArchiveListing, Client, CompressCall, CompressConfig, CompressDelivery,
+	CompressFormat, CompressReport, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
+	ExtractRequest, ExtractRoot, ListDelivery, RemoteFileType, SourceDisposal, compress_job,
+	entries_request, extract_config, extract_job, extract_request, list_job, password,
 };
 
 #[js_type(import, no_ser, no_default)]
@@ -113,6 +113,32 @@ pub struct ExtractArchiveEntriesParams {
 }
 
 #[js_type(import, no_ser, no_default)]
+pub struct ListArchiveParams {
+	pub archive: AnyFile,
+	/// The guard against decompression bombs; when left out, the SDK's (1000 times the
+	/// archive, at least 256 MiB).
+	#[serde(default)]
+	#[tsify(optional)]
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// Lists macOS metadata as an extraction with the same setting skips it (see
+	/// `ExtractArchiveParams.skipMacMetadata`); `true` when left out.
+	#[serde(default)]
+	#[tsify(optional)]
+	pub skip_mac_metadata: Option<bool>,
+	/// Entries, in batches as they are read, each batch before the update that counts it:
+	/// every one of them, also past the 10 000 the listing keeps.
+	#[tsify(type = "(entries: ArchiveEntry[]) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_entries: Option<js_sys::Function>,
+	#[tsify(type = "(update: ListUpdate) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_update: Option<js_sys::Function>,
+	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
+	#[serde(default)]
+	pub managed_future: ManagedFuture,
+}
+
+#[js_type(import, no_ser, no_default)]
 pub struct CompressItemsParams {
 	pub items: Vec<AnyItemWithContext>,
 	pub destination: AnyNormalDir,
@@ -177,6 +203,27 @@ async fn run_extract(
 		.await;
 	// the job has ended and dropped its sender: everything it reported reaches its callbacks
 	// before the result does
+	let _ = delivered.await;
+	result
+}
+
+async fn run_list(
+	client: Arc<Client>,
+	archive: RemoteFileType<'static>,
+	config: ExtractConfig,
+	on_entries: Option<js_sys::Function>,
+	on_update: Option<js_sys::Function>,
+	managed_future: ManagedFuture,
+) -> Result<ArchiveListing, Error> {
+	let (sender, delivered) = spawn_local_dispatch(move |delivery| match delivery {
+		ListDelivery::Entries(entries) => call_callback(on_entries.as_ref(), &entries),
+		ListDelivery::Update(update) => call_callback(on_update.as_ref(), &update),
+	});
+	let result = managed_future
+		.into_js_managed_commander_job(move |control| {
+			list_job(client, archive, config, sender, control)
+		})?
+		.await;
 	let _ = delivered.await;
 	result
 }
@@ -296,6 +343,42 @@ impl JsClient {
 			request,
 			config,
 			callbacks,
+			params.managed_future,
+		)
+		.await
+	}
+
+	/// Lists an archive's entries without extracting any: what each one is, and what
+	/// extracting it with the same settings would do with it (skip it, and why).
+	///
+	/// A zip's or 7z's index says it all: only the index is read, and the smallest encrypted
+	/// entry, as an extraction reads it, to check `password` (see the listing's `password`). A
+	/// tar's members, or what a single compressed file decodes to, are only known by reading it
+	/// all, which takes as long as downloading it; that is reported as it goes, and can be
+	/// paused and cancelled through `managedFuture`. A listing takes one of the archive job
+	/// slots, as an extract does. The listing is returned whether it completed, was cancelled
+	/// or failed, with the entries read until then.
+	#[wasm_bindgen(js_name = "listArchive")]
+	pub async fn list_archive(
+		&self,
+		params: ListArchiveParams,
+		password: Option<String>,
+	) -> Result<ArchiveListing, Error> {
+		let password = self::password(password)?;
+		let archive = RemoteFileType::try_from(params.archive)?;
+		let config = extract_config(
+			None,
+			None,
+			params.expansion_limit,
+			params.skip_mac_metadata,
+			password,
+		);
+		run_list(
+			self.inner(),
+			archive,
+			config,
+			params.on_entries,
+			params.on_update,
 			params.managed_future,
 		)
 		.await

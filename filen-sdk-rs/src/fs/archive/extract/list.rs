@@ -4,6 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 
 use crate::{
 	Error, ErrorKind,
@@ -67,6 +68,7 @@ pub enum ArchiveEntryKind {
 
 /// An entry of an archive, and what extracting it would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ArchiveEntry {
 	/// What [`ExtractRequest::Entries`](super::ExtractRequest::Entries) takes to extract it.
 	pub id: ArchiveEntryId,
@@ -81,6 +83,15 @@ pub struct ArchiveEntry {
 	/// The size of the file it extracts to: as the archive states it, for a hard link its
 	/// target's, and for a single compressed file what it decodes to. `None` for a directory.
 	pub size: Option<u64>,
+	/// When it was last changed, as the archive states it.
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		tsify(type = "bigint", optional),
+		serde(
+			with = "filen_types::serde::time::optional",
+			skip_serializing_if = "Option::is_none"
+		)
+	)]
 	pub modified: Option<DateTime<Utc>>,
 	/// Its data is encrypted.
 	pub encrypted: bool,
