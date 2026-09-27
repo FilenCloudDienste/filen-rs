@@ -45,11 +45,14 @@ use crate::{
 #[derive(Default)]
 struct Recorder {
 	top_level: Mutex<Vec<ExtractedTopLevel>>,
+	/// The size of each `on_top_level_created` batch.
+	batches: Mutex<Vec<usize>>,
 	updates: Mutex<Vec<ExtractUpdate>>,
 }
 
 impl ExtractCallback for Recorder {
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>) {
+		self.batches.lock().unwrap().push(items.len());
 		self.top_level.lock().unwrap().extend(items);
 	}
 
@@ -219,7 +222,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 		len: setup.archive.size(),
 		limits: CodecLimits {
 			decoder_memory: CODEC_MEM_BUDGET,
-			max_members: 1000,
+			max_members: 2000,
 			expansion: Some(ExpansionLimit::DEFAULT),
 			max_index_bytes: 32 << 20,
 		},
@@ -930,4 +933,109 @@ async fn a_7z_with_a_wrong_password_creates_nothing() {
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
 	assert!(created_dirs(&setup).is_empty());
 	assert!(finished(&setup).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn top_level_items_arrive_in_bounded_batches() {
+	let names: Vec<String> = (0..300).map(|i| format!("f{i:03}.txt")).collect();
+	let members: Vec<(&str, &[u8])> = names
+		.iter()
+		.map(|name| (name.as_str(), &b"x"[..]))
+		.collect();
+	let setup = setup("bundle.tar", tar_of(&members), |_| {});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 300);
+	// every item reached the callback before the job returned, none in a batch over 256
+	assert_eq!(job.recorder.top_level.lock().unwrap().len(), 300);
+	let batches = job.recorder.batches.lock().unwrap().clone();
+	assert!(
+		batches.iter().all(|&n| (1..=256).contains(&n)),
+		"{batches:?}"
+	);
+	assert!(
+		batches.len() < 300,
+		"items are batched, not sent one by one: {batches:?}"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn items_past_the_reports_records_reach_new_shares_too() {
+	let names: Vec<String> = (0..1005).map(|i| format!("f{i:04}.txt")).collect();
+	let members: Vec<(&str, &[u8])> = names
+		.iter()
+		.map(|name| (name.as_str(), &b"x"[..]))
+		.collect();
+	let setup = setup("bundle.tar", tar_of(&members), |backend| {
+		// the destination is shared while the job runs
+		backend.later_targets = Some(crate::connect::ConnectedTargets::with_test_users(1));
+	});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.top_level.len(), 1000);
+	assert_eq!(report.omitted.top_level, 5);
+	let log = setup.backend.log();
+	let beyond: Vec<Uuid> = log.fetched_items.clone();
+	assert_eq!(
+		beyond.len(),
+		5,
+		"only the items the report keeps no record of are fetched"
+	);
+	let propagated: std::collections::HashSet<Uuid> =
+		log.propagated_trees.iter().copied().collect();
+	let kept: Vec<Uuid> = report.top_level.iter().map(|top| top.item.uuid()).collect();
+	assert!(
+		kept.iter()
+			.chain(&beyond)
+			.all(|uuid| propagated.contains(uuid)),
+		"every top-level item reaches the new share"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
+	// too large (incompressible, so compressed too) to check the password on up front: it
+	// shows once the entry is opened
+	let mut state = 0x9E37_79B9_7F4A_7C15u64;
+	let big: Vec<u8> = (0..17 << 20)
+		.map(|_| {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state as u8
+		})
+		.collect();
+	let zip = zip_of(
+		&[("docs", None), ("docs/big.bin", Some(&big))],
+		Some(b"right"),
+	);
+	// the entry's first chunk comes slowest, long after the folder is created
+	let setup = setup("bundle.zip", zip, |backend| backend.reverse_chunks = true);
+	let options = Options {
+		password: Some(ArchivePassword::new("wrong".into()).unwrap()),
+		..Options::default()
+	};
+	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(finished(&setup).is_empty());
+	let log = setup.backend.log();
+	let root = log
+		.created_dirs
+		.iter()
+		.find(|(_, name)| name == "bundle")
+		.map(|(uuid, _)| *uuid)
+		.expect("the new folder was created before the password showed wrong");
+	assert_eq!(
+		log.trashed_dirs,
+		[root],
+		"the folder, with everything in it, is trashed"
+	);
 }

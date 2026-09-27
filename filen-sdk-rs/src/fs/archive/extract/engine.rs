@@ -241,6 +241,9 @@ struct Driver<B: DriveBackend> {
 	held: Option<WorkerEvent>,
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
+	/// Top-level items past the report's records, by uuid and whether each is a directory:
+	/// what propagating them to targets the destination gains takes.
+	top_level_beyond: Vec<(Uuid, bool)>,
 	/// Entries the archive holds no checksum for, which were extracted unverified.
 	unchecked_entries: u64,
 	/// Plaintext bytes committed to uploads, for `max_bytes`.
@@ -356,6 +359,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		held: None,
 		events_closed: false,
 		codec_result: None,
+		top_level_beyond: Vec::new(),
 		unchecked_entries: 0,
 		committed: 0,
 		items: 0,
@@ -435,8 +439,45 @@ impl<B: DisposalBackend> Driver<B> {
 			),
 			(Ok(()), None) => (ExtractPhase::Done, Ok(())),
 		};
+		if let Err(error) = &result
+			&& error.kind() == ErrorKind::ArchiveWrongPassword
+			&& self.reporter.counts().files_done == 0
+		{
+			self.trash_created_dirs().await;
+		}
 		self.reporter.finish(phase);
 		result
+	}
+
+	/// A wrong password that only showed once entries were read (no entry was small enough to
+	/// check it on first) leaves the directories created so far and no file: they go to the
+	/// trash, so a retry with the right password starts clean. Trashed, never deleted: they can
+	/// be restored.
+	async fn trash_created_dirs(&mut self) {
+		let dirs = self
+			.report
+			.top_level
+			.iter()
+			.filter_map(|top| match &top.item {
+				NonRootItemType::Dir(dir) => Some(dir.uuid()),
+				NonRootItemType::File(_) => None,
+			})
+			.chain(
+				self.top_level_beyond
+					.iter()
+					.filter(|(_, is_dir)| *is_dir)
+					.map(|(uuid, _)| *uuid),
+			)
+			.collect::<Vec<_>>();
+		for uuid in dirs {
+			if let Err(error) = self.backend.trash_dir(uuid).await {
+				tracing::warn!(
+					"archive {}: failed to trash a directory created before the wrong password \
+					 showed: {error}",
+					self.archive.uuid()
+				);
+			}
+		}
 	}
 
 	/// Records `error` as ending the job when it is that kind of error.
@@ -857,12 +898,15 @@ impl<B: DisposalBackend> Driver<B> {
 		key: ExtractTopLevelKey,
 		item: NonRootItemType<'static, Normal>,
 	) {
+		let is_dir = matches!(item, NonRootItemType::Dir(_));
 		let top = ExtractedTopLevel { key, item };
-		keep(
+		if !keep(
 			&mut self.report.top_level,
 			&mut self.report.omitted.top_level,
 			top.clone(),
-		);
+		) {
+			self.top_level_beyond.push((top.item.uuid(), is_dir));
+		}
 		self.reporter.top_level_created(top);
 	}
 
@@ -1596,6 +1640,20 @@ impl<B: DisposalBackend> Driver<B> {
 			for error in self.backend.propagate_tree(&added, &top.item).await {
 				self.reporter.event(ExtractEvent::PropagationFailed {
 					dest_uuid: top.item.uuid(),
+					error: Arc::new(error),
+				});
+			}
+		}
+		// the items the report keeps no record of, fetched again: only when the destination
+		// changed, which is rare, rather than holding every one of them for the whole job
+		for &(uuid, is_dir) in &self.top_level_beyond {
+			let errors = match self.backend.normal_item(uuid, is_dir).await {
+				Ok(item) => self.backend.propagate_tree(&added, &item).await,
+				Err(error) => vec![error],
+			};
+			for error in errors {
+				self.reporter.event(ExtractEvent::PropagationFailed {
+					dest_uuid: uuid,
 					error: Arc::new(error),
 				});
 			}

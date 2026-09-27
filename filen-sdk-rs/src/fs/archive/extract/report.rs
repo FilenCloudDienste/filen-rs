@@ -1,9 +1,9 @@
 //! What an extraction reports while it runs and when it ends, and the [`Reporter`] that turns
 //! job state changes into throttled, ordered callbacks.
 
-use filen_macros::js_type;
 use std::{sync::Arc, time::Duration};
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::{
@@ -318,7 +318,13 @@ pub(crate) struct ExtractState {
 	counts: ItemCounts,
 	bytes_read: u64,
 	active: Vec<ExtractActiveFile>,
+	/// Top-level items created and not delivered yet: they go out in batches, each before the
+	/// next update.
+	pending_top_level: Vec<ExtractedTopLevel>,
 }
+
+/// Most top-level items one `on_top_level_created` call carries.
+const TOP_LEVEL_BATCH: usize = 256;
 
 impl JobState for ExtractState {
 	type Phase = ExtractPhase;
@@ -346,6 +352,9 @@ impl JobState for ExtractState {
 		callback: &dyn ExtractCallback,
 		snapshot: Snapshot<ExtractEvent, ExtractPhase>,
 	) {
+		if !self.pending_top_level.is_empty() {
+			callback.on_top_level_created(std::mem::take(&mut self.pending_top_level));
+		}
 		callback.on_update(ExtractUpdate {
 			phase: snapshot.phase,
 			run_state: snapshot.run_state,
@@ -396,6 +405,7 @@ impl Reporter {
 				counts: ItemCounts::default(),
 				bytes_read: 0,
 				active: Vec::new(),
+				pending_top_level: Vec::new(),
 			},
 			Box::new(callback),
 		)
@@ -410,9 +420,19 @@ impl Reporter {
 		});
 	}
 
-	/// Delivered at once, after an update carrying everything that happened before it.
+	/// Delivered in a batch of up to [`TOP_LEVEL_BATCH`] items right before the next update
+	/// (every job ends with one), so a caller holds every item the job created by the time the
+	/// job returns.
 	pub(crate) fn top_level_created(&self, item: ExtractedTopLevel) {
-		self.flush_then_call(|callback| callback.on_top_level_created(vec![item]));
+		let mut full = false;
+		self.with_state(|state| {
+			state.pending_top_level.push(item);
+			state.core.mark_changed();
+			full = state.pending_top_level.len() >= TOP_LEVEL_BATCH;
+		});
+		if full {
+			self.flush_then_call(|_| {});
+		}
 	}
 
 	pub(crate) fn dir_created(&self, dest_uuid: Uuid, dest_parent: Uuid, name: &str) {

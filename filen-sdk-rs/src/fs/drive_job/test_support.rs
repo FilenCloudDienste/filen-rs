@@ -74,6 +74,8 @@ pub(crate) struct FakeLog {
 	pub(crate) uploaded_data: HashMap<(Uuid, u64), Vec<u8>>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
+	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
+	pub(crate) fetched_items: Vec<Uuid>,
 	pub(crate) out_of_order_dirs: Vec<String>,
 	pub(crate) colored: Vec<Uuid>,
 	pub(crate) propagated: Vec<Uuid>,
@@ -578,6 +580,46 @@ mod disposal {
 				.retain(|_, (parent, ..)| !gone.contains(parent));
 			log.trashed_dirs.push(uuid);
 			Ok(())
+		}
+
+		async fn normal_item(
+			&self,
+			uuid: Uuid,
+			is_dir: bool,
+		) -> Result<NonRootItemType<'static, Normal>, Error> {
+			self.log().fetched_items.push(uuid);
+			Ok(if is_dir {
+				NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
+					uuid,
+					DecryptedDirectoryMeta {
+						name: Cow::Borrowed("fetched"),
+						created: None,
+					},
+					Uuid::new_v4().into(),
+					Utc::now(),
+				)))
+			} else {
+				NonRootItemType::File(Cow::Owned(RemoteFile::from_meta(
+					uuid,
+					StableUuid::new_for_test(uuid),
+					Uuid::new_v4().into(),
+					1,
+					1,
+					"de-1",
+					"bucket",
+					Utc::now(),
+					false,
+					FileMeta::Decoded(DecryptedFileMeta {
+						name: Cow::Borrowed("fetched"),
+						size: 1,
+						mime: Cow::Borrowed("text/plain"),
+						key: FileKey::V3(EncryptionKey::generate()),
+						last_modified: Utc::now(),
+						created: None,
+						hash: None,
+					}),
+				)))
+			})
 		}
 	}
 }

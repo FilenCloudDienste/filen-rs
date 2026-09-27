@@ -20,7 +20,7 @@ use crate::{
 	Error,
 	fs::{
 		HasUUID,
-		categories::{DirType, Normal, fs::CategoryFS},
+		categories::{DirType, NonRootItemType, Normal, fs::CategoryFS},
 		drive_job::backend::{ClientBackend, DriveBackend},
 		file::traits::HasFileInfo,
 	},
@@ -113,6 +113,12 @@ pub(crate) trait DisposalBackend: DriveBackend {
 		uuid: Uuid,
 	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
 	fn trash_dir(&self, uuid: Uuid) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+	/// An item of the user's drive, for a job that kept only its uuid.
+	fn normal_item(
+		&self,
+		uuid: Uuid,
+		is_dir: bool,
+	) -> impl Future<Output = Result<NonRootItemType<'static, Normal>, Error>> + MaybeSend;
 }
 
 impl DisposalBackend for ClientBackend {
@@ -162,6 +168,19 @@ impl DisposalBackend for ClientBackend {
 		let client = self.client();
 		let mut dir = client.get_dir(uuid).await?;
 		client.trash_dir(&mut dir).await
+	}
+
+	async fn normal_item(
+		&self,
+		uuid: Uuid,
+		is_dir: bool,
+	) -> Result<NonRootItemType<'static, Normal>, Error> {
+		let client = self.client();
+		Ok(if is_dir {
+			NonRootItemType::Dir(std::borrow::Cow::Owned(client.get_dir(uuid).await?))
+		} else {
+			NonRootItemType::File(std::borrow::Cow::Owned(client.get_file(uuid).await?))
+		})
 	}
 }
 

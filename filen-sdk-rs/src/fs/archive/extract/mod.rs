@@ -6,13 +6,14 @@ pub(crate) mod codec;
 mod engine;
 mod report;
 
+use filen_macros::js_type;
+
 use crate::fs::{
 	archive::dispose::SourceDisposal,
 	categories::{DirType, Normal},
 	file::{RemoteFile, enums::RemoteFileType},
 	name::ValidatedName,
 };
-use filen_macros::js_type;
 
 pub use crate::fs::archive::password::ArchivePassword;
 pub use report::{
