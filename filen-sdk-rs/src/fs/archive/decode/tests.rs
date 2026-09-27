@@ -446,6 +446,59 @@ fn brotli_round_trip_and_damage() {
 	));
 }
 
+/// Decodes `bytes` with every bit of `flips` flipped at each position in turn, and truncated at
+/// each length: a damaged stream is refused or decodes to something, never panics, and every
+/// refusal is a [`CodecError`].
+fn damage_never_panics(codec: StreamCodec, bytes: &[u8]) {
+	let check = |damaged: &[u8], what: &str| {
+		let result = std::panic::catch_unwind(|| decode(codec, damaged, BUDGET))
+			.unwrap_or_else(|_| panic!("{codec:?}: {what} panicked"));
+		if let Err(error) = result {
+			assert!(codec_error(&error).is_some(), "{codec:?}: {what}: {error}");
+		}
+	};
+	for at in 0..bytes.len() {
+		for bit in [0x01, 0x80] {
+			let mut damaged = bytes.to_vec();
+			damaged[at] ^= bit;
+			check(&damaged, &format!("a flip of {bit:#x} at {at}"));
+		}
+		check(&bytes[..at], &format!("a cut at {at}"));
+	}
+}
+
+#[test]
+fn a_damaged_xz_never_panics() {
+	let data = sample(3_000);
+	// a filter chain and a second stream, so the damage reaches every part of the framing
+	let mut bytes = xz(&data, |options| {
+		options.filters = vec![FilterConfig::new_delta(2), FilterConfig::new_bcj_x86(0)];
+		options.set_check_sum_type(CheckType::Sha256);
+	});
+	bytes.extend_from_slice(&[0; 4]);
+	bytes.extend(xz(&data[..100], |options| {
+		options.set_check_sum_type(CheckType::Crc32)
+	}));
+	damage_never_panics(StreamCodec::Xz, &bytes);
+}
+
+#[test]
+fn a_damaged_lz4_never_panics() {
+	let data = sample(3_000);
+	let mut bytes = vec![0x5F, 0x2A, 0x4D, 0x18, 2, 0, 0, 0, 7, 7];
+	bytes.extend(lz4(
+		&data,
+		FrameInfo::new()
+			.block_size(BlockSize::Max64KB)
+			.block_mode(BlockMode::Linked)
+			.block_checksums(true)
+			.content_checksum(true)
+			.content_size(Some(data.len() as u64)),
+	));
+	bytes.extend(lz4(&data[..100], FrameInfo::new()));
+	damage_never_panics(StreamCodec::Lz4, &bytes);
+}
+
 #[test]
 fn input_errors_pass_through_unchanged() {
 	/// Hands out a valid stream's first bytes, then fails.
