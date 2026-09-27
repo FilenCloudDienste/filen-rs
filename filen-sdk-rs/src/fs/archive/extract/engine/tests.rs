@@ -1325,7 +1325,8 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		password: Some(ArchivePassword::new("wrong".into()).unwrap()),
 		..Options::default()
 	};
-	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
+	let job = start(&setup, options);
+	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
 	assert!(finished(&setup).is_empty());
 	let log = setup.backend.log();
@@ -1339,6 +1340,15 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		log.trashed_dirs,
 		[root],
 		"the folder, with everything in it, is trashed"
+	);
+	assert_eq!(
+		job.recorder.top_level.lock().unwrap().len(),
+		1,
+		"the callback got the folder"
+	);
+	assert!(
+		failed.report.top_level.is_empty(),
+		"the report no longer lists it as created"
 	);
 }
 

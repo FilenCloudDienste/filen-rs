@@ -273,7 +273,10 @@ pub struct ExtractReport {
 	/// Items created directly in the destination (the new folder, or with
 	/// [`ExtractRoot::Destination`](super::ExtractRoot::Destination) every item at the top of
 	/// the archive), in creation order, up to [`MAX_REPORT_RECORDS`]; the callback receives all
-	/// of them.
+	/// of them, as they are created. An extraction that failed with
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind) before extracting any file moved the
+	/// folders it had created to the trash, for a retry to start clean: they are left out here,
+	/// though the callback received them.
 	pub top_level: Vec<ExtractedTopLevel>,
 	pub failures: Vec<ExtractFailure>,
 	pub skipped: Vec<ExtractSkippedEntry>,

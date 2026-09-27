@@ -577,8 +577,8 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// A wrong password that only showed once entries were read (no entry was small enough to
 	/// check it on first) leaves the directories created so far and no file: they go to the
-	/// trash, so a retry with the right password starts clean. Trashed, never deleted: they can
-	/// be restored.
+	/// trash, so a retry with the right password starts clean, and out of the report's top-level
+	/// items. Trashed, never deleted: they can be restored.
 	async fn trash_created_dirs(&mut self) {
 		let dirs = self
 			.report
@@ -608,12 +608,16 @@ impl<B: DisposalBackend> Driver<B> {
 					continue;
 				}
 			}
-			if let Err(error) = self.backend.trash_dir(uuid).await {
-				tracing::warn!(
+			match self.backend.trash_dir(uuid).await {
+				Ok(()) => {
+					self.report.top_level.retain(|top| top.item.uuid() != uuid);
+					self.top_level_beyond.retain(|(beyond, _)| *beyond != uuid);
+				}
+				Err(error) => tracing::warn!(
 					"archive {}: failed to trash a directory created before the wrong password \
 					 showed: {error}",
 					self.archive.uuid()
-				);
+				),
 			}
 		}
 	}
