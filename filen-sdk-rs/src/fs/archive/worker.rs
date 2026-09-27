@@ -55,6 +55,9 @@ pub(crate) enum WorkerEvent {
 	/// compressing, it is in the archive.
 	FileEnd,
 	Skipped(SkippedMember),
+	/// When compressing into a format whose start is written last (a 7z): the archive's first
+	/// chunk, sent after all the others.
+	Head(Vec<u8>),
 }
 
 /// What a streaming archive holds.
@@ -65,6 +68,8 @@ pub(crate) enum StreamLayout {
 	/// A zip, read from its central directory; every entry's data is checked against its
 	/// CRC-32 or authentication code.
 	Zip,
+	/// A 7z, read from its header; entries are checked against the CRC-32s it lists.
+	SevenZ,
 	/// One compressed file.
 	Single { codec: StreamCodec },
 }
@@ -135,6 +140,12 @@ fn ended() -> io::Error {
 	io::Error::other(JobEnded)
 }
 
+/// A fetch the driver could not answer: an error of the archive's source, which every other
+/// error a codec reads through is not (those are the archive's own: damaged data).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct SourceFailed(io::Error);
+
 /// The codec's end of the exchange.
 pub(crate) struct WorkerPort {
 	events: mpsc::Sender<WorkerEvent>,
@@ -160,9 +171,22 @@ impl WorkerPort {
 			index,
 			reply,
 		})?;
-		let chunk = answer.blocking_recv().map_err(|_| ended())??;
+		let chunk = answer
+			.blocking_recv()
+			.map_err(|_| ended())?
+			.map_err(|error| io::Error::new(error.kind(), SourceFailed(error)))?;
 		self.shared.note_progress();
 		Ok(chunk)
+	}
+
+	/// Shows the driver the codec is alive through work that exchanges nothing with it (a long
+	/// key derivation); fails as an exchange would once the driver is gone.
+	pub(crate) fn keep_alive(&self) -> io::Result<()> {
+		if self.shared.cancelled.load(Ordering::Relaxed) {
+			return Err(ended());
+		}
+		self.shared.note_progress();
+		Ok(())
 	}
 
 	pub(crate) fn shared(&self) -> &WorkerShared {
@@ -321,8 +345,9 @@ pub(crate) struct SeekInput<'p> {
 	source: u32,
 	len: u64,
 	pos: u64,
-	/// The two most recent chunks, most recent first.
-	cache: [Option<(u64, Vec<u8>)>; 2],
+	/// The most recent chunks, most recent first.
+	cache: Vec<(u64, Vec<u8>)>,
+	slots: usize,
 }
 
 impl<'p> SeekInput<'p> {
@@ -332,28 +357,32 @@ impl<'p> SeekInput<'p> {
 			source,
 			len,
 			pos: 0,
-			cache: [None, None],
+			cache: Vec::new(),
+			slots: 2,
 		}
 	}
 
+	/// Keeps up to `slots` chunks (at least 2: a read across a chunk boundary needs both), for
+	/// readers that take turns at several places of the source.
+	pub(crate) fn set_slots(&mut self, slots: usize) {
+		self.slots = slots.max(2);
+		self.cache.truncate(self.slots);
+	}
+
 	fn chunk(&mut self, index: u64) -> io::Result<&[u8]> {
-		if self.cache[1]
-			.as_ref()
-			.is_some_and(|(cached, _)| *cached == index)
-		{
-			self.cache.swap(0, 1);
-		} else if self.cache[0]
-			.as_ref()
-			.is_none_or(|(cached, _)| *cached != index)
-		{
-			let data = self.port.fetch(self.source, index)?;
-			self.port
-				.shared
-				.input_bytes
-				.fetch_add(data.len() as u64, Ordering::Relaxed);
-			self.cache[1] = self.cache[0].replace((index, data));
+		match self.cache.iter().position(|(cached, _)| *cached == index) {
+			Some(at) => self.cache[..=at].rotate_right(1),
+			None => {
+				let data = self.port.fetch(self.source, index)?;
+				self.port
+					.shared
+					.input_bytes
+					.fetch_add(data.len() as u64, Ordering::Relaxed);
+				self.cache.truncate(self.slots - 1);
+				self.cache.insert(0, (index, data));
+			}
 		}
-		Ok(&self.cache[0].as_ref().expect("just filled").1)
+		Ok(&self.cache[0].1)
 	}
 }
 
@@ -401,6 +430,9 @@ pub(crate) struct ChunkSink<'p> {
 	chunk: Vec<u8>,
 	written: u64,
 	failed: bool,
+	/// Whether the first chunk is held back, to be patched and sent last.
+	holds_head: bool,
+	head: Option<Vec<u8>>,
 }
 
 impl<'p> ChunkSink<'p> {
@@ -410,11 +442,22 @@ impl<'p> ChunkSink<'p> {
 			chunk: new_chunk(),
 			written: 0,
 			failed: false,
+			holds_head: false,
+			head: None,
+		}
+	}
+
+	/// A sink that keeps the first chunk until [`ChunkSink::finish_with_head`].
+	pub(crate) fn holding_head(port: &'p WorkerPort) -> Self {
+		Self {
+			holds_head: true,
+			..Self::new(port)
 		}
 	}
 
 	/// Sends what is left; the bytes written in all.
 	pub(crate) fn finish(mut self) -> io::Result<u64> {
+		debug_assert!(!self.holds_head, "a held head is sent by finish_with_head");
 		if self.failed {
 			return Err(ended());
 		}
@@ -422,6 +465,31 @@ impl<'p> ChunkSink<'p> {
 			let last = std::mem::take(&mut self.chunk);
 			self.port.send(WorkerEvent::Data(last))?;
 		}
+		Ok(self.written)
+	}
+
+	/// Sends the last chunk, then the held first one with `start` written over its first
+	/// bytes (which the archive already holds, zeroed); the bytes written in all.
+	pub(crate) fn finish_with_head(mut self, start: &[u8]) -> io::Result<u64> {
+		debug_assert!(self.holds_head);
+		if self.failed {
+			return Err(ended());
+		}
+		let last = std::mem::take(&mut self.chunk);
+		let (mut head, last) = match self.head.take() {
+			Some(head) => (head, Some(last)),
+			None => (last, None),
+		};
+		if head.len() < start.len() {
+			return Err(io::Error::other(
+				"the archive is shorter than its start header",
+			));
+		}
+		head[..start.len()].copy_from_slice(start);
+		if let Some(last) = last.filter(|last| !last.is_empty()) {
+			self.port.send(WorkerEvent::Data(last))?;
+		}
+		self.port.send(WorkerEvent::Head(head))?;
 		Ok(self.written)
 	}
 }
@@ -436,6 +504,10 @@ impl Write for ChunkSink<'_> {
 		self.written += n as u64;
 		if self.chunk.len() == CHUNK_SIZE {
 			let full = std::mem::replace(&mut self.chunk, new_chunk());
+			if self.holds_head && self.head.is_none() {
+				self.head = Some(full);
+				return Ok(n);
+			}
 			if let Err(e) = self.port.send(WorkerEvent::Data(full)) {
 				self.failed = true;
 				return Err(e);

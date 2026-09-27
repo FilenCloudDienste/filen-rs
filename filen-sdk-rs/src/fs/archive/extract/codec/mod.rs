@@ -1,5 +1,5 @@
-//! The codec side of extracting an archive (a tar, a compressed tar, one compressed file, or a
-//! zip): runs on the codec worker, reads the archive through the driver chunk by chunk, and hands
+//! The codec side of extracting an archive (a tar, a compressed tar, one compressed file, a zip or
+//! 7z): runs on the codec worker, reads the archive through the driver chunk by chunk, and hands
 //! the driver its entries in archive order.
 
 use std::io::{self, Cursor, Read};
@@ -19,10 +19,18 @@ use super::{
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		limits::display_path,
 		password::ArchivePassword,
+		sevenz::{
+			SevenZError, from_source,
+			read::{
+				FOLDER_ENDS_EARLY, FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind,
+				SevenZLimits, read_error, read_index as read_sevenz_index, windows_link_target,
+				wrong_key,
+			},
+		},
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{
-			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, StreamLayout,
-			WorkerEvent, WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, SourceFailed,
+			StreamLayout, WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
 			crypto::{
@@ -69,6 +77,8 @@ pub(crate) struct ArchiveEnd {
 	/// [`StreamEnd`](super::super::decode::StreamEnd)), or before a zip's first.
 	pub(crate) unaccounted_bytes: u64,
 	pub(crate) duplicates: Option<DuplicateEntries>,
+	/// Entries extracted with no checksum in the archive to check them against.
+	pub(crate) unchecked_entries: u64,
 }
 
 /// Encrypted zip entries up to this size are read in full to check the password before anything
@@ -92,6 +102,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			Ok(ArchiveEnd {
 				unaccounted_bytes: unread + drain_trailing(rest).map_err(failure)?,
 				duplicates: None,
+				unchecked_entries: 0,
 			})
 		}
 		Some(Detected::Stream(codec)) => {
@@ -132,6 +143,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				Ok(ArchiveEnd {
 					unaccounted_bytes: unread + tar_trailing + end.unaccounted_bytes,
 					duplicates: None,
+					unchecked_entries: 0,
 				})
 			} else {
 				port.send(WorkerEvent::Opened(StreamLayout::Single { codec }))
@@ -140,10 +152,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			}
 		}
 		Some(Detected::Zip) => extract_zip(port, &job),
-		Some(Detected::SevenZ) => Err(Error::custom(
-			ErrorKind::ArchiveUnsupported,
-			"7z archives cannot be extracted yet",
-		)),
+		Some(Detected::SevenZ) => extract_sevenz(port, &job),
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
 			"the file is not an archive the SDK can extract",
@@ -176,6 +185,7 @@ fn extract_single(
 	Ok(ArchiveEnd {
 		unaccounted_bytes: end.unaccounted_bytes,
 		duplicates: None,
+		unchecked_entries: 0,
 	})
 }
 
@@ -354,7 +364,250 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 			names: index.duplicate_names.clone(),
 			count: index.duplicate_count,
 		}),
+		unchecked_entries: 0,
 	})
+}
+
+/// A 7z: its entries in header order, folder by folder, each checked against its CRC-32 when the
+/// header lists one.
+fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
+	let mut source = SeekInput::new(port, 0, job.len);
+	let password = job.password.as_ref().map(ArchivePassword::utf16le);
+	// a derivation exchanges nothing with the driver for up to a minute: without this it would
+	// be given up on as a dead codec, and a cancel would wait it out
+	let keep_alive = || port.keep_alive();
+	let mut keys = Keys::new(password.as_ref().map(|password| &password[..])).on_round(&keep_alive);
+	let limits = SevenZLimits {
+		max_index_bytes: job.limits.max_index_bytes,
+		max_entries: job.limits.max_members,
+		decoder_memory: job.limits.decoder_memory,
+	};
+	let index =
+		read_sevenz_index(&mut source, job.len, limits, &mut keys).map_err(sevenz_failure)?;
+	// a folder's packed streams are read in turns (BCJ2 has four)
+	// (at most 5 chunks: a folder of several BCJ2 coders refetches rather than hold more)
+	source.set_slots((index.max_packed_streams() + 1).min(5));
+	if let Some(limit) = job.limits.expansion {
+		let stated = index
+			.entries
+			.iter()
+			.fold(0u64, |total, entry| total.saturating_add(entry.size));
+		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
+			return Err(refused(Refused::Expansion(limit.ratio)));
+		}
+	}
+	let encrypted = |entry: &SevenZEntry| {
+		entry
+			.stream
+			.is_some_and(|stream| index.folders[stream.folder].encrypted())
+	};
+	// an encrypted header only decodes with the right password; encrypted data is checked on
+	// the entry cheapest to reach that has a CRC-32, before anything is created. An empty entry
+	// proves nothing: decoding nothing matches its CRC-32 under any key
+	let mut verified = index.headers_encrypted || !index.entries.iter().any(encrypted);
+	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
+	if !verified {
+		if password.is_none() {
+			return Err(sevenz_failure(SevenZError::PasswordRequired));
+		}
+		let probe = index
+			.entries
+			.iter()
+			.filter(|entry| {
+				encrypted(entry)
+					&& entry.size > 0
+					&& entry.crc.is_some()
+					&& index.folders[entry.stream.expect("encrypted").folder].supported()
+			})
+			.min_by_key(|entry| entry.stream.expect("encrypted").offset + entry.size)
+			.filter(|entry| {
+				entry.stream.expect("encrypted").offset + entry.size <= PASSWORD_PROBE_BYTES
+			});
+		if let Some(probe) = probe {
+			// setting the folder up fails for the archive's reasons; what decodes wrong under
+			// the key (skipping to the entry, or the entry itself) is the key's
+			let mut data = cursor.open(&index, probe, &mut keys).map_err(|error| {
+				sevenz_failure(match error {
+					SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
+					SevenZError::Corrupt(FOLDER_ENDS_EARLY) => SevenZError::WrongPassword,
+					error => error,
+				})
+			})?;
+			io::copy(&mut data, &mut io::sink())
+				.map_err(|error| sevenz_failure(wrong_key(read_error(error))))?;
+			verified = true;
+		}
+	}
+
+	port.send(WorkerEvent::Opened(StreamLayout::SevenZ))
+		.map_err(failure)?;
+	let mut unchecked_entries = 0;
+	// while the password is unchecked, damage in encrypted data is likelier a wrong password
+	// than a damaged archive
+	let judged = |error: Error, entry: &SevenZEntry, verified: bool| {
+		if !verified && encrypted(entry) && error.kind() == ErrorKind::ArchiveCorrupt {
+			Error::custom(
+				ErrorKind::ArchiveWrongPassword,
+				"the password is likely wrong",
+			)
+		} else {
+			error
+		}
+	};
+	// whether reading an entry whole against its CRC-32 proved the password
+	let proves = |entry: &SevenZEntry| entry.crc.is_some() && encrypted(entry) && entry.size > 0;
+	for entry in &index.entries {
+		let supported = entry
+			.stream
+			.is_none_or(|stream| index.folders[stream.folder].supported());
+		// a reparse point's data says whether it is a link, so it is read before anything is
+		// sent, and sent from here when it is a file's
+		let mut held = None;
+		let skip = match entry.kind {
+			SevenZKind::Anti => Some(ExtractSkipReason::AntiItem),
+			SevenZKind::Symlink => Some(ExtractSkipReason::Symlink {
+				target: sevenz_symlink_target(&mut cursor, &index, entry, &mut keys),
+			}),
+			_ if !supported => Some(ExtractSkipReason::UnsupportedMethod),
+			SevenZKind::Reparse => {
+				let data = cursor
+					.open(&index, entry, &mut keys)
+					.map_err(sevenz_failure)
+					.and_then(|mut data| {
+						let mut bytes = Vec::new();
+						data.read_to_end(&mut bytes).map_err(sevenz_io_failure)?;
+						Ok(bytes)
+					})
+					.map_err(|error| judged(error, entry, verified))?;
+				verified |= proves(entry);
+				match windows_link_target(&data) {
+					Some(target) => Some(ExtractSkipReason::Symlink {
+						target: display_path(&target).0.to_owned(),
+					}),
+					None => {
+						held = Some(data);
+						None
+					}
+				}
+			}
+			SevenZKind::File | SevenZKind::Dir => None,
+		};
+		if let Some(reason) = skip {
+			port.send(sevenz_skipped(entry, reason)).map_err(failure)?;
+			continue;
+		}
+		let is_dir = entry.kind == SevenZKind::Dir;
+		let mut path = match entry_path(&entry.name) {
+			Ok(path) => path,
+			Err(PathRejection::Empty) if is_dir => continue,
+			Err(rejection) => {
+				port.send(sevenz_skipped(entry, path_skip_reason(rejection)))
+					.map_err(failure)?;
+				continue;
+			}
+		};
+		path.rewritten |= entry.name_rewritten;
+		port.send(WorkerEvent::Entry(EntryHead {
+			ordinal: entry.ordinal,
+			path,
+			modified: entry.modified,
+			kind: if is_dir {
+				EntryKind::Dir
+			} else {
+				EntryKind::File {
+					size: Some(entry.size),
+				}
+			},
+		}))
+		.map_err(failure)?;
+		if is_dir {
+			continue;
+		}
+		if entry.stream.is_some() {
+			let sent = match held {
+				Some(data) => send_file_data(port, &mut data.as_slice()).map_err(failure),
+				None => cursor
+					.open(&index, entry, &mut keys)
+					.map_err(sevenz_failure)
+					.and_then(|mut data| {
+						send_file_data(port, &mut data).map_err(sevenz_io_failure)
+					}),
+			};
+			sent.map_err(|error| judged(error, entry, verified))?;
+			verified |= proves(entry);
+			if entry.crc.is_none() {
+				unchecked_entries += 1;
+			}
+		}
+		port.send(WorkerEvent::FileEnd).map_err(failure)?;
+	}
+	Ok(ArchiveEnd {
+		unaccounted_bytes: index.unaccounted_bytes,
+		duplicates: None,
+		unchecked_entries,
+	})
+}
+
+/// A symlink entry's target, for reporting: its data, when small and readable.
+fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
+	cursor: &mut FolderCursor<'s, R>,
+	index: &SevenZIndex,
+	entry: &SevenZEntry,
+	keys: &mut Keys<'_>,
+) -> String {
+	let readable = entry
+		.stream
+		.is_some_and(|stream| index.folders[stream.folder].supported());
+	if !readable || entry.size > MAX_ARCHIVE_PATH_BYTES as u64 {
+		return String::new();
+	}
+	let mut target = Vec::new();
+	match cursor
+		.open(index, entry, keys)
+		.map(|mut data| data.read_to_end(&mut target))
+	{
+		Ok(Ok(_)) => display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
+		_ => String::new(),
+	}
+}
+
+fn sevenz_skipped(entry: &SevenZEntry, reason: ExtractSkipReason) -> WorkerEvent {
+	let (path, path_truncated) = display_path(&entry.name);
+	WorkerEvent::Skipped(SkippedMember {
+		ordinal: entry.ordinal,
+		path: path.to_owned(),
+		path_truncated,
+		bytes: entry.size,
+		reason,
+	})
+}
+
+fn sevenz_failure(error: SevenZError) -> Error {
+	let kind = match &error {
+		SevenZError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
+		SevenZError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
+		SevenZError::TooLarge(_) => ErrorKind::ArchiveTooLarge,
+		SevenZError::PasswordRequired => ErrorKind::ArchivePasswordRequired,
+		SevenZError::WrongPassword => ErrorKind::ArchiveWrongPassword,
+		SevenZError::Read(_) => {
+			let SevenZError::Read(error) = error else {
+				unreachable!("matched above")
+			};
+			return failure(error);
+		}
+	};
+	Error::custom(kind, error.to_string())
+}
+
+/// The error an entry's read ended with: its checks', or its source's.
+fn sevenz_io_failure(error: io::Error) -> Error {
+	if error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<SevenZError>())
+	{
+		return sevenz_failure(read_error(error));
+	}
+	failure(error)
 }
 
 /// Whether an entry that opened may still be under a wrong key: ZipCrypto's check byte lets 1
@@ -675,12 +928,16 @@ fn failure(error: io::Error) -> Error {
 			Err(inner) if inner.is::<JobEnded>() => {
 				Error::custom(ErrorKind::Cancelled, "the archive job ended")
 			}
-			Err(inner) => Error::custom(ErrorKind::IO, inner.to_string()),
+			Err(inner) if inner.is::<SourceFailed>() => {
+				Error::custom(ErrorKind::IO, inner.to_string())
+			}
+			// whatever else a read ended with came from a decoder: the data is damaged
+			Err(inner) => Error::custom(ErrorKind::ArchiveCorrupt, inner.to_string()),
 		},
 		None if kind == io::ErrorKind::UnexpectedEof => {
 			Error::custom(ErrorKind::ArchiveCorrupt, "the archive ends early")
 		}
-		None => Error::custom(ErrorKind::IO, kind.to_string()),
+		None => Error::custom(ErrorKind::ArchiveCorrupt, kind.to_string()),
 	}
 }
 

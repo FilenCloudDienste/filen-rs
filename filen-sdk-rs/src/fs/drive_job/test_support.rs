@@ -488,6 +488,32 @@ impl DriveBackend for FakeBackend {
 			"a copy must never be registered under a name the destination holds"
 		);
 		let mut log = self.log();
+		// the server's rules for finishing an upload: every chunk index once, and nothing past
+		// the last
+		let mut indices: Vec<u64> = log
+			.uploaded
+			.iter()
+			.filter(|(file, _)| *file == upload.spec.uuid)
+			.map(|(_, index)| *index)
+			.collect();
+		indices.sort_unstable();
+		assert_eq!(
+			indices,
+			(0..completion.num_chunks).collect::<Vec<_>>(),
+			"an upload is finished with each of its chunks uploaded once"
+		);
+		if self.quirks.contains(&Quirk::KeepUploads) {
+			let mut hasher = blake3::Hasher::new();
+			for index in 0..completion.num_chunks {
+				let chunk = &log.uploaded_data[&(upload.spec.uuid, index)];
+				hasher.update(chunk);
+			}
+			assert_eq!(
+				completion.hash,
+				filen_types::crypto::Blake3Hash::from(hasher.finalize()),
+				"the hash an upload is finished with is of its chunks in order"
+			);
+		}
 		log.finished
 			.insert(upload.spec.uuid, (name.as_ref().to_owned(), completion));
 		log.registered_in

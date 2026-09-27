@@ -226,6 +226,7 @@ impl Client {
 			sources,
 			max_bytes: config.max_bytes,
 			config: archives,
+			head_last: matches!(config.format, CompressFormat::SevenZ { .. }),
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
 			disposal,

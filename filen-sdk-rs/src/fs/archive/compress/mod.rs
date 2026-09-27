@@ -29,6 +29,7 @@ pub use super::{
 	encode::Compression,
 	format::StreamCodec,
 	password::ArchivePassword,
+	sevenz::write::{SevenZEncryption, SevenZMethod},
 	zip::{crypto::AesStrength, write::ZipMethod},
 };
 pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
@@ -77,6 +78,16 @@ pub enum CompressFormat {
 		method: ZipMethod,
 		encryption: Option<AesStrength>,
 	},
+	/// A 7z of the items: each file compressed on its own, or `solid` (files together in blocks
+	/// of up to 2 GiB, which compresses better but reads slower when one file is wanted), and
+	/// encrypted with AES-256 when `encryption` is set.
+	SevenZ {
+		/// How the files are compressed.
+		method: SevenZMethod,
+		/// Whether the files are compressed together in blocks rather than each on its own.
+		solid: bool,
+		encryption: Option<SevenZEncryption>,
+	},
 }
 
 impl StreamCodec {
@@ -105,44 +116,47 @@ impl CompressFormat {
 			} => format!(".tar{}", compression.codec.extension()),
 			Self::Single { compression } => compression.codec.extension().to_owned(),
 			Self::Zip { .. } => ".zip".to_owned(),
+			Self::SevenZ { .. } => ".7z".to_owned(),
 		}
 	}
 
 	/// Checks the format's levels, and that a password comes exactly with encryption.
 	pub(crate) fn check(self, has_password: bool) -> Result<(), Error> {
-		if let Self::Zip { method, encryption } = self {
-			let level = match method {
-				ZipMethod::Stored => None,
-				ZipMethod::Deflate { level } | ZipMethod::Bzip2 { level } => Some(level),
-			};
-			if level.is_some_and(|level| !(1..=9).contains(&level)) {
-				return Err(Error::custom(
-					ErrorKind::InvalidState,
-					"zip compression takes levels 1 to 9",
-				));
-			}
-			match (encryption.is_some(), has_password) {
-				(true, false) => {
-					return Err(Error::custom(
-						ErrorKind::ArchivePasswordRequired,
-						"an encrypted zip needs a password",
-					));
-				}
-				(false, true) => {
+		let encrypted = match self {
+			Self::Zip { method, encryption } => {
+				let level = match method {
+					ZipMethod::Stored => None,
+					ZipMethod::Deflate { level } | ZipMethod::Bzip2 { level } => Some(level),
+				};
+				if level.is_some_and(|level| !(1..=9).contains(&level)) {
 					return Err(Error::custom(
 						ErrorKind::InvalidState,
-						"a password was given for an archive that is not encrypted",
+						"zip compression takes levels 1 to 9",
 					));
 				}
-				_ => {}
+				encryption.is_some()
 			}
-		} else if has_password {
-			return Err(Error::custom(
+			Self::SevenZ {
+				method, encryption, ..
+			} => {
+				method
+					.check()
+					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
+				encryption.is_some()
+			}
+			Self::Tar { .. } | Self::Single { .. } => false,
+		};
+		match (encrypted, has_password) {
+			(true, false) => Err(Error::custom(
+				ErrorKind::ArchivePasswordRequired,
+				"an encrypted archive needs a password",
+			)),
+			(false, true) => Err(Error::custom(
 				ErrorKind::InvalidState,
-				"only zip archives are encrypted",
-			));
+				"a password was given for an archive that is not encrypted",
+			)),
+			_ => self.encoder_memory().map(drop),
 		}
-		self.encoder_memory().map(drop)
 	}
 
 	/// Memory the format's encoder needs, in bytes (0 for a bare tar).
@@ -166,6 +180,20 @@ impl CompressFormat {
 				}
 				.encoder_memory()?,
 			}),
+			Self::SevenZ {
+				method, encryption, ..
+			} => {
+				method
+					.check()
+					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
+				// an encrypted header is compressed with LZMA2 on its own, once the data is done
+				Ok(match encryption {
+					Some(SevenZEncryption::EntriesAndHeaders) => method
+						.encoder_memory()
+						.max(super::sevenz::write::header_encoder_memory()),
+					_ => method.encoder_memory(),
+				})
+			}
 		}
 	}
 
@@ -179,6 +207,7 @@ impl CompressFormat {
 			} => ExtensionFormat::CompressedTar(compression.codec),
 			Self::Single { compression } => ExtensionFormat::Stream(compression.codec),
 			Self::Zip { .. } => ExtensionFormat::Zip,
+			Self::SevenZ { .. } => ExtensionFormat::SevenZ,
 		};
 		match match_extension(name) {
 			Some((extension, format)) if format == expected => Ok(extension.len()),
@@ -272,5 +301,56 @@ mod tests {
 				.unwrap(),
 			7_600_000
 		);
+	}
+
+	#[test]
+	fn every_formats_default_fits_the_smallest_codec_budget() {
+		// iOS and wasm budget 128 MiB for a job's codec
+		const SMALLEST_BUDGET: u64 = 128 << 20;
+		let codecs = [
+			StreamCodec::Gzip,
+			StreamCodec::Bzip2,
+			StreamCodec::Xz,
+			StreamCodec::Lzma,
+			StreamCodec::Lzip,
+			StreamCodec::Lz4,
+			StreamCodec::Brotli,
+		];
+		let mut formats: Vec<CompressFormat> = codecs
+			.iter()
+			.flat_map(|&codec| {
+				[
+					CompressFormat::Tar {
+						compression: Some(compression(codec)),
+					},
+					CompressFormat::Single {
+						compression: compression(codec),
+					},
+				]
+			})
+			.collect();
+		formats.push(CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		});
+		for method in [
+			SevenZMethod::Lzma2 { level: 6 },
+			SevenZMethod::Lzma { level: 6 },
+			SevenZMethod::Ppmd { level: 6 },
+			SevenZMethod::Bzip2 { level: 9 },
+		] {
+			formats.push(CompressFormat::SevenZ {
+				method,
+				solid: true,
+				encryption: None,
+			});
+		}
+		for format in formats {
+			let memory = format.encoder_memory().unwrap();
+			assert!(
+				memory <= SMALLEST_BUDGET,
+				"{format:?} states {memory} bytes"
+			);
+		}
 	}
 }

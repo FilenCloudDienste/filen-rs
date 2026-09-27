@@ -32,6 +32,11 @@ impl ArchivePassword {
 	pub(crate) fn as_bytes(&self) -> &[u8] {
 		self.0.as_bytes()
 	}
+
+	/// The password as UTF-16LE, which 7z derives its keys from.
+	pub(crate) fn utf16le(&self) -> Zeroizing<Vec<u8>> {
+		Zeroizing::new(self.0.encode_utf16().flat_map(u16::to_le_bytes).collect())
+	}
 }
 
 impl fmt::Debug for ArchivePassword {
@@ -51,5 +56,11 @@ mod tests {
 		let password = ArchivePassword::new(" secret ".into()).unwrap();
 		assert_eq!(password.as_bytes(), b" secret ", "kept exactly as given");
 		assert_eq!(format!("{password:?}"), "ArchivePassword(<redacted>)");
+		let password = ArchivePassword::new("aé𝄞".into()).unwrap();
+		assert_eq!(
+			*password.utf16le(),
+			[0x61, 0, 0xE9, 0, 0x34, 0xD8, 0x1E, 0xDD],
+			"UTF-16LE, with a surrogate pair"
+		);
 	}
 }

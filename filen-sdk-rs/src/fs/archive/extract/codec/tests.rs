@@ -17,6 +17,7 @@ use crate::{
 		extract::ExpansionLimit,
 		format::StreamCodec,
 		password::ArchivePassword,
+		sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 		worker,
 		zip::{
 			crypto::AesStrength,
@@ -123,6 +124,7 @@ fn run_full(
 				member.bytes,
 				member.reason,
 			)),
+			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
 		}
 	}
 	// the result follows the events closing, once the codec's thread hands it over
@@ -239,6 +241,7 @@ fn a_bare_tar_is_sent_member_by_member() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
+			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
 		}
@@ -311,6 +314,7 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
+			unchecked_entries: 0,
 			unaccounted_bytes: 4,
 			duplicates: None,
 		}
@@ -322,6 +326,7 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 	// what `tar cf e.tar -T /dev/null` writes: the end-of-archive marker, padded to a record
 	let empty = vec![0u8; 10 * 1024];
 	let nothing = ArchiveEnd {
+		unchecked_entries: 0,
 		unaccounted_bytes: 0,
 		duplicates: None,
 	};
@@ -369,6 +374,7 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
+			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
 		}
@@ -377,15 +383,20 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 
 #[test]
 fn what_the_codec_cannot_read_is_refused() {
-	// zip magic without a zip behind it
+	// zip and 7z magic without the archive behind it
 	assert_eq!(
 		kind(run(b"PK\x03\x04rest", "a.zip").1),
 		ErrorKind::ArchiveCorrupt
 	);
 	assert_eq!(
 		kind(run(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4], "a.7z").1),
-		ErrorKind::ArchiveUnsupported
+		ErrorKind::ArchiveCorrupt
 	);
+	// a 7z of a format version after 0.x
+	let mut future = [0u8; 32];
+	future[..6].copy_from_slice(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]);
+	future[6] = 1;
+	assert_eq!(kind(run(&future, "a.7z").1), ErrorKind::ArchiveUnsupported);
 	assert_eq!(
 		kind(run(b"just some text", "a.txt").1),
 		ErrorKind::ArchiveUnsupported
@@ -526,6 +537,7 @@ fn a_zip_is_sent_entry_by_entry() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
+			unchecked_entries: 0,
 			unaccounted_bytes: 0,
 			duplicates: None,
 		}
@@ -608,6 +620,272 @@ fn zip_duplicates_symlinks_and_bombs() {
 	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
 }
 
+/// A 7z of `entries` (a `None` is a directory), with keys cheap to derive.
+fn sevenz_of(
+	entries: &[(&str, Option<&[u8]>)],
+	method: SevenZMethod,
+	solid: bool,
+	encryption: Option<(SevenZEncryption, &str)>,
+) -> Vec<u8> {
+	let password: Option<Vec<u8>> = encryption
+		.map(|(_, password)| password.encode_utf16().flat_map(u16::to_le_bytes).collect());
+	let mut writer = SevenZWriter::with_cycles_power(
+		Vec::new(),
+		method,
+		solid,
+		encryption.map(|(what, _)| (what, &password.as_ref().unwrap()[..])),
+		4,
+	)
+	.unwrap();
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None),
+			Some(data) => {
+				writer
+					.add_file(path, None, data.len() as u64, &mut &data[..])
+					.unwrap();
+			}
+		}
+	}
+	let (mut archive, start) = writer.finish().unwrap();
+	archive[..32].copy_from_slice(&start);
+	archive
+}
+
+#[test]
+fn a_7z_is_sent_entry_by_entry() {
+	let big = pattern(CHUNK_SIZE + 99, 4);
+	for solid in [false, true] {
+		let archive = sevenz_of(
+			&[
+				("docs", None),
+				("docs/a.txt", Some(b"alpha")),
+				("empty", Some(b"")),
+				("big.bin", Some(&big)),
+			],
+			SevenZMethod::Lzma2 { level: 1 },
+			solid,
+			None,
+		);
+		let (seen, end) = run(&archive, "sample.7z");
+		// files with data come first, then directories and empty files
+		assert_eq!(
+			seen,
+			vec![
+				Seen::Opened(StreamLayout::SevenZ),
+				file(0, "docs/a.txt", b"alpha"),
+				Seen::File {
+					ordinal: 1,
+					path: "big.bin".into(),
+					size: Some(big.len() as u64),
+					chunks: vec![CHUNK_SIZE, 99],
+					data: big.clone(),
+					ended: true,
+				},
+				Seen::Dir(2, "docs".into()),
+				file(3, "empty", b""),
+			],
+			"solid {solid}"
+		);
+		assert_eq!(
+			end.unwrap(),
+			ArchiveEnd {
+				unchecked_entries: 0,
+				unaccounted_bytes: 0,
+				duplicates: None,
+			}
+		);
+	}
+}
+
+#[test]
+fn an_encrypted_7z_needs_the_right_password_before_anything_is_sent() {
+	for what in [
+		SevenZEncryption::Entries,
+		SevenZEncryption::EntriesAndHeaders,
+	] {
+		let archive = sevenz_of(
+			&[("secret.txt", Some(b"secret"))],
+			SevenZMethod::Lzma2 { level: 1 },
+			true,
+			Some((what, "right")),
+		);
+		let (seen, end) = run_full(&archive, "s.7z", LIMITS, None);
+		assert_eq!(kind(end), ErrorKind::ArchivePasswordRequired, "{what:?}");
+		assert!(seen.is_empty());
+		let (seen, end) = run_full(&archive, "s.7z", LIMITS, Some("wrong"));
+		assert_eq!(kind(end), ErrorKind::ArchiveWrongPassword, "{what:?}");
+		assert!(
+			seen.is_empty(),
+			"the password is checked before anything is sent"
+		);
+		let (seen, end) = run_full(&archive, "s.7z", LIMITS, Some("right"));
+		end.unwrap();
+		assert_eq!(
+			seen,
+			vec![
+				Seen::Opened(StreamLayout::SevenZ),
+				file(0, "secret.txt", b"secret"),
+			]
+		);
+	}
+}
+
+#[test]
+fn sevenz_symlinks_and_anti_items_are_skipped() {
+	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut link = SevenZEntry::new_file("link");
+	link.has_windows_attributes = true;
+	link.windows_attributes = 0x8000 | (0o120_777 << 16);
+	writer
+		.push_archive_entry(link, Some(&b"target/file"[..]))
+		.unwrap();
+	let mut anti = SevenZEntry::new_file("gone");
+	anti.is_anti_item = true;
+	anti.has_stream = false;
+	writer.push_archive_entry::<&[u8]>(anti, None).unwrap();
+	writer
+		.push_archive_entry(SevenZEntry::new_file("kept"), Some(&b"kept"[..]))
+		.unwrap();
+	let archive = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&archive, "links.7z");
+	end.unwrap();
+	assert_eq!(
+		seen,
+		vec![
+			Seen::Opened(StreamLayout::SevenZ),
+			Seen::Skipped(
+				0,
+				"link".into(),
+				11,
+				ExtractSkipReason::Symlink {
+					target: "target/file".into()
+				}
+			),
+			Seen::Skipped(1, "gone".into(), 0, ExtractSkipReason::AntiItem),
+			file(2, "kept", b"kept"),
+		]
+	);
+}
+
+/// A Windows REPARSE_DATA_BUFFER for a symlink (`tag` 0xA000000C, with its flags field) or a
+/// mount point (0xA0000003), as 7-Zip stores one with `-snl`.
+fn reparse_data(tag: u32, substitute: &str, print: &str) -> Vec<u8> {
+	let utf16 =
+		|text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+	let (substitute, print) = (utf16(substitute), utf16(print));
+	let mut body = Vec::new();
+	for field in [0, substitute.len(), substitute.len(), print.len()] {
+		body.extend_from_slice(&u16::try_from(field).unwrap().to_le_bytes());
+	}
+	if tag == 0xA000_000C {
+		body.extend_from_slice(&1u32.to_le_bytes());
+	}
+	body.extend(substitute);
+	body.extend(print);
+	let mut data = tag.to_le_bytes().to_vec();
+	data.extend_from_slice(&u16::try_from(body.len()).unwrap().to_le_bytes());
+	data.extend_from_slice(&[0, 0]);
+	data.extend(body);
+	data
+}
+
+#[test]
+fn a_7z_reparse_point_is_a_link_only_when_its_data_says_so() {
+	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
+	const REPARSE_POINT: u32 = 0x400;
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut push = |name: &str, data: Option<&[u8]>| {
+		let mut entry = SevenZEntry::new_file(name);
+		entry.has_windows_attributes = true;
+		entry.windows_attributes = REPARSE_POINT | 0x20;
+		entry.has_stream = data.is_some();
+		writer.push_archive_entry(entry, data).unwrap();
+	};
+	let symlink = reparse_data(0xA000_000C, r"\??\C:\data\file.txt", r"C:\data\file.txt");
+	let junction = reparse_data(0xA000_0003, r"\??\C:\data", "");
+	let placeholder = pattern(5000, 3);
+	push("link", Some(&symlink));
+	push("junction", Some(&junction));
+	// a file behind a reparse point (a cloud placeholder, say) carries its content
+	push("placeholder.bin", Some(&placeholder));
+	push("odd.txt", Some(b"not reparse data"));
+	push("empty", None);
+	let archive = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&archive, "links.7z");
+	end.unwrap();
+	let link = |ordinal, path: &str, bytes: &[u8], target: &str| {
+		Seen::Skipped(
+			ordinal,
+			path.into(),
+			bytes.len() as u64,
+			ExtractSkipReason::Symlink {
+				target: target.into(),
+			},
+		)
+	};
+	assert_eq!(
+		seen,
+		vec![
+			Seen::Opened(StreamLayout::SevenZ),
+			link(0, "link", &symlink, r"C:\data\file.txt"),
+			// a junction without a print name shows its substitute name, less the NT prefix
+			link(1, "junction", &junction, r"C:\data"),
+			file(2, "placeholder.bin", &placeholder),
+			file(3, "odd.txt", b"not reparse data"),
+			file(4, "empty", b""),
+		]
+	);
+}
+
+#[test]
+fn damaged_data_is_reported_as_a_damaged_archive() {
+	// the data of an unencrypted entry: the decoder, not the source, fails
+	let data = pattern(200_000, 1);
+	let mut archive = sevenz_of(
+		&[("a.bin", Some(&data))],
+		SevenZMethod::Deflate { level: 6 },
+		false,
+		None,
+	);
+	archive[32 + 50] ^= 0xFF;
+	let (_, end) = run(&archive, "a.7z");
+	assert_eq!(kind(end), ErrorKind::ArchiveCorrupt);
+
+	let mut zip = zip_of(&[("a.bin", Some(&data))], None);
+	// a byte inside the deflate stream, past the local header and name
+	zip[30 + 5 + 100] ^= 0xFF;
+	let (_, end) = run(&zip, "a.zip");
+	assert_eq!(
+		kind(end),
+		ErrorKind::ArchiveCorrupt,
+		"a zip's decoder errors too"
+	);
+}
+
+#[test]
+fn a_filtered_7z_spanning_chunks_decodes() {
+	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod};
+	// the x86 branch filter over LZMA2, across several of the source's chunks
+	let data = pattern(3 * CHUNK_SIZE, 9);
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	writer.set_content_methods(vec![
+		EncoderMethod::BCJ_X86_FILTER.into(),
+		EncoderMethod::LZMA2.into(),
+	]);
+	writer
+		.push_archive_entry(SevenZEntry::new_file("program.exe"), Some(&data[..]))
+		.unwrap();
+	let archive = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&archive, "program.7z");
+	end.unwrap();
+	let Some(Seen::File { data: read, .. }) = seen.get(1) else {
+		panic!("{seen:?}");
+	};
+	assert_eq!(*read, data);
+}
+
 #[test]
 fn data_under_a_tar_directory_is_unaccounted() {
 	let mut builder = tar::Builder::new(Vec::new());
@@ -664,6 +942,62 @@ fn an_empty_deflated_directory_is_no_hidden_data() {
 	// a "directory" that stores data hides it
 	let (_, end) = run(&zip_with_deflated_dirs(b"not a directory's"), "java.zip");
 	assert!(end.unwrap().unaccounted_bytes > 0);
+}
+
+#[test]
+fn a_wrong_password_on_lzma_entries_reads_as_one() {
+	let archive = sevenz_of(
+		&[("a.txt", Some(&pattern(10_000, 1)[..]))],
+		SevenZMethod::Lzma { level: 1 },
+		false,
+		Some((SevenZEncryption::Entries, "right")),
+	);
+	for attempt in 0..16 {
+		let wrong = format!("wrong {attempt}");
+		let (seen, end) = run_full(&archive, "a.7z", LIMITS, Some(&wrong));
+		assert_eq!(kind(end), ErrorKind::ArchiveWrongPassword, "{wrong}");
+		assert!(seen.is_empty());
+	}
+}
+
+#[test]
+fn an_empty_7z_entry_proves_no_password() {
+	use sevenz_rust2::{
+		ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod,
+		encoder_options::AesEncoderOptions,
+	};
+	// sevenz-rust2 gives an empty file added with a reader a data stream of its own; decoding
+	// nothing matches its CRC-32 under any key, and LZMA2 reads nothing before its first output
+	let data = pattern(64 << 10, 5);
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	writer.set_content_methods(vec![
+		AesEncoderOptions::new("right".into()).into(),
+		EncoderMethod::LZMA2.into(),
+	]);
+	writer.set_encrypt_header(false);
+	writer
+		.push_archive_entry(SevenZEntry::new_file("empty.txt"), Some(&b""[..]))
+		.unwrap();
+	writer
+		.push_archive_entry(SevenZEntry::new_file("data.bin"), Some(&data[..]))
+		.unwrap();
+	let archive = writer.finish().unwrap().into_inner();
+	for wrong in ["wrong", "also wrong"] {
+		let (seen, end) = run_full(&archive, "empty.7z", LIMITS, Some(wrong));
+		assert_eq!(
+			end.map(|_| ()).map_err(|error| error.kind()),
+			Err(ErrorKind::ArchiveWrongPassword),
+			"{seen:?}"
+		);
+		assert!(seen.is_empty(), "nothing is created: {seen:?}");
+	}
+	let (seen, end) = run_full(&archive, "empty.7z", LIMITS, Some("right"));
+	end.unwrap();
+	assert!(
+		seen.iter()
+			.any(|seen| matches!(seen, Seen::File { data: read, .. } if *read == data)),
+		"{seen:?}"
+	);
 }
 
 /// A zip of stored, ZipCrypto-encrypted files (no data descriptors, so each check byte is the
