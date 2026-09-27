@@ -193,30 +193,45 @@ fn find_directory<R: Read + Seek>(
 	let window = len.min(EOCD_LEN + MAX_COMMENT_LEN);
 	let tail = read_at(source, len - window, window as usize)?;
 	let comment_end = |at: usize| at as u64 + EOCD_LEN + u64::from(u16_at(&tail, at + 20));
-	// a record whose comment ends the file, or else the last one whose comment fits: other tools
-	// open a zip with bytes after its comment too
+	// the record whose comment ends the file, or else the last one whose comment fits (other
+	// tools open a zip with bytes after its comment); either only if its directory can be where
+	// it says, since a comment, and the bytes after one, can hold the record's signature too
 	let mut candidates = 0;
-	let mut fitting = None;
-	let mut at = tail.len() - EOCD_LEN as usize;
-	let at = loop {
-		if u32_at(&tail, at) == EOCD_SIG {
-			candidates += 1;
-			match comment_end(at) {
-				end if end == window => break at,
-				end if end < window => {
+	let (mut exact, mut fitting, mut implausible) = (None, None, None);
+	for at in (0..=tail.len() - EOCD_LEN as usize).rev() {
+		if u32_at(&tail, at) != EOCD_SIG {
+			continue;
+		}
+		candidates += 1;
+		let end = comment_end(at);
+		if end <= window {
+			let record = &tail[at..at + EOCD_LEN as usize];
+			match (
+				end == window,
+				plausible(source, len - window + at as u64, record)?,
+			) {
+				(true, true) => {
+					exact = Some(at);
+					break;
+				}
+				(false, true) => {
 					fitting.get_or_insert(at);
 				}
-				_ => {}
-			}
-			if candidates == MAX_EOCD_CANDIDATES {
-				break fitting.ok_or(ZipError::Corrupt("no end of central directory record"))?;
+				// kept for the error reading it gives, should nothing else do
+				(true, false) => {
+					implausible.get_or_insert(at);
+				}
+				(false, false) => {}
 			}
 		}
-		if at == 0 {
-			break fitting.ok_or(ZipError::Corrupt("no end of central directory record"))?;
+		if candidates == MAX_EOCD_CANDIDATES {
+			break;
 		}
-		at -= 1;
-	};
+	}
+	let at = exact
+		.or(fitting)
+		.or(implausible)
+		.ok_or(ZipError::Corrupt("no end of central directory record"))?;
 	let trailing = window - comment_end(at);
 	let eocd_pos = len - window + at as u64;
 	let eocd = &tail[at..at + EOCD_LEN as usize];
@@ -291,6 +306,22 @@ fn find_directory<R: Read + Seek>(
 		shift,
 		trailing,
 	})
+}
+
+/// Whether the end record at `eocd_pos` can be the zip's: it has a zip64 locator before it, or
+/// its central directory fits before it and starts with a record's signature.
+fn plausible<R: Read + Seek>(source: &mut R, eocd_pos: u64, eocd: &[u8]) -> Result<bool, ZipError> {
+	if eocd_pos >= EOCD64_LOCATOR_LEN
+		&& u32_at(&read_at(source, eocd_pos - EOCD64_LOCATOR_LEN, 4)?, 0) == EOCD64_LOCATOR_SIG
+	{
+		return Ok(true);
+	}
+	let size = u64::from(u32_at(eocd, 12));
+	let offset = u64::from(u32_at(eocd, 16));
+	let Some(start) = eocd_pos.checked_sub(size).filter(|&start| offset <= start) else {
+		return Ok(false);
+	};
+	Ok(size == 0 || u32_at(&read_at(source, start, 4)?, 0) == CENTRAL_HEADER_SIG)
 }
 
 /// Reads a zip's central directory.

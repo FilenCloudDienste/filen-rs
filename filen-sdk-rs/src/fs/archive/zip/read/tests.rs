@@ -777,6 +777,30 @@ fn an_entry_of_over_4_gib_reads_back() {
 }
 
 #[test]
+fn an_end_record_signature_after_the_comment_is_not_taken_for_one() {
+	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);
+	// trailing bytes holding what reads as an end record of one entry, whose directory would
+	// start in the real end record
+	let fake = [
+		&EOCD_SIG.to_le_bytes()[..],
+		&[0; 4],
+		&1u16.to_le_bytes(),
+		&1u16.to_le_bytes(),
+		&(CENTRAL_HEADER_LEN as u32).to_le_bytes(),
+		&0u32.to_le_bytes(),
+		&0u16.to_le_bytes(),
+		b"and more padding",
+	]
+	.concat();
+	let mut padded = zip.clone();
+	padded.extend_from_slice(&fake);
+	let mut source = Cursor::new(&padded);
+	let index = read_index(&mut source, padded.len() as u64, LIMITS).unwrap();
+	assert_eq!(index.trailing_bytes, fake.len() as u64);
+	assert_eq!(read_all(&padded, None).unwrap()[0].2, b"alpha");
+}
+
+#[test]
 fn bytes_after_the_end_record_are_counted() {
 	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);
 	let mut padded = zip.clone();
