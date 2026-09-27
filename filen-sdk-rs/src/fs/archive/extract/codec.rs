@@ -23,7 +23,8 @@ use super::{
 			SevenZError, from_source,
 			read::{
 				FOLDER_ENDS_EARLY, FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind,
-				SevenZLimits, read_error, read_index as read_sevenz_index, wrong_key,
+				SevenZLimits, read_error, read_index as read_sevenz_index, windows_link_target,
+				wrong_key,
 			},
 		},
 		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarMember, TarReader},
@@ -436,16 +437,54 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 	port.send(WorkerEvent::Opened(StreamLayout::SevenZ))
 		.map_err(failure)?;
 	let mut unchecked_entries = 0;
+	// while the password is unchecked, damage in encrypted data is likelier a wrong password
+	// than a damaged archive
+	let judged = |error: Error, entry: &SevenZEntry, verified: bool| {
+		if !verified && encrypted(entry) && error.kind() == ErrorKind::ArchiveCorrupt {
+			Error::custom(
+				ErrorKind::ArchiveWrongPassword,
+				"the password is likely wrong",
+			)
+		} else {
+			error
+		}
+	};
+	// whether reading an entry whole against its CRC-32 proved the password
+	let proves = |entry: &SevenZEntry| entry.crc.is_some() && encrypted(entry) && entry.size > 0;
 	for entry in &index.entries {
 		let supported = entry
 			.stream
 			.is_none_or(|stream| index.folders[stream.folder].supported());
+		// a reparse point's data says whether it is a link, so it is read before anything is
+		// sent, and sent from here when it is a file's
+		let mut held = None;
 		let skip = match entry.kind {
 			SevenZKind::Anti => Some(ExtractSkipReason::AntiItem),
 			SevenZKind::Symlink => Some(ExtractSkipReason::Symlink {
 				target: sevenz_symlink_target(&mut cursor, &index, entry, &mut keys),
 			}),
 			_ if !supported => Some(ExtractSkipReason::UnsupportedMethod),
+			SevenZKind::Reparse => {
+				let data = cursor
+					.open(&index, entry, &mut keys)
+					.map_err(sevenz_failure)
+					.and_then(|mut data| {
+						let mut bytes = Vec::new();
+						data.read_to_end(&mut bytes).map_err(sevenz_io_failure)?;
+						Ok(bytes)
+					})
+					.map_err(|error| judged(error, entry, verified))?;
+				verified |= proves(entry);
+				match windows_link_target(&data) {
+					Some(target) => Some(ExtractSkipReason::Symlink {
+						target: display_path(&target).0.to_owned(),
+					}),
+					None => {
+						held = Some(data);
+						None
+					}
+				}
+			}
 			SevenZKind::File | SevenZKind::Dir => None,
 		};
 		if let Some(reason) = skip {
@@ -480,28 +519,18 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 			continue;
 		}
 		if entry.stream.is_some() {
-			let checked = entry.crc.is_some();
-			let sent = cursor
-				.open(&index, entry, &mut keys)
-				.map_err(sevenz_failure)
-				.and_then(|mut data| send_file_data(port, &mut data).map_err(sevenz_io_failure));
-			match sent {
-				Ok(_) => verified |= checked && encrypted(entry) && entry.size > 0,
-				// while the password is unchecked, damage in encrypted data is likelier a
-				// wrong password than a damaged archive
-				Err(error)
-					if !verified
-						&& encrypted(entry)
-						&& error.kind() == ErrorKind::ArchiveCorrupt =>
-				{
-					return Err(Error::custom(
-						ErrorKind::ArchiveWrongPassword,
-						"the password is likely wrong",
-					));
-				}
-				Err(error) => return Err(error),
-			}
-			if !checked {
+			let sent = match held {
+				Some(data) => send_file_data(port, &mut data.as_slice()).map_err(failure),
+				None => cursor
+					.open(&index, entry, &mut keys)
+					.map_err(sevenz_failure)
+					.and_then(|mut data| {
+						send_file_data(port, &mut data).map_err(sevenz_io_failure)
+					}),
+			};
+			sent.map_err(|error| judged(error, entry, verified))?;
+			verified |= proves(entry);
+			if entry.crc.is_none() {
 				unchecked_entries += 1;
 			}
 		}

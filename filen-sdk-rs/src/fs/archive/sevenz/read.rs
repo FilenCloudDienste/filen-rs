@@ -208,7 +208,12 @@ impl Folder {
 pub(crate) enum SevenZKind {
 	File,
 	Dir,
+	/// A Unix symlink, whose data is its target.
 	Symlink,
+	/// A Windows reparse point with data under [`REPARSE_LINK_MAX`] bytes: a link when the data
+	/// is a symlink's or a junction's (see [`windows_link_target`]), otherwise a file, as 7-Zip
+	/// has it. A larger one is a file behind a reparse point (a cloud placeholder, say).
+	Reparse,
 	/// A deletion marker of an update archive: no content.
 	Anti,
 }
@@ -998,8 +1003,9 @@ fn read_files(
 		let unix_type = attribute
 			.filter(|attribute| attribute & ATTRIBUTE_UNIX_EXTENSION != 0)
 			.map(|attribute| (attribute >> 16) & UNIX_TYPE_MASK);
-		let symlink = unix_type == Some(UNIX_SYMLINK)
-			|| attribute.is_some_and(|attribute| attribute & ATTRIBUTE_REPARSE_POINT != 0);
+		let symlink = unix_type == Some(UNIX_SYMLINK);
+		let reparse =
+			!symlink && attribute.is_some_and(|attribute| attribute & ATTRIBUTE_REPARSE_POINT != 0);
 		let (kind, stream, size, crc) = if empty_stream[ordinal] {
 			let (is_empty_file, is_anti) = (empty_file[empty_at], anti[empty_at]);
 			empty_at += 1;
@@ -1019,6 +1025,8 @@ fn read_files(
 			))?;
 			let kind = if symlink {
 				SevenZKind::Symlink
+			} else if reparse && size < REPARSE_LINK_MAX {
+				SevenZKind::Reparse
 			} else {
 				SevenZKind::File
 			};
@@ -1503,6 +1511,49 @@ pub(crate) fn wrong_key(error: SevenZError) -> SevenZError {
 		SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
 		error => error,
 	}
+}
+
+/// The size under which a reparse point's data may be a link's, as 7-Zip reads it.
+pub(crate) const REPARSE_LINK_MAX: u64 = 1 << 12;
+
+/// The target of the Windows link whose REPARSE_DATA_BUFFER is `data`: a symlink's or a
+/// junction's print name, or else its substitute name less the NT `\??\` prefix. `None` for
+/// data that is no such buffer, which 7-Zip extracts as a file's content.
+pub(crate) fn windows_link_target(data: &[u8]) -> Option<String> {
+	const SYMLINK: u32 = 0xA000_000C;
+	const MOUNT_POINT: u32 = 0xA000_0003;
+	let u16_at = |at: usize| Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?));
+	let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+	// the tag, the data's length and a reserved field, then the names' offsets and lengths
+	if usize::from(u16_at(4)?) + 8 != data.len() {
+		return None;
+	}
+	let names = match tag {
+		// a symlink's flags come before its names
+		SYMLINK => 8 + 8 + 4,
+		MOUNT_POINT => 8 + 8,
+		_ => return None,
+	};
+	let name = |field: usize| -> Option<String> {
+		let offset = usize::from(u16_at(8 + field)?);
+		let len = usize::from(u16_at(10 + field)?);
+		let bytes = data.get(names + offset..names + offset + len)?;
+		let units = bytes
+			.chunks_exact(2)
+			.map(|unit| u16::from_le_bytes([unit[0], unit[1]]));
+		char::decode_utf16(units)
+			.collect::<Result<String, _>>()
+			.ok()
+	};
+	let (substitute, print) = (name(0)?, name(4)?);
+	Some(if print.is_empty() {
+		substitute
+			.strip_prefix(r"\??\")
+			.unwrap_or(&substitute)
+			.to_owned()
+	} else {
+		print
+	})
 }
 
 /// The error of reading past what a folder decodes to.

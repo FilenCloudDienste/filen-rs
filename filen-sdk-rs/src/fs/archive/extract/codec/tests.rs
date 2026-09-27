@@ -779,6 +779,76 @@ fn sevenz_symlinks_and_anti_items_are_skipped() {
 	);
 }
 
+/// A Windows REPARSE_DATA_BUFFER for a symlink (`tag` 0xA000000C, with its flags field) or a
+/// mount point (0xA0000003), as 7-Zip stores one with `-snl`.
+fn reparse_data(tag: u32, substitute: &str, print: &str) -> Vec<u8> {
+	let utf16 =
+		|text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+	let (substitute, print) = (utf16(substitute), utf16(print));
+	let mut body = Vec::new();
+	for field in [0, substitute.len(), substitute.len(), print.len()] {
+		body.extend_from_slice(&(field as u16).to_le_bytes());
+	}
+	if tag == 0xA000_000C {
+		body.extend_from_slice(&1u32.to_le_bytes());
+	}
+	body.extend(substitute);
+	body.extend(print);
+	let mut data = tag.to_le_bytes().to_vec();
+	data.extend_from_slice(&(body.len() as u16).to_le_bytes());
+	data.extend_from_slice(&[0, 0]);
+	data.extend(body);
+	data
+}
+
+#[test]
+fn a_7z_reparse_point_is_a_link_only_when_its_data_says_so() {
+	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
+	const REPARSE_POINT: u32 = 0x400;
+	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut push = |name: &str, data: Option<&[u8]>| {
+		let mut entry = SevenZEntry::new_file(name);
+		entry.has_windows_attributes = true;
+		entry.windows_attributes = REPARSE_POINT | 0x20;
+		entry.has_stream = data.is_some();
+		writer.push_archive_entry(entry, data).unwrap();
+	};
+	let symlink = reparse_data(0xA000_000C, r"\??\C:\data\file.txt", r"C:\data\file.txt");
+	let junction = reparse_data(0xA000_0003, r"\??\C:\data", "");
+	let placeholder = pattern(5000, 3);
+	push("link", Some(&symlink));
+	push("junction", Some(&junction));
+	// a file behind a reparse point (a cloud placeholder, say) carries its content
+	push("placeholder.bin", Some(&placeholder));
+	push("odd.txt", Some(b"not reparse data"));
+	push("empty", None);
+	let archive = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&archive, "links.7z");
+	end.unwrap();
+	let link = |ordinal, path: &str, bytes: &[u8], target: &str| {
+		Seen::Skipped(
+			ordinal,
+			path.into(),
+			bytes.len() as u64,
+			ExtractSkipReason::Symlink {
+				target: target.into(),
+			},
+		)
+	};
+	assert_eq!(
+		seen,
+		vec![
+			Seen::Opened(StreamLayout::SevenZ),
+			link(0, "link", &symlink, r"C:\data\file.txt"),
+			// a junction without a print name shows its substitute name, less the NT prefix
+			link(1, "junction", &junction, r"C:\data"),
+			file(2, "placeholder.bin", &placeholder),
+			file(3, "odd.txt", b"not reparse data"),
+			file(4, "empty", b""),
+		]
+	);
+}
+
 #[test]
 fn damaged_data_is_reported_as_a_damaged_archive() {
 	// the data of an unencrypted entry: the decoder, not the source, fails
