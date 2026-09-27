@@ -223,7 +223,9 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 	let extracted = index
 		.entries
 		.iter()
-		.filter(|entry| entry.kind == ZipKind::File && zip_supported(entry))
+		.filter(|entry| {
+			entry.kind == ZipKind::File && zip_supported(entry) && entry_path(&entry.name).is_ok()
+		})
 		.fold(0u64, |total, entry| total.saturating_add(entry.size));
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
@@ -421,6 +423,7 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 				&& entry
 					.stream
 					.is_none_or(|stream| index.folders[stream.folder].supported())
+				&& entry_path(&entry.name).is_ok()
 		})
 		.fold(0u64, |total, entry| total.saturating_add(entry.size));
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {

@@ -1695,6 +1695,25 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 		let report = start(&fits, options).running.await.unwrap().unwrap();
 		assert_eq!(report.counts.bytes_done, 9, "{name}");
 	}
+
+	// an entry skipped for its path takes no storage
+	let with_unsafe: [(&str, Option<&[u8]>); 2] = [
+		("../outside.txt", Some(&[7; 100])),
+		("a.txt", Some(b"alpha")),
+	];
+	for (name, archive) in [
+		("u.zip", zip_of(&with_unsafe, None)),
+		("u.7z", sevenz_of(&with_unsafe, None)),
+	] {
+		let setup = setup(name, archive, |_| {});
+		let options = Options {
+			max_bytes: Some(10),
+			..Options::default()
+		};
+		let report = start(&setup, options).running.await.unwrap().unwrap();
+		assert_eq!(report.counts.bytes_done, 5, "{name}");
+		assert_eq!(report.counts.entries_skipped, 1, "{name}");
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
