@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use filen_macros::js_type;
-use serde::Serialize;
-use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::js_sys;
 
 use crate::{
 	Error,
 	auth::JsClient,
-	js::{AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture},
+	js::{
+		AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback,
+		spawn_local_dispatch,
+	},
 };
 
 use super::{
@@ -83,20 +85,6 @@ pub struct CompressItemsParams {
 	pub managed_future: ManagedFuture,
 }
 
-/// Calls `callback` with `value`, if the caller passed one.
-fn call(callback: Option<&js_sys::Function>, value: &impl Serialize) {
-	let Some(callback) = callback else {
-		return;
-	};
-	let serializer = serde_wasm_bindgen::Serializer::new()
-		.serialize_maps_as_objects(true)
-		.serialize_large_number_types_as_bigints(true);
-	let value = value
-		.serialize(&serializer)
-		.expect("failed to serialize an archive callback (should be impossible)");
-	let _ = callback.call1(&JsValue::UNDEFINED, &value);
-}
-
 async fn run_extract(
 	client: Arc<Client>,
 	request: ExtractRequest,
@@ -105,54 +93,40 @@ async fn run_extract(
 	on_top_level_created: Option<js_sys::Function>,
 	managed_future: ManagedFuture,
 ) -> Result<ExtractReport, Error> {
-	// The JS functions never leave this thread: the job sends its callbacks over a channel,
-	// and this task calls them here, in order.
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-	let (drained, drained_receiver) = tokio::sync::oneshot::channel::<()>();
-	crate::runtime::spawn_local(async move {
-		while let Some(delivery) = receiver.recv().await {
-			match delivery {
-				ExtractDelivery::TopLevelCreated(items) => {
-					call(on_top_level_created.as_ref(), &items)
-				}
-				ExtractDelivery::Update(update) => call(on_update.as_ref(), &update),
-			}
+	let (sender, delivered) = spawn_local_dispatch(move |delivery| match delivery {
+		ExtractDelivery::TopLevelCreated(items) => {
+			call_callback(on_top_level_created.as_ref(), &items)
 		}
-		let _ = drained.send(());
+		ExtractDelivery::Update(update) => call_callback(on_update.as_ref(), &update),
 	});
 	let result = managed_future
 		.into_js_managed_commander_job(move |control| {
 			extract_job(client, request, config, sender, control)
 		})?
 		.await;
-	let _ = drained_receiver.await;
+	// the job has ended and dropped its sender: everything it reported reaches its callbacks
+	// before the result does
+	let _ = delivered.await;
 	result
 }
 
 async fn run_compress(
 	client: Arc<Client>,
-	call_: CompressCall,
+	call: CompressCall,
 	on_update: Option<js_sys::Function>,
 	on_archive_created: Option<js_sys::Function>,
 	managed_future: ManagedFuture,
 ) -> Result<CompressReport, Error> {
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-	let (drained, drained_receiver) = tokio::sync::oneshot::channel::<()>();
-	crate::runtime::spawn_local(async move {
-		while let Some(delivery) = receiver.recv().await {
-			match delivery {
-				CompressDelivery::ArchiveCreated(archive) => {
-					call(on_archive_created.as_ref(), &archive)
-				}
-				CompressDelivery::Update(update) => call(on_update.as_ref(), &update),
-			}
+	let (sender, delivered) = spawn_local_dispatch(move |delivery| match delivery {
+		CompressDelivery::ArchiveCreated(archive) => {
+			call_callback(on_archive_created.as_ref(), &archive)
 		}
-		let _ = drained.send(());
+		CompressDelivery::Update(update) => call_callback(on_update.as_ref(), &update),
 	});
 	let result = managed_future
-		.into_js_managed_commander_job(move |control| compress_job(client, call_, sender, control))?
+		.into_js_managed_commander_job(move |control| compress_job(client, call, sender, control))?
 		.await;
-	let _ = drained_receiver.await;
+	let _ = delivered.await;
 	result
 }
 

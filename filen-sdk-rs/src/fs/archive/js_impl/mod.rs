@@ -6,7 +6,7 @@
 //! A password is always an argument of its own, never a field of a record: uniffi prints a
 //! record's fields in the foreign `toString`, and a record could end up serialized.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc};
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -25,7 +25,7 @@ use crate::{
 		file::{RemoteFile, enums::RemoteFileType},
 		name::ValidatedName,
 	},
-	job::{JobControl, JobError, job_error, report::RunState},
+	job::{JobControl, JobError, job_error, millis, report::RunState},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyNormalDir, File, NonRootNormalItemTagged,
 	},
@@ -305,10 +305,6 @@ pub struct CompressReport {
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.
 	pub error: Option<JobError>,
-}
-
-fn millis(duration: Duration) -> u64 {
-	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl From<dispose::KeptReason> for ArchiveKeptReason {

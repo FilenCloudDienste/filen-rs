@@ -13,7 +13,7 @@ pub(crate) mod report;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub use js::JobError;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub(crate) use js::job_error;
+pub(crate) use js::{job_error, millis};
 
 use std::{
 	future::Future,

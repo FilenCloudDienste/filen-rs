@@ -2,7 +2,7 @@
 //! items and report the same types; the job's callbacks reach the caller in the order the job
 //! made them, all before the call returns.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -17,7 +17,7 @@ use crate::{
 		file::enums::RemoteFileType,
 		name::ValidatedName,
 	},
-	job::{JobError, job_error},
+	job::{JobError, job_error, millis},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
 		AnySharedDirWithContext, DirByCategoryWithContext, NonRootNormalItemTagged,
@@ -345,10 +345,6 @@ impl From<super::CopyEvent> for CopyEvent {
 	}
 }
 
-fn millis(duration: Duration) -> u64 {
-	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 impl From<super::CopyUpdate> for CopyUpdate {
 	fn from(update: super::CopyUpdate) -> Self {
 		Self {
@@ -567,14 +563,15 @@ mod wasm_impl {
 	use std::sync::Arc;
 
 	use filen_macros::js_type;
-	use serde::Serialize;
-	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+	use wasm_bindgen::prelude::wasm_bindgen;
 	use web_sys::js_sys;
 
 	use crate::{
 		Error,
 		auth::JsClient,
-		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
+		js::{
+			AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback, spawn_local_dispatch,
+		},
 	};
 
 	use super::{
@@ -640,26 +637,14 @@ mod wasm_impl {
 		fn deliver(&self, delivery: Delivery) {
 			match delivery {
 				Delivery::TopLevelPlanned(items) => {
-					call(self.on_top_level_planned.as_ref(), &items)
+					call_callback(self.on_top_level_planned.as_ref(), &items)
 				}
-				Delivery::TopLevelCreated(item) => call(self.on_top_level_created.as_ref(), &item),
-				Delivery::Update(update) => call(self.on_update.as_ref(), &update),
+				Delivery::TopLevelCreated(item) => {
+					call_callback(self.on_top_level_created.as_ref(), &item)
+				}
+				Delivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
 			}
 		}
-	}
-
-	/// Calls `callback` with `value`, if the caller passed one.
-	fn call(callback: Option<&js_sys::Function>, value: &impl Serialize) {
-		let Some(callback) = callback else {
-			return;
-		};
-		let serializer = serde_wasm_bindgen::Serializer::new()
-			.serialize_maps_as_objects(true)
-			.serialize_large_number_types_as_bigints(true);
-		let value = value
-			.serialize(&serializer)
-			.expect("failed to serialize a copy callback (should be impossible)");
-		let _ = callback.call1(&JsValue::UNDEFINED, &value);
 	}
 
 	async fn run(
@@ -669,16 +654,7 @@ mod wasm_impl {
 		callbacks: Callbacks,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
-		// The JS functions never leave this thread: the job sends its callbacks over a channel,
-		// and this task calls them here, in order.
-		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-		let (drained, drained_receiver) = tokio::sync::oneshot::channel::<()>();
-		crate::runtime::spawn_local(async move {
-			while let Some(delivery) = receiver.recv().await {
-				callbacks.deliver(delivery);
-			}
-			let _ = drained.send(());
-		});
+		let (sender, delivered) = spawn_local_dispatch(move |delivery| callbacks.deliver(delivery));
 		let result = managed_future
 			.into_js_managed_commander_job(move |control| {
 				copy_job(client, requests, max_bytes, sender, control)
@@ -686,7 +662,7 @@ mod wasm_impl {
 			.await;
 		// the job has ended and dropped its sender: everything it reported reaches its
 		// callback before the result does
-		let _ = drained_receiver.await;
+		let _ = delivered.await;
 		result
 	}
 
@@ -740,7 +716,7 @@ mod wasm_impl {
 
 #[cfg(all(test, feature = "uniffi"))]
 mod tests {
-	use std::{borrow::Cow, sync::Mutex};
+	use std::{borrow::Cow, sync::Mutex, time::Duration};
 
 	use chrono::Utc;
 	use filen_types::{
