@@ -1,5 +1,6 @@
 // Drive fixtures and copy drivers shared between the integration-test binaries that recreate
-// drive items (copy_tests, connect_tests); each binary compiles its own copy and uses a subset.
+// drive items (copy_tests, connect_tests, archive_tests); each binary compiles its own copy and
+// uses a subset.
 #![allow(dead_code)]
 
 use std::{
@@ -58,6 +59,17 @@ pub async fn upload(
 /// `len` bytes that repeat every 251 bytes, so no two chunks of a file are alike.
 pub fn data(len: usize, seed: u8) -> Vec<u8> {
 	(0..251u8).cycle().take(len).map(|b| b ^ seed).collect()
+}
+
+/// `len` bytes no codec can shrink, the same for the same `seed`: an archive of them is as large
+/// as they are, so it spans as many chunks.
+pub fn noise(len: usize, seed: u8) -> Vec<u8> {
+	let mut bytes = vec![0; len];
+	blake3::Hasher::new()
+		.update(&[seed])
+		.finalize_xof()
+		.fill(&mut bytes);
+	bytes
 }
 
 /// A new public link to `dir`, as someone given it reads it.
