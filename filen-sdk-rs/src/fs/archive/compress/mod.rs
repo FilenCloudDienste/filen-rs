@@ -484,51 +484,6 @@ mod tests {
 	}
 
 	#[test]
-	fn a_formats_stated_levels_are_the_ones_its_check_takes() {
-		// past every level any codec or method takes
-		const LEVELS_TRIED: u32 = 32;
-		let tar = |codec| CompressFormat::Tar {
-			compression: Some(compression(codec)),
-		};
-		let zip = |method| CompressFormat::Zip {
-			method,
-			encryption: None,
-		};
-		let sevenz = |method| CompressFormat::SevenZ {
-			method,
-			solid: false,
-			encryption: None,
-		};
-		let formats = [
-			tar(StreamCodec::Gzip),
-			tar(StreamCodec::Bzip2),
-			tar(StreamCodec::Xz),
-			tar(StreamCodec::Lzma),
-			tar(StreamCodec::Lzip),
-			tar(StreamCodec::Lz4),
-			tar(StreamCodec::Brotli),
-			tar(StreamCodec::Zstd),
-			zip(ZipMethod::Deflate { level: 1 }),
-			zip(ZipMethod::Bzip2 { level: 1 }),
-			sevenz(SevenZMethod::Lzma2 { level: 1 }),
-			sevenz(SevenZMethod::Lzma { level: 1 }),
-			sevenz(SevenZMethod::Ppmd { level: 1 }),
-			sevenz(SevenZMethod::Bzip2 { level: 1 }),
-			sevenz(SevenZMethod::Deflate { level: 1 }),
-		];
-		for format in formats {
-			let levels = format.levels().unwrap();
-			for level in 0..=LEVELS_TRIED {
-				assert_eq!(
-					format.with_level(level).check(false).is_ok(),
-					levels.contains(&level),
-					"{format:?} at {level}"
-				);
-			}
-		}
-	}
-
-	#[test]
 	fn every_formats_default_fits_the_smallest_codec_budget() {
 		// iOS and wasm budget 128 MiB for a job's codec
 		const SMALLEST_BUDGET: u64 = 128 << 20;

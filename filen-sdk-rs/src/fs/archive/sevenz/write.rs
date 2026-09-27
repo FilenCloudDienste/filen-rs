@@ -792,20 +792,30 @@ mod tests {
 	#[test]
 	fn levels_are_stated_and_checked() {
 		assert_eq!(SevenZMethod::Copy.levels(), None);
-		assert_eq!(SevenZMethod::Lzma { level: 5 }.levels(), Some(0..=9));
-		assert_eq!(SevenZMethod::Bzip2 { level: 5 }.levels(), Some(1..=9));
-		assert!(SevenZMethod::Copy.check().is_ok());
-		assert!(SevenZMethod::Lzma2 { level: 0 }.check().is_ok());
-		assert!(SevenZMethod::Deflate { level: 9 }.check().is_ok());
-		for method in [
-			SevenZMethod::Lzma2 { level: 10 },
-			SevenZMethod::Ppmd { level: 0 },
-		] {
-			assert_eq!(
-				method.check().unwrap_err().kind(),
-				ErrorKind::InvalidState,
-				"{method:?}"
-			);
+		SevenZMethod::Copy.check().unwrap();
+		// each method at a level, and the levels it takes
+		type AtLevel = fn(u32) -> SevenZMethod;
+		let methods: [(AtLevel, _); 5] = [
+			(|level| SevenZMethod::Lzma2 { level }, 0..=9),
+			(|level| SevenZMethod::Lzma { level }, 0..=9),
+			(|level| SevenZMethod::Ppmd { level }, 1..=9),
+			(|level| SevenZMethod::Bzip2 { level }, 1..=9),
+			(|level| SevenZMethod::Deflate { level }, 1..=9),
+		];
+		for (method, levels) in methods {
+			assert_eq!(method(5).levels(), Some(levels.clone()), "{:?}", method(5));
+			// both ends are taken, one past either is refused
+			method(*levels.start()).check().unwrap();
+			method(*levels.end()).check().unwrap();
+			let below = levels.start().checked_sub(1);
+			for outside in below.into_iter().chain([levels.end() + 1]) {
+				assert_eq!(
+					method(outside).check().unwrap_err().kind(),
+					ErrorKind::InvalidState,
+					"{:?}",
+					method(outside)
+				);
+			}
 		}
 		assert!(
 			SevenZMethod::Lzma2 { level: 9 }.encoder_memory()

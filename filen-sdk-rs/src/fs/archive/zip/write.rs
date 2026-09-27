@@ -576,22 +576,25 @@ mod tests {
 	fn a_methods_levels_are_stated_and_checked() {
 		assert_eq!(ZipMethod::Stored.levels(), None);
 		ZipMethod::Stored.check().unwrap();
-		for method in [
-			ZipMethod::Deflate { level: 9 },
-			ZipMethod::Bzip2 { level: 1 },
-		] {
-			assert_eq!(method.levels(), Some(1..=9), "{method:?}");
-			method.check().unwrap();
-		}
-		for method in [
-			ZipMethod::Deflate { level: 0 },
-			ZipMethod::Bzip2 { level: 10 },
-		] {
-			assert_eq!(
-				method.check().unwrap_err().kind(),
-				ErrorKind::InvalidState,
-				"{method:?}"
-			);
+		// each method at a level, and the levels it takes
+		type AtLevel = fn(u32) -> ZipMethod;
+		let methods: [(AtLevel, _); 2] = [
+			(|level| ZipMethod::Deflate { level }, 1..=9),
+			(|level| ZipMethod::Bzip2 { level }, 1..=9),
+		];
+		for (method, levels) in methods {
+			assert_eq!(method(5).levels(), Some(levels.clone()), "{:?}", method(5));
+			// both ends are taken, one past either is refused
+			method(*levels.start()).check().unwrap();
+			method(*levels.end()).check().unwrap();
+			for outside in [levels.start() - 1, levels.end() + 1] {
+				assert_eq!(
+					method(outside).check().unwrap_err().kind(),
+					ErrorKind::InvalidState,
+					"{:?}",
+					method(outside)
+				);
+			}
 		}
 	}
 
