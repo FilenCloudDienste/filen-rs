@@ -1239,6 +1239,25 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 	.await;
 	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
 
+	// a compressed tar whose codec carries no checksum (an lz4 frame without one): the archive's
+	// hash matches the bytes read, but nothing checked what they decoded to
+	let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+	encoder.write_all(&tar).unwrap();
+	let unchecked = encoder.finish().unwrap();
+	let (setup, report) = extract_disposing(
+		unchecked.clone(),
+		Some(hash(&unchecked)),
+		SourceDisposal::Trash,
+		new_folder(),
+		|_| {},
+	)
+	.await;
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::Unconfirmed
+	));
+	assert!(setup.backend.log().trashed_files.is_empty());
+
 	// a file that failed to upload
 	let (setup, report) = {
 		let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {

@@ -45,8 +45,11 @@ pub enum ArchiveSource {
 	Keep(RemoteFileType<'static>),
 	/// One of the user's own files, removed once the extraction is verified: completed with
 	/// nothing failed, skipped or unaccounted, the archive read in full and matching the hash in
-	/// its metadata, and every extracted item confirmed with the server. Otherwise it is kept
-	/// and the report says why.
+	/// its metadata, every extracted file's data checked against a checksum the archive carries
+	/// for it (a tar's own data needs none: the hash covers it), and every extracted item
+	/// confirmed with the server. Otherwise it is kept and the report says why: so a brotli or
+	/// LZMA-alone archive, or an lz4, xz or zstd one written without its checksum, is always
+	/// kept, as [`KeptReason::Unconfirmed`](crate::fs::archive::KeptReason::Unconfirmed).
 	Dispose {
 		file: RemoteFile,
 		how: SourceDisposal,
