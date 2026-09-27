@@ -109,6 +109,9 @@ impl BlockDecoder {
 
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
+        // Every literal is part of the block's output, which may not exceed the maximum block
+        // size. Check before decoding them: an RLE section can state up to 1 MiB in one byte.
+        check_decompressed_size(u64::from(section.regenerated_size))?;
         let raw = &raw[bytes_in_literals_header as usize..];
         vprintln!(
             "Found {} literalssection with regenerated size: {}, and compressed size: {:?}",
@@ -156,6 +159,12 @@ impl BlockDecoder {
 
         let mut seq_section = SequencesHeader::new();
         let bytes_in_sequence_header = seq_section.parse_from_header(raw)?;
+        // Each sequence copies at least MIN_MATCH_LENGTH bytes, so the count alone bounds the
+        // output from below. Check before decoding the sequences into a buffer of that many.
+        check_decompressed_size(
+            u64::from(section.regenerated_size)
+                + u64::from(seq_section.num_sequences) * MIN_MATCH_LENGTH,
+        )?;
         let raw = &raw[bytes_in_sequence_header as usize..];
         vprintln!(
             "Found sequencessection with sequences: {} and size: {}",
@@ -179,6 +188,15 @@ impl BlockDecoder {
                 &mut workspace.fse,
                 &mut workspace.sequences,
             )?;
+            // All literals are output, whether a sequence or the tail copies them, and every
+            // match on top. Check the total before anything is written to the decode buffer,
+            // which would otherwise grow by all of it.
+            let matched: u64 = workspace
+                .sequences
+                .iter()
+                .map(|seq| u64::from(seq.ml))
+                .sum();
+            check_decompressed_size(workspace.literals_buffer.len() as u64 + matched)?;
             vprintln!("Executing sequences");
             execute_sequences(workspace)?;
         } else {
@@ -281,4 +299,16 @@ impl BlockDecoder {
             | (u32::from(self.header_buffer[1]) << 5)
             | (u32::from(self.header_buffer[2]) << 13)
     }
+}
+
+/// The least a sequence copies: its match length is at least 3.
+const MIN_MATCH_LENGTH: u64 = 3;
+
+/// Refuses a block that decompresses to more than [`MAX_BLOCK_SIZE`] bytes, as the format
+/// requires of every block (RFC 8878, 3.1.1.2.4).
+fn check_decompressed_size(at_least: u64) -> Result<(), DecompressBlockError> {
+    if at_least > u64::from(MAX_BLOCK_SIZE) {
+        return Err(DecompressBlockError::DecompressedSizeTooLarge { at_least });
+    }
+    Ok(())
 }

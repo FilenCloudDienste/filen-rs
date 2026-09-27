@@ -7,7 +7,10 @@
 //! stream. Frames that need a dictionary are refused.
 //!
 //! A frame's window sets what it costs: ruzstd refuses a window over the limit it is given
-//! before allocating for it, so that limit is the largest window [`Budget`] can hold.
+//! before allocating for it, so that limit is the largest window [`Budget`] can hold. That holds
+//! only while no block decodes to more than its 128 KiB maximum, which ruzstd 0.9 left
+//! unchecked (a few KiB of sequences could fill gigabytes): the workspace patches in a vendored
+//! copy that refuses such a block before writing any of it (`filen-sdk-rs/vendor/ruzstd`).
 
 use std::io::{self, Read};
 
@@ -20,11 +23,13 @@ use super::{
 
 const MAGIC: u32 = 0xFD2F_B528;
 
-/// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4).
+/// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4), which the vendored ruzstd
+/// enforces.
 const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 
 /// The decoder's state besides its window: the literals and block buffers (a block each), the
-/// sequences of a block, and the entropy tables. Measured under 1 MiB (see the tests).
+/// sequences of a block (at most 43690 of 12 bytes, a match copying 3 bytes at least), and the
+/// entropy tables. Measured under 1 MiB with the most sequences a block holds (see the tests).
 const STATE_BYTES: u64 = 2 * 1024 * 1024;
 
 pub(super) struct ZstdDecoder<R> {

@@ -17,7 +17,8 @@ Only `src/` differs from the published crate, by the patch in the commit that fo
 adding this directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
 
 - a literals section may regenerate at most 128 KiB;
-- a block may hold at most 128 KiB / 3 sequences, since each copies at least 3 bytes;
+- a block's literals and 3 bytes per sequence (a match copies at least 3) may come to at most
+  128 KiB, checked before the sequences are decoded into a buffer of that many;
 - a block's literals and matches together may decode to at most 128 KiB, checked before any of
   it is written to the ring;
 - the per-block sum is counted in `usize`, so it cannot overflow.

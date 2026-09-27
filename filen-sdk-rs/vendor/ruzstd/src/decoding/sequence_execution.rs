@@ -5,7 +5,8 @@ use crate::decoding::errors::ExecuteSequencesError;
 pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
     let mut literals_copy_counter = 0;
     let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0;
+    // usize, not u32: callers bound a block's output, but the sum must not wrap regardless
+    let mut seq_sum: usize = 0;
 
     for idx in 0..scratch.sequences.len() {
         let seq = scratch.sequences[idx];
@@ -34,18 +35,18 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
                 .repeat(actual_offset as usize, seq.ml as usize)?;
         }
 
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
+        seq_sum += seq.ml as usize;
+        seq_sum += seq.ll as usize;
     }
     if literals_copy_counter < scratch.literals_buffer.len() {
         let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
         scratch.buffer.push(rest_literals);
-        seq_sum += rest_literals.len() as u32;
+        seq_sum += rest_literals.len();
     }
 
     let diff = scratch.buffer.len() - old_buffer_size;
     assert!(
-        seq_sum as usize == diff,
+        seq_sum == diff,
         "Seq_sum: {} is different from the difference in buffersize: {}",
         seq_sum,
         diff
