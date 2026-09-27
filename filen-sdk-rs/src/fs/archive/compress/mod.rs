@@ -35,7 +35,10 @@ pub use super::{
 	sevenz::write::{SevenZEncryption, SevenZMethod},
 	zip::{crypto::AesStrength, write::ZipMethod},
 };
-pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
+pub use crate::fs::drive_job::{
+	listing::{ItemSource, ItemSourceDir, ScanProgress},
+	plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
+};
 
 use super::format::{ExtensionFormat, match_extension};
 
