@@ -1229,6 +1229,8 @@ fn a_finder_zip_keeps_its_unflagged_utf8_names() {
 			other("finder/link", ZipKind::Symlink),
 			other("finder/Café/", ZipKind::Dir),
 			file("finder/Café/Résumé.txt", b"bonjour\n"),
+			// decomposed, and passed on as it is
+			file("finder/Cafe\u{301} NFD.txt", b"decomposed\n"),
 		]
 	);
 }

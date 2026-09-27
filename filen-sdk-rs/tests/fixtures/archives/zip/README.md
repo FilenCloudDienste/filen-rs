@@ -14,8 +14,9 @@ OS X (19) version-made-by host, so the tests patch that into the Info-ZIP symlin
 
 Made on macOS 26.5 with Info-ZIP Zip 3.0 (`/usr/bin/zip`), `ditto`, bsdtar 3.5.3 (libarchive
 3.7.4) and 7-Zip 26.01 (`7zz`, Homebrew). Running the script again gives the same contents,
-not the same bytes: encryption salts and headers are random, and `ditto` stamps `__MACOSX`
-directories with the current time.
+not the same bytes: encryption salts and headers are random, `ditto` stamps `__MACOSX`
+directories with the current time, and Info-ZIP stamps the entry it reads from stdin (the one in
+`zip64-infozip.zip`) with it too.
 
 ```sh
 # Run in an empty directory on macOS; writes the fixtures to ./out.
@@ -33,6 +34,8 @@ open("src/hello.txt", "wb").write(b"hello from a real zip tool\n")
 # the repeat is 35000 bytes back: past deflate's 32 KiB window, inside deflate64's 64 KiB
 open("src/sub/far.bin", "wb").write(noise(1, 1000) + bytes(34000) + noise(1, 1000))
 open("src/sub/lines.txt", "wb").write(b"".join(b"line %d\n" % i for i in range(500)))
+# a decomposed (NFD) name, as macOS may store one
+open("finder/Cafe\u0301 NFD.txt", "wb").write(b"decomposed\n")
 PY
 printf 'bonjour\n' > 'finder/Café/Résumé.txt'
 printf 'naive\n' > finder/naïve.txt
