@@ -118,15 +118,14 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let mut block = [0u8; TAR_BLOCK as usize];
 			let block_len = read_full(&mut decoded, &mut block).map_err(failure)?;
 			let block = &block[..block_len];
-			// an empty tar decodes to its end-of-archive marker alone, so only its name tells it
-			// from a file of zeros
-			let tar = block_len == block.len()
-				&& (is_tar_header(block)
-					|| is_end_marker(block)
-						&& matches!(
-							extension_format(&job.name),
-							Some(ExtensionFormat::CompressedTar(_))
-						));
+			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker
+			// alone, so only its name tells it from a file of zeros
+			let tar = is_tar_header(block)
+				|| is_end_marker(block)
+					&& matches!(
+						extension_format(&job.name),
+						Some(ExtensionFormat::CompressedTar(_))
+					);
 			if tar {
 				port.send(WorkerEvent::Opened(StreamLayout::Tar {
 					codec: Some(codec),
