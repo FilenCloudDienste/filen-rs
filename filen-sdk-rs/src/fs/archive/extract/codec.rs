@@ -19,8 +19,8 @@ use super::{
 		sevenz::{
 			SevenZError, from_source,
 			read::{
-				FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind, SevenZLimits, read_error,
-				read_index as read_sevenz_index,
+				FOLDER_ENDS_EARLY, FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind,
+				SevenZLimits, read_error, read_index as read_sevenz_index, wrong_key,
 			},
 		},
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
@@ -250,11 +250,14 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
 			.map_err(failure)?;
 	}
-	let mut unaccounted_bytes = index.prefix_bytes;
+	let mut unaccounted_bytes = index.prefix_bytes.saturating_add(index.directory_slack);
 	for entry in &index.entries {
 		unaccounted_bytes =
 			unaccounted_bytes.saturating_add(unaccounted_after(&mut source, index.shift, entry));
-		if entry.kind == ZipKind::Dir {
+		if entry.kind == ZipKind::Dir
+			&& entry.compressed_size > 0
+			&& !decodes_to_nothing(&mut source, index.shift, entry, password, entry_limits)
+		{
 			// a directory holds no data: anything stored under one is extracted nowhere
 			unaccounted_bytes = unaccounted_bytes.saturating_add(entry.compressed_size);
 		}
@@ -384,14 +387,17 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 				entry.stream.expect("encrypted").offset + entry.size <= PASSWORD_PROBE_BYTES
 			});
 		if let Some(probe) = probe {
-			cursor
-				.open(&index, probe, &mut keys)
-				.and_then(|mut data| {
-					io::copy(&mut data, &mut io::sink())
-						.map(drop)
-						.map_err(read_error)
+			// setting the folder up fails for the archive's reasons; what decodes wrong under
+			// the key (skipping to the entry, or the entry itself) is the key's
+			let mut data = cursor.open(&index, probe, &mut keys).map_err(|error| {
+				sevenz_failure(match error {
+					SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
+					SevenZError::Corrupt(FOLDER_ENDS_EARLY) => SevenZError::WrongPassword,
+					error => error,
 				})
-				.map_err(|error| sevenz_failure(wrong_password(error)))?;
+			})?;
+			io::copy(&mut data, &mut io::sink())
+				.map_err(|error| sevenz_failure(wrong_key(read_error(error))))?;
 			verified = true;
 		}
 	}
@@ -477,16 +483,6 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 	})
 }
 
-/// A probe's failure: a wrong key decrypts to noise, which fails to decode or to match its
-/// CRC-32.
-fn wrong_password(error: SevenZError) -> SevenZError {
-	match error {
-		SevenZError::Corrupt(_) => SevenZError::WrongPassword,
-		SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
-		error => error,
-	}
-}
-
 /// A symlink entry's target, for reporting: its data, when small and readable.
 fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
@@ -556,6 +552,22 @@ fn zip_supported(entry: &ZipEntry) -> bool {
 		14 | 95 => entry.encryption == ZipEncryption::None,
 		_ => false,
 	}
+}
+
+/// Whether a directory entry's stored bytes are an empty stream (as `java.util.zip` and Python
+/// deflate directories: two bytes), checked against its size and CRC-32 to the end.
+fn decodes_to_nothing<R: Read + std::io::Seek>(
+	source: &mut R,
+	shift: u64,
+	entry: &ZipEntry,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+) -> bool {
+	entry.size == 0
+		&& zip_supported(entry)
+		&& open_entry(source, shift, entry, password, limits)
+			.and_then(|mut data| io::copy(&mut data, &mut io::sink()).map_err(ZipError::Read))
+			.is_ok_and(|read| read == 0)
 }
 
 /// A symlink entry's target, for reporting: its data, when small and readable.

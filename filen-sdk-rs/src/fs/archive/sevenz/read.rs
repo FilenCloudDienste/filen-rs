@@ -365,17 +365,9 @@ pub(crate) fn read_index<R: Read + Seek>(
 			// a CRC proves the key decoded it: what fails after that is the header's own damage
 			header_checked = folder.crc.is_some();
 			let decoded =
-				decode_header(source, folder, &offsets, &streams.pack_sizes, limits, keys)
-					.map_err(|error| match error {
-						// a wrong key decrypts to noise, which fails to decode or to match its CRC
-						SevenZError::Corrupt(_) if encrypted => SevenZError::WrongPassword,
-						SevenZError::Read(error) if encrypted && !from_source(&error) => {
-							SevenZError::WrongPassword
-						}
-						error => error,
-					})?;
+				decode_header(source, folder, &offsets, &streams.pack_sizes, limits, keys)?;
 			if decoded.first() != Some(&K_HEADER) {
-				return Err(if encrypted {
+				return Err(if encrypted && !header_checked {
 					SevenZError::WrongPassword
 				} else {
 					SevenZError::Corrupt("a packed 7z header that is not a header")
@@ -456,22 +448,33 @@ fn decode_header<R: Read + Seek>(
 	keys: &mut Keys<'_>,
 ) -> Result<Vec<u8>, SevenZError> {
 	let shared = Rc::new(RefCell::new(source));
+	// setting the coders up (their properties, the streams they name) fails for the archive's
+	// own reasons; decoding under a wrong key fails for the key's
 	let mut reader = open_folder(&shared, folder, offsets, sizes, limits.decoder_memory, keys)?;
+	let decoding = |error| {
+		if folder.encrypted() {
+			wrong_key(error)
+		} else {
+			error
+		}
+	};
 	let mut decoded = Vec::new();
 	(&mut reader)
 		.take(folder.size())
 		.read_to_end(&mut decoded)
-		.map_err(read_error)?;
+		.map_err(|error| decoding(read_error(error)))?;
 	if decoded.len() as u64 != folder.size() {
-		return Err(SevenZError::Corrupt("a packed 7z header ends early"));
+		return Err(decoding(SevenZError::Corrupt(
+			"a packed 7z header ends early",
+		)));
 	}
 	if folder
 		.crc
 		.is_some_and(|crc| crc32fast::hash(&decoded) != crc)
 	{
-		return Err(SevenZError::Corrupt(
+		return Err(decoding(SevenZError::Corrupt(
 			"a packed 7z header's CRC does not match",
-		));
+		)));
 	}
 	Ok(decoded)
 }
@@ -1333,7 +1336,7 @@ impl<'s, R: Read + Seek + 's> FolderCursor<'s, R> {
 			io::copy(&mut reader.by_ref().take(skip), &mut io::sink()).map_err(read_error)?;
 		*at += skipped;
 		if skipped != skip {
-			return Err(SevenZError::Corrupt("a 7z folder ends early"));
+			return Err(SevenZError::Corrupt(FOLDER_ENDS_EARLY));
 		}
 		Ok(EntryData {
 			reader,
@@ -1384,7 +1387,7 @@ impl Read for EntryData<'_, '_> {
 		if n == 0 {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
-				SevenZError::Corrupt("a 7z folder ends early"),
+				SevenZError::Corrupt(FOLDER_ENDS_EARLY),
 			));
 		}
 		self.crc.update(&buf[..n]);
@@ -1393,6 +1396,19 @@ impl Read for EntryData<'_, '_> {
 		Ok(n)
 	}
 }
+
+/// What decoding under a key failed with, as far as the key is concerned: a wrong key decrypts to
+/// noise, which fails to decode or to match its CRC. The source's own errors stay.
+pub(crate) fn wrong_key(error: SevenZError) -> SevenZError {
+	match error {
+		SevenZError::Corrupt(_) => SevenZError::WrongPassword,
+		SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
+		error => error,
+	}
+}
+
+/// The error of reading past what a folder decodes to.
+pub(crate) const FOLDER_ENDS_EARLY: &str = "a 7z folder ends early";
 
 /// A decoder's read error: the source's own passes through, anything else is damaged data.
 pub(crate) fn read_error(error: io::Error) -> SevenZError {

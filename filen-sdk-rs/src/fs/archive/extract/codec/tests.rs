@@ -763,3 +763,40 @@ fn data_under_a_tar_directory_is_unaccounted() {
 	assert_eq!(seen[1], Seen::Dir(0, "docs".into()));
 	assert_eq!(end.unwrap().unaccounted_bytes, 17);
 }
+
+/// A zip written by the `zip` crate, directories stored as "files" named with a trailing slash,
+/// deflated, as `java.util.zip` and Python write them.
+fn zip_with_deflated_dirs(dir_data: &[u8]) -> Vec<u8> {
+	use zip8::{CompressionMethod, write::SimpleFileOptions};
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+	writer.start_file("docs/", options).unwrap();
+	writer.write_all(dir_data).unwrap();
+	writer.start_file("docs/a.txt", options).unwrap();
+	writer.write_all(b"alpha").unwrap();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn an_empty_deflated_directory_is_no_hidden_data() {
+	let zip = zip_with_deflated_dirs(b"");
+	let mut source = std::io::Cursor::new(&zip[..]);
+	let index = crate::fs::archive::zip::read::read_index(
+		&mut source,
+		zip.len() as u64,
+		crate::fs::archive::zip::read::ZipLimits {
+			max_index_bytes: 1 << 20,
+			max_entries: 10,
+		},
+	)
+	.unwrap();
+	assert!(
+		index.entries[0].compressed_size > 0,
+		"the directory is stored as a deflate stream, as Java writes it"
+	);
+	let (seen, end) = run(&zip, "java.zip");
+	assert_eq!(end.unwrap().unaccounted_bytes, 0, "{seen:?}");
+	// a "directory" that stores data hides it
+	let (_, end) = run(&zip_with_deflated_dirs(b"not a directory's"), "java.zip");
+	assert!(end.unwrap().unaccounted_bytes > 0);
+}

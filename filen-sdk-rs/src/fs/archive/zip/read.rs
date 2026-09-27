@@ -11,6 +11,7 @@
 use std::{
 	cell::RefCell,
 	io::{self, BufReader, Read, Seek, SeekFrom},
+	mem,
 	rc::Rc,
 };
 
@@ -129,6 +130,8 @@ pub(crate) struct ZipIndex {
 	pub(crate) prefix_bytes: u64,
 	/// What the zip's recorded offsets are off by: the bytes prepended to it.
 	pub(crate) shift: u64,
+	/// Bytes in the central directory after its last record.
+	pub(crate) directory_slack: u64,
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -269,16 +272,29 @@ pub(crate) fn read_index<R: Read + Seek>(
 	let mut duplicate_count = 0;
 	// every listed entry's data is accounted for, a replaced duplicate's included
 	let mut first_header = directory.start - directory.shift;
+	// the index is charged for the heap it takes, names (decoded CP437 grows up to 3 times)
+	// twice over with the name map
+	let mut heap_left = limits.max_index_bytes.saturating_mul(HEAP_PER_INDEX_BYTE);
 	let mut at = 0;
-	for ordinal in 0..directory.entries {
+	let mut ordinal = 0u64;
+	// every record is read, however many the end record counts: old writers wrapped the count
+	// at 65536, and records past it would be neither extracted nor reported
+	while at + 4 <= bytes.len() && u32_at(&bytes, at) == CENTRAL_HEADER_SIG {
+		if ordinal >= limits.max_entries {
+			return Err(ZipError::TooLarge("a zip lists more entries than allowed"));
+		}
 		let (entry, next) = parse_central_header(&bytes, at, ordinal)?;
 		at = next;
+		ordinal += 1;
+		heap_left = heap_left
+			.checked_sub(mem::size_of::<ZipEntry>() as u64 + 2 * entry.name.len() as u64)
+			.ok_or(ZipError::TooLarge("a zip's index over the memory budget"))?;
 		first_header = first_header.min(entry.header_offset);
 		match by_name.get(&entry.name) {
 			Some(&index) => {
 				duplicate_count += 1;
 				if duplicate_names.len() < MAX_DUPLICATE_NAMES {
-					duplicate_names.push(entry.name.clone());
+					duplicate_names.push(entry.name.chars().take(256).collect());
 				}
 				// the last one listed wins, as with other zip tools
 				entries[index] = entry;
@@ -289,7 +305,15 @@ pub(crate) fn read_index<R: Read + Seek>(
 			}
 		}
 	}
+	if ordinal != directory.entries && ordinal % 0x1_0000 != directory.entries % 0x1_0000 {
+		return Err(ZipError::Corrupt(
+			"a zip's central directory holds other than the entries it counts",
+		));
+	}
+	// bytes in the central directory after its last record belong to nothing
+	let directory_slack = (bytes.len() - at) as u64;
 	drop(by_name);
+	drop(bytes);
 	entries.sort_by_key(|entry| entry.header_offset);
 
 	let prefix_bytes = directory.shift + first_header;
@@ -327,6 +351,7 @@ pub(crate) fn read_index<R: Read + Seek>(
 		duplicate_count,
 		prefix_bytes,
 		shift: directory.shift,
+		directory_slack,
 	})
 }
 
@@ -553,6 +578,9 @@ pub(crate) fn unaccounted_after<R: Read + Seek>(
 		gap => gap,
 	}
 }
+
+/// Heap a zip's parsed index may take, per byte of its central directory budget.
+const HEAP_PER_INDEX_BYTE: u64 = 3;
 
 /// Memory a zip entry's decoder may use.
 #[derive(Debug, Clone, Copy)]
