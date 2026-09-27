@@ -1,6 +1,6 @@
-//! The codec side of extracting a streaming archive (a tar, a compressed tar, or one compressed
-//! file): runs on the codec worker, reads the archive through the driver chunk by chunk, and
-//! hands the driver its entries in archive order.
+//! The codec side of extracting an archive (a tar, a compressed tar, one compressed file, or a
+//! zip): runs on the codec worker, reads the archive through the driver chunk by chunk, and hands
+//! the driver its entries in archive order.
 
 use std::io::{self, Cursor, Read};
 
@@ -13,14 +13,23 @@ use super::{
 		decode::{CodecError, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{DETECT_HEAD_LEN, Detected, archive_default_name, detect, is_tar_header},
+		limits::MAX_ARCHIVE_PATH_BYTES,
 		limits::display_path,
+		password::ArchivePassword,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{
-			ChunkInput, EntryHead, EntryKind, JobEnded, SkippedMember, StreamLayout, WorkerEvent,
-			WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SkippedMember, StreamLayout,
+			WorkerEvent, WorkerPort, read_full, send_file_data,
+		},
+		zip::{
+			crypto::CryptoError,
+			read::{
+				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipKind, ZipLimits, open_entry,
+				read_index,
+			},
 		},
 	},
-	ExpansionLimit, ExtractSkipReason,
+	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
 };
 
 /// Bytes of a tar header block.
@@ -34,6 +43,8 @@ pub(crate) struct CodecLimits {
 	/// Most tar headers read, every record counted.
 	pub(crate) max_members: u64,
 	pub(crate) expansion: Option<ExpansionLimit>,
+	/// Most bytes of a zip's central directory read.
+	pub(crate) max_index_bytes: u64,
 }
 
 /// A streaming archive to extract.
@@ -43,15 +54,21 @@ pub(crate) struct StreamJob {
 	pub(crate) name: String,
 	pub(crate) len: u64,
 	pub(crate) limits: CodecLimits,
+	pub(crate) password: Option<ArchivePassword>,
 }
 
-/// How a streaming archive ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How an archive ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArchiveEnd {
-	/// Bytes after the last entry that belong to none (see
-	/// [`StreamEnd`](super::super::decode::StreamEnd)).
+	/// Bytes that belong to no entry: after the last one (see
+	/// [`StreamEnd`](super::super::decode::StreamEnd)), or before a zip's first.
 	pub(crate) unaccounted_bytes: u64,
+	pub(crate) duplicates: Option<DuplicateEntries>,
 }
+
+/// Encrypted zip entries up to this size are read in full to check the password before anything
+/// is created; a larger smallest one is checked as it is extracted.
+const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 
 /// Reads a streaming archive through `port`, sending its entries. An error the driver caused
 /// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
@@ -69,6 +86,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let rest = walk_tar(port, source, job.limits.max_members)?;
 			Ok(ArchiveEnd {
 				unaccounted_bytes: drain_trailing(rest).map_err(failure)?,
+				duplicates: None,
 			})
 		}
 		Some(Detected::Stream(codec)) => {
@@ -99,6 +117,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				let end = decoded.inner.end().expect("drained to the end");
 				Ok(ArchiveEnd {
 					unaccounted_bytes: tar_trailing + end.unaccounted_bytes,
+					duplicates: None,
 				})
 			} else {
 				port.send(WorkerEvent::Opened(StreamLayout::Single { codec }))
@@ -106,9 +125,10 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				extract_single(port, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
-		Some(Detected::Zip | Detected::SevenZ) => Err(Error::custom(
+		Some(Detected::Zip) => extract_zip(port, &job),
+		Some(Detected::SevenZ) => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
-			"zip and 7z archives cannot be extracted yet",
+			"7z archives cannot be extracted yet",
 		)),
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
@@ -141,7 +161,205 @@ fn extract_single(
 	port.send(WorkerEvent::FileEnd).map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: end.unaccounted_bytes,
+		duplicates: None,
 	})
+}
+
+/// A zip: its entries in local-header order, each checked against its CRC-32 or authentication
+/// code.
+fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
+	let mut source = SeekInput::new(port, 0, job.len);
+	let limits = ZipLimits {
+		max_index_bytes: job.limits.max_index_bytes,
+		max_entries: job.limits.max_members,
+	};
+	let index = read_index(&mut source, job.len, limits).map_err(zip_failure)?;
+	let entry_limits = EntryLimits {
+		decoder_memory: job.limits.decoder_memory,
+	};
+	if let Some(limit) = job.limits.expansion {
+		// the sizes a zip states are known up front, so a bomb is refused before it is decoded
+		let stated: u64 = index.entries.iter().map(|entry| entry.size).sum();
+		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
+			return Err(refused(Refused::Expansion(limit.ratio)));
+		}
+	}
+	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
+	let encrypted = || {
+		index
+			.entries
+			.iter()
+			.filter(|entry| entry.kind == ZipKind::File && entry.encryption != ZipEncryption::None)
+	};
+	if encrypted().next().is_some() {
+		let Some(password) = password else {
+			return Err(zip_failure(ZipError::PasswordRequired));
+		};
+		// a password verifier alone lets a wrong password through now and then; reading the
+		// smallest entry in full checks it against the CRC-32 or authentication code too
+		if let Some(probe) = encrypted()
+			.filter(|entry| zip_supported(entry))
+			.min_by_key(|entry| entry.compressed_size)
+			&& probe.compressed_size <= PASSWORD_PROBE_BYTES
+		{
+			let mut reader = open_entry(
+				&mut source,
+				index.shift,
+				probe,
+				Some(password),
+				entry_limits,
+			)
+			.map_err(zip_failure)?;
+			io::copy(&mut reader, &mut io::sink()).map_err(|error| {
+				match zip_io_failure(error) {
+					error if error.kind() == ErrorKind::ArchiveCorrupt => Error::custom(
+						ErrorKind::ArchiveWrongPassword,
+						"the password is likely wrong",
+					),
+					error => error,
+				}
+			})?;
+		}
+	}
+
+	port.send(WorkerEvent::Opened(StreamLayout::Zip))
+		.map_err(failure)?;
+	for entry in &index.overlapping {
+		port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
+			.map_err(failure)?;
+	}
+	for entry in &index.entries {
+		if entry.kind == ZipKind::Symlink {
+			let target =
+				zip_symlink_target(&mut source, index.shift, entry, password, entry_limits);
+			port.send(zip_skipped(entry, ExtractSkipReason::Symlink { target }))
+				.map_err(failure)?;
+			continue;
+		}
+		if entry.kind == ZipKind::File && !zip_supported(entry) {
+			port.send(zip_skipped(entry, ExtractSkipReason::UnsupportedMethod))
+				.map_err(failure)?;
+			continue;
+		}
+		let is_dir = entry.kind == ZipKind::Dir;
+		let mut path = match entry_path(&entry.name) {
+			Ok(path) => path,
+			Err(PathRejection::Empty) if is_dir => continue,
+			Err(rejection) => {
+				port.send(zip_skipped(entry, path_skip_reason(rejection)))
+					.map_err(failure)?;
+				continue;
+			}
+		};
+		path.rewritten |= entry.name_rewritten;
+		port.send(WorkerEvent::Entry(EntryHead {
+			ordinal: entry.ordinal,
+			path,
+			modified: entry.modified,
+			kind: if is_dir {
+				EntryKind::Dir
+			} else {
+				EntryKind::File {
+					size: Some(entry.size),
+				}
+			},
+		}))
+		.map_err(failure)?;
+		if !is_dir {
+			let mut reader = open_entry(&mut source, index.shift, entry, password, entry_limits)
+				.map_err(zip_failure)?;
+			send_file_data(port, &mut reader).map_err(zip_io_failure)?;
+			port.send(WorkerEvent::FileEnd).map_err(failure)?;
+		}
+	}
+	Ok(ArchiveEnd {
+		unaccounted_bytes: index.prefix_bytes,
+		duplicates: (index.duplicate_count > 0).then(|| DuplicateEntries {
+			names: index.duplicate_names.clone(),
+			count: index.duplicate_count,
+		}),
+	})
+}
+
+/// Whether the SDK reads the entry's compression method under its encryption.
+fn zip_supported(entry: &ZipEntry) -> bool {
+	match entry.method {
+		0 | 8 | 9 | 12 => true,
+		14 | 95 => entry.encryption == ZipEncryption::None,
+		_ => false,
+	}
+}
+
+/// A symlink entry's target, for reporting: its data, when small and readable.
+fn zip_symlink_target<R: Read + std::io::Seek>(
+	source: &mut R,
+	shift: u64,
+	entry: &ZipEntry,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+) -> String {
+	if entry.size > MAX_ARCHIVE_PATH_BYTES as u64 || !zip_supported(entry) {
+		return String::new();
+	}
+	let mut target = Vec::new();
+	match open_entry(source, shift, entry, password, limits)
+		.map(|mut reader| reader.read_to_end(&mut target))
+	{
+		Ok(Ok(_)) => display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
+		_ => String::new(),
+	}
+}
+
+fn zip_skipped(entry: &ZipEntry, reason: ExtractSkipReason) -> WorkerEvent {
+	let (path, path_truncated) = display_path(&entry.name);
+	WorkerEvent::Skipped(SkippedMember {
+		ordinal: entry.ordinal,
+		path: path.to_owned(),
+		path_truncated,
+		bytes: entry.size,
+		reason,
+	})
+}
+
+fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {
+	match rejection {
+		PathRejection::TooLong => ExtractSkipReason::PathTooLong,
+		PathRejection::TooDeep => ExtractSkipReason::PathTooDeep,
+		PathRejection::Unsafe | PathRejection::Empty => ExtractSkipReason::UnsafePath,
+	}
+}
+
+fn zip_failure(error: ZipError) -> Error {
+	let kind = match &error {
+		ZipError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
+		ZipError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
+		ZipError::TooLarge(_) => ErrorKind::ArchiveTooLarge,
+		ZipError::PasswordRequired => ErrorKind::ArchivePasswordRequired,
+		ZipError::WrongPassword => ErrorKind::ArchiveWrongPassword,
+		ZipError::Read(_) => {
+			let ZipError::Read(error) = error else {
+				unreachable!("matched above")
+			};
+			return zip_io_failure(error);
+		}
+	};
+	Error::custom(kind, error.to_string())
+}
+
+/// The error an entry's read ended with: the reader's own, or its source's.
+fn zip_io_failure(error: io::Error) -> Error {
+	if error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<ZipError>() || inner.is::<CryptoError>())
+	{
+		let inner = error.into_inner().expect("checked above");
+		return match inner.downcast::<ZipError>() {
+			Ok(zip) => zip_failure(*zip),
+			// the only crypto error left after opening is a failed authentication code
+			Err(crypto) => Error::custom(ErrorKind::ArchiveCorrupt, crypto.to_string()),
+		};
+	}
+	failure(error)
 }
 
 /// Sends every member of the tar in `reader`; returns what follows its end-of-archive marker.
@@ -177,12 +395,8 @@ fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<R
 			// the archive's own root
 			Err(PathRejection::Empty) if is_dir => continue,
 			Err(rejection) => {
-				let reason = match rejection {
-					PathRejection::TooLong => ExtractSkipReason::PathTooLong,
-					PathRejection::TooDeep => ExtractSkipReason::PathTooDeep,
-					PathRejection::Unsafe | PathRejection::Empty => ExtractSkipReason::UnsafePath,
-				};
-				port.send(skipped(this, &member, reason)).map_err(failure)?;
+				port.send(skipped(this, &member, path_skip_reason(rejection)))
+					.map_err(failure)?;
 				continue;
 			}
 		};

@@ -12,8 +12,12 @@ pub mod extract;
 pub(crate) mod format;
 pub(crate) mod limits;
 pub(crate) mod names;
+pub(crate) mod password;
 pub(crate) mod tar_iter;
 pub(crate) mod worker;
+pub(crate) mod zip;
 
 pub use config::ArchiveConfig;
 pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
+pub use password::ArchivePassword;
+pub use zip::crypto::AesStrength;

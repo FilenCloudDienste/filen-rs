@@ -25,6 +25,12 @@ wasm-full = [
 	"dep:brotli-decompressor",
 	"dep:crc32fast",
 	"dep:brotli",
+	"dep:aes",
+	"dep:ctr",
+	"dep:hmac",
+	"dep:sha1",
+	"dep:zeroize",
+	"dep:deflate64",
 ]
 service-worker = ["filen-types/service-worker"]
 multi-threaded-crypto = ["dep:rayon", "dep:wasm-bindgen-rayon"]
@@ -235,6 +241,13 @@ brotli-decompressor = { version = "6", default-features = false, features = [
 ] }
 crc32fast = "1.5"
 brotli = { version = "9", default-features = false, features = ["std"] }
+# zip: WinZip AES and deflate64 (entries are parsed by fs::archive::zip itself)
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+sha1 = "0.10"
+zeroize = "1"
+deflate64 = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -307,6 +320,12 @@ crc32fast = { version = "1.5", optional = true }
 brotli = { version = "9", default-features = false, features = [
 	"std",
 ], optional = true }
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+zeroize = { version = "1", optional = true }
+deflate64 = { version = "0.1", optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
@@ -354,6 +373,13 @@ lzma-rust2 = { version = "0.21", default-features = false, features = [
 lz4_flex = { version = "0.14", default-features = false, features = [
 	"std",
 	"frame",
+] }
+# a second zip implementation to check the SDK's zips against, both ways
+zip8 = { package = "zip", version = "8.6", default-features = false, features = [
+	"deflate-flate2",
+	"deflate64",
+	"bzip2",
+	"aes-crypto",
 ] }
 
 # wasm only dev-dependencies

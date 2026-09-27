@@ -46,7 +46,7 @@ impl<R: Read> LzmaAloneDecoder<R> {
 /// The dictionary a stream of `decoded_size` bytes needs at most: no match can reach further
 /// back than the output so far, so a smaller dictionary than the header's decodes the same
 /// bytes. `None` is an unknown size, which keeps the header's.
-pub(super) fn clamp_dict(dict_size: u32, decoded_size: Option<u64>) -> u32 {
+pub(crate) fn clamp_dict(dict_size: u32, decoded_size: Option<u64>) -> u32 {
 	match decoded_size {
 		Some(size) => u64::from(dict_size)
 			.min(size.max(LZMA_DICT_MIN))

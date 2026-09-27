@@ -15,7 +15,6 @@ use crate::{
 	consts::CHUNK_SIZE,
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
-		archive::dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			extract::{
@@ -23,6 +22,14 @@ use crate::{
 				codec::{CodecLimits, StreamJob, extract_stream},
 			},
 			worker,
+		},
+		archive::{
+			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
+			password::ArchivePassword,
+			zip::{
+				crypto::AesStrength,
+				write::{Encryption, ZipMethod, ZipWriter},
+			},
 		},
 		dir::RootDirectory,
 		drive_job::{backend::ListedNames, counts::ItemCounts, test_support::FakeBackend},
@@ -156,6 +163,7 @@ struct Options {
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
 	dispose: Option<(SourceDisposal, Uuid)>,
+	password: Option<ArchivePassword>,
 }
 
 impl Default for Options {
@@ -166,6 +174,7 @@ impl Default for Options {
 			max_bytes: None,
 			max_items: None,
 			dispose: None,
+			password: None,
 		}
 	}
 }
@@ -211,7 +220,9 @@ fn start(setup: &Setup, options: Options) -> Job {
 			decoder_memory: CODEC_MEM_BUDGET,
 			max_members: 1000,
 			expansion: Some(ExpansionLimit::DEFAULT),
+			max_index_bytes: 32 << 20,
 		},
+		password: options.password.clone(),
 	};
 	start_with(
 		setup,
@@ -742,4 +753,101 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 		KeptReason::Unconfirmed
 	));
 	assert!(setup.backend.log().deleted_files.is_empty());
+}
+
+fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
+	let mut writer = ZipWriter::new(Vec::new());
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None).unwrap(),
+			Some(data) => {
+				let encryption = password.map(|password| Encryption {
+					password,
+					strength: AesStrength::Aes128,
+					salt: vec![1; 8],
+				});
+				writer
+					.add_file(
+						path,
+						None,
+						data.len() as u64,
+						ZipMethod::Deflate { level: 6 },
+						encryption,
+						&mut &data[..],
+					)
+					.unwrap();
+			}
+		}
+	}
+	writer.finish().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extracts_an_encrypted_zip_and_removes_it() {
+	let big = pattern(2 * CHUNK_SIZE + 5, 6);
+	let zip = zip_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("docs/big.bin", Some(&big)),
+		],
+		Some(b"pw"),
+	);
+	// a zip's entries are checked one by one, so no hash of the whole archive is needed
+	let (setup, parent) = disposable(zip, None, |_| {});
+	let options = Options {
+		dispose: Some((SourceDisposal::DeletePermanently, parent)),
+		password: Some(ArchivePassword::new("pw".into()).unwrap()),
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(created_dirs(&setup), ["bundle", "docs"]);
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([
+			("a.txt".to_owned(), (5, 1, hash(b"alpha"))),
+			("big.bin".to_owned(), (big.len() as u64, 3, hash(&big))),
+		])
+	);
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_without_its_password_creates_nothing() {
+	let zip = zip_of(&[("a.txt", Some(b"a"))], Some(b"pw"));
+	let setup = setup("s.zip", zip, |_| {});
+	let failed = start(&setup, Options::default())
+		.running
+		.await
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchivePasswordRequired);
+	assert!(created_dirs(&setup).is_empty());
+	let options = Options {
+		password: Some(ArchivePassword::new("nope".into()).unwrap()),
+		..Options::default()
+	};
+	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(created_dirs(&setup).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_with_duplicate_names_is_kept() {
+	let zip = zip_of(&[("same", Some(b"1")), ("same", Some(b"2"))], None);
+	let (setup, parent) = disposable(zip, None, |_| {});
+	let options = Options {
+		dispose: Some((SourceDisposal::Trash, parent)),
+		..Options::default()
+	};
+	let report = start(&setup, options).running.await.unwrap().unwrap();
+	assert_eq!(report.duplicates.as_ref().map(|d| d.count), Some(1));
+	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
+	assert!(setup.backend.log().trashed_files.is_empty());
 }

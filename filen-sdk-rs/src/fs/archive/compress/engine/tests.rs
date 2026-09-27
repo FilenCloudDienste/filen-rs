@@ -238,6 +238,7 @@ fn start(
 	let job = CompressJob {
 		format,
 		entries: setup.entries.clone(),
+		password: None,
 	};
 	start_with(
 		setup,
@@ -512,6 +513,7 @@ async fn compress_disposing(
 	let job = CompressJob {
 		format: CompressFormat::Tar { compression: None },
 		entries: setup.entries.clone(),
+		password: None,
 	};
 	let job = start_disposing(
 		setup,
@@ -617,6 +619,7 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	let job = CompressJob {
 		format: CompressFormat::Tar { compression: None },
 		entries: setup.entries.clone(),
+		password: None,
 	};
 	let job = start_disposing(
 		&setup,

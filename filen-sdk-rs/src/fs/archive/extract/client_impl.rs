@@ -77,7 +77,9 @@ impl Client {
 				decoder_memory: archives.codec_mem_budget,
 				max_members: archives.max_members,
 				expansion: config.expansion_limit,
+				max_index_bytes: archives.max_index_bytes,
 			},
+			password: config.password,
 		};
 		run_extract(ExtractTask {
 			backend: Arc::new(ClientBackend::new(self)),

@@ -212,6 +212,10 @@ struct Driver<B: DriveBackend> {
 	served: u64,
 	/// The archive's plaintext as the codec read it, in order.
 	archive_hasher: blake3::Hasher,
+	/// The codec read the archive front to back, once: `archive_hasher` covers it all.
+	sequential: bool,
+	/// What the archive turned out to hold.
+	layout: Option<StreamLayout>,
 	dispose: Option<(SourceDisposal, Uuid)>,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
 
@@ -277,6 +281,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		totals,
 		counts: Default::default(),
 		unaccounted_bytes: 0,
+		duplicates: None,
 		dispositions: Vec::new(),
 	};
 	let fail = |report: ExtractReport, phase, error: Error| {
@@ -332,6 +337,8 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		reading: None,
 		served: 0,
 		archive_hasher: blake3::Hasher::new(),
+		sequential: true,
+		layout: None,
 		dispose,
 		ask: None,
 		resolver: None,
@@ -667,7 +674,10 @@ impl<B: DisposalBackend> Driver<B> {
 
 	fn codec_finished(&mut self, result: CodecResult) {
 		match &result {
-			Ok(end) => self.report.unaccounted_bytes = end.unaccounted_bytes,
+			Ok(end) => {
+				self.report.unaccounted_bytes = end.unaccounted_bytes;
+				self.report.duplicates = end.duplicates.clone();
+			}
 			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
 			Err(error) if self.fatal.is_some() || self.control.is_stopping() => {
 				tracing::debug!("archive codec ended after the job did: {error}");
@@ -698,13 +708,23 @@ impl<B: DisposalBackend> Driver<B> {
 				index,
 				reply,
 			} => {
-				// asking for the next chunk means the codec is done with the one before
+				// asking for another chunk means the codec is done with the one before
 				self.reading = None;
-				debug_assert_eq!(index, self.served, "the codec reads the archive in order");
+				if index != self.served {
+					// a jump (a zip is read from its end): what was fetched ahead is of no use
+					self.sequential = false;
+					self.fetches = FuturesOrdered::new();
+					self.ready.clear();
+					self.next_fetch = index;
+					self.served = index;
+				}
 				self.ask = Some((index, reply));
 				self.serve_ask();
 			}
-			WorkerEvent::Opened(layout) => self.open(layout).await?,
+			WorkerEvent::Opened(layout) => {
+				self.layout = Some(layout);
+				self.open(layout).await?
+			}
 			WorkerEvent::Entry(head) => self.on_entry(head),
 			WorkerEvent::Skipped(member) => self.on_skipped(member),
 			event @ (WorkerEvent::Data(_) | WorkerEvent::FileEnd) => self.retry_held(event),
@@ -734,7 +754,9 @@ impl<B: DisposalBackend> Driver<B> {
 		self.unverified = listed.unverified;
 		let root_entry = self.entry_id(0);
 		let new_folder = match (&self.root, layout) {
-			(ExtractRoot::NewFolder { name }, StreamLayout::Tar { .. }) => Some(name.clone()),
+			(ExtractRoot::NewFolder { name }, StreamLayout::Tar { .. } | StreamLayout::Zip) => {
+				Some(name.clone())
+			}
 			(_, StreamLayout::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
 		let root_uuid = match new_folder {
@@ -1461,17 +1483,24 @@ impl<B: DisposalBackend> Driver<B> {
 				bytes: self.report.unaccounted_bytes,
 			});
 		}
-		// every chunk was read, so the hash covers the whole archive
-		if self.served != self.chunks {
-			return kept(KeptReason::Unconfirmed);
+		if self.report.duplicates.is_some() {
+			return kept(KeptReason::Incomplete);
 		}
-		let read = Blake3Hash::from(self.archive_hasher.finalize());
-		match self.archive.hash() {
-			Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
-			None if how == SourceDisposal::DeletePermanently => {
-				return kept(KeptReason::HashUnavailable);
+		if self.layout != Some(StreamLayout::Zip) {
+			// A streaming archive's entries carry no checksum of their own (a tar's) or share
+			// one for the whole stream: the whole archive, read front to back, has to match the
+			// hash in its metadata. A zip's entries were each checked as they were read.
+			if !self.sequential || self.served != self.chunks {
+				return kept(KeptReason::Unconfirmed);
 			}
-			_ => {}
+			let read = Blake3Hash::from(self.archive_hasher.finalize());
+			match self.archive.hash() {
+				Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
+				None if how == SourceDisposal::DeletePermanently => {
+					return kept(KeptReason::HashUnavailable);
+				}
+				_ => {}
+			}
 		}
 		if !self.output_confirmed(counts).await {
 			return kept(KeptReason::Unconfirmed);

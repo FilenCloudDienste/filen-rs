@@ -30,6 +30,7 @@ use std::io::{self, Read};
 use super::format::StreamCodec;
 pub(crate) use input::Trailing;
 use input::{Input, TRUNCATED};
+pub(crate) use lzma::clamp_dict as clamp_lzma_dict;
 
 /// How a decoded stream ended, once its decoder has returned `Ok(0)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

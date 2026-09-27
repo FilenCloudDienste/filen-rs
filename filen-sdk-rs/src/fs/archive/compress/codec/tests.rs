@@ -17,6 +17,11 @@ use crate::{
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
 		worker,
+		zip::{
+			crypto::AesStrength,
+			read::{EntryLimits, ZipKind, ZipLimits, open_entry, read_index},
+			write::ZipMethod,
+		},
 	},
 };
 
@@ -35,7 +40,21 @@ fn run(
 	sources: &HashMap<u32, Vec<u8>>,
 	short: Option<u32>,
 ) -> Written {
-	let job = CompressJob { format, entries };
+	run_with(format, entries, sources, short, None)
+}
+
+fn run_with(
+	format: CompressFormat,
+	entries: Vec<ArchiveEntry>,
+	sources: &HashMap<u32, Vec<u8>>,
+	short: Option<u32>,
+	password: Option<&str>,
+) -> Written {
+	let job = CompressJob {
+		format,
+		entries,
+		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+	};
 	let mut link = worker::start(move |port| compress(&port, job)).unwrap();
 	let mut written = Written {
 		archive: Vec::new(),
@@ -345,4 +364,199 @@ fn the_size_gate_is_exact_at_the_long_name_boundaries() {
 			"paths of {len} bytes"
 		);
 	}
+}
+
+/// Reads a zip back through the zip crate: path (dirs end in `/`) and data per entry.
+fn zip_crate_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Vec<u8>)> {
+	let mut zip = zip8::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+	(0..zip.len())
+		.map(|i| {
+			let mut file = match password {
+				None => zip.by_index(i).unwrap(),
+				Some(password) => zip.by_index_decrypt(i, password).unwrap(),
+			};
+			let mut data = Vec::new();
+			file.read_to_end(&mut data).unwrap();
+			(file.name().to_owned(), data)
+		})
+		.collect()
+}
+
+/// Reads a zip back through our own reader, which checks every CRC and AES code.
+fn our_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Vec<u8>)> {
+	let mut source = std::io::Cursor::new(archive);
+	let index = read_index(
+		&mut source,
+		archive.len() as u64,
+		ZipLimits {
+			max_index_bytes: 32 << 20,
+			max_entries: 1000,
+		},
+	)
+	.unwrap();
+	assert!(index.overlapping.is_empty() && index.duplicate_count == 0);
+	assert_eq!(index.prefix_bytes, 0);
+	index
+		.entries
+		.iter()
+		.map(|entry| {
+			let mut data = Vec::new();
+			if entry.kind == ZipKind::File {
+				open_entry(
+					&mut source,
+					index.shift,
+					entry,
+					password,
+					EntryLimits {
+						decoder_memory: 64 << 20,
+					},
+				)
+				.unwrap()
+				.read_to_end(&mut data)
+				.unwrap();
+			}
+			(entry.name.clone(), data)
+		})
+		.collect()
+}
+
+fn members_as_entries(members: &[Member]) -> Vec<(String, Vec<u8>)> {
+	members
+		.iter()
+		.map(|member| (member.path.clone(), member.data.clone()))
+		.collect()
+}
+
+#[test]
+fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
+	let methods = [
+		ZipMethod::Stored,
+		ZipMethod::Deflate { level: 1 },
+		ZipMethod::Deflate { level: 9 },
+		ZipMethod::Bzip2 { level: 1 },
+	];
+	for method in methods {
+		for encryption in [None, Some(AesStrength::Aes128), Some(AesStrength::Aes256)] {
+			let (entries, sources, members) = sample();
+			let password = encryption.map(|_| "correct horse");
+			let written = run_with(
+				CompressFormat::Zip { method, encryption },
+				entries,
+				&sources,
+				None,
+				password,
+			);
+			let case = format!("{method:?} {encryption:?}");
+			assert_eq!(
+				written.result.unwrap(),
+				written.archive.len() as u64,
+				"{case}"
+			);
+			assert_eq!(written.file_ends, 4, "{case}");
+			let (_, whole) = written.chunks.split_last().unwrap();
+			assert!(whole.iter().all(|&n| n == CHUNK_SIZE), "{case}");
+			let expected = members_as_entries(&members);
+			let password = password.map(str::as_bytes);
+			assert_eq!(our_entries(&written.archive, password), expected, "{case}");
+			assert_eq!(
+				zip_crate_entries(&written.archive, password),
+				expected,
+				"{case}"
+			);
+		}
+	}
+}
+
+#[test]
+fn every_zip_entry_gets_its_own_salt() {
+	let (entries, sources, _) = sample();
+	let written = run_with(
+		CompressFormat::Zip {
+			method: ZipMethod::Stored,
+			encryption: Some(AesStrength::Aes256),
+		},
+		entries,
+		&sources,
+		None,
+		Some("pw"),
+	);
+	written.result.unwrap();
+	let mut source = std::io::Cursor::new(&written.archive[..]);
+	let index = read_index(
+		&mut source,
+		written.archive.len() as u64,
+		ZipLimits {
+			max_index_bytes: 1 << 20,
+			max_entries: 100,
+		},
+	)
+	.unwrap();
+	// a stored AES entry's data starts with its 16-byte salt
+	let salts: std::collections::HashSet<Vec<u8>> = index
+		.entries
+		.iter()
+		.filter(|entry| entry.kind == ZipKind::File)
+		.map(|entry| {
+			let at = entry.header_offset as usize;
+			let name_len = u16::from_le_bytes([written.archive[at + 26], written.archive[at + 27]]);
+			let extra_len =
+				u16::from_le_bytes([written.archive[at + 28], written.archive[at + 29]]);
+			let data = at + 30 + usize::from(name_len) + usize::from(extra_len);
+			written.archive[data..data + 16].to_vec()
+		})
+		.collect();
+	assert_eq!(salts.len(), 4);
+}
+
+#[test]
+fn an_encrypted_zip_without_a_password_writes_nothing() {
+	let (entries, sources, _) = sample();
+	let written = run(
+		CompressFormat::Zip {
+			method: ZipMethod::Stored,
+			encryption: Some(AesStrength::Aes256),
+		},
+		entries,
+		&sources,
+		None,
+	);
+	assert_eq!(
+		written.result.unwrap_err().kind(),
+		ErrorKind::ArchivePasswordRequired
+	);
+	assert!(written.archive.is_empty());
+}
+
+#[test]
+fn a_zip_source_that_changed_length_fails_the_archive() {
+	let (entries, sources, _) = sample();
+	let written = run(
+		CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		},
+		entries,
+		&sources,
+		Some(2),
+	);
+	assert_eq!(
+		written.result.unwrap_err().kind(),
+		ErrorKind::FileChangedDuringSync
+	);
+}
+
+#[test]
+fn an_empty_zip_is_valid() {
+	let written = run(
+		CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		},
+		Vec::new(),
+		&HashMap::new(),
+		None,
+	);
+	assert_eq!(written.result.unwrap(), 22, "just the end record");
+	assert!(zip_crate_entries(&written.archive, None).is_empty());
+	assert!(our_entries(&written.archive, None).is_empty());
 }

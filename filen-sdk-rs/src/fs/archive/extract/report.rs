@@ -21,7 +21,7 @@ use crate::{
 
 pub use crate::job::report::RunState;
 
-use super::ExtractSkipReason;
+use super::{DuplicateEntries, ExtractSkipReason};
 use crate::fs::archive::dispose::SourceDisposition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,8 +224,11 @@ pub struct ExtractReport {
 	pub totals: ArchiveTotals,
 	pub counts: ItemCounts,
 	/// Bytes in the archive after its last entry that belong to none (another archive appended
-	/// to it, say), counted from the first non-zero one; zero padding is not counted.
+	/// to it, say), counted from the first non-zero one; zero padding is not counted. For a zip,
+	/// the bytes before its first entry (a self-extracting stub, say).
 	pub unaccounted_bytes: u64,
+	/// Names a zip lists more than once; the last entry of each was extracted.
+	pub duplicates: Option<DuplicateEntries>,
 	/// What became of the archive, when it was to be removed.
 	pub dispositions: Vec<SourceDisposition>,
 }

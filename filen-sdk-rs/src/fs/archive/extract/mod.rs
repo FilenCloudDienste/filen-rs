@@ -13,6 +13,7 @@ use crate::fs::{
 	name::ValidatedName,
 };
 
+pub use crate::fs::archive::password::ArchivePassword;
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport,
@@ -87,6 +88,9 @@ pub struct ExtractConfig {
 	pub max_items: Option<u64>,
 	/// `None` turns the check off.
 	pub expansion_limit: Option<ExpansionLimit>,
+	/// For an archive with encrypted entries. Checked before anything is created, on the
+	/// smallest encrypted entry.
+	pub password: Option<ArchivePassword>,
 }
 
 impl Default for ExtractConfig {
@@ -95,6 +99,7 @@ impl Default for ExtractConfig {
 			max_bytes: None,
 			max_items: None,
 			expansion_limit: Some(ExpansionLimit::DEFAULT),
+			password: None,
 		}
 	}
 }
@@ -121,4 +126,19 @@ pub enum ExtractSkipReason {
 	/// A path that climbs out of the folder it is extracted into, or cannot be made into drive
 	/// names.
 	UnsafePath,
+	/// A zip entry whose data overlaps another's, which a well-formed zip never has.
+	OverlappingData,
+	/// Data compressed or encrypted in a way the SDK does not read (zip PPMd, or encrypted LZMA
+	/// and XZ entries).
+	UnsupportedMethod,
+}
+
+/// Names a zip lists more than once; the last entry of each name is extracted, as other zip
+/// tools do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateEntries {
+	/// Up to 100 of the names.
+	pub names: Vec<String>,
+	/// How many entries were left out for a later one of the same name.
+	pub count: u64,
 }

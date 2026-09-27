@@ -13,7 +13,16 @@ use std::{
 use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
-	fs::archive::{extract::ExpansionLimit, format::StreamCodec, worker},
+	fs::archive::{
+		extract::ExpansionLimit,
+		format::StreamCodec,
+		password::ArchivePassword,
+		worker,
+		zip::{
+			crypto::AesStrength,
+			write::{Encryption, ZipMethod, ZipWriter},
+		},
+	},
 };
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -23,6 +32,7 @@ const LIMITS: CodecLimits = CodecLimits {
 		ratio: 1000,
 		floor: 256 << 20,
 	}),
+	max_index_bytes: 32 << 20,
 };
 
 /// What the driver saw, with a file's data joined up.
@@ -55,10 +65,20 @@ fn run_with(
 	name: &str,
 	limits: CodecLimits,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
+	run_full(archive, name, limits, None)
+}
+
+fn run_full(
+	archive: &[u8],
+	name: &str,
+	limits: CodecLimits,
+	password: Option<&str>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
 	let job = StreamJob {
 		name: name.to_owned(),
 		len: archive.len() as u64,
 		limits,
+		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
 	};
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
@@ -212,7 +232,8 @@ fn a_bare_tar_is_sent_member_by_member() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 0
+			unaccounted_bytes: 0,
+			duplicates: None,
 		}
 	);
 }
@@ -249,7 +270,8 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 4
+			unaccounted_bytes: 4,
+			duplicates: None,
 		}
 	);
 }
@@ -277,15 +299,21 @@ fn a_single_compressed_file_is_named_after_the_archive() {
 	assert_eq!(
 		end.unwrap(),
 		ArchiveEnd {
-			unaccounted_bytes: 0
+			unaccounted_bytes: 0,
+			duplicates: None,
 		}
 	);
 }
 
 #[test]
 fn what_the_codec_cannot_read_is_refused() {
+	// zip magic without a zip behind it
 	assert_eq!(
 		kind(run(b"PK\x03\x04rest", "a.zip").1),
+		ErrorKind::ArchiveCorrupt
+	);
+	assert_eq!(
+		kind(run(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4], "a.7z").1),
 		ErrorKind::ArchiveUnsupported
 	);
 	assert_eq!(
@@ -346,6 +374,7 @@ fn the_codec_stops_once_its_driver_is_gone() {
 					name: "sample.tar".into(),
 					len,
 					limits: LIMITS,
+					password: None,
 				},
 			);
 			exited.store(true, Ordering::SeqCst);
@@ -363,4 +392,146 @@ fn the_codec_stops_once_its_driver_is_gone() {
 		assert!(Instant::now() < deadline, "the codec thread kept running");
 		std::thread::sleep(Duration::from_millis(5));
 	}
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
+	let mut writer = ZipWriter::new(Vec::new());
+	for (path, data) in entries {
+		match data {
+			None => writer.add_dir(path, None).unwrap(),
+			Some(data) => {
+				let encryption = password.map(|password| Encryption {
+					password,
+					strength: AesStrength::Aes256,
+					salt: vec![9; 16],
+				});
+				writer
+					.add_file(
+						path,
+						None,
+						data.len() as u64,
+						ZipMethod::Deflate { level: 6 },
+						encryption,
+						&mut &data[..],
+					)
+					.unwrap();
+			}
+		}
+	}
+	writer.finish().unwrap()
+}
+
+fn zip_sample() -> (Vec<u8>, Vec<Seen>) {
+	let big = pattern(CHUNK_SIZE + 99, 4);
+	let zip = zip_of(
+		&[
+			("docs", None),
+			("docs/a.txt", Some(b"alpha")),
+			("docs/big.bin", Some(&big)),
+			("../evil", Some(b"x")),
+		],
+		None,
+	);
+	let seen = vec![
+		Seen::Opened(StreamLayout::Zip),
+		Seen::Dir(0, "docs".into()),
+		file(1, "docs/a.txt", b"alpha"),
+		file(2, "docs/big.bin", &big),
+		Seen::Skipped(3, "../evil".into(), 1, ExtractSkipReason::UnsafePath),
+	];
+	(zip, seen)
+}
+
+#[test]
+fn a_zip_is_sent_entry_by_entry() {
+	let (zip, expected) = zip_sample();
+	let (seen, end) = run(&zip, "bundle.zip");
+	assert_eq!(seen, expected);
+	assert_eq!(
+		end.unwrap(),
+		ArchiveEnd {
+			unaccounted_bytes: 0,
+			duplicates: None,
+		}
+	);
+}
+
+#[test]
+fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
+	let zip = zip_of(&[("secret.txt", Some(b"secret"))], Some(b"right"));
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, None);
+	assert!(seen.is_empty());
+	assert_eq!(kind(end), ErrorKind::ArchivePasswordRequired);
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, Some("wrong"));
+	assert!(seen.is_empty());
+	assert_eq!(kind(end), ErrorKind::ArchiveWrongPassword);
+	let (seen, end) = run_full(&zip, "s.zip", LIMITS, Some("right"));
+	end.unwrap();
+	assert_eq!(
+		seen,
+		[
+			Seen::Opened(StreamLayout::Zip),
+			file(0, "secret.txt", b"secret")
+		]
+	);
+}
+
+#[test]
+fn zip_duplicates_symlinks_and_bombs() {
+	let zip = zip_of(&[("same", Some(b"one")), ("same", Some(b"two"))], None);
+	let (seen, end) = run(&zip, "d.zip");
+	let end = end.unwrap();
+	assert_eq!(
+		end.duplicates,
+		Some(DuplicateEntries {
+			names: vec!["same".into()],
+			count: 1
+		})
+	);
+	assert_eq!(seen[1], file(1, "same", b"two"), "the last one listed wins");
+
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	writer
+		.add_symlink(
+			"link",
+			"target/file",
+			zip8::write::SimpleFileOptions::default(),
+		)
+		.unwrap();
+	let linked = writer.finish().unwrap().into_inner();
+	let (seen, end) = run(&linked, "l.zip");
+	end.unwrap();
+	assert_eq!(
+		seen,
+		[
+			Seen::Opened(StreamLayout::Zip),
+			Seen::Skipped(
+				0,
+				"link".into(),
+				11,
+				ExtractSkipReason::Symlink {
+					target: "target/file".into()
+				}
+			),
+		]
+	);
+
+	let zeros = zip_of(&[("zeros", Some(&vec![0u8; 4 << 20]))], None);
+	let bomb = CodecLimits {
+		expansion: Some(ExpansionLimit {
+			ratio: 10,
+			floor: 1 << 20,
+		}),
+		..LIMITS
+	};
+	let (seen, end) = run_with(&zeros, "z.zip", bomb);
+	assert!(
+		seen.is_empty(),
+		"refused on its stated sizes, before anything is sent"
+	);
+	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
 }
