@@ -2208,6 +2208,7 @@ dependencies = [
  "serde_path_to_error",
  "sha1",
  "sha2 0.10.9",
+ "siphasher 1.0.1",
  "stable_deref_trait",
  "string-interner",
  "tempfile",

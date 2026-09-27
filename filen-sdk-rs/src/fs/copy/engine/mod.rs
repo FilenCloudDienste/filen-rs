@@ -55,14 +55,13 @@ use crate::{
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
-		name::ValidatedName,
+		name::{ValidatedName, keep_both::TakenNames},
 	},
 	job::{JobControl, JobTasks, Stopped},
 	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::{
-	naming::TakenNames,
 	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 	report::{
 		ActiveFile, CopiedTopLevel, CopyEvent, CopyFailed, CopyFailure, CopyPhase, CopyReport,
