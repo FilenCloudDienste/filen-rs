@@ -90,6 +90,7 @@ impl Client {
 	) -> Result<CompressReport, CompressFailed> {
 		let reporter = Reporter::new(callback);
 		let (format, max_bytes) = (config.format, config.max_bytes);
+		let archives = self.archive_config().clone();
 		let Planned {
 			extension_len,
 			report,
@@ -99,6 +100,7 @@ impl Client {
 			read_back,
 		} = plan_compression(
 			&*self,
+			&archives,
 			sources,
 			destination.uuid(),
 			&name,
@@ -107,7 +109,6 @@ impl Client {
 			&control,
 		)
 		.await?;
-		let archives = self.archive_config().clone();
 		run_compress(CompressTask {
 			backend: Arc::new(ClientBackend::new(self)),
 			control,
@@ -128,11 +129,8 @@ impl Client {
 	}
 }
 
-/// What planning a compression reads from the client: its archive settings and its source
-/// listings. Tests plan against a fake.
-trait PlanningClient {
-	fn archive_settings(&self) -> &ArchiveConfig;
-
+/// Lists a compression's source directories: the client, or a test's fake.
+trait SourceLister {
 	async fn list_source(
 		&self,
 		dir: ItemSourceDir,
@@ -140,11 +138,7 @@ trait PlanningClient {
 	) -> Result<PlanSource<ItemSourceDir>, Error>;
 }
 
-impl PlanningClient for Client {
-	fn archive_settings(&self) -> &ArchiveConfig {
-		self.archive_config()
-	}
-
+impl SourceLister for Client {
 	async fn list_source(
 		&self,
 		dir: ItemSourceDir,
@@ -167,8 +161,13 @@ struct Planned {
 /// Checks the format and `name`, lists and plans the sources, and checks the archive can be
 /// written and extracted again. A job paused before it starts waits here, in
 /// [`CompressPhase::Scanning`], before listing anything.
+#[expect(
+	clippy::too_many_arguments,
+	reason = "the request's parts, the archive settings, and the job's reporter and control"
+)]
 async fn plan_compression(
-	client: &impl PlanningClient,
+	lister: &impl SourceLister,
+	archives: &ArchiveConfig,
 	sources: CompressSources,
 	destination: Uuid,
 	name: &ValidatedName,
@@ -176,7 +175,6 @@ async fn plan_compression(
 	reporter: &MaybeArc<Reporter>,
 	control: &JobControl,
 ) -> Result<Planned, CompressFailed> {
-	let archives = client.archive_settings();
 	// every source a disposal was asked for is reported, however early the job ends
 	let requested: Vec<Uuid> = match &sources {
 		CompressSources::Keep(_) => Vec::new(),
@@ -221,7 +219,7 @@ async fn plan_compression(
 			(sources, Some((how, items)))
 		}
 	};
-	let mut plan = match plan_sources(client, sources, reporter, control).await {
+	let mut plan = match plan_sources(lister, sources, reporter, control).await {
 		Ok(plan) => plan,
 		Err(ScanError::Stopped) => {
 			return Err(end_early(
@@ -294,7 +292,7 @@ async fn plan_compression(
 /// Lists every source directory and plans the archive's entries under a root of its own. A
 /// pause is waited out before anything is listed, and between source directories.
 async fn plan_sources(
-	client: &impl PlanningClient,
+	lister: &impl SourceLister,
 	sources: Vec<ItemSource>,
 	reporter: &MaybeArc<Reporter>,
 	control: &JobControl,
@@ -321,7 +319,7 @@ async fn plan_sources(
 			ItemSource::Dir(dir) => {
 				reporter.checkpoint(control).await?;
 				bytes.next_source();
-				let listing = client.list_source(dir, &bytes);
+				let listing = lister.list_source(dir, &bytes);
 				let source = watch_listing(listing, &ops, control, || report(sources_done))
 					.await?
 					.map_err(ScanError::Failed)?;
@@ -903,18 +901,14 @@ mod tests {
 		assert!(check_path(&format!("{deep}/x"), 0).is_err());
 	}
 
-	/// Plans against listings it makes up, one file per directory, recording which directories
-	/// it was asked to list.
-	struct FakeClient {
-		archives: ArchiveConfig,
+	/// Makes up listings, one file per directory, recording which directories it was asked to
+	/// list.
+	#[derive(Default)]
+	struct FakeLister {
 		listed: Mutex<Vec<Uuid>>,
 	}
 
-	impl PlanningClient for FakeClient {
-		fn archive_settings(&self) -> &ArchiveConfig {
-			&self.archives
-		}
-
+	impl SourceLister for FakeLister {
 		async fn list_source(
 			&self,
 			dir: ItemSourceDir,
@@ -981,7 +975,7 @@ mod tests {
 
 	/// A compression of `sources` planned with a pause asked for before it starts.
 	struct PausedPlan {
-		client: Arc<FakeClient>,
+		lister: Arc<FakeLister>,
 		updates: Arc<Updates>,
 		reporter: MaybeArc<Reporter>,
 		pause: tokio::sync::watch::Sender<bool>,
@@ -991,20 +985,18 @@ mod tests {
 	}
 
 	async fn plan_paused(sources: CompressSources) -> PausedPlan {
-		let client = Arc::new(FakeClient {
-			archives: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
-			listed: Mutex::default(),
-		});
+		let lister = Arc::new(FakeLister::default());
 		let updates = Arc::new(Updates::default());
 		let reporter = Reporter::new(Arc::clone(&updates));
 		let (pause, cancel, control) = controls();
 		pause.send_replace(true);
 		let planned = tokio::spawn({
-			let client = Arc::clone(&client);
+			let lister = Arc::clone(&lister);
 			let reporter = MaybeArc::clone(&reporter);
 			async move {
 				plan_compression(
-					&*client,
+					&*lister,
+					&ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 					sources,
 					Uuid::new_v4(),
 					&ValidatedName::try_from("a.tar").unwrap(),
@@ -1022,7 +1014,7 @@ mod tests {
 		});
 		wait_until("the job reports itself paused", || reporter.is_paused()).await;
 		PausedPlan {
-			client,
+			lister,
 			updates,
 			reporter,
 			pause,
@@ -1042,7 +1034,7 @@ mod tests {
 			("file-only", file_only, Vec::new()),
 		] {
 			let paused = plan_paused(sources).await;
-			assert!(paused.client.listed.lock().unwrap().is_empty(), "{case}");
+			assert!(paused.lister.listed.lock().unwrap().is_empty(), "{case}");
 			assert_eq!(paused.updates.run_states(), [RunState::Paused], "{case}");
 			assert_eq!(
 				paused.updates.last_phase(),
@@ -1053,7 +1045,7 @@ mod tests {
 
 			paused.pause.send_replace(false);
 			let totals = paused.planned.await.unwrap().unwrap();
-			assert_eq!(*paused.client.listed.lock().unwrap(), listed, "{case}");
+			assert_eq!(*paused.lister.listed.lock().unwrap(), listed, "{case}");
 			assert_eq!(totals.files, 1, "{case}");
 			// the plan's update is sent once resumed, never reading running before
 			assert_eq!(
@@ -1077,7 +1069,7 @@ mod tests {
 		let failed = paused.planned.await.unwrap().unwrap_err();
 
 		assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-		assert!(paused.client.listed.lock().unwrap().is_empty());
+		assert!(paused.lister.listed.lock().unwrap().is_empty());
 		let [disposition] = &failed.report.dispositions[..] else {
 			panic!("one source: {:?}", failed.report.dispositions);
 		};
