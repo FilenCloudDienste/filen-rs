@@ -4,6 +4,7 @@
 mod client_impl;
 pub(crate) mod codec;
 mod engine;
+mod read_back;
 mod report;
 
 pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
@@ -45,9 +46,12 @@ pub enum CompressSources {
 	/// confirmed with the server, and each source still exactly as it was read. Otherwise they
 	/// are kept and the report says why. The archive cannot be written into one of them.
 	///
-	/// The archive is not read back first. With an encrypted format, have the user confirm the
-	/// password before removing anything for good: a mistyped one leaves an archive nobody can
-	/// open.
+	/// Before deleting anything for good, the archive is read back from the server as
+	/// extracting would read it ([`CompressPhase::Verifying`]), which downloads it once more:
+	/// every entry has to be its source's data. Trashed sources can be restored, so trashing
+	/// reads nothing back. The read back uses the password the archive was written with, so it
+	/// cannot tell a mistyped one: with an encrypted format, have the user confirm the password
+	/// before removing anything for good.
 	///
 	/// An item given twice, or inside another given folder, shares that one's outcome, its bytes
 	/// counted there; a file of it that the folder's permanent removal deleted before stopping

@@ -40,6 +40,7 @@ use super::{
 	engine::{
 		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
 	},
+	read_back::ReadBack,
 	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
 };
 
@@ -157,6 +158,7 @@ impl Client {
 			..CompressReport::default()
 		};
 		report.renamed.extend(top_level_renamed);
+		let how = dispose.as_ref().map(|(how, _)| *how);
 		let disposal =
 			match dispose.map(|(how, items)| disposal(&plan, how, items, destination.uuid())) {
 				None => None,
@@ -182,6 +184,10 @@ impl Client {
 		}
 		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
+		// a permanent disposal reads the archive back as extracting would
+		// a permanent disposal reads the archive back as extracting would
+		let read_back = (how == Some(SourceDisposal::DeletePermanently))
+			.then(|| ReadBack::as_extracting(&entries, &archives, config.password.clone()));
 		let job = CompressJob {
 			format: config.format,
 			entries,
@@ -201,6 +207,7 @@ impl Client {
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
 			disposal,
+			read_back,
 		})
 		.await
 	}

@@ -41,6 +41,9 @@ pub enum CompressPhase {
 	Compressing,
 	/// Registering the archive in the destination.
 	Finishing,
+	/// Reading the archive back, to check it holds the sources before they are deleted for
+	/// good.
+	Verifying,
 	/// Removing the sources, once the archive is verified.
 	DisposingSources,
 	Done,

@@ -382,7 +382,13 @@ impl DriveBackend for FakeBackend {
 		if let Some(kind) = self.fail_fetch.get(&name) {
 			return Err(Error::custom(*kind, "fetch failed"));
 		}
-		self.log().fetched.push((file.uuid(), index));
+		let mut log = self.log();
+		log.fetched.push((file.uuid(), index));
+		// a file the job uploaded reads back as it was uploaded
+		if let Some(data) = log.uploaded_data.get(&(file.uuid(), index)) {
+			return Ok(data.clone());
+		}
+		drop(log);
 		if let Some(contents) = self.contents.get(&file.uuid()) {
 			let start = (index * CHUNK_SIZE_U64) as usize;
 			return Ok(contents[start..(start + CHUNK_SIZE).min(contents.len())].to_vec());
