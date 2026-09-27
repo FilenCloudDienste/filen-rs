@@ -12,22 +12,22 @@ use filen_macros::js_type;
 
 use super::{
 	crypto::{AesStrength, AesWriter},
-	read::{CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, LOCAL_HEADER_SIG},
+	read::{
+		CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
+		FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG,
+	},
 };
 
 const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
-const FLAG_ENCRYPTED: u16 = 0x0001;
-const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
-const FLAG_UTF8: u16 = 0x0800;
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 const METHOD_BZIP2: u16 = 12;
 const METHOD_AES: u16 = 99;
-/// Unix (3), zip specification 6.3.
-const VERSION_MADE_BY: u16 = 0x033F;
+/// Made on Unix, to zip specification 6.3.
+const VERSION_MADE_BY: u16 = (HOST_UNIX << 8) | 63;
 /// An entry this large, or larger, is written with zip64 sizes: its compressed size may pass
 /// 4 GiB even though its data does not, since stored and deflated data can grow a little.
-const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
+pub(crate) const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 
 /// How a zip entry's data is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +111,9 @@ impl<W: Write> Write for Counting<W> {
 pub(crate) struct ZipWriter<W> {
 	out: Counting<W>,
 	entries: Vec<CentralEntry>,
+	/// [`ZIP64_ENTRY_THRESHOLD`], lowered by tests that cannot write 4 GiB to reach it.
+	#[cfg(test)]
+	zip64_entry_threshold: u64,
 }
 
 impl<W: Write> ZipWriter<W> {
@@ -121,7 +124,32 @@ impl<W: Write> ZipWriter<W> {
 				written: 0,
 			},
 			entries: Vec::new(),
+			#[cfg(test)]
+			zip64_entry_threshold: ZIP64_ENTRY_THRESHOLD,
 		}
+	}
+
+	/// A writer whose archive already holds `written` bytes that `out` never sees, and which
+	/// writes an entry of `zip64_entry_threshold` bytes or more with zip64 sizes: the zip64
+	/// records of an archive past 4 GiB, without writing 4 GiB.
+	#[cfg(test)]
+	pub(crate) fn past(out: W, written: u64, zip64_entry_threshold: u64) -> Self {
+		Self {
+			out: Counting {
+				inner: out,
+				written,
+			},
+			entries: Vec::new(),
+			zip64_entry_threshold,
+		}
+	}
+
+	/// The size from which an entry is written with zip64 sizes.
+	fn zip64_entry_threshold(&self) -> u64 {
+		#[cfg(test)]
+		return self.zip64_entry_threshold;
+		#[cfg(not(test))]
+		ZIP64_ENTRY_THRESHOLD
 	}
 
 	/// Adds a directory; `path` without its trailing `/`.
@@ -158,7 +186,7 @@ impl<W: Write> ZipWriter<W> {
 		encryption: Option<Encryption<'_>>,
 		data: &mut dyn Read,
 	) -> io::Result<u64> {
-		let zip64 = size >= ZIP64_ENTRY_THRESHOLD;
+		let zip64 = size >= self.zip64_entry_threshold();
 		let mut entry = CentralEntry {
 			name: path.as_bytes().to_vec(),
 			flags: FLAG_UTF8
@@ -332,8 +360,11 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 
 /// The zip specification version (4.4.3.2) that deflate and directories need.
 const VERSION_DEFLATE: u16 = 20;
+/// The version that zip64 sizes, offsets and end records need.
 const VERSION_ZIP64: u16 = 45;
+/// The version that bzip2 needs.
 const VERSION_BZIP2: u16 = 46;
+/// The version that WinZip AES needs (its specification, not APPNOTE's).
 const VERSION_AES: u16 = 51;
 
 /// The highest version any of the entry's features needs: a bzip2 entry with zip64 sizes needs
@@ -535,6 +566,52 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn the_central_zip64_field_holds_what_the_fixed_fields_leave_out_in_order() {
+		const FULL: u32 = u32::MAX;
+		// (size, compressed size, offset; the fixed fields' compressed size, size and offset,
+		// and the zip64 values after them, in the specification's order)
+		for ((size, compressed_size, offset), fixed, zip64) in [
+			(
+				(5 << 30, 6 << 30, 7 << 30),
+				(FULL, FULL, FULL),
+				vec![5 << 30, 6 << 30, 7 << 30],
+			),
+			((10, 6 << 30, 20), (FULL, 10, 20), vec![6 << 30]),
+			((20, 10, 7 << 30), (10, 20, FULL), vec![7 << 30]),
+			((20, 10, 30), (10, 20, 30), vec![]),
+		] {
+			let entry = CentralEntry {
+				name: b"big".to_vec(),
+				flags: 0,
+				method: METHOD_STORED,
+				aes: None,
+				dos: dos_datetime(None),
+				unix_time: None,
+				crc: 0,
+				compressed_size,
+				size,
+				offset,
+				dir: false,
+			};
+			let mut record = Vec::new();
+			write_central_header(&mut record, &entry).unwrap();
+			let u32_at = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
+			assert_eq!((u32_at(20), u32_at(24), u32_at(42)), fixed);
+			let extra = &record[46 + entry.name.len()..];
+			let values: Vec<u64> = if extra.starts_with(&0x0001u16.to_le_bytes()) {
+				let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
+				extra[4..4 + len]
+					.chunks_exact(8)
+					.map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+					.collect()
+			} else {
+				Vec::new()
+			};
+			assert_eq!(values, zip64, "{size} {compressed_size} {offset}");
+		}
+	}
 
 	#[test]
 	fn the_version_needed_meets_every_requirement() {
