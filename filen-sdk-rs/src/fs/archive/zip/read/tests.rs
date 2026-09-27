@@ -212,6 +212,44 @@ fn we_read_the_zip_crates_zips() {
 }
 
 #[test]
+fn we_read_the_zip_crates_zip_crypto() {
+	use zip8::unstable::write::FileOptionsExt;
+	// a second implementation of the key schedule: a mistake the reader shares with the tests'
+	// own encryptor would cancel out
+	let sample = sample();
+	for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
+		let mut writer = zip8::ZipWriter::new(Cursor::new(Vec::new()));
+		for (path, data) in &sample {
+			let options = SimpleFileOptions::default().compression_method(method);
+			match data {
+				None => writer.add_directory(path.as_str(), options).unwrap(),
+				Some(data) => {
+					let options = options.with_deprecated_encryption(b"pw").unwrap();
+					writer.start_file(path.as_str(), options).unwrap();
+					writer.write_all(data).unwrap();
+				}
+			}
+		}
+		let zip = writer.finish().unwrap().into_inner();
+		let mut source = Cursor::new(&zip);
+		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		assert!(
+			index
+				.entries
+				.iter()
+				.filter(|entry| entry.kind == ZipKind::File)
+				.all(|entry| matches!(entry.encryption, ZipEncryption::ZipCrypto { .. })),
+			"{method:?}"
+		);
+		assert_eq!(
+			read_all(&zip, Some(b"pw")).unwrap(),
+			expected(&sample),
+			"{method:?}"
+		);
+	}
+}
+
+#[test]
 fn passwords_are_asked_for_and_checked() {
 	let zip = ours(
 		&[("secret.txt", Some(&b"secret"[..]))],
