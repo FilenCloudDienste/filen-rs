@@ -1,6 +1,9 @@
-//! The copy engine's drive operations, on a logged-in client.
+//! The drive operations a job made of many items needs (locking, creating directories,
+//! transferring chunks, registering files, sharing new items with the destination's links and
+//! shares), as a trait so engines can run against a fake in tests, and its implementation on a
+//! logged-in client.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid, traits::CowHelpers};
@@ -26,9 +29,100 @@ use crate::{
 		name::ValidatedName,
 	},
 	sync::lock::ResourceLock,
+	util::{MaybeSend, MaybeSendSync},
 };
 
-use super::engine::{CopyBackend, CreatedDir, UploadSpec};
+/// Outcome of creating a directory.
+#[derive(Debug)]
+pub(crate) enum CreatedDir {
+	Created(RemoteDirectory),
+	/// The server already had a directory with that name there and returned it instead.
+	Merged,
+}
+
+/// What a new file is created as.
+#[derive(Debug, Clone)]
+pub(crate) struct UploadSpec {
+	pub(crate) uuid: Uuid,
+	pub(crate) parent: Uuid,
+	pub(crate) name: ValidatedName,
+	pub(crate) mime: Option<String>,
+}
+
+/// The drive operations a job needs. The production implementation is the client; tests use a
+/// fake with the real memory semaphore.
+pub(crate) trait DriveBackend: MaybeSendSync + 'static {
+	type DriveLock: MaybeSendSync + 'static;
+	type Upload: MaybeSendSync + 'static;
+
+	/// The client's file-IO memory semaphore, in bytes.
+	fn memory(&self) -> Arc<Semaphore>;
+	/// Acquires the drive lock, waiting while another client holds it.
+	fn acquire_drive_lock(
+		&self,
+	) -> impl Future<Output = Result<Self::DriveLock, Error>> + MaybeSend;
+	fn connected_targets(
+		&self,
+		dir: Uuid,
+	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
+	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
+	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
+	/// the directory, and reports a merge into an existing one instead of returning it.
+	fn create_dir_unpropagated(
+		&self,
+		parent: Uuid,
+		uuid: Uuid,
+		name: &ValidatedName,
+		created: DateTime<Utc>,
+	) -> impl Future<Output = Result<CreatedDir, Error>> + MaybeSend;
+	fn set_dir_color(
+		&self,
+		dir: &mut RemoteDirectory,
+		color: DirColor<'static>,
+	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+	/// Adds a new item to `targets`; returns the operations that failed.
+	fn propagate(
+		&self,
+		targets: &ConnectedTargets,
+		item: NonRootItemType<'_, Normal>,
+	) -> impl Future<Output = Vec<Error>> + MaybeSend;
+	/// Adds a created top-level item, and for a directory everything below it, to `targets`;
+	/// returns the operations that failed.
+	fn propagate_tree(
+		&self,
+		targets: &ConnectedTargets,
+		item: &NonRootItemType<'static, Normal>,
+	) -> impl Future<Output = Vec<Error>> + MaybeSend;
+	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload;
+	/// Downloads and decrypts chunk `index` of `file`.
+	fn fetch_chunk(
+		&self,
+		file: &RemoteFileType<'static>,
+		index: u64,
+	) -> impl Future<Output = Result<Vec<u8>, Error>> + MaybeSend;
+	/// Encrypts and uploads the plaintext `data` as chunk `index` of `upload`.
+	fn upload_chunk(
+		&self,
+		upload: &Self::Upload,
+		index: u64,
+		data: Vec<u8>,
+	) -> impl Future<Output = Result<RemoteFileInfo, Error>> + MaybeSend;
+	/// Whether a file or directory called `name` exists in `parent`, compared as the server
+	/// compares names.
+	fn name_exists(
+		&self,
+		parent: Uuid,
+		name: &ValidatedName,
+	) -> impl Future<Output = Result<bool, Error>> + MaybeSend;
+	/// Registers the uploaded file under `name`. The caller holds the drive lock.
+	fn finish_upload(
+		&self,
+		upload: &Self::Upload,
+		name: &ValidatedName,
+		completion: UploadCompletion,
+		info: RemoteFileInfo,
+	) -> impl Future<Output = Result<RemoteFile, Error>> + MaybeSend;
+}
 
 pub(crate) struct ClientBackend {
 	client: Arc<Client>,
@@ -45,7 +139,7 @@ pub(crate) struct ClientUpload {
 	upload_key: String,
 }
 
-impl CopyBackend for ClientBackend {
+impl DriveBackend for ClientBackend {
 	type DriveLock = Arc<ResourceLock>;
 	type Upload = ClientUpload;
 
@@ -61,7 +155,7 @@ impl CopyBackend for ClientBackend {
 		self.client.fetch_connected_targets(dir).await
 	}
 
-	async fn create_copy_dir(
+	async fn create_dir_unpropagated(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,

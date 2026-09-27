@@ -26,6 +26,7 @@ use crate::{
 			RemoteDirectory,
 			traits::{HasDirInfo, HasRemoteDirInfo},
 		},
+		drive_job::backend::ClientBackend,
 		file::enums::RemoteFileType,
 		name::ValidatedName,
 	},
@@ -35,7 +36,6 @@ use crate::{
 
 use super::{
 	CopyFailed, CopyReport,
-	backend::ClientBackend,
 	engine::run_copy,
 	plan::{CopyPlan, CopyPlanner, Listed, PlanRequest, PlanSource, PlanTotals, SourceDir},
 	report::{CopyCallback, CopyPhase, Reporter, ScanProgress},

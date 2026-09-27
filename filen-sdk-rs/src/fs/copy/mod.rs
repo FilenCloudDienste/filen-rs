@@ -2,7 +2,6 @@
 //! copy reads each decrypted source and writes a new encrypted item. See
 //! [`Client::copy_items_to`](crate::auth::Client::copy_items_to).
 
-mod backend;
 mod client_impl;
 mod engine;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]

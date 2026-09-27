@@ -3,6 +3,7 @@ pub mod categories;
 pub mod client_impl;
 pub mod copy;
 pub mod dir;
+pub(crate) mod drive_job;
 pub mod enums;
 pub mod file;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]

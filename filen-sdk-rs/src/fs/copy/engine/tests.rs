@@ -20,8 +20,10 @@ use crate::{
 			report::{CopyCallback, CopyUpdate, RunState},
 		},
 		dir::{RootDirectory, meta::DecryptedDirectoryMeta},
+		drive_job::name_retry::TOP_LEVEL_NAME_ATTEMPTS,
 		file::{
 			AnonymousRemoteFile,
+			enums::RemoteFileType,
 			meta::{DecryptedFileMeta, FileMeta},
 		},
 	},
@@ -212,7 +214,7 @@ impl FakeBackend {
 	}
 }
 
-impl CopyBackend for FakeBackend {
+impl DriveBackend for FakeBackend {
 	type DriveLock = FakeLock;
 	type Upload = FakeUpload;
 
@@ -260,7 +262,7 @@ impl CopyBackend for FakeBackend {
 		})
 	}
 
-	async fn create_copy_dir(
+	async fn create_dir_unpropagated(
 		&self,
 		parent: Uuid,
 		uuid: Uuid,

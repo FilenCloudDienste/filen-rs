@@ -25,7 +25,6 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
-	future::Future,
 	iter, mem,
 	sync::Arc,
 };
@@ -48,17 +47,23 @@ use crate::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
+		drive_job::{
+			backend::{CreatedDir, DriveBackend, UploadSpec},
+			ends_job,
+			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
+			lock::{HeldLock, LockWait, wait_for_lock},
+			name_retry::NameRetry,
+		},
 		file::{
 			RemoteFile,
-			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
-		name::{ValidatedName, keep_both::TakenNames},
+		name::ValidatedName,
 	},
 	job::{JobControl, JobTasks, Stopped},
-	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendSync, sleep},
+	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::{
@@ -72,155 +77,6 @@ use super::{
 /// Chunks of one file in flight at once. More only helps a single large file; with several
 /// files running, the memory budget is the bound.
 const CHUNKS_PER_FILE: usize = 4;
-
-/// How many names a top-level item tries when the ones it picks turn out to be taken at the
-/// destination (by an entry the listing could not name, or one created since the listing).
-const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
-
-/// The keep-both names a top-level item moves through when the destination turns out to hold
-/// the one it picked.
-struct NameRetry {
-	taken: TakenNames,
-	attempts: usize,
-	is_dir: bool,
-}
-
-impl NameRetry {
-	fn new(is_dir: bool) -> Self {
-		Self {
-			taken: TakenNames::default(),
-			attempts: 0,
-			is_dir,
-		}
-	}
-
-	/// The next name after `taken_name`, or an error once [`TOP_LEVEL_NAME_ATTEMPTS`] names
-	/// were tried.
-	fn next(&mut self, taken_name: ValidatedName) -> Result<ValidatedName, Error> {
-		self.attempts += 1;
-		if self.attempts >= TOP_LEVEL_NAME_ATTEMPTS {
-			return Err(Error::custom(
-				ErrorKind::InvalidState,
-				"could not find a free name for the copy at the destination",
-			));
-		}
-		self.taken.insert(taken_name.as_ref());
-		Ok(self.taken.allocate(taken_name, self.is_dir)?)
-	}
-
-	/// `name`, or the first following keep-both name the server reports free in `parent`.
-	async fn free_name<B: CopyBackend>(
-		&mut self,
-		backend: &B,
-		parent: Uuid,
-		mut name: ValidatedName,
-	) -> Result<ValidatedName, Error> {
-		while backend.name_exists(parent, &name).await? {
-			name = self.next(name)?;
-		}
-		Ok(name)
-	}
-}
-
-/// Outcome of creating a directory.
-#[derive(Debug)]
-pub(crate) enum CreatedDir {
-	Created(RemoteDirectory),
-	/// The server already had a directory with that name there and returned it instead.
-	Merged,
-}
-
-/// What a new file is created as.
-#[derive(Debug, Clone)]
-pub(crate) struct UploadSpec {
-	pub(crate) uuid: Uuid,
-	pub(crate) parent: Uuid,
-	pub(crate) name: ValidatedName,
-	pub(crate) mime: Option<String>,
-}
-
-/// The drive operations a copy needs. The production implementation is the client; tests use
-/// a fake with the real memory semaphore.
-pub(crate) trait CopyBackend: MaybeSendSync + 'static {
-	type DriveLock: MaybeSendSync + 'static;
-	type Upload: MaybeSendSync + 'static;
-
-	/// The client's file-IO memory semaphore, in bytes.
-	fn memory(&self) -> Arc<Semaphore>;
-	/// Acquires the drive lock, waiting while another client holds it.
-	fn acquire_drive_lock(
-		&self,
-	) -> impl Future<Output = Result<Self::DriveLock, Error>> + MaybeSend;
-	fn connected_targets(
-		&self,
-		dir: Uuid,
-	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
-	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
-	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
-	/// the directory, and reports a merge into an existing one instead of returning it.
-	fn create_copy_dir(
-		&self,
-		parent: Uuid,
-		uuid: Uuid,
-		name: &ValidatedName,
-		created: DateTime<Utc>,
-	) -> impl Future<Output = Result<CreatedDir, Error>> + MaybeSend;
-	fn set_dir_color(
-		&self,
-		dir: &mut RemoteDirectory,
-		color: DirColor<'static>,
-	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
-	/// Adds a new item to `targets`; returns the operations that failed.
-	fn propagate(
-		&self,
-		targets: &ConnectedTargets,
-		item: NonRootItemType<'_, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	/// Adds a created top-level item, and for a directory everything below it, to `targets`;
-	/// returns the operations that failed.
-	fn propagate_tree(
-		&self,
-		targets: &ConnectedTargets,
-		item: &NonRootItemType<'static, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload;
-	/// Downloads and decrypts chunk `index` of `file`.
-	fn fetch_chunk(
-		&self,
-		file: &RemoteFileType<'static>,
-		index: u64,
-	) -> impl Future<Output = Result<Vec<u8>, Error>> + MaybeSend;
-	/// Encrypts and uploads the plaintext `data` as chunk `index` of `upload`.
-	fn upload_chunk(
-		&self,
-		upload: &Self::Upload,
-		index: u64,
-		data: Vec<u8>,
-	) -> impl Future<Output = Result<RemoteFileInfo, Error>> + MaybeSend;
-	/// Whether a file or directory called `name` exists in `parent`, compared as the server
-	/// compares names.
-	fn name_exists(
-		&self,
-		parent: Uuid,
-		name: &ValidatedName,
-	) -> impl Future<Output = Result<bool, Error>> + MaybeSend;
-	/// Registers the uploaded file under `name`. The caller holds the drive lock.
-	fn finish_upload(
-		&self,
-		upload: &Self::Upload,
-		name: &ValidatedName,
-		completion: UploadCompletion,
-		info: RemoteFileInfo,
-	) -> impl Future<Output = Result<RemoteFile, Error>> + MaybeSend;
-}
-
-/// Errors after which nothing else can succeed either.
-fn ends_job(error: &Error) -> bool {
-	matches!(
-		error.kind(),
-		ErrorKind::MaxStorageReached | ErrorKind::Unauthenticated
-	)
-}
 
 /// A created directory with the name it got, or why it was not created.
 type DirResult = Result<(RemoteDirectory, ValidatedName), DirError>;
@@ -260,7 +116,7 @@ struct RequestState {
 	targets: Arc<ConnectedTargets>,
 }
 
-struct Job<B: CopyBackend, D> {
+struct Job<B: DriveBackend, D> {
 	backend: Arc<B>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
@@ -289,7 +145,7 @@ pub(crate) async fn run_copy<B, D>(
 	reporter: MaybeArc<Reporter>,
 ) -> Result<CopyReport<D>, CopyFailed<D>>
 where
-	B: CopyBackend,
+	B: DriveBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
 	let mut child_dirs = vec![Vec::new(); plan.dirs.len()];
@@ -330,7 +186,7 @@ where
 
 impl<B, D> Job<B, D>
 where
-	B: CopyBackend,
+	B: DriveBackend,
 	D: Clone + MaybeSendSync + 'static,
 {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
@@ -533,7 +389,7 @@ where
 				}
 			} else {
 				if keep_warm.is_none() && !ready.is_empty() {
-					match wait_for_lock(&*self.backend, &self.control, &self.reporter).await {
+					match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await {
 						Ok(LockWait::Locked(held)) => keep_warm = Some(held),
 						// the loop reports the pause or the stop and waits it out
 						Ok(LockWait::Paused) | Err(Stopped) => continue,
@@ -849,7 +705,7 @@ where
 				continue;
 			}
 			let _lock = loop {
-				match wait_for_lock(&*self.backend, &self.control, &self.reporter).await? {
+				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
 					LockWait::Locked(held) => break held,
 					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
 					LockWait::Failed(error) => {
@@ -910,7 +766,7 @@ struct DirTask<B> {
 	verify_name: bool,
 }
 
-async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
+async fn create_dir<B: DriveBackend>(task: DirTask<B>) -> DirResult {
 	let DirTask {
 		backend,
 		control,
@@ -929,7 +785,7 @@ async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
 	// The shared lock the job holds is normally handed out at once; a fresh acquisition (its
 	// lease was lost) can wait long. Nothing is sent before the lock is held, so a pause or stop
 	// until then leaves the create to be tried again; once held, the create runs to the end.
-	let _lock = match wait_for_lock(backend, &control, &reporter).await {
+	let _lock = match wait_for_lock(backend, &control, &reporter.ops()).await {
 		Ok(LockWait::Locked(held)) => held,
 		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
 		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(stage, error)),
@@ -943,7 +799,7 @@ async fn create_dir<B: CopyBackend>(task: DirTask<B>) -> DirResult {
 				.map_err(|e| DirError::Failed(stage, e))?;
 		}
 		match backend
-			.create_copy_dir(parent, uuid, &name, created)
+			.create_dir_unpropagated(parent, uuid, &name, created)
 			.await
 			.map_err(|e| DirError::Failed(stage, e))?
 		{
@@ -1027,46 +883,6 @@ struct ChunkReservation {
 	_op: OpGuard,
 }
 
-/// The drive lock, held as one of the job's in-flight operations. The lock is dropped before
-/// the operation ends, so the job is only reported paused once the lock is gone.
-struct HeldLock<L> {
-	_lock: L,
-	_op: OpGuard,
-}
-
-enum LockWait<L> {
-	Locked(HeldLock<L>),
-	/// A pause was requested while waiting; nothing is held.
-	Paused,
-	Failed(Error),
-}
-
-/// Waits for the drive lock, which another client may hold for a long time. A stop ends the
-/// wait (`Err`), and a pause requested meanwhile ends it or drops the lock just acquired, so a
-/// paused job holds no lock. After [`LockWait::Paused`] the caller waits out the pause before
-/// trying again.
-async fn wait_for_lock<B: CopyBackend>(
-	backend: &B,
-	control: &JobControl,
-	reporter: &MaybeArc<Reporter>,
-) -> Result<LockWait<B::DriveLock>, Stopped> {
-	let op = reporter.op();
-	let result = tokio::select! {
-		biased;
-		() = control.stopping() => return Err(Stopped),
-		() = control.pause_changed(false) => return Ok(LockWait::Paused),
-		result = backend.acquire_drive_lock() => result,
-	};
-	Ok(match result {
-		Ok(_) if control.is_pause_requested() => LockWait::Paused,
-		Ok(lock) => LockWait::Locked(HeldLock {
-			_lock: lock,
-			_op: op,
-		}),
-		Err(error) => LockWait::Failed(error),
-	})
-}
-
 /// Waits for the job to be running and for memory for chunk `index`. A pause that starts while
 /// waiting hands the memory back until the job resumes, so a paused job holds none.
 async fn reserve_chunk(
@@ -1101,7 +917,7 @@ async fn reserve_chunk(
 	}
 }
 
-async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
+async fn copy_file<B: DriveBackend>(task: FileTask<B>) -> FileOutcome {
 	let index = task.index;
 	let parent = task.parent;
 	let top_level = task.top_level;
@@ -1114,7 +930,7 @@ async fn copy_file<B: CopyBackend>(task: FileTask<B>) -> FileOutcome {
 	}
 }
 
-async fn copy_file_inner<B: CopyBackend>(
+async fn copy_file_inner<B: DriveBackend>(
 	task: FileTask<B>,
 ) -> Result<(RemoteFile, ValidatedName), FileError> {
 	let FileTask {
@@ -1257,52 +1073,47 @@ async fn copy_file_inner<B: CopyBackend>(
 		final_times: (source.created().unwrap_or(modified), modified),
 	};
 
-	// Registering the file is not started while paused, but once started it runs to the end
-	// even on cancel, so a file that exists is always reported.
-	let _lock = loop {
-		control.checkpoint().await?;
-		match wait_for_lock(&*backend, &control, &reporter).await? {
-			LockWait::Locked(held) => break held,
-			LockWait::Paused => {}
-			LockWait::Failed(error) => return Err(FileError::Failed(CopyStage::Finalize, error)),
+	let finalized = finalize_new_file(FinalizeTask {
+		backend: &*backend,
+		control: &control,
+		ops: &reporter.ops(),
+		upload: &upload,
+		parent,
+		name,
+		recheck: top_level.then_some(&mut retry),
+		completion,
+		info: info.unwrap_or_default(),
+		targets: &targets,
+	})
+	.await;
+	match finalized {
+		Ok(Finalized {
+			file,
+			name,
+			propagation_errors,
+		}) => {
+			report_propagation_errors(&reporter, file.uuid(), propagation_errors);
+			Ok((file, name))
 		}
-	};
-	if top_level {
-		// Registering a file under a name the parent already holds would make the copy a new
-		// version of that file instead of a new file, so the name is checked again here, while
-		// holding the drive lock: clients that write under the lock cannot take it in between.
-		name = retry
-			.free_name(&*backend, parent, name)
-			.await
-			.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
-	}
-	let remote = backend
-		.finish_upload(&upload, &name, completion, info.unwrap_or_default())
-		.await
-		.map_err(|e| FileError::Failed(CopyStage::Finalize, e))?;
-	let registered_as_version = remote.stable_uuid != remote.uuid;
-	if registered_as_version {
-		tracing::error!(
-			"copied file {} was registered as a new version of the existing file {}",
-			remote.uuid,
-			Uuid::from(remote.stable_uuid)
-		);
-	}
-	if !targets.is_empty() {
-		for error in backend
-			.propagate(&targets, NonRootItemType::File(Cow::Borrowed(&remote)))
-			.await
-		{
-			reporter.event(CopyEvent::PropagationFailed {
-				dest_uuid: remote.uuid(),
-				error: Arc::new(error),
-			});
+		Err(FinalizeError::RegisteredAsVersion {
+			file,
+			propagation_errors,
+		}) => {
+			report_propagation_errors(&reporter, file.uuid(), propagation_errors);
+			Err(FileError::RegisteredAsVersion(file))
 		}
+		Err(FinalizeError::Stopped) => Err(FileError::Stopped),
+		Err(FinalizeError::Failed(error)) => Err(FileError::Failed(CopyStage::Finalize, error)),
 	}
-	if registered_as_version {
-		return Err(FileError::RegisteredAsVersion(Box::new(remote)));
+}
+
+fn report_propagation_errors(reporter: &Reporter, dest_uuid: Uuid, errors: Vec<Error>) {
+	for error in errors {
+		reporter.event(CopyEvent::PropagationFailed {
+			dest_uuid,
+			error: Arc::new(error),
+		});
 	}
-	Ok((remote, name))
 }
 
 #[cfg(test)]
