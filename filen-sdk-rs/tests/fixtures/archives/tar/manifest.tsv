@@ -80,5 +80,7 @@ ustar.tar	symlink	tree/dir/link	text.txt
 ustar.tar	file	tree/café.txt	6	8944ecd2
 ustar.tar	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
 ustar.tar	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.lzma	unchecked		4
+pax.tar.zst	unchecked		4
 appledouble.tar	file	._note.txt	197	9adca009
 appledouble.tar	file	note.txt	39	8c076356

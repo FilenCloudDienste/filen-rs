@@ -1,10 +1,14 @@
 # archive	kind	path	size or target	crc32
 frames.bin.zst	file	frames.bin	6206	0ac7d86d
 frames.bin.zst	unaccounted		42
+frames.bin.zst	unchecked		1
 skippable-frames.bin.lz4	file	skippable-frames.bin	6206	0ac7d86d
 skippable-frames.bin.lz4	unaccounted		20
+skippable-frames.bin.lz4	unchecked		1
 text.txt.br	file	text.txt	2110	187b5864
+text.txt.br	unchecked		1
 text.txt.lzma	file	text.txt	2110	187b5864
+text.txt.lzma	unchecked		1
 two-members.bin.bz2	file	two-members.bin	6206	0ac7d86d
 two-members.bin.gz	file	two-members.bin	6206	0ac7d86d
 two-streams-x86.bin.xz	file	two-streams-x86.bin	6206	0ac7d86d

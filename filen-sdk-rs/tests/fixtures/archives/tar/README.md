@@ -14,6 +14,9 @@ writes them in each format, so the fixtures are bsdtar's own output without anyt
 machine that made them. `pax.tar` carries bsdtar's vendor keys (`LIBARCHIVE.xattr.*` and
 `SCHILY.xattr.*`).
 
+The manifest expects the files of `pax.tar.lzma` and `pax.tar.zst` to be unchecked: LZMA-alone
+carries no checksum, and libarchive writes zstd frames without one.
+
 `appledouble.tar` is what bsdtar writes on macOS for a file with an extended attribute: an
 AppleDouble `._note.txt` member ahead of the file.
 

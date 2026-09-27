@@ -1184,8 +1184,9 @@ fn an_encrypted_directory_is_judged_by_its_length() {
 const FIXTURE_PASSWORD: &str = "fixture password";
 
 /// Extracts every archive in `tests/fixtures/archives/<dir>`, made by real tools (see the README
-/// there), and checks what the codec sends against the directory's `manifest.tsv`, which was
-/// written from the inputs rather than from what the SDK reads.
+/// there), and checks what the codec sends, the bytes that belong to no entry and the entries no
+/// checksum covered against the directory's `manifest.tsv`, which was written from the inputs
+/// rather than from what the SDK reads.
 fn check_fixtures(dir: &str) {
 	let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 		.join("tests/fixtures/archives")
@@ -1227,6 +1228,9 @@ fn check_fixtures(dir: &str) {
 			.collect();
 		if end.unaccounted_bytes > 0 {
 			found.push(format!("unaccounted\t\t{}", end.unaccounted_bytes));
+		}
+		if end.unchecked_entries > 0 {
+			found.push(format!("unchecked\t\t{}", end.unchecked_entries));
 		}
 		rows.sort();
 		found.sort();

@@ -17,7 +17,9 @@ members, streams or frames one after another, holding both files:
 - `frames.bin.zst`: skippable frames around a level-19 frame and a frame without a checksum.
 
 The skippable frames (20 and 42 bytes) are written by `skippable.py`, since neither CLI writes
-them, and are the unaccounted bytes the manifest expects. Made on macOS with xz 5.8, gzip
+them, and are the unaccounted bytes the manifest expects. The manifest also expects a file to be
+unchecked where its stream carries no checksum: brotli and LZMA-alone never do, and the second
+lz4 and zstd frames are written without one. Made on macOS with xz 5.8, gzip
 (Apple's), bzip2 1.0.8, brotli 1.2, lz4 1.10 and zstd 1.5.7, from this directory:
 
 ```sh
