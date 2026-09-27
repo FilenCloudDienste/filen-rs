@@ -9,8 +9,8 @@ mod report;
 pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use client_impl::CompressConfig;
 pub use report::{
-	CompressCallback, CompressCounts, CompressEvent, CompressFailed, CompressPhase, CompressReport,
-	CompressUpdate, HashMismatch, RunState,
+	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
+	CompressPhase, CompressReport, CompressUpdate, HashMismatch, RunState,
 };
 
 use std::ops::RangeInclusive;

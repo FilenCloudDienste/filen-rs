@@ -70,6 +70,17 @@ pub struct CompressCounts {
 	pub bytes_done: u64,
 }
 
+/// The source file being read into the archive right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct CompressActiveFile {
+	pub source_uuid: Uuid,
+	/// Its path in the archive.
+	pub path: String,
+	pub size: u64,
+	pub bytes_read: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum CompressEvent {
 	Skipped(SkippedEntry),
@@ -99,6 +110,9 @@ pub struct CompressUpdate {
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
 	pub counts: CompressCounts,
+	/// The source being read: an archive is written one file at a time, in its order. `None`
+	/// between files, and for an empty one.
+	pub active: Option<CompressActiveFile>,
 	pub events: Vec<CompressEvent>,
 	pub bytes_per_second: Option<u64>,
 	pub eta: Option<Duration>,
@@ -161,6 +175,7 @@ pub(crate) struct CompressState {
 	scan: ScanProgress,
 	totals: PlanTotals,
 	counts: CompressCounts,
+	active: Option<CompressActiveFile>,
 	/// The job ended: whatever it did not read, it never will.
 	ended: bool,
 }
@@ -200,6 +215,7 @@ impl JobState for CompressState {
 			scan: self.scan,
 			totals: self.totals,
 			counts: self.counts,
+			active: self.active.clone(),
 			events: snapshot.events,
 			bytes_per_second: snapshot.bytes_per_second,
 			eta: snapshot.eta,
@@ -209,6 +225,7 @@ impl JobState for CompressState {
 
 	fn settle(&mut self) {
 		self.ended = true;
+		self.active = None;
 	}
 }
 
@@ -222,6 +239,7 @@ impl Reporter {
 				scan: ScanProgress::default(),
 				totals: PlanTotals::default(),
 				counts: CompressCounts::default(),
+				active: None,
 				ended: false,
 			},
 			Box::new(callback),
@@ -259,9 +277,24 @@ impl Reporter {
 		});
 	}
 
-	pub(crate) fn source_read(&self, bytes: u64) {
+	/// `bytes` more of the source `file` were read; `file` builds it when it starts.
+	pub(crate) fn source_read(
+		&self,
+		source_uuid: Uuid,
+		bytes: u64,
+		file: impl FnOnce() -> CompressActiveFile,
+	) {
 		self.with_state(|state| {
 			state.counts.bytes_read += bytes;
+			match &mut state.active {
+				Some(active) if active.source_uuid == source_uuid => active.bytes_read += bytes,
+				active => {
+					*active = Some(CompressActiveFile {
+						bytes_read: bytes,
+						..file()
+					});
+				}
+			}
 			state.core.mark_changed();
 		});
 	}
@@ -269,6 +302,7 @@ impl Reporter {
 	pub(crate) fn file_done(&self) {
 		self.with_state(|state| {
 			state.counts.files_done += 1;
+			state.active = None;
 			state.core.mark_changed();
 		});
 	}
@@ -332,6 +366,44 @@ mod tests {
 		}
 	}
 
+	fn starting(source_uuid: Uuid, path: &str) -> CompressActiveFile {
+		CompressActiveFile {
+			source_uuid,
+			path: path.to_owned(),
+			size: 5,
+			bytes_read: 0,
+		}
+	}
+
+	#[test]
+	fn the_source_being_read_is_active_until_it_is_in() {
+		let reporter = Reporter::new(Updates::default());
+		let [a, b] = [Uuid::new_v4(), Uuid::new_v4()];
+		let active = || reporter.read(|state| state.active.clone());
+		reporter.source_read(a, 2, || starting(a, "a"));
+		reporter.source_read(a, 3, || starting(a, "a"));
+		assert_eq!(
+			active(),
+			Some(CompressActiveFile {
+				bytes_read: 5,
+				..starting(a, "a")
+			})
+		);
+		reporter.file_done();
+		assert_eq!(active(), None);
+		reporter.source_read(b, 1, || starting(b, "b"));
+		assert_eq!(
+			active(),
+			Some(CompressActiveFile {
+				bytes_read: 1,
+				..starting(b, "b")
+			})
+		);
+		reporter.finish(CompressPhase::Cancelled);
+		assert_eq!(active(), None, "an ended job reads nothing");
+		assert_eq!(reporter.counts().bytes_read, 6);
+	}
+
 	#[test]
 	fn a_job_that_ended_has_no_time_left() {
 		for phase in [
@@ -347,7 +419,8 @@ mod tests {
 				bytes: 100,
 			};
 			reporter.set_plan(totals, &[], &[]);
-			reporter.source_read(30);
+			let source = Uuid::new_v4();
+			reporter.source_read(source, 30, || starting(source, "a"));
 			reporter.finish(phase);
 			let last = updates.0.lock().unwrap().last().cloned().unwrap();
 			assert_eq!(last.phase, phase);

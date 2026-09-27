@@ -59,7 +59,8 @@ use crate::{
 };
 
 use super::report::{
-	CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch, Reporter,
+	CompressActiveFile, CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch,
+	Reporter,
 };
 
 /// Archive chunks uploading at once.
@@ -596,7 +597,14 @@ impl<B: DisposalBackend> Driver<B> {
 			};
 			self.reporter.event(event);
 		}
-		self.reporter.source_read(len);
+		let (source_uuid, size) = (state.file.uuid(), state.file.size());
+		self.reporter
+			.source_read(source_uuid, len, || CompressActiveFile {
+				source_uuid,
+				path: state.path.clone(),
+				size,
+				bytes_read: 0,
+			});
 		let _ = reply.send(Ok(data));
 	}
 
