@@ -48,6 +48,16 @@ pub(crate) struct CompressJob {
 /// away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or [`ErrorKind::IO`]; the
 /// driver knows the real one.
 pub(crate) fn compress(port: &WorkerPort, job: CompressJob) -> Result<u64, Error> {
+	compress_with(port, job, ZipWriter::new)
+}
+
+/// [`compress`], a zip written through the writer `zip_writer` makes of the sink: a test's writes
+/// zip64 records without writing 4 GiB.
+fn compress_with<'p>(
+	port: &'p WorkerPort,
+	job: CompressJob,
+	zip_writer: impl FnOnce(ChunkSink<'p>) -> ZipWriter<ChunkSink<'p>>,
+) -> Result<u64, Error> {
 	let sink = ChunkSink::new(port);
 	match job.format {
 		CompressFormat::Tar { compression: None } => {
@@ -75,7 +85,7 @@ pub(crate) fn compress(port: &WorkerPort, job: CompressJob) -> Result<u64, Error
 					));
 				}
 			};
-			let mut zip = ZipWriter::new(sink);
+			let mut zip = zip_writer(sink);
 			for entry in job.entries {
 				match entry {
 					ArchiveEntry::Dir { path, modified } => {

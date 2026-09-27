@@ -16,7 +16,7 @@ use crate::{
 		encode::Compression,
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
-		worker,
+		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
 			read::{EntryLimits, ZipKind, ZipLimits, open_entry, read_index},
@@ -55,7 +55,20 @@ fn run_with(
 		entries,
 		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
 	};
-	let mut link = worker::start(move |port| compress(&port, job)).unwrap();
+	drive(
+		worker::start(move |port| compress(&port, job)).unwrap(),
+		sources,
+		short,
+	)
+}
+
+/// Answers the codec's asks from `sources` until it returns; `short` sources answer one byte
+/// short.
+fn drive(
+	mut link: WorkerLink<Result<u64, Error>>,
+	sources: &HashMap<u32, Vec<u8>>,
+	short: Option<u32>,
+) -> Written {
 	let mut written = Written {
 		archive: Vec::new(),
 		chunks: Vec::new(),
@@ -464,6 +477,73 @@ fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
 				"{case}"
 			);
 		}
+	}
+}
+
+#[test]
+fn a_zip_of_zip64_entries_reads_back_entry_for_entry() {
+	// what an entry of 4 GiB or more is written with, for every entry
+	const ZIP64_FROM: u64 = 0;
+	const ZIP64_SIZE: u32 = u32::MAX;
+	for (method, encryption) in [
+		(ZipMethod::Stored, None),
+		(ZipMethod::Deflate { level: 6 }, Some(AesStrength::Aes256)),
+		(ZipMethod::Bzip2 { level: 1 }, None),
+	] {
+		let (entries, sources, members) = sample();
+		let password = encryption.map(|_| ArchivePassword::new("zip64".to_owned()).unwrap());
+		let job = CompressJob {
+			format: CompressFormat::Zip { method, encryption },
+			entries,
+			password: password.clone(),
+		};
+		let written = drive(
+			worker::start(move |port| {
+				compress_with(&port, job, |sink| ZipWriter::past(sink, 0, ZIP64_FROM))
+			})
+			.unwrap(),
+			&sources,
+			None,
+		);
+		let case = format!("{method:?} {encryption:?}");
+		assert_eq!(
+			written.result.unwrap(),
+			written.archive.len() as u64,
+			"{case}"
+		);
+		assert_eq!(written.file_ends, 4, "{case}");
+
+		// every file's local header leaves its sizes to its zip64 data descriptor
+		let mut source = std::io::Cursor::new(&written.archive[..]);
+		let index = read_index(
+			&mut source,
+			written.archive.len() as u64,
+			ZipLimits {
+				max_index_bytes: 1 << 20,
+				max_entries: 100,
+			},
+		)
+		.unwrap();
+		let u32_at =
+			|at: usize| u32::from_le_bytes(written.archive[at..at + 4].try_into().unwrap());
+		for entry in index.entries.iter().filter(|e| e.kind == ZipKind::File) {
+			let at = entry.header_offset as usize;
+			assert_eq!(
+				(u32_at(at + 18), u32_at(at + 22)),
+				(ZIP64_SIZE, ZIP64_SIZE),
+				"{} {case}",
+				entry.name
+			);
+		}
+
+		let expected = members_as_entries(&members);
+		let password = password.as_ref().map(ArchivePassword::as_bytes);
+		assert_eq!(our_entries(&written.archive, password), expected, "{case}");
+		assert_eq!(
+			zip_crate_entries(&written.archive, password),
+			expected,
+			"{case}"
+		);
 	}
 }
 
