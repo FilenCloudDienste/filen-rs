@@ -1,4 +1,4 @@
-//! Runs a [`ItemPlan`]: creates the directories parent first, then copies the files, each
+//! Runs an [`ItemPlan`]: creates the directories parent first, then copies the files, each
 //! through a chunk pipeline.
 //!
 //! # Memory and deadlock-freedom
@@ -49,9 +49,9 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
 		drive_job::{
+			Fatal,
 			backend::{DriveBackend, UploadSpec},
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
-			ends_job,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
 			lock::{HeldLock, LockWait, wait_for_lock},
 			name_retry::NameRetry,
@@ -64,7 +64,7 @@ use crate::{
 		},
 		name::ValidatedName,
 	},
-	job::{JobControl, JobTasks, Stopped},
+	job::{JobControl, JobTasks, Stopped, report::JobReport},
 	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
@@ -128,7 +128,7 @@ struct Job<B: DriveBackend, D> {
 	requests: Vec<RequestState>,
 	report: CopyReport<D>,
 	/// The error that ended the job early, shared with the failure it came from.
-	fatal: Option<Arc<Error>>,
+	fatal: Fatal,
 }
 
 /// Runs `plan`, reporting to `reporter`. The plan's totals, skips and renames are reported
@@ -168,7 +168,7 @@ where
 		requests: Vec::new(),
 		plan,
 		report,
-		fatal: None,
+		fatal: Fatal::default(),
 	};
 	let result = job.run().await;
 	job.report.counts = job.reporter.counts();
@@ -203,21 +203,10 @@ where
 		}
 		.await;
 
-		let (phase, result) = match (outcome, &self.fatal) {
-			(_, Some(error)) => (CopyPhase::Failed, Err(Arc::clone(error))),
-			(Err(Stopped), None) if self.control.is_cancelled() => (
-				CopyPhase::Cancelled,
-				Err(Arc::new(Error::custom(
-					ErrorKind::Cancelled,
-					"copy cancelled",
-				))),
-			),
-			(Err(Stopped), None) => (
-				CopyPhase::Failed,
-				Err(Arc::new(Error::custom(ErrorKind::Internal, "copy stopped"))),
-			),
-			(Ok(()), None) => (CopyPhase::Done, Ok(())),
-		};
+		// the report's name is the same whatever its destination type
+		let (phase, result) = self
+			.fatal
+			.end(outcome, &self.control, CopyReport::<()>::NAME);
 		self.reporter.finish(phase);
 		result
 	}
@@ -268,22 +257,14 @@ where
 		destination
 	}
 
-	/// Records `error` as ending the job when it is that kind of error.
+	/// Ends the job with `error` when an item's error is one nothing can succeed after.
 	fn note_error(&mut self, error: &Arc<Error>) {
-		if self.fatal.is_none() && ends_job(error) {
-			self.fatal = Some(Arc::clone(error));
-			self.control.stop();
-			self.reporter.wind_down(&self.control);
-		}
+		self.fatal.note(error, &self.control, &*self.reporter);
 	}
 
 	fn stop_error(&mut self, error: Error) -> Stopped {
-		let error = Arc::new(error);
-		if self.fatal.is_none() {
-			self.fatal = Some(error);
-		}
-		self.control.stop();
-		self.reporter.wind_down(&self.control);
+		self.fatal
+			.stop(Arc::new(error), &self.control, &*self.reporter);
 		Stopped
 	}
 

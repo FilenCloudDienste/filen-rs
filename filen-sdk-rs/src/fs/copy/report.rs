@@ -248,9 +248,9 @@ pub(crate) struct CopyState {
 }
 
 impl JobPhase for CopyPhase {
-	fn is_terminal(self) -> bool {
-		matches!(self, Self::Done | Self::Cancelled | Self::Failed)
-	}
+	const DONE: Self = Self::Done;
+	const CANCELLED: Self = Self::Cancelled;
+	const FAILED: Self = Self::Failed;
 }
 
 impl JobState for CopyState {

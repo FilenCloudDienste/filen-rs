@@ -50,7 +50,7 @@ use crate::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			dispose::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
-				SourceDisposition, Tree, dir_digest, dispose_file, file_digest,
+				SourceDisposition, Tree, dir_digest, dispose_file, file_digest, kept_on_early_end,
 			},
 			format::extract_folder_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
@@ -61,10 +61,11 @@ use crate::{
 		},
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
+			Fatal,
 			backend::{DriveBackend, UploadSpec},
+			cancelled,
 			counts::ItemCounts,
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
-			ends_job,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
 			lock::{LockWait, wait_for_lock},
 			name_retry::NameRetry,
@@ -80,7 +81,10 @@ use crate::{
 			keep_both::{NameShape, TakenNames},
 		},
 	},
-	job::{JobControl, Stopped, report::OpGuard},
+	job::{
+		JobControl, Stopped,
+		report::{JobReport, OpGuard},
+	},
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
@@ -308,7 +312,7 @@ struct Driver<B: DriveBackend> {
 	stalled_ticks: u32,
 
 	report: ExtractReport,
-	fatal: Option<Arc<Error>>,
+	fatal: Fatal,
 }
 
 /// Runs an extraction: waits for a job slot, starts the codec, and drives it to the end.
@@ -346,22 +350,13 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		dispositions: Vec::new(),
 	};
 	let archive_uuid = archive.uuid();
-	let fail = |mut report: ExtractReport, phase, error: Error| {
+	// ended before anything was extracted: the archive to remove is kept
+	let fail = |mut report: ExtractReport, phase, error| {
 		if disposal_requested {
-			let reason = if phase == ExtractPhase::Cancelled {
-				KeptReason::Interrupted
-			} else {
-				KeptReason::Incomplete
-			};
-			let disposition = SourceDisposition {
-				uuid: archive_uuid,
-				outcome: DisposalOutcome::Kept {
-					reason,
-					bytes_freed: 0,
-				},
-			};
-			reporter.event(ExtractEvent::SourceDisposition(disposition.clone()));
-			report.dispositions.push(disposition);
+			let cancelled = phase == ExtractPhase::Cancelled;
+			for disposition in kept_on_early_end(&[archive_uuid], cancelled) {
+				report_disposition(&reporter, &mut report, disposition);
+			}
 		}
 		reporter.finish(phase);
 		ExtractFailed {
@@ -369,22 +364,26 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 				counts: reporter.counts(),
 				..report
 			},
-			error: Arc::new(error),
+			error,
 		}
 	};
 
 	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
-		return Err(fail(report, ExtractPhase::Failed, error));
+		return Err(fail(report, ExtractPhase::Failed, Arc::new(error)));
 	}
 	// Leased and floored before the codec starts, so a waiting job holds nothing.
 	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
 		reporter.set_cancelling();
-		return Err(fail(report, ExtractPhase::Cancelled, cancelled()));
+		return Err(fail(
+			report,
+			ExtractPhase::Cancelled,
+			cancelled(ExtractReport::NAME),
+		));
 	};
 	reporter.set_phase(ExtractPhase::Scanning);
 	let link = match start() {
 		Ok(link) => link,
-		Err(error) => return Err(fail(report, ExtractPhase::Failed, error)),
+		Err(error) => return Err(fail(report, ExtractPhase::Failed, Arc::new(error))),
 	};
 
 	let floor = (floor, reporter.op());
@@ -442,7 +441,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		stamp: 0,
 		stalled_ticks: 0,
 		report,
-		fatal: None,
+		fatal: Fatal::default(),
 	};
 	let result = driver.run().await;
 	let Driver {
@@ -457,15 +456,21 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 	}
 }
 
-fn cancelled() -> Error {
-	Error::custom(ErrorKind::Cancelled, "extraction cancelled")
-}
-
 fn worker_died() -> Error {
 	Error::custom(
 		ErrorKind::ArchiveWorkerDied,
 		"the archive's codec stopped responding",
 	)
+}
+
+/// Records what became of the archive in `report`, and tells of it.
+fn report_disposition(
+	reporter: &Reporter,
+	report: &mut ExtractReport,
+	disposition: SourceDisposition,
+) {
+	reporter.event(ExtractEvent::SourceDisposition(disposition.clone()));
+	report.dispositions.push(disposition);
 }
 
 /// Records `failure` in `report`; the event's copy of it, while the report keeps records.
@@ -515,7 +520,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let outcome = async {
 			self.extract().await?;
 			self.release_input();
-			if self.fatal.is_some() {
+			if self.fatal.error().is_some() {
 				return Ok(());
 			}
 			self.reporter.set_phase(ExtractPhase::Finishing);
@@ -528,51 +533,42 @@ impl<B: DisposalBackend> Driver<B> {
 					uuid: self.archive.uuid(),
 					outcome,
 				};
-				self.reporter
-					.event(ExtractEvent::SourceDisposition(disposition.clone()));
-				self.report.dispositions.push(disposition);
+				report_disposition(&self.reporter, &mut self.report, disposition);
 			}
 			Ok(())
 		}
 		.await;
-		let (phase, result) = match (outcome, &self.fatal) {
-			(_, Some(error)) => (ExtractPhase::Failed, Err(Arc::clone(error))),
-			(Err(Stopped), None) if self.control.is_cancelled() => {
-				(ExtractPhase::Cancelled, Err(Arc::new(cancelled())))
-			}
-			(Err(Stopped), None) => (
-				ExtractPhase::Failed,
-				Err(Arc::new(Error::custom(
-					ErrorKind::Internal,
-					"extraction stopped",
-				))),
-			),
-			(Ok(()), None) => (ExtractPhase::Done, Ok(())),
-		};
+		let (phase, result) = self.fatal.end(outcome, &self.control, ExtractReport::NAME);
+		// a cancel once everything was extracted keeps the archive, but the job is done; it still
+		// ends as cancelled jobs do, however late it was seen
+		if result.is_ok() && self.control.is_cancelled() {
+			self.reporter.set_cancelling();
+		}
 		// the archive to remove was not touched: say so, rather than leave its disposition out
 		if self.dispose.is_some() && self.report.dispositions.is_empty() {
-			let counts = self.reporter.counts();
-			let complete = counts.files_failed + counts.dirs_failed + counts.entries_skipped == 0;
-			let reason = if result.is_ok() && complete {
+			let dispositions = if result.is_ok() {
+				let counts = self.reporter.counts();
+				let complete =
+					counts.files_failed + counts.dirs_failed + counts.entries_skipped == 0;
 				// only an archive in the trash is not removed after a complete extraction
-				KeptReason::Changed
-			} else if result.is_ok() {
-				KeptReason::Incomplete
-			} else if self.control.is_cancelled() {
-				KeptReason::Interrupted
+				let reason = if complete {
+					KeptReason::Changed
+				} else {
+					KeptReason::Incomplete
+				};
+				vec![SourceDisposition {
+					uuid: self.archive.uuid(),
+					outcome: DisposalOutcome::Kept {
+						reason,
+						bytes_freed: 0,
+					},
+				}]
 			} else {
-				KeptReason::Incomplete
+				kept_on_early_end(&[self.archive.uuid()], phase == ExtractPhase::Cancelled)
 			};
-			let disposition = SourceDisposition {
-				uuid: self.archive.uuid(),
-				outcome: DisposalOutcome::Kept {
-					reason,
-					bytes_freed: 0,
-				},
-			};
-			self.reporter
-				.event(ExtractEvent::SourceDisposition(disposition.clone()));
-			self.report.dispositions.push(disposition);
+			for disposition in dispositions {
+				report_disposition(&self.reporter, &mut self.report, disposition);
+			}
 		}
 		if result.is_err() {
 			// planned and never started: a job that ends early leaves them
@@ -645,22 +641,15 @@ impl<B: DisposalBackend> Driver<B> {
 			.retain(|(uuid, _)| !trashed.contains(uuid));
 	}
 
-	/// Records `error` as ending the job when it is that kind of error.
+	/// Ends the job with `error` when an entry's error is one nothing can succeed after.
 	fn note_error(&mut self, error: &Arc<Error>) {
-		if self.fatal.is_none() && ends_job(error) {
-			self.fatal = Some(Arc::clone(error));
-			self.control.stop();
-			self.reporter.set_cancelling();
-		}
+		self.fatal.note(error, &self.control, &*self.reporter);
 	}
 
 	/// Ends the job with `error`, unless an earlier error already did.
 	fn stop_with(&mut self, error: Error) {
-		if self.fatal.is_none() {
-			self.fatal = Some(Arc::new(error));
-		}
-		self.control.stop();
-		self.reporter.set_cancelling();
+		self.fatal
+			.stop(Arc::new(error), &self.control, &*self.reporter);
 	}
 
 	fn entry_id(&self, ordinal: u64) -> ArchiveEntryId {
@@ -943,7 +932,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.unchecked_entries = end.unchecked_entries;
 			}
 			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
-			Err(error) if self.fatal.is_some() || self.control.is_stopping() => {
+			Err(error) if self.fatal.error().is_some() || self.control.is_stopping() => {
 				tracing::debug!("archive codec ended after the job did: {error}");
 			}
 			// The archive is damaged from here on, but what came before it is whole: the files
@@ -955,9 +944,8 @@ impl<B: DisposalBackend> Driver<B> {
 				} else {
 					tracing::warn!("archive {}: {error}", self.archive.uuid());
 				}
-				if self.fatal.is_none() {
-					self.fatal = Some(Arc::new(Error::custom(error.kind(), error.to_string())));
-				}
+				self.fatal
+					.record(Arc::new(Error::custom(error.kind(), error.to_string())));
 				self.held = None;
 				if let Some(ordinal) = self.current.take()
 					&& let Some(file) = self.files.remove(&ordinal)
@@ -1816,15 +1804,19 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Whether the server holds exactly what the counts say was created: every file at its size
 	/// and every directory, listed again below the items created in the destination. Listed
 	/// as many at once as other small requests; a pause is waited out between them, holding
-	/// nothing, and a cancel ends the check unconfirmed.
+	/// nothing, and a cancel drops those in flight and ends the check unconfirmed.
 	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
 		let mut found = Tree::default();
 		if !self.into_destination {
 			// each request counts in flight, so a pause is only reported once it is over
 			let _listing = self.reporter.op();
-			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
-				Ok(tree) => found = tree,
-				Err(_) => return false,
+			let listed = self
+				.control
+				.until_stopping(self.backend.list_tree(self.dirs[ROOT].uuid))
+				.await;
+			match listed {
+				Ok(Ok(tree)) => found = tree,
+				Ok(Err(_)) | Err(Stopped) => return false,
 			}
 			// the folder itself
 			found.dirs.insert(self.dirs[ROOT].uuid);
@@ -1844,13 +1836,19 @@ impl<B: DisposalBackend> Driver<B> {
 				return false;
 			}
 			let listing = self.reporter.op();
-			let listed = join_all(
-				batch
-					.iter()
-					.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
-			)
-			.await;
+			// a listing removes nothing: a cancel drops the ones in flight
+			let listed = self
+				.control
+				.until_stopping(join_all(
+					batch
+						.iter()
+						.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
+				))
+				.await;
 			drop(listing);
+			let Ok(listed) = listed else {
+				return false;
+			};
 			for tree in listed {
 				let Some(tree) = tree else {
 					return false;

@@ -5,7 +5,7 @@
 //! Nothing below the top level can collide with an existing item, since it lands in a
 //! directory the job creates. Sibling names that collide in the source (case-insensitive
 //! duplicates) are renamed rather than dropped, and a directory whose metadata cannot be
-//! decrypted is created under its uuid so its readable contents are still copied. A file
+//! decrypted is created under its uuid so its readable contents are still recreated. A file
 //! whose metadata cannot be decrypted has no key to read it with, so it is skipped.
 
 use std::{
@@ -39,7 +39,8 @@ pub(crate) struct SourceDir<D> {
 	pub(crate) created: Option<DateTime<Utc>>,
 	/// Shared-in listings carry no color; they report [`DirColor::Default`].
 	pub(crate) color: DirColor<'static>,
-	/// Whatever the caller needs to address this directory again (to retry a failed copy).
+	/// Whatever the job needs to address this directory again (a copy, to retry it when it
+	/// fails; a compress needs nothing).
 	pub(crate) handle: D,
 }
 
@@ -80,7 +81,8 @@ pub(crate) enum PlanSource<D> {
 #[derive(Debug, Clone)]
 pub(crate) struct PlanRequest<D> {
 	pub(crate) source: PlanSource<D>,
-	/// The existing directory the source is copied into.
+	/// The directory the source is recreated in: an existing one for a copy, the archive's
+	/// root for a compress.
 	pub(crate) destination: Uuid,
 	/// Name to use instead of the source's (still subject to keep-both).
 	pub(crate) name: Option<ValidatedName>,
@@ -205,7 +207,7 @@ pub(crate) struct ItemPlan<D> {
 	pub(crate) skipped: Vec<SkippedEntry>,
 	/// Renames below the top level. Top-level items are renamed by keep-both as a matter of
 	/// course and are reported through [`ItemPlan::top_level`]; a name that changes again while
-	/// copying is reported by the job.
+	/// the job runs is reported by the job.
 	pub(crate) renamed: Vec<RenamedEntry>,
 	pub(crate) totals: PlanTotals,
 	/// Destinations whose listing had entries with undecryptable names: the top-level names
@@ -227,7 +229,7 @@ impl<D> Default for ItemPlan<D> {
 	}
 }
 
-/// Builds a [`ItemPlan`]. Every destination must be registered with the names it already holds
+/// Builds an [`ItemPlan`]. Every destination must be registered with the names it already holds
 /// before the plan is built, so top-level names are chosen against them.
 #[derive(Debug, Default)]
 pub(crate) struct ItemPlanner {
@@ -251,14 +253,14 @@ impl ItemPlanner {
 		self.unverified_destinations.insert(uuid);
 	}
 
-	/// Validates every request before planning any: a directory cannot be copied into itself
-	/// or one of its descendants.
+	/// Validates every request before planning any: a directory cannot be placed inside
+	/// itself or one of its descendants.
 	pub(crate) fn plan<D>(mut self, requests: Vec<PlanRequest<D>>) -> Result<ItemPlan<D>, Error> {
 		for request in &requests {
 			if !self.destinations.contains_key(&request.destination) {
 				return Err(Error::custom(
 					ErrorKind::Internal,
-					"copy destination was not registered with the planner",
+					"a destination was not registered with the planner",
 				));
 			}
 			if let PlanSource::Dir { root, dirs, .. } = &request.source
@@ -267,7 +269,7 @@ impl ItemPlanner {
 			{
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
-					"cannot copy a directory into itself or one of its subdirectories",
+					"cannot place a directory inside itself or one of its subdirectories",
 				));
 			}
 		}
@@ -367,8 +369,7 @@ fn allocate_name(
 	(allocated, reason)
 }
 
-/// An item's segment of a source path: its name, or its uuid when its metadata could not be
-/// decrypted.
+/// How keep-both numbers an item's name: a directory's whole, a file's before its extension.
 fn shape(is_dir: bool) -> NameShape {
 	if is_dir {
 		NameShape::Dir
@@ -377,6 +378,8 @@ fn shape(is_dir: bool) -> NameShape {
 	}
 }
 
+/// An item's segment of a source path: its name, or its uuid when its metadata could not be
+/// decrypted.
 fn path_segment(name: Option<&str>, uuid: Uuid) -> Cow<'_, str> {
 	name.map_or_else(|| Cow::Owned(uuid.to_string()), Cow::Borrowed)
 }

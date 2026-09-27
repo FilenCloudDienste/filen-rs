@@ -51,7 +51,14 @@ pub enum RunState {
 
 /// A job's phase. A terminal phase ends the job: no time is left to estimate once it is reached.
 pub(crate) trait JobPhase: Copy + PartialEq + MaybeSend + 'static {
-	fn is_terminal(self) -> bool;
+	/// The terminal phases: every job ends in one of these three.
+	const DONE: Self;
+	const CANCELLED: Self;
+	const FAILED: Self;
+
+	fn is_terminal(self) -> bool {
+		self == Self::DONE || self == Self::CANCELLED || self == Self::FAILED
+	}
 }
 
 /// How much of a job's work is done, in the units its rate and time left are estimated in.
@@ -211,6 +218,9 @@ pub(crate) trait JobTick: MaybeSendSync {
 	fn set_pause_requested(&self, requested: bool);
 	/// A cancel overrides a pause: the job winds down instead of pausing.
 	fn set_cancelling(&self);
+	/// The job winds down, cancelled through `control` or ended by an error: a stop overrides
+	/// a pause (see [`Reporter::wind_down`]).
+	fn wind_down(&self, control: &JobControl);
 }
 
 /// A handle to a job's reporter for code that does not know which job it works for.
@@ -456,6 +466,10 @@ impl<S: JobState> JobTick for Reporter<S> {
 	fn set_cancelling(&self) {
 		Reporter::set_cancelling(self);
 	}
+
+	fn wind_down(&self, control: &JobControl) {
+		Reporter::wind_down(self, control);
+	}
 }
 
 /// A job's report, named in the message of the [`JobFailed`] that carries it.
@@ -512,9 +526,9 @@ mod tests {
 	}
 
 	impl JobPhase for Phase {
-		fn is_terminal(self) -> bool {
-			self == Self::Done || self == Self::Cancelled || self == Self::Failed
-		}
+		const DONE: Self = Self::Done;
+		const CANCELLED: Self = Self::Cancelled;
+		const FAILED: Self = Self::Failed;
 	}
 
 	/// A job of 10 units, of which `done` are done.

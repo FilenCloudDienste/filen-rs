@@ -8,7 +8,7 @@ use std::{
 	time::Duration,
 };
 
-use tokio::task::JoinHandle;
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
 use crate::{
@@ -1487,6 +1487,83 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 	let events = disposition_events(&job.recorder);
 	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
 	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+/// Starts an extraction of `members` into the destination that removes the archive once it is
+/// verified, with a cancel for it.
+fn start_disposing(members: &[(&str, &[u8])]) -> (Setup, Job, watch::Sender<bool>) {
+	let tar = tar_of(members);
+	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let (_pause, cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			root: ExtractRoot::Destination,
+			control,
+			dispose: Some((SourceDisposal::Trash, parent)),
+			..Options::default()
+		},
+	);
+	(setup, job, cancel)
+}
+
+/// Cancels `job` once `setup`'s fake drive holds one of its requests, and lets them all go on
+/// after it ended: the archive's contents all exist by then, so the job is done, it ends as a
+/// cancelled one does, and the archive is kept, interrupted, told of once.
+async fn cancel_once_held(setup: &Setup, job: Job, cancel: watch::Sender<bool>) {
+	wait_until("a request is held", || !setup.backend.log().held.is_empty()).await;
+	cancel.send_replace(true);
+	let report = job.running.await.unwrap().unwrap();
+	setup.backend.release_all();
+	let interrupted = |outcome: &DisposalOutcome| {
+		matches!(
+			outcome,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Interrupted,
+				bytes_freed: 0
+			}
+		)
+	};
+	assert!(interrupted(&disposition(&report)));
+	let events = disposition_events(&job.recorder);
+	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(ExtractPhase::Done, RunState::Cancelling)
+	);
+	assert!(setup.backend.log().trashed_files.is_empty());
+	assert_released(setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_the_output_is_checked_keeps_the_archive_as_interrupted() {
+	// more top-level items than are checked at once: the check holds on the first batch
+	let names: Vec<String> = (0..2 * MAX_SMALL_PARALLEL_REQUESTS + 2)
+		.map(|i| format!("f{i:03}.txt"))
+		.collect();
+	let members: Vec<(&str, &[u8])> = names
+		.iter()
+		.map(|name| (name.as_str(), &b"x"[..]))
+		.collect();
+	let (setup, job, cancel) = start_disposing(&members);
+	wait_until("a file is registered", || {
+		!setup.backend.log().finished.is_empty()
+	})
+	.await;
+	let first: Vec<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.hold_requests(Request::State, first);
+	cancel_once_held(&setup, job, cancel).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_the_archive_is_removed_keeps_it_as_interrupted() {
+	let (setup, job, cancel) = start_disposing(&[("a.txt", b"alpha")]);
+	// the archive's own state is asked for only right before it goes to the trash
+	setup
+		.backend
+		.hold_requests(Request::State, [setup.archive.uuid()]);
+	cancel_once_held(&setup, job, cancel).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

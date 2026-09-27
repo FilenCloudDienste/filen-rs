@@ -43,6 +43,7 @@ use crate::{
 		},
 		categories::{DirType, Normal},
 		drive_job::{
+			self, Fatal,
 			backend::{DriveBackend, UploadSpec},
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
 			name_retry::NameRetry,
@@ -59,7 +60,10 @@ use crate::{
 			keep_both::{NameShape, TakenNames},
 		},
 	},
-	job::{JobControl, Stopped, report::OpGuard},
+	job::{
+		JobControl, Stopped,
+		report::{JobReport, OpGuard},
+	},
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
@@ -203,7 +207,7 @@ struct Driver<B: DriveBackend> {
 	/// The files behind `mismatched`, for the report.
 	hash_mismatches: Vec<HashMismatch>,
 	read_back: Option<ReadBack>,
-	fatal: Option<Arc<Error>>,
+	fatal: Fatal,
 }
 
 /// Runs a compression: waits for a job slot, starts the codec, uploads the archive and
@@ -326,7 +330,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		mismatched: BTreeSet::new(),
 		hash_mismatches: Vec::new(),
 		read_back,
-		fatal: None,
+		fatal: Fatal::default(),
 	};
 	let incomplete = !report.skipped.is_empty();
 	let mut dispositions = Vec::new();
@@ -334,7 +338,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	driver.next_served = driver.next_fetch;
 	let outcome = async {
 		driver.compress().await?;
-		if driver.fatal.is_some() {
+		if driver.fatal.error().is_some() {
 			return Err(Stopped);
 		}
 		// the codec is done: registering and removing the sources hold no memory floor, and
@@ -384,8 +388,8 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		..
 	} = driver;
 	report.hash_mismatches = hash_mismatches;
-	match (outcome, fatal) {
-		(Ok(archive), None) => {
+	match fatal.end(outcome, &control, CompressReport::NAME) {
+		(_, Ok(archive)) => {
 			report.archive = Some(archive);
 			report.dispositions = dispositions;
 			// a cancel once the archive exists keeps the sources, but the job is done; it still
@@ -397,27 +401,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			report.counts = reporter.counts();
 			Ok(report)
 		}
-		(_, Some(error)) => Err(end_early(
-			&reporter,
-			report,
-			&requested,
-			CompressPhase::Failed,
-			error,
-		)),
-		(Err(Stopped), None) if control.is_cancelled() => Err(end_early(
-			&reporter,
-			report,
-			&requested,
-			CompressPhase::Cancelled,
-			cancelled(),
-		)),
-		(Err(Stopped), None) => Err(end_early(
-			&reporter,
-			report,
-			&requested,
-			CompressPhase::Failed,
-			Arc::new(Error::custom(ErrorKind::Internal, "compression stopped")),
-		)),
+		(phase, Err(error)) => Err(end_early(&reporter, report, &requested, phase, error)),
 	}
 }
 
@@ -443,7 +427,7 @@ pub(crate) fn end_early(
 }
 
 pub(crate) fn cancelled() -> Arc<Error> {
-	Arc::new(Error::custom(ErrorKind::Cancelled, "compression cancelled"))
+	drive_job::cancelled(CompressReport::NAME)
 }
 
 fn worker_died() -> Error {
@@ -472,11 +456,8 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn stop_with(&mut self, error: Error) {
-		if self.fatal.is_none() {
-			self.fatal = Some(Arc::new(error));
-		}
-		self.control.stop();
-		self.reporter.set_cancelling();
+		self.fatal
+			.stop(Arc::new(error), &self.control, &*self.reporter);
 	}
 
 	/// Runs the codec to its end with every archive chunk uploaded; `Err` when stopped.
@@ -775,7 +756,7 @@ impl<B: DisposalBackend> Driver<B> {
 			)),
 			Ok(_) => {}
 			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
-			Err(error) if self.fatal.is_some() || self.control.is_stopping() => {
+			Err(error) if self.fatal.error().is_some() || self.control.is_stopping() => {
 				tracing::debug!("archive codec ended after the job did: {error}");
 			}
 			Err(error) => {
@@ -1072,7 +1053,7 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			Err(FinalizeError::Stopped) => Err(Stopped),
 			Err(FinalizeError::RegisteredAsVersion { file, .. }) => {
-				self.fatal = Some(Arc::new(Error::custom(
+				self.fatal.record(Arc::new(Error::custom(
 					ErrorKind::InvalidState,
 					format!(
 						"the archive was registered as a new version of the existing file {}",
@@ -1082,7 +1063,7 @@ impl<B: DisposalBackend> Driver<B> {
 				Err(Stopped)
 			}
 			Err(FinalizeError::Failed(error)) => {
-				self.fatal = Some(Arc::new(error));
+				self.fatal.record(Arc::new(error));
 				Err(Stopped)
 			}
 		}
