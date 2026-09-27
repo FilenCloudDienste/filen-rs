@@ -76,6 +76,10 @@ pub enum KeptReason {
 	Failed { error: Arc<Error> },
 }
 
+/// What became of a source. A source inside another one the job was given (or given twice)
+/// shares that one's outcome with a `bytes_freed` of 0: what the outer removal freed, this
+/// source's files included, is counted once, on the outer source. So a folder inside one whose
+/// permanent removal stopped part way is kept, and may still have lost files to it.
 #[derive(Debug, Clone)]
 pub enum DisposalOutcome {
 	Disposed {
