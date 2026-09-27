@@ -1,4 +1,4 @@
-exclude = ["**/node_modules/**", "**/target/**", "**/dist/**"]
+exclude = ["**/node_modules/**", "**/target/**", "**/dist/**", "filen-sdk-rs/vendor/**"]
 
 [formatting]
 indent_string = "	"
