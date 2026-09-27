@@ -9,13 +9,19 @@ mod js_impl;
 mod plan;
 mod report;
 
-pub use crate::job::{JobControl, JobController};
+pub use crate::{
+	fs::drive_job::counts::ItemCounts,
+	job::{JobControl, JobController},
+};
 pub use client_impl::{CopyConfig, CopyRequest, CopySource, CopySourceDir};
 pub use plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry};
 pub use report::{
-	ActiveFile, CopiedTopLevel, CopyCallback, CopyCounts, CopyEvent, CopyPhase, CopyStage,
-	CopyUpdate, FailureInfo, PlannedTopLevelItem, RunState, ScanProgress,
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyEvent, CopyPhase, CopyStage, CopyUpdate,
+	FailureInfo, PlannedTopLevelItem, RunState, ScanProgress,
 };
+
+/// A copy's running counts: the name [`ItemCounts`] shipped under before other jobs shared it.
+pub type CopyCounts = ItemCounts;
 
 // The report types are generic over how a failed directory is addressed again, which keeps the
 // planner and engine independent of the client; callers only ever see them with CopySourceDir.

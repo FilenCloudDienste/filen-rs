@@ -465,9 +465,12 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		fs::copy::{
-			plan::{SkipReason, SkippedEntry},
-			report::{CopiedTopLevel, CopyCounts, CopyUpdate, PlannedTopLevelItem},
+		fs::{
+			copy::{
+				plan::{SkipReason, SkippedEntry},
+				report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
+			},
+			drive_job::counts::ItemCounts,
 		},
 		job::test_support::{SetOnDrop, controls},
 	};
@@ -527,11 +530,11 @@ mod tests {
 
 		assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
 		assert_eq!(report.totals, needs, "the report says what the copy needs");
-		let not_attempted = CopyCounts {
+		let not_attempted = ItemCounts {
 			dirs_not_attempted: needs.dirs,
 			files_not_attempted: needs.files,
 			bytes_not_attempted: needs.bytes,
-			..CopyCounts::default()
+			..ItemCounts::default()
 		};
 		assert_eq!(report.counts, not_attempted);
 		assert!(
@@ -577,11 +580,11 @@ mod tests {
 				*plan_to_run(Err(scan), Some(0), &reporter).unwrap_err();
 			assert_eq!(error.kind(), kind);
 			assert_eq!(report.totals, PlanTotals::default());
-			assert_eq!(report.counts, CopyCounts::default());
+			assert_eq!(report.counts, ItemCounts::default());
 			let last = updates.last();
 			assert_eq!(
 				(last.phase, last.totals, last.counts),
-				(phase, PlanTotals::default(), CopyCounts::default())
+				(phase, PlanTotals::default(), ItemCounts::default())
 			);
 		}
 	}

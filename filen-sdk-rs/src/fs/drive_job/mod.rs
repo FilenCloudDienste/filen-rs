@@ -2,9 +2,13 @@
 //! archives and extracted entries.
 
 pub(crate) mod backend;
+pub(crate) mod counts;
+pub(crate) mod dir;
 pub(crate) mod finalize;
 pub(crate) mod lock;
 pub(crate) mod name_retry;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::{Error, ErrorKind};
 

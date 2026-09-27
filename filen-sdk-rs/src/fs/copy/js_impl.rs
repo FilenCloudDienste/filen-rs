@@ -31,8 +31,8 @@ use crate::{
 // The core types this module mirrors under the same name (CopyEvent, CopyUpdate, CopyReport,
 // CopyFailure) are written out as `super::X`.
 use super::{
-	ActiveFile, CopiedTopLevel, CopyCallback, CopyConfig, CopyCounts, CopyFailed, CopyPhase,
-	CopyRequest, CopySource, CopySourceDir, CopyStage, FailedSource, FailureInfo, JobControl,
+	ActiveFile, CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyRequest,
+	CopySource, CopySourceDir, CopyStage, FailedSource, FailureInfo, ItemCounts, JobControl,
 	PlanTotals, PlannedTopLevelItem, RenameReason, RenamedEntry, RunState, ScanProgress,
 	SkippedEntry,
 };
@@ -142,7 +142,7 @@ pub struct CopyUpdate {
 	pub run_state: RunState,
 	pub scan: ScanProgress,
 	pub totals: PlanTotals,
-	pub counts: CopyCounts,
+	pub counts: ItemCounts,
 	pub active: Vec<ActiveFile>,
 	pub events: Vec<CopyEvent>,
 	pub bytes_per_second: Option<u64>,
@@ -191,7 +191,7 @@ pub struct CopyReport {
 	pub skipped: Vec<SkippedEntry>,
 	pub renamed: Vec<CopyRenamedEntry>,
 	pub totals: PlanTotals,
-	pub counts: CopyCounts,
+	pub counts: ItemCounts,
 	/// Why the copy ended early: kind `Cancelled` when cancelled, or the error that stopped it.
 	/// `undefined` when it ran to the end, failures of single items included.
 	pub error: Option<CopyError>,
@@ -1007,11 +1007,11 @@ mod tests {
 			files: 2,
 			bytes: 1024,
 		};
-		let counts = CopyCounts {
+		let counts = ItemCounts {
 			dirs_not_attempted: 1,
 			files_not_attempted: 2,
 			bytes_not_attempted: 1024,
-			..CopyCounts::default()
+			..ItemCounts::default()
 		};
 		let refused = CopyReport::from(CopyFailed {
 			report: copy::CopyReport {
@@ -1072,7 +1072,7 @@ mod tests {
 			run_state: RunState::Running,
 			scan: ScanProgress::default(),
 			totals: PlanTotals::default(),
-			counts: CopyCounts::default(),
+			counts: ItemCounts::default(),
 			active: Vec::new(),
 			events: Vec::new(),
 			bytes_per_second: None,
