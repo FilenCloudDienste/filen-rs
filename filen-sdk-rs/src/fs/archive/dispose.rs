@@ -64,7 +64,10 @@ pub enum KeptReason {
 	/// The source changed since the job read it: it moved, was trashed, got a new version, or
 	/// holds other items now.
 	Changed,
-	/// The job's output could not be confirmed with the server.
+	/// The job's output could not be confirmed: the server did not hold what was created, the
+	/// archive was not read in full, or something the job extracted was checked by nothing (a
+	/// 7z entry without a CRC-32, or the files of a brotli or LZMA-alone stream, or of an lz4,
+	/// xz or zstd stream written without its optional checksum).
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,

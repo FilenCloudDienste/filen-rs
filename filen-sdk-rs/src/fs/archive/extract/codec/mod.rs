@@ -10,7 +10,7 @@ use crate::{Error, ErrorKind};
 
 use super::{
 	super::{
-		decode::{CodecError, StreamDecoder, Trailing, codec_error, open_stream},
+		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{PathRejection, entry_path},
 		format::{
 			DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_default_name, detect,
@@ -42,7 +42,7 @@ use super::{
 			},
 		},
 	},
-	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
+	DuplicateEntries, ExpansionLimit, ExtractSkipReason, storage_exceeded,
 };
 
 /// What the codec may spend on an archive.
@@ -55,6 +55,9 @@ pub(crate) struct CodecLimits {
 	pub(crate) expansion: Option<ExpansionLimit>,
 	/// Most bytes of a zip's central directory read.
 	pub(crate) max_index_bytes: u64,
+	/// Storage free for the files, which an archive stating its sizes up front is refused for
+	/// before anything is created (see [`ExtractConfig::max_bytes`](super::ExtractConfig)).
+	pub(crate) max_bytes: Option<u64>,
 }
 
 /// A streaming archive to extract.
@@ -74,7 +77,10 @@ pub(crate) struct ArchiveEnd {
 	/// [`StreamEnd`](super::super::decode::StreamEnd)), or before a zip's first.
 	pub(crate) unaccounted_bytes: u64,
 	pub(crate) duplicates: Option<DuplicateEntries>,
-	/// Entries extracted with no checksum in the archive to check them against.
+	/// Entries extracted whose decoded data nothing in the archive checked: a 7z entry without a
+	/// CRC-32, or the files of a stream whose codec carries no checksum (brotli, LZMA-alone,
+	/// and lz4, xz or zstd written without one). A bare tar's data is stored rather than
+	/// decoded, and is checked by the archive's own hash instead.
 	pub(crate) unchecked_entries: u64,
 }
 
@@ -95,9 +101,9 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 		Some(Detected::Tar) => {
 			port.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
 				.map_err(failure)?;
-			let (rest, unread) = walk_tar(port, source, job.limits.max_members)?;
+			let walked = walk_tar(port, source, job.limits.max_members)?;
 			Ok(ArchiveEnd {
-				unaccounted_bytes: unread + drain_trailing(rest).map_err(failure)?,
+				unaccounted_bytes: walked.unread + drain_trailing(walked.rest).map_err(failure)?,
 				duplicates: None,
 				unchecked_entries: 0,
 			})
@@ -114,33 +120,32 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let mut block = [0u8; TAR_BLOCK_LEN];
 			let block_len = read_full(&mut decoded, &mut block).map_err(failure)?;
 			let block = &block[..block_len];
-			// an empty tar decodes to its end-of-archive marker alone, so only its name tells it
-			// from a file of zeros
-			let tar = block_len == block.len()
-				&& (is_tar_header(block)
-					|| is_end_marker(block)
-						&& matches!(
-							extension_format(&job.name),
-							Some(ExtensionFormat::CompressedTar(_))
-						));
+			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker
+			// alone, so only its name tells it from a file of zeros
+			let tar = is_tar_header(block)
+				|| is_end_marker(block)
+					&& matches!(
+						extension_format(&job.name),
+						Some(ExtensionFormat::CompressedTar(_))
+					);
 			if tar {
 				port.send(WorkerEvent::Opened(StreamLayout::Tar {
 					codec: Some(codec),
 				}))
 				.map_err(failure)?;
-				let (rest, unread) = walk_tar(
+				let walked = walk_tar(
 					port,
 					Cursor::new(block).chain(decoded),
 					job.limits.max_members,
 				)?;
-				let (_, mut decoded) = rest.into_inner();
+				let (_, mut decoded) = walked.rest.into_inner();
 				// zero blocks after the end-of-archive marker are the usual record padding
 				let tar_trailing = drain_trailing(&mut decoded).map_err(failure)?;
 				let end = decoded.inner.end().expect("drained to the end");
 				Ok(ArchiveEnd {
-					unaccounted_bytes: unread + tar_trailing + end.unaccounted_bytes,
+					unaccounted_bytes: walked.unread + tar_trailing + end.unaccounted_bytes,
 					duplicates: None,
-					unchecked_entries: 0,
+					unchecked_entries: unchecked(end.check, walked.files),
 				})
 			} else {
 				port.send(WorkerEvent::Opened(StreamLayout::Single { codec }))
@@ -148,8 +153,10 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				extract_single(port, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
-		Some(Detected::Zip) => extract_zip(port, &job),
-		Some(Detected::SevenZ) => extract_sevenz(port, &job),
+		Some(Detected::Zip) => extract_zip(port, SeekInput::rereading(source.into_inner().1), &job),
+		Some(Detected::SevenZ) => {
+			extract_sevenz(port, SeekInput::rereading(source.into_inner().1), &job)
+		}
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
 			"the file is not an archive the SDK can extract",
@@ -182,14 +189,26 @@ fn extract_single(
 	Ok(ArchiveEnd {
 		unaccounted_bytes: end.unaccounted_bytes,
 		duplicates: None,
-		unchecked_entries: 0,
+		unchecked_entries: unchecked(end.check, 1),
 	})
 }
 
-/// A zip: its entries in local-header order, each checked against its CRC-32 or authentication
-/// code.
-fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut source = SeekInput::new(port, 0, job.len);
+/// The `files` a stream decoded to that are unchecked: all of them when its codec verified
+/// nothing (see [`StreamCheck`]).
+fn unchecked(check: StreamCheck, files: u64) -> u64 {
+	match check {
+		StreamCheck::Verified => 0,
+		StreamCheck::Unverifiable => files,
+	}
+}
+
+/// A zip read from `source`: its entries in local-header order, each checked against its CRC-32
+/// or authentication code.
+fn extract_zip(
+	port: &WorkerPort,
+	mut source: SeekInput<'_>,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
 	let limits = ZipLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
@@ -207,6 +226,16 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
+	}
+	let extracted = index
+		.entries
+		.iter()
+		.filter(|entry| {
+			entry.kind == ZipKind::File && zip_supported(entry) && entry_path(&entry.name).is_ok()
+		})
+		.fold(0u64, |total, entry| total.saturating_add(entry.size));
+	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
+		return Err(error);
 	}
 	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
 	let encrypted = || {
@@ -365,10 +394,13 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 	})
 }
 
-/// A 7z: its entries in header order, folder by folder, each checked against its CRC-32 when the
-/// header lists one.
-fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut source = SeekInput::new(port, 0, job.len);
+/// A 7z read from `source`: its entries in header order, folder by folder, each checked against
+/// its CRC-32 when the header lists one.
+fn extract_sevenz(
+	port: &WorkerPort,
+	mut source: SeekInput<'_>,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
 	let password = job.password.as_ref().map(ArchivePassword::utf16le);
 	// a derivation exchanges nothing with the driver for up to a minute: without this it would
 	// be given up on as a dead codec, and a cancel would wait it out
@@ -392,6 +424,20 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
+	}
+	let extracted = index
+		.entries
+		.iter()
+		.filter(|entry| {
+			entry.kind == SevenZKind::File
+				&& entry
+					.stream
+					.is_none_or(|stream| index.folders[stream.folder].supported())
+				&& entry_path(&entry.name).is_ok()
+		})
+		.fold(0u64, |total, entry| total.saturating_add(entry.size));
+	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
+		return Err(error);
 	}
 	let encrypted = |entry: &SevenZEntry| {
 		entry
@@ -737,12 +783,22 @@ fn zip_io_failure(error: io::Error) -> Error {
 	failure(error)
 }
 
-/// Sends every member of the tar in `reader`; returns what follows its end-of-archive marker,
-/// and the bytes stored under directory members, which nothing extracts.
-fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<(R, u64), Error> {
+/// What [`walk_tar`] leaves.
+struct Walked<R> {
+	/// What follows the end-of-archive marker.
+	rest: R,
+	/// Bytes stored under directory members, which nothing extracts.
+	unread: u64,
+	/// Files sent.
+	files: u64,
+}
+
+/// Sends every member of the tar in `reader`.
+fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<Walked<R>, Error> {
 	let mut tar = TarReader::new(reader, max_members);
 	let mut ordinal = 0;
 	let mut unread = 0u64;
+	let mut files = 0u64;
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -805,9 +861,14 @@ fn walk_tar<R: Read>(port: &WorkerPort, reader: R, max_members: u64) -> Result<(
 		if !is_dir {
 			send_file_data(port, &mut TarBody(&mut tar)).map_err(failure)?;
 			port.send(WorkerEvent::FileEnd).map_err(failure)?;
+			files += 1;
 		}
 	}
-	Ok((tar.into_inner(), unread))
+	Ok(Walked {
+		rest: tar.into_inner(),
+		unread,
+		files,
+	})
 }
 
 fn skipped(ordinal: u64, member: &TarMember, reason: ExtractSkipReason) -> WorkerEvent {

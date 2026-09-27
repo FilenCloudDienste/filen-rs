@@ -239,7 +239,9 @@ struct Driver<B: DriveBackend> {
 	max_items: Option<u64>,
 	config: ArchiveConfig,
 	link: WorkerLink<CodecResult>,
-	floor: Option<OwnedSemaphorePermit>,
+	/// The memory floor while the job holds it, counted as an operation in flight: the job is
+	/// only reported paused once it has given it back, with everything held on top of it.
+	floor: Option<(OwnedSemaphorePermit, OpGuard)>,
 	/// The floor's two chunks, as the input and the output slot.
 	input_slot: Arc<Semaphore>,
 	output_slot: Arc<Semaphore>,
@@ -250,9 +252,9 @@ struct Driver<B: DriveBackend> {
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
-	/// Fetched chunks the codec has not asked for yet, each counted in flight while it holds
-	/// memory, so the job is only reported paused once a pause dropped them.
-	ready: VecDeque<(u64, Vec<u8>, OwnedSemaphorePermit, OpGuard)>,
+	/// Fetched chunks the codec has not asked for yet; held only with the floor, which counts
+	/// them in flight.
+	ready: VecDeque<(u64, Vec<u8>, OwnedSemaphorePermit)>,
 	/// The chunk the codec is reading, released when it asks for the next.
 	reading: Option<OwnedSemaphorePermit>,
 	/// The chunk the codec reads next.
@@ -383,6 +385,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		Err(error) => return Err(fail(report, ExtractPhase::Failed, error)),
 	};
 
+	let floor = (floor, reporter.op());
 	let chunks = archive.size().div_ceil(CHUNK_SIZE_U64);
 	let memory = backend.memory();
 	let mut driver = Driver {
@@ -509,6 +512,7 @@ impl<B: DisposalBackend> Driver<B> {
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
 		let outcome = async {
 			self.extract().await?;
+			self.release_input();
 			if self.fatal.is_some() {
 				return Ok(());
 			}
@@ -747,6 +751,16 @@ impl<B: DisposalBackend> Driver<B> {
 			&& self.finalizes.is_empty()
 	}
 
+	/// Gives back what only the codec needed, once it is done: chunks prefetched past its last
+	/// read (a zip's or 7z's index chunks, fetched again for its entries) and the floor. What
+	/// follows (the checks, the disposal) holds nothing while it waits out a pause.
+	fn release_input(&mut self) {
+		self.drop_prefetched();
+		self.ask = None;
+		self.reading = None;
+		self.floor = None;
+	}
+
 	/// Waits out a pause holding nothing: prefetched chunks and the floor are given back.
 	async fn pause(&mut self) -> Result<(), Stopped> {
 		self.drop_prefetched();
@@ -757,10 +771,11 @@ impl<B: DisposalBackend> Driver<B> {
 		{
 			self.reading = Some(slot);
 		}
+		// last, so the job counts as paused only now
 		self.floor = None;
 		self.reporter.checkpoint(&self.control).await?;
 		let floor = self.control.until_stopping(self.config.floor()).await?;
-		self.floor = Some(floor);
+		self.floor = Some((floor, self.reporter.op()));
 		Ok(())
 	}
 
@@ -850,7 +865,7 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.ready.front().is_none_or(|(ready, ..)| ready != index) {
 			return;
 		}
-		let (_, data, permit, _op) = self.ready.pop_front().expect("just checked");
+		let (_, data, permit) = self.ready.pop_front().expect("just checked");
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
 		self.served += 1;
@@ -859,15 +874,25 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		let _ = reply.send(Ok(data));
 		// progress follows the archive read, not only the idle ticks, which a busy job skips
-		self.reporter
-			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
+		self.report_bytes_read();
 	}
 
-	fn fetch_finished(&mut self, (index, result, permit, op): FetchedChunk) {
+	/// Reports the bytes of the archive the codec has read, which its inputs count once each.
+	fn report_bytes_read(&self) {
+		let read = self.link.shared.input_bytes();
+		debug_assert!(
+			read <= self.archive.size(),
+			"the codec read {read} bytes of a {}-byte archive",
+			self.archive.size()
+		);
+		self.reporter.set_bytes_read(read);
+	}
+
+	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) {
 		let expected = chunk_plaintext_len(self.archive.size(), index);
 		match result {
 			Ok(data) if data.len() as u64 == expected => {
-				self.ready.push_back((index, data, permit, op));
+				self.ready.push_back((index, data, permit));
 				self.serve_ask();
 			}
 			Ok(data) => self.stop_with(Error::custom(
@@ -882,8 +907,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn tick(&mut self, pause_requested: bool) {
-		self.reporter
-			.set_bytes_read(self.link.shared.input_bytes().min(self.archive.size()));
+		self.report_bytes_read();
 		self.reporter.tick();
 		let stamp = self.link.shared.progress();
 		// frozen while the driver owes the codec something: an answer, room for an event, or
@@ -1522,13 +1546,8 @@ impl<B: DisposalBackend> Driver<B> {
 			return;
 		};
 		let len = data.len() as u64;
-		if let Some(max) = self.max_bytes
-			&& self.committed + len >= max
-		{
-			self.stop_with(Error::custom(
-				ErrorKind::MaxStorageReached,
-				format!("the extraction needs more than the {max} bytes that are free"),
-			));
+		if let Some(error) = super::storage_exceeded(self.max_bytes, self.committed + len) {
+			self.stop_with(error);
 			return;
 		}
 		self.committed += len;
@@ -1786,6 +1805,8 @@ impl<B: DisposalBackend> Driver<B> {
 	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
 		let mut found = Tree::default();
 		if !self.into_destination {
+			// each request counts in flight, so a pause is only reported once it is over
+			let _listing = self.reporter.op();
 			match self.backend.list_tree(self.dirs[ROOT].uuid).await {
 				Ok(tree) => found = tree,
 				Err(_) => return false,
@@ -1807,12 +1828,14 @@ impl<B: DisposalBackend> Driver<B> {
 			if self.reporter.checkpoint(&self.control).await.is_err() {
 				return false;
 			}
+			let listing = self.reporter.op();
 			let listed = join_all(
 				batch
 					.iter()
 					.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
 			)
 			.await;
+			drop(listing);
 			for tree in listed {
 				let Some(tree) = tree else {
 					return false;

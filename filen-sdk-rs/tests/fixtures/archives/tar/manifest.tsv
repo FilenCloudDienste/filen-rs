@@ -1,0 +1,86 @@
+# archive	kind	path	size or target	crc32
+gnutar.tar	dir	tree
+gnutar.tar	dir	tree/dir
+gnutar.tar	file	tree/dir/text.txt	2110	187b5864
+gnutar.tar	file	tree/dir/bin.dat	4096	176031ac
+gnutar.tar	hardlink	tree/dir/hard	tree/dir/text.txt
+gnutar.tar	symlink	tree/dir/link	text.txt
+gnutar.tar	file	tree/café.txt	6	8944ecd2
+gnutar.tar	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+gnutar.tar	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar	dir	tree
+pax.tar	dir	tree/dir
+pax.tar	file	tree/dir/text.txt	2110	187b5864
+pax.tar	file	tree/dir/bin.dat	4096	176031ac
+pax.tar	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar	symlink	tree/dir/link	text.txt
+pax.tar	file	tree/café.txt	6	8944ecd2
+pax.tar	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.bz2	dir	tree
+pax.tar.bz2	dir	tree/dir
+pax.tar.bz2	file	tree/dir/text.txt	2110	187b5864
+pax.tar.bz2	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.bz2	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.bz2	symlink	tree/dir/link	text.txt
+pax.tar.bz2	file	tree/café.txt	6	8944ecd2
+pax.tar.bz2	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.bz2	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.gz	dir	tree
+pax.tar.gz	dir	tree/dir
+pax.tar.gz	file	tree/dir/text.txt	2110	187b5864
+pax.tar.gz	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.gz	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.gz	symlink	tree/dir/link	text.txt
+pax.tar.gz	file	tree/café.txt	6	8944ecd2
+pax.tar.gz	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.gz	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.lz4	dir	tree
+pax.tar.lz4	dir	tree/dir
+pax.tar.lz4	file	tree/dir/text.txt	2110	187b5864
+pax.tar.lz4	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.lz4	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.lz4	symlink	tree/dir/link	text.txt
+pax.tar.lz4	file	tree/café.txt	6	8944ecd2
+pax.tar.lz4	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.lz4	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.lzma	dir	tree
+pax.tar.lzma	dir	tree/dir
+pax.tar.lzma	file	tree/dir/text.txt	2110	187b5864
+pax.tar.lzma	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.lzma	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.lzma	symlink	tree/dir/link	text.txt
+pax.tar.lzma	file	tree/café.txt	6	8944ecd2
+pax.tar.lzma	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.lzma	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.xz	dir	tree
+pax.tar.xz	dir	tree/dir
+pax.tar.xz	file	tree/dir/text.txt	2110	187b5864
+pax.tar.xz	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.xz	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.xz	symlink	tree/dir/link	text.txt
+pax.tar.xz	file	tree/café.txt	6	8944ecd2
+pax.tar.xz	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.xz	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.zst	dir	tree
+pax.tar.zst	dir	tree/dir
+pax.tar.zst	file	tree/dir/text.txt	2110	187b5864
+pax.tar.zst	file	tree/dir/bin.dat	4096	176031ac
+pax.tar.zst	hardlink	tree/dir/hard	tree/dir/text.txt
+pax.tar.zst	symlink	tree/dir/link	text.txt
+pax.tar.zst	file	tree/café.txt	6	8944ecd2
+pax.tar.zst	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+pax.tar.zst	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+ustar.tar	dir	tree
+ustar.tar	dir	tree/dir
+ustar.tar	file	tree/dir/text.txt	2110	187b5864
+ustar.tar	file	tree/dir/bin.dat	4096	176031ac
+ustar.tar	hardlink	tree/dir/hard	tree/dir/text.txt
+ustar.tar	symlink	tree/dir/link	text.txt
+ustar.tar	file	tree/café.txt	6	8944ecd2
+ustar.tar	dir	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases
+ustar.tar	file	tree/a-directory-name-of-sixty-characters-for-the-long-path-cases/a-file-name-of-sixty-characters-for-the-long-path-cases.txt	5	279eb882
+pax.tar.lzma	unchecked		4
+pax.tar.zst	unchecked		4
+appledouble.tar	file	._note.txt	197	9adca009
+appledouble.tar	file	note.txt	39	8c076356

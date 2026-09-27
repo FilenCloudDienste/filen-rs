@@ -74,6 +74,8 @@ impl ReadBack {
 			// the archive is the job's own: whatever it expands to was read to write it
 			expansion: None,
 			max_index_bytes: config.max_index_bytes,
+			// reading back creates nothing in the drive
+			max_bytes: None,
 		};
 		Self {
 			dirs,

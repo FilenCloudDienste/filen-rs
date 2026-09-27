@@ -8,11 +8,14 @@ mod report;
 
 use filen_macros::js_type;
 
-use crate::fs::{
-	archive::dispose::SourceDisposal,
-	categories::{DirType, Normal},
-	file::{RemoteFile, enums::RemoteFileType},
-	name::ValidatedName,
+use crate::{
+	Error, ErrorKind,
+	fs::{
+		archive::dispose::SourceDisposal,
+		categories::{DirType, Normal},
+		file::{RemoteFile, enums::RemoteFileType},
+		name::ValidatedName,
+	},
 };
 
 pub use crate::fs::archive::{format::archive_default_name, password::ArchivePassword};
@@ -42,8 +45,11 @@ pub enum ArchiveSource {
 	Keep(RemoteFileType<'static>),
 	/// One of the user's own files, removed once the extraction is verified: completed with
 	/// nothing failed, skipped or unaccounted, the archive read in full and matching the hash in
-	/// its metadata, and every extracted item confirmed with the server. Otherwise it is kept
-	/// and the report says why.
+	/// its metadata, every extracted file's data checked against a checksum the archive carries
+	/// for it (a tar's own data needs none: the hash covers it), and every extracted item
+	/// confirmed with the server. Otherwise it is kept and the report says why: so a brotli or
+	/// LZMA-alone archive, or an lz4, xz or zstd one written without its checksum, is always
+	/// kept, as [`KeptReason::Unconfirmed`](crate::fs::archive::KeptReason::Unconfirmed).
 	Dispose {
 		/// The archive.
 		file: RemoteFile,
@@ -83,18 +89,26 @@ impl ExpansionLimit {
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
-	/// Storage still free on the account, if the caller knows it: an extraction whose uploads
-	/// would reach it fails with [`ErrorKind::MaxStorageReached`](crate::ErrorKind), keeping
-	/// what it extracted so far. A streaming archive's size is only known as it is read, so this
-	/// is checked as it goes, not up front.
+	/// Storage still free on the account, if the caller knows it: an extraction whose files
+	/// would reach it fails with [`ErrorKind::MaxStorageReached`](crate::ErrorKind). A zip or 7z
+	/// states its files' sizes in its index, so one stating that much for the files it will
+	/// extract (those skipped for their path or method left out) fails before anything is
+	/// created; a tar or single compressed file is only known as it is read, so it is checked as
+	/// it goes, and what was extracted so far is kept. A zip entry found overlapping another
+	/// only once it is read still counts up front, so such a zip may be refused though it fits.
 	pub max_bytes: Option<u64>,
 	/// Most directories and files created; an archive with more fails with
 	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind).
 	pub max_items: Option<u64>,
 	/// `None` turns the check off.
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// For an archive with encrypted entries. Checked before anything is created, on the
-	/// smallest encrypted entry.
+	/// For an archive with encrypted entries. Checked before anything is created on a 7z's
+	/// encrypted header, or else by reading the encrypted entry quickest to read in full, when
+	/// that takes at most 16 MiB of the archive. Otherwise it is checked as entries are
+	/// extracted: a wrong password found then fails the job with
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind), and when no file was extracted by
+	/// then, the folders created so far go to the trash (a folder holding a file someone else put
+	/// there meanwhile stays).
 	pub password: Option<ArchivePassword>,
 }
 
@@ -107,6 +121,19 @@ impl Default for ExtractConfig {
 			password: None,
 		}
 	}
+}
+
+/// The error for an extraction whose files, `bytes` in all, reach `max_bytes`; `None` while
+/// they fit. Files holding no bytes fit whatever the limit: empty files and directories take
+/// no storage, and the check as data is written only ever runs on some.
+pub(crate) fn storage_exceeded(max_bytes: Option<u64>, bytes: u64) -> Option<Error> {
+	let max = max_bytes?;
+	(bytes > 0 && bytes >= max).then(|| {
+		Error::custom(
+			ErrorKind::MaxStorageReached,
+			format!("the extraction needs more than the {max} bytes that are free"),
+		)
+	})
 }
 
 /// Why an archive entry was not extracted.

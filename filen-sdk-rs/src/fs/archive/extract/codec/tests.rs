@@ -34,6 +34,7 @@ const LIMITS: CodecLimits = CodecLimits {
 		floor: 256 << 20,
 	}),
 	max_index_bytes: 32 << 20,
+	max_bytes: None,
 };
 
 /// What the driver saw, with a file's data joined up.
@@ -75,6 +76,17 @@ fn run_full(
 	limits: CodecLimits,
 	password: Option<&str>,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
+	let (seen, result, _) = run_counting(archive, name, limits, password);
+	(seen, result)
+}
+
+/// As [`run_full`], and the bytes of the archive the codec counted as read.
+fn run_counting(
+	archive: &[u8],
+	name: &str,
+	limits: CodecLimits,
+	password: Option<&str>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let job = StreamJob {
 		name: name.to_owned(),
 		len: archive.len() as u64,
@@ -139,7 +151,7 @@ fn run_full(
 			Err(tokio::sync::oneshot::error::TryRecvError::Closed) => panic!("the codec died"),
 		}
 	};
-	(seen, result)
+	(seen, result, link.shared.input_bytes())
 }
 
 fn run(archive: &[u8], name: &str) -> (Vec<Seen>, Result<ArchiveEnd, Error>) {
@@ -375,6 +387,27 @@ fn a_zstd_tar_is_read_through_its_frames() {
 }
 
 #[test]
+fn what_a_codec_without_a_checksum_decodes_is_unchecked() {
+	let brotli = |data: &[u8]| {
+		let mut writer = ::brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+		writer.write_all(data).unwrap();
+		writer.into_inner()
+	};
+	// brotli carries no checksum: its one file, or every file of its tar, is unchecked
+	let (_, end) = run(&brotli(b"a note"), "note.txt.br");
+	assert_eq!(end.unwrap().unchecked_entries, 1);
+	let (_, end) = run(&brotli(&sample_tar()), "sample.tar.br");
+	assert_eq!(
+		end.unwrap().unchecked_entries,
+		1,
+		"docs/a.txt is its one file"
+	);
+	// gzip's CRC-32 checks all of it
+	let (_, end) = run(&gzip(&sample_tar()), "sample.tgz");
+	assert_eq!(end.unwrap().unchecked_entries, 0);
+}
+
+#[test]
 fn a_single_compressed_file_is_named_after_the_archive() {
 	let data = b"a single file, compressed on its own".repeat(100);
 	let (seen, end) = run(&gzip(&data), "notes.txt.gz");
@@ -568,6 +601,28 @@ fn a_zip_is_sent_entry_by_entry() {
 }
 
 #[test]
+fn every_byte_of_an_archive_counts_once_toward_the_bytes_read() {
+	let (zip, _) = zip_sample();
+	let sevenz = sevenz_of(
+		&[("big.bin", Some(&pattern(CHUNK_SIZE + 99, 4)))],
+		SevenZMethod::Lzma2 { level: 1 },
+		false,
+		None,
+	);
+	// a zip or 7z is told by its head, read as a stream's is, then read again from its start
+	for (archive, name) in [
+		(sample_tar(), "sample.tar"),
+		(gzip(&sample_tar()), "sample.tar.gz"),
+		(zip, "bundle.zip"),
+		(sevenz, "sample.7z"),
+	] {
+		let (_, end, read) = run_counting(&archive, name, LIMITS, None);
+		end.unwrap();
+		assert_eq!(read, archive.len() as u64, "{name}");
+	}
+}
+
+#[test]
 fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
 	let zip = zip_of(&[("secret.txt", Some(b"secret"))], Some(b"right"));
 	let (seen, end) = run_full(&zip, "s.zip", LIMITS, None);
@@ -641,6 +696,37 @@ fn zip_duplicates_symlinks_and_bombs() {
 		"refused on its stated sizes, before anything is sent"
 	);
 	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
+}
+
+#[test]
+fn a_zip_bomb_that_understates_its_size_is_stopped_at_it() {
+	const STATED: u32 = 1024;
+	let mut zip = zip_of(&[("zeros", Some(&vec![0u8; 4 << 20]))], None);
+	// the central record's uncompressed size, which is all the up-front check sees
+	let record = zip
+		.windows(4)
+		.rposition(|w| w == 0x0201_4b50u32.to_le_bytes())
+		.unwrap();
+	zip[record + 24..record + 28].copy_from_slice(&STATED.to_le_bytes());
+	let (seen, end) = run(&zip, "z.zip");
+	assert_eq!(kind(end), ErrorKind::ArchiveCorrupt);
+	let [
+		Seen::Opened(StreamLayout::Zip),
+		Seen::File { data, ended, .. },
+	] = &seen[..]
+	else {
+		panic!("{seen:?}");
+	};
+	assert!(data.len() <= STATED as usize && !ended, "{}", data.len());
+}
+
+#[test]
+fn bytes_after_a_zips_end_record_are_unaccounted() {
+	let (mut zip, expected) = zip_sample();
+	zip.extend_from_slice(&[0; 100]);
+	let (seen, end) = run(&zip, "padded.zip");
+	assert_eq!(seen, expected);
+	assert_eq!(end.unwrap().unaccounted_bytes, 100);
 }
 
 /// A 7z of `entries` (a `None` is a directory), with keys cheap to derive.
@@ -1129,4 +1215,77 @@ fn an_encrypted_directory_is_judged_by_its_length() {
 		let (_, end) = run_full(&zip, "aes.zip", LIMITS, Some("pw"));
 		assert!(end.unwrap().unaccounted_bytes > 0, "{method:?}");
 	}
+}
+
+/// The password of every fixture whose name starts with `encrypted`.
+const FIXTURE_PASSWORD: &str = "fixture password";
+
+/// Extracts every archive in `tests/fixtures/archives/<dir>`, made by real tools (see the README
+/// there), and checks what the codec sends, the bytes that belong to no entry and the entries no
+/// checksum covered against the directory's `manifest.tsv`, which was written from the inputs
+/// rather than from what the SDK reads.
+fn check_fixtures(dir: &str) {
+	let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/archives")
+		.join(dir);
+	let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
+	let mut expected = std::collections::BTreeMap::<&str, Vec<String>>::new();
+	for line in manifest.lines().filter(|line| !line.starts_with('#')) {
+		let (archive, row) = line.split_once('\t').unwrap();
+		expected.entry(archive).or_default().push(row.to_owned());
+	}
+	for (archive, mut rows) in expected {
+		let bytes = std::fs::read(root.join(archive)).unwrap();
+		let password = archive.starts_with("encrypted").then_some(FIXTURE_PASSWORD);
+		let (seen, end) = run_full(&bytes, archive, LIMITS, password);
+		let end = end.unwrap_or_else(|error| panic!("{archive}: {error}"));
+		let mut found: Vec<String> = seen
+			.into_iter()
+			.filter_map(|seen| match seen {
+				Seen::Opened(_) => None,
+				Seen::Dir(_, path) => Some(format!("dir\t{path}")),
+				Seen::File {
+					path, data, ended, ..
+				} => {
+					assert!(ended, "{archive}: {path} did not end");
+					Some(format!(
+						"file\t{path}\t{}\t{:08x}",
+						data.len(),
+						crc32fast::hash(&data)
+					))
+				}
+				Seen::Skipped(_, path, _, ExtractSkipReason::Symlink { target }) => {
+					Some(format!("symlink\t{path}\t{target}"))
+				}
+				Seen::Skipped(_, path, _, ExtractSkipReason::Hardlink { target }) => {
+					Some(format!("hardlink\t{path}\t{target}"))
+				}
+				Seen::Skipped(_, path, _, reason) => Some(format!("skip\t{path}\t{reason:?}")),
+			})
+			.collect();
+		if end.unaccounted_bytes > 0 {
+			found.push(format!("unaccounted\t\t{}", end.unaccounted_bytes));
+		}
+		if end.unchecked_entries > 0 {
+			found.push(format!("unchecked\t\t{}", end.unchecked_entries));
+		}
+		rows.sort();
+		found.sort();
+		assert_eq!(found, rows, "{archive}");
+	}
+}
+
+#[test]
+fn tar_fixtures_extract_to_their_manifest() {
+	check_fixtures("tar");
+}
+
+#[test]
+fn sevenz_fixtures_extract_to_their_manifest() {
+	check_fixtures("7z");
+}
+
+#[test]
+fn stream_fixtures_extract_to_their_manifest() {
+	check_fixtures("streams");
 }
