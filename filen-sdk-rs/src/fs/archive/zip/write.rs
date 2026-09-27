@@ -26,7 +26,7 @@ const METHOD_AES: u16 = 99;
 const VERSION_MADE_BY: u16 = (HOST_UNIX << 8) | 63;
 /// An entry this large, or larger, is written with zip64 sizes: its compressed size may pass
 /// 4 GiB even though its data does not, since stored and deflated data can grow a little.
-const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
+pub(crate) const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 
 /// How a zip entry's data is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +550,52 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn the_central_zip64_field_holds_what_the_fixed_fields_leave_out_in_order() {
+		const FULL: u32 = u32::MAX;
+		// (size, compressed size, offset; the fixed fields' compressed size, size and offset,
+		// and the zip64 values after them, in the specification's order)
+		for ((size, compressed_size, offset), fixed, zip64) in [
+			(
+				(5 << 30, 6 << 30, 7 << 30),
+				(FULL, FULL, FULL),
+				vec![5 << 30, 6 << 30, 7 << 30],
+			),
+			((10, 6 << 30, 20), (FULL, 10, 20), vec![6 << 30]),
+			((20, 10, 7 << 30), (10, 20, FULL), vec![7 << 30]),
+			((20, 10, 30), (10, 20, 30), vec![]),
+		] {
+			let entry = CentralEntry {
+				name: b"big".to_vec(),
+				flags: 0,
+				method: METHOD_STORED,
+				aes: None,
+				dos: dos_datetime(None),
+				unix_time: None,
+				crc: 0,
+				compressed_size,
+				size,
+				offset,
+				dir: false,
+			};
+			let mut record = Vec::new();
+			write_central_header(&mut record, &entry).unwrap();
+			let u32_at = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
+			assert_eq!((u32_at(20), u32_at(24), u32_at(42)), fixed);
+			let extra = &record[46 + entry.name.len()..];
+			let values: Vec<u64> = if extra.starts_with(&0x0001u16.to_le_bytes()) {
+				let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
+				extra[4..4 + len]
+					.chunks_exact(8)
+					.map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+					.collect()
+			} else {
+				Vec::new()
+			};
+			assert_eq!(values, zip64, "{size} {compressed_size} {offset}");
+		}
+	}
 
 	#[test]
 	fn the_version_needed_meets_every_requirement() {
