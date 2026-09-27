@@ -229,6 +229,8 @@ impl CompressFormat {
 				let takes = |level| self.with_level(level).encoder_memory().is_ok();
 				let low = (0..=HIGHEST_LEVEL).find(|&level| takes(level))?;
 				let high = (0..=HIGHEST_LEVEL).rev().find(|&level| takes(level))?;
+				// a method's levels have no gaps (the tests check every method)
+				debug_assert!((low..=high).all(takes), "{self:?} skips a level");
 				Some(low..=high)
 			}
 		}
@@ -502,18 +504,36 @@ mod tests {
 		] {
 			assert!(*codec.levels().0.end() <= HIGHEST_LEVEL, "{codec:?}");
 		}
-		for method in [
-			ZipMethod::Deflate { level: 0 },
-			ZipMethod::Bzip2 { level: 0 },
-		] {
-			let format = CompressFormat::Zip {
-				method,
-				encryption: None,
-			};
-			assert!(
-				format.with_level(HIGHEST_LEVEL).encoder_memory().is_err(),
-				"{method:?}"
-			);
+		// every zip and 7z method's levels are found by the probe: all of them below its top,
+		// with no gap, and none above
+		let zip = |method| CompressFormat::Zip {
+			method,
+			encryption: None,
+		};
+		let sevenz = |method| CompressFormat::SevenZ {
+			method,
+			solid: false,
+			encryption: None,
+		};
+		let formats = [
+			zip(ZipMethod::Deflate { level: 1 }),
+			zip(ZipMethod::Bzip2 { level: 1 }),
+			sevenz(SevenZMethod::Lzma2 { level: 1 }),
+			sevenz(SevenZMethod::Lzma { level: 1 }),
+			sevenz(SevenZMethod::Ppmd { level: 1 }),
+			sevenz(SevenZMethod::Bzip2 { level: 1 }),
+			sevenz(SevenZMethod::Deflate { level: 1 }),
+		];
+		for format in formats {
+			let levels = format.levels().unwrap();
+			assert!(*levels.end() < HIGHEST_LEVEL, "{format:?}");
+			for level in 0..=4 * HIGHEST_LEVEL {
+				assert_eq!(
+					format.with_level(level).check(false).is_ok(),
+					levels.contains(&level),
+					"{format:?} at {level}"
+				);
+			}
 		}
 	}
 
