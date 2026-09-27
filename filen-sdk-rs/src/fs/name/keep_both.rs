@@ -62,6 +62,9 @@ pub(crate) struct TakenNames {
 	/// the `k - 1` before it. Names are only ever added, so a candidate once seen taken stays
 	/// taken.
 	next_counter: SeededMap<CounterKey, u64>,
+	/// Numbered candidates built so far, the work an allocation costs.
+	#[cfg(test)]
+	candidates_built: u64,
 }
 
 /// What a numbered candidate's hint is kept under: the collision keys of the base and extension
@@ -77,7 +80,7 @@ impl TakenNames {
 	pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
 		Self {
 			keys: names.into_iter().map(collision_key).collect(),
-			next_counter: SeededMap::default(),
+			..Self::default()
 		}
 	}
 
@@ -114,6 +117,10 @@ impl TakenNames {
 		let mut contiguous = first_of_its_length(n);
 		loop {
 			let (candidate, key) = numbered_candidate(base, n, ext)?;
+			#[cfg(test)]
+			{
+				self.candidates_built += 1;
+			}
 			if let Some(known_taken_below) = key.as_ref().and_then(|key| self.next_counter.get(key))
 				&& *known_taken_below >= n
 			{
@@ -449,10 +456,13 @@ mod tests {
 		// names from an archive are attacker-chosen: the k-th duplicate must not retry every
 		// counter before it, or 20k duplicates of one name (and of its case variants) would
 		// take hundreds of millions of candidate checks
+		const DUPLICATES: u64 = 20_000;
+		// hints are kept per counter length, so a duplicate builds one candidate for each length
+		// (1 to 5 digits here) on its way to the free one
+		const MOST_BUILT_EACH: u64 = DUPLICATES.ilog10() as u64 + 2;
 		let mut names = TakenNames::default();
-		let start = std::time::Instant::now();
 		let mut last = String::new();
-		for i in 0..20_000 {
+		for i in 0..DUPLICATES {
 			let spelling = if i % 2 == 0 {
 				"report.pdf"
 			} else {
@@ -464,10 +474,12 @@ mod tests {
 				.into();
 		}
 		assert_eq!(last, "REPORT (19999).pdf");
+		assert!(names.candidates_built <= MOST_BUILT_EACH * DUPLICATES);
 		// and so must one long enough that every candidate is trimmed
+		names.candidates_built = 0;
 		let long = "x".repeat(250);
 		let long_upper = long.to_uppercase();
-		for i in 0..20_000 {
+		for i in 0..DUPLICATES {
 			let spelling = if i % 2 == 0 { &long } else { &long_upper };
 			last = names
 				.allocate(source_name(&format!("{spelling}.pdf")), NameShape::File)
@@ -475,11 +487,7 @@ mod tests {
 				.into();
 		}
 		assert_eq!(last, format!("{} (19999).pdf", &long_upper[..243]));
-		assert!(
-			start.elapsed() < std::time::Duration::from_secs(1),
-			"{:?}",
-			start.elapsed()
-		);
+		assert!(names.candidates_built <= MOST_BUILT_EACH * DUPLICATES);
 		// the hint never skips a free counter, even one below a counter taken out of order
 		let mut names = TakenNames::new(["a.txt", "a (2).txt"]);
 		let first: String = names
