@@ -19,7 +19,7 @@ use crate::{
 		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
-			read::{EntryLimits, ZipKind, ZipLimits, open_entry, read_index},
+			read::{EntryLimits, ZipEntry, ZipKind, ZipLimits, open_entry, read_index},
 			write::ZipMethod,
 		},
 	},
@@ -480,11 +480,61 @@ fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
 	}
 }
 
+/// A zip entry's records around its data, as its local header and data descriptor state them.
+#[derive(Debug, PartialEq)]
+struct EntryRecords {
+	/// The local header's compressed size and size fields.
+	local_sizes: (u32, u32),
+	/// The data of the local header's zip64 extra field, if it has one.
+	local_zip64: Option<Vec<u8>>,
+	/// The data descriptor's compressed size and size, and whether they are 8 bytes each.
+	descriptor: (u64, u64, bool),
+}
+
+/// The records of the file `entry` of `archive`, reading its descriptor as zip64 when `zip64`.
+fn entry_records(archive: &[u8], entry: &ZipEntry, zip64: bool) -> EntryRecords {
+	const ZIP64_EXTRA_ID: u16 = 0x0001;
+	const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
+	let u16_at = |at: usize| u16::from_le_bytes(archive[at..at + 2].try_into().unwrap());
+	let u32_at = |at: usize| u32::from_le_bytes(archive[at..at + 4].try_into().unwrap());
+	let u64_at = |at: usize| u64::from_le_bytes(archive[at..at + 8].try_into().unwrap());
+	let at = entry.header_offset as usize;
+	let name_len = usize::from(u16_at(at + 26));
+	let extra_len = usize::from(u16_at(at + 28));
+	let mut extra = &archive[at + 30 + name_len..at + 30 + name_len + extra_len];
+	let mut local_zip64 = None;
+	while !extra.is_empty() {
+		let (id, len) = (
+			u16::from_le_bytes([extra[0], extra[1]]),
+			usize::from(u16::from_le_bytes([extra[2], extra[3]])),
+		);
+		if id == ZIP64_EXTRA_ID {
+			local_zip64 = Some(extra[4..4 + len].to_vec());
+		}
+		extra = &extra[4 + len..];
+	}
+	let descriptor = at + 30 + name_len + extra_len + entry.compressed_size as usize;
+	assert_eq!(u32_at(descriptor), DATA_DESCRIPTOR_SIG, "{}", entry.name);
+	EntryRecords {
+		local_sizes: (u32_at(at + 18), u32_at(at + 22)),
+		local_zip64,
+		descriptor: if zip64 {
+			(u64_at(descriptor + 8), u64_at(descriptor + 16), true)
+		} else {
+			(
+				u64::from(u32_at(descriptor + 8)),
+				u64::from(u32_at(descriptor + 12)),
+				false,
+			)
+		},
+	}
+}
+
 #[test]
-fn a_zip_of_zip64_entries_reads_back_entry_for_entry() {
-	// what an entry of 4 GiB or more is written with, for every entry
-	const ZIP64_FROM: u64 = 0;
-	const ZIP64_SIZE: u32 = u32::MAX;
+fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
+	// lowered from 4 GiB, so the sample's file over a chunk is written as an entry that large
+	// is, and its small files as they are
+	const ZIP64_FROM: u64 = CHUNK_SIZE_U64;
 	for (method, encryption) in [
 		(ZipMethod::Stored, None),
 		(ZipMethod::Deflate { level: 6 }, Some(AesStrength::Aes256)),
@@ -513,7 +563,8 @@ fn a_zip_of_zip64_entries_reads_back_entry_for_entry() {
 		);
 		assert_eq!(written.file_ends, 4, "{case}");
 
-		// every file's local header leaves its sizes to its zip64 data descriptor
+		// a zip64 entry's local header leaves its sizes to its zip64 data descriptor, and
+		// carries the zip64 field that says so; every other entry's leaves them at 0
 		let mut source = std::io::Cursor::new(&written.archive[..]);
 		let index = read_index(
 			&mut source,
@@ -524,17 +575,24 @@ fn a_zip_of_zip64_entries_reads_back_entry_for_entry() {
 			},
 		)
 		.unwrap();
-		let u32_at =
-			|at: usize| u32::from_le_bytes(written.archive[at..at + 4].try_into().unwrap());
+		let mut zip64_entries = Vec::new();
 		for entry in index.entries.iter().filter(|e| e.kind == ZipKind::File) {
-			let at = entry.header_offset as usize;
+			let zip64 = entry.size >= ZIP64_FROM;
+			if zip64 {
+				zip64_entries.push(entry.name.as_str());
+			}
 			assert_eq!(
-				(u32_at(at + 18), u32_at(at + 22)),
-				(ZIP64_SIZE, ZIP64_SIZE),
+				entry_records(&written.archive, entry, zip64),
+				EntryRecords {
+					local_sizes: if zip64 { (u32::MAX, u32::MAX) } else { (0, 0) },
+					local_zip64: zip64.then(|| vec![0; 16]),
+					descriptor: (entry.compressed_size, entry.size, zip64),
+				},
 				"{} {case}",
 				entry.name
 			);
 		}
+		assert_eq!(zip64_entries, ["big.bin"], "{case}");
 
 		let expected = members_as_entries(&members);
 		let password = password.as_ref().map(ArchivePassword::as_bytes);
