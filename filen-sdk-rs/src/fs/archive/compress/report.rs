@@ -34,7 +34,7 @@ pub use crate::job::report::RunState;
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CompressPhase {
-	/// Listing the sources.
+	/// Listing the sources. A job paused before it starts waits here, having listed nothing.
 	Scanning,
 	/// Waiting for another archive job to finish; nothing is held meanwhile.
 	WaitingForWorker,

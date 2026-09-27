@@ -4,7 +4,8 @@
 //! A compression is an archive job: up to [`ArchiveConfig::job_concurrency`] run at once, a later
 //! one waiting in [`CompressPhase::WaitingForWorker`]. A job paused while it runs keeps its slot,
 //! since its codec's state stays resident; one paused before it got a slot waits the pause out
-//! without taking one, so it never keeps a later job from running.
+//! without taking one, so it never keeps a later job from running, and one paused before it
+//! starts waits in [`CompressPhase::Scanning`] before listing anything.
 //!
 //! [`ArchiveConfig::job_concurrency`]: super::ArchiveConfig::job_concurrency
 

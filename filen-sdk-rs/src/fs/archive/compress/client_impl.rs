@@ -11,6 +11,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
+			ArchiveConfig,
 			dispose::{ExpectedFile, SourceDisposal, Tree},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
@@ -73,7 +74,9 @@ impl Client {
 	/// The archive only becomes visible once all of it is uploaded, so a job that ends early
 	/// leaves nothing behind. Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once;
 	/// a later one waits, reporting [`CompressPhase::WaitingForWorker`]. It reports its progress
-	/// to `callback` and can be paused, resumed and cancelled through `control`.
+	/// to `callback` and can be paused, resumed and cancelled through `control`; a job paused
+	/// before it starts waits in [`CompressPhase::Scanning`], having listed nothing, until it is
+	/// resumed or cancelled.
 	///
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn compress_items(
@@ -86,115 +89,25 @@ impl Client {
 		control: JobControl,
 	) -> Result<CompressReport, CompressFailed> {
 		let reporter = Reporter::new(callback);
-		let archives = self.client().state().archives().clone();
-		// every source a disposal was asked for is reported, however early the job ends
-		let requested: Vec<Uuid> = match &sources {
-			CompressSources::Keep(_) => Vec::new(),
-			CompressSources::Dispose { items, .. } => {
-				items.iter().map(|item| item.uuid()).collect()
-			}
-		};
-		let refuse =
-			|report, phase, error| end_early(&reporter, report, &requested, phase, Arc::new(error));
-		let checked = config
-			.format
-			.check_name(name.as_ref())
-			.and_then(|extension_len| {
-				config
-					.format
-					.check_within(config.password.is_some(), archives.codec_mem_budget)?;
-				Ok(extension_len)
-			});
-		let extension_len = match checked {
-			Ok(extension_len) => extension_len,
-			Err(error) => {
-				return Err(refuse(
-					CompressReport::default(),
-					CompressPhase::Failed,
-					error,
-				));
-			}
-		};
-
-		let (sources, dispose) = match sources {
-			CompressSources::Keep(sources) => (sources, None),
-			CompressSources::Dispose { how, items } => {
-				let sources = items
-					.iter()
-					.map(|item| match item {
-						NonRootItemType::File(file) => {
-							ItemSource::File(RemoteFileType::from(file.clone().into_owned()))
-						}
-						NonRootItemType::Dir(dir) => {
-							ItemSource::Dir(ItemSourceDir::Normal(dir.clone().into_owned()))
-						}
-					})
-					.collect();
-				(sources, Some((how, items)))
-			}
-		};
-		let mut plan = match self.plan_sources(sources, &reporter, &control).await {
-			Ok(plan) => plan,
-			Err(ScanError::Stopped) => {
-				return Err(end_early(
-					&reporter,
-					CompressReport::default(),
-					&requested,
-					CompressPhase::Cancelled,
-					cancelled(),
-				));
-			}
-			Err(ScanError::Failed(error)) => {
-				return Err(refuse(
-					CompressReport::default(),
-					CompressPhase::Failed,
-					error,
-				));
-			}
-		};
-		let top_level_renamed = top_level_renames(&plan);
-		// the plan's records move into the report; nothing reads them in the plan again
-		let mut report = CompressReport {
-			skipped: std::mem::take(&mut plan.skipped),
-			renamed: std::mem::take(&mut plan.renamed),
-			totals: plan.totals,
-			..CompressReport::default()
-		};
-		report.renamed.extend(top_level_renamed);
-		let how = dispose.as_ref().map(|(how, _)| *how);
-		let disposal =
-			match dispose.map(|(how, items)| disposal(&plan, how, items, destination.uuid())) {
-				None => None,
-				Some(Ok(disposal)) => Some(disposal),
-				Some(Err(error)) => return Err(refuse(report, CompressPhase::Failed, error)),
-			};
-		let (entries, sources) = match archive_entries(plan, config.format) {
-			Ok(entries) => entries,
-			Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
-		};
-		if let (CompressFormat::Tar { compression: None }, Some(max)) =
-			(config.format, config.max_bytes)
-		{
-			let needed = tar_size(&entries);
-			if needed >= max {
-				report.needed_bytes = Some(needed);
-				let error = Error::custom(
-					ErrorKind::MaxStorageReached,
-					format!("the archive needs {needed} bytes but only {max} are free"),
-				);
-				return Err(refuse(report, CompressPhase::Failed, error));
-			}
-		}
-		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
-
-		// a permanent disposal reads the archive back as extracting would
-		let read_back = (how == Some(SourceDisposal::DeletePermanently))
-			.then(|| ReadBack::as_extracting(&entries, &archives, config.password.clone()));
-		let job = CompressJob {
-			format: config.format,
-			entries,
-			password: config.password,
-		};
+		let (format, max_bytes) = (config.format, config.max_bytes);
+		let Planned {
+			extension_len,
+			report,
+			disposal,
+			job,
+			sources,
+			read_back,
+		} = plan_compression(
+			&*self,
+			sources,
+			destination.uuid(),
+			&name,
+			config,
+			&reporter,
+			&control,
+		)
+		.await?;
+		let archives = self.archive_config().clone();
 		run_compress(CompressTask {
 			backend: Arc::new(ClientBackend::new(self)),
 			control,
@@ -203,9 +116,9 @@ impl Client {
 			name,
 			extension_len,
 			sources,
-			max_bytes: config.max_bytes,
+			max_bytes,
 			config: archives,
-			head_last: matches!(config.format, CompressFormat::SevenZ { .. }),
+			head_last: matches!(format, CompressFormat::SevenZ { .. }),
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
 			disposal,
@@ -213,52 +126,217 @@ impl Client {
 		})
 		.await
 	}
+}
 
-	/// Lists every source directory and plans the archive's entries under a root of its own.
-	async fn plan_sources(
+/// What planning a compression reads from the client: its archive settings and its source
+/// listings. Tests plan against a fake.
+trait PlanningClient {
+	fn archive_settings(&self) -> &ArchiveConfig;
+
+	async fn list_source(
 		&self,
-		sources: Vec<ItemSource>,
-		reporter: &MaybeArc<Reporter>,
-		control: &JobControl,
-	) -> Result<ItemPlan<ItemSourceDir>, ScanError> {
-		let sources_total = sources
-			.iter()
-			.filter(|source| matches!(source, ItemSource::Dir(_)))
-			.count() as u64;
-		let bytes = ListingBytes::default();
-		let ops = reporter.ops();
-		let mut sources_done = 0;
-		let report = |sources_done| reporter.set_scan(bytes.scan(sources_done, sources_total));
-		report(sources_done);
+		dir: ItemSourceDir,
+		bytes: &ListingBytes,
+	) -> Result<PlanSource<ItemSourceDir>, Error>;
+}
 
-		// the archive's root: nothing is in it yet, and nothing is listed for it
-		let root = Uuid::new_v4();
-		let mut planner = ItemPlanner::default();
-		planner.add_destination(root, std::iter::empty());
-		let mut requests = Vec::with_capacity(sources.len());
-		for source in sources {
-			let source = match source {
-				ItemSource::File(file) => PlanSource::File(file),
-				ItemSource::Dir(dir) => {
-					reporter.checkpoint(control).await?;
-					bytes.next_source();
-					let listing = self.list_item_source(dir, &bytes);
-					let source = watch_listing(listing, &ops, control, || report(sources_done))
-						.await?
-						.map_err(ScanError::Failed)?;
-					sources_done += 1;
-					report(sources_done);
-					source
-				}
-			};
-			requests.push(PlanRequest {
-				source,
-				destination: root,
-				name: None,
-			});
-		}
-		planner.plan(requests).map_err(ScanError::Failed)
+impl PlanningClient for Client {
+	fn archive_settings(&self) -> &ArchiveConfig {
+		self.archive_config()
 	}
+
+	async fn list_source(
+		&self,
+		dir: ItemSourceDir,
+		bytes: &ListingBytes,
+	) -> Result<PlanSource<ItemSourceDir>, Error> {
+		self.list_item_source(dir, bytes).await
+	}
+}
+
+/// A compression planned, ready for its engine.
+struct Planned {
+	extension_len: usize,
+	report: CompressReport,
+	disposal: Option<CompressDisposal>,
+	job: CompressJob,
+	sources: Vec<Source>,
+	read_back: Option<ReadBack>,
+}
+
+/// Checks the format and `name`, lists and plans the sources, and checks the archive can be
+/// written and extracted again. A job paused before it starts waits here, in
+/// [`CompressPhase::Scanning`], before listing anything.
+async fn plan_compression(
+	client: &impl PlanningClient,
+	sources: CompressSources,
+	destination: Uuid,
+	name: &ValidatedName,
+	config: CompressConfig,
+	reporter: &MaybeArc<Reporter>,
+	control: &JobControl,
+) -> Result<Planned, CompressFailed> {
+	let archives = client.archive_settings();
+	// every source a disposal was asked for is reported, however early the job ends
+	let requested: Vec<Uuid> = match &sources {
+		CompressSources::Keep(_) => Vec::new(),
+		CompressSources::Dispose { items, .. } => items.iter().map(|item| item.uuid()).collect(),
+	};
+	let refuse =
+		|report, phase, error| end_early(reporter, report, &requested, phase, Arc::new(error));
+	let checked = config
+		.format
+		.check_name(name.as_ref())
+		.and_then(|extension_len| {
+			config
+				.format
+				.check_within(config.password.is_some(), archives.codec_mem_budget)?;
+			Ok(extension_len)
+		});
+	let extension_len = match checked {
+		Ok(extension_len) => extension_len,
+		Err(error) => {
+			return Err(refuse(
+				CompressReport::default(),
+				CompressPhase::Failed,
+				error,
+			));
+		}
+	};
+
+	let (sources, dispose) = match sources {
+		CompressSources::Keep(sources) => (sources, None),
+		CompressSources::Dispose { how, items } => {
+			let sources = items
+				.iter()
+				.map(|item| match item {
+					NonRootItemType::File(file) => {
+						ItemSource::File(RemoteFileType::from(file.clone().into_owned()))
+					}
+					NonRootItemType::Dir(dir) => {
+						ItemSource::Dir(ItemSourceDir::Normal(dir.clone().into_owned()))
+					}
+				})
+				.collect();
+			(sources, Some((how, items)))
+		}
+	};
+	let mut plan = match plan_sources(client, sources, reporter, control).await {
+		Ok(plan) => plan,
+		Err(ScanError::Stopped) => {
+			return Err(end_early(
+				reporter,
+				CompressReport::default(),
+				&requested,
+				CompressPhase::Cancelled,
+				cancelled(),
+			));
+		}
+		Err(ScanError::Failed(error)) => {
+			return Err(refuse(
+				CompressReport::default(),
+				CompressPhase::Failed,
+				error,
+			));
+		}
+	};
+	let top_level_renamed = top_level_renames(&plan);
+	// the plan's records move into the report; nothing reads them in the plan again
+	let mut report = CompressReport {
+		skipped: std::mem::take(&mut plan.skipped),
+		renamed: std::mem::take(&mut plan.renamed),
+		totals: plan.totals,
+		..CompressReport::default()
+	};
+	report.renamed.extend(top_level_renamed);
+	let how = dispose.as_ref().map(|(how, _)| *how);
+	let disposal = match dispose.map(|(how, items)| disposal(&plan, how, items, destination)) {
+		None => None,
+		Some(Ok(disposal)) => Some(disposal),
+		Some(Err(error)) => return Err(refuse(report, CompressPhase::Failed, error)),
+	};
+	let (entries, sources) = match archive_entries(plan, config.format) {
+		Ok(entries) => entries,
+		Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
+	};
+	if let (CompressFormat::Tar { compression: None }, Some(max)) =
+		(config.format, config.max_bytes)
+	{
+		let needed = tar_size(&entries);
+		if needed >= max {
+			report.needed_bytes = Some(needed);
+			let error = Error::custom(
+				ErrorKind::MaxStorageReached,
+				format!("the archive needs {needed} bytes but only {max} are free"),
+			);
+			return Err(refuse(report, CompressPhase::Failed, error));
+		}
+	}
+	reporter.set_plan(report.totals, &report.skipped, &report.renamed);
+
+	// a permanent disposal reads the archive back as extracting would
+	let read_back = (how == Some(SourceDisposal::DeletePermanently))
+		.then(|| ReadBack::as_extracting(&entries, archives, config.password.clone()));
+	Ok(Planned {
+		extension_len,
+		report,
+		disposal,
+		job: CompressJob {
+			format: config.format,
+			entries,
+			password: config.password,
+		},
+		sources,
+		read_back,
+	})
+}
+
+/// Lists every source directory and plans the archive's entries under a root of its own. A
+/// pause is waited out before anything is listed, and between source directories.
+async fn plan_sources(
+	client: &impl PlanningClient,
+	sources: Vec<ItemSource>,
+	reporter: &MaybeArc<Reporter>,
+	control: &JobControl,
+) -> Result<ItemPlan<ItemSourceDir>, ScanError> {
+	reporter.checkpoint(control).await?;
+	let sources_total = sources
+		.iter()
+		.filter(|source| matches!(source, ItemSource::Dir(_)))
+		.count() as u64;
+	let bytes = ListingBytes::default();
+	let ops = reporter.ops();
+	let mut sources_done = 0;
+	let report = |sources_done| reporter.set_scan(bytes.scan(sources_done, sources_total));
+	report(sources_done);
+
+	// the archive's root: nothing is in it yet, and nothing is listed for it
+	let root = Uuid::new_v4();
+	let mut planner = ItemPlanner::default();
+	planner.add_destination(root, std::iter::empty());
+	let mut requests = Vec::with_capacity(sources.len());
+	for source in sources {
+		let source = match source {
+			ItemSource::File(file) => PlanSource::File(file),
+			ItemSource::Dir(dir) => {
+				reporter.checkpoint(control).await?;
+				bytes.next_source();
+				let listing = client.list_source(dir, &bytes);
+				let source = watch_listing(listing, &ops, control, || report(sources_done))
+					.await?
+					.map_err(ScanError::Failed)?;
+				sources_done += 1;
+				report(sources_done);
+				source
+			}
+		};
+		requests.push(PlanRequest {
+			source,
+			destination: root,
+			name: None,
+		});
+	}
+	planner.plan(requests).map_err(ScanError::Failed)
 }
 
 /// What removing `items`, the job's sources in request order, has to find unchanged: a file as
@@ -429,24 +507,35 @@ fn check_path(path: &str, extra: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
+	use std::{borrow::Cow, sync::Mutex};
+
+	use filen_types::api::v3::dir::color::DirColor;
+	use tokio::task::JoinHandle;
 
 	use super::*;
 	use crate::{
 		consts::CHUNK_SIZE_U64,
 		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 		fs::{
-			archive::compress::{
-				CompressUpdate, Compression, StreamCodec, report::CompressCallback,
+			archive::{
+				DisposalOutcome, KeptReason,
+				compress::{
+					CompressUpdate, Compression, RunState, StreamCodec, report::CompressCallback,
+				},
+				config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			},
 			dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
-			drive_job::plan::{Listed, SourceDir},
+			drive_job::{
+				plan::{Listed, PlanTotals, SourceDir},
+				test_support::wait_until,
+			},
 			file::{
 				AnonymousRemoteFile, RemoteFile,
 				enums::RemoteFileType,
 				meta::{DecryptedFileMeta, FileMeta},
 			},
 		},
+		job::test_support::controls,
 	};
 
 	#[expect(dead_code, reason = "only named by the compile-time check below")]
@@ -480,7 +569,7 @@ mod tests {
 			uuid: Uuid::new_v4(),
 			name: Some(name.to_owned()),
 			created: None,
-			color: filen_types::api::v3::dir::color::DirColor::Default,
+			color: DirColor::Default,
 			handle: (),
 		}
 	}
@@ -812,5 +901,202 @@ mod tests {
 		let deep = vec!["d"; MAX_ARCHIVE_PATH_DEPTH].join("/");
 		assert!(check_path(&deep, 0).is_ok());
 		assert!(check_path(&format!("{deep}/x"), 0).is_err());
+	}
+
+	/// Plans against listings it makes up, one file per directory, recording which directories
+	/// it was asked to list.
+	struct FakeClient {
+		archives: ArchiveConfig,
+		listed: Mutex<Vec<Uuid>>,
+	}
+
+	impl PlanningClient for FakeClient {
+		fn archive_settings(&self) -> &ArchiveConfig {
+			&self.archives
+		}
+
+		async fn list_source(
+			&self,
+			dir: ItemSourceDir,
+			_: &ListingBytes,
+		) -> Result<PlanSource<ItemSourceDir>, Error> {
+			let ItemSourceDir::Normal(dir) = dir else {
+				unreachable!("the tests list only the user's own directories")
+			};
+			let uuid = dir.uuid();
+			self.listed.lock().unwrap().push(uuid);
+			Ok(PlanSource::Dir {
+				root: SourceDir::new(dir, DirColor::Default, ItemSourceDir::Normal),
+				dirs: Vec::new(),
+				files: vec![Listed {
+					parent: uuid,
+					item: file("inside.txt", 7),
+				}],
+			})
+		}
+	}
+
+	#[derive(Default)]
+	struct Updates(Mutex<Vec<CompressUpdate>>);
+
+	impl CompressCallback for Updates {
+		fn on_archive_created(&self, _: RemoteFile) {}
+
+		fn on_update(&self, update: CompressUpdate) {
+			self.0.lock().unwrap().push(update);
+		}
+	}
+
+	impl Updates {
+		/// The run states the updates went through, each change once, pausing left out.
+		fn run_states(&self) -> Vec<RunState> {
+			let mut states: Vec<RunState> = self
+				.0
+				.lock()
+				.unwrap()
+				.iter()
+				.map(|update| update.run_state)
+				.filter(|state| *state != RunState::Pausing)
+				.collect();
+			states.dedup();
+			states
+		}
+
+		fn last_phase(&self) -> CompressPhase {
+			self.0.lock().unwrap().last().unwrap().phase
+		}
+	}
+
+	fn remote_dir(name: &str) -> RemoteDirectory {
+		RemoteDirectory::new_from_parts(
+			Uuid::new_v4(),
+			DecryptedDirectoryMeta {
+				name: Cow::Owned(name.to_owned()),
+				created: None,
+			},
+			Uuid::new_v4().into(),
+			chrono::Utc::now(),
+		)
+	}
+
+	/// A compression of `sources` planned with a pause asked for before it starts.
+	struct PausedPlan {
+		client: Arc<FakeClient>,
+		updates: Arc<Updates>,
+		reporter: MaybeArc<Reporter>,
+		pause: tokio::sync::watch::Sender<bool>,
+		cancel: tokio::sync::watch::Sender<bool>,
+		/// The plan's totals once it is done.
+		planned: JoinHandle<Result<PlanTotals, CompressFailed>>,
+	}
+
+	async fn plan_paused(sources: CompressSources) -> PausedPlan {
+		let client = Arc::new(FakeClient {
+			archives: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+			listed: Mutex::default(),
+		});
+		let updates = Arc::new(Updates::default());
+		let reporter = Reporter::new(Arc::clone(&updates));
+		let (pause, cancel, control) = controls();
+		pause.send_replace(true);
+		let planned = tokio::spawn({
+			let client = Arc::clone(&client);
+			let reporter = MaybeArc::clone(&reporter);
+			async move {
+				plan_compression(
+					&*client,
+					sources,
+					Uuid::new_v4(),
+					&ValidatedName::try_from("a.tar").unwrap(),
+					CompressConfig {
+						format: CompressFormat::Tar { compression: None },
+						max_bytes: None,
+						password: None,
+					},
+					&reporter,
+					&control,
+				)
+				.await
+				.map(|planned| planned.report.totals)
+			}
+		});
+		wait_until("the job reports itself paused", || reporter.is_paused()).await;
+		PausedPlan {
+			client,
+			updates,
+			reporter,
+			pause,
+			cancel,
+			planned,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_compression_paused_before_it_starts_lists_nothing_until_resumed() {
+		let dir = remote_dir("docs");
+		let folder =
+			CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(dir.clone()))]);
+		let file_only = CompressSources::Keep(vec![ItemSource::File(file("a.txt", 3))]);
+		for (case, sources, listed) in [
+			("folder", folder, vec![dir.uuid()]),
+			("file-only", file_only, Vec::new()),
+		] {
+			let paused = plan_paused(sources).await;
+			assert!(paused.client.listed.lock().unwrap().is_empty(), "{case}");
+			assert_eq!(paused.updates.run_states(), [RunState::Paused], "{case}");
+			assert_eq!(
+				paused.updates.last_phase(),
+				CompressPhase::Scanning,
+				"{case}"
+			);
+			assert!(!paused.planned.is_finished(), "{case}");
+
+			paused.pause.send_replace(false);
+			let totals = paused.planned.await.unwrap().unwrap();
+			assert_eq!(*paused.client.listed.lock().unwrap(), listed, "{case}");
+			assert_eq!(totals.files, 1, "{case}");
+			// the plan's update is sent once resumed, never reading running before
+			assert_eq!(
+				paused.updates.run_states(),
+				[RunState::Paused, RunState::Running],
+				"{case}"
+			);
+			assert_eq!(paused.reporter.ops_in_flight(), 0, "{case}");
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_compression_cancelled_while_paused_before_it_starts_keeps_its_sources() {
+		let dir = remote_dir("docs");
+		let paused = plan_paused(CompressSources::Dispose {
+			how: SourceDisposal::Trash,
+			items: vec![NonRootItemType::Dir(Cow::Owned(dir.clone()))],
+		})
+		.await;
+		paused.cancel.send_replace(true);
+		let failed = paused.planned.await.unwrap().unwrap_err();
+
+		assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+		assert!(paused.client.listed.lock().unwrap().is_empty());
+		let [disposition] = &failed.report.dispositions[..] else {
+			panic!("one source: {:?}", failed.report.dispositions);
+		};
+		assert_eq!(disposition.uuid, dir.uuid());
+		assert!(
+			matches!(
+				disposition.outcome,
+				DisposalOutcome::Kept {
+					reason: KeptReason::Interrupted,
+					bytes_freed: 0,
+				}
+			),
+			"{:?}",
+			disposition.outcome
+		);
+		assert_eq!(
+			paused.updates.run_states(),
+			[RunState::Paused, RunState::Cancelling]
+		);
+		assert_eq!(paused.updates.last_phase(), CompressPhase::Cancelled);
 	}
 }
