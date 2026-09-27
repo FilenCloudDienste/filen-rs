@@ -10,7 +10,7 @@ use crate::util::{SeededMap, SeededSet};
 
 /// The key two names collide on. The server compares names through `hash_name`, which
 /// lowercases with [`str::to_lowercase`], so this must use exactly the same folding.
-fn collision_key(name: &str) -> String {
+pub(crate) fn collision_key(name: &str) -> String {
 	name.to_lowercase()
 }
 

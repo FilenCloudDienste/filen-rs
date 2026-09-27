@@ -25,7 +25,7 @@ use crate::{
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
-		categories::{NonRootItemType, Normal},
+		categories::{DirType, NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 		file::{
 			RemoteFile,
@@ -39,7 +39,7 @@ use crate::{
 	},
 };
 
-use super::backend::{CreatedDir, DriveBackend, UploadSpec};
+use super::backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec};
 
 /// Bytes of memory semaphore that hold `chunks` chunks.
 pub(crate) fn budget(chunks: usize) -> usize {
@@ -53,6 +53,34 @@ pub(crate) fn chunk_data(uuid: Uuid, index: u64, size: u64) -> Vec<u8> {
 	vec![fill; usize::try_from(chunk_plaintext_len(size, index)).unwrap()]
 }
 
+/// Waits until `condition` holds, panicking with `what` if it does not within a generous time.
+pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+	for _ in 0..100_000 {
+		if condition() {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	panic!("timed out waiting until {what}");
+}
+
+/// Counts one of several calls running at once, for as long as it lives.
+struct Running(Arc<AtomicUsize>);
+
+impl Running {
+	/// Counts a call in `running`, handing `peak` how many run now.
+	fn start(running: &Arc<AtomicUsize>, peak: impl FnOnce(usize)) -> Self {
+		peak(running.fetch_add(1, Ordering::SeqCst) + 1);
+		Self(Arc::clone(running))
+	}
+}
+
+impl Drop for Running {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
 pub(crate) struct FakeLock(Arc<AtomicUsize>);
 impl Drop for FakeLock {
 	fn drop(&mut self) {
@@ -64,7 +92,15 @@ impl Drop for FakeLock {
 pub(crate) struct FakeLog {
 	pub(crate) fetched: Vec<(Uuid, u64)>,
 	pub(crate) uploaded: Vec<(Uuid, u64)>,
+	/// The parent of every created directory.
+	pub(crate) dir_parents: HashMap<Uuid, Uuid>,
 	pub(crate) finished: HashMap<Uuid, (String, UploadCompletion)>,
+	/// The directory each file was registered in, kept when the file is removed later.
+	pub(crate) registered_in: HashMap<Uuid, Uuid>,
+	/// Chunk uploads that started, in order.
+	pub(crate) upload_starts: Vec<(Uuid, u64)>,
+	/// Most registrations that ran at once.
+	pub(crate) peak_finishes: usize,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
 	pub(crate) out_of_order_dirs: Vec<String>,
 	pub(crate) colored: Vec<Uuid>,
@@ -124,11 +160,17 @@ pub(crate) struct FakeBackend {
 	/// writing without the drive lock took them at the last moment).
 	pub(crate) version_of: HashMap<String, Uuid>,
 	pub(crate) lock_calls: AtomicUsize,
+	/// Registrations running now.
+	finishes: Arc<AtomicUsize>,
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
 	/// until it is cleared; `None` while the lock is free.
 	pub(crate) block_locks_from: watch::Sender<Option<usize>>,
+	/// What listing any directory returns.
+	pub(crate) listed: ListedNames,
 	/// How this backend departs from a plain drive.
 	pub(crate) quirks: HashSet<Quirk>,
+	/// Files whose chunks are these bytes instead of [`chunk_data`].
+	pub(crate) contents: HashMap<Uuid, Vec<u8>>,
 }
 
 /// Chunks of memory a [`FakeBackend`] has unless a test asks for [`FakeBackend::with_memory`].
@@ -161,8 +203,11 @@ impl FakeBackend {
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
+			finishes: Arc::default(),
 			block_locks_from: watch::Sender::new(None),
+			listed: ListedNames::default(),
 			quirks: HashSet::new(),
+			contents: HashMap::new(),
 		}
 	}
 
@@ -230,6 +275,11 @@ impl DriveBackend for FakeBackend {
 		})
 	}
 
+	async fn list_dir_names(&self, _dir: &DirType<'static, Normal>) -> Result<ListedNames, Error> {
+		tokio::time::sleep(self.delay).await;
+		Ok(self.listed.clone())
+	}
+
 	async fn create_dir_unpropagated(
 		&self,
 		parent: Uuid,
@@ -258,9 +308,10 @@ impl DriveBackend for FakeBackend {
 			self.log().out_of_order_dirs.push(name.as_ref().to_owned());
 		}
 		self.known_dirs.lock().unwrap().insert(uuid);
-		self.log()
-			.created_dirs
-			.push((uuid, name.as_ref().to_owned()));
+		let mut log = self.log();
+		log.created_dirs.push((uuid, name.as_ref().to_owned()));
+		log.dir_parents.insert(uuid, parent);
+		drop(log);
 		Ok(CreatedDir::Created(RemoteDirectory::new_from_parts(
 			uuid,
 			DecryptedDirectoryMeta {
@@ -324,6 +375,10 @@ impl DriveBackend for FakeBackend {
 			return Err(Error::custom(*kind, "fetch failed"));
 		}
 		self.log().fetched.push((file.uuid(), index));
+		if let Some(contents) = self.contents.get(&file.uuid()) {
+			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
+			return Ok(contents[start..(start + CHUNK_SIZE).min(contents.len())].to_vec());
+		}
 		let mut data = chunk_data(file.uuid(), index, file.size());
 		if self.short_reads.contains(&name) && index + 1 == file.size().div_ceil(CHUNK_SIZE_U64) {
 			data.pop();
@@ -338,6 +393,7 @@ impl DriveBackend for FakeBackend {
 		data: Vec<u8>,
 	) -> Result<RemoteFileInfo, Error> {
 		let name = upload.spec.name.as_ref();
+		self.log().upload_starts.push((upload.spec.uuid, index));
 		if self.blocked_uploads.contains(name) {
 			std::future::pending::<()>().await;
 		}
@@ -370,6 +426,10 @@ impl DriveBackend for FakeBackend {
 			self.live_locks.load(Ordering::SeqCst) > 0,
 			"finalizing holds the drive lock"
 		);
+		let _running = Running::start(&self.finishes, |running| {
+			let mut log = self.log();
+			log.peak_finishes = log.peak_finishes.max(running);
+		});
 		if let Some(delay) = self.slow_finish.get(name.as_ref()) {
 			self.log().finishing.push(name.as_ref().to_owned());
 			tokio::time::sleep(*delay).await;
@@ -388,6 +448,9 @@ impl DriveBackend for FakeBackend {
 		self.log()
 			.finished
 			.insert(upload.spec.uuid, (name.as_ref().to_owned(), completion));
+		self.log()
+			.registered_in
+			.insert(upload.spec.uuid, upload.spec.parent);
 		let stable_uuid = self
 			.version_of
 			.get(name.as_ref())

@@ -5,12 +5,14 @@
 //! The vocabulary the archive jobs share with copying (their control, sources, plan records,
 //! counts and run state) is exported from [`fs::copy`](crate::fs::copy), where it first shipped.
 
-// The archive modules land one tested piece at a time, ahead of the extract engine that ties
-// them together; until then their items have no production caller.
-#![allow(dead_code)]
-
+pub(crate) mod config;
 pub(crate) mod decode;
 pub(crate) mod entry_path;
+pub mod extract;
 pub(crate) mod format;
 pub(crate) mod limits;
+pub(crate) mod names;
 pub(crate) mod tar_iter;
+pub(crate) mod worker;
+
+pub use config::ArchiveConfig;
