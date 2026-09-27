@@ -95,8 +95,12 @@ pub struct ExtractConfig {
 	pub max_items: Option<u64>,
 	/// `None` turns the check off.
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// For an archive with encrypted entries. Checked before anything is created, on the
-	/// smallest encrypted entry.
+	/// For an archive with encrypted entries. Checked before anything is created on a 7z's
+	/// encrypted header, or else by reading the encrypted entry quickest to read in full, when
+	/// that takes at most 16 MiB of the archive. Otherwise it is checked as entries are
+	/// extracted: a wrong password found then fails the job with
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind), and the folders created so far,
+	/// which hold no file yet, go to the trash.
 	pub password: Option<ArchivePassword>,
 }
 

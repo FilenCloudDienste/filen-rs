@@ -33,12 +33,19 @@ impl Client {
 	/// end-to-end encrypted), so the archive is downloaded and decoded here, and every entry is
 	/// encrypted and uploaded as a new item.
 	///
-	/// Reads tars (bare, or compressed with gzip, bzip2, xz, LZMA, lzip, lz4 or brotli) and
-	/// single compressed files, front to back, extracting each entry as it is read: no entry is
-	/// known before it is reached. Links, devices and entries whose paths climb out of the
-	/// destination are skipped and reported. Names taken in their directory get keep-both names.
+	/// Reads:
+	/// - tars, bare or compressed with gzip, bzip2, xz, LZMA, lzip, lz4 or brotli, and single
+	///   compressed files: front to back, each entry extracted as it is read, none known before
+	///   it is reached;
+	/// - zips (stored, Deflate, Deflate64, bzip2, LZMA, XZ; ZipCrypto or AES encrypted) and 7z
+	///   archives (LZMA, LZMA2, PPMd, bzip2, Deflate(64), the branch and delta filters; AES
+	///   encrypted, headers included): from their index, entry by entry, each checked against
+	///   the checksum the archive lists for it.
 	///
-	/// One archive job runs at a time per [`ArchiveConfig::job_concurrency`]; a later one waits,
+	/// Links, devices and entries whose paths climb out of the destination are skipped and
+	/// reported. Names taken in their directory get keep-both names.
+	///
+	/// Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once; a later one waits,
 	/// reporting [`ExtractPhase::WaitingForWorker`](super::ExtractPhase::WaitingForWorker). It
 	/// reports its progress to `callback` and can be paused, resumed and cancelled through
 	/// `control`. A failed entry does not stop the others; a damaged archive, running out of

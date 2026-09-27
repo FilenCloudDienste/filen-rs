@@ -78,8 +78,8 @@ pub struct ArchiveEntryId {
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ArchiveTotals {
-	/// An archive read front to back, whose entries are only known as they come: progress is
-	/// how much of the archive has been read.
+	/// Progress is how much of the archive has been read, for every format: a tar's entries
+	/// are only known as they come, and a zip's or 7z's entry counts are not reported.
 	Streaming { archive_bytes: u64 },
 }
 
