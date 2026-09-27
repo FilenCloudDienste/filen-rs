@@ -76,7 +76,7 @@ impl SevenZMethod {
 		match self {
 			Self::Copy => 0,
 			Self::Lzma2 { level } | Self::Lzma { level } => {
-				u64::from(lzma_rust2::LzmaOptions::with_preset(level).get_memory_usage()) * 1024
+				crate::fs::archive::encode::lzma_encoder_memory(level)
 			}
 			Self::Ppmd { level } => u64::from(ppmd_memory(level)) + (1 << 20),
 			// bzip2's documented compression memory: 400 kB + 8 × the block size

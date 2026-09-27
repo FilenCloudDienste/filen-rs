@@ -2,6 +2,8 @@
 //! run on the server (items are end-to-end encrypted), so an archive's codec runs in the SDK:
 //! entries are downloaded and decrypted, (de)compressed, then encrypted and uploaded.
 
+#[cfg(test)]
+pub(crate) mod alloc_meter;
 pub mod compress;
 pub(crate) mod config;
 pub(crate) mod decode;

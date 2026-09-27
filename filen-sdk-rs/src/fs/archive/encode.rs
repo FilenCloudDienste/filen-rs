@@ -3,12 +3,12 @@
 //! encoder's memory is known before it is built, so a job can refuse a level its budget cannot
 //! hold instead of running out of memory.
 
-use filen_macros::js_type;
 use std::{
 	io::{self, Write},
 	ops::RangeInclusive,
 };
 
+use filen_macros::js_type;
 use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
 use lzma_rust2::{LzipOptions, LzipWriter, LzmaOptions, LzmaWriter, XzOptions, XzWriter};
 
@@ -75,24 +75,30 @@ impl Compression {
 			StreamCodec::Gzip => ENCODER_SLACK_BYTES,
 			// bzip2's documented compression memory: 400 kB + 8 × the block size
 			StreamCodec::Bzip2 => 400_000 + 8 * u64::from(level) * 100_000,
-			StreamCodec::Xz | StreamCodec::Lzma | StreamCodec::Lzip => {
-				u64::from(LzmaOptions::with_preset(level).get_memory_usage()) * 1024
-					+ ENCODER_SLACK_BYTES
-			}
+			StreamCodec::Xz | StreamCodec::Lzma | StreamCodec::Lzip => lzma_encoder_memory(level),
 			// an input and an output block, and a small hash table
 			StreamCodec::Lz4 => 2 * LZ4_BLOCK_BYTES + ENCODER_SLACK_BYTES,
-			// An estimate: the ring buffer and its hash tables, more at the tree-hashing
-			// qualities (10 and 11). Upper bounds, not measurements.
+			// The ring buffer and hash tables of a 4 MiB window, measured over the qualities
+			// (see the test): at most 29 MiB up to 8, 48 MiB at 9 and 64 MiB at 10 and 11,
+			// stated with a quarter or more to spare.
 			StreamCodec::Brotli => {
 				let window = 1u64 << BROTLI_LGWIN;
-				if level >= 10 {
-					12 * window
-				} else {
-					4 * window + (16 << 20)
+				match level {
+					0..=8 => 9 * window,
+					9 => 15 * window,
+					_ => 20 * window,
 				}
 			}
 		})
 	}
+}
+
+/// An LZMA encoder's memory at `preset`, the same for LZMA-alone, lzip, xz and 7z's LZMA and
+/// LZMA2. lzma-rust2's own figure is not in the unit it states (it overshoots the real use about
+/// 140 times), so this is from measurement: the peak is 8 to 11.7 times the dictionary over
+/// the presets (the binary-tree match finders of 4 and up take the most).
+pub(crate) fn lzma_encoder_memory(preset: u32) -> u64 {
+	12 * u64::from(LzmaOptions::with_preset(preset).dict_size) + ENCODER_SLACK_BYTES
 }
 
 /// An encoder over the sink `W`; [`StreamEncoder::finish`] ends the stream and gives the sink
@@ -286,5 +292,73 @@ mod tests {
 		assert!(memory(StreamCodec::Xz, 0) < memory(StreamCodec::Xz, 6));
 		assert!(memory(StreamCodec::Xz, 6) < memory(StreamCodec::Xz, 9));
 		assert!(memory(StreamCodec::Brotli, 9) < memory(StreamCodec::Brotli, 11));
+	}
+
+	/// Input for the memory tests: text-like runs and noise, so the encoders' match finders
+	/// and entropy coders both work.
+	fn mixed_input(len: usize) -> Vec<u8> {
+		let mut state = 0x2545_F491_4F6C_DD1Du64;
+		(0..len)
+			.map(|i| {
+				if (i / 4096) % 2 == 0 {
+					b"the quick brown fox jumps over the lazy dog "[i % 44]
+				} else {
+					state ^= state << 13;
+					state ^= state >> 7;
+					state ^= state << 17;
+					state as u8
+				}
+			})
+			.collect()
+	}
+
+	/// Encodes 2 MiB at each of `levels` (`None` for lz4, which has none), checking the heap the
+	/// encoder took against what it states. A 10 MiB input measures the same: the peaks are
+	/// bound by the dictionary or window, not the input.
+	fn check_encoder_memory(codec: StreamCodec, levels: &[Option<u32>]) {
+		let input = mixed_input(2 << 20);
+		for &level in levels {
+			let compression = Compression { codec, level };
+			let stated = compression.encoder_memory().unwrap();
+			let (_, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+				let mut encoder = open_encoder(compression, io::sink()).unwrap();
+				encoder.write_all(&input).unwrap();
+				encoder.finish().unwrap();
+			});
+			assert!(
+				peak <= stated,
+				"{codec:?} at level {level:?} took {peak} bytes, stating {stated}"
+			);
+		}
+	}
+
+	fn levels(range: std::ops::RangeInclusive<u32>) -> Vec<Option<u32>> {
+		range.map(Some).collect()
+	}
+
+	#[test]
+	fn deflate_bzip2_and_lz4_stay_within_their_stated_memory() {
+		check_encoder_memory(StreamCodec::Gzip, &levels(1..=9));
+		check_encoder_memory(StreamCodec::Bzip2, &levels(1..=9));
+		check_encoder_memory(StreamCodec::Lz4, &[None]);
+	}
+
+	#[test]
+	fn lzma_encoders_stay_within_their_stated_memory() {
+		// 7 to 9 take 185 to 673 MiB, too much for a test run; they measured 11.5, 11.5 and
+		// 10.5 times their dictionaries, within the stated 12
+		for codec in [StreamCodec::Xz, StreamCodec::Lzma, StreamCodec::Lzip] {
+			check_encoder_memory(codec, &levels(0..=6));
+		}
+	}
+
+	#[test]
+	fn brotli_stays_within_its_stated_memory() {
+		check_encoder_memory(StreamCodec::Brotli, &levels(0..=9));
+	}
+
+	#[test]
+	fn brotli_at_its_tree_qualities_stays_within_its_stated_memory() {
+		check_encoder_memory(StreamCodec::Brotli, &levels(10..=11));
 	}
 }

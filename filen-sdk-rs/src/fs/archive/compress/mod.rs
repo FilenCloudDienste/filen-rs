@@ -274,4 +274,55 @@ mod tests {
 			7_600_000
 		);
 	}
+
+	#[test]
+	fn every_formats_default_fits_the_smallest_codec_budget() {
+		// iOS and wasm budget 128 MiB for a job's codec
+		const SMALLEST_BUDGET: u64 = 128 << 20;
+		let codecs = [
+			StreamCodec::Gzip,
+			StreamCodec::Bzip2,
+			StreamCodec::Xz,
+			StreamCodec::Lzma,
+			StreamCodec::Lzip,
+			StreamCodec::Lz4,
+			StreamCodec::Brotli,
+		];
+		let mut formats: Vec<CompressFormat> = codecs
+			.iter()
+			.flat_map(|&codec| {
+				[
+					CompressFormat::Tar {
+						compression: Some(compression(codec)),
+					},
+					CompressFormat::Single {
+						compression: compression(codec),
+					},
+				]
+			})
+			.collect();
+		formats.push(CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		});
+		for method in [
+			SevenZMethod::Lzma2 { level: 6 },
+			SevenZMethod::Lzma { level: 6 },
+			SevenZMethod::Ppmd { level: 6 },
+			SevenZMethod::Bzip2 { level: 9 },
+		] {
+			formats.push(CompressFormat::SevenZ {
+				method,
+				solid: true,
+				encryption: None,
+			});
+		}
+		for format in formats {
+			let memory = format.encoder_memory().unwrap();
+			assert!(
+				memory <= SMALLEST_BUDGET,
+				"{format:?} states {memory} bytes"
+			);
+		}
+	}
 }
