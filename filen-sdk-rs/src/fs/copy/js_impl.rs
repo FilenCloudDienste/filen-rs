@@ -32,7 +32,7 @@ use crate::{
 // CopyFailure) are written out as `super::X`.
 use super::{
 	ActiveFile, CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyRequest,
-	CopySource, CopySourceDir, CopyStage, FailedSource, FailureInfo, ItemCounts, JobControl,
+	CopyStage, FailedSource, FailureInfo, ItemCounts, ItemSource, ItemSourceDir, JobControl,
 	PlanTotals, PlannedTopLevelItem, RenameReason, RenamedEntry, RunState, ScanProgress,
 	SkippedEntry,
 };
@@ -197,7 +197,7 @@ pub struct CopyReport {
 	pub error: Option<CopyError>,
 }
 
-impl TryFrom<AnyItemWithContext> for CopySource {
+impl TryFrom<AnyItemWithContext> for ItemSource {
 	type Error = Error;
 
 	fn try_from(item: AnyItemWithContext) -> Result<Self, Error> {
@@ -205,7 +205,7 @@ impl TryFrom<AnyItemWithContext> for CopySource {
 			AnyItemWithContext::File(file) => Self::File(RemoteFileType::try_from(file)?),
 			AnyItemWithContext::Dir(dir) => Self::Dir(match DirByCategoryWithContext::from(dir) {
 				DirByCategoryWithContext::Normal(DirType::Dir(dir)) => {
-					CopySourceDir::Normal(dir.into_owned())
+					ItemSourceDir::Normal(dir.into_owned())
 				}
 				DirByCategoryWithContext::Normal(DirType::Root(_)) => {
 					return Err(Error::custom(
@@ -213,9 +213,9 @@ impl TryFrom<AnyItemWithContext> for CopySource {
 						"the root directory cannot be copied",
 					));
 				}
-				DirByCategoryWithContext::Shared(dir, role) => CopySourceDir::Shared(dir, role),
+				DirByCategoryWithContext::Shared(dir, role) => ItemSourceDir::Shared(dir, role),
 				DirByCategoryWithContext::Linked(dir, link) => {
-					CopySourceDir::Linked(dir, link.try_into()?)
+					ItemSourceDir::Linked(dir, link.try_into()?)
 				}
 			}),
 		})
@@ -227,16 +227,16 @@ impl From<FailedSource> for AnyItemWithContext {
 		match source {
 			FailedSource::File(file) => Self::File(AnyFile::from(*file)),
 			FailedSource::Dir(dir) => Self::Dir(match dir {
-				CopySourceDir::Normal(dir) => {
+				ItemSourceDir::Normal(dir) => {
 					AnyDirWithContext::Normal(AnyNormalDir::Dir(dir.into()))
 				}
-				CopySourceDir::Shared(dir, role) => {
+				ItemSourceDir::Shared(dir, role) => {
 					AnyDirWithContext::Shared(AnySharedDirWithContext {
 						dir: dir.into(),
 						share_info: role,
 					})
 				}
-				CopySourceDir::Linked(dir, link) => {
+				ItemSourceDir::Linked(dir, link) => {
 					AnyDirWithContext::Linked(AnyLinkedDirWithContext {
 						dir: dir.into(),
 						link: link.into(),
@@ -860,15 +860,15 @@ mod tests {
 		)
 	}
 
-	fn failure_source(item: AnyItemWithContext) -> CopySource {
-		CopySource::try_from(item).expect("a failed item is a copy source again")
+	fn failure_source(item: AnyItemWithContext) -> ItemSource {
+		ItemSource::try_from(item).expect("a failed item is a copy source again")
 	}
 
 	#[test]
 	fn a_failed_file_is_a_copy_source_again() {
 		let source = file();
 		let item = AnyItemWithContext::from(FailedSource::File(Box::new(source.clone())));
-		let CopySource::File(copied) = failure_source(item) else {
+		let ItemSource::File(copied) = failure_source(item) else {
 			panic!("a file");
 		};
 		assert_eq!(copied.uuid(), source.uuid());
@@ -879,8 +879,8 @@ mod tests {
 	fn a_failed_directory_is_a_copy_source_again() {
 		let source = dir();
 		let item =
-			AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Normal(source.clone())));
-		let CopySource::Dir(CopySourceDir::Normal(copied)) = failure_source(item) else {
+			AnyItemWithContext::from(FailedSource::Dir(ItemSourceDir::Normal(source.clone())));
+		let ItemSource::Dir(ItemSourceDir::Normal(copied)) = failure_source(item) else {
 			panic!("a directory of the user's drive");
 		};
 		assert_eq!(copied.uuid(), source.uuid());
@@ -893,13 +893,13 @@ mod tests {
 			email: "sharer@example.com".to_owned(),
 			id: 7,
 		});
-		let item = AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Shared(
+		let item = AnyItemWithContext::from(FailedSource::Dir(ItemSourceDir::Shared(
 			DirType::Dir(Cow::Owned(SharedDirectory {
 				inner: shared.clone(),
 			})),
 			role.clone(),
 		)));
-		let CopySource::Dir(CopySourceDir::Shared(dir_back, role_back)) = failure_source(item)
+		let ItemSource::Dir(ItemSourceDir::Shared(dir_back, role_back)) = failure_source(item)
 		else {
 			panic!("a shared directory");
 		};
@@ -914,11 +914,11 @@ mod tests {
 			enable_download: true,
 			salt: LinkPasswordSalt::None,
 		};
-		let item = AnyItemWithContext::from(FailedSource::Dir(CopySourceDir::Linked(
+		let item = AnyItemWithContext::from(FailedSource::Dir(ItemSourceDir::Linked(
 			DirType::Dir(Cow::Owned(LinkedDirectory(linked.clone()))),
 			link.clone(),
 		)));
-		let CopySource::Dir(CopySourceDir::Linked(dir_back, link_back)) = failure_source(item)
+		let ItemSource::Dir(ItemSourceDir::Linked(dir_back, link_back)) = failure_source(item)
 		else {
 			panic!("a directory in a public link");
 		};
@@ -931,7 +931,7 @@ mod tests {
 		let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(
 			Root::from(RootDirectory::new(Uuid::new_v4())),
 		)));
-		let error = CopySource::try_from(root).unwrap_err();
+		let error = ItemSource::try_from(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 

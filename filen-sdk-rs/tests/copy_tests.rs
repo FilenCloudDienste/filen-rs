@@ -12,8 +12,8 @@ use filen_sdk_rs::{
 		HasName, HasParent, HasRemoteInfo, HasUUID,
 		categories::{DirType, NonRootItemType},
 		copy::{
-			CopyConfig, CopyEvent, CopyFailed, CopyPhase, CopyRequest, CopySource, CopySourceDir,
-			CopyStage, JobControl, PlanTotals,
+			CopyConfig, CopyEvent, CopyFailed, CopyPhase, CopyRequest, CopyStage, ItemSource,
+			ItemSourceDir, JobControl, PlanTotals,
 		},
 		dir::RemoteDirectory,
 		file::{
@@ -58,7 +58,7 @@ async fn copy_tree_keeps_contents_and_metadata() {
 	let report = client
 		.clone()
 		.copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))],
 			destination.clone().into(),
 			CopyConfig::default(),
 			recorder.clone(),
@@ -116,7 +116,7 @@ async fn copying_into_the_same_parent_keeps_both() {
 	for expected in ["a (1).txt", "a (2).txt"] {
 		let report = copy(
 			&client,
-			vec![CopySource::File(file.clone().into())],
+			vec![ItemSource::File(file.clone().into())],
 			test_dir,
 		)
 		.await
@@ -140,7 +140,7 @@ async fn copying_a_directory_into_itself_is_rejected() {
 	for destination in [&source, &sub] {
 		let CopyFailed { error, .. } = copy(
 			&client,
-			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))],
 			destination,
 		)
 		.await
@@ -183,7 +183,7 @@ async fn copy_completes_on_a_small_memory_budget() {
 		originals
 			.iter()
 			.cloned()
-			.map(|f| CopySource::File(f.into()))
+			.map(|f| ItemSource::File(f.into()))
 			.collect(),
 		&destination,
 	)
@@ -212,7 +212,7 @@ async fn copy_from_a_public_link_into_a_linked_directory() {
 	upload(&client, &source, "inside.txt", b"linked content").await;
 	let source_link = dir_link_info(&client, &source).await;
 	let linked_source = || {
-		CopySource::Dir(CopySourceDir::Linked(
+		ItemSource::Dir(ItemSourceDir::Linked(
 			DirType::Root(Cow::Owned(source_link.root.clone())),
 			source_link.link.clone(),
 		))
@@ -283,7 +283,7 @@ async fn cancel_ends_the_copy_and_reports_what_was_created() {
 	let CopyFailed { report, error } = client
 		.clone()
 		.copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source))],
 			destination.clone().into(),
 			CopyConfig::default(),
 			SignalOnCreate {
@@ -373,7 +373,7 @@ async fn copies_from_public_links() {
 	// without the password the listing is refused and nothing is created
 	let CopyFailed { error, .. } = copy(
 		&client,
-		vec![CopySource::Dir(CopySourceDir::Linked(
+		vec![ItemSource::Dir(ItemSourceDir::Linked(
 			DirType::Root(Cow::Owned(info.root.clone())),
 			info.link.clone(),
 		))],
@@ -400,11 +400,11 @@ async fn copies_from_public_links() {
 	let report = copy(
 		&client,
 		vec![
-			CopySource::Dir(CopySourceDir::Linked(
+			ItemSource::Dir(ItemSourceDir::Linked(
 				DirType::Dir(Cow::Owned(sub_linked)),
 				link,
 			)),
-			CopySource::File(linked_file),
+			ItemSource::File(linked_file),
 		],
 		&destination,
 	)
@@ -436,7 +436,7 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 	upload(&client, &second, "renamed.txt", b"already here").await;
 
 	let request =
-		|source: CopySource, destination: &RemoteDirectory, name: Option<&str>| CopyRequest {
+		|source: ItemSource, destination: &RemoteDirectory, name: Option<&str>| CopyRequest {
 			source,
 			destination: destination.clone().into(),
 			name: name.map(|name| ValidatedName::try_from(name).unwrap()),
@@ -445,19 +445,19 @@ async fn copy_items_to_takes_a_destination_and_name_per_request() {
 		.clone()
 		.copy_items_to(
 			vec![
-				request(CopySource::File(file.clone().into()), &first, None),
+				request(ItemSource::File(file.clone().into()), &first, None),
 				request(
-					CopySource::File(file.clone().into()),
+					ItemSource::File(file.clone().into()),
 					&second,
 					Some("renamed.txt"),
 				),
 				request(
-					CopySource::Dir(CopySourceDir::Normal(dir.clone())),
+					ItemSource::Dir(ItemSourceDir::Normal(dir.clone())),
 					&second,
 					Some("dir copy"),
 				),
 				// the same source into the same place again
-				request(CopySource::File(file.clone().into()), &first, None),
+				request(ItemSource::File(file.clone().into()), &first, None),
 			],
 			CopyConfig::default(),
 			Arc::new(Recorder::default()),
@@ -500,7 +500,7 @@ async fn copies_into_the_drive_root() {
 	let result = client
 		.clone()
 		.copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source))],
 			client.root().clone().into(),
 			CopyConfig::default(),
 			Arc::new(Recorder::default()),
@@ -553,8 +553,8 @@ async fn names_clash_the_way_the_server_compares_them() {
 	let report = copy(
 		&client,
 		vec![
-			CopySource::File(lower.into()),
-			CopySource::File(umlaut.into()),
+			ItemSource::File(lower.into()),
+			ItemSource::File(umlaut.into()),
 		],
 		&destination,
 	)
@@ -569,7 +569,7 @@ async fn names_clash_the_way_the_server_compares_them() {
 	assert!(names.contains(&"äbc (1).txt".to_owned()), "{names:?}");
 
 	// a name at the byte limit, copied next to itself, is shortened to fit its counter
-	let report = copy(&client, vec![CopySource::File(long.into())], &source)
+	let report = copy(&client, vec![ItemSource::File(long.into())], &source)
 		.await
 		.unwrap();
 	let copied = report.top_level[0].item.name().unwrap().to_owned();
@@ -644,7 +644,7 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 
 	let report = copy(
 		&client,
-		vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+		vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))],
 		&destination,
 	)
 	.await
@@ -699,7 +699,7 @@ async fn a_copy_cancelled_before_it_starts_creates_nothing() {
 	let CopyFailed { error, .. } = client
 		.clone()
 		.copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source))],
 			destination.clone().into(),
 			CopyConfig::default(),
 			recorder.clone(),
@@ -746,7 +746,7 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 		async move {
 			client
 				.copy_items(
-					vec![CopySource::Dir(CopySourceDir::Normal(source))],
+					vec![ItemSource::Dir(ItemSourceDir::Normal(source))],
 					destination.into(),
 					CopyConfig::default(),
 					Arc::new(Recorder::default()),
@@ -810,8 +810,8 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 		.clone()
 		.copy_items(
 			vec![
-				CopySource::File(kept.clone().into()),
-				CopySource::File(RemoteFileType::File(Cow::Owned(missing))),
+				ItemSource::File(kept.clone().into()),
+				ItemSource::File(RemoteFileType::File(Cow::Owned(missing))),
 			],
 			destination.clone().into(),
 			CopyConfig::default(),
@@ -840,7 +840,7 @@ async fn a_failed_file_is_reported_with_its_parent_and_can_be_retried_there() {
 		.clone()
 		.copy_items_to(
 			vec![CopyRequest {
-				source: CopySource::File(real.clone().into()),
+				source: ItemSource::File(real.clone().into()),
 				destination: failure.info.dest_parent_dir.clone(),
 				name: Some(ValidatedName::try_from(failure.info.dest_name.as_str()).unwrap()),
 			}],
@@ -868,7 +868,7 @@ async fn max_bytes_is_checked_before_anything_is_written() {
 		.unwrap();
 	let copy_with = |max_bytes: u64, recorder: Arc<Recorder>| {
 		client.clone().copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source.clone()))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))],
 			destination.clone().into(),
 			CopyConfig {
 				max_bytes: Some(max_bytes),
@@ -926,7 +926,7 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 	client
 		.clone()
 		.copy_items(
-			vec![CopySource::Dir(CopySourceDir::Normal(source))],
+			vec![ItemSource::Dir(ItemSourceDir::Normal(source))],
 			destination.clone().into(),
 			CopyConfig::default(),
 			recorder.clone(),
@@ -944,7 +944,7 @@ async fn missing_sources_and_destinations_fail_before_anything_is_created() {
 	let file = upload(&client, test_dir, "a.txt", b"nowhere to go").await;
 	let gone = client.create_dir(&test_dir.into(), "gone").await.unwrap();
 	client.delete_dir_permanently(gone.clone()).await.unwrap();
-	let failed = copy(&client, vec![CopySource::File(file.into())], &gone)
+	let failed = copy(&client, vec![ItemSource::File(file.into())], &gone)
 		.await
 		.expect_err("a deleted destination fails the copy");
 	assert!(failed.report.top_level.is_empty());
@@ -999,8 +999,8 @@ async fn undecryptable_entries_are_renamed_or_skipped() {
 	let report = copy(
 		&client,
 		vec![
-			CopySource::Dir(CopySourceDir::Normal(source)),
-			CopySource::File(clash.into()),
+			ItemSource::Dir(ItemSourceDir::Normal(source)),
+			ItemSource::File(clash.into()),
 		],
 		&destination,
 	)

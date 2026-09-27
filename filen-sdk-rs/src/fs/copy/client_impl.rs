@@ -1,67 +1,35 @@
 //! The public copy API on [`Client`]: scans the sources and destinations, plans the copy, and
 //! runs it.
 
-use std::{
-	borrow::Cow,
-	sync::{
-		Arc,
-		atomic::{AtomicU64, Ordering},
-	},
-};
-
-use filen_types::{
-	fs::{ParentUuid, Uuid},
-	traits::CowHelpers,
-};
+use std::sync::Arc;
 
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
-	connect::{DirPublicLink, fs::SharingRole},
-	consts::CALLBACK_INTERVAL,
 	fs::{
-		HasName, HasParent, HasUUID,
-		categories::{DirType, Linked, Normal, Shared, fs::CategoryFS},
-		dir::{
-			RemoteDirectory,
-			traits::{HasDirInfo, HasRemoteDirInfo},
+		HasName, HasUUID,
+		categories::{DirType, Normal, fs::CategoryFS},
+		drive_job::{
+			backend::ClientBackend,
+			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
+			plan::{ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlanTotals},
 		},
-		drive_job::backend::ClientBackend,
-		file::enums::RemoteFileType,
 		name::ValidatedName,
 	},
-	job::{JobControl, Stopped},
-	util::{MaybeArc, sleep},
+	job::JobControl,
+	util::MaybeArc,
 };
 
 use super::{
 	CopyFailed, CopyReport,
 	engine::run_copy,
-	plan::{CopyPlan, CopyPlanner, Listed, PlanRequest, PlanSource, PlanTotals, SourceDir},
-	report::{CopyCallback, CopyPhase, Reporter, ScanProgress},
+	report::{CopyCallback, CopyPhase, Reporter},
 };
-
-/// A directory to copy, with what is needed to list it.
-#[derive(Debug, Clone)]
-pub enum CopySourceDir {
-	/// One of the user's own directories.
-	Normal(RemoteDirectory),
-	/// A directory shared with (or by) the user.
-	Shared(DirType<'static, Shared>, SharingRole),
-	/// A directory in a public link.
-	Linked(DirType<'static, Linked>, DirPublicLink),
-}
-
-#[derive(Debug, Clone)]
-pub enum CopySource {
-	File(RemoteFileType<'static>),
-	Dir(CopySourceDir),
-}
 
 /// One item to copy and where to put it.
 #[derive(Debug, Clone)]
 pub struct CopyRequest {
-	pub source: CopySource,
+	pub source: ItemSource,
 	/// An existing directory of the user's own drive.
 	pub destination: DirType<'static, Normal>,
 	/// The name to give the copy instead of the source's. Either way, a name already taken at
@@ -78,129 +46,12 @@ pub struct CopyConfig {
 	pub max_bytes: Option<u64>,
 }
 
-/// The source directory for the root of a listing that can start at a category root; `handle`
-/// takes the root to address it again.
-fn root_source_dir<Cat>(
-	root: DirType<'static, Cat>,
-	handle: impl FnOnce(DirType<'static, Cat>) -> CopySourceDir,
-) -> SourceDir<CopySourceDir>
-where
-	Cat: CategoryFS,
-	Cat::Root: HasName + HasDirInfo + HasRemoteDirInfo,
-	Cat::Dir: HasRemoteDirInfo,
-{
-	match root {
-		DirType::Root(root) => {
-			let color = root.color().into_owned_cow();
-			SourceDir::new(root.into_owned(), color, |root| {
-				handle(DirType::Root(Cow::Owned(root)))
-			})
-		}
-		DirType::Dir(dir) => {
-			let color = dir.color().into_owned_cow();
-			SourceDir::new(dir.into_owned(), color, |dir| {
-				handle(DirType::Dir(Cow::Owned(dir)))
-			})
-		}
-	}
-}
-
-/// Bytes of listing responses received by earlier sources, and by the one being listed.
-#[derive(Default)]
-struct ListingBytes {
-	done: AtomicU64,
-	current: AtomicU64,
-	/// `u64::MAX` while unknown.
-	current_total: AtomicU64,
-}
-
-impl ListingBytes {
-	fn scan(&self, sources_done: u64, sources_total: u64) -> ScanProgress {
-		let done = self.done.load(Ordering::Relaxed);
-		let current = self.current.load(Ordering::Relaxed);
-		let total = self.current_total.load(Ordering::Relaxed);
-		ScanProgress {
-			sources_done,
-			sources_total,
-			listing_bytes: done + current,
-			listing_total_bytes: (total != u64::MAX).then(|| done + total),
-		}
-	}
-
-	fn next_source(&self) {
-		let current = self.current.swap(0, Ordering::Relaxed);
-		self.done.fetch_add(current, Ordering::Relaxed);
-		self.current_total.store(u64::MAX, Ordering::Relaxed);
-	}
-}
-
-/// The directories and files below a source directory.
-type Listing = (
-	Vec<Listed<SourceDir<CopySourceDir>>>,
-	Vec<Listed<RemoteFileType<'static>>>,
-);
-
-/// The directory a listed entry is in. The planner keys entries by directory uuid; an entry
-/// listed under anything else is left out, and logged.
-fn listed_parent(uuid: Uuid, parent: ParentUuid) -> Option<Uuid> {
-	let ParentUuid::Uuid(parent) = parent else {
-		tracing::warn!(
-			"copy: leaving out listed entry {uuid}, whose parent {parent:?} is not a directory"
-		);
-		return None;
-	};
-	Some(parent)
-}
-
-/// Lists `root` recursively. `handle_of` takes a listed directory to address it again for a
-/// retry.
-async fn list_source<Cat>(
-	client: &Cat::Client,
-	root: &DirType<'_, Cat>,
-	context: Cat::ListDirContext<'_>,
-	handle_of: impl Fn(Cat::Dir) -> CopySourceDir,
-	bytes: &ListingBytes,
-) -> Result<Listing, Error>
-where
-	Cat: CategoryFS,
-	Cat::Dir: HasRemoteDirInfo,
-	RemoteFileType<'static>: From<Cat::File>,
-{
-	let progress = |received: u64, total: Option<u64>| {
-		bytes.current.store(received, Ordering::Relaxed);
-		bytes
-			.current_total
-			.store(total.unwrap_or(u64::MAX), Ordering::Relaxed);
-	};
-	let (dirs, files) = Cat::list_dir_recursive(client, root, Some(&progress), context).await?;
-	let dirs = dirs
-		.into_iter()
-		.filter_map(|dir| {
-			let parent = listed_parent(dir.uuid(), *dir.parent())?;
-			let color = dir.color().into_owned_cow();
-			let item = SourceDir::new(dir, color, &handle_of);
-			Some(Listed { parent, item })
-		})
-		.collect();
-	let files = files
-		.into_iter()
-		.filter_map(|file| {
-			let parent = listed_parent(file.uuid(), *file.parent())?;
-			Some(Listed {
-				parent,
-				item: RemoteFileType::from(file),
-			})
-		})
-		.collect();
-	Ok((dirs, files))
-}
-
 impl Client {
 	/// Copies `sources` into `destination`, keeping both when a name is taken there.
 	/// See [`copy_items_to`](Self::copy_items_to).
 	pub async fn copy_items(
 		self: Arc<Self>,
-		sources: Vec<CopySource>,
+		sources: Vec<ItemSource>,
 		destination: DirType<'static, Normal>,
 		config: CopyConfig,
 		callback: impl CopyCallback,
@@ -256,10 +107,10 @@ impl Client {
 		requests: Vec<CopyRequest>,
 		reporter: &MaybeArc<Reporter>,
 		control: &JobControl,
-	) -> Result<(CopyPlanner, Vec<PlanRequest<CopySourceDir>>), ScanError> {
+	) -> Result<(ItemPlanner, Vec<PlanRequest<ItemSourceDir>>), ScanError> {
 		let dir_sources = requests
 			.iter()
-			.filter(|r| matches!(r.source, CopySource::Dir(_)))
+			.filter(|r| matches!(r.source, ItemSource::Dir(_)))
 			.count() as u64;
 		let mut destinations: Vec<DirType<'static, Normal>> = Vec::new();
 		for request in &requests {
@@ -276,12 +127,13 @@ impl Client {
 		let report = |sources_done| reporter.set_scan(bytes.scan(sources_done, sources_total));
 		report(sources_done);
 
-		let mut planner = CopyPlanner::default();
+		let ops = reporter.ops();
+		let mut planner = ItemPlanner::default();
 		for destination in destinations {
 			reporter.checkpoint(control).await?;
 			let listed = watch_listing(
 				Normal::list_dir(self, &destination, None::<&fn(u64, Option<u64>)>, ()),
-				reporter,
+				&ops,
 				control,
 				|| report(sources_done),
 			);
@@ -301,12 +153,12 @@ impl Client {
 		let mut planned = Vec::with_capacity(requests.len());
 		for request in requests {
 			let source = match request.source {
-				CopySource::File(file) => PlanSource::File(file),
-				CopySource::Dir(dir) => {
+				ItemSource::File(file) => PlanSource::File(file),
+				ItemSource::Dir(dir) => {
 					reporter.checkpoint(control).await?;
 					bytes.next_source();
-					let listing = self.list_dir_source(dir, &bytes);
-					let source = watch_listing(listing, reporter, control, || report(sources_done))
+					let listing = self.list_item_source(dir, &bytes);
+					let source = watch_listing(listing, &ops, control, || report(sources_done))
 						.await?
 						.map_err(ScanError::Failed)?;
 					sources_done += 1;
@@ -322,93 +174,6 @@ impl Client {
 		}
 		Ok((planner, planned))
 	}
-
-	async fn list_dir_source(
-		&self,
-		dir: CopySourceDir,
-		bytes: &ListingBytes,
-	) -> Result<PlanSource<CopySourceDir>, Error> {
-		let (root, (dirs, files)) = match dir {
-			CopySourceDir::Normal(dir) => {
-				let listing = list_source::<Normal>(
-					self,
-					&DirType::Dir(Cow::Borrowed(&dir)),
-					(),
-					CopySourceDir::Normal,
-					bytes,
-				)
-				.await?;
-				let color = dir.color().into_owned_cow();
-				(SourceDir::new(dir, color, CopySourceDir::Normal), listing)
-			}
-			CopySourceDir::Shared(root, role) => {
-				// every listed directory's handle owns the role it is listed again with on retry
-				let listing = list_source::<Shared>(
-					self,
-					&root,
-					&role,
-					|dir| CopySourceDir::Shared(DirType::Dir(Cow::Owned(dir)), role.clone()),
-					bytes,
-				)
-				.await?;
-				let root = root_source_dir(root, |root| CopySourceDir::Shared(root, role));
-				(root, listing)
-			}
-			CopySourceDir::Linked(root, link) => {
-				// every listed directory's handle owns the link it is listed again with on retry
-				let listing = list_source::<Linked>(
-					self.unauthed(),
-					&root,
-					Cow::Borrowed(&link),
-					|dir| CopySourceDir::Linked(DirType::Dir(Cow::Owned(dir)), link.clone()),
-					bytes,
-				)
-				.await?;
-				let root = root_source_dir(root, |root| CopySourceDir::Linked(root, link));
-				(root, listing)
-			}
-		};
-		Ok(PlanSource::Dir { root, dirs, files })
-	}
-}
-
-/// Runs a listing, reporting scan progress while it downloads. A cancel drops it; a pause
-/// lets it finish (it holds no transfer memory), and the copy counts as pausing until it has.
-async fn watch_listing<T>(
-	listing: impl Future<Output = T>,
-	reporter: &MaybeArc<Reporter>,
-	control: &JobControl,
-	report: impl Fn(),
-) -> Result<T, ScanError> {
-	let _op = reporter.op();
-	let listing = std::pin::pin!(control.until_stopping(listing));
-	let ticker = async {
-		loop {
-			sleep(CALLBACK_INTERVAL).await;
-			reporter.set_pause_requested(control.is_pause_requested());
-			report();
-		}
-	};
-	let result = tokio::select! {
-		result = listing => result,
-		_ = ticker => unreachable!("the ticker never ends"),
-	};
-	result.map_err(|Stopped| {
-		reporter.set_cancelling();
-		ScanError::Stopped
-	})
-}
-
-enum ScanError {
-	Stopped,
-	Failed(Error),
-}
-
-/// For a stop the reporter was already told about, as [`Reporter::checkpoint`] does.
-impl From<Stopped> for ScanError {
-	fn from(_: Stopped) -> Self {
-		Self::Stopped
-	}
 }
 
 /// The plan to run, or the end of a copy that never starts: its scan was cancelled or failed,
@@ -416,10 +181,10 @@ impl From<Stopped> for ScanError {
 /// totals, none of them attempted, so the caller can tell how much storage it needs; its skips
 /// and renames stay out, since it never starts.
 fn plan_to_run(
-	plan: Result<CopyPlan<CopySourceDir>, ScanError>,
+	plan: Result<ItemPlan<ItemSourceDir>, ScanError>,
 	max_bytes: Option<u64>,
 	reporter: &Reporter,
-) -> Result<CopyPlan<CopySourceDir>, Box<CopyFailed>> {
+) -> Result<ItemPlan<ItemSourceDir>, Box<CopyFailed>> {
 	let (phase, error, totals) = match plan {
 		Ok(plan) => match max_bytes {
 			Some(max_bytes) if plan.totals.bytes > max_bytes => (
@@ -458,19 +223,22 @@ mod tests {
 	use std::{
 		sync::{
 			Mutex,
-			atomic::{AtomicBool, AtomicU64},
+			atomic::{AtomicBool, AtomicU64, Ordering},
 		},
 		time::Duration,
 	};
 
+	use filen_types::fs::Uuid;
+
 	use super::*;
 	use crate::{
 		fs::{
-			copy::{
+			copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
+			drive_job::{
+				counts::ItemCounts,
+				listing::ScanProgress,
 				plan::{SkipReason, SkippedEntry},
-				report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
 			},
-			drive_job::counts::ItemCounts,
 		},
 		job::test_support::{SetOnDrop, controls},
 	};
@@ -511,7 +279,7 @@ mod tests {
 			files: 2,
 			bytes: 1024,
 		};
-		let plan = || CopyPlan {
+		let plan = || ItemPlan {
 			skipped: vec![SkippedEntry {
 				source_path: "/Top/secret".to_owned(),
 				bytes: 7,
@@ -520,7 +288,7 @@ mod tests {
 				},
 			}],
 			totals: needs,
-			..CopyPlan::default()
+			..ItemPlan::default()
 		};
 		let updates = Arc::new(Updates::default());
 		let reporter = Reporter::new(Arc::clone(&updates));
@@ -623,7 +391,7 @@ mod tests {
 			}
 			"listed"
 		};
-		let result = watch_listing(listing, &reporter, &control, || {
+		let result = watch_listing(listing, &reporter.ops(), &control, || {
 			reporter.set_scan(ScanProgress {
 				sources_done: 0,
 				sources_total: 1,
@@ -659,10 +427,9 @@ mod tests {
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			cancel.send_replace(true);
 		};
-		let (result, ()) = tokio::join!(
-			watch_listing(listing, &reporter, &control, || {}),
-			cancel_later
-		);
+		let ops = reporter.ops();
+		let (result, ()) =
+			tokio::join!(watch_listing(listing, &ops, &control, || {}), cancel_later);
 		assert!(matches!(result, Err(ScanError::Stopped)));
 		assert!(
 			dropped.load(Ordering::SeqCst),
@@ -680,7 +447,7 @@ mod tests {
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			7
 		};
-		let result = watch_listing(listing, &reporter, &control, || {}).await;
+		let result = watch_listing(listing, &reporter.ops(), &control, || {}).await;
 		assert!(
 			matches!(result, Ok(7)),
 			"an in-flight listing completes while pausing"

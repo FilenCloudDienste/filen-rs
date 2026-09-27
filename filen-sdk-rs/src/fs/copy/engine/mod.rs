@@ -1,4 +1,4 @@
-//! Runs a [`CopyPlan`]: creates the directories parent first, then copies the files, each
+//! Runs a [`ItemPlan`]: creates the directories parent first, then copies the files, each
 //! through a chunk pipeline.
 //!
 //! # Memory and deadlock-freedom
@@ -67,12 +67,13 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
-use super::{
-	plan::{CopyPlan, DestParent, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
-	report::{
-		ActiveFile, CopiedTopLevel, CopyEvent, CopyFailed, CopyFailure, CopyPhase, CopyReport,
-		CopyStage, FailedSource, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
-	},
+use super::report::{
+	ActiveFile, CopiedTopLevel, CopyEvent, CopyFailed, CopyFailure, CopyPhase, CopyReport,
+	CopyStage, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
+};
+use crate::fs::drive_job::{
+	listing::FailedSource,
+	plan::{DestParent, ItemPlan, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 };
 
 /// Chunks of one file in flight at once. More only helps a single large file; with several
@@ -115,7 +116,7 @@ struct Job<B: DriveBackend, D> {
 	backend: Arc<B>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
-	plan: CopyPlan<D>,
+	plan: ItemPlan<D>,
 	/// Where each planned directory stands.
 	dir_states: Vec<DirState>,
 	/// The destinations the top-level items are created in, by uuid.
@@ -134,7 +135,7 @@ struct Job<B: DriveBackend, D> {
 /// the plan, by uuid.
 pub(crate) async fn run_copy<B, D>(
 	backend: Arc<B>,
-	mut plan: CopyPlan<D>,
+	mut plan: ItemPlan<D>,
 	destination_dirs: HashMap<Uuid, DirType<'static, Normal>>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,

@@ -5,8 +5,10 @@ pub(crate) mod backend;
 pub(crate) mod counts;
 pub(crate) mod dir;
 pub(crate) mod finalize;
+pub(crate) mod listing;
 pub(crate) mod lock;
 pub(crate) mod name_retry;
+pub(crate) mod plan;
 #[cfg(test)]
 pub(crate) mod test_support;
 

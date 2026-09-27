@@ -206,6 +206,11 @@ pub(crate) trait JobTick: MaybeSendSync {
 	/// Settles whether the job counts as paused, and sends an update when one is due.
 	fn tick(&self);
 	fn ops_in_flight(&self) -> &AtomicU64;
+	/// Records whether a pause is requested; the job counts as paused once no operation is in
+	/// flight.
+	fn set_pause_requested(&self, requested: bool);
+	/// A cancel overrides a pause: the job winds down instead of pausing.
+	fn set_cancelling(&self);
 }
 
 /// A handle to a job's reporter for code that does not know which job it works for.
@@ -225,6 +230,14 @@ impl Ops {
 		// a job reported paused stops being paused once anything starts
 		self.0.tick();
 		OpGuard(self.clone())
+	}
+
+	pub(crate) fn set_pause_requested(&self, requested: bool) {
+		self.0.set_pause_requested(requested);
+	}
+
+	pub(crate) fn set_cancelling(&self) {
+		self.0.set_cancelling();
 	}
 }
 
@@ -434,6 +447,14 @@ impl<S: JobState> JobTick for Reporter<S> {
 
 	fn ops_in_flight(&self) -> &AtomicU64 {
 		&self.ops_in_flight
+	}
+
+	fn set_pause_requested(&self, requested: bool) {
+		Reporter::set_pause_requested(self, requested);
+	}
+
+	fn set_cancelling(&self) {
+		Reporter::set_cancelling(self);
 	}
 }
 
