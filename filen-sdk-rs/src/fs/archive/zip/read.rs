@@ -132,6 +132,8 @@ pub(crate) struct ZipIndex {
 	pub(crate) shift: u64,
 	/// Bytes in the central directory after its last record.
 	pub(crate) directory_slack: u64,
+	/// Bytes after the end record and its comment (padding, or a comment length that falls short).
+	pub(crate) trailing_bytes: u64,
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
@@ -164,6 +166,8 @@ struct Directory {
 	entries: u64,
 	/// What its recorded offsets are off by: the bytes prepended to the zip.
 	shift: u64,
+	/// Bytes after the end record's comment.
+	trailing: u64,
 }
 
 fn find_directory<R: Read + Seek>(
@@ -176,24 +180,34 @@ fn find_directory<R: Read + Seek>(
 	}
 	let window = len.min(EOCD_LEN + MAX_COMMENT_LEN);
 	let tail = read_at(source, len - window, window as usize)?;
+	let comment_end = |at: usize| at as u64 + EOCD_LEN + u64::from(u16_at(&tail, at + 20));
+	// a record whose comment ends the file, or else the last one whose comment fits: other tools
+	// open a zip with bytes after its comment too
 	let mut candidates = 0;
+	let mut fitting = None;
 	let mut at = tail.len() - EOCD_LEN as usize;
-	let (eocd_pos, eocd) = loop {
+	let at = loop {
 		if u32_at(&tail, at) == EOCD_SIG {
 			candidates += 1;
-			let comment_len = u64::from(u16_at(&tail, at + 20));
-			if at as u64 + EOCD_LEN + comment_len == window {
-				break (len - window + at as u64, &tail[at..at + EOCD_LEN as usize]);
+			match comment_end(at) {
+				end if end == window => break at,
+				end if end < window => {
+					fitting.get_or_insert(at);
+				}
+				_ => {}
 			}
 			if candidates == MAX_EOCD_CANDIDATES {
-				return Err(ZipError::Corrupt("no end of central directory record"));
+				break fitting.ok_or(ZipError::Corrupt("no end of central directory record"))?;
 			}
 		}
 		if at == 0 {
-			return Err(ZipError::Corrupt("no end of central directory record"));
+			break fitting.ok_or(ZipError::Corrupt("no end of central directory record"))?;
 		}
 		at -= 1;
 	};
+	let trailing = window - comment_end(at);
+	let eocd_pos = len - window + at as u64;
+	let eocd = &tail[at..at + EOCD_LEN as usize];
 	if u16_at(eocd, 4) != 0 || u16_at(eocd, 6) != 0 {
 		return Err(ZipError::Unsupported("a zip split across several files"));
 	}
@@ -263,6 +277,7 @@ fn find_directory<R: Read + Seek>(
 		size,
 		entries,
 		shift,
+		trailing,
 	})
 }
 
@@ -362,6 +377,7 @@ pub(crate) fn read_index<R: Read + Seek>(
 		prefix_bytes,
 		shift: directory.shift,
 		directory_slack,
+		trailing_bytes: directory.trailing,
 	})
 }
 

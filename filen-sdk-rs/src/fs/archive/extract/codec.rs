@@ -255,7 +255,10 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		port.send(zip_skipped(entry, ExtractSkipReason::OverlappingData))
 			.map_err(failure)?;
 	}
-	let mut unaccounted_bytes = index.prefix_bytes.saturating_add(index.directory_slack);
+	let mut unaccounted_bytes = index
+		.prefix_bytes
+		.saturating_add(index.directory_slack)
+		.saturating_add(index.trailing_bytes);
 	for entry in &index.entries {
 		unaccounted_bytes =
 			unaccounted_bytes.saturating_add(unaccounted_after(&mut source, index.shift, entry));

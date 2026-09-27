@@ -545,3 +545,21 @@ fn zip64_sizes_and_offsets_read_back() {
 		}
 	}
 }
+
+#[test]
+fn bytes_after_the_end_record_are_counted() {
+	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);
+	let mut padded = zip.clone();
+	padded.extend_from_slice(&[0; 100]);
+	// a comment length that falls short of the comment leaves bytes after it too
+	let mut short_comment = zip.clone();
+	let comment = b"a comment, less its last 7 bytes";
+	short_comment[zip.len() - 2..].copy_from_slice(&((comment.len() - 7) as u16).to_le_bytes());
+	short_comment.extend_from_slice(comment);
+	for (zip, trailing) in [(&zip, 0), (&padded, 100), (&short_comment, 7)] {
+		let mut source = Cursor::new(zip);
+		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		assert_eq!(index.trailing_bytes, trailing);
+		assert_eq!(read_all(zip, None).unwrap()[0].2, b"alpha");
+	}
+}
