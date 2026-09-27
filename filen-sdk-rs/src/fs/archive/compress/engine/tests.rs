@@ -39,6 +39,7 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			tar_iter::TarReader,
+			test_support::pattern,
 			worker,
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
@@ -141,10 +142,6 @@ fn source_file(name: &str, bytes: &[u8], hash: Option<Blake3Hash>) -> RemoteFile
 		meta,
 	);
 	RemoteFileType::File(Cow::Owned(file))
-}
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| (i % 241) as u8 ^ seed).collect()
 }
 
 fn hash_of(data: &[u8]) -> Option<Blake3Hash> {
