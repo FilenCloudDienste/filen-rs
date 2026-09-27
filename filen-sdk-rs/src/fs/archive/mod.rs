@@ -9,6 +9,7 @@
 // them together; until then their items have no production caller.
 #![allow(dead_code)]
 
+pub(crate) mod decode;
 pub(crate) mod entry_path;
 pub(crate) mod format;
 pub(crate) mod limits;
