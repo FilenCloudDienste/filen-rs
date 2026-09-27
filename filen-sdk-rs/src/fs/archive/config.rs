@@ -66,7 +66,12 @@ const MIN_CODEC_MEM_BUDGET: u64 = 16 << 20;
 /// client (a web worker builds a client per public link): the lease is process-wide there.
 #[derive(Clone)]
 pub struct ArchiveConfig {
-	/// Memory for one job's codec state.
+	/// Memory for one job's codec state: an extraction whose decoder needs more fails with
+	/// [`ErrorKind::ArchiveTooLarge`], a compression whose encoder needs more with
+	/// [`ErrorKind::InsufficientMemory`].
+	///
+	/// [`ErrorKind::ArchiveTooLarge`]: crate::ErrorKind::ArchiveTooLarge
+	/// [`ErrorKind::InsufficientMemory`]: crate::ErrorKind::InsufficientMemory
 	pub codec_mem_budget: u64,
 	/// Archive jobs that run at once. A running job keeps its slot while paused (its codec
 	/// state stays resident); a job paused before it got one waits without taking it.
