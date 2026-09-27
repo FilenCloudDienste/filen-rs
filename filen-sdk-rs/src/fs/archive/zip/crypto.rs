@@ -197,10 +197,9 @@ impl<R: Read> Read for AesReader<R> {
 				&mut self.mac,
 				Hmac::<Sha1>::new_from_slice(&[]).expect("any key length"),
 			);
-			// the code is the first 10 bytes of the MAC
-			if mac.finalize().into_bytes()[..AES_AUTH_CODE_LEN as usize] != code {
-				return Err(CryptoError::AuthenticationFailed.into());
-			}
+			// the code is the MAC's first bytes, compared in constant time
+			mac.verify_truncated_left(&code)
+				.map_err(|_| CryptoError::AuthenticationFailed)?;
 			self.authenticated = true;
 		}
 		Ok(0)
@@ -390,6 +389,16 @@ mod tests {
 				error.get_ref().and_then(|e| e.downcast_ref()),
 				Some(CryptoError::AuthenticationFailed)
 			));
+			// so does a flipped byte of the code itself, at either end of it
+			for from_end in [1, AES_AUTH_CODE_LEN as usize] {
+				let mut tampered = stored.clone();
+				tampered[stored.len() - from_end] ^= 0x80;
+				let error = open(b"pw", &tampered).unwrap_err();
+				assert!(matches!(
+					error.get_ref().and_then(|e| e.downcast_ref()),
+					Some(CryptoError::AuthenticationFailed)
+				));
+			}
 		}
 	}
 
