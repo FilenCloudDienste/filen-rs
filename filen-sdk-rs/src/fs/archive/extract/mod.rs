@@ -8,11 +8,14 @@ mod report;
 
 use filen_macros::js_type;
 
-use crate::fs::{
-	archive::dispose::SourceDisposal,
-	categories::{DirType, Normal},
-	file::{RemoteFile, enums::RemoteFileType},
-	name::ValidatedName,
+use crate::{
+	Error, ErrorKind,
+	fs::{
+		archive::dispose::SourceDisposal,
+		categories::{DirType, Normal},
+		file::{RemoteFile, enums::RemoteFileType},
+		name::ValidatedName,
+	},
 };
 
 pub use crate::fs::archive::{format::archive_default_name, password::ArchivePassword};
@@ -81,10 +84,11 @@ impl ExpansionLimit {
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
-	/// Storage still free on the account, if the caller knows it: an extraction whose uploads
-	/// would reach it fails with [`ErrorKind::MaxStorageReached`](crate::ErrorKind), keeping
-	/// what it extracted so far. A streaming archive's size is only known as it is read, so this
-	/// is checked as it goes, not up front.
+	/// Storage still free on the account, if the caller knows it: an extraction whose files
+	/// would reach it fails with [`ErrorKind::MaxStorageReached`](crate::ErrorKind). A zip or 7z
+	/// states its files' sizes in its index, so one stating that much fails before anything is
+	/// created; a tar or single compressed file is only known as it is read, so it is checked as
+	/// it goes, and what was extracted so far is kept.
 	pub max_bytes: Option<u64>,
 	/// Most directories and files created; an archive with more fails with
 	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind).
@@ -105,6 +109,18 @@ impl Default for ExtractConfig {
 			password: None,
 		}
 	}
+}
+
+/// The error for an extraction whose files, `bytes` in all, reach `max_bytes`; `None` while
+/// they fit.
+pub(crate) fn storage_exceeded(max_bytes: Option<u64>, bytes: u64) -> Option<Error> {
+	let max = max_bytes?;
+	(bytes > 0 && bytes >= max).then(|| {
+		Error::custom(
+			ErrorKind::MaxStorageReached,
+			format!("the extraction needs more than the {max} bytes that are free"),
+		)
+	})
 }
 
 /// Why an archive entry was not extracted.

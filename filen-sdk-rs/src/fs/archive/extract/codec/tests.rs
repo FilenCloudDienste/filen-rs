@@ -34,6 +34,7 @@ const LIMITS: CodecLimits = CodecLimits {
 		floor: 256 << 20,
 	}),
 	max_index_bytes: 32 << 20,
+	max_bytes: None,
 };
 
 /// What the driver saw, with a file's data joined up.

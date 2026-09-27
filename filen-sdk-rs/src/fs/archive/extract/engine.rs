@@ -1447,13 +1447,8 @@ impl<B: DisposalBackend> Driver<B> {
 			return;
 		};
 		let len = data.len() as u64;
-		if let Some(max) = self.max_bytes
-			&& self.committed + len >= max
-		{
-			self.stop_with(Error::custom(
-				ErrorKind::MaxStorageReached,
-				format!("the extraction needs more than the {max} bytes that are free"),
-			));
+		if let Some(error) = super::storage_exceeded(self.max_bytes, self.committed + len) {
+			self.stop_with(error);
 			return;
 		}
 		self.committed += len;

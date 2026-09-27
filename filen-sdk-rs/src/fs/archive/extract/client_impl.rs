@@ -84,6 +84,7 @@ impl Client {
 				max_members: archives.max_members,
 				expansion: config.expansion_limit,
 				max_index_bytes: archives.max_index_bytes,
+				max_bytes: config.max_bytes,
 			},
 			password: config.password,
 		};

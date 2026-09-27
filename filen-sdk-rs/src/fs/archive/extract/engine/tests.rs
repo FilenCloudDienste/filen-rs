@@ -258,6 +258,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 			max_members: options.config.max_members,
 			expansion: Some(ExpansionLimit::DEFAULT),
 			max_index_bytes: 32 << 20,
+			max_bytes: options.max_bytes,
 		},
 		password: options.password.clone(),
 	};
@@ -1112,6 +1113,38 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 	));
 	assert_eq!(setup.backend.log().deleted_files, [setup.archive.uuid()]);
 	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
+	let entries: [(&str, Option<&[u8]>); 3] = [
+		("docs", None),
+		("docs/a.txt", Some(b"alpha")),
+		("b.txt", Some(b"beta")),
+	];
+	for (name, archive) in [
+		("s.zip", zip_of(&entries, None)),
+		("s.7z", sevenz_of(&entries, None)),
+	] {
+		// what the index states, 9 bytes, reaches the limit
+		let refused = setup(name, archive.clone(), |_| {});
+		let options = Options {
+			max_bytes: Some(9),
+			..Options::default()
+		};
+		let failed = start(&refused, options).running.await.unwrap().unwrap_err();
+		assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached, "{name}");
+		assert!(created_dirs(&refused).is_empty(), "{name}");
+		assert!(finished(&refused).is_empty(), "{name}");
+
+		let fits = setup(name, archive, |_| {});
+		let options = Options {
+			max_bytes: Some(10),
+			..Options::default()
+		};
+		let report = start(&fits, options).running.await.unwrap().unwrap();
+		assert_eq!(report.counts.bytes_done, 9, "{name}");
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

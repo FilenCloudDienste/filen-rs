@@ -40,7 +40,7 @@ use super::{
 			},
 		},
 	},
-	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
+	DuplicateEntries, ExpansionLimit, ExtractSkipReason, storage_exceeded,
 };
 
 /// What the codec may spend on an archive.
@@ -53,6 +53,9 @@ pub(crate) struct CodecLimits {
 	pub(crate) expansion: Option<ExpansionLimit>,
 	/// Most bytes of a zip's central directory read.
 	pub(crate) max_index_bytes: u64,
+	/// Storage free for the files, which an archive stating its sizes up front is refused for
+	/// before anything is created (see [`ExtractConfig::max_bytes`](super::ExtractConfig)).
+	pub(crate) max_bytes: Option<u64>,
 }
 
 /// A streaming archive to extract.
@@ -217,6 +220,14 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
+	}
+	let extracted = index
+		.entries
+		.iter()
+		.filter(|entry| entry.kind == ZipKind::File && zip_supported(entry))
+		.fold(0u64, |total, entry| total.saturating_add(entry.size));
+	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
+		return Err(error);
 	}
 	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
 	let encrypted = || {
@@ -402,6 +413,19 @@ fn extract_sevenz(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Erro
 		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
 			return Err(refused(Refused::Expansion(limit.ratio)));
 		}
+	}
+	let extracted = index
+		.entries
+		.iter()
+		.filter(|entry| {
+			entry.kind == SevenZKind::File
+				&& entry
+					.stream
+					.is_none_or(|stream| index.folders[stream.folder].supported())
+		})
+		.fold(0u64, |total, entry| total.saturating_add(entry.size));
+	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
+		return Err(error);
 	}
 	let encrypted = |entry: &SevenZEntry| {
 		entry
