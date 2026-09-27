@@ -634,3 +634,29 @@ fn which_bsdtar() -> Result<std::path::PathBuf, ()> {
 	.find(|path| path.exists())
 	.ok_or(())
 }
+
+#[test]
+fn a_wrong_password_under_lzma_reads_as_one() {
+	// LZMA reads its first bytes as it starts: under a wrong key, that is where it fails
+	let sample = sample();
+	let archive = theirs(
+		&sample,
+		vec![
+			AesEncoderOptions::new("secret".into()).into(),
+			EncoderMethod::LZMA.into(),
+		],
+		true,
+		true,
+	);
+	for attempt in 0..16 {
+		let wrong = format!("wrong {attempt}");
+		assert!(
+			matches!(
+				read_all(&archive, Some(&wrong)),
+				Err(SevenZError::WrongPassword)
+			),
+			"{wrong}"
+		);
+	}
+	assert!(read_all(&archive, Some("secret")).is_ok());
+}

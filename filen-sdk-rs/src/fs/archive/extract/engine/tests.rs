@@ -207,6 +207,7 @@ fn start_with(
 		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
 		start,
 		dispose: options.dispose,
+		disposal_requested: options.dispose.is_some(),
 	}));
 	Job {
 		running,

@@ -228,10 +228,15 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 				Ok(mut reader) => {
 					io::copy(&mut reader, &mut io::sink()).map_err(
 						|error| match zip_io_failure(error) {
-							error if error.kind() == ErrorKind::ArchiveCorrupt => Error::custom(
-								ErrorKind::ArchiveWrongPassword,
-								"the password is likely wrong",
-							),
+							error
+								if key_unproven(probe)
+									&& error.kind() == ErrorKind::ArchiveCorrupt =>
+							{
+								Error::custom(
+									ErrorKind::ArchiveWrongPassword,
+									"the password is likely wrong",
+								)
+							}
 							error => error,
 						},
 					)?;
@@ -314,9 +319,13 @@ fn extract_zip(port: &WorkerPort, job: &StreamJob) -> Result<ArchiveEnd, Error> 
 		let encrypted = entry.encryption != ZipEncryption::None;
 		match send_file_data(port, &mut reader).map_err(zip_io_failure) {
 			Ok(_) => verified |= encrypted,
-			// while no entry proved the password, damage in encrypted data is likelier a wrong
-			// password than a damaged archive
-			Err(error) if encrypted && !verified && error.kind() == ErrorKind::ArchiveCorrupt => {
+			// while no entry proved the password, damage in ZipCrypto data is likelier a wrong
+			// password than a damaged archive (its check byte passes 1 wrong one in 256; AES's
+			// verifier, which already passed, 1 in 65536)
+			Err(error)
+				if key_unproven(entry)
+					&& !verified && error.kind() == ErrorKind::ArchiveCorrupt =>
+			{
 				return Err(Error::custom(
 					ErrorKind::ArchiveWrongPassword,
 					"the password is likely wrong",
@@ -543,6 +552,12 @@ fn sevenz_io_failure(error: io::Error) -> Error {
 		return sevenz_failure(read_error(error));
 	}
 	failure(error)
+}
+
+/// Whether an entry that opened may still be under a wrong key: ZipCrypto's check byte lets 1
+/// wrong password in 256 through, where the AES verifier that let it open passes 1 in 65536.
+fn key_unproven(entry: &ZipEntry) -> bool {
+	matches!(entry.encryption, ZipEncryption::ZipCrypto { .. })
 }
 
 /// Whether the SDK reads the entry's compression method under its encryption.

@@ -60,6 +60,7 @@ impl Client {
 			destination,
 			root,
 		} = request;
+		let disposal_requested = matches!(archive, ArchiveSource::Dispose { .. });
 		let (archive, dispose) = match archive {
 			ArchiveSource::Keep(archive) => (archive, None),
 			ArchiveSource::Dispose { file, how } => {
@@ -98,6 +99,7 @@ impl Client {
 			config: archives,
 			start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
 			dispose,
+			disposal_requested,
 		})
 		.await
 	}

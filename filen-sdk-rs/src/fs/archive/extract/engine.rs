@@ -116,6 +116,9 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
 	/// How to remove the archive once the extraction is verified, and the directory it is in.
 	pub(crate) dispose: Option<(SourceDisposal, Uuid)>,
+	/// Whether the caller asked for the archive to be removed, which `dispose` leaves out for an
+	/// archive in the trash: every way the job ends reports what became of it.
+	pub(crate) disposal_requested: bool,
 }
 
 enum DirState {
@@ -217,6 +220,7 @@ struct Driver<B: DriveBackend> {
 	/// What the archive turned out to hold.
 	layout: Option<StreamLayout>,
 	dispose: Option<(SourceDisposal, Uuid)>,
+	disposal_requested: bool,
 	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
 
 	/// Set up when the codec reports what the archive holds.
@@ -276,6 +280,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		config,
 		start,
 		dispose,
+		disposal_requested,
 	} = task;
 	let totals = super::ArchiveTotals::Streaming {
 		archive_bytes: archive.size(),
@@ -292,7 +297,24 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		duplicates: None,
 		dispositions: Vec::new(),
 	};
-	let fail = |report: ExtractReport, phase, error: Error| {
+	let archive_uuid = archive.uuid();
+	let fail = |mut report: ExtractReport, phase, error: Error| {
+		if disposal_requested {
+			let reason = if phase == ExtractPhase::Cancelled {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Incomplete
+			};
+			let disposition = SourceDisposition {
+				uuid: archive_uuid,
+				outcome: DisposalOutcome::Kept {
+					reason,
+					bytes_freed: 0,
+				},
+			};
+			reporter.event(ExtractEvent::SourceDisposition(disposition.clone()));
+			report.dispositions.push(disposition);
+		}
 		reporter.finish(phase);
 		ExtractFailed {
 			report: ExtractReport {
@@ -348,6 +370,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		sequential: true,
 		layout: None,
 		dispose,
+		disposal_requested,
 		ask: None,
 		resolver: None,
 		into_destination: false,
@@ -444,8 +467,11 @@ impl<B: DisposalBackend> Driver<B> {
 			(Ok(()), None) => (ExtractPhase::Done, Ok(())),
 		};
 		// the archive to remove was not touched: say so, rather than leave its disposition out
-		if result.is_err() && self.dispose.is_some() && self.report.dispositions.is_empty() {
-			let reason = if self.control.is_cancelled() {
+		if self.disposal_requested && self.report.dispositions.is_empty() {
+			let reason = if result.is_ok() {
+				// only an archive in the trash is not removed after a complete extraction
+				KeptReason::Changed
+			} else if self.control.is_cancelled() {
 				KeptReason::Interrupted
 			} else {
 				KeptReason::Incomplete
@@ -1611,7 +1637,11 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 		}
 		if !self.output_confirmed(counts).await {
-			return kept(KeptReason::Unconfirmed);
+			return kept(if self.control.is_stopping() {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Unconfirmed
+			});
 		}
 		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
 		dispose_file(&*self.backend, archive, how, &self.control).await
@@ -1630,6 +1660,10 @@ impl<B: DisposalBackend> Driver<B> {
 			found.dirs.insert(self.dirs[ROOT].uuid);
 		}
 		for top in &self.report.top_level {
+			// one request per item: a cancel is not kept waiting for all of them
+			if self.control.is_stopping() {
+				return false;
+			}
 			match &top.item {
 				NonRootItemType::File(file) => match self.backend.file_state(file.uuid()).await {
 					Ok(state) if !state.trash => {
@@ -1649,6 +1683,10 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		// the top-level items the report keeps no record of, as recheck_targets goes through them
 		for &(uuid, is_dir) in &self.top_level_beyond {
+			// one request per item: a cancel is not kept waiting for all of them
+			if self.control.is_stopping() {
+				return false;
+			}
 			if is_dir {
 				match self.backend.list_tree(uuid).await {
 					Ok(tree) => {
@@ -1709,6 +1747,10 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 		};
 		for top in &self.report.top_level {
+			// one request per item: a cancel is not kept waiting for all of them
+			if self.control.is_stopping() {
+				return Ok(());
+			}
 			for error in self.backend.propagate_tree(&added, &top.item).await {
 				self.reporter.event(ExtractEvent::PropagationFailed {
 					dest_uuid: top.item.uuid(),
@@ -1719,6 +1761,10 @@ impl<B: DisposalBackend> Driver<B> {
 		// the items the report keeps no record of, fetched again: only when the destination
 		// changed, which is rare, rather than holding every one of them for the whole job
 		for &(uuid, is_dir) in &self.top_level_beyond {
+			// one request per item: a cancel is not kept waiting for all of them
+			if self.control.is_stopping() {
+				return Ok(());
+			}
 			let errors = match self.backend.normal_item(uuid, is_dir).await {
 				Ok(item) => self.backend.propagate_tree(&added, &item).await,
 				Err(error) => vec![error],

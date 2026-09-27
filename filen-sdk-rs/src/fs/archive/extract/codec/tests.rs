@@ -800,3 +800,19 @@ fn an_empty_deflated_directory_is_no_hidden_data() {
 	let (_, end) = run(&zip_with_deflated_dirs(b"not a directory's"), "java.zip");
 	assert!(end.unwrap().unaccounted_bytes > 0);
 }
+
+#[test]
+fn a_wrong_password_on_lzma_entries_reads_as_one() {
+	let archive = sevenz_of(
+		&[("a.txt", Some(&pattern(10_000, 1)[..]))],
+		SevenZMethod::Lzma { level: 1 },
+		false,
+		Some((SevenZEncryption::Entries, "right")),
+	);
+	for attempt in 0..16 {
+		let wrong = format!("wrong {attempt}");
+		let (seen, end) = run_full(&archive, "a.7z", LIMITS, Some(&wrong));
+		assert_eq!(kind(end), ErrorKind::ArchiveWrongPassword, "{wrong}");
+		assert!(seen.is_empty());
+	}
+}

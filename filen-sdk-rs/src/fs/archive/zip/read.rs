@@ -224,6 +224,16 @@ fn find_directory<R: Read + Seek>(
 			if u32_at(&record, 0) != EOCD64_SIG {
 				return Err(ZipError::Corrupt("the zip64 end record is missing"));
 			}
+			// one elsewhere carries extensible data up to the locator; bytes between the two
+			// would belong to nothing
+			let reaches = u64_at(&record, 4)
+				.checked_add(12)
+				.and_then(|len| record_at.checked_add(len));
+			if record_at != before && reaches != Some(eocd_pos - EOCD64_LOCATOR_LEN) {
+				return Err(ZipError::Corrupt(
+					"the zip64 end record does not reach its locator",
+				));
+			}
 			entries = u64_at(&record, 32);
 			size = u64_at(&record, 40);
 			offset = u64_at(&record, 48);

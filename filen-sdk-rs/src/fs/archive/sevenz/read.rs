@@ -450,7 +450,6 @@ fn decode_header<R: Read + Seek>(
 	let shared = Rc::new(RefCell::new(source));
 	// setting the coders up (their properties, the streams they name) fails for the archive's
 	// own reasons; decoding under a wrong key fails for the key's
-	let mut reader = open_folder(&shared, folder, offsets, sizes, limits.decoder_memory, keys)?;
 	let decoding = |error| {
 		if folder.encrypted() {
 			wrong_key(error)
@@ -458,6 +457,13 @@ fn decode_header<R: Read + Seek>(
 			error
 		}
 	};
+	// a decoder that reads its first bytes as it starts (LZMA, PPMd) fails there under a wrong
+	// key: a read error, unlike the setup's own
+	let mut reader = open_folder(&shared, folder, offsets, sizes, limits.decoder_memory, keys)
+		.map_err(|error| match error {
+			SevenZError::Read(_) => decoding(error),
+			error => error,
+		})?;
 	let mut decoded = Vec::new();
 	(&mut reader)
 		.take(folder.size())
@@ -988,7 +994,17 @@ fn read_names(
 	if bytes.len() % 2 != 0 {
 		return Err(SevenZError::Corrupt("7z names of an odd length"));
 	}
-	heap.charge(bytes.len() as u64 * 2)?;
+	// the names are counted before any is made: a property of nothing but ends would otherwise
+	// make one (empty) name per two bytes before the count is compared
+	let ends = bytes.chunks_exact(2).filter(|pair| pair == &[0, 0]).count();
+	if ends != count {
+		return Err(SevenZError::Corrupt("7z names do not match the files"));
+	}
+	// the UTF-16 units, the strings (up to 1.5 times their UTF-16 size) and the list
+	heap.charge(
+		(bytes.len() as u64).saturating_mul(3)
+			+ count as u64 * mem::size_of::<(String, bool)>() as u64,
+	)?;
 	let units: Vec<u16> = bytes
 		.chunks_exact(2)
 		.map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
@@ -1233,7 +1249,9 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 								clamp_lzma_dict(dict, Some(size)),
 								None,
 							)
-							.map_err(|_| SevenZError::Corrupt("invalid 7z LZMA properties"))?,
+							// its properties are checked already: what fails here is the first
+							// bytes of the stream it reads, the data's (or a wrong key's)
+							.map_err(SevenZError::Read)?,
 						)
 					}
 					Method::Lzma2 => Box::new(lzma_rust2::Lzma2Reader::new(
@@ -1244,8 +1262,15 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 					Method::Ppmd => {
 						let (order, memory) = ppmd_props(props)?;
 						Box::new(
-							ppmd_rust::Ppmd7Decoder::new(buffered(input), order, memory)
-								.map_err(|_| SevenZError::Corrupt("damaged 7z PPMd data"))?,
+							ppmd_rust::Ppmd7Decoder::new(buffered(input), order, memory).map_err(
+								// its properties are checked already, as for LZMA
+								|error| {
+									SevenZError::Read(io::Error::new(
+										io::ErrorKind::InvalidData,
+										error.to_string(),
+									))
+								},
+							)?,
 						)
 					}
 					Method::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(input)),

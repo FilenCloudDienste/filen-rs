@@ -326,7 +326,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		}
 		driver.reporter.set_phase(CompressPhase::Finishing);
 		// the destination may have been shared or linked since the job started
-		let targets = match driver.backend.connected_targets(driver.destination).await {
+		let refetched = driver
+			.control
+			.until_stopping(driver.backend.connected_targets(driver.destination))
+			.await?;
+		let targets = match refetched {
 			Ok(current) => current,
 			Err(error) => {
 				tracing::warn!("failed to re-check the archive destination's shares: {error}");
@@ -750,8 +754,35 @@ impl<B: DisposalBackend> Driver<B> {
 				_ => Some(KeptReason::Unconfirmed),
 			}
 		};
-		let mut dispositions = Vec::with_capacity(targets.len());
+		// a source inside another (a file and its folder both given) goes with that one: its
+		// removal removes it, and its own attempt would only find it gone
+		let within: Vec<Option<usize>> = targets
+			.iter()
+			.enumerate()
+			.map(|(index, target)| {
+				targets.iter().enumerate().position(|(other, outer)| {
+					other != index
+						&& match (target, outer) {
+							(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
+								read.files.contains_key(&file.uuid)
+							}
+							(
+								DisposalTarget::Dir { uuid, .. }
+								| DisposalTarget::Unavailable { uuid },
+								DisposalTarget::Dir { read, .. },
+							) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
+							_ => false,
+						}
+				})
+			})
+			.collect();
+		let nested_uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
+		let mut outcomes: Vec<Option<(Uuid, DisposalOutcome)>> = Vec::with_capacity(targets.len());
 		for (request, target) in targets.into_iter().enumerate() {
+			if within[request].is_some() {
+				outcomes.push(None);
+				continue;
+			}
 			let held_back = archive_reason.clone().or_else(|| own_reason(request));
 			let (uuid, outcome) = match (&held_back, target) {
 				(Some(reason), target) => (
@@ -777,12 +808,43 @@ impl<B: DisposalBackend> Driver<B> {
 					},
 				),
 			};
-			let disposition = SourceDisposition { uuid, outcome };
-			self.reporter
-				.event(CompressEvent::SourceDisposition(disposition.clone()));
-			dispositions.push(disposition);
+			outcomes.push(Some((uuid, outcome)));
 		}
-		dispositions
+		let resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
+			.map(|request| {
+				let mut outer = request;
+				// containment is strict, so the chain ends
+				while let Some(next) = within[outer] {
+					outer = next;
+				}
+				let (_, outcome) = outcomes[outer].clone().expect("an outermost source");
+				let uuid = match &outcomes[request] {
+					Some((uuid, _)) => *uuid,
+					None => nested_uuids[request],
+				};
+				let outcome = match outcome {
+					_ if outer == request => outcome,
+					DisposalOutcome::Disposed { how, .. } => DisposalOutcome::Disposed {
+						how,
+						bytes_freed: 0,
+					},
+					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::Kept {
+						reason,
+						bytes_freed: 0,
+					},
+				};
+				(uuid, outcome)
+			})
+			.collect();
+		resolved
+			.into_iter()
+			.map(|(uuid, outcome)| {
+				let disposition = SourceDisposition { uuid, outcome };
+				self.reporter
+					.event(CompressEvent::SourceDisposition(disposition.clone()));
+				disposition
+			})
+			.collect()
 	}
 
 	/// Registers the uploaded archive in the destination.
