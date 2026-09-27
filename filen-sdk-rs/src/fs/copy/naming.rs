@@ -121,27 +121,48 @@ fn strip_counter(stem: &str) -> Option<(&str, u64)> {
 /// boundary so the result fits [`MAX_BYTES`].
 fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, EntryNameError> {
 	let suffix = format!(" ({n})");
-	// An extension so long that no base character fits is folded into the base, so trimming
-	// eats into it instead of producing an empty base.
-	let (base, ext) = if ext.len() + suffix.len() >= MAX_BYTES {
-		(Cow::Owned(format!("{base}{ext}")), "")
-	} else {
-		(Cow::Borrowed(base), ext)
+	// The base keeps at least its first character: an extension that leaves no room for it is
+	// folded into the base, so trimming eats into the extension instead. A candidate starting
+	// with the suffix's space would have to be encoded, which lengthens it past the limit.
+	let (base, ext, mut budget) = match MAX_BYTES
+		.checked_sub(suffix.len() + ext.len())
+		.filter(|&budget| base.floor_char_boundary(budget) > 0)
+	{
+		Some(budget) => (Cow::Borrowed(base), ext, budget),
+		None => (
+			Cow::Owned(format!("{base}{ext}")),
+			"",
+			MAX_BYTES - suffix.len(),
+		),
 	};
-	let mut budget = MAX_BYTES - suffix.len() - ext.len();
 	loop {
 		// floor_char_boundary always returns a char boundary.
 		#[allow(clippy::string_slice)]
 		let trimmed = &base[..base.floor_char_boundary(budget)];
 		let candidate = format!("{trimmed}{suffix}{ext}");
-		match ValidatedName::try_from(candidate.as_str()) {
-			// NFC normalization can lengthen a name slightly; trim further and retry.
-			Err(EntryNameError {
-				kind: EntryNameErrorKind::TooLong { .. },
-				..
-			}) if budget > 1 => budget -= 1,
-			Err(_) => return encode_name(&candidate),
+		let too_long = match ValidatedName::try_from(candidate.as_str()) {
 			Ok(name) => return Ok(name),
+			Err(
+				error @ EntryNameError {
+					kind: EntryNameErrorKind::TooLong { .. },
+					..
+				},
+			) => error,
+			Err(_) => match encode_name(&candidate) {
+				Ok(name) => return Ok(name),
+				Err(
+					error @ EntryNameError {
+						kind: EntryNameErrorKind::TooLong { .. },
+						..
+					},
+				) => error,
+				Err(error) => return Err(error),
+			},
+		};
+		// NFC normalization or encoding lengthened it: trim further, keeping the first character
+		budget = trimmed.len() - 1;
+		if base.floor_char_boundary(budget) == 0 {
+			return Err(too_long);
 		}
 	}
 }
@@ -286,6 +307,24 @@ mod tests {
 		assert!(renamed.len() <= MAX_BYTES, "{} bytes", renamed.len());
 		assert!(renamed.starts_with("a."), "{renamed}");
 		assert!(renamed.ends_with(" (1)"), "{renamed}");
+	}
+
+	#[test]
+	fn an_extension_leaving_no_room_for_the_first_character_is_trimmed_instead() {
+		// numbered, the 4-byte first character would not fit before this extension: a candidate
+		// without it starts with a space, which only encoding makes valid, and the encoding
+		// outgrew the limit by the 100th duplicate
+		let name = format!("\u{1F600}.{}", "a".repeat(247));
+		let mut names = TakenNames::new([name.as_str()]);
+		let allocated: Vec<String> = (0..150)
+			.map(|_| names.allocate(source_name(&name), false).unwrap().into())
+			.collect();
+		assert_eq!(allocated[0], format!("\u{1F600}.{} (1)", "a".repeat(246)));
+		assert_eq!(
+			allocated[99],
+			format!("\u{1F600}.{} (100)", "a".repeat(244))
+		);
+		assert!(allocated.iter().all(|name| name.len() <= MAX_BYTES));
 	}
 
 	#[test]
