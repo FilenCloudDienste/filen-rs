@@ -37,8 +37,9 @@ pub struct ExtractArchiveParams {
 	#[serde(default)]
 	#[tsify(type = "number | bigint", optional)]
 	pub max_items: Option<u64>,
-	/// The guard against decompression bombs; when left out, the SDK's (1000 times the
-	/// archive, at least 256 MiB).
+	/// The guard against decompression bombs, which also bounds what a tar's hard links copy
+	/// in all (past it: `ArchiveTooLarge`); when left out, the SDK's (1000 times the archive,
+	/// at least 256 MiB).
 	#[serde(default)]
 	#[tsify(optional)]
 	pub expansion_limit: Option<ExpansionLimit>,
@@ -88,8 +89,9 @@ pub struct ExtractArchiveEntriesParams {
 	#[serde(default)]
 	#[tsify(type = "number | bigint", optional)]
 	pub max_items: Option<u64>,
-	/// The guard against decompression bombs; when left out, the SDK's (1000 times the
-	/// archive, at least 256 MiB).
+	/// The guard against decompression bombs, which also bounds what a tar's hard links copy
+	/// in all (past it: `ArchiveTooLarge`); when left out, the SDK's (1000 times the archive,
+	/// at least 256 MiB).
 	#[serde(default)]
 	#[tsify(optional)]
 	pub expansion_limit: Option<ExpansionLimit>,
@@ -115,8 +117,8 @@ pub struct ExtractArchiveEntriesParams {
 #[js_type(import, no_ser, no_default)]
 pub struct ListArchiveParams {
 	pub archive: AnyFile,
-	/// The guard against decompression bombs; when left out, the SDK's (1000 times the
-	/// archive, at least 256 MiB).
+	/// The guard against decompression bombs an extraction would run under (see
+	/// `ExtractArchiveParams.expansionLimit`); when left out, the SDK's.
 	#[serde(default)]
 	#[tsify(optional)]
 	pub expansion_limit: Option<ExpansionLimit>,
@@ -126,7 +128,7 @@ pub struct ListArchiveParams {
 	#[tsify(optional)]
 	pub skip_mac_metadata: Option<bool>,
 	/// Entries, in batches as they are read, each batch before the update that counts it:
-	/// every one of them, also past the 10 000 the listing keeps.
+	/// every one of them, also past what the listing keeps.
 	#[tsify(type = "(entries: ArchiveEntry[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_entries: Option<js_sys::Function>,
@@ -311,8 +313,13 @@ impl JsClient {
 	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
 	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. A failure's `retry`
 	/// gives the `base` and destination that put it where it was meant to land. An entry of
-	/// another archive, or not below `base`, fails the extract: a zip's or 7z's before anything
-	/// is created, a tar's once it is read to its end. The archive is never removed afterwards.
+	/// another archive fails the extract before anything runs. A zip's or 7z's entries are
+	/// checked against its index before anything is created; a tar's are only known as it is
+	/// read, so one not below `base` fails the extract when it is reached, and one the tar does
+	/// not hold once it is read to its end, what was extracted until then staying. A chosen
+	/// directory of a tar brings what the tar stores after it below it (every tool stores a
+	/// directory before its contents); a zip's or 7z's everything below it. The archive is
+	/// never removed afterwards.
 	#[wasm_bindgen(js_name = "extractArchiveEntries")]
 	pub async fn extract_archive_entries(
 		&self,
@@ -351,13 +358,15 @@ impl JsClient {
 	/// Lists an archive's entries without extracting any: what each one is, and what
 	/// extracting it with the same settings would do with it (skip it, and why).
 	///
-	/// A zip's or 7z's index says it all: only the index is read, and the smallest encrypted
-	/// entry, as an extraction reads it, to check `password` (see the listing's `password`). A
-	/// tar's members, or what a single compressed file decodes to, are only known by reading it
-	/// all, which takes as long as downloading it; that is reported as it goes, and can be
-	/// paused and cancelled through `managedFuture`. A listing takes one of the archive job
-	/// slots, as an extract does. The listing is returned whether it completed, was cancelled
-	/// or failed, with the entries read until then.
+	/// A zip's or 7z's index says nearly all: the index is read, and besides it only the
+	/// smallest encrypted entry, as an extraction reads it, to check `password` (see the
+	/// listing's `password`), and what tells a link's target: each unencrypted zip symlink's
+	/// data, and a 7z link's when it is within the first 16 MiB of its folder (past that, a 7z
+	/// link is listed without its target). A tar's members, or what a single compressed file
+	/// decodes to, are only known by reading it all, which takes as long as downloading it; that
+	/// is reported as it goes, and can be paused and cancelled through `managedFuture`. A
+	/// listing takes one of the archive job slots, as an extract does. The listing is returned
+	/// whether it completed, was cancelled or failed, with the entries read until then.
 	#[wasm_bindgen(js_name = "listArchive")]
 	pub async fn list_archive(
 		&self,

@@ -166,6 +166,8 @@ pub struct ExtractFailureInfo {
 	/// Where to extract the entry again for it to land where it was meant to: pass its `entry`
 	/// to `extractArchiveEntries` with this `base`, the directory `destination` names as the
 	/// destination, and the root `destination`. Failures sharing a retry go again in one call.
+	/// A tar's hard link that failed does not go again this way: it is a copy of a file stored
+	/// before it, which is in the drive by then, where it can be copied.
 	pub retry: ExtractRetry,
 	pub error: JobError,
 }
@@ -287,7 +289,8 @@ pub struct ArchiveListing {
 	/// What the archive is; `undefined` when the listing ended before it could tell.
 	pub format: Option<ArchiveFormat>,
 	pub password: PasswordCheck,
-	/// The first 10 000 entries; the callback received every one.
+	/// The first 10 000 entries, as long as their text (paths, targets, methods) fits 16 MiB;
+	/// the callback received every one.
 	pub entries: Vec<ArchiveEntry>,
 	/// Entries the callback received that `entries` leaves out.
 	pub omitted_entries: u64,

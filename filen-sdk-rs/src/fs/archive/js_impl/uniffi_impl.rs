@@ -29,7 +29,7 @@ pub trait ExtractArchiveCallback: Send + Sync {
 #[uniffi::export(with_foreign)]
 pub trait ListArchiveCallback: Send + Sync {
 	/// Entries, in batches as they are read, each batch before the update that counts it:
-	/// every one of them, also past the 10 000 the listing keeps.
+	/// every one of them, also past what the listing keeps.
 	fn on_entries(&self, entries: Vec<ArchiveEntry>);
 	fn on_update(&self, update: ListUpdate);
 }
@@ -55,8 +55,9 @@ pub struct ExtractArchiveConfig {
 	/// `ArchiveTooLarge`.
 	#[uniffi(default = None)]
 	pub max_items: Option<u64>,
-	/// The guard against decompression bombs; `None` keeps the SDK's (1000 times the
-	/// archive, at least 256 MiB).
+	/// The guard against decompression bombs, which also bounds what a tar's hard links copy
+	/// in all (past it: `ArchiveTooLarge`); `None` keeps the SDK's (1000 times the archive, at
+	/// least 256 MiB).
 	#[uniffi(default = None)]
 	pub expansion_limit: Option<ExpansionLimit>,
 	/// Leaves out the metadata macOS writes beside files: everything in a `__MACOSX` folder
@@ -76,8 +77,8 @@ pub struct ExtractArchiveConfig {
 /// decide which entries it skips.
 #[derive(uniffi::Record, Default)]
 pub struct ListArchiveConfig {
-	/// The guard against decompression bombs; `None` keeps the SDK's (1000 times the
-	/// archive, at least 256 MiB).
+	/// The guard against decompression bombs an extraction would run under (see
+	/// `ExtractArchiveConfig.expansion_limit`); `None` keeps the SDK's.
 	#[uniffi(default = None)]
 	pub expansion_limit: Option<ExpansionLimit>,
 	/// Lists macOS metadata as an extraction with the same setting skips it (see
@@ -200,9 +201,13 @@ impl JsClient {
 	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
 	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. A failure's `retry`
 	/// gives the `base` and destination that put it where it was meant to land. An entry of
-	/// another archive, or not below `base`, fails the extract: a zip's or 7z's before anything
-	/// is created, a tar's once it is read to its end. The archive is never removed afterwards,
-	/// so a `config.dispose` is refused.
+	/// another archive fails the extract before anything runs. A zip's or 7z's entries are
+	/// checked against its index before anything is created; a tar's are only known as it is
+	/// read, so one not below `base` fails the extract when it is reached, and one the tar does
+	/// not hold once it is read to its end, what was extracted until then staying. A chosen
+	/// directory of a tar brings what the tar stores after it below it (every tool stores a
+	/// directory before its contents); a zip's or 7z's everything below it. The archive is
+	/// never removed afterwards, so a `config.dispose` is refused.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn extract_archive_entries(
 		&self,
@@ -237,12 +242,14 @@ impl JsClient {
 	/// Lists `archive`'s entries without extracting any: what each one is, and what extracting
 	/// it with the same settings would do with it (skip it, and why).
 	///
-	/// A zip's or 7z's index says it all: only the index is read, and the smallest encrypted
-	/// entry, as an extraction reads it, to check `password` (see the listing's `password`). A
-	/// tar's members, or what a single compressed file decodes to, are only known by reading it
-	/// all, which takes as long as downloading it; that is reported as it goes, and can be
-	/// paused and cancelled through `managed_future`. A listing takes one of the archive job
-	/// slots, as an extract does.
+	/// A zip's or 7z's index says nearly all: the index is read, and besides it only the
+	/// smallest encrypted entry, as an extraction reads it, to check `password` (see the
+	/// listing's `password`), and what tells a link's target: each unencrypted zip symlink's
+	/// data, and a 7z link's when it is within the first 16 MiB of its folder (past that, a 7z
+	/// link is listed without its target). A tar's members, or what a single compressed file
+	/// decodes to, are only known by reading it all, which takes as long as downloading it; that
+	/// is reported as it goes, and can be paused and cancelled through `managed_future`. A
+	/// listing takes one of the archive job slots, as an extract does.
 	///
 	/// The listing is returned whether it completed, was cancelled or failed, with the entries
 	/// read until then. Only an abort through `managed_future` gets it: cancelling the calling
