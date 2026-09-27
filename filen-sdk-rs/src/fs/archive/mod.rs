@@ -10,4 +10,5 @@ pub(crate) mod decode;
 pub(crate) mod entry_path;
 pub(crate) mod format;
 pub(crate) mod limits;
+pub(crate) mod names;
 pub(crate) mod tar_iter;
