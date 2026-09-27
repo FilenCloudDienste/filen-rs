@@ -26,7 +26,7 @@
 
 use std::{
 	borrow::Cow,
-	collections::{HashMap, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	io,
 	sync::Arc,
 };
@@ -600,6 +600,7 @@ impl<B: DisposalBackend> Driver<B> {
 					.map(|(uuid, _)| *uuid),
 			)
 			.collect::<Vec<_>>();
+		let mut trashed = HashSet::new();
 		for uuid in dirs {
 			// the job created no file: one in there now is someone else's, and keeps the folder
 			match self.backend.list_tree(uuid).await {
@@ -615,8 +616,7 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			match self.backend.trash_dir(uuid).await {
 				Ok(()) => {
-					self.report.top_level.retain(|top| top.item.uuid() != uuid);
-					self.top_level_beyond.retain(|(beyond, _)| *beyond != uuid);
+					trashed.insert(uuid);
 				}
 				Err(error) => tracing::warn!(
 					"archive {}: failed to trash a directory created before the wrong password \
@@ -625,6 +625,11 @@ impl<B: DisposalBackend> Driver<B> {
 				),
 			}
 		}
+		self.report
+			.top_level
+			.retain(|top| !trashed.contains(&top.item.uuid()));
+		self.top_level_beyond
+			.retain(|(uuid, _)| !trashed.contains(uuid));
 	}
 
 	/// Records `error` as ending the job when it is that kind of error.

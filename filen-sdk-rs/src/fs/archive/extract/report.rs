@@ -263,7 +263,8 @@ pub struct ExtractUpdate {
 }
 
 /// The outcome of an extraction, whether it completed, was cancelled or failed. Directories
-/// and files it created stay; a file it was writing when it stopped never becomes visible.
+/// and files it created stay, except the folders a late wrong password sends to the trash (see
+/// `top_level`); a file it was writing when it stopped never becomes visible.
 ///
 /// An extraction knows no totals up front: an entry is only known once it is read. What one
 /// that ended early leaves [not attempted](ItemCounts::files_not_attempted) is what it had
@@ -276,7 +277,8 @@ pub struct ExtractReport {
 	/// of them, as they are created. An extraction that failed with
 	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind) before extracting any file moved the
 	/// folders it had created to the trash, for a retry to start clean: they are left out here,
-	/// though the callback received them.
+	/// though the callback received them, and `counts.dirs_created` still counts them, and the
+	/// directories in them, as created.
 	pub top_level: Vec<ExtractedTopLevel>,
 	pub failures: Vec<ExtractFailure>,
 	pub skipped: Vec<ExtractSkippedEntry>,

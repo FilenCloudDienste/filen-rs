@@ -104,8 +104,9 @@ pub struct ExtractConfig {
 	/// encrypted header, or else by reading the encrypted entry quickest to read in full, when
 	/// that takes at most 16 MiB of the archive. Otherwise it is checked as entries are
 	/// extracted: a wrong password found then fails the job with
-	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind), and the folders created so far,
-	/// which hold no file yet, go to the trash.
+	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind), and when no file was extracted by
+	/// then, the folders created so far go to the trash (a folder holding a file someone else put
+	/// there meanwhile stays).
 	pub password: Option<ArchivePassword>,
 }
 
