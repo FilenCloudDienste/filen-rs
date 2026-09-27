@@ -563,3 +563,108 @@ fn bytes_after_the_end_record_are_counted() {
 		assert_eq!(read_all(zip, None).unwrap()[0].2, b"alpha");
 	}
 }
+
+/// Version-made-by hosts: MS-DOS, Unix and OS X.
+const DOS: u8 = 0;
+const UNIX: u8 = 3;
+const OS_X: u8 = 19;
+
+/// A central directory record for `name` and nothing else of note, made on `host`.
+fn central_record(host: u8, flags: u16, name: &[u8], extra: &[u8], unix_mode: u32) -> Vec<u8> {
+	[
+		&CENTRAL_HEADER_SIG.to_le_bytes()[..],
+		&[20, host],
+		&20u16.to_le_bytes(),
+		&flags.to_le_bytes(),
+		// method, time, date, CRC-32, sizes
+		&[0; 18],
+		&(name.len() as u16).to_le_bytes(),
+		&(extra.len() as u16).to_le_bytes(),
+		// comment length, disk, internal attributes
+		&[0; 6],
+		&(unix_mode << 16).to_le_bytes(),
+		&0u32.to_le_bytes(),
+		name,
+		extra,
+	]
+	.concat()
+}
+
+/// An Info-ZIP Unicode path field holding `name`, for a record whose raw name has `crc`.
+fn unicode_path(crc: u32, name: &str) -> Vec<u8> {
+	[
+		&0x7075u16.to_le_bytes()[..],
+		&(5 + name.len() as u16).to_le_bytes(),
+		&[1],
+		&crc.to_le_bytes(),
+		name.as_bytes(),
+	]
+	.concat()
+}
+
+#[test]
+fn names_are_decoded_as_their_writers_meant() {
+	const FLAG_UTF8: u16 = 0x0800;
+	let utf8 = "Café/Résumé.txt".as_bytes();
+	let cp437: &[u8] = b"Caf\x82/R\x82sum\x82.txt";
+	// (host, flags, raw name, extra field, name, rewritten)
+	let cases = [
+		(DOS, FLAG_UTF8, utf8, Vec::new(), "Café/Résumé.txt", false),
+		// flagged, but not UTF-8: read as CP437, and said to be rewritten
+		(
+			DOS,
+			FLAG_UTF8,
+			cp437,
+			Vec::new(),
+			"Caf\u{E9}/R\u{E9}sum\u{E9}.txt",
+			true,
+		),
+		(DOS, 0, cp437, Vec::new(), "Café/Résumé.txt", false),
+		// macOS Archive Utility, ditto and Info-ZIP on Unix store UTF-8 without saying so
+		(UNIX, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
+		(OS_X, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
+		// a DOS name that happens to be valid UTF-8 stays CP437 ("├⌐" is 0xC3 0xA9)
+		(DOS, 0, utf8, Vec::new(), "Caf├⌐/R├⌐sum├⌐.txt", false),
+		// the Unicode path field wins while it matches the raw name
+		(
+			DOS,
+			0,
+			cp437,
+			unicode_path(crc32fast::hash(cp437), "Unicode/Näme.txt"),
+			"Unicode/Näme.txt",
+			false,
+		),
+		// once the raw name changed (an old tool renamed the entry), it is stale
+		(
+			DOS,
+			0,
+			cp437,
+			unicode_path(crc32fast::hash(b"old name"), "Unicode/Näme.txt"),
+			"Café/Résumé.txt",
+			false,
+		),
+	];
+	for (host, flags, raw, extra, name, rewritten) in cases {
+		let record = central_record(host, flags, raw, &extra, 0o100_644);
+		let (entry, _) = parse_central_header(&record, 0, 0).unwrap();
+		assert_eq!(
+			(entry.name.as_str(), entry.name_rewritten),
+			(name, rewritten),
+			"{host} {flags:#x} {raw:?}"
+		);
+	}
+}
+
+#[test]
+fn symlinks_are_recognised_from_unix_and_os_x() {
+	for (host, kind) in [
+		(UNIX, ZipKind::Symlink),
+		(OS_X, ZipKind::Symlink),
+		// a DOS host's high attribute bits are no Unix mode
+		(DOS, ZipKind::File),
+	] {
+		let record = central_record(host, 0, b"link", &[], 0o120_755);
+		let (entry, _) = parse_central_header(&record, 0, 0).unwrap();
+		assert_eq!(entry.kind, kind, "{host}");
+	}
+}

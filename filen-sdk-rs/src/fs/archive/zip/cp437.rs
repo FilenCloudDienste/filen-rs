@@ -1,4 +1,5 @@
-//! Code page 437, the character set zip names are in unless an entry says it is UTF-8.
+//! Code page 437, the character set zip names are in unless an entry says it is UTF-8, or was
+//! made on Unix, whose tools store UTF-8 without saying so.
 
 /// The characters of bytes 0x80 to 0xFF; bytes below are ASCII.
 const HIGH: [char; 128] = [

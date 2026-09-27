@@ -40,6 +40,10 @@ const MAX_COMMENT_LEN: u64 = 0xFFFF;
 const MAX_EOCD_CANDIDATES: usize = 16;
 /// Names kept one by one when a name is listed twice; beyond that they are counted.
 const MAX_DUPLICATE_NAMES: usize = 100;
+/// The version-made-by hosts (zip specification 4.4.2.2) whose external attributes carry a Unix
+/// mode, and whose writers store names in the system's encoding, UTF-8 by now.
+const HOST_UNIX: u16 = 3;
+const HOST_OS_X: u16 = 19;
 
 /// Why reading a zip failed, other than its source.
 #[derive(Debug, thiserror::Error)]
@@ -396,7 +400,7 @@ fn parse_central_header(
 			"a central directory entry has no signature",
 		));
 	}
-	let made_by_unix = u16_at(header, 4) >> 8 == 3;
+	let made_by_unix = matches!(u16_at(header, 4) >> 8, HOST_UNIX | HOST_OS_X);
 	let flags = u16_at(header, 8);
 	let mut method = u16_at(header, 10);
 	let dos_time = u16_at(header, 12);
@@ -492,7 +496,12 @@ fn parse_central_header(
 			Err(_) => (cp437::decode(raw_name), true),
 		}
 	} else {
-		(cp437::decode(raw_name), false)
+		// macOS Archive Utility, ditto and Info-ZIP on Unix store UTF-8 names without flagging
+		// them; one that reads as UTF-8 is taken as that, as 7-Zip does
+		match std::str::from_utf8(raw_name) {
+			Ok(name) if made_by_unix => (name.to_owned(), false),
+			_ => (cp437::decode(raw_name), false),
+		}
 	};
 	let encryption = if flags & 0x0001 == 0 {
 		ZipEncryption::None
