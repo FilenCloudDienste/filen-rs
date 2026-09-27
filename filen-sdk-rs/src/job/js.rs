@@ -3,6 +3,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use filen_types::fs::Uuid;
+
 use crate::Error;
 
 /// An error in a job's progress or report. On uniffi it is the SDK error itself, as in the
@@ -42,6 +44,35 @@ pub(crate) fn job_error(error: Arc<Error>) -> JobError {
 		inner_message: error.inner_message(),
 	}
 }
+
+/// A created item a job could not finish: it could not get its color, or could not be added to
+/// one of the destination's public links or shares.
+#[derive(Debug, Clone)]
+#[filen_macros::js_type(export, no_deser, no_default)]
+pub struct ItemError {
+	pub dest_uuid: Uuid,
+	pub error: JobError,
+}
+
+impl ItemError {
+	pub(crate) fn new(dest_uuid: Uuid, error: Arc<Error>) -> Self {
+		Self {
+			dest_uuid,
+			error: job_error(error),
+		}
+	}
+}
+
+// The names these records went by when only a copy had them, so TypeScript written against those
+// keeps compiling.
+#[cfg(all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"))]
+#[wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section)]
+const TS_COPY_ALIASES: &str = r#"
+export type CopyError = JobError;
+export type CopyCounts = ItemCounts;
+export type CopyItemError = ItemError;
+export type CopyRenamedEntry = RenamedEntry;
+"#;
 
 /// A duration in a job's progress, in the milliseconds the bindings report it in.
 pub(crate) fn millis(duration: Duration) -> u64 {

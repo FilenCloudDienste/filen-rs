@@ -17,7 +17,7 @@ use crate::{
 		file::enums::RemoteFileType,
 		name::ValidatedName,
 	},
-	job::{JobError, job_error, millis},
+	job::{ItemError, JobError, job_error, millis},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
 		AnySharedDirWithContext, DirByCategoryWithContext, NonRootNormalItemTagged,
@@ -29,8 +29,7 @@ use crate::{
 use super::{
 	ActiveFile, CopiedTopLevel, CopyCallback, CopyConfig, CopyFailed, CopyPhase, CopyRequest,
 	CopyStage, FailedSource, FailureInfo, ItemCounts, ItemSource, ItemSourceDir, JobControl,
-	PlanTotals, PlannedTopLevelItem, RenameReason, RenamedEntry, RunState, ScanProgress,
-	SkippedEntry,
+	PlanTotals, PlannedTopLevelItem, RenamedEntry, RunState, ScanProgress, SkippedEntry,
 };
 
 /// One item to copy into its own destination, optionally under another name.
@@ -77,23 +76,6 @@ pub struct CopyFileDone {
 	pub size: u64,
 }
 
-#[js_type(export, no_deser)]
-pub struct CopyRenamedEntry {
-	pub source_uuid: Uuid,
-	pub source_path: String,
-	pub name: String,
-	pub reason: RenameReason,
-}
-
-/// A created item that could not get its color, or could not be added to one of the
-/// destination's public links or shares.
-#[derive(Debug, Clone)]
-#[js_type(export, no_deser, no_default)]
-pub struct CopyItemError {
-	pub dest_uuid: Uuid,
-	pub error: JobError,
-}
-
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, tagged, no_default)]
 pub enum CopyEvent {
@@ -103,9 +85,9 @@ pub enum CopyEvent {
 	FileDone(CopyFileDone),
 	FileFailed(CopyFailureInfo),
 	Skipped(SkippedEntry),
-	Renamed(CopyRenamedEntry),
-	PropagationFailed(CopyItemError),
-	ColorFailed(CopyItemError),
+	Renamed(RenamedEntry),
+	PropagationFailed(ItemError),
+	ColorFailed(ItemError),
 }
 
 /// One progress callback: the complete current state plus the events since the last one.
@@ -163,7 +145,7 @@ pub struct CopyReport {
 	pub top_level: Vec<CopiedTopLevelItem>,
 	pub failures: Vec<CopyFailure>,
 	pub skipped: Vec<SkippedEntry>,
-	pub renamed: Vec<CopyRenamedEntry>,
+	pub renamed: Vec<RenamedEntry>,
 	pub totals: PlanTotals,
 	pub counts: ItemCounts,
 	/// Why the copy ended early: kind `Cancelled` when cancelled, or the error that stopped it.
@@ -277,17 +259,6 @@ impl From<FailureInfo> for CopyFailureInfo {
 	}
 }
 
-impl From<RenamedEntry> for CopyRenamedEntry {
-	fn from(entry: RenamedEntry) -> Self {
-		Self {
-			source_uuid: entry.source_uuid,
-			source_path: entry.source_path,
-			name: entry.name.into(),
-			reason: entry.reason,
-		}
-	}
-}
-
 impl From<super::CopyFailure> for CopyFailure {
 	fn from(failure: super::CopyFailure) -> Self {
 		Self {
@@ -328,18 +299,12 @@ impl From<super::CopyEvent> for CopyEvent {
 			}),
 			super::CopyEvent::FileFailed(info) => Self::FileFailed(info.into()),
 			super::CopyEvent::Skipped(entry) => Self::Skipped(entry),
-			super::CopyEvent::Renamed(entry) => Self::Renamed(entry.into()),
+			super::CopyEvent::Renamed(entry) => Self::Renamed(entry),
 			super::CopyEvent::PropagationFailed { dest_uuid, error } => {
-				Self::PropagationFailed(CopyItemError {
-					dest_uuid,
-					error: job_error(error),
-				})
+				Self::PropagationFailed(ItemError::new(dest_uuid, error))
 			}
 			super::CopyEvent::ColorFailed { dest_uuid, error } => {
-				Self::ColorFailed(CopyItemError {
-					dest_uuid,
-					error: job_error(error),
-				})
+				Self::ColorFailed(ItemError::new(dest_uuid, error))
 			}
 		}
 	}
@@ -391,7 +356,7 @@ impl From<super::CopyReport> for CopyReport {
 			top_level: report.top_level.into_iter().map(Into::into).collect(),
 			failures: report.failures.into_iter().map(Into::into).collect(),
 			skipped: report.skipped,
-			renamed: report.renamed.into_iter().map(Into::into).collect(),
+			renamed: report.renamed,
 			totals: report.totals,
 			counts: report.counts,
 			error: None,

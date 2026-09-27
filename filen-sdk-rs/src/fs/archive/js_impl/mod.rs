@@ -20,12 +20,12 @@ use crate::{
 		drive_job::{
 			counts::ItemCounts,
 			listing::{ItemSource, ScanProgress},
-			plan::{PlanTotals, RenameReason, SkippedEntry},
+			plan::{PlanTotals, RenamedEntry, SkippedEntry},
 		},
 		file::{RemoteFile, enums::RemoteFileType},
 		name::ValidatedName,
 	},
-	job::{JobControl, JobError, job_error, millis, report::RunState},
+	job::{ItemError, JobControl, JobError, job_error, millis, report::RunState},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyNormalDir, File, NonRootNormalItemTagged,
 	},
@@ -34,7 +34,7 @@ use crate::{
 use super::{
 	compress::{
 		self, CompressCallback, CompressConfig, CompressCounts, CompressFormat, CompressPhase,
-		CompressSources,
+		CompressSources, HashMismatch,
 	},
 	dispose::{self, SourceDisposal},
 	extract::{
@@ -68,14 +68,6 @@ pub enum ExtractInto {
 	},
 	/// The destination itself.
 	Destination,
-}
-
-/// A created item that could not be added to one of the destination's public links or shares.
-#[derive(Debug, Clone)]
-#[js_type(export, no_deser, no_default)]
-pub struct ArchiveItemError {
-	pub dest_uuid: Uuid,
-	pub error: JobError,
 }
 
 /// Why a source was kept rather than removed.
@@ -188,7 +180,7 @@ pub enum ExtractEvent {
 	Renamed(ExtractRenamedEntry),
 	MisleadingName(ExtractMisleadingName),
 	SourceDisposition(ArchiveSourceDisposition),
-	PropagationFailed(ArchiveItemError),
+	PropagationFailed(ItemError),
 }
 
 /// One progress callback: the complete current state plus the events since the last one.
@@ -242,31 +234,16 @@ pub struct ExtractReport {
 	pub error: Option<JobError>,
 }
 
-#[js_type(export, no_deser)]
-pub struct CompressRenamedEntry {
-	pub source_uuid: Uuid,
-	pub source_path: String,
-	/// The name the item has in the archive.
-	pub name: String,
-	pub reason: RenameReason,
-}
-
-#[js_type(export, no_deser)]
-pub struct CompressHashMismatch {
-	pub source_uuid: Uuid,
-	pub path: String,
-}
-
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, tagged, no_default)]
 pub enum CompressEvent {
 	Skipped(SkippedEntry),
-	Renamed(CompressRenamedEntry),
+	Renamed(RenamedEntry),
 	/// A source's data did not match the hash in its metadata; it went into the archive as it
 	/// was read, and is kept.
-	SourceHashMismatch(CompressHashMismatch),
+	SourceHashMismatch(HashMismatch),
 	SourceDisposition(ArchiveSourceDisposition),
-	PropagationFailed(ArchiveItemError),
+	PropagationFailed(ItemError),
 }
 
 /// One progress callback: the complete current state plus the events since the last one.
@@ -293,7 +270,7 @@ pub struct CompressReport {
 	/// The archive, once registered in the destination.
 	pub archive: Option<File>,
 	pub skipped: Vec<SkippedEntry>,
-	pub renamed: Vec<CompressRenamedEntry>,
+	pub renamed: Vec<RenamedEntry>,
 	pub totals: PlanTotals,
 	pub counts: CompressCounts,
 	/// The storage the archive needed, when a storage limit refused it up front.
@@ -301,7 +278,7 @@ pub struct CompressReport {
 	/// What became of the sources, when they were to be removed.
 	pub dispositions: Vec<ArchiveSourceDisposition>,
 	/// Source files whose data did not match the hash in their metadata (up to 1000).
-	pub hash_mismatches: Vec<CompressHashMismatch>,
+	pub hash_mismatches: Vec<HashMismatch>,
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.
 	pub error: Option<JobError>,
@@ -393,10 +370,7 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 			Event::MisleadingName(entry) => Self::MisleadingName(entry),
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
-				Self::PropagationFailed(ArchiveItemError {
-					dest_uuid,
-					error: job_error(error),
-				})
+				Self::PropagationFailed(ItemError::new(dest_uuid, error))
 			}
 		}
 	}
@@ -460,21 +434,13 @@ impl From<compress::CompressEvent> for CompressEvent {
 		use compress::CompressEvent as Event;
 		match event {
 			Event::Skipped(entry) => Self::Skipped(entry),
-			Event::Renamed(entry) => Self::Renamed(CompressRenamedEntry {
-				source_uuid: entry.source_uuid,
-				source_path: entry.source_path,
-				name: entry.name.into(),
-				reason: entry.reason,
-			}),
+			Event::Renamed(entry) => Self::Renamed(entry),
 			Event::SourceHashMismatch { source_uuid, path } => {
-				Self::SourceHashMismatch(CompressHashMismatch { source_uuid, path })
+				Self::SourceHashMismatch(HashMismatch { source_uuid, path })
 			}
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
-				Self::PropagationFailed(ArchiveItemError {
-					dest_uuid,
-					error: job_error(error),
-				})
+				Self::PropagationFailed(ItemError::new(dest_uuid, error))
 			}
 		}
 	}
@@ -501,28 +467,12 @@ impl From<compress::CompressReport> for CompressReport {
 		Self {
 			archive: report.archive.map(File::from),
 			skipped: report.skipped,
-			renamed: report
-				.renamed
-				.into_iter()
-				.map(|entry| CompressRenamedEntry {
-					source_uuid: entry.source_uuid,
-					source_path: entry.source_path,
-					name: entry.name.into(),
-					reason: entry.reason,
-				})
-				.collect(),
+			renamed: report.renamed,
 			totals: report.totals,
 			counts: report.counts,
 			needed_bytes: report.needed_bytes,
 			dispositions: report.dispositions.into_iter().map(Into::into).collect(),
-			hash_mismatches: report
-				.hash_mismatches
-				.into_iter()
-				.map(|mismatch| CompressHashMismatch {
-					source_uuid: mismatch.source_uuid,
-					path: mismatch.path,
-				})
-				.collect(),
+			hash_mismatches: report.hash_mismatches,
 			error: None,
 		}
 	}

@@ -152,6 +152,7 @@ pub struct CompressReport {
 
 /// A source file whose data did not match the hash in its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct HashMismatch {
 	pub source_uuid: Uuid,
 	/// Its path in the archive.

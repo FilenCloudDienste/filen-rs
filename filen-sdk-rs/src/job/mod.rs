@@ -11,7 +11,7 @@ pub(crate) mod progress;
 pub(crate) mod report;
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub use js::JobError;
+pub use js::{ItemError, JobError};
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub(crate) use js::{job_error, millis};
 
