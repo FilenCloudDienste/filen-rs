@@ -893,7 +893,18 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 	let failed = job.running.await.unwrap().unwrap_err();
 
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
-	assert_eq!(failed.report.counts.files_done, 1);
+	// every entry reached is done or not attempted
+	assert_eq!(
+		failed.report.counts,
+		ItemCounts {
+			dirs_created: 1,
+			files_done: 1,
+			bytes_done: 5,
+			files_not_attempted: 1,
+			bytes_not_attempted: 3 * CHUNK_SIZE as u64,
+			..ItemCounts::default()
+		}
+	);
 	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter, &job.recorder);
@@ -912,6 +923,16 @@ async fn the_limits_end_the_job() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
 	assert!(finished(&setup_bytes).is_empty());
+	assert_eq!(
+		failed.report.counts,
+		ItemCounts {
+			dirs_created: 1,
+			files_not_attempted: 1,
+			bytes_not_attempted: 1000,
+			..ItemCounts::default()
+		},
+		"the file that would not fit is not attempted"
+	);
 	assert_released(&setup_bytes, &job.reporter, &job.recorder);
 
 	let setup_items = setup("a.tar", tar, |_| {});
@@ -1890,6 +1911,15 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
 	assert!(finished(&setup).is_empty());
+	// the entry failed to open before it was announced, so the job never started it; the
+	// folders count as created, trashed since
+	assert_eq!(
+		failed.report.counts,
+		ItemCounts {
+			dirs_created: 2,
+			..ItemCounts::default()
+		}
+	);
 	let log = setup.backend.log();
 	let root = log
 		.created_dirs
