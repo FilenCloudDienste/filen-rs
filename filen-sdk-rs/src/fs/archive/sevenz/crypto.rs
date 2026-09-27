@@ -266,19 +266,31 @@ mod tests {
 	}
 
 	#[test]
-	fn derivation_matches_a_straight_sha256_over_the_rounds() {
-		let password = b"p\0w\0";
-		let props = props(4);
-		let key = derive_key(password, &props, &mut || Ok(())).unwrap();
-		let mut sha = Sha256::new();
-		for counter in 0u64..16 {
-			sha.update(&props.salt);
-			sha.update(password);
-			sha.update(counter.to_le_bytes());
+	fn derivation_matches_keys_computed_elsewhere() {
+		// computed with Python's hashlib, as 7-Zip's 7zAes.cpp derives a key: SHA-256 over salt,
+		// UTF-16LE password and a little-endian 64-bit round counter, 2^cycles times. That the
+		// SDK reads 7-Zip's own encrypted archives is checked on the fixtures
+		// (`sevenz_fixtures_extract_to_their_manifest` in extract/codec/tests.rs).
+		let utf16 =
+			|text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+		for (password, cycles_power, expected) in [
+			(
+				"fixture password",
+				WRITE_CYCLES_POWER,
+				"08c019f74d46b880101787dce0a31ef59ce32750c0b109066445d546be5d7d09",
+			),
+			(
+				"p",
+				4,
+				"04c79caf1d88a343ac1070d5d9f512a6f072dd20ded484af25ff8a04be860ed7",
+			),
+		] {
+			let key = derive_key(&utf16(password), &props(cycles_power), &mut || Ok(())).unwrap();
+			let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+			assert_eq!(hex, expected, "{password} at 2^{cycles_power}");
 		}
-		assert_eq!(key[..], sha.finalize()[..]);
 		assert!(matches!(
-			derive_key(password, &self::props(MAX_CYCLES_POWER + 1), &mut || Ok(())),
+			derive_key(b"p\0", &props(MAX_CYCLES_POWER + 1), &mut || Ok(())),
 			Err(SevenZError::Unsupported(_))
 		));
 	}
