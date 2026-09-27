@@ -668,3 +668,63 @@ fn symlinks_are_recognised_from_unix_and_os_x() {
 		assert_eq!(entry.kind, kind, "{host}");
 	}
 }
+
+/// `zip`, whose one entry's central record states `size` as its uncompressed size.
+fn stating_size(zip: &[u8], size: u32) -> Vec<u8> {
+	let record = zip
+		.windows(4)
+		.rposition(|w| w == CENTRAL_HEADER_SIG.to_le_bytes())
+		.unwrap();
+	let mut stating = zip.to_vec();
+	stating[record + 24..record + 28].copy_from_slice(&size.to_le_bytes());
+	stating
+}
+
+#[test]
+fn an_entry_is_held_to_its_stated_size() {
+	let data = pattern(10_000, 3);
+	let zip = ours(
+		&[("a.bin", Some(&data[..]))],
+		ZipMethod::Deflate { level: 6 },
+		None,
+	);
+	assert!(matches!(
+		read_all(&stating_size(&zip, 5_000), None),
+		Err(ZipError::Corrupt("an entry holds more data than it states"))
+	));
+	assert!(matches!(
+		read_all(&stating_size(&zip, 20_000), None),
+		Err(ZipError::Corrupt("an entry holds less data than it states"))
+	));
+}
+
+#[test]
+fn an_understated_bomb_stops_at_its_stated_size() {
+	const STATED: u32 = 1024;
+	let zeros = vec![0u8; 4 << 20];
+	let zip = stating_size(
+		&ours(
+			&[("bomb.bin", Some(&zeros[..]))],
+			ZipMethod::Deflate { level: 9 },
+			None,
+		),
+		STATED,
+	);
+	let mut source = Cursor::new(&zip);
+	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+	let mut entry = open_entry(&mut source, index.shift, &index.entries[0], None, ENTRY).unwrap();
+	let mut buf = [0u8; 4096];
+	let mut delivered = 0;
+	let error = loop {
+		match entry.read(&mut buf) {
+			Ok(0) => panic!("the bomb read to its end"),
+			Ok(n) => delivered += n,
+			Err(error) => break error,
+		}
+	};
+	assert!(delivered <= STATED as usize, "{delivered}");
+	assert!(matches!(
+		error.get_ref().and_then(|e| e.downcast_ref()),
+		Some(ZipError::Corrupt("an entry holds more data than it states"))
+	));
+}
