@@ -15,20 +15,19 @@ pub use report::{
 
 use crate::{
 	Error, ErrorKind,
-	fs::{
-		categories::{NonRootItemType, Normal},
-		drive_job::listing::ItemSource,
-	},
+	fs::categories::{NonRootItemType, Normal},
 };
 
 pub use super::{
 	encode::Compression,
+	format::StreamCodec,
 	password::ArchivePassword,
 	sevenz::write::{SevenZEncryption, SevenZMethod},
 	zip::{crypto::AesStrength, write::ZipMethod},
 };
+pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
 
-use super::format::{ExtensionFormat, StreamCodec, match_extension};
+use super::format::{ExtensionFormat, match_extension};
 
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]

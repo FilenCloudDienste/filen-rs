@@ -23,6 +23,7 @@ pub(crate) mod tar_iter;
 pub(crate) mod worker;
 pub(crate) mod zip;
 
+pub use crate::job::{JobControl, JobController};
 pub use config::ArchiveConfig;
 pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use password::ArchivePassword;
