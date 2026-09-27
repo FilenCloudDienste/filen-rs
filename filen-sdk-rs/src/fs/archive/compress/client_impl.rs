@@ -1,7 +1,7 @@
 //! The public compress API on [`Client`]: lists and plans the sources, checks the archive can be
 //! written and extracted again, and runs the job.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use filen_types::fs::Uuid;
 
@@ -22,15 +22,15 @@ use crate::{
 			backend::ClientBackend,
 			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
 			plan::{
-				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, RenameReason,
-				RenamedEntry,
+				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlannedItem,
+				RenameReason, RenamedEntry,
 			},
 		},
 		file::{
 			enums::RemoteFileType,
 			traits::{HasFileInfo, HasRemoteFileInfo},
 		},
-		name::ValidatedName,
+		name::{ValidatedName, keep_both::SourceName},
 	},
 	job::JobControl,
 	util::MaybeArc,
@@ -157,7 +157,7 @@ impl Client {
 				(sources, Some((how, items)))
 			}
 		};
-		let plan = match self.plan_sources(sources, &reporter, &control).await {
+		let mut plan = match self.plan_sources(sources, &reporter, &control).await {
 			Ok(plan) => plan,
 			Err(ScanError::Stopped) => {
 				let error = Error::custom(ErrorKind::Cancelled, "compression cancelled");
@@ -175,23 +175,25 @@ impl Client {
 				));
 			}
 		};
+		let top_level_renamed = top_level_renames(&plan);
+		// the plan's records move into the report; nothing reads them in the plan again
 		let mut report = CompressReport {
-			skipped: plan.skipped.clone(),
-			renamed: plan.renamed.clone(),
+			skipped: std::mem::take(&mut plan.skipped),
+			renamed: std::mem::take(&mut plan.renamed),
 			totals: plan.totals,
 			..CompressReport::default()
 		};
-		report.renamed.extend(top_level_renames(&plan));
-		let (entries, sources) = match archive_entries(&plan, config.format) {
-			Ok(entries) => entries,
-			Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
-		};
+		report.renamed.extend(top_level_renamed);
 		let disposal =
 			match dispose.map(|(how, items)| disposal(&plan, how, items, destination.uuid())) {
 				None => None,
 				Some(Ok(disposal)) => Some(disposal),
 				Some(Err(error)) => return Err(refuse(report, CompressPhase::Failed, error)),
 			};
+		let (entries, sources) = match archive_entries(plan, config.format) {
+			Ok(entries) => entries,
+			Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
+		};
 		if let (CompressFormat::Tar { compression: None }, Some(max)) =
 			(config.format, config.max_bytes)
 		{
@@ -205,7 +207,7 @@ impl Client {
 				return Err(refuse(report, CompressPhase::Failed, error));
 			}
 		}
-		reporter.set_plan(plan.totals, &report.skipped, &report.renamed);
+		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
 		let job = CompressJob {
 			format: config.format,
@@ -236,7 +238,7 @@ impl Client {
 		sources: Vec<ItemSource>,
 		reporter: &MaybeArc<Reporter>,
 		control: &JobControl,
-	) -> Result<ItemPlan<crate::fs::drive_job::listing::ItemSourceDir>, ScanError> {
+	) -> Result<ItemPlan<ItemSourceDir>, ScanError> {
 		let sources_total = sources
 			.iter()
 			.filter(|source| matches!(source, ItemSource::Dir(_)))
@@ -338,22 +340,32 @@ fn disposal<D>(
 	})
 }
 
-/// Top-level items the planner gave keep-both names, since two sources had the same name.
+/// Top-level items the planner gave keep-both names, since two sources had the same name. The
+/// planner reports the other renames of top-level items itself.
 fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
+	let reported: HashSet<Uuid> = plan
+		.renamed
+		.iter()
+		.map(|renamed| renamed.source_uuid)
+		.collect();
 	plan.top_level
 		.iter()
 		.filter_map(|top| {
 			let (source_uuid, source_path, name) = match top.item {
-				crate::fs::drive_job::plan::PlannedItem::Dir(index) => {
+				PlannedItem::Dir(index) => {
 					let dir = &plan.dirs[index];
 					(dir.source_uuid, &dir.source_path, &dir.name)
 				}
-				crate::fs::drive_job::plan::PlannedItem::File(index) => {
+				PlannedItem::File(index) => {
 					let file = &plan.files[index];
 					(file.source.uuid(), &file.source_path, &file.name)
 				}
 			};
-			(source_path != name.as_ref()).then(|| RenamedEntry {
+			// an item's own name, as the planner made it valid (NFC, legacy names encoded)
+			let own = SourceName::parse(source_path).map(SourceName::into_name);
+			let kept_both = !reported.contains(&source_uuid)
+				&& own.is_ok_and(|own| own.as_ref() != name.as_ref());
+			kept_both.then(|| RenamedEntry {
 				source_uuid,
 				source_path: source_path.clone(),
 				name: name.clone(),
@@ -366,7 +378,7 @@ fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
 /// The archive's entries (directories parent first, then files) and the files the codec reads,
 /// with every path checked against what extracting accepts.
 fn archive_entries<D>(
-	plan: &ItemPlan<D>,
+	plan: ItemPlan<D>,
 	format: CompressFormat,
 ) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
 	if matches!(format, CompressFormat::Single { .. })
@@ -394,7 +406,7 @@ fn archive_entries<D>(
 		});
 	}
 	let mut sources = Vec::with_capacity(plan.files.len());
-	for (index, file) in plan.files.iter().enumerate() {
+	for (index, file) in plan.files.into_iter().enumerate() {
 		let path = path_in(file.parent, &file.name, &dir_paths);
 		check_path(&path, 0)?;
 		entries.push(ArchiveEntry::File {
@@ -406,7 +418,7 @@ fn archive_entries<D>(
 			modified: file.source.last_modified(),
 		});
 		sources.push(Source {
-			file: file.source.clone(),
+			file: file.source,
 			path,
 			request: file.request,
 		});
@@ -553,9 +565,14 @@ mod tests {
 
 	#[test]
 	fn a_plan_becomes_entries_with_joined_paths() {
-		let plan = plan();
+		let renamed = top_level_renames(&plan());
+		assert_eq!(renamed.len(), 1);
+		assert_eq!(
+			(renamed[0].source_path.as_str(), renamed[0].name.as_ref()),
+			("Photos", "Photos (1)")
+		);
 		let (entries, sources) =
-			archive_entries(&plan, CompressFormat::Tar { compression: None }).unwrap();
+			archive_entries(plan(), CompressFormat::Tar { compression: None }).unwrap();
 		let paths: Vec<(&str, Option<u64>)> = entries
 			.iter()
 			.map(|entry| match entry {
@@ -585,16 +602,10 @@ mod tests {
 				assert_eq!(&sources[*source as usize].path, path);
 			}
 		}
-		let renamed = top_level_renames(&plan);
-		assert_eq!(renamed.len(), 1);
-		assert_eq!(
-			(renamed[0].source_path.as_str(), renamed[0].name.as_ref()),
-			("Photos", "Photos (1)")
-		);
 
 		assert_eq!(
 			archive_entries(
-				&plan,
+				plan(),
 				CompressFormat::Single {
 					compression: crate::fs::archive::compress::Compression {
 						codec: crate::fs::archive::format::StreamCodec::Gzip,
@@ -606,6 +617,53 @@ mod tests {
 			.kind(),
 			ErrorKind::InvalidState,
 			"a single compressed file is exactly one file"
+		);
+	}
+
+	#[test]
+	fn only_a_keep_both_rename_at_the_top_is_reported_as_one() {
+		let root = Uuid::new_v4();
+		let mut planner = ItemPlanner::default();
+		planner.add_destination(root, std::iter::empty());
+		let request = |source| PlanRequest {
+			source,
+			destination: root,
+			name: None,
+		};
+		// a name only valid once encoded, a name in NFD, and two files of the same name
+		let nfd = source_dir("Cafe\u{301}");
+		let plan = planner
+			.plan(vec![
+				request(PlanSource::File(file("a:b.txt", 1))),
+				request(PlanSource::Dir {
+					root: nfd.clone(),
+					dirs: Vec::new(),
+					files: Vec::new(),
+				}),
+				request(PlanSource::File(file("x.txt", 2))),
+				request(PlanSource::File(file("x.txt", 3))),
+			])
+			.unwrap();
+		let legacy = plan.files[0].source.uuid();
+		assert_eq!(
+			plan.renamed
+				.iter()
+				.map(|renamed| (renamed.source_uuid, renamed.reason))
+				.collect::<Vec<_>>(),
+			[(legacy, RenameReason::InvalidName)],
+			"the planner reports the encoded name"
+		);
+		let renamed = top_level_renames(&plan);
+		assert_eq!(
+			renamed
+				.iter()
+				.map(|renamed| (
+					renamed.source_path.as_str(),
+					renamed.name.as_ref(),
+					renamed.reason
+				))
+				.collect::<Vec<_>>(),
+			[("x.txt", "x (1).txt", RenameReason::DuplicateName)]
 		);
 	}
 
