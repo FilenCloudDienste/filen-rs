@@ -249,7 +249,7 @@ fn start_with(
 }
 
 /// What the real codec is given for `setup`'s archive.
-fn stream_job(setup: &Setup, password: Option<ArchivePassword>) -> StreamJob {
+fn stream_job(setup: &Setup, options: &Options) -> StreamJob {
 	StreamJob {
 		name: setup.archive.name().unwrap().to_owned(),
 		len: setup.archive.size(),
@@ -260,13 +260,13 @@ fn stream_job(setup: &Setup, password: Option<ArchivePassword>) -> StreamJob {
 			max_index_bytes: 32 << 20,
 			max_bytes: options.max_bytes,
 		},
-		password,
+		password: options.password.clone(),
 	}
 }
 
 /// Runs the real codec on its own thread.
 fn start(setup: &Setup, options: Options) -> Job {
-	let job = stream_job(setup, options.password.clone());
+	let job = stream_job(setup, &options);
 	start_with(
 		setup,
 		options,
@@ -1689,13 +1689,15 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 	let codec = Arc::new(Mutex::new(None));
 	let job = {
 		let codec = Arc::clone(&codec);
-		let job = stream_job(&setup, Some(ArchivePassword::new(password).unwrap()));
+		let options = Options {
+			control,
+			password: Some(ArchivePassword::new(password).unwrap()),
+			..Options::default()
+		};
+		let job = stream_job(&setup, &options);
 		start_with(
 			&setup,
-			Options {
-				control,
-				..Options::default()
-			},
+			options,
 			Box::new(move || {
 				let link = worker::start(move |port| extract_stream(&port, job))?;
 				*codec.lock().unwrap() = Some(Arc::clone(&link.shared));
