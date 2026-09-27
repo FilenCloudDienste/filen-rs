@@ -543,13 +543,16 @@ fn entries_read_out_of_order_reopen_their_folder() {
 	}
 }
 
-/// libarchive's `bsdtar`, when installed, reads ours and writes 7z we read.
+/// libarchive's `bsdtar` reads ours and writes 7z we read. macOS always ships it, so there it
+/// runs, and fails without it; elsewhere it is ignored rather than passing without checking
+/// anything (run it with `--ignored` where libarchive-tools is installed).
 #[test]
+#[cfg_attr(
+	not(target_os = "macos"),
+	ignore = "needs bsdtar, which only macOS always has"
+)]
 fn bsdtar_interop() {
-	let Ok(bsdtar) = which_bsdtar() else {
-		eprintln!("bsdtar is not installed: skipping");
-		return;
-	};
+	let bsdtar = which_bsdtar().expect("bsdtar is installed");
 	let dir = tempfile::tempdir().unwrap();
 	let sample = sample();
 	for method in [
@@ -602,11 +605,11 @@ fn bsdtar_interop() {
 			.args(["docs", "big.bin"])
 			.status()
 			.unwrap();
-		if !status.success() {
-			// libarchive builds differ in the 7z coders they write
-			eprintln!("bsdtar cannot write 7z with {compression}: skipping it");
-			continue;
-		}
+		// every libarchive built with zlib, bzip2 and liblzma writes them all, as macOS's is
+		assert!(
+			status.success(),
+			"bsdtar cannot write 7z with {compression}"
+		);
 		let mut read = read_all(&std::fs::read(&path).unwrap(), None)
 			.unwrap_or_else(|error| panic!("{compression}: {error}"));
 		read.sort_by(|a, b| a.0.cmp(&b.0));
@@ -623,7 +626,7 @@ fn bsdtar_interop() {
 	let _ = std::io::stdout().flush();
 }
 
-fn which_bsdtar() -> Result<std::path::PathBuf, ()> {
+fn which_bsdtar() -> Option<std::path::PathBuf> {
 	[
 		"/usr/bin/bsdtar",
 		"/usr/local/bin/bsdtar",
@@ -632,7 +635,6 @@ fn which_bsdtar() -> Result<std::path::PathBuf, ()> {
 	.into_iter()
 	.map(std::path::PathBuf::from)
 	.find(|path| path.exists())
-	.ok_or(())
 }
 
 #[test]
