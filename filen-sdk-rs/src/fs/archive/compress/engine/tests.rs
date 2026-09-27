@@ -998,3 +998,189 @@ async fn a_source_inside_another_goes_with_it() {
 	deleted.dedup();
 	assert_eq!(deleted.len(), 3);
 }
+
+fn run_permanent_disposal(setup: &Setup, targets: Vec<DisposalTarget>, control: JobControl) -> Job {
+	let hashed = vec![true; targets.len()];
+	let job = CompressJob {
+		format: CompressFormat::Tar { compression: None },
+		entries: setup.entries.clone(),
+		password: None,
+	};
+	start_disposing(
+		setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		control,
+		None,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+		Some(CompressDisposal {
+			how: SourceDisposal::DeletePermanently,
+			targets,
+			hashed,
+		}),
+		CompressReport::default(),
+	)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_a_partial_removal_did_not_reach_is_kept() {
+	// a.txt comes last in the folder's (uuid) order, and the removal stops at the second file
+	let setup = loop {
+		let setup = setup(|backend, files| {
+			backend
+				.fail_deletes_of
+				.insert(files[1].uuid().max(files[2].uuid()));
+		});
+		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
+		if ids[0] > ids[1] && ids[0] > ids[2] {
+			break setup;
+		}
+	};
+	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
+	let docs = Uuid::new_v4();
+	setup.backend.place_dir(docs, Uuid::new_v4());
+	for file in [&a, &big, &top] {
+		setup.backend.place_file(file.uuid(), docs, file.size());
+	}
+	let targets = vec![
+		DisposalTarget::Dir {
+			uuid: docs,
+			read: Tree {
+				files: [&a, &big, &top]
+					.iter()
+					.map(|file| (file.uuid(), file.size()))
+					.collect(),
+				dirs: Default::default(),
+			},
+		},
+		DisposalTarget::File(ExpectedFile::of(&a, a.uuid(), docs)),
+	];
+	let job = run_permanent_disposal(&setup, targets, JobControl::default());
+	let report = job.running.await.unwrap().unwrap();
+	let log = setup.backend.log();
+	assert_eq!(log.deleted_files, vec![big.uuid().min(top.uuid())]);
+	assert!(log.file_parents.contains_key(&a.uuid()));
+	assert!(
+		matches!(
+			report.dispositions[1].outcome,
+			DisposalOutcome::Kept { bytes_freed: 0, .. }
+		),
+		"{:?}",
+		report.dispositions
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_a_partial_removal_took_is_reported_removed() {
+	// a.txt comes first in the folder's (uuid) order, and the removal stops at the last file
+	let setup = loop {
+		let setup = setup(|backend, files| {
+			backend
+				.fail_deletes_of
+				.insert(files[1].uuid().max(files[2].uuid()));
+		});
+		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
+		if ids[0] < ids[1] && ids[0] < ids[2] {
+			break setup;
+		}
+	};
+	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
+	let docs = Uuid::new_v4();
+	setup.backend.place_dir(docs, Uuid::new_v4());
+	for file in [&a, &big, &top] {
+		setup.backend.place_file(file.uuid(), docs, file.size());
+	}
+	let targets = vec![
+		DisposalTarget::Dir {
+			uuid: docs,
+			read: Tree {
+				files: [&a, &big, &top]
+					.iter()
+					.map(|file| (file.uuid(), file.size()))
+					.collect(),
+				dirs: Default::default(),
+			},
+		},
+		DisposalTarget::File(ExpectedFile::of(&a, a.uuid(), docs)),
+	];
+	let job = run_permanent_disposal(&setup, targets, JobControl::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert!(setup.backend.log().deleted_files.contains(&a.uuid()));
+	assert!(
+		matches!(
+			report.dispositions[0].outcome,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Failed { .. },
+				bytes_freed
+			} if bytes_freed > 0
+		),
+		"{:?}",
+		report.dispositions
+	);
+	assert!(
+		matches!(
+			report.dispositions[1].outcome,
+			DisposalOutcome::Disposed {
+				how: SourceDisposal::DeletePermanently,
+				bytes_freed: 0
+			}
+		),
+		"{:?}",
+		report.dispositions
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folders_whose_reads_hold_each_other_are_kept() {
+	let setup = setup(|_, _| {});
+	let [x, y] = [Uuid::new_v4(), Uuid::new_v4()];
+	let holding = |other| DisposalTarget::Dir {
+		uuid: if other == y { x } else { y },
+		read: Tree {
+			files: Default::default(),
+			dirs: [other].into(),
+		},
+	};
+	let targets = vec![holding(y), holding(x)];
+	let job = run_permanent_disposal(&setup, targets, JobControl::default());
+	let report = tokio::time::timeout(Duration::from_secs(30), job.running)
+		.await
+		.expect("the disposal ends")
+		.unwrap()
+		.unwrap();
+	assert_eq!(report.dispositions.len(), 2);
+	for disposition in &report.dispositions {
+		assert!(
+			matches!(
+				disposition.outcome,
+				DisposalOutcome::Kept {
+					reason: KeptReason::Changed,
+					bytes_freed: 0
+				}
+			),
+			"{disposition:?}"
+		);
+	}
+	assert!(setup.backend.log().deleted_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_early_end_tells_the_callback_of_every_kept_source() {
+	let setup = setup(|backend, _| {
+		backend
+			.fail_fetch
+			.insert("big.bin".to_owned(), ErrorKind::Server);
+	});
+	let placed = place(&setup);
+	let targets = targets(&setup, &placed);
+	let job = run_permanent_disposal(&setup, targets, JobControl::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.report.dispositions.len(), 2);
+	let told = job
+		.recorder
+		.events()
+		.into_iter()
+		.filter(|event| matches!(event, CompressEvent::SourceDisposition(_)))
+		.count();
+	assert_eq!(told, 2);
+}

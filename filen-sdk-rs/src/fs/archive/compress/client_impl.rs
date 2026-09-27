@@ -11,7 +11,9 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			dispose::{ExpectedFile, SourceDisposal, Tree},
+			dispose::{
+				DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, SourceDisposition, Tree,
+			},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
 		},
@@ -38,7 +40,9 @@ use super::{
 	ArchivePassword, CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
 	engine::{CompressDisposal, CompressTask, DisposalTarget, Source, run_compress},
-	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
+	report::{
+		CompressCallback, CompressEvent, CompressFailed, CompressPhase, CompressReport, Reporter,
+	},
 };
 
 #[derive(Debug, Clone)]
@@ -81,7 +85,32 @@ impl Client {
 	) -> Result<CompressReport, CompressFailed> {
 		let reporter = Reporter::new(callback);
 		let archives = self.client().state().archives().clone();
-		let refuse = |report: CompressReport, phase, error: Error| {
+		// every source a disposal was asked for is reported, however early the job ends
+		let requested: Vec<Uuid> = match &sources {
+			CompressSources::Keep(_) => Vec::new(),
+			CompressSources::Dispose { items, .. } => {
+				items.iter().map(|item| item.uuid()).collect()
+			}
+		};
+		let refuse = |mut report: CompressReport, phase, error: Error| {
+			let reason = if phase == CompressPhase::Cancelled {
+				KeptReason::Interrupted
+			} else {
+				KeptReason::Incomplete
+			};
+			report.dispositions = requested
+				.iter()
+				.map(|&uuid| SourceDisposition {
+					uuid,
+					outcome: DisposalOutcome::Kept {
+						reason: reason.clone(),
+						bytes_freed: 0,
+					},
+				})
+				.collect();
+			for disposition in &report.dispositions {
+				reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
+			}
 			reporter.finish_unstarted(phase, report.totals);
 			CompressFailed {
 				report: CompressReport {

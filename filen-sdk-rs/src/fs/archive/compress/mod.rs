@@ -42,6 +42,10 @@ pub enum CompressSources {
 	/// The archive is not read back first. With an encrypted format, have the user confirm the
 	/// password before removing anything for good: a mistyped one leaves an archive nobody can
 	/// open.
+	///
+	/// An item given twice, or inside another given folder, shares that one's outcome, its bytes
+	/// counted there; a file of it that the folder's permanent removal deleted before stopping
+	/// is reported removed.
 	Dispose {
 		how: SourceDisposal,
 		items: Vec<NonRootItemType<'static, Normal>>,

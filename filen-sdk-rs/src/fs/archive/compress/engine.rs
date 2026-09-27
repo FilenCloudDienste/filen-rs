@@ -238,6 +238,9 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		} else {
 			KeptReason::Incomplete
 		});
+		for disposition in &report.dispositions {
+			reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
+		}
 		reporter.finish(phase);
 		report.counts = reporter.counts();
 		CompressFailed {
@@ -368,12 +371,18 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 				Err(Stopped) => disposal
 					.targets
 					.iter()
-					.map(|target| SourceDisposition {
-						uuid: target.uuid(),
-						outcome: DisposalOutcome::Kept {
-							reason: KeptReason::Interrupted,
-							bytes_freed: 0,
-						},
+					.map(|target| {
+						let disposition = SourceDisposition {
+							uuid: target.uuid(),
+							outcome: DisposalOutcome::Kept {
+								reason: KeptReason::Interrupted,
+								bytes_freed: 0,
+							},
+						};
+						driver
+							.reporter
+							.event(CompressEvent::SourceDisposition(disposition.clone()));
+						disposition
 					})
 					.collect(),
 			};
@@ -414,6 +423,13 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			(CompressPhase::Done, Ok(()))
 		}
 	};
+	// a finished disposal told of each source as it went; the kept ones an early end reports
+	// are told here
+	if result.is_err() {
+		for disposition in &report.dispositions {
+			reporter.event(CompressEvent::SourceDisposition(disposition.clone()));
+		}
+	}
 	reporter.finish(phase);
 	report.counts = reporter.counts();
 	match result {
@@ -785,7 +801,7 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		// a source inside another (a file and its folder both given) goes with that one: its
 		// removal removes it, and its own attempt would only find it gone
-		let within: Vec<Option<usize>> = targets
+		let mut within: Vec<Option<usize>> = targets
 			.iter()
 			.enumerate()
 			.map(|(index, target)| {
@@ -807,18 +823,45 @@ impl<B: DisposalBackend> Driver<B> {
 				})
 			})
 			.collect();
+		// a move between two folders' listings can leave each read holding the other: a chain
+		// like that has no outermost source, so every source on or behind it is kept as changed
+		let cyclic: Vec<bool> = (0..within.len())
+			.map(|request| {
+				let mut outer = request;
+				for _ in 0..within.len() {
+					match within[outer] {
+						Some(next) => outer = next,
+						None => return false,
+					}
+				}
+				true
+			})
+			.collect();
+		for (within, _) in within
+			.iter_mut()
+			.zip(&cyclic)
+			.filter(|(_, cyclic)| **cyclic)
+		{
+			*within = None;
+		}
 		let nested_uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
 		let nested_files: Vec<bool> = targets
 			.iter()
 			.map(|target| matches!(target, DisposalTarget::File(_)))
 			.collect();
 		let mut outcomes: Vec<Option<(Uuid, DisposalOutcome)>> = Vec::with_capacity(targets.len());
+		// the files each folder's permanent removal deleted, even when it stopped part way
+		let mut deleted = vec![BTreeSet::new(); targets.len()];
 		for (request, target) in targets.into_iter().enumerate() {
 			if within[request].is_some() {
 				outcomes.push(None);
 				continue;
 			}
-			let held_back = archive_reason.clone().or_else(|| own_reason(request));
+			let held_back = if cyclic[request] {
+				Some(KeptReason::Changed)
+			} else {
+				archive_reason.clone().or_else(|| own_reason(request))
+			};
 			let (uuid, outcome) = match (&held_back, target) {
 				(Some(reason), target) => (
 					target.uuid(),
@@ -833,7 +876,15 @@ impl<B: DisposalBackend> Driver<B> {
 				),
 				(None, DisposalTarget::Dir { uuid, read }) => (
 					uuid,
-					dispose_dir(&*self.backend, uuid, &read, how, &self.control).await,
+					dispose_dir(
+						&*self.backend,
+						uuid,
+						&read,
+						how,
+						&self.control,
+						&mut deleted[request],
+					)
+					.await,
 				),
 				(None, DisposalTarget::Unavailable { uuid }) => (
 					uuid,
@@ -845,10 +896,10 @@ impl<B: DisposalBackend> Driver<B> {
 			};
 			outcomes.push(Some((uuid, outcome)));
 		}
-		let mut resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
+		let resolved: Vec<(Uuid, DisposalOutcome)> = (0..outcomes.len())
 			.map(|request| {
 				let mut outer = request;
-				// containment is strict, so the chain ends
+				// the chains are acyclic: cycles were cut above
 				while let Some(next) = within[outer] {
 					outer = next;
 				}
@@ -863,6 +914,16 @@ impl<B: DisposalBackend> Driver<B> {
 						how,
 						bytes_freed: 0,
 					},
+					// a folder removed for good only in part may have taken a file given on
+					// its own too
+					DisposalOutcome::Kept { .. }
+						if nested_files[request] && deleted[outer].contains(&uuid) =>
+					{
+						DisposalOutcome::Disposed {
+							how: SourceDisposal::DeletePermanently,
+							bytes_freed: 0,
+						}
+					}
 					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::Kept {
 						reason,
 						bytes_freed: 0,
@@ -871,36 +932,6 @@ impl<B: DisposalBackend> Driver<B> {
 				(uuid, outcome)
 			})
 			.collect();
-		// a folder removed for good only in part may have taken a file given on its own too
-		for (request, (uuid, outcome)) in resolved.iter_mut().enumerate() {
-			let partly_removed = matches!(
-				outcome,
-				DisposalOutcome::Kept { bytes_freed, .. } if *bytes_freed == 0
-			) && within[request].is_some()
-				&& nested_files[request];
-			if partly_removed {
-				let mut outer = request;
-				while let Some(next) = within[outer] {
-					outer = next;
-				}
-				let outer_freed = matches!(
-					outcomes[outer],
-					Some((_, DisposalOutcome::Kept { bytes_freed, .. })) if bytes_freed > 0
-				);
-				if outer_freed
-					&& self
-						.backend
-						.file_state(*uuid)
-						.await
-						.map_or(true, |state| state.trash)
-				{
-					*outcome = DisposalOutcome::Disposed {
-						how: SourceDisposal::DeletePermanently,
-						bytes_freed: 0,
-					};
-				}
-			}
-		}
 		resolved
 			.into_iter()
 			.map(|(uuid, outcome)| {

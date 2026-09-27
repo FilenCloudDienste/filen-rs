@@ -87,6 +87,7 @@ pub enum DisposalOutcome {
 		reason: KeptReason,
 		/// Bytes of its files already deleted for good when a permanent removal stopped part
 		/// way (0 otherwise): those files are gone, and only the job's output still holds them.
+		/// Empty files may be gone too while this is 0.
 		bytes_freed: u64,
 	},
 }
@@ -339,6 +340,7 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	read: &Tree,
 	how: SourceDisposal,
 	control: &JobControl,
+	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
 	if control.is_stopping() {
 		return kept(KeptReason::Interrupted);
@@ -380,6 +382,7 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 				);
 			}
 			bytes_freed += size;
+			deleted.insert(uuid);
 		}
 		// only a directory the job emptied is trashed: anything that arrived since stays
 		match backend.list_tree(dir).await {
