@@ -887,6 +887,8 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn codec_finished(&mut self, result: CodecResult) {
+		// the codec holds no chunk any more
+		self.reading = None;
 		match &result {
 			Ok(end) => {
 				self.report.unaccounted_bytes = end.unaccounted_bytes;

@@ -1771,6 +1771,34 @@ async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_archive_read_to_its_end_holds_no_memory() {
+	let big = pattern(3 * CHUNK_SIZE, 8);
+	let setup = setup("bundle.tar", tar_of(&[("big.bin", &big)]), |backend| {
+		backend
+			.slow_finish
+			.insert("big.bin".to_owned(), Duration::from_secs(3));
+	});
+	let job = start(&setup, Options::default());
+	wait_until("big.bin registers, the archive read", || {
+		setup
+			.backend
+			.log()
+			.finishing
+			.contains(&"big.bin".to_owned())
+	})
+	.await;
+	// while it still registers
+	let released = wait_until("the codec's last chunk is given back", || {
+		setup.backend.memory.available_permits() == setup.backend.budget
+	});
+	tokio::time::timeout(Duration::from_secs(2), released)
+		.await
+		.expect("the last chunk is given back once the codec ended");
+	job.running.await.unwrap().unwrap();
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_paused_winds_down() {
 	let setup = setup(
 		"bundle.tar",
