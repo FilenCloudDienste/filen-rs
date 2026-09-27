@@ -376,6 +376,12 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 		Err(Stopped) => return kept(KeptReason::Interrupted),
 	}
 	let mut bytes_freed = 0;
+	// once files are deleted, whatever stops the removal leaves them deleted: every outcome says
+	// how many
+	let partly = |reason, bytes_freed| DisposalOutcome::Kept {
+		reason,
+		bytes_freed,
+	};
 	if how == SourceDisposal::DeletePermanently {
 		// every file is checked before any is deleted: a directory is removed whole or not at
 		// all for this reason
@@ -390,11 +396,6 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 				Err(Stopped) => return kept(KeptReason::Interrupted),
 			}
 		}
-		// from here on, what stops the removal leaves files deleted: every outcome says how many
-		let partly = |reason, bytes_freed| DisposalOutcome::Kept {
-			reason,
-			bytes_freed,
-		};
 		for (&uuid, &size) in &read.files {
 			if control.is_stopping() {
 				return partly(KeptReason::Interrupted, bytes_freed);
@@ -426,18 +427,15 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 		}
 	}
 	if control.is_stopping() {
-		return DisposalOutcome::Kept {
-			reason: KeptReason::Interrupted,
-			bytes_freed,
-		};
+		return partly(KeptReason::Interrupted, bytes_freed);
 	}
 	match backend.trash_dir(dir).await {
 		Ok(()) => DisposalOutcome::Disposed { how, bytes_freed },
-		Err(error) => DisposalOutcome::Kept {
-			reason: KeptReason::Failed {
+		Err(error) => partly(
+			KeptReason::Failed {
 				error: Arc::new(error),
 			},
 			bytes_freed,
-		},
+		),
 	}
 }

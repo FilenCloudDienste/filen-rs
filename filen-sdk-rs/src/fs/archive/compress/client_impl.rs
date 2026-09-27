@@ -185,7 +185,6 @@ impl Client {
 		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
 		// a permanent disposal reads the archive back as extracting would
-		// a permanent disposal reads the archive back as extracting would
 		let read_back = (how == Some(SourceDisposal::DeletePermanently))
 			.then(|| ReadBack::as_extracting(&entries, &archives, config.password.clone()));
 		let job = CompressJob {

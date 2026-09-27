@@ -46,6 +46,7 @@ use crate::{
 			name_retry::NameRetry,
 		},
 		file::{
+			RemoteFile,
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
@@ -416,11 +417,12 @@ pub(crate) fn end_early(
 	error: Arc<Error>,
 ) -> CompressFailed {
 	let cancelled = phase == CompressPhase::Cancelled;
-	report.dispositions = kept_on_early_end(requested, cancelled);
-	reporter.dispositions(&report.dispositions);
+	// before the dispositions go out, so their update reads as cancelling
 	if cancelled {
 		reporter.set_cancelling();
 	}
+	report.dispositions = kept_on_early_end(requested, cancelled);
+	reporter.dispositions(&report.dispositions);
 	reporter.finish_early(phase, report.totals);
 	report.counts = reporter.counts();
 	CompressFailed { report, error }
@@ -766,7 +768,7 @@ impl<B: DisposalBackend> Driver<B> {
 	async fn dispose(
 		&mut self,
 		disposal: CompressDisposal,
-		archive: &crate::fs::file::RemoteFile,
+		archive: &RemoteFile,
 		incomplete: bool,
 	) -> Vec<SourceDisposition> {
 		let CompressDisposal {
@@ -777,8 +779,9 @@ impl<B: DisposalBackend> Driver<B> {
 		let read_back = self.read_back.take();
 		// a source whose own files could not be checked is kept on its own; anything wrong
 		// with the archive keeps them all
+		let mismatched = std::mem::take(&mut self.mismatched);
 		let own_reason = |request: usize| {
-			if self.mismatched.contains(&request) {
+			if mismatched.contains(&request) {
 				Some(KeptReason::HashMismatch)
 			} else if how == SourceDisposal::DeletePermanently && !hashed[request] {
 				Some(KeptReason::HashUnavailable)
@@ -810,16 +813,7 @@ impl<B: DisposalBackend> Driver<B> {
 						&& state.size == self.written
 						&& state.chunks == self.next_index =>
 				{
-					read_back_reason(
-						&*self.backend,
-						&self.control,
-						&self.reporter,
-						&self.sources,
-						how,
-						archive,
-						read_back,
-					)
-					.await
+					self.read_back(how, archive, read_back).await
 				}
 				Ok(_) => Some(KeptReason::Unconfirmed),
 				Err(Stopped) => Some(KeptReason::Interrupted),
@@ -965,13 +959,50 @@ impl<B: DisposalBackend> Driver<B> {
 			.collect()
 	}
 
+	/// Why the sources are kept after reading `archive` back, which a permanent disposal needs:
+	/// the encoders are the SDK's own, and nothing else would hold the data if one were wrong.
+	async fn read_back(
+		&mut self,
+		how: SourceDisposal,
+		archive: &RemoteFile,
+		read_back: Option<ReadBack>,
+	) -> Option<KeptReason> {
+		if how == SourceDisposal::Trash {
+			return None;
+		}
+		let Some(read_back) = read_back else {
+			return Some(KeptReason::Unconfirmed);
+		};
+		// every source was read to its end, so each hash is of all of it; nothing reads the
+		// sources' paths again
+		let files = self
+			.sources
+			.iter_mut()
+			.map(|source| (std::mem::take(&mut source.path), source.hasher.finalize()))
+			.collect();
+		let verdict = reads_back(
+			&*self.backend,
+			&self.control,
+			&self.reporter,
+			archive,
+			read_back,
+			files,
+		)
+		.await;
+		match verdict {
+			Ok(true) => None,
+			Ok(false) => Some(KeptReason::Unconfirmed),
+			Err(Stopped) => Some(KeptReason::Interrupted),
+		}
+	}
+
 	/// Registers the uploaded archive in the destination.
 	async fn register(
 		&mut self,
 		name: ValidatedName,
 		shape: NameShape,
 		targets: ConnectedTargets,
-	) -> Result<crate::fs::file::RemoteFile, Stopped> {
+	) -> Result<RemoteFile, Stopped> {
 		let now = Utc::now();
 		let completion = UploadCompletion {
 			written: self.written,
@@ -1028,35 +1059,6 @@ impl<B: DisposalBackend> Driver<B> {
 				Err(Stopped)
 			}
 		}
-	}
-}
-
-/// Why the sources are kept after reading `archive` back, which a permanent disposal needs: the
-/// encoders are the SDK's own, and nothing else would hold the data if one were wrong.
-async fn read_back_reason<B: DriveBackend>(
-	backend: &B,
-	control: &JobControl,
-	reporter: &Reporter,
-	sources: &[SourceState],
-	how: SourceDisposal,
-	archive: &crate::fs::file::RemoteFile,
-	read_back: Option<ReadBack>,
-) -> Option<KeptReason> {
-	if how == SourceDisposal::Trash {
-		return None;
-	}
-	let Some(read_back) = read_back else {
-		return Some(KeptReason::Unconfirmed);
-	};
-	// every source was read to its end, so each hash is of all of it
-	let files = sources
-		.iter()
-		.map(|source| (source.path.clone(), source.hasher.finalize()))
-		.collect();
-	match reads_back(backend, control, reporter, archive, read_back, files).await {
-		Ok(true) => None,
-		Ok(false) => Some(KeptReason::Unconfirmed),
-		Err(Stopped) => Some(KeptReason::Interrupted),
 	}
 }
 
