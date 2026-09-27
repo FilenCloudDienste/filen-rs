@@ -240,6 +240,17 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		}
 	}
 
+	// Leased and floored before anything is read, so a waiting job holds nothing and does
+	// nothing. A pause asked for before then is recorded first: the job reads paused while it
+	// waits it out, never running.
+	reporter.set_pause_requested(control.is_pause_requested());
+	reporter.set_phase(CompressPhase::WaitingForWorker);
+	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
+		reporter.set_cancelling();
+		return Err(fail(report, CompressPhase::Cancelled, cancelled()));
+	};
+	reporter.set_phase(CompressPhase::Compressing);
+
 	// the archive's name is picked against the destination up front, and checked again when it
 	// is registered
 	let prepared = async {
@@ -254,13 +265,6 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
 		Err(Stopped) => return Err(fail(report, CompressPhase::Cancelled, cancelled())),
 	};
-
-	reporter.set_phase(CompressPhase::WaitingForWorker);
-	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
-		reporter.set_cancelling();
-		return Err(fail(report, CompressPhase::Cancelled, cancelled()));
-	};
-	reporter.set_phase(CompressPhase::Compressing);
 	let link = match start() {
 		Ok(link) => link,
 		Err(error) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),

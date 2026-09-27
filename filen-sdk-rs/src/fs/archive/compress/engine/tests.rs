@@ -1608,11 +1608,9 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 	pause.send_replace(false);
 	let report = paused.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, 3);
-	// updates before it reached the slot's queue read running: the pause is taken up there
-	let states = run_states(&paused.recorder);
-	assert!(
-		states.ends_with(&[RunState::Paused, RunState::Running]),
-		"{states:?}"
+	assert_eq!(
+		run_states(&paused.recorder),
+		[RunState::Paused, RunState::Running]
 	);
 	assert_released(&setup_paused, &paused.reporter);
 	assert!(setup_paused.config.floor_is_free());
