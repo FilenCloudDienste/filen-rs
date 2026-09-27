@@ -20,6 +20,7 @@ use crate::{
 			report::{CopyCallback, CopyUpdate, RunState},
 		},
 		dir::{RootDirectory, meta::DecryptedDirectoryMeta},
+		drive_job::name_retry::TOP_LEVEL_NAME_ATTEMPTS,
 		file::{
 			AnonymousRemoteFile,
 			enums::RemoteFileType,

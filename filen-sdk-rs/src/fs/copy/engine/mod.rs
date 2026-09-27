@@ -47,14 +47,19 @@ use crate::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
-		drive_job::backend::{CreatedDir, DriveBackend, UploadSpec},
+		drive_job::{
+			backend::{CreatedDir, DriveBackend, UploadSpec},
+			ends_job,
+			lock::{HeldLock, LockWait, wait_for_lock},
+			name_retry::NameRetry,
+		},
 		file::{
 			RemoteFile,
 			read::{check_chunks_consistent, chunk_plaintext_len},
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
-		name::{ValidatedName, keep_both::TakenNames},
+		name::ValidatedName,
 	},
 	job::{JobControl, JobTasks, Stopped},
 	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
@@ -71,63 +76,6 @@ use super::{
 /// Chunks of one file in flight at once. More only helps a single large file; with several
 /// files running, the memory budget is the bound.
 const CHUNKS_PER_FILE: usize = 4;
-
-/// How many names a top-level item tries when the ones it picks turn out to be taken at the
-/// destination (by an entry the listing could not name, or one created since the listing).
-const TOP_LEVEL_NAME_ATTEMPTS: usize = 8;
-
-/// The keep-both names a top-level item moves through when the destination turns out to hold
-/// the one it picked.
-struct NameRetry {
-	taken: TakenNames,
-	attempts: usize,
-	is_dir: bool,
-}
-
-impl NameRetry {
-	fn new(is_dir: bool) -> Self {
-		Self {
-			taken: TakenNames::default(),
-			attempts: 0,
-			is_dir,
-		}
-	}
-
-	/// The next name after `taken_name`, or an error once [`TOP_LEVEL_NAME_ATTEMPTS`] names
-	/// were tried.
-	fn next(&mut self, taken_name: ValidatedName) -> Result<ValidatedName, Error> {
-		self.attempts += 1;
-		if self.attempts >= TOP_LEVEL_NAME_ATTEMPTS {
-			return Err(Error::custom(
-				ErrorKind::InvalidState,
-				"could not find a free name for the copy at the destination",
-			));
-		}
-		self.taken.insert(taken_name.as_ref());
-		Ok(self.taken.allocate(taken_name, self.is_dir)?)
-	}
-
-	/// `name`, or the first following keep-both name the server reports free in `parent`.
-	async fn free_name<B: DriveBackend>(
-		&mut self,
-		backend: &B,
-		parent: Uuid,
-		mut name: ValidatedName,
-	) -> Result<ValidatedName, Error> {
-		while backend.name_exists(parent, &name).await? {
-			name = self.next(name)?;
-		}
-		Ok(name)
-	}
-}
-
-/// Errors after which nothing else can succeed either.
-fn ends_job(error: &Error) -> bool {
-	matches!(
-		error.kind(),
-		ErrorKind::MaxStorageReached | ErrorKind::Unauthenticated
-	)
-}
 
 /// A created directory with the name it got, or why it was not created.
 type DirResult = Result<(RemoteDirectory, ValidatedName), DirError>;
@@ -440,7 +388,7 @@ where
 				}
 			} else {
 				if keep_warm.is_none() && !ready.is_empty() {
-					match wait_for_lock(&*self.backend, &self.control, &self.reporter).await {
+					match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await {
 						Ok(LockWait::Locked(held)) => keep_warm = Some(held),
 						// the loop reports the pause or the stop and waits it out
 						Ok(LockWait::Paused) | Err(Stopped) => continue,
@@ -756,7 +704,7 @@ where
 				continue;
 			}
 			let _lock = loop {
-				match wait_for_lock(&*self.backend, &self.control, &self.reporter).await? {
+				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
 					LockWait::Locked(held) => break held,
 					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
 					LockWait::Failed(error) => {
@@ -836,7 +784,7 @@ async fn create_dir<B: DriveBackend>(task: DirTask<B>) -> DirResult {
 	// The shared lock the job holds is normally handed out at once; a fresh acquisition (its
 	// lease was lost) can wait long. Nothing is sent before the lock is held, so a pause or stop
 	// until then leaves the create to be tried again; once held, the create runs to the end.
-	let _lock = match wait_for_lock(backend, &control, &reporter).await {
+	let _lock = match wait_for_lock(backend, &control, &reporter.ops()).await {
 		Ok(LockWait::Locked(held)) => held,
 		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
 		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(stage, error)),
@@ -932,46 +880,6 @@ struct FileOutcome {
 struct ChunkReservation {
 	_permit: OwnedSemaphorePermit,
 	_op: OpGuard,
-}
-
-/// The drive lock, held as one of the job's in-flight operations. The lock is dropped before
-/// the operation ends, so the job is only reported paused once the lock is gone.
-struct HeldLock<L> {
-	_lock: L,
-	_op: OpGuard,
-}
-
-enum LockWait<L> {
-	Locked(HeldLock<L>),
-	/// A pause was requested while waiting; nothing is held.
-	Paused,
-	Failed(Error),
-}
-
-/// Waits for the drive lock, which another client may hold for a long time. A stop ends the
-/// wait (`Err`), and a pause requested meanwhile ends it or drops the lock just acquired, so a
-/// paused job holds no lock. After [`LockWait::Paused`] the caller waits out the pause before
-/// trying again.
-async fn wait_for_lock<B: DriveBackend>(
-	backend: &B,
-	control: &JobControl,
-	reporter: &MaybeArc<Reporter>,
-) -> Result<LockWait<B::DriveLock>, Stopped> {
-	let op = reporter.op();
-	let result = tokio::select! {
-		biased;
-		() = control.stopping() => return Err(Stopped),
-		() = control.pause_changed(false) => return Ok(LockWait::Paused),
-		result = backend.acquire_drive_lock() => result,
-	};
-	Ok(match result {
-		Ok(_) if control.is_pause_requested() => LockWait::Paused,
-		Ok(lock) => LockWait::Locked(HeldLock {
-			_lock: lock,
-			_op: op,
-		}),
-		Err(error) => LockWait::Failed(error),
-	})
 }
 
 /// Waits for the job to be running and for memory for chunk `index`. A pause that starts while
@@ -1168,7 +1076,7 @@ async fn copy_file_inner<B: DriveBackend>(
 	// even on cancel, so a file that exists is always reported.
 	let _lock = loop {
 		control.checkpoint().await?;
-		match wait_for_lock(&*backend, &control, &reporter).await? {
+		match wait_for_lock(&*backend, &control, &reporter.ops()).await? {
 			LockWait::Locked(held) => break held,
 			LockWait::Paused => {}
 			LockWait::Failed(error) => return Err(FileError::Failed(CopyStage::Finalize, error)),
