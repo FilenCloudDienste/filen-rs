@@ -523,6 +523,8 @@ impl<B: DisposalBackend> Driver<B> {
 	/// is reading stays resident until it asks again, held against the job's own input slot
 	/// instead of the client's memory budget.
 	async fn pause(&mut self) -> Result<(), Stopped> {
+		// the job counts as paused only once everything below is given back
+		let releasing = self.reporter.op();
 		self.fetches = FuturesOrdered::new();
 		self.ready.clear();
 		self.next_fetch = self.next_served;
@@ -535,6 +537,7 @@ impl<B: DisposalBackend> Driver<B> {
 				"the input slot is free while pausing"
 			);
 		}
+		drop(releasing);
 		self.reporter.checkpoint(&self.control).await?;
 		let floor = self.control.until_stopping(self.config.floor()).await?;
 		self.floor = Some(floor);

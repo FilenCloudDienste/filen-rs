@@ -10,7 +10,10 @@ use std::{
 };
 
 use chrono::Utc;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+	sync::{Semaphore, mpsc},
+	task::JoinHandle,
+};
 
 use super::*;
 use crate::{
@@ -53,6 +56,10 @@ use crate::{
 struct Recorder {
 	created: Mutex<Vec<RemoteFile>>,
 	updates: Mutex<Vec<CompressUpdate>>,
+	/// The client's memory budget, to see what an update reading paused was sent with.
+	memory: Option<Arc<Semaphore>>,
+	/// The budget's free permits at each update reading paused.
+	free_when_paused: Mutex<Vec<usize>>,
 }
 
 impl CompressCallback for Recorder {
@@ -61,6 +68,14 @@ impl CompressCallback for Recorder {
 	}
 
 	fn on_update(&self, update: CompressUpdate) {
+		if update.run_state == RunState::Paused
+			&& let Some(memory) = &self.memory
+		{
+			self.free_when_paused
+				.lock()
+				.unwrap()
+				.push(memory.available_permits());
+		}
 		self.updates.lock().unwrap().push(update);
 	}
 }
@@ -207,7 +222,10 @@ fn start_disposing(
 	disposal: Option<CompressDisposal>,
 	report: CompressReport,
 ) -> Job {
-	let recorder = Arc::new(Recorder::default());
+	let recorder = Arc::new(Recorder {
+		memory: Some(Arc::clone(&setup.backend.memory)),
+		..Recorder::default()
+	});
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
 	let config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
@@ -1482,13 +1500,23 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 		None,
 		Box::new(move || Ok(link)),
 	);
-	// the first source's chunk takes the job's own slot, the chunk being read the client's
-	// budget
+	// the first source's chunk takes the job's own slot; the chunk being read and the two
+	// fetched ahead of it take the client's budget
 	read_into_the_second_source(&events).await;
+	let budget = setup.backend.budget;
+	wait_until("two chunks are fetched ahead", || {
+		setup.backend.memory.available_permits() == budget - 3 * CHUNK_BYTES
+	})
+	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert_released(&setup, &job.reporter);
 	assert_eq!(job.recorder.last().run_state, RunState::Paused);
+	let free = job.recorder.free_when_paused.lock().unwrap().clone();
+	assert!(
+		!free.is_empty() && free.iter().all(|&free| free == budget),
+		"no update reads paused while the budget is held: {free:?}"
+	);
 
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
