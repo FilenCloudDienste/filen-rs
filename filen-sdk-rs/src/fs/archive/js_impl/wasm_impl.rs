@@ -1,0 +1,237 @@
+use std::sync::Arc;
+
+use filen_macros::js_type;
+use serde::Serialize;
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
+use web_sys::js_sys;
+
+use crate::{
+	Error,
+	auth::JsClient,
+	js::{AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture},
+};
+
+use super::{
+	Client, CompressCall, CompressDelivery, CompressFormat, CompressReport, ExpansionLimit,
+	ExtractConfig, ExtractDelivery, ExtractInto, ExtractReport, ExtractRequest, SourceDisposal,
+	compress_job, extract_job, extract_request, password,
+};
+
+#[js_type(import, no_ser, no_default)]
+pub struct ExtractArchiveParams {
+	pub archive: AnyFile,
+	pub destination: AnyNormalDir,
+	pub into: ExtractInto,
+	/// Storage still free on the account, if known: a zip or 7z stating more fails before
+	/// anything is written; a streaming archive (tar, one compressed file) fails once it has
+	/// written that much, keeping what it extracted.
+	#[serde(default)]
+	#[tsify(type = "number | bigint", optional)]
+	pub max_bytes: Option<u64>,
+	/// Most items to create.
+	#[serde(default)]
+	#[tsify(type = "number | bigint", optional)]
+	pub max_items: Option<u64>,
+	/// The guard against decompression bombs; when left out, the SDK's (1000 times the
+	/// archive, at least 256 MiB).
+	#[serde(default)]
+	#[tsify(optional)]
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// Removes the archive once everything in it was extracted and verified.
+	#[serde(default)]
+	#[tsify(optional)]
+	pub dispose: Option<SourceDisposal>,
+	#[tsify(type = "(update: ExtractUpdate) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_update: Option<js_sys::Function>,
+	/// Top-level items created, in batches: every one of them, also past the 1000 the report
+	/// keeps.
+	#[tsify(type = "(items: ExtractedTopLevelItem[]) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_top_level_created: Option<js_sys::Function>,
+	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
+	#[serde(default)]
+	pub managed_future: ManagedFuture,
+}
+
+#[js_type(import, no_ser, no_default)]
+pub struct CompressItemsParams {
+	pub items: Vec<AnyItemWithContext>,
+	pub destination: AnyNormalDir,
+	/// The archive's name, ending in the format's extension (see `archiveExtension`).
+	pub name: String,
+	pub format: CompressFormat,
+	/// Storage still free on the account, if known.
+	#[serde(default)]
+	#[tsify(type = "number | bigint", optional)]
+	pub max_bytes: Option<u64>,
+	/// Removes the items once the archive is registered and verified. The archive is not read
+	/// back first: with an encrypted format, have the user confirm the password (type it twice)
+	/// before removing anything for good, as a mistyped one leaves an archive nobody can open.
+	#[serde(default)]
+	#[tsify(optional)]
+	pub dispose: Option<SourceDisposal>,
+	#[tsify(type = "(update: CompressUpdate) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_update: Option<js_sys::Function>,
+	/// The archive is registered in the destination.
+	#[tsify(type = "(archive: File) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_archive_created: Option<js_sys::Function>,
+	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
+	#[serde(default)]
+	pub managed_future: ManagedFuture,
+}
+
+/// Calls `callback` with `value`, if the caller passed one.
+fn call(callback: Option<&js_sys::Function>, value: &impl Serialize) {
+	let Some(callback) = callback else {
+		return;
+	};
+	let serializer = serde_wasm_bindgen::Serializer::new()
+		.serialize_maps_as_objects(true)
+		.serialize_large_number_types_as_bigints(true);
+	let value = value
+		.serialize(&serializer)
+		.expect("failed to serialize an archive callback (should be impossible)");
+	let _ = callback.call1(&JsValue::UNDEFINED, &value);
+}
+
+async fn run_extract(
+	client: Arc<Client>,
+	request: ExtractRequest,
+	config: ExtractConfig,
+	on_update: Option<js_sys::Function>,
+	on_top_level_created: Option<js_sys::Function>,
+	managed_future: ManagedFuture,
+) -> Result<ExtractReport, Error> {
+	// The JS functions never leave this thread: the job sends its callbacks over a channel,
+	// and this task calls them here, in order.
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let (drained, drained_receiver) = tokio::sync::oneshot::channel::<()>();
+	crate::runtime::spawn_local(async move {
+		while let Some(delivery) = receiver.recv().await {
+			match delivery {
+				ExtractDelivery::TopLevelCreated(items) => {
+					call(on_top_level_created.as_ref(), &items)
+				}
+				ExtractDelivery::Update(update) => call(on_update.as_ref(), &update),
+			}
+		}
+		let _ = drained.send(());
+	});
+	let result = managed_future
+		.into_js_managed_commander_job(move |control| {
+			extract_job(client, request, config, sender, control)
+		})?
+		.await;
+	let _ = drained_receiver.await;
+	result
+}
+
+async fn run_compress(
+	client: Arc<Client>,
+	call_: CompressCall,
+	on_update: Option<js_sys::Function>,
+	on_archive_created: Option<js_sys::Function>,
+	managed_future: ManagedFuture,
+) -> Result<CompressReport, Error> {
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+	let (drained, drained_receiver) = tokio::sync::oneshot::channel::<()>();
+	crate::runtime::spawn_local(async move {
+		while let Some(delivery) = receiver.recv().await {
+			match delivery {
+				CompressDelivery::ArchiveCreated(archive) => {
+					call(on_archive_created.as_ref(), &archive)
+				}
+				CompressDelivery::Update(update) => call(on_update.as_ref(), &update),
+			}
+		}
+		let _ = drained.send(());
+	});
+	let result = managed_future
+		.into_js_managed_commander_job(move |control| compress_job(client, call_, sender, control))?
+		.await;
+	let _ = drained_receiver.await;
+	result
+}
+
+#[wasm_bindgen(js_class = "Client")]
+impl JsClient {
+	/// Extracts an archive (zip, 7z, tar and its compressed forms, or one compressed file)
+	/// into a directory, entirely in this browser: the archive is downloaded, decrypted and
+	/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
+	/// destination is kept, and the entry is named `name (1)`, ...
+	///
+	/// `password` opens an encrypted archive; without one the extract fails before anything is
+	/// created. A wrong one is found before anything is created too when the archive has an
+	/// encrypted entry small enough to check it on (16 MiB), else as the first encrypted entry
+	/// is read; folders created by then go to the trash. The report is returned whether the extract
+	/// completed, was cancelled or failed.
+	#[wasm_bindgen(js_name = "extractArchive")]
+	pub async fn extract_archive(
+		&self,
+		params: ExtractArchiveParams,
+		password: Option<String>,
+	) -> Result<ExtractReport, Error> {
+		// wrapped first, so an argument refused below still drops it wiped
+		let password = self::password(password)?;
+		let request = extract_request(
+			params.archive,
+			params.destination,
+			params.into,
+			params.dispose,
+		)?;
+		let config = ExtractConfig {
+			max_bytes: params.max_bytes,
+			max_items: params.max_items,
+			expansion_limit: params
+				.expansion_limit
+				.or(ExtractConfig::default().expansion_limit),
+			password,
+			// the bindings do not expose the option yet: the SDK's default
+			skip_mac_metadata: ExtractConfig::default().skip_mac_metadata,
+		};
+		run_extract(
+			self.inner(),
+			request,
+			config,
+			params.on_update,
+			params.on_top_level_created,
+			params.managed_future,
+		)
+		.await
+	}
+
+	/// Compresses items into a new archive in a directory, entirely in this browser. `name`
+	/// has to end in the format's extension (see `archiveExtension`); a name taken at the
+	/// destination is kept, and the archive is named `name (1).ext`, ...
+	///
+	/// `password` is required exactly when the format is encrypted. The report is returned
+	/// whether the compress completed, was cancelled or failed; a compress that did not
+	/// complete leaves nothing in the drive.
+	#[wasm_bindgen(js_name = "compressItems")]
+	pub async fn compress_items(
+		&self,
+		params: CompressItemsParams,
+		password: Option<String>,
+	) -> Result<CompressReport, Error> {
+		let call = CompressCall::new(
+			params.items,
+			params.destination,
+			&params.name,
+			params.format,
+			params.max_bytes,
+			params.dispose,
+			self::password(password)?,
+		)?;
+		run_compress(
+			self.inner(),
+			call,
+			params.on_update,
+			params.on_archive_created,
+			params.managed_future,
+		)
+		.await
+	}
+}
