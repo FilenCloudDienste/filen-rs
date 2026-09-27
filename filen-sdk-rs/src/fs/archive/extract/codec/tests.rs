@@ -935,11 +935,11 @@ fn an_empty_zip_crypto_entry_proves_no_password() {
 
 /// A zip whose directory entry is encrypted with AES, as the `zip` crate writes one started as a
 /// file named with a trailing slash.
-fn zip_with_encrypted_dir(dir_data: &[u8]) -> Vec<u8> {
-	use zip8::{AesMode, CompressionMethod, write::SimpleFileOptions};
+fn zip_with_encrypted_dir(method: zip8::CompressionMethod, dir_data: &[u8]) -> Vec<u8> {
+	use zip8::{AesMode, write::SimpleFileOptions};
 	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
 	let options = SimpleFileOptions::default()
-		.compression_method(CompressionMethod::Deflated)
+		.compression_method(method)
 		.with_aes_encryption(AesMode::Aes256, "pw");
 	writer.start_file("docs/", options).unwrap();
 	writer.write_all(dir_data).unwrap();
@@ -950,13 +950,17 @@ fn zip_with_encrypted_dir(dir_data: &[u8]) -> Vec<u8> {
 
 #[test]
 fn an_encrypted_directory_is_judged_by_its_length() {
-	let (seen, end) = run_full(&zip_with_encrypted_dir(b""), "aes.zip", LIMITS, Some("pw"));
-	assert_eq!(end.unwrap().unaccounted_bytes, 0, "{seen:?}");
-	let (_, end) = run_full(
-		&zip_with_encrypted_dir(b"not a directory's"),
-		"aes.zip",
-		LIMITS,
-		Some("pw"),
-	);
-	assert!(end.unwrap().unaccounted_bytes > 0);
+	use zip8::CompressionMethod;
+	for method in [
+		CompressionMethod::Stored,
+		CompressionMethod::Deflated,
+		CompressionMethod::Bzip2,
+	] {
+		let zip = zip_with_encrypted_dir(method, b"");
+		let (seen, end) = run_full(&zip, "aes.zip", LIMITS, Some("pw"));
+		assert_eq!(end.unwrap().unaccounted_bytes, 0, "{method:?}: {seen:?}");
+		let zip = zip_with_encrypted_dir(method, b"not a directory's");
+		let (_, end) = run_full(&zip, "aes.zip", LIMITS, Some("pw"));
+		assert!(end.unwrap().unaccounted_bytes > 0, "{method:?}");
+	}
 }

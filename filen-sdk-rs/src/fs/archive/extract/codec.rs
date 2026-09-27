@@ -604,8 +604,11 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	let data = entry.compressed_size.checked_sub(overhead);
 	match entry.method {
 		0 => data == Some(0),
-		// an empty deflate stream takes 2 bytes, too few for any literal and its block's end
-		8 => data.is_some_and(|data| data <= 2),
+		// an empty deflate (or deflate64) stream takes 2 bytes, too few for any literal and its
+		// block's end
+		8 | 9 => data.is_some_and(|data| data <= 2),
+		// an empty bzip2 stream is its 4-byte header and 10-byte end: no room for a block
+		12 => data.is_some_and(|data| data <= 14),
 		_ => false,
 	}
 }
