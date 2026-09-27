@@ -183,6 +183,11 @@ struct FileSlot<U> {
 }
 
 impl<U> FileSlot<U> {
+	/// Its size: as the archive states it, or else what was read of it.
+	fn bytes(&self) -> u64 {
+		self.active.size.unwrap_or(self.written)
+	}
+
 	/// The name the archive gives it: the last segment of its path.
 	fn archive_name(&self) -> &str {
 		self.path
@@ -470,10 +475,9 @@ fn report_file_failure<U>(
 		stage,
 		error,
 	};
-	let bytes = file.active.size.unwrap_or(file.written);
 	reporter.file_failed(
 		Some(file.active.dest_uuid),
-		bytes,
+		file.bytes(),
 		record_failure(report, failure),
 	);
 }
@@ -549,6 +553,15 @@ impl<B: DisposalBackend> Driver<B> {
 			self.reporter
 				.event(ExtractEvent::SourceDisposition(disposition.clone()));
 			self.report.dispositions.push(disposition);
+		}
+		if result.is_err() {
+			// planned and never started: a job that ends early leaves them
+			let unattempted = self
+				.dirs
+				.iter()
+				.filter(|dir| matches!(dir.state, DirState::Planned))
+				.count();
+			self.reporter.dirs_not_attempted(unattempted as u64);
 		}
 		if let Err(error) = &result
 			&& error.kind() == ErrorKind::ArchiveWrongPassword
@@ -755,7 +768,8 @@ impl<B: DisposalBackend> Driver<B> {
 			if let Some(file) = self.files.remove(&ordinal)
 				&& !file.failed
 			{
-				self.reporter.file_abandoned(file.active.dest_uuid);
+				self.reporter
+					.file_abandoned(file.active.dest_uuid, file.bytes());
 			}
 		}
 		self.current = None;
@@ -889,7 +903,8 @@ impl<B: DisposalBackend> Driver<B> {
 					&& let Some(file) = self.files.remove(&ordinal)
 					&& !file.failed
 				{
-					self.reporter.file_abandoned(file.active.dest_uuid);
+					self.reporter
+						.file_abandoned(file.active.dest_uuid, file.bytes());
 				}
 			}
 		}
@@ -1643,7 +1658,9 @@ impl<B: DisposalBackend> Driver<B> {
 					);
 				}
 			}
-			Err(FinalizeError::Stopped) => self.reporter.file_abandoned(file.active.dest_uuid),
+			Err(FinalizeError::Stopped) => self
+				.reporter
+				.file_abandoned(file.active.dest_uuid, file.bytes()),
 			Err(FinalizeError::RegisteredAsVersion {
 				file: registered,
 				propagation_errors,

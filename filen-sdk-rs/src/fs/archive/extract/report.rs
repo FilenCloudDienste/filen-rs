@@ -264,6 +264,10 @@ pub struct ExtractUpdate {
 
 /// The outcome of an extraction, whether it completed, was cancelled or failed. Directories
 /// and files it created stay; a file it was writing when it stopped never becomes visible.
+///
+/// An extraction knows no totals up front: an entry is only known once it is read. What one
+/// that ended early leaves [not attempted](ItemCounts::files_not_attempted) is what it had
+/// started or planned: the files it was writing and the directories it had not created yet.
 #[derive(Debug)]
 pub struct ExtractReport {
 	/// Items created directly in the destination (the new folder, or with
@@ -372,10 +376,9 @@ impl JobState for ExtractState {
 	}
 
 	fn settle(&mut self) {
-		// A file still running now was never finished. Nothing else is left unattempted: a
-		// streaming archive's entries are only known as they are read.
+		// a file still running now was never finished
 		for file in std::mem::take(&mut self.active) {
-			self.counts.bytes_done -= file.bytes_done;
+			self.not_attempted(&file);
 		}
 	}
 }
@@ -391,6 +394,13 @@ impl ExtractState {
 			Some(index) => self.active.remove(index).bytes_done,
 			None => 0,
 		}
+	}
+
+	/// Counts a file the job started and dropped: what it uploaded is no longer done.
+	fn not_attempted(&mut self, file: &ExtractActiveFile) {
+		self.counts.bytes_done -= file.bytes_done;
+		self.counts.files_not_attempted += 1;
+		self.counts.bytes_not_attempted += file.size.unwrap_or(file.bytes_done);
 	}
 }
 
@@ -511,11 +521,22 @@ impl Reporter {
 		});
 	}
 
-	/// A file that was running when the job stopped: it is neither done nor failed.
-	pub(crate) fn file_abandoned(&self, dest_uuid: Uuid) {
+	/// A file that was running when the job stopped, `bytes` in size: not attempted, neither done
+	/// nor failed.
+	pub(crate) fn file_abandoned(&self, dest_uuid: Uuid, bytes: u64) {
 		self.with_state(|state| {
 			let counted = state.remove_active(dest_uuid);
 			state.counts.bytes_done -= counted;
+			state.counts.files_not_attempted += 1;
+			state.counts.bytes_not_attempted += bytes;
+			state.core.mark_changed();
+		});
+	}
+
+	/// Directories planned that a job which ended early never started.
+	pub(crate) fn dirs_not_attempted(&self, count: u64) {
+		self.with_state(|state| {
+			state.counts.dirs_not_attempted += count;
 			state.core.mark_changed();
 		});
 	}

@@ -768,10 +768,17 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 	let failed = job.running.await.unwrap().unwrap_err();
 
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	assert_eq!(failed.report.counts.files_done, 1);
 	assert_eq!(
-		failed.report.counts.bytes_done, 4,
-		"the dropped file counts nothing"
+		failed.report.counts,
+		ItemCounts {
+			dirs_created: 1,
+			files_done: 1,
+			bytes_done: 4,
+			// the dropped file, at the size the archive states
+			files_not_attempted: 1,
+			bytes_not_attempted: CHUNK_SIZE as u64,
+			..ItemCounts::default()
+		}
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Cancelled);
 	assert_released(&setup, &job.reporter);
@@ -1639,6 +1646,54 @@ async fn a_pause_leaves_no_directory_uncreated() {
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.dirs_created, count as u64 + 1);
 	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_leaves_the_directories_not_created_yet_not_attempted() {
+	let count = MAX_SMALL_PARALLEL_REQUESTS + 10;
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		backend.delay = Duration::from_secs(10);
+	});
+	let (_pause, cancel, control) = controls();
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	for ordinal in 0..count {
+		events
+			.send(dir_entry(ordinal as u64, &format!("d{ordinal:03}")))
+			.await
+			.unwrap();
+	}
+	wait_until(
+		"every directory is planned, the first being created",
+		|| {
+			events.capacity() == events.max_capacity()
+				&& job.reporter.ops_in_flight() == MAX_SMALL_PARALLEL_REQUESTS as u64
+		},
+	)
+	.await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	drop((events, result));
+	assert_eq!(
+		failed.report.counts,
+		ItemCounts {
+			// the new folder, and the creates in flight, which finish
+			dirs_created: MAX_SMALL_PARALLEL_REQUESTS as u64 + 1,
+			dirs_not_attempted: 10,
+			..ItemCounts::default()
+		}
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
