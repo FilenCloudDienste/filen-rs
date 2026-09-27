@@ -11,19 +11,19 @@ use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
 use super::{
 	crypto::{AesStrength, AesWriter},
-	read::{CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, LOCAL_HEADER_SIG},
+	read::{
+		CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
+		FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG,
+	},
 };
 
 const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
-const FLAG_ENCRYPTED: u16 = 0x0001;
-const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
-const FLAG_UTF8: u16 = 0x0800;
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 const METHOD_BZIP2: u16 = 12;
 const METHOD_AES: u16 = 99;
-/// Unix (3), zip specification 6.3.
-const VERSION_MADE_BY: u16 = 0x033F;
+/// Made on Unix, to zip specification 6.3.
+const VERSION_MADE_BY: u16 = (HOST_UNIX << 8) | 63;
 /// An entry this large, or larger, is written with zip64 sizes: its compressed size may pass
 /// 4 GiB even though its data does not, since stored and deflated data can grow a little.
 const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
@@ -114,7 +114,8 @@ impl<W: Write> Write for Counting<W> {
 pub(crate) struct ZipWriter<W> {
 	out: Counting<W>,
 	entries: Vec<CentralEntry>,
-	/// [`ZIP64_ENTRY_THRESHOLD`], but for the tests, which cannot write 4 GiB to reach it.
+	/// [`ZIP64_ENTRY_THRESHOLD`], lowered by tests that cannot write 4 GiB to reach it.
+	#[cfg(test)]
 	zip64_entry_threshold: u64,
 }
 
@@ -126,6 +127,7 @@ impl<W: Write> ZipWriter<W> {
 				written: 0,
 			},
 			entries: Vec::new(),
+			#[cfg(test)]
 			zip64_entry_threshold: ZIP64_ENTRY_THRESHOLD,
 		}
 	}
@@ -143,6 +145,14 @@ impl<W: Write> ZipWriter<W> {
 			entries: Vec::new(),
 			zip64_entry_threshold,
 		}
+	}
+
+	/// The size from which an entry is written with zip64 sizes.
+	fn zip64_entry_threshold(&self) -> u64 {
+		#[cfg(test)]
+		return self.zip64_entry_threshold;
+		#[cfg(not(test))]
+		ZIP64_ENTRY_THRESHOLD
 	}
 
 	/// Adds a directory; `path` without its trailing `/`.
@@ -179,7 +189,7 @@ impl<W: Write> ZipWriter<W> {
 		encryption: Option<Encryption<'_>>,
 		data: &mut dyn Read,
 	) -> io::Result<u64> {
-		let zip64 = size >= self.zip64_entry_threshold;
+		let zip64 = size >= self.zip64_entry_threshold();
 		let mut entry = CentralEntry {
 			name: path.as_bytes().to_vec(),
 			flags: FLAG_UTF8
@@ -351,8 +361,11 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 
 /// The zip specification version (4.4.3.2) that deflate and directories need.
 const VERSION_DEFLATE: u16 = 20;
+/// The version that zip64 sizes, offsets and end records need.
 const VERSION_ZIP64: u16 = 45;
+/// The version that bzip2 needs.
 const VERSION_BZIP2: u16 = 46;
+/// The version that WinZip AES needs (its specification, not APPNOTE's).
 const VERSION_AES: u16 = 51;
 
 /// The highest version any of the entry's features needs: a bzip2 entry with zip64 sizes needs

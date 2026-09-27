@@ -605,16 +605,14 @@ fn bytes_after_the_end_record_are_counted() {
 	}
 }
 
-/// Version-made-by hosts: MS-DOS, Unix and OS X.
-const DOS: u8 = 0;
-const UNIX: u8 = 3;
-const OS_X: u8 = 19;
+/// The MS-DOS version-made-by host, which the reader has no use for.
+const HOST_DOS: u16 = 0;
 
 /// A central directory record for `name` and nothing else of note, made on `host`.
-fn central_record(host: u8, flags: u16, name: &[u8], extra: &[u8], unix_mode: u32) -> Vec<u8> {
+fn central_record(host: u16, flags: u16, name: &[u8], extra: &[u8], unix_mode: u32) -> Vec<u8> {
 	[
 		&CENTRAL_HEADER_SIG.to_le_bytes()[..],
-		&[20, host],
+		&((host << 8) | 20).to_le_bytes(),
 		&20u16.to_le_bytes(),
 		&flags.to_le_bytes(),
 		// method, time, date, CRC-32, sizes
@@ -645,30 +643,36 @@ fn unicode_path(crc: u32, name: &str) -> Vec<u8> {
 
 #[test]
 fn names_are_decoded_as_their_writers_meant() {
-	const FLAG_UTF8: u16 = 0x0800;
 	let utf8 = "Café/Résumé.txt".as_bytes();
 	let cp437: &[u8] = b"Caf\x82/R\x82sum\x82.txt";
 	// (host, flags, raw name, extra field, name, rewritten)
 	let cases = [
-		(DOS, FLAG_UTF8, utf8, Vec::new(), "Café/Résumé.txt", false),
+		(
+			HOST_DOS,
+			FLAG_UTF8,
+			utf8,
+			Vec::new(),
+			"Café/Résumé.txt",
+			false,
+		),
 		// flagged, but not UTF-8: read as CP437, and said to be rewritten
 		(
-			DOS,
+			HOST_DOS,
 			FLAG_UTF8,
 			cp437,
 			Vec::new(),
 			"Caf\u{E9}/R\u{E9}sum\u{E9}.txt",
 			true,
 		),
-		(DOS, 0, cp437, Vec::new(), "Café/Résumé.txt", false),
+		(HOST_DOS, 0, cp437, Vec::new(), "Café/Résumé.txt", false),
 		// macOS Archive Utility, ditto and Info-ZIP on Unix store UTF-8 without saying so
-		(UNIX, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
-		(OS_X, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
+		(HOST_UNIX, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
+		(HOST_OS_X, 0, utf8, Vec::new(), "Café/Résumé.txt", false),
 		// a DOS name that happens to be valid UTF-8 stays CP437 ("├⌐" is 0xC3 0xA9)
-		(DOS, 0, utf8, Vec::new(), "Caf├⌐/R├⌐sum├⌐.txt", false),
+		(HOST_DOS, 0, utf8, Vec::new(), "Caf├⌐/R├⌐sum├⌐.txt", false),
 		// the Unicode path field wins while it matches the raw name
 		(
-			DOS,
+			HOST_DOS,
 			0,
 			cp437,
 			unicode_path(crc32fast::hash(cp437), "Unicode/Näme.txt"),
@@ -677,7 +681,7 @@ fn names_are_decoded_as_their_writers_meant() {
 		),
 		// once the raw name changed (an old tool renamed the entry), it is stale
 		(
-			DOS,
+			HOST_DOS,
 			0,
 			cp437,
 			unicode_path(crc32fast::hash(b"old name"), "Unicode/Näme.txt"),
@@ -699,10 +703,10 @@ fn names_are_decoded_as_their_writers_meant() {
 #[test]
 fn symlinks_are_recognised_from_unix_and_os_x() {
 	for (host, kind) in [
-		(UNIX, ZipKind::Symlink),
-		(OS_X, ZipKind::Symlink),
+		(HOST_UNIX, ZipKind::Symlink),
+		(HOST_OS_X, ZipKind::Symlink),
 		// a DOS host's high attribute bits are no Unix mode
-		(DOS, ZipKind::File),
+		(HOST_DOS, ZipKind::File),
 	] {
 		let record = central_record(host, 0, b"link", &[], 0o120_755);
 		let (entry, _) = parse_central_header(&record, 0, 0).unwrap();
@@ -999,7 +1003,7 @@ fn real_tools_symlinks_are_recognised() {
 	let (_, infozip) = fixture!("symlink-infozip.zip");
 	let (_, sevenzip) = fixture!("symlink-7zip.zip");
 	// the same zip, as made on each version-made-by host
-	let on_host = |host: u8| {
+	let on_host = |host: u16| {
 		let mut zip = infozip.to_vec();
 		let mut at = 0;
 		while let Some(found) = zip[at..]
@@ -1007,7 +1011,7 @@ fn real_tools_symlinks_are_recognised() {
 			.position(|w| w == CENTRAL_HEADER_SIG.to_le_bytes())
 		{
 			at += found;
-			zip[at + 5] = host;
+			zip[at + 5] = host as u8;
 			at += 4;
 		}
 		zip
@@ -1015,8 +1019,8 @@ fn real_tools_symlinks_are_recognised() {
 	for (zip, link) in [
 		(infozip.to_vec(), ZipKind::Symlink),
 		(sevenzip.to_vec(), ZipKind::Symlink),
-		(on_host(OS_X), ZipKind::Symlink),
-		(on_host(DOS), ZipKind::File),
+		(on_host(HOST_OS_X), ZipKind::Symlink),
+		(on_host(HOST_DOS), ZipKind::File),
 	] {
 		let kinds: Vec<_> = read_all(&zip, None)
 			.unwrap()

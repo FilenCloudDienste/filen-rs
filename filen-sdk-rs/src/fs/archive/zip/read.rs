@@ -29,6 +29,14 @@ pub(crate) const EOCD_SIG: u32 = 0x0605_4b50;
 pub(crate) const EOCD64_SIG: u32 = 0x0606_4b50;
 pub(crate) const EOCD64_LOCATOR_SIG: u32 = 0x0706_4b50;
 
+/// General-purpose flags (zip specification 4.4.4).
+pub(crate) const FLAG_ENCRYPTED: u16 = 0x0001;
+/// For LZMA: the stream ends with an end marker.
+const FLAG_LZMA_END_MARKER: u16 = 0x0002;
+pub(crate) const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
+pub(crate) const FLAG_UTF8: u16 = 0x0800;
+
 const EOCD_LEN: u64 = 22;
 const EOCD64_LEN: u64 = 56;
 const EOCD64_LOCATOR_LEN: u64 = 20;
@@ -42,8 +50,8 @@ const MAX_EOCD_CANDIDATES: usize = 16;
 const MAX_DUPLICATE_NAMES: usize = 100;
 /// The version-made-by hosts (zip specification 4.4.2.2) whose external attributes carry a Unix
 /// mode, and whose writers store names in the system's encoding, UTF-8 by now.
-const HOST_UNIX: u16 = 3;
-const HOST_OS_X: u16 = 19;
+pub(crate) const HOST_UNIX: u16 = 3;
+pub(crate) const HOST_OS_X: u16 = 19;
 
 /// Why reading a zip failed, other than its source.
 #[derive(Debug, thiserror::Error)]
@@ -490,7 +498,7 @@ fn parse_central_header(
 
 	let (name, name_rewritten) = if let Some(name) = unicode_name {
 		(name, false)
-	} else if flags & 0x0800 != 0 {
+	} else if flags & FLAG_UTF8 != 0 {
 		match std::str::from_utf8(raw_name) {
 			Ok(name) => (name.to_owned(), false),
 			Err(_) => (cp437::decode(raw_name), true),
@@ -503,9 +511,9 @@ fn parse_central_header(
 			_ => (cp437::decode(raw_name), false),
 		}
 	};
-	let encryption = if flags & 0x0001 == 0 {
+	let encryption = if flags & FLAG_ENCRYPTED == 0 {
 		ZipEncryption::None
-	} else if flags & 0x0040 != 0 {
+	} else if flags & FLAG_STRONG_ENCRYPTION != 0 {
 		return Err(ZipError::Unsupported("PKWARE strong encryption"));
 	} else if method == 99 {
 		let (strength, authenticated_only, actual) =
@@ -518,7 +526,7 @@ fn parse_central_header(
 	} else {
 		// with a data descriptor, the check byte is the high byte of the DOS time instead of
 		// the CRC's
-		let check = if flags & 0x0008 != 0 {
+		let check = if flags & FLAG_DATA_DESCRIPTOR != 0 {
 			(dos_time >> 8) as u8
 		} else {
 			(crc >> 24) as u8
@@ -544,8 +552,8 @@ fn parse_central_header(
 			kind,
 			method,
 			encryption,
-			lzma_end_marker: flags & 0x0002 != 0,
-			has_descriptor: flags & 0x0008 != 0,
+			lzma_end_marker: flags & FLAG_LZMA_END_MARKER != 0,
+			has_descriptor: flags & FLAG_DATA_DESCRIPTOR != 0,
 			crc,
 			compressed_size,
 			size,
