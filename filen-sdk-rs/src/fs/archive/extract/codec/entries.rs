@@ -46,6 +46,11 @@ pub(crate) struct Selection {
 }
 
 impl Selection {
+	/// The directory the chosen entries land relative to.
+	pub(crate) fn base(&self) -> &[ValidatedName] {
+		&self.base
+	}
+
 	pub(crate) fn new(ordinals: impl IntoIterator<Item = u64>, base: Vec<ValidatedName>) -> Self {
 		let mut ordinals: Vec<u64> = ordinals.into_iter().collect();
 		ordinals.sort_unstable();

@@ -126,6 +126,12 @@ pub enum ExtractStage {
 /// `destination` (fetched by its uuid), this `base`, and
 /// [`ExtractRoot::Destination`](super::ExtractRoot::Destination). Failures that share a retry
 /// go again in one request.
+///
+/// A tar's hard link that failed does not go again this way: it is a copy of a file stored
+/// before it, and a tar is read front to back, so a request that does not take that file too
+/// has nothing to copy, and skips the link as
+/// [`ExtractSkipReason::Hardlink`](super::ExtractSkipReason::Hardlink); taking the file too
+/// extracts it a second time. The file is in the drive by then, where it can be copied.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[js_type(export, no_deser, no_default)]
 pub struct ExtractRetry {
@@ -592,6 +598,15 @@ impl Reporter {
 			let counted = state.remove_active(dest_uuid);
 			state.counts.bytes_done -= counted;
 			state.counts.files_not_attempted += 1;
+			state.counts.bytes_not_attempted += bytes;
+			state.core.mark_changed();
+		});
+	}
+
+	/// Files, `bytes` in all, taken on that a job which ended early never started.
+	pub(crate) fn files_not_attempted(&self, count: u64, bytes: u64) {
+		self.with_state(|state| {
+			state.counts.files_not_attempted += count;
 			state.counts.bytes_not_attempted += bytes;
 			state.core.mark_changed();
 		});

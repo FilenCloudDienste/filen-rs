@@ -110,6 +110,8 @@ pub(crate) struct FakeLog {
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
 	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
 	pub(crate) fetched_items: Vec<Uuid>,
+	/// Most items fetched by uuid at once.
+	pub(crate) peak_item_fetches: usize,
 	pub(crate) out_of_order_dirs: Vec<String>,
 	pub(crate) colored: Vec<Uuid>,
 	pub(crate) propagated: Vec<Uuid>,
@@ -190,6 +192,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) lock_calls: AtomicUsize,
 	/// Registrations running now.
 	finishes: Arc<AtomicUsize>,
+	/// Items fetched by uuid now.
+	item_fetches: Arc<AtomicUsize>,
 	/// Drive-lock acquisitions from this call index on wait (another client holds the lock)
 	/// until it is cleared; `None` while the lock is free.
 	pub(crate) block_locks_from: watch::Sender<Option<usize>>,
@@ -240,6 +244,7 @@ impl FakeBackend {
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
 			finishes: Arc::default(),
+			item_fetches: Arc::default(),
 			block_locks_from: watch::Sender::new(None),
 			listed: ListedNames::default(),
 			contents: HashMap::new(),
@@ -702,6 +707,11 @@ mod disposal {
 			uuid: Uuid,
 			is_dir: bool,
 		) -> Result<NonRootItemType<'static, Normal>, Error> {
+			let _running = Running::start(&self.item_fetches, |running| {
+				let mut log = self.log();
+				log.peak_item_fetches = log.peak_item_fetches.max(running);
+			});
+			tokio::time::sleep(self.delay).await;
 			// a file in the fake drive is fetched at its size; any other is one byte
 			let (size, chunks) = {
 				let mut log = self.log();

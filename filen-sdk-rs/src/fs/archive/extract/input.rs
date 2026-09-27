@@ -12,6 +12,7 @@ use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
 	fs::{
+		HasUUID,
 		archive::config::{ArchiveConfig, CHUNK_BYTES},
 		drive_job::backend::DriveBackend,
 		file::{enums::RemoteFileType, read::chunk_plaintext_len, traits::HasFileInfo},
@@ -44,6 +45,27 @@ pub(super) fn take_memory(
 			.try_acquire_many_owned(CHUNK_BYTES as u32)
 			.ok()
 	})
+}
+
+/// `data`, fetched as chunk `index` of `file`, when it holds as much as that chunk does: a
+/// short one would shift everything after it.
+pub(super) fn whole_chunk(
+	file: &RemoteFileType<'static>,
+	index: u64,
+	data: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
+	let expected = chunk_plaintext_len(file.size(), index);
+	if data.len() as u64 == expected {
+		return Ok(data);
+	}
+	Err(Error::custom(
+		ErrorKind::Response,
+		format!(
+			"chunk {index} of {} holds {} bytes instead of {expected}",
+			file.uuid(),
+			data.len()
+		),
+	))
 }
 
 pub(super) struct ArchiveInput<B> {
@@ -160,22 +182,10 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		&mut self,
 		(index, result, permit, _op): FetchedChunk,
 	) -> Result<(), Error> {
-		let expected = chunk_plaintext_len(self.archive.size(), index);
-		match result {
-			Ok(data) if data.len() as u64 == expected => {
-				self.ready.push_back((index, data, permit));
-				self.serve_ask();
-				Ok(())
-			}
-			Ok(data) => Err(Error::custom(
-				ErrorKind::Response,
-				format!(
-					"chunk {index} of the archive holds {} bytes instead of {expected}",
-					data.len()
-				),
-			)),
-			Err(error) => Err(error),
-		}
+		let data = whole_chunk(&self.archive, index, result?)?;
+		self.ready.push_back((index, data, permit));
+		self.serve_ask();
+		Ok(())
 	}
 
 	fn serve_ask(&mut self) {

@@ -30,6 +30,7 @@ use crate::{
 		},
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
+			extract::ExtractRetry,
 			format::StreamCodec,
 			password::ArchivePassword,
 			sevenz::write::{SevenZEncryption, SevenZMethod},
@@ -213,6 +214,7 @@ struct Options {
 	config: ArchiveConfig,
 	/// Every entry, or those a partial extraction chose.
 	selection: Option<Selection>,
+	expansion: Option<ExpansionLimit>,
 }
 
 impl Default for Options {
@@ -226,6 +228,7 @@ impl Default for Options {
 			password: None,
 			config: test_config(),
 			selection: None,
+			expansion: Some(ExpansionLimit::DEFAULT),
 		}
 	}
 }
@@ -265,6 +268,12 @@ fn start_with(
 		root: options.root,
 		max_bytes: options.max_bytes,
 		max_items: options.max_items,
+		expansion: options.expansion,
+		base: options
+			.selection
+			.as_ref()
+			.map(|selection| selection.base().to_vec())
+			.unwrap_or_default(),
 		config: options.config,
 		start,
 		dispose: options.dispose,
@@ -285,7 +294,7 @@ fn stream_job(setup: &Setup, options: &Options) -> StreamJob {
 		limits: CodecLimits {
 			decoder_memory: CODEC_MEM_BUDGET,
 			max_members: options.config.max_members,
-			expansion: Some(ExpansionLimit::DEFAULT),
+			expansion: options.expansion,
 			max_index_bytes: 32 << 20,
 			max_bytes: options.max_bytes,
 		},
@@ -3177,5 +3186,329 @@ async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 	assert!(
 		batches.iter().all(|&batch| batch <= CALLBACK_BATCH),
 		"{batches:?}"
+	);
+}
+
+/// A bare tar of the file `a.bin` holding `data`, then `links` hard links to it.
+fn tar_with_links(data: &[u8], links: usize) -> Vec<u8> {
+	let mut tar = tar_of(&[("a.bin", data)]);
+	tar.truncate(tar.len() - 1024);
+	let mut builder = tar::Builder::new(tar);
+	for link in 0..links {
+		append_hard_link(&mut builder, &format!("l{link:03}"), "a.bin");
+	}
+	builder.into_inner().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_links_copy_no_more_than_the_expansion_limit_allows() {
+	// 1 MiB and 400 links to it: 400 MiB out of a 1.2 MB tar
+	let data = pattern(1 << 20, 3);
+	let tar = tar_with_links(&data, 400);
+	let limit = ExpansionLimit {
+		ratio: 10,
+		floor: 4 << 20,
+	};
+	let bomb = setup("bomb.tar", tar.clone(), |_| {});
+	let job = start(
+		&bomb,
+		Options {
+			expansion: Some(limit),
+			..Options::default()
+		},
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveTooLarge);
+	// what the limit allows, of 12 MiB: the file and 11 copies
+	let uploaded: u64 = finished(&bomb).values().map(|(size, ..)| size).sum();
+	assert!(uploaded <= 12 << 20, "{uploaded} bytes uploaded");
+	assert_released(&bomb, &job.reporter, &job.recorder);
+
+	// with no limit, every link is copied
+	let unlimited = setup("links.tar", tar_with_links(&data[..10], 400), |_| {});
+	let job = start(
+		&unlimited,
+		Options {
+			expansion: None,
+			..Options::default()
+		},
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_links_to_one_file_open_as_fast_as_they_are_worked_off() {
+	let setup = setup("links.tar", tar_with_links(b"linked", 200), |backend| {
+		backend.keep_uploads = true;
+		// every link waits for the file first
+		backend
+			.slow_finish
+			.insert("a.bin".to_owned(), Duration::from_millis(100));
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 201);
+	let log = setup.backend.log();
+	assert_eq!(log.fetched_items.len(), 200);
+	assert!(
+		log.peak_item_fetches <= MAX_SMALL_PARALLEL_REQUESTS,
+		"{} fetched at once",
+		log.peak_item_fetches
+	);
+	drop(log);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_links_name_is_reported_as_any_entrys() {
+	let mut tar = tar_of(&[("a.txt", b"alpha")]);
+	tar.truncate(tar.len() - 1024);
+	let mut builder = tar::Builder::new(tar);
+	append_hard_link(&mut builder, "c\u{202E}txt.exe", "a.txt");
+	append_hard_link(&mut builder, "d:e", "a.txt");
+	let setup = setup("bundle.tar", builder.into_inner().unwrap(), |backend| {
+		backend.keep_uploads = true;
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(
+		report
+			.misleading_names
+			.iter()
+			.map(|name| name.path.as_str())
+			.collect::<Vec<_>>(),
+		["c\u{202E}txt.exe"]
+	);
+	assert_eq!(
+		renames(&report)
+			.into_iter()
+			.map(|(_, _, reason)| reason)
+			.collect::<Vec<_>>(),
+		[ExtractRenameReason::PathRewritten]
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn links_to_links_and_to_themselves() {
+	let mut tar = tar_of(&[("a.txt", b"alpha")]);
+	tar.truncate(tar.len() - 1024);
+	let mut builder = tar::Builder::new(tar);
+	append_hard_link(&mut builder, "b", "a.txt");
+	// a link to a link copies what that one copies
+	append_hard_link(&mut builder, "c", "b");
+	// a link to itself names nothing before it
+	append_hard_link(&mut builder, "self", "self");
+	// a link to a link to nothing
+	append_hard_link(&mut builder, "d", "self");
+	let setup = setup("bundle.tar", builder.into_inner().unwrap(), |backend| {
+		backend.keep_uploads = true;
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	let files = finished(&setup);
+	assert_eq!(
+		files.keys().collect::<Vec<_>>(),
+		["bundle/a.txt", "bundle/b", "bundle/c"]
+	);
+	assert_eq!(files["bundle/c"], files["bundle/a.txt"]);
+	assert_eq!(
+		report
+			.skipped
+			.iter()
+			.map(|skipped| skipped.path.as_str())
+			.collect::<Vec<_>>(),
+		["self", "d"]
+	);
+	// the skipped links are no items
+	assert_eq!(report.counts.files_done, 3);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_that_waited_for_a_file_that_failed_is_no_item() {
+	let setup = setup("bundle.tar", Vec::new(), |backend| {
+		backend
+			.slow_finish
+			.insert("a.txt".to_owned(), Duration::from_millis(100));
+		backend
+			.fail_finish
+			.insert("a.txt".to_owned(), ErrorKind::Server);
+	});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	// a.txt, and the two files after the link: the link counts only while it waits
+	let job = start_with(
+		&setup,
+		Options {
+			max_items: Some(3),
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	for event in [
+		WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }),
+		file_entry(0, "a.txt", 1),
+		WorkerEvent::Data(b"a".to_vec()),
+		WorkerEvent::FileEnd,
+		link_entry(1, "b.txt", "a.txt"),
+	] {
+		events.send(event).await.unwrap();
+	}
+	wait_until("a.txt failed", || job.reporter.counts().files_failed == 1).await;
+	for (ordinal, name) in [(2, "c.txt"), (3, "d.txt")] {
+		for event in [
+			file_entry(ordinal, name, 1),
+			WorkerEvent::Data(b"x".to_vec()),
+			WorkerEvent::FileEnd,
+		] {
+			events.send(event).await.unwrap();
+		}
+	}
+	drop(events);
+	let _ = result.send(read_in_full());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle/c.txt", "bundle/d.txt"]);
+	assert_eq!(report.counts.entries_skipped, 1);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+/// A job whose scripted codec sends the file `a.txt` and, once it is registered and the fetches
+/// of it held, a hard link `b.txt` to it; returned once the link's copy waits on its fetch.
+async fn a_link_copying(control: JobControl) -> (Setup, Job) {
+	let setup = setup("bundle.tar", Vec::new(), |backend| {
+		backend.keep_uploads = true
+	});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+		Box::new(move || Ok(link)),
+	);
+	for event in [
+		WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }),
+		file_entry(0, "a.txt", 1),
+		WorkerEvent::Data(b"a".to_vec()),
+		WorkerEvent::FileEnd,
+	] {
+		events.send(event).await.unwrap();
+	}
+	wait_until("a.txt is registered", || {
+		!setup.backend.log().finished.is_empty()
+	})
+	.await;
+	let target: Vec<Uuid> = setup.backend.log().finished.keys().copied().collect();
+	setup.backend.hold_requests(Request::Fetch, target);
+	events.send(link_entry(1, "b.txt", "a.txt")).await.unwrap();
+	drop(events);
+	let _ = result.send(read_in_full());
+	wait_until("the copy is fetched", || {
+		!setup.backend.log().held.is_empty()
+	})
+	.await;
+	(setup, job)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_copy_is_paused_as_any_transfer() {
+	let (pause, _cancel, control) = controls();
+	let (setup, job) = a_link_copying(control).await;
+	pause.send_replace(true);
+	setup.backend.release_all();
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_paused_holding_nothing(&setup, &job, &test_config());
+	pause.send_replace(false);
+	job.running.await.unwrap().unwrap();
+	let files = finished(&setup);
+	assert_eq!(files["bundle/b.txt"], files["bundle/a.txt"]);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_copy_is_dropped_by_a_cancel() {
+	let (_pause, cancel, control) = controls();
+	let (setup, job) = a_link_copying(control).await;
+	cancel.send_replace(true);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert_eq!(finished_paths(&setup), ["bundle/a.txt"]);
+	assert_eq!(
+		(
+			failed.report.counts.files_done,
+			failed.report.counts.files_not_attempted
+		),
+		(1, 1)
+	);
+	setup.backend.release_all();
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_of_a_partial_extraction_is_retried_below_its_base() {
+	let tar = tar_of(&[
+		("docs/", b""),
+		("docs/sub/a.txt", b"alpha"),
+		("docs/sub/b.txt", b"beta"),
+	]);
+	let setup = setup("bundle.tar", tar.clone(), |backend| {
+		backend
+			.fail_upload
+			.insert("b.txt".to_owned(), ErrorKind::Server);
+	});
+	let job = start(&setup, chosen(&[0], &["docs"]));
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["sub/a.txt"]);
+	let failure = &report.failures[0];
+	// the entry's path in the archive, and where it goes again
+	assert_eq!(failure.path, "docs/sub/b.txt");
+	let sub = log_dir(&setup, "sub");
+	assert_eq!(
+		failure.retry,
+		ExtractRetry {
+			destination: sub,
+			base: "docs/sub".into(),
+		}
+	);
+
+	let retry = setup_in(sub, "bundle.tar", tar, |_| {});
+	let job = start(&retry, chosen(&[failure.entry.index], &["docs", "sub"]));
+	job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&retry), ["b.txt"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_the_archive_is_read_ends_with_no_time_left() {
+	// fetched slowly enough for the rate to be known before the cancel
+	let tar = tar_of(&[("big.bin", &incompressible(6 * CHUNK_SIZE, 0x40))]);
+	let setup = setup("slow.tar", tar, |backend| {
+		backend
+			.slow
+			.insert("slow.tar".to_owned(), Duration::from_millis(100));
+	});
+	let (_pause, cancel, control) = controls();
+	let job = start(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+	);
+	wait_until("the rate is known", || {
+		job.recorder
+			.updates
+			.lock()
+			.unwrap()
+			.last()
+			.is_some_and(|update| update.eta.is_some_and(|eta| !eta.is_zero()))
+	})
+	.await;
+	cancel.send_replace(true);
+	job.running.await.unwrap().unwrap_err();
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.eta),
+		(ExtractPhase::Cancelled, Some(Duration::ZERO))
 	);
 }

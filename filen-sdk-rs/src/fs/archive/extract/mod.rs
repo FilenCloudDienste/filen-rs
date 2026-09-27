@@ -101,6 +101,11 @@ pub enum ExtractRequest {
 /// How much more than it reads a compressed archive may decode to: at most `ratio` times the
 /// compressed bytes read so far, but always at least `floor` bytes. Stops a decompression bomb
 /// before it costs its full output in time and storage.
+///
+/// A tar's hard links, each extracted as a copy of the file it names, are held to the same
+/// bound, compressed or not: what they copy in all may not pass it either, so a small tar of
+/// one file and many links to it fails with
+/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind) rather than upload that file each time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(import, export, no_default)]
 pub struct ExpansionLimit {

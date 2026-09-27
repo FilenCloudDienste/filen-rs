@@ -103,6 +103,10 @@ impl Client {
 			}
 		};
 		let archives = self.client().state().archives().clone();
+		let base = selection
+			.as_ref()
+			.map(|selection| selection.base().to_vec())
+			.unwrap_or_default();
 		let job = StreamJob {
 			name: archive.name().unwrap_or_default().to_owned(),
 			len: archive.size(),
@@ -120,6 +124,8 @@ impl Client {
 			root,
 			max_bytes: config.max_bytes,
 			max_items: config.max_items,
+			expansion: config.expansion_limit,
+			base,
 			config: archives,
 			start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
 			dispose,

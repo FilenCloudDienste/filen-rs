@@ -68,7 +68,7 @@ use crate::{
 		},
 		file::{
 			enums::RemoteFileType,
-			read::{check_chunks_consistent, chunk_plaintext_len},
+			read::check_chunks_consistent,
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
@@ -85,9 +85,9 @@ use crate::{
 };
 
 use super::{
-	ExtractRoot, ExtractSkipReason,
+	ExpansionLimit, ExtractRoot, ExtractSkipReason,
 	codec::{ArchiveEnd, link_key},
-	input::{ArchiveInput, Floor, take_memory},
+	input::{ArchiveInput, Floor, take_memory, whole_chunk},
 	report::{
 		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractFailure,
 		ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
@@ -121,6 +121,11 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) root: ExtractRoot,
 	pub(crate) max_bytes: Option<u64>,
 	pub(crate) max_items: Option<u64>,
+	/// What a tar's hard links may copy (see [`ExpansionLimit`]).
+	pub(crate) expansion: Option<ExpansionLimit>,
+	/// For a partial extraction, the directory of the archive its entries land relative to
+	/// (the codec strips it from their paths); empty otherwise.
+	pub(crate) base: Vec<ValidatedName>,
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
 	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
@@ -196,18 +201,28 @@ struct LinkCopy {
 	fetching: bool,
 }
 
-/// A file a tar's hard links may name, by the path it was sent at.
+/// A file a tar's hard links may name, by the path it was sent at: one the codec sent, or
+/// another hard link's copy.
 struct LinkTarget {
 	ordinal: u64,
 	uuid: Uuid,
+	/// Its size: as the archive states it, then as registered.
+	size: u64,
 	registered: bool,
 }
 
 /// A hard link waiting for the file it names to be registered.
 struct PendingLink {
-	file: NewFile,
+	link: TakenLink,
 	/// What it is reported as if that file never is.
 	unresolved: SkippedMember,
+}
+
+/// A hard link taken on, not opened yet.
+struct TakenLink {
+	file: NewFile,
+	/// What the links after it that name its path find it by.
+	key: u128,
 }
 
 impl<U> FileSlot<U> {
@@ -238,8 +253,8 @@ struct NewFile {
 
 /// Where a file's data comes from.
 enum FileSource {
-	/// The codec, which sends it next; `link_key` when a hard link may name the file.
-	Codec { link_key: Option<u128> },
+	/// The codec, which sends it next.
+	Codec,
 	/// A copy of the registered file `target`, for a hard link.
 	Link { target: Uuid },
 }
@@ -300,8 +315,17 @@ struct Driver<B: DriveBackend> {
 	/// The files a tar's hard links may name, by [`link_key`] of their paths: kept for a tar
 	/// only, whose links name files by path.
 	link_targets: SeededMap<u128, LinkTarget>,
-	/// Hard links waiting for the file they name to be registered, by that file's ordinal.
+	/// Hard links waiting for the file they name to be registered, by that file's ordinal, and
+	/// how many there are.
 	waiting_links: HashMap<u64, Vec<PendingLink>>,
+	links_waiting: usize,
+	/// Hard links whose file is registered, opened only as fast as the files open before them
+	/// are worked off: a thousand links to one file do not all start at once.
+	ready_links: VecDeque<(TakenLink, Uuid)>,
+	/// What the hard links taken on copy in all, charged against `expansion`.
+	link_bytes: u64,
+	expansion: Option<ExpansionLimit>,
+	base: Vec<ValidatedName>,
 	link_sources: FuturesUnordered<MaybeSendBoxFuture<'static, LinkSource>>,
 	link_chunks: FuturesUnordered<MaybeSendBoxFuture<'static, LinkChunk>>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, UploadedChunk>>,
@@ -343,6 +367,8 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		root,
 		max_bytes,
 		max_items,
+		expansion,
+		base,
 		config,
 		start,
 		dispose,
@@ -420,6 +446,11 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		files: BTreeMap::new(),
 		link_targets: SeededMap::default(),
 		waiting_links: HashMap::new(),
+		links_waiting: 0,
+		ready_links: VecDeque::new(),
+		link_bytes: 0,
+		expansion,
+		base,
 		link_sources: FuturesUnordered::new(),
 		link_chunks: FuturesUnordered::new(),
 		current: None,
@@ -724,12 +755,19 @@ impl<B: DisposalBackend> Driver<B> {
 			&& self.uploads.is_empty()
 			&& self.held.is_none()
 			&& self.files.is_empty()
+			&& self.ready_links.is_empty()
 			&& self.codec_result.is_some()
 	}
 
-	/// Whether the codec waits for what it sent so far to be worked off first.
+	/// Whether the codec waits for what it sent so far to be worked off first: hard links not
+	/// opened yet count as open files.
 	fn backlogged(&self) -> bool {
-		self.uncreated_dirs >= MAX_UNCREATED_DIRS || self.files.len() >= MAX_OPEN_FILES
+		self.uncreated_dirs >= MAX_UNCREATED_DIRS || self.open_files() >= MAX_OPEN_FILES
+	}
+
+	/// Files open, and hard links taken on that will be.
+	fn open_files(&self) -> usize {
+		self.files.len() + self.links_waiting + self.ready_links.len()
 	}
 
 	fn idle(&self) -> bool {
@@ -763,8 +801,25 @@ impl<B: DisposalBackend> Driver<B> {
 		self.held = None;
 		self.link_sources = FuturesUnordered::new();
 		self.link_chunks = FuturesUnordered::new();
-		// they would copy files the job stops before registering
+		// taken on and never started: not attempted
+		let links = self.links_waiting + self.ready_links.len();
+		let bytes = self
+			.waiting_links
+			.values()
+			.flatten()
+			.map(|waiting| waiting.link.file.size.unwrap_or(0))
+			.chain(
+				self.ready_links
+					.iter()
+					.map(|(link, _)| link.file.size.unwrap_or(0)),
+			)
+			.sum();
+		if links > 0 {
+			self.reporter.files_not_attempted(links as u64, bytes);
+		}
 		self.waiting_links.clear();
+		self.links_waiting = 0;
+		self.ready_links.clear();
 		if !self.uploads.is_empty() {
 			self.uploads = FuturesUnordered::new();
 		}
@@ -798,6 +853,7 @@ impl<B: DisposalBackend> Driver<B> {
 		if let Some(event) = self.held.take() {
 			self.retry_held(event);
 		}
+		self.open_ready_links();
 		self.copy_links();
 		// files held back while a pause was requested: a pause lifted before the job went idle
 		// has no resume of its own to start them
@@ -1102,22 +1158,44 @@ impl<B: DisposalBackend> Driver<B> {
 
 	fn on_entry(&mut self, head: EntryHead) {
 		let entry = self.entry_id(head.ordinal);
-		let segments = &head.path.segments;
-		let path = joined(segments);
-		if head.path.rewritten
-			&& let Some(name) = segments.last()
+		self.report_path(entry, &head.path);
+		match head.kind {
+			EntryKind::Dir => {
+				self.resolve_dirs(&head.path.segments, entry, head.modified);
+			}
+			EntryKind::File { size } => {
+				let Some(file) = self.new_file(head.ordinal, &head.path, size, head.modified)
+				else {
+					return;
+				};
+				let ordinal = file.ordinal;
+				self.open_file(file);
+				// a tar's hard links name the files before them by path
+				if matches!(self.layout, Some(ArchiveFormat::Tar { .. })) {
+					self.link_target(ordinal, &head.path);
+				}
+			}
+		}
+	}
+
+	/// Reports what an entry at `path` that is taken on is named: a path made into valid drive
+	/// names, and a name that reads as something it is not.
+	fn report_path(&mut self, entry: ArchiveEntryId, path: &ArchivePath) {
+		let joined = self.archive_joined(&path.segments);
+		if path.rewritten
+			&& let Some(name) = path.segments.last()
 		{
 			self.renamed(
 				entry,
-				path.clone(),
+				joined.clone(),
 				name,
 				ExtractRenameReason::PathRewritten,
 			);
 		}
-		if head.path.suspicious {
+		if path.suspicious {
 			let record = ExtractMisleadingName {
 				entry,
-				path: path.clone(),
+				path: joined,
 			};
 			if keep(
 				&mut self.report.misleading_names,
@@ -1127,24 +1205,29 @@ impl<B: DisposalBackend> Driver<B> {
 				self.reporter.event(ExtractEvent::MisleadingName(record));
 			}
 		}
-		match head.kind {
-			EntryKind::Dir => {
-				self.resolve_dirs(segments, entry, head.modified);
-			}
-			EntryKind::File { size } => {
-				// a tar's hard links name the files before them by path
-				let link_key = matches!(self.layout, Some(ArchiveFormat::Tar { .. }))
-					.then(|| link_key(&head.path));
-				let Some(file) = self.new_file(head.ordinal, &head.path, size, head.modified)
-				else {
-					return;
-				};
-				self.open_file(NewFile {
-					source: FileSource::Codec { link_key },
-					..file
-				});
-			}
-		}
+	}
+
+	/// `segments`, a path below the extraction's root, as the path of the archive it is: the
+	/// base of a partial extraction first.
+	fn archive_joined(&self, segments: &[ValidatedName]) -> String {
+		joined(&[&self.base[..], segments].concat())
+	}
+
+	/// Notes open file `ordinal`, at `path`, as the one the hard links after it that name that
+	/// path copy: a later file of the same path is the one links after it name.
+	fn link_target(&mut self, ordinal: u64, path: &ArchivePath) {
+		let Some(file) = self.files.get_mut(&ordinal) else {
+			return;
+		};
+		let key = link_key(path);
+		file.link_key = Some(key);
+		let target = LinkTarget {
+			ordinal,
+			uuid: file.active.dest_uuid,
+			size: file.bytes(),
+			registered: false,
+		};
+		self.link_targets.insert(key, target);
 	}
 
 	/// A file entry at `path`: its directories planned and a free name taken for it in the last;
@@ -1172,12 +1255,12 @@ impl<B: DisposalBackend> Driver<B> {
 			Ok(name) => Some(NewFile {
 				ordinal,
 				entry,
-				path: joined(&path.segments),
+				path: self.archive_joined(&path.segments),
 				parent,
 				name,
 				size,
 				modified,
-				source: FileSource::Codec { link_key: None },
+				source: FileSource::Codec,
 			}),
 			Err(error) => {
 				self.stop_with(error.into());
@@ -1186,9 +1269,13 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	/// A tar hard link: extracted as a copy of the file it names, once that one is registered,
-	/// or skipped when there is none (it was skipped, it failed, or no file of its path came
-	/// before).
+	/// A tar hard link: extracted as a copy of the file it names (one the codec sent, or another
+	/// link's copy), once that one is registered, or skipped when there is none (it was skipped,
+	/// it failed, or no file of its path came before).
+	///
+	/// What links copy is charged against the [`ExpansionLimit`], as what a compressed archive
+	/// decodes to is: a bare tar of one file and a thousand links to it would otherwise upload
+	/// that file a thousand times. Past the limit the job fails, as a compressed one does.
 	///
 	/// Its name is taken as it comes, as any entry's, so the names the entries after it get do
 	/// not hang on when its target is registered; a link skipped after all leaves that name
@@ -1204,51 +1291,122 @@ impl<B: DisposalBackend> Driver<B> {
 		let Some(target) = self.link_targets.get(&link_key(&target)) else {
 			return self.on_skipped(unresolved);
 		};
-		let (target_ordinal, registered, uuid) = (target.ordinal, target.registered, target.uuid);
+		let (target_ordinal, registered, uuid, size) =
+			(target.ordinal, target.registered, target.uuid, target.size);
 		let pending = !registered
 			&& self
 				.files
 				.get(&target_ordinal)
-				.is_some_and(|file| !file.failed);
+				.is_some_and(|file| !file.failed)
+			// a link naming another link that is not open yet
+			|| self
+				.waiting_links
+				.values()
+				.flatten()
+				.any(|waiting| waiting.link.file.ordinal == target_ordinal)
+			|| self
+				.ready_links
+				.iter()
+				.any(|(link, _)| link.file.ordinal == target_ordinal);
 		if !registered && !pending {
 			return self.on_skipped(unresolved);
 		}
-		let Some(file) = self.new_file(ordinal, &path, None, modified) else {
+		if let Some(limit) = self.expansion {
+			let allowed = limit
+				.floor
+				.max(self.link.shared.input_bytes().saturating_mul(limit.ratio));
+			if self.link_bytes.saturating_add(size) > allowed {
+				return self.stop_with(Error::custom(
+					ErrorKind::ArchiveTooLarge,
+					format!(
+						"the archive's hard links copy more than {} times its size",
+						limit.ratio
+					),
+				));
+			}
+		}
+		self.link_bytes += size;
+		let entry = self.entry_id(ordinal);
+		self.report_path(entry, &path);
+		let Some(file) = self.new_file(ordinal, &path, Some(size), modified) else {
 			return;
 		};
+		// a link may be named by the links after it, as the file it copies is; its uuid is set
+		// once it is opened
+		let key = link_key(&path);
+		self.link_targets.insert(
+			key,
+			LinkTarget {
+				ordinal,
+				uuid: Uuid::nil(),
+				size,
+				registered: false,
+			},
+		);
+		let link = TakenLink { file, key };
 		if registered {
-			self.open_file(NewFile {
-				source: FileSource::Link { target: uuid },
-				..file
-			});
+			self.ready_links.push_back((link, uuid));
 		} else {
+			self.links_waiting += 1;
 			self.waiting_links
 				.entry(target_ordinal)
 				.or_default()
-				.push(PendingLink { file, unresolved });
+				.push(PendingLink { link, unresolved });
 		}
 	}
 
-	/// File `ordinal` was registered as `uuid`: the hard links waiting for it copy it now.
-	fn link_target_registered(&mut self, ordinal: u64, key: Option<u128>, uuid: Uuid) {
+	/// Opens the hard links whose file is registered, while the files open leave room and the
+	/// fetches of their targets are as many at once as other small requests.
+	fn open_ready_links(&mut self) {
+		while self.files.len() < MAX_OPEN_FILES
+			&& self.link_sources.len() < MAX_SMALL_PARALLEL_REQUESTS
+			&& let Some((TakenLink { file, key }, target)) = self.ready_links.pop_front()
+		{
+			let ordinal = file.ordinal;
+			self.open_file(NewFile {
+				source: FileSource::Link { target },
+				..file
+			});
+			if let Some(file) = self.files.get_mut(&ordinal) {
+				file.link_key = Some(key);
+				if let Some(target) = self.link_targets.get_mut(&key)
+					&& target.ordinal == ordinal
+				{
+					target.uuid = file.active.dest_uuid;
+				}
+			}
+		}
+	}
+
+	/// File `ordinal` was registered as `uuid`, `size` bytes: the hard links waiting for it copy
+	/// it now, as fast as they are opened.
+	fn link_target_registered(&mut self, ordinal: u64, key: Option<u128>, uuid: Uuid, size: u64) {
 		if let Some(target) = key.and_then(|key| self.link_targets.get_mut(&key))
 			&& target.ordinal == ordinal
 		{
 			target.registered = true;
+			target.uuid = uuid;
+			target.size = size;
 		}
-		for PendingLink { file, .. } in self.waiting_links.remove(&ordinal).unwrap_or_default() {
-			self.open_file(NewFile {
-				source: FileSource::Link { target: uuid },
-				..file
-			});
-		}
+		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
+		self.links_waiting -= waiting.len();
+		self.ready_links.extend(
+			waiting
+				.into_iter()
+				.map(|PendingLink { link, .. }| (link, uuid)),
+		);
 	}
 
-	/// File `ordinal` failed: the hard links waiting for it have nothing to copy.
+	/// File `ordinal` failed: the hard links waiting for it have nothing to copy, and are
+	/// skipped, no item after all.
 	fn link_target_failed(&mut self, ordinal: u64) {
-		for PendingLink { unresolved, .. } in
-			self.waiting_links.remove(&ordinal).unwrap_or_default()
-		{
+		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
+		self.links_waiting -= waiting.len();
+		for PendingLink { link, unresolved } in waiting {
+			self.items -= 1;
+			self.link_bytes -= link.file.size.unwrap_or(0);
+			// the links waiting for this one fail with it
+			self.link_target_failed(link.file.ordinal);
 			self.on_skipped(unresolved);
 		}
 	}
@@ -1444,11 +1602,11 @@ impl<B: DisposalBackend> Driver<B> {
 		let mut names = Vec::new();
 		while dir != ROOT {
 			let slot = &self.dirs[dir];
-			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).as_ref());
+			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).clone());
 			dir = slot.parent;
 		}
 		names.reverse();
-		names.join("/")
+		self.archive_joined(&names)
 	}
 
 	fn open_file(&mut self, new: NewFile) {
@@ -1502,19 +1660,7 @@ impl<B: DisposalBackend> Driver<B> {
 			},
 		);
 		match source {
-			FileSource::Codec { link_key } => {
-				self.current = Some(ordinal);
-				if let Some(key) = link_key {
-					let target = LinkTarget {
-						ordinal,
-						uuid: dest_uuid,
-						registered: false,
-					};
-					// a later file of the same path is the one links after it name
-					self.link_targets.insert(key, target);
-					self.files.get_mut(&ordinal).expect("just added").link_key = Some(key);
-				}
-			}
+			FileSource::Codec => self.current = Some(ordinal),
 			FileSource::Link { target } => {
 				self.files.get_mut(&ordinal).expect("just added").copy = Some(LinkCopy::default());
 				let backend = Arc::clone(&self.backend);
@@ -1662,21 +1808,10 @@ impl<B: DisposalBackend> Driver<B> {
 			let backend = Arc::clone(&self.backend);
 			let op = self.reporter.op();
 			self.link_chunks.push(Box::pin(async move {
-				let result = backend.fetch_chunk(&source, index).await.and_then(|data| {
-					let expected = chunk_plaintext_len(source.size(), index);
-					if data.len() as u64 == expected {
-						Ok(data)
-					} else {
-						Err(Error::custom(
-							ErrorKind::Response,
-							format!(
-								"chunk {index} of a hard link's target holds {} bytes instead of \
-								 {expected}",
-								data.len()
-							),
-						))
-					}
-				});
+				let result = backend
+					.fetch_chunk(&source, index)
+					.await
+					.and_then(|data| whole_chunk(&source, index, data));
 				(ordinal, result, permit, op)
 			}));
 		}
@@ -1741,6 +1876,7 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		ExtractRetry {
 			destination: self.dirs[dir].uuid,
+			// with the base of a partial extraction: that is where it is in the archive
 			base: self.archive_path(dir),
 		}
 	}
@@ -1852,7 +1988,12 @@ impl<B: DisposalBackend> Driver<B> {
 					..file.active
 				};
 				self.reporter.file_done(&active, file.written);
-				self.link_target_registered(ordinal, file.link_key, registered.uuid());
+				self.link_target_registered(
+					ordinal,
+					file.link_key,
+					registered.uuid(),
+					file.written,
+				);
 				self.created_digest = self
 					.created_digest
 					.wrapping_add(file_digest(active.dest_uuid, file.written));
