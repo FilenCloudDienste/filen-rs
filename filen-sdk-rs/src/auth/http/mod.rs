@@ -305,9 +305,9 @@ pub struct JsClientConfig {
 	pub log_level: Option<LogLevel>,
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub file_io_memory_budget: Option<u64>,
-	// These three carry `uniffi(default = None)` where the fields above do not: a bare new field
-	// on a `uniffi::Record` changes the generated Kotlin/Swift constructor arity, so every
-	// existing caller would stop compiling.
+	// The fields from here on carry `uniffi(default = None)` where the fields above do not: a
+	// bare new field on a `uniffi::Record` changes the generated Kotlin/Swift constructor arity,
+	// so every existing caller would stop compiling.
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub thumbnail_mem_budget: Option<u64>,
