@@ -20,6 +20,16 @@ pub(crate) const SOLID_BLOCK_BYTES: u64 = 2 << 30;
 
 /// The dictionary a packed header is compressed with; headers are small.
 const HEADER_DICT_BYTES: u32 = 1 << 20;
+/// The level a packed header is compressed at.
+const HEADER_LEVEL: u32 = 6;
+
+/// The memory compressing a packed header takes, as [`lzma_encoder_memory`] states it for its
+/// dictionary.
+///
+/// [`lzma_encoder_memory`]: crate::fs::archive::encode::lzma_encoder_memory
+pub(crate) fn header_encoder_memory() -> u64 {
+	12 * u64::from(HEADER_DICT_BYTES) + (1 << 20)
+}
 
 /// PPMd's model order per level (1 to 9), as 7-Zip picks them.
 const PPMD_ORDERS: [u32; 10] = [3, 4, 4, 5, 5, 6, 8, 16, 24, 32];
@@ -501,7 +511,12 @@ impl<W: Write> SevenZWriter<W> {
 			// the header, compressed and encrypted as a folder of its own, then a small plain
 			// header saying where it is
 			let pack_pos = self.data_len()?;
-			self.open_folder(SevenZMethod::Lzma2 { level: 6 }, Some(HEADER_DICT_BYTES))?;
+			self.open_folder(
+				SevenZMethod::Lzma2 {
+					level: HEADER_LEVEL,
+				},
+				Some(HEADER_DICT_BYTES),
+			)?;
 			let State::Open(folder) = &mut self.state else {
 				return Err(failed());
 			};

@@ -5,6 +5,8 @@
 //! brotli and LZMA-alone streams carry no magic, so for those the extension decides, and zip is
 //! also tried by extension, since a self-extracting stub or other leading bytes hide its magic.
 
+use crate::fs::name::{ValidatedName, keep_both::SourceName};
+
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -194,6 +196,14 @@ pub fn archive_default_name(name: &str) -> &str {
 		Some((extension, _)) => &name[..name.len() - extension.len()],
 		None => name,
 	}
+}
+
+/// The folder an archive named `name` is extracted into by default: [`archive_default_name`],
+/// made into a valid name, or `Archive` when nothing of it is left.
+pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
+	SourceName::parse(name.map(archive_default_name).unwrap_or(""))
+		.map(SourceName::into_name)
+		.unwrap_or_else(|_| ValidatedName::try_from("Archive").expect("a valid name"))
 }
 
 #[cfg(test)]

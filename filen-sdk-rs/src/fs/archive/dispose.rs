@@ -7,6 +7,10 @@
 //! ever trashed, never purged: a permanent removal deletes the files the job read one by one and
 //! trashes what is left, so nothing the job did not read is ever deleted for good. Directory
 //! sizes are never used, since the server caches them.
+//!
+//! A listing holds only finished uploads: a file another device is still uploading into a source
+//! directory is not seen, and ends up in the trash with the directory, where it can be
+//! restored.
 
 use std::{
 	collections::{BTreeMap, BTreeSet},
@@ -24,6 +28,7 @@ use crate::{
 		drive_job::backend::{ClientBackend, DriveBackend},
 		file::traits::HasFileInfo,
 	},
+	job::JobControl,
 	util::MaybeSend,
 };
 
@@ -40,8 +45,9 @@ pub enum SourceDisposal {
 	/// Move them to the trash, where they can be restored. Frees no storage until the trash is
 	/// emptied.
 	Trash,
-	/// Delete the files for good (older versions of them are kept, as the drive keeps them);
-	/// directories are trashed once emptied.
+	/// Delete the files for good; directories are trashed once emptied. A file with older
+	/// versions is kept instead ([`KeptReason::HasVersions`]): deleting it for good would leave
+	/// its versions where no client can reach them.
 	DeletePermanently,
 }
 
@@ -62,6 +68,11 @@ pub enum KeptReason {
 	Changed,
 	/// The job's output could not be confirmed with the server.
 	Unconfirmed,
+	/// Deleting it for good would lose the older versions of a file in it.
+	HasVersions,
+	/// The job was cancelled while removing it: `bytes_freed` of its files were already deleted
+	/// for good, the rest is still there.
+	Interrupted { bytes_freed: u64 },
 	/// Removing it failed.
 	Failed { error: Arc<Error> },
 }
@@ -103,6 +114,45 @@ pub(crate) struct Tree {
 	pub(crate) dirs: BTreeSet<Uuid>,
 }
 
+impl Tree {
+	/// The digest of its items, as [`file_digest`] and [`dir_digest`] add them up.
+	pub(crate) fn digest(&self) -> u128 {
+		let files = self.files.iter().fold(0u128, |sum, (&uuid, &size)| {
+			sum.wrapping_add(file_digest(uuid, size))
+		});
+		self.dirs
+			.iter()
+			.fold(files, |sum, &uuid| sum.wrapping_add(dir_digest(uuid)))
+	}
+}
+
+/// A file's share of an order-free digest of a set of items: the sum of every item's. Two sets
+/// with the same sum hold the same items, short of a deliberate 128-bit collision, which the
+/// items' uuids (the server's to pick) leave no room for.
+pub(crate) fn file_digest(uuid: Uuid, size: u64) -> u128 {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(b"file");
+	hasher.update(uuid.as_bytes());
+	hasher.update(&size.to_le_bytes());
+	u128::from_le_bytes(
+		hasher.finalize().as_bytes()[..16]
+			.try_into()
+			.expect("16 bytes"),
+	)
+}
+
+/// A directory's share of an order-free digest, as [`file_digest`].
+pub(crate) fn dir_digest(uuid: Uuid) -> u128 {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(b"dir");
+	hasher.update(uuid.as_bytes());
+	u128::from_le_bytes(
+		hasher.finalize().as_bytes()[..16]
+			.try_into()
+			.expect("16 bytes"),
+	)
+}
+
 /// What removing sources needs besides a [`DriveBackend`].
 pub(crate) trait DisposalBackend: DriveBackend {
 	fn file_state(&self, uuid: Uuid) -> impl Future<Output = Result<FileState, Error>> + MaybeSend;
@@ -113,6 +163,11 @@ pub(crate) trait DisposalBackend: DriveBackend {
 		uuid: Uuid,
 	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
 	fn trash_dir(&self, uuid: Uuid) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+	/// Whether the file has older versions.
+	fn has_older_versions(
+		&self,
+		uuid: Uuid,
+	) -> impl Future<Output = Result<bool, Error>> + MaybeSend;
 	/// An item of the user's drive, for a job that kept only its uuid.
 	fn normal_item(
 		&self,
@@ -170,6 +225,13 @@ impl DisposalBackend for ClientBackend {
 		client.trash_dir(&mut dir).await
 	}
 
+	async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
+		let client = self.client();
+		let file = client.get_file(uuid).await?;
+		let versions = client.list_file_versions(&file).await?;
+		Ok(versions.iter().any(|version| version.uuid() != uuid))
+	}
+
 	async fn normal_item(
 		&self,
 		uuid: Uuid,
@@ -222,18 +284,30 @@ fn failed(error: Error) -> DisposalOutcome {
 	})
 }
 
-/// Removes one file source if it is still what the job read.
+/// Removes one file source if it is still what the job read. `control` says whether the job was
+/// cancelled, which ends the removal before its next request.
 pub(crate) async fn dispose_file<B: DisposalBackend>(
 	backend: &B,
 	file: ExpectedFile,
 	how: SourceDisposal,
+	control: &JobControl,
 ) -> DisposalOutcome {
+	if control.is_stopping() {
+		return kept(KeptReason::Interrupted { bytes_freed: 0 });
+	}
 	let state = match backend.file_state(file.uuid).await {
 		Ok(state) => state,
 		Err(error) => return failed(error),
 	};
 	if !file.matches(&state) {
 		return kept(KeptReason::Changed);
+	}
+	if how == SourceDisposal::DeletePermanently {
+		match backend.has_older_versions(file.uuid).await {
+			Ok(false) => {}
+			Ok(true) => return kept(KeptReason::HasVersions),
+			Err(error) => return failed(error),
+		}
 	}
 	let removed = match how {
 		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
@@ -252,12 +326,18 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 }
 
 /// Removes one directory source if everything below it is still what the job read.
+/// `control` says whether the job was cancelled, which ends the removal before its next
+/// request.
 pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	backend: &B,
 	dir: Uuid,
 	read: &Tree,
 	how: SourceDisposal,
+	control: &JobControl,
 ) -> DisposalOutcome {
+	if control.is_stopping() {
+		return kept(KeptReason::Interrupted { bytes_freed: 0 });
+	}
 	match backend.list_tree(dir).await {
 		Ok(listed) if listed == *read => {}
 		Ok(_) => return kept(KeptReason::Changed),
@@ -265,7 +345,22 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	}
 	let mut bytes_freed = 0;
 	if how == SourceDisposal::DeletePermanently {
+		// every file is checked before any is deleted: a directory is removed whole or not at
+		// all for this reason
+		for &uuid in read.files.keys() {
+			if control.is_stopping() {
+				return kept(KeptReason::Interrupted { bytes_freed: 0 });
+			}
+			match backend.has_older_versions(uuid).await {
+				Ok(false) => {}
+				Ok(true) => return kept(KeptReason::HasVersions),
+				Err(error) => return failed(error),
+			}
+		}
 		for (&uuid, &size) in &read.files {
+			if control.is_stopping() {
+				return kept(KeptReason::Interrupted { bytes_freed });
+			}
 			if let Err(error) = backend.delete_file_permanently(uuid).await {
 				return failed(error);
 			}

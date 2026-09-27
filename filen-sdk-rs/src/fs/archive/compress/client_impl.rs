@@ -48,6 +48,8 @@ pub struct CompressConfig {
 	/// before anything is written, and one that would reach this is refused up front with
 	/// [`ErrorKind::MaxStorageReached`], its size in the report's `needed_bytes`; a compressed
 	/// archive is refused as soon as its written bytes would reach it, leaving nothing behind.
+	/// Reaching it counts: an archive exactly as large as the free storage is refused, as the
+	/// server refuses an upload that would fill the account.
 	pub max_bytes: Option<u64>,
 	/// For an encrypted format, and only then.
 	pub password: Option<ArchivePassword>,

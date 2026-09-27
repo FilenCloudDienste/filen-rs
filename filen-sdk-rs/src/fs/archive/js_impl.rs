@@ -104,6 +104,11 @@ pub enum ArchiveKeptReason {
 	Changed,
 	/// The job's output could not be confirmed with the server.
 	Unconfirmed,
+	/// Deleting it for good would lose the older versions of a file in it.
+	HasVersions,
+	/// The job was cancelled while removing it: `bytes_freed` of its files were already deleted
+	/// for good, the rest is still there.
+	Interrupted { bytes_freed: u64 },
 	/// Removing it failed.
 	Failed { error: JobError },
 }
@@ -292,6 +297,8 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of the sources, when they were to be removed.
 	pub dispositions: Vec<ArchiveSourceDisposition>,
+	/// Source files whose data did not match the hash in their metadata (up to 1000).
+	pub hash_mismatches: Vec<CompressHashMismatch>,
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.
 	pub error: Option<JobError>,
@@ -311,6 +318,8 @@ impl From<dispose::KeptReason> for ArchiveKeptReason {
 			Kept::HashUnavailable => Self::HashUnavailable,
 			Kept::Changed => Self::Changed,
 			Kept::Unconfirmed => Self::Unconfirmed,
+			Kept::HasVersions => Self::HasVersions,
+			Kept::Interrupted { bytes_freed } => Self::Interrupted { bytes_freed },
 			Kept::Failed { error } => Self::Failed {
 				error: job_error(error),
 			},
@@ -502,6 +511,14 @@ impl From<compress::CompressReport> for CompressReport {
 			counts: report.counts,
 			needed_bytes: report.needed_bytes,
 			dispositions: report.dispositions.into_iter().map(Into::into).collect(),
+			hash_mismatches: report
+				.hash_mismatches
+				.into_iter()
+				.map(|mismatch| CompressHashMismatch {
+					source_uuid: mismatch.source_uuid,
+					path: mismatch.path,
+				})
+				.collect(),
 			error: None,
 		}
 	}
@@ -663,6 +680,10 @@ impl CompressCall {
 		dispose: Option<SourceDisposal>,
 		password: Option<ArchivePassword>,
 	) -> Result<Self, Error> {
+		// the format's own rules reject the call, as an invalid argument, rather than end in a
+		// failed job
+		format.check_name(name)?;
+		format.check(password.is_some())?;
 		Ok(Self {
 			sources: compress_sources(items, dispose)?,
 			destination: DirType::from(destination),
@@ -719,15 +740,16 @@ pub fn archive_encoder_memory(format: CompressFormat) -> Result<u64, Error> {
 	format.encoder_memory()
 }
 
-/// The name of what an archive extracts to: its name without its archive extension
-/// (`photos.tar.gz` → `photos`).
+/// The name of the folder an archive extracts to by default: its name without its archive
+/// extension (`photos.tar.gz` → `photos`), made into a valid name (`Archive` when nothing is
+/// left).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveDefaultName")
 )]
 pub fn archive_default_name(name: String) -> String {
-	super::format::archive_default_name(&name).to_owned()
+	super::format::extract_folder_name(Some(&name)).into()
 }
 
 #[cfg(feature = "uniffi")]
@@ -770,8 +792,9 @@ mod uniffi_impl {
 
 	#[derive(uniffi::Record, Default)]
 	pub struct ExtractArchiveConfig {
-		/// Storage still free on the account, if known: an archive stating more fails before
-		/// anything is written.
+		/// Storage still free on the account, if known: a zip or 7z stating more fails before
+		/// anything is written; a streaming archive (tar, one compressed file) fails once it has
+		/// written that much, keeping what it extracted.
 		#[uniffi(default = None)]
 		pub max_bytes: Option<u64>,
 		/// Most items to create.
@@ -792,7 +815,9 @@ mod uniffi_impl {
 		/// Storage still free on the account, if known.
 		#[uniffi(default = None)]
 		pub max_bytes: Option<u64>,
-		/// Removes the items once the archive is registered and verified.
+		/// Removes the items once the archive is registered and verified. The archive is not read
+		/// back first: with an encrypted format, have the user confirm the password (type it twice)
+		/// before removing anything for good, as a mistyped one leaves an archive nobody can open.
 		#[uniffi(default = None)]
 		pub dispose: Option<SourceDisposal>,
 	}
@@ -804,8 +829,10 @@ mod uniffi_impl {
 		/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
 		/// destination is kept, and the entry is named `name (1)`, ...
 		///
-		/// `password` opens an encrypted archive; without one, or with a wrong one, the extract
-		/// fails before anything is created. The report is returned whether the extract
+		/// `password` opens an encrypted archive; without one the extract fails before anything is
+		/// created. A wrong one is found before anything is created too when the archive has an
+		/// encrypted entry small enough to check it on (16 MiB), else as the first encrypted entry
+		/// is read; folders created by then go to the trash. The report is returned whether the extract
 		/// completed, was cancelled or failed.
 		#[allow(clippy::too_many_arguments)]
 		pub async fn extract_archive(
@@ -818,6 +845,8 @@ mod uniffi_impl {
 			callback: Arc<dyn ExtractArchiveCallback>,
 			managed_future: ManagedFuture,
 		) -> Result<ExtractReport, Error> {
+			// wrapped first, so an argument refused below still drops it wiped
+			let password = self::password(password)?;
 			let request = extract_request(archive, destination, into, config.dispose)?;
 			let config = ExtractConfig {
 				max_bytes: config.max_bytes,
@@ -825,23 +854,24 @@ mod uniffi_impl {
 				expansion_limit: config
 					.expansion_limit
 					.or(ExtractConfig::default().expansion_limit),
-				password: self::password(password)?,
+				password,
 			};
 			let client = self.inner();
-			managed_future
-				.into_js_managed_commander_job(move |control| async move {
-					let (sender, delivered) =
-						spawn_ordered_dispatch(move |delivery| match delivery {
-							ExtractDelivery::TopLevelCreated(items) => {
-								callback.on_top_level_created(items)
-							}
-							ExtractDelivery::Update(update) => callback.on_update(update),
-						});
-					let result = extract_job(client, request, config, sender, control).await;
-					let _ = delivered.await;
-					result
+			// the foreign callbacks run on the dispatch thread, in order; waiting for them is no
+			// part of the job, so a cancel's grace never cuts off a report already made
+			let (sender, delivered) = spawn_ordered_dispatch(move |delivery| match delivery {
+				ExtractDelivery::TopLevelCreated(items) => callback.on_top_level_created(items),
+				ExtractDelivery::Update(update) => callback.on_update(update),
+			});
+			let result = managed_future
+				.into_js_managed_commander_job(move |control| {
+					extract_job(client, request, config, sender, control)
 				})
-				.await
+				.await;
+			// the job has ended and dropped its sender: this returns once all it reported was
+			// delivered
+			let _ = delivered.await;
+			result
 		}
 
 		/// Compresses `items` into a new archive `name` in `destination`, entirely on this
@@ -872,20 +902,17 @@ mod uniffi_impl {
 				self::password(password)?,
 			)?;
 			let client = self.inner();
-			managed_future
-				.into_js_managed_commander_job(move |control| async move {
-					let (sender, delivered) =
-						spawn_ordered_dispatch(move |delivery| match delivery {
-							CompressDelivery::ArchiveCreated(archive) => {
-								callback.on_archive_created(archive)
-							}
-							CompressDelivery::Update(update) => callback.on_update(update),
-						});
-					let result = compress_job(client, call, sender, control).await;
-					let _ = delivered.await;
-					result
+			let (sender, delivered) = spawn_ordered_dispatch(move |delivery| match delivery {
+				CompressDelivery::ArchiveCreated(archive) => callback.on_archive_created(archive),
+				CompressDelivery::Update(update) => callback.on_update(update),
+			});
+			let result = managed_future
+				.into_js_managed_commander_job(move |control| {
+					compress_job(client, call, sender, control)
 				})
-				.await
+				.await;
+			let _ = delivered.await;
+			result
 		}
 	}
 }
@@ -916,8 +943,9 @@ mod wasm_impl {
 		pub archive: AnyFile,
 		pub destination: AnyNormalDir,
 		pub into: ExtractInto,
-		/// Storage still free on the account, if known: an archive stating more fails before
-		/// anything is written.
+		/// Storage still free on the account, if known: a zip or 7z stating more fails before
+		/// anything is written; a streaming archive (tar, one compressed file) fails once it has
+		/// written that much, keeping what it extracted.
 		#[serde(default)]
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
@@ -958,7 +986,9 @@ mod wasm_impl {
 		#[serde(default)]
 		#[tsify(optional)]
 		pub max_bytes: Option<u64>,
-		/// Removes the items once the archive is registered and verified.
+		/// Removes the items once the archive is registered and verified. The archive is not read
+		/// back first: with an encrypted format, have the user confirm the password (type it twice)
+		/// before removing anything for good, as a mistyped one leaves an archive nobody can open.
 		#[serde(default)]
 		#[tsify(optional)]
 		pub dispose: Option<SourceDisposal>,
@@ -1056,8 +1086,10 @@ mod wasm_impl {
 		/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
 		/// destination is kept, and the entry is named `name (1)`, ...
 		///
-		/// `password` opens an encrypted archive; without one, or with a wrong one, the extract
-		/// fails before anything is created. The report is returned whether the extract
+		/// `password` opens an encrypted archive; without one the extract fails before anything is
+		/// created. A wrong one is found before anything is created too when the archive has an
+		/// encrypted entry small enough to check it on (16 MiB), else as the first encrypted entry
+		/// is read; folders created by then go to the trash. The report is returned whether the extract
 		/// completed, was cancelled or failed.
 		#[wasm_bindgen(js_name = "extractArchive")]
 		pub async fn extract_archive(
@@ -1065,6 +1097,8 @@ mod wasm_impl {
 			params: ExtractArchiveParams,
 			password: Option<String>,
 		) -> Result<ExtractReport, Error> {
+			// wrapped first, so an argument refused below still drops it wiped
+			let password = self::password(password)?;
 			let request = extract_request(
 				params.archive,
 				params.destination,
@@ -1077,7 +1111,7 @@ mod wasm_impl {
 				expansion_limit: params
 					.expansion_limit
 					.or(ExtractConfig::default().expansion_limit),
-				password: self::password(password)?,
+				password,
 			};
 			run_extract(
 				self.inner(),

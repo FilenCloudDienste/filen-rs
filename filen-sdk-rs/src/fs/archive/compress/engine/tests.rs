@@ -835,3 +835,63 @@ async fn a_7z_uploads_its_first_chunk_last() {
 		assert_released(&setup, &job.reporter);
 	}
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permanent_removal_keeps_what_has_older_versions() {
+	// the top-level file has versions: it is kept, the folder goes
+	let setup_file = setup(|backend, files| {
+		backend.versioned_files.insert(files[2].uuid());
+	});
+	let report = compress_disposing(
+		&setup_file,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = &outcomes(&report)[..] else {
+		panic!("two sources");
+	};
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(
+		matches!(
+			top,
+			DisposalOutcome::Kept {
+				reason: KeptReason::HasVersions
+			}
+		),
+		"{top:?}"
+	);
+
+	// a file in the folder has versions: nothing of the folder is deleted
+	let setup_dir = setup(|backend, files| {
+		backend.versioned_files.insert(files[1].uuid());
+	});
+	let report = compress_disposing(
+		&setup_dir,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, _] = &outcomes(&report)[..] else {
+		panic!("two sources");
+	};
+	assert!(
+		matches!(
+			docs,
+			DisposalOutcome::Kept {
+				reason: KeptReason::HasVersions
+			}
+		),
+		"{docs:?}"
+	);
+	let log = setup_dir.backend.log();
+	let folder_files = [setup_dir.sources[0].1.uuid(), setup_dir.sources[1].1.uuid()];
+	assert!(
+		log.deleted_files
+			.iter()
+			.all(|uuid| !folder_files.contains(uuid))
+	);
+	assert!(log.trashed_dirs.is_empty());
+}

@@ -121,6 +121,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) merge_once: Mutex<HashSet<String>>,
 	pub(crate) targets: ConnectedTargets,
 	pub(crate) later_targets: Option<ConnectedTargets>,
+	/// Files with older versions.
+	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Later chunks of a file download faster than earlier ones.
 	pub(crate) reverse_chunks: bool,
 	/// Lowercased names the destination holds without the listing having shown them.
@@ -171,6 +173,7 @@ impl FakeBackend {
 			merge_once: Mutex::new(HashSet::new()),
 			targets: ConnectedTargets::default(),
 			later_targets: None,
+			versioned_files: HashSet::new(),
 			reverse_chunks: false,
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
@@ -580,6 +583,10 @@ mod disposal {
 				.retain(|_, (parent, ..)| !gone.contains(parent));
 			log.trashed_dirs.push(uuid);
 			Ok(())
+		}
+
+		async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
+			Ok(self.versioned_files.contains(&uuid))
 		}
 
 		async fn normal_item(

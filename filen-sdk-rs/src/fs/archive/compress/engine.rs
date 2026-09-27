@@ -34,6 +34,7 @@ use crate::{
 				SourceDisposition, Tree, dispose_dir, dispose_file,
 			},
 			hash::HeadLastHasher,
+			limits::MAX_REPORT_RECORDS,
 			worker::{ARCHIVE_STALL_TIMEOUT, WorkerEvent, WorkerLink},
 		},
 		categories::{DirType, Normal},
@@ -57,7 +58,9 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
-use super::report::{CompressEvent, CompressFailed, CompressPhase, CompressReport, Reporter};
+use super::report::{
+	CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch, Reporter,
+};
 
 /// Archive chunks uploading at once.
 const UPLOADS_AT_ONCE: usize = 4;
@@ -186,6 +189,8 @@ struct Driver<B: DriveBackend> {
 	stalled_ticks: u32,
 	/// The top-level sources a file of which did not match the hash in its metadata.
 	mismatched: BTreeSet<usize>,
+	/// The files behind `mismatched`, for the report.
+	hash_mismatches: Vec<HashMismatch>,
 	fatal: Option<Arc<Error>>,
 }
 
@@ -307,6 +312,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		stamp: 0,
 		stalled_ticks: 0,
 		mismatched: BTreeSet::new(),
+		hash_mismatches: Vec::new(),
 		fatal: None,
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -320,10 +326,22 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		}
 		driver.reporter.set_phase(CompressPhase::Finishing);
 		let archive = driver.register(name, shape, targets).await?;
+		// the archive exists from here on: a cancel now keeps the sources, but the job is done
 		if let Some(disposal) = disposal {
 			driver.reporter.set_phase(CompressPhase::DisposingSources);
-			driver.reporter.checkpoint(&driver.control).await?;
-			dispositions = driver.dispose(disposal, &archive, incomplete).await;
+			dispositions = match driver.reporter.checkpoint(&driver.control).await {
+				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
+				Err(Stopped) => disposal
+					.targets
+					.iter()
+					.map(|target| SourceDisposition {
+						uuid: target.uuid(),
+						outcome: DisposalOutcome::Kept {
+							reason: KeptReason::Interrupted { bytes_freed: 0 },
+						},
+					})
+					.collect(),
+			};
 		}
 		Ok(archive)
 	}
@@ -332,8 +350,10 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		reporter,
 		fatal,
 		control,
+		hash_mismatches,
 		..
 	} = driver;
+	report.hash_mismatches = hash_mismatches;
 	let (phase, result) = match (outcome, fatal) {
 		(_, Some(error)) => (CompressPhase::Failed, Err(error)),
 		(Err(Stopped), None) if control.is_cancelled() => {
@@ -446,6 +466,8 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
+	/// Waits out a pause, giving back the floor and every prefetched chunk. The chunk the codec
+	/// is reading stays (with its permit): the codec holds that data until it asks again.
 	async fn pause(&mut self) -> Result<(), Stopped> {
 		self.fetches = FuturesOrdered::new();
 		self.ready.clear();
@@ -531,6 +553,12 @@ impl<B: DisposalBackend> Driver<B> {
 				state.file.uuid()
 			);
 			self.mismatched.insert(state.request);
+			if self.hash_mismatches.len() < MAX_REPORT_RECORDS {
+				self.hash_mismatches.push(HashMismatch {
+					source_uuid: state.file.uuid(),
+					path: state.path.clone(),
+				});
+			}
 			let event = CompressEvent::SourceHashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
@@ -716,12 +744,14 @@ impl<B: DisposalBackend> Driver<B> {
 						reason: reason.clone(),
 					},
 				),
-				(None, DisposalTarget::File(file)) => {
-					(file.uuid, dispose_file(&*self.backend, file, how).await)
-				}
-				(None, DisposalTarget::Dir { uuid, read }) => {
-					(uuid, dispose_dir(&*self.backend, uuid, &read, how).await)
-				}
+				(None, DisposalTarget::File(file)) => (
+					file.uuid,
+					dispose_file(&*self.backend, file, how, &self.control).await,
+				),
+				(None, DisposalTarget::Dir { uuid, read }) => (
+					uuid,
+					dispose_dir(&*self.backend, uuid, &read, how, &self.control).await,
+				),
 				(None, DisposalTarget::Unavailable { uuid }) => (
 					uuid,
 					DisposalOutcome::Kept {

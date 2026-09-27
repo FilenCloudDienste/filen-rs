@@ -48,9 +48,9 @@ use crate::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			dispose::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
-				SourceDisposition, Tree, dispose_file,
+				SourceDisposition, Tree, dir_digest, dispose_file, file_digest,
 			},
-			format::archive_default_name,
+			format::extract_folder_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
 				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, SkippedMember, StreamLayout,
@@ -75,7 +75,7 @@ use crate::{
 		},
 		name::{
 			ValidatedName,
-			keep_both::{NameShape, SourceName, TakenNames},
+			keep_both::{NameShape, TakenNames},
 		},
 	},
 	job::{JobControl, Stopped, report::OpGuard},
@@ -241,6 +241,9 @@ struct Driver<B: DriveBackend> {
 	held: Option<WorkerEvent>,
 	events_closed: bool,
 	codec_result: Option<CodecResult>,
+	/// The order-free digest of the files and directories the job created, which the output
+	/// has to hold exactly before the archive is removed.
+	created_digest: u128,
 	/// Top-level items past the report's records, by uuid and whether each is a directory:
 	/// what propagating them to targets the destination gains takes.
 	top_level_beyond: Vec<(Uuid, bool)>,
@@ -360,6 +363,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		events_closed: false,
 		codec_result: None,
 		top_level_beyond: Vec::new(),
+		created_digest: 0,
 		unchecked_entries: 0,
 		committed: 0,
 		items: 0,
@@ -470,6 +474,18 @@ impl<B: DisposalBackend> Driver<B> {
 			)
 			.collect::<Vec<_>>();
 		for uuid in dirs {
+			// the job created no file: one in there now is someone else's, and keeps the folder
+			match self.backend.list_tree(uuid).await {
+				Ok(tree) if tree.files.is_empty() => {}
+				Ok(_) => continue,
+				Err(error) => {
+					tracing::warn!(
+						"archive {}: failed to list a directory before trashing it: {error}",
+						self.archive.uuid()
+					);
+					continue;
+				}
+			}
 			if let Err(error) = self.backend.trash_dir(uuid).await {
 				tracing::warn!(
 					"archive {}: failed to trash a directory created before the wrong password \
@@ -521,6 +537,8 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			if pause_requested && !stopping && self.idle() {
 				self.pause().await?;
+				// finalizes held back while pausing
+				self.finalize_ready();
 				continue;
 			}
 			let take_events =
@@ -672,6 +690,8 @@ impl<B: DisposalBackend> Driver<B> {
 		self.served += 1;
 		self.archive_hasher.update_rayon(&data);
 		let _ = reply.send(Ok(data));
+		// progress follows the archive read, not only the idle ticks, which a busy job skips
+		self.reporter.set_bytes_read(self.link.shared.input_bytes());
 	}
 
 	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) {
@@ -845,10 +865,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn default_folder_name(&self) -> ValidatedName {
-		let name = self.archive.name().map(archive_default_name).unwrap_or("");
-		SourceName::parse(name)
-			.map(SourceName::into_name)
-			.unwrap_or_else(|_| ValidatedName::try_from("Archive").expect("a valid name"))
+		extract_folder_name(self.archive.name())
 	}
 
 	/// Creates the folder entries are extracted into.
@@ -877,6 +894,7 @@ impl<B: DisposalBackend> Driver<B> {
 						self.destination.uuid(),
 						outcome.name.as_ref(),
 					);
+					self.created_digest = self.created_digest.wrapping_add(dir_digest(dir.uuid()));
 					let uuid = dir.uuid();
 					self.top_level_created(
 						ExtractTopLevelKey::Root,
@@ -1132,6 +1150,7 @@ impl<B: DisposalBackend> Driver<B> {
 				}
 				self.reporter
 					.dir_created(created.uuid(), parent, name.as_ref());
+				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
 				self.dirs[dir].state = DirState::Created(created.uuid());
 				self.ready_dirs
 					.extend(self.dirs[dir].children.iter().copied());
@@ -1398,6 +1417,11 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Registers every file whose data is all up and whose directory exists; forgets failed
 	/// files with nothing left in flight.
 	fn finalize_ready(&mut self) {
+		// a finalize started now would park on the pause holding the job busy, so the job
+		// could never go idle and give back its memory: it starts on resume instead
+		if self.control.is_pause_requested() {
+			return;
+		}
 		let ready: Vec<u64> = self
 			.files
 			.iter()
@@ -1486,6 +1510,9 @@ impl<B: DisposalBackend> Driver<B> {
 					..file.active
 				};
 				self.reporter.file_done(&active, file.written);
+				self.created_digest = self
+					.created_digest
+					.wrapping_add(file_digest(active.dest_uuid, file.written));
 				if file.parent == ROOT && self.into_destination {
 					self.top_level_created(
 						ExtractTopLevelKey::Entry { id: file.entry },
@@ -1561,7 +1588,7 @@ impl<B: DisposalBackend> Driver<B> {
 			return kept(KeptReason::Unconfirmed);
 		}
 		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
-		dispose_file(&*self.backend, archive, how).await
+		dispose_file(&*self.backend, archive, how, &self.control).await
 	}
 
 	/// Whether the server holds exactly what the counts say was created: every file at its size
@@ -1597,9 +1624,11 @@ impl<B: DisposalBackend> Driver<B> {
 				},
 			}
 		}
+		// the very items the job created, each file at the size it wrote
 		found.files.len() as u64 == counts.files_done
 			&& found.files.values().sum::<u64>() == counts.bytes_done
 			&& found.dirs.len() as u64 == counts.dirs_created
+			&& found.digest() == self.created_digest
 	}
 
 	/// The destination may have been shared or linked while the extraction ran; items created

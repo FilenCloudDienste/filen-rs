@@ -119,6 +119,17 @@ pub struct CompressReport {
 	pub needed_bytes: Option<u64>,
 	/// What became of each source, when the sources were to be removed.
 	pub dispositions: Vec<SourceDisposition>,
+	/// Source files whose data did not match the hash in their metadata: they went into the
+	/// archive as they were read (up to 1000 are listed).
+	pub hash_mismatches: Vec<HashMismatch>,
+}
+
+/// A source file whose data did not match the hash in its metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashMismatch {
+	pub source_uuid: Uuid,
+	/// Its path in the archive.
+	pub path: String,
 }
 
 impl JobReport for CompressReport {

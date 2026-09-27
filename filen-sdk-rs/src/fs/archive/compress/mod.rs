@@ -10,7 +10,7 @@ pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisp
 pub use client_impl::CompressConfig;
 pub use report::{
 	CompressCallback, CompressCounts, CompressEvent, CompressFailed, CompressPhase, CompressReport,
-	CompressUpdate, RunState,
+	CompressUpdate, HashMismatch, RunState,
 };
 
 use crate::{
@@ -38,6 +38,10 @@ pub enum CompressSources {
 	/// nothing skipped, every source's data matching the hash in its metadata, the archive
 	/// confirmed with the server, and each source still exactly as it was read. Otherwise they
 	/// are kept and the report says why. The archive cannot be written into one of them.
+	///
+	/// The archive is not read back first. With an encrypted format, have the user confirm the
+	/// password before removing anything for good: a mistyped one leaves an archive nobody can
+	/// open.
 	Dispose {
 		how: SourceDisposal,
 		items: Vec<NonRootItemType<'static, Normal>>,
@@ -159,11 +163,19 @@ impl CompressFormat {
 					.encoder_memory()?,
 				})
 			}
-			Self::SevenZ { method, .. } => {
+			Self::SevenZ {
+				method, encryption, ..
+			} => {
 				method
 					.check()
 					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
-				Ok(method.encoder_memory())
+				// an encrypted header is compressed with LZMA2 on its own, once the data is done
+				Ok(match encryption {
+					Some(SevenZEncryption::EntriesAndHeaders) => method
+						.encoder_memory()
+						.max(super::sevenz::write::header_encoder_memory()),
+					_ => method.encoder_memory(),
+				})
 			}
 		}
 	}

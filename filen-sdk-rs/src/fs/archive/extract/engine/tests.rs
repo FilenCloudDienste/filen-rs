@@ -1039,3 +1039,29 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		"the folder, with everything in it, is trashed"
 	);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_extract_finishes_once_resumed() {
+	let big = pattern(3 * CHUNK_SIZE, 1);
+	let tar = tar_of(&[("a.bin", &big[..]), ("b.txt", b"b"), ("c.txt", b"c")]);
+	let setup = setup("bundle.tar", tar, |_| {});
+	let (pause, _cancel, control) = controls();
+	pause.send_replace(true);
+	let job = start(
+		&setup,
+		Options {
+			control,
+			..Options::default()
+		},
+	);
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(
+		finished(&setup).is_empty(),
+		"nothing is registered while paused"
+	);
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 3);
+	assert_eq!(finished(&setup).len(), 3);
+	assert_released(&setup, &job.reporter);
+}
