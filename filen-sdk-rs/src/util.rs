@@ -1,4 +1,8 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+	collections::{HashMap, HashSet},
+	hash::BuildHasher,
+	sync::{Arc, atomic::Ordering},
+};
 
 pub struct PathIterator<'a> {
 	path: &'a str,
@@ -365,3 +369,30 @@ mod peekable_receiver_tests {
 		assert_eq!(rx.recv().await, None);
 	}
 }
+
+/// A [`BuildHasher`] keyed with fresh randomness per map. std's `RandomState` has no entropy
+/// source on `wasm32-unknown-unknown` and hashes with fixed keys there, so a map keyed by names
+/// an archive or a drive listing chose could be made to collide on purpose.
+#[derive(Debug, Clone)]
+pub(crate) struct SeededState {
+	keys: (u64, u64),
+}
+
+impl Default for SeededState {
+	fn default() -> Self {
+		Self {
+			keys: (rand::random(), rand::random()),
+		}
+	}
+}
+
+impl BuildHasher for SeededState {
+	type Hasher = siphasher::sip::SipHasher13;
+
+	fn build_hasher(&self) -> Self::Hasher {
+		siphasher::sip::SipHasher13::new_with_keys(self.keys.0, self.keys.1)
+	}
+}
+
+pub(crate) type SeededMap<K, V> = HashMap<K, V, SeededState>;
+pub(crate) type SeededSet<K> = HashSet<K, SeededState>;

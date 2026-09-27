@@ -8,11 +8,12 @@
 //!   and an item the destination already holds (an archive directory is never merged into an
 //!   existing one, so extracting never mixes into the user's content).
 
-use std::collections::HashMap;
-
-use crate::fs::name::{
-	EntryNameError, ValidatedName,
-	keep_both::{NameShape, TakenNames, collision_key},
+use crate::{
+	fs::name::{
+		EntryNameError, ValidatedName,
+		keep_both::{NameShape, TakenNames, collision_key},
+	},
+	util::SeededMap,
 };
 
 /// A directory the resolver planned; the root (the directory entries land in) is [`ROOT`].
@@ -35,7 +36,7 @@ struct Node {
 	taken: TakenNames,
 	/// Subdirectories by the collision key of the name the archive gave them, which may differ
 	/// from the name they are created under.
-	children: HashMap<String, DirId>,
+	children: SeededMap<String, DirId>,
 }
 
 pub(crate) struct PathResolver {
@@ -48,7 +49,7 @@ impl PathResolver {
 		Self {
 			dirs: vec![Node {
 				taken: TakenNames::new(existing),
-				children: HashMap::new(),
+				children: SeededMap::default(),
 			}],
 		}
 	}
@@ -73,7 +74,7 @@ impl PathResolver {
 			let id = self.dirs.len();
 			self.dirs.push(Node {
 				taken: TakenNames::default(),
-				children: HashMap::new(),
+				children: SeededMap::default(),
 			});
 			self.dirs[current].children.insert(key, id);
 			planned.push(PlannedDir {

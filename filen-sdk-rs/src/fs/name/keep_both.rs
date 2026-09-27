@@ -3,12 +3,10 @@
 //! there. Used wherever the SDK creates items from other items: copies, compressed archives and
 //! extracted entries.
 
-use std::{
-	borrow::Cow,
-	collections::{HashMap, HashSet},
-};
+use std::borrow::Cow;
 
 use super::{EntryNameError, EntryNameErrorKind, MAX_BYTES, ValidatedName, encode_name};
+use crate::util::{SeededMap, SeededSet};
 
 /// The key two names collide on. The server compares names through `hash_name`, which
 /// lowercases with [`str::to_lowercase`], so this must use exactly the same folding.
@@ -58,18 +56,18 @@ pub(crate) enum NameShape {
 /// The names taken in one destination directory, compared case-insensitively.
 #[derive(Debug, Default)]
 pub(crate) struct TakenNames {
-	keys: HashSet<String>,
+	keys: SeededSet<String>,
 	/// Per `(stem, extension)` collision key, a counter below which every candidate is known to
 	/// be taken, so the `k`-th duplicate of one name does not retry the `k - 1` before it.
 	/// Names are only ever added, so a candidate once seen taken stays taken.
-	next_counter: HashMap<(String, String), u64>,
+	next_counter: SeededMap<(String, String), u64>,
 }
 
 impl TakenNames {
 	pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
 		Self {
 			keys: names.into_iter().map(collision_key).collect(),
-			next_counter: HashMap::new(),
+			next_counter: SeededMap::default(),
 		}
 	}
 

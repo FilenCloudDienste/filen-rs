@@ -2306,6 +2306,7 @@ dependencies = [
  "sevenz-rust2",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "siphasher 1.0.1",
  "stable_deref_trait",
  "string-interner",
  "tar",
