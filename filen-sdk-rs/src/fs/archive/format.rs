@@ -4,6 +4,11 @@
 //! The magic bytes win over the name: a `.zip` that is really a tar is read as a tar. Only
 //! brotli and LZMA-alone streams carry no magic, so for those the extension decides, and zip is
 //! also tried by extension, since a self-extracting stub or other leading bytes hide its magic.
+//! An empty tar is nothing but its end-of-archive marker, so its extension decides too.
+//!
+//! A tar header's checksum is checked right after the zip and 7z magics, before the stream
+//! codecs': a plain tar starts with its first member's path, which can spell `LZIP` or `BZh9`,
+//! while a compressed stream passing a header checksum by chance is all but impossible.
 
 use crate::fs::name::{ValidatedName, keep_both::SourceName};
 
@@ -56,6 +61,9 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(&SEVEN_Z_MAGIC) {
 		return Some(Detected::SevenZ);
 	}
+	if head.len() >= DETECT_HEAD_LEN && is_tar_header(&head[..DETECT_HEAD_LEN]) {
+		return Some(Detected::Tar);
+	}
 	if head.starts_with(&[0x1F, 0x8B]) {
 		return Some(Detected::Stream(StreamCodec::Gzip));
 	}
@@ -71,12 +79,16 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(b"LZIP") {
 		return Some(Detected::Stream(StreamCodec::Lzip));
 	}
-	if head.len() >= DETECT_HEAD_LEN && is_tar_header(&head[..DETECT_HEAD_LEN]) {
-		return Some(Detected::Tar);
-	}
 	// no magic: the name is all there is to go by
-	match extension_format(name)? {
+	let (extension, format) = match_extension(name)?;
+	match format {
 		ExtensionFormat::Zip => Some(Detected::Zip),
+		ExtensionFormat::Tar if is_end_marker(head) => Some(Detected::Tar),
+		// a real tar.lzip starts with lzip's magic, so a `.tlz` without it is the older
+		// tar.lzma that went by the same name
+		ExtensionFormat::CompressedTar(StreamCodec::Lzip) if extension == ".tlz" => {
+			Some(Detected::Stream(StreamCodec::Lzma))
+		}
 		ExtensionFormat::Stream(codec @ (StreamCodec::Brotli | StreamCodec::Lzma)) => {
 			Some(Detected::Stream(codec))
 		}
@@ -110,6 +122,12 @@ pub(crate) fn is_tar_header(block: &[u8]) -> bool {
 		return false;
 	}
 	stored == unsigned || i64::try_from(stored).is_ok_and(|stored| stored == signed)
+}
+
+/// Whether `block` is a whole block of zeros: a tar's end-of-archive marker, and all an empty
+/// tar holds.
+pub(crate) fn is_end_marker(block: &[u8]) -> bool {
+	block.len() == DETECT_HEAD_LEN && block.iter().all(|&b| b == 0)
 }
 
 /// A tar octal number field: leading spaces, octal digits, then NUL or space padding.
@@ -267,6 +285,27 @@ mod tests {
 	}
 
 	#[test]
+	fn a_tar_header_wins_over_magic_its_first_path_happens_to_spell() {
+		// a plain tar's first bytes are its first member's path, which may spell a weak magic
+		for name in ["LZIP/notes.txt", "BZh9.txt", "BZh1/"] {
+			assert_eq!(
+				detect(&tar_header(name), "x"),
+				Some(Detected::Tar),
+				"{name}"
+			);
+		}
+	}
+
+	#[test]
+	fn an_empty_tar_is_told_by_its_extension() {
+		// the end-of-archive marker is all an empty tar holds
+		let empty = [0u8; DETECT_HEAD_LEN];
+		assert_eq!(detect(&empty, "e.tar"), Some(Detected::Tar));
+		assert_eq!(detect(&empty, "e.bin"), None);
+		assert_eq!(detect(&empty[..100], "e.tar"), None);
+	}
+
+	#[test]
 	fn formats_without_magic_are_told_by_their_extension() {
 		assert_eq!(
 			detect(b"\x0b\x02\x80data", "a.br"),
@@ -278,6 +317,12 @@ mod tests {
 		);
 		assert_eq!(
 			detect(&[0x5D, 0, 0, 0x80, 0], "a.lzma"),
+			Some(Detected::Stream(StreamCodec::Lzma))
+		);
+		// `.tlz` is tar.lzip, and also the older name of tar.lzma: without lzip's magic it is
+		// the latter
+		assert_eq!(
+			detect(&[0x5D, 0, 0, 0x80, 0], "a.tlz"),
 			Some(Detected::Stream(StreamCodec::Lzma))
 		);
 		// a zip behind a self-extractor stub has no magic at its start

@@ -281,6 +281,36 @@ fn a_compressed_tar_reports_the_data_behind_it() {
 }
 
 #[test]
+fn an_empty_tar_is_an_archive_of_nothing() {
+	// what `tar cf e.tar -T /dev/null` writes: the end-of-archive marker, padded to a record
+	let empty = vec![0u8; 10 * 1024];
+	let nothing = ArchiveEnd {
+		unchecked_entries: 0,
+		unaccounted_bytes: 0,
+		duplicates: None,
+	};
+	let (seen, end) = run(&empty, "e.tar");
+	assert_eq!(seen, [Seen::Opened(StreamLayout::Tar { codec: None })]);
+	assert_eq!(end.unwrap(), nothing);
+	let (seen, end) = run(&gzip(&empty), "e.tar.gz");
+	assert_eq!(
+		seen,
+		[Seen::Opened(StreamLayout::Tar {
+			codec: Some(StreamCodec::Gzip)
+		})]
+	);
+	assert_eq!(end.unwrap(), nothing);
+	// without a tar's name, zeros are a file of zeros
+	let (seen, _) = run(&gzip(&empty), "zeros.gz");
+	assert_eq!(
+		seen[0],
+		Seen::Opened(StreamLayout::Single {
+			codec: StreamCodec::Gzip
+		})
+	);
+}
+
+#[test]
 fn a_single_compressed_file_is_named_after_the_archive() {
 	let data = b"a single file, compressed on its own".repeat(100);
 	let (seen, end) = run(&gzip(&data), "notes.txt.gz");
