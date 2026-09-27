@@ -1,8 +1,11 @@
 //! Zip encryption: WinZip AES (read and written) and the legacy "traditional PKWARE"
 //! encryption (ZipCrypto, read only: it is broken, and the SDK never writes it).
 //!
-//! The key material this module holds itself, the PBKDF2 output and ZipCrypto's keys, is wiped
-//! when dropped; the AES and HMAC states are their crates' to wipe.
+//! What is wiped when dropped: the PBKDF2 output and ZipCrypto's keys, which this module holds
+//! itself, and the AES key schedules, through the `aes` crate's `zeroize` feature. What is not:
+//! the HMAC-SHA1 state keyed with the authentication key (`hmac` 0.12 has no way to wipe it) and
+//! the counter mode's position and buffered keystream (`ctr` and `cipher` are built without
+//! their `zeroize` features).
 
 use std::io::{self, Read, Take, Write};
 
