@@ -29,6 +29,7 @@ use crate::{
 	Error, ErrorKind,
 	blocking::send_catching_panic,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+	util::SeededSet,
 };
 
 use super::{entry_path::ArchivePath, extract::ExtractSkipReason, format::StreamCodec};
@@ -116,7 +117,9 @@ pub(crate) struct WorkerShared {
 	/// Moved whenever the codec takes input or hands over an event: the driver's evidence that
 	/// the codec is alive.
 	progress: AtomicU64,
-	/// Bytes of the archive the codec has read.
+	/// Bytes of its input the codec has read, each counted once however often it is read (a
+	/// chunk evicted from a [`SeekInput`]'s cache and fetched again, an entry read for a password
+	/// probe and then again for real), so it never exceeds the input's length.
 	input_bytes: AtomicU64,
 }
 
@@ -394,6 +397,8 @@ pub(crate) struct SeekInput<'p> {
 	/// The most recent chunks, most recent first.
 	cache: Vec<(u64, Vec<u8>)>,
 	slots: usize,
+	/// Every chunk fetched so far, so one fetched again counts as read once.
+	fetched: SeededSet<u64>,
 }
 
 impl<'p> SeekInput<'p> {
@@ -405,6 +410,7 @@ impl<'p> SeekInput<'p> {
 			pos: 0,
 			cache: Vec::new(),
 			slots: 2,
+			fetched: SeededSet::default(),
 		}
 	}
 
@@ -420,10 +426,12 @@ impl<'p> SeekInput<'p> {
 			Some(at) => self.cache[..=at].rotate_right(1),
 			None => {
 				let data = self.port.fetch(self.source, index)?;
-				self.port
-					.shared
-					.input_bytes
-					.fetch_add(data.len() as u64, Ordering::Relaxed);
+				if self.fetched.insert(index) {
+					self.port
+						.shared
+						.input_bytes
+						.fetch_add(data.len() as u64, Ordering::Relaxed);
+				}
 				self.cache.truncate(self.slots - 1);
 				self.cache.insert(0, (index, data));
 			}
@@ -608,7 +616,47 @@ pub(crate) fn read_full(reader: &mut (impl Read + ?Sized), buf: &mut [u8]) -> io
 
 #[cfg(test)]
 mod tests {
+	use std::io::{Seek, SeekFrom};
+
 	use super::*;
+
+	/// Runs `read` on a codec worker over a source of `len` bytes, answering every ask; the chunk
+	/// indices asked for, and what `read` returned.
+	async fn with_source<R: Send + 'static>(
+		len: u64,
+		read: impl FnOnce(&WorkerPort) -> Result<R, Error> + Send + 'static,
+	) -> (Vec<u64>, Result<R, Error>) {
+		let mut link = start(move |port| read(&port)).unwrap();
+		let mut asked = Vec::new();
+		while let Some(event) = link.events.recv().await {
+			let WorkerEvent::Ask { index, reply, .. } = event else {
+				panic!("the reader only asks, sent {event:?}");
+			};
+			asked.push(index);
+			let start = index * CHUNK_SIZE_U64;
+			let end = (start + CHUNK_SIZE_U64).min(len);
+			let _ = reply.send(Ok((start..end).map(|at| (at % 251) as u8).collect()));
+		}
+		(asked, (&mut link.done).await.unwrap())
+	}
+
+	#[tokio::test]
+	async fn a_chunk_fetched_again_counts_once_toward_the_bytes_read() {
+		let len = 2 * CHUNK_SIZE_U64 + 100;
+		let (asked, read) = with_source(len, move |port| {
+			let mut source = SeekInput::new(port, 0, len);
+			let mut byte = [0u8];
+			// the first two chunks evict the last one from the cache of two before it is read again
+			for at in [len - 1, 0, CHUNK_SIZE_U64, len - 1] {
+				source.seek(SeekFrom::Start(at))?;
+				source.read_exact(&mut byte)?;
+			}
+			Ok(port.shared().input_bytes())
+		})
+		.await;
+		assert_eq!(asked, [2, 0, 1, 2]);
+		assert_eq!(read.unwrap(), len);
+	}
 
 	#[tokio::test]
 	async fn a_codec_that_panics_ends_its_events_and_fails_with_the_message() {
