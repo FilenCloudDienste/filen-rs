@@ -11,14 +11,17 @@
 mod client_impl;
 pub(crate) mod codec;
 mod engine;
+mod read_back;
 mod report;
 
 pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use client_impl::{CompressConfig, CompressRequest};
 pub use report::{
-	CompressCallback, CompressCounts, CompressEvent, CompressFailed, CompressPhase, CompressReport,
-	CompressUpdate, HashMismatch, RunState,
+	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
+	CompressPhase, CompressReport, CompressUpdate, HashMismatch, RunState,
 };
+
+use std::ops::RangeInclusive;
 
 use filen_macros::js_type;
 
@@ -38,6 +41,10 @@ pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
 
 use super::format::{ExtensionFormat, match_extension};
 
+/// The highest level a codec or method takes (brotli's), so a method's own levels
+/// can be found by its check.
+const HIGHEST_LEVEL: u32 = 11;
+
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]
 pub enum CompressSources {
@@ -48,9 +55,13 @@ pub enum CompressSources {
 	/// confirmed with the server, and each source still exactly as it was read. Otherwise they
 	/// are kept and the report says why. The archive cannot be written into one of them.
 	///
-	/// The archive is not read back first. With an encrypted format, have the user confirm the
-	/// password before removing anything for good: a mistyped one leaves an archive nobody can
-	/// open.
+	/// Before deleting anything for good, the archive is read back from the server as
+	/// extracting would read it ([`CompressPhase::Verifying`], its progress in
+	/// [`CompressCounts::bytes_verified`]), which downloads it once more: every entry has to be
+	/// its source's data. Trashed sources can be restored, so trashing
+	/// reads nothing back. The read back uses the password the archive was written with, so it
+	/// cannot tell a mistyped one: with an encrypted format, have the user confirm the password
+	/// before removing anything for good.
 	///
 	/// An item given twice, or inside another given folder, shares that one's outcome, its bytes
 	/// counted there; a file of it that the folder's permanent removal deleted before stopping
@@ -131,8 +142,15 @@ impl CompressFormat {
 		}
 	}
 
-	/// Checks the format's levels, and that a password comes exactly with encryption.
-	pub(crate) fn check(self, has_password: bool) -> Result<(), Error> {
+	/// Checks everything about the format a job can know before it starts: its levels, that a
+	/// password comes exactly with encryption, and that its encoder fits `budget`.
+	pub(crate) fn check_within(self, has_password: bool, budget: u64) -> Result<(), Error> {
+		within_budget(self.check(has_password)?, budget).map(drop)
+	}
+
+	/// Checks the format's levels, and that a password comes exactly with encryption; the
+	/// memory its encoder needs, in bytes.
+	pub(crate) fn check(self, has_password: bool) -> Result<u64, Error> {
 		let encrypted = match self {
 			Self::Zip { encryption, .. } => encryption.is_some(),
 			Self::SevenZ { encryption, .. } => encryption.is_some(),
@@ -147,51 +165,141 @@ impl CompressFormat {
 				ErrorKind::InvalidState,
 				"a password was given for an archive that is not encrypted",
 			)),
-			_ => self.encoder_memory().map(drop),
+			_ => self.encoder_memory(),
 		}
 	}
 
 	/// Memory the format's encoder needs, in bytes (0 for a bare tar).
 	pub fn encoder_memory(self) -> Result<u64, Error> {
+		let method_levels = match self {
+			Self::Zip { method, .. } => method.check(),
+			Self::SevenZ { method, .. } => method.check(),
+			Self::Tar { .. } | Self::Single { .. } => Ok(()),
+		};
+		method_levels.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
 		match self {
 			Self::Tar { compression: None } => Ok(0),
 			Self::Tar {
 				compression: Some(compression),
 			}
 			| Self::Single { compression } => compression.encoder_memory(),
-			Self::Zip { method, .. } => {
-				method
-					.check()
-					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
-				Ok(match method {
-					ZipMethod::Stored => 0,
-					ZipMethod::Deflate { .. } => Compression {
-						codec: StreamCodec::Gzip,
-						level: None,
-					}
-					.encoder_memory()?,
-					ZipMethod::Bzip2 { level } => Compression {
-						codec: StreamCodec::Bzip2,
-						level: Some(level),
-					}
-					.encoder_memory()?,
-				})
-			}
+			Self::Zip { method, .. } => Ok(match method {
+				ZipMethod::Stored => 0,
+				ZipMethod::Deflate { .. } => Compression {
+					codec: StreamCodec::Gzip,
+					level: None,
+				}
+				.encoder_memory()?,
+				ZipMethod::Bzip2 { level } => Compression {
+					codec: StreamCodec::Bzip2,
+					level: Some(level),
+				}
+				.encoder_memory()?,
+			}),
+			// an encrypted header is compressed with LZMA2 on its own, once the data is done
 			Self::SevenZ {
-				method, encryption, ..
-			} => {
-				method
-					.check()
-					.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
-				// an encrypted header is compressed with LZMA2 on its own, once the data is done
-				Ok(match encryption {
-					Some(SevenZEncryption::EntriesAndHeaders) => method
-						.encoder_memory()
-						.max(super::sevenz::write::header_encoder_memory()),
-					_ => method.encoder_memory(),
-				})
+				method,
+				encryption: Some(SevenZEncryption::EntriesAndHeaders),
+				..
+			} => Ok(method
+				.encoder_memory()
+				.max(super::sevenz::write::header_encoder_memory())),
+			Self::SevenZ { method, .. } => Ok(method.encoder_memory()),
+		}
+	}
+
+	/// The encoder's memory, in bytes, refused with [`ErrorKind::InsufficientMemory`] when over
+	/// `budget` (a client's is its [`ArchiveConfig::codec_mem_budget`]).
+	///
+	/// [`ArchiveConfig::codec_mem_budget`]: super::ArchiveConfig::codec_mem_budget
+	pub fn check_budget(self, budget: u64) -> Result<u64, Error> {
+		within_budget(self.encoder_memory()?, budget)
+	}
+
+	/// The levels the format's codec or method takes, for a UI to offer; `None` for one without
+	/// levels (a bare tar, a stored zip, a 7z copy). Which of them fit a device is
+	/// [`CompressFormat::max_level_within`].
+	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+		match self {
+			Self::Tar { compression: None } => None,
+			Self::Tar {
+				compression: Some(compression),
+			}
+			| Self::Single { compression } => Some(compression.codec.levels().0),
+			Self::Zip {
+				method: ZipMethod::Stored,
+				..
+			}
+			| Self::SevenZ {
+				method: SevenZMethod::Copy,
+				..
+			} => None,
+			// the methods state their levels only through their checks
+			Self::Zip { .. } | Self::SevenZ { .. } => {
+				let takes = |level| self.with_level(level).encoder_memory().is_ok();
+				let low = (0..=HIGHEST_LEVEL).find(|&level| takes(level))?;
+				let high = (0..=HIGHEST_LEVEL).rev().find(|&level| takes(level))?;
+				// a method's levels have no gaps (the tests check every method)
+				debug_assert!((low..=high).all(takes), "{self:?} skips a level");
+				Some(low..=high)
 			}
 		}
+	}
+
+	/// The format at `level`, unchecked; the same format when it has no levels.
+	pub fn with_level(self, level: u32) -> Self {
+		match self {
+			Self::Tar {
+				compression: Some(compression),
+			} => Self::Tar {
+				compression: Some(Compression {
+					level: Some(level),
+					..compression
+				}),
+			},
+			Self::Single { compression } => Self::Single {
+				compression: Compression {
+					level: Some(level),
+					..compression
+				},
+			},
+			Self::Zip { method, encryption } => Self::Zip {
+				method: match method {
+					ZipMethod::Stored => ZipMethod::Stored,
+					ZipMethod::Deflate { .. } => ZipMethod::Deflate { level },
+					ZipMethod::Bzip2 { .. } => ZipMethod::Bzip2 { level },
+				},
+				encryption,
+			},
+			Self::SevenZ {
+				method,
+				solid,
+				encryption,
+			} => Self::SevenZ {
+				method: match method {
+					SevenZMethod::Copy => SevenZMethod::Copy,
+					SevenZMethod::Lzma2 { .. } => SevenZMethod::Lzma2 { level },
+					SevenZMethod::Lzma { .. } => SevenZMethod::Lzma { level },
+					SevenZMethod::Ppmd { .. } => SevenZMethod::Ppmd { level },
+					SevenZMethod::Bzip2 { .. } => SevenZMethod::Bzip2 { level },
+					SevenZMethod::Deflate { .. } => SevenZMethod::Deflate { level },
+				},
+				solid,
+				encryption,
+			},
+			Self::Tar { compression: None } => self,
+		}
+	}
+
+	/// The highest of the format's [levels](CompressFormat::levels) whose encoder fits `budget`
+	/// bytes (a client's is its [`ArchiveConfig::codec_mem_budget`]); `None` when the format has
+	/// no levels or not even its lowest fits.
+	///
+	/// [`ArchiveConfig::codec_mem_budget`]: super::ArchiveConfig::codec_mem_budget
+	pub fn max_level_within(self, budget: u64) -> Option<u32> {
+		self.levels()?
+			.rev()
+			.find(|&level| self.with_level(level).check_budget(budget).is_ok())
 	}
 
 	/// The length of the extension `name` ends in, which has to be one this format goes by
@@ -214,6 +322,17 @@ impl CompressFormat {
 			)),
 		}
 	}
+}
+
+/// `memory`, an encoder's, refused with [`ErrorKind::InsufficientMemory`] when over `budget`.
+fn within_budget(memory: u64, budget: u64) -> Result<u64, Error> {
+	if memory > budget {
+		return Err(Error::custom(
+			ErrorKind::InsufficientMemory,
+			format!("this format needs {memory} bytes of codec memory, over the {budget} allowed"),
+		));
+	}
+	Ok(memory)
 }
 
 #[cfg(test)]
@@ -298,6 +417,134 @@ mod tests {
 				.unwrap(),
 			7_600_000
 		);
+	}
+
+	#[test]
+	fn a_formats_levels_and_what_fits_a_budget_are_known_up_front() {
+		const SMALLEST_BUDGET: u64 = 128 << 20;
+		let tar = |codec| CompressFormat::Tar {
+			compression: Some(compression(codec)),
+		};
+		let sevenz = |method| CompressFormat::SevenZ {
+			method,
+			solid: true,
+			encryption: Some(SevenZEncryption::Entries),
+		};
+		assert_eq!(tar(StreamCodec::Brotli).levels(), Some(0..=11));
+		assert_eq!(tar(StreamCodec::Lz4).levels(), Some(1..=1));
+		assert_eq!(CompressFormat::Tar { compression: None }.levels(), None);
+		let deflate = CompressFormat::Zip {
+			method: ZipMethod::Deflate { level: 6 },
+			encryption: None,
+		};
+		assert_eq!(deflate.levels(), Some(1..=9));
+		assert_eq!(
+			CompressFormat::Zip {
+				method: ZipMethod::Stored,
+				encryption: None,
+			}
+			.levels(),
+			None
+		);
+		assert_eq!(
+			sevenz(SevenZMethod::Lzma2 { level: 5 }).levels(),
+			Some(0..=9)
+		);
+		assert_eq!(
+			sevenz(SevenZMethod::Ppmd { level: 5 }).levels(),
+			Some(1..=9)
+		);
+		assert_eq!(sevenz(SevenZMethod::Copy).levels(), None);
+		assert_eq!(
+			sevenz(SevenZMethod::Ppmd { level: 5 }).with_level(9),
+			sevenz(SevenZMethod::Ppmd { level: 9 }),
+			"only the level changes"
+		);
+
+		// the dictionaries and models that fit a phone's budget
+		assert_eq!(
+			sevenz(SevenZMethod::Lzma2 { level: 9 }).max_level_within(SMALLEST_BUDGET),
+			Some(6)
+		);
+		assert_eq!(
+			sevenz(SevenZMethod::Ppmd { level: 9 }).max_level_within(SMALLEST_BUDGET),
+			Some(7)
+		);
+		assert_eq!(tar(StreamCodec::Xz).max_level_within(256 << 20), Some(7));
+		assert_eq!(
+			tar(StreamCodec::Gzip).max_level_within(SMALLEST_BUDGET),
+			Some(9)
+		);
+		assert_eq!(tar(StreamCodec::Xz).max_level_within(1), None);
+		assert_eq!(
+			sevenz(SevenZMethod::Ppmd { level: 8 })
+				.check_budget(SMALLEST_BUDGET)
+				.unwrap_err()
+				.kind(),
+			ErrorKind::InsufficientMemory
+		);
+		assert_eq!(
+			sevenz(SevenZMethod::Ppmd { level: 7 })
+				.check_budget(SMALLEST_BUDGET)
+				.unwrap(),
+			sevenz(SevenZMethod::Ppmd { level: 7 })
+				.encoder_memory()
+				.unwrap()
+		);
+		assert_eq!(
+			deflate
+				.check_within(true, SMALLEST_BUDGET)
+				.unwrap_err()
+				.kind(),
+			ErrorKind::InvalidState,
+			"the password is checked with the budget"
+		);
+	}
+
+	#[test]
+	fn the_level_probe_covers_every_codecs_levels() {
+		for codec in [
+			StreamCodec::Gzip,
+			StreamCodec::Bzip2,
+			StreamCodec::Xz,
+			StreamCodec::Lzma,
+			StreamCodec::Lzip,
+			StreamCodec::Lz4,
+			StreamCodec::Brotli,
+		] {
+			assert!(*codec.levels().0.end() <= HIGHEST_LEVEL, "{codec:?}");
+		}
+		// every zip and 7z method's levels are found by the probe: all of them below its top,
+		// with no gap, and none above
+		let zip = |method| CompressFormat::Zip {
+			method,
+			encryption: None,
+		};
+		let sevenz = |method| CompressFormat::SevenZ {
+			method,
+			solid: false,
+			encryption: None,
+		};
+		let formats = [
+			zip(ZipMethod::Deflate { level: 1 }),
+			zip(ZipMethod::Bzip2 { level: 1 }),
+			sevenz(SevenZMethod::Lzma2 { level: 1 }),
+			sevenz(SevenZMethod::Lzma { level: 1 }),
+			sevenz(SevenZMethod::Ppmd { level: 1 }),
+			sevenz(SevenZMethod::Bzip2 { level: 1 }),
+			sevenz(SevenZMethod::Deflate { level: 1 }),
+		];
+		for format in formats {
+			let levels = format.levels().unwrap();
+			assert!(*levels.end() < HIGHEST_LEVEL, "{format:?}");
+			for level in 0..=4 * HIGHEST_LEVEL {
+				assert_eq!(
+					format.with_level(level).check(false).is_ok(),
+					levels.contains(&level),
+					"{format:?} at {level}"
+				);
+			}
+		}
 	}
 
 	#[test]

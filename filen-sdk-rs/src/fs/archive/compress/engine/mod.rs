@@ -7,7 +7,9 @@
 //! for one input and one output chunk, more only from the client's budget when it is free right
 //! now, and a pause that gives back the floor, the prefetched chunks and every reservation from
 //! the client's budget once in-flight work is done. A paused job keeps its codec's state and the
-//! source chunk the codec is reading resident.
+//! source chunk the codec is reading resident. Once the codec is done the floor is given back;
+//! reading the archive back before a permanent disposal takes it again, and pauses the same way
+//! (see [`read_back`](super::read_back)).
 
 use std::{
 	collections::{BTreeSet, VecDeque},
@@ -61,8 +63,10 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
+use super::read_back::{ReadBack, reads_back};
 use super::report::{
-	CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch, Reporter,
+	CompressActiveFile, CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch,
+	Reporter,
 };
 
 /// Archive chunks uploading at once.
@@ -104,6 +108,8 @@ pub(crate) struct CompressTask<B> {
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
 	pub(crate) disposal: Option<CompressDisposal>,
+	/// Reads the archive back before a permanent disposal.
+	pub(crate) read_back: Option<ReadBack>,
 }
 
 /// How to remove the sources once the archive is verified, and what the job read of them.
@@ -196,6 +202,7 @@ struct Driver<B: DriveBackend> {
 	mismatched: BTreeSet<usize>,
 	/// The files behind `mismatched`, for the report.
 	hash_mismatches: Vec<HashMismatch>,
+	read_back: Option<ReadBack>,
 	fatal: Option<Arc<Error>>,
 }
 
@@ -218,6 +225,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		start,
 		mut report,
 		disposal,
+		read_back,
 	} = task;
 	let shape = NameShape::FileWithExtension { len: extension_len };
 	// every source a disposal was asked for is reported, however the job ends
@@ -313,6 +321,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		stalled_ticks: 0,
 		mismatched: BTreeSet::new(),
 		hash_mismatches: Vec::new(),
+		read_back,
 		fatal: None,
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -324,6 +333,9 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		if driver.fatal.is_some() {
 			return Err(Stopped);
 		}
+		// the codec is done: registering and removing the sources hold no memory floor, and
+		// reading the archive back takes its own
+		driver.floor = None;
 		driver.reporter.set_phase(CompressPhase::Finishing);
 		// the destination may have been shared or linked since the job started
 		let refetched = driver
@@ -340,7 +352,14 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		let archive = driver.register(name, shape, targets).await?;
 		// the archive exists from here on: a cancel now keeps the sources, but the job is done
 		if let Some(disposal) = disposal {
-			driver.reporter.set_phase(CompressPhase::DisposingSources);
+			// a permanent disposal reads the archive back first
+			driver
+				.reporter
+				.set_phase(if disposal.how == SourceDisposal::DeletePermanently {
+					CompressPhase::Verifying
+				} else {
+					CompressPhase::DisposingSources
+				});
 			dispositions = match driver.reporter.checkpoint(&driver.control).await {
 				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
 				Err(Stopped) => {
@@ -621,7 +640,19 @@ impl<B: DisposalBackend> Driver<B> {
 			};
 			self.reporter.event(event);
 		}
-		self.reporter.source_read(len);
+		let (source_uuid, size) = (state.file.uuid(), state.file.size());
+		self.reporter
+			.source_read(source_uuid, len, || CompressActiveFile {
+				source_uuid,
+				name: state
+					.path
+					.rsplit_once('/')
+					.map_or(&*state.path, |(_, name)| name)
+					.to_owned(),
+				path: state.path.clone(),
+				size,
+				bytes_done: 0,
+			});
 		let _ = reply.send(Ok(data));
 	}
 
@@ -768,10 +799,12 @@ impl<B: DisposalBackend> Driver<B> {
 			targets,
 			hashed,
 		} = disposal;
+		let read_back = self.read_back.take();
 		// a source whose own files could not be checked is kept on its own; anything wrong
 		// with the archive keeps them all
+		let mismatched = std::mem::take(&mut self.mismatched);
 		let own_reason = |request: usize| {
-			if self.mismatched.contains(&request) {
+			if mismatched.contains(&request) {
 				Some(KeptReason::HashMismatch)
 			} else if how == SourceDisposal::DeletePermanently && !hashed[request] {
 				Some(KeptReason::HashUnavailable)
@@ -792,18 +825,24 @@ impl<B: DisposalBackend> Driver<B> {
 			None
 		} else {
 			// the archive as the server holds it
-			match self.backend.file_state(archive.uuid()).await {
-				Ok(state)
+			let state = self
+				.control
+				.until_stopping(self.backend.file_state(archive.uuid()))
+				.await;
+			match state {
+				Ok(Ok(state))
 					if !state.trash
 						&& !state.versioned
 						&& state.size == self.written
 						&& state.chunks == self.next_index =>
 				{
-					None
+					self.read_back(how, archive, read_back).await
 				}
-				_ => Some(KeptReason::Unconfirmed),
+				Ok(_) => Some(KeptReason::Unconfirmed),
+				Err(Stopped) => Some(KeptReason::Interrupted),
 			}
 		};
+		self.reporter.set_phase(CompressPhase::DisposingSources);
 		// a source inside another (a file and its folder both given) goes with that one: its
 		// removal removes it, and its own attempt would only find it gone
 		let mut within: Vec<Option<usize>> = targets
@@ -941,6 +980,43 @@ impl<B: DisposalBackend> Driver<B> {
 			.into_iter()
 			.map(|disposition| disposition.expect("every source goes with an outermost one"))
 			.collect()
+	}
+
+	/// Why the sources are kept after reading `archive` back, which a permanent disposal needs:
+	/// the encoders are the SDK's own, and nothing else would hold the data if one were wrong.
+	async fn read_back(
+		&mut self,
+		how: SourceDisposal,
+		archive: &RemoteFile,
+		read_back: Option<ReadBack>,
+	) -> Option<KeptReason> {
+		if how == SourceDisposal::Trash {
+			return None;
+		}
+		let Some(read_back) = read_back else {
+			return Some(KeptReason::Unconfirmed);
+		};
+		// every source was read to its end, so each hash is of all of it; nothing reads the
+		// sources' paths again
+		let files = self
+			.sources
+			.iter_mut()
+			.map(|source| (std::mem::take(&mut source.path), source.hasher.finalize()))
+			.collect();
+		let verdict = reads_back(
+			&*self.backend,
+			&self.control,
+			&self.reporter,
+			archive,
+			read_back,
+			files,
+		)
+		.await;
+		match verdict {
+			Ok(true) => None,
+			Ok(false) => Some(KeptReason::Unconfirmed),
+			Err(Stopped) => Some(KeptReason::Interrupted),
+		}
 	}
 
 	/// Registers the uploaded archive in the destination.

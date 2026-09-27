@@ -25,6 +25,7 @@ use crate::{
 			compress::{
 				CompressFormat, CompressUpdate, RunState,
 				codec::{ArchiveEntry, CompressJob, compress},
+				read_back::ReadBack,
 				report::CompressCallback,
 			},
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
@@ -32,9 +33,11 @@ use crate::{
 			dispose::{DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree},
 			encode::Compression,
 			format::StreamCodec,
-			sevenz::write::SevenZMethod,
+			password::ArchivePassword,
+			sevenz::write::{SevenZEncryption, SevenZMethod},
 			tar_iter::TarReader,
 			worker,
+			zip::{crypto::AesStrength, write::ZipMethod},
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -46,7 +49,7 @@ use crate::{
 			meta::{DecryptedFileMeta, FileMeta},
 		},
 	},
-	job::test_support::controls,
+	job::{report::JobState, test_support::controls},
 };
 
 #[derive(Default)]
@@ -57,10 +60,21 @@ struct Recorder {
 	memory: Option<Arc<Semaphore>>,
 	/// The budget's free permits at each update reading paused.
 	free_when_paused: Mutex<Vec<usize>>,
+	/// What to hold in this drive once the archive is registered, the sources having been
+	/// read: these items, and the archive's own chunks if asked.
+	hold_when_created: Option<(Arc<FakeBackend>, Vec<Uuid>, bool)>,
 }
 
 impl CompressCallback for Recorder {
 	fn on_archive_created(&self, archive: RemoteFile) {
+		if let Some((backend, items, and_archive)) = &self.hold_when_created {
+			backend.held.send_modify(|held| {
+				held.extend(items);
+				if *and_archive {
+					held.insert(archive.uuid());
+				}
+			});
+		}
 		self.created.lock().unwrap().push(archive);
 	}
 
@@ -135,6 +149,12 @@ struct Setup {
 	entries: Vec<ArchiveEntry>,
 	sources: Vec<(String, RemoteFileType<'static>)>,
 	contents: Vec<Vec<u8>>,
+	/// The archive's password, which reading it back takes too.
+	password: Option<ArchivePassword>,
+	/// Reading the archive back waits from its first chunk until the test releases it.
+	hold_archive: bool,
+	/// Items held once the archive is registered (a source's fetches are never held).
+	hold_after_registering: Vec<Uuid>,
 }
 
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
@@ -178,6 +198,9 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 		entries,
 		sources: paths.iter().map(|p| (*p).to_owned()).zip(files).collect(),
 		contents,
+		password: None,
+		hold_archive: false,
+		hold_after_registering: Vec::new(),
 	}
 }
 
@@ -220,10 +243,19 @@ fn start_disposing(
 ) -> Job {
 	let recorder = Arc::new(Recorder {
 		memory: Some(Arc::clone(&setup.backend.memory)),
+		hold_when_created: Some((
+			Arc::clone(&setup.backend),
+			setup.hold_after_registering.clone(),
+			setup.hold_archive,
+		)),
 		..Recorder::default()
 	});
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
+	let config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
+	let read_back = disposal
+		.as_ref()
+		.map(|_| ReadBack::as_extracting(&setup.entries, &config, setup.password.clone()));
 	let running = tokio::spawn(run_compress(CompressTask {
 		backend: Arc::clone(&setup.backend),
 		control,
@@ -242,11 +274,12 @@ fn start_disposing(
 			})
 			.collect(),
 		max_bytes,
-		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		config,
 		head_last: matches!(format, CompressFormat::SevenZ { .. }),
 		start,
 		report,
 		disposal,
+		read_back,
 	}));
 	Job {
 		running,
@@ -379,6 +412,24 @@ async fn compresses_the_sources_into_one_new_file() {
 	assert_eq!(report.counts.bytes_done, bytes.len() as u64);
 	assert_eq!(job.recorder.created.lock().unwrap().len(), 1);
 	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
+	// each file with data was the active one while it was read, named as in the archive
+	let mut active: Vec<(String, String)> = job
+		.recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| update.active.clone())
+		.map(|file| (file.name, file.path))
+		.collect();
+	active.dedup();
+	assert!(
+		active
+			.iter()
+			.all(|(name, path)| path.ends_with(name.as_str())),
+		"{active:?}"
+	);
+	assert!(job.recorder.last().active.is_empty());
 	assert!(
 		job.recorder.events().is_empty(),
 		"every source matched its hash"
@@ -1244,11 +1295,11 @@ fn hold(setup: &Setup, uuid: Uuid) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_dropped_past_its_cancel_grace_has_told_of_what_it_removed() {
-	let setup = setup(|_, _| {});
+	let mut setup = setup(|_, _| {});
 	let placed = place(&setup);
 	let top = setup.sources[2].1.uuid();
 	// the folder goes first; the top file's deletion is sent and never answered
-	hold(&setup, top);
+	setup.hold_after_registering.push(top);
 	let (_pause, cancel, control) = controls();
 	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
 	wait_until("the top file's deletion is sent", || {
@@ -1330,14 +1381,15 @@ async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
-	let setup = setup(|_, _| {});
+	let mut setup = setup(|_, _| {});
 	let placed = place(&setup);
 	// the folder's files are deleted in uuid order: the cancel comes while the first is
 	let (_, first) = setup.sources[..2]
 		.iter()
 		.min_by_key(|(_, file)| file.uuid())
 		.unwrap();
-	hold(&setup, first.uuid());
+	let first = first.clone();
+	setup.hold_after_registering.push(first.uuid());
 	let (_pause, cancel, control) = controls();
 	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
 	wait_until("the first file's deletion is sent", || {
@@ -1596,4 +1648,268 @@ async fn a_pause_while_registering_holds_the_disposal_back() {
 		"{:?}",
 		report.dispositions
 	);
+}
+
+/// The phases the callback saw, each change once.
+fn phases(recorder: &Recorder) -> Vec<CompressPhase> {
+	let mut phases: Vec<CompressPhase> = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|update| update.phase)
+		.collect();
+	phases.dedup();
+	phases
+}
+
+/// Compresses the setup into `name` in `format`, removing the sources for good.
+fn dispose_permanently_as(setup: &Setup, name: &str, format: CompressFormat) -> Job {
+	let placed = place(setup);
+	let job = CompressJob {
+		format,
+		entries: setup.entries.clone(),
+		password: setup.password.clone(),
+	};
+	start_disposing(
+		setup,
+		name,
+		format,
+		JobControl::default(),
+		None,
+		Box::new(move || worker::start(move |port| compress(&port, job))),
+		Some(CompressDisposal {
+			how: SourceDisposal::DeletePermanently,
+			targets: targets(setup, &placed),
+			hashed: vec![true; 2],
+		}),
+		CompressReport::default(),
+	)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permanent_removal_reads_the_archive_back_first() {
+	let password = || Some(ArchivePassword::new("hunter2".to_owned()).unwrap());
+	for (name, format, password) in [
+		("b.tar.gz", gzip_tar(), None),
+		(
+			"b.zip",
+			CompressFormat::Zip {
+				method: ZipMethod::Deflate { level: 6 },
+				encryption: Some(AesStrength::Aes256),
+			},
+			password(),
+		),
+		(
+			"b.7z",
+			CompressFormat::SevenZ {
+				method: SevenZMethod::Lzma2 { level: 1 },
+				solid: true,
+				encryption: Some(SevenZEncryption::EntriesAndHeaders),
+			},
+			password(),
+		),
+	] {
+		let mut setup = setup(|_, _| {});
+		setup.password = password;
+		let job = dispose_permanently_as(&setup, name, format);
+		let report = job.running.await.unwrap().unwrap();
+		let archive = report.archive.as_ref().unwrap().uuid();
+		assert!(
+			outcomes(&report)
+				.iter()
+				.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+			"{name}: {:?}",
+			report.dispositions
+		);
+		assert!(
+			setup
+				.backend
+				.log()
+				.fetched
+				.iter()
+				.any(|(file, _)| *file == archive),
+			"{name}: the archive is read back"
+		);
+		let phases = phases(&job.recorder);
+		assert!(
+			phases.ends_with(&[
+				CompressPhase::Finishing,
+				CompressPhase::Verifying,
+				CompressPhase::DisposingSources,
+				CompressPhase::Done,
+			]),
+			"{name}: {phases:?}"
+		);
+		assert_released(&setup, &job.reporter);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
+	// the archive a codec writes for the same sources, with one byte of a.txt's data off
+	let straight = setup(|_, _| {});
+	let job = start(
+		&straight,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+	);
+	let report = job.running.await.unwrap().unwrap();
+	let mut damaged = uploaded(&straight, report.archive.unwrap().uuid());
+	// the directory's header, then a.txt's, then its data
+	let data = 2 * 512;
+	assert_eq!(&damaged[data..data + 5], b"alpha");
+	damaged[data] ^= 1;
+
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_disposing(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+		Some(CompressDisposal {
+			how: SourceDisposal::DeletePermanently,
+			targets: targets(&setup, &placed),
+			hashed: vec![true; 2],
+		}),
+		CompressReport::default(),
+	);
+	// a codec that reads every source whole and writes the damaged archive
+	for (source, index) in [(0, 0), (1, 0), (1, 1), (2, 0)] {
+		let (reply, answer) = oneshot::channel();
+		events
+			.send(WorkerEvent::Ask {
+				source,
+				index,
+				reply,
+			})
+			.await
+			.unwrap();
+		answer.await.unwrap().unwrap();
+		events.send(WorkerEvent::FileEnd).await.ok();
+	}
+	for chunk in damaged.chunks(CHUNK_SIZE) {
+		events
+			.send(WorkerEvent::Data(chunk.to_vec()))
+			.await
+			.unwrap();
+	}
+	drop(events);
+	result.send(Ok(damaged.len() as u64)).unwrap();
+
+	let report = job.running.await.unwrap().unwrap();
+	assert!(report.archive.is_some(), "the archive stays");
+	all_kept_for(&report, |reason| matches!(reason, KeptReason::Unconfirmed));
+	assert!(setup.backend.log().deleted_files.is_empty());
+	assert!(setup.backend.log().trashed_dirs.is_empty());
+	assert_released(&setup, &job.reporter);
+}
+
+/// Starts a permanent disposal of the setup whose archive's read back waits at its first chunk,
+/// and waits until it does; the archive's uuid.
+async fn held_at_the_read_back(setup: &mut Setup, control: JobControl) -> (Job, Uuid) {
+	setup.hold_archive = true;
+	let placed = place(setup);
+	let job = run_permanent_disposal(setup, targets(setup, &placed), control);
+	wait_until("the archive's first chunk is asked for", || {
+		!setup.backend.log().held.is_empty()
+	})
+	.await;
+	let archive = setup.backend.log().held[0];
+	assert_eq!(job.recorder.last().phase, CompressPhase::Verifying);
+	(job, archive)
+}
+
+fn archive_fetches(setup: &Setup, archive: Uuid) -> usize {
+	setup
+		.backend
+		.log()
+		.fetched
+		.iter()
+		.filter(|(file, _)| *file == archive)
+		.count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_while_reading_the_archive_back_keeps_the_sources() {
+	let mut setup = setup(|_, _| {});
+	let (_pause, cancel, control) = controls();
+	let (job, archive) = held_at_the_read_back(&mut setup, control).await;
+	cancel.send_replace(true);
+	// the fetch never answers: only dropping it ends the job
+	let report = tokio::time::timeout(Duration::from_secs(30), job.running)
+		.await
+		.expect("the cancel ends the read back")
+		.unwrap()
+		.unwrap();
+	all_kept_for(&report, |reason| matches!(reason, KeptReason::Interrupted));
+	assert_eq!(told(&job.recorder).len(), 2);
+	setup.backend.held.send_modify(|held| held.clear());
+	assert_eq!(
+		archive_fetches(&setup, archive),
+		0,
+		"nothing reads the archive once the job ended"
+	);
+	assert!(setup.backend.log().deleted_files.is_empty());
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::Done, RunState::Cancelling)
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
+	let mut setup = setup(|_, _| {});
+	let (pause, _cancel, control) = controls();
+	let (job, archive) = held_at_the_read_back(&mut setup, control).await;
+	pause.send_replace(true);
+	// the fetch in flight finishes; the pause is seen when the reader asks again
+	setup.backend.held.send_modify(|held| held.clear());
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	let last = job.recorder.last();
+	assert_eq!(
+		(last.phase, last.run_state),
+		(CompressPhase::Verifying, RunState::Paused)
+	);
+	assert_released(&setup, &job.reporter);
+	let fetched = archive_fetches(&setup, archive);
+	assert_eq!(fetched, 1, "the first chunk is read, the second waits");
+	assert_eq!(
+		last.counts.bytes_verified, CHUNK_SIZE as u64,
+		"the read back reports its progress"
+	);
+	// the plan's totals, which the engine is handed with its report
+	let sources: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
+	let totals = crate::fs::drive_job::plan::PlanTotals {
+		dirs: 1,
+		files: 3,
+		bytes: sources,
+	};
+	job.reporter.set_plan(totals, &[], &[]);
+	let units = job.reporter.read(|state| state.progress().units);
+	assert_eq!(
+		units.total - units.settled,
+		setup.backend.log().finished[&archive].1.written - CHUNK_SIZE as u64,
+		"what is left of the archive to read is the work left"
+	);
+
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(
+		outcomes(&report)
+			.iter()
+			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+		"{:?}",
+		report.dispositions
+	);
+	assert_eq!(report.counts.bytes_verified, report.counts.bytes_done);
+	assert_released(&setup, &job.reporter);
 }

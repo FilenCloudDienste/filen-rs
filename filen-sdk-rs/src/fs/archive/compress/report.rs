@@ -37,6 +37,9 @@ pub enum CompressPhase {
 	Compressing,
 	/// Registering the archive in the destination.
 	Finishing,
+	/// Reading the archive back, to check it holds the sources before they are deleted for
+	/// good.
+	Verifying,
 	/// Removing the sources, once the archive is verified.
 	DisposingSources,
 	/// Ran to its end.
@@ -66,6 +69,26 @@ pub struct CompressCounts {
 	/// Bytes of the archive uploaded so far.
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
+	pub bytes_done: u64,
+	/// Bytes of the archive read back to check it before the sources are deleted for good (see
+	/// [`CompressPhase::Verifying`]); up to `bytes_done`, and 0 when nothing is read back.
+	pub bytes_verified: u64,
+}
+
+/// The source file being read into the archive right now, shaped like the copy and extract
+/// jobs' active files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct CompressActiveFile {
+	/// The source file's uuid.
+	pub source_uuid: Uuid,
+	/// Its name in the archive.
+	pub name: String,
+	/// Its whole path in the archive.
+	pub path: String,
+	/// Its size in bytes.
+	pub size: u64,
+	/// Bytes of it read so far.
 	pub bytes_done: u64,
 }
 
@@ -104,6 +127,11 @@ pub struct CompressUpdate {
 	pub totals: PlanTotals,
 	/// What was done so far.
 	pub counts: CompressCounts,
+	/// The source being read, as the copy and extract updates list theirs. An archive is
+	/// written one file at a time, in its order, so this holds at most one: none between files,
+	/// or for an empty one.
+	pub active: Vec<CompressActiveFile>,
+	/// What happened since the last update, in order.
 	pub events: Vec<CompressEvent>,
 	/// Bytes of the sources read (and, in `Verifying`, of the archive read back) per second,
 	/// over the last 10 seconds of running time; `None` until there is a rate.
@@ -175,6 +203,9 @@ pub(crate) struct CompressState {
 	scan: ScanProgress,
 	totals: PlanTotals,
 	counts: CompressCounts,
+	active: Option<CompressActiveFile>,
+	/// Bytes of the archive to read back, once reading it back started.
+	verify_total: u64,
 	/// The job ended: whatever it did not read, it never will.
 	ended: bool,
 }
@@ -189,16 +220,15 @@ impl JobState for CompressState {
 	}
 
 	fn progress(&self) -> Progress {
+		// the sources read, then the archive read back if it is
+		let done = self.counts.bytes_read + self.counts.bytes_verified;
+		let total = self.totals.bytes + self.verify_total;
 		Progress {
-			bytes_done: self.counts.bytes_read,
+			bytes_done: done,
 			units: Units {
-				done: self.counts.bytes_read,
-				settled: if self.ended {
-					self.totals.bytes
-				} else {
-					self.counts.bytes_read
-				},
-				total: self.totals.bytes,
+				done,
+				settled: if self.ended { total } else { done },
+				total,
 			},
 		}
 	}
@@ -214,6 +244,7 @@ impl JobState for CompressState {
 			scan: self.scan,
 			totals: self.totals,
 			counts: self.counts,
+			active: self.active.iter().cloned().collect(),
 			events: snapshot.events,
 			bytes_per_second: snapshot.bytes_per_second,
 			eta: snapshot.eta,
@@ -223,6 +254,7 @@ impl JobState for CompressState {
 
 	fn settle(&mut self) {
 		self.ended = true;
+		self.active = None;
 	}
 }
 
@@ -236,6 +268,8 @@ impl Reporter {
 				scan: ScanProgress::default(),
 				totals: PlanTotals::default(),
 				counts: CompressCounts::default(),
+				active: None,
+				verify_total: 0,
 				ended: false,
 			},
 			Box::new(callback),
@@ -273,9 +307,24 @@ impl Reporter {
 		});
 	}
 
-	pub(crate) fn source_read(&self, bytes: u64) {
+	/// `bytes` more of the source `file` were read; `file` builds it when it starts.
+	pub(crate) fn source_read(
+		&self,
+		source_uuid: Uuid,
+		bytes: u64,
+		file: impl FnOnce() -> CompressActiveFile,
+	) {
 		self.with_state(|state| {
 			state.counts.bytes_read += bytes;
+			match &mut state.active {
+				Some(active) if active.source_uuid == source_uuid => active.bytes_done += bytes,
+				active => {
+					*active = Some(CompressActiveFile {
+						bytes_done: bytes,
+						..file()
+					});
+				}
+			}
 			state.core.mark_changed();
 		});
 	}
@@ -283,6 +332,22 @@ impl Reporter {
 	pub(crate) fn file_done(&self) {
 		self.with_state(|state| {
 			state.counts.files_done += 1;
+			state.active = None;
+			state.core.mark_changed();
+		});
+	}
+
+	/// Reading the `len` bytes of the archive back started.
+	pub(crate) fn verifying(&self, len: u64) {
+		self.with_state(|state| {
+			state.verify_total = len;
+			state.core.mark_changed();
+		});
+	}
+
+	pub(crate) fn archive_verified(&self, bytes: u64) {
+		self.with_state(|state| {
+			state.counts.bytes_verified += bytes;
 			state.core.mark_changed();
 		});
 	}
@@ -346,6 +411,45 @@ mod tests {
 		}
 	}
 
+	fn starting(source_uuid: Uuid, path: &str) -> CompressActiveFile {
+		CompressActiveFile {
+			source_uuid,
+			name: path.to_owned(),
+			path: path.to_owned(),
+			size: 5,
+			bytes_done: 0,
+		}
+	}
+
+	#[test]
+	fn the_source_being_read_is_active_until_it_is_in() {
+		let reporter = Reporter::new(Updates::default());
+		let [a, b] = [Uuid::from_u128(1), Uuid::from_u128(2)];
+		let active = || reporter.read(|state| state.active.clone());
+		reporter.source_read(a, 2, || starting(a, "a"));
+		reporter.source_read(a, 3, || starting(a, "a"));
+		assert_eq!(
+			active(),
+			Some(CompressActiveFile {
+				bytes_done: 5,
+				..starting(a, "a")
+			})
+		);
+		reporter.file_done();
+		assert_eq!(active(), None);
+		reporter.source_read(b, 1, || starting(b, "b"));
+		assert_eq!(
+			active(),
+			Some(CompressActiveFile {
+				bytes_done: 1,
+				..starting(b, "b")
+			})
+		);
+		reporter.finish(CompressPhase::Cancelled);
+		assert_eq!(active(), None, "an ended job reads nothing");
+		assert_eq!(reporter.counts().bytes_read, 6);
+	}
+
 	#[test]
 	fn a_job_that_ended_has_no_time_left() {
 		for phase in [
@@ -361,7 +465,8 @@ mod tests {
 				bytes: 100,
 			};
 			reporter.set_plan(totals, &[], &[]);
-			reporter.source_read(30);
+			let source = Uuid::from_u128(1);
+			reporter.source_read(source, 30, || starting(source, "a"));
 			reporter.finish(phase);
 			let last = updates.0.lock().unwrap().last().cloned().unwrap();
 			assert_eq!(last.phase, phase);

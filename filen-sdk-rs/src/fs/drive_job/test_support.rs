@@ -173,8 +173,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
-	/// Directories whose listing and files whose permanent deletion wait while they are in the
-	/// set, each wait logged in [`FakeLog::held`].
+	/// Directories whose listing and files whose fetches or permanent deletion wait while they
+	/// are in the set, each wait logged in [`FakeLog::held`].
 	pub(crate) held: watch::Sender<HashSet<Uuid>>,
 	/// Lowercased names the destination holds without the listing having shown them.
 	pub(crate) existing: Mutex<HashSet<String>>,
@@ -403,6 +403,7 @@ impl DriveBackend for FakeBackend {
 		file: &RemoteFileType<'static>,
 		index: u64,
 	) -> Result<Vec<u8>, Error> {
+		self.hold(file.uuid()).await;
 		let name = file.name().unwrap_or_default().to_owned();
 		if self.quirks.contains(&Quirk::ReverseChunks) {
 			tokio::time::sleep(Duration::from_millis(10 * (file.chunks() - index))).await;
@@ -412,7 +413,13 @@ impl DriveBackend for FakeBackend {
 		if let Some(kind) = self.fail_fetch.get(&name) {
 			return Err(Error::custom(*kind, "fetch failed"));
 		}
-		self.log().fetched.push((file.uuid(), index));
+		let mut log = self.log();
+		log.fetched.push((file.uuid(), index));
+		// a file the job uploaded reads back as it was uploaded
+		if let Some(data) = log.uploaded_data.get(&(file.uuid(), index)) {
+			return Ok(data.clone());
+		}
+		drop(log);
 		if let Some(contents) = self.contents.get(&file.uuid()) {
 			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
 			return Ok(contents[start..(start + CHUNK_SIZE).min(contents.len())].to_vec());

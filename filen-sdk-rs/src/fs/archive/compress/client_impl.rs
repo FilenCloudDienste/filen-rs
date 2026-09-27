@@ -40,6 +40,7 @@ use super::{
 	engine::{
 		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
 	},
+	read_back::ReadBack,
 	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
 };
 
@@ -117,17 +118,9 @@ impl Client {
 			.format
 			.check_name(name.as_ref())
 			.and_then(|extension_len| {
-				config.format.check(config.password.is_some())?;
-				let memory = config.format.encoder_memory()?;
-				if memory > archives.codec_mem_budget {
-					return Err(Error::custom(
-						ErrorKind::InsufficientMemory,
-						format!(
-							"this format needs {memory} bytes of codec memory, over the {} allowed",
-							archives.codec_mem_budget
-						),
-					));
-				}
+				config
+					.format
+					.check_within(config.password.is_some(), archives.codec_mem_budget)?;
 				Ok(extension_len)
 			});
 		let extension_len = match checked {
@@ -186,6 +179,7 @@ impl Client {
 			..CompressReport::default()
 		};
 		report.renamed.extend(top_level_renamed);
+		let how = dispose.as_ref().map(|(how, _)| *how);
 		let disposal =
 			match dispose.map(|(how, items)| disposal(&plan, how, items, destination.uuid())) {
 				None => None,
@@ -211,6 +205,9 @@ impl Client {
 		}
 		reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
+		// a permanent disposal reads the archive back as extracting would
+		let read_back = (how == Some(SourceDisposal::DeletePermanently))
+			.then(|| ReadBack::as_extracting(&entries, &archives, config.password.clone()));
 		let job = CompressJob {
 			format: config.format,
 			entries,
@@ -230,6 +227,7 @@ impl Client {
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
 			disposal,
+			read_back,
 		})
 		.await
 	}
