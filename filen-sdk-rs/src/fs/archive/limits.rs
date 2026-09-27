@@ -25,6 +25,11 @@ pub(crate) fn display_path(path: &str) -> (&str, bool) {
 	(shown, true)
 }
 
+/// Whether `needed` is past `limit`: exactly `limit` fits.
+pub(crate) fn exceeds_limit(needed: u64, limit: u64) -> bool {
+	needed > limit
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
