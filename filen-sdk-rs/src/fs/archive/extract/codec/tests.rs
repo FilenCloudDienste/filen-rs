@@ -652,6 +652,37 @@ fn zip_duplicates_symlinks_and_bombs() {
 	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
 }
 
+#[test]
+fn a_zip_bomb_that_understates_its_size_is_stopped_at_it() {
+	const STATED: u32 = 1024;
+	let mut zip = zip_of(&[("zeros", Some(&vec![0u8; 4 << 20]))], None);
+	// the central record's uncompressed size, which is all the up-front check sees
+	let record = zip
+		.windows(4)
+		.rposition(|w| w == 0x0201_4b50u32.to_le_bytes())
+		.unwrap();
+	zip[record + 24..record + 28].copy_from_slice(&STATED.to_le_bytes());
+	let (seen, end) = run(&zip, "z.zip");
+	assert_eq!(kind(end), ErrorKind::ArchiveCorrupt);
+	let [
+		Seen::Opened(StreamLayout::Zip),
+		Seen::File { data, ended, .. },
+	] = &seen[..]
+	else {
+		panic!("{seen:?}");
+	};
+	assert!(data.len() <= STATED as usize && !ended, "{}", data.len());
+}
+
+#[test]
+fn bytes_after_a_zips_end_record_are_unaccounted() {
+	let (mut zip, expected) = zip_sample();
+	zip.extend_from_slice(&[0; 100]);
+	let (seen, end) = run(&zip, "padded.zip");
+	assert_eq!(seen, expected);
+	assert_eq!(end.unwrap().unaccounted_bytes, 100);
+}
+
 /// A 7z of `entries` (a `None` is a directory), with keys cheap to derive.
 fn sevenz_of(
 	entries: &[(&str, Option<&[u8]>)],
