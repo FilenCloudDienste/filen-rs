@@ -4,6 +4,7 @@
 //! hold instead of running out of memory.
 
 use std::{
+	fmt,
 	io::{self, Write},
 	ops::RangeInclusive,
 };
@@ -41,6 +42,26 @@ impl StreamCodec {
 	}
 }
 
+/// `level`, refused with [`ErrorKind::InvalidState`] when outside `levels`, the levels `what`
+/// takes.
+pub(super) fn check_level(
+	what: impl fmt::Display,
+	levels: RangeInclusive<u32>,
+	level: u32,
+) -> Result<u32, Error> {
+	if levels.contains(&level) {
+		return Ok(level);
+	}
+	Err(Error::custom(
+		ErrorKind::InvalidState,
+		format!(
+			"{what} takes levels {} to {}, not {level}",
+			levels.start(),
+			levels.end()
+		),
+	))
+}
+
 /// The brotli window: 4 MiB, a common default that keeps the encoder's memory modest.
 const BROTLI_LGWIN: u32 = 22;
 
@@ -59,16 +80,7 @@ impl Compression {
 		let (levels, default) = self.codec.levels();
 		match self.level {
 			None => Ok(default),
-			Some(level) if levels.contains(&level) => Ok(level),
-			Some(level) => Err(Error::custom(
-				ErrorKind::InvalidState,
-				format!(
-					"{:?} takes levels {} to {}, not {level}",
-					self.codec,
-					levels.start(),
-					levels.end()
-				),
-			)),
+			Some(level) => check_level(format_args!("{:?}", self.codec), levels, level),
 		}
 	}
 

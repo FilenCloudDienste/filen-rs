@@ -5,9 +5,14 @@
 //! salt per entry; zip64 records are written wherever sizes, offsets or the entry count need
 //! them.
 
-use std::io::{self, Read, Write};
+use std::{
+	io::{self, Read, Write},
+	ops::RangeInclusive,
+};
 
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+
+use crate::{Error, fs::archive::encode::check_level};
 
 use super::{
 	crypto::{AesStrength, AesWriter},
@@ -54,13 +59,23 @@ pub enum ZipMethod {
 }
 
 impl ZipMethod {
-	/// The method's level, checked against its range.
-	pub(crate) fn check(self) -> Result<(), &'static str> {
+	/// The levels the method takes; `None` for [`ZipMethod::Stored`], which has none.
+	pub fn levels(self) -> Option<RangeInclusive<u32>> {
 		match self {
-			Self::Stored => Ok(()),
-			Self::Deflate { level } | Self::Bzip2 { level } if (1..=9).contains(&level) => Ok(()),
-			Self::Deflate { .. } | Self::Bzip2 { .. } => Err("zip compression takes levels 1 to 9"),
+			Self::Stored => None,
+			Self::Deflate { .. } | Self::Bzip2 { .. } => Some(1..=9),
 		}
+	}
+
+	/// The method's level, checked against its [levels](ZipMethod::levels).
+	pub(crate) fn check(self) -> Result<(), Error> {
+		let (level, name) = match self {
+			Self::Stored => return Ok(()),
+			Self::Deflate { level } => (level, "zip Deflate"),
+			Self::Bzip2 { level } => (level, "zip BZip2"),
+		};
+		let levels = self.levels().expect("a method with a level has levels");
+		check_level(name, levels, level).map(drop)
 	}
 
 	fn code(self) -> u16 {
@@ -549,7 +564,32 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 
 #[cfg(test)]
 mod tests {
+	use crate::ErrorKind;
+
 	use super::*;
+
+	#[test]
+	fn a_methods_levels_are_stated_and_checked() {
+		assert_eq!(ZipMethod::Stored.levels(), None);
+		ZipMethod::Stored.check().unwrap();
+		for method in [
+			ZipMethod::Deflate { level: 9 },
+			ZipMethod::Bzip2 { level: 1 },
+		] {
+			assert_eq!(method.levels(), Some(1..=9), "{method:?}");
+			method.check().unwrap();
+		}
+		for method in [
+			ZipMethod::Deflate { level: 0 },
+			ZipMethod::Bzip2 { level: 10 },
+		] {
+			assert_eq!(
+				method.check().unwrap_err().kind(),
+				ErrorKind::InvalidState,
+				"{method:?}"
+			);
+		}
+	}
 
 	#[test]
 	fn the_central_zip64_field_holds_what_the_fixed_fields_leave_out_in_order() {

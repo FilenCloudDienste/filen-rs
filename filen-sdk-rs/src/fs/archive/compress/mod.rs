@@ -32,10 +32,6 @@ pub use crate::fs::drive_job::listing::{ItemSource, ItemSourceDir};
 
 use super::format::{ExtensionFormat, match_extension};
 
-/// The highest level a codec or method takes (brotli's), so a method's own levels
-/// can be found by its check.
-const HIGHEST_LEVEL: u32 = 11;
-
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]
 pub enum CompressSources {
@@ -162,12 +158,11 @@ impl CompressFormat {
 
 	/// Memory the format's encoder needs, in bytes (0 for a bare tar).
 	pub fn encoder_memory(self) -> Result<u64, Error> {
-		let method_levels = match self {
-			Self::Zip { method, .. } => method.check(),
-			Self::SevenZ { method, .. } => method.check(),
-			Self::Tar { .. } | Self::Single { .. } => Ok(()),
-		};
-		method_levels.map_err(|message| Error::custom(ErrorKind::InvalidState, message))?;
+		match self {
+			Self::Zip { method, .. } => method.check()?,
+			Self::SevenZ { method, .. } => method.check()?,
+			Self::Tar { .. } | Self::Single { .. } => {}
+		}
 		match self {
 			Self::Tar { compression: None } => Ok(0),
 			Self::Tar {
@@ -217,23 +212,8 @@ impl CompressFormat {
 				compression: Some(compression),
 			}
 			| Self::Single { compression } => Some(compression.codec.levels().0),
-			Self::Zip {
-				method: ZipMethod::Stored,
-				..
-			}
-			| Self::SevenZ {
-				method: SevenZMethod::Copy,
-				..
-			} => None,
-			// the methods state their levels only through their checks
-			Self::Zip { .. } | Self::SevenZ { .. } => {
-				let takes = |level| self.with_level(level).encoder_memory().is_ok();
-				let low = (0..=HIGHEST_LEVEL).find(|&level| takes(level))?;
-				let high = (0..=HIGHEST_LEVEL).rev().find(|&level| takes(level))?;
-				// a method's levels have no gaps (the tests check every method)
-				debug_assert!((low..=high).all(takes), "{self:?} skips a level");
-				Some(low..=high)
-			}
+			Self::Zip { method, .. } => method.levels(),
+			Self::SevenZ { method, .. } => method.levels(),
 		}
 	}
 
@@ -493,20 +473,12 @@ mod tests {
 	}
 
 	#[test]
-	fn the_level_probe_covers_every_codecs_levels() {
-		for codec in [
-			StreamCodec::Gzip,
-			StreamCodec::Bzip2,
-			StreamCodec::Xz,
-			StreamCodec::Lzma,
-			StreamCodec::Lzip,
-			StreamCodec::Lz4,
-			StreamCodec::Brotli,
-		] {
-			assert!(*codec.levels().0.end() <= HIGHEST_LEVEL, "{codec:?}");
-		}
-		// every zip and 7z method's levels are found by the probe: all of them below its top,
-		// with no gap, and none above
+	fn a_formats_stated_levels_are_the_ones_its_check_takes() {
+		// past every level any codec or method takes
+		const LEVELS_TRIED: u32 = 32;
+		let tar = |codec| CompressFormat::Tar {
+			compression: Some(compression(codec)),
+		};
 		let zip = |method| CompressFormat::Zip {
 			method,
 			encryption: None,
@@ -517,6 +489,14 @@ mod tests {
 			encryption: None,
 		};
 		let formats = [
+			tar(StreamCodec::Gzip),
+			tar(StreamCodec::Bzip2),
+			tar(StreamCodec::Xz),
+			tar(StreamCodec::Lzma),
+			tar(StreamCodec::Lzip),
+			tar(StreamCodec::Lz4),
+			tar(StreamCodec::Brotli),
+			tar(StreamCodec::Zstd),
 			zip(ZipMethod::Deflate { level: 1 }),
 			zip(ZipMethod::Bzip2 { level: 1 }),
 			sevenz(SevenZMethod::Lzma2 { level: 1 }),
@@ -527,8 +507,7 @@ mod tests {
 		];
 		for format in formats {
 			let levels = format.levels().unwrap();
-			assert!(*levels.end() < HIGHEST_LEVEL, "{format:?}");
-			for level in 0..=4 * HIGHEST_LEVEL {
+			for level in 0..=LEVELS_TRIED {
 				assert_eq!(
 					format.with_level(level).check(false).is_ok(),
 					levels.contains(&level),
