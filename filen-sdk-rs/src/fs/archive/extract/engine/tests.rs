@@ -606,6 +606,71 @@ async fn directories_are_planned_only_as_fast_as_they_are_created() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registrations_run_bounded() {
+	let names: Vec<String> = (0..3 * MAX_SMALL_PARALLEL_REQUESTS)
+		.map(|i| format!("e{i:03}"))
+		.collect();
+	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+	let setup = setup("empty.tar", tar_of(&members), |backend| {
+		for name in &names {
+			backend
+				.slow_finish
+				.insert(name.clone(), Duration::from_millis(20));
+		}
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, names.len() as u64);
+	assert_eq!(
+		setup.backend.log().peak_finishes,
+		MAX_SMALL_PARALLEL_REQUESTS,
+		"as many at once as other small requests, and no more"
+	);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn files_are_read_only_as_fast_as_they_are_registered() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
+		// another client holds the drive lock from the first registration on (the folder's
+		// create is the first acquisition)
+		backend.block_locks_from.send_replace(Some(1));
+	});
+	let (events, result, link) = worker::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	events
+		.send(WorkerEvent::Opened(StreamLayout::Tar { codec: None }))
+		.await
+		.unwrap();
+	let count = MAX_OPEN_FILES + 10;
+	let mut taken = None;
+	for ordinal in 0..count {
+		let entry = || file_entry(ordinal as u64, &format!("e{ordinal:03}"), 0);
+		// longer than a silent codec is given, which a waiting one must not be taken for
+		if tokio::time::timeout(2 * ARCHIVE_STALL_TIMEOUT, events.send(entry()))
+			.await
+			.is_err()
+		{
+			taken.get_or_insert(ordinal);
+			setup.backend.block_locks_from.send_replace(None);
+			events.send(entry()).await.unwrap();
+		}
+		events.send(WorkerEvent::FileEnd).await.unwrap();
+	}
+	// the last file taken ended in the channel, not yet taken either
+	assert_eq!(
+		taken,
+		Some(MAX_OPEN_FILES),
+		"the codec waits for the files to be registered"
+	);
+	drop(events);
+	let _ = result.send(read_in_full());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, count as u64);
+	assert_released(&setup, &job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 	let tar = tar_of(&[
 		("done.txt", b"done"),

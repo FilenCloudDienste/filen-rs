@@ -104,6 +104,10 @@ const PREFETCH_CHUNKS: usize = 4;
 /// only as fast as they are created.
 const MAX_UNCREATED_DIRS: usize = 16 * MAX_SMALL_PARALLEL_REQUESTS;
 
+/// File entries open (reading, uploading or waiting to be registered) past which the codec is
+/// kept waiting: an archive of empty or tiny files is read only as fast as they are registered.
+const MAX_OPEN_FILES: usize = 4 * MAX_SMALL_PARALLEL_REQUESTS;
+
 /// What the codec returns.
 pub(crate) type CodecResult = Result<ArchiveEnd, Error>;
 
@@ -651,7 +655,7 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Whether the codec waits for what it sent so far to be worked off first.
 	fn backlogged(&self) -> bool {
-		self.uncreated_dirs >= MAX_UNCREATED_DIRS
+		self.uncreated_dirs >= MAX_UNCREATED_DIRS || self.files.len() >= MAX_OPEN_FILES
 	}
 
 	fn idle(&self) -> bool {
@@ -1519,8 +1523,8 @@ impl<B: DisposalBackend> Driver<B> {
 			.file_failed(Some(dest_uuid), bytes, kept.then_some(failure));
 	}
 
-	/// Registers every file whose data is all up and whose directory exists; forgets failed
-	/// files with nothing left in flight.
+	/// Registers the files whose data is all up and whose directory exists, as many at once as
+	/// other small requests; forgets failed files with nothing left in flight.
 	fn finalize_ready(&mut self) {
 		// a finalize started now would park on the pause holding the job busy, so the job
 		// could never go idle and give back its memory: it starts on resume instead
@@ -1541,9 +1545,9 @@ impl<B: DisposalBackend> Driver<B> {
 		for ordinal in ready {
 			if self.files[&ordinal].failed {
 				self.files.remove(&ordinal);
-				continue;
+			} else if self.finalizes.len() < MAX_SMALL_PARALLEL_REQUESTS {
+				self.start_finalize(ordinal);
 			}
-			self.start_finalize(ordinal);
 		}
 	}
 
