@@ -100,14 +100,24 @@ fn run_counting(
 /// `archive` through the codec running `job`: what it sent, how it ended, and the bytes of the
 /// archive it counted as read.
 fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
+	run_job_answering(job, |index| {
+		let start = (index * CHUNK_SIZE_U64) as usize;
+		let end = (start + CHUNK_SIZE).min(archive.len());
+		Ok(archive[start..end].to_vec())
+	})
+}
+
+/// As [`run_job`], each chunk the codec asks for answered by `answer`.
+fn run_job_answering(
+	job: StreamJob,
+	mut answer: impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
 			WorkerEvent::Ask { index, reply, .. } => {
-				let start = (index * CHUNK_SIZE_U64) as usize;
-				let end = (start + CHUNK_SIZE).min(archive.len());
-				let _ = reply.send(Ok(archive[start..end].to_vec()));
+				let _ = reply.send(answer(index));
 			}
 			WorkerEvent::Opened(layout) => seen.push(Seen::Opened(layout)),
 			WorkerEvent::Entry(head) => seen.push(match head.kind {
@@ -1538,10 +1548,9 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 	);
 }
 
-#[test]
-fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
-	// a link in every chunk: reading all their targets would fetch the whole archive
-	let links = LIST_READ_BYTES as usize / CHUNK_SIZE + 4;
+/// A zip of `links` symlinks to `target`, each followed by a chunk of data: a link in every
+/// chunk.
+fn zip_of_spread_links(links: usize) -> Vec<u8> {
 	let stored = zip8::write::SimpleFileOptions::default()
 		.compression_method(zip8::CompressionMethod::Stored);
 	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -1554,7 +1563,36 @@ fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
 			.write_all(&incompressible(CHUNK_SIZE, link as u64))
 			.unwrap();
 	}
-	let zip = writer.finish().unwrap().into_inner();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_zip_listing_stops_reading_symlink_targets_at_a_failed_fetch() {
+	let zip = zip_of_spread_links(8);
+	// the index, at the end, is read; every link's chunk before it fails to fetch
+	let index_from = (zip.len() as u64 - 4096) / CHUNK_SIZE_U64;
+	let mut failed = 0;
+	let (_, end, _) = run_job_answering(
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+		|index| {
+			if index < index_from {
+				failed += 1;
+				return Err(std::io::Error::other("offline"));
+			}
+			let start = (index * CHUNK_SIZE_U64) as usize;
+			Ok(zip[start..(start + CHUNK_SIZE).min(zip.len())].to_vec())
+		},
+	);
+	// the listing ends with the source's error, asking no more of it
+	assert_eq!(kind(end), ErrorKind::IO);
+	assert_eq!(failed, 1);
+}
+
+#[test]
+fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
+	// a link in every chunk: reading all their targets would fetch the whole archive
+	let links = LIST_READ_BYTES as usize / CHUNK_SIZE + 4;
+	let zip = zip_of_spread_links(links);
 	let (entries, end) = listed(
 		&zip,
 		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),

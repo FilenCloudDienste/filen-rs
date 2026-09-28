@@ -10,14 +10,14 @@ use crate::{
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		password::ArchivePassword,
 		sevenz::{
-			SevenZError, from_source,
+			SevenZError,
 			read::{
 				FOLDER_ENDS_EARLY, FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind,
 				SevenZLimits, read_error, read_index as read_sevenz_index, windows_link_target,
 				wrong_key,
 			},
 		},
-		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent},
+		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent, from_source},
 	},
 };
 

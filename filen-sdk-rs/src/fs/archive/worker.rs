@@ -234,6 +234,14 @@ fn ended() -> io::Error {
 #[error("{0}")]
 pub(crate) struct SourceFailed(io::Error);
 
+/// Whether a read ended with the source's own error (a failed fetch, or the job ending) rather
+/// than a decoder's.
+pub(crate) fn from_source(error: &io::Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<SourceFailed>() || inner.is::<JobEnded>())
+}
+
 /// The codec's end of the exchange.
 pub(crate) struct WorkerPort {
 	events: mpsc::Sender<WorkerEvent>,

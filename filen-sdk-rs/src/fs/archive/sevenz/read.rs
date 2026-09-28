@@ -17,12 +17,12 @@ use chrono::{DateTime, Utc};
 use super::{
 	SevenZError,
 	crypto::{AES_ID, AES_PARTIAL_BLOCK, AesCbcReader, AesProps, BLOCK, Key, derive_key},
-	from_source,
 	header::*,
 };
 use crate::fs::archive::{
 	decode::{clamp_lzma_dict, open_stream},
 	format::StreamCodec,
+	worker::from_source,
 };
 
 /// Most coders in one folder; 7-Zip writes at most four (BCJ2 with its three LZMA coders).
