@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-	Error, ErrorKind,
+	Error,
 	auth::{Client, JsClient},
 	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture},
 };
@@ -66,11 +66,26 @@ pub struct ExtractArchiveConfig {
 	/// extracts them as ordinary files.
 	#[uniffi(default = None)]
 	pub skip_mac_metadata: Option<bool>,
-	/// Removes the archive once everything in it was extracted and verified. Only for
-	/// `extract_archive`: `extract_archive_entries` extracts part of the archive, which is never
-	/// removed.
+	/// Removes the archive once everything in it was extracted and verified.
 	#[uniffi(default = None)]
 	pub dispose: Option<SourceDisposal>,
+}
+
+/// `ExtractArchiveConfig` for part of an archive, which is never removed afterwards.
+#[derive(uniffi::Record, Default)]
+pub struct ExtractArchiveEntriesConfig {
+	/// See `ExtractArchiveConfig.max_bytes`.
+	#[uniffi(default = None)]
+	pub max_bytes: Option<u64>,
+	/// See `ExtractArchiveConfig.max_items`.
+	#[uniffi(default = None)]
+	pub max_items: Option<u64>,
+	/// See `ExtractArchiveConfig.expansion_limit`.
+	#[uniffi(default = None)]
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// See `ExtractArchiveConfig.skip_mac_metadata`.
+	#[uniffi(default = None)]
+	pub skip_mac_metadata: Option<bool>,
 }
 
 /// What a listing reports an extraction would do: the settings of `ExtractArchiveConfig` that
@@ -194,7 +209,7 @@ impl JsClient {
 	/// what was extracted until then staying. A chosen directory of a tar brings what the tar
 	/// stores after it below it (every tool stores a directory before its contents); a zip's or
 	/// 7z's everything below it. The archive is
-	/// never removed afterwards, so a `config.dispose` is refused.
+	/// never removed afterwards.
 	#[allow(clippy::too_many_arguments)]
 	pub async fn extract_archive_entries(
 		&self,
@@ -203,18 +218,12 @@ impl JsClient {
 		base: String,
 		destination: AnyNormalDir,
 		root: ExtractRoot,
-		config: ExtractArchiveConfig,
+		config: ExtractArchiveEntriesConfig,
 		password: Option<String>,
 		callback: Arc<dyn ExtractArchiveCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<ExtractReport, Error> {
 		let password = self::password(password)?;
-		if config.dispose.is_some() {
-			return Err(Error::custom(
-				ErrorKind::InvalidState,
-				"an archive extracted in part is never removed",
-			));
-		}
 		let request = entries_request(archive, entries, &base, destination, root)?;
 		let config = ExtractSettings {
 			max_bytes: config.max_bytes,
