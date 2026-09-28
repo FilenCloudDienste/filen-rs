@@ -12,15 +12,18 @@
 //! tree answers against the tree AS EDITED:
 //!
 //! - [`Edits::written`](Edits) holds every row this pass wrote, keyed by the path it now sits at —
-//!   the rows a move landed and the rows a confirmation advanced. A path it holds a row for
-//!   REPLACES the shared tree's row there.
+//!   the rows a move landed, and a confirmed row the pass had itself written. A path it holds a
+//!   row for REPLACES the shared tree's row there.
 //! - [`Edits::vacated`](Edits) holds the shared tree's nodes this pass moved AWAY, each standing for
 //!   itself and its whole subtree: every row of the shared tree at or under one is gone from this
 //!   view, for the rest of the pass. That is exact, not an approximation — a move takes every row at
 //!   or under its source, and a later move can only bring rows back as written ones.
+//! - [`Edits::agreed`](Edits) holds the marker a confirmation advanced on a shared row the pass
+//!   left in place — the one field a confirmation changes, so a pass after an upload records one
+//!   entry per confirmed push instead of re-writing each row under its path.
 //!
 //! So a row of the edited view is a written row, or else a shared one that no vacated node sits at
-//! or above. Every read walks the two trees side by side — each directory's children merged in the
+//! or above, carrying its advanced marker where it has one. Every read walks the two trees side by side — each directory's children merged in the
 //! tree's own sibling order, a vacated shared node skipped with its whole subtree — so the edited
 //! view enumerates in EXACTLY the order a copy of the tree with the same edits applied would, and
 //! the folded questions fold exactly as the tree folds (they are the tree's own sibling searches,
@@ -34,7 +37,7 @@
 //! window. They must see the source vacated and the destination occupied, exactly as the copied tree
 //! did; the tests in `rows.rs` hold every question to what a copy with the same edits answers.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use filen_types::crypto::Blake3Hash;
 
@@ -51,6 +54,11 @@ pub(in super::super) struct Edits {
 	written: Tree,
 	/// The shared tree's nodes this pass moved away, each with its whole subtree.
 	vacated: HashSet<NodeId>,
+	/// The agreed-content marker this pass advanced on a shared row it left where it was: the one
+	/// field a confirmation changes, so a confirmed row costs an entry here rather than a copy of
+	/// the row and its path in [`written`](Self::written). A confirmation is not a row write — the
+	/// carry rule and every count ignore the marker — so nothing else moves with it.
+	agreed: HashMap<NodeId, Option<Blake3Hash>>,
 	/// The edited view's row count, and the two other counts the tree keeps: kept here so the
 	/// whole-set questions a pass asks stay O(1) whatever it moved.
 	rows: usize,
@@ -87,6 +95,7 @@ impl Edits {
 		Self {
 			written: Tree::default(),
 			vacated: HashSet::new(),
+			agreed: HashMap::new(),
 			rows: shared.len(),
 			carryable: shared.carryable_rows(),
 			remote_rows: shared.remote_rows,
@@ -140,13 +149,14 @@ impl Edits {
 		rel_path: &str,
 		agreed_hash: Option<Blake3Hash>,
 	) -> Option<BaselineEntry> {
-		let mut row = self.view(shared).get(rel_path)?;
-		// What the tree hands back after the same write: its `agreed` map holds the marker only
-		// where it differs from the content hash, and reads the content hash back otherwise — which
-		// is then this very value.
-		row.agreed_hash = agreed_hash;
-		self.write(shared, &row);
-		Some(row)
+		let view = self.view(shared);
+		let at = view.resolve(rel_path)?;
+		if view.written_row(at).is_some() {
+			return self.written.set_agreed(rel_path, agreed_hash);
+		}
+		let id = at.shared.filter(|&id| shared.is_row(id))?;
+		self.agreed.insert(id, agreed_hash);
+		Some(self.view(shared).entry_at(at, rel_path.to_string()))
 	}
 
 	/// Put `row` in the view, replacing whatever row it shows at that path.
@@ -228,7 +238,12 @@ impl<'a> View<'a> {
 	fn fill_row(&self, at: At, row: &mut BaselineEntry) {
 		match (self.written_row(at), at.shared) {
 			(Some(id), _) => self.edits.written.fill_row(id, row),
-			(None, Some(id)) => self.shared.fill_row(id, row),
+			(None, Some(id)) => {
+				self.shared.fill_row(id, row);
+				if let Some(&agreed) = self.edits.agreed.get(&id) {
+					row.agreed_hash = agreed;
+				}
+			}
 			(None, None) => unreachable!("a node of the edited view is in one tree or the other"),
 		}
 	}
@@ -428,17 +443,43 @@ impl<'a> View<'a> {
 
 	/// The rows awaiting confirmation: the shared tree's that the view still shows, then the
 	/// written ones. In no order, like the tree's.
+	///
+	/// A shared row's candidacy is decided by its EFFECTIVE marker — the pass's advance where it
+	/// made one — before its path is built, so a pass that confirmed every push answers "none"
+	/// for the price of a lookup per push.
 	pub(in super::super) fn unconfirmed(self) -> impl Iterator<Item = BaselineEntry> + 'a {
-		self.shared
+		let (shared, edits) = (self.shared, self.edits);
+		let advanced = edits
+			.agreed
+			.iter()
+			.filter(move |&(&id, &agreed)| {
+				let node = &shared.nodes[id.index()];
+				let content = node
+					.has(super::HAS_CONTENT_HASH)
+					.then(|| Blake3Hash::from(node.content_hash));
+				agreed != content
+			})
+			.map(|(&id, _)| id);
+		shared
 			.agreed
 			.keys()
-			.filter(move |&&id| self.shared.awaits_confirmation(id))
-			.filter_map(move |&id| {
-				let path = self.shared.path_of(id);
-				self.shows_shared(id, &path)
-					.then(|| self.shared.entry_at(id, path))
+			.copied()
+			.filter(move |id| !edits.agreed.contains_key(id))
+			.chain(advanced)
+			.filter(move |&id| shared.awaits_confirmation(id))
+			.filter_map(move |id| {
+				let path = shared.path_of(id);
+				self.shows_shared(id, &path).then(|| {
+					self.entry_at(
+						At {
+							shared: Some(id),
+							written: None,
+						},
+						path,
+					)
+				})
 			})
-			.chain(self.edits.written.unconfirmed())
+			.chain(edits.written.unconfirmed())
 	}
 
 	pub(in super::super) fn any_unconfirmed(&self) -> bool {
