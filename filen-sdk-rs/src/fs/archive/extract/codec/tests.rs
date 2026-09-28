@@ -1341,12 +1341,15 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 	end.unwrap();
 	assert_eq!(seen[1..], [file(0, "._notes.txt", b"just text")]);
 
-	// the same in a zip and a 7z, whose data is read to tell
+	// the same in a zip and a 7z, whose data is read to tell: its magic and version, not the
+	// magic alone
 	let data = apple_double_data();
+	let other_version = [&data[..4], b"\x00\x01\x00\x00"].concat();
 	let entries = [
 		("a.txt", Some(&b"a"[..])),
 		("._a.txt", Some(&data[..])),
 		("._b.txt", Some(&b"b"[..])),
+		("._c.txt", Some(&other_version[..])),
 	];
 	for (name, archive) in [
 		("m.zip", zip_of(&entries, None)),
@@ -1359,7 +1362,12 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		end.unwrap();
 		assert_eq!(
 			outline(&seen),
-			["file a.txt 1", "skip ._a.txt MacMetadata", "file ._b.txt 1"],
+			[
+				"file a.txt 1",
+				"skip ._a.txt MacMetadata",
+				"file ._b.txt 1",
+				"file ._c.txt 8"
+			],
 			"{name}"
 		);
 	}

@@ -66,8 +66,10 @@ impl Selection {
 const MAC_METADATA_DIR: &str = "__MACOSX";
 
 /// What an AppleDouble file starts with: the resource fork and attributes macOS keeps for a
-/// file `x`, stored beside it as `._x` where the file system cannot hold them.
-const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
+/// file `x`, stored beside it as `._x` where the file system cannot hold them. Its magic, then
+/// the only version macOS writes: 8 bytes, so a file of the user's is not taken for one (and
+/// left out) by 4 bytes that happen to match.
+const APPLE_DOUBLE_HEAD: [u8; 8] = [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
 
 /// How an entry's path marks it as macOS metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,10 +355,10 @@ impl<'p> Walk<'p> {
 /// Whether an entry that may be AppleDouble (see [`Verdict::Take`]) is one, by the first bytes
 /// of its `data`; those bytes, which the data sent has to start with.
 pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
-	let mut head = vec![0u8; APPLE_DOUBLE_MAGIC.len()];
+	let mut head = vec![0u8; APPLE_DOUBLE_HEAD.len()];
 	let read = read_full(data, &mut head)?;
 	head.truncate(read);
-	Ok((head == APPLE_DOUBLE_MAGIC, head))
+	Ok((head == APPLE_DOUBLE_HEAD, head))
 }
 
 /// What a hard link's target is looked up by among the files extracted (or listed) before it:
