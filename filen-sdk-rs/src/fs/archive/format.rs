@@ -86,9 +86,9 @@ pub(crate) enum Detected {
 pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK as usize;
 
 const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
-const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
+pub(crate) const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Tells the format of a file from its first bytes (up to [`DETECT_HEAD_LEN`]) and its name.
 pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {

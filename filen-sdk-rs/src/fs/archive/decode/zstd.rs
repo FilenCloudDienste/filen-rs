@@ -19,12 +19,15 @@ use ruzstd::decoding::{
 	errors::{DecompressBlockError, FrameDecoderError},
 };
 
+use crate::fs::archive::format::ZSTD_MAGIC;
+
 use super::{
 	Budget, CodecError, Describe, Input, SKIPPABLE_FRAME_MAGIC, StreamCheck, StreamDecoder,
 	StreamEnd, TRUNCATED, skip_skippable_frame,
 };
 
-const MAGIC: u32 = 0xFD2F_B528;
+/// A frame's magic number, as the little-endian word the frame starts with.
+const MAGIC: u32 = u32::from_le_bytes(ZSTD_MAGIC);
 
 /// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4), which the vendored ruzstd
 /// enforces.
