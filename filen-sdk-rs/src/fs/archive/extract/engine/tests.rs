@@ -39,7 +39,7 @@ use crate::{
 				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
 				zip_of,
 			},
-			worker::LinkHead,
+			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
 		dir::RootDirectory,
 		drive_job::{

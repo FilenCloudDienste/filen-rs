@@ -49,10 +49,11 @@ use crate::{
 			},
 			entry_path::{ArchivePath, joined},
 			format::{ArchiveFormat, extract_folder_name},
+			input::{CodecFeed, Fed, start_reading, take_memory, whole_chunk},
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
-				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, LinkHead, SkippedMember, StallWatch,
-				WorkerEvent, WorkerLink, worker_died,
+				EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent, WorkerLink,
+				codec_failed, worker_died,
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
@@ -60,7 +61,6 @@ use crate::{
 		drive_job::{
 			Fatal,
 			backend::{DriveBackend, UploadSpec},
-			cancelled,
 			counts::ItemCounts,
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
@@ -69,7 +69,6 @@ use crate::{
 		},
 		file::{
 			enums::RemoteFileType,
-			read::check_chunks_consistent,
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
@@ -88,7 +87,6 @@ use crate::{
 use super::{
 	ExpansionLimit, ExtractRoot, ExtractSkipReason,
 	codec::{ArchiveEnd, link_key},
-	input::{ArchiveInput, Floor, take_memory, whole_chunk},
 	report::{
 		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractFailure,
 		ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
@@ -338,14 +336,12 @@ struct Driver<B: DriveBackend> {
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
 	config: ArchiveConfig,
-	link: WorkerLink<CodecResult>,
-	floor: Option<Floor>,
+	feed: CodecFeed<B, ArchiveEnd>,
 	/// The floor's output chunk; its input chunk is the input's.
 	output_slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
 	memory: Arc<Semaphore>,
 	targets: Arc<ConnectedTargets>,
-	input: ArchiveInput<B>,
 	/// What the archive turned out to hold.
 	layout: Option<ArchiveFormat>,
 	dispose: Option<(SourceDisposal, Uuid)>,
@@ -389,7 +385,6 @@ struct Driver<B: DriveBackend> {
 	/// An event the driver cannot take on yet, and so the last it took: while it waits, the
 	/// codec parks.
 	held: Option<WorkerEvent>,
-	events_closed: bool,
 	codec_result: Option<CodecResult>,
 	/// The order-free digest of the files and directories the job created, which the output
 	/// has to hold exactly before the archive is removed.
@@ -404,7 +399,6 @@ struct Driver<B: DriveBackend> {
 	/// Plaintext bytes committed to uploads, for `max_bytes`.
 	committed: u64,
 	items: u64,
-	stall: StallWatch,
 
 	report: ExtractReport,
 	fatal: Fatal,
@@ -452,29 +446,26 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		}
 	};
 
-	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
-		return Err(fail(report, ExtractPhase::Failed, Arc::new(error)));
-	}
-	// Leased and floored before the codec starts, so a waiting job holds nothing.
-	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
-		reporter.set_cancelling();
-		return Err(fail(
-			report,
-			ExtractPhase::Cancelled,
-			cancelled(ExtractReport::NAME),
-		));
-	};
-	reporter.set_phase(ExtractPhase::Scanning);
-	let link = match start() {
-		Ok(link) => link,
-		Err(error) => return Err(fail(report, ExtractPhase::Failed, Arc::new(error))),
+	let archive = Arc::new(archive);
+	let started = start_reading(
+		Arc::clone(&backend),
+		Arc::clone(&archive),
+		&config,
+		&control,
+		&reporter,
+		ExtractPhase::Scanning,
+		start,
+		ExtractReport::NAME,
+	)
+	.await;
+	let (_lease, feed) = match started {
+		Ok(started) => started,
+		Err((phase, error)) => return Err(fail(report, phase, error)),
 	};
 
-	let floor = (floor, reporter.op());
 	let memory = backend.memory();
-	let archive = Arc::new(archive);
 	let mut driver = Driver {
-		input: ArchiveInput::new(Arc::clone(&backend), Arc::clone(&archive)),
+		feed,
 		backend,
 		control,
 		reporter,
@@ -484,8 +475,6 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		max_bytes,
 		max_items,
 		config,
-		link,
-		floor: Some(floor),
 		output_slot: Arc::new(Semaphore::new(1)),
 		memory,
 		targets: Arc::default(),
@@ -513,7 +502,6 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		uploads: FuturesUnordered::new(),
 		finalizes: FuturesUnordered::new(),
 		held: None,
-		events_closed: false,
 		codec_result: None,
 		top_level_beyond: Vec::new(),
 		created_digest: 0,
@@ -521,7 +509,6 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		left_out: 0,
 		committed: 0,
 		items: 0,
-		stall: StallWatch::default(),
 		report,
 		fatal: Fatal::default(),
 	};
@@ -589,7 +576,7 @@ impl<B: DisposalBackend> Driver<B> {
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
 		let outcome = async {
 			self.extract().await?;
-			self.release_input();
+			self.feed.release();
 			if self.fatal.error().is_some() {
 				return Ok(());
 			}
@@ -746,12 +733,8 @@ impl<B: DisposalBackend> Driver<B> {
 				self.finalize_ready();
 				continue;
 			}
-			let take_events = !stopping
-				&& !pause_requested
-				&& self.held.is_none()
-				&& !self.backlogged()
-				&& !self.events_closed;
-			let await_result = self.events_closed && self.codec_result.is_none() && !stopping;
+			let take_events =
+				!stopping && !pause_requested && self.held.is_none() && !self.backlogged();
 
 			tokio::select! {
 				biased;
@@ -772,19 +755,18 @@ impl<B: DisposalBackend> Driver<B> {
 				Some(chunk) = self.link_chunks.next(), if !self.link_chunks.is_empty() => {
 					self.link_chunk_fetched(chunk);
 				}
-				Some(fetched) = self.input.fetched(), if self.input.fetching() => {
-					if let Err(error) = self.input.fetch_finished(fetched) {
-						self.stop_with(error);
+				fed = self.feed.next(take_events, !stopping) => match fed {
+					Fed::Fetched(result) => {
+						if let Err(error) = result {
+							self.stop_with(error);
+						}
+						self.report_bytes_read();
 					}
-					self.report_bytes_read();
-				}
-				event = self.link.events.recv(), if take_events => match event {
-					Some(event) => self.on_event(event).await?,
-					None => self.events_closed = true,
+					Fed::Asked => self.report_bytes_read(),
+					Fed::Event(event) => self.on_event(event).await?,
+					Fed::EventsClosed => {}
+					Fed::Finished(result) => self.codec_finished(result),
 				},
-				result = &mut self.link.done, if await_result => {
-					self.codec_finished(result.unwrap_or_else(|_| Err(worker_died())));
-				}
 				() = sleep(CALLBACK_INTERVAL) => self.tick(pause_requested),
 			}
 		}
@@ -820,32 +802,24 @@ impl<B: DisposalBackend> Driver<B> {
 
 	fn idle(&self) -> bool {
 		self.uploads.is_empty()
-			&& !self.input.fetching()
+			&& !self.feed.fetching()
 			&& self.link_sources.is_empty()
 			&& self.link_chunks.is_empty()
 			&& self.dir_creates.is_empty()
 			&& self.finalizes.is_empty()
 	}
 
-	/// Gives back what only the codec needed, once it is done: chunks prefetched past its last
-	/// read (a zip's or 7z's index chunks, fetched again for its entries) and the floor. What
-	/// follows (the checks, the disposal) holds nothing while it waits out a pause.
-	fn release_input(&mut self) {
-		self.input.release();
-		self.floor = None;
-	}
-
 	/// Waits out a pause holding nothing: prefetched chunks and the floor are given back.
 	async fn pause(&mut self) -> Result<(), Stopped> {
-		self.input
-			.wait_out_pause(&mut self.floor, &self.reporter, &self.control, &self.config)
+		self.feed
+			.wait_out_pause(&self.reporter, &self.control, &self.config)
 			.await
 	}
 
 	/// Drops the transfers in flight; the files they belonged to are abandoned.
 	fn drop_transfers(&mut self) {
 		self.reporter.set_cancelling();
-		self.input.drop_all();
+		self.feed.drop_all();
 		self.held = None;
 		self.link_sources = FuturesUnordered::new();
 		self.link_chunks = FuturesUnordered::new();
@@ -891,7 +865,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Starts whatever can start without waiting: answers the codec, prefetches, creates the
 	/// directories whose parents exist, takes up a held event, registers finished files.
 	fn advance(&mut self) {
-		self.input.advance(&self.reporter.ops());
+		self.feed.advance(&self.reporter.ops());
 		self.report_bytes_read();
 		while self.dir_creates.len() < MAX_SMALL_PARALLEL_REQUESTS
 			&& let Some(dir) = self.ready_dirs.pop_front()
@@ -911,7 +885,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Reports the bytes of the archive the codec has read, which its inputs count once each: as
 	/// the codec reads, not only on the idle ticks, which a busy job skips.
 	fn report_bytes_read(&self) {
-		let read = self.link.shared.input_bytes();
+		let read = self.feed.bytes_read();
 		debug_assert!(
 			read <= self.archive.size(),
 			"the codec read {read} bytes of a {}-byte archive",
@@ -923,52 +897,36 @@ impl<B: DisposalBackend> Driver<B> {
 	fn tick(&mut self, pause_requested: bool) {
 		self.report_bytes_read();
 		self.reporter.tick();
-		let owed = self.input.owes_codec()
-			|| self.held.is_some()
-			|| self.backlogged()
-			|| pause_requested
-			|| self.codec_result.is_some();
-		if self.stall.stalled(&self.link.shared, owed) {
-			tracing::error!(
-				"archive {}: the codec made no progress for {ARCHIVE_STALL_TIMEOUT:?}",
-				self.archive.uuid()
-			);
-			self.link.retire();
+		let owed = self.held.is_some() || self.backlogged() || pause_requested;
+		if self.feed.give_up_if_stalled(owed) {
 			self.codec_result = Some(Err(worker_died()));
 			self.stop_with(worker_died());
 		}
 	}
 
 	fn codec_finished(&mut self, result: CodecResult) {
-		self.input.codec_done();
 		match &result {
 			Ok(end) => {
 				self.report.unaccounted_bytes = end.unaccounted_bytes;
 				self.report.duplicates = end.duplicates.clone();
 				self.unchecked_entries = end.unchecked_entries;
 			}
-			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
-			Err(error) if self.fatal.error().is_some() || self.control.is_stopping() => {
-				tracing::debug!("archive codec ended after the job did: {error}");
-			}
-			// The archive is damaged from here on, but what came before it is whole: the files
-			// whose data is complete still finish, and only the one being read is dropped.
 			Err(error) => {
-				// a dead codec is a bug to hear of, where a damaged archive is only the user's
-				if error.kind() == ErrorKind::ArchiveWorkerDied {
-					tracing::error!("archive {}: {error}", self.archive.uuid());
-				} else {
-					tracing::warn!("archive {}: {error}", self.archive.uuid());
-				}
-				self.fatal
-					.record(Arc::new(Error::custom(error.kind(), error.to_string())));
-				self.held = None;
-				if let Some(ordinal) = self.current.take()
-					&& let Some(file) = self.files.remove(&ordinal)
-					&& !file.failed
-				{
-					self.reporter
-						.file_abandoned(file.active.dest_uuid, file.bytes());
+				// an error the driver caused (it failed a fetch, or stopped) is already the job's
+				let ended = self.fatal.error().is_some() || self.control.is_stopping();
+				// The archive is damaged from here on, but what came before it is whole: the files
+				// whose data is complete still finish, and only the one being read is dropped.
+				if codec_failed(self.archive.uuid(), error, ended) {
+					self.fatal
+						.record(Arc::new(Error::custom(error.kind(), error.to_string())));
+					self.held = None;
+					if let Some(ordinal) = self.current.take()
+						&& let Some(file) = self.files.remove(&ordinal)
+						&& !file.failed
+					{
+						self.reporter
+							.file_abandoned(file.active.dest_uuid, file.bytes());
+					}
 				}
 			}
 		}
@@ -977,14 +935,6 @@ impl<B: DisposalBackend> Driver<B> {
 
 	async fn on_event(&mut self, event: WorkerEvent) -> Result<(), Stopped> {
 		match event {
-			WorkerEvent::Ask {
-				source: _,
-				index,
-				reply,
-			} => {
-				self.input.ask(index, reply);
-				self.report_bytes_read();
-			}
 			WorkerEvent::Opened(layout) => {
 				self.layout = Some(layout);
 				self.open(layout).await?
@@ -993,8 +943,9 @@ impl<B: DisposalBackend> Driver<B> {
 			WorkerEvent::Skipped(member) => self.on_skipped(member),
 			event @ (WorkerEvent::Data(_) | WorkerEvent::FileEnd) => self.retry_held(event),
 			WorkerEvent::Link(link) => self.on_link(*link),
-			// only a compressing codec sends a head, and only a listing's lists
-			WorkerEvent::Head(_) | WorkerEvent::Listed(_) => {
+			// the feed answers asks, only a compressing codec sends a head, and only a listing's
+			// lists
+			WorkerEvent::Ask { .. } | WorkerEvent::Head(_) | WorkerEvent::Listed(_) => {
 				debug_assert!(false, "an extracting codec sent {event:?}");
 			}
 		}
@@ -1340,7 +1291,7 @@ impl<B: DisposalBackend> Driver<B> {
 		if let Some(limit) = self.expansion {
 			let allowed = limit
 				.floor
-				.max(self.link.shared.input_bytes().saturating_mul(limit.ratio));
+				.max(self.feed.bytes_read().saturating_mul(limit.ratio));
 			if self.link_bytes.saturating_add(size) > allowed {
 				return self.stop_with(Error::custom(
 					ErrorKind::ArchiveTooLarge,
@@ -2121,7 +2072,7 @@ impl<B: DisposalBackend> Driver<B> {
 			// one for the whole stream: the whole archive, read front to back, has to match the
 			// hash in its metadata. A zip's or a 7z's entries were each checked as they were
 			// read.
-			let Some(read) = self.input.read_whole() else {
+			let Some(read) = self.feed.read_whole() else {
 				return kept(KeptReason::Unconfirmed);
 			};
 			match self.archive.hash() {
