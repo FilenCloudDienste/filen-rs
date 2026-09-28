@@ -88,8 +88,8 @@ use super::{
 	engine::PassStructures,
 	plan,
 	probe::{self, Fixture, NameStyle, Shape, baseline_rows, probe_rules},
+	rows::Baseline,
 	scan::{self, RuleFiles},
-	tree::Baseline,
 };
 use crate::{
 	auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient},
@@ -2532,9 +2532,10 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		structures.view_bytes as u64,
 		structures.scan_bytes as u64,
 	);
-	// A pass does not COPY the tree: `pass_inputs` hands it the store's resident `Arc<Baseline>`,
-	// the very object this child sized before the pass began. One that started copying it would be
-	// the finding, and it would otherwise surface only as two columns that happened to disagree.
+	// A pass does not COPY the tree: `pass_inputs` hands it a `Baseline` sharing the store's
+	// resident tree, the very object this child sized before the pass began. One that started
+	// copying it would be the finding, and it would otherwise surface only as two columns that
+	// happened to disagree.
 	//
 	// Except when the pass FOLDS a directory move. `Prepared::fold_dir_moves` takes
 	// `&mut self.baseline` and re-keys the moved subtree to the paths it ends up at, so that

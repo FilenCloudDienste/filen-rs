@@ -29,11 +29,11 @@ use unicode_normalization::UnicodeNormalization;
 use super::{
 	baseline::NodeKind,
 	ignore::{IgnoreDecision, IgnoreRules, rule_file_dir},
+	rows::Baseline,
 	scan::{
 		LocalNode, LocalScan, RuleFiles, ScanError, collision_key, fast_path_hash, hash_file,
 		load_rule_file, name_rejection, record, scan_subtree,
 	},
-	tree::Baseline,
 };
 use crate::io::FilenMetaExt;
 

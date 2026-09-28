@@ -20,7 +20,7 @@ use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, tree::Baseline};
+use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, rows::Baseline, tree::Tree};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`.
 ///
@@ -370,7 +370,7 @@ impl BaselineEntry {
 	/// It lives here, on the row it is about, because THREE readers need the same answer and a
 	/// second copy of the field list is how a new column comes to be carried by one of them and not
 	/// another: [`derive::carried`](super::derive) builds the two nodes from a row that passes,
-	/// [`Baseline`](super::tree::Baseline) indexes the rows that fail so a pass can find them all
+	/// [`Tree`](super::tree::Tree) indexes the rows that fail so a pass can find them all
 	/// without walking the tree, and a carried side answers "does this side hold the path" straight
 	/// off that index without building a node at all.
 	///
@@ -568,7 +568,7 @@ pub(crate) struct BaselineStore {
 	/// A [`RefCell`] because every write path takes `&self` — the connection is already the single
 	/// writer, serialized by the pair's store mutex, so there is no second borrower to race. The
 	/// store is `Send` and never `Sync`, exactly as the `Connection` inside it already makes it.
-	resident: RefCell<HashMap<PairId, Arc<Baseline>>>,
+	resident: RefCell<HashMap<PairId, Arc<Tree>>>,
 }
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
@@ -1197,7 +1197,7 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	/// `pair`'s rows as the resident [`Baseline`] tree, read from the DB on the first call and kept
+	/// `pair`'s rows as a [`Baseline`] over the resident [`Tree`], read from the DB on the first call and kept
 	/// in step by every write path here afterwards.
 	///
 	/// This is what a pass reconciles against, so it is read once per PAIR rather than once per
@@ -1213,18 +1213,18 @@ impl BaselineStore {
 	/// — the pass reconciles against a fixed baseline and writes the rows it advances — and the
 	/// FIRST write of such a pass clones the tree once, after which the store owns it alone again
 	/// and the rest of that pass's writes land in place. A pass that writes nothing clones nothing.
-	pub(crate) fn baseline(&self, pair: PairId) -> rusqlite::Result<Arc<Baseline>> {
+	pub(crate) fn baseline(&self, pair: PairId) -> rusqlite::Result<Baseline> {
 		if let Some(rows) = self.resident.borrow().get(&pair) {
-			return Ok(Arc::clone(rows));
+			return Ok(Baseline::resident(Arc::clone(rows)));
 		}
 		let rows = Arc::new(self.read_tree(pair)?);
 		self.resident.borrow_mut().insert(pair, Arc::clone(&rows));
-		Ok(rows)
+		Ok(Baseline::resident(rows))
 	}
 
-	/// `pair`'s rows as a [`Baseline`] tree, built from them AS THEY ARRIVE.
+	/// `pair`'s rows as a [`Tree`], built from them AS THEY ARRIVE.
 	///
-	/// Not `Baseline::from_rows(self.entries(pair)?)`, which is the same tree by way of a `Vec` of
+	/// Not `Tree::from_rows(self.entries(pair)?)`, which is the same tree by way of a `Vec` of
 	/// every row the pair has. That `Vec` is the widest thing a process holding an idle pair ever
 	/// builds: at a million rows it is ~300 MiB of `BaselineEntry` and their paths, alive beside
 	/// the tree being built out of it — and once freed, the pages an allocator has not returned to
@@ -1234,12 +1234,12 @@ impl BaselineStore {
 	/// The `ORDER BY` is `entries`'s, kept because the tree is built by `upsert`
 	/// per row: parent before child for same-prefix paths, which is the order a load is cheapest
 	/// in and the order both read paths agree on.
-	fn read_tree(&self, pair: PairId) -> rusqlite::Result<Baseline> {
+	fn read_tree(&self, pair: PairId) -> rusqlite::Result<Tree> {
 		let mut statement = self.conn.prepare(&format!(
 			"SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 ORDER BY rel_path"
 		))?;
 		let mut rows = statement.query(params![pair])?;
-		let mut tree = Baseline::default();
+		let mut tree = Tree::default();
 		while let Some(row) = rows.next()? {
 			tree.upsert(&Self::row_to_entry(row)?);
 		}
@@ -1253,7 +1253,7 @@ impl BaselineStore {
 	///
 	/// A pair nothing has read yet has no resident copy, and gains one from the DB when something
 	/// asks: there is nothing to keep in step until then.
-	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut Baseline)) {
+	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut Tree)) {
 		if let Some(rows) = self.resident.borrow_mut().get_mut(&pair) {
 			apply(Arc::make_mut(rows));
 		}

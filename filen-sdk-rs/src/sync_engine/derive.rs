@@ -51,9 +51,9 @@ use super::{
 	engine::written_node,
 	observe::{LocalObservation, LocalObservations},
 	plan::{self, RemoteNode},
+	rows::Baseline,
 	scan::LocalNode,
 	side::{FromRow, Nodes, Side},
-	tree::Baseline,
 };
 
 /// What a pass reconciles, before its observations are merged in.
