@@ -216,8 +216,6 @@ pub(crate) trait JobTick: MaybeSendSync {
 	/// Records whether a pause is requested; the job counts as paused once no operation is in
 	/// flight.
 	fn set_pause_requested(&self, requested: bool);
-	/// A cancel overrides a pause: the job winds down instead of pausing.
-	fn set_cancelling(&self);
 	/// The job winds down, cancelled through `control` or ended by an error: a stop overrides
 	/// a pause (see [`Reporter::wind_down`]).
 	fn wind_down(&self, control: &JobControl);
@@ -246,8 +244,8 @@ impl Ops {
 		self.0.set_pause_requested(requested);
 	}
 
-	pub(crate) fn set_cancelling(&self) {
-		self.0.set_cancelling();
+	pub(crate) fn wind_down(&self, control: &JobControl) {
+		self.0.wind_down(control);
 	}
 }
 
@@ -403,6 +401,11 @@ impl<S: JobState> Reporter<S> {
 	}
 
 	/// A cancel overrides a pause: the job winds down instead of pausing, reported cancelling.
+	/// Called by the archive jobs, which the service-worker build leaves out.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
 	pub(crate) fn set_cancelling(&self) {
 		self.stop(true);
 	}
@@ -461,10 +464,6 @@ impl<S: JobState> JobTick for Reporter<S> {
 
 	fn set_pause_requested(&self, requested: bool) {
 		Reporter::set_pause_requested(self, requested);
-	}
-
-	fn set_cancelling(&self) {
-		Reporter::set_cancelling(self);
 	}
 
 	fn wind_down(&self, control: &JobControl) {

@@ -23,6 +23,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use filen_types::fs::Uuid;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -174,6 +175,41 @@ impl StallWatch {
 		self.still_ticks += 1;
 		CALLBACK_INTERVAL * self.still_ticks >= ARCHIVE_STALL_TIMEOUT
 	}
+
+	/// One tick, as [`Self::stalled`]; a codec of `archive` that stalled is given up on: logged,
+	/// and its `link` retired. Whether it was.
+	pub(crate) fn give_up_if_stalled<T>(
+		&mut self,
+		link: &WorkerLink<T>,
+		owed: bool,
+		archive: Uuid,
+	) -> bool {
+		if !self.stalled(&link.shared, owed) {
+			return false;
+		}
+		tracing::error!(
+			"archive {archive}: the codec made no progress for {ARCHIVE_STALL_TIMEOUT:?}"
+		);
+		link.retire();
+		true
+	}
+}
+
+/// Logs how the codec of `archive` failed with `error`; whether that error is the job's, which
+/// it is not once the job had `ended` (the driver failed a fetch, or stopped): the codec then
+/// only failed for it.
+pub(crate) fn codec_failed(archive: Uuid, error: &Error, ended: bool) -> bool {
+	if ended {
+		tracing::debug!("archive codec ended after the job did: {error}");
+		return false;
+	}
+	// a dead codec is a bug to hear of, where a damaged archive is only the user's
+	if error.kind() == ErrorKind::ArchiveWorkerDied {
+		tracing::error!("archive {archive}: {error}");
+	} else {
+		tracing::warn!("archive {archive}: {error}");
+	}
+	true
 }
 
 /// Marks the error of an exchange that failed because the driver went away or cancelled, which

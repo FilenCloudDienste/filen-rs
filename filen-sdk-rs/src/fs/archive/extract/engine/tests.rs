@@ -39,7 +39,7 @@ use crate::{
 				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
 				zip_of,
 			},
-			worker::LinkHead,
+			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -953,6 +953,15 @@ async fn the_limits_end_the_job() {
 	let job = start(&setup_bytes, options);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
+	// ended by an error, not cancelled
+	assert!(
+		job.recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|update| update.run_state == RunState::Running)
+	);
 	assert!(finished(&setup_bytes).is_empty());
 	assert_eq!(
 		failed.report.counts,

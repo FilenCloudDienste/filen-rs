@@ -6,16 +6,18 @@
 //! archive is extracted, by which time a permanent deletion has left the data nowhere else.
 //! Trashed sources can be restored, so a disposal to the trash is not read back.
 //!
-//! The read goes through the same reader and limits as extracting, one chunk at a time. Its
-//! memory is the codec's budget and the job's two-chunk floor: the chunk being fetched and the
-//! one the reader holds. A zip's or 7z's reader also keeps up to two chunks it read before, part
-//! of its own state as when extracting. A pause is seen when the reader asks for its next chunk:
-//! the fetch in flight finishes, the floor is given back, and the reader's state, with the chunk
-//! it holds, stays resident; nothing of the client's memory budget is held.
+//! The read goes through the same reader, limits and input as extracting (see
+//! [`CodecFeed`]): its memory is the codec's budget and the job's two-chunk floor, the chunk
+//! being fetched and the one the reader holds, with chunks fetched ahead only while the client's
+//! memory has room right now. A zip's or 7z's reader also keeps up to two chunks it read before,
+//! part of its own state as when extracting. A pause is seen when the reader asks for a chunk
+//! not fetched yet: the fetches in flight finish, the floor and what was fetched ahead are given
+//! back, and the reader's state, with the chunk it holds, stays resident; nothing of the
+//! client's memory budget is held.
 
 use std::{
 	collections::{HashMap, HashSet},
-	pin::pin,
+	sync::Arc,
 };
 
 use crate::{
@@ -27,11 +29,9 @@ use crate::{
 			config::ArchiveConfig,
 			extract::codec::{ArchiveEnd, CodecLimits, StreamJob, Task, extract_stream},
 			format::ArchiveFormat,
+			input::{CodecFeed, Fed},
 			password::ArchivePassword,
-			worker::{
-				self, EntryHead, EntryKind, StallWatch, WorkerEvent, WorkerLink, WorkerShared,
-				worker_died,
-			},
+			worker::{self, EntryHead, EntryKind, WorkerEvent, WorkerLink, worker_died},
 		},
 		drive_job::backend::DriveBackend,
 		file::{RemoteFile, enums::RemoteFileType, traits::HasFileInfo},
@@ -103,9 +103,9 @@ impl ReadBack {
 
 /// Whether `archive` reads back as exactly `files` (each by its path, with the BLAKE3 of what was
 /// read of its source) and the directories of `read_back`. `Err` once the job stops; a pause
-/// holds the read between two chunks, holding no floor.
+/// holds no floor.
 pub(crate) async fn reads_back<B: DriveBackend>(
-	backend: &B,
+	backend: &Arc<B>,
 	control: &JobControl,
 	reporter: &MaybeArc<Reporter>,
 	archive: &RemoteFile,
@@ -170,7 +170,7 @@ impl Check {
 	/// Takes one of the codec's events; `Err` with why the archive is not what was written.
 	fn take(&mut self, event: WorkerEvent) -> Result<(), String> {
 		match event {
-			WorkerEvent::Ask { .. } => unreachable!("the reader's asks are answered first"),
+			WorkerEvent::Ask { .. } => unreachable!("the feed answers the reader's asks"),
 			WorkerEvent::Opened(layout) => {
 				self.single = matches!(layout, ArchiveFormat::Single { .. });
 			}
@@ -228,7 +228,7 @@ impl Check {
 
 /// What serving the reader takes from its job.
 struct Reading<'a, B> {
-	backend: &'a B,
+	backend: &'a Arc<B>,
 	control: &'a JobControl,
 	reporter: &'a MaybeArc<Reporter>,
 	config: &'a ArchiveConfig,
@@ -244,99 +244,57 @@ async fn read<B: DriveBackend>(
 		config,
 	}: Reading<'_, B>,
 	archive: &RemoteFile,
-	mut link: WorkerLink<ReadBackResult>,
+	link: WorkerLink<ReadBackResult>,
 	mut check: Check,
 ) -> Result<Result<(), String>, Stopped> {
-	let file = RemoteFileType::from(archive.clone());
-	let mut floor = Some(control.until_stopping(config.floor()).await?);
-	// a zip or 7z reader may ask for a chunk again; progress counts each once
-	let mut fetched = HashSet::new();
-	let mut watch = Watch {
-		control,
-		reporter,
-		stall: StallWatch::default(),
-		answered: false,
+	let floor = control.until_stopping(config.floor()).await?;
+	let file = Arc::new(RemoteFileType::from(archive.clone()));
+	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, (floor, reporter.op()));
+	// what the reader read so far, each chunk counted once however often it asks for it
+	let mut verified = 0;
+	let mut report_verified = |feed: &CodecFeed<B, ArchiveEnd>| {
+		let read = feed.bytes_read();
+		reporter.archive_verified(read - verified);
+		verified = read;
 	};
 	loop {
-		let Some(event) = watch.until(&link.shared, link.events.recv()).await? else {
-			link.retire();
-			return Ok(Err(worker_died().to_string()));
-		};
-		let Some(event) = event else {
-			break;
-		};
-		if let WorkerEvent::Ask { index, reply, .. } = event {
-			// the reader waits for its chunk, so a pause holds nothing in flight
-			if control.is_pause_requested() {
-				floor = None;
+		let pause_requested = control.is_pause_requested();
+		reporter.set_pause_requested(pause_requested);
+		if control.is_stopping() {
+			return Err(Stopped);
+		}
+		if pause_requested {
+			// seen once the reader waits for its next chunk, which a pause then holds back: it
+			// has read the ones before, and nothing is in flight
+			if feed.owes_codec() && !feed.fetching() {
+				report_verified(&feed);
+				feed.wait_out_pause(reporter, control, config).await?;
+				continue;
 			}
-			reporter.checkpoint(control).await?;
-			if floor.is_none() {
-				floor = Some(control.until_stopping(config.floor()).await?);
-			}
-			let _op = reporter.op();
-			match control
-				.until_stopping(backend.fetch_chunk(&file, index))
-				.await?
-			{
-				Ok(chunk) => {
-					if fetched.insert(index) {
-						reporter.archive_verified(chunk.len() as u64);
+		} else {
+			feed.advance(&reporter.ops());
+			report_verified(&feed);
+		}
+		tokio::select! {
+			biased;
+			() = control.stopping() => {},
+			() = control.pause_changed(pause_requested) => {},
+			fed = feed.next(true, true) => match fed {
+				Fed::Fetched(Err(error)) => return Ok(Err(format!("reading it failed: {error}"))),
+				Fed::Fetched(Ok(())) | Fed::Asked => report_verified(&feed),
+				Fed::Event(event) => {
+					if let Err(why) = check.take(event) {
+						return Ok(Err(why));
 					}
-					let _ = reply.send(Ok(chunk));
 				}
-				Err(error) => return Ok(Err(format!("reading it failed: {error}"))),
-			}
-			watch.answered = true;
-			continue;
-		}
-		if let Err(why) = check.take(event) {
-			return Ok(Err(why));
-		}
-	}
-	let Some(ended) = watch.until(&link.shared, &mut link.done).await? else {
-		link.retire();
-		return Ok(Err(worker_died().to_string()));
-	};
-	Ok(match ended {
-		Ok(Ok(end)) => check.complete(&end),
-		Ok(Err(error)) => Err(error.to_string()),
-		Err(_) => Err("its reader died".to_owned()),
-	})
-}
-
-/// Watches the reader while the read waits on it, as the other archive drivers watch their
-/// codecs: one that makes no progress for [`ARCHIVE_STALL_TIMEOUT`] is given up on. While the
-/// read fetches a chunk or waits out a pause it owes the reader, and does not tick.
-///
-/// [`ARCHIVE_STALL_TIMEOUT`]: crate::fs::archive::worker::ARCHIVE_STALL_TIMEOUT
-struct Watch<'a> {
-	control: &'a JobControl,
-	reporter: &'a MaybeArc<Reporter>,
-	stall: StallWatch,
-	/// A chunk was handed over since the last tick: the reader was owed it until then.
-	answered: bool,
-}
-
-impl Watch<'_> {
-	/// `next`, or `None` once the reader stopped moving; `Err` once the job stops.
-	async fn until<T>(
-		&mut self,
-		shared: &WorkerShared,
-		next: impl Future<Output = T>,
-	) -> Result<Option<T>, Stopped> {
-		let mut next = pin!(next);
-		loop {
-			tokio::select! {
-				biased;
-				() = self.control.stopping() => return Err(Stopped),
-				value = &mut next => return Ok(Some(value)),
-				() = sleep(CALLBACK_INTERVAL) => {
-					self.reporter.tick();
-					let owed = std::mem::take(&mut self.answered);
-					if self.stall.stalled(shared, owed) {
-						return Ok(None);
-					}
+				Fed::EventsClosed => {}
+				Fed::Finished(Ok(end)) => return Ok(check.complete(&end)),
+				Fed::Finished(Err(error)) => return Ok(Err(error.to_string())),
+			},
+			() = sleep(CALLBACK_INTERVAL) => {
+				reporter.tick();
+				if feed.give_up_if_stalled(pause_requested) {
+					return Ok(Err(worker_died().to_string()));
 				}
 			}
 		}

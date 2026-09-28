@@ -4,9 +4,8 @@
 mod client_impl;
 pub(crate) mod codec;
 mod engine;
-mod input;
 mod list;
-mod report;
+pub(crate) mod report;
 
 use filen_macros::js_type;
 

@@ -42,6 +42,7 @@ use crate::{
 			},
 			tar_iter::TarReader,
 			test_support::pattern,
+			worker::ARCHIVE_STALL_TIMEOUT,
 			worker::{self, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
@@ -500,6 +501,8 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	assert!(failed.report.archive.is_none());
 	assert!(setup_storage.backend.log().finished.is_empty());
 	assert_released(&setup_storage, &job.reporter);
+	// ended by an error, not cancelled
+	assert_eq!(run_states(&job.recorder), [RunState::Running]);
 
 	// a source that cannot be read
 	let setup_fetch = setup(|backend, _| {

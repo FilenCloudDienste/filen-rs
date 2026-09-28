@@ -259,7 +259,7 @@ pub(crate) async fn watch_listing<T>(
 		_ = ticker => unreachable!("the ticker never ends"),
 	};
 	result.map_err(|Stopped| {
-		ops.set_cancelling();
+		ops.wind_down(control);
 		ScanError::Stopped
 	})
 }
