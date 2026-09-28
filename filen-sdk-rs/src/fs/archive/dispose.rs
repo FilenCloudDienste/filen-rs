@@ -73,7 +73,8 @@ pub enum KeptReason {
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
-	/// The job was cancelled while removing it.
+	/// The job was cancelled before it removed it: before the removal began (the job ended
+	/// early), or while checking or removing it.
 	Interrupted,
 	/// Removing it failed.
 	Failed { error: Arc<Error> },
