@@ -115,7 +115,8 @@ impl ArchiveEnd {
 const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 
 /// Most a listing decodes of a 7z folder to read a symlink's target, or tell whether a reparse
-/// point is a link: a link past it (at the end of a solid block, say) is listed unread.
+/// point is a link: a link past it (at the end of a solid block, say) is listed unread. For a
+/// zip, most of the archive it fetches for symlink targets, and most it holds of them.
 const LIST_READ_BYTES: u64 = 16 << 20;
 
 /// Reads a streaming archive through `port`, sending its entries. An error the driver caused
@@ -418,6 +419,8 @@ fn extract_zip(
 		walk.port
 			.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 			.map_err(failure)?;
+		let mut targets =
+			zip_symlink_targets(walk.port, &mut source, &index, password, entry_limits);
 		let mut listed: Vec<(&ZipEntry, bool)> = index
 			.entries
 			.iter()
@@ -426,11 +429,10 @@ fn extract_zip(
 			.collect();
 		listed.sort_unstable_by_key(|(entry, _)| entry.ordinal);
 		for (entry, overlapping) in listed {
-			let target = if entry.kind == ZipKind::Symlink {
-				zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
-			} else {
-				String::new()
-			};
+			let target = targets
+				.binary_search_by_key(&entry.ordinal, |(ordinal, _)| *ordinal)
+				.map(|at| std::mem::take(&mut targets[at].1))
+				.unwrap_or_default();
 			walk.list(zip_found(entry, overlapping, target), None)
 				.map_err(failure)?;
 		}
@@ -1074,6 +1076,39 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 		METHOD_BZIP2 => data.is_some_and(|data| data <= 14),
 		_ => false,
 	}
+}
+
+/// The targets of a zip's symlinks, for listing, by ordinal. They are read in the order their
+/// data is stored, so the archive is read front to back once, however its index orders them,
+/// rather than a chunk fetched again for each; and only until reading them has fetched
+/// [`LIST_READ_BYTES`] of the archive or they hold that much: the links past it are listed
+/// with their targets unread. An overlapping entry's data is never read.
+fn zip_symlink_targets(
+	port: &WorkerPort,
+	source: &mut SeekInput<'_>,
+	index: &ZipIndex,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+) -> Vec<(u64, String)> {
+	let first_read = port.shared().input_bytes();
+	let mut held = 0;
+	let mut targets = Vec::new();
+	for entry in index
+		.entries
+		.iter()
+		.filter(|entry| entry.kind == ZipKind::Symlink)
+	{
+		if port.shared().input_bytes() - first_read > LIST_READ_BYTES || held > LIST_READ_BYTES {
+			break;
+		}
+		let target = zip_symlink_target(source, index.shift, entry, password, limits);
+		if !target.is_empty() {
+			held += (target.len() + size_of::<(u64, String)>()) as u64;
+			targets.push((entry.ordinal, target));
+		}
+	}
+	targets.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+	targets
 }
 
 /// A symlink entry's target, for reporting: its data, when small and readable.

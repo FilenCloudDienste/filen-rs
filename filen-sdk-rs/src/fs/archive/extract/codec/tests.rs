@@ -1531,6 +1531,42 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 }
 
 #[test]
+fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
+	// a link in every chunk: reading all their targets would fetch the whole archive
+	let links = LIST_READ_BYTES as usize / CHUNK_SIZE + 4;
+	let stored = zip8::write::SimpleFileOptions::default()
+		.compression_method(zip8::CompressionMethod::Stored);
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	for link in 0..links {
+		writer
+			.add_symlink(format!("link{link}"), "target", stored)
+			.unwrap();
+		writer.start_file(format!("filler{link}"), stored).unwrap();
+		writer
+			.write_all(&incompressible(CHUNK_SIZE, link as u64))
+			.unwrap();
+	}
+	let zip = writer.finish().unwrap().into_inner();
+	let (entries, end) = listed(
+		&zip,
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	// read in the order they are stored until the budget is spent, the rest listed unread
+	let read: Vec<bool> = entries
+		.iter()
+		.filter_map(|entry| match &entry.kind {
+			ArchiveEntryKind::Symlink { target } => Some(target == "target"),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(read.len(), links);
+	let unread = read.iter().position(|read| !read).unwrap();
+	assert!(unread > 1, "{read:?}");
+	assert!(read[unread..].iter().all(|read| !read), "{read:?}");
+}
+
+#[test]
 fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 	let data = apple_double_data();
 	let zip = zip_of(

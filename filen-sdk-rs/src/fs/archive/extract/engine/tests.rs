@@ -18,10 +18,10 @@ use crate::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			entry_path::entry_path,
 			extract::{
-				ArchiveEntry, ArchiveListing, ArchiveTotals, ExpansionLimit, ExtractCallback,
-				ExtractEvent, ExtractSkipReason, ExtractUpdate, ListCallback, ListFailed,
-				ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,
-				PasswordCheck, RunState,
+				ArchiveEntry, ArchiveEntryKind, ArchiveListing, ArchiveTotals, ExpansionLimit,
+				ExtractCallback, ExtractEvent, ExtractSkipReason, ExtractUpdate, ListCallback,
+				ListFailed, ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES,
+				MAX_LISTED_ENTRIES, PasswordCheck, RunState,
 				codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
 				list::{ListReporter, ListTask, run_list},
 				report::CALLBACK_BATCH,
@@ -3089,6 +3089,76 @@ async fn a_zip_is_listed_from_its_index_alone() {
 	assert_eq!(
 		setup.backend.memory.available_permits(),
 		setup.backend.budget
+	);
+}
+
+/// A zip of `runs` runs of `per_run` symlinks, each run stored before a chunk of other data,
+/// whose index lists the runs' links in turns: taken in index order, every link is in another
+/// chunk from the one before it.
+fn zip_of_scattered_symlinks(runs: usize, per_run: usize) -> Vec<u8> {
+	const EOCD_LEN: usize = 22;
+	const CENTRAL_HEADER_LEN: usize = 46;
+	let stored = zip8::write::SimpleFileOptions::default()
+		.compression_method(zip8::CompressionMethod::Stored);
+	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	for run in 0..runs {
+		for link in 0..per_run {
+			writer
+				.add_symlink(format!("run{run}/link{link}"), "target", stored)
+				.unwrap();
+		}
+		writer.start_file(format!("filler{run}"), stored).unwrap();
+		writer
+			.write_all(&incompressible(CHUNK_SIZE, run as u64))
+			.unwrap();
+	}
+	let zip = writer.finish().unwrap().into_inner();
+	let u16_at = |at: usize| usize::from(u16::from_le_bytes([zip[at], zip[at + 1]]));
+	let u32_at = |at: usize| u32::from_le_bytes(zip[at..at + 4].try_into().unwrap()) as usize;
+	let end = zip.len() - EOCD_LEN;
+	let (directory_len, directory) = (u32_at(end + 12), u32_at(end + 16));
+	let mut records = Vec::new();
+	let mut at = directory;
+	while at < directory + directory_len {
+		let len = CENTRAL_HEADER_LEN + u16_at(at + 28) + u16_at(at + 30) + u16_at(at + 32);
+		records.push(&zip[at..at + len]);
+		at += len;
+	}
+	// the n-th entry of every run, then the n+1-th: run r's entries are records r * per..
+	let per = per_run + 1;
+	let mut scattered = zip[..directory].to_vec();
+	for nth in 0..per {
+		for run in 0..runs {
+			scattered.extend_from_slice(records[run * per + nth]);
+		}
+	}
+	scattered.extend_from_slice(&zip[end..]);
+	scattered
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zips_symlinks_are_listed_reading_it_front_to_back() {
+	let zip = zip_of_scattered_symlinks(3, 500);
+	let chunks = zip.len().div_ceil(CHUNK_SIZE);
+	let setup = setup("links.zip", zip, |_| {});
+	let listing = list(&setup, JobControl::default(), test_config());
+	let listed = listing.running.await.unwrap().unwrap();
+
+	let links: Vec<&ArchiveEntryKind> = listed
+		.entries
+		.iter()
+		.map(|entry| &entry.kind)
+		.filter(|kind| matches!(kind, ArchiveEntryKind::Symlink { .. }))
+		.collect();
+	let target = ArchiveEntryKind::Symlink {
+		target: "target".into(),
+	};
+	assert_eq!(links, vec![&target; 1500]);
+	// its index in the last chunks, then each chunk holding links once: not a fetch per link
+	let fetched = setup.backend.log().fetched.len();
+	assert!(
+		fetched <= 2 * chunks,
+		"{fetched} fetches of {chunks} chunks"
 	);
 }
 
