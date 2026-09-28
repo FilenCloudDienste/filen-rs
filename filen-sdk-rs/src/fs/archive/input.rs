@@ -361,6 +361,11 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 		self.input.fetching()
 	}
 
+	/// Whether the codec waits on a chunk.
+	pub(crate) fn owes_codec(&self) -> bool {
+		self.input.owes_codec()
+	}
+
 	pub(crate) fn archive(&self) -> &Arc<RemoteFileType<'static>> {
 		self.input.archive()
 	}

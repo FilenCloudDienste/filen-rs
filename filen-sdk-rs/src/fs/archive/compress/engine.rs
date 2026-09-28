@@ -964,7 +964,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.map(|source| (std::mem::take(&mut source.path), source.hasher.finalize()))
 			.collect();
 		let verdict = reads_back(
-			&*self.backend,
+			&self.backend,
 			&self.control,
 			&self.reporter,
 			archive,
