@@ -9,9 +9,9 @@ use crate::{
 use super::{
 	ArchiveEntry, ArchiveEntryId, ArchiveListing, CompressCall, CompressConfig, CompressDelivery,
 	CompressFormat, CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery,
-	ExtractReport, ExtractRequest, ExtractRoot, ExtractUpdate, ExtractedTopLevelItem, ListDelivery,
-	ListUpdate, RemoteFileType, SourceDisposal, compress_job, entries_request, extract_config,
-	extract_job, extract_request, list_job, password,
+	ExtractReport, ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate,
+	ExtractedTopLevelItem, ListDelivery, ListUpdate, RemoteFileType, SourceDisposal, compress_job,
+	entries_request, extract_job, extract_request, list_job, password,
 };
 
 /// Receives an extract's progress, in the order the extract made it, before the call
@@ -169,13 +169,13 @@ impl JsClient {
 		// wrapped first, so an argument refused below still drops it wiped
 		let password = self::password(password)?;
 		let request = extract_request(archive, destination, root, config.dispose)?;
-		let config = extract_config(
-			config.max_bytes,
-			config.max_items,
-			config.expansion_limit,
-			config.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			max_bytes: config.max_bytes,
+			max_items: config.max_items,
+			expansion_limit: config.expansion_limit,
+			skip_mac_metadata: config.skip_mac_metadata,
+		}
+		.into_config(password);
 		run_extract(self.inner(), request, config, callback, managed_future).await
 	}
 
@@ -216,13 +216,13 @@ impl JsClient {
 			));
 		}
 		let request = entries_request(archive, entries, &base, destination, root)?;
-		let config = extract_config(
-			config.max_bytes,
-			config.max_items,
-			config.expansion_limit,
-			config.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			max_bytes: config.max_bytes,
+			max_items: config.max_items,
+			expansion_limit: config.expansion_limit,
+			skip_mac_metadata: config.skip_mac_metadata,
+		}
+		.into_config(password);
 		run_extract(self.inner(), request, config, callback, managed_future).await
 	}
 
@@ -251,13 +251,12 @@ impl JsClient {
 	) -> Result<ArchiveListing, Error> {
 		let password = self::password(password)?;
 		let archive = RemoteFileType::try_from(archive)?;
-		let config = extract_config(
-			None,
-			None,
-			config.expansion_limit,
-			config.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			expansion_limit: config.expansion_limit,
+			skip_mac_metadata: config.skip_mac_metadata,
+			..ExtractSettings::default()
+		}
+		.into_config(password);
 		let client = self.inner();
 		managed_future
 			.into_ordered_job(

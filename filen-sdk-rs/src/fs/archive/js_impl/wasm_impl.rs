@@ -13,8 +13,8 @@ use crate::{
 use super::{
 	ArchiveEntryId, ArchiveListing, Client, CompressCall, CompressConfig, CompressDelivery,
 	CompressFormat, CompressReport, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
-	ExtractRequest, ExtractRoot, ListDelivery, RemoteFileType, SourceDisposal, compress_job,
-	entries_request, extract_config, extract_job, extract_request, list_job, password,
+	ExtractRequest, ExtractRoot, ExtractSettings, ListDelivery, RemoteFileType, SourceDisposal,
+	compress_job, entries_request, extract_job, extract_request, list_job, password,
 };
 
 #[js_type(import, no_ser, no_default)]
@@ -258,13 +258,13 @@ impl JsClient {
 			params.root,
 			params.dispose,
 		)?;
-		let config = extract_config(
-			params.max_bytes,
-			params.max_items,
-			params.expansion_limit,
-			params.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			max_bytes: params.max_bytes,
+			max_items: params.max_items,
+			expansion_limit: params.expansion_limit,
+			skip_mac_metadata: params.skip_mac_metadata,
+		}
+		.into_config(password);
 		let callbacks = ExtractCallbacks {
 			on_update: params.on_update,
 			on_top_level_created: params.on_top_level_created,
@@ -309,13 +309,13 @@ impl JsClient {
 			params.destination,
 			params.root,
 		)?;
-		let config = extract_config(
-			params.max_bytes,
-			params.max_items,
-			params.expansion_limit,
-			params.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			max_bytes: params.max_bytes,
+			max_items: params.max_items,
+			expansion_limit: params.expansion_limit,
+			skip_mac_metadata: params.skip_mac_metadata,
+		}
+		.into_config(password);
 		let callbacks = ExtractCallbacks {
 			on_update: params.on_update,
 			on_top_level_created: params.on_top_level_created,
@@ -350,13 +350,12 @@ impl JsClient {
 	) -> Result<ArchiveListing, Error> {
 		let password = self::password(password)?;
 		let archive = RemoteFileType::try_from(params.archive)?;
-		let config = extract_config(
-			None,
-			None,
-			params.expansion_limit,
-			params.skip_mac_metadata,
-			password,
-		);
+		let config = ExtractSettings {
+			expansion_limit: params.expansion_limit,
+			skip_mac_metadata: params.skip_mac_metadata,
+			..ExtractSettings::default()
+		}
+		.into_config(password);
 		let callbacks = ListCallbacks {
 			on_entries: params.on_entries,
 			on_update: params.on_update,

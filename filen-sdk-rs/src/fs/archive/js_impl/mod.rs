@@ -705,28 +705,27 @@ fn entries_request(
 	})
 }
 
-/// An extract's (or a listing's) config from the call's arguments: what the call leaves out is
-/// the SDK's default.
-fn extract_config(
+/// The settings of an extract call, or of a listing (which leaves out `max_bytes` and
+/// `max_items`), by name: what the call leaves out is the SDK's default.
+#[derive(Default)]
+struct ExtractSettings {
 	max_bytes: Option<u64>,
 	max_items: Option<u64>,
 	expansion_limit: Option<ExpansionLimit>,
 	skip_mac_metadata: Option<bool>,
-	password: Option<ArchivePassword>,
-) -> ExtractConfig {
-	let mut config = ExtractConfig {
-		max_bytes,
-		max_items,
-		password,
-		..ExtractConfig::default()
-	};
-	if let Some(limit) = expansion_limit {
-		config.expansion_limit = Some(limit);
+}
+
+impl ExtractSettings {
+	fn into_config(self, password: Option<ArchivePassword>) -> ExtractConfig {
+		let defaults = ExtractConfig::default();
+		ExtractConfig {
+			max_bytes: self.max_bytes,
+			max_items: self.max_items,
+			expansion_limit: self.expansion_limit.or(defaults.expansion_limit),
+			password,
+			skip_mac_metadata: self.skip_mac_metadata.unwrap_or(defaults.skip_mac_metadata),
+		}
 	}
-	if let Some(skip) = skip_mac_metadata {
-		config.skip_mac_metadata = skip;
-	}
-	config
 }
 
 /// What `compressItems` compresses, and whether the items go afterwards.

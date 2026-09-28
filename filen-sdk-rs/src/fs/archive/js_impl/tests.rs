@@ -138,7 +138,7 @@ fn names(base: &[ValidatedName]) -> Vec<&str> {
 #[test]
 fn what_a_call_leaves_out_is_the_sdks_default() {
 	let defaults = ExtractConfig::default();
-	let config = extract_config(None, None, None, None, None);
+	let config = ExtractSettings::default().into_config(None);
 	assert_eq!(
 		(
 			config.max_bytes,
@@ -157,7 +157,13 @@ fn what_a_call_leaves_out_is_the_sdks_default() {
 		ratio: 10,
 		floor: 1 << 20,
 	};
-	let config = extract_config(Some(5), Some(7), Some(limit), Some(false), None);
+	let config = ExtractSettings {
+		max_bytes: Some(5),
+		max_items: Some(7),
+		expansion_limit: Some(limit),
+		skip_mac_metadata: Some(false),
+	}
+	.into_config(None);
 	assert_eq!(
 		(
 			config.max_bytes,
