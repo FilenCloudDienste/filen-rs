@@ -18,8 +18,11 @@ use std::{
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
 use super::{
-	cp437,
+	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
+	FLAG_ENCRYPTED, FLAG_UTF8, HOST_OS_X, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES, METHOD_BZIP2,
+	METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_STORED, METHOD_XZ, METHOD_ZSTD, cp437,
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
+	method_supported,
 };
 use crate::{
 	fs::archive::{
@@ -29,19 +32,9 @@ use crate::{
 	util::SeededMap,
 };
 
-pub(crate) const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
-pub(crate) const CENTRAL_HEADER_SIG: u32 = 0x0201_4b50;
-pub(crate) const EOCD_SIG: u32 = 0x0605_4b50;
-pub(crate) const EOCD64_SIG: u32 = 0x0606_4b50;
-pub(crate) const EOCD64_LOCATOR_SIG: u32 = 0x0706_4b50;
-
-/// General-purpose flags (zip specification 4.4.4).
-pub(crate) const FLAG_ENCRYPTED: u16 = 0x0001;
-/// For LZMA: the stream ends with an end marker.
+/// For LZMA: the stream ends with an end marker (a general-purpose flag).
 const FLAG_LZMA_END_MARKER: u16 = 0x0002;
-pub(crate) const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
-pub(crate) const FLAG_UTF8: u16 = 0x0800;
 
 const EOCD_LEN: u64 = 22;
 const EOCD64_LEN: u64 = 56;
@@ -54,10 +47,6 @@ const MAX_COMMENT_LEN: u64 = 0xFFFF;
 const MAX_EOCD_CANDIDATES: usize = 16;
 /// Names kept one by one when a name is listed twice; beyond that they are counted.
 const MAX_DUPLICATE_NAMES: usize = 100;
-/// The version-made-by hosts (zip specification 4.4.2.2) whose external attributes carry a Unix
-/// mode, and whose writers store names in the system's encoding, UTF-8 by now.
-pub(crate) const HOST_UNIX: u16 = 3;
-pub(crate) const HOST_OS_X: u16 = 19;
 
 /// Why reading a zip failed, other than its source.
 #[derive(Debug, thiserror::Error)]
@@ -556,7 +545,7 @@ fn parse_central_header(
 		ZipEncryption::None
 	} else if flags & FLAG_STRONG_ENCRYPTION != 0 {
 		return Err(ZipError::Unsupported("PKWARE strong encryption"));
-	} else if method == 99 {
+	} else if method == METHOD_AES {
 		let (strength, authenticated_only, actual) =
 			aes.ok_or(ZipError::Corrupt("an AES entry without its AES field"))?;
 		method = actual;
@@ -725,19 +714,23 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 	// bytes and its authentication code) can be read to the end once it is done
 	let decrypted = Shared(Rc::new(RefCell::new(decrypted)));
 	let rest = decrypted.clone();
+	if !method_supported(entry.method, encrypted) {
+		return Err(ZipError::Unsupported(
+			if method_supported(entry.method, false) {
+				"an encrypted LZMA or XZ entry"
+			} else {
+				"a compression method"
+			},
+		));
+	}
 	let decoded: Box<dyn Read + 's> = match entry.method {
-		0 => Box::new(decrypted),
-		8 => Box::new(flate2::read::DeflateDecoder::new(decrypted)),
-		9 => Box::new(deflate64::Deflate64Decoder::new(decrypted)),
-		12 => Box::new(bzip2::read::BzDecoder::new(decrypted)),
-		// LZMA and XZ have their own memory limits, which the encrypted forms would first have to
-		// buffer around; only the plain forms are read
-		14 | 95 if encrypted => {
-			return Err(ZipError::Unsupported("an encrypted LZMA or XZ entry"));
-		}
-		14 => lzma_entry(Box::new(decrypted), entry, limits)?,
-		93 => stream_entry(StreamCodec::Zstd, decrypted, limits)?,
-		95 => stream_entry(StreamCodec::Xz, decrypted, limits)?,
+		METHOD_STORED => Box::new(decrypted),
+		METHOD_DEFLATE => Box::new(flate2::read::DeflateDecoder::new(decrypted)),
+		METHOD_DEFLATE64 => Box::new(deflate64::Deflate64Decoder::new(decrypted)),
+		METHOD_BZIP2 => Box::new(bzip2::read::BzDecoder::new(decrypted)),
+		METHOD_LZMA => lzma_entry(Box::new(decrypted), entry, limits)?,
+		METHOD_ZSTD => stream_entry(StreamCodec::Zstd, decrypted, limits)?,
+		METHOD_XZ => stream_entry(StreamCodec::Xz, decrypted, limits)?,
 		_ => return Err(ZipError::Unsupported("a compression method")),
 	};
 	let check_crc = !matches!(

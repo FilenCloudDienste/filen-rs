@@ -15,23 +15,18 @@ use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use crate::{Error, fs::archive::encode::check_level};
 
 use super::{
+	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
+	FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES, METHOD_BZIP2,
+	METHOD_DEFLATE, METHOD_STORED,
 	crypto::{AesStrength, AesWriter},
-	read::{
-		CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
-		FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG,
-	},
 };
 
 const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
-const METHOD_STORED: u16 = 0;
-const METHOD_DEFLATE: u16 = 8;
-const METHOD_BZIP2: u16 = 12;
-const METHOD_AES: u16 = 99;
 /// Made on Unix, to zip specification 6.3.
 const VERSION_MADE_BY: u16 = (HOST_UNIX << 8) | 63;
 /// An entry this large, or larger, is written with zip64 sizes: its compressed size may pass
 /// 4 GiB even though its data does not, since stored and deflated data can grow a little.
-pub(crate) const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
+pub(super) const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 
 /// How a zip entry's data is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

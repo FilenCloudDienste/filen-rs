@@ -36,7 +36,10 @@ use super::{
 			SourceFailed, WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
+			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
+			METHOD_STORED, METHOD_XZ, METHOD_ZSTD,
 			crypto::{AES_AUTH_CODE_LEN, AES_VERIFIER_LEN, CryptoError, ZIP_CRYPTO_HEADER_LEN},
+			method_supported,
 			read::{
 				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipIndex, ZipKind, ZipLimits,
 				open_entry, read_index, unaccounted_after,
@@ -292,14 +295,14 @@ fn zip_method(entry: &ZipEntry) -> Option<String> {
 		return None;
 	}
 	Some(match entry.method {
-		0 => "Stored".to_owned(),
-		8 => "Deflate".to_owned(),
-		9 => "Deflate64".to_owned(),
-		12 => "BZip2".to_owned(),
-		14 => "LZMA".to_owned(),
-		93 => "Zstd".to_owned(),
-		95 => "XZ".to_owned(),
-		98 => "PPMd".to_owned(),
+		METHOD_STORED => "Stored".to_owned(),
+		METHOD_DEFLATE => "Deflate".to_owned(),
+		METHOD_DEFLATE64 => "Deflate64".to_owned(),
+		METHOD_BZIP2 => "BZip2".to_owned(),
+		METHOD_LZMA => "LZMA".to_owned(),
+		METHOD_ZSTD => "Zstd".to_owned(),
+		METHOD_XZ => "XZ".to_owned(),
+		METHOD_PPMD => "PPMd".to_owned(),
 		other => format!("method {other}"),
 	})
 }
@@ -1033,11 +1036,7 @@ fn key_unproven(entry: &ZipEntry) -> bool {
 
 /// Whether the SDK reads the entry's compression method under its encryption.
 fn zip_supported(entry: &ZipEntry) -> bool {
-	match entry.method {
-		0 | 8 | 9 | 12 | 93 => true,
-		14 | 95 => entry.encryption == ZipEncryption::None,
-		_ => false,
-	}
+	method_supported(entry.method, entry.encryption != ZipEncryption::None)
 }
 
 /// Whether a directory entry's stored bytes are an empty stream (as `java.util.zip` and Python
@@ -1067,12 +1066,12 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	};
 	let data = entry.compressed_size.checked_sub(overhead);
 	match entry.method {
-		0 => data == Some(0),
+		METHOD_STORED => data == Some(0),
 		// an empty deflate (or deflate64) stream takes 2 bytes, too few for any literal and its
 		// block's end
-		8 | 9 => data.is_some_and(|data| data <= 2),
+		METHOD_DEFLATE | METHOD_DEFLATE64 => data.is_some_and(|data| data <= 2),
 		// an empty bzip2 stream is its 4-byte header and 10-byte end: no room for a block
-		12 => data.is_some_and(|data| data <= 14),
+		METHOD_BZIP2 => data.is_some_and(|data| data <= 14),
 		_ => false,
 	}
 }
