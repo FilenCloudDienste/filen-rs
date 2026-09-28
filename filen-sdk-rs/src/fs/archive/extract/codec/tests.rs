@@ -23,7 +23,9 @@ use crate::{
 		format::StreamCodec,
 		password::ArchivePassword,
 		sevenz::write::{SevenZEncryption, SevenZMethod},
-		test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
+		test_support::{
+			TarMember, gzip, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
+		},
 		worker,
 	},
 	fs::name::ValidatedName,
@@ -2016,4 +2018,50 @@ fn hard_links_are_looked_up_by_a_key_each_job_draws() {
 	assert_ne!(keys.of(&path), keys.of(&entry_path("docs/b.txt").unwrap()));
 	// across jobs the same path hashes apart: no archive can pick paths that collide
 	assert_ne!(keys.of(&path), LinkKeys::new().of(&path));
+}
+
+#[test]
+fn a_listed_hard_link_to_mac_metadata_is_metadata() {
+	let data = apple_double_data();
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("__MACOSX/._a.txt", &data),
+		TarMember::HardLink {
+			path: "__MACOSX/._b.txt",
+			target: "__MACOSX/._a.txt",
+		},
+		TarMember::HardLink {
+			path: "__MACOSX/copy.txt",
+			target: "a.txt",
+		},
+	]);
+	let (entries, end) = listed(
+		&tar,
+		job_of(&tar, "m.tar", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert_eq!(
+		entries
+			.iter()
+			.map(|entry| (
+				entry.stored_path.as_str(),
+				entry.mac_metadata,
+				entry.skip.clone()
+			))
+			.collect::<Vec<_>>(),
+		[
+			("a.txt", false, None),
+			(
+				"__MACOSX/._a.txt",
+				true,
+				Some(ExtractSkipReason::MacMetadata)
+			),
+			(
+				"__MACOSX/._b.txt",
+				true,
+				Some(ExtractSkipReason::MacMetadata)
+			),
+			("__MACOSX/copy.txt", false, None),
+		]
+	);
 }

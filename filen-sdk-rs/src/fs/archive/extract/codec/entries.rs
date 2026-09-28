@@ -74,7 +74,8 @@ const APPLE_DOUBLE_HEAD: [u8; 8] = [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x
 /// How an entry's path marks it as macOS metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MacShape {
-	/// A `__MACOSX` folder, or anything but a file in one: its path says it all.
+	/// A `__MACOSX` folder, or anything but a file or a hard link in one: its path says it all.
+	/// A hard link is judged as any, and left out only when the file it copies is.
 	InMacFolder,
 	/// A file in a `__MACOSX` folder or named `._name`, which an ordinary file may be too: an
 	/// AppleDouble file when its first bytes say so. A file is never left out by its path alone,
@@ -111,8 +112,10 @@ impl Found<'_> {
 			.segments
 			.first()
 			.is_some_and(|first| first.as_ref() == MAC_METADATA_DIR);
-		if self.kind != ArchiveEntryKind::File {
-			return in_mac_folder.then_some(MacShape::InMacFolder);
+		match self.kind {
+			ArchiveEntryKind::File => {}
+			ArchiveEntryKind::Hardlink { .. } => return None,
+			_ => return in_mac_folder.then_some(MacShape::InMacFolder),
 		}
 		let apple_double = in_mac_folder
 			|| path.segments.last().is_some_and(|name| {
@@ -177,6 +180,11 @@ impl<'p> Walk<'p> {
 
 	pub(super) fn listing(&self) -> bool {
 		self.listing.is_some()
+	}
+
+	/// Whether AppleDouble files are left out (see [`Verdict::Take`]).
+	pub(super) fn skips_mac_metadata(&self) -> bool {
+		self.skip_mac_metadata
 	}
 
 	/// The id of the listed archive's entry `ordinal`.
@@ -270,7 +278,11 @@ impl<'p> Walk<'p> {
 			Some(MacShape::AppleDoubleName) => {
 				(apple_double.unwrap_or(true), apple_double == Some(true))
 			}
-			None => (false, false),
+			// a hard link to metadata left out
+			None => {
+				let linked = found.unreadable == Some(ExtractSkipReason::MacMetadata);
+				(linked, false)
+			}
 		};
 		let skip = match &found.unreadable {
 			// the target is the kind's already
