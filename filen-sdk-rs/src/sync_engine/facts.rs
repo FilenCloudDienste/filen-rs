@@ -55,8 +55,8 @@ use super::{
 	observe::{LocalObservation, LocalObservations},
 	outcome::{PlannedConflict, UnsyncablePath, UnsyncableReason},
 	plan::{self, RemoteView, SyncAction},
+	rows::Baseline,
 	scan::LocalScan,
-	tree::Baseline,
 };
 
 /// Everything a pass blocks, reports or withholds, keyed by path and carried between passes.

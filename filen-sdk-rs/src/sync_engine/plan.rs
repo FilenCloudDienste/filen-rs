@@ -10,7 +10,6 @@ use std::{
 	borrow::Cow,
 	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
-	sync::Arc,
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
@@ -22,9 +21,9 @@ use super::{
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
+	rows::Baseline,
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
 	side::{Nodes, NodesAt, Side},
-	tree::Baseline,
 };
 use crate::cache::{RemoteItem, UndecodableItem};
 
@@ -2215,7 +2214,7 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// stop being path-keyed whole-tree maps.
 pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
-	baseline: &mut Arc<Baseline>,
+	baseline: &mut Baseline,
 	local: &mut Side<LocalNode>,
 	remote: &mut Side<RemoteNode>,
 	held: &BTreeSet<String>,
@@ -2232,7 +2231,7 @@ pub(crate) fn fold_dir_moves(
 		let scope = changed
 			.as_deref()
 			.map_or(PassPaths::Whole, PassPaths::Changed);
-		// An immutable reborrow, scoped so it is dead before `Arc::make_mut` below wants the
+		// An immutable reborrow, scoped so it is dead before `move_subtree` below wants the
 		// mutable one back. A carried side reads its nodes off these very rows, which is why the
 		// re-key and the row move that follows it cannot be reordered (see `Side::rekey_subtree`).
 		let action = {
@@ -2253,9 +2252,9 @@ pub(crate) fn fold_dir_moves(
 				local.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
 			}
 		}
-		// Taken by value only once a move is actually being folded: the baseline the pass reads is
-		// the store's resident copy, and a pass that folds no directory move must not clone it.
-		Arc::make_mut(baseline).move_subtree(from, to);
+		// Written only once a move is actually being folded: the rows the pass reads are shared
+		// with the store, and a pass that folds no directory move must not copy them.
+		baseline.move_subtree(from, to);
 		// The next iteration's scope, keyed like the maps and the rows this move just re-keyed.
 		// `Prepared::fold_dir_moves` does the same to the caller's copy once this returns; without
 		// it here, a move nested under this one would be looked for at a path nothing holds.
@@ -3116,7 +3115,7 @@ mod tests {
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
 		let (mut baseline, mut local, mut remote) = (
-			Arc::new(tree(baseline)),
+			tree(baseline),
 			Side::from(local.clone()),
 			Side::from(remote.clone()),
 		);
@@ -3349,7 +3348,7 @@ mod tests {
 		let (mut baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
 		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
 		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
-		let mut baseline = Arc::new(tree(&baseline));
+		let mut baseline = tree(&baseline);
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -3728,7 +3727,7 @@ mod tests {
 		let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
 		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
 		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
-		let mut baseline = Arc::new(tree(&baseline));
+		let mut baseline = tree(&baseline);
 		assert!(
 			fold_dir_moves(
 				SyncMode::TwoWay,
@@ -3750,15 +3749,12 @@ mod tests {
 		let (baseline, local, remote) = moved_tree(TreeIds::new(), "documents", "docs");
 		let scope = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
 		let (mut whole_baseline, mut whole_local, mut whole_remote) = (
-			Arc::new(tree(&baseline)),
+			tree(&baseline),
 			Side::from(local.clone()),
 			Side::from(remote.clone()),
 		);
-		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) = (
-			Arc::new(tree(&baseline)),
-			Side::from(local),
-			Side::from(remote),
-		);
+		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) =
+			(tree(&baseline), Side::from(local), Side::from(remote));
 		let by_whole = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut whole_baseline,
@@ -7526,7 +7522,7 @@ mod tests {
 		/// The case as it stands once the directory-move fold has run over it at `paths`, with the
 		/// set re-keyed exactly as `Prepared::fold_dir_moves` re-keys it, and the moves that took.
 		fn fold(case: &Case, mode: SyncMode, paths: PassPaths<'_>) -> (Case, Vec<SyncAction>) {
-			let mut baseline = Arc::new(case.baseline.clone());
+			let mut baseline = case.baseline.clone();
 			let mut local = case.local.clone();
 			let mut remote = case.remote.clone();
 			let mut decided = case.decided.clone();
@@ -7546,7 +7542,7 @@ mod tests {
 					.collect();
 			}
 			let folded = Case {
-				baseline: Arc::unwrap_or_clone(baseline),
+				baseline,
 				local,
 				remote,
 				decided,
@@ -7907,6 +7903,7 @@ mod tests {
 					out.decided.insert(upper.to_owned());
 					out.decided.remove(lower);
 					out.baseline
+						.tree_mut()
 						.upsert(&row(index_of(lower), Shape::Synced).expect("a synced row"));
 				}
 				// One spelling HELD — the cache mid-transition — and the other decided. A held

@@ -33,8 +33,8 @@ use super::{
 	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry},
 	ignore::rule_file_dir,
 	plan::{self, RemoteNode, in_quarantine, is_safe_name, join_path},
+	rows::Baseline,
 	side::{Nodes, NodesAt, Side},
-	tree::Baseline,
 };
 use crate::cache::{RemoteItem, SearchResult, hydrate_by_uuids, read_ancestors};
 
