@@ -579,10 +579,10 @@ fn a_compress_update_carries_its_active_file_and_events() {
 		phase: CompressPhase::Verifying,
 		active: vec![active.clone()],
 		events: vec![
-			compress::CompressEvent::SourceHashMismatch {
+			compress::CompressEvent::SourceHashMismatch(HashMismatch {
 				source_uuid,
 				path: "docs/a.txt".into(),
-			},
+			}),
 			compress::CompressEvent::Renamed(RenamedEntry {
 				source_uuid,
 				source_path: "/docs/A.txt".into(),

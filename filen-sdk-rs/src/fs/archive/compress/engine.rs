@@ -599,17 +599,15 @@ impl<B: DisposalBackend> Driver<B> {
 				state.file.uuid()
 			);
 			self.mismatched.insert(state.request);
-			if self.hash_mismatches.len() < MAX_REPORT_RECORDS {
-				self.hash_mismatches.push(HashMismatch {
-					source_uuid: state.file.uuid(),
-					path: state.path.clone(),
-				});
-			}
-			let event = CompressEvent::SourceHashMismatch {
+			let mismatch = HashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
 			};
-			self.reporter.event(event);
+			if self.hash_mismatches.len() < MAX_REPORT_RECORDS {
+				self.hash_mismatches.push(mismatch.clone());
+			}
+			self.reporter
+				.event(CompressEvent::SourceHashMismatch(mismatch));
 		}
 		let (source_uuid, size) = (state.file.uuid(), state.file.size());
 		self.reporter

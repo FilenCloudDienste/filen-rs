@@ -579,9 +579,7 @@ impl From<compress::CompressEvent> for CompressEvent {
 		match event {
 			Event::Skipped(entry) => Self::Skipped(entry),
 			Event::Renamed(entry) => Self::Renamed(entry),
-			Event::SourceHashMismatch { source_uuid, path } => {
-				Self::SourceHashMismatch(HashMismatch { source_uuid, path })
-			}
+			Event::SourceHashMismatch(mismatch) => Self::SourceHashMismatch(mismatch),
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))

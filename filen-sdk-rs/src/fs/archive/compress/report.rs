@@ -98,10 +98,7 @@ pub enum CompressEvent {
 	Renamed(RenamedEntry),
 	/// A source's data does not match the hash in its metadata. It is in the archive as it was
 	/// read; the source itself may be damaged.
-	SourceHashMismatch {
-		source_uuid: Uuid,
-		path: String,
-	},
+	SourceHashMismatch(HashMismatch),
 	/// What became of a source, when the sources were to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The archive was registered but could not be added to one of the destination's public
