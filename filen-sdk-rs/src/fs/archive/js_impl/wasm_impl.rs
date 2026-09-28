@@ -40,10 +40,12 @@ pub struct ExtractArchiveParams {
 	#[serde(default)]
 	#[tsify(optional)]
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// Leaves out the metadata macOS writes beside files: everything in a `__MACOSX` folder
-	/// and AppleDouble `._name` files, reported skipped for `macMetadata`. Left out on purpose,
-	/// they keep nothing from removing the archive afterwards. `true` when left out; `false`
-	/// extracts them as ordinary files.
+	/// Leaves out the metadata macOS writes beside files, reported skipped for `macMetadata`:
+	/// AppleDouble files (named `._name` or kept in a `__MACOSX` folder, told by their first
+	/// bytes), a tar's hard links to them, and the `__MACOSX` folders that hold nothing else (one
+	/// holding anything of the user's, or nothing, is created). Left out on purpose, they keep
+	/// nothing from removing the archive afterwards. `true` when left out; `false` extracts
+	/// them as ordinary files.
 	#[serde(default)]
 	#[tsify(optional)]
 	pub skip_mac_metadata: Option<bool>,
@@ -94,9 +96,11 @@ pub struct ExtractArchiveEntriesParams {
 	#[serde(default)]
 	#[tsify(optional)]
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// Leaves out the metadata macOS writes beside files: everything in a `__MACOSX` folder
-	/// and AppleDouble `._name` files, reported skipped for `macMetadata`. `true` when left
-	/// out; `false` extracts them as ordinary files.
+	/// Leaves out the metadata macOS writes beside files, reported skipped for `macMetadata`:
+	/// AppleDouble files (named `._name` or kept in a `__MACOSX` folder, told by their first
+	/// bytes), a tar's hard links to them, and the `__MACOSX` folders that hold nothing else (one
+	/// holding anything of the user's, or nothing, is created). `true` when left out; `false`
+	/// extracts them as ordinary files.
 	#[serde(default)]
 	#[tsify(optional)]
 	pub skip_mac_metadata: Option<bool>,
