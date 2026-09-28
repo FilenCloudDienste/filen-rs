@@ -56,7 +56,7 @@ use super::{
 	baseline::BaselineEntry,
 	plan::{is_under, moved_path},
 	rows::Baseline,
-	tree::at_or_under_folded,
+	scan::at_or_under_folded,
 };
 
 /// One side of a pass, addressed by path.

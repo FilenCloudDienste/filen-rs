@@ -1845,7 +1845,14 @@ pub fn run() -> String {
 			store
 				.set_state_index(indexed)
 				.expect("toggling the conflict-state index");
-			let (_, elapsed) = timed(|| store.conflicts(pair).expect("reading the conflicts"));
+			let (_, elapsed) = timed(|| {
+				if indexed {
+					store.conflicts(pair)
+				} else {
+					store.conflicts_walked(pair)
+				}
+				.expect("reading the conflicts")
+			});
 			let samples = if indexed {
 				&mut conflict_indexed
 			} else {

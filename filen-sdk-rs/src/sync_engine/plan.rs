@@ -2015,9 +2015,11 @@ fn detect_moves<'m>(
 		// Keyed by the raw bytes since `Blake3Hash` is not `std::hash::Hash`.
 		let mut created_by_hash: HashMap<[u8; 32], Vec<Cow<'m, str>>> = HashMap::new();
 		visit_move_targets(paths, local, |path, node| {
+			// The side map first: on a whole pass it is a hash lookup and the baseline is a read of
+			// the store, and almost every local file is on the remote too.
 			if node.kind == NodeKind::File
-				&& !baseline.contains_key(&path)
 				&& !remote.holds(&path)
+				&& !baseline.contains_key(&path)
 				&& let Some(hash) = node.content_hash
 			{
 				created_by_hash
@@ -7576,6 +7578,84 @@ mod tests {
 			);
 		}
 
+		/// The rows a pass reads out of the store, held to the resident tree they used to be read
+		/// out of, over every generated case: the case's own rows, then the same rows once the
+		/// directory-move fold has run over them in each mode — the fold window, with the table
+		/// still holding every moved row under its source — then a few more random moves and
+		/// confirmations on top.
+		///
+		/// The expectation is the TREE, real code given the same rows and the same edits, not an
+		/// answer this generator writes down: `rows::tests::assert_alike` asks both every question
+		/// the boundary answers, at every path either side has held, every ancestor, every folded
+		/// spelling and every string prefix that is no path prefix. The corpus is what reaches the
+		/// shapes the hand-written ones cannot enumerate: case-only collisions, `Ä`/`ä` and `İ`,
+		/// nested ignored roots, a decided path whose collision partner is not decided.
+		#[test]
+		fn the_store_backed_rows_answer_every_case_as_the_resident_tree_does() {
+			use crate::sync_engine::{rows::tests as rows, tree::Tree};
+
+			let mut seen = Coverage::default();
+			let (mut folds, mut edits) = (0, 0);
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				let held: Vec<BaselineEntry> = case.baseline.iter().collect();
+				let paths = || {
+					TREE.iter()
+						.map(|(path, _)| path.to_string())
+						.chain(case.decided.iter().cloned())
+						.chain(["moved".to_string(), "a/moved/deep".to_string()])
+				};
+				let unedited = Tree::from_rows(held.clone());
+				rows::assert_alike(
+					&format!("seed {seed}"),
+					&case.baseline,
+					&unedited,
+					&rows::probes(paths()),
+				);
+				for mode in MODES {
+					let (mut after, moves) = fold(&case, mode, PassPaths::Changed(&case.decided));
+					let mut oracle = unedited.clone();
+					for action in &moves {
+						let (from, to) = action.endpoints();
+						oracle.move_subtree(from, to);
+					}
+					folds += moves.len();
+					let mut probes = rows::probes(paths().chain(oracle.paths()));
+					rows::assert_alike(
+						&format!("seed {seed} {mode:?}, {} fold(s)", moves.len()),
+						&after.baseline,
+						&oracle,
+						&probes,
+					);
+					if mode != SyncMode::TwoWay {
+						continue;
+					}
+					let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed);
+					for step in 0..3 {
+						let (what, _) = rows::random_edit(
+							&mut rng,
+							step,
+							&mut after.baseline,
+							&mut oracle,
+							&probes,
+						);
+						edits += 1;
+						probes = rows::probes(probes.into_iter().chain(oracle.paths()));
+						rows::assert_alike(
+							&format!("seed {seed}, then {what}"),
+							&after.baseline,
+							&oracle,
+							&probes,
+						);
+					}
+				}
+			}
+			assert!(
+				folds > 100 && edits > 1_000,
+				"only {folds} fold(s) and {edits} edit(s): this tested almost nothing"
+			);
+		}
+
 		/// The fold at the pass's scope carries exactly the moves a whole-map fold carries, and
 		/// leaves the three inputs in the same shape.
 		///
@@ -7902,9 +7982,9 @@ mod tests {
 					place(&mut out.nodes, upper);
 					out.decided.insert(upper.to_owned());
 					out.decided.remove(lower);
-					out.baseline
-						.tree_mut()
-						.upsert(&row(index_of(lower), Shape::Synced).expect("a synced row"));
+					out.baseline.upsert_for_test(
+						&row(index_of(lower), Shape::Synced).expect("a synced row"),
+					);
 				}
 				// One spelling HELD — the cache mid-transition — and the other decided. A held
 				// path is always decided: what withheld it was an announcement about it.
