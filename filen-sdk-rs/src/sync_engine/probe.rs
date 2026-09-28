@@ -2142,12 +2142,9 @@ pub fn run() -> String {
 	// The widest single move a pass can fold: a whole top-level directory moved on the remote, so
 	// one action carries every row under it. Measured at both scopes over the same subtree in the
 	// same run — the remote's copy is moved to the other name before each, so the second fold
-	// carries the directory back and the three structures end where they started.
-	//
-	// The store held the other handle on the resident tree until `baseline_first_write` above took
-	// its own copy, so this detaching write is free; it is here so that a run which ever stops
-	// being true cannot charge a whole-tree clone to the fold.
-	let _ = baseline.tree_mut();
+	// carries the directory back and the three structures end where they started. The fold writes
+	// its moves as the pass's own edits beside the resident tree, never into a copy of it, so
+	// neither figure carries a whole-tree clone whoever else holds the tree.
 	let moved_root = format!("{rename_root}-moved");
 	let move_scope = BTreeSet::from([rename_root.clone(), moved_root.clone()]);
 	let mut remote_at = rename_root.clone();
