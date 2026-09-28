@@ -18,12 +18,13 @@ use lzma_rust2::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::fs::archive::format::XZ_MAGIC;
+
 use super::{
 	Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd, TRUNCATED,
 	lzma::clamp_dict,
 };
 
-const MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
 const FOOTER_MAGIC: [u8; 2] = *b"YZ";
 
 /// Memory charged per BCJ or Delta filter; their buffers are 4 KiB and 256 bytes.
@@ -91,7 +92,7 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 
 	fn read_stream_header(&mut self, input: &mut Input<R>) -> io::Result<()> {
 		let header: [u8; 12] = input.read_array()?;
-		if header[..6] != MAGIC {
+		if header[..6] != XZ_MAGIC {
 			return Err(CodecError::Corrupt("not an xz stream").into());
 		}
 		let flags = [header[6], header[7]];
@@ -312,7 +313,7 @@ impl<'a, R: Read + 'a> Read for XzDecoder<'a, R> {
 					while input.fill_to(4)?.starts_with(&[0; 4]) {
 						input.consume(4);
 					}
-					if input.fill_to(MAGIC.len())?.starts_with(&MAGIC) {
+					if input.fill_to(XZ_MAGIC.len())?.starts_with(&XZ_MAGIC) {
 						State::StreamHeader(input)
 					} else {
 						self.end = Some(StreamEnd {

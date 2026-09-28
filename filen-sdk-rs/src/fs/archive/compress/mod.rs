@@ -15,7 +15,6 @@ mod engine;
 mod read_back;
 mod report;
 
-pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use client_impl::{CompressConfig, CompressRequest};
 pub use report::{
 	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
@@ -28,7 +27,10 @@ use filen_macros::js_type;
 
 use crate::{
 	Error, ErrorKind,
-	fs::categories::{NonRootItemType, Normal},
+	fs::{
+		archive::dispose::SourceDisposal,
+		categories::{NonRootItemType, Normal},
+	},
 };
 
 pub use super::{

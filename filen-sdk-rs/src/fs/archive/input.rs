@@ -480,7 +480,10 @@ mod tests {
 		consts::CHUNK_SIZE,
 		fs::{
 			archive::{
-				extract::{ArchiveTotals, ExtractCallback, ExtractUpdate, ExtractedTopLevel},
+				extract::{
+					ArchiveTotals, ExtractCallback, ExtractUpdate, ExtractedTopLevel,
+					report::Reporter as ExtractReporter,
+				},
 				test_support::{pattern, remote_file},
 			},
 			drive_job::test_support::FakeBackend,
@@ -525,10 +528,7 @@ mod tests {
 		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
 		backend.contents.insert(archive.uuid(), bytes);
 		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive));
-		let reporter = crate::fs::archive::extract::report::Reporter::new(
-			Ignore,
-			ArchiveTotals::Streaming { archive_bytes: 0 },
-		);
+		let reporter = ExtractReporter::new(Ignore, ArchiveTotals::Streaming { archive_bytes: 0 });
 		let ops = reporter.ops();
 		// a zip's head, then its index at the end: nothing fetched ahead of either
 		assert_eq!(read(&mut input, &ops, 0).await, 1);

@@ -10,8 +10,10 @@ use lzma_rust2::{
 	CheckType, FilterConfig, LzipOptions, LzipWriter, LzmaOptions, LzmaWriter, XzOptions, XzWriter,
 };
 
+use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+
 use super::*;
-use crate::fs::archive::test_support::gzip;
+use crate::fs::archive::{alloc_meter::peak_bytes, test_support::gzip};
 
 const MIB_USIZE: usize = 1024 * 1024;
 const MIB: u64 = MIB_USIZE as u64;
@@ -94,7 +96,7 @@ fn lz4(data: &[u8], info: FrameInfo) -> Vec<u8> {
 const ZSTD_INVALID: &str = "invalid zstd data";
 
 fn zstd(data: &[u8]) -> Vec<u8> {
-	ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+	compress_to_vec(data, CompressionLevel::Fastest)
 }
 
 /// A zstd frame of raw blocks, written by hand: a window of `1 << window_log` bytes, the content
@@ -624,8 +626,7 @@ fn a_zstd_window_is_charged_before_it_is_allocated() {
 	// a 64 MiB window's ring needs 192 MiB at its peak: refused under a 64 MiB budget, without
 	// allocating for it
 	let frame = zstd_raw_frame(b"small", 26, false, None);
-	let (result, peak) =
-		crate::fs::archive::alloc_meter::peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
+	let (result, peak) = peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
 	assert!(matches!(
 		codec_err(result),
 		CodecError::OverBudget { limit } if limit == BUDGET
@@ -659,7 +660,7 @@ impl Write for Hashed {
 /// Decodes `bytes` under the heap meter: the decoded length and CRC-32, and the decoder's peak.
 fn zstd_peak(bytes: &[u8]) -> ((u64, u32), u64) {
 	let mut hashed = Hashed::default();
-	let ((), peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
+	let ((), peak) = peak_bytes(|| {
 		let mut decoder = open_stream(StreamCodec::Zstd, bytes, 512 * MIB).unwrap();
 		io::copy(&mut decoder, &mut hashed).unwrap();
 	});
@@ -745,8 +746,7 @@ fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
 	// may decode to 128 KiB at most
 	let frame = zstd_crafted_frame(10, &zstd_sequences_block(1000, 0));
 	assert_eq!(frame.len(), 2028);
-	let (result, peak) =
-		crate::fs::archive::alloc_meter::peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
+	let (result, peak) = peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
 	assert_eq!(corrupt(result), ZSTD_INVALID);
 	assert!(peak < 4 * MIB, "took {peak} bytes");
 
@@ -774,9 +774,8 @@ fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
 	let rle = 1 | 0b11 << 2 | (size << 4);
 	let mut block = rle.to_le_bytes()[..3].to_vec();
 	block.extend_from_slice(&[b'x', 0]);
-	let (result, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
-		decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET)
-	});
+	let (result, peak) =
+		peak_bytes(|| decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET));
 	assert_eq!(corrupt(result), ZSTD_INVALID);
 	assert!(peak < MIB, "took {peak} bytes");
 }
@@ -798,9 +797,8 @@ fn zstd_huffman_literals_stop_at_their_stated_size() {
 	block.extend(std::iter::repeat_n(0xFF, 4 * STREAM));
 	// no sequences
 	block.push(0);
-	let (result, peak) = crate::fs::archive::alloc_meter::peak_bytes(|| {
-		decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET)
-	});
+	let (result, peak) =
+		peak_bytes(|| decode(StreamCodec::Zstd, &zstd_crafted_frame(10, &block), BUDGET));
 	assert_eq!(corrupt(result), ZSTD_INVALID);
 	assert!(peak < 512 * 1024, "took {peak} bytes");
 }

@@ -3,7 +3,7 @@
 
 use std::{
 	collections::{BTreeMap, HashMap, HashSet},
-	io::Write,
+	io::{Cursor, Write},
 	sync::{Mutex, atomic::Ordering},
 	time::Duration,
 };
@@ -33,8 +33,12 @@ use crate::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 			extract::ExtractFailure,
 			format::StreamCodec,
+			limits::display_path,
 			password::ArchivePassword,
-			sevenz::write::{SevenZEncryption, SevenZMethod},
+			sevenz::{
+				crypto::MAX_CYCLES_POWER,
+				write::{SevenZEncryption, SevenZMethod},
+			},
 			test_support::{
 				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
 				zip_of,
@@ -1908,7 +1912,7 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 		.windows(aes.len())
 		.rposition(|window| window == aes)
 		.expect("the header's AES coder");
-	archive[at + 5] = 0xC0 | crate::fs::archive::sevenz::crypto::MAX_CYCLES_POWER;
+	archive[at + 5] = 0xC0 | MAX_CYCLES_POWER;
 	// the start header's CRC-32 of the header, then its own
 	let next =
 		32 + usize::try_from(u64::from_le_bytes(archive[12..20].try_into().unwrap())).unwrap();
@@ -2015,8 +2019,7 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 		5,
 		"only the items the report keeps no record of are fetched"
 	);
-	let propagated: std::collections::HashSet<Uuid> =
-		log.propagated_trees.iter().copied().collect();
+	let propagated: HashSet<Uuid> = log.propagated_trees.iter().copied().collect();
 	let kept: Vec<Uuid> = report.top_level.iter().map(|top| top.item.uuid()).collect();
 	assert!(
 		kept.iter()
@@ -2402,7 +2405,7 @@ async fn a_pause_leaves_no_directory_uncreated() {
 	})
 	.await;
 	// a moment of the creates' ten seconds, for the driver to take the archive's end
-	tokio::time::sleep(Duration::from_secs(1)).await;
+	sleep(Duration::from_secs(1)).await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert!(!job.running.is_finished(), "the rest are created on resume");
@@ -2774,7 +2777,7 @@ async fn a_hard_link_is_extracted_as_a_copy_of_the_file_it_names() {
 
 /// A hard link at `path` to the file sent at `target`, as the codec sends it.
 fn link_entry(ordinal: u64, path: &str, target: &str) -> WorkerEvent {
-	let (shown, truncated) = crate::fs::archive::limits::display_path(path);
+	let (shown, truncated) = display_path(path);
 	WorkerEvent::Link(Box::new(LinkHead {
 		ordinal,
 		path: entry_path(path).unwrap(),
@@ -3116,7 +3119,7 @@ fn zip_of_scattered_symlinks(runs: usize, per_run: usize) -> Vec<u8> {
 	const CENTRAL_HEADER_LEN: usize = 46;
 	let stored = zip8::write::SimpleFileOptions::default()
 		.compression_method(zip8::CompressionMethod::Stored);
-	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let mut writer = zip8::ZipWriter::new(Cursor::new(Vec::new()));
 	for run in 0..runs {
 		for link in 0..per_run {
 			writer

@@ -304,20 +304,63 @@ pub(crate) fn kept_on_early_end(sources: &[Uuid], cancelled: bool) -> Vec<Source
 		.iter()
 		.map(|&uuid| SourceDisposition {
 			uuid,
-			outcome: kept(reason.clone()),
+			outcome: DisposalOutcome::kept(reason.clone()),
 		})
 		.collect()
 }
 
-fn kept(reason: KeptReason) -> DisposalOutcome {
-	DisposalOutcome::Kept {
-		reason,
-		bytes_freed: 0,
+impl DisposalOutcome {
+	/// Kept for `reason`, before anything of it was deleted.
+	pub(crate) fn kept(reason: KeptReason) -> Self {
+		Self::Kept {
+			reason,
+			bytes_freed: 0,
+		}
 	}
 }
 
+/// How a job's sources nest, as [`nesting`] tells it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Nesting {
+	/// The source each one is removed with: the outermost of those it lies within, or itself.
+	pub(crate) outermost: Vec<usize>,
+	/// Whether it lies on or behind a chain of sources that loops back on itself.
+	pub(crate) cyclic: Vec<bool>,
+}
+
+/// How sources nest, from the source each one lies directly `within` (if any): a source inside
+/// another goes with that one, whose removal removes it. A move between two folders' listings
+/// can leave each read holding the other: a chain like that has no outermost source, so every
+/// source on or behind it goes with itself, and is marked cyclic.
+pub(crate) fn nesting(within: &[Option<usize>]) -> Nesting {
+	let cyclic: Vec<bool> = (0..within.len())
+		.map(|source| {
+			let mut outer = source;
+			for _ in 0..within.len() {
+				match within[outer] {
+					Some(next) => outer = next,
+					None => return false,
+				}
+			}
+			true
+		})
+		.collect();
+	// the chains left are acyclic: none reaches a cyclic source, or it would be one
+	let outermost = (0..within.len())
+		.map(|mut outer| {
+			while !cyclic[outer]
+				&& let Some(next) = within[outer]
+			{
+				outer = next;
+			}
+			outer
+		})
+		.collect();
+	Nesting { outermost, cyclic }
+}
+
 fn failed(error: Error) -> DisposalOutcome {
-	kept(KeptReason::Failed {
+	DisposalOutcome::kept(KeptReason::Failed {
 		error: Arc::new(error),
 	})
 }
@@ -334,10 +377,10 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	let state = match control.until_stopping(backend.file_state(file.uuid)).await {
 		Ok(Ok(state)) => state,
 		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return kept(KeptReason::Interrupted),
+		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 	};
 	if !file.matches(&state) {
-		return kept(KeptReason::Changed);
+		return DisposalOutcome::kept(KeptReason::Changed);
 	}
 	if how == SourceDisposal::DeletePermanently {
 		match control
@@ -345,13 +388,13 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 			.await
 		{
 			Ok(Ok(false)) => {}
-			Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+			Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
 			Ok(Err(error)) => return failed(error),
-			Err(Stopped) => return kept(KeptReason::Interrupted),
+			Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 		}
 	}
 	if control.is_stopping() {
-		return kept(KeptReason::Interrupted);
+		return DisposalOutcome::kept(KeptReason::Interrupted);
 	}
 	let removed = match how {
 		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
@@ -382,9 +425,9 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 ) -> DisposalOutcome {
 	match control.until_stopping(backend.list_tree(dir)).await {
 		Ok(Ok(listed)) if listed == *read => {}
-		Ok(Ok(_)) => return kept(KeptReason::Changed),
+		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),
 		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return kept(KeptReason::Interrupted),
+		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 	}
 	let mut bytes_freed = 0;
 	// once files are deleted, whatever stops the removal leaves them deleted: every outcome says
@@ -402,9 +445,9 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 				.await
 			{
 				Ok(Ok(false)) => {}
-				Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+				Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
 				Ok(Err(error)) => return failed(error),
-				Err(Stopped) => return kept(KeptReason::Interrupted),
+				Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 			}
 		}
 		for (&uuid, &size) in &read.files {
@@ -448,5 +491,45 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 			},
 			bytes_freed,
 		),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_source_goes_with_the_outermost_one_it_lies_within() {
+		// 2 in 1 in 0, and 3 on its own
+		assert_eq!(
+			nesting(&[None, Some(0), Some(1), None]),
+			Nesting {
+				outermost: vec![0, 0, 0, 3],
+				cyclic: vec![false; 4],
+			}
+		);
+		// 0 and 1 in each other, 2 in 1, 3 on its own: the loop and what is behind it go alone
+		assert_eq!(
+			nesting(&[Some(1), Some(0), Some(1), None]),
+			Nesting {
+				outermost: vec![0, 1, 2, 3],
+				cyclic: vec![true, true, true, false],
+			}
+		);
+		// a source within itself is a loop too
+		assert_eq!(
+			nesting(&[Some(0)]),
+			Nesting {
+				outermost: vec![0],
+				cyclic: vec![true],
+			}
+		);
+		assert_eq!(
+			nesting(&[]),
+			Nesting {
+				outermost: vec![],
+				cyclic: vec![],
+			}
+		);
 	}
 }

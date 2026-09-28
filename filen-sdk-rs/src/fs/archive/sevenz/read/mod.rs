@@ -47,6 +47,8 @@ const ZSTD_ID: u64 = 0x04F7_1101;
 /// window is charged against what the folder's other coders leave of the budget once its
 /// frame's header is read, as a zstd stream carries it nowhere else.
 const ZSTD_BASE_BYTES: u64 = 4 << 20;
+/// The size under which a reparse point's data may be a link's, as 7-Zip reads it.
+const REPARSE_LINK_MAX: u64 = 1 << 12;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SevenZLimits {
@@ -1566,9 +1568,6 @@ pub(crate) fn wrong_key(error: SevenZError) -> SevenZError {
 		error => error,
 	}
 }
-
-/// The size under which a reparse point's data may be a link's, as 7-Zip reads it.
-pub(crate) const REPARSE_LINK_MAX: u64 = 1 << 12;
 
 /// The target of the Windows link whose REPARSE_DATA_BUFFER is `data`: a symlink's or a
 /// junction's print name, or else its substitute name less the NT `\??\` prefix. `None` for

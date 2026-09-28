@@ -1,6 +1,8 @@
-//! Runs an extraction of a streaming archive: the async driver of the codec worker. It fetches
-//! the archive for the codec, creates the directories and uploads the files the codec reads out
-//! of it, in archive order, and registers each file once its data is up.
+//! Runs an extraction of an archive of any format (a tar, compressed or not, a single compressed
+//! file, a zip or a 7z): the async driver of the codec worker. It feeds the codec the archive,
+//! creates the directories and uploads the files the codec reads out of it, in the order the
+//! codec reads them, copies a tar's hard links from the files they name, and registers each file
+//! once its data is up.
 //!
 //! # Memory and progress
 //!
@@ -440,10 +442,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 	// ended before anything was extracted: the archive to remove is kept
 	let fail = |mut report: ExtractReport, phase, error| {
 		if disposal_requested {
-			let cancelled = phase == ExtractPhase::Cancelled;
-			for disposition in kept_on_early_end(&[archive_uuid], cancelled) {
-				report_disposition(&reporter, &mut report, disposition);
-			}
+			report_kept_on_early_end(&reporter, &mut report, archive_uuid, phase);
 		}
 		reporter.finish(phase);
 		ExtractFailed {
@@ -549,14 +548,22 @@ fn report_disposition(
 	report.dispositions.push(disposition);
 }
 
-/// Records `failure` in `report`; the event's copy of it, while the report keeps records.
-fn record_failure(report: &mut ExtractReport, failure: ExtractFailure) -> Option<ExtractFailure> {
-	keep(
-		&mut report.failures,
-		&mut report.omitted.failures,
-		failure.clone(),
-	)
-	.then_some(failure)
+/// Records and tells that the archive to remove is kept by a job that ended early, in `phase`.
+fn report_kept_on_early_end(
+	reporter: &Reporter,
+	report: &mut ExtractReport,
+	archive: Uuid,
+	phase: ExtractPhase,
+) {
+	for disposition in kept_on_early_end(&[archive], phase == ExtractPhase::Cancelled) {
+		report_disposition(reporter, report, disposition);
+	}
+}
+
+/// Records `record` in `list`, or counts it in `omitted` past the records a report keeps (see
+/// [`keep`]); `record` back for its event while the report keeps them.
+fn record<T: Clone>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> Option<T> {
+	keep(list, omitted, record.clone()).then_some(record)
 }
 
 /// Records `file` as failed at `stage`, in `report` and as an event, to be tried again as
@@ -581,7 +588,7 @@ fn report_file_failure<U>(
 	reporter.file_failed(
 		Some(file.active.dest_uuid),
 		file.bytes(),
-		record_failure(report, failure),
+		record(&mut report.failures, &mut report.omitted.failures, failure),
 	);
 }
 
@@ -617,25 +624,21 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		// the archive to remove was not touched: say so, rather than leave its disposition out
 		if self.dispose.is_some() && self.report.dispositions.is_empty() {
-			let dispositions = if result.is_ok() {
+			let archive = self.archive.uuid();
+			if result.is_ok() {
 				// only an archive in the trash is not removed after a complete extraction
 				let reason = if self.complete(self.reporter.counts()) {
 					KeptReason::Changed
 				} else {
 					KeptReason::Incomplete
 				};
-				vec![SourceDisposition {
-					uuid: self.archive.uuid(),
-					outcome: DisposalOutcome::Kept {
-						reason,
-						bytes_freed: 0,
-					},
-				}]
-			} else {
-				kept_on_early_end(&[self.archive.uuid()], phase == ExtractPhase::Cancelled)
-			};
-			for disposition in dispositions {
+				let disposition = SourceDisposition {
+					uuid: archive,
+					outcome: DisposalOutcome::kept(reason),
+				};
 				report_disposition(&self.reporter, &mut self.report, disposition);
+			} else {
+				report_kept_on_early_end(&self.reporter, &mut self.report, archive, phase);
 			}
 		}
 		if result.is_err() {
@@ -1122,18 +1125,18 @@ impl<B: DisposalBackend> Driver<B> {
 		name: &ValidatedName,
 		reason: ExtractRenameReason,
 	) {
-		let record = ExtractRenamedEntry {
+		let renamed = ExtractRenamedEntry {
 			entry,
 			path,
 			name: name.as_ref().to_owned(),
 			reason,
 		};
-		if keep(
+		if let Some(renamed) = record(
 			&mut self.report.renamed,
 			&mut self.report.omitted.renamed,
-			record.clone(),
+			renamed,
 		) {
-			self.reporter.event(ExtractEvent::Renamed(record));
+			self.reporter.event(ExtractEvent::Renamed(renamed));
 		}
 	}
 
@@ -1156,19 +1159,19 @@ impl<B: DisposalBackend> Driver<B> {
 		if member.reason == ExtractSkipReason::MacMetadata {
 			self.left_out += 1;
 		}
-		let record = ExtractSkippedEntry {
+		let skipped = ExtractSkippedEntry {
 			entry: self.entry_id(member.ordinal),
 			path: member.path,
 			path_truncated: member.path_truncated,
 			bytes: member.bytes,
 			reason: member.reason,
 		};
-		let kept = keep(
+		let kept = record(
 			&mut self.report.skipped,
 			&mut self.report.omitted.skipped,
-			record.clone(),
+			skipped,
 		);
-		self.reporter.skipped(member.bytes, kept.then_some(record));
+		self.reporter.skipped(member.bytes, kept);
 	}
 
 	fn on_entry(&mut self, head: EntryHead) {
@@ -1208,16 +1211,17 @@ impl<B: DisposalBackend> Driver<B> {
 			);
 		}
 		if path.suspicious {
-			let record = ExtractMisleadingName {
+			let misleading = ExtractMisleadingName {
 				entry,
 				path: joined,
 			};
-			if keep(
+			if let Some(misleading) = record(
 				&mut self.report.misleading_names,
 				&mut self.report.omitted.misleading_names,
-				record.clone(),
+				misleading,
 			) {
-				self.reporter.event(ExtractEvent::MisleadingName(record));
+				self.reporter
+					.event(ExtractEvent::MisleadingName(misleading));
 			}
 		}
 	}
@@ -1555,8 +1559,11 @@ impl<B: DisposalBackend> Driver<B> {
 					retry: Some(self.retry(self.dirs[dir].parent)),
 					error: Arc::clone(&error),
 				};
-				self.reporter
-					.dir_failed(record_failure(&mut self.report, failure));
+				self.reporter.dir_failed(record(
+					&mut self.report.failures,
+					&mut self.report.omitted.failures,
+					failure,
+				));
 				self.fail_subtree(dir, &error);
 			}
 		}
@@ -2028,31 +2035,26 @@ impl<B: DisposalBackend> Driver<B> {
 				let stage = ExtractStage::RegisteredAsVersion {
 					existing_file: registered.stable_uuid.into(),
 				};
-				let retry = self.file_retry(&file);
-				report_file_failure(
-					&mut self.report,
-					&self.reporter,
-					&file,
-					stage,
-					error.into(),
-					retry,
-				);
+				self.finalize_failed(&file, stage, Arc::new(error));
 			}
 			Err(FinalizeError::Failed(error)) => {
 				self.link_target_failed(ordinal);
 				let error = Arc::new(error);
 				self.note_error(&error);
-				let retry = self.file_retry(&file);
-				report_file_failure(
-					&mut self.report,
-					&self.reporter,
-					&file,
-					ExtractStage::Finalize,
-					error,
-					retry,
-				);
+				self.finalize_failed(&file, ExtractStage::Finalize, error);
 			}
 		}
+	}
+
+	/// Reports `file`, which could not be registered, as failed at `stage`.
+	fn finalize_failed(
+		&mut self,
+		file: &FileSlot<B::Upload>,
+		stage: ExtractStage,
+		error: Arc<Error>,
+	) {
+		let retry = self.file_retry(file);
+		report_file_failure(&mut self.report, &self.reporter, file, stage, error, retry);
 	}
 
 	/// Whether every entry the archive holds is extracted: none failed, and none skipped but the
@@ -2063,10 +2065,7 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Removes the archive if the extraction is verified; what became of it.
 	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
-		let kept = |reason| DisposalOutcome::Kept {
-			reason,
-			bytes_freed: 0,
-		};
+		let kept = DisposalOutcome::kept;
 		let counts = self.reporter.counts();
 		if !self.complete(counts) {
 			return kept(KeptReason::Incomplete);

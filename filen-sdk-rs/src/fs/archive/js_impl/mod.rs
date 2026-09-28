@@ -51,6 +51,7 @@ use super::{
 		CompressPhase, CompressRequest, CompressSources, HashMismatch,
 	},
 	dispose::{self, SourceDisposal},
+	entry_path::joined,
 	extract::{
 		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
@@ -486,12 +487,7 @@ impl From<extract::ExtractRetry> for ExtractRetry {
 		Self {
 			destination: retry.destination.uuid(),
 			destination_dir: retry.destination.into(),
-			base: retry
-				.base
-				.iter()
-				.map(AsRef::as_ref)
-				.collect::<Vec<&str>>()
-				.join("/"),
+			base: joined(&retry.base),
 		}
 	}
 }
