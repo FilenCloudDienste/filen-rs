@@ -757,6 +757,7 @@ mod tests {
 	use std::io::{Seek, SeekFrom};
 
 	use super::*;
+	use crate::fs::archive::test_support::pattern;
 
 	/// Runs `read` on a codec worker over a source of `len` bytes, answering every ask; the chunk
 	/// indices asked for, and what `read` returned.
@@ -764,6 +765,7 @@ mod tests {
 		len: u64,
 		read: impl FnOnce(&WorkerPort) -> Result<R, Error> + Send + 'static,
 	) -> (Vec<u64>, Result<R, Error>) {
+		let source = pattern(usize::try_from(len).unwrap(), 0);
 		let mut link = start(move |port| read(&port)).unwrap();
 		let mut asked = Vec::new();
 		while let Some(event) = link.events.recv().await {
@@ -771,9 +773,11 @@ mod tests {
 				panic!("the reader only asks, sent {event:?}");
 			};
 			asked.push(index);
-			let start = index * CHUNK_SIZE_U64;
-			let end = (start + CHUNK_SIZE_U64).min(len);
-			let _ = reply.send(Ok((start..end).map(|at| (at % 251) as u8).collect()));
+			let chunk = source
+				.chunks(CHUNK_SIZE)
+				.nth(usize::try_from(index).unwrap())
+				.unwrap();
+			let _ = reply.send(Ok(chunk.to_vec()));
 		}
 		(asked, (&mut link.done).await.unwrap())
 	}

@@ -1,15 +1,8 @@
 //! The driver against the fake drive, with the real codec on its thread; the archive the fake
 //! received is put back together and read with the SDK's own decoders.
 
-use std::{
-	borrow::Cow,
-	collections::BTreeMap,
-	io::Read,
-	sync::{Mutex, atomic::Ordering},
-	time::Duration,
-};
+use std::{borrow::Cow, collections::BTreeMap, io::Read, sync::Mutex, time::Duration};
 
-use chrono::Utc;
 use tokio::{
 	sync::{Semaphore, mpsc},
 	task::JoinHandle,
@@ -18,12 +11,11 @@ use tokio::{
 use super::*;
 use crate::{
 	consts::CHUNK_SIZE,
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName,
 		archive::{
 			compress::{
-				CompressFormat, CompressUpdate, RunState,
+				CompressFormat, CompressUpdate,
 				codec::{ArchiveEntry, CompressJob, compress},
 				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
@@ -41,7 +33,7 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			tar_iter::TarReader,
-			test_support::pattern,
+			test_support::{hash, pattern, remote_file},
 			worker::ARCHIVE_STALL_TIMEOUT,
 			worker::{self, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
@@ -52,12 +44,12 @@ use crate::{
 			plan::{PlanTotals, SkipReason, SkippedEntry},
 			test_support::{FakeBackend, Quirk, Request, wait_until},
 		},
-		file::{
-			AnonymousRemoteFile, RemoteFile,
-			meta::{DecryptedFileMeta, FileMeta},
-		},
+		file::RemoteFile,
 	},
-	job::{report::JobState, test_support::controls},
+	job::{
+		report::{JobState, RunState},
+		test_support::{controls, settled_run_states},
+	},
 };
 
 #[derive(Default)]
@@ -119,36 +111,13 @@ impl Recorder {
 	fn last(&self) -> CompressUpdate {
 		self.updates.lock().unwrap().last().unwrap().clone()
 	}
-}
 
-fn source_file(name: &str, bytes: &[u8], hash: Option<Blake3Hash>) -> RemoteFileType<'static> {
-	let size = bytes.len() as u64;
-	let meta = FileMeta::Decoded(DecryptedFileMeta {
-		name: Cow::Owned(name.to_owned()),
-		size,
-		mime: Cow::Borrowed("application/octet-stream"),
-		key: FileKey::V3(EncryptionKey::generate()),
-		last_modified: Utc::now(),
-		created: None,
-		hash,
-	});
-	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		Uuid::new_v4(),
-		(),
-		Uuid::new_v4().into(),
-		size,
-		size.div_ceil(CHUNK_SIZE_U64),
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		meta,
-	);
-	RemoteFileType::File(Cow::Owned(file))
-}
-
-fn hash_of(data: &[u8]) -> Option<Blake3Hash> {
-	Some(Blake3Hash::from(blake3::hash(data)))
+	/// The run states the callback saw, each change once; a pause may be complete before an
+	/// update shows it pausing, so pausing is left out.
+	fn run_states(&self) -> Vec<RunState> {
+		let updates = self.updates.lock().unwrap();
+		settled_run_states(updates.iter().map(|update| update.run_state))
+	}
 }
 
 /// A directory with two files, one over a chunk, and a file at the top.
@@ -170,8 +139,27 @@ struct Setup {
 	reader: Mutex<Option<StartReadBack>>,
 }
 
+/// The job's destination, and the folder the sources were read from.
+const DESTINATION: Uuid = Uuid::from_u128(0xD0);
+const SOURCES_PARENT: Uuid = Uuid::from_u128(0x50);
+
+/// The sources' uuids, `a.txt`'s, `big.bin`'s and `top.txt`'s, in the order they sort in.
+const SOURCE_UUIDS: [Uuid; 3] = [
+	Uuid::from_u128(0x5A),
+	Uuid::from_u128(0x5B),
+	Uuid::from_u128(0x5C),
+];
+
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
-	let destination = Uuid::new_v4();
+	setup_with(SOURCE_UUIDS, configure)
+}
+
+/// A [`Setup`] whose sources have `uuids`.
+fn setup_with(
+	uuids: [Uuid; 3],
+	configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>]),
+) -> Setup {
+	let destination = DESTINATION;
 	let contents = vec![
 		b"alpha".to_vec(),
 		pattern(CHUNK_SIZE + 77, 3),
@@ -181,7 +169,11 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 	let files: Vec<RemoteFileType<'static>> = contents
 		.iter()
 		.zip(paths)
-		.map(|(data, path)| source_file(path.rsplit('/').next().unwrap(), data, hash_of(data)))
+		.zip(uuids)
+		.map(|((data, path), uuid)| {
+			let name = path.rsplit('/').next().unwrap();
+			remote_file(uuid, SOURCES_PARENT, name, data, Some(hash(data)))
+		})
 		.collect();
 	let mut backend = FakeBackend::new(destination);
 	backend.quirks.insert(Quirk::KeepUploads);
@@ -373,20 +365,6 @@ fn members(archive: &[u8], codec: Option<StreamCodec>) -> Vec<(String, Vec<u8>)>
 	members
 }
 
-fn assert_released(setup: &Setup, reporter: &Reporter) {
-	assert_eq!(
-		setup.backend.memory.available_permits(),
-		setup.backend.budget,
-		"every memory reservation is released"
-	);
-	assert_eq!(
-		setup.backend.live_locks.load(Ordering::SeqCst),
-		0,
-		"no drive lock is held"
-	);
-	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compresses_the_sources_into_one_new_file() {
 	let setup = setup(|backend, _| {
@@ -454,7 +432,7 @@ async fn compresses_the_sources_into_one_new_file() {
 		job.recorder.events().is_empty(),
 		"every source matched its hash"
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -482,7 +460,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		})
 		.collect();
 	assert_eq!(mismatched, ["top.txt"]);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,9 +478,9 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
 	assert!(failed.report.archive.is_none());
 	assert!(setup_storage.backend.log().finished.is_empty());
-	assert_released(&setup_storage, &job.reporter);
+	setup_storage.backend.assert_released(&job.reporter);
 	// ended by an error, not cancelled
-	assert_eq!(run_states(&job.recorder), [RunState::Running]);
+	assert_eq!(job.recorder.run_states(), [RunState::Running]);
 
 	// a source that cannot be read
 	let setup_fetch = setup(|backend, _| {
@@ -520,7 +498,7 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Server);
 	assert!(setup_fetch.backend.log().finished.is_empty());
-	assert_released(&setup_fetch, &job.reporter);
+	setup_fetch.backend.assert_released(&job.reporter);
 
 	// a cancel while the archive is uploading
 	let setup_cancel = setup(|backend, _| {
@@ -545,7 +523,7 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
 	assert!(setup_cancel.backend.log().finished.is_empty());
 	assert_eq!(job.recorder.last().phase, CompressPhase::Cancelled);
-	assert_released(&setup_cancel, &job.reporter);
+	setup_cancel.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -563,7 +541,7 @@ async fn a_silent_codec_is_given_up_on() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWorkerDied);
 	assert!(setup.backend.log().finished.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -600,7 +578,7 @@ async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -611,9 +589,12 @@ struct Placed {
 	docs: Uuid,
 }
 
+/// Where [`place`] puts the sources.
+const PLACED_PARENT: Uuid = Uuid::from_u128(0x70);
+const PLACED_DOCS: Uuid = Uuid::from_u128(0x71);
+
 fn place(setup: &Setup) -> Placed {
-	let parent = Uuid::new_v4();
-	let docs = Uuid::new_v4();
+	let (parent, docs) = (PLACED_PARENT, PLACED_DOCS);
 	setup.backend.place_dir(docs, parent);
 	for (index, (_, file)) in setup.sources.iter().enumerate() {
 		let at = if index < 2 { docs } else { parent };
@@ -668,7 +649,7 @@ async fn compress_disposing(
 		report,
 	);
 	let report = job.running.await.unwrap().unwrap();
-	assert_released(setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	report
 }
 
@@ -752,7 +733,9 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	let setup = setup(|_, _| {});
 	let placed = place(&setup);
 	// a file arrived in the directory after it was read
-	setup.backend.place_file(Uuid::new_v4(), placed.docs, 10);
+	setup
+		.backend
+		.place_file(Uuid::from_u128(0x7A), placed.docs, 10);
 	let disposal = CompressDisposal {
 		how: SourceDisposal::DeletePermanently,
 		targets: targets(&setup, &placed),
@@ -867,7 +850,7 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 			source_path: "docs/secret".into(),
 			bytes: 1,
 			reason: SkipReason::UndecryptableFile {
-				uuid: Uuid::new_v4(),
+				uuid: Uuid::from_u128(0x5E),
 			},
 		}],
 		..CompressReport::default()
@@ -974,7 +957,7 @@ async fn a_7z_uploads_its_first_chunk_last() {
 			"{method:?}"
 		);
 		assert_eq!(report.counts.files_done, 3);
-		assert_released(&setup, &job.reporter);
+		setup.backend.assert_released(&job.reporter);
 	}
 }
 
@@ -1173,20 +1156,13 @@ fn run_disposal(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 	// a.txt comes last in the folder's (uuid) order, and the removal stops at the second file
-	let setup = loop {
-		let setup = setup(|backend, files| {
-			backend
-				.fail_deletes_of
-				.insert(files[1].uuid().max(files[2].uuid()));
-		});
-		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
-		if ids[0] > ids[1] && ids[0] > ids[2] {
-			break setup;
-		}
-	};
+	let [a, big, top] = SOURCE_UUIDS;
+	let setup = setup_with([top, a, big], |backend, files| {
+		backend.fail_deletes_of.insert(files[2].uuid());
+	});
 	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
-	let docs = Uuid::new_v4();
-	setup.backend.place_dir(docs, Uuid::new_v4());
+	let docs = PLACED_DOCS;
+	setup.backend.place_dir(docs, PLACED_PARENT);
 	for file in [&a, &big, &top] {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
@@ -1221,20 +1197,12 @@ async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_a_partial_removal_took_is_reported_removed() {
 	// a.txt comes first in the folder's (uuid) order, and the removal stops at the last file
-	let setup = loop {
-		let setup = setup(|backend, files| {
-			backend
-				.fail_deletes_of
-				.insert(files[1].uuid().max(files[2].uuid()));
-		});
-		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
-		if ids[0] < ids[1] && ids[0] < ids[2] {
-			break setup;
-		}
-	};
+	let setup = setup(|backend, files| {
+		backend.fail_deletes_of.insert(files[2].uuid());
+	});
 	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
-	let docs = Uuid::new_v4();
-	setup.backend.place_dir(docs, Uuid::new_v4());
+	let docs = PLACED_DOCS;
+	setup.backend.place_dir(docs, PLACED_PARENT);
 	for file in [&a, &big, &top] {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
@@ -1281,7 +1249,7 @@ async fn a_file_a_partial_removal_took_is_reported_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folders_whose_reads_hold_each_other_are_kept() {
 	let setup = setup(|_, _| {});
-	let [x, y] = [Uuid::new_v4(), Uuid::new_v4()];
+	let [x, y] = [Uuid::from_u128(0x7B), Uuid::from_u128(0x7C)];
 	let holding = |other| DisposalTarget::Dir {
 		uuid: if other == y { x } else { y },
 		read: Tree {
@@ -1432,7 +1400,7 @@ async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
 		(last.phase, last.run_state),
 		(CompressPhase::Done, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1480,7 +1448,7 @@ async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
 	);
 	assert_eq!(setup.backend.log().deleted_files, [first.uuid()]);
 	assert!(setup.backend.log().trashed_dirs.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1523,7 +1491,7 @@ async fn a_cancel_while_compressing_keeps_every_source() {
 		(last.phase, last.run_state),
 		(CompressPhase::Cancelled, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1549,19 +1517,33 @@ async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
 	assert!(setup.backend.log().uploaded.is_empty());
 }
 
-/// The run states the callback saw, each change once; a pause may be complete before an update
-/// shows it pausing, so pausing is left out.
-fn run_states(recorder: &Recorder) -> Vec<RunState> {
-	let mut states: Vec<RunState> = recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.map(|update| update.run_state)
-		.filter(|state| *state != RunState::Pausing)
-		.collect();
-	states.dedup();
-	states
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_codec_reading_its_sources_out_of_order_fails_the_job() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+	);
+	// the second source before the first
+	let (reply, _answer) = oneshot::channel();
+	events
+		.send(WorkerEvent::Ask {
+			source: 1,
+			index: 0,
+			reply,
+		})
+		.await
+		.unwrap();
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Internal);
+	assert!(setup.backend.log().finished.is_empty());
+	setup.backend.assert_released(&job.reporter);
+	drop((events, result));
 }
 
 /// Plays a codec that reads the first source and the first chunk of the second, and then keeps
@@ -1604,7 +1586,7 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	assert_eq!(job.recorder.last().run_state, RunState::Paused);
 	let free = job.recorder.free_when_paused.lock().unwrap().clone();
 	assert!(
@@ -1616,11 +1598,11 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
 	assert_eq!(
-		run_states(&job.recorder),
+		job.recorder.run_states(),
 		[RunState::Running, RunState::Paused, RunState::Cancelling]
 	);
 	assert!(setup.backend.log().finished.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -1663,10 +1645,10 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 	let report = paused.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, 3);
 	assert_eq!(
-		run_states(&paused.recorder),
+		paused.recorder.run_states(),
 		[RunState::Paused, RunState::Running]
 	);
-	assert_released(&setup_paused, &paused.reporter);
+	setup_paused.backend.assert_released(&paused.reporter);
 	assert!(setup_paused.config.floor_is_free());
 }
 
@@ -1687,13 +1669,13 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_released(&setup_paused, &job.reporter);
+	setup_paused.backend.assert_released(&job.reporter);
 	assert!(setup_paused.backend.log().finished.is_empty());
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
 	let paused = uploaded(&setup_paused, report.archive.unwrap().uuid());
 	assert_eq!(
-		run_states(&job.recorder),
+		job.recorder.run_states(),
 		[RunState::Running, RunState::Paused, RunState::Running]
 	);
 
@@ -1745,7 +1727,7 @@ async fn a_pause_while_registering_holds_the_disposal_back() {
 		(CompressPhase::DisposingSources, RunState::Paused)
 	);
 	assert!(setup.backend.log().trashed_files.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
@@ -1849,7 +1831,7 @@ async fn a_permanent_removal_reads_the_archive_back_first() {
 			]),
 			"{name}: {phases:?}"
 		);
-		assert_released(&setup, &job.reporter);
+		setup.backend.assert_released(&job.reporter);
 	}
 }
 
@@ -1929,7 +1911,7 @@ fn assert_kept_unconfirmed(setup: &Setup, reporter: &Reporter, report: &Compress
 	all_kept_for(report, |reason| matches!(reason, KeptReason::Unconfirmed));
 	assert!(setup.backend.log().deleted_files.is_empty());
 	assert!(setup.backend.log().trashed_dirs.is_empty());
-	assert_released(setup, reporter);
+	setup.backend.assert_released(reporter);
 }
 
 /// A scripted reader for the setup's archive: what it sends, how it ends, and its progress.
@@ -2033,7 +2015,7 @@ async fn a_slow_read_back_is_not_given_up_on() {
 		"{:?}",
 		report.dispositions
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2104,7 +2086,7 @@ async fn a_cancel_while_reading_the_archive_back_keeps_the_sources() {
 		(last.phase, last.run_state),
 		(CompressPhase::Done, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2121,7 +2103,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 		(last.phase, last.run_state),
 		(CompressPhase::Verifying, RunState::Paused)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	let fetched = archive_fetches(&setup, archive);
 	assert_eq!(fetched, 1, "the first chunk is read, the second waits");
 	assert_eq!(
@@ -2153,5 +2135,5 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 		report.dispositions
 	);
 	assert_eq!(report.counts.bytes_verified, report.counts.bytes_done);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }

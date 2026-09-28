@@ -14,7 +14,7 @@ use crate::fs::archive::{
 		crypto::RAW_KEY_POWER,
 		write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 	},
-	test_support::pattern,
+	test_support::{damaged_copies, pattern},
 };
 
 const LIMITS: SevenZLimits = SevenZLimits {
@@ -505,13 +505,11 @@ fn a_byte_flip_never_panics() {
 	];
 	for archive in archives {
 		// the header is where parsing happens: flip every byte of its last part
-		for at in (archive.len().saturating_sub(300)..archive.len()).chain((0..32).step_by(3)) {
-			for bit in [0x01, 0x80] {
-				let mut damaged = archive.clone();
-				damaged[at] ^= bit;
-				let _ = std::panic::catch_unwind(|| read_all(&damaged, Some("pw")))
-					.unwrap_or_else(|_| panic!("a flip of {bit:#x} at {at} panicked"));
-			}
+		let positions =
+			(archive.len().saturating_sub(300)..archive.len()).chain((0..32).step_by(3));
+		for (at, bit, damaged) in damaged_copies(&archive, positions) {
+			let _ = std::panic::catch_unwind(|| read_all(&damaged, Some("pw")))
+				.unwrap_or_else(|_| panic!("a flip of {bit:#x} at {at} panicked"));
 		}
 	}
 }

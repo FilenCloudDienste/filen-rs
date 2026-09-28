@@ -104,37 +104,49 @@ impl Fatal {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{fs::archive::extract::ExtractPhase, job::test_support::controls};
+	use crate::job::test_support::controls;
+
+	/// A job's phases, as few as [`Fatal::end`] needs.
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	enum Phase {
+		Done,
+		Cancelled,
+		Failed,
+	}
+
+	impl JobPhase for Phase {
+		const DONE: Self = Self::Done;
+		const CANCELLED: Self = Self::Cancelled;
+		const FAILED: Self = Self::Failed;
+	}
 
 	#[test]
 	fn the_first_error_recorded_ends_the_job_whatever_its_work_returned() {
 		let control = JobControl::default();
 		let mut fatal = Fatal::default();
-		let (phase, result) = fatal.end::<_, ExtractPhase>(Ok(7), &control, "job");
-		assert_eq!((phase, result.unwrap()), (ExtractPhase::Done, 7));
+		let (phase, result) = fatal.end::<_, Phase>(Ok(7), &control, "job");
+		assert_eq!((phase, result.unwrap()), (Phase::Done, 7));
 
 		fatal.record(Arc::new(Error::custom(
 			ErrorKind::MaxStorageReached,
 			"full",
 		)));
 		fatal.record(Arc::new(Error::custom(ErrorKind::Server, "later")));
-		let (phase, result) = fatal.end::<_, ExtractPhase>(Ok(()), &control, "job");
-		assert_eq!(phase, ExtractPhase::Failed);
+		let (phase, result) = fatal.end::<_, Phase>(Ok(()), &control, "job");
+		assert_eq!(phase, Phase::Failed);
 		assert_eq!(result.unwrap_err().kind(), ErrorKind::MaxStorageReached);
 	}
 
 	#[test]
 	fn a_job_stopped_without_an_error_ended_cancelled_or_failed() {
 		let (_pause, cancel, control) = controls();
-		let (phase, result) =
-			Fatal::default().end::<(), ExtractPhase>(Err(Stopped), &control, "job");
-		assert_eq!(phase, ExtractPhase::Failed);
+		let (phase, result) = Fatal::default().end::<(), Phase>(Err(Stopped), &control, "job");
+		assert_eq!(phase, Phase::Failed);
 		assert_eq!(result.unwrap_err().kind(), ErrorKind::Internal);
 
 		cancel.send_replace(true);
-		let (phase, result) =
-			Fatal::default().end::<(), ExtractPhase>(Err(Stopped), &control, "job");
-		assert_eq!(phase, ExtractPhase::Cancelled);
+		let (phase, result) = Fatal::default().end::<(), Phase>(Err(Stopped), &control, "job");
+		assert_eq!(phase, Phase::Cancelled);
 		let error = result.unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::Cancelled);
 		assert!(error.to_string().contains("job cancelled"), "{error}");

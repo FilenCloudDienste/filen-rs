@@ -1,6 +1,6 @@
 use std::{
 	collections::{HashMap, HashSet},
-	sync::{Mutex, atomic::Ordering},
+	sync::Mutex,
 	time::Duration,
 };
 
@@ -188,20 +188,6 @@ fn start(
 }
 
 /// Everything a finished job must have given back.
-fn assert_released(backend: &FakeBackend, reporter: &Reporter) {
-	assert_eq!(
-		backend.memory.available_permits(),
-		backend.budget,
-		"every memory reservation is released"
-	);
-	assert_eq!(
-		backend.live_locks.load(Ordering::SeqCst),
-		0,
-		"no drive lock is held"
-	);
-	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
-}
-
 fn assert_each_chunk_once(backend: &FakeBackend) {
 	let log = backend.log();
 	let fetched: HashSet<_> = log.fetched.iter().copied().collect();
@@ -252,7 +238,7 @@ async fn copies_a_tree_parent_first_with_every_chunk_once() {
 	let (running, recorder, reporter) = start(&backend, plan, JobControl::default());
 	let report = running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_each_chunk_once(&backend);
 	{
 		let log = backend.log();
@@ -339,7 +325,7 @@ async fn stored_chunks_without_data_are_not_copied() {
 	let (running, _recorder, reporter) = start(&backend, plan, JobControl::default());
 	running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let log = backend.log();
 	assert_eq!(
 		log.fetched,
@@ -390,7 +376,7 @@ async fn copy_many(memory_chunks: usize, files: usize, chunks_per_file: u64) {
 		.expect("the copy must not deadlock")
 		.unwrap()
 		.unwrap();
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_each_chunk_once(&backend);
 	let log = backend.log();
 	assert_eq!(log.finished.len(), files);
@@ -461,7 +447,7 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || reporter.is_paused()).await;
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let uploaded = backend.log().uploaded.len();
 	tokio::time::sleep(Duration::from_secs(60)).await;
 	assert_eq!(
@@ -488,7 +474,7 @@ async fn pause_during_file_copies_releases_everything_and_resumes() {
 
 	pause.send_replace(false);
 	let report = running.await.unwrap().unwrap();
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_each_chunk_once(&backend);
 	assert_eq!(backend.log().uploaded.len(), 18);
 	assert_eq!(report.counts.bytes_done, 18 * CHUNK_SIZE_U64);
@@ -531,7 +517,7 @@ async fn a_paused_job_holds_no_memory_while_a_chunk_waited_for_it() {
 	drop(elsewhere);
 	pause.send_replace(false);
 	running.await.unwrap().unwrap();
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(backend.log().finished.len(), 1);
 }
 
@@ -575,12 +561,12 @@ async fn a_paused_job_holds_nothing_on_a_multi_threaded_runtime() {
 		})
 		.await;
 		if reporter.is_paused() {
-			assert_released(&backend, &reporter);
+			backend.assert_released(&reporter);
 		}
 		pause.send_replace(false);
 	}
 	running.await.unwrap().unwrap();
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(backend.log().finished.len(), 24);
 	assert_each_chunk_once(&backend);
 }
@@ -618,7 +604,7 @@ async fn pause_during_directory_creation_holds_no_lock_and_resumes() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || reporter.is_paused()).await;
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let created = backend.log().created_dirs.len();
 	assert!(created < 201, "paused before every directory existed");
 	tokio::time::sleep(Duration::from_secs(60)).await;
@@ -633,7 +619,7 @@ async fn pause_during_directory_creation_holds_no_lock_and_resumes() {
 	assert_eq!(backend.log().created_dirs.len(), 201);
 	assert_eq!(backend.log().finished.len(), 200);
 	assert!(backend.log().out_of_order_dirs.is_empty());
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -683,7 +669,7 @@ async fn a_pause_controller_dropped_while_paused_lets_the_job_finish() {
 		.unwrap()
 		.unwrap();
 	assert_eq!(backend.log().uploaded.len(), 18);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(recorder.last().run_state, RunState::Running);
 }
 
@@ -707,7 +693,7 @@ async fn a_cancel_while_paused_ends_the_pause() {
 	let CopyFailed { error, .. } = running.await.unwrap().unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let updates = recorder.updates.lock().unwrap();
 	let states: Vec<RunState> = updates[updates_before_cancel..]
 		.iter()
@@ -749,7 +735,7 @@ async fn cancel_during_directory_creation_reports_what_was_created() {
 	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(
 		backend.log().finished.is_empty(),
 		"no file is copied after a cancel"
@@ -803,7 +789,7 @@ async fn cancel_during_file_copies_drops_transfers_and_keeps_finished_files() {
 	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(
 		backend.log().finished.len(),
 		1,
@@ -967,7 +953,7 @@ async fn running_out_of_storage_ends_the_job() {
 	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(
 		backend.log().finished.is_empty(),
 		"the other files are stopped, not finished"
@@ -1076,7 +1062,7 @@ async fn a_failed_file_does_not_stop_the_others() {
 	);
 	let report = running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(backend.log().finished.len(), 1);
 	let failure = only_failure(&report);
 	assert!(matches!(&failure.source, FailedSource::File(file) if file.uuid() == bad.uuid()));
@@ -1123,7 +1109,7 @@ async fn a_failed_directory_fails_its_subtree_without_attempting_it() {
 	);
 	let report = running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let log = backend.log();
 	assert_eq!(
 		log.created_dirs.len(),
@@ -1382,7 +1368,7 @@ async fn cancel_ends_a_drive_lock_wait_before_a_file_is_registered() {
 		.unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(backend.log().finished.is_empty());
 	assert_eq!(report.counts.files_done, 0);
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
@@ -1406,13 +1392,13 @@ async fn pause_ends_a_drive_lock_wait_before_a_file_is_registered() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || reporter.is_paused()).await;
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 
 	unblock_locks(&backend);
 	pause.send_replace(false);
 	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().finished.len(), 1);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1430,7 +1416,7 @@ async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || reporter.is_paused()).await;
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(backend.log().created_dirs.is_empty());
 
 	unblock_locks(&backend);
@@ -1438,7 +1424,7 @@ async fn pause_ends_a_drive_lock_wait_during_directory_creation() {
 	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 4);
 	assert_eq!(backend.log().finished.len(), 3);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1468,7 +1454,7 @@ async fn cancel_ends_a_drive_lock_wait_while_propagating_to_new_shares() {
 		.unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(report.top_level.len(), 1, "the copied file is kept");
 	assert!(backend.log().propagated_trees.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
@@ -1492,7 +1478,7 @@ async fn pause_ends_a_directory_create_waiting_for_a_fresh_lock_and_retries_it()
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || reporter.is_paused()).await;
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(backend.log().created_dirs.is_empty());
 
 	unblock_locks(&backend);
@@ -1531,7 +1517,7 @@ async fn cancel_ends_a_directory_create_waiting_for_a_fresh_lock() {
 		.unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(backend.log().created_dirs.is_empty());
 	assert_eq!(
 		report.counts.dirs_failed, 0,
@@ -1653,7 +1639,7 @@ async fn a_file_gives_up_after_the_bounded_number_of_taken_names() {
 		JobControl::default(),
 	);
 	let report = running.await.unwrap().unwrap();
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert!(backend.log().finished.is_empty());
 	assert!(
 		backend.log().uploaded.is_empty(),
@@ -1685,7 +1671,7 @@ async fn a_file_registered_as_a_version_is_reported_and_not_offered_as_a_copy() 
 	);
 	let report = running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let failure = only_failure(&report);
 	assert_eq!(
 		failure.info.stage,
@@ -1765,7 +1751,7 @@ async fn a_deep_chain_is_created_parent_first() {
 	);
 	let report = running.await.unwrap().unwrap();
 
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	let log = backend.log();
 	assert_eq!(log.created_dirs.len(), 501);
 	assert!(log.out_of_order_dirs.is_empty());
@@ -1828,7 +1814,7 @@ async fn an_inconsistent_chunk_count_fails_the_file() {
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().fetched.is_empty(), "nothing is read");
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1853,7 +1839,7 @@ async fn a_short_file_fails_as_a_download() {
 	assert_eq!(info.stage, CopyStage::Download);
 	assert_eq!(info.error.kind(), ErrorKind::Response);
 	assert!(backend.log().finished.is_empty(), "nothing is registered");
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_eq!(report.counts.bytes_done, 0);
 	assert_eq!(report.counts.bytes_failed, 2 * CHUNK_SIZE_U64 + 5);
 }
@@ -1882,7 +1868,7 @@ async fn a_failed_upload_is_an_upload_failure() {
 	assert_eq!(info.stage, CopyStage::Upload);
 	assert_eq!(info.error.kind(), ErrorKind::Server);
 	assert_eq!(backend.log().finished.len(), 1);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 
@@ -1909,7 +1895,7 @@ async fn a_failed_registration_is_a_finalize_failure() {
 	assert!(backend.log().finished.is_empty());
 	assert_eq!(report.counts.bytes_done, 0);
 	assert_eq!(report.counts.bytes_failed, 2 * CHUNK_SIZE_U64);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 
@@ -1926,7 +1912,7 @@ async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 	);
 	let report = running.await.unwrap().unwrap();
 	assert_eq!(only_failure(&report).info.stage, CopyStage::Finalize);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1946,7 +1932,7 @@ async fn a_failed_drive_lock_ends_directory_creation() {
 	assert!(backend.log().created_dirs.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
 	assert_eq!(report.counts.files_not_attempted, 5);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 
@@ -1978,7 +1964,7 @@ async fn a_fatal_error_during_directory_creation_ends_the_job() {
 		counts.files_not_attempted + counts.files_failed,
 		3 * MAX_SMALL_PARALLEL_REQUESTS as u64
 	);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 
@@ -1999,7 +1985,7 @@ async fn a_failed_target_fetch_ends_the_job_before_anything_is_created() {
 	assert!(backend.log().created_dirs.is_empty());
 	assert!(report.top_level.is_empty());
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 
@@ -2116,7 +2102,7 @@ async fn a_directory_gives_up_after_the_bounded_number_of_taken_names() {
 	assert_eq!(info.affected_files, 1);
 	assert!(backend.log().created_dirs.is_empty());
 	assert!(backend.log().finished.is_empty());
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2175,7 +2161,7 @@ async fn pause_during_the_target_fetch_waits_and_resumes() {
 		backend.log().created_dirs.is_empty(),
 		"nothing starts while paused"
 	);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	pause.send_replace(false);
 	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().created_dirs.len(), 3);
@@ -2208,7 +2194,7 @@ async fn pause_while_finishing_waits_and_resumes() {
 		backend.log().propagated_trees.is_empty(),
 		"nothing is propagated while paused"
 	);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	pause.send_replace(false);
 	running.await.unwrap().unwrap();
 	assert_eq!(backend.log().propagated_trees.len(), 1);
@@ -2256,7 +2242,7 @@ async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
 	assert_eq!(backend.log().finished.len(), 1);
 	assert_eq!(report.top_level.len(), 1, "a file that exists is reported");
 	assert_eq!(report.counts.files_done, 1);
-	assert_released(&backend, &reporter);
+	backend.assert_released(&reporter);
 	assert_counts_add_up(&report, &recorder.last());
 }
 

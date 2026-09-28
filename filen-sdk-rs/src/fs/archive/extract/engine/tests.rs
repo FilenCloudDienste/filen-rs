@@ -40,8 +40,8 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			test_support::{
-				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
-				zip_of,
+				TarMember, gzip, hash, incompressible, pattern, remote_file, sevenz_of, tar_of,
+				tar_with, zip_of,
 			},
 			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
@@ -52,7 +52,7 @@ use crate::{
 			test_support::{FakeBackend, Quirk, Request, wait_until},
 		},
 	},
-	job::test_support::controls,
+	job::test_support::{controls, run_states},
 };
 
 /// What a job held when an update reported it paused.
@@ -102,15 +102,8 @@ impl Recorder {
 
 	/// Every run state the updates went through, each once per stretch.
 	fn run_states(&self) -> Vec<RunState> {
-		let mut states: Vec<RunState> = self
-			.updates
-			.lock()
-			.unwrap()
-			.iter()
-			.map(|update| update.run_state)
-			.collect();
-		states.dedup();
-		states
+		let updates = self.updates.lock().unwrap();
+		run_states(updates.iter().map(|update| update.run_state))
 	}
 }
 
@@ -130,10 +123,6 @@ fn archive_file_with(
 	hash: Option<Blake3Hash>,
 ) -> RemoteFileType<'static> {
 	remote_file(ARCHIVE, ARCHIVE_PARENT, name, bytes, hash)
-}
-
-fn hash(data: &[u8]) -> Blake3Hash {
-	Blake3Hash::from(blake3::hash(data))
 }
 
 struct Setup {
@@ -298,17 +287,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 
 /// Everything a finished job must have given back.
 fn assert_released(setup: &Setup, reporter: &Reporter, recorder: &Recorder) {
-	assert_eq!(
-		setup.backend.memory.available_permits(),
-		setup.backend.budget,
-		"every memory reservation is released"
-	);
-	assert_eq!(
-		setup.backend.live_locks.load(Ordering::SeqCst),
-		0,
-		"no drive lock is held"
-	);
-	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
+	setup.backend.assert_released(reporter);
 	assert!(
 		recorder
 			.held_while_paused
@@ -938,11 +917,33 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 		}
 	);
 	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
-	let last = job.recorder.last();
-	assert_eq!(last.phase, ExtractPhase::Failed);
-	// what the job did not read it never will: no time is left
-	assert_eq!(last.eta, Some(Duration::ZERO));
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
+	/// A tar member's header: its name, then its checksum at this offset.
+	const CHECKSUM_AT: usize = 148;
+	/// Where `second.bin`'s header starts: past `first.txt`'s header and its data block.
+	const SECOND_HEADER: usize = 2 * 512;
+	let mut tar = tar_of(&[
+		("first.txt", b"first"),
+		("second.bin", &pattern(3 * CHUNK_SIZE, 3)),
+	]);
+	tar[SECOND_HEADER + CHECKSUM_AT] ^= 1;
+	let setup = setup("broken.tar", tar, |_| {});
+	let job = start(&setup, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
+	let last = job.recorder.last();
+	// most of the archive is unread, and the job never reads it: no time is left
+	assert!(last.bytes_read < setup.archive.size(), "{last:?}");
+	assert_eq!(
+		(last.phase, last.eta),
+		(ExtractPhase::Failed, Some(Duration::ZERO))
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
