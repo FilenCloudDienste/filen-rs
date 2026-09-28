@@ -27,9 +27,9 @@ use super::{
 		list::{ArchiveEntryKind, PasswordCheck},
 		storage_exceeded,
 	},
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, Refused, StreamJob,
+	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
 	entries::{Found, Verdict, Walk},
-	failure, refused, take_file,
+	failure, take_file,
 };
 
 /// How a 7z entry's data is compressed, for display: its folder's coders, outermost first.
@@ -200,45 +200,14 @@ pub(super) fn extract_sevenz(
 	source.set_slots((index.max_packed_streams() + 1).min(5));
 	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
 	if walk.listing() {
-		let checked = check_sevenz_password(&mut cursor, &index, &mut keys, password.is_some())?;
-		port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
-			.map_err(failure)?;
-		// a listing reads the index: a link's data is read only where little has to be decoded
-		// to reach it, and never when the archive states more than it may decode to
-		let stated = index
-			.entries
-			.iter()
-			.fold(0u64, |total, entry| total.saturating_add(entry.size));
-		let within_limit = job
-			.limits
-			.expansion
-			.is_none_or(|limit| stated <= limit.floor.max(job.len.saturating_mul(limit.ratio)));
-		for entry in &index.entries {
-			let cheap = entry
-				.stream
-				.is_some_and(|stream| stream.offset.saturating_add(entry.size) <= LIST_READ_BYTES);
-			if !(within_limit && cheap) {
-				walk.list(sevenz_unread(&index, entry), None)
-					.map_err(failure)?;
-				continue;
-			}
-			// a link's data unread for a wrong password leaves it listed as a link without its
-			// target
-			let found = match sevenz_found(&mut cursor, &index, entry, &mut keys) {
-				Ok((found, _)) => found,
-				Err(_) if checked == PasswordCheck::Wrong || password.is_none() => {
-					sevenz_unread(&index, entry)
-				}
-				Err(error) => return Err(sevenz_failure(error)),
-			};
-			walk.list(found, None).map_err(failure)?;
-		}
-		return Ok(ArchiveEnd {
-			unaccounted_bytes: index.unaccounted_bytes,
-			duplicates: None,
-			unchecked_entries: 0,
-			password: checked,
-		});
+		return list_sevenz(
+			walk,
+			&mut cursor,
+			&index,
+			&mut keys,
+			password.is_some(),
+			job,
+		);
 	}
 	walk.check_selection(index.entries.iter().map(|entry| {
 		(
@@ -247,15 +216,7 @@ pub(super) fn extract_sevenz(
 			entry.kind == SevenZKind::Dir,
 		)
 	}))?;
-	if let Some(limit) = job.limits.expansion {
-		let stated = index
-			.entries
-			.iter()
-			.fold(0u64, |total, entry| total.saturating_add(entry.size));
-		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
-			return Err(refused(Refused::Expansion(limit.ratio)));
-		}
-	}
+	check_stated_size(job, index.entries.iter().map(|entry| entry.size))?;
 	let extracted = walk.extracted_bytes(
 		index
 			.entries
@@ -373,6 +334,49 @@ pub(super) fn extract_sevenz(
 		duplicates: None,
 		unchecked_entries,
 		password: PasswordCheck::NotNeeded,
+	})
+}
+
+/// A 7z listed from its index: what each entry is, a link's data read only where little has to
+/// be decoded to reach it, and never when the archive states more than it may decode to.
+fn list_sevenz<'s, R: Read + Seek + 's>(
+	walk: &mut Walk,
+	cursor: &mut FolderCursor<'s, R>,
+	index: &SevenZIndex,
+	keys: &mut Keys<'_>,
+	has_password: bool,
+	job: &StreamJob,
+) -> Result<ArchiveEnd, Error> {
+	let checked = check_sevenz_password(cursor, index, keys, has_password)?;
+	walk.port
+		.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
+		.map_err(failure)?;
+	let within_limit = check_stated_size(job, index.entries.iter().map(|entry| entry.size)).is_ok();
+	for entry in &index.entries {
+		let cheap = entry
+			.stream
+			.is_some_and(|stream| stream.offset.saturating_add(entry.size) <= LIST_READ_BYTES);
+		if !(within_limit && cheap) {
+			walk.list(sevenz_unread(index, entry), None)
+				.map_err(failure)?;
+			continue;
+		}
+		// a link's data unread for a wrong password leaves it listed as a link without its
+		// target
+		let found = match sevenz_found(cursor, index, entry, keys) {
+			Ok((found, _)) => found,
+			Err(_) if checked == PasswordCheck::Wrong || !has_password => {
+				sevenz_unread(index, entry)
+			}
+			Err(error) => return Err(sevenz_failure(error)),
+		};
+		walk.list(found, None).map_err(failure)?;
+	}
+	Ok(ArchiveEnd {
+		unaccounted_bytes: index.unaccounted_bytes,
+		duplicates: None,
+		unchecked_entries: 0,
+		password: checked,
 	})
 }
 

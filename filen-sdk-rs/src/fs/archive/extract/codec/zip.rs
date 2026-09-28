@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek};
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
-		entry_path::entry_path,
+		entry_path::{ArchivePath, entry_path},
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		password::ArchivePassword,
@@ -30,9 +30,9 @@ use super::{
 		list::{ArchiveEntryKind, PasswordCheck},
 		storage_exceeded,
 	},
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, Refused, StreamJob,
+	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
 	entries::{Found, Verdict, Walk},
-	failure, refused, take_file,
+	failure, take_file,
 };
 
 /// How a zip entry's data is compressed, for display.
@@ -160,39 +160,14 @@ pub(super) fn extract_zip(
 		count: index.duplicate_count,
 	});
 	if walk.listing() {
-		let checked = check_zip_password(&mut source, &index, password, entry_limits)?;
-		walk.port
-			.send(WorkerEvent::Opened(ArchiveFormat::Zip))
-			.map_err(failure)?;
-		let mut targets =
-			zip_symlink_targets(walk.port, &mut source, &index, password, entry_limits);
-		let mut listed: Vec<(&ZipEntry, bool)> = index
-			.entries
-			.iter()
-			.map(|entry| (entry, false))
-			.chain(index.overlapping.iter().map(|entry| (entry, true)))
-			.collect();
-		listed.sort_unstable_by_key(|(entry, _)| entry.ordinal);
-		for (entry, overlapping) in listed {
-			let target = targets
-				.binary_search_by_key(&entry.ordinal, |(ordinal, _)| *ordinal)
-				.map(|at| std::mem::take(&mut targets[at].1))
-				.unwrap_or_default();
-			walk.list(zip_found(entry, overlapping, target), None)
-				.map_err(failure)?;
-		}
-		// what the index shows: the bytes around and between entries would take reading every
-		// entry's local header, the whole archive
-		let unaccounted_bytes = index
-			.prefix_bytes
-			.saturating_add(index.directory_slack)
-			.saturating_add(index.trailing_bytes);
-		return Ok(ArchiveEnd {
-			unaccounted_bytes,
+		return list_zip(
+			walk,
+			&mut source,
+			&index,
+			password,
+			entry_limits,
 			duplicates,
-			unchecked_entries: 0,
-			password: checked,
-		});
+		);
 	}
 	walk.check_selection(index.entries.iter().chain(&index.overlapping).map(|entry| {
 		(
@@ -201,16 +176,8 @@ pub(super) fn extract_zip(
 			entry.kind == ZipKind::Dir,
 		)
 	}))?;
-	if let Some(limit) = job.limits.expansion {
-		// the sizes a zip states are known up front, so a bomb is refused before it is decoded
-		let stated = index
-			.entries
-			.iter()
-			.fold(0u64, |total, entry| total.saturating_add(entry.size));
-		if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) {
-			return Err(refused(Refused::Expansion(limit.ratio)));
-		}
-	}
+	// the sizes a zip states are known up front, so a bomb is refused before it is decoded
+	check_stated_size(job, index.entries.iter().map(|entry| entry.size))?;
 	let extracted = walk.extracted_bytes(
 		index
 			.entries
@@ -238,10 +205,7 @@ pub(super) fn extract_zip(
 			walk.port.send(found.skipped(reason)).map_err(failure)?;
 		}
 	}
-	let mut unaccounted_bytes = index
-		.prefix_bytes
-		.saturating_add(index.directory_slack)
-		.saturating_add(index.trailing_bytes);
+	let mut unaccounted_bytes = around_entries(&index);
 	for entry in &index.entries {
 		let found = zip_found(entry, false, String::new());
 		let verdict = walk.judge(&found)?;
@@ -250,15 +214,13 @@ pub(super) fn extract_zip(
 		if matches!(verdict, Verdict::Ignore) {
 			continue;
 		}
-		unaccounted_bytes =
-			unaccounted_bytes.saturating_add(unaccounted_after(&mut source, index.shift, entry));
-		if entry.kind == ZipKind::Dir
-			&& entry.compressed_size > 0
-			&& !decodes_to_nothing(&mut source, index.shift, entry, password, entry_limits)
-		{
-			// a directory holds no data: anything stored under one is extracted nowhere
-			unaccounted_bytes = unaccounted_bytes.saturating_add(entry.compressed_size);
-		}
+		unaccounted_bytes = unaccounted_bytes.saturating_add(unaccounted_at(
+			&mut source,
+			index.shift,
+			entry,
+			password,
+			entry_limits,
+		));
 		let (path, apple_double) = match verdict {
 			Verdict::Ignore | Verdict::Root => continue,
 			Verdict::Skip(ExtractSkipReason::Symlink { .. }) => {
@@ -287,48 +249,24 @@ pub(super) fn extract_zip(
 			continue;
 		}
 		// opened before it is announced: its local header may show it overlapping the next
-		let mut reader = match open_entry(&mut source, index.shift, entry, password, entry_limits) {
-			Ok(reader) => reader,
+		match open_entry(&mut source, index.shift, entry, password, entry_limits) {
+			Ok(mut reader) => {
+				verified |= take_zip_file(
+					walk,
+					&found,
+					path,
+					apple_double,
+					entry,
+					&mut reader,
+					verified,
+				)?;
+			}
 			Err(ZipError::Overlapping) => {
 				walk.port
 					.send(found.skipped(ExtractSkipReason::OverlappingData))
 					.map_err(failure)?;
-				continue;
 			}
 			Err(error) => return Err(zip_failure(error)),
-		};
-		let encrypted = entry.encryption != ZipEncryption::None;
-		match take_file(
-			walk,
-			&found,
-			path,
-			Some(entry.size),
-			apple_double,
-			&mut reader,
-		)
-		.map_err(zip_io_failure)
-		{
-			// an AppleDouble file left out was not read to its end: it proves nothing
-			Ok(0) => {}
-			// an empty ZipCrypto entry matches its CRC-32 under any key; AES's authentication
-			// code rejects a wrong one even over nothing
-			Ok(_) => {
-				verified |= encrypted
-					&& (entry.size > 0 || matches!(entry.encryption, ZipEncryption::Aes { .. }))
-			}
-			// while no entry proved the password, damage in ZipCrypto data is likelier a wrong
-			// password than a damaged archive (its check byte passes 1 wrong one in 256; AES's
-			// verifier, which already passed, 1 in 65536)
-			Err(error)
-				if key_unproven(entry)
-					&& !verified && error.kind() == ErrorKind::ArchiveCorrupt =>
-			{
-				return Err(Error::custom(
-					ErrorKind::ArchiveWrongPassword,
-					"the password is likely wrong",
-				));
-			}
-			Err(error) => return Err(error),
 		}
 	}
 	Ok(ArchiveEnd {
@@ -337,6 +275,113 @@ pub(super) fn extract_zip(
 		unchecked_entries: 0,
 		password: PasswordCheck::NotNeeded,
 	})
+}
+
+/// A zip listed from its index alone: what each entry is, with the symlink targets read front
+/// to back.
+fn list_zip(
+	walk: &mut Walk,
+	source: &mut SeekInput<'_>,
+	index: &ZipIndex,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+	duplicates: Option<DuplicateEntries>,
+) -> Result<ArchiveEnd, Error> {
+	let checked = check_zip_password(source, index, password, limits)?;
+	walk.port
+		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
+		.map_err(failure)?;
+	let mut targets = zip_symlink_targets(walk.port, source, index, password, limits);
+	let mut listed: Vec<(&ZipEntry, bool)> = index
+		.entries
+		.iter()
+		.map(|entry| (entry, false))
+		.chain(index.overlapping.iter().map(|entry| (entry, true)))
+		.collect();
+	listed.sort_unstable_by_key(|(entry, _)| entry.ordinal);
+	for (entry, overlapping) in listed {
+		let target = targets
+			.binary_search_by_key(&entry.ordinal, |(ordinal, _)| *ordinal)
+			.map(|at| std::mem::take(&mut targets[at].1))
+			.unwrap_or_default();
+		walk.list(zip_found(entry, overlapping, target), None)
+			.map_err(failure)?;
+	}
+	// what the index shows: the bytes around and between entries would take reading every
+	// entry's local header, the whole archive
+	Ok(ArchiveEnd {
+		unaccounted_bytes: around_entries(index),
+		duplicates,
+		unchecked_entries: 0,
+		password: checked,
+	})
+}
+
+/// The bytes around a zip's entries that its index shows belong to none: before the first, in
+/// the central directory, and after its end record.
+fn around_entries(index: &ZipIndex) -> u64 {
+	index
+		.prefix_bytes
+		.saturating_add(index.directory_slack)
+		.saturating_add(index.trailing_bytes)
+}
+
+/// The bytes of `entry` and after it that belong to nothing: past its data (see
+/// [`unaccounted_after`]), and for a directory, whatever is stored under it.
+fn unaccounted_at<R: Read + Seek>(
+	source: &mut R,
+	shift: u64,
+	entry: &ZipEntry,
+	password: Option<&[u8]>,
+	limits: EntryLimits,
+) -> u64 {
+	let after = unaccounted_after(source, shift, entry);
+	// a directory holds no data: anything stored under one is extracted nowhere
+	if entry.kind == ZipKind::Dir
+		&& entry.compressed_size > 0
+		&& !decodes_to_nothing(source, shift, entry, password, limits)
+	{
+		return after.saturating_add(entry.compressed_size);
+	}
+	after
+}
+
+/// Sends the file `entry`, taken at `path`, its data read from `reader`; whether reading it
+/// whole proved the password, which `verified` says an entry before it already did.
+fn take_zip_file(
+	walk: &Walk,
+	found: &Found,
+	path: ArchivePath,
+	apple_double: bool,
+	entry: &ZipEntry,
+	reader: &mut dyn Read,
+	verified: bool,
+) -> Result<bool, Error> {
+	let encrypted = entry.encryption != ZipEncryption::None;
+	match take_file(walk, found, path, Some(entry.size), apple_double, reader)
+		.map_err(zip_io_failure)
+	{
+		// an AppleDouble file left out was not read to its end: it proves nothing
+		Ok(0) => Ok(false),
+		// an empty ZipCrypto entry matches its CRC-32 under any key; AES's authentication code
+		// rejects a wrong one even over nothing
+		Ok(_) => {
+			Ok(encrypted
+				&& (entry.size > 0 || matches!(entry.encryption, ZipEncryption::Aes { .. })))
+		}
+		// while no entry proved the password, damage in ZipCrypto data is likelier a wrong
+		// password than a damaged archive (its check byte passes 1 wrong one in 256; AES's
+		// verifier, which already passed, 1 in 65536)
+		Err(error)
+			if key_unproven(entry) && !verified && error.kind() == ErrorKind::ArchiveCorrupt =>
+		{
+			Err(Error::custom(
+				ErrorKind::ArchiveWrongPassword,
+				"the password is likely wrong",
+			))
+		}
+		Err(error) => Err(error),
+	}
 }
 
 /// Whether an entry that opened may still be under a wrong key: ZipCrypto's check byte lets 1

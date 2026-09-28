@@ -264,6 +264,20 @@ fn take_file(
 	Ok(1)
 }
 
+/// Refuses an archive whose entries state more than the [`ExpansionLimit`] lets it decode to:
+/// the `sizes` a zip or a 7z states are known before anything is decoded.
+fn check_stated_size(job: &StreamJob, sizes: impl IntoIterator<Item = u64>) -> Result<(), Error> {
+	let stated = sizes
+		.into_iter()
+		.fold(0u64, |total, size| total.saturating_add(size));
+	match job.limits.expansion {
+		Some(limit) if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) => {
+			Err(refused(Refused::Expansion(limit.ratio)))
+		}
+		_ => Ok(()),
+	}
+}
+
 /// The `files` a stream decoded to that are unchecked: all of them when its codec verified
 /// nothing (see [`StreamCheck`]).
 fn unchecked(check: StreamCheck, files: u64) -> u64 {
