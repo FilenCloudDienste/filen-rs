@@ -711,7 +711,7 @@ pub async fn test_versioning_disabled_edit_ghost_is_not_adopted() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
@@ -5911,7 +5911,7 @@ pub async fn test_a_versioning_disabled_edit_is_one_update_and_no_retirement() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
@@ -6241,7 +6241,7 @@ pub async fn test_update_and_query_item_follows_a_versioning_disabled_edit() {
 
 	let _version_lock = rss
 		.client
-		.acquire_lock_with_default("test:versions")
+		.acquire_lock_with_default(test_utils::locks::VERSIONS)
 		.await
 		.unwrap();
 	rss.client.set_versioning_enabled(false).await.unwrap();
