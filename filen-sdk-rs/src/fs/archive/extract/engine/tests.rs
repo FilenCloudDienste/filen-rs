@@ -2,12 +2,14 @@
 //! real time on a multi-threaded runtime; the stall test scripts a silent codec on paused time.
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, HashMap, HashSet},
 	io::{Cursor, Write},
 	sync::{Mutex, atomic::Ordering},
 	time::Duration,
 };
 
+use filen_types::crypto::Blake3Hash;
 use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
@@ -20,8 +22,8 @@ use crate::{
 			entry_path::entry_path,
 			extract::{
 				ArchiveEntry, ArchiveEntryKind, ArchiveListing, ArchiveTotals, ExpansionLimit,
-				ExtractCallback, ExtractEvent, ExtractSkipReason, ExtractUpdate, ListCallback,
-				ListFailed, ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES,
+				ExtractCallback, ExtractEvent, ExtractSkipReason, ExtractStage, ExtractUpdate,
+				ListCallback, ListFailed, ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES,
 				MAX_LISTED_ENTRIES, PasswordCheck, RunState,
 				codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
 				list::{ListReporter, ListTask, run_list},
