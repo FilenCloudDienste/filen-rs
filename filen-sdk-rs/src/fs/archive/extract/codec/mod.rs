@@ -31,7 +31,7 @@ use super::{
 	list::{ArchiveEntryKind, PasswordCheck},
 };
 use entries::{Found, Verdict, Walk, apple_double};
-pub(crate) use entries::{Selection, Task, link_key};
+pub(crate) use entries::{LinkKeys, Selection, Task};
 use sevenz::extract_sevenz;
 use tar::walk_tar;
 use zip::extract_zip;

@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-	super::{codec::link_key, report::ExtractStage},
+	super::{codec::LinkKeys, report::ExtractStage},
 	CHUNKS_PER_FILE, Driver, FileSource, LinkChunk, MAX_OPEN_FILES, NewFile,
 };
 
@@ -36,12 +36,14 @@ pub(super) struct LinkCopy {
 	fetching: bool,
 }
 
-/// The files a tar's hard links may name, by [`link_key`] of the path each was sent at: one the
+/// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
 /// codec sent, or another hard link's copy. A tar may hold a million files, each of which a
 /// link after it may name, so each costs 16 bytes in the map (and its share of the map's spare
 /// room), and 24 more once registered: what an open one is, its slot in the open files tells.
 #[derive(Default)]
 pub(super) struct LinkTargets {
+	/// The job's key for the paths.
+	keys: LinkKeys,
 	by_key: SeededMap<u64, LinkTarget>,
 	/// The uuid and size of each registered target.
 	registered: Vec<(Uuid, u64)>,
@@ -144,7 +146,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let Some(file) = self.files.get_mut(&ordinal) else {
 			return;
 		};
-		let key = link_key(path);
+		let key = self.link_targets.keys.of(path);
 		file.link_key = Some(key);
 		self.link_targets.open(key, ordinal);
 	}
@@ -168,7 +170,7 @@ impl<B: DisposalBackend> Driver<B> {
 			target,
 			unresolved,
 		} = link;
-		let (target, size) = match self.link_targets.get(link_key(&target)) {
+		let (target, size) = match self.link_targets.get(self.link_targets.keys.of(&target)) {
 			Some(Named::Registered { uuid, size }) => (Ok(uuid), size),
 			Some(Named::Open(ordinal)) => match self.pending_size(ordinal) {
 				Some(size) => (Err(ordinal), size),
@@ -197,7 +199,7 @@ impl<B: DisposalBackend> Driver<B> {
 			return;
 		};
 		// a link may be named by the links after it, as the file it copies is
-		let key = link_key(&path);
+		let key = self.link_targets.keys.of(&path);
 		self.link_targets.open(key, ordinal);
 		let link = TakenLink { file, key };
 		match target {

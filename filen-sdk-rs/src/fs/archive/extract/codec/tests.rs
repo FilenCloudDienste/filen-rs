@@ -1960,3 +1960,14 @@ fn a_tar_directory_chosen_brings_what_is_stored_after_it() {
 	end.unwrap();
 	assert_eq!(outline(&seen), ["dir docs", "file docs/late.txt 1"]);
 }
+
+#[test]
+fn hard_links_are_looked_up_by_a_key_each_job_draws() {
+	let path = entry_path("docs/a.txt").unwrap();
+	let keys = LinkKeys::new();
+	// within one job a link and the file it names meet
+	assert_eq!(keys.of(&path), keys.of(&entry_path("docs/a.txt").unwrap()));
+	assert_ne!(keys.of(&path), keys.of(&entry_path("docs/b.txt").unwrap()));
+	// across jobs the same path hashes apart: no archive can pick paths that collide
+	assert_ne!(keys.of(&path), LinkKeys::new().of(&path));
+}

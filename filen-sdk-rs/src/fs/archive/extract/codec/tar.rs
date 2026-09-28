@@ -18,7 +18,7 @@ use crate::{
 use super::{
 	super::{ExtractSkipReason, list::ArchiveEntryKind},
 	Refused,
-	entries::{Found, MacShape, Verdict, Walk, apple_double, link_key},
+	entries::{Found, LinkKeys, MacShape, Verdict, Walk, apple_double},
 	failure, take_file,
 };
 
@@ -42,10 +42,8 @@ pub(super) fn walk_tar<R: Read>(
 	let mut ordinal = 0;
 	let mut unread = 0u64;
 	let mut files = 0u64;
-	// what a listing resolves hard links against: the files it says are extracted (hard links
-	// resolved included, which later links may name), by path, with their sizes and ordinals. An
-	// extraction's driver resolves them against the files it created
-	let mut listed_files = SeededMap::<u64, (u64, u64)>::default();
+	// an extraction's driver resolves hard links against the files it created
+	let mut listed_files = ListedFiles::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -159,6 +157,15 @@ fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
 	}
 }
 
+/// What a listing resolves hard links against: the files it says are extracted (hard links
+/// resolved included, which later links may name), by [`LinkKeys`] of their paths, with their
+/// sizes and ordinals.
+#[derive(Default)]
+struct ListedFiles {
+	keys: LinkKeys,
+	by_key: SeededMap<u64, (u64, u64)>,
+}
+
 /// Lists the member `found`, a hard link to `link_target` resolved against `listed_files`, the
 /// files listed before it as extracted, which it joins when it is one.
 fn list_member<R: Read>(
@@ -166,12 +173,12 @@ fn list_member<R: Read>(
 	tar: &mut TarReader<R>,
 	mut found: Found,
 	link_target: Option<HardlinkTarget>,
-	listed_files: &mut SeededMap<u64, (u64, u64)>,
+	listed_files: &mut ListedFiles,
 ) -> Result<(), Error> {
 	if let Some((target, shown)) = link_target {
 		match target
 			.ok()
-			.and_then(|target| listed_files.get(&link_key(&target)))
+			.and_then(|target| listed_files.by_key.get(&listed_files.keys.of(&target)))
 		{
 			Some(&(size, target)) => {
 				found.size = size;
@@ -193,14 +200,18 @@ fn list_member<R: Read>(
 		_ => None,
 	};
 	let ordinal = found.ordinal;
-	let key = found.path.as_ref().ok().map(link_key);
+	let key = found
+		.path
+		.as_ref()
+		.ok()
+		.map(|path| listed_files.keys.of(path));
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
 	if walk.list(found, apple_double).map_err(failure)?
 		&& !is_dir
 		&& let Some(key) = key
 	{
-		listed_files.insert(key, (size, ordinal));
+		listed_files.by_key.insert(key, (size, ordinal));
 	}
 	Ok(())
 }
