@@ -43,6 +43,7 @@ use super::{
 	},
 	read_back::ReadBack,
 	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
+	single_is_one_file,
 };
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,7 @@ async fn plan_compression(
 			config
 				.format
 				.check_within(config.password.is_some(), archives.codec_mem_budget)?;
+			sources.check_for(config.format)?;
 			Ok(extension_len)
 		});
 	let extension_len = match checked {
@@ -442,13 +444,11 @@ fn archive_entries<D>(
 	plan: ItemPlan<D>,
 	format: CompressFormat,
 ) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
+	// the file checked up front may still have been skipped, undecryptable
 	if matches!(format, CompressFormat::Single { .. })
 		&& (plan.files.len() != 1 || !plan.dirs.is_empty())
 	{
-		return Err(Error::custom(
-			ErrorKind::InvalidState,
-			"a single compressed file is made of exactly one file",
-		));
+		return Err(single_is_one_file());
 	}
 	let mut dir_paths: Vec<String> = Vec::with_capacity(plan.dirs.len());
 	let path_in = |parent: DestParent, name: &ValidatedName, dir_paths: &[String]| match parent {
@@ -1021,6 +1021,52 @@ mod tests {
 			pause,
 			cancel,
 			planned,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_single_file_of_a_folder_or_of_two_files_is_refused_before_listing() {
+		let single = CompressFormat::Single {
+			compression: Compression {
+				codec: StreamCodec::Gzip,
+				level: None,
+			},
+		};
+		for (case, sources) in [
+			(
+				"a folder",
+				vec![ItemSource::Dir(ItemSourceDir::Normal(remote_dir("docs")))],
+			),
+			(
+				"two files",
+				vec![
+					ItemSource::File(file("a.txt", 3)),
+					ItemSource::File(file("b.txt", 4)),
+				],
+			),
+		] {
+			let lister = FakeLister::default();
+			let reporter = Reporter::new(Arc::new(Updates::default()));
+			let (_pause, _cancel, control) = controls();
+			let failed = plan_compression(
+				&lister,
+				&ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+				CompressSources::Keep(sources),
+				Uuid::from_u128(1),
+				&ValidatedName::try_from("a.gz").unwrap(),
+				CompressConfig {
+					format: single,
+					max_bytes: None,
+					password: None,
+				},
+				&reporter,
+				&control,
+			)
+			.await
+			.err()
+			.expect(case);
+			assert_eq!(failed.error.kind(), ErrorKind::InvalidState, "{case}");
+			assert!(lister.listed.lock().unwrap().is_empty(), "{case}");
 		}
 	}
 

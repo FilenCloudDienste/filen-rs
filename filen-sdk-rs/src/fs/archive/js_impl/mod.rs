@@ -882,8 +882,10 @@ impl CompressCall {
 		config
 			.format
 			.check_within(config.password.is_some(), codec_mem_budget)?;
+		let sources = compress_sources(items, dispose)?;
+		sources.check_for(config.format)?;
 		Ok(Self {
-			sources: compress_sources(items, dispose)?,
+			sources,
 			destination: DirType::from(destination),
 			name: ValidatedName::try_from(name)?,
 			config,
@@ -960,20 +962,24 @@ pub fn archive_encoder_memory(format: CompressFormat) -> Result<u64, Error> {
 pub struct ArchiveLevels {
 	pub min: u32,
 	pub max: u32,
+	/// The level to preselect: a codec's own default, or 7-Zip's for a 7z method.
+	pub default_level: u32,
 }
 
 /// The levels `format` takes (its own level ignored), for a UI to offer; `undefined` for a
 /// format without levels (a bare tar, a stored zip, a 7z copy). Which of them this device runs
-/// is `archiveMaxLevel`.
+/// is `archiveMaxLevel`, which may be below the default.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveFormatLevels")
 )]
 pub fn archive_format_levels(format: CompressFormat) -> Option<ArchiveLevels> {
-	format.levels().map(|levels| ArchiveLevels {
+	let levels = format.levels()?;
+	Some(ArchiveLevels {
 		min: *levels.start(),
 		max: *levels.end(),
+		default_level: format.default_level()?,
 	})
 }
 

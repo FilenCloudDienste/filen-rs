@@ -11,7 +11,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			compress::{SevenZMethod, StreamCodec, ZipMethod},
+			compress::{Compression, SevenZMethod, StreamCodec, ZipMethod},
 			config::CODEC_MEM_BUDGET,
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
 			zip::crypto::AesStrength,
@@ -228,6 +228,35 @@ fn names_and_passwords_are_checked_at_the_edge() {
 		ErrorKind::InsufficientMemory
 	);
 	assert!(call("a.7z", ppmd, 256 << 20).is_ok());
+
+	// a single compressed file is one file, which the kind of each item tells up front
+	let one = |item| {
+		CompressCall::new(
+			vec![item],
+			destination(),
+			"a.gz",
+			CompressConfig {
+				format: CompressFormat::Single {
+					compression: Compression {
+						codec: StreamCodec::Gzip,
+						level: None,
+					},
+				},
+				max_bytes: None,
+				password: None,
+			},
+			None,
+			CODEC_MEM_BUDGET,
+		)
+	};
+	let folder = AnyItemWithContext::Dir(AnyDirWithContext::Normal(destination()));
+	assert_eq!(one(folder).err().unwrap().kind(), ErrorKind::InvalidState);
+	assert!(
+		one(AnyItemWithContext::File(AnyFile::File(
+			remote_file().into()
+		)))
+		.is_ok()
+	);
 }
 
 #[test]
@@ -296,7 +325,11 @@ fn helpers_tell_a_formats_levels_and_what_fits() {
 	};
 	assert_eq!(
 		archive_format_levels(deflate),
-		Some(ArchiveLevels { min: 1, max: 9 })
+		Some(ArchiveLevels {
+			min: 1,
+			max: 9,
+			default_level: 6
+		})
 	);
 	assert_eq!(
 		archive_format_levels(CompressFormat::Tar { compression: None }),
