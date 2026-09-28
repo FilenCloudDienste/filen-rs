@@ -3425,6 +3425,48 @@ async fn links_to_links_and_to_themselves() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_hard_link_comes_out_with_the_target_its_listing_names() {
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("other.txt", b"other"),
+		hard_link("b", "a.txt"),
+		hard_link("c", "b"),
+	]);
+	let listing = list(
+		&setup("bundle.tar", tar.clone(), |_| {}),
+		JobControl::default(),
+		test_config(),
+	);
+	let listed = listing.running.await.unwrap().unwrap();
+	let target_of = |index: usize| match &listed.entries[index].kind {
+		ArchiveEntryKind::Hardlink { target_id, .. } => target_id.map(|id| id.index),
+		other => panic!("{other:?} is no hard link"),
+	};
+	// each names the entry it copies, a link naming a link
+	assert_eq!((target_of(2), target_of(3)), (Some(0), Some(2)));
+
+	// alone, a link has nothing to copy; with the entries its listing names, it is extracted
+	for (chosen_ids, extracted, skipped) in [
+		(&[3][..], &[][..], &["c"][..]),
+		(&[3, 2, 0], &["a.txt", "b", "c"], &[]),
+	] {
+		let setup = setup("bundle.tar", tar.clone(), |_| {});
+		let job = start(&setup, chosen(chosen_ids, &[]));
+		let report = job.running.await.unwrap().unwrap();
+		assert_eq!(finished_paths(&setup), extracted, "{chosen_ids:?}");
+		assert_eq!(
+			report
+				.skipped
+				.iter()
+				.map(|skipped| skipped.path.as_str())
+				.collect::<Vec<_>>(),
+			skipped,
+			"{chosen_ids:?}"
+		);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_that_waited_for_a_file_that_failed_is_no_item() {
 	let setup = setup("bundle.tar", Vec::new(), |backend| {
 		backend

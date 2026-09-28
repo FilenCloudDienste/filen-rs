@@ -1465,7 +1465,11 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 				"docs/hard",
 				Some("docs/hard"),
 				ArchiveEntryKind::Hardlink {
-					target: "docs/a.txt".into()
+					target: "docs/a.txt".into(),
+					target_id: Some(ArchiveEntryId {
+						archive: LISTED,
+						index: 1,
+					}),
 				},
 				Some(5),
 				None,
@@ -1494,7 +1498,8 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 		(&entries[0].kind, &entries[0].skip),
 		(
 			&ArchiveEntryKind::Hardlink {
-				target: "gone.txt".into()
+				target: "gone.txt".into(),
+				target_id: None,
 			},
 			&Some(ExtractSkipReason::Hardlink {
 				target: String::new()

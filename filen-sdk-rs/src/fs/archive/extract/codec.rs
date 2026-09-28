@@ -1187,9 +1187,9 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 	let mut unread = 0u64;
 	let mut files = 0u64;
 	// what a listing resolves hard links against: the files it says are extracted (hard links
-	// resolved included, which later links may name), by path, with their sizes. An
+	// resolved included, which later links may name), by path, with their sizes and ordinals. An
 	// extraction's driver resolves them against the files it created
-	let mut listed_files = SeededMap::<u64, u64>::default();
+	let mut listed_files = SeededMap::<u64, (u64, u64)>::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -1213,6 +1213,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 			MemberKind::Hardlink { target } => (
 				ArchiveEntryKind::Hardlink {
 					target: display_path(target).0.to_owned(),
+					target_id: None,
 				},
 				None,
 			),
@@ -1243,7 +1244,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 		};
 		// a hard link names an earlier file, the same whatever else it is stored with
 		let link_target = match (&member.kind, &found.kind) {
-			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown }) => {
+			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown, .. }) => {
 				Some((entry_path(target), shown.clone()))
 			}
 			_ => None,
@@ -1254,7 +1255,13 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 					.ok()
 					.and_then(|target| listed_files.get(&link_key(&target)))
 				{
-					Some(&size) => found.size = size,
+					Some(&(size, target)) => {
+						found.size = size;
+						found.kind = ArchiveEntryKind::Hardlink {
+							target: shown,
+							target_id: Some(walk.listed_id(target)),
+						};
+					}
 					None => {
 						found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
 					}
@@ -1273,7 +1280,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 			if walk.list(found, apple_double).map_err(failure)?
 				&& !is_dir && let Some(key) = key
 			{
-				listed_files.insert(key, size);
+				listed_files.insert(key, (size, this));
 			}
 			continue;
 		}
