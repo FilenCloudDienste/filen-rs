@@ -1574,6 +1574,99 @@ fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
 	assert!(read[unread..].iter().all(|read| !read), "{read:?}");
 }
 
+/// A zip of one deflated symlink to `target`, its stream padded with `padding` empty stored
+/// blocks: a few bytes of target stated in as much archive as the padding takes. Built by hand,
+/// as no writer pads a stream.
+fn zip_of_padded_symlink(target: &[u8], padding: usize) -> Vec<u8> {
+	// an empty non-final stored block, then the target in a final one
+	let mut stream = [0u8, 0, 0, 0xff, 0xff].repeat(padding);
+	let len = target.len() as u16;
+	stream.push(1);
+	stream.extend(len.to_le_bytes());
+	stream.extend((!len).to_le_bytes());
+	stream.extend(target);
+	let name = b"link";
+	// version needed, flags, method (deflate), time, date, CRC-32, sizes, name and extra length
+	let common = [
+		&20u16.to_le_bytes()[..],
+		&0u16.to_le_bytes(),
+		&8u16.to_le_bytes(),
+		&0u16.to_le_bytes(),
+		&0x21u16.to_le_bytes(),
+		&crc32fast::hash(target).to_le_bytes(),
+		&(stream.len() as u32).to_le_bytes(),
+		&(target.len() as u32).to_le_bytes(),
+		&(name.len() as u16).to_le_bytes(),
+		&0u16.to_le_bytes(),
+	]
+	.concat();
+	let mut zip = Vec::new();
+	zip.extend(0x0403_4b50u32.to_le_bytes());
+	zip.extend(&common);
+	zip.extend(name);
+	zip.extend(&stream);
+	let mut central = Vec::new();
+	central.extend(0x0201_4b50u32.to_le_bytes());
+	// made by Unix, so the mode in the external attributes counts
+	central.extend(0x0314u16.to_le_bytes());
+	central.extend(&common);
+	// comment length, disk, internal attributes
+	central.extend([0u8; 6]);
+	central.extend((0o120_777u32 << 16).to_le_bytes());
+	// the local header's offset
+	central.extend(0u32.to_le_bytes());
+	central.extend(name);
+	let central_at = zip.len() as u32;
+	zip.extend(&central);
+	zip.extend(0x0605_4b50u32.to_le_bytes());
+	zip.extend([0u8; 4]);
+	zip.extend(1u16.to_le_bytes());
+	zip.extend(1u16.to_le_bytes());
+	zip.extend((central.len() as u32).to_le_bytes());
+	zip.extend(central_at.to_le_bytes());
+	zip.extend([0u8; 2]);
+	zip
+}
+
+#[test]
+fn a_zip_listing_reads_no_padded_symlink_past_its_budget() {
+	// 6 bytes of target in 40 MiB of deflate stream: its stated size is short, and reading it
+	// would fetch the whole archive
+	let zip = zip_of_padded_symlink(b"target", (40 << 20) / 5);
+	let (seen, end, read) = run_job(
+		&zip,
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert!(
+		matches!(
+			&seen[..],
+			[Seen::Opened(_), Seen::Listed(ArchiveEntry { kind: ArchiveEntryKind::Symlink { target }, .. })]
+				if target.is_empty()
+		),
+		"{seen:?}"
+	);
+	// the chunks holding the index, at the archive's end, and at most the listing's budget
+	// besides
+	const INDEX_CHUNKS: usize = 2;
+	let fetched = read.div_ceil(CHUNK_SIZE_U64) as usize;
+	assert!(
+		fetched <= INDEX_CHUNKS + LIST_READ_BYTES as usize / CHUNK_SIZE,
+		"{fetched} chunks fetched"
+	);
+	// a target of a few bytes in a short stream is still read
+	let zip = zip_of_padded_symlink(b"target", 4);
+	let (entries, end) = listed(
+		&zip,
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert!(
+		matches!(&entries[..], [ArchiveEntry { kind: ArchiveEntryKind::Symlink { target }, .. }] if target == "target"),
+		"{entries:?}"
+	);
+}
+
 #[test]
 fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 	let data = apple_double_data();

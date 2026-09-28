@@ -436,7 +436,8 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 /// data is stored, so the archive is read front to back once, however its index orders them,
 /// rather than a chunk fetched again for each; and only until reading them has fetched
 /// [`LIST_READ_BYTES`] of the archive or they hold that much: the links past it are listed
-/// with their targets unread. An overlapping entry's data is never read.
+/// with their targets unread, as is one whose data would take the reading past it. An
+/// overlapping entry's data is never read.
 fn zip_symlink_targets(
 	port: &WorkerPort,
 	source: &mut SeekInput<'_>,
@@ -452,8 +453,13 @@ fn zip_symlink_targets(
 		.iter()
 		.filter(|entry| entry.kind == ZipKind::Symlink)
 	{
-		if port.shared().input_bytes() - first_read > LIST_READ_BYTES || held > LIST_READ_BYTES {
+		let fetched = port.shared().input_bytes() - first_read;
+		if fetched > LIST_READ_BYTES || held > LIST_READ_BYTES {
 			break;
+		}
+		// its stated compressed size is what reading it fetches, however short its target
+		if fetched.saturating_add(entry.compressed_size) > LIST_READ_BYTES {
+			continue;
 		}
 		let target = zip_symlink_target(source, index.shift, entry, password, limits);
 		if !target.is_empty() {
@@ -464,6 +470,11 @@ fn zip_symlink_targets(
 	targets.sort_unstable_by_key(|(ordinal, _)| *ordinal);
 	targets
 }
+
+/// Most compressed data a symlink's target is read from: twice the longest path, room for any
+/// method's overhead on a real one. A stream padded out (with empty deflate blocks, say) past it
+/// states a short target in as much of the archive as it likes.
+const MAX_TARGET_COMPRESSED: u64 = 2 * MAX_ARCHIVE_PATH_BYTES as u64;
 
 /// A symlink entry's target, for reporting: its data, when small and readable.
 fn zip_symlink_target<R: Read + std::io::Seek>(
@@ -476,6 +487,7 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	// an encrypted target is left unread: each one would cost a key derivation, and an archive
 	// of nothing but encrypted links would spend minutes on them creating nothing
 	if entry.size > MAX_ARCHIVE_PATH_BYTES as u64
+		|| entry.compressed_size > MAX_TARGET_COMPRESSED
 		|| !zip_supported(entry)
 		|| entry.encryption != ZipEncryption::None
 	{
