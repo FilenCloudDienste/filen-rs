@@ -209,7 +209,7 @@ measured.
 | `twoway_small_delete_10k` | Ten deletions: under the guard's floor, so they are PLANNED. The control for the mass delete below. |
 | `twoway_mass_delete_10k` | Sixty per cent deleted. Past the guard's limit (half the tracked set) — and past the changelist cap (a quarter) on the way, which is why a guard-tripping delete is necessarily a WHOLE pass on a watched pair. Asserts `actions: 0` AND `held: one per deleted file`, so "the guard held everything" cannot read as "the pass did nothing". |
 | `twoway_rename_storm_10k` | Renames in place, announced as the two-ended event a watcher reports. |
-| `twoway_dir_move_*` | One directory renamed, carrying its subtree. The case that cost 63 seconds before it was narrowed. Pins `dir_moves`, so a re-upload of the subtree cannot pass as a fold. Folding the move is also a WRITE to the pass's own copy of the baseline, so its fresh-child widest point is where a copy of the resident tree shows. |
+| `twoway_dir_move_*` | One directory renamed — the DEEPEST one, a leaf of twenty files. The case that cost 63 seconds before it was narrowed. Pins `dir_moves`, so a re-upload of the subtree cannot pass as a fold. Because the moved directory is a leaf, its cost says nothing about how a fold scales with what the directory holds: `twoway_top_dir_move_100k` (group 4) is the other end. |
 | `twoway_after_upload_*` | The pass after an upload: one per cent of the files carry the row an unconfirmed push of ours leaves (the content and version this side wrote, the agreed-content marker still on the previous content), each announced long enough ago to confirm, plus ONE edited file so the plan pins `actions: 1`. The run also asserts the pass confirmed every push, so a pass that stopped confirming — and so stopped writing to its copy of the baseline — cannot report itself cheap. It prices that write: the other one, besides a folded move, a change-scoped pass makes to its baseline. |
 | `twoway_both_changelists_10k` | The only scenario whose REMOTE changelist is non-empty: one announced remote upsert per local edit, so `observe_remote` is priced against a real delta rather than an empty list. It is NOT a conflict scenario — see below. |
 | `twoway_first_sync_*` | No baseline at all. Reads both sides whole for `EmptyBaseline` and plans the ENTIRE tree (`actions: one per node`). The only row that hashes the whole tree — see what is not covered, below. |
@@ -261,9 +261,19 @@ rule files in it, which is listed below as not covered.
 
 ## Group 4 — sizes
 
-The three headline classes at 1k, 10k, 100k and 1M, plus the two passes that write
-to their own copy of the baseline — `twoway_dir_move_*` and `twoway_after_upload_*`
-— at 100k and 1M. A figure is only ever read
+The three headline classes at 1k, 10k, 100k and 1M, plus the two passes that edit
+their own view of the baseline — `twoway_dir_move_*` and `twoway_after_upload_*`
+— at 100k and 1M.
+
+`twoway_top_dir_move_100k` renames a directory holding HALF the pair: its own shape,
+two top-level directories of 50k files each (50000/1/73 ASCII), one of them moved. It
+is what a folded move costs as the moved directory grows. The memory child bounds the
+pass's baseline edits by what it edited (one move, one confirmation: a fixed number of
+bytes each), so a fold that wrote the rows it carries fails there rather than printing
+a large widest point. Its local observation of the 50k files it finds at the new path is
+per-pass data and still scales with the move — that is the scan, not the baseline.
+
+A figure is only ever read
 per node against the tree it was taken on, which is why every record carries the
 node count the fixture actually held.
 
