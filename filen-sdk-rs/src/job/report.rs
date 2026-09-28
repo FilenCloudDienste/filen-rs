@@ -36,6 +36,8 @@ use crate::{
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RunState {
+	/// Running, and also a job an error stopped while it winds down: that one ignores a pause,
+	/// as there is nothing left to pause, and reports `Cancelling` only once it is cancelled too.
 	Running,
 	/// A pause was requested and in-flight work is still finishing.
 	Pausing,
@@ -496,5 +498,103 @@ impl<R> From<JobFailed<R>> for Error {
 		drop(report);
 		Arc::try_unwrap(error)
 			.unwrap_or_else(|shared| Error::custom_with_source(shared.kind(), shared, None::<&str>))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::job::test_support::controls;
+
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	enum Phase {
+		Working,
+		Done,
+		Cancelled,
+		Failed,
+	}
+
+	impl JobPhase for Phase {
+		const DONE: Self = Self::Done;
+		const CANCELLED: Self = Self::Cancelled;
+		const FAILED: Self = Self::Failed;
+	}
+
+	/// A job of 10 units, of which `done` are done.
+	struct State {
+		core: RunCore<(), Phase>,
+		done: u64,
+	}
+
+	/// The run state and whether time left was estimated, of each update.
+	type Seen = Mutex<Vec<(RunState, bool)>>;
+
+	impl JobState for State {
+		type Phase = Phase;
+		type Event = ();
+		type Callback = Seen;
+
+		fn core(&mut self) -> &mut RunCore<(), Phase> {
+			&mut self.core
+		}
+
+		fn progress(&self) -> Progress {
+			Progress {
+				bytes_done: self.done,
+				units: Units {
+					done: self.done,
+					settled: self.done,
+					total: 10,
+				},
+			}
+		}
+
+		fn deliver(&mut self, seen: &Seen, snapshot: Snapshot<(), Phase>) {
+			seen.lock()
+				.unwrap()
+				.push((snapshot.run_state, snapshot.eta.is_some()));
+		}
+
+		fn settle(&mut self) {}
+	}
+
+	#[test]
+	fn a_job_an_error_stopped_runs_on_until_a_cancel() {
+		let reporter = Reporter::from_parts(
+			State {
+				core: RunCore::new(Phase::Working),
+				done: 0,
+			},
+			Box::new(Seen::default()),
+		);
+		// two updates of progress: time left can be told
+		for done in 1..=2 {
+			reporter.with_state(|state| {
+				state.done = done;
+				state.core().mark_urgent();
+			});
+		}
+		let (_pause, cancel, control) = controls();
+		reporter.set_pause_requested(true);
+		// an error stops the paused job: it winds down, running, and a pause asked again changes
+		// nothing, with no time left to estimate
+		reporter.wind_down(&control);
+		reporter.set_pause_requested(false);
+		reporter.set_pause_requested(true);
+		// until it is cancelled
+		cancel.send_replace(true);
+		reporter.wind_down(&control);
+		assert_eq!(
+			*reporter.callback.lock().unwrap(),
+			[
+				(RunState::Running, false),
+				(RunState::Running, true),
+				(RunState::Paused, true),
+				(RunState::Running, false),
+				(RunState::Running, false),
+				(RunState::Running, false),
+				(RunState::Cancelling, false),
+			]
+		);
 	}
 }
