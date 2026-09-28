@@ -51,6 +51,9 @@ pub mod probe;
 mod scan;
 // The two sides a pass reconciles, behind the narrowest access each consumer needs.
 mod side;
+// The resident baseline tree a pass used to read its rows from: now the oracle the store-backed
+// reader (`rows`) is held to in the tests, and a structure the probe still sizes.
+#[cfg(any(test, feature = "bench-internals"))]
 mod tree;
 mod watch;
 

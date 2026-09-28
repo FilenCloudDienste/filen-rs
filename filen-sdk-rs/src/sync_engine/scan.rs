@@ -256,6 +256,36 @@ pub(super) fn collision_key(rel_path: &str) -> String {
 	rel_path.chars().flat_map(char::to_lowercase).collect()
 }
 
+/// Whether `path` IS `prefix`, or lies under it, folded the way [`collision_key`] folds, but
+/// without materializing either folded form.
+///
+/// The question a directory move asks of the two side maps about its destination. Folding each
+/// key into a [`collision_key`](super::scan::collision_key) first allocates a `String` for every
+/// key of the whole tree, to learn — for all but a handful of them — that the very first character
+/// already differs. This stops at that character.
+pub(super) fn at_or_under_folded(path: &str, prefix: &str) -> bool {
+	// Almost every name on a real drive is ASCII, where folding a byte is one instruction and
+	// `char::to_lowercase` is a table lookup returning an iterator. The two agree on ASCII by
+	// construction — `to_lowercase` maps an ASCII char to exactly one ASCII char — so the fast
+	// path is the same answer, not an approximation.
+	if path.is_ascii() && prefix.is_ascii() {
+		let (path, prefix) = (path.as_bytes(), prefix.as_bytes());
+		return path.len() >= prefix.len()
+			&& path[..prefix.len()].eq_ignore_ascii_case(prefix)
+			&& path.get(prefix.len()).is_none_or(|&byte| byte == b'/');
+	}
+	// Comparing the two folded CHARACTER streams is comparing the two folded strings: a lowercase
+	// expansion never yields `/`, so the separator can only be matched by a real one, and a prefix
+	// that runs out mid-expansion leaves a character that is not `/` and is refused here.
+	let mut folded = path.chars().flat_map(char::to_lowercase);
+	for want in prefix.chars().flat_map(char::to_lowercase) {
+		if folded.next() != Some(want) {
+			return false;
+		}
+	}
+	matches!(folded.next(), None | Some('/'))
+}
+
 /// A 128-bit digest of a [`collision_key`], for the per-pass sets that only ever ask whether some
 /// other entry folded the same way. Keeping the digest instead of the key costs 16 bytes an entry
 /// rather than a second copy of every path; every hit is checked against the real paths, so two

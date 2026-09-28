@@ -15,6 +15,7 @@ use std::{
 
 use chrono::Utc;
 use filen_types::fs::ParentUuid;
+use futures::FutureExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -1405,7 +1406,7 @@ impl SyncEngine {
 	pub(super) async fn bench_load_pair(
 		&self,
 		pair: PairId,
-	) -> Result<(usize, usize, super::tree::ResidentTerms), Error> {
+	) -> Result<(usize, usize, super::rows::ResidentTerms), Error> {
 		let store = self.pair_store(pair).await?;
 		let baseline = locked(&store)
 			.baseline(pair)
@@ -4688,7 +4689,12 @@ impl SyncEngine {
 	) -> Result<SyncReport, Error> {
 		let mut contained = super::events::contain_panics(observer);
 		let observer: &mut (dyn FnMut(SyncEvent) + Send) = &mut contained;
-		let result = self.run_pass(pair, observer, when_idle).await;
+		// A pass that panics — a baseline read that failed, which is a panic on purpose so that it is
+		// never read as an absent row, or any broken invariant — fails as a PASS: the error goes to
+		// the caller, and a watch loop backs off and runs the next one instead of dying with the
+		// pass and leaving the pair silently unsynced. Everything the pass held is released by the
+		// unwind; the next pass is forced whole below, like any failed one.
+		let result = pass_panics_as_errors(pair, self.run_pass(pair, observer, when_idle)).await;
 		// What this pass's outcome means for the NEXT one's scope, wherever it ended. A pass that
 		// failed outright took both changelists and applied nothing, so what it took is reflected
 		// nowhere and the next pass cannot rely on them.
@@ -5134,6 +5140,28 @@ impl SyncEngine {
 		});
 		Ok(report)
 	}
+}
+
+/// `pass`, with a panic inside it answered as the pass's error (see [`SyncEngine::sync_pass`]).
+async fn pass_panics_as_errors<T>(
+	pair: PairId,
+	pass: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+	std::panic::AssertUnwindSafe(pass)
+		.catch_unwind()
+		.await
+		.unwrap_or_else(|panic| {
+			let what = panic
+				.downcast_ref::<&str>()
+				.map(|message| (*message).to_string())
+				.or_else(|| panic.downcast_ref::<String>().cloned())
+				.unwrap_or_else(|| "a panic with no message".to_string());
+			tracing::error!("sync_once[pair {pair}]: the pass panicked: {what}");
+			Err(Error::custom(
+				ErrorKind::Internal,
+				format!("the pass panicked: {what}"),
+			))
+		})
 }
 
 /// What a finished pass's outcome means for the NEXT pass's scope: the rows of the full-pass
@@ -8495,6 +8523,36 @@ mod tests {
 			"a.txt".to_string(),
 			written_at("a.txt", uuid, NodeKind::File, Some(hash)),
 		)])
+	}
+
+	/// A pass that panics — a baseline read that failed panics on purpose — comes back as the
+	/// pass's error, which the watch loop backs off on, instead of unwinding into the loop's task
+	/// and ending it without a word.
+	#[tokio::test]
+	async fn a_panicking_pass_fails_as_a_pass() {
+		let failed = pass_panics_as_errors::<()>(7, async {
+			panic!("reading pair 7's baseline rows failed: disk I/O error")
+		})
+		.await
+		.expect_err("a pass that panicked is a failed pass");
+		assert!(
+			failed
+				.to_string()
+				.contains("the pass panicked: reading pair 7's baseline rows failed"),
+			"{failed}"
+		);
+		let owned = pass_panics_as_errors::<()>(7, async { panic!("{}", String::from("owned")) })
+			.await
+			.expect_err("a pass that panicked is a failed pass");
+		assert!(
+			owned.to_string().contains("the pass panicked: owned"),
+			"{owned}"
+		);
+		assert!(
+			pass_panics_as_errors(7, async { Ok(3) })
+				.await
+				.is_ok_and(|n| n == 3)
+		);
 	}
 
 	/// The restart this journal exists for: the engine that made the write is gone, and the one
