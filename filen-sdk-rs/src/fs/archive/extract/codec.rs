@@ -1186,8 +1186,9 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 	let mut ordinal = 0;
 	let mut unread = 0u64;
 	let mut files = 0u64;
-	// what a listing resolves hard links against: the files it says are extracted, by path, with
-	// their sizes. An extraction's driver resolves them against the files it created
+	// what a listing resolves hard links against: the files it says are extracted (hard links
+	// resolved included, which later links may name), by path, with their sizes. An
+	// extraction's driver resolves them against the files it created
 	let mut listed_files = SeededMap::<u64, u64>::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
@@ -1268,9 +1269,9 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 			};
 			let key = found.path.as_ref().ok().map(link_key);
 			let size = found.size;
-			let is_file = found.kind == ArchiveEntryKind::File;
+			let is_dir = found.kind == ArchiveEntryKind::Dir;
 			if walk.list(found, apple_double).map_err(failure)?
-				&& is_file && let Some(key) = key
+				&& !is_dir && let Some(key) = key
 			{
 				listed_files.insert(key, size);
 			}

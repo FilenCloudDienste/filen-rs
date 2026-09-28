@@ -3403,6 +3403,25 @@ async fn links_to_links_and_to_themselves() {
 	// the skipped links are no items
 	assert_eq!(report.counts.files_done, 3);
 	assert_released(&setup, &job.reporter, &job.recorder);
+
+	// a listing tells the same of each link
+	let listing = list(&setup, JobControl::default(), test_config());
+	let listed = listing.running.await.unwrap().unwrap();
+	assert_eq!(
+		listed
+			.entries
+			.iter()
+			.map(|entry| (entry.stored_path.as_str(), entry.size, entry.skip.is_some()))
+			.collect::<Vec<_>>(),
+		[
+			("a.txt", Some(5), false),
+			("b", Some(5), false),
+			("c", Some(5), false),
+			("self", Some(0), true),
+			("d", Some(0), true),
+		]
+	);
+	assert_eq!(listed.totals.files, report.counts.files_done);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
