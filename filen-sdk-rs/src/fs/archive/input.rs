@@ -445,7 +445,7 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	}
 	// leased and floored before the codec starts, so a waiting job holds nothing
 	let Ok((lease, floor)) = config.admit(control, &reporter.ops()).await else {
-		reporter.set_cancelling();
+		reporter.wind_down(control);
 		return Err((S::Phase::CANCELLED, cancelled(job)));
 	};
 	reporter.set_phase(reading);

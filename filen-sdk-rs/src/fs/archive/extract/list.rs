@@ -526,7 +526,7 @@ impl<B: DriveBackend> Lister<B> {
 			if self.control.is_stopping() {
 				// nothing a listing does has to finish
 				self.feed.drop_all();
-				self.reporter.set_cancelling();
+				self.reporter.wind_down(&self.control);
 				return Err(Stopped);
 			}
 			if self.feed.events_closed() && (self.end.is_some() || self.fatal.error().is_some()) {

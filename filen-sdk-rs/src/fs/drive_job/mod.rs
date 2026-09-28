@@ -61,11 +61,11 @@ impl Fatal {
 	}
 
 	/// Ends the job with `error`, unless an earlier error already did: nothing new starts, and it
-	/// reports itself winding down.
+	/// winds down (reported cancelling only when it was cancelled as well).
 	pub(crate) fn stop(&mut self, error: Arc<Error>, control: &JobControl, job: &impl JobTick) {
 		self.record(error);
 		control.stop();
-		job.set_cancelling();
+		job.wind_down(control);
 	}
 
 	/// Ends the job with an item's `error` when nothing else can succeed after it ([`ends_job`])

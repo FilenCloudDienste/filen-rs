@@ -355,7 +355,7 @@ where
 			let stopping = self.control.is_stopping();
 			if stopping || pause_requested {
 				if stopping {
-					self.reporter.set_cancelling();
+					self.reporter.wind_down(&self.control);
 				}
 				if in_flight.is_empty() {
 					keep_warm = None;
@@ -526,7 +526,7 @@ where
 			self.reporter.set_pause_requested(pause_requested);
 			let stopping = self.control.is_stopping();
 			if stopping {
-				self.reporter.set_cancelling();
+				self.reporter.wind_down(&self.control);
 			}
 			if !stopping && !pause_requested {
 				while tasks.len() < MAX_SMALL_PARALLEL_REQUESTS && next < self.plan.files.len() {

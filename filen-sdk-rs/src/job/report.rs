@@ -96,6 +96,10 @@ pub(crate) struct RunCore<E, P> {
 	phase: P,
 	pause_requested: bool,
 	paused: bool,
+	/// Winding down, for a cancel or an error that ended the job: nothing new starts, so it
+	/// neither pauses nor has time left to estimate.
+	stopping: bool,
+	/// Winding down for a cancel.
 	cancelling: bool,
 	/// Whether anything (counters included) moved since the last update.
 	changed: bool,
@@ -112,6 +116,7 @@ impl<E, P: JobPhase> RunCore<E, P> {
 			phase,
 			pause_requested: false,
 			paused: false,
+			stopping: false,
 			cancelling: false,
 			changed: true,
 			clock,
@@ -125,7 +130,8 @@ impl<E, P: JobPhase> RunCore<E, P> {
 			RunState::Cancelling
 		} else if self.paused {
 			RunState::Paused
-		} else if self.pause_requested {
+		} else if self.pause_requested && !self.stopping {
+			// a job an error ended runs on to its end whatever was asked
 			RunState::Pausing
 		} else {
 			RunState::Running
@@ -164,7 +170,7 @@ impl<E, P: JobPhase> RunCore<E, P> {
 			events,
 			bytes_per_second: self.rate.bytes_per_second(),
 			// a job winding down does nothing more, so there is no time left to estimate
-			eta: if self.cancelling && !self.phase.is_terminal() {
+			eta: if self.stopping && !self.phase.is_terminal() {
 				None
 			} else {
 				self.rate
@@ -201,8 +207,9 @@ pub(crate) trait JobTick: MaybeSendSync {
 	/// Records whether a pause is requested; the job counts as paused once no operation is in
 	/// flight.
 	fn set_pause_requested(&self, requested: bool);
-	/// A cancel overrides a pause: the job winds down instead of pausing.
-	fn set_cancelling(&self);
+	/// The job winds down, cancelled through `control` or ended by an error: a stop overrides
+	/// a pause (see [`Reporter::wind_down`]).
+	fn wind_down(&self, control: &JobControl);
 }
 
 /// A handle to a job's reporter for code that does not know which job it works for.
@@ -228,8 +235,8 @@ impl Ops {
 		self.0.set_pause_requested(requested);
 	}
 
-	pub(crate) fn set_cancelling(&self) {
-		self.0.set_cancelling();
+	pub(crate) fn wind_down(&self, control: &JobControl) {
+		self.0.wind_down(control);
 	}
 }
 
@@ -337,7 +344,7 @@ impl<S: JobState> Reporter<S> {
 		let result = control.checkpoint().await;
 		self.set_pause_requested(control.is_pause_requested());
 		if result.is_err() {
-			self.set_cancelling();
+			self.wind_down(control);
 		}
 		result
 	}
@@ -357,7 +364,7 @@ impl<S: JobState> Reporter<S> {
 	fn update_paused(&self, state: &mut S, now: Duration) {
 		let in_flight = self.ops_in_flight.load(Ordering::SeqCst);
 		let core = state.core();
-		let paused = core.pause_requested && !core.cancelling && in_flight == 0;
+		let paused = core.pause_requested && !core.stopping && in_flight == 0;
 		if paused != core.paused {
 			core.paused = paused;
 			if paused {
@@ -384,12 +391,23 @@ impl<S: JobState> Reporter<S> {
 		});
 	}
 
-	/// A cancel overrides a pause: the job winds down instead of pausing.
+	/// A cancel overrides a pause: the job winds down instead of pausing, reported cancelling.
 	pub(crate) fn set_cancelling(&self) {
+		self.stop(true);
+	}
+
+	/// The job winds down, and stops overriding a pause: reported cancelling when `control`
+	/// cancelled it, and running on to its end when an error did.
+	pub(crate) fn wind_down(&self, control: &JobControl) {
+		self.stop(control.is_cancelled());
+	}
+
+	fn stop(&self, cancelled: bool) {
 		self.with_state(|state| {
 			let core = state.core();
-			if !core.cancelling {
-				core.cancelling = true;
+			if !core.stopping || cancelled && !core.cancelling {
+				core.stopping = true;
+				core.cancelling |= cancelled;
 				core.mark_urgent();
 			}
 		});
@@ -430,8 +448,8 @@ impl<S: JobState> JobTick for Reporter<S> {
 		Reporter::set_pause_requested(self, requested);
 	}
 
-	fn set_cancelling(&self) {
-		Reporter::set_cancelling(self);
+	fn wind_down(&self, control: &JobControl) {
+		Reporter::wind_down(self, control);
 	}
 }
 

@@ -249,7 +249,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	reporter.set_pause_requested(control.is_pause_requested());
 	reporter.set_phase(CompressPhase::WaitingForWorker);
 	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
-		reporter.set_cancelling();
+		reporter.wind_down(&control);
 		return Err(fail(report, CompressPhase::Cancelled, cancelled()));
 	};
 	reporter.set_phase(CompressPhase::Compressing);

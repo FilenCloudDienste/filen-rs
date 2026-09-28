@@ -981,6 +981,15 @@ async fn running_out_of_storage_ends_the_job() {
 		"the copy returns the failure's own error"
 	);
 	assert_eq!(recorder.last().phase, CopyPhase::Failed);
+	// ended by an error, not cancelled
+	assert!(
+		recorder
+			.updates
+			.lock()
+			.unwrap()
+			.iter()
+			.all(|update| update.run_state != RunState::Cancelling)
+	);
 }
 
 fn max_storage_error() -> Arc<Error> {

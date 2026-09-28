@@ -818,7 +818,7 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Drops the transfers in flight; the files they belonged to are abandoned.
 	fn drop_transfers(&mut self) {
-		self.reporter.set_cancelling();
+		self.reporter.wind_down(&self.control);
 		self.feed.drop_all();
 		self.held = None;
 		self.link_sources = FuturesUnordered::new();
@@ -1031,7 +1031,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.pause().await?;
 			}
 			if self.control.is_stopping() {
-				self.reporter.set_cancelling();
+				self.reporter.wind_down(&self.control);
 				return Err(Stopped);
 			}
 			let task = DirTask {
