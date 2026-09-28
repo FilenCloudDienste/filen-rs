@@ -4,17 +4,23 @@
 //! reader connections (see [`Readers`]) with a read transaction open on it, and every question the
 //! pass asks becomes an indexed statement against the table as that transaction sees it.
 //!
-//! # One consistent state for the whole pass
+//! # One consistent state for the whole plan
 //!
 //! The file is in WAL mode, so the transaction pins the snapshot it first read — the counts, read
 //! by [`Snapshot::begin`] itself — for as long as it stays open, whatever the store's own
 //! connection commits meanwhile. That is what a pass used to get from the immutable `Arc` of the
-//! resident tree, and it matters for more than other writers: a pass WRITES while it reads, and
-//! the apply layer's lookups have to keep answering from the rows the plan was made from rather than
-//! from the ones the pass has just committed. The pass gate and the reading lock serialize a pair's
-//! passes and keep `resolve_conflict` out; this transaction is what keeps the pass consistent with
-//! itself. It ends when the last clone of the pass's [`Baseline`](super::Baseline) is dropped, and
-//! the connection goes back to the store for the next pass.
+//! resident tree, and it matters for more than other writers: a pass WRITES while it plans (the
+//! confirmations it persists, the conflicts it records), and its reads have to keep answering from
+//! the rows the plan is being made from rather than from the ones the pass has just committed. The
+//! pass gate and the reading lock serialize a pair's passes and keep `resolve_conflict` out; this
+//! transaction is what keeps the plan consistent with itself.
+//!
+//! It ends when the plan does. An open reader is a mark no checkpoint can pass, so held through the
+//! apply it would grow the `-wal` file by every commit the apply made — one per action — and by every
+//! other pair's, for as long as the apply ran, a suspended one included. So the pass freezes the rows
+//! at the paths its actions name out of it ([`Baseline::freeze`](super::Baseline::freeze)) — the
+//! apply reads nothing else, and the plan's rows are what it has to read — and the last clone of the
+//! snapshot is dropped there, handing the connection back to the store for the next pass.
 //!
 //! # A failed read is a panic, never an absence
 //!
@@ -35,7 +41,59 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::super::baseline::{BaselineEntry, BaselineStore, ENTRY_COLUMNS, PairId, Readers};
+use super::super::baseline::{
+	BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind, PairId, Readers,
+};
+
+/// How many statements the pass's reads ran, and how many rows they handed back, in this process —
+/// the benchmark's count of what a pass asked the store (see `bench::MemAnswer`).
+#[cfg(feature = "bench-internals")]
+static STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "bench-internals")]
+static ROWS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(statements, rows)` read so far (see [`STATEMENTS`]).
+#[cfg(feature = "bench-internals")]
+pub(in super::super) fn reads() -> (u64, u64) {
+	use std::sync::atomic::Ordering;
+	(
+		STATEMENTS.load(Ordering::Relaxed),
+		ROWS_READ.load(Ordering::Relaxed),
+	)
+}
+
+/// Zero the counters, so what follows is measured on its own.
+#[cfg(feature = "bench-internals")]
+pub(in super::super) fn reset_reads() {
+	use std::sync::atomic::Ordering;
+	STATEMENTS.store(0, Ordering::Relaxed);
+	ROWS_READ.store(0, Ordering::Relaxed);
+}
+
+/// What one statement handed back, counted in rows for [`ROWS_READ`].
+trait Answer {
+	// Counted only where there is a counter to count into.
+	#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
+	fn rows(&self) -> usize;
+}
+
+impl<T> Answer for Vec<T> {
+	fn rows(&self) -> usize {
+		self.len()
+	}
+}
+
+impl<T> Answer for Option<T> {
+	fn rows(&self) -> usize {
+		usize::from(self.is_some())
+	}
+}
+
+impl Answer for bool {
+	fn rows(&self) -> usize {
+		usize::from(*self)
+	}
+}
 
 /// How many rows one enumerating statement reads before it lets the connection go.
 ///
@@ -189,8 +247,26 @@ static RANGE: LazyLock<[[String; 2]; 2]> = LazyLock::new(|| {
 		[range_sql(true, false), range_sql(true, true)],
 	]
 });
+static DIRS: LazyLock<[[String; 2]; 2]> = LazyLock::new(|| {
+	[
+		[dirs_sql(false, false), dirs_sql(false, true)],
+		[dirs_sql(true, false), dirs_sql(true, true)],
+	]
+});
 static UNSYNCED: LazyLock<[String; 2]> =
 	LazyLock::new(|| [unsynced_sql(false), unsynced_sql(true)]);
+
+/// The directory rows from a path on — strictly below a bound when `bounded` — in path order, off
+/// the partial index that holds nothing else.
+fn dirs_sql(inclusive: bool, bounded: bool) -> String {
+	format!(
+		"SELECT {ENTRY_COLUMNS} FROM baseline INDEXED BY baseline_dirs
+		 WHERE pair_id = ?1 AND kind = {} AND rel_path {} ?2{} ORDER BY rel_path",
+		NodeKind::Dir.as_i64(),
+		if inclusive { ">=" } else { ">" },
+		if bounded { " AND rel_path < ?3" } else { "" },
+	)
+}
 
 fn unconfirmed_sql() -> String {
 	format!(
@@ -252,18 +328,27 @@ impl Snapshot {
 		})
 	}
 
-	fn with<T>(&self, what: &str, read: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> T {
+	fn with<T: Answer>(
+		&self,
+		what: &str,
+		read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+	) -> T {
+		#[cfg(feature = "bench-internals")]
+		STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 		let guard = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
 		let conn = guard
 			.as_ref()
 			.expect("a snapshot holds its connection until it is dropped");
-		read(conn).unwrap_or_else(|error| {
+		let answer = read(conn).unwrap_or_else(|error| {
 			panic!(
 				"reading pair {}'s baseline rows ({what}) failed: {error} — refusing to read a \
 				 failed read as an absent row",
 				self.pair
 			)
-		})
+		});
+		#[cfg(feature = "bench-internals")]
+		ROWS_READ.fetch_add(answer.rows() as u64, std::sync::atomic::Ordering::Relaxed);
+		answer
 	}
 
 	/// What the last page read says about `rel_path`, where it can say.
@@ -328,6 +413,37 @@ impl Snapshot {
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&page));
 		page
+	}
+
+	/// Up to `limit` DIRECTORY rows from `from` on, strictly below `to` when there is one, in path
+	/// order. Not a contiguous stretch of the table — the files between them are skipped — so it
+	/// answers no point question and is not kept as the last page.
+	pub(super) fn dir_page(
+		&self,
+		from: &str,
+		inclusive: bool,
+		to: Option<&str>,
+		limit: usize,
+	) -> Arc<Page> {
+		let rows: Vec<BaselineEntry> = self.with("a range of directory rows", |conn| {
+			let mut statement =
+				conn.prepare_cached(&DIRS[usize::from(inclusive)][usize::from(to.is_some())])?;
+			let rows = match to {
+				Some(to) => statement
+					.query_map(params![self.pair, from, to], BaselineStore::row_to_entry)?,
+				None => {
+					statement.query_map(params![self.pair, from], BaselineStore::row_to_entry)?
+				}
+			};
+			rows.take(limit).collect()
+		});
+		Arc::new(Page {
+			from: from.to_string(),
+			inclusive,
+			to: to.map(str::to_string),
+			complete: rows.len() < limit,
+			rows,
+		})
 	}
 
 	fn rows_from(
@@ -507,7 +623,31 @@ mod tests {
 				.unwrap()
 		};
 		let primary = "PRIMARY KEY";
-		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 15] = [
+		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 19] = [
+			(
+				dirs_sql(false, false),
+				vec![&1_i64, &"a"],
+				"baseline_dirs",
+				"(pair_id=? AND rel_path>?)",
+			),
+			(
+				dirs_sql(true, false),
+				vec![&1_i64, &"a"],
+				"baseline_dirs",
+				"(pair_id=? AND rel_path>?)",
+			),
+			(
+				dirs_sql(false, true),
+				vec![&1_i64, &"a/", &"a0"],
+				"baseline_dirs",
+				"(pair_id=? AND rel_path>? AND rel_path<?)",
+			),
+			(
+				dirs_sql(true, true),
+				vec![&1_i64, &"a/", &"a0"],
+				"baseline_dirs",
+				"(pair_id=? AND rel_path>? AND rel_path<?)",
+			),
 			(
 				UNCONFIRMED_PATHS.to_string(),
 				vec![&1_i64],

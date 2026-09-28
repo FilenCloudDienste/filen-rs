@@ -1772,12 +1772,19 @@ fn reconcile_two_way(
 /// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
 /// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
 /// its source and the insert of its destination in a single transaction.
+///
+/// `dirs_only` narrows a whole pass's visit to the directory rows, off an index holding nothing
+/// else: a visitor that only wants directories then reads a few per cent of the rows, not all of
+/// them — once per directory move the fold carries. A change-scoped pass visits its own paths
+/// either way.
 fn visit_move_sources(
 	paths: PassPaths<'_>,
 	baseline: &Baseline,
+	dirs_only: bool,
 	mut visit: impl FnMut(&BaselineEntry),
 ) {
 	match paths {
+		PassPaths::Whole if dirs_only => baseline.visit_dir_rows(visit),
 		PassPaths::Whole => baseline.visit_rows(visit),
 		PassPaths::Changed(changed) => {
 			let mut rows = baseline.cursor();
@@ -1880,7 +1887,7 @@ fn detect_moves<'m>(
 			}
 			remote_path_of_uuid.insert(node.remote_uuid, path);
 		});
-		visit_move_sources(paths, baseline, |base| {
+		visit_move_sources(paths, baseline, false, |base| {
 			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
@@ -2016,7 +2023,7 @@ fn detect_moves<'m>(
 					.push(path);
 			}
 		});
-		visit_move_sources(paths, baseline, |base| {
+		visit_move_sources(paths, baseline, false, |base| {
 			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
@@ -2380,7 +2387,7 @@ fn next_dir_move<'m>(
 	// directories are a small fraction of the rows — so the visitor checks that against a row it did
 	// not allocate, and a path is copied only for a row that is actually a candidate.
 	let mut sources: Vec<(String, Uuid)> = Vec::new();
-	visit_move_sources(paths, baseline, |row| {
+	visit_move_sources(paths, baseline, true, |row| {
 		if row.kind == NodeKind::Dir
 			&& row.state == BaselineState::Synced
 			&& let Some(uuid) = row.remote_uuid

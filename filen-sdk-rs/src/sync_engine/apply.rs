@@ -226,7 +226,9 @@ pub(super) struct ApplyContext<'a> {
 	/// unmeasurable — and the alternative is two type parameters threaded through every function
 	/// in this module.
 	pub(super) local: &'a (dyn NodesAt<Node = LocalNode> + Send + Sync),
-	/// The pair's baseline as of the start of the pass — what the local side is expected to hold.
+	/// The pair's baseline as of the start of the pass — what the local side is expected to hold —
+	/// FROZEN at the paths the plan's actions name and their ancestors (see `Baseline::freeze`):
+	/// every lookup here, and every carried node `local` and `remote` derive, is one of those.
 	pub(super) baseline: &'a Baseline,
 	pub(super) remote: &'a (dyn NodesAt<Node = RemoteNode> + Send + Sync),
 	/// The sync root resolved to a remote directory (every top-level parent).
@@ -384,6 +386,12 @@ pub(super) async fn apply(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
+	// Every commit below would otherwise land behind the pass's open read transaction, which no
+	// checkpoint can reach past (see `Baseline::freeze`).
+	assert!(
+		ctx.baseline.is_frozen(),
+		"the apply layer runs on the rows its plan named, frozen, never on the pass's open snapshot"
+	);
 	// uuid -> the remote file object, for every file this plan acts on: hydrated from the cache
 	// by [`resolve_folded_objects`], and from the server for what this engine wrote and the cache
 	// has not listed yet.

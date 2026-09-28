@@ -437,17 +437,19 @@ impl<T: FromRow> Side<T> {
 					.filter_map(|key| Some((key.clone(), moved_path(key, from, to)?)))
 					.collect();
 				// The landing paths first — the destinations a row arrives at, and no other path
-				// under `to` (see the note above). Taken from the rows about to move rather than
-				// from the destination's subtree, so it is the size of what moves.
-				let mut landing: Vec<String> = Vec::new();
-				if baseline.contains_key(from) {
-					landing.push(to.to_owned());
-				}
-				baseline.visit_subtree_paths(from, |path| {
-					if let Some(dest) = moved_path(path, from, to) {
-						landing.push(dest);
-					}
-				});
+				// under `to` (see the note above). Found among the overlay's OWN keys, as those at
+				// or under `to` with a row at the same place under `from`: a lookup per key the
+				// pass observed there, rather than a walk of the rows about to move, which is the
+				// size of the subtree and would make a folded move of a large directory cost it.
+				let landing: Vec<String> = overlay
+					.edits
+					.keys()
+					.filter(|key| {
+						moved_path(key, to, from)
+							.is_some_and(|source| baseline.contains_key(&source))
+					})
+					.cloned()
+					.collect();
 				for key in landing {
 					overlay.edits.remove(&key);
 				}
