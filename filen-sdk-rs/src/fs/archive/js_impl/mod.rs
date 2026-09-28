@@ -1064,7 +1064,8 @@ pub fn archive_encoder_memory(format: CompressFormat) -> Result<u64, Error> {
 pub struct ArchiveLevels {
 	pub min: u32,
 	pub max: u32,
-	/// The level to preselect: a codec's own default, or 7-Zip's for a 7z method.
+	/// The level to preselect: a codec's own default (a 7z's BZip2 takes bzip2's), or 7-Zip's
+	/// for a 7z method.
 	pub default_level: u32,
 }
 

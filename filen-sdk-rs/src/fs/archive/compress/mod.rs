@@ -100,7 +100,8 @@ pub(crate) fn single_is_one_file() -> Error {
 }
 
 /// The level a 7z method is written at unless a UI chooses another: 7-Zip's own default
-/// ("normal", its `-mx5`), whose levels the SDK's follow.
+/// ("normal", its `-mx5`), whose levels the SDK's follow, but for BZip2's (see
+/// [`CompressFormat::default_level`]).
 const SEVEN_Z_DEFAULT_LEVEL: u32 = 5;
 
 /// What an archive is written as.
@@ -263,8 +264,9 @@ impl CompressFormat {
 
 	/// The level for a UI to preselect among the format's [levels](CompressFormat::levels): a
 	/// stream codec's own default (what `level: None` writes), which a zip's Deflate and BZip2
-	/// share with gzip and bzip2, and 7-Zip's for a 7z method; `None` for a format without
-	/// levels.
+	/// and a 7z's BZip2 share with gzip and bzip2, and 7-Zip's for any other 7z method; `None`
+	/// for a format without levels. A 7z's BZip2 levels are bzip2's block sizes, and 7-Zip's
+	/// default writes the largest, 900 KB, as bzip2's does.
 	pub fn default_level(self) -> Option<u32> {
 		let codec = match self {
 			Self::Tar { compression: None }
@@ -276,6 +278,10 @@ impl CompressFormat {
 				method: SevenZMethod::Copy,
 				..
 			} => return None,
+			Self::SevenZ {
+				method: SevenZMethod::Bzip2 { .. },
+				..
+			} => StreamCodec::Bzip2,
 			Self::SevenZ { .. } => return Some(SEVEN_Z_DEFAULT_LEVEL),
 			Self::Tar {
 				compression: Some(compression),
@@ -499,6 +505,7 @@ mod tests {
 			(zip(ZipMethod::Bzip2 { level: 1 }), 9),
 			(sevenz(SevenZMethod::Lzma2 { level: 0 }), 5),
 			(sevenz(SevenZMethod::Ppmd { level: 1 }), 5),
+			(sevenz(SevenZMethod::Bzip2 { level: 1 }), 9),
 		];
 		for (format, default) in leveled {
 			assert_eq!(format.default_level(), Some(default), "{format:?}");
