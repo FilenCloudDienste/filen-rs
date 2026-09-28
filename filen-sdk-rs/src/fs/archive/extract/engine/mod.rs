@@ -26,15 +26,19 @@
 //! registered) but lets directory creates and registrations in flight finish, so every item
 //! that was created is known and reported.
 
+mod dirs;
+mod files;
+mod finish;
+mod links;
+
 use std::{
-	borrow::Cow,
-	collections::{BTreeMap, HashMap, HashSet, VecDeque},
+	collections::{BTreeMap, HashMap, VecDeque},
 	sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
-use filen_types::{api::v3::dir::color::DirColor, crypto::Blake3Hash, fs::Uuid};
-use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
+use filen_types::fs::Uuid;
+use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
@@ -42,60 +46,52 @@ use crate::{
 	connect::ConnectedTargets,
 	consts::{CALLBACK_INTERVAL, MAX_SMALL_PARALLEL_REQUESTS},
 	fs::{
-		HasName, HasUUID,
+		HasUUID,
 		archive::{
 			config::ArchiveConfig,
 			dispose::{
-				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
-				SourceDisposition, Tree, dir_digest, dispose_file, file_digest, kept_on_early_end,
+				DisposalBackend, DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition,
+				kept_on_early_end,
 			},
 			entry_path::{ArchivePath, joined},
-			format::{ArchiveFormat, extract_folder_name},
-			input::{CodecFeed, Fed, ReadingJob, start_reading, take_memory, whole_chunk},
-			names::{DirId, PathResolver, PlannedDir, ROOT},
+			format::ArchiveFormat,
+			input::{CodecFeed, Fed, ReadingJob, start_reading},
+			limits::exceeds_limit,
+			names::{DirId, PathResolver},
 			worker::{
-				EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent, WorkerLink,
-				codec_failed, worker_died,
+				EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerLink, codec_failed,
+				worker_died,
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
-		dir::RemoteDirectory,
 		drive_job::{
 			Fatal,
-			backend::{DriveBackend, UploadSpec},
-			counts::ItemCounts,
-			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
-			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
-			lock::{LockWait, wait_for_lock},
-			name_retry::NameRetry,
+			backend::DriveBackend,
+			dir::{CreatedDirOutcome, DirError},
+			finalize::{FinalizeError, Finalized},
 		},
-		file::{
-			enums::RemoteFileType,
-			traits::{HasFileInfo, HasRemoteFileInfo},
-			write::{RemoteFileInfo, UploadCompletion},
-		},
-		name::{
-			ValidatedName,
-			keep_both::{NameShape, TakenNames},
-		},
+		file::{enums::RemoteFileType, traits::HasFileInfo, write::RemoteFileInfo},
+		name::ValidatedName,
 	},
 	job::{
 		JobControl, Stopped,
 		report::{JobReport, OpGuard},
 	},
-	util::{MaybeArc, MaybeSendBoxFuture, SeededMap, sleep},
+	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
 use super::{
 	ExpansionLimit, ExtractRoot, ExtractSkipReason,
-	codec::{ArchiveEnd, link_key},
+	codec::ArchiveEnd,
 	report::{
-		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractFailure,
-		ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
-		ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-		ExtractTopLevelTrashed, ExtractedTopLevel, Reporter, keep,
+		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractMisleadingName,
+		ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractSkippedEntry,
+		ExtractTopLevelKey, ExtractedTopLevel, Reporter, keep,
 	},
 };
+
+use dirs::{DirSlot, DirState};
+use links::{LinkCopy, LinkTargets, PendingLink, TakenLink};
 
 /// Chunks of one file uploading at once.
 const CHUNKS_PER_FILE: usize = 4;
@@ -147,38 +143,6 @@ enum ArchiveDisposal {
 	Unavailable,
 }
 
-enum DirState {
-	Planned,
-	Creating,
-	/// Kept whole, as a failure's retry targets it.
-	Created(DirType<'static, Normal>),
-	Failed(Arc<Error>),
-}
-
-/// A directory of the extraction; [`ROOT`] is the one entries land in.
-struct DirSlot {
-	uuid: Uuid,
-	parent: DirId,
-	/// The name it is created under.
-	name: ValidatedName,
-	/// The name the archive gave it, when `name` is a keep-both name instead.
-	archive_name: Option<ValidatedName>,
-	created: DateTime<Utc>,
-	/// The entry that named it first.
-	entry: ArchiveEntryId,
-	state: DirState,
-	children: Vec<DirId>,
-}
-
-impl DirSlot {
-	fn created_uuid(&self) -> Option<Uuid> {
-		match &self.state {
-			DirState::Created(dir) => Some(dir.uuid()),
-			_ => None,
-		}
-	}
-}
-
 /// A file entry being extracted.
 struct FileSlot<U> {
 	entry: ArchiveEntryId,
@@ -201,94 +165,6 @@ struct FileSlot<U> {
 	link_key: Option<u64>,
 	/// For a hard link, the file it copies.
 	copy: Option<LinkCopy>,
-}
-
-/// A hard link's copy of the file it names: that file's chunks, fetched one at a time (their
-/// hash is taken in order) and uploaded as the link's.
-#[derive(Default)]
-struct LinkCopy {
-	/// The file, once fetched by its uuid.
-	source: Option<Arc<RemoteFileType<'static>>>,
-	/// A chunk of it is being fetched.
-	fetching: bool,
-}
-
-/// The files a tar's hard links may name, by [`link_key`] of the path each was sent at: one the
-/// codec sent, or another hard link's copy. A tar may hold a million files, each of which a
-/// link after it may name, so each costs 16 bytes in the map (and its share of the map's spare
-/// room), and 24 more once registered: what an open one is, its slot in the open files tells.
-#[derive(Default)]
-struct LinkTargets {
-	by_key: SeededMap<u64, LinkTarget>,
-	/// The uuid and size of each registered target.
-	registered: Vec<(Uuid, u64)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LinkTarget {
-	/// The file or hard link of this ordinal, not registered yet.
-	Open(u32),
-	/// Registered, its uuid and size at this index of [`LinkTargets::registered`].
-	Registered(u32),
-}
-
-/// What a hard link's target is, once looked up.
-enum Named {
-	/// The file or hard link of this ordinal, not registered yet.
-	Open(u64),
-	Registered {
-		uuid: Uuid,
-		size: u64,
-	},
-}
-
-impl LinkTargets {
-	/// Notes the file or hard link `ordinal` as the one that links after it naming `key` name:
-	/// a later file at the same path takes over.
-	fn open(&mut self, key: u64, ordinal: u64) {
-		// the member cap keeps ordinals far below u32::MAX; one past it is never named
-		if let Ok(ordinal) = u32::try_from(ordinal) {
-			self.by_key.insert(key, LinkTarget::Open(ordinal));
-		}
-	}
-
-	fn get(&self, key: u64) -> Option<Named> {
-		Some(match *self.by_key.get(&key)? {
-			LinkTarget::Open(ordinal) => Named::Open(u64::from(ordinal)),
-			LinkTarget::Registered(at) => {
-				let (uuid, size) = self.registered[at as usize];
-				Named::Registered { uuid, size }
-			}
-		})
-	}
-
-	/// File `ordinal`, noted under `key`, was registered as `uuid`, `size` bytes; nothing when a
-	/// later file took the key over.
-	fn registered(&mut self, key: u64, ordinal: u64, uuid: Uuid, size: u64) {
-		let Some(target) = self.by_key.get_mut(&key) else {
-			return;
-		};
-		if *target == LinkTarget::Open(u32::try_from(ordinal).unwrap_or(u32::MAX))
-			&& let Ok(at) = u32::try_from(self.registered.len())
-		{
-			*target = LinkTarget::Registered(at);
-			self.registered.push((uuid, size));
-		}
-	}
-}
-
-/// A hard link waiting for the file it names to be registered.
-struct PendingLink {
-	link: TakenLink,
-	/// What it is reported as if that file never is.
-	unresolved: SkippedMember,
-}
-
-/// A hard link taken on, not opened yet.
-struct TakenLink {
-	file: NewFile,
-	/// What the links after it that name its path find it by.
-	key: u64,
 }
 
 impl<U> FileSlot<U> {
@@ -566,32 +442,6 @@ fn record<T: Clone>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> Option<T
 	keep(list, omitted, record.clone()).then_some(record)
 }
 
-/// Records `file` as failed at `stage`, in `report` and as an event, to be tried again as
-/// `retry` says.
-fn report_file_failure<U>(
-	report: &mut ExtractReport,
-	reporter: &Reporter,
-	file: &FileSlot<U>,
-	stage: ExtractStage,
-	error: Arc<Error>,
-	retry: Option<ExtractRetry>,
-) {
-	let failure = ExtractFailure {
-		entry: file.entry,
-		path: file.path.clone(),
-		dest_parent: file.active.dest_parent,
-		dest_name: file.name.as_ref().to_owned(),
-		stage,
-		retry,
-		error,
-	};
-	reporter.file_failed(
-		Some(file.active.dest_uuid),
-		file.bytes(),
-		record(&mut report.failures, &mut report.omitted.failures, failure),
-	);
-}
-
 impl<B: DisposalBackend> Driver<B> {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
@@ -658,60 +508,6 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		self.reporter.finish(phase);
 		result
-	}
-
-	/// A wrong password that only showed once entries were read (no entry was small enough to
-	/// check it on first) leaves the directories created so far and no file: they go to the
-	/// trash, so a retry with the right password starts clean, and out of the report's top-level
-	/// items. Trashed, never deleted: they can be restored.
-	async fn trash_created_dirs(&mut self) {
-		let dirs = self
-			.report
-			.top_level
-			.iter()
-			.filter_map(|top| match &top.item {
-				NonRootItemType::Dir(dir) => Some(dir.uuid()),
-				NonRootItemType::File(_) => None,
-			})
-			.chain(
-				self.top_level_beyond
-					.iter()
-					.filter(|(_, is_dir)| *is_dir)
-					.map(|(uuid, _)| *uuid),
-			)
-			.collect::<Vec<_>>();
-		let mut trashed = HashSet::new();
-		for uuid in dirs {
-			// the job created no file: one in there now is someone else's, and keeps the folder
-			match self.backend.list_tree(uuid).await {
-				Ok(tree) if tree.files.is_empty() => {}
-				Ok(_) => continue,
-				Err(error) => {
-					tracing::warn!(
-						"archive {}: failed to list a directory before trashing it: {error}",
-						self.archive.uuid()
-					);
-					continue;
-				}
-			}
-			match self.backend.trash_dir(uuid).await {
-				Ok(()) => {
-					trashed.insert(uuid);
-					let trashed = ExtractTopLevelTrashed { dest_uuid: uuid };
-					self.reporter.event(ExtractEvent::TopLevelTrashed(trashed));
-				}
-				Err(error) => tracing::warn!(
-					"archive {}: failed to trash a directory created before the wrong password \
-					 showed: {error}",
-					self.archive.uuid()
-				),
-			}
-		}
-		self.report
-			.top_level
-			.retain(|top| !trashed.contains(&top.item.uuid()));
-		self.top_level_beyond
-			.retain(|(uuid, _)| !trashed.contains(uuid));
 	}
 
 	/// Ends the job with `error` when an entry's error is one nothing can succeed after.
@@ -842,25 +638,7 @@ impl<B: DisposalBackend> Driver<B> {
 		self.held = None;
 		self.link_sources = FuturesUnordered::new();
 		self.link_chunks = FuturesUnordered::new();
-		// taken on and never started: not attempted
-		let links = self.links_waiting + self.ready_links.len();
-		let bytes = self
-			.waiting_links
-			.values()
-			.flatten()
-			.map(|waiting| waiting.link.file.size.unwrap_or(0))
-			.chain(
-				self.ready_links
-					.iter()
-					.map(|(link, _)| link.file.size.unwrap_or(0)),
-			)
-			.sum();
-		if links > 0 {
-			self.reporter.files_not_attempted(links as u64, bytes);
-		}
-		self.waiting_links.clear();
-		self.links_waiting = 0;
-		self.ready_links.clear();
+		self.drop_taken_links();
 		if !self.uploads.is_empty() {
 			self.uploads = FuturesUnordered::new();
 		}
@@ -903,13 +681,19 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Reports the bytes of the archive the codec has read, which its inputs count once each: as
 	/// the codec reads, not only on the idle ticks, which a busy job skips.
-	fn report_bytes_read(&self) {
+	fn report_bytes_read(&mut self) {
 		let read = self.feed.bytes_read();
-		debug_assert!(
-			read <= self.archive.size(),
-			"the codec read {read} bytes of a {}-byte archive",
-			self.archive.size()
-		);
+		// every chunk fed was checked to hold exactly what the archive's size gives it
+		if read > self.archive.size() {
+			self.stop_with(Error::custom(
+				ErrorKind::Internal,
+				format!(
+					"the codec read {read} bytes of a {}-byte archive",
+					self.archive.size()
+				),
+			));
+			return;
+		}
 		self.reporter.set_bytes_read(read);
 	}
 
@@ -971,127 +755,6 @@ impl<B: DisposalBackend> Driver<B> {
 		Ok(())
 	}
 
-	/// Sets up where entries go, once the codec has told what the archive holds.
-	async fn open(&mut self, layout: ArchiveFormat) -> Result<(), Stopped> {
-		let destination = self.destination.uuid();
-		let listed = self
-			.control
-			.until_stopping(self.backend.list_dir_names(&self.destination))
-			.await?;
-		let targets = self
-			.control
-			.until_stopping(self.backend.connected_targets(destination))
-			.await?;
-		let (listed, targets) = match (listed, targets) {
-			(Ok(listed), Ok(targets)) => (listed, targets),
-			(Err(error), _) | (_, Err(error)) => {
-				self.stop_with(error);
-				return Err(Stopped);
-			}
-		};
-		self.targets = Arc::new(targets);
-		self.unverified = listed.unverified;
-		let root_entry = self.entry_id(0);
-		let new_folder = match (&self.root, layout) {
-			(
-				ExtractRoot::NewFolder { name },
-				ArchiveFormat::Tar { .. } | ArchiveFormat::Zip | ArchiveFormat::SevenZ,
-			) => Some(name.clone()),
-			(_, ArchiveFormat::Single { .. }) | (ExtractRoot::Destination, _) => None,
-		};
-		let root = match new_folder {
-			None => {
-				self.into_destination = true;
-				self.resolver = Some(PathResolver::new(listed.names.iter().map(String::as_str)));
-				self.destination.clone()
-			}
-			Some(name) => {
-				let wanted = match name {
-					Some(name) => name,
-					None => self.default_folder_name(),
-				};
-				let mut taken = TakenNames::new(listed.names.iter().map(String::as_str));
-				let name = match taken.allocate(wanted, NameShape::Dir) {
-					Ok(name) => name,
-					Err(error) => {
-						self.stop_with(error.into());
-						return Err(Stopped);
-					}
-				};
-				let folder = self.create_root(name).await?;
-				self.resolver = Some(PathResolver::new(std::iter::empty()));
-				DirType::Dir(Cow::Owned(folder))
-			}
-		};
-		self.dirs.push(DirSlot {
-			uuid: root.uuid(),
-			parent: ROOT,
-			name: ValidatedName::try_from("root").expect("a valid name"),
-			archive_name: None,
-			created: Utc::now(),
-			entry: root_entry,
-			state: DirState::Created(root),
-			children: Vec::new(),
-		});
-		self.reporter.set_phase(ExtractPhase::Extracting);
-		Ok(())
-	}
-
-	fn default_folder_name(&self) -> ValidatedName {
-		extract_folder_name(self.archive.name())
-	}
-
-	/// Creates the folder entries are extracted into.
-	async fn create_root(&mut self, name: ValidatedName) -> Result<RemoteDirectory, Stopped> {
-		loop {
-			// No entry is read yet, so only prefetched chunks are in flight: waited out holding
-			// nothing, as between entries.
-			if self.control.is_pause_requested() {
-				self.pause().await?;
-			}
-			if self.control.is_stopping() {
-				self.reporter.wind_down(&self.control);
-				return Err(Stopped);
-			}
-			let task = DirTask {
-				backend: Arc::clone(&self.backend),
-				control: self.control.clone(),
-				ops: self.reporter.ops(),
-				targets: Arc::clone(&self.targets),
-				parent: self.destination.uuid(),
-				uuid: Uuid::new_v4(),
-				name: name.clone(),
-				created: Utc::now(),
-				color: DirColor::Default,
-				top_level: true,
-				verify_name: self.unverified,
-				subject: "item",
-			};
-			match create_dir(task).await {
-				Ok(outcome) => {
-					let dir = outcome.dir;
-					self.report_propagation(dir.uuid(), outcome.propagation_errors);
-					self.reporter.dir_created(
-						dir.uuid(),
-						self.destination.uuid(),
-						outcome.name.as_ref(),
-					);
-					self.created_digest = self.created_digest.wrapping_add(dir_digest(dir.uuid()));
-					self.top_level_created(
-						ExtractTopLevelKey::Root,
-						NonRootItemType::Dir(Cow::Owned(dir.clone())),
-					);
-					return Ok(dir);
-				}
-				Err(DirError::NotStarted) => {}
-				Err(DirError::Failed(error)) => {
-					self.stop_with(error);
-					return Err(Stopped);
-				}
-			}
-		}
-	}
-
 	fn top_level_created(
 		&mut self,
 		key: ExtractTopLevelKey,
@@ -1144,7 +807,7 @@ impl<B: DisposalBackend> Driver<B> {
 	fn count_item(&mut self) -> bool {
 		self.items += 1;
 		if let Some(max) = self.max_items
-			&& self.items > max
+			&& exceeds_limit(self.items, max)
 		{
 			self.stop_with(Error::custom(
 				ErrorKind::ArchiveTooLarge,
@@ -1232,17 +895,6 @@ impl<B: DisposalBackend> Driver<B> {
 		joined(&[&self.base[..], segments].concat())
 	}
 
-	/// Notes open file `ordinal`, at `path`, as the one the hard links after it that name that
-	/// path copy: a later file of the same path is the one links after it name.
-	fn link_target(&mut self, ordinal: u64, path: &ArchivePath) {
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
-		let key = link_key(path);
-		file.link_key = Some(key);
-		self.link_targets.open(key, ordinal);
-	}
-
 	/// A file entry at `path`: its directories planned and a free name taken for it in the last;
 	/// `None` once the job ended.
 	fn new_file(
@@ -1281,1010 +933,6 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 		}
 	}
-
-	/// A tar hard link: extracted as a copy of the file it names (one the codec sent, or another
-	/// link's copy), once that one is registered, or skipped when there is none (it was skipped,
-	/// it failed, or no file of its path came before).
-	///
-	/// What links copy is charged against the [`ExpansionLimit`], as what a compressed archive
-	/// decodes to is: a bare tar of one file and a thousand links to it would otherwise upload
-	/// that file a thousand times. Past the limit the job fails, as a compressed one does.
-	///
-	/// Its name is taken as it comes, as any entry's, so the names the entries after it get do
-	/// not hang on when its target is registered; a link skipped after all leaves that name
-	/// taken, and a later entry of the same name gets a keep-both name.
-	fn on_link(&mut self, link: LinkHead) {
-		let LinkHead {
-			ordinal,
-			path,
-			modified,
-			target,
-			unresolved,
-		} = link;
-		let (target, size) = match self.link_targets.get(link_key(&target)) {
-			Some(Named::Registered { uuid, size }) => (Ok(uuid), size),
-			Some(Named::Open(ordinal)) => match self.pending_size(ordinal) {
-				Some(size) => (Err(ordinal), size),
-				None => return self.on_skipped(unresolved),
-			},
-			None => return self.on_skipped(unresolved),
-		};
-		if let Some(limit) = self.expansion {
-			let allowed = limit
-				.floor
-				.max(self.feed.bytes_read().saturating_mul(limit.ratio));
-			if self.link_bytes.saturating_add(size) > allowed {
-				return self.stop_with(Error::custom(
-					ErrorKind::ArchiveTooLarge,
-					format!(
-						"the archive's hard links copy more than {} times its size",
-						limit.ratio
-					),
-				));
-			}
-		}
-		self.link_bytes += size;
-		let entry = self.entry_id(ordinal);
-		self.report_path(entry, &path);
-		let Some(file) = self.new_file(ordinal, &path, Some(size), modified) else {
-			return;
-		};
-		// a link may be named by the links after it, as the file it copies is
-		let key = link_key(&path);
-		self.link_targets.open(key, ordinal);
-		let link = TakenLink { file, key };
-		match target {
-			Ok(uuid) => self.ready_links.push_back((link, uuid)),
-			Err(target_ordinal) => {
-				self.links_waiting += 1;
-				self.waiting_links
-					.entry(target_ordinal)
-					.or_default()
-					.push(PendingLink { link, unresolved });
-			}
-		}
-	}
-
-	/// The size of file `ordinal` that hard links wait for: open and not failed, or a hard link
-	/// taken on and not opened yet; `None` when it is neither, so has nothing to copy.
-	fn pending_size(&self, ordinal: u64) -> Option<u64> {
-		if let Some(file) = self.files.get(&ordinal) {
-			return (!file.failed).then(|| file.bytes());
-		}
-		self.waiting_links
-			.values()
-			.flatten()
-			.map(|waiting| &waiting.link)
-			.chain(self.ready_links.iter().map(|(link, _)| link))
-			.find(|link| link.file.ordinal == ordinal)
-			.map(|link| link.file.size.unwrap_or(0))
-	}
-
-	/// Opens the hard links whose file is registered, while the files open leave room and the
-	/// fetches of their targets are as many at once as other small requests.
-	fn open_ready_links(&mut self) {
-		while self.files.len() < MAX_OPEN_FILES
-			&& self.link_sources.len() < MAX_SMALL_PARALLEL_REQUESTS
-			&& let Some((TakenLink { file, key }, target)) = self.ready_links.pop_front()
-		{
-			let ordinal = file.ordinal;
-			self.open_file(NewFile {
-				source: FileSource::Link { target },
-				..file
-			});
-			if let Some(file) = self.files.get_mut(&ordinal) {
-				file.link_key = Some(key);
-			}
-		}
-	}
-
-	/// File `ordinal` was registered as `uuid`, `size` bytes: the hard links waiting for it copy
-	/// it now, as fast as they are opened.
-	fn link_target_registered(&mut self, ordinal: u64, key: Option<u64>, uuid: Uuid, size: u64) {
-		if let Some(key) = key {
-			self.link_targets.registered(key, ordinal, uuid, size);
-		}
-		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
-		self.links_waiting -= waiting.len();
-		self.ready_links.extend(
-			waiting
-				.into_iter()
-				.map(|PendingLink { link, .. }| (link, uuid)),
-		);
-	}
-
-	/// File `ordinal` failed: the hard links waiting for it have nothing to copy, and are
-	/// skipped, no item after all.
-	fn link_target_failed(&mut self, ordinal: u64) {
-		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
-		self.links_waiting -= waiting.len();
-		for PendingLink { link, unresolved } in waiting {
-			self.items -= 1;
-			self.link_bytes -= link.file.size.unwrap_or(0);
-			// the links waiting for this one fail with it
-			self.link_target_failed(link.file.ordinal);
-			self.on_skipped(unresolved);
-		}
-	}
-
-	/// The directory `segments` names, planning the ones not seen before; `None` once the job
-	/// ended.
-	fn resolve_dirs(
-		&mut self,
-		segments: &[ValidatedName],
-		entry: ArchiveEntryId,
-		modified: Option<DateTime<Utc>>,
-	) -> Option<DirId> {
-		let mut planned = Vec::new();
-		let resolved = self
-			.resolver
-			.as_mut()
-			.expect("entries follow the archive's layout")
-			.resolve_dirs(segments, &mut planned);
-		let dir = match resolved {
-			Ok(dir) => dir,
-			Err(error) => {
-				self.stop_with(error.into());
-				return None;
-			}
-		};
-		for PlannedDir {
-			id,
-			parent,
-			name,
-			archive_name,
-		} in planned
-		{
-			if !self.count_item() {
-				return None;
-			}
-			// every planned directory is kept for the whole job, and one entry can imply 256:
-			// they are capped like members, before they cost more
-			if self.dirs.len() as u64 > self.config.max_members {
-				self.stop_with(Error::custom(
-					ErrorKind::ArchiveTooLarge,
-					format!(
-						"the archive names more than {} directories",
-						self.config.max_members
-					),
-				));
-				return None;
-			}
-			debug_assert_eq!(id, self.dirs.len());
-			let state = match &self.dirs[parent].state {
-				DirState::Failed(error) => DirState::Failed(Arc::clone(error)),
-				DirState::Created(_) => {
-					self.ready_dirs.push_back(id);
-					DirState::Planned
-				}
-				DirState::Planned | DirState::Creating => DirState::Planned,
-			};
-			match state {
-				DirState::Failed(_) => self.reporter.dir_failed(None),
-				_ => self.uncreated_dirs += 1,
-			}
-			self.dirs[parent].children.push(id);
-			self.dirs.push(DirSlot {
-				uuid: Uuid::new_v4(),
-				parent,
-				name,
-				archive_name,
-				// Filen directories keep a creation time only; the archive's modification time
-				// is the closest it has
-				created: if id == dir {
-					modified.unwrap_or_else(Utc::now)
-				} else {
-					Utc::now()
-				},
-				entry,
-				state,
-				children: Vec::new(),
-			});
-		}
-		Some(dir)
-	}
-
-	fn start_dir(&mut self, dir: DirId) {
-		let slot = &self.dirs[dir];
-		let parent = self.dirs[slot.parent]
-			.created_uuid()
-			.expect("a directory is only created once its parent exists");
-		let top_level = slot.parent == ROOT && self.into_destination;
-		let task = DirTask {
-			backend: Arc::clone(&self.backend),
-			control: self.control.clone(),
-			ops: self.reporter.ops(),
-			targets: Arc::clone(&self.targets),
-			parent,
-			uuid: slot.uuid,
-			name: slot.name.clone(),
-			created: slot.created,
-			color: DirColor::Default,
-			top_level,
-			verify_name: top_level && self.unverified,
-			subject: "item",
-		};
-		self.dirs[dir].state = DirState::Creating;
-		self.dir_creates
-			.push(Box::pin(async move { (dir, create_dir(task).await) }));
-	}
-
-	fn dir_finished(&mut self, dir: DirId, result: Result<CreatedDirOutcome, DirError>) {
-		let parent = self.dirs[self.dirs[dir].parent].uuid;
-		match result {
-			Ok(CreatedDirOutcome {
-				dir: created,
-				name,
-				color_error: _,
-				propagation_errors,
-			}) => {
-				self.report_propagation(created.uuid(), propagation_errors);
-				// one record, with the name it got in the end (a keep-both name the resolver
-				// picked, then possibly another the destination turned out to need)
-				let slot = &self.dirs[dir];
-				let entry = slot.entry;
-				if name.as_ref() != slot.archive_name.as_ref().unwrap_or(&slot.name).as_ref() {
-					let path = self.archive_path(dir);
-					self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
-				}
-				self.reporter
-					.dir_created(created.uuid(), parent, name.as_ref());
-				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
-				self.dirs[dir].state = DirState::Created(DirType::Dir(Cow::Owned(created.clone())));
-				self.uncreated_dirs -= 1;
-				self.ready_dirs
-					.extend(self.dirs[dir].children.iter().copied());
-				if self.dirs[dir].parent == ROOT && self.into_destination {
-					self.top_level_created(
-						ExtractTopLevelKey::Entry { id: entry },
-						NonRootItemType::Dir(Cow::Owned(created)),
-					);
-				}
-				self.finalize_ready();
-			}
-			// tried again once the pause is over
-			Err(DirError::NotStarted) => {
-				self.dirs[dir].state = DirState::Planned;
-				self.ready_dirs.push_front(dir);
-			}
-			Err(DirError::Failed(error)) => {
-				let error = Arc::new(error);
-				self.note_error(&error);
-				let failure = ExtractFailure {
-					entry: self.dirs[dir].entry,
-					path: self.archive_path(dir),
-					dest_parent: parent,
-					dest_name: self.dirs[dir].name.as_ref().to_owned(),
-					stage: ExtractStage::CreateDirectory,
-					retry: Some(self.retry(self.dirs[dir].parent)),
-					error: Arc::clone(&error),
-				};
-				self.reporter.dir_failed(record(
-					&mut self.report.failures,
-					&mut self.report.omitted.failures,
-					failure,
-				));
-				self.fail_subtree(dir, &error);
-			}
-		}
-	}
-
-	/// Marks `root`'s planned subdirectories failed, and fails the files waiting in them.
-	fn fail_subtree(&mut self, root: DirId, error: &Arc<Error>) {
-		let mut stack = vec![root];
-		while let Some(dir) = stack.pop() {
-			if dir != root {
-				self.reporter.dir_failed(None);
-			}
-			if matches!(self.dirs[dir].state, DirState::Planned | DirState::Creating) {
-				self.uncreated_dirs -= 1;
-			}
-			self.dirs[dir].state = DirState::Failed(Arc::clone(error));
-			stack.extend(self.dirs[dir].children.iter().copied());
-		}
-		self.ready_dirs
-			.retain(|dir| !matches!(self.dirs[*dir].state, DirState::Failed(_)));
-		let waiting: Vec<u64> = self
-			.files
-			.iter()
-			.filter(|(_, file)| {
-				!file.failed && matches!(self.dirs[file.parent].state, DirState::Failed(_))
-			})
-			.map(|(ordinal, _)| *ordinal)
-			.collect();
-		for ordinal in waiting {
-			self.fail_file(ordinal, ExtractStage::CreateDirectory, Arc::clone(error));
-		}
-	}
-
-	/// A directory's path in the archive, as drive names.
-	fn archive_path(&self, dir: DirId) -> String {
-		joined(&self.archive_names(dir))
-	}
-
-	/// A directory's path in the archive: the base, then the names of the directories below
-	/// it.
-	fn archive_names(&self, mut dir: DirId) -> Vec<ValidatedName> {
-		let mut names = Vec::new();
-		while dir != ROOT {
-			let slot = &self.dirs[dir];
-			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).clone());
-			dir = slot.parent;
-		}
-		names.extend(self.base.iter().rev().cloned());
-		names.reverse();
-		names
-	}
-
-	fn open_file(&mut self, new: NewFile) {
-		let NewFile {
-			ordinal,
-			entry,
-			path,
-			parent,
-			name,
-			size,
-			modified,
-			source,
-		} = new;
-		let dest_uuid = Uuid::new_v4();
-		let parent_uuid = self.dirs[parent].uuid;
-		let upload = self.backend.begin_upload(UploadSpec {
-			uuid: dest_uuid,
-			parent: parent_uuid,
-			// the upload owns its name; the file may be renamed again before it is registered
-			name: name.clone(),
-			mime: None,
-		});
-		let active = ExtractActiveFile {
-			entry,
-			dest_uuid,
-			dest_parent: parent_uuid,
-			name: name.as_ref().to_owned(),
-			size,
-			bytes_done: 0,
-		};
-		self.files.insert(
-			ordinal,
-			FileSlot {
-				entry,
-				path,
-				parent,
-				upload: Arc::new(upload),
-				active: active.clone(),
-				name,
-				hasher: blake3::Hasher::new(),
-				written: 0,
-				next_index: 0,
-				uploading: 0,
-				info: None,
-				modified,
-				ended: false,
-				finalizing: false,
-				failed: false,
-				link_key: None,
-				copy: None,
-			},
-		);
-		match source {
-			FileSource::Codec => self.current = Some(ordinal),
-			FileSource::Link { target } => {
-				self.files.get_mut(&ordinal).expect("just added").copy = Some(LinkCopy::default());
-				let backend = Arc::clone(&self.backend);
-				let op = self.reporter.op();
-				self.link_sources.push(Box::pin(async move {
-					let result = backend.normal_item(target, false).await;
-					drop(op);
-					(ordinal, result)
-				}));
-			}
-		}
-		if let DirState::Failed(error) = &self.dirs[parent].state {
-			let error = Arc::clone(error);
-			self.fail_file(ordinal, ExtractStage::CreateDirectory, error);
-		} else {
-			self.reporter.file_started(active);
-		}
-	}
-
-	/// Takes up a data or file-end event, or holds it until it can be.
-	fn retry_held(&mut self, event: WorkerEvent) {
-		// a file's events after the job stopped taking it are dropped
-		let Some(ordinal) = self.current else {
-			return;
-		};
-		let Some(file) = self.files.get(&ordinal) else {
-			return;
-		};
-		let data = match event {
-			WorkerEvent::FileEnd => {
-				self.files.get_mut(&ordinal).expect("looked up above").ended = true;
-				self.current = None;
-				self.finalize_ready();
-				return;
-			}
-			WorkerEvent::Data(data) => data,
-			// only data and file ends are ever held
-			_ => return,
-		};
-		if file.failed {
-			return;
-		}
-		let waits =
-			self.dirs[file.parent].created_uuid().is_none() || file.uploading >= CHUNKS_PER_FILE;
-		let permit = if waits {
-			None
-		} else {
-			take_memory(&self.output_slot, &self.memory)
-		};
-		let Some(permit) = permit else {
-			self.held = Some(WorkerEvent::Data(data));
-			return;
-		};
-		self.upload(ordinal, data, permit);
-	}
-
-	/// Uploads `data` as the next chunk of file `ordinal`, in the memory `permit` holds.
-	fn upload(&mut self, ordinal: u64, data: Vec<u8>, permit: OwnedSemaphorePermit) {
-		let len = data.len() as u64;
-		if let Some(error) = super::storage_exceeded(self.max_bytes, self.committed + len) {
-			self.stop_with(error);
-			return;
-		}
-		self.committed += len;
-		let file = self
-			.files
-			.get_mut(&ordinal)
-			.expect("an uploading file is known");
-		file.hasher.update_rayon(&data);
-		file.written += len;
-		file.uploading += 1;
-		let index = file.next_index;
-		file.next_index += 1;
-		let upload = Arc::clone(&file.upload);
-		let backend = Arc::clone(&self.backend);
-		let op = self.reporter.op();
-		self.uploads.push(Box::pin(async move {
-			let result = backend.upload_chunk(&upload, index, data).await;
-			drop((permit, op));
-			(ordinal, len, result)
-		}) as MaybeSendBoxFuture<'static, _>);
-	}
-
-	fn upload_finished(&mut self, ordinal: u64, len: u64, result: Result<RemoteFileInfo, Error>) {
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
-		file.uploading -= 1;
-		let (failed, dest_uuid) = (file.failed, file.active.dest_uuid);
-		match result {
-			Ok(info) => {
-				file.info = Some(info);
-				if !failed {
-					self.reporter.chunk_uploaded(dest_uuid, len);
-				}
-			}
-			Err(error) => {
-				let error = Arc::new(error);
-				self.note_error(&error);
-				if !failed {
-					self.fail_file(ordinal, ExtractStage::Upload, error);
-				}
-			}
-		}
-		self.finalize_ready();
-	}
-
-	/// Reports file `ordinal` as failed; its later data is dropped.
-	fn fail_file(&mut self, ordinal: u64, stage: ExtractStage, error: Arc<Error>) {
-		let retry = self.file_retry(&self.files[&ordinal]);
-		let file = self
-			.files
-			.get_mut(&ordinal)
-			.expect("a failed file is known");
-		file.failed = true;
-		report_file_failure(&mut self.report, &self.reporter, file, stage, error, retry);
-		self.link_target_failed(ordinal);
-	}
-
-	/// Starts fetching the next chunk of each hard link's target whose copy can go on: its
-	/// directory exists, it has room for another upload, and memory is free right now.
-	fn copy_links(&mut self) {
-		let ready: Vec<u64> = self
-			.files
-			.iter()
-			.filter(|(_, file)| {
-				file.copy
-					.as_ref()
-					.is_some_and(|copy| copy.source.is_some() && !copy.fetching)
-					&& !file.failed && !file.ended
-					&& file.uploading < CHUNKS_PER_FILE
-					&& self.dirs[file.parent].created_uuid().is_some()
-			})
-			.map(|(ordinal, _)| *ordinal)
-			.collect();
-		for ordinal in ready {
-			let Some(permit) = take_memory(&self.output_slot, &self.memory) else {
-				return;
-			};
-			let file = self.files.get_mut(&ordinal).expect("just found");
-			let copy = file.copy.as_mut().expect("just found");
-			copy.fetching = true;
-			let source = Arc::clone(copy.source.as_ref().expect("just found"));
-			let index = file.next_index;
-			let backend = Arc::clone(&self.backend);
-			let op = self.reporter.op();
-			self.link_chunks.push(Box::pin(async move {
-				let result = backend
-					.fetch_chunk(&source, index)
-					.await
-					.and_then(|data| whole_chunk(&source, index, data));
-				(ordinal, result, permit, op)
-			}));
-		}
-	}
-
-	fn link_source_fetched(
-		&mut self,
-		ordinal: u64,
-		result: Result<NonRootItemType<'static, Normal>, Error>,
-	) {
-		let source = match result {
-			Ok(NonRootItemType::File(file)) => RemoteFileType::from(file.into_owned()),
-			Ok(NonRootItemType::Dir(_)) => {
-				let error = Error::custom(ErrorKind::InvalidState, "a hard link names a directory");
-				return self.fail_file(ordinal, ExtractStage::Upload, Arc::new(error));
-			}
-			Err(error) => {
-				let error = Arc::new(error);
-				self.note_error(&error);
-				return self.fail_file(ordinal, ExtractStage::Upload, error);
-			}
-		};
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
-		// an empty file has no chunk to copy
-		file.ended = source.chunks() == 0;
-		file.copy.as_mut().expect("a link copies").source = Some(Arc::new(source));
-		self.finalize_ready();
-	}
-
-	fn link_chunk_fetched(&mut self, (ordinal, result, permit, _op): LinkChunk) {
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
-		let copy = file.copy.as_mut().expect("a link copies");
-		copy.fetching = false;
-		let chunks = copy.source.as_ref().expect("fetched from").chunks();
-		if file.failed {
-			return;
-		}
-		match result {
-			Ok(data) => {
-				self.upload(ordinal, data, permit);
-				if let Some(file) = self.files.get_mut(&ordinal) {
-					file.ended = file.next_index == chunks;
-				}
-			}
-			Err(error) => {
-				let error = Arc::new(error);
-				self.note_error(&error);
-				self.fail_file(ordinal, ExtractStage::Upload, error);
-			}
-		}
-	}
-
-	/// Where an entry of `dir` that failed is extracted again: the nearest directory there is,
-	/// `dir` itself unless it failed too. The root always is.
-	fn retry(&self, mut dir: DirId) -> ExtractRetry {
-		loop {
-			if let DirState::Created(destination) = &self.dirs[dir].state {
-				return ExtractRetry {
-					destination: destination.clone(),
-					// with the base of a partial extraction: that is where it is in the archive
-					base: self.archive_names(dir),
-				};
-			}
-			dir = self.dirs[dir].parent;
-		}
-	}
-
-	/// Where `file`, which failed, is extracted again: `None` for a tar's hard link, whose copy
-	/// needs the file it names read in the same pass (see [`ExtractFailure::retry`]).
-	fn file_retry<U>(&self, file: &FileSlot<U>) -> Option<ExtractRetry> {
-		file.copy.is_none().then(|| self.retry(file.parent))
-	}
-
-	/// Registers the files whose data is all up and whose directory exists, as many at once as
-	/// other small requests; forgets failed files with nothing left in flight.
-	fn finalize_ready(&mut self) {
-		// a finalize started now would park on the pause holding the job busy, so the job
-		// could never go idle and give back its memory: it starts on resume instead
-		if self.control.is_pause_requested() {
-			return;
-		}
-		let ready: Vec<u64> = self
-			.files
-			.iter()
-			.filter(|(_, file)| {
-				file.ended
-					&& file.uploading == 0
-					&& !file.finalizing
-					&& (file.failed || self.dirs[file.parent].created_uuid().is_some())
-			})
-			.map(|(ordinal, _)| *ordinal)
-			.collect();
-		for ordinal in ready {
-			if self.files[&ordinal].failed {
-				self.files.remove(&ordinal);
-			} else if self.finalizes.len() < MAX_SMALL_PARALLEL_REQUESTS {
-				self.start_finalize(ordinal);
-			}
-		}
-	}
-
-	fn start_finalize(&mut self, ordinal: u64) {
-		let top_level = {
-			let file = &self.files[&ordinal];
-			file.parent == ROOT && self.into_destination
-		};
-		let parent = self.dirs[self.files[&ordinal].parent]
-			.created_uuid()
-			.expect("checked by the caller");
-		let file = self.files.get_mut(&ordinal).expect("checked by the caller");
-		file.finalizing = true;
-		let modified = file.modified.unwrap_or_else(Utc::now);
-		let completion = UploadCompletion {
-			written: file.written,
-			num_chunks: file.next_index,
-			hash: Blake3Hash::from(file.hasher.finalize()),
-			final_times: (modified, modified),
-		};
-		let upload = Arc::clone(&file.upload);
-		let info = file.info.clone().unwrap_or_default();
-		let name = file.name.clone();
-		let backend = Arc::clone(&self.backend);
-		let control = self.control.clone();
-		let ops = self.reporter.ops();
-		let targets = Arc::clone(&self.targets);
-		self.finalizes.push(Box::pin(async move {
-			let mut retry = NameRetry::new(NameShape::File, "item");
-			let result = finalize_new_file_unless_paused(FinalizeTask {
-				backend: &*backend,
-				control: &control,
-				ops: &ops,
-				upload: &upload,
-				parent,
-				name,
-				// a directory the job did not create may hold the name by now
-				recheck: top_level.then_some(&mut retry),
-				completion,
-				info,
-				targets: &targets,
-			})
-			.await;
-			(ordinal, result)
-		}) as MaybeSendBoxFuture<'static, _>);
-	}
-
-	fn finalize_finished(
-		&mut self,
-		ordinal: u64,
-		result: Option<Result<Finalized, FinalizeError>>,
-	) {
-		let Some(result) = result else {
-			// a pause came before the drive lock: started again on resume
-			if let Some(file) = self.files.get_mut(&ordinal) {
-				file.finalizing = false;
-			}
-			return;
-		};
-		let Some(file) = self.files.remove(&ordinal) else {
-			return;
-		};
-		match result {
-			Ok(Finalized {
-				file: registered,
-				name,
-				propagation_errors,
-			}) => {
-				self.report_propagation(registered.uuid(), propagation_errors);
-				if name.as_ref() != file.archive_name() {
-					self.renamed(
-						file.entry,
-						file.path.clone(),
-						&name,
-						ExtractRenameReason::DuplicateName,
-					);
-				}
-				let active = ExtractActiveFile {
-					name: name.as_ref().to_owned(),
-					..file.active
-				};
-				self.reporter.file_done(&active, file.written);
-				self.link_target_registered(
-					ordinal,
-					file.link_key,
-					registered.uuid(),
-					file.written,
-				);
-				self.created_digest = self
-					.created_digest
-					.wrapping_add(file_digest(active.dest_uuid, file.written));
-				if file.parent == ROOT && self.into_destination {
-					self.top_level_created(
-						ExtractTopLevelKey::Entry { id: file.entry },
-						NonRootItemType::File(Cow::Owned(registered)),
-					);
-				}
-			}
-			Err(FinalizeError::Stopped) => self
-				.reporter
-				.file_abandoned(file.active.dest_uuid, file.bytes()),
-			Err(FinalizeError::RegisteredAsVersion {
-				file: registered,
-				propagation_errors,
-			}) => {
-				self.link_target_failed(ordinal);
-				self.report_propagation(registered.uuid(), propagation_errors);
-				let error = Error::custom(
-					ErrorKind::InvalidState,
-					"the entry was registered as a new version of an existing file",
-				);
-				let stage = ExtractStage::RegisteredAsVersion {
-					existing_file: registered.stable_uuid.into(),
-				};
-				self.finalize_failed(&file, stage, Arc::new(error));
-			}
-			Err(FinalizeError::Failed(error)) => {
-				self.link_target_failed(ordinal);
-				let error = Arc::new(error);
-				self.note_error(&error);
-				self.finalize_failed(&file, ExtractStage::Finalize, error);
-			}
-		}
-	}
-
-	/// Reports `file`, which could not be registered, as failed at `stage`.
-	fn finalize_failed(
-		&mut self,
-		file: &FileSlot<B::Upload>,
-		stage: ExtractStage,
-		error: Arc<Error>,
-	) {
-		let retry = self.file_retry(file);
-		report_file_failure(&mut self.report, &self.reporter, file, stage, error, retry);
-	}
-
-	/// Whether every entry the archive holds is extracted: none failed, and none skipped but the
-	/// macOS metadata left out on purpose.
-	fn complete(&self, counts: ItemCounts) -> bool {
-		counts.files_failed + counts.dirs_failed + counts.entries_skipped - self.left_out == 0
-	}
-
-	/// Removes the archive if the extraction is verified; what became of it.
-	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
-		let kept = DisposalOutcome::kept;
-		let counts = self.reporter.counts();
-		if !self.complete(counts) {
-			return kept(KeptReason::Incomplete);
-		}
-		if self.report.unaccounted_bytes > 0 {
-			return kept(KeptReason::UnaccountedData {
-				bytes: self.report.unaccounted_bytes,
-			});
-		}
-		if self.report.duplicates.is_some() {
-			return kept(KeptReason::Incomplete);
-		}
-		if self.unchecked_entries > 0 {
-			return kept(KeptReason::Unconfirmed);
-		}
-		if !matches!(
-			self.layout,
-			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ)
-		) {
-			// A streaming archive's entries carry no checksum of their own (a tar's) or share
-			// one for the whole stream: the whole archive, read front to back, has to match the
-			// hash in its metadata. A zip's or a 7z's entries were each checked as they were
-			// read.
-			let Some(read) = self.feed.read_whole() else {
-				return kept(KeptReason::Unconfirmed);
-			};
-			match self.archive.hash() {
-				Some(expected) if expected != read => return kept(KeptReason::HashMismatch),
-				None if how == SourceDisposal::DeletePermanently => {
-					return kept(KeptReason::HashUnavailable);
-				}
-				_ => {}
-			}
-		}
-		if !self.output_confirmed(counts).await {
-			return kept(if self.control.is_stopping() {
-				KeptReason::Interrupted
-			} else {
-				KeptReason::Unconfirmed
-			});
-		}
-		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
-		dispose_file(&*self.backend, archive, how, &self.control).await
-	}
-
-	/// Whether the server holds exactly what the counts say was created: every file at its size
-	/// and every directory, listed again below the items created in the destination. Listed
-	/// as many at once as other small requests; a pause is waited out between them, holding
-	/// nothing, and a cancel drops those in flight and ends the check unconfirmed.
-	async fn output_confirmed(&mut self, counts: ItemCounts) -> bool {
-		let mut found = Tree::default();
-		if !self.into_destination {
-			// each request counts in flight, so a pause is only reported once it is over
-			let _listing = self.reporter.op();
-			let listed = self
-				.control
-				.until_stopping(self.backend.list_tree(self.dirs[ROOT].uuid))
-				.await;
-			match listed {
-				Ok(Ok(tree)) => found = tree,
-				Ok(Err(_)) | Err(Stopped) => return false,
-			}
-			// the folder itself
-			found.dirs.insert(self.dirs[ROOT].uuid);
-		}
-		// the new folder is listed whole above; the items past the report's records are
-		// checked as recheck_targets goes through them
-		let items: Vec<(Uuid, bool)> = self
-			.report
-			.top_level
-			.iter()
-			.filter(|top| top.key != ExtractTopLevelKey::Root)
-			.map(|top| (top.item.uuid(), matches!(top.item, NonRootItemType::Dir(_))))
-			.chain(self.top_level_beyond.iter().copied())
-			.collect();
-		for batch in items.chunks(MAX_SMALL_PARALLEL_REQUESTS) {
-			if self.reporter.checkpoint(&self.control).await.is_err() {
-				return false;
-			}
-			let listing = self.reporter.op();
-			// a listing removes nothing: a cancel drops the ones in flight
-			let listed = self
-				.control
-				.until_stopping(join_all(
-					batch
-						.iter()
-						.map(|&(uuid, is_dir)| created_tree(&*self.backend, uuid, is_dir)),
-				))
-				.await;
-			drop(listing);
-			let Ok(listed) = listed else {
-				return false;
-			};
-			for tree in listed {
-				let Some(tree) = tree else {
-					return false;
-				};
-				found.dirs.extend(tree.dirs);
-				found.files.extend(tree.files);
-			}
-			self.reporter.tick();
-		}
-		// the very items the job created, each file at the size it wrote
-		found.files.len() as u64 == counts.files_done
-			&& found.files.values().sum::<u64>() == counts.bytes_done
-			&& found.dirs.len() as u64 == counts.dirs_created
-			&& found.digest() == self.created_digest
-	}
-
-	/// The destination may have been shared or linked while the extraction ran; items created
-	/// before that were propagated to the old targets only. Propagate everything created (each
-	/// top-level item with its subtree) to the new ones, as many items at once as other small
-	/// requests, under the drive lock, which a pause gives back until it is over.
-	async fn recheck_targets(&mut self) -> Result<(), Stopped> {
-		self.reporter.checkpoint(&self.control).await?;
-		let destination = self.destination.uuid();
-		let current = match self
-			.control
-			.until_stopping(self.backend.connected_targets(destination))
-			.await?
-		{
-			Ok(current) => current,
-			Err(error) => {
-				// the extraction itself succeeded; only report
-				tracing::warn!("failed to re-check the extraction destination's shares: {error}");
-				return Ok(());
-			}
-		};
-		let added = current.without(&self.targets);
-		if added.is_empty() || self.report.top_level.is_empty() {
-			return Ok(());
-		}
-		let items = self.report.top_level.len() + self.top_level_beyond.len();
-		let mut next = 0;
-		while next < items {
-			let _lock = loop {
-				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
-					LockWait::Locked(held) => break held,
-					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
-					LockWait::Failed(error) => {
-						tracing::warn!(
-							"failed to lock the drive to propagate extracted items: {error}"
-						);
-						return Ok(());
-					}
-				}
-			};
-			while next < items && !self.control.is_pause_requested() {
-				// a cancel is not kept waiting for every item
-				if self.control.is_stopping() {
-					return Err(Stopped);
-				}
-				let end = (next + MAX_SMALL_PARALLEL_REQUESTS).min(items);
-				let propagated = join_all((next..end).map(|index| {
-					propagate_top_level(
-						&*self.backend,
-						&self.report.top_level,
-						&self.top_level_beyond,
-						index,
-						&added,
-					)
-				}))
-				.await;
-				for (dest_uuid, errors) in propagated {
-					for error in errors {
-						self.reporter.event(ExtractEvent::PropagationFailed {
-							dest_uuid,
-							error: Arc::new(error),
-						});
-					}
-				}
-				next = end;
-				self.reporter.tick();
-			}
-		}
-		Ok(())
-	}
-}
-
-/// Propagates top-level item `index` of `kept` followed by `beyond` (those past the report's
-/// records, fetched again: only when the destination changed, which is rare, rather than
-/// holding every one of them for the whole job) with its subtree to `added`; its uuid, and
-/// what failed.
-async fn propagate_top_level<B: DisposalBackend>(
-	backend: &B,
-	kept: &[ExtractedTopLevel],
-	beyond: &[(Uuid, bool)],
-	index: usize,
-	added: &ConnectedTargets,
-) -> (Uuid, Vec<Error>) {
-	if let Some(top) = kept.get(index) {
-		return (
-			top.item.uuid(),
-			backend.propagate_tree(added, &top.item).await,
-		);
-	}
-	let (uuid, is_dir) = beyond[index - kept.len()];
-	let errors = match backend.normal_item(uuid, is_dir).await {
-		Ok(item) => backend.propagate_tree(added, &item).await,
-		Err(error) => vec![error],
-	};
-	(uuid, errors)
-}
-
-/// What the server holds of a top-level item the job created: itself, and everything below a
-/// directory; `None` if it could not be listed, or is a file in the trash.
-async fn created_tree<B: DisposalBackend>(backend: &B, uuid: Uuid, is_dir: bool) -> Option<Tree> {
-	let mut tree = Tree::default();
-	if is_dir {
-		tree = backend.list_tree(uuid).await.ok()?;
-		tree.dirs.insert(uuid);
-	} else {
-		let state = backend.file_state(uuid).await.ok()?;
-		if state.trash {
-			return None;
-		}
-		tree.files.insert(uuid, state.size);
-	}
-	Some(tree)
 }
 
 #[cfg(test)]
