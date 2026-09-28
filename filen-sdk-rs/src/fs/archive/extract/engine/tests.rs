@@ -35,7 +35,10 @@ use crate::{
 			format::StreamCodec,
 			password::ArchivePassword,
 			sevenz::write::{SevenZEncryption, SevenZMethod},
-			test_support::{gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, zip_of},
+			test_support::{
+				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
+				zip_of,
+			},
 			worker::LinkHead,
 		},
 		dir::RootDirectory,
@@ -369,26 +372,19 @@ fn created_dirs(setup: &Setup) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracts_a_compressed_tar_into_a_new_folder() {
 	let big = pattern(2 * CHUNK_SIZE + 100, 7);
-	let mut tar = tar_of(&[
-		("docs/", b""),
-		("docs/a.txt", b"alpha"),
-		("docs/sub/big.bin", &big),
-		("empty.txt", b""),
+	let tar = tar_with(&[
+		TarMember::Data("docs/", b""),
+		TarMember::Data("docs/a.txt", b"alpha"),
+		TarMember::Data("docs/sub/big.bin", &big),
+		TarMember::Data("empty.txt", b""),
 		// the same name in another folder
-		("other/a.txt", b"another alpha"),
+		TarMember::Data("other/a.txt", b"another alpha"),
+		// a symlink the extraction skips
+		TarMember::Symlink {
+			path: "link",
+			target: "docs/a.txt",
+		},
 	]);
-	// a symlink the extraction skips, written into a second tar and joined on
-	let mut builder = tar::Builder::new(Vec::new());
-	let mut link = tar::Header::new_gnu();
-	link.set_entry_type(tar::EntryType::Symlink);
-	link.set_size(0);
-	builder
-		.append_link(&mut link, "link", "docs/a.txt")
-		.unwrap();
-	let linked = builder.into_inner().unwrap();
-	// drop the first tar's end-of-archive blocks so the link member follows on
-	tar.truncate(tar.len() - 1024);
-	tar.extend(linked);
 	let setup = setup("sample.tar.gz", gzip(&tar), |_| {});
 
 	let job = start(&setup, Options::default());
@@ -2696,27 +2692,25 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 }
 
 /// Appends a tar hard link at `path` to the member at `target`.
-fn append_hard_link(builder: &mut tar::Builder<Vec<u8>>, path: &str, target: &str) {
-	let mut header = tar::Header::new_gnu();
-	header.set_entry_type(tar::EntryType::Link);
-	header.set_size(0);
-	builder.append_link(&mut header, path, target).unwrap();
+/// A hard link at `path` to the file at `target`.
+fn hard_link<'a>(path: &'a str, target: &'a str) -> TarMember<'a> {
+	TarMember::HardLink { path, target }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hard_link_is_extracted_as_a_copy_of_the_file_it_names() {
 	let big = incompressible(2 * CHUNK_SIZE + 77, 0x51);
-	let mut tar = tar_of(&[("docs/", b""), ("docs/a.bin", &big), ("empty", b"")]);
-	// drop the end-of-archive blocks so the links follow on
-	tar.truncate(tar.len() - 1024);
-	let mut builder = tar::Builder::new(tar);
-	append_hard_link(&mut builder, "docs/hard", "docs/a.bin");
-	append_hard_link(&mut builder, "top.bin", "docs/a.bin");
-	append_hard_link(&mut builder, "empty-link", "empty");
-	// nothing to copy: a path no file came at, and a directory's
-	append_hard_link(&mut builder, "gone", "missing.txt");
-	append_hard_link(&mut builder, "dir-link", "docs");
-	let tar = builder.into_inner().unwrap();
+	let tar = tar_with(&[
+		TarMember::Data("docs/", b""),
+		TarMember::Data("docs/a.bin", &big),
+		TarMember::Data("empty", b""),
+		hard_link("docs/hard", "docs/a.bin"),
+		hard_link("top.bin", "docs/a.bin"),
+		hard_link("empty-link", "empty"),
+		// nothing to copy: a path no file came at, and a directory's
+		hard_link("gone", "missing.txt"),
+		hard_link("dir-link", "docs"),
+	]);
 	let setup = setup("bundle.tar", tar, |backend| {
 		backend.quirks.insert(Quirk::KeepUploads);
 	});
@@ -3277,13 +3271,12 @@ async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 
 /// A bare tar of the file `a.bin` holding `data`, then `links` hard links to it.
 fn tar_with_links(data: &[u8], links: usize) -> Vec<u8> {
-	let mut tar = tar_of(&[("a.bin", data)]);
-	tar.truncate(tar.len() - 1024);
-	let mut builder = tar::Builder::new(tar);
-	for link in 0..links {
-		append_hard_link(&mut builder, &format!("l{link:03}"), "a.bin");
-	}
-	builder.into_inner().unwrap()
+	let paths: Vec<String> = (0..links).map(|link| format!("l{link:03}")).collect();
+	let members: Vec<TarMember> = [TarMember::Data("a.bin", data)]
+		.into_iter()
+		.chain(paths.iter().map(|path| hard_link(path, "a.bin")))
+		.collect();
+	tar_with(&members)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3348,12 +3341,12 @@ async fn many_links_to_one_file_open_as_fast_as_they_are_worked_off() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_links_name_is_reported_as_any_entrys() {
-	let mut tar = tar_of(&[("a.txt", b"alpha")]);
-	tar.truncate(tar.len() - 1024);
-	let mut builder = tar::Builder::new(tar);
-	append_hard_link(&mut builder, "c\u{202E}txt.exe", "a.txt");
-	append_hard_link(&mut builder, "d:e", "a.txt");
-	let setup = setup("bundle.tar", builder.into_inner().unwrap(), |backend| {
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		hard_link("c\u{202E}txt.exe", "a.txt"),
+		hard_link("d:e", "a.txt"),
+	]);
+	let setup = setup("bundle.tar", tar, |backend| {
 		backend.quirks.insert(Quirk::KeepUploads);
 	});
 	let job = start(&setup, Options::default());
@@ -3377,17 +3370,17 @@ async fn a_links_name_is_reported_as_any_entrys() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn links_to_links_and_to_themselves() {
-	let mut tar = tar_of(&[("a.txt", b"alpha")]);
-	tar.truncate(tar.len() - 1024);
-	let mut builder = tar::Builder::new(tar);
-	append_hard_link(&mut builder, "b", "a.txt");
-	// a link to a link copies what that one copies
-	append_hard_link(&mut builder, "c", "b");
-	// a link to itself names nothing before it
-	append_hard_link(&mut builder, "self", "self");
-	// a link to a link to nothing
-	append_hard_link(&mut builder, "d", "self");
-	let setup = setup("bundle.tar", builder.into_inner().unwrap(), |backend| {
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		hard_link("b", "a.txt"),
+		// a link to a link copies what that one copies
+		hard_link("c", "b"),
+		// a link to itself names nothing before it
+		hard_link("self", "self"),
+		// a link to a link to nothing
+		hard_link("d", "self"),
+	]);
+	let setup = setup("bundle.tar", tar, |backend| {
 		backend.quirks.insert(Quirk::KeepUploads);
 	});
 	let job = start(&setup, Options::default());
@@ -3428,6 +3421,48 @@ async fn links_to_links_and_to_themselves() {
 		]
 	);
 	assert_eq!(listed.totals.files, report.counts.files_done);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_hard_link_comes_out_with_the_target_its_listing_names() {
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("other.txt", b"other"),
+		hard_link("b", "a.txt"),
+		hard_link("c", "b"),
+	]);
+	let listing = list(
+		&setup("bundle.tar", tar.clone(), |_| {}),
+		JobControl::default(),
+		test_config(),
+	);
+	let listed = listing.running.await.unwrap().unwrap();
+	let target_of = |index: usize| match &listed.entries[index].kind {
+		ArchiveEntryKind::Hardlink { target_id, .. } => target_id.map(|id| id.index),
+		other => panic!("{other:?} is no hard link"),
+	};
+	// each names the entry it copies, a link naming a link
+	assert_eq!((target_of(2), target_of(3)), (Some(0), Some(2)));
+
+	// alone, a link has nothing to copy; with the entries its listing names, it is extracted
+	for (chosen_ids, extracted, skipped) in [
+		(&[3][..], &[][..], &["c"][..]),
+		(&[3, 2, 0], &["a.txt", "b", "c"], &[]),
+	] {
+		let setup = setup("bundle.tar", tar.clone(), |_| {});
+		let job = start(&setup, chosen(chosen_ids, &[]));
+		let report = job.running.await.unwrap().unwrap();
+		assert_eq!(finished_paths(&setup), extracted, "{chosen_ids:?}");
+		assert_eq!(
+			report
+				.skipped
+				.iter()
+				.map(|skipped| skipped.path.as_str())
+				.collect::<Vec<_>>(),
+			skipped,
+			"{chosen_ids:?}"
+		);
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

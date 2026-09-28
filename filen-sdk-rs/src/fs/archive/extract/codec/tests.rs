@@ -56,15 +56,6 @@ enum Seen {
 	Listed(ArchiveEntry),
 }
 
-fn path_of(head: &EntryHead) -> String {
-	head.path
-		.segments
-		.iter()
-		.map(AsRef::as_ref)
-		.collect::<Vec<&str>>()
-		.join("/")
-}
-
 fn run_with(
 	archive: &[u8],
 	name: &str,
@@ -117,10 +108,10 @@ fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Err
 			}
 			WorkerEvent::Opened(layout) => seen.push(Seen::Opened(layout)),
 			WorkerEvent::Entry(head) => seen.push(match head.kind {
-				EntryKind::Dir => Seen::Dir(head.ordinal, path_of(&head)),
+				EntryKind::Dir => Seen::Dir(head.ordinal, head.path.joined()),
 				EntryKind::File { size } => Seen::File {
 					ordinal: head.ordinal,
-					path: path_of(&head),
+					path: head.path.joined(),
 					size,
 					chunks: Vec::new(),
 					data: Vec::new(),
@@ -151,8 +142,8 @@ fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Err
 			)),
 			WorkerEvent::Link(link) => seen.push(Seen::Link(
 				link.ordinal,
-				joined(&link.path),
-				joined(&link.target),
+				link.path.joined(),
+				link.target.joined(),
 			)),
 			WorkerEvent::Listed(entry) => seen.push(Seen::Listed(*entry)),
 			WorkerEvent::Head(_) => panic!("an extracting codec sent a head"),
@@ -1484,7 +1475,11 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 				"docs/hard",
 				Some("docs/hard"),
 				ArchiveEntryKind::Hardlink {
-					target: "docs/a.txt".into()
+					target: "docs/a.txt".into(),
+					target_id: Some(ArchiveEntryId {
+						archive: LISTED,
+						index: 1,
+					}),
 				},
 				Some(5),
 				None,
@@ -1513,7 +1508,8 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 		(&entries[0].kind, &entries[0].skip),
 		(
 			&ArchiveEntryKind::Hardlink {
-				target: "gone.txt".into()
+				target: "gone.txt".into(),
+				target_id: None,
 			},
 			&Some(ExtractSkipReason::Hardlink {
 				target: String::new()

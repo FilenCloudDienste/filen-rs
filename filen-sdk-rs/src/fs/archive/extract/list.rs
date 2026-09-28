@@ -48,10 +48,16 @@ pub enum ArchiveEntryKind {
 		target: String,
 	},
 	/// A tar hard link: a second name for the earlier file at `target`, as stored and cut to at
-	/// most 4096 bytes. Extracted as a copy of that file, when it was extracted.
+	/// most 4096 bytes. Extracted as a copy of that file, when it was extracted: a partial
+	/// extraction ([`ExtractRequest::Entries`](super::ExtractRequest::Entries)) has to take the
+	/// entry `target_id` too, and when that is a hard link as well, its own target in turn.
+	/// `target_id` is `None` when the link names no file the archive stores before it, and is
+	/// skipped.
 	Hardlink {
 		/// The path of the file it names, as stored, at most 4096 bytes.
 		target: String,
+		/// That file's entry; `None` when the archive stores no such file before the link.
+		target_id: Option<ArchiveEntryId>,
 	},
 	/// A device node or FIFO.
 	Device,
@@ -398,7 +404,7 @@ impl ArchiveEntry {
 	/// The bytes of text it holds.
 	pub(crate) fn text_bytes(&self) -> usize {
 		let target = match &self.kind {
-			ArchiveEntryKind::Symlink { target } | ArchiveEntryKind::Hardlink { target } => {
+			ArchiveEntryKind::Symlink { target } | ArchiveEntryKind::Hardlink { target, .. } => {
 				target.len()
 			}
 			_ => 0,

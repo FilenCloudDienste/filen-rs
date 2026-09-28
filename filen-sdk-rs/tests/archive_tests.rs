@@ -1128,7 +1128,8 @@ async fn a_tar_hard_link_is_extracted_as_a_copy_of_its_target() {
 	assert_eq!(
 		hard.kind,
 		ArchiveEntryKind::Hardlink {
-			target: "tree/dir/text.txt".to_owned()
+			target: "tree/dir/text.txt".to_owned(),
+			target_id: Some(entry(&listing, "tree/dir/text.txt").id),
 		}
 	);
 	assert_eq!(hard.size, Some(2110), "as large as the file it names");

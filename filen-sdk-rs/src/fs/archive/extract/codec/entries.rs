@@ -179,6 +179,15 @@ impl<'p> Walk<'p> {
 		self.listing.is_some()
 	}
 
+	/// The id of the listed archive's entry `ordinal`.
+	pub(super) fn listed_id(&self, ordinal: u64) -> ArchiveEntryId {
+		ArchiveEntryId {
+			archive: self.listing.expect("only a listing lists"),
+			// the member cap keeps ordinals far below u32::MAX
+			index: u32::try_from(ordinal).unwrap_or(u32::MAX),
+		}
+	}
+
 	/// Checks, before anything is created, a partial extraction of an archive whose entries are
 	/// all known up front (a zip's or 7z's): that it holds every entry chosen, each below the
 	/// base. Directories chosen are noted, so what is below one is chosen wherever it is stored.
@@ -250,7 +259,6 @@ impl<'p> Walk<'p> {
 	/// Sends what a listing says of `found`; whether an extraction creates it. `apple_double` is
 	/// what its data told, when read; otherwise its name decides.
 	pub(super) fn list(&self, found: Found, apple_double: Option<bool>) -> io::Result<bool> {
-		let archive = self.listing.expect("only a listing lists");
 		if found.is_dir() && matches!(found.path, Err(PathRejection::Empty)) {
 			// the archive's own root, which no extraction creates
 			return Ok(false);
@@ -279,14 +287,10 @@ impl<'p> Walk<'p> {
 		let (stored_path, stored_path_truncated) = display_path(found.stored);
 		let path = found.path.as_ref().ok();
 		let entry = ArchiveEntry {
-			id: ArchiveEntryId {
-				archive,
-				// the member cap keeps ordinals far below u32::MAX
-				index: u32::try_from(found.ordinal).unwrap_or(u32::MAX),
-			},
+			id: self.listed_id(found.ordinal),
 			stored_path: stored_path.to_owned(),
 			stored_path_truncated,
-			path: path.map(joined),
+			path: path.map(ArchivePath::joined),
 			size: (found.kind != ArchiveEntryKind::Dir).then_some(found.size),
 			modified: found.modified,
 			encrypted: found.encrypted,
@@ -363,17 +367,8 @@ pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
 /// share a key about once in 36 billion archives, and then a link copies another file of the
 /// same archive.
 pub(crate) fn link_key(path: &ArchivePath) -> u64 {
-	let digest = blake3::hash(joined(path).as_bytes());
+	let digest = blake3::hash(path.joined().as_bytes());
 	u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
-}
-
-/// A path's segments joined with `/`.
-pub(crate) fn joined(path: &ArchivePath) -> String {
-	path.segments
-		.iter()
-		.map(AsRef::as_ref)
-		.collect::<Vec<&str>>()
-		.join("/")
 }
 
 pub(super) fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {

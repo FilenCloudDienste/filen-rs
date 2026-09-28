@@ -86,19 +86,56 @@ pub(crate) fn gzip(data: &[u8]) -> Vec<u8> {
 
 /// A GNU tar of `members`, each a directory when its path ends in `/`.
 pub(crate) fn tar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+	let members: Vec<TarMember> = members
+		.iter()
+		.map(|&(path, data)| TarMember::Data(path, data))
+		.collect();
+	tar_with(&members)
+}
+
+/// A member of a tar [`tar_with`] builds.
+pub(crate) enum TarMember<'a> {
+	/// A file holding the data, or a directory when its path ends in `/`.
+	Data(&'a str, &'a [u8]),
+	Symlink {
+		path: &'a str,
+		target: &'a str,
+	},
+	/// A second name for the file stored before it at `target`.
+	HardLink {
+		path: &'a str,
+		target: &'a str,
+	},
+}
+
+/// A GNU tar of `members`.
+pub(crate) fn tar_with(members: &[TarMember]) -> Vec<u8> {
 	let mut builder = tar::Builder::new(Vec::new());
-	for (path, data) in members {
+	for member in members {
 		let mut header = tar::Header::new_gnu();
 		header.set_mtime(1_700_000_000);
 		header.set_mode(0o644);
-		if path.ends_with('/') {
-			header.set_entry_type(tar::EntryType::Directory);
-			header.set_size(0);
-			builder.append_data(&mut header, path, &b""[..]).unwrap();
-		} else {
-			header.set_entry_type(tar::EntryType::Regular);
-			header.set_size(data.len() as u64);
-			builder.append_data(&mut header, path, *data).unwrap();
+		match *member {
+			TarMember::Data(path, _) if path.ends_with('/') => {
+				header.set_entry_type(tar::EntryType::Directory);
+				header.set_size(0);
+				builder.append_data(&mut header, path, &b""[..]).unwrap();
+			}
+			TarMember::Data(path, data) => {
+				header.set_entry_type(tar::EntryType::Regular);
+				header.set_size(data.len() as u64);
+				builder.append_data(&mut header, path, data).unwrap();
+			}
+			TarMember::Symlink { path, target } => {
+				header.set_entry_type(tar::EntryType::Symlink);
+				header.set_size(0);
+				builder.append_link(&mut header, path, target).unwrap();
+			}
+			TarMember::HardLink { path, target } => {
+				header.set_entry_type(tar::EntryType::Link);
+				header.set_size(0);
+				builder.append_link(&mut header, path, target).unwrap();
+			}
 		}
 	}
 	builder.into_inner().unwrap()

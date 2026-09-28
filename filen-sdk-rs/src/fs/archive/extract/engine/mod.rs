@@ -47,7 +47,7 @@ use crate::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
 				SourceDisposition, Tree, dir_digest, dispose_file, file_digest, kept_on_early_end,
 			},
-			entry_path::ArchivePath,
+			entry_path::{ArchivePath, joined},
 			format::{ArchiveFormat, extract_folder_name},
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
@@ -594,14 +594,6 @@ fn report_file_failure<U>(
 		file.bytes(),
 		record_failure(report, failure),
 	);
-}
-
-fn joined(segments: &[ValidatedName]) -> String {
-	segments
-		.iter()
-		.map(AsRef::as_ref)
-		.collect::<Vec<&str>>()
-		.join("/")
 }
 
 impl<B: DisposalBackend> Driver<B> {

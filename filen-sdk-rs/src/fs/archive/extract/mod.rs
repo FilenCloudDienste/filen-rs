@@ -98,6 +98,8 @@ pub enum ExtractRequest {
 	/// A chosen directory of a tar brings what the tar stores after it below it: every tool
 	/// stores a directory before its contents, and what came before is gone by the time the
 	/// directory is reached. A zip's or 7z's brings everything below it, wherever it is stored.
+	/// A tar's hard link is extracted only along with the entry it names (see
+	/// [`ArchiveEntryKind::Hardlink`]).
 	///
 	/// The archive is never removed afterwards: part of it is not extracted.
 	Entries {

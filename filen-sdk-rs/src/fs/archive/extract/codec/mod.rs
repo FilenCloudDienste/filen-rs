@@ -36,9 +36,12 @@ use super::{
 			SourceFailed, WorkerEvent, WorkerPort, read_full, send_file_data,
 		},
 		zip::{
+			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
+			METHOD_STORED, METHOD_XZ, METHOD_ZSTD,
 			crypto::{
 				AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, CryptoError, ZIP_CRYPTO_HEADER_LEN_U64,
 			},
+			method_supported,
 			read::{
 				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipIndex, ZipKind, ZipLimits,
 				open_entry, read_index, unaccounted_after,
@@ -50,7 +53,7 @@ use super::{
 	storage_exceeded,
 };
 use entries::{Found, MacShape, Verdict, Walk, apple_double};
-pub(crate) use entries::{Selection, Task, joined, link_key};
+pub(crate) use entries::{Selection, Task, link_key};
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +210,7 @@ fn extract_single(
 			"the archive's name cannot be made into a file name",
 		)
 	})?;
-	let stored = joined(&path);
+	let stored = path.joined();
 	let mut found = Found {
 		ordinal: 0,
 		stored: &stored,
@@ -295,14 +298,14 @@ fn zip_method(entry: &ZipEntry) -> Option<String> {
 		return None;
 	}
 	Some(match entry.method {
-		0 => "Stored".to_owned(),
-		8 => "Deflate".to_owned(),
-		9 => "Deflate64".to_owned(),
-		12 => "BZip2".to_owned(),
-		14 => "LZMA".to_owned(),
-		93 => "Zstd".to_owned(),
-		95 => "XZ".to_owned(),
-		98 => "PPMd".to_owned(),
+		METHOD_STORED => "Stored".to_owned(),
+		METHOD_DEFLATE => "Deflate".to_owned(),
+		METHOD_DEFLATE64 => "Deflate64".to_owned(),
+		METHOD_BZIP2 => "BZip2".to_owned(),
+		METHOD_LZMA => "LZMA".to_owned(),
+		METHOD_ZSTD => "Zstd".to_owned(),
+		METHOD_XZ => "XZ".to_owned(),
+		METHOD_PPMD => "PPMd".to_owned(),
 		other => format!("method {other}"),
 	})
 }
@@ -1037,11 +1040,7 @@ fn key_unproven(entry: &ZipEntry) -> bool {
 
 /// Whether the SDK reads the entry's compression method under its encryption.
 fn zip_supported(entry: &ZipEntry) -> bool {
-	match entry.method {
-		0 | 8 | 9 | 12 | 93 => true,
-		14 | 95 => entry.encryption == ZipEncryption::None,
-		_ => false,
-	}
+	method_supported(entry.method, entry.encryption != ZipEncryption::None)
 }
 
 /// Whether a directory entry's stored bytes are an empty stream (as `java.util.zip` and Python
@@ -1071,12 +1070,12 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	};
 	let data = entry.compressed_size.checked_sub(overhead);
 	match entry.method {
-		0 => data == Some(0),
+		METHOD_STORED => data == Some(0),
 		// an empty deflate (or deflate64) stream takes 2 bytes, too few for any literal and its
 		// block's end
-		8 | 9 => data.is_some_and(|data| data <= 2),
+		METHOD_DEFLATE | METHOD_DEFLATE64 => data.is_some_and(|data| data <= 2),
 		// an empty bzip2 stream is its 4-byte header and 10-byte end: no room for a block
-		12 => data.is_some_and(|data| data <= 14),
+		METHOD_BZIP2 => data.is_some_and(|data| data <= 14),
 		_ => false,
 	}
 }
@@ -1190,9 +1189,9 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 	let mut unread = 0u64;
 	let mut files = 0u64;
 	// what a listing resolves hard links against: the files it says are extracted (hard links
-	// resolved included, which later links may name), by path, with their sizes. An
+	// resolved included, which later links may name), by path, with their sizes and ordinals. An
 	// extraction's driver resolves them against the files it created
-	let mut listed_files = SeededMap::<u64, u64>::default();
+	let mut listed_files = SeededMap::<u64, (u64, u64)>::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -1216,6 +1215,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 			MemberKind::Hardlink { target } => (
 				ArchiveEntryKind::Hardlink {
 					target: display_path(target).0.to_owned(),
+					target_id: None,
 				},
 				None,
 			),
@@ -1246,7 +1246,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 		};
 		// a hard link names an earlier file, the same whatever else it is stored with
 		let link_target = match (&member.kind, &found.kind) {
-			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown }) => {
+			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown, .. }) => {
 				Some((entry_path(target), shown.clone()))
 			}
 			_ => None,
@@ -1257,7 +1257,13 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 					.ok()
 					.and_then(|target| listed_files.get(&link_key(&target)))
 				{
-					Some(&size) => found.size = size,
+					Some(&(size, target)) => {
+						found.size = size;
+						found.kind = ArchiveEntryKind::Hardlink {
+							target: shown,
+							target_id: Some(walk.listed_id(target)),
+						};
+					}
 					None => {
 						found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
 					}
@@ -1276,7 +1282,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 			if walk.list(found, apple_double).map_err(failure)?
 				&& !is_dir && let Some(key) = key
 			{
-				listed_files.insert(key, size);
+				listed_files.insert(key, (size, this));
 			}
 			continue;
 		}

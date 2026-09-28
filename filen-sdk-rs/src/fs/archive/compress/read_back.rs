@@ -175,12 +175,7 @@ impl Check {
 				self.single = matches!(layout, ArchiveFormat::Single { .. });
 			}
 			WorkerEvent::Entry(EntryHead { path, kind, .. }) => {
-				let path = path
-					.segments
-					.iter()
-					.map(AsRef::as_ref)
-					.collect::<Vec<&str>>()
-					.join("/");
+				let path = path.joined();
 				match kind {
 					EntryKind::Dir if self.dirs.remove(&path) => {}
 					EntryKind::Dir => return Err(format!("it holds an extra directory {path}")),
