@@ -59,8 +59,9 @@
 //! to diff two records whose scenario, fixture or node count disagree.
 //!
 //! A run is also stamped with the commit it was built from, marked `-dirty` when the working tree
-//! did not match it. Each run writes ONE fresh file; nothing is ever appended to, so a stale row
-//! cannot read as a fresh one.
+//! did not match it — and a run so marked REFUSES to write into `benches/sync_engine/baseline/`,
+//! where the published figures live (see [`refuse_unreproducible`]). Each run writes ONE fresh file;
+//! nothing is ever appended to, so a stale row cannot read as a fresh one.
 
 use std::{
 	collections::{BTreeMap, BTreeSet, HashMap},
@@ -1208,6 +1209,39 @@ fn commit_stamp(head: &str, porcelain: &str) -> String {
 	} else {
 		format!("{head}-dirty")
 	}
+}
+
+/// Where the PUBLISHED result files live: the directory `BASELINE.md` quotes its figures from.
+fn published_dir() -> PathBuf {
+	Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/sync_engine/baseline")
+}
+
+/// Refuse a run that would write into `published` a file its own stamp cannot reproduce.
+///
+/// The stamp says `-dirty` and nothing reads it: a whole round of published figures carried one,
+/// every "after" in it measured on code that was never committed. A file in `published` is a
+/// figure somebody will quote, so it has to name a commit that builds the binary it came from — a
+/// dirty tree cannot, and neither can a stamp git could not produce at all (`unknown`). Anywhere
+/// else a dirty run is an edit-test loop and is left alone; its file still says `-dirty`.
+///
+/// Compared as canonical paths, so `baseline/../baseline` and a symlink to it are the same place.
+/// A `published` that does not exist holds nothing, and nothing that exists can be under it.
+fn refuse_unreproducible(out: &Path, published: &Path, commit: &str) -> Result<(), String> {
+	let (Ok(out), Ok(published)) = (out.canonicalize(), published.canonicalize()) else {
+		return Ok(());
+	};
+	if !out.starts_with(&published) {
+		return Ok(());
+	}
+	if commit.ends_with("-dirty") || commit.starts_with("unknown") {
+		return Err(format!(
+			"refusing to write a result file into {} from a build stamped {commit:?}: a published \
+			 figure must name a commit that reproduces it. Commit the tree first, or point \
+			 SYNC_BENCH_OUT somewhere else",
+			published.display()
+		));
+	}
+	Ok(())
 }
 
 /// The constants a run is stamped with. Collected once, before anything is measured.
@@ -2776,6 +2810,13 @@ pub fn run() -> Result<String, String> {
 	let chosen = select(&wanted)?;
 
 	let (commit, toolchain, machine, profile) = run_meta();
+	let dir = std::env::var("SYNC_BENCH_OUT")
+		.map(PathBuf::from)
+		.unwrap_or_else(|_| std::env::temp_dir());
+	fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+	// Before anything is measured: a refusal after an hour of samples would be a refusal nobody
+	// waits for.
+	refuse_unreproducible(&dir, &published_dir(), &commit)?;
 	let runtime = tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()
@@ -2793,10 +2834,6 @@ pub fn run() -> Result<String, String> {
 		mark_overhead_ns: overhead,
 		records: Vec::new(),
 	};
-	let dir = std::env::var("SYNC_BENCH_OUT")
-		.map(PathBuf::from)
-		.unwrap_or_else(|_| std::env::temp_dir());
-	fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
 	// One fresh file per run, named so two runs cannot land on one path. Nothing is ever appended
 	// to: an appended table is how a stale row comes to read as a fresh one.
 	// The selector is in the name to make it readable, and the uuid is what makes it unique — so
@@ -3612,6 +3649,34 @@ mod tests {
 			commit_stamp("abcdef123456", " M filen-sdk-rs/src/sync_engine/bench.rs"),
 			"abcdef123456-dirty"
 		);
+	}
+
+	/// A dirty or unstamped build may not write into the published directory, however the path to
+	/// it is spelled — and anywhere else it may.
+	#[test]
+	fn a_dirty_build_cannot_publish() {
+		let scratch = std::env::temp_dir().join(format!("bench_publish_{}", uuid::Uuid::new_v4()));
+		let published = scratch.join("baseline");
+		let elsewhere = scratch.join("elsewhere");
+		fs::create_dir_all(published.join("nested")).unwrap();
+		fs::create_dir_all(&elsewhere).unwrap();
+		let respelled = published.join("..").join("baseline");
+		for out in [&published, &published.join("nested"), &respelled] {
+			for stamp in ["abcdef123456-dirty", "unknown"] {
+				assert!(
+					refuse_unreproducible(out, &published, stamp).is_err(),
+					"{} accepted a {stamp:?} build",
+					out.display()
+				);
+			}
+			assert!(refuse_unreproducible(out, &published, "abcdef123456").is_ok());
+		}
+		assert!(refuse_unreproducible(&elsewhere, &published, "abcdef123456-dirty").is_ok());
+		// A sibling whose NAME starts with the published directory's is not inside it.
+		let sibling = scratch.join("baseline_old");
+		fs::create_dir_all(&sibling).unwrap();
+		assert!(refuse_unreproducible(&sibling, &published, "abcdef123456-dirty").is_ok());
+		fs::remove_dir_all(&scratch).unwrap();
 	}
 
 	/// An even sample count takes the MEAN of the two middles. `SYNC_BENCH_SAMPLES` is a
