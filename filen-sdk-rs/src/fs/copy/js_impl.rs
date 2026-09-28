@@ -102,7 +102,9 @@ pub struct CopyUpdate {
 	pub active: Vec<ActiveFile>,
 	pub events: Vec<CopyEvent>,
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds.
+	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
+	/// cancelled job winds down; 0 on the final update, whether the job completed, was cancelled
+	/// or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,

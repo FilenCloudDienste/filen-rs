@@ -231,7 +231,9 @@ pub struct ExtractUpdate {
 	pub active: Vec<ExtractActiveFile>,
 	pub events: Vec<ExtractEvent>,
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds.
+	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
+	/// cancelled job winds down; 0 on the final update, whether the job completed, was cancelled
+	/// or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -289,7 +291,9 @@ pub struct ListUpdate {
 	/// Entries listed so far.
 	pub entries: u64,
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds.
+	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
+	/// cancelled job winds down; 0 on the final update, whether the job completed, was cancelled
+	/// or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -345,7 +349,9 @@ pub struct CompressUpdate {
 	pub active: Vec<CompressActiveFile>,
 	pub events: Vec<CompressEvent>,
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds.
+	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
+	/// cancelled job winds down; 0 on the final update, whether the job completed, was cancelled
+	/// or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
