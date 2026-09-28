@@ -222,7 +222,7 @@ pub(super) fn extract_zip(
 			entry_limits,
 		));
 		let (path, apple_double) = match verdict {
-			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(ExtractSkipReason::Symlink { .. }) => {
 				let target =
 					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
@@ -270,6 +270,7 @@ pub(super) fn extract_zip(
 			Err(error) => return Err(zip_failure(error)),
 		}
 	}
+	walk.send_mac_folders().map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes,
 		duplicates,
@@ -350,7 +351,7 @@ fn unaccounted_at<R: Read + Seek>(
 /// Sends the file `entry`, taken at `path`, its data read from `reader`; whether reading it
 /// whole proved the password, which `verified` says an entry before it already did.
 fn take_zip_file(
-	walk: &Walk,
+	walk: &mut Walk,
 	found: &Found,
 	path: ArchivePath,
 	apple_double: bool,

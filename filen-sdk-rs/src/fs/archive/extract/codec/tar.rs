@@ -71,7 +71,7 @@ pub(super) fn walk_tar<R: Read>(
 			continue;
 		}
 		let (path, apple_double) = match walk.judge(&found)? {
-			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(reason) => {
 				walk.port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
@@ -105,6 +105,9 @@ pub(super) fn walk_tar<R: Read>(
 		.map_err(failure)?;
 		left_out.note(&found.path, sent == 0);
 		files += sent;
+	}
+	if !walk.listing() {
+		walk.send_mac_folders().map_err(failure)?;
 	}
 	walk.finish()?;
 	Ok(Walked {

@@ -115,13 +115,58 @@ async fn mac_metadata_left_out_keeps_nothing_from_removing_the_archive() {
 			.iter()
 			.map(|skipped| (skipped.path.as_str(), &skipped.reason))
 			.collect::<Vec<_>>(),
+		// the folder once everything in it was judged
 		[
-			("__MACOSX/", &ExtractSkipReason::MacMetadata),
 			("__MACOSX/._a.txt", &ExtractSkipReason::MacMetadata),
 			("._a.txt", &ExtractSkipReason::MacMetadata),
+			("__MACOSX/", &ExtractSkipReason::MacMetadata),
 		]
 	);
 	assert_eq!(report.counts.entries_skipped, 3);
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mac_folder_holding_anything_of_the_users_is_created_and_reported_so() {
+	let apple_double = [&[0x00, 0x05, 0x16, 0x07][..], b"\x00\x02\x00\x00"].concat();
+	let tar = tar_of(&[
+		("__MACOSX/", b""),
+		("__MACOSX/meta/", b""),
+		("__MACOSX/meta/._a.txt", &apple_double),
+		// no metadata: an empty folder, and a file that is not AppleDouble, of the user's
+		("__MACOSX/empty/", b""),
+		("__MACOSX/user/", b""),
+		("__MACOSX/user/notes.txt", b"notes"),
+	]);
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::Trash,
+		ExtractRoot::NewFolder { name: None },
+		|_| {},
+	)
+	.await;
+	assert_eq!(finished_paths(&setup), ["bundle/__MACOSX/user/notes.txt"]);
+	assert_eq!(
+		created_dirs(&setup),
+		["bundle", "__MACOSX", "user", "empty"]
+	);
+	// what was created is not reported skipped: only the folder holding metadata alone
+	assert_eq!(
+		report
+			.skipped
+			.iter()
+			.map(|skipped| (skipped.path.as_str(), &skipped.reason))
+			.collect::<Vec<_>>(),
+		[
+			("__MACOSX/meta/._a.txt", &ExtractSkipReason::MacMetadata),
+			("__MACOSX/meta/", &ExtractSkipReason::MacMetadata),
+		]
+	);
+	// nothing dropped: the archive goes
 	assert!(matches!(
 		disposition(&report),
 		DisposalOutcome::Disposed { .. }

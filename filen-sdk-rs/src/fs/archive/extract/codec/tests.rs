@@ -2065,3 +2065,33 @@ fn a_listed_hard_link_to_mac_metadata_is_metadata() {
 		]
 	);
 }
+
+#[test]
+fn a_mac_folder_is_sent_once_everything_in_it_was_judged() {
+	let data = apple_double_data();
+	let entries = [
+		("__MACOSX/", None),
+		("__MACOSX/._a.txt", Some(&data[..])),
+		("__MACOSX/empty/", None),
+	];
+	for (name, archive) in [
+		("m.zip", zip_of(&entries, None)),
+		(
+			"m.7z",
+			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
+		),
+	] {
+		let (seen, end, _) = run_job(&archive, job_of(&archive, name, true, Task::Extract(None)));
+		end.unwrap();
+		// an empty folder may be the user's: created, and the folder above it with it
+		assert_eq!(
+			outline(&seen),
+			[
+				"skip __MACOSX/._a.txt MacMetadata",
+				"dir __MACOSX",
+				"dir __MACOSX/empty"
+			],
+			"{name}"
+		);
+	}
+}

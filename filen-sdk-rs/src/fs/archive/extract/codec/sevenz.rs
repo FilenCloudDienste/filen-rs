@@ -276,7 +276,7 @@ pub(super) fn extract_sevenz(
 			verified |= proves(entry);
 		}
 		let (path, apple_double) = match walk.judge_again(&found, verdict) {
-			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(reason) => {
 				port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
@@ -329,6 +329,7 @@ pub(super) fn extract_sevenz(
 			}
 		}
 	}
+	walk.send_mac_folders().map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,

@@ -217,7 +217,7 @@ fn extract_single(
 				walk.port.send(found.skipped(reason)).map_err(failure)?;
 				0
 			}
-			Verdict::Ignore | Verdict::Root => 0,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => 0,
 		}
 	};
 	// read to the end whatever became of the file, for the stream's own checks
@@ -235,7 +235,7 @@ fn extract_single(
 /// checked: then it is sent as skipped.
 /// Whether it was sent as a file (1) or not (0), to count.
 fn take_file(
-	walk: &Walk,
+	walk: &mut Walk,
 	found: &Found,
 	path: ArchivePath,
 	size: Option<u64>,
@@ -249,6 +249,7 @@ fn take_file(
 				.send(found.skipped(ExtractSkipReason::MacMetadata))?;
 			return Ok(0);
 		}
+		walk.taken_after_all(found);
 		head
 	} else {
 		Vec::new()
