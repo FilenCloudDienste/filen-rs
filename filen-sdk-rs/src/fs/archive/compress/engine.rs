@@ -39,7 +39,7 @@ use crate::{
 			},
 			hash::HeadLastHasher,
 			limits::MAX_REPORT_RECORDS,
-			worker::{ARCHIVE_STALL_TIMEOUT, StallWatch, WorkerEvent, WorkerLink, worker_died},
+			worker::{StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
 		},
 		categories::{DirType, Normal},
 		drive_job::{
@@ -716,12 +716,10 @@ impl<B: DisposalBackend> Driver<B> {
 			|| self.held.is_some()
 			|| pause_requested
 			|| self.codec_result.is_some();
-		if self.stall.stalled(&self.link.shared, owed) {
-			tracing::error!(
-				"archive {}: the codec made no progress for {ARCHIVE_STALL_TIMEOUT:?}",
-				self.archive_uuid
-			);
-			self.link.retire();
+		if self
+			.stall
+			.give_up_if_stalled(&self.link, owed, self.archive_uuid)
+		{
 			self.codec_result = Some(Err(worker_died()));
 			self.stop_with(worker_died());
 		}
@@ -739,18 +737,11 @@ impl<B: DisposalBackend> Driver<B> {
 				),
 			)),
 			Ok(_) => {}
-			// An error the driver caused (it failed a fetch, or stopped) is already the job's.
-			Err(error) if self.fatal.error().is_some() || self.control.is_stopping() => {
-				tracing::debug!("archive codec ended after the job did: {error}");
-			}
 			Err(error) => {
-				// a dead codec is a bug to hear of, where a damaged archive is only the user's
-				if error.kind() == ErrorKind::ArchiveWorkerDied {
-					tracing::error!("archive {}: {error}", self.archive_uuid);
-				} else {
-					tracing::warn!("archive {}: {error}", self.archive_uuid);
+				let ended = self.fatal.error().is_some() || self.control.is_stopping();
+				if codec_failed(self.archive_uuid, error, ended) {
+					self.stop_with(Error::custom(error.kind(), error.to_string()));
 				}
-				self.stop_with(Error::custom(error.kind(), error.to_string()));
 			}
 		}
 		self.codec_result = Some(result);

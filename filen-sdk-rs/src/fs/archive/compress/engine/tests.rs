@@ -42,6 +42,7 @@ use crate::{
 			},
 			tar_iter::TarReader,
 			test_support::pattern,
+			worker::ARCHIVE_STALL_TIMEOUT,
 			worker::{self, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
