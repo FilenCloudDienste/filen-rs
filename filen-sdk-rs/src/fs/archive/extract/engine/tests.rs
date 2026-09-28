@@ -917,11 +917,33 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 		}
 	);
 	assert_eq!(finished_paths(&setup), ["broken/first.txt"]);
-	let last = job.recorder.last();
-	assert_eq!(last.phase, ExtractPhase::Failed);
-	// what the job did not read it never will: no time is left
-	assert_eq!(last.eta, Some(Duration::ZERO));
+	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
+	/// A tar member's header: its name, then its checksum at this offset.
+	const CHECKSUM_AT: usize = 148;
+	/// Where `second.bin`'s header starts: past `first.txt`'s header and its data block.
+	const SECOND_HEADER: usize = 2 * 512;
+	let mut tar = tar_of(&[
+		("first.txt", b"first"),
+		("second.bin", &pattern(3 * CHUNK_SIZE, 3)),
+	]);
+	tar[SECOND_HEADER + CHECKSUM_AT] ^= 1;
+	let setup = setup("broken.tar", tar, |_| {});
+	let job = start(&setup, Options::default());
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
+	let last = job.recorder.last();
+	// most of the archive is unread, and the job never reads it: no time is left
+	assert!(last.bytes_read < setup.archive.size(), "{last:?}");
+	assert_eq!(
+		(last.phase, last.eta),
+		(ExtractPhase::Failed, Some(Duration::ZERO))
+	);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
