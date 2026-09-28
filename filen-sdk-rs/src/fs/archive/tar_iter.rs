@@ -493,6 +493,7 @@ fn parse_pax_time(value: &[u8]) -> Option<MemberTime> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::fs::archive::test_support::damaged_copies;
 
 	/// A tar header block of `kind` for `name` with `size`, checksummed.
 	fn header(name: &[u8], kind: u8, size: u64) -> [u8; 512] {
@@ -953,23 +954,18 @@ mod tests {
 			paths
 		};
 		assert_eq!(walk(&archive), ["p/q.txt", "a/long/name", "s", "dir/"]);
-		for at in 0..archive.len() {
+		for (at, bit, mut damaged) in damaged_copies(&archive, 0..archive.len()) {
 			let block = at / 512 * 512;
-			let is_header = is_tar_header(&archive[block..block + 512]);
-			for bit in [0x01, 0x80] {
-				let mut damaged = archive.clone();
-				damaged[at] ^= bit;
-				// a header whose checksum no longer matches is refused before it is parsed, so
-				// the damaged header gets a matching checksum to reach its fields
-				if is_header && !(148..156).contains(&(at - block)) {
-					let header = &mut damaged[block..block + 512];
-					header[148..156].fill(b' ');
-					let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
-					header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-				}
-				std::panic::catch_unwind(|| walk(&damaged))
-					.unwrap_or_else(|_| panic!("a flip of {bit:#x} at {at} panicked"));
+			// a header whose checksum no longer matches is refused before it is parsed, so
+			// the damaged header gets a matching checksum to reach its fields
+			if is_tar_header(&archive[block..block + 512]) && !(148..156).contains(&(at - block)) {
+				let header = &mut damaged[block..block + 512];
+				header[148..156].fill(b' ');
+				let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+				header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
 			}
+			std::panic::catch_unwind(|| walk(&damaged))
+				.unwrap_or_else(|_| panic!("a flip of {bit:#x} at {at} panicked"));
 		}
 	}
 

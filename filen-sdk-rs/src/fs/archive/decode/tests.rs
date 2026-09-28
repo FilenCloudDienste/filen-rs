@@ -13,7 +13,10 @@ use lzma_rust2::{
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
 use super::*;
-use crate::fs::archive::{alloc_meter::peak_bytes, test_support::gzip};
+use crate::fs::archive::{
+	alloc_meter::peak_bytes,
+	test_support::{damaged_copies, gzip},
+};
 
 const MIB: u64 = 1024 * 1024;
 const BUDGET: u64 = 64 * MIB;
@@ -492,12 +495,10 @@ fn damage_never_panics(codec: StreamCodec, bytes: &[u8]) {
 			assert!(codec_error(&error).is_some(), "{codec:?}: {what}: {error}");
 		}
 	};
+	for (at, bit, damaged) in damaged_copies(bytes, 0..bytes.len()) {
+		check(&damaged, &format!("a flip of {bit:#x} at {at}"));
+	}
 	for at in 0..bytes.len() {
-		for bit in [0x01, 0x80] {
-			let mut damaged = bytes.to_vec();
-			damaged[at] ^= bit;
-			check(&damaged, &format!("a flip of {bit:#x} at {at}"));
-		}
 		check(&bytes[..at], &format!("a cut at {at}"));
 	}
 }

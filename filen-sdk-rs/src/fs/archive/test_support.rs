@@ -58,6 +58,21 @@ pub(crate) fn remote_file(
 	RemoteFileType::File(Cow::Owned(file))
 }
 
+/// Copies of `bytes` each damaged at one of `positions`: the byte there with its lowest bit
+/// flipped, then with its highest; with where, and which bit, for a failing test to say.
+pub(crate) fn damaged_copies(
+	bytes: &[u8],
+	positions: impl IntoIterator<Item = usize>,
+) -> impl Iterator<Item = (usize, u8, Vec<u8>)> {
+	positions.into_iter().flat_map(move |at| {
+		[0x01, 0x80].map(|bit| {
+			let mut damaged = bytes.to_vec();
+			damaged[at] ^= bit;
+			(at, bit, damaged)
+		})
+	})
+}
+
 /// A compression method built at a level, and the levels it takes.
 pub(crate) type LeveledMethod<M> = (fn(u32) -> M, RangeInclusive<u32>);
 

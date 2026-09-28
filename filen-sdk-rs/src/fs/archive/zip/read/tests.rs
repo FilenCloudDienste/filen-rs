@@ -11,7 +11,7 @@ use zip8::{AesMode, CompressionMethod, write::SimpleFileOptions};
 
 use super::*;
 use crate::fs::archive::{
-	test_support::pattern,
+	test_support::{damaged_copies, pattern},
 	zip::write::{Encryption, ZipMethod, ZipWriter},
 };
 
@@ -1387,16 +1387,17 @@ fn a_damaged_byte_never_panics() {
 	];
 	for (skipped, zip) in archives {
 		// every header, record, length and offset, and every entry's data, in turn
-		for at in 0..zip.len() {
-			for damage in [|b: u8| b ^ 0x01, |b: u8| b ^ 0x80, |_| 0xFF] {
-				let mut damaged = zip.clone();
-				damaged[at] = damage(damaged[at]);
-				let mut source = Sparse::past(skipped, damaged.into());
-				let len = source.len();
-				let _ =
-					std::panic::catch_unwind(move || read_source(&mut source, len, Some(b"pw")))
-						.unwrap_or_else(|_| panic!("damage at {at} of a {len}-byte zip panicked"));
-			}
+		// a byte set to 0xFF as well as flipped: a length or an offset at its largest
+		let set = (0..zip.len()).map(|at| {
+			let mut damaged = zip.clone();
+			damaged[at] = 0xFF;
+			(at, 0xFF, damaged)
+		});
+		for (at, _, damaged) in damaged_copies(&zip, 0..zip.len()).chain(set) {
+			let mut source = Sparse::past(skipped, damaged.into());
+			let len = source.len();
+			let _ = std::panic::catch_unwind(move || read_source(&mut source, len, Some(b"pw")))
+				.unwrap_or_else(|_| panic!("damage at {at} of a {len}-byte zip panicked"));
 		}
 	}
 }
