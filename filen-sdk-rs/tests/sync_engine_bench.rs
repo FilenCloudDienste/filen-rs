@@ -30,7 +30,7 @@
 //! ```
 //!
 //! `SYNC_BENCH_SCENARIO` takes one name, a comma-separated list, `default` (every scenario but the
-//! three 1M rows) or `all`; it defaults to `default`. `SYNC_BENCH_SAMPLES` defaults to 3, and
+//! 1M rows) or `all`; it defaults to `default`. `SYNC_BENCH_SAMPLES` defaults to 3, and
 //! `SYNC_BENCH_OUT` to the temp directory. Each run writes ONE fresh JSON file and never appends to
 //! an existing one.
 //!

@@ -309,6 +309,17 @@ pub enum Change {
 	/// `note_owed_remote` does not, on its own, make the reconcile call the path both-sides-changed.
 	/// A conflict-heavy scenario is not covered by this matrix — see the scenario document.
 	BothSidesPerMille(u32),
+	/// The pass after an UPLOAD: this many files per thousand carry the row an unconfirmed push of
+	/// ours leaves — the content this side holds, the version it minted, and an agreed-content
+	/// marker still on the previous content — and the cache has announced each of them long enough
+	/// ago to confirm it. On top of that ONE other file is edited, so the pass has something to
+	/// plan and [`Count::PerChanged`] reads it.
+	///
+	/// What it prices is the confirmation, not the edit: advancing an agreed-content marker is the
+	/// one write a change-scoped pass makes to its own copy of the baseline, and that write is
+	/// what used to copy the whole resident tree. `one_pass` asserts the pass confirmed every one
+	/// of the pushes, so a pass that stopped confirming cannot report itself cheap.
+	AfterUpload(u32),
 }
 
 impl Change {
@@ -324,6 +335,7 @@ impl Change {
 			Self::MoveDir => "move_dir".to_owned(),
 			Self::FirstSync => "first_sync".to_owned(),
 			Self::BothSidesPerMille(per_mille) => format!("both_sides_per_mille_{per_mille}"),
+			Self::AfterUpload(per_mille) => format!("after_upload_per_mille_{per_mille}"),
 		}
 	}
 
@@ -333,13 +345,21 @@ impl Change {
 			Self::Idle | Self::FirstSync => 0,
 			// One directory, not one file — but one thing either way, which is what the
 			// expectations are written against.
-			Self::OneFile | Self::MoveDir => 1,
+			Self::OneFile | Self::MoveDir | Self::AfterUpload(_) => 1,
 			Self::Files(files) => files as usize,
 			Self::PerMille(per_mille)
 			| Self::ScatteredPerMille(per_mille)
 			| Self::DeletePerMille(per_mille)
 			| Self::RenamePerMille(per_mille)
 			| Self::BothSidesPerMille(per_mille) => (files * per_mille as usize / 1000).max(1),
+		}
+	}
+
+	/// How many of `files` carry an unconfirmed push of ours (see [`AfterUpload`](Self::AfterUpload)).
+	fn pushes(self, files: usize) -> usize {
+		match self {
+			Self::AfterUpload(per_mille) => (files * per_mille as usize / 1000).max(1),
+			_ => 0,
 		}
 	}
 
@@ -1099,6 +1119,15 @@ pub const SCENARIOS: &[Scenario] = &[
 		},
 	),
 	balanced(
+		"twoway_after_upload_100k",
+		100_000,
+		Change::AfterUpload(10),
+		SyncMode::TwoWay,
+		4,
+		ExpectRead::Scoped,
+		PER_CHANGED,
+	),
+	balanced(
 		"twoway_first_sync_100k",
 		100_000,
 		Change::FirstSync,
@@ -1134,6 +1163,31 @@ pub const SCENARIOS: &[Scenario] = &[
 		"twoway_one_percent_1m",
 		1_000_000,
 		Change::PerMille(10),
+		SyncMode::TwoWay,
+		1,
+		ExpectRead::Scoped,
+		PER_CHANGED,
+	),
+	// The two passes that write to their own copy of the baseline — a folded directory move and a
+	// confirmed push — at the size where a copy of the tree is the pass's widest point.
+	balanced(
+		"twoway_dir_move_1m",
+		1_000_000,
+		Change::MoveDir,
+		SyncMode::TwoWay,
+		1,
+		ExpectRead::Scoped,
+		Expect {
+			actions: Count::PerChanged,
+			held: Count::Exactly(0),
+			conflicts: Count::Exactly(0),
+			dir_moves: Count::PerChanged,
+		},
+	),
+	balanced(
+		"twoway_after_upload_1m",
+		1_000_000,
+		Change::AfterUpload(10),
 		SyncMode::TwoWay,
 		1,
 		ExpectRead::Scoped,
@@ -1411,6 +1465,9 @@ struct Applied {
 	/// How many files (or directories) the class touched — what the scenario's [`Expect`] is read
 	/// against.
 	changed: usize,
+	/// How many unconfirmed pushes of ours the fixture's baseline holds, every one of which the
+	/// pass must confirm (see [`Change::AfterUpload`]).
+	pushes: usize,
 }
 
 impl Applied {
@@ -1422,6 +1479,7 @@ impl Applied {
 			renamed: Vec::new(),
 			remote: Vec::new(),
 			changed: 0,
+			pushes: 0,
 		}
 	}
 }
@@ -1538,6 +1596,7 @@ async fn prepare_bed(scenario: &Scenario) -> Bed {
 	// were reproducible between two runs of one binary. `apply_change` asserts this held.
 	rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 	let fixture_hash = fixture_signature(&fixture, &rows);
+	let pushes = leave_unconfirmed_pushes(&mut rows, scenario);
 
 	let seeded = if scenario.change.seeds_baseline() {
 		engine
@@ -1563,7 +1622,17 @@ async fn prepare_bed(scenario: &Scenario) -> Bed {
 	// The change is applied here, with the baseline rows still in scope to build it from — and the
 	// rows are dropped with them. A million-row fixture would otherwise leave a million paths
 	// resident in the HARNESS for the rest of the run, against which no engine figure could be read.
-	let applied = apply_change(&fixture, &rows, scenario);
+	let mut applied = apply_change(&fixture, &rows, scenario);
+	applied.pushes = pushes;
+	let stood = engine
+		.bench_seed_stood_pushes(pair)
+		.await
+		.expect("reading the pushes the seeded baseline holds");
+	assert_eq!(
+		stood, pushes,
+		"{}: the seeded baseline holds {stood} unconfirmed push(es) where the fixture left {pushes}",
+		scenario.name
+	);
 	let nodes = fixture.nodes();
 	// The tree ON DISK, against the scenario's own declaration. Here rather than beside `validate`
 	// in `run_scenario`, because the file a change class did NOT touch is found through the
@@ -1726,6 +1795,38 @@ fn remote_edits(
 }
 
 /// What `scenario`'s change class does to the fixture ON DISK, applied once before any sample runs.
+/// Rewrite the LAST files of `rows` the way an unconfirmed push of ours leaves them, and answer how
+/// many that was (see [`Change::AfterUpload`]).
+///
+/// The row keeps the content this side holds and the version it minted — the fixture's cache lists
+/// that very uuid at the path — and only its agreed-content marker stays on a previous content. The
+/// last files rather than the first, so they are never the file the class edits (which
+/// [`pick_indices`] takes from the front).
+fn leave_unconfirmed_pushes(rows: &mut [BaselineEntry], scenario: &Scenario) -> usize {
+	let files = rows.iter().filter(|row| row.kind == NodeKind::File).count();
+	let wanted = scenario.change.pushes(files);
+	assert!(
+		wanted < files,
+		"{}: {wanted} push(es) would take every one of {files} file(s), leaving none to edit",
+		scenario.name
+	);
+	let previous = Blake3Hash::from([0x5a; 32]);
+	for row in rows
+		.iter_mut()
+		.rev()
+		.filter(|row| row.kind == NodeKind::File)
+		.take(wanted)
+	{
+		assert_ne!(
+			row.content_hash,
+			Some(previous),
+			"a fixture file hashes to the marker's stand-in"
+		);
+		row.agreed_hash = Some(previous);
+	}
+	wanted
+}
+
 fn apply_change(fixture: &Fixture, rows: &[BaselineEntry], scenario: &Scenario) -> Applied {
 	let root = fixture.root();
 	assert!(
@@ -1756,7 +1857,11 @@ fn apply_change(fixture: &Fixture, rows: &[BaselineEntry], scenario: &Scenario) 
 	};
 	match scenario.change {
 		Change::Idle | Change::FirstSync => Applied::nothing(),
-		Change::OneFile | Change::PerMille(_) | Change::ScatteredPerMille(_) | Change::Files(_) => {
+		Change::OneFile
+		| Change::PerMille(_)
+		| Change::ScatteredPerMille(_)
+		| Change::Files(_)
+		| Change::AfterUpload(_) => {
 			let picked = pick(matches!(scenario.change, Change::ScatteredPerMille(_)));
 			let touched = edit_files(root, &picked, scenario.file_bytes);
 			Applied {
@@ -1883,6 +1988,7 @@ struct Plan {
 	held: usize,
 	conflicts: usize,
 	dir_moves: usize,
+	confirmed: usize,
 }
 
 /// One measured pass: announce, run the REAL `prepare` under a step log, and split what it cost.
@@ -1986,6 +2092,13 @@ async fn one_pass(bed: &Bed, scenario: &Scenario) -> (Timing, Plan, Option<PassS
 		pass.dir_moves,
 		bed,
 	);
+	// Every push the fixture left, and none it did not: a pass after an upload that confirmed
+	// nothing never wrote to its baseline, and that write is what the scenario prices.
+	assert_eq!(
+		pass.confirmed, bed.applied.pushes,
+		"{}: the pass confirmed {} push(es) where the fixture left {} awaiting confirmation",
+		scenario.name, pass.confirmed, bed.applied.pushes,
+	);
 	(
 		Timing::split(start, total, &marks),
 		Plan {
@@ -1993,6 +2106,7 @@ async fn one_pass(bed: &Bed, scenario: &Scenario) -> (Timing, Plan, Option<PassS
 			held: pass.held,
 			conflicts: pass.conflicts,
 			dir_moves: pass.dir_moves,
+			confirmed: pass.confirmed,
 		},
 		pass.structures,
 	)
@@ -2017,6 +2131,7 @@ struct Handover {
 	renamed: Vec<(String, String)>,
 	remote: Vec<RemoteLine>,
 	changed: usize,
+	pushes: usize,
 	/// Where the child writes its answer.
 	answer: PathBuf,
 }
@@ -2213,6 +2328,7 @@ fn measure_memory(bed: &Bed, scenario: &Scenario, samples: usize) -> Vec<MemAnsw
 				renamed: bed.applied.renamed.clone(),
 				remote: bed.applied.remote.clone(),
 				changed: bed.applied.changed,
+				pushes: bed.applied.pushes,
 				answer: answer.clone(),
 			};
 			fs::write(
@@ -2336,6 +2452,15 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	let changes = engine.pair_changes(handover.pair).await;
 	changes.cover_local();
 	changes.note_tree_size(handover.rows);
+	let stood = engine
+		.bench_seed_stood_pushes(handover.pair)
+		.await
+		.expect("reading the pushes the parent's baseline holds");
+	assert_eq!(
+		stood, handover.pushes,
+		"the child found {stood} unconfirmed push(es) where its parent left {}",
+		handover.pushes
+	);
 	// No assertion that the pair is UNdegraded here, deliberately: `bench_reset_changes` dropped the
 	// changelist entry two lines above and `pair_changes` built a fresh one, so the flag is `None` by
 	// construction and an assertion on it could not fail. What holds this honest is `one_pass`, which
@@ -2356,6 +2481,7 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 			renamed: handover.renamed.clone(),
 			remote: handover.remote.clone(),
 			changed: handover.changed,
+			pushes: handover.pushes,
 		},
 		fixture_hash: handover.fixture_hash,
 	};
@@ -2416,7 +2542,11 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	// since every re-keyed name grows by the move's prefix. Asserting through that case would be
 	// asserting something untrue; asserting nowhere would drop the guard for the twenty-nine
 	// scenarios of the default set where it does hold.
-	if plan.dir_moves == 0 {
+	//
+	// And except when the pass CONFIRMS a push: advancing an agreed-content marker writes to the
+	// pass's copy as well, so that copy is a different object too — and a clone sizes its buffers
+	// to what they hold rather than to the capacity the store's grew to.
+	if plan.dir_moves == 0 && plan.confirmed == 0 {
 		assert_eq!(
 			structures.0, pair_baseline_computed_bytes as u64,
 			"the pass's baseline computes itself as {} byte(s) where the loaded pair's computes \
@@ -2790,7 +2920,7 @@ fn select(wanted: &str) -> Result<Vec<&'static Scenario>, String> {
 /// Run the scenarios `SYNC_BENCH_SCENARIO` names and write ONE fresh result file.
 ///
 /// `SYNC_BENCH_SCENARIO` takes one name, a comma-separated list, `default` (every scenario but the
-/// three 1M rows) or `all`, and defaults to `default`; `SYNC_BENCH_SAMPLES` overrides the sample
+/// 1M rows) or `all`, and defaults to `default`; `SYNC_BENCH_SAMPLES` overrides the sample
 /// count; `SYNC_BENCH_OUT` is the DIRECTORY the file lands in.
 ///
 /// # Errors
