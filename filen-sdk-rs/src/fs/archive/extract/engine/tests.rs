@@ -1943,16 +1943,12 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 			}),
 		)
 	};
-	let shared = loop {
-		if let Some(shared) = codec.lock().unwrap().take() {
-			break shared;
-		}
-		sleep(Duration::from_millis(5)).await;
-	};
-	// the codec shows it is alive while it derives, which exchanges nothing with the driver
-	while shared.progress() < 10 {
-		sleep(Duration::from_millis(5)).await;
-	}
+	wait_until("the codec starts", || codec.lock().unwrap().is_some()).await;
+	let shared = codec.lock().unwrap().take().unwrap();
+	// the codec shows it is alive while it derives, which exchanges nothing with the driver:
+	// past the two exchanges each of the archive's chunks takes
+	let fetching = 2 * setup.archive.size().div_ceil(CHUNK_SIZE as u64);
+	wait_until("the codec derives the key", || shared.progress() > fetching).await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
@@ -1960,14 +1956,7 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 	// what it shared (a derivation run to its end would too, eventually), having shown progress
 	// at most once more, for the 2^16 rounds under way when the job ended
 	let at_end = shared.progress();
-	let ended = tokio::time::Instant::now();
-	while Arc::strong_count(&shared) > 1 {
-		assert!(
-			ended.elapsed() < Duration::from_secs(120),
-			"the codec never stopped"
-		);
-		sleep(Duration::from_millis(5)).await;
-	}
+	wait_until("the codec stops", || Arc::strong_count(&shared) == 1).await;
 	assert!(
 		shared.progress() - at_end <= 1,
 		"the codec derived on for {} more checks",
