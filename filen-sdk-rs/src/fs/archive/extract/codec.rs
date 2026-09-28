@@ -48,7 +48,7 @@ use super::{
 	storage_exceeded,
 };
 use entries::{Found, MacShape, Verdict, Walk, apple_double};
-pub(crate) use entries::{Selection, Task, joined, link_key};
+pub(crate) use entries::{Selection, Task, link_key};
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -204,7 +204,7 @@ fn extract_single(
 			"the archive's name cannot be made into a file name",
 		)
 	})?;
-	let stored = joined(&path);
+	let stored = path.joined();
 	let mut found = Found {
 		ordinal: 0,
 		stored: &stored,

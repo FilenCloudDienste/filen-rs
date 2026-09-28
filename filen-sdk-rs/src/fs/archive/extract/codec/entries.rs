@@ -283,7 +283,7 @@ impl<'p> Walk<'p> {
 			},
 			stored_path: stored_path.to_owned(),
 			stored_path_truncated,
-			path: path.map(joined),
+			path: path.map(ArchivePath::joined),
 			size: (found.kind != ArchiveEntryKind::Dir).then_some(found.size),
 			modified: found.modified,
 			encrypted: found.encrypted,
@@ -370,17 +370,8 @@ pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
 /// the archive stores the file's (case and all), in 16 bytes, so a million files cost 16 MB of
 /// keys rather than their paths.
 pub(crate) fn link_key(path: &ArchivePath) -> u128 {
-	let digest = blake3::hash(joined(path).as_bytes());
+	let digest = blake3::hash(path.joined().as_bytes());
 	u128::from_le_bytes(digest.as_bytes()[..16].try_into().expect("16 bytes"))
-}
-
-/// A path's segments joined with `/`.
-pub(crate) fn joined(path: &ArchivePath) -> String {
-	path.segments
-		.iter()
-		.map(AsRef::as_ref)
-		.collect::<Vec<&str>>()
-		.join("/")
 }
 
 pub(super) fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {

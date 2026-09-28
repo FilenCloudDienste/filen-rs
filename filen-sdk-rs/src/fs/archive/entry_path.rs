@@ -24,6 +24,22 @@ pub(crate) struct ArchivePath {
 	pub(crate) suspicious: bool,
 }
 
+impl ArchivePath {
+	/// Its segments joined with `/`.
+	pub(crate) fn joined(&self) -> String {
+		joined(&self.segments)
+	}
+}
+
+/// `segments`, a path's drive names, joined with `/`.
+pub(crate) fn joined(segments: &[ValidatedName]) -> String {
+	segments
+		.iter()
+		.map(AsRef::as_ref)
+		.collect::<Vec<&str>>()
+		.join("/")
+}
+
 /// Why an entry's path cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathRejection {
