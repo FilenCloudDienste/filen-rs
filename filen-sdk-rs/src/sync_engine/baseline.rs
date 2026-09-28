@@ -807,8 +807,9 @@ impl Readers {
 	/// A connection whose read transaction has ended, back for the next pass — kept only when no
 	/// other is idle. Each keeps its own page cache (up to [`READER_CACHE_KIB`]) for as long as it
 	/// is kept, and a pair runs one pass at a time: a second snapshot open at once (a dry run
-	/// beside a pass, a confirmation sweep beside a suspended one) is a moment, not a steady state,
-	/// and the connection it opened is closed rather than kept for the life of the store.
+	/// beside a pass that is still planning — a pass hands its own back once its plan is made) is
+	/// a moment, not a steady state, and the connection it opened is closed rather than kept for
+	/// the life of the store.
 	pub(super) fn give(&self, conn: Connection) {
 		let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
 		if idle.is_empty() {
