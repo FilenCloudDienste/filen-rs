@@ -1494,11 +1494,16 @@ async fn a_cancel_while_compressing_keeps_every_source() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
-	let setup = setup(|_, _| {});
+	// the destination's targets, fetched while the archive is named, never come
+	let setup = setup(|backend, _| backend.targets_delay = Duration::from_secs(3600));
 	let placed = place(&setup);
 	let (_pause, cancel, control) = controls();
-	cancel.send_replace(true);
 	let job = run_permanent_disposal(&setup, targets(&setup, &placed), control);
+	wait_until("the archive is being named", || {
+		setup.backend.log().target_fetches == 1
+	})
+	.await;
+	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
 	let last = job.recorder.last();
