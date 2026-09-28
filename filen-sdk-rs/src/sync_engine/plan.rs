@@ -1383,25 +1383,19 @@ pub(super) fn confirm_agreed_content(
 	baseline: &mut Baseline,
 	raw_remote: &impl NodesAt<Node = RemoteNode>,
 ) -> Vec<BaselineEntry> {
-	// The candidates first, since advancing one writes to the very structure they are read from.
 	// Only the rows that await confirmation are candidates, and the baseline indexes those, so a
 	// converged pair reads no row at all.
-	let confirmed: Vec<BaselineEntry> = baseline
-		.unconfirmed()
-		.filter(|entry| {
-			raw_remote.at(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid
-		})
-		.collect();
-	confirmed
-		.into_iter()
-		.filter_map(|entry| {
+	baseline.confirm_where(|entry| {
+		let confirmed =
+			raw_remote.at(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid;
+		if confirmed {
 			tracing::debug!(
 				"plan: the remote confirms {:?} — both sides hold what the baseline records",
 				entry.rel_path
 			);
-			baseline.set_agreed(&entry.rel_path, entry.content_hash)
-		})
-		.collect()
+		}
+		confirmed
+	})
 }
 
 /// Advance the agreed-content marker of every unconfirmed row whose version uuid is in `confirmed`
@@ -1416,24 +1410,18 @@ pub(super) fn confirm_agreed_pushes(
 	baseline: &mut Baseline,
 	confirmed: &HashSet<Uuid>,
 ) -> Vec<BaselineEntry> {
-	let advancing: Vec<BaselineEntry> = baseline
-		.unconfirmed()
-		.filter(|entry| {
-			entry
-				.remote_uuid
-				.is_some_and(|uuid| confirmed.contains(&uuid))
-		})
-		.collect();
-	advancing
-		.into_iter()
-		.filter_map(|entry| {
+	baseline.confirm_where(|entry| {
+		let stood = entry
+			.remote_uuid
+			.is_some_and(|uuid| confirmed.contains(&uuid));
+		if stood {
 			tracing::debug!(
 				"plan: {:?} — this engine's push stood as the remote head long enough to count as agreed",
 				entry.rel_path
 			);
-			baseline.set_agreed(&entry.rel_path, entry.content_hash)
-		})
-		.collect()
+		}
+		stood
+	})
 }
 
 /// What the server's version chain says about a push of ours: how long it stood before anything
