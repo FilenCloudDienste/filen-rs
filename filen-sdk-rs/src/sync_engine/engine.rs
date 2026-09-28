@@ -1314,7 +1314,7 @@ pub(super) struct BenchPass {
 	pub(super) dir_moves: usize,
 	/// Pushes of ours this pass confirmed — the rows whose agreed-content marker it advanced. A
 	/// pass after an upload that confirmed none measured a pass that never wrote to its baseline,
-	/// which is the one write that makes it copy the tree.
+	/// which is the one edit such a pass makes to its view of the rows.
 	pub(super) confirmed: usize,
 	pub(super) rows: usize,
 	/// What the pass's own structures computed their size as at its widest point.
@@ -3117,7 +3117,7 @@ impl SyncEngine {
 			.await?
 			.map_err(|e| db_error(e, "loading the baseline"))?;
 		// A pair with nothing awaiting confirmation is the steady state, and the sweep runs in the
-		// stretches where no pass does: it must not copy the resident map to find that out. The
+		// stretches where no pass does: it must not read a row to find that out. The
 		// gate `prepare` uses, and the filter all three confirmation steps already apply.
 		if !baseline.any_unconfirmed() {
 			return Ok(());
@@ -3773,8 +3773,8 @@ impl SyncEngine {
 		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
 		// demonstrably hold, which is what a later foreign edit is measured against.
 		// Asked before the map is touched: the confirmation advances the rows an unconfirmed push
-		// left behind, and a pair with none — the steady state — must not copy the whole resident
-		// baseline to find that out.
+		// left behind, and a pair with none — the steady state — must not read a row to find that
+		// out.
 		let mut confirmed = Vec::new();
 		if baseline.any_unconfirmed() {
 			// A WHOLE view, whose backing derives nothing — so reading it against an empty tree is

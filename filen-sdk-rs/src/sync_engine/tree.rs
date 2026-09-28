@@ -68,6 +68,12 @@ use super::{
 	ignore::FILENIGNORE,
 };
 
+// A pass's own edits, kept beside the tree rather than written into a copy of it. A child module so
+// it reads the tree's nodes directly, as the tree's own queries do.
+mod edits;
+
+pub(super) use self::edits::{Edits, View};
+
 /// A node's index in [`Tree::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct NodeId(u32);
@@ -411,6 +417,7 @@ impl Tree {
 		self.rows
 	}
 
+	#[cfg(test)]
 	pub(super) fn is_empty(&self) -> bool {
 		self.rows == 0
 	}
@@ -1025,6 +1032,10 @@ impl Tree {
 
 	/// Advance the agreed-content marker of the row at `rel_path`, and hand back the row as it now
 	/// stands. `None` when nothing is there.
+	///
+	/// No pass writes this into the tree any more — a pass's confirmation is an
+	/// [`Edits`] entry beside it — so what is left is the tests' oracle for that edit.
+	#[cfg(test)]
 	pub(super) fn set_agreed(
 		&mut self,
 		rel_path: &str,
