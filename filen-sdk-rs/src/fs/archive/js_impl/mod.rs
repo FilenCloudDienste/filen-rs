@@ -46,7 +46,6 @@ use super::{
 		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
 		OmittedRecords, PasswordCheck,
 	},
-	format::{ExtensionFormat, extension_format},
 	password::ArchivePassword,
 };
 
@@ -946,13 +945,7 @@ pub fn archive_max_level(format: CompressFormat, budget: u64) -> Option<u32> {
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveFormatOfName")
 )]
 pub fn archive_format_of_name(name: String) -> Option<ArchiveFormat> {
-	Some(match extension_format(&name)? {
-		ExtensionFormat::Zip => ArchiveFormat::Zip,
-		ExtensionFormat::SevenZ => ArchiveFormat::SevenZ,
-		ExtensionFormat::Tar => ArchiveFormat::Tar { codec: None },
-		ExtensionFormat::CompressedTar(codec) => ArchiveFormat::Tar { codec: Some(codec) },
-		ExtensionFormat::Stream(codec) => ArchiveFormat::Single { codec },
-	})
+	ArchiveFormat::of_name(&name)
 }
 
 /// The name of the folder an archive extracts to by default: its name without its archive

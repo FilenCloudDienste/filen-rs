@@ -61,6 +61,16 @@ pub enum ArchiveFormat {
 	Single { codec: StreamCodec },
 }
 
+impl ArchiveFormat {
+	/// What a file named `name` holds as far as its extension tells (`.tar.gz` and `.tgz` a
+	/// gzip tar, `.gz` one gzip-compressed file), matched case-insensitively; `None` for a name
+	/// with no archive extension. The file's own bytes decide once it is read: a `.zip` that is
+	/// really a tar is read as a tar, and a tar named without an extension is read too.
+	pub fn of_name(name: &str) -> Option<Self> {
+		match_extension(name).map(|(_, format)| format)
+	}
+}
+
 /// What a file turned out to hold, as far as its first bytes tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Detected {
@@ -110,11 +120,13 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 		// lz4 and zstd share their skippable frames: past the head, only the name tells them
 		// apart
 		None => {
-			return match extension_format(name)? {
-				ExtensionFormat::Stream(codec @ (StreamCodec::Lz4 | StreamCodec::Zstd))
-				| ExtensionFormat::CompressedTar(codec @ (StreamCodec::Lz4 | StreamCodec::Zstd)) => {
-					Some(Detected::Stream(codec))
+			return match ArchiveFormat::of_name(name)? {
+				ArchiveFormat::Single {
+					codec: codec @ (StreamCodec::Lz4 | StreamCodec::Zstd),
 				}
+				| ArchiveFormat::Tar {
+					codec: Some(codec @ (StreamCodec::Lz4 | StreamCodec::Zstd)),
+				} => Some(Detected::Stream(codec)),
 				_ => None,
 			};
 		}
@@ -126,19 +138,19 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	// no magic: the name is all there is to go by
 	let (extension, format) = match_extension(name)?;
 	match format {
-		ExtensionFormat::Zip => Some(Detected::Zip),
-		ExtensionFormat::Tar if is_end_marker(head) => Some(Detected::Tar),
+		ArchiveFormat::Zip => Some(Detected::Zip),
+		ArchiveFormat::Tar { codec: None } if is_end_marker(head) => Some(Detected::Tar),
 		// a real tar.lzip starts with lzip's magic, so a `.tlz` without it is the older
 		// tar.lzma that went by the same name
-		ExtensionFormat::CompressedTar(StreamCodec::Lzip) if extension == ".tlz" => {
-			Some(Detected::Stream(StreamCodec::Lzma))
+		ArchiveFormat::Tar {
+			codec: Some(StreamCodec::Lzip),
+		} if extension == ".tlz" => Some(Detected::Stream(StreamCodec::Lzma)),
+		ArchiveFormat::Single {
+			codec: codec @ (StreamCodec::Brotli | StreamCodec::Lzma),
 		}
-		ExtensionFormat::Stream(codec @ (StreamCodec::Brotli | StreamCodec::Lzma)) => {
-			Some(Detected::Stream(codec))
-		}
-		ExtensionFormat::CompressedTar(codec @ (StreamCodec::Brotli | StreamCodec::Lzma)) => {
-			Some(Detected::Stream(codec))
-		}
+		| ArchiveFormat::Tar {
+			codec: Some(codec @ (StreamCodec::Brotli | StreamCodec::Lzma)),
+		} => Some(Detected::Stream(codec)),
 		_ => None,
 	}
 }
@@ -207,69 +219,52 @@ fn parse_octal(field: &[u8]) -> Option<u64> {
 	any.then_some(value)
 }
 
-/// What a file name's extension says it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExtensionFormat {
-	Zip,
-	SevenZ,
-	Tar,
-	CompressedTar(StreamCodec),
-	Stream(StreamCodec),
+/// A tar compressed with `codec`, as an extension names it.
+const fn tar(codec: StreamCodec) -> ArchiveFormat {
+	ArchiveFormat::Tar { codec: Some(codec) }
+}
+
+/// One file compressed with `codec`, as an extension names it.
+const fn single(codec: StreamCodec) -> ArchiveFormat {
+	ArchiveFormat::Single { codec }
 }
 
 /// Recognised extensions, longest first so `.tar.gz` wins over `.gz`. Matched case-insensitively.
-const EXTENSIONS: &[(&str, ExtensionFormat)] = &[
-	(".tar.gz", ExtensionFormat::CompressedTar(StreamCodec::Gzip)),
-	(
-		".tar.bz2",
-		ExtensionFormat::CompressedTar(StreamCodec::Bzip2),
-	),
-	(".tar.xz", ExtensionFormat::CompressedTar(StreamCodec::Xz)),
-	(
-		".tar.lzma",
-		ExtensionFormat::CompressedTar(StreamCodec::Lzma),
-	),
-	(".tar.lz4", ExtensionFormat::CompressedTar(StreamCodec::Lz4)),
-	(".tar.lz", ExtensionFormat::CompressedTar(StreamCodec::Lzip)),
-	(
-		".tar.br",
-		ExtensionFormat::CompressedTar(StreamCodec::Brotli),
-	),
-	(
-		".tar.zst",
-		ExtensionFormat::CompressedTar(StreamCodec::Zstd),
-	),
-	(".tgz", ExtensionFormat::CompressedTar(StreamCodec::Gzip)),
-	(".tbz2", ExtensionFormat::CompressedTar(StreamCodec::Bzip2)),
-	(".tbz", ExtensionFormat::CompressedTar(StreamCodec::Bzip2)),
-	(".txz", ExtensionFormat::CompressedTar(StreamCodec::Xz)),
-	(".tlz", ExtensionFormat::CompressedTar(StreamCodec::Lzip)),
-	(".tzst", ExtensionFormat::CompressedTar(StreamCodec::Zstd)),
-	(".zip", ExtensionFormat::Zip),
-	(".7z", ExtensionFormat::SevenZ),
-	(".tar", ExtensionFormat::Tar),
-	(".gz", ExtensionFormat::Stream(StreamCodec::Gzip)),
-	(".bz2", ExtensionFormat::Stream(StreamCodec::Bzip2)),
-	(".xz", ExtensionFormat::Stream(StreamCodec::Xz)),
-	(".lzma", ExtensionFormat::Stream(StreamCodec::Lzma)),
-	(".lz4", ExtensionFormat::Stream(StreamCodec::Lz4)),
-	(".lz", ExtensionFormat::Stream(StreamCodec::Lzip)),
-	(".br", ExtensionFormat::Stream(StreamCodec::Brotli)),
-	(".zst", ExtensionFormat::Stream(StreamCodec::Zstd)),
+const EXTENSIONS: &[(&str, ArchiveFormat)] = &[
+	(".tar.gz", tar(StreamCodec::Gzip)),
+	(".tar.bz2", tar(StreamCodec::Bzip2)),
+	(".tar.xz", tar(StreamCodec::Xz)),
+	(".tar.lzma", tar(StreamCodec::Lzma)),
+	(".tar.lz4", tar(StreamCodec::Lz4)),
+	(".tar.lz", tar(StreamCodec::Lzip)),
+	(".tar.br", tar(StreamCodec::Brotli)),
+	(".tar.zst", tar(StreamCodec::Zstd)),
+	(".tgz", tar(StreamCodec::Gzip)),
+	(".tbz2", tar(StreamCodec::Bzip2)),
+	(".tbz", tar(StreamCodec::Bzip2)),
+	(".txz", tar(StreamCodec::Xz)),
+	(".tlz", tar(StreamCodec::Lzip)),
+	(".tzst", tar(StreamCodec::Zstd)),
+	(".zip", ArchiveFormat::Zip),
+	(".7z", ArchiveFormat::SevenZ),
+	(".tar", ArchiveFormat::Tar { codec: None }),
+	(".gz", single(StreamCodec::Gzip)),
+	(".bz2", single(StreamCodec::Bzip2)),
+	(".xz", single(StreamCodec::Xz)),
+	(".lzma", single(StreamCodec::Lzma)),
+	(".lz4", single(StreamCodec::Lz4)),
+	(".lz", single(StreamCodec::Lzip)),
+	(".br", single(StreamCodec::Brotli)),
+	(".zst", single(StreamCodec::Zstd)),
 ];
 
 /// The recognised extension `name` ends in, with what it says the file holds.
-pub(crate) fn match_extension(name: &str) -> Option<(&'static str, ExtensionFormat)> {
+pub(crate) fn match_extension(name: &str) -> Option<(&'static str, ArchiveFormat)> {
 	EXTENSIONS.iter().copied().find(|(extension, _)| {
 		name.len() > extension.len()
 			&& name.is_char_boundary(name.len() - extension.len())
 			&& name[name.len() - extension.len()..].eq_ignore_ascii_case(extension)
 	})
-}
-
-/// What `name`'s extension says the file holds, if it is one this module knows.
-pub(crate) fn extension_format(name: &str) -> Option<ExtensionFormat> {
-	match_extension(name).map(|(_, format)| format)
 }
 
 /// An archive's name without its archive and codec extensions (`photos.tar.gz` → `photos`), or

@@ -16,8 +16,8 @@ use super::{
 		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{ArchivePath, entry_path},
 		format::{
-			ArchiveFormat, DETECT_HEAD_LEN, Detected, ExtensionFormat, archive_stem, detect,
-			extension_format, is_end_marker, is_tar_header,
+			ArchiveFormat, DETECT_HEAD_LEN, Detected, archive_stem, detect, is_end_marker,
+			is_tar_header,
 		},
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		limits::display_path,
@@ -152,8 +152,8 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let tar = is_tar_header(block)
 				|| is_end_marker(block)
 					&& matches!(
-						extension_format(&job.name),
-						Some(ExtensionFormat::CompressedTar(_))
+						ArchiveFormat::of_name(&job.name),
+						Some(ArchiveFormat::Tar { codec: Some(_) })
 					);
 			if tar {
 				port.send(WorkerEvent::Opened(ArchiveFormat::Tar {

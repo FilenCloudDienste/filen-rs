@@ -41,7 +41,7 @@ pub use crate::fs::drive_job::{
 	plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
 };
 
-use super::format::{ExtensionFormat, match_extension};
+use super::format::{ArchiveFormat, match_extension};
 
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]
@@ -288,13 +288,14 @@ impl CompressFormat {
 	/// (`.tgz` is a `.tar.gz`): readers tell brotli and LZMA streams by their extension alone.
 	pub(crate) fn check_name(self, name: &str) -> Result<usize, Error> {
 		let expected = match self {
-			Self::Tar { compression: None } => ExtensionFormat::Tar,
-			Self::Tar {
-				compression: Some(compression),
-			} => ExtensionFormat::CompressedTar(compression.codec),
-			Self::Single { compression } => ExtensionFormat::Stream(compression.codec),
-			Self::Zip { .. } => ExtensionFormat::Zip,
-			Self::SevenZ { .. } => ExtensionFormat::SevenZ,
+			Self::Tar { compression } => ArchiveFormat::Tar {
+				codec: compression.map(|compression| compression.codec),
+			},
+			Self::Single { compression } => ArchiveFormat::Single {
+				codec: compression.codec,
+			},
+			Self::Zip { .. } => ArchiveFormat::Zip,
+			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
 		};
 		match match_extension(name) {
 			Some((extension, format)) if format == expected => Ok(extension.len()),
