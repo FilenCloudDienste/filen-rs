@@ -286,13 +286,14 @@ impl JsClient {
 	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
 	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
 	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. A failure's `retry`
-	/// gives the `base` and destination that put it where it was meant to land. An entry of
-	/// another archive fails the extract before anything runs. A zip's or 7z's entries are
-	/// checked against its index before anything is created; a tar's are only known as it is
-	/// read, so one not below `base` fails the extract when it is reached, and one the tar does
-	/// not hold once it is read to its end, what was extracted until then staying. A chosen
-	/// directory of a tar brings what the tar stores after it below it (every tool stores a
-	/// directory before its contents); a zip's or 7z's everything below it. The archive is
+	/// gives the `base` and destination that put it where it was meant to land. A call choosing
+	/// no entry, an entry of another archive, or a `base` that is not drive names is refused
+	/// before anything runs. A zip's or 7z's entries are checked against its index before
+	/// anything is created; a tar's are only known as it is read, so one not below `base` fails
+	/// the extract when it is reached, and one the tar does not hold once it is read to its end,
+	/// what was extracted until then staying. A chosen directory of a tar brings what the tar
+	/// stores after it below it (every tool stores a directory before its contents); a zip's or
+	/// 7z's everything below it. The archive is
 	/// never removed afterwards.
 	#[wasm_bindgen(js_name = "extractArchiveEntries")]
 	pub async fn extract_archive_entries(
@@ -304,7 +305,7 @@ impl JsClient {
 		let request = entries_request(
 			params.archive,
 			params.entries,
-			params.base,
+			&params.base,
 			params.destination,
 			params.root,
 		)?;

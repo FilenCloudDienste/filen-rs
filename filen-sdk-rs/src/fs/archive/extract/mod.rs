@@ -27,6 +27,8 @@ pub use crate::fs::{
 	},
 	drive_job::counts::ItemCounts,
 };
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+pub(crate) use client_impl::check_entries;
 pub use list::{
 	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListFailed, ListPhase,
 	ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
@@ -83,9 +85,9 @@ pub enum ExtractRequest {
 	/// them.
 	///
 	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
-	/// names separated by `/`: with `base` `photos`, the entry `photos/2024/a.jpg` lands at
-	/// `2024/a.jpg` in the root. An empty `base` keeps the archive's paths. An id of another
-	/// archive fails the job before anything runs. A zip's or 7z's ids are checked against its
+	/// names: with `base` `[photos]`, the entry `photos/2024/a.jpg` lands at `2024/a.jpg` in the
+	/// root. An empty `base` keeps the archive's paths. No id, or an id of another archive,
+	/// fails the job before anything runs. A zip's or 7z's ids are checked against its
 	/// index before anything is created: an id it does not hold, of an entry not below `base`, or
 	/// of a file at `base` itself fails the job. A tar's members are only known as it is read: a
 	/// member chosen that is not below `base` fails the job when it is reached, and an id the tar
@@ -99,7 +101,7 @@ pub enum ExtractRequest {
 	Entries {
 		archive: RemoteFileType<'static>,
 		ids: Vec<ArchiveEntryId>,
-		base: String,
+		base: Vec<ValidatedName>,
 		destination: DirType<'static, Normal>,
 		root: ExtractRoot,
 	},

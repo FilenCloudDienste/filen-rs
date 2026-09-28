@@ -1039,7 +1039,7 @@ async fn part_of_an_archive_extracts_below_its_base() {
 	let entries = |ids, base: &str, destination: &RemoteDirectory| ExtractRequest::Entries {
 		archive: archive.clone(),
 		ids,
-		base: base.to_owned(),
+		base: vec![ValidatedName::try_from(base).unwrap()],
 		destination: destination.clone().into(),
 		root: ExtractRoot::Destination,
 	};

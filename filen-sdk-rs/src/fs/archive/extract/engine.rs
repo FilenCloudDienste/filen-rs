@@ -56,6 +56,7 @@ use crate::{
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
+		dir::RemoteDirectory,
 		drive_job::{
 			Fatal,
 			backend::{DriveBackend, UploadSpec},
@@ -139,7 +140,8 @@ pub(crate) struct ExtractTask<B> {
 enum DirState {
 	Planned,
 	Creating,
-	Created(Uuid),
+	/// Kept whole, as a failure's retry targets it.
+	Created(DirType<'static, Normal>),
 	Failed(Arc<Error>),
 }
 
@@ -160,8 +162,8 @@ struct DirSlot {
 
 impl DirSlot {
 	fn created_uuid(&self) -> Option<Uuid> {
-		match self.state {
-			DirState::Created(uuid) => Some(uuid),
+		match &self.state {
+			DirState::Created(dir) => Some(dir.uuid()),
 			_ => None,
 		}
 	}
@@ -510,7 +512,7 @@ fn report_file_failure<U>(
 	file: &FileSlot<U>,
 	stage: ExtractStage,
 	error: Arc<Error>,
-	retry: ExtractRetry,
+	retry: Option<ExtractRetry>,
 ) {
 	let failure = ExtractFailure {
 		entry: file.entry,
@@ -981,11 +983,11 @@ impl<B: DisposalBackend> Driver<B> {
 			) => Some(name.clone()),
 			(_, ArchiveFormat::Single { .. }) | (ExtractRoot::Destination, _) => None,
 		};
-		let root_uuid = match new_folder {
+		let root = match new_folder {
 			None => {
 				self.into_destination = true;
 				self.resolver = Some(PathResolver::new(listed.names.iter().map(String::as_str)));
-				destination
+				self.destination.clone()
 			}
 			Some(name) => {
 				let wanted = match name {
@@ -1002,17 +1004,17 @@ impl<B: DisposalBackend> Driver<B> {
 				};
 				let folder = self.create_root(name).await?;
 				self.resolver = Some(PathResolver::new(std::iter::empty()));
-				folder
+				DirType::Dir(Cow::Owned(folder))
 			}
 		};
 		self.dirs.push(DirSlot {
-			uuid: root_uuid,
+			uuid: root.uuid(),
 			parent: ROOT,
 			name: ValidatedName::try_from("root").expect("a valid name"),
 			archive_name: None,
 			created: Utc::now(),
 			entry: root_entry,
-			state: DirState::Created(root_uuid),
+			state: DirState::Created(root),
 			children: Vec::new(),
 		});
 		self.reporter.set_phase(ExtractPhase::Extracting);
@@ -1024,7 +1026,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Creates the folder entries are extracted into.
-	async fn create_root(&mut self, name: ValidatedName) -> Result<Uuid, Stopped> {
+	async fn create_root(&mut self, name: ValidatedName) -> Result<RemoteDirectory, Stopped> {
 		loop {
 			// No entry is read yet, so only prefetched chunks are in flight: waited out holding
 			// nothing, as between entries.
@@ -1058,12 +1060,11 @@ impl<B: DisposalBackend> Driver<B> {
 						outcome.name.as_ref(),
 					);
 					self.created_digest = self.created_digest.wrapping_add(dir_digest(dir.uuid()));
-					let uuid = dir.uuid();
 					self.top_level_created(
 						ExtractTopLevelKey::Root,
-						NonRootItemType::Dir(Cow::Owned(dir)),
+						NonRootItemType::Dir(Cow::Owned(dir.clone())),
 					);
-					return Ok(uuid);
+					return Ok(dir);
 				}
 				Err(DirError::NotStarted) => {}
 				Err(DirError::Failed(error)) => {
@@ -1533,7 +1534,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.reporter
 					.dir_created(created.uuid(), parent, name.as_ref());
 				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
-				self.dirs[dir].state = DirState::Created(created.uuid());
+				self.dirs[dir].state = DirState::Created(DirType::Dir(Cow::Owned(created.clone())));
 				self.uncreated_dirs -= 1;
 				self.ready_dirs
 					.extend(self.dirs[dir].children.iter().copied());
@@ -1559,7 +1560,7 @@ impl<B: DisposalBackend> Driver<B> {
 					dest_parent: parent,
 					dest_name: self.dirs[dir].name.as_ref().to_owned(),
 					stage: ExtractStage::CreateDirectory,
-					retry: self.retry(self.dirs[dir].parent),
+					retry: Some(self.retry(self.dirs[dir].parent)),
 					error: Arc::clone(&error),
 				};
 				self.reporter
@@ -1598,15 +1599,22 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// A directory's path in the archive, as drive names.
-	fn archive_path(&self, mut dir: DirId) -> String {
+	fn archive_path(&self, dir: DirId) -> String {
+		joined(&self.archive_names(dir))
+	}
+
+	/// A directory's path in the archive: the base, then the names of the directories below
+	/// it.
+	fn archive_names(&self, mut dir: DirId) -> Vec<ValidatedName> {
 		let mut names = Vec::new();
 		while dir != ROOT {
 			let slot = &self.dirs[dir];
 			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).clone());
 			dir = slot.parent;
 		}
+		names.extend(self.base.iter().rev().cloned());
 		names.reverse();
-		self.archive_joined(&names)
+		names
 	}
 
 	fn open_file(&mut self, new: NewFile) {
@@ -1770,7 +1778,7 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Reports file `ordinal` as failed; its later data is dropped.
 	fn fail_file(&mut self, ordinal: u64, stage: ExtractStage, error: Arc<Error>) {
-		let retry = self.retry(self.files[&ordinal].parent);
+		let retry = self.file_retry(&self.files[&ordinal]);
 		let file = self
 			.files
 			.get_mut(&ordinal)
@@ -1869,16 +1877,24 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Where an entry of `dir` that failed is extracted again: the nearest directory there is,
-	/// `dir` itself unless it failed too.
+	/// `dir` itself unless it failed too. The root always is.
 	fn retry(&self, mut dir: DirId) -> ExtractRetry {
-		while self.dirs[dir].created_uuid().is_none() {
+		loop {
+			if let DirState::Created(destination) = &self.dirs[dir].state {
+				return ExtractRetry {
+					destination: destination.clone(),
+					// with the base of a partial extraction: that is where it is in the archive
+					base: self.archive_names(dir),
+				};
+			}
 			dir = self.dirs[dir].parent;
 		}
-		ExtractRetry {
-			destination: self.dirs[dir].uuid,
-			// with the base of a partial extraction: that is where it is in the archive
-			base: self.archive_path(dir),
-		}
+	}
+
+	/// Where `file`, which failed, is extracted again: `None` for a tar's hard link, whose copy
+	/// needs the file it names read in the same pass (see [`ExtractFailure::retry`]).
+	fn file_retry<U>(&self, file: &FileSlot<U>) -> Option<ExtractRetry> {
+		file.copy.is_none().then(|| self.retry(file.parent))
 	}
 
 	/// Registers the files whose data is all up and whose directory exists, as many at once as
@@ -2020,7 +2036,7 @@ impl<B: DisposalBackend> Driver<B> {
 				let stage = ExtractStage::RegisteredAsVersion {
 					existing_file: registered.stable_uuid.into(),
 				};
-				let retry = self.retry(file.parent);
+				let retry = self.file_retry(&file);
 				report_file_failure(
 					&mut self.report,
 					&self.reporter,
@@ -2034,7 +2050,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.link_target_failed(ordinal);
 				let error = Arc::new(error);
 				self.note_error(&error);
-				let retry = self.retry(file.parent);
+				let retry = self.file_retry(&file);
 				report_file_failure(
 					&mut self.report,
 					&self.reporter,

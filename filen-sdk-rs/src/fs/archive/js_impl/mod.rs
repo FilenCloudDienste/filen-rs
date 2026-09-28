@@ -18,6 +18,7 @@ use crate::{
 	Error, ErrorKind,
 	auth::{Client, JsClient},
 	fs::{
+		HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			counts::ItemCounts,
@@ -42,7 +43,7 @@ use super::{
 	extract::{
 		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
-		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractRetry,
+		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
 		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
 		OmittedRecords, PasswordCheck,
 	},
@@ -162,13 +163,27 @@ pub struct ExtractFailureInfo {
 	pub dest_parent: Uuid,
 	pub dest_name: String,
 	pub stage: ExtractStage,
-	/// Where to extract the entry again for it to land where it was meant to: pass its `entry`
-	/// to `extractArchiveEntries` with this `base`, the directory `destination` names as the
-	/// destination, and the root `destination`. Failures sharing a retry go again in one call.
-	/// A tar's hard link that failed does not go again this way: it is a copy of a file stored
-	/// before it, which is in the drive by then, where it can be copied.
-	pub retry: ExtractRetry,
+	/// Where to extract the entry again for it to land where it was meant to. `undefined` only
+	/// for a tar's hard link that failed, which does not go again: it is a copy of a file stored
+	/// before it, which is in the drive by then, where it can be copied (so offer no retry for
+	/// it).
+	pub retry: Option<ExtractRetry>,
 	pub error: JobError,
+}
+
+/// Where to extract an entry that failed again, for it to land where it was meant to: pass its
+/// `entry` to `extractArchiveEntries` with this `base`, `destinationDir` as the destination, and
+/// the root `destination`. Failures sharing a retry go again in one call.
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractRetry {
+	/// The directory nearest the entry that the extraction created, or extracted into (the
+	/// drive's root, say): its parent, unless that failed too.
+	pub destination: Uuid,
+	/// The same directory, to extract into.
+	pub destination_dir: AnyNormalDir,
+	/// That directory's path in the archive, as drive names separated by `/`.
+	pub base: String,
 }
 
 #[js_type(export, no_deser)]
@@ -396,6 +411,21 @@ impl From<dispose::SourceDisposition> for ArchiveSourceDisposition {
 	}
 }
 
+impl From<extract::ExtractRetry> for ExtractRetry {
+	fn from(retry: extract::ExtractRetry) -> Self {
+		Self {
+			destination: retry.destination.uuid(),
+			destination_dir: retry.destination.into(),
+			base: retry
+				.base
+				.iter()
+				.map(AsRef::as_ref)
+				.collect::<Vec<&str>>()
+				.join("/"),
+		}
+	}
+}
+
 impl From<extract::ExtractFailure> for ExtractFailureInfo {
 	fn from(failure: extract::ExtractFailure) -> Self {
 		Self {
@@ -404,7 +434,7 @@ impl From<extract::ExtractFailure> for ExtractFailureInfo {
 			dest_parent: failure.dest_parent,
 			dest_name: failure.dest_name,
 			stage: failure.stage,
-			retry: failure.retry,
+			retry: failure.retry.map(Into::into),
 			error: job_error(failure.error),
 		}
 	}
@@ -650,19 +680,26 @@ fn extract_request(
 	})
 }
 
-/// What `extractArchiveEntries` extracts, and where. The entries and `base` are checked by the
-/// extract itself, which fails with the report of what it did.
+/// What `extractArchiveEntries` extracts, and where: some entries of this archive, below a
+/// `base` of valid names (empty segments left out, so `/docs//sub/` is `docs/sub`). A call
+/// breaking that is refused before the extract starts.
 fn entries_request(
 	archive: AnyFile,
 	entries: Vec<ArchiveEntryId>,
-	base: String,
+	base: &str,
 	destination: AnyNormalDir,
 	root: ExtractRoot,
 ) -> Result<ExtractRequest, Error> {
+	let archive = RemoteFileType::try_from(archive)?;
+	extract::check_entries(archive.uuid(), &entries)?;
 	Ok(ExtractRequest::Entries {
-		archive: RemoteFileType::try_from(archive)?,
+		archive,
 		ids: entries,
-		base,
+		base: base
+			.split('/')
+			.filter(|segment| !segment.is_empty())
+			.map(ValidatedName::try_from)
+			.collect::<Result<_, _>>()?,
 		destination: DirType::from(destination),
 		root: root.try_into()?,
 	})

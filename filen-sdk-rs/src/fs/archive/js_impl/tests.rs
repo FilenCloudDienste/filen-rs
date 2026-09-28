@@ -78,22 +78,12 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 }
 
 #[test]
-fn chosen_entries_go_to_the_extract_as_given() {
-	let file = remote_file();
-	let entries = vec![
-		ArchiveEntryId {
-			archive: file.uuid(),
-			index: 4,
-		},
-		ArchiveEntryId {
-			archive: file.uuid(),
-			index: 1,
-		},
-	];
+fn chosen_entries_go_to_the_extract_below_a_base_of_names() {
+	let entries = vec![entry_id(4), entry_id(1)];
 	let request = entries_request(
-		AnyFile::File(file.clone().into()),
+		AnyFile::File(remote_file().into()),
 		entries.clone(),
-		"photos/2024".into(),
+		"/photos//2024/",
 		destination(),
 		ExtractRoot::Destination,
 	)
@@ -108,10 +98,41 @@ fn chosen_entries_go_to_the_extract_as_given() {
 	else {
 		panic!("some entries, into the destination itself");
 	};
+	assert_eq!((archive.uuid(), ids), (ARCHIVE, entries));
+	assert_eq!(names(&base), ["photos", "2024"]);
+}
+
+#[test]
+fn a_call_choosing_no_entry_of_its_archive_or_an_invalid_base_is_refused() {
+	let refused = |entries, base| {
+		entries_request(
+			AnyFile::File(remote_file().into()),
+			entries,
+			base,
+			destination(),
+			ExtractRoot::Destination,
+		)
+		.unwrap_err()
+		.kind()
+	};
+	let of_another = ArchiveEntryId {
+		archive: Uuid::from_u128(0xb),
+		index: 0,
+	};
+	assert_eq!(refused(Vec::new(), ""), ErrorKind::InvalidState);
 	assert_eq!(
-		(archive.uuid(), ids, base.as_str()),
-		(file.uuid(), entries, "photos/2024")
+		refused(vec![entry_id(0), of_another], ""),
+		ErrorKind::InvalidState
 	);
+	assert_eq!(
+		refused(vec![entry_id(0)], "docs/\u{0}"),
+		ErrorKind::InvalidName
+	);
+}
+
+/// `base`'s names, for comparing.
+fn names(base: &[ValidatedName]) -> Vec<&str> {
+	base.iter().map(AsRef::as_ref).collect()
 }
 
 #[test]
@@ -355,13 +376,22 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 	let [failed] = report.failures.as_slice() else {
 		panic!("one failure");
 	};
+	let retry = failed
+		.retry
+		.as_ref()
+		.expect("a failure keeps where to retry it");
 	assert_eq!(
-		(failed.retry.clone(), failed.error.kind()),
+		(retry.destination, retry.base.as_str(), failed.error.kind()),
 		(
-			failure(ErrorKind::Server).retry,
+			Uuid::from_u128(0xd),
+			"docs/sub",
 			ErrorKind::MaxStorageReached
-		),
-		"a failure keeps where to retry it"
+		)
+	);
+	// the directory itself, for a retry to extract into without looking it up
+	assert_eq!(
+		DirType::<'static, Normal>::from(retry.destination_dir.clone()),
+		DirType::Dir(Cow::Owned(dir()))
 	);
 	let [first, second] = report.dispositions.as_slice() else {
 		panic!("two dispositions");
@@ -399,10 +429,13 @@ fn failure(kind: ErrorKind) -> extract::ExtractFailure {
 		dest_parent: Uuid::from_u128(0xd),
 		dest_name: "a.txt".into(),
 		stage: ExtractStage::Upload,
-		retry: ExtractRetry {
-			destination: Uuid::from_u128(0xd),
-			base: "docs".into(),
-		},
+		retry: Some(extract::ExtractRetry {
+			destination: DirType::Dir(Cow::Owned(dir())),
+			base: vec![
+				ValidatedName::try_from("docs").unwrap(),
+				ValidatedName::try_from("sub").unwrap(),
+			],
+		}),
 		error: Arc::new(Error::custom(kind, "failed")),
 	}
 }
@@ -509,13 +542,13 @@ fn an_extract_update_reports_milliseconds_and_the_parts_of_its_events() {
 		(
 			failed.entry,
 			failed.dest_parent,
-			failed.retry.base.as_str(),
+			failed.retry.as_ref().map(|retry| retry.base.as_str()),
 			failed.error.kind()
 		),
 		(
 			entry_id(3),
 			Uuid::from_u128(0xd),
-			"docs",
+			Some("docs/sub"),
 			ErrorKind::MaxStorageReached
 		)
 	);

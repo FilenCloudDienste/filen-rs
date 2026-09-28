@@ -30,7 +30,7 @@ use crate::{
 		},
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
-			extract::ExtractRetry,
+			extract::ExtractFailure,
 			format::StreamCodec,
 			password::ArchivePassword,
 			sevenz::write::{SevenZEncryption, SevenZMethod},
@@ -2916,21 +2916,18 @@ async fn a_failed_entry_is_extracted_again_where_it_was_meant_to_go() {
 	let docs = log_dir(&setup, "docs");
 	// the file whose upload failed, the directory that failed and the file waiting in it: all go
 	// again into the directory that exists, as its contents
-	let retries: BTreeMap<&str, &ExtractRetry> = report
+	let retries: BTreeMap<&str, (Uuid, Vec<&str>)> = report
 		.failures
 		.iter()
-		.map(|failure| (failure.path.as_str(), &failure.retry))
+		.map(|failure| (failure.path.as_str(), retry_target(failure)))
 		.collect();
-	let in_docs = ExtractRetry {
-		destination: docs,
-		base: "docs".into(),
-	};
+	let in_docs = (docs, vec!["docs"]);
 	assert_eq!(
 		retries,
 		BTreeMap::from([
-			("docs/a.txt", &in_docs),
-			("docs/deep", &in_docs),
-			("docs/deep/b.txt", &in_docs),
+			("docs/a.txt", in_docs.clone()),
+			("docs/deep", in_docs.clone()),
+			("docs/deep/b.txt", in_docs),
 		])
 	);
 
@@ -3438,6 +3435,58 @@ async fn a_link_copy_is_dropped_by_a_cancel() {
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
+/// Where `failure` goes again: the uuid of the directory, and its path in the archive.
+fn retry_target(failure: &ExtractFailure) -> (Uuid, Vec<&str>) {
+	let retry = failure.retry.as_ref().expect("a failed entry goes again");
+	(
+		retry.destination.uuid(),
+		retry.base.iter().map(AsRef::as_ref).collect(),
+	)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_at_the_top_is_retried_in_the_drives_root() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"alpha")]), |backend| {
+		backend
+			.fail_upload
+			.insert("a.txt".to_owned(), ErrorKind::Server);
+	});
+	let job = start(&setup, chosen(&[0], &[]));
+	let report = job.running.await.unwrap().unwrap();
+	let [failure] = report.failures.as_slice() else {
+		panic!("{:?}", report.failures);
+	};
+	let retry = failure.retry.as_ref().expect("a failed file goes again");
+	// the extraction's destination itself, the drive's root here: as given, not fetched again
+	assert!(
+		matches!(&retry.destination, DirType::Root(root) if root.uuid() == setup.destination),
+		"{:?}",
+		retry.destination
+	);
+	assert!(retry.base.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_hard_link_has_no_retry() {
+	let data = pattern(1000, 7);
+	let setup = setup("bundle.tar", tar_with_links(&data, 1), |backend| {
+		backend
+			.fail_upload
+			.insert("l000".to_owned(), ErrorKind::Server);
+	});
+	let job = start(&setup, Options::default());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(finished_paths(&setup), ["bundle/a.bin"]);
+	let [failure] = report.failures.as_slice() else {
+		panic!("{:?}", report.failures);
+	};
+	// a request for the link alone would have nothing to copy: the link's file is in the drive
+	assert_eq!(
+		(failure.path.as_str(), failure.retry.is_none()),
+		("l000", true)
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_of_a_partial_extraction_is_retried_below_its_base() {
 	let tar = tar_of(&[
@@ -3457,13 +3506,7 @@ async fn a_failure_of_a_partial_extraction_is_retried_below_its_base() {
 	// the entry's path in the archive, and where it goes again
 	assert_eq!(failure.path, "docs/sub/b.txt");
 	let sub = log_dir(&setup, "sub");
-	assert_eq!(
-		failure.retry,
-		ExtractRetry {
-			destination: sub,
-			base: "docs/sub".into(),
-		}
-	);
+	assert_eq!(retry_target(failure), (sub, vec!["docs", "sub"]));
 
 	let retry = setup_in(sub, "bundle.tar", tar, |_| {});
 	let job = start(&retry, chosen(&[failure.entry.index], &["docs", "sub"]));

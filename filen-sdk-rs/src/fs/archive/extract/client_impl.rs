@@ -12,7 +12,6 @@ use crate::{
 		archive::{config::ArchiveConfig, worker},
 		drive_job::backend::ClientBackend,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
-		name::ValidatedName,
 	},
 	job::JobControl,
 };
@@ -84,7 +83,8 @@ impl Client {
 				destination,
 				root,
 			} => {
-				let selection = selection(archive.uuid(), ids, &base);
+				let selection = check_entries(archive.uuid(), &ids)
+					.map(|()| Selection::new(ids.into_iter().map(|id| u64::from(id.index)), base));
 				(archive, None, false, destination, root, Some(selection))
 			}
 		};
@@ -195,9 +195,8 @@ fn codec_limits(archives: &ArchiveConfig, config: &ExtractConfig) -> CodecLimits
 	}
 }
 
-/// The entries of the archive `archive` that `ids` names, below `base`: checked to be of that
-/// archive, with a base of valid drive names.
-fn selection(archive: Uuid, ids: Vec<ArchiveEntryId>, base: &str) -> Result<Selection, Error> {
+/// Checks `ids`, the entries chosen to extract, name some of `archive`'s.
+pub(crate) fn check_entries(archive: Uuid, ids: &[ArchiveEntryId]) -> Result<(), Error> {
 	if ids.is_empty() {
 		return Err(Error::custom(
 			ErrorKind::InvalidState,
@@ -210,15 +209,7 @@ fn selection(archive: Uuid, ids: Vec<ArchiveEntryId>, base: &str) -> Result<Sele
 			"an entry chosen to extract is of another archive",
 		));
 	}
-	let base = base
-		.split('/')
-		.filter(|segment| !segment.is_empty())
-		.map(ValidatedName::try_from)
-		.collect::<Result<Vec<_>, _>>()?;
-	Ok(Selection::new(
-		ids.into_iter().map(|id| u64::from(id.index)),
-		base,
-	))
+	Ok(())
 }
 
 #[cfg(test)]
@@ -245,24 +236,12 @@ mod tests {
 	fn the_entries_chosen_are_checked_before_anything_runs() {
 		let archive = Uuid::from_u128(1);
 		let id = |archive, index| ArchiveEntryId { archive, index };
-		let name = |name| ValidatedName::try_from(name).unwrap();
-		assert_eq!(
-			selection(
-				archive,
-				vec![id(archive, 3), id(archive, 1), id(archive, 3)],
-				"/docs//sub/"
-			)
-			.unwrap(),
-			Selection::new([1, 3], vec![name("docs"), name("sub")])
-		);
-		for (ids, base) in [
-			(vec![], ""),
-			(vec![id(Uuid::from_u128(2), 0)], ""),
-			(vec![id(archive, 0)], "docs/\u{0}"),
-		] {
-			assert!(
-				selection(archive, ids.clone(), base).is_err(),
-				"{ids:?} {base:?}"
+		assert!(check_entries(archive, &[id(archive, 3), id(archive, 1)]).is_ok());
+		for ids in [vec![], vec![id(archive, 0), id(Uuid::from_u128(2), 0)]] {
+			assert_eq!(
+				check_entries(archive, &ids).unwrap_err().kind(),
+				ErrorKind::InvalidState,
+				"{ids:?}"
 			);
 		}
 	}
