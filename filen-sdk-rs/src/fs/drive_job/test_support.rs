@@ -122,13 +122,16 @@ pub(crate) struct FakeLog {
 	pub(crate) probes: Vec<String>,
 	/// Drive-lock acquisitions that had to wait for another holder.
 	pub(crate) lock_waits: usize,
-	/// Slow registrations that have started.
-	pub(crate) finishing: Vec<String>,
 	/// Requests that waited while held ([`FakeBackend::hold_requests`]), in the order they came.
 	pub(crate) held: Vec<(Request, Uuid)>,
+	/// Requests that waited while held by name ([`FakeBackend::hold_named`]), in the order they
+	/// came.
+	pub(crate) held_named: Vec<(Request, String)>,
 }
 
-/// A request to a [`FakeBackend`] that a test can hold, to stop a job at that step.
+/// A request to a [`FakeBackend`] that a test can hold, to stop a job at that step: one about an
+/// item that exists by its uuid ([`FakeBackend::hold_requests`]), one about an item a job creates
+/// by its name ([`FakeBackend::hold_named`]), which the test cannot know the uuid of up front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Request {
 	/// Fetching one of a file's chunks.
@@ -141,6 +144,12 @@ pub(crate) enum Request {
 	Delete,
 	/// Propagating an item's tree to the destination's shares and links.
 	Propagate,
+	/// Creating a directory, by its name.
+	Create,
+	/// Uploading one of a file's chunks, by the file's name.
+	Upload,
+	/// Registering an uploaded file, by its name.
+	Finish,
 }
 
 pub(crate) struct FakeUpload {
@@ -175,8 +184,6 @@ pub(crate) struct FakeBackend {
 	pub(crate) blocked_uploads: HashSet<String>,
 	pub(crate) fail_create: HashMap<String, ErrorKind>,
 	pub(crate) fail_finish: HashMap<String, ErrorKind>,
-	/// Registrations that take this long, logged in `finishing` when they start.
-	pub(crate) slow_finish: HashMap<String, Duration>,
 	/// Files whose last chunk comes back one byte short.
 	pub(crate) short_reads: HashSet<String>,
 	/// Fetching the destination's shares and links fails.
@@ -195,6 +202,9 @@ pub(crate) struct FakeBackend {
 	/// [`FakeLog::held`]. Held by kind as well as item, as one job sends several kinds about
 	/// the same item and a test means to stop it at one of them.
 	held: watch::Sender<HashSet<(Request, Uuid)>>,
+	/// Requests about a directory or file of a name that wait while they are in the set, each
+	/// wait logged in [`FakeLog::held_named`].
+	held_named: watch::Sender<HashSet<(Request, String)>>,
 	/// Lowercased names the destination holds without the listing having shown them.
 	pub(crate) existing: Mutex<HashSet<String>>,
 	/// Names the server registers as a new version of the given existing file (a client
@@ -235,7 +245,6 @@ impl FakeBackend {
 			blocked_uploads: HashSet::new(),
 			fail_create: HashMap::new(),
 			fail_finish: HashMap::new(),
-			slow_finish: HashMap::new(),
 			short_reads: HashSet::new(),
 			fail_targets: None,
 			targets_delay: Duration::ZERO,
@@ -246,6 +255,7 @@ impl FakeBackend {
 			versioned_files: HashSet::new(),
 			fail_deletes_of: HashSet::new(),
 			held: watch::Sender::new(HashSet::new()),
+			held_named: watch::Sender::new(HashSet::new()),
 			existing: Mutex::new(HashSet::new()),
 			version_of: HashMap::new(),
 			lock_calls: AtomicUsize::new(0),
@@ -295,9 +305,48 @@ impl FakeBackend {
 			.send_modify(|held| held.extend(items.into_iter().map(|uuid| (request, uuid))));
 	}
 
+	/// Holds each `request` about a directory or file of any of `names` until it is released.
+	pub(crate) fn hold_named(
+		&self,
+		request: Request,
+		names: impl IntoIterator<Item = impl Into<String>>,
+	) {
+		self.held_named.send_modify(|held| {
+			held.extend(names.into_iter().map(|name| (request, name.into())));
+		});
+	}
+
+	/// Lets each `request` about any of `names` go on, and holds none of them from now on.
+	pub(crate) fn release_named(
+		&self,
+		request: Request,
+		names: impl IntoIterator<Item = impl Into<String>>,
+	) {
+		self.held_named.send_modify(|held| {
+			for name in names {
+				held.remove(&(request, name.into()));
+			}
+		});
+	}
+
 	/// Lets every held request go on, and holds none from now on.
 	pub(crate) fn release_all(&self) {
 		self.held.send_replace(HashSet::new());
+		self.held_named.send_replace(HashSet::new());
+	}
+
+	/// Waits while `request` about a directory or file named `name` is held.
+	async fn hold_name(&self, request: Request, name: &str) {
+		let key = (request, name.to_owned());
+		if self.held_named.borrow().contains(&key) {
+			self.log().held_named.push(key.clone());
+			// the sender lives in `self`, which outlives this wait
+			let _ = self
+				.held_named
+				.subscribe()
+				.wait_for(|held| !held.contains(&key))
+				.await;
+		}
 	}
 
 	/// Waits while `request` about `uuid` is held.
@@ -379,6 +428,7 @@ impl DriveBackend for FakeBackend {
 			self.live_locks.load(Ordering::SeqCst) > 0,
 			"creates hold the drive lock"
 		);
+		self.hold_name(Request::Create, name.as_ref()).await;
 		self.wait(name.as_ref()).await;
 		if let Some(kind) = self.fail_create.get(name.as_ref()) {
 			return Err(Error::custom(*kind, "create failed"));
@@ -493,6 +543,7 @@ impl DriveBackend for FakeBackend {
 		if self.blocked_uploads.contains(name) {
 			std::future::pending::<()>().await;
 		}
+		self.hold_name(Request::Upload, name).await;
 		self.wait(name).await;
 		if let Some(kind) = self.fail_upload.get(name) {
 			return Err(Error::custom(*kind, "upload failed"));
@@ -530,10 +581,7 @@ impl DriveBackend for FakeBackend {
 			let mut log = self.log();
 			log.peak_finishes = log.peak_finishes.max(running);
 		});
-		if let Some(delay) = self.slow_finish.get(name.as_ref()) {
-			self.log().finishing.push(name.as_ref().to_owned());
-			tokio::time::sleep(*delay).await;
-		}
+		self.hold_name(Request::Finish, name.as_ref()).await;
 		if let Some(kind) = self.fail_finish.get(name.as_ref()) {
 			return Err(Error::custom(*kind, "registration failed"));
 		}

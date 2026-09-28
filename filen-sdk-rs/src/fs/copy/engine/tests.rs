@@ -16,7 +16,7 @@ use crate::{
 		dir::RootDirectory,
 		drive_job::{
 			name_retry::TOP_LEVEL_NAME_ATTEMPTS,
-			test_support::{FakeBackend, Quirk, chunk_data, wait_until},
+			test_support::{FakeBackend, Quirk, Request, chunk_data, wait_until},
 		},
 		file::{
 			AnonymousRemoteFile,
@@ -934,13 +934,17 @@ async fn running_out_of_storage_ends_the_job() {
 		.map(|i| source_file(&format!("f{i}"), 100))
 		.collect();
 	let mut backend = FakeBackend::new(destination).with_memory(16);
-	backend.delay = Duration::from_secs(10);
-	backend
-		.slow
-		.insert("f2".to_owned(), Duration::from_millis(1));
 	backend
 		.fail_upload
 		.insert("f2".to_owned(), ErrorKind::MaxStorageReached);
+	// the others upload only once the failure has ended the job
+	backend.hold_named(
+		Request::Upload,
+		sources
+			.iter()
+			.filter_map(|source| source.name())
+			.filter(|name| *name != "f2"),
+	);
 	let backend = Arc::new(backend);
 	let (running, recorder, reporter) = start(
 		&backend,
@@ -2220,10 +2224,8 @@ async fn a_pause_controller_dropped_before_the_job_starts_lets_it_run() {
 #[tokio::test(start_paused = true)]
 async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
 	let destination = Uuid::new_v4();
-	let mut backend = FakeBackend::new(destination);
-	backend
-		.slow_finish
-		.insert("a.txt".to_owned(), Duration::from_secs(3));
+	let backend = FakeBackend::new(destination);
+	backend.hold_named(Request::Finish, ["a.txt"]);
 	let backend = Arc::new(backend);
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(
@@ -2231,11 +2233,13 @@ async fn a_registration_in_flight_finishes_on_cancel_and_is_reported() {
 		plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
 		control,
 	);
+	let registering = (Request::Finish, "a.txt".to_owned());
 	wait_until("the file is being registered", || {
-		!backend.log().finishing.is_empty()
+		backend.log().held_named.contains(&registering)
 	})
 	.await;
 	cancel.send_replace(true);
+	backend.release_named(Request::Finish, ["a.txt"]);
 	let CopyFailed { report, error } = running.await.unwrap().unwrap_err();
 
 	assert_eq!(error.kind(), ErrorKind::Cancelled);

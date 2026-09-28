@@ -6,6 +6,8 @@ pub(crate) mod codec;
 mod engine;
 mod list;
 pub(crate) mod report;
+#[cfg(test)]
+mod test_support;
 
 use filen_macros::js_type;
 
