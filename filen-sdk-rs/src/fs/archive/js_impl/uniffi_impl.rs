@@ -21,7 +21,9 @@ use super::{
 #[uniffi::export(with_foreign)]
 pub trait ExtractArchiveCallback: Send + Sync {
 	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps.
+	/// keeps. A folder among them goes to the trash again when a wrong password shows only
+	/// once entries were read, before any file was extracted: an update's
+	/// `ExtractEvent::TopLevelTrashed` tells which.
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>);
 	fn on_update(&self, update: ExtractUpdate);
 }
@@ -287,7 +289,7 @@ impl JsClient {
 			skip_mac_metadata: config.skip_mac_metadata,
 			..ExtractSettings::default()
 		}
-		.into_config(password);
+		.into_list_config(password);
 		let client = self.inner();
 		managed_future
 			.into_ordered_job(

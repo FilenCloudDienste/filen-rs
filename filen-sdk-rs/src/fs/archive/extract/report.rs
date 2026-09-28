@@ -214,6 +214,15 @@ pub struct ExtractMisleadingName {
 	pub path: String,
 }
 
+/// A folder handed to `on_top_level_created` that was moved to the trash: a wrong password
+/// showed only once entries were read, before any file was extracted (see
+/// `ExtractConfig::password`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractTopLevelTrashed {
+	pub dest_uuid: Uuid,
+}
+
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
@@ -290,6 +299,7 @@ pub enum ExtractEvent {
 	Renamed(ExtractRenamedEntry),
 	/// An entry is being extracted under a name that reads as something it is not.
 	MisleadingName(ExtractMisleadingName),
+	TopLevelTrashed(ExtractTopLevelTrashed),
 	/// What became of the archive, when it was to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
@@ -397,7 +407,10 @@ pub type ExtractFailed = JobFailed<ExtractReport>;
 /// Receives an extraction's progress. All calls come from the one job, in order.
 pub trait ExtractCallback: MaybeSendSync + 'static {
 	/// Items created directly in the destination, delivered as soon as they exist and before
-	/// any update counts them, so a caller can clean up even after an abrupt end.
+	/// any update counts them, so a caller can clean up even after an abrupt end. A folder
+	/// among them goes to the trash again when a wrong password shows only once entries were
+	/// read, before any file was extracted: an update's [`ExtractEvent::TopLevelTrashed`] tells
+	/// which.
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>);
 	fn on_update(&self, update: ExtractUpdate);
 }

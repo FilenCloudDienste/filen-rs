@@ -55,8 +55,9 @@ use super::{
 		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
-		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
-		MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
+		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractTopLevelTrashed,
+		ListCallback, ListConfig, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords,
+		PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -229,6 +230,9 @@ pub enum ExtractEvent {
 	Renamed(ExtractRenamedEntry),
 	/// An entry is being extracted under a name that reads as something it is not.
 	MisleadingName(ExtractMisleadingName),
+	/// A folder handed to the top-level callback was moved to the trash.
+	TopLevelTrashed(ExtractTopLevelTrashed),
+	/// What became of the archive, when it was to be removed.
 	SourceDisposition(ArchiveSourceDisposition),
 	/// An item was created but could not be added to one of the destination's public links or
 	/// shares.
@@ -538,6 +542,7 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 			Event::Skipped(entry) => Self::Skipped(entry),
 			Event::Renamed(entry) => Self::Renamed(entry),
 			Event::MisleadingName(entry) => Self::MisleadingName(entry),
+			Event::TopLevelTrashed(trashed) => Self::TopLevelTrashed(trashed),
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))
@@ -831,6 +836,21 @@ impl ExtractSettings {
 			skip_mac_metadata: self.skip_mac_metadata.unwrap_or(defaults.skip_mac_metadata),
 		}
 	}
+
+	/// A listing's config, which has no `max_bytes` or `max_items`.
+	fn into_list_config(self, password: Option<ArchivePassword>) -> ListConfig {
+		let ExtractConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+			..
+		} = self.into_config(password);
+		ListConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+		}
+	}
 }
 
 /// What `compressItems` compresses, and whether the items go afterwards.
@@ -992,7 +1012,7 @@ type Listed = (Result<extract::ArchiveListing, extract::ListFailed>, u64);
 async fn list_job(
 	client: Arc<Client>,
 	archive: RemoteFileType<'static>,
-	config: ExtractConfig,
+	config: ListConfig,
 	sender: UnboundedSender<ListDelivery>,
 	control: JobControl,
 ) -> Result<Listed, Error> {

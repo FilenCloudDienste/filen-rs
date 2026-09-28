@@ -29,14 +29,14 @@ pub use crate::fs::{
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub(crate) use client_impl::check_entries;
 pub use list::{
-	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListFailed, ListPhase,
-	ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
+	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListConfig, ListFailed,
+	ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
 	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
+	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
 };
 
 /// Where an archive's entries are created.

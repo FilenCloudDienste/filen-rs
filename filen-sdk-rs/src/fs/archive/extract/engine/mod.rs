@@ -91,7 +91,7 @@ use super::{
 		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractFailure,
 		ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
 		ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-		ExtractedTopLevel, Reporter, keep,
+		ExtractTopLevelTrashed, ExtractedTopLevel, Reporter, keep,
 	},
 };
 
@@ -694,6 +694,8 @@ impl<B: DisposalBackend> Driver<B> {
 			match self.backend.trash_dir(uuid).await {
 				Ok(()) => {
 					trashed.insert(uuid);
+					let trashed = ExtractTopLevelTrashed { dest_uuid: uuid };
+					self.reporter.event(ExtractEvent::TopLevelTrashed(trashed));
 				}
 				Err(error) => tracing::warn!(
 					"archive {}: failed to trash a directory created before the wrong password \
