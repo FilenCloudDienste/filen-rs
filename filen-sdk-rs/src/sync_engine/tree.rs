@@ -1,7 +1,11 @@
-//! The resident baseline: one pair's rows as an id-keyed tree, held between passes.
+//! The resident baseline: one pair's rows as an id-keyed tree.
 //!
-//! The store holds these and nothing else reads one directly: a pass reads its rows through
-//! [`rows::Baseline`](super::rows::Baseline), the boundary this tree is today's backing for.
+//! The store used to hold one of these per pair for the life of the pair, and every pass read its
+//! rows out of it. A pass now reads them out of the store's table through
+//! [`rows::Baseline`](super::rows::Baseline), and this tree is compiled only into the tests —
+//! where it is the ORACLE that reader is held to, real code answering every question the reader
+//! answers — and into `bench-internals`, whose probe still sizes one. What follows is the design
+//! as it stood when it was the backing.
 //!
 //! The rows a pass reconciles against used to be a `HashMap<String, BaselineEntry>` — 808 bytes a
 //! row measured, every path materialized and stored whole, and a second copy of it in every
@@ -55,6 +59,10 @@
 //! is pruned the moment its last child leaves, so "this node has children" and "this node has a row
 //! under it" mean the same thing.
 
+// Under `bench-internals` alone only the probe's handful of these is called; the rest is the
+// oracle's, and the tests call every one.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::{
 	cmp::Ordering,
 	collections::{BTreeSet, HashMap, HashSet},
@@ -67,12 +75,6 @@ use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind},
 	ignore::FILENIGNORE,
 };
-
-// A pass's own edits, kept beside the tree rather than written into a copy of it. A child module so
-// it reads the tree's nodes directly, as the tree's own queries do.
-mod edits;
-
-pub(super) use self::edits::{Edits, View};
 
 /// A node's index in [`Tree::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -192,35 +194,6 @@ pub(super) fn fold_cmp(a: &str, b: &str) -> Ordering {
 	a.chars()
 		.flat_map(char::to_lowercase)
 		.cmp(b.chars().flat_map(char::to_lowercase))
-}
-
-/// Whether `path` IS `prefix`, or lies under it, folded the way [`fold_cmp`] folds — and, like it,
-/// without materializing either folded form.
-///
-/// The same question [`Tree::occupied`] answers from a node's children, asked of a map that has
-/// no such order: the two side maps a directory move checks its destination against. Folding each
-/// key into a [`collision_key`](super::scan::collision_key) first allocates a `String` for every
-/// key of the whole tree, to learn — for all but a handful of them — that the very first character
-/// already differs. This stops at that character.
-pub(super) fn at_or_under_folded(path: &str, prefix: &str) -> bool {
-	// Same fast path, and same argument for it, as `fold_cmp`: on ASCII the two foldings are the
-	// same answer rather than an approximation.
-	if path.is_ascii() && prefix.is_ascii() {
-		let (path, prefix) = (path.as_bytes(), prefix.as_bytes());
-		return path.len() >= prefix.len()
-			&& path[..prefix.len()].eq_ignore_ascii_case(prefix)
-			&& path.get(prefix.len()).is_none_or(|&byte| byte == b'/');
-	}
-	// Comparing the two folded CHARACTER streams is comparing the two folded strings: a lowercase
-	// expansion never yields `/`, so the separator can only be matched by a real one, and a prefix
-	// that runs out mid-expansion leaves a character that is not `/` and is refused here.
-	let mut folded = path.chars().flat_map(char::to_lowercase);
-	for want in prefix.chars().flat_map(char::to_lowercase) {
-		if folded.next() != Some(want) {
-			return false;
-		}
-	}
-	matches!(folded.next(), None | Some('/'))
 }
 
 /// The order a directory's children are kept in: by folded name, then by the raw one. The store's
@@ -1033,8 +1006,6 @@ impl Tree {
 	/// Advance the agreed-content marker of the row at `rel_path`, and hand back the row as it now
 	/// stands. `None` when nothing is there.
 	///
-	/// The store never writes this into its own tree: a pass's confirmation is an [`Edits`] entry
-	/// beside it, which writes here only on a row the pass itself has written.
 	pub(super) fn set_agreed(
 		&mut self,
 		rel_path: &str,
@@ -1329,7 +1300,11 @@ mod tests {
 	use uuid::Uuid;
 
 	use super::{
-		super::{baseline::BaselineChange, plan::is_under, scan::collision_key},
+		super::{
+			baseline::BaselineChange,
+			plan::is_under,
+			scan::{at_or_under_folded, collision_key},
+		},
 		*,
 	};
 
