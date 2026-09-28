@@ -2171,31 +2171,21 @@ test("copyItems copies a tree and delivers every callback in order before it res
 	const { source, big } = await copySource(parent)
 	const destination = await state.createDir(parent, "destination")
 
-	const log: string[] = []
+	const copied = callbackLog()
+	const { log } = copied
 	const updates: CopyUpdate[] = []
-	let resolved = false
-	let lateCallbacks = 0
 	const report = await state.copyItems({
 		items: [source],
 		destination,
-		onTopLevelPlanned: items => {
-			lateCallbacks += resolved ? 1 : 0
-			log.push(`planned:${items.length}`)
-		},
-		onTopLevelCreated: item => {
-			lateCallbacks += resolved ? 1 : 0
-			log.push(`created:${item.request}`)
-		},
+		onTopLevelPlanned: items => copied.note(`planned:${items.length}`),
+		onTopLevelCreated: item => copied.note(`created:${item.request}`),
 		onUpdate: update => {
-			lateCallbacks += resolved ? 1 : 0
 			updates.push(update)
-			log.push(`update:${update.phase}`)
+			copied.note(`update:${update.phase}`)
 		}
 	})
-	resolved = true
-	await new Promise(resolve => setTimeout(resolve, 500))
 
-	expect(lateCallbacks).toBe(0)
+	expect(await copied.resolved()).toBe(0)
 	expect(report.error).toBeUndefined()
 	expect(report.failures).toHaveLength(0)
 	expect(report.topLevel).toHaveLength(1)
@@ -2376,17 +2366,6 @@ async function expectExtracted(folder: Dir, source: ArchiveSource) {
 	expect(await state.listDir(await childDir(root, "empty"))).toMatchObject({ dirs: [], files: [] })
 }
 
-async function expectRejectedWith(call: Promise<unknown>, kind: string) {
-	let error: unknown
-	try {
-		await call
-	} catch (e) {
-		error = e
-	}
-	expect(error).toBeInstanceOf(FilenSdkError)
-	expect((error as FilenSdkError).kind).toBe(kind)
-}
-
 /// The callbacks of one job, in the order they came, and how many came after its call
 /// resolved (there must be none: the SDK delivers everything a job reported first).
 function callbackLog() {
@@ -2502,15 +2481,22 @@ test("an encrypted archive needs its password: none and a wrong one fail before 
 	const source = await archiveSource(parent, 11)
 	const format: CompressFormat = { type: "zip", method: { type: "deflate", level: 1 }, encryption: "aes128" }
 	// an encrypted format refuses a call without a password before anything runs
-	await expectRejectedWith(
-		state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format }),
-		"ArchivePasswordRequired"
-	)
+	await expect(
+		state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format })
+	).rejects.toMatchObject({ kind: "ArchivePasswordRequired" })
+	// a single compressed file of a folder, before anything is listed
+	await expect(
+		state.compressItems({
+			items: [source.root],
+			destination: parent,
+			name: "folder.gz",
+			format: { type: "single", compression: { codec: "gzip" } }
+		})
+	).rejects.toMatchObject({ kind: "InvalidState" })
 	// and an unencrypted one a call with a password
-	await expectRejectedWith(
-		state.compressItems({ items: [source.root], destination: parent, name: "open.tar.gz", format: tarGz }, "a password"),
-		"InvalidState"
-	)
+	await expect(
+		state.compressItems({ items: [source.root], destination: parent, name: "open.tar.gz", format: tarGz }, "a password")
+	).rejects.toMatchObject({ kind: "InvalidState" })
 	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format }, "right horse")
 
 	const into = await state.createDir(parent, "into")
@@ -2535,8 +2521,9 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	const format: CompressFormat = { type: "zip", method: { type: "bzip2", level: 9 }, encryption: "aes192" }
 	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "listed.zip", format }, "list me")
 
-	// a zip's index is readable without the password, which is checked only when given
-	const required = await state.listArchive({ archive: archive! })
+	// a zip's index is readable without the password, which is checked only when given; the
+	// expansion limit takes plain numbers as well as bigints
+	const required = await state.listArchive({ archive: archive!, expansionLimit: { ratio: 1000, floor: 256 * 1024 * 1024 } })
 	expect(required.error).toBeUndefined()
 	expect([required.format, required.password]).toStrictEqual([{ type: "zip" }, "required"])
 	expect((await state.listArchive({ archive: archive! }, "not me")).password).toBe("wrong")
@@ -2560,7 +2547,7 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	)
 	expect(await listed.resolved()).toBe(0)
 	expect(listing.password).toBe("right")
-	expect(listing.omittedEntries).toBe(0n)
+	expect([listing.omittedEntries, listing.undeliveredEntries]).toStrictEqual([0n, 0n])
 	// every entry the listing keeps came through the callback, before the update counting it
 	expect(batches.flat()).toStrictEqual(listing.entries)
 	expect(listed.log.indexOf("entries")).toBeLessThan(listed.log.lastIndexOf("update"))
@@ -2574,7 +2561,7 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	expect(listing.entries.every(entry => entry.id.archive === archive!.uuid)).toBe(true)
 })
 
-test("extractArchiveEntries extracts the entries chosen below a base, and one again where a failure's retry puts it", async () => {
+test("extractArchiveEntries extracts the entries chosen below a base, one again into a retry's directory, and refuses a bad call", async () => {
 	const parent = await state.createDir(testDir, "archive-entries")
 	const source = await archiveSource(parent, 13)
 	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "chosen.tar.gz", format: tarGz })
@@ -2595,14 +2582,15 @@ test("extractArchiveEntries extracts the entries chosen below a base, and one ag
 	expect([dirs.map(nameOf), files]).toStrictEqual([["sub"], []])
 	expect(await state.downloadFile(await childFile(dirs[0], "data.bin"))).toStrictEqual(source.data)
 
-	// a failure's retry names the directory nearest it that the extract created, and that
-	// directory's path in the archive: the entry lands there again, beside what is in its way
-	const retry: ExtractRetry = { destination: dirs[0].uuid, base: "archived/sub" }
+	// a retry as a failure carries it (no entry can be made to fail against the server): the
+	// directory nearest the entry that the extract created, and that directory's path in the
+	// archive. The entry lands there again, beside what is in its way
+	const retry: ExtractRetry = { destination: dirs[0].uuid, destinationDir: dirs[0], base: "archived/sub" }
 	const again = await state.extractArchiveEntries({
 		archive: archive!,
 		entries: [entry("archived/sub/data.bin").id],
 		base: retry.base,
-		destination: await state.getDir(retry.destination),
+		destination: retry.destinationDir,
 		root: { type: "destination" }
 	})
 	expect(again.error).toBeUndefined()
@@ -2618,6 +2606,13 @@ test("extractArchiveEntries extracts the entries chosen below a base, and one ag
 	})
 	expect(outside.error).toBeDefined()
 	expect(outside.counts.filesDone).toBe(0n)
+
+	// no entry, or a base that is not drive names, is refused before anything runs
+	const call = { archive: archive!, destination: into, root: { type: "destination" } } as const
+	await expect(state.extractArchiveEntries({ ...call, entries: [], base: "" })).rejects.toMatchObject({ kind: "InvalidState" })
+	await expect(
+		state.extractArchiveEntries({ ...call, entries: [entry("archived/notes.txt").id], base: "archived/\u0000" })
+	).rejects.toMatchObject({ kind: "InvalidName" })
 })
 
 test("compressItems and extractArchive pause, resume and cancel through managedFuture", async () => {
@@ -2773,10 +2768,9 @@ test("extractArchive reads an archive from a public link, called without a singl
 	expect(nameOf(report.topLevel[0].item)).toBe("from-link")
 	await expectExtracted(await state.getDir(report.topLevel[0].item.uuid), source)
 	// a linked archive is not the user's to remove
-	await expectRejectedWith(
-		state.extractArchive({ archive: linked, destination: parent, root: { type: "destination" }, dispose: "trash" }),
-		"InvalidState"
-	)
+	await expect(
+		state.extractArchive({ archive: linked, destination: parent, root: { type: "destination" }, dispose: "trash" })
+	).rejects.toMatchObject({ kind: "InvalidState" })
 })
 
 test("the archive helpers name formats, their levels, what fits and what a name holds", () => {
@@ -2784,8 +2778,9 @@ test("the archive helpers name formats, their levels, what fits and what a name 
 	expect(archiveExtension(zip)).toBe(".zip")
 	expect(archiveExtension({ type: "tar", compression: { codec: "zstd" } })).toBe(".tar.zst")
 	expect(archiveExtension({ type: "single", compression: { codec: "gzip" } })).toBe(".gz")
-	expect(archiveFormatLevels(zip)).toStrictEqual({ min: 1, max: 9 })
-	expect(archiveFormatLevels({ type: "tar", compression: { codec: "zstd" } })).toStrictEqual({ min: 1, max: 1 })
+	expect(archiveFormatLevels(zip)).toStrictEqual({ min: 1, max: 9, defaultLevel: 6 })
+	expect(archiveFormatLevels({ type: "tar", compression: { codec: "zstd" } })).toStrictEqual({ min: 1, max: 1, defaultLevel: 1 })
+	expect(archiveFormatLevels({ type: "sevenZ", method: { type: "ppmd", level: 9 }, solid: false })?.defaultLevel).toBe(5)
 	expect(archiveFormatLevels({ type: "tar" })).toBeUndefined()
 	expect(archiveEncoderMemory({ type: "tar" })).toBe(0n)
 	// a level the format does not take is refused
