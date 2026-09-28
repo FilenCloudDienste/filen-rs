@@ -35,9 +35,22 @@ directory (`git log -- filen-sdk-rs/vendor/ruzstd`):
 Besides `src/`: `Cargo.toml` is the published (normalized) one, less the dev-dependencies,
 benches and examples of the crate's own test suite, which a dependency never builds; those
 tests' fixtures, the benches, the examples, `Cargo.toml.orig`, `Cargo.lock` and
-`.cargo_vcs_info.json` are left out. `rustfmt.toml` (keeping upstream's default formatting) and
-this file are ours. The patch's tests live in the SDK (`fs/archive/decode/tests.rs`).
+`.cargo_vcs_info.json` are left out. `src/tests` is that suite as published, kept so `src/`
+stays the crate's less the patch; without its fixtures and dev-dependencies it does not build,
+and nothing builds it (it is `#[cfg(test)]`, and only the SDK's own tests run). `rustfmt.toml`
+(keeping upstream's default formatting) and this file are ours. The patch's tests live in the
+SDK (`fs/archive/decode/tests.rs`).
+
+## Building elsewhere
+
+`[patch.crates-io]` applies only in the workspace whose root `Cargo.toml` holds it: a workspace
+that depends on `filen-sdk-rs` from outside this one has to repeat the entry, pointing at this
+directory. Without it the SDK does not build: `fs/archive/decode/zstd.rs` names the error the
+patch adds (`DecompressBlockError::DecompressedSizeTooLarge`) in a constant for that purpose,
+so an unpatched ruzstd fails the build rather than decode unbounded blocks.
 
 ## Leaving
 
-Drop this directory and the `[patch.crates-io]` entry once a ruzstd release bounds block sizes.
+Drop this directory and the `[patch.crates-io]` entry once a ruzstd release bounds block sizes,
+and with them the build guard in `fs/archive/decode/zstd.rs`, or make it name what that release
+reports for a block past 128 KiB.
