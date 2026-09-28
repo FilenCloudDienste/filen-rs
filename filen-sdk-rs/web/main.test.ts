@@ -2615,6 +2615,115 @@ test("extractArchiveEntries extracts the entries chosen below a base, one again 
 	).rejects.toMatchObject({ kind: "InvalidName" })
 })
 
+/// A USTAR tar of `members`, in order: a file holding `data`, or a hard link naming an earlier
+/// member at `linkTo`.
+function ustarOf(members: ({ path: string; data: Uint8Array } | { path: string; linkTo: string })[]) {
+	const encoder = new TextEncoder()
+	const blocks: Uint8Array[] = []
+	for (const member of members) {
+		const data = "data" in member ? member.data : new Uint8Array(0)
+		const header = new Uint8Array(512)
+		const put = (at: number, text: string) => header.set(encoder.encode(text), at)
+		put(0, member.path)
+		put(100, "0000644\0")
+		put(108, "0000000\0")
+		put(116, "0000000\0")
+		put(124, `${data.length.toString(8).padStart(11, "0")}\0`)
+		put(136, "00000000000\0")
+		// the checksum is taken with its own field as spaces
+		put(148, "        ")
+		put(156, "data" in member ? "0" : "1")
+		if ("linkTo" in member) {
+			put(157, member.linkTo)
+		}
+		put(257, "ustar\0")
+		put(263, "00")
+		const checksum = header.reduce((sum, byte) => sum + byte, 0)
+		put(148, `${checksum.toString(8).padStart(6, "0")}\0 `)
+		blocks.push(header)
+		const body = new Uint8Array(Math.ceil(data.length / 512) * 512)
+		body.set(data)
+		blocks.push(body)
+	}
+	// the end-of-archive marker
+	blocks.push(new Uint8Array(1024))
+	const tar = new Uint8Array(blocks.reduce((len, block) => len + block.length, 0))
+	let at = 0
+	for (const block of blocks) {
+		tar.set(block, at)
+		at += block.length
+	}
+	return tar
+}
+
+test("a listing names the entry a tar's hard link copies, which extracting the link takes along", async () => {
+	const parent = await state.createDir(testDir, "archive-hardlink")
+	const alpha = new TextEncoder().encode("alpha")
+	const tar = ustarOf([
+		{ path: "a.txt", data: alpha },
+		{ path: "other.txt", data: new TextEncoder().encode("other") },
+		{ path: "b", linkTo: "a.txt" },
+		{ path: "c", linkTo: "b" }
+	])
+	const archive = await state.uploadFile(tar, { parent, name: "linked.tar" })
+	const { entries } = await state.listArchive({ archive })
+	const entry = (path: string) => entries.find(e => e.path === path)!
+	// each names the entry it copies, a link naming a link
+	expect(entry("b").kind).toStrictEqual({ type: "hardlink", target: "a.txt", targetId: entry("a.txt").id })
+	expect(entry("c").kind).toStrictEqual({ type: "hardlink", target: "b", targetId: entry("b").id })
+
+	// alone, a link has nothing to copy; with the entries its listing names, it is extracted
+	const call = { archive, base: "", root: { type: "destination" } } as const
+	const alone = await state.createDir(parent, "alone")
+	const skipped = await state.extractArchiveEntries({ ...call, entries: [entry("c").id], destination: alone })
+	expect(skipped.error).toBeUndefined()
+	expect(skipped.skipped.map(entry => entry.path)).toStrictEqual(["c"])
+	const chain = await state.createDir(parent, "chain")
+	const extracted = await state.extractArchiveEntries({
+		...call,
+		entries: [entry("c").id, entry("b").id, entry("a.txt").id],
+		destination: chain
+	})
+	expect(extracted.error).toBeUndefined()
+	const { files } = await state.listDir(chain)
+	expect(files.map(nameOf).sort()).toStrictEqual(["a.txt", "b", "c"])
+	for (const file of files) {
+		expect(await state.downloadFile(file)).toStrictEqual(alpha)
+	}
+})
+
+test("a wrong password that shows only once entries are read trashes the folder it created, and says so", async () => {
+	const parent = await state.createDir(testDir, "archive-late-password")
+	const source = await state.createDir(parent, "zeros")
+	// past what is read in full to check the password up front: it shows once the entry is read
+	await state.uploadFile(new Uint8Array(17 * 1024 * 1024), { parent: source, name: "zeros.bin" })
+	const format: CompressFormat = { type: "sevenZ", method: { type: "lzma2", level: 1 }, solid: true, encryption: "entries" }
+	const { archive } = await state.compressItems({ items: [source], destination: parent, name: "late.7z", format }, "right")
+
+	const into = await state.createDir(parent, "into")
+	const created: ExtractedTopLevelItem[] = []
+	const updates: ExtractUpdate[] = []
+	const report = await state.extractArchive(
+		{
+			archive: archive!,
+			destination: into,
+			root: { type: "newFolder" },
+			onTopLevelCreated: items => created.push(...items),
+			onUpdate: update => updates.push(update)
+		},
+		"wrong"
+	)
+	expect(report.error?.kind).toBe("ArchiveWrongPassword")
+	expect(report.counts.filesDone).toBe(0n)
+	// the callback got the new folder, which went to the trash, so a retry starts clean: the
+	// report no longer lists it, and an update tells which it was
+	expect(created.map(item => item.key)).toStrictEqual([{ type: "root" }])
+	expect(report.topLevel).toHaveLength(0)
+	const trashed = updates.flatMap(update => update.events).filter(event => event.type === "topLevelTrashed")
+	expect(trashed.map(event => event.destUuid)).toStrictEqual([created[0].item.uuid])
+	expect(await state.listDir(into)).toMatchObject({ dirs: [], files: [] })
+})
+
 test("compressItems and extractArchive pause, resume and cancel through managedFuture", async () => {
 	const parent = await state.createDir(testDir, "archive-controls")
 	const source = await state.createDir(parent, "big")
