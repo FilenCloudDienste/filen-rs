@@ -399,6 +399,26 @@ impl Observations {
 		);
 	}
 
+	/// Record a push of ours that the cache announced long enough ago to have stood its
+	/// [`CONFIRM_TENURE`] — the state the pass after an upload finds once the cache has caught up,
+	/// which is the pass that confirms it.
+	#[cfg(feature = "bench-internals")]
+	fn bench_stood(&self, uuid: Uuid) {
+		let now = Instant::now();
+		let announced = now
+			.checked_sub(CONFIRM_TENURE * 2)
+			.expect("the monotonic clock has run longer than two confirmation windows");
+		self.state().insert_push(
+			uuid,
+			PushTenure {
+				lineage: None,
+				recorded: announced,
+				announced: Some(announced),
+				superseded: None,
+			},
+		);
+	}
+
 	/// What the announcements say about the push that minted `uuid`.
 	fn push_verdict(&self, uuid: Uuid, now: Instant) -> PushVerdict {
 		let state = self.state();
@@ -1292,6 +1312,10 @@ pub(super) struct BenchPass {
 	/// [`plan::fold_dir_moves`]). A scenario that moves a directory and folds no move measured a
 	/// re-upload of the subtree instead, which is a different pass at a very different price.
 	pub(super) dir_moves: usize,
+	/// Pushes of ours this pass confirmed — the rows whose agreed-content marker it advanced. A
+	/// pass after an upload that confirmed none measured a pass that never wrote to its baseline,
+	/// which is the one write that makes it copy the tree.
+	pub(super) confirmed: usize,
 	pub(super) rows: usize,
 	/// What the pass's own structures computed their size as at its widest point.
 	///
@@ -1393,6 +1417,25 @@ impl SyncEngine {
 		))
 	}
 
+	/// Record every push the pair's baseline holds unconfirmed as one the cache announced long
+	/// enough ago to have stood its tenure, and answer how many that was.
+	///
+	/// The in-memory half of "the pass after an upload": the rows an unconfirmed push leaves are in
+	/// the DB, and what confirms them in a change-scoped pass is the announcement record, which no
+	/// DB carries — so a memory child has to be told again, like [`Self::bench_seed_carry`].
+	pub(super) async fn bench_seed_stood_pushes(&self, pair: PairId) -> Result<usize, Error> {
+		let store = self.pair_store(pair).await?;
+		let baseline = locked(&store)
+			.baseline(pair)
+			.map_err(|e| db_error(e, "loading the benchmark pair's baseline"))?;
+		let mut seeded = 0;
+		for uuid in baseline.unconfirmed().filter_map(|row| row.remote_uuid) {
+			self.observed.bench_stood(uuid);
+			seeded += 1;
+		}
+		Ok(seeded)
+	}
+
 	/// Put a pair's changelist back in the state a freshly registered pair's is in.
 	///
 	/// A memory child opens an engine on a baseline DB that ALREADY holds the pair, and
@@ -1471,6 +1514,7 @@ impl SyncEngine {
 			held: screened.decision.held.len(),
 			conflicts: screened.conflicts.len(),
 			dir_moves: prep.dir_moves.len(),
+			confirmed: prep.confirmed.len(),
 			rows: prep.baseline.len(),
 			structures,
 		};
