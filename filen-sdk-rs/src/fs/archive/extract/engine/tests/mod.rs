@@ -244,6 +244,18 @@ fn finished_paths(setup: &Setup) -> Vec<String> {
 	finished(setup).into_keys().collect()
 }
 
+/// The uuid of the directory the job created as `name`.
+pub(super) fn log_dir(setup: &Setup, name: &str) -> Uuid {
+	setup
+		.backend
+		.log()
+		.created_dirs
+		.iter()
+		.find(|(_, created)| created == name)
+		.map(|(uuid, _)| *uuid)
+		.expect("the directory was created")
+}
+
 fn created_dirs(setup: &Setup) -> Vec<String> {
 	setup
 		.backend
@@ -496,6 +508,23 @@ async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
 			),
 		]
 	);
+	// both go again into the directory as it was created, under the name it got
+	use crate::fs::HasName;
+	let docs = log_dir(&setup, "docs (2)");
+	for failure in &report.failures {
+		let retry = failure.retry.as_ref().expect("a failed entry goes again");
+		let DirType::Dir(dir) = &retry.destination else {
+			panic!("{:?}", retry.destination);
+		};
+		assert_eq!(
+			(dir.uuid(), dir.name(), dir.parent),
+			(docs, Some("docs (2)"), setup.destination.into())
+		);
+		assert_eq!(
+			retry.base.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+			["docs"]
+		);
+	}
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
@@ -676,4 +705,16 @@ async fn chosen_entries_are_extracted_with_the_directories_that_hold_them() {
 		assert_eq!(report.counts.files_done, expected.len() as u64);
 		assert_released(&setup, &job.reporter, &job.recorder);
 	}
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_directory_slot_holds_no_directory() {
+	// an archive may plan as many directories as it holds members: each slot keeps its created
+	// directory's uuid, not the directory, which is built again only for a failure's retry
+	assert!(
+		size_of::<DirSlot>() <= 152,
+		"{} bytes",
+		size_of::<DirSlot>()
+	);
 }

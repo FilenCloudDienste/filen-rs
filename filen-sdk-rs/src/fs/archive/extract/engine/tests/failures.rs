@@ -94,18 +94,6 @@ async fn a_directory_that_fails_takes_its_subtree_and_nothing_else() {
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
-/// The uuid of the directory the job created as `name`.
-fn log_dir(setup: &Setup, name: &str) -> Uuid {
-	setup
-		.backend
-		.log()
-		.created_dirs
-		.iter()
-		.find(|(_, created)| created == name)
-		.map(|(uuid, _)| *uuid)
-		.expect("the directory was created")
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_that_fails_is_recorded_once_and_the_rest_extract() {
 	let tar = tar_of(&[

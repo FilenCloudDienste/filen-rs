@@ -232,6 +232,9 @@ struct Driver<B: DriveBackend> {
 	/// The destination listing could not name every item.
 	unverified: bool,
 	dirs: Vec<DirSlot>,
+	/// The directory entries land in, set up with the root's slot: the destination, or the
+	/// folder the job created in it.
+	root_dir: Option<DirType<'static, Normal>>,
 	/// Directories planned and neither created nor failed.
 	uncreated_dirs: usize,
 	ready_dirs: VecDeque<DirId>,
@@ -359,6 +362,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		into_destination: false,
 		unverified: false,
 		dirs: Vec::new(),
+		root_dir: None,
 		uncreated_dirs: 0,
 		ready_dirs: VecDeque::new(),
 		dir_creates: FuturesUnordered::new(),
