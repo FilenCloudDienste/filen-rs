@@ -644,3 +644,6 @@ impl<B: DriveBackend> Lister<B> {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests;
