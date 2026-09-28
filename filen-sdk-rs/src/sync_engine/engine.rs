@@ -1391,13 +1391,14 @@ impl SyncEngine {
 		);
 	}
 
-	/// Load the pair's baseline into the store the engine keeps it in, and answer how many rows it
-	/// holds and what the tree computes its own size as.
+	/// Open the pair's store and read its baseline the way a pass begins to, and answer how many
+	/// rows it holds and what the baseline computes its own size as.
 	///
 	/// The steady state a memory child reports is an engine holding this pair and NOTHING else, and
 	/// running a pass is not a way to reach it: the figure afterwards would be one that had held a
 	/// whole pass's structures. This offers no way to assemble a pass — it hands back two numbers —
-	/// and what it leaves behind is the resident copy an idle engine sits on between passes.
+	/// and what it leaves behind is what an idle engine sits on between passes: the pair's store
+	/// and one idle reader connection, with nothing of the rows in memory.
 	///
 	/// The terms come back BESIDE the total rather than instead of it: the total is what every
 	/// published figure has always been, and the split is what says which of nine structures to
@@ -3224,10 +3225,10 @@ impl SyncEngine {
 		};
 		let store = self.pair_store(pair).await?;
 		let now = Utc::now().timestamp_millis();
-		// The pair's three reads in ONE hop off the runtime thread. The baseline comes from the
-		// store's resident copy, which costs a `SELECT` over the whole pair the FIRST time anything
-		// asks for it and an `Arc` clone every time after (see [`BaselineStore::baseline`]); the
-		// other two ride along rather than paying for a hop each.
+		// The pair's three reads in ONE hop off the runtime thread. The baseline is a snapshot of the
+		// table — a read transaction on a reader connection and the pair's counts, read nothing else
+		// (see [`BaselineStore::baseline`]); the other two ride along rather than paying for a hop
+		// each.
 		let (baseline, failures, last_ignored) = off_store(&store, move |store| {
 			let baseline = store
 				.baseline(pair)
@@ -5082,6 +5083,14 @@ impl SyncEngine {
 		// is not a reachable subfolder.
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
+		// The plan is made: end the pass's read transaction before the first action commits. The
+		// apply reads only the rows at the paths its actions name, and holding the transaction open
+		// for the rest would pin the WAL through every upload (see `Baseline::freeze`).
+		prep.baseline =
+			mem::take(&mut prep.baseline).freeze(decision.safe.iter().flat_map(|action| {
+				let (from, to) = action.endpoints();
+				[from, to]
+			}));
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,

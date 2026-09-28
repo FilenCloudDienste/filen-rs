@@ -79,6 +79,8 @@ const SCHEMA_VERSION: i64 = 3;
 ///   and `unconfirmed` [`BaselineEntry::awaits_confirmation`]. Each has a partial index, because
 ///   each is a whole-set question a pass asks before it reads either side and whose answer on a
 ///   converged pair is empty: the index is the set, and costs nothing while the set is.
+/// - `baseline_dirs` holds the directory rows alone: a whole pass looks for the source of a
+///   directory move among them, once per move it folds, and they are a few per cent of the rows.
 ///
 /// `baseline` is a `WITHOUT ROWID` table: its rows live IN the primary key's b-tree, in
 /// `(pair_id, rel_path)` order. A pass reads its rows by path — point lookups and ranges of that
@@ -136,6 +138,7 @@ CREATE INDEX IF NOT EXISTS baseline_rule_files ON baseline (pair_id, rel_path)
 	WHERE rule_file = 1;
 CREATE INDEX IF NOT EXISTS baseline_unconfirmed ON baseline (pair_id, rel_path)
 	WHERE unconfirmed = 1;
+CREATE INDEX IF NOT EXISTS baseline_dirs ON baseline (pair_id, rel_path) WHERE kind = 1;
 
 CREATE TABLE IF NOT EXISTS baseline_counts (
 	pair_id INTEGER PRIMARY KEY REFERENCES sync_pairs (id) ON DELETE CASCADE,
@@ -363,7 +366,7 @@ pub(crate) enum NodeKind {
 }
 
 impl NodeKind {
-	fn as_i64(self) -> i64 {
+	pub(super) const fn as_i64(self) -> i64 {
 		match self {
 			Self::Dir => 1,
 			Self::File => 2,
@@ -772,6 +775,15 @@ const READER_CACHE_KIB: i64 = 8 * 1024;
 /// difference for the life of the process.
 const WRITER_CACHE_KIB: i64 = 2 * 1024;
 
+/// What the `-wal` file is cut back to once a checkpoint has emptied it, in bytes.
+///
+/// SQLite never shrinks the file on its own: it rewinds to the start and keeps the size it grew to.
+/// A first sync's one transaction over the whole tree grows it to hundreds of MiB, and without a
+/// limit the file then stays that size for as long as the engine holds a connection open. Twice
+/// what the default autocheckpoint lets it reach (1000 pages of [`PAGE_SIZE`]), so ordinary use is
+/// never truncated and regrown.
+const WAL_SIZE_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+
 /// The connections a pair's passes read on: one per pass in flight, reused across passes so a pass
 /// does not pay a connection open (a schema parse, a fresh statement cache) for its rows.
 pub(crate) struct Readers {
@@ -1139,7 +1151,8 @@ impl BaselineStore {
 		// (see [`SCHEMA`]); every connection that writes rows needs it, and this is the only one.
 		conn.execute_batch(&format!(
 			"PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \
-			 PRAGMA recursive_triggers = ON; PRAGMA cache_size = -{WRITER_CACHE_KIB};"
+			 PRAGMA recursive_triggers = ON; PRAGMA cache_size = -{WRITER_CACHE_KIB}; \
+			 PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES};"
 		))
 		.map_err(open_error)?;
 		let version: i64 = conn
@@ -2061,6 +2074,10 @@ mod tests {
 			assert_eq!(pragma::<String>(store, "journal_mode"), "wal");
 			assert_eq!(pragma::<i64>(store, "synchronous"), 1, "NORMAL is 1");
 			assert_eq!(pragma::<i64>(store, "busy_timeout"), 30_000);
+			assert_eq!(
+				pragma::<i64>(store, "journal_size_limit"),
+				WAL_SIZE_LIMIT_BYTES
+			);
 		};
 		let entry = file_entry("a.txt", [1u8; 32], 3);
 		let pair = {
@@ -2982,6 +2999,70 @@ mod tests {
 		] {
 			assert_eq!(Derived::of(&dir_entry(path)).folded_path, folded, "{owed}");
 		}
+	}
+
+	/// A pass's read transaction ends when its plan is made. Held through the apply, it would pin
+	/// the WAL: no checkpoint reaches past an open reader, so every commit made meanwhile — one per
+	/// applied action, here and on every other pair of the file — would grow the `-wal` file, which
+	/// SQLite never shrinks back while a connection is open. Frozen for its apply, the pass holds no
+	/// transaction, and the same commits leave the file where autocheckpoint keeps it.
+	#[test]
+	fn a_pass_frozen_for_its_apply_leaves_the_wal_to_its_checkpoints() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let seeded: Vec<BaselineEntry> = (0..20_000)
+			.map(|n| file_entry(&format!("d{}/f{n:05}.txt", n % 50), [1; 32], n))
+			.collect();
+		store
+			.apply_changes(
+				pair,
+				&seeded
+					.iter()
+					.map(BaselineChange::Upsert)
+					.collect::<Vec<_>>(),
+			)
+			.unwrap();
+		// The seeding transaction's own frames out of the way, so what follows is the apply's.
+		store
+			.conn
+			.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+			.unwrap();
+		let mut wal = store.readers.path.clone().into_os_string();
+		wal.push("-wal");
+		let wal = PathBuf::from(wal);
+
+		// A pass: its plan reads rows through the snapshot, and its apply commits one action at a
+		// time while it goes on reading the rows the plan named.
+		let pass = store.baseline(pair).unwrap();
+		assert!(pass.get("d0/f00000.txt").is_some());
+		let applying = pass.freeze(["d0/f00000.txt", "new/f00000.txt"]);
+		for n in 0..1_500_u64 {
+			let path = format!("new/f{n:05}.txt");
+			store
+				.record_pending(
+					pair,
+					Uuid::new_v4(),
+					&created(&path),
+					NOW,
+					&[BaselineChange::Upsert(&file_entry(&path, [2; 32], n))],
+				)
+				.unwrap();
+		}
+		// Still the rows the plan was made from, not the ones the pass has since committed.
+		assert!(applying.get("d0/f00000.txt").is_some());
+		assert!(applying.get("new/f00000.txt").is_none());
+		// Autocheckpoint lets the log reach 1000 pages before it copies them back and rewinds.
+		let bound = 2 * 1000 * PAGE_SIZE as u64;
+		let grown = std::fs::metadata(&wal).unwrap().len();
+		assert!(
+			grown <= bound,
+			"1500 commits under a pass's apply grew the WAL to {:.1} MiB, past the {:.1} MiB \
+			 autocheckpoint keeps it to: the pass is holding a read transaction open",
+			grown as f64 / (1024.0 * 1024.0),
+			bound as f64 / (1024.0 * 1024.0),
+		);
 	}
 
 	/// A write that FAILED changed no row, so what a pass reads — the rows, and the counts the
