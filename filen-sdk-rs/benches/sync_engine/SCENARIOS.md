@@ -4,7 +4,8 @@ What each scenario is for, and what its number means.
 
 This document is definitional — it should stay true whatever the numbers do.
 The figures to set beside it live in `BASELINE.md`, which carries the landing
-sweep of the memory round and says which of its older rows are dead.
+sweep of the store round (`run_p`) and its alternated 1M comparison with the
+resident tree (`run_q`).
 
 ## How to read any row
 
@@ -46,7 +47,11 @@ asks whether two medians sit inside each other's in-run range, which at three
 samples most rows do, including rows whose medians are tens of per cent apart. The
 gate is the line above it — a scenario whose whole-pass yardstick moved more than
 ten per cent between the two runs is marked `MACHINE MOVED`, and every percentage
-under it carries the machine as well as the code.
+under it carries the machine as well as the code. The gate is only a gate while the
+WHOLE pass's code is the same on both sides: between two builds that changed the
+whole pass itself (the store round did — a whole pass now reads every row from the
+table), a moved yardstick is the code as much as the machine, and only an
+alternated same-session run can tell the two apart.
 
 `compare`'s header prints both runs' `mark_overhead_ns`: one step mark timed through
 `mark` itself, so it is a second, free reading of how fast the machine was answering
@@ -94,9 +99,12 @@ misquoting these replace came from names that did not:
 - `mem:fresh_process_pass_widest_over_floor_rss` and
   `mem:fresh_process_pass_widest_over_pair_loaded_rss` — that same widest point,
   measured from the two floors worth measuring it from. The first includes
-  opening the engine and reading the tree, neither of which a pass pays again;
+  opening the engine and loading the pair, neither of which a pass pays again;
   the second is what the PASS added on top of an already-loaded pair, and is the
-  figure a per-pass memory target is read off.
+  figure a per-pass memory target is read off. Since the store round, "loading the
+  pair" holds no rows: it opens the store's reader and counts, so this second figure
+  now includes every page and row a pass reads, which the resident tree used to
+  have paid for before the pass began.
 - `mem:fresh_process_peak_rss` — `getrusage`'s high-water mark for the whole
   child. The transients of BUILDING what the pass held sit between this and
   `widest`, which is why the two differ and neither is the other.
@@ -115,23 +123,36 @@ misquoting these replace came from names that did not:
   and `mem:pass_sides_computed_bytes` (view + scan) — what those structures say they
   cost, summed from their own capacities. A COMPUTED figure, never a measured one:
   it can exceed a resident set, because capacity is allocated without necessarily
-  being faulted in. There is deliberately no `baseline + view + scan` total: the
-  baseline term is the pair's own tree, resident before the pass began and the same
-  `Arc` the pair figure reports (a run asserts the two are equal), so a sum
-  including it reads as the pass's own cost while being almost entirely not that.
+  being faulted in. The BASELINE terms (`mem:pair_baseline_term_handle` /
+  `_edits_computed_bytes`) are the snapshot handle — a pooled reader connection,
+  its pair and its counts, 192 bytes — and the pass's own edits over the table:
+  its folded directory moves and confirmed pushes, or the rows frozen for its
+  apply. Between passes the pair is the handle and nothing else, at every size;
+  the store holds no rows in memory. A run asserts that the pass's figure is at
+  least the pair's, and that its edits stay within `EDITS_BASE_BYTES` plus
+  `EDIT_BYTES` per folded move or confirmed push, so a fold that wrote the rows it
+  carries fails the run instead of printing a large widest point. (Before the store
+  round these columns were the resident tree's capacities; the two are not
+  comparable, and the old terms print as ONLY IN BEFORE.)
+- `walk:baseline_read_statements` / `walk:baseline_read_rows` — what the measured
+  pass asked the store for its rows, counted in the snapshot: statements run and
+  rows decoded. Three statements and no rows for an idle pass; about six
+  statements per changed path for a scoped one.
   `pass_view` is zero for every scenario whose remote changelist is empty, which is
   every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
   it was not told about. Zero is an answer, which is why that column is printed in
   kibibytes — in mebibytes 411 B and 0 B both print `0.000`.
 
 `summarize` prints TWO attribution ratios, because one answered neither
-question. `pair_attributed` is what the resident baseline computes itself as
+question. `pair_attributed` is what the pair's baseline computes itself as
 over what LOADING it added (`pair_loaded − floor`); the remainder is the
 engine's fixed cost — SQLite's page cache and mapped pages, the runtime, the
-client. `pass_attributed` is what the pass's two SIDES compute themselves as
+client. Since the store round the baseline is a 192-byte handle, so this ratio
+is ~0 % by design: loading a pair costs the engine's fixed cost and nothing
+that scales. `pass_attributed` is what the pass's two SIDES compute themselves as
 over what the PASS added on top of an already-loaded pair
-(`widest − pair_loaded`); the baseline is not in it, because it was resident
-before the pass began.
+(`widest − pair_loaded`); the baseline's rows are not in it, because the pass
+reads them from the table rather than holding them.
 
 A change-scoped pass's sides are CARRIED — they hold only what the pass
 observed and derive the rest from the baseline rows — so a small
