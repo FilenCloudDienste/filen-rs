@@ -41,8 +41,9 @@ use super::{
 pub(super) enum DirState {
 	Planned,
 	Creating,
-	/// Kept whole, as a failure's retry targets it.
-	Created(DirType<'static, Normal>),
+	/// Its uuid alone: a failure's retry builds the directory from the slot, and the root's is
+	/// kept once in the driver, so an archive's thousands of directories do not each hold one.
+	Created(Uuid),
 	Failed(Arc<Error>),
 }
 
@@ -50,7 +51,7 @@ pub(super) enum DirState {
 pub(super) struct DirSlot {
 	pub(super) uuid: Uuid,
 	parent: DirId,
-	/// The name it is created under.
+	/// The name it is created under, and once it is, the name it got.
 	name: ValidatedName,
 	/// The name the archive gave it, when `name` is a keep-both name instead.
 	archive_name: Option<ValidatedName>,
@@ -64,7 +65,7 @@ pub(super) struct DirSlot {
 impl DirSlot {
 	pub(super) fn created_uuid(&self) -> Option<Uuid> {
 		match &self.state {
-			DirState::Created(dir) => Some(dir.uuid()),
+			DirState::Created(uuid) => Some(*uuid),
 			_ => None,
 		}
 	}
@@ -130,9 +131,10 @@ impl<B: DisposalBackend> Driver<B> {
 			archive_name: None,
 			created: Utc::now(),
 			entry: root_entry,
-			state: DirState::Created(root),
+			state: DirState::Created(root.uuid()),
 			children: Vec::new(),
 		});
+		self.root_dir = Some(root);
 		self.reporter.set_phase(ExtractPhase::Extracting);
 		Ok(())
 	}
@@ -314,8 +316,14 @@ impl<B: DisposalBackend> Driver<B> {
 				}
 				self.reporter
 					.dir_created(created.uuid(), parent, name.as_ref());
+				// the name a retry into it finds it under; the archive's stays where it was
+				let slot = &mut self.dirs[dir];
+				if name != slot.name {
+					let planned = std::mem::replace(&mut slot.name, name);
+					slot.archive_name.get_or_insert(planned);
+				}
 				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
-				self.dirs[dir].state = DirState::Created(DirType::Dir(Cow::Owned(created.clone())));
+				self.dirs[dir].state = DirState::Created(created.uuid());
 				self.uncreated_dirs -= 1;
 				self.ready_dirs
 					.extend(self.dirs[dir].children.iter().copied());
@@ -404,15 +412,31 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Where an entry of `dir` that failed is extracted again: the nearest directory there is,
 	/// `dir` itself unless it failed too. The root always is.
 	pub(super) fn retry(&self, mut dir: DirId) -> ExtractRetry {
-		loop {
-			if let DirState::Created(destination) = &self.dirs[dir].state {
-				return ExtractRetry {
-					destination: destination.clone(),
-					// with the base of a partial extraction: that is where it is in the archive
-					base: self.archive_names(dir),
-				};
-			}
+		while !matches!(self.dirs[dir].state, DirState::Created(_)) {
 			dir = self.dirs[dir].parent;
 		}
+		ExtractRetry {
+			destination: self.created_dir(dir),
+			// with the base of a partial extraction: that is where it is in the archive
+			base: self.archive_names(dir),
+		}
+	}
+
+	/// Created directory `dir`, as the drive holds it: the root as the job has it, any other
+	/// built from its slot, the way the job created it.
+	fn created_dir(&self, dir: DirId) -> DirType<'static, Normal> {
+		if dir == ROOT {
+			return self
+				.root_dir
+				.clone()
+				.expect("the root is set up before any entry is taken");
+		}
+		let slot = &self.dirs[dir];
+		DirType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
+			slot.uuid,
+			RemoteDirectory::make_meta(slot.name.clone(), slot.created),
+			self.dirs[slot.parent].uuid.into(),
+			slot.created,
+		)))
 	}
 }

@@ -10,8 +10,6 @@ pub(crate) mod write;
 
 use std::io;
 
-use super::worker::{JobEnded, SourceFailed};
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SevenZError {
 	#[error("the 7z archive is damaged: {0}")]
@@ -26,12 +24,4 @@ pub(crate) enum SevenZError {
 	WrongPassword,
 	#[error(transparent)]
 	Read(#[from] io::Error),
-}
-
-/// Whether a read ended with the source's own error (a failed fetch, or the job ending) rather
-/// than a decoder's.
-pub(crate) fn from_source(error: &io::Error) -> bool {
-	error
-		.get_ref()
-		.is_some_and(|inner| inner.is::<SourceFailed>() || inner.is::<JobEnded>())
 }

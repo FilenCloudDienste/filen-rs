@@ -10,7 +10,7 @@ use crate::{
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		password::ArchivePassword,
-		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent, WorkerPort},
+		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent, WorkerPort, from_source},
 		zip::{
 			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
 			METHOD_STORED, METHOD_XZ, METHOD_ZSTD,
@@ -227,7 +227,8 @@ pub(super) fn extract_zip(
 			Verdict::Ignore | Verdict::Root => continue,
 			Verdict::Skip(ExtractSkipReason::Symlink { .. }) => {
 				let target =
-					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits);
+					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
+						.map_err(zip_io_failure)?;
 				walk.port
 					.send(found.skipped(ExtractSkipReason::Symlink { target }))
 					.map_err(failure)?;
@@ -293,7 +294,7 @@ fn list_zip(
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 		.map_err(failure)?;
-	let mut targets = zip_symlink_targets(walk.port, source, index, password, limits);
+	let mut targets = zip_symlink_targets(walk.port, source, index, password, limits)?;
 	let mut listed: Vec<(&ZipEntry, bool)> = index
 		.entries
 		.iter()
@@ -438,14 +439,16 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 /// data is stored, so the archive is read front to back once, however its index orders them,
 /// rather than a chunk fetched again for each; and only until reading them has fetched
 /// [`LIST_READ_BYTES`] of the archive or they hold that much: the links past it are listed
-/// with their targets unread. An overlapping entry's data is never read.
+/// with their targets unread, as is one whose data would take the reading past it. An
+/// overlapping entry's data is never read. Fails on the first read the archive's source failed
+/// (a fetch, or the job ending), which no later one would get past.
 fn zip_symlink_targets(
 	port: &WorkerPort,
 	source: &mut SeekInput<'_>,
 	index: &ZipIndex,
 	password: Option<&[u8]>,
 	limits: EntryLimits,
-) -> Vec<(u64, String)> {
+) -> Result<Vec<(u64, String)>, Error> {
 	let first_read = port.shared().input_bytes();
 	let mut held = 0;
 	let mut targets = Vec::new();
@@ -454,41 +457,59 @@ fn zip_symlink_targets(
 		.iter()
 		.filter(|entry| entry.kind == ZipKind::Symlink)
 	{
-		if port.shared().input_bytes() - first_read > LIST_READ_BYTES || held > LIST_READ_BYTES {
+		let fetched = port.shared().input_bytes() - first_read;
+		if fetched > LIST_READ_BYTES || held > LIST_READ_BYTES {
 			break;
 		}
-		let target = zip_symlink_target(source, index.shift, entry, password, limits);
+		// its stated compressed size is what reading it fetches, however short its target
+		if fetched.saturating_add(entry.compressed_size) > LIST_READ_BYTES {
+			continue;
+		}
+		let target = zip_symlink_target(source, index.shift, entry, password, limits)
+			.map_err(zip_io_failure)?;
 		if !target.is_empty() {
 			held += (target.len() + size_of::<(u64, String)>()) as u64;
 			targets.push((entry.ordinal, target));
 		}
 	}
 	targets.sort_unstable_by_key(|(ordinal, _)| *ordinal);
-	targets
+	Ok(targets)
 }
 
-/// A symlink entry's target, for reporting: its data, when small and readable.
+/// Most compressed data a symlink's target is read from: twice the longest path, room for any
+/// method's overhead on a real one. A stream padded out (with empty deflate blocks, say) past it
+/// states a short target in as much of the archive as it likes.
+const MAX_TARGET_COMPRESSED: u64 = 2 * MAX_ARCHIVE_PATH_BYTES as u64;
+
+/// A symlink entry's target, for reporting: its data, when small and readable; empty when not.
+/// Fails only on an error of the archive's source, not of the entry's data.
 fn zip_symlink_target<R: Read + std::io::Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
 	password: Option<&[u8]>,
 	limits: EntryLimits,
-) -> String {
+) -> io::Result<String> {
 	// an encrypted target is left unread: each one would cost a key derivation, and an archive
 	// of nothing but encrypted links would spend minutes on them creating nothing
 	if entry.size > MAX_ARCHIVE_PATH_BYTES as u64
+		|| entry.compressed_size > MAX_TARGET_COMPRESSED
 		|| !zip_supported(entry)
 		|| entry.encryption != ZipEncryption::None
 	{
-		return String::new();
+		return Ok(String::new());
 	}
 	let mut target = Vec::new();
-	match open_entry(source, shift, entry, password, limits)
-		.map(|mut reader| reader.read_to_end(&mut target))
-	{
-		Ok(Ok(_)) => display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
-		_ => String::new(),
+	let read = match open_entry(source, shift, entry, password, limits) {
+		Ok(mut reader) => reader.read_to_end(&mut target),
+		Err(ZipError::Read(error)) => Err(error),
+		Err(_) => return Ok(String::new()),
+	};
+	match read {
+		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
+		Err(error) if from_source(&error) => Err(error),
+		// a damaged link keeps nothing else from being read
+		Err(_) => Ok(String::new()),
 	}
 }
 

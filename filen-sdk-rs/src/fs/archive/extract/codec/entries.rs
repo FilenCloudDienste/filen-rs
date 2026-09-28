@@ -366,9 +366,29 @@ pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
 /// BLAKE3, so a million files cost 8 MB of keys rather than their paths. Two paths of a million
 /// share a key about once in 36 billion archives, and then a link copies another file of the
 /// same archive.
-pub(crate) fn link_key(path: &ArchivePath) -> u64 {
-	let digest = blake3::hash(path.joined().as_bytes());
-	u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
+///
+/// That holds only for paths the archive's author could not pick to collide: 8 bytes of a fixed
+/// hash collide after about 2^32 tries, minutes of work, and would let a crafted tar's link copy
+/// a file other than the one it names, or the listing show one. The hash is keyed with a key
+/// drawn for each job (or listing), which the archive cannot know; one job keeps one key, so a
+/// link and its target always meet.
+pub(crate) struct LinkKeys([u8; blake3::KEY_LEN]);
+
+impl LinkKeys {
+	pub(crate) fn new() -> Self {
+		Self(rand::random())
+	}
+
+	pub(crate) fn of(&self, path: &ArchivePath) -> u64 {
+		let digest = blake3::keyed_hash(&self.0, path.joined().as_bytes());
+		u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
+	}
+}
+
+impl Default for LinkKeys {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 pub(super) fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {

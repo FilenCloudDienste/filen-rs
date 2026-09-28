@@ -100,14 +100,24 @@ fn run_counting(
 /// `archive` through the codec running `job`: what it sent, how it ended, and the bytes of the
 /// archive it counted as read.
 fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
+	run_job_answering(job, |index| {
+		let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
+		let end = (start + CHUNK_SIZE).min(archive.len());
+		Ok(archive[start..end].to_vec())
+	})
+}
+
+/// As [`run_job`], each chunk the codec asks for answered by `answer`.
+fn run_job_answering(
+	job: StreamJob,
+	mut answer: impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
 			WorkerEvent::Ask { index, reply, .. } => {
-				let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
-				let end = (start + CHUNK_SIZE).min(archive.len());
-				let _ = reply.send(Ok(archive[start..end].to_vec()));
+				let _ = reply.send(answer(index));
 			}
 			WorkerEvent::Opened(layout) => seen.push(Seen::Opened(layout)),
 			WorkerEvent::Entry(head) => seen.push(match head.kind {
@@ -1546,10 +1556,9 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 	);
 }
 
-#[test]
-fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
-	// a link in every chunk: reading all their targets would fetch the whole archive
-	let links = usize::try_from(LIST_READ_BYTES).unwrap() / CHUNK_SIZE + 4;
+/// A zip of `links` symlinks to `target`, each followed by a chunk of data: a link in every
+/// chunk.
+fn zip_of_spread_links(links: usize) -> Vec<u8> {
 	let stored = zip8::write::SimpleFileOptions::default()
 		.compression_method(zip8::CompressionMethod::Stored);
 	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -1562,7 +1571,36 @@ fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
 			.write_all(&incompressible(CHUNK_SIZE, link as u64))
 			.unwrap();
 	}
-	let zip = writer.finish().unwrap().into_inner();
+	writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_zip_listing_stops_reading_symlink_targets_at_a_failed_fetch() {
+	let zip = zip_of_spread_links(8);
+	// the index, at the end, is read; every link's chunk before it fails to fetch
+	let index_from = (zip.len() as u64 - 4096) / CHUNK_SIZE_U64;
+	let mut failed = 0;
+	let (_, end, _) = run_job_answering(
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+		|index| {
+			if index < index_from {
+				failed += 1;
+				return Err(std::io::Error::other("offline"));
+			}
+			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
+			Ok(zip[start..(start + CHUNK_SIZE).min(zip.len())].to_vec())
+		},
+	);
+	// the listing ends with the source's error, asking no more of it
+	assert_eq!(kind(end), ErrorKind::IO);
+	assert_eq!(failed, 1);
+}
+
+#[test]
+fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
+	// a link in every chunk: reading all their targets would fetch the whole archive
+	let links = usize::try_from(LIST_READ_BYTES).unwrap() / CHUNK_SIZE + 4;
+	let zip = zip_of_spread_links(links);
 	let (entries, end) = listed(
 		&zip,
 		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
@@ -1580,6 +1618,99 @@ fn a_zip_listing_stops_reading_symlink_targets_past_its_budget() {
 	let unread = read.iter().position(|read| !read).unwrap();
 	assert!(unread > 1, "{read:?}");
 	assert!(read[unread..].iter().all(|read| !read), "{read:?}");
+}
+
+/// A zip of one deflated symlink to `target`, its stream padded with `padding` empty stored
+/// blocks: a few bytes of target stated in as much archive as the padding takes. Built by hand,
+/// as no writer pads a stream.
+fn zip_of_padded_symlink(target: &[u8], padding: usize) -> Vec<u8> {
+	// an empty non-final stored block, then the target in a final one
+	let mut stream = [0u8, 0, 0, 0xff, 0xff].repeat(padding);
+	let len = u16::try_from(target.len()).unwrap();
+	stream.push(1);
+	stream.extend(len.to_le_bytes());
+	stream.extend((!len).to_le_bytes());
+	stream.extend(target);
+	let name = b"link";
+	// version needed, flags, method (deflate), time, date, CRC-32, sizes, name and extra length
+	let common = [
+		&20u16.to_le_bytes()[..],
+		&0u16.to_le_bytes(),
+		&8u16.to_le_bytes(),
+		&0u16.to_le_bytes(),
+		&0x21u16.to_le_bytes(),
+		&crc32fast::hash(target).to_le_bytes(),
+		&u32::try_from(stream.len()).unwrap().to_le_bytes(),
+		&u32::try_from(target.len()).unwrap().to_le_bytes(),
+		&u16::try_from(name.len()).unwrap().to_le_bytes(),
+		&0u16.to_le_bytes(),
+	]
+	.concat();
+	let mut zip = Vec::new();
+	zip.extend(0x0403_4b50u32.to_le_bytes());
+	zip.extend(&common);
+	zip.extend(name);
+	zip.extend(&stream);
+	let mut central = Vec::new();
+	central.extend(0x0201_4b50u32.to_le_bytes());
+	// made by Unix, so the mode in the external attributes counts
+	central.extend(0x0314u16.to_le_bytes());
+	central.extend(&common);
+	// comment length, disk, internal attributes
+	central.extend([0u8; 6]);
+	central.extend((0o120_777u32 << 16).to_le_bytes());
+	// the local header's offset
+	central.extend(0u32.to_le_bytes());
+	central.extend(name);
+	let central_at = u32::try_from(zip.len()).unwrap();
+	zip.extend(&central);
+	zip.extend(0x0605_4b50u32.to_le_bytes());
+	zip.extend([0u8; 4]);
+	zip.extend(1u16.to_le_bytes());
+	zip.extend(1u16.to_le_bytes());
+	zip.extend(u32::try_from(central.len()).unwrap().to_le_bytes());
+	zip.extend(central_at.to_le_bytes());
+	zip.extend([0u8; 2]);
+	zip
+}
+
+#[test]
+fn a_zip_listing_reads_no_padded_symlink_past_its_budget() {
+	// 6 bytes of target in 40 MiB of deflate stream: its stated size is short, and reading it
+	// would fetch the whole archive
+	let zip = zip_of_padded_symlink(b"target", (40 << 20) / 5);
+	let (seen, end, read) = run_job(
+		&zip,
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert!(
+		matches!(
+			&seen[..],
+			[Seen::Opened(_), Seen::Listed(ArchiveEntry { kind: ArchiveEntryKind::Symlink { target }, .. })]
+				if target.is_empty()
+		),
+		"{seen:?}"
+	);
+	// the chunks holding the index, at the archive's end, and at most the listing's budget
+	// besides
+	const INDEX_CHUNKS: usize = 2;
+	let fetched = usize::try_from(read.div_ceil(CHUNK_SIZE_U64)).unwrap();
+	assert!(
+		fetched <= INDEX_CHUNKS + usize::try_from(LIST_READ_BYTES).unwrap() / CHUNK_SIZE,
+		"{fetched} chunks fetched"
+	);
+	// a target of a few bytes in a short stream is still read
+	let zip = zip_of_padded_symlink(b"target", 4);
+	let (entries, end) = listed(
+		&zip,
+		job_of(&zip, "l.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert!(
+		matches!(&entries[..], [ArchiveEntry { kind: ArchiveEntryKind::Symlink { target }, .. }] if target == "target"),
+		"{entries:?}"
+	);
 }
 
 #[test]
@@ -1874,4 +2005,15 @@ fn a_tar_directory_chosen_brings_what_is_stored_after_it() {
 	let (seen, end, _) = run_job(&tar, job_of(&tar, "t.tar", true, chosen(&[1], &[])));
 	end.unwrap();
 	assert_eq!(outline(&seen), ["dir docs", "file docs/late.txt 1"]);
+}
+
+#[test]
+fn hard_links_are_looked_up_by_a_key_each_job_draws() {
+	let path = entry_path("docs/a.txt").unwrap();
+	let keys = LinkKeys::new();
+	// within one job a link and the file it names meet
+	assert_eq!(keys.of(&path), keys.of(&entry_path("docs/a.txt").unwrap()));
+	assert_ne!(keys.of(&path), keys.of(&entry_path("docs/b.txt").unwrap()));
+	// across jobs the same path hashes apart: no archive can pick paths that collide
+	assert_ne!(keys.of(&path), LinkKeys::new().of(&path));
 }
