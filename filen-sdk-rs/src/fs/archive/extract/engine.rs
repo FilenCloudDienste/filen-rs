@@ -431,10 +431,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 	// ended before anything was extracted: the archive to remove is kept
 	let fail = |mut report: ExtractReport, phase, error| {
 		if disposal_requested {
-			let cancelled = phase == ExtractPhase::Cancelled;
-			for disposition in kept_on_early_end(&[archive_uuid], cancelled) {
-				report_disposition(&reporter, &mut report, disposition);
-			}
+			report_kept_on_early_end(&reporter, &mut report, archive_uuid, phase);
 		}
 		reporter.finish(phase);
 		ExtractFailed {
@@ -535,6 +532,18 @@ fn report_disposition(
 	report.dispositions.push(disposition);
 }
 
+/// Records and tells that the archive to remove is kept by a job that ended early, in `phase`.
+fn report_kept_on_early_end(
+	reporter: &Reporter,
+	report: &mut ExtractReport,
+	archive: Uuid,
+	phase: ExtractPhase,
+) {
+	for disposition in kept_on_early_end(&[archive], phase == ExtractPhase::Cancelled) {
+		report_disposition(reporter, report, disposition);
+	}
+}
+
 /// Records `failure` in `report`; the event's copy of it, while the report keeps records.
 fn record_failure(report: &mut ExtractReport, failure: ExtractFailure) -> Option<ExtractFailure> {
 	keep(
@@ -603,25 +612,21 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 		// the archive to remove was not touched: say so, rather than leave its disposition out
 		if self.disposal_requested && self.report.dispositions.is_empty() {
-			let dispositions = if result.is_ok() {
+			let archive = self.archive.uuid();
+			if result.is_ok() {
 				// only an archive in the trash is not removed after a complete extraction
 				let reason = if self.complete(self.reporter.counts()) {
 					KeptReason::Changed
 				} else {
 					KeptReason::Incomplete
 				};
-				vec![SourceDisposition {
-					uuid: self.archive.uuid(),
-					outcome: DisposalOutcome::Kept {
-						reason,
-						bytes_freed: 0,
-					},
-				}]
-			} else {
-				kept_on_early_end(&[self.archive.uuid()], phase == ExtractPhase::Cancelled)
-			};
-			for disposition in dispositions {
+				let disposition = SourceDisposition {
+					uuid: archive,
+					outcome: DisposalOutcome::kept(reason),
+				};
 				report_disposition(&self.reporter, &mut self.report, disposition);
+			} else {
+				report_kept_on_early_end(&self.reporter, &mut self.report, archive, phase);
 			}
 		}
 		if result.is_err() {
@@ -2047,10 +2052,7 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Removes the archive if the extraction is verified; what became of it.
 	async fn dispose_archive(&mut self, how: SourceDisposal, parent: Uuid) -> DisposalOutcome {
-		let kept = |reason| DisposalOutcome::Kept {
-			reason,
-			bytes_freed: 0,
-		};
+		let kept = DisposalOutcome::kept;
 		let counts = self.reporter.counts();
 		if !self.complete(counts) {
 			return kept(KeptReason::Incomplete);

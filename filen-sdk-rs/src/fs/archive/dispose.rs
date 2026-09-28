@@ -297,20 +297,23 @@ pub(crate) fn kept_on_early_end(sources: &[Uuid], cancelled: bool) -> Vec<Source
 		.iter()
 		.map(|&uuid| SourceDisposition {
 			uuid,
-			outcome: kept(reason.clone()),
+			outcome: DisposalOutcome::kept(reason.clone()),
 		})
 		.collect()
 }
 
-fn kept(reason: KeptReason) -> DisposalOutcome {
-	DisposalOutcome::Kept {
-		reason,
-		bytes_freed: 0,
+impl DisposalOutcome {
+	/// Kept for `reason`, before anything of it was deleted.
+	pub(crate) fn kept(reason: KeptReason) -> Self {
+		Self::Kept {
+			reason,
+			bytes_freed: 0,
+		}
 	}
 }
 
 fn failed(error: Error) -> DisposalOutcome {
-	kept(KeptReason::Failed {
+	DisposalOutcome::kept(KeptReason::Failed {
 		error: Arc::new(error),
 	})
 }
@@ -327,10 +330,10 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	let state = match control.until_stopping(backend.file_state(file.uuid)).await {
 		Ok(Ok(state)) => state,
 		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return kept(KeptReason::Interrupted),
+		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 	};
 	if !file.matches(&state) {
-		return kept(KeptReason::Changed);
+		return DisposalOutcome::kept(KeptReason::Changed);
 	}
 	if how == SourceDisposal::DeletePermanently {
 		match control
@@ -338,13 +341,13 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 			.await
 		{
 			Ok(Ok(false)) => {}
-			Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+			Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
 			Ok(Err(error)) => return failed(error),
-			Err(Stopped) => return kept(KeptReason::Interrupted),
+			Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 		}
 	}
 	if control.is_stopping() {
-		return kept(KeptReason::Interrupted);
+		return DisposalOutcome::kept(KeptReason::Interrupted);
 	}
 	let removed = match how {
 		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
@@ -375,9 +378,9 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 ) -> DisposalOutcome {
 	match control.until_stopping(backend.list_tree(dir)).await {
 		Ok(Ok(listed)) if listed == *read => {}
-		Ok(Ok(_)) => return kept(KeptReason::Changed),
+		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),
 		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return kept(KeptReason::Interrupted),
+		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 	}
 	let mut bytes_freed = 0;
 	// once files are deleted, whatever stops the removal leaves them deleted: every outcome says
@@ -395,9 +398,9 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 				.await
 			{
 				Ok(Ok(false)) => {}
-				Ok(Ok(true)) => return kept(KeptReason::HasVersions),
+				Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
 				Ok(Err(error)) => return failed(error),
-				Err(Stopped) => return kept(KeptReason::Interrupted),
+				Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
 			}
 		}
 		for (&uuid, &size) in &read.files {

@@ -876,10 +876,7 @@ impl<B: DisposalBackend> Driver<B> {
 			// the files the folder's permanent removal deleted, even when it stopped part way
 			let mut deleted = BTreeSet::new();
 			let outcome = match (held_back, target) {
-				(Some(reason), _) => DisposalOutcome::Kept {
-					reason,
-					bytes_freed: 0,
-				},
+				(Some(reason), _) => DisposalOutcome::kept(reason),
 				(None, DisposalTarget::File(file)) => {
 					dispose_file(&*self.backend, file, how, &self.control).await
 				}
@@ -894,10 +891,9 @@ impl<B: DisposalBackend> Driver<B> {
 					)
 					.await
 				}
-				(None, DisposalTarget::Unavailable { .. }) => DisposalOutcome::Kept {
-					reason: KeptReason::Changed,
-					bytes_freed: 0,
-				},
+				(None, DisposalTarget::Unavailable { .. }) => {
+					DisposalOutcome::kept(KeptReason::Changed)
+				}
 			};
 			// the source and those that go with it are told of as soon as its outcome is final
 			let told: Vec<usize> = (0..uuids.len())
@@ -920,10 +916,7 @@ impl<B: DisposalBackend> Driver<B> {
 							bytes_freed: 0,
 						}
 					}
-					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::Kept {
-						reason: reason.clone(),
-						bytes_freed: 0,
-					},
+					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::kept(reason.clone()),
 				};
 				dispositions[nested] = Some(SourceDisposition {
 					uuid: uuids[nested],
