@@ -1168,8 +1168,9 @@ pub const SCENARIOS: &[Scenario] = &[
 		ExpectRead::Scoped,
 		PER_CHANGED,
 	),
-	// The two passes that write to their own copy of the baseline — a folded directory move and a
-	// confirmed push — at the size where a copy of the tree is the pass's widest point.
+	// The two passes that edit their own view of the baseline — a folded directory move and a
+	// confirmed push — at the size where a copy of the tree was the pass's widest point, before
+	// those edits moved beside the tree instead of into a copy of it.
 	balanced(
 		"twoway_dir_move_1m",
 		1_000_000,
@@ -2537,25 +2538,17 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	// copying it would be the finding, and it would otherwise surface only as two columns that
 	// happened to disagree.
 	//
-	// Except when the pass FOLDS a directory move. `Prepared::fold_dir_moves` takes
-	// `&mut self.baseline` and re-keys the moved subtree to the paths it ends up at, so that
-	// pass's tree is a different object from the store's by construction — and a different SIZE,
-	// since every re-keyed name grows by the move's prefix. Asserting through that case would be
-	// asserting something untrue; asserting nowhere would drop the guard for the twenty-nine
-	// scenarios of the default set where it does hold.
-	//
-	// And except when the pass CONFIRMS a push: advancing an agreed-content marker writes to the
-	// pass's copy as well, so that copy is a different object too — and a clone sizes its buffers
-	// to what they hold rather than to the capacity the store's grew to.
-	if plan.dir_moves == 0 && plan.confirmed == 0 {
-		assert_eq!(
-			structures.0, pair_baseline_computed_bytes as u64,
-			"the pass's baseline computes itself as {} byte(s) where the loaded pair's computes \
-			 {} and this pass folded no directory move — the pass is not reading the baseline the \
-			 store holds",
-			structures.0, pair_baseline_computed_bytes,
-		);
-	}
+	// That includes a pass that FOLDS a directory move or CONFIRMS a push. Both edit the pass's
+	// view, and those edits live beside the shared tree rather than in a copy of it — a copy
+	// would size its buffers to what they hold rather than to the capacity the store's grew to,
+	// and fail this.
+	assert_eq!(
+		structures.0, pair_baseline_computed_bytes as u64,
+		"the pass's baseline computes itself as {} byte(s) where the loaded pair's computes {} \
+		 ({} directory move(s) folded, {} push(es) confirmed) — the pass is not reading the \
+		 baseline the store holds",
+		structures.0, pair_baseline_computed_bytes, plan.dir_moves, plan.confirmed,
+	);
 	drop(bed);
 	// A high-water mark cannot sit BELOW a sample of the same process's resident set. Zero is what
 	// `peak_rss_bytes` answers where it cannot ask — `getrusage` failing, or a target that has none
