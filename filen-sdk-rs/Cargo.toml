@@ -225,8 +225,9 @@ walkdir = "2.5.0"
 # the SDK checks PPMd's properties against the crate's bounds before building its decoder.
 # lzma-rust2's `optimization` feature (on below, for speed) adds 14 sites: two in its range
 # decoder (inline assembly reading direct bits), which reads archive data, and the rest in its
-# encoder's match finders, which see only the user's own files. Always on natively; on wasm only with `wasm-full`, so the service-worker
-# build (where fs::archive doesn't exist) never compiles them.
+# encoder's match finders, which see only the user's own files. Always on natively; on wasm
+# only with `wasm-full`, so the service-worker build (where fs::archive doesn't exist) never
+# compiles them.
 tar = { version = "0.4.46", default-features = false }
 flate2 = { version = "1.1", default-features = false, features = [
 	"rust_backend",

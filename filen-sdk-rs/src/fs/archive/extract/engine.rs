@@ -1,6 +1,8 @@
-//! Runs an extraction of a streaming archive: the async driver of the codec worker. It fetches
-//! the archive for the codec, creates the directories and uploads the files the codec reads out
-//! of it, in archive order, and registers each file once its data is up.
+//! Runs an extraction of an archive of any format (a tar, compressed or not, a single compressed
+//! file, a zip or a 7z): the async driver of the codec worker. It feeds the codec the archive,
+//! creates the directories and uploads the files the codec reads out of it, in the order the
+//! codec reads them, copies a tar's hard links from the files they name, and registers each file
+//! once its data is up.
 //!
 //! # Memory and progress
 //!

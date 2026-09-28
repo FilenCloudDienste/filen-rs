@@ -44,8 +44,8 @@ pub use report::{
 pub enum ExtractRoot {
 	/// In a new folder in the destination, called `name`, or by default the name
 	/// [`archive_default_name`] makes of the archive's (`photos.tar.gz` → `photos`). A name the
-	/// destination holds gets the next keep-both name. A single compressed file ignores this and is always
-	/// written straight into the destination.
+	/// destination holds gets the next keep-both name. A single compressed file ignores this and
+	/// is always written straight into the destination.
 	NewFolder { name: Option<ValidatedName> },
 	/// Straight into the destination; entries whose names it holds get keep-both names.
 	Destination,
