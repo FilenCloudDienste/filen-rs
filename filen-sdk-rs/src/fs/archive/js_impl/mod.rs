@@ -8,7 +8,13 @@
 //! A password is always an argument of its own, never a field of a record: uniffi prints a
 //! record's fields in the foreign `toString`, and a record could end up serialized.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{
+	borrow::Cow,
+	sync::{
+		Arc,
+		atomic::{AtomicU64, AtomicUsize, Ordering},
+	},
+};
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -45,7 +51,7 @@ use super::{
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
 		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
-		OmittedRecords, PasswordCheck,
+		MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -291,6 +297,10 @@ pub struct ListUpdate {
 	pub archive_bytes: u64,
 	/// Entries listed so far.
 	pub entries: u64,
+	/// Entries the entries callback did not receive, since it had not returned from the earlier
+	/// ones yet while 16 MiB of their text waited for it; they are counted in `entries` all the
+	/// same, and a listing of an archive this large is best shown from its own `entries`.
+	pub undelivered_entries: u64,
 	pub bytes_per_second: Option<u64>,
 	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
 	/// cancelled job winds down; 0 on the final update, whether the job completed, was cancelled
@@ -313,6 +323,8 @@ pub struct ArchiveListing {
 	pub entries: Vec<ArchiveEntry>,
 	/// Entries the callback received that `entries` leaves out.
 	pub omitted_entries: u64,
+	/// Entries the callback did not receive (see the update's `undeliveredEntries`).
+	pub undelivered_entries: u64,
 	pub totals: ListTotals,
 	/// Bytes of the archive that belong to no entry (see the extract report's).
 	pub unaccounted_bytes: u64,
@@ -549,6 +561,7 @@ impl From<extract::ListUpdate> for ListUpdate {
 			bytes_read: update.bytes_read,
 			archive_bytes: update.archive_bytes,
 			entries: update.entries,
+			undelivered_entries: 0,
 			bytes_per_second: update.bytes_per_second,
 			eta_ms: update.eta.map(millis),
 			active_time_ms: millis(update.active_time),
@@ -563,6 +576,7 @@ impl From<extract::ArchiveListing> for ArchiveListing {
 			password: listing.password,
 			entries: listing.entries,
 			omitted_entries: listing.omitted_entries,
+			undelivered_entries: 0,
 			totals: listing.totals,
 			unaccounted_bytes: listing.unaccounted_bytes,
 			duplicates: listing.duplicates,
@@ -804,23 +818,81 @@ async fn extract_job(
 	})
 }
 
+/// Text of listed entries (paths, targets, methods) handed to the delivery task and not yet
+/// taken by the app, past which a listing's later batches are dropped, and counted, rather than
+/// queued: the SDK hands over every entry as it reads it, and an app slower than the reading
+/// would otherwise buffer a million entries' paths. As much as a listing keeps.
+const MAX_UNDELIVERED_ENTRY_BYTES: usize = MAX_LISTED_BYTES;
+
 /// A listing's callback, converted for the bindings.
 enum ListDelivery {
-	Entries(Vec<ArchiveEntry>),
+	/// Entries, held against [`MAX_UNDELIVERED_ENTRY_BYTES`] until delivered.
+	Entries(Vec<ArchiveEntry>, QueuedEntries),
 	Update(ListUpdate),
 }
 
+/// The text of a batch of entries on its way to the app, given back once it is delivered (or
+/// dropped undelivered).
+struct QueuedEntries {
+	bytes: usize,
+	queued: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedEntries {
+	fn drop(&mut self) {
+		self.queued.fetch_sub(self.bytes, Ordering::Relaxed);
+	}
+}
+
 /// Passes a listing's callbacks to the binding's delivery task over one channel, which keeps
-/// their order.
-struct ListChannel(UnboundedSender<ListDelivery>);
+/// their order, holding no more entries than [`MAX_UNDELIVERED_ENTRY_BYTES`] allows.
+struct ListChannel {
+	sender: UnboundedSender<ListDelivery>,
+	/// The text of the entries sent and not yet delivered.
+	queued: Arc<AtomicUsize>,
+	/// Entries dropped since the app had not taken the earlier ones yet.
+	undelivered: Arc<AtomicU64>,
+}
+
+impl ListChannel {
+	fn new(sender: UnboundedSender<ListDelivery>) -> Self {
+		Self {
+			sender,
+			queued: Arc::default(),
+			undelivered: Arc::default(),
+		}
+	}
+}
 
 impl ListCallback for ListChannel {
 	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
-		let _ = self.0.send(ListDelivery::Entries(entries));
+		let bytes = entries.iter().map(ArchiveEntry::text_bytes).sum();
+		// a batch always fits an empty queue, however large
+		let reserved = self
+			.queued
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+				(queued == 0 || queued + bytes <= MAX_UNDELIVERED_ENTRY_BYTES)
+					.then_some(queued + bytes)
+			})
+			.is_ok();
+		if !reserved {
+			self.undelivered
+				.fetch_add(entries.len() as u64, Ordering::Relaxed);
+			return;
+		}
+		let queued = QueuedEntries {
+			bytes,
+			queued: Arc::clone(&self.queued),
+		};
+		let _ = self.sender.send(ListDelivery::Entries(entries, queued));
 	}
 
 	fn on_update(&self, update: extract::ListUpdate) {
-		let _ = self.0.send(ListDelivery::Update(update.into()));
+		let update = ListUpdate {
+			undelivered_entries: self.undelivered.load(Ordering::Relaxed),
+			..update.into()
+		};
+		let _ = self.sender.send(ListDelivery::Update(update));
 	}
 }
 
@@ -832,13 +904,16 @@ async fn list_job(
 	sender: UnboundedSender<ListDelivery>,
 	control: JobControl,
 ) -> Result<ArchiveListing, Error> {
-	let result = client
-		.list_archive(archive, config, ListChannel(sender), control)
-		.await;
+	let channel = ListChannel::new(sender);
+	let undelivered = Arc::clone(&channel.undelivered);
+	let result = client.list_archive(archive, config, channel, control).await;
 	// a listing that ended early still resolves, with the entries it read
-	Ok(match result {
-		Ok(listing) => listing.into(),
-		Err(failed) => failed.into(),
+	Ok(ArchiveListing {
+		undelivered_entries: undelivered.load(Ordering::Relaxed),
+		..match result {
+			Ok(listing) => listing.into(),
+			Err(failed) => failed.into(),
+		}
 	})
 }
 

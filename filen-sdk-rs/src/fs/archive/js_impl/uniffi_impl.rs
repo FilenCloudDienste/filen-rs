@@ -29,7 +29,8 @@ pub trait ExtractArchiveCallback: Send + Sync {
 #[uniffi::export(with_foreign)]
 pub trait ListArchiveCallback: Send + Sync {
 	/// Entries, in batches as they are read, each batch before the update that counts it:
-	/// every one of them, also past what the listing keeps.
+	/// every one of them, also past what the listing keeps, unless this is still busy with 16
+	/// MiB of earlier ones (see `ListUpdate.undelivered_entries`).
 	fn on_entries(&self, entries: Vec<ArchiveEntry>);
 	fn on_update(&self, update: ListUpdate);
 }
@@ -129,7 +130,8 @@ pub(super) fn deliver_extract(callback: &dyn ExtractArchiveCallback, delivery: E
 
 pub(super) fn deliver_list(callback: &dyn ListArchiveCallback, delivery: ListDelivery) {
 	match delivery {
-		ListDelivery::Entries(entries) => callback.on_entries(entries),
+		// the batch's text counts as queued until the callback has returned
+		ListDelivery::Entries(entries, _queued) => callback.on_entries(entries),
 		ListDelivery::Update(update) => callback.on_update(update),
 	}
 }

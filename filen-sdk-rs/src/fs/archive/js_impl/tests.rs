@@ -781,7 +781,7 @@ fn list_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 	delivered_in_order(
 		|recorder, delivery| deliver_list(recorder, delivery),
 		|sender| {
-			let channel = ListChannel(sender);
+			let channel = ListChannel::new(sender);
 			let mut sent = Vec::new();
 			for i in 0..300 {
 				match i % 2 {
@@ -793,4 +793,41 @@ fn list_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 			sent
 		},
 	);
+}
+
+#[test]
+fn a_listing_holds_no_more_entries_than_its_limit_for_an_app_that_lags() {
+	let (sender, mut delivery) = tokio::sync::mpsc::unbounded_channel();
+	let channel = ListChannel::new(sender);
+	// entries of 1 MiB of text each: a lagging app gets as many as fit, and the rest are counted
+	let big = |index| ArchiveEntry {
+		stored_path: "a".repeat(1 << 20),
+		..archive_entry(index)
+	};
+	let sent = 3 * MAX_UNDELIVERED_ENTRY_BYTES / (1 << 20);
+	for index in 0..sent {
+		channel.on_entries(vec![big(index as u32)]);
+	}
+	channel.on_update(list_update(1));
+	let queued = channel.queued.load(Ordering::Relaxed);
+	assert!(queued <= MAX_UNDELIVERED_ENTRY_BYTES, "{queued}");
+	let mut delivered = Vec::new();
+	let mut undelivered = None;
+	while let Ok(item) = delivery.try_recv() {
+		match item {
+			ListDelivery::Entries(entries, _) => {
+				delivered.extend(entries.iter().map(|e| e.id.index))
+			}
+			ListDelivery::Update(update) => undelivered = Some(update.undelivered_entries),
+		}
+	}
+	// the first ones, in order, and the update counts the rest
+	let kept = delivered.len();
+	assert!(kept > 0 && kept < sent, "{kept} of {sent}");
+	assert_eq!(delivered, (0..kept as u32).collect::<Vec<_>>());
+	assert_eq!(undelivered, Some((sent - kept) as u64));
+	// delivered, the entries no longer count, and the next batch goes through
+	assert_eq!(channel.queued.load(Ordering::Relaxed), 0);
+	channel.on_entries(vec![big(0)]);
+	assert!(matches!(delivery.try_recv(), Ok(ListDelivery::Entries(..))));
 }

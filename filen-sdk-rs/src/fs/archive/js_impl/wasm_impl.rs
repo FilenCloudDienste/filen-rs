@@ -125,7 +125,8 @@ pub struct ListArchiveParams {
 	#[tsify(optional)]
 	pub skip_mac_metadata: Option<bool>,
 	/// Entries, in batches as they are read, each batch before the update that counts it:
-	/// every one of them, also past what the listing keeps.
+	/// every one of them, also past what the listing keeps, unless this is still busy with 16
+	/// MiB of earlier ones (see `ListUpdate.undeliveredEntries`).
 	#[tsify(type = "(entries: ArchiveEntry[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_entries: Option<js_sys::Function>,
@@ -195,7 +196,10 @@ struct ListCallbacks {
 impl ListCallbacks {
 	fn deliver(&self, delivery: ListDelivery) {
 		match delivery {
-			ListDelivery::Entries(entries) => call_callback(self.on_entries.as_ref(), &entries),
+			// the batch's text counts as queued until the callback has returned
+			ListDelivery::Entries(entries, _queued) => {
+				call_callback(self.on_entries.as_ref(), &entries)
+			}
 			ListDelivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
 		}
 	}

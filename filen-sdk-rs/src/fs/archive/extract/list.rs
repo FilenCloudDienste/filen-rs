@@ -397,7 +397,7 @@ pub(crate) fn add_entry(
 
 impl ArchiveEntry {
 	/// The bytes of text it holds.
-	fn text_bytes(&self) -> usize {
+	pub(crate) fn text_bytes(&self) -> usize {
 		let target = match &self.kind {
 			ArchiveEntryKind::Symlink { target } | ArchiveEntryKind::Hardlink { target } => {
 				target.len()
