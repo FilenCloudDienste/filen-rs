@@ -10,6 +10,9 @@ use std::{
 	time::{Duration, Instant},
 };
 
+// the crate, which the codec's own `tar` would shadow through `super::*`
+use ::tar;
+use chrono::DateTime;
 use filen_types::fs::Uuid;
 
 use super::*;

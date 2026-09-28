@@ -4,12 +4,11 @@
 //! entry is instead of its data.
 
 mod entries;
+mod tar;
 
 use std::io::{self, Cursor, Read, Seek};
 
-use chrono::DateTime;
-
-use crate::{Error, ErrorKind, util::SeededMap};
+use crate::{Error, ErrorKind};
 
 use super::{
 	super::{
@@ -30,10 +29,10 @@ use super::{
 				wrong_key,
 			},
 		},
-		tar_iter::{MemberKind, TAR_BLOCK, TarError, TarReader},
+		tar_iter::TAR_BLOCK,
 		worker::{
-			ChunkInput, EntryHead, EntryKind, JobEnded, LinkHead, SeekInput, SkippedMember,
-			SourceFailed, WorkerEvent, WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SourceFailed, WorkerEvent,
+			WorkerPort, read_full, send_file_data,
 		},
 		zip::{
 			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
@@ -50,8 +49,9 @@ use super::{
 	list::{ArchiveEntryKind, PasswordCheck},
 	storage_exceeded,
 };
-use entries::{Found, MacShape, Verdict, Walk, apple_double};
+use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{Selection, Task, link_key};
+use tar::walk_tar;
 
 /// What the codec may spend on an archive.
 #[derive(Debug, Clone, Copy)]
@@ -1170,191 +1170,6 @@ fn zip_io_failure(error: io::Error) -> Error {
 	failure(error)
 }
 
-/// What [`walk_tar`] leaves.
-struct Walked<R> {
-	/// What follows the end-of-archive marker.
-	rest: R,
-	/// Bytes stored under directory members, which nothing extracts.
-	unread: u64,
-	/// Files sent.
-	files: u64,
-}
-
-/// Sends every member of the tar in `reader`, or what each is when listing.
-fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Walked<R>, Error> {
-	let mut tar = TarReader::new(reader, max_members);
-	let mut ordinal = 0;
-	let mut unread = 0u64;
-	let mut files = 0u64;
-	// what a listing resolves hard links against: the files it says are extracted (hard links
-	// resolved included, which later links may name), by path, with their sizes and ordinals. An
-	// extraction's driver resolves them against the files it created
-	let mut listed_files = SeededMap::<u64, (u64, u64)>::default();
-	while let Some(member) = tar.next_member().map_err(tar_failure)? {
-		let this = ordinal;
-		ordinal += 1;
-		let (kind, unreadable) = match &member.kind {
-			MemberKind::File => (ArchiveEntryKind::File, None),
-			// a hard link with data of its own holds the file, as for libarchive
-			MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
-			MemberKind::Dir => {
-				unread = unread.saturating_add(member.size);
-				(ArchiveEntryKind::Dir, None)
-			}
-			MemberKind::Symlink { target } => {
-				let target = display_path(target).0.to_owned();
-				(
-					ArchiveEntryKind::Symlink {
-						target: target.clone(),
-					},
-					Some(ExtractSkipReason::Symlink { target }),
-				)
-			}
-			MemberKind::Hardlink { target } => (
-				ArchiveEntryKind::Hardlink {
-					target: display_path(target).0.to_owned(),
-					target_id: None,
-				},
-				None,
-			),
-			MemberKind::Device | MemberKind::Fifo => {
-				(ArchiveEntryKind::Device, Some(ExtractSkipReason::Device))
-			}
-			MemberKind::Sparse => (ArchiveEntryKind::File, Some(ExtractSkipReason::Sparse)),
-			MemberKind::Unsupported(_) => (
-				ArchiveEntryKind::Other,
-				Some(ExtractSkipReason::UnsupportedType),
-			),
-		};
-		let mut found = Found {
-			ordinal: this,
-			stored: &member.path,
-			path: entry_path(&member.path).map(|mut path| {
-				path.rewritten |= member.path_rewritten;
-				path
-			}),
-			kind,
-			unreadable,
-			size: member.size,
-			modified: member
-				.modified
-				.and_then(|time| DateTime::from_timestamp(time.secs, time.nanos)),
-			encrypted: false,
-			method: None,
-		};
-		// a hard link names an earlier file, the same whatever else it is stored with
-		let link_target = match (&member.kind, &found.kind) {
-			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown, .. }) => {
-				Some((entry_path(target), shown.clone()))
-			}
-			_ => None,
-		};
-		if walk.listing() {
-			if let Some((target, shown)) = link_target {
-				match target
-					.ok()
-					.and_then(|target| listed_files.get(&link_key(&target)))
-				{
-					Some(&(size, target)) => {
-						found.size = size;
-						found.kind = ArchiveEntryKind::Hardlink {
-							target: shown,
-							target_id: Some(walk.listed_id(target)),
-						};
-					}
-					None => {
-						found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
-					}
-				}
-			}
-			// a listing reads a tar through: an AppleDouble member is told by its data here
-			let apple_double = match found.mac_shape() {
-				Some(MacShape::AppleDoubleName) => {
-					Some(apple_double(&mut TarBody(&mut tar)).map_err(failure)?.0)
-				}
-				_ => None,
-			};
-			let key = found.path.as_ref().ok().map(link_key);
-			let size = found.size;
-			let is_dir = found.kind == ArchiveEntryKind::Dir;
-			if walk.list(found, apple_double).map_err(failure)?
-				&& !is_dir && let Some(key) = key
-			{
-				listed_files.insert(key, (size, this));
-			}
-			continue;
-		}
-		let (path, apple_double) = match walk.judge(&found)? {
-			Verdict::Ignore | Verdict::Root => continue,
-			Verdict::Skip(reason) => {
-				walk.port.send(found.skipped(reason)).map_err(failure)?;
-				continue;
-			}
-			Verdict::Take { path, apple_double } => (path, apple_double),
-		};
-		if let Some((target, shown)) = link_target {
-			let unresolved = SkippedMember {
-				ordinal: this,
-				path: display_path(&member.path).0.to_owned(),
-				path_truncated: display_path(&member.path).1,
-				bytes: 0,
-				reason: ExtractSkipReason::Hardlink { target: shown },
-			};
-			// the file it names, where this job extracts it
-			let event = match target.ok().and_then(|target| walk.within_base(target)) {
-				Some(target) => WorkerEvent::Link(Box::new(LinkHead {
-					ordinal: this,
-					path,
-					modified: found.modified,
-					target,
-					unresolved,
-				})),
-				None => WorkerEvent::Skipped(unresolved),
-			};
-			walk.port.send(event).map_err(failure)?;
-			continue;
-		}
-		if found.kind == ArchiveEntryKind::Dir {
-			walk.port
-				.send(WorkerEvent::Entry(EntryHead {
-					ordinal: this,
-					path,
-					modified: found.modified,
-					kind: EntryKind::Dir,
-				}))
-				.map_err(failure)?;
-			continue;
-		}
-		files += take_file(
-			walk,
-			&found,
-			path,
-			Some(found.size),
-			apple_double,
-			&mut TarBody(&mut tar),
-		)
-		.map_err(failure)?;
-	}
-	walk.finish()?;
-	Ok(Walked {
-		rest: tar.into_inner(),
-		unread,
-		files,
-	})
-}
-
-/// The current member's data.
-struct TarBody<'t, R>(&'t mut TarReader<R>);
-
-impl<R: Read> Read for TarBody<'_, R> {
-	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		self.0.read_body(buf).map_err(|e| match refusal(e) {
-			Ok(refused) => io::Error::new(io::ErrorKind::InvalidData, refused),
-			Err(e) => e,
-		})
-	}
-}
-
 /// Decoded bytes, stopped once they exceed the [`ExpansionLimit`].
 struct Expanding<'p, D> {
 	inner: D,
@@ -1404,22 +1219,6 @@ enum Refused {
 	TooManyMembers(u64),
 	#[error("the archive decodes to more than {0} times its size")]
 	Expansion(u64),
-}
-
-/// What the tar reader refused, or the read error it passed on.
-fn refusal(error: TarError) -> Result<Refused, io::Error> {
-	match error {
-		TarError::Read(error) => Err(error),
-		TarError::Corrupt(what) => Ok(Refused::Corrupt(what)),
-		TarError::TooManyMembers(max) => Ok(Refused::TooManyMembers(max)),
-	}
-}
-
-fn tar_failure(error: TarError) -> Error {
-	match refusal(error) {
-		Ok(refused) => self::refused(refused),
-		Err(error) => failure(error),
-	}
 }
 
 fn refused(refused: Refused) -> Error {
