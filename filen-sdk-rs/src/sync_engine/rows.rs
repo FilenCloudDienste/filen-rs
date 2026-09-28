@@ -133,11 +133,20 @@ struct Edits {
 	vacated: BTreeSet<String>,
 	/// The marker a confirmation advanced on a table row the pass left in place — the one field a
 	/// confirmation changes, so a confirmed push costs an entry here rather than a written row.
-	agreed: HashMap<String, Option<Blake3Hash>>,
+	agreed: HashMap<String, Agreed>,
 	/// The edited view's counts, kept so the whole-set questions stay O(1) whatever the pass moved.
 	rows: usize,
 	carryable: usize,
 	remote_rows: usize,
+}
+
+/// A marker the pass advanced on a table row, and whether the row, carrying it, still awaits
+/// confirmation — decided when the marker is set, from the row in hand, so that the question "is
+/// anything unconfirmed" never has to read the row back.
+#[derive(Debug, Clone, Copy)]
+struct Agreed {
+	hash: Option<Blake3Hash>,
+	awaits: bool,
 }
 
 impl Edits {
@@ -275,20 +284,24 @@ fn carryable_count(counts: Counts) -> usize {
 /// directory's entries (in whatever order the filesystem lists them), the reconcile reads its keys
 /// sorted. Answers exactly what [`Baseline::get`] answers.
 ///
-/// It answers out of a [`Page`] of the table wherever the page spans the path asked. On the first
-/// path it is asked in a directory it reads that directory's range from its start, which covers a
-/// whole ordinary directory in one statement whatever order its entries are asked in; past that
-/// page it reads from the path asked, growing the page while the caller keeps landing in it and
-/// shrinking it to a single row while it does not — so a caller walking the table in order reads
-/// it in large pages, and one asking about scattered paths costs a point lookup each.
+/// It answers the table's half out of a [`Page`] wherever the page spans the path asked, and the
+/// pass's own edits over it exactly as `get` does. On the first path it is asked in a directory it
+/// reads that directory's range from its start, which covers an ordinary directory whatever order
+/// its entries are asked in; past that page it reads from the path asked. Both page sizes follow the
+/// caller: a page most of whose rows were asked for makes the next one twice as large, one that
+/// answered a single lookup halves it — so a walk of the table reads it in large pages, and a
+/// caller asking about scattered paths pays about a point lookup each.
 pub(super) struct Cursor<'a> {
 	baseline: &'a Baseline,
 	page: Option<Arc<Page>>,
-	/// The directory the last page was read for.
+	/// Whether `page` was read from a directory's start rather than from a path.
+	page_is_dir: bool,
+	/// The directory the last directory page was read for.
 	dir: Option<String>,
-	/// How many rows the next page read from a path reads, and how many lookups the current page
-	/// has answered.
+	/// How many rows the next page of each kind reads, and how many lookups the current page has
+	/// answered.
 	want: usize,
+	dir_want: usize,
 	answered: usize,
 }
 
@@ -296,19 +309,42 @@ impl Cursor<'_> {
 	/// The most a page reads, however well the caller keeps to it.
 	const MAX_PAGE: usize = 1024;
 
+	fn adapt(want: &mut usize, rows: usize, answered: usize) {
+		if answered * 2 >= rows.max(1) {
+			*want = (*want * 2).min(Self::MAX_PAGE);
+		} else if answered <= 1 {
+			*want = (*want / 2).max(1);
+		}
+	}
+
 	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
-		let snapshot = match (&self.baseline.rows, &self.baseline.edits) {
-			(Some(snapshot), None) => snapshot,
-			_ => return self.baseline.get(rel_path),
-		};
+		let baseline = self.baseline;
+		if let Some(edits) = baseline.edits.as_deref() {
+			if let Some(row) = edits.written.get(rel_path) {
+				return Some(row.clone());
+			}
+			if edits.vacated_over(rel_path).is_some() {
+				return None;
+			}
+		}
+		let snapshot = baseline.rows.as_deref()?;
+		let stored = self.stored(snapshot, rel_path)?;
+		Some(baseline.marked(stored))
+	}
+
+	/// The table's row at `rel_path`, out of the current page or a new one.
+	fn stored(&mut self, snapshot: &Snapshot, rel_path: &str) -> Option<BaselineEntry> {
 		if let Some(answer) = self.page.as_deref().and_then(|page| page.answer(rel_path)) {
 			self.answered += 1;
 			return answer.cloned();
 		}
-		if self.answered * 2 >= self.want {
-			self.want = (self.want * 2).min(Self::MAX_PAGE);
-		} else if self.answered <= 1 {
-			self.want = (self.want / 2).max(1);
+		if let Some(page) = self.page.as_deref() {
+			let want = if self.page_is_dir {
+				&mut self.dir_want
+			} else {
+				&mut self.want
+			};
+			Self::adapt(want, page.rows.len(), self.answered);
 		}
 		self.answered = 1;
 		let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
@@ -319,9 +355,10 @@ impl Cursor<'_> {
 			} else {
 				(format!("{dir}/"), Some(format!("{dir}0")))
 			};
-			let page = snapshot.page(&from, false, to.as_deref(), self.want.max(PAGE));
+			let page = snapshot.page(&from, false, to.as_deref(), self.dir_want);
 			let answer = page.answer(rel_path).map(|row| row.cloned());
 			self.page = Some(page);
+			self.page_is_dir = true;
 			if let Some(answer) = answer {
 				return answer;
 			}
@@ -332,6 +369,7 @@ impl Cursor<'_> {
 			.expect("a page read from a path answers for that path")
 			.cloned();
 		self.page = Some(page);
+		self.page_is_dir = false;
 		answer
 	}
 }
@@ -479,12 +517,12 @@ impl Baseline {
 
 	/// `row` as this pass sees it: with the marker it advanced there, if it did.
 	fn marked(&self, mut row: BaselineEntry) -> BaselineEntry {
-		if let Some(&agreed) = self
+		if let Some(agreed) = self
 			.edits
 			.as_deref()
 			.and_then(|edits| edits.agreed.get(&row.rel_path))
 		{
-			row.agreed_hash = agreed;
+			row.agreed_hash = agreed.hash;
 		}
 		row
 	}
@@ -546,8 +584,10 @@ impl Baseline {
 		Cursor {
 			baseline: self,
 			page: None,
+			page_is_dir: false,
 			dir: None,
 			want: 1,
+			dir_want: PAGE,
 			answered: 0,
 		}
 	}
@@ -599,20 +639,26 @@ impl Baseline {
 		let Some(edits) = self.edits.as_deref() else {
 			return stored.into_iter();
 		};
-		// A table row's candidacy is decided by its EFFECTIVE marker: one the pass advanced can
-		// leave the set or, advanced to something else, join it.
-		let mut seen = BTreeSet::new();
+		// A table row's candidacy is decided by its EFFECTIVE marker: one the pass advanced leaves
+		// the set, or — advanced to something other than its content — joins it.
+		let listed: BTreeSet<String> = stored.iter().map(|row| row.rel_path.clone()).collect();
+		let joined: Vec<BaselineEntry> = edits
+			.agreed
+			.iter()
+			.filter(|(path, agreed)| agreed.awaits && !listed.contains(*path))
+			.filter_map(|(path, _)| self.rows.as_deref()?.row(path))
+			.collect();
 		let mut out: Vec<BaselineEntry> = stored
 			.into_iter()
-			.chain(
-				edits
-					.agreed
-					.keys()
-					.filter_map(|path| self.rows.as_deref()?.row(path)),
-			)
-			.filter(|row| edits.shows_stored(&row.rel_path) && seen.insert(row.rel_path.clone()))
+			.chain(joined)
+			.filter(|row| {
+				edits.shows_stored(&row.rel_path)
+					&& edits
+						.agreed
+						.get(&row.rel_path)
+						.is_none_or(|agreed| agreed.awaits)
+			})
 			.map(|row| self.marked(row))
-			.filter(BaselineEntry::awaits_confirmation)
 			.collect();
 		out.extend(
 			edits
@@ -625,10 +671,59 @@ impl Baseline {
 	}
 
 	pub(super) fn any_unconfirmed(&self) -> bool {
-		match (self.edits.is_some(), self.rows.as_deref()) {
-			(false, Some(snapshot)) => snapshot.any_unconfirmed(),
-			_ => self.unconfirmed().next().is_some(),
+		let Some(edits) = self.edits.as_deref() else {
+			return self.rows.as_deref().is_some_and(Snapshot::any_unconfirmed);
+		};
+		edits
+			.written
+			.values()
+			.any(BaselineEntry::awaits_confirmation)
+			|| edits
+				.agreed
+				.iter()
+				.any(|(path, agreed)| agreed.awaits && edits.shows_stored(path))
+			|| self.rows.as_deref().is_some_and(|snapshot| {
+				snapshot.unconfirmed_paths().iter().any(|path| {
+					edits.shows_stored(path) && !edits.agreed.contains_key(path.as_str())
+				})
+			})
+	}
+
+	/// Advance the marker of every row awaiting confirmation that `confirms` accepts to the content
+	/// the row records — what a confirmation IS — and hand back each row as it now stands, for the
+	/// caller to persist. An edit to THIS view, like [`set_agreed`](Self::set_agreed), which it
+	/// is for a set of rows at once: the rows come from this view's own
+	/// [`unconfirmed`](Self::unconfirmed), so none is read back to be advanced.
+	pub(super) fn confirm_where(
+		&mut self,
+		mut confirms: impl FnMut(&BaselineEntry) -> bool,
+	) -> Vec<BaselineEntry> {
+		let rows: Vec<BaselineEntry> = self.unconfirmed().filter(|row| confirms(row)).collect();
+		if rows.is_empty() {
+			return rows;
 		}
+		let edits = self.edits_mut();
+		rows.into_iter()
+			.map(|row| {
+				let agreed = row.content_hash;
+				if let Some(written) = edits.written.get_mut(&row.rel_path) {
+					written.agreed_hash = agreed;
+					return written.clone();
+				}
+				let row = BaselineEntry {
+					agreed_hash: agreed,
+					..row
+				};
+				edits.agreed.insert(
+					row.rel_path.clone(),
+					Agreed {
+						hash: agreed,
+						awaits: row.awaits_confirmation(),
+					},
+				);
+				row
+			})
+			.collect()
 	}
 
 	/// Whether any row records a remote item.
@@ -834,19 +929,28 @@ impl Baseline {
 		}
 		edits.vacated.insert(from.to_string());
 		edits.unwrite_subtree(from);
-		// What the view shows at each destination NOW, with every source gone: what each write
-		// replaces. The destinations are distinct, so no write below changes another's.
-		let replaced: Vec<Option<BaselineEntry>> =
-			moving.iter().map(|row| self.get(&row.rel_path)).collect();
+		// What the view shows at or under the destination NOW, with every source gone: the rows the
+		// writes below replace, read as one range rather than a lookup per moved row. The
+		// destinations are distinct, so no write below changes another's.
+		let mut replaced: HashMap<String, BaselineEntry> = self
+			.get(to)
+			.into_iter()
+			.chain(self.subtree(to))
+			.map(|row| (row.rel_path.clone(), row))
+			.collect();
 		let edits = self.edits_mut();
-		for (row, old) in moving.into_iter().zip(replaced) {
+		for row in moving {
+			let old = replaced.remove(&row.rel_path);
 			edits.write(row, old.as_ref());
 		}
 	}
 
 	/// Advance the agreed-content marker of the row at `rel_path` in THIS view, and hand back the
 	/// row as it now stands. `None` when nothing is there. An edit, like
-	/// [`move_subtree`](Self::move_subtree).
+	/// [`move_subtree`](Self::move_subtree). The engine confirms through
+	/// [`confirm_where`](Self::confirm_where); this is the tests' way of setting ANY marker, which is
+	/// what reaches the shapes a confirmation alone never makes.
+	#[cfg(test)]
 	pub(super) fn set_agreed(
 		&mut self,
 		rel_path: &str,
@@ -858,11 +962,18 @@ impl Baseline {
 			row.agreed_hash = agreed_hash;
 			return Some(row.clone());
 		}
-		edits.agreed.insert(rel_path.to_string(), agreed_hash);
-		Some(BaselineEntry {
+		let row = BaselineEntry {
 			agreed_hash,
 			..current
-		})
+		};
+		edits.agreed.insert(
+			rel_path.to_string(),
+			Agreed {
+				hash: agreed_hash,
+				awaits: row.awaits_confirmation(),
+			},
+		);
+		Some(row)
 	}
 
 	/// Write `entry` into the rows a test built this baseline from. Only before the pass has edited
@@ -1311,6 +1422,27 @@ pub(super) mod tests {
 		let held = oracle.paths().collect::<Vec<_>>();
 		let pick =
 			|rng: &mut StdRng, from: &[String]| from[rng.random_range(0..from.len())].clone();
+		if rng.random_range(0..6) == 0 {
+			// A confirmation as the engine makes one: every unconfirmed row a predicate takes,
+			// advanced to its own content. The tree's form of it is one `set_agreed` per row.
+			let salt = rng.random_range(0..3_usize);
+			let takes = |row: &BaselineEntry| !(row.rel_path.len() + salt).is_multiple_of(3);
+			let mut confirmed = view.confirm_where(takes);
+			let mut expected: Vec<BaselineEntry> = oracle
+				.unconfirmed()
+				.filter(takes)
+				.collect::<Vec<_>>()
+				.into_iter()
+				.filter_map(|row| oracle.set_agreed(&row.rel_path, row.content_hash))
+				.collect();
+			confirmed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+			expected.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+			assert_eq!(
+				confirmed, expected,
+				"step {step}: confirm_where confirmed different rows"
+			);
+			return (format!("confirm_where(salt {salt})"), false);
+		}
 		if rng.random_range(0..4) == 0 {
 			let path = if held.is_empty() || rng.random_range(0..3) == 0 {
 				pick(rng, probes)

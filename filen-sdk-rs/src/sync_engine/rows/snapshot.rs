@@ -172,6 +172,8 @@ const UNCARRYABLE: &str = "SELECT rel_path FROM baseline INDEXED BY baseline_unc
 	 WHERE pair_id = ?1 AND carryable = 0";
 const RULE_FILES: &str = "SELECT rel_path FROM baseline INDEXED BY baseline_rule_files
 	 WHERE pair_id = ?1 AND rule_file = 1";
+const UNCONFIRMED_PATHS: &str = "SELECT rel_path FROM baseline INDEXED BY baseline_unconfirmed
+	 WHERE pair_id = ?1 AND unconfirmed = 1";
 const ANY_UNCONFIRMED: &str = "SELECT 1 FROM baseline INDEXED BY baseline_unconfirmed
 	 WHERE pair_id = ?1 AND unconfirmed = 1 LIMIT 1";
 const COUNTS: &str =
@@ -404,6 +406,10 @@ impl Snapshot {
 		})
 	}
 
+	pub(super) fn unconfirmed_paths(&self) -> Vec<String> {
+		self.paths("the unconfirmed rows' paths", UNCONFIRMED_PATHS)
+	}
+
 	pub(super) fn any_unconfirmed(&self) -> bool {
 		self.with("whether any row is unconfirmed", |conn| {
 			conn.prepare_cached(ANY_UNCONFIRMED)?
@@ -501,7 +507,13 @@ mod tests {
 				.unwrap()
 		};
 		let primary = "PRIMARY KEY";
-		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 14] = [
+		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 15] = [
+			(
+				UNCONFIRMED_PATHS.to_string(),
+				vec![&1_i64],
+				"baseline_unconfirmed",
+				"(pair_id=?)",
+			),
 			(
 				at_sql(),
 				vec![&1_i64, &"a"],
