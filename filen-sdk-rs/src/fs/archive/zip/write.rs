@@ -65,7 +65,7 @@ impl ZipMethod {
 	}
 
 	/// The levels the method takes; `None` for [`ZipMethod::Stored`], which has none.
-	pub fn levels(self) -> Option<RangeInclusive<u32>> {
+	pub(crate) fn levels(self) -> Option<RangeInclusive<u32>> {
 		self.leveled().map(|(_, _, levels)| levels)
 	}
 

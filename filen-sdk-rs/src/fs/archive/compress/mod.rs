@@ -15,7 +15,6 @@ mod engine;
 mod read_back;
 mod report;
 
-pub use super::dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use client_impl::CompressConfig;
 pub use report::{
 	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
@@ -26,7 +25,10 @@ use std::ops::RangeInclusive;
 
 use crate::{
 	Error, ErrorKind,
-	fs::categories::{NonRootItemType, Normal},
+	fs::{
+		archive::dispose::SourceDisposal,
+		categories::{NonRootItemType, Normal},
+	},
 };
 
 pub use super::{

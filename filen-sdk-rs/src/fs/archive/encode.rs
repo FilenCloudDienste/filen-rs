@@ -175,7 +175,7 @@ impl<W: Write> StreamEncoder<W> for brotli::CompressorWriter<W> {
 /// than being written to: the input is gathered a frame at a time and each frame compressed on
 /// its own, with its content checksum. Frames one after another are one zstd stream to every
 /// decoder (RFC 8878 §3.1), and past its first 128 KiB window a frame loses no matches.
-pub(crate) struct ZstdEncoder<W> {
+struct ZstdEncoder<W> {
 	sink: W,
 	input: Vec<u8>,
 	output: Vec<u8>,

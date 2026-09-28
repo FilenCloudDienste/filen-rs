@@ -428,11 +428,7 @@ impl ListReporter {
 
 /// Adds `entry` to `listing`: kept while it holds fewer than [`MAX_LISTED_ENTRIES`] whose text,
 /// `kept_bytes` so far, fits [`MAX_LISTED_BYTES`]; counted either way.
-pub(crate) fn add_entry(
-	listing: &mut ArchiveListing,
-	kept_bytes: &mut usize,
-	entry: &ArchiveEntry,
-) {
+fn add_entry(listing: &mut ArchiveListing, kept_bytes: &mut usize, entry: &ArchiveEntry) {
 	listing.totals.count(entry);
 	let bytes = entry.text_bytes();
 	if listing.omitted_entries == 0
