@@ -7,9 +7,9 @@ use chrono::DateTime;
 use crate::{
 	Error,
 	fs::archive::{
-		entry_path::entry_path,
+		entry_path::{ArchivePath, PathRejection, entry_path},
 		limits::display_path,
-		tar_iter::{MemberKind, TarError, TarReader},
+		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent},
 	},
 	util::SeededMap,
@@ -49,55 +49,10 @@ pub(super) fn walk_tar<R: Read>(
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
-		let (kind, unreadable) = match &member.kind {
-			MemberKind::File => (ArchiveEntryKind::File, None),
-			// a hard link with data of its own holds the file, as for libarchive
-			MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
-			MemberKind::Dir => {
-				unread = unread.saturating_add(member.size);
-				(ArchiveEntryKind::Dir, None)
-			}
-			MemberKind::Symlink { target } => {
-				let target = display_path(target).0.to_owned();
-				(
-					ArchiveEntryKind::Symlink {
-						target: target.clone(),
-					},
-					Some(ExtractSkipReason::Symlink { target }),
-				)
-			}
-			MemberKind::Hardlink { target } => (
-				ArchiveEntryKind::Hardlink {
-					target: display_path(target).0.to_owned(),
-					target_id: None,
-				},
-				None,
-			),
-			MemberKind::Device | MemberKind::Fifo => {
-				(ArchiveEntryKind::Device, Some(ExtractSkipReason::Device))
-			}
-			MemberKind::Sparse => (ArchiveEntryKind::File, Some(ExtractSkipReason::Sparse)),
-			MemberKind::Unsupported(_) => (
-				ArchiveEntryKind::Other,
-				Some(ExtractSkipReason::UnsupportedType),
-			),
-		};
-		let mut found = Found {
-			ordinal: this,
-			stored: &member.path,
-			path: entry_path(&member.path).map(|mut path| {
-				path.rewritten |= member.path_rewritten;
-				path
-			}),
-			kind,
-			unreadable,
-			size: member.size,
-			modified: member
-				.modified
-				.and_then(|time| DateTime::from_timestamp(time.secs, time.nanos)),
-			encrypted: false,
-			method: None,
-		};
+		if member.kind == MemberKind::Dir {
+			unread = unread.saturating_add(member.size);
+		}
+		let found = member_found(&member, this);
 		// a hard link names an earlier file, the same whatever else it is stored with
 		let link_target = match (&member.kind, &found.kind) {
 			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown, .. }) => {
@@ -106,38 +61,7 @@ pub(super) fn walk_tar<R: Read>(
 			_ => None,
 		};
 		if walk.listing() {
-			if let Some((target, shown)) = link_target {
-				match target
-					.ok()
-					.and_then(|target| listed_files.get(&link_key(&target)))
-				{
-					Some(&(size, target)) => {
-						found.size = size;
-						found.kind = ArchiveEntryKind::Hardlink {
-							target: shown,
-							target_id: Some(walk.listed_id(target)),
-						};
-					}
-					None => {
-						found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
-					}
-				}
-			}
-			// a listing reads a tar through: an AppleDouble member is told by its data here
-			let apple_double = match found.mac_shape() {
-				Some(MacShape::AppleDoubleName) => {
-					Some(apple_double(&mut TarBody(&mut tar)).map_err(failure)?.0)
-				}
-				_ => None,
-			};
-			let key = found.path.as_ref().ok().map(link_key);
-			let size = found.size;
-			let is_dir = found.kind == ArchiveEntryKind::Dir;
-			if walk.list(found, apple_double).map_err(failure)?
-				&& !is_dir && let Some(key) = key
-			{
-				listed_files.insert(key, (size, this));
-			}
+			list_member(walk, &mut tar, found, link_target, &mut listed_files)?;
 			continue;
 		}
 		let (path, apple_double) = match walk.judge(&found)? {
@@ -148,25 +72,8 @@ pub(super) fn walk_tar<R: Read>(
 			}
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
-		if let Some((target, shown)) = link_target {
-			let unresolved = SkippedMember {
-				ordinal: this,
-				path: display_path(&member.path).0.to_owned(),
-				path_truncated: display_path(&member.path).1,
-				bytes: 0,
-				reason: ExtractSkipReason::Hardlink { target: shown },
-			};
-			// the file it names, where this job extracts it
-			let event = match target.ok().and_then(|target| walk.within_base(target)) {
-				Some(target) => WorkerEvent::Link(Box::new(LinkHead {
-					ordinal: this,
-					path,
-					modified: found.modified,
-					target,
-					unresolved,
-				})),
-				None => WorkerEvent::Skipped(unresolved),
-			};
+		if let Some(target) = link_target {
+			let event = link_event(walk, &member, &found, path, target);
 			walk.port.send(event).map_err(failure)?;
 			continue;
 		}
@@ -197,6 +104,133 @@ pub(super) fn walk_tar<R: Read>(
 		unread,
 		files,
 	})
+}
+
+/// The file a hard link names, as a path, and as its listing shows it.
+type HardlinkTarget = (Result<ArchivePath, PathRejection>, String);
+
+/// What `member`, the `ordinal`-th of its tar, is, before anything is read of it but its header.
+fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
+	let (kind, unreadable) = match &member.kind {
+		MemberKind::File => (ArchiveEntryKind::File, None),
+		// a hard link with data of its own holds the file, as for libarchive
+		MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
+		MemberKind::Dir => (ArchiveEntryKind::Dir, None),
+		MemberKind::Symlink { target } => {
+			let target = display_path(target).0.to_owned();
+			(
+				ArchiveEntryKind::Symlink {
+					target: target.clone(),
+				},
+				Some(ExtractSkipReason::Symlink { target }),
+			)
+		}
+		MemberKind::Hardlink { target } => (
+			ArchiveEntryKind::Hardlink {
+				target: display_path(target).0.to_owned(),
+				target_id: None,
+			},
+			None,
+		),
+		MemberKind::Device | MemberKind::Fifo => {
+			(ArchiveEntryKind::Device, Some(ExtractSkipReason::Device))
+		}
+		MemberKind::Sparse => (ArchiveEntryKind::File, Some(ExtractSkipReason::Sparse)),
+		MemberKind::Unsupported(_) => (
+			ArchiveEntryKind::Other,
+			Some(ExtractSkipReason::UnsupportedType),
+		),
+	};
+	Found {
+		ordinal,
+		stored: &member.path,
+		path: entry_path(&member.path).map(|mut path| {
+			path.rewritten |= member.path_rewritten;
+			path
+		}),
+		kind,
+		unreadable,
+		size: member.size,
+		modified: member
+			.modified
+			.and_then(|time| DateTime::from_timestamp(time.secs, time.nanos)),
+		encrypted: false,
+		method: None,
+	}
+}
+
+/// Lists the member `found`, a hard link to `link_target` resolved against `listed_files`, the
+/// files listed before it as extracted, which it joins when it is one.
+fn list_member<R: Read>(
+	walk: &mut Walk,
+	tar: &mut TarReader<R>,
+	mut found: Found,
+	link_target: Option<HardlinkTarget>,
+	listed_files: &mut SeededMap<u64, (u64, u64)>,
+) -> Result<(), Error> {
+	if let Some((target, shown)) = link_target {
+		match target
+			.ok()
+			.and_then(|target| listed_files.get(&link_key(&target)))
+		{
+			Some(&(size, target)) => {
+				found.size = size;
+				found.kind = ArchiveEntryKind::Hardlink {
+					target: shown,
+					target_id: Some(walk.listed_id(target)),
+				};
+			}
+			None => {
+				found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
+			}
+		}
+	}
+	// a listing reads a tar through: an AppleDouble member is told by its data here
+	let apple_double = match found.mac_shape() {
+		Some(MacShape::AppleDoubleName) => {
+			Some(apple_double(&mut TarBody(tar)).map_err(failure)?.0)
+		}
+		_ => None,
+	};
+	let ordinal = found.ordinal;
+	let key = found.path.as_ref().ok().map(link_key);
+	let size = found.size;
+	let is_dir = found.kind == ArchiveEntryKind::Dir;
+	if walk.list(found, apple_double).map_err(failure)?
+		&& !is_dir
+		&& let Some(key) = key
+	{
+		listed_files.insert(key, (size, ordinal));
+	}
+	Ok(())
+}
+
+/// What the driver is sent for `member`, a hard link taken at `path`: the link to the file it
+/// names, where this job extracts it, or the link skipped when this job extracts none there.
+fn link_event(
+	walk: &Walk,
+	member: &TarMember,
+	found: &Found,
+	path: ArchivePath,
+	(target, shown): HardlinkTarget,
+) -> WorkerEvent {
+	let unresolved = SkippedMember {
+		ordinal: found.ordinal,
+		path: display_path(&member.path).0.to_owned(),
+		path_truncated: display_path(&member.path).1,
+		bytes: 0,
+		reason: ExtractSkipReason::Hardlink { target: shown },
+	};
+	match target.ok().and_then(|target| walk.within_base(target)) {
+		Some(target) => WorkerEvent::Link(Box::new(LinkHead {
+			ordinal: found.ordinal,
+			path,
+			modified: found.modified,
+			target,
+			unresolved,
+		})),
+		None => WorkerEvent::Skipped(unresolved),
+	}
 }
 
 /// The current member's data.
