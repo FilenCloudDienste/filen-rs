@@ -1622,20 +1622,22 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_compress_writes_the_archive_it_would_have() {
-	let setup_paused = setup(|backend, _| {
-		// the job is still reading when the pause comes
-		backend
-			.slow
-			.insert("big.bin".to_owned(), Duration::from_millis(300));
+	// the job is still reading when the pause comes
+	let mut big = None;
+	let setup_paused = setup(|backend, files| {
+		backend.hold_requests(Request::Fetch, [files[1].uuid()]);
+		big = Some(files[1].uuid());
 	});
+	let big = (Request::Fetch, big.unwrap());
 	let (pause, _cancel, control) = controls();
 	let format = CompressFormat::Tar { compression: None };
 	let job = start(&setup_paused, "b.tar", format, control, None);
-	wait_until("the first source is read", || {
-		job.reporter.counts().bytes_read > 0
+	wait_until("the second source is being read", || {
+		setup_paused.backend.log().held.contains(&big)
 	})
 	.await;
 	pause.send_replace(true);
+	setup_paused.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	setup_paused.backend.assert_released(&job.reporter);
 	assert!(setup_paused.backend.log().finished.is_empty());
@@ -1665,10 +1667,9 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pause_while_registering_holds_the_disposal_back() {
+	let registering = (Request::Finish, "b.tar".to_owned());
 	let setup = setup(|backend, _| {
-		backend
-			.slow_finish
-			.insert("b.tar".to_owned(), Duration::from_millis(300));
+		backend.hold_named(Request::Finish, ["b.tar"]);
 	});
 	let placed = place(&setup);
 	let (pause, _cancel, control) = controls();
@@ -1679,10 +1680,11 @@ async fn a_pause_while_registering_holds_the_disposal_back() {
 		control,
 	);
 	wait_until("the archive is being registered", || {
-		!setup.backend.log().finishing.is_empty()
+		setup.backend.log().held_named.contains(&registering)
 	})
 	.await;
 	pause.send_replace(true);
+	setup.backend.release_named(Request::Finish, ["b.tar"]);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert_eq!(
 		job.recorder.created.lock().unwrap().len(),

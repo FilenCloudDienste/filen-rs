@@ -121,8 +121,6 @@ pub(crate) struct FakeLog {
 	pub(crate) probes: Vec<String>,
 	/// Drive-lock acquisitions that had to wait for another holder.
 	pub(crate) lock_waits: usize,
-	/// Slow registrations that have started.
-	pub(crate) finishing: Vec<String>,
 	/// Requests that waited while held ([`FakeBackend::hold_requests`]), in the order they came.
 	pub(crate) held: Vec<(Request, Uuid)>,
 	/// Requests that waited while held by name ([`FakeBackend::hold_named`]), in the order they
@@ -174,8 +172,6 @@ pub(crate) struct FakeBackend {
 	/// Every propagation to a share or link fails.
 	pub(crate) fail_propagate: bool,
 	pub(crate) fail_finish: HashMap<String, ErrorKind>,
-	/// Registrations that take this long, logged in `finishing` when they start.
-	pub(crate) slow_finish: HashMap<String, Duration>,
 	/// Files whose last chunk comes back one byte short.
 	pub(crate) short_reads: HashSet<String>,
 	/// Fetching the destination's shares and links fails.
@@ -243,7 +239,6 @@ impl FakeBackend {
 			fail_color: false,
 			fail_propagate: false,
 			fail_finish: HashMap::new(),
-			slow_finish: HashMap::new(),
 			short_reads: HashSet::new(),
 			fail_targets: None,
 			targets_delay: Duration::ZERO,
@@ -583,10 +578,6 @@ impl DriveBackend for FakeBackend {
 			log.peak_finishes = log.peak_finishes.max(running);
 		});
 		self.hold_name(Request::Finish, name.as_ref()).await;
-		if let Some(delay) = self.slow_finish.get(name.as_ref()) {
-			self.log().finishing.push(name.as_ref().to_owned());
-			tokio::time::sleep(*delay).await;
-		}
 		if let Some(kind) = self.fail_finish.get(name.as_ref()) {
 			return Err(Error::custom(*kind, "registration failed"));
 		}
