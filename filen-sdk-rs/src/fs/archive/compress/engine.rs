@@ -160,6 +160,19 @@ struct SourceState {
 	hasher: blake3::Hasher,
 }
 
+impl SourceState {
+	fn new(source: Source) -> Self {
+		Self {
+			chunks: source.file.size().div_ceil(CHUNK_SIZE_U64),
+			file: Arc::new(source.file),
+			path: source.path,
+			request: source.request,
+			served: 0,
+			hasher: blake3::Hasher::new(),
+		}
+	}
+}
+
 struct Driver<B: DriveBackend> {
 	backend: Arc<B>,
 	control: JobControl,
@@ -255,15 +268,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	};
 	reporter.set_phase(CompressPhase::Compressing);
 
-	// the archive's name is picked against the destination up front, and checked again when it
-	// is registered
-	let prepared = async {
-		let listed = backend.list_dir_names(&destination).await?;
-		let targets = backend.connected_targets(destination.uuid()).await?;
-		let name =
-			TakenNames::new(listed.names.iter().map(String::as_str)).allocate(name, shape)?;
-		Ok::<_, Error>((name, targets))
-	};
+	let prepared = named_in(&*backend, &destination, name, shape);
 	let (name, targets) = match control.until_stopping(prepared).await {
 		Ok(Ok(prepared)) => prepared,
 		Ok(Err(error)) => return Err(fail(report, CompressPhase::Failed, Arc::new(error))),
@@ -282,17 +287,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		mime: None,
 	});
 	let memory = backend.memory();
-	let sources = sources
-		.into_iter()
-		.map(|source| SourceState {
-			chunks: source.file.size().div_ceil(CHUNK_SIZE_U64),
-			file: Arc::new(source.file),
-			path: source.path,
-			request: source.request,
-			served: 0,
-			hasher: blake3::Hasher::new(),
-		})
-		.collect();
+	let sources = sources.into_iter().map(SourceState::new).collect();
 	let mut driver = Driver {
 		backend,
 		control,
@@ -332,7 +327,6 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		fatal: Fatal::default(),
 	};
 	let incomplete = !report.skipped.is_empty();
-	let mut dispositions = Vec::new();
 	driver.next_fetch = driver.first_chunk_from(0);
 	driver.next_served = driver.next_fetch;
 	let outcome = async {
@@ -340,43 +334,9 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		if driver.fatal.error().is_some() {
 			return Err(Stopped);
 		}
-		// the codec is done: registering and removing the sources hold no memory floor, and
-		// reading the archive back takes its own
-		driver.floor = None;
-		driver.reporter.set_phase(CompressPhase::Finishing);
-		// the destination may have been shared or linked since the job started
-		let refetched = driver
-			.control
-			.until_stopping(driver.backend.connected_targets(driver.destination))
-			.await?;
-		let targets = match refetched {
-			Ok(current) => current,
-			Err(error) => {
-				tracing::warn!("failed to re-check the archive destination's shares: {error}");
-				targets
-			}
-		};
-		let archive = driver.register(name, shape, targets).await?;
-		// the archive exists from here on: a cancel now keeps the sources, but the job is done
-		if let Some(disposal) = disposal {
-			// a permanent disposal reads the archive back first
-			driver
-				.reporter
-				.set_phase(if disposal.how == SourceDisposal::DeletePermanently {
-					CompressPhase::Verifying
-				} else {
-					CompressPhase::DisposingSources
-				});
-			dispositions = match driver.reporter.checkpoint(&driver.control).await {
-				Ok(()) => driver.dispose(disposal, &archive, incomplete).await,
-				Err(Stopped) => {
-					let kept = kept_on_early_end(&requested, true);
-					driver.reporter.dispositions(&kept);
-					kept
-				}
-			};
-		}
-		Ok(archive)
+		driver
+			.finish(name, shape, targets, disposal, &requested, incomplete)
+			.await
 	}
 	.await;
 	let Driver {
@@ -388,7 +348,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	} = driver;
 	report.hash_mismatches = hash_mismatches;
 	match fatal.end(outcome, &control, CompressReport::NAME) {
-		(_, Ok(archive)) => {
+		(_, Ok((archive, dispositions))) => {
 			report.archive = Some(archive);
 			report.dispositions = dispositions;
 			// a cancel once the archive exists keeps the sources, but the job is done; it still
@@ -402,6 +362,20 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		}
 		(phase, Err(error)) => Err(end_early(&reporter, report, &requested, phase, error)),
 	}
+}
+
+/// The archive's name, picked against what `destination` holds up front (it is checked again when
+/// the archive is registered), and the shares and links the archive is propagated to.
+async fn named_in<B: DriveBackend>(
+	backend: &B,
+	destination: &DirType<'static, Normal>,
+	name: ValidatedName,
+	shape: NameShape,
+) -> Result<(ValidatedName, ConnectedTargets), Error> {
+	let listed = backend.list_dir_names(destination).await?;
+	let targets = backend.connected_targets(destination.uuid()).await?;
+	let name = TakenNames::new(listed.names.iter().map(String::as_str)).allocate(name, shape)?;
+	Ok((name, targets))
 }
 
 /// Ends a job early, before it removed any source: every source a disposal was asked for is
@@ -748,6 +722,56 @@ impl<B: DisposalBackend> Driver<B> {
 		self.codec_result = Some(result);
 	}
 
+	/// Registers the archive, once the codec is done, and removes the sources if asked to: the
+	/// archive, and what became of each source.
+	async fn finish(
+		&mut self,
+		name: ValidatedName,
+		shape: NameShape,
+		targets: ConnectedTargets,
+		disposal: Option<CompressDisposal>,
+		requested: &[Uuid],
+		incomplete: bool,
+	) -> Result<(RemoteFile, Vec<SourceDisposition>), Stopped> {
+		// the codec is done: registering and removing the sources hold no memory floor, and
+		// reading the archive back takes its own
+		self.floor = None;
+		self.reporter.set_phase(CompressPhase::Finishing);
+		// the destination may have been shared or linked since the job started
+		let refetched = self
+			.control
+			.until_stopping(self.backend.connected_targets(self.destination))
+			.await?;
+		let targets = match refetched {
+			Ok(current) => current,
+			Err(error) => {
+				tracing::warn!("failed to re-check the archive destination's shares: {error}");
+				targets
+			}
+		};
+		let archive = self.register(name, shape, targets).await?;
+		// the archive exists from here on: a cancel now keeps the sources, but the job is done
+		let Some(disposal) = disposal else {
+			return Ok((archive, Vec::new()));
+		};
+		// a permanent disposal reads the archive back first
+		self.reporter
+			.set_phase(if disposal.how == SourceDisposal::DeletePermanently {
+				CompressPhase::Verifying
+			} else {
+				CompressPhase::DisposingSources
+			});
+		let dispositions = match self.reporter.checkpoint(&self.control).await {
+			Ok(()) => self.dispose(disposal, &archive, incomplete).await,
+			Err(Stopped) => {
+				let kept = kept_on_early_end(requested, true);
+				self.reporter.dispositions(&kept);
+				kept
+			}
+		};
+		Ok((archive, dispositions))
+	}
+
 	/// Removes the sources if the archive is verified; what became of each.
 	async fn dispose(
 		&mut self,
@@ -773,62 +797,12 @@ impl<B: DisposalBackend> Driver<B> {
 				None
 			}
 		};
-		let archive_reason = if incomplete {
-			Some(KeptReason::Incomplete)
-		} else if self
-			.sources
-			.iter()
-			.any(|source| source.served != source.chunks)
-		{
-			// a source not read to its end had its hash never checked
-			Some(KeptReason::Unconfirmed)
-		} else if (0..targets.len()).all(|request| own_reason(request).is_some()) {
-			None
-		} else {
-			// the archive as the server holds it
-			let state = self
-				.control
-				.until_stopping(self.backend.file_state(archive.uuid()))
-				.await;
-			match state {
-				Ok(Ok(state))
-					if !state.trash
-						&& !state.versioned
-						&& state.size == self.written
-						&& state.chunks == self.next_index =>
-				{
-					self.read_back(how, archive, read_back).await
-				}
-				Ok(_) => Some(KeptReason::Unconfirmed),
-				Err(Stopped) => Some(KeptReason::Interrupted),
-			}
-		};
+		let every_source_kept = (0..targets.len()).all(|request| own_reason(request).is_some());
+		let archive_reason = self
+			.archive_kept(how, archive, read_back, incomplete, every_source_kept)
+			.await;
 		self.reporter.set_phase(CompressPhase::DisposingSources);
-		// a source inside another (a file and its folder both given) goes with that one: its
-		// removal removes it, and its own attempt would only find it gone
-		let within: Vec<Option<usize>> = targets
-			.iter()
-			.enumerate()
-			.map(|(index, target)| {
-				targets.iter().enumerate().position(|(other, outer)| {
-					other != index
-						// the same item given twice goes with its first
-						&& (other < index && outer.uuid() == target.uuid()
-							|| match (target, outer) {
-							(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
-								read.files.contains_key(&file.uuid)
-							}
-							(
-								DisposalTarget::Dir { uuid, .. }
-								| DisposalTarget::Unavailable { uuid },
-								DisposalTarget::Dir { read, .. },
-							) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
-							_ => false,
-						})
-				})
-			})
-			.collect();
-		let Nesting { outermost, cyclic } = nesting(&within);
+		let Nesting { outermost, cyclic } = nesting(&enclosing(&targets));
 		let uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
 		let files: Vec<bool> = targets
 			.iter()
@@ -846,24 +820,10 @@ impl<B: DisposalBackend> Driver<B> {
 			};
 			// the files the folder's permanent removal deleted, even when it stopped part way
 			let mut deleted = BTreeSet::new();
-			let outcome = match (held_back, target) {
-				(Some(reason), _) => DisposalOutcome::kept(reason),
-				(None, DisposalTarget::File(file)) => {
-					dispose_file(&*self.backend, file, how, &self.control).await
-				}
-				(None, DisposalTarget::Dir { uuid, read }) => {
-					dispose_dir(
-						&*self.backend,
-						uuid,
-						&read,
-						how,
-						&self.control,
-						&mut deleted,
-					)
-					.await
-				}
-				(None, DisposalTarget::Unavailable { .. }) => {
-					DisposalOutcome::kept(KeptReason::Changed)
+			let outcome = match held_back {
+				Some(reason) => DisposalOutcome::kept(reason),
+				None => {
+					dispose_target(&*self.backend, &self.control, target, how, &mut deleted).await
 				}
 			};
 			// the source and those that go with it are told of as soon as its outcome is final
@@ -871,23 +831,10 @@ impl<B: DisposalBackend> Driver<B> {
 				.filter(|&nested| outermost[nested] == request)
 				.collect();
 			for &nested in &told {
-				let outcome = match &outcome {
-					_ if nested == request => outcome.clone(),
-					DisposalOutcome::Disposed { how, .. } => DisposalOutcome::Disposed {
-						how: *how,
-						bytes_freed: 0,
-					},
-					// a folder removed for good only in part may have taken a file given on
-					// its own too
-					DisposalOutcome::Kept { .. }
-						if files[nested] && deleted.contains(&uuids[nested]) =>
-					{
-						DisposalOutcome::Disposed {
-							how: SourceDisposal::DeletePermanently,
-							bytes_freed: 0,
-						}
-					}
-					DisposalOutcome::Kept { reason, .. } => DisposalOutcome::kept(reason.clone()),
+				let outcome = if nested == request {
+					outcome.clone()
+				} else {
+					going_with(&outcome, files[nested] && deleted.contains(&uuids[nested]))
 				};
 				dispositions[nested] = Some(SourceDisposition {
 					uuid: uuids[nested],
@@ -904,6 +851,51 @@ impl<B: DisposalBackend> Driver<B> {
 			.into_iter()
 			.map(|disposition| disposition.expect("every source goes with an outermost one"))
 			.collect()
+	}
+
+	/// Why every source is kept for what is wrong with the archive, if anything is: the job left
+	/// entries out, a source was not read to its end, or the archive the server holds is not the
+	/// one uploaded, or does not read back. The server is not asked when `every_source_kept` for
+	/// a reason of its own.
+	async fn archive_kept(
+		&mut self,
+		how: SourceDisposal,
+		archive: &RemoteFile,
+		read_back: Option<ReadBack>,
+		incomplete: bool,
+		every_source_kept: bool,
+	) -> Option<KeptReason> {
+		if incomplete {
+			return Some(KeptReason::Incomplete);
+		}
+		if self
+			.sources
+			.iter()
+			.any(|source| source.served != source.chunks)
+		{
+			// a source not read to its end had its hash never checked
+			return Some(KeptReason::Unconfirmed);
+		}
+		if every_source_kept {
+			return None;
+		}
+		// the archive as the server holds it
+		let state = self
+			.control
+			.until_stopping(self.backend.file_state(archive.uuid()))
+			.await;
+		match state {
+			Ok(Ok(state))
+				if !state.trash
+					&& !state.versioned
+					&& state.size == self.written
+					&& state.chunks == self.next_index =>
+			{
+				self.read_back(how, archive, read_back).await
+			}
+			Ok(_) => Some(KeptReason::Unconfirmed),
+			Err(Stopped) => Some(KeptReason::Interrupted),
+		}
 	}
 
 	/// Why the sources are kept after reading `archive` back, which a permanent disposal needs:
@@ -1015,6 +1007,69 @@ impl DisposalTarget {
 			Self::File(file) => file.uuid,
 			Self::Dir { uuid, .. } | Self::Unavailable { uuid } => *uuid,
 		}
+	}
+}
+
+/// Removes `target`, which nothing holds back; what became of it. A folder's permanent removal
+/// adds the files it deleted to `deleted`, even when it stopped part way.
+async fn dispose_target<B: DisposalBackend>(
+	backend: &B,
+	control: &JobControl,
+	target: DisposalTarget,
+	how: SourceDisposal,
+	deleted: &mut BTreeSet<Uuid>,
+) -> DisposalOutcome {
+	match target {
+		DisposalTarget::File(file) => dispose_file(backend, file, how, control).await,
+		DisposalTarget::Dir { uuid, read } => {
+			dispose_dir(backend, uuid, &read, how, control, deleted).await
+		}
+		DisposalTarget::Unavailable { .. } => DisposalOutcome::kept(KeptReason::Changed),
+	}
+}
+
+/// For each of `targets`, the one it goes with, if any: a source inside another (a file and its
+/// folder both given) goes with that one, whose removal removes it, and its own attempt would only
+/// find it gone.
+fn enclosing(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
+	targets
+		.iter()
+		.enumerate()
+		.map(|(index, target)| {
+			targets.iter().enumerate().position(|(other, outer)| {
+				other != index
+					// the same item given twice goes with its first
+					&& (other < index && outer.uuid() == target.uuid()
+						|| match (target, outer) {
+						(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
+							read.files.contains_key(&file.uuid)
+						}
+						(
+							DisposalTarget::Dir { uuid, .. } | DisposalTarget::Unavailable { uuid },
+							DisposalTarget::Dir { read, .. },
+						) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
+						_ => false,
+					})
+			})
+		})
+		.collect()
+}
+
+/// What became of a source that goes with another, whose removal ended in `outcome`: removed with
+/// it, freeing nothing of its own, or kept with it, unless it is a file the other's permanent
+/// removal `deleted` before it stopped.
+fn going_with(outcome: &DisposalOutcome, deleted: bool) -> DisposalOutcome {
+	match outcome {
+		DisposalOutcome::Disposed { how, .. } => DisposalOutcome::Disposed {
+			how: *how,
+			bytes_freed: 0,
+		},
+		// a folder removed for good only in part may have taken a file given on its own too
+		DisposalOutcome::Kept { .. } if deleted => DisposalOutcome::Disposed {
+			how: SourceDisposal::DeletePermanently,
+			bytes_freed: 0,
+		},
+		DisposalOutcome::Kept { reason, .. } => DisposalOutcome::kept(reason.clone()),
 	}
 }
 
