@@ -430,7 +430,7 @@ pub(crate) mod test_support {
 
 	use tokio::sync::watch;
 
-	use super::JobControl;
+	use super::{JobControl, report::RunState};
 
 	/// A job control with its pause and cancel senders, so a test can drop one without the other
 	/// (a [`JobController`](super::JobController) only drops both).
@@ -441,6 +441,23 @@ pub(crate) mod test_support {
 			pause,
 			cancel,
 			JobControl::from_receivers(Some(pause_rx), Some(cancel_rx)),
+		)
+	}
+
+	/// The run states a job's updates went through, each stretch once.
+	pub(crate) fn run_states(states: impl IntoIterator<Item = RunState>) -> Vec<RunState> {
+		let mut states: Vec<RunState> = states.into_iter().collect();
+		states.dedup();
+		states
+	}
+
+	/// As [`run_states`], with pausing left out: whether a job shows it before paused depends on
+	/// how long its work in flight takes.
+	pub(crate) fn settled_run_states(states: impl IntoIterator<Item = RunState>) -> Vec<RunState> {
+		run_states(
+			states
+				.into_iter()
+				.filter(|state| *state != RunState::Pausing),
 		)
 	}
 

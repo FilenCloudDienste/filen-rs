@@ -37,6 +37,7 @@ use crate::{
 		},
 		name::ValidatedName,
 	},
+	job::report::{JobState, Reporter},
 };
 
 use super::backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec};
@@ -262,6 +263,22 @@ impl FakeBackend {
 
 	pub(crate) fn log(&self) -> MutexGuard<'_, FakeLog> {
 		self.log.lock().unwrap()
+	}
+
+	/// Asserts a job that ended holds nothing of the backend (every memory reservation and drive
+	/// lock given back) and has nothing in flight on its `reporter`.
+	pub(crate) fn assert_released<S: JobState>(&self, reporter: &Reporter<S>) {
+		assert_eq!(
+			self.memory.available_permits(),
+			self.budget,
+			"every memory reservation is released"
+		);
+		assert_eq!(
+			self.live_locks.load(Ordering::SeqCst),
+			0,
+			"no drive lock is held"
+		);
+		assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
 	}
 
 	async fn wait(&self, name: &str) {

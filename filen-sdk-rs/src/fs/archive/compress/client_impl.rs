@@ -534,7 +534,7 @@ mod tests {
 				meta::{DecryptedFileMeta, FileMeta},
 			},
 		},
-		job::test_support::controls,
+		job::test_support::{controls, settled_run_states},
 	};
 
 	#[expect(dead_code, reason = "only named by the compile-time check below")]
@@ -945,16 +945,8 @@ mod tests {
 	impl Updates {
 		/// The run states the updates went through, each change once, pausing left out.
 		fn run_states(&self) -> Vec<RunState> {
-			let mut states: Vec<RunState> = self
-				.0
-				.lock()
-				.unwrap()
-				.iter()
-				.map(|update| update.run_state)
-				.filter(|state| *state != RunState::Pausing)
-				.collect();
-			states.dedup();
-			states
+			let updates = self.0.lock().unwrap();
+			settled_run_states(updates.iter().map(|update| update.run_state))
 		}
 
 		fn last_phase(&self) -> CompressPhase {

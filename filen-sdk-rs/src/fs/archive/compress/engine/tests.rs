@@ -1,13 +1,7 @@
 //! The driver against the fake drive, with the real codec on its thread; the archive the fake
 //! received is put back together and read with the SDK's own decoders.
 
-use std::{
-	borrow::Cow,
-	collections::BTreeMap,
-	io::Read,
-	sync::{Mutex, atomic::Ordering},
-	time::Duration,
-};
+use std::{borrow::Cow, collections::BTreeMap, io::Read, sync::Mutex, time::Duration};
 
 use chrono::Utc;
 use tokio::{
@@ -57,7 +51,10 @@ use crate::{
 			meta::{DecryptedFileMeta, FileMeta},
 		},
 	},
-	job::{report::JobState, test_support::controls},
+	job::{
+		report::JobState,
+		test_support::{controls, settled_run_states},
+	},
 };
 
 #[derive(Default)]
@@ -118,6 +115,13 @@ impl Recorder {
 
 	fn last(&self) -> CompressUpdate {
 		self.updates.lock().unwrap().last().unwrap().clone()
+	}
+
+	/// The run states the callback saw, each change once; a pause may be complete before an
+	/// update shows it pausing, so pausing is left out.
+	fn run_states(&self) -> Vec<RunState> {
+		let updates = self.updates.lock().unwrap();
+		settled_run_states(updates.iter().map(|update| update.run_state))
 	}
 }
 
@@ -373,20 +377,6 @@ fn members(archive: &[u8], codec: Option<StreamCodec>) -> Vec<(String, Vec<u8>)>
 	members
 }
 
-fn assert_released(setup: &Setup, reporter: &Reporter) {
-	assert_eq!(
-		setup.backend.memory.available_permits(),
-		setup.backend.budget,
-		"every memory reservation is released"
-	);
-	assert_eq!(
-		setup.backend.live_locks.load(Ordering::SeqCst),
-		0,
-		"no drive lock is held"
-	);
-	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compresses_the_sources_into_one_new_file() {
 	let setup = setup(|backend, _| {
@@ -454,7 +444,7 @@ async fn compresses_the_sources_into_one_new_file() {
 		job.recorder.events().is_empty(),
 		"every source matched its hash"
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -482,7 +472,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		})
 		.collect();
 	assert_eq!(mismatched, ["top.txt"]);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,9 +490,9 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
 	assert!(failed.report.archive.is_none());
 	assert!(setup_storage.backend.log().finished.is_empty());
-	assert_released(&setup_storage, &job.reporter);
+	setup_storage.backend.assert_released(&job.reporter);
 	// ended by an error, not cancelled
-	assert_eq!(run_states(&job.recorder), [RunState::Running]);
+	assert_eq!(job.recorder.run_states(), [RunState::Running]);
 
 	// a source that cannot be read
 	let setup_fetch = setup(|backend, _| {
@@ -520,7 +510,7 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Server);
 	assert!(setup_fetch.backend.log().finished.is_empty());
-	assert_released(&setup_fetch, &job.reporter);
+	setup_fetch.backend.assert_released(&job.reporter);
 
 	// a cancel while the archive is uploading
 	let setup_cancel = setup(|backend, _| {
@@ -545,7 +535,7 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
 	assert!(setup_cancel.backend.log().finished.is_empty());
 	assert_eq!(job.recorder.last().phase, CompressPhase::Cancelled);
-	assert_released(&setup_cancel, &job.reporter);
+	setup_cancel.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -563,7 +553,7 @@ async fn a_silent_codec_is_given_up_on() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWorkerDied);
 	assert!(setup.backend.log().finished.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -600,7 +590,7 @@ async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -668,7 +658,7 @@ async fn compress_disposing(
 		report,
 	);
 	let report = job.running.await.unwrap().unwrap();
-	assert_released(setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	report
 }
 
@@ -972,7 +962,7 @@ async fn a_7z_uploads_its_first_chunk_last() {
 			"{method:?}"
 		);
 		assert_eq!(report.counts.files_done, 3);
-		assert_released(&setup, &job.reporter);
+		setup.backend.assert_released(&job.reporter);
 	}
 }
 
@@ -1430,7 +1420,7 @@ async fn a_cancel_drops_a_listing_in_flight_and_keeps_the_source() {
 		(last.phase, last.run_state),
 		(CompressPhase::Done, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1478,7 +1468,7 @@ async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
 	);
 	assert_eq!(setup.backend.log().deleted_files, [first.uuid()]);
 	assert!(setup.backend.log().trashed_dirs.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1521,7 +1511,7 @@ async fn a_cancel_while_compressing_keeps_every_source() {
 		(last.phase, last.run_state),
 		(CompressPhase::Cancelled, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1540,21 +1530,6 @@ async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
 	);
 	assert_eq!(told(&job.recorder).len(), 2);
 	assert!(setup.backend.log().uploaded.is_empty());
-}
-
-/// The run states the callback saw, each change once; a pause may be complete before an update
-/// shows it pausing, so pausing is left out.
-fn run_states(recorder: &Recorder) -> Vec<RunState> {
-	let mut states: Vec<RunState> = recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.map(|update| update.run_state)
-		.filter(|state| *state != RunState::Pausing)
-		.collect();
-	states.dedup();
-	states
 }
 
 /// Plays a codec that reads the first source and the first chunk of the second, and then keeps
@@ -1597,7 +1572,7 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	assert_eq!(job.recorder.last().run_state, RunState::Paused);
 	let free = job.recorder.free_when_paused.lock().unwrap().clone();
 	assert!(
@@ -1609,11 +1584,11 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
 	assert_eq!(
-		run_states(&job.recorder),
+		job.recorder.run_states(),
 		[RunState::Running, RunState::Paused, RunState::Cancelling]
 	);
 	assert!(setup.backend.log().finished.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	drop((events, result));
 }
 
@@ -1656,10 +1631,10 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 	let report = paused.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, 3);
 	assert_eq!(
-		run_states(&paused.recorder),
+		paused.recorder.run_states(),
 		[RunState::Paused, RunState::Running]
 	);
-	assert_released(&setup_paused, &paused.reporter);
+	setup_paused.backend.assert_released(&paused.reporter);
 	assert!(setup_paused.config.floor_is_free());
 }
 
@@ -1680,13 +1655,13 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_released(&setup_paused, &job.reporter);
+	setup_paused.backend.assert_released(&job.reporter);
 	assert!(setup_paused.backend.log().finished.is_empty());
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
 	let paused = uploaded(&setup_paused, report.archive.unwrap().uuid());
 	assert_eq!(
-		run_states(&job.recorder),
+		job.recorder.run_states(),
 		[RunState::Running, RunState::Paused, RunState::Running]
 	);
 
@@ -1738,7 +1713,7 @@ async fn a_pause_while_registering_holds_the_disposal_back() {
 		(CompressPhase::DisposingSources, RunState::Paused)
 	);
 	assert!(setup.backend.log().trashed_files.is_empty());
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
@@ -1842,7 +1817,7 @@ async fn a_permanent_removal_reads_the_archive_back_first() {
 			]),
 			"{name}: {phases:?}"
 		);
-		assert_released(&setup, &job.reporter);
+		setup.backend.assert_released(&job.reporter);
 	}
 }
 
@@ -1922,7 +1897,7 @@ fn assert_kept_unconfirmed(setup: &Setup, reporter: &Reporter, report: &Compress
 	all_kept_for(report, |reason| matches!(reason, KeptReason::Unconfirmed));
 	assert!(setup.backend.log().deleted_files.is_empty());
 	assert!(setup.backend.log().trashed_dirs.is_empty());
-	assert_released(setup, reporter);
+	setup.backend.assert_released(reporter);
 }
 
 /// A scripted reader for the setup's archive: what it sends, how it ends, and its progress.
@@ -2026,7 +2001,7 @@ async fn a_slow_read_back_is_not_given_up_on() {
 		"{:?}",
 		report.dispositions
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2097,7 +2072,7 @@ async fn a_cancel_while_reading_the_archive_back_keeps_the_sources() {
 		(last.phase, last.run_state),
 		(CompressPhase::Done, RunState::Cancelling)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2114,7 +2089,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 		(last.phase, last.run_state),
 		(CompressPhase::Verifying, RunState::Paused)
 	);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 	let fetched = archive_fetches(&setup, archive);
 	assert_eq!(fetched, 1, "the first chunk is read, the second waits");
 	assert_eq!(
@@ -2146,5 +2121,5 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 		report.dispositions
 	);
 	assert_eq!(report.counts.bytes_verified, report.counts.bytes_done);
-	assert_released(&setup, &job.reporter);
+	setup.backend.assert_released(&job.reporter);
 }

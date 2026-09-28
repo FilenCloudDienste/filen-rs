@@ -52,7 +52,7 @@ use crate::{
 			test_support::{FakeBackend, Request, wait_until},
 		},
 	},
-	job::test_support::controls,
+	job::test_support::{controls, run_states},
 };
 
 /// What a job held when an update reported it paused.
@@ -102,15 +102,8 @@ impl Recorder {
 
 	/// Every run state the updates went through, each once per stretch.
 	fn run_states(&self) -> Vec<RunState> {
-		let mut states: Vec<RunState> = self
-			.updates
-			.lock()
-			.unwrap()
-			.iter()
-			.map(|update| update.run_state)
-			.collect();
-		states.dedup();
-		states
+		let updates = self.updates.lock().unwrap();
+		run_states(updates.iter().map(|update| update.run_state))
 	}
 }
 
@@ -298,17 +291,7 @@ fn start(setup: &Setup, options: Options) -> Job {
 
 /// Everything a finished job must have given back.
 fn assert_released(setup: &Setup, reporter: &Reporter, recorder: &Recorder) {
-	assert_eq!(
-		setup.backend.memory.available_permits(),
-		setup.backend.budget,
-		"every memory reservation is released"
-	);
-	assert_eq!(
-		setup.backend.live_locks.load(Ordering::SeqCst),
-		0,
-		"no drive lock is held"
-	);
-	assert_eq!(reporter.ops_in_flight(), 0, "nothing is in flight");
+	setup.backend.assert_released(reporter);
 	assert!(
 		recorder
 			.held_while_paused
