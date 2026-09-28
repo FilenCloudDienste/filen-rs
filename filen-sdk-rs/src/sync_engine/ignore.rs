@@ -35,9 +35,9 @@ use super::{
 	SyncMode,
 	baseline::NodeKind,
 	plan::{RemoteNode, RemoteView},
+	rows::Baseline,
 	scan::collision_key,
 	side::{Nodes, NodesAt},
-	tree::Baseline,
 };
 use crate::Error;
 
@@ -551,7 +551,7 @@ pub(crate) struct RuleCandidates<'a> {
 /// offers [`load_remote_rules`] as its candidate set: it has the map in hand and no index of it, so
 /// finding them costs the scan of a map it just built. A change-scoped pass has the opposite — no
 /// map worth scanning and an index that answers — and names them from
-/// [`Baseline::rule_file_rows`](super::tree::Baseline::rule_file_rows) instead.
+/// [`Baseline::rule_file_rows`](super::rows::Baseline::rule_file_rows) instead.
 pub(crate) fn rule_file_paths(view: &RemoteView, baseline: &Baseline) -> Vec<String> {
 	view.nodes
 		.of(baseline)

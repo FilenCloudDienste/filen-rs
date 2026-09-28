@@ -38,8 +38,8 @@ use super::{
 		FILENIGNORE, IgnoreDecision, IgnoreParseError, IgnoreRules, IgnoreSource,
 		MAX_RULE_FILE_BYTES, Origin, rule_file_text,
 	},
+	rows::Baseline,
 	side::Side,
-	tree::Baseline,
 };
 use crate::{
 	fs::name::ValidatedName,

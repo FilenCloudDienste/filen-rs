@@ -1,5 +1,8 @@
 //! The resident baseline: one pair's rows as an id-keyed tree, held between passes.
 //!
+//! The store holds these and nothing else reads one directly: a pass reads its rows through
+//! [`rows::Baseline`](super::rows::Baseline), the boundary this tree is today's backing for.
+//!
 //! The rows a pass reconciles against used to be a `HashMap<String, BaselineEntry>` — 808 bytes a
 //! row measured, every path materialized and stored whole, and a second copy of it in every
 //! per-pass structure keyed the same way. This holds the same rows as a `Vec<Node>` addressed by a
@@ -8,9 +11,9 @@
 //! set, the report, a log line.
 //!
 //! What that buys, besides the bytes: the questions a pass asks about a SUBTREE stop being scans of
-//! every row. "Is anything at or under this path, under any spelling" ([`Baseline::occupied`]),
-//! "does the baseline still track anything here" ([`Baseline::tracked`]), "is every row under this
-//! directory synced" ([`Baseline::subtree_all_synced`]) are all answered from the node's own
+//! every row. "Is anything at or under this path, under any spelling" ([`Tree::occupied`]),
+//! "does the baseline still track anything here" ([`Tree::tracked`]), "is every row under this
+//! directory synced" ([`Tree::subtree_all_synced`]) are all answered from the node's own
 //! children or from an index.
 //!
 //! "Where is the row with this uuid" is NOT one of them any more. It used to be a resident
@@ -31,7 +34,7 @@
 //!
 //! # Every leaf name lives in ONE allocation
 //!
-//! A node does not own its name: it holds a `(offset, length)` into [`Baseline::names`], one
+//! A node does not own its name: it holds a `(offset, length)` into [`Tree::names`], one
 //! `String` the whole tree's leaf names are appended to. That is 8 bytes a node instead of 16, and
 //! — the part that costs more than the 8 — it is ONE heap block for a million names rather than a
 //! million blocks an allocator has to keep pages resident for. Cloning the tree, which
@@ -39,7 +42,7 @@
 //! of walking a million allocations.
 //!
 //! Names are never edited in place: a rename is a remove and an insert, so the old bytes are
-//! simply left behind and [`Baseline::maybe_compact_names`] rebuilds the arena once most of it is
+//! simply left behind and [`Tree::maybe_compact_names`] rebuilds the arena once most of it is
 //! dead. That is the one structure here whose size could otherwise follow the pair's HISTORY
 //! rather than its tree.
 //!
@@ -48,7 +51,7 @@
 //! A row can sit under a directory that has no row (a destination-only item adopted at a mode
 //! switch, a subtree whose directory rows were untracked). Such a path becomes a node with
 //! [`PRESENT`] clear: it holds its children and nothing else. It is not a row — it is not counted
-//! by [`Baseline::len`], never yielded by an iterator, and never answers [`Baseline::get`] — and it
+//! by [`Tree::len`], never yielded by an iterator, and never answers [`Tree::get`] — and it
 //! is pruned the moment its last child leaves, so "this node has children" and "this node has a row
 //! under it" mean the same thing.
 
@@ -65,7 +68,7 @@ use super::{
 	ignore::FILENIGNORE,
 };
 
-/// A node's index in [`Baseline::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
+/// A node's index in [`Tree::nodes`]. The root is [`NodeId::ROOT`] and is never a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct NodeId(u32);
 
@@ -102,7 +105,7 @@ const HAS_REMOTE_MODIFIED: u8 = 1 << 5;
 #[derive(Debug, Clone)]
 struct Node {
 	parent: NodeId,
-	/// Where this node's leaf name sits in [`Baseline::names`]: a byte offset and a byte length,
+	/// Where this node's leaf name sits in [`Tree::names`]: a byte offset and a byte length,
 	/// NFC and exactly as the row's path spells it. Never the path, and never an allocation of its
 	/// own (see the module doc).
 	name_at: u32,
@@ -119,7 +122,7 @@ struct Node {
 }
 
 impl Node {
-	/// A node with no name yet: [`Baseline::insert_node`] puts one in the arena and points the node
+	/// A node with no name yet: [`Tree::insert_node`] puts one in the arena and points the node
 	/// at it, so the arena stays the only place a name is ever written.
 	fn empty(parent: NodeId) -> Self {
 		Self {
@@ -188,7 +191,7 @@ pub(super) fn fold_cmp(a: &str, b: &str) -> Ordering {
 /// Whether `path` IS `prefix`, or lies under it, folded the way [`fold_cmp`] folds — and, like it,
 /// without materializing either folded form.
 ///
-/// The same question [`Baseline::occupied`] answers from a node's children, asked of a map that has
+/// The same question [`Tree::occupied`] answers from a node's children, asked of a map that has
 /// no such order: the two side maps a directory move checks its destination against. Folding each
 /// key into a [`collision_key`](super::scan::collision_key) first allocates a `String` for every
 /// key of the whole tree, to learn — for all but a handful of them — that the very first character
@@ -221,8 +224,8 @@ fn sibling_cmp(a: &str, b: &str) -> Ordering {
 	fold_cmp(a, b).then_with(|| a.cmp(b))
 }
 
-/// A row with nothing set and no path: the buffer [`Baseline::visit_rows`] refills, and the value
-/// [`Baseline::fill_row`] writes every field of.
+/// A row with nothing set and no path: the buffer [`Tree::visit_rows`] refills, and the value
+/// [`Tree::fill_row`] writes every field of.
 fn blank_row() -> BaselineEntry {
 	BaselineEntry {
 		rel_path: String::new(),
@@ -244,7 +247,7 @@ fn blank_row() -> BaselineEntry {
 
 /// One pair's baseline rows, resident between passes (see the module doc).
 #[derive(Debug, Clone)]
-pub(super) struct Baseline {
+pub(super) struct Tree {
 	nodes: Vec<Node>,
 	/// Every leaf name in the tree, appended end to end; a node addresses its own by offset and
 	/// length (see the module doc). Never indexed by anything but a node's own pair, so the
@@ -260,7 +263,7 @@ pub(super) struct Baseline {
 	/// Conflicted rows only.
 	side: HashMap<NodeId, ConflictSides>,
 	/// Rows whose `agreed_hash` is NOT their `content_hash` — the shape an unconfirmed push leaves
-	/// (see [`Baseline::awaits_confirmation`]). A row that is not here agrees with itself, which is
+	/// (see [`Tree::awaits_confirmation`]). A row that is not here agrees with itself, which is
 	/// every row of a converged pair.
 	agreed: HashMap<NodeId, Option<Blake3Hash>>,
 	/// The rows that stand in for NEITHER side of a pass
@@ -291,7 +294,7 @@ pub(super) struct Baseline {
 	remote_rows: usize,
 }
 
-impl Default for Baseline {
+impl Default for Tree {
 	fn default() -> Self {
 		Self {
 			nodes: vec![Node::empty(NodeId::ROOT)],
@@ -309,7 +312,7 @@ impl Default for Baseline {
 	}
 }
 
-/// What [`Baseline::resident_bytes`] is made of, one field per structure it counts.
+/// What [`Tree::resident_bytes`] is made of, one field per structure it counts.
 ///
 /// Reported per term rather than summed because the sum cannot be acted on. Every field is in
 /// BYTES and counted the way `resident_bytes` counts — a heap allocation rounded to the 16-byte
@@ -321,7 +324,7 @@ pub(super) struct ResidentTerms {
 	/// The node array's own allocation: `capacity`, not `len`.
 	pub(super) nodes: usize,
 	/// The name arena: the ONE allocation every leaf name lives in, the bytes no node points at
-	/// any more included (see [`Baseline::maybe_compact_names`]). Not the paths — no node holds
+	/// any more included (see [`Tree::maybe_compact_names`]). Not the paths — no node holds
 	/// one.
 	pub(super) names: usize,
 	/// The removed-slot free list.
@@ -366,7 +369,7 @@ impl ResidentTerms {
 	}
 }
 
-impl Baseline {
+impl Tree {
 	/// The rows as the store read them back, in any order.
 	///
 	/// The store's own read builds the tree row by row instead
@@ -568,7 +571,7 @@ impl Baseline {
 	}
 
 	/// The rows awaiting confirmation: this side's content is on record and is not what the two
-	/// sides last agreed on (see [`Baseline::agreed`]). The whole map is the candidate set, so a
+	/// sides last agreed on (see [`Tree::agreed`]). The whole map is the candidate set, so a
 	/// converged pair answers "none" without touching a node.
 	pub(super) fn unconfirmed(&self) -> impl Iterator<Item = BaselineEntry> + '_ {
 		self.agreed
@@ -1237,14 +1240,14 @@ impl Baseline {
 /// cannot go stale within the borrow it holds (the baseline is immutable for as long as it lives)
 /// and a miss costs one full resolve, exactly what every lookup used to cost.
 pub(super) struct Cursor<'a> {
-	baseline: &'a Baseline,
+	baseline: &'a Tree,
 	/// The parent path `at` stands for; `""` is the pair root, which `at` starts on.
 	dir: String,
 	at: NodeId,
 }
 
 impl Cursor<'_> {
-	/// The row at `rel_path`, as [`Baseline::get`] gives it.
+	/// The row at `rel_path`, as [`Tree::get`] gives it.
 	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
 		let (parent, name) = rel_path
 			.rsplit_once('/')
@@ -1264,7 +1267,7 @@ impl Cursor<'_> {
 /// Every row under one node, parent before child, with each row's path built as the walk descends
 /// (one `String` per row rather than one per node of the tree).
 struct Walk<'a> {
-	baseline: &'a Baseline,
+	baseline: &'a Tree,
 	/// `(node, how many of its children have been visited, how long the path was before its name)`.
 	stack: Vec<(NodeId, usize, usize)>,
 	path: String,
@@ -1322,14 +1325,14 @@ mod tests {
 
 	/// The index's answer and the row's must be the same answer, for every row the tree holds.
 	///
-	/// The only place the two halves of the contract meet. [`Baseline::carryable`] reads the
-	/// `uncarryable` set, recorded from the entry a caller handed [`Baseline::upsert`], while
-	/// `derive::carried` asks [`BaselineEntry::carryable`] of the row [`Baseline::fill_row`]
+	/// The only place the two halves of the contract meet. [`Tree::carryable`] reads the
+	/// `uncarryable` set, recorded from the entry a caller handed [`Tree::upsert`], while
+	/// `derive::carried` asks [`BaselineEntry::carryable`] of the row [`Tree::fill_row`]
 	/// rebuilds out of the node's flag bits. They agree only while the store round-trips every
 	/// field the rule reads: narrow one column or drop one flag and the index would call a row
 	/// carryable that derives nothing — a path in neither map and in neither `dirty` nor `held`,
 	/// which is a pass planning over an agreement nobody recorded.
-	fn index_agrees_with_every_row(tree: &Baseline) {
+	fn index_agrees_with_every_row(tree: &Tree) {
 		let mut rows = Vec::new();
 		tree.visit_rows(|row| rows.push(row.clone()));
 		for row in rows {
@@ -1343,7 +1346,7 @@ mod tests {
 	}
 
 	/// Every term of [`ResidentTerms`] is in the total, and the total is what
-	/// [`Baseline::resident_bytes`] answers.
+	/// [`Tree::resident_bytes`] answers.
 	///
 	/// The struct is destructured EXHAUSTIVELY here on purpose: a term added to it and left out of
 	/// [`ResidentTerms::named`] would otherwise be missing from every total silently, and a
@@ -1353,7 +1356,7 @@ mod tests {
 	#[cfg(feature = "bench-internals")]
 	#[test]
 	fn every_resident_term_is_in_the_total() {
-		let tree = Baseline::from_rows([
+		let tree = Tree::from_rows([
 			file("docs/a.txt", Uuid::from_u128(1), [1; 32]),
 			file("docs/b.txt", Uuid::from_u128(2), [2; 32]),
 			dir("docs"),
@@ -1418,7 +1421,7 @@ mod tests {
 			..whole.clone()
 		};
 
-		let mut tree = Baseline::from_rows([whole.clone()]);
+		let mut tree = Tree::from_rows([whole.clone()]);
 		assert_eq!(tree.carryable_rows(), 1);
 		assert!(tree.carryable("docs/a.txt"));
 		assert_eq!(tree.uncarryable_paths().count(), 0);
@@ -1493,7 +1496,7 @@ mod tests {
 	/// walk knowing anything about observations.
 	#[test]
 	fn the_folded_subtree_walk_lets_the_caller_choose_which_rows_count() {
-		let tree = Baseline::from_rows([
+		let tree = Tree::from_rows([
 			file("Docs/a.txt", Uuid::from_u128(1), [1; 32]),
 			file("notes", Uuid::from_u128(2), [2; 32]),
 		]);
@@ -1553,7 +1556,7 @@ mod tests {
 		}
 	}
 
-	fn paths(baseline: &Baseline) -> Vec<String> {
+	fn paths(baseline: &Tree) -> Vec<String> {
 		let mut all: Vec<String> = baseline.paths().collect();
 		all.sort();
 		all
@@ -1654,7 +1657,7 @@ mod tests {
 	#[test]
 	fn renaming_forever_does_not_grow_the_name_arena_forever() {
 		let keepers: Vec<String> = (0..50).map(|i| format!("keep/k{i}.txt")).collect();
-		let mut tree = Baseline::from_rows(
+		let mut tree = Tree::from_rows(
 			std::iter::once(dir("keep")).chain(
 				keepers
 					.iter()
@@ -1720,7 +1723,7 @@ mod tests {
 			..file("a/pushed.bin", Uuid::new_v4(), [2; 32])
 		};
 		let plain = dir("a");
-		let baseline = Baseline::from_rows([held.clone(), unconfirmed.clone(), plain.clone()]);
+		let baseline = Tree::from_rows([held.clone(), unconfirmed.clone(), plain.clone()]);
 
 		assert_eq!(baseline.get("a/b/c.txt"), Some(held));
 		assert_eq!(baseline.get("a/pushed.bin"), Some(unconfirmed));
@@ -1734,13 +1737,13 @@ mod tests {
 	/// deleted, and a row moved all have to leave the answer describing where things are.
 	///
 	/// The tree no longer indexes either id — the store does — so this asks the way a pass asks,
-	/// through [`Baseline::synced_paths`], which is the walking twin of
+	/// through [`Tree::synced_paths`], which is the walking twin of
 	/// [`BaselineStore::synced_paths`](super::baseline::BaselineStore::synced_paths).
 	#[test]
 	fn the_uuid_and_lineage_lookups_follow_the_rows() {
 		let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
 		let held_by_the_dir = Uuid::new_v4();
-		let mut baseline = Baseline::from_rows([
+		let mut baseline = Tree::from_rows([
 			BaselineEntry {
 				remote_uuid: Some(held_by_the_dir),
 				..dir("d")
@@ -1748,7 +1751,7 @@ mod tests {
 			file("d/x.txt", first, [1; 32]),
 		]);
 		let lineage = StableUuid::new_for_test(first);
-		let at = |tree: &Baseline, uuid: Uuid| tree.synced_paths(&[uuid], &[]).path_by_uuid(uuid);
+		let at = |tree: &Tree, uuid: Uuid| tree.synced_paths(&[uuid], &[]).path_by_uuid(uuid);
 		assert_eq!(at(&baseline, first).as_deref(), Some("d/x.txt"));
 		assert_eq!(
 			baseline
@@ -1778,7 +1781,7 @@ mod tests {
 	/// under it. `""` holds nothing, exactly as the path-keyed form it replaces answered.
 	#[test]
 	fn occupied_finds_any_spelling_at_or_under_a_path() {
-		let baseline = Baseline::from_rows([
+		let baseline = Tree::from_rows([
 			dir("Photos"),
 			file("Photos/Ärger.txt", Uuid::new_v4(), [1; 32]),
 			dir("empty_parent/inner"),
@@ -1802,7 +1805,7 @@ mod tests {
 	/// about to untrack exist, and those are keyed the way the store keys them.
 	#[test]
 	fn tracked_asks_about_the_exact_path_and_a_directorys_subtree() {
-		let baseline = Baseline::from_rows([dir("a"), file("a/b/c.txt", Uuid::new_v4(), [1; 32])]);
+		let baseline = Tree::from_rows([dir("a"), file("a/b/c.txt", Uuid::new_v4(), [1; 32])]);
 
 		assert!(baseline.tracked("a", false));
 		assert!(baseline.tracked("a/b", true), "a row under it");
@@ -1817,7 +1820,7 @@ mod tests {
 	fn two_siblings_that_fold_together_are_both_addressable() {
 		let (upper, lower) = (Uuid::new_v4(), Uuid::new_v4());
 		let baseline =
-			Baseline::from_rows([file("A.txt", upper, [1; 32]), file("a.txt", lower, [2; 32])]);
+			Tree::from_rows([file("A.txt", upper, [1; 32]), file("a.txt", lower, [2; 32])]);
 
 		assert_eq!(baseline.len(), 2);
 		assert_eq!(baseline.get("A.txt").unwrap().remote_uuid, Some(upper));
@@ -1829,8 +1832,7 @@ mod tests {
 	/// a path that still holds children keeps the path reachable.
 	#[test]
 	fn a_path_only_node_lives_exactly_as_long_as_its_subtree() {
-		let mut baseline =
-			Baseline::from_rows([dir("a"), file("a/b/c.txt", Uuid::new_v4(), [1; 32])]);
+		let mut baseline = Tree::from_rows([dir("a"), file("a/b/c.txt", Uuid::new_v4(), [1; 32])]);
 
 		baseline.remove("a");
 		assert_eq!(baseline.len(), 1);
@@ -1853,7 +1855,7 @@ mod tests {
 	#[test]
 	fn a_subtree_move_re_keys_its_rows_and_overwrites_only_what_it_lands_on() {
 		let moved = Uuid::new_v4();
-		let mut baseline = Baseline::from_rows([
+		let mut baseline = Tree::from_rows([
 			dir("a"),
 			file("a/x.txt", moved, [1; 32]),
 			dir("b"),
@@ -1882,7 +1884,7 @@ mod tests {
 	#[test]
 	fn removing_a_subtree_drops_the_root_and_its_rows_only() {
 		let (dropped, kept) = (Uuid::new_v4(), Uuid::new_v4());
-		let mut baseline = Baseline::from_rows([
+		let mut baseline = Tree::from_rows([
 			dir("build"),
 			file("build/out.bin", dropped, [1; 32]),
 			file("builder.txt", kept, [2; 32]),
@@ -1912,7 +1914,7 @@ mod tests {
 	#[test]
 	fn the_pair_root_and_a_second_claim_on_one_uuid_are_refused() {
 		let shared = Uuid::new_v4();
-		let mut baseline = Baseline::from_rows([dir("d"), file("d/x.txt", shared, [1; 32])]);
+		let mut baseline = Tree::from_rows([dir("d"), file("d/x.txt", shared, [1; 32])]);
 
 		baseline.remove_subtrees(&BTreeSet::from([String::new()]));
 		baseline.move_subtree("", "e");
@@ -1949,7 +1951,7 @@ mod tests {
 	#[test]
 	fn unconfirmed_holds_the_rows_awaiting_confirmation_only() {
 		let pushed = Uuid::new_v4();
-		let mut baseline = Baseline::from_rows([
+		let mut baseline = Tree::from_rows([
 			BaselineEntry {
 				agreed_hash: None,
 				..file("pushed.txt", pushed, [1; 32])
@@ -1987,7 +1989,7 @@ mod tests {
 	/// it that is not `Synced` is a divergence the per-path plan has to see.
 	#[test]
 	fn subtree_all_synced_sees_every_row_under_a_directory() {
-		let mut baseline = Baseline::from_rows([
+		let mut baseline = Tree::from_rows([
 			dir("a"),
 			file("a/x.txt", Uuid::new_v4(), [1; 32]),
 			file("a/deep/y.txt", Uuid::new_v4(), [2; 32]),
@@ -2005,12 +2007,11 @@ mod tests {
 		assert!(!baseline.subtree_all_synced("a"));
 	}
 
-	/// The store hands its write paths to [`Baseline::apply`] as changes; each one has to land the
+	/// The store hands its write paths to [`Tree::apply`] as changes; each one has to land the
 	/// way the statement it mirrors lands.
 	#[test]
 	fn applying_a_change_list_mirrors_each_statement() {
-		let mut baseline =
-			Baseline::from_rows([dir("a"), file("a/x.txt", Uuid::new_v4(), [1; 32])]);
+		let mut baseline = Tree::from_rows([dir("a"), file("a/x.txt", Uuid::new_v4(), [1; 32])]);
 		let created = file("b/new.txt", Uuid::new_v4(), [5; 32]);
 
 		baseline.apply(&[
@@ -2023,12 +2024,12 @@ mod tests {
 		assert_eq!(baseline.len(), 2);
 	}
 
-	/// The cursor is a memo over [`Baseline::get`] and has to answer identically — for a path whose
+	/// The cursor is a memo over [`Tree::get`] and has to answer identically — for a path whose
 	/// directory it has never seen, for one that is no row, for a sibling that folds onto another
 	/// spelling, and after a miss, which must leave the directory it holds consistent.
 	#[test]
 	fn the_cursor_answers_exactly_what_a_fresh_lookup_answers() {
-		let baseline = Baseline::from_rows([
+		let baseline = Tree::from_rows([
 			dir("a"),
 			file("a/x.txt", Uuid::new_v4(), [1; 32]),
 			file("a/X.txt", Uuid::new_v4(), [2; 32]),
@@ -2059,7 +2060,7 @@ mod tests {
 	/// second walk, since it reuses one buffer.
 	#[test]
 	fn visiting_the_paths_hands_out_what_collecting_them_does() {
-		let baseline = Baseline::from_rows([
+		let baseline = Tree::from_rows([
 			dir("a"),
 			file("a/x.txt", Uuid::new_v4(), [1; 32]),
 			file("a/X.txt", Uuid::new_v4(), [2; 32]),
@@ -2081,7 +2082,7 @@ mod tests {
 			"the reused buffer must not leak between walks"
 		);
 
-		let empty = Baseline::default();
+		let empty = Tree::default();
 		let mut none = Vec::new();
 		empty.visit_row_paths(|path| none.push(path.to_string()));
 		assert!(none.is_empty(), "a pair with no rows visits nothing");
@@ -2091,7 +2092,7 @@ mod tests {
 	/// nameless row would be a row nothing can address.
 	#[test]
 	fn a_row_with_no_path_is_refused() {
-		let mut baseline = Baseline::default();
+		let mut baseline = Tree::default();
 		baseline.upsert(&file("", Uuid::new_v4(), [1; 32]));
 		assert!(baseline.is_empty());
 	}

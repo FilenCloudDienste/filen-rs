@@ -53,9 +53,9 @@ use super::{
 	observe,
 	plan::{self, PassHolds, RemoteNode, RemoteView},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
+	rows::Baseline,
 	scan::{self, LocalNode, LocalScan, RuleFiles},
 	side::{FromRow, Nodes, NodesAt, Side},
-	tree::Baseline,
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -2147,7 +2147,7 @@ pub fn run() -> String {
 	// The store held the other handle on the resident tree until `baseline_first_write` above took
 	// its own copy, so this detaching write is free; it is here so that a run which ever stops
 	// being true cannot charge a whole-tree clone to the fold.
-	let _ = Arc::make_mut(&mut baseline);
+	let _ = baseline.tree_mut();
 	let moved_root = format!("{rename_root}-moved");
 	let move_scope = BTreeSet::from([rename_root.clone(), moved_root.clone()]);
 	let mut remote_at = rename_root.clone();
@@ -2793,8 +2793,9 @@ pub fn run() -> String {
 	// this run's memory column incomparable with the ones already recorded.
 	const FLAT_CHILDREN: usize = 100_000;
 	const FLAT_INSERTS: usize = 1_000;
-	let mut flat =
-		Baseline::from_rows((0..FLAT_CHILDREN).map(|index| plain_row(&format!("flat/{index:07}"))));
+	let mut flat = super::tree::Tree::from_rows(
+		(0..FLAT_CHILDREN).map(|index| plain_row(&format!("flat/{index:07}"))),
+	);
 	let (_, flat_inserts) = timed(|| {
 		// `!` sorts before every digit, so each of these lands at the FRONT of the child vector:
 		// the worst position, and the one a name-ordered walk into a full directory keeps hitting.

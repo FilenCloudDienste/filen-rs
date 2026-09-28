@@ -41,9 +41,9 @@ use super::{
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
+	rows::Baseline,
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::NodesAt,
-	tree::Baseline,
 };
 use crate::{
 	auth::Client,
