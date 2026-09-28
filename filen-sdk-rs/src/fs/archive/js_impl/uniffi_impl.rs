@@ -32,7 +32,8 @@ pub trait ExtractArchiveCallback: Send + Sync {
 pub trait ListArchiveCallback: Send + Sync {
 	/// Entries, in batches as they are read, each batch before the update that counts it:
 	/// every one of them, also past what the listing keeps, unless this is still busy with 16
-	/// MiB of earlier ones (see `ListUpdate.undelivered_entries`).
+	/// MiB of earlier ones, counting the entries as well as their text (see
+	/// `ListUpdate.undelivered_entries`).
 	fn on_entries(&self, entries: Vec<ArchiveEntry>);
 	fn on_update(&self, update: ListUpdate);
 }

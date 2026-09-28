@@ -11,6 +11,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
+			alloc_meter,
 			compress::{Compression, SevenZMethod, StreamCodec, ZipMethod},
 			config::CODEC_MEM_BUDGET,
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
@@ -830,4 +831,26 @@ fn a_listing_holds_no_more_entries_than_its_limit_for_an_app_that_lags() {
 	assert_eq!(channel.queued.load(Ordering::Relaxed), 0);
 	channel.on_entries(vec![big(0)]);
 	assert!(matches!(delivery.try_recv(), Ok(ListDelivery::Entries(..))));
+}
+
+#[test]
+fn a_listing_holds_no_more_memory_than_its_limit_in_short_entries() {
+	let (sender, delivery) = tokio::sync::mpsc::unbounded_channel();
+	let channel = ListChannel::new(sender);
+	// short paths: the entries holding them cost several times their text, which alone would
+	// let all of them queue for an app that never takes one
+	let sent = 300_000;
+	let ((), peak) = alloc_meter::peak_bytes(|| {
+		for index in 0..sent {
+			channel.on_entries(vec![archive_entry(index)]);
+		}
+	});
+	// what one batch takes on its way in, and the channel's own blocks
+	const SLACK: u64 = 1 << 20;
+	assert!(
+		peak <= MAX_UNDELIVERED_ENTRY_BYTES as u64 + SLACK,
+		"{peak} bytes held"
+	);
+	assert!(channel.undelivered.load(Ordering::Relaxed) > 0);
+	drop(delivery);
 }

@@ -301,8 +301,9 @@ pub struct ListUpdate {
 	/// Entries listed so far.
 	pub entries: u64,
 	/// Entries the entries callback did not receive, since it had not returned from the earlier
-	/// ones yet while 16 MiB of their text waited for it; they are counted in `entries` all the
-	/// same, and a listing of an archive this large is best shown from its own `entries`.
+	/// ones yet while 16 MiB of them (the entries and their text) waited for it; they are counted
+	/// in `entries` all the same, and a listing of an archive this large is best shown from its
+	/// own `entries`.
 	pub undelivered_entries: u64,
 	pub bytes_per_second: Option<u64>,
 	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a
@@ -832,10 +833,11 @@ async fn extract_job(
 	})
 }
 
-/// Text of listed entries (paths, targets, methods) handed to the delivery task and not yet
-/// taken by the app, past which a listing's later batches are dropped, and counted, rather than
-/// queued: the SDK hands over every entry as it reads it, and an app slower than the reading
-/// would otherwise buffer a million entries' paths. As much as a listing keeps.
+/// Memory of listed entries handed to the delivery task and not yet taken by the app (the
+/// entries, their text and the message carrying them), past which a listing's later batches are
+/// dropped, and counted, rather than queued: the SDK hands over every entry as it reads it, and
+/// an app slower than the reading would otherwise buffer a million entries. As much as a listing
+/// keeps of their text.
 const MAX_UNDELIVERED_ENTRY_BYTES: usize = MAX_LISTED_BYTES;
 
 /// A listing's callback, converted for the bindings.
@@ -845,8 +847,8 @@ enum ListDelivery {
 	Update(ListUpdate),
 }
 
-/// The text of a batch of entries on its way to the app, given back once it is delivered (or
-/// dropped undelivered).
+/// The memory a batch of entries on its way to the app holds, given back once it is delivered
+/// (or dropped undelivered).
 struct QueuedEntries {
 	bytes: usize,
 	queued: Arc<AtomicUsize>,
@@ -862,7 +864,7 @@ impl Drop for QueuedEntries {
 /// their order, holding no more entries than [`MAX_UNDELIVERED_ENTRY_BYTES`] allows.
 struct ListChannel {
 	sender: UnboundedSender<ListDelivery>,
-	/// The text of the entries sent and not yet delivered.
+	/// The memory of the entries sent and not yet delivered.
 	queued: Arc<AtomicUsize>,
 	/// Entries dropped since the app had not taken the earlier ones yet.
 	undelivered: Arc<AtomicU64>,
@@ -880,7 +882,11 @@ impl ListChannel {
 
 impl ListCallback for ListChannel {
 	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
-		let bytes = entries.iter().map(ArchiveEntry::text_bytes).sum();
+		// a short path costs less than the entry holding it, so the text alone would let a
+		// lagging app queue several times the limit in entries
+		let bytes = size_of::<ListDelivery>()
+			+ entries.capacity() * size_of::<ArchiveEntry>()
+			+ entries.iter().map(ArchiveEntry::text_bytes).sum::<usize>();
 		// a batch always fits an empty queue, however large
 		let reserved = self
 			.queued

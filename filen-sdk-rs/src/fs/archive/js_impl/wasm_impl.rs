@@ -130,7 +130,8 @@ pub struct ListArchiveParams {
 	pub skip_mac_metadata: Option<bool>,
 	/// Entries, in batches as they are read, each batch before the update that counts it:
 	/// every one of them, also past what the listing keeps, unless this is still busy with 16
-	/// MiB of earlier ones (see `ListUpdate.undeliveredEntries`).
+	/// MiB of earlier ones, counting the entries as well as their text (see
+	/// `ListUpdate.undeliveredEntries`).
 	#[tsify(type = "(entries: ArchiveEntry[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_entries: Option<js_sys::Function>,
