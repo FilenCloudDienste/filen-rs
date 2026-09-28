@@ -1303,6 +1303,32 @@ async fn mac_metadata_left_out_keeps_nothing_from_removing_the_archive() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordinary_file_in_a_mac_folder_is_extracted_before_the_archive_goes() {
+	// a file is only macOS metadata when its data says so, wherever it is stored
+	let tar = tar_of(&[
+		("__MACOSX/thesis.docx", b"irreplaceable"),
+		("a.txt", b"alpha"),
+	]);
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::DeletePermanently,
+		ExtractRoot::NewFolder { name: None },
+		|_| {},
+	)
+	.await;
+	assert_eq!(
+		finished_paths(&setup),
+		["bundle/__MACOSX/thesis.docx", "bundle/a.txt"]
+	);
+	assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+	assert!(matches!(
+		disposition(&report),
+		DisposalOutcome::Disposed { .. }
+	));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_that_cannot_be_verified_is_kept() {
 	let tar = good_tar();
 	let new_folder = || ExtractRoot::NewFolder { name: None };

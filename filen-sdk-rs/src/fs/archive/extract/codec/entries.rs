@@ -72,10 +72,11 @@ const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
 /// How an entry's path marks it as macOS metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MacShape {
-	/// In a `__MACOSX` folder: its path says it all.
+	/// A `__MACOSX` folder, or anything but a file in one: its path says it all.
 	InMacFolder,
-	/// A file named `._name`, which an ordinary file may be too: an AppleDouble file when its
-	/// first bytes say so.
+	/// A file in a `__MACOSX` folder or named `._name`, which an ordinary file may be too: an
+	/// AppleDouble file when its first bytes say so. A file is never left out by its path alone,
+	/// so an archive that is removed once extracted takes no ordinary file with it.
 	AppleDoubleName,
 }
 
@@ -104,15 +105,15 @@ impl Found<'_> {
 	/// How its path marks it as macOS metadata, if it does.
 	pub(super) fn mac_shape(&self) -> Option<MacShape> {
 		let path = self.path.as_ref().ok()?;
-		if path
+		let in_mac_folder = path
 			.segments
 			.first()
-			.is_some_and(|first| first.as_ref() == MAC_METADATA_DIR)
-		{
-			return Some(MacShape::InMacFolder);
+			.is_some_and(|first| first.as_ref() == MAC_METADATA_DIR);
+		if self.kind != ArchiveEntryKind::File {
+			return in_mac_folder.then_some(MacShape::InMacFolder);
 		}
-		let apple_double = self.kind == ArchiveEntryKind::File
-			&& path.segments.last().is_some_and(|name| {
+		let apple_double = in_mac_folder
+			|| path.segments.last().is_some_and(|name| {
 				let name: &str = name.as_ref();
 				name.len() > 2 && name.starts_with("._")
 			});
@@ -252,8 +253,8 @@ impl<'p> Walk<'p> {
 			// the archive's own root, which no extraction creates
 			return Ok(false);
 		}
-		// an extraction reads a `._` file's data to tell whether it is AppleDouble: where a
-		// listing did not, it marks the entry by its name, and does not say it is skipped
+		// an extraction reads a file's data to tell whether it is AppleDouble: where a listing
+		// did not, it marks the entry by its path, and does not say it is skipped
 		let (mac_metadata, left_out) = match found.mac_shape() {
 			Some(MacShape::InMacFolder) => (true, true),
 			Some(MacShape::AppleDoubleName) => {
@@ -324,8 +325,8 @@ impl<'p> Walk<'p> {
 	}
 
 	/// Bytes of the `files` (by ordinal, path as stored and size) the job extracts: every one
-	/// with a usable path, or those a partial extraction chose. What is known to be left out as
-	/// macOS metadata by its path does not count.
+	/// with a usable path, or those a partial extraction chose. A file that may be macOS
+	/// metadata counts: only its data tells.
 	pub(super) fn extracted_bytes<'e>(
 		&self,
 		files: impl Iterator<Item = (u64, &'e str, u64)>,
@@ -333,25 +334,13 @@ impl<'p> Walk<'p> {
 		let mut chooser = self.chooser.clone();
 		files
 			.filter(|&(ordinal, stored, _)| {
-				let found = Found {
-					ordinal,
-					stored,
-					path: entry_path(stored),
-					kind: ArchiveEntryKind::File,
-					unreadable: None,
-					size: 0,
-					modified: None,
-					encrypted: false,
-					method: None,
-				};
-				let chosen = match &mut chooser {
-					None => found.path.is_ok(),
+				let path = entry_path(stored);
+				match &mut chooser {
+					None => path.is_ok(),
 					Some(chooser) => chooser
-						.choose(ordinal, &found.path, false)
+						.choose(ordinal, &path, false)
 						.is_ok_and(|path| path.is_some_and(|path| path.is_ok())),
-				};
-				chosen
-					&& !(self.skip_mac_metadata && found.mac_shape() == Some(MacShape::InMacFolder))
+				}
 			})
 			.fold(0u64, |total, (_, _, size)| total.saturating_add(size))
 	}

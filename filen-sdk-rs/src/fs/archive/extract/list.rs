@@ -109,10 +109,11 @@ pub struct ArchiveEntry {
 	pub path_rewritten: bool,
 	/// Its path reads as something it is not (an extraction reports it as a misleading name).
 	pub misleading_name: bool,
-	/// macOS metadata: inside a `__MACOSX` folder, or an AppleDouble `._` file. A tar's `._`
-	/// file is told by its data, which a listing reads; a zip's, 7z's or single file's by its
-	/// name alone, so `skip` leaves it out: an extraction checks its data, and extracts it when
-	/// it is an ordinary file after all. See the extraction's `skip_mac_metadata`.
+	/// macOS metadata: a `__MACOSX` folder, or an AppleDouble file (named `._name`, or any file
+	/// in a `__MACOSX` folder). A tar's file is told by its data, which a listing reads; a
+	/// zip's, 7z's or single file's by its path alone, so `skip` leaves it out: an extraction
+	/// checks its data, and extracts it when it is an ordinary file after all. See the
+	/// extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
 }
 

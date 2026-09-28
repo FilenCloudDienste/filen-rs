@@ -1515,6 +1515,19 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 			skip.then_some(ExtractSkipReason::MacMetadata)
 		);
 	}
+	// so is a file in a `__MACOSX` folder, which is no metadata when its data is ordinary
+	let tar = tar_of(&[("__MACOSX/", b""), ("__MACOSX/notes.txt", b"plain")]);
+	let (entries, _) = listed(
+		&tar,
+		job_of(&tar, "m.tar", true, Task::List { archive: LISTED }),
+	);
+	assert_eq!(
+		entries
+			.iter()
+			.map(|entry| (entry.mac_metadata, entry.skip.clone()))
+			.collect::<Vec<_>>(),
+		[(true, Some(ExtractSkipReason::MacMetadata)), (false, None)]
+	);
 }
 
 #[test]

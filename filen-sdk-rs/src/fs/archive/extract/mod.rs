@@ -158,9 +158,9 @@ pub struct ExtractConfig {
 	/// then, the folders created so far go to the trash (a folder holding a file someone else put
 	/// there meanwhile stays).
 	pub password: Option<ArchivePassword>,
-	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them:
-	/// everything in a `__MACOSX` folder (Finder's zips) and AppleDouble files (`._name`, told by
-	/// the four bytes they start with), reported skipped as
+	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them: the
+	/// `__MACOSX` folders of Finder's zips and AppleDouble files (named `._name` or kept in such
+	/// a folder, told by the four bytes they start with), reported skipped as
 	/// [`ExtractSkipReason::MacMetadata`]. Left out on purpose, they keep nothing from removing
 	/// the archive once the rest is extracted. `true` by default; `false` extracts them as
 	/// ordinary files.
