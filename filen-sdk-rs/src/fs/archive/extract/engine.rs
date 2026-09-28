@@ -544,14 +544,10 @@ fn report_kept_on_early_end(
 	}
 }
 
-/// Records `failure` in `report`; the event's copy of it, while the report keeps records.
-fn record_failure(report: &mut ExtractReport, failure: ExtractFailure) -> Option<ExtractFailure> {
-	keep(
-		&mut report.failures,
-		&mut report.omitted.failures,
-		failure.clone(),
-	)
-	.then_some(failure)
+/// Records `record` in `list`, or counts it in `omitted` past the records a report keeps (see
+/// [`keep`]); `record` back for its event while the report keeps them.
+fn record<T: Clone>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> Option<T> {
+	keep(list, omitted, record.clone()).then_some(record)
 }
 
 /// Records `file` as failed at `stage`, in `report` and as an event, to be tried again as
@@ -576,7 +572,7 @@ fn report_file_failure<U>(
 	reporter.file_failed(
 		Some(file.active.dest_uuid),
 		file.bytes(),
-		record_failure(report, failure),
+		record(&mut report.failures, &mut report.omitted.failures, failure),
 	);
 }
 
@@ -1112,18 +1108,18 @@ impl<B: DisposalBackend> Driver<B> {
 		name: &ValidatedName,
 		reason: ExtractRenameReason,
 	) {
-		let record = ExtractRenamedEntry {
+		let renamed = ExtractRenamedEntry {
 			entry,
 			path,
 			name: name.as_ref().to_owned(),
 			reason,
 		};
-		if keep(
+		if let Some(renamed) = record(
 			&mut self.report.renamed,
 			&mut self.report.omitted.renamed,
-			record.clone(),
+			renamed,
 		) {
-			self.reporter.event(ExtractEvent::Renamed(record));
+			self.reporter.event(ExtractEvent::Renamed(renamed));
 		}
 	}
 
@@ -1146,19 +1142,19 @@ impl<B: DisposalBackend> Driver<B> {
 		if member.reason == ExtractSkipReason::MacMetadata {
 			self.left_out += 1;
 		}
-		let record = ExtractSkippedEntry {
+		let skipped = ExtractSkippedEntry {
 			entry: self.entry_id(member.ordinal),
 			path: member.path,
 			path_truncated: member.path_truncated,
 			bytes: member.bytes,
 			reason: member.reason,
 		};
-		let kept = keep(
+		let kept = record(
 			&mut self.report.skipped,
 			&mut self.report.omitted.skipped,
-			record.clone(),
+			skipped,
 		);
-		self.reporter.skipped(member.bytes, kept.then_some(record));
+		self.reporter.skipped(member.bytes, kept);
 	}
 
 	fn on_entry(&mut self, head: EntryHead) {
@@ -1198,16 +1194,17 @@ impl<B: DisposalBackend> Driver<B> {
 			);
 		}
 		if path.suspicious {
-			let record = ExtractMisleadingName {
+			let misleading = ExtractMisleadingName {
 				entry,
 				path: joined,
 			};
-			if keep(
+			if let Some(misleading) = record(
 				&mut self.report.misleading_names,
 				&mut self.report.omitted.misleading_names,
-				record.clone(),
+				misleading,
 			) {
-				self.reporter.event(ExtractEvent::MisleadingName(record));
+				self.reporter
+					.event(ExtractEvent::MisleadingName(misleading));
 			}
 		}
 	}
@@ -1544,8 +1541,11 @@ impl<B: DisposalBackend> Driver<B> {
 					retry: Some(self.retry(self.dirs[dir].parent)),
 					error: Arc::clone(&error),
 				};
-				self.reporter
-					.dir_failed(record_failure(&mut self.report, failure));
+				self.reporter.dir_failed(record(
+					&mut self.report.failures,
+					&mut self.report.omitted.failures,
+					failure,
+				));
 				self.fail_subtree(dir, &error);
 			}
 		}
@@ -2017,31 +2017,26 @@ impl<B: DisposalBackend> Driver<B> {
 				let stage = ExtractStage::RegisteredAsVersion {
 					existing_file: registered.stable_uuid.into(),
 				};
-				let retry = self.file_retry(&file);
-				report_file_failure(
-					&mut self.report,
-					&self.reporter,
-					&file,
-					stage,
-					error.into(),
-					retry,
-				);
+				self.finalize_failed(&file, stage, Arc::new(error));
 			}
 			Err(FinalizeError::Failed(error)) => {
 				self.link_target_failed(ordinal);
 				let error = Arc::new(error);
 				self.note_error(&error);
-				let retry = self.file_retry(&file);
-				report_file_failure(
-					&mut self.report,
-					&self.reporter,
-					&file,
-					ExtractStage::Finalize,
-					error,
-					retry,
-				);
+				self.finalize_failed(&file, ExtractStage::Finalize, error);
 			}
 		}
+	}
+
+	/// Reports `file`, which could not be registered, as failed at `stage`.
+	fn finalize_failed(
+		&mut self,
+		file: &FileSlot<B::Upload>,
+		stage: ExtractStage,
+		error: Arc<Error>,
+	) {
+		let retry = self.file_retry(file);
+		report_file_failure(&mut self.report, &self.reporter, file, stage, error, retry);
 	}
 
 	/// Whether every entry the archive holds is extracted: none failed, and none skipped but the
