@@ -312,6 +312,46 @@ impl DisposalOutcome {
 	}
 }
 
+/// How a job's sources nest, as [`nesting`] tells it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Nesting {
+	/// The source each one is removed with: the outermost of those it lies within, or itself.
+	pub(crate) outermost: Vec<usize>,
+	/// Whether it lies on or behind a chain of sources that loops back on itself.
+	pub(crate) cyclic: Vec<bool>,
+}
+
+/// How sources nest, from the source each one lies directly `within` (if any): a source inside
+/// another goes with that one, whose removal removes it. A move between two folders' listings
+/// can leave each read holding the other: a chain like that has no outermost source, so every
+/// source on or behind it goes with itself, and is marked cyclic.
+pub(crate) fn nesting(within: &[Option<usize>]) -> Nesting {
+	let cyclic: Vec<bool> = (0..within.len())
+		.map(|source| {
+			let mut outer = source;
+			for _ in 0..within.len() {
+				match within[outer] {
+					Some(next) => outer = next,
+					None => return false,
+				}
+			}
+			true
+		})
+		.collect();
+	// the chains left are acyclic: none reaches a cyclic source, or it would be one
+	let outermost = (0..within.len())
+		.map(|mut outer| {
+			while !cyclic[outer]
+				&& let Some(next) = within[outer]
+			{
+				outer = next;
+			}
+			outer
+		})
+		.collect();
+	Nesting { outermost, cyclic }
+}
+
 fn failed(error: Error) -> DisposalOutcome {
 	DisposalOutcome::kept(KeptReason::Failed {
 		error: Arc::new(error),
@@ -444,5 +484,45 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 			},
 			bytes_freed,
 		),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn a_source_goes_with_the_outermost_one_it_lies_within() {
+		// 2 in 1 in 0, and 3 on its own
+		assert_eq!(
+			nesting(&[None, Some(0), Some(1), None]),
+			Nesting {
+				outermost: vec![0, 0, 0, 3],
+				cyclic: vec![false; 4],
+			}
+		);
+		// 0 and 1 in each other, 2 in 1, 3 on its own: the loop and what is behind it go alone
+		assert_eq!(
+			nesting(&[Some(1), Some(0), Some(1), None]),
+			Nesting {
+				outermost: vec![0, 1, 2, 3],
+				cyclic: vec![true, true, true, false],
+			}
+		);
+		// a source within itself is a loop too
+		assert_eq!(
+			nesting(&[Some(0)]),
+			Nesting {
+				outermost: vec![0],
+				cyclic: vec![true],
+			}
+		);
+		assert_eq!(
+			nesting(&[]),
+			Nesting {
+				outermost: vec![],
+				cyclic: vec![],
+			}
+		);
 	}
 }

@@ -34,8 +34,9 @@ use crate::{
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			dispose::{
-				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
-				SourceDisposition, Tree, dispose_dir, dispose_file, kept_on_early_end,
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, Nesting,
+				SourceDisposal, SourceDisposition, Tree, dispose_dir, dispose_file,
+				kept_on_early_end, nesting,
 			},
 			hash::HeadLastHasher,
 			limits::MAX_REPORT_RECORDS,
@@ -805,7 +806,7 @@ impl<B: DisposalBackend> Driver<B> {
 		self.reporter.set_phase(CompressPhase::DisposingSources);
 		// a source inside another (a file and its folder both given) goes with that one: its
 		// removal removes it, and its own attempt would only find it gone
-		let mut within: Vec<Option<usize>> = targets
+		let within: Vec<Option<usize>> = targets
 			.iter()
 			.enumerate()
 			.map(|(index, target)| {
@@ -827,37 +828,7 @@ impl<B: DisposalBackend> Driver<B> {
 				})
 			})
 			.collect();
-		// a move between two folders' listings can leave each read holding the other: a chain
-		// like that has no outermost source, so every source on or behind it is kept as changed
-		let cyclic: Vec<bool> = (0..within.len())
-			.map(|request| {
-				let mut outer = request;
-				for _ in 0..within.len() {
-					match within[outer] {
-						Some(next) => outer = next,
-						None => return false,
-					}
-				}
-				true
-			})
-			.collect();
-		for (within, _) in within
-			.iter_mut()
-			.zip(&cyclic)
-			.filter(|(_, cyclic)| **cyclic)
-		{
-			*within = None;
-		}
-		// the outermost source each one goes with (itself, if none): the chains are acyclic, the
-		// cycles were cut above
-		let outermost: Vec<usize> = (0..within.len())
-			.map(|mut outer| {
-				while let Some(next) = within[outer] {
-					outer = next;
-				}
-				outer
-			})
-			.collect();
+		let Nesting { outermost, cyclic } = nesting(&within);
 		let uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
 		let files: Vec<bool> = targets
 			.iter()
