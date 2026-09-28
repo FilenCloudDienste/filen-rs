@@ -16,18 +16,19 @@ use super::*;
 use crate::{
 	consts::CHUNK_SIZE,
 	fs::{
-		HasName,
 		archive::{
-			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			config::CODEC_MEM_BUDGET,
 			entry_path::entry_path,
 			extract::{
-				ArchiveEntry, ArchiveEntryKind, ArchiveListing, ArchiveTotals, ExpansionLimit,
-				ExtractCallback, ExtractEvent, ExtractSkipReason, ExtractStage, ExtractUpdate,
-				ListCallback, ListFailed, ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES,
-				MAX_LISTED_ENTRIES, PasswordCheck, RunState,
-				codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
-				list::{ListReporter, ListTask, run_list},
+				ArchiveEntryKind, ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractEvent,
+				ExtractSkipReason, ExtractStage, ExtractUpdate, ListPhase, ListTotals,
+				MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck, RunState,
+				codec::{Selection, extract_stream},
 				report::CALLBACK_BATCH,
+				test_support::{
+					ARCHIVE_PARENT, MAX_MEMBERS, Options, Setup, archive_file_with, list, setup,
+					setup_in, stream_job, test_config,
+				},
 			},
 			worker,
 		},
@@ -42,8 +43,7 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			test_support::{
-				TarMember, gzip, hash, incompressible, pattern, remote_file, sevenz_of, tar_of,
-				tar_with, zip_of,
+				TarMember, gzip, hash, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
 			},
 			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
@@ -109,52 +109,6 @@ impl Recorder {
 	}
 }
 
-/// The archive every test extracts, the directory it is in, and the one it is extracted into:
-/// fixed, so a failing test runs the same way again.
-const ARCHIVE: Uuid = Uuid::from_u128(0xA);
-const ARCHIVE_PARENT: Uuid = Uuid::from_u128(0xA0);
-const DESTINATION: Uuid = Uuid::from_u128(0xD);
-
-fn archive_file(name: &str, bytes: &[u8]) -> RemoteFileType<'static> {
-	archive_file_with(name, bytes, None)
-}
-
-fn archive_file_with(
-	name: &str,
-	bytes: &[u8],
-	hash: Option<Blake3Hash>,
-) -> RemoteFileType<'static> {
-	remote_file(ARCHIVE, ARCHIVE_PARENT, name, bytes, hash)
-}
-
-struct Setup {
-	backend: Arc<FakeBackend>,
-	destination: Uuid,
-	archive: RemoteFileType<'static>,
-}
-
-fn setup(name: &str, bytes: Vec<u8>, configure: impl FnOnce(&mut FakeBackend)) -> Setup {
-	setup_in(DESTINATION, name, bytes, configure)
-}
-
-/// [`setup`] for a job that extracts into `destination`.
-fn setup_in(
-	destination: Uuid,
-	name: &str,
-	bytes: Vec<u8>,
-	configure: impl FnOnce(&mut FakeBackend),
-) -> Setup {
-	let archive = archive_file(name, &bytes);
-	let mut backend = FakeBackend::new(destination);
-	backend.contents.insert(archive.uuid(), bytes);
-	configure(&mut backend);
-	Setup {
-		backend: Arc::new(backend),
-		destination,
-		archive,
-	}
-}
-
 type Running = JoinHandle<Result<ExtractReport, ExtractFailed>>;
 
 struct Job {
@@ -165,46 +119,6 @@ struct Job {
 
 /// The method the tests' 7z archives are compressed with.
 const LZMA2: SevenZMethod = SevenZMethod::Lzma2 { level: 1 };
-
-/// Members a test archive may have, for the codec and the driver alike.
-const MAX_MEMBERS: u64 = 2000;
-
-/// The archive settings of a test job, with [`MAX_MEMBERS`].
-fn test_config() -> ArchiveConfig {
-	let mut config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
-	config.max_members = MAX_MEMBERS;
-	config
-}
-
-struct Options {
-	root: ExtractRoot,
-	control: JobControl,
-	max_bytes: Option<u64>,
-	max_items: Option<u64>,
-	dispose: Option<(SourceDisposal, Uuid)>,
-	password: Option<ArchivePassword>,
-	/// Shared between jobs that compete for its slots.
-	config: ArchiveConfig,
-	/// Every entry, or those a partial extraction chose.
-	selection: Option<Selection>,
-	expansion: Option<ExpansionLimit>,
-}
-
-impl Default for Options {
-	fn default() -> Self {
-		Self {
-			root: ExtractRoot::NewFolder { name: None },
-			control: JobControl::default(),
-			max_bytes: None,
-			max_items: None,
-			dispose: None,
-			password: None,
-			config: test_config(),
-			selection: None,
-			expansion: Some(ExpansionLimit::DEFAULT),
-		}
-	}
-}
 
 fn start_with(
 	setup: &Setup,
@@ -256,24 +170,6 @@ fn start_with(
 		running,
 		recorder,
 		reporter,
-	}
-}
-
-/// What the real codec is given for `setup`'s archive.
-fn stream_job(setup: &Setup, options: &Options) -> StreamJob {
-	StreamJob {
-		name: setup.archive.name().unwrap().to_owned(),
-		len: setup.archive.size(),
-		limits: CodecLimits {
-			decoder_memory: CODEC_MEM_BUDGET,
-			max_members: options.config.max_members,
-			expansion: options.expansion,
-			max_index_bytes: 32 << 20,
-			max_bytes: options.max_bytes,
-		},
-		password: options.password.clone(),
-		skip_mac_metadata: true,
-		task: Task::Extract(options.selection.clone()),
 	}
 }
 
@@ -2975,62 +2871,6 @@ async fn a_failed_entry_is_extracted_again_where_it_was_meant_to_go() {
 	let job = start(&retry, chosen(&indices, &["docs"]));
 	job.running.await.unwrap().unwrap();
 	assert_eq!(finished_paths(&retry), ["a.txt", "deep/b.txt"]);
-}
-
-#[derive(Default)]
-struct ListRecorder {
-	/// The size of each `on_entries` batch, and every entry.
-	batches: Mutex<Vec<usize>>,
-	entries: Mutex<Vec<ArchiveEntry>>,
-	updates: Mutex<Vec<ListUpdate>>,
-}
-
-impl ListCallback for ListRecorder {
-	fn on_entries(&self, entries: Vec<ArchiveEntry>) {
-		self.batches.lock().unwrap().push(entries.len());
-		self.entries.lock().unwrap().extend(entries);
-	}
-
-	fn on_update(&self, update: ListUpdate) {
-		self.updates.lock().unwrap().push(update);
-	}
-}
-
-struct Listing {
-	running: JoinHandle<Result<ArchiveListing, ListFailed>>,
-	recorder: Arc<ListRecorder>,
-	reporter: MaybeArc<ListReporter>,
-}
-
-/// Lists `setup`'s archive with the real codec.
-fn list(setup: &Setup, control: JobControl, config: ArchiveConfig) -> Listing {
-	let recorder = Arc::new(ListRecorder::default());
-	let reporter = ListReporter::new(Arc::clone(&recorder), setup.archive.size());
-	let job = StreamJob {
-		task: Task::List {
-			archive: setup.archive.uuid(),
-		},
-		..stream_job(
-			setup,
-			&Options {
-				config: config.clone(),
-				..Options::default()
-			},
-		)
-	};
-	let running = tokio::spawn(run_list(ListTask {
-		backend: Arc::clone(&setup.backend),
-		control,
-		reporter: MaybeArc::clone(&reporter),
-		archive: setup.archive.clone(),
-		config,
-		start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
-	}));
-	Listing {
-		running,
-		recorder,
-		reporter,
-	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
