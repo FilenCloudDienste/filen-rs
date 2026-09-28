@@ -355,12 +355,14 @@ pub(super) fn apple_double(data: &mut dyn Read) -> io::Result<(bool, Vec<u8>)> {
 	Ok((head == APPLE_DOUBLE_MAGIC, head))
 }
 
-/// What a hard link's target is looked up by among the files extracted before it: its path, as
-/// the archive stores the file's (case and all), in 16 bytes, so a million files cost 16 MB of
-/// keys rather than their paths.
-pub(crate) fn link_key(path: &ArchivePath) -> u128 {
+/// What a hard link's target is looked up by among the files extracted (or listed) before it:
+/// its path, as the archive stores the file's (case and all), in the first 8 bytes of its
+/// BLAKE3, so a million files cost 8 MB of keys rather than their paths. Two paths of a million
+/// share a key about once in 36 billion archives, and then a link copies another file of the
+/// same archive.
+pub(crate) fn link_key(path: &ArchivePath) -> u64 {
 	let digest = blake3::hash(path.joined().as_bytes());
-	u128::from_le_bytes(digest.as_bytes()[..16].try_into().expect("16 bytes"))
+	u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"))
 }
 
 pub(super) fn path_skip_reason(rejection: PathRejection) -> ExtractSkipReason {

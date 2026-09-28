@@ -1188,7 +1188,7 @@ fn walk_tar<R: Read>(walk: &mut Walk, reader: R, max_members: u64) -> Result<Wal
 	let mut files = 0u64;
 	// what a listing resolves hard links against: the files it says are extracted, by path, with
 	// their sizes. An extraction's driver resolves them against the files it created
-	let mut listed_files = SeededMap::<u128, u64>::default();
+	let mut listed_files = SeededMap::<u64, u64>::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;

@@ -188,7 +188,7 @@ struct FileSlot<U> {
 	finalizing: bool,
 	failed: bool,
 	/// What a tar's hard links find it by, when it may be the target of one.
-	link_key: Option<u128>,
+	link_key: Option<u64>,
 	/// For a hard link, the file it copies.
 	copy: Option<LinkCopy>,
 }
@@ -203,14 +203,68 @@ struct LinkCopy {
 	fetching: bool,
 }
 
-/// A file a tar's hard links may name, by the path it was sent at: one the codec sent, or
-/// another hard link's copy.
-struct LinkTarget {
-	ordinal: u64,
-	uuid: Uuid,
-	/// Its size: as the archive states it, then as registered.
-	size: u64,
-	registered: bool,
+/// The files a tar's hard links may name, by [`link_key`] of the path each was sent at: one the
+/// codec sent, or another hard link's copy. A tar may hold a million files, each of which a
+/// link after it may name, so each costs 16 bytes in the map (and its share of the map's spare
+/// room), and 24 more once registered: what an open one is, its slot in the open files tells.
+#[derive(Default)]
+struct LinkTargets {
+	by_key: SeededMap<u64, LinkTarget>,
+	/// The uuid and size of each registered target.
+	registered: Vec<(Uuid, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkTarget {
+	/// The file or hard link of this ordinal, not registered yet.
+	Open(u32),
+	/// Registered, its uuid and size at this index of [`LinkTargets::registered`].
+	Registered(u32),
+}
+
+/// What a hard link's target is, once looked up.
+enum Named {
+	/// The file or hard link of this ordinal, not registered yet.
+	Open(u64),
+	Registered {
+		uuid: Uuid,
+		size: u64,
+	},
+}
+
+impl LinkTargets {
+	/// Notes the file or hard link `ordinal` as the one that links after it naming `key` name:
+	/// a later file at the same path takes over.
+	fn open(&mut self, key: u64, ordinal: u64) {
+		// the member cap keeps ordinals far below u32::MAX; one past it is never named
+		if let Ok(ordinal) = u32::try_from(ordinal) {
+			self.by_key.insert(key, LinkTarget::Open(ordinal));
+		}
+	}
+
+	fn get(&self, key: u64) -> Option<Named> {
+		Some(match *self.by_key.get(&key)? {
+			LinkTarget::Open(ordinal) => Named::Open(u64::from(ordinal)),
+			LinkTarget::Registered(at) => {
+				let (uuid, size) = self.registered[at as usize];
+				Named::Registered { uuid, size }
+			}
+		})
+	}
+
+	/// File `ordinal`, noted under `key`, was registered as `uuid`, `size` bytes; nothing when a
+	/// later file took the key over.
+	fn registered(&mut self, key: u64, ordinal: u64, uuid: Uuid, size: u64) {
+		let Some(target) = self.by_key.get_mut(&key) else {
+			return;
+		};
+		if *target == LinkTarget::Open(u32::try_from(ordinal).unwrap_or(u32::MAX))
+			&& let Ok(at) = u32::try_from(self.registered.len())
+		{
+			*target = LinkTarget::Registered(at);
+			self.registered.push((uuid, size));
+		}
+	}
 }
 
 /// A hard link waiting for the file it names to be registered.
@@ -224,7 +278,7 @@ struct PendingLink {
 struct TakenLink {
 	file: NewFile,
 	/// What the links after it that name its path find it by.
-	key: u128,
+	key: u64,
 }
 
 impl<U> FileSlot<U> {
@@ -314,9 +368,9 @@ struct Driver<B: DriveBackend> {
 	files: BTreeMap<u64, FileSlot<B::Upload>>,
 	/// The file receiving data.
 	current: Option<u64>,
-	/// The files a tar's hard links may name, by [`link_key`] of their paths: kept for a tar
-	/// only, whose links name files by path.
-	link_targets: SeededMap<u128, LinkTarget>,
+	/// The files a tar's hard links may name: kept for a tar only, whose links name files by
+	/// path.
+	link_targets: LinkTargets,
 	/// Hard links waiting for the file they name to be registered, by that file's ordinal, and
 	/// how many there are.
 	waiting_links: HashMap<u64, Vec<PendingLink>>,
@@ -446,7 +500,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		ready_dirs: VecDeque::new(),
 		dir_creates: FuturesUnordered::new(),
 		files: BTreeMap::new(),
-		link_targets: SeededMap::default(),
+		link_targets: LinkTargets::default(),
 		waiting_links: HashMap::new(),
 		links_waiting: 0,
 		ready_links: VecDeque::new(),
@@ -1214,13 +1268,7 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		let key = link_key(path);
 		file.link_key = Some(key);
-		let target = LinkTarget {
-			ordinal,
-			uuid: file.active.dest_uuid,
-			size: file.bytes(),
-			registered: false,
-		};
-		self.link_targets.insert(key, target);
+		self.link_targets.open(key, ordinal);
 	}
 
 	/// A file entry at `path`: its directories planned and a free name taken for it in the last;
@@ -1281,29 +1329,14 @@ impl<B: DisposalBackend> Driver<B> {
 			target,
 			unresolved,
 		} = link;
-		let Some(target) = self.link_targets.get(&link_key(&target)) else {
-			return self.on_skipped(unresolved);
+		let (target, size) = match self.link_targets.get(link_key(&target)) {
+			Some(Named::Registered { uuid, size }) => (Ok(uuid), size),
+			Some(Named::Open(ordinal)) => match self.pending_size(ordinal) {
+				Some(size) => (Err(ordinal), size),
+				None => return self.on_skipped(unresolved),
+			},
+			None => return self.on_skipped(unresolved),
 		};
-		let (target_ordinal, registered, uuid, size) =
-			(target.ordinal, target.registered, target.uuid, target.size);
-		let pending = !registered
-			&& self
-				.files
-				.get(&target_ordinal)
-				.is_some_and(|file| !file.failed)
-			// a link naming another link that is not open yet
-			|| self
-				.waiting_links
-				.values()
-				.flatten()
-				.any(|waiting| waiting.link.file.ordinal == target_ordinal)
-			|| self
-				.ready_links
-				.iter()
-				.any(|(link, _)| link.file.ordinal == target_ordinal);
-		if !registered && !pending {
-			return self.on_skipped(unresolved);
-		}
 		if let Some(limit) = self.expansion {
 			let allowed = limit
 				.floor
@@ -1324,28 +1357,35 @@ impl<B: DisposalBackend> Driver<B> {
 		let Some(file) = self.new_file(ordinal, &path, Some(size), modified) else {
 			return;
 		};
-		// a link may be named by the links after it, as the file it copies is; its uuid is set
-		// once it is opened
+		// a link may be named by the links after it, as the file it copies is
 		let key = link_key(&path);
-		self.link_targets.insert(
-			key,
-			LinkTarget {
-				ordinal,
-				uuid: Uuid::nil(),
-				size,
-				registered: false,
-			},
-		);
+		self.link_targets.open(key, ordinal);
 		let link = TakenLink { file, key };
-		if registered {
-			self.ready_links.push_back((link, uuid));
-		} else {
-			self.links_waiting += 1;
-			self.waiting_links
-				.entry(target_ordinal)
-				.or_default()
-				.push(PendingLink { link, unresolved });
+		match target {
+			Ok(uuid) => self.ready_links.push_back((link, uuid)),
+			Err(target_ordinal) => {
+				self.links_waiting += 1;
+				self.waiting_links
+					.entry(target_ordinal)
+					.or_default()
+					.push(PendingLink { link, unresolved });
+			}
 		}
+	}
+
+	/// The size of file `ordinal` that hard links wait for: open and not failed, or a hard link
+	/// taken on and not opened yet; `None` when it is neither, so has nothing to copy.
+	fn pending_size(&self, ordinal: u64) -> Option<u64> {
+		if let Some(file) = self.files.get(&ordinal) {
+			return (!file.failed).then(|| file.bytes());
+		}
+		self.waiting_links
+			.values()
+			.flatten()
+			.map(|waiting| &waiting.link)
+			.chain(self.ready_links.iter().map(|(link, _)| link))
+			.find(|link| link.file.ordinal == ordinal)
+			.map(|link| link.file.size.unwrap_or(0))
 	}
 
 	/// Opens the hard links whose file is registered, while the files open leave room and the
@@ -1362,24 +1402,15 @@ impl<B: DisposalBackend> Driver<B> {
 			});
 			if let Some(file) = self.files.get_mut(&ordinal) {
 				file.link_key = Some(key);
-				if let Some(target) = self.link_targets.get_mut(&key)
-					&& target.ordinal == ordinal
-				{
-					target.uuid = file.active.dest_uuid;
-				}
 			}
 		}
 	}
 
 	/// File `ordinal` was registered as `uuid`, `size` bytes: the hard links waiting for it copy
 	/// it now, as fast as they are opened.
-	fn link_target_registered(&mut self, ordinal: u64, key: Option<u128>, uuid: Uuid, size: u64) {
-		if let Some(target) = key.and_then(|key| self.link_targets.get_mut(&key))
-			&& target.ordinal == ordinal
-		{
-			target.registered = true;
-			target.uuid = uuid;
-			target.size = size;
+	fn link_target_registered(&mut self, ordinal: u64, key: Option<u64>, uuid: Uuid, size: u64) {
+		if let Some(key) = key {
+			self.link_targets.registered(key, ordinal, uuid, size);
 		}
 		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
 		self.links_waiting -= waiting.len();
