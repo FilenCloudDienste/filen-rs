@@ -10,17 +10,23 @@
 //! cache's single-writer worker model is untouched.
 
 use std::{
-	cell::RefCell,
 	collections::{BTreeSet, HashMap},
-	path::Path,
-	sync::Arc,
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex, PoisonError},
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params, types::Type};
 use uuid::Uuid;
 
-use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, rows::Baseline, tree::Tree};
+use super::{
+	engine::PendingKind,
+	guard::DeleteGuard,
+	ignore::FILENIGNORE,
+	mode::SyncMode,
+	rows::{Baseline, Snapshot},
+	scan::collision_key,
+};
 
 /// The schema version this build writes and understands, stamped into `PRAGMA user_version`.
 ///
@@ -34,7 +40,13 @@ use super::{engine::PendingKind, guard::DeleteGuard, mode::SyncMode, rows::Basel
 /// and one such row fails the whole journal read and with it the engine's construction. A row's
 /// MEANING changing is exactly what this constant is for — the refusal above says what to do about
 /// the file, where the journal read would only say that a column was NULL.
-const SCHEMA_VERSION: i64 = 2;
+///
+/// Moved to 3 when a pass stopped reading the rows out of a resident copy and began reading them
+/// out of the table itself (see [`rows`](super::rows)): the table gained the columns and indexes
+/// those reads seek, and the counts table the triggers keep. A version-2 file has none of them, so
+/// every one of those reads would fail on it — or, where a column happened to exist, read it as
+/// something it never recorded.
+const SCHEMA_VERSION: i64 = 3;
 
 /// Schema for the baseline DB, created whole on a fresh DB. `foreign_keys`, `synchronous` and the
 /// busy timeout are applied per-connection in [`BaselineStore::init`] (they reset on every open);
@@ -54,6 +66,34 @@ const SCHEMA_VERSION: i64 = 2;
 /// baseline and journal rows keyed by the id it started with — which a plain `INTEGER PRIMARY KEY`
 /// hands straight to the next pair created, whose first sync is then reconciled against a stranger's
 /// rows. With the id retired those writes hit the foreign key and fail, which is what they should do.
+///
+/// A pass reads its rows out of `baseline` itself (see [`rows`](super::rows)), so the table carries
+/// what those reads seek on, each column computed in Rust by [`Derived::of`] from the row it is
+/// written with — never by SQL, which could not agree with the engine's own rules:
+///
+/// - `folded_path` is [`collision_key`](super::scan::collision_key) of `rel_path`:
+///   `char::to_lowercase` over the whole path. SQLite's `lower()` folds ASCII only, and the Ä/ä,
+///   final-sigma and dotted-İ cases are exactly where the two differ. Indexed with `rel_path` so a
+///   folded at-or-under question is a range over it and every row of it comes back in one order.
+/// - `carryable` is [`BaselineEntry::carryable`], `rule_file` whether the row IS a `.filenignore`,
+///   and `unconfirmed` [`BaselineEntry::awaits_confirmation`]. Each has a partial index, because
+///   each is a whole-set question a pass asks before it reads either side and whose answer on a
+///   converged pair is empty: the index is the set, and costs nothing while the set is.
+///
+/// `baseline` is a `WITHOUT ROWID` table: its rows live IN the primary key's b-tree, in
+/// `(pair_id, rel_path)` order. A pass reads its rows by path — point lookups and ranges of that
+/// key — and in a rowid table every row of a range is an index step and then a seek into a second
+/// b-tree for the row itself; clustered, a range is a walk of consecutive leaves and a point lookup
+/// one descent. SQLite advises the layout for rows under a twentieth of a page, which a row here
+/// (two paths, three hashes, two uuids) passes only at [`PAGE_SIZE`].
+///
+/// `baseline_counts` is each pair's row count, and how many of those rows are uncarryable and how
+/// many record a remote item — kept by the three triggers below on every insert, delete and
+/// change of those two columns, so the whole-set counts a pass asks for are one row read and never
+/// a `COUNT(*)`, which is a walk of the pair. The triggers count a row that `INSERT OR REPLACE` or
+/// `UPDATE OR REPLACE` deletes to make room only because every connection turns
+/// `recursive_triggers` on ([`BaselineStore::init`]): without it SQLite fires no delete trigger for
+/// a row REPLACE removes, and the count would drift up by one per overwrite.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sync_pairs (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +109,7 @@ CREATE TABLE IF NOT EXISTS sync_pairs (
 CREATE TABLE IF NOT EXISTS baseline (
 	pair_id INTEGER NOT NULL REFERENCES sync_pairs (id) ON DELETE CASCADE,
 	rel_path TEXT NOT NULL,
+	folded_path TEXT NOT NULL,
 	kind INTEGER NOT NULL,
 	remote_uuid BLOB,
 	content_hash BLOB,
@@ -82,8 +123,51 @@ CREATE TABLE IF NOT EXISTS baseline (
 	remote_size INTEGER,
 	remote_stable_uuid BLOB,
 	agreed_hash BLOB,
+	carryable INTEGER NOT NULL,
+	rule_file INTEGER NOT NULL,
+	unconfirmed INTEGER NOT NULL,
 	PRIMARY KEY (pair_id, rel_path)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS baseline_folded ON baseline (pair_id, folded_path, rel_path);
+CREATE INDEX IF NOT EXISTS baseline_uncarryable ON baseline (pair_id, rel_path)
+	WHERE carryable = 0;
+CREATE INDEX IF NOT EXISTS baseline_rule_files ON baseline (pair_id, rel_path)
+	WHERE rule_file = 1;
+CREATE INDEX IF NOT EXISTS baseline_unconfirmed ON baseline (pair_id, rel_path)
+	WHERE unconfirmed = 1;
+
+CREATE TABLE IF NOT EXISTS baseline_counts (
+	pair_id INTEGER PRIMARY KEY REFERENCES sync_pairs (id) ON DELETE CASCADE,
+	rows INTEGER NOT NULL,
+	uncarryable INTEGER NOT NULL,
+	remote_rows INTEGER NOT NULL
 );
+
+CREATE TRIGGER IF NOT EXISTS baseline_counted AFTER INSERT ON baseline BEGIN
+	INSERT INTO baseline_counts (pair_id, rows, uncarryable, remote_rows)
+	VALUES (NEW.pair_id, 1, NEW.carryable = 0, NEW.remote_uuid IS NOT NULL)
+	ON CONFLICT (pair_id) DO UPDATE SET
+		rows = rows + 1,
+		uncarryable = uncarryable + (NEW.carryable = 0),
+		remote_rows = remote_rows + (NEW.remote_uuid IS NOT NULL);
+END;
+
+CREATE TRIGGER IF NOT EXISTS baseline_uncounted AFTER DELETE ON baseline BEGIN
+	UPDATE baseline_counts SET
+		rows = rows - 1,
+		uncarryable = uncarryable - (OLD.carryable = 0),
+		remote_rows = remote_rows - (OLD.remote_uuid IS NOT NULL)
+	WHERE pair_id = OLD.pair_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS baseline_recounted
+	AFTER UPDATE OF carryable, remote_uuid ON baseline BEGIN
+	UPDATE baseline_counts SET
+		uncarryable = uncarryable - (OLD.carryable = 0) + (NEW.carryable = 0),
+		remote_rows = remote_rows - (OLD.remote_uuid IS NOT NULL) + (NEW.remote_uuid IS NOT NULL)
+	WHERE pair_id = NEW.pair_id;
+END;
 
 CREATE TABLE IF NOT EXISTS pending_writes (
 	uuid BLOB PRIMARY KEY,
@@ -117,24 +201,28 @@ CREATE TABLE IF NOT EXISTS ignored_roots (
 );
 ";
 
-/// The columns [`BaselineStore::row_to_entry`] reads, named once so the statements that hand back
-/// rows cannot drift apart from each other or from it.
 /// Objects added to the schema after version 1 was first written, created on EVERY open rather
 /// than only on a fresh DB: [`SCHEMA`] runs once, when the file holds no table of ours, so an index
 /// added to it alone would never reach a DB that already exists. `IF NOT EXISTS` makes the re-run
 /// free, and an index changes no row's MEANING, so [`SCHEMA_VERSION`] does not move — an older
 /// build opening the file just plans its own reads without it.
 ///
-/// The one object here serves the conflict read ([`BaselineStore::conflicts`]): the rows a pair
+/// `baseline_state` serves the conflict read ([`BaselineStore::conflicts`]): the rows a pair
 /// holds in conflict are a handful out of a whole tree, and finding them without the index is a
-/// walk of every row of the pair — a walk that runs under the pair's store mutex.
+/// walk of every row of the pair — a walk that runs under the pair's store mutex. It carries
+/// `rel_path` as well so that a pass's "is every row under this directory synced" is one seek per
+/// unsynced state bounded to the directory's range, rather than a visit of every unsynced row of
+/// the pair (see [`rows`](super::rows)).
 const ADDITIVE_SCHEMA: &str = "
-CREATE INDEX IF NOT EXISTS baseline_state ON baseline (pair_id, state);
+CREATE INDEX IF NOT EXISTS baseline_state ON baseline (pair_id, state, rel_path);
 CREATE INDEX IF NOT EXISTS baseline_remote_uuid ON baseline (pair_id, remote_uuid);
 CREATE INDEX IF NOT EXISTS baseline_remote_stable_uuid ON baseline (pair_id, remote_stable_uuid);
 ";
 
-const ENTRY_COLUMNS: &str = "rel_path, kind, remote_uuid, content_hash, size, local_mtime,
+/// The columns [`BaselineStore::row_to_entry`] reads, named once so the statements that hand back
+/// rows cannot drift apart from each other or from it.
+pub(super) const ENTRY_COLUMNS: &str =
+	"rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 	 remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
 	 remote_stable_uuid, agreed_hash";
 
@@ -161,8 +249,9 @@ const DELETE_UNDER_PATH: &str =
 const UPSERT_ENTRY: &str = "INSERT OR REPLACE INTO baseline
 	 (pair_id, rel_path, kind, remote_uuid, content_hash, size, local_mtime,
 	  remote_modified, state, local_kind, remote_kind, remote_hash, remote_size,
-	  remote_stable_uuid, agreed_hash)
-	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
+	  remote_stable_uuid, agreed_hash, folded_path, carryable, rule_file, unconfirmed)
+	 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+	  ?19)";
 const DELETE_ENTRY: &str = "DELETE FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
 
 /// The id seek [`BaselineStore::synced_paths`] runs against `column`: one `IN` list of exactly
@@ -174,8 +263,10 @@ fn synced_by(column: &str) -> String {
 		.map(|at| format!("?{at}"))
 		.collect::<Vec<_>>()
 		.join(", ");
+	// Named for the reason `conflict_rows_sql` gives: without statistics the planner would walk
+	// the clustered primary key on `pair_id` instead.
 	format!(
-		"SELECT rel_path, remote_uuid, remote_stable_uuid FROM baseline
+		"SELECT rel_path, remote_uuid, remote_stable_uuid FROM baseline INDEXED BY baseline_{column}
 		 WHERE pair_id = ?1 AND {column} IN ({binds})"
 	)
 }
@@ -185,7 +276,7 @@ fn synced_by(column: &str) -> String {
 ///
 /// Two statements for the same reason the deletes are two. Asking one `UPDATE` for both — `rel_path
 /// = ?2 OR (rel_path > ?2 || '/' AND rel_path < ?2 || '0')` — plans as `SEARCH baseline USING INDEX
-/// sqlite_autoindex_baseline_1 (pair_id=?)`: an `OR` of a point and a range is not sargable, so it
+/// PRIMARY KEY (pair_id=?)`: an `OR` of a point and a range is not sargable, so it
 /// walks every row of the pair, which is the cost the whole-pair read it replaced had.
 ///
 /// They read the STORE rather than the pass's baseline, which is deliberate: the plan re-keys its
@@ -201,11 +292,52 @@ fn synced_by(column: &str) -> String {
 /// move onto an occupied destination, but `plan::next_case_only_dir_rename` in a pushing mode does
 /// not check the local end, so rows under both spellings reach here; the directory has been renamed
 /// on disk by then, and failing on the primary key would leave the store holding it under two names.
-const MOVE_AT_PATH: &str =
-	"UPDATE OR REPLACE baseline SET rel_path = ?3 WHERE pair_id = ?1 AND rel_path = ?2";
-const MOVE_UNDER_PATH: &str =
-	"UPDATE OR REPLACE baseline SET rel_path = ?3 || substr(rel_path, length(?2) + 1)
+///
+/// Each also carries the columns a key change moves with it: `folded_path` the same prefix swap in
+/// its folded form (`?4` is `?2` folded, `?5` is `?3` folded — folding is per character, so the
+/// folded path of `to/rest` IS the folded `to` followed by the folded `rest`, and `length` and
+/// `substr` count characters on both), and `rule_file` for the one row whose LEAF the move
+/// renames (`?6`: whether the new leaf is a `.filenignore`). A row under the source keeps its leaf,
+/// so it keeps its flag.
+const MOVE_AT_PATH: &str = "UPDATE OR REPLACE baseline
+	 SET rel_path = ?3, folded_path = ?5, rule_file = (kind = 2 AND ?6)
+	 WHERE pair_id = ?1 AND rel_path = ?2";
+const MOVE_UNDER_PATH: &str = "UPDATE OR REPLACE baseline
+	 SET rel_path = ?3 || substr(rel_path, length(?2) + 1),
+	  folded_path = ?5 || substr(folded_path, length(?4) + 1)
 	 WHERE pair_id = ?1 AND rel_path > ?2 || '/' AND rel_path < ?2 || '0'";
+
+/// Write one row with the columns [`Derived`] computes from it — the statement every write of a row
+/// goes through, on the store's connection and on the one a test builds its rows in alike.
+pub(super) fn upsert_row(
+	conn: &Connection,
+	pair: PairId,
+	entry: &BaselineEntry,
+) -> rusqlite::Result<()> {
+	let derived = Derived::of(entry);
+	conn.prepare_cached(UPSERT_ENTRY)?.execute(params![
+		pair,
+		entry.rel_path,
+		entry.kind.as_i64(),
+		entry.remote_uuid,
+		entry.content_hash.as_ref().map(|h| h.as_ref().as_slice()),
+		entry.size.map(|s| s as i64),
+		entry.local_mtime,
+		entry.remote_modified,
+		entry.state.as_i64(),
+		entry.local_kind.map(NodeKind::as_i64),
+		entry.remote_kind.map(NodeKind::as_i64),
+		entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
+		entry.remote_size.map(|s| s as i64),
+		entry.remote_stable_uuid,
+		entry.agreed_hash.as_ref().map(|h| h.as_ref().as_slice()),
+		derived.folded_path,
+		derived.carryable,
+		derived.rule_file,
+		derived.unconfirmed,
+	])?;
+	Ok(())
+}
 
 /// `pending_writes.kind` discriminants — what the write did.
 const KIND_CREATED: i64 = 1;
@@ -278,7 +410,7 @@ pub(crate) enum BaselineState {
 }
 
 impl BaselineState {
-	fn as_i64(self) -> i64 {
+	const fn as_i64(self) -> i64 {
 		match self {
 			Self::Synced => 0,
 			Self::Conflicted => 1,
@@ -370,9 +502,9 @@ impl BaselineEntry {
 	/// It lives here, on the row it is about, because THREE readers need the same answer and a
 	/// second copy of the field list is how a new column comes to be carried by one of them and not
 	/// another: [`derive::carried`](super::derive) builds the two nodes from a row that passes,
-	/// [`Tree`](super::tree::Tree) indexes the rows that fail so a pass can find them all
-	/// without walking the tree, and a carried side answers "does this side hold the path" straight
-	/// off that index without building a node at all.
+	/// the store writes it into the row's `carryable` column so a pass can find every row that fails
+	/// through a partial index rather than a walk, and a carried side answers "does this side hold
+	/// the path" straight off that column without building a node at all.
 	///
 	/// A row that fails this is not a defect. It is one the engine wrote one-sided on purpose — a
 	/// `KeepLocal`/`KeepRemote` resolution that cleared a half, an [`Adopted`](BaselineState::Adopted)
@@ -397,6 +529,50 @@ impl BaselineEntry {
 						&& self.remote_modified.is_some()
 				}
 			}
+	}
+
+	/// Whether this row awaits confirmation of a push of ours: this side's content is on record and
+	/// is not what the two sides last agreed on (see [`agreed_hash`](Self::agreed_hash)).
+	pub(crate) fn awaits_confirmation(&self) -> bool {
+		self.kind == NodeKind::File
+			&& self.state == BaselineState::Synced
+			&& self.content_hash.is_some()
+			&& self.agreed_hash != self.content_hash
+	}
+
+	/// Whether this row IS a `.filenignore`: a file whose leaf name is exactly that.
+	pub(crate) fn is_rule_file(&self) -> bool {
+		self.kind == NodeKind::File && self.rel_path.rsplit('/').next() == Some(FILENIGNORE)
+	}
+}
+
+/// The columns a row is written with beyond its own fields (see [`SCHEMA`]), computed here from the
+/// row — the one place each rule lives — and never by SQL.
+///
+/// Computed ONCE, when the row is written, and trusted by every read after: nothing recomputes them
+/// on open. So each rule is part of what a stored row MEANS, and changing one —
+/// [`BaselineEntry::carryable`], [`BaselineEntry::is_rule_file`],
+/// [`BaselineEntry::awaits_confirmation`], or [`collision_key`], whose `char::to_lowercase` is the
+/// toolchain's Unicode tables — leaves every row written before the change answering by the old
+/// rule: a row the new carry rule rejects still carried, a spelling the new tables fold together
+/// missed by the collision check. Such a change bumps [`SCHEMA_VERSION`], so that a file written
+/// under the old rules is refused rather than misread; `the_derived_columns_are_pinned_to_the_schema_version`
+/// fails on each until it is.
+pub(super) struct Derived {
+	pub(super) folded_path: String,
+	pub(super) carryable: bool,
+	pub(super) rule_file: bool,
+	pub(super) unconfirmed: bool,
+}
+
+impl Derived {
+	pub(super) fn of(entry: &BaselineEntry) -> Self {
+		Self {
+			folded_path: collision_key(&entry.rel_path),
+			carryable: entry.carryable(),
+			rule_file: entry.is_rule_file(),
+			unconfirmed: entry.awaits_confirmation(),
+		}
 	}
 }
 
@@ -559,16 +735,128 @@ fn keep_first(slot: &mut Option<String>, rel_path: &str, what: &str) {
 const SYNCED_CHUNK: usize = 64;
 
 /// The baseline DB handle (sole owner / single writer).
+///
+/// It holds nothing of a pair's rows between passes: a pass reads them out of the table, through
+/// one of [`readers`](Self::readers) (see [`BaselineStore::baseline`]).
 pub(crate) struct BaselineStore {
 	conn: Connection,
-	/// Each pair's rows as they stand, read whole from the DB once and kept in step by every write
-	/// path below (see [`BaselineStore::baseline`]). A pass reads its baseline from here instead of
-	/// paying the whole-tree `SELECT` and the map build every time.
-	///
-	/// A [`RefCell`] because every write path takes `&self` — the connection is already the single
-	/// writer, serialized by the pair's store mutex, so there is no second borrower to race. The
-	/// store is `Send` and never `Sync`, exactly as the `Connection` inside it already makes it.
-	resident: RefCell<HashMap<PairId, Arc<Tree>>>,
+	/// The connections passes read on, shared with every [`Snapshot`] that has one out.
+	readers: Arc<Readers>,
+	/// The file an in-memory store stands on, removed with the store (see
+	/// [`open_in_memory`](Self::open_in_memory)).
+	#[cfg(test)]
+	_file: Option<tempfile::TempPath>,
+}
+
+/// The DB's page size, in bytes. Twice SQLite's default, so that a `baseline` row — ~250 bytes
+/// with two paths — stays inside the twentieth of a page `WITHOUT ROWID` is laid out for (see
+/// [`SCHEMA`]).
+const PAGE_SIZE: usize = 8192;
+
+/// The page cache a READER connection keeps, in KiB (a negative `cache_size` is KiB, not pages).
+///
+/// Chosen, not defaulted, because this is now the one place a pair's rows are held in the process:
+/// the resident tree this replaced was ~127 bytes a row for the life of the pair, and SQLite's own
+/// cache would otherwise be the same cost moved somewhere nobody sized. What a pass's point lookups
+/// touch on every read is the interior pages of two b-trees — the table, which IS its primary key,
+/// and `baseline_folded` — which at a million rows come to a few MiB; the leaves they lead to are read
+/// through the OS page cache, which is the kernel's to evict and is not this process's resident
+/// set. 8 MiB keeps every interior page of a million-row pair resident with room for the leaves a
+/// directory's worth of lookups revisits, and it is a CEILING: a pair smaller than that never
+/// grows the cache to it. A whole pass pages the entire table through it and leaves it full.
+const READER_CACHE_KIB: i64 = 8 * 1024;
+
+/// The page cache of the store's own WRITING connection, in KiB. SQLite's default, stated: the
+/// writer reads a few pages per statement and a first sync's million-row transaction spills to the
+/// WAL whatever its cache, so a larger one buys that transaction little and costs every pair the
+/// difference for the life of the process.
+const WRITER_CACHE_KIB: i64 = 2 * 1024;
+
+/// The connections a pair's passes read on: one per pass in flight, reused across passes so a pass
+/// does not pay a connection open (a schema parse, a fresh statement cache) for its rows.
+pub(crate) struct Readers {
+	path: PathBuf,
+	idle: Mutex<Vec<Connection>>,
+}
+
+impl Readers {
+	fn take(&self) -> rusqlite::Result<Connection> {
+		let idle = self
+			.idle
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.pop();
+		match idle {
+			Some(conn) => Ok(conn),
+			None => open_reader(&self.path),
+		}
+	}
+
+	/// A connection whose read transaction has ended, back for the next pass — kept only when no
+	/// other is idle. Each keeps its own page cache (up to [`READER_CACHE_KIB`]) for as long as it
+	/// is kept, and a pair runs one pass at a time: a second snapshot open at once (a dry run
+	/// beside a pass, a confirmation sweep beside a suspended one) is a moment, not a steady state,
+	/// and the connection it opened is closed rather than kept for the life of the store.
+	pub(super) fn give(&self, conn: Connection) {
+		let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+		if idle.is_empty() {
+			idle.push(conn);
+		}
+	}
+}
+
+/// A connection a pass reads on. Read-write at the file level — a WAL reader has to be able to
+/// write the shared-memory index — but `query_only`, so nothing a pass does through it can write a
+/// row; the busy timeout covers the rare moment a reader waits on WAL recovery.
+fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
+	let conn = Connection::open(path)?;
+	conn.busy_timeout(std::time::Duration::from_millis(30_000))?;
+	conn.execute_batch(&format!(
+		"PRAGMA query_only = ON; PRAGMA cache_size = -{READER_CACHE_KIB};"
+	))?;
+	// Every statement a pass reads with, with room: the default of 16 would evict on a pass that
+	// uses all of them, and re-preparing is the cost the cache exists to remove.
+	conn.set_prepared_statement_cache_capacity(32);
+	Ok(conn)
+}
+
+/// The states a row can hold other than `Synced`, as stored: what the reader's "is every row under
+/// this directory synced" seeks on (see `baseline_state`). Written out so that a new state has to be
+/// added here — the `match` below refuses to compile until it is.
+pub(super) const UNSYNCED_STATES: [i64; 3] = [
+	BaselineState::Conflicted.as_i64(),
+	BaselineState::Adopted.as_i64(),
+	BaselineState::Overwritten.as_i64(),
+];
+
+const _: () = {
+	// Every state but `Synced` is in `UNSYNCED_STATES`: the match is exhaustive, so a new state
+	// fails here until someone decides which side of that line it is on.
+	const fn listed(state: BaselineState) -> bool {
+		match state {
+			BaselineState::Synced => false,
+			BaselineState::Conflicted | BaselineState::Adopted | BaselineState::Overwritten => true,
+		}
+	}
+	assert!(listed(BaselineState::Conflicted) && !listed(BaselineState::Synced));
+};
+
+/// A connection holding the schema and one pair, for a test to write rows into and read them back
+/// through a [`Snapshot`] — the store's own statements on the store's own tables.
+#[cfg(test)]
+pub(super) fn test_rows_connection(pair: PairId) -> Connection {
+	let conn = Connection::open_in_memory().expect("opening a test connection");
+	conn.execute_batch(&format!(
+		"PRAGMA page_size = {PAGE_SIZE}; PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;
+		 {SCHEMA} {ADDITIVE_SCHEMA}"
+	))
+	.expect("creating the test schema");
+	conn.execute(
+		"INSERT INTO sync_pairs (id, local_root, remote_root, mode) VALUES (?1, '/test', ?2, ?3)",
+		params![pair, Uuid::nil(), SyncMode::TwoWay.as_i64()],
+	)
+	.expect("registering the test pair");
+	conn
 }
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
@@ -610,6 +898,9 @@ fn is_unwritten(conn: &Connection) -> rusqlite::Result<bool> {
 ///
 /// Takes the batch as a parameter so the failure path is testable with a batch that cannot commit.
 fn create_schema(conn: &Connection, schema: &str) -> rusqlite::Result<()> {
+	// Before anything is written: the page size of a file is fixed once it holds a page, and once it
+	// is in WAL mode.
+	conn.execute_batch(&format!("PRAGMA page_size = {PAGE_SIZE};"))?;
 	let tx = conn.unchecked_transaction()?;
 	conn.execute_batch(schema)?;
 	conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -738,19 +1029,52 @@ fn describe_changes(changes: &[BaselineChange<'_>]) -> String {
 /// index covers, and there is deliberately no `ORDER BY` here: the ordering
 /// [`BaselineStore::conflicts`] promises is applied to the rows it hands back, for the reason
 /// given there.
+///
+/// The index is NAMED (`INDEXED BY`): this DB is never `ANALYZE`d, and with no statistics the
+/// planner prefers a walk of the clustered primary key on `pair_id` — every row of the pair — to a
+/// seek of a narrower index it would then have to read each row back through. Named, the seek is
+/// taken or the statement refuses to prepare.
 fn conflict_rows_sql() -> String {
+	format!(
+		"SELECT {ENTRY_COLUMNS} FROM baseline INDEXED BY baseline_state
+		 WHERE pair_id = ?1 AND state IN (?2, ?3)"
+	)
+}
+
+/// [`conflict_rows_sql`] without the index named: the read as it runs in a file without the
+/// index, for the probe's without-index phase and the plan test's control.
+#[cfg(any(test, feature = "bench-internals"))]
+fn conflict_rows_walked_sql() -> String {
 	format!("SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 AND state IN (?2, ?3)")
 }
 
 impl BaselineStore {
 	/// Open (creating if needed) the baseline DB at `path`.
 	pub(crate) fn open(path: &Path) -> Result<Self, crate::Error> {
-		Self::init(Connection::open(path).map_err(open_error)?)
+		Self::init(Connection::open(path).map_err(open_error)?, path)
 	}
 
+	/// A store no other test sees, removed with it.
+	///
+	/// On a temporary FILE rather than SQLite's `:memory:`, because a pass reads its rows on a
+	/// second connection inside a WAL read transaction (see [`baseline`](Self::baseline)), and an
+	/// in-memory database has neither a second connection nor WAL.
 	#[cfg(test)]
 	pub(crate) fn open_in_memory() -> Result<Self, crate::Error> {
-		Self::init(Connection::open_in_memory().map_err(open_error)?)
+		let file = tempfile::Builder::new()
+			.prefix("sync-baseline-")
+			.suffix(".db")
+			.tempfile()
+			.map_err(|error| {
+				crate::Error::custom(
+					crate::ErrorKind::Internal,
+					format!("creating a test baseline DB: {error}"),
+				)
+			})?
+			.into_temp_path();
+		let mut store = Self::open(&file)?;
+		store._file = Some(file);
+		Ok(store)
 	}
 
 	/// Take this connection's write lock and hold it until the returned transaction is dropped —
@@ -792,7 +1116,7 @@ impl BaselineStore {
 	/// when it carries exactly that version: anything else — older or newer — is refused rather than
 	/// read, since there is no migration chain to bring it here and reading foreign rows under these
 	/// rules would misplan them into deletes.
-	fn init(conn: Connection) -> Result<Self, crate::Error> {
+	fn init(conn: Connection, path: &Path) -> Result<Self, crate::Error> {
 		// Both are per-connection, reset on every open, and neither writes to the file — so they are
 		// safe to apply before this build knows whether the DB is even one it can read. The timeout
 		// covers the version read below too: it retries a transient `SQLITE_BUSY` rather than
@@ -811,8 +1135,13 @@ impl BaselineStore {
 		// the flag a pause fails to persist is the one that protects the pair on the next open.
 		conn.busy_timeout(std::time::Duration::from_millis(30_000))
 			.map_err(open_error)?;
-		conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")
-			.map_err(open_error)?;
+		// `recursive_triggers` is what makes the counting triggers see a row that REPLACE deletes
+		// (see [`SCHEMA`]); every connection that writes rows needs it, and this is the only one.
+		conn.execute_batch(&format!(
+			"PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; \
+			 PRAGMA recursive_triggers = ON; PRAGMA cache_size = -{WRITER_CACHE_KIB};"
+		))
+		.map_err(open_error)?;
 		let version: i64 = conn
 			.query_row("PRAGMA user_version", [], |row| row.get(0))
 			.map_err(open_error)?;
@@ -857,7 +1186,12 @@ impl BaselineStore {
 		conn.execute_batch(ADDITIVE_SCHEMA).map_err(open_error)?;
 		Ok(Self {
 			conn,
-			resident: RefCell::new(HashMap::new()),
+			readers: Arc::new(Readers {
+				path: path.to_path_buf(),
+				idle: Mutex::new(Vec::new()),
+			}),
+			#[cfg(test)]
+			_file: None,
 		})
 	}
 
@@ -911,19 +1245,11 @@ impl BaselineStore {
 		)?;
 		if changed > 0 {
 			for entry in adopted {
-				// The non-mirroring form: these rows are inside the transaction below, and a copy
-				// updated per row would keep the rows a rollback took back (see `note_written`).
+				// The non-retrying form: these rows are inside the transaction above.
 				self.upsert_entry_once(id, entry)?;
 			}
 		}
 		tx.commit()?;
-		if changed > 0 {
-			self.note_written(id, |rows| {
-				for entry in adopted {
-					rows.upsert(entry);
-				}
-			});
-		}
 		Ok(changed)
 	}
 
@@ -966,7 +1292,6 @@ impl BaselineStore {
 		// The `ON DELETE CASCADE` (with `foreign_keys = ON`) drops the pair's baseline rows.
 		self.conn
 			.execute("DELETE FROM sync_pairs WHERE id = ?1", params![id])?;
-		self.forget_resident(id);
 		Ok(())
 	}
 
@@ -1071,9 +1396,6 @@ impl BaselineStore {
 			|| format!("the baseline row for {:?}", entry.rel_path),
 			|| self.upsert_entry_once(pair, entry),
 		)
-		.inspect(|()| {
-			self.note_written(pair, |rows| rows.upsert(entry));
-		})
 	}
 
 	/// [`upsert_entry`](Self::upsert_entry) without the retry, for the callers already inside a
@@ -1081,24 +1403,7 @@ impl BaselineStore {
 	/// wait for and a retry of the statement alone would re-run it inside a transaction that has
 	/// already failed.
 	fn upsert_entry_once(&self, pair: PairId, entry: &BaselineEntry) -> rusqlite::Result<()> {
-		self.conn.prepare_cached(UPSERT_ENTRY)?.execute(params![
-			pair,
-			entry.rel_path,
-			entry.kind.as_i64(),
-			entry.remote_uuid,
-			entry.content_hash.as_ref().map(|h| h.as_ref().as_slice()),
-			entry.size.map(|s| s as i64),
-			entry.local_mtime,
-			entry.remote_modified,
-			entry.state.as_i64(),
-			entry.local_kind.map(NodeKind::as_i64),
-			entry.remote_kind.map(NodeKind::as_i64),
-			entry.remote_hash.as_ref().map(|h| h.as_ref().as_slice()),
-			entry.remote_size.map(|s| s as i64),
-			entry.remote_stable_uuid,
-			entry.agreed_hash.as_ref().map(|h| h.as_ref().as_slice()),
-		])?;
-		Ok(())
+		upsert_row(&self.conn, pair, entry)
 	}
 
 	/// One baseline row by path (whole-pair snapshots go through `entries`).
@@ -1197,71 +1502,24 @@ impl BaselineStore {
 		Ok(())
 	}
 
-	/// `pair`'s rows as a [`Baseline`] over the resident [`Tree`], read from the DB on the first call and kept
-	/// in step by every write path here afterwards.
+	/// `pair`'s rows as a pass reads them: a [`Snapshot`] of the table, on a reader connection of
+	/// the pass's own with a read transaction open (see [`rows`](super::rows)).
 	///
-	/// This is what a pass reconciles against, so it is read once per PAIR rather than once per
-	/// pass: at 100k rows the `SELECT` and the tree build it replaces cost ~180 ms, which an idle
-	/// pass would otherwise pay to find out that nothing changed.
+	/// Nothing is read here but the pair's counts, which is the read that pins the snapshot: what a
+	/// pass then asks, it asks of the table. The store keeps nothing of the pair between passes —
+	/// the resident tree this replaced was the whole pair, ~127 bytes a row for the life of the
+	/// process — and a pass that asks nothing (an idle wake) costs this one row read.
 	///
 	/// This process's store is assumed to be the only writer of the pair's rows — it is, for every
-	/// path in the engine — and a second writer on the same file (another engine, another process)
-	/// would leave the copy describing rows that connection has since changed. Nothing enforces it.
-	///
-	/// Handed out as an [`Arc`], and every write below applies itself through
-	/// [`Arc::make_mut`]: while a pass holds a copy, that pass's view stays exactly the one it read
-	/// — the pass reconciles against a fixed baseline and writes the rows it advances — and the
-	/// FIRST write of such a pass clones the tree once, after which the store owns it alone again
-	/// and the rest of that pass's writes land in place. A pass that writes nothing clones nothing.
+	/// path in the engine. The snapshot does not depend on it: a second writer's commits are simply
+	/// not in a snapshot that began before them, exactly as this store's own are not.
 	pub(crate) fn baseline(&self, pair: PairId) -> rusqlite::Result<Baseline> {
-		if let Some(rows) = self.resident.borrow().get(&pair) {
-			return Ok(Baseline::resident(Arc::clone(rows)));
-		}
-		let rows = Arc::new(self.read_tree(pair)?);
-		self.resident.borrow_mut().insert(pair, Arc::clone(&rows));
-		Ok(Baseline::resident(rows))
-	}
-
-	/// `pair`'s rows as a [`Tree`], built from them AS THEY ARRIVE.
-	///
-	/// Not `Tree::from_rows(self.entries(pair)?)`, which is the same tree by way of a `Vec` of
-	/// every row the pair has. That `Vec` is the widest thing a process holding an idle pair ever
-	/// builds: at a million rows it is ~300 MiB of `BaselineEntry` and their paths, alive beside
-	/// the tree being built out of it — and once freed, the pages an allocator has not returned to
-	/// the kernel are still resident, so a pair loaded that way costs its own size twice over for
-	/// the life of the process. One row at a time costs one row.
-	///
-	/// The `ORDER BY` is `entries`'s, kept because the tree is built by `upsert`
-	/// per row: parent before child for same-prefix paths, which is the order a load is cheapest
-	/// in and the order both read paths agree on.
-	fn read_tree(&self, pair: PairId) -> rusqlite::Result<Tree> {
-		let mut statement = self.conn.prepare(&format!(
-			"SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 ORDER BY rel_path"
-		))?;
-		let mut rows = statement.query(params![pair])?;
-		let mut tree = Tree::default();
-		while let Some(row) = rows.next()? {
-			tree.upsert(&Self::row_to_entry(row)?);
-		}
-		tree.shrink_after_load();
-		Ok(tree)
-	}
-
-	/// Apply to the resident copy what a write that has just COMMITTED did to the DB. Called on the
-	/// success path only: a write that failed changed no row, and mirroring it would make the
-	/// resident copy describe a DB that does not exist.
-	///
-	/// A pair nothing has read yet has no resident copy, and gains one from the DB when something
-	/// asks: there is nothing to keep in step until then.
-	fn note_written(&self, pair: PairId, apply: impl FnOnce(&mut Tree)) {
-		if let Some(rows) = self.resident.borrow_mut().get_mut(&pair) {
-			apply(Arc::make_mut(rows));
-		}
-	}
-
-	/// Drop `pair`'s resident copy: its rows are gone, or are about to be re-read from scratch.
-	fn forget_resident(&self, pair: PairId) {
-		self.resident.borrow_mut().remove(&pair);
+		let conn = self.readers.take()?;
+		Ok(Baseline::stored(Snapshot::begin(
+			conn,
+			pair,
+			Some(Arc::clone(&self.readers)),
+		)?))
 	}
 
 	/// The rows `pair` is holding in conflict — both flavours — ordered by path.
@@ -1272,9 +1530,20 @@ impl BaselineStore {
 	/// makes it a seek of those rows rather than that same walk with the filtering moved into
 	/// SQLite.
 	pub(crate) fn conflicts(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
+		self.conflicts_by(pair, &conflict_rows_sql())
+	}
+
+	/// [`conflicts`](Self::conflicts) in a file without the state index (see
+	/// [`conflict_rows_walked_sql`]).
+	#[cfg(feature = "bench-internals")]
+	pub(super) fn conflicts_walked(&self, pair: PairId) -> rusqlite::Result<Vec<BaselineEntry>> {
+		self.conflicts_by(pair, &conflict_rows_walked_sql())
+	}
+
+	fn conflicts_by(&self, pair: PairId, sql: &str) -> rusqlite::Result<Vec<BaselineEntry>> {
 		let mut held: Vec<BaselineEntry> = self
 			.conn
-			.prepare(&conflict_rows_sql())?
+			.prepare(sql)?
 			.query_map(
 				params![
 					pair,
@@ -1302,11 +1571,6 @@ impl BaselineStore {
 			|| format!("the deletion of the baseline row for {rel_path:?}"),
 			|| self.delete_entry_once(pair, rel_path),
 		)
-		.inspect(|()| {
-			self.note_written(pair, |rows| {
-				rows.remove(rel_path);
-			});
-		})
 	}
 
 	/// [`delete_entry`](Self::delete_entry) without the retry, for a caller already inside one of
@@ -1333,9 +1597,7 @@ impl BaselineStore {
 				delete_under.execute(params![pair, root])?;
 			}
 		}
-		tx.commit().inspect(|()| {
-			self.note_written(pair, |rows| rows.remove_subtrees(roots));
-		})
+		tx.commit()
 	}
 
 	/// Journal a remote write AND apply the baseline edits it produced, in ONE transaction.
@@ -1370,7 +1632,6 @@ impl BaselineStore {
 			},
 			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes),
 		)
-		.inspect(|()| self.note_written(pair, |rows| rows.apply(changes)))
 	}
 
 	fn record_pending_once(
@@ -1433,7 +1694,6 @@ impl BaselineStore {
 				tx.commit()
 			},
 		)
-		.inspect(|()| self.note_written(pair, |rows| rows.apply(changes)))
 	}
 
 	/// Runs inside a transaction the caller opened, so every statement here is the non-retrying
@@ -1444,12 +1704,23 @@ impl BaselineStore {
 				BaselineChange::Upsert(entry) => self.upsert_entry_once(pair, entry)?,
 				BaselineChange::Delete(rel_path) => self.delete_entry_once(pair, rel_path)?,
 				BaselineChange::MoveSubtree { from, to } => {
-					self.conn
-						.prepare_cached(MOVE_AT_PATH)?
-						.execute(params![pair, from, to])?;
-					self.conn
-						.prepare_cached(MOVE_UNDER_PATH)?
-						.execute(params![pair, from, to])?;
+					let (folded_from, folded_to) = (collision_key(from), collision_key(to));
+					let is_rule_file = to.rsplit('/').next() == Some(FILENIGNORE);
+					self.conn.prepare_cached(MOVE_AT_PATH)?.execute(params![
+						pair,
+						from,
+						to,
+						folded_from,
+						folded_to,
+						is_rule_file
+					])?;
+					self.conn.prepare_cached(MOVE_UNDER_PATH)?.execute(params![
+						pair,
+						from,
+						to,
+						folded_from,
+						folded_to
+					])?;
 				}
 			}
 		}
@@ -1609,9 +1880,13 @@ impl BaselineStore {
 		})
 	}
 
-	fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<BaselineEntry> {
-		let kind_raw: i64 = row.get("kind")?;
-		let state_raw: i64 = row.get("state")?;
+	/// A row as [`ENTRY_COLUMNS`] lists its columns, read by POSITION: every row of every
+	/// enumeration a pass makes comes through here, and a lookup by name is a walk of the column
+	/// names per field. `the_entry_columns_are_read_in_the_order_they_are_listed` holds the two lists
+	/// together.
+	pub(super) fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<BaselineEntry> {
+		let kind_raw: i64 = row.get(1)?;
+		let state_raw: i64 = row.get(7)?;
 		// Straight into the fixed-size array rusqlite decodes blobs into — no `Vec` per hash, and a
 		// blob of the wrong length is refused by the column read itself rather than by a check of
 		// ours. Three of these per row, on every row of every pass's baseline read.
@@ -1620,9 +1895,6 @@ impl BaselineStore {
 				.get::<_, Option<[u8; 32]>>(column)?
 				.map(Blake3Hash::from))
 		};
-		let content_hash = hash("content_hash")?;
-		let remote_hash = hash("remote_hash")?;
-		let agreed_hash = hash("agreed_hash")?;
 		let side_kind = |raw: Option<i64>| match raw {
 			None => Ok(None),
 			Some(raw) => NodeKind::from_i64(raw)
@@ -1630,20 +1902,20 @@ impl BaselineStore {
 				.ok_or_else(|| corrupt("kind", raw)),
 		};
 		Ok(BaselineEntry {
-			rel_path: row.get("rel_path")?,
+			rel_path: row.get(0)?,
 			kind: NodeKind::from_i64(kind_raw).ok_or_else(|| corrupt("kind", kind_raw))?,
-			remote_uuid: row.get("remote_uuid")?,
-			content_hash,
-			size: row.get::<_, Option<i64>>("size")?.map(|s| s as u64),
-			local_mtime: row.get("local_mtime")?,
-			remote_modified: row.get("remote_modified")?,
+			remote_uuid: row.get(2)?,
+			content_hash: hash(3)?,
+			size: row.get::<_, Option<i64>>(4)?.map(|s| s as u64),
+			local_mtime: row.get(5)?,
+			remote_modified: row.get(6)?,
 			state: BaselineState::from_i64(state_raw).ok_or_else(|| corrupt("state", state_raw))?,
-			local_kind: side_kind(row.get("local_kind")?)?,
-			remote_kind: side_kind(row.get("remote_kind")?)?,
-			remote_hash,
-			remote_size: row.get::<_, Option<i64>>("remote_size")?.map(|s| s as u64),
-			remote_stable_uuid: row.get("remote_stable_uuid")?,
-			agreed_hash,
+			local_kind: side_kind(row.get(8)?)?,
+			remote_kind: side_kind(row.get(9)?)?,
+			remote_hash: hash(10)?,
+			remote_size: row.get::<_, Option<i64>>(11)?.map(|s| s as u64),
+			remote_stable_uuid: row.get(12)?,
+			agreed_hash: hash(13)?,
 		})
 	}
 }
@@ -2264,16 +2536,12 @@ mod tests {
 		std::fs::remove_file(&path).ok();
 	}
 
-	/// The resident tree is built from the rows as they arrive; the materialized read is the same
-	/// rows by way of a `Vec`. The two must be the same tree — same rows, same order, same
-	/// parents — or the read that a pass actually uses is not the one the tests cover.
-	///
-	/// Handed the rows in OPPOSITE orders on purpose. Both reads issue the same `ORDER BY
-	/// rel_path`, so comparing them as they come is comparing a loop with itself; reversing one
-	/// side puts every child before its own directory and every sibling backwards, which is the
-	/// only way to ask whether the tree a pass loads depends on the order its rows arrived in.
+	/// What a pass reads through [`BaselineStore::baseline`] is the rows the store holds, every
+	/// derived column and count with them: held to the resident tree built from the same rows, over
+	/// every question a pass asks. The rows go in out of path order, a child before its own
+	/// directory, and include every derived column's interesting case.
 	#[test]
-	fn the_streamed_load_builds_the_tree_the_materialized_read_builds() {
+	fn the_store_reads_back_what_a_tree_of_its_rows_answers() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let (pair, _) = store
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
@@ -2281,37 +2549,46 @@ mod tests {
 		assert_eq!(
 			store.baseline(pair).unwrap().len(),
 			0,
-			"a pair with no rows loads an empty tree"
+			"a pair with no rows reads no rows"
 		);
-
-		// Written out of path order, and with a child before its own directory — though the reads
-		// below both sort, so this is the DB's fidelity and not yet the question.
 		for entry in [
 			file_entry("a/deep/b.txt", [9u8; 32], 4242),
 			dir_entry("a"),
 			file_entry("c.txt", [1u8; 32], 7),
 			dir_entry("a/deep"),
+			file_entry("a/.filenignore", [2u8; 32], 3),
+			BaselineEntry {
+				agreed_hash: None,
+				..file_entry("A/pushed.txt", [3u8; 32], 3)
+			},
+			BaselineEntry {
+				state: BaselineState::Conflicted,
+				..file_entry("a/deep/held.txt", [4u8; 32], 4)
+			},
+			BaselineEntry {
+				remote_uuid: None,
+				..file_entry("\u{130}.txt", [5u8; 32], 5)
+			},
 		] {
 			store.upsert_entry(pair, &entry).unwrap();
 		}
-		// The upserts above mirrored themselves into the copy the first read made, and this is a
-		// test of the READ: make the store go back to the DB for it.
-		store.forget_resident(pair);
+		assert_reads_its_rows(&store, pair, "eight rows");
+		assert_eq!(store.baseline(pair).unwrap().len(), 8);
+	}
 
-		let streamed = store.baseline(pair).unwrap();
-		let mut rows = store.entries(pair).unwrap();
-		rows.reverse();
-		let materialized = Baseline::from_rows(rows);
-		assert_eq!(streamed.len(), materialized.len(), "same row count");
-		assert_eq!(
-			streamed.iter().collect::<Vec<_>>(),
-			materialized.iter().collect::<Vec<_>>(),
-			"same rows, in the same walk order, from opposite arrival orders"
+	/// The store's reader for `pair`, held to the resident tree built from what the table holds.
+	fn assert_reads_its_rows(store: &BaselineStore, pair: PairId, what: &str) {
+		let rows = store.entries(pair).unwrap();
+		let probes = super::super::rows::tests::probes(
+			rows.iter()
+				.map(|row| row.rel_path.clone())
+				.chain(["new/path".to_string()]),
 		);
-		assert_eq!(
-			streamed.len(),
-			4,
-			"and it is the four rows that were written, not an empty tree both paths agree on"
+		super::super::rows::tests::assert_alike(
+			what,
+			&store.baseline(pair).unwrap(),
+			&super::super::tree::Tree::from_rows(rows),
+			&probes,
 		);
 	}
 
@@ -2402,33 +2679,20 @@ mod tests {
 		assert_eq!(store.entry(pair, "x.txt").unwrap(), None);
 	}
 
-	/// The resident copy a pass reconciles against has to describe the DB after EVERY write path,
-	/// or a pass reads rows that are not there (a fabricated absence) or misses rows that are.
-	/// Every path that writes a baseline row is driven here and the copy compared against a fresh
-	/// read of the file.
+	/// Every path that writes a baseline row keeps the columns and counts a pass reads true to the
+	/// rows: a count that drifted, or a folded path or flag a move did not carry, is a pass reading
+	/// rows that are not there — a fabricated absence — or missing rows that are. Each write is
+	/// followed by the whole reader held to a tree built from the table's rows, including the two
+	/// `UPDATE OR REPLACE` moves, whose overwritten rows only the delete trigger counts out.
 	#[test]
-	fn every_write_path_keeps_the_resident_copy_equal_to_the_db() {
+	fn every_write_path_keeps_what_a_pass_reads_true_to_the_rows() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let (pair, _) = store
 			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
-		// From the DB: the copy exists from here on, so every write below has one to keep in step.
 		assert!(store.baseline(pair).unwrap().is_empty());
-
 		let agrees = |store: &BaselineStore, what: &str| {
-			let from_db: HashMap<String, BaselineEntry> = store
-				.entries(pair)
-				.unwrap()
-				.into_iter()
-				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect();
-			let resident: HashMap<String, BaselineEntry> = store
-				.baseline(pair)
-				.unwrap()
-				.iter()
-				.map(|entry| (entry.rel_path.clone(), entry))
-				.collect();
-			assert_eq!(resident, from_db, "after {what}");
+			assert_reads_its_rows(store, pair, &format!("after {what}"));
 		};
 
 		store
@@ -2440,7 +2704,39 @@ mod tests {
 			.upsert_entry(pair, &file_entry("a/sub/y.txt", [2; 32], 2))
 			.unwrap();
 		store.upsert_entry(pair, &dir_entry("ab")).unwrap();
+		store
+			.upsert_entry(pair, &file_entry("a/sub/.filenignore", [6; 32], 6))
+			.unwrap();
+		store
+			.upsert_entry(
+				pair,
+				&BaselineEntry {
+					agreed_hash: None,
+					..file_entry("a/pushed.txt", [7; 32], 7)
+				},
+			)
+			.unwrap();
+		store
+			.upsert_entry(
+				pair,
+				&BaselineEntry {
+					remote_uuid: None,
+					..file_entry("b/sub/lost.txt", [8; 32], 8)
+				},
+			)
+			.unwrap();
 		agrees(&store, "upsert_entry");
+		// Rewritten in place: one-sided, then whole again — the flag and both counts follow.
+		store
+			.upsert_entry(
+				pair,
+				&BaselineEntry {
+					remote_uuid: None,
+					..file_entry("a/x.txt", [1; 32], 1)
+				},
+			)
+			.unwrap();
+		agrees(&store, "upsert_entry, now uncarryable");
 
 		store.delete_entry(pair, "ab").unwrap();
 		agrees(&store, "delete_entry");
@@ -2469,6 +2765,25 @@ mod tests {
 			.unwrap();
 		agrees(&store, "apply_changes(MoveSubtree), case only");
 
+		// A file renamed INTO being a rule file, and one renamed out of it: the one row whose leaf
+		// a move changes.
+		store
+			.apply_changes(
+				pair,
+				&[
+					BaselineChange::MoveSubtree {
+						from: "B/pushed.txt",
+						to: "B/.filenignore",
+					},
+					BaselineChange::MoveSubtree {
+						from: "B/sub/.filenignore",
+						to: "B/sub/rules.txt",
+					},
+				],
+			)
+			.unwrap();
+		agrees(&store, "apply_changes(MoveSubtree), a leaf renamed");
+
 		store
 			.record_pending(
 				pair,
@@ -2482,6 +2797,39 @@ mod tests {
 			)
 			.unwrap();
 		agrees(&store, "record_pending");
+
+		// Moves whose ends are not ASCII, which carry `folded_path` by a prefix swap counted in
+		// characters: into a directory named by the dotted İ, whose folding is LONGER than it, and
+		// Ä; then out of it again under Greek capitals, whose folding is not what `lower()` makes.
+		// An ASCII move cannot tell a swap counted on the wrong column from the right one.
+		store
+			.apply_changes(
+				pair,
+				&[BaselineChange::MoveSubtree {
+					from: "B/sub",
+					to: "İ/Äsub",
+				}],
+			)
+			.unwrap();
+		agrees(&store, "apply_changes(MoveSubtree), into non-ASCII ends");
+		store
+			.apply_changes(
+				pair,
+				&[BaselineChange::MoveSubtree {
+					from: "İ",
+					to: "ΣΑΣ/İİ",
+				}],
+			)
+			.unwrap();
+		agrees(&store, "apply_changes(MoveSubtree), between non-ASCII ends");
+		let moved = store.baseline(pair).unwrap();
+		assert!(
+			moved.contains_key("ΣΑΣ/İİ/Äsub") && moved.contains_key("ΣΑΣ/İİ/Äsub/rules.txt"),
+			"the two moves carried nothing, so they checked nothing"
+		);
+		// Another spelling of the moved file finds it through the folded path the move carried.
+		assert!(moved.occupied("σασ/İİ/äSUB/RULES.TXT"));
+		drop(moved);
 
 		store
 			.set_mode(
@@ -2501,13 +2849,150 @@ mod tests {
 		agrees(&store, "delete_subtrees");
 	}
 
-	/// A write that FAILED changed no row, so the copy must still describe the DB as it still is.
+	/// Two snapshots open at once — a dry run beside a pass — leave ONE reader connection behind
+	/// when they end, not two: each idle reader keeps its page cache for the life of the store.
+	#[test]
+	fn overlapping_snapshots_leave_one_idle_reader() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		store.upsert_entry(pair, &dir_entry("a")).unwrap();
+		let idle = || {
+			store
+				.readers
+				.idle
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.len()
+		};
+		let (first, second) = (store.baseline(pair).unwrap(), store.baseline(pair).unwrap());
+		assert!(first.contains_key("a") && second.contains_key("a"));
+		assert_eq!(idle(), 0, "both readers are in use");
+		drop((first, second));
+		assert_eq!(
+			idle(),
+			1,
+			"the store keeps one idle reader, and closes the rest"
+		);
+		// And the next pass reuses it.
+		assert!(store.baseline(pair).unwrap().contains_key("a"));
+		assert_eq!(idle(), 1);
+	}
+
+	/// The rules [`Derived`] computes its columns by, pinned against the schema version the stored
+	/// columns were written under. A change to any of them fails here, and the message says what
+	/// the change owes: a [`SCHEMA_VERSION`] bump, then this test's pins moved to match.
+	#[test]
+	fn the_derived_columns_are_pinned_to_the_schema_version() {
+		let owed = "a rule the stored derived columns were computed by changed (see `Derived`): bump \
+		            SCHEMA_VERSION so a file written under the old rule is refused, then move this pin";
+		assert_eq!(
+			(SCHEMA_VERSION, char::UNICODE_VERSION),
+			(3, (17, 0, 0)),
+			"{owed}"
+		);
+		// Confirmed: this helper's rows otherwise carry a marker that is not their content.
+		let confirmed = |row: BaselineEntry| BaselineEntry {
+			agreed_hash: row.content_hash,
+			..row
+		};
+		let synced = confirmed(file_entry("d/f.txt", [1; 32], 1));
+		let dir = dir_entry("d");
+		// Each row with exactly one thing different from a synced file, and what each rule answers.
+		let cases: [(&str, BaselineEntry, [bool; 3]); 10] = [
+			("synced file", synced.clone(), [true, false, false]),
+			("directory", dir.clone(), [true, false, false]),
+			(
+				"no remote uuid",
+				BaselineEntry {
+					remote_uuid: None,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"no content hash",
+				BaselineEntry {
+					content_hash: None,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"no size",
+				BaselineEntry {
+					size: None,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"no local mtime",
+				BaselineEntry {
+					local_mtime: None,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"no remote stamp",
+				BaselineEntry {
+					remote_modified: None,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"conflicted",
+				BaselineEntry {
+					state: BaselineState::Conflicted,
+					..synced.clone()
+				},
+				[false, false, false],
+			),
+			(
+				"pushed, unconfirmed",
+				BaselineEntry {
+					agreed_hash: None,
+					..synced.clone()
+				},
+				[true, false, true],
+			),
+			(
+				"rule file",
+				confirmed(file_entry("d/.filenignore", [1; 32], 1)),
+				[true, true, false],
+			),
+		];
+		for (what, row, [carryable, rule_file, unconfirmed]) in cases {
+			let derived = Derived::of(&row);
+			assert_eq!(
+				(derived.carryable, derived.rule_file, derived.unconfirmed),
+				(carryable, rule_file, unconfirmed),
+				"{what}: {owed}"
+			);
+		}
+		// The foldings the collision check depends on, where `char::to_lowercase` and ASCII lowering
+		// part: the dotted İ lowers LONGER than itself, a capital sigma never to the final form.
+		for (path, folded) in [
+			("Ä/İ.txt", "ä/i\u{307}.txt"),
+			("ΣΑΣ", "σασ"),
+			("Документы", "документы"),
+		] {
+			assert_eq!(Derived::of(&dir_entry(path)).folded_path, folded, "{owed}");
+		}
+	}
+
+	/// A write that FAILED changed no row, so what a pass reads — the rows, and the counts the
+	/// triggers keep, which roll back with the statement that fired them — must still describe the
+	/// DB as it still is.
 	/// Triggers refuse one path per write shape, which is the only way to fail a write on purpose:
 	/// contention fails a write before it has run a statement, and what has to be covered here is a
 	/// write that fails HALF WAY — the second row of an adoption, whose rows land inside the mode
 	/// switch's own transaction, so a rollback takes back the row the loop already ran.
 	#[test]
-	fn a_failed_write_leaves_the_resident_copy_describing_the_db() {
+	fn a_failed_write_leaves_what_a_pass_reads_describing_the_db() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let (pair, _) = store
 			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
@@ -2551,6 +3036,7 @@ mod tests {
 				.collect();
 			assert_eq!(rows(&store), from_db, "after a failed {what}");
 			assert_eq!(rows(&store), before, "after a failed {what}");
+			assert_reads_its_rows(&store, pair, &format!("after a failed {what}"));
 		};
 
 		let boom = file_entry("boom.txt", [3; 32], 3);
@@ -2645,10 +3131,9 @@ mod tests {
 		);
 	}
 
-	/// A pair that is gone takes its resident rows with it: sqlite never hands its id out again,
-	/// but a copy left behind would be a whole tree of rows nothing can reach.
+	/// A pair that is gone takes its rows and its counts with it.
 	#[test]
-	fn deleting_a_pair_drops_its_resident_rows() {
+	fn deleting_a_pair_drops_its_rows_and_counts() {
 		let store = BaselineStore::open_in_memory().unwrap();
 		let (pair, _) = store
 			.create_pair("/local", Uuid::new_v4(), SyncMode::TwoWay)
@@ -2659,8 +3144,16 @@ mod tests {
 		assert_eq!(store.baseline(pair).unwrap().len(), 1);
 
 		store.delete_pair(pair).unwrap();
-		assert!(store.resident.borrow().is_empty());
 		assert!(store.baseline(pair).unwrap().is_empty());
+		let counted: i64 = store
+			.conn
+			.query_row(
+				"SELECT COUNT(*) FROM baseline_counts WHERE pair_id = ?1",
+				params![pair],
+				|row| row.get(0),
+			)
+			.unwrap();
+		assert_eq!(counted, 0, "the pair's counts row went with it");
 	}
 
 	/// A directory move re-keys the row at the source and every row under it, keeps everything else
@@ -2980,8 +3473,7 @@ mod tests {
 	#[test]
 	fn the_conflict_read_seeks_the_state_index() {
 		let store = BaselineStore::open_in_memory().unwrap();
-		let sql = conflict_rows_sql();
-		let plan = |store: &BaselineStore| -> Vec<String> {
+		let plan = |store: &BaselineStore, sql: &str| -> Vec<String> {
 			store
 				.conn
 				.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -2999,7 +3491,7 @@ mod tests {
 				.unwrap()
 		};
 
-		let indexed = plan(&store);
+		let indexed = plan(&store, &conflict_rows_sql());
 		assert!(
 			indexed
 				.iter()
@@ -3008,7 +3500,16 @@ mod tests {
 		);
 
 		store.set_state_index(false).unwrap();
-		let walked = plan(&store);
+		// Without the index the read refuses to run rather than walking the pair in silence…
+		assert!(
+			store
+				.conn
+				.prepare(&format!("EXPLAIN QUERY PLAN {}", conflict_rows_sql()))
+				.is_err(),
+			"the conflict read must name its index, not fall back to a walk"
+		);
+		// …and the same read unnamed is exactly that walk.
+		let walked = plan(&store, &conflict_rows_walked_sql());
 		assert!(
 			!walked.iter().any(|step| step.contains("baseline_state")),
 			"the control plan must not name an index that is gone: {walked:?}"
@@ -3067,7 +3568,7 @@ mod tests {
 	/// Every statement that works on a whole subtree must SEEK the primary-key index, and the plan
 	/// has to name the columns it seeks on.
 	///
-	/// `SEARCH baseline USING INDEX sqlite_autoindex_baseline_1 (pair_id=?)` — no `rel_path` term —
+	/// `SEARCH baseline USING PRIMARY KEY (pair_id=?)` — no `rel_path` term —
 	/// is what an unsargable predicate produces: a walk of every index entry of the pair, with no
 	/// `SCAN` step to give it away. Both the `substr` form these replaced and an `OR` of the two
 	/// ranges plan exactly that, so asserting only "SEARCH, and not SCAN" passes for the very shape
@@ -3088,7 +3589,7 @@ mod tests {
 				// A DELETE reports the same seek as `SEARCH ... USING COVERING INDEX ...`.
 				plan.iter()
 					.any(|step| step.starts_with("SEARCH baseline USING")
-						&& step.contains("sqlite_autoindex_baseline_1")
+						&& step.contains("PRIMARY KEY")
 						&& step.contains(seek)),
 				"{sql}\nmust seek on {seek}: {plan:?}"
 			);
@@ -3102,8 +3603,16 @@ mod tests {
 
 		assert_seeks(DELETE_AT_PATH, &[&1_i64, &"docs"], at_path);
 		assert_seeks(DELETE_UNDER_PATH, &[&1_i64, &"docs"], under_path);
-		assert_seeks(MOVE_AT_PATH, &[&1_i64, &"docs", &"moved"], at_path);
-		assert_seeks(MOVE_UNDER_PATH, &[&1_i64, &"docs", &"moved"], under_path);
+		assert_seeks(
+			MOVE_AT_PATH,
+			&[&1_i64, &"docs", &"moved", &"docs", &"moved", &false],
+			at_path,
+		);
+		assert_seeks(
+			MOVE_UNDER_PATH,
+			&[&1_i64, &"docs", &"moved", &"docs", &"moved"],
+			under_path,
+		);
 	}
 
 	#[test]
