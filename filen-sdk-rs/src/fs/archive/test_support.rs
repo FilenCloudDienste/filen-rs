@@ -1,12 +1,13 @@
 //! Data and archives the archive tests share: bytes that compress and bytes that do not, and
 //! small archives made by the SDK's own writers and the `tar` crate.
 
-use std::{borrow::Cow, io::Write};
+use std::{borrow::Cow, io::Write, ops::RangeInclusive};
 
 use chrono::Utc;
 use filen_types::{crypto::Blake3Hash, fs::Uuid};
 
 use crate::{
+	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::file::{
@@ -55,6 +56,32 @@ pub(crate) fn remote_file(
 		meta,
 	);
 	RemoteFileType::File(Cow::Owned(file))
+}
+
+/// A compression method built at a level, and the levels it takes.
+pub(crate) type LeveledMethod<M> = (fn(u32) -> M, RangeInclusive<u32>);
+
+/// Checks a compression method's levels: each of `methods` (built at a level) states its
+/// levels, takes both ends of them, and refuses one past either as an invalid state.
+pub(crate) fn assert_levels_checked<M: Copy + std::fmt::Debug>(
+	methods: &[LeveledMethod<M>],
+	levels: impl Fn(M) -> Option<RangeInclusive<u32>>,
+	check: impl Fn(M) -> Result<(), Error>,
+) {
+	for (method, range) in methods {
+		assert_eq!(levels(method(5)), Some(range.clone()), "{:?}", method(5));
+		check(method(*range.start())).unwrap();
+		check(method(*range.end())).unwrap();
+		let below = range.start().checked_sub(1);
+		for outside in below.into_iter().chain([range.end() + 1]) {
+			assert_eq!(
+				check(method(outside)).unwrap_err().kind(),
+				ErrorKind::InvalidState,
+				"{:?}",
+				method(outside)
+			);
+		}
+	}
 }
 
 /// The BLAKE3 hash of `data`, as a file's metadata holds it.

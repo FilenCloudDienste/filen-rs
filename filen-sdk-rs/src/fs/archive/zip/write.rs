@@ -563,34 +563,21 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 
 #[cfg(test)]
 mod tests {
-	use crate::ErrorKind;
-
 	use super::*;
+	use crate::fs::archive::test_support::assert_levels_checked;
 
 	#[test]
 	fn a_methods_levels_are_stated_and_checked() {
 		assert_eq!(ZipMethod::Stored.levels(), None);
 		ZipMethod::Stored.check().unwrap();
-		// each method at a level, and the levels it takes
-		type AtLevel = fn(u32) -> ZipMethod;
-		let methods: [(AtLevel, _); 2] = [
-			(|level| ZipMethod::Deflate { level }, 1..=9),
-			(|level| ZipMethod::Bzip2 { level }, 1..=9),
-		];
-		for (method, levels) in methods {
-			assert_eq!(method(5).levels(), Some(levels.clone()), "{:?}", method(5));
-			// both ends are taken, one past either is refused
-			method(*levels.start()).check().unwrap();
-			method(*levels.end()).check().unwrap();
-			for outside in [levels.start() - 1, levels.end() + 1] {
-				assert_eq!(
-					method(outside).check().unwrap_err().kind(),
-					ErrorKind::InvalidState,
-					"{:?}",
-					method(outside)
-				);
-			}
-		}
+		assert_levels_checked(
+			&[
+				(|level| ZipMethod::Deflate { level }, 1..=9),
+				(|level| ZipMethod::Bzip2 { level }, 1..=9),
+			],
+			ZipMethod::levels,
+			ZipMethod::check,
+		);
 	}
 
 	#[test]
