@@ -14,6 +14,7 @@ use super::*;
 use crate::{
 	consts::CHUNK_SIZE,
 	fs::{
+		HasName,
 		archive::{
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			entry_path::entry_path,
