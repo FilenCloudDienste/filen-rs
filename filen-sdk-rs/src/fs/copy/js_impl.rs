@@ -373,30 +373,30 @@ impl From<CopyFailed> for CopyReport {
 	}
 }
 
-/// A callback of the job, converted for the bindings.
-enum Delivery {
+/// A copy's callback, converted for the bindings.
+enum CopyDelivery {
 	TopLevelPlanned(Vec<CopyPlannedItem>),
 	TopLevelCreated(CopiedTopLevelItem),
 	Update(CopyUpdate),
 }
 
-/// Passes the job's callbacks to the binding's delivery task over one channel, which keeps
+/// Passes a copy's callbacks to the binding's delivery task over one channel, which keeps
 /// their order.
-struct DeliveryChannel(UnboundedSender<Delivery>);
+struct CopyChannel(UnboundedSender<CopyDelivery>);
 
-impl CopyCallback for DeliveryChannel {
+impl CopyCallback for CopyChannel {
 	fn on_top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
-		let _ = self.0.send(Delivery::TopLevelPlanned(
+		let _ = self.0.send(CopyDelivery::TopLevelPlanned(
 			items.into_iter().map(Into::into).collect(),
 		));
 	}
 
 	fn on_top_level_created(&self, item: CopiedTopLevel) {
-		let _ = self.0.send(Delivery::TopLevelCreated(item.into()));
+		let _ = self.0.send(CopyDelivery::TopLevelCreated(item.into()));
 	}
 
 	fn on_update(&self, update: super::CopyUpdate) {
-		let _ = self.0.send(Delivery::Update(update.into()));
+		let _ = self.0.send(CopyDelivery::Update(update.into()));
 	}
 }
 
@@ -405,14 +405,14 @@ async fn copy_job(
 	client: Arc<Client>,
 	requests: Vec<CopyRequest>,
 	max_bytes: Option<u64>,
-	sender: UnboundedSender<Delivery>,
+	sender: UnboundedSender<CopyDelivery>,
 	control: JobControl,
 ) -> Result<CopyReport, Error> {
 	let result = client
 		.copy_items_to(
 			requests,
 			CopyConfig { max_bytes },
-			DeliveryChannel(sender),
+			CopyChannel(sender),
 			control,
 		)
 		.await;
@@ -430,12 +430,12 @@ mod uniffi_impl {
 	use crate::{
 		Error,
 		auth::JsClient,
-		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture, spawn_ordered_dispatch},
+		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture},
 	};
 
 	use super::{
-		Client, CopiedTopLevelItem, CopyEntry, CopyPlannedItem, CopyReport, CopyRequest,
-		CopyUpdate, Delivery, copy_job, requests_into, requests_to,
+		Client, CopiedTopLevelItem, CopyDelivery, CopyEntry, CopyPlannedItem, CopyReport,
+		CopyRequest, CopyUpdate, copy_job, requests_into, requests_to,
 	};
 
 	/// Receives a copy's progress, in the order the copy made it, before the call returns.
@@ -457,11 +457,11 @@ mod uniffi_impl {
 		pub max_bytes: Option<u64>,
 	}
 
-	pub(super) fn dispatch(callback: &dyn CopyItemsCallback, delivery: Delivery) {
+	pub(super) fn deliver_copy(callback: &dyn CopyItemsCallback, delivery: CopyDelivery) {
 		match delivery {
-			Delivery::TopLevelPlanned(items) => callback.on_top_level_planned(items),
-			Delivery::TopLevelCreated(item) => callback.on_top_level_created(item),
-			Delivery::Update(update) => callback.on_update(update),
+			CopyDelivery::TopLevelPlanned(items) => callback.on_top_level_planned(items),
+			CopyDelivery::TopLevelCreated(item) => callback.on_top_level_created(item),
+			CopyDelivery::Update(update) => callback.on_update(update),
 		}
 	}
 
@@ -472,19 +472,14 @@ mod uniffi_impl {
 		callback: Arc<dyn CopyItemsCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
-		// the foreign callbacks may block: they run on the dispatch thread, in order. Waiting for
-		// them is no part of the job, so a cancel's grace never cuts off a report already made
-		let (sender, delivered) =
-			spawn_ordered_dispatch(move |delivery| dispatch(callback.as_ref(), delivery));
-		let result = managed_future
-			.into_js_managed_commander_job(move |control| {
-				copy_job(client, requests, config.max_bytes, sender, control)
-			})
-			.await;
-		// the job has ended and dropped its sender: this returns once everything it reported
-		// was delivered
-		let _ = delivered.await;
-		result
+		managed_future
+			.into_ordered_job(
+				move |delivery| deliver_copy(callback.as_ref(), delivery),
+				move |sender, control| {
+					copy_job(client, requests, config.max_bytes, sender, control)
+				},
+			)
+			.await
 	}
 
 	#[uniffi::export]
@@ -534,13 +529,12 @@ mod wasm_impl {
 	use crate::{
 		Error,
 		auth::JsClient,
-		js::{
-			AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback, spawn_local_dispatch,
-		},
+		js::{AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback},
 	};
 
 	use super::{
-		Client, CopyEntry, CopyReport, CopyRequest, Delivery, copy_job, requests_into, requests_to,
+		Client, CopyDelivery, CopyEntry, CopyReport, CopyRequest, copy_job, requests_into,
+		requests_to,
 	};
 
 	#[js_type(import, no_ser, no_default)]
@@ -592,22 +586,22 @@ mod wasm_impl {
 		pub managed_future: ManagedFuture,
 	}
 
-	struct Callbacks {
+	struct CopyCallbacks {
 		on_update: Option<js_sys::Function>,
 		on_top_level_planned: Option<js_sys::Function>,
 		on_top_level_created: Option<js_sys::Function>,
 	}
 
-	impl Callbacks {
-		fn deliver(&self, delivery: Delivery) {
+	impl CopyCallbacks {
+		fn deliver(&self, delivery: CopyDelivery) {
 			match delivery {
-				Delivery::TopLevelPlanned(items) => {
+				CopyDelivery::TopLevelPlanned(items) => {
 					call_callback(self.on_top_level_planned.as_ref(), &items)
 				}
-				Delivery::TopLevelCreated(item) => {
+				CopyDelivery::TopLevelCreated(item) => {
 					call_callback(self.on_top_level_created.as_ref(), &item)
 				}
-				Delivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
+				CopyDelivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
 			}
 		}
 	}
@@ -616,19 +610,15 @@ mod wasm_impl {
 		client: Arc<Client>,
 		requests: Vec<CopyRequest>,
 		max_bytes: Option<u64>,
-		callbacks: Callbacks,
+		callbacks: CopyCallbacks,
 		managed_future: ManagedFuture,
 	) -> Result<CopyReport, Error> {
-		let (sender, delivered) = spawn_local_dispatch(move |delivery| callbacks.deliver(delivery));
-		let result = managed_future
-			.into_js_managed_commander_job(move |control| {
-				copy_job(client, requests, max_bytes, sender, control)
-			})?
-			.await;
-		// the job has ended and dropped its sender: everything it reported reaches its
-		// callback before the result does
-		let _ = delivered.await;
-		result
+		managed_future
+			.into_ordered_job(
+				move |delivery| callbacks.deliver(delivery),
+				move |sender, control| copy_job(client, requests, max_bytes, sender, control),
+			)
+			.await
 	}
 
 	#[wasm_bindgen(js_class = "Client")]
@@ -643,7 +633,7 @@ mod wasm_impl {
 		#[wasm_bindgen(js_name = "copyItems")]
 		pub async fn copy_items(&self, params: CopyItemsParams) -> Result<CopyReport, Error> {
 			let requests = requests_into(params.items, params.destination)?;
-			let callbacks = Callbacks {
+			let callbacks = CopyCallbacks {
 				on_update: params.on_update,
 				on_top_level_planned: params.on_top_level_planned,
 				on_top_level_created: params.on_top_level_created,
@@ -662,7 +652,7 @@ mod wasm_impl {
 		#[wasm_bindgen(js_name = "copyItemsTo")]
 		pub async fn copy_items_to(&self, params: CopyItemsToParams) -> Result<CopyReport, Error> {
 			let requests = requests_to(params.entries)?;
-			let callbacks = Callbacks {
+			let callbacks = CopyCallbacks {
 				on_update: params.on_update,
 				on_top_level_planned: params.on_top_level_planned,
 				on_top_level_created: params.on_top_level_created,
@@ -681,13 +671,9 @@ mod wasm_impl {
 
 #[cfg(all(test, feature = "uniffi"))]
 mod tests {
-	use std::{borrow::Cow, sync::Mutex, time::Duration};
+	use std::{borrow::Cow, time::Duration};
 
-	use chrono::Utc;
-	use filen_types::{
-		api::v3::dir::{color::DirColor, link::info::LinkPasswordSalt},
-		fs::ParentUuid,
-	};
+	use filen_types::api::v3::dir::link::info::LinkPasswordSalt;
 
 	use super::{uniffi_impl::CopyItemsCallback, *};
 	use crate::{
@@ -696,58 +682,22 @@ mod tests {
 			DirPublicLink, PasswordState,
 			fs::{ShareInfo, SharedDirectory, SharingRole},
 		},
-		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+		crypto::{shared::CreateRandom, v3::EncryptionKey},
 		fs::{
+			archive::test_support::remote_file,
+			categories::NonRootItemType,
 			copy,
-			dir::{
-				LinkedDirectory, RemoteDirectory, RootDirectory,
-				meta::{DecryptedDirectoryMeta, DirectoryMeta},
-			},
-			file::{
-				AnonymousRemoteFile, RemoteFile,
-				meta::{DecryptedFileMeta, FileMeta},
-				traits::HasFileInfo,
-			},
+			dir::{LinkedDirectory, RootDirectory},
+			file::traits::HasFileInfo,
 		},
-		js::{Root, spawn_ordered_dispatch},
+		js::{
+			Root,
+			test_support::{PARENT, Recorder, delivered_in_order, drive_dir},
+		},
 	};
 
 	fn file() -> RemoteFileType<'static> {
-		let file: AnonymousRemoteFile = RemoteFile::from_meta(
-			Uuid::new_v4(),
-			(),
-			Uuid::new_v4().into(),
-			10,
-			1,
-			"de-1",
-			"bucket",
-			Utc::now(),
-			false,
-			FileMeta::Decoded(DecryptedFileMeta {
-				name: Cow::Borrowed("a.txt"),
-				size: 10,
-				mime: Cow::Borrowed("text/plain"),
-				key: FileKey::V3(EncryptionKey::generate()),
-				last_modified: Utc::now(),
-				created: None,
-				hash: None,
-			}),
-		);
-		RemoteFileType::File(Cow::Owned(file))
-	}
-
-	fn dir() -> RemoteDirectory {
-		RemoteDirectory::from_meta(
-			Uuid::new_v4(),
-			ParentUuid::Uuid(Uuid::new_v4()),
-			DirColor::Blue,
-			false,
-			Utc::now(),
-			DirectoryMeta::Decoded(DecryptedDirectoryMeta {
-				name: Cow::Borrowed("Photos"),
-				created: None,
-			}),
-		)
+		remote_file(Uuid::from_u128(0xf), PARENT, "a.txt", b"ten bytes!", None)
 	}
 
 	fn failure_source(item: AnyItemWithContext) -> ItemSource {
@@ -767,7 +717,7 @@ mod tests {
 
 	#[test]
 	fn a_failed_directory_is_a_copy_source_again() {
-		let source = dir();
+		let source = drive_dir(Uuid::from_u128(0xd), "Photos");
 		let item =
 			AnyItemWithContext::from(FailedSource::Dir(ItemSourceDir::Normal(source.clone())));
 		let ItemSource::Dir(ItemSourceDir::Normal(copied)) = failure_source(item) else {
@@ -778,7 +728,7 @@ mod tests {
 
 	#[test]
 	fn a_failed_shared_or_linked_directory_is_a_copy_source_again() {
-		let shared = dir();
+		let shared = drive_dir(Uuid::from_u128(0x5d), "Shared");
 		let role = SharingRole::Receiver(ShareInfo {
 			email: "sharer@example.com".to_owned(),
 			id: 7,
@@ -796,9 +746,9 @@ mod tests {
 		assert_eq!(dir_back.uuid(), shared.uuid());
 		assert_eq!(role_back, role);
 
-		let linked = dir();
+		let linked = drive_dir(Uuid::from_u128(0x1d), "Linked");
 		let link = DirPublicLink {
-			link_uuid: Uuid::new_v4(),
+			link_uuid: Uuid::from_u128(0x11),
 			link_key: MetaKey::V3(EncryptionKey::generate()),
 			password: PasswordState::None,
 			enable_download: true,
@@ -819,7 +769,7 @@ mod tests {
 	#[test]
 	fn the_root_directory_cannot_be_copied() {
 		let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(
-			Root::from(RootDirectory::new(Uuid::new_v4())),
+			Root::from(RootDirectory::new(Uuid::from_u128(0x7))),
 		)));
 		let error = ItemSource::try_from(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
@@ -829,7 +779,7 @@ mod tests {
 	fn a_name_given_for_a_copy_must_be_valid() {
 		let entry = |name: &str| CopyEntry {
 			item: AnyItemWithContext::from(FailedSource::File(Box::new(file()))),
-			destination: AnyNormalDir::Dir(dir().into()),
+			destination: AnyNormalDir::Dir(drive_dir(Uuid::from_u128(0xd), "Photos").into()),
 			name: Some(name.to_owned()),
 		};
 		let error = CopyRequest::try_from(entry("a/b.txt")).unwrap_err();
@@ -840,9 +790,9 @@ mod tests {
 
 	#[test]
 	fn an_update_reports_milliseconds_and_the_parts_of_its_errors() {
-		let parent = dir();
+		let parent = drive_dir(Uuid::from_u128(0xd), "Photos");
 		let failure = FailureInfo {
-			source_uuid: Uuid::new_v4(),
+			source_uuid: Uuid::from_u128(0xf),
 			source_path: "/a.txt".to_owned(),
 			dest_parent_dir: DirType::Dir(Cow::Owned(parent.clone())),
 			dest_name: "a.txt".to_owned(),
@@ -925,32 +875,28 @@ mod tests {
 		assert_eq!((update.totals, update.counts), (totals, counts));
 	}
 
-	#[derive(Default)]
-	struct Recorder(Mutex<Vec<u64>>);
-
 	impl CopyItemsCallback for Recorder {
 		fn on_top_level_planned(&self, items: Vec<CopyPlannedItem>) {
-			self.0
-				.lock()
-				.unwrap()
-				.extend(items.iter().map(|i| i.request));
+			for item in items {
+				self.push(item.request);
+			}
 		}
 
 		fn on_top_level_created(&self, item: CopiedTopLevelItem) {
-			self.0.lock().unwrap().push(item.request);
+			self.push(item.request);
 		}
 
 		fn on_update(&self, update: CopyUpdate) {
-			self.0.lock().unwrap().push(update.active_time_ms);
+			self.push(update.active_time_ms);
 		}
 	}
 
 	fn planned(request: u64) -> PlannedTopLevelItem {
 		PlannedTopLevelItem {
 			request: request as usize,
-			source_uuid: Uuid::new_v4(),
-			dest_uuid: Uuid::new_v4(),
-			dest_parent: Uuid::new_v4(),
+			source_uuid: Uuid::from_u128(0x5),
+			dest_uuid: Uuid::from_u128(0xde),
+			dest_parent: PARENT,
 			name: "a".to_owned(),
 			is_dir: false,
 		}
@@ -973,30 +919,28 @@ mod tests {
 
 	#[test]
 	fn callbacks_are_delivered_in_order_until_the_job_lets_go() {
-		let recorder = Arc::new(Recorder::default());
-		let (sender, delivered) = {
-			let recorder = Arc::clone(&recorder);
-			spawn_ordered_dispatch(move |delivery| {
-				uniffi_impl::dispatch(recorder.as_ref(), delivery)
-			})
-		};
-		let channel = DeliveryChannel(sender);
-		let mut expected = Vec::new();
-		for i in 0..300 {
-			match i % 3 {
-				0 => channel.on_top_level_planned(vec![planned(i)]),
-				1 => channel.on_update(update(i)),
-				_ => channel.on_top_level_created(CopiedTopLevel {
-					request: i as usize,
-					source_uuid: Uuid::new_v4(),
-					item: crate::fs::categories::NonRootItemType::Dir(Cow::Owned(dir())),
-				}),
-			}
-			expected.push(i);
-		}
-		drop(channel);
-		futures::executor::block_on(delivered)
-			.expect("delivery ends once the job drops its sender");
-		assert_eq!(*recorder.0.lock().unwrap(), expected);
+		delivered_in_order(
+			|recorder, delivery| uniffi_impl::deliver_copy(recorder, delivery),
+			|sender| {
+				let channel = CopyChannel(sender);
+				let mut sent = Vec::new();
+				for i in 0..300 {
+					match i % 3 {
+						0 => channel.on_top_level_planned(vec![planned(i)]),
+						1 => channel.on_update(update(i)),
+						_ => channel.on_top_level_created(CopiedTopLevel {
+							request: i as usize,
+							source_uuid: Uuid::from_u128(0x5),
+							item: NonRootItemType::Dir(Cow::Owned(drive_dir(
+								Uuid::from_u128(0xde),
+								"a",
+							))),
+						}),
+					}
+					sent.push(i);
+				}
+				sent
+			},
+		);
 	}
 }

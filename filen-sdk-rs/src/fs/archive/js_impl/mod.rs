@@ -16,7 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
 	Error, ErrorKind,
-	auth::Client,
+	auth::{Client, JsClient},
 	fs::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
@@ -807,6 +807,8 @@ enum CompressDelivery {
 	Update(CompressUpdate),
 }
 
+/// Passes a compress's callbacks to the binding's delivery task over one channel, which keeps
+/// their order.
 struct CompressChannel(UnboundedSender<CompressDelivery>);
 
 impl CompressCallback for CompressChannel {
@@ -854,6 +856,7 @@ impl CompressCall {
 	}
 }
 
+/// Runs the compress as the job of a managed future, its callbacks going to `sender`.
 async fn compress_job(
 	client: Arc<Client>,
 	call: CompressCall,
@@ -870,10 +873,29 @@ async fn compress_job(
 			control,
 		)
 		.await;
+	// a compress that ended early still resolves, with the report of what it did
 	Ok(match result {
 		Ok(report) => report.into(),
 		Err(failed) => failed.into(),
 	})
+}
+
+#[cfg_attr(
+	feature = "wasm-full",
+	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
+)]
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl JsClient {
+	/// The memory for one archive job's codec state in effect, in bytes (see
+	/// `JsClientConfig.archiveCodecMemBudget`): pass it to `archiveMaxLevel`, or compare
+	/// `archiveEncoderMemory` with it, to offer only what this device runs.
+	#[cfg_attr(
+		feature = "wasm-full",
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveCodecMemBudget")
+	)]
+	pub fn archive_codec_mem_budget(&self) -> u64 {
+		self.inner_ref().archive_config().codec_mem_budget
+	}
 }
 
 /// The file-name extension an archive in `format` carries, dot included (`.tar.gz`, `.7z`):

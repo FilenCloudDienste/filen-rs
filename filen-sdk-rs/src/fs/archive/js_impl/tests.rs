@@ -1,7 +1,4 @@
-use std::{sync::Mutex, time::Duration};
-
-use chrono::Utc;
-use filen_types::fs::ParentUuid;
+use std::time::Duration;
 
 use super::{
 	uniffi_impl::{
@@ -11,8 +8,6 @@ use super::{
 	*,
 };
 use crate::{
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
-	fs::drive_job::plan::RenameReason,
 	fs::{
 		HasUUID,
 		archive::{
@@ -21,59 +16,26 @@ use crate::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
 			zip::crypto::AesStrength,
 		},
-		dir::{
-			RemoteDirectory, RootDirectory,
-			meta::{DecryptedDirectoryMeta, DirectoryMeta},
-		},
-		file::{
-			meta::{DecryptedFileMeta, FileMeta},
-			traits::HasFileInfo,
-		},
+		dir::{RemoteDirectory, RootDirectory},
+		drive_job::plan::RenameReason,
+		file::traits::HasFileInfo,
 	},
 	job::report::JobFailed,
-	js::{Root, spawn_ordered_dispatch},
+	js::{
+		Root,
+		test_support::{Recorder, delivered_in_order, drive_dir, drive_file},
+	},
 };
 
-/// An archive of `size` bytes in the user's drive.
-fn remote_file_of(size: u64) -> RemoteFile {
-	RemoteFile::from_meta(
-		Uuid::new_v4(),
-		filen_types::fs::StableUuid::new_for_test(Uuid::new_v4()),
-		Uuid::new_v4().into(),
-		size,
-		1,
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		FileMeta::Decoded(DecryptedFileMeta {
-			name: Cow::Borrowed("a.zip"),
-			size,
-			mime: Cow::Borrowed("application/zip"),
-			key: FileKey::V3(EncryptionKey::generate()),
-			last_modified: Utc::now(),
-			created: None,
-			hash: None,
-		}),
-	)
-}
+/// The archive every test extracts from, a file of the user's drive.
+const ARCHIVE: Uuid = Uuid::from_u128(0xa);
 
 fn remote_file() -> RemoteFile {
-	remote_file_of(10)
+	drive_file(ARCHIVE, "a.zip", 10)
 }
 
 fn dir() -> RemoteDirectory {
-	RemoteDirectory::from_meta(
-		Uuid::new_v4(),
-		ParentUuid::Uuid(Uuid::new_v4()),
-		filen_types::api::v3::dir::color::DirColor::Blue,
-		false,
-		Utc::now(),
-		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
-			name: Cow::Borrowed("Photos"),
-			created: None,
-		}),
-	)
+	drive_dir(Uuid::from_u128(0xd), "Photos")
 }
 
 fn destination() -> AnyNormalDir {
@@ -264,7 +226,7 @@ fn items_to_remove_have_to_be_the_users_own_and_not_the_root() {
 		[file.uuid(), dir.uuid()]
 	);
 	let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(Root::from(
-		RootDirectory::new(Uuid::new_v4()),
+		RootDirectory::new(Uuid::from_u128(0x7)),
 	))));
 	for dispose in [None, Some(SourceDisposal::Trash)] {
 		let error = compress_sources(vec![root.clone()], dispose).unwrap_err();
@@ -366,7 +328,7 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 		duplicates: None,
 		dispositions: vec![
 			SourceDisposition {
-				uuid: Uuid::new_v4(),
+				uuid: Uuid::from_u128(0x5a),
 				outcome: DisposalOutcome::Kept {
 					reason: KeptReason::Failed {
 						error: Arc::clone(&removal),
@@ -375,7 +337,7 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 				},
 			},
 			SourceDisposition {
-				uuid: Uuid::new_v4(),
+				uuid: Uuid::from_u128(0x5b),
 				outcome: DisposalOutcome::Disposed {
 					how: SourceDisposal::DeletePermanently,
 					bytes_freed: 7,
@@ -422,8 +384,6 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 			.is_none()
 	);
 }
-
-const ARCHIVE: Uuid = Uuid::from_u128(0xa);
 
 fn entry_id(index: u32) -> ArchiveEntryId {
 	ArchiveEntryId {
@@ -661,16 +621,6 @@ fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
 	assert!(ArchiveListing::from(listing).error.is_none());
 }
 
-/// Records what a job delivered, each callback by a number it carries, in the order it came.
-#[derive(Default)]
-struct Recorder(Mutex<Vec<u64>>);
-
-impl Recorder {
-	fn push(&self, value: u64) {
-		self.0.lock().unwrap().push(value);
-	}
-}
-
 impl ExtractArchiveCallback for Recorder {
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>) {
 		for item in items {
@@ -711,31 +661,15 @@ impl ListArchiveCallback for Recorder {
 	}
 }
 
-/// Delivers what `send` sends, through `deliver` on the shared ordered dispatch, and checks it
-/// all reached the callback, in order, once the sender is dropped (as a job drops it when it
-/// ends).
-fn delivered_in_order<T: Send + 'static>(
-	deliver: fn(&Recorder, T),
-	send: impl FnOnce(UnboundedSender<T>) -> Vec<u64>,
-) {
-	let recorder = Arc::new(Recorder::default());
-	let (sender, delivered) = {
-		let recorder = Arc::clone(&recorder);
-		spawn_ordered_dispatch(move |delivery| deliver(&recorder, delivery))
-	};
-	let expected = send(sender);
-	futures::executor::block_on(delivered).expect("delivery ends once the job drops its sender");
-	assert_eq!(*recorder.0.lock().unwrap(), expected);
-}
-
 #[test]
 fn extract_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 	delivered_in_order(
 		|recorder, delivery| deliver_extract(recorder, delivery),
 		|sender| {
 			let channel = ExtractChannel(sender);
-			(0..300)
-				.inspect(|&i| match i % 2 {
+			let mut sent = Vec::new();
+			for i in 0..300 {
+				match i % 2 {
 					0 => channel.on_top_level_created(vec![extract::ExtractedTopLevel {
 						key: ExtractTopLevelKey::Entry {
 							id: entry_id(i as u32),
@@ -743,8 +677,10 @@ fn extract_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 						item: NonRootItemType::Dir(Cow::Owned(dir())),
 					}]),
 					_ => channel.on_update(extract_update(i)),
-				})
-				.collect()
+				}
+				sent.push(i);
+			}
+			sent
 		},
 	);
 }
@@ -755,12 +691,15 @@ fn compress_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 		|recorder, delivery| deliver_compress(recorder, delivery),
 		|sender| {
 			let channel = CompressChannel(sender);
-			(0..300)
-				.inspect(|&i| match i % 3 {
-					0 => channel.on_archive_created(remote_file_of(i)),
+			let mut sent = Vec::new();
+			for i in 0..300 {
+				match i % 3 {
+					0 => channel.on_archive_created(drive_file(ARCHIVE, "a.tar", i)),
 					_ => channel.on_update(compress_update(i)),
-				})
-				.collect()
+				}
+				sent.push(i);
+			}
+			sent
 		},
 	);
 }
@@ -771,12 +710,15 @@ fn list_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 		|recorder, delivery| deliver_list(recorder, delivery),
 		|sender| {
 			let channel = ListChannel(sender);
-			(0..300)
-				.inspect(|&i| match i % 2 {
+			let mut sent = Vec::new();
+			for i in 0..300 {
+				match i % 2 {
 					0 => channel.on_entries(vec![archive_entry(i as u32)]),
 					_ => channel.on_update(list_update(i)),
-				})
-				.collect()
+				}
+				sent.push(i);
+			}
+			sent
 		},
 	);
 }

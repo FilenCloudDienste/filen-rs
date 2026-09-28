@@ -7,10 +7,7 @@ use web_sys::js_sys;
 use crate::{
 	Error,
 	auth::JsClient,
-	js::{
-		AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback,
-		spawn_local_dispatch,
-	},
+	js::{AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback},
 };
 
 use super::{
@@ -190,6 +187,36 @@ impl ExtractCallbacks {
 	}
 }
 
+struct ListCallbacks {
+	on_entries: Option<js_sys::Function>,
+	on_update: Option<js_sys::Function>,
+}
+
+impl ListCallbacks {
+	fn deliver(&self, delivery: ListDelivery) {
+		match delivery {
+			ListDelivery::Entries(entries) => call_callback(self.on_entries.as_ref(), &entries),
+			ListDelivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
+		}
+	}
+}
+
+struct CompressCallbacks {
+	on_update: Option<js_sys::Function>,
+	on_archive_created: Option<js_sys::Function>,
+}
+
+impl CompressCallbacks {
+	fn deliver(&self, delivery: CompressDelivery) {
+		match delivery {
+			CompressDelivery::ArchiveCreated(archive) => {
+				call_callback(self.on_archive_created.as_ref(), &archive)
+			}
+			CompressDelivery::Update(update) => call_callback(self.on_update.as_ref(), &update),
+		}
+	}
+}
+
 async fn run_extract(
 	client: Arc<Client>,
 	request: ExtractRequest,
@@ -197,69 +224,16 @@ async fn run_extract(
 	callbacks: ExtractCallbacks,
 	managed_future: ManagedFuture,
 ) -> Result<ExtractReport, Error> {
-	let (sender, delivered) = spawn_local_dispatch(move |delivery| callbacks.deliver(delivery));
-	let result = managed_future
-		.into_js_managed_commander_job(move |control| {
-			extract_job(client, request, config, sender, control)
-		})?
-		.await;
-	// the job has ended and dropped its sender: everything it reported reaches its callbacks
-	// before the result does
-	let _ = delivered.await;
-	result
-}
-
-async fn run_list(
-	client: Arc<Client>,
-	archive: RemoteFileType<'static>,
-	config: ExtractConfig,
-	on_entries: Option<js_sys::Function>,
-	on_update: Option<js_sys::Function>,
-	managed_future: ManagedFuture,
-) -> Result<ArchiveListing, Error> {
-	let (sender, delivered) = spawn_local_dispatch(move |delivery| match delivery {
-		ListDelivery::Entries(entries) => call_callback(on_entries.as_ref(), &entries),
-		ListDelivery::Update(update) => call_callback(on_update.as_ref(), &update),
-	});
-	let result = managed_future
-		.into_js_managed_commander_job(move |control| {
-			list_job(client, archive, config, sender, control)
-		})?
-		.await;
-	let _ = delivered.await;
-	result
-}
-
-async fn run_compress(
-	client: Arc<Client>,
-	call: CompressCall,
-	on_update: Option<js_sys::Function>,
-	on_archive_created: Option<js_sys::Function>,
-	managed_future: ManagedFuture,
-) -> Result<CompressReport, Error> {
-	let (sender, delivered) = spawn_local_dispatch(move |delivery| match delivery {
-		CompressDelivery::ArchiveCreated(archive) => {
-			call_callback(on_archive_created.as_ref(), &archive)
-		}
-		CompressDelivery::Update(update) => call_callback(on_update.as_ref(), &update),
-	});
-	let result = managed_future
-		.into_js_managed_commander_job(move |control| compress_job(client, call, sender, control))?
-		.await;
-	let _ = delivered.await;
-	result
+	managed_future
+		.into_ordered_job(
+			move |delivery| callbacks.deliver(delivery),
+			move |sender, control| extract_job(client, request, config, sender, control),
+		)
+		.await
 }
 
 #[wasm_bindgen(js_class = "Client")]
 impl JsClient {
-	/// The memory for one archive job's codec state in effect, in bytes (see
-	/// `JsClientConfig.archiveCodecMemBudget`): pass it to `archiveMaxLevel`, or compare
-	/// `archiveEncoderMemory` with it, to offer only what this device runs.
-	#[wasm_bindgen(js_name = "archiveCodecMemBudget")]
-	pub fn archive_codec_mem_budget(&self) -> u64 {
-		self.inner_ref().archive_config().codec_mem_budget
-	}
-
 	/// Extracts an archive (zip, 7z, tar and its compressed forms, or one compressed file)
 	/// into a directory, entirely in this browser: the archive is downloaded, decrypted and
 	/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
@@ -382,15 +356,18 @@ impl JsClient {
 			params.skip_mac_metadata,
 			password,
 		);
-		run_list(
-			self.inner(),
-			archive,
-			config,
-			params.on_entries,
-			params.on_update,
-			params.managed_future,
-		)
-		.await
+		let callbacks = ListCallbacks {
+			on_entries: params.on_entries,
+			on_update: params.on_update,
+		};
+		let client = self.inner();
+		params
+			.managed_future
+			.into_ordered_job(
+				move |delivery| callbacks.deliver(delivery),
+				move |sender, control| list_job(client, archive, config, sender, control),
+			)
+			.await
 	}
 
 	/// Compresses items into a new archive in a directory, entirely in this browser. `name`
@@ -419,13 +396,17 @@ impl JsClient {
 			params.dispose,
 			self.inner_ref().archive_config().codec_mem_budget,
 		)?;
-		run_compress(
-			self.inner(),
-			call,
-			params.on_update,
-			params.on_archive_created,
-			params.managed_future,
-		)
-		.await
+		let callbacks = CompressCallbacks {
+			on_update: params.on_update,
+			on_archive_created: params.on_archive_created,
+		};
+		let client = self.inner();
+		params
+			.managed_future
+			.into_ordered_job(
+				move |delivery| callbacks.deliver(delivery),
+				move |sender, control| compress_job(client, call, sender, control),
+			)
+			.await
 	}
 }

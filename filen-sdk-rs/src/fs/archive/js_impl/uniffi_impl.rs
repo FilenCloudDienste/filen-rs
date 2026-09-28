@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
 	Error, ErrorKind,
 	auth::{Client, JsClient},
-	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture, spawn_ordered_dispatch},
+	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture},
 };
 
 use super::{
@@ -133,30 +133,16 @@ async fn run_extract(
 	callback: Arc<dyn ExtractArchiveCallback>,
 	managed_future: ManagedFuture,
 ) -> Result<ExtractReport, Error> {
-	// the foreign callbacks may block: they run on the dispatch thread, in order. Waiting for
-	// them is no part of the job, so a cancel's grace never cuts off a report already made
-	let (sender, delivered) =
-		spawn_ordered_dispatch(move |delivery| deliver_extract(callback.as_ref(), delivery));
-	let result = managed_future
-		.into_js_managed_commander_job(move |control| {
-			extract_job(client, request, config, sender, control)
-		})
-		.await;
-	// the job has ended and dropped its sender: this returns once everything it reported was
-	// delivered
-	let _ = delivered.await;
-	result
+	managed_future
+		.into_ordered_job(
+			move |delivery| deliver_extract(callback.as_ref(), delivery),
+			move |sender, control| extract_job(client, request, config, sender, control),
+		)
+		.await
 }
 
 #[uniffi::export]
 impl JsClient {
-	/// The memory for one archive job's codec state in effect, in bytes (see
-	/// `JsClientConfig.archive_codec_mem_budget`): pass it to `archive_max_level`, or compare
-	/// `archive_encoder_memory` with it, to offer only what this device runs.
-	pub fn archive_codec_mem_budget(&self) -> u64 {
-		self.inner_ref().archive_config().codec_mem_budget
-	}
-
 	/// Extracts `archive` (zip, 7z, tar and its compressed forms, or one compressed file)
 	/// into `destination`, entirely on this device: the archive is downloaded, decrypted and
 	/// decoded as a stream, and every entry uploaded as a new item. A name taken at the
@@ -272,15 +258,12 @@ impl JsClient {
 			password,
 		);
 		let client = self.inner();
-		let (sender, delivered) =
-			spawn_ordered_dispatch(move |delivery| deliver_list(callback.as_ref(), delivery));
-		let result = managed_future
-			.into_js_managed_commander_job(move |control| {
-				list_job(client, archive, config, sender, control)
-			})
-			.await;
-		let _ = delivered.await;
-		result
+		managed_future
+			.into_ordered_job(
+				move |delivery| deliver_list(callback.as_ref(), delivery),
+				move |sender, control| list_job(client, archive, config, sender, control),
+			)
+			.await
 	}
 
 	/// Compresses `items` into a new archive `name` in `destination`, entirely on this
@@ -317,14 +300,11 @@ impl JsClient {
 			self.inner_ref().archive_config().codec_mem_budget,
 		)?;
 		let client = self.inner();
-		let (sender, delivered) =
-			spawn_ordered_dispatch(move |delivery| deliver_compress(callback.as_ref(), delivery));
-		let result = managed_future
-			.into_js_managed_commander_job(move |control| {
-				compress_job(client, call, sender, control)
-			})
-			.await;
-		let _ = delivered.await;
-		result
+		managed_future
+			.into_ordered_job(
+				move |delivery| deliver_compress(callback.as_ref(), delivery),
+				move |sender, control| compress_job(client, call, sender, control),
+			)
+			.await
 	}
 }

@@ -6,6 +6,8 @@ use tokio::sync::{
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::js_sys;
 
+use crate::{Error, job::JobControl, js::ManagedFuture};
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -43,7 +45,7 @@ pub(crate) fn optional_function<'de, D: serde::Deserializer<'de>>(
 /// where the JS functions it calls live (they never leave the thread that got them). Dropping
 /// every returned sender ends the task, which then resolves the returned receiver: every item
 /// sent by then has been handled.
-pub(crate) fn spawn_local_dispatch<T: 'static>(
+fn spawn_local_dispatch<T: 'static>(
 	mut handler: impl FnMut(T) + 'static,
 ) -> (UnboundedSender<T>, oneshot::Receiver<()>) {
 	let (sender, mut receiver) = mpsc::unbounded_channel::<T>();
@@ -55,6 +57,34 @@ pub(crate) fn spawn_local_dispatch<T: 'static>(
 		let _ = done.send(());
 	});
 	(sender, handled)
+}
+
+impl ManagedFuture {
+	/// Runs `job` as [`into_js_managed_commander_job`](Self::into_js_managed_commander_job)
+	/// does, handing it a channel whose items reach `deliver` in the order they were sent, on
+	/// this thread: the wasm twin of the uniffi `into_ordered_job`. Resolves once the job has
+	/// ended and everything it sent was delivered, so every callback runs before the call
+	/// resolves.
+	pub(crate) async fn into_ordered_job<D, T, F, Fut>(
+		self,
+		deliver: impl FnMut(D) + 'static,
+		job: F,
+	) -> Result<T, Error>
+	where
+		D: Send + 'static,
+		F: FnOnce(UnboundedSender<D>, JobControl) -> Fut + Send + 'static,
+		Fut: Future<Output = Result<T, Error>> + 'static,
+		T: Send + 'static,
+	{
+		let (sender, delivered) = spawn_local_dispatch(deliver);
+		let result = self
+			.into_js_managed_commander_job(move |control| job(sender, control))?
+			.await;
+		// the job has ended and dropped its sender: this returns once everything it sent was
+		// delivered
+		let _ = delivered.await;
+		result
+	}
 }
 
 /// Calls a job's `callback` with `value`, if the caller passed one, serialized as the SDK's
