@@ -74,6 +74,24 @@ export type CopyItemError = ItemError;
 export type CopyRenamedEntry = RenamedEntry;
 "#;
 
+// The same names for Kotlin, Swift and the React Native TypeScript. uniffi has no type alias,
+// but a custom type over another becomes one there (`typealias CopyCounts = ItemCounts`, `export
+// type CopyCounts = ItemCounts`). `CopyError` needs none: uniffi hands over the error itself.
+#[cfg(feature = "uniffi")]
+mod uniffi_copy_aliases {
+	use super::ItemError;
+	use crate::fs::drive_job::{counts::ItemCounts, plan::RenamedEntry};
+
+	pub struct CopyCounts(ItemCounts);
+	uniffi::custom_newtype!(CopyCounts, ItemCounts);
+
+	pub struct CopyItemError(ItemError);
+	uniffi::custom_newtype!(CopyItemError, ItemError);
+
+	pub struct CopyRenamedEntry(RenamedEntry);
+	uniffi::custom_newtype!(CopyRenamedEntry, RenamedEntry);
+}
+
 /// A duration in a job's progress, in the milliseconds the bindings report it in.
 pub(crate) fn millis(duration: Duration) -> u64 {
 	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
