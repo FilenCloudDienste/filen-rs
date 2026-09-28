@@ -70,7 +70,8 @@ pub enum ArchiveEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct ArchiveEntry {
-	/// What [`ExtractRequest::Entries`](super::ExtractRequest::Entries) takes to extract it.
+	/// What extracting some entries (`ExtractRequest::Entries`, `extractArchiveEntries`) takes
+	/// to extract it.
 	pub id: ArchiveEntryId,
 	/// Its path as the archive stores it, cut to at most 4096 bytes.
 	pub stored_path: String,
@@ -97,23 +98,21 @@ pub struct ArchiveEntry {
 	pub encrypted: bool,
 	/// How a zip's or 7z's entry is compressed, for display (`Deflate`, `LZMA2`, `BCJ+LZMA`,
 	/// `method 98`); `None` for an entry without data, and for a tar's members or a single file,
-	/// which the archive's own compression covers (see [`ArchiveListing::format`]).
+	/// which the archive's own compression covers (see the listing's `format`).
 	pub method: Option<String>,
 	/// Why extracting it would skip it; `None` for an entry an extraction creates (or may: an
 	/// AppleDouble file told by its name alone). A link's target is in `kind`, and left empty
 	/// here.
 	pub skip: Option<ExtractSkipReason>,
 	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
-	/// [`ExtractRenameReason::PathRewritten`](super::ExtractRenameReason::PathRewritten)).
+	/// `PathRewritten`).
 	pub path_rewritten: bool,
-	/// Its path reads as something it is not (see
-	/// [`ExtractMisleadingName`](super::ExtractMisleadingName)).
+	/// Its path reads as something it is not (an extraction reports it as a misleading name).
 	pub misleading_name: bool,
 	/// macOS metadata: inside a `__MACOSX` folder, or an AppleDouble `._` file. A tar's `._`
 	/// file is told by its data, which a listing reads; a zip's, 7z's or single file's by its
 	/// name alone, so `skip` leaves it out: an extraction checks its data, and extracts it when
-	/// it is an ordinary file after all. See
-	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata).
+	/// it is an ordinary file after all. See the extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
 }
 

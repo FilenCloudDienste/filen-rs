@@ -52,7 +52,7 @@ pub enum ZipMethod {
 	/// central directory refuse for stored entries, such as `java.util.zip.ZipInputStream`;
 	/// `ZipFile` and every other central-directory reader take it.
 	Stored,
-	/// Levels 1 to 9; zip has no level 0 deflate (use [`ZipMethod::Stored`]).
+	/// Levels 1 to 9; zip has no level 0 deflate (use `Stored`).
 	Deflate { level: u32 },
 	/// Levels 1 to 9.
 	Bzip2 { level: u32 },

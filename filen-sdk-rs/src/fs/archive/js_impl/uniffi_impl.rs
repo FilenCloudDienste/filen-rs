@@ -194,7 +194,7 @@ impl JsClient {
 		run_extract(self.inner(), request, config, callback, managed_future).await
 	}
 
-	/// [`extract_archive`](Self::extract_archive) for some of the archive's entries: those
+	/// `extract_archive` for some of the archive's entries: those
 	/// `entries` names (from `list_archive`, or a failure's `entry`), everything below a
 	/// directory among them, and the directories that hold them.
 	///

@@ -72,8 +72,8 @@ pub struct CompressCounts {
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
 	pub bytes_done: u64,
-	/// Bytes of the archive read back to check it before the sources are deleted for good (see
-	/// [`CompressPhase::Verifying`]); up to `bytes_done`, and 0 when nothing is read back.
+	/// Bytes of the archive read back to check it before the sources are deleted for good (in
+	/// the phase `Verifying`); up to `bytes_done`, and 0 when nothing is read back.
 	pub bytes_verified: u64,
 }
 

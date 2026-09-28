@@ -238,7 +238,7 @@ pub struct ExtractedTopLevel {
 	pub item: NonRootItemType<'static, Normal>,
 }
 
-/// Records a report only counts, past [`MAX_REPORT_RECORDS`] of each kind.
+/// Records a report only counts, past the first 1000 of each kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct OmittedRecords {

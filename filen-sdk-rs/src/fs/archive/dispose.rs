@@ -46,7 +46,7 @@ pub enum SourceDisposal {
 	/// emptied.
 	Trash,
 	/// Delete the files for good; directories are trashed once emptied. A file with older
-	/// versions is kept instead ([`KeptReason::HasVersions`]): deleting it for good would leave
+	/// versions is kept instead (kept for `HasVersions`): deleting it for good would leave
 	/// its versions where no client can reach them.
 	DeletePermanently,
 }

@@ -505,8 +505,7 @@ mod uniffi_impl {
 			run(self.inner(), requests, config, callback, managed_future).await
 		}
 
-		/// [`copy_items`](Self::copy_items), with a destination (and optionally a name) for
-		/// each entry.
+		/// `copy_items`, with a destination (and optionally a name) for each entry.
 		pub async fn copy_items_to(
 			&self,
 			entries: Vec<CopyEntry>,

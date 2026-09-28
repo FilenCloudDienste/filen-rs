@@ -113,8 +113,8 @@ pub enum ExtractRequest {
 ///
 /// A tar's hard links, each extracted as a copy of the file it names, are held to the same
 /// bound, compressed or not: what they copy in all may not pass it either, so a small tar of
-/// one file and many links to it fails with
-/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind) rather than upload that file each time.
+/// one file and many links to it fails with `ArchiveTooLarge` rather than upload that file each
+/// time.
 ///
 /// Only ever passed in, so the bindings take either number type for both, as they do for
 /// their other sizes.
@@ -234,7 +234,7 @@ pub enum ExtractSkipReason {
 	UnsupportedMethod,
 	/// A 7z deletion marker, which an update archive carries for a file it removed.
 	AntiItem,
-	/// macOS metadata left out (see [`ExtractConfig::skip_mac_metadata`]).
+	/// macOS metadata left out (see the extraction's `skip_mac_metadata`).
 	MacMetadata,
 }
 
