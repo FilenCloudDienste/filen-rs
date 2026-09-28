@@ -267,7 +267,7 @@ impl JsClient {
 			skip_mac_metadata: config.skip_mac_metadata,
 			..ExtractSettings::default()
 		}
-		.into_config(password);
+		.into_list_config(password);
 		let client = self.inner();
 		managed_future
 			.into_ordered_job(

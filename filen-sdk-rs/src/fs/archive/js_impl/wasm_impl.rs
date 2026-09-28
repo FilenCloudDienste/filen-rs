@@ -359,7 +359,7 @@ impl JsClient {
 			skip_mac_metadata: params.skip_mac_metadata,
 			..ExtractSettings::default()
 		}
-		.into_config(password);
+		.into_list_config(password);
 		let callbacks = ListCallbacks {
 			on_entries: params.on_entries,
 			on_update: params.on_update,

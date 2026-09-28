@@ -25,7 +25,7 @@ use filen_sdk_rs::{
 				ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveListing, ArchiveSource,
 				ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport, ExtractRequest,
 				ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractedTopLevel, ListCallback,
-				ListTotals, ListUpdate, PasswordCheck,
+				ListConfig, ListTotals, ListUpdate, PasswordCheck,
 			},
 		},
 		categories::{DirType, NonRootItemType},
@@ -180,13 +180,18 @@ impl ListCallback for ListRecorder {
 	fn on_update(&self, _: ListUpdate) {}
 }
 
-/// Lists `archive` under `config`, checking the callback was handed the entries the listing
-/// keeps.
+/// Lists `archive` as `config` would extract it, checking the callback was handed the entries
+/// the listing keeps.
 async fn list(
 	client: &Arc<Client>,
 	archive: RemoteFileType<'static>,
 	config: ExtractConfig,
 ) -> Result<ArchiveListing, ErrorKind> {
+	let config = ListConfig {
+		expansion_limit: config.expansion_limit,
+		skip_mac_metadata: config.skip_mac_metadata,
+		password: config.password,
+	};
 	let recorder = Arc::new(ListRecorder::default());
 	let listing = client
 		.clone()

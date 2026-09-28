@@ -21,7 +21,9 @@ use super::{
 	ExtractPhase, ExtractReport, ExtractRequest,
 	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
 	engine::{ExtractTask, run_extract},
-	list::{ArchiveListing, ListCallback, ListFailed, ListReporter, ListTask, run_list},
+	list::{
+		ArchiveListing, ListCallback, ListConfig, ListFailed, ListReporter, ListTask, run_list,
+	},
 	report::Reporter,
 };
 
@@ -135,8 +137,7 @@ impl Client {
 	}
 
 	/// Lists an archive's entries without extracting any: what each one is, and what extracting
-	/// it with `config` would do with it (skip it, and why). `max_bytes` and `max_items` are not
-	/// checked: a listing creates nothing.
+	/// it with the same settings as `config` would do with it (skip it, and why).
 	///
 	/// A zip's or 7z's index says nearly all: the index is read, and besides it only the
 	/// smallest encrypted entry, as an extraction reads it, to check the password (see
@@ -157,11 +158,12 @@ impl Client {
 	pub async fn list_archive(
 		self: Arc<Self>,
 		archive: RemoteFileType<'static>,
-		config: ExtractConfig,
+		config: ListConfig,
 		callback: impl ListCallback,
 		control: JobControl,
 	) -> Result<ArchiveListing, ListFailed> {
 		let archives = self.client().state().archives().clone();
+		let config = ExtractConfig::from(config);
 		let job = StreamJob {
 			name: archive.name().unwrap_or_default().to_owned(),
 			len: archive.size(),
@@ -266,7 +268,7 @@ mod tests {
 		));
 		assert_send(client.list_archive(
 			archive,
-			ExtractConfig::default(),
+			ListConfig::default(),
 			Ignore,
 			JobControl::default(),
 		));

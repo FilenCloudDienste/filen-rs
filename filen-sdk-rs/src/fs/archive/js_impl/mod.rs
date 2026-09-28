@@ -51,7 +51,8 @@ use super::{
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
 		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractTopLevelTrashed,
-		ListCallback, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
+		ListCallback, ListConfig, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords,
+		PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -747,6 +748,21 @@ impl ExtractSettings {
 			skip_mac_metadata: self.skip_mac_metadata.unwrap_or(defaults.skip_mac_metadata),
 		}
 	}
+
+	/// A listing's config, which has no `max_bytes` or `max_items`.
+	fn into_list_config(self, password: Option<ArchivePassword>) -> ListConfig {
+		let ExtractConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+			..
+		} = self.into_config(password);
+		ListConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+		}
+	}
 }
 
 /// What `compressItems` compresses, and whether the items go afterwards.
@@ -902,7 +918,7 @@ impl ListCallback for ListChannel {
 async fn list_job(
 	client: Arc<Client>,
 	archive: RemoteFileType<'static>,
-	config: ExtractConfig,
+	config: ListConfig,
 	sender: UnboundedSender<ListDelivery>,
 	control: JobControl,
 ) -> Result<ArchiveListing, Error> {

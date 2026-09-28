@@ -15,6 +15,7 @@ use crate::{
 			config::ArchiveConfig,
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, start_reading},
+			password::ArchivePassword,
 			worker::{WorkerEvent, WorkerLink, codec_failed, worker_died},
 		},
 		drive_job::{Fatal, backend::DriveBackend},
@@ -28,7 +29,7 @@ use crate::{
 };
 
 use super::{
-	DuplicateEntries, ExtractSkipReason,
+	DuplicateEntries, ExpansionLimit, ExtractConfig, ExtractSkipReason,
 	codec::ArchiveEnd,
 	engine::CodecResult,
 	report::{ArchiveEntryId, CALLBACK_BATCH, RunState},
@@ -182,6 +183,50 @@ impl ListTotals {
 				self.files += 1;
 				self.bytes += size;
 			}
+		}
+	}
+}
+
+/// How a listing reads an archive, and which extraction's verdicts it shows: those of an
+/// extraction with the same settings.
+#[derive(Debug, Clone)]
+pub struct ListConfig {
+	/// As [`ExtractConfig::expansion_limit`]: a 7z link's target is read only while the
+	/// archive states no more than this allows.
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// As [`ExtractConfig::skip_mac_metadata`]: whether the entries left out as macOS metadata
+	/// are listed skipped.
+	pub skip_mac_metadata: bool,
+	/// As [`ExtractConfig::password`]: checked on the index or an entry when it can be (see
+	/// [`ArchiveListing::password`]).
+	pub password: Option<ArchivePassword>,
+}
+
+impl Default for ListConfig {
+	fn default() -> Self {
+		let ExtractConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+			..
+		} = ExtractConfig::default();
+		Self {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+		}
+	}
+}
+
+impl From<ListConfig> for ExtractConfig {
+	/// An extraction with the listing's settings, and neither cap.
+	fn from(config: ListConfig) -> Self {
+		Self {
+			max_bytes: None,
+			max_items: None,
+			expansion_limit: config.expansion_limit,
+			skip_mac_metadata: config.skip_mac_metadata,
+			password: config.password,
 		}
 	}
 }
