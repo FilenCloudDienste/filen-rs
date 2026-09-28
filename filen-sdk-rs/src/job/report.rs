@@ -392,6 +392,11 @@ impl<S: JobState> Reporter<S> {
 	}
 
 	/// A cancel overrides a pause: the job winds down instead of pausing, reported cancelling.
+	/// Called by the archive jobs, which the service-worker build leaves out.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
 	pub(crate) fn set_cancelling(&self) {
 		self.stop(true);
 	}
