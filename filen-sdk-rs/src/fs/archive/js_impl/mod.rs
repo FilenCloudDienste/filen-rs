@@ -50,8 +50,8 @@ use super::{
 		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
 		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
-		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ListCallback, ListPhase, ListTotals,
-		MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
+		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractTopLevelTrashed,
+		ListCallback, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -221,6 +221,7 @@ pub enum ExtractEvent {
 	Skipped(ExtractSkippedEntry),
 	Renamed(ExtractRenamedEntry),
 	MisleadingName(ExtractMisleadingName),
+	TopLevelTrashed(ExtractTopLevelTrashed),
 	SourceDisposition(ArchiveSourceDisposition),
 	PropagationFailed(ItemError),
 }
@@ -491,6 +492,7 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 			Event::Skipped(entry) => Self::Skipped(entry),
 			Event::Renamed(entry) => Self::Renamed(entry),
 			Event::MisleadingName(entry) => Self::MisleadingName(entry),
+			Event::TopLevelTrashed(trashed) => Self::TopLevelTrashed(trashed),
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))

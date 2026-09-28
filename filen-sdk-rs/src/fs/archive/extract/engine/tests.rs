@@ -2085,6 +2085,19 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		failed.report.top_level.is_empty(),
 		"the report no longer lists it as created"
 	);
+	let trashed: Vec<Uuid> = job
+		.recorder
+		.updates
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| &update.events)
+		.filter_map(|event| match event {
+			ExtractEvent::TopLevelTrashed(trashed) => Some(trashed.dest_uuid),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(trashed, [root], "and is told it went to the trash");
 }
 
 /// Settings with one job slot, for jobs that compete for it.

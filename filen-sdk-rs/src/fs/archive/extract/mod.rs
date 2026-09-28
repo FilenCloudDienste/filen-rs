@@ -36,7 +36,7 @@ pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
 	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
+	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
 };
 
 /// Where an archive's entries are created.

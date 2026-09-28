@@ -211,6 +211,15 @@ pub struct ExtractMisleadingName {
 	pub path: String,
 }
 
+/// A folder handed to `on_top_level_created` that was moved to the trash: a wrong password
+/// showed only once entries were read, before any file was extracted (see
+/// `ExtractConfig::password`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractTopLevelTrashed {
+	pub dest_uuid: Uuid,
+}
+
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(
@@ -270,6 +279,7 @@ pub enum ExtractEvent {
 	Renamed(ExtractRenamedEntry),
 	/// An entry is being extracted under a name that reads as something it is not.
 	MisleadingName(ExtractMisleadingName),
+	TopLevelTrashed(ExtractTopLevelTrashed),
 	/// What became of the archive, when it was to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
