@@ -57,6 +57,11 @@ pub(crate) fn remote_file(
 	RemoteFileType::File(Cow::Owned(file))
 }
 
+/// The BLAKE3 hash of `data`, as a file's metadata holds it.
+pub(crate) fn hash(data: &[u8]) -> Blake3Hash {
+	Blake3Hash::from(blake3::hash(data))
+}
+
 /// Bytes that compress well, told apart by `seed`: a ramp over 251 values, a prime, so its
 /// period lines up with no chunk or block size.
 pub(crate) fn pattern(len: usize, seed: u8) -> Vec<u8> {

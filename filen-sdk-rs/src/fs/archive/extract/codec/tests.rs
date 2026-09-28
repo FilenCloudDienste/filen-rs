@@ -293,7 +293,7 @@ fn a_hard_link_carrying_data_is_extracted_as_a_file() {
 
 #[test]
 fn a_file_is_sent_in_whole_chunks() {
-	let data: Vec<u8> = (0..CHUNK_SIZE + 7).map(|i| (i % 251) as u8).collect();
+	let data = pattern(CHUNK_SIZE + 7, 0);
 	let mut builder = tar::Builder::new(Vec::new());
 	append(&mut builder, tar::EntryType::Regular, "big.bin", &data);
 	let (seen, _) = run(&builder.into_inner().unwrap(), "big.tar");

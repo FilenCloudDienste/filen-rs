@@ -3,7 +3,6 @@
 
 use std::{borrow::Cow, collections::BTreeMap, io::Read, sync::Mutex, time::Duration};
 
-use chrono::Utc;
 use tokio::{
 	sync::{Semaphore, mpsc},
 	task::JoinHandle,
@@ -12,7 +11,6 @@ use tokio::{
 use super::*;
 use crate::{
 	consts::CHUNK_SIZE,
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName,
 		archive::{
@@ -35,7 +33,7 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			tar_iter::TarReader,
-			test_support::pattern,
+			test_support::{hash, pattern, remote_file},
 			worker::ARCHIVE_STALL_TIMEOUT,
 			worker::{self, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
@@ -46,10 +44,7 @@ use crate::{
 			plan::{PlanTotals, SkipReason, SkippedEntry},
 			test_support::{FakeBackend, Request, wait_until},
 		},
-		file::{
-			AnonymousRemoteFile, RemoteFile,
-			meta::{DecryptedFileMeta, FileMeta},
-		},
+		file::RemoteFile,
 	},
 	job::{
 		report::JobState,
@@ -125,36 +120,6 @@ impl Recorder {
 	}
 }
 
-fn source_file(name: &str, bytes: &[u8], hash: Option<Blake3Hash>) -> RemoteFileType<'static> {
-	let size = bytes.len() as u64;
-	let meta = FileMeta::Decoded(DecryptedFileMeta {
-		name: Cow::Owned(name.to_owned()),
-		size,
-		mime: Cow::Borrowed("application/octet-stream"),
-		key: FileKey::V3(EncryptionKey::generate()),
-		last_modified: Utc::now(),
-		created: None,
-		hash,
-	});
-	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		Uuid::new_v4(),
-		(),
-		Uuid::new_v4().into(),
-		size,
-		size.div_ceil(CHUNK_SIZE_U64),
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		meta,
-	);
-	RemoteFileType::File(Cow::Owned(file))
-}
-
-fn hash_of(data: &[u8]) -> Option<Blake3Hash> {
-	Some(Blake3Hash::from(blake3::hash(data)))
-}
-
 /// A directory with two files, one over a chunk, and a file at the top.
 struct Setup {
 	backend: Arc<FakeBackend>,
@@ -174,8 +139,27 @@ struct Setup {
 	reader: Mutex<Option<StartReadBack>>,
 }
 
+/// The job's destination, and the folder the sources were read from.
+const DESTINATION: Uuid = Uuid::from_u128(0xD0);
+const SOURCES_PARENT: Uuid = Uuid::from_u128(0x50);
+
+/// The sources' uuids, `a.txt`'s, `big.bin`'s and `top.txt`'s, in the order they sort in.
+const SOURCE_UUIDS: [Uuid; 3] = [
+	Uuid::from_u128(0x5A),
+	Uuid::from_u128(0x5B),
+	Uuid::from_u128(0x5C),
+];
+
 fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -> Setup {
-	let destination = Uuid::new_v4();
+	setup_with(SOURCE_UUIDS, configure)
+}
+
+/// A [`Setup`] whose sources have `uuids`.
+fn setup_with(
+	uuids: [Uuid; 3],
+	configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>]),
+) -> Setup {
+	let destination = DESTINATION;
 	let contents = vec![
 		b"alpha".to_vec(),
 		pattern(CHUNK_SIZE + 77, 3),
@@ -185,7 +169,11 @@ fn setup(configure: impl FnOnce(&mut FakeBackend, &[RemoteFileType<'static>])) -
 	let files: Vec<RemoteFileType<'static>> = contents
 		.iter()
 		.zip(paths)
-		.map(|(data, path)| source_file(path.rsplit('/').next().unwrap(), data, hash_of(data)))
+		.zip(uuids)
+		.map(|((data, path), uuid)| {
+			let name = path.rsplit('/').next().unwrap();
+			remote_file(uuid, SOURCES_PARENT, name, data, Some(hash(data)))
+		})
 		.collect();
 	let mut backend = FakeBackend::new(destination);
 	backend.keep_uploads = true;
@@ -601,9 +589,12 @@ struct Placed {
 	docs: Uuid,
 }
 
+/// Where [`place`] puts the sources.
+const PLACED_PARENT: Uuid = Uuid::from_u128(0x70);
+const PLACED_DOCS: Uuid = Uuid::from_u128(0x71);
+
 fn place(setup: &Setup) -> Placed {
-	let parent = Uuid::new_v4();
-	let docs = Uuid::new_v4();
+	let (parent, docs) = (PLACED_PARENT, PLACED_DOCS);
 	setup.backend.place_dir(docs, parent);
 	for (index, (_, file)) in setup.sources.iter().enumerate() {
 		let at = if index < 2 { docs } else { parent };
@@ -742,7 +733,9 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	let setup = setup(|_, _| {});
 	let placed = place(&setup);
 	// a file arrived in the directory after it was read
-	setup.backend.place_file(Uuid::new_v4(), placed.docs, 10);
+	setup
+		.backend
+		.place_file(Uuid::from_u128(0x7A), placed.docs, 10);
 	let disposal = CompressDisposal {
 		how: SourceDisposal::DeletePermanently,
 		targets: targets(&setup, &placed),
@@ -857,7 +850,7 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 			source_path: "docs/secret".into(),
 			bytes: 1,
 			reason: SkipReason::UndecryptableFile {
-				uuid: Uuid::new_v4(),
+				uuid: Uuid::from_u128(0x5E),
 			},
 		}],
 		..CompressReport::default()
@@ -1161,20 +1154,13 @@ fn run_disposal(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 	// a.txt comes last in the folder's (uuid) order, and the removal stops at the second file
-	let setup = loop {
-		let setup = setup(|backend, files| {
-			backend
-				.fail_deletes_of
-				.insert(files[1].uuid().max(files[2].uuid()));
-		});
-		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
-		if ids[0] > ids[1] && ids[0] > ids[2] {
-			break setup;
-		}
-	};
+	let [a, big, top] = SOURCE_UUIDS;
+	let setup = setup_with([top, a, big], |backend, files| {
+		backend.fail_deletes_of.insert(files[2].uuid());
+	});
 	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
-	let docs = Uuid::new_v4();
-	setup.backend.place_dir(docs, Uuid::new_v4());
+	let docs = PLACED_DOCS;
+	setup.backend.place_dir(docs, PLACED_PARENT);
 	for file in [&a, &big, &top] {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
@@ -1209,20 +1195,12 @@ async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_a_partial_removal_took_is_reported_removed() {
 	// a.txt comes first in the folder's (uuid) order, and the removal stops at the last file
-	let setup = loop {
-		let setup = setup(|backend, files| {
-			backend
-				.fail_deletes_of
-				.insert(files[1].uuid().max(files[2].uuid()));
-		});
-		let ids: Vec<Uuid> = setup.sources.iter().map(|(_, file)| file.uuid()).collect();
-		if ids[0] < ids[1] && ids[0] < ids[2] {
-			break setup;
-		}
-	};
+	let setup = setup(|backend, files| {
+		backend.fail_deletes_of.insert(files[2].uuid());
+	});
 	let [a, big, top] = [0, 1, 2].map(|source| setup.sources[source].1.clone());
-	let docs = Uuid::new_v4();
-	setup.backend.place_dir(docs, Uuid::new_v4());
+	let docs = PLACED_DOCS;
+	setup.backend.place_dir(docs, PLACED_PARENT);
 	for file in [&a, &big, &top] {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
@@ -1269,7 +1247,7 @@ async fn a_file_a_partial_removal_took_is_reported_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folders_whose_reads_hold_each_other_are_kept() {
 	let setup = setup(|_, _| {});
-	let [x, y] = [Uuid::new_v4(), Uuid::new_v4()];
+	let [x, y] = [Uuid::from_u128(0x7B), Uuid::from_u128(0x7C)];
 	let holding = |other| DisposalTarget::Dir {
 		uuid: if other == y { x } else { y },
 		read: Tree {

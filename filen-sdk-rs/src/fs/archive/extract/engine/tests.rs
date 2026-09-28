@@ -40,8 +40,8 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			test_support::{
-				TarMember, gzip, incompressible, pattern, remote_file, sevenz_of, tar_of, tar_with,
-				zip_of,
+				TarMember, gzip, hash, incompressible, pattern, remote_file, sevenz_of, tar_of,
+				tar_with, zip_of,
 			},
 			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
@@ -123,10 +123,6 @@ fn archive_file_with(
 	hash: Option<Blake3Hash>,
 ) -> RemoteFileType<'static> {
 	remote_file(ARCHIVE, ARCHIVE_PARENT, name, bytes, hash)
-}
-
-fn hash(data: &[u8]) -> Blake3Hash {
-	Blake3Hash::from(blake3::hash(data))
 }
 
 struct Setup {

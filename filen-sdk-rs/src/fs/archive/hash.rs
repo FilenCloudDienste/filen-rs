@@ -91,6 +91,7 @@ impl HeadLastHasher {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::fs::archive::test_support::pattern;
 
 	fn hash_head_last(data: &[u8]) -> blake3::Hash {
 		let chunk = CHUNK_SIZE_U64 as usize;
@@ -104,7 +105,7 @@ mod tests {
 	#[test]
 	fn matches_hashing_in_order_at_every_shape() {
 		let chunk = CHUNK_SIZE_U64 as usize;
-		let data: Vec<u8> = (0..9 * chunk + 1).map(|i| (i % 251) as u8).collect();
+		let data = pattern(9 * chunk + 1, 0);
 		let mut lens = vec![0, 1, 1024, 1025, chunk - 1, chunk, chunk + 1, chunk + 1024];
 		for chunks in 2..=9 {
 			lens.extend([chunks * chunk - 1, chunks * chunk, chunks * chunk + 1]);

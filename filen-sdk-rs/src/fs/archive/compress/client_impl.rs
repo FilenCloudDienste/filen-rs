@@ -513,8 +513,6 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		consts::CHUNK_SIZE_U64,
-		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 		fs::{
 			archive::{
 				DisposalOutcome, KeptReason,
@@ -522,17 +520,14 @@ mod tests {
 					CompressUpdate, Compression, RunState, StreamCodec, report::CompressCallback,
 				},
 				config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+				test_support::{pattern, remote_file},
 			},
 			dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 			drive_job::{
 				plan::{Listed, PlanTotals, SourceDir},
 				test_support::wait_until,
 			},
-			file::{
-				AnonymousRemoteFile, RemoteFile,
-				enums::RemoteFileType,
-				meta::{DecryptedFileMeta, FileMeta},
-			},
+			file::{RemoteFile, enums::RemoteFileType},
 		},
 		job::test_support::{controls, settled_run_states},
 	};
@@ -574,27 +569,8 @@ mod tests {
 	}
 
 	fn file(name: &str, size: u64) -> RemoteFileType<'static> {
-		let anonymous: AnonymousRemoteFile = RemoteFile::from_meta(
-			Uuid::new_v4(),
-			(),
-			Uuid::new_v4().into(),
-			size,
-			size.div_ceil(CHUNK_SIZE_U64),
-			"de-1",
-			"bucket",
-			chrono::Utc::now(),
-			false,
-			FileMeta::Decoded(DecryptedFileMeta {
-				name: Cow::Owned(name.to_owned()),
-				size,
-				mime: Cow::Borrowed("text/plain"),
-				key: FileKey::V3(EncryptionKey::generate()),
-				last_modified: chrono::Utc::now(),
-				created: None,
-				hash: None,
-			}),
-		);
-		RemoteFileType::File(Cow::Owned(anonymous))
+		let data = pattern(usize::try_from(size).unwrap(), 1);
+		remote_file(Uuid::new_v4(), Uuid::new_v4(), name, &data, None)
 	}
 
 	/// A plan of `Photos/` (with `a.jpg` and `2024/b.jpg`) and a top-level file also called
