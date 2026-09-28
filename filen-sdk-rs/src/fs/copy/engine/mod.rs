@@ -25,7 +25,7 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, VecDeque},
-	fmt, iter, mem,
+	iter, mem,
 	sync::Arc,
 };
 
@@ -143,7 +143,7 @@ pub(crate) async fn run_copy<B, D>(
 ) -> Result<CopyReport<D>, CopyFailed<D>>
 where
 	B: DriveBackend,
-	D: Clone + fmt::Debug + MaybeSendSync + 'static,
+	D: Clone + MaybeSendSync + 'static,
 {
 	let mut child_dirs = vec![Vec::new(); plan.dirs.len()];
 	for (index, dir) in plan.dirs.iter().enumerate() {
@@ -184,7 +184,7 @@ where
 impl<B, D> Job<B, D>
 where
 	B: DriveBackend,
-	D: Clone + fmt::Debug + MaybeSendSync + 'static,
+	D: Clone + MaybeSendSync + 'static,
 {
 	/// `Err` with [`ErrorKind::Cancelled`] when cancelled, or the error that ended the job.
 	async fn run(&mut self) -> Result<(), Arc<Error>> {
@@ -203,9 +203,10 @@ where
 		}
 		.await;
 
+		// the report's name is the same whatever its destination type
 		let (phase, result) = self
 			.fatal
-			.end(outcome, &self.control, CopyReport::<D>::NAME);
+			.end(outcome, &self.control, CopyReport::<()>::NAME);
 		self.reporter.finish(phase);
 		result
 	}
