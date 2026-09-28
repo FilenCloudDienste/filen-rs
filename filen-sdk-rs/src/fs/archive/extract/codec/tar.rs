@@ -12,7 +12,7 @@ use crate::{
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent},
 	},
-	util::SeededMap,
+	util::{SeededMap, SeededSet},
 };
 
 use super::{
@@ -44,6 +44,7 @@ pub(super) fn walk_tar<R: Read>(
 	let mut files = 0u64;
 	// an extraction's driver resolves hard links against the files it created
 	let mut listed_files = ListedFiles::default();
+	let mut left_out = LeftOut::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -59,11 +60,18 @@ pub(super) fn walk_tar<R: Read>(
 			_ => None,
 		};
 		if walk.listing() {
-			list_member(walk, &mut tar, found, link_target, &mut listed_files)?;
+			list_member(
+				walk,
+				&mut tar,
+				found,
+				link_target,
+				&mut listed_files,
+				&mut left_out,
+			)?;
 			continue;
 		}
 		let (path, apple_double) = match walk.judge(&found)? {
-			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(reason) => {
 				walk.port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
@@ -71,7 +79,7 @@ pub(super) fn walk_tar<R: Read>(
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
 		if let Some(target) = link_target {
-			let event = link_event(walk, &member, &found, path, target);
+			let event = link_event(walk, &member, &found, path, target, &left_out);
 			walk.port.send(event).map_err(failure)?;
 			continue;
 		}
@@ -86,7 +94,7 @@ pub(super) fn walk_tar<R: Read>(
 				.map_err(failure)?;
 			continue;
 		}
-		files += take_file(
+		let sent = take_file(
 			walk,
 			&found,
 			path,
@@ -95,6 +103,11 @@ pub(super) fn walk_tar<R: Read>(
 			&mut TarBody(&mut tar),
 		)
 		.map_err(failure)?;
+		left_out.note(&found.path, sent == 0);
+		files += sent;
+	}
+	if !walk.listing() {
+		walk.send_mac_folders().map_err(failure)?;
 	}
 	walk.finish()?;
 	Ok(Walked {
@@ -166,6 +179,39 @@ struct ListedFiles {
 	by_key: SeededMap<u64, (u64, u64)>,
 }
 
+/// The files left out as macOS metadata, by [`LinkKeys`] of their paths: a hard link to one is
+/// left out as metadata too, rather than skipped for want of its file, which would keep the
+/// archive from being removed. Only a tar has hard links, and only AppleDouble files are noted,
+/// so this holds next to nothing.
+#[derive(Default)]
+struct LeftOut {
+	keys: LinkKeys,
+	files: SeededSet<u64>,
+}
+
+impl LeftOut {
+	/// A file at `path` was left out as metadata, or extracted: the last file at a path is the
+	/// one a link names.
+	fn note(&mut self, path: &Result<ArchivePath, PathRejection>, left_out: bool) {
+		let Ok(path) = path else {
+			return;
+		};
+		if left_out {
+			self.files.insert(self.keys.of(path));
+		} else if !self.files.is_empty() {
+			self.files.remove(&self.keys.of(path));
+		}
+	}
+
+	/// Whether the last file at `path` was left out as metadata.
+	fn holds(&self, path: &Result<ArchivePath, PathRejection>) -> bool {
+		!self.files.is_empty()
+			&& path
+				.as_ref()
+				.is_ok_and(|path| self.files.contains(&self.keys.of(path)))
+	}
+}
+
 /// Lists the member `found`, a hard link to `link_target` resolved against `listed_files`, the
 /// files listed before it as extracted, which it joins when it is one.
 fn list_member<R: Read>(
@@ -174,18 +220,23 @@ fn list_member<R: Read>(
 	mut found: Found,
 	link_target: Option<HardlinkTarget>,
 	listed_files: &mut ListedFiles,
+	left_out: &mut LeftOut,
 ) -> Result<(), Error> {
 	if let Some((target, shown)) = link_target {
-		match target
+		let linked = target
+			.as_ref()
 			.ok()
-			.and_then(|target| listed_files.by_key.get(&listed_files.keys.of(&target)))
-		{
+			.and_then(|target| listed_files.by_key.get(&listed_files.keys.of(target)));
+		match linked {
 			Some(&(size, target)) => {
 				found.size = size;
 				found.kind = ArchiveEntryKind::Hardlink {
 					target: shown,
 					target_id: Some(walk.listed_id(target)),
 				};
+			}
+			None if left_out.holds(&target) => {
+				found.unreadable = Some(ExtractSkipReason::MacMetadata);
 			}
 			None => {
 				found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
@@ -206,6 +257,13 @@ fn list_member<R: Read>(
 		.ok()
 		.map(|path| listed_files.keys.of(path));
 	let size = found.size;
+	let is_file = found.kind == ArchiveEntryKind::File;
+	if is_file {
+		left_out.note(
+			&found.path,
+			apple_double == Some(true) && walk.skips_mac_metadata(),
+		);
+	}
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
 	if walk.list(found, apple_double).map_err(failure)?
 		&& !is_dir
@@ -224,13 +282,20 @@ fn link_event(
 	found: &Found,
 	path: ArchivePath,
 	(target, shown): HardlinkTarget,
+	left_out: &LeftOut,
 ) -> WorkerEvent {
+	// a copy of metadata left out is metadata left out, whatever path the link is at
+	let reason = if left_out.holds(&target) {
+		ExtractSkipReason::MacMetadata
+	} else {
+		ExtractSkipReason::Hardlink { target: shown }
+	};
 	let unresolved = SkippedMember {
 		ordinal: found.ordinal,
 		path: display_path(&member.path).0.to_owned(),
 		path_truncated: display_path(&member.path).1,
 		bytes: 0,
-		reason: ExtractSkipReason::Hardlink { target: shown },
+		reason,
 	};
 	match target.ok().and_then(|target| walk.within_base(target)) {
 		Some(target) => WorkerEvent::Link(Box::new(LinkHead {

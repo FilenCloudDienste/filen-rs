@@ -69,10 +69,12 @@ pub struct ExtractArchiveConfig {
 	/// least 256 MiB).
 	#[uniffi(default = None)]
 	pub expansion_limit: Option<ExpansionLimit>,
-	/// Leaves out the metadata macOS writes beside files: everything in a `__MACOSX` folder
-	/// and AppleDouble `._name` files, reported skipped for `MacMetadata`. Left out on purpose,
-	/// they keep nothing from removing the archive afterwards. `true` when `None`; `false`
-	/// extracts them as ordinary files.
+	/// Leaves out the metadata macOS writes beside files, reported skipped for `MacMetadata`:
+	/// AppleDouble files (named `._name` or kept in a `__MACOSX` folder, told by their first
+	/// bytes), a tar's hard links to them, and the `__MACOSX` folders that hold nothing else (one
+	/// holding anything of the user's, or nothing, is created). Left out on purpose, they keep
+	/// nothing from removing the archive afterwards. `true` when `None`; `false` extracts them
+	/// as ordinary files.
 	#[uniffi(default = None)]
 	pub skip_mac_metadata: Option<bool>,
 	/// Removes the archive once everything in it was extracted and verified.

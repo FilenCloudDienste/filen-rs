@@ -621,3 +621,37 @@ async fn links_past_a_tight_limit_end_the_job_with_what_they_created() {
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hard_link_to_mac_metadata_is_left_out_as_metadata() {
+	let apple_double = [&[0x00, 0x05, 0x16, 0x07][..], b"\x00\x02\x00\x00"].concat();
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("__MACOSX/._a.txt", &apple_double),
+		// a copy of metadata left out is left out; a copy of a file of the user's is extracted,
+		// in a __MACOSX folder or not
+		hard_link("__MACOSX/._b.txt", "__MACOSX/._a.txt"),
+		hard_link("__MACOSX/copy.txt", "a.txt"),
+	]);
+	let setup = setup("bundle.tar", tar, |_| {});
+	let report = start(&setup, Options::default())
+		.running
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		finished_paths(&setup),
+		["bundle/__MACOSX/copy.txt", "bundle/a.txt"]
+	);
+	assert_eq!(
+		report
+			.skipped
+			.iter()
+			.map(|skipped| (skipped.path.as_str(), &skipped.reason))
+			.collect::<Vec<_>>(),
+		[
+			("__MACOSX/._a.txt", &ExtractSkipReason::MacMetadata),
+			("__MACOSX/._b.txt", &ExtractSkipReason::MacMetadata),
+		]
+	);
+}

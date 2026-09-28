@@ -23,7 +23,9 @@ use crate::{
 		format::StreamCodec,
 		password::ArchivePassword,
 		sevenz::write::{SevenZEncryption, SevenZMethod},
-		test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
+		test_support::{
+			TarMember, gzip, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
+		},
 		worker,
 	},
 	fs::name::ValidatedName,
@@ -1372,6 +1374,34 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		);
 	}
 
+	// a listing reads the same bytes to tell
+	for (name, archive) in [
+		("m.zip", zip_of(&entries, None)),
+		(
+			"m.7z",
+			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
+		),
+	] {
+		let (shown, end) = listed(
+			&archive,
+			job_of(&archive, name, true, Task::List { archive: LISTED }),
+		);
+		end.unwrap();
+		assert_eq!(
+			shown
+				.iter()
+				.map(|entry| (entry.stored_path.as_str(), entry.skip.clone()))
+				.collect::<Vec<_>>(),
+			[
+				("a.txt", None),
+				("._a.txt", Some(ExtractSkipReason::MacMetadata)),
+				("._b.txt", None),
+				("._c.txt", None),
+			],
+			"{name}"
+		);
+	}
+
 	// Finder's __MACOSX folder, every entry in it
 	let zip = fixture("zip", "finder-ditto.zip");
 	let (seen, end, _) = run_job(&zip, job_of(&zip, "finder.zip", true, Task::Extract(None)));
@@ -1387,6 +1417,26 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 	assert!(
 		rest.iter().all(|line| !line.ends_with("MacMetadata")),
 		"{rest:?}"
+	);
+
+	// a listing reads what tells the AppleDouble files: the 3 files an extraction creates, and
+	// the 5 it leaves out
+	let (entries, end) = listed(
+		&zip,
+		job_of(&zip, "finder.zip", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	let files = |skip: Option<ExtractSkipReason>| {
+		entries
+			.iter()
+			.filter(|entry| entry.kind == ArchiveEntryKind::File && entry.skip == skip)
+			.count()
+	};
+	assert_eq!(files(None), 3, "{entries:?}");
+	assert_eq!(
+		files(Some(ExtractSkipReason::MacMetadata)),
+		5,
+		"{entries:?}"
 	);
 }
 
@@ -2016,4 +2066,80 @@ fn hard_links_are_looked_up_by_a_key_each_job_draws() {
 	assert_ne!(keys.of(&path), keys.of(&entry_path("docs/b.txt").unwrap()));
 	// across jobs the same path hashes apart: no archive can pick paths that collide
 	assert_ne!(keys.of(&path), LinkKeys::new().of(&path));
+}
+
+#[test]
+fn a_listed_hard_link_to_mac_metadata_is_metadata() {
+	let data = apple_double_data();
+	let tar = tar_with(&[
+		TarMember::Data("a.txt", b"alpha"),
+		TarMember::Data("__MACOSX/._a.txt", &data),
+		TarMember::HardLink {
+			path: "__MACOSX/._b.txt",
+			target: "__MACOSX/._a.txt",
+		},
+		TarMember::HardLink {
+			path: "__MACOSX/copy.txt",
+			target: "a.txt",
+		},
+	]);
+	let (entries, end) = listed(
+		&tar,
+		job_of(&tar, "m.tar", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	assert_eq!(
+		entries
+			.iter()
+			.map(|entry| (
+				entry.stored_path.as_str(),
+				entry.mac_metadata,
+				entry.skip.clone()
+			))
+			.collect::<Vec<_>>(),
+		[
+			("a.txt", false, None),
+			(
+				"__MACOSX/._a.txt",
+				true,
+				Some(ExtractSkipReason::MacMetadata)
+			),
+			(
+				"__MACOSX/._b.txt",
+				true,
+				Some(ExtractSkipReason::MacMetadata)
+			),
+			("__MACOSX/copy.txt", false, None),
+		]
+	);
+}
+
+#[test]
+fn a_mac_folder_is_sent_once_everything_in_it_was_judged() {
+	let data = apple_double_data();
+	let entries = [
+		("__MACOSX/", None),
+		("__MACOSX/._a.txt", Some(&data[..])),
+		("__MACOSX/empty/", None),
+	];
+	for (name, archive) in [
+		("m.zip", zip_of(&entries, None)),
+		(
+			"m.7z",
+			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
+		),
+	] {
+		let (seen, end, _) = run_job(&archive, job_of(&archive, name, true, Task::Extract(None)));
+		end.unwrap();
+		// an empty folder may be the user's: created, and the folder above it with it
+		assert_eq!(
+			outline(&seen),
+			[
+				"skip __MACOSX/._a.txt MacMetadata",
+				"dir __MACOSX",
+				"dir __MACOSX/empty"
+			],
+			"{name}"
+		);
+	}
 }

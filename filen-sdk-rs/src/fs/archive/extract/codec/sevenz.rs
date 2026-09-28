@@ -28,7 +28,7 @@ use super::{
 		storage_exceeded,
 	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
-	entries::{Found, Verdict, Walk},
+	entries::{Found, MacShape, Verdict, Walk, apple_double},
 	failure, take_file,
 };
 
@@ -276,7 +276,7 @@ pub(super) fn extract_sevenz(
 			verified |= proves(entry);
 		}
 		let (path, apple_double) = match walk.judge_again(&found, verdict) {
-			Verdict::Ignore | Verdict::Root => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(reason) => {
 				port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
@@ -329,6 +329,7 @@ pub(super) fn extract_sevenz(
 			}
 		}
 	}
+	walk.send_mac_folders().map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,
@@ -370,7 +371,16 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 			}
 			Err(error) => return Err(sevenz_failure(error)),
 		};
-		walk.list(found, None).map_err(failure)?;
+		// told as an extraction tells it, when metadata is left out
+		let apple_double = if walk.skips_mac_metadata()
+			&& found.unreadable.is_none()
+			&& found.mac_shape() == Some(MacShape::AppleDoubleName)
+		{
+			sevenz_apple_double(cursor, index, entry, keys)?
+		} else {
+			None
+		};
+		walk.list(found, apple_double).map_err(failure)?;
 	}
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
@@ -418,6 +428,27 @@ fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
 			.stream
 			.is_some_and(|stream| index.folders[stream.folder].encrypted()),
 		method: sevenz_method(index, entry),
+	}
+}
+
+/// Whether a file entry that may be AppleDouble is, by its first bytes; `None` when its data
+/// cannot be read (a wrong password), so it may be. Fails only on an error of the archive's
+/// source.
+fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
+	cursor: &mut FolderCursor<'s, R>,
+	index: &SevenZIndex,
+	entry: &SevenZEntry,
+	keys: &mut Keys<'_>,
+) -> Result<Option<bool>, Error> {
+	let read = match cursor.open(index, entry, keys) {
+		Ok(mut data) => apple_double(&mut data).map(|(apple_double, _)| apple_double),
+		Err(SevenZError::Read(error)) => Err(error),
+		Err(_) => return Ok(None),
+	};
+	match read {
+		Ok(apple_double) => Ok(Some(apple_double)),
+		Err(error) if from_source(&error) => Err(sevenz_io_failure(error)),
+		Err(_) => Ok(None),
 	}
 }
 
