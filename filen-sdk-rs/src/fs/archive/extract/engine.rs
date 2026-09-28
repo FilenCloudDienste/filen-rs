@@ -828,25 +828,7 @@ impl<B: DisposalBackend> Driver<B> {
 		self.held = None;
 		self.link_sources = FuturesUnordered::new();
 		self.link_chunks = FuturesUnordered::new();
-		// taken on and never started: not attempted
-		let links = self.links_waiting + self.ready_links.len();
-		let bytes = self
-			.waiting_links
-			.values()
-			.flatten()
-			.map(|waiting| waiting.link.file.size.unwrap_or(0))
-			.chain(
-				self.ready_links
-					.iter()
-					.map(|(link, _)| link.file.size.unwrap_or(0)),
-			)
-			.sum();
-		if links > 0 {
-			self.reporter.files_not_attempted(links as u64, bytes);
-		}
-		self.waiting_links.clear();
-		self.links_waiting = 0;
-		self.ready_links.clear();
+		self.drop_taken_links();
 		if !self.uploads.is_empty() {
 			self.uploads = FuturesUnordered::new();
 		}
@@ -1328,6 +1310,29 @@ impl<B: DisposalBackend> Driver<B> {
 					.push(PendingLink { link, unresolved });
 			}
 		}
+	}
+
+	/// Drops the hard links taken on and not opened yet, which a stopping job never starts: they
+	/// are not attempted.
+	fn drop_taken_links(&mut self) {
+		let links = self.links_waiting + self.ready_links.len();
+		let bytes = self
+			.waiting_links
+			.values()
+			.flatten()
+			.map(|waiting| waiting.link.file.size.unwrap_or(0))
+			.chain(
+				self.ready_links
+					.iter()
+					.map(|(link, _)| link.file.size.unwrap_or(0)),
+			)
+			.sum();
+		if links > 0 {
+			self.reporter.files_not_attempted(links as u64, bytes);
+		}
+		self.waiting_links.clear();
+		self.links_waiting = 0;
+		self.ready_links.clear();
 	}
 
 	/// The size of file `ordinal` that hard links wait for: open and not failed, or a hard link
