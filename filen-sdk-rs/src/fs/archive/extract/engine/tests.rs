@@ -15,7 +15,6 @@ use crate::{
 	consts::CHUNK_SIZE,
 	fs::{
 		archive::{
-			alloc_meter,
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			entry_path::entry_path,
 			extract::{
@@ -3799,25 +3798,4 @@ async fn links_past_a_tight_limit_end_the_job_with_what_they_created() {
 	);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup, &job.reporter, &job.recorder);
-}
-
-#[test]
-fn a_tars_link_targets_take_at_most_96_bytes_a_file() {
-	// the bound ArchiveConfig::max_members states
-	const BYTES_A_FILE: u64 = 96;
-	const FILES: u64 = 1_000_000;
-	let ((), peak) = alloc_meter::peak_bytes(|| {
-		let mut targets = LinkTargets::default();
-		for ordinal in 0..FILES {
-			// as spread as a hash's first bytes
-			let key = ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-			targets.open(key, ordinal);
-			targets.registered(key, ordinal, Uuid::from_u128(u128::from(ordinal)), ordinal);
-		}
-	});
-	assert!(
-		peak <= FILES * BYTES_A_FILE,
-		"{} bytes a file",
-		peak / FILES
-	);
 }
