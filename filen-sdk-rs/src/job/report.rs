@@ -36,6 +36,8 @@ use crate::{
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum RunState {
+	/// Running, and also a job an error stopped while it winds down: that one ignores a pause,
+	/// as there is nothing left to pause, and reports `Cancelling` only once it is cancelled too.
 	Running,
 	/// A pause was requested and in-flight work is still finishing.
 	Pausing,
@@ -102,6 +104,9 @@ pub(crate) struct RunCore<E, P> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WindingDown {
 	No,
+	/// For an error that ended the job: nothing new starts, so it neither pauses nor has time
+	/// left to estimate.
+	ForError,
 	/// For a cancel, which it is reported as.
 	ForCancel,
 }
@@ -127,7 +132,8 @@ impl<E, P: JobPhase> RunCore<E, P> {
 			RunState::Cancelling
 		} else if self.paused {
 			RunState::Paused
-		} else if self.pause_requested {
+		} else if self.pause_requested && self.winding_down == WindingDown::No {
+			// a job an error ended runs on to its end whatever was asked
 			RunState::Pausing
 		} else {
 			RunState::Running
@@ -326,7 +332,7 @@ impl<S: JobState> Reporter<S> {
 		let result = control.checkpoint().await;
 		self.set_pause_requested(control.is_pause_requested());
 		if result.is_err() {
-			self.set_cancelling();
+			self.wind_down(control);
 		}
 		result
 	}
@@ -373,12 +379,27 @@ impl<S: JobState> Reporter<S> {
 		});
 	}
 
-	/// A cancel overrides a pause: the job winds down instead of pausing.
+	/// A cancel overrides a pause: the job winds down instead of pausing, reported cancelling.
 	pub(crate) fn set_cancelling(&self) {
+		self.stop(true);
+	}
+
+	/// The job winds down, and stops overriding a pause: reported cancelling when `control`
+	/// cancelled it, and running on to its end when an error did.
+	pub(crate) fn wind_down(&self, control: &JobControl) {
+		self.stop(control.is_cancelled());
+	}
+
+	fn stop(&self, cancelled: bool) {
+		let why = if cancelled {
+			WindingDown::ForCancel
+		} else {
+			WindingDown::ForError
+		};
 		self.with_state(|state| {
 			let core = state.core();
-			if WindingDown::ForCancel > core.winding_down {
-				core.winding_down = WindingDown::ForCancel;
+			if why > core.winding_down {
+				core.winding_down = why;
 				core.mark_urgent();
 			}
 		});
@@ -453,5 +474,103 @@ impl<R> From<JobFailed<R>> for Error {
 		// the report may hold the error too, in the failure it came from
 		drop(report);
 		Error::unshared(error)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::job::test_support::controls;
+
+	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+	enum Phase {
+		Working,
+		Done,
+		Cancelled,
+		Failed,
+	}
+
+	impl JobPhase for Phase {
+		fn is_terminal(self) -> bool {
+			self == Self::Done || self == Self::Cancelled || self == Self::Failed
+		}
+	}
+
+	/// A job of 10 units, of which `done` are done.
+	struct State {
+		core: RunCore<(), Phase>,
+		done: u64,
+	}
+
+	/// The run state and whether time left was estimated, of each update.
+	type Seen = Mutex<Vec<(RunState, bool)>>;
+
+	impl JobState for State {
+		type Phase = Phase;
+		type Event = ();
+		type Callback = Seen;
+
+		fn core(&mut self) -> &mut RunCore<(), Phase> {
+			&mut self.core
+		}
+
+		fn progress(&self) -> Progress {
+			Progress {
+				bytes_done: self.done,
+				units: Units {
+					done: self.done,
+					settled: self.done,
+					total: 10,
+				},
+			}
+		}
+
+		fn deliver(&mut self, seen: &Seen, snapshot: Snapshot<(), Phase>) {
+			seen.lock()
+				.unwrap()
+				.push((snapshot.run_state, snapshot.eta.is_some()));
+		}
+
+		fn settle(&mut self) {}
+	}
+
+	#[test]
+	fn a_job_an_error_stopped_runs_on_until_a_cancel() {
+		let reporter = Reporter::from_parts(
+			State {
+				core: RunCore::new(Phase::Working),
+				done: 0,
+			},
+			Box::new(Seen::default()),
+		);
+		// two updates of progress: time left can be told
+		for done in 1..=2 {
+			reporter.with_state(|state| {
+				state.done = done;
+				state.core().mark_urgent();
+			});
+		}
+		let (_pause, cancel, control) = controls();
+		reporter.set_pause_requested(true);
+		// an error stops the paused job: it winds down, running, and a pause asked again changes
+		// nothing, with no time left to estimate
+		reporter.wind_down(&control);
+		reporter.set_pause_requested(false);
+		reporter.set_pause_requested(true);
+		// until it is cancelled
+		cancel.send_replace(true);
+		reporter.wind_down(&control);
+		assert_eq!(
+			*reporter.callback.lock().unwrap(),
+			[
+				(RunState::Running, false),
+				(RunState::Running, true),
+				(RunState::Paused, true),
+				(RunState::Running, false),
+				(RunState::Running, false),
+				(RunState::Running, false),
+				(RunState::Cancelling, false),
+			]
+		);
 	}
 }
