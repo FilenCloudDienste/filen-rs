@@ -373,7 +373,10 @@ pub type ExtractFailed = JobFailed<ExtractReport>;
 /// Receives an extraction's progress. All calls come from the one job, in order.
 pub trait ExtractCallback: MaybeSendSync + 'static {
 	/// Items created directly in the destination, delivered as soon as they exist and before
-	/// any update counts them, so a caller can clean up even after an abrupt end.
+	/// any update counts them, so a caller can clean up even after an abrupt end. A folder
+	/// among them goes to the trash again when a wrong password shows only once entries were
+	/// read, before any file was extracted: an update's [`ExtractEvent::TopLevelTrashed`] tells
+	/// which.
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>);
 	fn on_update(&self, update: ExtractUpdate);
 }

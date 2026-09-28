@@ -55,7 +55,9 @@ pub struct ExtractArchiveParams {
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_update: Option<js_sys::Function>,
 	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps.
+	/// keeps. A folder among them goes to the trash again when a wrong password shows only
+	/// once entries were read, before any file was extracted: an update's `topLevelTrashed`
+	/// event tells which.
 	#[tsify(type = "(items: ExtractedTopLevelItem[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_top_level_created: Option<js_sys::Function>,
@@ -102,7 +104,9 @@ pub struct ExtractArchiveEntriesParams {
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_update: Option<js_sys::Function>,
 	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps.
+	/// keeps. A folder among them goes to the trash again when a wrong password shows only
+	/// once entries were read, before any file was extracted: an update's `topLevelTrashed`
+	/// event tells which.
 	#[tsify(type = "(items: ExtractedTopLevelItem[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_top_level_created: Option<js_sys::Function>,
