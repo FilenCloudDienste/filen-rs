@@ -1033,9 +1033,8 @@ impl Tree {
 	/// Advance the agreed-content marker of the row at `rel_path`, and hand back the row as it now
 	/// stands. `None` when nothing is there.
 	///
-	/// No pass writes this into the tree any more — a pass's confirmation is an
-	/// [`Edits`] entry beside it — so what is left is the tests' oracle for that edit.
-	#[cfg(test)]
+	/// The store never writes this into its own tree: a pass's confirmation is an [`Edits`] entry
+	/// beside it, which writes here only on a row the pass itself has written.
 	pub(super) fn set_agreed(
 		&mut self,
 		rel_path: &str,
