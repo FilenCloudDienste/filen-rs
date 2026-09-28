@@ -82,7 +82,8 @@ fn link_entry(ordinal: u64, path: &str, target: &str) -> WorkerEvent {
 }
 
 /// Runs a scripted tar codec over `setup` that sends the file `a.txt` (with `a`), then, once
-/// `before_link` holds, a hard link `b.txt` to it; the report.
+/// `before_link` holds, a hard link `b.txt` to it, letting every held request go on once the
+/// link is taken; the report.
 async fn link_after(
 	setup: &Setup,
 	before_link: impl Fn(&Setup) -> bool,
@@ -99,6 +100,11 @@ async fn link_after(
 	}
 	wait_until("the link's turn", || before_link(setup)).await;
 	events.send(link_entry(1, "b.txt", "a.txt")).await.unwrap();
+	wait_until("the link is taken", || {
+		events.capacity() == events.max_capacity()
+	})
+	.await;
+	setup.backend.release_all();
 	drop(events);
 	let _ = result.send(read_in_full());
 	let report = job.running.await.unwrap();
@@ -121,21 +127,19 @@ async fn a_hard_link_copies_its_target_whenever_that_is_registered() {
 	assert_eq!(files["bundle/a.txt"], files["bundle/b.txt"]);
 
 	// the link comes while the file is being registered, and waits for it
-	let setup = setup_slow_finish();
-	let report = link_after(&setup, |setup| setup.backend.log().finishing == ["a.txt"])
+	let setup = setup_registering();
+	let report = link_after(&setup, |setup| !setup.backend.log().held_named.is_empty())
 		.await
 		.unwrap();
 	assert_eq!(finished_paths(&setup), ["bundle/a.txt", "bundle/b.txt"]);
 	assert_eq!(report.counts.files_done, 2);
 }
 
-/// A drive where `a.txt` takes long to register.
-fn setup_slow_finish() -> Setup {
+/// A drive where `a.txt`'s registration is held.
+fn setup_registering() -> Setup {
 	setup("bundle.tar", Vec::new(), |backend| {
 		backend.keep_uploads = true;
-		backend
-			.slow_finish
-			.insert("a.txt".to_owned(), Duration::from_millis(200));
+		backend.hold_named(Request::Finish, ["a.txt"]);
 	})
 }
 
@@ -170,15 +174,13 @@ async fn a_hard_link_to_a_file_that_failed_is_skipped() {
 
 	// failing to register while the link waits for it
 	let unregistered = setup("bundle.tar", Vec::new(), |backend| {
-		backend
-			.slow_finish
-			.insert("a.txt".to_owned(), Duration::from_millis(200));
+		backend.hold_named(Request::Finish, ["a.txt"]);
 		backend
 			.fail_finish
 			.insert("a.txt".to_owned(), ErrorKind::Server);
 	});
 	let report = link_after(&unregistered, |setup| {
-		setup.backend.log().finishing == ["a.txt"]
+		!setup.backend.log().held_named.is_empty()
 	})
 	.await
 	.unwrap();
@@ -237,12 +239,17 @@ async fn hard_links_copy_no_more_than_the_expansion_limit_allows() {
 async fn many_links_to_one_file_open_as_fast_as_they_are_worked_off() {
 	let setup = setup("links.tar", tar_with_links(b"linked", 200), |backend| {
 		backend.keep_uploads = true;
-		// every link waits for the file first
-		backend
-			.slow_finish
-			.insert("a.bin".to_owned(), Duration::from_millis(100));
+		backend.hold_named(Request::Finish, ["a.bin"]);
 	});
 	let job = start(&setup, Options::default());
+	// every link waits for the file first: the codec has read them all, and given back the
+	// chunk it read them from
+	wait_until("every link waits for a.bin", || {
+		!setup.backend.log().held_named.is_empty()
+			&& setup.backend.memory.available_permits() == setup.backend.budget
+	})
+	.await;
+	setup.backend.release_all();
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, 201);
 	let log = setup.backend.log();
@@ -385,9 +392,7 @@ async fn a_chosen_hard_link_comes_out_with_the_target_its_listing_names() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_link_that_waited_for_a_file_that_failed_is_no_item() {
 	let setup = setup("bundle.tar", Vec::new(), |backend| {
-		backend
-			.slow_finish
-			.insert("a.txt".to_owned(), Duration::from_millis(100));
+		backend.hold_named(Request::Finish, ["a.txt"]);
 		backend
 			.fail_finish
 			.insert("a.txt".to_owned(), ErrorKind::Server);
@@ -411,6 +416,12 @@ async fn a_link_that_waited_for_a_file_that_failed_is_no_item() {
 	] {
 		events.send(event).await.unwrap();
 	}
+	// the link waits for a.txt, whose registration fails only then
+	wait_until("the link is taken", || {
+		events.capacity() == events.max_capacity()
+	})
+	.await;
+	setup.backend.release_all();
 	wait_until("a.txt failed", || job.reporter.counts().files_failed == 1).await;
 	for (ordinal, name) in [(2, "c.txt"), (3, "d.txt")] {
 		for event in [

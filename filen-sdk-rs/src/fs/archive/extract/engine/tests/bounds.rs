@@ -7,9 +7,7 @@ use super::*;
 #[tokio::test(start_paused = true)]
 async fn directories_are_planned_only_as_fast_as_they_are_created() {
 	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
-		backend
-			.slow
-			.insert("blocked".to_owned(), Duration::from_secs(3600));
+		backend.hold_named(Request::Create, ["blocked"]);
 	});
 	let (events, result, link) = worker::scripted::<CodecResult>();
 	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
@@ -32,6 +30,7 @@ async fn directories_are_planned_only_as_fast_as_they_are_created() {
 		{
 			taken.get_or_insert(ordinal);
 			// once `blocked` is created, the rest are taken as they are created
+			setup.backend.release_all();
 			events.send(entry(ordinal)).await.unwrap();
 		}
 	}
@@ -55,25 +54,33 @@ async fn registrations_run_bounded() {
 		.collect();
 	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
 	let setup = setup("empty.tar", tar_of(&members), |backend| {
-		for name in &names {
-			backend
-				.slow_finish
-				.insert(name.clone(), Duration::from_millis(20));
-		}
+		backend.hold_named(Request::Finish, &names);
 	});
 	let job = start(&setup, Options::default());
+	// each registration let go in turn: the next one starts in its place
+	for (done, name) in names.iter().enumerate() {
+		let started = (done + MAX_SMALL_PARALLEL_REQUESTS).min(names.len());
+		wait_until("the registrations after it start", || {
+			setup.backend.log().held_named.len() == started
+		})
+		.await;
+		assert_eq!(
+			setup.backend.log().peak_finishes,
+			MAX_SMALL_PARALLEL_REQUESTS,
+			"as many at once as other small requests, and no more"
+		);
+		setup.backend.release_named(Request::Finish, [name]);
+	}
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.files_done, names.len() as u64);
-	assert_eq!(
-		setup.backend.log().peak_finishes,
-		MAX_SMALL_PARALLEL_REQUESTS,
-		"as many at once as other small requests, and no more"
-	);
-	assert_eq!(
-		setup.backend.log().finishing,
-		names,
-		"registered in archive order"
-	);
+	let started: Vec<String> = setup
+		.backend
+		.log()
+		.held_named
+		.iter()
+		.map(|(_, name)| name.clone())
+		.collect();
+	assert_eq!(started, names, "registered in archive order");
 	assert_released(&setup, &job.reporter, &job.recorder);
 }
 
@@ -163,26 +170,19 @@ async fn top_level_items_arrive_in_bounded_batches() {
 async fn the_archive_read_to_its_end_holds_no_memory() {
 	let big = pattern(3 * CHUNK_SIZE, 8);
 	let setup = setup("bundle.tar", tar_of(&[("big.bin", &big)]), |backend| {
-		backend
-			.slow_finish
-			.insert("big.bin".to_owned(), Duration::from_secs(3));
+		backend.hold_named(Request::Finish, ["big.bin"]);
 	});
 	let job = start(&setup, Options::default());
 	wait_until("big.bin registers, the archive read", || {
-		setup
-			.backend
-			.log()
-			.finishing
-			.contains(&"big.bin".to_owned())
+		!setup.backend.log().held_named.is_empty()
 	})
 	.await;
 	// while it still registers
-	let released = wait_until("the codec's last chunk is given back", || {
+	wait_until("the codec's last chunk is given back", || {
 		setup.backend.memory.available_permits() == setup.backend.budget
-	});
-	tokio::time::timeout(Duration::from_secs(2), released)
-		.await
-		.expect("the last chunk is given back once the codec ended");
+	})
+	.await;
+	setup.backend.release_all();
 	job.running.await.unwrap().unwrap();
 	assert_released(&setup, &job.reporter, &job.recorder);
 }

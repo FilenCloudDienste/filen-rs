@@ -264,8 +264,9 @@ const CREATING_WITH_THE_ARCHIVE: u64 = MAX_SMALL_PARALLEL_REQUESTS as u64 + 1;
 async fn a_pause_leaves_no_directory_uncreated() {
 	// more directories than are created at once, the rest waiting their turn
 	let count = MAX_SMALL_PARALLEL_REQUESTS + 10;
+	let names: Vec<String> = (0..count).map(|ordinal| format!("d{ordinal:03}")).collect();
 	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
-		backend.delay = Duration::from_secs(10);
+		backend.hold_named(Request::Create, &names);
 	});
 	let (pause, _cancel, control) = controls();
 	let (events, result, link) = worker::scripted::<CodecResult>();
@@ -281,21 +282,24 @@ async fn a_pause_leaves_no_directory_uncreated() {
 		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
-	for ordinal in 0..count {
-		events
-			.send(dir_entry(ordinal as u64, &format!("d{ordinal:03}")))
-			.await
-			.unwrap();
+	for (ordinal, name) in names.iter().enumerate() {
+		events.send(dir_entry(ordinal as u64, name)).await.unwrap();
 	}
+	wait_until(
+		"every directory is planned, the first being created",
+		|| {
+			events.capacity() == events.max_capacity()
+				&& setup.backend.log().held_named.len() == MAX_SMALL_PARALLEL_REQUESTS
+		},
+	)
+	.await;
 	drop(events);
 	let _ = result.send(read_in_full());
-	wait_until("the first directories are being created", || {
-		job.reporter.ops_in_flight() == CREATING_WITH_THE_ARCHIVE
-	})
-	.await;
-	// a moment of the creates' ten seconds, for the driver to take the archive's end
-	sleep(Duration::from_secs(1)).await;
+	// time only moves once every task waits: a moment of it lets the driver take the archive's
+	// end, with nothing else it could do while the creates are held
+	sleep(Duration::from_millis(1)).await;
 	pause.send_replace(true);
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert!(!job.running.is_finished(), "the rest are created on resume");
 
@@ -363,9 +367,7 @@ async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
 		.map(|(name, data)| (name.as_str(), &data[..]))
 		.collect();
 	let setup = setup("bundle.tar", tar_of(&members), |backend| {
-		backend
-			.slow
-			.insert("f1.bin".to_owned(), Duration::from_millis(300));
+		backend.hold_named(Request::Upload, ["f1.bin"]);
 	});
 	let config = test_config();
 	let (pause, _cancel, control) = controls();
@@ -378,10 +380,11 @@ async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
 		},
 	);
 	wait_until("f1.bin's first chunk uploads", || {
-		setup.backend.log().upload_starts.len() > 2
+		!setup.backend.log().held_named.is_empty()
 	})
 	.await;
 	pause.send_replace(true);
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	assert_paused_holding_nothing(&setup, &job, &config);
 
@@ -418,11 +421,7 @@ async fn a_cancel_while_paused_winds_down() {
 	let setup = setup(
 		"bundle.tar",
 		tar_of(&[("a.bin", &pattern(3 * CHUNK_SIZE, 4))]),
-		|backend| {
-			backend
-				.slow
-				.insert("a.bin".to_owned(), Duration::from_millis(300));
-		},
+		|backend| backend.hold_named(Request::Upload, ["a.bin"]),
 	);
 	let (pause, cancel, control) = controls();
 	let job = start(
@@ -433,10 +432,11 @@ async fn a_cancel_while_paused_winds_down() {
 		},
 	);
 	wait_until("a chunk uploads", || {
-		!setup.backend.log().upload_starts.is_empty()
+		!setup.backend.log().held_named.is_empty()
 	})
 	.await;
 	pause.send_replace(true);
+	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
@@ -528,12 +528,8 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 	let big = pattern(CHUNK_SIZE + 3, 5);
 	let tar = tar_of(&[("b.txt", b"b"), ("a.bin", &big[..])]);
 	let setup = setup("bundle.tar", tar, |backend| {
-		backend
-			.slow_finish
-			.insert("b.txt".into(), Duration::from_secs(2));
-		backend
-			.slow
-			.insert("a.bin".into(), Duration::from_millis(600));
+		backend.hold_named(Request::Finish, ["b.txt"]);
+		backend.hold_named(Request::Upload, ["a.bin"]);
 	});
 	let (pause, _cancel, control) = controls();
 	let job = start(
@@ -544,11 +540,11 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 		},
 	);
 	wait_until("b.txt registers and a.bin's chunks upload", || {
-		let log = setup.backend.log();
-		log.finishing.contains(&"b.txt".to_owned()) && log.upload_starts.len() == 3
+		setup.backend.log().held_named.len() == 3
 	})
 	.await;
 	pause.send_replace(true);
+	setup.backend.release_named(Request::Upload, ["a.bin"]);
 	wait_until("a.bin's chunks are uploaded", || {
 		setup.backend.log().uploaded.len() == 3
 	})
@@ -558,6 +554,7 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 		"b.txt still registers: the job has not gone idle"
 	);
 	pause.send_replace(false);
+	setup.backend.release_all();
 	let report = tokio::time::timeout(Duration::from_secs(20), job.running)
 		.await
 		.expect("the job finishes")
@@ -574,12 +571,10 @@ async fn a_pause_lifted_before_the_job_went_idle_loses_no_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_the_archive_is_read_ends_with_no_time_left() {
-	// fetched slowly enough for the rate to be known before the cancel
+	// read in part, and no further until the cancel: the rate is known, and time is left
 	let tar = tar_of(&[("big.bin", &incompressible(6 * CHUNK_SIZE, 0x40))]);
-	let setup = setup("slow.tar", tar, |backend| {
-		backend
-			.slow
-			.insert("slow.tar".to_owned(), Duration::from_millis(100));
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend.hold_named(Request::Upload, ["big.bin"]);
 	});
 	let (_pause, cancel, control) = controls();
 	let job = start(
