@@ -41,6 +41,7 @@ mod pause;
 mod plan;
 // The remote half: apply the announced changes to the derived remote view.
 mod remote;
+mod rows;
 // The permanent per-phase cost probe, driven by `tests/sync_engine_probe.rs`. Gated on
 // `bench-internals` like `cache::bench_support`, and deliberately not on `cfg(test)`: the `tests/`
 // binary links the library compiled WITHOUT `cfg(test)`, so such a seam would be invisible to the

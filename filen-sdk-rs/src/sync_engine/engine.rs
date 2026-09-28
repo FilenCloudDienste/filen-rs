@@ -41,9 +41,9 @@ use super::{
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
 	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
+	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	side::{Nodes, NodesAt, Side},
-	tree::Baseline,
 };
 use crate::{
 	Error, ErrorKind,
@@ -1674,7 +1674,7 @@ struct PassInputs {
 	record: PairRecord,
 	user_ignore: String,
 	store: SharedStore,
-	baseline: Arc<Baseline>,
+	baseline: Baseline,
 	/// The failure streaks that BLOCK planning this pass (see [`streak_blocks`]).
 	failures: HashMap<String, PathFailure>,
 	last_ignored: BTreeSet<String>,
@@ -1812,7 +1812,7 @@ pub(super) fn unaccounted_key(
 /// The read-only inputs to a pass, shared by planning and applying.
 struct Prepared {
 	record: PairRecord,
-	baseline: Arc<Baseline>,
+	baseline: Baseline,
 	/// What this pass read, and why (see [`PassRead`]).
 	read: PassRead,
 	/// The announced remote changes this pass CONSUMED — kept so a pass cut short can hand them
@@ -3122,9 +3122,7 @@ impl SyncEngine {
 		if !baseline.any_unconfirmed() {
 			return Ok(());
 		}
-		let advanced = self
-			.confirm_pushes(Arc::make_mut(&mut baseline), &HashMap::new())
-			.await;
+		let advanced = self.confirm_pushes(&mut baseline, &HashMap::new()).await;
 		if advanced.is_empty() {
 			return Ok(());
 		}
@@ -3325,7 +3323,7 @@ impl SyncEngine {
 		};
 		let delta = scope.take_remote();
 		let root = inputs.record.remote_root;
-		let for_remote = Arc::clone(&inputs.baseline);
+		let for_remote = inputs.baseline.clone();
 		let nodes = mem::take(&mut derived.remote);
 		// The delta comes back out with the observation: `observe_remote` only borrows it, and a
 		// pass cut short hands it to the next one (see `Prepared::remote_delta`).
@@ -3446,7 +3444,7 @@ impl SyncEngine {
 		// read — the branches it visited — which is why the carried `ignored_remote` facts still
 		// stand for everything it did not.
 		let local_root = PathBuf::from(&inputs.record.local_root);
-		let for_local = Arc::clone(&inputs.baseline);
+		let for_local = inputs.baseline.clone();
 		let dirty = mem::take(&mut derived.dirty);
 		let pass_rules = remote_rules.rules;
 		let (observations, rules) = tokio::task::spawn_blocking(move || {
@@ -3550,10 +3548,9 @@ impl SyncEngine {
 		let mut confirmed = Vec::new();
 		if inputs.baseline.any_unconfirmed() {
 			// Read BEFORE the rows are borrowed mutably: a change-scoped view derives its nodes
-			// from those very rows, so it cannot be read across the `make_mut`. Only the
-			// unconfirmed rows' own paths are looked up — `observed_confirmations` asks about no
-			// other — so this is the per-push work the confirmation already was, never the tree.
-			// Cloning the `Arc` instead would deep-copy the whole tree on every pass after a push.
+			// from those very rows, so it cannot be read across the confirmation's writes. Only
+			// the unconfirmed rows' own paths are looked up — `observed_confirmations` asks about
+			// no other — so this is the per-push work the confirmation already was, never the tree.
 			let at_unconfirmed: HashMap<String, RemoteNode> = {
 				let nodes = view.nodes.of(&inputs.baseline);
 				inputs
@@ -3566,8 +3563,9 @@ impl SyncEngine {
 					})
 					.collect()
 			};
-			let rows = Arc::make_mut(&mut inputs.baseline);
-			confirmed = self.confirm_pushes(rows, &at_unconfirmed).await;
+			confirmed = self
+				.confirm_pushes(&mut inputs.baseline, &at_unconfirmed)
+				.await;
 		}
 		super::step("confirm_pushes");
 
@@ -3783,9 +3781,8 @@ impl SyncEngine {
 			// exact, and leaves the rows free to be borrowed mutably beside it.
 			let no_rows = Baseline::default();
 			let raw = view.nodes.of(&no_rows);
-			let rows = Arc::make_mut(&mut baseline);
-			confirmed = plan::confirm_agreed_content(rows, &raw);
-			confirmed.extend(self.confirm_pushes(rows, &raw).await);
+			confirmed = plan::confirm_agreed_content(&mut baseline, &raw);
+			confirmed.extend(self.confirm_pushes(&mut baseline, &raw).await);
 		}
 		let baseline = baseline;
 
@@ -3810,7 +3807,7 @@ impl SyncEngine {
 			remote_rules.errors.push(error.to_string());
 		}
 		let local_root = PathBuf::from(&record.local_root);
-		let scan_baseline = Arc::clone(&baseline);
+		let scan_baseline = baseline.clone();
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
 		// `.filenignore` files on disk, over any remote copy read for the same directory. A mode that
 		// pulls alone reads on disk only the synced ones the remote has lost: they govern until that
@@ -5922,7 +5919,7 @@ mod tests {
 				delete_guard: DeleteGuard::unlimited(),
 				paused: false,
 			},
-			baseline: Arc::new(baseline),
+			baseline,
 			dir_moves: Vec::new(),
 			local_scan: LocalScan {
 				nodes: local

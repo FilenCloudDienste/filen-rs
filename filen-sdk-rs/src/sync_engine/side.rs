@@ -30,9 +30,9 @@
 //! # Why the baseline is supplied at READ time
 //!
 //! A carried side does not hold the baseline it derives from — [`Side::of`] takes it per read.
-//! It cannot hold one: a pass MUTATES the tree while both sides are live (`Arc::make_mut` for a
-//! push confirmation, `Baseline::move_subtree` for a directory move), so a side owning its own
-//! `Arc` would force a clone of the whole tree and then go on answering from the pre-move rows.
+//! It cannot hold one: a pass MUTATES the rows while both sides are live (`Baseline::set_agreed`
+//! for a push confirmation, `Baseline::move_subtree` for a directory move), so a side owning its
+//! own copy would force a clone of the whole tree and then go on answering from the pre-move rows.
 //!
 //! # Which mutations a derived backing cannot do the way a map does
 //!
@@ -55,7 +55,8 @@ use std::{
 use super::{
 	baseline::BaselineEntry,
 	plan::{is_under, moved_path},
-	tree::{Baseline, at_or_under_folded},
+	rows::Baseline,
+	tree::at_or_under_folded,
 };
 
 /// One side of a pass, addressed by path.
@@ -103,7 +104,7 @@ impl<V: Clone> NodesAt for HashMap<String, V> {
 	}
 
 	/// A scan of the keys, because a path-keyed map has no order to bisect — the baseline's own
-	/// answer ([`Baseline::occupied`](super::tree::Baseline::occupied)) is a walk of one node's
+	/// answer ([`Baseline::occupied`](super::rows::Baseline::occupied)) is a walk of one node's
 	/// children, and this is the same question asked of a map that holds paths no row tracks.
 	/// Folding each key into a [`collision_key`](super::scan::collision_key) first would allocate a
 	/// `String` per key to learn — for all but a handful — that the first character already
@@ -390,12 +391,12 @@ impl<T: FromRow> Side<T> {
 	///
 	/// On a CARRIED side this re-keys the overlay and nothing else. The carried half re-keys
 	/// itself, because its nodes are derived from rows that
-	/// [`Baseline::move_subtree`](super::tree::Baseline::move_subtree) moves — so this must run
+	/// [`Baseline::move_subtree`](super::rows::Baseline::move_subtree) moves — so this must run
 	/// BEFORE the rows move, while `from` still names them, and doing both would move it twice.
 	///
 	/// What it must also do is drop what this pass recorded at the paths the move WRITES A ROW TO
 	/// — `to` itself, and the path each row under `from` lands on. Those are the paths
-	/// [`Baseline::move_subtree`](super::tree::Baseline::move_subtree) overwrites, so the arriving
+	/// [`Baseline::move_subtree`](super::rows::Baseline::move_subtree) overwrites, so the arriving
 	/// row is what a whole read shows there and whatever the overlay said about the row that used
 	/// to sit there is superseded: a tombstone left standing would answer "absent" over a row that
 	/// has just arrived, and a node a producer placed there is one the whole backing's own re-key
