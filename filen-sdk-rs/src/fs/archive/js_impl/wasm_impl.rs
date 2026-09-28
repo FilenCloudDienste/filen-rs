@@ -374,10 +374,13 @@ impl JsClient {
 	/// has to end in the format's extension (see `archiveExtension`); a name taken at the
 	/// destination is kept, and the archive is named `name (1).ext`, ...
 	///
-	/// `password` is required exactly when the format is encrypted. A format whose encoder
-	/// needs more than `archiveCodecMemBudget` is refused, as an invalid argument. The report
-	/// is returned whether the compress completed, was cancelled or failed; a compress that did
-	/// not complete leaves nothing in the drive.
+	/// `password` is required exactly when the format is encrypted. The call is refused before
+	/// anything runs for a name without the format's extension (`InvalidName`), a level the
+	/// format does not take or a password where none belongs (`InvalidState`), a missing one
+	/// (`ArchivePasswordRequired`), and a format whose encoder needs more than
+	/// `archiveCodecMemBudget` (`InsufficientMemory`). The report is returned whether the
+	/// compress completed, was cancelled or failed; a compress that did not complete leaves
+	/// nothing in the drive.
 	#[wasm_bindgen(js_name = "compressItems")]
 	pub async fn compress_items(
 		&self,

@@ -279,12 +279,15 @@ impl JsClient {
 	/// device. `name` has to end in the format's extension (see `archive_extension`); a name
 	/// taken at the destination is kept, and the archive is named `name (1).ext`, ...
 	///
-	/// `password` is required exactly when the format is encrypted. A format whose encoder
-	/// needs more than `archive_codec_mem_budget` is refused, as an invalid argument. The report
-	/// is returned whether the compress completed, was cancelled or failed; a compress that did
-	/// not complete leaves nothing in the drive. Only an abort through `managed_future` gets
-	/// that report: cancelling the calling coroutine or task drops the call, and with it the
-	/// report (the job is stopped at once).
+	/// `password` is required exactly when the format is encrypted. The call is refused before
+	/// anything runs for a name without the format's extension (`InvalidName`), a level the
+	/// format does not take or a password where none belongs (`InvalidState`), a missing one
+	/// (`ArchivePasswordRequired`), and a format whose encoder needs more than
+	/// `archive_codec_mem_budget` (`InsufficientMemory`). The report is returned whether the
+	/// compress completed, was cancelled or failed; a compress that did not complete leaves
+	/// nothing in the drive. Only an abort through `managed_future` gets that report: cancelling
+	/// the calling coroutine or task drops the call, and with it the report (the job is stopped
+	/// at once).
 	#[allow(clippy::too_many_arguments)]
 	pub async fn compress_items(
 		&self,

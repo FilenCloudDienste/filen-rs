@@ -869,8 +869,9 @@ struct CompressCall {
 
 impl CompressCall {
 	/// The call's arguments, checked against the format's own rules and the client's
-	/// `codec_mem_budget` for its encoder: a call breaking them is refused, as an invalid
-	/// argument, rather than started as a job that fails.
+	/// `codec_mem_budget` for its encoder: a call breaking them is refused with the error the
+	/// job would fail with (`InsufficientMemory` for an encoder over the budget), rather than
+	/// started as a job that fails.
 	fn new(
 		items: Vec<AnyItemWithContext>,
 		destination: AnyNormalDir,
