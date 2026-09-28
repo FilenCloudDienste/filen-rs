@@ -101,9 +101,18 @@ use crate::{
 const HARNESS_VERSION: u32 = 4;
 
 /// Passes run and discarded before the first recorded sample of a scenario. The first pass over a
-/// fresh fixture reads a cold page cache and a cold baseline (the store's resident copy is built on
-/// the pair's first read), neither of which any later pass pays.
+/// fresh fixture reads a cold OS page cache and a cold reader connection (its statement cache and
+/// SQLite's page cache), neither of which any later pass pays.
 const WARMUPS: usize = 2;
+
+/// What a pass's baseline edits may compute themselves as, whatever they hold: the edits' own
+/// struct and the vector of their layers.
+const EDITS_BASE_BYTES: u64 = 4 * 1024;
+
+/// What ONE edit — a folded directory move, a confirmed push — may add to that: a layer holding two
+/// paths, or a marker entry keyed by one, with room for the map's slack. A move that wrote the rows
+/// it carries is hundreds of bytes per ROW, and fails this at any subtree past a handful of rows.
+const EDIT_BYTES: u64 = 1024;
 
 /// Samples per scenario when `SYNC_BENCH_SAMPLES` is unset. Three is the floor a median means
 /// anything over, and every one of them is recorded — a median alone hides a bimodal distribution.
@@ -1118,6 +1127,31 @@ pub const SCENARIOS: &[Scenario] = &[
 			dir_moves: Count::PerChanged,
 		},
 	),
+	// A directory holding HALF the pair renamed: two top-level directories of 50k files each, one
+	// of them moved. The move above carries the deepest directory, a leaf of twenty files, so its
+	// cost says nothing about how a fold scales with what the moved directory holds; this is the
+	// other end of that, with the other half left untouched for the fixture checks to verify. A pass
+	// that folded the move by writing the rows it carries holds every one of them in its edits, and
+	// the memory child's bound on those fails it.
+	Scenario {
+		name: "twoway_top_dir_move_100k",
+		version: 1,
+		files_per_leaf: 50_000,
+		depth: 1,
+		file_bytes: 73,
+		names: NameStyle::Ascii,
+		nodes: 100_000,
+		change: Change::MoveDir,
+		mode: SyncMode::TwoWay,
+		reps: 1,
+		read: ExpectRead::Scoped,
+		expect: Expect {
+			actions: Count::PerChanged,
+			held: Count::Exactly(0),
+			conflicts: Count::Exactly(0),
+			dir_moves: Count::PerChanged,
+		},
+	},
 	balanced(
 		"twoway_after_upload_100k",
 		100_000,
@@ -2206,6 +2240,9 @@ struct MemAnswer {
 	/// not to hold a second copy of the tree, and `whole_rows` is the figure that says whether it
 	/// held one anyway.
 	carried_walks: (u64, u64, u64, u64),
+	/// What the measured pass asked the store for its baseline rows: `(statements, rows)`. The
+	/// rows are no longer held between passes, so this is what a pass pays for them instead.
+	baseline_reads: (u64, u64),
 	/// The resident set at each boundary the engine marked, in order.
 	at_step: Vec<(String, u64)>,
 }
@@ -2283,6 +2320,9 @@ impl MemAnswer {
 			subtree_calls,
 		));
 		out.push(("walk:carried_entries_subtree_rows".to_owned(), subtree_rows));
+		let (statements, rows) = self.baseline_reads;
+		out.push(("walk:baseline_read_statements".to_owned(), statements));
+		out.push(("walk:baseline_read_rows".to_owned(), rows));
 		let (baseline, view, scan) = self.structures;
 		out.push(("mem:pass_baseline_computed_bytes".to_owned(), baseline));
 		out.push(("mem:pass_view_computed_bytes".to_owned(), view));
@@ -2492,12 +2532,14 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	// scenario's pass is the same lie a timing figure for one would be.
 	// Zeroed HERE, so what comes back describes the measured pass and not the engine's opening.
 	super::side::reset_carried_walks();
+	super::rows::reset_reads();
 	let log: Arc<Mutex<Vec<(&'static str, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 	let (_, plan, structures) = STEP_RSS
 		.scope(Arc::clone(&log), one_pass(&bed, scenario))
 		.await;
 	let after_pass_rss = probe::current_rss_bytes();
 	let walks = super::side::carried_walks();
+	let baseline_reads = super::rows::reads();
 	let carried_walks = (
 		walks.whole_calls,
 		walks.whole_rows,
@@ -2533,21 +2575,30 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		structures.view_bytes as u64,
 		structures.scan_bytes as u64,
 	);
-	// A pass does not COPY the tree: `pass_inputs` hands it a `Baseline` sharing the store's
-	// resident tree, the very object this child sized before the pass began. One that started
-	// copying it would be the finding, and it would otherwise surface only as two columns that
-	// happened to disagree.
-	//
-	// That includes a pass that FOLDS a directory move or CONFIRMS a push. Both edit the pass's
-	// view, and those edits live beside the shared tree rather than in a copy of it — a copy
-	// would size its buffers to what they hold rather than to the capacity the store's grew to,
-	// and fail this.
-	assert_eq!(
-		structures.0, pair_baseline_computed_bytes as u64,
-		"the pass's baseline computes itself as {} byte(s) where the loaded pair's computes {} \
-		 ({} directory move(s) folded, {} push(es) confirmed) — the pass is not reading the \
-		 baseline the store holds",
-		structures.0, pair_baseline_computed_bytes, plan.dir_moves, plan.confirmed,
+	// A pass holds no rows it did not edit: it reads the table through the same kind of handle the
+	// loaded pair holds, and what it holds beyond that is its EDITS — the directory moves it folded
+	// and the pushes it confirmed — each costing what it edited, never what the rows under it
+	// hold. A pass that copied the table, or folded a move by writing every row it carries (which
+	// is what a move of a large directory used to cost), sizes its edits by rows and fails the
+	// bound below.
+	let pass_edits = structures
+		.0
+		.checked_sub(pair_baseline_computed_bytes as u64)
+		.unwrap_or_else(|| {
+			panic!(
+				"the pass's baseline computes itself as {} byte(s), LESS than the loaded pair's {}: \
+				 it is not reading the table through the handle the store hands out",
+				structures.0, pair_baseline_computed_bytes
+			)
+		});
+	let edit_bound = EDITS_BASE_BYTES + EDIT_BYTES * (plan.dir_moves + plan.confirmed) as u64;
+	assert!(
+		pass_edits <= edit_bound,
+		"the pass's edits compute themselves as {pass_edits} byte(s) for {} directory move(s) \
+		 folded and {} push(es) confirmed, over the {edit_bound} those edits are entitled to — \
+		 the pass is holding rows it did not edit",
+		plan.dir_moves,
+		plan.confirmed,
 	);
 	drop(bed);
 	// A high-water mark cannot sit BELOW a sample of the same process's resident set. Zero is what
@@ -2610,6 +2661,7 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		rss_after_engine_open,
 		pair_baseline_terms,
 		carried_walks,
+		baseline_reads,
 		at_step,
 	}
 }
@@ -2664,9 +2716,9 @@ pub async fn run_scenario(scenario: &Scenario, samples: usize) -> Vec<Record> {
 		reps: 1,
 	};
 
-	// Discarded: the page cache, the store's resident baseline (the store builds it on the pair's
-	// FIRST read) and the branch predictors every recorded figure — the yardstick included — is
-	// then measured in.
+	// Discarded: the OS page cache, the reader connection's statement and page caches (the store
+	// opens it on the pair's FIRST read) and the branch predictors every recorded figure — the
+	// yardstick included — is then measured in.
 	for _ in 0..WARMUPS {
 		one_pass(&bed, scenario).await;
 	}
@@ -3957,6 +4009,7 @@ mod tests {
 			rss_after_engine_open: 1,
 			pair_baseline_terms: vec![("nodes".to_owned(), 60), ("names".to_owned(), 40)],
 			carried_walks: (7, 8, 9, 11),
+			baseline_reads: (13, 17),
 			at_step: vec![("from_baseline".to_owned(), 4)],
 		};
 		let names: Vec<String> = answer.metrics().into_iter().map(|(name, _)| name).collect();
