@@ -605,6 +605,36 @@ fn keep_lock_alive(lease: &Arc<SharedLease>) {
 	));
 }
 
+/// Send one Acquire for `uuid` and return the server's answer — from a task of its own, so a caller
+/// that stops waiting (a `select!` that moved on, a dropped future) does not cut the request short.
+/// A request cut short can still be granted server-side, and a lease nobody knows of holds the
+/// resource for every client until it expires. Whoever sees the answer decides what happens to it:
+/// the caller, if it is still waiting, and otherwise the task, which releases what was granted.
+/// Only the task can do that safely — a release sent the moment the caller gave up can reach the
+/// server before the grant does, and then releases nothing.
+async fn request_acquire(
+	client: Arc<AuthClient>,
+	url: Arc<str>,
+	body: Bytes,
+	uuid: Uuid,
+	resource: Arc<str>,
+) -> Result<bool, Error> {
+	let (answer, answered) = tokio::sync::oneshot::channel();
+	// Detached, not cancelled: the task must outlive a caller that stopped waiting.
+	drop(crate::runtime::spawn_task_maybe_send(async move {
+		let acquired = send_acquire(&client, &url, body).await;
+		if let Err(Ok(true)) = answer.send(acquired) {
+			release(&client, &url, uuid, &resource).await;
+		}
+	}));
+	answered.await.unwrap_or_else(|_| {
+		Err(Error::custom(
+			ErrorKind::Internal,
+			"the lock request's task ended without an answer",
+		))
+	})
+}
+
 fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 	std::iter::successors(
 		Some((
@@ -741,11 +771,22 @@ impl Client {
 			r#type: LockType::Acquire,
 			resource: Cow::Borrowed(&resource),
 		})?);
-		let url = lock_url();
+		// Shared with each attempt's request task, which can outlive this call (see
+		// `request_acquire`).
+		let url: Arc<str> = lock_url().into();
+		let shared_resource: Arc<str> = resource.as_str().into();
 		let client = self.arc_client();
 		let acquired_at = acquire_loop(
-			// refcount bump: every poll resends the same Acquire body
-			|| send_acquire(&client, &url, bytes.clone()),
+			|| {
+				request_acquire(
+					Arc::clone(&client),
+					Arc::clone(&url),
+					// refcount bump: every poll resends the same Acquire body
+					bytes.clone(),
+					uuid,
+					Arc::clone(&shared_resource),
+				)
+			},
 			&resource,
 			max_sleep_time,
 			attempts,
