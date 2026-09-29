@@ -19,7 +19,12 @@ use filen_sdk_rs::{
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::OnceCell;
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{
+	Layer,
+	fmt::{TestWriter, writer::BoxMakeWriter},
+	layer::SubscriberExt,
+	util::SubscriberInitExt,
+};
 
 pub mod locks;
 
@@ -156,12 +161,21 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
 				tracing_subscriber::filter::LevelFilter::INFO,
 			);
 		// `try_init` so this coexists with any subscriber the SDK installs; `with_test_writer`
-		// routes output through cargo test's capture. The filters are per layer, so `RUST_LOG`
-		// narrows the captured output without silencing the decision lines.
+		// routes output through cargo test's capture. That capture is per thread and inherited at
+		// spawn, so the runtime's workers keep the buffer of whichever test built this runtime, and
+		// whatever a spawned task logs in any later test (a sync engine's watch loop, say) is lost.
+		// `FILEN_TEST_LOG_STDERR` writes everything straight to stderr instead, uncaptured. The
+		// filters are per layer, so `RUST_LOG` narrows the main output without silencing the
+		// decision lines.
+		let writer = if env::var_os("FILEN_TEST_LOG_STDERR").is_some() {
+			BoxMakeWriter::new(std::io::stderr)
+		} else {
+			BoxMakeWriter::new(TestWriter::new())
+		};
 		let _ = tracing_subscriber::registry()
 			.with(
 				tracing_subscriber::fmt::layer()
-					.with_test_writer()
+					.with_writer(writer)
 					.with_filter(filter),
 			)
 			.with(
