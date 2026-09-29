@@ -7,16 +7,16 @@
 //! that used to (`tree.rs`, ~127 bytes a row for the life of the pair) is compiled only into the
 //! tests, where it is the ORACLE every answer here is held to.
 //!
-//! Every question is ONE indexed statement or one keyset-paged range, off `baseline`'s columns and
-//! indexes (see `baseline::SCHEMA`):
+//! Every question is an indexed statement or a keyset-paged range off `baseline`'s columns and
+//! indexes (see `baseline::SCHEMA`) — or no statement at all, where a page already read spans it:
 //!
 //! | Method | Shape | Answered by |
 //! |---|---|---|
 //! | [`get`](Baseline::get), [`contains_key`](Baseline::contains_key), [`carryable`](Baseline::carryable) | point, exact path | the last page any enumeration read, where it spans the path (see `snapshot::Page`) — else a page of the primary key's range read from the path, one row long unless the questions before it walked in path order (see `Snapshot::point`) |
-//! | [`cursor`](Baseline::cursor) | point, asked a directory at a time | a page of the directory's range, then pages from the path asked, sized to how many of the last page's rows were asked for |
+//! | [`cursor`](Baseline::cursor) | point, asked a directory at a time | on a directory's first miss the one row asked for, while no directory before it needed more ([`Cursor`]), else a page of the directory's range; then pages from the path asked, sized to how many of the last page's rows were asked for |
 //! | [`tracked`](Baseline::tracked) | point, or anything strictly under | the primary key, then one row of the range `(p/, p0)` |
-//! | [`occupied`](Baseline::occupied) | folded, at or under | `baseline_folded`: `folded_path` equality, then one row of the range `(f/, f0)` |
-//! | [`folded_row_paths`](Baseline::folded_row_paths) | folded, exact | `folded_path` equality |
+//! | [`occupied`](Baseline::occupied) | folded, at or under | `baseline_folded`: a page from the folded path on, unless the last one spans it (see `Snapshot::folded_at`), then one row of the range `(f/, f0)` |
+//! | [`folded_row_paths`](Baseline::folded_row_paths) | folded, exact | `baseline_folded`: a page from the folded path on, as above |
 //! | [`any_folded_row_at_or_under`](Baseline::any_folded_row_at_or_under) | folded, at or under, first match | the two above, paged, stopping at the first row the predicate takes |
 //! | [`subtree_all_synced`](Baseline::subtree_all_synced) | subtree predicate | `baseline_state (pair_id, state, rel_path)`: one seek per unsynced state, bounded to the range |
 //! | [`subtree`](Baseline::subtree), [`visit_subtree_paths`](Baseline::visit_subtree_paths) | subtree | the primary key's range `(p/, p0)`, paged |
@@ -604,11 +604,12 @@ impl Indexed {
 /// it — so a walk of the table reads it in large pages, and a caller asking about scattered paths
 /// pays about a point lookup each.
 ///
-/// The directory's range is read on the SECOND path asked there that the page in hand cannot answer,
-/// once a directory has shown that a caller asks one path a directory: the first reads the one row
-/// asked for, as a point lookup does ([`Read::Probe`]). A pass deciding one changed file reads one row
-/// of its directory rather than all of it, where a walk of the tree probes one directory, learns
-/// from it, and reads every directory after it whole from the start.
+/// It starts out PROBING: a directory's first miss reads the one row asked for, as a point lookup
+/// does ([`Read::Probe`]), and its range is read on the SECOND path asked there that the page in
+/// hand cannot answer. The first directory that needs more than its probe stops the probing for
+/// good. A pass deciding one changed file reads one row of its directory rather than all of it,
+/// where a walk of the tree probes one directory, learns from it, and reads every directory after
+/// it whole from the start.
 pub(super) struct Cursor<'a> {
 	baseline: &'a Baseline,
 	page: Option<Arc<Page>>,
@@ -1636,7 +1637,8 @@ impl Baseline {
 #[cfg(feature = "bench-internals")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResidentTerms {
-	/// The snapshot handle: a connection, its pair and its counts.
+	/// The snapshot handle: a connection, its pair and its counts. Not the pages it keeps to answer
+	/// point and folded questions out of — up to [`MAX_PAGE`] rows each, dropped with the pass.
 	pub(super) handle: usize,
 	/// The pass's edits over the table — what it moved and confirmed — or the rows frozen for its
 	/// apply. Zero on a pair between passes.
