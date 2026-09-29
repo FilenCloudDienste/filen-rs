@@ -525,6 +525,28 @@ struct TableRows<'a> {
 	next: usize,
 }
 
+impl TableRows<'_> {
+	/// The span's next page, or `None` once it is read through.
+	fn next_page(&mut self) -> Option<Arc<Page>> {
+		if self.exhausted {
+			return None;
+		}
+		let snapshot = self.snapshot?;
+		let Span { lo, inclusive, hi } = &self.span;
+		let page = if self.dirs {
+			snapshot.dir_page(lo, *inclusive, hi.as_deref(), PAGE)
+		} else {
+			snapshot.page(lo, *inclusive, hi.as_deref(), PAGE)
+		};
+		self.exhausted = !page.is_full();
+		if let Some(last) = page.rows.last() {
+			self.span.lo.clone_from(&last.rel_path);
+			self.span.inclusive = false;
+		}
+		Some(page)
+	}
+}
+
 impl Iterator for TableRows<'_> {
 	type Item = BaselineEntry;
 
@@ -538,22 +560,7 @@ impl Iterator for TableRows<'_> {
 				self.next += 1;
 				return Some(row.clone());
 			}
-			if self.exhausted {
-				return None;
-			}
-			let snapshot = self.snapshot?;
-			let Span { lo, inclusive, hi } = &self.span;
-			let page = if self.dirs {
-				snapshot.dir_page(lo, *inclusive, hi.as_deref(), PAGE)
-			} else {
-				snapshot.page(lo, *inclusive, hi.as_deref(), PAGE)
-			};
-			self.exhausted = !page.is_full();
-			if let Some(last) = page.rows.last() {
-				self.span.lo.clone_from(&last.rel_path);
-				self.span.inclusive = false;
-			}
-			self.page = Some(page);
+			self.page = Some(self.next_page()?);
 			self.next = 0;
 		}
 	}
@@ -857,15 +864,7 @@ impl Baseline {
 			return Box::new(std::iter::empty());
 		}
 		if depth == 0 {
-			let snapshot = self.table();
-			return Box::new(TableRows {
-				exhausted: snapshot.is_none(),
-				snapshot,
-				span,
-				dirs,
-				page: None,
-				next: 0,
-			});
+			return Box::new(self.table_rows(span, dirs));
 		}
 		match self.layer(depth) {
 			Layer::Block(block) => {
@@ -915,6 +914,41 @@ impl Baseline {
 					)
 				};
 				merge(kept, Box::new(point.into_iter().chain(subtree)))
+			}
+		}
+	}
+
+	fn table_rows(&self, span: Span, dirs: bool) -> TableRows<'_> {
+		let snapshot = self.table();
+		TableRows {
+			exhausted: snapshot.is_none(),
+			snapshot,
+			span,
+			dirs,
+			page: None,
+			next: 0,
+		}
+	}
+
+	/// Every row of the view inside `span` (directory rows alone when `dirs`), in path order, handed
+	/// to `visit` by reference. A view with no edits — every pass that has folded no move and
+	/// confirmed nothing yet — hands out the table's own pages as it reads them, so a walk of the
+	/// pair decodes each row once and copies none. Each page is read before any of it is handed out,
+	/// so `visit` may ask this baseline anything.
+	fn visit_in(&self, span: Span, dirs: bool, visit: &mut dyn FnMut(&BaselineEntry)) {
+		if self.depth() > 0 {
+			for row in self.rows_in(self.depth(), span, dirs) {
+				visit(&row);
+			}
+			return;
+		}
+		if span.is_empty() {
+			return;
+		}
+		let mut rows = self.table_rows(span, dirs);
+		while let Some(page) = rows.next_page() {
+			for row in &page.rows {
+				visit(row);
 			}
 		}
 	}
@@ -1279,17 +1313,13 @@ impl Baseline {
 
 	/// Every row, parent before child.
 	pub(super) fn visit_rows(&self, mut visit: impl FnMut(&BaselineEntry)) {
-		for row in self.iter() {
-			visit(&row);
-		}
+		self.visit_in(Span::all(), false, &mut visit);
 	}
 
 	/// Every DIRECTORY row, parent before child: the rows a directory move can start from, read off
 	/// an index that holds nothing else instead of out of a walk of every row.
 	pub(super) fn visit_dir_rows(&self, mut visit: impl FnMut(&BaselineEntry)) {
-		for row in self.rows_in(self.depth(), Span::all(), true) {
-			visit(&row);
-		}
+		self.visit_in(Span::all(), true, &mut visit);
 	}
 
 	/// Every row's path, parent before child.
@@ -1300,9 +1330,7 @@ impl Baseline {
 
 	/// Every row's path, parent before child.
 	pub(super) fn visit_row_paths(&self, mut visit: impl FnMut(&str)) {
-		for row in self.iter() {
-			visit(&row.rel_path);
-		}
+		self.visit_in(Span::all(), false, &mut |row| visit(&row.rel_path));
 	}
 
 	/// Every row STRICTLY under `root` (`""` is every row), parent before child.
@@ -1312,9 +1340,7 @@ impl Baseline {
 
 	/// Every path STRICTLY under `root` (`""` is every path), parent before child.
 	pub(super) fn visit_subtree_paths(&self, root: &str, mut visit: impl FnMut(&str)) {
-		for row in self.subtree(root) {
-			visit(&row.rel_path);
-		}
+		self.visit_in(Span::under(root), false, &mut |row| visit(&row.rel_path));
 	}
 
 	/// The rows awaiting confirmation of a push of ours. Empty on a converged pair.
