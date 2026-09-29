@@ -1613,9 +1613,8 @@ impl CacheState {
 	/// Abandon the in-flight (non-converged) resync attempt cleanly: durably flag `needs_resync`,
 	/// tell progress consumers the attempt finished without converging, and — only when `arm_retry`
 	/// — schedule a self-retry so a quiet account re-attempts. No lock is held and nothing is
-	/// committed at any caller, so this drops no work. `arm_retry` is `false` on the abort paths
-	/// where a queued control message (Shutdown / Add / Remove) will itself re-drive the loop, so a
-	/// timer would be redundant; it leaves `resync_retry` untouched in that case.
+	/// committed at any caller, so this drops no work. `arm_retry` is `false` only where the worker
+	/// is shutting down, so a timer would never fire; it leaves `resync_retry` untouched in that case.
 	fn abort_resync_unconverged(&mut self, arm_retry: bool) {
 		self.mark_needs_resync_surfacing_errors();
 		Self::send_resync_progress(
@@ -2520,9 +2519,11 @@ impl CacheState {
 						// committed. `peek` LEFT the message queued (a closed channel stays observable as
 						// `None`), so whoever consumes the channel next applies it: the enclosing
 						// `process_control_burst`'s drain loop, or `run`'s control arm. Mark `needs_resync`
-						// so a fresh resync follows an add/remove, and finish. The queued message will
-						// re-drive the loop, so no retry timer.
-						self.abort_resync_unconverged(false);
+						// so a fresh resync follows an add/remove, and finish. Arm the retry timer too:
+						// only an add of a NEW root re-runs the resync on its own, and a join of a root
+						// that is already active or a removal re-drives nothing — on a quiet account the
+						// flag would then wait for an unrelated event, leaving the roots unpopulated.
+						self.abort_resync_unconverged(true);
 						return Ok(());
 					},
 					read_task = recv_read_task(&mut self.read_tasks), if self.read_tasks.is_some() => {

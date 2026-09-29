@@ -1360,7 +1360,8 @@ async fn test_add_sync_root_rejects_invalid_uuid() {
 /// bounded attempts (under the old unbounded acquisition the worker parked inside the island
 /// until the lock was won, freezing event application for the whole contention window), and the
 /// resync itself must converge via the retry timer once the lock frees up. An event applied in that
-/// window must reach the root's registration.
+/// window must reach the root's registration, and a second registration of the root interrupting
+/// the wait must not leave the resync without a retry.
 #[shared_test_runtime]
 async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	// ISOLATION: this is the ONLY cache test that holds the account-wide drive lock for an
@@ -1469,6 +1470,16 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 		.await,
 		"an event applied before the root's first listing commits is announced to the root"
 	);
+
+	// A second registration of the same root while its resync is still waiting for the lock: the
+	// join interrupts that wait but re-runs nothing itself (the root is already active), and on a
+	// quiet account no event will either — the resync has to re-arm its own retry, or the
+	// convergence below never comes.
+	let _join = client2
+		.clone()
+		.add_sync_root(sub_uuid, noop_sync_root_callback())
+		.await
+		.unwrap();
 
 	// CONVERGENCE: once the lock frees up, the patient acquisition (or the next retry) wins it and
 	// the resync materializes the root's anchor row (which only the resync writes — no event
