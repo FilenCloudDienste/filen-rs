@@ -1,11 +1,14 @@
-use crate::{mcp_server::endpoints::Endpoint, util::RemotePath};
+use crate::{
+	mcp_server::endpoints::{
+		Endpoint,
+		support::{find_item_or_err, require_dir},
+	},
+	util::RemotePath,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{
-		HasUUID as _,
-		categories::{DirType, NonRootFileType, Normal},
-	},
+	fs::{HasUUID as _, categories::NonRootFileType},
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -40,16 +43,10 @@ impl Endpoint for WriteFile {
 			.basename()
 			.context("Cannot write to the root directory")?;
 		let parent_path = path.parent();
-		let parent_dir: DirType<'_, Normal> = match client
-			.find_item_at_path(&parent_path.0)
-			.await
-			.context("Failed to find parent directory")?
-		{
-			Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-			Some(NonRootFileType::Root(root)) => DirType::Root(root),
-			Some(_) => return Err(anyhow::anyhow!("Not a directory: {}", parent_path.0)),
-			None => return Err(anyhow::anyhow!("No such directory: {}", parent_path.0)),
-		};
+		let parent_dir = require_dir(
+			find_item_or_err(client, &parent_path.0, "directory").await?,
+			&parent_path.0,
+		)?;
 
 		match client
 			.find_item_at_path(&path.0)

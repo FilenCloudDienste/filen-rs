@@ -1,4 +1,4 @@
-use crate::mcp_server::endpoints::Endpoint;
+use crate::mcp_server::endpoints::{Endpoint, support::find_item_or_err};
 use anyhow::{Context, Result};
 use filen_sdk_rs::fs::{
 	HasName as _, HasUUID as _,
@@ -60,13 +60,7 @@ impl Endpoint for Stat {
 		client: &filen_sdk_rs::auth::Client,
 		input: Self::Input,
 	) -> Result<Self::Output> {
-		let Some(item) = client
-			.find_item_at_path(&input.path)
-			.await
-			.context("Failed to find item")?
-		else {
-			return Err(anyhow::anyhow!("No such file or directory: {}", input.path));
-		};
+		let item = find_item_or_err(client, &input.path, "file or directory").await?;
 		match item {
 			NonRootFileType::File(file) => Ok(StatOutput {
 				item_type: ItemType::File,

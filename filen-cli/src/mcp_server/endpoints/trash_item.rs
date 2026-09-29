@@ -1,8 +1,14 @@
-use crate::{mcp_server::endpoints::Endpoint, util::RemotePath};
+use crate::{
+	mcp_server::endpoints::{
+		Endpoint,
+		support::{find_item_or_err, reject_root},
+	},
+	util::RemotePath,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{HasUUID as _, categories::NonRootFileType},
+	fs::{HasUUID as _, categories::NonRootItemType},
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -33,16 +39,11 @@ impl Endpoint for TrashItem {
 		let path = RemotePath::new(&input.path);
 		let permanent = input.permanent.unwrap_or(false);
 
-		let Some(item) = client
-			.find_item_at_path(&path.0)
-			.await
-			.context("Failed to find file or directory")?
-		else {
-			return Err(anyhow::anyhow!("No such file or directory: {}", path.0));
-		};
+		let item = find_item_or_err(client, &path.0, "file or directory").await?;
+		let item = reject_root(item, "Cannot trash or delete the root directory")?;
 
 		let uuid = match item {
-			NonRootFileType::File(file) => {
+			NonRootItemType::File(file) => {
 				let mut file = file.into_owned();
 				let uuid = file.uuid().to_string();
 				if permanent {
@@ -58,7 +59,7 @@ impl Endpoint for TrashItem {
 				}
 				uuid
 			}
-			NonRootFileType::Dir(dir) => {
+			NonRootItemType::Dir(dir) => {
 				let mut dir = dir.into_owned();
 				let uuid = dir.uuid().to_string();
 				if permanent {
@@ -73,9 +74,6 @@ impl Endpoint for TrashItem {
 						.context("Failed to trash directory")?;
 				}
 				uuid
-			}
-			NonRootFileType::Root(_) => {
-				return Err(anyhow::anyhow!("Cannot trash or delete the root directory"));
 			}
 		};
 

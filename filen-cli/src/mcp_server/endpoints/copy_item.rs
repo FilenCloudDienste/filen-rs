@@ -1,11 +1,15 @@
-use crate::{commands::fs_cmds, mcp_server::endpoints::Endpoint, util::RemotePath};
+use crate::{
+	commands::fs_cmds,
+	mcp_server::endpoints::{
+		Endpoint,
+		support::{find_item_or_err, reject_root, require_dir},
+	},
+	util::RemotePath,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
-	fs::{
-		HasName as _, HasUUID as _,
-		categories::{DirType, NonRootFileType},
-	},
+	fs::{HasName as _, HasUUID as _, categories::NonRootItemType},
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -36,41 +40,18 @@ impl Endpoint for CopyItem {
 		let source_path = RemotePath::new(&input.source_path);
 		let destination_path = RemotePath::new(&input.destination_path);
 
-		let Some(source) = client
-			.find_item_at_path(&source_path.0)
-			.await
-			.context("Failed to find source file or directory")?
-		else {
-			return Err(anyhow::anyhow!(
-				"No such source file or directory: {}",
-				source_path.0
-			));
-		};
+		let source = find_item_or_err(client, &source_path.0, "source file or directory").await?;
+		let source = reject_root(source, "Cannot copy root directory")?;
 		let source_name = match &source {
-			NonRootFileType::File(file) => file.name(),
-			NonRootFileType::Dir(dir) => dir.name(),
-			NonRootFileType::Root(_) => return Err(anyhow::anyhow!("Cannot copy root directory")),
+			NonRootItemType::File(file) => file.name(),
+			NonRootItemType::Dir(dir) => dir.name(),
 		}
 		.context("Failed to decrypt source name")?
 		.to_string();
 
-		let Some(destination) = client
-			.find_item_at_path(&destination_path.0)
-			.await
-			.context("Failed to find destination directory")?
-		else {
-			return Err(anyhow::anyhow!(
-				"No such destination directory: {}",
-				destination_path.0
-			));
-		};
-		let destination_dir = match destination {
-			NonRootFileType::Dir(dir) => DirType::Dir(dir),
-			NonRootFileType::Root(root) => DirType::Root(root),
-			NonRootFileType::File(_) => {
-				return Err(anyhow::anyhow!("Not a directory: {}", destination_path.0));
-			}
-		};
+		let destination =
+			find_item_or_err(client, &destination_path.0, "destination directory").await?;
+		let destination_dir = require_dir(destination, &destination_path.0)?;
 
 		let new_path = destination_path.navigate(&source_name);
 		if new_path.0.starts_with(&format!("{}/", source_path.0)) {
@@ -93,21 +74,20 @@ impl Endpoint for CopyItem {
 		}
 
 		let uuid = match source {
-			NonRootFileType::File(file) => {
+			NonRootItemType::File(file) => {
 				fs_cmds::copy_file(client, file.as_ref(), &destination_dir)
 					.await
 					.context("Failed to copy file")?
 					.uuid()
 					.to_string()
 			}
-			NonRootFileType::Dir(dir) => {
+			NonRootItemType::Dir(dir) => {
 				fs_cmds::copy_dir_recursive(client, dir.as_ref(), &destination_dir)
 					.await
 					.context("Failed to copy directory")?
 					.uuid()
 					.to_string()
 			}
-			NonRootFileType::Root(_) => unreachable!("checked above"),
 		};
 
 		Ok(CopyItemOutput {

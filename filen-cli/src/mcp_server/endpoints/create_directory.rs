@@ -1,12 +1,15 @@
 use std::borrow::Cow;
 
-use crate::{mcp_server::endpoints::Endpoint, util::RemotePath};
+use crate::{
+	mcp_server::endpoints::{Endpoint, support::require_dir},
+	util::RemotePath,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasUUID as _,
-		categories::{DirType, NonRootFileType, Normal},
+		categories::{DirType, Normal},
 	},
 	io::RemoteDirectory,
 };
@@ -53,23 +56,16 @@ async fn create_dir_recursive(
 	recursive: bool,
 ) -> Result<RemoteDirectory> {
 	let parent = directory.parent();
-	let parent_dir: DirType<'_, Normal> = match client
+	let existing = client
 		.find_item_at_path(&parent.0)
 		.await
-		.context("Failed to find parent directory")?
-	{
-		Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-		Some(NonRootFileType::Root(root)) => DirType::Root(root),
-		Some(_) => return Err(anyhow::anyhow!("Not a directory: {}", parent.0)),
-		None => {
-			if recursive {
-				DirType::Dir(Cow::Owned(
-					Box::pin(create_dir_recursive(client, &parent, true)).await?,
-				))
-			} else {
-				return Err(anyhow::anyhow!("No such parent directory: {}", parent.0));
-			}
-		}
+		.context("Failed to find parent directory")?;
+	let parent_dir: DirType<'_, Normal> = match existing {
+		Some(item) => require_dir(item, &parent.0)?,
+		None if recursive => DirType::Dir(Cow::Owned(
+			Box::pin(create_dir_recursive(client, &parent, true)).await?,
+		)),
+		None => return Err(anyhow::anyhow!("No such parent directory: {}", parent.0)),
 	};
 	client
 		.create_dir(

@@ -1,10 +1,16 @@
-use crate::{mcp_server::endpoints::Endpoint, util::RemotePath};
+use crate::{
+	mcp_server::endpoints::{
+		Endpoint,
+		support::{find_item_or_err, reject_root, require_dir},
+	},
+	util::RemotePath,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
 	fs::{
 		HasName as _, HasParent as _, HasUUID as _,
-		categories::{DirType, NonRootFileType},
+		categories::{DirType, NonRootFileType, NonRootItemType},
 		dir::meta::DirectoryMetaChanges,
 		file::meta::FileMetaChanges,
 	},
@@ -39,20 +45,11 @@ impl Endpoint for MoveItem {
 		let source_path = RemotePath::new(&input.source_path);
 		let destination_path = RemotePath::new(&input.destination_path);
 
-		let Some(source) = client
-			.find_item_at_path(&source_path.0)
-			.await
-			.context("Failed to find source file or directory")?
-		else {
-			return Err(anyhow::anyhow!(
-				"No such source file or directory: {}",
-				source_path.0
-			));
-		};
+		let source = find_item_or_err(client, &source_path.0, "source file or directory").await?;
+		let source = reject_root(source, "Cannot move root directory")?;
 		let source_filename = match &source {
-			NonRootFileType::File(file) => file.name(),
-			NonRootFileType::Dir(dir) => dir.name(),
-			NonRootFileType::Root(_) => return Err(anyhow::anyhow!("Cannot move root directory")),
+			NonRootItemType::File(file) => file.name(),
+			NonRootItemType::Dir(dir) => dir.name(),
 		}
 		.context("Failed to decrypt source name")?
 		.to_string();
@@ -106,23 +103,10 @@ impl Endpoint for MoveItem {
 					.context("Destination cannot be the root directory")?
 					.to_string();
 				let parent_path = destination_path.parent();
-				let destination_dir = match client
-					.find_item_at_path(&parent_path.0)
-					.await
-					.context("Failed to find destination parent directory")?
-				{
-					Some(NonRootFileType::Dir(dir)) => DirType::Dir(dir),
-					Some(NonRootFileType::Root(root)) => DirType::Root(root),
-					Some(NonRootFileType::File(_)) => {
-						return Err(anyhow::anyhow!("Not a directory: {}", parent_path.0));
-					}
-					None => {
-						return Err(anyhow::anyhow!(
-							"No such destination directory: {}",
-							parent_path.0
-						));
-					}
-				};
+				let destination_dir = require_dir(
+					find_item_or_err(client, &parent_path.0, "destination directory").await?,
+					&parent_path.0,
+				)?;
 				(destination_dir, new_name, destination_path.clone())
 			}
 		};
@@ -137,7 +121,7 @@ impl Endpoint for MoveItem {
 
 		let needs_rename = new_name != source_filename;
 		match source {
-			NonRootFileType::File(file) => {
+			NonRootItemType::File(file) => {
 				let mut file = file.into_owned();
 				if *file.parent() != destination_dir.uuid() {
 					client
@@ -157,7 +141,7 @@ impl Endpoint for MoveItem {
 						.context("Failed to rename file")?;
 				}
 			}
-			NonRootFileType::Dir(dir) => {
+			NonRootItemType::Dir(dir) => {
 				let mut dir = dir.into_owned();
 				if *dir.parent() != destination_dir.uuid() {
 					client
@@ -177,7 +161,6 @@ impl Endpoint for MoveItem {
 						.context("Failed to rename directory")?;
 				}
 			}
-			NonRootFileType::Root(_) => return Err(anyhow::anyhow!("Cannot move root directory")),
 		}
 
 		Ok(MoveItemOutput { path: new_path.0 })

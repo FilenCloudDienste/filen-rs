@@ -1,4 +1,4 @@
-use crate::mcp_server::endpoints::Endpoint;
+use crate::mcp_server::endpoints::{Endpoint, support::find_item_or_err};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	fs::{categories::NonRootFileType, file::traits::HasFileInfo as _},
@@ -42,13 +42,7 @@ impl Endpoint for ReadFile {
 				"Only one of head and tail can be specified"
 			));
 		}
-		let Some(file) = client
-			.find_item_at_path(&input.file_path)
-			.await
-			.context("Failed to find file")?
-		else {
-			return Err(anyhow::anyhow!("No such file: {}", input.file_path));
-		};
+		let file = find_item_or_err(client, &input.file_path, "file").await?;
 		let file = match file {
 			NonRootFileType::File(file) => file,
 			_ => return Err(anyhow::anyhow!("Not a file: {}", input.file_path)),

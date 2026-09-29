@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::mcp_server::endpoints::Endpoint;
+use crate::mcp_server::endpoints::{Endpoint, support::resolve_full_path};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
@@ -45,21 +45,13 @@ impl Endpoint for RestoreTrashItem {
 				.restore_dir(&mut dir)
 				.await
 				.context("Failed to restore directory")?;
-			let (path, _) = client
-				.get_item_path(&NonRootItemType::Dir(Cow::Borrowed(&dir)))
-				.await
-				.context("Failed to resolve restored path")?;
-			format!("/{}", path.trim_end_matches('/'))
+			resolve_full_path(client, &NonRootItemType::Dir(Cow::Borrowed(&dir))).await?
 		} else if let Some(mut file) = files.into_iter().find(|file| file.uuid() == uuid) {
 			client
 				.restore_file(&mut file)
 				.await
 				.context("Failed to restore file")?;
-			let (path, _) = client
-				.get_item_path(&NonRootItemType::File(Cow::Borrowed(&file)))
-				.await
-				.context("Failed to resolve restored path")?;
-			format!("/{}", path.trim_end_matches('/'))
+			resolve_full_path(client, &NonRootItemType::File(Cow::Borrowed(&file))).await?
 		} else {
 			return Err(anyhow::anyhow!("No trashed item with uuid: {}", input.uuid));
 		};

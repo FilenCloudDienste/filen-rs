@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::mcp_server::endpoints::Endpoint;
+use crate::mcp_server::endpoints::{Endpoint, support::resolve_full_path};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
@@ -51,32 +51,27 @@ impl Endpoint for ListPublicLinks {
 
 		let mut items = Vec::with_capacity(dirs.len() + files.len());
 		for dir in &dirs {
-			let (path, _) = client
-				.get_item_path(&NonRootItemType::Dir(Cow::Borrowed(dir)))
-				.await
-				.context("Failed to resolve path")?;
+			let path = resolve_full_path(client, &NonRootItemType::Dir(Cow::Borrowed(dir))).await?;
 			items.push(LinkedItem {
 				uuid: dir.uuid().to_string(),
 				name: dir
 					.name()
 					.map(str::to_string)
 					.unwrap_or_else(|| dir.uuid().to_string()),
-				path: format!("/{}", path.trim_end_matches('/')),
+				path,
 				item_type: LinkedItemType::Directory,
 			});
 		}
 		for file in &files {
-			let (path, _) = client
-				.get_item_path(&NonRootItemType::File(Cow::Borrowed(file)))
-				.await
-				.context("Failed to resolve path")?;
+			let path =
+				resolve_full_path(client, &NonRootItemType::File(Cow::Borrowed(file))).await?;
 			items.push(LinkedItem {
 				uuid: file.uuid().to_string(),
 				name: file
 					.name()
 					.map(str::to_string)
 					.unwrap_or_else(|| file.uuid().to_string()),
-				path: format!("/{}", path.trim_end_matches('/')),
+				path,
 				item_type: LinkedItemType::File,
 			});
 		}

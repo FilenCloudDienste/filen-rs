@@ -1,6 +1,9 @@
-use crate::mcp_server::endpoints::Endpoint;
+use crate::mcp_server::endpoints::{
+	Endpoint,
+	support::{find_item_or_err, require_dir},
+};
 use anyhow::{Context, Result};
-use filen_sdk_rs::fs::categories::{DirType, NonRootFileType, Normal};
+use filen_sdk_rs::fs::categories::Normal;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadDirectoryInput {
@@ -28,21 +31,10 @@ impl Endpoint for ReadDirectory {
 		client: &filen_sdk_rs::auth::Client,
 		input: Self::Input,
 	) -> Result<Self::Output> {
-		let Some(directory) = client
-			.find_item_at_path(&input.directory_path)
-			.await
-			.context("Failed to find parent directory")?
-		else {
-			return Err(anyhow::anyhow!(
-				"No such directory: {}",
-				input.directory_path
-			));
-		};
-		let directory: DirType<'_, Normal> = match directory {
-			NonRootFileType::Dir(dir) => DirType::Dir(dir),
-			NonRootFileType::Root(root) => DirType::Root(root),
-			_ => return Err(anyhow::anyhow!("Not a directory: {}", input.directory_path)),
-		};
+		let directory = require_dir(
+			find_item_or_err(client, &input.directory_path, "directory").await?,
+			&input.directory_path,
+		)?;
 
 		let (dirs, files) = client
 			.list_dir::<_, Normal>(&directory, None::<&fn(u64, Option<u64>)>)

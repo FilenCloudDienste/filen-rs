@@ -17,6 +17,7 @@ mod read_file;
 mod restore_trash_item;
 mod set_public_link;
 mod stat;
+mod support;
 mod trash_item;
 mod write_file;
 
