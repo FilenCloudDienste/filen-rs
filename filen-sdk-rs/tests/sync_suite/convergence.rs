@@ -1,5 +1,5 @@
 //! Non-colliding convergence & ordering tests (`CONVERGE-*`) for the two-way sync engine.
-use std::{borrow::Cow, collections::BTreeSet};
+use std::{borrow::Cow, collections::BTreeSet, sync::Arc, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_types::fs::StableUuid;
@@ -8,7 +8,9 @@ use futures::FutureExt;
 use filen_sdk_rs::fs::HasName;
 use filen_sdk_rs::fs::HasUUID;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
+use filen_sdk_rs::sync::lock::ResourceLock;
 use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1140,8 +1142,27 @@ async fn converge_21_watch_no_self_induced_loop() {
 // ============================================================================
 #[shared_test_runtime]
 async fn converge_22_watch_two_clients_disjoint_converge() {
-	use std::sync::Arc;
 	let tc = two_clients(SyncMode::TwoWay).await;
+	watch_two_clients_disjoint_converge(tc, None).await;
+}
+
+/// CONVERGE-22 with another client holding the drive-write lock while both stacks start, and for a
+/// while after: both caches' first resyncs and both engines' first passes queue behind it and race
+/// for it the moment it frees — what a device sees starting up while another one is mid-sync.
+#[shared_test_runtime]
+async fn converge_22b_watch_two_clients_disjoint_converge_behind_a_held_lock() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let holder = derive_client(&resources.client);
+	let held = holder.lock_drive().await.unwrap();
+	let tc = two_clients_on(resources, SyncMode::TwoWay).await;
+	watch_two_clients_disjoint_converge(tc, Some(held)).await;
+}
+
+/// Watch both clients, write one file on each side, and wait for both trees to hold both. `held`,
+/// if any, is a drive-write lock another client took before either stack started; it is released
+/// once both writes have had long enough to queue behind it.
+async fn watch_two_clients_disjoint_converge(tc: TwoClients, held: Option<Arc<ResourceLock>>) {
+	const HOLD: Duration = Duration::from_secs(20);
 	let TwoClients {
 		resources,
 		cache_a,
@@ -1157,12 +1178,28 @@ async fn converge_22_watch_two_clients_disjoint_converge() {
 	let _ = (&cache_a, &cache_b);
 	let ea = Arc::new(engine_a);
 	let eb = Arc::new(engine_b);
-	let ha = ea.clone().watch(pair_a).await.unwrap();
-	let hb = eb.clone().watch(pair_b).await.unwrap();
+	// One span per side: both engines number their pair 1, so their logs are otherwise the same.
+	let ha = ea
+		.clone()
+		.watch(pair_a)
+		.instrument(tracing::info_span!("engine_a"))
+		.await
+		.unwrap();
+	let hb = eb
+		.clone()
+		.watch(pair_b)
+		.instrument(tracing::info_span!("engine_b"))
+		.await
+		.unwrap();
 
 	// Near-simultaneous disjoint creates.
 	write_file(&local_a, "wa.txt", b"a");
 	write_file(&local_b, "wb.txt", b"b");
+
+	if let Some(held) = held {
+		tokio::time::sleep(HOLD).await;
+		drop(held);
+	}
 
 	// Wait for both trees to converge to the union.
 	let mut converged = false;
@@ -1181,7 +1218,8 @@ async fn converge_22_watch_two_clients_disjoint_converge() {
 	}
 	assert!(
 		converged,
-		"watch-mode two-client disjoint creates did not converge"
+		"watch-mode two-client disjoint creates did not converge\n{}",
+		describe_watches(&[("A", &ha, &local_a), ("B", &hb, &local_b)])
 	);
 	let _ = &resources;
 

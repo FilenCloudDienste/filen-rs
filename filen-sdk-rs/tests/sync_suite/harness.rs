@@ -16,7 +16,7 @@ use std::{
 };
 
 use filen_sdk_rs::fs::HasUUID;
-use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport};
+use filen_sdk_rs::sync_engine::{SyncEngine, SyncMode, SyncReport, WatchHandle};
 use uuid::Uuid;
 
 use crate::helpers::*;
@@ -147,6 +147,23 @@ pub fn assert_trees_identical(a: &Path, b: &Path, label_a: &str, label_b: &str) 
 	assert_eq!(ta.len(), tb.len(), "tree sizes differ");
 }
 
+/// Each watched side's health and local tree, for a watch test's failure message. A watch that
+/// stops syncing says nothing on its own: its loop runs on a runtime worker, whose log output the
+/// test harness does not capture.
+pub fn describe_watches(sides: &[(&str, &WatchHandle, &Path)]) -> String {
+	sides
+		.iter()
+		.map(|(label, handle, local)| {
+			format!(
+				"side {label}: {:?}; local tree {:?}",
+				*handle.status().borrow(),
+				walk_tree(local).keys().collect::<Vec<_>>()
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
+
 /// A single-client sync setup: one engine on its own derived cache, a fresh local dir, and a fresh
 /// auto-cleaned remote dir already converged into the cache.
 pub struct SingleClient {
@@ -268,7 +285,12 @@ impl TwoClients {
 
 /// Build two clients on one shared remote dir, both in `mode`.
 pub async fn two_clients(mode: SyncMode) -> TwoClients {
-	let resources = test_utils::RESOURCES.get_resources().await;
+	two_clients_on(test_utils::RESOURCES.get_resources().await, mode).await
+}
+
+/// [`two_clients`] on a remote dir the caller already made — for a test that has to do something
+/// between creating the dir and starting either stack.
+pub async fn two_clients_on(resources: test_utils::TestResources, mode: SyncMode) -> TwoClients {
 	let remote: Uuid = resources.dir.uuid();
 	let cache_a = TestCache::new(&resources.client, remote).await;
 	let cache_b = TestCache::new(&resources.client, remote).await;
