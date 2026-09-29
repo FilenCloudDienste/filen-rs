@@ -627,6 +627,21 @@ impl<T: FromRow> SideRef<'_, T> {
 		}
 	}
 
+	/// What [`NodesAt::at`] answers at `row`'s path, for a caller holding `row` as this side's
+	/// baseline hands it out there: the carried half is derived from the row in hand rather than
+	/// read again. `row` must be the baseline's row at its path in the view this side reads — a
+	/// row of any other view answers for rows the pass does not have.
+	pub(super) fn at_row(&self, row: &BaselineEntry) -> Option<Cow<'_, T>> {
+		match self.side {
+			Side::Whole(map) => map.get(&row.rel_path).map(Cow::Borrowed),
+			Side::Carried(overlay) => match overlay.get(&row.rel_path) {
+				Some(Some(node)) => Some(Cow::Borrowed(node)),
+				Some(None) => None,
+				None => T::from_row(row).map(Cow::Owned),
+			},
+		}
+	}
+
 	/// The candidates for [`Nodes::under`]: the subtree rather than the tree, so a carried side
 	/// answers a directory question in the size of the directory.
 	fn entries_under(&self, dir: &str) -> Entries<'_, T> {

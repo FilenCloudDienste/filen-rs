@@ -609,9 +609,10 @@ fn observation_callback(
 	})
 }
 
-/// Read what the cache's announcements say about every unconfirmed push in `baseline`: the version
-/// uuids they confirm, and the rows (`rel_path`, ours, the foreign version at the path) they say
-/// nothing about that are worth asking the server about.
+/// Read what the cache's announcements say about every unconfirmed push in `unconfirmed` — the rows
+/// [`Baseline::unconfirmed`] hands out, read once by the caller: the version uuids they confirm, and
+/// the rows (`rel_path`, ours, the foreign version at the path) they say nothing about that are
+/// worth asking the server about.
 ///
 /// Purely a READ of the observations. The records it consulted stay put, because the caller may be
 /// a dry run: [`SyncEngine::plan_pair`] reaches this through `prepare` and persists nothing, and a
@@ -620,14 +621,14 @@ fn observation_callback(
 /// ([`Observations::forget_pushes`]).
 fn observed_confirmations(
 	observed: &Observations,
-	baseline: &Baseline,
+	unconfirmed: &[BaselineEntry],
 	raw_remote: &impl NodesAt<Node = RemoteNode>,
 	now: Instant,
 ) -> (std::collections::HashSet<Uuid>, Vec<(String, Uuid, Uuid)>) {
 	let mut confirmed = std::collections::HashSet::new();
 	// rel_path is only for the log; the lookup runs on the foreign version sitting at it.
 	let mut ask_server = Vec::new();
-	for entry in baseline.unconfirmed() {
+	for entry in unconfirmed {
 		let rel_path = &entry.rel_path;
 		let Some(ours) = entry.remote_uuid else {
 			continue;
@@ -2987,10 +2988,11 @@ impl SyncEngine {
 	async fn confirm_pushes(
 		&self,
 		baseline: &mut Baseline,
+		unconfirmed: &[BaselineEntry],
 		raw_remote: &impl NodesAt<Node = RemoteNode>,
 	) -> Vec<BaselineEntry> {
 		let (mut confirmed, ask_server) =
-			observed_confirmations(&self.observed, baseline, raw_remote, Instant::now());
+			observed_confirmations(&self.observed, unconfirmed, raw_remote, Instant::now());
 
 		// The foreign versions this dates our pushes against, read whole in one go.
 		let foreign = self
@@ -3124,7 +3126,10 @@ impl SyncEngine {
 		if !baseline.any_unconfirmed() {
 			return Ok(());
 		}
-		let advanced = self.confirm_pushes(&mut baseline, &HashMap::new()).await;
+		let unconfirmed: Vec<BaselineEntry> = baseline.unconfirmed().collect();
+		let advanced = self
+			.confirm_pushes(&mut baseline, &unconfirmed, &HashMap::new())
+			.await;
 		if advanced.is_empty() {
 			return Ok(());
 		}
@@ -3553,20 +3558,22 @@ impl SyncEngine {
 			// from those very rows, so it cannot be read across the confirmation's writes. Only
 			// the unconfirmed rows' own paths are looked up — `observed_confirmations` asks about
 			// no other — so this is the per-push work the confirmation already was, never the tree.
+			// Read once for both: each is a seek into the table per row off a partial index, and
+			// the carried view's node at a row's path is that very row's.
+			let unconfirmed: Vec<BaselineEntry> = inputs.baseline.unconfirmed().collect();
 			let at_unconfirmed: HashMap<String, RemoteNode> = {
 				let nodes = view.nodes.of(&inputs.baseline);
-				inputs
-					.baseline
-					.unconfirmed()
+				unconfirmed
+					.iter()
 					.filter_map(|row| {
 						nodes
-							.at(&row.rel_path)
+							.at_row(row)
 							.map(|node| (row.rel_path.clone(), node.into_owned()))
 					})
 					.collect()
 			};
 			confirmed = self
-				.confirm_pushes(&mut inputs.baseline, &at_unconfirmed)
+				.confirm_pushes(&mut inputs.baseline, &unconfirmed, &at_unconfirmed)
 				.await;
 		}
 		super::step("confirm_pushes");
@@ -3784,7 +3791,9 @@ impl SyncEngine {
 			let no_rows = Baseline::default();
 			let raw = view.nodes.of(&no_rows);
 			confirmed = plan::confirm_agreed_content(&mut baseline, &raw);
-			confirmed.extend(self.confirm_pushes(&mut baseline, &raw).await);
+			// Read after the confirmation above, whose edits take rows out of the set.
+			let unconfirmed: Vec<BaselineEntry> = baseline.unconfirmed().collect();
+			confirmed.extend(self.confirm_pushes(&mut baseline, &unconfirmed, &raw).await);
 		}
 		let baseline = baseline;
 
@@ -10659,8 +10668,8 @@ mod tests {
 		let baseline = written_row(uuid, hash(1));
 		let ripe = Instant::now() + past_window();
 
-		let read =
-			|| observed_confirmations(&observations, &tree(&baseline), &HashMap::new(), ripe).0;
+		let unconfirmed: Vec<BaselineEntry> = tree(&baseline).unconfirmed().collect();
+		let read = || observed_confirmations(&observations, &unconfirmed, &HashMap::new(), ripe).0;
 		assert_eq!(read(), std::collections::HashSet::from([uuid]));
 		assert_eq!(
 			read(),
