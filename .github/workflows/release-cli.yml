@@ -234,6 +234,11 @@ jobs:
       - name: Generate markdown docs
         run: cargo run -- --export-markdown-docs exit
         working-directory: ./filen-cli
+        env:
+          # This job doesn't install Wild, so undo .cargo/config.toml's clang+Wild for the
+          # native x86_64-unknown-linux-gnu build (RUSTFLAGS replaces the config's rustflags).
+          RUSTFLAGS: -Zhigher-ranked-assumptions
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
       - name: Zip markdown docs
         run: |
           mkdir -p filen-cli-markdown-docs
