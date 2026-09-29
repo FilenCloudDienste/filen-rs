@@ -141,11 +141,16 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
 			.add_directive("html5ever=info".parse().expect("valid directive"))
 			.add_directive("selectors=info".parse().expect("valid directive"));
 		// `try_init` so this coexists with any subscriber the SDK installs; `with_test_writer`
-		// routes output through cargo test's capture.
-		let _ = tracing_subscriber::fmt()
-			.with_env_filter(filter)
-			.with_test_writer()
-			.try_init();
+		// routes output through cargo test's capture. That capture is per thread and inherited at
+		// spawn, so the runtime's workers keep the buffer of whichever test built this runtime, and
+		// whatever a spawned task logs in any later test (a sync engine's watch loop, say) is lost.
+		// `FILEN_TEST_LOG_STDERR` writes everything straight to stderr instead, uncaptured.
+		let fmt = tracing_subscriber::fmt().with_env_filter(filter);
+		let _ = if env::var_os("FILEN_TEST_LOG_STDERR").is_some() {
+			fmt.with_writer(std::io::stderr).try_init()
+		} else {
+			fmt.with_test_writer().try_init()
+		};
 		tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
 			.build()
