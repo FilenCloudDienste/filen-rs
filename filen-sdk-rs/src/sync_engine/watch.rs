@@ -41,6 +41,7 @@ use std::{
 
 use notify::{EventHandler, RecursiveMode, Watcher};
 use tokio::{sync::Notify, time::Instant};
+use tracing::Instrument;
 
 use super::{
 	SyncEvent, SyncObserver, SyncReport,
@@ -360,9 +361,14 @@ impl SyncEngine {
 		// Subscribed before the loop starts, so a change made while it sets itself up is still
 		// pending for its first wait rather than lost.
 		let rules = self.user_ignore_changes();
-		let loop_done = tokio::spawn(run_loop(
-			engine, pair, config, dirty, rules, stop, observer, status_tx,
-		));
+		// In the caller's span: every pass the loop runs logs `pair N`, and pair ids are per engine
+		// database, so two engines in one process are otherwise indistinguishable in the log.
+		let loop_done = tokio::spawn(
+			run_loop(
+				engine, pair, config, dirty, rules, stop, observer, status_tx,
+			)
+			.in_current_span(),
+		);
 
 		Ok(WatchHandle {
 			shutdown: shutdown_tx,
