@@ -19,6 +19,7 @@ mod set_public_link;
 mod stat;
 mod support;
 mod trash_item;
+mod who_am_i;
 mod write_file;
 
 pub trait Endpoint {
@@ -105,5 +106,6 @@ pub fn all_endpoints() -> Vec<Box<dyn AnyEndpoint>> {
 		Box::new(get_public_link::GetPublicLink),
 		Box::new(set_public_link::SetPublicLink),
 		Box::new(delete_public_link::DeletePublicLink),
+		Box::new(who_am_i::WhoAmI),
 	]
 }
