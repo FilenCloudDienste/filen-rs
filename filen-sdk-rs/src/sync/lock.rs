@@ -309,6 +309,44 @@ fn keep_lock_alive(lock: &Arc<ResourceLock>, acquired_at: Instant) {
 	crate::runtime::spawn_local(run_keep_alive(Arc::downgrade(lock), acquired_at));
 }
 
+/// Send one Acquire for `uuid` and return the server's answer — from a task of its own, so a caller
+/// that stops waiting (a `select!` that moved on, a dropped future) does not cut the request short.
+/// A request cut short can still be granted server-side, and a lease nobody knows of holds the
+/// resource for every client until it expires. Whoever sees the answer decides what happens to it:
+/// the caller, if it is still waiting, and otherwise the task, which releases what was granted.
+/// Only the task can do that safely — a release sent the moment the caller gave up can reach the
+/// server before the grant does, and then releases nothing.
+async fn request_acquire(
+	client: Arc<AuthClient>,
+	body: Bytes,
+	url: Arc<str>,
+	uuid: Uuid,
+	resource: Arc<str>,
+) -> Result<api::v3::user::lock::Response<'static>, Error> {
+	let (answer, answered) = tokio::sync::oneshot::channel();
+	// Detached, not cancelled: `drop` here is this module's lock release, hence the full path.
+	std::mem::drop(crate::runtime::spawn_task_maybe_send(async move {
+		let response = client
+			.post_raw_bytes_auth::<api::v3::user::lock::Response<'static>>(
+				body,
+				&url,
+				api::v3::user::lock::ENDPOINT.into(),
+			)
+			.await;
+		if let Err(Ok(response)) = answer.send(response)
+			&& response.acquired
+		{
+			actually_drop(&client, uuid, &resource).await;
+		}
+	}));
+	answered.await.unwrap_or_else(|_| {
+		Err(Error::custom(
+			ErrorKind::Internal,
+			"the lock request's task ended without an answer",
+		))
+	})
+}
+
 fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 	std::iter::successors(
 		Some((
@@ -343,20 +381,22 @@ impl Client {
 			r#type: LockType::Acquire,
 			resource: Cow::Borrowed(&resource),
 		})?);
-		let url = gateway_url(api::v3::user::lock::ENDPOINT);
-		let endpoint = api::v3::user::lock::ENDPOINT;
+		// Shared with each attempt's request task, which can outlive this call (see
+		// `request_acquire`).
+		let url: Arc<str> = gateway_url(api::v3::user::lock::ENDPOINT).into();
+		let shared_resource: Arc<str> = resource.as_str().into();
 		for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
 			// The server's lease clock starts when it processes this request, no
 			// earlier than now — the refresh schedule is anchored to the send time.
 			let attempt_started = Instant::now();
-			let resp = self
-				.arc_client()
-				.post_raw_bytes_auth::<api::v3::user::lock::Response>(
-					bytes.clone(),
-					&url,
-					endpoint.into(),
-				)
-				.await?;
+			let resp = request_acquire(
+				self.arc_client(),
+				bytes.clone(),
+				Arc::clone(&url),
+				uuid,
+				Arc::clone(&shared_resource),
+			)
+			.await?;
 
 			if !resp.acquired {
 				debug!(
