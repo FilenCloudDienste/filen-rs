@@ -17,7 +17,9 @@ use crate::cache::{CacheState, sql::columns::ITEMS_UUID};
 
 impl CacheState {
 	/// The upward ancestor chain of `uuid` — the seed itself plus every ancestor up to (and including)
-	/// the account root — by walking `items.parent`. Empty if `uuid` is not cached. Cycle-safe.
+	/// the account root — by walking `items.parent`, plus the parent the walk stopped at when that
+	/// one is not cached (a sync root whose first listing has not committed yet). Empty if `uuid` is
+	/// not cached. Cycle-safe.
 	pub(crate) fn ancestors_of(&self, uuid: Uuid) -> rusqlite::Result<Vec<Uuid>> {
 		let mut stmt = self
 			.db
@@ -213,6 +215,30 @@ mod tests {
 		assert!(
 			state
 				.in_any_sync_root(Uuid::from_u128(9), &account_roots)
+				.unwrap()
+		);
+	}
+
+	/// A sync root whose own node is not cached yet (its first listing has not committed) still owns
+	/// what events put under it: the membership gate admits them by the root's key, and dispatch has
+	/// to find the same owner or the event is applied and announced to nobody.
+	#[test]
+	fn a_root_not_cached_yet_still_owns_what_is_under_it() {
+		let mut state = CacheState::new_in_memory();
+		let unlisted_root = Uuid::from_u128(1);
+		let child = dir(2, unlisted_root);
+		let grandchild = dir(3, child.uuid);
+		state
+			.upsert_dirs([&child, &grandchild].into_iter())
+			.unwrap();
+
+		assert_eq!(
+			state.owning_sync_roots(child.uuid, &roots(&[1])).unwrap(),
+			vec![unlisted_root]
+		);
+		assert!(
+			state
+				.in_any_sync_root(grandchild.uuid, &roots(&[1]))
 				.unwrap()
 		);
 	}

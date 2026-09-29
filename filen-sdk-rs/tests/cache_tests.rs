@@ -1359,7 +1359,8 @@ async fn test_add_sync_root_rejects_invalid_uuid() {
 /// lock, a worker whose resync cannot acquire it must still apply socket events between its
 /// bounded attempts (under the old unbounded acquisition the worker parked inside the island
 /// until the lock was won, freezing event application for the whole contention window), and the
-/// resync itself must converge via the retry timer once the lock frees up.
+/// resync itself must converge via the retry timer once the lock frees up. An event applied in that
+/// window must reach the root's registration.
 #[shared_test_runtime]
 async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	// ISOLATION: this is the ONLY cache test that holds the account-wide drive lock for an
@@ -1399,14 +1400,24 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	// `Finished`. (The contended attempts in between report `converged: false` and never match.)
 	let since = messages_len(&messages2);
 
+	// What the root's registration is told. The events below land while the root's first listing
+	// is still waiting for the lock, so its own node is not cached yet — and an event applied then
+	// must still reach the root that admitted it: the listing that commits later finds the item
+	// already cached and announces nothing.
+	let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+	let recording = || -> SyncRootCallback {
+		let seen = seen.clone();
+		Box::new(move |events: &mut dyn Iterator<Item = &CacheEvent<'_>>| {
+			seen.lock()
+				.unwrap()
+				.extend(events.map(|event| format!("{:?}", event.event)));
+		})
+	};
+
 	// Validation (`get_dir`, no lock involved) can hit fresh-dir propagation lag — retry.
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 	let _handle2 = loop {
-		match client2
-			.clone()
-			.add_sync_root(sub_uuid, noop_sync_root_callback())
-			.await
-		{
+		match client2.clone().add_sync_root(sub_uuid, recording()).await {
 			Ok(handle) => break handle,
 			Err(e) if tokio::time::Instant::now() < deadline => {
 				eprintln!("add_sync_root({sub_uuid}) not accepted yet ({e}); retrying");
@@ -1446,6 +1457,17 @@ async fn test_cache_applies_events_while_drive_lock_is_contended() {
 	assert!(
 		poll_for_item(&path2, file_uuid, Duration::from_secs(45)).await,
 		"socket events must keep applying while the drive lock is contended"
+	);
+	let file_key = file_uuid.to_string();
+	assert!(
+		poll_until(Duration::from_secs(5), || {
+			seen.lock()
+				.unwrap()
+				.iter()
+				.any(|event| event.contains(&file_key))
+		})
+		.await,
+		"an event applied before the root's first listing commits is announced to the root"
 	);
 
 	// CONVERGENCE: once the lock frees up, the patient acquisition (or the next retry) wins it and
