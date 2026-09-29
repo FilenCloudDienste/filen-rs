@@ -306,8 +306,7 @@ async fn write_rclone_config(
 		"".to_string()
 	};
 
-	fs::write(&rclone_config_path, rclone_config_content)
-		.await
+	write_private_file(&rclone_config_path, &rclone_config_content)
 		.context("Failed to write Rclone config file")?;
 	debug!(
 		"Wrote Rclone config file at {}",
@@ -342,3 +341,28 @@ fn get_available_disk_space(path: &Path) -> Result<u64> {
 			)
 		})
 }
+
+/// Write `contents` to `path`, creating or truncating it with owner-only permissions
+/// (mode `0o600` on Unix). The auth config holds the master keys, private key and API key,
+/// so it must never be left group- or world-readable for other users on the machine.
+fn write_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+	use std::io::Write;
+
+	let mut options = std::fs::OpenOptions::new();
+	options.write(true).create(true).truncate(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600);
+	}
+	let mut file = options.open(path)?;
+	// A pre-existing file keeps its previous mode through create+truncate, so tighten it
+	// explicitly while it is still empty, before any secret bytes are written.
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+	}
+	file.write_all(contents.as_bytes())
+}
+// copied from filen-cli/src/auth.rs
