@@ -125,8 +125,9 @@ misquoting these replace came from names that did not:
   it can exceed a resident set, because capacity is allocated without necessarily
   being faulted in. The BASELINE terms (`mem:pair_baseline_term_handle` /
   `_edits_computed_bytes`) are the snapshot handle — a pooled reader connection,
-  its pair, its counts and the pages its questions last read, 272 bytes — and the
-  pass's own edits over the table:
+  its pair and its counts, 272 bytes, not counting the pages its questions last
+  read (up to 1,024 rows each, dropped with the pass) — and the pass's own edits
+  over the table:
   its folded directory moves and confirmed pushes, or the rows frozen for its
   apply. Between passes the pair is the handle and nothing else, at every size;
   the store holds no rows in memory. A run asserts that the pass's figure is at
@@ -139,7 +140,9 @@ misquoting these replace came from names that did not:
   pass asked the store for its rows, counted in the snapshot: statements run and
   rows decoded. Three statements and no rows for an idle pass, eight for one changed
   file; a scoped pass that decides many paths asks about them in path order and
-  reads them a page at a time, about one and a half statements per changed path.
+  reads them a page at a time, so the count follows how the paths cluster:
+  `twoway_one_percent_100k` runs 1,322 statements for its 982 changed paths,
+  `twoway_top_dir_move_100k`, whose moved directory holds half the pair, 1,768.
   `pass_view` is zero for every scenario whose remote changelist is empty, which is
   every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
   it was not told about. Zero is an answer, which is why that column is printed in
