@@ -5,7 +5,7 @@
 	"type": "module",
 	"scripts": {
 		"build": "vite build -c vite.sw.config.ts",
-		"test": "npm run build && vitest run --browser.name=chromium && vitest run --browser.name=firefox",
+		"test": "npm run build && { vitest run --browser.name=chromium; chromium=$?; vitest run --browser.name=firefox && exit $chromium; }",
 		"ubrn:ios": "ubrn build ios --and-generate",
 		"ubrn:android": "ubrn build android --and-generate",
 		"ubrn:android:arm": "ubrn build android --and-generate -t arm64-v8a",

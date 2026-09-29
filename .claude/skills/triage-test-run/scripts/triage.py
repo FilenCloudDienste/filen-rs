@@ -621,7 +621,8 @@ def cmd_failures(args):
                       f"{info['total_ms'] // 1000}s total, finished {hhmm(info['finished_at'])}")
             for b in ("chromium", "firefox"):
                 if b not in leg["browsers"] and leg["short"] == "wasm":
-                    print(f"   vitest {b}: NOT RUN (the npm script chains browsers with &&; a failure earlier skips it)")
+                    print(f"   vitest {b}: NOT RUN (the build failed or the step died first; on runs whose npm "
+                          f"script chains the browsers with &&, a chromium failure also skips firefox)")
     print(f"\n== suggested clusters (mechanical: same test, or shared panic site / message head) -> "
           f"{d / 'clusters.json'}{clusters_note}")
     for c in data["suggested_clusters"]:

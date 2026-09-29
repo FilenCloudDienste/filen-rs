@@ -49,10 +49,11 @@ gh run list --repo FilenCloudDienste/filen-rs --workflow test.yml --commit <sha>
 "Last night" = the most recent completed scheduled `Tests` run (they start ~00:40 UTC and take up
 to 4 h 30 m; a run still `in_progress` has partial logs — say so and wait or triage the finished
 legs). A run id or URL from the user wins. `Tests` = 6 native legs (`test (os, V1|V2)`: three OSes ×
-two accounts, V1 and V2, plus one share account) + `test-wasm` (chromium then firefox, `&&`-chained)
-+ `test-2fa (V1|V2)` after the matrix. `Continuous Integration` = clippy / fmt / unit tests per OS +
-wasm; its failures are usually step errors (a clippy `error:`, a rustfmt `Diff in`), which the script
-turns into `STEP` failure records and clusters like tests, so the rest of the procedure is the same.
+two accounts, V1 and V2, plus one share account) + `test-wasm` (chromium then firefox, one after
+the other; firefox runs even when chromium fails) + `test-2fa (V1|V2)` after the matrix.
+`Continuous Integration` = clippy / fmt / unit tests per OS + wasm; its failures are usually step
+errors (a clippy `error:`, a rustfmt `Diff in`), which the script turns into `STEP` failure records
+and clusters like tests, so the rest of the procedure is the same.
 
 ## 2. Fetch and parse
 
@@ -78,7 +79,9 @@ Read the leg table first. What a line means:
   `process didn't exit successfully` line as the message.
 - `STEP` records = a CI leg's step errors (clippy, rustfmt `Diff in`, `##[error]`) turned into failure
   records, clustered like tests; `step=` in the leg header names the red step.
-- wasm: a chromium failure means firefox never ran — `failures` prints `NOT RUN` for it.
+- wasm: `NOT RUN` for a browser = it never started: the build failed, or the step was cancelled or
+  killed first. On older runs whose npm test script still chains the browsers with `&&` (the
+  step's `> npm run build && …` log line shows which), a chromium failure also skips firefox.
 - `image=` is the runner image; a difference between two legs of the same OS is a discriminator
   (image rollouts are gradual).
 - `WARNING … binary reports N failed, parsed M` = a test name the parser did not match; read that
