@@ -1230,6 +1230,18 @@ mod tests {
 				"{where_}: occupied({path:?})"
 			);
 		}
+		// A caller holding the baseline's row asks with it instead of its path, and must be told
+		// the same.
+		for row in baseline.iter() {
+			for (name, side) in [("whole", &w), ("carried", &c)] {
+				assert_eq!(
+					side.at_row(&row).map(Cow::into_owned),
+					side.at(&row.rel_path).map(Cow::into_owned),
+					"{where_}: {name}.at_row({:?})",
+					row.rel_path
+				);
+			}
+		}
 		for (dir, _) in PATHS.iter().filter(|(_, is_dir)| *is_dir) {
 			let mut under_w: Vec<String> =
 				w.under(dir).map(|(path, _)| path.into_owned()).collect();
