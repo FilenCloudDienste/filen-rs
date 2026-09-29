@@ -1258,7 +1258,7 @@ fn preview_only_without_an_embedded_thumbnail_refuses_instead_of_decoding() {
 /// be generated here — the vendored libheif is decode-only and `image` has no
 /// AV1 encoder — so this reads the committed browser fixture rather than
 /// inventing a binary. It is what proves the `avif` brand claimed in
-/// `formats/heif.rs` reaches a decoder that actually answers.
+/// `formats/heif/mod.rs` reaches a decoder that actually answers.
 #[cfg(feature = "heif")]
 #[test]
 fn avif_thumbnails_through_the_heif_path() {
@@ -1360,7 +1360,7 @@ fn transformed_grids_place_their_tiles_where_the_whole_frame_decode_does() {
 /// A HEIF decode is priced by its bit depth and chroma format, on top of a
 /// fixed setup cost and the compressed input it holds: the same 64x48-tile
 /// grid fits a budget in 8-bit 4:2:0, and in 10-bit 4:2:0, that it does not
-/// fit in 10-bit 4:2:2. The rates are mirrored from `formats/heif.rs` (1 MiB
+/// fit in 10-bit 4:2:2. The rates are mirrored from `formats/heif/mod.rs` (1 MiB
 /// of setup; 20 B/px past 8 bits at 4:2:2 or 4:4:4, 12 B/px otherwise; the
 /// file once plus twice a tile's share of it) rather than read, so that a
 /// test of the charge cannot pass whatever the charge is.
@@ -1443,7 +1443,7 @@ const CAMERA_JPEG_COLOURS: &[(&str, [u8; 3])] = &[
 /// image — whose charge includes the compressed input libheif holds — they
 /// would refuse the embedded thumbnail of a large file at a small budget, so
 /// each decode gets its own. The budget here covers the thumbnail's own charge
-/// (1 MiB of setup and 20 B/px, mirrored from `formats/heif.rs`) with a
+/// (1 MiB of setup and 20 B/px, mirrored from `formats/heif/mod.rs`) with a
 /// kilobyte to spare, and no more: take the grid's input charge out of it as
 /// well and the thumbnail no longer fits. Its 160x106 is coded as 160x112 —
 /// HEVC rounds the height up to whole 8-row coding blocks — and the coded size

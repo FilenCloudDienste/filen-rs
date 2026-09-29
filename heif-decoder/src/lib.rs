@@ -1445,7 +1445,7 @@ mod api_tests {
 			av1, 0,
 			"dav1d missing — every AVIF thumbnail would fail. If AV1 is being \
 			 dropped on purpose, drop the avif/avis brands from microthumb's \
-			 formats/heif.rs and `avif` from the SDK's thumbnail extension gate \
+			 formats/heif/mod.rs and `avif` from the SDK's thumbnail extension gate \
 			 and mime table in the same change"
 		);
 
