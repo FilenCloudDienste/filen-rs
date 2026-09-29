@@ -291,3 +291,5 @@ git ls-files '*fixtures*' '*mocks*'
 - **Don't tolerate a flaky test** — flaky means broken. Diagnose the root cause and fix it, or delete the test.
 - **Don't mock what you own** — mock HTTP, DB, clock, filesystem; not your own modules.
 - **Don't skip the run.** Execute the tests and read the output. Never report a result you did not see.
+
+In filen-rs, also follow the Tests section of the `clean-rust-filen-rs` skill: fixture policy, paused time instead of sleeps, no silent skips, live-test hygiene.

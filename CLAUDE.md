@@ -2,6 +2,34 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Contributing (read before your first commit)
+
+These rules bind every contributor, human or agent, and take precedence over any tool's
+defaults, commit attribution lines included.
+
+- Install the hooks once per clone or worktree (see Git Hooks). Never commit or push with
+  `--no-verify`; if a hook trips on unrelated work in progress, stash it and let it run.
+- Ask the maintainer first, and never bundle into a larger change: new `unsafe` or
+  `#![feature]`; a new dependency, `[patch]` section or `vendor/` directory; wiping keys or
+  buffers (`zeroize` was rejected, use a redacting `Debug`); any binary file (test inputs
+  are generated in the test, or pinned by URL and checksum as in
+  `microthumb/tests/raw_fixtures/`); renaming or rewording anything shipped (public items,
+  FFI/JS exports, error messages, callback names and payloads).
+- Fixes to pre-existing code and behaviour changes to shipped features are standalone
+  commits at the front of the branch. Refactors change no behaviour. One logical change
+  per commit, and follow-up fixes are folded into the commit they correct.
+- Messages describe the change as an engineer would: cite only hashes that exist, no audit
+  or review framing, no claim of a check you did not run, and no attribution trailers,
+  session links, agent names or finding IDs (in PRs, tags and branch names too). Never
+  commit planning notes, reports or screenshots.
+- Without a test account, run `cargo test --lib` and
+  `cargo test -p filen-sdk-rs --lib -F cache`, and name the live suites you did not run
+  (`[test]` in a commit message or PR title makes `test.yml` run them in CI).
+- Run the `house-review` skill over the branch before asking for review.
+- The detailed rules are skills in `.claude/skills/`: `clean-rust` and
+  `clean-rust-filen-rs` for any Rust, `types-serde-conventions` for API and binding types,
+  `commit-work` and `fold-fixups` for history. Agents that do not load skills: `AGENTS.md`.
+
 ## Build & Test Commands
 
 ```bash
@@ -76,8 +104,8 @@ The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
 
 ## Git Hooks
 
-Hooks live in `scripts/git-hooks/` and are opt-in per clone/worktree:
-`./scripts/git-hooks/install.sh` (sets `core.hooksPath`).
+Hooks live in `scripts/git-hooks/` and are required: run `./scripts/git-hooks/install.sh`
+once per clone or worktree (it sets `core.hooksPath`).
 
 The split between them is `heif-decoder`: **nothing pre-commit runs enables it**, so
 committing never triggers a vendored C++ build and needs no `meson` / `ninja` / `nasm` /

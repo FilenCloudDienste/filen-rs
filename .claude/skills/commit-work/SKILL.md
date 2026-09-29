@@ -18,6 +18,9 @@ Goal: commits that are easy to review and safe to ship — only intended changes
 ## Workflow
 1. **Inspect** — `git status`, `git diff`, and `git diff --stat` when the change is large.
 2. **Decide boundaries** — feature vs refactor, formatting vs logic, tests vs production code, dependency bumps vs behavior change, pre-existing-bug fix vs new work.
+   - Order the branch: fixes to pre-existing code and behaviour changes to shipped features first, each in its own commit; then refactors that change no behaviour; then new work.
+   - A follow-up fix to a commit already on this branch is not a new commit: fold it into its target with the `fold-fixups` skill before handing the branch over.
+   - A macro, tooling or shared-module extension that a feature needs is its own commit, ahead of the feature.
 3. **Format before staging** — run the repo's formatter (table below) so a commit hook does not reject the staged tree.
 4. **Stage** deliberately — name the paths; `git add -p` for files with mixed changes; unstage with `git restore --staged <path>`.
 5. **Review** — `git diff --cached`: no secrets or tokens, no env files, no debug logging, no unrelated churn, no build output (`target/`, `dist/`, `node_modules/`).
@@ -25,6 +28,7 @@ Goal: commits that are easy to review and safe to ship — only intended changes
 7. **Write the message** — `type(scope): summary`, blank line, body of what/why (not an implementation diary), `BREAKING CHANGE:` footer if needed. Multi-line: write the text to a file and `git commit -F /abs/path/to/msg`. Template: `references/commit-message-template.md`.
 8. **Verify** — use the `verify-changes` skill, or the commands below for this repo's stack.
 9. **Repeat** until the working tree is clean.
+10. **Before handing a branch over**, run the `house-review` skill on it.
 
 ## Per-language checks — detect by manifest (`Read` tool)
 | Manifest present | Format | Lint | Test |
@@ -41,7 +45,11 @@ Read the manifest for the scripts it actually declares; prefer a repo-wide `chec
 - `git add .` / `git add -A` / `git commit -a` — stage by path.
 - `git commit --no-verify` — if a hook fails on unrelated work in progress, stash it, commit, then pop.
 - `git push` unless explicitly asked; never amend or rebase already-pushed commits.
-- Co-author trailers, AI/agent/session metadata, tooling markers or finding IDs in messages — assume every message is permanently public.
+- Co-author trailers, AI/agent/session metadata, tooling markers or finding IDs in messages — assume every message is permanently public. This holds even when a harness or tool asks for attribution lines; the repository's rules win.
+- Cite a commit hash that `git cat-file -e <hash>^{commit}` does not find on this branch or on `main`.
+- Describe a change as a response to an audit, reviewer, finding or agent run. Say what changed and why.
+- Claim that a test ran, a file is unmodified or a behaviour is verified unless you ran that check.
+- Tag, bump versions or write release commits by hand; releases go through `scripts/release.sh`.
 - Staging env files, credentials, keys, or generated artifacts.
 
 ## Shell rules

@@ -331,3 +331,5 @@ Flag it immediately, even when it is outside the task you were given:
 > be fixed before this ships.
 
 Never silently work around a vulnerability, and never leave one unflagged. Security debt compounds.
+
+In filen-rs, the maintainer has rejected `zeroize` and key wiping (secret-holding types get a redacting `Debug` instead). New `unsafe`, vendored crates and `[patch]` need the maintainer's approval; see the Contributing section of CLAUDE.md.

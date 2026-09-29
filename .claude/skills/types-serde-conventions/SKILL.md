@@ -65,6 +65,10 @@ hand-written `Serialize` impl in `shared/out_root.rs`) are skipped.
 Key invariant: `no_ser` suppresses only the serde derive, **not** `tsify(into_wasm_abi, …)`.
 That is what makes the pattern below work.
 
+Never hand-write `Tsify` or uniffi derives for a binding type, and derive serde yourself
+only in the externally-managed pattern below. If `#[js_type]` cannot express what you need,
+extend it in `filen-macros` in its own commit, ahead of the change that uses it.
+
 ### Externally managed serde
 
 When a type needs `Serialize`/`Deserialize` on **all** platforms, not just WASM, derive them
