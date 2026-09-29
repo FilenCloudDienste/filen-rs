@@ -3,7 +3,22 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
+mod copy_item;
+mod create_directory;
+mod delete_public_link;
+mod get_public_link;
+mod list_public_links;
+mod list_trash;
+mod move_item;
+mod public_link_expiration;
 mod read_directory;
+mod read_directory_recursive;
+mod read_file;
+mod restore_trash_item;
+mod set_public_link;
+mod stat;
+mod trash_item;
+mod write_file;
 
 pub trait Endpoint {
 	type Input: serde::Serialize + serde::de::DeserializeOwned + schemars::JsonSchema;
@@ -73,5 +88,21 @@ impl<T: Endpoint + Send + Sync> AnyEndpoint for T {
 }
 
 pub fn all_endpoints() -> Vec<Box<dyn AnyEndpoint>> {
-	vec![Box::new(read_directory::ReadDirectory)]
+	vec![
+		Box::new(read_directory::ReadDirectory),
+		Box::new(read_directory_recursive::ReadDirectoryRecursive),
+		Box::new(read_file::ReadFile),
+		Box::new(stat::Stat),
+		Box::new(create_directory::CreateDirectory),
+		Box::new(write_file::WriteFile),
+		Box::new(move_item::MoveItem),
+		Box::new(copy_item::CopyItem),
+		Box::new(trash_item::TrashItem),
+		Box::new(list_trash::ListTrash),
+		Box::new(restore_trash_item::RestoreTrashItem),
+		Box::new(list_public_links::ListPublicLinks),
+		Box::new(get_public_link::GetPublicLink),
+		Box::new(set_public_link::SetPublicLink),
+		Box::new(delete_public_link::DeletePublicLink),
+	]
 }

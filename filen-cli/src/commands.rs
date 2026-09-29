@@ -13,7 +13,7 @@ use crate::{
 	util::RemotePath,
 };
 
-mod fs_cmds;
+pub(crate) mod fs_cmds;
 mod notes_cmds;
 mod public_links_cmds;
 mod rclone_cmds;
