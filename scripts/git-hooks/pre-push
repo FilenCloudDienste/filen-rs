@@ -12,7 +12,9 @@
 #   brew llvm (macOS)     wasm32 C objects for the cache's bundled SQLite
 #   WASI_SDK_PATH         wasm32 C++ sysroot; only the wasm heif-decoder pass
 #
-# To bypass in an emergency: git push --no-verify
+# It also refuses to push unfolded fixup!/squash!/amend! commits (see the
+# fold-fixups skill). These checks are required (see CLAUDE.md, Contributing);
+# the variables below are the scoped ways to skip one.
 #
 # Env vars:
 #   SKIP_HEAVY_CLIPPY=1   build no vendored C++ at all: skips the heif-decoder
@@ -36,6 +38,29 @@ yellow=$'\033[33m'
 bold=$'\033[1m'
 reset=$'\033[0m'
 
+# git passes one "<local ref> <local sha> <remote ref> <remote sha>" line per ref.
+# Only the commits this push adds are checked: from the remote tip when the branch
+# exists there, otherwise from where the branch leaves origin/main.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+	case $local_sha in *[!0]*) ;; *) continue ;; esac # deleting a remote branch
+	case $remote_sha in
+	*[!0]*) git cat-file -e "$remote_sha^{commit}" 2>/dev/null && base=$remote_sha ||
+		base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+	*) base=$(git merge-base "$local_sha" origin/main 2>/dev/null) ;;
+	esac
+	if [ -z "$base" ]; then
+		printf '%spre-push: no origin/main to compare against, not checking for unfolded fixups%s\n' \
+			"$yellow" "$reset"
+		continue
+	fi
+	fixups=$(git log --format='%h %s' "$base..$local_sha" | grep -E '^[0-9a-f]+ (fixup|squash|amend)!')
+	if [ -n "$fixups" ]; then
+		printf '%spre-push: unfolded fix-up commits; fold them into their targets first (fold-fixups skill):%s\n%s\n' \
+			"$red$bold" "$reset" "$fixups"
+		exit 1
+	fi
+done
+
 run() {
 	local name=$1
 	shift
@@ -44,7 +69,7 @@ run() {
 		printf '%s    ok%s\n' "$green" "$reset"
 	else
 		printf '%s    failed: %s%s\n' "$red" "$name" "$reset"
-		printf '\n%spre-push failed.%s Fix the issue above, or run with --no-verify to bypass.\n' \
+		printf '\n%spre-push failed.%s Fix the issue above and push again.\n' \
 			"$red$bold" "$reset"
 		exit 1
 	fi
@@ -75,8 +100,7 @@ if [ -f filen-sdk-rs/Cargo.toml ] && [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ] &&
 	printf '  %sexport WASI_SDK_PATH=~/wasi-sdk%s   (put it in your shell profile)\n' "$bold" "$reset"
 	printf 'Pick the asset matching your host from %shttps://github.com/WebAssembly/wasi-sdk/releases%s.\n' \
 		"$bold" "$reset"
-	printf 'Or skip these passes with %s, or bypass with %s.\n' \
-		"SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+	printf 'Or skip these passes with %s.\n' "SKIP_HEAVY_CLIPPY=1"
 	exit 1
 fi
 
@@ -99,8 +123,8 @@ if [ "${SKIP_HEAVY_CLIPPY:-0}" != "1" ]; then
 	if [ -n "$missing" ]; then
 		printf '%smissing build tools for the vendored dav1d build:%s%s\n' \
 			"$red$bold" "$missing" "$reset"
-		printf 'Install them (macOS: %sbrew install%s%s; Debian/Ubuntu: apt-get, Windows: choco), skip these passes with %s, or bypass with %s.\n' \
-			"$bold" "$reset" "$missing" "SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+		printf 'Install them (macOS: %sbrew install%s%s; Debian/Ubuntu: apt-get, Windows: choco), or skip these passes with %s.\n' \
+			"$bold" "$reset" "$missing" "SKIP_HEAVY_CLIPPY=1"
 		exit 1
 	fi
 	run "cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto -- -D warnings" \
@@ -158,8 +182,8 @@ if [ -f filen-sdk-rs/Cargo.toml ]; then
 		if [ "$(uname -s)" = "Darwin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/clang ]; then
 			printf '%sbrew llvm not found — cannot run the WASM clippy CI runs (-F wasm-full,cache,heif-decoder).%s\n' \
 				"$red$bold" "$reset"
-			printf 'Install it with %sbrew install llvm%s, skip these passes with %s, or bypass with %s.\n' \
-				"$bold" "$reset" "SKIP_HEAVY_CLIPPY=1" "git push --no-verify"
+			printf 'Install it with %sbrew install llvm%s, or skip these passes with %s.\n' \
+				"$bold" "$reset" "SKIP_HEAVY_CLIPPY=1"
 			exit 1
 		fi
 		# Scoped to this one command: CI runs the service-worker pass without

@@ -14,9 +14,9 @@ hooks_rel=$(realpath --relative-to="$repo_root" "$script_dir" 2>/dev/null \
 		"$script_dir" "$repo_root")
 
 cd "$repo_root"
-chmod +x "$script_dir"/pre-commit "$script_dir"/pre-push
+chmod +x "$script_dir"/pre-commit "$script_dir"/commit-msg "$script_dir"/pre-push
 git config core.hooksPath "$hooks_rel"
 
 printf 'Installed: git core.hooksPath -> %s\n' "$hooks_rel"
-printf 'Hooks active: pre-commit, pre-push\n'
-printf 'Bypass with --no-verify when needed.\n'
+printf 'Hooks active: pre-commit, commit-msg, pre-push\n'
+printf 'These hooks are required; do not bypass them with --no-verify (see CLAUDE.md).\n'

@@ -2,7 +2,8 @@
 # Fast checks that run before every commit.
 # Mirrors a subset of .github/workflows/ci.yml — see pre-push for the heavier checks.
 #
-# To bypass in an emergency: git commit --no-verify
+# These checks are required (see CLAUDE.md, Contributing). A tool they need that is
+# missing stops the commit with an install message instead of skipping the check.
 
 set -u
 set -o pipefail
@@ -12,7 +13,6 @@ cd "$repo_root"
 
 red=$'\033[31m'
 green=$'\033[32m'
-yellow=$'\033[33m'
 bold=$'\033[1m'
 reset=$'\033[0m'
 
@@ -24,7 +24,7 @@ run() {
 		printf '%s    ok%s\n' "$green" "$reset"
 	else
 		printf '%s    failed: %s%s\n' "$red" "$name" "$reset"
-		printf '\n%spre-commit failed.%s Fix the issue above, or run with --no-verify to bypass.\n' \
+		printf '\n%spre-commit failed.%s Fix the issue above and commit again.\n' \
 			"$red$bold" "$reset"
 		exit 1
 	fi
@@ -41,7 +41,8 @@ if have cargo; then
 			bash -c 'cd filen-sdk-rs && cargo fmt -- --check'
 	fi
 else
-	printf '%scargo not found, skipping rustfmt%s\n' "$yellow" "$reset"
+	printf '%scargo not found — cannot run pre-commit checks%s\n' "$red" "$reset"
+	exit 1
 fi
 
 # Taplo — TOML lint + format.
@@ -49,23 +50,23 @@ if have taplo; then
 	run "taplo lint" env RUST_LOG=error taplo lint
 	run "taplo fmt --check" env RUST_LOG=error taplo fmt --check
 else
-	printf '%staplo not installed, skipping (install: cargo install taplo-cli)%s\n' \
-		"$yellow" "$reset"
+	printf '%staplo not installed; the TOML checks cannot run.%s\n' "$red$bold" "$reset"
+	printf 'Install it with %scargo install taplo-cli --version 0.10.0 --locked%s.\n' "$bold" "$reset"
+	exit 1
 fi
 
-# sqlfluff — only on staged SQL files for speed.
-if have sqlfluff; then
-	staged_sql=$(git diff --cached --name-only --diff-filter=ACM -z \
-		| tr '\0' '\n' | grep -E '\.sql$' || true)
-	if [ -n "$staged_sql" ]; then
-		# shellcheck disable=SC2086
-		run "sqlfluff lint (staged)" bash -c 'sqlfluff lint "$@"' _ $staged_sql
-	else
-		printf '%s==>%s sqlfluff: no staged .sql files\n' "$bold" "$reset"
-	fi
+# sqlfluff — only on staged SQL files for speed, so it is only needed when there are some.
+staged_sql=$(git diff --cached --name-only --diff-filter=ACM -z \
+	| tr '\0' '\n' | grep -E '\.sql$' || true)
+if [ -z "$staged_sql" ]; then
+	printf '%s==>%s sqlfluff: no staged .sql files\n' "$bold" "$reset"
+elif have sqlfluff; then
+	# shellcheck disable=SC2086
+	run "sqlfluff lint (staged)" bash -c 'sqlfluff lint "$@"' _ $staged_sql
 else
-	printf '%ssqlfluff not installed, skipping (install: pip install sqlfluff)%s\n' \
-		"$yellow" "$reset"
+	printf '%ssqlfluff not installed; the staged .sql files cannot be linted.%s\n' "$red$bold" "$reset"
+	printf 'Install it with %spip install sqlfluff%s.\n' "$bold" "$reset"
+	exit 1
 fi
 
 # Default clippy config — the cheapest of the four CI clippy invocations.
@@ -101,8 +102,7 @@ if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
 		if [ "$(uname -s)" = "Darwin" ] && [ ! -x /opt/homebrew/opt/llvm/bin/clang ]; then
 			printf '%sbrew llvm not found — cannot run the WASM clippy pass (-F wasm-full,cache).%s\n' \
 				"$red$bold" "$reset"
-			printf 'Install it with %sbrew install llvm%s, or bypass with %s.\n' \
-				"$bold" "$reset" "--no-verify"
+			printf 'Install it with %sbrew install llvm%s.\n' "$bold" "$reset"
 			exit 1
 		fi
 		# Scoped to this one command: the service-worker pass runs without them,
@@ -119,9 +119,10 @@ if have cargo && [ -f filen-sdk-rs/Cargo.toml ]; then
 		run "cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker (filen-sdk-rs)" \
 			bash -c 'cd filen-sdk-rs && RUSTFLAGS="-C target-feature=-nontrapping-fptoint,+bulk-memory --cfg getrandom_backend=\"wasm_js\"" cargo clippy --target wasm32-unknown-unknown --no-default-features -F service-worker -- -D warnings'
 	else
-		printf '%swasm32-unknown-unknown target not installed, skipping WASM clippy%s\n' \
-			"$yellow" "$reset"
-		printf '%s    install: rustup target add wasm32-unknown-unknown%s\n' "$yellow" "$reset"
+		printf '%swasm32-unknown-unknown target not installed; the WASM clippy passes cannot run.%s\n' \
+			"$red$bold" "$reset"
+		printf 'Install it with %srustup target add wasm32-unknown-unknown%s.\n' "$bold" "$reset"
+		exit 1
 	fi
 fi
 

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Checks every commit message before the commit is made. Commit messages are
+# public and permanent, so this rejects:
+#   - attribution trailers (indented or spaced ones too), generated-by lines
+#     and the robot emoji, and session links;
+#   - review finding IDs (F042 and the like), and audit or review framing
+#     ("per the audit", "the auditor", "review findings", "what review found");
+#   - commit hashes that do not exist in this repository. Cite another
+#     repository's commit as <repo>@<sha>, which is not checked.
+#
+# fixup!/squash!/amend! subjects are allowed here so the fold-fixups flow works;
+# pre-push refuses to push them unfolded.
+
+set -u
+
+red=$'\033[31m'
+bold=$'\033[1m'
+reset=$'\033[0m'
+
+# git strips comment lines after this hook runs, so ignore them here.
+body=$(grep -v '^#' "$1")
+
+fail() {
+	printf '%scommit-msg: %s%s\n' "$red$bold" "$1" "$reset"
+	[ -n "${2:-}" ] && printf '%s\n' "$2"
+	exit 1
+}
+
+if hits=$(printf '%s\n' "$body" | grep -inE '^[[:space:]]*co-authored-by[[:space:]]*:'); then
+	fail 'no Co-Authored-By trailers' "$hits"
+fi
+
+if hits=$(printf '%s\n' "$body" | grep -nE 'Generated with \[?Claude|noreply@anthropic\.com|Claude-Session:|claude\.ai/code|🤖'); then
+	fail 'no generated-by lines or session links' "$hits"
+fi
+
+if hits=$(printf '%s\n' "$body" | grep -nE '(^|[^[:alnum:]_])F[0-9]{3}([^[:alnum:]_]|$)'); then
+	fail 'no review finding IDs; say what the change does instead' "$hits"
+fi
+
+if hits=$(printf '%s\n' "$body" |
+	grep -inE '(^|[^[:alnum:]_])(auditors?|audit[[:space:]]+(findings?|follow-?ups?)|per[[:space:]]+the[[:space:]]+audits?|review[[:space:]]+(findings?|found))([^[:alnum:]_]|$)'); then
+	fail 'no audit or review framing; say what the change does instead' "$hits"
+fi
+
+# Candidate hashes: 7-40 lowercase hex characters with at least one digit and one
+# letter, so words ("decade", "facade") and plain numbers are not mistaken for
+# hashes. URLs, UUIDs and <repo>@<sha> citations are removed first.
+missing=
+for tok in $(printf '%s\n' "$body" |
+	sed -E -e 's#https?://[^[:space:]]+##g' \
+		-e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}//g' \
+		-e 's/[A-Za-z0-9_.-]+@[0-9a-f]{7,40}//g' |
+	grep -oEw '[0-9a-f]{7,40}' | grep '[0-9]' | grep '[a-f]' | sort -u); do
+	git cat-file -e "$tok^{commit}" 2>/dev/null || missing="$missing $tok"
+done
+if [ -n "$missing" ]; then
+	fail 'cited commit hashes that do not exist in this repository:' "$missing
+Cite a commit that exists here, or another repository's commit as <repo>@<sha>."
+fi

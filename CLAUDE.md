@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 These rules bind every contributor, human or agent, and take precedence over any tool's
 defaults, commit attribution lines included.
 
-- Install the hooks once per clone or worktree (see Git Hooks). Never commit or push with
-  `--no-verify`; if a hook trips on unrelated work in progress, stash it and let it run.
+- The hooks are required (see Git Hooks); agent sessions install them on start. Never
+  commit or push with `--no-verify`; if a hook trips on unrelated work in progress, stash
+  it and let it run.
 - Ask the maintainer first, and never bundle into a larger change: new `unsafe` or
   `#![feature]`; a new dependency, `[patch]` section or `vendor/` directory; wiping keys or
   buffers (`zeroize` was rejected, use a redacting `Debug`); any binary file (test inputs
@@ -104,8 +105,10 @@ The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
 
 ## Git Hooks
 
-Hooks live in `scripts/git-hooks/` and are required: run `./scripts/git-hooks/install.sh`
-once per clone or worktree (it sets `core.hooksPath`).
+Hooks live in `scripts/git-hooks/` and are required. Claude Code sessions install them
+automatically (`.claude/hooks/SessionStart.sh`, which also lists any tools the hooks need that
+are missing); otherwise run `./scripts/git-hooks/install.sh` once per clone or worktree (it
+sets `core.hooksPath`).
 
 The split between them is `heif-decoder`: **nothing pre-commit runs enables it**, so
 committing never triggers a vendored C++ build and needs no `meson` / `ninja` / `nasm` /
@@ -117,11 +120,18 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
   cache by running those clippy invocations first, or the commit may be killed by a tool/CI
-  timeout mid-hook. Missing `taplo` / `sqlfluff` / the wasm32 target are skipped with a
-  warning; missing brew LLVM on macOS is a hard failure, since the `cache` wasm pass cannot
-  run without it and quietly dropping the feature would report ok on a configuration nobody
-  ships.
-- **pre-push** — heavier: the `heif-decoder` feature-combination clippy, `clippy --tests`,
+  timeout mid-hook. A missing tool stops the commit with an install message instead of
+  skipping its check: `taplo`, the wasm32 target, brew LLVM on macOS (the `cache` wasm pass
+  cannot run without it, and dropping the feature would report ok on a configuration nobody
+  ships), and `sqlfluff` when `.sql` files are staged.
+- **commit-msg** — rejects `Co-Authored-By` trailers (in any case, indented or spaced),
+  generated-by lines and the robot emoji, session links, review finding IDs (`F042`), audit
+  or review framing (`auditor`, `audit finding`, `audit follow-up`, `per the audit`,
+  `review finding`, `review found`), and cited commit hashes that do not exist in this
+  repository; cite another repository's commit as `<repo>@<sha>`.
+  `fixup!`/`squash!`/`amend!` subjects pass, so the `fold-fixups` flow works.
+- **pre-push** — first refuses to push unfolded `fixup!`/`squash!`/`amend!` commits. Then
+  the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests`,
   both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
   and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
   ships), full `sqlfluff lint .`, and `cargo test --lib --no-fail-fast`. This is the hook

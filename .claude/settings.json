@@ -11,7 +11,19 @@
 			"Bash(grep * .env*)"
 		]
 	},
+	"attribution": { "commit": "", "pr": "" },
+	"includeCoAuthoredBy": false,
 	"hooks": {
+		"SessionStart": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/SessionStart.sh\""
+					}
+				]
+			}
+		],
 		"UserPromptSubmit": [
 			{
 				"hooks": [
