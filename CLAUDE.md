@@ -49,9 +49,9 @@ Test notes:
   and avoid running several test binaries in one parallel pool — contention starves the
   convergence polls and tests start failing.
 - `dir_tests::size` sleeps ~80 minutes waiting out the backend's throttled size
-  recomputation, and on `main` it is a normal test — exclude it from sweeps with
-  `--skip size` unless you specifically mean to exercise the size endpoint. (Some branches
-  carry an `#[ignore]` for it; there, run it with `--ignored` instead.)
+  recomputation, so it is `#[ignore]`d. Run it explicitly with
+  `cargo test -p filen-sdk-rs --test dir_tests size -- --ignored` when you mean to exercise
+  the size endpoint.
 - `filen-mobile-native-cache` is a UniFFI crate; build/test it with
   `cargo build -p filen-mobile-native-cache`.
 
@@ -217,7 +217,10 @@ The `Client` dispatches to the correct version at runtime via `AuthInfo` enum.
 - **WASM** (`target_family = "wasm"`) — uses `wasm-bindgen`, `web-sys` WebSocket, `wasm-bindgen-rayon`
 - **UniFFI** (`feature = "uniffi"`) — generates FFI scaffolding for mobile; used by `filen-mobile-native-cache`
 
-The `filen-sdk-rs/web/` directory contains a Node/Yarn project for WASM testing (see `wasm-test.sh`).
+The `filen-sdk-rs/web/` directory contains the npm project for the browser WASM tests
+(`web/main.test.ts`). Build the bindings with `bash wasm-pack.sh` run from `filen-sdk-rs/`
+(the script uses relative paths and needs `WASI_SDK_PATH`), then run
+`npm --prefix filen-sdk-rs/web test`.
 
 ### Mobile Consumers
 

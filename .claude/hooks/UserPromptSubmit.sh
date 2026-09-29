@@ -24,11 +24,11 @@ The evaluation (Step 1) is WORTHLESS unless you ACTIVATE (Step 2) the skills.
 
 Example of correct sequence:
 - research: NO - not a research task
-- typescript-react-performance: YES - need to optimize a TS function
+- clean-rust-filen-rs: YES - writing Rust in this repository
 - code-style: YES - need to follow specific code style guidelines
 
 [Then IMMEDIATELY use Skill() tool:]
-> Skill(typescript-react-performance)
+> Skill(clean-rust-filen-rs)
 > Skill(code-style)
 
 [THEN and ONLY THEN start implementation]
