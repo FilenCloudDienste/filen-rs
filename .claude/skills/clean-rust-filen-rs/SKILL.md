@@ -161,7 +161,8 @@ Fixing any of these is its own commit, offered before it is made.
 ## House rules the maintainer enforces in review
 
 Every rule below was a review correction on a real branch. Apply them while writing, then
-walk the checklist at the end before handing work over.
+walk the checklist at the end before handing work over. The `house-review` skill runs the
+same rules over a finished branch.
 
 ### Reuse before writing
 
