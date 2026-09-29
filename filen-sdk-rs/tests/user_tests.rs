@@ -1,5 +1,6 @@
 use std::{
 	io::Cursor,
+	panic::AssertUnwindSafe,
 	sync::Arc,
 	time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use filen_sdk_rs::{
 	user::events::{DecryptedUserEvent, DecryptedUserEventKind},
 };
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
+use futures::FutureExt;
 use rand::Rng;
 
 fn file_meta_name<'a>(meta: &'a FileMeta<'_>) -> Option<&'a str> {
@@ -878,16 +880,42 @@ async fn set_nickname_round_trip() {
 	use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 
 	let client = test_utils::RESOURCES.client().await;
+	// The server joins the account nickname live into every note and chat participant it
+	// lists, so rotating it mid-flight breaks the whole-`Note` / whole-`Chat` equality asserts
+	// of the note and chat tests on a sibling CI leg (note_tests::note_content_editing raced
+	// exactly this on the 2026-09-26 nightly). Hold both of their locks across the whole
+	// round trip, which also keeps two concurrent runs of this test from restoring each
+	// other's nickname. `test:chats` comes first: contact, chats, notes is the order every
+	// test that holds more than one of them keeps.
+	let _chats_lock = client
+		.acquire_lock_with_default(test_utils::locks::CHATS)
+		.await
+		.unwrap();
+	let _notes_lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
 	let original = client.get_user_info().await.unwrap().nick_name;
 
 	let suffix: [u8; 6] = rand::random();
 	let new_nick = format!("test-nick-{}", BASE64_URL_SAFE_NO_PAD.encode(suffix));
 
-	client.set_nickname(Some(new_nick.clone())).await.unwrap();
-	let after = client.get_user_info().await.unwrap().nick_name;
-	assert_eq!(after, Some(new_nick), "nickname should be updated");
+	let result = AssertUnwindSafe(async {
+		client.set_nickname(Some(new_nick.clone())).await.unwrap();
+		let after = client.get_user_info().await.unwrap().nick_name;
+		assert_eq!(after, Some(new_nick), "nickname should be updated");
+	})
+	.catch_unwind()
+	.await;
 
-	client.set_nickname(original.clone()).await.unwrap();
+	// Restore even if the body panicked: a leaked test nickname stays on the shared account,
+	// and in every note and chat participant, until something resets it.
+	let restore = client.set_nickname(original.clone()).await;
+
+	if let Err(panic) = result {
+		std::panic::resume_unwind(panic);
+	}
+	restore.unwrap();
 	let restored = client.get_user_info().await.unwrap().nick_name;
 	assert_eq!(restored, original, "nickname should be restored");
 }
@@ -911,8 +939,6 @@ async fn get_gdpr_info_returns_user_data() {
 async fn update_personal_info_round_trip() {
 	use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 	use filen_sdk_rs::user::UpdatePersonalInfo;
-	use futures::FutureExt;
-	use std::panic::AssertUnwindSafe;
 
 	let client = test_utils::RESOURCES.client().await;
 	let _lock = client
