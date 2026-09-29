@@ -9,7 +9,7 @@ For now, syncing, drive mounting, etc. are available through the managed Rclone,
 > [!WARNING]
 > **Public Beta:**
 > This is the Rust rewrite of [`FilenCloudDienste/filen-cli`](https://github.com/FilenCloudDienste/filen-cli), which has been [sunsetted](https://github.com/FilenCloudDienste/filen-cli?tab=readme-ov-file#sunsetting-filen-cli).
-> While it aims to fully replace it, it is currently in open beta: Some functionality is still missing, and *there might be bugs*. 
+> While it aims to fully replace it, it is currently in open beta: Some functionality might still be missing, and _there might be bugs_.
 
 > [!NOTE]
 > Please **report bugs** on our [issues page at `filen-rs`](https://github.com/FilenCloudDienste/filen-rs/issues?q=label%3Acli)! \
@@ -17,12 +17,13 @@ For now, syncing, drive mounting, etc. are available through the managed Rclone,
 
 ## Installation and updates
 
-💻 **Linux** and **macOS**: 
+💻 **Linux** and **macOS**:
+
 ```bash
 curl -sL https://raw.githubusercontent.com/FilenCloudDienste/filen-rs/refs/heads/main/filen-cli/install.sh | bash
 ```
 
-💻 **Windows**: Download the latest binaries from the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases/latest). 
+💻 **Windows**: Download the latest binaries from the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases/latest).
 
 🐋 Docker images are also available as [`filen/cli`](https://hub.docker.com/r/filen/cli/tags) (you need to specify a version instead of using `:latest`).
 
