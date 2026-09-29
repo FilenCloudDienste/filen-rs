@@ -1,0 +1,15 @@
+# Changes to the contribution rules and the checks that enforce them, to dependencies and the
+# toolchain, to crypto, and to committed test fixtures need the maintainer's review
+# (see CLAUDE.md, Contributing).
+
+/CLAUDE.md @Enduriel
+/AGENTS.md @Enduriel
+/.claude/ @Enduriel
+/.github/ @Enduriel
+/scripts/ @Enduriel
+/.cargo/ @Enduriel
+/rust-toolchain.toml @Enduriel
+Cargo.toml @Enduriel
+Cargo.lock @Enduriel
+/filen-sdk-rs/src/crypto/ @Enduriel
+**/tests/*fixtures/ @Enduriel

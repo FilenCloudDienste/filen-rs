@@ -15,7 +15,13 @@ defaults, commit attribution lines included.
   buffers (`zeroize` was rejected, use a redacting `Debug`); any binary file (test inputs
   are generated in the test, or pinned by URL and checksum as in
   `microthumb/tests/raw_fixtures/`); renaming or rewording anything shipped (public items,
-  FFI/JS exports, error messages, callback names and payloads).
+  FFI/JS exports, error messages, callback names and payloads). The diff policy (see Git
+  Hooks) blocks, on commit and in CI, added or changed `unsafe`, `[patch]`, `[replace]` or
+  `[source]` sections, `vendor/`, git dependencies not pinned to a full `rev` or not under
+  the maintainer's GitHub accounts, `zeroize`, and binary files that no `README.md` or
+  `generate.sh` in their directory names. A new crates.io dependency is only listed, as a
+  new `Cargo.lock` package, and `#![feature]` and renamed or reworded shipped items are
+  left to review.
 - Fixes to pre-existing code and behaviour changes to shipped features are standalone
   commits at the front of the branch. Refactors change no behaviour. One logical change
   per commit, and follow-up fixes are folded into the commit they correct.
@@ -123,7 +129,18 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   timeout mid-hook. A missing tool stops the commit with an install message instead of
   skipping its check: `taplo`, the wasm32 target, brew LLVM on macOS (the `cache` wasm pass
   cannot run without it, and dropping the feature would report ok on a configuration nobody
-  ships), and `sqlfluff` when `.sql` files are staged.
+  ships), and `sqlfluff` when `.sql` files are staged. It also runs
+  `scripts/check-diff-policy.sh` on the staged changes, which blocks what needs the
+  maintainer's approval (see Contributing): `[patch]`/`[replace]`/`[source]` sections,
+  `vendor/`, git dependencies not pinned to a full `rev` or not in a repository under
+  `github.com/Enduriel` or `github.com/FilenCloudDienste`, `zeroize`, added or changed
+  `unsafe` code, and binary files, added or changed, whose name no `generate.sh` or
+  `README.md` in the same directory mentions. It also lists, without blocking, new
+  `Cargo.lock` packages and new majors of existing ones (`sha2 0.11`), each to be justified
+  in the PR, and every added `#[allow]`/`#[expect]` line, each of which needs a comment
+  naming its tradeoff. Commit an approved change with `SKIP_DIFF_POLICY=1`;
+  nothing else is a reason to set it. Branch Lint still reports it, in its last step, so the
+  PR shows what was approved.
 - **commit-msg** — rejects `Co-Authored-By` trailers (in any case, indented or spaced),
   generated-by lines and the robot emoji, session links, review finding IDs (`F042`), audit
   or review framing (`auditor`, `audit finding`, `audit follow-up`, `per the audit`,
@@ -143,7 +160,12 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally lints with
 `filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache`, and
-cross-compiles for Android, iOS and Windows — none of which the hooks attempt.
+cross-compiles for Android, iOS and Windows — none of which the hooks attempt. `ci.yml`
+runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
+pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the fast checks
+a branch that skipped the hooks would miss: the diff policy and commit-message checks
+against the pull request's target branch (`origin/main` for a push), unfolded fix-ups,
+`cargo fmt`, `taplo`, and the `-p filen-sdk-rs -F uniffi,http-provider` clippy pass.
 
 The auto-formatter some editors/agents run on save does **not** match this repo's nightly
 `cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before

@@ -1,0 +1,91 @@
+name: Branch Lint
+# Fast checks on every push to a feature branch and on every pull request into main or dev
+# (from a fork too), so a change that skipped the git hooks is caught before review: commit
+# messages, formatting, one clippy pass and the diff policy.
+# ci.yml runs the full matrix on main, dev and pull requests into them.
+on:
+  push:
+    branches-ignore:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+jobs:
+  branch-lint:
+    runs-on: ubuntu-latest
+    name: Branch lint
+    env:
+      # What the checks compare against: the pull request's target branch, or main for a
+      # branch push. Not pull_request.base.sha, which can lag the base the merge commit
+      # below was built on and would pull the target's newer commits into the checks.
+      BASE: origin/${{ github.base_ref || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff policy and the commit-message checks compare against $BASE, and the
+          # message check looks up every commit hash a message cites. On a pull request this
+          # checks out the merge into the target branch; its merge commit is skipped below.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-ci-linux-latest
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: 'false'
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+      - name: Install Wild linker
+        # Must run before the first cargo invocation: .cargo/config.toml routes every native
+        # linux-gnu link through Wild, and even clippy links build scripts.
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          # On a cache miss the action cargo-installs from the repo checkout, where the same
+          # config applies — building Wild would need Wild. Env vars beat config.toml, so
+          # restore the stock linker just for this bootstrap build.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Install TOML linter
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: taplo-cli@0.10.0
+      - name: Check commit messages
+        run: |
+          status=0
+          for c in $(git rev-list --no-merges "$BASE"..HEAD); do
+            git log -1 --format=%B "$c" > "$RUNNER_TEMP/msg"
+            if ! bash scripts/git-hooks/commit-msg "$RUNNER_TEMP/msg"; then
+              echo "in $(git log -1 --format='%h %s' "$c")"
+              status=1
+            fi
+          done
+          fixups=$(git log --format='%h %s' "$BASE"..HEAD | grep -E '^[0-9a-f]+ (fixup|squash|amend)!' || true)
+          if [ -n "$fixups" ]; then
+            echo "unfolded fix-up commits; fold them into their targets first (fold-fixups skill):"
+            echo "$fixups"
+            status=1
+          fi
+          exit $status
+      - name: Run rustfmt
+        run: cargo fmt --all -- --check
+      - name: Run TOML linter and formatter
+        run: |
+          taplo lint
+          taplo fmt --check
+      # Package-scoped, so neither heif-decoder nor its vendored C++ is built.
+      - name: Run clippy (filen-sdk-rs, UniFFI)
+        run: cargo clippy -p filen-sdk-rs -F uniffi,http-provider --all-targets -- -D warnings
+      # Last, and whatever failed above: a change the maintainer approved (committed with
+      # SKIP_DIFF_POLICY=1) keeps this step red, and must not hide the checks before it.
+      - name: Check the diff policy
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-diff-policy.sh "$BASE"...HEAD

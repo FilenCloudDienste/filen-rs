@@ -36,30 +36,31 @@ git config core.hooksPath                 # expect: scripts/git-hooks
 # Stray files: planning notes, screenshots, scratch output. Read the list.
 git diff --name-only --diff-filter=A $BASE HEAD | cat
 
-# Binary files (numstat prints "-" for them). Each needs the maintainer's sign-off.
-git diff --numstat $BASE HEAD | awk '$1 == "-"'
+# Diff policy: [patch]/vendor, git dependencies unpinned or outside the maintainer's
+# accounts, zeroize, unsafe, and binary files that no README.md or generate.sh beside
+# them names; each needs the maintainer's sign-off. It also lists new Cargo.lock packages
+# and majors, each named with its reason in the PR description, and every added
+# #[allow]/#[expect] line: read each one; one without a comment naming its tradeoff is a
+# finding. The same script runs in pre-commit and in CI.
+bash scripts/check-diff-policy.sh $BASE..HEAD
 
 # Dependencies: every added line is a new dependency or feature and needs sign-off.
 git diff $BASE HEAD -- '*Cargo.toml' | grep -E '^\+[^+]'
 
-# Policy words in added lines: unsafe, key wiping, vendored or patched crates.
-git diff -U0 $BASE HEAD -- '*.rs' '*.toml' | grep -nE '^\+.*(unsafe|zeroize|\[patch|vendor/)'
-
 # Review and agent markers in added lines.
 git diff -U0 $BASE HEAD | grep -nE '^\+.*(ponytail:|TODO\(agent|F[0-9]{3}[^0-9]|[Aa]udit (note|finding))'
 
-# Commit messages: no attribution, session links or finding IDs.
-git log --format='%h%n%B' $BASE..HEAD \
-	| grep -nE 'Co-Authored-By|Generated with|noreply@anthropic|claude\.ai|Claude-Session|F[0-9]{3}[^0-9]'
+# Commit messages, through the same commit-msg hook CI runs: no attribution, session
+# links, finding IDs, or audit or review framing, and every cited hash exists here
+# (<repo>@<sha> for another repo).
+msg=$(mktemp)
+for c in $(git rev-list --no-merges $BASE..HEAD); do
+	git log -1 --format=%B $c > "$msg"
+	bash scripts/git-hooks/commit-msg "$msg" || git log -1 --format='  in %h %s' $c
+done
 
 # Unfolded fix-up commits.
 git log --format='%h %s' $BASE..HEAD | grep -E '^[0-9a-f]+ (fixup|squash|amend)!'
-
-# Every hash a commit message cites must exist in this repository. A <repo>@<sha>
-# citation of another repository is dropped first; tokens without a digit are words.
-git log --format=%B $BASE..HEAD | sed -E 's/[A-Za-z0-9_.-]+@[0-9a-f]{7,40}//g' \
-	| grep -oEw '[0-9a-f]{7,40}' | grep '[0-9]' | sort -u \
-	| while read -r h; do git cat-file -e "$h^{commit}" 2>/dev/null || echo "does not resolve: $h"; done
 ```
 
 Then the build and test gates, and say in the PR which ones you ran:

@@ -69,6 +69,13 @@ else
 	exit 1
 fi
 
+# Diff policy — changes that need the maintainer's approval (see CLAUDE.md, Contributing).
+if [ "${SKIP_DIFF_POLICY:-0}" = "1" ]; then
+	printf '%s==>%s diff policy: skipped (SKIP_DIFF_POLICY=1)\n' "$bold" "$reset"
+else
+	run "diff policy (staged)" bash scripts/check-diff-policy.sh --cached
+fi
+
 # Default clippy config — the cheapest of the four CI clippy invocations.
 # heif-decoder is excluded because its cmake-rs build breaks incremental compiles.
 # See https://github.com/rust-lang/cmake-rs/issues/248
