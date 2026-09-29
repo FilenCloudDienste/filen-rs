@@ -11,8 +11,6 @@ use filen_sdk_rs::{
 };
 use filen_types::api::v3::dir::link::PublicLinkExpiration;
 
-// todo: write tests for this (!)
-
 pub(crate) async fn list_public_links(ui: &mut UI, client: &mut LazyClient) -> Result<()> {
 	let client = client.get(ui).await?;
 	let (dirs, files) = client
