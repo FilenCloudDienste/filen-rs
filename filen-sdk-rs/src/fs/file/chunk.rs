@@ -28,6 +28,9 @@ impl AsMut<Vec<u8>> for Chunk<'_> {
 	}
 }
 
+// into_parts moves the fields out past Chunk's Drop, and the constructors skip a u32 to usize
+// check that cannot fail on any supported target.
+#[allow(unsafe_code)]
 impl<'a> Chunk<'a> {
 	pub fn try_acquire(chunk_size: NonZeroU32, state: &'a SharedClientState) -> Option<Chunk<'a>> {
 		state

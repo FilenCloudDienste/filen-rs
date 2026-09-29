@@ -84,3 +84,6 @@ rexpect = "0.6.2"
 [features]
 default = []
 is_docker = []
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # Changes to the contribution rules and the checks that enforce them, to dependencies and the
-# toolchain, to crypto, and to committed test fixtures need the maintainer's review
-# (see CLAUDE.md, Contributing).
+# toolchain, to crypto, to the code that already uses unsafe, and to committed test fixtures
+# need the maintainer's review (see CLAUDE.md, Contributing).
 
 /CLAUDE.md @Enduriel
 /AGENTS.md @Enduriel
@@ -13,3 +13,23 @@ Cargo.toml @Enduriel
 Cargo.lock @Enduriel
 /filen-sdk-rs/src/crypto/ @Enduriel
 **/tests/*fixtures/ @Enduriel
+
+# Code that uses unsafe: every file under an #[allow(unsafe_code)] (a directory where the
+# allow covers every file in it). filen-sdk-rs's crypto files are covered above.
+/filen-cli/tests/manuel_tests.rs @Enduriel
+/filen-cli/tests/updater_tests.rs @Enduriel
+/filen-mobile-native-cache/src/auth.rs @Enduriel
+/filen-mobile-native-cache/src/env.rs @Enduriel
+/filen-sdk-rs/src/fs/file/chunk.rs @Enduriel
+/filen-sdk-rs/src/js/categories/common/dir/color.rs @Enduriel
+/filen-sdk-rs/src/js/managed_futures/multi_threaded.rs @Enduriel
+/filen-sdk-rs/src/js/managed_futures/service_worker.rs @Enduriel
+/filen-sdk-rs/src/obs/ @Enduriel
+/filen-sdk-rs/src/runtime.rs @Enduriel
+/filen-types/src/crypto/mod.rs @Enduriel
+/filen-types/src/fs.rs @Enduriel
+/filen-types/src/serde/mod.rs @Enduriel
+/filen-types/src/serde/str/ @Enduriel
+/filen-types/src/stable_uuid.rs @Enduriel
+/heif-decoder/src/ @Enduriel
+/microthumb/tests/alloc_ceiling.rs @Enduriel

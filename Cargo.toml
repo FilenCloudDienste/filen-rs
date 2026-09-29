@@ -15,6 +15,18 @@ members = [
 	"filen-sync-core",
 ]
 
+# Every member opts in with `[lints] workspace = true`; a new crate must too.
+[workspace.lints.rust]
+# New unsafe needs the maintainer's approval (see CLAUDE.md, Contributing). The existing
+# sites carry an #[allow(unsafe_code)] that says what the unsafe is for.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+# Module files are named after their directory: foo/mod.rs, not foo.rs next to foo/.
+self_named_module_files = "deny"
+
 [profile.test]
 opt-level = 3
 

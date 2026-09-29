@@ -66,3 +66,6 @@ tokio = { version = "1.47.1", features = ["full", "test-util"] }
 test-utils = { path = "../test-utils" }
 rand = "0.9.2"
 base64 = "0.22.1"
+
+[lints]
+workspace = true

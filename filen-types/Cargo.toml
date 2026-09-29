@@ -47,3 +47,6 @@ service-worker = []
 # Exposes test-only constructors that bypass deserialization-only guarantees
 # (StableUuid). For dev-dependencies of downstream crates; never in production.
 test-seams = []
+
+[lints]
+workspace = true

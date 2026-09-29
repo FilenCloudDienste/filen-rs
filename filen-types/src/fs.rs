@@ -244,6 +244,7 @@ mod uuid {
 	}
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	#[allow(unsafe_code)] // FromWasmAbi::from_abi is an unsafe trait method
 	impl FromWasmAbi for UuidStr {
 		type Abi = <str as RefFromWasmAbi>::Abi;
 
@@ -308,6 +309,8 @@ mod uuid {
 		}
 	}
 
+	// Skips re-validating bytes the constructors produced as a hyphenated UUID.
+	#[allow(unsafe_code)]
 	impl AsRef<str> for UuidStr {
 		fn as_ref(&self) -> &str {
 			// SAFETY: The string is guaranteed to be valid UTF-8 because it is a UUID string
@@ -321,6 +324,8 @@ mod uuid {
 		}
 	}
 
+	// Skips re-validating bytes the constructors produced as a hyphenated UUID.
+	#[allow(unsafe_code)]
 	impl From<&UuidStr> for Uuid {
 		fn from(uuid_string: &UuidStr) -> Self {
 			// SAFETY: The string is guaranteed to be a valid Hyphenated UUID string

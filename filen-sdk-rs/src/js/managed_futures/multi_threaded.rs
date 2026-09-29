@@ -94,6 +94,8 @@ mod pausable {
 	}
 
 	impl PauseSignalRust {
+		// Borrows the Rust object behind the JS wrapper's __wbg_ptr, as wasm-bindgen's glue does.
+		#[allow(unsafe_code)]
 		fn get_ref_from_js_value(
 			value: &wasm_bindgen::JsValue,
 		) -> Result<wasm_bindgen::__rt::RcRef<Self>, JsValue> {

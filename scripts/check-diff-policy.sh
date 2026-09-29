@@ -49,6 +49,22 @@ added() {
 added '*Cargo.toml' '*.cargo/config.toml' '*.cargo/config' | grep -qE '^\+[[:space:]]*(\[(patch|replace|source)|replace-with)' &&
 	block 'a [patch], [replace] or [source] section needs maintainer approval; depend on a maintained fork by git rev instead.'
 
+# Every crate inherits the workspace lints: [lints] workspace = true, or the dotted
+# lints.workspace = true before the first table.
+nolints=
+while read -r path; do
+	git show "$new:$path" 2>/dev/null | awk '
+		{ s = $0; gsub(/[[:space:]]/, "", s) }
+		s ~ /^\[/ { t = s; sub(/^\[+/, "", t); sub(/\].*/, "", t) }
+		t == "package" { p = 1 }
+		t == "lints" && s ~ /^workspace=true/ || t == "" && s ~ /^lints(\.|=\{)workspace=true/ { l = 1 }
+		END { exit !(p && !l) }
+	' && nolints="$nolints$path"$'\n'
+done < <(git diff --no-renames "$range" --name-only --diff-filter=AM -- '*Cargo.toml')
+[ -n "$nolints" ] &&
+	block "a crate must inherit the workspace lints; add [lints] workspace = true to its Cargo.toml:
+$(first "${nolints%$'\n'}")"
+
 git diff -M "$range" --name-only --diff-filter=A | grep -qE '(^|/)vendor/' &&
 	block 'vendored sources (vendor/) need maintainer approval.'
 

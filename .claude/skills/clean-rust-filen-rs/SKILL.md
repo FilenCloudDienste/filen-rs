@@ -106,18 +106,23 @@ Seal with the `clean-rust` skill's private-module `Sealed` supertrait if closure
 
 - **Hard tabs** (`rustfmt.toml: hard_tabs = true`). The editor/agent save-formatter does not match
   this repo's nightly `cargo fmt`; run `cargo fmt -p <crate>` before staging or pre-commit fails.
-- There are **no** `[workspace.lints]` and no `clippy.toml` — nothing enforces the import or
-  `#[allow]` conventions mechanically; review does.
+- The root `Cargo.toml`'s `[workspace.lints]` (every member opts in with
+  `[lints] workspace = true`) denies `unsafe_code`, `clippy::dbg_macro`, `clippy::todo` and
+  `clippy::self_named_module_files`. There is no `clippy.toml`, and nothing enforces the import or
+  allow-comment conventions mechanically; review does.
 - `pin_project` (proc-macro, `project = Name`) is used **only** under `filen-sdk-rs/src/auth/http/`;
   everything else (`runtime.rs`, `socket/thread_handling.rs`, `js/managed_futures/*`) uses
   `pin_project_lite`. Follow the neighbourhood; do not mix them in one file.
-- Baseline `unsafe`: the inventory is
-  `git grep -nE "unsafe (\{|fn|impl|extern)|#\[unsafe\(" -- '*.rs' ':!heif-decoder/deps/**'` —
-  ~50 sites outside `heif-decoder/src/lib.rs` (the C FFI surface, ~80 more), concentrated in
-  `filen-types/src/serde/str/**` (fixed-size string newtypes), `filen-sdk-rs/src/runtime.rs`,
-  `fs/file/chunk.rs`, `crypto/{v1,v2,v3}.rs`, `js/**` wasm ABI lifts, `obs/mod.rs`, and
-  `filen-mobile-native-cache/src/{auth.rs,env.rs}`. Anything outside that grep is new: it needs the
-  ask from the `clean-rust` skill and a `// SAFETY:` comment.
+- Baseline `unsafe`: every existing site sits under an `#[allow(unsafe_code)]` whose comment says
+  what the unsafe is for — `git grep -n "allow(unsafe_code)" -- '*.rs'` is the inventory. Two are
+  wide: the module-level one on `filen-types/src/serde/str` (fixed-size string newtypes) and the
+  crate-level one in `heif-decoder/src/lib.rs` (the C FFI surface); the rest cover one small
+  module, item, statement or match arm (`filen-sdk-rs/src/runtime.rs`, `fs/file/chunk.rs`,
+  `crypto/{v1,v2,v3}.rs`, `js/**` wasm ABI lifts, `obs/mod.rs`,
+  `filen-mobile-native-cache/src/{auth.rs,env.rs}`, a few tests). New unsafe outside those
+  scopes fails the lint; adding an allow or widening one needs the ask from the `clean-rust`
+  skill and a `// SAFETY:` comment, and `scripts/check-diff-policy.sh` blocks added or changed
+  unsafe lines either way.
 - `filen-mobile-native-cache` is UniFFI: build/test with `-p filen-mobile-native-cache`.
 - Touching API request/response types or serde? Pair with the `types-serde-conventions` skill.
 

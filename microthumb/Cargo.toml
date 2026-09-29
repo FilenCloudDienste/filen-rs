@@ -59,3 +59,6 @@ image = { version = "0.25.6", default-features = false, features = [
 	"webp",
 ] }
 jpeg-encoder = { version = "0.7", default-features = false }
+
+[lints]
+workspace = true

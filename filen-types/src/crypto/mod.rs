@@ -70,6 +70,7 @@ impl wasm_bindgen::describe::WasmDescribe for EncryptedString<'_> {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[allow(unsafe_code)] // FromWasmAbi::from_abi is an unsafe trait method
 impl<'a> wasm_bindgen::convert::FromWasmAbi for EncryptedString<'a> {
 	type Abi = <String as wasm_bindgen::convert::FromWasmAbi>::Abi;
 	#[inline]

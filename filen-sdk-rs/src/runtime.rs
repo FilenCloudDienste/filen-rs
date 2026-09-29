@@ -4,6 +4,9 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 
 use crate::util::MaybeSend;
 
+// Scoped tasks: rayon runs closures that borrow the caller's stack, and the handle blocks on
+// drop until they finish.
+#[allow(unsafe_code)]
 mod async_scoped_task {
 	// The mt-crypto-only scoped-task machinery, gated once at the module rather than per item.
 	#[cfg(feature = "multi-threaded-crypto")]
@@ -389,6 +392,7 @@ mod commander_thread {
 			fn drop(mut this: Pin<&mut Self>) {
 				// SAFETY: this is the only place we take the cancel signal out of the ManuallyDrop
 				// drop is only ever called once, so this is safe
+				#[allow(unsafe_code)]
 				let cancel_signal = unsafe { ManuallyDrop::take(&mut this.cancel_signal) };
 				// don't care if it errors, just means the task was already completed/dropped
 				let _ = cancel_signal.send(());
@@ -746,6 +750,7 @@ mod wasm_threading {
 			*weak_handle = std::rc::Rc::downgrade(&worker_handle);
 		});
 		// Interpret the address we were given as a pointer to a closure to call.
+		#[allow(unsafe_code)]
 		let closure = unsafe { Box::from_raw(ptr as *mut Box<dyn FnOnce()>) };
 		(*closure)();
 		std::mem::drop(worker_handle);

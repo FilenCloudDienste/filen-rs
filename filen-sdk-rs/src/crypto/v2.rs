@@ -46,6 +46,8 @@ impl From<BadNonce> for Nonce<NonceSize> {
 	}
 }
 
+// Skips re-validating bytes drawn from an ASCII alphabet.
+#[allow(unsafe_code)]
 impl AsRef<str> for BadNonce {
 	fn as_ref(&self) -> &str {
 		// SAFETY: The nonce is generated from a fixed set of valid chars
@@ -382,6 +384,8 @@ impl CreateRandom for FileKey {
 			.expect("Failed to generate V2 key")
 	}
 }
+// Skips the unreachable error arm of a fixed-size hex encode.
+#[allow(unsafe_code)]
 pub(crate) fn hash(name: &[u8]) -> [u8; 20] {
 	let mut temp = [0u8; 128];
 	// SAFETY: The length of hashed_named must be 2x the length of a Sha512 hash, which is 128 bytes

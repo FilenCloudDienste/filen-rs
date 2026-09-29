@@ -20,6 +20,8 @@ pub(crate) fn init_logger() {
 static VM: OnceLock<jni::JavaVM> = OnceLock::new();
 
 #[cfg(target_os = "android")]
+// JNI entry point: export_name is an unsafe attribute.
+#[allow(unsafe_code)]
 #[unsafe(export_name = "Java_io_filen_app_FilenDocumentsProvider_initJavaVM")]
 pub extern "system" fn java_init(env: jni::JNIEnv, _class: jni::objects::JClass) {
 	let vm = env.get_java_vm().unwrap();

@@ -40,6 +40,7 @@ impl wasm_bindgen::describe::WasmDescribe for DirColor {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[allow(unsafe_code)] // FromWasmAbi::from_abi is an unsafe trait method
 impl wasm_bindgen::convert::FromWasmAbi for DirColor {
 	type Abi = <String as wasm_bindgen::convert::FromWasmAbi>::Abi;
 

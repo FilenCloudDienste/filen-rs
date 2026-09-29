@@ -327,6 +327,8 @@ mod inflight {
 /// Android logcat sink: a `MakeWriter` over the NDK `__android_log_write`, mapping the
 /// tracing level to an Android log priority. No external crate.
 #[cfg(target_os = "android")]
+// Calls liblog's C API.
+#[allow(unsafe_code)]
 mod android {
 	use std::ffi::CString;
 	use std::io::{self, Write};

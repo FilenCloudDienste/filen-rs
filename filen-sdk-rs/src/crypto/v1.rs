@@ -218,6 +218,8 @@ impl MetaCrypter for FileKey {
 	}
 }
 
+// Skips the unreachable error arms of fixed-size hex encodes.
+#[allow(unsafe_code)]
 fn hash_password(password: &[u8]) -> DerivedPassword<'static> {
 	let mut out = vec![0u8; 256];
 

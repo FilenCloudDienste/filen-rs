@@ -280,3 +280,6 @@ tempfile = "3.23.0"
 # wasm only dev-dependencies
 [target.'cfg(all(target_family="wasm", target_os= "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3.54"
+
+[lints]
+workspace = true

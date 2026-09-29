@@ -71,6 +71,8 @@ mod pausable {
 		// and impl wasm_bindgen::convert::RefFromWasmAbi for PauseSignalRust
 		// the default TryFromJsValue implementation calls into JS to delete the value JS side
 		// this version clones the inner value instead
+		// Reads the Rust object behind the JS wrapper's __wbg_ptr, as that glue does.
+		#[allow(unsafe_code)]
 		fn clone_from_js_value(
 			value: wasm_bindgen::JsValue,
 		) -> wasm_bindgen::__rt::core::result::Result<Self, JsValue> {

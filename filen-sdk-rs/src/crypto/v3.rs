@@ -89,6 +89,8 @@ impl Debug for EncryptionKey {
 }
 
 impl MetaCrypter for EncryptionKey {
+	// Hex-encodes the nonce straight into the String's buffer.
+	#[allow(unsafe_code)]
 	fn blocking_encrypt_meta_into(&self, meta: &str, mut out: String) -> EncryptedString<'static> {
 		let nonce: [u8; NONCE_SIZE] = rand::random();
 		let nonce = Nonce::from_slice(&nonce);

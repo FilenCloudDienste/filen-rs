@@ -1067,6 +1067,7 @@ impl FilenMobileCacheState {
 				let new_guard = OwnedRwLockReadGuard::map(state, |state| match state.status {
 					AuthStatus::Authenticated(ref auth_cache_state) => auth_cache_state,
 					// SAFETY: We just checked that the status is Authenticated, so this is safe
+					#[allow(unsafe_code)]
 					AuthStatus::Unauthenticated(_) => unsafe { unreachable_unchecked() },
 				});
 				// we check for cleanup separately so we don't spawn an unnecessary task and try to reacquire the lock for no reason
@@ -1108,6 +1109,7 @@ impl FilenMobileCacheState {
 				let new_guard = OwnedRwLockReadGuard::map(state, |state| match state.status {
 					AuthStatus::Authenticated(ref auth_cache_state) => auth_cache_state,
 					// SAFETY: We just checked that the status is Authenticated, so this is safe
+					#[allow(unsafe_code)]
 					AuthStatus::Unauthenticated(_) => unsafe { unreachable_unchecked() },
 				});
 				f(new_guard)

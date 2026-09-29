@@ -1,6 +1,8 @@
 #[test]
 // do not run in aarch64-apple-darwin, because there is no release asset for that
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+// std::env::set_var is unsafe since edition 2024.
+#[allow(unsafe_code)]
 fn test_updater() {
 	use regex::Regex;
 	use std::fs;

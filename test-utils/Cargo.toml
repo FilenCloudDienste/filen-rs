@@ -21,3 +21,6 @@ anyhow = "1.0.102"
 
 [features]
 cli = ["dep:filen-cli", "dep:assert_cmd", "dep:assert_fs"]
+
+[lints]
+workspace = true

@@ -1,6 +1,8 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+// The crate is a binding to libheif's C API: bindgen output, plus the calls that wrap it.
+#![allow(unsafe_code)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use std::{

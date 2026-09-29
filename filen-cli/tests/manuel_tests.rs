@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 #[filen_macros::shared_test_runtime]
+// std::env::set_var is unsafe since edition 2024.
+#[allow(unsafe_code)]
 async fn run_manuel_tests() {
 	// export auth config to tmp file
 	use std::io::Write;

@@ -10,6 +10,10 @@
 //! meters are process-wide, and runs the cases in ONE #[test] so no parallel
 //! test pollutes the counters.
 
+// Both meters hook the allocator: libmalloc's malloc_logger through FFI, and a
+// #[global_allocator] elsewhere.
+#![allow(unsafe_code)]
+
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

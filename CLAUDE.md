@@ -22,6 +22,9 @@ defaults, commit attribution lines included.
   `generate.sh` in their directory names. A new crates.io dependency is only listed, as a
   new `Cargo.lock` package, and `#![feature]` and renamed or reworded shipped items are
   left to review.
+  The workspace lints deny `unsafe_code`: each existing site sits under a commented
+  `#[allow(unsafe_code)]`. Every crate inherits them with `[lints] workspace = true`, and
+  the diff policy blocks a `Cargo.toml` with a `[package]` table but without it.
 - Fixes to pre-existing code and behaviour changes to shipped features are standalone
   commits at the front of the branch. Refactors change no behaviour. One logical change
   per commit, and follow-up fixes are folded into the commit they correct.

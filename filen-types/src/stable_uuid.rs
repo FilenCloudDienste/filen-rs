@@ -93,6 +93,7 @@ impl wasm_bindgen::describe::WasmDescribe for StableUuid {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[allow(unsafe_code)] // FromWasmAbi::from_abi is an unsafe trait method
 impl wasm_bindgen::convert::FromWasmAbi for StableUuid {
 	type Abi = <str as wasm_bindgen::convert::RefFromWasmAbi>::Abi;
 
