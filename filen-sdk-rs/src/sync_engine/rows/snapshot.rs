@@ -101,6 +101,10 @@ impl Answer for bool {
 /// enough that what a page holds is noise beside what the walk itself builds.
 pub(super) const PAGE: usize = 256;
 
+/// The most rows a page read for a caller that keeps to it holds, however well it keeps to it: the
+/// cursor's pages and the point questions' read-ahead both double up to this.
+pub(super) const MAX_PAGE: usize = 1024;
+
 /// The whole-set counts a pass asks for, as `baseline_counts` recorded them when the snapshot
 /// began.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -122,6 +126,48 @@ pub(in super::super) struct Snapshot {
 	/// The last page any enumeration or cursor read, kept so that a point question about a path it
 	/// spans is answered out of it (see [`Page`]).
 	last_page: Mutex<Option<Arc<Page>>>,
+	/// The last page the point questions read for themselves (see [`Snapshot::point`]). Apart from
+	/// `last_page`, so that a question about some other path, asked while an enumeration is being
+	/// handed out, does not take away the page the questions about the enumerated rows answer from.
+	ahead: Mutex<Ahead<Page>>,
+	/// The same for the questions about one folded path (see [`Snapshot::folded_at`]).
+	folded_ahead: Mutex<Ahead<FoldedPage>>,
+}
+
+/// The page a kind of question read last, and what the questions made of it (see
+/// [`Snapshot::point`]).
+#[derive(Debug)]
+struct Ahead<P> {
+	page: Option<Arc<P>>,
+	/// How many questions `page` answered.
+	answered: usize,
+	/// How many rows `page` was read for.
+	want: usize,
+}
+
+impl<P> Default for Ahead<P> {
+	fn default() -> Self {
+		Self {
+			page: None,
+			answered: 0,
+			want: 0,
+		}
+	}
+}
+
+impl<P> Ahead<P> {
+	/// How many rows the page read after this one does: twice as many when it answered as many
+	/// questions as it has `rows` and the question that missed it lies `past` its last row — a walk
+	/// in order — and one otherwise, which is what a lookup of the one row reads. It counts
+	/// questions, not distinct rows: a sparse walk asking each path several times grows its pages
+	/// past the one row a path needs, reading a few rows more per path, never a wrong answer.
+	fn next_want(&self, rows: usize, past: bool) -> usize {
+		if past && self.answered >= rows {
+			(self.want * 2).min(MAX_PAGE)
+		} else {
+			1
+		}
+	}
 }
 
 /// A contiguous stretch of the table as the snapshot reads it: every row from `from` on, up to the
@@ -165,6 +211,57 @@ impl Page {
 	/// Whether the read stopped at its limit, so the range goes on past the last row.
 	pub(super) fn is_full(&self) -> bool {
 		!self.complete
+	}
+}
+
+/// A stretch of `baseline_folded` as the folded questions read it: every `(folded_path, rel_path)`
+/// from the folded path `from` on, in the index's order, up to the last one read — or to the end of
+/// the pair when the read ran out before its limit. AUTHORITATIVE for every folded path it spans, as
+/// [`Page`] is for paths, but for the last one of a read that stopped at its limit: two rows can
+/// share a folded path, so more of that one may follow.
+#[derive(Debug)]
+struct FoldedPage {
+	from: String,
+	complete: bool,
+	rows: Vec<(String, String)>,
+}
+
+impl FoldedPage {
+	/// `Some(the path of every row folded to `folded`)` where this page answers for it.
+	fn answer(&self, folded: &str) -> Option<Vec<String>> {
+		let spanned = folded >= self.from.as_str()
+			&& (self.complete
+				|| self
+					.rows
+					.last()
+					.is_some_and(|(last, _)| folded < last.as_str()));
+		spanned.then(|| {
+			let at = self.rows.partition_point(|(key, _)| key.as_str() < folded);
+			self.rows[at..]
+				.iter()
+				.take_while(|(key, _)| key == folded)
+				.map(|(_, path)| path.clone())
+				.collect()
+		})
+	}
+
+	/// How many of its rows this page can hand out: all of them once it reached the end, and
+	/// otherwise every one before its last folded path.
+	fn answerable(&self) -> usize {
+		match self.rows.last() {
+			Some((last, _)) if !self.complete => self
+				.rows
+				.partition_point(|(key, _)| key.as_str() < last.as_str()),
+			_ => self.rows.len(),
+		}
+	}
+
+	/// Whether every folded path this page can answer for sorts before `folded`: the question lies
+	/// past the page, where a walk in order goes on.
+	fn answerable_below(&self, folded: &str) -> bool {
+		self.rows
+			.last()
+			.is_some_and(|(last, _)| last.as_str() <= folded)
 	}
 }
 
@@ -218,8 +315,9 @@ fn range_sql(inclusive: bool, bounded: bool) -> String {
 // so the planner has no statistics, and with none it will as soon seek `baseline_remote_uuid` on
 // `pair_id` alone — a walk of the whole pair — as the partial index the question was written for.
 // Named, the index is used or the statement fails to PREPARE, which is loud rather than slow.
-const ROW: &str = "SELECT carryable FROM baseline WHERE pair_id = ?1 AND rel_path = ?2";
-const FOLDED_AT: &str = "SELECT rel_path FROM baseline INDEXED BY baseline_folded WHERE pair_id = ?1 AND folded_path = ?2";
+/// Stepped and stopped rather than `LIMIT`ed, for the reason [`range_sql`] gives.
+const FOLDED_FROM: &str = "SELECT folded_path, rel_path FROM baseline INDEXED BY baseline_folded
+	 WHERE pair_id = ?1 AND folded_path >= ?2 ORDER BY folded_path, rel_path";
 /// Keyset-paged on `(folded_path, rel_path)`, which is what `baseline_folded` orders by: two rows
 /// can share a folded path, so the folded path alone is not a position to resume from. Stepped and
 /// stopped rather than `LIMIT`ed, for the reason [`range_sql`] gives.
@@ -239,7 +337,6 @@ const COUNTS: &str =
 
 /// Each statement text built once: a lookup is a `prepare_cached` keyed on the text, and building
 /// the text per call would be an allocation per row a pass asks for.
-static AT: LazyLock<String> = LazyLock::new(at_sql);
 static UNCONFIRMED: LazyLock<String> = LazyLock::new(unconfirmed_sql);
 static RANGE: LazyLock<[[String; 2]; 2]> = LazyLock::new(|| {
 	[
@@ -273,10 +370,6 @@ fn unconfirmed_sql() -> String {
 		"SELECT {ENTRY_COLUMNS} FROM baseline INDEXED BY baseline_unconfirmed
 		 WHERE pair_id = ?1 AND unconfirmed = 1"
 	)
-}
-
-fn at_sql() -> String {
-	format!("SELECT {ENTRY_COLUMNS} FROM baseline WHERE pair_id = ?1 AND rel_path = ?2")
 }
 
 /// The unsynced rows strictly under a directory: one seek per unsynced state, bounded to the
@@ -325,6 +418,8 @@ impl Snapshot {
 			pair,
 			counts,
 			last_page: Mutex::new(None),
+			ahead: Mutex::new(Ahead::default()),
+			folded_ahead: Mutex::new(Ahead::default()),
 		})
 	}
 
@@ -367,27 +462,54 @@ impl Snapshot {
 
 	/// The row at exactly `rel_path`.
 	pub(super) fn row(&self, rel_path: &str) -> Option<BaselineEntry> {
-		if let Some(row) = self.remembered(rel_path, |row| row.cloned()) {
-			return row;
-		}
-		self.with("a row", |conn| {
-			conn.prepare_cached(&AT)?
-				.query_row(params![self.pair, rel_path], BaselineStore::row_to_entry)
-				.optional()
-		})
+		self.point(rel_path, |row| row.cloned())
 	}
 
-	/// Whether a row sits at exactly `rel_path`, and if so whether it is carryable — the two point
-	/// questions that need no more of the row than that.
+	/// Whether a row sits at exactly `rel_path`, and if so whether it is carryable.
 	pub(super) fn carryable_at(&self, rel_path: &str) -> Option<bool> {
-		if let Some(flag) = self.remembered(rel_path, |row| row.map(BaselineEntry::carryable)) {
-			return flag;
+		self.point(rel_path, |row| row.map(BaselineEntry::carryable))
+	}
+
+	/// What the table holds at exactly `rel_path`, handed to `answer`: out of the last page an
+	/// enumeration read where it spans the path, else out of the last page these questions read,
+	/// else out of a new page read FROM the path.
+	///
+	/// The new page is sized to how the last one was used. A question past the last row of a page
+	/// every row of which was asked about is a walk in path order — a pass asking about its decided
+	/// set, which it holds sorted — and reads twice as many rows as that page did; any other
+	/// question reads one row, which is the one row a point lookup reads. So a walk over a moved
+	/// directory's fifty thousand paths is a few hundred statements rather than fifty thousand, and
+	/// the pages it keeps are never larger than [`MAX_PAGE`] rows.
+	fn point<T>(&self, rel_path: &str, answer: impl Fn(Option<&BaselineEntry>) -> T) -> T {
+		if let Some(found) = self.remembered(rel_path, &answer) {
+			return found;
 		}
-		self.with("a row's carry flag", |conn| {
-			conn.prepare_cached(ROW)?
-				.query_row(params![self.pair, rel_path], |row| row.get(0))
-				.optional()
-		})
+		let mut ahead = self.ahead.lock().unwrap_or_else(PoisonError::into_inner);
+		let (found, want) = match ahead.page.as_deref() {
+			Some(page) => (
+				page.answer(rel_path).map(&answer),
+				ahead.next_want(
+					page.rows.len(),
+					page.rows
+						.last()
+						.is_some_and(|last| last.rel_path.as_str() < rel_path),
+				),
+			),
+			None => (None, 1),
+		};
+		if let Some(found) = found {
+			ahead.answered += 1;
+			return found;
+		}
+		ahead.want = want;
+		let page = self.read_page(rel_path, true, None, ahead.want);
+		let found = answer(
+			page.answer(rel_path)
+				.expect("a page read from a path answers for that path"),
+		);
+		ahead.page = Some(page);
+		ahead.answered = 1;
+		found
 	}
 
 	/// Up to `limit` rows from `from` on (`inclusive` or not), strictly below `to` when there is
@@ -400,19 +522,24 @@ impl Snapshot {
 		to: Option<&str>,
 		limit: usize,
 	) -> Arc<Page> {
-		let rows = self.rows_from(from, inclusive, to, limit);
-		let page = Arc::new(Page {
-			from: from.to_string(),
-			inclusive,
-			to: to.map(str::to_string),
-			complete: rows.len() < limit,
-			rows,
-		});
+		let page = self.read_page(from, inclusive, to, limit);
 		*self
 			.last_page
 			.lock()
 			.unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&page));
 		page
+	}
+
+	/// [`page`](Self::page), without keeping it.
+	fn read_page(&self, from: &str, inclusive: bool, to: Option<&str>, limit: usize) -> Arc<Page> {
+		let rows = self.rows_from(from, inclusive, to, limit);
+		Arc::new(Page {
+			from: from.to_string(),
+			inclusive,
+			to: to.map(str::to_string),
+			complete: rows.len() < limit,
+			rows,
+		})
 	}
 
 	/// Up to `limit` DIRECTORY rows from `from` on, strictly below `to` when there is one, in path
@@ -467,13 +594,54 @@ impl Snapshot {
 		})
 	}
 
-	/// The path of every row whose folded path is exactly `folded`.
+	/// The path of every row whose folded path is exactly `folded`: out of the page these questions
+	/// read last where it spans `folded`, else out of a new one read from `folded` on and sized as a
+	/// point question's is ([`point`](Self::point)) — so a pass folding its decided set in order reads
+	/// the folded index a page at a time rather than a statement a path.
 	pub(super) fn folded_at(&self, folded: &str) -> Vec<String> {
-		self.with("the rows at a folded path", |conn| {
-			conn.prepare_cached(FOLDED_AT)?
-				.query_map(params![self.pair, folded], |row| row.get(0))?
-				.collect()
-		})
+		let mut ahead = self
+			.folded_ahead
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner);
+		let (found, want) = match ahead.page.as_deref() {
+			Some(page) => (
+				page.answer(folded),
+				ahead.next_want(page.answerable(), page.answerable_below(folded)),
+			),
+			None => (None, 1),
+		};
+		// Counted in rows handed out rather than questions, which for a folded path can be several.
+		if let Some(found) = found {
+			ahead.answered += found.len().max(1);
+			return found;
+		}
+		// Never one row: a page that stops at its limit cannot answer for its last folded path, and
+		// a one-row page read from a folded path some row holds stops on that very path — so it
+		// would take a second statement to answer what the one after it can.
+		let mut want = want.max(2);
+		loop {
+			let rows: Vec<(String, String)> = self.with("the rows from a folded path", |conn| {
+				conn.prepare_cached(FOLDED_FROM)?
+					.query_map(params![self.pair, folded], |row| {
+						Ok((row.get(0)?, row.get(1)?))
+					})?
+					.take(want)
+					.collect()
+			});
+			let page = FoldedPage {
+				from: folded.to_string(),
+				complete: rows.len() < want,
+				rows,
+			};
+			if let Some(found) = page.answer(folded) {
+				ahead.page = Some(Arc::new(page));
+				ahead.answered = found.len().max(1);
+				ahead.want = want;
+				return found;
+			}
+			// Every row it read is folded to `folded` itself, and more may follow: read past them.
+			want *= 2;
+		}
 	}
 
 	/// Up to `limit` rows STRICTLY under the folded path `folded`, as `(folded_path, rel_path)`,
@@ -571,6 +739,14 @@ impl Snapshot {
 			.last_page
 			.get_mut()
 			.unwrap_or_else(PoisonError::into_inner) = None;
+		self.ahead
+			.get_mut()
+			.unwrap_or_else(PoisonError::into_inner)
+			.page = None;
+		self.folded_ahead
+			.get_mut()
+			.unwrap_or_else(PoisonError::into_inner)
+			.page = None;
 	}
 }
 
@@ -623,7 +799,7 @@ mod tests {
 				.unwrap()
 		};
 		let primary = "PRIMARY KEY";
-		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 19] = [
+		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 17] = [
 			(
 				dirs_sql(false, false),
 				vec![&1_i64, &"a"],
@@ -655,18 +831,6 @@ mod tests {
 				"(pair_id=?)",
 			),
 			(
-				at_sql(),
-				vec![&1_i64, &"a"],
-				primary,
-				"(pair_id=? AND rel_path=?)",
-			),
-			(
-				ROW.to_string(),
-				vec![&1_i64, &"a"],
-				primary,
-				"(pair_id=? AND rel_path=?)",
-			),
-			(
 				range_sql(true, false),
 				vec![&1_i64, &"a"],
 				primary,
@@ -679,10 +843,10 @@ mod tests {
 				"(pair_id=? AND rel_path>? AND rel_path<?)",
 			),
 			(
-				FOLDED_AT.to_string(),
+				FOLDED_FROM.to_string(),
 				vec![&1_i64, &"a"],
 				"baseline_folded",
-				"(pair_id=? AND folded_path=?)",
+				"(pair_id=? AND folded_path>?)",
 			),
 			(
 				FOLDED_UNDER.to_string(),
@@ -790,13 +954,11 @@ mod tests {
 		let guard = snapshot.conn.lock().unwrap();
 		let conn = guard.as_ref().unwrap();
 		for sql in [
-			AT.as_str(),
-			ROW,
 			&RANGE[0][0],
 			&RANGE[0][1],
 			&RANGE[1][0],
 			&RANGE[1][1],
-			FOLDED_AT,
+			FOLDED_FROM,
 			FOLDED_UNDER,
 			&UNSYNCED[1],
 		] {
@@ -810,6 +972,151 @@ mod tests {
 				statement.get_status(rusqlite::StatementStatus::VmStep) > 0,
 				"the read never ran this statement, so its counter says nothing: {sql}"
 			);
+		}
+	}
+
+	/// A point question answers what the row at that path is, and a folded one which rows fold to
+	/// that path, whatever order the questions come in — and questions walked in order read the
+	/// table a growing page at a time, where the same questions out of order read a row each. The
+	/// walk interleaves a path no row holds between every two rows, which is what a pass's decided
+	/// set does with the paths a move vacated; every third row has a twin by case, so one folded path
+	/// names two rows and a page can stop between them.
+	#[test]
+	fn questions_in_order_read_ahead_and_answer_as_one_row_each() {
+		let row = |rel_path: String| BaselineEntry {
+			rel_path,
+			..crate::sync_engine::rows::tests::file_for_test(1)
+		};
+		let mut rows: Vec<BaselineEntry> = Vec::new();
+		let mut folded: Vec<(String, Vec<String>)> = Vec::new();
+		for n in 0..(MAX_PAGE * 3) {
+			let path = format!("d/f{n:05}");
+			let mut at = vec![path.clone()];
+			if n % 3 == 0 {
+				let twin = format!("D/f{n:05}");
+				rows.push(row(twin.clone()));
+				at.insert(0, twin);
+			}
+			rows.push(row(path.clone()));
+			folded.push((path.clone(), at));
+			folded.push((format!("{path}x"), Vec::new()));
+		}
+		let mut asked: Vec<(String, Option<&BaselineEntry>)> = Vec::new();
+		for row in rows.iter().filter(|row| row.rel_path.starts_with('d')) {
+			asked.push((row.rel_path.clone(), Some(row)));
+			asked.push((format!("{}x", row.rel_path), None));
+		}
+		let runs = |snapshot: &Snapshot, sql: &str| {
+			let guard = snapshot.conn.lock().unwrap();
+			let runs = guard
+				.as_ref()
+				.unwrap()
+				.prepare_cached(sql)
+				.unwrap()
+				.get_status(rusqlite::StatementStatus::Run);
+			usize::try_from(runs).unwrap()
+		};
+		// In order with and without the paths no row holds (a folded walk of a pass's decided set
+		// has none between its rows), and backwards.
+		for (reversed, absent) in [(false, true), (false, false), (true, true)] {
+			let snapshot = standalone(rows.clone());
+			let keep = |path: &str| absent || !path.ends_with('x');
+			let mut order: Vec<&(String, Option<&BaselineEntry>)> =
+				asked.iter().filter(|(path, _)| keep(path)).collect();
+			let mut folded_order: Vec<&(String, Vec<String>)> =
+				folded.iter().filter(|(key, _)| keep(key)).collect();
+			if reversed {
+				order.reverse();
+				folded_order.reverse();
+			}
+			let context = format!("reversed: {reversed}, absent paths asked: {absent}");
+			for (path, expected) in &order {
+				assert_eq!(
+					snapshot.row(path).as_ref(),
+					*expected,
+					"row({path:?}), {context}"
+				);
+				assert_eq!(
+					snapshot.carryable_at(path),
+					expected.map(BaselineEntry::carryable),
+					"carryable_at({path:?}), {context}"
+				);
+				// Statements alone cannot see a backwards walk reading large pages: it misses every
+				// one of them whatever their size.
+				let held = snapshot
+					.ahead
+					.lock()
+					.unwrap()
+					.page
+					.as_ref()
+					.map_or(0, |page| page.rows.len());
+				assert!(
+					!reversed || held <= 1,
+					"a backwards walk read a {held}-row page for {path:?}, {context}"
+				);
+			}
+			for (key, expected) in &folded_order {
+				assert_eq!(
+					&snapshot.folded_at(key),
+					expected,
+					"folded_at({key:?}), {context}"
+				);
+				// Twice the rows folded to the path at most: a page doubles until it reads past them.
+				let held = snapshot
+					.folded_ahead
+					.lock()
+					.unwrap()
+					.page
+					.as_ref()
+					.map_or(0, |page| page.rows.len());
+				let bound = 2 * expected.len().max(1);
+				assert!(
+					!reversed || held <= bound,
+					"a backwards walk read a {held}-row folded page for {key:?}, {context}"
+				);
+			}
+			let (point, by_folded) = (runs(&snapshot, &RANGE[1][0]), runs(&snapshot, FOLDED_FROM));
+			if reversed {
+				assert!(
+					point >= order.len() / 2 && by_folded >= folded_order.len() / 2,
+					"out of order, every question about a row reads it on its own: {point} and \
+					 {by_folded} read(s), {context}"
+				);
+			} else {
+				assert!(
+					point < 32 && by_folded < 32,
+					"{} point and {} folded questions in order read {point} and {by_folded} \
+					 page(s), {context}",
+					order.len() * 2,
+					folded_order.len()
+				);
+			}
+		}
+	}
+
+	/// A folded question nothing read ahead for costs one statement, as the equality it replaced
+	/// did — also where a row holds the path, whose page must reach past it to answer.
+	#[test]
+	fn a_lone_folded_question_reads_one_page() {
+		let row = |rel_path: &str| BaselineEntry {
+			rel_path: rel_path.to_string(),
+			..crate::sync_engine::rows::tests::file_for_test(1)
+		};
+		for (asked, expected) in [
+			("b", vec!["b".to_string()]),
+			("a", vec!["a".to_string()]),
+			("c", Vec::new()),
+		] {
+			let snapshot = standalone(vec![row("a"), row("b")]);
+			assert_eq!(snapshot.folded_at(asked), expected, "folded_at({asked:?})");
+			let guard = snapshot.conn.lock().unwrap();
+			let runs = guard
+				.as_ref()
+				.unwrap()
+				.prepare_cached(FOLDED_FROM)
+				.unwrap()
+				.get_status(rusqlite::StatementStatus::Run);
+			assert_eq!(runs, 1, "folded_at({asked:?}) read {runs} pages");
 		}
 	}
 }
