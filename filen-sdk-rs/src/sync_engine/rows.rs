@@ -590,24 +590,44 @@ impl Indexed {
 /// sorted. Answers exactly what [`Baseline::get`] answers.
 ///
 /// It answers the table's half out of a [`Page`] wherever the page spans the path asked, and the
-/// pass's own edits over it exactly as `get` does. On the first path it is asked in a directory it
-/// reads that directory's range from its start, which covers an ordinary directory whatever order
-/// its entries are asked in; past that page it reads from the path asked. Both page sizes follow the
-/// caller: a page most of whose rows were asked for makes the next one twice as large, one that
-/// answered a single lookup halves it — so a walk of the table reads it in large pages, and a
-/// caller asking about scattered paths pays about a point lookup each.
+/// pass's own edits over it exactly as `get` does. In a directory it reads that directory's range
+/// from its start, which covers an ordinary directory whatever order its entries are asked in; past
+/// that page it reads from the path asked. Both page sizes follow the caller: a page most of whose
+/// rows were asked for makes the next one twice as large, one that answered a single lookup halves
+/// it — so a walk of the table reads it in large pages, and a caller asking about scattered paths
+/// pays about a point lookup each.
+///
+/// The directory's range is read on the SECOND path asked there that the page in hand cannot answer,
+/// once a directory has shown that a caller asks one path a directory: the first reads the one row
+/// asked for, as a point lookup does ([`Read::Probe`]). A pass deciding one changed file reads one row
+/// of its directory rather than all of it, where a walk of the tree probes one directory, learns
+/// from it, and reads every directory after it whole from the start.
 pub(super) struct Cursor<'a> {
 	baseline: &'a Baseline,
 	page: Option<Arc<Page>>,
-	/// Whether `page` was read from a directory's start rather than from a path.
-	page_is_dir: bool,
-	/// The directory the last directory page was read for.
+	/// How `page` was read, which says which of the two sizes its use adapts.
+	read: Read,
+	/// The directory the last page was read in.
 	dir: Option<String>,
+	/// Whether a directory's first miss reads the one row asked for, rather than its range: while
+	/// every directory has needed no more than that.
+	probe_first: bool,
 	/// How many rows the next page of each kind reads, and how many lookups the current page has
 	/// answered.
 	want: usize,
 	dir_want: usize,
 	answered: usize,
+}
+
+/// How a [`Cursor`]'s page was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+	/// The one row asked for, a directory's first miss.
+	Probe,
+	/// The directory's range from its start.
+	Dir,
+	/// From the path asked, on.
+	Path,
 }
 
 impl Cursor<'_> {
@@ -643,17 +663,26 @@ impl Cursor<'_> {
 			return answer.cloned();
 		}
 		if let Some(page) = self.page.as_deref() {
-			let want = if self.page_is_dir {
-				&mut self.dir_want
-			} else {
-				&mut self.want
-			};
-			Self::adapt(want, page.rows.len(), self.answered);
+			match self.read {
+				Read::Dir => Self::adapt(&mut self.dir_want, page.rows.len(), self.answered),
+				Read::Path => Self::adapt(&mut self.want, page.rows.len(), self.answered),
+				Read::Probe => {}
+			}
 		}
 		self.answered = 1;
 		let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-		if self.dir.as_deref() != Some(dir) {
+		let entered = self.dir.as_deref() != Some(dir);
+		if entered {
+			// The directory being left needed its probe and nothing more, or it did not.
+			if self.dir.is_some() {
+				self.probe_first = self.read == Read::Probe;
+			}
 			self.dir = Some(dir.to_string());
+		}
+		if entered && self.probe_first {
+			return self.read_from(snapshot, rel_path, 1, Read::Probe);
+		}
+		if entered || self.read == Read::Probe {
 			let (from, to) = if dir.is_empty() {
 				(String::new(), None)
 			} else {
@@ -662,18 +691,29 @@ impl Cursor<'_> {
 			let page = snapshot.page(&from, false, to.as_deref(), self.dir_want);
 			let answer = page.answer(rel_path).map(|row| row.cloned());
 			self.page = Some(page);
-			self.page_is_dir = true;
+			self.read = Read::Dir;
 			if let Some(answer) = answer {
 				return answer;
 			}
 		}
-		let page = snapshot.page(rel_path, true, None, self.want);
+		self.read_from(snapshot, rel_path, self.want, Read::Path)
+	}
+
+	/// A page of `limit` rows from `rel_path` on, kept as `read`, and its answer there.
+	fn read_from(
+		&mut self,
+		snapshot: &Snapshot,
+		rel_path: &str,
+		limit: usize,
+		read: Read,
+	) -> Option<BaselineEntry> {
+		let page = snapshot.page(rel_path, true, None, limit);
 		let answer = page
 			.answer(rel_path)
 			.expect("a page read from a path answers for that path")
 			.cloned();
 		self.page = Some(page);
-		self.page_is_dir = false;
+		self.read = read;
 		answer
 	}
 }
@@ -1177,8 +1217,9 @@ impl Baseline {
 		Cursor {
 			baseline: self,
 			page: None,
-			page_is_dir: false,
+			read: Read::Probe,
 			dir: None,
+			probe_first: true,
 			want: 1,
 			dir_want: PAGE,
 			answered: 0,
