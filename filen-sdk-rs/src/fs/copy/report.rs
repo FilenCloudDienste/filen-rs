@@ -320,6 +320,9 @@ impl<T: CopyCallback + ?Sized> CopyCallback for Arc<T> {
 	}
 }
 
+// `pause_requested`, `paused` and `cancelling` can hold together (`run_state` ranks them);
+// `changed` marks unsent progress.
+#[allow(clippy::struct_excessive_bools)]
 struct State {
 	phase: CopyPhase,
 	pause_requested: bool,

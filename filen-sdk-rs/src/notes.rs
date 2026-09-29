@@ -133,6 +133,8 @@ impl NoteParticipant {
 }
 
 #[js_type(import, export)]
+// Mirrors the server's note record; favorite, pinned, trash and archive are independent.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Note {
 	uuid: Uuid,
 	owner_id: u64,

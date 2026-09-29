@@ -37,6 +37,8 @@ mod util;
 	disable_help_flag = true,
 	disable_help_subcommand = true
 )]
+// Each bool is an independent clap flag.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct CliArgs {
 	/// Print help about a command or topic
 	#[arg(short, long, num_args = 0..=1, default_missing_value = "", hide = true)]

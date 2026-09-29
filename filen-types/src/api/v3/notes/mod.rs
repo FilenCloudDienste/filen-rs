@@ -70,6 +70,8 @@ pub struct NoteParticipant<'a> {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
+// Wire format: each bool is its own field of the server's note JSON.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Note<'a> {
 	pub uuid: Uuid,
 	#[serde(with = "crate::serde::number::permissive_u64")]

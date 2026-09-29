@@ -67,6 +67,8 @@ impl log::Log for CustomLogger {
 
 const FAILED_TO_READ_INPUT_PROMPT: &str = "Failed to read input prompt";
 
+// Independent output settings, each set from its own CLI flag.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct UI {
 	quiet: bool,
 	history: Vec<String>,

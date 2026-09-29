@@ -230,6 +230,8 @@ impl Client {
 
 #[derive(Debug, Clone, PartialEq)]
 #[js_type(export, no_default)]
+// Mirrors the user info and settings responses; each bool is its own server field.
+#[allow(clippy::struct_excessive_bools)]
 pub struct UserInfo {
 	// user/info
 	pub id: u64,

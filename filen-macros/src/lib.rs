@@ -1716,6 +1716,8 @@ pub fn js_type_tagged(_attr: TokenStream, passthrough: TokenStream) -> TokenStre
 	passthrough
 }
 
+// One flag per `#[js_type]` argument.
+#[allow(clippy::struct_excessive_bools)]
 struct JsTypeState {
 	from_abi: TokenStream2,
 	into_abi: TokenStream2,
