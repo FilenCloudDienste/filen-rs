@@ -738,10 +738,17 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 			Side::Carried(overlay) => {
 				// The rows this side carries, corrected by what the pass recorded over them. Each
 				// overlay key is distinct, so a tombstone can only cancel a row that was counted.
+				// Asked in path order: the baseline then reads the rows a page at a time, where the
+				// map's own order is a row per question.
+				let mut edits: Vec<(&String, bool)> = overlay
+					.iter()
+					.map(|(path, edit)| (path, edit.is_some()))
+					.collect();
+				edits.sort_unstable_by_key(|&(path, _)| path);
 				let mut added = 0usize;
 				let mut removed = 0usize;
-				for (path, edit) in overlay.iter() {
-					match (edit.is_some(), self.baseline.carryable(path)) {
+				for (path, present) in edits {
+					match (present, self.baseline.carryable(path)) {
 						(true, false) => added += 1,
 						(false, true) => removed += 1,
 						_ => {}
