@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::mcp_server::endpoints::{
+use crate::rpc_servers::endpoints::{
 	Endpoint,
 	support::{find_item_or_err, require_dir},
 };

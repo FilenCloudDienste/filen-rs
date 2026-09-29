@@ -1,5 +1,5 @@
 use crate::{
-	mcp_server::endpoints::{
+	rpc_servers::endpoints::{
 		Endpoint,
 		support::{find_item_or_err, map_link_status_err, reject_root},
 	},

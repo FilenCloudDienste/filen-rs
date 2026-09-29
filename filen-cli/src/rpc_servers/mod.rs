@@ -1,13 +1,13 @@
 //! [cli-doc] mcp-server
 //! You can use the Filen CLI to run a local MCP server (https://modelcontextprotocol.io)
 //! that allows AI agents to interact with your Filen drive.
-//!
+
 use crate::ui::UI;
 use anyhow::{Context as _, Result};
 
 mod endpoints;
-pub(crate) mod rpc_server;
-pub(crate) mod server;
+pub(crate) mod json_rpc_server;
+pub(crate) mod mcp_server;
 
 pub(crate) async fn mcp_cmd(ui: &mut UI) -> Result<()> {
 	let filen_cli_binary = std::env::current_exe().context("Failed to get current executable")?;

@@ -1,6 +1,6 @@
 use crate::{
 	commands::fs_cmds,
-	mcp_server::endpoints::{
+	rpc_servers::endpoints::{
 		Endpoint,
 		support::{find_item_or_err, reject_root, require_dir},
 	},

@@ -1,4 +1,4 @@
-use crate::mcp_server::endpoints::Endpoint;
+use crate::rpc_servers::endpoints::Endpoint;
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,

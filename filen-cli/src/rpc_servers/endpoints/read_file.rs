@@ -1,4 +1,4 @@
-use crate::mcp_server::endpoints::{Endpoint, support::find_item_or_err};
+use crate::rpc_servers::endpoints::{Endpoint, support::find_item_or_err};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	fs::{categories::NonRootFileType, file::traits::HasFileInfo as _},

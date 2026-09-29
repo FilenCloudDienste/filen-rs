@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use crate::{
-	mcp_server::endpoints::{Endpoint, support::require_dir},
+	rpc_servers::endpoints::{Endpoint, support::require_dir},
 	util::RemotePath,
 };
 use anyhow::{Context, Result};

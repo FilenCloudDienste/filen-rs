@@ -497,7 +497,7 @@ pub(crate) async fn execute_command(
 			None
 		}
 		Commands::Mcp => {
-			crate::mcp_server::mcp_cmd(ui).await?;
+			crate::rpc_servers::mcp_cmd(ui).await?;
 			None
 		}
 		Commands::ExportApiKey => {

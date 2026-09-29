@@ -1,8 +1,4 @@
-// module written by Claude
-
-use std::sync::Arc;
-
-use crate::mcp_server::endpoints::{AnyEndpoint, all_endpoints};
+use crate::rpc_servers::endpoints::{AnyEndpoint, all_endpoints};
 use anyhow::Result;
 use rmcp::{
 	ErrorData, RoleServer, ServerHandler,
@@ -16,6 +12,7 @@ use rmcp::{
 	},
 	service::RequestContext,
 };
+use std::sync::Arc;
 
 /// Convert a `schemars` schema into the shape `Tool` wants.
 ///

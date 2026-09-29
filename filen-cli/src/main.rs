@@ -26,7 +26,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
-mod mcp_server;
+mod rpc_servers;
 mod ui;
 mod updater;
 mod util;
@@ -306,12 +306,12 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 
 	if cli_args.mcp_server {
 		let client = client.get(ui).await?;
-		return mcp_server::server::run_mcp_server(client.clone()).await;
+		return rpc_servers::mcp_server::run_mcp_server(client.clone()).await;
 	}
 
 	if cli_args.json_rpc_server {
 		let client = client.get(ui).await?;
-		return mcp_server::rpc_server::run_json_rpc_server(client.clone(), |addr| {
+		return rpc_servers::json_rpc_server::run_json_rpc_server(client.clone(), |addr| {
 			ui.print_success(&format!("JSON-RPC server started successfully at {}", addr));
 		})
 		.await;
