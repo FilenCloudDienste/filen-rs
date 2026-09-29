@@ -125,7 +125,8 @@ misquoting these replace came from names that did not:
   it can exceed a resident set, because capacity is allocated without necessarily
   being faulted in. The BASELINE terms (`mem:pair_baseline_term_handle` /
   `_edits_computed_bytes`) are the snapshot handle — a pooled reader connection,
-  its pair and its counts, 192 bytes — and the pass's own edits over the table:
+  its pair, its counts and the pages its questions last read, 272 bytes — and the
+  pass's own edits over the table:
   its folded directory moves and confirmed pushes, or the rows frozen for its
   apply. Between passes the pair is the handle and nothing else, at every size;
   the store holds no rows in memory. A run asserts that the pass's figure is at
@@ -136,8 +137,9 @@ misquoting these replace came from names that did not:
   comparable, and the old terms print as ONLY IN BEFORE.)
 - `walk:baseline_read_statements` / `walk:baseline_read_rows` — what the measured
   pass asked the store for its rows, counted in the snapshot: statements run and
-  rows decoded. Three statements and no rows for an idle pass; about six
-  statements per changed path for a scoped one.
+  rows decoded. Three statements and no rows for an idle pass, eight for one changed
+  file; a scoped pass that decides many paths asks about them in path order and
+  reads them a page at a time, about one and a half statements per changed path.
   `pass_view` is zero for every scenario whose remote changelist is empty, which is
   every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
   it was not told about. Zero is an answer, which is why that column is printed in
@@ -147,7 +149,7 @@ misquoting these replace came from names that did not:
 question. `pair_attributed` is what the pair's baseline computes itself as
 over what LOADING it added (`pair_loaded − floor`); the remainder is the
 engine's fixed cost — SQLite's page cache and mapped pages, the runtime, the
-client. Since the store round the baseline is a 192-byte handle, so this ratio
+client. Since the store round the baseline is a 272-byte handle, so this ratio
 is ~0 % by design: loading a pair costs the engine's fixed cost and nothing
 that scales. `pass_attributed` is what the pass's two SIDES compute themselves as
 over what the PASS added on top of an already-loaded pair

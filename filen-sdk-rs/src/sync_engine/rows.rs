@@ -12,8 +12,7 @@
 //!
 //! | Method | Shape | Answered by |
 //! |---|---|---|
-//! | [`get`](Baseline::get) | point, exact path | the primary key — or the last page any enumeration read, where it spans the path (see `snapshot::Page`) |
-//! | [`contains_key`](Baseline::contains_key), [`carryable`](Baseline::carryable) | point | the primary key, reading the `carryable` column alone |
+//! | [`get`](Baseline::get), [`contains_key`](Baseline::contains_key), [`carryable`](Baseline::carryable) | point, exact path | the last page any enumeration read, where it spans the path (see `snapshot::Page`) — else a page of the primary key's range read from the path, one row long unless the questions before it walked in path order (see `Snapshot::point`) |
 //! | [`cursor`](Baseline::cursor) | point, asked a directory at a time | a page of the directory's range, then pages from the path asked, sized to how many of the last page's rows were asked for |
 //! | [`tracked`](Baseline::tracked) | point, or anything strictly under | the primary key, then one row of the range `(p/, p0)` |
 //! | [`occupied`](Baseline::occupied) | folded, at or under | `baseline_folded`: `folded_path` equality, then one row of the range `(f/, f0)` |
@@ -110,7 +109,7 @@ use uuid::Uuid;
 mod snapshot;
 
 pub(super) use self::snapshot::Snapshot;
-use self::snapshot::{Counts, PAGE, Page};
+use self::snapshot::{Counts, MAX_PAGE, PAGE, Page};
 #[cfg(feature = "bench-internals")]
 pub(super) use self::snapshot::{reads, reset_reads};
 use super::{
@@ -612,12 +611,9 @@ pub(super) struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-	/// The most a page reads, however well the caller keeps to it.
-	const MAX_PAGE: usize = 1024;
-
 	fn adapt(want: &mut usize, rows: usize, answered: usize) {
 		if answered * 2 >= rows.max(1) {
-			*want = (*want * 2).min(Self::MAX_PAGE);
+			*want = (*want * 2).min(MAX_PAGE);
 		} else if answered <= 1 {
 			*want = (*want / 2).max(1);
 		}
