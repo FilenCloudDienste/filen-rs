@@ -278,7 +278,11 @@ pub struct Client {
 	#[cfg(feature = "cache")]
 	pub(crate) cache_slot: tokio::sync::Mutex<crate::cache::CacheSlot>,
 
+	// Fetched lazily: None = not fetched yet, Some(None) = fetched and the user has none.
+	#[allow(clippy::option_option)]
 	nickname: std::sync::RwLock<Option<Option<Arc<str>>>>,
+	// Same three states as `nickname`.
+	#[allow(clippy::option_option)]
 	avatar_url: std::sync::RwLock<Option<Option<Arc<str>>>>,
 }
 

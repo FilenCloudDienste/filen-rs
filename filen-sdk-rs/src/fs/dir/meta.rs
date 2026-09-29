@@ -230,6 +230,7 @@ impl<'a> DecryptedDirectoryMeta<'a> {
 pub struct DirectoryMetaChanges {
 	name: Option<ValidatedName>,
 	// double option because we need to distinguish between "not set" and "set to None"
+	#[allow(clippy::option_option)]
 	created: Option<Option<DateTime<Utc>>>,
 }
 

@@ -525,6 +525,7 @@ pub struct FileMetaChanges {
 	mime: Option<String>,
 	last_modified: Option<DateTime<Utc>>,
 	// double option because we need to distinguish between "not set" and "set to None"
+	#[allow(clippy::option_option)]
 	created: Option<Option<DateTime<Utc>>>,
 }
 

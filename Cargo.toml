@@ -26,6 +26,8 @@ dbg_macro = "deny"
 todo = "deny"
 # Module files are named after their directory: foo/mod.rs, not foo.rs next to foo/.
 self_named_module_files = "deny"
+# The rest had existing hits; each one carries an #[allow] whose comment gives the reason.
+option_option = "deny"
 
 [profile.test]
 opt-level = 3

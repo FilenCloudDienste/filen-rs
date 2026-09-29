@@ -4,8 +4,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 
 // Only referenced by the `wasm-full`-gated `deserialize_with` attributes on
-// `DirectoryMetaChanges`/`FileMetaChanges`; kept under `test` for its unit test.
+// `DirectoryMetaChanges`/`FileMetaChanges`; kept under `test` for its unit test. A missing
+// field is None (leave unchanged), `null` is Some(None) (clear), a timestamp sets it.
 #[cfg(any(feature = "wasm-full", test))]
+#[allow(clippy::option_option)]
 pub(crate) fn deserialize_double_option_timestamp<'de, D>(
 	deserializer: D,
 ) -> Result<Option<Option<DateTime<Utc>>>, D::Error>
@@ -27,6 +29,7 @@ mod tests {
 	#[derive(Debug, Deserialize)]
 	struct MyStruct {
 		#[serde(default, deserialize_with = "deserialize_double_option_timestamp")]
+		#[allow(clippy::option_option)] // the deserializer's three states
 		field: Option<Option<DateTime<Utc>>>,
 	}
 
