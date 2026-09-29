@@ -1869,6 +1869,39 @@ fn detect_moves<'m>(
 	actions: &mut Vec<SyncAction>,
 	consumed: &mut HashSet<String>,
 ) {
+	// Content hash -> the new local paths carrying it (not in baseline, not on the remote). Keyed by
+	// the raw bytes since `Blake3Hash` is not `std::hash::Hash`. Built before either half runs: it
+	// depends on neither half's decisions, and it is what bounds the rows the push half keeps below.
+	let mut created_by_hash: HashMap<[u8; 32], Vec<Cow<'m, str>>> = HashMap::new();
+	if mode.pushes() {
+		visit_move_targets(paths, local, |path, node| {
+			// The side map first: on a whole pass it is a hash lookup and the baseline is a read of
+			// the store, and almost every local file is on the remote too.
+			if node.kind == NodeKind::File
+				&& !remote.holds(&path)
+				&& !baseline.contains_key(&path)
+				&& let Some(hash) = node.content_hash
+			{
+				created_by_hash
+					.entry(*hash.as_ref())
+					.or_default()
+					.push(path);
+			}
+		});
+	}
+	// The rows a LOCAL move can start from: synced files the local side no longer holds whose content
+	// reappears at a new local path. Collected on the pull half's walk of the rows where there is one,
+	// so a two-way pass walks them once — in the order a walk of their own would hand them out, and
+	// judged against `consumed` only once the pull half is done with it, exactly as that walk would
+	// judge them. Only a row with somewhere to move to is kept: a mass deletion keeps none.
+	let local_source = |base: &BaselineEntry| {
+		base.content_hash
+			.is_some_and(|hash| created_by_hash.contains_key(hash.as_ref()))
+			&& base.kind == NodeKind::File
+			&& base.state == BaselineState::Synced
+			&& !local.holds(&base.rel_path)
+	};
+	let mut local_sources: Vec<BaselineEntry> = Vec::new();
 	if mode.pulls() {
 		// One walk for both indexes. The second is there because a file's uuid is re-minted by
 		// every content edit, so a move that CARRIED an edit inside one window is invisible to the
@@ -1888,6 +1921,9 @@ fn detect_moves<'m>(
 			remote_path_of_uuid.insert(node.remote_uuid, path);
 		});
 		visit_move_sources(paths, baseline, false, |base| {
+			if mode.pushes() && local_source(base) {
+				local_sources.push(base.clone());
+			}
 			let from = &base.rel_path;
 			if base.kind != NodeKind::File
 				|| base.state != BaselineState::Synced
@@ -2003,44 +2039,29 @@ fn detect_moves<'m>(
 				consumed.insert(to.to_string());
 			}
 		});
+	} else if mode.pushes() && !created_by_hash.is_empty() {
+		visit_move_sources(paths, baseline, false, |base| {
+			if local_source(base) {
+				local_sources.push(base.clone());
+			}
+		});
 	}
 
 	if mode.pushes() {
-		// Content hash -> the new local paths carrying it (not in baseline, not on the remote).
-		// Keyed by the raw bytes since `Blake3Hash` is not `std::hash::Hash`.
-		let mut created_by_hash: HashMap<[u8; 32], Vec<Cow<'m, str>>> = HashMap::new();
-		visit_move_targets(paths, local, |path, node| {
-			// The side map first: on a whole pass it is a hash lookup and the baseline is a read of
-			// the store, and almost every local file is on the remote too.
-			if node.kind == NodeKind::File
-				&& !remote.holds(&path)
-				&& !baseline.contains_key(&path)
-				&& let Some(hash) = node.content_hash
-			{
-				created_by_hash
-					.entry(*hash.as_ref())
-					.or_default()
-					.push(path);
-			}
-		});
-		visit_move_sources(paths, baseline, false, |base| {
+		for base in &local_sources {
 			let from = &base.rel_path;
-			if base.kind != NodeKind::File
-				|| base.state != BaselineState::Synced
-				|| consumed.contains(from)
-				|| local.holds(from)
-			{
-				return;
+			if consumed.contains(from) {
+				continue;
 			}
 			let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
-				return;
+				continue;
 			};
 			// The remote must still hold the original file at `from` for there to be one to move.
 			if remote.at(from).map(|n| n.remote_uuid) != Some(uuid) {
-				return;
+				continue;
 			}
 			let Some(candidates) = created_by_hash.get(hash.as_ref()) else {
-				return;
+				continue;
 			};
 			let fresh: Vec<&str> = candidates
 				.iter()
@@ -2063,7 +2084,7 @@ fn detect_moves<'m>(
 				consumed.insert(from.clone());
 				consumed.insert(to.to_string());
 			}
-		});
+		}
 	}
 }
 
@@ -5321,6 +5342,44 @@ mod tests {
 				.iter()
 				.any(|a| matches!(a, SyncAction::MoveLocal { .. })),
 			"the adopted row was matched as a move source: {actions:?}"
+		);
+	}
+
+	/// The push half of a two-way pass judges the rows the pull half's walk kept for it: a local
+	/// rename is a remote move, and of two rows gone with the same content the first in path order
+	/// is its source — as a walk of its own would have picked.
+	#[test]
+	fn a_two_way_local_rename_is_a_remote_move_and_the_first_same_hash_source_wins() {
+		let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+		let baseline = map(vec![
+			("a.txt", base_file("a.txt", a, [5; 32])),
+			("b.txt", base_file("b.txt", b, [5; 32])),
+		]);
+		let remote = map(vec![
+			("a.txt", remote_file("a.txt", a, [5; 32])),
+			("b.txt", remote_file("b.txt", b, [5; 32])),
+		]);
+		let local = map(vec![("c.txt", local_file("c.txt", [5; 32]))]);
+		let actions = plan(SyncMode::TwoWay, &baseline, &local, &remote);
+		let moves: Vec<_> = actions
+			.iter()
+			.filter(|action| matches!(action, SyncAction::MoveRemote { .. }))
+			.collect();
+		assert_eq!(
+			moves,
+			vec![&SyncAction::MoveRemote {
+				from_path: "a.txt".to_string(),
+				to_path: "c.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: a,
+			}],
+			"{actions:?}"
+		);
+		assert!(
+			!actions.contains(&SyncAction::UploadFile {
+				rel_path: "c.txt".to_string()
+			}),
+			"the renamed file was uploaded again: {actions:?}"
 		);
 	}
 
