@@ -1,7 +1,7 @@
 use std::{
 	borrow::Cow,
-	env,
-	sync::{Arc, OnceLock},
+	env, mem,
+	sync::{Arc, Mutex, OnceLock, PoisonError},
 	time::Duration,
 };
 
@@ -30,11 +30,33 @@ pub struct TestResources {
 	pub dir: RemoteDirectory,
 }
 
+/// Directory cleanups spawned by dropped [`TestResources`] and not awaited yet. A drop inside a
+/// runtime cannot block on its cleanup, and the cleanup takes the account-wide drive lock: a test
+/// starting while one runs would wait out its hold, or the whole server lease if the release is
+/// lost. The next [`Resources::get_resources`] awaits them first.
+static PENDING_CLEANUPS: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+async fn await_pending_cleanups() {
+	let pending = mem::take(
+		&mut *PENDING_CLEANUPS
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner),
+	);
+	for cleanup in pending {
+		// A cleanup that panicked or whose runtime is gone has nothing left to wait for.
+		let _ = cleanup.await;
+	}
+}
+
 impl Drop for TestResources {
 	fn drop(&mut self) {
 		match tokio::runtime::Handle::try_current() {
 			Ok(handle) => {
-				handle.spawn(Self::cleanup(self.client.clone(), self.dir.clone()));
+				let cleanup = handle.spawn(Self::cleanup(self.client.clone(), self.dir.clone()));
+				PENDING_CLEANUPS
+					.lock()
+					.unwrap_or_else(PoisonError::into_inner)
+					.push(cleanup);
 			}
 			Err(_) => {
 				let rt = rt();
@@ -92,6 +114,7 @@ impl Resources {
 	}
 
 	pub async fn get_resources(&self) -> TestResources {
+		await_pending_cleanups().await;
 		let name = format!(
 			"rs-{}",
 			BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
@@ -108,6 +131,7 @@ impl Resources {
 	}
 
 	pub async fn get_resources_with_lock(&self) -> (TestResources, Arc<ResourceLock>) {
+		await_pending_cleanups().await;
 		let name = format!(
 			"rs-{}",
 			BASE64_URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
