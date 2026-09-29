@@ -5167,9 +5167,27 @@ pub async fn test_draining_drops_markers_for_files_with_no_local_copy() {
 // markers and uploads their files underneath them: two uploads race the same `cache_dir/<uuid>`
 // rename (ENOENT), and the drain re-marks a file the owning test has just cleared. Isolating the
 // cache is what makes the drain's own behaviour observable without perturbing anything else.
+//
+// The live replay tests use it too. On the shared cache, sibling tests' rows make their events
+// relevant to the replay: a buffered apply that fails owes a reconcile pass, and a row the replay
+// cannot attribute refuses the log. Either one turns a replayable gap into the full sweep those
+// tests assert did not run. Isolation removes the rows replay cannot attribute, those parented to
+// Recents, Favorites or Links, since nothing lists those here; the rest it only narrows. The seed
+// pass re-lists the account root, so every sibling test dir that exists by then is held here too,
+// and events directly under one can still fail to apply or add it to the replay's targets. The
+// purge test's trash listing likewise holds every trashed item on the account.
 async fn get_isolated_db_resources(tag: &str) -> (Arc<FilenMobileCacheState>, TestResources) {
-	let files_path = std::env::temp_dir().join(format!("test_files_{tag}"));
+	let files_path = isolated_files_path(tag);
 	std::fs::create_dir_all(&files_path).unwrap();
+	// The state is in memory, but the `db_state.json` it mirrors its live bookkeeping to sits in
+	// the temp dir and outlives the run. Tests that read the mirror must see this state's values:
+	// the event cursor is written as the max over the file, so a previous run's would satisfy a
+	// wait for this run's before it exists.
+	if let Err(e) = std::fs::remove_file(files_path.join("db_state.json"))
+		&& e.kind() != std::io::ErrorKind::NotFound
+	{
+		panic!("could not clear the previous run's db_state.json: {e}");
+	}
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = resources.client.to_stringified();
 	let state = Arc::new(
@@ -5180,6 +5198,11 @@ async fn get_isolated_db_resources(tag: &str) -> (Arc<FilenMobileCacheState>, Te
 		.unwrap(),
 	);
 	(state, resources)
+}
+
+// Where `get_isolated_db_resources` keeps `tag`'s files, `db_state.json` among them.
+fn isolated_files_path(tag: &str) -> std::path::PathBuf {
+	std::env::temp_dir().join(format!("test_files_{tag}"))
 }
 
 // Returns the cached file's (uuid, stable_uuid) pair. The two diverge as soon as the server
@@ -6998,7 +7021,9 @@ pub async fn test_a_pre_aborted_signal_stops_before_anything_happens() {
 /// themselves and the assertions are meaningless. Readers run freely alongside each other and
 /// the rest of the suite; they only exclude the live window. An in-process lock is the right
 /// scope: sibling CI legs run separate processes on separate cache DBs and separate accounts
-/// per auth version, so nothing crosses processes except wall-clock slowdown.
+/// per auth version, so nothing crosses processes except wall-clock slowdown. The replay tests
+/// arm their drainers on isolated states, not the singleton, and take the write guard only to
+/// stay serialized with the other live windows on the shared account.
 static LIVE_WINDOW_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 /// Tears the drainer down on drop, as a panic safety net: the write guard is released on
@@ -7660,13 +7685,12 @@ fn last_listed(db: &FilenMobileCacheState, uuid: &str) -> i64 {
 
 /// The live path's durable bookkeeping, read from the `db_state.json` the cache mirrors it to
 /// (`update_saved_db_state`; the in-memory test state writes it like any other).
-fn saved_db_state() -> serde_json::Value {
-	let path = std::env::temp_dir()
-		.join("test_files")
-		.join("db_state.json");
+fn saved_db_state(tag: &str) -> serde_json::Value {
+	let path = isolated_files_path(tag).join("db_state.json");
 	let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
 		panic!(
-			"{} must exist once the cache has run (get_db_resources builds the same path): {e}",
+			"{} must exist once the cache has run (get_isolated_db_resources builds the same \
+			 path): {e}",
 			path.display()
 		)
 	});
@@ -7675,16 +7699,22 @@ fn saved_db_state() -> serde_json::Value {
 
 /// The drive watermark: the last drive counter this cache accounted for. Written by the drainer
 /// ONLY — at the end of a gap pass that converged, and after each live event it applies.
-fn drive_watermark() -> i64 {
-	saved_db_state()["driveWatermark"].as_i64().unwrap_or(0)
+fn drive_watermark(tag: &str) -> i64 {
+	saved_db_state(tag)["driveWatermark"].as_i64().unwrap_or(0)
 }
 
 /// Whether a reconcile pass is owed. Set by `set_materialized_containers` for a container it has
 /// not seen before; cleared only by a pass that converged.
-fn pending_reconcile() -> bool {
-	saved_db_state()["pendingReconcile"]
+fn pending_reconcile(tag: &str) -> bool {
+	saved_db_state(tag)["pendingReconcile"]
 		.as_bool()
 		.unwrap_or(false)
+}
+
+/// The event cursor, once a converged pass or a replay has stamped it (`advance_events_cursor`
+/// sets it in memory first and mirrors it here after).
+fn events_cursor(tag: &str) -> Option<i64> {
+	saved_db_state(tag)["eventsCursor"].as_i64()
 }
 
 /// Waits until the drainer has run its gap check and moved on, after a `start_live_updates`
@@ -7703,10 +7733,10 @@ fn pending_reconcile() -> bool {
 /// under the (held, hence relevant) test dir — the same shape as
 /// `wait_until_live_is_delivering`, for the same reason: an event emitted before the
 /// subscription is up is never redelivered.
-async fn wait_until_the_gap_check_has_run(rss: &TestResources, before: i64) {
+async fn wait_until_the_gap_check_has_run(rss: &TestResources, tag: &str, before: i64) {
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
 	let mut pass = 0;
-	while drive_watermark() <= before {
+	while drive_watermark(tag) <= before {
 		assert!(
 			std::time::Instant::now() < deadline,
 			"the drive watermark never moved past {before}: no gap pass converged and no live \
@@ -7718,7 +7748,7 @@ async fn wait_until_the_gap_check_has_run(rss: &TestResources, before: i64) {
 			.unwrap();
 		pass += 1;
 		let settle = std::time::Instant::now() + std::time::Duration::from_secs(6);
-		while drive_watermark() <= before && std::time::Instant::now() < settle {
+		while drive_watermark(tag) <= before && std::time::Instant::now() < settle {
 			tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 		}
 	}
@@ -7732,25 +7762,36 @@ async fn wait_until_the_gap_check_has_run(rss: &TestResources, before: i64) {
 /// about, so a test that does not wait for the sweep to CONVERGE is testing the fallback.
 ///
 /// Convergence is observed through the debt: every caller has just reported fresh materialized
-/// containers, which owes a pass, and only a pass that converged clears it. A drainer leaked by
-/// a sibling test (see `LiveWindow`) fails here, loudly, rather than three assertions later:
-/// `start_live_updates` is then a no-op, no gap check runs, and the debt stands.
-async fn seed_the_event_cursor(db: &Arc<FilenMobileCacheState>, rss: &TestResources) {
+/// containers, which owes a pass, and only a pass that converged clears it.
+///
+/// And through the cursor itself. The pass clears the debt before it stamps the cursor
+/// (`gap_check` runs `reconcile_pass`, then `advance_events_cursor`), so a clear debt does not
+/// yet mean a cursor exists: a `stop_live_updates` landing in between aborts the drainer with
+/// the cursor unset, and the reconnect then has nothing to replay from and sweeps. The cursor is
+/// set in memory before it is mirrored to the file, so its value in the file is the proof.
+async fn seed_the_event_cursor(db: &Arc<FilenMobileCacheState>, rss: &TestResources, tag: &str) {
 	assert!(
-		pending_reconcile(),
+		pending_reconcile(tag),
 		"report the materialized containers before seeding; that is what owes the pass"
 	);
-	let before = drive_watermark();
+	let before = drive_watermark(tag);
 	db.start_live_updates();
-	wait_until_the_gap_check_has_run(rss, before).await;
+	wait_until_the_gap_check_has_run(rss, tag, before).await;
 	// The pass writes the watermark before it clears the debt; give that write its moment.
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-	while pending_reconcile() {
+	while pending_reconcile(tag) {
 		assert!(
 			std::time::Instant::now() < deadline,
-			"the launch pass did not converge, or never ran because a sibling live test left \
-			 the drainer armed and `start_live_updates` was a no-op; with the debt standing, \
-			 every later gap falls back to the sweep and replay cannot be tested"
+			"the launch pass did not converge; with the debt standing, every later gap falls \
+			 back to the sweep and replay cannot be tested"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+	}
+	while events_cursor(tag).is_none() {
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the launch pass converged but never stamped the event cursor; the next gap has no \
+			 lower bound to replay from and falls back to the sweep"
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 	}
@@ -7776,8 +7817,9 @@ async fn outlast_the_dispatch() {
 /// the decoy standing still is that difference, in miniature.
 #[shared_test_runtime]
 pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() {
+	let tag = "replay_gap";
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
-	let (db, rss) = get_db_resources().await;
+	let (db, rss) = get_isolated_db_resources(tag).await;
 	let _teardown = LiveWindow(db.clone());
 
 	let target = rss
@@ -7802,7 +7844,7 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 
 	// The sweep that stamps the cursor is the same sweep whose absence the decoy is about to
 	// demonstrate; its stamp is read only once that sweep has converged.
-	seed_the_event_cursor(&db, &rss).await;
+	seed_the_event_cursor(&db, &rss, tag).await;
 	let decoy_listed_before = last_listed(&db, &decoy_uuid);
 
 	// The outage, and a change in exactly one of the two containers.
@@ -7825,11 +7867,11 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 	);
 	outlast_the_dispatch().await;
 
-	let before_reconnect = drive_watermark();
+	let before_reconnect = drive_watermark(tag);
 	db.start_live_updates();
 	// The decoy's stamp below is a negative assertion, so it may only be read once the gap
 	// check — and every listing it started — is over.
-	wait_until_the_gap_check_has_run(&rss, before_reconnect).await;
+	wait_until_the_gap_check_has_run(&rss, tag, before_reconnect).await;
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 	let delivered = loop {
 		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap() {
@@ -7869,8 +7911,9 @@ pub async fn test_a_gap_replays_the_event_log_instead_of_relisting_everything() 
 /// listed the origin, which for a materialized container is never.
 #[shared_test_runtime]
 pub async fn test_replaying_a_move_relists_both_ends() {
+	let tag = "replay_move";
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
-	let (db, rss) = get_db_resources().await;
+	let (db, rss) = get_isolated_db_resources(tag).await;
 	let _teardown = LiveWindow(db.clone());
 
 	let origin = rss
@@ -7930,7 +7973,7 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 		origin_uuid
 	);
 
-	seed_the_event_cursor(&db, &rss).await;
+	seed_the_event_cursor(&db, &rss, tag).await;
 	let origin_listed_before = last_listed(&db, &origin_uuid);
 	let decoy_listed_before = last_listed(&db, &decoy_uuid);
 
@@ -7942,13 +7985,13 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 		.unwrap();
 	outlast_the_dispatch().await;
 
-	let before_reconnect = drive_watermark();
+	let before_reconnect = drive_watermark(tag);
 	db.start_live_updates();
 	// Every stamp below is read only once the gap check is over. The pass lists its containers
 	// concurrently and the destination's listing alone re-parents the row, so polling for the
 	// re-parent and then reading the origin's stamp reads it mid-pass — which is exactly how
 	// this test once failed with the origin's listing 217 µs from landing.
-	wait_until_the_gap_check_has_run(&rss, before_reconnect).await;
+	wait_until_the_gap_check_has_run(&rss, tag, before_reconnect).await;
 	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 	loop {
 		if let Some(FfiObject::File(f)) = db.query_item_by_uuid(&stable_id).unwrap()
@@ -8017,8 +8060,9 @@ pub async fn test_replaying_a_move_relists_both_ends() {
 /// longer has, until the user happens to open Trash.
 #[shared_test_runtime]
 pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
+	let tag = "replay_purge";
 	let _live_window = LIVE_WINDOW_LOCK.write().await;
-	let (db, rss) = get_db_resources().await;
+	let (db, rss) = get_isolated_db_resources(tag).await;
 	let _teardown = LiveWindow(db.clone());
 
 	let container = rss
@@ -8062,7 +8106,7 @@ pub async fn test_replaying_a_purge_from_the_trash_retires_the_row() {
 	db.set_materialized_containers(vec![container_uuid.clone()])
 		.await
 		.unwrap();
-	seed_the_event_cursor(&db, &rss).await;
+	seed_the_event_cursor(&db, &rss, tag).await;
 
 	// The outage, and the purge. `deleteFilePermanently` carries the lineage but no parent, and
 	// the row it names sits in the trash — so the trash listing is the only thing that can

@@ -19,6 +19,7 @@ use filen_sdk_rs::{
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::OnceCell;
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod locks;
 
@@ -140,11 +141,34 @@ pub fn rt() -> &'static tokio::runtime::Runtime {
 			.add_directive("reqwest=info".parse().expect("valid directive"))
 			.add_directive("html5ever=info".parse().expect("valid directive"))
 			.add_directive("selectors=info".parse().expect("valid directive"));
+		// The mobile cache's live path logs why each reconnect replayed the event log or fell back
+		// to re-listing every container. Those lines come from its runtime's worker threads, which
+		// inherit the output capture of whichever test built that runtime, so through the test
+		// writer they print only if THAT test fails. A direct write to stderr is never captured.
+		// INFO is the decisions and failures, without the per-event lines.
+		let live_decisions = tracing_subscriber::filter::Targets::new()
+			.with_target(
+				"filen_mobile_native_cache::live",
+				tracing_subscriber::filter::LevelFilter::INFO,
+			)
+			.with_target(
+				"filen_mobile_native_cache::replay",
+				tracing_subscriber::filter::LevelFilter::INFO,
+			);
 		// `try_init` so this coexists with any subscriber the SDK installs; `with_test_writer`
-		// routes output through cargo test's capture.
-		let _ = tracing_subscriber::fmt()
-			.with_env_filter(filter)
-			.with_test_writer()
+		// routes output through cargo test's capture. The filters are per layer, so `RUST_LOG`
+		// narrows the captured output without silencing the decision lines.
+		let _ = tracing_subscriber::registry()
+			.with(
+				tracing_subscriber::fmt::layer()
+					.with_test_writer()
+					.with_filter(filter),
+			)
+			.with(
+				tracing_subscriber::fmt::layer()
+					.with_writer(std::io::stderr)
+					.with_filter(live_decisions),
+			)
 			.try_init();
 		tokio::runtime::Builder::new_multi_thread()
 			.enable_all()

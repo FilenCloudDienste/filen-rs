@@ -336,8 +336,9 @@ async fn gap_check(state: &Arc<RwLock<CacheState>>) {
 	// NO state guard across the round trip (the module's lock discipline).
 	let remote = match client.get_last_event_ids().await {
 		Ok(response) => response.drive,
+		// At INFO like the decisions below: it skips the whole check, at most once per connect.
 		Err(e) => {
-			tracing::debug!("gap check could not read the drive counter: {e}");
+			tracing::info!("gap check could not read the drive counter: {e}");
 			return;
 		}
 	};
@@ -424,6 +425,7 @@ async fn close_gap_by_replay(
 		}
 	}
 	if !relist_containers(state, containers.into_iter().collect()).await {
+		tracing::info!("a container the replay named did not converge; full pass");
 		return false;
 	}
 	// Only now: a cursor advanced over a container that did not converge would leave it stale
