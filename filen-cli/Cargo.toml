@@ -67,6 +67,7 @@ console = "0.16.4"
 ctrlc = "3.5.2"
 schemars = "1.2.2"
 rmcp = { version = "3.4.0", features = ["server", "transport-io"] }
+jsonrpsee = { version = "0.26.0", features = ["server"] }
 
 [dev-dependencies]
 test-utils = { path = "../test-utils", features = ["cli"] }

@@ -6,6 +6,7 @@ use crate::ui::UI;
 use anyhow::{Context as _, Result};
 
 mod endpoints;
+pub(crate) mod rpc_server;
 pub(crate) mod server;
 
 pub(crate) async fn mcp_cmd(ui: &mut UI) -> Result<()> {
