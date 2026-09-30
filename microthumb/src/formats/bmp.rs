@@ -122,13 +122,18 @@ impl PreparedDecode for PreparedBmp {
 	}
 
 	fn peak_estimate(&self) -> usize {
-		// One raw row + one RGBA row + the palette.
-		self.header.stride as usize + self.header.width as usize * 4 + self.header.palette.len()
+		// One raw row + one RGBA row + the palette; a row wider than this
+		// target's usize prices as unaffordable.
+		usize::try_from(self.header.stride)
+			.unwrap_or(usize::MAX)
+			.saturating_add(self.header.width as usize * 4)
+			.saturating_add(self.header.palette.len())
 	}
 
 	fn decode_into(mut self: Box<Self>, sink: &mut dyn PixelSink) -> Result<(), ThumbError> {
 		let h = &self.header;
-		let mut raw = vec![0u8; h.stride as usize];
+		let stride = usize::try_from(h.stride).map_err(|_| err("row too large"))?;
+		let mut raw = vec![0u8; stride];
 		let mut rgba = vec![0u8; h.width as usize * 4];
 		let used = match h.bits_per_px {
 			8 => h.width as usize,
