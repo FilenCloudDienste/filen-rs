@@ -20,6 +20,7 @@
 //! | [`any_folded_row_at_or_under`](Baseline::any_folded_row_at_or_under) | folded, at or under, first match | the two above, paged, stopping at the first row the predicate takes |
 //! | [`subtree_all_synced`](Baseline::subtree_all_synced) | subtree predicate | `baseline_state (pair_id, state, rel_path)`: one seek per unsynced state, bounded to the range |
 //! | [`subtree`](Baseline::subtree), [`visit_subtree_paths`](Baseline::visit_subtree_paths) | subtree | the primary key's range `(p/, p0)`, paged |
+//! | [`count_subtree`](Baseline::count_subtree) | subtree, counted | one `COUNT` over the primary key's range `(p/, p0)`; through edits, the walk above |
 //! | [`iter`](Baseline::iter), [`visit_rows`](Baseline::visit_rows), [`visit_row_paths`](Baseline::visit_row_paths) | whole pair | the primary key, paged |
 //! | [`len`](Baseline::len), [`carryable_rows`](Baseline::carryable_rows), [`has_remote_rows`](Baseline::has_remote_rows) | count | `baseline_counts`, read once when the snapshot begins |
 //! | [`any_unconfirmed`](Baseline::any_unconfirmed), [`unconfirmed`](Baseline::unconfirmed) | small set | the partial index `baseline_unconfirmed` |
@@ -1344,6 +1345,20 @@ impl Baseline {
 		self.visit_in(Span::under(root), false, &mut |row| visit(&row.rel_path));
 	}
 
+	/// How many rows lie STRICTLY under `root` (`""` is every row): what
+	/// [`visit_subtree_paths`](Self::visit_subtree_paths) visits, counted by the table rather than
+	/// read out of it. Through the pass's edits it is that walk, counted — the one caller, the
+	/// assembly check, asks before the pass has edited anything.
+	pub(super) fn count_subtree(&self, root: &str) -> usize {
+		if self.depth() > 0 {
+			let mut rows = 0;
+			self.visit_subtree_paths(root, |_| rows += 1);
+			return rows;
+		}
+		self.table()
+			.map_or(0, |snapshot| snapshot.count_under(root))
+	}
+
 	/// The rows awaiting confirmation of a push of ours. Empty on a converged pair.
 	pub(super) fn unconfirmed(&self) -> impl Iterator<Item = BaselineEntry> + '_ {
 		self.unconfirmed_in(self.depth()).into_iter()
@@ -1986,6 +2001,11 @@ pub(super) mod tests {
 				sorted(oracle_under),
 				"{at}: visit_subtree_paths"
 			);
+			assert_eq!(
+				view.count_subtree(path),
+				under_paths.len(),
+				"{at}: count_subtree"
+			);
 		}
 	}
 
@@ -2149,6 +2169,14 @@ pub(super) mod tests {
 			rows.iter()
 				.map(|row| row.rel_path.clone())
 				.chain(["new", "new/inner", "archive/new", "DOCS"].map(String::from)),
+		);
+		// Before any edit too: the view is the table alone there, and its answers the table's own
+		// statements — the one place `count_subtree` is a `COUNT` rather than the walk it counts.
+		assert_alike(
+			"unedited",
+			&Baseline::from_rows(rows.clone()),
+			&Tree::from_rows(rows.clone()),
+			&everything,
 		);
 		let (mut mapped, mut written, mut confirms, mut deepest) = (0, 0, 0, 0);
 		for (seeds, steps) in [(0..60, 8), (1000..1020, 24)] {
