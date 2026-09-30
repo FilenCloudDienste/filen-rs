@@ -1347,8 +1347,9 @@ impl Baseline {
 
 	/// How many rows lie STRICTLY under `root` (`""` is every row): what
 	/// [`visit_subtree_paths`](Self::visit_subtree_paths) visits, counted by the table rather than
-	/// read out of it. Through the pass's edits it is that walk, counted — the one caller, the
-	/// assembly check, asks before the pass has edited anything.
+	/// read out of it. Through the pass's edits it is that walk, counted — both callers, the
+	/// assembly check and the pairing of a renamed directory with the rows it left, ask before the
+	/// pass has edited anything.
 	pub(super) fn count_subtree(&self, root: &str) -> usize {
 		if self.depth() > 0 {
 			let mut rows = 0;
