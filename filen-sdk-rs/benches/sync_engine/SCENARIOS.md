@@ -142,17 +142,21 @@ misquoting these replace came from names that did not:
   file; a scoped pass that decides many paths asks about them in path order and
   reads them a page at a time, so the count follows how the paths cluster:
   `twoway_one_percent_100k` runs 745 statements for its 982 changed paths,
-  `twoway_top_dir_move_100k`, whose moved directory holds half the pair, 848.
+  `twoway_top_dir_move_100k`, whose moved directory holds half the pair, 1,048.
   A directory move's rows are bounded the way its edits are: each move scenario
   declares the rows its pass may read per file the move carries
   (`read_rows_per_carried_file`), set at the multiple it measured rounded up, so a
-  pass that reads the moved subtree once more fails the run. It is 8 for
-  `twoway_top_dir_move_100k` (350,072 rows for 50,000 files), and 20, 30 and 37 for
-  the leaf moves at 10k, 100k and 1M, set when they read 393, 582 and 738 rows for
-  their twenty files; they read 329, 518 and 674 since a directory move proven to
-  carry its subtree unchanged stopped deciding it. About half of a leaf's rows are
-  the page the fold's cursor reads ahead past the leaf: its first walk of the
-  pass's paths reads 190 of the 329 at 10k, for twenty files and their directory.
+  pass that reads the moved subtree once more fails the run. It is 9 for
+  `twoway_top_dir_move_100k` (400,075 rows for 50,000 files, eight reads of the
+  moved subtree; one of them is the observation's read of the rows the renamed
+  directory's files take their hashes from instead of opening them), and 20, 30
+  and 37 for the leaf moves at 10k, 100k and 1M, set when they read 393, 582 and
+  738 rows for their twenty files; they read 329, 518 and 674 once a directory
+  move proven to carry its subtree unchanged stopped deciding it, and 352, 541 and
+  697 since the renamed leaf's walk reads the rows its files left. About half of a
+  leaf's rows are the page the fold's cursor reads ahead past the leaf: its first
+  walk of the pass's paths reads 190 of the 352 at 10k, for twenty files and their
+  directory.
   `pass_view` is zero for every scenario whose remote changelist is empty, which is
   every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
   it was not told about. Zero is an answer, which is why that column is printed in

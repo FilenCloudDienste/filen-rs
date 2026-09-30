@@ -686,9 +686,9 @@ pub struct Scenario {
 	/// subtree costs a row per file, so a bound set at the multiple the scenario measured, rounded
 	/// up to the next whole one, fails a pass that reads the subtree once more. Per scenario rather
 	/// than one constant, because the multiple is not one: a directory holding half the pair reads
-	/// seven rows a file, while a leaf of twenty files reads sixteen to thirty-four, about half of
+	/// eight rows a file, while a leaf of twenty files reads seventeen to thirty-five, about half of
 	/// them the page the fold's cursor reads ahead past the leaf (its first walk of the pass's
-	/// paths reads 190 of the 10k tree's 329). Lower it when a read is removed. `None` for every
+	/// paths reads 190 of the 10k tree's 352). Lower it when a read is removed. `None` for every
 	/// other change class; `validate` holds the two together.
 	///
 	/// Not in [`definition_hash`](Self::definition_hash): it decides what a run REFUSES, not what
@@ -924,7 +924,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		PER_CHANGED,
 	),
 	Scenario {
-		// 329 rows for the twenty files the leaf carries.
+		// 352 rows for the twenty files the leaf carries.
 		read_rows_per_carried_file: Some(20),
 		..balanced(
 			"twoway_dir_move_10k",
@@ -1151,7 +1151,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		PER_CHANGED,
 	),
 	Scenario {
-		// 518 rows for the twenty files the leaf carries.
+		// 541 rows for the twenty files the leaf carries.
 		read_rows_per_carried_file: Some(30),
 		..balanced(
 			"twoway_dir_move_100k",
@@ -1193,8 +1193,10 @@ pub const SCENARIOS: &[Scenario] = &[
 			conflicts: Count::Exactly(0),
 			dir_moves: Count::PerChanged,
 		},
-		// 350,072 rows for 50,000 files: the moved subtree, read seven times.
-		read_rows_per_carried_file: Some(8),
+		// 400,075 rows for 50,000 files: the moved subtree, read eight times. One of them is the
+		// observation's read of the rows the renamed directory's files take their hashes from,
+		// which is what spares it opening and reading those 50,000 files.
+		read_rows_per_carried_file: Some(9),
 	},
 	balanced(
 		"twoway_after_upload_100k",
@@ -1250,7 +1252,7 @@ pub const SCENARIOS: &[Scenario] = &[
 	// confirmed push — at the size where a copy of the tree was the pass's widest point, before
 	// those edits moved beside the tree instead of into a copy of it.
 	Scenario {
-		// 674 rows for the twenty files the leaf carries.
+		// 697 rows for the twenty files the leaf carries.
 		read_rows_per_carried_file: Some(37),
 		..balanced(
 			"twoway_dir_move_1m",
