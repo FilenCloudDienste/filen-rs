@@ -313,6 +313,16 @@ impl<T> Side<T> {
 		.map(String::as_str)
 	}
 
+	/// Whether this pass recorded nothing at `path`, so that whatever this side holds there is the
+	/// node its row carries. No row is read to say so. A whole side records everything it holds
+	/// and never answers `true`.
+	pub(super) fn untouched(&self, path: &str) -> bool {
+		match self {
+			Self::Whole(_) => false,
+			Self::Carried(overlay) => overlay.get(path).is_none(),
+		}
+	}
+
 	/// This side's nodes by value, for a test that owns a WHOLE one and wants to feed them
 	/// somewhere. Asserts the backing for the reason [`whole`](Self::whole) does: a carried side's
 	/// nodes are not held anywhere to be handed over.
