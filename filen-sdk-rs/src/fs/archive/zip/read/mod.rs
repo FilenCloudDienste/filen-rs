@@ -24,17 +24,21 @@ use super::{
 	METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_STORED, METHOD_XZ, METHOD_ZSTD, cp437,
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
 };
-use crate::fs::drive_job::exceeds_limit;
 use crate::{
 	Error, ErrorKind,
-	fs::archive::{
-		bytes,
-		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
-		error::read_failure,
-		format::StreamCodec,
-		limits::HEAP_PER_INDEX_BYTE,
-		password::ArchivePassword,
+	fs::{
+		archive::{
+			bytes,
+			decode::{StreamDecoder, clamp_lzma_dict, lzma_memory, open_stream},
+			error::read_failure,
+			format::StreamCodec,
+			limits::HEAP_PER_INDEX_BYTE,
+			password::ArchivePassword,
+		},
+		drive_job::exceeds_limit,
+		zip::ZipExtendedTime,
 	},
+	io::nt_time_to_datetime,
 	util::SeededMap,
 };
 
@@ -569,10 +573,10 @@ fn parse_central_header(
 			}
 			// NTFS times: a tag of mtime, atime and ctime as FILETIMEs
 			0x000A if data.len() >= 32 && u16_at(data, 4) == 1 && u16_at(data, 6) >= 24 => {
-				modified = filetime(u64_at(data, 8));
+				modified = nt_time_to_datetime(u64_at(data, 8));
 			}
 			// Unix extended timestamp: flags, then the modification time when flagged
-			0x5455 if data.len() >= 5 && data[0] & 1 == 1 => {
+			ZipExtendedTime::HEADER_ID if data.len() >= 5 && data[0] & 1 == 1 => {
 				let secs = i32::from_le_bytes(data[1..5].try_into().expect("4 bytes"));
 				unix_modified = DateTime::from_timestamp(i64::from(secs), 0);
 			}
@@ -662,13 +666,6 @@ fn parse_central_header(
 		},
 		next,
 	))
-}
-
-/// A Windows FILETIME (100 ns ticks since 1601) as a time, if it is one chrono can hold.
-fn filetime(ticks: u64) -> Option<DateTime<Utc>> {
-	const EPOCH_DIFFERENCE_SECS: i64 = 11_644_473_600;
-	let secs = i64::try_from(ticks / 10_000_000).ok()? - EPOCH_DIFFERENCE_SECS;
-	DateTime::from_timestamp(secs, (ticks % 10_000_000) as u32 * 100)
 }
 
 /// A DOS date and time, which is in whatever time zone the writer was in: read as local time,
@@ -823,13 +820,8 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 }
 
 /// A reader two decoders share, one after the other.
+#[derive(Clone)]
 struct Shared<'s>(Rc<RefCell<Box<dyn Read + 's>>>);
-
-impl Clone for Shared<'_> {
-	fn clone(&self) -> Self {
-		Self(Rc::clone(&self.0))
-	}
-}
 
 impl Read for Shared<'_> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -890,9 +882,9 @@ fn lzma_entry<'s>(
 		entry.size
 	};
 	let dict_size = clamp_lzma_dict(dict_size, Some(entry.size));
-	let kib = lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props)
-		.map_err(|_| ZipError::Corrupt("invalid LZMA properties"))?;
-	if u64::from(kib) * 1024 > limits.decoder_memory {
+	let memory =
+		lzma_memory(dict_size, props).ok_or(ZipError::Corrupt("invalid LZMA properties"))?;
+	if memory > limits.decoder_memory {
 		return Err(ZipError::TooLarge(
 			"an entry's LZMA dictionary is over the codec budget",
 		));

@@ -36,7 +36,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::{DateTime, Utc};
 use filen_types::fs::Uuid;
 use futures::{StreamExt, stream::FuturesUnordered};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::{
 	Error, ErrorKind,
@@ -65,10 +65,7 @@ use crate::{
 		file::{enums::RemoteFileType, traits::HasFileInfo, write::RemoteFileInfo},
 		name::ValidatedName,
 	},
-	job::{
-		JobControl, Stopped,
-		report::{JobReport, OpGuard},
-	},
+	job::{JobControl, Stopped, report::JobReport},
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
@@ -234,9 +231,6 @@ enum FileSource {
 	/// A copy of the registered file `target`, for a hard link.
 	Link { target: Uuid },
 }
-
-/// A chunk of a hard link's target, fetched for the link's file `ordinal`.
-type LinkChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
 
 /// A hard link's target fetched by its uuid, for the link's file `ordinal`.
 type LinkSource = (u64, Result<NonRootItemType<'static, Normal>, Error>);
@@ -639,20 +633,16 @@ impl<B: DisposalBackend> Driver<B> {
 		if !self.uploads.is_empty() {
 			self.uploads = FuturesUnordered::new();
 		}
-		let abandoned: Vec<u64> = self
-			.files
-			.iter()
-			.filter(|(_, file)| file.phase != FilePhase::Finalizing)
-			.map(|(ordinal, _)| *ordinal)
-			.collect();
-		for ordinal in abandoned {
-			if let Some(file) = self.files.remove(&ordinal)
-				&& !file.failed()
-			{
-				self.reporter
-					.file_abandoned(file.active.dest_uuid, file.bytes());
+		let reporter = &self.reporter;
+		self.files.retain(|_, file| {
+			if file.phase == FilePhase::Finalizing {
+				return true;
 			}
-		}
+			if !file.failed() {
+				reporter.file_abandoned(file.active.dest_uuid, file.bytes());
+			}
+			false
+		});
 		self.current = None;
 	}
 
@@ -888,7 +878,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// `segments`, a path below the extraction's root, as the path of the archive it is: the
 	/// base of a partial extraction first.
 	fn archive_joined(&self, segments: &[ValidatedName]) -> String {
-		joined(&[&self.base[..], segments].concat())
+		joined(self.base.iter().chain(segments))
 	}
 
 	/// A file entry at `path`: its directories planned and a free name taken for it in the last;

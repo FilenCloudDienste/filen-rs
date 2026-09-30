@@ -270,6 +270,11 @@ fn xz_damage() {
 		corrupt(decode(StreamCodec::Xz, &bytes[..bytes.len() - 12], BUDGET)),
 		TRUNCATED
 	);
+	// inside the first block's header, after its size byte
+	assert_eq!(
+		corrupt(decode(StreamCodec::Xz, &bytes[..14], BUDGET)),
+		TRUNCATED
+	);
 
 	let mut junk = bytes.clone();
 	junk.extend_from_slice(&[0, 0, 0, 0, 7]);
@@ -432,6 +437,11 @@ fn lz4_damage() {
 	// without the end mark and content checksum
 	assert_eq!(
 		corrupt(decode(StreamCodec::Lz4, &bytes[..bytes.len() - 8], BUDGET)),
+		TRUNCATED
+	);
+	// inside a block's data
+	assert_eq!(
+		corrupt(decode(StreamCodec::Lz4, &bytes[..bytes.len() / 2], BUDGET)),
 		TRUNCATED
 	);
 
@@ -603,6 +613,15 @@ fn zstd_damage() {
 	);
 	assert_eq!(
 		corrupt(decode(StreamCodec::Zstd, &bytes[..bytes.len() / 2], BUDGET)),
+		TRUNCATED
+	);
+	// inside a skippable frame ahead of the data
+	assert_eq!(
+		corrupt(decode(
+			StreamCodec::Zstd,
+			&[0x50, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2],
+			BUDGET
+		)),
 		TRUNCATED
 	);
 	let mut bad_checksum = bytes.clone();

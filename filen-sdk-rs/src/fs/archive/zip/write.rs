@@ -10,16 +10,18 @@ use std::{
 	ops::RangeInclusive,
 };
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use filen_macros::js_type;
-
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
 use crate::{
 	Error, ErrorKind,
-	fs::archive::{
-		bytes::{Counting, copy_with_crc},
-		encode::check_level,
-		password::ArchivePassword,
+	fs::{
+		archive::{
+			bytes::{Counting, copy_with_crc},
+			encode::check_level,
+			password::ArchivePassword,
+		},
+		zip::ZipExtendedTime,
 	},
 };
 
@@ -316,10 +318,17 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 		}
 	}
 	if let Some(time) = entry.unix_time {
-		extra.extend_from_slice(&0x5455u16.to_le_bytes());
-		extra.extend_from_slice(&5u16.to_le_bytes());
-		extra.push(1);
-		extra.extend_from_slice(&time.to_le_bytes());
+		// the field holds a signed time: the bits are the same either way
+		let data = ZipExtendedTime {
+			modification: Some(time.cast_unsigned()),
+			creation: None,
+		}
+		.to_extra_data();
+		extra.extend_from_slice(&ZipExtendedTime::HEADER_ID.to_le_bytes());
+		let len = u16::try_from(data.len())
+			.expect("an extended timestamp field is at most 13 bytes (should be impossible)");
+		extra.extend_from_slice(&len.to_le_bytes());
+		extra.extend_from_slice(&data);
 	}
 	if let Some((strength, actual)) = entry.aes {
 		extra.extend_from_slice(&0x9901u16.to_le_bytes());
@@ -429,15 +438,15 @@ fn write_central_header<W: Write>(out: &mut W, entry: &CentralEntry) -> io::Resu
 	out.write_all(&extra)
 }
 
-/// `(date, time)` as DOS stores them, in local time (what zip tools show), clamped to the years
-/// DOS can hold; 1980-01-01 when unknown.
+/// `(date, time)` as DOS stores them, in UTC as download-as-zip writes them (the extended
+/// timestamp beside it holds the zone-free time), clamped to the years DOS can hold; 1980-01-01
+/// when unknown.
 fn dos_datetime(modified: Option<DateTime<Utc>>) -> (u16, u16) {
 	let Some(time) = modified else {
 		return ((1 << 5) | 1, 0);
 	};
-	let local = time.with_timezone(&Local);
-	let year = local.year().clamp(1980, 2107);
-	if year != local.year() {
+	let year = time.year().clamp(1980, 2107);
+	if year != time.year() {
 		// out of range: the nearest end of it
 		return if year == 1980 {
 			((1 << 5) | 1, 0)
@@ -445,8 +454,8 @@ fn dos_datetime(modified: Option<DateTime<Utc>>) -> (u16, u16) {
 			((127 << 9) | (12 << 5) | 31, (23 << 11) | (59 << 5) | 29)
 		};
 	}
-	let date = ((year - 1980).cast_unsigned() << 9) | (local.month() << 5) | local.day();
-	let clock = (local.hour() << 11) | (local.minute() << 5) | (local.second() / 2);
+	let date = ((year - 1980).cast_unsigned() << 9) | (time.month() << 5) | time.day();
+	let clock = (time.hour() << 11) | (time.minute() << 5) | (time.second() / 2);
 	(
 		u16::try_from(date).expect(
 			"years since 1980 are 0..=127, month 1..=12 and day 1..=31: 16 bits (should be \
@@ -562,6 +571,22 @@ pub(crate) mod test_support {
 mod tests {
 	use super::*;
 	use crate::fs::archive::test_support::assert_levels_checked;
+
+	#[test]
+	fn dos_times_are_written_in_utc() {
+		// This pins the field packing everywhere, but tells UTC from local time only on a machine
+		// whose zone is not UTC: CI runners are in UTC, so a switch back to local time would pass
+		// there and fail only on such a developer machine.
+		// 2024-03-05 13:45:21 UTC
+		let time = DateTime::from_timestamp(1_709_646_321, 0).unwrap();
+		assert_eq!(
+			dos_datetime(Some(time)),
+			(
+				((2024 - 1980) << 9) | (3 << 5) | 5,
+				(13 << 11) | (45 << 5) | 10
+			)
+		);
+	}
 
 	#[test]
 	fn a_methods_levels_are_stated_and_checked() {

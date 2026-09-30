@@ -20,7 +20,7 @@ use crate::{
 				codec::LinkKeys,
 				report::{ExtractStage, entry_index},
 			},
-			input::{take_memory, whole_chunk},
+			input::{FetchedChunk, take_memory, whole_chunk},
 			worker::{LinkHead, SkippedMember},
 		},
 		categories::{NonRootItemType, Normal},
@@ -31,8 +31,7 @@ use crate::{
 };
 
 use super::{
-	Driver, FilePhase, FileSource, LinkChunk, LinkPhase, LinkSource, MAX_OPEN_FILES, NewFile,
-	SlotSource,
+	Driver, FilePhase, FileSource, LinkPhase, LinkSource, MAX_OPEN_FILES, NewFile, SlotSource,
 };
 
 /// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
@@ -118,8 +117,8 @@ pub(super) struct Links {
 	bytes: u64,
 	/// The files hard links copy, being fetched by uuid.
 	pub(super) sources: FuturesUnordered<MaybeSendBoxFuture<'static, LinkSource>>,
-	/// Chunks of those files, being fetched for a copy.
-	pub(super) chunks: FuturesUnordered<MaybeSendBoxFuture<'static, LinkChunk>>,
+	/// Chunks of those files, being fetched for a copy, by the ordinal of the link's file.
+	pub(super) chunks: FuturesUnordered<MaybeSendBoxFuture<'static, FetchedChunk>>,
 }
 
 /// A hard link waiting for the file it names to be registered.
@@ -369,7 +368,7 @@ impl<B: DisposalBackend> Driver<B> {
 		self.finalize_ready();
 	}
 
-	pub(super) fn link_chunk_fetched(&mut self, (ordinal, result, permit, _op): LinkChunk) {
+	pub(super) fn link_chunk_fetched(&mut self, (ordinal, result, permit, _op): FetchedChunk) {
 		let Some(file) = self.files.get_mut(&ordinal) else {
 			return;
 		};

@@ -53,12 +53,12 @@ impl ArchivePath {
 }
 
 /// `segments`, a path's drive names, joined with `/`.
-pub(crate) fn joined(segments: &[ValidatedName]) -> String {
+pub(crate) fn joined<'a>(segments: impl IntoIterator<Item = &'a ValidatedName>) -> String {
 	segments
-		.iter()
+		.into_iter()
 		.map(AsRef::as_ref)
-		.collect::<Vec<&str>>()
-		.join("/")
+		.intersperse("/")
+		.collect()
 }
 
 /// Why an entry's path cannot be used.

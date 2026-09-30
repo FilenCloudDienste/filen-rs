@@ -476,8 +476,13 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// A directory's path in the archive, as drive names.
-	fn archive_path(&self, dir: DirId) -> String {
-		joined(&self.archive_names(dir))
+	fn archive_path(&self, mut dir: DirId) -> String {
+		let mut names = Vec::new();
+		while let DirPlace::Named(named) = &self.dirs.slots[dir].place {
+			names.push(named.archive_name());
+			dir = named.parent;
+		}
+		joined(self.base.iter().chain(names.into_iter().rev()))
 	}
 
 	/// A directory's path in the archive: the base, then the names of the directories below

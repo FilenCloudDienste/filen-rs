@@ -3,6 +3,8 @@
 
 use std::io::{self, Read, Seek};
 
+use microthumb::BorrowedSeqReader;
+
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
@@ -16,7 +18,7 @@ use crate::{
 		format::ArchiveFormat,
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		password::ArchivePassword,
-		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
+		worker::{CachedInput, EntryKind, WorkerEvent, from_source},
 		zip::{
 			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_STORED,
 			crypto::{AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, ZIP_CRYPTO_HEADER_LEN_U64},
@@ -127,9 +129,10 @@ fn check_zip_password<R: Read + Seek>(
 /// or authentication code.
 pub(super) fn extract_zip(
 	walk: &mut Walk,
-	mut source: SeekInput<'_>,
+	mut input: CachedInput<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
+	let mut source = BorrowedSeqReader::new(&mut input);
 	let limits = ZipLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
@@ -265,7 +268,7 @@ pub(super) fn extract_zip(
 /// tells an AppleDouble file read front to back.
 fn list_zip(
 	walk: &mut Walk,
-	source: &mut SeekInput<'_>,
+	source: &mut BorrowedSeqReader<'_>,
 	index: &ZipIndex,
 	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
@@ -432,7 +435,7 @@ enum PreRead {
 /// later one would get past.
 fn zip_pre_read(
 	walk: &Walk,
-	source: &mut SeekInput<'_>,
+	source: &mut BorrowedSeqReader<'_>,
 	index: &ZipIndex,
 	password: Option<&ArchivePassword>,
 	limits: EntryLimits,

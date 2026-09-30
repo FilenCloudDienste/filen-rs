@@ -41,9 +41,6 @@ pub(crate) const UNIX_TYPE_MASK: u32 = 0o170_000;
 pub(crate) const UNIX_SYMLINK: u32 = 0o120_000;
 pub(crate) const UNIX_DIR: u32 = 0o040_000;
 
-/// Seconds from 1601-01-01, where FILETIME counts from, to the Unix epoch.
-pub(crate) const FILETIME_UNIX_OFFSET_SECS: i64 = 11_644_473_600;
-
 /// A read position in a decoded header.
 pub(crate) struct HeaderReader<'a> {
 	bytes: &'a [u8],

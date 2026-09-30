@@ -24,6 +24,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::Uuid;
+use microthumb::ByteSource;
 use tokio::sync::{mpsc, oneshot};
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -135,7 +136,7 @@ pub(crate) struct WorkerShared {
 	/// the codec is alive.
 	progress: AtomicU64,
 	/// Bytes of its input the codec has read, each counted once however often it is read (a
-	/// chunk evicted from a [`SeekInput`]'s cache and fetched again, an entry read for a password
+	/// chunk evicted from a [`CachedInput`]'s cache and fetched again, an entry read for a password
 	/// probe and then again for real), so it never exceeds the input's length.
 	input_bytes: AtomicU64,
 }
@@ -478,14 +479,17 @@ impl Read for ChunkInput<'_> {
 	}
 }
 
-/// An input's plaintext with random access, for formats read from their end (zip): chunks are
+/// An input's plaintext with random access, for formats read from their end (zip, 7z), read as
+/// `Read + Seek` through a [`BorrowedSeqReader`](microthumb::BorrowedSeqReader): chunks are
 /// fetched through the driver as they are needed, and the last two stay cached, so a record that
 /// straddles a chunk boundary, or a header read before its data, costs no second fetch.
-pub(crate) struct SeekInput<'p> {
+///
+/// A chunk shorter than its place in the input promises fails the read with `UnexpectedEof`,
+/// rather than ending the input early as a short read past the data would.
+pub(crate) struct CachedInput<'p> {
 	port: &'p WorkerPort,
 	source: u32,
 	len: u64,
-	pos: u64,
 	/// The most recent chunks, most recent first.
 	cache: Vec<(u64, Vec<u8>)>,
 	slots: usize,
@@ -497,13 +501,12 @@ pub(crate) struct SeekInput<'p> {
 	counted_prefix: u64,
 }
 
-impl<'p> SeekInput<'p> {
+impl<'p> CachedInput<'p> {
 	pub(crate) fn new(port: &'p WorkerPort, source: u32, len: u64) -> Self {
 		Self {
 			port,
 			source,
 			len,
-			pos: 0,
 			cache: Vec::new(),
 			slots: 2,
 			fetched: Vec::new(),
@@ -565,35 +568,24 @@ impl<'p> SeekInput<'p> {
 	}
 }
 
-impl Read for SeekInput<'_> {
-	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		if buf.is_empty() || self.pos >= self.len {
+impl ByteSource for CachedInput<'_> {
+	fn len(&self) -> u64 {
+		self.len
+	}
+
+	fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+		if buf.is_empty() || offset >= self.len {
 			return Ok(0);
 		}
-		let index = self.pos / CHUNK_SIZE_U64;
-		let within = (self.pos % CHUNK_SIZE_U64) as usize;
+		let index = offset / CHUNK_SIZE_U64;
+		let within = (offset % CHUNK_SIZE_U64) as usize;
 		let chunk = self.chunk(index)?;
 		if within >= chunk.len() {
 			return Err(io::ErrorKind::UnexpectedEof.into());
 		}
 		let n = buf.len().min(chunk.len() - within);
 		buf[..n].copy_from_slice(&chunk[within..within + n]);
-		self.pos += n as u64;
 		Ok(n)
-	}
-}
-
-impl std::io::Seek for SeekInput<'_> {
-	fn seek(&mut self, to: std::io::SeekFrom) -> io::Result<u64> {
-		let target = match to {
-			std::io::SeekFrom::Start(offset) => Some(offset),
-			std::io::SeekFrom::End(delta) => self.len.checked_add_signed(delta),
-			std::io::SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
-		};
-		self.pos = target.ok_or_else(|| {
-			io::Error::new(io::ErrorKind::InvalidInput, "a seek before the start")
-		})?;
-		Ok(self.pos)
 	}
 }
 
@@ -792,6 +784,8 @@ pub(crate) mod test_support {
 mod tests {
 	use std::io::{Seek, SeekFrom};
 
+	use microthumb::BorrowedSeqReader;
+
 	use super::*;
 	use crate::fs::archive::test_support::pattern;
 
@@ -822,7 +816,8 @@ mod tests {
 	async fn a_chunk_fetched_again_counts_once_toward_the_bytes_read() {
 		let len = 2 * CHUNK_SIZE_U64 + 100;
 		let (asked, read) = with_source(len, move |port| {
-			let mut source = SeekInput::new(port, 0, len);
+			let mut input = CachedInput::new(port, 0, len);
+			let mut source = BorrowedSeqReader::new(&mut input);
 			let mut byte = [0u8];
 			// the first two chunks evict the last one from the cache of two before it is read again
 			for at in [len - 1, 0, CHUNK_SIZE_U64, len - 1] {
@@ -843,8 +838,8 @@ mod tests {
 			// into the second chunk, then read again from the start and to the end
 			let mut input = ChunkInput::new(port, 0, len);
 			input.read_exact(&mut vec![0u8; CHUNK_SIZE + 7])?;
-			let mut source = SeekInput::rereading(input);
-			source.read_to_end(&mut Vec::new())?;
+			let mut input = CachedInput::rereading(input);
+			BorrowedSeqReader::new(&mut input).read_to_end(&mut Vec::new())?;
 			Ok(port.shared().input_bytes())
 		})
 		.await;

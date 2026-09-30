@@ -209,7 +209,8 @@ impl<R: Read> Lz4Decoder<R> {
 		if size > frame.block_max {
 			return Err(CodecError::Corrupt("an lz4 block over the frame's block size").into());
 		}
-		self.input.read_exact_to(&mut self.compressed[..size])?;
+		// an input that ends first fails as truncated, through `settle`
+		self.input.read_exact(&mut self.compressed[..size])?;
 		let stored = &self.compressed[..size];
 		if frame.block_checksums
 			&& XxHash32::oneshot(0, stored).to_le_bytes() != self.input.read_array()?

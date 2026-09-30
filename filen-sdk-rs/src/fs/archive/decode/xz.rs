@@ -14,15 +14,14 @@ use std::{
 use lzma_rust2::{
 	Lzma2Reader,
 	filter::{bcj::BcjReader, delta::DeltaReader},
-	lzma2_get_memory_usage,
 };
 use sha2::{Digest, Sha256};
 
 use crate::fs::archive::format::XZ_MAGIC;
 
 use super::{
-	Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd, TRUNCATED,
-	lzma::clamp_dict,
+	Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd,
+	lzma::{clamp_dict, lzma2_memory},
 };
 
 const FOOTER_MAGIC: [u8; 2] = *b"YZ";
@@ -109,12 +108,8 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 		let header_size = (usize::from(size_byte) + 1) * 4;
 		let mut header = [0u8; 1024];
 		header[0] = size_byte;
-		let rest = input.fill_to(header_size - 1)?;
-		header[1..header_size].copy_from_slice(
-			rest.get(..header_size - 1)
-				.ok_or(CodecError::Corrupt(TRUNCATED))?,
-		);
-		input.consume(header_size - 1);
+		// an input that ends first fails as truncated, through `settle`
+		input.read_exact(&mut header[1..header_size])?;
 
 		let (fields, crc) = header[..header_size].split_at(header_size - 4);
 		if crc32fast::hash(fields).to_le_bytes() != crc {
@@ -152,10 +147,8 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		let dict_size = clamp_dict(*dict_size, decoded_size);
-		self.budget.charge(
-			u64::from(lzma2_get_memory_usage(dict_size)) * 1024
-				+ FILTER_BYTES * before.len() as u64,
-		)?;
+		self.budget
+			.charge(lzma2_memory(dict_size) + FILTER_BYTES * before.len() as u64)?;
 		let block_input = BlockInput {
 			input,
 			limit: compressed_size,
@@ -199,13 +192,10 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 			}
 		}
 		let check_size = block.check.size();
-		let stored = input.fill_to(check_size)?;
-		let stored = stored
-			.get(..check_size)
-			.ok_or(CodecError::Corrupt(TRUNCATED))?;
-		let outcome = block.check.verify(stored)?;
-		input.consume(check_size);
-		self.check = self.check.and(outcome);
+		// the largest check the format defines is 64 bytes
+		let mut stored = [0u8; 64];
+		input.read_exact(&mut stored[..check_size])?;
+		self.check = self.check.and(block.check.verify(&stored[..check_size])?);
 
 		let unpadded = block.header_size + compressed + check_size as u64;
 		stream.blocks += 1;
@@ -399,8 +389,9 @@ enum PreFilter {
 	Bcj { arch: BcjArch, start: u32 },
 }
 
+/// The architecture a BCJ filter converts branch addresses for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BcjArch {
+pub(crate) enum BcjArch {
 	X86,
 	PowerPc,
 	Ia64,
@@ -457,25 +448,29 @@ impl Filter {
 
 impl PreFilter {
 	fn wrap<'a, R: Read + 'a>(self, inner: Box<dyn Chain<R> + 'a>) -> Box<dyn Chain<R> + 'a> {
-		let (arch, start) = match self {
-			Self::Delta { distance } => return Box::new(DeltaReader::new(inner, distance)),
-			Self::Bcj { arch, start } => (arch, start as usize),
-		};
-		Box::new(match arch {
-			BcjArch::X86 => BcjReader::new_x86(inner, start),
-			BcjArch::PowerPc => BcjReader::new_ppc(inner, start),
-			BcjArch::Ia64 => BcjReader::new_ia64(inner, start),
-			BcjArch::Arm => BcjReader::new_arm(inner, start),
-			BcjArch::ArmThumb => BcjReader::new_arm_thumb(inner, start),
-			BcjArch::Sparc => BcjReader::new_sparc(inner, start),
-			BcjArch::Arm64 => BcjReader::new_arm64(inner, start),
-			BcjArch::RiscV => BcjReader::new_riscv(inner, start),
-		})
+		match self {
+			Self::Delta { distance } => Box::new(DeltaReader::new(inner, distance)),
+			Self::Bcj { arch, start } => Box::new(bcj_reader(arch, inner, start as usize)),
+		}
+	}
+}
+
+/// A BCJ filter for `arch` over `inner`, whose data starts at `start`.
+pub(crate) fn bcj_reader<R>(arch: BcjArch, inner: R, start: usize) -> BcjReader<R> {
+	match arch {
+		BcjArch::X86 => BcjReader::new_x86(inner, start),
+		BcjArch::PowerPc => BcjReader::new_ppc(inner, start),
+		BcjArch::Ia64 => BcjReader::new_ia64(inner, start),
+		BcjArch::Arm => BcjReader::new_arm(inner, start),
+		BcjArch::ArmThumb => BcjReader::new_arm_thumb(inner, start),
+		BcjArch::Sparc => BcjReader::new_sparc(inner, start),
+		BcjArch::Arm64 => BcjReader::new_arm64(inner, start),
+		BcjArch::RiscV => BcjReader::new_riscv(inner, start),
 	}
 }
 
 /// The dictionary size an LZMA2 properties byte (0 to 40) stands for.
-fn lzma2_dict_size(bits: u8) -> u32 {
+pub(crate) fn lzma2_dict_size(bits: u8) -> u32 {
 	if bits == 40 {
 		return u32::MAX;
 	}

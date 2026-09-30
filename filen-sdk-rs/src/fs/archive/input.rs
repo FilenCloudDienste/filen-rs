@@ -36,8 +36,9 @@ use crate::{
 /// sources a compression reads.
 pub(crate) const PREFETCH_CHUNKS: usize = 4;
 
-/// A fetched chunk of the archive, with the memory it holds.
-type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
+/// A fetched chunk under the key it was fetched for (by default its index in the file), with
+/// the memory it holds and the operation in flight it counts as.
+pub(crate) type FetchedChunk<K = u64> = (K, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
 
 /// Memory for one chunk: `slot` (the job's floor of one input or one output chunk) when free,
 /// else the client's `memory` if it has room now, else nothing.
@@ -54,6 +55,17 @@ pub(crate) fn take_memory(
 			)
 			.ok()
 	})
+}
+
+/// Moves the chunk the codec is reading, `reading`, onto the job's `slot` when it took the
+/// client's memory instead: once a pause dropped everything fetched ahead, nothing else holds
+/// the slot, and so a paused job holds none of the client's budget.
+pub(crate) fn hold_on_slot(reading: &mut Option<OwnedSemaphorePermit>, slot: &Arc<Semaphore>) {
+	if reading.is_some()
+		&& let Ok(permit) = Arc::clone(slot).try_acquire_owned()
+	{
+		*reading = Some(permit);
+	}
 }
 
 /// `data`, fetched as chunk `index` of `file`, when it holds as much as that chunk does: a
@@ -246,13 +258,8 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		control: &JobControl,
 	) -> Result<(), Stopped> {
 		self.drop_prefetched();
-		// The chunk the codec is reading stays with it, part of its state. Nothing else holds the
-		// input slot now, so it moves there if it took from the client's budget.
-		if self.reading.is_some()
-			&& let Ok(slot) = Arc::clone(&self.slot).try_acquire_owned()
-		{
-			self.reading = Some(slot);
-		}
+		// the chunk the codec is reading stays with it, part of its state
+		hold_on_slot(&mut self.reading, &self.slot);
 		// last, so the job counts as paused only now
 		*running = None;
 		reporter.checkpoint(control).await?;

@@ -10,6 +10,8 @@
 //! codecs': a plain tar starts with its first member's path, which can spell `LZIP` or `BZh9`,
 //! while a compressed stream passing a header checksum by chance is all but impossible.
 
+use std::ops::Range;
+
 use filen_macros::js_type;
 
 use crate::fs::name::{ValidatedName, keep_both::SourceName};
@@ -83,6 +85,8 @@ pub(crate) enum Detected {
 
 /// Bytes of the head of a file that [`detect`] looks at: enough for a tar header's checksum.
 pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK_LEN;
+/// Where a tar header keeps its checksum.
+pub(crate) const TAR_CHECKSUM: Range<usize> = 148..156;
 
 const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 pub(crate) const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
@@ -97,7 +101,7 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(&SEVEN_Z_MAGIC) {
 		return Some(Detected::SevenZ);
 	}
-	if head.len() >= DETECT_HEAD_LEN && is_tar_header(&head[..DETECT_HEAD_LEN]) {
+	if head.first_chunk().is_some_and(is_tar_header) {
 		return Some(Detected::Tar);
 	}
 	if head.starts_with(&[0x1F, 0x8B]) {
@@ -169,14 +173,11 @@ fn after_skippable_frames(mut head: &[u8]) -> Option<&[u8]> {
 	}
 }
 
-/// Whether `block` (one 512-byte block) is a tar header: its checksum field matches the sum of
-/// its bytes with that field counted as spaces. Old tars summed signed bytes, so both sums are
-/// accepted, as GNU tar does. An all-zero block (the end-of-archive marker) is not a header.
-pub(crate) fn is_tar_header(block: &[u8]) -> bool {
-	let Ok(block) = <&[u8; TAR_BLOCK_LEN]>::try_from(block) else {
-		return false;
-	};
-	let Some(stored) = parse_octal(&block[148..156]) else {
+/// Whether `block` is a tar header: its checksum field matches the sum of its bytes with that
+/// field counted as spaces. Old tars summed signed bytes, so both sums are accepted, as GNU tar
+/// does. An all-zero block (the end-of-archive marker) is not a header.
+pub(crate) fn is_tar_header(block: &[u8; TAR_BLOCK_LEN]) -> bool {
+	let Some(stored) = parse_octal(&block[TAR_CHECKSUM]) else {
 		return false;
 	};
 	let (unsigned, signed) =
@@ -184,7 +185,11 @@ pub(crate) fn is_tar_header(block: &[u8]) -> bool {
 			.iter()
 			.enumerate()
 			.fold((0u64, 0i64), |(unsigned, signed), (i, &byte)| {
-				let byte = if (148..156).contains(&i) { b' ' } else { byte };
+				let byte = if TAR_CHECKSUM.contains(&i) {
+					b' '
+				} else {
+					byte
+				};
 				(unsigned + u64::from(byte), signed + i64::from(byte as i8))
 			});
 	// an all-zero block sums to 8 spaces
@@ -194,13 +199,9 @@ pub(crate) fn is_tar_header(block: &[u8]) -> bool {
 	stored == unsigned || i64::try_from(stored).is_ok_and(|stored| stored == signed)
 }
 
-/// Whether `block` is a whole block of zeros: a tar's end-of-archive marker, and all an empty
-/// tar holds.
-pub(crate) fn is_end_marker(block: &[u8]) -> bool {
-	block.len() == DETECT_HEAD_LEN && block.iter().all(|&b| b == 0)
-}
-
-/// A tar octal number field: leading spaces, octal digits, then NUL or space padding.
+/// A tar octal number field: leading spaces, octal digits, then NUL or space padding. Written
+/// out rather than taken from the tar crate, whose parser also takes a sign and trims tabs and
+/// line breaks, so it would tell some damaged headers from data differently.
 fn parse_octal(field: &[u8]) -> Option<u64> {
 	let digits = field
 		.iter()
@@ -216,6 +217,12 @@ fn parse_octal(field: &[u8]) -> Option<u64> {
 		any = true;
 	}
 	any.then_some(value)
+}
+
+/// Whether `block` is a whole block of zeros: a tar's end-of-archive marker, and all an empty
+/// tar holds.
+pub(crate) fn is_end_marker(block: &[u8]) -> bool {
+	block.len() == DETECT_HEAD_LEN && block.iter().all(|&b| b == 0)
 }
 
 /// A tar compressed with `codec`, as an extension names it.
@@ -311,6 +318,7 @@ pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::fs::archive::test_support::tar_checksummed;
 
 	fn tar_header(name: &str) -> [u8; DETECT_HEAD_LEN] {
 		let mut block = [0u8; DETECT_HEAD_LEN];
@@ -319,10 +327,7 @@ mod tests {
 		block[124..136].copy_from_slice(b"00000000005\0");
 		block[156] = b'0';
 		block[257..263].copy_from_slice(b"ustar\0");
-		block[148..156].fill(b' ');
-		let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
-		block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		block
+		tar_checksummed(block)
 	}
 
 	#[test]
@@ -481,17 +486,37 @@ mod tests {
 		assert!(!is_tar_header(&corrupted));
 		// the end-of-archive marker is not a header
 		assert!(!is_tar_header(&[0u8; DETECT_HEAD_LEN]));
-		// a block of the wrong size is not a header
-		assert!(!is_tar_header(&header[..511]));
 	}
 
 	#[test]
 	fn old_tars_summing_signed_bytes_are_accepted() {
 		let mut block = tar_header("\u{e9}.txt");
-		block[148..156].fill(b' ');
+		block[TAR_CHECKSUM].fill(b' ');
 		let signed: i64 = block.iter().map(|&b| i64::from(b as i8)).sum();
-		block[148..155].copy_from_slice(format!("{signed:06o}\0").as_bytes());
+		block[TAR_CHECKSUM][..7].copy_from_slice(format!("{signed:06o}\0").as_bytes());
 		assert!(is_tar_header(&block));
+	}
+
+	#[test]
+	fn a_checksum_is_octal_digits_after_spaces_up_to_a_nul_or_space() {
+		let header = tar_header("dir/file.txt");
+		let with_checksum = |field: String| {
+			let mut block = header;
+			block[TAR_CHECKSUM].copy_from_slice(field.as_bytes());
+			block
+		};
+		let sum: u64 = with_checksum(" ".repeat(TAR_CHECKSUM.len()))
+			.iter()
+			.map(|&b| u64::from(b))
+			.sum();
+		assert!(is_tar_header(&with_checksum(format!("{sum:06o}\0 "))));
+		assert!(is_tar_header(&with_checksum(format!(" {sum:06o}\0"))));
+		// what follows the space ending the digits is not read
+		assert!(is_tar_header(&with_checksum(format!("{sum:06o} 1"))));
+		// a sign, or padding other than spaces, is not a checksum
+		assert!(!is_tar_header(&with_checksum(format!("+{sum:06o}\0"))));
+		assert!(!is_tar_header(&with_checksum(format!("\t{sum:06o}\0"))));
+		assert!(!is_tar_header(&with_checksum(format!("{sum:06o}\t\0"))));
 	}
 
 	#[test]

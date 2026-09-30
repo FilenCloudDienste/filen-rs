@@ -16,9 +16,11 @@ use crate::{
 	Error, ErrorKind,
 	fs::archive::{
 		bytes::{Counting, copy_with_crc},
+		decode::lzma2_dict_size,
 		encode::{check_level, lzma_encoder_memory},
 		password::ArchivePassword,
 	},
+	io::datetime_to_nt_time,
 };
 
 use super::{
@@ -578,7 +580,7 @@ impl<W: Write> SevenZWriter<W> {
 			let times: Vec<Option<u64>> = self
 				.files
 				.iter()
-				.map(|file| file.modified.and_then(to_filetime))
+				.map(|file| file.modified.and_then(datetime_to_nt_time))
 				.collect();
 			if times.iter().any(Option::is_some) {
 				let mut data = Vec::new();
@@ -610,17 +612,10 @@ impl<W: Write> SevenZWriter<W> {
 	}
 }
 
-/// A time as a Windows FILETIME, if it is after 1601.
-fn to_filetime(time: DateTime<Utc>) -> Option<u64> {
-	let secs = u64::try_from(time.timestamp().checked_add(FILETIME_UNIX_OFFSET_SECS)?).ok()?;
-	secs.checked_mul(10_000_000)?
-		.checked_add(u64::from(time.timestamp_subsec_nanos() / 100))
-}
-
 /// LZMA2's property byte for the smallest dictionary it can state that holds `dict`.
 fn lzma2_dict_prop(dict: u32) -> u8 {
 	(0u8..40)
-		.find(|&bits| (2 | u32::from(bits & 1)) << (bits / 2 + 11) >= dict)
+		.find(|&bits| lzma2_dict_size(bits) >= dict)
 		.unwrap_or(40)
 }
 
@@ -766,18 +761,6 @@ mod tests {
 		assert_eq!(
 			SevenZMethod::Ppmd { level: 9 }.encoder_memory(),
 			(192 << 20) + (1 << 20)
-		);
-	}
-
-	#[test]
-	fn filetimes_start_in_1601() {
-		assert_eq!(
-			to_filetime(DateTime::from_timestamp(0, 0).unwrap()),
-			Some(116_444_736_000_000_000)
-		);
-		assert_eq!(
-			to_filetime(DateTime::from_timestamp(-FILETIME_UNIX_OFFSET_SECS - 1, 0).unwrap()),
-			None
 		);
 	}
 }

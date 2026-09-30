@@ -17,7 +17,7 @@
 
 use std::io::{self, Read};
 
-use tar::{EntryType, Header};
+use tar::{EntryType, GnuExtSparseHeader, Header};
 
 use crate::{Error, ErrorKind, fs::drive_job::exceeds_limit};
 
@@ -370,12 +370,11 @@ impl<R: Read> TarReader<R> {
 			if blocks > MAX_SPARSE_BLOCKS {
 				return Err(TarError::Corrupt("a sparse member's map is too long"));
 			}
-			let mut block = [0u8; TAR_BLOCK_LEN];
-			if read_full(&mut self.inner, &mut block)? != block.len() {
+			let mut block = GnuExtSparseHeader::new();
+			if read_full(&mut self.inner, block.as_mut_bytes())? != TAR_BLOCK_LEN {
 				return Err(TarError::Corrupt("a sparse member's map ends early"));
 			}
-			// the extended sparse header's `isextended` flag
-			extended = block[504] != 0;
+			extended = block.isextended[0] != 0;
 		}
 		Ok(())
 	}
@@ -494,7 +493,10 @@ fn parse_pax_time(value: &[u8]) -> Option<MemberTime> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::fs::archive::test_support::damaged_copies;
+	use crate::fs::archive::{
+		format::TAR_CHECKSUM,
+		test_support::{damaged_copies, tar_checksummed},
+	};
 
 	/// A tar header block of `kind` for `name` with `size`, checksummed.
 	fn header(name: &[u8], kind: u8, size: u64) -> [u8; 512] {
@@ -506,20 +508,14 @@ mod tests {
 		block[156] = kind;
 		block[257..263].copy_from_slice(b"ustar\0");
 		block[263..265].copy_from_slice(b"00");
-		block[148..156].fill(b' ');
-		let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
-		block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		block
+		tar_checksummed(block)
 	}
 
 	/// `header` with the old GNU magic, as GNU tar writes for its own extensions.
 	fn gnu_header(name: &[u8], kind: u8, size: u64) -> [u8; 512] {
 		let mut block = header(name, kind, size);
 		block[257..265].copy_from_slice(b"ustar  \0");
-		block[148..156].fill(b' ');
-		let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
-		block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		block
+		tar_checksummed(block)
 	}
 
 	fn padded(data: &[u8]) -> Vec<u8> {
@@ -631,10 +627,7 @@ mod tests {
 		let mut archive = Vec::new();
 		let mut link = header(b"short", b'1', 0);
 		link[157..167].copy_from_slice(b"docs/a.txt");
-		link[148..156].fill(b' ');
-		let sum: u32 = link.iter().map(|&b| u32::from(b)).sum();
-		link[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		archive.extend_from_slice(&link);
+		archive.extend_from_slice(&tar_checksummed(link));
 		member(
 			&mut archive,
 			b"././@LongLink",
@@ -692,14 +685,6 @@ mod tests {
 			.collect()
 	}
 
-	/// `block` checksummed again after an edit.
-	fn resum(mut block: [u8; 512]) -> [u8; 512] {
-		block[148..156].fill(b' ');
-		let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
-		block[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		block
-	}
-
 	#[test]
 	fn a_hard_links_size_counts_only_in_a_pax_archive() {
 		// old writers put the target's size on a hard link and no data after it: libarchive and
@@ -708,7 +693,7 @@ mod tests {
 		old[257..265].fill(0);
 		for link in [
 			gnu_header(b"link", b'1', 2048),
-			resum(old),
+			tar_checksummed(old),
 			header(b"link", b'1', 2048),
 		] {
 			let mut archive = link.to_vec();
@@ -935,10 +920,7 @@ mod tests {
 		member(&mut archive, b"l", b'1', b"");
 		let mut sparse = gnu_header(b"s", b'S', 4);
 		sparse[482] = 1;
-		sparse[148..156].fill(b' ');
-		let sum: u32 = sparse.iter().map(|&b| u32::from(b)).sum();
-		sparse[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
-		archive.extend_from_slice(&sparse);
+		archive.extend_from_slice(&tar_checksummed(sparse));
 		archive.extend_from_slice(&[0u8; 512]);
 		archive.extend(padded(b"data"));
 		member(&mut archive, b"dir/", b'5', b"");
@@ -959,11 +941,11 @@ mod tests {
 			let block = at / 512 * 512;
 			// a header whose checksum no longer matches is refused before it is parsed, so
 			// the damaged header gets a matching checksum to reach its fields
-			if is_tar_header(&archive[block..block + 512]) && !(148..156).contains(&(at - block)) {
-				let header = &mut damaged[block..block + 512];
-				header[148..156].fill(b' ');
-				let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
-				header[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+			let header: &mut [u8; 512] = (&mut damaged[block..block + 512]).try_into().unwrap();
+			if archive[block..].first_chunk().is_some_and(is_tar_header)
+				&& !TAR_CHECKSUM.contains(&(at - block))
+			{
+				*header = tar_checksummed(*header);
 			}
 			std::panic::catch_unwind(|| walk(&damaged))
 				.unwrap_or_else(|_| panic!("a flip of {bit:#x} at {at} panicked"));

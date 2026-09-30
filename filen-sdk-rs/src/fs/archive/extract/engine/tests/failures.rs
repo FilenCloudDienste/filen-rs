@@ -2,6 +2,7 @@
 //! file, a damaged archive, a limit; and where a failed entry is extracted again.
 
 use super::*;
+use crate::fs::archive::format::TAR_CHECKSUM;
 
 #[tokio::test(start_paused = true)]
 async fn a_failed_codec_gives_back_its_own_error() {
@@ -330,15 +331,13 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
-	/// A tar member's header: its name, then its checksum at this offset.
-	const CHECKSUM_AT: usize = 148;
 	/// Where `second.bin`'s header starts: past `first.txt`'s header and its data block.
 	const SECOND_HEADER: usize = 2 * 512;
 	let mut tar = tar_of(&[
 		("first.txt", b"first"),
 		("second.bin", &pattern(3 * CHUNK_SIZE, 3)),
 	]);
-	tar[SECOND_HEADER + CHECKSUM_AT] ^= 1;
+	tar[SECOND_HEADER + TAR_CHECKSUM.start] ^= 1;
 	let setup = setup("broken.tar", tar, |_| {});
 	let job = start(&setup, Options::default());
 	let failed = job.running.await.unwrap().unwrap_err();

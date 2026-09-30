@@ -60,32 +60,6 @@ impl<R: Read> Input<R> {
 		Ok(array)
 	}
 
-	/// Fills `out` completely, a truncated stream when the input ends first.
-	pub(super) fn read_exact_to(&mut self, mut out: &mut [u8]) -> io::Result<()> {
-		while !out.is_empty() {
-			let read = self.read(out)?;
-			if read == 0 {
-				return Err(CodecError::Corrupt(TRUNCATED).into());
-			}
-			out = &mut out[read..];
-		}
-		Ok(())
-	}
-
-	/// Skips `n` bytes, a truncated stream when the input ends first.
-	pub(super) fn skip(&mut self, mut n: u64) -> io::Result<()> {
-		while n > 0 {
-			let buffered = self.fill_buf()?.len();
-			if buffered == 0 {
-				return Err(CodecError::Corrupt(TRUNCATED).into());
-			}
-			let step = buffered.min(usize::try_from(n).unwrap_or(usize::MAX));
-			self.consume(step);
-			n -= step as u64;
-		}
-		Ok(())
-	}
-
 	/// Reads the input to its end and returns how many bytes there were from the first non-zero
 	/// one on (`prefix`, bytes a decoder took from the input but did not use, comes first):
 	/// zero bytes before any data are padding, not data.

@@ -5,17 +5,21 @@ use crate::fs::{
 	file::{enums::RemoteFileType, traits::HasFileInfo},
 };
 
-struct ZipExtendedTime {
-	modification: Option<u32>,
-	creation: Option<u32>,
+/// The Unix extended timestamp extra field: flags, then each time they name, in seconds since the
+/// Unix epoch.
+pub(crate) struct ZipExtendedTime {
+	pub(crate) modification: Option<u32>,
+	pub(crate) creation: Option<u32>,
 }
 
 impl ZipExtendedTime {
+	pub(crate) const HEADER_ID: u16 = 0x5455;
+
 	fn count(&self) -> u16 {
 		u16::from(self.modification.is_some()) + u16::from(self.creation.is_some())
 	}
 
-	fn to_extra_data(&self) -> Vec<u8> {
+	pub(crate) fn to_extra_data(&self) -> Vec<u8> {
 		let mut bytes = Vec::with_capacity(1 + 4 * usize::from(self.count()));
 		let mut flags = 0u8;
 		if self.modification.is_some() {
@@ -39,7 +43,7 @@ impl From<ZipExtendedTime> for UnknownExtraField {
 	fn from(value: ZipExtendedTime) -> Self {
 		let data = value.to_extra_data();
 		UnknownExtraField {
-			header_id: async_zip::spec::header::HeaderId(0x5455),
+			header_id: async_zip::spec::header::HeaderId(ZipExtendedTime::HEADER_ID),
 			data_size: u16::try_from(data.len())
 				.expect("a flags byte and at most two u32 times (should be impossible)"),
 			content: data,

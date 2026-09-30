@@ -42,6 +42,11 @@ const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 /// holding the most sequences; Huffman literals stop at their stated size (see the tests).
 const STATE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// The least a zstd decoder is charged before its frame's header states the window: its input
+/// buffer, its state and the ring of a window of up to 896 KiB (see [`max_window`]). A reader
+/// that has to charge a decoder before it reaches the frame, as 7z's does, charges this.
+pub(crate) const MIN_DECODER_BYTES: u64 = 4 << 20;
+
 /// Fails the build against a ruzstd without the fork's patch that bounds what a block decodes
 /// to, which nothing else here would notice: the budget above rests on that bound.
 const _: fn(u64, u64) -> DecompressBlockError =
@@ -281,5 +286,11 @@ mod tests {
 		assert_eq!(max_window(budget(64)), (32 << 20) - MAX_BLOCK_BYTES);
 		// too little for any ring past its state
 		assert_eq!(max_window(budget(2)), 0);
+	}
+
+	#[test]
+	fn the_least_a_decoder_is_charged_holds_its_state_and_a_window() {
+		let budget = Budget::new(MIN_DECODER_BYTES).unwrap();
+		assert_eq!(max_window(budget), (1 << 20) - MAX_BLOCK_BYTES);
 	}
 }

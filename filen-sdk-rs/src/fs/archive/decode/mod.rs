@@ -37,7 +37,9 @@ use crate::{Error, ErrorKind};
 use super::format::StreamCodec;
 pub(crate) use input::Trailing;
 use input::{Input, TRUNCATED};
-pub(crate) use lzma::clamp_dict as clamp_lzma_dict;
+pub(crate) use lzma::{clamp_dict as clamp_lzma_dict, lzma_memory, lzma2_memory};
+pub(crate) use xz::{BcjArch, bcj_reader, lzma2_dict_size};
+pub(crate) use zstd::MIN_DECODER_BYTES as ZSTD_MIN_DECODER_BYTES;
 
 /// The magic numbers of the skippable frames lz4 and zstd share: a little-endian magic and
 /// length, then that many bytes no decoder reads.
@@ -110,9 +112,11 @@ impl From<CodecError> for Error {
 /// when it ends first; the frame's bytes, header included.
 fn skip_skippable_frame<R: Read>(input: &mut Input<R>) -> io::Result<u64> {
 	let header: [u8; 8] = input.read_array()?;
-	let size = u32::from_le_bytes(header[4..].try_into().expect("4 bytes"));
-	input.skip(u64::from(size))?;
-	Ok(8 + u64::from(size))
+	let size = u64::from(u32::from_le_bytes(header[4..].try_into().expect("4 bytes")));
+	if io::copy(&mut input.take(size), &mut io::sink())? != size {
+		return Err(CodecError::Corrupt(TRUNCATED).into());
+	}
+	Ok(8 + size)
 }
 
 /// Memory a decoder's input buffer takes, on top of what [`open_stream`] charges per codec.

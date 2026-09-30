@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 
 pub use sink::{BoxAccumulator, PixelSink, SmallImage};
 pub(crate) use source::SubSource;
-pub use source::{ByteSource, FileSource, MemSource, SeqReader};
+pub use source::{BorrowedSeqReader, ByteSource, FileSource, MemSource, SeqReader};
 
 use crate::{sink::accumulator_bytes, source::BulkHintRelay};
 

@@ -17,8 +17,10 @@ use crate::{
 
 use super::{
 	dispose::{DirState, DisposalBackend, FileState, Tree},
+	format::TAR_CHECKSUM,
 	password::ArchivePassword,
 	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+	tar_iter::TAR_BLOCK_LEN,
 	zip::{
 		crypto::AesStrength,
 		write::{Encryption, ZipMethod, ZipWriter},
@@ -101,6 +103,14 @@ pub(crate) fn gzip(data: &[u8]) -> Vec<u8> {
 	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
 	encoder.write_all(data).unwrap();
 	encoder.finish().unwrap()
+}
+
+/// `block` with its tar header checksum set to the sum of its bytes, as after an edit.
+pub(crate) fn tar_checksummed(mut block: [u8; TAR_BLOCK_LEN]) -> [u8; TAR_BLOCK_LEN] {
+	block[TAR_CHECKSUM].fill(b' ');
+	let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+	block[TAR_CHECKSUM][..7].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+	block
 }
 
 /// A GNU tar of `members`, each a directory when its path ends in `/`.

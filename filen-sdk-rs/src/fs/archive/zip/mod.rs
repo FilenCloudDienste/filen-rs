@@ -1,6 +1,11 @@
 //! Zip archives, read and written by the SDK itself: the central directory is parsed within the
 //! index budget, entries are decrypted and decompressed one at a time, and archives are written
 //! front to back with data descriptors, so neither side ever needs the whole archive at once.
+//!
+//! Download-as-zip (`fs::zip`) writes through `async_zip` instead, but that crate (the SDK's
+//! fork) can neither write WinZip AES entries nor run synchronously on the codec worker, so
+//! archive jobs keep their own writer. The two share the extended timestamp field's encoding and
+//! both write DOS times in UTC.
 
 pub(crate) mod cp437;
 pub(crate) mod crypto;

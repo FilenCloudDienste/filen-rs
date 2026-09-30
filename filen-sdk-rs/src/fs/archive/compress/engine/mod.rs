@@ -37,7 +37,7 @@ use crate::{
 				dispose_file, kept_on_early_end, nesting,
 			},
 			hash::HeadLastHasher,
-			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
+			input::{FetchedChunk, PREFETCH_CHUNKS, hold_on_slot, take_memory, whole_chunk},
 			limits::keep,
 			worker::{
 				CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, unexpected_event,
@@ -168,14 +168,6 @@ pub(crate) enum DisposalTarget {
 /// A chunk of a source: its source number and index.
 type ChunkKey = (u32, u64);
 
-/// A fetched chunk of a source, with the memory it holds.
-type FetchedChunk = (
-	ChunkKey,
-	Result<Vec<u8>, Error>,
-	OwnedSemaphorePermit,
-	OpGuard,
-);
-
 /// The archive's hash, taken as its chunks are uploaded.
 enum ArchiveHash {
 	/// The chunks come in order.
@@ -236,7 +228,8 @@ struct Driver<B: DriveBackend> {
 	next_fetch: ChunkKey,
 	/// The chunk the codec reads next.
 	next_served: ChunkKey,
-	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
+	/// Chunks of the sources being fetched, by their [`ChunkKey`].
+	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk<ChunkKey>>>,
 	/// Fetched chunks the codec has not read yet; each counts as in flight, so the job does not
 	/// count as paused while one still holds memory.
 	ready: VecDeque<(ChunkKey, Vec<u8>, OwnedSemaphorePermit, OpGuard)>,
@@ -532,14 +525,7 @@ impl<B: DisposalBackend> Driver<B> {
 		self.fetches = FuturesOrdered::new();
 		self.ready.clear();
 		self.next_fetch = self.next_served;
-		if self.reading.take().is_some() {
-			// nothing else holds the slot once the prefetched chunks are dropped
-			self.reading = Arc::clone(&self.input_slot).try_acquire_owned().ok();
-			debug_assert!(
-				self.reading.is_some(),
-				"the input slot is free while pausing"
-			);
-		}
+		hold_on_slot(&mut self.reading, &self.input_slot);
 		drop(releasing);
 		self.reporter.checkpoint(&self.control).await
 	}
@@ -567,7 +553,7 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	fn fetch_finished(&mut self, (key, result, permit, op): FetchedChunk) {
+	fn fetch_finished(&mut self, (key, result, permit, op): FetchedChunk<ChunkKey>) {
 		let source = source_at(&self.sources, key.0).expect("the driver fetches only its sources");
 		match result.and_then(|data| whole_chunk(&source.file, key.1, data)) {
 			Ok(data) => {

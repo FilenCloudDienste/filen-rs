@@ -25,7 +25,8 @@ use crate::{
 		password::ArchivePassword,
 		tar_iter::TAR_BLOCK_LEN,
 		worker::{
-			ChunkInput, EntryKind, SeekInput, WorkerEvent, WorkerPort, from_source, send_file_data,
+			CachedInput, ChunkInput, EntryKind, WorkerEvent, WorkerPort, from_source,
+			send_file_data,
 		},
 	},
 };
@@ -145,7 +146,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 			let block = &block[..block_len];
 			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker
 			// alone, so only its name tells it from a file of zeros
-			let tar = is_tar_header(block)
+			let tar = block.first_chunk().is_some_and(is_tar_header)
 				|| is_end_marker(block)
 					&& matches!(
 						ArchiveFormat::of_name(&job.name),
@@ -175,12 +176,16 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				extract_single(&mut walk, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
-		Some(Detected::Zip) => {
-			extract_zip(&mut walk, SeekInput::rereading(source.into_inner().1), &job)
-		}
-		Some(Detected::SevenZ) => {
-			extract_sevenz(&mut walk, SeekInput::rereading(source.into_inner().1), &job)
-		}
+		Some(Detected::Zip) => extract_zip(
+			&mut walk,
+			CachedInput::rereading(source.into_inner().1),
+			&job,
+		),
+		Some(Detected::SevenZ) => extract_sevenz(
+			&mut walk,
+			CachedInput::rereading(source.into_inner().1),
+			&job,
+		),
 		None => Err(Error::custom(
 			ErrorKind::ArchiveUnsupported,
 			"the file is not an archive the SDK can extract",

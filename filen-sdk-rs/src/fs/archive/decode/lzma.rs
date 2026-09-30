@@ -5,7 +5,9 @@ use std::{
 	mem,
 };
 
-use lzma_rust2::{Action, LzipStream, LzmaReader, Status, lzma_get_memory_usage_by_props};
+use lzma_rust2::{
+	Action, LzipStream, LzmaReader, Status, lzma_get_memory_usage_by_props, lzma2_get_memory_usage,
+};
 
 use super::{
 	Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd, TRUNCATED,
@@ -54,6 +56,18 @@ pub(crate) fn clamp_dict(dict_size: u32, decoded_size: Option<u64>) -> u32 {
 	}
 }
 
+/// The memory an LZMA decoder with properties byte `props` and a dictionary of `dict_size` bytes
+/// takes; `None` when `props` is not a valid properties byte.
+pub(crate) fn lzma_memory(dict_size: u32, props: u8) -> Option<u64> {
+	let kib = lzma_get_memory_usage_by_props(dict_size, props).ok()?;
+	Some(u64::from(kib) * 1024)
+}
+
+/// The memory an LZMA2 decoder with a dictionary of `dict_size` bytes takes.
+pub(crate) fn lzma2_memory(dict_size: u32) -> u64 {
+	u64::from(lzma2_get_memory_usage(dict_size)) * 1024
+}
+
 impl<R: Read> Read for LzmaAloneDecoder<R> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		if buf.is_empty() {
@@ -69,10 +83,9 @@ impl<R: Read> Read for LzmaAloneDecoder<R> {
 					let decoded_size = u64::from_le_bytes(header[5..].try_into().expect("8 bytes"));
 					let known_size = (decoded_size != u64::MAX).then_some(decoded_size);
 					let dict_size = clamp_dict(dict_size, known_size);
-					let kib = lzma_get_memory_usage_by_props(dict_size, props)
-						.map_err(|_| CodecError::Corrupt("invalid LZMA properties"))?;
-					self.budget
-						.charge(u64::from(kib) * 1024 + LZMA_READ_AHEAD_BYTES)?;
+					let memory = lzma_memory(dict_size, props)
+						.ok_or(CodecError::Corrupt("invalid LZMA properties"))?;
+					self.budget.charge(memory + LZMA_READ_AHEAD_BYTES)?;
 					AloneState::Body(Box::new(LzmaReader::new_with_props(
 						input,
 						decoded_size,

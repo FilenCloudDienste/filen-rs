@@ -2,6 +2,8 @@
 
 use std::io::{self, Read, Seek};
 
+use microthumb::BorrowedSeqReader;
+
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
@@ -20,7 +22,7 @@ use crate::{
 				read_index as read_sevenz_index, windows_link_target, wrong_key,
 			},
 		},
-		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
+		worker::{CachedInput, EntryKind, WorkerEvent, from_source},
 	},
 };
 
@@ -128,7 +130,7 @@ fn sevenz_found<'e, 's, R: Read + Seek + 's>(
 /// its CRC-32 when the header lists one.
 pub(super) fn extract_sevenz(
 	walk: &mut Walk,
-	mut source: SeekInput<'_>,
+	mut input: CachedInput<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
 	let port = walk.port;
@@ -141,11 +143,17 @@ pub(super) fn extract_sevenz(
 		max_entries: job.limits.max_members,
 		decoder_memory: job.limits.decoder_memory,
 	};
-	let index = read_sevenz_index(&mut source, job.len, limits, &mut keys).map_err(Error::from)?;
+	let index = read_sevenz_index(
+		&mut BorrowedSeqReader::new(&mut input),
+		job.len,
+		limits,
+		&mut keys,
+	)
+	.map_err(Error::from)?;
 	// a folder's packed streams are read in turns (BCJ2 has four)
 	// (at most 5 chunks: a folder of several BCJ2 coders refetches rather than hold more)
-	source.set_slots((index.max_packed_streams() + 1).min(5));
-	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
+	input.set_slots((index.max_packed_streams() + 1).min(5));
+	let mut cursor = FolderCursor::new(BorrowedSeqReader::new(&mut input), limits.decoder_memory);
 	if walk.listing() {
 		return list_sevenz(walk, &mut cursor, &index, &mut keys, job);
 	}

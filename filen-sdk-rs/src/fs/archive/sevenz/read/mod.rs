@@ -19,15 +19,21 @@ use super::{
 	crypto::{AES_ID, AesCbcReader, AesProps, BLOCK, Key, derive_key},
 	header::*,
 };
-use crate::fs::archive::{
-	bytes,
-	decode::{CodecError, clamp_lzma_dict, open_stream},
-	format::StreamCodec,
-	limits::HEAP_PER_INDEX_BYTE,
-	password::ArchivePassword,
-	worker::from_source,
+use crate::{
+	fs::archive::{
+		bytes,
+		decode::{
+			BcjArch, CodecError, ZSTD_MIN_DECODER_BYTES, bcj_reader, clamp_lzma_dict, lzma_memory,
+			lzma2_dict_size, lzma2_memory, open_stream,
+		},
+		format::StreamCodec,
+		limits::HEAP_PER_INDEX_BYTE,
+		password::ArchivePassword,
+		worker::from_source,
+	},
+	fs::drive_job::exceeds_limit,
+	io::nt_time_to_datetime,
 };
-use crate::fs::drive_job::exceeds_limit;
 
 /// Most coders in one folder; 7-Zip writes at most four (BCJ2 with its three LZMA coders).
 const MAX_CODERS: u64 = 8;
@@ -44,10 +50,6 @@ const INPUT_BUFFER: usize = 64 * 1024;
 const MAX_KEYS: u64 = 16;
 /// The zstd coder's id, as 7-Zip ZS (the zstd fork of 7-Zip) and p7zip's zstd plugin write it.
 const ZSTD_ID: u64 = 0x04F7_1101;
-/// What a zstd coder is charged up front: its decoder's state and a small window. A larger
-/// window is charged against what the folder's other coders leave of the budget once its
-/// frame's header is read, as a zstd stream carries it nowhere else.
-const ZSTD_BASE_BYTES: u64 = 4 << 20;
 /// The size under which a reparse point's data may be a link's, as 7-Zip reads it.
 const REPARSE_LINK_MAX: u64 = 1 << 12;
 
@@ -56,18 +58,6 @@ pub(crate) struct SevenZLimits {
 	pub(crate) max_index_bytes: u64,
 	pub(crate) max_entries: u64,
 	pub(crate) decoder_memory: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Branch {
-	X86,
-	Arm,
-	ArmThumb,
-	Arm64,
-	Ppc,
-	Sparc,
-	Ia64,
-	RiscV,
 }
 
 /// A coder the SDK decodes.
@@ -83,7 +73,7 @@ pub(crate) enum Method {
 	/// 7-Zip ZS's zstd, whose properties (the version and level that wrote it) decoding needs
 	/// none of.
 	Zstd,
-	Bcj(Branch),
+	Bcj(BcjArch),
 	Bcj2,
 	Delta,
 	Aes,
@@ -95,17 +85,17 @@ impl Method {
 			0x00 => Self::Copy,
 			0x21 => Self::Lzma2,
 			0x03 => Self::Delta,
-			0x0A => Self::Bcj(Branch::Arm64),
-			0x0B => Self::Bcj(Branch::RiscV),
+			0x0A => Self::Bcj(BcjArch::Arm64),
+			0x0B => Self::Bcj(BcjArch::RiscV),
 			0x03_0101 => Self::Lzma,
 			0x03_0401 => Self::Ppmd,
-			0x0303_0103 => Self::Bcj(Branch::X86),
+			0x0303_0103 => Self::Bcj(BcjArch::X86),
 			0x0303_011B => Self::Bcj2,
-			0x0303_0205 => Self::Bcj(Branch::Ppc),
-			0x0303_0401 => Self::Bcj(Branch::Ia64),
-			0x0303_0501 => Self::Bcj(Branch::Arm),
-			0x0303_0701 => Self::Bcj(Branch::ArmThumb),
-			0x0303_0805 => Self::Bcj(Branch::Sparc),
+			0x0303_0205 => Self::Bcj(BcjArch::PowerPc),
+			0x0303_0401 => Self::Bcj(BcjArch::Ia64),
+			0x0303_0501 => Self::Bcj(BcjArch::Arm),
+			0x0303_0701 => Self::Bcj(BcjArch::ArmThumb),
+			0x0303_0805 => Self::Bcj(BcjArch::Sparc),
 			0x04_0108 => Self::Deflate,
 			0x04_0109 => Self::Deflate64,
 			0x04_0202 => Self::Bzip2,
@@ -126,14 +116,14 @@ impl Method {
 			Self::Deflate => "Deflate",
 			Self::Deflate64 => "Deflate64",
 			Self::Zstd => "ZSTD",
-			Self::Bcj(Branch::X86) => "BCJ",
-			Self::Bcj(Branch::Arm) => "ARM",
-			Self::Bcj(Branch::ArmThumb) => "ARMT",
-			Self::Bcj(Branch::Arm64) => "ARM64",
-			Self::Bcj(Branch::Ppc) => "PPC",
-			Self::Bcj(Branch::Sparc) => "SPARC",
-			Self::Bcj(Branch::Ia64) => "IA64",
-			Self::Bcj(Branch::RiscV) => "RISCV",
+			Self::Bcj(BcjArch::X86) => "BCJ",
+			Self::Bcj(BcjArch::Arm) => "ARM",
+			Self::Bcj(BcjArch::ArmThumb) => "ARMT",
+			Self::Bcj(BcjArch::Arm64) => "ARM64",
+			Self::Bcj(BcjArch::PowerPc) => "PPC",
+			Self::Bcj(BcjArch::Sparc) => "SPARC",
+			Self::Bcj(BcjArch::Ia64) => "IA64",
+			Self::Bcj(BcjArch::RiscV) => "RISCV",
 			Self::Bcj2 => "BCJ2",
 			Self::Delta => "Delta",
 			Self::Aes => "7zAES",
@@ -145,17 +135,17 @@ impl Method {
 			Self::Copy => 0x00,
 			Self::Lzma2 => 0x21,
 			Self::Delta => 0x03,
-			Self::Bcj(Branch::Arm64) => 0x0A,
-			Self::Bcj(Branch::RiscV) => 0x0B,
+			Self::Bcj(BcjArch::Arm64) => 0x0A,
+			Self::Bcj(BcjArch::RiscV) => 0x0B,
 			Self::Lzma => 0x03_0101,
 			Self::Ppmd => 0x03_0401,
-			Self::Bcj(Branch::X86) => 0x0303_0103,
+			Self::Bcj(BcjArch::X86) => 0x0303_0103,
 			Self::Bcj2 => 0x0303_011B,
-			Self::Bcj(Branch::Ppc) => 0x0303_0205,
-			Self::Bcj(Branch::Ia64) => 0x0303_0401,
-			Self::Bcj(Branch::Arm) => 0x0303_0501,
-			Self::Bcj(Branch::ArmThumb) => 0x0303_0701,
-			Self::Bcj(Branch::Sparc) => 0x0303_0805,
+			Self::Bcj(BcjArch::PowerPc) => 0x0303_0205,
+			Self::Bcj(BcjArch::Ia64) => 0x0303_0401,
+			Self::Bcj(BcjArch::Arm) => 0x0303_0501,
+			Self::Bcj(BcjArch::ArmThumb) => 0x0303_0701,
+			Self::Bcj(BcjArch::Sparc) => 0x0303_0805,
 			Self::Deflate => 0x04_0108,
 			Self::Deflate64 => 0x04_0109,
 			Self::Bzip2 => 0x04_0202,
@@ -1141,7 +1131,7 @@ fn read_files(
 			name_rewritten: name.rewritten,
 			kind,
 			size,
-			modified: modified[ordinal].and_then(filetime),
+			modified: modified[ordinal].and_then(nt_time_to_datetime),
 			stream,
 		});
 	}
@@ -1211,12 +1201,6 @@ fn read_names(
 	Ok(names)
 }
 
-/// A Windows FILETIME (100 ns ticks since 1601) as a time, if chrono can hold it.
-pub(crate) fn filetime(ticks: u64) -> Option<DateTime<Utc>> {
-	let secs = i64::try_from(ticks / 10_000_000).ok()? - FILETIME_UNIX_OFFSET_SECS;
-	DateTime::from_timestamp(secs, (ticks % 10_000_000) as u32 * 100)
-}
-
 /// A packed stream read through the archive shared by all of a folder's packed streams, each
 /// at its own position.
 struct PackStream<R> {
@@ -1253,25 +1237,19 @@ fn coder_memory(folder: &Folder, coder: usize, method: Method) -> Result<u64, Se
 		+ match method {
 			Method::Lzma => {
 				let (props, dict) = lzma_props(props)?;
-				u64::from(
-					lzma_rust2::lzma_get_memory_usage_by_props(
-						clamp_lzma_dict(dict, Some(size)),
-						props,
-					)
-					.map_err(|_| SevenZError::Corrupt("invalid 7z LZMA properties"))?,
-				) * 1024
+				lzma_memory(clamp_lzma_dict(dict, Some(size)), props)
+					.ok_or(SevenZError::Corrupt("invalid 7z LZMA properties"))?
 			}
-			Method::Lzma2 => {
-				let dict = clamp_lzma_dict(lzma2_dict(props)?, Some(size));
-				u64::from(lzma_rust2::lzma2_get_memory_usage(dict)) * 1024
-			}
+			Method::Lzma2 => lzma2_memory(clamp_lzma_dict(lzma2_dict(props)?, Some(size))),
 			Method::Ppmd => u64::from(ppmd_props(props)?.1),
 			// bzip2's worst case (-9) is under 4 MiB
 			Method::Bzip2 => 4 << 20,
 			Method::Deflate64 => 256 << 10,
 			// its four stream buffers, 256 KiB each
 			Method::Bcj2 => 1 << 20,
-			Method::Zstd => ZSTD_BASE_BYTES,
+			// a larger window is charged against what the folder's other coders leave of the
+			// budget once its frame's header is read, as a zstd stream states it nowhere else
+			Method::Zstd => ZSTD_MIN_DECODER_BYTES,
 			Method::Copy | Method::Deflate | Method::Bcj(_) | Method::Delta | Method::Aes => 0,
 		})
 }
@@ -1288,9 +1266,8 @@ fn lzma_props(props: &[u8]) -> Result<(u8, u32), SevenZError> {
 
 /// LZMA2's dictionary size, from its one property byte.
 fn lzma2_dict(props: &[u8]) -> Result<u32, SevenZError> {
-	match props {
-		[40] => Ok(u32::MAX),
-		&[bits] if bits < 40 => Ok((2 | u32::from(bits & 1)) << (bits / 2 + 11)),
+	match *props {
+		[bits @ 0..=40] => Ok(lzma2_dict_size(bits)),
 		_ => Err(SevenZError::Corrupt("invalid 7z LZMA2 properties")),
 	}
 }
@@ -1368,7 +1345,8 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 		sizes,
 		keys,
 		// the budget is the caller's to set, up to u64::MAX
-		zstd_memory: ZSTD_BASE_BYTES.saturating_add((decoder_memory - memory) / zstd_coders.max(1)),
+		zstd_memory: ZSTD_MIN_DECODER_BYTES
+			.saturating_add((decoder_memory - memory) / zstd_coders.max(1)),
 	};
 	let reader = builder.output(folder.main)?;
 	Ok(Box::new(Settled(reader)))
@@ -1500,20 +1478,7 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 					Method::Deflate64 => Box::new(deflate64::Deflate64Decoder::new(input)),
 					Method::Zstd => open_stream(StreamCodec::Zstd, input, self.zstd_memory)
 						.map_err(|error| SevenZError::Read(error.into()))?,
-					Method::Bcj(branch) => {
-						use lzma_rust2::filter::bcj::BcjReader;
-						let start = branch_start(props)?;
-						Box::new(match branch {
-							Branch::X86 => BcjReader::new_x86(input, start),
-							Branch::Arm => BcjReader::new_arm(input, start),
-							Branch::ArmThumb => BcjReader::new_arm_thumb(input, start),
-							Branch::Arm64 => BcjReader::new_arm64(input, start),
-							Branch::Ppc => BcjReader::new_ppc(input, start),
-							Branch::Sparc => BcjReader::new_sparc(input, start),
-							Branch::Ia64 => BcjReader::new_ia64(input, start),
-							Branch::RiscV => BcjReader::new_riscv(input, start),
-						})
-					}
+					Method::Bcj(arch) => Box::new(bcj_reader(arch, input, branch_start(props)?)),
 					Method::Delta => match **props {
 						[distance] => Box::new(lzma_rust2::filter::delta::DeltaReader::new(
 							input,
