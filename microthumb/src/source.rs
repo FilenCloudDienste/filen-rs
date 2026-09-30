@@ -172,7 +172,9 @@ impl ByteSource for SubSource {
 			return Ok(0);
 		}
 		let available = self.len - offset;
-		let want = (buf.len() as u64).min(available) as usize;
+		let want = buf
+			.len()
+			.min(usize::try_from(available).unwrap_or(usize::MAX));
 		self.inner.read_at(self.start + offset, &mut buf[..want])
 	}
 

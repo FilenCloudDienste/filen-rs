@@ -55,7 +55,7 @@ fn mean_channel(rgba: &[u8], channel: usize) -> u32 {
 		sum += u64::from(px[channel]);
 		n += 1;
 	}
-	(sum / n.max(1)) as u32
+	u32::try_from(sum / n.max(1)).unwrap()
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn jpeg_baseline_downscales_a_checkerboard_to_grey() {
 
 #[test]
 fn png_rows_stream_and_preserve_aspect() {
-	let image = RgbImage::from_fn(1000, 500, |x, _| Rgb([(x % 256) as u8, 0, 0]));
+	let image = RgbImage::from_fn(1000, 500, |x, _| Rgb([x.to_le_bytes()[0], 0, 0]));
 	let bytes = encode(&image, ImageFormat::Png);
 	let result = thumb(Box::new(MemSource(bytes)), &spec(100))
 		.unwrap()
@@ -265,20 +265,20 @@ fn jpeg_with_exif_thumbnail_sized(orientation_: u16, main_w: u32, main_h: u32) -
 	tiff.extend_from_slice(&0x0202u16.to_le_bytes());
 	tiff.extend_from_slice(&4u16.to_le_bytes());
 	tiff.extend_from_slice(&1u32.to_le_bytes());
-	tiff.extend_from_slice(&(thumb.len() as u32).to_le_bytes());
+	tiff.extend_from_slice(&u32::try_from(thumb.len()).unwrap().to_le_bytes());
 	tiff.extend_from_slice(&0u32.to_le_bytes());
 	assert_eq!(tiff.len(), 56);
 	tiff.extend_from_slice(&thumb);
 
 	let main = encode(
 		&RgbImage::from_fn(main_w, main_h, |x, y| {
-			Rgb([255, (x % 256) as u8, (y % 256) as u8])
+			Rgb([255, x.to_le_bytes()[0], y.to_le_bytes()[0]])
 		}),
 		ImageFormat::Jpeg,
 	);
 	let mut exif_payload = b"Exif\0\0".to_vec();
 	exif_payload.extend_from_slice(&tiff);
-	let app1_len = (exif_payload.len() + 2) as u16;
+	let app1_len = u16::try_from(exif_payload.len() + 2).unwrap();
 	let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE1];
 	bytes.extend_from_slice(&app1_len.to_be_bytes());
 	bytes.extend_from_slice(&exif_payload);
@@ -338,8 +338,8 @@ fn progressive_jpeg(image: &RgbImage, sampling: jpeg_encoder::SamplingFactor) ->
 	enc.set_sampling_factor(sampling);
 	enc.encode(
 		image.as_raw(),
-		image.width() as u16,
-		image.height() as u16,
+		u16::try_from(image.width()).unwrap(),
+		u16::try_from(image.height()).unwrap(),
 		jpeg_encoder::ColorType::Rgb,
 	)
 	.unwrap();
@@ -395,9 +395,9 @@ fn dc_mae(original: &RgbImage, dc: &microthumb::SmallImage) -> f64 {
 fn smooth_image(w: u32, h: u32) -> RgbImage {
 	RgbImage::from_fn(w, h, |x, y| {
 		Rgb([
-			(x * 255 / w.max(1)) as u8,
-			(y * 255 / h.max(1)) as u8,
-			((x + y) * 127 / (w + h).max(1)) as u8,
+			u8::try_from(x * 255 / w.max(1)).unwrap(),
+			u8::try_from(y * 255 / h.max(1)).unwrap(),
+			u8::try_from((x + y) * 127 / (w + h).max(1)).unwrap(),
 		])
 	})
 }
@@ -435,7 +435,7 @@ fn dc_parse_handles_grayscale() {
 	let mut enc = jpeg_encoder::Encoder::new(&mut out, 90);
 	enc.set_progressive(true);
 	let luma: Vec<u8> = (0..200u32 * 120)
-		.map(|i| ((i % 200) * 255 / 200) as u8)
+		.map(|i| u8::try_from((i % 200) * 255 / 200).unwrap())
 		.collect();
 	enc.encode(&luma, 200, 120, jpeg_encoder::ColorType::Luma)
 		.unwrap();
@@ -457,7 +457,7 @@ fn dc_parse_reads_only_a_prefix_of_the_file() {
 		Rgb([
 			(x * 7 % 251) as u8,
 			(y * 13 % 249) as u8,
-			((x ^ y) % 256) as u8,
+			(x ^ y).to_le_bytes()[0],
 		])
 	});
 	let bytes = progressive_jpeg(&image, jpeg_encoder::SamplingFactor::F_2_2);
@@ -538,13 +538,13 @@ fn a_dc_scan_with_a_huge_quantizer_and_shift_does_not_panic() {
 	// Entropy: per block, code "0" then CAT one-bits (maximum positive
 	// magnitude). 0xFF is byte-stuffed as required inside a scan.
 	let blocks = u64::from(DIM.div_ceil(8)).pow(2);
-	let (mut acc, mut n) = (0u32, 0u32);
+	let (mut acc, mut n) = (0u8, 0u32);
 	let mut scan = Vec::new();
-	let push = |bit: u32, acc: &mut u32, n: &mut u32, out: &mut Vec<u8>| {
+	let push = |bit: u8, acc: &mut u8, n: &mut u32, out: &mut Vec<u8>| {
 		*acc = (*acc << 1) | bit;
 		*n += 1;
 		if *n == 8 {
-			let byte = *acc as u8;
+			let byte = *acc;
 			out.push(byte);
 			if byte == 0xFF {
 				out.push(0);
@@ -643,16 +643,18 @@ fn interlaced_gif_rows_land_at_their_display_positions() {
 		.unwrap()
 		.expect("interlaced gif must thumbnail");
 	assert_eq!((result.width, result.height), (16, 16));
-	for y in 0..16u32 {
-		let v = result.rgba[(y * 16 * 4) as usize];
-		assert_eq!(v, y as u8 * 17, "row {y} landed wrong");
+	for y in 0..16u8 {
+		let v = result.rgba[usize::from(y) * 16 * 4];
+		assert_eq!(v, y * 17, "row {y} landed wrong");
 	}
 }
 
 #[test]
 fn tiff_gray16_streams_with_depth_downscale() {
 	let (w, h) = (300u32, 200u32);
-	let data: Vec<u16> = (0..w * h).map(|i| ((i % w) * 65535 / w) as u16).collect();
+	let data: Vec<u16> = (0..w * h)
+		.map(|i| u16::try_from((i % w) * 65535 / w).unwrap())
+		.collect();
 	let mut bytes = Vec::new();
 	{
 		let mut enc = tiff::encoder::TiffEncoder::new(std::io::Cursor::new(&mut bytes)).unwrap();
@@ -733,12 +735,13 @@ fn bmp_bytes(
 	rows: &[&[u8]],
 ) -> Vec<u8> {
 	let stride = ((w as usize * bpp as usize).div_ceil(32)) * 4;
-	let data_offset = 14 + 40 + palette.len() * 4;
+	let palette_len = u32::try_from(palette.len()).unwrap();
+	let data_offset = 14 + 40 + palette_len * 4;
 	let mut bytes = Vec::new();
 	bytes.extend_from_slice(b"BM");
-	bytes.extend_from_slice(&(data_offset as u32 + (stride as u32) * h).to_le_bytes());
+	bytes.extend_from_slice(&(data_offset + u32::try_from(stride).unwrap() * h).to_le_bytes());
 	bytes.extend_from_slice(&0u32.to_le_bytes());
-	bytes.extend_from_slice(&(data_offset as u32).to_le_bytes());
+	bytes.extend_from_slice(&data_offset.to_le_bytes());
 	bytes.extend_from_slice(&40u32.to_le_bytes());
 	bytes.extend_from_slice(&(w as i32).to_le_bytes());
 	let h_field = if top_down { -(h as i32) } else { h as i32 };
@@ -748,7 +751,7 @@ fn bmp_bytes(
 	bytes.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
 	bytes.extend_from_slice(&0u32.to_le_bytes());
 	bytes.extend_from_slice(&[0u8; 8]); // ppm
-	bytes.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+	bytes.extend_from_slice(&palette_len.to_le_bytes());
 	bytes.extend_from_slice(&0u32.to_le_bytes());
 	for entry in palette {
 		bytes.extend_from_slice(entry);
@@ -855,7 +858,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 fn png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
-	out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+	out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
 	out.extend_from_slice(tag);
 	out.extend_from_slice(data);
 	let mut crc_input = tag.to_vec();
@@ -937,13 +940,13 @@ fn a_forged_strip_count_tiff_refuses_before_any_decode_work() {
 		(278, 4, 1),        // RowsPerStrip = 1
 		(279, 4, 1),        // StripByteCounts
 	];
-	t.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+	t.extend_from_slice(&u16::try_from(entries.len()).unwrap().to_le_bytes());
 	for &(tag, kind, value) in entries {
 		t.extend_from_slice(&tag.to_le_bytes());
 		t.extend_from_slice(&kind.to_le_bytes());
 		t.extend_from_slice(&1u32.to_le_bytes());
 		if kind == 3 {
-			t.extend_from_slice(&(value as u16).to_le_bytes());
+			t.extend_from_slice(&u16::try_from(value).unwrap().to_le_bytes());
 			t.extend_from_slice(&0u16.to_le_bytes());
 		} else {
 			t.extend_from_slice(&value.to_le_bytes());
@@ -1164,14 +1167,14 @@ fn a_progressive_jpeg_past_the_dc_block_cap_still_serves_its_embedded_thumbnail(
 	tiff.extend_from_slice(&0x0202u16.to_le_bytes());
 	tiff.extend_from_slice(&4u16.to_le_bytes());
 	tiff.extend_from_slice(&1u32.to_le_bytes());
-	tiff.extend_from_slice(&(thumb.len() as u32).to_le_bytes());
+	tiff.extend_from_slice(&u32::try_from(thumb.len()).unwrap().to_le_bytes());
 	tiff.extend_from_slice(&0u32.to_le_bytes());
 	assert_eq!(tiff.len(), 56);
 	tiff.extend_from_slice(&thumb);
 
 	let mut exif_payload = b"Exif\0\0".to_vec();
 	exif_payload.extend_from_slice(&tiff);
-	let app1_len = (exif_payload.len() + 2) as u16;
+	let app1_len = u16::try_from(exif_payload.len() + 2).unwrap();
 	let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE1];
 	bytes.extend_from_slice(&app1_len.to_be_bytes());
 	bytes.extend_from_slice(&exif_payload);
@@ -1334,14 +1337,12 @@ fn transformed_grids_place_their_tiles_where_the_whole_frame_decode_does() {
 			whole.dimensions(),
 			"{name}"
 		);
-		for (i, (tiled, framed)) in thumb
+		for (tiled, (x, y, framed)) in thumb
 			.image
 			.rgba
 			.chunks_exact(4)
-			.zip(whole.pixels())
-			.enumerate()
+			.zip(whole.enumerate_pixels())
 		{
-			let (x, y) = (i as u32 % whole.width(), i as u32 / whole.width());
 			let expected = nearest(&framed.0, GRID_COLOURS);
 			assert_ne!(
 				expected, "magenta",
@@ -1557,7 +1558,9 @@ fn a_fujifilm_hif_offers_its_camera_jpeg_as_the_preview() {
 		// Bare, like Fujifilm's: nothing ahead of its tables, no EXIF.
 		assert_eq!(located.exif_insert_at, Some(2));
 		assert_eq!(located.stream_orientation, None);
-		let jpeg = &bytes[located.offset as usize..(located.offset + located.len) as usize];
+		let start = usize::try_from(located.offset).unwrap();
+		let end = usize::try_from(located.offset + located.len).unwrap();
+		let jpeg = &bytes[start..end];
 		assert_eq!(jpeg[..2], [0xFF, 0xD8]);
 		assert_eq!(jpeg[jpeg.len() - 2..], [0xFF, 0xD9]);
 	}

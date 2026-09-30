@@ -89,8 +89,8 @@ impl FormatDecoder for Jpeg {
 		// decode buffer at ~1–2× the target instead of 4× (a 2× ask made a
 		// 24 MP source pick 1/4 and blow the budget). The short side can land
 		// a few percent under the target; the final fill-resize absorbs it.
-		let req_w = spec.target_width.min(u16::MAX.into()) as u16;
-		let req_h = spec.target_height.min(u16::MAX.into()) as u16;
+		let req_w = u16::try_from(spec.target_width).unwrap_or(u16::MAX);
+		let req_h = u16::try_from(spec.target_height).unwrap_or(u16::MAX);
 		let (out_w, out_h) = decoder.scale(req_w, req_h).map_err(decode_err)?;
 
 		Ok(Box::new(PreparedJpeg {
@@ -309,21 +309,23 @@ fn convert_row(format: PixelFormat, row: &[u8], rgba: &mut [u8]) {
 		PixelFormat::CMYK32 => {
 			for (dst, src) in rgba.chunks_exact_mut(4).zip(row.chunks_exact(4)) {
 				// jpeg-decoder hands CMYK through unconverted (Adobe inverted).
-				let (c, m, y, k) = (
-					u16::from(src[0]),
-					u16::from(src[1]),
-					u16::from(src[2]),
-					u16::from(src[3]),
-				);
-				dst.copy_from_slice(&[
-					(c * k / 255) as u8,
-					(m * k / 255) as u8,
-					(y * k / 255) as u8,
+				let k = src[3];
+				let px = [
+					scale_by_k(src[0], k),
+					scale_by_k(src[1], k),
+					scale_by_k(src[2], k),
 					255,
-				]);
+				];
+				dst.copy_from_slice(&px);
 			}
 		}
 	}
+}
+
+/// `channel * k / 255`: a byte times a byte over 255 is itself a byte.
+fn scale_by_k(channel: u8, k: u8) -> u8 {
+	u8::try_from(u16::from(channel) * u16::from(k) / 255)
+		.expect("a byte times a byte over 255 is at most 255 (should be impossible)")
 }
 
 fn rgba_image(w: u32, h: u32, format: PixelFormat, pixels: &[u8]) -> Option<SmallImage> {

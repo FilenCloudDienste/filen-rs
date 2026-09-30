@@ -255,8 +255,8 @@ pub(super) fn window_and_count(
 	filter: &CompiledFilter,
 	range: &Range<usize>,
 ) -> rusqlite::Result<(Vec<SearchHit>, usize)> {
-	let limit = range.end.saturating_sub(range.start).min(i64::MAX as usize) as i64;
-	let offset = range.start.min(i64::MAX as usize) as i64;
+	let limit = i64::try_from(range.end.saturating_sub(range.start)).unwrap_or(i64::MAX);
+	let offset = i64::try_from(range.start).unwrap_or(i64::MAX);
 	if limit == 0 {
 		return Ok((Vec::new(), count_results(conn, scope, filter)?));
 	}
@@ -298,7 +298,7 @@ pub(super) fn window_and_count(
 		return Ok((Vec::new(), count_results(conn, scope, filter)?));
 	};
 	let results = rows.into_iter().map(|(hit, _)| hit).collect();
-	Ok((results, total.max(0) as usize))
+	Ok((results, usize::try_from(total.max(0)).unwrap_or(usize::MAX)))
 }
 
 /// Test-facing shim over [`window_and_count`] for assertions that only care about the page.
@@ -338,7 +338,7 @@ pub(super) fn count_results(
 			|row| row.get(COUNT),
 		)?,
 	};
-	Ok(count.max(0) as usize)
+	Ok(usize::try_from(count.max(0)).unwrap_or(usize::MAX))
 }
 
 /// The position of `column` in `row`'s result set, for the `FromSqlConversionFailure` payload

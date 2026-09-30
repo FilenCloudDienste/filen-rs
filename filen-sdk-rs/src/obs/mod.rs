@@ -316,7 +316,7 @@ mod inflight {
 				op_target = %target,
 				op_name = name,
 				op_fields = %fields,
-				elapsed_ms = elapsed.as_millis() as u64,
+				elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
 				"operation still running",
 			);
 		}

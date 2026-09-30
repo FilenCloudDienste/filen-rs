@@ -94,8 +94,8 @@ pub fn orientation(exif: &[u8]) -> u8 {
 	fn walk(exif: &[u8]) -> Option<u32> {
 		tiff_ifd0(exif)?.uint_value(0x0112)
 	}
-	match walk(exif) {
-		Some(v @ 1..=8) => v as u8,
+	match walk(exif).map(u8::try_from) {
+		Some(Ok(v @ 1..=8)) => v,
 		_ => 1,
 	}
 }
@@ -128,8 +128,8 @@ pub fn orientation_in_window(header: &[u8], window: &[u8]) -> u8 {
 		};
 		Ifd::at(window, endian, 0)?.uint_value(0x0112)
 	}
-	match walk(header, window) {
-		Some(v @ 1..=8) => v as u8,
+	match walk(header, window).map(u8::try_from) {
+		Some(Ok(v @ 1..=8)) => v,
 		_ => 1,
 	}
 }

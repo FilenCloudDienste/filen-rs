@@ -290,17 +290,17 @@ impl Span {
 	/// block pixel, first image pixel, count)`, or `None` when none does.
 	fn visible(&self, len: u32) -> Option<(usize, u32, u32)> {
 		let image_start = u64::from(self.image_start);
-		let from = self.start.max(image_start);
-		let to = (self.start + u64::from(len)).min(image_start + u64::from(self.image_len));
-		if from >= to {
-			return None;
-		}
-		// All three are bounded by `len` or `image_len`, both u32.
-		Some((
-			(from - self.start) as usize,
-			(from - image_start) as u32,
-			(to - from) as u32,
-		))
+		// How far into the block the image starts, and into the image the block
+		// does. Either one at or past its side's length, a gap too wide for u32
+		// included, leaves nothing in common.
+		let block_skip = u32::try_from(image_start.saturating_sub(self.start))
+			.ok()
+			.filter(|&skip| skip < len)?;
+		let image_skip = u32::try_from(self.start.saturating_sub(image_start))
+			.ok()
+			.filter(|&skip| skip < self.image_len)?;
+		let count = (len - block_skip).min(self.image_len - image_skip);
+		Some((block_skip as usize, image_skip, count))
 	}
 }
 

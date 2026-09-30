@@ -132,7 +132,9 @@ impl FormatDecoder for Tiff {
 			Some(window) => (window.as_slice(), 0usize),
 			None => (
 				probe.as_slice(),
-				exif::ifd0_offset(&probe).unwrap_or(0) as usize,
+				exif::ifd0_offset(&probe)
+					.and_then(|off| usize::try_from(off).ok())
+					.unwrap_or(0),
 			),
 		};
 		let orientation = match &ifd_window {

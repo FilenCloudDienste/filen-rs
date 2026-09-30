@@ -13,7 +13,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::{
 	Error,
 	auth::{Client, shared_client::SharedClient},
-	consts::CHUNK_SIZE_U64,
+	consts::CHUNK_SIZE,
 	fs::file::{
 		BaseFile, FileBuilder, RemoteFile,
 		client_impl::{FileReaderSharedClientExt, build_exif_tee_from_builder},
@@ -94,7 +94,7 @@ impl Client {
 			exif_tee,
 		);
 		let buffer_size = known_size
-			.map(|size| std::cmp::min(size, CHUNK_SIZE_U64) as usize)
+			.map(|size| usize::try_from(size).unwrap_or(usize::MAX).min(CHUNK_SIZE))
 			.unwrap_or(IO_BUFFER_SIZE);
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
@@ -575,7 +575,9 @@ where
 			.map(|p| MaybeArc::new(move |bytes| p.report(bytes)) as MaybeSendCallback<u64>);
 		let mut reader =
 			self.get_file_reader_for_range_with_callback(file, start, end, reader_callback);
-		let buffer_size = std::cmp::min(end.saturating_sub(start), CHUNK_SIZE_U64) as usize;
+		let buffer_size = usize::try_from(end.saturating_sub(start))
+			.unwrap_or(usize::MAX)
+			.min(CHUNK_SIZE);
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
 		let mut buffer = vec![0u8; buffer_size];
@@ -594,7 +596,7 @@ where
 	}
 
 	async fn download_file(&self, file: &dyn File) -> Result<Vec<u8>, Error> {
-		let mut writer = Vec::with_capacity(file.size() as usize);
+		let mut writer = Vec::with_capacity(usize::try_from(file.size()).unwrap_or(0));
 		self.download_file_to_writer(file, &mut writer, None)
 			.await?;
 		Ok(writer)

@@ -35,10 +35,10 @@ impl<DirExtra, FileExtra> FSTree<DirExtra, FileExtra> {
 	}
 
 	pub(crate) fn root_children(&self) -> DirChildrenInfo {
-		DirChildrenInfo::new(
-			self.entries.len() as u32 - self.root_num_children,
-			self.root_num_children,
-		)
+		let num_entries = u32::try_from(self.entries.len())
+			.expect("the tree builder caps the entry count at u32::MAX (should be impossible)");
+		let start = num_entries - self.root_num_children;
+		DirChildrenInfo::new(start, self.root_num_children)
 	}
 
 	pub(crate) fn get_name(&self, entry: &impl EntryName) -> &str {
@@ -585,8 +585,20 @@ where
 			);
 			errors.extend(child_errors);
 
-			let children_idx = self.final_entries.len() as u32;
-			let children_count = filtered_children.len() as u32;
+			// DirChildrenInfo indexes entries with u32, so the end of this run must fit too
+			let indices = u32::try_from(self.final_entries.len())
+				.ok()
+				.zip(u32::try_from(filtered_children.len()).ok())
+				.filter(|&(idx, count)| idx.checked_add(count).is_some());
+			let Some((children_idx, children_count)) = indices else {
+				return (
+					Err(Error::custom(
+						ErrorKind::InsufficientMemory,
+						"directory tree has more entries than u32 indices can address",
+					)),
+					errors,
+				);
+			};
 
 			let children_info = DirChildrenInfo::new(children_idx, children_count);
 			self.final_entries.append(&mut filtered_children);

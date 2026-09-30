@@ -148,13 +148,9 @@ impl PreparedDecode for PreparedPng {
 			let mut buf = vec![0u8; size];
 			let out = self.reader.next_frame(&mut buf).map_err(decode_err)?;
 			let row_len = out.line_size;
-			for (y, row) in buf
-				.chunks_exact(row_len)
-				.take(out.height as usize)
-				.enumerate()
-			{
+			for (y, row) in (0..out.height).zip(buf.chunks_exact(row_len)) {
 				convert_row(color, row, &mut rgba_row)?;
-				sink.push(0, y as u32, w, &rgba_row)?;
+				sink.push(0, y, w, &rgba_row)?;
 			}
 			return Ok(());
 		}
@@ -232,8 +228,9 @@ mod tests {
 		encoder.set_color(ColorType::Rgba);
 		encoder.set_depth(depth);
 		let mut writer = encoder.write_header().expect("png header");
-		let data: Vec<u8> = (0..width as usize * 8 * bytes_per_px)
-			.map(|i| (i % 251) as u8)
+		let data: Vec<u8> = (0..=250u8)
+			.cycle()
+			.take(width as usize * 8 * bytes_per_px)
 			.collect();
 		writer.write_image_data(&data).expect("png body");
 		writer.finish().expect("png finish");

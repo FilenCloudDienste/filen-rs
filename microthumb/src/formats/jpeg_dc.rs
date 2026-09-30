@@ -57,15 +57,24 @@ impl<'a> ByteCursor<'a> {
 	}
 
 	fn next_u8(&mut self) -> Result<u8, ThumbError> {
-		if self.pos < self.buf_start || self.pos >= self.buf_start + self.buf_len as u64 {
-			let n = self.src.read_at(self.pos, &mut self.buf)?;
-			if n == 0 {
-				return Err(err("truncated"));
+		let buffered = self
+			.pos
+			.checked_sub(self.buf_start)
+			.and_then(|off| usize::try_from(off).ok())
+			.filter(|&off| off < self.buf_len);
+		let off = match buffered {
+			Some(off) => off,
+			None => {
+				let n = self.src.read_at(self.pos, &mut self.buf)?;
+				if n == 0 {
+					return Err(err("truncated"));
+				}
+				self.buf_start = self.pos;
+				self.buf_len = n;
+				0
 			}
-			self.buf_start = self.pos;
-			self.buf_len = n;
-		}
-		let byte = self.buf[(self.pos - self.buf_start) as usize];
+		};
+		let byte = self.buf[off];
 		self.pos += 1;
 		Ok(byte)
 	}
@@ -254,7 +263,7 @@ impl PreparedDcScan {
 		};
 		let dims = (frame.width, frame.height);
 		let out_dims = (frame.width.div_ceil(8), frame.height.div_ceil(8));
-		let plane_bytes = total_blocks(&frame)? as usize * 4;
+		let plane_bytes = total_blocks(&frame)? * 4;
 		Ok(PreparedDcScan {
 			src,
 			dims,
@@ -273,7 +282,7 @@ fn mcu_grid(frame: &FrameInfo) -> (u32, u32) {
 	)
 }
 
-fn total_blocks(frame: &FrameInfo) -> Result<u64, ThumbError> {
+fn total_blocks(frame: &FrameInfo) -> Result<usize, ThumbError> {
 	let (mcus_x, mcus_y) = mcu_grid(frame);
 	let mut total = 0u64;
 	for (_, comp) in &frame.comps {
@@ -282,7 +291,7 @@ fn total_blocks(frame: &FrameInfo) -> Result<u64, ThumbError> {
 	if total == 0 || total > MAX_TOTAL_BLOCKS {
 		return Err(err("implausible dc plane size"));
 	}
-	Ok(total)
+	usize::try_from(total).map_err(|_| err("implausible dc plane size"))
 }
 
 impl PreparedDecode for PreparedDcScan {
@@ -373,15 +382,21 @@ impl Planes {
 						let cb = sample(&self.comps[1]) - 128;
 						let cr = sample(&self.comps[2]) - 128;
 						(
-							(y_ + (1402 * cr) / 1000).clamp(0, 255),
-							(y_ - (344 * cb + 714 * cr) / 1000).clamp(0, 255),
-							(y_ + (1772 * cb) / 1000).clamp(0, 255),
+							y_ + (1402 * cr) / 1000,
+							y_ - (344 * cb + 714 * cr) / 1000,
+							y_ + (1772 * cb) / 1000,
 						)
 					}
 					_ => return Err(err("unsupported component count for emission")),
 				};
 				let o = x as usize * 4;
-				row[o..o + 4].copy_from_slice(&[r as u8, g as u8, b as u8, 255]);
+				let px = [
+					r.clamp(0, 255) as u8,
+					g.clamp(0, 255) as u8,
+					b.clamp(0, 255) as u8,
+					255,
+				];
+				row[o..o + 4].copy_from_slice(&px);
 			}
 			sink.push(0, y, out_w, &row)?;
 		}
@@ -483,7 +498,7 @@ impl<'a, 'b> Walk<'a, 'b> {
 			}
 			let total: u64 = counts.iter().map(|&c| u64::from(c)).sum();
 			if tc == 0 {
-				let mut symbols = Vec::with_capacity(total as usize);
+				let mut symbols = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
 				for _ in 0..total {
 					symbols.push(self.cursor.next_u8()?);
 				}
@@ -775,11 +790,16 @@ impl<'a, 'b> Walk<'a, 'b> {
 					// the high bits and emits garbage pixels. Saturating keeps
 					// a hostile file's DC absurd-but-bounded, which the sample
 					// clamp then flattens.
-					let value = (i64::from(comp.pred) << al)
-						.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+					let shifted = i64::from(comp.pred) << al;
+					let value = i32::try_from(shifted).unwrap_or(if shifted < 0 {
+						i32::MIN
+					} else {
+						i32::MAX
+					});
 					let (bx, by) = if interleaved {
-						let mcu_x = (unit % u64::from(mcus_x)) as u32;
-						let mcu_y = (unit / u64::from(mcus_x)) as u32;
+						// unit < mcus_x * mcus_y, so neither fallback fires.
+						let mcu_x = u32::try_from(unit % u64::from(mcus_x)).unwrap_or(u32::MAX);
+						let mcu_y = u32::try_from(unit / u64::from(mcus_x)).unwrap_or(u32::MAX);
 						(
 							mcu_x * u32::from(comp.info.h) + b % u32::from(comp.info.h),
 							mcu_y * u32::from(comp.info.v) + b / u32::from(comp.info.h),
@@ -789,7 +809,7 @@ impl<'a, 'b> Walk<'a, 'b> {
 						// hostile file can push the row past u32::MAX: saturating leaves
 						// the block off the grid instead of wrapping it onto an earlier row.
 						(
-							(comp.seq % units_x) as u32,
+							u32::try_from(comp.seq % units_x).unwrap_or(u32::MAX),
 							u32::try_from(comp.seq / units_x).unwrap_or(u32::MAX),
 						)
 					};

@@ -356,11 +356,11 @@ fn compose(first: u8, then: u8) -> u8 {
 	let [a, b, c, d] = ORIENTATIONS[usize::from(first - 1)];
 	let [e, f, g, h] = ORIENTATIONS[usize::from(then - 1)];
 	let product = [e * a + f * c, e * b + f * d, g * a + h * c, g * b + h * d];
-	let index = ORIENTATIONS
+	ORIENTATIONS
 		.iter()
-		.position(|m| *m == product)
-		.expect("the eight orientations are closed under composition");
-	index as u8 + 1
+		.zip(1u8..)
+		.find_map(|(m, orientation)| (*m == product).then_some(orientation))
+		.expect("the eight orientations are closed under composition")
 }
 
 /// A FullBox's version, flags and body.
@@ -460,7 +460,8 @@ mod tests {
 		loop {
 			let (kind, body, body_end) = cr3::read_box(&mut src, at, end).unwrap();
 			if &kind == b"meta" {
-				return &file[body as usize..body_end as usize];
+				let range = usize::try_from(body).unwrap()..usize::try_from(body_end).unwrap();
+				return &file[range];
 			}
 			at = body_end;
 		}
@@ -472,8 +473,8 @@ mod tests {
 		assert_eq!(meta.primary_size, (120, 80));
 		assert_eq!(meta.jpeg_thumbnails.len(), 3);
 		for thumbnail in &meta.jpeg_thumbnails {
-			let start = thumbnail.offset as usize;
-			let end = start + thumbnail.len as usize;
+			let start = usize::try_from(thumbnail.offset).unwrap();
+			let end = start + usize::try_from(thumbnail.len).unwrap();
 			assert_eq!(&FUJI[start..start + 2], [0xFF, 0xD8], "SOI at {start}");
 			assert_eq!(&FUJI[end - 2..end], [0xFF, 0xD9], "EOI before {end}");
 			assert_eq!(thumbnail.orientation, 1);
@@ -549,7 +550,10 @@ mod tests {
 	}
 
 	fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-		let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+		let mut out = u32::try_from(body.len() + 8)
+			.unwrap()
+			.to_be_bytes()
+			.to_vec();
 		out.extend_from_slice(kind);
 		out.extend_from_slice(body);
 		out

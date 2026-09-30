@@ -120,6 +120,7 @@ pub mod truncating_seconds_or_millis_opt {
 
 mod truncating_visitor {
 	use chrono::{DateTime, Utc};
+	use num_traits::ToPrimitive;
 	use serde::{
 		Deserializer,
 		de::{Error, Visitor},
@@ -160,10 +161,17 @@ mod truncating_visitor {
 					.map(from_seconds_or_millis)
 			}
 
-			// the only lossy case: cast, truncating and saturating at the
-			// i64 bounds
+			// the only lossy case: truncating toward zero and saturating at the
+			// i64 bounds (NaN reads as 0)
 			fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-				Ok(from_seconds_or_millis(v as i64))
+				let saturated = if v > 0.0 {
+					i64::MAX
+				} else if v < 0.0 {
+					i64::MIN
+				} else {
+					0
+				};
+				Ok(from_seconds_or_millis(v.to_i64().unwrap_or(saturated)))
 			}
 
 			fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>

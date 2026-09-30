@@ -117,8 +117,8 @@ impl PreparedDecode for PreparedSimple {
 		}
 		let data = rgba.into_raw();
 		let row_len = w as usize * 4;
-		for (y, row) in data.chunks_exact(row_len).enumerate() {
-			sink.push(0, y as u32, w, row)?;
+		for (y, row) in (0..h).zip(data.chunks_exact(row_len)) {
+			sink.push(0, y, w, row)?;
 		}
 		Ok(())
 	}

@@ -243,8 +243,8 @@ pub trait CategoryFSExt: CategoryFS {
 		let iter = tree.dfs_iter_with_path("");
 		let (num_dirs, num_files, _) = stats.snapshot();
 
-		let mut files = Vec::with_capacity(num_files as usize);
-		let mut dirs = Vec::with_capacity(num_dirs as usize);
+		let mut files = Vec::with_capacity(usize::try_from(num_files).unwrap_or(0));
+		let mut dirs = Vec::with_capacity(usize::try_from(num_dirs).unwrap_or(0));
 
 		for (entry, path) in iter {
 			match entry {

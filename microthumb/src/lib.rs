@@ -83,7 +83,7 @@ const MAX_SOURCE_SIDE_PIXELS: u32 = 1 << 20;
 /// return the best image that fits.
 fn affordable_target(mem_budget: usize) -> u32 {
 	let max_px = (mem_budget / 2 / 20).max(1);
-	(max_px as f64).sqrt() as u32
+	u32::try_from(max_px.isqrt()).unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -362,7 +362,10 @@ pub(crate) fn canvas_dims(
 		cw = (cw * u64::from(MAX_CANVAS_LONG_SIDE) / long).max(1);
 		ch = (ch * u64::from(MAX_CANVAS_LONG_SIDE) / long).max(1);
 	}
-	(cw.min(ow) as u32, ch.min(oh) as u32)
+	(
+		u32::try_from(cw.min(ow)).unwrap_or(u32::MAX),
+		u32::try_from(ch.min(oh)).unwrap_or(u32::MAX),
+	)
 }
 
 /// Whether a preview is big enough to serve the request: its long side covers

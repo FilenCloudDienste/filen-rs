@@ -797,10 +797,10 @@ async fn download_to_zip() {
 				match field {
 					ExtraField::ExtendedTimestamp(data) => {
 						if let Some(modified) = expected_file.last_modified() {
-							assert_eq!(data.mod_time(), Some(modified.timestamp() as u32));
+							assert_eq!(data.mod_time().map(i64::from), Some(modified.timestamp()));
 						}
 						if let Some(created) = expected_file.created() {
-							assert_eq!(data.cr_time(), Some(created.timestamp() as u32));
+							assert_eq!(data.cr_time().map(i64::from), Some(created.timestamp()));
 						}
 					}
 					ExtraField::Ntfs(data) => {

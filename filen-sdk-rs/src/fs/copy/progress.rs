@@ -181,9 +181,12 @@ impl RateEstimator {
 	}
 
 	/// Bytes per second over the window, or `None` until two samples span some active time.
+	/// An absurd rate over a tiny window saturates.
 	pub(crate) fn bytes_per_second(&self) -> Option<u64> {
 		let span = self.span()?;
-		Some((span.bytes_done as f64 / span.active.as_secs_f64()) as u64)
+		// `span` only yields a non-zero active time, so the division cannot panic
+		let rate = u128::from(span.bytes_done) * 1_000_000_000 / span.active.as_nanos();
+		Some(u64::try_from(rate).unwrap_or(u64::MAX))
 	}
 
 	/// Time left to process `remaining_units` at the windowed rate, or `None` while there is no

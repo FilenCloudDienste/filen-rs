@@ -333,7 +333,10 @@ mod tests {
 	use crate::{ByteSource, FormatDecoder, MemSource, ThumbSpec, locate_preview};
 
 	fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-		let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+		let mut out = u32::try_from(body.len() + 8)
+			.unwrap()
+			.to_be_bytes()
+			.to_vec();
 		out.extend_from_slice(kind);
 		out.extend_from_slice(body);
 		out
@@ -554,7 +557,8 @@ mod tests {
 			}
 			let mut moov = boxed(b"uuid", &canon);
 			if let Some((codec, sample)) = track_sample {
-				moov.extend_from_slice(&track(codec, mdat_at, sample.len() as u32));
+				let sample_size = u32::try_from(sample.len()).unwrap();
+				moov.extend_from_slice(&track(codec, mdat_at, sample_size));
 			}
 
 			let mut file = boxed(b"ftyp", b"crx iso");
@@ -772,7 +776,7 @@ mod tests {
 		let noise: Vec<u8> = (0..640 * 480 * 3)
 			.map(|_| {
 				state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-				(state >> 16) as u8
+				(state >> 16).to_le_bytes()[0]
 			})
 			.collect();
 		let mut preview = Vec::new();

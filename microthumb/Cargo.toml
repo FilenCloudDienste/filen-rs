@@ -9,7 +9,7 @@ default = []
 heif = ["dep:heif-decoder"]
 # SVG rasterisation. Off by default: it pulls resvg/usvg into builds that only
 # ever see camera formats.
-svg = ["dep:resvg", "dep:roxmltree"]
+svg = ["dep:resvg", "dep:roxmltree", "dep:num-traits"]
 
 [dependencies]
 image = { version = "0.25.6", default-features = false, features = [
@@ -36,6 +36,8 @@ resvg = { version = "0.48", default-features = false, optional = true }
 # Pinned to the exact version usvg 0.48 locks: the expansion pre-pass reads the
 # document with the same parser usvg will, and adds nothing to the lockfile.
 roxmltree = { version = "0.21.1", optional = true }
+# Float-to-int conversions (ToPrimitive) without a truncating `as`, which the workspace lints deny.
+num-traits = { version = "0.2.19", optional = true }
 
 # See the jpeg-decoder note above: the rayon worker is what keeps the baseline
 # JPEG decode to one MCU row at a time. filen-sdk-rs already drives rayon's

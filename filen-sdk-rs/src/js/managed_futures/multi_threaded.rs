@@ -6,6 +6,7 @@ mod pausable {
 	// https://github.com/xuxiaocheng0201/pausable_future
 	use std::{cell::OnceCell, future::Future};
 
+	use num_traits::ToPrimitive;
 	use pin_project_lite::pin_project;
 	use serde::Deserialize;
 	use wasm_bindgen::{JsCast, JsValue};
@@ -104,7 +105,8 @@ mod pausable {
 					js_sys::Reflect::get(value, v.get_or_init(|| JsValue::from_str("__wbg_ptr")))
 				})
 			}?;
-			let ptr = ptr.as_f64().map_or(0, |ptr| ptr as u32);
+			// __wbg_ptr is a wasm32 address; a missing or out-of-range value reads as null.
+			let ptr = ptr.as_f64().and_then(|ptr| ptr.to_u32()).unwrap_or(0);
 			if ptr == 0 {
 				Err(value.clone())
 			} else {

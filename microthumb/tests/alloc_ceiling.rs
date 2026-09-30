@@ -284,7 +284,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	// 24 MP — the class of source the old full-frame pipeline died on
 	// (96 MB of RGBA). Fixture encoding happens OUTSIDE the measurement.
 	let gradient = RgbImage::from_fn(6000, 4000, |x, y| {
-		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+		Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, ((x + y) & 0xFF) as u8])
 	});
 
 	let mut jpeg = Vec::new();
@@ -335,7 +335,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	// coefficient buffer): served by the DC-scan parser, which also must not
 	// read past the DC scans at the head of the file.
 	let gradient = RgbImage::from_fn(6000, 4000, |x, y| {
-		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+		Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, ((x + y) & 0xFF) as u8])
 	});
 	let mut jpeg = Vec::new();
 	{
@@ -371,7 +371,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 			palette.extend_from_slice(&[i, i.wrapping_mul(3), i.wrapping_mul(7)]);
 		}
 		let mut enc = gif::Encoder::new(&mut gif_bytes, 4000, 3000, &palette).unwrap();
-		let pixels: Vec<u8> = (0..4000usize * 3000).map(|i| (i % 256) as u8).collect();
+		let pixels: Vec<u8> = (0..=255u8).cycle().take(4000 * 3000).collect();
 		enc.write_frame(&gif::Frame::from_indexed_pixels(4000, 3000, pixels, None))
 			.unwrap();
 	}
@@ -386,7 +386,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	// 24 MP striped TIFF — peak is one 16-row strip.
 	let mut tiff_bytes = Vec::new();
 	{
-		let data: Vec<u8> = (0..6000usize * 4000 * 3).map(|i| (i % 253) as u8).collect();
+		let data: Vec<u8> = (0..253u8).cycle().take(6000 * 4000 * 3).collect();
 		let mut enc = tiff::encoder::TiffEncoder::new(Cursor::new(&mut tiff_bytes)).unwrap();
 		let mut img = enc
 			.new_image::<tiff::encoder::colortype::RGB8>(6000, 4000)
@@ -421,7 +421,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	bmp_bytes.extend_from_slice(&0u32.to_le_bytes());
 	// 6000*3 = 18000 bytes/row, already 4-aligned; identical rows are fine
 	// for a memory test.
-	let row: Vec<u8> = (0..6000usize * 3).map(|i| (i % 251) as u8).collect();
+	let row: Vec<u8> = (0..251u8).cycle().take(6000 * 3).collect();
 	for _ in 0..4000 {
 		bmp_bytes.extend_from_slice(&row);
 	}
@@ -441,7 +441,7 @@ fn generate_stays_inside_the_budget_for_large_sources() {
 	// to catch it.
 	let px = 3200usize * 2200;
 	let frame = RgbImage::from_fn(3200, 2200, |x, y| {
-		Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+		Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, ((x + y) & 0xFF) as u8])
 	});
 	for format in [ImageFormat::WebP, ImageFormat::Qoi] {
 		let mut bytes = Vec::new();

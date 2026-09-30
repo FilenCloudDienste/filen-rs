@@ -974,7 +974,7 @@ mod tests {
 		let mut conn = db();
 		let mut events = Vec::new();
 		// Each event names a distinct held container, so each adds exactly one target.
-		for byte in 0..=super::MAX_TARGETED_CONTAINERS as u8 {
+		for byte in (0u8..).take(MAX_TARGETED_CONTAINERS + 1) {
 			// Disjoint ranges, and neither may land on ROOT: a held row whose parent is NULL
 			// is the account root, which resolves to `Unknown` and would end the fold early.
 			let parent = byte.wrapping_add(100);

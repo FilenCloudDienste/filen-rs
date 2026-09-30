@@ -108,10 +108,14 @@ Seal with the `clean-rust` skill's private-module `Sealed` supertrait if closure
   this repo's nightly `cargo fmt`; run `cargo fmt -p <crate>` before staging or pre-commit fails.
 - The root `Cargo.toml`'s `[workspace.lints]` (every member opts in with `[lints] workspace = true`)
   denies `unsafe_code`, `clippy::dbg_macro`, `clippy::todo`, `clippy::self_named_module_files`,
-  `clippy::option_option`, `clippy::struct_excessive_bools` and `clippy::string_slice`. Every hit
-  that predates a lint carries an `#[allow]` whose comment gives the reason; a new hit gets a
-  rewrite, or an allow with its own reason. There is no `clippy.toml`, and nothing enforces the
-  import or allow-comment conventions mechanically; review does.
+  `clippy::option_option`, `clippy::struct_excessive_bools`, `clippy::string_slice` and
+  `clippy::cast_possible_truncation`. Every hit that predates a lint carries an `#[allow]` whose
+  comment gives the reason; a new hit gets a rewrite, or an allow with its own reason. The
+  exception is `cast_possible_truncation`, which has no allows at all: a cast that could
+  truncate becomes `T::try_from` (with `?`, a saturating `unwrap_or`, or an `expect` naming the
+  invariant), and a float-to-int one `num_traits::ToPrimitive`; the diff policy blocks an allow
+  of it or of `clippy::pedantic`. There is no `clippy.toml`, and nothing enforces the import or
+  allow-comment conventions mechanically; review does.
 - `pin_project` (proc-macro, `project = Name`) is used **only** under `filen-sdk-rs/src/auth/http/`;
   everything else (`runtime.rs`, `socket/thread_handling.rs`, `js/managed_futures/*`) uses
   `pin_project_lite`. Follow the neighbourhood; do not mix them in one file.

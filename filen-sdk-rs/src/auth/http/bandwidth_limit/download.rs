@@ -101,7 +101,7 @@ where
 		while let Some(item) = stream.next().await {
 			match item {
 				Ok(mut bytes) => {
-					while let Some(chunk_size)= NonZeroU32::new(bytes.len().min(u32::MAX as usize) as u32){
+					while let Some(chunk_size)= NonZeroU32::new(u32::try_from(bytes.len()).unwrap_or(u32::MAX)){
 						match limiter.acquire_amount(chunk_size.div_ceil(BYTES_PER_KILOBYTE)).await {
 							Ok(()) => {
 								yield Ok(bytes);

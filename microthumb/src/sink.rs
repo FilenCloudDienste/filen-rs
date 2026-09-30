@@ -54,7 +54,7 @@ fn contributions(src: u32, dst: u32, cell: u32) -> u32 {
 	// s maps to cell  ⇔  cell*src/dst ≤ s (rounded up) and s < (cell+1)*src/dst.
 	let start = (u64::from(cell) * u64::from(src)).div_ceil(u64::from(dst));
 	let end = ((u64::from(cell) + 1) * u64::from(src)).div_ceil(u64::from(dst));
-	(end - start) as u32
+	u32::try_from(end - start).unwrap_or(u32::MAX)
 }
 
 impl BoxAccumulator {
@@ -121,11 +121,17 @@ impl PixelSink for BoxAccumulator {
 			return Err(ThumbError::Geometry);
 		}
 		for row in 0..rows {
-			// Integer source→target mapping; u64 keeps 4-gigapixel inputs exact.
-			let ty = ((y + row) as u64 * self.dst_h as u64 / self.src_h as u64) as usize;
+			// Integer source→target mapping; u64 keeps 4-gigapixel inputs exact. The
+			// bounds check above keeps every mapped cell inside dst_w × dst_h, so the
+			// conversions to usize cannot fail.
+			let ty = usize::try_from((y + row) as u64 * self.dst_h as u64 / self.src_h as u64)
+				.map_err(|_| ThumbError::Geometry)?;
 			let src_row = &rgba[row as usize * row_bytes..][..row_bytes];
 			for col in 0..w as usize {
-				let tx = ((x as u64 + col as u64) * self.dst_w as u64 / self.src_w as u64) as usize;
+				let tx = usize::try_from(
+					(x as u64 + col as u64) * self.dst_w as u64 / self.src_w as u64,
+				)
+				.map_err(|_| ThumbError::Geometry)?;
 				let t = ty * self.dst_w as usize + tx;
 				let s = col * 4;
 				// Saturating: a pathological aspect ratio could route millions

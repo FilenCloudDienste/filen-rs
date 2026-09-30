@@ -166,9 +166,9 @@ async fn copy_completes_on_a_small_memory_budget() {
 
 	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
 	let mut originals = Vec::new();
-	for i in 0..4 {
+	for (i, seed) in (0..4).zip(0u8..) {
 		let name = format!("f{i}.bin");
-		originals.push(upload(&client, &source, &name, &data(3 * CHUNK_SIZE + i, i as u8)).await);
+		originals.push(upload(&client, &source, &name, &data(3 * CHUNK_SIZE + i, seed)).await);
 	}
 	let destination = client
 		.create_dir(&test_dir.into(), "destination")
@@ -613,10 +613,10 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 		("two-chunks-plus-one", 2 * CHUNK_SIZE + 1),
 	];
 	let mut boundary_files = Vec::new();
-	for (i, (name, size)) in sizes.iter().enumerate() {
+	for ((name, size), seed) in sizes.iter().zip(0u8..) {
 		boundary_files.push((
 			*name,
-			upload(&client, &source, name, &data(*size, i as u8)).await,
+			upload(&client, &source, name, &data(*size, seed)).await,
 		));
 	}
 	let many = client.create_dir(&(&source).into(), "many").await.unwrap();
@@ -638,7 +638,7 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 	}
 	upload(&client, &deepest, "bottom.txt", b"bottom").await;
 	let wide = client.create_dir(&(&source).into(), "wide").await.unwrap();
-	stream::iter(0..30)
+	stream::iter(0..30u8)
 		.map(|i| {
 			let client = client.clone();
 			let wide = wide.clone();
@@ -647,7 +647,7 @@ async fn copies_chunk_boundaries_many_files_and_deep_and_wide_trees() {
 					.create_dir(&(&wide).into(), &format!("w{i}"))
 					.await
 					.unwrap();
-				upload(&client, &dir, "leaf", &[i as u8]).await;
+				upload(&client, &dir, "leaf", &[i]).await;
 			}
 		})
 		.buffer_unordered(8)
@@ -739,13 +739,13 @@ async fn pausing_and_resuming_many_times_copies_everything_once() {
 	let test_dir = &resources.dir;
 	let source = client.create_dir(&test_dir.into(), "source").await.unwrap();
 	let mut originals = Vec::new();
-	for i in 0..4 {
+	for (i, seed) in (0..4).zip(0u8..) {
 		originals.push(
 			upload(
 				&client,
 				&source,
 				&format!("f{i}"),
-				&data(2 * CHUNK_SIZE + i, i as u8),
+				&data(2 * CHUNK_SIZE + i, seed),
 			)
 			.await,
 		);

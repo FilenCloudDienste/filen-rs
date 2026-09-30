@@ -1095,7 +1095,7 @@ mod tests {
 		let one_chunk = super::CHUNK_SIZE_U64 + u64::from(super::FILE_CHUNK_SIZE_EXTRA.get());
 
 		// A 4-chunk budget: half is 2 chunks, which caps the otherwise-8-MiB default window.
-		let four_chunks = (one_chunk * 4) as usize;
+		let four_chunks = usize::try_from(one_chunk * 4).unwrap();
 		assert_eq!(
 			super::effective_read_ahead(None, four_chunks),
 			one_chunk * 2,
@@ -1108,7 +1108,7 @@ mod tests {
 		);
 
 		// A 2-chunk budget (the iOS default): half is exactly one chunk, the minimum window.
-		let two_chunks = (one_chunk * 2) as usize;
+		let two_chunks = usize::try_from(one_chunk * 2).unwrap();
 		assert_eq!(
 			super::effective_read_ahead(None, two_chunks),
 			super::MIN_READ_AHEAD_BYTES,

@@ -84,7 +84,7 @@ mod tests {
 	/// written at `off`.
 	fn raf(off: u32, len: u32, payload: &[u8]) -> Vec<u8> {
 		let mut file = b"FUJIFILMCCD-RAW 0201FF393101FinePix".to_vec();
-		file.resize(JPEG_POINTER_AT as usize, 0);
+		file.resize(usize::try_from(JPEG_POINTER_AT).unwrap(), 0);
 		file.extend_from_slice(&off.to_be_bytes());
 		file.extend_from_slice(&len.to_be_bytes());
 		file.resize(off as usize, 0);
@@ -112,7 +112,8 @@ mod tests {
 	#[test]
 	fn the_pointed_at_preview_is_located() {
 		let good = jpeg(1600, 1200);
-		let located = locate_preview(&mut MemSource(raf(148, good.len() as u32, &good)))
+		let len = u32::try_from(good.len()).unwrap();
+		let located = locate_preview(&mut MemSource(raf(148, len, &good)))
 			.unwrap()
 			.expect("a preview");
 		assert_eq!((located.offset, located.len), (148, good.len() as u64));
@@ -127,7 +128,7 @@ mod tests {
 	#[test]
 	fn the_header_pointer_is_a_claim_not_a_promise() {
 		let good = jpeg(1600, 1200);
-		assert!(open(raf(148, good.len() as u32, &good)));
+		assert!(open(raf(148, u32::try_from(good.len()).unwrap(), &good)));
 		assert!(Raf.detect(b"FUJIFILMCCD-RAW 0201"));
 		assert!(!Raf.detect(b"\xFF\xD8\xFFsomething else"));
 

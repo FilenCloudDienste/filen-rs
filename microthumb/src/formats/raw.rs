@@ -274,7 +274,7 @@ fn read_directory(
 	// maker notes inline, so its absence is not a reason to drop the table.
 	let (table, next) = match read_exact_at(src, at + 2, table_len + 4) {
 		Some(table) => {
-			let next = u32_at(&table, table_len as usize, endian).unwrap_or(0);
+			let next = u32_at(&table, usize::from(count) * 12, endian).unwrap_or(0);
 			(table, u64::from(next))
 		}
 		None => (read_exact_at(src, at + 2, table_len)?, 0),
@@ -415,7 +415,7 @@ impl Walk<'_> {
 		if entry.typ != 4 && entry.typ != 13 {
 			return Vec::new();
 		}
-		let count = entry.count.min(MAX_IFDS as u32);
+		let count = entry.count.min(u32::try_from(MAX_IFDS).unwrap_or(u32::MAX));
 		if count == 1 {
 			return entry
 				.scalar(endian)
@@ -447,7 +447,7 @@ impl Walk<'_> {
 		if self.orientation.is_none()
 			&& let Some(o @ 1..=8) = dir.scalar(0x0112, endian)
 		{
-			self.orientation = Some(o as u8);
+			self.orientation = u8::try_from(o).ok();
 		}
 		let width = dir.scalar(0x0100, endian).unwrap_or(0);
 		let height = dir.scalar(0x0101, endian).unwrap_or(0);
@@ -458,8 +458,8 @@ impl Walk<'_> {
 		// green grid.
 		let displayable = photometric.is_none_or(|p| p == 2 || p == 6);
 		let (w, h) = (
-			width.min(u32::MAX.into()) as u32,
-			height.min(u32::MAX.into()) as u32,
+			u32::try_from(width).unwrap_or(u32::MAX),
+			u32::try_from(height).unwrap_or(u32::MAX),
 		);
 
 		if displayable
@@ -1111,7 +1111,7 @@ mod tests {
 		tiff.extend_from_slice(&u32::from(orientation).to_le_bytes());
 		tiff.extend_from_slice(&0u32.to_le_bytes());
 		let mut app1 = vec![0xFF, 0xE1];
-		app1.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+		app1.extend_from_slice(&u16::try_from(2 + 6 + tiff.len()).unwrap().to_be_bytes());
 		app1.extend_from_slice(b"Exif\0\0");
 		app1.extend_from_slice(&tiff);
 		app1

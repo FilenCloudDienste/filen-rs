@@ -1,3 +1,4 @@
+use num_traits::ToPrimitive;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -27,7 +28,9 @@ pub(crate) fn f64_to_u64(value: f64) -> Result<u64, F64ToU64Error> {
 	} else if value.fract() != 0.0 {
 		Err(F64ToU64Error::NotInteger(value))
 	} else {
-		Ok(value as u64)
+		// NaN, negatives, values >= 2^64 and non-integers are rejected above, so this
+		// always converts exactly
+		value.to_u64().ok_or(F64ToU64Error::TooLarge(value))
 	}
 }
 

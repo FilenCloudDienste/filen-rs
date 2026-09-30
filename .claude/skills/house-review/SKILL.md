@@ -38,8 +38,9 @@ git diff --name-only --diff-filter=A $BASE HEAD | cat
 
 # Diff policy: [patch]/vendor, git dependencies unpinned or outside the maintainer's
 # accounts, zeroize, unsafe, and binary files that no README.md or generate.sh beside
-# them names; each needs the maintainer's sign-off. It also lists new Cargo.lock packages
-# and majors, each named with its reason in the PR description, and every added
+# them names, each of which needs the maintainer's sign-off, and any allow of
+# clippy::cast_possible_truncation, which has no exceptions. It also lists new Cargo.lock
+# packages and majors, each named with its reason in the PR description, and every added
 # #[allow]/#[expect] line: read each one; one without a comment naming its tradeoff is a
 # finding. The same script runs in pre-commit and in CI.
 bash scripts/check-diff-policy.sh $BASE..HEAD

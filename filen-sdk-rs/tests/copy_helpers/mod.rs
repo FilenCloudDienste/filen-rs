@@ -56,7 +56,7 @@ pub async fn upload(
 
 /// `len` bytes that repeat every 251 bytes, so no two chunks of a file are alike.
 pub fn data(len: usize, seed: u8) -> Vec<u8> {
-	(0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+	(0..251u8).cycle().take(len).map(|b| b ^ seed).collect()
 }
 
 /// `dir`'s recursive contents, keyed by the path below `dir`. Entries whose metadata cannot be

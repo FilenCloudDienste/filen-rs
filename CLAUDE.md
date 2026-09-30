@@ -23,8 +23,11 @@ defaults, commit attribution lines included.
   new `Cargo.lock` package, and `#![feature]` and renamed or reworded shipped items are
   left to review.
   The workspace lints deny `unsafe_code`: each existing site sits under a commented
-  `#[allow(unsafe_code)]`. Every crate inherits them with `[lints] workspace = true`, and
-  the diff policy blocks a `Cargo.toml` with a `[package]` table but without it.
+  `#[allow(unsafe_code)]`. They deny `clippy::cast_possible_truncation` with no exceptions:
+  a cast that could truncate becomes `T::try_from`, or `num_traits::ToPrimitive` from a
+  float, and the diff policy blocks an allow of it. Every crate inherits them with
+  `[lints] workspace = true`, and the diff policy blocks a `Cargo.toml` with a `[package]`
+  table but without it.
 - Fixes to pre-existing code and behaviour changes to shipped features are standalone
   commits at the front of the branch. Refactors change no behaviour. One logical change
   per commit, and follow-up fixes are folded into the commit they correct.
@@ -137,11 +140,12 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   maintainer's approval (see Contributing): `[patch]`/`[replace]`/`[source]` sections,
   `vendor/`, git dependencies not pinned to a full `rev` or not in a repository under
   `github.com/Enduriel` or `github.com/FilenCloudDienste`, `zeroize`, added or changed
-  `unsafe` code, and binary files, added or changed, whose name no `generate.sh` or
-  `README.md` in the same directory mentions. It also lists, without blocking, new
-  `Cargo.lock` packages and new majors of existing ones (`sha2 0.11`), each to be justified
-  in the PR, and every added `#[allow]`/`#[expect]` line, each of which needs a comment
-  naming its tradeoff. Commit an approved change with `SKIP_DIFF_POLICY=1`;
+  `unsafe` code, an allow of `clippy::cast_possible_truncation` (it has no exceptions) or of
+  `clippy::pedantic` (which would switch it off), and binary files, added or changed, whose
+  name no `generate.sh` or `README.md` in the same directory mentions. It also lists, without
+  blocking, new `Cargo.lock` packages and new majors of existing ones (`sha2 0.11`), each to
+  be justified in the PR, and every added `#[allow]`/`#[expect]` line, each of which needs a
+  comment naming its tradeoff. Commit an approved change with `SKIP_DIFF_POLICY=1`;
   nothing else is a reason to set it. Branch Lint still reports it, in its last step, so the
   PR shows what was approved.
 - **commit-msg** — rejects `Co-Authored-By` trailers (in any case, indented or spaced),

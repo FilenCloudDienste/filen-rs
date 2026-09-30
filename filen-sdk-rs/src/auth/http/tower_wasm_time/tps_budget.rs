@@ -9,6 +9,8 @@ use std::{
 	},
 	time::Duration,
 };
+
+use num_traits::ToPrimitive;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use tokio::time::Instant;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -76,20 +78,22 @@ impl TpsBudget {
 		assert!(retry_percent <= 1000.0);
 		assert!(min_per_sec < i32::MAX as u32);
 
-		let (deposit_amount, withdraw_amount) = if retry_percent == 0.0 {
+		let (deposit_amount, withdraw_ratio) = if retry_percent == 0.0 {
 			// If there is no percent, then you gain nothing from deposits.
 			// Withdrawals can only be made against the reserve, over time.
-			(0, 1)
+			(0, 1.0_f32)
 		} else if retry_percent <= 1.0 {
-			(1, (1.0 / retry_percent) as isize)
+			(1, 1.0 / retry_percent)
 		} else {
 			// Support for when retry_percent is between 1.0 and 1000.0,
 			// meaning for every deposit D, D * retry_percent withdrawals
 			// can be made.
-			(1000, (1000.0 / retry_percent) as isize)
+			(1000, 1000.0 / retry_percent)
 		};
+		// The asserts make the ratio at least 1; a tiny percentage overflows isize and saturates.
+		let withdraw_amount = withdraw_ratio.to_isize().unwrap_or(isize::MAX);
 		let reserve = (min_per_sec as isize)
-			.saturating_mul(ttl.as_secs() as isize) // ttl is between 1 and 60 seconds
+			.saturating_mul(isize::try_from(ttl.as_secs()).unwrap_or(isize::MAX)) // ttl is between 1 and 60 seconds
 			.saturating_mul(withdraw_amount);
 
 		// AtomicIsize isn't clone, so the slots need to be built in a loop...

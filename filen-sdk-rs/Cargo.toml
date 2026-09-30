@@ -64,6 +64,8 @@ hmac = { version = "0.12.1", features = ["std"] }
 uuid = { version = "1.18.0", default-features = false }
 chrono = { version = "0.4.41", features = ["serde"] }
 digest = "0.10.7"
+# Float-to-int conversions (ToPrimitive) without a truncating `as`, which the workspace lints deny.
+num-traits = "0.2.19"
 serde = "1.0.219"
 serde_json = "1.0.142"
 hex = { package = "const-hex", version = "1.18.1", features = ["serde"] }

@@ -1196,7 +1196,7 @@ mod tests {
 		for _ in 0..20_000 {
 			let len = (next() % 12) as usize;
 			let name: String = (0..len)
-				.map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+				.map(|_| alphabet[usize::try_from(next() % alphabet.len() as u64).unwrap()])
 				.collect();
 			assert_encode_round_trip(&name);
 		}

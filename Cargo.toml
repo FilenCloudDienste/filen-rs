@@ -30,6 +30,11 @@ self_named_module_files = "deny"
 option_option = "deny"
 struct_excessive_bools = "deny"
 string_slice = "deny"
+# No exceptions: every cast that could truncate is rewritten (T::try_from, or
+# num_traits::ToPrimitive from a float), and the diff policy blocks an allow of this lint.
+# It cannot be "forbid": clap's derive carries #[allow(clippy::pedantic)], which a forbid
+# turns into error E0453, and so does every function a #[wasm_bindgen] extern block imports.
+cast_possible_truncation = "deny"
 
 [profile.test]
 opt-level = 3

@@ -111,7 +111,7 @@ where
 			Poll::Ready(Err(e)) => {
 				let e = e.with_context(this.endpoint.clone());
 				tracing::warn!(
-					elapsed_ms = this.started.elapsed().as_millis() as u64,
+					elapsed_ms = u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX),
 					error = %e,
 					"request failed",
 				);

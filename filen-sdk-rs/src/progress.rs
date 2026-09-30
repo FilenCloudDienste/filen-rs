@@ -44,7 +44,12 @@ impl<'a> ThrottledProgress<'a> {
 	/// Wrap `callback` with the default [`CALLBACK_INTERVAL`], returning `None` when there is no
 	/// callback so call sites keep their "no callback" fast path.
 	pub(crate) fn new(callback: Option<MaybeSendCallback<'a, u64>>) -> Option<MaybeArc<Self>> {
-		callback.map(|callback| Self::with_interval(callback, CALLBACK_INTERVAL.as_millis() as u64))
+		callback.map(|callback| {
+			Self::with_interval(
+				callback,
+				u64::try_from(CALLBACK_INTERVAL.as_millis()).unwrap_or(u64::MAX),
+			)
+		})
 	}
 
 	fn with_interval(callback: MaybeSendCallback<'a, u64>, interval_millis: u64) -> MaybeArc<Self> {
@@ -64,7 +69,7 @@ impl<'a> ThrottledProgress<'a> {
 			return;
 		}
 		self.pending.fetch_add(delta, Ordering::Relaxed);
-		let now = self.start.elapsed().as_millis() as u64;
+		let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
 		let last = self.last_emit_millis.load(Ordering::Relaxed);
 		// Claim the time slot with a CAS so that, even if several chunk futures clear the interval
 		// at the same instant, only one of them forwards; the rest leave their bytes pending and

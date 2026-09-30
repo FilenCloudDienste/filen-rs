@@ -57,6 +57,7 @@ use crate::{
 	ByteSource, FormatDecoder, PixelSink, PreparedDecode, SmallImage, ThumbError, ThumbSpec,
 };
 
+use num_traits::ToPrimitive;
 use resvg::{tiny_skia, usvg};
 
 pub struct Svg;
@@ -161,14 +162,17 @@ impl FormatDecoder for Svg {
 		spec: &ThumbSpec,
 	) -> Result<Box<dyn PreparedDecode>, ThumbError> {
 		let len = src.len();
-		if len == 0 || len > MAX_SVG_DOC_BYTES {
+		let Some(size) = usize::try_from(len)
+			.ok()
+			.filter(|_| len != 0 && len <= MAX_SVG_DOC_BYTES)
+		else {
 			return Err(ThumbError::Decode(format!(
 				"svg: {len} bytes is outside the supported document size"
 			)));
-		}
+		};
 		// No header/payload split exists in XML — the whole (capped) document
 		// is the header, and usvg needs all of it anyway.
-		let mut text = vec![0u8; len as usize];
+		let mut text = vec![0u8; size];
 		let mut filled = 0;
 		while filled < text.len() {
 			let n = src.read_at(filled as u64, &mut text[filled..])?;
@@ -937,8 +941,11 @@ fn arc_vertices(radius: f64) -> u64 {
 	// Clamped far below `u64::MAX`, not at it: the count is only ever compared
 	// against a budget, and `u64::MAX as f64` rounds to 2^64, so saturating
 	// there and then adding to it wrapped back to a small number — which read
-	// as "well under budget" and turned the guard below into a no-op.
-	(4.0 * per_quarter).min(f64::from(u32::MAX)) as u64
+	// as "well under budget" and turned the guard below into a no-op. The
+	// clamped value is a whole number in [4, u32::MAX], so the fallback is
+	// never taken; it charges the clamp all the same.
+	let vertices = (4.0 * per_quarter).min(f64::from(u32::MAX));
+	vertices.to_u64().unwrap_or(u64::from(u32::MAX))
 }
 
 /// A CSS length in user units, deliberately over-read: the number is taken
@@ -1370,7 +1377,12 @@ fn raster_dims(aspect: f64, spec: &ThumbSpec) -> (u32, u32) {
 		w *= shrink;
 		h *= shrink;
 	}
-	((w.round() as u32).max(1), (h.round() as u32).max(1))
+	// Both sides end at most MAX_CANVAS_LONG_SIDE: the long-side cap scales them
+	// under it and the area shrink only lowers them. A product that overflows f64
+	// on an extreme aspect can leave NaN, which `to_u32` refuses: that side gets
+	// one pixel, as a side that rounds to zero does.
+	let side = |v: f64| v.round().to_u32().unwrap_or(1).max(1);
+	(side(w), side(h))
 }
 
 struct PreparedSvg {
@@ -1460,13 +1472,16 @@ impl PreparedDecode for PreparedSvg {
 			.map_err(|e| ThumbError::Decode(format!("svg: {e}")))?;
 		let (ow, oh) = self.out_dims;
 		let size = tree.size();
-		let scale =
+		let fit =
 			(f64::from(ow) / f64::from(size.width())).min(f64::from(oh) / f64::from(size.height()));
 		// The render transform is f32, and a subnormal document size fits an
 		// f64 scale that overflows f32 to infinity, which renders nothing.
-		if !(scale > 0.0 && scale <= f64::from(f32::MAX)) {
+		let Some(scale) = fit
+			.to_f32()
+			.filter(|_| fit > 0.0 && fit <= f64::from(f32::MAX))
+		else {
 			return Err(ThumbError::Decode("svg: degenerate document size".into()));
-		}
+		};
 		// The estimate promised a fixed render allowance; hold the real tree to
 		// it before anything allocates. Dashing happens inside the stroke of a
 		// path that is itself inside the layer stack, so the two are concurrent
@@ -1478,7 +1493,7 @@ impl PreparedDecode for PreparedSvg {
 				"svg: stroke-dasharray expands past the memory allowance".into(),
 			));
 		}
-		if layer_peak(tree.root(), scale, self.layer_cap()).saturating_add(dashes) > allowance {
+		if layer_peak(tree.root(), fit, self.layer_cap()).saturating_add(dashes) > allowance {
 			return Err(ThumbError::Decode(
 				"svg: isolated layer stack exceeds the memory allowance".into(),
 			));
@@ -1488,7 +1503,6 @@ impl PreparedDecode for PreparedSvg {
 		};
 		// Uniform fit, centered: the aspect from `open` and usvg's can differ
 		// on exotic documents, and a letterboxed render beats a distorted one.
-		let scale = scale as f32;
 		let ts = tiny_skia::Transform::from_scale(scale, scale).post_translate(
 			(ow as f32 - size.width() * scale) / 2.0,
 			(oh as f32 - size.height() * scale) / 2.0,
@@ -1580,7 +1594,10 @@ fn path_dash_bytes(path: &usvg::Path) -> u64 {
 		}
 	}
 	let pairs = (dashes.len() / 2) as f64;
-	(length * pairs / interval * DASH_BYTES).min(u64::MAX as f64) as u64
+	// Saturating: an estimate past u64, infinite length or NaN included, is
+	// charged u64::MAX rather than undercounted.
+	let bytes = length * pairs / interval * DASH_BYTES;
+	bytes.to_u64().unwrap_or(u64::MAX)
 }
 
 /// Worst-case concurrent isolated-layer bytes resvg can hold while rendering
@@ -1607,12 +1624,8 @@ fn layer_peak(group: &usvg::Group, scale: f64, cap: u64) -> u64 {
 		let bbox = group.abs_layer_bounding_box();
 		let w = (f64::from(bbox.width()) * scale).ceil() + f64::from(LAYER_PAD);
 		let h = (f64::from(bbox.height()) * scale).ceil() + f64::from(LAYER_PAD);
-		let bytes = if w.is_finite() && h.is_finite() {
-			(w * h * 4.0).min(u64::MAX as f64) as u64
-		} else {
-			u64::MAX
-		}
-		.min(cap);
+		// Saturating: a product past u64, or a non-finite side, is charged the most.
+		let bytes = (w * h * 4.0).to_u64().unwrap_or(u64::MAX).min(cap);
 		own = bytes;
 		if group.clip_path().is_some() {
 			own = own.saturating_add(bytes.saturating_mul(2));

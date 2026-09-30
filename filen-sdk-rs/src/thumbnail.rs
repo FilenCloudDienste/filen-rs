@@ -280,7 +280,7 @@ pub const MAX_THUMBNAIL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 /// read-ahead, see `RemoteChunkSource`) parks in its hand-off channel. What
 /// the stream's reader holds in flight is pool memory drawn from the client's
 /// file-io budget, exactly like any download's, and is not charged here.
-pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 3 * crate::consts::CHUNK_SIZE_U64 as usize;
+pub const REMOTE_SOURCE_RESIDENT_BYTES: usize = 3 * crate::consts::CHUNK_SIZE;
 
 /// The thumbnail that was written, and how it was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,7 +691,7 @@ mod remote_chunks {
 			.with_start(start)
 			.with_end(end)
 			.build();
-		let mut data = Vec::with_capacity((end - start) as usize);
+		let mut data = Vec::with_capacity(usize::try_from(end - start).unwrap_or(0));
 		reader.read_to_end(&mut data).await?;
 		Ok(data)
 	}
@@ -2657,7 +2657,7 @@ mod tests {
 	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
 		use image::{ImageFormat, RgbImage};
 		let image = RgbImage::from_fn(width, height, |x, y| {
-			image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
+			image::Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, 0])
 		});
 		let mut bytes = Vec::new();
 		image
@@ -2676,8 +2676,8 @@ mod tests {
 			state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
 			let noise = (state >> 26) as u8;
 			image::Rgba([
-				((x % 256) as u8).wrapping_add(noise),
-				((y % 256) as u8).wrapping_add(noise),
+				((x & 0xFF) as u8).wrapping_add(noise),
+				((y & 0xFF) as u8).wrapping_add(noise),
 				noise,
 				alpha(x, y),
 			])
@@ -2775,7 +2775,7 @@ mod tests {
 	#[test]
 	fn a_lossy_thumbnail_keeps_real_transparency_exactly() {
 		let spec = ThumbSpec::new(64, 64, DEFAULT_THUMBNAIL_MEM_BUDGET);
-		let source = noise_png_bytes(64, 64, |x, y| ((x * 4 + y) % 256) as u8);
+		let source = noise_png_bytes(64, 64, |x, y| ((x * 4 + y) & 0xFF) as u8);
 		let (_, lossless) =
 			thumbnail_with(source.clone(), &spec, ThumbnailFit::Cover, None).unwrap();
 		let (outcome, lossy) =
@@ -2986,7 +2986,8 @@ mod tests {
 			Box::new(move |ask| {
 				asks.lock().unwrap().push(ask);
 				let (start, end) = chunk_range(ask.index, len);
-				Ok(vec![ask.index as u8; (end - start) as usize])
+				let fill = u8::try_from(ask.index).unwrap();
+				Ok(vec![fill; usize::try_from(end - start).unwrap()])
 			})
 		});
 		let mut buf = [0u8; 16];
@@ -3108,7 +3109,8 @@ mod tests {
 			Some(cancel.clone()),
 			Box::new(move |ask| {
 				let (start, end) = chunk_range(ask.index, len);
-				Ok(data[start as usize..end as usize].to_vec())
+				let range = usize::try_from(start).unwrap()..usize::try_from(end).unwrap();
+				Ok(data[range].to_vec())
 			}),
 		);
 		let mut out = Vec::new();
@@ -3310,7 +3312,7 @@ mod tests {
 	fn jpeg_bytes(width: u32, height: u32) -> Vec<u8> {
 		use image::{ImageFormat, RgbImage};
 		let image = RgbImage::from_fn(width, height, |x, y| {
-			image::Rgb([(x % 256) as u8, (y % 256) as u8, 0])
+			image::Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, 0])
 		});
 		let mut bytes = Vec::new();
 		image
@@ -3320,13 +3322,13 @@ mod tests {
 	}
 
 	/// Where a SubIFD JPEG sits in [`raw_with`]: past the two directories.
-	const PREVIEW_AT: u64 = 200;
+	const PREVIEW_AT: u16 = 200;
 
 	/// A RAW-shaped container: a little-endian TIFF whose IFD0 carries
 	/// `orientation` and whose SubIFD points at a JPEG of `declared` bytes at
 	/// [`PREVIEW_AT`] — the shape every TIFF-family camera uses, and the one
 	/// microthumb's own tests prove it walks.
-	fn raw_with(jpeg: &[u8], orientation: u32, declared: u32) -> Vec<u8> {
+	fn raw_with(jpeg: &[u8], orientation: u32, declared: u64) -> Vec<u8> {
 		fn entry(tag: u16, typ: u16, count: u32, value: u32) -> Vec<u8> {
 			let mut out = tag.to_le_bytes().to_vec();
 			out.extend_from_slice(&typ.to_le_bytes());
@@ -3341,10 +3343,10 @@ mod tests {
 		file.extend_from_slice(&0u32.to_le_bytes());
 		file.resize(60, 0);
 		file.extend_from_slice(&2u16.to_le_bytes());
-		file.extend_from_slice(&entry(0x0201, 4, 1, PREVIEW_AT as u32));
-		file.extend_from_slice(&entry(0x0202, 4, 1, declared));
+		file.extend_from_slice(&entry(0x0201, 4, 1, u32::from(PREVIEW_AT)));
+		file.extend_from_slice(&entry(0x0202, 4, 1, u32::try_from(declared).unwrap()));
 		file.extend_from_slice(&0u32.to_le_bytes());
-		file.resize(PREVIEW_AT as usize, 0);
+		file.resize(usize::from(PREVIEW_AT), 0);
 		file.extend_from_slice(jpeg);
 		file
 	}
@@ -3366,7 +3368,7 @@ mod tests {
 	#[test]
 	fn the_written_preview_is_the_stored_jpeg_and_nothing_else() {
 		let jpeg = jpeg_bytes(640, 480);
-		let (preview, out) = write(raw_with(&jpeg, 1, jpeg.len() as u32));
+		let (preview, out) = write(raw_with(&jpeg, 1, jpeg.len() as u64));
 		assert_eq!(out, jpeg);
 		assert_eq!(preview.app1, None);
 		assert_eq!((preview.located.width, preview.located.height), (640, 480));
@@ -3381,7 +3383,7 @@ mod tests {
 		use image::{ImageDecoder, metadata::Orientation};
 
 		let jpeg = jpeg_bytes(640, 480);
-		let (preview, out) = write(raw_with(&jpeg, 6, jpeg.len() as u32));
+		let (preview, out) = write(raw_with(&jpeg, 6, jpeg.len() as u64));
 		let at = usize::from(preview.located.exif_insert_at.expect("a splice point"));
 		// SOI, then the 16-byte JFIF APP0 with its marker and length.
 		assert_eq!(at, 2 + 2 + 16);
@@ -3410,17 +3412,17 @@ mod tests {
 		jpeg.extend_from_slice(&super::orientation_app1(6));
 		jpeg.extend_from_slice(&plain[2..]);
 		// The container claims 8; the stream says 6 and the stream wins.
-		let (preview, out) = write(raw_with(&jpeg, 8, jpeg.len() as u32));
+		let (preview, out) = write(raw_with(&jpeg, 8, jpeg.len() as u64));
 		assert_eq!(out, jpeg);
 		assert_eq!(preview.app1, None);
 		assert_eq!(preview.located.stream_orientation, Some(6));
 		assert_eq!(preview.viewer_orientation(), 6);
 		// Neither side declares anything: upright, and nothing spliced.
-		let (preview, out) = write(raw_with(&plain, 1, plain.len() as u32));
+		let (preview, out) = write(raw_with(&plain, 1, plain.len() as u64));
 		assert_eq!(out, plain);
 		assert_eq!(preview.viewer_orientation(), 1);
 		// Only the container knows: spliced, and reported.
-		let (preview, _) = write(raw_with(&plain, 3, plain.len() as u32));
+		let (preview, _) = write(raw_with(&plain, 3, plain.len() as u64));
 		assert!(preview.app1.is_some());
 		assert_eq!(preview.viewer_orientation(), 3);
 	}
@@ -3435,8 +3437,8 @@ mod tests {
 
 		let hif = include_bytes!("../../microthumb/tests/fixtures/heif/fuji-irot1.heic");
 		let (preview, out) = write(hif.to_vec());
-		let start = preview.located.offset as usize;
-		let jpeg = &hif[start..start + preview.located.len as usize];
+		let start = usize::try_from(preview.located.offset).unwrap();
+		let jpeg = &hif[start..start + usize::try_from(preview.located.len).unwrap()];
 		let at = usize::from(preview.located.exif_insert_at.expect("a splice point"));
 		assert_eq!(at, 2, "nothing ahead of a bare JPEG's tables");
 		assert_eq!(out.len(), jpeg.len() + ORIENTATION_APP1_LEN);
@@ -3470,11 +3472,13 @@ mod tests {
 			if offset >= self.len {
 				return Ok(0);
 			}
+			let rest = usize::try_from(self.len - offset).unwrap();
+			let offset = usize::try_from(offset).unwrap();
 			self.furthest
-				.fetch_max(offset as usize + buf.len(), Ordering::Relaxed);
-			let n = (self.len - offset).min(buf.len() as u64) as usize;
+				.fetch_max(offset + buf.len(), Ordering::Relaxed);
+			let n = rest.min(buf.len());
 			for (i, b) in buf[..n].iter_mut().enumerate() {
-				*b = self.prefix.get(offset as usize + i).copied().unwrap_or(0);
+				*b = self.prefix.get(offset + i).copied().unwrap_or(0);
 			}
 			Ok(n)
 		}
@@ -3500,16 +3504,16 @@ mod tests {
 	#[test]
 	fn a_forged_length_is_refused_before_any_payload_is_read() {
 		let jpeg = with_sof_dims(jpeg_bytes(640, 480), 8000, 6000);
-		let sparse = |declared: u32| {
+		let sparse = |declared: u64| {
 			let furthest = Arc::new(AtomicUsize::new(0));
 			let src = Sparse {
 				prefix: raw_with(&jpeg, 1, declared),
-				len: u64::from(declared) + PREVIEW_AT + 1024,
+				len: declared + u64::from(PREVIEW_AT) + 1024,
 				furthest: furthest.clone(),
 			};
 			(src, furthest)
 		};
-		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES as u32 + 1);
+		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES + 1);
 		assert_eq!(locate_embedded_preview(&mut src).unwrap(), None);
 		assert!(
 			furthest.load(Ordering::Relaxed) < 64 * 1024,
@@ -3518,7 +3522,7 @@ mod tests {
 		);
 		// One byte under the ceiling is served — and locating it reads no
 		// payload either.
-		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES as u32);
+		let (mut src, furthest) = sparse(MAX_PREVIEW_BYTES);
 		assert!(locate_embedded_preview(&mut src).unwrap().is_some());
 		assert!(furthest.load(Ordering::Relaxed) < 64 * 1024);
 	}
@@ -3528,7 +3532,7 @@ mod tests {
 	#[test]
 	fn a_source_that_runs_short_is_an_error_not_a_short_file() {
 		let jpeg = jpeg_bytes(640, 480);
-		let declared = jpeg.len() as u32 + 4096;
+		let declared = jpeg.len() as u64 + 4096;
 		let container = raw_with(&jpeg, 1, declared);
 		let real_len = container.len() as u64;
 		struct Truncated(MemSource, u64);

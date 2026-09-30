@@ -22,8 +22,8 @@ fn noisy_jpeg(width: u32, height: u32) -> Vec<u8> {
 		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
 		let noise = (state >> 24) as u8;
 		image::Rgb([
-			((x % 256) as u8).wrapping_add(noise),
-			((y % 256) as u8).wrapping_add(noise),
+			x.to_le_bytes()[0].wrapping_add(noise),
+			y.to_le_bytes()[0].wrapping_add(noise),
 			noise,
 		])
 	});

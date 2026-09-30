@@ -2,8 +2,9 @@
 # Blocks changes that need the maintainer's approval before they land (see CLAUDE.md,
 # Contributing): [patch]/[replace]/[source] sections, vendored sources, git dependencies
 # not pinned to a rev or not under the Enduriel or FilenCloudDienste GitHub accounts,
-# zeroize, unsafe code, and binary files that no generate.sh or README.md next to them
-# names. Only the diff is checked, so what is already on main never trips it.
+# zeroize, unsafe code, an allow of clippy::cast_possible_truncation, and binary files that
+# no generate.sh or README.md next to them names. Only the diff is checked, so what is
+# already on main never trips it.
 #
 #   scripts/check-diff-policy.sh --cached              staged changes (pre-commit)
 #   scripts/check-diff-policy.sh origin/main...HEAD    a whole branch (CI, house-review)
@@ -96,6 +97,15 @@ unsafe_lines=$(added '*.rs' | sed -E 's#(^\+|[[:space:]])//.*#\1#' |
 [ -n "$unsafe_lines" ] &&
 	block "added or changed unsafe code needs maintainer approval:
 $(first "$unsafe_lines")"
+
+# clippy::cast_possible_truncation has no exceptions (see the workspace lints in Cargo.toml),
+# and an allow of clippy::pedantic would switch it off too. Any line naming either is caught,
+# so an attribute list spread over several lines cannot slip past.
+cast_allows=$(added '*.rs' | sed -E 's#(^\+|[[:space:]])//.*#\1#' |
+	grep -E 'cast_possible_truncation|clippy::pedantic')
+[ -n "$cast_allows" ] &&
+	block "clippy::cast_possible_truncation is never allowed, nor clippy::pedantic around it; rewrite the cast with T::try_from, or num_traits::ToPrimitive from a float:
+$(first "$cast_allows")"
 
 # A binary file, new or changed, is allowed where a generate.sh or README.md in its own
 # directory names it, saying how it is made or where it comes from. Without rename

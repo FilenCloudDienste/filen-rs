@@ -1040,7 +1040,7 @@ mod tests {
 
 	fn planned(request: u64) -> PlannedTopLevelItem {
 		PlannedTopLevelItem {
-			request: request as usize,
+			request: usize::try_from(request).unwrap(),
 			source_uuid: Uuid::new_v4(),
 			dest_uuid: Uuid::new_v4(),
 			dest_parent: Uuid::new_v4(),
@@ -1080,7 +1080,7 @@ mod tests {
 				0 => channel.on_top_level_planned(vec![planned(i)]),
 				1 => channel.on_update(update(i)),
 				_ => channel.on_top_level_created(CopiedTopLevel {
-					request: i as usize,
+					request: usize::try_from(i).unwrap(),
 					source_uuid: Uuid::new_v4(),
 					item: crate::fs::categories::NonRootItemType::Dir(Cow::Owned(dir())),
 				}),

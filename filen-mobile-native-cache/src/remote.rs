@@ -1997,7 +1997,7 @@ impl AuthCacheState {
 
 	/// How many files have local changes that have not reached the server.
 	pub(crate) fn pending_upload_count(&self) -> Result<u32, CacheError> {
-		Ok(sql::select_pending_uploads(&self.conn())?.len() as u32)
+		Ok(u32::try_from(sql::select_pending_uploads(&self.conn())?.len()).unwrap_or(u32::MAX))
 	}
 
 	pub(crate) async fn clear_local_cache_by_uuid(&self, uuid: &str) -> Result<(), CacheError> {

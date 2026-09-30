@@ -5319,7 +5319,7 @@ pub async fn test_the_drain_retries_a_file_whose_uuid_was_re_minted() {
 	db.update_dir_children(test_dir_path).await.unwrap();
 	match db.query_item(&file_path).unwrap().unwrap() {
 		FfiObject::File(f) => assert_eq!(
-			f.size as usize,
+			usize::try_from(f.size).unwrap(),
 			DRAINED.len(),
 			"the drained bytes must be the ones now on the server"
 		),
@@ -5367,7 +5367,7 @@ pub async fn test_the_drain_never_replaces_a_marked_edit_with_an_empty_file() {
 	db.update_dir_children(test_dir_path).await.unwrap();
 	match db.query_item(&file_path).unwrap() {
 		Some(FfiObject::File(f)) => assert_eq!(
-			f.size as usize,
+			usize::try_from(f.size).unwrap(),
 			EDITED.len(),
 			"the drain must send the edited bytes, not create an empty file over them"
 		),
@@ -6036,7 +6036,7 @@ pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
 		modified.file.uuid, uuid_before,
 		"...and takes a freshly minted version id"
 	);
-	assert_eq!(modified.file.size as usize, EDITED.len());
+	assert_eq!(usize::try_from(modified.file.size).unwrap(), EDITED.len());
 	assert_eq!(
 		modified.file.pending_upload_at, None,
 		"the edit reached the server, so nothing is left outstanding"
@@ -6093,7 +6093,7 @@ pub async fn test_modify_file_content_lands_external_bytes_as_a_new_version() {
 		"modify_content_renamed.txt",
 		"the stable id must have reached the file under its current name"
 	);
-	assert_eq!(by_stable.file.size as usize, AGAIN.len());
+	assert_eq!(usize::try_from(by_stable.file.size).unwrap(), AGAIN.len());
 
 	tokio::fs::remove_file(&external).await.ok();
 }
@@ -6182,7 +6182,7 @@ pub async fn test_update_and_query_item_follows_a_file_to_its_deletion() {
 		"the refresh must follow the file across the edit, not report the version it held"
 	);
 	assert_eq!(head.stable_uuid, stable, "and it is still the same file");
-	assert_eq!(head.size as usize, EDITED.len());
+	assert_eq!(usize::try_from(head.size).unwrap(), EDITED.len());
 	assert_eq!(
 		db.query_item_by_uuid(&stable).unwrap(),
 		Some(FfiObject::File(head)),
@@ -6285,7 +6285,7 @@ pub async fn test_update_and_query_item_follows_a_versioning_disabled_edit() {
 		other => panic!("expected the replaced file's head, got {other:?}"),
 	};
 	assert_eq!(head.uuid, new_file.uuid().to_string());
-	assert_eq!(head.size as usize, EDITED.len());
+	assert_eq!(usize::try_from(head.size).unwrap(), EDITED.len());
 	assert_eq!(
 		head.original_parent, None,
 		"the ghost the edit left behind is trashed; the head is not"
@@ -6429,7 +6429,7 @@ pub async fn test_download_file_if_changed_with_item_serves_bytes_and_item_toget
 	assert_eq!(tokio::fs::read(&fresh.path).await.unwrap(), CONTENT);
 	assert_eq!(fresh.file.uuid, file.uuid().to_string());
 	assert_eq!(fresh.file.stable_uuid, file.stable_uuid().to_string());
-	assert_eq!(fresh.file.size as usize, CONTENT.len());
+	assert_eq!(usize::try_from(fresh.file.size).unwrap(), CONTENT.len());
 	assert_eq!(fresh.file.pending_upload_at, None);
 	assert_eq!(
 		progress.max.load(std::sync::atomic::Ordering::Relaxed),
@@ -6753,7 +6753,7 @@ pub async fn test_an_aborted_modify_leaves_the_edit_for_the_drain() {
 	match db.query_item(&file_path).unwrap().unwrap() {
 		FfiObject::File(f) => {
 			assert_eq!(
-				f.size as usize,
+				usize::try_from(f.size).unwrap(),
 				edited.len(),
 				"the drained bytes must be the ones now on the server"
 			);
@@ -6888,7 +6888,7 @@ pub async fn test_an_aborted_new_upload_leaves_no_row() {
 		.await
 		.unwrap();
 	assert_eq!(uploaded.id, file_path);
-	assert_eq!(uploaded.file.size as usize, contents.len());
+	assert_eq!(usize::try_from(uploaded.file.size).unwrap(), contents.len());
 	assert_eq!(
 		db.query_item(&file_path).unwrap(),
 		Some(FfiObject::File(uploaded.file)),

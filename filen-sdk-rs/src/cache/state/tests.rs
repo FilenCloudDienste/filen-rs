@@ -1833,7 +1833,7 @@ fn drain_holds_watermark_at_a_hole_across_batch_boundaries() {
 		"watermark held at the contiguous frontier (1), not freed by a later batch's high id"
 	);
 	assert!(
-		item_count(&state) as usize > BATCH_SIZE + 1,
+		usize::try_from(item_count(&state)).unwrap() > BATCH_SIZE + 1,
 		"every event still applied across both batches (the hole holds the watermark, not the apply)"
 	);
 }

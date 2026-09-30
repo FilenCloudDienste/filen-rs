@@ -583,7 +583,7 @@ mod tests {
 
 	#[test]
 	fn large_input_roundtrip() {
-		let bytes: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+		let bytes: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
 		let hs: HexString = bytes.clone().into();
 		let s = hs.to_string();
 		assert_eq!(s.len(), bytes.len() * 2);
@@ -594,8 +594,10 @@ mod tests {
 
 	#[test]
 	fn large_input_with_prefix_roundtrip() {
-		let bytes: Vec<u8> = (0..512usize)
-			.map(|i| (i.wrapping_mul(7) % 256) as u8)
+		let bytes: Vec<u8> = (0..=255u8)
+			.cycle()
+			.take(512)
+			.map(|i| i.wrapping_mul(7))
 			.collect();
 		let hs: HexString = bytes.clone().into();
 		let prefixed = format!("0x{}", hs);

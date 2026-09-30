@@ -172,11 +172,7 @@ pub(crate) mod test_support {
 	/// every code point is truncated to a single byte.
 	pub(crate) fn latin1_bytes(s: &str) -> Vec<u8> {
 		s.chars()
-			.map(|c| {
-				let cp = c as u32;
-				assert!(cp <= 0xFF, "test string must be Latin-1 representable");
-				cp as u8
-			})
+			.map(|c| u8::try_from(c).expect("test string must be Latin-1 representable"))
 			.collect()
 	}
 }

@@ -40,7 +40,8 @@ impl From<ZipExtendedTime> for UnknownExtraField {
 		let data = value.to_extra_data();
 		UnknownExtraField {
 			header_id: async_zip::spec::header::HeaderId(0x5455),
-			data_size: data.len() as u16,
+			data_size: u16::try_from(data.len())
+				.expect("a flags byte and at most two u32 times (should be impossible)"),
 			content: data,
 		}
 	}
@@ -70,7 +71,9 @@ impl From<ZipNTFSTime> for UnknownExtraField {
 		let data = value.to_extra_data();
 		UnknownExtraField {
 			header_id: async_zip::spec::header::HeaderId(0x000A),
-			data_size: data.len() as u16,
+			data_size: u16::try_from(data.len()).expect(
+				"reserved, tag, size and three u64 times are 32 bytes (should be impossible)",
+			),
 			content: data,
 		}
 	}

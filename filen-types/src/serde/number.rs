@@ -6,6 +6,7 @@
 /// non-numeric string, object, array) fails like a plain u64 field. Wire API
 /// types should use [`permissive_u64`] or stricter instead.
 pub mod truncating_u64 {
+	use num_traits::ToPrimitive;
 	use serde::{
 		Deserializer, Serialize, Serializer,
 		de::{Error, Visitor},
@@ -43,10 +44,10 @@ pub mod truncating_u64 {
 					.map_err(|_| E::custom("negative value cannot be converted to u64"))
 			}
 
-			// the only lossy case: cast, truncating and saturating at the
-			// u64 bounds
+			// the only lossy case: truncating toward zero and saturating at the
+			// u64 bounds (NaN reads as 0)
 			fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
-				Ok(v as u64)
+				Ok(v.to_u64().unwrap_or(if v > 0.0 { u64::MAX } else { 0 }))
 			}
 
 			fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
