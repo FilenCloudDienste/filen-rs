@@ -543,20 +543,16 @@ fn heap(bytes: usize) -> usize {
 /// rows, so walking it whole would charge the side for a tree the baseline is already charged for,
 /// and would report a scoped pass holding two more copies of the tree it exists not to hold.
 ///
-/// Two things it cannot see, both small and both named rather than folded in: an overlay's
-/// TOMBSTONES (a path observed absent) cost a key each and are not among its own keys, and a
-/// carried slot holds `Option<V>` where a whole one holds `V`, which is the only reason the slot
-/// width is chosen per backing here.
+/// An overlay's TOMBSTONES (a path observed absent) sit in a set of their own, counted here by its
+/// slots. What it cannot see, and names rather than folds in, is each tombstone's key: they are
+/// not among the side's own keys.
 fn side_owned_bytes<V: FromRow>(
 	side: &Side<V>,
 	baseline: &Baseline,
 	node_heap: impl Fn(&V) -> usize,
 ) -> usize {
-	let value = match side {
-		Side::Whole(_) => size_of::<V>(),
-		Side::Carried(_) => size_of::<Option<V>>(),
-	};
-	let slots = side.capacity() * (size_of::<String>() + value + 1);
+	let slots = side.capacity() * (size_of::<String>() + size_of::<V>() + 1)
+		+ side.tombstone_capacity() * (size_of::<String>() + 1);
 	let read = side.of(baseline);
 	let owned: usize = side
 		.own_keys()
