@@ -2,6 +2,8 @@
 //! mtime+size fast-path so an unchanged file is never re-hashed. An edit that kept BOTH its size
 //! and its mtime is therefore invisible here; what protects it from being overwritten is the
 //! pre-download stash hashing its target (`apply::local_holds_unsynced_content`), not the scan.
+//! A subtree walk extends the same trust to a directory its caller proved renamed: a file the
+//! fast path misses at its own path may take the hash of the row it left (see [`scan_subtree`]).
 //!
 //! Paths are NFC-normalized (macOS hands back NFD) and `/`-joined so they key 1:1 against the
 //! NFC-normalized remote snapshot and the baseline. Two entries that normalize to the same key are
@@ -61,7 +63,8 @@ pub(crate) struct LocalNode {
 	/// Modification time in epoch millis.
 	pub(crate) mtime_millis: i64,
 	/// BLAKE3 of the content (files only): reused from the baseline when `(size, mtime)` matched
-	/// (the fast-path), otherwise freshly computed.
+	/// (the fast-path) — the row at its own path, or the one at the path a caller proved its
+	/// directory was renamed from — otherwise freshly computed.
 	pub(crate) content_hash: Option<Blake3Hash>,
 }
 
@@ -444,13 +447,21 @@ pub(crate) fn scan_local(
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
 ) -> (LocalScan, IgnoreRules) {
-	scan_local_watched(root, "", baseline, rules, &rule_files, &mut |_| {})
+	scan_local_watched(
+		root,
+		"",
+		baseline,
+		rules,
+		&rule_files,
+		&mut |_| {},
+		&mut |_, _, _| None,
+	)
 }
 
 /// [`scan_local`], with a hook called for every entry the walker lists, just before the scan reads
 /// it. It exists for the tests: an entry that is there when the walk lists it and gone when the
 /// scan reads it is a race no test can produce from the outside, and it is the one this scan has
-/// to survive without calling the tree partial.
+/// to survive without calling the tree partial. `moved_hash` is [`scan_subtree`]'s.
 fn scan_local_watched(
 	root: &Path,
 	start: &str,
@@ -458,6 +469,7 @@ fn scan_local_watched(
 	mut rules: IgnoreRules,
 	rule_files: &RuleFiles,
 	on_listed: &mut dyn FnMut(&Path),
+	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
 ) -> (LocalScan, IgnoreRules) {
 	// Where the walk begins, and how far below the root that is. Every entry is keyed against the
 	// ROOT, so a subtree walk produces the very keys a whole-tree walk would; the two rules that go
@@ -734,7 +746,8 @@ fn scan_local_watched(
 			NodeKind::File => {
 				let size = metadata.len();
 				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
-				let reused = fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime);
+				let reused = fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime)
+					.or_else(|| moved_hash(&rel_path, size, mtime));
 				let content_hash = match reused {
 					Some(hash) => Some(hash),
 					None => match hash_file(entry.path()) {
@@ -825,14 +838,30 @@ fn scan_local_watched(
 ///
 /// `start` is a node of the scan like any other. Only the pair root is skipped, and only because it
 /// is the pair's anchor rather than a synced item.
+///
+/// `moved_hash` is asked about a file only once the fast path has missed at the file's own path,
+/// with its root-relative path, size and mtime; a hash it answers is taken instead of reading the
+/// file, and `None` reads it. It is how `observe::observe_local` hands a directory it proved renamed
+/// the hashes of the rows its files left. An answer skips the read and with it any error the read
+/// would have reported, so what the hook answers for is the caller's trust; a caller with no rename
+/// to offer passes `&mut |_, _, _| None`, and the walk is the one it always was.
 pub(crate) fn scan_subtree(
 	root: &Path,
 	start: &str,
 	baseline: &Baseline,
 	rules: IgnoreRules,
 	rule_files: &RuleFiles,
+	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
 ) -> (LocalScan, IgnoreRules) {
-	scan_local_watched(root, start, baseline, rules, rule_files, &mut |_| {})
+	scan_local_watched(
+		root,
+		start,
+		baseline,
+		rules,
+		rule_files,
+		&mut |_| {},
+		moved_hash,
+	)
 }
 
 #[cfg(test)]
@@ -1243,6 +1272,7 @@ mod tests {
 					fs::remove_file(path).unwrap();
 				}
 			},
+			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1301,6 +1331,7 @@ mod tests {
 					}
 				}
 			},
+			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1363,6 +1394,7 @@ mod tests {
 					fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
 				}
 			},
+			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1411,6 +1443,7 @@ mod tests {
 					fs::remove_dir_all(&root).unwrap();
 				}
 			},
+			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1936,6 +1969,7 @@ mod tests {
 			&Baseline::default(),
 			IgnoreRules::default(),
 			&RuleFiles::Read,
+			&mut |_, _, _| None,
 		);
 
 		assert!(scan.complete, "{:?}", scan.errors);
@@ -1986,6 +2020,7 @@ mod tests {
 			&baseline,
 			IgnoreRules::default(),
 			&RuleFiles::Read,
+			&mut |_, _, _| None,
 		);
 		let whole = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read).0;
 
