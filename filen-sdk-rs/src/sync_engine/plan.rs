@@ -1801,7 +1801,8 @@ fn reconcile_two_way(
 /// and the only endpoint such a row could match is its own path — which [`detect_moves`] refuses
 /// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
 /// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
-/// its source and the insert of its destination in a single transaction.
+/// its source and the insert of its destination in a single transaction. A debug build asserts it
+/// over the decided rows where the directory-move fold reads them (`FoldDirs::read`).
 fn visit_move_sources(
 	paths: PassPaths<'_>,
 	baseline: &Baseline,
@@ -2426,9 +2427,31 @@ impl<'m> FoldDirs<'m> {
 		};
 		let mut dirs = ChangedDirs::default();
 		let mut rows = baseline.cursor();
+		// The remote uuid and the whole-life id of every decided `Synced` row, with the path that
+		// records it. The move detection trusts that no two such rows record one of them (see
+		// [`visit_move_sources`]); this walk has every decided row in hand, so it is where a second
+		// claimant shows, at no read of its own.
+		#[cfg(debug_assertions)]
+		let (mut uuids, mut lineages) = (HashMap::new(), HashMap::new());
 		for path in changed {
 			// First: every question below about `path` is answered out of the page this keeps.
 			let row = rows.get(path);
+			#[cfg(debug_assertions)]
+			if let Some(row) = row
+				.as_ref()
+				.filter(|row| row.state == BaselineState::Synced)
+			{
+				let by_uuid = row.remote_uuid.and_then(|uuid| uuids.insert(uuid, path));
+				let by_lineage = row
+					.remote_stable_uuid
+					.and_then(|lineage| lineages.insert(lineage, path));
+				if let Some(first) = by_uuid.or(by_lineage) {
+					debug_assert!(
+						false,
+						"{first:?} and {path:?} are both synced rows recording one remote item"
+					);
+				}
+			}
 			if let Some(uuid) = row.as_ref().and_then(dir_move_source) {
 				dirs.sources.push((path, uuid));
 			}
