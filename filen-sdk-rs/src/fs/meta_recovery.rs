@@ -19,6 +19,9 @@ pub(crate) fn latin1_to_string(bytes: &[u8]) -> String {
 /// Windows filenames) as lone `\udXXX` escapes, which `JSON.parse` accepts
 /// but serde_json rejects. Substituting U+FFFD matches what TS recipients
 /// effectively render once such a name leaves the JS string domain.
+// `s` is only sliced where `i` sits on a `\` byte, or `last_copied` just past an ASCII
+// `\uXXXX` escape: both char boundaries.
+#[allow(clippy::string_slice)]
 pub(crate) fn replace_unpaired_surrogate_escapes(s: &str) -> Option<String> {
 	const REPLACEMENT: &str = "\\uFFFD";
 	let bytes = s.as_bytes();

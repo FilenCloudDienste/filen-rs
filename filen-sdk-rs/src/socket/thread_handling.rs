@@ -693,6 +693,8 @@ where
 		));
 	}
 
+	// Byte 0 is the ASCII packet type checked above, so 1 is a char boundary.
+	#[allow(clippy::string_slice)]
 	let handshake: HandShake = serde_json::from_str(&handshake_msg[1..]).map_err(|e| {
 		Error::custom(
 			ErrorKind::Server,

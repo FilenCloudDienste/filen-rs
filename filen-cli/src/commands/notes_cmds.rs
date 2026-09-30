@@ -186,20 +186,15 @@ mod checklist_parser {
 		let mut items: Vec<String> = Vec::new();
 		let mut rest = html;
 
-		while let Some(ul_start) = rest.find("<ul") {
-			let after_tag_name = &rest[ul_start + "<ul".len()..];
-			let Some(tag_end) = after_tag_name.find('>') else {
+		while let Some((_, after_tag_name)) = rest.split_once("<ul") {
+			let Some((attributes, body_start)) = after_tag_name.split_once('>') else {
 				break;
 			};
-			let checked = attribute_value(&after_tag_name[..tag_end], "data-checked")
-				.is_some_and(|value| value == "true");
+			let checked =
+				attribute_value(attributes, "data-checked").is_some_and(|value| value == "true");
 
-			let body_start = &after_tag_name[tag_end + 1..];
 			// A missing closing tag means the rest of the input is the list body.
-			let (body, remainder) = match body_start.find("</ul>") {
-				Some(ul_end) => (&body_start[..ul_end], &body_start[ul_end + "</ul>".len()..]),
-				None => (body_start, ""),
-			};
+			let (body, remainder) = body_start.split_once("</ul>").unwrap_or((body_start, ""));
 
 			for text in list_item_texts(body) {
 				items.push(format!("- [{}] {}", if checked { "x" } else { " " }, text));
@@ -212,15 +207,11 @@ mod checklist_parser {
 
 	/// Reads the value of a double- or single-quoted attribute out of a tag's attribute list.
 	fn attribute_value<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
-		let start = attributes.find(name)? + name.len();
-		let rest = attributes[start..].trim_start();
-		let rest = rest.strip_prefix('=')?.trim_start();
-		let quote = rest.chars().next()?;
-		if quote != '"' && quote != '\'' {
-			return None;
-		}
-		let value = &rest[quote.len_utf8()..];
-		value.find(quote).map(|end| &value[..end])
+		let (_, rest) = attributes.split_once(name)?;
+		let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+		let mut value = rest.chars();
+		let quote = value.next().filter(|c| matches!(c, '"' | '\''))?;
+		value.as_str().split_once(quote).map(|(value, _)| value)
 	}
 
 	/// Yields the text of every `<li>` in `body`, with nested inline tags stripped and entities
@@ -229,19 +220,13 @@ mod checklist_parser {
 		let mut texts = Vec::new();
 		let mut rest = body;
 
-		while let Some(li_start) = rest.find("<li") {
-			let after_tag_name = &rest[li_start + "<li".len()..];
-			let Some(tag_end) = after_tag_name.find('>') else {
+		while let Some((_, after_tag_name)) = rest.split_once("<li") {
+			let Some((_, content_start)) = after_tag_name.split_once('>') else {
 				break;
 			};
-			let content_start = &after_tag_name[tag_end + 1..];
-			let (content, remainder) = match content_start.find("</li>") {
-				Some(li_end) => (
-					&content_start[..li_end],
-					&content_start[li_end + "</li>".len()..],
-				),
-				None => (content_start, ""),
-			};
+			let (content, remainder) = content_start
+				.split_once("</li>")
+				.unwrap_or((content_start, ""));
 			texts.push(decode_entities(&strip_tags(content)).trim().to_string());
 			rest = remainder;
 		}

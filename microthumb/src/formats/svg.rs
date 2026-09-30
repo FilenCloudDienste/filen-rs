@@ -495,13 +495,12 @@ const FUNC_IRI_ATTRS: [&str; 5] = ["mask", "clip-path", "filter", "fill", "strok
 /// or the `)`.
 fn func_iri(value: &str) -> Option<&str> {
 	let rest = value.trim_start().strip_prefix("url(")?.trim_start();
-	let quoted = rest.starts_with(['\'', '"']);
-	let rest = if quoted { &rest[1..] } else { rest };
+	let rest = rest.strip_prefix(['\'', '"']).unwrap_or(rest);
 	let id = rest.trim_start().strip_prefix('#')?;
-	let end = id
-		.find([')', '\'', '"', ' ', '\t', '\n', '\r'])
-		.unwrap_or(id.len());
-	(end > 0).then(|| &id[..end])
+	let id = id
+		.split_once([')', '\'', '"', ' ', '\t', '\n', '\r'])
+		.map_or(id, |(id, _)| id);
+	(!id.is_empty()).then_some(id)
 }
 
 /// The id inside an `IRI` (`#id`), likewise: `svgtypes` skips leading spaces
@@ -635,7 +634,7 @@ fn references_filter(node: roxmltree::Node) -> bool {
 /// this pass can see, so the ids are all it can learn from one.
 fn css_link_ids(text: &str) -> impl Iterator<Item = &str> {
 	text.match_indices("url(")
-		.filter_map(|(at, _)| func_iri(&text[at..]))
+		.filter_map(|(at, _)| text.get(at..).and_then(func_iri))
 }
 
 /// What one element's copies cost — markers and filter chains — and the
@@ -902,10 +901,13 @@ fn path_arcs(d: &str) -> (u64, f64) {
 						i = exponent;
 					}
 				}
-				if d[start..i].bytes().any(|b| b.is_ascii_digit()) {
+				// `start` and `i` only ever step over ASCII bytes, so both are char boundaries.
+				#[allow(clippy::string_slice)]
+				let run = &d[start..i];
+				if run.bytes().any(|b| b.is_ascii_digit()) {
 					// A run that will not parse must not read as zero: charge
 					// it the largest magnitude there is rather than undercount.
-					let number = d[start..i].parse::<f64>().unwrap_or(f64::INFINITY).abs();
+					let number = run.parse::<f64>().unwrap_or(f64::INFINITY).abs();
 					largest = largest.max(number);
 				} else {
 					// A lone sign or dot: not a number, do not stall on it.
@@ -953,14 +955,16 @@ fn declared_length(value: &str, viewport: f64) -> f64 {
 		.take_while(|c| c.is_ascii_alphabetic() || *c == '%')
 		.map(char::len_utf8)
 		.sum();
-	let unit_start = value.len() - unit_len;
-	let Ok(number) = value[..unit_start].parse::<f64>() else {
+	let Some((number, unit)) = value.split_at_checked(value.len() - unit_len) else {
+		return 0.0;
+	};
+	let Ok(number) = number.parse::<f64>() else {
 		return 0.0;
 	};
 	if !number.is_finite() {
 		return 0.0;
 	}
-	if value[unit_start..].starts_with('%') {
+	if unit.starts_with('%') {
 		number.abs() / 100.0 * viewport
 	} else {
 		number.abs() * 96.0
@@ -1300,8 +1304,8 @@ fn absolute_length(value: &str) -> Option<f64> {
 		.take_while(|c| c.is_ascii_alphabetic() || *c == '%')
 		.map(char::len_utf8)
 		.sum();
-	let unit_start = value.len() - unit_len;
-	let scale = match &value[unit_start..] {
+	let (number, unit) = value.split_at_checked(value.len() - unit_len)?;
+	let scale = match unit {
 		"" | "px" => 1.0,
 		"in" => 96.0,
 		"cm" => 96.0 / 2.54,
@@ -1310,7 +1314,7 @@ fn absolute_length(value: &str) -> Option<f64> {
 		"pc" => 16.0,
 		_ => return None,
 	};
-	let number: f64 = value[..unit_start].parse().ok()?;
+	let number: f64 = number.parse().ok()?;
 	(number.is_finite() && number > 0.0).then_some(number * scale)
 }
 

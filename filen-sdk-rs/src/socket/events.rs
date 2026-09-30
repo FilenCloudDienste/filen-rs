@@ -107,6 +107,8 @@ where
 			}
 		}
 
+		// Bytes 0 and 1 matched ASCII-digit packet and message types above: 2 is a char boundary.
+		#[allow(clippy::string_slice)]
 		let event_str = &msg[2..];
 
 		if event_str == AUTHED_TRUE {

@@ -106,13 +106,12 @@ Seal with the `clean-rust` skill's private-module `Sealed` supertrait if closure
 
 - **Hard tabs** (`rustfmt.toml: hard_tabs = true`). The editor/agent save-formatter does not match
   this repo's nightly `cargo fmt`; run `cargo fmt -p <crate>` before staging or pre-commit fails.
-- The root `Cargo.toml`'s `[workspace.lints]` (every member opts in with
-  `[lints] workspace = true`) denies `unsafe_code`, `clippy::dbg_macro`, `clippy::todo`,
-  `clippy::self_named_module_files`, `clippy::option_option` and
-  `clippy::struct_excessive_bools`. Every hit that predates a lint carries an `#[allow]` whose
-  comment gives the reason; a new hit gets a rewrite, or an allow with its own reason. There is
-  no `clippy.toml`, and nothing enforces the import or allow-comment conventions mechanically;
-  review does.
+- The root `Cargo.toml`'s `[workspace.lints]` (every member opts in with `[lints] workspace = true`)
+  denies `unsafe_code`, `clippy::dbg_macro`, `clippy::todo`, `clippy::self_named_module_files`,
+  `clippy::option_option`, `clippy::struct_excessive_bools` and `clippy::string_slice`. Every hit
+  that predates a lint carries an `#[allow]` whose comment gives the reason; a new hit gets a
+  rewrite, or an allow with its own reason. There is no `clippy.toml`, and nothing enforces the
+  import or allow-comment conventions mechanically; review does.
 - `pin_project` (proc-macro, `project = Name`) is used **only** under `filen-sdk-rs/src/auth/http/`;
   everything else (`runtime.rs`, `socket/thread_handling.rs`, `js/managed_futures/*`) uses
   `pin_project_lite`. Follow the neighbourhood; do not mix them in one file.

@@ -20,6 +20,8 @@ impl<'a> PathIterator<'a> {
 impl<'a> Iterator for PathIterator<'a> {
 	type Item = (&'a str, &'a str);
 
+	// Every index is 0, a `/` from `match_indices`, or one past one; all are char boundaries.
+	#[allow(clippy::string_slice)]
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
 			if self.last_idx >= self.path.len() {

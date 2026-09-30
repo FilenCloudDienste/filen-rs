@@ -193,6 +193,8 @@ pub(crate) fn derive_password(
 	Ok(derived_data)
 }
 
+// `derived_str` is the hex of 64 bytes: 128 ASCII chars.
+#[allow(clippy::string_slice)]
 pub(crate) fn derive_password_and_kek(
 	pwd: &[u8],
 	salt: &SizedHexString<U256>,

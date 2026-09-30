@@ -343,7 +343,9 @@ fn fullwidth_to_ascii_letter(c: char) -> Option<char> {
 fn with_first_char(name: &str, first: char) -> String {
 	let mut out = String::with_capacity(name.len() + first.len_utf8());
 	out.push(first);
-	out.push_str(&name[name.chars().next().map(char::len_utf8).unwrap_or_default()..]);
+	let mut rest = name.chars();
+	rest.next();
+	out.push_str(rest.as_str());
 	out
 }
 

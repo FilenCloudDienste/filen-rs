@@ -107,12 +107,10 @@ fn split_extension(name: &str, is_dir: bool) -> (&str, &str) {
 /// Splits a trailing ` (n)` off `stem`, when there is a non-empty base before it.
 fn strip_counter(stem: &str) -> Option<(&str, u64)> {
 	let inner = stem.strip_suffix(')')?;
-	let open = inner.rfind(" (")?;
-	let digits = &inner[open + 2..];
+	let (base, digits) = inner.rsplit_once(" (")?;
 	if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
 		return None;
 	}
-	let base = &inner[..open];
 	if base.is_empty() {
 		return None;
 	}
@@ -132,6 +130,8 @@ fn numbered_candidate(base: &str, n: u64, ext: &str) -> Result<ValidatedName, En
 	};
 	let mut budget = MAX_BYTES - suffix.len() - ext.len();
 	loop {
+		// floor_char_boundary always returns a char boundary.
+		#[allow(clippy::string_slice)]
 		let trimmed = &base[..base.floor_char_boundary(budget)];
 		let candidate = format!("{trimmed}{suffix}{ext}");
 		match ValidatedName::try_from(candidate.as_str()) {

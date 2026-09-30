@@ -94,17 +94,18 @@ fn rewrite_line(reldir: &str, line: &str) -> Option<String> {
 	// Handle \! and \# escapes — the char after \ is literal.
 	// After rewriting, it ends up mid-pattern where it's already literal,
 	// so we just strip the backslash and proceed.
-	if rest.starts_with("\\!") || rest.starts_with("\\#") {
-		rest = &rest[1..];
-	} else if rest.starts_with('!') {
+	if let Some(escaped) = rest
+		.strip_prefix('\\')
+		.filter(|r| r.starts_with(['!', '#']))
+	{
+		rest = escaped;
+	} else if let Some(negated) = rest.strip_prefix('!') {
 		negation = "!";
-		rest = &rest[1..];
+		rest = negated;
 	}
 
 	let anchored = rest.starts_with('/');
-	if anchored {
-		rest = &rest[1..];
-	}
+	rest = rest.strip_prefix('/').unwrap_or(rest);
 
 	let dir_suffix = if rest.ends_with('/') { "/" } else { "" };
 	let body = rest.strip_suffix('/').unwrap_or(rest);
