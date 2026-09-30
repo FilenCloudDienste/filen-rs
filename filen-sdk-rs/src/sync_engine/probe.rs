@@ -1321,8 +1321,8 @@ fn prepare_scoped(
 	costs.push(
 		"assembly_check",
 		bounds_elapsed + elapsed,
-		"`assembly_bounds` before the merge, per observation plus the rows under each one it \
-		 replaced, and the assembled map's length after it",
+		"`assembly_bounds` before the merge, per observation a count of the rows under it and one \
+		 per root it pruned, and the assembled map's length after it",
 	);
 	assert!(
 		accounted,

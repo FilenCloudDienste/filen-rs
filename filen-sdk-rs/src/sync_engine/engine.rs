@@ -1753,14 +1753,46 @@ pub(super) fn assembly_bounds(
 		// with, so counting it as one an observation replaced subtracts it a second time — `carried`
 		// below has already left it out — and puts the bound below the map the pass legitimately
 		// assembled.
+		//
+		// COUNTED, not read: the table's count under the path, less what the walk pruned and the
+		// held rows outside that. Read, it was every row under the path — after a directory is
+		// renamed away, every row it held, which `merge_local` then walks again. A pruned root costs
+		// a lookup and a count, and the loop stops once nothing under the path is left to take.
+		// Each subtraction takes rows the count holds. Saturating all the same: one the count could
+		// not cover errs toward a higher bound and a whole read, never wraps to one that passes any
+		// map.
 		let rows_at = |at: &str| {
-			let mut rows = usize::from(
+			let own = usize::from(
 				baseline.contains_key(at) && !pruned.contains(at) && !held.contains(at),
 			);
-			baseline.visit_subtree_paths(at, |path| {
-				rows += usize::from(!plan::at_or_under_root(&pruned, path) && !held.contains(path));
-			});
-			rows
+			// Pruned at `at` or above it: the walk covered nothing under it.
+			if !at.is_empty() && plan::at_or_under_root(&pruned, at) {
+				return own;
+			}
+			let mut under = baseline.count_subtree(at);
+			for root in strictly_under(&pruned, at) {
+				if under == 0 {
+					break;
+				}
+				// Once, at the outermost root: one inside another is in the count of the one it is
+				// in.
+				if root
+					.rsplit_once('/')
+					.is_some_and(|(parent, _)| plan::at_or_under_root(&pruned, parent))
+				{
+					continue;
+				}
+				under = under.saturating_sub(
+					usize::from(baseline.contains_key(root)) + baseline.count_subtree(root),
+				);
+			}
+			// A held row under a pruned root went with that root.
+			let held_under = strictly_under(held, at)
+				.filter(|path| {
+					!plan::at_or_under_root(&pruned, path) && baseline.contains_key(path)
+				})
+				.count();
+			own + under.saturating_sub(held_under)
 		};
 		match observation {
 			LocalObservation::Dir(scan) if scan.complete => {
@@ -1780,6 +1812,17 @@ pub(super) fn assembly_bounds(
 	let carried = baseline.len().saturating_sub(held.len());
 	let lowest = carried.saturating_sub(replaced).saturating_add(certain);
 	lowest..=lowest.saturating_add(slack)
+}
+
+/// The paths in `set` strictly under `dir`, as [`Baseline::count_subtree`] reads "under": `""`
+/// holds every path but itself.
+fn strictly_under<'s>(set: &'s BTreeSet<String>, dir: &str) -> impl Iterator<Item = &'s String> {
+	if dir.is_empty() {
+		set.range::<String, _>(..)
+	} else {
+		set.range(plan::subtree_bounds(dir))
+	}
+	.filter(|path| !path.is_empty())
 }
 
 /// The first key in the two maps a narrowed reconcile would never visit, if there is one — the
@@ -6222,6 +6265,116 @@ mod tests {
 		assert!(
 			assembly_accounted(&baseline, &assembled, &observed, &held),
 			"the hidden root took the one row it had in the map, and the held row was never in one"
+		);
+	}
+
+	/// The rows a complete walk replaces are the table's count under it less what it pruned and
+	/// less the held rows, and the subtractions have to land exactly once each: a root pruned
+	/// INSIDE another pruned root is in that root's count already, a held row under a pruned root
+	/// went with the root, and a held row outside every root is taken on its own. A sibling that
+	/// is a string prefix and no path prefix (`docs b`) is under none of them.
+	#[test]
+	fn the_assembly_check_subtracts_nested_pruned_roots_and_held_rows_once() {
+		let hash = Blake3Hash::from([7u8; 32]);
+		let file = |rel: &str| file_row(rel, Uuid::new_v4(), hash);
+		let dir = |rel: &str| dir_row(rel, Uuid::new_v4());
+		let baseline = Baseline::from_rows([
+			dir("docs"),
+			file("docs/a.txt"),
+			file("docs/half.txt"),
+			dir("docs/build"),
+			file("docs/build/out.o"),
+			dir("docs/build/cache"),
+			file("docs/build/cache/c.bin"),
+			file("docs/build/held.o"),
+			dir("docs/link"),
+			file("docs/link/l.txt"),
+			file("docs b"),
+			file("keep.txt"),
+		]);
+		// Rows that record one side only (`derive::carried`): in neither map, one of them under a
+		// root the walk pruned.
+		let held = BTreeSet::from(["docs/half.txt".to_string(), "docs/build/held.o".to_string()]);
+		let ignored = |pattern: &str| IgnoreDecision {
+			level: IgnoreLevel::User,
+			pattern: pattern.to_string(),
+		};
+		let scan = LocalScan {
+			nodes: [
+				local_dir("docs"),
+				local_file("docs/a.txt", hash),
+				local_file("docs/new.txt", hash),
+			]
+			.into_iter()
+			.map(|node| (node.rel_path.clone(), node))
+			.collect(),
+			complete: true,
+			errors: Vec::new(),
+			invalid_names: BTreeMap::new(),
+			aliased_dirs: BTreeMap::from([("docs/link".to_string(), "elsewhere".to_string())]),
+			ignored: BTreeMap::from([
+				("docs/build".to_string(), ignored("build/")),
+				("docs/build/cache".to_string(), ignored("cache/")),
+			]),
+			ignored_default_untracked: 0,
+			ignore_blocked: BTreeSet::new(),
+		};
+		let observed = LocalObservations {
+			observed: BTreeMap::from([("docs".to_string(), LocalObservation::Dir(Box::new(scan)))]),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+
+		// Twelve rows, two held: ten carried. The walk replaces `docs` and `docs/a.txt` — every
+		// other row under it is pruned or held — and brings three nodes back. Subtracting the
+		// nested root or the held row under `docs/build` a second time, or `docs/half.txt` not at
+		// all, moves the one size the map may have.
+		assert_eq!(assembly_bounds(&baseline, &observed, &held), 11..=11);
+	}
+
+	/// The check COUNTS the rows an observation replaces rather than reading them. After a
+	/// directory is renamed away those are every row it held, which `merge_local` walks right
+	/// after: reading them here as well was a second sweep of the subtree, for a number.
+	#[test]
+	fn the_assembly_check_counts_the_rows_it_replaces_without_reading_them() {
+		const FILES: usize = 2_000;
+		let hash = Blake3Hash::from([7u8; 32]);
+		let baseline = Baseline::from_rows(
+			std::iter::once(dir_row("logs", Uuid::new_v4()))
+				.chain(
+					(0..FILES).map(|n| file_row(&format!("logs/{n:05}.txt"), Uuid::new_v4(), hash)),
+				)
+				.chain([file_row("keep.txt", Uuid::new_v4(), hash)]),
+		);
+		// A hidden root takes its rows as an absence does, and unlike one it can be written here.
+		let observed = LocalObservations {
+			observed: BTreeMap::from([(
+				"logs".to_string(),
+				LocalObservation::Hidden(IgnoreDecision {
+					level: IgnoreLevel::User,
+					pattern: "logs/".to_string(),
+				}),
+			)]),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+		let before = baseline.reads_for_test();
+		let bounds = assembly_bounds(&baseline, &observed, &BTreeSet::new());
+		let after = baseline.reads_for_test();
+		assert_eq!(
+			bounds,
+			1..=1,
+			"everything but `keep.txt` went with the hidden root"
+		);
+		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
+		assert!(
+			statements <= 2 && rows <= 2,
+			"the check read {rows} row(s) in {statements} statement(s) to count the {FILES} \
+			 file(s) under the hidden root"
 		);
 	}
 

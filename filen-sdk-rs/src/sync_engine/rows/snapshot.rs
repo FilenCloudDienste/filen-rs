@@ -95,6 +95,13 @@ impl Answer for bool {
 	}
 }
 
+/// A `COUNT`: the one row it hands back, whatever it counted.
+impl Answer for usize {
+	fn rows(&self) -> usize {
+		1
+	}
+}
+
 /// How many rows one enumerating statement reads before it lets the connection go.
 ///
 /// Large enough that a whole-pair walk is a few thousand statements rather than a million, small
@@ -356,6 +363,18 @@ static DIRS: LazyLock<[[String; 2]; 2]> = LazyLock::new(|| {
 });
 static UNSYNCED: LazyLock<[String; 2]> =
 	LazyLock::new(|| [unsynced_sql(false), unsynced_sql(true)]);
+static COUNT_UNDER: LazyLock<[String; 2]> =
+	LazyLock::new(|| [count_under_sql(false), count_under_sql(true)]);
+
+/// How many rows lie after a path — strictly below a bound when `bounded` — off the primary key's
+/// range: SQLite counts the range's cells and hands back one number, where reading the rows out of
+/// it decodes and copies every one.
+fn count_under_sql(bounded: bool) -> String {
+	format!(
+		"SELECT COUNT(*) FROM baseline WHERE pair_id = ?1 AND rel_path > ?2{}",
+		if bounded { " AND rel_path < ?3" } else { "" },
+	)
+}
 
 /// The directory rows from a path on — strictly below a bound when `bounded` — in path order, off
 /// the partial index that holds nothing else.
@@ -733,6 +752,21 @@ impl Snapshot {
 		})
 	}
 
+	/// How many rows lie strictly under `root` (`""`: every row), counted rather than read.
+	pub(super) fn count_under(&self, root: &str) -> usize {
+		self.with("the rows under a directory, counted", |conn| {
+			if root.is_empty() {
+				conn.prepare_cached(&COUNT_UNDER[0])?
+					.query_row(params![self.pair, root], |row| row.get(0))
+			} else {
+				conn.prepare_cached(&COUNT_UNDER[1])?.query_row(
+					params![self.pair, format!("{root}/"), format!("{root}0")],
+					|row| row.get(0),
+				)
+			}
+		})
+	}
+
 	/// What [`reads`](Self::reads) has counted so far.
 	#[cfg(test)]
 	pub(super) fn reads_for_test(&self) -> (usize, usize) {
@@ -819,7 +853,7 @@ mod tests {
 				.unwrap()
 		};
 		let primary = "PRIMARY KEY";
-		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 17] = [
+		let cases: [(String, Vec<&dyn rusqlite::ToSql>, &str, &str); 19] = [
 			(
 				dirs_sql(false, false),
 				vec![&1_i64, &"a"],
@@ -923,6 +957,18 @@ mod tests {
 				primary,
 				"(pair_id=? AND rel_path>?)",
 			),
+			(
+				count_under_sql(true),
+				vec![&1_i64, &"a/", &"a0"],
+				primary,
+				"(pair_id=? AND rel_path>? AND rel_path<?)",
+			),
+			(
+				count_under_sql(false),
+				vec![&1_i64, &""],
+				primary,
+				"(pair_id=? AND rel_path>?)",
+			),
 		];
 		for (sql, args, index, seek) in &cases {
 			let steps = plan(sql, args);
@@ -971,6 +1017,8 @@ mod tests {
 		snapshot.unsynced_under("");
 		snapshot.unsynced_under("d0");
 		snapshot.unsynced_under("d1");
+		snapshot.count_under("d0");
+		snapshot.count_under("d1");
 		let guard = snapshot.conn.lock().unwrap();
 		let conn = guard.as_ref().unwrap();
 		for sql in [
@@ -981,6 +1029,7 @@ mod tests {
 			FOLDED_FROM,
 			FOLDED_UNDER,
 			&UNSYNCED[1],
+			&COUNT_UNDER[1],
 		] {
 			let statement = conn.prepare_cached(sql).unwrap();
 			assert_eq!(
