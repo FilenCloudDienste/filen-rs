@@ -3134,13 +3134,15 @@ pub(crate) fn reconcile(
 ) -> Plan {
 	let mut actions = Vec::new();
 	let mut consumed = HashSet::new();
-	tracing::debug!(
-		"reconcile: mode {mode:?} — {} baseline / {} local / {} remote entries",
-		baseline.len(),
-		local.len(),
-		remote.len()
-	);
 	let keys = reconcile_keys(paths, baseline, local, remote, &holds.held_remote);
+	// What the pass decides, against the rows it decides it from. Not the sides' sizes: a carried
+	// side counts its nodes by asking the rows about every path it recorded — every row under a
+	// directory moved away — and that read would be paid only with debug logging on, unseen.
+	tracing::debug!(
+		"reconcile: mode {mode:?} — {} path(s) to decide, {} baseline row(s)",
+		keys.len(),
+		baseline.len()
+	);
 
 	// Consume the paths the view could not resolve before anything else looks at them, so neither
 	// move detection nor the per-path reconcile acts on a name the cache is showing twice. (A path
@@ -5628,6 +5630,63 @@ mod tests {
 			rows < 5 * FILES / 2,
 			"move detection read {rows} row(s) in {statements} statement(s): more than twice the \
 			 {FILES} file(s) under the renamed directory"
+		);
+	}
+
+	/// A reconcile reads the same rows with debug logging on as with it off: its debug line asks
+	/// nothing of the sides. A carried side counts its nodes by asking the rows about every path
+	/// it recorded, so counting the local one read every row under a directory moved away — in a
+	/// pass deciding one path, and only where debug logging was on to pay for it.
+	#[test]
+	fn a_reconcile_reads_the_same_rows_with_debug_logging_on() {
+		const FILES: usize = 2_000;
+		// One pass's inputs over rows of their own, so each run is counted from the same start: a
+		// directory whose every file the local side found gone, one of them decided. The same
+		// uuids each time, so the two plans can be compared.
+		let pass = || {
+			let baseline = Baseline::from_rows((0..FILES).map(|n| {
+				base_file(
+					&format!("dir/{n:05}.txt"),
+					Uuid::from_u128(1 + n as u128),
+					[1; 32],
+				)
+			}));
+			let mut local: Side<LocalNode> = Side::carried();
+			for n in 0..FILES {
+				local.remove(&baseline, &format!("dir/{n:05}.txt"));
+			}
+			(baseline, local)
+		};
+		let decided = BTreeSet::from(["dir/00000.txt".to_string()]);
+		let reconciled = |(baseline, local): (Baseline, Side<LocalNode>)| {
+			let remote: Side<RemoteNode> = Side::carried();
+			let before = baseline.reads_for_test();
+			let plan = reconcile(
+				SyncMode::TwoWay,
+				&baseline,
+				&local.of(&baseline),
+				&remote.of(&baseline),
+				&PassHolds::default(),
+				PassPaths::Changed(&decided),
+			);
+			let after = baseline.reads_for_test();
+			(plan.actions, (after.0 - before.0, after.1 - before.1))
+		};
+		let quiet =
+			tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+				assert!(!tracing::enabled!(tracing::Level::DEBUG));
+				reconciled(pass())
+			});
+		let logged = tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+			assert!(
+				tracing::enabled!(tracing::Level::DEBUG),
+				"the debug lines must be live for this to test them"
+			);
+			reconciled(pass())
+		});
+		assert_eq!(
+			quiet, logged,
+			"the plan and the (statements, rows) it read, with debug logging off and on"
 		);
 	}
 
