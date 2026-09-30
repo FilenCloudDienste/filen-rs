@@ -1845,6 +1845,35 @@ fn visit_move_targets<'m, N: Nodes>(
 	}
 }
 
+/// [`visit_move_targets`] over both sides, for a pass that detects moves in both directions.
+///
+/// A whole pass walks each map. A change-scoped one asks both sides about each of its paths in
+/// turn: a carried side answers from the path's row, and walking the paths once per side read the
+/// rows there twice — after a directory rename, every row under the new name. Asked together,
+/// whichever question about a path reads its row first, the rest are answered out of the page it
+/// read.
+fn visit_move_targets_of_both<'m, L: Nodes, R: Nodes>(
+	paths: PassPaths<'m>,
+	local: &'m L,
+	remote: &'m R,
+	mut visit_local: impl FnMut(Cow<'m, str>, Cow<'m, L::Node>),
+	mut visit_remote: impl FnMut(Cow<'m, str>, Cow<'m, R::Node>),
+) {
+	let PassPaths::Changed(changed) = paths else {
+		visit_move_targets(paths, local, visit_local);
+		visit_move_targets(paths, remote, visit_remote);
+		return;
+	};
+	for path in changed {
+		if let Some(node) = local.at(path) {
+			visit_local(Cow::Borrowed(path.as_str()), node);
+		}
+		if let Some(node) = remote.at(path) {
+			visit_remote(Cow::Borrowed(path.as_str()), node);
+		}
+	}
+}
+
 /// Detect file moves/renames so they apply as a single metadata op instead of a re-transfer, and
 /// return the set of paths they consume (excluded from the per-path reconcile). Files only.
 ///
@@ -1896,21 +1925,43 @@ fn detect_moves<'m>(
 	// the raw bytes since `Blake3Hash` is not `std::hash::Hash`. Built before either half runs: it
 	// depends on neither half's decisions, and it is what bounds the rows the push half keeps below.
 	let mut created_by_hash: HashMap<[u8; 32], Vec<Cow<'m, str>>> = HashMap::new();
-	if mode.pushes() {
-		visit_move_targets(paths, local, |path, node| {
-			// The side map first: on a whole pass it is a hash lookup and the baseline is a read of
-			// the store, and almost every local file is on the remote too.
-			if node.kind == NodeKind::File
-				&& !remote.holds(&path)
-				&& !baseline.contains_key(&path)
-				&& let Some(hash) = node.content_hash
-			{
-				created_by_hash
-					.entry(*hash.as_ref())
-					.or_default()
-					.push(path);
-			}
-		});
+	let created = |path: Cow<'m, str>, node: Cow<'m, LocalNode>| {
+		// The side map first: on a whole pass it is a hash lookup and the baseline is a read of the
+		// store, and almost every local file is on the remote too.
+		if node.kind == NodeKind::File
+			&& !remote.holds(&path)
+			&& !baseline.contains_key(&path)
+			&& let Some(hash) = node.content_hash
+		{
+			created_by_hash
+				.entry(*hash.as_ref())
+				.or_default()
+				.push(path);
+		}
+	};
+	// Where each remote file sits now, by uuid and by lineage: what the pull half matches the rows
+	// against. The second index is there because a file's uuid is re-minted by every content edit,
+	// so a move that CARRIED an edit inside one window is invisible to the first — the uuid the
+	// baseline recorded no longer names anything live. The server-minted lineage id is not
+	// re-minted, so it still finds the file at its new path and the pass carries the item across
+	// instead of quarantining the old path and downloading the new one from scratch.
+	let mut remote_path_of_uuid: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
+	let mut remote_path_of_lineage: HashMap<StableUuid, Cow<'m, str>> = HashMap::new();
+	let placed = |path: Cow<'m, str>, node: Cow<'m, RemoteNode>| {
+		if node.kind != NodeKind::File {
+			return;
+		}
+		if let Some(lineage) = node.stable_uuid {
+			remote_path_of_lineage.insert(lineage, path.clone());
+		}
+		remote_path_of_uuid.insert(node.remote_uuid, path);
+	};
+	// Each map is built by its own half's mode, and a two-way pass builds both in one walk.
+	match (mode.pushes(), mode.pulls()) {
+		(true, true) => visit_move_targets_of_both(paths, local, remote, created, placed),
+		(true, false) => visit_move_targets(paths, local, created),
+		(false, true) => visit_move_targets(paths, remote, placed),
+		(false, false) => {}
 	}
 	// The rows a LOCAL move can start from: synced files the local side no longer holds whose content
 	// reappears at a new local path. Collected on the pull half's walk of the rows where there is one,
@@ -1926,23 +1977,6 @@ fn detect_moves<'m>(
 	};
 	let mut local_sources: Vec<BaselineEntry> = Vec::new();
 	if mode.pulls() {
-		// One walk for both indexes. The second is there because a file's uuid is re-minted by
-		// every content edit, so a move that CARRIED an edit inside one window is invisible to the
-		// first — the uuid the baseline recorded no longer names anything live. The server-minted
-		// lineage id is not re-minted, so it still finds the file at its new path and the pass
-		// carries the item across instead of quarantining the old path and downloading the new one
-		// from scratch.
-		let mut remote_path_of_uuid: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
-		let mut remote_path_of_lineage: HashMap<StableUuid, Cow<'m, str>> = HashMap::new();
-		visit_move_targets(paths, remote, |path, node| {
-			if node.kind != NodeKind::File {
-				return;
-			}
-			if let Some(lineage) = node.stable_uuid {
-				remote_path_of_lineage.insert(lineage, path.clone());
-			}
-			remote_path_of_uuid.insert(node.remote_uuid, path);
-		});
 		visit_move_sources(paths, baseline, |base| {
 			if mode.pushes() && local_source(base) {
 				local_sources.push(base.clone());
@@ -5546,6 +5580,54 @@ mod tests {
 				.iter()
 				.any(|a| matches!(a, SyncAction::TrashRemote { .. })),
 			"a.txt is instead trashed + the new files uploaded"
+		);
+	}
+
+	/// A change-scoped two-way pass asks both sides about each of its paths in one walk to build
+	/// move detection's two target maps, so the rows at those paths are read once for both maps and
+	/// once more for the move sources. After a directory rename those paths are every row under the
+	/// new name, and both sides need the row there: the local side to learn the remote holds each
+	/// file it found, the remote side for the node the row carries.
+	#[test]
+	fn a_scoped_move_detection_reads_the_decided_rows_once_for_both_target_maps() {
+		const FILES: usize = 2_000;
+		let paths: Vec<String> = (0..FILES)
+			.map(|n| format!("moved_dir/{n:05}.txt"))
+			.collect();
+		let baseline = Baseline::from_rows(
+			std::iter::once(base_dir("moved_dir", Uuid::new_v4())).chain(
+				paths
+					.iter()
+					.map(|path| base_file(path, Uuid::new_v4(), [1; 32])),
+			),
+		);
+		// The local nodes a pass found walking the renamed directory, over rows that carry the
+		// remote's.
+		let (mut local, remote) = (Side::carried(), Side::carried());
+		local.insert("moved_dir".to_string(), local_dir("moved_dir"));
+		let mut decided = BTreeSet::from(["moved_dir".to_string()]);
+		for path in &paths {
+			local.insert(path.clone(), local_file(path, [1; 32]));
+			decided.insert(path.clone());
+		}
+		let (mut actions, mut consumed) = (Vec::new(), HashSet::new());
+		let before = baseline.reads_for_test();
+		detect_moves(
+			SyncMode::TwoWay,
+			&baseline,
+			&local.of(&baseline),
+			&remote.of(&baseline),
+			PassPaths::Changed(&decided),
+			&mut actions,
+			&mut consumed,
+		);
+		let after = baseline.reads_for_test();
+		assert!(actions.is_empty(), "{actions:?}");
+		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
+		assert!(
+			rows < 5 * FILES / 2,
+			"move detection read {rows} row(s) in {statements} statement(s): more than twice the \
+			 {FILES} file(s) under the renamed directory"
 		);
 	}
 
