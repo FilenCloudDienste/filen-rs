@@ -475,7 +475,16 @@ fn scan_local_watched(
 	};
 	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
 	// estimate worth having; a pair with none still gets a walk's worth of room up front.
-	let capacity = baseline.len().max(1024);
+	//
+	// For the WHOLE tree only. A subtree walk covers one directory, and the pair's count sizes its
+	// table to the tree instead: a 50k-entry directory of a 100k-row pair was walked into a 13.8 MB
+	// table where the entries it found need half that, and the gap grows with the pair. It starts
+	// at a walk's worth and grows to what it finds.
+	let capacity = if start.is_empty() {
+		baseline.len().max(1024)
+	} else {
+		1024
+	};
 	// The walk asks about one directory's entries at a time, so the lookup keeps that directory in
 	// hand instead of resolving every path from the root again.
 	let mut rows = baseline.cursor();
@@ -1939,6 +1948,58 @@ mod tests {
 			],
 			"the start directory is a node, its keys are root-relative, and only the ROOT's own \
 			 quarantine bin is the engine's"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A subtree walk is sized to the walk and not to the pair: the pair's row count is what the
+	/// WHOLE tree holds, and a table reserved for it around one directory's entries is the tree's
+	/// worth of memory spent on a fraction of it.
+	#[test]
+	fn a_subtree_walk_is_sized_to_the_walk_and_a_whole_one_to_the_pair() {
+		let root = temp_root();
+		fs::create_dir(root.join("sub")).unwrap();
+		fs::write(root.join("sub").join("a.txt"), b"a").unwrap();
+		let rows = 4096;
+		let baseline = Baseline::from_rows((0..rows).map(|at| BaselineEntry {
+			rel_path: format!("elsewhere/{at}.txt"),
+			kind: NodeKind::File,
+			remote_uuid: None,
+			content_hash: Some(Blake3Hash::from([1; 32])),
+			size: Some(1),
+			local_mtime: Some(1),
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		}));
+		assert_eq!(baseline.len(), rows);
+
+		let (subtree, _) = scan_subtree(
+			&root,
+			"sub",
+			&baseline,
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+		);
+		let whole = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read).0;
+
+		assert_eq!(sorted_paths(&subtree), vec!["sub", "sub/a.txt"]);
+		let subtree_room = subtree.nodes.into_whole().capacity();
+		assert!(
+			subtree_room < rows,
+			"a walk of one directory reserved room for {subtree_room} node(s), the {rows}-row pair's \
+			 worth"
+		);
+		let whole_room = whole.nodes.into_whole().capacity();
+		assert!(
+			whole_room >= rows,
+			"the whole-tree walk still starts with room for the pair: {whole_room}"
 		);
 
 		fs::remove_dir_all(&root).ok();
