@@ -1690,6 +1690,19 @@ fn svg_aspect_comes_from_width_height_then_view_box() {
 
 #[cfg(feature = "svg")]
 #[test]
+fn svg_with_a_subnormal_size_is_refused_not_rendered_blank() {
+	// 1e-40 is a subnormal f32. Fitting it to the target needs a scale past
+	// f32::MAX, which the f32 render transform turns into infinity: nothing
+	// draws, and a blank raster used to come back as a thumbnail.
+	let bytes = svg_doc(
+		r#"width="1e-40" height="1e-40""#,
+		r#"<rect width="1" height="1" fill="lime"/>"#,
+	);
+	assert!(thumb(Box::new(MemSource(bytes)), &spec(64)).is_err());
+}
+
+#[cfg(feature = "svg")]
+#[test]
 fn svg_renders_a_flat_colour_and_upscales_small_nominal_sizes() {
 	// A 16px nominal size still rasterises at the target — scaling up is what
 	// vectors are for — and a full-cover rect lands exactly that colour.

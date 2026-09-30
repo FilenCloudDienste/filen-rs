@@ -1458,7 +1458,9 @@ impl PreparedDecode for PreparedSvg {
 		let size = tree.size();
 		let scale =
 			(f64::from(ow) / f64::from(size.width())).min(f64::from(oh) / f64::from(size.height()));
-		if !(scale.is_finite() && scale > 0.0) {
+		// The render transform is f32, and a subnormal document size fits an
+		// f64 scale that overflows f32 to infinity, which renders nothing.
+		if !(scale > 0.0 && scale <= f64::from(f32::MAX)) {
 			return Err(ThumbError::Decode("svg: degenerate document size".into()));
 		}
 		// The estimate promised a fixed render allowance; hold the real tree to
