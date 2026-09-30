@@ -133,9 +133,14 @@ misquoting these replace came from names that did not:
   the store holds no rows in memory. A run asserts that the pass's figure is at
   least the pair's, and that its edits stay within `EDITS_BASE_BYTES` plus
   `EDIT_BYTES` per folded move or confirmed push, so a fold that wrote the rows it
-  carries fails the run instead of printing a large widest point. (Before the store
-  round these columns were the resident tree's capacities; the two are not
-  comparable, and the old terms print as ONLY IN BEFORE.)
+  carries fails the run instead of printing a large widest point. What a directory
+  move's pass READS is bounded beside that, per file the move carries (the `walk:`
+  row below). `pass_view` is zero for every scenario whose remote changelist is
+  empty, which is every scenario here but `twoway_both_changelists_10k`: a carried
+  side owns nothing it was not told about. Zero is an answer, which is why that
+  column is printed in kibibytes — in mebibytes 411 B and 0 B both print `0.000`.
+  (Before the store round these columns were the resident tree's capacities; the
+  two are not comparable, and the old terms print as ONLY IN BEFORE.)
 - `walk:baseline_read_statements` / `walk:baseline_read_rows` — what the measured
   pass asked the store for its rows, counted in the snapshot: statements run and
   rows decoded. Three statements and no rows for an idle pass, eight for one changed
@@ -151,16 +156,10 @@ misquoting these replace came from names that did not:
   moved subtree; one of them is the observation's read of the rows the renamed
   directory's files take their hashes from instead of opening them), and 20, 30
   and 37 for the leaf moves at 10k, 100k and 1M, set when they read 393, 582 and
-  738 rows for their twenty files; they read 329, 518 and 674 once a directory
-  move proven to carry its subtree unchanged stopped deciding it, and 352, 541 and
-  697 since the renamed leaf's walk reads the rows its files left. About half of a
+  738 rows for their twenty files; they now read 352, 541 and 697. About half of a
   leaf's rows are the page the fold's cursor reads ahead past the leaf: its first
   walk of the pass's paths reads 190 of the 352 at 10k, for twenty files and their
   directory.
-  `pass_view` is zero for every scenario whose remote changelist is empty, which is
-  every scenario here but `twoway_both_changelists_10k`: a carried side owns nothing
-  it was not told about. Zero is an answer, which is why that column is printed in
-  kibibytes — in mebibytes 411 B and 0 B both print `0.000`.
 
 `summarize` prints TWO attribution ratios, because one answered neither
 question. `pair_attributed` is what the pair's baseline computes itself as
@@ -310,8 +309,13 @@ two top-level directories of 50k files each (50000/1/73 ASCII), one of them move
 is what a folded move costs as the moved directory grows. The memory child bounds the
 pass's baseline edits by what it edited (one move, one confirmation: a fixed number of
 bytes each), so a fold that wrote the rows it carries fails there rather than printing
-a large widest point. Its local observation of the 50k files it finds at the new path is
-per-pass data and still scales with the move — that is the scan, not the baseline.
+a large widest point, and it bounds the rows the pass reads by the files the move carries
+(`read_rows_per_carried_file`, under `walk:` above), so a pass that reads the moved
+subtree once more fails there too. Its local observation of the 50k files it finds at the
+new path is per-pass data and still scales with the move — that is the scan, not the
+baseline — and so does the observation's one read of the 50k rows those files left, whose
+kinds, sizes, mtimes and hashes it keeps by path while it walks, so that a file whose
+size and mtime its row still records takes the row's hash instead of being opened.
 
 A figure is only ever read
 per node against the tree it was taken on, which is why every record carries the
