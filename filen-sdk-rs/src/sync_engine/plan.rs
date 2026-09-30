@@ -1802,7 +1802,8 @@ fn reconcile_two_way(
 /// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
 /// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
 /// its source and the insert of its destination in a single transaction. A debug build asserts it
-/// over the decided rows where the directory-move fold reads them (`FoldDirs::read`).
+/// over the decided rows where the directory-move fold reads them (`FoldDirs::read`), whose
+/// pruning of what a proven move carried rests on it as well (see [`fold_dir_moves`]).
 fn visit_move_sources(
 	paths: PassPaths<'_>,
 	baseline: &Baseline,
@@ -2294,6 +2295,26 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// caller that re-keyed it again would move a chained move's paths twice (`a -> b`, then
 /// `c -> a`).
 ///
+/// A push matched on the new directory's FULL signature proves more than that it is the move:
+/// every path under the destination is one of the rows', with the row's kind, hash and size
+/// ([`Matched::Signature`]). At such a path the local node is the row's content, and — where this
+/// pass recorded nothing on the remote side (`Side::untouched`) — the remote node is the row's
+/// own item, so the reconcile would decide nothing there: no transfer, since both sides agree
+/// with the row; no end of a file move, since a node carried off its row names no path but its
+/// own; and no nested move for the next iteration, since both sides hold it. So a scoped fold
+/// takes those paths back out of the set as it re-keys it, and neither the next iteration nor the
+/// reconcile reads their rows again. Whatever the remote side DID record under the destination
+/// stays in the set — an edit or re-mint announced inside the directory, a deletion, a move out,
+/// one of this engine's own writes folded in (`PendingWrites::fold_into`) — and so does the
+/// destination itself. Nothing leaves the set after a case-only rename, a pull, a push matched
+/// only once a nested move was set aside, on a whole pass, or where the remote side is whole.
+///
+/// The pruning rests on two things it does not read. No row under the source may be uncarryable,
+/// or its path would read as an absence once it left the set: the engine holds every such path,
+/// which refuses the move, and any other caller is caught by one read of the uncarryable rows'
+/// index, which keeps the set whole. And no two decided `Synced` rows may record one remote uuid
+/// or one lineage, which the move detection already assumes (see [`visit_move_sources`]).
+///
 /// What still costs the whole map either way is the destination check (`occupied`) and the re-key
 /// itself, both of which walk a side map that has no order to bisect. Those go when the side maps
 /// stop being path-keyed whole-tree maps.
@@ -2326,6 +2347,13 @@ pub(crate) fn fold_dir_moves(
 			break;
 		};
 		let (from, to) = action.endpoints();
+		// Whether what this move carried may leave the set (see above), asked while `from` still
+		// names its rows.
+		let prune = matched == (Matched::Signature { full: true })
+			&& decided.is_some()
+			&& !baseline
+				.uncarryable_paths()
+				.any(|path| is_under(&path, from));
 		// The side the move carries is re-keyed, and the other one told to stay where it is: both
 		// read the rows about to move (see `Side::stay_put`). A push matched by its signature asks
 		// for no walk of them, because the match already proved what staying put would record — no
@@ -2336,7 +2364,7 @@ pub(crate) fn fold_dir_moves(
 				remote.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
 				match matched {
 					Matched::Identity => local.stay_put(bl, from, to),
-					Matched::Signature => Vec::new(),
+					Matched::Signature { .. } => Vec::new(),
 				}
 			} else {
 				local.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
@@ -2349,11 +2377,13 @@ pub(crate) fn fold_dir_moves(
 		// The next iteration's scope, and the reconcile's: keyed like the maps and the rows this
 		// move just re-keyed. Without it a move nested under this one would be looked for at a path
 		// nothing holds, and the reconcile would decide paths no input is keyed by any more. What
-		// the other side had to record to stay put is decided too, keyed where it now stands.
+		// the other side had to record to stay put is decided too, keyed where it now stands, and
+		// what a proven move carried unchanged leaves (see above).
 		if let Some(set) = decided.as_deref_mut() {
 			*set = std::mem::take(set)
 				.into_iter()
 				.map(|path| moved_path(&path, from, to).unwrap_or(path))
+				.filter(|path| !(prune && is_under(path, to) && remote.untouched(path)))
 				.chain(stayed)
 				.collect();
 		}
@@ -2374,8 +2404,11 @@ enum Matched {
 	/// about what either side holds under it.
 	Identity,
 	/// A push, by the signature of the local subtree ([`next_dir_move`]): nothing local is left at
-	/// or under the source, and every row under it has a local node where it lands.
-	Signature,
+	/// or under the source, and every row under it has a local node where it lands. `full` when it
+	/// was the new directory's WHOLE signature that matched, rather than what it holds once a
+	/// nested move is set aside: then every local node under the destination is a row's as well,
+	/// with the row's kind, hash and size.
+	Signature { full: bool },
 }
 
 /// What one iteration of [`fold_dir_moves`] enumerates for its two detectors: the directories each
@@ -2817,10 +2850,11 @@ fn dir_move_from<'m, 's>(
 		let new_dirs = new_local_dirs
 			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, gone, dirs));
 		let mut matches = new_dirs.iter().filter(|dir| dir.matches(signature));
-		let to = matches.next()?.path.as_ref();
+		let dir = matches.next()?;
 		if matches.next().is_some() {
 			return None;
 		}
+		let to = dir.path.as_ref();
 		// The same subtree vanished from somewhere else too: which of the two moved is a guess.
 		let twin = gone
 			.iter()
@@ -2839,7 +2873,8 @@ fn dir_move_from<'m, 's>(
 				kind: NodeKind::Dir,
 				remote_uuid: uuid,
 			})?;
-		(action, Matched::Signature)
+		let full = dir.full == *signature;
+		(action, Matched::Signature { full })
 	} else {
 		return None;
 	};
@@ -3051,6 +3086,12 @@ pub(crate) struct PassHolds {
 /// names every path whose nodes are not its row's, and what the pass adds to it is every path its
 /// observations moved off that row (see `derive::Derived::decided`).
 ///
+/// One kind of path leaves the set again: one a proven directory move carried, once the fold has
+/// shown both of its nodes to be the ones its row describes — the local one by the move's
+/// signature, the remote one because the pass recorded nothing there (see [`fold_dir_moves`]).
+/// That is a proof that the three inputs agree there rather than an observation of it, and
+/// nothing else takes a path back out.
+///
 /// A path left out of the set is a path nothing decides. That can never INVENT an absence — a
 /// deletion is only ever planned at a path this loop visits — but it can DELAY one, which is
 /// invariant I1's safe direction, and the reason the requirement above is written in terms of
@@ -3086,8 +3127,9 @@ pub(crate) struct Plan {
 /// [`Changed`](PassPaths::Changed) is that same union intersected with the pass's own set. Nothing
 /// is left unretired by the intersection: the both-absent arm retires a row whose path neither
 /// side holds any more, and a path this leaves out is one whose two nodes were CARRIED from its
-/// own row, which puts it on both sides. A row is retired by the pass that observes its absence,
-/// and observing that absence is what put the path in the set.
+/// own row, or one a proven directory fold showed equal to its row (see [`fold_dir_moves`]) —
+/// either way it is on both sides. A row is retired by the pass that observes its absence, and
+/// observing that absence is what put the path in the set.
 fn reconcile_keys<'m>(
 	paths: PassPaths<'m>,
 	baseline: &Baseline,
@@ -4226,6 +4268,360 @@ mod tests {
 		actions
 	}
 
+	/// `decided` with every move of `moves` replayed over it in order, as the fold re-keys the set
+	/// it is handed: that set as it would come back had the fold taken nothing out of it.
+	fn rekeyed(decided: BTreeSet<String>, moves: &[SyncAction]) -> BTreeSet<String> {
+		moves.iter().fold(decided, |set, action| {
+			let (from, to) = action.endpoints();
+			set.into_iter()
+				.map(|path| moved_path(&path, from, to).unwrap_or(path))
+				.collect()
+		})
+	}
+
+	/// Fold and reconcile carried sides three ways — at the set the fold hands back, at that set
+	/// with nothing taken out of it, and whole — and require one plan of all three. Hands back the
+	/// plan and the set the fold handed back.
+	fn plan_three_ways(
+		mode: SyncMode,
+		rows: &Baseline,
+		local: Side<LocalNode>,
+		remote: Side<RemoteNode>,
+		decided: BTreeSet<String>,
+	) -> (Vec<SyncAction>, BTreeSet<String>) {
+		let (mut folded, mut folded_local, mut folded_remote) =
+			(rows.clone(), local.clone(), remote.clone());
+		let mut pruned = decided.clone();
+		let moves = fold_dir_moves(
+			mode,
+			&mut folded,
+			&mut folded_local,
+			&mut folded_remote,
+			&BTreeSet::new(),
+			Some(&mut pruned),
+		);
+		// What staying put recorded is in the fold's set and in no replay of the moves.
+		let unpruned: BTreeSet<String> = rekeyed(decided, &moves).union(&pruned).cloned().collect();
+		let plan_at = |paths| {
+			let mut actions = moves.clone();
+			actions.extend(
+				reconcile(
+					mode,
+					&folded,
+					&folded_local.of(&folded),
+					&folded_remote.of(&folded),
+					&PassHolds::default(),
+					paths,
+				)
+				.actions,
+			);
+			actions
+		};
+		let plan = plan_at(PassPaths::Changed(&pruned));
+		assert_eq!(
+			plan,
+			plan_at(PassPaths::Changed(&unpruned)),
+			"{mode:?}: the set the fold pruned planned something the unpruned one did not"
+		);
+		let (mut whole_rows, mut whole_local, mut whole_remote) = (rows.clone(), local, remote);
+		let mut whole = fold_dir_moves(
+			mode,
+			&mut whole_rows,
+			&mut whole_local,
+			&mut whole_remote,
+			&BTreeSet::new(),
+			None,
+		);
+		whole.extend(
+			reconcile(
+				mode,
+				&whole_rows,
+				&whole_local.of(&whole_rows),
+				&whole_remote.of(&whole_rows),
+				&PassHolds::default(),
+				PassPaths::Whole,
+			)
+			.actions,
+		);
+		assert_eq!(
+			plan, whole,
+			"{mode:?}: the scoped pass planned something the whole one did not"
+		);
+		(plan, pruned)
+	}
+
+	/// What a pushed directory move proved it carried unchanged leaves the set; what the remote
+	/// recorded under it does not. A new version of a file announced inside the moved directory is
+	/// still planned at its new path, and so is a deletion there, while the files the move carried
+	/// untouched are no longer decided at all.
+	#[test]
+	fn a_remote_edit_inside_a_pushed_directory_move_is_still_planned() {
+		let dir = Uuid::new_v4();
+		let files = ["a.txt", "b.txt", "c.txt"].map(|name| (name, Uuid::new_v4()));
+		let baseline = Baseline::from_rows(
+			std::iter::once(base_dir("docs", dir)).chain(
+				files
+					.iter()
+					.map(|(name, uuid)| base_file(&format!("docs/{name}"), *uuid, [1; 32])),
+			),
+		);
+		let edited = Uuid::new_v4();
+		for mode in [
+			SyncMode::TwoWay,
+			SyncMode::LocalToRemote,
+			SyncMode::LocalBackup,
+		] {
+			for trashed in [false, true] {
+				// What a pass holds once it observed the rename: the old name gone, the new one
+				// walked...
+				let (mut local, mut remote) = (Side::carried(), Side::carried());
+				let mut decided = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
+				local.remove(&baseline, "docs");
+				local.insert("documents".to_string(), local_dir("documents"));
+				for (name, _) in &files {
+					let (from, to) = (format!("docs/{name}"), format!("documents/{name}"));
+					local.remove(&baseline, &from);
+					local.insert(to.clone(), local_file(&to, [1; 32]));
+					decided.extend([from, to]);
+				}
+				// ...and announced on the remote meanwhile, a new version of `a.txt` and, the
+				// second time round, `b.txt` trashed.
+				remote.insert(
+					"docs/a.txt".to_string(),
+					remote_version("docs/a.txt", files[0].1, edited, [9; 32]),
+				);
+				if trashed {
+					remote.remove(&baseline, "docs/b.txt");
+				}
+				let (plan, pruned) = plan_three_ways(mode, &baseline, local, remote, decided);
+				let mut expected = vec![SyncAction::MoveRemote {
+					from_path: "docs".to_string(),
+					to_path: "documents".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: dir,
+				}];
+				expected.push(match mode {
+					SyncMode::TwoWay => SyncAction::DownloadFile {
+						rel_path: "documents/a.txt".to_string(),
+						remote_uuid: edited,
+					},
+					_ => SyncAction::UploadFile {
+						rel_path: "documents/a.txt".to_string(),
+					},
+				});
+				if trashed {
+					expected.push(match mode {
+						SyncMode::TwoWay => SyncAction::DeleteLocal {
+							rel_path: "documents/b.txt".to_string(),
+							kind: NodeKind::File,
+						},
+						_ => SyncAction::UploadFile {
+							rel_path: "documents/b.txt".to_string(),
+						},
+					});
+				}
+				assert_eq!(plan, expected, "{mode:?}, b.txt trashed: {trashed}");
+				assert!(
+					pruned.contains("documents") && pruned.contains("documents/a.txt"),
+					"{mode:?}: the destination and the edited file stay decided: {pruned:?}"
+				);
+				assert_eq!(
+					pruned.contains("documents/b.txt"),
+					trashed,
+					"{mode:?}: b.txt stays decided exactly when the remote recorded its trashing: \
+					 {pruned:?}"
+				);
+				assert!(
+					!pruned.contains("documents/c.txt"),
+					"{mode:?}: the file carried untouched leaves the set: {pruned:?}"
+				);
+			}
+		}
+	}
+
+	/// A case-only directory rename is a remote move too, but matched by name alone: it proves
+	/// nothing about what the directory holds, so the set is only re-keyed and a child edited in
+	/// the same pass is still pushed.
+	#[test]
+	fn a_case_only_directory_rename_decides_everything_it_carried() {
+		let (dir, a, b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+		let baseline = Baseline::from_rows([
+			base_dir("Docs", dir),
+			base_file("Docs/a.txt", a, [1; 32]),
+			base_file("Docs/b.txt", b, [2; 32]),
+		]);
+		let mut local = Side::carried();
+		let mut decided = BTreeSet::new();
+		for (old, new) in [
+			("Docs", "docs"),
+			("Docs/a.txt", "docs/a.txt"),
+			("Docs/b.txt", "docs/b.txt"),
+		] {
+			local.remove(&baseline, old);
+			decided.extend([old.to_string(), new.to_string()]);
+		}
+		local.extend([
+			("docs".to_string(), local_dir("docs")),
+			("docs/a.txt".to_string(), local_file("docs/a.txt", [1; 32])),
+			("docs/b.txt".to_string(), local_file("docs/b.txt", [9; 32])),
+		]);
+		let (plan, pruned) = plan_three_ways(
+			SyncMode::LocalToRemote,
+			&baseline,
+			local,
+			Side::carried(),
+			decided.clone(),
+		);
+		assert_eq!(
+			plan,
+			vec![
+				SyncAction::MoveRemote {
+					from_path: "Docs".to_string(),
+					to_path: "docs".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: dir,
+				},
+				SyncAction::UploadFile {
+					rel_path: "docs/b.txt".to_string(),
+				},
+			]
+		);
+		assert_eq!(
+			pruned,
+			rekeyed(decided, &plan[..1]),
+			"the set is re-keyed, and nothing leaves it"
+		);
+	}
+
+	/// `mv z new; mv b new/b` at a change-scoped pass. `new` matches `z` only once the nested
+	/// `new/b` is set aside, so that move proves nothing about `new/b` and takes nothing out of the
+	/// set: the next iteration still finds `new/b` among the local directories no row records, and
+	/// folds the second move as a whole pass does.
+	#[test]
+	fn a_move_matched_without_its_nested_move_prunes_nothing() {
+		let (b, z) = (Uuid::new_v4(), Uuid::new_v4());
+		let baseline = Baseline::from_rows([
+			base_dir("b", b),
+			base_file("b/1.txt", Uuid::new_v4(), [1; 32]),
+			base_dir("z", z),
+			base_file("z/2.txt", Uuid::new_v4(), [2; 32]),
+		]);
+		for mode in [SyncMode::TwoWay, SyncMode::LocalToRemote] {
+			let mut local = Side::carried();
+			let mut decided = BTreeSet::new();
+			for (old, new) in [
+				("z", "new"),
+				("z/2.txt", "new/2.txt"),
+				("b", "new/b"),
+				("b/1.txt", "new/b/1.txt"),
+			] {
+				local.remove(&baseline, old);
+				decided.extend([old.to_string(), new.to_string()]);
+			}
+			local.extend([
+				("new".to_string(), local_dir("new")),
+				("new/2.txt".to_string(), local_file("new/2.txt", [2; 32])),
+				("new/b".to_string(), local_dir("new/b")),
+				(
+					"new/b/1.txt".to_string(),
+					local_file("new/b/1.txt", [1; 32]),
+				),
+			]);
+			let (plan, _) = plan_three_ways(mode, &baseline, local, Side::carried(), decided);
+			assert_eq!(
+				plan,
+				vec![
+					SyncAction::MoveRemote {
+						from_path: "z".to_string(),
+						to_path: "new".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: z,
+					},
+					SyncAction::MoveRemote {
+						from_path: "b".to_string(),
+						to_path: "new/b".to_string(),
+						kind: NodeKind::Dir,
+						remote_uuid: b,
+					},
+				],
+				"{mode:?}"
+			);
+		}
+	}
+
+	/// A push matched on the new directory's whole signature still takes nothing out of the set
+	/// where the rows under it do not answer for the remote side: once with a row there that no
+	/// side is carried from — the engine holds such a row and so refuses the move, a caller that
+	/// does not hold it leaves it unobserved — and once with a whole remote side, whose every node
+	/// is one the pass recorded.
+	#[test]
+	fn a_proven_directory_move_prunes_nothing_its_rows_do_not_answer_for() {
+		let dir = Uuid::new_v4();
+		let files = ["a.txt", "b.txt", "c.txt"].map(|name| (name, Uuid::new_v4()));
+		for whole_remote in [false, true] {
+			let mut baseline = Baseline::from_rows(std::iter::once(base_dir("docs", dir)).chain(
+				files.iter().map(|(name, uuid)| {
+					let row = base_file(&format!("docs/{name}"), *uuid, [1; 32]);
+					match (*name, whole_remote) {
+						// Synced, with the hash and size the move is matched on, but no remote
+						// stamp: a row neither side is carried from.
+						("b.txt", false) => BaselineEntry {
+							remote_modified: None,
+							..row
+						},
+						_ => row,
+					}
+				}),
+			));
+			let mut local = Side::carried();
+			let mut decided = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
+			local.remove(&baseline, "docs");
+			local.insert("documents".to_string(), local_dir("documents"));
+			for (name, _) in &files {
+				let (from, to) = (format!("docs/{name}"), format!("documents/{name}"));
+				local.remove(&baseline, &from);
+				// One path, which the side and the set each keep a copy of.
+				local.insert(to.clone(), local_file(&to, [1; 32]));
+				decided.extend([from, to]);
+			}
+			let mut remote = match whole_remote {
+				false => Side::carried(),
+				true => std::iter::once(("docs".to_string(), remote_dir_node("docs", dir)))
+					.chain(files.iter().map(|(name, uuid)| {
+						let path = format!("docs/{name}");
+						let node = remote_file(&path, *uuid, [1; 32]);
+						(path, node)
+					}))
+					.collect(),
+			};
+			// The set as the fold is handed it, to replay the move over once the fold has its own.
+			let original = decided.clone();
+			let moves = fold_dir_moves(
+				SyncMode::LocalToRemote,
+				&mut baseline,
+				&mut local,
+				&mut remote,
+				&BTreeSet::new(),
+				Some(&mut decided),
+			);
+			assert_eq!(
+				moves,
+				vec![SyncAction::MoveRemote {
+					from_path: "docs".to_string(),
+					to_path: "documents".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: dir,
+				}],
+				"whole remote: {whole_remote}"
+			);
+			assert_eq!(
+				decided,
+				rekeyed(original, &moves),
+				"whole remote: {whole_remote}: nothing may leave the set"
+			);
+		}
+	}
+
 	/// The remote deleted a file and then moved its directory, inside one delta: the view
 	/// tombstones the file where it was and carries the rest across. Folding the move moves the
 	/// rows under BOTH sides, and a carried remote side that followed them held the deleted file
@@ -4355,8 +4751,9 @@ mod tests {
 	/// number of times, whatever it holds. On the first iteration: once for the move sources and
 	/// both sides' directories together, once for whether anything local is left at the source, and
 	/// once for the source's signature — which the twin check and the new directories' match reuse
-	/// rather than read again. On the second, which finds nothing: once more for the sources and the
-	/// directories.
+	/// rather than read again. The second, which finds nothing, reads only what the move did not
+	/// prove unchanged: here the renamed directory itself, since the remote side recorded nothing
+	/// under it (see [`fold_dir_moves`]).
 	#[test]
 	fn a_scoped_directory_rename_fold_reads_the_renamed_rows_a_fixed_number_of_times() {
 		const FILES: usize = 2_000;
@@ -4402,9 +4799,9 @@ mod tests {
 		);
 		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
 		assert!(
-			rows < 5 * FILES,
-			"the fold read {rows} row(s) in {statements} statement(s): more than four times the \
-			 {FILES} file(s) it moved"
+			rows < 7 * FILES / 2,
+			"the fold read {rows} row(s) in {statements} statement(s): more than three and a half \
+			 times the {FILES} file(s) it moved"
 		);
 	}
 
@@ -8392,13 +8789,17 @@ mod tests {
 		}
 
 		/// The case as it stands once the directory-move fold has run over it — at the case's own
-		/// scope when `scoped`, whole otherwise — and the moves that took.
+		/// scope when `scoped`, whole otherwise — the moves that took, and the case's own set with
+		/// those moves replayed over it.
 		///
-		/// The set is re-keyed here too, every move replayed in order over the case's own set: the
-		/// set a whole fold, which is handed none, is read with afterwards, and the oracle for the
-		/// scoped fold's. That one may hold more — what the side a move did not carry recorded to
-		/// stay put (see `Side::stay_put`) — and never less.
-		fn fold(case: &Case, mode: SyncMode, scoped: bool) -> (Case, Vec<SyncAction>) {
+		/// The replay is the set a whole fold, which is handed none, is read with afterwards. A
+		/// scoped fold's own set is the replay less what a proven move carried unchanged, plus what
+		/// the side a move did not carry recorded to stay put (see `Side::stay_put`).
+		fn fold(
+			case: &Case,
+			mode: SyncMode,
+			scoped: bool,
+		) -> (Case, Vec<SyncAction>, BTreeSet<String>) {
 			let mut baseline = case.baseline.clone();
 			let mut local = case.local.clone();
 			let mut remote = case.remote.clone();
@@ -8411,22 +8812,11 @@ mod tests {
 				&case.holds.held_remote,
 				scoped.then_some(&mut decided),
 			);
-			let mut oracle = case.decided.clone();
-			for action in &moves {
-				let (from, to) = action.endpoints();
-				oracle = oracle
-					.into_iter()
-					.map(|path| moved_path(&path, from, to).unwrap_or(path))
-					.collect();
-			}
+			let replayed = rekeyed(case.decided.clone(), &moves);
 			let decided = if scoped {
-				assert!(
-					decided.is_superset(&oracle),
-					"{mode:?}: the fold lost a path of the set it was handed"
-				);
 				decided
 			} else {
-				oracle
+				rekeyed(decided, &moves)
 			};
 			let folded = Case {
 				baseline,
@@ -8438,7 +8828,7 @@ mod tests {
 					..PassHolds::default()
 				},
 			};
-			(folded, moves)
+			(folded, moves, replayed)
 		}
 
 		/// The same property after the directory-move fold a pass runs first, at the same scope the
@@ -8451,7 +8841,7 @@ mod tests {
 			for seed in 0..CASES {
 				let case = generate(seed, &mut seen);
 				for mode in MODES {
-					let (after, moves) = fold(&case, mode, true);
+					let (after, moves, _) = fold(&case, mode, true);
 					seen.folds += moves.len();
 					assert_same_plan(seed, mode, &after, &mut seen);
 				}
@@ -8498,7 +8888,7 @@ mod tests {
 					&rows::probes(paths()),
 				);
 				for mode in MODES {
-					let (mut after, moves) = fold(&case, mode, true);
+					let (mut after, moves, _) = fold(&case, mode, true);
 					let mut oracle = unedited.clone();
 					for action in &moves {
 						let (from, to) = action.endpoints();
@@ -8554,8 +8944,8 @@ mod tests {
 			for seed in 0..CASES {
 				let case = generate(seed, &mut seen);
 				for mode in MODES {
-					let (whole, by_whole) = fold(&case, mode, false);
-					let (scoped, by_scope) = fold(&case, mode, true);
+					let (whole, by_whole, _) = fold(&case, mode, false);
+					let (scoped, by_scope, _) = fold(&case, mode, true);
 					seen.folds += by_whole.len();
 					seen.pushed_folds += by_whole
 						.iter()
@@ -8573,10 +8963,6 @@ mod tests {
 						whole.remote, scoped.remote,
 						"seed {seed}, {mode:?}: the narrowed fold left another remote side"
 					);
-					assert_eq!(
-						whole.decided, scoped.decided,
-						"seed {seed}, {mode:?}: the narrowed fold re-keyed the set differently"
-					);
 				}
 			}
 			assert!(
@@ -8589,6 +8975,92 @@ mod tests {
 				"only {} pushed directory move(s) carried a file, so the carried subtree was barely \
 				 tested",
 				seen.pushed_folds
+			);
+		}
+
+		/// The fold at the pass's scope, pruned, and the reconcile after it plan exactly what the
+		/// unpruned set and a whole pass plan, over every generated case in every mode — the staged
+		/// subtree moves included, with the remote edits, deletions and moves the random changes
+		/// drew under them. And what the fold took out of the set is only what the rule allows:
+		/// paths strictly under the destination of a pushed move that the remote side recorded
+		/// nothing at.
+		#[test]
+		fn a_pruned_fold_and_reconcile_plan_what_the_unpruned_and_whole_ones_plan() {
+			let mut seen = Coverage::default();
+			let mut pruned_paths = 0;
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				for mode in MODES {
+					let (whole, by_whole, _) = fold(&case, mode, false);
+					let (scoped, by_scope, replayed) = fold(&case, mode, true);
+					let context = format!("seed {seed}, {mode:?}");
+					assert_eq!(by_whole, by_scope, "{context}: other moves");
+					assert_eq!(whole.local, scoped.local, "{context}: another local side");
+					assert_eq!(
+						whole.remote, scoped.remote,
+						"{context}: another remote side"
+					);
+					assert_eq!(
+						whole.baseline.iter().collect::<Vec<_>>(),
+						scoped.baseline.iter().collect::<Vec<_>>(),
+						"{context}: other rows"
+					);
+					seen.pushed_folds += by_scope
+						.iter()
+						.filter(|action| pushed_with_files(&scoped.baseline, action))
+						.count();
+					let pruned = &scoped.decided;
+					// What staying put recorded is in the fold's set and in no replay of the moves.
+					let unpruned: BTreeSet<String> = replayed.union(pruned).cloned().collect();
+					for path in unpruned.difference(pruned) {
+						let under_a_push = by_scope.iter().any(|action| {
+							matches!(
+								action,
+								SyncAction::MoveRemote {
+									kind: NodeKind::Dir,
+									..
+								}
+							) && is_under(path, action.rel_path())
+						});
+						assert!(
+							under_a_push && scoped.remote.untouched(path),
+							"{context}: {path:?} left the set, and is not a path a pushed move \
+							 carried with nothing recorded on the remote"
+						);
+						pruned_paths += 1;
+					}
+					let plan_at = |paths| {
+						reconcile(
+							mode,
+							&scoped.baseline,
+							&scoped.local.of(&scoped.baseline),
+							&scoped.remote.of(&scoped.baseline),
+							&scoped.holds,
+							paths,
+						)
+					};
+					let expected = plan_at(PassPaths::Whole);
+					for (what, set) in [("unpruned", &unpruned), ("pruned", pruned)] {
+						let plan = plan_at(PassPaths::Changed(set));
+						assert_eq!(
+							expected.actions, plan.actions,
+							"{context}: the {what} set planned something else"
+						);
+						assert_eq!(
+							expected.deferred_paths, plan.deferred_paths,
+							"{context}: the {what} set counted other deferrals"
+						);
+					}
+				}
+			}
+			assert!(
+				seen.pushed_folds > 50,
+				"only {} pushed directory move(s) carried a file",
+				seen.pushed_folds
+			);
+			assert!(
+				pruned_paths > 100,
+				"only {pruned_paths} path(s) left the set, so the pruning was barely exercised"
 			);
 		}
 
