@@ -1605,6 +1605,15 @@ impl Baseline {
 			.upsert_for_test(entry);
 	}
 
+	/// `(statements, rows)` read so far out of the snapshot behind this baseline and every clone
+	/// sharing it: what a test holds a pass's reads to.
+	#[cfg(test)]
+	pub(super) fn reads_for_test(&self) -> (usize, usize) {
+		self.rows
+			.as_deref()
+			.map_or((0, 0), Snapshot::reads_for_test)
+	}
+
 	/// What this baseline holds in memory, in bytes: the handle a pass reads the table through,
 	/// and the pass's own edits over it — nothing per row it did not edit. What SQLite caches for
 	/// it is its reader's page cache, bounded by `baseline::READER_CACHE_KIB` and measured as a

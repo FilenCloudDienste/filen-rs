@@ -2471,7 +2471,9 @@ fn next_dir_move<'m>(
 			}
 		});
 	}
-	// The new local directories and what each holds, built only once a pushed move is possible.
+	// The sources gone locally with their signatures, and the new local directories with theirs,
+	// built only once a pushed move is possible — and each read once for every source it answers.
+	let mut gone: Option<Vec<(&str, Signature)>> = None;
 	let mut new_local_dirs: Option<Vec<NewLocalDir<'m>>> = None;
 
 	// Every move that holds up but for the parents of its destination. A missing parent another of
@@ -2488,6 +2490,7 @@ fn next_dir_move<'m>(
 				held,
 				&sources,
 				&remote_dir_at,
+				&mut gone,
 				&mut new_local_dirs,
 				from,
 				*uuid,
@@ -2512,15 +2515,16 @@ fn next_dir_move<'m>(
 
 /// The directory move of the baseline directory `from` (remote uuid `uuid`), checked against
 /// everything [`next_dir_move`] requires except the parents of its destination.
-#[allow(clippy::too_many_arguments)] // the pass's inputs plus two indexes built once per call
-fn dir_move_from<'m>(
+#[allow(clippy::too_many_arguments)] // the pass's inputs plus the indexes built once per call
+fn dir_move_from<'m, 's>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
 	local: &'m impl Nodes<Node = LocalNode>,
 	remote: &impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
-	sources: &[(String, Uuid)],
+	sources: &'s [(String, Uuid)],
 	remote_dir_at: &HashMap<Uuid, Cow<'m, str>>,
+	gone: &mut Option<Vec<(&'s str, Signature)>>,
 	new_local_dirs: &mut Option<Vec<NewLocalDir<'m>>>,
 	from: &str,
 	uuid: Uuid,
@@ -2547,20 +2551,29 @@ fn dir_move_from<'m>(
 			.is_some_and(|n| n.kind == NodeKind::Dir && n.remote_uuid == uuid)
 		&& !local.occupied(from)
 	{
-		let signature = baseline_dir_signature(baseline, from)?;
+		// Nothing local is at `from` under any spelling, so it holds nothing there either: it is one
+		// of the sources gone locally, and in `gone` exactly when the baseline vouches for it. The
+		// first source to get here reads its own signature first, and only one the baseline vouches
+		// for goes on to read the others'.
+		let gone: &[(&str, Signature)] = match gone {
+			Some(gone) => gone,
+			None => {
+				let signature = baseline_dir_signature(baseline, from)?;
+				gone.insert(gone_signatures(baseline, local, sources, from, signature))
+			}
+		};
+		let (_, signature) = gone.iter().find(|(path, _)| *path == from)?;
 		let new_dirs = new_local_dirs
-			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, sources, paths));
-		let mut matches = new_dirs.iter().filter(|dir| dir.matches(&signature));
+			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, gone, paths));
+		let mut matches = new_dirs.iter().filter(|dir| dir.matches(signature));
 		let to = matches.next()?.path.as_ref();
 		if matches.next().is_some() {
 			return None;
 		}
 		// The same subtree vanished from somewhere else too: which of the two moved is a guess.
-		let twin = sources.iter().any(|(other, _)| {
-			other != from
-				&& !local.holds(other)
-				&& baseline_dir_signature(baseline, other).as_ref() == Some(&signature)
-		});
+		let twin = gone
+			.iter()
+			.any(|(other, other_signature)| *other != from && other_signature == signature);
 		let (to_parent, to_name) = (parent_path(to), leaf(to));
 		let via = match to_parent.is_empty() {
 			true => leaf(from).to_string(),
@@ -2604,23 +2617,43 @@ impl NewLocalDir<'_> {
 	}
 }
 
+/// Every one of `sources` gone locally whose subtree the baseline vouches for, with its signature,
+/// in `sources`' order: what a pushed move is matched from, and what makes one a guess. `from`'s is
+/// the `signature` already in hand, and is not read again.
+fn gone_signatures<'s>(
+	baseline: &Baseline,
+	local: &impl NodesAt<Node = LocalNode>,
+	sources: &'s [(String, Uuid)],
+	from: &str,
+	signature: Signature,
+) -> Vec<(&'s str, Signature)> {
+	let mut in_hand = Some(signature);
+	sources
+		.iter()
+		.filter(|(path, _)| !local.holds(path))
+		.filter_map(|(path, _)| {
+			let signature = match path == from {
+				true => in_hand.take(),
+				false => baseline_dir_signature(baseline, path),
+			};
+			Some((path.as_str(), signature?))
+		})
+		.collect()
+}
+
 /// The local directories the baseline does not record, with their signatures (see [`NewLocalDir`]).
 /// A nested directory is a move of its own when either of its signatures is that of a synced
-/// directory gone locally; `mv z new; mv b new/b` then matches `new` to `z` and `new/b` to `b`,
-/// while a subdirectory that moved along inside its parent still leaves the parent's full signature
-/// to match. A directory whose full signature matches a gone one gets no reduced signature at all:
-/// the full match already explains it. Computed deepest first, so a chain of such moves reduces from the inside out.
+/// directory gone locally (`gone`, see [`gone_signatures`]); `mv z new; mv b new/b` then matches
+/// `new` to `z` and `new/b` to `b`, while a subdirectory that moved along inside its parent still
+/// leaves the parent's full signature to match. A directory whose full signature matches a gone one
+/// gets no reduced signature at all: the full match already explains it. Computed deepest first, so
+/// a chain of such moves reduces from the inside out.
 fn new_local_dir_signatures<'m>(
 	baseline: &Baseline,
 	local: &'m impl Nodes<Node = LocalNode>,
-	sources: &[(String, Uuid)],
+	gone: &[(&str, Signature)],
 	paths: PassPaths<'m>,
 ) -> Vec<NewLocalDir<'m>> {
-	let gone: Vec<Signature> = sources
-		.iter()
-		.filter(|(path, _)| !local.holds(path))
-		.filter_map(|(path, _)| baseline_dir_signature(baseline, path))
-		.collect();
 	let mut candidates: Vec<Cow<'m, str>> = Vec::new();
 	visit_move_targets(paths, local, |path, node| {
 		if node.kind == NodeKind::Dir && !baseline.contains_key(&path) {
@@ -2636,11 +2669,11 @@ fn new_local_dir_signatures<'m>(
 		let mut without_nested_moves: Option<Signature> = None;
 		// A directory whose whole tree already matches one gone locally is that move, its nested
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
-		let explained = gone.contains(&full);
+		let explained = gone.iter().any(|(_, sig)| *sig == full);
 		for inner in &dirs {
 			if !explained
 				&& is_under(&inner.path, &path)
-				&& gone.iter().any(|sig| inner.matches(sig))
+				&& gone.iter().any(|(_, sig)| inner.matches(sig))
 			{
 				let inner_rel = &inner.path[path.len()..];
 				// The only copy of the signature, made once per directory that holds a nested move.
@@ -4008,6 +4041,63 @@ mod tests {
 				"{mode:?}"
 			);
 		}
+	}
+
+	/// A change-scoped pass folding a directory rename reads the renamed directory's rows a fixed
+	/// number of times, whatever it holds. On the first iteration: twice for the remote's
+	/// directories (the case-only rename's and the pulled move's) and once for the move sources,
+	/// once for whether anything local is left at the source, and once for the source's signature —
+	/// which the twin check and the new directories' match reuse rather than read again. On the
+	/// second, which finds nothing: once each for the move sources and the remote's directories.
+	#[test]
+	fn a_scoped_directory_rename_fold_reads_the_renamed_rows_a_fixed_number_of_times() {
+		const FILES: usize = 2_000;
+		let dir = Uuid::new_v4();
+		let files: Vec<(String, String)> = (0..FILES)
+			.map(|n| (format!("dir/{n:05}.txt"), format!("moved_dir/{n:05}.txt")))
+			.collect();
+		let mut baseline = Baseline::from_rows(
+			std::iter::once(base_dir("dir", dir)).chain(
+				files
+					.iter()
+					.map(|(from, _)| base_file(from, Uuid::new_v4(), [1; 32])),
+			),
+		);
+		// What a pass holds once it observed the rename: the old name gone, the new one walked.
+		let (mut local, mut remote) = (Side::carried(), Side::carried());
+		local.remove(&baseline, "dir");
+		local.insert("moved_dir".to_string(), local_dir("moved_dir"));
+		let mut decided = BTreeSet::from(["dir".to_string(), "moved_dir".to_string()]);
+		for (from, to) in &files {
+			local.remove(&baseline, from);
+			local.insert(to.clone(), local_file(to, [1; 32]));
+			decided.extend([from.clone(), to.clone()]);
+		}
+		let before = baseline.reads_for_test();
+		let (moves, _) = fold_dir_moves(
+			SyncMode::TwoWay,
+			&mut baseline,
+			&mut local,
+			&mut remote,
+			&BTreeSet::new(),
+			PassPaths::Changed(&decided),
+		);
+		let after = baseline.reads_for_test();
+		assert_eq!(
+			moves,
+			vec![SyncAction::MoveRemote {
+				from_path: "dir".to_string(),
+				to_path: "moved_dir".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: dir,
+			}]
+		);
+		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
+		assert!(
+			rows < 8 * FILES,
+			"the fold read {rows} row(s) in {statements} statement(s): more than seven times the \
+			 {FILES} file(s) it moved"
+		);
 	}
 
 	/// A remote move whose local subtree was edited meanwhile is still one move: the edit is
