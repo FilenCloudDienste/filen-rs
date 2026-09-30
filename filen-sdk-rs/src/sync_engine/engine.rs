@@ -1916,16 +1916,22 @@ struct Prepared {
 impl Prepared {
 	/// Carry each directory move across as one move — a case-only rename included — and read the
 	/// rest of the pass where those subtrees end up (see [`plan::fold_dir_moves`]).
+	///
+	/// The fold re-keys the paths a scoped pass decides itself, move by move as it folds them; what
+	/// is replayed here is everything else this pass keys by path.
 	fn fold_dir_moves(&mut self) {
-		let (moves, stayed) = plan::fold_dir_moves(
+		let decided = match &mut self.read {
+			PassRead::Scoped(decided) => Some(decided),
+			PassRead::Whole(_) => None,
+		};
+		self.dir_moves = plan::fold_dir_moves(
 			self.record.mode,
 			&mut self.baseline,
 			&mut self.local_scan.nodes,
 			&mut self.remote_view.nodes,
 			&self.holds.held_remote,
-			self.read.paths(),
+			decided,
 		);
-		self.dir_moves = moves;
 		// What this pass blocks and reports is keyed by path too, and has to follow the fold, or a
 		// block stays behind at a path nothing is keyed by any more while its item reads as absent at
 		// the new one: a remote item the view cannot place would have its local copy quarantined.
@@ -1935,14 +1941,6 @@ impl Prepared {
 			// Keyed like the baseline rows they were read from. A park on the moved directory itself
 			// is cleared by its rename, as any rename clears one; carried along, it would hold back the
 			// very move that renames it.
-			// Keyed like the maps and the rows the fold just moved — so it moves with them, or the
-			// next pass decides a path nothing is keyed by any more.
-			if let PassRead::Scoped(decided) = &mut self.read {
-				*decided = mem::take(decided)
-					.into_iter()
-					.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
-					.collect();
-			}
 			rekey_paths(&mut self.facts.unknown_remote, from, to);
 			self.failures.remove(from);
 			rekey_paths(&mut self.failures, from, to);
@@ -1971,11 +1969,6 @@ impl Prepared {
 					}
 				}
 			}
-		}
-		// What the side a move did not carry recorded to stay put, which the replay above cannot
-		// produce: decided as well, and already keyed where the moves left it.
-		if let PassRead::Scoped(decided) = &mut self.read {
-			decided.extend(stayed);
 		}
 	}
 
