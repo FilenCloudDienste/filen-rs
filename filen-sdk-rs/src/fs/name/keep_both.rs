@@ -3,7 +3,7 @@
 //! there. Used wherever the SDK creates items from other items: copies, compressed archives and
 //! extracted entries.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use super::{EntryNameError, EntryNameErrorKind, MAX_BYTES, ValidatedName, encode_name};
 use crate::util::{SeededMap, SeededSet};
@@ -54,11 +54,13 @@ pub(crate) enum NameShape {
 #[derive(Debug, Default)]
 pub(crate) struct TakenNames {
 	keys: SeededSet<String>,
-	/// Per [`CounterKey`], a counter below which every candidate of that suffix length is known
-	/// to be taken, so the `k`-th duplicate of one name (or of its case variants) does not retry
-	/// the `k - 1` before it. Names are only ever added, so a candidate once seen taken stays
-	/// taken.
-	next_counter: SeededMap<CounterKey, u64>,
+	/// Per [`CounterKey`], the runs of counters whose candidates are all known to be taken, as
+	/// `first -> end` (exclusive), disjoint and never touching. The `k`-th duplicate of one name
+	/// (or of its case variants) jumps over a run instead of retrying the `k - 1` counters before
+	/// it, wherever its walk starts: a name that already ends in ` (n)` starts partway through a
+	/// counter length. Names are only ever added, so a candidate once seen taken stays taken, and
+	/// a run never covers a free one.
+	taken_runs: SeededMap<CounterKey, BTreeMap<u64, u64>>,
 }
 
 /// What a numbered candidate's hint is kept under: the collision keys of the base and extension
@@ -118,50 +120,63 @@ impl TakenNames {
 		let (mut base, mut n) = strip_counter(stem)
 			.and_then(|(base, n)| Some((base, n.checked_add(1)?)))
 			.unwrap_or((stem, 1));
-		// the hint may only be raised when every counter of this length below `n` is known taken
-		let mut contiguous = first_of_its_length(n);
+		// every counter from `from` below `n` was seen taken, under the key `walked`
+		let (mut from, mut walked) = (n, None);
 		loop {
 			let (candidate, key) = numbered_candidate(base, n, ext)?;
 			*built += 1;
-			if let Some(known_taken_below) = key.as_ref().and_then(|key| self.next_counter.get(key))
-				&& *known_taken_below >= n
-			{
-				contiguous = true;
-				if *known_taken_below > n {
-					n = *known_taken_below;
-					continue;
+			if key != walked {
+				// a new counter length (or base): what the walk found under the last is kept
+				if let Some(walked) = walked.take()
+					&& from < n
+				{
+					add_run(self.taken_runs.entry(walked).or_default(), from, n);
 				}
+				(from, walked) = (n, key.clone());
+			}
+			if let Some(end) = key
+				.as_ref()
+				.and_then(|key| self.taken_runs.get(key))
+				.and_then(|runs| runs.range(..=n).next_back())
+				.map(|(_, &end)| end)
+				.filter(|&end| end > n)
+			{
+				n = end;
+				continue;
 			}
 			if self.insert(candidate.as_ref()) {
-				if contiguous
-					&& let Some(key) = key
-					&& let Some(next) = n.checked_add(1)
+				if let Some(key) = key
+					&& let Some(end) = n.checked_add(1)
 				{
-					self.next_counter.insert(key, next);
+					add_run(self.taken_runs.entry(key).or_default(), from, end);
 				}
 				return Ok(candidate);
 			}
-			// Every iteration either returns, skips a taken name, or jumps forward, and only
+			// Every iteration either returns, skips a taken name, or jumps past a run, and only
 			// finitely many names are taken, so counting up terminates. Only a continued counter
 			// can run out of numbers; the whole stem then starts over at 1.
 			(base, n) = match n.checked_add(1) {
-				Some(next) => {
-					contiguous |= first_of_its_length(next);
-					(base, next)
-				}
-				None => {
-					contiguous = true;
-					(stem, 1)
-				}
+				Some(next) => (base, next),
+				None => (stem, 1),
 			};
 		}
 	}
 }
 
-/// Whether `n` is the smallest counter of its number of digits.
-fn first_of_its_length(n: u64) -> bool {
-	n.checked_ilog10()
-		.is_some_and(|digits| 10u64.pow(digits) == n)
+/// Records that the candidates of every counter in `first..end` are taken, merged with the runs
+/// it overlaps or touches, so a lookup finds the whole run from any counter inside it.
+fn add_run(runs: &mut BTreeMap<u64, u64>, mut first: u64, mut end: u64) {
+	if let Some((&before, &before_end)) = runs.range(..first).next_back()
+		&& before_end >= first
+	{
+		first = before;
+		end = end.max(before_end);
+	}
+	while let Some((&start, &run_end)) = runs.range(first..=end).next() {
+		runs.remove(&start);
+		end = end.max(run_end);
+	}
+	runs.insert(first, end);
 }
 
 /// `(stem, ext)` with `ext` including its dot. A leading dot (`.bashrc`) is part of the stem,
@@ -539,7 +554,15 @@ mod tests {
 			"\u{3a3}",
 		];
 		// counters a name already ends in, so numbering starts at every length up to the last
-		const COUNTERS: &[&str] = &["", "", " (9)", " (99)", " (999)", " (18446744073709551614)"];
+		const COUNTERS: &[&str] = &[
+			"",
+			"",
+			" (9)",
+			" (99)",
+			" (999)",
+			" (123456)",
+			" (18446744073709551614)",
+		];
 		let mut rng = StdRng::seed_from_u64(0x6b65_6570_626f_7468);
 		// an extension holds no dot, and nothing encoding would lengthen past the limit
 		let text = |rng: &mut StdRng, bytes: usize, ext: bool| {
@@ -660,6 +683,78 @@ mod tests {
 			[first.as_str(), second.as_str()],
 			["a (1).txt", "a (3).txt"]
 		);
+	}
+
+	#[test]
+	fn long_names_sharing_a_trimmed_base_are_allocated_in_linear_time() {
+		// names from an archive are attacker-chosen: distinct names that only differ past the
+		// point where a numbered candidate trims them all get the same candidates, so each one's
+		// duplicate must not retry every counter the ones before it took
+		let prefix = "a".repeat(MAX_BYTES - 4);
+		let names: Vec<String> = (0..2000).map(|i| format!("{prefix}{i:04}")).collect();
+		let mut taken = TakenNames::default();
+		let mut built = 0;
+		for name in &names {
+			taken
+				.allocate_counting(source_name(name), NameShape::Dir, &mut built)
+				.unwrap();
+		}
+		assert_eq!(built, 0, "every name is free the first time");
+		let mut last = String::new();
+		for name in &names {
+			last = taken
+				.allocate_counting(source_name(name), NameShape::Dir, &mut built)
+				.unwrap()
+				.into();
+		}
+		assert!(last.ends_with(" (2000)"), "{last}");
+		// a candidate for each counter length on the way to the free one (1 to 4 digits)
+		assert!(built <= 5 * names.len() as u64, "{} candidates", built);
+	}
+
+	#[test]
+	fn duplicates_of_a_numbered_name_are_allocated_in_linear_time() {
+		// a name that already ends in ` (n)` starts its walk partway through a counter length;
+		// its duplicates, and names numbered inside the run they took, must not retry it
+		for (name, shape) in [
+			("a (123456)", NameShape::Dir),
+			("a (100000).txt", NameShape::File),
+		] {
+			let mut taken = TakenNames::default();
+			let mut built = 0;
+			let mut last = String::new();
+			for _ in 0..2001 {
+				last = taken
+					.allocate_counting(source_name(name), shape, &mut built)
+					.unwrap()
+					.into();
+			}
+			// the first duplicate builds one candidate, each later one two: where its walk
+			// starts, and past the run there
+			assert!(built <= 2 * 2000, "{name}: {} candidates, {last}", built);
+			let (stem, ext) = split_extension(name, shape);
+			let (base, n) = strip_counter(stem).unwrap();
+			assert_eq!(last, format!("{base} ({}){ext}", n + 2000));
+			for i in 1..=2000 {
+				let inside = format!("{base} ({}){ext}", n + i);
+				taken
+					.allocate_counting(source_name(&inside), shape, &mut built)
+					.unwrap();
+			}
+			assert!(built <= 4 * 2000, "{name}: {} candidates", built);
+		}
+		// the runs never cover a free counter, even one inside a run taken out of order
+		let mut names = TakenNames::new(["a (5)", "a (7)"]);
+		let taken: Vec<String> = ["a (5)", "a (7)", "a (5)", "a (5)"]
+			.into_iter()
+			.map(|name| {
+				names
+					.allocate(source_name(name), NameShape::Dir)
+					.unwrap()
+					.into()
+			})
+			.collect();
+		assert_eq!(taken, ["a (6)", "a (8)", "a (9)", "a (10)"]);
 	}
 
 	#[test]

@@ -9,6 +9,7 @@ use std::{
 	time::Duration,
 };
 
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use tokio::{
 	sync::{Semaphore, mpsc},
 	task::JoinHandle,
@@ -2281,4 +2282,79 @@ async fn a_pause_while_removing_holds_no_lock_and_removes_nothing() {
 		"the paused job asked for no lock while they were held back"
 	);
 	setup.backend.assert_released(&job.reporter);
+}
+
+/// [`enclosing`] as a scan of every pair of targets, the definition it has to agree with.
+fn enclosing_by_scanning(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
+	targets
+		.iter()
+		.enumerate()
+		.map(|(index, target)| {
+			targets.iter().enumerate().position(|(other, outer)| {
+				other != index
+					&& (other < index && outer.uuid() == target.uuid()
+						|| match (target, outer) {
+							(DisposalTarget::File(file), DisposalTarget::Dir(outer)) => {
+								outer.read.files.contains_key(&file.uuid)
+							}
+							(
+								DisposalTarget::Dir(ExpectedDir { uuid, .. })
+								| DisposalTarget::Unavailable { uuid },
+								DisposalTarget::Dir(outer),
+							) => {
+								outer.read.dirs.contains(uuid)
+									|| outer.read.files.contains_key(uuid)
+							}
+							_ => false,
+						})
+			})
+		})
+		.collect()
+}
+
+#[test]
+fn sources_go_with_the_first_one_holding_them() {
+	let mut rng = StdRng::seed_from_u64(0x656e_636c_6f73_696e);
+	// few uuids, so sources repeat and hold each other, in loops too
+	let pool: Vec<Uuid> = (0..6).map(|i| Uuid::from_u128(0xE0 + i)).collect();
+	for _ in 0..2000 {
+		let targets: Vec<DisposalTarget> = (0..rng.random_range(0..7))
+			.map(|_| {
+				let uuid = pool[rng.random_range(0..pool.len())];
+				match rng.random_range(0..3) {
+					0 => DisposalTarget::File(ExpectedFile {
+						uuid,
+						size: 1,
+						chunks: 1,
+						parent: PLACED_PARENT,
+					}),
+					1 => DisposalTarget::Unavailable { uuid },
+					_ => {
+						let mut read = Tree::default();
+						for &item in &pool {
+							match rng.random_range(0..4) {
+								0 => {
+									read.files.insert(item, 1);
+								}
+								1 => {
+									read.dirs.insert(item);
+								}
+								_ => {}
+							}
+						}
+						DisposalTarget::Dir(ExpectedDir {
+							uuid,
+							parent: PLACED_PARENT,
+							read,
+						})
+					}
+				}
+			})
+			.collect();
+		assert_eq!(
+			enclosing(&targets),
+			enclosing_by_scanning(&targets),
+			"{targets:?}"
+		);
+	}
 }

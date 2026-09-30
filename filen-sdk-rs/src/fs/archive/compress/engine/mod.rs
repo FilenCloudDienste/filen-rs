@@ -12,7 +12,7 @@
 //! (see [`read_back`](super::read_back)).
 
 use std::{
-	collections::{BTreeSet, VecDeque},
+	collections::{BTreeSet, HashMap, VecDeque},
 	io,
 	sync::Arc,
 };
@@ -811,6 +811,11 @@ impl<B: DisposalBackend> Driver<B> {
 			.map(|target| matches!(target, DisposalTarget::File(_)))
 			.collect();
 		let mut dispositions: Vec<Option<SourceDisposition>> = vec![None; targets.len()];
+		// the sources each outermost one goes with, itself included
+		let mut going = vec![Vec::new(); targets.len()];
+		for (source, &outer) in outermost.iter().enumerate() {
+			going[outer].push(source);
+		}
 		for (request, target) in targets.into_iter().enumerate() {
 			if outermost[request] != request {
 				continue;
@@ -835,9 +840,7 @@ impl<B: DisposalBackend> Driver<B> {
 				}
 			};
 			// the source and those that go with it are told of as soon as its outcome is final
-			let told: Vec<usize> = (0..uuids.len())
-				.filter(|&nested| outermost[nested] == request)
-				.collect();
+			let told = std::mem::take(&mut going[request]);
 			for &nested in &told {
 				let outcome = if nested == request {
 					outcome.clone()
@@ -1048,30 +1051,46 @@ async fn dispose_target<B: DisposalBackend>(
 
 /// For each of `targets`, the one it goes with, if any: a source inside another (a file and its
 /// folder both given) goes with that one, whose removal removes it, and its own attempt would only
-/// find it gone.
+/// find it gone. The first such one, when several are: the same item given twice goes with its
+/// first. Linear in the targets and what the folders among them read, however many are given.
 fn enclosing(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
-	targets
+	// where each item is given, first to last
+	let mut given: HashMap<Uuid, Vec<usize>> = HashMap::new();
+	for (index, target) in targets.iter().enumerate() {
+		given.entry(target.uuid()).or_default().push(index);
+	}
+	let mut outer: Vec<Option<usize>> = targets
 		.iter()
 		.enumerate()
 		.map(|(index, target)| {
-			targets.iter().enumerate().position(|(other, outer)| {
-				other != index
-					// the same item given twice goes with its first
-					&& (other < index && outer.uuid() == target.uuid()
-						|| match (target, outer) {
-						(DisposalTarget::File(file), DisposalTarget::Dir(outer)) => {
-							outer.read.files.contains_key(&file.uuid)
-						}
-						(
-							DisposalTarget::Dir(ExpectedDir { uuid, .. })
-							| DisposalTarget::Unavailable { uuid },
-							DisposalTarget::Dir(outer),
-						) => outer.read.dirs.contains(uuid) || outer.read.files.contains_key(uuid),
-						_ => false,
-					})
-			})
+			given[&target.uuid()]
+				.first()
+				.filter(|&&first| first < index)
+				.copied()
 		})
-		.collect()
+		.collect();
+	for (holder, target) in targets.iter().enumerate() {
+		let DisposalTarget::Dir(dir) = target else {
+			continue;
+		};
+		let read = dir
+			.read
+			.files
+			.keys()
+			.map(|uuid| (uuid, true))
+			.chain(dir.read.dirs.iter().map(|uuid| (uuid, false)));
+		for (uuid, is_file) in read {
+			for &inner in given.get(uuid).into_iter().flatten() {
+				// a file source is only ever among a folder's files
+				let held = inner != holder
+					&& (is_file || !matches!(targets[inner], DisposalTarget::File(_)));
+				if held && outer[inner].is_none_or(|first| holder < first) {
+					outer[inner] = Some(holder);
+				}
+			}
+		}
+	}
+	outer
 }
 
 /// What became of a source that goes with another, whose removal ended in `outcome`: removed with
