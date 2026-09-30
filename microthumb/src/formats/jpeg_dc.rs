@@ -785,7 +785,13 @@ impl<'a, 'b> Walk<'a, 'b> {
 							mcu_y * u32::from(comp.info.v) + b / u32::from(comp.info.h),
 						)
 					} else {
-						((comp.seq % units_x) as u32, (comp.seq / units_x) as u32)
+						// seq keeps counting across repeated scans of one component, so a
+						// hostile file can push the row past u32::MAX: saturating leaves
+						// the block off the grid instead of wrapping it onto an earlier row.
+						(
+							(comp.seq % units_x) as u32,
+							u32::try_from(comp.seq / units_x).unwrap_or(u32::MAX),
+						)
 					};
 					if bx < comp.plane_w && by < comp.plane_h {
 						comp.plane[(by * comp.plane_w + bx) as usize] = value;
