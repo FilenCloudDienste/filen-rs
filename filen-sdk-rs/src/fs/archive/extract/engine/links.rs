@@ -1,9 +1,13 @@
 //! A tar's hard links: each is extracted as a copy of the file it names, fetched back from the
 //! drive once that file is registered.
 
-use std::sync::Arc;
+use std::{
+	collections::{HashMap, VecDeque},
+	sync::Arc,
+};
 
 use filen_types::fs::Uuid;
+use futures::stream::FuturesUnordered;
 
 use crate::{
 	Error, ErrorKind,
@@ -12,6 +16,10 @@ use crate::{
 		archive::{
 			dispose::DisposalBackend,
 			entry_path::ArchivePath,
+			extract::{
+				codec::LinkKeys,
+				report::{ExtractStage, entry_index},
+			},
 			input::{take_memory, whole_chunk},
 			worker::{LinkHead, SkippedMember},
 		},
@@ -19,15 +27,12 @@ use crate::{
 		drive_job::CHUNKS_PER_FILE,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
-	util::SeededMap,
+	util::{MaybeSendBoxFuture, SeededMap},
 };
 
 use super::{
-	super::{
-		codec::LinkKeys,
-		report::{ExtractStage, entry_index},
-	},
-	Driver, FilePhase, FileSource, LinkChunk, LinkPhase, MAX_OPEN_FILES, NewFile, SlotSource,
+	Driver, FilePhase, FileSource, LinkChunk, LinkPhase, LinkSource, MAX_OPEN_FILES, NewFile,
+	SlotSource,
 };
 
 /// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
@@ -35,7 +40,7 @@ use super::{
 /// link after it may name, so each costs 16 bytes in the map (and its share of the map's spare
 /// room), and 24 more once registered: what an open one is, its slot in the open files tells.
 #[derive(Default)]
-pub(super) struct LinkTargets {
+struct LinkTargets {
 	/// The job's key for the paths.
 	keys: LinkKeys,
 	by_key: SeededMap<u64, LinkTarget>,
@@ -95,8 +100,30 @@ impl LinkTargets {
 	}
 }
 
+/// A tar's hard links as the job works them off: the files they may name, the links waiting for
+/// theirs, those ready to open, and the copies in flight.
+#[derive(Default)]
+pub(super) struct Links {
+	/// The files a tar's hard links may name: kept for a tar only, whose links name files by
+	/// path.
+	targets: LinkTargets,
+	/// Hard links waiting for the file they name to be registered, by that file's ordinal, and
+	/// how many there are.
+	waiting: HashMap<u64, Vec<PendingLink>>,
+	pub(super) waiting_count: usize,
+	/// Hard links whose file is registered, opened only as fast as the files open before them
+	/// are worked off: a thousand links to one file do not all start at once.
+	pub(super) ready: VecDeque<(TakenLink, Uuid)>,
+	/// What the hard links taken on copy in all, charged against the job's expansion limit.
+	bytes: u64,
+	/// The files hard links copy, being fetched by uuid.
+	pub(super) sources: FuturesUnordered<MaybeSendBoxFuture<'static, LinkSource>>,
+	/// Chunks of those files, being fetched for a copy.
+	pub(super) chunks: FuturesUnordered<MaybeSendBoxFuture<'static, LinkChunk>>,
+}
+
 /// A hard link waiting for the file it names to be registered.
-pub(super) struct PendingLink {
+struct PendingLink {
 	link: TakenLink,
 	/// What it is reported as if that file never is.
 	unresolved: SkippedMember,
@@ -112,14 +139,16 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Drops the hard links taken on and not opened yet, which a stopping job never starts: they
 	/// are not attempted.
 	pub(super) fn drop_taken_links(&mut self) {
-		let links = self.links_waiting + self.ready_links.len();
+		let links = self.links.waiting_count + self.links.ready.len();
 		let bytes = self
-			.waiting_links
+			.links
+			.waiting
 			.values()
 			.flatten()
 			.map(|waiting| waiting.link.file.size.unwrap_or(0))
 			.chain(
-				self.ready_links
+				self.links
+					.ready
 					.iter()
 					.map(|(link, _)| link.file.size.unwrap_or(0)),
 			)
@@ -128,21 +157,21 @@ impl<B: DisposalBackend> Driver<B> {
 		if links > 0 {
 			self.reporter.files_not_attempted(links as u64, bytes);
 		}
-		self.waiting_links.clear();
-		self.links_waiting = 0;
-		self.ready_links.clear();
+		self.links.waiting.clear();
+		self.links.waiting_count = 0;
+		self.links.ready.clear();
 	}
 
 	/// What the hard links that name `path` find the file there by.
 	pub(super) fn link_key(&self, path: &ArchivePath) -> u64 {
-		self.link_targets.keys.of(path)
+		self.links.targets.keys.of(path)
 	}
 
 	/// Notes open file `ordinal`, found by `key`, as the one the hard links after it that name
 	/// its path copy: a later file of the same path is the one links after it name.
 	pub(super) fn link_target(&mut self, ordinal: u64, key: u64) {
 		if self.files.contains_key(&ordinal) {
-			self.link_targets.open(key, ordinal);
+			self.links.targets.open(key, ordinal);
 		}
 	}
 
@@ -166,7 +195,7 @@ impl<B: DisposalBackend> Driver<B> {
 			target,
 			unresolved,
 		} = link;
-		let (target, size) = match self.link_targets.get(self.link_targets.keys.of(&target)) {
+		let (target, size) = match self.links.targets.get(self.links.targets.keys.of(&target)) {
 			Some(named @ Named::Registered { size, .. }) => (named, size),
 			Some(named @ Named::Open(ordinal)) => match self.pending_size(ordinal) {
 				Some(size) => (named, size),
@@ -175,8 +204,10 @@ impl<B: DisposalBackend> Driver<B> {
 			None => return self.on_skipped(unresolved),
 		};
 		if let Some(limit) = self.expansion
-			&& !limit.allows(self.feed.bytes_read(), self.link_bytes.saturating_add(size))
-		{
+			&& !limit.allows(
+				self.feed.bytes_read(),
+				self.links.bytes.saturating_add(size),
+			) {
 			return self.stop_with(Error::custom(
 				ErrorKind::ArchiveTooLarge,
 				format!(
@@ -185,7 +216,7 @@ impl<B: DisposalBackend> Driver<B> {
 				),
 			));
 		}
-		self.link_bytes += size;
+		self.links.bytes = self.links.bytes.saturating_add(size);
 		let entry = self.entry_id(ordinal);
 		self.report_path(entry, &path);
 		let Some(mut file) = self.new_file(ordinal, &path, Some(size), modified) else {
@@ -193,14 +224,15 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		// a link may be named by the links after it, as the file it copies is
 		let key = self.link_key(&path);
-		self.link_targets.open(key, ordinal);
+		self.links.targets.open(key, ordinal);
 		file.link_key = Some(key);
 		let link = TakenLink { file };
 		match target {
-			Named::Registered { uuid, .. } => self.ready_links.push_back((link, uuid)),
+			Named::Registered { uuid, .. } => self.links.ready.push_back((link, uuid)),
 			Named::Open(target_ordinal) => {
-				self.links_waiting += 1;
-				self.waiting_links
+				self.links.waiting_count += 1;
+				self.links
+					.waiting
 					.entry(target_ordinal)
 					.or_default()
 					.push(PendingLink { link, unresolved });
@@ -214,11 +246,12 @@ impl<B: DisposalBackend> Driver<B> {
 		if let Some(file) = self.files.get(&ordinal) {
 			return (!file.failed()).then(|| file.bytes());
 		}
-		self.waiting_links
+		self.links
+			.waiting
 			.values()
 			.flatten()
 			.map(|waiting| &waiting.link)
-			.chain(self.ready_links.iter().map(|(link, _)| link))
+			.chain(self.links.ready.iter().map(|(link, _)| link))
 			.find(|link| link.file.ordinal == ordinal)
 			.map(|link| link.file.size.unwrap_or(0))
 	}
@@ -227,8 +260,8 @@ impl<B: DisposalBackend> Driver<B> {
 	/// fetches of their targets are as many at once as other small requests.
 	pub(super) fn open_ready_links(&mut self) {
 		while self.files.len() < MAX_OPEN_FILES
-			&& self.link_sources.len() < MAX_SMALL_PARALLEL_REQUESTS
-			&& let Some((TakenLink { file }, target)) = self.ready_links.pop_front()
+			&& self.links.sources.len() < MAX_SMALL_PARALLEL_REQUESTS
+			&& let Some((TakenLink { file }, target)) = self.links.ready.pop_front()
 		{
 			self.open_file(NewFile {
 				source: FileSource::Link { target },
@@ -247,11 +280,11 @@ impl<B: DisposalBackend> Driver<B> {
 		size: u64,
 	) {
 		if let Some(key) = key {
-			self.link_targets.registered(key, ordinal, uuid, size);
+			self.links.targets.registered(key, ordinal, uuid, size);
 		}
-		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
-		self.links_waiting -= waiting.len();
-		self.ready_links.extend(
+		let waiting = self.links.waiting.remove(&ordinal).unwrap_or_default();
+		self.links.waiting_count -= waiting.len();
+		self.links.ready.extend(
 			waiting
 				.into_iter()
 				.map(|PendingLink { link, .. }| (link, uuid)),
@@ -261,11 +294,11 @@ impl<B: DisposalBackend> Driver<B> {
 	/// File `ordinal` failed: the hard links waiting for it have nothing to copy, and are
 	/// skipped, no item after all.
 	pub(super) fn link_target_failed(&mut self, ordinal: u64) {
-		let waiting = self.waiting_links.remove(&ordinal).unwrap_or_default();
-		self.links_waiting -= waiting.len();
+		let waiting = self.links.waiting.remove(&ordinal).unwrap_or_default();
+		self.links.waiting_count -= waiting.len();
 		for PendingLink { link, unresolved } in waiting {
 			self.items -= 1;
-			self.link_bytes -= link.file.size.unwrap_or(0);
+			self.links.bytes -= link.file.size.unwrap_or(0);
 			// the links waiting for this one fail with it
 			self.link_target_failed(link.file.ordinal);
 			self.on_skipped(unresolved);
@@ -282,7 +315,7 @@ impl<B: DisposalBackend> Driver<B> {
 				SlotSource::Link(LinkPhase::Idle(source))
 					if file.phase == FilePhase::Receiving
 						&& file.uploading < CHUNKS_PER_FILE
-						&& self.dirs[file.parent].created_uuid().is_some() =>
+						&& self.dirs.slots[file.parent].created_uuid().is_some() =>
 				{
 					Some((*ordinal, Arc::clone(source)))
 				}
@@ -298,7 +331,7 @@ impl<B: DisposalBackend> Driver<B> {
 			let index = file.next_index;
 			let backend = Arc::clone(&self.backend);
 			let op = self.reporter.op();
-			self.link_chunks.push(Box::pin(async move {
+			self.links.chunks.push(Box::pin(async move {
 				let result = backend
 					.fetch_chunk(&source, index)
 					.await

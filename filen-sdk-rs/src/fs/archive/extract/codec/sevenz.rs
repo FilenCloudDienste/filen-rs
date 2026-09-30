@@ -6,6 +6,11 @@ use crate::{
 	Error, ErrorKind,
 	fs::archive::{
 		error::read_failure,
+		extract::{
+			ExtractSkipReason,
+			list::{ArchiveEntryKind, PasswordCheck},
+			storage_exceeded,
+		},
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		sevenz::{
@@ -20,11 +25,6 @@ use crate::{
 };
 
 use super::{
-	super::{
-		ExtractSkipReason,
-		list::{ArchiveEntryKind, PasswordCheck},
-		storage_exceeded,
-	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,

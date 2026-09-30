@@ -6,8 +6,8 @@
 //!
 //! # Memory and progress
 //!
-//! A job holds a floor of two chunks of the archive memory ([`ArchiveConfig`]) for as long as it
-//! runs: one for the chunk of the archive the codec is reading, one for a chunk of output
+//! A job has a floor of two chunks for as long as it runs, taken outside the client's file-IO
+//! budget: one for the chunk of the archive the codec is reading, one for a chunk of output
 //! uploading. More (prefetched input, more uploads at once) is only taken when the client's
 //! file-IO budget has it free right now, never waited for, so a job always makes progress on its
 //! floor, and never waits on memory a transfer or another job holds. What the codec itself holds
@@ -17,9 +17,9 @@
 //! # Pause and cancel
 //!
 //! Pausing stops everything new: no chunk fetched or uploaded, no directory created, no event
-//! taken from the codec, which parks. In-flight work finishes; then the job gives back its floor
-//! and prefetched chunks and reports itself paused, holding no drive lock and no memory
-//! reservation. The codec keeps its own state resident while paused, and so the job keeps its
+//! taken from the codec, which parks. In-flight work finishes; then the job gives back its
+//! prefetched chunks and reports itself paused, holding no drive lock and none of the client's
+//! memory budget. The codec keeps its own state resident while paused, and so the job keeps its
 //! slot; a job paused before it got one waits without taking it.
 //!
 //! Cancelling drops the transfers in flight at once (a file only becomes visible when it is
@@ -31,10 +31,7 @@ mod files;
 mod finish;
 mod links;
 
-use std::{
-	collections::{BTreeMap, HashMap, VecDeque},
-	sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::Uuid;
@@ -64,12 +61,7 @@ use crate::{
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
-		drive_job::{
-			Fatal,
-			backend::DriveBackend,
-			dir::{CreatedDirOutcome, DirError},
-			finalize::UnlessPaused,
-		},
+		drive_job::{Fatal, backend::DriveBackend, exceeds_limit, finalize::UnlessPaused},
 		file::{enums::RemoteFileType, traits::HasFileInfo, write::RemoteFileInfo},
 		name::ValidatedName,
 	},
@@ -90,9 +82,8 @@ use super::{
 	},
 };
 
-use crate::fs::drive_job::exceeds_limit;
-use dirs::{DirSlot, DirState, Opened};
-use links::{LinkTargets, PendingLink, TakenLink};
+use dirs::{DirState, Dirs, Opened};
+use links::Links;
 
 /// Directories planned and not created yet past which the codec is kept waiting: an archive
 /// naming directories faster than they are created (each entry can imply 256) has them planned
@@ -122,7 +113,7 @@ pub(crate) struct ExtractTask<B> {
 	/// (the codec strips it from their paths); empty otherwise.
 	pub(crate) base: Vec<ValidatedName>,
 	pub(crate) config: ArchiveConfig,
-	/// Starts the codec; called once the job holds its lease and memory floor.
+	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
 	/// Whether the caller asked for the archive to be removed: every way the job ends then
 	/// reports what became of it.
@@ -268,7 +259,7 @@ struct Driver<B: DriveBackend> {
 	max_items: Option<u64>,
 	config: ArchiveConfig,
 	feed: CodecFeed<B, ArchiveEnd>,
-	/// The floor's output chunk; its input chunk is the input's.
+	/// The floor's output chunk; its input chunk is the feed's.
 	output_slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
 	memory: Arc<Semaphore>,
@@ -282,32 +273,15 @@ struct Driver<B: DriveBackend> {
 	into_destination: bool,
 	/// The destination listing could not name every item.
 	unverified: bool,
-	dirs: Vec<DirSlot>,
-	/// Directories planned and neither created nor failed.
-	uncreated_dirs: usize,
-	ready_dirs: VecDeque<DirId>,
-	dir_creates:
-		FuturesUnordered<MaybeSendBoxFuture<'static, (DirId, Result<CreatedDirOutcome, DirError>)>>,
+	dirs: Dirs,
 	/// Open file entries by ordinal, so ready ones register in archive order.
 	files: BTreeMap<u64, FileSlot<B::Upload>>,
 	/// The file receiving data.
 	current: Option<u64>,
-	/// The files a tar's hard links may name: kept for a tar only, whose links name files by
-	/// path.
-	link_targets: LinkTargets,
-	/// Hard links waiting for the file they name to be registered, by that file's ordinal, and
-	/// how many there are.
-	waiting_links: HashMap<u64, Vec<PendingLink>>,
-	links_waiting: usize,
-	/// Hard links whose file is registered, opened only as fast as the files open before them
-	/// are worked off: a thousand links to one file do not all start at once.
-	ready_links: VecDeque<(TakenLink, Uuid)>,
-	/// What the hard links taken on copy in all, charged against `expansion`.
-	link_bytes: u64,
+	/// A tar's hard links.
+	links: Links,
 	expansion: Option<ExpansionLimit>,
 	base: Vec<ValidatedName>,
-	link_sources: FuturesUnordered<MaybeSendBoxFuture<'static, LinkSource>>,
-	link_chunks: FuturesUnordered<MaybeSendBoxFuture<'static, LinkChunk>>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, UploadedChunk>>,
 	finalizes: FuturesUnordered<MaybeSendBoxFuture<'static, Registration>>,
 	/// Data of the current file the driver cannot take on yet, and so the last event it took:
@@ -407,20 +381,11 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		opened: None,
 		into_destination: false,
 		unverified: false,
-		dirs: Vec::new(),
-		uncreated_dirs: 0,
-		ready_dirs: VecDeque::new(),
-		dir_creates: FuturesUnordered::new(),
+		dirs: Dirs::default(),
 		files: BTreeMap::new(),
-		link_targets: LinkTargets::default(),
-		waiting_links: HashMap::new(),
-		links_waiting: 0,
-		ready_links: VecDeque::new(),
-		link_bytes: 0,
+		links: Links::default(),
 		expansion,
 		base,
-		link_sources: FuturesUnordered::new(),
-		link_chunks: FuturesUnordered::new(),
 		current: None,
 		uploads: FuturesUnordered::new(),
 		finalizes: FuturesUnordered::new(),
@@ -530,6 +495,7 @@ impl<B: DisposalBackend> Driver<B> {
 			// planned and never started: a job that ends early leaves them
 			let unattempted = self
 				.dirs
+				.slots
 				.iter()
 				.filter(|dir| matches!(dir.state, DirState::Planned))
 				.count();
@@ -592,13 +558,13 @@ impl<B: DisposalBackend> Driver<B> {
 				Some((ordinal, result)) = self.finalizes.next(), if !self.finalizes.is_empty() => {
 					self.finalize_finished(ordinal, result);
 				}
-				Some((dir, result)) = self.dir_creates.next(), if !self.dir_creates.is_empty() => {
+				Some((dir, result)) = self.dirs.creates.next(), if !self.dirs.creates.is_empty() => {
 					self.dir_finished(dir, result);
 				}
-				Some((ordinal, result)) = self.link_sources.next(), if !self.link_sources.is_empty() => {
+				Some((ordinal, result)) = self.links.sources.next(), if !self.links.sources.is_empty() => {
 					self.link_source_fetched(ordinal, result);
 				}
-				Some(chunk) = self.link_chunks.next(), if !self.link_chunks.is_empty() => {
+				Some(chunk) = self.links.chunks.next(), if !self.links.chunks.is_empty() => {
 					self.link_chunk_fetched(chunk);
 				}
 				fed = self.feed.next(take_events, !stopping) => match fed {
@@ -621,44 +587,44 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Whether nothing is left to do: the codec ended and everything it produced is settled, or,
 	/// when stopping, nothing that must finish is still running.
 	fn finished(&self, stopping: bool) -> bool {
-		let settled = self.dir_creates.is_empty() && self.finalizes.is_empty();
+		let settled = self.dirs.creates.is_empty() && self.finalizes.is_empty();
 		if stopping {
 			return settled;
 		}
 		// a directory can be left to start only while a pause is requested, which starts none
 		settled
-			&& self.ready_dirs.is_empty()
+			&& self.dirs.ready.is_empty()
 			&& self.uploads.is_empty()
 			&& self.held.is_none()
 			&& self.files.is_empty()
-			&& self.ready_links.is_empty()
+			&& self.links.ready.is_empty()
 			&& self.codec_done
 	}
 
 	/// Whether the codec waits for what it sent so far to be worked off first: hard links not
 	/// opened yet count as open files.
 	fn backlogged(&self) -> bool {
-		self.uncreated_dirs >= MAX_UNCREATED_DIRS || self.open_files() >= MAX_OPEN_FILES
+		self.dirs.uncreated >= MAX_UNCREATED_DIRS || self.open_files() >= MAX_OPEN_FILES
 	}
 
 	/// Files open, and hard links taken on that will be.
 	fn open_files(&self) -> usize {
-		self.files.len() + self.links_waiting + self.ready_links.len()
+		self.files.len() + self.links.waiting_count + self.links.ready.len()
 	}
 
 	fn idle(&self) -> bool {
 		self.uploads.is_empty()
 			&& !self.feed.fetching()
-			&& self.link_sources.is_empty()
-			&& self.link_chunks.is_empty()
-			&& self.dir_creates.is_empty()
+			&& self.links.sources.is_empty()
+			&& self.links.chunks.is_empty()
+			&& self.dirs.creates.is_empty()
 			&& self.finalizes.is_empty()
 	}
 
-	/// Waits out a pause holding nothing: prefetched chunks and the floor are given back.
+	/// Waits out a pause holding nothing: prefetched chunks are given back.
 	async fn pause(&mut self) -> Result<(), Stopped> {
 		self.feed
-			.wait_out_pause(&self.reporter, &self.control, &self.config)
+			.wait_out_pause(&self.reporter, &self.control)
 			.await
 	}
 
@@ -667,8 +633,8 @@ impl<B: DisposalBackend> Driver<B> {
 		self.reporter.wind_down(&self.control);
 		self.feed.drop_all();
 		self.held = None;
-		self.link_sources = FuturesUnordered::new();
-		self.link_chunks = FuturesUnordered::new();
+		self.links.sources = FuturesUnordered::new();
+		self.links.chunks = FuturesUnordered::new();
 		self.drop_taken_links();
 		if !self.uploads.is_empty() {
 			self.uploads = FuturesUnordered::new();
@@ -695,8 +661,8 @@ impl<B: DisposalBackend> Driver<B> {
 	fn advance(&mut self) {
 		self.feed.advance(&self.reporter.ops());
 		self.report_bytes_read();
-		while self.dir_creates.len() < MAX_SMALL_PARALLEL_REQUESTS
-			&& let Some(dir) = self.ready_dirs.pop_front()
+		while self.dirs.creates.len() < MAX_SMALL_PARALLEL_REQUESTS
+			&& let Some(dir) = self.dirs.ready.pop_front()
 		{
 			self.start_dir(dir);
 		}

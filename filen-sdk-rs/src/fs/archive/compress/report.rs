@@ -216,8 +216,6 @@ pub(crate) struct CompressState {
 	active: Option<CompressActiveFile>,
 	/// Bytes of the archive to read back, once reading it back started.
 	verify_total: u64,
-	/// The job ended: whatever it did not read, it never will.
-	ended: bool,
 }
 
 impl JobState for CompressState {
@@ -237,7 +235,7 @@ impl JobState for CompressState {
 			bytes_done: done,
 			units: Units {
 				done,
-				settled: if self.ended { total } else { done },
+				settled: if self.core.is_finished() { total } else { done },
 				total,
 			},
 		}
@@ -263,7 +261,6 @@ impl JobState for CompressState {
 	}
 
 	fn settle(&mut self) {
-		self.ended = true;
 		self.active = None;
 	}
 }
@@ -305,7 +302,6 @@ impl Reporter {
 				counts: CompressCounts::default(),
 				active: None,
 				verify_total: 0,
-				ended: false,
 			},
 			Box::new(callback),
 		)

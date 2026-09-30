@@ -1,4 +1,4 @@
-//! Pausing and cancelling an extraction: a paused job holds no memory, floor, slot or drive lock,
+//! Pausing and cancelling an extraction: a paused job holds no memory, slot or drive lock,
 //! and changes nothing until resumed; a cancelled one drops its transfers and tells what exists.
 
 use super::*;
@@ -157,7 +157,6 @@ async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
 	assert_eq!(report.counts.files_done, 1);
 	assert_released(&setup_queued, &queued.reporter, &queued.recorder);
 	assert_eq!(config.free_slots(), 1);
-	assert!(config.floor_is_free());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -183,7 +182,7 @@ async fn a_pause_while_a_registration_waits_for_the_lock_holds_nothing() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_paused_holding_nothing(&setup, &job);
 	assert!(finished(&setup).is_empty());
 
 	setup.backend.block_locks_from.send_replace(None);
@@ -233,7 +232,7 @@ async fn a_pause_while_the_archive_opens_holds_nothing() {
 	.await;
 	pause.send_replace(true);
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_paused_holding_nothing(&setup, &job);
 	assert!(created_dirs(&setup).is_empty(), "the folder waits too");
 
 	pause.send_replace(false);
@@ -391,7 +390,7 @@ async fn a_pause_mid_extraction_holds_nothing_and_changes_nothing() {
 	pause.send_replace(true);
 	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_paused_holding_nothing(&setup, &job);
 
 	pause.send_replace(false);
 	job.running.await.unwrap().unwrap();
@@ -512,7 +511,7 @@ async fn a_pause_while_finishing_gives_back_the_input_and_the_lock() {
 	pause.send_replace(true);
 	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_paused_holding_nothing(&setup, &job);
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Finishing);
 	assert_eq!(
 		setup.backend.log().propagated_trees.len(),

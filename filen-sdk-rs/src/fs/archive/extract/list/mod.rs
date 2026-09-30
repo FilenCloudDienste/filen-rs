@@ -14,7 +14,6 @@ use crate::{
 			config::ArchiveConfig,
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
-			password::ArchivePassword,
 			worker::{CodecStart, WorkerEvent, codec_failed, unexpected_event, worker_died},
 		},
 		drive_job::{Fatal, backend::DriveBackend},
@@ -28,7 +27,7 @@ use crate::{
 };
 
 use super::{
-	DuplicateEntries, ExpansionLimit, ExtractConfig, ExtractSkipReason,
+	DuplicateEntries, ExtractSkipReason,
 	codec::ArchiveEnd,
 	engine::CodecResult,
 	report::{ArchiveEntryId, CALLBACK_BATCH, ReadsArchive, RunState},
@@ -187,50 +186,6 @@ impl ListTotals {
 	}
 }
 
-/// How a listing reads an archive, and which extraction's verdicts it shows: those of an
-/// extraction with the same settings.
-#[derive(Debug, Clone)]
-pub struct ListConfig {
-	/// As [`ExtractConfig::expansion_limit`]: a 7z link's target is read only while the
-	/// archive states no more than this allows.
-	pub expansion_limit: Option<ExpansionLimit>,
-	/// As [`ExtractConfig::skip_mac_metadata`]: whether the entries left out as macOS metadata
-	/// are listed skipped.
-	pub skip_mac_metadata: bool,
-	/// As [`ExtractConfig::password`]: checked on the index or an entry when it can be (see
-	/// [`ListReport::password`]).
-	pub password: Option<ArchivePassword>,
-}
-
-impl Default for ListConfig {
-	fn default() -> Self {
-		let ExtractConfig {
-			expansion_limit,
-			skip_mac_metadata,
-			password,
-			..
-		} = ExtractConfig::default();
-		Self {
-			expansion_limit,
-			skip_mac_metadata,
-			password,
-		}
-	}
-}
-
-impl ListConfig {
-	/// The extraction whose verdicts the listing shows: its settings, and neither cap.
-	pub(crate) fn into_extraction(self) -> ExtractConfig {
-		ExtractConfig {
-			max_bytes: None,
-			max_items: None,
-			expansion_limit: self.expansion_limit,
-			skip_mac_metadata: self.skip_mac_metadata,
-			password: self.password,
-		}
-	}
-}
-
 /// Most entries an [`ListReport`] keeps; the callback receives every one.
 pub const MAX_LISTED_ENTRIES: usize = 10_000;
 
@@ -346,8 +301,6 @@ pub(crate) struct ListState {
 	entries: u64,
 	/// Entries not delivered yet: they go out in batches, each before the next update.
 	pending: Vec<ArchiveEntry>,
-	/// The job ended: whatever it did not read, it never will.
-	ended: bool,
 }
 
 impl JobState for ListState {
@@ -364,7 +317,7 @@ impl JobState for ListState {
 			bytes_done: self.bytes_read,
 			units: Units {
 				done: self.bytes_read,
-				settled: if self.ended {
+				settled: if self.core.is_finished() {
 					self.archive_bytes
 				} else {
 					self.bytes_read
@@ -390,9 +343,7 @@ impl JobState for ListState {
 		});
 	}
 
-	fn settle(&mut self) {
-		self.ended = true;
-	}
+	fn settle(&mut self) {}
 }
 
 impl ReadsArchive for ListState {
@@ -413,7 +364,6 @@ impl ListReporter {
 				bytes_read: 0,
 				entries: 0,
 				pending: Vec::new(),
-				ended: false,
 			},
 			Box::new(callback),
 		)
@@ -473,7 +423,7 @@ pub(crate) struct ListTask<B> {
 	pub(crate) reporter: MaybeArc<ListReporter>,
 	pub(crate) archive: RemoteFileType<'static>,
 	pub(crate) config: ArchiveConfig,
-	/// Starts the codec; called once the job holds its lease and memory floor.
+	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
 }
 
@@ -525,7 +475,6 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 		kept_bytes: 0,
 		control,
 		reporter,
-		config,
 		end: None,
 		fatal: Fatal::default(),
 	};
@@ -560,7 +509,6 @@ struct Lister<B> {
 	kept_bytes: usize,
 	control: JobControl,
 	reporter: MaybeArc<ListReporter>,
-	config: ArchiveConfig,
 	/// How the archive ended, once the codec returned it.
 	end: Option<ArchiveEnd>,
 	fatal: Fatal,
@@ -585,7 +533,7 @@ impl<B: DriveBackend> Lister<B> {
 			if pause_requested {
 				if !self.feed.fetching() {
 					self.feed
-						.wait_out_pause(&self.reporter, &self.control, &self.config)
+						.wait_out_pause(&self.reporter, &self.control)
 						.await?;
 					continue;
 				}

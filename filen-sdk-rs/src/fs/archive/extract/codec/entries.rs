@@ -17,18 +17,17 @@ use crate::{
 			bytes::read_full,
 			entry_path::{ArchivePath, PathRejection, entry_path},
 			error::read_failure,
+			extract::{
+				ExtractSkipReason,
+				list::{ArchiveEntry, ArchiveEntryKind, ListedPath},
+				report::ArchiveEntryId,
+			},
 			limits::display_path,
 			worker::{EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerPort},
 		},
 		name::{ValidatedName, keep_both::collision_key},
 	},
 	util::SeededSet,
-};
-
-use super::super::{
-	ExtractSkipReason,
-	list::{ArchiveEntry, ArchiveEntryKind, ListedPath},
-	report::ArchiveEntryId,
 };
 
 /// What the codec does with the entries it reads.

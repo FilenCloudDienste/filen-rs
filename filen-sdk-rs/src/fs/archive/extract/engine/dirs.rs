@@ -1,10 +1,11 @@
 //! The directories of an extraction: the folder its entries land in, and the ones their paths
 //! imply, planned as the entries name them and created parent first.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use filen_types::{api::v3::dir::color::DirColor, fs::Uuid};
+use futures::stream::FuturesUnordered;
 
 use crate::{
 	Error, ErrorKind,
@@ -13,30 +14,32 @@ use crate::{
 		archive::{
 			dispose::{DisposalBackend, dir_digest},
 			entry_path::joined,
+			extract::{
+				ExtractRoot,
+				report::{
+					ArchiveEntryId, ExtractFailure, ExtractPhase, ExtractRenameReason,
+					ExtractRetry, ExtractStage, ExtractTopLevelKey,
+				},
+			},
 			format::{ArchiveFormat, extract_folder_name},
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 		},
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
-		drive_job::dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
+		drive_job::{
+			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
+			exceeds_limit,
+		},
 		name::{
 			ValidatedName,
 			keep_both::{NameShape, TakenNames},
 		},
 	},
 	job::Stopped,
+	util::MaybeSendBoxFuture,
 };
 
-use super::{
-	super::{
-		ExtractRoot,
-		report::{
-			ArchiveEntryId, ExtractFailure, ExtractPhase, ExtractRenameReason, ExtractRetry,
-			ExtractStage, ExtractTopLevelKey,
-		},
-	},
-	Driver, record,
-};
+use super::{Driver, record};
 
 pub(super) enum DirState {
 	Planned,
@@ -67,6 +70,18 @@ impl<B: DisposalBackend> Driver<B> {
 			.as_mut()
 			.expect("entries follow the archive's layout")
 	}
+}
+
+/// The directories the job plans, by [`DirId`], and the creates it works them off with.
+#[derive(Default)]
+pub(super) struct Dirs {
+	pub(super) slots: Vec<DirSlot>,
+	/// Directories planned and neither created nor failed.
+	pub(super) uncreated: usize,
+	/// Planned directories whose parent is created, waiting for a create to start.
+	pub(super) ready: VecDeque<DirId>,
+	pub(super) creates:
+		FuturesUnordered<MaybeSendBoxFuture<'static, (DirId, Result<CreatedDirOutcome, DirError>)>>,
 }
 
 /// A directory of the extraction; [`ROOT`] is the one entries land in.
@@ -182,7 +197,7 @@ impl<B: DisposalBackend> Driver<B> {
 				(DirType::Dir(Cow::Owned(folder)), resolver)
 			}
 		};
-		self.dirs.push(DirSlot {
+		self.dirs.slots.push(DirSlot {
 			uuid: root.uuid(),
 			state: DirState::Created(root.uuid()),
 			place: DirPlace::Root(Box::new(root)),
@@ -280,7 +295,7 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			// every planned directory is kept for the whole job, and one entry can imply 256:
 			// they are capped like members, before they cost more
-			if self.dirs.len() as u64 > self.config.max_members {
+			if exceeds_limit(self.dirs.slots.len() as u64, self.config.max_members) {
 				self.stop_with(Error::custom(
 					ErrorKind::ArchiveTooLarge,
 					format!(
@@ -290,21 +305,29 @@ impl<B: DisposalBackend> Driver<B> {
 				));
 				return None;
 			}
-			debug_assert_eq!(id, self.dirs.len());
-			let state = match &self.dirs[parent].state {
+			// the resolver numbers directories in the order it plans them, parents first
+			let next = self.dirs.slots.len();
+			let Some(parent_slot) = self.dirs.slots.get_mut(parent).filter(|_| id == next) else {
+				self.stop_with(Error::custom(
+					ErrorKind::Internal,
+					"a directory was planned out of order",
+				));
+				return None;
+			};
+			parent_slot.children.push(id);
+			let state = match &parent_slot.state {
 				DirState::Failed(error) => DirState::Failed(Arc::clone(error)),
 				DirState::Created(_) => {
-					self.ready_dirs.push_back(id);
+					self.dirs.ready.push_back(id);
 					DirState::Planned
 				}
 				DirState::Planned | DirState::Creating => DirState::Planned,
 			};
 			match state {
 				DirState::Failed(_) => self.reporter.dir_failed(None),
-				_ => self.uncreated_dirs += 1,
+				_ => self.dirs.uncreated += 1,
 			}
-			self.dirs[parent].children.push(id);
-			self.dirs.push(DirSlot {
+			self.dirs.slots.push(DirSlot {
 				uuid: Uuid::new_v4(),
 				place: DirPlace::Named(NamedDir {
 					parent,
@@ -327,9 +350,9 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	pub(super) fn start_dir(&mut self, dir: DirId) {
-		let slot = &self.dirs[dir];
+		let slot = &self.dirs.slots[dir];
 		let named = slot.named();
-		let parent = self.dirs[named.parent]
+		let parent = self.dirs.slots[named.parent]
 			.created_uuid()
 			.expect("a directory is only created once its parent exists");
 		let top_level = named.parent == ROOT && self.into_destination;
@@ -347,15 +370,16 @@ impl<B: DisposalBackend> Driver<B> {
 			verify_name: top_level && self.unverified,
 			subject: "item",
 		};
-		self.dirs[dir].state = DirState::Creating;
-		self.dir_creates
+		self.dirs.slots[dir].state = DirState::Creating;
+		self.dirs
+			.creates
 			.push(Box::pin(async move { (dir, create_dir(task).await) }));
 	}
 
 	pub(super) fn dir_finished(&mut self, dir: DirId, result: Result<CreatedDirOutcome, DirError>) {
-		let named = self.dirs[dir].named();
+		let named = self.dirs.slots[dir].named();
 		let (parent_dir, entry) = (named.parent, named.entry);
-		let parent = self.dirs[parent_dir].uuid;
+		let parent = self.dirs.slots[parent_dir].uuid;
 		match result {
 			Ok(CreatedDirOutcome {
 				dir: created,
@@ -366,23 +390,24 @@ impl<B: DisposalBackend> Driver<B> {
 				self.report_propagation(created.uuid(), propagation_errors);
 				// one record, with the name it got in the end (a keep-both name the resolver
 				// picked, then possibly another the destination turned out to need)
-				if name != *self.dirs[dir].named().archive_name() {
+				if name != *self.dirs.slots[dir].named().archive_name() {
 					let path = self.archive_path(dir);
 					self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
 				}
 				self.reporter
 					.dir_created(created.uuid(), parent, name.as_ref());
 				// the name a retry into it finds it under; the archive's stays where it was
-				let named = self.dirs[dir].named_mut();
+				let named = self.dirs.slots[dir].named_mut();
 				if name != named.name {
 					let planned = std::mem::replace(&mut named.name, name);
 					named.archive_name.get_or_insert(planned);
 				}
 				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
-				self.dirs[dir].state = DirState::Created(created.uuid());
-				self.uncreated_dirs -= 1;
-				self.ready_dirs
-					.extend(self.dirs[dir].children.iter().copied());
+				self.dirs.slots[dir].state = DirState::Created(created.uuid());
+				self.dirs.uncreated -= 1;
+				self.dirs
+					.ready
+					.extend(self.dirs.slots[dir].children.iter().copied());
 				if parent_dir == ROOT && self.into_destination {
 					self.top_level_created(
 						ExtractTopLevelKey::Entry { id: entry },
@@ -393,8 +418,8 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			// tried again once the pause is over
 			Err(DirError::NotStarted) => {
-				self.dirs[dir].state = DirState::Planned;
-				self.ready_dirs.push_front(dir);
+				self.dirs.slots[dir].state = DirState::Planned;
+				self.dirs.ready.push_front(dir);
 			}
 			Err(DirError::Failed(error)) => {
 				let error = Arc::new(error);
@@ -403,7 +428,7 @@ impl<B: DisposalBackend> Driver<B> {
 					entry,
 					path: self.archive_path(dir),
 					dest_parent: parent,
-					dest_name: self.dirs[dir].named().name.as_ref().to_owned(),
+					dest_name: self.dirs.slots[dir].named().name.as_ref().to_owned(),
 					stage: ExtractStage::CreateDirectory,
 					retry: Some(self.retry(parent_dir)),
 					error: Arc::clone(&error),
@@ -425,19 +450,23 @@ impl<B: DisposalBackend> Driver<B> {
 			if dir != root {
 				self.reporter.dir_failed(None);
 			}
-			if matches!(self.dirs[dir].state, DirState::Planned | DirState::Creating) {
-				self.uncreated_dirs -= 1;
+			if matches!(
+				self.dirs.slots[dir].state,
+				DirState::Planned | DirState::Creating
+			) {
+				self.dirs.uncreated -= 1;
 			}
-			self.dirs[dir].state = DirState::Failed(Arc::clone(error));
-			stack.extend(self.dirs[dir].children.iter().copied());
+			self.dirs.slots[dir].state = DirState::Failed(Arc::clone(error));
+			stack.extend(self.dirs.slots[dir].children.iter().copied());
 		}
-		self.ready_dirs
-			.retain(|dir| !matches!(self.dirs[*dir].state, DirState::Failed(_)));
+		self.dirs
+			.ready
+			.retain(|dir| !matches!(self.dirs.slots[*dir].state, DirState::Failed(_)));
 		let waiting: Vec<u64> = self
 			.files
 			.iter()
 			.filter(|(_, file)| {
-				!file.failed() && matches!(self.dirs[file.parent].state, DirState::Failed(_))
+				!file.failed() && matches!(self.dirs.slots[file.parent].state, DirState::Failed(_))
 			})
 			.map(|(ordinal, _)| *ordinal)
 			.collect();
@@ -455,7 +484,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// it.
 	fn archive_names(&self, mut dir: DirId) -> Vec<ValidatedName> {
 		let mut names = Vec::new();
-		while let DirPlace::Named(named) = &self.dirs[dir].place {
+		while let DirPlace::Named(named) = &self.dirs.slots[dir].place {
 			names.push(named.archive_name().clone());
 			dir = named.parent;
 		}
@@ -468,8 +497,8 @@ impl<B: DisposalBackend> Driver<B> {
 	/// `dir` itself unless it failed too. The root always is.
 	pub(super) fn retry(&self, mut dir: DirId) -> ExtractRetry {
 		// the root is created before any entry is read
-		while !matches!(self.dirs[dir].state, DirState::Created(_)) {
-			dir = self.dirs[dir].named().parent;
+		while !matches!(self.dirs.slots[dir].state, DirState::Created(_)) {
+			dir = self.dirs.slots[dir].named().parent;
 		}
 		ExtractRetry {
 			destination: self.created_dir(dir),
@@ -481,13 +510,13 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Created directory `dir`, as the drive holds it: the root as the job has it, any other
 	/// built from its slot, the way the job created it.
 	fn created_dir(&self, dir: DirId) -> DirType<'static, Normal> {
-		let slot = &self.dirs[dir];
+		let slot = &self.dirs.slots[dir];
 		match &slot.place {
 			DirPlace::Root(root) => DirType::clone(root),
 			DirPlace::Named(named) => DirType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
 				slot.uuid,
 				RemoteDirectory::make_meta(named.name.clone(), named.created),
-				self.dirs[named.parent].uuid.into(),
+				self.dirs.slots[named.parent].uuid.into(),
 				named.created,
 			))),
 		}

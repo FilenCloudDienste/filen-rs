@@ -147,6 +147,13 @@ impl<E, P: JobPhase> RunCore<E, P> {
 		}
 	}
 
+	/// Whether the job ended: only its last update, [`Reporter::finish_with`], gives it a
+	/// terminal phase. Used by the archive jobs, which the service-worker build leaves out.
+	#[cfg(feature = "archive")]
+	pub(crate) fn is_finished(&self) -> bool {
+		self.phase.is_terminal()
+	}
+
 	/// Marks the next update as carrying a change.
 	pub(crate) fn mark_changed(&mut self) {
 		self.changed = true;

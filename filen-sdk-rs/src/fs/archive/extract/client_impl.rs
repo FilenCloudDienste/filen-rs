@@ -24,7 +24,7 @@ use super::{
 	ExtractWhat,
 	codec::{CodecLimits, StreamJob, Task, extract_stream},
 	engine::{ArchiveDisposal, CodecResult, ExtractTask, run_extract},
-	list::{ListCallback, ListConfig, ListFailed, ListReport, ListReporter, ListTask, run_list},
+	list::{ListCallback, ListFailed, ListReport, ListReporter, ListTask, run_list},
 	report::Reporter,
 };
 
@@ -75,6 +75,50 @@ impl Default for ExtractConfig {
 			expansion_limit: Some(ExpansionLimit::default()),
 			password: None,
 			skip_mac_metadata: true,
+		}
+	}
+}
+
+/// How a listing reads an archive, and which extraction's verdicts it shows: those of an
+/// extraction with the same settings.
+#[derive(Debug, Clone)]
+pub struct ListConfig {
+	/// As [`ExtractConfig::expansion_limit`]: a 7z link's target is read only while the
+	/// archive states no more than this allows.
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// As [`ExtractConfig::skip_mac_metadata`]: whether the entries left out as macOS metadata
+	/// are listed skipped.
+	pub skip_mac_metadata: bool,
+	/// As [`ExtractConfig::password`]: checked on the index or an entry when it can be (see
+	/// [`ListReport::password`]).
+	pub password: Option<ArchivePassword>,
+}
+
+impl Default for ListConfig {
+	fn default() -> Self {
+		let ExtractConfig {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+			..
+		} = ExtractConfig::default();
+		Self {
+			expansion_limit,
+			skip_mac_metadata,
+			password,
+		}
+	}
+}
+
+impl ListConfig {
+	/// The extraction whose verdicts the listing shows: its settings, and neither cap.
+	pub(crate) fn into_extraction(self) -> ExtractConfig {
+		ExtractConfig {
+			max_bytes: None,
+			max_items: None,
+			expansion_limit: self.expansion_limit,
+			skip_mac_metadata: self.skip_mac_metadata,
+			password: self.password,
 		}
 	}
 }
@@ -217,7 +261,7 @@ fn start_codec(
 		name: archive.name().unwrap_or_default().to_owned(),
 		len: archive.size(),
 		limits: CodecLimits {
-			decoder_memory: archives.codec_mem_budget,
+			decoder_memory: archives.codec_mem_budget(),
 			max_members: archives.max_members,
 			expansion: config.expansion_limit,
 			max_index_bytes: archives.max_index_bytes,
@@ -235,12 +279,12 @@ mod tests {
 	use super::*;
 	use crate::{
 		ErrorKind,
-		fs::archive::{
-			extract::{
+		fs::{
+			archive::extract::{
 				ArchiveEntry, ArchiveEntryId, EntrySelection, ExtractRoot, ExtractUpdate,
 				ExtractedTopLevel, ListUpdate,
 			},
-			test_support::remote_file,
+			drive_job::test_support::remote_file,
 		},
 	};
 

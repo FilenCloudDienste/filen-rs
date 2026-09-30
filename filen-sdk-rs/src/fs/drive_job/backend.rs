@@ -3,6 +3,8 @@
 //! shares), as a trait so engines can run against a fake in tests, and its implementation on a
 //! logged-in client.
 
+#[cfg(feature = "archive")]
+use std::borrow::Cow;
 use std::{future::Future, sync::Arc};
 
 use chrono::{DateTime, Utc};
@@ -129,6 +131,14 @@ pub(crate) trait DriveBackend: MaybeSendSync + 'static {
 		targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
 	) -> impl Future<Output = Vec<Error>> + MaybeSend;
+	/// An item of the user's drive, for a job that kept only its uuid: a file a tar's hard link
+	/// copies, or a top-level item to propagate again.
+	#[cfg(feature = "archive")]
+	fn normal_item(
+		&self,
+		uuid: Uuid,
+		is_dir: bool,
+	) -> impl Future<Output = Result<NonRootItemType<'static, Normal>, Error>> + MaybeSend;
 	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload;
 	/// Downloads and decrypts chunk `index` of `file`.
 	fn fetch_chunk(
@@ -246,6 +256,19 @@ impl DriveBackend for ClientBackend {
 			Err(error) => return vec![error],
 		};
 		self.client.propagate_to_targets(targets, &items).await
+	}
+
+	#[cfg(feature = "archive")]
+	async fn normal_item(
+		&self,
+		uuid: Uuid,
+		is_dir: bool,
+	) -> Result<NonRootItemType<'static, Normal>, Error> {
+		Ok(if is_dir {
+			NonRootItemType::Dir(Cow::Owned(self.client.get_dir(uuid).await?))
+		} else {
+			NonRootItemType::File(Cow::Owned(self.client.get_file(uuid).await?))
+		})
 	}
 
 	fn begin_upload(&self, spec: UploadSpec) -> Self::Upload {

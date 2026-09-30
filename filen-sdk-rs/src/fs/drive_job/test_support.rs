@@ -14,6 +14,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::dir::color::DirColor,
+	crypto::Blake3Hash,
 	fs::{StableUuid, Uuid},
 };
 use tokio::sync::{Semaphore, watch};
@@ -21,14 +22,14 @@ use tokio::sync::{Semaphore, watch};
 use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
-	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
 		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 		file::{
-			RemoteFile,
+			AnonymousRemoteFile, RemoteFile,
 			enums::RemoteFileType,
 			meta::{DecryptedFileMeta, FileMeta},
 			read::chunk_plaintext_len,
@@ -44,7 +45,7 @@ use super::backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec};
 
 /// Bytes of memory semaphore that hold `chunks` chunks.
 pub(crate) fn budget(chunks: usize) -> usize {
-	chunks * (CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE)
+	chunks * FULL_CHUNK_BYTES
 }
 
 /// The plaintext of chunk `index` of the source file `uuid`.
@@ -52,6 +53,39 @@ pub(crate) fn chunk_data(uuid: Uuid, index: u64, size: u64) -> Vec<u8> {
 	// The low byte of each, on purpose: a fill pattern distinct per file and per chunk.
 	let fill = uuid.as_u128().to_le_bytes()[0] ^ index.to_le_bytes()[0];
 	vec![fill; usize::try_from(chunk_plaintext_len(size, index)).unwrap()]
+}
+
+/// A file `name` in `parent` holding `bytes`, with `hash` in its metadata.
+pub(crate) fn remote_file(
+	uuid: Uuid,
+	parent: Uuid,
+	name: &str,
+	bytes: &[u8],
+	hash: Option<Blake3Hash>,
+) -> RemoteFileType<'static> {
+	let size = bytes.len() as u64;
+	let meta = FileMeta::Decoded(DecryptedFileMeta {
+		name: Cow::Owned(name.to_owned()),
+		size,
+		mime: Cow::Borrowed("application/octet-stream"),
+		key: FileKey::V3(EncryptionKey::generate()),
+		last_modified: Utc::now(),
+		created: None,
+		hash,
+	});
+	let file: AnonymousRemoteFile = RemoteFile::from_meta(
+		uuid,
+		(),
+		parent.into(),
+		size,
+		size.div_ceil(CHUNK_SIZE_U64),
+		"de-1",
+		"bucket",
+		Utc::now(),
+		false,
+		meta,
+	);
+	RemoteFileType::File(Cow::Owned(file))
 }
 
 /// Waits until `condition` holds, panicking with `what` if it does not within a generous time.
@@ -110,7 +144,7 @@ pub(crate) struct FakeLog {
 	/// Most registrations that ran at once.
 	pub(crate) peak_finishes: usize,
 	pub(crate) created_dirs: Vec<(Uuid, String)>,
-	/// Items fetched by uuid ([`DisposalBackend::normal_item`]).
+	/// Items fetched by uuid ([`DriveBackend::normal_item`]).
 	pub(crate) fetched_items: Vec<Uuid>,
 	/// Most items fetched by uuid at once.
 	pub(crate) peak_item_fetches: usize,
@@ -350,7 +384,7 @@ impl FakeBackend {
 	}
 
 	/// Waits while `request` about `uuid` is held.
-	async fn hold(&self, request: Request, uuid: Uuid) {
+	pub(crate) async fn hold(&self, request: Request, uuid: Uuid) {
 		let key = (request, uuid);
 		if self.held.borrow().contains(&key) {
 			self.log().held.push(key);
@@ -493,6 +527,59 @@ impl DriveBackend for FakeBackend {
 		self.hold(Request::Propagate, item.uuid()).await;
 		self.log().propagated_trees.push(item.uuid());
 		Vec::new()
+	}
+
+	#[cfg(feature = "archive")]
+	async fn normal_item(
+		&self,
+		uuid: Uuid,
+		is_dir: bool,
+	) -> Result<NonRootItemType<'static, Normal>, Error> {
+		let _running = Running::start(&self.item_fetches, |running| {
+			let mut log = self.log();
+			log.peak_item_fetches = log.peak_item_fetches.max(running);
+		});
+		tokio::time::sleep(self.delay).await;
+		// a file in the fake drive is fetched at its size; any other is one byte
+		let (size, chunks) = {
+			let mut log = self.log();
+			log.fetched_items.push(uuid);
+			log.file_parents
+				.get(&uuid)
+				.map_or((1, 1), |&(_, size, chunks)| (size, chunks))
+		};
+		Ok(if is_dir {
+			NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
+				uuid,
+				DecryptedDirectoryMeta {
+					name: Cow::Borrowed("fetched"),
+					created: None,
+				},
+				Uuid::new_v4().into(),
+				Utc::now(),
+			)))
+		} else {
+			NonRootItemType::File(Cow::Owned(RemoteFile::from_meta(
+				uuid,
+				StableUuid::new_for_test(uuid),
+				Uuid::new_v4().into(),
+				size,
+				chunks,
+				"de-1",
+				"bucket",
+				Utc::now(),
+				false,
+				FileMeta::Decoded(DecryptedFileMeta {
+					name: Cow::Borrowed("fetched"),
+					size,
+					mime: Cow::Borrowed("text/plain"),
+					key: FileKey::V3(EncryptionKey::generate()),
+					last_modified: Utc::now(),
+					created: None,
+					hash: None,
+				}),
+			)))
+		})
 	}
 
 	fn begin_upload(&self, spec: UploadSpec) -> FakeUpload {
@@ -660,189 +747,5 @@ impl DriveBackend for FakeBackend {
 				hash: Some(completion.hash),
 			}),
 		))
-	}
-}
-
-#[cfg(feature = "archive")]
-mod disposal {
-	use super::*;
-	use crate::fs::archive::dispose::{DirState, DisposalBackend, FileState, Tree};
-	use filen_types::fs::ParentUuid;
-
-	impl FakeBackend {
-		/// Places an existing file in the fake drive, as a source a job may remove.
-		pub(crate) fn place_file(&self, uuid: Uuid, parent: Uuid, size: u64) {
-			self.log()
-				.file_parents
-				.insert(uuid, (parent, size, size.div_ceil(CHUNK_SIZE_U64)));
-		}
-
-		/// Places an existing directory in the fake drive, or moves one already there.
-		pub(crate) fn place_dir(&self, uuid: Uuid, parent: Uuid) {
-			self.log().dir_parents.insert(uuid, parent);
-		}
-
-		fn assert_locked(&self) {
-			assert!(
-				self.live_locks.load(Ordering::SeqCst) > 0,
-				"removals hold the drive lock"
-			);
-		}
-	}
-
-	impl DisposalBackend for FakeBackend {
-		async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
-			self.hold(Request::State, uuid).await;
-			tokio::time::sleep(self.delay).await;
-			let log = self.log();
-			match log.file_parents.get(&uuid) {
-				Some(&(parent, size, chunks)) => Ok(FileState {
-					size,
-					chunks,
-					parent: ParentUuid::Uuid(parent),
-					versioned: false,
-					trash: false,
-				}),
-				None if log.trashed_files.contains(&uuid) => {
-					Err(Error::custom(ErrorKind::FileNotFound, "trashed"))
-				}
-				None => Err(Error::custom(ErrorKind::FileNotFound, "no such file")),
-			}
-		}
-
-		async fn dir_state(&self, uuid: Uuid) -> Result<DirState, Error> {
-			self.hold(Request::State, uuid).await;
-			tokio::time::sleep(self.delay).await;
-			match self.log().dir_parents.get(&uuid) {
-				Some(&parent) => Ok(DirState {
-					parent: ParentUuid::Uuid(parent),
-					trash: false,
-				}),
-				None => Err(Error::custom(
-					ErrorKind::FolderNotFound,
-					"no such directory",
-				)),
-			}
-		}
-
-		async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
-			self.hold(Request::List, dir).await;
-			tokio::time::sleep(self.delay).await;
-			let log = self.log();
-			let mut tree = Tree::default();
-			let mut below = vec![dir];
-			while let Some(parent) = below.pop() {
-				for (&child, &of) in &log.dir_parents {
-					if of == parent && tree.dirs.insert(child) {
-						below.push(child);
-					}
-				}
-			}
-			for (&file, &(parent, size, _)) in &log.file_parents {
-				if parent == dir || tree.dirs.contains(&parent) {
-					tree.files.insert(file, size);
-				}
-			}
-			Ok(tree)
-		}
-
-		async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
-			self.assert_locked();
-			let mut log = self.log();
-			log.file_parents.remove(&uuid);
-			log.trashed_files.push(uuid);
-			Ok(())
-		}
-
-		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
-			self.assert_locked();
-			self.hold(Request::Delete, uuid).await;
-			if self.fail_deletes_of.contains(&uuid) {
-				return Err(Error::custom(ErrorKind::Server, "delete failed"));
-			}
-			let mut log = self.log();
-			log.file_parents.remove(&uuid);
-			log.deleted_files.push(uuid);
-			Ok(())
-		}
-
-		async fn trash_dir(&self, uuid: Uuid) -> Result<(), Error> {
-			self.assert_locked();
-			let mut log = self.log();
-			// the whole subtree goes with it
-			let mut gone = vec![uuid];
-			let mut index = 0;
-			while index < gone.len() {
-				let parent = gone[index];
-				gone.extend(
-					log.dir_parents
-						.iter()
-						.filter(|(_, of)| **of == parent)
-						.map(|(child, _)| *child),
-				);
-				index += 1;
-			}
-			log.dir_parents.retain(|dir, _| !gone.contains(dir));
-			log.file_parents
-				.retain(|_, (parent, ..)| !gone.contains(parent));
-			log.trashed_dirs.push(uuid);
-			Ok(())
-		}
-
-		async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
-			Ok(self.versioned_files.contains(&uuid))
-		}
-
-		async fn normal_item(
-			&self,
-			uuid: Uuid,
-			is_dir: bool,
-		) -> Result<NonRootItemType<'static, Normal>, Error> {
-			let _running = Running::start(&self.item_fetches, |running| {
-				let mut log = self.log();
-				log.peak_item_fetches = log.peak_item_fetches.max(running);
-			});
-			tokio::time::sleep(self.delay).await;
-			// a file in the fake drive is fetched at its size; any other is one byte
-			let (size, chunks) = {
-				let mut log = self.log();
-				log.fetched_items.push(uuid);
-				log.file_parents
-					.get(&uuid)
-					.map_or((1, 1), |&(_, size, chunks)| (size, chunks))
-			};
-			Ok(if is_dir {
-				NonRootItemType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
-					uuid,
-					DecryptedDirectoryMeta {
-						name: Cow::Borrowed("fetched"),
-						created: None,
-					},
-					Uuid::new_v4().into(),
-					Utc::now(),
-				)))
-			} else {
-				NonRootItemType::File(Cow::Owned(RemoteFile::from_meta(
-					uuid,
-					StableUuid::new_for_test(uuid),
-					Uuid::new_v4().into(),
-					size,
-					chunks,
-					"de-1",
-					"bucket",
-					Utc::now(),
-					false,
-					FileMeta::Decoded(DecryptedFileMeta {
-						name: Cow::Borrowed("fetched"),
-						size,
-						mime: Cow::Borrowed("text/plain"),
-						key: FileKey::V3(EncryptionKey::generate()),
-						last_modified: Utc::now(),
-						created: None,
-						hash: None,
-					}),
-				)))
-			})
-		}
 	}
 }

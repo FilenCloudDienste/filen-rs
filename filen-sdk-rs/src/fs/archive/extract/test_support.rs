@@ -13,10 +13,9 @@ use crate::{
 		archive::{
 			config::{ArchiveConfig, CODEC_MEM_BUDGET},
 			password::ArchivePassword,
-			test_support::remote_file,
 			worker,
 		},
-		drive_job::test_support::FakeBackend,
+		drive_job::test_support::{FakeBackend, remote_file},
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
 	job::JobControl,

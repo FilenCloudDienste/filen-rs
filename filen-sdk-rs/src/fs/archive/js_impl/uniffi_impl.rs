@@ -343,7 +343,7 @@ impl JsClient {
 				password: checked_password(password)?,
 			},
 			config.dispose,
-			self.inner_ref().archives().codec_mem_budget,
+			self.inner_ref().archives().codec_mem_budget(),
 		)?;
 		let client = self.inner();
 		managed_future

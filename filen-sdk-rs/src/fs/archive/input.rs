@@ -11,11 +11,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::{
 	Error, ErrorKind,
-	consts::CHUNK_SIZE_U64,
+	consts::{CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 	fs::{
 		HasUUID,
 		archive::{
-			config::{ArchiveConfig, CHUNK_BYTES},
+			config::ArchiveConfig,
 			worker::{StallWatch, WorkerEvent, WorkerLink, worker_died},
 		},
 		drive_job::{backend::DriveBackend, cancelled},
@@ -39,12 +39,8 @@ pub(crate) const PREFETCH_CHUNKS: usize = 4;
 /// A fetched chunk of the archive, with the memory it holds.
 type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
 
-/// A job's memory floor while it holds it, counted as an operation in flight: the job is only
-/// reported paused once it has given it back, with everything held on top of it.
-type Floor = (OwnedSemaphorePermit, OpGuard);
-
-/// Memory for one chunk: `slot` (one of the floor's) when free, else the client's `memory` if it
-/// has room now, else nothing.
+/// Memory for one chunk: `slot` (the job's floor of one input or one output chunk) when free,
+/// else the client's `memory` if it has room now, else nothing.
 pub(crate) fn take_memory(
 	slot: &Arc<Semaphore>,
 	memory: &Arc<Semaphore>,
@@ -52,7 +48,7 @@ pub(crate) fn take_memory(
 	Arc::clone(slot).try_acquire_owned().ok().or_else(|| {
 		Arc::clone(memory)
 			.try_acquire_many_owned(
-				u32::try_from(CHUNK_BYTES).expect(
+				u32::try_from(FULL_CHUNK_BYTES).expect(
 					"a full chunk is about 1 MiB, far below u32::MAX (should be impossible)",
 				),
 			)
@@ -87,8 +83,8 @@ struct ArchiveInput<B> {
 	chunks: u64,
 	next_fetch: u64,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
-	/// Fetched chunks the codec has not asked for yet; held only with the floor, which counts
-	/// them in flight.
+	/// Fetched chunks the codec has not asked for yet; held only while the feed counts as
+	/// running, which counts them in flight.
 	ready: VecDeque<(u64, Vec<u8>, OwnedSemaphorePermit)>,
 	/// The chunk the codec is reading, released when it asks for the next.
 	reading: Option<OwnedSemaphorePermit>,
@@ -101,7 +97,8 @@ struct ArchiveInput<B> {
 	/// The codec read the archive front to back, once: `hasher` covers it all.
 	sequential: bool,
 	ask: Option<(u64, oneshot::Sender<Vec<u8>>)>,
-	/// The floor's input chunk.
+	/// The job's floor of input: one chunk it can always take, outside the client's budget, so
+	/// it never waits on memory a transfer or another job holds.
 	slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
 	memory: Arc<Semaphore>,
@@ -241,27 +238,25 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	}
 
 	/// Waits out a pause holding nothing but the chunk the codec is reading: prefetched chunks
-	/// and the job's `floor` are given back, and the floor taken again once the pause is over.
+	/// are given back, and so is `running`, taken again once the pause is over.
 	async fn wait_out_pause<S: JobState>(
 		&mut self,
-		floor: &mut Option<Floor>,
+		running: &mut Option<OpGuard>,
 		reporter: &MaybeArc<Reporter<S>>,
 		control: &JobControl,
-		config: &ArchiveConfig,
 	) -> Result<(), Stopped> {
 		self.drop_prefetched();
 		// The chunk the codec is reading stays with it, part of its state. Nothing else holds the
-		// floor's input slot now, so it moves there if it took from the client's budget.
+		// input slot now, so it moves there if it took from the client's budget.
 		if self.reading.is_some()
 			&& let Ok(slot) = Arc::clone(&self.slot).try_acquire_owned()
 		{
 			self.reading = Some(slot);
 		}
 		// last, so the job counts as paused only now
-		*floor = None;
+		*running = None;
 		reporter.checkpoint(control).await?;
-		let taken = control.until_stopping(config.floor()).await?;
-		*floor = Some((taken, reporter.op()));
+		*running = Some(reporter.op());
 		Ok(())
 	}
 
@@ -274,12 +269,13 @@ impl<B: DriveBackend> ArchiveInput<B> {
 
 /// A reading codec and the archive it reads, as the drivers of an extraction, a listing and a
 /// compression's read-back all serve it: its asks answered from the archive, its events and its
-/// result taken, and the codec given up on once it stops moving. It holds the job's memory floor
-/// while the codec reads.
+/// result taken, and the codec given up on once it stops moving.
 pub(crate) struct CodecFeed<B, T> {
 	input: ArchiveInput<B>,
 	link: WorkerLink<Result<T, Error>>,
-	floor: Option<Floor>,
+	/// Counts the feed as an operation in flight while the codec reads, so the job is only
+	/// reported paused once the feed gave back everything it held on top of the codec's chunk.
+	running: Option<OpGuard>,
 	stall: StallWatch,
 	stage: Stage,
 }
@@ -310,17 +306,17 @@ pub(crate) enum Fed<T> {
 }
 
 impl<B: DriveBackend, T> CodecFeed<B, T> {
-	/// A feed of `archive` to the codec at the other end of `link`, holding the job's `floor`.
+	/// A feed of `archive` to the codec at the other end of `link`, counted as `running`.
 	pub(crate) fn new(
 		backend: Arc<B>,
 		archive: Arc<RemoteFileType<'static>>,
 		link: WorkerLink<Result<T, Error>>,
-		floor: Floor,
+		running: OpGuard,
 	) -> Self {
 		Self {
 			input: ArchiveInput::new(backend, archive),
 			link,
-			floor: Some(floor),
+			running: Some(running),
 			stall: StallWatch::default(),
 			stage: Stage::Events,
 		}
@@ -400,11 +396,11 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	}
 
 	/// Gives back what only the codec needed, once it is done: chunks prefetched past its last
-	/// read (a zip's or 7z's index chunks, fetched again for its entries) and the floor. What
-	/// follows holds nothing while it waits out a pause.
+	/// read (a zip's or 7z's index chunks, fetched again for its entries). What follows holds
+	/// nothing while it waits out a pause.
 	pub(crate) fn release(&mut self) {
 		self.input.release();
-		self.floor = None;
+		self.running = None;
 	}
 
 	/// Waits out a pause holding nothing but the chunk the codec is reading (see
@@ -413,10 +409,9 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 		&mut self,
 		reporter: &MaybeArc<Reporter<S>>,
 		control: &JobControl,
-		config: &ArchiveConfig,
 	) -> Result<(), Stopped> {
 		self.input
-			.wait_out_pause(&mut self.floor, reporter, control, config)
+			.wait_out_pause(&mut self.running, reporter, control)
 			.await
 	}
 
@@ -446,9 +441,9 @@ pub(crate) struct ReadingJob<'a, S: JobState> {
 }
 
 /// Starts a job that reads `archive` through a codec: checks its chunks, waits for a job slot
-/// and its memory floor (holding nothing meanwhile, see [`ArchiveConfig::admit`]), enters phase
-/// `reading` and starts the codec. The slot, held until dropped, and the codec's feed; `Err`
-/// with the phase the job ends in and why. `job` is what its report calls it.
+/// (holding nothing meanwhile, see [`ArchiveConfig::admit`]), enters the job's `reading` phase
+/// and starts the codec. The slot, held until dropped, and the codec's feed; `Err` with the
+/// phase the job ends in and why.
 pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	backend: Arc<B>,
 	archive: Arc<RemoteFileType<'static>>,
@@ -465,15 +460,14 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	if let Err(error) = check_chunks_consistent(archive.chunks(), archive.size()) {
 		return Err((S::Phase::FAILED, Arc::new(error)));
 	}
-	// leased and floored before the codec starts, so a waiting job holds nothing
-	let Ok((lease, floor)) = config.admit(control, &reporter.ops()).await else {
+	// leased before the codec starts, so a waiting job holds nothing
+	let Ok(lease) = config.admit(control, &reporter.ops()).await else {
 		reporter.wind_down(control);
 		return Err((S::Phase::CANCELLED, cancelled(name)));
 	};
 	reporter.set_phase(reading);
 	let link = start().map_err(|error| (S::Phase::FAILED, Arc::new(error)))?;
-	let floor = (floor, reporter.op());
-	Ok((lease, CodecFeed::new(backend, archive, link, floor)))
+	Ok((lease, CodecFeed::new(backend, archive, link, reporter.op())))
 }
 
 #[cfg(test)]
@@ -489,9 +483,9 @@ mod tests {
 					ExtractCallback, ExtractUpdate, ExtractedTopLevel,
 					report::Reporter as ExtractReporter,
 				},
-				test_support::{pattern, remote_file},
+				test_support::pattern,
 			},
-			drive_job::test_support::FakeBackend,
+			drive_job::test_support::{FakeBackend, remote_file},
 		},
 	};
 

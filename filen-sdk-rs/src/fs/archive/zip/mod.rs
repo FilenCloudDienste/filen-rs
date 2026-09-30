@@ -36,13 +36,17 @@ pub(crate) const METHOD_XZ: u16 = 95;
 pub(crate) const METHOD_PPMD: u16 = 98;
 const METHOD_AES: u16 = 99;
 
-/// Whether the SDK reads data compressed with `method`, `encrypted` or not. LZMA and XZ have
-/// their own memory limits, which the encrypted forms would first have to buffer around: only
-/// their plain forms are read.
-pub(crate) fn method_supported(method: u16, encrypted: bool) -> bool {
-	match method {
-		METHOD_STORED | METHOD_DEFLATE | METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_ZSTD => true,
-		METHOD_LZMA | METHOD_XZ => !encrypted,
-		_ => false,
-	}
+/// A compression method's name, for display; `None` for one without a name here.
+pub(crate) fn method_name(method: u16) -> Option<&'static str> {
+	Some(match method {
+		METHOD_STORED => "Stored",
+		METHOD_DEFLATE => "Deflate",
+		METHOD_DEFLATE64 => "Deflate64",
+		METHOD_BZIP2 => "BZip2",
+		METHOD_LZMA => "LZMA",
+		METHOD_ZSTD => "Zstd",
+		METHOD_XZ => "XZ",
+		METHOD_PPMD => "PPMd",
+		_ => return None,
+	})
 }

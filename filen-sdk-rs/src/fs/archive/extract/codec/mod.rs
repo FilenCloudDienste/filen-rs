@@ -10,10 +10,9 @@ mod zip;
 
 use std::io::{self, Cursor, Read};
 
-use crate::{Error, ErrorKind};
-
-use super::{
-	super::{
+use crate::{
+	Error, ErrorKind,
+	fs::archive::{
 		bytes::read_full,
 		decode::{StreamCheck, StreamDecoder, Trailing, open_stream},
 		entry_path::{ArchivePath, entry_path},
@@ -29,6 +28,9 @@ use super::{
 			ChunkInput, EntryKind, SeekInput, WorkerEvent, WorkerPort, from_source, send_file_data,
 		},
 	},
+};
+
+use super::{
 	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
 	list::{ArchiveEntryKind, PasswordCheck},
 };
@@ -71,7 +73,7 @@ pub(crate) struct StreamJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArchiveEnd {
 	/// Bytes that belong to no entry: after the last one (see
-	/// [`StreamEnd`](super::super::decode::StreamEnd)), or before a zip's first.
+	/// [`StreamEnd`](crate::fs::archive::decode::StreamEnd)), or before a zip's first.
 	pub(crate) unaccounted_bytes: u64,
 	pub(crate) duplicates: Option<DuplicateEntries>,
 	/// Entries extracted whose decoded data nothing in the archive checked: a 7z entry without a

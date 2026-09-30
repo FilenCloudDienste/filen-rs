@@ -18,7 +18,7 @@ use tokio::{
 use super::*;
 use crate::{
 	auth::http::ClientConfig,
-	consts::CHUNK_SIZE,
+	consts::{CHUNK_SIZE, FULL_CHUNK_BYTES},
 	fs::{
 		HasName,
 		archive::{
@@ -28,7 +28,6 @@ use crate::{
 				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
 			},
-			config::CHUNK_BYTES,
 			decode::open_stream,
 			dispose::{
 				DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, SourceDisposal, Tree,
@@ -43,7 +42,7 @@ use crate::{
 				write::{SevenZEncryption, SevenZMethod},
 			},
 			tar_iter::TarReader,
-			test_support::{hash, pattern, remote_file},
+			test_support::{hash, pattern},
 			worker::{self, ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
@@ -51,7 +50,7 @@ use crate::{
 		drive_job::{
 			backend::ListedNames,
 			plan::{PlanTotals, SkipReason, SkippedEntry},
-			test_support::{FakeBackend, Quirk, Request, wait_until},
+			test_support::{FakeBackend, Quirk, Request, remote_file, wait_until},
 		},
 		file::RemoteFile,
 	},
@@ -1747,7 +1746,7 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	read_into_the_second_source(&events).await;
 	let budget = setup.backend.budget;
 	wait_until("two chunks are fetched ahead", || {
-		setup.backend.memory.available_permits() == budget - 3 * CHUNK_BYTES
+		setup.backend.memory.available_permits() == budget - 3 * FULL_CHUNK_BYTES
 	})
 	.await;
 	pause.send_replace(true);
@@ -1816,7 +1815,7 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 		[RunState::Paused, RunState::Running]
 	);
 	setup_paused.backend.assert_released(&paused.reporter);
-	assert!(setup_paused.config.floor_is_free());
+	assert_eq!(setup_paused.config.free_slots(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

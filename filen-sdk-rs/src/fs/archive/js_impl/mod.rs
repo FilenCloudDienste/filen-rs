@@ -1109,7 +1109,7 @@ impl JsClient {
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveCodecMemBudget")
 	)]
 	pub fn archive_codec_mem_budget(&self) -> u64 {
-		self.inner_ref().archives().codec_mem_budget
+		self.inner_ref().archives().codec_mem_budget()
 	}
 }
 

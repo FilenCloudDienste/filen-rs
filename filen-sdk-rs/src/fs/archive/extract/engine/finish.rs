@@ -18,6 +18,7 @@ use crate::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, Removing,
 				SourceDisposal, Tree, dispose_file,
 			},
+			extract::report::{ExtractEvent, ExtractTopLevelKey, ExtractedTopLevel},
 			format::ArchiveFormat,
 			names::ROOT,
 		},
@@ -32,10 +33,7 @@ use crate::{
 	util::sleep,
 };
 
-use super::{
-	super::report::{ExtractEvent, ExtractTopLevelKey, ExtractedTopLevel},
-	Driver,
-};
+use super::Driver;
 
 /// How long an extraction that found its password wrong late waits for the drive lock to trash
 /// the directories it created, before it leaves them: the job has already ended, and nothing
@@ -182,7 +180,7 @@ impl<B: DisposalBackend> Driver<B> {
 			let _listing = self.reporter.op();
 			let listed = self
 				.control
-				.until_stopping(self.backend.list_tree(self.dirs[ROOT].uuid))
+				.until_stopping(self.backend.list_tree(self.dirs.slots[ROOT].uuid))
 				.await;
 			match listed {
 				Ok(Ok(tree)) => found = tree,
@@ -190,7 +188,7 @@ impl<B: DisposalBackend> Driver<B> {
 				Err(Stopped) => return false,
 			}
 			// the folder itself
-			found.dirs.insert(self.dirs[ROOT].uuid);
+			found.dirs.insert(self.dirs.slots[ROOT].uuid);
 		}
 		// the new folder is listed whole above; the items past the report's records are
 		// checked as recheck_targets goes through them

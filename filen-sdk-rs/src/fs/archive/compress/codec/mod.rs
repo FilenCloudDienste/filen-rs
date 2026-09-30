@@ -5,10 +5,9 @@ use std::io::{self, Read, Write};
 
 use chrono::{DateTime, Utc};
 
-use crate::{Error, ErrorKind};
-
-use super::{
-	super::{
+use crate::{
+	Error, ErrorKind,
+	fs::archive::{
 		encode::{StreamEncoder, open_encoder},
 		password::ArchivePassword,
 		sevenz::write::SevenZWriter,
@@ -19,8 +18,9 @@ use super::{
 			write::{Encryption, ZipMethod, ZipWriter},
 		},
 	},
-	CheckedArchive, Compression,
 };
+
+use super::{CheckedArchive, Compression};
 
 /// An entry of the archive, in the order it is written.
 #[derive(Debug, Clone, PartialEq, Eq)]

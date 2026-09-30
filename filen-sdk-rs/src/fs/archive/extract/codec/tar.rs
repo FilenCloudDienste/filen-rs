@@ -9,6 +9,7 @@ use crate::{
 	fs::archive::{
 		entry_path::{ArchivePath, PathRejection, entry_path},
 		error::read_failure,
+		extract::{ExtractSkipReason, list::ArchiveEntryKind},
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryKind, LinkHead, WorkerEvent},
@@ -17,7 +18,6 @@ use crate::{
 };
 
 use super::{
-	super::{ExtractSkipReason, list::ArchiveEntryKind},
 	Taken,
 	entries::{
 		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,

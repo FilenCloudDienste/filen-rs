@@ -14,6 +14,13 @@ use crate::{
 		HasUUID,
 		archive::{
 			dispose::{DisposalBackend, file_digest},
+			extract::{
+				report::{
+					ExtractActiveFile, ExtractFailure, ExtractRenameReason, ExtractReport,
+					ExtractRetry, ExtractStage, ExtractTopLevelKey, Reporter,
+				},
+				storage_exceeded,
+			},
 			input::take_memory,
 			names::ROOT,
 		},
@@ -34,16 +41,7 @@ use crate::{
 };
 
 use super::{
-	super::{
-		report::{
-			ExtractActiveFile, ExtractFailure, ExtractRenameReason, ExtractReport, ExtractRetry,
-			ExtractStage, ExtractTopLevelKey, Reporter,
-		},
-		storage_exceeded,
-	},
-	Driver, FilePhase, FileSlot, FileSource, LinkPhase, NewFile, SlotSource,
-	dirs::DirState,
-	record,
+	Driver, FilePhase, FileSlot, FileSource, LinkPhase, NewFile, SlotSource, dirs::DirState, record,
 };
 
 impl<B: DisposalBackend> Driver<B> {
@@ -60,7 +58,7 @@ impl<B: DisposalBackend> Driver<B> {
 			link_key,
 		} = new;
 		let dest_uuid = Uuid::new_v4();
-		let parent_uuid = self.dirs[parent].uuid;
+		let parent_uuid = self.dirs.slots[parent].uuid;
 		let upload = self.backend.begin_upload(UploadSpec {
 			uuid: dest_uuid,
 			parent: parent_uuid,
@@ -103,14 +101,14 @@ impl<B: DisposalBackend> Driver<B> {
 			FileSource::Link { target } => {
 				let backend = Arc::clone(&self.backend);
 				let op = self.reporter.op();
-				self.link_sources.push(Box::pin(async move {
+				self.links.sources.push(Box::pin(async move {
 					let result = backend.normal_item(target, false).await;
 					drop(op);
 					(ordinal, result)
 				}));
 			}
 		}
-		if let DirState::Failed(error) = &self.dirs[parent].state {
+		if let DirState::Failed(error) = &self.dirs.slots[parent].state {
 			let error = Arc::clone(error);
 			self.fail_file(ordinal, ExtractStage::CreateDirectory, error);
 		} else {
@@ -144,8 +142,8 @@ impl<B: DisposalBackend> Driver<B> {
 		if file.failed() {
 			return;
 		}
-		let waits =
-			self.dirs[file.parent].created_uuid().is_none() || file.uploading >= CHUNKS_PER_FILE;
+		let waits = self.dirs.slots[file.parent].created_uuid().is_none()
+			|| file.uploading >= CHUNKS_PER_FILE;
 		let permit = if waits {
 			None
 		} else {
@@ -252,7 +250,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.filter(|(_, file)| {
 				file.uploading == 0
 					&& match file.phase {
-						FilePhase::Ended => self.dirs[file.parent].created_uuid().is_some(),
+						FilePhase::Ended => self.dirs.slots[file.parent].created_uuid().is_some(),
 						FilePhase::Failed { ended } => ended,
 						FilePhase::Receiving | FilePhase::Finalizing => false,
 					}
@@ -273,7 +271,7 @@ impl<B: DisposalBackend> Driver<B> {
 			let file = &self.files[&ordinal];
 			file.parent == ROOT && self.into_destination
 		};
-		let parent = self.dirs[self.files[&ordinal].parent]
+		let parent = self.dirs.slots[self.files[&ordinal].parent]
 			.created_uuid()
 			.expect("checked by the caller");
 		let file = self.files.get_mut(&ordinal).expect("checked by the caller");

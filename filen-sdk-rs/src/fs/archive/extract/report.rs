@@ -436,8 +436,6 @@ pub(crate) struct ExtractState {
 	/// Top-level items created and not delivered yet: they go out in batches, each before the
 	/// next update.
 	pending_top_level: Vec<ExtractedTopLevel>,
-	/// The job ended: whatever of the archive it did not read, it never will.
-	ended: bool,
 }
 
 /// Most items one callback of a batch (`on_top_level_batch`, `on_entries_batch`) carries.
@@ -458,7 +456,7 @@ impl JobState for ExtractState {
 			bytes_done: self.counts.bytes_done,
 			units: Units {
 				done: self.bytes_read,
-				settled: if self.ended {
+				settled: if self.core.is_finished() {
 					archive_bytes
 				} else {
 					self.bytes_read
@@ -491,7 +489,6 @@ impl JobState for ExtractState {
 	}
 
 	fn settle(&mut self) {
-		self.ended = true;
 		// a file still running now was never finished
 		for file in std::mem::take(&mut self.active) {
 			self.not_attempted(file.bytes_done, file.size.unwrap_or(file.bytes_done));
@@ -554,7 +551,6 @@ impl Reporter {
 				bytes_read: 0,
 				active: Vec::new(),
 				pending_top_level: Vec::new(),
-				ended: false,
 			},
 			Box::new(callback),
 		)

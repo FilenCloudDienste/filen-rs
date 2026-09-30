@@ -81,6 +81,8 @@ pub const CHUNK_SIZE_U64: u64 = CHUNK_SIZE as u64;
 pub const FILE_CHUNK_SIZE: NonZeroU32 = NonZeroU32::new(1024 * 1024).unwrap(); // 1 MiB
 pub const FILE_CHUNK_SIZE_EXTRA: NonZeroU32 = NonZeroU32::new(28).unwrap(); // auth tag (16) + nonce (12)
 pub const FILE_CHUNK_SIZE_EXTRA_USIZE: usize = FILE_CHUNK_SIZE_EXTRA.get() as usize;
+/// Bytes one chunk takes in memory, with its encryption overhead.
+pub(crate) const FULL_CHUNK_BYTES: usize = CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE;
 
 /// Bound on concurrent small operations: in-flight entries of a recursive upload, cache
 /// fetches, and a copy's concurrent operations. Memory is bounded separately by the client's

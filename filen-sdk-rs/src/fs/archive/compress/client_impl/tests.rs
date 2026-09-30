@@ -9,16 +9,16 @@ use crate::{
 	auth::http::ClientConfig,
 	fs::{
 		archive::{
-			DisposalOutcome, KeptReason,
-			compress::{CompressUpdate, Compression, StreamCodec, report::CompressCallback},
+			Compression, DisposalOutcome, KeptReason, SourceDisposition, StreamCodec,
+			compress::{CompressCounts, CompressEvent, CompressUpdate, report::CompressCallback},
 			config::ArchiveConfig,
-			test_support::{pattern, remote_file},
+			test_support::pattern,
 		},
 		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
 		drive_job::{
 			listing::{ListingBytes, SourceLister},
 			plan::{Listed, PlanSource, PlanTotals, SourceDir},
-			test_support::wait_until,
+			test_support::{remote_file, wait_until},
 		},
 		file::{RemoteFile, enums::RemoteFileType},
 	},
@@ -440,7 +440,151 @@ impl Updates {
 	}
 
 	fn last_phase(&self) -> CompressPhase {
-		self.0.lock().unwrap().last().unwrap().phase
+		self.last().phase
+	}
+
+	fn last(&self) -> CompressUpdate {
+		self.0.lock().unwrap().last().unwrap().clone()
+	}
+}
+
+fn bare_tar() -> CheckedFormat {
+	CheckedFormat::Archive(CheckedArchive::Tar { compression: None })
+}
+
+/// Whether `dispositions` keep exactly `requested`, for `reason`.
+fn kept_for(dispositions: &[SourceDisposition], requested: &[Uuid], reason: &KeptReason) -> bool {
+	dispositions.len() == requested.len()
+		&& dispositions
+			.iter()
+			.zip(requested)
+			.all(|(disposition, uuid)| {
+				disposition.uuid == *uuid
+					&& matches!(
+						&disposition.outcome,
+						DisposalOutcome::Kept { reason: kept, bytes_freed: 0 }
+							if std::mem::discriminant(kept) == std::mem::discriminant(reason)
+					)
+			})
+}
+
+#[test]
+fn a_tar_larger_than_max_bytes_is_refused_with_its_size() {
+	let (CompressJob::Archive { entries, .. }, _) = compress_job(plan(), bare_tar()).unwrap()
+	else {
+		unreachable!("a tar holds entries")
+	};
+	let needed = tar_size(&entries);
+	let totals = plan().totals;
+	let requested = [Uuid::from_u128(0xC0), Uuid::from_u128(0xC1)];
+	let updates = Arc::new(Updates::default());
+	let reporter = Reporter::new(Arc::clone(&updates));
+
+	let CompressFailed { report, error } = *plan_to_run(
+		Ok(plan()),
+		bare_tar(),
+		None,
+		DESTINATION,
+		Some(needed - 1),
+		&reporter,
+		&requested,
+	)
+	.map(|_| ())
+	.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::MaxStorageReached);
+	assert_eq!(
+		report.needed_bytes,
+		Some(needed),
+		"the report says what the tar needs"
+	);
+	assert_eq!(report.totals, totals);
+	assert_eq!(
+		report.renamed.len(),
+		1,
+		"the plan's top-level rename is reported"
+	);
+	assert!(
+		kept_for(&report.dispositions, &requested, &KeptReason::Incomplete),
+		"{:?}",
+		report.dispositions
+	);
+	let last = updates.last();
+	assert_eq!((last.phase, last.totals), (CompressPhase::Failed, totals));
+	let told: Vec<Uuid> = updates
+		.0
+		.lock()
+		.unwrap()
+		.iter()
+		.flat_map(|update| &update.events)
+		.filter_map(|event| match event {
+			CompressEvent::SourceDisposition(disposition) => Some(disposition.uuid),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(told, requested, "every kept source is told");
+
+	for max_bytes in [Some(needed), None] {
+		let updates = Arc::new(Updates::default());
+		let reporter = Reporter::new(Arc::clone(&updates));
+		let run = plan_to_run(
+			Ok(plan()),
+			bare_tar(),
+			None,
+			DESTINATION,
+			max_bytes,
+			&reporter,
+			&requested,
+		)
+		.map_err(|_| ())
+		.unwrap();
+		assert_eq!(run.report.needed_bytes, None, "a tar that fits runs");
+		assert_eq!(run.report.totals, totals);
+		assert!(updates.0.lock().unwrap().is_empty(), "and has not ended");
+	}
+}
+
+#[test]
+fn a_compression_whose_scan_ended_reports_nothing_but_its_kept_sources() {
+	let scans = [
+		(
+			ScanError::Stopped,
+			CompressPhase::Cancelled,
+			ErrorKind::Cancelled,
+			KeptReason::Interrupted,
+		),
+		(
+			ScanError::Failed(Error::custom(ErrorKind::Server, "listing failed")),
+			CompressPhase::Failed,
+			ErrorKind::Server,
+			KeptReason::Incomplete,
+		),
+	];
+	for (scan, phase, kind, reason) in scans {
+		let requested = [Uuid::from_u128(0xC0)];
+		let updates = Arc::new(Updates::default());
+		let reporter = Reporter::new(Arc::clone(&updates));
+		let CompressFailed { report, error } = *plan_to_run::<()>(
+			Err(scan),
+			bare_tar(),
+			None,
+			DESTINATION,
+			Some(0),
+			&reporter,
+			&requested,
+		)
+		.map(|_| ())
+		.unwrap_err();
+		assert_eq!(error.kind(), kind);
+		assert_eq!(report.totals, PlanTotals::default());
+		assert_eq!(report.counts, CompressCounts::default());
+		assert!(report.skipped.is_empty() && report.renamed.is_empty());
+		assert!(kept_for(&report.dispositions, &requested, &reason));
+		let last = updates.last();
+		assert_eq!(
+			(last.phase, last.totals, last.counts),
+			(phase, PlanTotals::default(), CompressCounts::default())
+		);
 	}
 }
 

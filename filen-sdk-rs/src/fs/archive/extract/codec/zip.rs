@@ -8,15 +8,19 @@ use crate::{
 	fs::archive::{
 		entry_path::ArchivePath,
 		error::read_failure,
+		extract::{
+			DuplicateEntries, ExtractSkipReason,
+			list::{ArchiveEntryKind, PasswordCheck},
+			storage_exceeded,
+		},
 		format::ArchiveFormat,
 		limits::MAX_ARCHIVE_PATH_BYTES,
 		password::ArchivePassword,
 		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
 		zip::{
-			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
-			METHOD_STORED, METHOD_XZ, METHOD_ZSTD,
+			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_STORED,
 			crypto::{AES_AUTH_CODE_LEN_U64, AES_VERIFIER_LEN, ZIP_CRYPTO_HEADER_LEN_U64},
-			method_supported,
+			method_name,
 			read::{
 				EntryLimits, ZipEncryption, ZipEntry, ZipError, ZipIndex, ZipKind, ZipLimits,
 				open_entry, read_index, unaccounted_after,
@@ -26,11 +30,6 @@ use crate::{
 };
 
 use super::{
-	super::{
-		DuplicateEntries, ExtractSkipReason,
-		list::{ArchiveEntryKind, PasswordCheck},
-		storage_exceeded,
-	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,
@@ -41,17 +40,9 @@ fn zip_method(entry: &ZipEntry) -> Option<String> {
 	if entry.kind == ZipKind::Dir {
 		return None;
 	}
-	Some(match entry.method {
-		METHOD_STORED => "Stored".to_owned(),
-		METHOD_DEFLATE => "Deflate".to_owned(),
-		METHOD_DEFLATE64 => "Deflate64".to_owned(),
-		METHOD_BZIP2 => "BZip2".to_owned(),
-		METHOD_LZMA => "LZMA".to_owned(),
-		METHOD_ZSTD => "Zstd".to_owned(),
-		METHOD_XZ => "XZ".to_owned(),
-		METHOD_PPMD => "PPMd".to_owned(),
-		other => format!("method {other}"),
-	})
+	Some(
+		method_name(entry.method).map_or_else(|| format!("method {}", entry.method), str::to_owned),
+	)
 }
 
 /// What a zip entry is, before anything is read of it but its record. A symlink's target is
@@ -63,7 +54,7 @@ fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: Option<String>)
 		ZipKind::Dir => (ArchiveEntryKind::Dir, None),
 		ZipKind::File => (
 			ArchiveEntryKind::File,
-			(!zip_supported(entry)).then_some(ExtractSkipReason::UnsupportedMethod),
+			(!entry.supported()).then_some(ExtractSkipReason::UnsupportedMethod),
 		),
 	};
 	Found {
@@ -107,7 +98,7 @@ fn check_zip_password<R: Read + Seek>(
 	// proves little (ZipCrypto's check byte lets 1 in 256 wrong passwords through, and its CRC
 	// matches whatever the key), so one with data goes first
 	let Some(probe) = encrypted
-		.filter(|entry| zip_supported(entry))
+		.filter(|entry| entry.supported())
 		.min_by_key(|entry| (entry.size == 0, entry.compressed_size))
 		.filter(|probe| probe.compressed_size <= PASSWORD_PROBE_BYTES)
 	else {
@@ -175,7 +166,7 @@ pub(super) fn extract_zip(
 		index
 			.entries
 			.iter()
-			.filter(|entry| entry.kind == ZipKind::File && zip_supported(entry))
+			.filter(|entry| entry.kind == ZipKind::File && entry.supported())
 			.map(|entry| (entry.ordinal, entry.name.as_str(), entry.size)),
 	);
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
@@ -384,11 +375,6 @@ fn key_unproven(entry: &ZipEntry) -> bool {
 	matches!(entry.encryption, ZipEncryption::ZipCrypto { .. })
 }
 
-/// Whether the SDK reads the entry's compression method under its encryption.
-fn zip_supported(entry: &ZipEntry) -> bool {
-	method_supported(entry.method, entry.encryption != ZipEncryption::None)
-}
-
 /// Whether a directory entry's stored bytes are an empty stream (as `java.util.zip` and Python
 /// deflate directories: two bytes), checked against its size and CRC-32 to the end.
 fn decodes_to_nothing<R: Read + std::io::Seek>(
@@ -398,7 +384,7 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> bool {
-	if entry.size != 0 || !zip_supported(entry) {
+	if entry.size != 0 || !entry.supported() {
 		return false;
 	}
 	// an encrypted one is judged by its length: decrypting each would cost a key derivation per
@@ -459,7 +445,7 @@ fn zip_pre_read(
 		let apple_double = walk.skips_mac_metadata()
 			&& entry.kind == ZipKind::File
 			&& entry.encryption == ZipEncryption::None
-			&& zip_supported(entry)
+			&& entry.supported()
 			&& zip_found(entry, false, None).mac_shape() == Some(MacShape::AppleDoubleName);
 		if entry.kind != ZipKind::Symlink && !apple_double {
 			continue;
@@ -538,7 +524,7 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	// of nothing but encrypted links would spend minutes on them creating nothing
 	if entry.size > MAX_ARCHIVE_PATH_BYTES as u64
 		|| entry.compressed_size > MAX_TARGET_COMPRESSED
-		|| !zip_supported(entry)
+		|| !entry.supported()
 		|| entry.encryption != ZipEncryption::None
 	{
 		return Ok(None);

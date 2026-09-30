@@ -683,10 +683,10 @@ mod tests {
 		},
 		crypto::{shared::CreateRandom, v3::EncryptionKey},
 		fs::{
-			archive::test_support::remote_file,
 			categories::NonRootItemType,
 			copy,
 			dir::{LinkedDirectory, RootDirectory},
+			drive_job::test_support::remote_file,
 			file::{enums::RemoteFileType, traits::HasFileInfo},
 		},
 		js::{

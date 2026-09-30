@@ -1,23 +1,22 @@
 //! Data and archives the archive tests share: bytes that compress and bytes that do not, and
-//! small archives made by the SDK's own writers and the `tar` crate.
+//! small archives made by the SDK's own writers and the `tar` crate; and the fake drive's side of
+//! removing a job's sources.
 
-use std::{borrow::Cow, io::Write, ops::RangeInclusive};
+use std::{io::Write, ops::RangeInclusive, sync::atomic::Ordering};
 
-use chrono::Utc;
-use filen_types::{crypto::Blake3Hash, fs::Uuid};
+use filen_types::{
+	crypto::Blake3Hash,
+	fs::{ParentUuid, Uuid},
+};
 
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
-	fs::file::{
-		AnonymousRemoteFile, RemoteFile,
-		enums::RemoteFileType,
-		meta::{DecryptedFileMeta, FileMeta},
-	},
+	fs::drive_job::test_support::{FakeBackend, Request},
 };
 
 use super::{
+	dispose::{DirState, DisposalBackend, FileState, Tree},
 	password::ArchivePassword,
 	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 	zip::{
@@ -29,39 +28,6 @@ use super::{
 /// `password`, checked.
 pub(crate) fn archive_password(password: &str) -> ArchivePassword {
 	ArchivePassword::new(password.to_owned()).unwrap()
-}
-
-/// A file `name` in `parent` holding `bytes`, with `hash` in its metadata.
-pub(crate) fn remote_file(
-	uuid: Uuid,
-	parent: Uuid,
-	name: &str,
-	bytes: &[u8],
-	hash: Option<Blake3Hash>,
-) -> RemoteFileType<'static> {
-	let size = bytes.len() as u64;
-	let meta = FileMeta::Decoded(DecryptedFileMeta {
-		name: Cow::Owned(name.to_owned()),
-		size,
-		mime: Cow::Borrowed("application/octet-stream"),
-		key: FileKey::V3(EncryptionKey::generate()),
-		last_modified: Utc::now(),
-		created: None,
-		hash,
-	});
-	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		uuid,
-		(),
-		parent.into(),
-		size,
-		size.div_ceil(CHUNK_SIZE_U64),
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		meta,
-	);
-	RemoteFileType::File(Cow::Owned(file))
 }
 
 /// Copies of `bytes` each damaged at one of `positions`: the byte there with its lowest bit
@@ -254,4 +220,129 @@ pub(crate) fn sevenz_of(
 	let (mut archive, start) = writer.finish().unwrap();
 	archive[..32].copy_from_slice(&start);
 	archive
+}
+
+impl FakeBackend {
+	/// Places an existing file in the fake drive, as a source a job may remove.
+	pub(crate) fn place_file(&self, uuid: Uuid, parent: Uuid, size: u64) {
+		self.log()
+			.file_parents
+			.insert(uuid, (parent, size, size.div_ceil(CHUNK_SIZE_U64)));
+	}
+
+	/// Places an existing directory in the fake drive, or moves one already there.
+	pub(crate) fn place_dir(&self, uuid: Uuid, parent: Uuid) {
+		self.log().dir_parents.insert(uuid, parent);
+	}
+
+	fn assert_locked(&self) {
+		assert!(
+			self.live_locks.load(Ordering::SeqCst) > 0,
+			"removals hold the drive lock"
+		);
+	}
+}
+
+impl DisposalBackend for FakeBackend {
+	async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
+		self.hold(Request::State, uuid).await;
+		tokio::time::sleep(self.delay).await;
+		let log = self.log();
+		match log.file_parents.get(&uuid) {
+			Some(&(parent, size, chunks)) => Ok(FileState {
+				size,
+				chunks,
+				parent: ParentUuid::Uuid(parent),
+				versioned: false,
+				trash: false,
+			}),
+			None if log.trashed_files.contains(&uuid) => {
+				Err(Error::custom(ErrorKind::FileNotFound, "trashed"))
+			}
+			None => Err(Error::custom(ErrorKind::FileNotFound, "no such file")),
+		}
+	}
+
+	async fn dir_state(&self, uuid: Uuid) -> Result<DirState, Error> {
+		self.hold(Request::State, uuid).await;
+		tokio::time::sleep(self.delay).await;
+		match self.log().dir_parents.get(&uuid) {
+			Some(&parent) => Ok(DirState {
+				parent: ParentUuid::Uuid(parent),
+				trash: false,
+			}),
+			None => Err(Error::custom(
+				ErrorKind::FolderNotFound,
+				"no such directory",
+			)),
+		}
+	}
+
+	async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
+		self.hold(Request::List, dir).await;
+		tokio::time::sleep(self.delay).await;
+		let log = self.log();
+		let mut tree = Tree::default();
+		let mut below = vec![dir];
+		while let Some(parent) = below.pop() {
+			for (&child, &of) in &log.dir_parents {
+				if of == parent && tree.dirs.insert(child) {
+					below.push(child);
+				}
+			}
+		}
+		for (&file, &(parent, size, _)) in &log.file_parents {
+			if parent == dir || tree.dirs.contains(&parent) {
+				tree.files.insert(file, size);
+			}
+		}
+		Ok(tree)
+	}
+
+	async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
+		self.assert_locked();
+		let mut log = self.log();
+		log.file_parents.remove(&uuid);
+		log.trashed_files.push(uuid);
+		Ok(())
+	}
+
+	async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
+		self.assert_locked();
+		self.hold(Request::Delete, uuid).await;
+		if self.fail_deletes_of.contains(&uuid) {
+			return Err(Error::custom(ErrorKind::Server, "delete failed"));
+		}
+		let mut log = self.log();
+		log.file_parents.remove(&uuid);
+		log.deleted_files.push(uuid);
+		Ok(())
+	}
+
+	async fn trash_dir(&self, uuid: Uuid) -> Result<(), Error> {
+		self.assert_locked();
+		let mut log = self.log();
+		// the whole subtree goes with it
+		let mut gone = vec![uuid];
+		let mut index = 0;
+		while index < gone.len() {
+			let parent = gone[index];
+			gone.extend(
+				log.dir_parents
+					.iter()
+					.filter(|(_, of)| **of == parent)
+					.map(|(child, _)| *child),
+			);
+			index += 1;
+		}
+		log.dir_parents.retain(|dir, _| !gone.contains(dir));
+		log.file_parents
+			.retain(|_, (parent, ..)| !gone.contains(parent));
+		log.trashed_dirs.push(uuid);
+		Ok(())
+	}
+
+	async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
+		Ok(self.versioned_files.contains(&uuid))
+	}
 }

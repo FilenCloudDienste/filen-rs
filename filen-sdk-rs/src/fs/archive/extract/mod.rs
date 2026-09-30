@@ -25,10 +25,10 @@ use crate::{
 
 use codec::Selection;
 
-pub use client_impl::ExtractConfig;
+pub use client_impl::{ExtractConfig, ListConfig};
 pub use list::{
-	ArchiveEntry, ArchiveEntryKind, ListCallback, ListConfig, ListFailed, ListPhase, ListReport,
-	ListTotals, ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
+	ArchiveEntry, ArchiveEntryKind, ListCallback, ListFailed, ListPhase, ListReport, ListTotals,
+	ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,

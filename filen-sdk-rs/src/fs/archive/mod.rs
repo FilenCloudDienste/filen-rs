@@ -9,7 +9,7 @@ mod bytes;
 mod compress;
 pub(crate) mod config;
 mod decode;
-pub(crate) mod dispose;
+mod dispose;
 mod encode;
 mod entry_path;
 mod error;
@@ -25,7 +25,7 @@ mod password;
 mod sevenz;
 mod tar_iter;
 #[cfg(test)]
-pub(crate) mod test_support;
+mod test_support;
 mod worker;
 mod zip;
 

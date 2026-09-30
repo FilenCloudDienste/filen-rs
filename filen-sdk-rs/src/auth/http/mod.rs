@@ -17,11 +17,10 @@ use reqwest::{
 use serde::{Serialize, de::DeserializeOwned};
 use tower::{ServiceBuilder, ServiceExt, limit::GlobalConcurrencyLimitLayer};
 
-use crate::consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE};
 use crate::{
 	Error,
 	auth::{Client, http::auth::AuthLayer, unauth::UnauthClient},
-	consts::gateway_url,
+	consts::{FULL_CHUNK_BYTES, gateway_url},
 	thumbnail::{MAX_THUMBNAIL_SOURCE_BYTES, REMOTE_SOURCE_RESIDENT_BYTES},
 	util::{MaybeSend, MaybeSendSync},
 };
@@ -248,12 +247,12 @@ impl Default for ClientConfig {
 				#[cfg(not(target_os = "ios"))]
 				{
 					// 16 full Chunks
-					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 16
+					FULL_CHUNK_BYTES * 16
 				}
 				#[cfg(target_os = "ios")]
 				{
 					// 8 full Chunks (lower than other targets for the tighter iOS memory limits)
-					(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE) * 8
+					FULL_CHUNK_BYTES * 8
 				}
 			},
 		}
@@ -523,14 +522,13 @@ impl SharedClientState {
 		// semaphore will ever hold and hang every upload/download forever. Reject it in *every*
 		// build, not only when `http-provider` (with its stricter half-budget rule below) is
 		// compiled in.
-		if config.file_io_memory_budget < CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE {
+		if config.file_io_memory_budget < FULL_CHUNK_BYTES {
 			return Err(Error::custom(
 				crate::ErrorKind::InvalidState,
 				format!(
 					"file_io_memory_budget ({}) is too small: it must hold at least one chunk \
 					 ({} bytes)",
-					config.file_io_memory_budget,
-					CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE
+					config.file_io_memory_budget, FULL_CHUNK_BYTES
 				),
 			));
 		}
@@ -540,14 +538,13 @@ impl SharedClientState {
 		// download. That cap is meaningless if half the budget cannot hold even one chunk, so
 		// reject such a configuration at construction rather than silently degrade.
 		#[cfg(feature = "http-provider")]
-		if config.file_io_memory_budget / 2 < CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE {
+		if config.file_io_memory_budget / 2 < FULL_CHUNK_BYTES {
 			return Err(Error::custom(
 				crate::ErrorKind::InvalidState,
 				format!(
 					"file_io_memory_budget ({}) is too small: half of it must hold at least one \
 					 chunk ({} bytes)",
-					config.file_io_memory_budget,
-					CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE
+					config.file_io_memory_budget, FULL_CHUNK_BYTES
 				),
 			));
 		}
@@ -1627,7 +1624,7 @@ mod thumbnail_gate_tests {
 
 #[cfg(test)]
 mod min_memory_budget_tests {
-	use super::{CHUNK_SIZE, ClientConfig, FILE_CHUNK_SIZE_EXTRA_USIZE, SharedClientState};
+	use super::{ClientConfig, FULL_CHUNK_BYTES, SharedClientState};
 
 	/// A budget below one full encrypted chunk can never satisfy `Chunk::acquire`'s `acquire_many`
 	/// (it would await more permits than the semaphore will ever hold), hanging every transfer.
@@ -1635,7 +1632,7 @@ mod min_memory_budget_tests {
 	/// feature (with its stricter half-budget rule) is compiled in.
 	#[tokio::test]
 	async fn rejects_budget_below_one_chunk() {
-		let one_chunk = CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE;
+		let one_chunk = FULL_CHUNK_BYTES;
 
 		// Half a chunk: acquire_many(chunk_size) would await more permits than exist -> hang.
 		assert!(
@@ -1660,13 +1657,13 @@ mod min_memory_budget_tests {
 
 #[cfg(all(test, feature = "http-provider"))]
 mod memory_budget_validation_tests {
-	use super::{CHUNK_SIZE, ClientConfig, FILE_CHUNK_SIZE_EXTRA_USIZE, SharedClientState};
+	use super::{ClientConfig, FULL_CHUNK_BYTES, SharedClientState};
 
 	/// `SharedClientState::new` rejects a memory budget whose half cannot hold one chunk, because
 	/// the HTTP provider caps a stream's read-ahead window at half the budget.
 	#[tokio::test]
 	async fn rejects_budget_whose_half_cannot_hold_one_chunk() {
-		let one_chunk = CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE;
+		let one_chunk = FULL_CHUNK_BYTES;
 
 		// budget == 1 chunk -> half is half a chunk -> rejected.
 		assert!(

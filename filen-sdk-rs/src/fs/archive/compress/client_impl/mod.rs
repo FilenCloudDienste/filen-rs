@@ -190,25 +190,17 @@ async fn plan_compression(
 		CompressSources::Keep(_) => Vec::new(),
 		CompressSources::Dispose { items, .. } => items.iter().map(|item| item.uuid()).collect(),
 	};
-	let refuse =
-		|report, phase, error| end_early(reporter, report, &requested, phase, Arc::new(error));
-	let checked = config
-		.format
-		.check_name(name.as_ref())
-		.and_then(|extension_len| {
-			let format = config
-				.format
-				.check_within(config.password, archives.codec_mem_budget)?;
-			sources.check_for(config.format)?;
-			Ok((extension_len, format))
-		});
+	let checked = checked_format(config.format, config.password, name, archives)
+		.and_then(|checked| sources.check_for(config.format).map(|()| checked));
 	let (extension_len, format) = match checked {
 		Ok(checked) => checked,
 		Err(error) => {
-			return Err(refuse(
+			return Err(end_early(
+				reporter,
 				CompressReport::default(),
+				&requested,
 				CompressPhase::Failed,
-				error,
+				Arc::new(error),
 			));
 		}
 	};
@@ -230,16 +222,99 @@ async fn plan_compression(
 			(sources, Some((how, items)))
 		}
 	};
-	let mut plan = match plan_sources(lister, sources, reporter, control).await {
+	let plan = plan_sources(lister, sources, reporter, control).await;
+	let Run {
+		report,
+		job,
+		sources,
+		disposed,
+	} = plan_to_run(
+		plan,
+		format,
+		dispose,
+		destination,
+		config.max_bytes,
+		reporter,
+		&requested,
+	)
+	.map_err(|failed| *failed)?;
+	reporter.set_plan(report.totals, &report.skipped, &report.renamed);
+
+	let disposal = disposed.map(|(how, sources)| CompressDisposal {
+		removal: match how {
+			SourceDisposal::Trash => Removal::Trash,
+			// a permanent disposal reads the archive back as extracting would
+			SourceDisposal::DeletePermanently => Removal::DeletePermanently {
+				read_back: ReadBack::as_extracting(&job, archives),
+			},
+		},
+		sources,
+	});
+	Ok(Planned {
+		extension_len,
+		report,
+		disposal,
+		job,
+		sources,
+	})
+}
+
+/// The length of the format's extension `name` ends in, and the format checked with its
+/// password, if its encoder fits in the archive settings' codec budget.
+fn checked_format(
+	format: CompressFormat,
+	password: Option<ArchivePassword>,
+	name: &ValidatedName,
+	archives: &ArchiveConfig,
+) -> Result<(usize, CheckedFormat), Error> {
+	let extension_len = format.check_name(name.as_ref())?;
+	let checked = format.check_within(password, archives.codec_mem_budget())?;
+	Ok((extension_len, checked))
+}
+
+/// What a compression runs once its sources are planned.
+struct Run {
+	/// The report so far: the plan's totals, skips and renames.
+	report: CompressReport,
+	job: CompressJob,
+	/// The files the codec reads, by source number.
+	sources: Vec<Source>,
+	/// How to remove the sources, and what that has to find.
+	disposed: Option<(SourceDisposal, Vec<DisposalSource>)>,
+}
+
+/// What to run, or the end of a compression that never starts: its scan was cancelled or
+/// failed, it cannot be written as planned, or it is a bare tar that needs more than
+/// `max_bytes`, whose size the report then gives in `needed_bytes`. Every source a disposal was
+/// asked for, `requested`, is reported kept.
+fn plan_to_run<D>(
+	plan: Result<ItemPlan<D>, ScanError>,
+	format: CheckedFormat,
+	dispose: Option<(SourceDisposal, Vec<NonRootItemType<'static, Normal>>)>,
+	destination: Uuid,
+	max_bytes: Option<u64>,
+	reporter: &Reporter,
+	requested: &[Uuid],
+) -> Result<Run, Box<CompressFailed>> {
+	let refuse = |report, phase, error| {
+		Box::new(end_early(
+			reporter,
+			report,
+			requested,
+			phase,
+			Arc::new(error),
+		))
+	};
+	let mut plan = match plan {
 		Ok(plan) => plan,
 		Err(ScanError::Stopped) => {
-			return Err(end_early(
+			return Err(Box::new(end_early(
 				reporter,
 				CompressReport::default(),
-				&requested,
+				requested,
 				CompressPhase::Cancelled,
 				cancelled(),
-			));
+			)));
 		}
 		Err(ScanError::Failed(error)) => {
 			return Err(refuse(
@@ -275,7 +350,7 @@ async fn plan_compression(
 			entries,
 		},
 		Some(max),
-	) = (&job, config.max_bytes)
+	) = (&job, max_bytes)
 	{
 		let needed = tar_size(entries);
 		if exceeds_limit(needed, max) {
@@ -287,24 +362,11 @@ async fn plan_compression(
 			return Err(refuse(report, CompressPhase::Failed, error));
 		}
 	}
-	reporter.set_plan(report.totals, &report.skipped, &report.renamed);
-
-	let disposal = disposed.map(|(how, sources)| CompressDisposal {
-		removal: match how {
-			SourceDisposal::Trash => Removal::Trash,
-			// a permanent disposal reads the archive back as extracting would
-			SourceDisposal::DeletePermanently => Removal::DeletePermanently {
-				read_back: ReadBack::as_extracting(&job, archives),
-			},
-		},
-		sources,
-	});
-	Ok(Planned {
-		extension_len,
+	Ok(Run {
 		report,
-		disposal,
 		job,
 		sources,
+		disposed,
 	})
 }
 

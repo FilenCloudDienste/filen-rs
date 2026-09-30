@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::blocking::send_catching_panic;
 use crate::{
 	Error, ErrorKind,
-	consts::{CALLBACK_INTERVAL, CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
+	consts::{CALLBACK_INTERVAL, CHUNK_SIZE, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 };
 
 use super::{
@@ -230,8 +230,8 @@ pub(crate) fn codec_failed(archive: Uuid, error: &Error, ended: bool) -> bool {
 	true
 }
 
-/// Starts a job's codec, once the job holds its slot and memory floor: the driver's end of it,
-/// whose codec returns `R`.
+/// Starts a job's codec, once the job holds its slot: the driver's end of it, whose codec
+/// returns `R`.
 pub(crate) type CodecStart<R> = Box<dyn FnOnce() -> Result<WorkerLink<R>, Error> + Send>;
 
 /// Marks the error of an exchange that failed because the driver went away or cancelled, which
@@ -729,7 +729,7 @@ impl Write for HeadSink<'_> {
 /// An empty chunk with room for the chunk's encryption overhead, so encrypting it in place never
 /// reallocates.
 fn new_chunk() -> Vec<u8> {
-	Vec::with_capacity(CHUNK_SIZE + FILE_CHUNK_SIZE_EXTRA_USIZE)
+	Vec::with_capacity(FULL_CHUNK_BYTES)
 }
 
 /// Hands the driver everything `reader` yields as the current file's data, in whole chunks;

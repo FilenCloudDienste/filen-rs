@@ -69,8 +69,6 @@ use crate::{
 struct HeldWhilePaused {
 	/// Whether the client's memory budget was all free.
 	memory_free: bool,
-	/// Whether every job's floor was free (the job's own, when no other runs).
-	floor_free: bool,
 	drive_locks: usize,
 }
 
@@ -131,11 +129,9 @@ fn start_with(setup: &Setup, options: Options, start: CodecStart<CodecResult>) -
 	let probe: Probe = {
 		let memory = Arc::clone(&setup.backend.memory);
 		let budget = setup.backend.budget;
-		let config = options.config.clone();
 		let live_locks = Arc::clone(&setup.backend.live_locks);
 		Box::new(move || HeldWhilePaused {
 			memory_free: memory.available_permits() == budget,
-			floor_free: config.floor_is_free(),
 			drive_locks: live_locks.load(Ordering::SeqCst),
 		})
 	};
@@ -602,14 +598,13 @@ fn one_slot() -> ArchiveConfig {
 	config
 }
 
-/// Asserts a paused job holds nothing it gives back: memory, its floor, a drive lock, an
-/// operation in flight.
-fn assert_paused_holding_nothing(setup: &Setup, job: &Job, config: &ArchiveConfig) {
+/// Asserts a paused job holds nothing it gives back: memory, a drive lock, an operation in
+/// flight.
+fn assert_paused_holding_nothing(setup: &Setup, job: &Job) {
 	assert!(job.reporter.is_paused());
 	let held = job.recorder.held_while_paused.lock().unwrap().clone();
 	let nothing = HeldWhilePaused {
 		memory_free: true,
-		floor_free: true,
 		drive_locks: 0,
 	};
 	assert!(
@@ -621,7 +616,6 @@ fn assert_paused_holding_nothing(setup: &Setup, job: &Job, config: &ArchiveConfi
 		setup.backend.budget,
 		"a paused job holds no memory"
 	);
-	assert!(config.floor_is_free(), "a paused job holds no floor");
 	assert_eq!(
 		setup.backend.live_locks.load(Ordering::SeqCst),
 		0,
@@ -706,8 +700,8 @@ fn a_directory_slot_holds_no_directory() {
 	// an archive may plan as many directories as it holds members: each slot keeps its created
 	// directory's uuid, not the directory, which is built again only for a failure's retry
 	assert!(
-		size_of::<DirSlot>() <= 152,
+		size_of::<dirs::DirSlot>() <= 152,
 		"{} bytes",
-		size_of::<DirSlot>()
+		size_of::<dirs::DirSlot>()
 	);
 }

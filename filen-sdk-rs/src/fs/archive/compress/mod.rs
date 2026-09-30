@@ -455,7 +455,7 @@ mod tests {
 	use filen_types::fs::Uuid;
 
 	use super::*;
-	use crate::fs::archive::test_support::remote_file;
+	use crate::fs::drive_job::test_support::remote_file;
 
 	fn compression(codec: StreamCodec) -> Compression {
 		Compression { codec, level: None }

@@ -23,7 +23,6 @@ use super::{
 	FLAG_ENCRYPTED, FLAG_UTF8, HOST_OS_X, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES, METHOD_BZIP2,
 	METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_STORED, METHOD_XZ, METHOD_ZSTD, cp437,
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
-	method_supported,
 };
 use crate::fs::drive_job::exceeds_limit;
 use crate::{
@@ -718,6 +717,25 @@ pub(crate) fn unaccounted_after<R: Read + Seek>(
 	}
 }
 
+impl ZipEntry {
+	/// Whether [`open_entry`] reads the entry's compression method under its encryption.
+	pub(crate) fn supported(&self) -> bool {
+		self.unsupported().is_none()
+	}
+
+	/// What of the entry [`open_entry`] cannot read, if anything: its compression method, or
+	/// that method under its encryption. LZMA and XZ have their own memory limits, which the
+	/// encrypted forms would first have to buffer around: only their plain forms are read.
+	pub(crate) fn unsupported(&self) -> Option<&'static str> {
+		match self.method {
+			METHOD_STORED | METHOD_DEFLATE | METHOD_DEFLATE64 | METHOD_BZIP2 | METHOD_ZSTD => None,
+			METHOD_LZMA | METHOD_XZ if self.encryption == ZipEncryption::None => None,
+			METHOD_LZMA | METHOD_XZ => Some("an encrypted LZMA or XZ entry"),
+			_ => Some("a compression method"),
+		}
+	}
+}
+
 /// Memory a zip entry's decoder may use.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EntryLimits {
@@ -770,19 +788,12 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 			)?)
 		}
 	};
-	let encrypted = entry.encryption != ZipEncryption::None;
 	// the decompressor reads through a shared handle, so what it leaves (an AES entry's last
 	// bytes and its authentication code) can be read to the end once it is done
 	let decrypted = Shared(Rc::new(RefCell::new(decrypted)));
 	let rest = decrypted.clone();
-	if !method_supported(entry.method, encrypted) {
-		return Err(ZipError::Unsupported(
-			if method_supported(entry.method, false) {
-				"an encrypted LZMA or XZ entry"
-			} else {
-				"a compression method"
-			},
-		));
+	if let Some(what) = entry.unsupported() {
+		return Err(ZipError::Unsupported(what));
 	}
 	let decoded: Box<dyn Read + 's> = match entry.method {
 		METHOD_STORED => Box::new(decrypted),
@@ -792,7 +803,7 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 		METHOD_LZMA => lzma_entry(Box::new(decrypted), entry, limits)?,
 		METHOD_ZSTD => stream_entry(StreamCodec::Zstd, decrypted, limits)?,
 		METHOD_XZ => stream_entry(StreamCodec::Xz, decrypted, limits)?,
-		_ => return Err(ZipError::Unsupported("a compression method")),
+		_ => unreachable!("unsupported() refused every other method above"),
 	};
 	let check_crc = !matches!(
 		entry.encryption,

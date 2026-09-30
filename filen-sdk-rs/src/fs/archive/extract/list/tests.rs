@@ -184,7 +184,6 @@ async fn a_tar_listing_reads_it_all_and_can_be_paused_and_cancelled() {
 	pause.send_replace(true);
 	paused.backend.release_all();
 	wait_until("the listing is paused", || listing.reporter.is_paused()).await;
-	assert!(config.floor_is_free());
 	assert_eq!(
 		paused.backend.memory.available_permits(),
 		paused.backend.budget
@@ -235,7 +234,6 @@ async fn a_tar_listing_reads_it_all_and_can_be_paused_and_cancelled() {
 		(ListPhase::Cancelled, Some(Duration::ZERO))
 	);
 	assert_eq!(listing.reporter.ops_in_flight(), 0);
-	assert!(config.floor_is_free());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

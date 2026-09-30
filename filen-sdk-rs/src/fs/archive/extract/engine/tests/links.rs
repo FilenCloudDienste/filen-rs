@@ -487,7 +487,7 @@ async fn a_link_copy_is_paused_as_any_transfer() {
 	pause.send_replace(true);
 	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &test_config());
+	assert_paused_holding_nothing(&setup, &job);
 	pause.send_replace(false);
 	job.running.await.unwrap().unwrap();
 	let files = finished(&setup);

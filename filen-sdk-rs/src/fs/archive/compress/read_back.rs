@@ -7,13 +7,13 @@
 //! Trashed sources can be restored, so a disposal to the trash is not read back.
 //!
 //! The read goes through the same reader, limits and input as extracting (see
-//! [`CodecFeed`]): its memory is the codec's budget and the job's two-chunk floor, the chunk
-//! being fetched and the one the reader holds, with chunks fetched ahead only while the client's
-//! memory has room right now. A zip's or 7z's reader also keeps up to two chunks it read before,
-//! part of its own state as when extracting. A pause is seen when the reader asks for a chunk
-//! not fetched yet: the fetches in flight finish, the floor and what was fetched ahead are given
-//! back, and the reader's state, with the chunk it holds, stays resident; nothing of the
-//! client's memory budget is held.
+//! [`CodecFeed`]): its memory is the codec's budget and the feed's floor of one input chunk, the
+//! chunk being fetched or the one the reader holds, with chunks fetched ahead only while the
+//! client's memory has room right now. A zip's or 7z's reader also keeps up to two chunks it read
+//! before, part of its own state as when extracting. A pause is seen when the reader asks for a
+//! chunk not fetched yet: the fetches in flight finish, what was fetched ahead is given back, and
+//! the reader's state, with the chunk it holds, stays resident; nothing of the client's memory
+//! budget is held.
 
 use std::{
 	collections::{HashMap, HashSet},
@@ -56,8 +56,6 @@ pub(crate) struct ReadBack {
 	/// The archive's directories, by path.
 	pub(crate) dirs: Vec<String>,
 	pub(crate) start: StartReadBack,
-	/// Where the reader's memory floor comes from.
-	pub(crate) config: ArchiveConfig,
 }
 
 impl ReadBack {
@@ -79,7 +77,7 @@ impl ReadBack {
 			CompressJob::Single { .. } => (Vec::new(), None),
 		};
 		let limits = CodecLimits {
-			decoder_memory: config.codec_mem_budget,
+			decoder_memory: config.codec_mem_budget(),
 			max_members: config.max_members,
 			// the archive is the job's own: whatever it expands to was read to write it
 			expansion: None,
@@ -101,14 +99,12 @@ impl ReadBack {
 				};
 				worker::start(move |port| extract_stream(&port, job))
 			}),
-			config: config.clone(),
 		}
 	}
 }
 
 /// Whether `archive` reads back as exactly `files` (each by its path, with the BLAKE3 of what was
-/// read of its source) and the directories of `read_back`. `Err` once the job stops; a pause
-/// holds no floor.
+/// read of its source) and the directories of `read_back`. `Err` once the job stops.
 pub(crate) async fn reads_back<B: DriveBackend>(
 	backend: &Arc<B>,
 	control: &JobControl,
@@ -117,11 +113,7 @@ pub(crate) async fn reads_back<B: DriveBackend>(
 	read_back: ReadBack,
 	files: HashMap<String, blake3::Hash>,
 ) -> Result<bool, Stopped> {
-	let ReadBack {
-		dirs,
-		start,
-		config,
-	} = read_back;
+	let ReadBack { dirs, start } = read_back;
 	let checked = Check {
 		files,
 		dirs: dirs.into_iter().collect(),
@@ -136,13 +128,7 @@ pub(crate) async fn reads_back<B: DriveBackend>(
 		Err(error) => return Ok(unread(archive, &Unread::Failed(error))),
 	};
 	reporter.verifying(archive.size());
-	let reading = Reading {
-		backend,
-		control,
-		reporter,
-		config: &config,
-	};
-	match read(reading, archive, link, checked).await? {
+	match read(backend, control, reporter, archive, link, checked).await? {
 		Ok(()) => Ok(true),
 		Err(why) => Ok(unread(archive, &why)),
 	}
@@ -248,30 +234,18 @@ impl Check {
 	}
 }
 
-/// What serving the reader takes from its job.
-struct Reading<'a, B> {
-	backend: &'a Arc<B>,
-	control: &'a JobControl,
-	reporter: &'a MaybeArc<Reporter>,
-	config: &'a ArchiveConfig,
-}
-
 /// Serves the reading codec the archive's chunks and checks what it reads; the outer `Err` once
 /// the job stops, the inner one with why the archive did not read back.
 async fn read<B: DriveBackend>(
-	Reading {
-		backend,
-		control,
-		reporter,
-		config,
-	}: Reading<'_, B>,
+	backend: &Arc<B>,
+	control: &JobControl,
+	reporter: &MaybeArc<Reporter>,
 	archive: &RemoteFile,
 	link: WorkerLink<ReadBackResult>,
 	mut check: Check,
 ) -> Result<Result<(), Unread>, Stopped> {
-	let floor = control.until_stopping(config.floor()).await?;
 	let file = Arc::new(RemoteFileType::from(archive.clone()));
-	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, (floor, reporter.op()));
+	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, reporter.op());
 	// what the reader read so far, each chunk counted once however often it asks for it
 	let mut verified = 0;
 	let mut report_verified = |feed: &CodecFeed<B, ArchiveEnd>| {
@@ -290,7 +264,7 @@ async fn read<B: DriveBackend>(
 			// has read the ones before, and nothing is in flight
 			if feed.owes_codec() && !feed.fetching() {
 				report_verified(&feed);
-				feed.wait_out_pause(reporter, control, config).await?;
+				feed.wait_out_pause(reporter, control).await?;
 				continue;
 			}
 		} else {

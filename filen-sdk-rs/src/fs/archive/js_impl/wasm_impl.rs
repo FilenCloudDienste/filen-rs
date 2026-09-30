@@ -449,7 +449,7 @@ impl JsClient {
 				password: checked_password(password)?,
 			},
 			params.dispose,
-			self.inner_ref().archives().codec_mem_budget,
+			self.inner_ref().archives().codec_mem_budget(),
 		)?;
 		let callbacks = CompressCallbacks {
 			on_update: params.on_update,

@@ -5,11 +5,10 @@
 //!
 //! Memory, pause and cancel work as in extraction (see the extract engine): a two-chunk floor
 //! for one input and one output chunk, more only from the client's budget when it is free right
-//! now, and a pause that gives back the floor, the prefetched chunks and every reservation from
-//! the client's budget once in-flight work is done. A paused job keeps its codec's state and the
-//! source chunk the codec is reading resident. Once the codec is done the floor is given back;
-//! reading the archive back before a permanent disposal takes it again, and pauses the same way
-//! (see [`read_back`](super::read_back)).
+//! now, and a pause that gives back the prefetched chunks and every reservation from the
+//! client's budget once in-flight work is done. A paused job keeps its codec's state and the
+//! source chunk the codec is reading resident. Reading the archive back before a permanent
+//! disposal has a floor of its own, and pauses the same way (see [`read_back`](super::read_back)).
 
 use std::{
 	collections::{BTreeSet, HashMap, VecDeque},
@@ -108,7 +107,7 @@ pub(crate) struct CompressTask<B> {
 	pub(crate) config: ArchiveConfig,
 	/// The codec sends the archive's first chunk last ([`WorkerEvent::Head`]).
 	pub(crate) head_last: bool,
-	/// Starts the codec; called once the job holds its lease and memory floor.
+	/// Starts the codec; called once the job holds its lease.
 	pub(crate) start: CodecStart<CodecResult>,
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
@@ -225,9 +224,9 @@ struct Driver<B: DriveBackend> {
 	backend: Arc<B>,
 	control: JobControl,
 	reporter: MaybeArc<Reporter>,
-	config: ArchiveConfig,
 	link: WorkerLink<CodecResult>,
-	floor: Option<OwnedSemaphorePermit>,
+	/// The job's floor: one chunk of input and one of output it can always take, outside the
+	/// client's budget, so it never waits on memory a transfer or another job holds.
 	input_slot: Arc<Semaphore>,
 	output_slot: Arc<Semaphore>,
 	memory: Arc<Semaphore>,
@@ -305,12 +304,12 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		}
 	}
 
-	// Leased and floored before anything is read, so a waiting job holds nothing and does
+	// Leased before anything is read, so a waiting job holds nothing and does
 	// nothing. A pause asked for before then is recorded first: the job reads paused while it
 	// waits it out, never running.
 	reporter.set_pause_requested(control.is_pause_requested());
 	reporter.set_phase(CompressPhase::WaitingForWorker);
-	let Ok((_lease, floor)) = config.admit(&control, &reporter.ops()).await else {
+	let Ok(_lease) = config.admit(&control, &reporter.ops()).await else {
 		reporter.wind_down(&control);
 		return Err(fail(report, CompressPhase::Cancelled, cancelled()));
 	};
@@ -340,9 +339,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		backend,
 		control,
 		reporter,
-		config,
 		link,
-		floor: Some(floor),
 		input_slot: Arc::new(Semaphore::new(1)),
 		output_slot: Arc::new(Semaphore::new(1)),
 		memory,
@@ -526,7 +523,7 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	/// Waits out a pause, giving back the floor and every prefetched chunk. The chunk the codec
+	/// Waits out a pause, giving back every prefetched chunk. The chunk the codec
 	/// is reading stays resident until it asks again, held against the job's own input slot
 	/// instead of the client's memory budget.
 	async fn pause(&mut self) -> Result<(), Stopped> {
@@ -535,7 +532,6 @@ impl<B: DisposalBackend> Driver<B> {
 		self.fetches = FuturesOrdered::new();
 		self.ready.clear();
 		self.next_fetch = self.next_served;
-		self.floor = None;
 		if self.reading.take().is_some() {
 			// nothing else holds the slot once the prefetched chunks are dropped
 			self.reading = Arc::clone(&self.input_slot).try_acquire_owned().ok();
@@ -545,10 +541,7 @@ impl<B: DisposalBackend> Driver<B> {
 			);
 		}
 		drop(releasing);
-		self.reporter.checkpoint(&self.control).await?;
-		let floor = self.control.until_stopping(self.config.floor()).await?;
-		self.floor = Some(floor);
-		Ok(())
+		self.reporter.checkpoint(&self.control).await
 	}
 
 	fn advance(&mut self) {
@@ -774,9 +767,6 @@ impl<B: DisposalBackend> Driver<B> {
 		requested: &[Uuid],
 		incomplete: bool,
 	) -> Result<(RemoteFile, Vec<SourceDisposition>), Stopped> {
-		// the codec is done: registering and removing the sources hold no memory floor, and
-		// reading the archive back takes its own
-		self.floor = None;
 		self.reporter.set_phase(CompressPhase::Finishing);
 		// the destination may have been shared or linked since the job started
 		let refetched = self

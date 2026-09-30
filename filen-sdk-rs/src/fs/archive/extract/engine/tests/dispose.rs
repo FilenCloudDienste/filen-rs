@@ -527,7 +527,7 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 	pause.send_replace(true);
 	setup.backend.release_all();
 	wait_until("the job is paused", || job.reporter.is_paused()).await;
-	assert_paused_holding_nothing(&setup, &job, &config);
+	assert_paused_holding_nothing(&setup, &job);
 	assert!(
 		setup.backend.log().trashed_files.is_empty(),
 		"the archive is not removed while paused"
