@@ -204,7 +204,7 @@ pub(super) fn observe_local(
 	// entries it holds, and a rule file sorts after siblings whose names start below `.`, so
 	// rewriting in the loop can file the directory AFTER something under it. `covered` only looks
 	// upward, so both would stand — and two nested observations are what `merge_local` and
-	// `assembly_accounted` are both written against.
+	// `assembly_bounds` are both written against.
 	let dirty: BTreeSet<&str> = dirty
 		.iter()
 		.map(|path| rule_file_dir(path).unwrap_or(path))
@@ -583,7 +583,7 @@ mod tests {
 	/// A dirty rule file is observed as its DIRECTORY, and that directory answers for the entries
 	/// under it — including a dirty sibling whose name sorts before `.filenignore`, which the set
 	/// hands over first. Two observations that nest would break the rule `derive::merge_local` and
-	/// `engine::assembly_accounted` are written against.
+	/// `engine::assembly_bounds` are written against.
 	#[test]
 	fn a_dirty_rule_file_is_observed_as_the_directory_that_holds_its_siblings() {
 		let root = temp_root();

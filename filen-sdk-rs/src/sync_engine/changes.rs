@@ -192,7 +192,7 @@ pub enum FullPassReason {
 	/// pass reads everything rather than leaving it to the safety net.
 	IncompleteObservation,
 	/// A change-scoped pass's assembled local map did not account for the rows and observations it
-	/// was built from (see `engine::assembly_accounted`). Deriving again from the same rows would
+	/// was built from (see `engine::assembly_bounds`). Deriving again from the same rows would
 	/// reproduce the miscount, so the next pass reads both sides.
 	AssemblyMismatch,
 }
