@@ -10,7 +10,7 @@
 //! [`ArchiveConfig::job_concurrency`]: super::ArchiveConfig::job_concurrency
 
 mod client_impl;
-pub(crate) mod codec;
+mod codec;
 mod engine;
 mod read_back;
 mod report;
@@ -18,7 +18,7 @@ mod report;
 pub use client_impl::{CompressConfig, CompressRequest};
 pub use report::{
 	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
-	CompressPhase, CompressReport, CompressUpdate, HashMismatch, RunState,
+	CompressPhase, CompressReport, CompressUpdate, HashMismatch,
 };
 
 use std::ops::RangeInclusive;
@@ -33,19 +33,13 @@ use crate::{
 	},
 };
 
-pub use super::{
-	encode::Compression,
-	format::StreamCodec,
-	password::ArchivePassword,
-	sevenz::write::{SevenZEncryption, SevenZMethod},
-	zip::{crypto::AesStrength, write::ZipMethod},
-};
-pub use crate::fs::drive_job::{
-	listing::{ItemSource, ItemSourceDir, ScanProgress},
-	plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
-};
+pub use super::{encode::Compression, zip::write::ZipMethod};
+pub use crate::fs::drive_job::listing::ItemSource;
 
-use super::format::{ArchiveFormat, match_extension};
+use super::{
+	AesStrength, ArchiveFormat, SevenZEncryption, SevenZMethod, StreamCodec,
+	format::match_extension,
+};
 
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]

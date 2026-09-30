@@ -1,13 +1,15 @@
 //! A heap meter for the lib's tests: the peak of live bytes allocated on the current thread
-//! while measuring. It counts per thread, so tests running in parallel do not see each other's
-//! allocations; it sees only Rust allocations, which every codec the archives use makes.
+//! while measuring. It is the lib test binary's global allocator (see the crate root) and
+//! forwards every call to the system allocator. It counts per thread, so tests running in
+//! parallel do not see each other's allocations; it sees only Rust allocations, which every codec
+//! the archives use makes.
 
 use std::{
 	alloc::{GlobalAlloc, Layout, System},
 	cell::Cell,
 };
 
-struct Meter;
+pub(crate) struct Meter;
 
 // const-initialized and without destructors: reading them never allocates, which the
 // allocator itself relies on
@@ -36,15 +38,21 @@ fn note(delta: isize) {
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for Meter {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-		note(layout.size() as isize);
 		// SAFETY: the caller's layout, under the contract this method was called with.
-		unsafe { System.alloc(layout) }
+		let ptr = unsafe { System.alloc(layout) };
+		if !ptr.is_null() {
+			note(layout.size() as isize);
+		}
+		ptr
 	}
 
 	unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-		note(layout.size() as isize);
 		// SAFETY: the caller's layout, under the contract this method was called with.
-		unsafe { System.alloc_zeroed(layout) }
+		let ptr = unsafe { System.alloc_zeroed(layout) };
+		if !ptr.is_null() {
+			note(layout.size() as isize);
+		}
+		ptr
 	}
 
 	unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -54,15 +62,16 @@ unsafe impl GlobalAlloc for Meter {
 	}
 
 	unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-		note(new_size as isize - layout.size() as isize);
 		// SAFETY: `ptr` was allocated by `System` with `layout`, and `new_size` meets the
 		// contract this method was called with.
-		unsafe { System.realloc(ptr, layout, new_size) }
+		let new = unsafe { System.realloc(ptr, layout, new_size) };
+		// a null result leaves the old block allocated as it was
+		if !new.is_null() {
+			note(new_size as isize - layout.size() as isize);
+		}
+		new
 	}
 }
-
-#[global_allocator]
-static METER: Meter = Meter;
 
 /// What `f` returns, and the most bytes it held allocated on this thread at once.
 pub(crate) fn peak_bytes<T>(f: impl FnOnce() -> T) -> (T, u64) {

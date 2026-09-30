@@ -378,7 +378,7 @@ mod tests {
 	use filen_types::fs::Uuid;
 
 	use super::LinkTargets;
-	use crate::fs::archive::alloc_meter;
+	use crate::alloc_meter;
 
 	#[test]
 	fn a_tars_link_targets_take_at_most_96_bytes_a_file() {

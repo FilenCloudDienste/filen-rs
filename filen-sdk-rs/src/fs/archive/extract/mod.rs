@@ -2,10 +2,10 @@
 //! [`Client::extract_archive`](crate::auth::Client::extract_archive).
 
 mod client_impl;
-pub(crate) mod codec;
+pub(super) mod codec;
 mod engine;
 mod list;
-pub(crate) mod report;
+pub(super) mod report;
 #[cfg(test)]
 mod test_support;
 
@@ -14,20 +14,13 @@ use filen_macros::js_type;
 use crate::{
 	Error, ErrorKind,
 	fs::{
-		archive::dispose::SourceDisposal,
+		archive::{ArchivePassword, SourceDisposal},
 		categories::{DirType, Normal},
 		file::{RemoteFile, enums::RemoteFileType},
 		name::ValidatedName,
 	},
 };
 
-pub use crate::fs::{
-	archive::{
-		format::{ArchiveFormat, archive_default_name},
-		password::ArchivePassword,
-	},
-	drive_job::counts::ItemCounts,
-};
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 pub(crate) use client_impl::check_entries;
 pub use list::{
@@ -38,7 +31,7 @@ pub use report::{
 	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
 	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, OmittedRecords, RunState,
+	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, OmittedRecords,
 };
 
 /// Where an archive's entries are created.

@@ -56,6 +56,11 @@ jobs:
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy single-threaded
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed --no-default-features -- -D warnings
+      - name: Run clippy without archive
+        # Package-scoped and library only: at the workspace root, or with the tests and their
+        # test-utils dev-dependency, the crates that depend on filen-sdk-rs turn its default
+        # features, archive among them, back on.
+        run: cargo clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache --lib -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests

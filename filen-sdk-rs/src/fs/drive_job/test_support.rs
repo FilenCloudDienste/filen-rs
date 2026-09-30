@@ -663,10 +663,7 @@ impl DriveBackend for FakeBackend {
 	}
 }
 
-#[cfg(any(
-	not(all(target_family = "wasm", target_os = "unknown")),
-	feature = "wasm-full"
-))]
+#[cfg(feature = "archive")]
 mod disposal {
 	use super::*;
 	use crate::fs::archive::dispose::{DisposalBackend, FileState, Tree};

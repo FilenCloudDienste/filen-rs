@@ -98,7 +98,7 @@ Test notes:
 
 ## Feature Flags
 
-`filen-sdk-rs` (most flags are additive and off by default; `default = ["multi-threaded-crypto"]`):
+`filen-sdk-rs` (most flags are additive and off by default; `default = ["multi-threaded-crypto", "archive"]`):
 
 | Feature | What it enables |
 |---------|-----------------|
@@ -108,6 +108,7 @@ Test notes:
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
+| `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata) — never enable in production |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
@@ -158,7 +159,10 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   the heavier checks: the `heif-decoder` feature-combination clippy, `clippy --tests`,
   both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
   and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
-  ships), full `sqlfluff lint .`, and `cargo test --lib --no-fail-fast`. This is the hook
+  ships), full `sqlfluff lint .`, `cargo test --lib --no-fail-fast`, and a package-scoped
+  `cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache` for the binding layers'
+  tests (`fs/*/js_impl*`, `js/uniffi.rs`), which are gated on `uniffi` and so never built by
+  the workspace run, since no workspace member turns it on. This is the hook
   that needs `meson` / `ninja` (/ `nasm` on x86) and `WASI_SDK_PATH`; it stops with an
   install message rather than degrading the feature set. `SKIP_HEAVY_CLIPPY=1` builds no
   vendored C++ at all — it skips the `heif-decoder` passes, native and wasm, *and* adds
@@ -166,8 +170,10 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   the crate anyway (see below); it is the escape hatch if you have no wasi-sdk; `SKIP_TESTS=1` and `SKIP_SQLFLUFF=1` skip theirs.
 
 Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally lints with
-`filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache`, and
-cross-compiles for Android, iOS and Windows — none of which the hooks attempt. `ci.yml`
+`filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache` and a
+package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache --lib`
+that builds the SDK without `archive`, and cross-compiles for Android, iOS and Windows — none of
+which the hooks attempt. `ci.yml`
 runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
 pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the fast checks
 a branch that skipped the hooks would miss: the diff policy and commit-message checks
@@ -229,6 +235,13 @@ building a configuration that never ships.
 | `uniffi-bindgen` / `uniffi-bindgen-swift` | Thin wrappers to drive UniFFI codegen for Kotlin and Swift |
 | `filen-cli` | CLI tool for interacting with Filen drive |
 | `filen-rclone-wrapper` | Rclone integration wrapper |
+
+`ruzstd` comes from a fork pinned by rev (`filen-sdk-rs/Cargo.toml`): 0.9.0 plus a bound on
+what one zstd block decodes to, sent upstream as https://github.com/KillingSpark/zstd-rs/pull/124.
+`fs/archive/decode/zstd.rs` fails the build against a ruzstd without it. Its `unsafe` (in the
+ring and decode buffers) is upstream's, untouched by the fork. Once a release carries the bound,
+go back to it and drop the guard, or make it name what that release reports for a block past
+128 KiB.
 
 ## Architecture
 

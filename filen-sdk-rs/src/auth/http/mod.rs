@@ -99,25 +99,16 @@ pub struct ClientConfig {
 	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
 	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`.
 	thumbnail_decode_concurrency: usize,
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	/// See [`ClientConfig::with_archive_codec_mem_budget`].
 	archive_codec_mem_budget: u64,
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	/// See [`ClientConfig::with_archive_job_concurrency`].
 	archive_job_concurrency: usize,
 }
 
 impl ClientConfig {
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	/// Memory for one archive job's codec state (a dictionary, window or model). Extracting an
 	/// archive whose decoder needs more fails with
 	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind::ArchiveTooLarge); compressing into a
@@ -131,10 +122,7 @@ impl ClientConfig {
 		self
 	}
 
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	/// How many archive jobs (extracting, compressing) run at once; later ones wait. Ignored on
 	/// wasm, where one runs at a time per page.
 	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
@@ -252,15 +240,9 @@ impl Default for ClientConfig {
 			thumbnail_mem_budget: APP_PROCESS_MEM_BUDGET,
 			thumbnail_max_source_bytes: MAX_THUMBNAIL_SOURCE_BYTES,
 			thumbnail_decode_concurrency: 2,
-			#[cfg(any(
-				not(all(target_family = "wasm", target_os = "unknown")),
-				feature = "wasm-full"
-			))]
+			#[cfg(feature = "archive")]
 			archive_codec_mem_budget: crate::fs::archive::config::CODEC_MEM_BUDGET,
-			#[cfg(any(
-				not(all(target_family = "wasm", target_os = "unknown")),
-				feature = "wasm-full"
-			))]
+			#[cfg(feature = "archive")]
 			archive_job_concurrency: crate::fs::archive::config::JOB_CONCURRENCY,
 			file_io_memory_budget: {
 				#[cfg(not(target_os = "ios"))]
@@ -323,20 +305,14 @@ pub struct JsClientConfig {
 	/// into a format whose encoder needs more is refused with `InsufficientMemory`
 	/// (`archiveMaxLevel` finds the highest level that fits, `archiveCodecMemBudget` reads the
 	/// budget in effect).
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub archive_codec_mem_budget: Option<u64>,
 	/// How many archive jobs (extracting, listing, compressing) run at once, later ones waiting;
 	/// the platform's when left out (1 on mobile, 2 elsewhere; at least 1). Ignored on the web,
 	/// where one runs at a time per page.
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub archive_job_concurrency: Option<u32>,
@@ -398,10 +374,7 @@ impl From<JsClientConfig> for ClientConfig {
 				.with_thumbnail_decode_concurrency((thumbnail_decode_concurrency as usize).max(1));
 		}
 		// no clamping here: ArchiveConfig clamps both to their range
-		#[cfg(any(
-			not(all(target_family = "wasm", target_os = "unknown")),
-			feature = "wasm-full"
-		))]
+		#[cfg(feature = "archive")]
 		{
 			if let Some(budget) = value.archive_codec_mem_budget {
 				config = config.with_archive_codec_mem_budget(budget);
@@ -539,11 +512,8 @@ pub(crate) struct SharedClientState {
 	#[cfg(feature = "http-provider")]
 	file_io_memory_budget: usize,
 	thumbnails: ThumbnailConfig,
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
-	archives: crate::fs::archive::config::ArchiveConfig,
+	#[cfg(feature = "archive")]
+	archives: crate::fs::archive::ArchiveConfig,
 }
 
 impl SharedClientState {
@@ -584,11 +554,8 @@ impl SharedClientState {
 
 		// Built before `config.log_level` is moved out below.
 		let thumbnails = ThumbnailConfig::new(&config);
-		#[cfg(any(
-			not(all(target_family = "wasm", target_os = "unknown")),
-			feature = "wasm-full"
-		))]
-		let archives = crate::fs::archive::config::ArchiveConfig::new(
+		#[cfg(feature = "archive")]
+		let archives = crate::fs::archive::ArchiveConfig::new(
 			config.archive_codec_mem_budget,
 			config.archive_job_concurrency,
 		);
@@ -641,10 +608,7 @@ impl SharedClientState {
 			#[cfg(feature = "http-provider")]
 			file_io_memory_budget: config.file_io_memory_budget,
 			thumbnails,
-			#[cfg(any(
-				not(all(target_family = "wasm", target_os = "unknown")),
-				feature = "wasm-full"
-			))]
+			#[cfg(feature = "archive")]
 			archives,
 		})
 	}
@@ -657,11 +621,8 @@ impl SharedClientState {
 		&self.thumbnails
 	}
 
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
-	pub(crate) fn archives(&self) -> &crate::fs::archive::config::ArchiveConfig {
+	#[cfg(feature = "archive")]
+	pub(crate) fn archives(&self) -> &crate::fs::archive::ArchiveConfig {
 		&self.archives
 	}
 

@@ -3,7 +3,7 @@
 //!
 //! The codec parks its thread on every exchange, so it never runs on a thread that drives async
 //! tasks: natively it gets a thread of its own per job, on wasm it runs on the archive purpose's
-//! long-lived worker (see [`WorkerSlot`](crate::blocking::WorkerSlot)). The driver owns
+//! long-lived worker (see `blocking::WorkerSlot`, which exists only there). The driver owns
 //! everything else: the network, memory reservations, the drive lock, names and reporting.
 //!
 //! No chunk waits in a channel unaccounted for. The codec asks for its input one chunk at a time

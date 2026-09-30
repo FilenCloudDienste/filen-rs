@@ -13,9 +13,9 @@ use lzma_rust2::{
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
 use super::*;
-use crate::fs::archive::{
+use crate::{
 	alloc_meter::peak_bytes,
-	test_support::{damaged_copies, gzip},
+	fs::archive::test_support::{damaged_copies, gzip},
 };
 
 const MIB_USIZE: usize = 1024 * 1024;

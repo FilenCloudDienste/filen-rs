@@ -1,9 +1,4 @@
-// Needs a thread it may block for an archive's codec, which the service-worker build (no atomics)
-// does not have.
-#[cfg(any(
-	not(all(target_family = "wasm", target_os = "unknown")),
-	feature = "wasm-full"
-))]
+#[cfg(feature = "archive")]
 pub mod archive;
 pub mod cache;
 pub mod categories;

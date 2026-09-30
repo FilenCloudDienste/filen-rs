@@ -46,6 +46,7 @@ use crate::{
 };
 
 use super::{
+	ArchiveFormat,
 	compress::{
 		self, CompressActiveFile, CompressCallback, CompressConfig, CompressCounts, CompressFormat,
 		CompressPhase, CompressRequest, CompressSources, HashMismatch,
@@ -53,12 +54,11 @@ use super::{
 	dispose::{self, SourceDisposal},
 	entry_path::joined,
 	extract::{
-		self, ArchiveEntry, ArchiveEntryId, ArchiveFormat, ArchiveSource, ArchiveTotals,
-		DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
-		ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry, ExtractRequest,
-		ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractTopLevelTrashed,
-		ListCallback, ListConfig, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords,
-		PasswordCheck,
+		self, ArchiveEntry, ArchiveEntryId, ArchiveSource, ArchiveTotals, DuplicateEntries,
+		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
+		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractSkippedEntry, ExtractStage,
+		ExtractTopLevelKey, ExtractTopLevelTrashed, ListCallback, ListConfig, ListPhase,
+		ListTotals, MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
 	},
 	password::ArchivePassword,
 };

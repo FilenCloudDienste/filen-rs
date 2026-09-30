@@ -282,9 +282,9 @@ mod tests {
 	use std::io::Read;
 
 	use super::*;
-	use crate::fs::archive::{
+	use crate::{
 		alloc_meter::peak_bytes,
-		decode::{StreamCheck, open_stream},
+		fs::archive::decode::{StreamCheck, open_stream},
 	};
 
 	const CODECS: [StreamCodec; 8] = [

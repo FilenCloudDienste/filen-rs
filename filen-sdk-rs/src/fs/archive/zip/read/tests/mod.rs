@@ -11,8 +11,8 @@ use std::{
 	io::{Cursor, Write},
 };
 
+use ::zip::{AesMode, CompressionMethod, write::SimpleFileOptions};
 use chrono::TimeZone;
-use zip8::{AesMode, CompressionMethod, write::SimpleFileOptions};
 
 use super::*;
 use crate::fs::archive::{
@@ -166,7 +166,7 @@ fn the_zip_crate_reads_our_zips() {
 			method,
 			encryption.map(|strength| (&b"pw"[..], strength)),
 		);
-		let mut archive = zip8::ZipArchive::new(Cursor::new(&zip)).unwrap();
+		let mut archive = ::zip::ZipArchive::new(Cursor::new(&zip)).unwrap();
 		assert_eq!(archive.len(), sample.len());
 		for (path, data) in &sample {
 			let Some(data) = data else {
@@ -195,7 +195,7 @@ fn we_read_the_zip_crates_zips() {
 		(CompressionMethod::Deflated, Some(AesMode::Aes128)),
 		(CompressionMethod::Stored, Some(AesMode::Aes256)),
 	] {
-		let mut writer = zip8::ZipWriter::new(Cursor::new(Vec::new()));
+		let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 		for (path, data) in &sample {
 			let mut options = SimpleFileOptions::default().compression_method(method);
 			if let Some(mode) = aes {
@@ -217,12 +217,12 @@ fn we_read_the_zip_crates_zips() {
 
 #[test]
 fn we_read_the_zip_crates_zip_crypto() {
-	use zip8::unstable::write::FileOptionsExt;
+	use ::zip::unstable::write::FileOptionsExt;
 	// a second implementation of the key schedule: a mistake the reader shares with the tests'
 	// own encryptor would cancel out
 	let sample = sample();
 	for method in [CompressionMethod::Stored, CompressionMethod::Deflated] {
-		let mut writer = zip8::ZipWriter::new(Cursor::new(Vec::new()));
+		let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 		for (path, data) in &sample {
 			let options = SimpleFileOptions::default().compression_method(method);
 			match data {

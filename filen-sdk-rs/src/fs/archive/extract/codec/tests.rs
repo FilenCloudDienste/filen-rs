@@ -641,12 +641,12 @@ fn zip_duplicates_symlinks_and_bombs() {
 	);
 	assert_eq!(seen[1], file(1, "same", b"two"), "the last one listed wins");
 
-	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
 	writer
 		.add_symlink(
 			"link",
 			"target/file",
-			zip8::write::SimpleFileOptions::default(),
+			::zip::write::SimpleFileOptions::default(),
 		)
 		.unwrap();
 	let linked = writer.finish().unwrap().into_inner();
@@ -973,8 +973,8 @@ fn data_under_a_tar_directory_is_unaccounted() {
 /// A zip written by the `zip` crate, directories stored as "files" named with a trailing slash,
 /// deflated, as `java.util.zip` and Python write them.
 fn zip_with_deflated_dirs(dir_data: &[u8]) -> Vec<u8> {
-	use zip8::{CompressionMethod, write::SimpleFileOptions};
-	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	use ::zip::{CompressionMethod, write::SimpleFileOptions};
+	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
 	let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 	writer.start_file("docs/", options).unwrap();
 	writer.write_all(dir_data).unwrap();
@@ -1141,9 +1141,9 @@ fn an_empty_zip_crypto_entry_proves_no_password() {
 
 /// A zip whose directory entry is encrypted with AES, as the `zip` crate writes one started as a
 /// file named with a trailing slash.
-fn zip_with_encrypted_dir(method: zip8::CompressionMethod, dir_data: &[u8]) -> Vec<u8> {
-	use zip8::{AesMode, write::SimpleFileOptions};
-	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+fn zip_with_encrypted_dir(method: ::zip::CompressionMethod, dir_data: &[u8]) -> Vec<u8> {
+	use ::zip::{AesMode, write::SimpleFileOptions};
+	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
 	let options = SimpleFileOptions::default()
 		.compression_method(method)
 		.with_aes_encryption(AesMode::Aes256, "pw");
@@ -1156,7 +1156,7 @@ fn zip_with_encrypted_dir(method: zip8::CompressionMethod, dir_data: &[u8]) -> V
 
 #[test]
 fn an_encrypted_directory_is_judged_by_its_length() {
-	use zip8::CompressionMethod;
+	use ::zip::CompressionMethod;
 	for method in [
 		CompressionMethod::Stored,
 		CompressionMethod::Deflated,
@@ -1609,9 +1609,9 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 /// A zip of `links` symlinks to `target`, each followed by a chunk of data: a link in every
 /// chunk.
 fn zip_of_spread_links(links: usize) -> Vec<u8> {
-	let stored = zip8::write::SimpleFileOptions::default()
-		.compression_method(zip8::CompressionMethod::Stored);
-	let mut writer = zip8::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let stored = ::zip::write::SimpleFileOptions::default()
+		.compression_method(::zip::CompressionMethod::Stored);
+	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
 	for link in 0..links {
 		writer
 			.add_symlink(format!("link{link}"), "target", stored)

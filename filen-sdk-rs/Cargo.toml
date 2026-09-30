@@ -10,26 +10,25 @@ license = "AGPL-3.0"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [features]
-default = ["multi-threaded-crypto"]
+default = ["multi-threaded-crypto", "archive"]
 malformed = []
 heif-decoder = ["dep:heif-decoder", "microthumb/heif"]
 uniffi = ["dep:uniffi", "filen-types/uniffi"]
-wasm-full = [
-	"multi-threaded-crypto",
+wasm-full = ["multi-threaded-crypto", "archive"]
+# Compressing and extracting archives (fs::archive) and its codec crates. On wasm it needs
+# `wasm-full`: the codecs run on a thread they may block, which the service-worker build lacks.
+archive = [
 	"dep:tar",
 	"dep:flate2",
 	"dep:bzip2",
 	"dep:lzma-rust2",
 	"dep:lz4_flex",
 	"dep:twox-hash",
-	"dep:brotli-decompressor",
 	"dep:crc32fast",
 	"dep:ppmd-rust",
 	"dep:brotli",
 	"dep:aes",
 	"dep:ctr",
-	"dep:hmac",
-	"dep:sha1",
 	"dep:zeroize",
 	"dep:deflate64",
 	"dep:ruzstd",
@@ -180,6 +179,54 @@ heif-decoder = { path = "../heif-decoder", optional = true }
 # is added only by the native target section below, so wasm builds keep
 # refusing SVG instead of carrying a rasteriser.
 microthumb = { path = "../microthumb" }
+# Archive codecs for compress/extract (fs::archive, the `archive` feature), all written in Rust:
+# no C code or C toolchain, so they build for wasm as they are. Written in Rust is not free of
+# `unsafe`: ppmd-rust (7z PPMd) and libbz2-rs-sys (under bzip2) are translations of C and use it
+# throughout, and ruzstd's ring and decode buffers use it, all on archive data an attacker may
+# have made; the SDK checks PPMd's properties against the crate's bounds before building its
+# decoder.
+# lzma-rust2's `optimization` feature (on below, for speed) adds 14 sites: two in its range
+# decoder (inline assembly reading direct bits), which reads archive data, and the rest in its
+# encoder's match finders, which see only the user's own files.
+tar = { version = "0.4.46", default-features = false, optional = true }
+flate2 = { version = "1.1", default-features = false, features = [
+	"rust_backend",
+], optional = true }
+bzip2 = { version = "0.6", optional = true }
+lzma-rust2 = { version = "0.21", default-features = false, features = [
+	"std",
+	"optimization",
+	"lzip",
+	"encoder",
+	"xz",
+], optional = true }
+lz4_flex = { version = "0.14", default-features = false, features = [
+	"std",
+	"safe-decode",
+	"safe-encode",
+	"frame",
+], optional = true }
+twox-hash = { version = "2", default-features = false, features = [
+	"xxhash32",
+], optional = true }
+crc32fast = { version = "1.5", optional = true }
+brotli = { version = "9", default-features = false, features = [
+	"std",
+], optional = true }
+# zip: WinZip AES and deflate64 (entries are parsed by fs::archive::zip itself)
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+zeroize = { version = "1", optional = true }
+deflate64 = { version = "0.1", optional = true }
+ppmd-rust = { version = "1.4", optional = true }
+# zstd, both ways; `hash` writes and checks the frames' content checksums. A fork of 0.9.0
+# that refuses a block decoding past its maximum (128 KiB, or the window if smaller), which the
+# codec budget rests on, until a release does: https://github.com/KillingSpark/zstd-rs/pull/124.
+# decode/zstd.rs fails the build against a ruzstd without that check.
+ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
+	"std",
+	"hash",
+], optional = true }
 
 # ios dependencies
 [target.'cfg(target_os="ios")'.dependencies]
@@ -219,56 +266,6 @@ tokio-stream = { version = "0.1.17", default-features = false, features = [
 uniffi = { version = "0.29.4", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
-# Archive codecs for compress/extract (fs::archive), all written in Rust: no C code or C
-# toolchain, so they build for wasm as they are. Written in Rust is not free of `unsafe`:
-# ppmd-rust (7z PPMd) and libbz2-rs-sys (under bzip2) are translations of C and use it
-# throughout and ruzstd's ring buffer uses it, all on archive data an attacker may have made;
-# the SDK checks PPMd's properties against the crate's bounds before building its decoder.
-# lzma-rust2's `optimization` feature (on below, for speed) adds 14 sites: two in its range
-# decoder (inline assembly reading direct bits), which reads archive data, and the rest in its
-# encoder's match finders, which see only the user's own files. Always on natively; on wasm
-# only with `wasm-full`, so the service-worker build (where fs::archive doesn't exist) never
-# compiles them.
-tar = { version = "0.4.46", default-features = false }
-flate2 = { version = "1.1", default-features = false, features = [
-	"rust_backend",
-] }
-bzip2 = "0.6"
-lzma-rust2 = { version = "0.21", default-features = false, features = [
-	"std",
-	"optimization",
-	"lzip",
-	"encoder",
-	"xz",
-] }
-lz4_flex = { version = "0.14", default-features = false, features = [
-	"std",
-	"safe-decode",
-	"safe-encode",
-	"frame",
-] }
-twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
-brotli-decompressor = { version = "6", default-features = false, features = [
-	"std",
-] }
-crc32fast = "1.5"
-brotli = { version = "9", default-features = false, features = ["std"] }
-# zip: WinZip AES and deflate64 (entries are parsed by fs::archive::zip itself)
-aes = "0.8"
-ctr = "0.9"
-hmac = "0.12"
-sha1 = "0.10"
-zeroize = "1"
-deflate64 = "0.1"
-ppmd-rust = "1.4"
-# zstd, both ways; `hash` writes and checks the frames' content checksums. A fork of 0.9.0
-# that refuses a block decoding past its maximum (128 KiB, or the window if smaller), which the
-# codec budget rests on, until a release does: https://github.com/KillingSpark/zstd-rs/pull/124.
-# decode/zstd.rs fails the build against a ruzstd without that check.
-ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
-	"std",
-	"hash",
-] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -312,46 +309,6 @@ wasm-streams = "0.4.2"
 parking_lot = { version = "0.12", features = ["nightly"] }
 wasm-bindgen-rayon = { version = "1.3.0", optional = true }
 futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
-# The archive codecs above, enabled by `wasm-full`.
-tar = { version = "0.4.46", default-features = false, optional = true }
-flate2 = { version = "1.1", default-features = false, features = [
-	"rust_backend",
-], optional = true }
-bzip2 = { version = "0.6", optional = true }
-lzma-rust2 = { version = "0.21", default-features = false, features = [
-	"std",
-	"optimization",
-	"lzip",
-	"encoder",
-	"xz",
-], optional = true }
-lz4_flex = { version = "0.14", default-features = false, features = [
-	"std",
-	"safe-decode",
-	"safe-encode",
-	"frame",
-], optional = true }
-twox-hash = { version = "2", default-features = false, features = [
-	"xxhash32",
-], optional = true }
-brotli-decompressor = { version = "6", default-features = false, features = [
-	"std",
-], optional = true }
-crc32fast = { version = "1.5", optional = true }
-brotli = { version = "9", default-features = false, features = [
-	"std",
-], optional = true }
-aes = { version = "0.8", optional = true }
-ctr = { version = "0.9", optional = true }
-hmac = { version = "0.12", optional = true }
-sha1 = { version = "0.10", optional = true }
-zeroize = { version = "1", optional = true }
-deflate64 = { version = "0.1", optional = true }
-ppmd-rust = { version = "1.4", optional = true }
-ruzstd = { git = "https://github.com/FilenCloudDienste/zstd-rs", rev = "68f09df4d3f112ba746e835be2be4ae8b9705159", default-features = false, features = [
-	"std",
-	"hash",
-], optional = true }
 
 # dev-dependencies
 # `test-seams` exposes `StableUuid::new_for_test`, which fixtures need to stand in for a value
@@ -372,7 +329,16 @@ tokio-util = { version = "0.7.16", default-features = false, features = [
 ] }
 test-utils = { path = "../test-utils" }
 filen-macros = { path = "../filen-macros" }
-zip = { version = "5.1.1", default-features = false }
+# Test-only: an independent zip implementation the SDK's zip reader and writer (and
+# download-as-zip) are checked against, reading the zips the SDK writes and writing ones it reads.
+# 8.6 for AES, deflate64 and bzip2; its AES brings second majors of aes, cipher, hmac, pbkdf2 and
+# sha1 next to the SDK's own, in the dev graph only.
+zip = { version = "8.6", default-features = false, features = [
+	"deflate-flate2",
+	"deflate64",
+	"bzip2",
+	"aes-crypto",
+] }
 imap = { version = "3.0.0-alpha.15", default-features = false, features = [
 	"rustls-tls",
 ] }
@@ -388,25 +354,6 @@ reqwest = { version = "0.12.22", features = [
 scraper = "0.24.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.23.0"
-# Reference encoders for the archive decoder tests (fs::archive::decode), in formats the SDK
-# only reads so far.
-lzma-rust2 = { version = "0.21", default-features = false, features = [
-	"std",
-	"encoder",
-	"xz",
-	"lzip",
-] }
-lz4_flex = { version = "0.14", default-features = false, features = [
-	"std",
-	"frame",
-] }
-# a second zip implementation to check the SDK's zips against, both ways
-zip8 = { package = "zip", version = "8.6", default-features = false, features = [
-	"deflate-flate2",
-	"deflate64",
-	"bzip2",
-	"aes-crypto",
-] }
 # Test-only: an independent 7z implementation the SDK's 7z reader and writer are checked against,
 # reading the archives the SDK writes and writing ones it reads. Its AES brings second majors of
 # aes, cbc and cipher next to the SDK's own, in the dev graph only.

@@ -15,18 +15,13 @@ use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
 		archive::{
-			AesStrength, ArchivePassword, DisposalOutcome, KeptReason, SevenZEncryption,
-			SevenZMethod, SourceDisposal,
-			compress::{
-				CompressCallback, CompressConfig, CompressFormat, CompressReport, CompressRequest,
-				CompressSources, CompressUpdate, Compression, StreamCodec, ZipMethod,
-			},
-			extract::{
-				ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveListing, ArchiveSource,
-				ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport, ExtractRequest,
-				ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractedTopLevel, ListCallback,
-				ListConfig, ListTotals, ListUpdate, PasswordCheck,
-			},
+			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveListing,
+			ArchivePassword, ArchiveSource, CompressCallback, CompressConfig, CompressFormat,
+			CompressReport, CompressRequest, CompressSources, CompressUpdate, Compression,
+			DisposalOutcome, ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport,
+			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractedTopLevel,
+			KeptReason, ListCallback, ListConfig, ListTotals, ListUpdate, PasswordCheck,
+			SevenZEncryption, SevenZMethod, SourceDisposal, StreamCodec, ZipMethod,
 		},
 		categories::{DirType, NonRootItemType},
 		copy::{ItemSource, ItemSourceDir, JobControl},

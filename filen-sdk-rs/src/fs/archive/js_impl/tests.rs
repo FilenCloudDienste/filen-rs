@@ -8,11 +8,11 @@ use super::{
 	*,
 };
 use crate::{
+	alloc_meter,
 	fs::{
 		HasUUID,
 		archive::{
-			alloc_meter,
-			compress::{Compression, SevenZMethod, StreamCodec, ZipMethod},
+			Compression, SevenZMethod, StreamCodec, ZipMethod,
 			config::CODEC_MEM_BUDGET,
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
 			zip::crypto::AesStrength,

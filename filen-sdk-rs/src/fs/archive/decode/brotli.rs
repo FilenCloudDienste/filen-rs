@@ -7,7 +7,7 @@
 
 use std::io::{self, BufRead, Read};
 
-use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
+use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, enc::StandardAlloc};
 
 use super::{
 	Budget, CodecError, Describe, Input, StreamCheck, StreamDecoder, StreamEnd, TRUNCATED,

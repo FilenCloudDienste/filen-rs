@@ -378,7 +378,7 @@ fn the_size_gate_is_exact_at_the_long_name_boundaries() {
 
 /// Reads a zip back through the zip crate: path (dirs end in `/`) and data per entry.
 fn zip_crate_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Vec<u8>)> {
-	let mut zip = zip8::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+	let mut zip = ::zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
 	(0..zip.len())
 		.map(|i| {
 			let mut file = match password {

@@ -36,11 +36,11 @@ use crate::{
 const PREFETCH_CHUNKS: usize = 4;
 
 /// A fetched chunk of the archive, with the memory it holds.
-pub(crate) type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
+type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
 
 /// A job's memory floor while it holds it, counted as an operation in flight: the job is only
 /// reported paused once it has given it back, with everything held on top of it.
-pub(crate) type Floor = (OwnedSemaphorePermit, OpGuard);
+type Floor = (OwnedSemaphorePermit, OpGuard);
 
 /// Memory for one chunk: `slot` (one of the floor's) when free, else the client's `memory` if it
 /// has room now, else nothing.
@@ -80,7 +80,7 @@ pub(crate) fn whole_chunk(
 	))
 }
 
-pub(crate) struct ArchiveInput<B> {
+struct ArchiveInput<B> {
 	backend: Arc<B>,
 	archive: Arc<RemoteFileType<'static>>,
 	chunks: u64,
@@ -107,7 +107,7 @@ pub(crate) struct ArchiveInput<B> {
 }
 
 impl<B: DriveBackend> ArchiveInput<B> {
-	pub(crate) fn new(backend: Arc<B>, archive: Arc<RemoteFileType<'static>>) -> Self {
+	fn new(backend: Arc<B>, archive: Arc<RemoteFileType<'static>>) -> Self {
 		Self {
 			chunks: archive.size().div_ceil(CHUNK_SIZE_U64),
 			memory: backend.memory(),
@@ -126,13 +126,13 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		}
 	}
 
-	pub(crate) fn archive(&self) -> &Arc<RemoteFileType<'static>> {
+	fn archive(&self) -> &Arc<RemoteFileType<'static>> {
 		&self.archive
 	}
 
 	/// The codec asks for chunk `index`, which means it is done with the one before; answered
 	/// by [`Self::advance`] once the chunk is in.
-	pub(crate) fn ask(&mut self, index: u64, reply: oneshot::Sender<io::Result<Vec<u8>>>) {
+	fn ask(&mut self, index: u64, reply: oneshot::Sender<io::Result<Vec<u8>>>) {
 		self.reading = None;
 		if index != self.served {
 			// a jump (a zip is read from its end): what was fetched ahead is of no use
@@ -148,27 +148,27 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	}
 
 	/// The codec ended: it holds no chunk any more.
-	pub(crate) fn codec_done(&mut self) {
+	fn codec_done(&mut self) {
 		self.reading = None;
 	}
 
 	/// Whether the codec waits on a chunk.
-	pub(crate) fn owes_codec(&self) -> bool {
+	fn owes_codec(&self) -> bool {
 		self.ask.is_some()
 	}
 
-	pub(crate) fn fetching(&self) -> bool {
+	fn fetching(&self) -> bool {
 		!self.fetches.is_empty()
 	}
 
 	/// The next chunk fetched, in the order they were asked for.
-	pub(crate) async fn fetched(&mut self) -> Option<FetchedChunk> {
+	async fn fetched(&mut self) -> Option<FetchedChunk> {
 		self.fetches.next().await
 	}
 
 	/// Answers the codec when its chunk is in, and fetches ahead while memory is free right
 	/// now; `ops` counts the fetches in flight.
-	pub(crate) fn advance(&mut self, ops: &Ops) {
+	fn advance(&mut self, ops: &Ops) {
 		self.serve_ask();
 		// Nothing is fetched ahead of what the codec asks for until it has read two chunks one
 		// after the other, since it started or last jumped: a zip or 7z reads its head, then its
@@ -196,10 +196,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	}
 
 	/// Takes in a fetched chunk; the error that ends the job when it failed or came back short.
-	pub(crate) fn fetch_finished(
-		&mut self,
-		(index, result, permit, _op): FetchedChunk,
-	) -> Result<(), Error> {
+	fn fetch_finished(&mut self, (index, result, permit, _op): FetchedChunk) -> Result<(), Error> {
 		let data = whole_chunk(&self.archive, index, result?)?;
 		self.ready.push_back((index, data, permit));
 		self.serve_ask();
@@ -230,21 +227,21 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	}
 
 	/// Drops every fetch and what was fetched, and the codec's ask: the job is stopping.
-	pub(crate) fn drop_all(&mut self) {
+	fn drop_all(&mut self) {
 		self.drop_prefetched();
 		self.ask = None;
 	}
 
 	/// Gives back everything, once the codec is done with the archive (a zip's or 7z's index
 	/// chunks may have been fetched again for their entries).
-	pub(crate) fn release(&mut self) {
+	fn release(&mut self) {
 		self.drop_all();
 		self.reading = None;
 	}
 
 	/// Waits out a pause holding nothing but the chunk the codec is reading: prefetched chunks
 	/// and the job's `floor` are given back, and the floor taken again once the pause is over.
-	pub(crate) async fn wait_out_pause<S: JobState>(
+	async fn wait_out_pause<S: JobState>(
 		&mut self,
 		floor: &mut Option<Floor>,
 		reporter: &MaybeArc<Reporter<S>>,
@@ -268,7 +265,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 	}
 
 	/// The hash of the whole archive, when the codec read it front to back, once.
-	pub(crate) fn read_whole(&self) -> Option<Blake3Hash> {
+	fn read_whole(&self) -> Option<Blake3Hash> {
 		(self.sequential && self.served == self.chunks)
 			.then(|| Blake3Hash::from(self.hasher.finalize()))
 	}

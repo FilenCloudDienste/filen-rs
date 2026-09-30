@@ -41,10 +41,7 @@ pub(crate) enum CreatedDir {
 }
 
 /// The names a directory holds.
-#[cfg(any(
-	not(all(target_family = "wasm", target_os = "unknown")),
-	feature = "wasm-full"
-))]
+#[cfg(feature = "archive")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ListedNames {
 	pub(crate) names: Vec<String>,
@@ -79,10 +76,7 @@ pub(crate) trait DriveBackend: MaybeSendSync + 'static {
 		dir: Uuid,
 	) -> impl Future<Output = Result<ConnectedTargets, Error>> + MaybeSend;
 	/// The names of the items in `dir`.
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	fn list_dir_names(
 		&self,
 		dir: &crate::fs::categories::DirType<'static, Normal>,
@@ -155,10 +149,7 @@ impl ClientBackend {
 		Self { client }
 	}
 
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	pub(crate) fn client(&self) -> &Client {
 		&self.client
 	}
@@ -185,10 +176,7 @@ impl DriveBackend for ClientBackend {
 		self.client.fetch_connected_targets(dir).await
 	}
 
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	async fn list_dir_names(
 		&self,
 		dir: &crate::fs::categories::DirType<'static, Normal>,

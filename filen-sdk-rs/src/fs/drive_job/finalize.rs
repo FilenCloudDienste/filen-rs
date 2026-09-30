@@ -88,10 +88,7 @@ pub(crate) async fn finalize_new_file<B: DriveBackend>(
 /// the drive lock is held ends it with nothing sent (`None`) instead of being waited out, for
 /// the caller to start it again once resumed: a job that pauses once its registrations are
 /// over is never kept from pausing by one waiting for the lock.
-#[cfg(any(
-	not(all(target_family = "wasm", target_os = "unknown")),
-	feature = "wasm-full"
-))]
+#[cfg(feature = "archive")]
 pub(crate) async fn finalize_new_file_unless_paused<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
 ) -> Option<Result<Finalized, FinalizeError>> {

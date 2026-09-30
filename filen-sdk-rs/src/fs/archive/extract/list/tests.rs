@@ -97,9 +97,9 @@ async fn a_zip_is_listed_from_its_index_alone() {
 fn zip_of_scattered_symlinks(runs: usize, per_run: usize) -> Vec<u8> {
 	const EOCD_LEN: usize = 22;
 	const CENTRAL_HEADER_LEN: usize = 46;
-	let stored = zip8::write::SimpleFileOptions::default()
-		.compression_method(zip8::CompressionMethod::Stored);
-	let mut writer = zip8::ZipWriter::new(Cursor::new(Vec::new()));
+	let stored = ::zip::write::SimpleFileOptions::default()
+		.compression_method(::zip::CompressionMethod::Stored);
+	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 	for run in 0..runs {
 		for link in 0..per_run {
 			writer

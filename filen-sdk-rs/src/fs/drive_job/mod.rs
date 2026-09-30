@@ -45,10 +45,7 @@ pub(crate) struct Fatal(Option<Arc<Error>>);
 
 impl Fatal {
 	/// Read by the archive jobs, which the service-worker build leaves out.
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	pub(crate) fn error(&self) -> Option<&Arc<Error>> {
 		self.0.as_ref()
 	}

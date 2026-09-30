@@ -12,7 +12,7 @@ fn many_entries_use_zip64_end_records() {
 	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
 	assert_eq!(index.entries.len(), 70_000);
 	assert_eq!(
-		zip8::ZipArchive::new(Cursor::new(&zip)).unwrap().len(),
+		::zip::ZipArchive::new(Cursor::new(&zip)).unwrap().len(),
 		70_000
 	);
 }
@@ -235,7 +235,7 @@ fn zip64_sizes_and_offsets_read_back() {
 				"{case}"
 			);
 
-			let mut archive = zip8::ZipArchive::new(source).unwrap();
+			let mut archive = ::zip::ZipArchive::new(source).unwrap();
 			for (path, data) in &sample {
 				let Some(data) = data else {
 					assert!(archive.by_name(&format!("{path}/")).unwrap().is_dir());
@@ -298,7 +298,7 @@ fn an_entry_of_over_4_gib_reads_back() {
 	drop(entry);
 	assert_eq!(read, BIG);
 
-	let mut archive = zip8::ZipArchive::new(source).unwrap();
+	let mut archive = ::zip::ZipArchive::new(source).unwrap();
 	let file = archive.by_name("big.bin").unwrap();
 	assert_eq!(
 		(file.size(), file.compressed_size(), file.header_start()),

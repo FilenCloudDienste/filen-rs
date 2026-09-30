@@ -10,12 +10,30 @@
 )]
 #![allow(type_alias_bounds)]
 
+// The archive codecs run on a thread they may block, which on wasm only the threaded `wasm-full`
+// build has (`blocking::WorkerSlot`).
+#[cfg(all(
+	feature = "archive",
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+))]
+compile_error!(
+	"the `archive` feature needs `wasm-full` on wasm32-unknown-unknown; the service-worker build \
+	 turns default features off"
+);
+
+// The lib test binary's allocator: the system one, metered so a test can bound the heap a codec
+// takes.
+#[cfg(test)]
+mod alloc_meter;
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_meter::Meter = alloc_meter::Meter;
+
 pub(crate) mod api;
 pub mod auth;
-#[cfg(any(
-	not(all(target_family = "wasm", target_os = "unknown")),
-	feature = "wasm-full"
-))]
+#[cfg(feature = "archive")]
 pub(crate) mod blocking;
 // Compiles on native AND wasm32-unknown-unknown (rusqlite ≥0.38 bundles a wasm SQLite). On wasm
 // the cache additionally requires `wasm-full` (worker/socket hosting) and the DB is the wasm

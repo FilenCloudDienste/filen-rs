@@ -46,10 +46,7 @@ pub(crate) enum NameShape {
 	File,
 	/// A file whose last `len` bytes are one extension, kept apart whole (`a.tar.gz` →
 	/// `a (1).tar.gz`, where [`NameShape::File`] would give `a.tar (1).gz`).
-	#[cfg(any(
-		not(all(target_family = "wasm", target_os = "unknown")),
-		feature = "wasm-full"
-	))]
+	#[cfg(feature = "archive")]
 	FileWithExtension { len: usize },
 }
 
@@ -172,10 +169,7 @@ fn first_of_its_length(n: u64) -> bool {
 fn split_extension(name: &str, shape: NameShape) -> (&str, &str) {
 	match shape {
 		NameShape::Dir => (name, ""),
-		#[cfg(any(
-			not(all(target_family = "wasm", target_os = "unknown")),
-			feature = "wasm-full"
-		))]
+		#[cfg(feature = "archive")]
 		NameShape::FileWithExtension { len }
 			if len < name.len() && name.is_char_boundary(name.len() - len) =>
 		{

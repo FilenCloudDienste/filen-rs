@@ -11,7 +11,7 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			ArchiveConfig,
+			ArchiveConfig, ArchivePassword,
 			dispose::{ExpectedFile, SourceDisposal, Tree},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
@@ -36,7 +36,7 @@ use crate::{
 };
 
 use super::{
-	ArchivePassword, CompressFormat, CompressSources,
+	CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
 	engine::{
 		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
