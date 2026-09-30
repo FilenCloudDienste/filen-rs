@@ -14,7 +14,7 @@
 //!
 //! Nodes and paths come back as [`Cow`] for the same reason: a materialized side hands out a
 //! reference to what it already holds — no allocation, which is what keeps a whole pass's cost
-//! where it was — and a derived one hands out what it just built.
+//! where it was — and a derived one hands out what it just built, and lends what it holds.
 //!
 //! # The two backings
 //!
@@ -713,8 +713,9 @@ pub(super) struct SideRef<'a, T> {
 }
 
 impl<T: FromRow> SideRef<'_, T> {
-	/// Every path this side holds with its node, as borrowed pairs for a materialized map and
-	/// owned ones for a carried side.
+	/// Every path this side holds with its node: borrowed pairs for what the side holds — a
+	/// materialized map, a carried side's overlay — and owned ones for the nodes a carried side
+	/// derives from its rows.
 	///
 	/// O(tree) on a carried side, which is what [`Nodes`] means by its own existence: a backing
 	/// that derives its nodes can only enumerate them by walking the rows.
@@ -738,13 +739,7 @@ impl<T: FromRow> SideRef<'_, T> {
 						out.push((row.rel_path.clone(), node));
 					}
 				});
-				out.extend(
-					overlay
-						.nodes
-						.iter()
-						.map(|(path, node)| (path.clone(), node.clone())),
-				);
-				Entries::Carried(out.into_iter())
+				Entries::Carried(out.into_iter(), overlay.nodes.iter())
 			}
 		}
 	}
@@ -766,6 +761,10 @@ impl<T: FromRow> SideRef<'_, T> {
 
 	/// The candidates for [`Nodes::under`]: the subtree rather than the tree, so a carried side
 	/// answers a directory question in the size of the directory.
+	///
+	/// The overlay's nodes are lent whole, as a materialized map's are, for `under` to narrow: a
+	/// directory the pass walked — a renamed directory's destination — is all overlay, and copying
+	/// it out to hand it over was a second copy of every node the walk found.
 	fn entries_under(&self, dir: &str) -> Entries<'_, T> {
 		match self.side {
 			Side::Whole(map) => Entries::Whole(map.iter()),
@@ -783,14 +782,7 @@ impl<T: FromRow> SideRef<'_, T> {
 				}
 				#[cfg(feature = "bench-internals")]
 				CARRIED_SUBTREE_ROWS.fetch_add(out.len() as u64, Ordering::Relaxed);
-				out.extend(
-					overlay
-						.nodes
-						.iter()
-						.filter(|(path, _)| is_under(path, dir))
-						.map(|(path, node)| (path.clone(), node.clone())),
-				);
-				Entries::Carried(out.into_iter())
+				Entries::Carried(out.into_iter(), overlay.nodes.iter())
 			}
 		}
 	}
@@ -800,7 +792,12 @@ impl<T: FromRow> SideRef<'_, T> {
 /// materialized side paying an allocation it did not pay before.
 enum Entries<'a, T> {
 	Whole(hash_map::Iter<'a, String, T>),
-	Carried(std::vec::IntoIter<(String, T)>),
+	/// The nodes a carried side derives from its rows, built for this walk, then the ones its
+	/// overlay holds.
+	Carried(
+		std::vec::IntoIter<(String, T)>,
+		hash_map::Iter<'a, String, T>,
+	),
 }
 
 impl<'a, T: Clone> Iterator for Entries<'a, T> {
@@ -808,14 +805,18 @@ impl<'a, T: Clone> Iterator for Entries<'a, T> {
 
 	fn next(&mut self) -> Option<Self::Item> {
 		match self {
-			Self::Whole(entries) => entries
+			Self::Whole(held) => held.next().map(lent),
+			Self::Carried(built, held) => built
 				.next()
-				.map(|(path, node)| (Cow::Borrowed(path.as_str()), Cow::Borrowed(node))),
-			Self::Carried(entries) => entries
-				.next()
-				.map(|(path, node)| (Cow::Owned(path), Cow::Owned(node))),
+				.map(|(path, node)| (Cow::Owned(path), Cow::Owned(node)))
+				.or_else(|| held.next().map(lent)),
 		}
 	}
+}
+
+/// A node a side holds, lent with its path.
+fn lent<'a, T: Clone>((path, node): (&'a String, &'a T)) -> (Cow<'a, str>, Cow<'a, T>) {
+	(Cow::Borrowed(path.as_str()), Cow::Borrowed(node))
 }
 
 impl<T: FromRow> NodesAt for SideRef<'_, T> {
@@ -1553,6 +1554,36 @@ mod tests {
 		let read = side.of(&rows);
 		assert!(!read.holds("gone/7") && read.holds("found/7"));
 		assert_eq!(Nodes::len(&read), 1000);
+	}
+
+	/// A carried side LENDS the nodes its overlay holds, as a materialized one lends every node: a
+	/// walk of a directory the pass observed whole — a renamed directory's destination — would
+	/// otherwise copy every node under it to hand it out.
+	#[test]
+	fn a_carried_side_lends_the_nodes_it_holds() {
+		let rows = Baseline::from_rows([row_named(0, "carried.txt")]);
+		let mut side: Side<RemoteNode> = Side::carried();
+		let mut placed = node_at(4, 1);
+		placed.rel_path = "dir/placed.txt".to_owned();
+		side.insert(placed.rel_path.clone(), placed);
+		let read = side.of(&rows);
+
+		let under: Vec<_> = read.under("dir").collect();
+		assert_eq!(under.len(), 1);
+		assert!(
+			matches!(under[0], (Cow::Borrowed(_), Cow::Borrowed(_))),
+			"under() copied a node the side holds"
+		);
+		let mut walked = 0;
+		for (path, node) in read.iter() {
+			walked += 1;
+			assert_eq!(
+				matches!(node, Cow::Borrowed(_)),
+				path == "dir/placed.txt",
+				"iter() at {path:?}: a held node is lent, a row's is built"
+			);
+		}
+		assert_eq!(walked, 2, "the carried row and the placed node");
 	}
 
 	/// A row at an arbitrary path, in the one shape both sides carry.
