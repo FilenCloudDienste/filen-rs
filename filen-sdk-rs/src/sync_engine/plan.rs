@@ -1772,19 +1772,12 @@ fn reconcile_two_way(
 /// (`to != from`). The one shape that would break the equivalence is two `Synced` rows recording
 /// one remote uuid or one lineage id, and no write path produces one: a move commits the delete of
 /// its source and the insert of its destination in a single transaction.
-///
-/// `dirs_only` narrows a whole pass's visit to the directory rows, off an index holding nothing
-/// else: a visitor that only wants directories then reads a few per cent of the rows, not all of
-/// them — once per directory move the fold carries. A change-scoped pass visits its own paths
-/// either way.
 fn visit_move_sources(
 	paths: PassPaths<'_>,
 	baseline: &Baseline,
-	dirs_only: bool,
 	mut visit: impl FnMut(&BaselineEntry),
 ) {
 	match paths {
-		PassPaths::Whole if dirs_only => baseline.visit_dir_rows(visit),
 		PassPaths::Whole => baseline.visit_rows(visit),
 		PassPaths::Changed(changed) => {
 			let mut rows = baseline.cursor();
@@ -1920,7 +1913,7 @@ fn detect_moves<'m>(
 			}
 			remote_path_of_uuid.insert(node.remote_uuid, path);
 		});
-		visit_move_sources(paths, baseline, false, |base| {
+		visit_move_sources(paths, baseline, |base| {
 			if mode.pushes() && local_source(base) {
 				local_sources.push(base.clone());
 			}
@@ -2040,7 +2033,7 @@ fn detect_moves<'m>(
 			}
 		});
 	} else if mode.pushes() && !created_by_hash.is_empty() {
-		visit_move_sources(paths, baseline, false, |base| {
+		visit_move_sources(paths, baseline, |base| {
 			if local_source(base) {
 				local_sources.push(base.clone());
 			}
@@ -2229,7 +2222,8 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 ///
 /// — so scoping loses no move the whole read finds, and a move it does leave out is one the
 /// narrowed reconcile would not have decided either. Each iteration re-keys the set with the move
-/// it just folded, so a move nested in that subtree is named by where the outer one put it.
+/// it just folded, so a move nested in that subtree is named by where the outer one put it, and
+/// reads the set's rows once for both detectors (see [`FoldDirs`]).
 ///
 /// The paths the side a move did not carry had to record to stay put are decided too: they join
 /// the set, and come back beside the moves keyed where the last move left them, for the caller to
@@ -2266,9 +2260,10 @@ pub(crate) fn fold_dir_moves(
 		let action = {
 			let bl: &Baseline = baseline;
 			let (local_ref, remote_ref) = (local.of(bl), remote.of(bl));
-			next_case_only_dir_rename(mode, bl, &local_ref, &remote_ref, held, scope)
+			let dirs = FoldDirs::read(scope, bl, &local_ref, &remote_ref);
+			next_case_only_dir_rename(mode, bl, &local_ref, &remote_ref, held, &dirs)
 				.map(|action| (action, Matched::Identity))
-				.or_else(|| next_dir_move(mode, bl, &local_ref, &remote_ref, held, scope))
+				.or_else(|| next_dir_move(mode, bl, &local_ref, &remote_ref, held, &dirs))
 		};
 		let Some((action, matched)) = action else {
 			break;
@@ -2333,6 +2328,202 @@ enum Matched {
 	Signature,
 }
 
+/// What one iteration of [`fold_dir_moves`] enumerates for its two detectors: the directories each
+/// side holds, and the directory rows a move can start from.
+///
+/// A whole pass enumerates each side's map and the directory rows, and a detector walks what it
+/// asks about only once the one before it has left something to find. A change-scoped pass
+/// enumerates its own paths for all of them, and asked one detector at a time it read the rows at
+/// those paths once per walk: after a directory rename, the remote's directories twice and the move
+/// sources once, three reads of the renamed rows an iteration. So a scoped iteration reads them in
+/// ONE cursor walk, asks both sides about each path while the page that answers for it is the one
+/// the cursor just read, and keeps only what the detectors ask about: the directories, a few among
+/// the paths.
+enum FoldDirs<'m> {
+	/// A whole pass: each detector walks the maps and the directory rows itself.
+	Whole,
+	/// A change-scoped pass: its own paths, read once.
+	Changed(ChangedDirs<'m>),
+}
+
+/// The directories at a change-scoped pass's own paths, each list in path order — the order the
+/// detectors walked those paths in — and already narrowed by the question its detector asks of
+/// each, asked in the walk while that path's row was in hand.
+#[derive(Default)]
+struct ChangedDirs<'m> {
+	/// The rows a directory move can start from, with their remote uuids.
+	sources: Vec<(&'m str, Uuid)>,
+	/// The local directories the remote holds nothing at: a case-only rename's local end.
+	local_only: Vec<&'m str>,
+	/// The local directories no row records: where a pushed move can end.
+	local_new: Vec<&'m str>,
+	/// The remote directories, with their uuids: where a pulled move can end.
+	remote: Vec<(&'m str, Uuid)>,
+	/// The remote directories the local side holds nothing at: a case-only rename's remote end.
+	remote_only: Vec<(&'m str, Uuid)>,
+}
+
+impl<'m> FoldDirs<'m> {
+	/// What one iteration enumerates at `paths`: nothing read up front for a whole pass, and one
+	/// walk of its own paths for a scoped one.
+	fn read(
+		paths: PassPaths<'m>,
+		baseline: &Baseline,
+		local: &impl NodesAt<Node = LocalNode>,
+		remote: &impl NodesAt<Node = RemoteNode>,
+	) -> Self {
+		let PassPaths::Changed(changed) = paths else {
+			return Self::Whole;
+		};
+		let mut dirs = ChangedDirs::default();
+		let mut rows = baseline.cursor();
+		for path in changed {
+			// First: every question below about `path` is answered out of the page this keeps.
+			let row = rows.get(path);
+			if let Some(uuid) = row.as_ref().and_then(dir_move_source) {
+				dirs.sources.push((path, uuid));
+			}
+			if local
+				.at(path)
+				.is_some_and(|node| node.kind == NodeKind::Dir)
+			{
+				if !remote.holds(path) {
+					dirs.local_only.push(path);
+				}
+				if row.is_none() {
+					dirs.local_new.push(path);
+				}
+			}
+			if let Some(node) = remote.at(path)
+				&& node.kind == NodeKind::Dir
+			{
+				dirs.remote.push((path, node.remote_uuid));
+				if !local.holds(path) {
+					dirs.remote_only.push((path, node.remote_uuid));
+				}
+			}
+		}
+		Self::Changed(dirs)
+	}
+
+	/// Hand `visit` the path and remote uuid of every row a directory move can start from. A whole
+	/// pass reads them off the index that holds nothing but directory rows: a few per cent of the
+	/// rows, where a walk of every row would read all of them once per move the fold carries.
+	fn visit_sources(&self, baseline: &Baseline, mut visit: impl FnMut(&str, Uuid)) {
+		match self {
+			Self::Whole => baseline.visit_dir_rows(|row| {
+				if let Some(uuid) = dir_move_source(row) {
+					visit(&row.rel_path, uuid);
+				}
+			}),
+			Self::Changed(dirs) => {
+				for &(path, uuid) in &dirs.sources {
+					visit(path, uuid);
+				}
+			}
+		}
+	}
+
+	/// Hand `visit` every local directory the remote holds nothing at under that exact spelling.
+	fn visit_local_only(
+		&self,
+		local: &'m impl Nodes<Node = LocalNode>,
+		remote: &impl NodesAt<Node = RemoteNode>,
+		mut visit: impl FnMut(Cow<'m, str>),
+	) {
+		match self {
+			Self::Whole => {
+				for (path, node) in local.iter() {
+					if node.kind == NodeKind::Dir && !remote.holds(&path) {
+						visit(path);
+					}
+				}
+			}
+			Self::Changed(dirs) => {
+				for &path in &dirs.local_only {
+					visit(Cow::Borrowed(path));
+				}
+			}
+		}
+	}
+
+	/// Hand `visit` every local directory no row records.
+	fn visit_local_new(
+		&self,
+		local: &'m impl Nodes<Node = LocalNode>,
+		baseline: &Baseline,
+		mut visit: impl FnMut(Cow<'m, str>),
+	) {
+		match self {
+			Self::Whole => {
+				for (path, node) in local.iter() {
+					if node.kind == NodeKind::Dir && !baseline.contains_key(&path) {
+						visit(path);
+					}
+				}
+			}
+			Self::Changed(dirs) => {
+				for &path in &dirs.local_new {
+					visit(Cow::Borrowed(path));
+				}
+			}
+		}
+	}
+
+	/// Hand `visit` every remote directory, with its uuid.
+	fn visit_remote(
+		&self,
+		remote: &'m impl Nodes<Node = RemoteNode>,
+		mut visit: impl FnMut(Cow<'m, str>, Uuid),
+	) {
+		match self {
+			Self::Whole => {
+				for (path, node) in remote.iter() {
+					if node.kind == NodeKind::Dir {
+						visit(path, node.remote_uuid);
+					}
+				}
+			}
+			Self::Changed(dirs) => {
+				for &(path, uuid) in &dirs.remote {
+					visit(Cow::Borrowed(path), uuid);
+				}
+			}
+		}
+	}
+
+	/// Hand `visit` every remote directory the local side holds nothing at under that exact
+	/// spelling, with its uuid.
+	fn visit_remote_only(
+		&self,
+		remote: &'m impl Nodes<Node = RemoteNode>,
+		local: &impl NodesAt<Node = LocalNode>,
+		mut visit: impl FnMut(Cow<'m, str>, Uuid),
+	) {
+		match self {
+			Self::Whole => {
+				for (path, node) in remote.iter() {
+					if node.kind == NodeKind::Dir && !local.holds(&path) {
+						visit(path, node.remote_uuid);
+					}
+				}
+			}
+			Self::Changed(dirs) => {
+				for &(path, uuid) in &dirs.remote_only {
+					visit(Cow::Borrowed(path), uuid);
+				}
+			}
+		}
+	}
+}
+
+/// The remote uuid of `row` where a directory move can start from it: a synced directory row's.
+fn dir_move_source(row: &BaselineEntry) -> Option<Uuid> {
+	(row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
+		.then_some(row.remote_uuid)
+		.flatten()
+}
+
 /// The shallowest case-only directory rename left in the inputs (see [`fold_dir_moves`]).
 fn next_case_only_dir_rename<'m>(
 	mode: super::SyncMode,
@@ -2340,29 +2531,24 @@ fn next_case_only_dir_rename<'m>(
 	local: &'m impl Nodes<Node = LocalNode>,
 	remote: &'m impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
-	paths: PassPaths<'m>,
+	dirs: &FoldDirs<'m>,
 ) -> Option<SyncAction> {
 	// Collision key -> the local directory no remote item holds under that exact spelling. The scan
 	// refuses two local entries with one key, so the map loses nothing.
 	let mut local_only: HashMap<String, Cow<'m, str>> = HashMap::new();
-	visit_move_targets(paths, local, |path, node| {
-		if node.kind == NodeKind::Dir && !remote.holds(&path) {
-			local_only.insert(collision_key(&path), path);
-		}
+	dirs.visit_local_only(local, remote, |path| {
+		local_only.insert(collision_key(&path), path);
 	});
 	if local_only.is_empty() {
 		return None;
 	}
 	let mut candidates: Vec<(Cow<'m, str>, Cow<'m, str>, Uuid)> = Vec::new();
-	visit_move_targets(paths, remote, |remote_path, node| {
-		if node.kind != NodeKind::Dir || local.holds(&remote_path) {
-			return;
-		}
+	dirs.visit_remote_only(remote, local, |remote_path, remote_uuid| {
 		let Some(local_path) = local_only.get(&collision_key(&remote_path)) else {
 			return;
 		};
 		if parent_path(local_path) == parent_path(&remote_path) {
-			candidates.push((local_path.clone(), remote_path, node.remote_uuid));
+			candidates.push((local_path.clone(), remote_path, remote_uuid));
 		}
 	});
 	candidates.sort_unstable_by(|(a, ..), (b, ..)| {
@@ -2443,19 +2629,14 @@ fn next_dir_move<'m>(
 	local: &'m impl Nodes<Node = LocalNode>,
 	remote: &'m impl Nodes<Node = RemoteNode>,
 	held: &BTreeSet<String>,
-	paths: PassPaths<'m>,
+	dirs: &FoldDirs<'m>,
 ) -> Option<(SyncAction, Matched)> {
 	// Only a synced directory can be the source of a directory move, and at any ordinary shape the
-	// directories are a small fraction of the rows — so the visitor checks that against a row it did
-	// not allocate, and a path is copied only for a row that is actually a candidate.
+	// directories are a small fraction of the rows — so a path is copied only for a row that is
+	// actually a candidate.
 	let mut sources: Vec<(String, Uuid)> = Vec::new();
-	visit_move_sources(paths, baseline, true, |row| {
-		if row.kind == NodeKind::Dir
-			&& row.state == BaselineState::Synced
-			&& let Some(uuid) = row.remote_uuid
-		{
-			sources.push((row.rel_path.clone(), uuid));
-		}
+	dirs.visit_sources(baseline, |path, uuid| {
+		sources.push((path.to_string(), uuid))
 	});
 	if sources.is_empty() {
 		return None;
@@ -2465,10 +2646,8 @@ fn next_dir_move<'m>(
 	});
 	let mut remote_dir_at: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
 	if mode.pulls() {
-		visit_move_targets(paths, remote, |path, node| {
-			if node.kind == NodeKind::Dir {
-				remote_dir_at.insert(node.remote_uuid, path);
-			}
+		dirs.visit_remote(remote, |path, uuid| {
+			remote_dir_at.insert(uuid, path);
 		});
 	}
 	// The sources gone locally with their signatures, and the new local directories with theirs,
@@ -2494,7 +2673,7 @@ fn next_dir_move<'m>(
 				&mut new_local_dirs,
 				from,
 				*uuid,
-				paths,
+				dirs,
 			)
 		})
 		.collect();
@@ -2528,7 +2707,7 @@ fn dir_move_from<'m, 's>(
 	new_local_dirs: &mut Option<Vec<NewLocalDir<'m>>>,
 	from: &str,
 	uuid: Uuid,
-	paths: PassPaths<'m>,
+	dirs: &FoldDirs<'m>,
 ) -> Option<(SyncAction, Matched)> {
 	let (action, matched) = if local.at(from).is_some_and(|n| n.kind == NodeKind::Dir) {
 		let to = remote_dir_at.get(&uuid)?.as_ref();
@@ -2564,7 +2743,7 @@ fn dir_move_from<'m, 's>(
 		};
 		let (_, signature) = gone.iter().find(|(path, _)| *path == from)?;
 		let new_dirs = new_local_dirs
-			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, gone, paths));
+			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, gone, dirs));
 		let mut matches = new_dirs.iter().filter(|dir| dir.matches(signature));
 		let to = matches.next()?.path.as_ref();
 		if matches.next().is_some() {
@@ -2652,16 +2831,12 @@ fn new_local_dir_signatures<'m>(
 	baseline: &Baseline,
 	local: &'m impl Nodes<Node = LocalNode>,
 	gone: &[(&str, Signature)],
-	paths: PassPaths<'m>,
+	dirs: &FoldDirs<'m>,
 ) -> Vec<NewLocalDir<'m>> {
 	let mut candidates: Vec<Cow<'m, str>> = Vec::new();
-	visit_move_targets(paths, local, |path, node| {
-		if node.kind == NodeKind::Dir && !baseline.contains_key(&path) {
-			candidates.push(path);
-		}
-	});
+	dirs.visit_local_new(local, baseline, |path| candidates.push(path));
 	candidates.sort_unstable_by_key(|path| Reverse(path.matches('/').count()));
-	let mut dirs: Vec<NewLocalDir<'m>> = Vec::with_capacity(candidates.len());
+	let mut new_dirs: Vec<NewLocalDir<'m>> = Vec::with_capacity(candidates.len());
 	for path in candidates {
 		let Some(full) = dir_signature(local, &path) else {
 			continue;
@@ -2670,7 +2845,7 @@ fn new_local_dir_signatures<'m>(
 		// A directory whose whole tree already matches one gone locally is that move, its nested
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
 		let explained = gone.iter().any(|(_, sig)| *sig == full);
-		for inner in &dirs {
+		for inner in &new_dirs {
 			if !explained
 				&& is_under(&inner.path, &path)
 				&& gone.iter().any(|(_, sig)| inner.matches(sig))
@@ -2682,13 +2857,13 @@ fn new_local_dir_signatures<'m>(
 					.retain(|rel, _| rel != inner_rel && !is_under(rel, inner_rel));
 			}
 		}
-		dirs.push(NewLocalDir {
+		new_dirs.push(NewLocalDir {
 			path,
 			full,
 			without_nested_moves,
 		});
 	}
-	dirs
+	new_dirs
 }
 
 /// What a directory holds, relative to it: every path under it with its kind and, for a file, its
@@ -4044,11 +4219,11 @@ mod tests {
 	}
 
 	/// A change-scoped pass folding a directory rename reads the renamed directory's rows a fixed
-	/// number of times, whatever it holds. On the first iteration: twice for the remote's
-	/// directories (the case-only rename's and the pulled move's) and once for the move sources,
-	/// once for whether anything local is left at the source, and once for the source's signature —
-	/// which the twin check and the new directories' match reuse rather than read again. On the
-	/// second, which finds nothing: once each for the move sources and the remote's directories.
+	/// number of times, whatever it holds. On the first iteration: once for the move sources and
+	/// both sides' directories together, once for whether anything local is left at the source, and
+	/// once for the source's signature — which the twin check and the new directories' match reuse
+	/// rather than read again. On the second, which finds nothing: once more for the sources and the
+	/// directories.
 	#[test]
 	fn a_scoped_directory_rename_fold_reads_the_renamed_rows_a_fixed_number_of_times() {
 		const FILES: usize = 2_000;
@@ -4094,8 +4269,8 @@ mod tests {
 		);
 		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
 		assert!(
-			rows < 8 * FILES,
-			"the fold read {rows} row(s) in {statements} statement(s): more than seven times the \
+			rows < 5 * FILES,
+			"the fold read {rows} row(s) in {statements} statement(s): more than four times the \
 			 {FILES} file(s) it moved"
 		);
 	}
