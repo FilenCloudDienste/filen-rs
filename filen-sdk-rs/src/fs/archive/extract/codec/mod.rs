@@ -311,15 +311,17 @@ fn likely_wrong_password() -> Error {
 	)
 }
 
-/// A symlink entry's target, for reporting, read from its `data` once opened: empty when its
+/// A symlink entry's target, for reporting, read from its `data` once opened: `None` when its
 /// data is damaged or cannot be opened. Fails only on an error of the archive's source.
-fn link_target(data: io::Result<impl Read>) -> io::Result<String> {
+fn link_target(data: io::Result<impl Read>) -> io::Result<Option<String>> {
 	let mut target = Vec::new();
 	match data.and_then(|mut data| data.read_to_end(&mut target)) {
-		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
+		Ok(_) => Ok(Some(
+			display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
+		)),
 		Err(error) if from_source(&error) => Err(error),
 		// a damaged link keeps nothing else from being read
-		Err(_) => Ok(String::new()),
+		Err(_) => Ok(None),
 	}
 }
 

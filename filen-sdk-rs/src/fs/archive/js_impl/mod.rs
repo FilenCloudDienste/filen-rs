@@ -33,7 +33,8 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			counts::ItemCounts,
-			listing::{ItemSource, ScanProgress},
+			js_impl::item_source,
+			listing::ScanProgress,
 			plan::{PlanTotals, RenamedEntry, SkippedEntry},
 		},
 		file::{RemoteFile, enums::RemoteFileType},
@@ -54,11 +55,11 @@ use super::{
 	dispose::{self, SourceDisposal},
 	entry_path::joined,
 	extract::{
-		self, ArchiveEntry, ArchiveEntryId, ArchiveSource, ArchiveTotals, DuplicateEntries,
+		self, ArchiveEntry, ArchiveEntryId, ArchiveSource, DuplicateEntries, EntrySelection,
 		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
 		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractSkippedEntry, ExtractStage,
-		ExtractTopLevelKey, ExtractTopLevelTrashed, ListCallback, ListConfig, ListPhase,
-		ListTotals, MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
+		ExtractTopLevelKey, ExtractWhat, ListCallback, ListConfig, ListPhase, ListTotals,
+		MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -215,6 +216,17 @@ pub struct ExtractFileDone {
 	pub size: u64,
 }
 
+/// A folder handed to the top-level callback that was moved to the trash: a wrong password
+/// showed only once entries were read, before any file was extracted (see the `password`
+/// argument).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ExtractTopLevelTrashed {
+	/// The folder's uuid.
+	pub dest_uuid: Uuid,
+}
+
+/// Something that happened to one item, reported in the next update.
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, tagged, no_default)]
 pub enum ExtractEvent {
@@ -251,7 +263,9 @@ pub struct ExtractUpdate {
 	pub phase: ExtractPhase,
 	/// Whether it runs, is paused or winds down.
 	pub run_state: RunState,
-	pub totals: ArchiveTotals,
+	/// The archive's size in bytes; progress is how much of it was read (`bytesRead`).
+	pub archive_bytes: u64,
+	/// What was done so far.
 	pub counts: ItemCounts,
 	/// Archive bytes read so far.
 	pub bytes_read: u64,
@@ -262,9 +276,9 @@ pub struct ExtractUpdate {
 	/// Bytes of files extracted per second, over the last 10 seconds of running time;
 	/// `undefined` until there is a rate.
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a job
-	/// an error or a cancel stopped winds down; 0 on the final update, whether the job completed,
-	/// was cancelled or failed.
+	/// Estimated time left, in milliseconds. `undefined` until it can be told, and while the job
+	/// winds down after an error or a cancel stopped it; 0 on the final update, whether the job
+	/// completed, was cancelled or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -301,7 +315,9 @@ pub struct ExtractReport {
 	pub misleading_names: Vec<ExtractMisleadingName>,
 	/// What the lists above only count.
 	pub omitted: OmittedRecords,
-	pub totals: ArchiveTotals,
+	/// The archive's size in bytes.
+	pub archive_bytes: u64,
+	/// What was done.
 	pub counts: ItemCounts,
 	/// Bytes of the archive that belong to no entry: after its last one (another archive
 	/// appended to it, say), or before a zip's first (a self-extracting stub).
@@ -337,9 +353,9 @@ pub struct ListUpdate {
 	/// Bytes of the archive read per second, over the last 10 seconds of running time;
 	/// `undefined` until there is a rate.
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a job
-	/// an error or a cancel stopped winds down; 0 on the final update, whether the job completed,
-	/// was cancelled or failed.
+	/// Estimated time left, in milliseconds. `undefined` until it can be told, and while the job
+	/// winds down after an error or a cancel stopped it; 0 on the final update, whether the job
+	/// completed, was cancelled or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -350,7 +366,7 @@ pub struct ListUpdate {
 /// folders in `__MACOSX` folders come last when macOS metadata is left out.
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, no_default)]
-pub struct ArchiveListing {
+pub struct ListReport {
 	/// What the archive is; `undefined` when the listing ended before it could tell.
 	pub format: Option<ArchiveFormat>,
 	/// What the listing found out about the password.
@@ -414,9 +430,9 @@ pub struct CompressUpdate {
 	/// Bytes of the sources read (and, in `verifying`, of the archive read back) per second,
 	/// over the last 10 seconds of running time; `undefined` until there is a rate.
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a job
-	/// an error or a cancel stopped winds down; 0 on the final update, whether the job completed,
-	/// was cancelled or failed.
+	/// Estimated time left, in milliseconds. `undefined` until it can be told, and while the job
+	/// winds down after an error or a cancel stopped it; 0 on the final update, whether the job
+	/// completed, was cancelled or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -442,6 +458,8 @@ pub struct CompressReport {
 	pub dispositions: Vec<ArchiveSourceDisposition>,
 	/// Source files whose data did not match the hash in their metadata (up to 1000).
 	pub hash_mismatches: Vec<HashMismatch>,
+	/// Mismatches past the 1000 `hashMismatches` lists, only counted.
+	pub omitted_hash_mismatches: u64,
 	/// Why the compress ended early: kind `Cancelled` when cancelled, or the error that stopped
 	/// it. `undefined` when it ran to the end.
 	pub error: Option<SdkError>,
@@ -542,7 +560,9 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 			Event::Skipped(entry) => Self::Skipped(entry),
 			Event::Renamed(entry) => Self::Renamed(entry),
 			Event::MisleadingName(entry) => Self::MisleadingName(entry),
-			Event::TopLevelTrashed(trashed) => Self::TopLevelTrashed(trashed),
+			Event::TopLevelTrashed { dest_uuid } => {
+				Self::TopLevelTrashed(ExtractTopLevelTrashed { dest_uuid })
+			}
 			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
 			Event::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))
@@ -556,7 +576,7 @@ impl From<extract::ExtractUpdate> for ExtractUpdate {
 		Self {
 			phase: update.phase,
 			run_state: update.run_state,
-			totals: update.totals,
+			archive_bytes: update.archive_bytes,
 			counts: update.counts,
 			bytes_read: update.bytes_read,
 			active: update.active,
@@ -586,7 +606,7 @@ impl From<extract::ExtractReport> for ExtractReport {
 			renamed: report.renamed,
 			misleading_names: report.misleading_names,
 			omitted: report.omitted,
-			totals: report.totals,
+			archive_bytes: report.archive_bytes,
 			counts: report.counts,
 			unaccounted_bytes: report.unaccounted_bytes,
 			duplicates: report.duplicates,
@@ -605,55 +625,6 @@ impl From<extract::ExtractFailed> for ExtractReport {
 	}
 }
 
-impl From<extract::ListUpdate> for ListUpdate {
-	fn from(update: extract::ListUpdate) -> Self {
-		Self {
-			phase: update.phase,
-			run_state: update.run_state,
-			bytes_read: update.bytes_read,
-			archive_bytes: update.archive_bytes,
-			entries: update.entries,
-			undelivered_entries: 0,
-			bytes_per_second: update.bytes_per_second,
-			eta_ms: update.eta.map(millis),
-			active_time_ms: millis(update.active_time),
-		}
-	}
-}
-
-impl From<extract::ArchiveListing> for ArchiveListing {
-	fn from(listing: extract::ArchiveListing) -> Self {
-		Self {
-			format: listing.format,
-			password: listing.password,
-			entries: listing.entries,
-			omitted_entries: listing.omitted_entries,
-			undelivered_entries: 0,
-			totals: listing.totals,
-			unaccounted_bytes: listing.unaccounted_bytes,
-			duplicates: listing.duplicates,
-			error: None,
-		}
-	}
-}
-
-impl ArchiveListing {
-	/// How a listing ended, for the bindings, with the entries the app did not receive: one
-	/// that ended early still resolves, with the entries it read.
-	fn new(
-		result: Result<extract::ArchiveListing, extract::ListFailed>,
-		undelivered_entries: u64,
-	) -> Self {
-		Self {
-			undelivered_entries,
-			..match result {
-				Ok(listing) => listing.into(),
-				Err(failed) => failed.into(),
-			}
-		}
-	}
-}
-
 impl ExtractReport {
 	/// How an extract ended, for the bindings: one that ended early still resolves, with the
 	/// report of what it did.
@@ -665,11 +636,43 @@ impl ExtractReport {
 	}
 }
 
-impl From<extract::ListFailed> for ArchiveListing {
-	fn from(failed: extract::ListFailed) -> Self {
+impl ListUpdate {
+	/// `update` for the bindings, with the entries the app did not receive.
+	fn new(update: extract::ListUpdate, undelivered_entries: u64) -> Self {
 		Self {
-			error: Some(sdk_error(failed.error)),
-			..failed.report.into()
+			phase: update.phase,
+			run_state: update.run_state,
+			bytes_read: update.bytes_read,
+			archive_bytes: update.archive_bytes,
+			entries: update.entries,
+			undelivered_entries,
+			bytes_per_second: update.bytes_per_second,
+			eta_ms: update.eta.map(millis),
+			active_time_ms: millis(update.active_time),
+		}
+	}
+}
+
+impl ListReport {
+	/// How a listing ended, for the bindings, with the entries the app did not receive.
+	fn new(
+		result: Result<extract::ListReport, extract::ListFailed>,
+		undelivered_entries: u64,
+	) -> Self {
+		let (listing, error) = match result {
+			Ok(listing) => (listing, None),
+			Err(failed) => (failed.report, Some(sdk_error(failed.error))),
+		};
+		Self {
+			format: listing.format,
+			password: listing.password,
+			entries: listing.entries,
+			omitted_entries: listing.omitted_entries,
+			undelivered_entries,
+			totals: listing.totals,
+			unaccounted_bytes: listing.unaccounted_bytes,
+			duplicates: listing.duplicates,
+			error,
 		}
 	}
 }
@@ -717,6 +720,7 @@ impl From<compress::CompressReport> for CompressReport {
 			needed_bytes: report.needed_bytes,
 			dispositions: report.dispositions.into_iter().map(Into::into).collect(),
 			hash_mismatches: report.hash_mismatches,
+			omitted_hash_mismatches: report.omitted_hash_mismatches,
 			error: None,
 		}
 	}
@@ -743,7 +747,7 @@ impl CompressReport {
 }
 
 /// The password argument of a call, checked.
-fn password(password: Option<String>) -> Result<Option<ArchivePassword>, Error> {
+fn checked_password(password: Option<String>) -> Result<Option<ArchivePassword>, Error> {
 	password.map(ArchivePassword::new).transpose()
 }
 
@@ -783,8 +787,8 @@ fn extract_request(
 			));
 		}
 	};
-	Ok(ExtractRequest::All {
-		archive,
+	Ok(ExtractRequest {
+		what: ExtractWhat::All(archive),
 		destination: DirType::from(destination),
 		root: root.try_into()?,
 	})
@@ -800,16 +804,17 @@ fn entries_request(
 	destination: AnyNormalDir,
 	root: ExtractRoot,
 ) -> Result<ExtractRequest, Error> {
-	let archive = RemoteFileType::try_from(archive)?;
-	extract::check_entries(archive.uuid(), &entries)?;
-	Ok(ExtractRequest::Entries {
-		archive,
-		ids: entries,
-		base: base
-			.split('/')
-			.filter(|segment| !segment.is_empty())
-			.map(ValidatedName::try_from)
-			.collect::<Result<_, _>>()?,
+	let base = base
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.map(ValidatedName::try_from)
+		.collect::<Result<_, _>>()?;
+	Ok(ExtractRequest {
+		what: ExtractWhat::Entries(EntrySelection::new(
+			RemoteFileType::try_from(archive)?,
+			entries,
+			base,
+		)?),
 		destination: DirType::from(destination),
 		root: root.try_into()?,
 	})
@@ -862,7 +867,7 @@ fn compress_sources(
 		return Ok(CompressSources::Keep(
 			items
 				.into_iter()
-				.map(ItemSource::try_from)
+				.map(|item| item_source(item, "compressed"))
 				.collect::<Result<_, _>>()?,
 		));
 	};
@@ -887,7 +892,7 @@ fn compress_sources(
 /// An extract's callback, as the job made it: the binding's delivery task converts it (see the
 /// module docs).
 enum ExtractDelivery {
-	TopLevelCreated(Vec<ExtractedTopLevelItem>),
+	TopLevelBatch(Vec<extract::ExtractedTopLevel>),
 	Update(extract::ExtractUpdate),
 }
 
@@ -896,10 +901,8 @@ enum ExtractDelivery {
 struct ExtractChannel(UnboundedSender<ExtractDelivery>);
 
 impl ExtractCallback for ExtractChannel {
-	fn on_top_level_created(&self, items: Vec<extract::ExtractedTopLevel>) {
-		let _ = self.0.send(ExtractDelivery::TopLevelCreated(
-			items.into_iter().map(Into::into).collect(),
-		));
+	fn on_top_level_batch(&self, items: Vec<extract::ExtractedTopLevel>) {
+		let _ = self.0.send(ExtractDelivery::TopLevelBatch(items));
 	}
 
 	fn on_update(&self, update: extract::ExtractUpdate) {
@@ -996,17 +999,14 @@ impl ListCallback for ListChannel {
 	}
 
 	fn on_update(&self, update: extract::ListUpdate) {
-		let update = ListUpdate {
-			undelivered_entries: self.undelivered.load(Ordering::Relaxed),
-			..update.into()
-		};
+		let update = ListUpdate::new(update, self.undelivered.load(Ordering::Relaxed));
 		let _ = self.sender.send(ListDelivery::Update(update));
 	}
 }
 
 /// How a listing ended, and the entries the app did not receive: the binding's report once the
 /// job has returned (see the module docs).
-type Listed = (Result<extract::ArchiveListing, extract::ListFailed>, u64);
+type Listed = (Result<extract::ListReport, extract::ListFailed>, u64);
 
 /// Runs the listing as the job of a managed future, its callbacks going to `sender`.
 async fn list_job(
@@ -1109,7 +1109,7 @@ impl JsClient {
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveCodecMemBudget")
 	)]
 	pub fn archive_codec_mem_budget(&self) -> u64 {
-		self.inner_ref().archive_config().codec_mem_budget
+		self.inner_ref().archives().codec_mem_budget
 	}
 }
 
@@ -1121,7 +1121,7 @@ impl JsClient {
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveExtension")
 )]
 pub fn archive_extension(format: CompressFormat) -> String {
-	format.extension()
+	format.extension().to_owned()
 }
 
 /// The memory `format`'s encoder needs, in bytes; fails for a level the format does not take.
@@ -1201,7 +1201,7 @@ pub fn archive_format_of_name(name: String) -> Option<ArchiveFormat> {
 	wasm_bindgen::prelude::wasm_bindgen(js_name = "archiveDefaultName")
 )]
 pub fn archive_default_name(name: String) -> String {
-	super::format::archive_default_name(&name).into()
+	super::archive_default_name(&name).into()
 }
 
 #[cfg(feature = "uniffi")]

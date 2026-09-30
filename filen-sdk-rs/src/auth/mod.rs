@@ -365,6 +365,13 @@ impl Client {
 		self.unauthed().thumbnails()
 	}
 
+	/// The archive settings in effect (after clamping): codec memory and jobs at once.
+	/// Shared, with the job gate, by every client descended from the same `UnauthClient`.
+	#[cfg(feature = "archive")]
+	pub fn archives(&self) -> &crate::fs::archive::ArchiveConfig {
+		self.client().state().archives()
+	}
+
 	pub(crate) fn arc_client(&self) -> Arc<AuthClient> {
 		self.http_client.clone()
 	}

@@ -14,7 +14,8 @@ use filen_macros::js_type;
 use crate::{
 	Error, ErrorKind,
 	fs::{
-		archive::{ArchivePassword, SourceDisposal},
+		HasUUID,
+		archive::SourceDisposal,
 		categories::{DirType, Normal},
 		drive_job::exceeds_limit,
 		file::{RemoteFile, enums::RemoteFileType},
@@ -22,17 +23,18 @@ use crate::{
 	},
 };
 
-#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub(crate) use client_impl::check_entries;
+use codec::Selection;
+
+pub use client_impl::ExtractConfig;
 pub use list::{
-	ArchiveEntry, ArchiveEntryKind, ArchiveListing, ListCallback, ListConfig, ListFailed,
-	ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
+	ArchiveEntry, ArchiveEntryKind, ListCallback, ListConfig, ListFailed, ListPhase, ListReport,
+	ListTotals, ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
-	ArchiveEntryId, ArchiveTotals, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
+	ArchiveEntryId, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,
 	ExtractFailure, ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry,
 	ExtractReport, ExtractRetry, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, OmittedRecords,
+	ExtractUpdate, ExtractedTopLevel, OmittedRecords,
 };
 
 /// Where an archive's entries are created.
@@ -76,41 +78,81 @@ pub enum ArchiveSource {
 
 /// What to extract, and where to.
 #[derive(Debug, Clone)]
-pub enum ExtractRequest {
-	/// Every entry of the archive into `destination`, an existing directory of the user's drive.
-	All {
-		archive: ArchiveSource,
-		destination: DirType<'static, Normal>,
-		root: ExtractRoot,
-	},
-	/// Some of the archive's entries into `destination`: those `ids` names (from
-	/// [`Client::list_archive`](crate::auth::Client::list_archive), or a failure's
-	/// [`ExtractRetry`]), everything below a directory among them, and the directories that hold
-	/// them.
-	///
-	/// Each lands at its path in the archive less `base`, a directory of the archive as drive
-	/// names: with `base` `[photos]`, the entry `photos/2024/a.jpg` lands at `2024/a.jpg` in the
-	/// root. An empty `base` keeps the archive's paths. No id, or an id of another archive,
-	/// fails the job before anything runs. A zip's or 7z's ids are checked against its
-	/// index before anything is created: an id it does not hold, of an entry not below `base`, or
-	/// of a file at `base` itself fails the job. A tar's members are only known as it is read: a
-	/// member chosen that is not below `base` fails the job when it is reached, and an id the tar
-	/// does not hold once it is read to its end, what was extracted until then staying.
-	///
-	/// A chosen directory of a tar brings what the tar stores after it below it: every tool
-	/// stores a directory before its contents, and what came before is gone by the time the
-	/// directory is reached. A zip's or 7z's brings everything below it, wherever it is stored.
-	/// A tar's hard link is extracted only along with the entry it names (see
-	/// [`ArchiveEntryKind::Hardlink`]).
-	///
-	/// The archive is never removed afterwards: part of it is not extracted.
-	Entries {
+pub struct ExtractRequest {
+	/// The archive, and which of its entries to extract.
+	pub what: ExtractWhat,
+	/// An existing directory of the user's drive.
+	pub destination: DirType<'static, Normal>,
+	/// Whether the entries go into a new folder or straight into `destination`.
+	pub root: ExtractRoot,
+}
+
+/// Which of an archive's entries to extract.
+#[derive(Debug, Clone)]
+pub enum ExtractWhat {
+	/// Every entry of the archive.
+	All(ArchiveSource),
+	/// Some of the archive's entries. The archive is never removed afterwards: part of it is
+	/// not extracted.
+	Entries(EntrySelection),
+}
+
+/// Some entries of one archive, chosen to extract: those the ids name (from
+/// [`Client::list_archive`](crate::auth::Client::list_archive), or a failure's
+/// [`ExtractRetry`]), everything below a directory among them, and the directories that hold
+/// them.
+///
+/// Each lands at its path in the archive less `base`, a directory of the archive as drive
+/// names: with `base` `[photos]`, the entry `photos/2024/a.jpg` lands at `2024/a.jpg` in the
+/// root. An empty `base` keeps the archive's paths. A zip's or 7z's ids are checked against its
+/// index before anything is created: an id it does not hold, of an entry not below `base`, or
+/// of a file at `base` itself fails the job. A tar's members are only known as it is read: a
+/// member chosen that is not below `base` fails the job when it is reached, and an id the tar
+/// does not hold once it is read to its end, what was extracted until then staying.
+///
+/// A chosen directory of a tar brings what the tar stores after it below it: every tool
+/// stores a directory before its contents, and what came before is gone by the time the
+/// directory is reached. A zip's or 7z's brings everything below it, wherever it is stored.
+/// A tar's hard link is extracted only along with the entry it names (see
+/// [`ArchiveEntryKind::Hardlink`]).
+#[derive(Debug, Clone)]
+pub struct EntrySelection {
+	archive: RemoteFileType<'static>,
+	selection: Selection,
+}
+
+impl EntrySelection {
+	/// The entries `ids` names of `archive`, below `base`. Fails with
+	/// [`ErrorKind::InvalidState`] when `ids` is empty or names an entry of another archive.
+	pub fn new(
 		archive: RemoteFileType<'static>,
 		ids: Vec<ArchiveEntryId>,
 		base: Vec<ValidatedName>,
-		destination: DirType<'static, Normal>,
-		root: ExtractRoot,
-	},
+	) -> Result<Self, Error> {
+		if ids.is_empty() {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"no entry was chosen to extract",
+			));
+		}
+		if ids.iter().any(|id| id.archive != archive.uuid()) {
+			return Err(Error::custom(
+				ErrorKind::InvalidState,
+				"an entry chosen to extract is of another archive",
+			));
+		}
+		let selection = Selection::new(ids.into_iter().map(|id| u64::from(id.index)), base);
+		Ok(Self { archive, selection })
+	}
+
+	/// The archive the entries are of.
+	pub fn archive(&self) -> &RemoteFileType<'static> {
+		&self.archive
+	}
+
+	pub(crate) fn into_parts(self) -> (RemoteFileType<'static>, Selection) {
+		(self.archive, self.selection)
+	}
 }
 
 /// How much more than it reads a compressed archive may decode to: at most `ratio` times the
@@ -135,62 +177,21 @@ pub struct ExpansionLimit {
 	pub floor: u64,
 }
 
-impl ExpansionLimit {
+impl Default for ExpansionLimit {
 	/// A thousand times, and at least 256 MiB: more than ordinary data compresses to.
-	pub const DEFAULT: Self = Self {
-		ratio: 1000,
-		floor: 256 << 20,
-	};
+	fn default() -> Self {
+		Self {
+			ratio: 1000,
+			floor: 256 << 20,
+		}
+	}
+}
 
+impl ExpansionLimit {
 	/// Whether `decoded` bytes are within the limit for an archive of which `read` bytes were
 	/// read.
 	pub(crate) fn allows(self, read: u64, decoded: u64) -> bool {
 		decoded <= self.floor.max(read.saturating_mul(self.ratio))
-	}
-}
-
-#[derive(Debug, Clone)]
-pub struct ExtractConfig {
-	/// Storage still free on the account, if the caller knows it. A job that needs more fails
-	/// with [`ErrorKind::MaxStorageReached`](crate::ErrorKind); one that needs exactly this much
-	/// fits. A zip or 7z states its files' sizes in its index, so one stating more for the files
-	/// it will extract (those skipped for their path or method left out) fails before anything
-	/// is created; a tar or single compressed file is only known as it is read, so it is checked as
-	/// it goes, and what was extracted so far is kept. A zip entry found overlapping another
-	/// only once it is read still counts up front, so such a zip may be refused though it fits.
-	pub max_bytes: Option<u64>,
-	/// Most directories and files created; an archive with more fails with
-	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind).
-	pub max_items: Option<u64>,
-	/// `None` turns the check off.
-	pub expansion_limit: Option<ExpansionLimit>,
-	/// For an archive with encrypted entries. Checked before anything is created on a 7z's
-	/// encrypted header, or else by reading the encrypted entry quickest to read in full, when
-	/// that takes at most 16 MiB of the archive. Otherwise it is checked as entries are
-	/// extracted: a wrong password found then fails the job with
-	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind), and when no file was extracted by
-	/// then, the folders created so far go to the trash (a folder holding a file someone else put
-	/// there meanwhile stays).
-	pub password: Option<ArchivePassword>,
-	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them,
-	/// reported skipped as [`ExtractSkipReason::MacMetadata`]: AppleDouble files (named `._name`
-	/// or kept in a `__MACOSX` folder of Finder's zips, told by the 8 bytes they start with), a
-	/// tar's hard links to them, and the `__MACOSX` folders (and folders in them) that hold
-	/// nothing else. A folder there that holds anything of the user's, or nothing at all, is
-	/// created. Left out on purpose, they keep nothing from removing the archive once the rest is
-	/// extracted. `true` by default; `false` extracts them as ordinary files.
-	pub skip_mac_metadata: bool,
-}
-
-impl Default for ExtractConfig {
-	fn default() -> Self {
-		Self {
-			max_bytes: None,
-			max_items: None,
-			expansion_limit: Some(ExpansionLimit::DEFAULT),
-			password: None,
-			skip_mac_metadata: true,
-		}
 	}
 }
 

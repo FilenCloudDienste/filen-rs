@@ -114,7 +114,7 @@ impl Client {
 		} = request;
 		let reporter = Reporter::new(callback);
 		let (format, max_bytes) = (config.format, config.max_bytes);
-		let archives = self.archive_config().clone();
+		let archives = self.archives().clone();
 		let Planned {
 			extension_len,
 			report,

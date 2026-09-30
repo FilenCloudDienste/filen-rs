@@ -29,8 +29,10 @@ pub struct Compression {
 }
 
 impl StreamCodec {
-	/// The levels the codec takes, and the one it uses by default.
-	pub fn levels(self) -> (RangeInclusive<u32>, u32) {
+	/// The levels the codec takes, and the one it uses by default. Callers outside the SDK ask
+	/// [`CompressFormat::levels`](super::CompressFormat::levels) and
+	/// [`default_level`](super::CompressFormat::default_level).
+	pub(crate) fn levels(self) -> (RangeInclusive<u32>, u32) {
 		match self {
 			Self::Gzip => (0..=9, 6),
 			Self::Bzip2 => (1..=9, 9),

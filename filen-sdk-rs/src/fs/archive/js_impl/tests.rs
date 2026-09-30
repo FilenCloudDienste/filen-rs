@@ -15,6 +15,7 @@ use crate::{
 			Compression, SevenZMethod, StreamCodec, ZipMethod,
 			config::CODEC_MEM_BUDGET,
 			dispose::{DisposalOutcome, KeptReason, SourceDisposition},
+			extract::codec::Selection,
 			zip::crypto::AesStrength,
 		},
 		dir::{RemoteDirectory, RootDirectory},
@@ -53,11 +54,11 @@ fn an_archive_to_remove_has_to_be_the_users_own() {
 		Some(SourceDisposal::Trash),
 	)
 	.unwrap();
-	let ExtractRequest::All {
-		archive: ArchiveSource::Dispose {
+	let ExtractRequest {
+		what: ExtractWhat::All(ArchiveSource::Dispose {
 			file: disposed,
 			how,
-		},
+		}),
 		root: extract::ExtractRoot::NewFolder { name: None },
 		..
 	} = request
@@ -89,18 +90,24 @@ fn chosen_entries_go_to_the_extract_below_a_base_of_names() {
 		ExtractRoot::Destination,
 	)
 	.unwrap();
-	let ExtractRequest::Entries {
-		archive,
-		ids,
-		base,
+	let ExtractRequest {
+		what: ExtractWhat::Entries(chosen),
 		root: extract::ExtractRoot::Destination,
 		..
 	} = request
 	else {
 		panic!("some entries, into the destination itself");
 	};
-	assert_eq!((archive.uuid(), ids), (ARCHIVE, entries));
-	assert_eq!(names(&base), ["photos", "2024"]);
+	let (archive, selection) = chosen.into_parts();
+	assert_eq!(archive.uuid(), ARCHIVE);
+	assert_eq!(names(selection.base()), ["photos", "2024"]);
+	assert_eq!(
+		selection,
+		Selection::new(
+			entries.iter().map(|id| u64::from(id.index)),
+			selection.base().to_vec()
+		)
+	);
 }
 
 #[test]
@@ -189,10 +196,10 @@ fn names_and_passwords_are_checked_at_the_edge() {
 	.unwrap_err();
 	assert_eq!(error.kind(), ErrorKind::InvalidName);
 	assert_eq!(
-		password(Some(String::new())).unwrap_err().kind(),
+		checked_password(Some(String::new())).unwrap_err().kind(),
 		ErrorKind::InvalidState
 	);
-	assert!(password(None).unwrap().is_none());
+	assert!(checked_password(None).unwrap().is_none());
 	let call = |name, format, budget| {
 		CompressCall::new(
 			Vec::new(),
@@ -285,9 +292,16 @@ fn items_to_remove_have_to_be_the_users_own_and_not_the_root() {
 	let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(Root::from(
 		RootDirectory::new(Uuid::from_u128(0x7)),
 	))));
-	for dispose in [None, Some(SourceDisposal::Trash)] {
+	for (dispose, refusal) in [
+		(None, "the root directory cannot be compressed"),
+		(
+			Some(SourceDisposal::Trash),
+			"only items in the user's own drive, not its root, can be removed after compressing",
+		),
+	] {
 		let error = compress_sources(vec![root.clone()], dispose).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState, "{dispose:?}");
+		assert!(error.to_string().contains(refusal), "{error}");
 	}
 }
 
@@ -383,7 +397,7 @@ fn a_report_carries_why_the_job_ended_and_what_became_of_its_sources() {
 		renamed: Vec::new(),
 		misleading_names: vec![misleading.clone()],
 		omitted: OmittedRecords::default(),
-		totals: ArchiveTotals::Streaming { archive_bytes: 0 },
+		archive_bytes: 0,
 		counts: ItemCounts::default(),
 		unaccounted_bytes: 0,
 		duplicates: None,
@@ -484,7 +498,7 @@ fn extract_update(millis: u64) -> extract::ExtractUpdate {
 	extract::ExtractUpdate {
 		phase: ExtractPhase::Extracting,
 		run_state: RunState::Running,
-		totals: ArchiveTotals::Streaming { archive_bytes: 100 },
+		archive_bytes: 100,
 		counts: ItemCounts::default(),
 		bytes_read: 40,
 		active: Vec::new(),
@@ -528,15 +542,13 @@ fn archive_entry(index: u32) -> ArchiveEntry {
 		id: entry_id(index),
 		stored_path: format!("docs/{index}.txt"),
 		stored_path_truncated: false,
-		path: Some(format!("docs/{index}.txt")),
+		path: Some(extract::ListedPath::plain(format!("docs/{index}.txt"))),
 		kind: extract::ArchiveEntryKind::File,
 		size: Some(u64::from(index) * 3),
 		modified: None,
 		encrypted: false,
 		method: Some("Deflate".into()),
 		skip: None,
-		path_rewritten: false,
-		misleading_name: false,
 		mac_metadata: false,
 	}
 }
@@ -652,15 +664,23 @@ fn a_compress_update_carries_its_active_file_and_events() {
 
 #[test]
 fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
-	let update = ListUpdate::from(extract::ListUpdate {
-		eta: Some(Duration::from_millis(300)),
-		..list_update(1200)
-	});
-	assert_eq!(
-		(update.eta_ms, update.active_time_ms, update.entries),
-		(Some(300), 1200, 1)
+	let update = ListUpdate::new(
+		extract::ListUpdate {
+			eta: Some(Duration::from_millis(300)),
+			..list_update(1200)
+		},
+		7,
 	);
-	let listing = extract::ArchiveListing {
+	assert_eq!(
+		(
+			update.eta_ms,
+			update.active_time_ms,
+			update.entries,
+			update.undelivered_entries
+		),
+		(Some(300), 1200, 1, 7)
+	);
+	let listing = extract::ListReport {
 		format: Some(ArchiveFormat::Zip),
 		password: PasswordCheck::Wrong,
 		entries: vec![archive_entry(0), archive_entry(1)],
@@ -670,10 +690,14 @@ fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
 		duplicates: None,
 	};
 	let ended = Arc::new(Error::custom(ErrorKind::ArchiveWrongPassword, "wrong"));
-	let failed = ArchiveListing::from(JobFailed {
-		report: listing.clone(),
-		error: Arc::clone(&ended),
-	});
+	let failed = ListReport::new(
+		Err(JobFailed {
+			report: listing.clone(),
+			error: Arc::clone(&ended),
+		}),
+		3,
+	);
+	assert_eq!(failed.undelivered_entries, 3);
 	assert!(Arc::ptr_eq(failed.error.as_ref().unwrap(), &ended));
 	assert_eq!(
 		(
@@ -691,11 +715,11 @@ fn a_listing_carries_why_it_ended_and_the_entries_read_by_then() {
 			9
 		)
 	);
-	assert!(ArchiveListing::from(listing).error.is_none());
+	assert!(ListReport::new(Ok(listing), 0).error.is_none());
 }
 
 impl ExtractArchiveCallback for Recorder {
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>) {
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevelItem>) {
 		for item in items {
 			let ExtractTopLevelKey::Entry { id } = item.key else {
 				panic!("an entry at the top");
@@ -743,7 +767,7 @@ fn extract_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 			let mut sent = Vec::new();
 			for i in 0..300 {
 				match i % 2 {
-					0 => channel.on_top_level_created(vec![extract::ExtractedTopLevel {
+					0 => channel.on_top_level_batch(vec![extract::ExtractedTopLevel {
 						key: ExtractTopLevelKey::Entry {
 							id: entry_id(u32::try_from(i).unwrap()),
 						},

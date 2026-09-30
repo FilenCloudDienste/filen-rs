@@ -5,6 +5,8 @@ pub(crate) mod backend;
 pub(crate) mod counts;
 pub(crate) mod dir;
 pub(crate) mod finalize;
+#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+pub(crate) mod js_impl;
 pub(crate) mod listing;
 pub(crate) mod lock;
 pub(crate) mod name_retry;

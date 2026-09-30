@@ -136,7 +136,7 @@ fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
 		// a hard link with data of its own holds the file, as for libarchive
 		MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
 		MemberKind::Dir => (ArchiveEntryKind::Dir, None),
-		MemberKind::Symlink { target } => symlink(display_path(target).0.to_owned()),
+		MemberKind::Symlink { target } => symlink(Some(display_path(target).0.to_owned())),
 		MemberKind::Hardlink { target } => (
 			ArchiveEntryKind::Hardlink {
 				target: display_path(target).0.to_owned(),

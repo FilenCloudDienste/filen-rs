@@ -229,6 +229,8 @@ const fn single(codec: StreamCodec) -> ArchiveFormat {
 }
 
 /// Recognised extensions, longest first so `.tar.gz` wins over `.gz`. Matched case-insensitively.
+/// Each format's own extension comes before its aliases (`.tar.gz` before `.tgz`): the first row
+/// of a format is the extension the SDK names it with.
 const EXTENSIONS: &[(&str, ArchiveFormat)] = &[
 	(".tar.gz", tar(StreamCodec::Gzip)),
 	(".tar.bz2", tar(StreamCodec::Bzip2)),
@@ -256,6 +258,17 @@ const EXTENSIONS: &[(&str, ArchiveFormat)] = &[
 	(".br", single(StreamCodec::Brotli)),
 	(".zst", single(StreamCodec::Zstd)),
 ];
+
+impl ArchiveFormat {
+	/// The extension the SDK names a file of this format with, dot included.
+	pub(crate) fn extension(self) -> &'static str {
+		EXTENSIONS
+			.iter()
+			.find(|(_, format)| *format == self)
+			.map(|(extension, _)| *extension)
+			.expect("every format has an extension")
+	}
+}
 
 /// The recognised extension `name` ends in, with what it says the file holds.
 pub(crate) fn match_extension(name: &str) -> Option<(&'static str, ArchiveFormat)> {
@@ -393,6 +406,22 @@ mod tests {
 		assert_eq!(detect(&long, "a.gz"), None);
 		// a skippable frame before anything else is no stream
 		assert_eq!(detect(&skippable(2), "x"), None);
+	}
+
+	#[test]
+	fn every_format_is_named_with_its_own_extension() {
+		for &(_, format) in EXTENSIONS {
+			let extension = format.extension();
+			assert_eq!(
+				match_extension(&format!("a{extension}")),
+				Some((extension, format))
+			);
+		}
+		assert_eq!(tar(StreamCodec::Gzip).extension(), ".tar.gz");
+		assert_eq!(tar(StreamCodec::Bzip2).extension(), ".tar.bz2");
+		assert_eq!(tar(StreamCodec::Lzip).extension(), ".tar.lz");
+		assert_eq!(tar(StreamCodec::Zstd).extension(), ".tar.zst");
+		assert_eq!(single(StreamCodec::Lzma).extension(), ".lzma");
 	}
 
 	#[test]

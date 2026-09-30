@@ -33,7 +33,7 @@ use crate::{
 };
 
 use super::{
-	super::report::{ExtractEvent, ExtractTopLevelKey, ExtractTopLevelTrashed, ExtractedTopLevel},
+	super::report::{ExtractEvent, ExtractTopLevelKey, ExtractedTopLevel},
 	Driver,
 };
 
@@ -321,8 +321,8 @@ impl<B: DisposalBackend> Driver<B> {
 			match self.backend.trash_dir(uuid).await {
 				Ok(()) => {
 					trashed.insert(uuid);
-					let trashed = ExtractTopLevelTrashed { dest_uuid: uuid };
-					self.reporter.event(ExtractEvent::TopLevelTrashed(trashed));
+					self.reporter
+						.event(ExtractEvent::TopLevelTrashed { dest_uuid: uuid });
 				}
 				Err(error) => tracing::warn!(
 					"archive {}: failed to trash a directory created before the wrong password \

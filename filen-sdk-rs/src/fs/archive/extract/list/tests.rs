@@ -43,7 +43,11 @@ async fn a_zip_is_listed_from_its_index_alone() {
 		listed
 			.entries
 			.iter()
-			.map(|entry| (entry.id.index, entry.path.as_deref(), entry.size))
+			.map(|entry| (
+				entry.id.index,
+				entry.path.as_ref().map(|path| path.path.as_str()),
+				entry.size
+			))
 			.collect::<Vec<_>>(),
 		[
 			(0, Some("big.bin"), Some(big.len() as u64)),
@@ -285,14 +289,12 @@ fn stated_sizes_add_up_without_overflowing() {
 		},
 		stored_path: "big.bin".to_owned(),
 		stored_path_truncated: false,
-		path: Some("big.bin".to_owned()),
+		path: Some(ListedPath::plain("big.bin")),
 		size: Some(1 << 63),
 		modified: None,
 		encrypted: false,
 		method: None,
 		skip,
-		path_rewritten: false,
-		misleading_name: false,
 		mac_metadata: false,
 		kind: ArchiveEntryKind::File,
 	};

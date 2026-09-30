@@ -114,7 +114,7 @@ fn sevenz_found<'e, 's, R: Read + Seek + 's>(
 				.read_to_end(&mut data)
 				.map_err(read_error)?;
 			match windows_link_target(&data) {
-				Some(target) => display_path(&target).0.to_owned(),
+				Some(target) => Some(display_path(&target).0.to_owned()),
 				None => return Ok((found, Some(data))),
 			}
 		}
@@ -135,7 +135,7 @@ pub(super) fn extract_sevenz(
 	// a derivation exchanges nothing with the driver for up to a minute: without this it would
 	// be given up on as a dead codec, and a cancel would wait it out
 	let keep_alive = || port.keep_alive();
-	let mut keys = Keys::new(job.password.as_ref()).on_round(&keep_alive);
+	let mut keys = Keys::new(job.password.as_ref()).with_on_round(&keep_alive);
 	let limits = SevenZLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
@@ -322,7 +322,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
 	let (kind, unreadable) = match entry.kind {
 		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
-		SevenZKind::Symlink => symlink(String::new()),
+		SevenZKind::Symlink => symlink(None),
 		SevenZKind::Dir => (ArchiveEntryKind::Dir, None),
 		_ if !index.supported(entry) => (
 			ArchiveEntryKind::File,
@@ -364,24 +364,24 @@ fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
 	}
 }
 
-/// A symlink entry's target, for reporting: its data, when small and readable; empty when it
+/// A symlink entry's target, for reporting: its data, when small and readable; `None` when it
 /// is not. Fails only on an error of the archive's source.
 fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	entry: &SevenZEntry,
 	keys: &mut Keys<'_>,
-) -> Result<String, SevenZError> {
+) -> Result<Option<String>, SevenZError> {
 	if entry.stream.is_none()
 		|| !index.supported(entry)
 		|| entry.size > MAX_ARCHIVE_PATH_BYTES as u64
 	{
-		return Ok(String::new());
+		return Ok(None);
 	}
 	let data = match cursor.open(index, entry, keys) {
 		Ok(data) => Ok(data),
 		Err(SevenZError::Read(error)) => Err(error),
-		Err(_) => return Ok(String::new()),
+		Err(_) => return Ok(None),
 	};
 	link_target(data).map_err(SevenZError::Read)
 }

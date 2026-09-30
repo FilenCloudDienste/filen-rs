@@ -17,6 +17,7 @@ use tokio::{
 
 use super::*;
 use crate::{
+	auth::http::ClientConfig,
 	consts::CHUNK_SIZE,
 	fs::{
 		HasName,
@@ -27,7 +28,7 @@ use crate::{
 				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
 			},
-			config::{CHUNK_BYTES, CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			config::CHUNK_BYTES,
 			decode::open_stream,
 			dispose::{
 				DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, SourceDisposal, Tree,
@@ -214,7 +215,7 @@ fn setup_with(
 		password: None,
 		hold_archive: false,
 		hold_after_registering: Vec::new(),
-		config: ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+		config: ArchiveConfig::new(&ClientConfig::default()),
 		reader: Mutex::new(None),
 	}
 }
@@ -431,7 +432,7 @@ async fn compresses_the_sources_into_one_new_file() {
 	let total: u64 = setup.contents.iter().map(|c| c.len() as u64).sum();
 	assert_eq!(report.counts.files_done, 3);
 	assert_eq!(report.counts.bytes_read, total);
-	assert_eq!(report.counts.bytes_done, bytes.len() as u64);
+	assert_eq!(report.counts.archive_bytes, bytes.len() as u64);
 	assert_eq!(job.recorder.created.lock().unwrap().len(), 1);
 	assert_eq!(job.recorder.last().phase, CompressPhase::Done);
 	// each file with data was the active one while it was read, named as in the archive
@@ -472,7 +473,16 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		JobControl::default(),
 		None,
 	);
-	job.running.await.unwrap().unwrap();
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(
+		report
+			.hash_mismatches
+			.iter()
+			.map(|mismatch| mismatch.path.as_str())
+			.collect::<Vec<_>>(),
+		["top.txt"]
+	);
+	assert_eq!(report.omitted_hash_mismatches, 0);
 	let mismatched: Vec<String> = job
 		.recorder
 		.events()
@@ -496,11 +506,11 @@ async fn an_archive_exactly_as_large_as_the_free_storage_fits() {
 		.unwrap()
 		.unwrap()
 		.counts
-		.bytes_done;
+		.archive_bytes;
 
 	let exact = start(&setup, "b.tar", tar, JobControl::default(), Some(size));
 	let report = exact.running.await.unwrap().unwrap();
-	assert_eq!(report.counts.bytes_done, size);
+	assert_eq!(report.counts.archive_bytes, size);
 
 	let short = start(&setup, "c.tar", tar, JobControl::default(), Some(size - 1));
 	let failed = short.running.await.unwrap().unwrap_err();
@@ -1765,7 +1775,8 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_compress_paused_before_it_starts_takes_no_slot() {
 	let mut setup_paused = setup(|_, _| {});
-	setup_paused.config = ArchiveConfig::new(CODEC_MEM_BUDGET, 1);
+	setup_paused.config =
+		ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(1));
 	let (pause, _cancel, control) = controls();
 	pause.send_replace(true);
 	let paused = start(&setup_paused, "paused.tgz", gzip_tar(), control, None);
@@ -2286,7 +2297,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 		"{:?}",
 		report.dispositions
 	);
-	assert_eq!(report.counts.bytes_verified, report.counts.bytes_done);
+	assert_eq!(report.counts.bytes_verified, report.counts.archive_bytes);
 	setup.backend.assert_released(&job.reporter);
 }
 

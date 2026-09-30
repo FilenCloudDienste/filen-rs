@@ -9,7 +9,6 @@ use filen_types::fs::Uuid;
 use crate::{
 	Error,
 	fs::{
-		archive::limits::MAX_REPORT_RECORDS,
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::counts::ItemCounts,
 		name::ValidatedName,
@@ -79,25 +78,6 @@ pub(crate) fn entry_index(ordinal: u64) -> u32 {
 	u32::try_from(ordinal).expect("the member cap keeps ordinals far below u32::MAX")
 }
 
-/// How much there is to extract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-	feature = "wasm-full",
-	derive(serde::Serialize, tsify::Tsify),
-	tsify(into_wasm_abi, large_number_types_as_bigints),
-	serde(
-		tag = "type",
-		rename_all = "camelCase",
-		rename_all_fields = "camelCase"
-	)
-)]
-#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-pub enum ArchiveTotals {
-	/// Progress is how much of the archive has been read, for every format: a tar's entries
-	/// are only known as they come, and a zip's or 7z's entry counts are not reported.
-	Streaming { archive_bytes: u64 },
-}
-
 /// A file being extracted right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
@@ -136,7 +116,7 @@ pub enum ExtractStage {
 }
 
 /// Where to extract an entry that failed again, for it to land where it was meant to:
-/// [`ExtractRequest::Entries`](super::ExtractRequest::Entries) with the entry's id, this
+/// [`ExtractWhat::Entries`](super::ExtractWhat::Entries) with the entry's id, this
 /// `destination`, this `base`, and [`ExtractRoot::Destination`](super::ExtractRoot::Destination).
 /// Failures that share a retry go again in one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,15 +209,6 @@ pub struct ExtractMisleadingName {
 	pub path: String,
 }
 
-/// A folder handed to `on_top_level_created` that was moved to the trash: a wrong password
-/// showed only once entries were read, before any file was extracted (see
-/// `ExtractConfig::password`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default)]
-pub struct ExtractTopLevelTrashed {
-	pub dest_uuid: Uuid,
-}
-
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
@@ -314,7 +285,13 @@ pub enum ExtractEvent {
 	Renamed(ExtractRenamedEntry),
 	/// An entry is being extracted under a name that reads as something it is not.
 	MisleadingName(ExtractMisleadingName),
-	TopLevelTrashed(ExtractTopLevelTrashed),
+	/// A folder handed to `on_top_level_batch` was moved to the trash: a wrong password showed
+	/// only once entries were read, before any file was extracted (see
+	/// `ExtractConfig::password`).
+	TopLevelTrashed {
+		/// The folder's uuid.
+		dest_uuid: Uuid,
+	},
 	/// What became of the archive, when it was to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The item was created but could not be added to one of the destination's public links or
@@ -334,7 +311,11 @@ pub struct ExtractUpdate {
 	pub phase: ExtractPhase,
 	/// Whether it runs, is paused or winds down.
 	pub run_state: RunState,
-	pub totals: ArchiveTotals,
+	/// The archive's size. Progress is how much of it was read (`bytes_read`), for every format:
+	/// a tar's entries are only known as they come, and a zip's or 7z's entry counts are not
+	/// reported.
+	pub archive_bytes: u64,
+	/// What was done so far.
 	pub counts: ItemCounts,
 	/// Bytes of the archive read so far.
 	pub bytes_read: u64,
@@ -364,7 +345,7 @@ pub struct ExtractUpdate {
 pub struct ExtractReport {
 	/// Items created directly in the destination (the new folder, or with
 	/// [`ExtractRoot::Destination`](super::ExtractRoot::Destination) every item at the top of
-	/// the archive), in creation order, up to [`MAX_REPORT_RECORDS`]; the callback receives all
+	/// the archive), in creation order, up to 1000; the callback receives all
 	/// of them, as they are created. An extraction that failed with
 	/// [`ErrorKind::ArchiveWrongPassword`](crate::ErrorKind) before extracting any file tried
 	/// to move the folders it had created to the trash, for a retry to start clean: those it
@@ -381,7 +362,9 @@ pub struct ExtractReport {
 	pub misleading_names: Vec<ExtractMisleadingName>,
 	/// What the lists above only count.
 	pub omitted: OmittedRecords,
-	pub totals: ArchiveTotals,
+	/// The archive's size in bytes.
+	pub archive_bytes: u64,
+	/// What was done.
 	pub counts: ItemCounts,
 	/// Bytes in the archive after its last entry that belong to none (another archive appended
 	/// to it, say), counted from the first non-zero one; zero padding is not counted. For a zip,
@@ -395,7 +378,7 @@ pub struct ExtractReport {
 
 impl ExtractReport {
 	/// The report of an extraction that has done nothing yet.
-	pub(crate) fn new(totals: ArchiveTotals) -> Self {
+	pub(crate) fn new(archive_bytes: u64) -> Self {
 		Self {
 			top_level: Vec::new(),
 			failures: Vec::new(),
@@ -403,7 +386,7 @@ impl ExtractReport {
 			renamed: Vec::new(),
 			misleading_names: Vec::new(),
 			omitted: OmittedRecords::default(),
-			totals,
+			archive_bytes,
 			counts: ItemCounts::default(),
 			unaccounted_bytes: 0,
 			duplicates: None,
@@ -423,16 +406,19 @@ pub type ExtractFailed = JobFailed<ExtractReport>;
 pub trait ExtractCallback: MaybeSendSync + 'static {
 	/// Items created directly in the destination, in batches of up to 256, each delivered right
 	/// before the next update (every job ends with one): no update counts an item its caller was
-	/// not given, so a caller holds every item to clean up. A folder among them goes to the trash
-	/// again when a wrong password shows only once entries were read, before any file was
-	/// extracted: an update's [`ExtractEvent::TopLevelTrashed`] tells which.
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>);
+	/// not given, so a caller holds every item to clean up. Batched, unlike a copy's one call per
+	/// item, since an archive's top level may hold as many entries as the member limit allows. A
+	/// folder among them may go to the trash again when a wrong password shows only once entries
+	/// were read, before any file was extracted: an update's [`ExtractEvent::TopLevelTrashed`]
+	/// tells which.
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevel>);
+	/// The job's progress, throttled; the last one comes once the job ended.
 	fn on_update(&self, update: ExtractUpdate);
 }
 
 impl<T: ExtractCallback + ?Sized> ExtractCallback for Arc<T> {
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>) {
-		(**self).on_top_level_created(items);
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevel>) {
+		(**self).on_top_level_batch(items);
 	}
 
 	fn on_update(&self, update: ExtractUpdate) {
@@ -443,7 +429,7 @@ impl<T: ExtractCallback + ?Sized> ExtractCallback for Arc<T> {
 /// What an extraction counts, next to the job-agnostic [`RunCore`].
 pub(crate) struct ExtractState {
 	core: RunCore<ExtractEvent, ExtractPhase>,
-	totals: ArchiveTotals,
+	archive_bytes: u64,
 	counts: ItemCounts,
 	bytes_read: u64,
 	active: Vec<ExtractActiveFile>,
@@ -454,7 +440,7 @@ pub(crate) struct ExtractState {
 	ended: bool,
 }
 
-/// Most items one callback of a batch (`on_top_level_created`, `on_entries`) carries.
+/// Most items one callback of a batch (`on_top_level_batch`, `on_entries_batch`) carries.
 pub(crate) const CALLBACK_BATCH: usize = 256;
 
 impl JobState for ExtractState {
@@ -467,7 +453,7 @@ impl JobState for ExtractState {
 	}
 
 	fn progress(&self) -> Progress {
-		let ArchiveTotals::Streaming { archive_bytes } = self.totals;
+		let archive_bytes = self.archive_bytes;
 		Progress {
 			bytes_done: self.counts.bytes_done,
 			units: Units {
@@ -488,12 +474,12 @@ impl JobState for ExtractState {
 		snapshot: Snapshot<ExtractEvent, ExtractPhase>,
 	) {
 		if !self.pending_top_level.is_empty() {
-			callback.on_top_level_created(std::mem::take(&mut self.pending_top_level));
+			callback.on_top_level_batch(std::mem::take(&mut self.pending_top_level));
 		}
 		callback.on_update(ExtractUpdate {
 			phase: snapshot.phase,
 			run_state: snapshot.run_state,
-			totals: self.totals,
+			archive_bytes: self.archive_bytes,
 			counts: self.counts,
 			bytes_read: self.bytes_read,
 			active: self.active.clone(),
@@ -559,11 +545,11 @@ impl<S: ReadsArchive> job::report::Reporter<S> {
 pub(crate) type Reporter = job::report::Reporter<ExtractState>;
 
 impl Reporter {
-	pub(crate) fn new(callback: impl ExtractCallback, totals: ArchiveTotals) -> MaybeArc<Self> {
+	pub(crate) fn new(callback: impl ExtractCallback, archive_bytes: u64) -> MaybeArc<Self> {
 		Self::from_parts(
 			ExtractState {
 				core: RunCore::new(ExtractPhase::WaitingForWorker),
-				totals,
+				archive_bytes,
 				counts: ItemCounts::default(),
 				bytes_read: 0,
 				active: Vec::new(),
@@ -706,18 +692,6 @@ impl Reporter {
 
 	pub(crate) fn counts(&self) -> ItemCounts {
 		self.read(|state| state.counts)
-	}
-}
-
-/// Adds `record` to `list` unless it holds [`MAX_REPORT_RECORDS`] already, then only counting
-/// it in `omitted`; whether it was kept.
-pub(crate) fn keep<T>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> bool {
-	if list.len() < MAX_REPORT_RECORDS {
-		list.push(record);
-		true
-	} else {
-		*omitted += 1;
-		false
 	}
 }
 

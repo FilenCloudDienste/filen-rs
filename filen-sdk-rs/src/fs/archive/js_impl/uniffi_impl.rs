@@ -9,22 +9,24 @@ use crate::{
 };
 
 use super::{
-	ArchiveEntry, ArchiveEntryId, ArchiveListing, CompressCall, CompressConfig, CompressDelivery,
-	CompressFormat, CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery,
-	ExtractReport, ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate,
-	ExtractedTopLevelItem, ListDelivery, ListUpdate, RemoteFileType, SourceDisposal, compress_job,
-	entries_request, extract_job, extract_request, list_job, password,
+	ArchiveEntry, ArchiveEntryId, CompressCall, CompressConfig, CompressDelivery, CompressFormat,
+	CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
+	ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate, ExtractedTopLevelItem,
+	ListDelivery, ListReport, ListUpdate, RemoteFileType, SourceDisposal, checked_password,
+	compress_job, entries_request, extract_job, extract_request, list_job,
 };
 
 /// Receives an extract's progress, in the order the extract made it, before the call
 /// returns.
 #[uniffi::export(with_foreign)]
 pub trait ExtractArchiveCallback: Send + Sync {
-	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps. A folder among them goes to the trash again when a wrong password shows only
-	/// once entries were read, before any file was extracted: an update's
+	/// Top-level items created, in batches of up to 256, each delivered right before the next
+	/// update: every one of them, also past the 1000 the report keeps. Batched, unlike copy's
+	/// `on_top_level_created`, since an archive's top level may hold as many entries as the
+	/// member limit allows. A folder among them may go to the trash again when a wrong password
+	/// shows only once entries were read, before any file was extracted: an update's
 	/// `ExtractEvent::TopLevelTrashed` tells which.
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevelItem>);
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevelItem>);
 	fn on_update(&self, update: ExtractUpdate);
 }
 
@@ -151,7 +153,9 @@ pub struct CompressItemsConfig {
 
 pub(super) fn deliver_extract(callback: &dyn ExtractArchiveCallback, delivery: ExtractDelivery) {
 	match delivery {
-		ExtractDelivery::TopLevelCreated(items) => callback.on_top_level_created(items),
+		ExtractDelivery::TopLevelBatch(items) => {
+			callback.on_top_level_batch(items.into_iter().map(Into::into).collect())
+		}
 		ExtractDelivery::Update(update) => callback.on_update(update.into()),
 	}
 }
@@ -210,7 +214,7 @@ impl JsClient {
 		callback: Arc<dyn ExtractArchiveCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<ExtractReport, Error> {
-		let password = self::password(password)?;
+		let password = checked_password(password)?;
 		let request = extract_request(archive, destination, config.root, config.dispose)?;
 		let config = ExtractSettings {
 			max_bytes: config.max_bytes,
@@ -247,7 +251,7 @@ impl JsClient {
 		callback: Arc<dyn ExtractArchiveCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<ExtractReport, Error> {
-		let password = self::password(password)?;
+		let password = checked_password(password)?;
 		let request = entries_request(
 			archive,
 			config.entries,
@@ -287,8 +291,8 @@ impl JsClient {
 		password: Option<String>,
 		callback: Arc<dyn ListArchiveCallback>,
 		managed_future: ManagedFuture,
-	) -> Result<ArchiveListing, Error> {
-		let password = self::password(password)?;
+	) -> Result<ListReport, Error> {
+		let password = checked_password(password)?;
 		let archive = RemoteFileType::try_from(archive)?;
 		let config = ExtractSettings {
 			expansion_limit: config.expansion_limit,
@@ -303,7 +307,7 @@ impl JsClient {
 				move |sender, control| list_job(client, archive, config, sender, control),
 			)
 			.await
-			.map(|(result, undelivered)| ArchiveListing::new(result, undelivered))
+			.map(|(result, undelivered)| ListReport::new(result, undelivered))
 	}
 
 	/// Compresses `items` into a new archive in `destination`, named as the config says,
@@ -336,10 +340,10 @@ impl JsClient {
 			CompressConfig {
 				format: config.format,
 				max_bytes: config.max_bytes,
-				password: self::password(password)?,
+				password: checked_password(password)?,
 			},
 			config.dispose,
-			self.inner_ref().archive_config().codec_mem_budget,
+			self.inner_ref().archives().codec_mem_budget,
 		)?;
 		let client = self.inner();
 		managed_future

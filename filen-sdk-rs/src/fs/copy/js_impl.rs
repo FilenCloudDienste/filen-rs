@@ -14,18 +14,18 @@ use filen_types::fs::Uuid;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-	Error, ErrorKind,
+	Error,
 	auth::Client,
 	fs::{
 		HasUUID,
 		categories::{DirType, Normal},
-		file::enums::RemoteFileType,
+		drive_job::js_impl::item_source,
 		name::ValidatedName,
 	},
 	job::{ItemError, SdkError, millis, sdk_error},
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyLinkedDirWithContext, AnyNormalDir,
-		AnySharedDirWithContext, DirByCategoryWithContext, NonRootNormalItemTagged,
+		AnySharedDirWithContext, NonRootNormalItemTagged,
 	},
 };
 
@@ -107,9 +107,9 @@ pub struct CopyUpdate {
 	pub active: Vec<ActiveFile>,
 	pub events: Vec<CopyEvent>,
 	pub bytes_per_second: Option<u64>,
-	/// Estimated time left, in milliseconds: `undefined` until it can be told, and while a job
-	/// an error or a cancel stopped winds down; 0 on the final update, whether the job completed,
-	/// was cancelled or failed.
+	/// Estimated time left, in milliseconds. `undefined` until it can be told, and while the job
+	/// winds down after an error or a cancel stopped it; 0 on the final update, whether the job
+	/// completed, was cancelled or failed.
 	pub eta_ms: Option<u64>,
 	/// Time spent running, paused time left out, in milliseconds.
 	pub active_time_ms: u64,
@@ -160,29 +160,9 @@ pub struct CopyReport {
 	pub error: Option<SdkError>,
 }
 
-impl TryFrom<AnyItemWithContext> for ItemSource {
-	type Error = Error;
-
-	fn try_from(item: AnyItemWithContext) -> Result<Self, Error> {
-		Ok(match item {
-			AnyItemWithContext::File(file) => Self::File(RemoteFileType::try_from(file)?),
-			AnyItemWithContext::Dir(dir) => Self::Dir(match DirByCategoryWithContext::from(dir) {
-				DirByCategoryWithContext::Normal(DirType::Dir(dir)) => {
-					ItemSourceDir::Normal(dir.into_owned())
-				}
-				DirByCategoryWithContext::Normal(DirType::Root(_)) => {
-					return Err(Error::custom(
-						ErrorKind::InvalidState,
-						"the root directory cannot be copied",
-					));
-				}
-				DirByCategoryWithContext::Shared(dir, role) => ItemSourceDir::Shared(dir, role),
-				DirByCategoryWithContext::Linked(dir, link) => {
-					ItemSourceDir::Linked(dir, link.try_into()?)
-				}
-			}),
-		})
-	}
+/// A binding's item as a copy's source.
+fn copy_source(item: AnyItemWithContext) -> Result<ItemSource, Error> {
+	item_source(item, "copied")
 }
 
 impl From<FailedSource> for AnyItemWithContext {
@@ -217,7 +197,7 @@ impl TryFrom<CopyEntry> for CopyRequest {
 
 	fn try_from(entry: CopyEntry) -> Result<Self, Error> {
 		Ok(Self {
-			source: entry.item.try_into()?,
+			source: copy_source(entry.item)?,
 			destination: DirType::from(entry.destination),
 			name: entry
 				.name
@@ -238,7 +218,7 @@ fn requests_into(
 		.into_iter()
 		.map(|item| {
 			Ok(CopyRequest {
-				source: item.try_into()?,
+				source: copy_source(item)?,
 				destination: destination.clone(),
 				name: None,
 			})
@@ -695,6 +675,7 @@ mod tests {
 
 	use super::{uniffi_impl::CopyItemsCallback, *};
 	use crate::{
+		ErrorKind,
 		auth::MetaKey,
 		connect::{
 			DirPublicLink, PasswordState,
@@ -706,7 +687,7 @@ mod tests {
 			categories::NonRootItemType,
 			copy,
 			dir::{LinkedDirectory, RootDirectory},
-			file::traits::HasFileInfo,
+			file::{enums::RemoteFileType, traits::HasFileInfo},
 		},
 		js::{
 			Root,
@@ -719,7 +700,7 @@ mod tests {
 	}
 
 	fn failure_source(item: AnyItemWithContext) -> ItemSource {
-		ItemSource::try_from(item).expect("a failed item is a copy source again")
+		copy_source(item).expect("a failed item is a copy source again")
 	}
 
 	#[test]
@@ -789,8 +770,13 @@ mod tests {
 		let root = AnyItemWithContext::Dir(AnyDirWithContext::Normal(AnyNormalDir::Root(
 			Root::from(RootDirectory::new(Uuid::from_u128(0x7))),
 		)));
-		let error = ItemSource::try_from(root).unwrap_err();
+		let error = copy_source(root).unwrap_err();
 		assert_eq!(error.kind(), ErrorKind::InvalidState);
+		assert!(
+			error
+				.to_string()
+				.contains("the root directory cannot be copied")
+		);
 	}
 
 	#[test]

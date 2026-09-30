@@ -57,7 +57,7 @@ fn zip_method(entry: &ZipEntry) -> Option<String> {
 /// What a zip entry is, before anything is read of it but its record. A symlink's target is
 /// only read for a listing, which reports it with the entry's kind; an extraction reads it when
 /// it reports the link skipped.
-fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: String) -> Found<'e> {
+fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: Option<String>) -> Found<'e> {
 	let (kind, unreadable) = match entry.kind {
 		ZipKind::Symlink => symlink(target),
 		ZipKind::Dir => (ArchiveEntryKind::Dir, None),
@@ -190,7 +190,7 @@ pub(super) fn extract_zip(
 		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 		.map_err(read_failure)?;
 	for entry in &index.overlapping {
-		let found = zip_found(entry, true, String::new());
+		let found = zip_found(entry, true, None);
 		if let Verdict::Skip(reason) = walk.judge(&found)? {
 			walk.port
 				.send(found.skipped(reason))
@@ -199,7 +199,7 @@ pub(super) fn extract_zip(
 	}
 	let mut unaccounted_bytes = around_entries(&index);
 	for entry in &index.entries {
-		let found = zip_found(entry, false, String::new());
+		let found = zip_found(entry, false, None);
 		let verdict = walk.judge(&found)?;
 		// what a partial extraction leaves out is not read at all, its local header included: a
 		// zip extracted in part reports the bytes around what it read only
@@ -220,7 +220,9 @@ pub(super) fn extract_zip(
 					zip_symlink_target(&mut source, index.shift, entry, password, entry_limits)
 						.map_err(read_failure)?;
 				walk.port
-					.send(found.skipped(ExtractSkipReason::Symlink { target }))
+					.send(found.skipped(ExtractSkipReason::Symlink {
+						target: target.unwrap_or_default(),
+					}))
 					.map_err(read_failure)?;
 				continue;
 			}
@@ -296,9 +298,9 @@ fn list_zip(
 			.ok()
 			.map(|at| std::mem::replace(&mut read[at].1, PreRead::Unread));
 		let (target, apple_double) = match read {
-			Some(PreRead::Target(target)) => (target, None),
-			Some(PreRead::AppleDouble(apple_double)) => (String::new(), Some(apple_double)),
-			Some(PreRead::Unread) | None => (String::new(), None),
+			Some(PreRead::Target(target)) => (Some(target), None),
+			Some(PreRead::AppleDouble(apple_double)) => (None, Some(apple_double)),
+			Some(PreRead::Unread) | None => (None, None),
 		};
 		walk.list(zip_found(entry, overlapping, target), apple_double)?;
 	}
@@ -458,8 +460,7 @@ fn zip_pre_read(
 			&& entry.kind == ZipKind::File
 			&& entry.encryption == ZipEncryption::None
 			&& zip_supported(entry)
-			&& zip_found(entry, false, String::new()).mac_shape()
-				== Some(MacShape::AppleDoubleName);
+			&& zip_found(entry, false, None).mac_shape() == Some(MacShape::AppleDoubleName);
 		if entry.kind != ZipKind::Symlink && !apple_double {
 			continue;
 		}
@@ -472,21 +473,26 @@ fn zip_pre_read(
 			continue;
 		}
 		let entry_read = if apple_double {
-			zip_apple_double(source, index.shift, entry, limits).map(PreRead::AppleDouble)
+			zip_apple_double(source, index.shift, entry, limits)
+				.map(|apple_double| Some(PreRead::AppleDouble(apple_double)))
 		} else {
-			zip_symlink_target(source, index.shift, entry, password, limits).map(PreRead::Target)
+			zip_symlink_target(source, index.shift, entry, password, limits)
+				// an empty target shows as one not read, so it is not held
+				.map(|target| {
+					target
+						.filter(|target| !target.is_empty())
+						.map(PreRead::Target)
+				})
 		};
-		match entry_read.map_err(read_failure)? {
-			PreRead::Target(target) if target.is_empty() => {}
-			entry_read => {
-				held += (size_of::<(u64, PreRead)>()
-					+ match &entry_read {
-						PreRead::Target(target) => target.len(),
-						_ => 0,
-					}) as u64;
-				read.push((entry.ordinal, entry_read));
-			}
-		}
+		let Some(entry_read) = entry_read.map_err(read_failure)? else {
+			continue;
+		};
+		held += (size_of::<(u64, PreRead)>()
+			+ match &entry_read {
+				PreRead::Target(target) => target.len(),
+				_ => 0,
+			}) as u64;
+		read.push((entry.ordinal, entry_read));
 	}
 	read.sort_unstable_by_key(|(ordinal, _)| *ordinal);
 	Ok(read)
@@ -519,7 +525,7 @@ fn zip_apple_double<R: Read + std::io::Seek>(
 /// states a short target in as much of the archive as it likes.
 const MAX_TARGET_COMPRESSED: u64 = 2 * MAX_ARCHIVE_PATH_BYTES as u64;
 
-/// A symlink entry's target, for reporting: its data, when small and readable; empty when not.
+/// A symlink entry's target, for reporting: its data, when small and readable; `None` when not.
 /// Fails only on an error of the archive's source, not of the entry's data.
 fn zip_symlink_target<R: Read + std::io::Seek>(
 	source: &mut R,
@@ -527,7 +533,7 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	entry: &ZipEntry,
 	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
-) -> io::Result<String> {
+) -> io::Result<Option<String>> {
 	// an encrypted target is left unread: each one would cost a key derivation, and an archive
 	// of nothing but encrypted links would spend minutes on them creating nothing
 	if entry.size > MAX_ARCHIVE_PATH_BYTES as u64
@@ -535,12 +541,12 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 		|| !zip_supported(entry)
 		|| entry.encryption != ZipEncryption::None
 	{
-		return Ok(String::new());
+		return Ok(None);
 	}
 	let data = match open_entry(source, shift, entry, password, limits) {
 		Ok(reader) => Ok(reader),
 		Err(ZipError::Read(error)) => Err(error),
-		Err(_) => return Ok(String::new()),
+		Err(_) => return Ok(None),
 	};
 	link_target(data)
 }

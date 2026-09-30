@@ -49,7 +49,7 @@ pub enum ArchiveEntryKind {
 	},
 	/// A tar hard link: a second name for the earlier file at `target`, as stored and cut to at
 	/// most 4096 bytes. Extracted as a copy of that file, when it was extracted: a partial
-	/// extraction ([`ExtractRequest::Entries`](super::ExtractRequest::Entries)) has to take the
+	/// extraction ([`ExtractWhat::Entries`](super::ExtractWhat::Entries)) has to take the
 	/// entry `target_id` too, and when that is a hard link as well, its own target in turn.
 	/// `target_id` is `None` when the link names no file the archive stores before it, and is
 	/// skipped.
@@ -69,21 +69,17 @@ pub enum ArchiveEntryKind {
 /// An entry of an archive, and what extracting it would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
-// Independent facts a listing reports about one entry, each a field of the bindings' record:
-// they are not one state, so no enum stands in for them.
-#[allow(clippy::struct_excessive_bools)]
 pub struct ArchiveEntry {
-	/// What extracting some entries (`ExtractRequest::Entries`, `extractArchiveEntries`) takes
+	/// What extracting some entries (`ExtractWhat::Entries`, `extractArchiveEntries`) takes
 	/// to extract it.
 	pub id: ArchiveEntryId,
 	/// Its path as the archive stores it, cut to at most 4096 bytes.
 	pub stored_path: String,
 	/// Whether `stored_path` was cut.
 	pub stored_path_truncated: bool,
-	/// Where extracting it puts it below the extraction's root, as drive names: before the
-	/// keep-both names a collision (with another entry, or an item in the destination) calls
-	/// for. `None` when its path cannot be extracted (see `skip`).
-	pub path: Option<String>,
+	/// Where extracting it puts it; `None` when its path cannot be extracted (see `skip`).
+	pub path: Option<ListedPath>,
+	/// What kind of item it is.
 	pub kind: ArchiveEntryKind,
 	/// The size of the file it extracts to: as the archive states it, for a hard link its
 	/// target's, and for a single compressed file what it decodes to, in bytes. `None` for a
@@ -109,11 +105,6 @@ pub struct ArchiveEntry {
 	/// AppleDouble file told by its name alone). A link's target is in `kind`, and left empty
 	/// here.
 	pub skip: Option<ExtractSkipReason>,
-	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
-	/// `PathRewritten`).
-	pub path_rewritten: bool,
-	/// Its path reads as something it is not (an extraction reports it as a misleading name).
-	pub misleading_name: bool,
 	/// macOS metadata: a `__MACOSX` folder, an AppleDouble file (named `._name`, or any file in
 	/// a `__MACOSX` folder), or a tar's hard link to one. A file is told by its first bytes,
 	/// which a listing leaving metadata out reads as an extraction does: a tar's always, a
@@ -124,6 +115,20 @@ pub struct ArchiveEntry {
 	/// does, once every entry was listed: skipped when everything in it is left out, not when it
 	/// holds anything of the user's, or nothing. See the extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
+}
+
+/// Where extracting an archive entry puts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
+pub struct ListedPath {
+	/// Its path below the extraction's root, as drive names: before the keep-both names a
+	/// collision (with another entry, or an item in the destination) calls for.
+	pub path: String,
+	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
+	/// `PathRewritten`).
+	pub rewritten: bool,
+	/// It reads as something it is not (an extraction reports it as a misleading name).
+	pub misleading: bool,
 }
 
 /// What a listing found out about the archive's password.
@@ -193,7 +198,7 @@ pub struct ListConfig {
 	/// are listed skipped.
 	pub skip_mac_metadata: bool,
 	/// As [`ExtractConfig::password`]: checked on the index or an entry when it can be (see
-	/// [`ArchiveListing::password`]).
+	/// [`ListReport::password`]).
 	pub password: Option<ArchivePassword>,
 }
 
@@ -213,23 +218,23 @@ impl Default for ListConfig {
 	}
 }
 
-impl From<ListConfig> for ExtractConfig {
-	/// An extraction with the listing's settings, and neither cap.
-	fn from(config: ListConfig) -> Self {
-		Self {
+impl ListConfig {
+	/// The extraction whose verdicts the listing shows: its settings, and neither cap.
+	pub(crate) fn into_extraction(self) -> ExtractConfig {
+		ExtractConfig {
 			max_bytes: None,
 			max_items: None,
-			expansion_limit: config.expansion_limit,
-			skip_mac_metadata: config.skip_mac_metadata,
-			password: config.password,
+			expansion_limit: self.expansion_limit,
+			skip_mac_metadata: self.skip_mac_metadata,
+			password: self.password,
 		}
 	}
 }
 
-/// Most entries an [`ArchiveListing`] keeps; the callback receives every one.
+/// Most entries an [`ListReport`] keeps; the callback receives every one.
 pub const MAX_LISTED_ENTRIES: usize = 10_000;
 
-/// Most bytes of text (paths, targets, methods) the entries an [`ArchiveListing`] keeps may hold
+/// Most bytes of text (paths, targets, methods) the entries an [`ListReport`] keeps may hold
 /// in all, as one entry can hold 8 KiB of paths: once they would pass it, the rest are only
 /// counted.
 pub const MAX_LISTED_BYTES: usize = 16 << 20;
@@ -243,8 +248,9 @@ pub const MAX_LISTED_BYTES: usize = 16 << 20;
 /// receives in batches as they are read, so an app keeps what it shows without the SDK building
 /// every entry up front.
 #[derive(Debug, Clone)]
-pub struct ArchiveListing {
-	/// `None` when the listing ended before it could tell.
+pub struct ListReport {
+	/// What the archive is. Always set on a listing that completed; `None` only when one that
+	/// ended early ended before it could tell.
 	pub format: Option<ArchiveFormat>,
 	/// What the listing found out about the password.
 	pub password: PasswordCheck,
@@ -261,13 +267,13 @@ pub struct ArchiveListing {
 	pub duplicates: Option<DuplicateEntries>,
 }
 
-impl JobReport for ArchiveListing {
+impl JobReport for ListReport {
 	const NAME: &'static str = "listing";
 }
 
 /// A listing that ended early: cancelled, or stopped by an error (a damaged archive, a wrong
 /// password for a 7z whose index is encrypted); it holds the entries read until then.
-pub type ListFailed = JobFailed<ArchiveListing>;
+pub type ListFailed = JobFailed<ListReport>;
 
 /// Where a listing is. The last three are where it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,7 +436,7 @@ impl ListReporter {
 
 /// Adds `entry` to `listing`: kept while it holds fewer than [`MAX_LISTED_ENTRIES`] whose text,
 /// `kept_bytes` so far, fits [`MAX_LISTED_BYTES`]; counted either way.
-fn add_entry(listing: &mut ArchiveListing, kept_bytes: &mut usize, entry: &ArchiveEntry) {
+fn add_entry(listing: &mut ListReport, kept_bytes: &mut usize, entry: &ArchiveEntry) {
 	listing.totals.count(entry);
 	let bytes = entry.text_bytes();
 	if listing.omitted_entries == 0
@@ -454,7 +460,7 @@ impl ArchiveEntry {
 			_ => 0,
 		};
 		self.stored_path.len()
-			+ self.path.as_ref().map_or(0, String::len)
+			+ self.path.as_ref().map_or(0, |path| path.path.len())
 			+ self.method.as_ref().map_or(0, String::len)
 			+ target
 	}
@@ -473,9 +479,7 @@ pub(crate) struct ListTask<B> {
 
 /// Runs a listing: waits for a job slot, starts the codec, and serves it the archive, collecting
 /// the entries it lists.
-pub(crate) async fn run_list<B: DriveBackend>(
-	task: ListTask<B>,
-) -> Result<ArchiveListing, ListFailed> {
+pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListReport, ListFailed> {
 	let ListTask {
 		backend,
 		control,
@@ -484,7 +488,7 @@ pub(crate) async fn run_list<B: DriveBackend>(
 		config,
 		start,
 	} = task;
-	let mut listing = ArchiveListing {
+	let mut listing = ListReport {
 		format: None,
 		password: PasswordCheck::NotNeeded,
 		entries: Vec::new(),
@@ -501,7 +505,7 @@ pub(crate) async fn run_list<B: DriveBackend>(
 			control: &control,
 			reporter: &reporter,
 			reading: ListPhase::Reading,
-			name: ArchiveListing::NAME,
+			name: ListReport::NAME,
 		},
 		start,
 	)
@@ -538,7 +542,7 @@ pub(crate) async fn run_list<B: DriveBackend>(
 		listing.unaccounted_bytes = end.unaccounted_bytes;
 		listing.duplicates = end.duplicates;
 	}
-	let (phase, result) = fatal.end(outcome, &control, ArchiveListing::NAME);
+	let (phase, result) = fatal.end(outcome, &control, ListReport::NAME);
 	reporter.finish(phase);
 	match result {
 		Ok(()) => Ok(listing),
@@ -564,7 +568,7 @@ struct Lister<B> {
 
 impl<B: DriveBackend> Lister<B> {
 	/// Serves the codec until it has returned; `Err` when stopped.
-	async fn run(&mut self, listing: &mut ArchiveListing) -> Result<(), Stopped> {
+	async fn run(&mut self, listing: &mut ListReport) -> Result<(), Stopped> {
 		loop {
 			let pause_requested = self.control.is_pause_requested();
 			self.reporter.set_pause_requested(pause_requested);
@@ -610,7 +614,7 @@ impl<B: DriveBackend> Lister<B> {
 		}
 	}
 
-	fn on_event(&mut self, event: WorkerEvent, listing: &mut ArchiveListing) {
+	fn on_event(&mut self, event: WorkerEvent, listing: &mut ListReport) {
 		match event {
 			WorkerEvent::Opened(format) => listing.format = Some(format),
 			WorkerEvent::Listed(entry) => {
@@ -655,6 +659,22 @@ impl<B: DriveBackend> Lister<B> {
 		if self.feed.give_up_if_stalled(pause_requested) {
 			self.fatal
 				.stop(Arc::new(worker_died()), &self.control, &*self.reporter);
+		}
+	}
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use super::ListedPath;
+
+	impl ListedPath {
+		/// `path`, neither rewritten nor misleading.
+		pub(crate) fn plain(path: impl Into<String>) -> Self {
+			Self {
+				path: path.into(),
+				rewritten: false,
+				misleading: false,
+			}
 		}
 	}
 }

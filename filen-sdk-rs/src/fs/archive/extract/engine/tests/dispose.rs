@@ -381,10 +381,7 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 	// cancelled while it waits for a slot
 	let config = one_slot();
 	// another job holds the slot
-	let other = Reporter::new(
-		Recorder::default(),
-		ArchiveTotals::Streaming { archive_bytes: 0 },
-	);
+	let other = Reporter::new(Recorder::default(), 0);
 	let _running = config.admit(&JobControl::default(), &other.ops()).await;
 	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	let (_pause, cancel, control) = controls();

@@ -486,7 +486,7 @@ mod tests {
 		fs::{
 			archive::{
 				extract::{
-					ArchiveTotals, ExtractCallback, ExtractUpdate, ExtractedTopLevel,
+					ExtractCallback, ExtractUpdate, ExtractedTopLevel,
 					report::Reporter as ExtractReporter,
 				},
 				test_support::{pattern, remote_file},
@@ -498,7 +498,7 @@ mod tests {
 	struct Ignore;
 
 	impl ExtractCallback for Ignore {
-		fn on_top_level_created(&self, _: Vec<ExtractedTopLevel>) {}
+		fn on_top_level_batch(&self, _: Vec<ExtractedTopLevel>) {}
 		fn on_update(&self, _: ExtractUpdate) {}
 	}
 
@@ -533,7 +533,7 @@ mod tests {
 		let mut backend = FakeBackend::new(Uuid::from_u128(3)).with_memory(8);
 		backend.contents.insert(archive.uuid(), bytes);
 		let mut input = ArchiveInput::new(Arc::new(backend), Arc::new(archive));
-		let reporter = ExtractReporter::new(Ignore, ArchiveTotals::Streaming { archive_bytes: 0 });
+		let reporter = ExtractReporter::new(Ignore, 0);
 		let ops = reporter.ops();
 		// a zip's head, then its index at the end: nothing fetched ahead of either
 		assert_eq!(read(&mut input, &ops, 0).await, 1);

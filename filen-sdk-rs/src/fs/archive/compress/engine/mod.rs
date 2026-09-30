@@ -39,7 +39,7 @@ use crate::{
 			},
 			hash::HeadLastHasher,
 			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
-			limits::MAX_REPORT_RECORDS,
+			limits::keep,
 			worker::{
 				CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, unexpected_event,
 				worker_died,
@@ -259,8 +259,10 @@ struct Driver<B: DriveBackend> {
 	codec_done: bool,
 	max_bytes: Option<u64>,
 	stall: StallWatch,
-	/// The source files that did not match the hash in their metadata, for the report.
+	/// The source files that did not match the hash in their metadata, for the report, and
+	/// how many more there were past what it lists.
 	hash_mismatches: Vec<HashMismatch>,
+	omitted_hash_mismatches: u64,
 	fatal: Fatal,
 }
 
@@ -370,6 +372,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		max_bytes,
 		stall: StallWatch::default(),
 		hash_mismatches: Vec::new(),
+		omitted_hash_mismatches: 0,
 		fatal: Fatal::default(),
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -390,9 +393,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		fatal,
 		control,
 		hash_mismatches,
+		omitted_hash_mismatches,
 		..
 	} = driver;
 	report.hash_mismatches = hash_mismatches;
+	report.omitted_hash_mismatches = omitted_hash_mismatches;
 	match fatal.end(outcome, &control, CompressReport::NAME) {
 		(_, Ok((archive, dispositions))) => {
 			report.dispositions = dispositions;
@@ -611,9 +616,11 @@ impl<B: DisposalBackend> Driver<B> {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
 			};
-			if self.hash_mismatches.len() < MAX_REPORT_RECORDS {
-				self.hash_mismatches.push(mismatch.clone());
-			}
+			keep(
+				&mut self.hash_mismatches,
+				&mut self.omitted_hash_mismatches,
+				mismatch.clone(),
+			);
 			self.reporter
 				.event(CompressEvent::SourceHashMismatch(mismatch));
 		}

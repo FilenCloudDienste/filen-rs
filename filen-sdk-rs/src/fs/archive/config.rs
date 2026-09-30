@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-	auth::Client,
+	auth::http::ClientConfig,
 	consts::{CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA_USIZE},
 	job::{JobControl, Stopped, report::Ops},
 };
@@ -58,9 +58,8 @@ pub(crate) use defaults::{CODEC_MEM_BUDGET, JOB_CONCURRENCY};
 /// The smallest codec budget: enough for every decoder at its default settings.
 const MIN_CODEC_MEM_BUDGET: u64 = 16 << 20;
 
-/// The archive settings a client runs its jobs under, built from its
-/// [`ClientConfig`](crate::auth::http::ClientConfig). Never fails: out-of-range settings are
-/// clamped.
+/// The archive settings a client runs its jobs under, built from its [`ClientConfig`]. Never
+/// fails: out-of-range settings are clamped.
 ///
 /// On wasm there is one codec worker per page, so one job runs at a time per page whatever the
 /// client (a web worker builds a client per public link): the lease is process-wide there.
@@ -81,20 +80,15 @@ pub struct ArchiveConfig {
 	/// folders in `__MACOSX` folders when macOS metadata is left out. Extracting or
 	/// listing a tar keeps up to 96 bytes per member for the hard links after it: a file they
 	/// may name, or anything else at a path, which keeps them from naming an earlier file there
-	/// (96 MB for a million members), outside the codec's memory.
-	pub max_members: u64,
-	/// Most bytes of an archive's index (a zip's central directory) read into memory.
-	pub max_index_bytes: u64,
+	/// (96 MB for a million members), outside the codec's memory. Fixed per target, not a
+	/// setting.
+	pub(crate) max_members: u64,
+	/// Most bytes of an archive's index (a zip's central directory, a 7z's header) read into
+	/// memory. Fixed per target, not a setting.
+	pub(crate) max_index_bytes: u64,
 	gate: Arc<Semaphore>,
 	/// [`FLOOR_CHUNKS`] chunks per concurrent job.
 	floor: Arc<Semaphore>,
-}
-
-impl Client {
-	/// The archive settings in effect (after clamping): codec memory, jobs at once, limits.
-	pub fn archive_config(&self) -> &ArchiveConfig {
-		self.client().state().archives()
-	}
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -102,20 +96,22 @@ static PAGE_GATE: std::sync::LazyLock<Arc<Semaphore>> =
 	std::sync::LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 impl ArchiveConfig {
-	pub(crate) fn new(codec_mem_budget: u64, job_concurrency: usize) -> Self {
+	/// Every construction path (default, builder, `From<JsClientConfig>`) ends in this one
+	/// constructor, so the clamps live here.
+	pub(crate) fn new(config: &ClientConfig) -> Self {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-		let (job_concurrency, gate) = {
-			let _ = job_concurrency;
-			(1, Arc::clone(&PAGE_GATE))
-		};
+		let (job_concurrency, gate) = (1, Arc::clone(&PAGE_GATE));
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		let (job_concurrency, gate) = {
-			// a zero-permit gate parks every job forever; tokio panics above MAX_PERMITS
-			let concurrency = job_concurrency.clamp(1, 64);
+			// a zero-permit gate parks every job forever, and tokio's Semaphore panics above
+			// MAX_PERMITS
+			let concurrency = config
+				.archive_job_concurrency
+				.clamp(1, Semaphore::MAX_PERMITS);
 			(concurrency, Arc::new(Semaphore::new(concurrency)))
 		};
 		Self {
-			codec_mem_budget: codec_mem_budget.max(MIN_CODEC_MEM_BUDGET),
+			codec_mem_budget: config.archive_codec_mem_budget.max(MIN_CODEC_MEM_BUDGET),
 			job_concurrency,
 			max_members: defaults::MAX_MEMBERS,
 			max_index_bytes: defaults::MAX_INDEX_BYTES,
@@ -194,17 +190,23 @@ mod tests {
 
 	#[test]
 	fn settings_are_clamped_rather_than_refused() {
-		let config = ArchiveConfig::new(0, 0);
+		let config = ArchiveConfig::new(
+			&ClientConfig::default()
+				.with_archive_codec_mem_budget(0)
+				.with_archive_job_concurrency(0),
+		);
 		assert_eq!(config.codec_mem_budget, MIN_CODEC_MEM_BUDGET);
 		assert_eq!(config.job_concurrency, 1);
 		assert_eq!(config.floor.available_permits(), FLOOR_CHUNKS * CHUNK_BYTES);
-		let config = ArchiveConfig::new(1 << 30, 1000);
-		assert_eq!(config.job_concurrency, 64);
+		let config =
+			ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(usize::MAX));
+		assert_eq!(config.job_concurrency, Semaphore::MAX_PERMITS);
+		assert_eq!(config.free_slots(), Semaphore::MAX_PERMITS);
 	}
 
 	#[tokio::test]
 	async fn every_leased_job_gets_its_floor() {
-		let config = ArchiveConfig::new(CODEC_MEM_BUDGET, 2);
+		let config = ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(2));
 		let (_a, _b) = (config.lease().await, config.lease().await);
 		let (_fa, _fb) = (config.floor().await, config.floor().await);
 		assert_eq!(config.floor.available_permits(), 0);

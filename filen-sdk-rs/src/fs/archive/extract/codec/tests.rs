@@ -20,7 +20,10 @@ use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::archive::{
 		decode::CodecError,
-		extract::{ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, PasswordCheck},
+		extract::{
+			ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, ListedPath,
+			PasswordCheck,
+		},
 		format::StreamCodec,
 		password::ArchivePassword,
 		sevenz::{
@@ -1522,15 +1525,13 @@ fn listed_entry(
 		},
 		stored_path: stored.to_owned(),
 		stored_path_truncated: false,
-		path: path.map(str::to_owned),
+		path: path.map(ListedPath::plain),
 		kind,
 		size,
 		modified: None,
 		encrypted: false,
 		method: None,
 		skip,
-		path_rewritten: false,
-		misleading_name: false,
 		mac_metadata: false,
 	}
 }
@@ -1846,7 +1847,7 @@ fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 			.iter()
 			.map(|entry| {
 				(
-					entry.path.as_deref(),
+					entry.path.as_ref().map(|path| path.path.as_str()),
 					entry.encrypted,
 					entry.method.as_deref(),
 					entry.mac_metadata,
@@ -1902,7 +1903,11 @@ fn a_7z_is_listed_from_its_index() {
 	assert_eq!(
 		listed_entries
 			.iter()
-			.map(|entry| (entry.path.as_deref(), entry.encrypted, entry.size))
+			.map(|entry| (
+				entry.path.as_ref().map(|path| path.path.as_str()),
+				entry.encrypted,
+				entry.size
+			))
 			.collect::<Vec<_>>(),
 		// in the index's order, which the SDK's writer gives files first
 		[
@@ -2315,7 +2320,7 @@ fn a_listing_tells_the_mac_folders_an_extraction_creates() {
 		let mut listed_created: Vec<String> = listed
 			.iter()
 			.filter(|entry| entry.kind == ArchiveEntryKind::Dir && entry.skip.is_none())
-			.filter_map(|entry| entry.path.clone())
+			.filter_map(|entry| entry.path.clone().map(|path| path.path))
 			.collect();
 		let mut created = created;
 		created.sort();

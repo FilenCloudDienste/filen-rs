@@ -192,34 +192,24 @@ impl CheckedArchive {
 	}
 }
 
-impl StreamCodec {
-	/// The file-name extension of a file compressed with the codec, dot included.
-	pub fn extension(self) -> &'static str {
-		match self {
-			Self::Gzip => ".gz",
-			Self::Bzip2 => ".bz2",
-			Self::Xz => ".xz",
-			Self::Lzma => ".lzma",
-			Self::Lzip => ".lz",
-			Self::Lz4 => ".lz4",
-			Self::Brotli => ".br",
-			Self::Zstd => ".zst",
-		}
-	}
-}
-
 impl CompressFormat {
 	/// The file-name extension an archive in this format carries, dot included: `.tar`,
 	/// `.tar.gz`, `.gz`, ...
-	pub fn extension(self) -> String {
+	pub fn extension(self) -> &'static str {
+		self.named_as().extension()
+	}
+
+	/// What an archive in this format is, as its name tells.
+	fn named_as(self) -> ArchiveFormat {
 		match self {
-			Self::Tar { compression: None } => ".tar".to_owned(),
-			Self::Tar {
-				compression: Some(compression),
-			} => format!(".tar{}", compression.codec.extension()),
-			Self::Single { compression } => compression.codec.extension().to_owned(),
-			Self::Zip { .. } => ".zip".to_owned(),
-			Self::SevenZ { .. } => ".7z".to_owned(),
+			Self::Tar { compression } => ArchiveFormat::Tar {
+				codec: compression.map(|compression| compression.codec),
+			},
+			Self::Single { compression } => ArchiveFormat::Single {
+				codec: compression.codec,
+			},
+			Self::Zip { .. } => ArchiveFormat::Zip,
+			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
 		}
 	}
 
@@ -439,18 +429,8 @@ impl CompressFormat {
 	/// The length of the extension `name` ends in, which has to be one this format goes by
 	/// (`.tgz` is a `.tar.gz`): readers tell brotli and LZMA streams by their extension alone.
 	pub(crate) fn check_name(self, name: &str) -> Result<usize, Error> {
-		let expected = match self {
-			Self::Tar { compression } => ArchiveFormat::Tar {
-				codec: compression.map(|compression| compression.codec),
-			},
-			Self::Single { compression } => ArchiveFormat::Single {
-				codec: compression.codec,
-			},
-			Self::Zip { .. } => ArchiveFormat::Zip,
-			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
-		};
 		match match_extension(name) {
-			Some((extension, format)) if format == expected => Ok(extension.len()),
+			Some((extension, format)) if format == self.named_as() => Ok(extension.len()),
 			_ => Err(Error::custom(
 				ErrorKind::InvalidName,
 				format!("an archive in this format is named *{}", self.extension()),

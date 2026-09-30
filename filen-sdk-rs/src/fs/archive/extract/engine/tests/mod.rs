@@ -21,22 +21,9 @@ use tokio::{sync::watch, task::JoinHandle};
 
 use super::*;
 use crate::{
+	auth::http::ClientConfig,
 	consts::CHUNK_SIZE,
 	fs::{
-		archive::{
-			config::CODEC_MEM_BUDGET,
-			entry_path::entry_path,
-			extract::{
-				ArchiveEntryKind, ArchiveTotals, ExpansionLimit, ExtractCallback, ExtractEvent,
-				ExtractSkipReason, ExtractStage, ExtractUpdate, PasswordCheck,
-				codec::{Selection, extract_stream},
-				test_support::{
-					ARCHIVE_PARENT, MAX_MEMBERS, Options, Setup, archive_file_with, list, setup,
-					setup_in, stream_job, test_config,
-				},
-			},
-			worker,
-		},
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
 			extract::ExtractFailure,
@@ -50,6 +37,19 @@ use crate::{
 				TarMember, gzip, hash, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
 			},
 			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
+		},
+		archive::{
+			entry_path::entry_path,
+			extract::{
+				ArchiveEntryKind, ExpansionLimit, ExtractCallback, ExtractEvent, ExtractSkipReason,
+				ExtractStage, ExtractUpdate, PasswordCheck,
+				codec::{Selection, extract_stream},
+				test_support::{
+					ARCHIVE_PARENT, MAX_MEMBERS, Options, Setup, archive_file_with, list, setup,
+					setup_in, stream_job, test_config,
+				},
+			},
+			worker,
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -80,7 +80,7 @@ type Probe = Box<dyn Fn() -> HeldWhilePaused + Send + Sync>;
 #[derive(Default)]
 struct Recorder {
 	top_level: Mutex<Vec<ExtractedTopLevel>>,
-	/// The size of each `on_top_level_created` batch.
+	/// The size of each `on_top_level_batch` batch.
 	batches: Mutex<Vec<usize>>,
 	updates: Mutex<Vec<ExtractUpdate>>,
 	probe: Option<Probe>,
@@ -89,7 +89,7 @@ struct Recorder {
 }
 
 impl ExtractCallback for Recorder {
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>) {
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevel>) {
 		self.batches.lock().unwrap().push(items.len());
 		self.top_level.lock().unwrap().extend(items);
 	}
@@ -143,12 +143,7 @@ fn start_with(setup: &Setup, options: Options, start: CodecStart<CodecResult>) -
 		probe: Some(probe),
 		..Recorder::default()
 	});
-	let reporter = Reporter::new(
-		Arc::clone(&recorder),
-		ArchiveTotals::Streaming {
-			archive_bytes: setup.archive.size(),
-		},
-	);
+	let reporter = Reporter::new(Arc::clone(&recorder), setup.archive.size());
 	let running = tokio::spawn(run_extract(ExtractTask {
 		backend: Arc::clone(&setup.backend),
 		control: options.control,
@@ -602,7 +597,7 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 
 /// Settings with one job slot, for jobs that compete for it.
 fn one_slot() -> ArchiveConfig {
-	let mut config = ArchiveConfig::new(CODEC_MEM_BUDGET, 1);
+	let mut config = ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(1));
 	config.max_members = MAX_MEMBERS;
 	config
 }

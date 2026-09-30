@@ -27,7 +27,7 @@ use crate::{
 
 use super::super::{
 	ExtractSkipReason,
-	list::{ArchiveEntry, ArchiveEntryKind},
+	list::{ArchiveEntry, ArchiveEntryKind, ListedPath},
 	report::ArchiveEntryId,
 };
 
@@ -202,8 +202,10 @@ pub(super) fn found_path(stored: &str, rewritten: bool) -> Result<ArchivePath, P
 	})
 }
 
-/// What a symlink to `target`, as shown, is listed as, and why an extraction skips it.
-pub(super) fn symlink(target: String) -> (ArchiveEntryKind, Option<ExtractSkipReason>) {
+/// What a symlink to `target`, as shown, is listed as, and why an extraction skips it. A target
+/// not read (`None`) is shown empty.
+pub(super) fn symlink(target: Option<String>) -> (ArchiveEntryKind, Option<ExtractSkipReason>) {
+	let target = target.unwrap_or_default();
 	(
 		ArchiveEntryKind::Symlink {
 			target: target.clone(),
@@ -572,14 +574,16 @@ impl<'p> Walk<'p> {
 			id: self.listed_id(found.ordinal),
 			stored_path: stored_path.to_owned(),
 			stored_path_truncated,
-			path: path.map(ArchivePath::joined),
+			path: path.map(|path| ListedPath {
+				path: path.joined(),
+				rewritten: path.rewritten,
+				misleading: path.suspicious,
+			}),
 			size: (found.kind != ArchiveEntryKind::Dir).then_some(found.size),
 			modified: found.modified,
 			encrypted: found.encrypted,
 			method: found.method,
 			skip,
-			path_rewritten: path.is_some_and(|path| path.rewritten),
-			misleading_name: path.is_some_and(|path| path.suspicious),
 			mac_metadata,
 			kind: found.kind,
 		};

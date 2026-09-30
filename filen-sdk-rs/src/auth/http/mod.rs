@@ -101,10 +101,10 @@ pub struct ClientConfig {
 	thumbnail_decode_concurrency: usize,
 	#[cfg(feature = "archive")]
 	/// See [`ClientConfig::with_archive_codec_mem_budget`].
-	archive_codec_mem_budget: u64,
+	pub(crate) archive_codec_mem_budget: u64,
 	#[cfg(feature = "archive")]
 	/// See [`ClientConfig::with_archive_job_concurrency`].
-	archive_job_concurrency: usize,
+	pub(crate) archive_job_concurrency: usize,
 }
 
 impl ClientConfig {
@@ -123,8 +123,8 @@ impl ClientConfig {
 	}
 
 	#[cfg(feature = "archive")]
-	/// How many archive jobs (extracting, compressing) run at once; later ones wait. Ignored on
-	/// wasm, where one runs at a time per page.
+	/// How many archive jobs (extracting, compressing) run at once, at least 1; later ones
+	/// wait. Ignored on wasm, where one runs at a time per page.
 	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
 		self.archive_job_concurrency = archive_job_concurrency;
 		self
@@ -555,10 +555,7 @@ impl SharedClientState {
 		// Built before `config.log_level` is moved out below.
 		let thumbnails = ThumbnailConfig::new(&config);
 		#[cfg(feature = "archive")]
-		let archives = crate::fs::archive::ArchiveConfig::new(
-			config.archive_codec_mem_budget,
-			config.archive_job_concurrency,
-		);
+		let archives = crate::fs::archive::ArchiveConfig::new(&config);
 
 		// Apply this client's level to the (host- or SDK-installed) global tracing filter only if
 		// one was explicitly set. A default-config client leaves this `None` so routine client

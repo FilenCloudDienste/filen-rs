@@ -431,8 +431,8 @@ impl<S: JobState> Reporter<S> {
 		self.stop(true);
 	}
 
-	/// The job winds down, and stops overriding a pause: reported cancelling when `control`
-	/// cancelled it, and running on to its end when an error did.
+	/// The job winds down, which a pause no longer holds up: reported cancelling when `control`
+	/// cancelled it, and running on to its end when an error stopped it.
 	pub(crate) fn wind_down(&self, control: &JobControl) {
 		self.stop(control.is_cancelled());
 	}

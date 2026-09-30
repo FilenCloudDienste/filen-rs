@@ -7,10 +7,11 @@ use filen_types::{crypto::Blake3Hash, fs::Uuid};
 use tokio::task::JoinHandle;
 
 use crate::{
+	auth::http::ClientConfig,
 	fs::{
 		HasName, HasUUID,
 		archive::{
-			config::{ArchiveConfig, CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			config::{ArchiveConfig, CODEC_MEM_BUDGET},
 			password::ArchivePassword,
 			test_support::remote_file,
 			worker,
@@ -23,8 +24,7 @@ use crate::{
 };
 
 use super::{
-	ArchiveEntry, ArchiveListing, ExpansionLimit, ExtractRoot, ListCallback, ListFailed,
-	ListUpdate,
+	ArchiveEntry, ExpansionLimit, ExtractRoot, ListCallback, ListFailed, ListReport, ListUpdate,
 	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
 	engine::ArchiveDisposal,
 	list::{ListReporter, ListTask, run_list},
@@ -81,7 +81,7 @@ pub(super) const MAX_MEMBERS: u64 = 2000;
 
 /// The archive settings of a test job, with [`MAX_MEMBERS`].
 pub(super) fn test_config() -> ArchiveConfig {
-	let mut config = ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY);
+	let mut config = ArchiveConfig::new(&ClientConfig::default());
 	config.max_members = MAX_MEMBERS;
 	config
 }
@@ -111,7 +111,7 @@ impl Default for Options {
 			password: None,
 			config: test_config(),
 			selection: None,
-			expansion: Some(ExpansionLimit::DEFAULT),
+			expansion: Some(ExpansionLimit::default()),
 		}
 	}
 }
@@ -154,7 +154,7 @@ impl ListCallback for ListRecorder {
 }
 
 pub(super) struct Listing {
-	pub(super) running: JoinHandle<Result<ArchiveListing, ListFailed>>,
+	pub(super) running: JoinHandle<Result<ListReport, ListFailed>>,
 	pub(super) recorder: Arc<ListRecorder>,
 	pub(super) reporter: MaybeArc<ListReporter>,
 }

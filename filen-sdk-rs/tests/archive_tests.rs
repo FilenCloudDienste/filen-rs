@@ -15,13 +15,14 @@ use filen_sdk_rs::{
 	fs::{
 		HasName, HasUUID,
 		archive::{
-			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchiveListing,
-			ArchivePassword, ArchiveSource, CompressCallback, CompressConfig, CompressFormat,
-			CompressReport, CompressRequest, CompressSources, CompressUpdate, Compression,
-			DisposalOutcome, ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport,
-			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractedTopLevel,
-			KeptReason, ListCallback, ListConfig, ListTotals, ListUpdate, PasswordCheck,
-			SevenZEncryption, SevenZMethod, SourceDisposal, StreamCodec, ZipMethod,
+			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchivePassword,
+			ArchiveSource, CompressCallback, CompressConfig, CompressFormat, CompressReport,
+			CompressRequest, CompressSources, CompressUpdate, Compression, DisposalOutcome,
+			EntrySelection, ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport,
+			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractWhat,
+			ExtractedTopLevel, KeptReason, ListCallback, ListConfig, ListReport, ListTotals,
+			ListUpdate, PasswordCheck, SevenZEncryption, SevenZMethod, SourceDisposal, StreamCodec,
+			ZipMethod,
 		},
 		categories::{DirType, NonRootItemType},
 		copy::{ItemSource, ItemSourceDir, JobControl},
@@ -58,7 +59,7 @@ struct ExtractRecorder {
 }
 
 impl ExtractCallback for ExtractRecorder {
-	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>) {
+	fn on_top_level_batch(&self, items: Vec<ExtractedTopLevel>) {
 		self.top_level.lock().unwrap().extend(items);
 	}
 
@@ -136,8 +137,8 @@ async fn extract_into(
 ) -> Result<ExtractReport, ErrorKind> {
 	run_extract(
 		client,
-		ExtractRequest::All {
-			archive,
+		ExtractRequest {
+			what: ExtractWhat::All(archive),
 			destination: destination.clone().into(),
 			root,
 		},
@@ -189,7 +190,7 @@ async fn list(
 	client: &Arc<Client>,
 	archive: RemoteFileType<'static>,
 	config: ExtractConfig,
-) -> Result<ArchiveListing, ErrorKind> {
+) -> Result<ListReport, ErrorKind> {
 	let config = ListConfig {
 		expansion_limit: config.expansion_limit,
 		skip_mac_metadata: config.skip_mac_metadata,
@@ -211,32 +212,41 @@ async fn list(
 }
 
 /// Each listed entry's extracted path and kind, sorted by path.
-fn outline(listing: &ArchiveListing) -> Vec<(&str, &ArchiveEntryKind)> {
+fn outline(listing: &ListReport) -> Vec<(&str, &ArchiveEntryKind)> {
 	let mut outline: Vec<_> = listing
 		.entries
 		.iter()
-		.map(|entry| (entry.path.as_deref().unwrap_or_default(), &entry.kind))
+		.map(|entry| {
+			(
+				entry
+					.path
+					.as_ref()
+					.map(|path| path.path.as_str())
+					.unwrap_or_default(),
+				&entry.kind,
+			)
+		})
 		.collect();
 	outline.sort_unstable_by_key(|(path, _)| *path);
 	outline
 }
 
 /// The listed entry at `path`.
-fn entry<'l>(listing: &'l ArchiveListing, path: &str) -> &'l ArchiveEntry {
+fn entry<'l>(listing: &'l ListReport, path: &str) -> &'l ArchiveEntry {
 	listing
 		.entries
 		.iter()
-		.find(|entry| entry.path.as_deref() == Some(path))
+		.find(|entry| entry.path.as_ref().map(|path| path.path.as_str()) == Some(path))
 		.unwrap_or_else(|| panic!("{path} is listed"))
 }
 
 /// The paths of the files an extraction with the listing's config creates, sorted.
-fn listed_files(listing: &ArchiveListing) -> Vec<&str> {
+fn listed_files(listing: &ListReport) -> Vec<&str> {
 	let mut files: Vec<&str> = listing
 		.entries
 		.iter()
 		.filter(|entry| entry.kind == ArchiveEntryKind::File && entry.skip.is_none())
-		.filter_map(|entry| entry.path.as_deref())
+		.filter_map(|entry| entry.path.as_ref().map(|path| path.path.as_str()))
 		.collect();
 	files.sort_unstable();
 	files
@@ -1040,10 +1050,15 @@ async fn part_of_an_archive_extracts_below_its_base() {
 		.await
 		.unwrap();
 	let id = |path| entry(&listing, path).id;
-	let entries = |ids, base: &str, destination: &RemoteDirectory| ExtractRequest::Entries {
-		archive: archive.clone(),
-		ids,
-		base: vec![ValidatedName::try_from(base).unwrap()],
+	let entries = |ids, base: &str, destination: &RemoteDirectory| ExtractRequest {
+		what: ExtractWhat::Entries(
+			EntrySelection::new(
+				archive.clone(),
+				ids,
+				vec![ValidatedName::try_from(base).unwrap()],
+			)
+			.unwrap(),
+		),
 		destination: destination.clone().into(),
 		root: ExtractRoot::Destination,
 	};
@@ -1228,8 +1243,8 @@ async fn a_finder_zips_mac_metadata_is_left_out_unless_asked_for() {
 			.unwrap();
 		let report = run_extract(
 			&client,
-			ExtractRequest::All {
-				archive: ArchiveSource::Keep(archive.clone()),
+			ExtractRequest {
+				what: ExtractWhat::All(ArchiveSource::Keep(archive.clone())),
 				destination: destination.clone().into(),
 				root: ExtractRoot::NewFolder { name: None },
 			},

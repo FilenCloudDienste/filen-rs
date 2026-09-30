@@ -56,6 +56,7 @@ use crate::{
 			entry_path::{ArchivePath, joined},
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
+			limits::keep,
 			names::DirId,
 			worker::{
 				CodecStart, EntryHead, EntryKind, SkippedMember, WorkerEvent, codec_failed,
@@ -85,7 +86,7 @@ use super::{
 	report::{
 		ArchiveEntryId, ExtractActiveFile, ExtractEvent, ExtractFailed, ExtractMisleadingName,
 		ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractSkippedEntry,
-		ExtractTopLevelKey, ExtractedTopLevel, Reporter, keep,
+		ExtractTopLevelKey, ExtractedTopLevel, Reporter,
 	},
 };
 
@@ -351,9 +352,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		start,
 		dispose,
 	} = task;
-	let report = ExtractReport::new(super::ArchiveTotals::Streaming {
-		archive_bytes: archive.size(),
-	});
+	let report = ExtractReport::new(archive.size());
 	let archive_uuid = archive.uuid();
 	// ended before anything was extracted: the archive to remove is kept
 	let fail = |mut report: ExtractReport, phase, error| {

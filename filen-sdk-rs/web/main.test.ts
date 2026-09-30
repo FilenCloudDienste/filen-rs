@@ -2478,7 +2478,7 @@ for (const [seed, trip] of ROUND_TRIPS.entries()) {
 				archive,
 				destination: parent,
 				root: { type: "newFolder" },
-				onTopLevelCreated: items => {
+				onTopLevelBatch: items => {
 					extracted.note("topLevel")
 					topLevel.push(...items)
 				},
@@ -2584,7 +2584,7 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	expect(listed.log.indexOf("entries")).toBeLessThan(listed.log.lastIndexOf("update"))
 	expect(updates.at(-1)).toMatchObject({ phase: "done", entries: BigInt(listing.entries.length) })
 	const files = listing.entries.filter(entry => entry.kind.type === "file").sort((a, b) => a.storedPath.localeCompare(b.storedPath))
-	expect(files.map(entry => [entry.path, entry.size, entry.encrypted, entry.skip])).toStrictEqual([
+	expect(files.map(entry => [entry.path?.path, entry.size, entry.encrypted, entry.skip])).toStrictEqual([
 		["archived/notes.txt", BigInt(source.notes.length), true, undefined],
 		["archived/sub/data.bin", BigInt(source.data.length), true, undefined]
 	])
@@ -2597,7 +2597,7 @@ test("extractArchiveEntries extracts the entries chosen below a base, one again 
 	const source = await archiveSource(parent, 13)
 	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "chosen.tar.gz", format: tarGz })
 	const { entries } = await state.listArchive({ archive: archive! })
-	const entry = (path: string) => entries.find(e => e.path === path)!
+	const entry = (path: string) => entries.find(e => e.path?.path === path)!
 
 	// the chosen directory and what is below it, at its path less the base
 	const into = await state.createDir(parent, "into")
@@ -2698,7 +2698,7 @@ test("a listing names the entry a tar's hard link copies, which extracting the l
 	])
 	const archive = await state.uploadFile(tar, { parent, name: "linked.tar" })
 	const { entries } = await state.listArchive({ archive })
-	const entry = (path: string) => entries.find(e => e.path === path)!
+	const entry = (path: string) => entries.find(e => e.path?.path === path)!
 	// each names the entry it copies, a link naming a link
 	expect(entry("b").kind).toStrictEqual({ type: "hardlink", target: "a.txt", targetId: entry("a.txt").id })
 	expect(entry("c").kind).toStrictEqual({ type: "hardlink", target: "b", targetId: entry("b").id })
@@ -2739,7 +2739,7 @@ test("a wrong password that shows only once entries are read trashes the folder 
 			archive: archive!,
 			destination: into,
 			root: { type: "newFolder" },
-			onTopLevelCreated: items => created.push(...items),
+			onTopLevelBatch: items => created.push(...items),
 			onUpdate: update => updates.push(update)
 		},
 		"wrong"
@@ -2822,7 +2822,7 @@ test("compressItems and extractArchive pause, resume and cancel through managedF
 		archive: resumed.archive!,
 		destination: parent,
 		root: { type: "newFolder", name: "stopped" },
-		onTopLevelCreated: () => extractController.abort(),
+		onTopLevelBatch: () => extractController.abort(),
 		onUpdate: update => extractUpdates.push(update),
 		managedFuture: { abortSignal: extractController.signal }
 	})

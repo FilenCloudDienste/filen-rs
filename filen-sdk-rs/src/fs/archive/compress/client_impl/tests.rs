@@ -6,11 +6,12 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::{
+	auth::http::ClientConfig,
 	fs::{
 		archive::{
 			DisposalOutcome, KeptReason,
 			compress::{CompressUpdate, Compression, StreamCodec, report::CompressCallback},
-			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			config::ArchiveConfig,
 			test_support::{pattern, remote_file},
 		},
 		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
@@ -480,7 +481,7 @@ async fn plan_paused(sources: CompressSources) -> PausedPlan {
 			plan_compression(
 				&*lister,
 				PlanJob {
-					archives: &ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+					archives: &ArchiveConfig::new(&ClientConfig::default()),
 					reporter: &reporter,
 					control: &control,
 				},
@@ -537,7 +538,7 @@ async fn a_single_file_of_a_folder_or_of_two_files_is_refused_before_listing() {
 		let failed = plan_compression(
 			&lister,
 			PlanJob {
-				archives: &ArchiveConfig::new(CODEC_MEM_BUDGET, JOB_CONCURRENCY),
+				archives: &ArchiveConfig::new(&ClientConfig::default()),
 				reporter: &reporter,
 				control: &control,
 			},

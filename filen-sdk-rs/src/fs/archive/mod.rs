@@ -38,14 +38,14 @@ pub use config::ArchiveConfig;
 pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use encode::Compression;
 pub use extract::{
-	ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ArchiveListing, ArchiveSource,
-	DuplicateEntries, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
+	ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ArchiveSource, DuplicateEntries,
+	EntrySelection, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 	ExtractEvent, ExtractFailed, ExtractFailure, ExtractMisleadingName, ExtractPhase,
 	ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractRequest, ExtractRetry,
 	ExtractRoot, ExtractSkipReason, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractTopLevelTrashed, ExtractUpdate, ExtractedTopLevel, ListCallback, ListConfig, ListFailed,
-	ListPhase, ListTotals, ListUpdate, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, OmittedRecords,
-	PasswordCheck,
+	ExtractUpdate, ExtractWhat, ExtractedTopLevel, ListCallback, ListConfig, ListFailed, ListPhase,
+	ListReport, ListTotals, ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,
+	OmittedRecords, PasswordCheck,
 };
 pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;

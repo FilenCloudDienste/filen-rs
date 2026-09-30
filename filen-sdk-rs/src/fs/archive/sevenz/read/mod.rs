@@ -352,7 +352,7 @@ impl<'p> Keys<'p> {
 
 	/// Calls `on_round` as a key derivation progresses (see [`derive_key`]); its error stops
 	/// the derivation, which fails with it.
-	pub(crate) fn on_round(self, on_round: &'p dyn Fn() -> io::Result<()>) -> Self {
+	pub(crate) fn with_on_round(self, on_round: &'p dyn Fn() -> io::Result<()>) -> Self {
 		Self {
 			on_round: Some(on_round),
 			..self

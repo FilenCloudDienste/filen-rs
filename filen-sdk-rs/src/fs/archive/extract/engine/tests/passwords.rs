@@ -263,7 +263,7 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		.iter()
 		.flat_map(|update| &update.events)
 		.filter_map(|event| match event {
-			ExtractEvent::TopLevelTrashed(trashed) => Some(trashed.dest_uuid),
+			ExtractEvent::TopLevelTrashed { dest_uuid } => Some(*dest_uuid),
 			_ => None,
 		})
 		.collect();

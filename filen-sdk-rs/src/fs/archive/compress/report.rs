@@ -57,11 +57,13 @@ impl JobPhase for CompressPhase {
 	const FAILED: Self = Self::Failed;
 }
 
+/// Running counts of a compression, against its plan's totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct CompressCounts {
 	/// Files written into the archive.
 	pub files_done: u64,
+	/// Entries left out of the archive (each also a `Skipped` event).
 	pub entries_skipped: u64,
 	/// Bytes of the files left out.
 	pub bytes_skipped: u64,
@@ -70,9 +72,9 @@ pub struct CompressCounts {
 	/// Bytes of the archive uploaded so far.
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
-	pub bytes_done: u64,
+	pub archive_bytes: u64,
 	/// Bytes of the archive read back to check it before the sources are deleted for good (in
-	/// the phase `Verifying`); up to `bytes_done`, and 0 when nothing is read back.
+	/// the phase `Verifying`); up to `archive_bytes`, and 0 when nothing is read back.
 	pub bytes_verified: u64,
 }
 
@@ -166,6 +168,8 @@ pub struct CompressReport {
 	/// Source files whose data did not match the hash in their metadata: they went into the
 	/// archive as they were read (up to 1000 are listed).
 	pub hash_mismatches: Vec<HashMismatch>,
+	/// Mismatches past the 1000 `hash_mismatches` lists, only counted.
+	pub omitted_hash_mismatches: u64,
 }
 
 /// A source file whose data did not match the hash in its metadata.
@@ -203,6 +207,7 @@ impl<T: CompressCallback + ?Sized> CompressCallback for Arc<T> {
 	}
 }
 
+/// What a compression counts, next to the job-agnostic [`RunCore`].
 pub(crate) struct CompressState {
 	core: RunCore<CompressEvent, CompressPhase>,
 	scan: ScanProgress,
@@ -286,6 +291,8 @@ impl PlanState for CompressState {
 	}
 }
 
+/// A compression's reporter: the job-agnostic [`job::report::Reporter`] over a
+/// [`CompressState`].
 pub(crate) type Reporter = job::report::Reporter<CompressState>;
 
 impl Reporter {
@@ -358,7 +365,7 @@ impl Reporter {
 
 	/// Delivered at once, after an update carrying everything that happened before it.
 	pub(crate) fn archive_created(&self, archive: RemoteFile, size: u64) {
-		self.with_state(|state| state.counts.bytes_done = size);
+		self.with_state(|state| state.counts.archive_bytes = size);
 		self.flush_then_call(|callback| callback.on_archive_created(archive));
 	}
 

@@ -11,11 +11,11 @@ use crate::{
 };
 
 use super::{
-	ArchiveEntryId, ArchiveListing, Client, CompressCall, CompressConfig, CompressDelivery,
-	CompressFormat, CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery,
-	ExtractReport, ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate, ListDelivery,
-	RemoteFileType, SourceDisposal, compress_job, entries_request, extract_job, extract_request,
-	list_job, password,
+	ArchiveEntryId, Client, CompressCall, CompressConfig, CompressDelivery, CompressFormat,
+	CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
+	ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate, ExtractedTopLevelItem,
+	ListDelivery, ListReport, RemoteFileType, SourceDisposal, checked_password, compress_job,
+	entries_request, extract_job, extract_request, list_job,
 };
 
 /// What `extractArchive` extracts, where to, and how.
@@ -66,13 +66,16 @@ pub struct ExtractArchiveParams {
 	#[tsify(type = "(update: ExtractUpdate) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_update: Option<js_sys::Function>,
-	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps. A folder among them goes to the trash again when a wrong password shows only
+	/// Top-level items created, in batches of up to 256, each delivered right before the next
+	/// update: every one of them, also past the 1000 the report keeps. Batched, unlike copy's
+	/// `onTopLevelCreated`, since an archive's top level may hold as many entries as the member
+	/// limit allows. A folder among them may go to the trash again when a wrong password shows only
 	/// once entries were read, before any file was extracted: an update's `topLevelTrashed`
 	/// event tells which.
 	#[tsify(type = "(items: ExtractedTopLevelItem[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
-	pub on_top_level_created: Option<js_sys::Function>,
+	pub on_top_level_batch: Option<js_sys::Function>,
+	/// The signals that pause and cancel the job.
 	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
 	#[serde(default)]
 	pub managed_future: ManagedFuture,
@@ -122,13 +125,16 @@ pub struct ExtractArchiveEntriesParams {
 	#[tsify(type = "(update: ExtractUpdate) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
 	pub on_update: Option<js_sys::Function>,
-	/// Top-level items created, in batches: every one of them, also past the 1000 the report
-	/// keeps. A folder among them goes to the trash again when a wrong password shows only
+	/// Top-level items created, in batches of up to 256, each delivered right before the next
+	/// update: every one of them, also past the 1000 the report keeps. Batched, unlike copy's
+	/// `onTopLevelCreated`, since an archive's top level may hold as many entries as the member
+	/// limit allows. A folder among them may go to the trash again when a wrong password shows only
 	/// once entries were read, before any file was extracted: an update's `topLevelTrashed`
 	/// event tells which.
 	#[tsify(type = "(items: ExtractedTopLevelItem[]) => void", optional)]
 	#[serde(default, deserialize_with = "crate::js::optional_function")]
-	pub on_top_level_created: Option<js_sys::Function>,
+	pub on_top_level_batch: Option<js_sys::Function>,
+	/// The signals that pause and cancel the job.
 	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
 	#[serde(default)]
 	pub managed_future: ManagedFuture,
@@ -210,14 +216,15 @@ pub struct CompressItemsParams {
 
 struct ExtractCallbacks {
 	on_update: Option<js_sys::Function>,
-	on_top_level_created: Option<js_sys::Function>,
+	on_top_level_batch: Option<js_sys::Function>,
 }
 
 impl ExtractCallbacks {
 	fn deliver(&self, delivery: ExtractDelivery) {
 		match delivery {
-			ExtractDelivery::TopLevelCreated(items) => {
-				call_callback(self.on_top_level_created.as_ref(), &items)
+			ExtractDelivery::TopLevelBatch(items) => {
+				let items: Vec<ExtractedTopLevelItem> = items.into_iter().map(Into::into).collect();
+				call_callback(self.on_top_level_batch.as_ref(), &items)
 			}
 			ExtractDelivery::Update(update) => {
 				call_callback(self.on_update.as_ref(), &ExtractUpdate::from(update))
@@ -295,7 +302,7 @@ impl JsClient {
 		params: ExtractArchiveParams,
 		password: Option<String>,
 	) -> Result<ExtractReport, Error> {
-		let password = self::password(password)?;
+		let password = checked_password(password)?;
 		let request = extract_request(
 			params.archive,
 			params.destination,
@@ -311,7 +318,7 @@ impl JsClient {
 		.into_config(password);
 		let callbacks = ExtractCallbacks {
 			on_update: params.on_update,
-			on_top_level_created: params.on_top_level_created,
+			on_top_level_batch: params.on_top_level_batch,
 		};
 		run_extract(
 			self.inner(),
@@ -345,7 +352,7 @@ impl JsClient {
 		params: ExtractArchiveEntriesParams,
 		password: Option<String>,
 	) -> Result<ExtractReport, Error> {
-		let password = self::password(password)?;
+		let password = checked_password(password)?;
 		let request = entries_request(
 			params.archive,
 			params.entries,
@@ -362,7 +369,7 @@ impl JsClient {
 		.into_config(password);
 		let callbacks = ExtractCallbacks {
 			on_update: params.on_update,
-			on_top_level_created: params.on_top_level_created,
+			on_top_level_batch: params.on_top_level_batch,
 		};
 		run_extract(
 			self.inner(),
@@ -391,8 +398,8 @@ impl JsClient {
 		&self,
 		params: ListArchiveParams,
 		password: Option<String>,
-	) -> Result<ArchiveListing, Error> {
-		let password = self::password(password)?;
+	) -> Result<ListReport, Error> {
+		let password = checked_password(password)?;
 		let archive = RemoteFileType::try_from(params.archive)?;
 		let config = ExtractSettings {
 			expansion_limit: params.expansion_limit,
@@ -412,7 +419,7 @@ impl JsClient {
 				move |sender, control| list_job(client, archive, config, sender, control),
 			)
 			.await
-			.map(|(result, undelivered)| ArchiveListing::new(result, undelivered))
+			.map(|(result, undelivered)| ListReport::new(result, undelivered))
 	}
 
 	/// Compresses items into a new archive in a directory, entirely in this browser. `name`
@@ -439,10 +446,10 @@ impl JsClient {
 			CompressConfig {
 				format: params.format,
 				max_bytes: params.max_bytes,
-				password: self::password(password)?,
+				password: checked_password(password)?,
 			},
 			params.dispose,
-			self.inner_ref().archive_config().codec_mem_budget,
+			self.inner_ref().archives().codec_mem_budget,
 		)?;
 		let callbacks = CompressCallbacks {
 			on_update: params.on_update,
