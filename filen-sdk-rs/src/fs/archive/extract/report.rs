@@ -406,11 +406,11 @@ pub type ExtractFailed = JobFailed<ExtractReport>;
 
 /// Receives an extraction's progress. All calls come from the one job, in order.
 pub trait ExtractCallback: MaybeSendSync + 'static {
-	/// Items created directly in the destination, delivered as soon as they exist and before
-	/// any update counts them, so a caller can clean up even after an abrupt end. A folder
-	/// among them goes to the trash again when a wrong password shows only once entries were
-	/// read, before any file was extracted: an update's [`ExtractEvent::TopLevelTrashed`] tells
-	/// which.
+	/// Items created directly in the destination, in batches of up to 256, each delivered right
+	/// before the next update (every job ends with one): no update counts an item its caller was
+	/// not given, so a caller holds every item to clean up. A folder among them goes to the trash
+	/// again when a wrong password shows only once entries were read, before any file was
+	/// extracted: an update's [`ExtractEvent::TopLevelTrashed`] tells which.
 	fn on_top_level_created(&self, items: Vec<ExtractedTopLevel>);
 	fn on_update(&self, update: ExtractUpdate);
 }
@@ -493,7 +493,7 @@ impl JobState for ExtractState {
 		self.ended = true;
 		// a file still running now was never finished
 		for file in std::mem::take(&mut self.active) {
-			self.not_attempted(&file);
+			self.not_attempted(file.bytes_done, file.size.unwrap_or(file.bytes_done));
 		}
 	}
 }
@@ -506,11 +506,36 @@ impl ExtractState {
 		}
 	}
 
-	/// Counts a file the job started and dropped: what it uploaded is no longer done.
-	fn not_attempted(&mut self, file: &ExtractActiveFile) {
-		self.counts.bytes_done -= file.bytes_done;
+	/// Counts a file the job started and dropped, `bytes` in size: the `uploaded` bytes of it are
+	/// no longer done.
+	fn not_attempted(&mut self, uploaded: u64, bytes: u64) {
+		self.counts.bytes_done -= uploaded;
 		self.counts.files_not_attempted += 1;
-		self.counts.bytes_not_attempted += file.size.unwrap_or(file.bytes_done);
+		self.counts.bytes_not_attempted = self.counts.bytes_not_attempted.saturating_add(bytes);
+	}
+}
+
+impl ReadsArchive for ExtractState {
+	fn bytes_read(&mut self) -> &mut u64 {
+		&mut self.bytes_read
+	}
+}
+
+/// The reporting state of a job that reads an archive through (an extraction, a listing): what
+/// [`set_bytes_read`](job::report::Reporter::set_bytes_read) updates.
+pub(crate) trait ReadsArchive: JobState {
+	fn bytes_read(&mut self) -> &mut u64;
+}
+
+impl<S: ReadsArchive> job::report::Reporter<S> {
+	/// `bytes_read` of the archive were read so far.
+	pub(crate) fn set_bytes_read(&self, bytes_read: u64) {
+		self.with_state(|state| {
+			if *state.bytes_read() != bytes_read {
+				*state.bytes_read() = bytes_read;
+				state.core().mark_changed();
+			}
+		});
 	}
 }
 
@@ -534,15 +559,6 @@ impl Reporter {
 		)
 	}
 
-	pub(crate) fn set_bytes_read(&self, bytes_read: u64) {
-		self.with_state(|state| {
-			if state.bytes_read != bytes_read {
-				state.bytes_read = bytes_read;
-				state.core.mark_changed();
-			}
-		});
-	}
-
 	/// Delivered in a batch of up to [`CALLBACK_BATCH`] items right before the next update
 	/// (every job ends with one), so a caller holds every item the job created by the time the
 	/// job returns.
@@ -554,7 +570,7 @@ impl Reporter {
 			full = state.pending_top_level.len() >= CALLBACK_BATCH;
 		});
 		if full {
-			self.flush_then_call(|_| {});
+			self.update_now();
 		}
 	}
 
@@ -638,9 +654,7 @@ impl Reporter {
 	pub(crate) fn file_abandoned(&self, dest_uuid: Uuid, bytes: u64) {
 		self.with_state(|state| {
 			let counted = state.remove_active(dest_uuid);
-			state.counts.bytes_done -= counted;
-			state.counts.files_not_attempted += 1;
-			state.counts.bytes_not_attempted += bytes;
+			state.not_attempted(counted, bytes);
 			state.core.mark_changed();
 		});
 	}
@@ -673,10 +687,6 @@ impl Reporter {
 				None => state.core.mark_changed(),
 			}
 		});
-	}
-
-	pub(crate) fn event(&self, event: ExtractEvent) {
-		self.with_state(|state| state.core.push(event));
 	}
 
 	pub(crate) fn counts(&self) -> ItemCounts {

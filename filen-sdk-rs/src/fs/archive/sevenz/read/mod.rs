@@ -20,8 +20,10 @@ use super::{
 	header::*,
 };
 use crate::fs::archive::{
+	bytes,
 	decode::{clamp_lzma_dict, open_stream},
 	format::StreamCodec,
+	limits::HEAP_PER_INDEX_BYTE,
 	password::ArchivePassword,
 	worker::from_source,
 };
@@ -33,8 +35,6 @@ const MAX_CODERS: u64 = 8;
 const MAX_CODER_INPUTS: u64 = 8;
 /// Most bytes of one coder's properties (AES's are 34 at most).
 const MAX_PROPS: usize = 64;
-/// Heap the parsed index may take, per byte of the header's budget.
-const HEAP_PER_INDEX_BYTE: u64 = 3;
 /// Rounds of key derivation one archive may cost, over all its keys: four at 7-Zip's
 /// strongest setting the SDK reads.
 const KDF_ROUNDS_BUDGET: u64 = 4 << super::crypto::MAX_CYCLES_POWER;
@@ -291,6 +291,21 @@ impl SevenZIndex {
 			.max()
 			.unwrap_or(1)
 	}
+
+	/// Whether `entry`'s data is encrypted: an entry without data is not.
+	pub(crate) fn encrypted(&self, entry: &SevenZEntry) -> bool {
+		entry
+			.stream
+			.is_some_and(|stream| self.folders[stream.folder].encrypted())
+	}
+
+	/// Whether `entry`'s data is compressed only with methods the SDK reads: an entry without
+	/// data is.
+	pub(crate) fn supported(&self, entry: &SevenZEntry) -> bool {
+		entry
+			.stream
+			.is_none_or(|stream| self.folders[stream.folder].supported())
+	}
 }
 
 /// What reading may spend on its index's heap.
@@ -526,16 +541,12 @@ fn unaccounted(mut covered: Vec<(u64, u64)>, len: u64) -> Result<u64, SevenZErro
 }
 
 fn read_at<R: Read + Seek>(source: &mut R, at: u64, len: usize) -> Result<Vec<u8>, SevenZError> {
-	source.seek(SeekFrom::Start(at))?;
-	let mut bytes = vec![0; len];
-	source.read_exact(&mut bytes).map_err(|error| {
-		if error.kind() == io::ErrorKind::UnexpectedEof {
-			SevenZError::Corrupt("the 7z archive ends early")
-		} else {
-			SevenZError::Read(error)
-		}
-	})?;
-	Ok(bytes)
+	bytes::read_at(
+		source,
+		at,
+		len,
+		SevenZError::Corrupt("the 7z archive ends early"),
+	)
 }
 
 /// Decodes a packed header's one folder in full, checked against its CRC.

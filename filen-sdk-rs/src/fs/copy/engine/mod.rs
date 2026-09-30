@@ -49,7 +49,7 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		dir::RemoteDirectory,
 		drive_job::{
-			Fatal,
+			CHUNKS_PER_FILE, Fatal,
 			backend::{DriveBackend, UploadSpec},
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
@@ -76,10 +76,6 @@ use crate::fs::drive_job::{
 	listing::FailedSource,
 	plan::{DestParent, ItemPlan, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 };
-
-/// Chunks of one file in flight at once. More only helps a single large file; with several
-/// files running, the memory budget is the bound.
-const CHUNKS_PER_FILE: usize = 4;
 
 /// A created directory with the name it got, or why it was not created.
 type DirResult = Result<CreatedDirOutcome, DirError>;

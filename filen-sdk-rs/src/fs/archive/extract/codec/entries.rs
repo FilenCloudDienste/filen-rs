@@ -14,9 +14,10 @@ use crate::{
 	Error, ErrorKind,
 	fs::{
 		archive::{
+			bytes::read_full,
 			entry_path::{ArchivePath, PathRejection, entry_path},
 			limits::display_path,
-			worker::{EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerPort, read_full},
+			worker::{EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerPort},
 		},
 		name::{ValidatedName, keep_both::collision_key},
 	},
@@ -139,13 +140,10 @@ impl MacFolders {
 		let Ok(stored) = &found.path else {
 			return;
 		};
-		let WorkerEvent::Skipped(skipped) = found.skipped(ExtractSkipReason::MacMetadata) else {
-			unreachable!("a skip record is a skip");
-		};
 		self.held.push(HeldMacFolder {
 			stored: stored.clone(),
 			sent: HeldAs::Extracted {
-				skipped,
+				skipped: found.skip_record(ExtractSkipReason::MacMetadata),
 				modified: found.modified,
 			},
 		});
@@ -197,6 +195,25 @@ fn collision_keys(path: &ArchivePath) -> Vec<String> {
 		.collect()
 }
 
+/// The path of an entry stored at `stored` as drive names, `rewritten` already when its reader
+/// had to change the name to read it.
+pub(super) fn found_path(stored: &str, rewritten: bool) -> Result<ArchivePath, PathRejection> {
+	entry_path(stored).map(|mut path| {
+		path.rewritten |= rewritten;
+		path
+	})
+}
+
+/// What a symlink to `target`, as shown, is listed as, and why an extraction skips it.
+pub(super) fn symlink(target: String) -> (ArchiveEntryKind, Option<ExtractSkipReason>) {
+	(
+		ArchiveEntryKind::Symlink {
+			target: target.clone(),
+		},
+		Some(ExtractSkipReason::Symlink { target }),
+	)
+}
+
 /// An entry as its format's reader tells of it.
 pub(super) struct Found<'a> {
 	pub(super) ordinal: u64,
@@ -240,14 +257,29 @@ impl Found<'_> {
 	}
 
 	/// The skip record for it.
-	pub(super) fn skipped(&self, reason: ExtractSkipReason) -> WorkerEvent {
+	pub(super) fn skip_record(&self, reason: ExtractSkipReason) -> SkippedMember {
 		let (path, path_truncated) = display_path(self.stored);
-		WorkerEvent::Skipped(SkippedMember {
+		SkippedMember {
 			ordinal: self.ordinal,
 			path: path.to_owned(),
 			path_truncated,
 			bytes: self.size,
 			reason,
+		}
+	}
+
+	/// It sent as skipped.
+	pub(super) fn skipped(&self, reason: ExtractSkipReason) -> WorkerEvent {
+		WorkerEvent::Skipped(self.skip_record(reason))
+	}
+
+	/// It sent taken at `path`, as `kind`.
+	pub(super) fn head(&self, path: ArchivePath, kind: EntryKind) -> WorkerEvent {
+		WorkerEvent::Entry(EntryHead {
+			ordinal: self.ordinal,
+			path,
+			modified: self.modified,
+			kind,
 		})
 	}
 }

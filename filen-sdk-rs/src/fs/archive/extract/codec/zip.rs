@@ -6,11 +6,11 @@ use std::io::{self, Read, Seek};
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
-		entry_path::{ArchivePath, entry_path},
+		entry_path::ArchivePath,
 		format::ArchiveFormat,
-		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
+		limits::MAX_ARCHIVE_PATH_BYTES,
 		password::ArchivePassword,
-		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent, from_source},
+		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
 		zip::{
 			METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_PPMD,
 			METHOD_STORED, METHOD_XZ, METHOD_ZSTD,
@@ -33,8 +33,8 @@ use super::{
 		storage_exceeded,
 	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
-	entries::{Found, MacShape, Verdict, Walk, apple_double},
-	failure, take_file,
+	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
+	failure, likely_wrong_password, link_target, take_file,
 };
 
 /// How a zip entry's data is compressed, for display.
@@ -60,12 +60,7 @@ fn zip_method(entry: &ZipEntry) -> Option<String> {
 /// it reports the link skipped.
 fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: String) -> Found<'e> {
 	let (kind, unreadable) = match entry.kind {
-		ZipKind::Symlink => (
-			ArchiveEntryKind::Symlink {
-				target: target.clone(),
-			},
-			Some(ExtractSkipReason::Symlink { target }),
-		),
+		ZipKind::Symlink => symlink(target),
 		ZipKind::Dir => (ArchiveEntryKind::Dir, None),
 		ZipKind::File => (
 			ArchiveEntryKind::File,
@@ -75,10 +70,7 @@ fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: String) -> Foun
 	Found {
 		ordinal: entry.ordinal,
 		stored: &entry.name,
-		path: entry_path(&entry.name).map(|mut path| {
-			path.rewritten |= entry.name_rewritten;
-			path
-		}),
+		path: found_path(&entry.name, entry.name_rewritten),
 		kind,
 		unreadable: if overlapping {
 			Some(ExtractSkipReason::OverlappingData)
@@ -191,12 +183,9 @@ pub(super) fn extract_zip(
 		return Err(error);
 	}
 	// set once an encrypted entry read back whole against its CRC-32 or authentication code
-	let mut verified = match check_zip_password(&mut source, &index, password, entry_limits)? {
-		PasswordCheck::NotNeeded | PasswordCheck::Right => true,
-		PasswordCheck::Unchecked => false,
-		PasswordCheck::Required => return Err(zip_failure(ZipError::PasswordRequired)),
-		PasswordCheck::Wrong => return Err(zip_failure(ZipError::WrongPassword)),
-	};
+	let mut verified = check_zip_password(&mut source, &index, password, entry_limits)?
+		.verified(ZipError::PasswordRequired, ZipError::WrongPassword)
+		.map_err(zip_failure)?;
 
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
@@ -242,12 +231,7 @@ pub(super) fn extract_zip(
 		};
 		if entry.kind == ZipKind::Dir {
 			walk.port
-				.send(WorkerEvent::Entry(EntryHead {
-					ordinal: entry.ordinal,
-					path,
-					modified: entry.modified,
-					kind: EntryKind::Dir,
-				}))
+				.send(found.head(path, EntryKind::Dir))
 				.map_err(failure)?;
 			continue;
 		}
@@ -384,10 +368,7 @@ fn take_zip_file(
 		Err(error)
 			if key_unproven(entry) && !verified && error.kind() == ErrorKind::ArchiveCorrupt =>
 		{
-			Err(Error::custom(
-				ErrorKind::ArchiveWrongPassword,
-				"the password is likely wrong",
-			))
+			Err(likely_wrong_password())
 		}
 		Err(error) => Err(error),
 	}
@@ -554,18 +535,12 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	{
 		return Ok(String::new());
 	}
-	let mut target = Vec::new();
-	let read = match open_entry(source, shift, entry, password, limits) {
-		Ok(mut reader) => reader.read_to_end(&mut target),
+	let data = match open_entry(source, shift, entry, password, limits) {
+		Ok(reader) => Ok(reader),
 		Err(ZipError::Read(error)) => Err(error),
 		Err(_) => return Ok(String::new()),
 	};
-	match read {
-		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
-		Err(error) if from_source(&error) => Err(error),
-		// a damaged link keeps nothing else from being read
-		Err(_) => Ok(String::new()),
-	}
+	link_target(data)
 }
 
 fn zip_failure(error: ZipError) -> Error {

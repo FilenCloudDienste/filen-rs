@@ -5,6 +5,7 @@
 //! The vocabulary the archive jobs share with copying (their control, sources, plan records,
 //! counts and run state) is exported from [`fs::copy`](crate::fs::copy), where it first shipped.
 
+mod bytes;
 mod compress;
 pub(crate) mod config;
 mod decode;

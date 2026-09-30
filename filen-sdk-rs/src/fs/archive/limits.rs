@@ -9,6 +9,9 @@ pub(crate) const MAX_ARCHIVE_PATH_BYTES: usize = 4096;
 /// Deepest entry path, in directory levels, for the same reasons as [`MAX_ARCHIVE_PATH_BYTES`].
 pub(crate) const MAX_ARCHIVE_PATH_DEPTH: usize = 256;
 
+/// Heap a zip's or 7z's parsed index may take, per byte of its index budget.
+pub(crate) const HEAP_PER_INDEX_BYTE: u64 = 3;
+
 /// Most skipped, renamed or failed entries a report keeps one by one; beyond that they are only
 /// counted, so an archive of a million symlinks cannot build a million-record report.
 pub(crate) const MAX_REPORT_RECORDS: usize = 1000;

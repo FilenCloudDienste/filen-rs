@@ -19,7 +19,7 @@ use std::io::{self, Read};
 
 use tar::{EntryType, Header};
 
-use super::format::is_tar_header;
+use super::{bytes::read_full, format::is_tar_header};
 use crate::fs::drive_job::exceeds_limit;
 
 /// Bytes of a tar block: headers, and member data padded to a whole number of them.
@@ -367,20 +367,6 @@ impl<R: Read> TarReader<R> {
 		}
 		Ok(())
 	}
-}
-
-/// Reads until `buf` is full or the stream ends; the number of bytes read.
-fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
-	let mut filled = 0;
-	while filled < buf.len() {
-		match reader.read(&mut buf[filled..]) {
-			Ok(0) => break,
-			Ok(read) => filled += read,
-			Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-			Err(error) => return Err(error),
-		}
-	}
-	Ok(filled)
 }
 
 fn padding(size: u64) -> u64 {

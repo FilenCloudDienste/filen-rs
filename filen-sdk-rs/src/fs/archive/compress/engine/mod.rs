@@ -13,7 +13,6 @@
 
 use std::{
 	collections::{BTreeSet, HashMap, VecDeque},
-	io,
 	sync::Arc,
 };
 
@@ -32,15 +31,16 @@ use crate::{
 	fs::{
 		HasUUID,
 		archive::{
-			config::{ArchiveConfig, CHUNK_BYTES},
+			config::ArchiveConfig,
 			dispose::{
 				DisposalBackend, DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, Nesting,
 				Removing, SourceDisposal, SourceDisposition, WrittenFile, dispose_dir,
 				dispose_file, kept_on_early_end, nesting,
 			},
 			hash::HeadLastHasher,
+			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
 			limits::MAX_REPORT_RECORDS,
-			worker::{StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
+			worker::{CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
 		},
 		categories::{DirType, Normal},
 		drive_job::{
@@ -52,7 +52,7 @@ use crate::{
 		file::{
 			RemoteFile,
 			enums::RemoteFileType,
-			read::{check_chunks_consistent, chunk_plaintext_len},
+			read::check_chunks_consistent,
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
@@ -76,9 +76,6 @@ use super::report::{
 
 /// Archive chunks uploading at once.
 const UPLOADS_AT_ONCE: usize = 4;
-
-/// Source chunks fetched ahead of the codec, memory permitting.
-const PREFETCH_CHUNKS: usize = 4;
 
 /// What the codec returns: the archive's length.
 pub(crate) type CodecResult = Result<u64, Error>;
@@ -109,7 +106,7 @@ pub(crate) struct CompressTask<B> {
 	/// The codec sends the archive's first chunk last ([`WorkerEvent::Head`]).
 	pub(crate) head_last: bool,
 	/// Starts the codec; called once the job holds its lease and memory floor.
-	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	pub(crate) start: CodecStart<CodecResult>,
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
 	pub(crate) disposal: Option<CompressDisposal>,
@@ -191,7 +188,7 @@ struct Driver<B: DriveBackend> {
 	/// count as paused while one still holds memory.
 	ready: VecDeque<(ChunkKey, Vec<u8>, OwnedSemaphorePermit, OpGuard)>,
 	reading: Option<OwnedSemaphorePermit>,
-	ask: Option<(ChunkKey, oneshot::Sender<io::Result<Vec<u8>>>)>,
+	ask: Option<(ChunkKey, oneshot::Sender<Vec<u8>>)>,
 
 	destination: Uuid,
 	upload: Arc<B::Upload>,
@@ -391,7 +388,7 @@ pub(crate) fn end_early(
 	}
 	report.dispositions = kept_on_early_end(requested, cancelled);
 	reporter.dispositions(&report.dispositions);
-	reporter.finish_early(phase, report.totals);
+	reporter.finish_with_totals(phase, report.totals);
 	report.counts = reporter.counts();
 	CompressFailed { report, error }
 }
@@ -502,7 +499,7 @@ impl<B: DisposalBackend> Driver<B> {
 		while self.fetches.len() + self.ready.len() < PREFETCH_CHUNKS
 			&& self.next_fetch.0 < self.sources.len()
 		{
-			let Some(permit) = self.take_memory(&self.input_slot) else {
+			let Some(permit) = take_memory(&self.input_slot, &self.memory) else {
 				break;
 			};
 			let (source, index) = self.next_fetch;
@@ -523,31 +520,13 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	fn take_memory(&self, slot: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
-		Arc::clone(slot).try_acquire_owned().ok().or_else(|| {
-			Arc::clone(&self.memory)
-				.try_acquire_many_owned(u32::try_from(CHUNK_BYTES).expect(
-					"a full chunk is about 1 MiB, far below u32::MAX (should be impossible)",
-				))
-				.ok()
-		})
-	}
-
 	fn fetch_finished(&mut self, ((source, index), result, permit, op): FetchedChunk) {
 		let file = &self.sources[source as usize].file;
-		let expected = chunk_plaintext_len(file.size(), index);
-		match result {
-			Ok(data) if data.len() as u64 == expected => {
+		match result.and_then(|data| whole_chunk(file, index, data)) {
+			Ok(data) => {
 				self.ready.push_back(((source, index), data, permit, op));
 				self.serve_ask();
 			}
-			Ok(data) => self.stop_with(Error::custom(
-				ErrorKind::Response,
-				format!(
-					"chunk {index} of a source holds {} bytes instead of {expected}",
-					data.len()
-				),
-			)),
 			Err(error) => self.stop_with(error),
 		}
 	}
@@ -599,7 +578,7 @@ impl<B: DisposalBackend> Driver<B> {
 				size,
 				bytes_done: 0,
 			});
-		let _ = reply.send(Ok(data));
+		let _ = reply.send(data);
 	}
 
 	fn on_event(&mut self, event: WorkerEvent) {
@@ -634,7 +613,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// upload slot is free.
 	fn take_data(&mut self, data: Vec<u8>, head: bool) {
 		let permit = if self.uploads.len() < UPLOADS_AT_ONCE {
-			self.take_memory(&self.output_slot)
+			take_memory(&self.output_slot, &self.memory)
 		} else {
 			None
 		};

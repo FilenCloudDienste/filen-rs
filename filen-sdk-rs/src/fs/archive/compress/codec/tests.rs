@@ -89,7 +89,7 @@ fn drive(
 				if short == Some(source) && end == data.len() {
 					end -= 1;
 				}
-				let _ = reply.send(Ok(data[start..end].to_vec()));
+				let _ = reply.send(data[start..end].to_vec());
 			}
 			WorkerEvent::Data(chunk) => {
 				written.chunks.push(chunk.len());

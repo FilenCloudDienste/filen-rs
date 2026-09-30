@@ -25,7 +25,7 @@ pub use crate::job::report::RunState;
 
 use crate::fs::drive_job::{
 	listing::{FailedSource, ScanProgress},
-	plan::{PlanTotals, RenamedEntry, SkippedEntry},
+	plan::{PlanState, PlanTotals, RenamedEntry, SkippedEntry},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +314,29 @@ impl JobState for CopyState {
 	}
 }
 
+impl PlanState for CopyState {
+	fn scan(&mut self) -> &mut ScanProgress {
+		&mut self.scan
+	}
+
+	fn totals(&mut self) -> &mut PlanTotals {
+		&mut self.totals
+	}
+
+	fn count_skipped(&mut self, entries: u64, bytes: u64) {
+		self.counts.entries_skipped += entries;
+		self.counts.bytes_skipped += bytes;
+	}
+
+	fn skipped_event(entry: SkippedEntry) -> CopyEvent {
+		CopyEvent::Skipped(entry)
+	}
+
+	fn renamed_event(entry: RenamedEntry) -> CopyEvent {
+		CopyEvent::Renamed(entry)
+	}
+}
+
 impl CopyState {
 	fn remove_active(&mut self, dest_uuid: Uuid) -> u64 {
 		match self.active.iter().position(|f| f.dest_uuid == dest_uuid) {
@@ -338,38 +361,6 @@ impl Reporter {
 			},
 			Box::new(callback),
 		)
-	}
-
-	pub(crate) fn set_scan(&self, scan: ScanProgress) {
-		self.with_state(|state| {
-			if state.scan != scan {
-				state.scan = scan;
-				state.core.mark_changed();
-			}
-		});
-	}
-
-	/// Takes the plan's totals and reports what it skipped or renamed.
-	pub(crate) fn set_plan(
-		&self,
-		totals: PlanTotals,
-		skipped: &[SkippedEntry],
-		renamed: &[RenamedEntry],
-	) {
-		self.with_state(|state| {
-			state.totals = totals;
-			for entry in skipped {
-				state.counts.entries_skipped += entry.entries();
-				state.counts.bytes_skipped += entry.bytes;
-				// the report keeps the entry too
-				state.core.push(CopyEvent::Skipped(entry.clone()));
-			}
-			for entry in renamed {
-				state.core.push(CopyEvent::Renamed(entry.clone()));
-			}
-			state.core.mark_changed();
-			state.core.mark_urgent();
-		});
 	}
 
 	pub(crate) fn top_level_planned(&self, items: Vec<PlannedTopLevelItem>) {
@@ -463,17 +454,7 @@ impl Reporter {
 		});
 	}
 
-	pub(crate) fn event(&self, event: CopyEvent) {
-		self.with_state(|state| state.core.push(event));
-	}
-
 	pub(crate) fn counts(&self) -> ItemCounts {
 		self.read(|state| state.counts)
-	}
-
-	/// The last update of a job that ends before it starts: it carries the `totals` the job
-	/// would have copied, none of them attempted.
-	pub(crate) fn finish_unstarted(&self, phase: CopyPhase, totals: PlanTotals) {
-		self.finish_with(phase, |state| state.totals = totals);
 	}
 }

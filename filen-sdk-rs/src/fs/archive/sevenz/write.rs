@@ -15,6 +15,7 @@ use filen_macros::js_type;
 use crate::{
 	Error,
 	fs::archive::{
+		bytes::{Counting, copy_with_crc},
 		encode::{check_level, lzma_encoder_memory},
 		password::ArchivePassword,
 	},
@@ -163,24 +164,6 @@ struct FileRecord {
 	name: String,
 	modified: Option<DateTime<Utc>>,
 	kind: FileKind,
-}
-
-/// The archive under a folder being written, counting its bytes.
-struct Counting<W> {
-	inner: W,
-	count: u64,
-}
-
-impl<W: Write> Write for Counting<W> {
-	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		let n = self.inner.write(buf)?;
-		self.count += n as u64;
-		Ok(n)
-	}
-
-	fn flush(&mut self) -> io::Result<()> {
-		self.inner.flush()
-	}
 }
 
 /// What a folder's compressed data goes through: nothing, or AES.
@@ -334,10 +317,7 @@ impl<W: Write> SevenZWriter<W> {
 		};
 		out.write_all(&[0; START_HEADER_LEN])?;
 		Ok(Self {
-			state: State::Idle(Counting {
-				inner: out,
-				count: 0,
-			}),
+			state: State::Idle(Counting::new(out, 0)),
 			method,
 			solid,
 			encryption,
@@ -383,28 +363,15 @@ impl<W: Write> SevenZWriter<W> {
 		let State::Open(folder) = &mut self.state else {
 			return Err(failed());
 		};
-		let mut crc = crc32fast::Hasher::new();
-		let mut buf = vec![0u8; 64 * 1024];
-		let mut read = 0u64;
-		loop {
-			let n = match data.read(&mut buf) {
-				Ok(0) => break,
-				Ok(n) => n,
-				Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-				Err(error) => {
-					self.state = State::Failed;
-					return Err(error);
-				}
-			};
-			crc.update(&buf[..n]);
-			if let Err(error) = folder.encoder.write_all(&buf[..n]) {
+		let (read, crc) = match copy_with_crc(data, &mut folder.encoder) {
+			Ok(copied) => copied,
+			Err(error) => {
 				self.state = State::Failed;
 				return Err(error);
 			}
-			read += n as u64;
-		}
+		};
 		folder.unpacked += read;
-		folder.substreams.push((read, crc.finalize()));
+		folder.substreams.push((read, crc));
 		self.files.push(FileRecord {
 			name: path.to_owned(),
 			modified,
@@ -420,7 +387,7 @@ impl<W: Write> SevenZWriter<W> {
 		let State::Idle(out) = std::mem::replace(&mut self.state, State::Failed) else {
 			return Err(failed());
 		};
-		let start = out.count;
+		let start = out.written;
 		let mut coders = Vec::with_capacity(2);
 		let packer = match &self.encryption {
 			None => Packer::Plain(out),
@@ -504,7 +471,7 @@ impl<W: Write> SevenZWriter<W> {
 			return Err(failed());
 		};
 		let (out, aes_taken) = folder.encoder.finish()?.finish()?;
-		let packed = out.count - folder.start;
+		let packed = out.written - folder.start;
 		let mut unpack_sizes = vec![folder.unpacked];
 		unpack_sizes.extend(aes_taken);
 		self.pack_sizes.push(packed);
@@ -551,7 +518,7 @@ impl<W: Write> SevenZWriter<W> {
 		} else {
 			(self.into_out()?, header)
 		};
-		let next_offset = out.count;
+		let next_offset = out.written;
 		out.write_all(&next)?;
 		let mut start = [0u8; START_HEADER_LEN];
 		start[..6].copy_from_slice(&SIGNATURE);
@@ -567,7 +534,7 @@ impl<W: Write> SevenZWriter<W> {
 	/// The bytes written after the start header.
 	fn data_len(&self) -> io::Result<u64> {
 		match &self.state {
-			State::Idle(out) => Ok(out.count),
+			State::Idle(out) => Ok(out.written),
 			_ => Err(failed()),
 		}
 	}

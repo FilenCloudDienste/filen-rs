@@ -141,6 +141,12 @@ impl ExpansionLimit {
 		ratio: 1000,
 		floor: 256 << 20,
 	};
+
+	/// Whether `decoded` bytes are within the limit for an archive of which `read` bytes were
+	/// read.
+	pub(crate) fn allows(self, read: u64, decoded: u64) -> bool {
+		decoded <= self.floor.max(read.saturating_mul(self.ratio))
+	}
 }
 
 #[derive(Debug, Clone)]

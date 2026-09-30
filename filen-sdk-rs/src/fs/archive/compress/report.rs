@@ -12,7 +12,7 @@ use crate::{
 		archive::dispose::SourceDisposition,
 		drive_job::{
 			listing::ScanProgress,
-			plan::{PlanTotals, RenamedEntry, SkippedEntry},
+			plan::{PlanState, PlanTotals, RenamedEntry, SkippedEntry},
 		},
 		file::RemoteFile,
 	},
@@ -260,6 +260,29 @@ impl JobState for CompressState {
 	}
 }
 
+impl PlanState for CompressState {
+	fn scan(&mut self) -> &mut ScanProgress {
+		&mut self.scan
+	}
+
+	fn totals(&mut self) -> &mut PlanTotals {
+		&mut self.totals
+	}
+
+	fn count_skipped(&mut self, entries: u64, bytes: u64) {
+		self.counts.entries_skipped += entries;
+		self.counts.bytes_skipped += bytes;
+	}
+
+	fn skipped_event(entry: SkippedEntry) -> CompressEvent {
+		CompressEvent::Skipped(entry)
+	}
+
+	fn renamed_event(entry: RenamedEntry) -> CompressEvent {
+		CompressEvent::Renamed(entry)
+	}
+}
+
 pub(crate) type Reporter = job::report::Reporter<CompressState>;
 
 impl Reporter {
@@ -276,37 +299,6 @@ impl Reporter {
 			},
 			Box::new(callback),
 		)
-	}
-
-	pub(crate) fn set_scan(&self, scan: ScanProgress) {
-		self.with_state(|state| {
-			if state.scan != scan {
-				state.scan = scan;
-				state.core.mark_changed();
-			}
-		});
-	}
-
-	/// Takes the plan's totals and reports what it skipped or renamed.
-	pub(crate) fn set_plan(
-		&self,
-		totals: PlanTotals,
-		skipped: &[SkippedEntry],
-		renamed: &[RenamedEntry],
-	) {
-		self.with_state(|state| {
-			state.totals = totals;
-			for entry in skipped {
-				state.counts.entries_skipped += entry.entries();
-				state.counts.bytes_skipped += entry.bytes;
-				state.core.push(CompressEvent::Skipped(entry.clone()));
-			}
-			for entry in renamed {
-				state.core.push(CompressEvent::Renamed(entry.clone()));
-			}
-			state.core.mark_changed();
-			state.core.mark_urgent();
-		});
 	}
 
 	/// `bytes` more of the source `file` were read; `file` builds it when it starts.
@@ -367,10 +359,6 @@ impl Reporter {
 		self.flush_then_call(|callback| callback.on_archive_created(archive));
 	}
 
-	pub(crate) fn event(&self, event: CompressEvent) {
-		self.with_state(|state| state.core.push(event));
-	}
-
 	/// Tells of what became of sources in an update sent at once: a job dropped before its last
 	/// update (the bindings drop one that outlives its cancel grace) has still told of every
 	/// source it removed.
@@ -387,12 +375,6 @@ impl Reporter {
 
 	pub(crate) fn counts(&self) -> CompressCounts {
 		self.read(|state| state.counts)
-	}
-
-	/// The last update of a job that ends early, carrying the `totals` it would have compressed
-	/// (a job refused before it planned was never told them).
-	pub(crate) fn finish_early(&self, phase: CompressPhase, totals: PlanTotals) {
-		self.finish_with(phase, |state| state.totals = totals);
 	}
 }
 

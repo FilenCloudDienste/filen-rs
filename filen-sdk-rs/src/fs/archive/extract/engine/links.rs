@@ -16,6 +16,7 @@ use crate::{
 			worker::{LinkHead, SkippedMember},
 		},
 		categories::{NonRootItemType, Normal},
+		drive_job::CHUNKS_PER_FILE,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
 	util::SeededMap,
@@ -23,7 +24,7 @@ use crate::{
 
 use super::{
 	super::{codec::LinkKeys, report::ExtractStage},
-	CHUNKS_PER_FILE, Driver, FileSource, LinkChunk, MAX_OPEN_FILES, NewFile,
+	Driver, FileSource, LinkChunk, MAX_OPEN_FILES, NewFile,
 };
 
 /// A hard link's copy of the file it names: that file's chunks, fetched one at a time (their
@@ -180,19 +181,16 @@ impl<B: DisposalBackend> Driver<B> {
 			},
 			None => return self.on_skipped(unresolved),
 		};
-		if let Some(limit) = self.expansion {
-			let allowed = limit
-				.floor
-				.max(self.feed.bytes_read().saturating_mul(limit.ratio));
-			if self.link_bytes.saturating_add(size) > allowed {
-				return self.stop_with(Error::custom(
-					ErrorKind::ArchiveTooLarge,
-					format!(
-						"the archive's hard links copy more than {} times its size",
-						limit.ratio
-					),
-				));
-			}
+		if let Some(limit) = self.expansion
+			&& !limit.allows(self.feed.bytes_read(), self.link_bytes.saturating_add(size))
+		{
+			return self.stop_with(Error::custom(
+				ErrorKind::ArchiveTooLarge,
+				format!(
+					"the archive's hard links copy more than {} times its size",
+					limit.ratio
+				),
+			));
 		}
 		self.link_bytes += size;
 		let entry = self.entry_id(ordinal);

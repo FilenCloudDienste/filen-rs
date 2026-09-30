@@ -28,8 +28,10 @@ use super::{
 use crate::fs::drive_job::exceeds_limit;
 use crate::{
 	fs::archive::{
+		bytes,
 		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
 		format::StreamCodec,
+		limits::HEAP_PER_INDEX_BYTE,
 		password::ArchivePassword,
 	},
 	util::SeededMap,
@@ -169,13 +171,12 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 fn read_at<R: Read + Seek>(source: &mut R, offset: u64, len: usize) -> Result<Vec<u8>, ZipError> {
-	source.seek(SeekFrom::Start(offset))?;
-	let mut buf = vec![0u8; len];
-	source.read_exact(&mut buf).map_err(|e| match e.kind() {
-		io::ErrorKind::UnexpectedEof => ZipError::Corrupt("a record runs past the end of the file"),
-		_ => ZipError::Read(e),
-	})?;
-	Ok(buf)
+	bytes::read_at(
+		source,
+		offset,
+		len,
+		ZipError::Corrupt("a record runs past the end of the file"),
+	)
 }
 
 /// The file's tail, read whole to find the end record, which the records around that are read
@@ -700,9 +701,6 @@ pub(crate) fn unaccounted_after<R: Read + Seek>(
 		gap => gap,
 	}
 }
-
-/// Heap a zip's parsed index may take, per byte of its central directory budget.
-const HEAP_PER_INDEX_BYTE: u64 = 3;
 
 /// Memory a zip entry's decoder may use.
 #[derive(Debug, Clone, Copy)]

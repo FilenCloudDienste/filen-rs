@@ -28,7 +28,10 @@ use crate::{
 			keep_both::{NameShape, SourceName, TakenNames},
 		},
 	},
+	job::report::{JobState, Reporter},
 };
+
+use super::listing::ScanProgress;
 
 /// A source directory, independent of the category it was listed from.
 #[derive(Debug, Clone)]
@@ -172,6 +175,58 @@ impl SkippedEntry {
 			SkipReason::UndecryptableFile { .. } => 1,
 			SkipReason::Unreachable { count } => count,
 		}
+	}
+}
+
+/// The reporting state of a job that scans its sources and plans from them (a copy, a
+/// compression): what [`Reporter::set_scan`], [`Reporter::set_plan`] and
+/// [`Reporter::finish_with_totals`] update.
+pub(crate) trait PlanState: JobState {
+	fn scan(&mut self) -> &mut ScanProgress;
+	fn totals(&mut self) -> &mut PlanTotals;
+	/// Counts `entries` skipped listed entries, holding `bytes`.
+	fn count_skipped(&mut self, entries: u64, bytes: u64);
+	fn skipped_event(entry: SkippedEntry) -> Self::Event;
+	fn renamed_event(entry: RenamedEntry) -> Self::Event;
+}
+
+impl<S: PlanState> Reporter<S> {
+	pub(crate) fn set_scan(&self, scan: ScanProgress) {
+		self.with_state(|state| {
+			if *state.scan() != scan {
+				*state.scan() = scan;
+				state.core().mark_changed();
+			}
+		});
+	}
+
+	/// Takes the plan's totals and reports what it skipped or renamed.
+	pub(crate) fn set_plan(
+		&self,
+		totals: PlanTotals,
+		skipped: &[SkippedEntry],
+		renamed: &[RenamedEntry],
+	) {
+		self.with_state(|state| {
+			*state.totals() = totals;
+			for entry in skipped {
+				state.count_skipped(entry.entries(), entry.bytes);
+				// the report keeps the entry too
+				state.core().push(S::skipped_event(entry.clone()));
+			}
+			for entry in renamed {
+				state.core().push(S::renamed_event(entry.clone()));
+			}
+			let core = state.core();
+			core.mark_changed();
+			core.mark_urgent();
+		});
+	}
+
+	/// The last update of a job that ends before it runs to its end: it carries the `totals` the
+	/// job would have worked through (a job refused before it planned was never told them).
+	pub(crate) fn finish_with_totals(&self, phase: S::Phase, totals: PlanTotals) {
+		self.finish_with(phase, |state| *state.totals() = totals);
 	}
 }
 

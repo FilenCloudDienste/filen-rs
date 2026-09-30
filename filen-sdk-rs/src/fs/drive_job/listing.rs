@@ -27,11 +27,14 @@ use crate::{
 		},
 		file::enums::RemoteFileType,
 	},
-	job::{JobControl, Stopped, report::Ops},
-	util::sleep,
+	job::{
+		JobControl, Stopped,
+		report::{Ops, Reporter},
+	},
+	util::{MaybeArc, sleep},
 };
 
-use super::plan::{Listed, PlanSource, SourceDir};
+use super::plan::{Listed, PlanSource, PlanState, SourceDir};
 
 /// A directory whose items a job recreates (copies, compresses), with what is needed to list it.
 #[derive(Debug, Clone)]
@@ -125,6 +128,104 @@ impl ListingBytes {
 	}
 }
 
+/// Lists a job's source directories: the client, or a test's fake.
+pub(crate) trait SourceLister {
+	async fn list_source(
+		&self,
+		dir: ItemSourceDir,
+		bytes: &ListingBytes,
+	) -> Result<PlanSource<ItemSourceDir>, Error>;
+}
+
+impl SourceLister for Client {
+	async fn list_source(
+		&self,
+		dir: ItemSourceDir,
+		bytes: &ListingBytes,
+	) -> Result<PlanSource<ItemSourceDir>, Error> {
+		self.list_item_source(dir, bytes).await
+	}
+}
+
+/// A job's scan: its listings (source directories, and a copy's destinations) run one after
+/// another, each once a pause is over, with the scan's progress reported as they download.
+pub(crate) struct SourceScan<'a, S: PlanState> {
+	reporter: &'a MaybeArc<Reporter<S>>,
+	ops: Ops,
+	control: &'a JobControl,
+	bytes: ListingBytes,
+	done: u64,
+	total: u64,
+}
+
+impl<'a, S: PlanState> SourceScan<'a, S> {
+	/// Starts a scan of `total` listings, reporting that none is done yet.
+	pub(crate) fn new(
+		reporter: &'a MaybeArc<Reporter<S>>,
+		control: &'a JobControl,
+		total: u64,
+	) -> Self {
+		let scan = Self {
+			reporter,
+			ops: reporter.ops(),
+			control,
+			bytes: ListingBytes::default(),
+			done: 0,
+			total,
+		};
+		scan.report();
+		scan
+	}
+
+	fn report(&self) {
+		self.reporter
+			.set_scan(self.bytes.scan(self.done, self.total));
+	}
+
+	async fn watch<T>(
+		&self,
+		listing: impl Future<Output = Result<T, Error>>,
+	) -> Result<T, ScanError> {
+		watch_listing(listing, &self.ops, self.control, || self.report())
+			.await?
+			.map_err(ScanError::Failed)
+	}
+
+	fn listed(&mut self) {
+		self.done += 1;
+		self.report();
+	}
+
+	/// Runs `listing` as the scan's next listing, once a pause is over.
+	pub(crate) async fn list<T>(
+		&mut self,
+		listing: impl Future<Output = Result<T, Error>>,
+	) -> Result<T, ScanError> {
+		self.reporter.checkpoint(self.control).await?;
+		let listed = self.watch(listing).await?;
+		self.listed();
+		Ok(listed)
+	}
+
+	/// `source` as the planner takes it: a file as it is, a directory listed recursively by
+	/// `lister` as the scan's next listing, once a pause is over.
+	pub(crate) async fn source(
+		&mut self,
+		lister: &impl SourceLister,
+		source: ItemSource,
+	) -> Result<PlanSource<ItemSourceDir>, ScanError> {
+		let dir = match source {
+			ItemSource::File(file) => return Ok(PlanSource::File(file)),
+			ItemSource::Dir(dir) => dir,
+		};
+		self.reporter.checkpoint(self.control).await?;
+		self.bytes.next_source();
+		let listed = self.watch(lister.list_source(dir, &self.bytes)).await?;
+		self.listed();
+		Ok(listed)
+	}
+}
+
 /// The directories and files below a source directory.
 pub(crate) type Listing = (
 	Vec<Listed<SourceDir<ItemSourceDir>>>,
@@ -188,7 +289,7 @@ where
 
 impl Client {
 	/// Lists a source directory recursively, for the planner.
-	pub(crate) async fn list_item_source(
+	async fn list_item_source(
 		&self,
 		dir: ItemSourceDir,
 		bytes: &ListingBytes,

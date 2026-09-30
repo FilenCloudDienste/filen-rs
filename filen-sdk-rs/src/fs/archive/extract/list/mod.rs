@@ -7,7 +7,6 @@ use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 
 use crate::{
-	Error,
 	consts::CALLBACK_INTERVAL,
 	fs::{
 		HasUUID,
@@ -16,7 +15,7 @@ use crate::{
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
 			password::ArchivePassword,
-			worker::{WorkerEvent, WorkerLink, codec_failed, worker_died},
+			worker::{CodecStart, WorkerEvent, codec_failed, worker_died},
 		},
 		drive_job::{Fatal, backend::DriveBackend},
 		file::enums::RemoteFileType,
@@ -32,7 +31,7 @@ use super::{
 	DuplicateEntries, ExpansionLimit, ExtractConfig, ExtractSkipReason,
 	codec::ArchiveEnd,
 	engine::CodecResult,
-	report::{ArchiveEntryId, CALLBACK_BATCH, RunState},
+	report::{ArchiveEntryId, CALLBACK_BATCH, ReadsArchive, RunState},
 };
 
 /// What kind of item an archive entry is.
@@ -390,6 +389,12 @@ impl JobState for ListState {
 	}
 }
 
+impl ReadsArchive for ListState {
+	fn bytes_read(&mut self) -> &mut u64 {
+		&mut self.bytes_read
+	}
+}
+
 /// A listing's reporter: the job-agnostic [`job::report::Reporter`] over a [`ListState`].
 pub(crate) type ListReporter = job::report::Reporter<ListState>;
 
@@ -408,15 +413,6 @@ impl ListReporter {
 		)
 	}
 
-	pub(crate) fn set_bytes_read(&self, bytes_read: u64) {
-		self.with_state(|state| {
-			if state.bytes_read != bytes_read {
-				state.bytes_read = bytes_read;
-				state.core.mark_changed();
-			}
-		});
-	}
-
 	/// Delivered in a batch of up to [`CALLBACK_BATCH`] entries right before the next update.
 	pub(crate) fn listed(&self, entry: ArchiveEntry) {
 		let mut full = false;
@@ -427,7 +423,7 @@ impl ListReporter {
 			full = state.pending.len() >= CALLBACK_BATCH;
 		});
 		if full {
-			self.flush_then_call(|_| {});
+			self.update_now();
 		}
 	}
 }
@@ -472,7 +468,7 @@ pub(crate) struct ListTask<B> {
 	pub(crate) archive: RemoteFileType<'static>,
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
-	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	pub(crate) start: CodecStart<CodecResult>,
 }
 
 /// Runs a listing: waits for a job slot, starts the codec, and serves it the archive, collecting

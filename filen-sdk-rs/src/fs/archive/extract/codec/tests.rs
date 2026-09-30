@@ -106,21 +106,24 @@ fn run_job(archive: &[u8], job: StreamJob) -> (Vec<Seen>, Result<ArchiveEnd, Err
 	run_job_answering(job, |index| {
 		let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
 		let end = (start + CHUNK_SIZE).min(archive.len());
-		Ok(archive[start..end].to_vec())
+		Some(archive[start..end].to_vec())
 	})
 }
 
-/// As [`run_job`], each chunk the codec asks for answered by `answer`.
+/// As [`run_job`], each chunk the codec asks for answered by `answer`; `None` drops the ask
+/// unanswered, as a driver does when the fetch failed and stopped the job.
 fn run_job_answering(
 	job: StreamJob,
-	mut answer: impl FnMut(u64) -> std::io::Result<Vec<u8>>,
+	mut answer: impl FnMut(u64) -> Option<Vec<u8>>,
 ) -> (Vec<Seen>, Result<ArchiveEnd, Error>, u64) {
 	let mut link = worker::start(move |port| extract_stream(&port, job)).unwrap();
 	let mut seen = Vec::new();
 	while let Some(event) = link.events.blocking_recv() {
 		match event {
 			WorkerEvent::Ask { index, reply, .. } => {
-				let _ = reply.send(answer(index));
+				if let Some(chunk) = answer(index) {
+					let _ = reply.send(chunk);
+				}
 			}
 			WorkerEvent::Opened(layout) => seen.push(Seen::Opened(layout)),
 			WorkerEvent::Entry(head) => seen.push(match head.kind {
@@ -540,7 +543,7 @@ fn the_codec_stops_once_its_driver_is_gone() {
 	let Some(WorkerEvent::Ask { reply, .. }) = link.events.blocking_recv() else {
 		panic!("the codec asks for the archive first");
 	};
-	reply.send(Ok(archive)).unwrap();
+	reply.send(archive).unwrap();
 	drop(link);
 	let deadline = Instant::now() + Duration::from_secs(10);
 	while !exited.load(Ordering::SeqCst) {
@@ -1644,14 +1647,14 @@ fn a_zip_listing_stops_reading_symlink_targets_at_a_failed_fetch() {
 		|index| {
 			if index < index_from {
 				failed += 1;
-				return Err(std::io::Error::other("offline"));
+				return None;
 			}
 			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
-			Ok(zip[start..(start + CHUNK_SIZE).min(zip.len())].to_vec())
+			Some(zip[start..(start + CHUNK_SIZE).min(zip.len())].to_vec())
 		},
 	);
-	// the listing ends with the source's error, asking no more of it
-	assert_eq!(kind(end), ErrorKind::IO);
+	// the listing ends with the job, asking no more of the source
+	assert_eq!(kind(end), ErrorKind::Cancelled);
 	assert_eq!(failed, 1);
 }
 
@@ -2024,14 +2027,14 @@ fn a_7z_listing_ends_with_its_sources_failure_reading_a_link() {
 			if index >= index_from {
 				index_read = true;
 			} else if index_read {
-				return Err(std::io::Error::other("offline"));
+				return None;
 			}
 			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
-			Ok(sevenz[start..(start + CHUNK_SIZE).min(sevenz.len())].to_vec())
+			Some(sevenz[start..(start + CHUNK_SIZE).min(sevenz.len())].to_vec())
 		},
 	);
 	assert!(index_read);
-	assert_eq!(kind(end), ErrorKind::IO);
+	assert_eq!(kind(end), ErrorKind::Cancelled);
 }
 
 #[test]

@@ -7,13 +7,13 @@ use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::{
-		HasName, HasUUID,
-		categories::{DirType, Normal, fs::CategoryFS},
+		HasUUID,
+		categories::{DirType, Normal},
 		drive_job::{
-			backend::ClientBackend,
+			backend::{ClientBackend, list_dir_names},
 			exceeds_limit,
-			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
-			plan::{ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlanTotals},
+			listing::{ItemSource, ItemSourceDir, ScanError, SourceScan},
+			plan::{ItemPlan, ItemPlanner, PlanRequest, PlanTotals},
 		},
 		name::ValidatedName,
 	},
@@ -122,53 +122,21 @@ impl Client {
 				destinations.push(request.destination.clone());
 			}
 		}
-		let sources_total = dir_sources + destinations.len() as u64;
-		let bytes = ListingBytes::default();
-		let mut sources_done = 0;
-		let report = |sources_done| reporter.set_scan(bytes.scan(sources_done, sources_total));
-		report(sources_done);
+		let mut scan = SourceScan::new(reporter, control, dir_sources + destinations.len() as u64);
 
-		let ops = reporter.ops();
 		let mut planner = ItemPlanner::default();
 		for destination in destinations {
-			reporter.checkpoint(control).await?;
-			let listed = watch_listing(
-				Normal::list_dir(self, &destination, None::<&fn(u64, Option<u64>)>, ()),
-				&ops,
-				control,
-				|| report(sources_done),
-			);
-			let (dirs, files) = listed.await?.map_err(ScanError::Failed)?;
-			let names = dirs
-				.iter()
-				.filter_map(|d| d.name())
-				.chain(files.iter().filter_map(|f| f.name()));
-			planner.add_destination(destination.uuid(), names);
-			if dirs.iter().any(|d| d.name().is_none()) || files.iter().any(|f| f.name().is_none()) {
+			let listed = scan.list(list_dir_names(self, &destination)).await?;
+			planner.add_destination(destination.uuid(), listed.names.iter().map(String::as_str));
+			if listed.unverified {
 				planner.mark_unverified(destination.uuid());
 			}
-			sources_done += 1;
-			report(sources_done);
 		}
 
 		let mut planned = Vec::with_capacity(requests.len());
 		for request in requests {
-			let source = match request.source {
-				ItemSource::File(file) => PlanSource::File(file),
-				ItemSource::Dir(dir) => {
-					reporter.checkpoint(control).await?;
-					bytes.next_source();
-					let listing = self.list_item_source(dir, &bytes);
-					let source = watch_listing(listing, &ops, control, || report(sources_done))
-						.await?
-						.map_err(ScanError::Failed)?;
-					sources_done += 1;
-					report(sources_done);
-					source
-				}
-			};
 			planned.push(PlanRequest {
-				source,
+				source: scan.source(self, request.source).await?,
 				destination: request.destination.uuid(),
 				name: request.name,
 			});
@@ -208,7 +176,7 @@ fn plan_to_run(
 		),
 		Err(ScanError::Failed(error)) => (CopyPhase::Failed, error, PlanTotals::default()),
 	};
-	reporter.finish_unstarted(phase, totals);
+	reporter.finish_with_totals(phase, totals);
 	Err(Box::new(CopyFailed {
 		report: CopyReport {
 			totals,
@@ -237,7 +205,7 @@ mod tests {
 			copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
 			drive_job::{
 				counts::ItemCounts,
-				listing::ScanProgress,
+				listing::{ListingBytes, ScanProgress, watch_listing},
 				plan::{SkipReason, SkippedEntry},
 			},
 		},

@@ -10,7 +10,7 @@ use crate::{
 		entry_path::{ArchivePath, PathRejection, entry_path},
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
-		worker::{EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent},
+		worker::{EntryKind, LinkHead, WorkerEvent},
 	},
 	util::SeededMap,
 };
@@ -18,7 +18,9 @@ use crate::{
 use super::{
 	super::{ExtractSkipReason, list::ArchiveEntryKind},
 	Refused,
-	entries::{Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double},
+	entries::{
+		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,
+	},
 	failure, take_file,
 };
 
@@ -84,7 +86,7 @@ pub(super) fn walk_tar<R: Read>(
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
 		if let Some(target) = link_target {
-			let (event, shadow) = link_event(walk, &member, &found, path, target, &shadowed);
+			let (event, shadow) = link_event(walk, &found, path, target, &shadowed);
 			shadowed.note(key, shadow);
 			walk.port.send(event).map_err(failure)?;
 			continue;
@@ -92,12 +94,7 @@ pub(super) fn walk_tar<R: Read>(
 		if found.kind == ArchiveEntryKind::Dir {
 			shadowed.note(key, Some(Shadow::Other));
 			walk.port
-				.send(WorkerEvent::Entry(EntryHead {
-					ordinal: this,
-					path,
-					modified: found.modified,
-					kind: EntryKind::Dir,
-				}))
+				.send(found.head(path, EntryKind::Dir))
 				.map_err(failure)?;
 			continue;
 		}
@@ -133,15 +130,7 @@ fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
 		// a hard link with data of its own holds the file, as for libarchive
 		MemberKind::Hardlink { .. } if member.size > 0 => (ArchiveEntryKind::File, None),
 		MemberKind::Dir => (ArchiveEntryKind::Dir, None),
-		MemberKind::Symlink { target } => {
-			let target = display_path(target).0.to_owned();
-			(
-				ArchiveEntryKind::Symlink {
-					target: target.clone(),
-				},
-				Some(ExtractSkipReason::Symlink { target }),
-			)
-		}
+		MemberKind::Symlink { target } => symlink(display_path(target).0.to_owned()),
 		MemberKind::Hardlink { target } => (
 			ArchiveEntryKind::Hardlink {
 				target: display_path(target).0.to_owned(),
@@ -161,10 +150,7 @@ fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
 	Found {
 		ordinal,
 		stored: &member.path,
-		path: entry_path(&member.path).map(|mut path| {
-			path.rewritten |= member.path_rewritten;
-			path
-		}),
+		path: found_path(&member.path, member.path_rewritten),
 		kind,
 		unreadable,
 		size: member.size,
@@ -309,7 +295,6 @@ fn list_member<R: Read>(
 /// own path.
 fn link_event(
 	walk: &Walk,
-	member: &TarMember,
 	found: &Found,
 	path: ArchivePath,
 	(target, shown): HardlinkTarget,
@@ -317,14 +302,8 @@ fn link_event(
 ) -> (WorkerEvent, Option<Shadow>) {
 	// a copy of metadata left out is metadata left out, whatever path the link is at
 	let shadow = shadowed.at(&target);
-	let (path_shown, path_truncated) = display_path(&member.path);
-	let unresolved = SkippedMember {
-		ordinal: found.ordinal,
-		path: path_shown.to_owned(),
-		path_truncated,
-		bytes: 0,
-		reason: shadow.unwrap_or(Shadow::Other).link_skip(shown),
-	};
+	// a link holds no data of its own: its size is 0
+	let unresolved = found.skip_record(shadow.unwrap_or(Shadow::Other).link_skip(shown));
 	let target = match shadow {
 		Some(_) => None,
 		None => target.ok().and_then(|target| walk.within_base(target)),

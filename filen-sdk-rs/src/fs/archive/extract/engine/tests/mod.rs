@@ -127,11 +127,7 @@ struct Job {
 /// The method the tests' 7z archives are compressed with.
 const LZMA2: SevenZMethod = SevenZMethod::Lzma2 { level: 1 };
 
-fn start_with(
-	setup: &Setup,
-	options: Options,
-	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
-) -> Job {
+fn start_with(setup: &Setup, options: Options, start: CodecStart<CodecResult>) -> Job {
 	let probe: Probe = {
 		let memory = Arc::clone(&setup.backend.memory);
 		let budget = setup.backend.budget;

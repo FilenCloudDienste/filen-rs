@@ -14,17 +14,19 @@ use crate::{Error, ErrorKind};
 
 use super::{
 	super::{
+		bytes::read_full,
 		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
 		entry_path::{ArchivePath, entry_path},
 		format::{
 			ArchiveFormat, DETECT_HEAD_LEN, Detected, archive_stem, detect, is_end_marker,
 			is_tar_header,
 		},
+		limits::display_path,
 		password::ArchivePassword,
 		tar_iter::TAR_BLOCK_LEN,
 		worker::{
-			ChunkInput, EntryHead, EntryKind, JobEnded, SeekInput, SourceFailed, WorkerEvent,
-			WorkerPort, read_full, send_file_data,
+			ChunkInput, EntryKind, JobEnded, SeekInput, WorkerEvent, WorkerPort, from_source,
+			send_file_data,
 		},
 	},
 	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
@@ -103,8 +105,8 @@ const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 const LIST_READ_BYTES: u64 = 16 << 20;
 
 /// Reads a streaming archive through `port`, sending its entries. An error the driver caused
-/// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
-/// [`ErrorKind::IO`]; the driver knows the real one.
+/// (it went away, or a fetch failed and stopped the job) comes back as
+/// [`ErrorKind::Cancelled`]; the driver knows the real one.
 pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
 	let mut walk = Walk::new(
 		port,
@@ -259,15 +261,44 @@ fn take_file(
 	} else {
 		Vec::new()
 	};
-	walk.port.send(WorkerEvent::Entry(EntryHead {
-		ordinal: found.ordinal,
-		path,
-		modified: found.modified,
-		kind: EntryKind::File { size },
-	}))?;
+	walk.port.send(found.head(path, EntryKind::File { size }))?;
 	send_file_data(walk.port, &mut Cursor::new(head).chain(data))?;
 	walk.port.send(WorkerEvent::FileEnd)?;
 	Ok(1)
+}
+
+impl PasswordCheck {
+	/// Whether checking the password up front proved it (or that none is needed), for a zip or
+	/// 7z extraction; `required` or `wrong`, the format's own errors, when it ends the job.
+	fn verified<E>(self, required: E, wrong: E) -> Result<bool, E> {
+		match self {
+			Self::NotNeeded | Self::Right => Ok(true),
+			Self::Unchecked => Ok(false),
+			Self::Required => Err(required),
+			Self::Wrong => Err(wrong),
+		}
+	}
+}
+
+/// What damage in encrypted data is taken for while no entry proved the password: a wrong
+/// password is likelier than a damaged archive.
+fn likely_wrong_password() -> Error {
+	Error::custom(
+		ErrorKind::ArchiveWrongPassword,
+		"the password is likely wrong",
+	)
+}
+
+/// A symlink entry's target, for reporting, read from its `data` once opened: empty when its
+/// data is damaged or cannot be opened. Fails only on an error of the archive's source.
+fn link_target(data: io::Result<impl Read>) -> io::Result<String> {
+	let mut target = Vec::new();
+	match data.and_then(|mut data| data.read_to_end(&mut target)) {
+		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
+		Err(error) if from_source(&error) => Err(error),
+		// a damaged link keeps nothing else from being read
+		Err(_) => Ok(String::new()),
+	}
 }
 
 /// Refuses an archive whose entries state more than the [`ExpansionLimit`] lets it decode to:
@@ -277,7 +308,7 @@ fn check_stated_size(job: &StreamJob, sizes: impl IntoIterator<Item = u64>) -> R
 		.into_iter()
 		.fold(0u64, |total, size| total.saturating_add(size));
 	match job.limits.expansion {
-		Some(limit) if stated > limit.floor.max(job.len.saturating_mul(limit.ratio)) => {
+		Some(limit) if !limit.allows(job.len, stated) => {
 			Err(refused(Refused::Expansion(limit.ratio)))
 		}
 		_ => Ok(()),
@@ -305,16 +336,13 @@ impl<D: Read> Read for Expanding<'_, D> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		let n = self.inner.read(buf)?;
 		self.decoded += n as u64;
-		if let Some(limit) = self.limit {
-			let allowed = limit
-				.floor
-				.max(self.port.shared().input_bytes().saturating_mul(limit.ratio));
-			if self.decoded > allowed {
-				return Err(io::Error::new(
-					io::ErrorKind::InvalidData,
-					Refused::Expansion(limit.ratio),
-				));
-			}
+		if let Some(limit) = self.limit
+			&& !limit.allows(self.port.shared().input_bytes(), self.decoded)
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				Refused::Expansion(limit.ratio),
+			));
 		}
 		Ok(n)
 	}
@@ -366,14 +394,11 @@ fn failure(error: io::Error) -> Error {
 	match error.into_inner() {
 		Some(inner) => match inner.downcast::<Refused>() {
 			Ok(refusal) => refused(*refusal),
-			Err(inner) if inner.is::<JobEnded>() => {
-				Error::custom(ErrorKind::Cancelled, "the archive job ended")
-			}
-			Err(inner) if inner.is::<SourceFailed>() => {
-				Error::custom(ErrorKind::IO, inner.to_string())
-			}
-			// whatever else a read ended with came from a decoder: the data is damaged
-			Err(inner) => Error::custom(ErrorKind::ArchiveCorrupt, inner.to_string()),
+			Err(inner) => match inner.downcast::<JobEnded>() {
+				Ok(ended) => (*ended).into(),
+				// whatever else a read ended with came from a decoder: the data is damaged
+				Err(inner) => Error::custom(ErrorKind::ArchiveCorrupt, inner.to_string()),
+			},
 		},
 		None if kind == io::ErrorKind::UnexpectedEof => {
 			Error::custom(ErrorKind::ArchiveCorrupt, "the archive ends early")

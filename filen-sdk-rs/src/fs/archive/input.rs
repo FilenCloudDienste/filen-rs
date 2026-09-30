@@ -3,7 +3,7 @@
 //! client's memory has room right now, and hashed as it is read; and the one loop their drivers
 //! share to serve it, take its events and its result, and give it up when it stops moving.
 
-use std::{collections::VecDeque, io, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 
 use filen_types::crypto::Blake3Hash;
 use futures::{StreamExt, stream::FuturesOrdered};
@@ -32,8 +32,9 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture},
 };
 
-/// Chunks of the archive fetched ahead of the codec, memory permitting.
-const PREFETCH_CHUNKS: usize = 4;
+/// Chunks fetched ahead of a codec, memory permitting: of the archive it reads, or of the
+/// sources a compression reads.
+pub(crate) const PREFETCH_CHUNKS: usize = 4;
 
 /// A fetched chunk of the archive, with the memory it holds.
 type FetchedChunk = (u64, Result<Vec<u8>, Error>, OwnedSemaphorePermit, OpGuard);
@@ -99,7 +100,7 @@ struct ArchiveInput<B> {
 	hasher: blake3::Hasher,
 	/// The codec read the archive front to back, once: `hasher` covers it all.
 	sequential: bool,
-	ask: Option<(u64, oneshot::Sender<io::Result<Vec<u8>>>)>,
+	ask: Option<(u64, oneshot::Sender<Vec<u8>>)>,
 	/// The floor's input chunk.
 	slot: Arc<Semaphore>,
 	/// The client's file-IO budget, for what goes beyond the floor.
@@ -132,7 +133,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 
 	/// The codec asks for chunk `index`, which means it is done with the one before; answered
 	/// by [`Self::advance`] once the chunk is in.
-	fn ask(&mut self, index: u64, reply: oneshot::Sender<io::Result<Vec<u8>>>) {
+	fn ask(&mut self, index: u64, reply: oneshot::Sender<Vec<u8>>) {
 		self.reading = None;
 		if index != self.served {
 			// a jump (a zip is read from its end): what was fetched ahead is of no use
@@ -216,7 +217,7 @@ impl<B: DriveBackend> ArchiveInput<B> {
 		self.served += 1;
 		self.run += 1;
 		self.hasher.update_rayon(&data);
-		let _ = reply.send(Ok(data));
+		let _ = reply.send(data);
 	}
 
 	fn drop_prefetched(&mut self) {
@@ -507,7 +508,7 @@ mod tests {
 				.expect("the chunk asked for is fetched");
 			input.fetch_finished(fetched).unwrap();
 		}
-		answer.await.unwrap().unwrap();
+		answer.await.unwrap();
 		input.advance(ops);
 		input.next_fetch
 	}

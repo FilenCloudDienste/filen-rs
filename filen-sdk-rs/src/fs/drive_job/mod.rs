@@ -22,6 +22,10 @@ use crate::{
 	},
 };
 
+/// Chunks of one file in flight at once. More only helps a single large file; with several
+/// files running, the memory budget is the bound.
+pub(crate) const CHUNKS_PER_FILE: usize = 4;
+
 /// Errors after which nothing else can succeed either, so they end the whole job.
 pub(crate) fn ends_job(error: &Error) -> bool {
 	matches!(

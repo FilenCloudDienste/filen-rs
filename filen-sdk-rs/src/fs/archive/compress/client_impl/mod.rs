@@ -20,10 +20,10 @@ use crate::{
 		drive_job::{
 			backend::ClientBackend,
 			exceeds_limit,
-			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
+			listing::{ItemSource, ItemSourceDir, ScanError, SourceLister, SourceScan},
 			plan::{
-				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlannedItem,
-				RenameReason, RenamedEntry,
+				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlannedItem, RenameReason,
+				RenamedEntry,
 			},
 		},
 		file::{
@@ -148,25 +148,6 @@ impl Client {
 			read_back,
 		})
 		.await
-	}
-}
-
-/// Lists a compression's source directories: the client, or a test's fake.
-trait SourceLister {
-	async fn list_source(
-		&self,
-		dir: ItemSourceDir,
-		bytes: &ListingBytes,
-	) -> Result<PlanSource<ItemSourceDir>, Error>;
-}
-
-impl SourceLister for Client {
-	async fn list_source(
-		&self,
-		dir: ItemSourceDir,
-		bytes: &ListingBytes,
-	) -> Result<PlanSource<ItemSourceDir>, Error> {
-		self.list_item_source(dir, bytes).await
 	}
 }
 
@@ -327,15 +308,11 @@ async fn plan_sources(
 	control: &JobControl,
 ) -> Result<ItemPlan<ItemSourceDir>, ScanError> {
 	reporter.checkpoint(control).await?;
-	let sources_total = sources
+	let dir_sources = sources
 		.iter()
 		.filter(|source| matches!(source, ItemSource::Dir(_)))
 		.count() as u64;
-	let bytes = ListingBytes::default();
-	let ops = reporter.ops();
-	let mut sources_done = 0;
-	let report = |sources_done| reporter.set_scan(bytes.scan(sources_done, sources_total));
-	report(sources_done);
+	let mut scan = SourceScan::new(reporter, control, dir_sources);
 
 	// the archive's root: nothing is in it yet, and nothing is listed for it
 	let root = Uuid::new_v4();
@@ -343,22 +320,8 @@ async fn plan_sources(
 	planner.add_destination(root, std::iter::empty());
 	let mut requests = Vec::with_capacity(sources.len());
 	for source in sources {
-		let source = match source {
-			ItemSource::File(file) => PlanSource::File(file),
-			ItemSource::Dir(dir) => {
-				reporter.checkpoint(control).await?;
-				bytes.next_source();
-				let listing = lister.list_source(dir, &bytes);
-				let source = watch_listing(listing, &ops, control, || report(sources_done))
-					.await?
-					.map_err(ScanError::Failed)?;
-				sources_done += 1;
-				report(sources_done);
-				source
-			}
-		};
 		requests.push(PlanRequest {
-			source,
+			source: scan.source(lister, source).await?,
 			destination: root,
 			name: None,
 		});

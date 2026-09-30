@@ -20,6 +20,7 @@ use crate::{
 		},
 		categories::NonRootItemType,
 		drive_job::{
+			CHUNKS_PER_FILE,
 			backend::UploadSpec,
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
 			name_retry::NameRetry,
@@ -38,7 +39,7 @@ use super::{
 		},
 		storage_exceeded,
 	},
-	CHUNKS_PER_FILE, Driver, FileSlot, FileSource, NewFile,
+	Driver, FileSlot, FileSource, NewFile,
 	dirs::DirState,
 	links::LinkCopy,
 	record,

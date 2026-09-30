@@ -63,6 +63,11 @@ pub(super) struct DirSlot {
 }
 
 impl DirSlot {
+	/// The name the archive gave it.
+	fn archive_name(&self) -> &ValidatedName {
+		self.archive_name.as_ref().unwrap_or(&self.name)
+	}
+
 	pub(super) fn created_uuid(&self) -> Option<Uuid> {
 		match &self.state {
 			DirState::Created(uuid) => Some(*uuid),
@@ -310,7 +315,7 @@ impl<B: DisposalBackend> Driver<B> {
 				// picked, then possibly another the destination turned out to need)
 				let slot = &self.dirs[dir];
 				let entry = slot.entry;
-				if name.as_ref() != slot.archive_name.as_ref().unwrap_or(&slot.name).as_ref() {
+				if name != *slot.archive_name() {
 					let path = self.archive_path(dir);
 					self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
 				}
@@ -401,7 +406,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let mut names = Vec::new();
 		while dir != ROOT {
 			let slot = &self.dirs[dir];
-			names.push(slot.archive_name.as_ref().unwrap_or(&slot.name).clone());
+			names.push(slot.archive_name().clone());
 			dir = slot.parent;
 		}
 		names.extend(self.base.iter().rev().cloned());

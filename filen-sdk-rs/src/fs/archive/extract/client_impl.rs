@@ -9,7 +9,10 @@ use crate::{
 	auth::Client,
 	fs::{
 		HasName, HasUUID,
-		archive::{config::ArchiveConfig, worker},
+		archive::{
+			config::ArchiveConfig,
+			worker::{self, CodecStart},
+		},
 		drive_job::backend::ClientBackend,
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
@@ -20,7 +23,7 @@ use super::{
 	ArchiveEntryId, ArchiveSource, ArchiveTotals, ExtractCallback, ExtractConfig, ExtractFailed,
 	ExtractPhase, ExtractReport, ExtractRequest,
 	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
-	engine::{ExtractTask, run_extract},
+	engine::{CodecResult, ExtractTask, run_extract},
 	list::{
 		ArchiveListing, ListCallback, ListConfig, ListFailed, ListReporter, ListTask, run_list,
 	},
@@ -104,19 +107,14 @@ impl Client {
 				});
 			}
 		};
-		let archives = self.client().state().archives().clone();
+		let archives = self.archive_config().clone();
 		let base = selection
 			.as_ref()
 			.map(|selection| selection.base().to_vec())
 			.unwrap_or_default();
-		let job = StreamJob {
-			name: archive.name().unwrap_or_default().to_owned(),
-			len: archive.size(),
-			limits: codec_limits(&archives, &config),
-			password: config.password,
-			skip_mac_metadata: config.skip_mac_metadata,
-			task: Task::Extract(selection),
-		};
+		let (max_bytes, max_items, expansion) =
+			(config.max_bytes, config.max_items, config.expansion_limit);
+		let start = start_codec(&archive, &archives, config, Task::Extract(selection));
 		run_extract(ExtractTask {
 			backend: Arc::new(ClientBackend::new(self)),
 			control,
@@ -124,12 +122,12 @@ impl Client {
 			archive,
 			destination,
 			root,
-			max_bytes: config.max_bytes,
-			max_items: config.max_items,
-			expansion: config.expansion_limit,
+			max_bytes,
+			max_items,
+			expansion,
 			base,
 			config: archives,
-			start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
+			start,
 			dispose,
 			disposal_requested,
 		})
@@ -162,39 +160,46 @@ impl Client {
 		callback: impl ListCallback,
 		control: JobControl,
 	) -> Result<ArchiveListing, ListFailed> {
-		let archives = self.client().state().archives().clone();
-		let config = ExtractConfig::from(config);
-		let job = StreamJob {
-			name: archive.name().unwrap_or_default().to_owned(),
-			len: archive.size(),
-			limits: codec_limits(&archives, &config),
-			password: config.password,
-			skip_mac_metadata: config.skip_mac_metadata,
-			task: Task::List {
-				archive: archive.uuid(),
-			},
+		let archives = self.archive_config().clone();
+		let task = Task::List {
+			archive: archive.uuid(),
 		};
+		let start = start_codec(&archive, &archives, ExtractConfig::from(config), task);
 		run_list(ListTask {
 			backend: Arc::new(ClientBackend::new(self)),
 			control,
 			reporter: ListReporter::new(callback, archive.size()),
 			archive,
 			config: archives,
-			start: Box::new(move || worker::start(move |port| extract_stream(&port, job))),
+			start,
 		})
 		.await
 	}
 }
 
-/// What the codec may spend on an archive, from the client's settings and the job's.
-fn codec_limits(archives: &ArchiveConfig, config: &ExtractConfig) -> CodecLimits {
-	CodecLimits {
-		decoder_memory: archives.codec_mem_budget,
-		max_members: archives.max_members,
-		expansion: config.expansion_limit,
-		max_index_bytes: archives.max_index_bytes,
-		max_bytes: config.max_bytes,
-	}
+/// Starts the codec that reads `archive` for `task`, under the client's `archives` settings and
+/// the job's `config`.
+fn start_codec(
+	archive: &RemoteFileType<'static>,
+	archives: &ArchiveConfig,
+	config: ExtractConfig,
+	task: Task,
+) -> CodecStart<CodecResult> {
+	let job = StreamJob {
+		name: archive.name().unwrap_or_default().to_owned(),
+		len: archive.size(),
+		limits: CodecLimits {
+			decoder_memory: archives.codec_mem_budget,
+			max_members: archives.max_members,
+			expansion: config.expansion_limit,
+			max_index_bytes: archives.max_index_bytes,
+			max_bytes: config.max_bytes,
+		},
+		password: config.password,
+		skip_mac_metadata: config.skip_mac_metadata,
+		task,
+	};
+	Box::new(move || worker::start(move |port| extract_stream(&port, job)))
 }
 
 /// Checks `ids`, the entries chosen to extract, name some of `archive`'s.

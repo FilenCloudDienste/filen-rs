@@ -58,7 +58,7 @@ use crate::{
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
 			names::{DirId, PathResolver},
 			worker::{
-				EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerLink, codec_failed,
+				CodecStart, EntryHead, EntryKind, SkippedMember, WorkerEvent, codec_failed,
 				worker_died,
 			},
 		},
@@ -93,9 +93,6 @@ use crate::fs::drive_job::exceeds_limit;
 use dirs::{DirSlot, DirState};
 use links::{LinkCopy, LinkTargets, PendingLink, TakenLink};
 
-/// Chunks of one file uploading at once.
-const CHUNKS_PER_FILE: usize = 4;
-
 /// Directories planned and not created yet past which the codec is kept waiting: an archive
 /// naming directories faster than they are created (each entry can imply 256) has them planned
 /// only as fast as they are created.
@@ -125,7 +122,7 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) base: Vec<ValidatedName>,
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
-	pub(crate) start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	pub(crate) start: CodecStart<CodecResult>,
 	/// How to remove the archive once the extraction is verified, and the directory it is in.
 	pub(crate) dispose: Option<(SourceDisposal, Uuid)>,
 	/// Whether the caller asked for the archive to be removed, which `dispose` leaves out for an

@@ -5,7 +5,6 @@ use std::io::{self, Read, Seek};
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
-		entry_path::entry_path,
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		sevenz::{
@@ -16,7 +15,7 @@ use crate::{
 				wrong_key,
 			},
 		},
-		worker::{EntryHead, EntryKind, SeekInput, WorkerEvent, from_source},
+		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
 	},
 };
 
@@ -27,8 +26,8 @@ use super::{
 		storage_exceeded,
 	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
-	entries::{Found, MacShape, Verdict, Walk, apple_double},
-	failure, take_file,
+	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
+	failure, likely_wrong_password, link_target, take_file,
 };
 
 /// How a 7z entry's data is compressed, for display: its folder's coders, outermost first.
@@ -54,15 +53,10 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	keys: &mut Keys<'_>,
 	has_password: bool,
 ) -> Result<PasswordCheck, Error> {
-	let encrypted = |entry: &SevenZEntry| {
-		entry
-			.stream
-			.is_some_and(|stream| index.folders[stream.folder].encrypted())
-	};
 	if index.headers_encrypted {
 		return Ok(PasswordCheck::Right);
 	}
-	if !index.entries.iter().any(encrypted) {
+	if !index.entries.iter().any(|entry| index.encrypted(entry)) {
 		return Ok(PasswordCheck::NotNeeded);
 	}
 	if !has_password {
@@ -72,10 +66,10 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 		.entries
 		.iter()
 		.filter(|entry| {
-			encrypted(entry)
+			index.encrypted(entry)
 				&& entry.size > 0
 				&& entry.crc.is_some()
-				&& index.folders[entry.stream.expect("encrypted").folder].supported()
+				&& index.supported(entry)
 		})
 		.min_by_key(|entry| entry.stream.expect("encrypted").offset + entry.size)
 		.filter(|entry| {
@@ -111,67 +105,24 @@ fn sevenz_found<'e, 's, R: Read + Seek + 's>(
 	entry: &'e SevenZEntry,
 	keys: &mut Keys<'_>,
 ) -> Result<(Found<'e>, Option<Vec<u8>>), SevenZError> {
-	let supported = entry
-		.stream
-		.is_none_or(|stream| index.folders[stream.folder].supported());
-	let mut held = None;
-	let (kind, unreadable) = match entry.kind {
-		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
-		SevenZKind::Symlink => {
-			let target = sevenz_symlink_target(cursor, index, entry, keys)?;
-			(
-				ArchiveEntryKind::Symlink {
-					target: target.clone(),
-				},
-				Some(ExtractSkipReason::Symlink { target }),
-			)
-		}
-		SevenZKind::Dir => (ArchiveEntryKind::Dir, None),
-		_ if !supported => (
-			ArchiveEntryKind::File,
-			Some(ExtractSkipReason::UnsupportedMethod),
-		),
-		SevenZKind::Reparse => {
+	let mut found = sevenz_unread(index, entry);
+	let target = match entry.kind {
+		SevenZKind::Symlink => sevenz_symlink_target(cursor, index, entry, keys)?,
+		SevenZKind::Reparse if index.supported(entry) => {
 			let mut data = Vec::new();
 			cursor
 				.open(index, entry, keys)?
 				.read_to_end(&mut data)
 				.map_err(read_error)?;
 			match windows_link_target(&data) {
-				Some(target) => {
-					let target = display_path(&target).0.to_owned();
-					(
-						ArchiveEntryKind::Symlink {
-							target: target.clone(),
-						},
-						Some(ExtractSkipReason::Symlink { target }),
-					)
-				}
-				None => {
-					held = Some(data);
-					(ArchiveEntryKind::File, None)
-				}
+				Some(target) => display_path(&target).0.to_owned(),
+				None => return Ok((found, Some(data))),
 			}
 		}
-		SevenZKind::File => (ArchiveEntryKind::File, None),
+		_ => return Ok((found, None)),
 	};
-	let found = Found {
-		ordinal: entry.ordinal,
-		stored: &entry.name,
-		path: entry_path(&entry.name).map(|mut path| {
-			path.rewritten |= entry.name_rewritten;
-			path
-		}),
-		kind,
-		unreadable,
-		size: entry.size,
-		modified: entry.modified,
-		encrypted: entry
-			.stream
-			.is_some_and(|stream| index.folders[stream.folder].encrypted()),
-		method: sevenz_method(index, entry),
-	};
-	Ok((found, held))
+	(found.kind, found.unreadable) = symlink(target);
+	Ok((found, None))
 }
 
 /// A 7z read from `source`: its entries in header order, folder by folder, each checked against
@@ -219,29 +170,16 @@ pub(super) fn extract_sevenz(
 		index
 			.entries
 			.iter()
-			.filter(|entry| {
-				entry.kind == SevenZKind::File
-					&& entry
-						.stream
-						.is_none_or(|stream| index.folders[stream.folder].supported())
-			})
+			.filter(|entry| entry.kind == SevenZKind::File && index.supported(entry))
 			.map(|entry| (entry.ordinal, entry.name.as_str(), entry.size)),
 	);
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
-	let encrypted = |entry: &SevenZEntry| {
-		entry
-			.stream
-			.is_some_and(|stream| index.folders[stream.folder].encrypted())
-	};
 	let mut verified =
-		match check_sevenz_password(&mut cursor, &index, &mut keys, job.password.is_some())? {
-			PasswordCheck::NotNeeded | PasswordCheck::Right => true,
-			PasswordCheck::Unchecked => false,
-			PasswordCheck::Required => return Err(sevenz_failure(SevenZError::PasswordRequired)),
-			PasswordCheck::Wrong => return Err(sevenz_failure(SevenZError::WrongPassword)),
-		};
+		check_sevenz_password(&mut cursor, &index, &mut keys, job.password.is_some())?
+			.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
+			.map_err(sevenz_failure)?;
 
 	port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(failure)?;
@@ -249,17 +187,15 @@ pub(super) fn extract_sevenz(
 	// while the password is unchecked, damage in encrypted data is likelier a wrong password
 	// than a damaged archive
 	let judged = |error: Error, entry: &SevenZEntry, verified: bool| {
-		if !verified && encrypted(entry) && error.kind() == ErrorKind::ArchiveCorrupt {
-			Error::custom(
-				ErrorKind::ArchiveWrongPassword,
-				"the password is likely wrong",
-			)
+		if !verified && index.encrypted(entry) && error.kind() == ErrorKind::ArchiveCorrupt {
+			likely_wrong_password()
 		} else {
 			error
 		}
 	};
 	// whether reading an entry whole against its CRC-32 proved the password
-	let proves = |entry: &SevenZEntry| entry.crc.is_some() && encrypted(entry) && entry.size > 0;
+	let proves =
+		|entry: &SevenZEntry| entry.crc.is_some() && index.encrypted(entry) && entry.size > 0;
 	for entry in &index.entries {
 		// what is left out is not read: its name decides whether it is chosen
 		let verdict = walk.judge(&sevenz_unread(&index, entry))?;
@@ -282,13 +218,8 @@ pub(super) fn extract_sevenz(
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
 		if entry.kind == SevenZKind::Dir {
-			port.send(WorkerEvent::Entry(EntryHead {
-				ordinal: entry.ordinal,
-				path,
-				modified: entry.modified,
-				kind: EntryKind::Dir,
-			}))
-			.map_err(failure)?;
+			port.send(found.head(path, EntryKind::Dir))
+				.map_err(failure)?;
 			continue;
 		}
 		let sent = match (entry.stream, held) {
@@ -362,13 +293,10 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		// an encrypted link's data unread for a wrong or missing password leaves it listed as
 		// a link without its target; the archive's damage and its source's failures end the
 		// listing, as they end an extraction
-		let encrypted = entry
-			.stream
-			.is_some_and(|stream| index.folders[stream.folder].encrypted());
 		let found = match sevenz_found(cursor, index, entry, keys) {
 			Ok((found, _)) => found,
 			Err(error)
-				if encrypted
+				if index.encrypted(entry)
 					&& !source_failed(&error)
 					&& (checked == PasswordCheck::Wrong || !has_password) =>
 			{
@@ -399,21 +327,11 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 /// What a 7z entry is by its header alone: before its data is read, or when it cannot be (a
 /// link's under a wrong password).
 fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
-	let supported = entry
-		.stream
-		.is_none_or(|stream| index.folders[stream.folder].supported());
 	let (kind, unreadable) = match entry.kind {
 		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
-		SevenZKind::Symlink => (
-			ArchiveEntryKind::Symlink {
-				target: String::new(),
-			},
-			Some(ExtractSkipReason::Symlink {
-				target: String::new(),
-			}),
-		),
+		SevenZKind::Symlink => symlink(String::new()),
 		SevenZKind::Dir => (ArchiveEntryKind::Dir, None),
-		_ if !supported => (
+		_ if !index.supported(entry) => (
 			ArchiveEntryKind::File,
 			Some(ExtractSkipReason::UnsupportedMethod),
 		),
@@ -422,17 +340,12 @@ fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
 	Found {
 		ordinal: entry.ordinal,
 		stored: &entry.name,
-		path: entry_path(&entry.name).map(|mut path| {
-			path.rewritten |= entry.name_rewritten;
-			path
-		}),
+		path: found_path(&entry.name, entry.name_rewritten),
 		kind,
 		unreadable,
 		size: entry.size,
 		modified: entry.modified,
-		encrypted: entry
-			.stream
-			.is_some_and(|stream| index.folders[stream.folder].encrypted()),
+		encrypted: index.encrypted(entry),
 		method: sevenz_method(index, entry),
 	}
 }
@@ -466,21 +379,18 @@ fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 	entry: &SevenZEntry,
 	keys: &mut Keys<'_>,
 ) -> Result<String, SevenZError> {
-	let readable = entry
-		.stream
-		.is_some_and(|stream| index.folders[stream.folder].supported());
-	if !readable || entry.size > MAX_ARCHIVE_PATH_BYTES as u64 {
+	if entry.stream.is_none()
+		|| !index.supported(entry)
+		|| entry.size > MAX_ARCHIVE_PATH_BYTES as u64
+	{
 		return Ok(String::new());
 	}
-	let mut target = Vec::new();
-	let read = cursor
-		.open(index, entry, keys)
-		.and_then(|mut data| data.read_to_end(&mut target).map_err(read_error));
-	match read {
-		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
-		Err(error) if source_failed(&error) => Err(error),
-		Err(_) => Ok(String::new()),
-	}
+	let data = match cursor.open(index, entry, keys) {
+		Ok(data) => Ok(data),
+		Err(SevenZError::Read(error)) => Err(error),
+		Err(_) => return Ok(String::new()),
+	};
+	link_target(data).map_err(SevenZError::Read)
 }
 
 /// Whether reading an entry failed for the archive's source rather than the archive.

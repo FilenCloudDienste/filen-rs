@@ -446,10 +446,34 @@ pub(crate) fn nesting(within: &[Option<usize>]) -> Nesting {
 	Nesting { outermost, cyclic }
 }
 
-fn failed(error: Error) -> DisposalOutcome {
-	DisposalOutcome::kept(KeptReason::Failed {
-		error: Arc::new(error),
-	})
+impl KeptReason {
+	fn failed(error: Error) -> Self {
+		Self::Failed {
+			error: Arc::new(error),
+		}
+	}
+}
+
+/// Waits for one request of a removal's checks: a cancel through `control` drops it and keeps
+/// the source as interrupted, and a failed request keeps it as failed.
+async fn checked<T>(
+	control: &JobControl,
+	request: impl Future<Output = Result<T, Error>>,
+) -> Result<T, KeptReason> {
+	match control.until_stopping(request).await {
+		Ok(Ok(value)) => Ok(value),
+		Ok(Err(error)) => Err(KeptReason::failed(error)),
+		Err(Stopped) => Err(KeptReason::Interrupted),
+	}
+}
+
+/// Keeps the source as interrupted once the job is stopping, before a removal request that would
+/// not be dropped once sent.
+fn unless_stopping(control: &JobControl) -> Result<(), KeptReason> {
+	if control.is_stopping() {
+		return Err(KeptReason::Interrupted);
+	}
+	Ok(())
 }
 
 /// Takes the drive lock for one source's recheck and removal, waiting out a pause first so a
@@ -459,7 +483,7 @@ fn failed(error: Error) -> DisposalOutcome {
 async fn lock_for_removal<B: DisposalBackend>(
 	backend: &B,
 	removing: Removing<'_>,
-) -> Result<HeldLock<B::DriveLock>, DisposalOutcome> {
+) -> Result<HeldLock<B::DriveLock>, KeptReason> {
 	let Removing {
 		control,
 		ops,
@@ -467,13 +491,13 @@ async fn lock_for_removal<B: DisposalBackend>(
 	} = removing;
 	let held = loop {
 		if ops.checkpoint(control).await.is_err() {
-			return Err(DisposalOutcome::kept(KeptReason::Interrupted));
+			return Err(KeptReason::Interrupted);
 		}
 		match wait_for_lock(backend, control, ops).await {
 			Ok(LockWait::Locked(held)) => break held,
 			Ok(LockWait::Paused) => {}
-			Ok(LockWait::Failed(error)) => return Err(failed(error)),
-			Err(Stopped) => return Err(DisposalOutcome::kept(KeptReason::Interrupted)),
+			Ok(LockWait::Failed(error)) => return Err(KeptReason::failed(error)),
+			Err(Stopped) => return Err(KeptReason::Interrupted),
 		}
 	};
 	if let Some(output) = output {
@@ -482,15 +506,15 @@ async fn lock_for_removal<B: DisposalBackend>(
 			.await
 		{
 			Ok(Ok(state)) if output.stands(&state) => {}
-			Ok(Ok(_)) => return Err(DisposalOutcome::kept(KeptReason::Unconfirmed)),
+			Ok(Ok(_)) => return Err(KeptReason::Unconfirmed),
 			Ok(Err(error)) => {
 				tracing::warn!(
 					"file {}: failed to confirm it before removing a source: {error}",
 					output.uuid
 				);
-				return Err(DisposalOutcome::kept(KeptReason::Unconfirmed));
+				return Err(KeptReason::Unconfirmed);
 			}
-			Err(Stopped) => return Err(DisposalOutcome::kept(KeptReason::Interrupted)),
+			Err(Stopped) => return Err(KeptReason::Interrupted),
 		}
 	}
 	Ok(held)
@@ -506,38 +530,7 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	how: SourceDisposal,
 	removing: Removing<'_>,
 ) -> DisposalOutcome {
-	let control = removing.control;
-	let _lock = match lock_for_removal(backend, removing).await {
-		Ok(lock) => lock,
-		Err(outcome) => return outcome,
-	};
-	let state = match control.until_stopping(backend.file_state(file.uuid)).await {
-		Ok(Ok(state)) => state,
-		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
-	};
-	if !file.matches(&state) {
-		return DisposalOutcome::kept(KeptReason::Changed);
-	}
-	if how == SourceDisposal::DeletePermanently {
-		match control
-			.until_stopping(backend.has_older_versions(file.uuid))
-			.await
-		{
-			Ok(Ok(false)) => {}
-			Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
-			Ok(Err(error)) => return failed(error),
-			Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
-		}
-	}
-	if control.is_stopping() {
-		return DisposalOutcome::kept(KeptReason::Interrupted);
-	}
-	let removed = match how {
-		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
-		SourceDisposal::DeletePermanently => backend.delete_file_permanently(file.uuid).await,
-	};
-	match removed {
+	match remove_file(backend, file, how, removing).await {
 		Ok(()) => DisposalOutcome::Disposed {
 			how,
 			bytes_freed: match how {
@@ -545,8 +538,32 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 				SourceDisposal::DeletePermanently => file.size,
 			},
 		},
-		Err(error) => failed(error),
+		Err(reason) => DisposalOutcome::kept(reason),
 	}
+}
+
+async fn remove_file<B: DisposalBackend>(
+	backend: &B,
+	file: ExpectedFile,
+	how: SourceDisposal,
+	removing: Removing<'_>,
+) -> Result<(), KeptReason> {
+	let _lock = lock_for_removal(backend, removing).await?;
+	let control = removing.control;
+	if !file.matches(&checked(control, backend.file_state(file.uuid)).await?) {
+		return Err(KeptReason::Changed);
+	}
+	if how == SourceDisposal::DeletePermanently
+		&& checked(control, backend.has_older_versions(file.uuid)).await?
+	{
+		return Err(KeptReason::HasVersions);
+	}
+	unless_stopping(control)?;
+	match how {
+		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
+		SourceDisposal::DeletePermanently => backend.delete_file_permanently(file.uuid).await,
+	}
+	.map_err(KeptReason::failed)
 }
 
 /// Removes one directory source if it is still where the job read it, out of the trash, and
@@ -561,87 +578,62 @@ pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	removing: Removing<'_>,
 	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
-	let (dir, read) = (expected.uuid, &expected.read);
-	let control = removing.control;
-	let _lock = match lock_for_removal(backend, removing).await {
-		Ok(lock) => lock,
-		Err(outcome) => return outcome,
-	};
-	match control.until_stopping(backend.dir_state(dir)).await {
-		Ok(Ok(state)) if expected.matches(&state) => {}
-		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),
-		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
-	}
-	match control.until_stopping(backend.list_tree(dir)).await {
-		Ok(Ok(listed)) if listed == *read => {}
-		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),
-		Ok(Err(error)) => return failed(error),
-		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
-	}
-	let mut bytes_freed = 0;
 	// once files are deleted, whatever stops the removal leaves them deleted: every outcome says
 	// how many
-	let partly = |reason, bytes_freed| DisposalOutcome::Kept {
-		reason,
-		bytes_freed,
-	};
+	let mut bytes_freed = 0;
+	match remove_dir(backend, expected, how, removing, deleted, &mut bytes_freed).await {
+		Ok(()) => DisposalOutcome::Disposed { how, bytes_freed },
+		Err(reason) => DisposalOutcome::Kept {
+			reason,
+			bytes_freed,
+		},
+	}
+}
+
+async fn remove_dir<B: DisposalBackend>(
+	backend: &B,
+	expected: &ExpectedDir,
+	how: SourceDisposal,
+	removing: Removing<'_>,
+	deleted: &mut BTreeSet<Uuid>,
+	bytes_freed: &mut u64,
+) -> Result<(), KeptReason> {
+	let (dir, read) = (expected.uuid, &expected.read);
+	let _lock = lock_for_removal(backend, removing).await?;
+	let control = removing.control;
+	if !expected.matches(&checked(control, backend.dir_state(dir)).await?)
+		|| checked(control, backend.list_tree(dir)).await? != *read
+	{
+		return Err(KeptReason::Changed);
+	}
 	if how == SourceDisposal::DeletePermanently {
 		// every file is checked before any is deleted: a directory is removed whole or not at
 		// all for this reason
 		for &uuid in read.files.keys() {
-			match control
-				.until_stopping(backend.has_older_versions(uuid))
-				.await
-			{
-				Ok(Ok(false)) => {}
-				Ok(Ok(true)) => return DisposalOutcome::kept(KeptReason::HasVersions),
-				Ok(Err(error)) => return failed(error),
-				Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
+			if checked(control, backend.has_older_versions(uuid)).await? {
+				return Err(KeptReason::HasVersions);
 			}
 		}
 		for (&uuid, &size) in &read.files {
-			if control.is_stopping() {
-				return partly(KeptReason::Interrupted, bytes_freed);
-			}
-			if let Err(error) = backend.delete_file_permanently(uuid).await {
-				return partly(
-					KeptReason::Failed {
-						error: Arc::new(error),
-					},
-					bytes_freed,
-				);
-			}
-			bytes_freed += size;
+			unless_stopping(control)?;
+			backend
+				.delete_file_permanently(uuid)
+				.await
+				.map_err(KeptReason::failed)?;
+			*bytes_freed += size;
 			deleted.insert(uuid);
 		}
 		// only a directory the job emptied is trashed: anything that arrived since stays
-		match control.until_stopping(backend.list_tree(dir)).await {
-			Ok(Ok(left)) if left.files.is_empty() => {}
-			Ok(Ok(_)) => return partly(KeptReason::Changed, bytes_freed),
-			Ok(Err(error)) => {
-				return partly(
-					KeptReason::Failed {
-						error: Arc::new(error),
-					},
-					bytes_freed,
-				);
-			}
-			Err(Stopped) => return partly(KeptReason::Interrupted, bytes_freed),
+		if !checked(control, backend.list_tree(dir))
+			.await?
+			.files
+			.is_empty()
+		{
+			return Err(KeptReason::Changed);
 		}
 	}
-	if control.is_stopping() {
-		return partly(KeptReason::Interrupted, bytes_freed);
-	}
-	match backend.trash_dir(dir).await {
-		Ok(()) => DisposalOutcome::Disposed { how, bytes_freed },
-		Err(error) => partly(
-			KeptReason::Failed {
-				error: Arc::new(error),
-			},
-			bytes_freed,
-		),
-	}
+	unless_stopping(control)?;
+	backend.trash_dir(dir).await.map_err(KeptReason::failed)
 }
 
 #[cfg(test)]

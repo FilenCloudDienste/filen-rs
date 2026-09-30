@@ -27,7 +27,7 @@ use crate::{
 				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
 			},
-			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
+			config::{CHUNK_BYTES, CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			decode::open_stream,
 			dispose::{
 				DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, SourceDisposal, Tree,
@@ -231,7 +231,7 @@ fn start_with(
 	format: CompressFormat,
 	control: JobControl,
 	max_bytes: Option<u64>,
-	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	start: CodecStart<CodecResult>,
 ) -> Job {
 	start_disposing(
 		setup,
@@ -252,7 +252,7 @@ fn start_disposing(
 	format: CompressFormat,
 	control: JobControl,
 	max_bytes: Option<u64>,
-	start: Box<dyn FnOnce() -> Result<WorkerLink<CodecResult>, Error> + Send>,
+	start: CodecStart<CodecResult>,
 	disposal: Option<CompressDisposal>,
 	report: CompressReport,
 ) -> Job {
@@ -555,6 +555,34 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	setup_cancel.backend.assert_released(&job.reporter);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_chunk_that_comes_back_short_ends_the_job() {
+	let setup = setup(|backend, files| {
+		// made-up data, whose last chunk comes back a byte short
+		backend.contents.remove(&files[1].uuid());
+		backend.short_reads.insert("big.bin".to_owned());
+	});
+	let job = start(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+	);
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Response);
+	assert!(
+		failed
+			.error
+			.to_string()
+			.contains(&SOURCE_UUIDS[1].to_string()),
+		"the error names the source: {}",
+		failed.error
+	);
+	assert!(setup.backend.log().finished.is_empty());
+	setup.backend.assert_released(&job.reporter);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_silent_codec_is_given_up_on() {
 	let setup = setup(|_, _| {});
@@ -602,7 +630,7 @@ async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	tokio::time::sleep(2 * ARCHIVE_STALL_TIMEOUT).await;
 	assert!(!job.running.is_finished());
 	setup.backend.release_all();
-	assert_eq!(answer.await.unwrap().unwrap(), setup.contents[0]);
+	assert_eq!(answer.await.unwrap(), setup.contents[0]);
 
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
@@ -1594,7 +1622,7 @@ async fn read_into_the_second_source(events: &mpsc::Sender<WorkerEvent>) {
 			})
 			.await
 			.unwrap();
-		answer.await.unwrap().unwrap();
+		answer.await.unwrap();
 	}
 }
 
@@ -1926,7 +1954,7 @@ async fn dispose_scripted(setup: &Setup, archive: &[u8]) -> Job {
 			})
 			.await
 			.unwrap();
-		answer.await.unwrap().unwrap();
+		answer.await.unwrap();
 		if last {
 			events.send(WorkerEvent::FileEnd).await.unwrap();
 		}
@@ -2026,7 +2054,7 @@ async fn a_slow_read_back_is_not_given_up_on() {
 		.await;
 	tokio::time::sleep(2 * ARCHIVE_STALL_TIMEOUT).await;
 	setup.backend.release_all();
-	answer.await.unwrap().unwrap();
+	answer.await.unwrap();
 	reader.shared.note_scripted_progress();
 	// and takes longer over the entries than a silent one is given, never as long over one
 	for found in found_in_the_archive(&setup) {

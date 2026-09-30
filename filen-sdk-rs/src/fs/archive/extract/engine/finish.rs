@@ -2,7 +2,7 @@
 //! meanwhile, and the archive removed once what it held is verified to be in the drive; or, after
 //! a wrong password showed late, the directories it created trashed.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use filen_types::fs::Uuid;
 use futures::future::join_all;
@@ -98,12 +98,7 @@ impl<B: DisposalBackend> Driver<B> {
 				}))
 				.await;
 				for (dest_uuid, errors) in propagated {
-					for error in errors {
-						self.reporter.event(ExtractEvent::PropagationFailed {
-							dest_uuid,
-							error: Arc::new(error),
-						});
-					}
+					self.report_propagation(dest_uuid, errors);
 				}
 				next = end;
 				self.reporter.tick();

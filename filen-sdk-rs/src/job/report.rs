@@ -341,6 +341,15 @@ impl<S: JobState> Reporter<S> {
 		call(&self.callback);
 	}
 
+	/// Sends an update carrying everything so far, at once. Used by the archive jobs, which the
+	/// service-worker build leaves out.
+	#[cfg(feature = "archive")]
+	pub(crate) fn update_now(&self) {
+		let now = self.now();
+		let mut state = self.lock();
+		self.flush(&mut state, now);
+	}
+
 	fn flush(&self, state: &mut S, now: Duration) {
 		let progress = state.progress();
 		let snapshot = state.core().snapshot(now, progress);
@@ -441,6 +450,11 @@ impl<S: JobState> Reporter<S> {
 				core.mark_urgent();
 			}
 		});
+	}
+
+	/// Queues `event` for the next update.
+	pub(crate) fn event(&self, event: S::Event) {
+		self.with_state(|state| state.core().push(event));
 	}
 
 	/// The last update of a job, sent at once.

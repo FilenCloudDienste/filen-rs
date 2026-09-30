@@ -10,12 +10,17 @@ use std::{
 	ops::RangeInclusive,
 };
 
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use filen_macros::js_type;
+
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
 use crate::{
 	Error,
-	fs::archive::{encode::check_level, password::ArchivePassword},
+	fs::archive::{
+		bytes::{Counting, copy_with_crc},
+		encode::check_level,
+		password::ArchivePassword,
+	},
 };
 
 use super::{
@@ -107,24 +112,6 @@ struct CentralEntry {
 	dir: bool,
 }
 
-/// Counts what goes through to `inner`.
-struct Counting<W> {
-	inner: W,
-	written: u64,
-}
-
-impl<W: Write> Write for Counting<W> {
-	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		let n = self.inner.write(buf)?;
-		self.written += n as u64;
-		Ok(n)
-	}
-
-	fn flush(&mut self) -> io::Result<()> {
-		self.inner.flush()
-	}
-}
-
 pub(crate) struct ZipWriter<W> {
 	out: Counting<W>,
 	entries: Vec<CentralEntry>,
@@ -136,28 +123,10 @@ pub(crate) struct ZipWriter<W> {
 impl<W: Write> ZipWriter<W> {
 	pub(crate) fn new(out: W) -> Self {
 		Self {
-			out: Counting {
-				inner: out,
-				written: 0,
-			},
+			out: Counting::new(out, 0),
 			entries: Vec::new(),
 			#[cfg(test)]
 			zip64_entry_threshold: ZIP64_ENTRY_THRESHOLD,
-		}
-	}
-
-	/// A writer whose archive already holds `written` bytes that `out` never sees, and which
-	/// writes an entry of `zip64_entry_threshold` bytes or more with zip64 sizes: the zip64
-	/// records of an archive past 4 GiB, without writing 4 GiB.
-	#[cfg(test)]
-	pub(crate) fn past(out: W, written: u64, zip64_entry_threshold: u64) -> Self {
-		Self {
-			out: Counting {
-				inner: out,
-				written,
-			},
-			entries: Vec::new(),
-			zip64_entry_threshold,
 		}
 	}
 
@@ -232,9 +201,7 @@ impl<W: Write> ZipWriter<W> {
 		write_local_header(&mut self.out, &entry, zip64)?;
 
 		let start = self.out.written;
-		let mut crc = crc32fast::Hasher::new();
-		let mut read = 0u64;
-		{
+		let (read, crc) = {
 			// data → compression → encryption → the archive
 			let encrypted: Box<dyn Finish + '_> = match &encryption {
 				None => Box::new(Plain(&mut self.out)),
@@ -256,28 +223,14 @@ impl<W: Write> ZipWriter<W> {
 					bzip2::Compression::new(level),
 				)),
 			};
-			let mut buf = vec![0u8; 64 * 1024];
-			loop {
-				let n = match data.read(&mut buf) {
-					Ok(0) => break,
-					Ok(n) => n,
-					Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-					Err(e) => return Err(e),
-				};
-				crc.update(&buf[..n]);
-				read += n as u64;
-				compressed.write_all(&buf[..n])?;
-			}
+			let copied = copy_with_crc(data, &mut compressed)?;
 			compressed.finish_into()?.finish()?;
-		}
+			copied
+		};
 		entry.compressed_size = self.out.written - start;
 		entry.size = read;
 		// AE-2 stores no CRC: the authentication code covers the data instead
-		entry.crc = if encryption.is_some() {
-			0
-		} else {
-			crc.finalize()
-		};
+		entry.crc = if encryption.is_some() { 0 } else { crc };
 		let out = &mut self.out;
 		out.write_all(&DATA_DESCRIPTOR_SIG.to_le_bytes())?;
 		out.write_all(&entry.crc.to_le_bytes())?;
@@ -577,6 +530,26 @@ impl<'b> FinishInto for bzip2::write::BzEncoder<Box<dyn Finish + 'b>> {
 		Self: 'a,
 	{
 		(*self).finish()
+	}
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::io::Write;
+
+	use super::{Counting, ZipWriter};
+
+	impl<W: Write> ZipWriter<W> {
+		/// A writer whose archive already holds `written` bytes that `out` never sees, and
+		/// which writes an entry of `zip64_entry_threshold` bytes or more with zip64 sizes: the
+		/// zip64 records of an archive past 4 GiB, without writing 4 GiB.
+		pub(crate) fn past(out: W, written: u64, zip64_entry_threshold: u64) -> Self {
+			Self {
+				out: Counting::new(out, written),
+				entries: Vec::new(),
+				zip64_entry_threshold,
+			}
+		}
 	}
 }
 

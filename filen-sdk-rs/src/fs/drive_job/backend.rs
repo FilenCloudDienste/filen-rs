@@ -15,7 +15,8 @@ use crate::{
 	connect::ConnectedTargets,
 	crypto,
 	fs::{
-		categories::{NonRootItemType, Normal},
+		HasName,
+		categories::{DirType, NonRootItemType, Normal, fs::CategoryFS},
 		dir::{RemoteDirectory, client_impl::CreateDirOutcome},
 		file::{
 			BaseFile, FileBuilder, RemoteFile,
@@ -41,13 +42,32 @@ pub(crate) enum CreatedDir {
 }
 
 /// The names a directory holds.
-#[cfg(feature = "archive")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ListedNames {
 	pub(crate) names: Vec<String>,
 	/// Some items' names could not be decrypted, so a name picked to be free among `names` may
 	/// still be taken.
 	pub(crate) unverified: bool,
+}
+
+/// Lists the names of the items in `dir`, a job's destination.
+pub(crate) async fn list_dir_names(
+	client: &Client,
+	dir: &DirType<'_, Normal>,
+) -> Result<ListedNames, Error> {
+	let (dirs, files) = Normal::list_dir(client, dir, None::<&fn(u64, Option<u64>)>, ()).await?;
+	let mut listed = ListedNames::default();
+	for name in dirs
+		.iter()
+		.map(|d| d.name())
+		.chain(files.iter().map(|f| f.name()))
+	{
+		match name {
+			Some(name) => listed.names.push(name.to_owned()),
+			None => listed.unverified = true,
+		}
+	}
+	Ok(listed)
 }
 
 /// What a new file is created as.
@@ -79,7 +99,7 @@ pub(crate) trait DriveBackend: MaybeSendSync + 'static {
 	#[cfg(feature = "archive")]
 	fn list_dir_names(
 		&self,
-		dir: &crate::fs::categories::DirType<'static, Normal>,
+		dir: &DirType<'static, Normal>,
 	) -> impl Future<Output = Result<ListedNames, Error>> + MaybeSend;
 	/// Creates `name` in `parent` under the given `uuid`. The caller holds the drive lock.
 	/// Unlike [`Client::create_dir`](crate::auth::Client::create_dir) it does not propagate
@@ -177,26 +197,8 @@ impl DriveBackend for ClientBackend {
 	}
 
 	#[cfg(feature = "archive")]
-	async fn list_dir_names(
-		&self,
-		dir: &crate::fs::categories::DirType<'static, Normal>,
-	) -> Result<ListedNames, Error> {
-		use crate::fs::{HasName, categories::fs::CategoryFS};
-
-		let (dirs, files) =
-			Normal::list_dir(&self.client, dir, None::<&fn(u64, Option<u64>)>, ()).await?;
-		let mut listed = ListedNames::default();
-		for name in dirs
-			.iter()
-			.map(|d| d.name())
-			.chain(files.iter().map(|f| f.name()))
-		{
-			match name {
-				Some(name) => listed.names.push(name.to_owned()),
-				None => listed.unverified = true,
-			}
-		}
-		Ok(listed)
+	async fn list_dir_names(&self, dir: &DirType<'static, Normal>) -> Result<ListedNames, Error> {
+		list_dir_names(&self.client, dir).await
 	}
 
 	async fn create_dir_unpropagated(

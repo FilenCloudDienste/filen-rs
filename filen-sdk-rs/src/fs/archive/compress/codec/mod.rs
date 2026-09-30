@@ -14,7 +14,10 @@ use super::{
 		sevenz::write::SevenZWriter,
 		tar_iter::{TAR_BLOCK, USTAR_NAME_LEN},
 		worker::{ChunkInput, ChunkSink, JobEnded, WorkerEvent, WorkerPort},
-		zip::write::{Encryption, ZipWriter},
+		zip::{
+			crypto::AesStrength,
+			write::{Encryption, ZipMethod, ZipWriter},
+		},
 	},
 	CompressFormat,
 };
@@ -45,7 +48,7 @@ pub(crate) struct CompressJob {
 }
 
 /// Writes the archive through `port`; returns its length. An error the driver caused (it went
-/// away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or [`ErrorKind::IO`]; the
+/// away, or a fetch failed and stopped the job) comes back as [`ErrorKind::Cancelled`]; the
 /// driver knows the real one.
 pub(crate) fn compress(port: &WorkerPort, job: CompressJob) -> Result<u64, Error> {
 	compress_with(port, job, ZipWriter::new)
@@ -75,48 +78,8 @@ fn compress_with<'p>(
 			encoder.finish().map_err(failure)?.finish().map_err(failure)
 		}
 		CompressFormat::Zip { method, encryption } => {
-			let password = match (encryption, &job.password) {
-				(None, _) => None,
-				(Some(strength), Some(password)) => Some((strength, password)),
-				(Some(_), None) => {
-					return Err(Error::custom(
-						ErrorKind::ArchivePasswordRequired,
-						"an encrypted zip needs a password",
-					));
-				}
-			};
-			let mut zip = zip_writer(sink);
-			for entry in job.entries {
-				match entry {
-					ArchiveEntry::Dir { path, modified } => {
-						zip.add_dir(&path, modified).map_err(failure)?;
-					}
-					ArchiveEntry::File {
-						source,
-						path,
-						size,
-						modified,
-					} => {
-						let encryption = password.map(|(strength, password)| {
-							// a fresh salt per entry, so no two entries share a key
-							let mut salt = vec![0u8; strength.salt_len()];
-							rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
-							Encryption {
-								password,
-								strength,
-								salt,
-							}
-						});
-						let mut data = ChunkInput::new(port, source, size);
-						let read = zip
-							.add_file(&path, modified, size, method, encryption, &mut data)
-							.map_err(failure)?;
-						check_length(read, size)?;
-						port.send(WorkerEvent::FileEnd).map_err(failure)?;
-					}
-				}
-			}
-			zip.finish().map_err(failure)?.finish().map_err(failure)
+			let password = with_password(encryption, job.password.as_ref(), "zip")?;
+			write_zip(port, zip_writer(sink), job.entries, method, password)
 		}
 		CompressFormat::SevenZ {
 			method,
@@ -125,39 +88,10 @@ fn compress_with<'p>(
 		} => {
 			// a 7z's start points at its header, so its first chunk is sent last
 			drop(sink);
-			let password = match (encryption, &job.password) {
-				(None, _) => None,
-				(Some(what), Some(password)) => Some((what, password)),
-				(Some(_), None) => {
-					return Err(Error::custom(
-						ErrorKind::ArchivePasswordRequired,
-						"an encrypted 7z needs a password",
-					));
-				}
-			};
-			let mut writer =
-				SevenZWriter::new(ChunkSink::holding_head(port), method, solid, password)
-					.map_err(failure)?;
-			for entry in job.entries {
-				match entry {
-					ArchiveEntry::Dir { path, modified } => writer.add_dir(&path, modified),
-					ArchiveEntry::File {
-						source,
-						path,
-						size,
-						modified,
-					} => {
-						let mut data = ChunkInput::new(port, source, size);
-						let read = writer
-							.add_file(&path, modified, size, &mut data)
-							.map_err(failure)?;
-						check_length(read, size)?;
-						port.send(WorkerEvent::FileEnd).map_err(failure)?;
-					}
-				}
-			}
-			let (sink, start) = writer.finish().map_err(failure)?;
-			sink.finish_with_head(&start).map_err(failure)
+			let password = with_password(encryption, job.password.as_ref(), "7z")?;
+			let writer = SevenZWriter::new(ChunkSink::holding_head(port), method, solid, password)
+				.map_err(failure)?;
+			write_7z(port, writer, job.entries)
 		}
 		CompressFormat::Single { compression } => {
 			let [ArchiveEntry::File { source, size, .. }] = job.entries[..] else {
@@ -168,11 +102,87 @@ fn compress_with<'p>(
 			};
 			let mut encoder: Box<dyn StreamEncoder<ChunkSink<'_>>> =
 				open_encoder(compression, sink)?;
-			copy_source(port, source, size, &mut encoder)?;
-			port.send(WorkerEvent::FileEnd).map_err(failure)?;
+			write_source(port, source, size, |data| io::copy(data, &mut encoder))?;
 			encoder.finish().map_err(failure)?.finish().map_err(failure)
 		}
 	}
+}
+
+/// The password an encrypted `format` is written with, paired with its encryption settings.
+fn with_password<'p, T>(
+	encryption: Option<T>,
+	password: Option<&'p ArchivePassword>,
+	format: &str,
+) -> Result<Option<(T, &'p ArchivePassword)>, Error> {
+	match (encryption, password) {
+		(None, _) => Ok(None),
+		(Some(encryption), Some(password)) => Ok(Some((encryption, password))),
+		(Some(_), None) => Err(Error::custom(
+			ErrorKind::ArchivePasswordRequired,
+			format!("an encrypted {format} needs a password"),
+		)),
+	}
+}
+
+fn write_zip(
+	port: &WorkerPort,
+	mut zip: ZipWriter<ChunkSink<'_>>,
+	entries: Vec<ArchiveEntry>,
+	method: ZipMethod,
+	password: Option<(AesStrength, &ArchivePassword)>,
+) -> Result<u64, Error> {
+	for entry in entries {
+		match entry {
+			ArchiveEntry::Dir { path, modified } => {
+				zip.add_dir(&path, modified).map_err(failure)?;
+			}
+			ArchiveEntry::File {
+				source,
+				path,
+				size,
+				modified,
+			} => {
+				let encryption = password.map(|(strength, password)| {
+					// a fresh salt per entry, so no two entries share a key
+					let mut salt = vec![0u8; strength.salt_len()];
+					rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
+					Encryption {
+						password,
+						strength,
+						salt,
+					}
+				});
+				write_source(port, source, size, |data| {
+					zip.add_file(&path, modified, size, method, encryption, data)
+				})?;
+			}
+		}
+	}
+	zip.finish().map_err(failure)?.finish().map_err(failure)
+}
+
+fn write_7z(
+	port: &WorkerPort,
+	mut writer: SevenZWriter<ChunkSink<'_>>,
+	entries: Vec<ArchiveEntry>,
+) -> Result<u64, Error> {
+	for entry in entries {
+		match entry {
+			ArchiveEntry::Dir { path, modified } => writer.add_dir(&path, modified),
+			ArchiveEntry::File {
+				source,
+				path,
+				size,
+				modified,
+			} => {
+				write_source(port, source, size, |data| {
+					writer.add_file(&path, modified, size, data)
+				})?;
+			}
+		}
+	}
+	let (sink, start) = writer.finish().map_err(failure)?;
+	sink.finish_with_head(&start).map_err(failure)
 }
 
 fn write_tar<W: Write>(
@@ -194,15 +204,15 @@ fn write_tar<W: Write>(
 				modified,
 			} => {
 				let mut header = header(tar::EntryType::Regular, 0o644, size, modified);
-				let mut data = Counted {
-					inner: ChunkInput::new(port, source, size),
-					read: 0,
-				};
-				// a path over 100 bytes goes into a GNU long-name record
-				tar.append_data(&mut header, &path, &mut data)
-					.map_err(failure)?;
-				check_length(data.read, size)?;
-				port.send(WorkerEvent::FileEnd).map_err(failure)?;
+				write_source(port, source, size, |data| {
+					let mut data = Counted {
+						inner: data,
+						read: 0,
+					};
+					// a path over 100 bytes goes into a GNU long-name record
+					tar.append_data(&mut header, &path, &mut data)?;
+					Ok(data.read)
+				})?;
 			}
 		}
 	}
@@ -247,16 +257,18 @@ fn header(
 	header
 }
 
-/// Copies source `source` into `out`, checking it is `size` bytes long.
-fn copy_source(
+/// Writes source `source` as the current file entry with `add`, which returns the bytes it read
+/// of it; checks that was all `size` of them, and tells the driver the file is in.
+fn write_source(
 	port: &WorkerPort,
 	source: u32,
 	size: u64,
-	out: &mut dyn Write,
+	add: impl FnOnce(&mut ChunkInput<'_>) -> io::Result<u64>,
 ) -> Result<(), Error> {
-	let mut input = ChunkInput::new(port, source, size);
-	let copied = io::copy(&mut input, out).map_err(failure)?;
-	check_length(copied, size)
+	let mut data = ChunkInput::new(port, source, size);
+	let read = add(&mut data).map_err(failure)?;
+	check_length(read, size)?;
+	port.send(WorkerEvent::FileEnd).map_err(failure)
 }
 
 /// A source whose data is not the length it was listed with changed while the job ran; the
@@ -286,9 +298,10 @@ impl<R: Read> Read for Counted<R> {
 
 /// The error a write or read ended with, as the job reports it.
 fn failure(error: io::Error) -> Error {
-	if error.get_ref().is_some_and(|inner| inner.is::<JobEnded>()) {
-		return Error::custom(ErrorKind::Cancelled, "the archive job ended");
-	}
+	let error = match error.downcast::<JobEnded>() {
+		Ok(ended) => return ended.into(),
+		Err(error) => error,
+	};
 	if error.kind() == io::ErrorKind::UnexpectedEof {
 		return Error::custom(
 			ErrorKind::FileChangedDuringSync,

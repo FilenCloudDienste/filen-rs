@@ -34,6 +34,7 @@ use crate::{
 };
 
 use super::{
+	bytes::read_full,
 	entry_path::ArchivePath,
 	extract::{ArchiveEntry, ExtractSkipReason},
 	format::ArchiveFormat,
@@ -49,10 +50,11 @@ pub(crate) const ARCHIVE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) enum WorkerEvent {
 	/// The codec needs chunk `index` of the plaintext of its input `source`: the archive when
 	/// extracting (always 0), a source file by its place in the job's entries when compressing.
+	/// A fetch that fails stops the job, and the reply is dropped unanswered.
 	Ask {
 		source: u32,
 		index: u64,
-		reply: oneshot::Sender<io::Result<Vec<u8>>>,
+		reply: oneshot::Sender<Vec<u8>>,
 	},
 	/// What the archive turned out to be; sent before any entry.
 	Opened(ArchiveFormat),
@@ -213,28 +215,30 @@ pub(crate) fn codec_failed(archive: Uuid, error: &Error, ended: bool) -> bool {
 	true
 }
 
+/// Starts a job's codec, once the job holds its slot and memory floor: the driver's end of it,
+/// whose codec returns `R`.
+pub(crate) type CodecStart<R> = Box<dyn FnOnce() -> Result<WorkerLink<R>, Error> + Send>;
+
 /// Marks the error of an exchange that failed because the driver went away or cancelled, which
 /// the driver never needs reported back.
 #[derive(Debug, thiserror::Error)]
 #[error("the archive job ended")]
 pub(crate) struct JobEnded;
 
+impl From<JobEnded> for Error {
+	fn from(ended: JobEnded) -> Self {
+		Error::custom_with_source(ErrorKind::Cancelled, ended, None::<&str>)
+	}
+}
+
 fn ended() -> io::Error {
 	io::Error::other(JobEnded)
 }
 
-/// A fetch the driver could not answer: an error of the archive's source, which every other
-/// error a codec reads through is not (those are the archive's own: damaged data).
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(crate) struct SourceFailed(io::Error);
-
-/// Whether a read ended with the source's own error (a failed fetch, or the job ending) rather
-/// than a decoder's.
+/// Whether a read ended because the job did (its driver stopped, failed a fetch, or went away)
+/// rather than with a decoder's error.
 pub(crate) fn from_source(error: &io::Error) -> bool {
-	error
-		.get_ref()
-		.is_some_and(|inner| inner.is::<SourceFailed>() || inner.is::<JobEnded>())
+	error.get_ref().is_some_and(|inner| inner.is::<JobEnded>())
 }
 
 /// The codec's end of the exchange.
@@ -262,10 +266,7 @@ impl WorkerPort {
 			index,
 			reply,
 		})?;
-		let chunk = answer
-			.blocking_recv()
-			.map_err(|_| ended())?
-			.map_err(|error| io::Error::new(error.kind(), SourceFailed(error)))?;
+		let chunk = answer.blocking_recv().map_err(|_| ended())?;
 		self.shared.note_progress();
 		Ok(chunk)
 	}
@@ -709,20 +710,6 @@ pub(crate) fn send_file_data(port: &WorkerPort, reader: &mut dyn Read) -> io::Re
 	}
 }
 
-/// Reads until `buf` is full or the stream ends; the number of bytes read.
-pub(crate) fn read_full(reader: &mut (impl Read + ?Sized), buf: &mut [u8]) -> io::Result<usize> {
-	let mut filled = 0;
-	while filled < buf.len() {
-		match reader.read(&mut buf[filled..]) {
-			Ok(0) => break,
-			Ok(n) => filled += n,
-			Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-			Err(e) => return Err(e),
-		}
-	}
-	Ok(filled)
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
 	use tokio::sync::{mpsc, oneshot};
@@ -785,7 +772,7 @@ mod tests {
 				.chunks(CHUNK_SIZE)
 				.nth(usize::try_from(index).unwrap())
 				.unwrap();
-			let _ = reply.send(Ok(chunk.to_vec()));
+			let _ = reply.send(chunk.to_vec());
 		}
 		(asked, (&mut link.done).await.unwrap())
 	}
