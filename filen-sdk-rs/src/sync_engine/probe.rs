@@ -46,7 +46,7 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, SyncedPaths,
 	},
 	derive::{self, Derived},
-	engine::{PendingKind, PendingWrites, assembly_accounted, unaccounted_key},
+	engine::{PendingKind, PendingWrites, assembly_bounds, unaccounted_key},
 	ignore::{
 		IgnoreRules, Origin, RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
@@ -1297,7 +1297,7 @@ fn prepare_scoped(
 	// it could not carry to it.
 	let mark = Instant::now();
 	let dirty = mem::take(&mut derived.dirty);
-	let (observations, rules) = observe::observe_local(
+	let (mut observations, rules) = observe::observe_local(
 		&fixture.root,
 		&baseline,
 		remote_rules.rules,
@@ -1309,20 +1309,24 @@ fn prepare_scoped(
 		mark.elapsed(),
 		"one stat per dirty path and its ancestors, one subtree walk per dirty directory",
 	);
+	// Plan 3.6's self-check, which the pass runs before anything plans against these maps. Its
+	// bounds are taken BEFORE the merge, as the pass takes them: the merge empties the walks they
+	// count. Timed apart from the merge and charged to the check, which is what they are.
+	let (accountable, bounds_elapsed) =
+		timed(|| assembly_bounds(&baseline, &observations, &held_rows));
 	let mark = Instant::now();
-	derive::merge_local(&mut derived, &baseline, &observations);
+	derive::merge_local(&mut derived, &baseline, &mut observations);
 	costs.push(
 		"merge_local",
 		mark.elapsed(),
 		"correcting the derived local map with what was observed: per observation",
 	);
-	// Plan 3.6's self-check, which the pass runs before anything plans against these maps.
-	let (accounted, elapsed) =
-		timed(|| assembly_accounted(&baseline, &derived, &observations, &held_rows));
+	let (accounted, elapsed) = timed(|| accountable.contains(&derived.local.of(&baseline).len()));
 	costs.push(
 		"assembly_check",
-		elapsed,
-		"`assembly_accounted`: per observation, plus the rows under each one it replaced",
+		bounds_elapsed + elapsed,
+		"`assembly_bounds` before the merge, per observation plus the rows under each one it \
+		 replaced, and the assembled map's length after it",
 	);
 	assert!(
 		accounted,

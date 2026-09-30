@@ -54,6 +54,8 @@ use std::{
 	collections::{HashMap, hash_map},
 };
 
+use itertools::Either;
+
 use super::{
 	baseline::BaselineEntry,
 	plan::{is_under, moved_path},
@@ -304,6 +306,14 @@ impl<T> Side<T> {
 			}
 		}
 	}
+
+	/// Make room for `additional` more nodes, for a caller that knows how many it is about to put.
+	pub(super) fn reserve(&mut self, additional: usize) {
+		match self {
+			Self::Whole(map) => map.reserve(additional),
+			Self::Carried(overlay) => overlay.edits.reserve(additional),
+		}
+	}
 }
 
 impl<T: FromRow> Side<T> {
@@ -327,6 +337,48 @@ impl<T: FromRow> Side<T> {
 				overlay.edits.insert(path.to_owned(), None);
 				was
 			}
+		}
+	}
+
+	/// [`remove`](Self::remove), for a caller already holding the baseline's row at the path: it
+	/// answers whether this side held a node there — what [`NodesAt::holds`] said before — and
+	/// neither reads the row again nor builds the node to say so.
+	///
+	/// A caller dropping a subtree throws away the node `remove` hands back, and on a carried side
+	/// that node costs a lookup of the row the caller already has plus the derivation of both its
+	/// halves: once per row under a directory moved away.
+	pub(super) fn forget(&mut self, row: &BaselineEntry) -> bool {
+		match self {
+			Self::Whole(map) => map.remove(&row.rel_path).is_some(),
+			Self::Carried(overlay) => {
+				let held = match overlay.edits.get(&row.rel_path) {
+					// Already a tombstone: nothing held, and the tombstone stands.
+					Some(None) => return false,
+					Some(Some(_)) => true,
+					// What the tree's carryable index answers at the row's path, from the row.
+					None => row.carryable(),
+				};
+				// A key of its own: the caller goes on to record the row's path as decided.
+				overlay.edits.insert(row.rel_path.clone(), None);
+				held
+			}
+		}
+	}
+
+	/// This side's nodes by value, for a caller done with it: what [`Nodes::iter`] yields, with a
+	/// materialized side's paths and nodes handed over rather than copied out.
+	pub(super) fn into_entries(self, baseline: &Baseline) -> impl Iterator<Item = (String, T)> {
+		match self {
+			Self::Whole(map) => Either::Left(map.into_iter()),
+			// A carried side holds its rows' nodes nowhere to hand over, so they are built as a
+			// walk of it builds them.
+			Self::Carried(_) => Either::Right(
+				self.of(baseline)
+					.iter()
+					.map(|(path, node)| (path.into_owned(), node.into_owned()))
+					.collect::<Vec<_>>()
+					.into_iter(),
+			),
 		}
 	}
 
@@ -1371,11 +1423,34 @@ mod tests {
 					}
 					2 => {
 						what = format!("remove({path:?})");
-						assert_eq!(
+						// `forget` is `remove` for a caller holding the row: asked of copies of
+						// both backings, it must say whether `remove` hands a node back and leave
+						// the side `remove` leaves.
+						let forgotten = baseline.get(path).map(|row| {
+							let (mut w, mut c) = (whole.clone(), carried.clone());
+							((w.forget(&row), w), (c.forget(&row), c))
+						});
+						let removed = (
 							whole.remove(&baseline, path),
 							carried.remove(&baseline, path),
+						);
+						assert_eq!(
+							removed.0, removed.1,
 							"seed {seed} step {step}: remove({path:?}) handed back different nodes"
 						);
+						if let Some(((w_held, w), (c_held, c))) = forgotten {
+							assert_eq!(
+								(w_held, c_held),
+								(removed.0.is_some(), removed.1.is_some()),
+								"seed {seed} step {step}: forget({path:?}) and remove disagree on \
+								 whether the side held a node"
+							);
+							assert!(
+								w == whole && c == carried,
+								"seed {seed} step {step}: forget({path:?}) left another side than \
+								 remove did"
+							);
+						}
 					}
 					3 => {
 						let keep_files = rng.random_range(0..2) == 0;

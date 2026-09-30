@@ -44,7 +44,7 @@
 //! directory pair whatever their stamps say — and the tests below pin that by planning against the
 //! derived maps and the whole-tree ones and comparing the plans.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, mem};
 
 use super::{
 	baseline::{BaselineEntry, NodeKind},
@@ -203,12 +203,33 @@ fn extracted(row: &BaselineEntry) -> Option<(LocalNode, RemoteNode)> {
 ///
 /// Every key it writes or drops goes into [`Derived::decided`] as it goes, which is what lets the
 /// reconcile skip the rest: the nodes it did not touch are still the ones their rows carry.
+///
+/// A walk's nodes are MOVED into the local side, which leaves its scan empty. They are the largest
+/// thing a scoped pass reads, and nothing after this reads them there: what still asks about a
+/// walk — the facts, the assembly check — asks what it found rather than the nodes it found, and
+/// the check takes its bounds before this runs (`engine::assembly_bounds`).
 pub(super) fn merge_local(
 	derived: &mut Derived,
 	baseline: &Baseline,
-	observed: &LocalObservations,
+	observed: &mut LocalObservations,
 ) {
-	for (at, observation) in &observed.observed {
+	// Room for every node the walks found, before the first one lands: grown into from empty, the
+	// table doubles its way up, and the allocator keeps every table it outgrew resident.
+	derived.local.reserve(
+		observed
+			.observed
+			.values()
+			.map(|observation| match observation {
+				LocalObservation::Dir(scan) => scan.nodes.of(baseline).len(),
+				LocalObservation::File { .. }
+				| LocalObservation::Absent(_)
+				| LocalObservation::Hidden(_) => 0,
+			})
+			.sum(),
+	);
+	for (at, observation) in &mut observed.observed {
+		// Asked of the observation before the arm below borrows its walk to empty it.
+		let pruned: BTreeSet<String> = observation.uncovered_roots().cloned().collect();
 		match observation {
 			// Still a node, even where the remote would reject its name: the caller screens the
 			// path out through the scan's `invalid_names`, and dropping it here would read as a
@@ -223,14 +244,12 @@ pub(super) fn merge_local(
 				// real path) it never looked at, and an incomplete walk may have missed anything,
 				// so both keep their rows.
 				if scan.complete {
-					let pruned: BTreeSet<String> = observation.uncovered_roots().cloned().collect();
 					drop_rows(derived, baseline, at, &pruned);
 				}
-				for (rel_path, node) in scan.nodes.of(baseline).iter() {
-					derived.decided.insert(rel_path.to_string());
-					derived
-						.local
-						.insert(rel_path.into_owned(), node.into_owned());
+				// The decided key is the one copy: the path and the node themselves move.
+				for (rel_path, node) in mem::take(&mut scan.nodes).into_entries(baseline) {
+					derived.decided.insert(rel_path.clone());
+					derived.local.insert(rel_path, node);
 				}
 			}
 			// The one construct that means deletion: a `stat` on this very path answered NotFound,
@@ -281,9 +300,7 @@ fn drop_rows(
 		dropped = true;
 	}
 	for row in baseline.subtree(at) {
-		if !plan::at_or_under_root(pruned, &row.rel_path)
-			&& derived.local.remove(baseline, &row.rel_path).is_some()
-		{
+		if !plan::at_or_under_root(pruned, &row.rel_path) && derived.local.forget(&row) {
 			derived.decided.insert(row.rel_path);
 			dropped = true;
 		}
@@ -313,6 +330,7 @@ mod tests {
 				PairChanges, RemoteDeltaEntry,
 				tests::{cache_event, cacheable_file},
 			},
+			engine::assembly_bounds,
 			facts::carry_over,
 			ignore::{FILENIGNORE, IgnoreRules},
 			observe::observe_local,
@@ -509,7 +527,7 @@ mod tests {
 			// The exact keys the delta moved, as `prepare_scoped` records them: what the pass
 			// DECIDES, where `dirty` says where to look.
 			derived.decided.append(&mut observed.changed);
-			let (local, _) = observe_local(
+			let (mut local, _) = observe_local(
 				&self.root,
 				baseline,
 				IgnoreRules::default(),
@@ -517,7 +535,7 @@ mod tests {
 				&derived.dirty,
 			);
 			assert!(local.complete, "{:?}", local.errors);
-			merge_local(&mut derived, baseline, &local);
+			merge_local(&mut derived, baseline, &mut local);
 			derived
 		}
 	}
@@ -1120,7 +1138,7 @@ mod tests {
 		fs::write(pair.root.join(FILENIGNORE), "deep/\n").unwrap();
 
 		let mut derived = from_baseline(&baseline, dirty_paths(&["docs/deep"]));
-		let (observed, rules) = observe_local(
+		let (mut observed, rules) = observe_local(
 			&pair.root,
 			&baseline,
 			IgnoreRules::default(),
@@ -1132,7 +1150,7 @@ mod tests {
 			"the rule has to be what the observation reports: {:?}",
 			observed.observed
 		);
-		merge_local(&mut derived, &baseline, &observed);
+		merge_local(&mut derived, &baseline, &mut observed);
 		// The remote half, filtered with the very rules the observation matched with — which is
 		// what `prepare_scoped` does a few lines after its own `merge_local`.
 		let mut view = RemoteView {
@@ -1195,7 +1213,7 @@ mod tests {
 		fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
 		let mut derived = from_baseline(&baseline, BTreeSet::from(["docs".to_string()]));
-		let (observed, _) = observe_local(
+		let (mut observed, _) = observe_local(
 			&pair.root,
 			&baseline,
 			IgnoreRules::default(),
@@ -1204,7 +1222,7 @@ mod tests {
 		);
 		fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 		assert!(!observed.complete, "the walk could not read a subtree");
-		merge_local(&mut derived, &baseline, &observed);
+		merge_local(&mut derived, &baseline, &mut observed);
 
 		assert!(
 			derived.local.of(&baseline).holds("docs/deep/inner.bin"),
@@ -1338,7 +1356,7 @@ mod tests {
 		let pair = Pair::converged();
 		let baseline = pair.baseline();
 		let mut derived = from_baseline(&baseline, BTreeSet::new());
-		let observed = LocalObservations {
+		let mut observed = LocalObservations {
 			observed: BTreeMap::new(),
 			siblings: BTreeMap::new(),
 			ignore_blocked: BTreeSet::new(),
@@ -1346,9 +1364,72 @@ mod tests {
 			errors: Vec::new(),
 		};
 
-		merge_local(&mut derived, &baseline, &observed);
+		merge_local(&mut derived, &baseline, &mut observed);
 
 		assert!(derived.local.of(&baseline).holds("top.txt"));
 		assert!(derived.local.of(&baseline).holds("docs/deep/inner.bin"));
+	}
+
+	/// A walk's nodes MOVE into the local side rather than being copied out of the scan, so the pass
+	/// stops holding two copies of every node it walked — and the assembly check, which counts what
+	/// each walk found, takes the same bounds before the merge as from observations nothing has
+	/// touched, and the merged map lands inside them.
+	///
+	/// The shape is a directory rename, the largest walk a scoped pass makes: an absence at the old
+	/// path and a walk of the new one.
+	#[test]
+	fn merging_a_walk_moves_its_nodes_and_leaves_the_assembly_bounds_as_they_were() {
+		let pair = Pair::converged();
+		let baseline = pair.baseline();
+		fs::rename(pair.root.join("docs"), pair.root.join("moved")).unwrap();
+		let mut derived = from_baseline(&baseline, dirty_paths(&["docs", "moved"]));
+		let dirty = derived.dirty.clone();
+		let observe = || {
+			observe_local(
+				&pair.root,
+				&baseline,
+				IgnoreRules::default(),
+				&RuleFiles::Read,
+				&dirty,
+			)
+			.0
+		};
+		let (mut merged, untouched) = (observe(), observe());
+		let held = derived.held.clone();
+
+		let bounds = assembly_bounds(&baseline, &merged, &held);
+		merge_local(&mut derived, &baseline, &mut merged);
+
+		let walks: Vec<&LocalScan> = merged
+			.observed
+			.values()
+			.filter_map(|observation| match observation {
+				LocalObservation::Dir(scan) => Some(&**scan),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(walks.len(), 1, "{:?}", merged.observed.keys());
+		assert!(
+			walks[0].nodes.whole().is_empty(),
+			"the walk still holds the nodes it handed the local side: the pass holds them twice"
+		);
+		let local = derived.local.of(&baseline);
+		for path in ["moved", "moved/notes.txt", "moved/deep/inner.bin"] {
+			assert!(
+				local.holds(path),
+				"{path:?} was walked and is not in the local side"
+			);
+		}
+		assert!(!local.holds("docs/notes.txt"), "the old path is gone");
+		assert_eq!(
+			bounds,
+			assembly_bounds(&baseline, &untouched, &held),
+			"the bounds taken before the merge are the ones the untouched observations give"
+		);
+		assert!(
+			bounds.contains(&local.len()),
+			"the merged map ({} node(s)) is outside {bounds:?}",
+			local.len()
+		);
 	}
 }
