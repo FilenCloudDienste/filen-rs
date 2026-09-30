@@ -671,8 +671,8 @@ impl RemoteView {
 	/// re-supplies such a root where the baseline still names a row at or under it, and drops one
 	/// with no rows left under it exactly as it did before this narrowing.
 	pub(crate) fn filter_changed(&mut self, filter: ViewFilter<'_>, decided: &BTreeSet<String>) {
-		self.hide(filter, PassPaths::Changed(decided));
-		self.resolve_collisions_changed(filter.baseline, decided);
+		let kept = self.hide(filter, PassPaths::Changed(decided));
+		self.resolve_collisions_changed(filter.baseline, kept);
 	}
 
 	/// The ignore half of [`filter`](Self::filter): an item the rules hide at or above its path
@@ -689,7 +689,17 @@ impl RemoteView {
 	/// `paths` says which nodes to ASK the rules about: every one of them
 	/// ([`PassPaths::Whole`], what a pass that read the remote whole owes), or only the keys a
 	/// change-scoped pass decided (see [`filter_changed`](Self::filter_changed)).
-	pub(super) fn hide(&mut self, filter: ViewFilter<'_>, paths: PassPaths<'_>) {
+	///
+	/// A change-scoped pass gets back the decided keys the view still holds, in the set's order:
+	/// what [`resolve_collisions_changed`](Self::resolve_collisions_changed) folds. Asking the
+	/// rules about a key needs its node, and on a carried side that is a read of its row, which
+	/// already says whether the view holds the key — the collision check asking again read every
+	/// decided row twice. A whole pass has no decided set, and gets nothing back.
+	pub(super) fn hide<'d>(
+		&mut self,
+		filter: ViewFilter<'_>,
+		paths: PassPaths<'d>,
+	) -> Vec<&'d String> {
 		let mut memo = HashMap::new();
 		let mut ignored = BTreeMap::new();
 		let mut untracked = 0usize;
@@ -714,20 +724,32 @@ impl RemoteView {
 			}
 			true
 		};
-		match paths {
-			PassPaths::Whole => self.nodes.retain(filter.baseline, |rel_path, node| {
-				!hidden(rel_path, node.kind == NodeKind::Dir)
-			}),
+		let kept = match paths {
+			PassPaths::Whole => {
+				self.nodes.retain(filter.baseline, |rel_path, node| {
+					!hidden(rel_path, node.kind == NodeKind::Dir)
+				});
+				Vec::new()
+			}
 			PassPaths::Changed(decided) => {
-				let roots: Vec<String> = decided
-					.iter()
-					.filter_map(|rel_path| {
-						let is_dir =
-							self.nodes.of(filter.baseline).at(rel_path)?.kind == NodeKind::Dir;
-						hidden(rel_path, is_dir).then(|| rel_path.clone())
-					})
-					.collect();
-				for root in roots {
+				let mut kept = Vec::new();
+				let mut roots = Vec::new();
+				for rel_path in decided {
+					let Some(is_dir) = self
+						.nodes
+						.of(filter.baseline)
+						.at(rel_path)
+						.map(|node| node.kind == NodeKind::Dir)
+					else {
+						continue;
+					};
+					if hidden(rel_path, is_dir) {
+						roots.push(rel_path);
+					} else {
+						kept.push(rel_path);
+					}
+				}
+				for root in &roots {
 					// Everything under a hidden directory goes with it, exactly as the whole form
 					// drops it: nothing under an ignored directory can be re-included.
 					//
@@ -737,13 +759,19 @@ impl RemoteView {
 					// a rule that newly hides a directory forces a whole read instead. If that ever
 					// stops being rare, the subtree is also named key-by-key in `decided` (every
 					// re-key records both ends), so the walk can be dropped for a scan of the set.
-					for under in self.nodes.subtree_paths(filter.baseline, &root) {
+					for under in self.nodes.subtree_paths(filter.baseline, root) {
 						self.nodes.remove(filter.baseline, &under);
 					}
-					self.nodes.remove(filter.baseline, &root);
+					self.nodes.remove(filter.baseline, root);
 				}
+				// A kept key under a hidden directory left with it. Asked again only when the rules
+				// hid something, which is the rare case the walk above already pays for.
+				if !roots.is_empty() {
+					kept.retain(|rel_path| self.nodes.of(filter.baseline).holds(rel_path));
+				}
+				kept
 			}
-		}
+		};
 		self.ignored = ignored;
 		self.ignored_default_untracked = untracked;
 		// An unplaceable item's own record leaves with whatever hides it: the holding directory for
@@ -770,6 +798,7 @@ impl RemoteView {
 			}
 			_ => true,
 		});
+		kept
 	}
 
 	/// The collision half of [`filter`](Self::filter): two remote items whose paths fold together
@@ -835,19 +864,20 @@ impl RemoteView {
 	/// would stall the pair for as long as the row lasted. Real keys are compared rather than
 	/// digests of them, which the whole form uses to keep one `u128` per node instead of a second
 	/// copy of every path — the decided set is a handful of paths, so there is nothing to save.
+	///
+	/// `kept` is the decided keys the view holds, in path order: what [`hide`](Self::hide) hands
+	/// back, having read each one's node for the rules already. A decided key the view does not
+	/// hold claims no name, and the order is the order the kept ones claim theirs in.
 	/// `pub(super)` for the same reason [`hide`](Self::hide) is: the probe times the two halves of
 	/// the scoped filter apart.
-	pub(super) fn resolve_collisions_changed(
+	pub(super) fn resolve_collisions_changed<'d>(
 		&mut self,
 		baseline: &Baseline,
-		decided: &BTreeSet<String>,
+		kept: impl IntoIterator<Item = &'d String>,
 	) {
 		let mut claimed: HashMap<String, String> = HashMap::new();
 		let mut clashes: Vec<String> = Vec::new();
-		for rel_path in decided {
-			if !self.nodes.of(baseline).holds(rel_path) {
-				continue;
-			}
+		for rel_path in kept {
 			let key = collision_key(rel_path);
 			let folds_like = |taken: &str| taken != rel_path && collision_key(taken) == key;
 			let onto = claimed
@@ -6903,6 +6933,56 @@ mod tests {
 		assert_eq!(carried_only.nodes.whole().len(), 2);
 	}
 
+	/// The narrowed filter reads the rows at the decided keys once for both of its halves: the
+	/// rules need each key's node, and whether the view holds a key is what that read already
+	/// answered. After a directory rename those keys are every row under the old name, which the
+	/// collision check then reads once more out of the folded index, for the carried keys a
+	/// decided one could fold onto.
+	#[test]
+	fn a_scoped_filter_reads_the_decided_rows_once_for_both_of_its_halves() {
+		const FILES: usize = 2_000;
+		let files: Vec<(String, String)> = (0..FILES)
+			.map(|n| (format!("dir/{n:05}.txt"), format!("moved_dir/{n:05}.txt")))
+			.collect();
+		let baseline = Baseline::from_rows(
+			std::iter::once(base_dir("dir", Uuid::new_v4())).chain(
+				files
+					.iter()
+					.map(|(from, _)| base_file(from, Uuid::new_v4(), [1; 32])),
+			),
+		);
+		// Both ends of every re-keyed path, as a pass records them; the remote holds the old ends.
+		let mut decided = BTreeSet::from(["dir".to_string(), "moved_dir".to_string()]);
+		for (from, to) in &files {
+			decided.extend([from.clone(), to.clone()]);
+		}
+		let rules = IgnoreRules::default();
+		let mut view = RemoteView {
+			nodes: Side::carried(),
+			has_collisions: false,
+			held_paths: BTreeSet::new(),
+			skipped: Vec::new(),
+			ignored: BTreeMap::new(),
+			ignored_default_untracked: 0,
+		};
+		let before = baseline.reads_for_test();
+		view.filter_changed(
+			ViewFilter {
+				rules: &rules,
+				baseline: &baseline,
+			},
+			&decided,
+		);
+		let after = baseline.reads_for_test();
+		assert!(!view.has_collisions);
+		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
+		assert!(
+			rows < 5 * FILES / 2,
+			"the filter read {rows} row(s) in {statements} statement(s): more than twice the \
+			 {FILES} file(s) under the renamed directory"
+		);
+	}
+
 	/// A root pattern of `*` empties the filtered view, rule file included, while the unfiltered one
 	/// still lists the remote: the pass reads its rule files and an emptied remote from that one, or
 	/// every such pass would read as a vanished remote.
@@ -8711,7 +8791,14 @@ mod tests {
 				let mut whole = case.view();
 				whole.resolve_collisions(&case.baseline);
 				let mut scoped = case.view();
-				scoped.resolve_collisions_changed(&case.baseline, &case.decided);
+				// The decided keys the view holds, which is what `hide` hands over when it runs
+				// first.
+				let kept: Vec<&String> = case
+					.decided
+					.iter()
+					.filter(|path| scoped.nodes.of(&case.baseline).holds(path))
+					.collect();
+				scoped.resolve_collisions_changed(&case.baseline, kept);
 				assert_same_claimed(*seed, &case.baseline, "collisions", &whole, &scoped);
 			}
 			seen.assert_reached();
@@ -8803,6 +8890,43 @@ mod tests {
 				scoped.ignored.is_empty(),
 				"a root an earlier pass found is re-supplied by the carried facts, not re-derived"
 			);
+		}
+
+		/// The same two shapes once the pass DECIDED their keys — a directory renamed away records
+		/// every row under its old name — are asked about like any other decided key, and the
+		/// narrowed filter drops them exactly as the whole one does: the hidden rows leave with
+		/// their root recorded, and the row folding onto a held path refuses the pass. The nodes
+		/// are carried off the rows here, so what the view holds at each key is the rows' answer.
+		#[test]
+		fn a_scoped_filter_drops_the_two_carried_shapes_once_they_are_decided() {
+			let case = ViewCase {
+				nodes: Side::carried(),
+				held_paths: BTreeSet::from(["Top.txt".to_owned()]),
+				skipped: Vec::new(),
+				decided: ["top.txt", "z", "z/1.txt"]
+					.into_iter()
+					.map(str::to_owned)
+					.collect(),
+				rules: rules_of(1),
+				baseline: Baseline::from_rows([
+					base_dir("z", uuid_at(index_of("z"))),
+					base_file("z/1.txt", uuid_at(index_of("z/1.txt")), hash_at(0, 0)),
+					base_file("top.txt", uuid_at(index_of("top.txt")), hash_at(1, 0)),
+				]),
+			};
+
+			let mut whole = case.view();
+			whole.filter(Some(case.filter()));
+			let mut scoped = case.view();
+			scoped.filter_changed(case.filter(), &case.decided);
+			for (form, view) in [("whole", &whole), ("scoped", &scoped)] {
+				assert!(
+					sorted_paths(&case.baseline, view).is_empty(),
+					"{form}: the rows at a hidden path leave, and the folded one is refused"
+				);
+				assert!(view.has_collisions, "{form}");
+				assert_eq!(view.ignored.keys().collect::<Vec<_>>(), vec!["z"], "{form}");
+			}
 		}
 	}
 }

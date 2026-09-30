@@ -1335,21 +1335,22 @@ fn prepare_scoped(
 	// `RemoteView::filter`'s two halves, run in ITS order and timed apart: together they are the
 	// largest per-node cost of a change-scoped pass, and one figure for both cannot say which of
 	// them a narrowing moved.
-	let ((), elapsed) = timed(|| {
+	let (kept, elapsed) = timed(|| {
 		view.hide(
 			plan::ViewFilter {
 				rules: &rules,
 				baseline: &baseline,
 			},
 			plan::PassPaths::Changed(&derived.decided),
-		);
+		)
 	});
 	costs.push(
 		"view_hide",
 		elapsed,
 		"`hide`: one decision per decided path (scoped) or per node (whole read)",
 	);
-	let ((), elapsed) = timed(|| view.resolve_collisions_changed(&baseline, &derived.decided));
+	// Handed the keys `hide` kept, as the pass hands them, so this times what the pass runs.
+	let ((), elapsed) = timed(|| view.resolve_collisions_changed(&baseline, kept));
 	costs.push(
 		"view_collisions",
 		elapsed,
