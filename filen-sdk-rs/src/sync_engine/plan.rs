@@ -2274,9 +2274,10 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// which a whole map does by itself and a carried side has to be told: the rows it derives its
 /// nodes from move with the fold (see `Side::stay_put`).
 ///
-/// `paths` narrows what the two detectors ENUMERATE, exactly as it narrows what [`reconcile`]
-/// decides, and for the same reason: a move both of whose endpoints the pass carried from their own
-/// baseline rows is not a move. Both endpoints of a real one are always in the set —
+/// `decided` is the set a change-scoped pass decides (see [`PassPaths::Changed`]); `None` is a
+/// whole pass. It narrows what the two detectors ENUMERATE, exactly as it narrows what
+/// [`reconcile`] decides, and for the same reason: a move both of whose endpoints the pass carried
+/// from their own baseline rows is not a move. Both endpoints of a real one are always in the set —
 ///
 /// - the side that moved observed an absence at the source and a node at the destination, and
 ///   [`PassPaths::Changed`]'s contract puts every such path in the set;
@@ -2285,13 +2286,12 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 ///   observed absence too.
 ///
 /// — so scoping loses no move the whole read finds, and a move it does leave out is one the
-/// narrowed reconcile would not have decided either. Each iteration re-keys the set with the move
-/// it just folded, so a move nested in that subtree is named by where the outer one put it, and
-/// reads the set's rows once for both detectors (see [`FoldDirs`]).
-///
-/// The paths the side a move did not carry had to record to stay put are decided too: they join
-/// the set, and come back beside the moves keyed where the last move left them, for the caller to
-/// add to its own copy once it has replayed the moves over it. A whole pass gets none back.
+/// narrowed reconcile would not have decided either. Each iteration re-keys the set in place with
+/// the move it just folded, so a move nested in that subtree is named by where the outer one put
+/// it, and reads the set's rows once for both detectors (see [`FoldDirs`]). The set the caller gets
+/// back is keyed like the maps and the rows, which is what the reconcile after it is handed; a
+/// caller that re-keyed it again would move a chained move's paths twice (`a -> b`, then
+/// `c -> a`).
 ///
 /// What still costs the whole map either way is the destination check (`occupied`) and the re-key
 /// itself, both of which walk a side map that has no order to bisect. Those go when the side maps
@@ -2302,26 +2302,18 @@ pub(crate) fn fold_dir_moves(
 	local: &mut Side<LocalNode>,
 	remote: &mut Side<RemoteNode>,
 	held: &BTreeSet<String>,
-	paths: PassPaths<'_>,
-) -> (Vec<SyncAction>, Vec<String>) {
+	mut decided: Option<&mut BTreeSet<String>>,
+) -> Vec<SyncAction> {
 	let mut renames = Vec::new();
-	// Owned only once a move has actually landed: a fold that finds nothing — which is almost every
-	// pass — reads the caller's set where it lies.
-	let mut changed: Option<Cow<'_, BTreeSet<String>>> = match paths {
-		PassPaths::Whole => None,
-		PassPaths::Changed(set) => Some(Cow::Borrowed(set)),
-	};
-	// What the side a move did not carry recorded to stay put, keyed like `changed`: the part of it
-	// the caller's own replay of the moves cannot produce.
-	let mut stayed_put: Vec<String> = Vec::new();
 	loop {
-		let scope = changed
-			.as_deref()
-			.map_or(PassPaths::Whole, PassPaths::Changed);
 		// An immutable reborrow, scoped so it is dead before `move_subtree` below wants the
 		// mutable one back. A carried side reads its nodes off these very rows, which is why the
 		// re-key and the row move that follows it cannot be reordered (see `Side::rekey_subtree`).
+		// The set is borrowed the same way, so the re-key below can take it back.
 		let action = {
+			let scope = decided
+				.as_deref()
+				.map_or(PassPaths::Whole, PassPaths::Changed);
 			let bl: &Baseline = baseline;
 			let (local_ref, remote_ref) = (local.of(bl), remote.of(bl));
 			let dirs = FoldDirs::read(scope, bl, &local_ref, &remote_ref);
@@ -2353,19 +2345,12 @@ pub(crate) fn fold_dir_moves(
 		// Written only once a move is actually being folded: the rows the pass reads are shared
 		// with the store, and a pass that folds no directory move must not copy them.
 		baseline.move_subtree(from, to);
-		// The next iteration's scope, keyed like the maps and the rows this move just re-keyed.
-		// `Prepared::fold_dir_moves` does the same to the caller's copy once this returns; without
-		// it here, a move nested under this one would be looked for at a path nothing holds. What
-		// the other side had to record to stay put is decided too, keyed where it now stands, and
-		// goes into the scope and the hand-back both, hence the copies of it.
-		if let Some(set) = &mut changed {
-			let rekeyed: BTreeSet<String> = set
-				.iter()
-				.map(|path| moved_path(path, from, to).unwrap_or_else(|| path.clone()))
-				.chain(stayed.iter().cloned())
-				.collect();
-			*set = Cow::Owned(rekeyed);
-			stayed_put = stayed_put
+		// The next iteration's scope, and the reconcile's: keyed like the maps and the rows this
+		// move just re-keyed. Without it a move nested under this one would be looked for at a path
+		// nothing holds, and the reconcile would decide paths no input is keyed by any more. What
+		// the other side had to record to stay put is decided too, keyed where it now stands.
+		if let Some(set) = decided.as_deref_mut() {
+			*set = std::mem::take(set)
 				.into_iter()
 				.map(|path| moved_path(&path, from, to).unwrap_or(path))
 				.chain(stayed)
@@ -2377,7 +2362,7 @@ pub(crate) fn fold_dir_moves(
 		);
 		renames.push(action);
 	}
-	(renames, stayed_put)
+	renames
 }
 
 /// How a directory move was matched, which is what [`fold_dir_moves`] may take as known about the
@@ -3455,13 +3440,13 @@ mod tests {
 			Side::from(local.clone()),
 			Side::from(remote.clone()),
 		);
-		let (mut actions, _) = fold_dir_moves(
+		let mut actions = fold_dir_moves(
 			mode,
 			&mut baseline,
 			&mut local,
 			&mut remote,
 			&BTreeSet::new(),
-			PassPaths::Whole,
+			None,
 		);
 		actions.extend(
 			reconcile(
@@ -3692,9 +3677,8 @@ mod tests {
 				&mut local,
 				&mut remote,
 				&BTreeSet::new(),
-				PassPaths::Whole,
+				None,
 			)
-			.0
 			.is_empty()
 		);
 	}
@@ -4072,9 +4056,8 @@ mod tests {
 				&mut local,
 				&mut remote,
 				&held,
-				PassPaths::Whole,
+				None,
 			)
-			.0
 			.is_empty()
 		);
 	}
@@ -4085,7 +4068,7 @@ mod tests {
 	#[test]
 	fn a_dir_move_is_carried_at_the_scope_a_pass_read() {
 		let (baseline, local, remote) = moved_tree(TreeIds::new(), "documents", "docs");
-		let scope = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
+		let mut scope = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
 		let (mut whole_baseline, mut whole_local, mut whole_remote) = (
 			tree(&baseline),
 			Side::from(local.clone()),
@@ -4093,21 +4076,21 @@ mod tests {
 		);
 		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) =
 			(tree(&baseline), Side::from(local), Side::from(remote));
-		let (by_whole, _) = fold_dir_moves(
+		let by_whole = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut whole_baseline,
 			&mut whole_local,
 			&mut whole_remote,
 			&BTreeSet::new(),
-			PassPaths::Whole,
+			None,
 		);
-		let (by_scope, _) = fold_dir_moves(
+		let by_scope = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut scoped_baseline,
 			&mut scoped_local,
 			&mut scoped_remote,
 			&BTreeSet::new(),
-			PassPaths::Changed(&scope),
+			Some(&mut scope),
 		);
 		assert!(
 			!by_whole.is_empty(),
@@ -4119,8 +4102,7 @@ mod tests {
 	}
 
 	/// What a change-scoped pass plans from carried sides: the fold at the pass's own set, then the
-	/// reconcile at that set as the pass re-keys it — every move replayed over it, then the paths
-	/// the fold hands back taken in.
+	/// reconcile at the set the fold hands back.
 	fn plan_scoped(
 		mode: SyncMode,
 		rows: &Baseline,
@@ -4129,22 +4111,14 @@ mod tests {
 		mut decided: BTreeSet<String>,
 	) -> Vec<SyncAction> {
 		let mut rows = rows.clone();
-		let (mut actions, stayed) = fold_dir_moves(
+		let mut actions = fold_dir_moves(
 			mode,
 			&mut rows,
 			&mut local,
 			&mut remote,
 			&BTreeSet::new(),
-			PassPaths::Changed(&decided),
+			Some(&mut decided),
 		);
-		for action in &actions {
-			let (from, to) = action.endpoints();
-			decided = decided
-				.into_iter()
-				.map(|path| moved_path(&path, from, to).unwrap_or(path))
-				.collect();
-		}
-		decided.extend(stayed);
 		actions.extend(
 			reconcile(
 				mode,
@@ -4315,13 +4289,13 @@ mod tests {
 			decided.extend([from.clone(), to.clone()]);
 		}
 		let before = baseline.reads_for_test();
-		let (moves, _) = fold_dir_moves(
+		let moves = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut baseline,
 			&mut local,
 			&mut remote,
 			&BTreeSet::new(),
-			PassPaths::Changed(&decided),
+			Some(&mut decided),
 		);
 		let after = baseline.reads_for_test();
 		assert_eq!(
@@ -8273,31 +8247,43 @@ mod tests {
 			);
 		}
 
-		/// The case as it stands once the directory-move fold has run over it at `paths`, with the
-		/// set re-keyed exactly as `Prepared::fold_dir_moves` re-keys it — every move replayed over
-		/// it, then what the side a move did not carry recorded to stay put (see `Side::stay_put`)
-		/// taken in — and the moves that took.
-		fn fold(case: &Case, mode: SyncMode, paths: PassPaths<'_>) -> (Case, Vec<SyncAction>) {
+		/// The case as it stands once the directory-move fold has run over it — at the case's own
+		/// scope when `scoped`, whole otherwise — and the moves that took.
+		///
+		/// The set is re-keyed here too, every move replayed in order over the case's own set: the
+		/// set a whole fold, which is handed none, is read with afterwards, and the oracle for the
+		/// scoped fold's. That one may hold more — what the side a move did not carry recorded to
+		/// stay put (see `Side::stay_put`) — and never less.
+		fn fold(case: &Case, mode: SyncMode, scoped: bool) -> (Case, Vec<SyncAction>) {
 			let mut baseline = case.baseline.clone();
 			let mut local = case.local.clone();
 			let mut remote = case.remote.clone();
 			let mut decided = case.decided.clone();
-			let (moves, stayed) = fold_dir_moves(
+			let moves = fold_dir_moves(
 				mode,
 				&mut baseline,
 				&mut local,
 				&mut remote,
 				&case.holds.held_remote,
-				paths,
+				scoped.then_some(&mut decided),
 			);
+			let mut oracle = case.decided.clone();
 			for action in &moves {
 				let (from, to) = action.endpoints();
-				decided = decided
+				oracle = oracle
 					.into_iter()
 					.map(|path| moved_path(&path, from, to).unwrap_or(path))
 					.collect();
 			}
-			decided.extend(stayed);
+			let decided = if scoped {
+				assert!(
+					decided.is_superset(&oracle),
+					"{mode:?}: the fold lost a path of the set it was handed"
+				);
+				decided
+			} else {
+				oracle
+			};
 			let folded = Case {
 				baseline,
 				local,
@@ -8321,7 +8307,7 @@ mod tests {
 			for seed in 0..CASES {
 				let case = generate(seed, &mut seen);
 				for mode in MODES {
-					let (after, moves) = fold(&case, mode, PassPaths::Changed(&case.decided));
+					let (after, moves) = fold(&case, mode, true);
 					seen.folds += moves.len();
 					assert_same_plan(seed, mode, &after, &mut seen);
 				}
@@ -8368,7 +8354,7 @@ mod tests {
 					&rows::probes(paths()),
 				);
 				for mode in MODES {
-					let (mut after, moves) = fold(&case, mode, PassPaths::Changed(&case.decided));
+					let (mut after, moves) = fold(&case, mode, true);
 					let mut oracle = unedited.clone();
 					for action in &moves {
 						let (from, to) = action.endpoints();
@@ -8424,8 +8410,8 @@ mod tests {
 			for seed in 0..CASES {
 				let case = generate(seed, &mut seen);
 				for mode in MODES {
-					let (whole, by_whole) = fold(&case, mode, PassPaths::Whole);
-					let (scoped, by_scope) = fold(&case, mode, PassPaths::Changed(&case.decided));
+					let (whole, by_whole) = fold(&case, mode, false);
+					let (scoped, by_scope) = fold(&case, mode, true);
 					seen.folds += by_whole.len();
 					assert_eq!(
 						by_whole, by_scope,

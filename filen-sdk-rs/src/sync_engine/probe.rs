@@ -1030,7 +1030,7 @@ fn pass_pure(
 		&mut local,
 		&mut remote,
 		&held,
-		plan::PassPaths::Whole,
+		None,
 	);
 	let planned = plan::reconcile(
 		SyncMode::TwoWay,
@@ -1447,23 +1447,14 @@ fn prepare_scoped(
 	// What the pass folds and plans with is `holds.held_remote`, which is the view's held set.
 	let held = view.held_paths;
 	let mark = Instant::now();
-	let (moves, stayed) = plan::fold_dir_moves(
+	let moves = plan::fold_dir_moves(
 		mode,
 		&mut baseline,
 		&mut local,
 		&mut remote,
 		&held,
-		plan::PassPaths::Changed(&decided),
+		Some(&mut decided),
 	);
-	// The decided set follows the fold, as `Prepared::fold_dir_moves` makes it follow for a pass.
-	for action in &moves {
-		let (from, to) = action.endpoints();
-		decided = decided
-			.into_iter()
-			.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
-			.collect();
-	}
-	decided.extend(stayed);
 	costs.push(
 		"dir_move_fold",
 		mark.elapsed(),
@@ -2111,9 +2102,8 @@ pub fn run() -> String {
 			&mut local,
 			&mut remote,
 			&held,
-			plan::PassPaths::Whole,
+			None,
 		)
-		.0
 	});
 	probe.record(
 		"fold_dir_moves_zero",
@@ -2125,7 +2115,7 @@ pub fn run() -> String {
 	// The same fold at the scope a change-scoped pass gives it. The pair is converged, so both find
 	// nothing — what the pair of lines says is what LOOKING costs, which is what every pass pays
 	// whether or not anything moved.
-	let idle_scope: BTreeSet<String> = local
+	let mut idle_scope: BTreeSet<String> = local
 		.whole()
 		.paths()
 		.next()
@@ -2139,9 +2129,8 @@ pub fn run() -> String {
 			&mut local,
 			&mut remote,
 			&held,
-			plan::PassPaths::Changed(&idle_scope),
+			Some(&mut idle_scope),
 		)
-		.0
 	});
 	probe.record(
 		"fold_dir_moves_scoped_zero",
@@ -2157,13 +2146,12 @@ pub fn run() -> String {
 	// its moves as the pass's own edits beside the resident tree, never into a copy of it, so
 	// neither figure carries a whole-tree clone whoever else holds the tree.
 	let moved_root = format!("{rename_root}-moved");
-	let move_scope = BTreeSet::from([rename_root.clone(), moved_root.clone()]);
 	let mut remote_at = rename_root.clone();
-	for (phase, scope) in [
-		("fold_dir_moves_dir_whole", plan::PassPaths::Whole),
+	for (phase, mut scope) in [
+		("fold_dir_moves_dir_whole", None),
 		(
 			"fold_dir_moves_dir_scoped",
-			plan::PassPaths::Changed(&move_scope),
+			Some(BTreeSet::from([rename_root.clone(), moved_root.clone()])),
 		),
 	] {
 		let to = if remote_at == rename_root {
@@ -2182,9 +2170,8 @@ pub fn run() -> String {
 				&mut local,
 				&mut remote,
 				&held,
-				scope,
+				scope.as_mut(),
 			)
-			.0
 		});
 		assert_eq!(
 			dir_moves.len(),
