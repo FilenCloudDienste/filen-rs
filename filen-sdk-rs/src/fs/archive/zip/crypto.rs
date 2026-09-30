@@ -12,7 +12,10 @@ use filen_macros::js_type;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
-use crate::fs::archive::password::ArchivePassword;
+use crate::{
+	Error, ErrorKind,
+	fs::archive::{error::read_failure, password::ArchivePassword},
+};
 
 /// PBKDF2 rounds WinZip AES derives its keys with, fixed by the format.
 const AES_KDF_ROUNDS: u32 = 1000;
@@ -123,11 +126,31 @@ pub(crate) enum CryptoError {
 	/// The data does not match its authentication code: damaged, or tampered with.
 	#[error("the encrypted data does not match its authentication code")]
 	AuthenticationFailed,
+	/// The entry is too short to hold the AES header and authentication code.
+	#[error("an AES entry too short for its header")]
+	TooShort,
+	/// Reading the encryption header failed.
+	#[error(transparent)]
+	Read(#[from] io::Error),
 }
 
 impl From<CryptoError> for io::Error {
 	fn from(error: CryptoError) -> Self {
-		io::Error::new(io::ErrorKind::InvalidData, error)
+		match error {
+			CryptoError::Read(error) => error,
+			error => io::Error::new(io::ErrorKind::InvalidData, error),
+		}
+	}
+}
+
+impl From<CryptoError> for Error {
+	fn from(error: CryptoError) -> Self {
+		let kind = match error {
+			CryptoError::Read(error) => return read_failure(error),
+			CryptoError::WrongPassword => ErrorKind::ArchiveWrongPassword,
+			CryptoError::AuthenticationFailed | CryptoError::TooShort => ErrorKind::ArchiveCorrupt,
+		};
+		Error::custom_with_source(kind, error, None::<&str>)
 	}
 }
 
@@ -148,14 +171,11 @@ impl<R: Read> AesReader<R> {
 		password: &ArchivePassword,
 		strength: AesStrength,
 		stored_len: u64,
-	) -> io::Result<Self> {
+	) -> Result<Self, CryptoError> {
 		let overhead = strength.salt_len() as u64 + AES_VERIFIER_LEN + AES_AUTH_CODE_LEN_U64;
-		let data_len = stored_len.checked_sub(overhead).ok_or_else(|| {
-			io::Error::new(
-				io::ErrorKind::InvalidData,
-				"an AES entry too short for its header",
-			)
-		})?;
+		let data_len = stored_len
+			.checked_sub(overhead)
+			.ok_or(CryptoError::TooShort)?;
 		let mut salt = [0u8; 16];
 		let salt = &mut salt[..strength.salt_len()];
 		inner.read_exact(salt)?;
@@ -163,7 +183,7 @@ impl<R: Read> AesReader<R> {
 		inner.read_exact(&mut verifier)?;
 		let keys = derive(password, salt, strength);
 		if keys.verifier != verifier {
-			return Err(CryptoError::WrongPassword.into());
+			return Err(CryptoError::WrongPassword);
 		}
 		Ok(Self {
 			inner: inner.take(data_len),
@@ -315,7 +335,11 @@ impl<R: Read> ZipCryptoReader<R> {
 	/// Opens an entry whose 12-byte encryption header comes next in `inner`; `check` is the
 	/// byte its last header byte decrypts to with the right password. A wrong password passes
 	/// this check once in 256; the entry's CRC-32 catches it then.
-	pub(crate) fn new(mut inner: R, password: &ArchivePassword, check: u8) -> io::Result<Self> {
+	pub(crate) fn new(
+		mut inner: R,
+		password: &ArchivePassword,
+		check: u8,
+	) -> Result<Self, CryptoError> {
 		let mut keys = CryptoKeys::new(password.as_bytes());
 		let mut header = [0u8; ZIP_CRYPTO_HEADER_LEN];
 		inner.read_exact(&mut header)?;
@@ -324,7 +348,7 @@ impl<R: Read> ZipCryptoReader<R> {
 			last = keys.decrypt(byte);
 		}
 		if last != check {
-			return Err(CryptoError::WrongPassword.into());
+			return Err(CryptoError::WrongPassword);
 		}
 		Ok(Self { inner, keys })
 	}
@@ -365,6 +389,15 @@ pub(crate) mod test_support {
 mod tests {
 	use super::{test_support::zip_crypto_encrypt, *};
 	use crate::fs::archive::test_support::archive_password;
+
+	#[test]
+	fn an_aes_entry_shorter_than_its_header_is_refused_before_reading() {
+		let stored = [0u8; 4];
+		assert!(matches!(
+			AesReader::new(&stored[..], &archive_password("pw"), AesStrength::Aes256, 4),
+			Err(CryptoError::TooShort)
+		));
+	}
 
 	#[test]
 	fn aes_round_trips_and_authenticates() {

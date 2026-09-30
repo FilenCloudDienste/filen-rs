@@ -603,6 +603,35 @@ async fn a_silent_codec_is_given_up_on() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_failed_codec_gives_back_its_own_error() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+	);
+	drop(events);
+	result
+		.send(Err(Error::custom_with_source(
+			ErrorKind::ArchiveCorrupt,
+			std::io::Error::other("damaged"),
+			None::<&str>,
+		)))
+		.unwrap();
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
+	assert!(
+		failed.error.downcast_ref::<std::io::Error>().is_some(),
+		"the codec's error reaches the caller whole, source and all"
+	);
+	setup.backend.assert_released(&job.reporter);
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	let setup = setup(|backend, files| {
 		backend.hold_requests(Request::Fetch, [files[0].uuid()]);

@@ -8,6 +8,7 @@ use crate::{
 	Error,
 	fs::archive::{
 		entry_path::{ArchivePath, PathRejection, entry_path},
+		error::read_failure,
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryKind, LinkHead, WorkerEvent},
@@ -17,11 +18,10 @@ use crate::{
 
 use super::{
 	super::{ExtractSkipReason, list::ArchiveEntryKind},
-	Refused,
 	entries::{
 		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,
 	},
-	failure, take_file,
+	take_file,
 };
 
 /// What [`walk_tar`] leaves.
@@ -47,7 +47,7 @@ pub(super) fn walk_tar<R: Read>(
 	// an extraction's driver resolves hard links against the files it created
 	let mut listed_files = SeededMap::default();
 	let mut shadowed = Shadowed::default();
-	while let Some(member) = tar.next_member().map_err(tar_failure)? {
+	while let Some(member) = tar.next_member().map_err(Error::from)? {
 		let this = ordinal;
 		ordinal += 1;
 		if member.kind == MemberKind::Dir {
@@ -80,7 +80,9 @@ pub(super) fn walk_tar<R: Read>(
 			}
 			Verdict::Skip(reason) => {
 				shadowed.note(key, Some(Shadow::of(&reason)));
-				walk.port.send(found.skipped(reason)).map_err(failure)?;
+				walk.port
+					.send(found.skipped(reason))
+					.map_err(read_failure)?;
 				continue;
 			}
 			Verdict::Take { path, apple_double } => (path, apple_double),
@@ -88,14 +90,14 @@ pub(super) fn walk_tar<R: Read>(
 		if let Some(target) = link_target {
 			let (event, shadow) = link_event(walk, &found, path, target, &shadowed);
 			shadowed.note(key, shadow);
-			walk.port.send(event).map_err(failure)?;
+			walk.port.send(event).map_err(read_failure)?;
 			continue;
 		}
 		if found.kind == ArchiveEntryKind::Dir {
 			shadowed.note(key, Some(Shadow::Other));
 			walk.port
 				.send(found.head(path, EntryKind::Dir))
-				.map_err(failure)?;
+				.map_err(read_failure)?;
 			continue;
 		}
 		let sent = take_file(
@@ -106,12 +108,12 @@ pub(super) fn walk_tar<R: Read>(
 			apple_double,
 			&mut TarBody(&mut tar),
 		)
-		.map_err(failure)?;
+		.map_err(read_failure)?;
 		// a file sent is taken, or left out as metadata
 		shadowed.note(key, (sent == 0).then_some(Shadow::MacMetadata));
 		files += sent;
 	}
-	walk.send_mac_folders().map_err(failure)?;
+	walk.send_mac_folders().map_err(read_failure)?;
 	walk.finish()?;
 	Ok(Walked {
 		rest: tar.into_inner(),
@@ -266,7 +268,7 @@ fn list_member<R: Read>(
 	// a listing reads a tar through: an AppleDouble member is told by its data here
 	let apple_double = match found.mac_shape() {
 		Some(MacShape::AppleDoubleName) => {
-			Some(apple_double(&mut TarBody(tar)).map_err(failure)?.0)
+			Some(apple_double(&mut TarBody(tar)).map_err(read_failure)?.0)
 		}
 		_ => None,
 	};
@@ -331,26 +333,10 @@ struct TarBody<'t, R>(&'t mut TarReader<R>);
 
 impl<R: Read> Read for TarBody<'_, R> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		self.0.read_body(buf).map_err(|e| match refusal(e) {
-			Ok(refused) => io::Error::new(io::ErrorKind::InvalidData, refused),
-			Err(e) => e,
+		self.0.read_body(buf).map_err(|error| match error {
+			TarError::Read(error) => error,
+			error => io::Error::new(io::ErrorKind::InvalidData, error),
 		})
-	}
-}
-
-/// What the tar reader refused, or the read error it passed on.
-fn refusal(error: TarError) -> Result<Refused, io::Error> {
-	match error {
-		TarError::Read(error) => Err(error),
-		TarError::Corrupt(what) => Ok(Refused::Corrupt(what)),
-		TarError::TooManyMembers(max) => Ok(Refused::TooManyMembers(max)),
-	}
-}
-
-fn tar_failure(error: TarError) -> Error {
-	match refusal(error) {
-		Ok(refused) => super::refused(refused),
-		Err(error) => failure(error),
 	}
 }
 

@@ -206,7 +206,8 @@ struct Driver<B: DriveBackend> {
 	/// first chunk sent last; the codec parks meanwhile.
 	held: Option<(Vec<u8>, bool)>,
 	events_closed: bool,
-	codec_result: Option<CodecResult>,
+	/// The codec returned, or was given up on.
+	codec_done: bool,
 	max_bytes: Option<u64>,
 	stall: StallWatch,
 	/// The top-level sources a file of which did not match the hash in its metadata.
@@ -312,7 +313,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		uploads: FuturesUnordered::new(),
 		held: None,
 		events_closed: false,
-		codec_result: None,
+		codec_done: false,
 		max_bytes,
 		stall: StallWatch::default(),
 		mismatched: BTreeSet::new(),
@@ -432,7 +433,7 @@ impl<B: DisposalBackend> Driver<B> {
 			if !pause_requested {
 				self.advance();
 			}
-			if self.codec_result.is_some() && self.uploads.is_empty() && self.held.is_none() {
+			if self.codec_done && self.uploads.is_empty() && self.held.is_none() {
 				return Ok(());
 			}
 			if pause_requested && self.uploads.is_empty() && self.fetches.is_empty() {
@@ -440,7 +441,7 @@ impl<B: DisposalBackend> Driver<B> {
 				continue;
 			}
 			let take_events = !pause_requested && self.held.is_none() && !self.events_closed;
-			let await_result = self.events_closed && self.codec_result.is_none();
+			let await_result = self.events_closed && !self.codec_done;
 			tokio::select! {
 				biased;
 				() = self.control.stopping() => {},
@@ -649,7 +650,7 @@ impl<B: DisposalBackend> Driver<B> {
 			}
 			(None, true) => {
 				self.stop_with(Error::custom(
-					ErrorKind::ArchiveCorrupt,
+					ErrorKind::Internal,
 					"the codec sent the archive's first chunk twice",
 				));
 				return;
@@ -668,15 +669,12 @@ impl<B: DisposalBackend> Driver<B> {
 
 	fn tick(&mut self, pause_requested: bool) {
 		self.reporter.tick();
-		let owed = self.ask.is_some()
-			|| self.held.is_some()
-			|| pause_requested
-			|| self.codec_result.is_some();
+		let owed = self.ask.is_some() || self.held.is_some() || pause_requested || self.codec_done;
 		if self
 			.stall
 			.give_up_if_stalled(&self.link, owed, self.archive_uuid)
 		{
-			self.codec_result = Some(Err(worker_died()));
+			self.codec_done = true;
 			self.stop_with(worker_died());
 		}
 	}
@@ -684,8 +682,9 @@ impl<B: DisposalBackend> Driver<B> {
 	fn codec_finished(&mut self, result: CodecResult) {
 		// the codec reads nothing more
 		self.reading = None;
-		match &result {
-			Ok(len) if *len != self.written => self.stop_with(Error::custom(
+		self.codec_done = true;
+		match result {
+			Ok(len) if len != self.written => self.stop_with(Error::custom(
 				ErrorKind::Internal,
 				format!(
 					"the codec wrote {len} archive bytes, {} were handed over",
@@ -695,12 +694,11 @@ impl<B: DisposalBackend> Driver<B> {
 			Ok(_) => {}
 			Err(error) => {
 				let ended = self.fatal.error().is_some() || self.control.is_stopping();
-				if codec_failed(self.archive_uuid, error, ended) {
-					self.stop_with(Error::custom(error.kind(), error.to_string()));
+				if codec_failed(self.archive_uuid, &error, ended) {
+					self.stop_with(error);
 				}
 			}
 		}
-		self.codec_result = Some(result);
 	}
 
 	/// Registers the archive, once the codec is done, and removes the sources if asked to: the

@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 
 use crate::{
-	Error,
+	Error, ErrorKind,
 	fs::archive::{
 		bytes::{Counting, copy_with_crc},
 		encode::{check_level, lzma_encoder_memory},
@@ -268,8 +268,12 @@ pub(crate) struct SevenZWriter<W: Write> {
 	files: Vec<FileRecord>,
 }
 
+/// The error of a call after an earlier one failed: the caller was told, and went on anyway.
 fn failed() -> io::Error {
-	io::Error::other("an earlier error ended the 7z archive")
+	io::Error::other(Error::custom(
+		ErrorKind::Internal,
+		"an earlier error ended the 7z archive",
+	))
 }
 
 impl<W: Write> SevenZWriter<W> {
@@ -293,6 +297,8 @@ impl<W: Write> SevenZWriter<W> {
 		encryption: Option<(SevenZEncryption, &ArchivePassword)>,
 		cycles_power: u8,
 	) -> io::Result<Self> {
+		// every folder is opened with this method: its level is in range from here on
+		method.check().map_err(io::Error::other)?;
 		let encryption = match encryption {
 			None => None,
 			Some((what, password)) => {
@@ -427,11 +433,12 @@ impl<W: Write> SevenZWriter<W> {
 				(Encoder::Lzma(Box::new(writer)), (Method::Lzma, props))
 			}
 			SevenZMethod::Ppmd { level } => {
+				// the level was checked when the writer was made
 				let (order, memory) = (PPMD_ORDERS[level as usize], ppmd_memory(level));
 				let mut props = vec![order];
 				props.extend_from_slice(&memory.to_le_bytes());
 				let encoder = ppmd_rust::Ppmd7Encoder::new(packer, u32::from(order), memory)
-					.map_err(|_| io::Error::other("the PPMd encoder could not start"))?;
+					.map_err(io::Error::other)?;
 				(Encoder::Ppmd(Box::new(encoder)), (Method::Ppmd, props))
 			}
 			SevenZMethod::Bzip2 { level } => (
@@ -756,6 +763,16 @@ mod tests {
 		assert_eq!(lzma2_dict_prop(3 << 20), 19);
 		assert_eq!(lzma2_dict_prop(64 << 20), 28);
 		assert_eq!(lzma2_dict_prop(u32::MAX), 40);
+	}
+
+	#[test]
+	fn a_writer_refuses_a_level_out_of_range() {
+		let method = SevenZMethod::Ppmd { level: 10 };
+		let error = SevenZWriter::new(Vec::new(), method, false, None)
+			.err()
+			.expect("the level is refused");
+		let error = Error::from(error);
+		assert_eq!(error.kind(), ErrorKind::InvalidState);
 	}
 
 	#[test]

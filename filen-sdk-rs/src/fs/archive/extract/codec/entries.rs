@@ -16,6 +16,7 @@ use crate::{
 		archive::{
 			bytes::read_full,
 			entry_path::{ArchivePath, PathRejection, entry_path},
+			error::read_failure,
 			limits::display_path,
 			worker::{EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerPort},
 		},
@@ -24,13 +25,10 @@ use crate::{
 	util::SeededSet,
 };
 
-use super::{
-	super::{
-		ExtractSkipReason,
-		list::{ArchiveEntry, ArchiveEntryKind},
-		report::ArchiveEntryId,
-	},
-	failure,
+use super::super::{
+	ExtractSkipReason,
+	list::{ArchiveEntry, ArchiveEntryKind},
+	report::ArchiveEntryId,
 };
 
 /// What the codec does with the entries it reads.
@@ -578,7 +576,7 @@ impl<'p> Walk<'p> {
 		};
 		self.port
 			.send(WorkerEvent::Listed(Box::new(entry)))
-			.map_err(failure)?;
+			.map_err(read_failure)?;
 		Ok(listed)
 	}
 

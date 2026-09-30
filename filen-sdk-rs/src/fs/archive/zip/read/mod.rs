@@ -27,9 +27,11 @@ use super::{
 };
 use crate::fs::drive_job::exceeds_limit;
 use crate::{
+	Error, ErrorKind,
 	fs::archive::{
 		bytes,
 		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
+		error::read_failure,
 		format::StreamCodec,
 		limits::HEAP_PER_INDEX_BYTE,
 		password::ArchivePassword,
@@ -78,6 +80,20 @@ pub(crate) enum ZipError {
 	Overlapping,
 	#[error(transparent)]
 	Read(#[from] io::Error),
+}
+
+impl From<ZipError> for Error {
+	fn from(error: ZipError) -> Self {
+		let kind = match error {
+			ZipError::Read(error) => return read_failure(error),
+			ZipError::Corrupt(_) | ZipError::Overlapping => ErrorKind::ArchiveCorrupt,
+			ZipError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
+			ZipError::TooLarge(_) => ErrorKind::ArchiveTooLarge,
+			ZipError::PasswordRequired => ErrorKind::ArchivePasswordRequired,
+			ZipError::WrongPassword => ErrorKind::ArchiveWrongPassword,
+		};
+		Error::custom_with_source(kind, error, None::<&str>)
+	}
 }
 
 /// What a reader may spend on a zip's index.
@@ -742,14 +758,16 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 		ZipEncryption::None => Box::new(stored),
 		ZipEncryption::ZipCrypto { check } => {
 			let password = password.ok_or(ZipError::PasswordRequired)?;
-			Box::new(ZipCryptoReader::new(stored, password, check).map_err(crypto_error)?)
+			Box::new(ZipCryptoReader::new(stored, password, check)?)
 		}
 		ZipEncryption::Aes { strength, .. } => {
 			let password = password.ok_or(ZipError::PasswordRequired)?;
-			Box::new(
-				AesReader::new(stored, password, strength, entry.compressed_size)
-					.map_err(crypto_error)?,
-			)
+			Box::new(AesReader::new(
+				stored,
+				password,
+				strength,
+				entry.compressed_size,
+			)?)
 		}
 	};
 	let encrypted = entry.encryption != ZipEncryption::None;
@@ -878,13 +896,15 @@ fn lzma_entry<'s>(
 	Ok(Box::new(reader))
 }
 
-fn crypto_error(error: io::Error) -> ZipError {
-	match error
-		.get_ref()
-		.and_then(|e| e.downcast_ref::<CryptoError>())
-	{
-		Some(CryptoError::WrongPassword) => ZipError::WrongPassword,
-		_ => ZipError::Read(error),
+impl From<CryptoError> for ZipError {
+	fn from(error: CryptoError) -> Self {
+		match error {
+			CryptoError::WrongPassword => ZipError::WrongPassword,
+			CryptoError::TooShort => ZipError::Corrupt("an AES entry too short for its header"),
+			CryptoError::Read(error) => ZipError::Read(error),
+			// only a read to the end checks the code, but it is damage all the same
+			error @ CryptoError::AuthenticationFailed => ZipError::Read(error.into()),
+		}
 	}
 }
 

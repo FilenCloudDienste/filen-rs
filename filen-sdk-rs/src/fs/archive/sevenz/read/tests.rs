@@ -9,12 +9,15 @@ use sevenz_rust2::{
 };
 
 use super::*;
-use crate::fs::archive::{
-	sevenz::{
-		crypto::RAW_KEY_POWER,
-		write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+use crate::{
+	Error, ErrorKind,
+	fs::archive::{
+		sevenz::{
+			crypto::RAW_KEY_POWER,
+			write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+		},
+		test_support::{archive_password, damaged_copies, pattern},
 	},
-	test_support::{archive_password, damaged_copies, pattern},
 };
 
 const LIMITS: SevenZLimits = SevenZLimits {
@@ -500,6 +503,20 @@ fn damage_is_detected() {
 }
 
 #[test]
+fn a_decoders_error_is_damage_without_its_message() {
+	let archive = ours(&sample(), SevenZMethod::Lzma2 { level: 1 }, true, None);
+	let mut damaged = archive.clone();
+	// the first packed byte is an LZMA2 control byte, and 0x05 is not a valid one
+	damaged[32] = 0x05;
+	let error = read_all(&damaged, None).expect_err("the data does not decode");
+	assert!(matches!(error, SevenZError::Decode(_)), "{error:?}");
+	assert_eq!(
+		error.to_string(),
+		"the 7z archive is damaged: a 7z coder's data does not decode"
+	);
+}
+
+#[test]
 fn a_byte_flip_never_panics() {
 	let archives = [
 		ours(&sample(), SevenZMethod::Lzma2 { level: 1 }, true, None),
@@ -711,15 +728,37 @@ fn aes_data_of_a_partial_block_is_damage_whatever_the_key() {
 		open_folder(&source, &folder, &[0], &[packed], 1 << 20, &mut keys).map(|_| ())
 	};
 	// told before any key is asked for
-	assert!(matches!(
-		folder(17),
-		Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK))
-	));
+	assert!(matches!(folder(17), Err(SevenZError::AesPartialBlock)));
 	// whole blocks pass on to the key (which this archive cannot give)
-	assert!(!matches!(
-		folder(32),
-		Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK))
-	));
+	assert!(!matches!(folder(32), Err(SevenZError::AesPartialBlock)));
+}
+
+#[test]
+fn a_zstd_coder_over_its_budget_stays_too_large() {
+	// a zstd frame of a 64 MiB window, far over what the coder's share of 8 MiB allows
+	let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD, 0, (26 - 10) << 3];
+	frame.extend_from_slice(&[1 | 5 << 3, 0, 0]);
+	frame.extend_from_slice(b"small");
+	let folder = Folder {
+		coders: vec![Coder {
+			method: Some(Method::Zstd),
+			props: Box::new([]),
+			inputs: 1,
+		}],
+		bind_pairs: Vec::new(),
+		packed: vec![0],
+		unpack_sizes: vec![5],
+		crc: None,
+		first_pack: 0,
+		main: 0,
+	};
+	let packed = frame.len() as u64;
+	let source = Rc::new(RefCell::new(Cursor::new(frame)));
+	let mut keys = Keys::new(None);
+	let error = open_folder(&source, &folder, &[0], &[packed], 8 << 20, &mut keys)
+		.and_then(|mut reader| reader.read_to_end(&mut Vec::new()).map_err(read_error))
+		.expect_err("the window is over the budget");
+	assert_eq!(Error::from(error).kind(), ErrorKind::ArchiveTooLarge);
 }
 
 #[test]

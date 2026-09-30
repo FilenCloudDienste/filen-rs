@@ -5,14 +5,14 @@ use std::io::{self, Read, Seek};
 use crate::{
 	Error, ErrorKind,
 	fs::archive::{
+		error::read_failure,
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
 		sevenz::{
 			SevenZError,
 			read::{
-				FOLDER_ENDS_EARLY, FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind,
-				SevenZLimits, read_error, read_index as read_sevenz_index, windows_link_target,
-				wrong_key,
+				FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind, SevenZLimits, read_error,
+				read_index as read_sevenz_index, windows_link_target, wrong_key,
 			},
 		},
 		worker::{EntryKind, SeekInput, WorkerEvent, from_source},
@@ -27,7 +27,7 @@ use super::{
 	},
 	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
-	failure, likely_wrong_password, link_target, take_file,
+	likely_wrong_password, link_target, take_file,
 };
 
 /// How a 7z entry's data is compressed, for display: its folder's coders, outermost first.
@@ -84,7 +84,7 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 		.open(index, probe, keys)
 		.map_err(|error| match error {
 			SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
-			SevenZError::Corrupt(FOLDER_ENDS_EARLY) => SevenZError::WrongPassword,
+			SevenZError::FolderEndsEarly | SevenZError::Decode(_) => SevenZError::WrongPassword,
 			error => error,
 		})
 		.and_then(|mut data| {
@@ -93,7 +93,7 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	match probed {
 		Ok(_) => Ok(PasswordCheck::Right),
 		Err(SevenZError::WrongPassword) => Ok(PasswordCheck::Wrong),
-		Err(error) => Err(sevenz_failure(error)),
+		Err(error) => Err(Error::from(error)),
 	}
 }
 
@@ -142,8 +142,7 @@ pub(super) fn extract_sevenz(
 		max_entries: job.limits.max_members,
 		decoder_memory: job.limits.decoder_memory,
 	};
-	let index =
-		read_sevenz_index(&mut source, job.len, limits, &mut keys).map_err(sevenz_failure)?;
+	let index = read_sevenz_index(&mut source, job.len, limits, &mut keys).map_err(Error::from)?;
 	// a folder's packed streams are read in turns (BCJ2 has four)
 	// (at most 5 chunks: a folder of several BCJ2 coders refetches rather than hold more)
 	source.set_slots((index.max_packed_streams() + 1).min(5));
@@ -179,10 +178,10 @@ pub(super) fn extract_sevenz(
 	let mut verified =
 		check_sevenz_password(&mut cursor, &index, &mut keys, job.password.is_some())?
 			.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
-			.map_err(sevenz_failure)?;
+			.map_err(Error::from)?;
 
 	port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
-		.map_err(failure)?;
+		.map_err(read_failure)?;
 	let mut unchecked_entries = 0;
 	// while the password is unchecked, damage in encrypted data is likelier a wrong password
 	// than a damaged archive
@@ -205,21 +204,21 @@ pub(super) fn extract_sevenz(
 		// a reparse point's data says whether it is a link, so it is read before anything is
 		// sent, and sent from here when it is a file's
 		let (found, held) = sevenz_found(&mut cursor, &index, entry, &mut keys)
-			.map_err(|error| judged(sevenz_failure(error), entry, verified))?;
+			.map_err(|error| judged(Error::from(error), entry, verified))?;
 		if entry.kind == SevenZKind::Reparse {
 			verified |= proves(entry);
 		}
 		let (path, apple_double) = match walk.judge_again(&found, verdict) {
 			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
 			Verdict::Skip(reason) => {
-				port.send(found.skipped(reason)).map_err(failure)?;
+				port.send(found.skipped(reason)).map_err(read_failure)?;
 				continue;
 			}
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
 		if entry.kind == SevenZKind::Dir {
 			port.send(found.head(path, EntryKind::Dir))
-				.map_err(failure)?;
+				.map_err(read_failure)?;
 			continue;
 		}
 		let sent = match (entry.stream, held) {
@@ -231,10 +230,10 @@ pub(super) fn extract_sevenz(
 				apple_double,
 				&mut data.as_slice(),
 			)
-			.map_err(failure),
+			.map_err(read_failure),
 			(Some(_), None) => cursor
 				.open(&index, entry, &mut keys)
-				.map_err(sevenz_failure)
+				.map_err(Error::from)
 				.and_then(|mut data| {
 					take_file(
 						walk,
@@ -244,11 +243,10 @@ pub(super) fn extract_sevenz(
 						apple_double,
 						&mut data,
 					)
-					.map_err(sevenz_io_failure)
+					.map_err(read_failure)
 				}),
-			(None, _) => {
-				take_file(walk, &found, path, Some(0), false, &mut io::empty()).map_err(failure)
-			}
+			(None, _) => take_file(walk, &found, path, Some(0), false, &mut io::empty())
+				.map_err(read_failure),
 		};
 		let sent = sent.map_err(|error| judged(error, entry, verified))?;
 		if sent > 0 && entry.stream.is_some() {
@@ -258,7 +256,7 @@ pub(super) fn extract_sevenz(
 			}
 		}
 	}
-	walk.send_mac_folders().map_err(failure)?;
+	walk.send_mac_folders().map_err(read_failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,
@@ -280,7 +278,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 	let checked = check_sevenz_password(cursor, index, keys, has_password)?;
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
-		.map_err(failure)?;
+		.map_err(read_failure)?;
 	let within_limit = check_stated_size(job, index.entries.iter().map(|entry| entry.size)).is_ok();
 	for entry in &index.entries {
 		let cheap = entry
@@ -302,7 +300,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 			{
 				sevenz_unread(index, entry)
 			}
-			Err(error) => return Err(sevenz_failure(error)),
+			Err(error) => return Err(Error::from(error)),
 		};
 		// told as an extraction tells it, when metadata is left out
 		let apple_double = if walk.skips_mac_metadata()
@@ -315,7 +313,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		};
 		walk.list(found, apple_double)?;
 	}
-	walk.send_mac_folders().map_err(failure)?;
+	walk.send_mac_folders().map_err(read_failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,
@@ -366,7 +364,7 @@ fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
 	};
 	match read {
 		Ok(apple_double) => Ok(Some(apple_double)),
-		Err(error) if from_source(&error) => Err(sevenz_io_failure(error)),
+		Err(error) if from_source(&error) => Err(read_failure(error)),
 		Err(_) => Ok(None),
 	}
 }
@@ -396,32 +394,4 @@ fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 /// Whether reading an entry failed for the archive's source rather than the archive.
 fn source_failed(error: &SevenZError) -> bool {
 	matches!(error, SevenZError::Read(error) if from_source(error))
-}
-
-fn sevenz_failure(error: SevenZError) -> Error {
-	let kind = match &error {
-		SevenZError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
-		SevenZError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
-		SevenZError::TooLarge(_) => ErrorKind::ArchiveTooLarge,
-		SevenZError::PasswordRequired => ErrorKind::ArchivePasswordRequired,
-		SevenZError::WrongPassword => ErrorKind::ArchiveWrongPassword,
-		SevenZError::Read(_) => {
-			let SevenZError::Read(error) = error else {
-				unreachable!("matched above")
-			};
-			return failure(error);
-		}
-	};
-	Error::custom(kind, error.to_string())
-}
-
-/// The error an entry's read ended with: its checks', or its source's.
-fn sevenz_io_failure(error: io::Error) -> Error {
-	if error
-		.get_ref()
-		.is_some_and(|inner| inner.is::<SevenZError>())
-	{
-		return sevenz_failure(read_error(error));
-	}
-	failure(error)
 }

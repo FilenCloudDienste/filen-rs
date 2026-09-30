@@ -12,6 +12,7 @@ mod decode;
 pub(crate) mod dispose;
 mod encode;
 mod entry_path;
+mod error;
 mod extract;
 mod format;
 mod hash;

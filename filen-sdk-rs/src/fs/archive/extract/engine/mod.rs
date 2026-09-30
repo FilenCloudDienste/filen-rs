@@ -272,7 +272,8 @@ struct Driver<B: DriveBackend> {
 	/// An event the driver cannot take on yet, and so the last it took: while it waits, the
 	/// codec parks.
 	held: Option<WorkerEvent>,
-	codec_result: Option<CodecResult>,
+	/// The codec returned, or was given up on.
+	codec_done: bool,
 	/// The order-free digest of the files and directories the job created, which the output
 	/// has to hold exactly before the archive is removed.
 	created_digest: u128,
@@ -392,7 +393,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		uploads: FuturesUnordered::new(),
 		finalizes: FuturesUnordered::new(),
 		held: None,
-		codec_result: None,
+		codec_done: false,
 		top_level_beyond: Vec::new(),
 		created_digest: 0,
 		unchecked_entries: 0,
@@ -602,7 +603,7 @@ impl<B: DisposalBackend> Driver<B> {
 			&& self.held.is_none()
 			&& self.files.is_empty()
 			&& self.ready_links.is_empty()
-			&& self.codec_result.is_some()
+			&& self.codec_done
 	}
 
 	/// Whether the codec waits for what it sent so far to be worked off first: hard links not
@@ -703,16 +704,17 @@ impl<B: DisposalBackend> Driver<B> {
 		self.reporter.tick();
 		let owed = self.held.is_some() || self.backlogged() || pause_requested;
 		if self.feed.give_up_if_stalled(owed) {
-			self.codec_result = Some(Err(worker_died()));
+			self.codec_done = true;
 			self.stop_with(worker_died());
 		}
 	}
 
 	fn codec_finished(&mut self, result: CodecResult) {
-		match &result {
+		self.codec_done = true;
+		match result {
 			Ok(end) => {
 				self.report.unaccounted_bytes = end.unaccounted_bytes;
-				self.report.duplicates = end.duplicates.clone();
+				self.report.duplicates = end.duplicates;
 				self.unchecked_entries = end.unchecked_entries;
 			}
 			Err(error) => {
@@ -720,9 +722,8 @@ impl<B: DisposalBackend> Driver<B> {
 				let ended = self.fatal.error().is_some() || self.control.is_stopping();
 				// The archive is damaged from here on, but what came before it is whole: the files
 				// whose data is complete still finish, and only the one being read is dropped.
-				if codec_failed(self.archive.uuid(), error, ended) {
-					self.fatal
-						.record(Arc::new(Error::custom(error.kind(), error.to_string())));
+				if codec_failed(self.archive.uuid(), &error, ended) {
+					self.fatal.record(Arc::new(error));
 					self.held = None;
 					if let Some(ordinal) = self.current.take()
 						&& let Some(file) = self.files.remove(&ordinal)
@@ -734,7 +735,6 @@ impl<B: DisposalBackend> Driver<B> {
 				}
 			}
 		}
-		self.codec_result = Some(result);
 	}
 
 	async fn on_event(&mut self, event: WorkerEvent) -> Result<(), Stopped> {

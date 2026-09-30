@@ -3,6 +3,57 @@
 
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn a_failed_codec_gives_back_its_own_error() {
+	let setup = setup("damaged.tar", tar_of(&[("a.txt", b"a")]), |_| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	drop(events);
+	result
+		.send(Err(Error::custom_with_source(
+			ErrorKind::ArchiveCorrupt,
+			std::io::Error::other("damaged"),
+			None::<&str>,
+		)))
+		.unwrap();
+	let failed = job.running.await.unwrap().unwrap_err();
+
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveCorrupt);
+	assert!(
+		failed.error.downcast_ref::<std::io::Error>().is_some(),
+		"the codec's error reaches the caller whole, source and all"
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_sizes_of_skipped_entries_add_up_without_overflowing() {
+	let setup = setup("bundle.zip", tar_of(&[("a.txt", b"a")]), |_| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	// sizes a zip64 entry may state, which together overflow a u64
+	for ordinal in 0..2 {
+		events
+			.send(WorkerEvent::Skipped(SkippedMember {
+				ordinal,
+				path: format!("huge{ordinal}.bin"),
+				path_truncated: false,
+				bytes: u64::MAX / 2 + 1,
+				reason: ExtractSkipReason::UnsupportedMethod,
+			}))
+			.await
+			.unwrap();
+	}
+	drop(events);
+	let _ = result.send(read_in_full());
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(
+		(report.counts.entries_skipped, report.counts.bytes_skipped),
+		(2, u64::MAX)
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
 /// The failure events the updates carried: whether of a directory, path, stage, error kind.
 fn failure_events(recorder: &Recorder) -> Vec<(bool, String, ExtractStage, ErrorKind)> {
 	let mut events: Vec<_> = recorder

@@ -16,12 +16,12 @@ use chrono::{DateTime, Utc};
 
 use super::{
 	SevenZError,
-	crypto::{AES_ID, AES_PARTIAL_BLOCK, AesCbcReader, AesProps, BLOCK, Key, derive_key},
+	crypto::{AES_ID, AesCbcReader, AesProps, BLOCK, Key, derive_key},
 	header::*,
 };
 use crate::fs::archive::{
 	bytes,
-	decode::{clamp_lzma_dict, open_stream},
+	decode::{CodecError, clamp_lzma_dict, open_stream},
 	format::StreamCodec,
 	limits::HEAP_PER_INDEX_BYTE,
 	password::ArchivePassword,
@@ -486,13 +486,13 @@ pub(crate) fn read_index<R: Read + Seek>(
 	};
 	let mut reader = HeaderReader::new(&header);
 	reader.byte()?;
-	let mut index =
-		read_header(&mut reader, limits, &mut heap, len).map_err(|error| match error {
-			SevenZError::Corrupt(_) if headers_encrypted && !header_checked => {
-				SevenZError::WrongPassword
-			}
-			error => error,
-		})?;
+	let mut index = read_header(&mut reader, limits, &mut heap, len).map_err(|error| {
+		if error.is_damage() && headers_encrypted && !header_checked {
+			SevenZError::WrongPassword
+		} else {
+			error
+		}
+	})?;
 	index.headers_encrypted = headers_encrypted;
 	covered.extend(
 		index
@@ -508,7 +508,7 @@ pub(crate) fn read_index<R: Read + Seek>(
 		.iter()
 		.all(|folder| folder.aes_blocks_whole(&index.pack_sizes))
 	{
-		return Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK));
+		return Err(SevenZError::AesPartialBlock);
 	}
 	// a folder no file takes its data from holds bytes nothing extracts
 	let mut used = vec![false; index.folders.len()];
@@ -572,7 +572,7 @@ fn decode_header<R: Read + Seek>(
 	// key: a read error, unlike the setup's own
 	let mut reader = open_folder(&shared, folder, offsets, sizes, limits.decoder_memory, keys)
 		.map_err(|error| match error {
-			SevenZError::Read(_) => decoding(error),
+			SevenZError::Read(_) | SevenZError::Decode(_) => decoding(error),
 			error => error,
 		})?;
 	let mut decoded = Vec::new();
@@ -1296,7 +1296,7 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 		return Err(SevenZError::Unsupported("a 7z coder"));
 	}
 	if !folder.aes_blocks_whole(sizes) {
-		return Err(SevenZError::Corrupt(AES_PARTIAL_BLOCK));
+		return Err(SevenZError::AesPartialBlock);
 	}
 	let memory = (0..folder.coders.len()).try_fold(0u64, |total, coder| {
 		Ok::<_, SevenZError>(total.saturating_add(coder_memory(folder, coder)?))
@@ -1320,7 +1320,31 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 		// the budget is the caller's to set, up to u64::MAX
 		zstd_memory: ZSTD_BASE_BYTES.saturating_add((decoder_memory - memory) / zstd_coders.max(1)),
 	};
-	builder.output(folder.main)
+	let reader = builder.output(folder.main)?;
+	Ok(Box::new(Settled(reader)))
+}
+
+/// Returns the job's end, the 7z reader's own errors and the stream decoders' (already settled,
+/// and telling a decoder over its budget from damage) unchanged, and turns anything a codec
+/// crate raised into [`SevenZError::Decode`], so that a crate's message (which may quote the
+/// data) never escapes.
+fn settle(error: io::Error) -> io::Error {
+	let passes = error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<SevenZError>() || inner.is::<CodecError>());
+	if passes || from_source(&error) {
+		return error;
+	}
+	io::Error::new(io::ErrorKind::InvalidData, SevenZError::Decode(error))
+}
+
+/// Applies [`settle`] to every error of a folder's chained coders.
+struct Settled<R>(R);
+
+impl<R: Read> Read for Settled<R> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self.0.read(buf).map_err(settle)
+	}
 }
 
 struct Builder<'b, 'k, 'p, R> {
@@ -1398,7 +1422,7 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 							)
 							// its properties are checked already: what fails here is the first
 							// bytes of the stream it reads, the data's (or a wrong key's)
-							.map_err(SevenZError::Read)?,
+							.map_err(|error| read_error(settle(error)))?,
 						)
 					}
 					Method::Lzma2 => Box::new(lzma_rust2::Lzma2Reader::new(
@@ -1411,11 +1435,12 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 						Box::new(
 							ppmd_rust::Ppmd7Decoder::new(buffered(input), order, memory).map_err(
 								// its properties are checked already, as for LZMA
-								|error| {
-									SevenZError::Read(io::Error::new(
+								|error| match error {
+									ppmd_rust::Error::IoError(error) => read_error(settle(error)),
+									error => SevenZError::Decode(io::Error::new(
 										io::ErrorKind::InvalidData,
-										error.to_string(),
-									))
+										error,
+									)),
 								},
 							)?,
 						)
@@ -1510,7 +1535,7 @@ impl<'s, R: Read + Seek + 's> FolderCursor<'s, R> {
 			io::copy(&mut reader.by_ref().take(skip), &mut io::sink()).map_err(read_error)?;
 		*at += skipped;
 		if skipped != skip {
-			return Err(SevenZError::Corrupt(FOLDER_ENDS_EARLY));
+			return Err(SevenZError::FolderEndsEarly);
 		}
 		Ok(EntryData {
 			reader,
@@ -1561,7 +1586,7 @@ impl Read for EntryData<'_, '_> {
 		if n == 0 {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
-				SevenZError::Corrupt(FOLDER_ENDS_EARLY),
+				SevenZError::FolderEndsEarly,
 			));
 		}
 		self.crc.update(&buf[..n]);
@@ -1575,7 +1600,7 @@ impl Read for EntryData<'_, '_> {
 /// noise, which fails to decode or to match its CRC. The source's own errors stay.
 pub(crate) fn wrong_key(error: SevenZError) -> SevenZError {
 	match error {
-		SevenZError::Corrupt(_) => SevenZError::WrongPassword,
+		error if error.is_damage() => SevenZError::WrongPassword,
 		SevenZError::Read(error) if !from_source(&error) => SevenZError::WrongPassword,
 		error => error,
 	}
@@ -1632,22 +1657,9 @@ pub(crate) fn windows_link_target(data: &[u8]) -> Option<String> {
 	})
 }
 
-/// The error of reading past what a folder decodes to.
-pub(crate) const FOLDER_ENDS_EARLY: &str = "a 7z folder ends early";
-
 /// A decoder's read error: the source's own passes through, anything else is damaged data.
 pub(crate) fn read_error(error: io::Error) -> SevenZError {
-	if error
-		.get_ref()
-		.is_some_and(|inner| inner.is::<SevenZError>())
-	{
-		return *error
-			.into_inner()
-			.expect("checked above")
-			.downcast::<SevenZError>()
-			.expect("checked above");
-	}
-	SevenZError::Read(error)
+	error.downcast().unwrap_or_else(SevenZError::Read)
 }
 
 #[cfg(test)]

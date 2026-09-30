@@ -32,6 +32,8 @@ use std::{
 	ops::RangeInclusive,
 };
 
+use crate::{Error, ErrorKind};
+
 use super::format::StreamCodec;
 pub(crate) use input::Trailing;
 use input::{Input, TRUNCATED};
@@ -93,10 +95,15 @@ impl From<CodecError> for io::Error {
 	}
 }
 
-/// The [`CodecError`] inside an error a decoder returned, if it is one rather than the input's
-/// own error.
-pub(crate) fn codec_error(error: &io::Error) -> Option<&CodecError> {
-	error.get_ref()?.downcast_ref()
+impl From<CodecError> for Error {
+	fn from(error: CodecError) -> Self {
+		let kind = match &error {
+			CodecError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
+			CodecError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
+			CodecError::OverBudget { .. } => ErrorKind::ArchiveTooLarge,
+		};
+		Error::custom_with_source(kind, error, None::<&str>)
+	}
 }
 
 /// Skips the skippable frame `input` is at (see [`SKIPPABLE_FRAME_MAGIC`]), a truncated stream

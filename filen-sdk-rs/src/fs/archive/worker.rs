@@ -644,10 +644,12 @@ impl<'p> ChunkSink<'p> {
 			Some(head) => (head, Some(last)),
 			None => (last, None),
 		};
+		// a writer holding its head back writes the start header's zero bytes first
 		if head.len() < start.len() {
-			return Err(io::Error::other(
+			return Err(io::Error::other(Error::custom(
+				ErrorKind::Internal,
 				"the archive is shorter than its start header",
-			));
+			)));
 		}
 		head[..start.len()].copy_from_slice(start);
 		if let Some(last) = last.filter(|last| !last.is_empty()) {

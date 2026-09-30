@@ -15,8 +15,6 @@ use crate::fs::archive::password::ArchivePassword;
 use super::SevenZError;
 
 pub(crate) const BLOCK: usize = 16;
-/// AES-CBC data of other than a whole number of blocks.
-pub(crate) const AES_PARTIAL_BLOCK: &str = "7z AES data is not a whole number of blocks";
 
 /// The coder id of 7z's AES-256 + SHA-256.
 pub(crate) const AES_ID: u64 = 0x06F1_0701;
@@ -157,7 +155,7 @@ impl<R: Read> Read for AesCbcReader<R> {
 					0 => {
 						return Err(io::Error::new(
 							io::ErrorKind::InvalidData,
-							SevenZError::Corrupt(AES_PARTIAL_BLOCK),
+							SevenZError::AesPartialBlock,
 						));
 					}
 					n => filled += n,

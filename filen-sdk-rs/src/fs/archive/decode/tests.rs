@@ -48,6 +48,12 @@ fn decode(codec: StreamCodec, bytes: &[u8], budget: u64) -> io::Result<(Vec<u8>,
 	Ok((out, end))
 }
 
+/// The [`CodecError`] inside an error a decoder returned, if it is one rather than the input's
+/// own error.
+fn codec_error(error: &io::Error) -> Option<&CodecError> {
+	error.get_ref()?.downcast_ref()
+}
+
 fn codec_err(result: io::Result<(Vec<u8>, StreamEnd)>) -> CodecError {
 	let error = result.expect_err("decoding should fail");
 	match codec_error(&error) {

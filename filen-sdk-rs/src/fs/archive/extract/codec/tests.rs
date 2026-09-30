@@ -19,15 +19,21 @@ use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::archive::{
+		decode::CodecError,
 		extract::{ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, PasswordCheck},
 		format::StreamCodec,
 		password::ArchivePassword,
-		sevenz::write::{SevenZEncryption, SevenZMethod},
+		sevenz::{
+			SevenZError,
+			write::{SevenZEncryption, SevenZMethod},
+		},
+		tar_iter::TarError,
 		test_support::{
 			TarMember, archive_password, gzip, incompressible, pattern, sevenz_of, tar_of,
 			tar_with, zip_of,
 		},
 		worker,
+		zip::read::ZipError,
 	},
 	fs::name::ValidatedName,
 };
@@ -514,6 +520,45 @@ fn archives_beyond_the_limits_are_refused() {
 	};
 	let (_, end) = run_with(&bzip2, "a.bz2", small_memory);
 	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
+}
+
+/// Whether the codec failed with a `T` inside its error.
+fn failed_with<T: std::error::Error + Send + Sync + 'static>(
+	result: Result<ArchiveEnd, Error>,
+) -> bool {
+	result
+		.expect_err("the codec should fail")
+		.downcast_ref::<T>()
+		.is_some()
+}
+
+#[test]
+fn a_refusal_keeps_the_readers_own_error() {
+	assert!(failed_with::<ZipError>(run(b"PK\x03\x04rest", "a.zip").1));
+	assert!(failed_with::<SevenZError>(
+		run(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4], "a.7z").1
+	));
+	let archive = gzip(&sample_tar());
+	assert!(failed_with::<CodecError>(
+		run(&archive[..archive.len() - 10], "sample.tgz").1
+	));
+	let few = CodecLimits {
+		max_members: 2,
+		..LIMITS
+	};
+	assert!(failed_with::<TarError>(
+		run_with(&sample_tar(), "sample.tar", few).1
+	));
+	let bomb = CodecLimits {
+		expansion: Some(ExpansionLimit {
+			ratio: 10,
+			floor: 1 << 20,
+		}),
+		..LIMITS
+	};
+	assert!(failed_with::<ExpansionExceeded>(
+		run_with(&gzip(&vec![0u8; 4 << 20]), "zeros.gz", bomb).1
+	));
 }
 
 #[test]

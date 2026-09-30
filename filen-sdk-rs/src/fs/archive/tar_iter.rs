@@ -19,8 +19,9 @@ use std::io::{self, Read};
 
 use tar::{EntryType, Header};
 
-use super::{bytes::read_full, format::is_tar_header};
-use crate::fs::drive_job::exceeds_limit;
+use crate::{Error, ErrorKind, fs::drive_job::exceeds_limit};
+
+use super::{bytes::read_full, error::read_failure, format::is_tar_header};
 
 /// Bytes of a tar block: headers, and member data padded to a whole number of them.
 pub(crate) const TAR_BLOCK_LEN: usize = 512;
@@ -82,11 +83,22 @@ pub(crate) struct TarMember {
 pub(crate) enum TarError {
 	#[error(transparent)]
 	Read(#[from] io::Error),
-	#[error("corrupt tar archive: {0}")]
+	#[error("the tar archive is damaged: {0}")]
 	Corrupt(&'static str),
 	/// More headers than the caller allows.
 	#[error("the tar archive has more than {0} members")]
 	TooManyMembers(u64),
+}
+
+impl From<TarError> for Error {
+	fn from(error: TarError) -> Self {
+		let kind = match error {
+			TarError::Read(error) => return read_failure(error),
+			TarError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
+			TarError::TooManyMembers(_) => ErrorKind::ArchiveTooLarge,
+		};
+		Error::custom_with_source(kind, error, None::<&str>)
+	}
 }
 
 /// The records seen before a member, applied to it.
@@ -715,7 +727,7 @@ mod tests {
 			walk(&archive),
 			(
 				sized(&[("target", 1), ("link", 0)]),
-				Some("corrupt tar archive: a header's checksum does not match".to_owned())
+				Some("the tar archive is damaged: a header's checksum does not match".to_owned())
 			)
 		);
 		// nor can the end-of-archive marker right after a link be taken for its data

@@ -308,7 +308,8 @@ fn a_single_file_is_exactly_one_file() {
 		},
 	};
 	let written = run(format, entries, &sources, None);
-	assert_eq!(written.result.unwrap_err().kind(), ErrorKind::InvalidState);
+	// the planner never hands the codec this; if it did, that is the SDK's own bug
+	assert_eq!(written.result.unwrap_err().kind(), ErrorKind::Internal);
 	assert!(written.archive.is_empty(), "nothing is written");
 }
 
@@ -704,4 +705,12 @@ fn an_empty_zip_is_valid() {
 	assert_eq!(written.result.unwrap(), 22, "just the end record");
 	assert!(zip_crate_entries(&written.archive, None).is_empty());
 	assert!(our_entries(&written.archive, None).is_empty());
+}
+
+#[test]
+fn a_writers_own_bug_is_reported_as_internal() {
+	let bug = std::io::Error::other(Error::custom(ErrorKind::Internal, "a writer's own bug"));
+	assert_eq!(failure(bug).kind(), ErrorKind::Internal);
+	let encoder = std::io::Error::other("an encoder failed");
+	assert_eq!(failure(encoder).kind(), ErrorKind::IO);
 }

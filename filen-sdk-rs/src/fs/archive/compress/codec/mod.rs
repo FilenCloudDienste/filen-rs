@@ -95,8 +95,9 @@ fn compress_with<'p>(
 		}
 		CompressFormat::Single { compression } => {
 			let [ArchiveEntry::File { source, size, .. }] = job.entries[..] else {
+				// the planner refuses any other shape before the codec starts
 				return Err(Error::custom(
-					ErrorKind::InvalidState,
+					ErrorKind::Internal,
 					"a single compressed file is made of exactly one file",
 				));
 			};
@@ -308,7 +309,7 @@ fn failure(error: io::Error) -> Error {
 			"a source file ended before its listed size",
 		);
 	}
-	Error::custom(ErrorKind::IO, error.to_string())
+	error.into()
 }
 
 #[cfg(test)]

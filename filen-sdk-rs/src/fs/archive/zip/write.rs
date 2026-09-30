@@ -15,7 +15,7 @@ use filen_macros::js_type;
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 
 use crate::{
-	Error,
+	Error, ErrorKind,
 	fs::archive::{
 		bytes::{Counting, copy_with_crc},
 		encode::check_level,
@@ -238,7 +238,14 @@ impl<W: Write> ZipWriter<W> {
 			out.write_all(&entry.compressed_size.to_le_bytes())?;
 			out.write_all(&entry.size.to_le_bytes())?;
 		} else {
-			let too_large = || io::Error::other("an entry grew past 4 GiB without zip64");
+			// data of the `size` stated, under the threshold, cannot get here: no method expands
+			// data by the threshold's margin
+			let too_large = || {
+				io::Error::other(Error::custom(
+					ErrorKind::Internal,
+					"an entry grew past 4 GiB without zip64",
+				))
+			};
 			out.write_all(
 				&u32::try_from(entry.compressed_size)
 					.map_err(|_| too_large())?

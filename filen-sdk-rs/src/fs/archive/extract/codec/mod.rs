@@ -15,8 +15,9 @@ use crate::{Error, ErrorKind};
 use super::{
 	super::{
 		bytes::read_full,
-		decode::{CodecError, StreamCheck, StreamDecoder, Trailing, codec_error, open_stream},
+		decode::{StreamCheck, StreamDecoder, Trailing, open_stream},
 		entry_path::{ArchivePath, entry_path},
+		error::read_failure,
 		format::{
 			ArchiveFormat, DETECT_HEAD_LEN, Detected, archive_stem, detect, is_end_marker,
 			is_tar_header,
@@ -25,8 +26,7 @@ use super::{
 		password::ArchivePassword,
 		tar_iter::TAR_BLOCK_LEN,
 		worker::{
-			ChunkInput, EntryKind, JobEnded, SeekInput, WorkerEvent, WorkerPort, from_source,
-			send_file_data,
+			ChunkInput, EntryKind, SeekInput, WorkerEvent, WorkerPort, from_source, send_file_data,
 		},
 	},
 	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
@@ -116,22 +116,22 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 	);
 	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
-	let head_len = read_full(&mut input, &mut head).map_err(failure)?;
+	let head_len = read_full(&mut input, &mut head).map_err(read_failure)?;
 	let head = &head[..head_len];
 	let source = Cursor::new(head).chain(input);
 	match detect(head, &job.name) {
 		Some(Detected::Tar) => {
 			port.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
-				.map_err(failure)?;
+				.map_err(read_failure)?;
 			let walked = walk_tar(&mut walk, source, job.limits.max_members)?;
 			Ok(ArchiveEnd::plain(
-				walked.unread + drain_trailing(walked.rest).map_err(failure)?,
+				walked.unread + drain_trailing(walked.rest).map_err(read_failure)?,
 				0,
 			))
 		}
 		Some(Detected::Stream(codec)) => {
-			let decoder = open_stream(codec, source, job.limits.decoder_memory)
-				.map_err(|e| failure(e.into()))?;
+			let decoder =
+				open_stream(codec, source, job.limits.decoder_memory).map_err(Error::from)?;
 			let mut decoded = Expanding {
 				inner: decoder,
 				port,
@@ -139,7 +139,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				decoded: 0,
 			};
 			let mut block = [0u8; TAR_BLOCK_LEN];
-			let block_len = read_full(&mut decoded, &mut block).map_err(failure)?;
+			let block_len = read_full(&mut decoded, &mut block).map_err(read_failure)?;
 			let block = &block[..block_len];
 			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker
 			// alone, so only its name tells it from a file of zeros
@@ -153,7 +153,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				port.send(WorkerEvent::Opened(ArchiveFormat::Tar {
 					codec: Some(codec),
 				}))
-				.map_err(failure)?;
+				.map_err(read_failure)?;
 				let walked = walk_tar(
 					&mut walk,
 					Cursor::new(block).chain(decoded),
@@ -161,7 +161,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				)?;
 				let (_, mut decoded) = walked.rest.into_inner();
 				// zero blocks after the end-of-archive marker are the usual record padding
-				let tar_trailing = drain_trailing(&mut decoded).map_err(failure)?;
+				let tar_trailing = drain_trailing(&mut decoded).map_err(read_failure)?;
 				let end = decoded.inner.end().expect("drained to the end");
 				Ok(ArchiveEnd::plain(
 					walked.unread + tar_trailing + end.unaccounted_bytes,
@@ -169,7 +169,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				))
 			} else {
 				port.send(WorkerEvent::Opened(ArchiveFormat::Single { codec }))
-					.map_err(failure)?;
+					.map_err(read_failure)?;
 				extract_single(&mut walk, &job.name, Cursor::new(block).chain(decoded))
 			}
 		}
@@ -212,23 +212,26 @@ fn extract_single(
 	};
 	let files = if walk.listing() {
 		// what it decodes to is only known once it is decoded
-		found.size = io::copy(&mut decoded, &mut io::sink()).map_err(failure)?;
+		found.size = io::copy(&mut decoded, &mut io::sink()).map_err(read_failure)?;
 		walk.list(found, None)?;
 		0
 	} else {
 		match walk.judge(&found)? {
 			Verdict::Take { path, apple_double } => {
-				take_file(walk, &found, path, None, apple_double, &mut decoded).map_err(failure)?
+				take_file(walk, &found, path, None, apple_double, &mut decoded)
+					.map_err(read_failure)?
 			}
 			Verdict::Skip(reason) => {
-				walk.port.send(found.skipped(reason)).map_err(failure)?;
+				walk.port
+					.send(found.skipped(reason))
+					.map_err(read_failure)?;
 				0
 			}
 			Verdict::Ignore | Verdict::Root | Verdict::Held => 0,
 		}
 	};
 	// read to the end whatever became of the file, for the stream's own checks
-	io::copy(&mut decoded, &mut io::sink()).map_err(failure)?;
+	io::copy(&mut decoded, &mut io::sink()).map_err(read_failure)?;
 	walk.finish()?;
 	let end = decoded.into_inner().1.inner.end().expect("read to the end");
 	Ok(ArchiveEnd::plain(
@@ -308,9 +311,7 @@ fn check_stated_size(job: &StreamJob, sizes: impl IntoIterator<Item = u64>) -> R
 		.into_iter()
 		.fold(0u64, |total, size| total.saturating_add(size));
 	match job.limits.expansion {
-		Some(limit) if !limit.allows(job.len, stated) => {
-			Err(refused(Refused::Expansion(limit.ratio)))
-		}
+		Some(limit) if !limit.allows(job.len, stated) => Err(ExpansionExceeded(limit.ratio).into()),
 		_ => Ok(()),
 	}
 }
@@ -341,7 +342,7 @@ impl<D: Read> Read for Expanding<'_, D> {
 		{
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
-				Refused::Expansion(limit.ratio),
+				Error::from(ExpansionExceeded(limit.ratio)),
 			));
 		}
 		Ok(n)
@@ -361,49 +362,15 @@ fn drain_trailing(mut reader: impl Read) -> io::Result<u64> {
 	}
 }
 
-/// Why the codec gave up on an archive, carried inside an [`io::Error`] out of a `Read`.
+/// An archive that decodes to more than its [`ExpansionLimit`] lets it: more than this many
+/// times its size.
 #[derive(Debug, thiserror::Error)]
-enum Refused {
-	#[error("the tar archive is damaged: {0}")]
-	Corrupt(&'static str),
-	#[error("the tar archive has more than {0} members")]
-	TooManyMembers(u64),
-	#[error("the archive decodes to more than {0} times its size")]
-	Expansion(u64),
-}
+#[error("the archive decodes to more than {0} times its size")]
+struct ExpansionExceeded(u64);
 
-fn refused(refused: Refused) -> Error {
-	let kind = match refused {
-		Refused::Corrupt(_) => ErrorKind::ArchiveCorrupt,
-		Refused::TooManyMembers(_) | Refused::Expansion(_) => ErrorKind::ArchiveTooLarge,
-	};
-	Error::custom(kind, refused.to_string())
-}
-
-/// The error an archive's read ended with, as the job reports it.
-fn failure(error: io::Error) -> Error {
-	if let Some(codec) = codec_error(&error) {
-		let kind = match codec {
-			CodecError::Corrupt(_) => ErrorKind::ArchiveCorrupt,
-			CodecError::Unsupported(_) => ErrorKind::ArchiveUnsupported,
-			CodecError::OverBudget { .. } => ErrorKind::ArchiveTooLarge,
-		};
-		return Error::custom(kind, codec.to_string());
-	}
-	let kind = error.kind();
-	match error.into_inner() {
-		Some(inner) => match inner.downcast::<Refused>() {
-			Ok(refusal) => refused(*refusal),
-			Err(inner) => match inner.downcast::<JobEnded>() {
-				Ok(ended) => (*ended).into(),
-				// whatever else a read ended with came from a decoder: the data is damaged
-				Err(inner) => Error::custom(ErrorKind::ArchiveCorrupt, inner.to_string()),
-			},
-		},
-		None if kind == io::ErrorKind::UnexpectedEof => {
-			Error::custom(ErrorKind::ArchiveCorrupt, "the archive ends early")
-		}
-		None => Error::custom(ErrorKind::ArchiveCorrupt, kind.to_string()),
+impl From<ExpansionExceeded> for Error {
+	fn from(error: ExpansionExceeded) -> Self {
+		Error::custom_with_source(ErrorKind::ArchiveTooLarge, error, None::<&str>)
 	}
 }
 
