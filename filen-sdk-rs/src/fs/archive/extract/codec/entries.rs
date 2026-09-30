@@ -4,7 +4,6 @@
 
 use std::{
 	cmp::Reverse,
-	collections::HashSet,
 	io::{self, Read},
 };
 
@@ -21,12 +20,16 @@ use crate::{
 		},
 		name::{ValidatedName, keep_both::collision_key},
 	},
+	util::SeededSet,
 };
 
-use super::super::{
-	ExtractSkipReason,
-	list::{ArchiveEntry, ArchiveEntryKind},
-	report::ArchiveEntryId,
+use super::{
+	super::{
+		ExtractSkipReason,
+		list::{ArchiveEntry, ArchiveEntryKind},
+		report::ArchiveEntryId,
+	},
+	failure,
 };
 
 /// What the codec does with the entries it reads.
@@ -88,28 +91,51 @@ pub(super) enum MacShape {
 /// judged: a folder that ends up holding nothing extracted is left out as metadata, but one
 /// that holds a file of the user's is created by that file's path anyway, and an empty one may
 /// be the user's own. Paths are told by [`prefix_digests`] of their collision keys.
-#[derive(Default)]
+///
+/// The folders an entry is below are counted as directories are: past the member cap, the
+/// archive is too large, before a crafted one (a million deep paths in `__MACOSX`) can fill
+/// memory with them.
 struct MacFolders {
+	/// The member cap, which also caps the folders noted.
+	max: u64,
 	held: Vec<HeldMacFolder>,
-	/// The folders (by digest) some entry judged is below.
-	occupied: HashSet<u128>,
+	/// The folders (by digest) some entry judged is below. Seeded: the digests are unkeyed, so
+	/// an archive could pick paths that collide in a fixed hasher.
+	occupied: SeededSet<u128>,
 	/// The folders something extracted is below.
-	created: HashSet<u128>,
+	created: SeededSet<u128>,
 }
 
 struct HeldMacFolder {
-	/// What it is reported as when left out.
-	skipped: SkippedMember,
-	/// Where it is created, below the extraction's root.
-	path: ArchivePath,
-	modified: Option<DateTime<Utc>>,
-	/// The digests of its path and every one above it, its own last.
-	prefixes: Vec<u128>,
+	/// Its path as the archive stores it, which its digests are of; created at it less the
+	/// base (see [`Walk::within_base`]).
+	stored: ArchivePath,
+	sent: HeldAs,
+}
+
+/// What a held folder is sent as once decided.
+enum HeldAs {
+	/// An extraction's: created, or left out as `skipped`.
+	Extracted {
+		skipped: SkippedMember,
+		modified: Option<DateTime<Utc>>,
+	},
+	/// A listing's entry, its skip decided with the folder.
+	Listed(Box<ArchiveEntry>),
 }
 
 impl MacFolders {
-	/// Holds back folder `found`, to be created at `path`.
-	fn hold(&mut self, found: &Found, path: ArchivePath) {
+	fn new(max: u64) -> Self {
+		Self {
+			max,
+			held: Vec::new(),
+			occupied: SeededSet::default(),
+			created: SeededSet::default(),
+		}
+	}
+
+	/// Holds back folder `found`, which an extraction is about to create.
+	fn hold(&mut self, found: &Found) {
 		let Ok(stored) = &found.path else {
 			return;
 		};
@@ -117,33 +143,49 @@ impl MacFolders {
 			unreachable!("a skip record is a skip");
 		};
 		self.held.push(HeldMacFolder {
-			skipped,
-			path,
-			modified: found.modified,
-			prefixes: prefix_digests(&collision_keys(stored)).collect(),
+			stored: stored.clone(),
+			sent: HeldAs::Extracted {
+				skipped,
+				modified: found.modified,
+			},
 		});
 	}
 
 	/// Notes an entry at `path` judged, and whether it is `created`, in the folders above it
-	/// when they are in a `__MACOSX` folder.
-	fn below(&mut self, path: &Result<ArchivePath, PathRejection>, created: bool) {
+	/// when they are in a `__MACOSX` folder. Created ones were noted judged first, so only
+	/// those judged can pass the cap.
+	fn below(
+		&mut self,
+		path: &Result<ArchivePath, PathRejection>,
+		created: bool,
+	) -> Result<(), Error> {
 		let Ok(path) = path else {
-			return;
+			return Ok(());
 		};
 		if path
 			.segments
 			.first()
 			.is_none_or(|first| first.as_ref() != MAC_METADATA_DIR)
 		{
-			return;
+			return Ok(());
 		}
 		let keys = collision_keys(path);
 		let above = prefix_digests(&keys[..keys.len() - 1]);
 		if created {
 			self.created.extend(above);
-		} else {
-			self.occupied.extend(above);
+			return Ok(());
 		}
+		self.occupied.extend(above);
+		if self.occupied.len() as u64 > self.max {
+			return Err(Error::custom(
+				ErrorKind::ArchiveTooLarge,
+				format!(
+					"the archive's __MACOSX folders hold more than {} directories",
+					self.max
+				),
+			));
+		}
+		Ok(())
 	}
 }
 
@@ -210,6 +252,18 @@ impl Found<'_> {
 	}
 }
 
+/// What a listing says an extraction does with an entry.
+#[derive(Debug)]
+pub(super) enum Listed {
+	Extracted,
+	Skipped(ExtractSkipReason),
+	/// Nothing: the directory is the root the others land in.
+	Root,
+	/// A folder in a `__MACOSX` folder, listed once every entry was
+	/// ([`Walk::send_mac_folders`]).
+	Held,
+}
+
 /// What an extraction does with an entry.
 #[derive(Debug)]
 pub(super) enum Verdict {
@@ -241,7 +295,12 @@ pub(super) struct Walk<'p> {
 }
 
 impl<'p> Walk<'p> {
-	pub(super) fn new(port: &'p WorkerPort, task: &Task, skip_mac_metadata: bool) -> Self {
+	pub(super) fn new(
+		port: &'p WorkerPort,
+		task: &Task,
+		skip_mac_metadata: bool,
+		max_members: u64,
+	) -> Self {
 		let (listing, chooser) = match task {
 			Task::Extract(selection) => (None, selection.clone().map(Chooser::new)),
 			Task::List { archive } => (Some(*archive), None),
@@ -251,7 +310,7 @@ impl<'p> Walk<'p> {
 			skip_mac_metadata,
 			listing,
 			chooser,
-			mac_folders: MacFolders::default(),
+			mac_folders: MacFolders::new(max_members),
 		}
 	}
 
@@ -324,12 +383,12 @@ impl<'p> Walk<'p> {
 			Err(rejection) => return Ok(Verdict::Skip(path_skip_reason(rejection))),
 		};
 		if self.skip_mac_metadata {
-			self.mac_folders.below(&found.path, false);
+			self.mac_folders.below(&found.path, false)?;
 		}
 		let apple_double = match found.mac_shape() {
 			Some(MacShape::InMacFolder) if self.skip_mac_metadata => {
 				if is_dir {
-					self.mac_folders.hold(found, path);
+					self.mac_folders.hold(found);
 					return Ok(Verdict::Held);
 				}
 				return Ok(Verdict::Skip(ExtractSkipReason::MacMetadata));
@@ -338,7 +397,7 @@ impl<'p> Walk<'p> {
 			_ => false,
 		};
 		if self.skip_mac_metadata && !apple_double {
-			self.mac_folders.below(&found.path, true);
+			self.mac_folders.below(&found.path, true)?;
 		}
 		Ok(Verdict::Take { path, apple_double })
 	}
@@ -347,7 +406,8 @@ impl<'p> Walk<'p> {
 	/// not.
 	pub(super) fn taken_after_all(&mut self, found: &Found) {
 		if self.skip_mac_metadata {
-			self.mac_folders.below(&found.path, true);
+			// judged first, so nothing new is noted
+			let _ = self.mac_folders.below(&found.path, true);
 		}
 	}
 
@@ -355,35 +415,44 @@ impl<'p> Walk<'p> {
 	/// as a directory) when something below it was created, which creates it anyway, or when
 	/// nothing is below it at all, as an empty folder of the user's is; left out as metadata
 	/// only when everything below it was left out. A folder is reported as what became of it,
-	/// and none is dropped unreported for an archive removed afterwards to take along.
+	/// and none is dropped unreported for an archive removed afterwards to take along. A
+	/// listing sends each as the entry its extraction would be.
 	pub(super) fn send_mac_folders(&mut self) -> io::Result<()> {
 		let MacFolders {
 			held,
 			occupied,
 			mut created,
-		} = std::mem::take(&mut self.mac_folders);
+			..
+		} = std::mem::replace(&mut self.mac_folders, MacFolders::new(0));
 		// deepest first: a folder created creates the ones above it too
 		let mut deepest: Vec<usize> = (0..held.len()).collect();
-		deepest.sort_unstable_by_key(|&at| Reverse(held[at].prefixes.len()));
+		deepest.sort_unstable_by_key(|&at| Reverse(held[at].stored.segments.len()));
 		let mut creates = vec![false; held.len()];
 		for at in deepest {
-			let prefixes = &held[at].prefixes;
+			let prefixes: Vec<u128> = prefix_digests(&collision_keys(&held[at].stored)).collect();
 			let own = prefixes.last().expect("a folder's path has a segment");
 			if created.contains(own) || !occupied.contains(own) {
 				creates[at] = true;
-				created.extend(prefixes.iter().copied());
+				created.extend(prefixes);
 			}
 		}
-		for (folder, create) in held.into_iter().zip(creates) {
-			self.port.send(if create {
-				WorkerEvent::Entry(EntryHead {
-					ordinal: folder.skipped.ordinal,
-					path: folder.path,
-					modified: folder.modified,
-					kind: EntryKind::Dir,
-				})
-			} else {
-				WorkerEvent::Skipped(folder.skipped)
+		for (HeldMacFolder { stored, sent }, create) in held.into_iter().zip(creates) {
+			self.port.send(match sent {
+				HeldAs::Extracted { skipped, modified } if create => {
+					WorkerEvent::Entry(EntryHead {
+						ordinal: skipped.ordinal,
+						path: self
+							.within_base(stored)
+							.expect("a folder held is below the base"),
+						modified,
+						kind: EntryKind::Dir,
+					})
+				}
+				HeldAs::Extracted { skipped, .. } => WorkerEvent::Skipped(skipped),
+				HeldAs::Listed(mut entry) => {
+					entry.skip = (!create).then_some(ExtractSkipReason::MacMetadata);
+					WorkerEvent::Listed(entry)
+				}
 			})?;
 		}
 		Ok(())
@@ -397,12 +466,30 @@ impl<'p> Walk<'p> {
 		}
 	}
 
-	/// Sends what a listing says of `found`; whether an extraction creates it. `apple_double` is
+	/// Sends what a listing says of `found`; what an extraction does with it. `apple_double` is
 	/// what its data told, when read; otherwise its name decides.
-	pub(super) fn list(&self, found: Found, apple_double: Option<bool>) -> io::Result<bool> {
+	pub(super) fn list(
+		&mut self,
+		found: Found,
+		apple_double: Option<bool>,
+	) -> Result<Listed, Error> {
 		if found.is_dir() && matches!(found.path, Err(PathRejection::Empty)) {
 			// the archive's own root, which no extraction creates
-			return Ok(false);
+			return Ok(Listed::Root);
+		}
+		// the `__MACOSX` folders are decided as an extraction decides them: noted as `judge`
+		// notes an entry (a tar's hard link is taken there before it is resolved)
+		let mut held = false;
+		if self.skip_mac_metadata
+			&& (found.unreadable.is_none()
+				|| matches!(found.kind, ArchiveEntryKind::Hardlink { .. }))
+		{
+			self.mac_folders.below(&found.path, false)?;
+			match found.mac_shape() {
+				Some(MacShape::InMacFolder) => held = found.is_dir(),
+				Some(MacShape::AppleDoubleName) if apple_double == Some(true) => {}
+				_ => self.mac_folders.below(&found.path, true)?,
+			}
 		}
 		// an extraction reads a file's data to tell whether it is AppleDouble: where a listing
 		// did not, it marks the entry by its path, and does not say it is skipped
@@ -446,9 +533,21 @@ impl<'p> Walk<'p> {
 			mac_metadata,
 			kind: found.kind,
 		};
-		let extracted = entry.skip.is_none();
-		self.port.send(WorkerEvent::Listed(Box::new(entry)))?;
-		Ok(extracted)
+		if held && let Some(stored) = path {
+			self.mac_folders.held.push(HeldMacFolder {
+				stored: stored.clone(),
+				sent: HeldAs::Listed(Box::new(entry)),
+			});
+			return Ok(Listed::Held);
+		}
+		let listed = match &entry.skip {
+			None => Listed::Extracted,
+			Some(reason) => Listed::Skipped(reason.clone()),
+		};
+		self.port
+			.send(WorkerEvent::Listed(Box::new(entry)))
+			.map_err(failure)?;
+		Ok(listed)
 	}
 
 	/// The verdict on an entry `first` took into the job, once its data told more of it than its
@@ -580,7 +679,7 @@ struct Chooser {
 	base: Vec<String>,
 	/// The digests ([`path_digest`]) of the directories chosen: what is below one is chosen
 	/// too, told by looking up each of its ancestors.
-	dirs: HashSet<u128>,
+	dirs: SeededSet<u128>,
 	/// Chosen entries met so far.
 	met: usize,
 }
@@ -594,7 +693,7 @@ impl Chooser {
 				.map(|segment| collision_key(segment.as_ref()))
 				.collect(),
 			selection,
-			dirs: HashSet::new(),
+			dirs: SeededSet::default(),
 			met: 0,
 		}
 	}

@@ -12,13 +12,13 @@ use crate::{
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryHead, EntryKind, LinkHead, SkippedMember, WorkerEvent},
 	},
-	util::{SeededMap, SeededSet},
+	util::SeededMap,
 };
 
 use super::{
 	super::{ExtractSkipReason, list::ArchiveEntryKind},
 	Refused,
-	entries::{Found, LinkKeys, MacShape, Verdict, Walk, apple_double},
+	entries::{Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double},
 	failure, take_file,
 };
 
@@ -43,8 +43,8 @@ pub(super) fn walk_tar<R: Read>(
 	let mut unread = 0u64;
 	let mut files = 0u64;
 	// an extraction's driver resolves hard links against the files it created
-	let mut listed_files = ListedFiles::default();
-	let mut left_out = LeftOut::default();
+	let mut listed_files = SeededMap::default();
+	let mut shadowed = Shadowed::default();
 	while let Some(member) = tar.next_member().map_err(tar_failure)? {
 		let this = ordinal;
 		ordinal += 1;
@@ -66,24 +66,31 @@ pub(super) fn walk_tar<R: Read>(
 				found,
 				link_target,
 				&mut listed_files,
-				&mut left_out,
+				&mut shadowed,
 			)?;
 			continue;
 		}
+		let key = shadowed.key(&found.path);
 		let (path, apple_double) = match walk.judge(&found)? {
-			Verdict::Ignore | Verdict::Root | Verdict::Held => continue,
+			Verdict::Ignore | Verdict::Root | Verdict::Held => {
+				shadowed.note(key, Some(Shadow::Other));
+				continue;
+			}
 			Verdict::Skip(reason) => {
+				shadowed.note(key, Some(Shadow::of(&reason)));
 				walk.port.send(found.skipped(reason)).map_err(failure)?;
 				continue;
 			}
 			Verdict::Take { path, apple_double } => (path, apple_double),
 		};
 		if let Some(target) = link_target {
-			let event = link_event(walk, &member, &found, path, target, &left_out);
+			let (event, shadow) = link_event(walk, &member, &found, path, target, &shadowed);
+			shadowed.note(key, shadow);
 			walk.port.send(event).map_err(failure)?;
 			continue;
 		}
 		if found.kind == ArchiveEntryKind::Dir {
+			shadowed.note(key, Some(Shadow::Other));
 			walk.port
 				.send(WorkerEvent::Entry(EntryHead {
 					ordinal: this,
@@ -103,12 +110,11 @@ pub(super) fn walk_tar<R: Read>(
 			&mut TarBody(&mut tar),
 		)
 		.map_err(failure)?;
-		left_out.note(&found.path, sent == 0);
+		// a file sent is taken, or left out as metadata
+		shadowed.note(key, (sent == 0).then_some(Shadow::MacMetadata));
 		files += sent;
 	}
-	if !walk.listing() {
-		walk.send_mac_folders().map_err(failure)?;
-	}
+	walk.send_mac_folders().map_err(failure)?;
 	walk.finish()?;
 	Ok(Walked {
 		rest: tar.into_inner(),
@@ -171,44 +177,77 @@ fn member_found(member: &TarMember, ordinal: u64) -> Found<'_> {
 }
 
 /// What a listing resolves hard links against: the files it says are extracted (hard links
-/// resolved included, which later links may name), by [`LinkKeys`] of their paths, with their
-/// sizes and ordinals.
+/// resolved included, which later links may name), by [`Shadowed::key`] of their paths, with
+/// their sizes and ordinals.
+type ListedFiles = SeededMap<u64, (u64, u64)>;
+
+/// The paths, by [`LinkKeys`], whose last member so far is not extracted as a file: left out,
+/// skipped, a directory, or not chosen. A hard link names the last member at its target's path,
+/// so one of these keeps a link from copying an earlier file stored there, which the driver
+/// (or a listing's [`ListedFiles`]) still holds under the path. A file extracted at a path
+/// takes it back.
 #[derive(Default)]
-struct ListedFiles {
+struct Shadowed {
 	keys: LinkKeys,
-	by_key: SeededMap<u64, (u64, u64)>,
+	by_key: SeededMap<u64, Shadow>,
 }
 
-/// The files left out as macOS metadata, by [`LinkKeys`] of their paths: a hard link to one is
-/// left out as metadata too, rather than skipped for want of its file, which would keep the
-/// archive from being removed. Only a tar has hard links, and only AppleDouble files are noted,
-/// so this holds next to nothing.
-#[derive(Default)]
-struct LeftOut {
-	keys: LinkKeys,
-	files: SeededSet<u64>,
+/// What stands at a [`Shadowed`] path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shadow {
+	/// A file left out as macOS metadata, or a hard link to one: a link to it is left out as
+	/// metadata too, rather than skipped for want of its file, which would keep the archive
+	/// from being removed.
+	MacMetadata,
+	/// Anything else not extracted as a file.
+	Other,
 }
 
-impl LeftOut {
-	/// A file at `path` was left out as metadata, or extracted: the last file at a path is the
-	/// one a link names.
-	fn note(&mut self, path: &Result<ArchivePath, PathRejection>, left_out: bool) {
-		let Ok(path) = path else {
-			return;
-		};
-		if left_out {
-			self.files.insert(self.keys.of(path));
-		} else if !self.files.is_empty() {
-			self.files.remove(&self.keys.of(path));
+impl Shadow {
+	/// What a member skipped for `reason` leaves at its path.
+	fn of(reason: &ExtractSkipReason) -> Self {
+		if *reason == ExtractSkipReason::MacMetadata {
+			Self::MacMetadata
+		} else {
+			Self::Other
 		}
 	}
 
-	/// Whether the last file at `path` was left out as metadata.
-	fn holds(&self, path: &Result<ArchivePath, PathRejection>) -> bool {
-		!self.files.is_empty()
-			&& path
-				.as_ref()
-				.is_ok_and(|path| self.files.contains(&self.keys.of(path)))
+	/// Why a hard link to a path standing so, shown as `shown`, is skipped.
+	fn link_skip(self, shown: String) -> ExtractSkipReason {
+		match self {
+			Self::MacMetadata => ExtractSkipReason::MacMetadata,
+			Self::Other => ExtractSkipReason::Hardlink { target: shown },
+		}
+	}
+}
+
+impl Shadowed {
+	/// What `path` is looked up by, here and in [`ListedFiles`].
+	fn key(&self, path: &Result<ArchivePath, PathRejection>) -> Option<u64> {
+		path.as_ref().ok().map(|path| self.keys.of(path))
+	}
+
+	/// The member at `key` is the last one there so far: extracted as a file (`None`), or
+	/// standing as `shadow`.
+	fn note(&mut self, key: Option<u64>, shadow: Option<Shadow>) {
+		let Some(key) = key else {
+			return;
+		};
+		match shadow {
+			Some(shadow) => {
+				self.by_key.insert(key, shadow);
+			}
+			None => {
+				self.by_key.remove(&key);
+			}
+		}
+	}
+
+	/// What stands at `target`, when it is no file extracted.
+	fn at(&self, target: &Result<ArchivePath, PathRejection>) -> Option<Shadow> {
+		self.key(target)
+			.and_then(|key| self.by_key.get(&key).copied())
 	}
 }
 
@@ -220,25 +259,20 @@ fn list_member<R: Read>(
 	mut found: Found,
 	link_target: Option<HardlinkTarget>,
 	listed_files: &mut ListedFiles,
-	left_out: &mut LeftOut,
+	shadowed: &mut Shadowed,
 ) -> Result<(), Error> {
 	if let Some((target, shown)) = link_target {
-		let linked = target
-			.as_ref()
-			.ok()
-			.and_then(|target| listed_files.by_key.get(&listed_files.keys.of(target)));
-		match linked {
-			Some(&(size, target)) => {
+		let linked = shadowed.key(&target).and_then(|key| listed_files.get(&key));
+		match (shadowed.at(&target), linked) {
+			(Some(shadow), _) => found.unreadable = Some(shadow.link_skip(shown)),
+			(None, Some(&(size, target))) => {
 				found.size = size;
 				found.kind = ArchiveEntryKind::Hardlink {
 					target: shown,
 					target_id: Some(walk.listed_id(target)),
 				};
 			}
-			None if left_out.holds(&target) => {
-				found.unreadable = Some(ExtractSkipReason::MacMetadata);
-			}
-			None => {
+			(None, None) => {
 				found.unreadable = Some(ExtractSkipReason::Hardlink { target: shown });
 			}
 		}
@@ -251,61 +285,65 @@ fn list_member<R: Read>(
 		_ => None,
 	};
 	let ordinal = found.ordinal;
-	let key = found
-		.path
-		.as_ref()
-		.ok()
-		.map(|path| listed_files.keys.of(path));
+	let key = shadowed.key(&found.path);
 	let size = found.size;
-	let is_file = found.kind == ArchiveEntryKind::File;
-	if is_file {
-		left_out.note(
-			&found.path,
-			apple_double == Some(true) && walk.skips_mac_metadata(),
-		);
-	}
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
-	if walk.list(found, apple_double).map_err(failure)?
-		&& !is_dir
-		&& let Some(key) = key
-	{
-		listed_files.by_key.insert(key, (size, ordinal));
-	}
+	let shadow = match walk.list(found, apple_double)? {
+		_ if is_dir => Some(Shadow::Other),
+		Listed::Extracted => {
+			if let Some(key) = key {
+				listed_files.insert(key, (size, ordinal));
+			}
+			None
+		}
+		Listed::Skipped(reason) => Some(Shadow::of(&reason)),
+		Listed::Root | Listed::Held => Some(Shadow::Other),
+	};
+	shadowed.note(key, shadow);
 	Ok(())
 }
 
 /// What the driver is sent for `member`, a hard link taken at `path`: the link to the file it
-/// names, where this job extracts it, or the link skipped when this job extracts none there.
+/// names, where this job extracts it, or the link skipped when this job extracts none there, or
+/// the last member at the target's path is no file extracted; and what the link leaves at its
+/// own path.
 fn link_event(
 	walk: &Walk,
 	member: &TarMember,
 	found: &Found,
 	path: ArchivePath,
 	(target, shown): HardlinkTarget,
-	left_out: &LeftOut,
-) -> WorkerEvent {
+	shadowed: &Shadowed,
+) -> (WorkerEvent, Option<Shadow>) {
 	// a copy of metadata left out is metadata left out, whatever path the link is at
-	let reason = if left_out.holds(&target) {
-		ExtractSkipReason::MacMetadata
-	} else {
-		ExtractSkipReason::Hardlink { target: shown }
-	};
+	let shadow = shadowed.at(&target);
+	let (path_shown, path_truncated) = display_path(&member.path);
 	let unresolved = SkippedMember {
 		ordinal: found.ordinal,
-		path: display_path(&member.path).0.to_owned(),
-		path_truncated: display_path(&member.path).1,
+		path: path_shown.to_owned(),
+		path_truncated,
 		bytes: 0,
-		reason,
+		reason: shadow.unwrap_or(Shadow::Other).link_skip(shown),
 	};
-	match target.ok().and_then(|target| walk.within_base(target)) {
-		Some(target) => WorkerEvent::Link(Box::new(LinkHead {
-			ordinal: found.ordinal,
-			path,
-			modified: found.modified,
-			target,
-			unresolved,
-		})),
-		None => WorkerEvent::Skipped(unresolved),
+	let target = match shadow {
+		Some(_) => None,
+		None => target.ok().and_then(|target| walk.within_base(target)),
+	};
+	match target {
+		Some(target) => (
+			WorkerEvent::Link(Box::new(LinkHead {
+				ordinal: found.ordinal,
+				path,
+				modified: found.modified,
+				target,
+				unresolved,
+			})),
+			None,
+		),
+		None => (
+			WorkerEvent::Skipped(unresolved),
+			Some(shadow.unwrap_or(Shadow::Other)),
+		),
 	}
 }
 

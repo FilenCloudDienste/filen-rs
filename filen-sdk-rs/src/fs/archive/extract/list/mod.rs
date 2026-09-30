@@ -121,8 +121,9 @@ pub struct ArchiveEntry {
 	/// zip's or 7z's while it reads little enough of the archive for it (as a link's target), a
 	/// single file's never. One it did not read is marked by its path alone and `skip` leaves it
 	/// out: an extraction extracts it when it is an ordinary file after all. A `__MACOSX` folder
-	/// is marked by its path, and listed skipped; an extraction creates one that holds anything
-	/// of the user's, or nothing. See the extraction's `skip_mac_metadata`.
+	/// is marked by its path. Leaving metadata out, the listing decides one as an extraction
+	/// does, once every entry was listed: skipped when everything in it is left out, not when it
+	/// holds anything of the user's, or nothing. See the extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
 }
 
@@ -233,7 +234,8 @@ pub const MAX_LISTED_ENTRIES: usize = 10_000;
 pub const MAX_LISTED_BYTES: usize = 16 << 20;
 
 /// What a listing found: the archive, and its entries in the order of its index (a tar's in the
-/// order it stores them).
+/// order it stores them), except that the folders in `__MACOSX` folders come last when macOS
+/// metadata is left out (see [`ArchiveEntry::mac_metadata`]).
 ///
 /// An archive may hold a million entries: the listing keeps the first [`MAX_LISTED_ENTRIES`], as
 /// long as their text fits [`MAX_LISTED_BYTES`], and counts the rest, which the callback

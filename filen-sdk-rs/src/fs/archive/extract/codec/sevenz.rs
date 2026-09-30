@@ -119,7 +119,7 @@ fn sevenz_found<'e, 's, R: Read + Seek + 's>(
 	let (kind, unreadable) = match entry.kind {
 		SevenZKind::Anti => (ArchiveEntryKind::Other, Some(ExtractSkipReason::AntiItem)),
 		SevenZKind::Symlink => {
-			let target = sevenz_symlink_target(cursor, index, entry, keys);
+			let target = sevenz_symlink_target(cursor, index, entry, keys)?;
 			(
 				ArchiveEntryKind::Symlink {
 					target: target.clone(),
@@ -358,15 +358,22 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 			.stream
 			.is_some_and(|stream| stream.offset.saturating_add(entry.size) <= LIST_READ_BYTES);
 		if !(within_limit && cheap) {
-			walk.list(sevenz_unread(index, entry), None)
-				.map_err(failure)?;
+			walk.list(sevenz_unread(index, entry), None)?;
 			continue;
 		}
-		// a link's data unread for a wrong password leaves it listed as a link without its
-		// target
+		// an encrypted link's data unread for a wrong or missing password leaves it listed as
+		// a link without its target; the archive's damage and its source's failures end the
+		// listing, as they end an extraction
+		let encrypted = entry
+			.stream
+			.is_some_and(|stream| index.folders[stream.folder].encrypted());
 		let found = match sevenz_found(cursor, index, entry, keys) {
 			Ok((found, _)) => found,
-			Err(_) if checked == PasswordCheck::Wrong || !has_password => {
+			Err(error)
+				if encrypted
+					&& !source_failed(&error)
+					&& (checked == PasswordCheck::Wrong || !has_password) =>
+			{
 				sevenz_unread(index, entry)
 			}
 			Err(error) => return Err(sevenz_failure(error)),
@@ -380,8 +387,9 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		} else {
 			None
 		};
-		walk.list(found, apple_double).map_err(failure)?;
+		walk.list(found, apple_double)?;
 	}
+	walk.send_mac_folders().map_err(failure)?;
 	Ok(ArchiveEnd {
 		unaccounted_bytes: index.unaccounted_bytes,
 		duplicates: None,
@@ -452,27 +460,34 @@ fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
 	}
 }
 
-/// A symlink entry's target, for reporting: its data, when small and readable.
+/// A symlink entry's target, for reporting: its data, when small and readable; empty when it
+/// is not. Fails only on an error of the archive's source.
 fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	entry: &SevenZEntry,
 	keys: &mut Keys<'_>,
-) -> String {
+) -> Result<String, SevenZError> {
 	let readable = entry
 		.stream
 		.is_some_and(|stream| index.folders[stream.folder].supported());
 	if !readable || entry.size > MAX_ARCHIVE_PATH_BYTES as u64 {
-		return String::new();
+		return Ok(String::new());
 	}
 	let mut target = Vec::new();
-	match cursor
+	let read = cursor
 		.open(index, entry, keys)
-		.map(|mut data| data.read_to_end(&mut target))
-	{
-		Ok(Ok(_)) => display_path(&String::from_utf8_lossy(&target)).0.to_owned(),
-		_ => String::new(),
+		.and_then(|mut data| data.read_to_end(&mut target).map_err(read_error));
+	match read {
+		Ok(_) => Ok(display_path(&String::from_utf8_lossy(&target)).0.to_owned()),
+		Err(error) if source_failed(&error) => Err(error),
+		Err(_) => Ok(String::new()),
 	}
+}
+
+/// Whether reading an entry failed for the archive's source rather than the archive.
+fn source_failed(error: &SevenZError) -> bool {
+	matches!(error, SevenZError::Read(error) if from_source(error))
 }
 
 fn sevenz_failure(error: SevenZError) -> Error {

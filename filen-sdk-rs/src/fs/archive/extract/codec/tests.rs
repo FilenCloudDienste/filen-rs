@@ -1591,7 +1591,8 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 			skip.then_some(ExtractSkipReason::MacMetadata)
 		);
 	}
-	// so is a file in a `__MACOSX` folder, which is no metadata when its data is ordinary
+	// so is a file in a `__MACOSX` folder, which is no metadata when its data is ordinary; the
+	// folder, listed once every entry was, is created for it as an extraction creates it
 	let tar = tar_of(&[("__MACOSX/", b""), ("__MACOSX/notes.txt", b"plain")]);
 	let (entries, _) = listed(
 		&tar,
@@ -1600,9 +1601,16 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 	assert_eq!(
 		entries
 			.iter()
-			.map(|entry| (entry.mac_metadata, entry.skip.clone()))
+			.map(|entry| (
+				entry.stored_path.as_str(),
+				entry.mac_metadata,
+				entry.skip.clone()
+			))
 			.collect::<Vec<_>>(),
-		[(true, Some(ExtractSkipReason::MacMetadata)), (false, None)]
+		[
+			("__MACOSX/notes.txt", false, None),
+			("__MACOSX/", true, None)
+		]
 	);
 }
 
@@ -1958,19 +1966,18 @@ fn a_partial_extraction_sends_what_was_chosen_below_its_base() {
 	assert_eq!(outline(&seen), ["file docs/a.txt 1", "dir docs"]);
 }
 
-/// A solid 7z of a file of `before` zero bytes, then a symlink to `target`.
-fn sevenz_link_after(before: usize, target: &[u8]) -> Vec<u8> {
+/// A solid 7z of a file of the bytes `before`, then a symlink to `target`.
+fn sevenz_link_after(before: &[u8], target: &[u8]) -> Vec<u8> {
 	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, SourceReader};
 	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
 	let mut link = SevenZEntry::new_file("link");
 	link.has_windows_attributes = true;
 	link.windows_attributes = 0x8000 | (0o120_777 << 16);
-	let zeros = vec![0u8; before];
 	writer
 		.push_archive_entries(
 			vec![SevenZEntry::new_file("zeros"), link],
 			vec![
-				SourceReader::new(Box::new(&zeros[..]) as Box<dyn Read>),
+				SourceReader::new(Box::new(before) as Box<dyn Read>),
 				SourceReader::new(Box::new(target) as Box<dyn Read>),
 			],
 		)
@@ -1989,18 +1996,41 @@ fn a_7z_link_is_listed_unread_past_what_a_listing_decodes() {
 		entries[1].kind.clone()
 	};
 	assert_eq!(
-		target(&sevenz_link_after(10, b"there")),
+		target(&sevenz_link_after(&[0; 10], b"there")),
 		ArchiveEntryKind::Symlink {
 			target: "there".into()
 		}
 	);
 	// past 16 MiB into its solid block, the link would cost decoding all that first
 	assert_eq!(
-		target(&sevenz_link_after(17 << 20, b"there")),
+		target(&sevenz_link_after(&vec![0; 17 << 20], b"there")),
 		ArchiveEntryKind::Symlink {
 			target: String::new()
 		}
 	);
+}
+
+#[test]
+fn a_7z_listing_ends_with_its_sources_failure_reading_a_link() {
+	// the link's data sits 3 MiB into its folder, past chunks the index is not in
+	let sevenz = sevenz_link_after(&incompressible(3 << 20, 0x7), b"there");
+	let index_from = (sevenz.len() as u64 - 1) / CHUNK_SIZE_U64;
+	// once the index was read, every chunk before it fails to fetch
+	let mut index_read = false;
+	let (_, end, _) = run_job_answering(
+		job_of(&sevenz, "l.7z", true, Task::List { archive: LISTED }),
+		|index| {
+			if index >= index_from {
+				index_read = true;
+			} else if index_read {
+				return Err(std::io::Error::other("offline"));
+			}
+			let start = usize::try_from(index * CHUNK_SIZE_U64).unwrap();
+			Ok(sevenz[start..(start + CHUNK_SIZE).min(sevenz.len())].to_vec())
+		},
+	);
+	assert!(index_read);
+	assert_eq!(kind(end), ErrorKind::IO);
 }
 
 #[test]
@@ -2112,6 +2142,160 @@ fn a_listed_hard_link_to_mac_metadata_is_metadata() {
 			("__MACOSX/copy.txt", false, None),
 		]
 	);
+}
+
+/// The listing's skip of every entry of `tar`, by stored path.
+fn listed_skips(tar: &[u8]) -> Vec<(String, Option<ExtractSkipReason>)> {
+	let (entries, end) = listed(
+		tar,
+		job_of(tar, "s.tar", true, Task::List { archive: LISTED }),
+	);
+	end.unwrap();
+	entries
+		.into_iter()
+		.map(|entry| (entry.stored_path, entry.skip))
+		.collect()
+}
+
+#[test]
+fn a_hard_link_to_metadata_stored_over_a_file_is_left_out() {
+	// a plain `._a`, then AppleDouble metadata at the same path: the link names the metadata
+	let data = apple_double_data();
+	let tar = tar_with(&[
+		TarMember::Data("._a", b"plain"),
+		TarMember::Data("._a", &data),
+		TarMember::HardLink {
+			path: "b",
+			target: "._a",
+		},
+	]);
+	let (seen, end, _) = run_job(&tar, job_of(&tar, "s.tar", true, Task::Extract(None)));
+	end.unwrap();
+	assert_eq!(
+		outline(&seen),
+		["file ._a 5", "skip ._a MacMetadata", "skip b MacMetadata"]
+	);
+	let skips = listed_skips(&tar);
+	assert_eq!(
+		skips[2],
+		("b".to_owned(), Some(ExtractSkipReason::MacMetadata))
+	);
+}
+
+#[test]
+fn a_hard_link_names_the_last_member_at_its_target() {
+	// `a` is a file, then a symlink: a link to `a` after it has no file to copy
+	let tar = tar_with(&[
+		TarMember::Data("a", b"alpha"),
+		TarMember::Symlink {
+			path: "a",
+			target: "elsewhere",
+		},
+		TarMember::HardLink {
+			path: "b",
+			target: "a",
+		},
+		TarMember::Data("a", b"again"),
+		TarMember::HardLink {
+			path: "c",
+			target: "a",
+		},
+	]);
+	let (seen, end, _) = run_job(&tar, job_of(&tar, "s.tar", true, Task::Extract(None)));
+	end.unwrap();
+	assert_eq!(
+		outline(&seen),
+		[
+			"file a 5",
+			"skip a Symlink { target: \"elsewhere\" }",
+			"skip b Hardlink { target: \"a\" }",
+			"file a 5",
+			"link c -> a",
+		]
+	);
+	let skips = listed_skips(&tar);
+	assert_eq!(
+		skips[2],
+		(
+			"b".to_owned(),
+			Some(ExtractSkipReason::Hardlink {
+				target: String::new()
+			})
+		)
+	);
+	assert_eq!(skips[4], ("c".to_owned(), None));
+}
+
+#[test]
+fn a_listing_tells_the_mac_folders_an_extraction_creates() {
+	let data = apple_double_data();
+	let entries = [
+		("__MACOSX/", None),
+		("__MACOSX/meta/", None),
+		("__MACOSX/meta/._a.txt", Some(&data[..])),
+		("__MACOSX/empty/", None),
+		("__MACOSX/mine/", None),
+		("__MACOSX/mine/notes.txt", Some(&b"plain"[..])),
+	];
+	let tar_members: Vec<(&str, &[u8])> = entries
+		.iter()
+		.map(|&(path, data)| (path, data.unwrap_or_default()))
+		.collect();
+	for (name, archive) in [
+		("m.tar", tar_of(&tar_members)),
+		("m.zip", zip_of(&entries, None)),
+		(
+			"m.7z",
+			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
+		),
+	] {
+		let (seen, end, _) = run_job(&archive, job_of(&archive, name, true, Task::Extract(None)));
+		end.unwrap();
+		let created: Vec<String> = seen
+			.iter()
+			.filter_map(|seen| match seen {
+				Seen::Dir(_, path) => Some(path.clone()),
+				_ => None,
+			})
+			.collect();
+		let (listed, end) = listed(
+			&archive,
+			job_of(&archive, name, true, Task::List { archive: LISTED }),
+		);
+		end.unwrap();
+		let mut listed_created: Vec<String> = listed
+			.iter()
+			.filter(|entry| entry.kind == ArchiveEntryKind::Dir && entry.skip.is_none())
+			.filter_map(|entry| entry.path.clone())
+			.collect();
+		let mut created = created;
+		created.sort();
+		listed_created.sort();
+		assert_eq!(listed_created, created, "{name}");
+		assert_eq!(
+			created,
+			["__MACOSX", "__MACOSX/empty", "__MACOSX/mine"],
+			"{name}"
+		);
+	}
+}
+
+#[test]
+fn deep_mac_folders_count_against_the_member_cap() {
+	// ten members, each below 200 folders of its own in __MACOSX: 2000 folders to note
+	let data = apple_double_data();
+	let deep = "/d".repeat(200);
+	let paths: Vec<String> = (0..10).map(|i| format!("__MACOSX/{i}{deep}/._f")).collect();
+	let members: Vec<TarMember> = paths
+		.iter()
+		.map(|path| TarMember::Data(path, &data))
+		.collect();
+	let tar = tar_with(&members);
+	let (_, end, _) = run_job(&tar, job_of(&tar, "m.tar", true, Task::Extract(None)));
+	assert_eq!(end.unwrap_err().kind(), ErrorKind::ArchiveTooLarge);
+	// kept whole, nothing is noted
+	let (_, end, _) = run_job(&tar, job_of(&tar, "m.tar", false, Task::Extract(None)));
+	end.unwrap();
 }
 
 #[test]

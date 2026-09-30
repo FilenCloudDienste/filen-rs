@@ -106,7 +106,12 @@ const LIST_READ_BYTES: u64 = 16 << 20;
 /// (it went away, or a fetch failed) comes back as [`ErrorKind::Cancelled`] or
 /// [`ErrorKind::IO`]; the driver knows the real one.
 pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
-	let mut walk = Walk::new(port, &job.task, job.skip_mac_metadata);
+	let mut walk = Walk::new(
+		port,
+		&job.task,
+		job.skip_mac_metadata,
+		job.limits.max_members,
+	);
 	let mut input = ChunkInput::new(port, 0, job.len);
 	let mut head = [0u8; DETECT_HEAD_LEN];
 	let head_len = read_full(&mut input, &mut head).map_err(failure)?;
@@ -206,7 +211,7 @@ fn extract_single(
 	let files = if walk.listing() {
 		// what it decodes to is only known once it is decoded
 		found.size = io::copy(&mut decoded, &mut io::sink()).map_err(failure)?;
-		walk.list(found, None).map_err(failure)?;
+		walk.list(found, None)?;
 		0
 	} else {
 		match walk.judge(&found)? {

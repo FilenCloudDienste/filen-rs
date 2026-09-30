@@ -313,9 +313,9 @@ fn list_zip(
 			Some(PreRead::AppleDouble(apple_double)) => (String::new(), Some(apple_double)),
 			Some(PreRead::Unread) | None => (String::new(), None),
 		};
-		walk.list(zip_found(entry, overlapping, target), apple_double)
-			.map_err(failure)?;
+		walk.list(zip_found(entry, overlapping, target), apple_double)?;
 	}
+	walk.send_mac_folders().map_err(failure)?;
 	// what the index shows: the bytes around and between entries would take reading every
 	// entry's local header, the whole archive
 	Ok(ArchiveEnd {

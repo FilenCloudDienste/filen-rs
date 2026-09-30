@@ -346,7 +346,8 @@ pub struct ListUpdate {
 }
 
 /// What a listing found, whether it completed, was cancelled or failed: the archive, and its
-/// entries in the order of its index (a tar's in the order it stores them).
+/// entries in the order of its index (a tar's in the order it stores them), except that the
+/// folders in `__MACOSX` folders come last when macOS metadata is left out.
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, no_default)]
 pub struct ArchiveListing {
