@@ -43,7 +43,7 @@ async fn extract_disposing(
 	let (setup, parent) = disposable(bytes, hash, configure);
 	let options = Options {
 		root,
-		dispose: Some((how, parent)),
+		dispose: Some(ArchiveDisposal::Remove { how, parent }),
 		..Options::default()
 	};
 	let job = start(&setup, options);
@@ -306,7 +306,10 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 				.insert("a.txt".to_owned(), ErrorKind::Server);
 		});
 		let options = Options {
-			dispose: Some((SourceDisposal::Trash, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::Trash,
+				parent,
+			}),
 			..Options::default()
 		};
 		let job = start(&setup, options);
@@ -354,7 +357,10 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 		&setup,
 		Options {
 			control,
-			dispose: Some((SourceDisposal::DeletePermanently, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::DeletePermanently,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -387,7 +393,10 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 		Options {
 			control,
 			config: config.clone(),
-			dispose: Some((SourceDisposal::Trash, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::Trash,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -411,7 +420,10 @@ fn start_disposing(members: &[(&str, &[u8])]) -> (Setup, Job, watch::Sender<bool
 		Options {
 			root: ExtractRoot::Destination,
 			control,
-			dispose: Some((SourceDisposal::Trash, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::Trash,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -497,7 +509,10 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 			root: ExtractRoot::Destination,
 			control,
 			config: config.clone(),
-			dispose: Some((SourceDisposal::Trash, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::Trash,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -542,7 +557,10 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let job = start(
 		&setup,
 		Options {
-			dispose: Some((SourceDisposal::Trash, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::Trash,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -558,7 +576,10 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let job = start(
 		&setup,
 		Options {
-			dispose: Some((SourceDisposal::DeletePermanently, parent)),
+			dispose: Some(ArchiveDisposal::Remove {
+				how: SourceDisposal::DeletePermanently,
+				parent,
+			}),
 			..Options::default()
 		},
 	);
@@ -571,11 +592,33 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_in_the_trash_is_kept_as_changed() {
+	let tar = good_tar();
+	let (setup, _) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let job = start(
+		&setup,
+		Options {
+			dispose: Some(ArchiveDisposal::Unavailable),
+			..Options::default()
+		},
+	);
+	let report = job.running.await.unwrap().unwrap();
+	assert_eq!(created_dirs(&setup), ["bundle", "docs"]);
+	assert!(matches!(kept(disposition(&report)), KeptReason::Changed));
+	assert_released(&setup, &job.reporter, &job.recorder);
+	let log = setup.backend.log();
+	assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zip_with_duplicate_names_is_kept() {
 	let zip = zip_of(&[("same", Some(b"1")), ("same", Some(b"2"))], None);
 	let (setup, parent) = disposable(zip, None, |_| {});
 	let options = Options {
-		dispose: Some((SourceDisposal::Trash, parent)),
+		dispose: Some(ArchiveDisposal::Remove {
+			how: SourceDisposal::Trash,
+			parent,
+		}),
 		..Options::default()
 	};
 	let report = start(&setup, options).running.await.unwrap().unwrap();

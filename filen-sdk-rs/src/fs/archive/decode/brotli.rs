@@ -5,7 +5,10 @@
 //! window, is refused; the decoder is built with `BrotliState::new_strict`, which refuses it as
 //! well (the crate's `Decompressor` accepts it).
 
-use std::io::{self, BufRead, Read};
+use std::{
+	io::{self, BufRead, Read},
+	mem,
+};
 
 use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, enc::StandardAlloc};
 
@@ -21,15 +24,22 @@ const TABLE_BYTES: u64 = 4 * 1024 * 1024;
 /// longest dictionary word (24).
 const RING_BUFFER_SLACK: u64 = 566;
 
-type State = BrotliState<StandardAlloc, StandardAlloc, StandardAlloc>;
+type Decoder = BrotliState<StandardAlloc, StandardAlloc, StandardAlloc>;
+
+enum State {
+	/// The window size is not read yet.
+	Start,
+	/// Built once the window size has been charged.
+	Decoding(Box<Decoder>),
+	Done(StreamEnd),
+	/// An error ended decoding.
+	Failed,
+}
 
 pub(super) struct BrotliDecoder<R> {
 	input: Input<R>,
 	budget: Budget,
-	/// Built once the window size has been charged.
-	state: Option<Box<State>>,
-	end: Option<StreamEnd>,
-	failed: bool,
+	state: State,
 }
 
 impl<R: Read> BrotliDecoder<R> {
@@ -37,13 +47,11 @@ impl<R: Read> BrotliDecoder<R> {
 		Self {
 			input,
 			budget,
-			state: None,
-			end: None,
-			failed: false,
+			state: State::Start,
 		}
 	}
 
-	fn start(&mut self) -> io::Result<Box<State>> {
+	fn start(&mut self) -> io::Result<Box<Decoder>> {
 		let [first] = *self
 			.input
 			.fill_to(1)?
@@ -59,11 +67,9 @@ impl<R: Read> BrotliDecoder<R> {
 		)))
 	}
 
-	fn decode(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		let mut state = match self.state.take() {
-			Some(state) => state,
-			None => self.start()?,
-		};
+	/// Decodes into `buf` with `decoder`, which goes back into the state unless the stream
+	/// ended or failed.
+	fn decode(&mut self, mut decoder: Box<Decoder>, buf: &mut [u8]) -> io::Result<usize> {
 		loop {
 			let input = self.input.fill_buf()?;
 			let at_end = input.is_empty();
@@ -80,23 +86,23 @@ impl<R: Read> BrotliDecoder<R> {
 				&mut output_offset,
 				buf,
 				&mut total_out,
-				&mut state,
+				&mut decoder,
 			);
 			self.input.consume(input_offset);
 			match result {
 				BrotliResult::ResultSuccess => {
-					self.end = Some(StreamEnd {
+					self.state = State::Done(StreamEnd {
 						check: StreamCheck::Unverifiable,
 						unaccounted_bytes: self.input.drain_trailing(&[])?,
 					});
 					return Ok(output_offset);
 				}
 				BrotliResult::NeedsMoreOutput => {
-					self.state = Some(state);
+					self.state = State::Decoding(decoder);
 					return Ok(output_offset);
 				}
 				BrotliResult::NeedsMoreInput if output_offset > 0 => {
-					self.state = Some(state);
+					self.state = State::Decoding(decoder);
 					return Ok(output_offset);
 				}
 				BrotliResult::NeedsMoreInput if at_end => {
@@ -131,19 +137,31 @@ fn window_bits(first: u8) -> Result<u32, CodecError> {
 
 impl<R: Read> Read for BrotliDecoder<R> {
 	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		if buf.is_empty() || self.end.is_some() {
+		if buf.is_empty() {
 			return Ok(0);
 		}
-		if self.failed {
-			return Err(CodecError::Corrupt(Self::INVALID).into());
+		// an error leaves the state `Failed`
+		match mem::replace(&mut self.state, State::Failed) {
+			State::Start => {
+				let decoder = self.start()?;
+				self.decode(decoder, buf)
+			}
+			State::Decoding(decoder) => self.decode(decoder, buf),
+			State::Done(end) => {
+				self.state = State::Done(end);
+				Ok(0)
+			}
+			State::Failed => Err(CodecError::Corrupt(Self::INVALID).into()),
 		}
-		self.decode(buf).inspect_err(|_| self.failed = true)
 	}
 }
 
 impl<R: Read> StreamDecoder for BrotliDecoder<R> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			State::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 

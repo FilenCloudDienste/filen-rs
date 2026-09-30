@@ -37,10 +37,11 @@ use crate::{
 };
 
 use super::{
-	CompressFormat, CompressSources,
+	CheckedArchive, CheckedFormat, CompressFormat, CompressSources,
 	codec::{ArchiveEntry, CompressJob, compress, tar_size},
 	engine::{
-		CompressDisposal, CompressTask, DisposalTarget, Source, cancelled, end_early, run_compress,
+		CompressDisposal, CompressTask, DisposalSource, DisposalTarget, Removal, Source, cancelled,
+		end_early, run_compress,
 	},
 	read_back::ReadBack,
 	report::{CompressCallback, CompressFailed, CompressPhase, CompressReport, Reporter},
@@ -95,6 +96,9 @@ impl Client {
 	/// `control`; a job paused before it starts waits in [`CompressPhase::Scanning`], having
 	/// listed nothing, until it is resumed or cancelled.
 	///
+	/// Returns the report, the registered archive in it; a job that ended early fails with the
+	/// report so far.
+	///
 	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn compress_items(
 		self: Arc<Self>,
@@ -117,7 +121,6 @@ impl Client {
 			disposal,
 			job,
 			sources,
-			read_back,
 		} = plan_compression(
 			&*self,
 			PlanJob {
@@ -145,7 +148,6 @@ impl Client {
 			start: Box::new(move || worker::start(move |port| compress(&port, job))),
 			report,
 			disposal,
-			read_back,
 		})
 		.await
 	}
@@ -158,7 +160,6 @@ struct Planned {
 	disposal: Option<CompressDisposal>,
 	job: CompressJob,
 	sources: Vec<Source>,
-	read_back: Option<ReadBack>,
 }
 
 /// What planning a compression borrows from its job.
@@ -195,14 +196,14 @@ async fn plan_compression(
 		.format
 		.check_name(name.as_ref())
 		.and_then(|extension_len| {
-			config
+			let format = config
 				.format
-				.check_within(config.password.is_some(), archives.codec_mem_budget)?;
+				.check_within(config.password, archives.codec_mem_budget)?;
 			sources.check_for(config.format)?;
-			Ok(extension_len)
+			Ok((extension_len, format))
 		});
-	let extension_len = match checked {
-		Ok(extension_len) => extension_len,
+	let (extension_len, format) = match checked {
+		Ok(checked) => checked,
 		Err(error) => {
 			return Err(refuse(
 				CompressReport::default(),
@@ -257,20 +258,26 @@ async fn plan_compression(
 		..CompressReport::default()
 	};
 	report.renamed.extend(top_level_renamed);
-	let how = dispose.as_ref().map(|(how, _)| *how);
-	let disposal = match dispose.map(|(how, items)| disposal(&plan, how, items, destination)) {
+	let disposed = match dispose.map(|(how, items)| {
+		disposal_sources(&plan, items, destination).map(|sources| (how, sources))
+	}) {
 		None => None,
-		Some(Ok(disposal)) => Some(disposal),
+		Some(Ok(disposed)) => Some(disposed),
 		Some(Err(error)) => return Err(refuse(report, CompressPhase::Failed, error)),
 	};
-	let (entries, sources) = match archive_entries(plan, config.format) {
-		Ok(entries) => entries,
+	let (job, sources) = match compress_job(plan, format) {
+		Ok(job) => job,
 		Err(error) => return Err(refuse(report, CompressPhase::Failed, error)),
 	};
-	if let (CompressFormat::Tar { compression: None }, Some(max)) =
-		(config.format, config.max_bytes)
+	if let (
+		CompressJob::Archive {
+			format: CheckedArchive::Tar { compression: None },
+			entries,
+		},
+		Some(max),
+	) = (&job, config.max_bytes)
 	{
-		let needed = tar_size(&entries);
+		let needed = tar_size(entries);
 		if exceeds_limit(needed, max) {
 			report.needed_bytes = Some(needed);
 			let error = Error::custom(
@@ -282,20 +289,22 @@ async fn plan_compression(
 	}
 	reporter.set_plan(report.totals, &report.skipped, &report.renamed);
 
-	// a permanent disposal reads the archive back as extracting would
-	let read_back = (how == Some(SourceDisposal::DeletePermanently))
-		.then(|| ReadBack::as_extracting(&entries, archives, config.password.clone()));
+	let disposal = disposed.map(|(how, sources)| CompressDisposal {
+		removal: match how {
+			SourceDisposal::Trash => Removal::Trash,
+			// a permanent disposal reads the archive back as extracting would
+			SourceDisposal::DeletePermanently => Removal::DeletePermanently {
+				read_back: ReadBack::as_extracting(&job, archives),
+			},
+		},
+		sources,
+	});
 	Ok(Planned {
 		extension_len,
 		report,
 		disposal,
-		job: CompressJob {
-			format: config.format,
-			entries,
-			password: config.password,
-		},
+		job,
 		sources,
-		read_back,
 	})
 }
 
@@ -332,15 +341,14 @@ async fn plan_sources(
 /// What removing `items`, the job's sources in request order, has to find unchanged: a file as
 /// it was listed, a directory where it was listed and holding exactly the files and directories
 /// the plan read below it.
-fn disposal<D>(
+fn disposal_sources<D>(
 	plan: &ItemPlan<D>,
-	how: SourceDisposal,
 	items: Vec<NonRootItemType<'static, Normal>>,
 	destination: Uuid,
-) -> Result<CompressDisposal, Error> {
-	let mut targets = Vec::with_capacity(items.len());
+) -> Result<Vec<DisposalSource>, Error> {
+	let mut sources = Vec::with_capacity(items.len());
 	for (request, item) in items.into_iter().enumerate() {
-		targets.push(match item {
+		let target = match item {
 			NonRootItemType::File(file) => match Uuid::try_from(file.parent) {
 				Ok(parent) => DisposalTarget::File(ExpectedFile::of(&*file, file.uuid(), parent)),
 				Err(_) => DisposalTarget::Unavailable { uuid: file.uuid() },
@@ -378,21 +386,20 @@ fn disposal<D>(
 					Err(_) => DisposalTarget::Unavailable { uuid },
 				}
 			}
+		};
+		sources.push(DisposalSource {
+			target,
+			hashed: true,
 		});
 	}
-	let mut hashed = vec![true; targets.len()];
 	for file in plan
 		.files
 		.iter()
 		.filter(|file| file.source.hash().is_none())
 	{
-		hashed[file.request] = false;
+		sources[file.request].hashed = false;
 	}
-	Ok(CompressDisposal {
-		how,
-		targets,
-		hashed,
-	})
+	Ok(sources)
 }
 
 /// Top-level items the planner gave keep-both names, since two sources had the same name. The
@@ -434,16 +441,42 @@ fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
 
 /// The archive's entries (directories parent first, then files) and the files the codec reads,
 /// with every path checked against what extracting accepts.
-fn archive_entries<D>(
+/// What the codec writes for `plan` in `format`, and the files it reads, by source number.
+fn compress_job<D>(
 	plan: ItemPlan<D>,
-	format: CompressFormat,
-) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
-	// the file checked up front may still have been skipped, undecryptable
-	if matches!(format, CompressFormat::Single { .. })
-		&& (plan.files.len() != 1 || !plan.dirs.is_empty())
-	{
-		return Err(single_is_one_file());
+	format: CheckedFormat,
+) -> Result<(CompressJob, Vec<Source>), Error> {
+	match format {
+		CheckedFormat::Archive(format) => {
+			let (entries, sources) = archive_entries(plan)?;
+			Ok((CompressJob::Archive { format, entries }, sources))
+		}
+		CheckedFormat::Single(compression) => {
+			// the file checked up front may still have been skipped, undecryptable
+			let ItemPlan { files, dirs, .. } = plan;
+			let (Ok([file]), true) = (<[_; 1]>::try_from(files), dirs.is_empty()) else {
+				return Err(single_is_one_file());
+			};
+			// with no directory planned, the file is at the top
+			let path = file.name.as_ref().to_owned();
+			check_path(&path, 0)?;
+			let job = CompressJob::Single {
+				compression,
+				source: 0,
+				size: file.size,
+			};
+			let source = Source {
+				file: file.source,
+				path,
+				request: file.request,
+			};
+			Ok((job, vec![source]))
+		}
 	}
+}
+
+/// The entries of an archive of `plan`, and the files it reads, by source number.
+fn archive_entries<D>(plan: ItemPlan<D>) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
 	let mut dir_paths: Vec<String> = Vec::with_capacity(plan.dirs.len());
 	let path_in = |parent: DestParent, name: &ValidatedName, dir_paths: &[String]| match parent {
 		DestParent::Existing(_) => name.as_ref().to_owned(),

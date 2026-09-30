@@ -136,7 +136,7 @@ impl<B: DisposalBackend> Driver<B> {
 			return kept(KeptReason::Unconfirmed);
 		}
 		if !matches!(
-			self.layout,
+			self.opened.as_ref().map(|opened| opened.layout),
 			Some(ArchiveFormat::Zip | ArchiveFormat::SevenZ)
 		) {
 			// A streaming archive's entries carry no checksum of their own (a tar's) or share

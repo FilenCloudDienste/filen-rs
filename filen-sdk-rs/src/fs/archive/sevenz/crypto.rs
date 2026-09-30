@@ -30,7 +30,6 @@ pub(crate) const MAX_CYCLES_POWER: u8 = 22;
 pub(crate) const RAW_KEY_POWER: u8 = 0x3F;
 
 /// A derived AES-256 key.
-#[derive(Clone)]
 pub(crate) struct Key([u8; 32]);
 
 impl fmt::Debug for Key {
@@ -39,15 +38,27 @@ impl fmt::Debug for Key {
 	}
 }
 
-/// An AES coder's properties.
-#[derive(Clone, PartialEq, Eq)]
+/// An AES coder's properties, as an archive states them.
+#[derive(PartialEq, Eq)]
 pub(crate) struct AesProps {
-	pub(crate) cycles_power: u8,
-	pub(crate) salt: Vec<u8>,
-	pub(crate) iv: [u8; BLOCK],
+	cycles_power: u8,
+	salt: Vec<u8>,
+	iv: [u8; BLOCK],
 }
 
 impl AesProps {
+	pub(crate) fn cycles_power(&self) -> u8 {
+		self.cycles_power
+	}
+
+	pub(crate) fn salt(&self) -> &[u8] {
+		&self.salt
+	}
+
+	pub(crate) fn iv(&self) -> [u8; BLOCK] {
+		self.iv
+	}
+
 	/// A first byte with the cycles power and whether salt and IV follow, then a byte with
 	/// their extra lengths, then salt and IV.
 	pub(crate) fn parse(props: &[u8]) -> Result<Self, SevenZError> {
@@ -71,46 +82,47 @@ impl AesProps {
 		parsed.iv[..iv_len].copy_from_slice(&rest[salt_len..]);
 		Ok(parsed)
 	}
-
-	/// The properties with a 16-byte salt and IV.
-	pub(crate) fn encode(&self) -> Vec<u8> {
-		debug_assert_eq!(self.salt.len(), BLOCK);
-		let mut props = vec![self.cycles_power | 0xC0, 0xFF];
-		props.extend_from_slice(&self.salt);
-		props.extend_from_slice(&self.iv);
-		props
-	}
 }
 
-/// Derives the key for `password` under `props`, from its UTF-16LE form. `on_round` is called
+/// The properties the SDK writes: the cycles power, then a 16-byte salt and IV.
+pub(crate) fn encode_props(cycles_power: u8, salt: &[u8; BLOCK], iv: &[u8; BLOCK]) -> Vec<u8> {
+	let mut props = vec![cycles_power | 0xC0, 0xFF];
+	props.extend_from_slice(salt);
+	props.extend_from_slice(iv);
+	props
+}
+
+/// Derives the key for `password` from its UTF-16LE form, `salt` and `2^cycles_power` rounds.
+/// `on_round` is called
 /// every 2^16 rounds, so a long derivation (2^22 rounds of a long password take a minute on
 /// wasm) can show it is progressing and be stopped: its error ends the derivation.
 pub(crate) fn derive_key(
 	password: &ArchivePassword,
-	props: &AesProps,
+	cycles_power: u8,
+	salt: &[u8],
 	on_round: &mut dyn FnMut() -> io::Result<()>,
 ) -> Result<Key, SevenZError> {
 	let password = password.utf16le();
 	let mut key = [0u8; 32];
-	if props.cycles_power == RAW_KEY_POWER {
-		let raw = props.salt.iter().chain(&password).copied();
+	if cycles_power == RAW_KEY_POWER {
+		let raw = salt.iter().chain(&password).copied();
 		for (byte, from) in key.iter_mut().zip(raw) {
 			*byte = from;
 		}
 		return Ok(Key(key));
 	}
-	if props.cycles_power > MAX_CYCLES_POWER {
+	if cycles_power > MAX_CYCLES_POWER {
 		return Err(SevenZError::Unsupported(
 			"a 7z key derivation over the rounds the SDK spends",
 		));
 	}
-	let mut round = Vec::with_capacity(props.salt.len() + password.len() + 8);
-	round.extend_from_slice(&props.salt);
+	let mut round = Vec::with_capacity(salt.len() + password.len() + 8);
+	round.extend_from_slice(salt);
 	round.extend_from_slice(&password);
 	let counter_at = round.len();
 	round.extend_from_slice(&[0; 8]);
 	let mut sha = Sha256::new();
-	for counter in 0..1u64 << props.cycles_power {
+	for counter in 0..1u64 << cycles_power {
 		round[counter_at..].copy_from_slice(&counter.to_le_bytes());
 		sha.update(&round);
 		if counter & 0xFFFF == 0xFFFF {
@@ -233,19 +245,17 @@ mod tests {
 	use super::*;
 	use crate::fs::archive::test_support::archive_password;
 
-	fn props(cycles_power: u8) -> AesProps {
-		AesProps {
-			cycles_power,
-			salt: (0..16).collect(),
-			iv: [7; BLOCK],
-		}
-	}
+	const SALT: [u8; BLOCK] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 	#[test]
 	fn props_round_trip_and_reject_bad_lengths() {
-		let props = props(19);
-		let encoded = props.encode();
+		let encoded = encode_props(19, &SALT, &[7; BLOCK]);
 		assert_eq!(encoded.len(), 34);
+		let props = AesProps {
+			cycles_power: 19,
+			salt: SALT.to_vec(),
+			iv: [7; BLOCK],
+		};
 		assert!(AesProps::parse(&encoded).unwrap() == props);
 		assert!(AesProps::parse(&encoded[..33]).is_err());
 		assert!(AesProps::parse(&[]).is_err());
@@ -276,7 +286,8 @@ mod tests {
 		] {
 			let key = derive_key(
 				&archive_password(password),
-				&props(cycles_power),
+				cycles_power,
+				&SALT,
 				&mut || Ok(()),
 			)
 			.unwrap();
@@ -293,7 +304,8 @@ mod tests {
 		assert!(matches!(
 			derive_key(
 				&archive_password("p"),
-				&props(MAX_CYCLES_POWER + 1),
+				MAX_CYCLES_POWER + 1,
+				&SALT,
 				&mut || Ok(())
 			),
 			Err(SevenZError::Unsupported(_))
@@ -303,7 +315,7 @@ mod tests {
 	#[test]
 	fn a_long_derivation_reports_its_rounds_and_stops_when_told() {
 		let mut rounds = 0;
-		derive_key(&archive_password("pw"), &props(18), &mut || {
+		derive_key(&archive_password("pw"), 18, &SALT, &mut || {
 			rounds += 1;
 			Ok(())
 		})
@@ -313,7 +325,8 @@ mod tests {
 		let mut rounds = 0;
 		let stopped = derive_key(
 			&archive_password("pw"),
-			&props(MAX_CYCLES_POWER),
+			MAX_CYCLES_POWER,
+			&SALT,
 			&mut || {
 				rounds += 1;
 				Err(io::Error::other("the job ended"))

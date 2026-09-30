@@ -33,19 +33,18 @@ const FILTER_BYTES: u64 = 64 * 1024;
 pub(super) struct XzDecoder<'a, R> {
 	state: State<'a, R>,
 	budget: Budget,
-	stream: Option<StreamState>,
+	/// Whether every stream so far carried a check this decoder verified.
 	check: StreamCheck,
-	end: Option<StreamEnd>,
 }
 
 enum State<'a, R> {
 	StreamHeader(Input<R>),
 	/// Expecting a block header, or the index that follows the last block.
-	BlockHeader(Input<R>),
-	Block(Box<Block<'a, R>>),
+	BlockHeader(Input<R>, StreamState),
+	Block(Box<Block<'a, R>>, StreamState),
 	/// Between streams: zero padding, then another stream or the end.
 	StreamPadding(Input<R>),
-	Done,
+	Done(StreamEnd),
 	/// An error ended decoding.
 	Failed,
 }
@@ -78,19 +77,11 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 		Self {
 			state: State::StreamHeader(input),
 			budget,
-			stream: None,
 			check: StreamCheck::Verified,
-			end: None,
 		}
 	}
 
-	fn stream(&mut self) -> &mut StreamState {
-		self.stream
-			.as_mut()
-			.expect("a stream header was read first")
-	}
-
-	fn read_stream_header(&mut self, input: &mut Input<R>) -> io::Result<()> {
+	fn read_stream_header(input: &mut Input<R>) -> io::Result<StreamState> {
 		let header: [u8; 12] = input.read_array()?;
 		if header[..6] != XZ_MAGIC {
 			return Err(CodecError::Corrupt("not an xz stream").into());
@@ -102,15 +93,19 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 		if flags[0] != 0 || flags[1] & 0xF0 != 0 {
 			return Err(CodecError::Unsupported("xz stream flags").into());
 		}
-		self.stream = Some(StreamState {
+		Ok(StreamState {
 			flags,
 			blocks: 0,
 			records: blake3::Hasher::new(),
-		});
-		Ok(())
+		})
 	}
 
-	fn open_block(&self, mut input: Input<R>, size_byte: u8) -> io::Result<Block<'a, R>> {
+	fn open_block(
+		&self,
+		mut input: Input<R>,
+		size_byte: u8,
+		stream: &StreamState,
+	) -> io::Result<Block<'a, R>> {
 		let header_size = (usize::from(size_byte) + 1) * 4;
 		let mut header = [0u8; 1024];
 		header[0] = size_byte;
@@ -161,11 +156,6 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 			u64::from(lzma2_get_memory_usage(dict_size)) * 1024
 				+ FILTER_BYTES * before.len() as u64,
 		)?;
-		let check_id = self
-			.stream
-			.as_ref()
-			.expect("a stream header was read first")
-			.check_id();
 		let block_input = BlockInput {
 			input,
 			limit: compressed_size,
@@ -183,11 +173,15 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 			compressed_size,
 			decoded_size,
 			decoded: 0,
-			check: Check::new(check_id),
+			check: Check::new(stream.check_id()),
 		})
 	}
 
-	fn finish_block(&mut self, block: Block<'a, R>) -> io::Result<Input<R>> {
+	fn finish_block(
+		&mut self,
+		block: Block<'a, R>,
+		stream: &mut StreamState,
+	) -> io::Result<Input<R>> {
 		let BlockInput {
 			mut input,
 			read: compressed,
@@ -214,7 +208,6 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 		self.check = self.check.and(outcome);
 
 		let unpadded = block.header_size + compressed + check_size as u64;
-		let stream = self.stream();
 		stream.blocks += 1;
 		stream.records.update(&unpadded.to_le_bytes());
 		stream.records.update(&block.decoded.to_le_bytes());
@@ -222,11 +215,7 @@ impl<'a, R: Read + 'a> XzDecoder<'a, R> {
 	}
 
 	/// Reads the index (its indicator byte already consumed) and the stream footer.
-	fn read_index_and_footer(&mut self, input: &mut Input<R>) -> io::Result<()> {
-		let stream = self
-			.stream
-			.as_ref()
-			.expect("a stream header was read first");
+	fn read_index_and_footer(input: &mut Input<R>, stream: &StreamState) -> io::Result<()> {
 		let mut index = IndexReader {
 			input,
 			crc: crc32fast::Hasher::new(),
@@ -282,20 +271,24 @@ impl<'a, R: Read + 'a> Read for XzDecoder<'a, R> {
 			// an error leaves the state `Failed`
 			self.state = match mem::replace(&mut self.state, State::Failed) {
 				State::StreamHeader(mut input) => {
-					self.read_stream_header(&mut input)?;
-					State::BlockHeader(input)
+					let stream = Self::read_stream_header(&mut input)?;
+					State::BlockHeader(input, stream)
 				}
-				State::BlockHeader(mut input) => match input.read_array::<1>()? {
+				State::BlockHeader(mut input, stream) => match input.read_array::<1>()? {
 					[0] => {
-						self.read_index_and_footer(&mut input)?;
+						Self::read_index_and_footer(&mut input, &stream)?;
 						State::StreamPadding(input)
 					}
-					[size_byte] => State::Block(Box::new(self.open_block(input, size_byte)?)),
+					[size_byte] => {
+						let block = self.open_block(input, size_byte, &stream)?;
+						State::Block(Box::new(block), stream)
+					}
 				},
-				State::Block(mut block) => {
+				State::Block(mut block, mut stream) => {
 					let read = block.chain.read(buf)?;
 					if read == 0 {
-						State::BlockHeader(self.finish_block(*block)?)
+						let input = self.finish_block(*block, &mut stream)?;
+						State::BlockHeader(input, stream)
 					} else {
 						block.decoded += read as u64;
 						if block.decoded_size.is_some_and(|size| block.decoded > size) {
@@ -305,7 +298,7 @@ impl<'a, R: Read + 'a> Read for XzDecoder<'a, R> {
 							.into());
 						}
 						block.check.update(&buf[..read]);
-						self.state = State::Block(block);
+						self.state = State::Block(block, stream);
 						return Ok(read);
 					}
 				}
@@ -316,15 +309,14 @@ impl<'a, R: Read + 'a> Read for XzDecoder<'a, R> {
 					if input.fill_to(XZ_MAGIC.len())?.starts_with(&XZ_MAGIC) {
 						State::StreamHeader(input)
 					} else {
-						self.end = Some(StreamEnd {
+						State::Done(StreamEnd {
 							check: self.check,
 							unaccounted_bytes: input.drain_trailing(&[])?,
-						});
-						State::Done
+						})
 					}
 				}
-				State::Done => {
-					self.state = State::Done;
+				State::Done(end) => {
+					self.state = State::Done(end);
 					return Ok(0);
 				}
 				State::Failed => return Err(CodecError::Corrupt(Self::INVALID).into()),
@@ -335,7 +327,10 @@ impl<'a, R: Read + 'a> Read for XzDecoder<'a, R> {
 
 impl<'a, R: Read + 'a> StreamDecoder for XzDecoder<'a, R> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			State::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 
@@ -662,10 +657,23 @@ mod tests {
 		let budget = Budget::new(64 << 20).unwrap();
 		let mut decoder = XzDecoder::new(Input::new(&bytes[..], 64 * 1024), budget);
 		let mut out = Vec::new();
-		decoder.read_to_end(&mut out).unwrap();
+		let mut buf = [0; 4096];
+		// the blocks finished while a later one is being read
+		let mut finished = 0;
+		loop {
+			let read = decoder.read(&mut buf).unwrap();
+			if read == 0 {
+				break;
+			}
+			out.extend_from_slice(&buf[..read]);
+			if let State::Block(_, stream) = &decoder.state {
+				finished = finished.max(stream.blocks);
+			}
+		}
 		assert_eq!(out, data);
-		// ⌈300 000 / 65 536⌉
-		assert_eq!(decoder.stream.unwrap().blocks, 5);
+		// ⌈300 000 / 65 536⌉ blocks: the last one's end leads straight into the index, which
+		// lists all of them
+		assert_eq!(finished + 1, 5);
 	}
 
 	#[test]

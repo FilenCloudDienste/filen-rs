@@ -88,7 +88,6 @@ fn written_by(
 				let encryption = password.as_ref().map(|(password, strength)| Encryption {
 					password,
 					strength: *strength,
-					salt: vec![3; strength.salt_len()],
 				});
 				let read = writer
 					.add_file(

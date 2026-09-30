@@ -20,7 +20,7 @@ const LZMA_DICT_MIN: u64 = 4096;
 enum AloneState<R> {
 	Header(Input<R>),
 	Body(Box<LzmaReader<Input<R>>>),
-	Done,
+	Done(StreamEnd),
 	/// An error ended decoding.
 	Failed,
 }
@@ -30,7 +30,6 @@ enum AloneState<R> {
 pub(super) struct LzmaAloneDecoder<R> {
 	state: AloneState<R>,
 	budget: Budget,
-	end: Option<StreamEnd>,
 }
 
 impl<R: Read> LzmaAloneDecoder<R> {
@@ -38,7 +37,6 @@ impl<R: Read> LzmaAloneDecoder<R> {
 		Self {
 			state: AloneState::Header(input),
 			budget,
-			end: None,
 		}
 	}
 }
@@ -91,14 +89,13 @@ impl<R: Read> Read for LzmaAloneDecoder<R> {
 					}
 					// bytes the decoder read ahead but didn't use come first
 					let (mut input, unused) = reader.into_parts();
-					self.end = Some(StreamEnd {
+					AloneState::Done(StreamEnd {
 						check: StreamCheck::Unverifiable,
 						unaccounted_bytes: input.drain_trailing(&unused)?,
-					});
-					AloneState::Done
+					})
 				}
-				AloneState::Done => {
-					self.state = AloneState::Done;
+				AloneState::Done(end) => {
+					self.state = AloneState::Done(end);
 					return Ok(0);
 				}
 				AloneState::Failed => return Err(CodecError::Corrupt(Self::INVALID).into()),
@@ -109,7 +106,10 @@ impl<R: Read> Read for LzmaAloneDecoder<R> {
 
 impl<R: Read> StreamDecoder for LzmaAloneDecoder<R> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			AloneState::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 

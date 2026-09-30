@@ -206,7 +206,6 @@ pub(crate) fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) 
 				let encryption = password.as_ref().map(|password| Encryption {
 					password,
 					strength: AesStrength::Aes256,
-					salt: vec![9; AesStrength::Aes256.salt_len()],
 				});
 				writer
 					.add_file(

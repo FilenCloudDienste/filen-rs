@@ -84,21 +84,37 @@ pub(crate) async fn finalize_new_file<B: DriveBackend>(
 	register(task, lock).await
 }
 
+/// What became of a registration that gives way to a pause.
+#[cfg(feature = "archive")]
+#[expect(
+	clippy::large_enum_variant,
+	reason = "made once per file and moved once, from its registration to the driver: boxing \
+	          would add an allocation to save a copy"
+)]
+pub(crate) enum UnlessPaused {
+	/// It was attempted: how it went.
+	Ran(Result<Finalized, FinalizeError>),
+	/// A pause came before the drive lock was held: nothing was sent.
+	Paused,
+}
+
 /// Registers an uploaded file like [`finalize_new_file`], except that a pause requested before
-/// the drive lock is held ends it with nothing sent (`None`) instead of being waited out, for
-/// the caller to start it again once resumed: a job that pauses once its registrations are
-/// over is never kept from pausing by one waiting for the lock.
+/// the drive lock is held ends it with nothing sent instead of being waited out, for the caller
+/// to start it again once resumed: a job that pauses once its registrations are over is never
+/// kept from pausing by one waiting for the lock.
 #[cfg(feature = "archive")]
 pub(crate) async fn finalize_new_file_unless_paused<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
-) -> Option<Result<Finalized, FinalizeError>> {
+) -> UnlessPaused {
 	let lock = match wait_for_lock(task.backend, task.control, task.ops).await {
 		Ok(LockWait::Locked(held)) => held,
-		Ok(LockWait::Paused) => return None,
-		Ok(LockWait::Failed(error)) => return Some(Err(FinalizeError::Failed(error))),
-		Err(Stopped) => return Some(Err(FinalizeError::Stopped)),
+		Ok(LockWait::Paused) => return UnlessPaused::Paused,
+		Ok(LockWait::Failed(error)) => {
+			return UnlessPaused::Ran(Err(FinalizeError::Failed(error)));
+		}
+		Err(Stopped) => return UnlessPaused::Ran(Err(FinalizeError::Stopped)),
 	};
-	Some(register(task, lock).await)
+	UnlessPaused::Ran(register(task, lock).await)
 }
 
 /// Registers the file under the drive lock `_lock`.

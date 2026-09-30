@@ -89,7 +89,7 @@ enum State<R, D> {
 	/// Looking for the next member's magic.
 	Between(Input<R>),
 	Member(D),
-	Done,
+	Done(StreamEnd),
 	/// An error ended decoding.
 	Failed,
 }
@@ -97,7 +97,6 @@ enum State<R, D> {
 pub(super) struct Members<R, D> {
 	state: State<R, D>,
 	members: u64,
-	end: Option<StreamEnd>,
 }
 
 impl<R: Read, D: Member<R>> Members<R, D> {
@@ -105,7 +104,6 @@ impl<R: Read, D: Member<R>> Members<R, D> {
 		Self {
 			state: State::Between(input),
 			members: 0,
-			end: None,
 		}
 	}
 }
@@ -133,15 +131,14 @@ impl<R: Read, D: Member<R>> Read for Members<R, D> {
 					} else if self.members == 0 {
 						return Err(CodecError::Corrupt(D::NOT_A_STREAM).into());
 					} else {
-						self.end = Some(StreamEnd {
+						State::Done(StreamEnd {
 							check: StreamCheck::Verified,
 							unaccounted_bytes: input.drain_trailing(&[])?,
-						});
-						State::Done
+						})
 					}
 				}
-				State::Done => {
-					self.state = State::Done;
+				State::Done(end) => {
+					self.state = State::Done(end);
 					return Ok(0);
 				}
 				State::Failed => return Err(CodecError::Corrupt(D::INVALID_DATA).into()),
@@ -152,7 +149,10 @@ impl<R: Read, D: Member<R>> Read for Members<R, D> {
 
 impl<R: Read, D: Member<R>> StreamDecoder for Members<R, D> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			State::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 

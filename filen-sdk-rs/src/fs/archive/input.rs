@@ -281,9 +281,18 @@ pub(crate) struct CodecFeed<B, T> {
 	link: WorkerLink<Result<T, Error>>,
 	floor: Option<Floor>,
 	stall: StallWatch,
-	events_closed: bool,
-	/// The codec's result was taken, or the codec given up on.
-	finished: bool,
+	stage: Stage,
+}
+
+/// How far the feed has taken what the codec sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+	/// Its events still come.
+	Events,
+	/// Its events ended: its result comes next.
+	Result,
+	/// Its result was taken, or the codec given up on.
+	Done,
 }
 
 /// What [`CodecFeed::next`] took.
@@ -313,8 +322,7 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 			link,
 			floor: Some(floor),
 			stall: StallWatch::default(),
-			events_closed: false,
-			finished: false,
+			stage: Stage::Events,
 		}
 	}
 
@@ -322,8 +330,8 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	/// once its events ended, when `take_result`. Cancel-safe, as a branch of the driver's own
 	/// `select!`: nothing is taken until it is returned.
 	pub(crate) async fn next(&mut self, take_events: bool, take_result: bool) -> Fed<T> {
-		let take_events = take_events && !self.events_closed;
-		let take_result = take_result && self.events_closed && !self.finished;
+		let take_events = take_events && self.stage == Stage::Events;
+		let take_result = take_result && self.stage == Stage::Result;
 		tokio::select! {
 			biased;
 			Some(fetched) = self.input.fetched(), if self.input.fetching() => {
@@ -340,12 +348,12 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 				}
 				Some(event) => Fed::Event(event),
 				None => {
-					self.events_closed = true;
+					self.stage = Stage::Result;
 					Fed::EventsClosed
 				}
 			},
 			result = &mut self.link.done, if take_result => {
-				self.finished = true;
+				self.stage = Stage::Done;
 				self.input.codec_done();
 				Fed::Finished(result.unwrap_or_else(|_| Err(worker_died())))
 			}
@@ -373,7 +381,7 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	}
 
 	pub(crate) fn events_closed(&self) -> bool {
-		self.events_closed
+		self.stage != Stage::Events
 	}
 
 	/// Bytes of the archive the codec has read, each counted once.
@@ -416,13 +424,12 @@ impl<B: DriveBackend, T> CodecFeed<B, T> {
 	/// codec was given up on, having made no progress while the driver `owed` it nothing (a
 	/// chunk it waits on counts as owed, and so does anything once it returned).
 	pub(crate) fn give_up_if_stalled(&mut self, owed: bool) -> bool {
-		let owed = owed || self.input.owes_codec() || self.finished;
+		let owed = owed || self.input.owes_codec() || self.stage == Stage::Done;
 		let archive = self.input.archive().uuid();
 		if !self.stall.give_up_if_stalled(&self.link, owed, archive) {
 			return false;
 		}
-		self.events_closed = true;
-		self.finished = true;
+		self.stage = Stage::Done;
 		true
 	}
 }

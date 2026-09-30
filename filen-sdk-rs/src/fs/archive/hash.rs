@@ -67,7 +67,7 @@ impl HeadLastHasher {
 	}
 
 	/// The hash of the whole archive, given its head.
-	pub(crate) fn finalize(self, head: &[u8]) -> blake3::Hash {
+	pub(crate) fn finalize(&self, head: &[u8]) -> blake3::Hash {
 		let Some(last) = self.pending else {
 			// the head is the whole archive
 			return blake3::hash(head);

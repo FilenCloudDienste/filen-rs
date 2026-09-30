@@ -247,11 +247,13 @@ pub(crate) enum SevenZKind {
 	Anti,
 }
 
-/// A file's data: its folder, and where in the folder's unpacked data it starts.
+/// A file's data: its folder, where in the folder's unpacked data it starts, and the CRC-32
+/// the archive lists for it, if it lists one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamRef {
 	pub(crate) folder: usize,
 	pub(crate) offset: u64,
+	pub(crate) crc: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,8 +264,8 @@ pub(crate) struct SevenZEntry {
 	/// The name was not valid UTF-16 and was decoded lossily.
 	pub(crate) name_rewritten: bool,
 	pub(crate) kind: SevenZKind,
+	/// 0 for an entry without data.
 	pub(crate) size: u64,
-	pub(crate) crc: Option<u32>,
 	pub(crate) modified: Option<DateTime<Utc>>,
 	pub(crate) stream: Option<StreamRef>,
 }
@@ -326,9 +328,16 @@ impl Heap {
 /// Derived keys, kept for the folders that share them, and the rounds still allowed.
 pub(crate) struct Keys<'p> {
 	password: Option<&'p ArchivePassword>,
-	derived: Vec<(AesProps, Key)>,
+	derived: Vec<DerivedKey>,
 	rounds_left: u64,
 	on_round: Option<&'p dyn Fn() -> io::Result<()>>,
+}
+
+/// A key and what it was derived with; the IV is not part of it.
+struct DerivedKey {
+	cycles_power: u8,
+	salt: Vec<u8>,
+	key: Key,
 }
 
 impl<'p> Keys<'p> {
@@ -350,18 +359,25 @@ impl<'p> Keys<'p> {
 		}
 	}
 
-	fn key(&mut self, props: &AesProps) -> Result<Key, SevenZError> {
+	/// Whether a password was given to derive keys from.
+	pub(crate) fn has_password(&self) -> bool {
+		self.password.is_some()
+	}
+
+	fn key(&mut self, props: &AesProps) -> Result<&Key, SevenZError> {
 		let password = self.password.ok_or(SevenZError::PasswordRequired)?;
-		// the IV is not part of the key
-		if let Some((_, key)) = self.derived.iter().find(|(derived, _)| {
-			derived.cycles_power == props.cycles_power && derived.salt == props.salt
-		}) {
-			return Ok(key.clone());
+		let (cycles_power, salt) = (props.cycles_power(), props.salt());
+		if let Some(at) = self
+			.derived
+			.iter()
+			.position(|derived| derived.cycles_power == cycles_power && derived.salt == salt)
+		{
+			return Ok(&self.derived[at].key);
 		}
 		if exceeds_limit(self.derived.len() as u64 + 1, MAX_KEYS) {
 			return Err(SevenZError::Unsupported("a 7z archive with too many keys"));
 		}
-		let rounds = match props.cycles_power {
+		let rounds = match cycles_power {
 			// every key costs at least a round, so salts alone cannot make keys without end
 			0x3F => 1,
 			power if power <= super::crypto::MAX_CYCLES_POWER => 1u64 << power,
@@ -378,11 +394,15 @@ impl<'p> Keys<'p> {
 				"7z keys that together take too long to derive",
 			))?;
 		let on_round = self.on_round;
-		let key = derive_key(password, props, &mut || {
+		let key = derive_key(password, cycles_power, salt, &mut || {
 			on_round.map_or(Ok(()), |on_round| on_round())
 		})?;
-		self.derived.push((props.clone(), key.clone()));
-		Ok(key)
+		let derived = DerivedKey {
+			cycles_power,
+			salt: salt.to_vec(),
+			key,
+		};
+		Ok(&self.derived.push_mut(derived).key)
 	}
 }
 
@@ -605,8 +625,15 @@ struct StreamsInfo {
 	substreams: Vec<Substreams>,
 }
 
-/// A folder's substreams (its files' data, one after the other): each one's size and CRC-32.
-type Substreams = Vec<(u64, Option<u32>)>;
+/// A folder's substreams: its files' data, one after the other.
+type Substreams = Vec<Substream>;
+
+/// One file's data in a folder.
+#[derive(Clone, Copy)]
+struct Substream {
+	size: u64,
+	crc: Option<u32>,
+}
 
 fn pack_offsets(streams: &StreamsInfo, len: u64) -> Result<Vec<u64>, SevenZError> {
 	let mut at = START_HEADER_LEN_U64
@@ -699,7 +726,12 @@ fn read_streams_info(
 		info.substreams = info
 			.folders
 			.iter()
-			.map(|folder| vec![(folder.size(), folder.crc)])
+			.map(|folder| {
+				vec![Substream {
+					size: folder.size(),
+					crc: folder.crc,
+				}]
+			})
 			.collect();
 	}
 	if id != K_END {
@@ -900,7 +932,7 @@ fn read_substreams(
 					sum = sum
 						.checked_add(size)
 						.ok_or(SevenZError::Corrupt("7z substream sizes overflow"))?;
-					sizes.push((size, None));
+					sizes.push(Substream { size, crc: None });
 				}
 			} else if count > 1 {
 				return Err(SevenZError::Corrupt("7z substreams without sizes"));
@@ -908,7 +940,10 @@ fn read_substreams(
 			let last = folder.size().checked_sub(sum).ok_or(SevenZError::Corrupt(
 				"7z substreams larger than their folder",
 			))?;
-			sizes.push((last, None));
+			sizes.push(Substream {
+				size: last,
+				crc: None,
+			});
 		}
 		substreams.push(sizes);
 	}
@@ -919,7 +954,7 @@ fn read_substreams(
 	let inherits = |folder: &Folder, count: u64| count == 1 && folder.crc.is_some();
 	for (folder, streams) in folders.iter().zip(&mut substreams) {
 		if inherits(folder, streams.len() as u64) {
-			streams[0].1 = folder.crc;
+			streams[0].crc = folder.crc;
 		}
 	}
 	let digest_count: u64 = folders
@@ -938,7 +973,7 @@ fn read_substreams(
 				for (folder, streams) in folders.iter().zip(&mut substreams) {
 					if !inherits(folder, streams.len() as u64) {
 						for stream in streams.iter_mut() {
-							stream.1 = digests.next().flatten();
+							stream.crc = digests.next().flatten();
 						}
 					}
 				}
@@ -1003,7 +1038,7 @@ fn read_files(
 	let mut empty_stream = vec![false; count];
 	let mut empty_file = Vec::new();
 	let mut anti = Vec::new();
-	let mut names: Vec<(String, bool)> = Vec::new();
+	let mut names: Vec<EntryName> = Vec::new();
 	let mut modified: Vec<Option<u64>> = vec![None; count];
 	let mut attributes: Vec<Option<u32>> = vec![None; count];
 	loop {
@@ -1053,19 +1088,20 @@ fn read_files(
 		.iter()
 		.enumerate()
 		.flat_map(|(folder, streams)| {
-			streams.iter().scan(0u64, move |offset, &(size, crc)| {
+			streams.iter().scan(0u64, move |offset, substream| {
 				let stream = StreamRef {
 					folder,
 					offset: *offset,
+					crc: substream.crc,
 				};
 				// the sizes sum to the folder's, a u64
-				*offset += size;
-				Some((stream, size, crc))
+				*offset += substream.size;
+				Some((stream, substream.size))
 			})
 		});
 	let mut empty_at = 0;
 	let mut entries = Vec::with_capacity(count);
-	for (ordinal, (name, name_rewritten)) in names.into_iter().enumerate() {
+	for (ordinal, name) in names.into_iter().enumerate() {
 		let attribute = attributes[ordinal];
 		let unix_type = attribute
 			.filter(|attribute| attribute & ATTRIBUTE_UNIX_EXTENSION != 0)
@@ -1073,7 +1109,7 @@ fn read_files(
 		let symlink = unix_type == Some(UNIX_SYMLINK);
 		let reparse =
 			!symlink && attribute.is_some_and(|attribute| attribute & ATTRIBUTE_REPARSE_POINT != 0);
-		let (kind, stream, size, crc) = if empty_stream[ordinal] {
+		let (kind, stream, size) = if empty_stream[ordinal] {
 			let (is_empty_file, is_anti) = (empty_file[empty_at], anti[empty_at]);
 			empty_at += 1;
 			let kind = if is_anti {
@@ -1085,9 +1121,9 @@ fn read_files(
 			} else {
 				SevenZKind::Dir
 			};
-			(kind, None, 0, None)
+			(kind, None, 0)
 		} else {
-			let (stream, size, crc) = substreams.next().ok_or(SevenZError::Corrupt(
+			let (stream, size) = substreams.next().ok_or(SevenZError::Corrupt(
 				"7z files outnumber their data streams",
 			))?;
 			let kind = if symlink {
@@ -1097,15 +1133,14 @@ fn read_files(
 			} else {
 				SevenZKind::File
 			};
-			(kind, Some(stream), size, crc)
+			(kind, Some(stream), size)
 		};
 		entries.push(SevenZEntry {
 			ordinal: ordinal as u64,
-			name,
-			name_rewritten,
+			name: name.name,
+			name_rewritten: name.rewritten,
 			kind,
 			size,
-			crc,
 			modified: modified[ordinal].and_then(filetime),
 			stream,
 		});
@@ -1118,12 +1153,19 @@ fn read_files(
 	Ok(entries)
 }
 
+/// A file's name, as the header stores it.
+struct EntryName {
+	name: String,
+	/// It was not valid UTF-16 and was decoded lossily.
+	rewritten: bool,
+}
+
 /// `count` null-terminated UTF-16LE names filling the property.
 fn read_names(
 	property: &mut HeaderReader<'_>,
 	count: usize,
 	heap: &mut Heap,
-) -> Result<Vec<(String, bool)>, SevenZError> {
+) -> Result<Vec<EntryName>, SevenZError> {
 	let bytes = property.bytes(property.remaining())?;
 	if bytes.len() % 2 != 0 {
 		return Err(SevenZError::Corrupt("7z names of an odd length"));
@@ -1136,14 +1178,13 @@ fn read_names(
 	}
 	// the UTF-16 units, the strings (up to 1.5 times their UTF-16 size) and the list
 	heap.charge(
-		(bytes.len() as u64).saturating_mul(3)
-			+ count as u64 * mem::size_of::<(String, bool)>() as u64,
+		(bytes.len() as u64).saturating_mul(3) + count as u64 * mem::size_of::<EntryName>() as u64,
 	)?;
 	let units: Vec<u16> = bytes
 		.chunks_exact(2)
 		.map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
 		.collect();
-	let names: Vec<(String, bool)> = units
+	let names: Vec<EntryName> = units
 		.split_inclusive(|&unit| unit == 0)
 		.map(|name| {
 			let name = name
@@ -1158,7 +1199,10 @@ fn read_names(
 					})
 				})
 				.collect();
-			Ok((decoded, rewritten))
+			Ok(EntryName {
+				name: decoded,
+				rewritten,
+			})
 		})
 		.collect::<Result<_, SevenZError>>()?;
 	if names.len() != count {
@@ -1199,14 +1243,14 @@ impl<R: Read + Seek> Read for PackStream<R> {
 	}
 }
 
-/// The memory `coder` of `folder` decodes with, in bytes; `None` when its properties are not
-/// ones the SDK reads.
-fn coder_memory(folder: &Folder, coder: usize) -> Result<u64, SevenZError> {
-	let Coder { method, props, .. } = &folder.coders[coder];
+/// The memory `coder` of `folder`, which decodes with `method`, takes, in bytes; an error when
+/// its properties are not ones the SDK reads.
+fn coder_memory(folder: &Folder, coder: usize, method: Method) -> Result<u64, SevenZError> {
+	let Coder { props, inputs, .. } = &folder.coders[coder];
 	let size = folder.unpack_sizes[coder];
-	let buffers = INPUT_BUFFER as u64 * folder.coders[coder].inputs as u64;
+	let buffers = INPUT_BUFFER as u64 * *inputs as u64;
 	Ok(buffers
-		+ match method.ok_or(SevenZError::Unsupported("a 7z coder"))? {
+		+ match method {
 			Method::Lzma => {
 				let (props, dict) = lzma_props(props)?;
 				u64::from(
@@ -1292,28 +1336,34 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 	decoder_memory: u64,
 	keys: &mut Keys<'_>,
 ) -> Result<Box<dyn Read + 's>, SevenZError> {
-	if !folder.supported() {
-		return Err(SevenZError::Unsupported("a 7z coder"));
-	}
+	let methods = folder
+		.coders
+		.iter()
+		.map(|coder| coder.method)
+		.collect::<Option<Vec<_>>>()
+		.ok_or(SevenZError::Unsupported("a 7z coder"))?;
 	if !folder.aes_blocks_whole(sizes) {
 		return Err(SevenZError::AesPartialBlock);
 	}
-	let memory = (0..folder.coders.len()).try_fold(0u64, |total, coder| {
-		Ok::<_, SevenZError>(total.saturating_add(coder_memory(folder, coder)?))
-	})?;
+	let memory = methods
+		.iter()
+		.enumerate()
+		.try_fold(0u64, |total, (coder, &method)| {
+			Ok::<_, SevenZError>(total.saturating_add(coder_memory(folder, coder, method)?))
+		})?;
 	if memory > decoder_memory {
 		return Err(SevenZError::TooLarge(
 			"a 7z folder's decoders are over the codec budget",
 		));
 	}
-	let zstd_coders = folder
-		.coders
+	let zstd_coders = methods
 		.iter()
-		.filter(|coder| coder.method == Some(Method::Zstd))
+		.filter(|&&method| method == Method::Zstd)
 		.count() as u64;
 	let mut builder = Builder {
 		source,
 		folder,
+		methods: &methods,
 		offsets,
 		sizes,
 		keys,
@@ -1350,6 +1400,8 @@ impl<R: Read> Read for Settled<R> {
 struct Builder<'b, 'k, 'p, R> {
 	source: &'b Rc<RefCell<R>>,
 	folder: &'b Folder,
+	/// Each coder's method, all of them ones the SDK decodes.
+	methods: &'b [Method],
 	offsets: &'b [u64],
 	sizes: &'b [u64],
 	keys: &'k mut Keys<'p>,
@@ -1385,12 +1437,9 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 			};
 			inputs.push(reader);
 		}
-		let Coder { method, props, .. } = &folder.coders[coder];
+		let props = &folder.coders[coder].props;
 		let size = folder.unpack_sizes[coder];
-		let method = method.expect("checked supported");
-		if method != Method::Bcj2 && inputs.len() != 1 {
-			return Err(SevenZError::Unsupported("a 7z coder with several inputs"));
-		}
+		let method = self.methods[coder];
 		let buffered = |input: Box<dyn Read + 's>| BufReader::with_capacity(INPUT_BUFFER, input);
 		let reader: Box<dyn Read + 's> = match method {
 			Method::Bcj2 => {
@@ -1407,6 +1456,7 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 				Box::new(lzma_rust2::filter::bcj2::Bcj2Reader::new(inputs, size))
 			}
 			_ => {
+				// the header was refused unless every coder but BCJ2 has one input
 				let input = inputs.pop().expect("one input");
 				match method {
 					Method::Copy => input,
@@ -1474,7 +1524,7 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 					Method::Aes => {
 						let props = AesProps::parse(props)?;
 						let key = self.keys.key(&props)?;
-						Box::new(AesCbcReader::new(input, &key, props.iv))
+						Box::new(AesCbcReader::new(input, key, props.iv()))
 					}
 					Method::Bcj2 => unreachable!("handled above"),
 				}
@@ -1489,8 +1539,15 @@ impl<'s, R: Read + Seek + 's> Builder<'_, '_, '_, R> {
 pub(crate) struct FolderCursor<'s, R> {
 	source: Rc<RefCell<R>>,
 	decoder_memory: u64,
-	/// The open folder, its reader, and how far into its unpacked data that is.
-	open: Option<(usize, Box<dyn Read + 's>, u64)>,
+	open: Option<OpenFolder<'s>>,
+}
+
+/// The folder a cursor reads.
+struct OpenFolder<'s> {
+	folder: usize,
+	reader: Box<dyn Read + 's>,
+	/// How far into the folder's unpacked data the reader is.
+	at: u64,
 }
 
 impl<'s, R: Read + Seek + 's> FolderCursor<'s, R> {
@@ -1513,23 +1570,28 @@ impl<'s, R: Read + Seek + 's> FolderCursor<'s, R> {
 		let stream = entry
 			.stream
 			.ok_or(SevenZError::Corrupt("a 7z entry without data"))?;
-		let reusable = self
-			.open
-			.as_ref()
-			.is_some_and(|(folder, _, at)| *folder == stream.folder && *at <= stream.offset);
-		if !reusable {
-			self.open = None;
-			let reader = open_folder(
-				&self.source,
-				&index.folders[stream.folder],
-				&index.pack_offsets,
-				&index.pack_sizes,
-				self.decoder_memory,
-				keys,
-			)?;
-			self.open = Some((stream.folder, reader, 0));
-		}
-		let (_, reader, at) = self.open.as_mut().expect("opened above");
+		let open = match self.open.take() {
+			Some(open) if open.folder == stream.folder && open.at <= stream.offset => open,
+			stale => {
+				// the reader it holds goes before another one is made
+				drop(stale);
+				let reader = open_folder(
+					&self.source,
+					&index.folders[stream.folder],
+					&index.pack_offsets,
+					&index.pack_sizes,
+					self.decoder_memory,
+					keys,
+				)?;
+				OpenFolder {
+					folder: stream.folder,
+					reader,
+					at: 0,
+				}
+			}
+		};
+		let open = self.open.insert(open);
+		let (reader, at) = (&mut open.reader, &mut open.at);
 		let skip = stream.offset - *at;
 		let skipped =
 			io::copy(&mut reader.by_ref().take(skip), &mut io::sink()).map_err(read_error)?;
@@ -1541,7 +1603,7 @@ impl<'s, R: Read + Seek + 's> FolderCursor<'s, R> {
 			reader,
 			at,
 			size: entry.size,
-			expected_crc: entry.crc,
+			expected_crc: stream.crc,
 			crc: crc32fast::Hasher::new(),
 			read: 0,
 			checked: false,

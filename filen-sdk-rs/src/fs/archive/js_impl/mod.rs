@@ -1065,9 +1065,10 @@ impl CompressCall {
 		codec_mem_budget: u64,
 	) -> Result<Self, Error> {
 		config.format.check_name(name)?;
+		// a copy: the job takes the password from its config, and checks it again there
 		config
 			.format
-			.check_within(config.password.is_some(), codec_mem_budget)?;
+			.check_within(config.password.clone(), codec_mem_budget)?;
 		let sources = compress_sources(items, dispose)?;
 		sources.check_for(config.format)?;
 		Ok(Self {

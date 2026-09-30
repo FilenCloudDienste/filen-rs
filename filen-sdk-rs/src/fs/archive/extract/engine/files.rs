@@ -16,13 +16,15 @@ use crate::{
 			dispose::{DisposalBackend, file_digest},
 			input::take_memory,
 			names::ROOT,
-			worker::WorkerEvent,
 		},
 		categories::NonRootItemType,
 		drive_job::{
 			CHUNKS_PER_FILE,
 			backend::UploadSpec,
-			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file_unless_paused},
+			finalize::{
+				FinalizeError, FinalizeTask, Finalized, UnlessPaused,
+				finalize_new_file_unless_paused,
+			},
 			name_retry::NameRetry,
 		},
 		file::write::{RemoteFileInfo, UploadCompletion},
@@ -39,9 +41,8 @@ use super::{
 		},
 		storage_exceeded,
 	},
-	Driver, FileSlot, FileSource, NewFile,
+	Driver, FilePhase, FileSlot, FileSource, LinkPhase, NewFile, SlotSource,
 	dirs::DirState,
-	links::LinkCopy,
 	record,
 };
 
@@ -56,6 +57,7 @@ impl<B: DisposalBackend> Driver<B> {
 			size,
 			modified,
 			source,
+			link_key,
 		} = new;
 		let dest_uuid = Uuid::new_v4();
 		let parent_uuid = self.dirs[parent].uuid;
@@ -77,7 +79,6 @@ impl<B: DisposalBackend> Driver<B> {
 		self.files.insert(
 			ordinal,
 			FileSlot {
-				entry,
 				path,
 				parent,
 				upload: Arc::new(upload),
@@ -89,17 +90,17 @@ impl<B: DisposalBackend> Driver<B> {
 				uploading: 0,
 				info: None,
 				modified,
-				ended: false,
-				finalizing: false,
-				failed: false,
-				link_key: None,
-				copy: None,
+				phase: FilePhase::Receiving,
+				link_key,
+				source: match source {
+					FileSource::Codec => SlotSource::Codec,
+					FileSource::Link { .. } => SlotSource::Link(LinkPhase::Resolving),
+				},
 			},
 		);
 		match source {
 			FileSource::Codec => self.current = Some(ordinal),
 			FileSource::Link { target } => {
-				self.files.get_mut(&ordinal).expect("just added").copy = Some(LinkCopy::default());
 				let backend = Arc::clone(&self.backend);
 				let op = self.reporter.op();
 				self.link_sources.push(Box::pin(async move {
@@ -117,8 +118,22 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	/// Takes up a data or file-end event, or holds it until it can be.
-	pub(super) fn retry_held(&mut self, event: WorkerEvent) {
+	/// The current file's data ended.
+	pub(super) fn end_file(&mut self) {
+		// a file's events after the job stopped taking it are dropped
+		let Some(ordinal) = self.current else {
+			return;
+		};
+		let Some(file) = self.files.get_mut(&ordinal) else {
+			return;
+		};
+		file.phase = file.phase.end();
+		self.current = None;
+		self.finalize_ready();
+	}
+
+	/// Uploads the current file's next data, or holds it until it can be.
+	pub(super) fn take_data(&mut self, data: Vec<u8>) {
 		// a file's events after the job stopped taking it are dropped
 		let Some(ordinal) = self.current else {
 			return;
@@ -126,18 +141,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let Some(file) = self.files.get(&ordinal) else {
 			return;
 		};
-		let data = match event {
-			WorkerEvent::FileEnd => {
-				self.files.get_mut(&ordinal).expect("looked up above").ended = true;
-				self.current = None;
-				self.finalize_ready();
-				return;
-			}
-			WorkerEvent::Data(data) => data,
-			// only data and file ends are ever held
-			_ => return,
-		};
-		if file.failed {
+		if file.failed() {
 			return;
 		}
 		let waits =
@@ -148,7 +152,7 @@ impl<B: DisposalBackend> Driver<B> {
 			take_memory(&self.output_slot, &self.memory)
 		};
 		let Some(permit) = permit else {
-			self.held = Some(WorkerEvent::Data(data));
+			self.held = Some(data);
 			return;
 		};
 		self.upload(ordinal, data, permit);
@@ -191,7 +195,7 @@ impl<B: DisposalBackend> Driver<B> {
 			return;
 		};
 		file.uploading -= 1;
-		let (failed, dest_uuid) = (file.failed, file.active.dest_uuid);
+		let (failed, dest_uuid) = (file.failed(), file.active.dest_uuid);
 		match result {
 			Ok(info) => {
 				file.info = Some(info);
@@ -217,7 +221,13 @@ impl<B: DisposalBackend> Driver<B> {
 			.files
 			.get_mut(&ordinal)
 			.expect("a failed file is known");
-		file.failed = true;
+		file.phase = FilePhase::Failed {
+			ended: match file.phase {
+				FilePhase::Receiving => false,
+				FilePhase::Ended | FilePhase::Finalizing => true,
+				FilePhase::Failed { ended } => ended,
+			},
+		};
 		report_file_failure(&mut self.report, &self.reporter, file, stage, error, retry);
 		self.link_target_failed(ordinal);
 	}
@@ -225,7 +235,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Where `file`, which failed, is extracted again: `None` for a tar's hard link, whose copy
 	/// needs the file it names read in the same pass (see [`ExtractFailure::retry`]).
 	fn file_retry<U>(&self, file: &FileSlot<U>) -> Option<ExtractRetry> {
-		file.copy.is_none().then(|| self.retry(file.parent))
+		matches!(file.source, SlotSource::Codec).then(|| self.retry(file.parent))
 	}
 
 	/// Registers the files whose data is all up and whose directory exists, as many at once as
@@ -240,15 +250,17 @@ impl<B: DisposalBackend> Driver<B> {
 			.files
 			.iter()
 			.filter(|(_, file)| {
-				file.ended
-					&& file.uploading == 0
-					&& !file.finalizing
-					&& (file.failed || self.dirs[file.parent].created_uuid().is_some())
+				file.uploading == 0
+					&& match file.phase {
+						FilePhase::Ended => self.dirs[file.parent].created_uuid().is_some(),
+						FilePhase::Failed { ended } => ended,
+						FilePhase::Receiving | FilePhase::Finalizing => false,
+					}
 			})
 			.map(|(ordinal, _)| *ordinal)
 			.collect();
 		for ordinal in ready {
-			if self.files[&ordinal].failed {
+			if self.files[&ordinal].failed() {
 				self.files.remove(&ordinal);
 			} else if self.finalizes.len() < MAX_SMALL_PARALLEL_REQUESTS {
 				self.start_finalize(ordinal);
@@ -265,7 +277,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.created_uuid()
 			.expect("checked by the caller");
 		let file = self.files.get_mut(&ordinal).expect("checked by the caller");
-		file.finalizing = true;
+		file.phase = FilePhase::Finalizing;
 		let modified = file.modified.unwrap_or_else(Utc::now);
 		let completion = UploadCompletion {
 			written: file.written,
@@ -300,17 +312,16 @@ impl<B: DisposalBackend> Driver<B> {
 		}) as MaybeSendBoxFuture<'static, _>);
 	}
 
-	pub(super) fn finalize_finished(
-		&mut self,
-		ordinal: u64,
-		result: Option<Result<Finalized, FinalizeError>>,
-	) {
-		let Some(result) = result else {
-			// a pause came before the drive lock: started again on resume
-			if let Some(file) = self.files.get_mut(&ordinal) {
-				file.finalizing = false;
+	pub(super) fn finalize_finished(&mut self, ordinal: u64, registration: UnlessPaused) {
+		let result = match registration {
+			UnlessPaused::Ran(result) => result,
+			UnlessPaused::Paused => {
+				// a pause came before the drive lock: started again on resume
+				if let Some(file) = self.files.get_mut(&ordinal) {
+					file.phase = FilePhase::Ended;
+				}
+				return;
 			}
-			return;
 		};
 		let Some(file) = self.files.remove(&ordinal) else {
 			return;
@@ -324,7 +335,7 @@ impl<B: DisposalBackend> Driver<B> {
 				self.report_propagation(registered.uuid(), propagation_errors);
 				if name.as_ref() != file.archive_name() {
 					self.renamed(
-						file.entry,
+						file.active.entry,
 						file.path.clone(),
 						&name,
 						ExtractRenameReason::DuplicateName,
@@ -346,7 +357,9 @@ impl<B: DisposalBackend> Driver<B> {
 					.wrapping_add(file_digest(active.dest_uuid, file.written));
 				if file.parent == ROOT && self.into_destination {
 					self.top_level_created(
-						ExtractTopLevelKey::Entry { id: file.entry },
+						ExtractTopLevelKey::Entry {
+							id: file.active.entry,
+						},
 						NonRootItemType::File(Cow::Owned(registered)),
 					);
 				}
@@ -401,7 +414,7 @@ fn report_file_failure<U>(
 	retry: Option<ExtractRetry>,
 ) {
 	let failure = ExtractFailure {
-		entry: file.entry,
+		entry: file.active.entry,
 		path: file.path.clone(),
 		dest_parent: file.active.dest_parent,
 		dest_name: file.name.as_ref().to_owned(),

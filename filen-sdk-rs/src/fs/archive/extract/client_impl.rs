@@ -23,7 +23,7 @@ use super::{
 	ArchiveEntryId, ArchiveSource, ArchiveTotals, ExtractCallback, ExtractConfig, ExtractFailed,
 	ExtractPhase, ExtractReport, ExtractRequest,
 	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
-	engine::{CodecResult, ExtractTask, run_extract},
+	engine::{ArchiveDisposal, CodecResult, ExtractTask, run_extract},
 	list::{
 		ArchiveListing, ListCallback, ListConfig, ListFailed, ListReporter, ListTask, run_list,
 	},
@@ -67,18 +67,20 @@ impl Client {
 		callback: impl ExtractCallback,
 		control: JobControl,
 	) -> Result<ExtractReport, ExtractFailed> {
-		let (archive, dispose, disposal_requested, destination, root, selection) = match request {
+		let (archive, dispose, destination, root, selection) = match request {
 			ExtractRequest::All {
 				archive,
 				destination,
 				root,
 			} => match archive {
-				ArchiveSource::Keep(archive) => (archive, None, false, destination, root, None),
+				ArchiveSource::Keep(archive) => (archive, None, destination, root, None),
 				ArchiveSource::Dispose { file, how } => {
-					// a file in the trash has no directory to confirm it is still in, and is kept
-					let dispose = Uuid::try_from(file.parent).ok().map(|parent| (how, parent));
+					let dispose = match Uuid::try_from(file.parent) {
+						Ok(parent) => ArchiveDisposal::Remove { how, parent },
+						Err(_) => ArchiveDisposal::Unavailable,
+					};
 					let archive = RemoteFileType::from(file);
-					(archive, dispose, true, destination, root, None)
+					(archive, Some(dispose), destination, root, None)
 				}
 			},
 			ExtractRequest::Entries {
@@ -90,7 +92,7 @@ impl Client {
 			} => {
 				let selection = check_entries(archive.uuid(), &ids)
 					.map(|()| Selection::new(ids.into_iter().map(|id| u64::from(id.index)), base));
-				(archive, None, false, destination, root, Some(selection))
+				(archive, None, destination, root, Some(selection))
 			}
 		};
 		let totals = ArchiveTotals::Streaming {
@@ -129,7 +131,6 @@ impl Client {
 			config: archives,
 			start,
 			dispose,
-			disposal_requested,
 		})
 		.await
 	}

@@ -127,8 +127,7 @@ fn a_plan_becomes_entries_with_joined_paths() {
 		(renamed[0].source_path.as_str(), renamed[0].name.as_ref()),
 		("Photos", "Photos (1)")
 	);
-	let (entries, sources) =
-		archive_entries(plan(), CompressFormat::Tar { compression: None }).unwrap();
+	let (entries, sources) = archive_entries(plan()).unwrap();
 	let paths: Vec<(&str, Option<u64>)> = entries
 		.iter()
 		.map(|entry| match entry {
@@ -160,14 +159,12 @@ fn a_plan_becomes_entries_with_joined_paths() {
 	}
 
 	assert_eq!(
-		archive_entries(
+		compress_job(
 			plan(),
-			CompressFormat::Single {
-				compression: Compression {
-					codec: StreamCodec::Gzip,
-					level: None,
-				},
-			},
+			CheckedFormat::Single(Compression {
+				codec: StreamCodec::Gzip,
+				level: None,
+			}),
 		)
 		.unwrap_err()
 		.kind(),
@@ -309,20 +306,23 @@ fn disposal_targets_hold_exactly_what_was_read() {
 			NonRootItemType::File(Cow::Owned(top.clone())),
 		]
 	};
-	let disposal = disposal(
-		&plan,
-		SourceDisposal::Trash,
-		items(&normal_top),
-		Uuid::new_v4(),
-	)
-	.unwrap();
-	assert_eq!(
-		disposal.hashed,
-		[false, false],
+	let sources = disposal_sources(&plan, items(&normal_top), DESTINATION).unwrap();
+	assert!(
+		sources.iter().all(|source| !source.hashed),
 		"the plan's files carry no hash"
 	);
-	let [DisposalTarget::Dir(dir), DisposalTarget::File(file)] = &disposal.targets[..] else {
-		panic!("{:?}", disposal.targets);
+	let [
+		DisposalSource {
+			target: DisposalTarget::Dir(dir),
+			..
+		},
+		DisposalSource {
+			target: DisposalTarget::File(file),
+			..
+		},
+	] = &sources[..]
+	else {
+		panic!("{sources:?}");
 	};
 	let ExpectedDir {
 		uuid,
@@ -348,7 +348,7 @@ fn disposal_targets_hold_exactly_what_was_read() {
 	// the archive would land in a source that is removed afterwards
 	for inside in [photos.source_uuid, year.source_uuid] {
 		assert_eq!(
-			disposal_of(&plan, items(&normal_top), inside)
+			disposal_sources(&plan, items(&normal_top), inside)
 				.unwrap_err()
 				.kind(),
 			ErrorKind::InvalidState
@@ -357,9 +357,9 @@ fn disposal_targets_hold_exactly_what_was_read() {
 
 	// a file in the trash is left alone
 	normal_top.parent = filen_types::fs::ParentUuid::Trash(parent);
-	let disposal = disposal_of(&plan, items(&normal_top), Uuid::new_v4()).unwrap();
+	let sources = disposal_sources(&plan, items(&normal_top), DESTINATION).unwrap();
 	assert!(matches!(
-		disposal.targets[1],
+		sources[1].target,
 		DisposalTarget::Unavailable { .. }
 	));
 
@@ -370,19 +370,11 @@ fn disposal_targets_hold_exactly_what_was_read() {
 		NonRootItemType::Dir(Cow::Owned(trashed_photos)),
 		NonRootItemType::File(Cow::Owned(normal_top)),
 	];
-	let disposal = disposal_of(&plan, items, Uuid::new_v4()).unwrap();
+	let sources = disposal_sources(&plan, items, DESTINATION).unwrap();
 	assert!(matches!(
-		disposal.targets[0],
+		sources[0].target,
 		DisposalTarget::Unavailable { .. }
 	));
-}
-
-fn disposal_of(
-	plan: &ItemPlan<()>,
-	items: Vec<NonRootItemType<'static, Normal>>,
-	destination: Uuid,
-) -> Result<CompressDisposal, Error> {
-	disposal(plan, SourceDisposal::Trash, items, destination)
 }
 
 #[test]

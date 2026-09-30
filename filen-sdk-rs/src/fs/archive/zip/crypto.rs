@@ -1,7 +1,10 @@
 //! Zip encryption: WinZip AES (read and written) and the legacy "traditional PKWARE"
 //! encryption (ZipCrypto, read only: it is broken, and the SDK never writes it).
 
-use std::io::{self, Read, Take, Write};
+use std::{
+	io::{self, Read, Take, Write},
+	mem,
+};
 
 use aes_gcm::aes::{Aes128, Aes192, Aes256};
 use ctr::{
@@ -9,6 +12,7 @@ use ctr::{
 	cipher::{KeyIvInit, StreamCipher},
 };
 use filen_macros::js_type;
+use filen_types::error::ConversionError;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -31,34 +35,38 @@ pub(crate) const AES_VERIFIER_LEN: u64 = 2;
 pub(crate) const ZIP_CRYPTO_HEADER_LEN: usize = 12;
 pub(crate) const ZIP_CRYPTO_HEADER_LEN_U64: u64 = ZIP_CRYPTO_HEADER_LEN as u64;
 
-/// The key size of a WinZip AES entry.
+/// The key size of a WinZip AES entry, numbered as the strength byte of its AES extra field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 #[js_type(import, export, no_default)]
 pub enum AesStrength {
-	Aes128,
-	Aes192,
-	Aes256,
+	/// AES with a 128-bit key.
+	Aes128 = 1,
+	/// AES with a 192-bit key.
+	Aes192 = 2,
+	/// AES with a 256-bit key.
+	Aes256 = 3,
+}
+
+impl TryFrom<u8> for AesStrength {
+	type Error = ConversionError;
+
+	fn try_from(byte: u8) -> Result<Self, Self::Error> {
+		match byte {
+			1 => Ok(Self::Aes128),
+			2 => Ok(Self::Aes192),
+			3 => Ok(Self::Aes256),
+			other => Err(ConversionError::InvalidEnumValue(
+				other,
+				"AesStrength",
+				1,
+				3,
+			)),
+		}
+	}
 }
 
 impl AesStrength {
-	/// The strength byte of the AES extra field.
-	pub(crate) fn from_byte(byte: u8) -> Option<Self> {
-		match byte {
-			1 => Some(Self::Aes128),
-			2 => Some(Self::Aes192),
-			3 => Some(Self::Aes256),
-			_ => None,
-		}
-	}
-
-	pub(crate) fn byte(self) -> u8 {
-		match self {
-			Self::Aes128 => 1,
-			Self::Aes192 => 2,
-			Self::Aes256 => 3,
-		}
-	}
-
 	fn key_len(self) -> usize {
 		match self {
 			Self::Aes128 => 16,
@@ -159,8 +167,16 @@ impl From<CryptoError> for Error {
 pub(crate) struct AesReader<R> {
 	inner: Take<R>,
 	cipher: Cipher,
-	mac: Hmac<Sha1>,
-	authenticated: bool,
+	auth: Auth,
+}
+
+/// Where an [`AesReader`]'s authentication code check stands.
+enum Auth {
+	/// The data is still being read into the MAC.
+	Pending(Hmac<Sha1>),
+	Verified,
+	/// The code did not match; every later read fails too.
+	Failed,
 }
 
 impl<R: Read> AesReader<R> {
@@ -188,8 +204,7 @@ impl<R: Read> AesReader<R> {
 		Ok(Self {
 			inner: inner.take(data_len),
 			cipher: keys.cipher,
-			mac: keys.mac,
-			authenticated: false,
+			auth: Auth::Pending(keys.mac),
 		})
 	}
 }
@@ -201,25 +216,33 @@ impl<R: Read> Read for AesReader<R> {
 		}
 		let n = self.inner.read(buf)?;
 		if n > 0 {
-			self.mac.update(&buf[..n]);
+			let Auth::Pending(mac) = &mut self.auth else {
+				unreachable!("the code is only checked once the data is read");
+			};
+			mac.update(&buf[..n]);
 			self.cipher.apply(&mut buf[..n]);
 			return Ok(n);
 		}
 		if self.inner.limit() > 0 {
 			return Err(io::ErrorKind::UnexpectedEof.into());
 		}
-		if !self.authenticated {
-			let mut code = [0u8; AES_AUTH_CODE_LEN];
-			self.inner.get_mut().read_exact(&mut code)?;
-			let mac = std::mem::replace(
-				&mut self.mac,
-				Hmac::<Sha1>::new_from_slice(&[]).expect("any key length"),
-			);
-			// the code is the MAC's first bytes, compared in constant time
-			mac.verify_truncated_left(&code)
-				.map_err(|_| CryptoError::AuthenticationFailed)?;
-			self.authenticated = true;
+		let verified = match mem::replace(&mut self.auth, Auth::Failed) {
+			Auth::Pending(mac) => {
+				let mut code = [0u8; AES_AUTH_CODE_LEN];
+				if let Err(error) = self.inner.get_mut().read_exact(&mut code) {
+					self.auth = Auth::Pending(mac);
+					return Err(error);
+				}
+				// the code is the MAC's first bytes, compared in constant time
+				mac.verify_truncated_left(&code).is_ok()
+			}
+			Auth::Verified => true,
+			Auth::Failed => false,
+		};
+		if !verified {
+			return Err(CryptoError::AuthenticationFailed.into());
 		}
+		self.auth = Auth::Verified;
 		Ok(0)
 	}
 }
@@ -234,13 +257,14 @@ pub(crate) struct AesWriter<W> {
 }
 
 impl<W: Write> AesWriter<W> {
+	/// Starts an entry under a salt of its own, so no two entries share a key.
 	pub(crate) fn new(
 		mut inner: W,
 		password: &ArchivePassword,
 		strength: AesStrength,
-		salt: &[u8],
 	) -> io::Result<Self> {
-		debug_assert_eq!(salt.len(), strength.salt_len());
+		let salt: [u8; 16] = rand::random();
+		let salt = &salt[..strength.salt_len()];
 		let keys = derive(password, salt, strength);
 		inner.write_all(salt)?;
 		inner.write_all(&keys.verifier)?;
@@ -407,9 +431,7 @@ mod tests {
 			AesStrength::Aes256,
 		] {
 			let data: Vec<u8> = (0..10_000u32).map(|i| i.to_le_bytes()[0]).collect();
-			let salt = vec![7u8; strength.salt_len()];
-			let mut writer =
-				AesWriter::new(Vec::new(), &archive_password("pw"), strength, &salt).unwrap();
+			let mut writer = AesWriter::new(Vec::new(), &archive_password("pw"), strength).unwrap();
 			writer.write_all(&data).unwrap();
 			let stored = writer.finish().unwrap();
 			let open = |password: &str, stored: &[u8]| {
@@ -432,6 +454,20 @@ mod tests {
 			let mut tampered = stored.clone();
 			tampered[strength.salt_len() + 2 + 100] ^= 1;
 			let error = open("pw", &tampered).unwrap_err();
+			assert!(matches!(
+				error.get_ref().and_then(|e| e.downcast_ref()),
+				Some(CryptoError::AuthenticationFailed)
+			));
+			// a failed check stays failed: reading on never reports the end as authenticated
+			let mut reader = AesReader::new(
+				&tampered[..],
+				&archive_password("pw"),
+				strength,
+				tampered.len() as u64,
+			)
+			.unwrap();
+			reader.read_to_end(&mut Vec::new()).unwrap_err();
+			let error = reader.read(&mut [0u8; 16]).unwrap_err();
 			assert!(matches!(
 				error.get_ref().and_then(|e| e.downcast_ref()),
 				Some(CryptoError::AuthenticationFailed)

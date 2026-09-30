@@ -67,7 +67,6 @@ async fn a_hard_link_is_extracted_as_a_copy_of_the_file_it_names() {
 fn link_entry(ordinal: u64, path: &str, target: &str) -> WorkerEvent {
 	let (shown, truncated) = display_path(path);
 	WorkerEvent::Link(Box::new(LinkHead {
-		ordinal,
 		path: entry_path(path).unwrap(),
 		modified: None,
 		target: entry_path(target).unwrap(),

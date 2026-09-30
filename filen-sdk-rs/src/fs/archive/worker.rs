@@ -99,7 +99,6 @@ pub(crate) enum EntryKind {
 /// extracts as a copy of the file it created for that one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkHead {
-	pub(crate) ordinal: u64,
 	pub(crate) path: ArchivePath,
 	pub(crate) modified: Option<DateTime<Utc>>,
 	/// The path of the file it names, as sent with that file's entry.
@@ -107,6 +106,13 @@ pub(crate) struct LinkHead {
 	/// What it is reported as when no file was created for its target (it was skipped, failed,
 	/// or never came): skipped, as a hard link.
 	pub(crate) unresolved: SkippedMember,
+}
+
+impl LinkHead {
+	/// Its place among the archive's members.
+	pub(crate) fn ordinal(&self) -> u64 {
+		self.unresolved.ordinal
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +159,15 @@ pub(crate) fn worker_died() -> Error {
 	Error::custom(
 		ErrorKind::ArchiveWorkerDied,
 		"the archive's codec stopped responding",
+	)
+}
+
+/// The error a job ends with when its codec sent an event only another kind of codec sends
+/// (see [`WorkerEvent`]), or one the feed answers itself.
+pub(crate) fn unexpected_event() -> Error {
+	Error::custom(
+		ErrorKind::Internal,
+		"the archive's codec sent an event its job never takes",
 	)
 }
 
@@ -594,9 +609,6 @@ pub(crate) struct ChunkSink<'p> {
 	chunk: Vec<u8>,
 	written: u64,
 	failed: bool,
-	/// Whether the first chunk is held back, to be patched and sent last.
-	holds_head: bool,
-	head: Option<Vec<u8>>,
 }
 
 impl<'p> ChunkSink<'p> {
@@ -606,22 +618,11 @@ impl<'p> ChunkSink<'p> {
 			chunk: new_chunk(),
 			written: 0,
 			failed: false,
-			holds_head: false,
-			head: None,
-		}
-	}
-
-	/// A sink that keeps the first chunk until [`ChunkSink::finish_with_head`].
-	pub(crate) fn holding_head(port: &'p WorkerPort) -> Self {
-		Self {
-			holds_head: true,
-			..Self::new(port)
 		}
 	}
 
 	/// Sends what is left; the bytes written in all.
 	pub(crate) fn finish(mut self) -> io::Result<u64> {
-		debug_assert!(!self.holds_head, "a held head is sent by finish_with_head");
 		if self.failed {
 			return Err(ended());
 		}
@@ -632,14 +633,63 @@ impl<'p> ChunkSink<'p> {
 		Ok(self.written)
 	}
 
-	/// Sends the last chunk, then the held first one with `start` written over its first
-	/// bytes (which the archive already holds, zeroed); the bytes written in all.
-	pub(crate) fn finish_with_head(mut self, start: &[u8]) -> io::Result<u64> {
-		debug_assert!(self.holds_head);
+	/// Takes what of `buf` fits in the current chunk: how many bytes, and the chunk once full.
+	fn fill(&mut self, buf: &[u8]) -> io::Result<(usize, Option<Vec<u8>>)> {
 		if self.failed {
 			return Err(ended());
 		}
-		let last = std::mem::take(&mut self.chunk);
+		let n = buf.len().min(CHUNK_SIZE - self.chunk.len());
+		self.chunk.extend_from_slice(&buf[..n]);
+		self.written += n as u64;
+		let full = (self.chunk.len() == CHUNK_SIZE)
+			.then(|| std::mem::replace(&mut self.chunk, new_chunk()));
+		Ok((n, full))
+	}
+
+	/// Hands a full chunk to the driver.
+	fn send(&mut self, chunk: Vec<u8>) -> io::Result<()> {
+		self.port.send(WorkerEvent::Data(chunk)).inspect_err(|_| {
+			self.failed = true;
+		})
+	}
+}
+
+impl Write for ChunkSink<'_> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		let (n, full) = self.fill(buf)?;
+		if let Some(full) = full {
+			self.send(full)?;
+		}
+		Ok(n)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+/// A [`ChunkSink`] for a format whose start is written last (a 7z): it keeps the first chunk
+/// until [`HeadSink::finish_with_head`] patches it and sends it after all the others.
+pub(crate) struct HeadSink<'p> {
+	sink: ChunkSink<'p>,
+	head: Option<Vec<u8>>,
+}
+
+impl<'p> HeadSink<'p> {
+	pub(crate) fn new(port: &'p WorkerPort) -> Self {
+		Self {
+			sink: ChunkSink::new(port),
+			head: None,
+		}
+	}
+
+	/// Sends the last chunk, then the held first one with `start` written over its first
+	/// bytes (which the archive already holds, zeroed); the bytes written in all.
+	pub(crate) fn finish_with_head(mut self, start: &[u8]) -> io::Result<u64> {
+		if self.sink.failed {
+			return Err(ended());
+		}
+		let last = std::mem::take(&mut self.sink.chunk);
 		let (mut head, last) = match self.head.take() {
 			Some(head) => (head, Some(last)),
 			None => (last, None),
@@ -653,31 +703,20 @@ impl<'p> ChunkSink<'p> {
 		}
 		head[..start.len()].copy_from_slice(start);
 		if let Some(last) = last.filter(|last| !last.is_empty()) {
-			self.port.send(WorkerEvent::Data(last))?;
+			self.sink.port.send(WorkerEvent::Data(last))?;
 		}
-		self.port.send(WorkerEvent::Head(head))?;
-		Ok(self.written)
+		self.sink.port.send(WorkerEvent::Head(head))?;
+		Ok(self.sink.written)
 	}
 }
 
-impl Write for ChunkSink<'_> {
+impl Write for HeadSink<'_> {
 	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-		if self.failed {
-			return Err(ended());
-		}
-		let n = buf.len().min(CHUNK_SIZE - self.chunk.len());
-		self.chunk.extend_from_slice(&buf[..n]);
-		self.written += n as u64;
-		if self.chunk.len() == CHUNK_SIZE {
-			let full = std::mem::replace(&mut self.chunk, new_chunk());
-			if self.holds_head && self.head.is_none() {
-				self.head = Some(full);
-				return Ok(n);
-			}
-			if let Err(e) = self.port.send(WorkerEvent::Data(full)) {
-				self.failed = true;
-				return Err(e);
-			}
+		let (n, full) = self.sink.fill(buf)?;
+		match full {
+			Some(full) if self.head.is_none() => self.head = Some(full),
+			Some(full) => self.sink.send(full)?,
+			None => {}
 		}
 		Ok(n)
 	}

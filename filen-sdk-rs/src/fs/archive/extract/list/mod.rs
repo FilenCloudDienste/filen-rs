@@ -15,7 +15,7 @@ use crate::{
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
 			password::ArchivePassword,
-			worker::{CodecStart, WorkerEvent, codec_failed, worker_died},
+			worker::{CodecStart, WorkerEvent, codec_failed, unexpected_event, worker_died},
 		},
 		drive_job::{Fatal, backend::DriveBackend},
 		file::enums::RemoteFileType,
@@ -617,7 +617,17 @@ impl<B: DriveBackend> Lister<B> {
 				add_entry(listing, &mut self.kept_bytes, &entry);
 				self.reporter.listed(*entry);
 			}
-			other => debug_assert!(false, "a listing codec sent {other:?}"),
+			// the feed answers asks, and a listing's codec sends nothing else
+			WorkerEvent::Ask { .. }
+			| WorkerEvent::Entry(_)
+			| WorkerEvent::Skipped(_)
+			| WorkerEvent::Data(_)
+			| WorkerEvent::FileEnd
+			| WorkerEvent::Link(_)
+			| WorkerEvent::Head(_) => {
+				self.fatal
+					.stop(Arc::new(unexpected_event()), &self.control, &*self.reporter);
+			}
 		}
 	}
 

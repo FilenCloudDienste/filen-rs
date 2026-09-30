@@ -585,8 +585,8 @@ fn parse_central_header(
 			}
 			// WinZip AES: vendor version, "AE", strength, the method under the encryption
 			0x9901 if data.len() >= 7 => {
-				let strength = AesStrength::from_byte(data[4])
-					.ok_or(ZipError::Unsupported("an AES strength"))?;
+				let strength = AesStrength::try_from(data[4])
+					.map_err(|_| ZipError::Unsupported("an AES strength"))?;
 				aes = Some((strength, u16_at(data, 0) == 2, u16_at(data, 5)));
 			}
 			_ => {}

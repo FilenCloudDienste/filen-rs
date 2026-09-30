@@ -9,10 +9,11 @@ use crate::fs::name::{ValidatedName, keep_both::SourceName};
 
 use super::limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH};
 
-/// An entry's path as drive names, parent directories first.
+/// An entry's path as drive names, parent directories first: never empty, at most
+/// [`MAX_ARCHIVE_PATH_DEPTH`] deep, made only by [`entry_path`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArchivePath {
-	pub(crate) segments: Vec<ValidatedName>,
+	segments: Vec<ValidatedName>,
 	/// Whether any segment differs from what the archive stored: a stripped absolute or drive
 	/// prefix, or a name encoded or shortened to be valid.
 	pub(crate) rewritten: bool,
@@ -25,6 +26,26 @@ pub(crate) struct ArchivePath {
 }
 
 impl ArchivePath {
+	pub(crate) fn segments(&self) -> &[ValidatedName] {
+		&self.segments
+	}
+
+	/// The entry's own name, and the directories it is in.
+	pub(crate) fn split_last(&self) -> (&ValidatedName, &[ValidatedName]) {
+		self.segments
+			.split_last()
+			.expect("entry_path never makes an empty path")
+	}
+
+	/// The path below its first `depth` segments; `None` when nothing is left.
+	pub(crate) fn below(&self, depth: usize) -> Option<ArchivePath> {
+		let segments = self.segments.get(depth..).filter(|rest| !rest.is_empty())?;
+		Some(ArchivePath {
+			segments: segments.to_vec(),
+			..*self
+		})
+	}
+
 	/// Its segments joined with `/`.
 	pub(crate) fn joined(&self) -> String {
 		joined(&self.segments)
@@ -173,6 +194,18 @@ mod tests {
 			names(&entry_path("docs\\report.pdf").unwrap()),
 			["docs", "report.pdf"]
 		);
+	}
+
+	#[test]
+	fn a_path_below_its_first_segments_keeps_its_flags() {
+		let path = entry_path("/docs/2024/report.pdf").unwrap();
+		let below = path.below(1).unwrap();
+		assert_eq!(names(&below), ["2024", "report.pdf"]);
+		assert!(below.rewritten);
+		assert_eq!(names(&path.below(0).unwrap()), names(&path));
+		// nothing left is no path
+		assert_eq!(path.below(3), None);
+		assert_eq!(path.below(4), None);
 	}
 
 	#[test]

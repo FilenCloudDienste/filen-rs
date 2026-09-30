@@ -23,19 +23,12 @@ use crate::{
 };
 
 use super::{
-	super::{codec::LinkKeys, report::ExtractStage},
-	Driver, FileSource, LinkChunk, MAX_OPEN_FILES, NewFile,
+	super::{
+		codec::LinkKeys,
+		report::{ExtractStage, entry_index},
+	},
+	Driver, FilePhase, FileSource, LinkChunk, LinkPhase, MAX_OPEN_FILES, NewFile, SlotSource,
 };
-
-/// A hard link's copy of the file it names: that file's chunks, fetched one at a time (their
-/// hash is taken in order) and uploaded as the link's.
-#[derive(Default)]
-pub(super) struct LinkCopy {
-	/// The file, once fetched by its uuid.
-	source: Option<Arc<RemoteFileType<'static>>>,
-	/// A chunk of it is being fetched.
-	fetching: bool,
-}
 
 /// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
 /// codec sent, or another hard link's copy. A tar may hold a million files, each of which a
@@ -59,6 +52,7 @@ enum LinkTarget {
 }
 
 /// What a hard link's target is, once looked up.
+#[derive(Clone, Copy)]
 enum Named {
 	/// The file or hard link of this ordinal, not registered yet.
 	Open(u64),
@@ -72,10 +66,8 @@ impl LinkTargets {
 	/// Notes the file or hard link `ordinal` as the one that links after it naming `key` name:
 	/// a later file at the same path takes over.
 	fn open(&mut self, key: u64, ordinal: u64) {
-		// the member cap keeps ordinals far below u32::MAX; one past it is never named
-		if let Ok(ordinal) = u32::try_from(ordinal) {
-			self.by_key.insert(key, LinkTarget::Open(ordinal));
-		}
+		self.by_key
+			.insert(key, LinkTarget::Open(entry_index(ordinal)));
 	}
 
 	fn get(&self, key: u64) -> Option<Named> {
@@ -94,7 +86,7 @@ impl LinkTargets {
 		let Some(target) = self.by_key.get_mut(&key) else {
 			return;
 		};
-		if *target == LinkTarget::Open(u32::try_from(ordinal).unwrap_or(u32::MAX))
+		if *target == LinkTarget::Open(entry_index(ordinal))
 			&& let Ok(at) = u32::try_from(self.registered.len())
 		{
 			*target = LinkTarget::Registered(at);
@@ -112,9 +104,8 @@ pub(super) struct PendingLink {
 
 /// A hard link taken on, not opened yet.
 pub(super) struct TakenLink {
+	/// Its file, found by the links after it that name its path.
 	file: NewFile,
-	/// What the links after it that name its path find it by.
-	key: u64,
 }
 
 impl<B: DisposalBackend> Driver<B> {
@@ -142,15 +133,17 @@ impl<B: DisposalBackend> Driver<B> {
 		self.ready_links.clear();
 	}
 
-	/// Notes open file `ordinal`, at `path`, as the one the hard links after it that name that
-	/// path copy: a later file of the same path is the one links after it name.
-	pub(super) fn link_target(&mut self, ordinal: u64, path: &ArchivePath) {
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
-		let key = self.link_targets.keys.of(path);
-		file.link_key = Some(key);
-		self.link_targets.open(key, ordinal);
+	/// What the hard links that name `path` find the file there by.
+	pub(super) fn link_key(&self, path: &ArchivePath) -> u64 {
+		self.link_targets.keys.of(path)
+	}
+
+	/// Notes open file `ordinal`, found by `key`, as the one the hard links after it that name
+	/// its path copy: a later file of the same path is the one links after it name.
+	pub(super) fn link_target(&mut self, ordinal: u64, key: u64) {
+		if self.files.contains_key(&ordinal) {
+			self.link_targets.open(key, ordinal);
+		}
 	}
 
 	/// A tar hard link: extracted as a copy of the file it names (one the codec sent, or another
@@ -166,17 +159,17 @@ impl<B: DisposalBackend> Driver<B> {
 	/// not hang on when its target is registered; a link skipped after all leaves that name
 	/// taken, and a later entry of the same name gets a keep-both name.
 	pub(super) fn on_link(&mut self, link: LinkHead) {
+		let ordinal = link.ordinal();
 		let LinkHead {
-			ordinal,
 			path,
 			modified,
 			target,
 			unresolved,
 		} = link;
 		let (target, size) = match self.link_targets.get(self.link_targets.keys.of(&target)) {
-			Some(Named::Registered { uuid, size }) => (Ok(uuid), size),
-			Some(Named::Open(ordinal)) => match self.pending_size(ordinal) {
-				Some(size) => (Err(ordinal), size),
+			Some(named @ Named::Registered { size, .. }) => (named, size),
+			Some(named @ Named::Open(ordinal)) => match self.pending_size(ordinal) {
+				Some(size) => (named, size),
 				None => return self.on_skipped(unresolved),
 			},
 			None => return self.on_skipped(unresolved),
@@ -195,16 +188,17 @@ impl<B: DisposalBackend> Driver<B> {
 		self.link_bytes += size;
 		let entry = self.entry_id(ordinal);
 		self.report_path(entry, &path);
-		let Some(file) = self.new_file(ordinal, &path, Some(size), modified) else {
+		let Some(mut file) = self.new_file(ordinal, &path, Some(size), modified) else {
 			return;
 		};
 		// a link may be named by the links after it, as the file it copies is
-		let key = self.link_targets.keys.of(&path);
+		let key = self.link_key(&path);
 		self.link_targets.open(key, ordinal);
-		let link = TakenLink { file, key };
+		file.link_key = Some(key);
+		let link = TakenLink { file };
 		match target {
-			Ok(uuid) => self.ready_links.push_back((link, uuid)),
-			Err(target_ordinal) => {
+			Named::Registered { uuid, .. } => self.ready_links.push_back((link, uuid)),
+			Named::Open(target_ordinal) => {
 				self.links_waiting += 1;
 				self.waiting_links
 					.entry(target_ordinal)
@@ -218,7 +212,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// taken on and not opened yet; `None` when it is neither, so has nothing to copy.
 	fn pending_size(&self, ordinal: u64) -> Option<u64> {
 		if let Some(file) = self.files.get(&ordinal) {
-			return (!file.failed).then(|| file.bytes());
+			return (!file.failed()).then(|| file.bytes());
 		}
 		self.waiting_links
 			.values()
@@ -234,16 +228,12 @@ impl<B: DisposalBackend> Driver<B> {
 	pub(super) fn open_ready_links(&mut self) {
 		while self.files.len() < MAX_OPEN_FILES
 			&& self.link_sources.len() < MAX_SMALL_PARALLEL_REQUESTS
-			&& let Some((TakenLink { file, key }, target)) = self.ready_links.pop_front()
+			&& let Some((TakenLink { file }, target)) = self.ready_links.pop_front()
 		{
-			let ordinal = file.ordinal;
 			self.open_file(NewFile {
 				source: FileSource::Link { target },
 				..file
 			});
-			if let Some(file) = self.files.get_mut(&ordinal) {
-				file.link_key = Some(key);
-			}
 		}
 	}
 
@@ -285,27 +275,26 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Starts fetching the next chunk of each hard link's target whose copy can go on: its
 	/// directory exists, it has room for another upload, and memory is free right now.
 	pub(super) fn copy_links(&mut self) {
-		let ready: Vec<u64> = self
+		let ready: Vec<(u64, Arc<RemoteFileType<'static>>)> = self
 			.files
 			.iter()
-			.filter(|(_, file)| {
-				file.copy
-					.as_ref()
-					.is_some_and(|copy| copy.source.is_some() && !copy.fetching)
-					&& !file.failed && !file.ended
-					&& file.uploading < CHUNKS_PER_FILE
-					&& self.dirs[file.parent].created_uuid().is_some()
+			.filter_map(|(ordinal, file)| match &file.source {
+				SlotSource::Link(LinkPhase::Idle(source))
+					if file.phase == FilePhase::Receiving
+						&& file.uploading < CHUNKS_PER_FILE
+						&& self.dirs[file.parent].created_uuid().is_some() =>
+				{
+					Some((*ordinal, Arc::clone(source)))
+				}
+				_ => None,
 			})
-			.map(|(ordinal, _)| *ordinal)
 			.collect();
-		for ordinal in ready {
+		for (ordinal, source) in ready {
 			let Some(permit) = take_memory(&self.output_slot, &self.memory) else {
 				return;
 			};
 			let file = self.files.get_mut(&ordinal).expect("just found");
-			let copy = file.copy.as_mut().expect("just found");
-			copy.fetching = true;
-			let source = Arc::clone(copy.source.as_ref().expect("just found"));
+			file.source = SlotSource::Link(LinkPhase::Fetching(Arc::clone(&source)));
 			let index = file.next_index;
 			let backend = Arc::clone(&self.backend);
 			let op = self.reporter.op();
@@ -340,8 +329,10 @@ impl<B: DisposalBackend> Driver<B> {
 			return;
 		};
 		// an empty file has no chunk to copy
-		file.ended = source.chunks() == 0;
-		file.copy.as_mut().expect("a link copies").source = Some(Arc::new(source));
+		if source.chunks() == 0 {
+			file.phase = file.phase.end();
+		}
+		file.source = SlotSource::Link(LinkPhase::Idle(Arc::new(source)));
 		self.finalize_ready();
 	}
 
@@ -349,17 +340,22 @@ impl<B: DisposalBackend> Driver<B> {
 		let Some(file) = self.files.get_mut(&ordinal) else {
 			return;
 		};
-		let copy = file.copy.as_mut().expect("a link copies");
-		copy.fetching = false;
-		let chunks = copy.source.as_ref().expect("fetched from").chunks();
-		if file.failed {
+		let SlotSource::Link(LinkPhase::Fetching(source)) = &file.source else {
+			unreachable!("a chunk is fetched only for a link fetching one");
+		};
+		let source = Arc::clone(source);
+		let chunks = source.chunks();
+		file.source = SlotSource::Link(LinkPhase::Idle(source));
+		if file.failed() {
 			return;
 		}
 		match result {
 			Ok(data) => {
 				self.upload(ordinal, data, permit);
-				if let Some(file) = self.files.get_mut(&ordinal) {
-					file.ended = file.next_index == chunks;
+				if let Some(file) = self.files.get_mut(&ordinal)
+					&& file.next_index == chunks
+				{
+					file.phase = file.phase.end();
 				}
 			}
 			Err(error) => {

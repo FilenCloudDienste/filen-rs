@@ -31,7 +31,7 @@ use super::{
 		list::{ArchiveEntryKind, PasswordCheck},
 		storage_exceeded,
 	},
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
+	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,
 };
@@ -357,10 +357,10 @@ fn take_zip_file(
 	match take_file(walk, found, path, Some(entry.size), apple_double, reader).map_err(read_failure)
 	{
 		// an AppleDouble file left out was not read to its end: it proves nothing
-		Ok(0) => Ok(false),
+		Ok(Taken::LeftOut) => Ok(false),
 		// an empty ZipCrypto entry matches its CRC-32 under any key; AES's authentication code
 		// rejects a wrong one even over nothing
-		Ok(_) => {
+		Ok(Taken::File) => {
 			Ok(encrypted
 				&& (entry.size > 0 || matches!(entry.encryption, ZipEncryption::Aes { .. })))
 		}

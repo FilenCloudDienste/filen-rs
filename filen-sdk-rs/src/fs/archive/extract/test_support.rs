@@ -11,7 +11,6 @@ use crate::{
 		HasName, HasUUID,
 		archive::{
 			config::{ArchiveConfig, CODEC_MEM_BUDGET, JOB_CONCURRENCY},
-			dispose::SourceDisposal,
 			password::ArchivePassword,
 			test_support::remote_file,
 			worker,
@@ -27,6 +26,7 @@ use super::{
 	ArchiveEntry, ArchiveListing, ExpansionLimit, ExtractRoot, ListCallback, ListFailed,
 	ListUpdate,
 	codec::{CodecLimits, Selection, StreamJob, Task, extract_stream},
+	engine::ArchiveDisposal,
 	list::{ListReporter, ListTask, run_list},
 };
 
@@ -91,7 +91,7 @@ pub(super) struct Options {
 	pub(super) control: JobControl,
 	pub(super) max_bytes: Option<u64>,
 	pub(super) max_items: Option<u64>,
-	pub(super) dispose: Option<(SourceDisposal, Uuid)>,
+	pub(super) dispose: Option<ArchiveDisposal>,
 	pub(super) password: Option<ArchivePassword>,
 	/// Shared between jobs that compete for its slots.
 	pub(super) config: ArchiveConfig,

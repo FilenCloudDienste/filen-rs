@@ -159,7 +159,7 @@ impl MacFolders {
 			return Ok(());
 		};
 		if path
-			.segments
+			.segments()
 			.first()
 			.is_none_or(|first| first.as_ref() != MAC_METADATA_DIR)
 		{
@@ -187,7 +187,7 @@ impl MacFolders {
 
 /// The collision keys of `path`'s segments.
 fn collision_keys(path: &ArchivePath) -> Vec<String> {
-	path.segments
+	path.segments()
 		.iter()
 		.map(|segment| collision_key(segment.as_ref()))
 		.collect()
@@ -238,7 +238,7 @@ impl Found<'_> {
 	pub(super) fn mac_shape(&self) -> Option<MacShape> {
 		let path = self.path.as_ref().ok()?;
 		let in_mac_folder = path
-			.segments
+			.segments()
 			.first()
 			.is_some_and(|first| first.as_ref() == MAC_METADATA_DIR);
 		match self.kind {
@@ -246,11 +246,10 @@ impl Found<'_> {
 			ArchiveEntryKind::Hardlink { .. } => return None,
 			_ => return in_mac_folder.then_some(MacShape::InMacFolder),
 		}
-		let apple_double = in_mac_folder
-			|| path.segments.last().is_some_and(|name| {
-				let name: &str = name.as_ref();
-				name.len() > 2 && name.starts_with("._")
-			});
+		let apple_double = in_mac_folder || {
+			let name: &str = path.split_last().0.as_ref();
+			name.len() > 2 && name.starts_with("._")
+		};
 		apple_double.then_some(MacShape::AppleDoubleName)
 	}
 
@@ -318,10 +317,16 @@ pub(super) enum Verdict {
 pub(super) struct Walk<'p> {
 	pub(super) port: &'p WorkerPort,
 	skip_mac_metadata: bool,
-	/// The archive, when listing it.
-	listing: Option<Uuid>,
-	chooser: Option<Chooser>,
+	mode: Mode,
 	mac_folders: MacFolders,
+}
+
+/// What a [`Walk`] is for.
+enum Mode {
+	/// An extraction: of every entry, or of those a partial one chose.
+	Extract { chooser: Option<Chooser> },
+	/// A listing of `archive`.
+	List { archive: Uuid },
 }
 
 impl<'p> Walk<'p> {
@@ -331,21 +336,37 @@ impl<'p> Walk<'p> {
 		skip_mac_metadata: bool,
 		max_members: u64,
 	) -> Self {
-		let (listing, chooser) = match task {
-			Task::Extract(selection) => (None, selection.clone().map(Chooser::new)),
-			Task::List { archive } => (Some(*archive), None),
+		let mode = match task {
+			Task::Extract(selection) => Mode::Extract {
+				chooser: selection.clone().map(Chooser::new),
+			},
+			Task::List { archive } => Mode::List { archive: *archive },
 		};
 		Self {
 			port,
 			skip_mac_metadata,
-			listing,
-			chooser,
+			mode,
 			mac_folders: MacFolders::new(max_members),
 		}
 	}
 
 	pub(super) fn listing(&self) -> bool {
-		self.listing.is_some()
+		matches!(self.mode, Mode::List { .. })
+	}
+
+	/// What a partial extraction chose.
+	fn chooser(&self) -> Option<&Chooser> {
+		match &self.mode {
+			Mode::Extract { chooser } => chooser.as_ref(),
+			Mode::List { .. } => None,
+		}
+	}
+
+	fn chooser_mut(&mut self) -> Option<&mut Chooser> {
+		match &mut self.mode {
+			Mode::Extract { chooser } => chooser.as_mut(),
+			Mode::List { .. } => None,
+		}
 	}
 
 	/// Whether AppleDouble files are left out (see [`Verdict::Take`]).
@@ -355,10 +376,9 @@ impl<'p> Walk<'p> {
 
 	/// The id of the listed archive's entry `ordinal`.
 	pub(super) fn listed_id(&self, ordinal: u64) -> ArchiveEntryId {
-		ArchiveEntryId {
-			archive: self.listing.expect("only a listing lists"),
-			// the member cap keeps ordinals far below u32::MAX
-			index: u32::try_from(ordinal).unwrap_or(u32::MAX),
+		match self.mode {
+			Mode::List { archive } => ArchiveEntryId::of(archive, ordinal),
+			Mode::Extract { .. } => unreachable!("only a listing lists"),
 		}
 	}
 
@@ -369,7 +389,7 @@ impl<'p> Walk<'p> {
 		&mut self,
 		entries: impl Iterator<Item = (u64, &'e str, bool)>,
 	) -> Result<(), Error> {
-		let Some(chooser) = &mut self.chooser else {
+		let Some(chooser) = self.chooser_mut() else {
 			return Ok(());
 		};
 		let mut found = 0;
@@ -397,7 +417,7 @@ impl<'p> Walk<'p> {
 	/// What an extraction does with `found`.
 	pub(super) fn judge(&mut self, found: &Found) -> Result<Verdict, Error> {
 		let is_dir = found.is_dir();
-		let path = match &mut self.chooser {
+		let path = match self.chooser_mut() {
 			None => found.path.clone(),
 			Some(chooser) => match chooser.choose(found.ordinal, &found.path, is_dir)? {
 				Some(path) => path,
@@ -456,7 +476,7 @@ impl<'p> Walk<'p> {
 		} = std::mem::replace(&mut self.mac_folders, MacFolders::new(0));
 		// deepest first: a folder created creates the ones above it too
 		let mut deepest: Vec<usize> = (0..held.len()).collect();
-		deepest.sort_unstable_by_key(|&at| Reverse(held[at].stored.segments.len()));
+		deepest.sort_unstable_by_key(|&at| Reverse(held[at].stored.segments().len()));
 		let mut creates = vec![false; held.len()];
 		for at in deepest {
 			let prefixes: Vec<u128> = prefix_digests(&collision_keys(&held[at].stored)).collect();
@@ -490,7 +510,7 @@ impl<'p> Walk<'p> {
 
 	/// Once every entry was read: a partial extraction of a tar has met every entry it chose.
 	pub(super) fn finish(&self) -> Result<(), Error> {
-		match &self.chooser {
+		match self.chooser() {
 			Some(chooser) if chooser.met < chooser.selection.ordinals.len() => Err(not_held()),
 			_ => Ok(()),
 		}
@@ -594,14 +614,11 @@ impl<'p> Walk<'p> {
 	/// `path`, of the file a hard link names, below the base: where the job extracts it; `None`
 	/// when it is not below the base, so not extracted.
 	pub(super) fn within_base(&self, path: ArchivePath) -> Option<ArchivePath> {
-		let Some(chooser) = &self.chooser else {
+		let Some(chooser) = self.chooser() else {
 			return Some(path);
 		};
-		let keys = chooser.below_base(&path).ok()?;
-		(keys.len() > chooser.base.len()).then(|| ArchivePath {
-			segments: path.segments[chooser.base.len()..].to_vec(),
-			..path
-		})
+		chooser.below_base(&path).ok()?;
+		path.below(chooser.base.len())
 	}
 
 	/// Bytes of the `files` (by ordinal, path as stored and size) the job extracts: every one
@@ -611,7 +628,7 @@ impl<'p> Walk<'p> {
 		&self,
 		files: impl Iterator<Item = (u64, &'e str, u64)>,
 	) -> u64 {
-		let mut chooser = self.chooser.clone();
+		let mut chooser = self.chooser().cloned();
 		files
 			.filter(|&(ordinal, stored, _)| {
 				let path = entry_path(stored);
@@ -756,11 +773,7 @@ impl Chooser {
 			// chosen, it is skipped for its path; otherwise nothing tells where it would be
 			Err(rejection) => return Ok(chosen.then_some(Err(*rejection))),
 		};
-		let keys: Vec<String> = path
-			.segments
-			.iter()
-			.map(|segment| collision_key(segment.as_ref()))
-			.collect();
+		let keys = collision_keys(path);
 		let in_chosen_dir = prefix_digests(&keys).any(|digest| self.dirs.contains(&digest));
 		if !chosen && !in_chosen_dir {
 			return Ok(None);
@@ -778,9 +791,9 @@ impl Chooser {
 				Err(not_held())
 			};
 		}
-		Ok(Some(Ok(ArchivePath {
-			segments: path.segments[self.base.len()..].to_vec(),
-			..path.clone()
-		})))
+		let below = path
+			.below(self.base.len())
+			.expect("a path longer than the base it starts with");
+		Ok(Some(Ok(below)))
 	}
 }

@@ -166,7 +166,7 @@ fn run_job_answering(
 				member.reason,
 			)),
 			WorkerEvent::Link(link) => seen.push(Seen::Link(
-				link.ordinal,
+				link.ordinal(),
 				link.path.joined(),
 				link.target.joined(),
 			)),

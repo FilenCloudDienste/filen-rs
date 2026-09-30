@@ -33,14 +33,17 @@ use crate::{
 		archive::{
 			config::ArchiveConfig,
 			dispose::{
-				DisposalBackend, DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, Nesting,
+				DisposalBackend, DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, Nest,
 				Removing, SourceDisposal, SourceDisposition, WrittenFile, dispose_dir,
 				dispose_file, kept_on_early_end, nesting,
 			},
 			hash::HeadLastHasher,
 			input::{PREFETCH_CHUNKS, take_memory, whole_chunk},
 			limits::MAX_REPORT_RECORDS,
-			worker::{CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
+			worker::{
+				CodecStart, StallWatch, WorkerEvent, WorkerLink, codec_failed, unexpected_event,
+				worker_died,
+			},
 		},
 		categories::{DirType, Normal},
 		drive_job::{
@@ -110,17 +113,47 @@ pub(crate) struct CompressTask<B> {
 	/// The report so far: the plan's totals, skips and renames.
 	pub(crate) report: CompressReport,
 	pub(crate) disposal: Option<CompressDisposal>,
-	/// Reads the archive back before a permanent disposal.
-	pub(crate) read_back: Option<ReadBack>,
 }
 
 /// How to remove the sources once the archive is verified, and what the job read of them.
-#[derive(Debug)]
 pub(crate) struct CompressDisposal {
-	pub(crate) how: SourceDisposal,
-	pub(crate) targets: Vec<DisposalTarget>,
-	/// Per target: every file read below it had a hash in its metadata to check it against.
-	pub(crate) hashed: Vec<bool>,
+	pub(crate) removal: Removal,
+	/// The top-level sources, in request order.
+	pub(crate) sources: Vec<DisposalSource>,
+}
+
+/// How the sources are removed.
+pub(crate) enum Removal {
+	/// Into the trash, where they can be restored: nothing is read back.
+	Trash,
+	/// For good, once the archive reads back as `read_back` reads it.
+	DeletePermanently { read_back: ReadBack },
+}
+
+impl Removal {
+	fn how(&self) -> SourceDisposal {
+		match self {
+			Self::Trash => SourceDisposal::Trash,
+			Self::DeletePermanently { .. } => SourceDisposal::DeletePermanently,
+		}
+	}
+}
+
+/// A top-level source to remove.
+#[derive(Debug)]
+pub(crate) struct DisposalSource {
+	pub(crate) target: DisposalTarget,
+	/// Every file read below it had a hash in its metadata to check it against.
+	pub(crate) hashed: bool,
+}
+
+/// A top-level source, as the job works out what becomes of it.
+struct SourceRemoval {
+	target: DisposalTarget,
+	/// Why it is kept on its own account, whatever becomes of the others: a file below it that
+	/// did not match its hash, or had none to check a permanent removal against.
+	own_reason: Option<KeptReason>,
+	nest: Nest,
 }
 
 #[derive(Debug)]
@@ -138,11 +171,29 @@ type ChunkKey = (u32, u64);
 
 /// A fetched chunk of a source, with the memory it holds.
 type FetchedChunk = (
-	(u32, u64),
+	ChunkKey,
 	Result<Vec<u8>, Error>,
 	OwnedSemaphorePermit,
 	OpGuard,
 );
+
+/// The archive's hash, taken as its chunks are uploaded.
+enum ArchiveHash {
+	/// The chunks come in order.
+	Streaming(Box<blake3::Hasher>),
+	/// The first chunk comes last ([`WorkerEvent::Head`]); the others are hashed as they come.
+	HeadLast(HeadLastHasher),
+	/// The first chunk came, last.
+	Done(blake3::Hash),
+}
+
+/// An archive chunk from the codec.
+enum ArchiveChunk {
+	/// The next chunk in order.
+	Next(Vec<u8>),
+	/// The first chunk, sent last.
+	Head(Vec<u8>),
+}
 
 struct SourceState {
 	file: Arc<RemoteFileType<'static>>,
@@ -152,6 +203,8 @@ struct SourceState {
 	/// Chunks handed to the codec, which asks for them in order.
 	served: u64,
 	hasher: blake3::Hasher,
+	/// Its data did not match the hash in its metadata.
+	mismatched: bool,
 }
 
 impl SourceState {
@@ -163,6 +216,7 @@ impl SourceState {
 			request: source.request,
 			served: 0,
 			hasher: blake3::Hasher::new(),
+			mismatched: false,
 		}
 	}
 }
@@ -180,9 +234,9 @@ struct Driver<B: DriveBackend> {
 
 	sources: Vec<SourceState>,
 	/// The chunks the codec will read, in order: every chunk of every source with data.
-	next_fetch: (usize, u64),
+	next_fetch: ChunkKey,
 	/// The chunk the codec reads next.
-	next_served: (usize, u64),
+	next_served: ChunkKey,
 	fetches: FuturesOrdered<MaybeSendBoxFuture<'static, FetchedChunk>>,
 	/// Fetched chunks the codec has not read yet; each counts as in flight, so the job does not
 	/// count as paused while one still holds memory.
@@ -193,28 +247,20 @@ struct Driver<B: DriveBackend> {
 	destination: Uuid,
 	upload: Arc<B::Upload>,
 	archive_uuid: Uuid,
-	hasher: blake3::Hasher,
-	/// Hashes the archive when its first chunk comes last; `None` once it has.
-	head_last: Option<HeadLastHasher>,
-	/// The archive's hash, once the first chunk came last.
-	head_last_hash: Option<blake3::Hash>,
+	hash: ArchiveHash,
 	written: u64,
 	next_index: u64,
 	info: Option<RemoteFileInfo>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, (u64, Result<RemoteFileInfo, Error>)>>,
-	/// An archive chunk waiting for memory or for an upload slot, and whether it is the
-	/// first chunk sent last; the codec parks meanwhile.
-	held: Option<(Vec<u8>, bool)>,
+	/// An archive chunk waiting for memory or for an upload slot; the codec parks meanwhile.
+	held: Option<ArchiveChunk>,
 	events_closed: bool,
 	/// The codec returned, or was given up on.
 	codec_done: bool,
 	max_bytes: Option<u64>,
 	stall: StallWatch,
-	/// The top-level sources a file of which did not match the hash in its metadata.
-	mismatched: BTreeSet<usize>,
-	/// The files behind `mismatched`, for the report.
+	/// The source files that did not match the hash in their metadata, for the report.
 	hash_mismatches: Vec<HashMismatch>,
-	read_back: Option<ReadBack>,
 	fatal: Fatal,
 }
 
@@ -237,13 +283,18 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		start,
 		mut report,
 		disposal,
-		read_back,
 	} = task;
 	let shape = NameShape::FileWithExtension { len: extension_len };
 	// every source a disposal was asked for is reported, however the job ends
 	let requested: Vec<Uuid> = disposal
 		.as_ref()
-		.map(|disposal| disposal.targets.iter().map(DisposalTarget::uuid).collect())
+		.map(|disposal| {
+			disposal
+				.sources
+				.iter()
+				.map(|source| source.target.uuid())
+				.collect()
+		})
 		.unwrap_or_default();
 	let fail = |report, phase, error| end_early(&reporter, report, &requested, phase, error);
 	for source in &sources {
@@ -303,9 +354,11 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		destination: destination.uuid(),
 		upload: Arc::new(upload),
 		archive_uuid,
-		hasher: blake3::Hasher::new(),
-		head_last: head_last.then(HeadLastHasher::new),
-		head_last_hash: None,
+		hash: if head_last {
+			ArchiveHash::HeadLast(HeadLastHasher::new())
+		} else {
+			ArchiveHash::Streaming(Box::default())
+		},
 		written: 0,
 		// the first chunk's index is kept for when it comes
 		next_index: u64::from(head_last),
@@ -316,9 +369,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 		codec_done: false,
 		max_bytes,
 		stall: StallWatch::default(),
-		mismatched: BTreeSet::new(),
 		hash_mismatches: Vec::new(),
-		read_back,
 		fatal: Fatal::default(),
 	};
 	let incomplete = !report.skipped.is_empty();
@@ -344,7 +395,6 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 	report.hash_mismatches = hash_mismatches;
 	match fatal.end(outcome, &control, CompressReport::NAME) {
 		(_, Ok((archive, dispositions))) => {
-			report.archive = Some(archive);
 			report.dispositions = dispositions;
 			// a cancel once the archive exists keeps the sources, but the job is done; it still
 			// ends as cancelled jobs do, however late it was seen
@@ -353,6 +403,7 @@ pub(crate) async fn run_compress<B: DisposalBackend>(
 			}
 			reporter.finish(CompressPhase::Done);
 			report.counts = reporter.counts();
+			report.archive = Some(archive);
 			Ok(report)
 		}
 		(phase, Err(error)) => Err(end_early(&reporter, report, &requested, phase, error)),
@@ -400,16 +451,16 @@ pub(crate) fn cancelled() -> Arc<Error> {
 
 impl<B: DisposalBackend> Driver<B> {
 	/// The first chunk of the first source with data at or after `source`, or the end.
-	fn first_chunk_from(&self, mut source: usize) -> (usize, u64) {
-		while source < self.sources.len() && self.sources[source].chunks == 0 {
+	fn first_chunk_from(&self, mut source: u32) -> ChunkKey {
+		while source_at(&self.sources, source).is_some_and(|state| state.chunks == 0) {
 			source += 1;
 		}
 		(source, 0)
 	}
 
 	/// The chunk after `chunk`, in the order the codec reads them.
-	fn after(&self, (source, index): (usize, u64)) -> (usize, u64) {
-		if index + 1 < self.sources[source].chunks {
+	fn after(&self, (source, index): ChunkKey) -> ChunkKey {
+		if source_at(&self.sources, source).is_some_and(|state| index + 1 < state.chunks) {
 			(source, index + 1)
 		} else {
 			self.first_chunk_from(source + 1)
@@ -498,34 +549,31 @@ impl<B: DisposalBackend> Driver<B> {
 	fn advance(&mut self) {
 		self.serve_ask();
 		while self.fetches.len() + self.ready.len() < PREFETCH_CHUNKS
-			&& self.next_fetch.0 < self.sources.len()
+			&& let Some(source) = source_at(&self.sources, self.next_fetch.0)
 		{
 			let Some(permit) = take_memory(&self.input_slot, &self.memory) else {
 				break;
 			};
-			let (source, index) = self.next_fetch;
-			self.next_fetch = self.after(self.next_fetch);
+			let file = Arc::clone(&source.file);
+			let key = self.next_fetch;
+			self.next_fetch = self.after(key);
 			let backend = Arc::clone(&self.backend);
-			let file = Arc::clone(&self.sources[source].file);
 			let op = self.reporter.op();
 			self.fetches.push_back(Box::pin(async move {
-				let result = backend.fetch_chunk(&file, index).await;
-				let source = u32::try_from(source).expect(
-					"the client numbers sources in u32 and refuses more (should be impossible)",
-				);
-				((source, index), result, permit, op)
+				let result = backend.fetch_chunk(&file, key.1).await;
+				(key, result, permit, op)
 			}) as MaybeSendBoxFuture<'static, _>);
 		}
-		if let Some((data, head)) = self.held.take() {
-			self.take_data(data, head);
+		if let Some(chunk) = self.held.take() {
+			self.take_chunk(chunk);
 		}
 	}
 
-	fn fetch_finished(&mut self, ((source, index), result, permit, op): FetchedChunk) {
-		let file = &self.sources[source as usize].file;
-		match result.and_then(|data| whole_chunk(file, index, data)) {
+	fn fetch_finished(&mut self, (key, result, permit, op): FetchedChunk) {
+		let source = source_at(&self.sources, key.0).expect("the driver fetches only its sources");
+		match result.and_then(|data| whole_chunk(&source.file, key.1, data)) {
 			Ok(data) => {
-				self.ready.push_back(((source, index), data, permit, op));
+				self.ready.push_back((key, data, permit, op));
 				self.serve_ask();
 			}
 			Err(error) => self.stop_with(error),
@@ -539,12 +587,15 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.ready.front().is_none_or(|(ready, ..)| ready != key) {
 			return;
 		}
-		let ((source, index), data, permit, _op) = self.ready.pop_front().expect("just checked");
+		let (key, data, permit, _op) = self.ready.pop_front().expect("just checked");
 		let (_, reply) = self.ask.take().expect("just checked");
 		self.reading = Some(permit);
-		self.next_served = self.after((source as usize, index));
+		self.next_served = self.after(key);
 		let len = data.len() as u64;
-		let state = &mut self.sources[source as usize];
+		let state = usize::try_from(key.0)
+			.ok()
+			.and_then(|source| self.sources.get_mut(source))
+			.expect("the driver fetches only its sources");
 		state.hasher.update_rayon(&data);
 		state.served += 1;
 		if state.served == state.chunks
@@ -555,7 +606,7 @@ impl<B: DisposalBackend> Driver<B> {
 				"source {} of an archive does not match the hash in its metadata",
 				state.file.uuid()
 			);
-			self.mismatched.insert(state.request);
+			state.mismatched = true;
 			let mismatch = HashMismatch {
 				source_uuid: state.file.uuid(),
 				path: state.path.clone(),
@@ -590,38 +641,42 @@ impl<B: DisposalBackend> Driver<B> {
 				reply,
 			} => {
 				self.reading = None;
-				debug_assert_eq!(
-					(source as usize, index),
-					self.next_served,
-					"the codec reads the sources in order"
-				);
+				// an ask out of order would never be served: the chunks are fetched in order
+				if (source, index) != self.next_served {
+					self.stop_with(Error::custom(
+						ErrorKind::Internal,
+						"the codec read its sources out of order",
+					));
+					return;
+				}
 				self.ask = Some(((source, index), reply));
 				self.serve_ask();
 			}
-			WorkerEvent::Data(data) => self.take_data(data, false),
-			WorkerEvent::Head(data) => self.take_data(data, true),
+			WorkerEvent::Data(data) => self.take_chunk(ArchiveChunk::Next(data)),
+			WorkerEvent::Head(data) => self.take_chunk(ArchiveChunk::Head(data)),
 			WorkerEvent::FileEnd => self.reporter.file_done(),
 			// the compressing codec sends nothing else
 			WorkerEvent::Opened(_)
 			| WorkerEvent::Entry(_)
 			| WorkerEvent::Skipped(_)
 			| WorkerEvent::Link(_)
-			| WorkerEvent::Listed(_) => {}
+			| WorkerEvent::Listed(_) => self.stop_with(unexpected_event()),
 		}
 	}
 
 	/// Uploads an archive chunk (the first one when `head`), or holds it until memory or an
 	/// upload slot is free.
-	fn take_data(&mut self, data: Vec<u8>, head: bool) {
+	fn take_chunk(&mut self, chunk: ArchiveChunk) {
 		let permit = if self.uploads.len() < UPLOADS_AT_ONCE {
 			take_memory(&self.output_slot, &self.memory)
 		} else {
 			None
 		};
 		let Some(permit) = permit else {
-			self.held = Some((data, head));
+			self.held = Some(chunk);
 			return;
 		};
+		let (ArchiveChunk::Next(data) | ArchiveChunk::Head(data)) = &chunk;
 		let len = data.len() as u64;
 		if let Some(max) = self.max_bytes
 			&& drive_job::exceeds_limit(self.written + len, max)
@@ -632,26 +687,26 @@ impl<B: DisposalBackend> Driver<B> {
 			));
 			return;
 		}
-		let index = match (&mut self.head_last, head) {
-			(None, false) => {
-				self.hasher.update_rayon(&data);
+		let (index, data) = match (chunk, &mut self.hash) {
+			(ArchiveChunk::Next(data), ArchiveHash::Streaming(hasher)) => {
+				hasher.update_rayon(&data);
 				self.next_index += 1;
-				self.next_index - 1
+				(self.next_index - 1, data)
 			}
-			(Some(hasher), false) => {
+			(ArchiveChunk::Next(data), ArchiveHash::HeadLast(hasher)) => {
 				hasher.update(&data);
 				self.next_index += 1;
-				self.next_index - 1
+				(self.next_index - 1, data)
 			}
-			(Some(_), true) => {
-				let hasher = self.head_last.take().expect("matched above");
-				self.head_last_hash = Some(hasher.finalize(&data));
-				0
+			(ArchiveChunk::Head(data), ArchiveHash::HeadLast(hasher)) => {
+				self.hash = ArchiveHash::Done(hasher.finalize(&data));
+				(0, data)
 			}
-			(None, true) => {
+			(ArchiveChunk::Next(_), ArchiveHash::Done(_))
+			| (ArchiveChunk::Head(_), ArchiveHash::Streaming(_) | ArchiveHash::Done(_)) => {
 				self.stop_with(Error::custom(
 					ErrorKind::Internal,
-					"the codec sent the archive's first chunk twice",
+					"the codec sent the archive's chunks out of order",
 				));
 				return;
 			}
@@ -734,12 +789,10 @@ impl<B: DisposalBackend> Driver<B> {
 			return Ok((archive, Vec::new()));
 		};
 		// a permanent disposal reads the archive back first
-		self.reporter
-			.set_phase(if disposal.how == SourceDisposal::DeletePermanently {
-				CompressPhase::Verifying
-			} else {
-				CompressPhase::DisposingSources
-			});
+		self.reporter.set_phase(match disposal.removal {
+			Removal::DeletePermanently { .. } => CompressPhase::Verifying,
+			Removal::Trash => CompressPhase::DisposingSources,
+		});
 		let dispositions = match self.reporter.checkpoint(&self.control).await {
 			Ok(()) => self.dispose(disposal, &archive, incomplete).await,
 			Err(Stopped) => {
@@ -758,49 +811,42 @@ impl<B: DisposalBackend> Driver<B> {
 		archive: &RemoteFile,
 		incomplete: bool,
 	) -> Vec<SourceDisposition> {
-		let CompressDisposal {
-			how,
-			targets,
-			hashed,
-		} = disposal;
-		let read_back = self.read_back.take();
+		let CompressDisposal { removal, sources } = disposal;
+		let how = removal.how();
+		let nests = nesting(&enclosing(&sources));
 		// a source whose own files could not be checked is kept on its own; anything wrong
 		// with the archive keeps them all
-		let mismatched = std::mem::take(&mut self.mismatched);
-		let own_reason = |request: usize| {
-			if mismatched.contains(&request) {
-				Some(KeptReason::HashMismatch)
-			} else if how == SourceDisposal::DeletePermanently && !hashed[request] {
-				Some(KeptReason::HashUnavailable)
-			} else {
-				None
-			}
-		};
-		let every_source_kept = (0..targets.len()).all(|request| own_reason(request).is_some());
+		let mut removals: Vec<SourceRemoval> = sources
+			.into_iter()
+			.zip(nests)
+			.map(|(source, nest)| SourceRemoval {
+				own_reason: (how == SourceDisposal::DeletePermanently && !source.hashed)
+					.then_some(KeptReason::HashUnavailable),
+				target: source.target,
+				nest,
+			})
+			.collect();
+		for source in self.sources.iter().filter(|source| source.mismatched) {
+			removals[source.request].own_reason = Some(KeptReason::HashMismatch);
+		}
+		let every_source_kept = removals.iter().all(|removal| removal.own_reason.is_some());
 		let archive_reason = self
-			.archive_kept(how, archive, read_back, incomplete, every_source_kept)
+			.archive_kept(removal, archive, incomplete, every_source_kept)
 			.await;
 		self.reporter.set_phase(CompressPhase::DisposingSources);
-		let Nesting { outermost, cyclic } = nesting(&enclosing(&targets));
-		let uuids: Vec<Uuid> = targets.iter().map(DisposalTarget::uuid).collect();
-		let files: Vec<bool> = targets
-			.iter()
-			.map(|target| matches!(target, DisposalTarget::File(_)))
-			.collect();
-		let mut dispositions: Vec<Option<SourceDisposition>> = vec![None; targets.len()];
+		let mut dispositions: Vec<Option<SourceDisposition>> = vec![None; removals.len()];
 		// the sources each outermost one goes with, itself included
-		let mut going = vec![Vec::new(); targets.len()];
-		for (source, &outer) in outermost.iter().enumerate() {
-			going[outer].push(source);
+		let mut going = vec![Vec::new(); removals.len()];
+		for (source, removal) in removals.iter().enumerate() {
+			going[removal.nest.outermost(source)].push(source);
 		}
-		for (request, target) in targets.into_iter().enumerate() {
-			if outermost[request] != request {
-				continue;
-			}
-			let held_back = if cyclic[request] {
-				Some(KeptReason::Changed)
-			} else {
-				archive_reason.clone().or_else(|| own_reason(request))
+		for (request, removal) in removals.iter().enumerate() {
+			let held_back = match removal.nest {
+				Nest::Within(_) => continue,
+				Nest::Cyclic => Some(KeptReason::Changed),
+				Nest::Outermost => archive_reason
+					.clone()
+					.or_else(|| removal.own_reason.clone()),
 			};
 			// the files the folder's permanent removal deleted, even when it stopped part way
 			let mut deleted = BTreeSet::new();
@@ -813,19 +859,22 @@ impl<B: DisposalBackend> Driver<B> {
 						ops: &ops,
 						output: Some(self.written_archive(archive)),
 					};
-					dispose_target(&*self.backend, removing, target, how, &mut deleted).await
+					dispose_target(&*self.backend, removing, &removal.target, how, &mut deleted)
+						.await
 				}
 			};
 			// the source and those that go with it are told of as soon as its outcome is final
 			let told = std::mem::take(&mut going[request]);
 			for &nested in &told {
+				let target = &removals[nested].target;
 				let outcome = if nested == request {
 					outcome.clone()
 				} else {
-					going_with(&outcome, files[nested] && deleted.contains(&uuids[nested]))
+					let file = matches!(target, DisposalTarget::File(_));
+					going_with(&outcome, file && deleted.contains(&target.uuid()))
 				};
 				dispositions[nested] = Some(SourceDisposition {
-					uuid: uuids[nested],
+					uuid: target.uuid(),
 					outcome,
 				});
 			}
@@ -847,9 +896,8 @@ impl<B: DisposalBackend> Driver<B> {
 	/// a reason of its own.
 	async fn archive_kept(
 		&mut self,
-		how: SourceDisposal,
+		removal: Removal,
 		archive: &RemoteFile,
-		read_back: Option<ReadBack>,
 		incomplete: bool,
 		every_source_kept: bool,
 	) -> Option<KeptReason> {
@@ -874,7 +922,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.await;
 		match state {
 			Ok(Ok(state)) if self.written_archive(archive).stands(&state) => {
-				self.read_back(how, archive, read_back).await
+				self.read_back(removal, archive).await
 			}
 			Ok(Ok(_)) => Some(KeptReason::Unconfirmed),
 			Ok(Err(error)) => {
@@ -899,17 +947,10 @@ impl<B: DisposalBackend> Driver<B> {
 
 	/// Why the sources are kept after reading `archive` back, which a permanent disposal needs:
 	/// the encoders are the SDK's own, and nothing else would hold the data if one were wrong.
-	async fn read_back(
-		&mut self,
-		how: SourceDisposal,
-		archive: &RemoteFile,
-		read_back: Option<ReadBack>,
-	) -> Option<KeptReason> {
-		if how == SourceDisposal::Trash {
+	async fn read_back(&mut self, removal: Removal, archive: &RemoteFile) -> Option<KeptReason> {
+		let Removal::DeletePermanently { read_back } = removal else {
+			// trashed sources can be restored
 			return None;
-		}
-		let Some(read_back) = read_back else {
-			return Some(KeptReason::Unconfirmed);
 		};
 		// every source was read to its end, so each hash is of all of it; nothing reads the
 		// sources' paths again
@@ -945,10 +986,14 @@ impl<B: DisposalBackend> Driver<B> {
 		let completion = UploadCompletion {
 			written: self.written,
 			num_chunks: self.next_index,
-			hash: Blake3Hash::from(
-				self.head_last_hash
-					.unwrap_or_else(|| self.hasher.finalize()),
-			),
+			hash: Blake3Hash::from(match &self.hash {
+				ArchiveHash::Streaming(hasher) => hasher.finalize(),
+				ArchiveHash::Done(hash) => *hash,
+				// the codec's length would not match what was handed over
+				ArchiveHash::HeadLast(_) => {
+					unreachable!("an archive is registered without its head")
+				}
+			}),
 			final_times: (now, now),
 		};
 		let mut retry = NameRetry::new(shape, "item");
@@ -1000,6 +1045,11 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 }
 
+/// Source `n`, by the number the codec asks for it by; `None` past the last.
+fn source_at(sources: &[SourceState], n: u32) -> Option<&SourceState> {
+	sources.get(usize::try_from(n).ok()?)
+}
+
 impl DisposalTarget {
 	fn uuid(&self) -> Uuid {
 		match self {
@@ -1015,13 +1065,13 @@ impl DisposalTarget {
 async fn dispose_target<B: DisposalBackend>(
 	backend: &B,
 	removing: Removing<'_>,
-	target: DisposalTarget,
+	target: &DisposalTarget,
 	how: SourceDisposal,
 	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
 	match target {
-		DisposalTarget::File(file) => dispose_file(backend, file, how, removing).await,
-		DisposalTarget::Dir(dir) => dispose_dir(backend, &dir, how, removing, deleted).await,
+		DisposalTarget::File(file) => dispose_file(backend, *file, how, removing).await,
+		DisposalTarget::Dir(dir) => dispose_dir(backend, dir, how, removing, deleted).await,
 		DisposalTarget::Unavailable { .. } => DisposalOutcome::kept(KeptReason::Changed),
 	}
 }
@@ -1030,24 +1080,24 @@ async fn dispose_target<B: DisposalBackend>(
 /// folder both given) goes with that one, whose removal removes it, and its own attempt would only
 /// find it gone. The first such one, when several are: the same item given twice goes with its
 /// first. Linear in the targets and what the folders among them read, however many are given.
-fn enclosing(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
+fn enclosing(sources: &[DisposalSource]) -> Vec<Option<usize>> {
 	// where each item is given, first to last
 	let mut given: HashMap<Uuid, Vec<usize>> = HashMap::new();
-	for (index, target) in targets.iter().enumerate() {
-		given.entry(target.uuid()).or_default().push(index);
+	for (index, source) in sources.iter().enumerate() {
+		given.entry(source.target.uuid()).or_default().push(index);
 	}
-	let mut outer: Vec<Option<usize>> = targets
+	let mut outer: Vec<Option<usize>> = sources
 		.iter()
 		.enumerate()
-		.map(|(index, target)| {
-			given[&target.uuid()]
+		.map(|(index, source)| {
+			given[&source.target.uuid()]
 				.first()
 				.filter(|&&first| first < index)
 				.copied()
 		})
 		.collect();
-	for (holder, target) in targets.iter().enumerate() {
-		let DisposalTarget::Dir(dir) = target else {
+	for (holder, source) in sources.iter().enumerate() {
+		let DisposalTarget::Dir(dir) = &source.target else {
 			continue;
 		};
 		let read = dir
@@ -1060,7 +1110,7 @@ fn enclosing(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
 			for &inner in given.get(uuid).into_iter().flatten() {
 				// a file source is only ever among a folder's files
 				let held = inner != holder
-					&& (is_file || !matches!(targets[inner], DisposalTarget::File(_)));
+					&& (is_file || !matches!(sources[inner].target, DisposalTarget::File(_)));
 				if held && outer[inner].is_none_or(|first| holder < first) {
 					outer[inner] = Some(holder);
 				}

@@ -167,7 +167,6 @@ fn start_with(setup: &Setup, options: Options, start: CodecStart<CodecResult>) -
 		config: options.config,
 		start,
 		dispose: options.dispose,
-		disposal_requested: options.dispose.is_some(),
 	}));
 	Job {
 		running,

@@ -144,11 +144,14 @@ pub struct CompressUpdate {
 	pub active_time: Duration,
 }
 
-/// The outcome of compressing. Nothing is visible in the drive unless the archive was
-/// registered.
+/// What compressing did, however it ended. Nothing is visible in the drive unless the job ran
+/// to its end.
 #[derive(Debug, Default)]
 pub struct CompressReport {
+	/// The archive, registered in the destination: always there once the job ran to its end, and
+	/// never in the report of a job that ended early, which leaves nothing in the drive.
 	pub archive: Option<RemoteFile>,
+	/// The items left out of the archive.
 	pub skipped: Vec<SkippedEntry>,
 	/// The items that got another name in the archive.
 	pub renamed: Vec<RenamedEntry>,

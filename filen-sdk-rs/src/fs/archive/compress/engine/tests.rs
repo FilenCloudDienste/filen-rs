@@ -22,7 +22,7 @@ use crate::{
 		HasName,
 		archive::{
 			compress::{
-				CompressFormat, CompressUpdate,
+				CheckedFormat, CompressFormat, CompressUpdate,
 				codec::{ArchiveEntry, CompressJob, compress},
 				read_back::{ReadBack, ReadBackResult, StartReadBack},
 				report::CompressCallback,
@@ -253,7 +253,7 @@ fn start_disposing(
 	control: JobControl,
 	max_bytes: Option<u64>,
 	start: CodecStart<CodecResult>,
-	disposal: Option<CompressDisposal>,
+	disposal: Option<(SourceDisposal, Vec<DisposalSource>)>,
 	report: CompressReport,
 ) -> Job {
 	let recorder = Arc::new(Recorder {
@@ -268,13 +268,19 @@ fn start_disposing(
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
 	let config = setup.config.clone();
-	let read_back = disposal.as_ref().map(|_| {
-		let mut read_back =
-			ReadBack::as_extracting(&setup.entries, &config, setup.password.clone());
-		if let Some(start) = setup.reader.lock().unwrap().take() {
-			read_back.start = start;
-		}
-		read_back
+	let disposal = disposal.map(|(how, sources)| CompressDisposal {
+		removal: match how {
+			SourceDisposal::Trash => Removal::Trash,
+			SourceDisposal::DeletePermanently => {
+				let written = job(format, setup.entries.clone(), setup.password.clone());
+				let mut read_back = ReadBack::as_extracting(&written, &config);
+				if let Some(start) = setup.reader.lock().unwrap().take() {
+					read_back.start = start;
+				}
+				Removal::DeletePermanently { read_back }
+			}
+		},
+		sources,
 	});
 	let running = tokio::spawn(run_compress(CompressTask {
 		backend: Arc::clone(&setup.backend),
@@ -299,12 +305,26 @@ fn start_disposing(
 		start,
 		report,
 		disposal,
-		read_back,
 	}));
 	Job {
 		running,
 		recorder,
 		reporter,
+	}
+}
+
+/// The codec's job for an archive of `entries` in `format`, checked with `password`.
+fn job(
+	format: CompressFormat,
+	entries: Vec<ArchiveEntry>,
+	password: Option<ArchivePassword>,
+) -> CompressJob {
+	let CheckedFormat::Archive(checked) = format.check(password).unwrap() else {
+		panic!("{format:?} holds entries");
+	};
+	CompressJob::Archive {
+		format: checked,
+		entries,
 	}
 }
 
@@ -315,11 +335,7 @@ fn start(
 	control: JobControl,
 	max_bytes: Option<u64>,
 ) -> Job {
-	let job = CompressJob {
-		format,
-		entries: setup.entries.clone(),
-		password: None,
-	};
+	let job = job(format, setup.entries.clone(), None);
 	start_with(
 		setup,
 		name,
@@ -389,8 +405,8 @@ async fn compresses_the_sources_into_one_new_file() {
 		None,
 	);
 	let report = job.running.await.unwrap().unwrap();
+	let archive = report.archive.as_ref().unwrap();
 
-	let archive = report.archive.as_ref().expect("the archive is registered");
 	assert_eq!(
 		archive.name(),
 		Some("bundle (1).tar.gz"),
@@ -456,8 +472,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		JobControl::default(),
 		None,
 	);
-	let report = job.running.await.unwrap().unwrap();
-	assert!(report.archive.is_some());
+	job.running.await.unwrap().unwrap();
 	let mismatched: Vec<String> = job
 		.recorder
 		.events()
@@ -505,7 +520,6 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
-	assert!(failed.report.archive.is_none());
 	assert!(setup_storage.backend.log().finished.is_empty());
 	setup_storage.backend.assert_released(&job.reporter);
 	// ended by an error, not cancelled
@@ -632,6 +646,56 @@ async fn a_failed_codec_gives_back_its_own_error() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_chunk_after_the_head_is_an_internal_error() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let format = CompressFormat::SevenZ {
+		method: SevenZMethod::Copy,
+		solid: false,
+		encryption: None,
+	};
+	let job = start_with(
+		&setup,
+		"b.7z",
+		format,
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+	);
+	// the head is the archive's last chunk: nothing may follow it
+	events.send(WorkerEvent::Head(vec![1; 32])).await.unwrap();
+	events.send(WorkerEvent::Data(vec![2; 8])).await.unwrap();
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Internal);
+	assert!(setup.backend.log().finished.is_empty());
+	setup.backend.assert_released(&job.reporter);
+	drop((events, result));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_only_an_extracting_codec_sends_is_an_internal_error() {
+	let setup = setup(|_, _| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(
+		&setup,
+		"b.tar",
+		CompressFormat::Tar { compression: None },
+		JobControl::default(),
+		None,
+		Box::new(move || Ok(link)),
+	);
+	events
+		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
+		.await
+		.unwrap();
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::Internal);
+	assert!(setup.backend.log().finished.is_empty());
+	setup.backend.assert_released(&job.reporter);
+	drop((events, result));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	let setup = setup(|backend, files| {
 		backend.hold_requests(Request::Fetch, [files[0].uuid()]);
@@ -708,6 +772,16 @@ fn targets(setup: &Setup, placed: &Placed) -> Vec<DisposalTarget> {
 	]
 }
 
+/// `targets` to remove, each with whether the files read below it were `hashed`.
+fn sources(targets: Vec<DisposalTarget>, hashed: &[bool]) -> Vec<DisposalSource> {
+	assert_eq!(targets.len(), hashed.len());
+	targets
+		.into_iter()
+		.zip(hashed)
+		.map(|(target, &hashed)| DisposalSource { target, hashed })
+		.collect()
+}
+
 async fn compress_disposing(
 	setup: &Setup,
 	how: SourceDisposal,
@@ -715,16 +789,12 @@ async fn compress_disposing(
 	report: CompressReport,
 ) -> CompressReport {
 	let placed = place(setup);
-	let disposal = CompressDisposal {
-		how,
-		targets: targets(setup, &placed),
-		hashed: hashed.to_vec(),
-	};
-	let job = CompressJob {
-		format: CompressFormat::Tar { compression: None },
-		entries: setup.entries.clone(),
-		password: None,
-	};
+	let disposal = (how, sources(targets(setup, &placed), &hashed));
+	let job = job(
+		CompressFormat::Tar { compression: None },
+		setup.entries.clone(),
+		None,
+	);
 	let job = start_disposing(
 		setup,
 		"b.tar",
@@ -823,16 +893,15 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 	setup
 		.backend
 		.place_file(Uuid::from_u128(0x7A), placed.docs, 10);
-	let disposal = CompressDisposal {
-		how: SourceDisposal::DeletePermanently,
-		targets: targets(&setup, &placed),
-		hashed: vec![true, true],
-	};
-	let job = CompressJob {
-		format: CompressFormat::Tar { compression: None },
-		entries: setup.entries.clone(),
-		password: None,
-	};
+	let disposal = (
+		SourceDisposal::DeletePermanently,
+		sources(targets(&setup, &placed), &[true; 2]),
+	);
+	let job = job(
+		CompressFormat::Tar { compression: None },
+		setup.entries.clone(),
+		None,
+	);
 	let job = start_disposing(
 		&setup,
 		"b.tar",
@@ -1009,7 +1078,7 @@ async fn a_7z_uploads_its_first_chunk_last() {
 		};
 		let job = start(&setup, "bundle.7z", format, JobControl::default(), None);
 		let report = job.running.await.unwrap().unwrap();
-		let archive = report.archive.as_ref().expect("the archive is registered");
+		let archive = report.archive.as_ref().unwrap();
 		let (_, completion) = setup.backend.log().finished[&archive.uuid()].clone();
 		let bytes = uploaded(&setup, archive.uuid());
 		assert_eq!(completion.written, bytes.len() as u64, "{method:?}");
@@ -1164,16 +1233,15 @@ async fn a_source_inside_another_goes_with_it() {
 		top.uuid(),
 		placed.parent,
 	)));
-	let disposal = CompressDisposal {
-		how: SourceDisposal::DeletePermanently,
-		targets,
-		hashed: vec![true; 4],
-	};
-	let job = CompressJob {
-		format: CompressFormat::Tar { compression: None },
-		entries: setup.entries.clone(),
-		password: None,
-	};
+	let disposal = (
+		SourceDisposal::DeletePermanently,
+		sources(targets, &[true; 4]),
+	);
+	let job = job(
+		CompressFormat::Tar { compression: None },
+		setup.entries.clone(),
+		None,
+	);
 	let job = start_disposing(
 		&setup,
 		"b.tar",
@@ -1219,11 +1287,11 @@ fn run_disposal(
 	control: JobControl,
 ) -> Job {
 	let hashed = vec![true; targets.len()];
-	let job = CompressJob {
-		format: CompressFormat::Tar { compression: None },
-		entries: setup.entries.clone(),
-		password: None,
-	};
+	let job = job(
+		CompressFormat::Tar { compression: None },
+		setup.entries.clone(),
+		None,
+	);
 	start_disposing(
 		setup,
 		"b.tar",
@@ -1231,11 +1299,7 @@ fn run_disposal(
 		control,
 		None,
 		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some(CompressDisposal {
-			how,
-			targets,
-			hashed,
-		}),
+		Some((how, sources(targets, &hashed))),
 		CompressReport::default(),
 	)
 }
@@ -1766,8 +1830,8 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	setup_paused.backend.assert_released(&job.reporter);
 	assert!(setup_paused.backend.log().finished.is_empty());
 	pause.send_replace(false);
-	let report = job.running.await.unwrap().unwrap();
-	let paused = uploaded(&setup_paused, report.archive.unwrap().uuid());
+	let archive = job.running.await.unwrap().unwrap().archive.unwrap();
+	let paused = uploaded(&setup_paused, archive.uuid());
 	assert_eq!(
 		job.recorder.run_states(),
 		[RunState::Running, RunState::Paused, RunState::Running]
@@ -1781,10 +1845,10 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 		JobControl::default(),
 		None,
 	);
-	let report = job.running.await.unwrap().unwrap();
+	let archive = job.running.await.unwrap().unwrap().archive.unwrap();
 	assert_eq!(
 		paused,
-		uploaded(&setup_straight, report.archive.unwrap().uuid()),
+		uploaded(&setup_straight, archive.uuid()),
 		"a pause changes nothing in the archive"
 	);
 }
@@ -1850,11 +1914,7 @@ fn phases(recorder: &Recorder) -> Vec<CompressPhase> {
 /// Compresses the setup into `name` in `format`, removing the sources for good.
 fn dispose_permanently_as(setup: &Setup, name: &str, format: CompressFormat) -> Job {
 	let placed = place(setup);
-	let job = CompressJob {
-		format,
-		entries: setup.entries.clone(),
-		password: setup.password.clone(),
-	};
+	let job = job(format, setup.entries.clone(), setup.password.clone());
 	start_disposing(
 		setup,
 		name,
@@ -1862,11 +1922,10 @@ fn dispose_permanently_as(setup: &Setup, name: &str, format: CompressFormat) -> 
 		JobControl::default(),
 		None,
 		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some(CompressDisposal {
-			how: SourceDisposal::DeletePermanently,
-			targets: targets(setup, &placed),
-			hashed: vec![true; 2],
-		}),
+		Some((
+			SourceDisposal::DeletePermanently,
+			sources(targets(setup, &placed), &[true; 2]),
+		)),
 		CompressReport::default(),
 	)
 }
@@ -1898,7 +1957,8 @@ async fn a_permanent_removal_reads_the_archive_back_first() {
 		setup.password = password;
 		let job = dispose_permanently_as(&setup, name, format);
 		let report = job.running.await.unwrap().unwrap();
-		let archive = report.archive.as_ref().unwrap().uuid();
+		let archive = report.archive.as_ref().unwrap();
+		let archive = archive.uuid();
 		assert!(
 			outcomes(&report)
 				.iter()
@@ -1940,8 +2000,8 @@ async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 		JobControl::default(),
 		None,
 	);
-	let report = job.running.await.unwrap().unwrap();
-	let mut damaged = uploaded(&straight, report.archive.unwrap().uuid());
+	let archive = job.running.await.unwrap().unwrap().archive.unwrap();
+	let mut damaged = uploaded(&straight, archive.uuid());
 	// the directory's header, then a.txt's, then its data
 	let data = 2 * 512;
 	assert_eq!(&damaged[data..data + 5], b"alpha");
@@ -1965,11 +2025,10 @@ async fn dispose_scripted(setup: &Setup, archive: &[u8]) -> Job {
 		JobControl::default(),
 		None,
 		Box::new(move || Ok(link)),
-		Some(CompressDisposal {
-			how: SourceDisposal::DeletePermanently,
-			targets: targets(setup, &placed),
-			hashed: vec![true; 2],
-		}),
+		Some((
+			SourceDisposal::DeletePermanently,
+			sources(targets(setup, &placed), &[true; 2]),
+		)),
 		CompressReport::default(),
 	);
 	// each source's chunks, and whether it is the source's last
@@ -2001,7 +2060,6 @@ async fn dispose_scripted(setup: &Setup, archive: &[u8]) -> Job {
 
 /// The archive stays, and every source is kept because the archive was not confirmed.
 fn assert_kept_unconfirmed(setup: &Setup, reporter: &Reporter, report: &CompressReport) {
-	assert!(report.archive.is_some(), "the archive stays");
 	all_kept_for(report, |reason| matches!(reason, KeptReason::Unconfirmed));
 	assert!(setup.backend.log().deleted_files.is_empty());
 	assert!(setup.backend.log().trashed_dirs.is_empty());
@@ -2342,7 +2400,8 @@ async fn a_pause_while_removing_holds_no_lock_and_removes_nothing() {
 }
 
 /// [`enclosing`] as a scan of every pair of targets, the definition it has to agree with.
-fn enclosing_by_scanning(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
+fn enclosing_by_scanning(sources: &[DisposalSource]) -> Vec<Option<usize>> {
+	let targets: Vec<&DisposalTarget> = sources.iter().map(|source| &source.target).collect();
 	targets
 		.iter()
 		.enumerate()
@@ -2408,10 +2467,12 @@ fn sources_go_with_the_first_one_holding_them() {
 				}
 			})
 			.collect();
+		let hashed = vec![true; targets.len()];
+		let sources = sources(targets, &hashed);
 		assert_eq!(
-			enclosing(&targets),
-			enclosing_by_scanning(&targets),
-			"{targets:?}"
+			enclosing(&sources),
+			enclosing_by_scanning(&sources),
+			"{sources:?}"
 		);
 	}
 }

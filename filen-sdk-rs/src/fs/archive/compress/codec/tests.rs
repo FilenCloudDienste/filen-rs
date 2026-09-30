@@ -12,6 +12,7 @@ use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::archive::{
+		compress::{CheckedFormat, CompressFormat},
 		decode::open_stream,
 		encode::Compression,
 		format::StreamCodec,
@@ -51,16 +52,33 @@ fn run_with(
 	short: Option<u32>,
 	password: Option<&str>,
 ) -> Written {
-	let job = CompressJob {
-		format,
-		entries,
-		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
-	};
+	let job = job(format, entries, password.map(archive_password));
 	drive(
 		worker::start(move |port| compress(&port, job)).unwrap(),
 		sources,
 		short,
 	)
+}
+
+/// The codec's job for `entries` in `format`, checked with `password`.
+fn job(
+	format: CompressFormat,
+	entries: Vec<ArchiveEntry>,
+	password: Option<ArchivePassword>,
+) -> CompressJob {
+	match format.check(password).unwrap() {
+		CheckedFormat::Archive(format) => CompressJob::Archive { format, entries },
+		CheckedFormat::Single(compression) => {
+			let [ArchiveEntry::File { source, size, .. }] = entries[..] else {
+				panic!("a single compressed file is one file");
+			};
+			CompressJob::Single {
+				compression,
+				source,
+				size,
+			}
+		}
+	}
 }
 
 /// Answers the codec's asks from `sources` until it returns; `short` sources answer one byte
@@ -299,21 +317,6 @@ fn a_single_file_compresses_on_its_own() {
 }
 
 #[test]
-fn a_single_file_is_exactly_one_file() {
-	let (entries, sources, _) = sample();
-	let format = CompressFormat::Single {
-		compression: Compression {
-			codec: StreamCodec::Gzip,
-			level: None,
-		},
-	};
-	let written = run(format, entries, &sources, None);
-	// the planner never hands the codec this; if it did, that is the SDK's own bug
-	assert_eq!(written.result.unwrap_err().kind(), ErrorKind::Internal);
-	assert!(written.archive.is_empty(), "nothing is written");
-}
-
-#[test]
 fn a_source_that_changed_length_fails_the_archive() {
 	let (entries, sources, _) = sample();
 	let written = run(
@@ -544,11 +547,11 @@ fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 	] {
 		let (entries, sources, members) = sample();
 		let password = encryption.map(|_| ArchivePassword::new("zip64".to_owned()).unwrap());
-		let job = CompressJob {
-			format: CompressFormat::Zip { method, encryption },
+		let job = job(
+			CompressFormat::Zip { method, encryption },
 			entries,
-			password: password.clone(),
-		};
+			password.clone(),
+		);
 		let written = drive(
 			worker::start(move |port| {
 				compress_with(&port, job, |sink| ZipWriter::past(sink, 0, ZIP64_FROM))
@@ -652,25 +655,6 @@ fn every_zip_entry_gets_its_own_salt() {
 		})
 		.collect();
 	assert_eq!(salts.len(), 4);
-}
-
-#[test]
-fn an_encrypted_zip_without_a_password_writes_nothing() {
-	let (entries, sources, _) = sample();
-	let written = run(
-		CompressFormat::Zip {
-			method: ZipMethod::Stored,
-			encryption: Some(AesStrength::Aes256),
-		},
-		entries,
-		&sources,
-		None,
-	);
-	assert_eq!(
-		written.result.unwrap_err().kind(),
-		ErrorKind::ArchivePasswordRequired
-	);
-	assert!(written.archive.is_empty());
 }
 
 #[test]

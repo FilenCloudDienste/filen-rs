@@ -25,7 +25,7 @@ use super::{
 		list::{ArchiveEntryKind, PasswordCheck},
 		storage_exceeded,
 	},
-	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, check_stated_size,
+	ArchiveEnd, LIST_READ_BYTES, PASSWORD_PROBE_BYTES, StreamJob, Taken, check_stated_size,
 	entries::{Found, MacShape, Verdict, Walk, apple_double, found_path, symlink},
 	likely_wrong_password, link_target, take_file,
 };
@@ -51,7 +51,6 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	keys: &mut Keys<'_>,
-	has_password: bool,
 ) -> Result<PasswordCheck, Error> {
 	if index.headers_encrypted {
 		return Ok(PasswordCheck::Right);
@@ -59,22 +58,22 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	if !index.entries.iter().any(|entry| index.encrypted(entry)) {
 		return Ok(PasswordCheck::NotNeeded);
 	}
-	if !has_password {
+	if !keys.has_password() {
 		return Ok(PasswordCheck::Required);
 	}
 	let Some(probe) = index
 		.entries
 		.iter()
-		.filter(|entry| {
+		.filter_map(|entry| Some((entry, entry.stream?)))
+		.filter(|(entry, stream)| {
 			index.encrypted(entry)
 				&& entry.size > 0
-				&& entry.crc.is_some()
+				&& stream.crc.is_some()
 				&& index.supported(entry)
 		})
-		.min_by_key(|entry| entry.stream.expect("encrypted").offset + entry.size)
-		.filter(|entry| {
-			entry.stream.expect("encrypted").offset + entry.size <= PASSWORD_PROBE_BYTES
-		})
+		.min_by_key(|(entry, stream)| stream.offset + entry.size)
+		.filter(|(entry, stream)| stream.offset + entry.size <= PASSWORD_PROBE_BYTES)
+		.map(|(entry, _)| entry)
 	else {
 		return Ok(PasswordCheck::Unchecked);
 	};
@@ -148,14 +147,7 @@ pub(super) fn extract_sevenz(
 	source.set_slots((index.max_packed_streams() + 1).min(5));
 	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
 	if walk.listing() {
-		return list_sevenz(
-			walk,
-			&mut cursor,
-			&index,
-			&mut keys,
-			job.password.is_some(),
-			job,
-		);
+		return list_sevenz(walk, &mut cursor, &index, &mut keys, job);
 	}
 	walk.check_selection(index.entries.iter().map(|entry| {
 		(
@@ -175,10 +167,9 @@ pub(super) fn extract_sevenz(
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
-	let mut verified =
-		check_sevenz_password(&mut cursor, &index, &mut keys, job.password.is_some())?
-			.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
-			.map_err(Error::from)?;
+	let mut verified = check_sevenz_password(&mut cursor, &index, &mut keys)?
+		.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
+		.map_err(Error::from)?;
 
 	port.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(read_failure)?;
@@ -193,8 +184,11 @@ pub(super) fn extract_sevenz(
 		}
 	};
 	// whether reading an entry whole against its CRC-32 proved the password
-	let proves =
-		|entry: &SevenZEntry| entry.crc.is_some() && index.encrypted(entry) && entry.size > 0;
+	let proves = |entry: &SevenZEntry| {
+		entry.stream.is_some_and(|stream| stream.crc.is_some())
+			&& index.encrypted(entry)
+			&& entry.size > 0
+	};
 	for entry in &index.entries {
 		// what is left out is not read: its name decides whether it is chosen
 		let verdict = walk.judge(&sevenz_unread(&index, entry))?;
@@ -249,9 +243,11 @@ pub(super) fn extract_sevenz(
 				.map_err(read_failure),
 		};
 		let sent = sent.map_err(|error| judged(error, entry, verified))?;
-		if sent > 0 && entry.stream.is_some() {
+		if sent == Taken::File
+			&& let Some(stream) = entry.stream
+		{
 			verified |= proves(entry);
-			if entry.crc.is_none() {
+			if stream.crc.is_none() {
 				unchecked_entries += 1;
 			}
 		}
@@ -272,10 +268,9 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	keys: &mut Keys<'_>,
-	has_password: bool,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
-	let checked = check_sevenz_password(cursor, index, keys, has_password)?;
+	let checked = check_sevenz_password(cursor, index, keys)?;
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(read_failure)?;
@@ -296,7 +291,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 			Err(error)
 				if index.encrypted(entry)
 					&& !source_failed(&error)
-					&& (checked == PasswordCheck::Wrong || !has_password) =>
+					&& (checked == PasswordCheck::Wrong || !keys.has_password()) =>
 			{
 				sevenz_unread(index, entry)
 			}

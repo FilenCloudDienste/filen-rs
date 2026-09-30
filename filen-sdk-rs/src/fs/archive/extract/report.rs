@@ -64,6 +64,21 @@ pub struct ArchiveEntryId {
 	pub index: u32,
 }
 
+impl ArchiveEntryId {
+	/// The id of member `ordinal` of `archive`.
+	pub(crate) fn of(archive: Uuid, ordinal: u64) -> Self {
+		Self {
+			archive,
+			index: entry_index(ordinal),
+		}
+	}
+}
+
+/// Member `ordinal`'s index among an archive's members.
+pub(crate) fn entry_index(ordinal: u64) -> u32 {
+	u32::try_from(ordinal).expect("the member cap keeps ordinals far below u32::MAX")
+}
+
 /// How much there is to extract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(

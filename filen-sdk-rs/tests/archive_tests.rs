@@ -84,8 +84,8 @@ async fn compress(
 	name: &str,
 	format: CompressFormat,
 	password: Option<&str>,
-) -> CompressReport {
-	client
+) -> (RemoteFile, CompressReport) {
+	let report = client
 		.clone()
 		.compress_items(
 			CompressRequest {
@@ -102,7 +102,12 @@ async fn compress(
 			JobControl::default(),
 		)
 		.await
-		.unwrap_or_else(|failed| panic!("compressing {name}: {}", failed.error))
+		.unwrap_or_else(|failed| panic!("compressing {name}: {}", failed.error));
+	let archive = report
+		.archive
+		.clone()
+		.expect("a compression that ran to its end holds its archive");
+	(archive, report)
 }
 
 /// Extracts `archive` into a new folder in `destination`, named after the archive.
@@ -312,7 +317,7 @@ async fn every_format_family_round_trips_through_the_drive() {
 	];
 	for (name, format, password) in formats {
 		let destination = client.create_dir(&test_dir.into(), name).await.unwrap();
-		let report = compress(
+		let (archive, report) = compress(
 			&client,
 			CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))]),
 			&destination,
@@ -321,7 +326,6 @@ async fn every_format_family_round_trips_through_the_drive() {
 			password,
 		)
 		.await;
-		let archive = report.archive.expect("the archive is registered");
 		assert_eq!(archive.name(), Some(name));
 		assert_eq!(report.counts.files_done, 3, "{name}");
 
@@ -388,7 +392,7 @@ async fn sources_are_trashed_and_the_archive_deleted_once_verified() {
 		.await
 		.unwrap();
 
-	let report = compress(
+	let (archive, report) = compress(
 		&client,
 		CompressSources::Dispose {
 			how: SourceDisposal::Trash,
@@ -411,7 +415,6 @@ async fn sources_are_trashed_and_the_archive_deleted_once_verified() {
 		"{:?}",
 		disposition.outcome
 	);
-	let archive = report.archive.expect("the archive is registered");
 	// the source folder is in the trash now, no longer in the test directory
 	let listed = client
 		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
@@ -494,7 +497,7 @@ async fn archives_of_several_chunks_keep_their_hash_and_contents() {
 	];
 	for (name, format) in formats {
 		let destination = client.create_dir(&test_dir.into(), name).await.unwrap();
-		let report = compress(
+		let archive = compress(
 			&client,
 			CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source.clone()))]),
 			&destination,
@@ -502,8 +505,8 @@ async fn archives_of_several_chunks_keep_their_hash_and_contents() {
 			format,
 			None,
 		)
-		.await;
-		let archive = report.archive.expect("the archive is registered");
+		.await
+		.0;
 		assert!(
 			archive.size() > 2 * CHUNK_SIZE as u64,
 			"{name} spans three chunks: {} bytes",
@@ -574,7 +577,7 @@ async fn deleting_sources_for_good_keeps_a_file_with_versions() {
 		.await
 		.unwrap();
 
-	let report = compress(
+	let (_, report) = compress(
 		&client,
 		CompressSources::Dispose {
 			how: SourceDisposal::DeletePermanently,
@@ -589,7 +592,6 @@ async fn deleting_sources_for_good_keeps_a_file_with_versions() {
 		None,
 	)
 	.await;
-	assert!(report.archive.is_some());
 	let outcome = |uuid| {
 		&report
 			.dispositions
@@ -644,7 +646,7 @@ async fn linked_sources_compress_and_a_linked_archive_extracts() {
 	let linked_source = dir_link_info(&client, &source).await;
 	let destination = client.create_dir(&test_dir.into(), "linked").await.unwrap();
 
-	let report = compress(
+	let (archive, report) = compress(
 		&client,
 		CompressSources::Keep(vec![
 			ItemSource::Dir(ItemSourceDir::Linked(
@@ -663,7 +665,6 @@ async fn linked_sources_compress_and_a_linked_archive_extracts() {
 	)
 	.await;
 	assert_eq!(report.counts.files_done, 4);
-	let archive = report.archive.expect("the archive is registered");
 
 	let report = extract(
 		&client,
@@ -697,7 +698,7 @@ async fn a_single_file_round_trips_as_a_gz() {
 	let file = upload(&client, test_dir, "notes.txt", &data(CHUNK_SIZE + 99, 3)).await;
 	let destination = client.create_dir(&test_dir.into(), "gz").await.unwrap();
 
-	let report = compress(
+	let archive = compress(
 		&client,
 		CompressSources::Keep(vec![ItemSource::File(file.clone().into())]),
 		&destination,
@@ -710,8 +711,8 @@ async fn a_single_file_round_trips_as_a_gz() {
 		},
 		None,
 	)
-	.await;
-	let archive = report.archive.expect("the archive is registered");
+	.await
+	.0;
 
 	let report = extract(
 		&client,
@@ -750,7 +751,7 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 		.create_dir(&test_dir.into(), "archives")
 		.await
 		.unwrap();
-	let report = compress(
+	let archive = compress(
 		&client,
 		CompressSources::Keep(vec![
 			ItemSource::Dir(ItemSourceDir::Normal(source)),
@@ -766,8 +767,8 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 		},
 		None,
 	)
-	.await;
-	let archive = report.archive.expect("the archive is registered");
+	.await
+	.0;
 
 	// straight into a destination holding both top-level names, cased differently
 	let destination = client
@@ -904,8 +905,7 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 			password,
 		)
 		.await
-		.archive
-		.expect("the archive is registered")
+		.0
 		.into()
 	};
 	let formats: [(&str, CompressFormat, Option<&str>, ArchiveFormat); 3] = [
@@ -1034,8 +1034,7 @@ async fn part_of_an_archive_extracts_below_its_base() {
 		None,
 	)
 	.await
-	.archive
-	.expect("the archive is registered")
+	.0
 	.into();
 	let listing = list(&client, archive.clone(), ExtractConfig::default())
 		.await

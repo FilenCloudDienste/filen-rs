@@ -37,7 +37,7 @@ pub use super::{encode::Compression, zip::write::ZipMethod};
 pub use crate::fs::drive_job::listing::ItemSource;
 
 use super::{
-	AesStrength, ArchiveFormat, SevenZEncryption, SevenZMethod, StreamCodec,
+	AesStrength, ArchiveFormat, ArchivePassword, SevenZEncryption, SevenZMethod, StreamCodec,
 	format::match_extension,
 };
 
@@ -97,6 +97,20 @@ pub(crate) fn single_is_one_file() -> Error {
 	)
 }
 
+fn password_required() -> Error {
+	Error::custom(
+		ErrorKind::ArchivePasswordRequired,
+		"an encrypted archive needs a password",
+	)
+}
+
+fn password_unwanted() -> Error {
+	Error::custom(
+		ErrorKind::InvalidState,
+		"a password was given for an archive that is not encrypted",
+	)
+}
+
 /// The level a 7z method is written at unless a UI chooses another: 7-Zip's own default
 /// ("normal", its `-mx5`), whose levels the SDK's follow, but for BZip2's (see
 /// [`CompressFormat::default_level`]).
@@ -140,6 +154,44 @@ pub enum CompressFormat {
 	},
 }
 
+/// A format [`CompressFormat::check`] passed: its levels are in range, and an encrypted one
+/// holds its password.
+#[derive(Debug)]
+pub(crate) enum CheckedFormat {
+	/// A format that holds entries.
+	Archive(CheckedArchive),
+	/// One file, compressed on its own.
+	Single(Compression),
+}
+
+/// A checked format that holds entries.
+#[derive(Debug)]
+pub(crate) enum CheckedArchive {
+	Tar {
+		compression: Option<Compression>,
+	},
+	Zip {
+		method: ZipMethod,
+		encryption: Option<(AesStrength, ArchivePassword)>,
+	},
+	SevenZ {
+		method: SevenZMethod,
+		solid: bool,
+		encryption: Option<(SevenZEncryption, ArchivePassword)>,
+	},
+}
+
+impl CheckedArchive {
+	/// The password it is encrypted with, if it is.
+	pub(crate) fn password(&self) -> Option<&ArchivePassword> {
+		match self {
+			Self::Tar { .. } => None,
+			Self::Zip { encryption, .. } => encryption.as_ref().map(|(_, password)| password),
+			Self::SevenZ { encryption, .. } => encryption.as_ref().map(|(_, password)| password),
+		}
+	}
+}
+
 impl StreamCodec {
 	/// The file-name extension of a file compressed with the codec, dot included.
 	pub fn extension(self) -> &'static str {
@@ -172,30 +224,62 @@ impl CompressFormat {
 	}
 
 	/// Checks everything about the format a job can know before it starts: its levels, that a
-	/// password comes exactly with encryption, and that its encoder fits `budget`.
-	pub(crate) fn check_within(self, has_password: bool, budget: u64) -> Result<(), Error> {
-		within_budget(self.check(has_password)?, budget).map(drop)
+	/// password comes exactly with encryption, and that its encoder fits `budget`; the format
+	/// with its password.
+	pub(crate) fn check_within(
+		self,
+		password: Option<ArchivePassword>,
+		budget: u64,
+	) -> Result<CheckedFormat, Error> {
+		let checked = self.check(password)?;
+		within_budget(self.encoder_memory()?, budget)?;
+		Ok(checked)
 	}
 
-	/// Checks the format's levels, and that a password comes exactly with encryption; the
-	/// memory its encoder needs, in bytes.
-	pub(crate) fn check(self, has_password: bool) -> Result<u64, Error> {
-		let encrypted = match self {
-			Self::Zip { encryption, .. } => encryption.is_some(),
-			Self::SevenZ { encryption, .. } => encryption.is_some(),
-			Self::Tar { .. } | Self::Single { .. } => false,
-		};
-		match (encrypted, has_password) {
-			(true, false) => Err(Error::custom(
-				ErrorKind::ArchivePasswordRequired,
-				"an encrypted archive needs a password",
-			)),
-			(false, true) => Err(Error::custom(
-				ErrorKind::InvalidState,
-				"a password was given for an archive that is not encrypted",
-			)),
-			_ => self.encoder_memory(),
-		}
+	/// Checks that a password comes exactly with encryption, and the format's levels (see
+	/// [`CompressFormat::encoder_memory`]); the format with its password.
+	pub(crate) fn check(self, password: Option<ArchivePassword>) -> Result<CheckedFormat, Error> {
+		let archive = |format| Ok(CheckedFormat::Archive(format));
+		let checked = match (self, password) {
+			(Self::Tar { compression }, None) => archive(CheckedArchive::Tar { compression }),
+			(Self::Single { compression }, None) => Ok(CheckedFormat::Single(compression)),
+			(Self::Tar { .. } | Self::Single { .. }, Some(_)) => Err(password_unwanted()),
+			(Self::Zip { method, encryption }, password) => match (encryption, password) {
+				(None, None) => archive(CheckedArchive::Zip {
+					method,
+					encryption: None,
+				}),
+				(Some(strength), Some(password)) => archive(CheckedArchive::Zip {
+					method,
+					encryption: Some((strength, password)),
+				}),
+				(Some(_), None) => Err(password_required()),
+				(None, Some(_)) => Err(password_unwanted()),
+			},
+			(
+				Self::SevenZ {
+					method,
+					solid,
+					encryption,
+				},
+				password,
+			) => match (encryption, password) {
+				(None, None) => archive(CheckedArchive::SevenZ {
+					method,
+					solid,
+					encryption: None,
+				}),
+				(Some(what), Some(password)) => archive(CheckedArchive::SevenZ {
+					method,
+					solid,
+					encryption: Some((what, password)),
+				}),
+				(Some(_), None) => Err(password_required()),
+				(None, Some(_)) => Err(password_unwanted()),
+			},
+		}?;
+		self.encoder_memory()?;
+		Ok(checked)
 	}
 
 	/// Memory the format's encoder needs, in bytes (0 for a bare tar).
@@ -432,34 +516,48 @@ mod tests {
 		assert_eq!(zip(ZipMethod::Stored, None).extension(), ".zip");
 		assert_eq!(zip(ZipMethod::Stored, None).check_name("a.ZIP").unwrap(), 4);
 		assert!(zip(ZipMethod::Stored, None).check_name("a.7z").is_err());
-		zip(ZipMethod::Stored, None).check(false).unwrap();
-		zip(ZipMethod::Deflate { level: 9 }, aes)
-			.check(true)
+		let password = || Some(ArchivePassword::new("pw".to_owned()).unwrap());
+		zip(ZipMethod::Stored, None).check(None).unwrap();
+		let checked = zip(ZipMethod::Deflate { level: 9 }, aes)
+			.check(password())
 			.unwrap();
+		assert!(
+			matches!(
+				checked,
+				CheckedFormat::Archive(CheckedArchive::Zip {
+					encryption: Some((AesStrength::Aes256, _)),
+					..
+				})
+			),
+			"the checked format holds its password"
+		);
 		zip(ZipMethod::Bzip2 { level: 1 }, None)
-			.check(false)
+			.check(None)
 			.unwrap();
 		for level in [0, 10] {
 			for method in [ZipMethod::Deflate { level }, ZipMethod::Bzip2 { level }] {
 				assert_eq!(
-					zip(method, None).check(false).unwrap_err().kind(),
+					zip(method, None).check(None).unwrap_err().kind(),
 					ErrorKind::InvalidState,
 					"{method:?}"
 				);
 			}
 		}
 		assert_eq!(
-			zip(ZipMethod::Stored, aes).check(false).unwrap_err().kind(),
+			zip(ZipMethod::Stored, aes).check(None).unwrap_err().kind(),
 			ErrorKind::ArchivePasswordRequired
 		);
 		assert_eq!(
-			zip(ZipMethod::Stored, None).check(true).unwrap_err().kind(),
+			zip(ZipMethod::Stored, None)
+				.check(password())
+				.unwrap_err()
+				.kind(),
 			ErrorKind::InvalidState,
 			"a password is never silently dropped"
 		);
 		assert_eq!(
 			CompressFormat::Tar { compression: None }
-				.check(true)
+				.check(password())
 				.unwrap_err()
 				.kind(),
 			ErrorKind::InvalidState
@@ -630,7 +728,10 @@ mod tests {
 		);
 		assert_eq!(
 			deflate
-				.check_within(true, SMALLEST_BUDGET)
+				.check_within(
+					Some(ArchivePassword::new("pw".to_owned()).unwrap()),
+					SMALLEST_BUDGET,
+				)
 				.unwrap_err()
 				.kind(),
 			ErrorKind::InvalidState,

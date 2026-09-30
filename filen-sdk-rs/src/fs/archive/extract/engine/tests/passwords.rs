@@ -21,7 +21,10 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 	// a zip's entries are checked one by one, so no hash of the whole archive is needed
 	let (setup, parent) = disposable(zip, None, |_| {});
 	let options = Options {
-		dispose: Some((SourceDisposal::DeletePermanently, parent)),
+		dispose: Some(ArchiveDisposal::Remove {
+			how: SourceDisposal::DeletePermanently,
+			parent,
+		}),
 		password: Some(ArchivePassword::new("pw".into()).unwrap()),
 		..Options::default()
 	};
@@ -82,7 +85,10 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 	// a 7z's entries are checked one by one, so no hash of the whole archive is needed
 	let (setup, parent) = disposable(archive, None, |_| {});
 	let options = Options {
-		dispose: Some((SourceDisposal::DeletePermanently, parent)),
+		dispose: Some(ArchiveDisposal::Remove {
+			how: SourceDisposal::DeletePermanently,
+			parent,
+		}),
 		password: Some(ArchivePassword::new("pw".into()).unwrap()),
 		..Options::default()
 	};

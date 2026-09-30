@@ -12,7 +12,10 @@
 //! unchecked (a few KiB of sequences could fill gigabytes): the SDK depends on a fork that
 //! refuses such a block before writing any of it (see the `ruzstd` entry in `Cargo.toml`).
 
-use std::io::{self, Read};
+use std::{
+	io::{self, Read},
+	mem,
+};
 
 use ruzstd::decoding::{
 	BlockDecodingStrategy, FrameDecoder,
@@ -48,14 +51,21 @@ pub(super) struct ZstdDecoder<R> {
 	input: Input<R>,
 	budget: Budget,
 	decoder: FrameDecoder,
-	frame: Option<Frame>,
+	state: State,
 	/// Frames read so far, skippable ones not included.
 	frames: u64,
 	/// Bytes of skippable frames, headers included.
 	skipped: u64,
 	check: StreamCheck,
-	end: Option<StreamEnd>,
-	failed: bool,
+}
+
+enum State {
+	/// Expecting a frame, a skippable frame or the end.
+	Between,
+	Frame(Frame),
+	Done(StreamEnd),
+	/// An error ended decoding.
+	Failed,
 }
 
 struct Frame {
@@ -73,48 +83,54 @@ impl<R: Read> ZstdDecoder<R> {
 			input,
 			budget,
 			decoder,
-			frame: None,
+			state: State::Between,
 			frames: 0,
 			skipped: 0,
 			check: StreamCheck::Verified,
-			end: None,
-			failed: false,
 		}
 	}
 
 	fn decode(&mut self, buf: &mut [u8]) -> io::Result<usize> {
 		loop {
-			let Some(frame) = &mut self.frame else {
-				if self.end.is_some() {
+			// an error leaves the state `Failed`
+			self.state = match mem::replace(&mut self.state, State::Failed) {
+				State::Between => self.start_frame()?,
+				State::Frame(mut frame) => {
+					if self.decoder.can_collect() > 0 {
+						let read = self
+							.decoder
+							.read(buf)
+							.map_err(|_| CodecError::Corrupt(Self::INVALID))?;
+						frame.decoded += read as u64;
+						self.state = State::Frame(frame);
+						return Ok(read);
+					}
+					if self.decoder.is_finished() {
+						self.finish_frame(frame)?;
+						State::Between
+					} else {
+						// a block at a time, so what is decoded but not handed out stays one block
+						let mut source = Source::new(&mut self.input);
+						let decoded = self
+							.decoder
+							.decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1));
+						if let Err(error) = decoded {
+							return Err(source.error(error, self.budget));
+						}
+						State::Frame(frame)
+					}
+				}
+				State::Done(end) => {
+					self.state = State::Done(end);
 					return Ok(0);
 				}
-				self.start_frame()?;
-				continue;
+				State::Failed => return Err(CodecError::Corrupt(Self::INVALID).into()),
 			};
-			if self.decoder.can_collect() > 0 {
-				let read = self
-					.decoder
-					.read(buf)
-					.map_err(|_| CodecError::Corrupt(Self::INVALID))?;
-				frame.decoded += read as u64;
-				return Ok(read);
-			}
-			if self.decoder.is_finished() {
-				self.finish_frame()?;
-				continue;
-			}
-			// a block at a time, so what is decoded but not handed out stays one block
-			let mut source = Source::new(&mut self.input);
-			let decoded = self
-				.decoder
-				.decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1));
-			if let Err(error) = decoded {
-				return Err(source.error(error, self.budget));
-			}
 		}
 	}
 
-	fn start_frame(&mut self) -> io::Result<()> {
+	/// Reads what comes between frames: the next one's start, or the end of the stream.
+	fn start_frame(&mut self) -> io::Result<State> {
 		let head = self.input.fill_to(5)?;
 		let magic = head
 			.first_chunk()
@@ -129,30 +145,26 @@ impl<R: Read> ZstdDecoder<R> {
 					return Err(source.error(error, self.budget));
 				}
 				self.frames += 1;
-				self.frame = Some(Frame {
+				Ok(State::Frame(Frame {
 					states_size,
 					decoded: 0,
-				});
+				}))
 			}
 			Some(magic) if SKIPPABLE_FRAME_MAGIC.contains(&magic) => {
 				let skipped = skip_skippable_frame(&mut self.input)?;
 				self.skipped = self.skipped.saturating_add(skipped);
+				Ok(State::Between)
 			}
-			_ if self.frames == 0 => {
-				return Err(CodecError::Corrupt("not a zstd stream").into());
-			}
-			_ => {
-				self.end = Some(StreamEnd {
-					check: self.check,
-					unaccounted_bytes: self.input.drain_trailing(&[])?.saturating_add(self.skipped),
-				});
-			}
+			_ if self.frames == 0 => Err(CodecError::Corrupt("not a zstd stream").into()),
+			_ => Ok(State::Done(StreamEnd {
+				check: self.check,
+				unaccounted_bytes: self.input.drain_trailing(&[])?.saturating_add(self.skipped),
+			})),
 		}
-		Ok(())
 	}
 
-	fn finish_frame(&mut self) -> Result<(), CodecError> {
-		let frame = self.frame.take().expect("called within a frame");
+	/// Checks the end of `frame`, all of it decoded.
+	fn finish_frame(&mut self, frame: Frame) -> Result<(), CodecError> {
 		match self.decoder.get_checksum_from_data() {
 			Some(stored) if Some(stored) != self.decoder.get_calculated_checksum() => {
 				return Err(CodecError::Corrupt("zstd content checksum mismatch"));
@@ -240,16 +252,16 @@ impl<R: Read> Read for ZstdDecoder<R> {
 		if buf.is_empty() {
 			return Ok(0);
 		}
-		if self.failed {
-			return Err(CodecError::Corrupt(Self::INVALID).into());
-		}
-		self.decode(buf).inspect_err(|_| self.failed = true)
+		self.decode(buf)
 	}
 }
 
 impl<R: Read> StreamDecoder for ZstdDecoder<R> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			State::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 

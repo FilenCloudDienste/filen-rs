@@ -13,6 +13,7 @@
 use std::{
 	hash::Hasher,
 	io::{self, BufRead, Read},
+	mem,
 };
 
 use lz4_flex::block::{decompress_into, decompress_into_with_dict};
@@ -32,7 +33,7 @@ const WINDOW: usize = 64 * 1024;
 pub(super) struct Lz4Decoder<R> {
 	input: Input<R>,
 	budget: Budget,
-	frame: Option<Frame>,
+	state: State,
 	/// Frames read so far, skippable ones not included.
 	frames: u64,
 	/// Bytes of skippable frames, headers included.
@@ -45,8 +46,15 @@ pub(super) struct Lz4Decoder<R> {
 	/// The frame's last (up to) 64 KiB of output, for linked blocks.
 	window: Vec<u8>,
 	check: StreamCheck,
-	end: Option<StreamEnd>,
-	failed: bool,
+}
+
+enum State {
+	/// Expecting a frame, a skippable frame or the end.
+	Between,
+	Frame(Frame),
+	Done(StreamEnd),
+	/// An error ended decoding.
+	Failed,
 }
 
 struct Frame {
@@ -63,7 +71,7 @@ impl<R: Read> Lz4Decoder<R> {
 		Self {
 			input,
 			budget,
-			frame: None,
+			state: State::Between,
 			frames: 0,
 			skipped: 0,
 			compressed: Vec::new(),
@@ -72,24 +80,28 @@ impl<R: Read> Lz4Decoder<R> {
 			len: 0,
 			window: Vec::new(),
 			check: StreamCheck::Verified,
-			end: None,
-			failed: false,
 		}
 	}
 
 	/// Decodes up to the next block with output, or to the end of the stream.
 	fn advance(&mut self) -> io::Result<()> {
-		while self.pos == self.len && self.end.is_none() {
-			if self.frame.is_some() {
-				self.read_block()?;
-			} else {
-				self.read_frame_start()?;
-			}
+		while self.pos == self.len {
+			// an error leaves the state `Failed`
+			self.state = match mem::replace(&mut self.state, State::Failed) {
+				State::Between => self.read_frame_start()?,
+				State::Frame(frame) => self.read_block(frame)?,
+				State::Done(end) => {
+					self.state = State::Done(end);
+					break;
+				}
+				State::Failed => return Err(CodecError::Corrupt(Self::INVALID).into()),
+			};
 		}
 		Ok(())
 	}
 
-	fn read_frame_start(&mut self) -> io::Result<()> {
+	/// Reads what comes between frames: the next one's start, or the end of the stream.
+	fn read_frame_start(&mut self) -> io::Result<State> {
 		let head = self.input.fill_to(4)?;
 		let magic = head
 			.get(..4)
@@ -97,29 +109,23 @@ impl<R: Read> Lz4Decoder<R> {
 		match magic {
 			Some(MAGIC) => {
 				self.input.consume(4);
-				self.read_frame_descriptor()?;
+				Ok(State::Frame(self.read_frame_descriptor()?))
 			}
 			Some(magic) if SKIPPABLE_FRAME_MAGIC.contains(&magic) => {
 				let skipped = skip_skippable_frame(&mut self.input)?;
 				self.skipped = self.skipped.saturating_add(skipped);
+				Ok(State::Between)
 			}
-			Some(LEGACY_MAGIC) => {
-				return Err(CodecError::Unsupported("the legacy lz4 format").into());
-			}
-			_ if self.frames == 0 => {
-				return Err(CodecError::Corrupt("not an lz4 stream").into());
-			}
-			_ => {
-				self.end = Some(StreamEnd {
-					check: self.check,
-					unaccounted_bytes: self.input.drain_trailing(&[])?.saturating_add(self.skipped),
-				});
-			}
+			Some(LEGACY_MAGIC) => Err(CodecError::Unsupported("the legacy lz4 format").into()),
+			_ if self.frames == 0 => Err(CodecError::Corrupt("not an lz4 stream").into()),
+			_ => Ok(State::Done(StreamEnd {
+				check: self.check,
+				unaccounted_bytes: self.input.drain_trailing(&[])?.saturating_add(self.skipped),
+			})),
 		}
-		Ok(())
 	}
 
-	fn read_frame_descriptor(&mut self) -> io::Result<()> {
+	fn read_frame_descriptor(&mut self) -> io::Result<Frame> {
 		let [flags, block_descriptor] = self.input.read_array()?;
 		let mut descriptor = [0u8; 14];
 		descriptor[..2].copy_from_slice(&[flags, block_descriptor]);
@@ -167,19 +173,18 @@ impl<R: Read> Lz4Decoder<R> {
 		}
 		self.window.clear();
 		self.frames += 1;
-		self.frame = Some(Frame {
+		Ok(Frame {
 			linked: flags & 0x20 == 0,
 			block_checksums: flags & 0x10 != 0,
 			content_hash: (flags & 0x04 != 0).then(XxHash32::default),
 			content_size,
 			block_max,
 			decoded: 0,
-		});
-		Ok(())
+		})
 	}
 
-	fn read_block(&mut self) -> io::Result<()> {
-		let frame = self.frame.as_mut().expect("called within a frame");
+	/// Reads `frame`'s next block, or its end mark.
+	fn read_block(&mut self, mut frame: Frame) -> io::Result<State> {
 		let raw = u32::from_le_bytes(self.input.read_array()?);
 		if raw == 0 {
 			// the end mark
@@ -196,8 +201,7 @@ impl<R: Read> Lz4Decoder<R> {
 					CodecError::Corrupt("an lz4 frame's size differs from its header").into(),
 				);
 			}
-			self.frame = None;
-			return Ok(());
+			return Ok(State::Between);
 		}
 
 		let stored_raw = raw & 0x8000_0000 != 0;
@@ -241,7 +245,7 @@ impl<R: Read> Lz4Decoder<R> {
 		}
 		self.pos = 0;
 		self.len = len;
-		Ok(())
+		Ok(State::Frame(frame))
 	}
 }
 
@@ -250,13 +254,7 @@ impl<R: Read> Read for Lz4Decoder<R> {
 		if buf.is_empty() {
 			return Ok(0);
 		}
-		if self.failed {
-			return Err(CodecError::Corrupt(Self::INVALID).into());
-		}
-		if let Err(e) = self.advance() {
-			self.failed = true;
-			return Err(e);
-		}
+		self.advance()?;
 		let n = (self.len - self.pos).min(buf.len());
 		buf[..n].copy_from_slice(&self.block[self.pos..self.pos + n]);
 		self.pos += n;
@@ -266,7 +264,10 @@ impl<R: Read> Read for Lz4Decoder<R> {
 
 impl<R: Read> StreamDecoder for Lz4Decoder<R> {
 	fn end(&self) -> Option<StreamEnd> {
-		self.end
+		match self.state {
+			State::Done(end) => Some(end),
+			_ => None,
+		}
 	}
 }
 

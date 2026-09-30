@@ -18,6 +18,7 @@ use crate::{
 
 use super::{
 	super::{ExtractSkipReason, list::ArchiveEntryKind},
+	Taken,
 	entries::{
 		Found, LinkKeys, Listed, MacShape, Verdict, Walk, apple_double, found_path, symlink,
 	},
@@ -100,7 +101,7 @@ pub(super) fn walk_tar<R: Read>(
 				.map_err(read_failure)?;
 			continue;
 		}
-		let sent = take_file(
+		let taken = take_file(
 			walk,
 			&found,
 			path,
@@ -110,8 +111,11 @@ pub(super) fn walk_tar<R: Read>(
 		)
 		.map_err(read_failure)?;
 		// a file sent is taken, or left out as metadata
-		shadowed.note(key, (sent == 0).then_some(Shadow::MacMetadata));
-		files += sent;
+		shadowed.note(
+			key,
+			(taken == Taken::LeftOut).then_some(Shadow::MacMetadata),
+		);
+		files += taken.files();
 	}
 	walk.send_mac_folders().map_err(read_failure)?;
 	walk.finish()?;
@@ -313,7 +317,6 @@ fn link_event(
 	match target {
 		Some(target) => (
 			WorkerEvent::Link(Box::new(LinkHead {
-				ordinal: found.ordinal,
 				path,
 				modified: found.modified,
 				target,

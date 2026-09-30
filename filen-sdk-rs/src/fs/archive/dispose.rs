@@ -406,20 +406,32 @@ impl DisposalOutcome {
 	}
 }
 
-/// How a job's sources nest, as [`nesting`] tells it.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Nesting {
-	/// The source each one is removed with: the outermost of those it lies within, or itself.
-	pub(crate) outermost: Vec<usize>,
-	/// Whether it lies on or behind a chain of sources that loops back on itself.
-	pub(crate) cyclic: Vec<bool>,
+/// How a job's source nests among the others, as [`nesting`] tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Nest {
+	/// It lies within no other: it is removed on its own.
+	Outermost,
+	/// It is removed with this source, the outermost of those it lies within.
+	Within(usize),
+	/// It lies on or behind a chain of sources that loops back on itself.
+	Cyclic,
+}
+
+impl Nest {
+	/// The source that `source`, nesting so, is removed with: itself unless it is within another.
+	pub(crate) fn outermost(self, source: usize) -> usize {
+		match self {
+			Self::Within(outer) => outer,
+			Self::Outermost | Self::Cyclic => source,
+		}
+	}
 }
 
 /// How sources nest, from the source each one lies directly `within` (if any): a source inside
 /// another goes with that one, whose removal removes it. A move between two folders' listings
 /// can leave each read holding the other: a chain like that has no outermost source, so every
-/// source on or behind it goes with itself, and is marked cyclic.
-pub(crate) fn nesting(within: &[Option<usize>]) -> Nesting {
+/// source on or behind it goes with itself, and is cyclic.
+pub(crate) fn nesting(within: &[Option<usize>]) -> Vec<Nest> {
 	let cyclic: Vec<bool> = (0..within.len())
 		.map(|source| {
 			let mut outer = source;
@@ -433,17 +445,22 @@ pub(crate) fn nesting(within: &[Option<usize>]) -> Nesting {
 		})
 		.collect();
 	// the chains left are acyclic: none reaches a cyclic source, or it would be one
-	let outermost = (0..within.len())
-		.map(|mut outer| {
-			while !cyclic[outer]
-				&& let Some(next) = within[outer]
-			{
+	(0..within.len())
+		.map(|source| {
+			if cyclic[source] {
+				return Nest::Cyclic;
+			}
+			let mut outer = source;
+			while let Some(next) = within[outer] {
 				outer = next;
 			}
-			outer
+			if outer == source {
+				Nest::Outermost
+			} else {
+				Nest::Within(outer)
+			}
 		})
-		.collect();
-	Nesting { outermost, cyclic }
+		.collect()
 }
 
 impl KeptReason {
@@ -642,36 +659,19 @@ mod tests {
 
 	#[test]
 	fn a_source_goes_with_the_outermost_one_it_lies_within() {
+		use Nest::{Cyclic, Outermost, Within};
 		// 2 in 1 in 0, and 3 on its own
 		assert_eq!(
 			nesting(&[None, Some(0), Some(1), None]),
-			Nesting {
-				outermost: vec![0, 0, 0, 3],
-				cyclic: vec![false; 4],
-			}
+			[Outermost, Within(0), Within(0), Outermost]
 		);
 		// 0 and 1 in each other, 2 in 1, 3 on its own: the loop and what is behind it go alone
 		assert_eq!(
 			nesting(&[Some(1), Some(0), Some(1), None]),
-			Nesting {
-				outermost: vec![0, 1, 2, 3],
-				cyclic: vec![true, true, true, false],
-			}
+			[Cyclic, Cyclic, Cyclic, Outermost]
 		);
 		// a source within itself is a loop too
-		assert_eq!(
-			nesting(&[Some(0)]),
-			Nesting {
-				outermost: vec![0],
-				cyclic: vec![true],
-			}
-		);
-		assert_eq!(
-			nesting(&[]),
-			Nesting {
-				outermost: vec![],
-				cyclic: vec![],
-			}
-		);
+		assert_eq!(nesting(&[Some(0)]), [Cyclic]);
+		assert_eq!(nesting(&[]), []);
 	}
 }

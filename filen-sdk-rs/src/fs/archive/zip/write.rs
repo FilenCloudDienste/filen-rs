@@ -91,11 +91,10 @@ impl ZipMethod {
 	}
 }
 
-/// How an entry is encrypted, with its salt.
+/// How an entry is encrypted; each entry gets a salt of its own.
 pub(crate) struct Encryption<'p> {
 	pub(crate) password: &'p ArchivePassword,
 	pub(crate) strength: AesStrength,
-	pub(crate) salt: Vec<u8>,
 }
 
 struct CentralEntry {
@@ -209,7 +208,6 @@ impl<W: Write> ZipWriter<W> {
 					&mut self.out,
 					encryption.password,
 					encryption.strength,
-					&encryption.salt,
 				)?),
 			};
 			let mut compressed: Box<dyn FinishInto + '_> = match method {
@@ -329,7 +327,7 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 		// AE-2
 		extra.extend_from_slice(&2u16.to_le_bytes());
 		extra.extend_from_slice(b"AE");
-		extra.push(strength.byte());
+		extra.push(strength as u8);
 		extra.extend_from_slice(&actual.to_le_bytes());
 	}
 	extra

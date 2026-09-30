@@ -13,13 +13,13 @@ use super::{
 		password::ArchivePassword,
 		sevenz::write::SevenZWriter,
 		tar_iter::{TAR_BLOCK, USTAR_NAME_LEN},
-		worker::{ChunkInput, ChunkSink, JobEnded, WorkerEvent, WorkerPort},
+		worker::{ChunkInput, ChunkSink, HeadSink, JobEnded, WorkerEvent, WorkerPort},
 		zip::{
 			crypto::AesStrength,
 			write::{Encryption, ZipMethod, ZipWriter},
 		},
 	},
-	CompressFormat,
+	CheckedArchive, Compression,
 };
 
 /// An entry of the archive, in the order it is written.
@@ -40,11 +40,20 @@ pub(crate) enum ArchiveEntry {
 	},
 }
 
-pub(crate) struct CompressJob {
-	pub(crate) format: CompressFormat,
-	pub(crate) entries: Vec<ArchiveEntry>,
-	/// For an encrypted format.
-	pub(crate) password: Option<ArchivePassword>,
+/// What the codec writes.
+#[derive(Debug)]
+pub(crate) enum CompressJob {
+	/// A tar, zip or 7z of `entries`.
+	Archive {
+		format: CheckedArchive,
+		entries: Vec<ArchiveEntry>,
+	},
+	/// Input `source`, `size` bytes, compressed on its own.
+	Single {
+		compression: Compression,
+		source: u32,
+		size: u64,
+	},
 }
 
 /// Writes the archive through `port`; returns its length. An error the driver caused (it went
@@ -61,67 +70,54 @@ fn compress_with<'p>(
 	job: CompressJob,
 	zip_writer: impl FnOnce(ChunkSink<'p>) -> ZipWriter<ChunkSink<'p>>,
 ) -> Result<u64, Error> {
-	let sink = ChunkSink::new(port);
-	match job.format {
-		CompressFormat::Tar { compression: None } => {
-			let mut tar = tar::Builder::new(sink);
-			write_tar(port, &mut tar, job.entries)?;
+	let (format, entries) = match job {
+		CompressJob::Archive { format, entries } => (format, entries),
+		CompressJob::Single {
+			compression,
+			source,
+			size,
+		} => {
+			let mut encoder: Box<dyn StreamEncoder<ChunkSink<'_>>> =
+				open_encoder(compression, ChunkSink::new(port))?;
+			write_source(port, source, size, |data| io::copy(data, &mut encoder))?;
+			return encoder.finish().map_err(failure)?.finish().map_err(failure);
+		}
+	};
+	match format {
+		CheckedArchive::Tar { compression: None } => {
+			let mut tar = tar::Builder::new(ChunkSink::new(port));
+			write_tar(port, &mut tar, entries)?;
 			// writes the two end-of-archive blocks
 			tar.into_inner().map_err(failure)?.finish().map_err(failure)
 		}
-		CompressFormat::Tar {
+		CheckedArchive::Tar {
 			compression: Some(compression),
 		} => {
-			let mut tar = tar::Builder::new(open_encoder(compression, sink)?);
-			write_tar(port, &mut tar, job.entries)?;
+			let mut tar = tar::Builder::new(open_encoder(compression, ChunkSink::new(port))?);
+			write_tar(port, &mut tar, entries)?;
 			let encoder = tar.into_inner().map_err(failure)?;
 			encoder.finish().map_err(failure)?.finish().map_err(failure)
 		}
-		CompressFormat::Zip { method, encryption } => {
-			let password = with_password(encryption, job.password.as_ref(), "zip")?;
-			write_zip(port, zip_writer(sink), job.entries, method, password)
+		CheckedArchive::Zip { method, encryption } => {
+			let zip = zip_writer(ChunkSink::new(port));
+			let encryption = encryption
+				.as_ref()
+				.map(|(strength, password)| (*strength, password));
+			write_zip(port, zip, entries, method, encryption)
 		}
-		CompressFormat::SevenZ {
+		CheckedArchive::SevenZ {
 			method,
 			solid,
 			encryption,
 		} => {
+			let encryption = encryption
+				.as_ref()
+				.map(|(what, password)| (*what, password));
 			// a 7z's start points at its header, so its first chunk is sent last
-			drop(sink);
-			let password = with_password(encryption, job.password.as_ref(), "7z")?;
-			let writer = SevenZWriter::new(ChunkSink::holding_head(port), method, solid, password)
+			let writer = SevenZWriter::new(HeadSink::new(port), method, solid, encryption)
 				.map_err(failure)?;
-			write_7z(port, writer, job.entries)
+			write_7z(port, writer, entries)
 		}
-		CompressFormat::Single { compression } => {
-			let [ArchiveEntry::File { source, size, .. }] = job.entries[..] else {
-				// the planner refuses any other shape before the codec starts
-				return Err(Error::custom(
-					ErrorKind::Internal,
-					"a single compressed file is made of exactly one file",
-				));
-			};
-			let mut encoder: Box<dyn StreamEncoder<ChunkSink<'_>>> =
-				open_encoder(compression, sink)?;
-			write_source(port, source, size, |data| io::copy(data, &mut encoder))?;
-			encoder.finish().map_err(failure)?.finish().map_err(failure)
-		}
-	}
-}
-
-/// The password an encrypted `format` is written with, paired with its encryption settings.
-fn with_password<'p, T>(
-	encryption: Option<T>,
-	password: Option<&'p ArchivePassword>,
-	format: &str,
-) -> Result<Option<(T, &'p ArchivePassword)>, Error> {
-	match (encryption, password) {
-		(None, _) => Ok(None),
-		(Some(encryption), Some(password)) => Ok(Some((encryption, password))),
-		(Some(_), None) => Err(Error::custom(
-			ErrorKind::ArchivePasswordRequired,
-			format!("an encrypted {format} needs a password"),
-		)),
 	}
 }
 
@@ -130,7 +126,7 @@ fn write_zip(
 	mut zip: ZipWriter<ChunkSink<'_>>,
 	entries: Vec<ArchiveEntry>,
 	method: ZipMethod,
-	password: Option<(AesStrength, &ArchivePassword)>,
+	encryption: Option<(AesStrength, &ArchivePassword)>,
 ) -> Result<u64, Error> {
 	for entry in entries {
 		match entry {
@@ -143,16 +139,8 @@ fn write_zip(
 				size,
 				modified,
 			} => {
-				let encryption = password.map(|(strength, password)| {
-					// a fresh salt per entry, so no two entries share a key
-					let mut salt = vec![0u8; strength.salt_len()];
-					rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
-					Encryption {
-						password,
-						strength,
-						salt,
-					}
-				});
+				let encryption =
+					encryption.map(|(strength, password)| Encryption { password, strength });
 				write_source(port, source, size, |data| {
 					zip.add_file(&path, modified, size, method, encryption, data)
 				})?;
@@ -164,7 +152,7 @@ fn write_zip(
 
 fn write_7z(
 	port: &WorkerPort,
-	mut writer: SevenZWriter<ChunkSink<'_>>,
+	mut writer: SevenZWriter<HeadSink<'_>>,
 	entries: Vec<ArchiveEntry>,
 ) -> Result<u64, Error> {
 	for entry in entries {

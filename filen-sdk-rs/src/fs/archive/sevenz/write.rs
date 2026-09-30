@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-	crypto::{AesCbcWriter, AesProps, BLOCK, Key, WRITE_CYCLES_POWER, derive_key},
+	crypto::{AesCbcWriter, BLOCK, Key, WRITE_CYCLES_POWER, derive_key, encode_props},
 	header::*,
 	read::Method,
 };
@@ -144,6 +144,8 @@ struct CoderRecord {
 }
 
 struct FolderRecord {
+	/// The bytes it takes in the archive.
+	packed: u64,
 	/// Outermost first: the compression coder, then AES.
 	coders: Vec<CoderRecord>,
 	unpack_sizes: Vec<u64>,
@@ -244,6 +246,23 @@ struct OpenFolder<W: Write> {
 	substreams: Vec<(u64, u32)>,
 }
 
+impl<W: Write> OpenFolder<W> {
+	/// Ends the folder's data; the archive, and the folder's record.
+	fn finish(self) -> io::Result<(Counting<W>, FolderRecord)> {
+		let (out, aes_taken) = self.encoder.finish()?.finish()?;
+		let mut unpack_sizes = vec![self.unpacked];
+		unpack_sizes.extend(aes_taken);
+		let record = FolderRecord {
+			packed: out.written - self.start,
+			coders: self.coders,
+			unpack_sizes,
+			substreams: self.substreams,
+			crc: None,
+		};
+		Ok((out, record))
+	}
+}
+
 enum State<W: Write> {
 	Idle(Counting<W>),
 	Open(Box<OpenFolder<W>>),
@@ -253,7 +272,7 @@ enum State<W: Write> {
 
 struct Encryption {
 	key: Key,
-	salt: [u8; 16],
+	salt: [u8; BLOCK],
 	cycles_power: u8,
 	headers: bool,
 }
@@ -264,7 +283,6 @@ pub(crate) struct SevenZWriter<W: Write> {
 	solid: bool,
 	encryption: Option<Encryption>,
 	folders: Vec<FolderRecord>,
-	pack_sizes: Vec<u64>,
 	files: Vec<FileRecord>,
 }
 
@@ -303,16 +321,12 @@ impl<W: Write> SevenZWriter<W> {
 			None => None,
 			Some((what, password)) => {
 				let salt: [u8; BLOCK] = rand::random();
-				let props = AesProps {
-					cycles_power,
-					salt: salt.to_vec(),
-					iv: [0; 16],
-				};
 				// 2^19 rounds hash the salted password that many times: 13 MiB for a short one,
 				// 2 GiB for the longest (1024 characters outside the BMP, 4 KiB of UTF-16), a
 				// second or two natively and some 15 s on wasm. That stays well inside the stall
 				// timeout, so no progress is shown, and a cancel waits for the key
-				let key = derive_key(password, &props, &mut || Ok(())).map_err(io::Error::other)?;
+				let key = derive_key(password, cycles_power, &salt, &mut || Ok(()))
+					.map_err(io::Error::other)?;
 				Some(Encryption {
 					key,
 					salt,
@@ -328,7 +342,6 @@ impl<W: Write> SevenZWriter<W> {
 			solid,
 			encryption,
 			folders: Vec::new(),
-			pack_sizes: Vec::new(),
 			files: Vec::new(),
 		})
 	}
@@ -358,24 +371,21 @@ impl<W: Write> SevenZWriter<W> {
 			});
 			return io::copy(data, &mut io::sink());
 		}
-		if let State::Open(folder) = &self.state
-			&& (!self.solid || folder.unpacked.saturating_add(size) > SOLID_BLOCK_BYTES)
-		{
-			self.close_folder()?;
-		}
-		if matches!(self.state, State::Idle(_)) {
-			self.open_folder(self.method, None)?;
-		}
-		let State::Open(folder) = &mut self.state else {
-			return Err(failed());
-		};
-		let (read, crc) = match copy_with_crc(data, &mut folder.encoder) {
-			Ok(copied) => copied,
-			Err(error) => {
-				self.state = State::Failed;
-				return Err(error);
+		// the writer stays failed unless this file goes in whole
+		let mut folder = match std::mem::replace(&mut self.state, State::Failed) {
+			State::Open(folder)
+				if self.solid && folder.unpacked.saturating_add(size) <= SOLID_BLOCK_BYTES =>
+			{
+				folder
 			}
+			State::Open(folder) => {
+				let out = self.close_folder(*folder)?;
+				self.open_folder(out, self.method, None)?
+			}
+			State::Idle(out) => self.open_folder(out, self.method, None)?,
+			State::Failed => return Err(failed()),
 		};
+		let (read, crc) = copy_with_crc(data, &mut folder.encoder)?;
 		folder.unpacked += read;
 		folder.substreams.push((read, crc));
 		self.files.push(FileRecord {
@@ -383,16 +393,21 @@ impl<W: Write> SevenZWriter<W> {
 			modified,
 			kind: FileKind::File { has_stream: true },
 		});
-		if !self.solid {
-			self.close_folder()?;
-		}
+		self.state = if self.solid {
+			State::Open(folder)
+		} else {
+			State::Idle(self.close_folder(*folder)?)
+		};
 		Ok(read)
 	}
 
-	fn open_folder(&mut self, method: SevenZMethod, dict: Option<u32>) -> io::Result<()> {
-		let State::Idle(out) = std::mem::replace(&mut self.state, State::Failed) else {
-			return Err(failed());
-		};
+	/// Starts a folder at the end of `out`.
+	fn open_folder(
+		&self,
+		out: Counting<W>,
+		method: SevenZMethod,
+		dict: Option<u32>,
+	) -> io::Result<Box<OpenFolder<W>>> {
 		let start = out.written;
 		let mut coders = Vec::with_capacity(2);
 		let packer = match &self.encryption {
@@ -402,12 +417,7 @@ impl<W: Write> SevenZWriter<W> {
 				let iv: [u8; BLOCK] = rand::random();
 				coders.push(CoderRecord {
 					method: Method::Aes,
-					props: AesProps {
-						cycles_power: encryption.cycles_power,
-						salt: encryption.salt.to_vec(),
-						iv,
-					}
-					.encode(),
+					props: encode_props(encryption.cycles_power, &encryption.salt, &iv),
 				});
 				Packer::Aes(Box::new(AesCbcWriter::new(out, &encryption.key, iv)))
 			}
@@ -463,67 +473,47 @@ impl<W: Write> SevenZWriter<W> {
 				props: coder.1,
 			},
 		);
-		self.state = State::Open(Box::new(OpenFolder {
+		Ok(Box::new(OpenFolder {
 			encoder,
 			coders,
 			start,
 			unpacked: 0,
 			substreams: Vec::new(),
-		}));
-		Ok(())
+		}))
 	}
 
-	fn close_folder(&mut self) -> io::Result<()> {
-		let State::Open(folder) = std::mem::replace(&mut self.state, State::Failed) else {
-			return Err(failed());
-		};
-		let (out, aes_taken) = folder.encoder.finish()?.finish()?;
-		let packed = out.written - folder.start;
-		let mut unpack_sizes = vec![folder.unpacked];
-		unpack_sizes.extend(aes_taken);
-		self.pack_sizes.push(packed);
-		self.folders.push(FolderRecord {
-			coders: folder.coders,
-			unpack_sizes,
-			substreams: folder.substreams,
-			crc: None,
-		});
-		self.state = State::Idle(out);
-		Ok(())
+	/// Ends `folder`, keeping its record; the archive.
+	fn close_folder(&mut self, folder: OpenFolder<W>) -> io::Result<Counting<W>> {
+		let (out, record) = folder.finish()?;
+		self.folders.push(record);
+		Ok(out)
 	}
 
 	/// Writes the header; the archive, and the start header to write over its first 32 bytes.
 	pub(crate) fn finish(mut self) -> io::Result<(W, [u8; START_HEADER_LEN])> {
-		if matches!(self.state, State::Open(_)) {
-			self.close_folder()?;
-		}
+		let out = match std::mem::replace(&mut self.state, State::Failed) {
+			State::Idle(out) => out,
+			State::Open(folder) => self.close_folder(*folder)?,
+			State::Failed => return Err(failed()),
+		};
 		let header = self.header();
 		let (mut out, next) = if self.encryption.as_ref().is_some_and(|e| e.headers) {
 			// the header, compressed and encrypted as a folder of its own, then a small plain
 			// header saying where it is
-			let pack_pos = self.data_len()?;
-			self.open_folder(
-				SevenZMethod::Lzma2 {
-					level: HEADER_LEVEL,
-				},
-				Some(HEADER_DICT_BYTES),
-			)?;
-			let State::Open(folder) = &mut self.state else {
-				return Err(failed());
+			let pack_pos = out.written;
+			let method = SevenZMethod::Lzma2 {
+				level: HEADER_LEVEL,
 			};
+			let mut folder = self.open_folder(out, method, Some(HEADER_DICT_BYTES))?;
 			folder.encoder.write_all(&header)?;
 			folder.unpacked = header.len() as u64;
-			self.close_folder()?;
-			let (Some(mut folder), Some(packed)) = (self.folders.pop(), self.pack_sizes.pop())
-			else {
-				return Err(failed());
-			};
-			folder.crc = Some(crc32fast::hash(&header));
+			let (out, mut record) = folder.finish()?;
+			record.crc = Some(crc32fast::hash(&header));
 			let mut next = vec![K_ENCODED_HEADER];
-			write_streams(&mut next, pack_pos, &[packed], &[folder], false);
-			(self.into_out()?, next)
+			write_streams(&mut next, pack_pos, &[record], false);
+			(out, next)
 		} else {
-			(self.into_out()?, header)
+			(out, header)
 		};
 		let next_offset = out.written;
 		out.write_all(&next)?;
@@ -538,21 +528,6 @@ impl<W: Write> SevenZWriter<W> {
 		Ok((out.inner, start))
 	}
 
-	/// The bytes written after the start header.
-	fn data_len(&self) -> io::Result<u64> {
-		match &self.state {
-			State::Idle(out) => Ok(out.written),
-			_ => Err(failed()),
-		}
-	}
-
-	fn into_out(self) -> io::Result<Counting<W>> {
-		match self.state {
-			State::Idle(out) => Ok(out),
-			_ => Err(failed()),
-		}
-	}
-
 	fn header(&mut self) -> Vec<u8> {
 		// files with data first, in the order their data was written, then directories and
 		// empty files: some readers take a solid block's files to be listed next to each other
@@ -561,7 +536,7 @@ impl<W: Write> SevenZWriter<W> {
 		let mut out = vec![K_HEADER];
 		if !self.folders.is_empty() {
 			out.push(K_MAIN_STREAMS_INFO);
-			write_streams(&mut out, 0, &self.pack_sizes, &self.folders, true);
+			write_streams(&mut out, 0, &self.folders, true);
 		}
 		if !self.files.is_empty() {
 			out.push(K_FILES_INFO);
@@ -664,19 +639,13 @@ fn write_defined(out: &mut Vec<u8>, defined: &[bool]) {
 	}
 }
 
-fn write_streams(
-	out: &mut Vec<u8>,
-	pack_pos: u64,
-	pack_sizes: &[u64],
-	folders: &[FolderRecord],
-	substreams: bool,
-) {
+fn write_streams(out: &mut Vec<u8>, pack_pos: u64, folders: &[FolderRecord], substreams: bool) {
 	out.push(K_PACK_INFO);
 	write_number(out, pack_pos);
-	write_number(out, pack_sizes.len() as u64);
+	write_number(out, folders.len() as u64);
 	out.push(K_SIZE);
-	for &size in pack_sizes {
-		write_number(out, size);
+	for folder in folders {
+		write_number(out, folder.packed);
 	}
 	out.push(K_END);
 

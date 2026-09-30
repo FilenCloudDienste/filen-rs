@@ -56,10 +56,10 @@ use crate::{
 			entry_path::{ArchivePath, joined},
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
-			names::{DirId, PathResolver},
+			names::DirId,
 			worker::{
 				CodecStart, EntryHead, EntryKind, SkippedMember, WorkerEvent, codec_failed,
-				worker_died,
+				unexpected_event, worker_died,
 			},
 		},
 		categories::{DirType, NonRootItemType, Normal},
@@ -67,7 +67,7 @@ use crate::{
 			Fatal,
 			backend::DriveBackend,
 			dir::{CreatedDirOutcome, DirError},
-			finalize::{FinalizeError, Finalized},
+			finalize::UnlessPaused,
 		},
 		file::{enums::RemoteFileType, traits::HasFileInfo, write::RemoteFileInfo},
 		name::ValidatedName,
@@ -90,8 +90,8 @@ use super::{
 };
 
 use crate::fs::drive_job::exceeds_limit;
-use dirs::{DirSlot, DirState};
-use links::{LinkCopy, LinkTargets, PendingLink, TakenLink};
+use dirs::{DirSlot, DirState, Opened};
+use links::{LinkTargets, PendingLink, TakenLink};
 
 /// Directories planned and not created yet past which the codec is kept waiting: an archive
 /// naming directories faster than they are created (each entry can imply 256) has them planned
@@ -123,16 +123,14 @@ pub(crate) struct ExtractTask<B> {
 	pub(crate) config: ArchiveConfig,
 	/// Starts the codec; called once the job holds its lease and memory floor.
 	pub(crate) start: CodecStart<CodecResult>,
-	/// How to remove the archive once the extraction is verified, and the directory it is in.
-	pub(crate) dispose: Option<(SourceDisposal, Uuid)>,
-	/// Whether the caller asked for the archive to be removed, which `dispose` leaves out for an
-	/// archive in the trash: every way the job ends reports what became of it.
-	pub(crate) disposal_requested: bool,
+	/// Whether the caller asked for the archive to be removed: every way the job ends then
+	/// reports what became of it.
+	pub(crate) dispose: Option<ArchiveDisposal>,
 }
 
 /// What to do with the archive once the extraction is verified.
 #[derive(Clone, Copy, Debug)]
-enum ArchiveDisposal {
+pub(crate) enum ArchiveDisposal {
 	/// Remove it this way, if it is still in `parent`.
 	Remove { how: SourceDisposal, parent: Uuid },
 	/// It was in the trash when the job started, so there is no directory to confirm it is
@@ -140,9 +138,54 @@ enum ArchiveDisposal {
 	Unavailable,
 }
 
+/// Where a file entry is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilePhase {
+	/// Its data is still coming: from the codec, or copied from a hard link's target.
+	Receiving,
+	/// All its data has come.
+	Ended,
+	/// It is being registered.
+	Finalizing,
+	/// It failed; its later data is dropped.
+	Failed {
+		/// All its data has come.
+		ended: bool,
+	},
+}
+
+impl FilePhase {
+	/// The phase once all the file's data has come.
+	fn end(self) -> Self {
+		match self {
+			Self::Receiving => Self::Ended,
+			Self::Failed { .. } => Self::Failed { ended: true },
+			ended @ (Self::Ended | Self::Finalizing) => ended,
+		}
+	}
+}
+
+/// Where a file slot's data comes from.
+enum SlotSource {
+	/// The codec, which sends it next.
+	Codec,
+	/// A copy of another file, for a hard link.
+	Link(LinkPhase),
+}
+
+/// A hard link's copy of the file it names: that file, fetched by its uuid, then its chunks one
+/// at a time (their hash is taken in order), uploaded as the link's.
+enum LinkPhase {
+	/// The file is being fetched by its uuid.
+	Resolving,
+	/// No chunk of the file is being fetched.
+	Idle(Arc<RemoteFileType<'static>>),
+	/// A chunk of the file is being fetched.
+	Fetching(Arc<RemoteFileType<'static>>),
+}
+
 /// A file entry being extracted.
 struct FileSlot<U> {
-	entry: ArchiveEntryId,
 	path: String,
 	parent: DirId,
 	upload: Arc<U>,
@@ -154,17 +197,17 @@ struct FileSlot<U> {
 	uploading: usize,
 	info: Option<RemoteFileInfo>,
 	modified: Option<DateTime<Utc>>,
-	/// All its data has come in: from the codec, or copied from a hard link's target.
-	ended: bool,
-	finalizing: bool,
-	failed: bool,
+	phase: FilePhase,
 	/// What a tar's hard links find it by, when it may be the target of one.
 	link_key: Option<u64>,
-	/// For a hard link, the file it copies.
-	copy: Option<LinkCopy>,
+	source: SlotSource,
 }
 
 impl<U> FileSlot<U> {
+	fn failed(&self) -> bool {
+		matches!(self.phase, FilePhase::Failed { .. })
+	}
+
 	/// Its size: as the archive states it, or else what was read of it.
 	fn bytes(&self) -> u64 {
 		self.active.size.unwrap_or(self.written)
@@ -188,6 +231,8 @@ struct NewFile {
 	size: Option<u64>,
 	modified: Option<DateTime<Utc>>,
 	source: FileSource,
+	/// What a tar's hard links find it by, when it may be the target of one.
+	link_key: Option<u64>,
 }
 
 /// Where a file's data comes from.
@@ -207,9 +252,9 @@ type LinkSource = (u64, Result<NonRootItemType<'static, Normal>, Error>);
 /// An uploaded chunk of a file, by the file's ordinal.
 type UploadedChunk = (u64, u64, Result<RemoteFileInfo, Error>);
 
-/// A file's registration, by the file's ordinal; `None` when a pause came first, to be started
-/// again on resume.
-type Registration = (u64, Option<Result<Finalized, FinalizeError>>);
+/// A file's registration, by the file's ordinal; one a pause came first to is started again on
+/// resume.
+type Registration = (u64, UnlessPaused);
 
 struct Driver<B: DriveBackend> {
 	backend: Arc<B>,
@@ -227,21 +272,16 @@ struct Driver<B: DriveBackend> {
 	/// The client's file-IO budget, for what goes beyond the floor.
 	memory: Arc<Semaphore>,
 	targets: Arc<ConnectedTargets>,
-	/// What the archive turned out to hold.
-	layout: Option<ArchiveFormat>,
 	dispose: Option<ArchiveDisposal>,
 
 	/// Set up when the codec reports what the archive holds.
-	resolver: Option<PathResolver>,
+	opened: Option<Opened>,
 	/// Entries land in the destination itself, so items at the top are created in a directory
 	/// the job did not create.
 	into_destination: bool,
 	/// The destination listing could not name every item.
 	unverified: bool,
 	dirs: Vec<DirSlot>,
-	/// The directory entries land in, set up with the root's slot: the destination, or the
-	/// folder the job created in it.
-	root_dir: Option<DirType<'static, Normal>>,
 	/// Directories planned and neither created nor failed.
 	uncreated_dirs: usize,
 	ready_dirs: VecDeque<DirId>,
@@ -269,9 +309,9 @@ struct Driver<B: DriveBackend> {
 	link_chunks: FuturesUnordered<MaybeSendBoxFuture<'static, LinkChunk>>,
 	uploads: FuturesUnordered<MaybeSendBoxFuture<'static, UploadedChunk>>,
 	finalizes: FuturesUnordered<MaybeSendBoxFuture<'static, Registration>>,
-	/// An event the driver cannot take on yet, and so the last it took: while it waits, the
-	/// codec parks.
-	held: Option<WorkerEvent>,
+	/// Data of the current file the driver cannot take on yet, and so the last event it took:
+	/// while it waits, the codec parks.
+	held: Option<Vec<u8>>,
 	/// The codec returned, or was given up on.
 	codec_done: bool,
 	/// The order-free digest of the files and directories the job created, which the output
@@ -310,7 +350,6 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		config,
 		start,
 		dispose,
-		disposal_requested,
 	} = task;
 	let report = ExtractReport::new(super::ArchiveTotals::Streaming {
 		archive_bytes: archive.size(),
@@ -318,7 +357,7 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 	let archive_uuid = archive.uuid();
 	// ended before anything was extracted: the archive to remove is kept
 	let fail = |mut report: ExtractReport, phase, error| {
-		if disposal_requested {
+		if dispose.is_some() {
 			report_kept_on_early_end(&reporter, &mut report, archive_uuid, phase);
 		}
 		reporter.finish(phase);
@@ -365,17 +404,11 @@ pub(crate) async fn run_extract<B: DisposalBackend>(
 		output_slot: Arc::new(Semaphore::new(1)),
 		memory,
 		targets: Arc::default(),
-		layout: None,
-		dispose: match dispose {
-			Some((how, parent)) => Some(ArchiveDisposal::Remove { how, parent }),
-			None if disposal_requested => Some(ArchiveDisposal::Unavailable),
-			None => None,
-		},
-		resolver: None,
+		dispose,
+		opened: None,
 		into_destination: false,
 		unverified: false,
 		dirs: Vec::new(),
-		root_dir: None,
 		uncreated_dirs: 0,
 		ready_dirs: VecDeque::new(),
 		dir_creates: FuturesUnordered::new(),
@@ -478,7 +511,8 @@ impl<B: DisposalBackend> Driver<B> {
 		if self.dispose.is_some() && self.report.dispositions.is_empty() {
 			let archive = self.archive.uuid();
 			if result.is_ok() {
-				// only an archive in the trash is not removed after a complete extraction
+				// only an unavailable archive, one in the trash, is not removed after a complete
+				// extraction
 				let reason = if self.complete(self.reporter.counts()) {
 					KeptReason::Changed
 				} else {
@@ -524,11 +558,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn entry_id(&self, ordinal: u64) -> ArchiveEntryId {
-		ArchiveEntryId {
-			archive: self.archive.uuid(),
-			// the member cap keeps ordinals far below u32::MAX
-			index: u32::try_from(ordinal).unwrap_or(u32::MAX),
-		}
+		ArchiveEntryId::of(self.archive.uuid(), ordinal)
 	}
 
 	async fn extract(&mut self) -> Result<(), Stopped> {
@@ -647,12 +677,12 @@ impl<B: DisposalBackend> Driver<B> {
 		let abandoned: Vec<u64> = self
 			.files
 			.iter()
-			.filter(|(_, file)| !file.finalizing)
+			.filter(|(_, file)| file.phase != FilePhase::Finalizing)
 			.map(|(ordinal, _)| *ordinal)
 			.collect();
 		for ordinal in abandoned {
 			if let Some(file) = self.files.remove(&ordinal)
-				&& !file.failed
+				&& !file.failed()
 			{
 				self.reporter
 					.file_abandoned(file.active.dest_uuid, file.bytes());
@@ -662,7 +692,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Starts whatever can start without waiting: answers the codec, prefetches, creates the
-	/// directories whose parents exist, takes up a held event, registers finished files.
+	/// directories whose parents exist, takes up held data, registers finished files.
 	fn advance(&mut self) {
 		self.feed.advance(&self.reporter.ops());
 		self.report_bytes_read();
@@ -671,8 +701,8 @@ impl<B: DisposalBackend> Driver<B> {
 		{
 			self.start_dir(dir);
 		}
-		if let Some(event) = self.held.take() {
-			self.retry_held(event);
+		if let Some(data) = self.held.take() {
+			self.take_data(data);
 		}
 		self.open_ready_links();
 		self.copy_links();
@@ -727,7 +757,7 @@ impl<B: DisposalBackend> Driver<B> {
 					self.held = None;
 					if let Some(ordinal) = self.current.take()
 						&& let Some(file) = self.files.remove(&ordinal)
-						&& !file.failed
+						&& !file.failed()
 					{
 						self.reporter
 							.file_abandoned(file.active.dest_uuid, file.bytes());
@@ -739,18 +769,16 @@ impl<B: DisposalBackend> Driver<B> {
 
 	async fn on_event(&mut self, event: WorkerEvent) -> Result<(), Stopped> {
 		match event {
-			WorkerEvent::Opened(layout) => {
-				self.layout = Some(layout);
-				self.open(layout).await?
-			}
+			WorkerEvent::Opened(layout) => self.open(layout).await?,
 			WorkerEvent::Entry(head) => self.on_entry(head),
 			WorkerEvent::Skipped(member) => self.on_skipped(member),
-			event @ (WorkerEvent::Data(_) | WorkerEvent::FileEnd) => self.retry_held(event),
+			WorkerEvent::Data(data) => self.take_data(data),
+			WorkerEvent::FileEnd => self.end_file(),
 			WorkerEvent::Link(link) => self.on_link(*link),
 			// the feed answers asks, only a compressing codec sends a head, and only a listing's
 			// lists
 			WorkerEvent::Ask { .. } | WorkerEvent::Head(_) | WorkerEvent::Listed(_) => {
-				debug_assert!(false, "an extracting codec sent {event:?}");
+				self.stop_with(unexpected_event());
 			}
 		}
 		Ok(())
@@ -843,18 +871,21 @@ impl<B: DisposalBackend> Driver<B> {
 		self.report_path(entry, &head.path);
 		match head.kind {
 			EntryKind::Dir => {
-				self.resolve_dirs(&head.path.segments, entry, head.modified);
+				self.resolve_dirs(head.path.segments(), entry, head.modified);
 			}
 			EntryKind::File { size } => {
-				let Some(file) = self.new_file(head.ordinal, &head.path, size, head.modified)
+				let Some(mut file) = self.new_file(head.ordinal, &head.path, size, head.modified)
 				else {
 					return;
 				};
-				let ordinal = file.ordinal;
-				self.open_file(file);
 				// a tar's hard links name the files before them by path
-				if matches!(self.layout, Some(ArchiveFormat::Tar { .. })) {
-					self.link_target(ordinal, &head.path);
+				if matches!(self.opened().layout, ArchiveFormat::Tar { .. }) {
+					file.link_key = Some(self.link_key(&head.path));
+				}
+				let (ordinal, link_key) = (file.ordinal, file.link_key);
+				self.open_file(file);
+				if let Some(key) = link_key {
+					self.link_target(ordinal, key);
 				}
 			}
 		}
@@ -863,10 +894,9 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Reports what an entry at `path` that is taken on is named: a path made into valid drive
 	/// names, and a name that reads as something it is not.
 	fn report_path(&mut self, entry: ArchiveEntryId, path: &ArchivePath) {
-		let joined = self.archive_joined(&path.segments);
-		if path.rewritten
-			&& let Some(name) = path.segments.last()
-		{
+		let joined = self.archive_joined(path.segments());
+		if path.rewritten {
+			let (name, _) = path.split_last();
 			self.renamed(
 				entry,
 				joined.clone(),
@@ -906,27 +936,24 @@ impl<B: DisposalBackend> Driver<B> {
 		modified: Option<DateTime<Utc>>,
 	) -> Option<NewFile> {
 		let entry = self.entry_id(ordinal);
-		let (name, parents) = path.segments.split_last()?;
+		let (name, parents) = path.split_last();
 		let parent = self.resolve_dirs(parents, entry, None)?;
 		if !self.count_item() {
 			return None;
 		}
-		let allocated = self
-			.resolver
-			.as_mut()
-			.expect("entries follow the archive's layout")
-			.file_name(parent, name.clone());
+		let allocated = self.opened_mut().resolver.file_name(parent, name.clone());
 		// a keep-both name is reported once the file is registered, under the name it got then
 		match allocated {
 			Ok(name) => Some(NewFile {
 				ordinal,
 				entry,
-				path: self.archive_joined(&path.segments),
+				path: self.archive_joined(path.segments()),
 				parent,
 				name,
 				size,
 				modified,
 				source: FileSource::Codec,
+				link_key: None,
 			}),
 			Err(error) => {
 				self.stop_with(error.into());

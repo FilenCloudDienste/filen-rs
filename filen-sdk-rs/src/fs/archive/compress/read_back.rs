@@ -30,7 +30,6 @@ use crate::{
 			extract::codec::{ArchiveEnd, CodecLimits, StreamJob, Task, extract_stream},
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed},
-			password::ArchivePassword,
 			worker::{self, EntryHead, EntryKind, WorkerEvent, WorkerLink, worker_died},
 		},
 		drive_job::backend::DriveBackend,
@@ -40,7 +39,10 @@ use crate::{
 	util::{MaybeArc, sleep},
 };
 
-use super::{codec::ArchiveEntry, report::Reporter};
+use super::{
+	codec::{ArchiveEntry, CompressJob},
+	report::Reporter,
+};
 
 /// What the reading codec returns.
 pub(crate) type ReadBackResult = Result<ArchiveEnd, Error>;
@@ -59,20 +61,23 @@ pub(crate) struct ReadBack {
 }
 
 impl ReadBack {
-	/// Reads back an archive of `entries` through the extracting codec, under the client's
-	/// `config`, with the `password` it was written with.
-	pub(crate) fn as_extracting(
-		entries: &[ArchiveEntry],
-		config: &ArchiveConfig,
-		password: Option<ArchivePassword>,
-	) -> Self {
-		let dirs = entries
-			.iter()
-			.filter_map(|entry| match entry {
-				ArchiveEntry::Dir { path, .. } => Some(path.clone()),
-				ArchiveEntry::File { .. } => None,
-			})
-			.collect();
+	/// Reads back what `job` writes through the extracting codec, under the client's `config`,
+	/// with the password it was written with.
+	pub(crate) fn as_extracting(job: &CompressJob, config: &ArchiveConfig) -> Self {
+		let (dirs, password) = match job {
+			CompressJob::Archive { format, entries } => {
+				let dirs = entries
+					.iter()
+					.filter_map(|entry| match entry {
+						ArchiveEntry::Dir { path, .. } => Some(path.clone()),
+						ArchiveEntry::File { .. } => None,
+					})
+					.collect();
+				// a copy: the reading codec runs on a worker of its own, apart from the job's
+				(dirs, format.password().cloned())
+			}
+			CompressJob::Single { .. } => (Vec::new(), None),
+		};
 		let limits = CodecLimits {
 			decoder_memory: config.codec_mem_budget,
 			max_members: config.max_members,

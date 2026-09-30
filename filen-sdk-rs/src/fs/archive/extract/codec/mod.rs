@@ -220,6 +220,7 @@ fn extract_single(
 			Verdict::Take { path, apple_double } => {
 				take_file(walk, &found, path, None, apple_double, &mut decoded)
 					.map_err(read_failure)?
+					.files()
 			}
 			Verdict::Skip(reason) => {
 				walk.port
@@ -243,7 +244,6 @@ fn extract_single(
 /// Sends the file `found` at `path`, `size` bytes if its archive states it, its data read from
 /// `data`, unless its first bytes show it AppleDouble when `apple_double` asks for that to be
 /// checked: then it is sent as skipped.
-/// Whether it was sent as a file (1) or not (0), to count.
 fn take_file(
 	walk: &mut Walk,
 	found: &Found,
@@ -251,13 +251,13 @@ fn take_file(
 	size: Option<u64>,
 	apple_double: bool,
 	data: &mut dyn Read,
-) -> io::Result<u64> {
+) -> io::Result<Taken> {
 	let head = if apple_double {
 		let (is_apple_double, head) = self::apple_double(data)?;
 		if is_apple_double {
 			walk.port
 				.send(found.skipped(ExtractSkipReason::MacMetadata))?;
-			return Ok(0);
+			return Ok(Taken::LeftOut);
 		}
 		walk.taken_after_all(found);
 		head
@@ -267,7 +267,26 @@ fn take_file(
 	walk.port.send(found.head(path, EntryKind::File { size }))?;
 	send_file_data(walk.port, &mut Cursor::new(head).chain(data))?;
 	walk.port.send(WorkerEvent::FileEnd)?;
-	Ok(1)
+	Ok(Taken::File)
+}
+
+/// What [`take_file`] did with a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taken {
+	/// It was sent, data and all.
+	File,
+	/// Its first bytes show it AppleDouble: it was sent as skipped, as macOS metadata.
+	LeftOut,
+}
+
+impl Taken {
+	/// The files it counts as sent.
+	fn files(self) -> u64 {
+		match self {
+			Self::File => 1,
+			Self::LeftOut => 0,
+		}
+	}
 }
 
 impl PasswordCheck {
