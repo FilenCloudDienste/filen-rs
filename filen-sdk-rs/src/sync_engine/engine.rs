@@ -8,6 +8,7 @@ use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	mem,
+	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	sync::{Arc, MutexGuard, PoisonError},
 	time::{Duration, Instant},
@@ -27,7 +28,7 @@ use super::{
 		PathFailure, PendingRow, SyncedPaths,
 	},
 	changes::{FullPassReason, PairChanges, PassScope, RemoteDeltaEntry},
-	derive::{self, Derived},
+	derive,
 	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
@@ -1710,8 +1711,9 @@ struct PairCarry {
 	scan_complete: bool,
 }
 
-/// Whether the local map a change-scoped pass assembled accounts for the rows and observations it
-/// was built from.
+/// The sizes the local map a change-scoped pass assembles may have and still account for the rows
+/// and observations it was built from: plan 3.6's self-check, which the pass holds the assembled
+/// map's length against.
 ///
 /// The map is the baseline's rows, minus the rows each observation replaces, plus the nodes that
 /// observation found. Both ends are computable from the pieces themselves:
@@ -1728,12 +1730,15 @@ struct PairCarry {
 /// was replaced by an observed node". Outside those bounds the assembly dropped paths that no
 /// observation asked it to drop — risk #1 of the plan, and the shape that fabricates an absence —
 /// so the pass reads both sides instead of planning from it.
-pub(super) fn assembly_accounted(
+///
+/// Computed from the observations alone, and BEFORE `merge_local` runs: the merge moves each walk's
+/// nodes out of its scan, so counting them afterwards would count none. Taken first, the bounds
+/// also stay what they have to be, a count independent of the code whose output they check.
+pub(super) fn assembly_bounds(
 	baseline: &Baseline,
-	derived: &Derived,
 	observed: &LocalObservations,
 	held: &BTreeSet<String>,
-) -> bool {
+) -> RangeInclusive<usize> {
 	// Rows the observations replace, and the nodes they put back. A COMPLETE walk's contribution is
 	// exact — every row under its key goes, every node it found arrives, and the two sets cannot
 	// overlap, since a node it found is not a row it pruned. The slack is the observations that may
@@ -1774,7 +1779,7 @@ pub(super) fn assembly_accounted(
 	// `rows_at`.
 	let carried = baseline.len().saturating_sub(held.len());
 	let lowest = carried.saturating_sub(replaced).saturating_add(certain);
-	(lowest..=lowest.saturating_add(slack)).contains(&derived.local.of(baseline).len())
+	lowest..=lowest.saturating_add(slack)
 }
 
 /// The first key in the two maps a narrowed reconcile would never visit, if there is one — the
@@ -3460,7 +3465,7 @@ impl SyncEngine {
 		let for_local = inputs.baseline.clone();
 		let dirty = mem::take(&mut derived.dirty);
 		let pass_rules = remote_rules.rules;
-		let (observations, rules) = tokio::task::spawn_blocking(move || {
+		let (mut observations, rules) = tokio::task::spawn_blocking(move || {
 			observe::observe_local(&local_root, &for_local, pass_rules, &rule_files, &dirty)
 		})
 		.await
@@ -3471,11 +3476,12 @@ impl SyncEngine {
 			)
 		})?;
 		super::step("observe_local");
-		derive::merge_local(&mut derived, &inputs.baseline, &observations);
+		// Plan 3.6's self-check, bounded before the merge empties the walks it counts and checked
+		// before anything plans against these maps.
+		let accountable = assembly_bounds(&inputs.baseline, &observations, &held_rows);
+		derive::merge_local(&mut derived, &inputs.baseline, &mut observations);
 		super::step("merge_local");
-
-		// Plan 3.6's self-check, before anything plans against these maps.
-		if !assembly_accounted(&inputs.baseline, &derived, &observations, &held_rows) {
+		if !accountable.contains(&derived.local.of(&inputs.baseline).len()) {
 			tracing::warn!(
 				"sync_once[pair {pair}]: the derived local map ({} node(s)) does not account for \
 				 the {} baseline row(s) and {} observation(s) it was built from; reading both \
@@ -3617,7 +3623,7 @@ impl SyncEngine {
 		}
 		super::step("pending_settle_and_fold");
 		// The other half of plan 3.6's self-check, here because this is where the last producer has
-		// run: `assembly_accounted` above bounds what the maps HOLD, and this asks whether the pass
+		// run: `assembly_bounds` above bounds what the maps HOLD, and this asks whether the pass
 		// would actually decide it.
 		//
 		// A DEBUG assert, which is the one thing here that was decided by measurement rather than
@@ -5675,6 +5681,7 @@ mod tests {
 		sync_engine::{
 			PauseMode,
 			baseline::{BaselineChange, NodeKind},
+			derive::Derived,
 			ignore::IgnoreRules,
 			plan::RemoteNode,
 			scan::LocalNode,
@@ -6004,6 +6011,17 @@ mod tests {
 			last_ignored: BTreeSet::new(),
 			confirmed: Vec::new(),
 		}
+	}
+
+	/// Plan 3.6's self-check as the pass runs it — [`assembly_bounds`], held against the length of
+	/// the map that was assembled — for a test holding the observations and the map at once.
+	fn assembly_accounted(
+		baseline: &Baseline,
+		derived: &Derived,
+		observed: &LocalObservations,
+		held: &BTreeSet<String>,
+	) -> bool {
+		assembly_bounds(baseline, observed, held).contains(&derived.local.of(baseline).len())
 	}
 
 	/// The assembly self-check of plan 3.6: a map that accounts for the rows it carried and the
