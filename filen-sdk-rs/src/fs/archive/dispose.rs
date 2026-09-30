@@ -3,37 +3,50 @@
 //!
 //! A source is only touched after a job that completed with nothing failed, skipped or left
 //! unaccounted, whose output was confirmed with the server, and only if the source is still
-//! exactly what the job read (checked again right before it is removed). Directories are only
-//! ever trashed, never purged: a permanent removal deletes the files the job read one by one and
-//! trashes what is left, so nothing the job did not read is ever deleted for good. Directory
-//! sizes are never used, since the server caches them.
+//! exactly what the job read: checked again right before it is removed, while holding the drive
+//! lock, so a client that writes under the lock cannot change it in between. A file the job
+//! wrote (a compression's archive) is checked again under that same lock too, so no source is
+//! removed once the archive that holds it is gone. A pause is waited
+//! out between sources, never while holding the lock. Directories are only ever trashed, never
+//! purged: a permanent removal deletes the files the job read one by one and trashes what is
+//! left, so nothing the job did not read is ever deleted for good. Directory sizes are never
+//! used, since the server caches them.
 //!
 //! A listing holds only finished uploads: a file another device is still uploading into a source
 //! directory is not seen, and ends up in the trash with the directory, where it can be
 //! restored.
 
-use filen_macros::js_type;
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	future::Future,
 	sync::Arc,
 };
 
+use filen_macros::js_type;
 use filen_types::fs::{ParentUuid, Uuid};
 
 use crate::{
-	Error,
+	Error, api,
 	fs::{
 		HasUUID,
 		categories::{DirType, NonRootItemType, Normal, fs::CategoryFS},
-		drive_job::backend::{ClientBackend, DriveBackend},
+		drive_job::{
+			backend::{ClientBackend, DriveBackend},
+			lock::{HeldLock, LockWait, wait_for_lock},
+		},
 		file::traits::HasFileInfo,
 	},
-	job::{JobControl, Stopped},
+	job::{JobControl, Stopped, report::Ops},
 	util::MaybeSend,
 };
 
 /// What to do with a job's sources once its result is verified.
+///
+/// An extraction that left macOS metadata out on purpose (`skip_mac_metadata`, on by default)
+/// still counts as complete: that metadata keeps nothing from removing the archive. With
+/// [`DeletePermanently`](Self::DeletePermanently), what was left out (resource forks, extended
+/// attributes, and any `._name` file that starts as an AppleDouble file does) is then gone for
+/// good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[js_type(import, export, no_default)]
 pub enum SourceDisposal {
@@ -59,7 +72,8 @@ pub enum KeptReason {
 	/// What was read does not match the hash in the source's metadata.
 	HashMismatch,
 	/// The source's metadata holds no hash to check what was read against, which a permanent
-	/// deletion requires.
+	/// deletion requires. Never given for a zip or 7z archive: every entry's own checksum, and
+	/// every entry having been extracted, confirm those instead of a whole-archive hash.
 	HashUnavailable,
 	/// The source changed since the job read it: it moved, was trashed, got a new version, or
 	/// holds other items now.
@@ -67,7 +81,9 @@ pub enum KeptReason {
 	/// The job's output could not be confirmed: the server did not hold what was created, the
 	/// archive was not read in full, or something the job extracted was checked by nothing (a
 	/// 7z entry without a CRC-32, or the files of a brotli or LZMA-alone stream, or of an lz4,
-	/// xz or zstd stream written without its optional checksum).
+	/// xz or zstd stream written without its optional checksum). Before a permanent deletion,
+	/// also an archive a compression wrote that does not read back as its sources, or could not
+	/// be read back (a request or its reader failed).
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
@@ -125,6 +141,13 @@ pub(crate) struct FileState {
 	pub(crate) trash: bool,
 }
 
+/// A directory's place on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirState {
+	pub(crate) parent: ParentUuid,
+	pub(crate) trash: bool,
+}
+
 /// Everything below a directory: files with their sizes, and directories.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Tree {
@@ -174,12 +197,16 @@ pub(crate) fn dir_digest(uuid: Uuid) -> u128 {
 /// What removing sources needs besides a [`DriveBackend`].
 pub(crate) trait DisposalBackend: DriveBackend {
 	fn file_state(&self, uuid: Uuid) -> impl Future<Output = Result<FileState, Error>> + MaybeSend;
+	fn dir_state(&self, uuid: Uuid) -> impl Future<Output = Result<DirState, Error>> + MaybeSend;
 	fn list_tree(&self, dir: Uuid) -> impl Future<Output = Result<Tree, Error>> + MaybeSend;
+	/// The caller holds the drive lock.
 	fn trash_file(&self, uuid: Uuid) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+	/// The caller holds the drive lock.
 	fn delete_file_permanently(
 		&self,
 		uuid: Uuid,
 	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+	/// The caller holds the drive lock.
 	fn trash_dir(&self, uuid: Uuid) -> impl Future<Output = Result<(), Error>> + MaybeSend;
 	/// Whether the file has older versions.
 	fn has_older_versions(
@@ -206,6 +233,15 @@ impl DisposalBackend for ClientBackend {
 		})
 	}
 
+	async fn dir_state(&self, uuid: Uuid) -> Result<DirState, Error> {
+		let response =
+			api::v3::dir::post(self.client().client(), &api::v3::dir::Request { uuid }).await?;
+		Ok(DirState {
+			parent: response.parent,
+			trash: response.trash,
+		})
+	}
+
 	async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
 		let client = self.client();
 		let dir = client.get_dir(dir).await?;
@@ -226,28 +262,36 @@ impl DisposalBackend for ClientBackend {
 	}
 
 	async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
-		let client = self.client();
-		let mut file = client.get_file(uuid).await?;
-		client.trash_file(&mut file).await
+		api::v3::file::trash::post(
+			self.client().client(),
+			&api::v3::file::trash::Request { uuid },
+		)
+		.await
 	}
 
 	async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
-		let client = self.client();
-		let file = client.get_file(uuid).await?;
-		client.delete_file_permanently(file).await
+		api::v3::file::delete::permanent::post(
+			self.client().client(),
+			&api::v3::file::delete::permanent::Request { uuid },
+		)
+		.await
 	}
 
 	async fn trash_dir(&self, uuid: Uuid) -> Result<(), Error> {
-		let client = self.client();
-		let mut dir = client.get_dir(uuid).await?;
-		client.trash_dir(&mut dir).await
+		api::v3::dir::trash::post(
+			self.client().client(),
+			&api::v3::dir::trash::Request { uuid },
+		)
+		.await
 	}
 
 	async fn has_older_versions(&self, uuid: Uuid) -> Result<bool, Error> {
-		let client = self.client();
-		let file = client.get_file(uuid).await?;
-		let versions = client.list_file_versions(&file).await?;
-		Ok(versions.iter().any(|version| version.uuid() != uuid))
+		let response = api::v3::file::versions::post(
+			self.client().client(),
+			&api::v3::file::versions::Request { uuid },
+		)
+		.await?;
+		Ok(response.versions.iter().any(|version| version.uuid != uuid))
 	}
 
 	async fn normal_item(
@@ -289,6 +333,49 @@ impl ExpectedFile {
 			&& state.size == self.size
 			&& state.chunks == self.chunks
 			&& state.parent == ParentUuid::Uuid(self.parent)
+	}
+}
+
+/// A file a job wrote, as it wrote it: its sources are only removed while it still stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WrittenFile {
+	pub(crate) uuid: Uuid,
+	/// Bytes the job wrote.
+	pub(crate) size: u64,
+	pub(crate) chunks: u64,
+}
+
+impl WrittenFile {
+	/// Whether the server still holds it as written: out of the trash, not superseded by a
+	/// newer version, at its size and chunk count.
+	pub(crate) fn stands(&self, state: &FileState) -> bool {
+		!state.trash && !state.versioned && state.size == self.size && state.chunks == self.chunks
+	}
+}
+
+/// What each removal of a job's sources is paced and checked by.
+#[derive(Clone, Copy)]
+pub(crate) struct Removing<'a> {
+	pub(crate) control: &'a JobControl,
+	pub(crate) ops: &'a Ops,
+	/// The file the job wrote, checked again under the lock each removal holds, so no source is
+	/// removed once a client writing under the lock removed or replaced it. `None` for an
+	/// extraction, whose output (the items it created) is confirmed once, before its archive
+	/// is removed.
+	pub(crate) output: Option<WrittenFile>,
+}
+
+/// A directory source as the job read it: where it was, and everything below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedDir {
+	pub(crate) uuid: Uuid,
+	pub(crate) parent: Uuid,
+	pub(crate) read: Tree,
+}
+
+impl ExpectedDir {
+	fn matches(&self, state: &DirState) -> bool {
+		!state.trash && state.parent == ParentUuid::Uuid(self.parent)
 	}
 }
 
@@ -365,15 +452,65 @@ fn failed(error: Error) -> DisposalOutcome {
 	})
 }
 
-/// Removes one file source if it is still what the job read. A cancel through `control` drops
-/// the check in flight, or ends the removal before its next request; a removal already sent is
-/// waited for, so its outcome is known.
+/// Takes the drive lock for one source's recheck and removal, waiting out a pause first so a
+/// paused job holds no lock, and checks the job's output again under it: a source is kept as
+/// unconfirmed once the output no longer stands, or its state cannot be fetched. A cancel keeps
+/// the source.
+async fn lock_for_removal<B: DisposalBackend>(
+	backend: &B,
+	removing: Removing<'_>,
+) -> Result<HeldLock<B::DriveLock>, DisposalOutcome> {
+	let Removing {
+		control,
+		ops,
+		output,
+	} = removing;
+	let held = loop {
+		if ops.checkpoint(control).await.is_err() {
+			return Err(DisposalOutcome::kept(KeptReason::Interrupted));
+		}
+		match wait_for_lock(backend, control, ops).await {
+			Ok(LockWait::Locked(held)) => break held,
+			Ok(LockWait::Paused) => {}
+			Ok(LockWait::Failed(error)) => return Err(failed(error)),
+			Err(Stopped) => return Err(DisposalOutcome::kept(KeptReason::Interrupted)),
+		}
+	};
+	if let Some(output) = output {
+		match control
+			.until_stopping(backend.file_state(output.uuid))
+			.await
+		{
+			Ok(Ok(state)) if output.stands(&state) => {}
+			Ok(Ok(_)) => return Err(DisposalOutcome::kept(KeptReason::Unconfirmed)),
+			Ok(Err(error)) => {
+				tracing::warn!(
+					"file {}: failed to confirm it before removing a source: {error}",
+					output.uuid
+				);
+				return Err(DisposalOutcome::kept(KeptReason::Unconfirmed));
+			}
+			Err(Stopped) => return Err(DisposalOutcome::kept(KeptReason::Interrupted)),
+		}
+	}
+	Ok(held)
+}
+
+/// Removes one file source if it is still what the job read, holding the drive lock from the
+/// check to the removal; a pause is waited out before the lock is taken. A cancel through
+/// `removing` drops the check in flight, or ends the removal before its next request; a removal
+/// already sent is waited for, so its outcome is known.
 pub(crate) async fn dispose_file<B: DisposalBackend>(
 	backend: &B,
 	file: ExpectedFile,
 	how: SourceDisposal,
-	control: &JobControl,
+	removing: Removing<'_>,
 ) -> DisposalOutcome {
+	let control = removing.control;
+	let _lock = match lock_for_removal(backend, removing).await {
+		Ok(lock) => lock,
+		Err(outcome) => return outcome,
+	};
 	let state = match control.until_stopping(backend.file_state(file.uuid)).await {
 		Ok(Ok(state)) => state,
 		Ok(Err(error)) => return failed(error),
@@ -412,17 +549,30 @@ pub(crate) async fn dispose_file<B: DisposalBackend>(
 	}
 }
 
-/// Removes one directory source if everything below it is still what the job read. A cancel
-/// through `control` drops the check or listing in flight, or ends the removal before its next
-/// request; a removal already sent is waited for, so what it freed is known.
+/// Removes one directory source if it is still where the job read it, out of the trash, and
+/// everything below it is still what the job read, holding the drive lock from the check to the
+/// removal; a pause is waited out before the lock is taken. A cancel through `removing` drops the
+/// check or listing in flight, or ends the removal before its next request; a removal already
+/// sent is waited for, so what it freed is known.
 pub(crate) async fn dispose_dir<B: DisposalBackend>(
 	backend: &B,
-	dir: Uuid,
-	read: &Tree,
+	expected: &ExpectedDir,
 	how: SourceDisposal,
-	control: &JobControl,
+	removing: Removing<'_>,
 	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
+	let (dir, read) = (expected.uuid, &expected.read);
+	let control = removing.control;
+	let _lock = match lock_for_removal(backend, removing).await {
+		Ok(lock) => lock,
+		Err(outcome) => return outcome,
+	};
+	match control.until_stopping(backend.dir_state(dir)).await {
+		Ok(Ok(state)) if expected.matches(&state) => {}
+		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),
+		Ok(Err(error)) => return failed(error),
+		Err(Stopped) => return DisposalOutcome::kept(KeptReason::Interrupted),
+	}
 	match control.until_stopping(backend.list_tree(dir)).await {
 		Ok(Ok(listed)) if listed == *read => {}
 		Ok(Ok(_)) => return DisposalOutcome::kept(KeptReason::Changed),

@@ -247,6 +247,27 @@ impl Ops {
 	pub(crate) fn wind_down(&self, control: &JobControl) {
 		self.0.wind_down(control);
 	}
+
+	/// Waits out a pause, reporting it; `Err` once the job is stopping.
+	#[cfg(feature = "archive")]
+	pub(crate) async fn checkpoint(&self, control: &JobControl) -> Result<(), Stopped> {
+		reported_checkpoint(&*self.0, control).await
+	}
+}
+
+/// [`JobControl::checkpoint`], with the job told whether a pause is requested before and after
+/// the wait, and that it winds down when the wait ends in `Err`.
+async fn reported_checkpoint(
+	job: &(impl JobTick + ?Sized),
+	control: &JobControl,
+) -> Result<(), Stopped> {
+	job.set_pause_requested(control.is_pause_requested());
+	let result = control.checkpoint().await;
+	job.set_pause_requested(control.is_pause_requested());
+	if result.is_err() {
+		job.wind_down(control);
+	}
+	result
 }
 
 /// Counts an operation (chunk transfer, create, finalize) as in flight until dropped; a pause is
@@ -349,13 +370,7 @@ impl<S: JobState> Reporter<S> {
 
 	/// Waits out a pause, reporting it; `Err` once the job is stopping.
 	pub(crate) async fn checkpoint(&self, control: &JobControl) -> Result<(), Stopped> {
-		self.set_pause_requested(control.is_pause_requested());
-		let result = control.checkpoint().await;
-		self.set_pause_requested(control.is_pause_requested());
-		if result.is_err() {
-			self.wind_down(control);
-		}
-		result
+		reported_checkpoint(self, control).await
 	}
 
 	/// Records whether a pause is requested; the job counts as paused once no operation is in

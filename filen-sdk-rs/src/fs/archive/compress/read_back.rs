@@ -128,12 +128,7 @@ pub(crate) async fn reads_back<B: DriveBackend>(
 		archive.size(),
 	) {
 		Ok(link) => link,
-		Err(error) => {
-			return Ok(differs(
-				archive,
-				&format!("its reader did not start: {error}"),
-			));
-		}
+		Err(error) => return Ok(unread(archive, &Unread::Failed(error))),
 	};
 	reporter.verifying(archive.size());
 	let reading = Reading {
@@ -144,15 +139,37 @@ pub(crate) async fn reads_back<B: DriveBackend>(
 	};
 	match read(reading, archive, link, checked).await? {
 		Ok(()) => Ok(true),
-		Err(why) => Ok(differs(archive, &why)),
+		Err(why) => Ok(unread(archive, &why)),
 	}
 }
 
-fn differs(archive: &RemoteFile, why: &str) -> bool {
-	tracing::error!(
-		"archive {} does not read back as its sources ({why}): they are kept",
-		archive.uuid()
-	);
+/// Why an archive did not read back as its sources.
+enum Unread {
+	/// It is not what was written: why, for the log.
+	Differs(String),
+	/// Reading it failed: its reader did not start, a chunk could not be fetched, or the reader
+	/// failed or died. The archive may well be right.
+	Failed(Error),
+}
+
+impl From<String> for Unread {
+	fn from(why: String) -> Self {
+		Self::Differs(why)
+	}
+}
+
+/// Logs why `archive` did not read back, which keeps the sources; `false`.
+fn unread(archive: &RemoteFile, why: &Unread) -> bool {
+	match why {
+		Unread::Differs(why) => tracing::error!(
+			"archive {} does not read back as its sources ({why}): they are kept",
+			archive.uuid()
+		),
+		Unread::Failed(error) => tracing::warn!(
+			"archive {}: failed to read it back, so its sources are kept: {error}",
+			archive.uuid()
+		),
+	}
 	false
 }
 
@@ -235,7 +252,7 @@ struct Reading<'a, B> {
 }
 
 /// Serves the reading codec the archive's chunks and checks what it reads; the outer `Err` once
-/// the job stops, the inner one with why the archive differs.
+/// the job stops, the inner one with why the archive did not read back.
 async fn read<B: DriveBackend>(
 	Reading {
 		backend,
@@ -246,7 +263,7 @@ async fn read<B: DriveBackend>(
 	archive: &RemoteFile,
 	link: WorkerLink<ReadBackResult>,
 	mut check: Check,
-) -> Result<Result<(), String>, Stopped> {
+) -> Result<Result<(), Unread>, Stopped> {
 	let floor = control.until_stopping(config.floor()).await?;
 	let file = Arc::new(RemoteFileType::from(archive.clone()));
 	let mut feed = CodecFeed::new(Arc::clone(backend), file, link, (floor, reporter.op()));
@@ -280,21 +297,21 @@ async fn read<B: DriveBackend>(
 			() = control.stopping() => {},
 			() = control.pause_changed(pause_requested) => {},
 			fed = feed.next(true, true) => match fed {
-				Fed::Fetched(Err(error)) => return Ok(Err(format!("reading it failed: {error}"))),
+				Fed::Fetched(Err(error)) => return Ok(Err(Unread::Failed(error))),
 				Fed::Fetched(Ok(())) | Fed::Asked => report_verified(&feed),
 				Fed::Event(event) => {
 					if let Err(why) = check.take(event) {
-						return Ok(Err(why));
+						return Ok(Err(why.into()));
 					}
 				}
 				Fed::EventsClosed => {}
-				Fed::Finished(Ok(end)) => return Ok(check.complete(&end)),
-				Fed::Finished(Err(error)) => return Ok(Err(error.to_string())),
+				Fed::Finished(Ok(end)) => return Ok(check.complete(&end).map_err(Unread::from)),
+				Fed::Finished(Err(error)) => return Ok(Err(Unread::Failed(error))),
 			},
 			() = sleep(CALLBACK_INTERVAL) => {
 				reporter.tick();
 				if feed.give_up_if_stalled(pause_requested) {
-					return Ok(Err(worker_died().to_string()));
+					return Ok(Err(Unread::Failed(worker_died())));
 				}
 			}
 		}

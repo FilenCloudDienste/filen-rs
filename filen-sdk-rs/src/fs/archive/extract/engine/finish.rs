@@ -2,7 +2,7 @@
 //! meanwhile, and the archive removed once what it held is verified to be in the drive; or, after
 //! a wrong password showed late, the directories it created trashed.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use filen_types::fs::Uuid;
 use futures::future::join_all;
@@ -15,8 +15,8 @@ use crate::{
 		HasUUID,
 		archive::{
 			dispose::{
-				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree,
-				dispose_file,
+				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, Removing,
+				SourceDisposal, Tree, dispose_file,
 			},
 			format::ArchiveFormat,
 			names::ROOT,
@@ -29,12 +29,18 @@ use crate::{
 		file::traits::HasRemoteFileInfo,
 	},
 	job::Stopped,
+	util::sleep,
 };
 
 use super::{
 	super::report::{ExtractEvent, ExtractTopLevelKey, ExtractTopLevelTrashed, ExtractedTopLevel},
 	Driver,
 };
+
+/// How long an extraction that found its password wrong late waits for the drive lock to trash
+/// the directories it created, before it leaves them: the job has already ended, and nothing
+/// else would end the wait while another client holds the lock.
+pub(super) const LATE_TRASH_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 impl<B: DisposalBackend> Driver<B> {
 	/// The destination may have been shared or linked while the extraction ran; items created
@@ -161,7 +167,13 @@ impl<B: DisposalBackend> Driver<B> {
 			});
 		}
 		let archive = ExpectedFile::of(&*self.archive, self.archive.uuid(), parent);
-		dispose_file(&*self.backend, archive, how, &self.control).await
+		let ops = self.reporter.ops();
+		let removing = Removing {
+			control: &self.control,
+			ops: &ops,
+			output: None,
+		};
+		dispose_file(&*self.backend, archive, how, removing).await
 	}
 
 	/// Whether the server holds exactly what the counts say was created: every file at its size
@@ -179,7 +191,8 @@ impl<B: DisposalBackend> Driver<B> {
 				.await;
 			match listed {
 				Ok(Ok(tree)) => found = tree,
-				Ok(Err(_)) | Err(Stopped) => return false,
+				Ok(Err(error)) => return self.unconfirmed(&error),
+				Err(Stopped) => return false,
 			}
 			// the folder itself
 			found.dirs.insert(self.dirs[ROOT].uuid);
@@ -213,11 +226,14 @@ impl<B: DisposalBackend> Driver<B> {
 				return false;
 			};
 			for tree in listed {
-				let Some(tree) = tree else {
-					return false;
-				};
-				found.dirs.extend(tree.dirs);
-				found.files.extend(tree.files);
+				match tree {
+					Ok(Some(tree)) => {
+						found.dirs.extend(tree.dirs);
+						found.files.extend(tree.files);
+					}
+					Ok(None) => return false,
+					Err(error) => return self.unconfirmed(&error),
+				}
 			}
 			self.reporter.tick();
 		}
@@ -232,11 +248,22 @@ impl<B: DisposalBackend> Driver<B> {
 			&& found.digest() == self.created_digest
 	}
 
+	/// Logs a request that failed while confirming the output, which keeps the archive as
+	/// unconfirmed.
+	fn unconfirmed(&self, error: &Error) -> bool {
+		tracing::warn!(
+			"archive {}: failed to confirm the extracted items: {error}",
+			self.archive.uuid()
+		);
+		false
+	}
+
 	/// A wrong password that only showed once entries were read (no entry was small enough to
 	/// check it on first) leaves the directories created so far and no file: they go to the
 	/// trash, so a retry with the right password starts clean, and out of the report's top-level
 	/// items. Trashed, never deleted: they can be restored. A directory that now holds a file, or
-	/// that could not be listed or trashed, is kept; the report's top-level items list what was
+	/// that could not be listed or trashed, is kept, as all of them are when the drive lock is
+	/// not had within [`LATE_TRASH_LOCK_WAIT`]; the report's top-level items list what was
 	/// kept.
 	pub(super) async fn trash_created_dirs(&mut self) {
 		let dirs = self
@@ -254,6 +281,34 @@ impl<B: DisposalBackend> Driver<B> {
 					.map(|(uuid, _)| *uuid),
 			)
 			.collect::<Vec<_>>();
+		if dirs.is_empty() {
+			return;
+		}
+		// the job has already stopped, so the lock is taken directly rather than through a wait
+		// a stop would end, and for a bounded time; holding it, nothing written under the lock
+		// lands between a folder's listing and its removal
+		let lock = tokio::select! {
+			lock = self.backend.acquire_drive_lock() => lock,
+			() = sleep(LATE_TRASH_LOCK_WAIT) => {
+				tracing::warn!(
+					"archive {}: the drive lock was not had within {LATE_TRASH_LOCK_WAIT:?}, so \
+					 the directories created before the wrong password showed are kept",
+					self.archive.uuid()
+				);
+				return;
+			}
+		};
+		let _lock = match lock {
+			Ok(lock) => lock,
+			Err(error) => {
+				tracing::warn!(
+					"archive {}: failed to lock the drive to trash the directories created \
+					 before the wrong password showed: {error}",
+					self.archive.uuid()
+				);
+				return;
+			}
+		};
 		let mut trashed = HashSet::new();
 		for uuid in dirs {
 			// the job created no file: one in there now is someone else's, and keeps the folder
@@ -315,18 +370,22 @@ async fn propagate_top_level<B: DisposalBackend>(
 }
 
 /// What the server holds of a top-level item the job created: itself, and everything below a
-/// directory; `None` if it could not be listed, or is a file in the trash.
-async fn created_tree<B: DisposalBackend>(backend: &B, uuid: Uuid, is_dir: bool) -> Option<Tree> {
+/// directory; `None` for a file in the trash.
+async fn created_tree<B: DisposalBackend>(
+	backend: &B,
+	uuid: Uuid,
+	is_dir: bool,
+) -> Result<Option<Tree>, Error> {
 	let mut tree = Tree::default();
 	if is_dir {
-		tree = backend.list_tree(uuid).await.ok()?;
+		tree = backend.list_tree(uuid).await?;
 		tree.dirs.insert(uuid);
 	} else {
-		let state = backend.file_state(uuid).await.ok()?;
+		let state = backend.file_state(uuid).await?;
 		if state.trash {
-			return None;
+			return Ok(None);
 		}
 		tree.files.insert(uuid, state.size);
 	}
-	Some(tree)
+	Ok(Some(tree))
 }

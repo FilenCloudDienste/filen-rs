@@ -1,7 +1,13 @@
 //! The driver against the fake drive, with the real codec on its thread; the archive the fake
 //! received is put back together and read with the SDK's own decoders.
 
-use std::{borrow::Cow, collections::BTreeMap, io::Read, sync::Mutex, time::Duration};
+use std::{
+	borrow::Cow,
+	collections::BTreeMap,
+	io::Read,
+	sync::{Mutex, atomic::Ordering},
+	time::Duration,
+};
 
 use tokio::{
 	sync::{Semaphore, mpsc},
@@ -22,7 +28,9 @@ use crate::{
 			},
 			config::{CODEC_MEM_BUDGET, JOB_CONCURRENCY},
 			decode::open_stream,
-			dispose::{DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal, Tree},
+			dispose::{
+				DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, SourceDisposal, Tree,
+			},
 			encode::Compression,
 			entry_path::entry_path,
 			extract::{PasswordCheck, codec::ArchiveEnd},
@@ -633,10 +641,11 @@ fn targets(setup: &Setup, placed: &Placed) -> Vec<DisposalTarget> {
 	};
 	let top = &setup.sources[2].1;
 	vec![
-		DisposalTarget::Dir {
+		DisposalTarget::Dir(ExpectedDir {
 			uuid: placed.docs,
+			parent: placed.parent,
 			read,
-		},
+		}),
 		DisposalTarget::File(ExpectedFile::of(top, top.uuid(), placed.parent)),
 	]
 }
@@ -1187,8 +1196,9 @@ async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
 	let targets = vec![
-		DisposalTarget::Dir {
+		DisposalTarget::Dir(ExpectedDir {
 			uuid: docs,
+			parent: PLACED_PARENT,
 			read: Tree {
 				files: [&a, &big, &top]
 					.iter()
@@ -1196,7 +1206,7 @@ async fn a_file_a_partial_removal_did_not_reach_is_kept() {
 					.collect(),
 				dirs: Default::default(),
 			},
-		},
+		}),
 		DisposalTarget::File(ExpectedFile::of(&a, a.uuid(), docs)),
 	];
 	let job = run_permanent_disposal(&setup, targets, JobControl::default());
@@ -1227,8 +1237,9 @@ async fn a_file_a_partial_removal_took_is_reported_removed() {
 		setup.backend.place_file(file.uuid(), docs, file.size());
 	}
 	let targets = vec![
-		DisposalTarget::Dir {
+		DisposalTarget::Dir(ExpectedDir {
 			uuid: docs,
+			parent: PLACED_PARENT,
 			read: Tree {
 				files: [&a, &big, &top]
 					.iter()
@@ -1236,7 +1247,7 @@ async fn a_file_a_partial_removal_took_is_reported_removed() {
 					.collect(),
 				dirs: Default::default(),
 			},
-		},
+		}),
 		DisposalTarget::File(ExpectedFile::of(&a, a.uuid(), docs)),
 	];
 	let job = run_permanent_disposal(&setup, targets, JobControl::default());
@@ -1270,12 +1281,15 @@ async fn a_file_a_partial_removal_took_is_reported_removed() {
 async fn folders_whose_reads_hold_each_other_are_kept() {
 	let setup = setup(|_, _| {});
 	let [x, y] = [Uuid::from_u128(0x7B), Uuid::from_u128(0x7C)];
-	let holding = |other| DisposalTarget::Dir {
-		uuid: if other == y { x } else { y },
-		read: Tree {
-			files: Default::default(),
-			dirs: [other].into(),
-		},
+	let holding = |other| {
+		DisposalTarget::Dir(ExpectedDir {
+			uuid: if other == y { x } else { y },
+			parent: PLACED_PARENT,
+			read: Tree {
+				files: Default::default(),
+				dirs: [other].into(),
+			},
+		})
 	};
 	let targets = vec![holding(y), holding(x)];
 	let job = run_permanent_disposal(&setup, targets, JobControl::default());
@@ -2183,4 +2197,88 @@ fn an_unreachable_record_counts_every_entry_it_stands_for() {
 	);
 	assert_eq!(reporter.counts().entries_skipped, 4);
 	assert_eq!(reporter.counts().bytes_skipped, 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_folder_moved_since_it_was_read_is_kept() {
+	let setup = setup(|_, _| {});
+	let placed = place(&setup);
+	let targets = targets(&setup, &placed);
+	// the folder moved, with everything in it, after the job read it
+	setup.backend.place_dir(placed.docs, Uuid::from_u128(0x72));
+	let job = run_permanent_disposal(&setup, targets, JobControl::default());
+	let report = job.running.await.unwrap().unwrap();
+	let outcomes = outcomes(&report);
+	assert!(
+		matches!(
+			&outcomes[0],
+			DisposalOutcome::Kept {
+				reason: KeptReason::Changed,
+				bytes_freed: 0
+			}
+		),
+		"{outcomes:?}"
+	);
+	assert!(matches!(&outcomes[1], DisposalOutcome::Disposed { .. }));
+	let log = setup.backend.log();
+	assert_eq!(
+		log.deleted_files,
+		[setup.sources[2].1.uuid()],
+		"nothing in the folder is deleted"
+	);
+	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_while_removing_holds_no_lock_and_removes_nothing() {
+	let setup = setup(|backend, _| {
+		// registering the archive takes the first lock; the removals wait for theirs
+		backend.block_locks_from.send_replace(Some(1));
+	});
+	let placed = place(&setup);
+	let targets = targets(&setup, &placed);
+	let (pause, _cancel, control) = controls();
+	let job = run_permanent_disposal(&setup, targets, control);
+
+	wait_until("a removal waits for the drive lock", || {
+		setup.backend.log().lock_waits == 1
+	})
+	.await;
+	pause.send_replace(true);
+	wait_until("the job is paused", || job.reporter.is_paused()).await;
+	assert_eq!(
+		setup.backend.live_locks.load(Ordering::SeqCst),
+		0,
+		"a paused job holds no lock"
+	);
+	// nor waits for one: with no ask for the lock left pending, a lock coming free lets
+	// nothing through
+	assert_eq!(
+		setup.backend.block_locks_from.receiver_count(),
+		0,
+		"a paused job waits for no lock"
+	);
+	{
+		let log = setup.backend.log();
+		assert!(
+			log.deleted_files.is_empty() && log.trashed_dirs.is_empty(),
+			"nothing is removed while paused"
+		);
+	}
+
+	setup.backend.block_locks_from.send_replace(None);
+	pause.send_replace(false);
+	let report = job.running.await.unwrap().unwrap();
+	for outcome in outcomes(&report) {
+		assert!(
+			matches!(outcome, DisposalOutcome::Disposed { .. }),
+			"{outcome:?}"
+		);
+	}
+	assert_eq!(
+		setup.backend.log().lock_waits,
+		1,
+		"the paused job asked for no lock while they were held back"
+	);
+	setup.backend.assert_released(&job.reporter);
 }

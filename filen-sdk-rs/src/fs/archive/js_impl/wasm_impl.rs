@@ -54,7 +54,11 @@ pub struct ExtractArchiveParams {
 	#[serde(default)]
 	#[tsify(optional)]
 	pub skip_mac_metadata: Option<bool>,
-	/// Removes the archive once everything in it was extracted and verified.
+	/// Removes the archive once everything in it was extracted and verified. A tar or a single
+	/// compressed file is verified by its hash, read front to back; a zip or a 7z by every
+	/// entry's own checksum and every entry having been extracted, not by a whole-archive hash.
+	/// macOS metadata left out (`skipMacMetadata`) does not keep it: removed for good, the
+	/// archive takes what was left out with it.
 	#[serde(default)]
 	#[tsify(optional)]
 	pub dispose: Option<SourceDisposal>,

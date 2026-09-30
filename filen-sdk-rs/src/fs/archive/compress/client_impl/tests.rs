@@ -288,6 +288,7 @@ fn disposal_targets_hold_exactly_what_was_read() {
 		Uuid::from_u128(0xB0).into(),
 		DateTime::<Utc>::UNIX_EPOCH,
 	);
+	let photos_parent = Uuid::try_from(photos_dir.parent).unwrap();
 	let mut normal_top = RemoteFile::from_meta(
 		top.uuid(),
 		filen_types::fs::StableUuid::new_for_test(top.uuid()),
@@ -319,14 +320,16 @@ fn disposal_targets_hold_exactly_what_was_read() {
 		[false, false],
 		"the plan's files carry no hash"
 	);
-	let [
-		DisposalTarget::Dir { uuid, read },
-		DisposalTarget::File(file),
-	] = &disposal.targets[..]
-	else {
+	let [DisposalTarget::Dir(dir), DisposalTarget::File(file)] = &disposal.targets[..] else {
 		panic!("{:?}", disposal.targets);
 	};
+	let ExpectedDir {
+		uuid,
+		parent: dir_parent,
+		read,
+	} = dir;
 	assert_eq!(*uuid, photos.source_uuid);
+	assert_eq!(*dir_parent, photos_parent);
 	assert_eq!(read.dirs, [year.source_uuid].into_iter().collect());
 	let sizes: Vec<u64> = read.files.values().copied().collect();
 	assert_eq!(read.files.len(), 2);
@@ -356,6 +359,19 @@ fn disposal_targets_hold_exactly_what_was_read() {
 	let disposal = disposal_of(&plan, items(&normal_top), Uuid::new_v4()).unwrap();
 	assert!(matches!(
 		disposal.targets[1],
+		DisposalTarget::Unavailable { .. }
+	));
+
+	// and so is a directory in the trash
+	let mut trashed_photos = photos_dir.clone();
+	trashed_photos.parent = filen_types::fs::ParentUuid::Trash(photos_parent);
+	let items = vec![
+		NonRootItemType::Dir(Cow::Owned(trashed_photos)),
+		NonRootItemType::File(Cow::Owned(normal_top)),
+	];
+	let disposal = disposal_of(&plan, items, Uuid::new_v4()).unwrap();
+	assert!(matches!(
+		disposal.targets[0],
 		DisposalTarget::Unavailable { .. }
 	));
 }

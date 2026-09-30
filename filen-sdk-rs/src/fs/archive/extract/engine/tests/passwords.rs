@@ -5,6 +5,7 @@ use super::{
 	dispose::{disposable, disposition},
 	*,
 };
+use crate::fs::archive::extract::engine::finish::LATE_TRASH_LOCK_WAIT;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracts_an_encrypted_zip_and_removes_it() {
@@ -261,4 +262,41 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		})
 		.collect();
 	assert_eq!(trashed, [root], "and is told it went to the trash");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wrong_password_found_late_keeps_the_directories_when_the_lock_does_not_come() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |_| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	events
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
+		.await
+		.unwrap();
+	events.send(dir_entry(0, "docs")).await.unwrap();
+	wait_until("the folders are created", || {
+		created_dirs(&setup) == ["bundle", "docs"]
+	})
+	.await;
+	// another client holds the lock from now on
+	let calls = setup.backend.lock_calls.load(Ordering::SeqCst);
+	setup.backend.block_locks_from.send_replace(Some(calls));
+	drop(events);
+	result
+		.send(Err(Error::custom(ErrorKind::ArchiveWrongPassword, "wrong")))
+		.unwrap();
+	let failed = tokio::time::timeout(2 * LATE_TRASH_LOCK_WAIT, job.running)
+		.await
+		.expect("the wait for the lock ends")
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	let log = setup.backend.log();
+	assert_eq!(log.lock_waits, 1, "the job waited for the lock");
+	assert!(log.trashed_dirs.is_empty());
+	assert_eq!(
+		failed.report.top_level.len(),
+		1,
+		"the report still lists the folder it kept"
+	);
 }

@@ -12,7 +12,7 @@ use crate::{
 		HasUUID,
 		archive::{
 			ArchiveConfig, ArchivePassword,
-			dispose::{ExpectedFile, SourceDisposal, Tree},
+			dispose::{ExpectedDir, ExpectedFile, SourceDisposal, Tree},
 			limits::{MAX_ARCHIVE_PATH_BYTES, MAX_ARCHIVE_PATH_DEPTH},
 			worker,
 		},
@@ -367,7 +367,8 @@ async fn plan_sources(
 }
 
 /// What removing `items`, the job's sources in request order, has to find unchanged: a file as
-/// it was listed, a directory holding exactly the files and directories the plan read below it.
+/// it was listed, a directory where it was listed and holding exactly the files and directories
+/// the plan read below it.
 fn disposal<D>(
 	plan: &ItemPlan<D>,
 	how: SourceDisposal,
@@ -402,12 +403,16 @@ fn disposal<D>(
 					.filter(|planned| planned.request == request)
 					.map(|planned| (planned.source.uuid(), planned.size))
 					.collect();
-				DisposalTarget::Dir {
-					uuid,
-					read: Tree {
-						files,
-						dirs: below.into_iter().collect(),
-					},
+				match Uuid::try_from(dir.parent) {
+					Ok(parent) => DisposalTarget::Dir(ExpectedDir {
+						uuid,
+						parent,
+						read: Tree {
+							files,
+							dirs: below.into_iter().collect(),
+						},
+					}),
+					Err(_) => DisposalTarget::Unavailable { uuid },
 				}
 			}
 		});

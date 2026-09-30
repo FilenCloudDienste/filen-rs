@@ -34,9 +34,9 @@ use crate::{
 		archive::{
 			config::{ArchiveConfig, CHUNK_BYTES},
 			dispose::{
-				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, Nesting,
-				SourceDisposal, SourceDisposition, Tree, dispose_dir, dispose_file,
-				kept_on_early_end, nesting,
+				DisposalBackend, DisposalOutcome, ExpectedDir, ExpectedFile, KeptReason, Nesting,
+				Removing, SourceDisposal, SourceDisposition, WrittenFile, dispose_dir,
+				dispose_file, kept_on_early_end, nesting,
 			},
 			hash::HeadLastHasher,
 			limits::MAX_REPORT_RECORDS,
@@ -129,10 +129,7 @@ pub(crate) struct CompressDisposal {
 #[derive(Debug)]
 pub(crate) enum DisposalTarget {
 	File(ExpectedFile),
-	Dir {
-		uuid: Uuid,
-		read: Tree,
-	},
+	Dir(ExpectedDir),
 	/// A source whose state the job cannot compare against (it is in the trash).
 	Unavailable {
 		uuid: Uuid,
@@ -828,7 +825,13 @@ impl<B: DisposalBackend> Driver<B> {
 			let outcome = match held_back {
 				Some(reason) => DisposalOutcome::kept(reason),
 				None => {
-					dispose_target(&*self.backend, &self.control, target, how, &mut deleted).await
+					let ops = self.reporter.ops();
+					let removing = Removing {
+						control: &self.control,
+						ops: &ops,
+						output: Some(self.written_archive(archive)),
+					};
+					dispose_target(&*self.backend, removing, target, how, &mut deleted).await
 				}
 			};
 			// the source and those that go with it are told of as soon as its outcome is final
@@ -890,16 +893,27 @@ impl<B: DisposalBackend> Driver<B> {
 			.until_stopping(self.backend.file_state(archive.uuid()))
 			.await;
 		match state {
-			Ok(Ok(state))
-				if !state.trash
-					&& !state.versioned
-					&& state.size == self.written
-					&& state.chunks == self.next_index =>
-			{
+			Ok(Ok(state)) if self.written_archive(archive).stands(&state) => {
 				self.read_back(how, archive, read_back).await
 			}
-			Ok(_) => Some(KeptReason::Unconfirmed),
+			Ok(Ok(_)) => Some(KeptReason::Unconfirmed),
+			Ok(Err(error)) => {
+				tracing::warn!(
+					"archive {}: failed to confirm it before removing its sources: {error}",
+					archive.uuid()
+				);
+				Some(KeptReason::Unconfirmed)
+			}
 			Err(Stopped) => Some(KeptReason::Interrupted),
+		}
+	}
+
+	/// `archive` as the job wrote it, which the sources are only removed while it still stands.
+	fn written_archive(&self, archive: &RemoteFile) -> WrittenFile {
+		WrittenFile {
+			uuid: archive.uuid(),
+			size: self.written,
+			chunks: self.next_index,
 		}
 	}
 
@@ -1010,7 +1024,8 @@ impl DisposalTarget {
 	fn uuid(&self) -> Uuid {
 		match self {
 			Self::File(file) => file.uuid,
-			Self::Dir { uuid, .. } | Self::Unavailable { uuid } => *uuid,
+			Self::Dir(dir) => dir.uuid,
+			Self::Unavailable { uuid } => *uuid,
 		}
 	}
 }
@@ -1019,16 +1034,14 @@ impl DisposalTarget {
 /// adds the files it deleted to `deleted`, even when it stopped part way.
 async fn dispose_target<B: DisposalBackend>(
 	backend: &B,
-	control: &JobControl,
+	removing: Removing<'_>,
 	target: DisposalTarget,
 	how: SourceDisposal,
 	deleted: &mut BTreeSet<Uuid>,
 ) -> DisposalOutcome {
 	match target {
-		DisposalTarget::File(file) => dispose_file(backend, file, how, control).await,
-		DisposalTarget::Dir { uuid, read } => {
-			dispose_dir(backend, uuid, &read, how, control, deleted).await
-		}
+		DisposalTarget::File(file) => dispose_file(backend, file, how, removing).await,
+		DisposalTarget::Dir(dir) => dispose_dir(backend, &dir, how, removing, deleted).await,
 		DisposalTarget::Unavailable { .. } => DisposalOutcome::kept(KeptReason::Changed),
 	}
 }
@@ -1046,13 +1059,14 @@ fn enclosing(targets: &[DisposalTarget]) -> Vec<Option<usize>> {
 					// the same item given twice goes with its first
 					&& (other < index && outer.uuid() == target.uuid()
 						|| match (target, outer) {
-						(DisposalTarget::File(file), DisposalTarget::Dir { read, .. }) => {
-							read.files.contains_key(&file.uuid)
+						(DisposalTarget::File(file), DisposalTarget::Dir(outer)) => {
+							outer.read.files.contains_key(&file.uuid)
 						}
 						(
-							DisposalTarget::Dir { uuid, .. } | DisposalTarget::Unavailable { uuid },
-							DisposalTarget::Dir { read, .. },
-						) => read.dirs.contains(uuid) || read.files.contains_key(uuid),
+							DisposalTarget::Dir(ExpectedDir { uuid, .. })
+							| DisposalTarget::Unavailable { uuid },
+							DisposalTarget::Dir(outer),
+						) => outer.read.dirs.contains(uuid) || outer.read.files.contains_key(uuid),
 						_ => false,
 					})
 			})

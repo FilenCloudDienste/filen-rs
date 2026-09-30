@@ -666,7 +666,7 @@ impl DriveBackend for FakeBackend {
 #[cfg(feature = "archive")]
 mod disposal {
 	use super::*;
-	use crate::fs::archive::dispose::{DisposalBackend, FileState, Tree};
+	use crate::fs::archive::dispose::{DirState, DisposalBackend, FileState, Tree};
 	use filen_types::fs::ParentUuid;
 
 	impl FakeBackend {
@@ -677,9 +677,16 @@ mod disposal {
 				.insert(uuid, (parent, size, size.div_ceil(CHUNK_SIZE_U64)));
 		}
 
-		/// Places an existing directory in the fake drive.
+		/// Places an existing directory in the fake drive, or moves one already there.
 		pub(crate) fn place_dir(&self, uuid: Uuid, parent: Uuid) {
 			self.log().dir_parents.insert(uuid, parent);
+		}
+
+		fn assert_locked(&self) {
+			assert!(
+				self.live_locks.load(Ordering::SeqCst) > 0,
+				"removals hold the drive lock"
+			);
 		}
 	}
 
@@ -700,6 +707,21 @@ mod disposal {
 					Err(Error::custom(ErrorKind::FileNotFound, "trashed"))
 				}
 				None => Err(Error::custom(ErrorKind::FileNotFound, "no such file")),
+			}
+		}
+
+		async fn dir_state(&self, uuid: Uuid) -> Result<DirState, Error> {
+			self.hold(Request::State, uuid).await;
+			tokio::time::sleep(self.delay).await;
+			match self.log().dir_parents.get(&uuid) {
+				Some(&parent) => Ok(DirState {
+					parent: ParentUuid::Uuid(parent),
+					trash: false,
+				}),
+				None => Err(Error::custom(
+					ErrorKind::FolderNotFound,
+					"no such directory",
+				)),
 			}
 		}
 
@@ -725,6 +747,7 @@ mod disposal {
 		}
 
 		async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
+			self.assert_locked();
 			let mut log = self.log();
 			log.file_parents.remove(&uuid);
 			log.trashed_files.push(uuid);
@@ -732,6 +755,7 @@ mod disposal {
 		}
 
 		async fn delete_file_permanently(&self, uuid: Uuid) -> Result<(), Error> {
+			self.assert_locked();
 			self.hold(Request::Delete, uuid).await;
 			if self.fail_deletes_of.contains(&uuid) {
 				return Err(Error::custom(ErrorKind::Server, "delete failed"));
@@ -743,6 +767,7 @@ mod disposal {
 		}
 
 		async fn trash_dir(&self, uuid: Uuid) -> Result<(), Error> {
+			self.assert_locked();
 			let mut log = self.log();
 			// the whole subtree goes with it
 			let mut gone = vec![uuid];

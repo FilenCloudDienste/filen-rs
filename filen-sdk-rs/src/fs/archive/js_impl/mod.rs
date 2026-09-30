@@ -91,7 +91,8 @@ pub enum ArchiveKeptReason {
 	/// What was read does not match the hash in the source's metadata.
 	HashMismatch,
 	/// The source's metadata holds no hash to check what was read against, which a permanent
-	/// deletion requires.
+	/// deletion requires. Never given for a zip or 7z archive: every entry's own checksum, and
+	/// every entry having been extracted, confirm those instead of a whole-archive hash.
 	HashUnavailable,
 	/// The source changed since the job read it: it moved, was trashed, got a new version, or
 	/// holds other items now.
@@ -99,7 +100,9 @@ pub enum ArchiveKeptReason {
 	/// The job's output could not be confirmed: the server did not hold what was created, the
 	/// archive was not read in full, or something the job extracted was checked by nothing (a
 	/// 7z entry without a CRC-32, or the files of a brotli or LZMA-alone stream, or of an lz4,
-	/// xz or zstd stream written without its optional checksum).
+	/// xz or zstd stream written without its optional checksum). Before a permanent deletion,
+	/// also an archive a compression wrote that does not read back as its sources, or could not
+	/// be read back (a request or its reader failed).
 	Unconfirmed,
 	/// Deleting it for good would lose the older versions of a file in it.
 	HasVersions,
