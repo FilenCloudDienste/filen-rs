@@ -16,7 +16,7 @@ use chrono::TimeZone;
 
 use super::*;
 use crate::fs::archive::{
-	test_support::{damaged_copies, pattern},
+	test_support::{archive_password, damaged_copies, pattern},
 	zip::write::{Encryption, ZipMethod, ZipWriter},
 };
 
@@ -32,7 +32,7 @@ const ENTRY: EntryLimits = EntryLimits {
 /// Every entry of `zip`, read through the reader: name, kind and data.
 fn read_all(
 	zip: &[u8],
-	password: Option<&[u8]>,
+	password: Option<&str>,
 ) -> Result<Vec<(String, ZipKind, Vec<u8>)>, ZipError> {
 	read_source(&mut Cursor::new(zip), zip.len() as u64, password)
 }
@@ -41,14 +41,15 @@ fn read_all(
 fn read_source<R: Read + Seek>(
 	source: &mut R,
 	len: u64,
-	password: Option<&[u8]>,
+	password: Option<&str>,
 ) -> Result<Vec<(String, ZipKind, Vec<u8>)>, ZipError> {
+	let password = password.map(archive_password);
 	let index = read_index(source, len, LIMITS)?;
 	let mut out = Vec::new();
 	for entry in &index.entries {
 		let mut data = Vec::new();
 		if entry.kind == ZipKind::File {
-			open_entry(source, index.shift, entry, password, ENTRY)?
+			open_entry(source, index.shift, entry, password.as_ref(), ENTRY)?
 				.read_to_end(&mut data)
 				.map_err(
 					|e| match e.into_inner().map(|inner| inner.downcast::<ZipError>()) {
@@ -66,7 +67,7 @@ fn read_source<R: Read + Seek>(
 fn ours(
 	entries: &[(&str, Option<&[u8]>)],
 	method: ZipMethod,
-	password: Option<(&[u8], AesStrength)>,
+	password: Option<(&str, AesStrength)>,
 ) -> Vec<u8> {
 	written_by(ZipWriter::new(Vec::new()), entries, method, password)
 }
@@ -76,16 +77,17 @@ fn written_by(
 	mut writer: ZipWriter<Vec<u8>>,
 	entries: &[(&str, Option<&[u8]>)],
 	method: ZipMethod,
-	password: Option<(&[u8], AesStrength)>,
+	password: Option<(&str, AesStrength)>,
 ) -> Vec<u8> {
 	let when = Some(Utc.with_ymd_and_hms(2024, 5, 6, 7, 8, 10).unwrap());
+	let password = password.map(|(password, strength)| (archive_password(password), strength));
 	for (path, data) in entries {
 		match data {
 			None => writer.add_dir(path, when).unwrap(),
 			Some(data) => {
-				let encryption = password.map(|(password, strength)| Encryption {
+				let encryption = password.as_ref().map(|(password, strength)| Encryption {
 					password,
-					strength,
+					strength: *strength,
 					salt: vec![3; strength.salt_len()],
 				});
 				let read = writer
@@ -144,9 +146,9 @@ fn our_zips_read_back_with_every_method_and_encryption() {
 			let zip = ours(
 				&borrowed(&sample),
 				method,
-				encryption.map(|strength| (&b"pw"[..], strength)),
+				encryption.map(|strength| ("pw", strength)),
 			);
-			let read = read_all(&zip, encryption.map(|_| &b"pw"[..])).unwrap();
+			let read = read_all(&zip, encryption.map(|_| "pw")).unwrap();
 			assert_eq!(read, expected(&sample), "{method:?} {encryption:?}");
 		}
 	}
@@ -164,7 +166,7 @@ fn the_zip_crate_reads_our_zips() {
 		let zip = ours(
 			&borrowed(&sample),
 			method,
-			encryption.map(|strength| (&b"pw"[..], strength)),
+			encryption.map(|strength| ("pw", strength)),
 		);
 		let mut archive = ::zip::ZipArchive::new(Cursor::new(&zip)).unwrap();
 		assert_eq!(archive.len(), sample.len());
@@ -210,7 +212,7 @@ fn we_read_the_zip_crates_zips() {
 			}
 		}
 		let zip = writer.finish().unwrap().into_inner();
-		let read = read_all(&zip, aes.map(|_| &b"pw"[..])).unwrap();
+		let read = read_all(&zip, aes.map(|_| "pw")).unwrap();
 		assert_eq!(read, expected(&sample), "{method:?} {aes:?}");
 	}
 }
@@ -246,7 +248,7 @@ fn we_read_the_zip_crates_zip_crypto() {
 			"{method:?}"
 		);
 		assert_eq!(
-			read_all(&zip, Some(b"pw")).unwrap(),
+			read_all(&zip, Some("pw")).unwrap(),
 			expected(&sample),
 			"{method:?}"
 		);
@@ -258,17 +260,17 @@ fn passwords_are_asked_for_and_checked() {
 	let zip = ours(
 		&[("secret.txt", Some(&b"secret"[..]))],
 		ZipMethod::Deflate { level: 6 },
-		Some((&b"right"[..], AesStrength::Aes256)),
+		Some(("right", AesStrength::Aes256)),
 	);
 	assert!(matches!(
 		read_all(&zip, None),
 		Err(ZipError::PasswordRequired)
 	));
 	assert!(matches!(
-		read_all(&zip, Some(b"wrong")),
+		read_all(&zip, Some("wrong")),
 		Err(ZipError::WrongPassword)
 	));
-	assert_eq!(read_all(&zip, Some(b"right")).unwrap()[0].2, b"secret");
+	assert_eq!(read_all(&zip, Some("right")).unwrap()[0].2, b"secret");
 }
 
 #[test]

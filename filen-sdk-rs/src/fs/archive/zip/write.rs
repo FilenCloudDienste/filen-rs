@@ -13,7 +13,10 @@ use std::{
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use filen_macros::js_type;
 
-use crate::{Error, fs::archive::encode::check_level};
+use crate::{
+	Error,
+	fs::archive::{encode::check_level, password::ArchivePassword},
+};
 
 use super::{
 	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
@@ -85,7 +88,7 @@ impl ZipMethod {
 
 /// How an entry is encrypted, with its salt.
 pub(crate) struct Encryption<'p> {
-	pub(crate) password: &'p [u8],
+	pub(crate) password: &'p ArchivePassword,
 	pub(crate) strength: AesStrength,
 	pub(crate) salt: Vec<u8>,
 }

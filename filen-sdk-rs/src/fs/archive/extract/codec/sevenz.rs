@@ -8,7 +8,6 @@ use crate::{
 		entry_path::entry_path,
 		format::ArchiveFormat,
 		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
-		password::ArchivePassword,
 		sevenz::{
 			SevenZError,
 			read::{
@@ -183,11 +182,10 @@ pub(super) fn extract_sevenz(
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
 	let port = walk.port;
-	let password = job.password.as_ref().map(ArchivePassword::utf16le);
 	// a derivation exchanges nothing with the driver for up to a minute: without this it would
 	// be given up on as a dead codec, and a cancel would wait it out
 	let keep_alive = || port.keep_alive();
-	let mut keys = Keys::new(password.as_ref().map(|password| &password[..])).on_round(&keep_alive);
+	let mut keys = Keys::new(job.password.as_ref()).on_round(&keep_alive);
 	let limits = SevenZLimits {
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
@@ -205,7 +203,7 @@ pub(super) fn extract_sevenz(
 			&mut cursor,
 			&index,
 			&mut keys,
-			password.is_some(),
+			job.password.is_some(),
 			job,
 		);
 	}
@@ -238,7 +236,7 @@ pub(super) fn extract_sevenz(
 			.is_some_and(|stream| index.folders[stream.folder].encrypted())
 	};
 	let mut verified =
-		match check_sevenz_password(&mut cursor, &index, &mut keys, password.is_some())? {
+		match check_sevenz_password(&mut cursor, &index, &mut keys, job.password.is_some())? {
 			PasswordCheck::NotNeeded | PasswordCheck::Right => true,
 			PasswordCheck::Unchecked => false,
 			PasswordCheck::Required => return Err(sevenz_failure(SevenZError::PasswordRequired)),

@@ -375,7 +375,7 @@ mod peekable_receiver_tests {
 /// A [`BuildHasher`] keyed with fresh randomness per map. std's `RandomState` has no entropy
 /// source on `wasm32-unknown-unknown` and hashes with fixed keys there, so a map keyed by names
 /// an archive or a drive listing chose could be made to collide on purpose.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SeededState {
 	keys: (u64, u64),
 }

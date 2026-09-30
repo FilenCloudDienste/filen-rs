@@ -16,7 +16,7 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 			("docs/a.txt", Some(b"alpha")),
 			("docs/big.bin", Some(&big)),
 		],
-		Some(b"pw"),
+		Some("pw"),
 	);
 	// a zip's entries are checked one by one, so no hash of the whole archive is needed
 	let (setup, parent) = disposable(zip, None, |_| {});
@@ -48,7 +48,7 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zip_without_its_password_creates_nothing() {
-	let zip = zip_of(&[("a.txt", Some(b"a"))], Some(b"pw"));
+	let zip = zip_of(&[("a.txt", Some(b"a"))], Some("pw"));
 	let setup = setup("s.zip", zip, |_| {});
 	let failed = start(&setup, Options::default())
 		.running
@@ -205,7 +205,7 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	let big = incompressible(17 << 20, 0x9E37_79B9_7F4A_7C15);
 	let zip = zip_of(
 		&[("docs", None), ("docs/big.bin", Some(&big))],
-		Some(b"right"),
+		Some("right"),
 	);
 	// the entry's first chunk comes slowest, long after the folder is created
 	let setup = setup("bundle.zip", zip, |backend| {

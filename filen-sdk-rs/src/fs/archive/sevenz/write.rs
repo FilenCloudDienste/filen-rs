@@ -14,11 +14,14 @@ use filen_macros::js_type;
 
 use crate::{
 	Error,
-	fs::archive::encode::{check_level, lzma_encoder_memory},
+	fs::archive::{
+		encode::{check_level, lzma_encoder_memory},
+		password::ArchivePassword,
+	},
 };
 
 use super::{
-	crypto::{AesCbcWriter, AesProps, Key, WRITE_CYCLES_POWER, derive_key},
+	crypto::{AesCbcWriter, AesProps, BLOCK, Key, WRITE_CYCLES_POWER, derive_key},
 	header::*,
 	read::Method,
 };
@@ -287,13 +290,13 @@ fn failed() -> io::Error {
 }
 
 impl<W: Write> SevenZWriter<W> {
-	/// Starts an archive over `out` with 32 zero bytes for the start header. `password` is
-	/// UTF-16LE; its key is derived once, here.
+	/// Starts an archive over `out` with 32 zero bytes for the start header. The
+	/// password's key is derived once, here.
 	pub(crate) fn new(
 		out: W,
 		method: SevenZMethod,
 		solid: bool,
-		encryption: Option<(SevenZEncryption, &[u8])>,
+		encryption: Option<(SevenZEncryption, &ArchivePassword)>,
 	) -> io::Result<Self> {
 		Self::with_cycles_power(out, method, solid, encryption, WRITE_CYCLES_POWER)
 	}
@@ -304,14 +307,13 @@ impl<W: Write> SevenZWriter<W> {
 		mut out: W,
 		method: SevenZMethod,
 		solid: bool,
-		encryption: Option<(SevenZEncryption, &[u8])>,
+		encryption: Option<(SevenZEncryption, &ArchivePassword)>,
 		cycles_power: u8,
 	) -> io::Result<Self> {
 		let encryption = match encryption {
 			None => None,
 			Some((what, password)) => {
-				let mut salt = [0u8; 16];
-				rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
+				let salt: [u8; BLOCK] = rand::random();
 				let props = AesProps {
 					cycles_power,
 					salt: salt.to_vec(),
@@ -424,8 +426,7 @@ impl<W: Write> SevenZWriter<W> {
 			None => Packer::Plain(out),
 			Some(encryption) => {
 				// a fresh IV per folder: two folders under one key never share a keystream
-				let mut iv = [0u8; 16];
-				rand::RngCore::fill_bytes(&mut rand::rng(), &mut iv);
+				let iv: [u8; BLOCK] = rand::random();
 				coders.push(CoderRecord {
 					method: Method::Aes,
 					props: AesProps {

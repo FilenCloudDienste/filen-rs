@@ -18,12 +18,18 @@ use crate::{
 };
 
 use super::{
+	password::ArchivePassword,
 	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 	zip::{
 		crypto::AesStrength,
 		write::{Encryption, ZipMethod, ZipWriter},
 	},
 };
+
+/// `password`, checked.
+pub(crate) fn archive_password(password: &str) -> ArchivePassword {
+	ArchivePassword::new(password.to_owned()).unwrap()
+}
 
 /// A file `name` in `parent` holding `bytes`, with `hash` in its metadata.
 pub(crate) fn remote_file(
@@ -190,13 +196,14 @@ pub(crate) fn tar_with(members: &[TarMember]) -> Vec<u8> {
 
 /// A zip of `entries` (a directory where there is no data), deflated, and encrypted with
 /// AES-256 under `password` when there is one.
-pub(crate) fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) -> Vec<u8> {
+	let password = password.map(archive_password);
 	let mut writer = ZipWriter::new(Vec::new());
 	for (path, data) in entries {
 		match data {
 			None => writer.add_dir(path, None).unwrap(),
 			Some(data) => {
-				let encryption = password.map(|password| Encryption {
+				let encryption = password.as_ref().map(|password| Encryption {
 					password,
 					strength: AesStrength::Aes256,
 					salt: vec![9; AesStrength::Aes256.salt_len()],
@@ -226,13 +233,12 @@ pub(crate) fn sevenz_of(
 	solid: bool,
 	encryption: Option<(SevenZEncryption, &str)>,
 ) -> Vec<u8> {
-	let password: Option<Vec<u8>> = encryption
-		.map(|(_, password)| password.encode_utf16().flat_map(u16::to_le_bytes).collect());
+	let password = encryption.map(|(_, password)| archive_password(password));
 	let mut writer = SevenZWriter::with_cycles_power(
 		Vec::new(),
 		method,
 		solid,
-		encryption.map(|(what, _)| (what, &password.as_ref().unwrap()[..])),
+		encryption.map(|(what, _)| (what, password.as_ref().unwrap())),
 		4,
 	)
 	.unwrap();

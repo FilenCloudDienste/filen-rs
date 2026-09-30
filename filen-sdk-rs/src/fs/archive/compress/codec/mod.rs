@@ -77,7 +77,7 @@ fn compress_with<'p>(
 		CompressFormat::Zip { method, encryption } => {
 			let password = match (encryption, &job.password) {
 				(None, _) => None,
-				(Some(strength), Some(password)) => Some((strength, password.as_bytes())),
+				(Some(strength), Some(password)) => Some((strength, password)),
 				(Some(_), None) => {
 					return Err(Error::custom(
 						ErrorKind::ArchivePasswordRequired,
@@ -127,7 +127,7 @@ fn compress_with<'p>(
 			drop(sink);
 			let password = match (encryption, &job.password) {
 				(None, _) => None,
-				(Some(what), Some(password)) => Some((what, password.utf16le())),
+				(Some(what), Some(password)) => Some((what, password)),
 				(Some(_), None) => {
 					return Err(Error::custom(
 						ErrorKind::ArchivePasswordRequired,
@@ -135,15 +135,9 @@ fn compress_with<'p>(
 					));
 				}
 			};
-			let mut writer = SevenZWriter::new(
-				ChunkSink::holding_head(port),
-				method,
-				solid,
-				password
-					.as_ref()
-					.map(|(what, password)| (*what, &password[..])),
-			)
-			.map_err(failure)?;
+			let mut writer =
+				SevenZWriter::new(ChunkSink::holding_head(port), method, solid, password)
+					.map_err(failure)?;
 			for entry in job.entries {
 				match entry {
 					ArchiveEntry::Dir { path, modified } => writer.add_dir(&path, modified),

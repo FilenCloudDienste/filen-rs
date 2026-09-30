@@ -295,7 +295,6 @@ impl JsClient {
 		params: ExtractArchiveParams,
 		password: Option<String>,
 	) -> Result<ExtractReport, Error> {
-		// wrapped first, so an argument refused below still drops it wiped
 		let password = self::password(password)?;
 		let request = extract_request(
 			params.archive,

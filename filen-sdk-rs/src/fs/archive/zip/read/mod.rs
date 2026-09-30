@@ -30,6 +30,7 @@ use crate::{
 	fs::archive::{
 		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
 		format::StreamCodec,
+		password::ArchivePassword,
 	},
 	util::SeededMap,
 };
@@ -716,7 +717,7 @@ pub(crate) fn open_entry<'s, R: Read + Seek>(
 	source: &'s mut R,
 	shift: u64,
 	entry: &ZipEntry,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> Result<Box<dyn Read + 's>, ZipError> {
 	let header = read_at(source, shift + entry.header_offset, LOCAL_HEADER_LEN)?;

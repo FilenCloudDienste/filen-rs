@@ -16,7 +16,7 @@ use crate::{
 		encode::Compression,
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
-		test_support::pattern,
+		test_support::{archive_password, pattern},
 		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
@@ -393,7 +393,7 @@ fn zip_crate_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Ve
 }
 
 /// Reads a zip back through our own reader, which checks every CRC and AES code.
-fn our_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Vec<u8>)> {
+fn our_entries(archive: &[u8], password: Option<&ArchivePassword>) -> Vec<(String, Vec<u8>)> {
 	let mut source = std::io::Cursor::new(archive);
 	let index = read_index(
 		&mut source,
@@ -466,10 +466,13 @@ fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
 			let (_, whole) = written.chunks.split_last().unwrap();
 			assert!(whole.iter().all(|&n| n == CHUNK_SIZE), "{case}");
 			let expected = members_as_entries(&members);
-			let password = password.map(str::as_bytes);
-			assert_eq!(our_entries(&written.archive, password), expected, "{case}");
 			assert_eq!(
-				zip_crate_entries(&written.archive, password),
+				our_entries(&written.archive, password.map(archive_password).as_ref()),
+				expected,
+				"{case}"
+			);
+			assert_eq!(
+				zip_crate_entries(&written.archive, password.map(str::as_bytes)),
 				expected,
 				"{case}"
 			);
@@ -593,10 +596,16 @@ fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 		assert_eq!(zip64_entries, ["big.bin"], "{case}");
 
 		let expected = members_as_entries(&members);
-		let password = password.as_ref().map(ArchivePassword::as_bytes);
-		assert_eq!(our_entries(&written.archive, password), expected, "{case}");
 		assert_eq!(
-			zip_crate_entries(&written.archive, password),
+			our_entries(&written.archive, password.as_ref()),
+			expected,
+			"{case}"
+		);
+		assert_eq!(
+			zip_crate_entries(
+				&written.archive,
+				password.as_ref().map(ArchivePassword::as_bytes)
+			),
 			expected,
 			"{case}"
 		);

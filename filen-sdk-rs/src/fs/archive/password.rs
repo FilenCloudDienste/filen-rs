@@ -1,9 +1,6 @@
-//! The password of an encrypted archive: never printed, never serialized, wiped from memory
-//! when dropped.
+//! The password of an encrypted archive: never printed, never serialized.
 
 use std::fmt;
-
-use zeroize::Zeroizing;
 
 use crate::{Error, ErrorKind};
 
@@ -13,13 +10,12 @@ const MAX_CHARS: usize = 1024;
 /// A password of 1 to 1024 characters for an encrypted zip or 7z, kept as given. Its `Debug`
 /// prints no part of it.
 #[derive(Clone)]
-pub struct ArchivePassword(Zeroizing<String>);
+pub struct ArchivePassword(String);
 
 impl ArchivePassword {
 	/// A password exactly as given: no trimming or normalization, since the archive was
 	/// encrypted with its bytes.
 	pub fn new(password: String) -> Result<Self, Error> {
-		let password = Zeroizing::new(password);
 		if password.is_empty() || password.chars().count() > MAX_CHARS {
 			return Err(Error::custom(
 				ErrorKind::InvalidState,
@@ -34,8 +30,8 @@ impl ArchivePassword {
 	}
 
 	/// The password as UTF-16LE, which 7z derives its keys from.
-	pub(crate) fn utf16le(&self) -> Zeroizing<Vec<u8>> {
-		Zeroizing::new(self.0.encode_utf16().flat_map(u16::to_le_bytes).collect())
+	pub(crate) fn utf16le(&self) -> Vec<u8> {
+		self.0.encode_utf16().flat_map(u16::to_le_bytes).collect()
 	}
 }
 
@@ -58,7 +54,7 @@ mod tests {
 		assert_eq!(format!("{password:?}"), "ArchivePassword(<redacted>)");
 		let password = ArchivePassword::new("aé𝄞".into()).unwrap();
 		assert_eq!(
-			*password.utf16le(),
+			password.utf16le(),
 			[0x61, 0, 0xE9, 0, 0x34, 0xD8, 0x1E, 0xDD],
 			"UTF-16LE, with a surrogate pair"
 		);

@@ -26,11 +26,11 @@ fn damage_is_caught() {
 	let zip = ours(
 		&[("a.txt", Some(&pattern(10_000, 2)[..]))],
 		ZipMethod::Stored,
-		Some((&b"pw"[..], AesStrength::Aes128)),
+		Some(("pw", AesStrength::Aes128)),
 	);
 	let mut flipped = zip.clone();
 	flipped[200] ^= 1;
-	assert!(read_all(&flipped, Some(b"pw")).is_err());
+	assert!(read_all(&flipped, Some("pw")).is_err());
 	// no end record
 	assert!(matches!(
 		read_all(&zip[..zip.len() - 10], None),
@@ -289,7 +289,7 @@ fn a_damaged_byte_never_panics() {
 			ours(
 				&small[1..],
 				ZipMethod::Bzip2 { level: 1 },
-				Some((&b"pw"[..], AesStrength::Aes128)),
+				Some(("pw", AesStrength::Aes128)),
 			),
 		),
 		(
@@ -320,7 +320,7 @@ fn a_damaged_byte_never_panics() {
 		for (at, _, damaged) in damaged_copies(&zip, 0..zip.len()).chain(set) {
 			let mut source = Sparse::past(skipped, damaged.into());
 			let len = source.len();
-			let _ = std::panic::catch_unwind(move || read_source(&mut source, len, Some(b"pw")))
+			let _ = std::panic::catch_unwind(move || read_source(&mut source, len, Some("pw")))
 				.unwrap_or_else(|_| panic!("damage at {at} of a {len}-byte zip panicked"));
 		}
 	}

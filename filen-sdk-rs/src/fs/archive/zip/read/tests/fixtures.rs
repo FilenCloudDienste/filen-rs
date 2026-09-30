@@ -154,14 +154,14 @@ fn real_tools_encrypted_zips_read_back() {
 				entry.name
 			);
 		}
-		let read = read_all(zip, Some(b"pw")).unwrap_or_else(|e| panic!("{name}: {e}"));
+		let read = read_all(zip, Some("pw")).unwrap_or_else(|e| panic!("{name}: {e}"));
 		assert_eq!(files_of_tree(read), fixture_tree(), "{name}");
 		assert!(
 			matches!(read_all(zip, None), Err(ZipError::PasswordRequired)),
 			"{name}"
 		);
 		assert!(
-			matches!(read_all(zip, Some(b"nope")), Err(ZipError::WrongPassword)),
+			matches!(read_all(zip, Some("nope")), Err(ZipError::WrongPassword)),
 			"{name}"
 		);
 	}
@@ -175,7 +175,7 @@ fn aes_zstd_zip(frames: &[u8], size: u32) -> Vec<u8> {
 	let mut zip = ours(
 		&[("z.bin", Some(frames))],
 		ZipMethod::Stored,
-		Some((b"pw", AesStrength::Aes256)),
+		Some(("pw", AesStrength::Aes256)),
 	);
 	// the extra field's header and length, its version and vendor; the method follows the
 	// strength byte
@@ -200,7 +200,7 @@ fn an_encrypted_zstd_entry_reads_back_and_data_after_its_frames_is_damage() {
 	let frames =
 		ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
 	let zip = aes_zstd_zip(&frames, u32::try_from(data.len()).unwrap());
-	let read = read_all(&zip, Some(b"pw")).unwrap();
+	let read = read_all(&zip, Some("pw")).unwrap();
 	assert_eq!(read, [("z.bin".to_owned(), ZipKind::File, data.clone())]);
 
 	// bytes after the last frame are none of the entry's data: the entry is damaged
@@ -209,7 +209,7 @@ fn an_encrypted_zstd_entry_reads_back_and_data_after_its_frames_is_damage() {
 		u32::try_from(data.len()).unwrap(),
 	);
 	assert!(matches!(
-		read_all(&zip, Some(b"pw")),
+		read_all(&zip, Some("pw")),
 		Err(ZipError::Corrupt(
 			"an entry holds data after its compressed stream"
 		))
@@ -219,7 +219,7 @@ fn an_encrypted_zstd_entry_reads_back_and_data_after_its_frames_is_damage() {
 		&[&frames[..], &[0; 8]].concat(),
 		u32::try_from(data.len()).unwrap(),
 	);
-	assert_eq!(read_all(&zip, Some(b"pw")).unwrap()[0].2, data);
+	assert_eq!(read_all(&zip, Some("pw")).unwrap()[0].2, data);
 }
 
 #[test]

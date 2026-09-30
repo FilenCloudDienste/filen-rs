@@ -665,17 +665,6 @@ impl ExtractReport {
 	}
 }
 
-impl CompressReport {
-	/// How a compress ended, for the bindings: one that ended early still resolves, with the
-	/// report of what it did.
-	fn new(result: Result<compress::CompressReport, compress::CompressFailed>) -> Self {
-		match result {
-			Ok(report) => report.into(),
-			Err(failed) => failed.into(),
-		}
-	}
-}
-
 impl From<extract::ListFailed> for ArchiveListing {
 	fn from(failed: extract::ListFailed) -> Self {
 		Self {
@@ -742,7 +731,18 @@ impl From<compress::CompressFailed> for CompressReport {
 	}
 }
 
-/// The password argument of a call, checked; moved into memory wiped on drop.
+impl CompressReport {
+	/// How a compress ended, for the bindings: one that ended early still resolves, with the
+	/// report of what it did.
+	fn new(result: Result<compress::CompressReport, compress::CompressFailed>) -> Self {
+		match result {
+			Ok(report) => report.into(),
+			Err(failed) => failed.into(),
+		}
+	}
+}
+
+/// The password argument of a call, checked.
 fn password(password: Option<String>) -> Result<Option<ArchivePassword>, Error> {
 	password.map(ArchivePassword::new).transpose()
 }

@@ -97,7 +97,7 @@ fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: String) -> Foun
 fn check_zip_password<R: Read + Seek>(
 	source: &mut R,
 	index: &ZipIndex,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> Result<PasswordCheck, Error> {
 	let mut encrypted = index
@@ -156,7 +156,7 @@ pub(super) fn extract_zip(
 	let entry_limits = EntryLimits {
 		decoder_memory: job.limits.decoder_memory,
 	};
-	let password = job.password.as_ref().map(ArchivePassword::as_bytes);
+	let password = job.password.as_ref();
 	let duplicates = (index.duplicate_count > 0).then(|| DuplicateEntries {
 		names: index.duplicate_names.clone(),
 		count: index.duplicate_count,
@@ -287,7 +287,7 @@ fn list_zip(
 	walk: &mut Walk,
 	source: &mut SeekInput<'_>,
 	index: &ZipIndex,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 	duplicates: Option<DuplicateEntries>,
 ) -> Result<ArchiveEnd, Error> {
@@ -341,7 +341,7 @@ fn unaccounted_at<R: Read + Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> u64 {
 	let after = unaccounted_after(source, shift, entry);
@@ -410,7 +410,7 @@ fn decodes_to_nothing<R: Read + std::io::Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> bool {
 	if entry.size != 0 || !zip_supported(entry) {
@@ -463,7 +463,7 @@ fn zip_pre_read(
 	walk: &Walk,
 	source: &mut SeekInput<'_>,
 	index: &ZipIndex,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> Result<Vec<(u64, PreRead)>, Error> {
 	let port = walk.port;
@@ -542,7 +542,7 @@ fn zip_symlink_target<R: Read + std::io::Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
-	password: Option<&[u8]>,
+	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> io::Result<String> {
 	// an encrypted target is left unread: each one would cost a key derivation, and an archive

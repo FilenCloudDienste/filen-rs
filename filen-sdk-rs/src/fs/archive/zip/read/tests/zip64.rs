@@ -193,7 +193,7 @@ fn zip64_sizes_and_offsets_read_back() {
 		(ZipMethod::Deflate { level: 6 }, Some(AesStrength::Aes256)),
 		(ZipMethod::Bzip2 { level: 1 }, None),
 	] {
-		let password = encryption.map(|_| &b"pw"[..]);
+		let password = encryption.map(|_| "pw");
 		// (past 4 GiB, whether every file is written with zip64 sizes)
 		for (skipped, threshold) in [(0, 0), (PAST_4_GIB, u64::MAX), (PAST_4_GIB, 0)] {
 			let case = format!("{method:?} {encryption:?} {skipped} {threshold}");
@@ -201,7 +201,7 @@ fn zip64_sizes_and_offsets_read_back() {
 				ZipWriter::past(Vec::new(), skipped, threshold),
 				&borrowed(&sample),
 				method,
-				encryption.map(|strength| (&b"pw"[..], strength)),
+				encryption.map(|strength| ("pw", strength)),
 			);
 			let mut source = Sparse::past(skipped, zip.into());
 			let len = source.len();
@@ -243,7 +243,7 @@ fn zip64_sizes_and_offsets_read_back() {
 				};
 				let mut file = match password {
 					None => archive.by_name(path).unwrap(),
-					Some(password) => archive.by_name_decrypt(path, password).unwrap(),
+					Some(password) => archive.by_name_decrypt(path, password.as_bytes()).unwrap(),
 				};
 				let mut read = Vec::new();
 				file.read_to_end(&mut read).unwrap();

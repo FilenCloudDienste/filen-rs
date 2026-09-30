@@ -14,7 +14,7 @@ use crate::fs::archive::{
 		crypto::RAW_KEY_POWER,
 		write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 	},
-	test_support::{damaged_copies, pattern},
+	test_support::{archive_password, damaged_copies, pattern},
 };
 
 const LIMITS: SevenZLimits = SevenZLimits {
@@ -22,10 +22,6 @@ const LIMITS: SevenZLimits = SevenZLimits {
 	max_entries: 1_000_000,
 	decoder_memory: 256 << 20,
 };
-
-fn utf16(password: &str) -> Vec<u8> {
-	password.encode_utf16().flat_map(u16::to_le_bytes).collect()
-}
 
 /// An entry as read back: path, kind and data.
 type Read7z = (String, SevenZKind, Vec<u8>);
@@ -40,8 +36,8 @@ fn read_with(
 	password: Option<&str>,
 	limits: SevenZLimits,
 ) -> Result<Vec<Read7z>, SevenZError> {
-	let password = password.map(utf16);
-	let mut keys = Keys::new(password.as_deref());
+	let password = password.map(archive_password);
+	let mut keys = Keys::new(password.as_ref());
 	let mut source = Cursor::new(archive);
 	let index = read_index(&mut source, archive.len() as u64, limits, &mut keys)?;
 	let mut cursor = FolderCursor::new(source, limits.decoder_memory);
@@ -115,12 +111,12 @@ fn ours_with(
 	encryption: Option<(SevenZEncryption, &str)>,
 	cycles_power: u8,
 ) -> Vec<u8> {
-	let password = encryption.map(|(_, password)| utf16(password));
+	let password = encryption.map(|(_, password)| archive_password(password));
 	let mut writer = SevenZWriter::with_cycles_power(
 		Vec::new(),
 		method,
 		solid,
-		encryption.map(|(what, _)| (what, &password.as_ref().unwrap()[..])),
+		encryption.map(|(what, _)| (what, password.as_ref().unwrap())),
 		cycles_power,
 	)
 	.unwrap();
@@ -167,12 +163,12 @@ fn our_7z_reads_back_with_every_method_blocking_and_encryption() {
 					.unwrap_or_else(|error| panic!("{case}: {error}"));
 				assert_eq!(read, in_our_order(&sample), "{case}");
 				let mut source = Cursor::new(&archive[..]);
-				let password = encryption.map(|(_, password)| utf16(password));
+				let password = encryption.map(|(_, password)| archive_password(password));
 				let index = read_index(
 					&mut source,
 					archive.len() as u64,
 					LIMITS,
-					&mut Keys::new(password.as_deref()),
+					&mut Keys::new(password.as_ref()),
 				)
 				.unwrap();
 				assert_eq!(index.unaccounted_bytes, 0, "{case}");
@@ -414,7 +410,7 @@ fn passwords_are_asked_for_and_checked() {
 
 #[test]
 fn an_archive_may_use_max_keys_keys_and_not_one_more() {
-	let password = utf16("right");
+	let password = archive_password("right");
 	let mut keys = Keys::new(Some(&password));
 	// raw keys, a round each: a one-byte salt and no IV
 	let props = |salt: u64| {

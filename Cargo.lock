@@ -2221,7 +2221,6 @@ dependencies = [
 name = "filen-sdk-rs"
 version = "0.4.49"
 dependencies = [
- "aes 0.8.4",
  "aes-gcm",
  "argon2",
  "async-stream",
@@ -2337,7 +2336,6 @@ dependencies = [
  "windows-sys 0.61.2",
  "yoke",
  "zenwebp",
- "zeroize",
  "zip",
 ]
 

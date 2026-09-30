@@ -3,7 +3,7 @@
 
 use std::io::{self, Read, Take, Write};
 
-use aes::{Aes128, Aes192, Aes256};
+use aes_gcm::aes::{Aes128, Aes192, Aes256};
 use ctr::{
 	Ctr128LE,
 	cipher::{KeyIvInit, StreamCipher},
@@ -11,7 +11,8 @@ use ctr::{
 use filen_macros::js_type;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use zeroize::Zeroizing;
+
+use crate::fs::archive::password::ArchivePassword;
 
 /// PBKDF2 rounds WinZip AES derives its keys with, fixed by the format.
 const AES_KDF_ROUNDS: u32 = 1000;
@@ -92,10 +93,10 @@ struct AesKeys {
 	verifier: [u8; 2],
 }
 
-fn derive(password: &[u8], salt: &[u8], strength: AesStrength) -> AesKeys {
+fn derive(password: &ArchivePassword, salt: &[u8], strength: AesStrength) -> AesKeys {
 	let key_len = strength.key_len();
-	let mut derived = Zeroizing::new(vec![0u8; 2 * key_len + 2]);
-	pbkdf2::pbkdf2_hmac::<Sha1>(password, salt, AES_KDF_ROUNDS, &mut derived);
+	let mut derived = vec![0u8; 2 * key_len + 2];
+	pbkdf2::pbkdf2_hmac::<Sha1>(password.as_bytes(), salt, AES_KDF_ROUNDS, &mut derived);
 	let (key, rest) = derived.split_at(key_len);
 	let (auth, verifier) = rest.split_at(key_len);
 	// WinZip counts blocks from 1, little-endian over the whole block
@@ -144,7 +145,7 @@ impl<R: Read> AesReader<R> {
 	/// `stored_len` bytes of `inner`.
 	pub(crate) fn new(
 		mut inner: R,
-		password: &[u8],
+		password: &ArchivePassword,
 		strength: AesStrength,
 		stored_len: u64,
 	) -> io::Result<Self> {
@@ -215,7 +216,7 @@ pub(crate) struct AesWriter<W> {
 impl<W: Write> AesWriter<W> {
 	pub(crate) fn new(
 		mut inner: W,
-		password: &[u8],
+		password: &ArchivePassword,
 		strength: AesStrength,
 		salt: &[u8],
 	) -> io::Result<Self> {
@@ -314,8 +315,8 @@ impl<R: Read> ZipCryptoReader<R> {
 	/// Opens an entry whose 12-byte encryption header comes next in `inner`; `check` is the
 	/// byte its last header byte decrypts to with the right password. A wrong password passes
 	/// this check once in 256; the entry's CRC-32 catches it then.
-	pub(crate) fn new(mut inner: R, password: &[u8], check: u8) -> io::Result<Self> {
-		let mut keys = CryptoKeys::new(password);
+	pub(crate) fn new(mut inner: R, password: &ArchivePassword, check: u8) -> io::Result<Self> {
+		let mut keys = CryptoKeys::new(password.as_bytes());
 		let mut header = [0u8; ZIP_CRYPTO_HEADER_LEN];
 		inner.read_exact(&mut header)?;
 		let mut last = 0;
@@ -363,6 +364,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
 	use super::{test_support::zip_crypto_encrypt, *};
+	use crate::fs::archive::test_support::archive_password;
 
 	#[test]
 	fn aes_round_trips_and_authenticates() {
@@ -373,24 +375,30 @@ mod tests {
 		] {
 			let data: Vec<u8> = (0..10_000u32).map(|i| i.to_le_bytes()[0]).collect();
 			let salt = vec![7u8; strength.salt_len()];
-			let mut writer = AesWriter::new(Vec::new(), b"pw", strength, &salt).unwrap();
+			let mut writer =
+				AesWriter::new(Vec::new(), &archive_password("pw"), strength, &salt).unwrap();
 			writer.write_all(&data).unwrap();
 			let stored = writer.finish().unwrap();
-			let open = |password: &[u8], stored: &[u8]| {
-				let mut reader = AesReader::new(stored, password, strength, stored.len() as u64)?;
+			let open = |password: &str, stored: &[u8]| {
+				let mut reader = AesReader::new(
+					stored,
+					&archive_password(password),
+					strength,
+					stored.len() as u64,
+				)?;
 				let mut out = Vec::new();
 				reader.read_to_end(&mut out)?;
 				Ok::<_, io::Error>(out)
 			};
-			assert_eq!(open(b"pw", &stored).unwrap(), data, "{strength:?}");
-			let error = open(b"wrong", &stored).unwrap_err();
+			assert_eq!(open("pw", &stored).unwrap(), data, "{strength:?}");
+			let error = open("wrong", &stored).unwrap_err();
 			assert!(matches!(
 				error.get_ref().and_then(|e| e.downcast_ref()),
 				Some(CryptoError::WrongPassword)
 			));
 			let mut tampered = stored.clone();
 			tampered[strength.salt_len() + 2 + 100] ^= 1;
-			let error = open(b"pw", &tampered).unwrap_err();
+			let error = open("pw", &tampered).unwrap_err();
 			assert!(matches!(
 				error.get_ref().and_then(|e| e.downcast_ref()),
 				Some(CryptoError::AuthenticationFailed)
@@ -399,7 +407,7 @@ mod tests {
 			for from_end in [1, AES_AUTH_CODE_LEN] {
 				let mut tampered = stored.clone();
 				tampered[stored.len() - from_end] ^= 0x80;
-				let error = open(b"pw", &tampered).unwrap_err();
+				let error = open("pw", &tampered).unwrap_err();
 				assert!(matches!(
 					error.get_ref().and_then(|e| e.downcast_ref()),
 					Some(CryptoError::AuthenticationFailed)
@@ -413,12 +421,12 @@ mod tests {
 		let data = b"legacy encrypted entry";
 		let stored = zip_crypto_encrypt(b"pw", 0xAB, data);
 		let mut out = Vec::new();
-		ZipCryptoReader::new(&stored[..], b"pw", 0xAB)
+		ZipCryptoReader::new(&stored[..], &archive_password("pw"), 0xAB)
 			.unwrap()
 			.read_to_end(&mut out)
 			.unwrap();
 		assert_eq!(out, data);
-		assert!(ZipCryptoReader::new(&stored[..], b"nope", 0xAB).is_err());
+		assert!(ZipCryptoReader::new(&stored[..], &archive_password("nope"), 0xAB).is_err());
 	}
 
 	#[test]

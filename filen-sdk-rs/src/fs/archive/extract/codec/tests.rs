@@ -24,7 +24,8 @@ use crate::{
 		password::ArchivePassword,
 		sevenz::write::{SevenZEncryption, SevenZMethod},
 		test_support::{
-			TarMember, gzip, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
+			TarMember, archive_password, gzip, incompressible, pattern, sevenz_of, tar_of,
+			tar_with, zip_of,
 		},
 		worker,
 	},
@@ -609,7 +610,7 @@ fn every_byte_of_an_archive_counts_once_toward_the_bytes_read() {
 
 #[test]
 fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
-	let zip = zip_of(&[("secret.txt", Some(b"secret"))], Some(b"right"));
+	let zip = zip_of(&[("secret.txt", Some(b"secret"))], Some("right"));
 	let (seen, end) = run_full(&zip, "s.zip", LIMITS, None);
 	assert!(seen.is_empty());
 	assert_eq!(kind(end), ErrorKind::ArchivePasswordRequired);
@@ -1119,14 +1120,14 @@ fn an_empty_zip_crypto_entry_proves_no_password() {
 	let data = pattern((16 << 20) + 1, 7);
 	let zip = zip_crypto_zip(&[("empty.txt", b""), ("data.bin", &data)], b"right");
 	// a wrong password that both check bytes let through (1 in 65536)
-	let passes = |password: &[u8], data: &[u8]| {
+	let passes = |password: &str, data: &[u8]| {
 		let check = (crc32fast::hash(data) >> 24) as u8;
 		let header = zip_crypto_encrypt(b"right", check, &[]);
-		ZipCryptoReader::new(&header[..], password, check).is_ok()
+		ZipCryptoReader::new(&header[..], &archive_password(password), check).is_ok()
 	};
 	let wrong = (0u32..)
 		.map(|attempt| format!("wrong{attempt}"))
-		.find(|password| passes(password.as_bytes(), b"") && passes(password.as_bytes(), &data))
+		.find(|password| passes(password, b"") && passes(password, &data))
 		.unwrap();
 	let (seen, end) = run_full(&zip, "crypto.zip", LIMITS, Some(&wrong));
 	assert_eq!(
@@ -1780,7 +1781,7 @@ fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 			("docs/a.txt", Some(b"alpha")),
 			("._a.txt", Some(&data)),
 		],
-		Some(b"pw"),
+		Some("pw"),
 	);
 	for (password, check) in [
 		(Some("pw"), PasswordCheck::Right),

@@ -22,6 +22,7 @@ use super::{
 use crate::fs::archive::{
 	decode::{clamp_lzma_dict, open_stream},
 	format::StreamCodec,
+	password::ArchivePassword,
 	worker::from_source,
 };
 use crate::fs::drive_job::exceeds_limit;
@@ -309,15 +310,14 @@ impl Heap {
 
 /// Derived keys, kept for the folders that share them, and the rounds still allowed.
 pub(crate) struct Keys<'p> {
-	password: Option<&'p [u8]>,
+	password: Option<&'p ArchivePassword>,
 	derived: Vec<(AesProps, Key)>,
 	rounds_left: u64,
 	on_round: Option<&'p dyn Fn() -> io::Result<()>>,
 }
 
 impl<'p> Keys<'p> {
-	/// `password` as UTF-16LE.
-	pub(crate) fn new(password: Option<&'p [u8]>) -> Self {
+	pub(crate) fn new(password: Option<&'p ArchivePassword>) -> Self {
 		Self {
 			password,
 			derived: Vec::new(),

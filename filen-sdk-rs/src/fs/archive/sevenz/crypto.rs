@@ -1,14 +1,16 @@
 //! 7z's AES-256 coder: CBC over the coder's input, with a key derived from the UTF-16LE
 //! password by `2^cycles` rounds of SHA-256 over salt, password and a round counter.
 
-use std::io::{self, Read, Write};
-
-use aes::{
-	Aes256,
-	cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray},
+use std::{
+	fmt,
+	io::{self, Read, Write},
 };
-use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+
+use aes_gcm::aes::Aes256;
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, generic_array::GenericArray};
+use sha2::{Digest, Sha256, Sha512};
+
+use crate::fs::archive::password::ArchivePassword;
 
 use super::SevenZError;
 
@@ -29,7 +31,15 @@ pub(crate) const MAX_CYCLES_POWER: u8 = 22;
 /// The marker 7z uses for "no derivation: the key is salt and password as they are".
 pub(crate) const RAW_KEY_POWER: u8 = 0x3F;
 
-pub(crate) type Key = Zeroizing<[u8; 32]>;
+/// A derived AES-256 key.
+#[derive(Clone)]
+pub(crate) struct Key([u8; 32]);
+
+impl fmt::Debug for Key {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "Key({})", hex::display(&Sha512::digest(self.0)))
+	}
+}
 
 /// An AES coder's properties.
 #[derive(Clone, PartialEq, Eq)]
@@ -74,30 +84,31 @@ impl AesProps {
 	}
 }
 
-/// Derives the key for `password` (UTF-16LE) under `props`. `on_round` is called every 2^16
-/// rounds, so a long derivation (2^22 rounds of a long password take a minute on wasm) can show
-/// it is progressing and be stopped: its error ends the derivation.
+/// Derives the key for `password` under `props`, from its UTF-16LE form. `on_round` is called
+/// every 2^16 rounds, so a long derivation (2^22 rounds of a long password take a minute on
+/// wasm) can show it is progressing and be stopped: its error ends the derivation.
 pub(crate) fn derive_key(
-	password: &[u8],
+	password: &ArchivePassword,
 	props: &AesProps,
 	on_round: &mut dyn FnMut() -> io::Result<()>,
 ) -> Result<Key, SevenZError> {
-	let mut key = Zeroizing::new([0u8; 32]);
+	let password = password.utf16le();
+	let mut key = [0u8; 32];
 	if props.cycles_power == RAW_KEY_POWER {
-		let raw = props.salt.iter().chain(password).copied();
+		let raw = props.salt.iter().chain(&password).copied();
 		for (byte, from) in key.iter_mut().zip(raw) {
 			*byte = from;
 		}
-		return Ok(key);
+		return Ok(Key(key));
 	}
 	if props.cycles_power > MAX_CYCLES_POWER {
 		return Err(SevenZError::Unsupported(
 			"a 7z key derivation over the rounds the SDK spends",
 		));
 	}
-	let mut round = Zeroizing::new(Vec::with_capacity(props.salt.len() + password.len() + 8));
+	let mut round = Vec::with_capacity(props.salt.len() + password.len() + 8);
 	round.extend_from_slice(&props.salt);
-	round.extend_from_slice(password);
+	round.extend_from_slice(&password);
 	let counter_at = round.len();
 	round.extend_from_slice(&[0; 8]);
 	let mut sha = Sha256::new();
@@ -109,30 +120,26 @@ pub(crate) fn derive_key(
 		}
 	}
 	key.copy_from_slice(&sha.finalize());
-	Ok(key)
+	Ok(Key(key))
 }
 
 /// Decrypts a CBC stream: the plaintext is the ciphertext's length, padding included (the
 /// coder's unpack size says where the data ends).
 pub(crate) struct AesCbcReader<R> {
 	inner: R,
-	cipher: Aes256,
-	previous: [u8; BLOCK],
-	/// Decrypted bytes not handed out yet.
+	cipher: cbc::Decryptor<Aes256>,
+	/// A decrypted block; `plain[plain_at..]` is not handed out yet.
 	plain: [u8; BLOCK],
 	plain_at: usize,
-	plain_len: usize,
 }
 
 impl<R: Read> AesCbcReader<R> {
 	pub(crate) fn new(inner: R, key: &Key, iv: [u8; BLOCK]) -> Self {
 		Self {
 			inner,
-			cipher: Aes256::new(GenericArray::from_slice(&key[..])),
-			previous: iv,
+			cipher: cbc::Decryptor::new(&key.0.into(), &iv.into()),
 			plain: [0; BLOCK],
-			plain_at: 0,
-			plain_len: 0,
+			plain_at: BLOCK,
 		}
 	}
 }
@@ -142,11 +149,10 @@ impl<R: Read> Read for AesCbcReader<R> {
 		if buf.is_empty() {
 			return Ok(0);
 		}
-		if self.plain_at == self.plain_len {
-			let mut block = [0u8; BLOCK];
+		if self.plain_at == BLOCK {
 			let mut filled = 0;
 			while filled < BLOCK {
-				match self.inner.read(&mut block[filled..])? {
+				match self.inner.read(&mut self.plain[filled..])? {
 					0 if filled == 0 => return Ok(0),
 					0 => {
 						return Err(io::Error::new(
@@ -157,18 +163,11 @@ impl<R: Read> Read for AesCbcReader<R> {
 					n => filled += n,
 				}
 			}
-			let ciphertext = block;
 			self.cipher
-				.decrypt_block(GenericArray::from_mut_slice(&mut block));
-			for (plain, previous) in block.iter_mut().zip(self.previous) {
-				*plain ^= previous;
-			}
-			self.previous = ciphertext;
-			self.plain = block;
+				.decrypt_block_mut(GenericArray::from_mut_slice(&mut self.plain));
 			self.plain_at = 0;
-			self.plain_len = BLOCK;
 		}
-		let n = buf.len().min(self.plain_len - self.plain_at);
+		let n = buf.len().min(BLOCK - self.plain_at);
 		buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
 		self.plain_at += n;
 		Ok(n)
@@ -178,8 +177,7 @@ impl<R: Read> Read for AesCbcReader<R> {
 /// Encrypts into a CBC stream; [`AesCbcWriter::finish`] pads the last block with zeros.
 pub(crate) struct AesCbcWriter<W> {
 	inner: W,
-	cipher: Aes256,
-	previous: [u8; BLOCK],
+	cipher: cbc::Encryptor<Aes256>,
 	pending: [u8; BLOCK],
 	pending_len: usize,
 	/// Plaintext bytes taken, which is the coder's unpack size.
@@ -190,8 +188,7 @@ impl<W: Write> AesCbcWriter<W> {
 	pub(crate) fn new(inner: W, key: &Key, iv: [u8; BLOCK]) -> Self {
 		Self {
 			inner,
-			cipher: Aes256::new(GenericArray::from_slice(&key[..])),
-			previous: iv,
+			cipher: cbc::Encryptor::new(&key.0.into(), &iv.into()),
 			pending: [0; BLOCK],
 			pending_len: 0,
 			taken: 0,
@@ -199,14 +196,9 @@ impl<W: Write> AesCbcWriter<W> {
 	}
 
 	fn encrypt_pending(&mut self) -> io::Result<()> {
-		let mut block = self.pending;
-		for (plain, previous) in block.iter_mut().zip(self.previous) {
-			*plain ^= previous;
-		}
 		self.cipher
-			.encrypt_block(GenericArray::from_mut_slice(&mut block));
-		self.inner.write_all(&block)?;
-		self.previous = block;
+			.encrypt_block_mut(GenericArray::from_mut_slice(&mut self.pending));
+		self.inner.write_all(&self.pending)?;
 		self.pending_len = 0;
 		Ok(())
 	}
@@ -241,6 +233,7 @@ impl<W: Write> Write for AesCbcWriter<W> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::fs::archive::test_support::archive_password;
 
 	fn props(cycles_power: u8) -> AesProps {
 		AesProps {
@@ -271,8 +264,6 @@ mod tests {
 		// UTF-16LE password and a little-endian 64-bit round counter, 2^cycles times. That the
 		// SDK reads 7-Zip's own encrypted archives is checked on the fixtures
 		// (`sevenz_fixtures_extract_to_their_manifest` in extract/codec/tests.rs).
-		let utf16 =
-			|text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
 		for (password, cycles_power, expected) in [
 			(
 				"fixture password",
@@ -285,12 +276,28 @@ mod tests {
 				"04c79caf1d88a343ac1070d5d9f512a6f072dd20ded484af25ff8a04be860ed7",
 			),
 		] {
-			let key = derive_key(&utf16(password), &props(cycles_power), &mut || Ok(())).unwrap();
-			let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-			assert_eq!(hex, expected, "{password} at 2^{cycles_power}");
+			let key = derive_key(
+				&archive_password(password),
+				&props(cycles_power),
+				&mut || Ok(()),
+			)
+			.unwrap();
+			assert_eq!(
+				hex::encode(key.0),
+				expected,
+				"{password} at 2^{cycles_power}"
+			);
+			assert!(
+				!format!("{key:?}").contains(expected),
+				"the key never reaches logs"
+			);
 		}
 		assert!(matches!(
-			derive_key(b"p\0", &props(MAX_CYCLES_POWER + 1), &mut || Ok(())),
+			derive_key(
+				&archive_password("p"),
+				&props(MAX_CYCLES_POWER + 1),
+				&mut || Ok(())
+			),
 			Err(SevenZError::Unsupported(_))
 		));
 	}
@@ -298,7 +305,7 @@ mod tests {
 	#[test]
 	fn a_long_derivation_reports_its_rounds_and_stops_when_told() {
 		let mut rounds = 0;
-		derive_key(b"pw", &props(18), &mut || {
+		derive_key(&archive_password("pw"), &props(18), &mut || {
 			rounds += 1;
 			Ok(())
 		})
@@ -306,17 +313,21 @@ mod tests {
 		// every 2^16 rounds
 		assert_eq!(rounds, 4);
 		let mut rounds = 0;
-		let stopped = derive_key(b"pw", &props(MAX_CYCLES_POWER), &mut || {
-			rounds += 1;
-			Err(io::Error::other("the job ended"))
-		});
+		let stopped = derive_key(
+			&archive_password("pw"),
+			&props(MAX_CYCLES_POWER),
+			&mut || {
+				rounds += 1;
+				Err(io::Error::other("the job ended"))
+			},
+		);
 		assert!(matches!(stopped, Err(SevenZError::Read(_))));
 		assert_eq!(rounds, 1, "the derivation stops at once");
 	}
 
 	#[test]
 	fn cbc_round_trips_with_zero_padding() {
-		let key = Zeroizing::new([3u8; 32]);
+		let key = Key([3u8; 32]);
 		for len in [0usize, 1, 15, 16, 17, 1000] {
 			let data: Vec<u8> = (0..len).map(|i| i.to_le_bytes()[0]).collect();
 			let mut writer = AesCbcWriter::new(Vec::new(), &key, [9; BLOCK]);

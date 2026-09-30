@@ -210,7 +210,6 @@ impl JsClient {
 		callback: Arc<dyn ExtractArchiveCallback>,
 		managed_future: ManagedFuture,
 	) -> Result<ExtractReport, Error> {
-		// wrapped first, so an argument refused below still drops it wiped
 		let password = self::password(password)?;
 		let request = extract_request(archive, destination, config.root, config.dispose)?;
 		let config = ExtractSettings {
