@@ -59,6 +59,10 @@ fn catch_panic<T>(job: impl FnOnce() -> T, report: impl FnOnce(String) + 'static
 
 /// The reports [`catch_panic`] leaves for the panic hook on wasm, where a panic traps its thread
 /// instead of unwinding to a caller that could catch it.
+///
+/// No test runs this module. The native tests catch a codec's panic through `catch_unwind`
+/// (`fs::archive::worker`'s tests), and the browser suite never makes a worker panic, so the
+/// hook, the outermost-first order of the reports and the retire they drive are unproven on wasm.
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod panic_reports {
 	use std::{cell::RefCell, sync::Once};
@@ -197,13 +201,17 @@ mod wasm_worker {
 			self.activity.load(Ordering::Relaxed)
 		}
 
-		/// Queues `job`, spawning a worker if there is none.
+		/// Queues `job`, spawning a worker if there is none. The receiver gets what `job`
+		/// returns, or, should it panic, what `on_panic` makes of the panic's message; `on_panic`
+		/// runs inside the panic hook, so it must not log (the panic may have struck while the
+		/// log's lock was held).
 		///
 		/// The returned generation names the worker that took the job; hand it to
 		/// [`retire`](Self::retire) if it stops answering.
 		pub(crate) fn submit<T: Send + 'static>(
 			&'static self,
 			job: impl FnOnce() -> T + Send + 'static,
+			on_panic: impl FnOnce(String) -> T + Send + 'static,
 		) -> (u64, tokio::sync::oneshot::Receiver<T>) {
 			let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 			// Poisoning cannot happen under `panic=abort`; taking the guard anyway keeps a
@@ -226,10 +234,12 @@ mod wasm_worker {
 			let generation = *generation;
 			let _ = jobs.send(Box::new(move || {
 				// a panic traps this worker: retired, the next job gets a fresh one instead of
-				// waiting out a stall deadline behind it
-				if let Some(value) = super::catch_panic(job, move |_| self.retire(generation)) {
-					let _ = result_tx.send(value);
-				}
+				// waiting out a stall deadline behind it. Retiring is the outer report, so it runs
+				// before the driver hears of the panic and submits again.
+				super::catch_panic(
+					move || super::send_catching_panic(job, result_tx, on_panic),
+					move |_| self.retire(generation),
+				);
 				// Not about speed: chunk traffic already covers a job that is merely slow. This is
 				// the only event a job that asks for no chunk at all produces, so bumping here is
 				// what makes the invariant total: every job the worker takes and returns from

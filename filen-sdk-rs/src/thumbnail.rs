@@ -1093,6 +1093,16 @@ mod remote_chunks {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+	/// What a decode that panicked answers its driver with, at once rather than after
+	/// [`DECODE_STALL_TIMEOUT`]. Runs inside the panic hook, so it logs nothing.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn decode_panicked<R>(message: String) -> Result<R, Error> {
+		Err(Error::custom(
+			ErrorKind::ImageError,
+			format!("thumbnail decode panicked: {message}"),
+		))
+	}
+
 	/// Runs a synchronous job over a cancellable source on a blocking thread —
 	/// the whole native protocol, shared by every source that has one
 	/// ([`over_remote_chunks`] below, `over_local_file` in `js_impls`), which
@@ -1206,16 +1216,18 @@ mod remote_chunks {
 				.thumbnails()
 				.decode_permit()
 				.await;
-			let (generation, mut done) = DECODES.submit(move || job(Box::new(source)));
+			let (generation, mut done) =
+				DECODES.submit(move || job(Box::new(source)), decode_panicked);
 			let died = || {
 				Error::custom(
 					ErrorKind::ImageError,
 					"thumbnail decode worker died".to_string(),
 				)
 			};
-			// A worker that trapped drops nothing: `done` never resolves, `incoming` never
-			// closes, and the next `submit` would queue behind it forever. This deadline is the
-			// only thing that notices, so every wait below is under it.
+			// A panic answers `done` from the panic hook. A worker that trapped any other way
+			// (libheif's stubbed `__cxa_throw`) drops nothing: `done` never resolves, `incoming`
+			// never closes, and the next `submit` would queue behind it forever. This deadline
+			// is the only thing that notices, so every wait below is under it.
 			let deadline = sleep_until(TimerInstant::now() + DECODE_STALL_TIMEOUT);
 			tokio::pin!(deadline);
 			// The stamp as of arming. Our job may not have STARTED — the worker takes jobs in
@@ -1317,7 +1329,7 @@ mod remote_chunks {
 	where
 		R: Send + 'static,
 	{
-		let (generation, mut done) = DECODES.submit(job);
+		let (generation, mut done) = DECODES.submit(job, decode_panicked);
 		let died = || {
 			Error::custom(
 				ErrorKind::ImageError,

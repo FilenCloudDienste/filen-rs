@@ -26,9 +26,10 @@ use chrono::{DateTime, Utc};
 use filen_types::fs::Uuid;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use crate::blocking::send_catching_panic;
 use crate::{
 	Error, ErrorKind,
-	blocking::send_catching_panic,
 	consts::{CALLBACK_INTERVAL, CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA_USIZE},
 };
 
@@ -370,7 +371,6 @@ pub(crate) fn start<R: Send + 'static>(
 	job: impl FnOnce(WorkerPort) -> Result<R, Error> + Send + 'static,
 ) -> Result<WorkerLink<Result<R, Error>>, Error> {
 	let (port, events, shared) = channels();
-	let (result, done) = oneshot::channel();
 	let (panicked_tx, panicked) = oneshot::channel();
 	// runs inside the panic hook on wasm, so it logs nothing (the panic may have struck while
 	// the log's lock was held); the driver logs the error it fails the job with
@@ -381,13 +381,14 @@ pub(crate) fn start<R: Send + 'static>(
 			format!("the archive's codec panicked: {message}"),
 		))
 	};
-	let run = move || send_catching_panic(move || job(port), result, on_panic);
+	let job = move || job(port);
 	let events = WorkerEvents::new(events, Some(panicked));
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
+		let (result, done) = oneshot::channel();
 		std::thread::Builder::new()
 			.name("filen-archive-codec".to_owned())
-			.spawn(run)?;
+			.spawn(move || send_catching_panic(job, result, on_panic))?;
 		Ok(WorkerLink {
 			events,
 			done,
@@ -396,8 +397,7 @@ pub(crate) fn start<R: Send + 'static>(
 	}
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
-		// the result goes through the channel above, which a panicking codec still answers
-		let (generation, _) = ARCHIVE_CODECS.submit(run);
+		let (generation, done) = ARCHIVE_CODECS.submit(job, on_panic);
 		Ok(WorkerLink {
 			events,
 			done,
