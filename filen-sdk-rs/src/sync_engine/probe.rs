@@ -1446,7 +1446,7 @@ fn prepare_scoped(
 	// What the pass folds and plans with is `holds.held_remote`, which is the view's held set.
 	let held = view.held_paths;
 	let mark = Instant::now();
-	let moves = plan::fold_dir_moves(
+	let (moves, stayed) = plan::fold_dir_moves(
 		mode,
 		&mut baseline,
 		&mut local,
@@ -1462,6 +1462,7 @@ fn prepare_scoped(
 			.map(|path| plan::moved_path(&path, from, to).unwrap_or(path))
 			.collect();
 	}
+	decided.extend(stayed);
 	costs.push(
 		"dir_move_fold",
 		mark.elapsed(),
@@ -2111,6 +2112,7 @@ pub fn run() -> String {
 			&held,
 			plan::PassPaths::Whole,
 		)
+		.0
 	});
 	probe.record(
 		"fold_dir_moves_zero",
@@ -2138,6 +2140,7 @@ pub fn run() -> String {
 			&held,
 			plan::PassPaths::Changed(&idle_scope),
 		)
+		.0
 	});
 	probe.record(
 		"fold_dir_moves_scoped_zero",
@@ -2180,6 +2183,7 @@ pub fn run() -> String {
 				&held,
 				scope,
 			)
+			.0
 		});
 		assert_eq!(
 			dir_moves.len(),
