@@ -3376,8 +3376,10 @@ mod tests {
 
 	use super::{
 		super::{
+			derive,
 			engine::{Observations, PendingKind, PendingWrites},
 			ignore::{IgnoreLevel, IgnoreSource, Origin},
+			side::FromRow,
 		},
 		*,
 	};
@@ -3429,37 +3431,105 @@ mod tests {
 
 	/// What a pass plans once the case-only directory renames are folded into its inputs: the
 	/// renames first, then the reconciled rest.
+	///
+	/// Planned twice, and required to come out the same: from the three inputs whole, and as a
+	/// change-scoped pass holds them — carried sides that decide only what differs from the rows
+	/// (see [`carried_twin`]). So every fold test written against this is a scoped-versus-whole one
+	/// as well, where a scoped fold otherwise meets only the generated cases.
 	fn plan_with_renames(
 		mode: SyncMode,
 		baseline: &HashMap<String, BaselineEntry>,
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		let (mut baseline, mut local, mut remote) = (
+		let (mut rows, mut whole_local, mut whole_remote) = (
 			tree(baseline),
 			Side::from(local.clone()),
 			Side::from(remote.clone()),
 		);
 		let mut actions = fold_dir_moves(
 			mode,
-			&mut baseline,
-			&mut local,
-			&mut remote,
+			&mut rows,
+			&mut whole_local,
+			&mut whole_remote,
 			&BTreeSet::new(),
 			None,
 		);
 		actions.extend(
 			reconcile(
 				mode,
-				&baseline,
-				&local.of(&baseline),
-				&remote.of(&baseline),
+				&rows,
+				&whole_local.of(&rows),
+				&whole_remote.of(&rows),
 				&PassHolds::default(),
 				PassPaths::Whole,
 			)
 			.actions,
 		);
+
+		let rows = tree(baseline);
+		let (twin_local, twin_remote, decided) = carried_twin(&rows, local, remote);
+		assert_eq!(
+			actions,
+			plan_scoped(mode, &rows, twin_local, twin_remote, decided),
+			"{mode:?}: the carried, change-scoped twin planned something else"
+		);
 		actions
+	}
+
+	/// The two sides a change-scoped pass would hold over `rows` where a whole read found `local`
+	/// and `remote`, and the set it decides: every row carried, and an observation recorded — the
+	/// node, or a tombstone — at each path where a whole side holds something other than what the
+	/// row there carries. Only those paths join the set [`derive::from_baseline`] starts it with,
+	/// which is the least a pass may decide ([`PassPaths::Changed`]'s contract).
+	///
+	/// Nothing is held beyond what the whole run holds, so the two plans can be compared: the
+	/// rows [`derive`] would hold are uncarryable, and each is in the set already.
+	fn carried_twin(
+		rows: &Baseline,
+		local: &HashMap<String, LocalNode>,
+		remote: &HashMap<String, RemoteNode>,
+	) -> (Side<LocalNode>, Side<RemoteNode>, BTreeSet<String>) {
+		let derive::Derived {
+			local: mut twin_local,
+			remote: mut twin_remote,
+			mut decided,
+			..
+		} = derive::from_baseline(rows, BTreeSet::new());
+		let mut paths: BTreeSet<String> = local.keys().chain(remote.keys()).cloned().collect();
+		rows.visit_row_paths(|path| {
+			paths.insert(path.to_owned());
+		});
+		for path in paths {
+			// Both sides recorded: neither is skipped because the other already put the path in
+			// the set.
+			let local_moved = observe_whole(rows, &mut twin_local, local, &path);
+			let remote_moved = observe_whole(rows, &mut twin_remote, remote, &path);
+			if local_moved || remote_moved {
+				decided.insert(path);
+			}
+		}
+		(twin_local, twin_remote, decided)
+	}
+
+	/// Record on `side` what `whole` holds at `path`, if that is not what the row there carries,
+	/// and answer whether it recorded anything.
+	fn observe_whole<T: FromRow + PartialEq>(
+		rows: &Baseline,
+		side: &mut Side<T>,
+		whole: &HashMap<String, T>,
+		path: &str,
+	) -> bool {
+		if side.of(rows).at(path).as_deref() == whole.get(path) {
+			return false;
+		}
+		match whole.get(path) {
+			Some(node) => side.insert(path.to_owned(), node.clone()),
+			None => {
+				side.remove(rows, path);
+			}
+		}
+		true
 	}
 
 	/// A synced directory holding `a.txt`, spelled `base_name` in the baseline, `local_name` on disk
@@ -7832,12 +7902,12 @@ mod tests {
 	/// is the whole of [`PassPaths::Changed`]'s contract. The corpus carries the shapes that break a
 	/// naive narrowing: every row state the baseline can hold, sibling names that fold together,
 	/// paths that are prefixes of one another, held conflicts, pushes no snapshot confirmed, moves
-	/// on either side, and a directory rename for the fold to find.
+	/// on either side, a directory rename for the fold to find, and a subtree moved with its files
+	/// for it to carry.
 	mod scoped {
 		use rand::{Rng, SeedableRng, rngs::StdRng};
 
 		use super::*;
-		use crate::sync_engine::derive;
 
 		/// How many generated cases each property runs over.
 		const CASES: u64 = 400;
@@ -7886,6 +7956,11 @@ mod tests {
 			SyncMode::RemoteToLocal,
 			SyncMode::RemoteBackup,
 		];
+
+		/// The directories of [`TREE`] a staged subtree move carries (see [`stage_move`]): each
+		/// holds a file, which a pushed move needs to be matched at all, and between them they
+		/// reach every depth the tree has, a directory nested in another and a rule file.
+		const MOVABLE: [&str; 6] = ["a/b", "a/c", "ab", "z", "d/e/f", "d"];
 
 		/// What a generated baseline row records. Every state a row can be in, plus the two
 		/// half-recorded shapes a resolution writes on purpose.
@@ -8089,6 +8164,32 @@ mod tests {
 			}
 		}
 
+		/// Move whatever the local side holds at and under `dir` to `moved`, as a pass that watched
+		/// the rename records it: a tombstone at each source path, the node at its destination, and
+		/// both ends decided. Staged after the random changes, so what they did inside `dir` moves
+		/// with it: the fold meets a subtree that matches its rows exactly, one a local change broke,
+		/// and one the remote changed underneath it.
+		fn stage_move(
+			dir: &str,
+			baseline: &Baseline,
+			local: &mut Side<LocalNode>,
+			decided: &mut BTreeSet<String>,
+		) {
+			let mut paths = local.subtree_paths(baseline, dir);
+			if local.of(baseline).holds(dir) {
+				paths.push(dir.to_string());
+			}
+			for path in paths {
+				let Some(node) = local.remove(baseline, &path) else {
+					continue;
+				};
+				let to = format!("moved{}", &path[dir.len()..]);
+				local.insert(to.clone(), at(&to, node));
+				decided.insert(path);
+				decided.insert(to);
+			}
+		}
+
 		/// One generated case: what a change-scoped pass holds when it reaches the reconcile.
 		struct Case {
 			baseline: Baseline,
@@ -8106,6 +8207,9 @@ mod tests {
 			changes: BTreeSet<Change>,
 			actions: usize,
 			folds: usize,
+			/// Directory moves pushed to the remote whose subtree holds a file: the fold that
+			/// carries rows the remote side still names, which only [`stage_move`] reaches.
+			pushed_folds: usize,
 		}
 
 		fn generate(seed: u64, seen: &mut Coverage) -> Case {
@@ -8115,12 +8219,26 @@ mod tests {
 			// only withholds its path (`derive::Derived::held`). Drawn here, applied below.
 			let stage_rename = rng.random_range(0..3) == 0;
 			let renamed = [index_of("empty"), index_of("Empty")];
+			// The subtree a staged move carries, from a stream of its own so every draw of this one
+			// lands where it did before the move was staged. Its rows are forced `Synced` for the
+			// reason the rename's are: a pushed move is only folded out of a subtree the baseline
+			// vouches for whole.
+			let staged = {
+				let mut staging = StdRng::seed_from_u64(seed ^ 0x6d6f_7665_6400_0000);
+				(staging.random_range(0..3) == 0)
+					.then(|| MOVABLE[staging.random_range(0..MOVABLE.len())])
+			};
 			let mut rows = Vec::new();
-			for index in 0..TREE.len() {
+			for (index, &(path, _)) in TREE.iter().enumerate() {
 				let shape = if stage_rename && renamed.contains(&index) {
 					Shape::Synced
 				} else {
-					SHAPES[rng.random_range(0..SHAPES.len())]
+					// Drawn whether or not the move overrides it, so the draws after it stay put.
+					let drawn = SHAPES[rng.random_range(0..SHAPES.len())];
+					match staged {
+						Some(dir) if path == dir || is_under(path, dir) => Shape::Synced,
+						_ => drawn,
+					}
 				};
 				seen.shapes.insert(shape);
 				if let Some(entry) = row(index, shape) {
@@ -8163,6 +8281,9 @@ mod tests {
 				remote.remove(&baseline, "empty");
 				decided.insert("empty".to_string());
 				decided.insert("Empty".to_string());
+			}
+			if let Some(dir) = staged {
+				stage_move(dir, &baseline, &mut local, &mut decided);
 			}
 			let mut held_remote = held;
 			// The cache showing one name twice withholds that path. A pass always decides such a
@@ -8413,6 +8534,10 @@ mod tests {
 					let (whole, by_whole) = fold(&case, mode, false);
 					let (scoped, by_scope) = fold(&case, mode, true);
 					seen.folds += by_whole.len();
+					seen.pushed_folds += by_whole
+						.iter()
+						.filter(|action| pushed_with_files(&whole.baseline, action))
+						.count();
 					assert_eq!(
 						by_whole, by_scope,
 						"seed {seed}, {mode:?}: the narrowed fold carried other moves"
@@ -8436,6 +8561,26 @@ mod tests {
 				"only {} directory move(s) were folded, so this tested almost nothing",
 				seen.folds
 			);
+			assert!(
+				seen.pushed_folds > 50,
+				"only {} pushed directory move(s) carried a file, so the carried subtree was barely \
+				 tested",
+				seen.pushed_folds
+			);
+		}
+
+		/// Whether `action` is a directory move pushed to the remote whose subtree, where the fold
+		/// left `baseline`, holds a file.
+		fn pushed_with_files(baseline: &Baseline, action: &SyncAction) -> bool {
+			matches!(
+				action,
+				SyncAction::MoveRemote {
+					kind: NodeKind::Dir,
+					..
+				}
+			) && baseline
+				.subtree(action.rel_path())
+				.any(|row| row.kind == NodeKind::File)
 		}
 
 		/// The two names of every fold class [`TREE`] spells twice — what a case-only sibling
