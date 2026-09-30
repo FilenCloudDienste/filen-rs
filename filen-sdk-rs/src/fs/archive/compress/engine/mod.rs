@@ -647,7 +647,7 @@ impl<B: DisposalBackend> Driver<B> {
 		};
 		let len = data.len() as u64;
 		if let Some(max) = self.max_bytes
-			&& self.written + len >= max
+			&& drive_job::exceeds_limit(self.written + len, max)
 		{
 			self.stop_with(Error::custom(
 				ErrorKind::MaxStorageReached,

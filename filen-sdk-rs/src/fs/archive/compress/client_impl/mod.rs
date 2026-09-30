@@ -19,6 +19,7 @@ use crate::{
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::{
 			backend::ClientBackend,
+			exceeds_limit,
 			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
 			plan::{
 				DestParent, ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlannedItem,
@@ -64,12 +65,11 @@ pub struct CompressRequest {
 pub struct CompressConfig {
 	/// What the archive is written as.
 	pub format: CompressFormat,
-	/// Storage still free on the account, if the caller knows it. A bare tar's size is known
-	/// before anything is written, and one that would reach this is refused up front with
-	/// [`ErrorKind::MaxStorageReached`], its size in the report's `needed_bytes`; a compressed
-	/// archive is refused as soon as its written bytes would reach it, leaving nothing behind.
-	/// Reaching it counts: an archive exactly as large as the free storage is refused, as the
-	/// server refuses an upload that would fill the account.
+	/// Storage still free on the account, if the caller knows it. A job that needs more fails
+	/// with [`ErrorKind::MaxStorageReached`]; one that needs exactly this much fits. A bare
+	/// tar's size is known before anything is written, so one that needs more is refused up
+	/// front, its size in the report's `needed_bytes`; a compressed archive is refused as soon
+	/// as its written bytes would pass it, leaving nothing behind.
 	pub max_bytes: Option<u64>,
 	/// For an encrypted format, and only then.
 	pub password: Option<ArchivePassword>,
@@ -290,7 +290,7 @@ async fn plan_compression(
 		(config.format, config.max_bytes)
 	{
 		let needed = tar_size(&entries);
-		if needed >= max {
+		if exceeds_limit(needed, max) {
 			report.needed_bytes = Some(needed);
 			let error = Error::custom(
 				ErrorKind::MaxStorageReached,

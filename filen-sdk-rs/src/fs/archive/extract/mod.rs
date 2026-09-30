@@ -16,6 +16,7 @@ use crate::{
 	fs::{
 		archive::{ArchivePassword, SourceDisposal},
 		categories::{DirType, Normal},
+		drive_job::exceeds_limit,
 		file::{RemoteFile, enums::RemoteFileType},
 		name::ValidatedName,
 	},
@@ -141,11 +142,11 @@ impl ExpansionLimit {
 
 #[derive(Debug, Clone)]
 pub struct ExtractConfig {
-	/// Storage still free on the account, if the caller knows it: an extraction whose files
-	/// would reach it fails with [`ErrorKind::MaxStorageReached`](crate::ErrorKind). A zip or 7z
-	/// states its files' sizes in its index, so one stating that much for the files it will
-	/// extract (those skipped for their path or method left out) fails before anything is
-	/// created; a tar or single compressed file is only known as it is read, so it is checked as
+	/// Storage still free on the account, if the caller knows it. A job that needs more fails
+	/// with [`ErrorKind::MaxStorageReached`](crate::ErrorKind); one that needs exactly this much
+	/// fits. A zip or 7z states its files' sizes in its index, so one stating more for the files
+	/// it will extract (those skipped for their path or method left out) fails before anything
+	/// is created; a tar or single compressed file is only known as it is read, so it is checked as
 	/// it goes, and what was extracted so far is kept. A zip entry found overlapping another
 	/// only once it is read still counts up front, so such a zip may be refused though it fits.
 	pub max_bytes: Option<u64>,
@@ -184,12 +185,11 @@ impl Default for ExtractConfig {
 	}
 }
 
-/// The error for an extraction whose files, `bytes` in all, reach `max_bytes`; `None` while
-/// they fit. Files holding no bytes fit whatever the limit: empty files and directories take
-/// no storage, and the check as data is written only ever runs on some.
+/// The error for an extraction whose files, `bytes` in all, need more than `max_bytes`; `None`
+/// while they fit.
 pub(crate) fn storage_exceeded(max_bytes: Option<u64>, bytes: u64) -> Option<Error> {
 	let max = max_bytes?;
-	(bytes > 0 && bytes >= max).then(|| {
+	exceeds_limit(bytes, max).then(|| {
 		Error::custom(
 			ErrorKind::MaxStorageReached,
 			format!("the extraction needs more than the {max} bytes that are free"),

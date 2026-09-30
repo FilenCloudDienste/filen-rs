@@ -22,9 +22,9 @@ use super::{
 use crate::fs::archive::{
 	decode::{clamp_lzma_dict, open_stream},
 	format::StreamCodec,
-	limits::exceeds_limit,
 	worker::from_source,
 };
+use crate::fs::drive_job::exceeds_limit;
 
 /// Most coders in one folder; 7-Zip writes at most four (BCJ2 with its three LZMA coders).
 const MAX_CODERS: u64 = 8;

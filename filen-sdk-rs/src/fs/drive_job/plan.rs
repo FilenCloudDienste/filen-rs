@@ -165,6 +165,16 @@ pub struct SkippedEntry {
 	pub reason: SkipReason,
 }
 
+impl SkippedEntry {
+	/// How many listed entries this one record stands for.
+	pub(crate) fn entries(&self) -> u64 {
+		match self.reason {
+			SkipReason::UndecryptableFile { .. } => 1,
+			SkipReason::Unreachable { count } => count,
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
 	feature = "wasm-full",

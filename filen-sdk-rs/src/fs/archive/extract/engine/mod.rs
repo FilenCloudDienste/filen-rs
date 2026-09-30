@@ -56,7 +56,6 @@ use crate::{
 			entry_path::{ArchivePath, joined},
 			format::ArchiveFormat,
 			input::{CodecFeed, Fed, ReadingJob, start_reading},
-			limits::exceeds_limit,
 			names::{DirId, PathResolver},
 			worker::{
 				EntryHead, EntryKind, SkippedMember, WorkerEvent, WorkerLink, codec_failed,
@@ -90,6 +89,7 @@ use super::{
 	},
 };
 
+use crate::fs::drive_job::exceeds_limit;
 use dirs::{DirSlot, DirState};
 use links::{LinkCopy, LinkTargets, PendingLink, TakenLink};
 

@@ -30,6 +30,13 @@ pub(crate) fn ends_job(error: &Error) -> bool {
 	)
 }
 
+/// Whether `needed` is past `limit`: exactly `limit` fits. Every cap a job checks (the free
+/// storage a caller gives, an archive's entries, members, items and keys, its index bytes)
+/// compares through this, so none is off by one.
+pub(crate) fn exceeds_limit(needed: u64, limit: u64) -> bool {
+	needed > limit
+}
+
 /// The error a job ends with once it is cancelled: `job` is what its report calls it.
 pub(crate) fn cancelled(job: &str) -> Arc<Error> {
 	Arc::new(Error::custom(
@@ -115,6 +122,13 @@ mod tests {
 		const DONE: Self = Self::Done;
 		const CANCELLED: Self = Self::Cancelled;
 		const FAILED: Self = Self::Failed;
+	}
+
+	#[test]
+	fn exactly_the_limit_fits_and_one_more_does_not() {
+		assert!(!exceeds_limit(10, 10));
+		assert!(exceeds_limit(11, 10));
+		assert!(!exceeds_limit(u64::MAX, u64::MAX));
 	}
 
 	#[test]

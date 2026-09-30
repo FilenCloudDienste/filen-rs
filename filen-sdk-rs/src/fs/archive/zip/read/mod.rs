@@ -24,11 +24,11 @@ use super::{
 	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
 	method_supported,
 };
+use crate::fs::drive_job::exceeds_limit;
 use crate::{
 	fs::archive::{
 		decode::{StreamDecoder, clamp_lzma_dict, open_stream},
 		format::StreamCodec,
-		limits::exceeds_limit,
 	},
 	util::SeededMap,
 };

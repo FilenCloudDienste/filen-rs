@@ -1,6 +1,6 @@
 //! The pieces 7z headers are made of: property ids, variable-length numbers and bit vectors.
 
-use crate::fs::archive::limits::exceeds_limit;
+use crate::fs::drive_job::exceeds_limit;
 
 use super::SevenZError;
 

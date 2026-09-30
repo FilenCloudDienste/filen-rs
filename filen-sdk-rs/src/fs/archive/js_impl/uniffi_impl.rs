@@ -54,10 +54,10 @@ pub trait CompressItemsCallback: Send + Sync {
 pub struct ExtractArchiveConfig {
 	/// Where the archive's entries are created in the destination.
 	pub root: ExtractRoot,
-	/// Storage still free on the account, if known: an extraction whose files would reach it
-	/// fails with `MaxStorageReached`. A zip or 7z states its files' sizes in its index, so one
-	/// stating that much fails before anything is created; a tar or single compressed file is
-	/// checked as it is read, keeping what was extracted so far.
+	/// Storage still free on the account, if known. A job that needs more fails with
+	/// `MaxStorageReached`; one that needs exactly this much fits. A zip or 7z states its files'
+	/// sizes in its index, so one stating more fails before anything is created; a tar or single
+	/// compressed file is checked as it is read, keeping what was extracted so far.
 	#[uniffi(default = None)]
 	pub max_bytes: Option<u64>,
 	/// Most directories and files to create; an archive with more fails with
@@ -129,9 +129,10 @@ pub struct CompressItemsConfig {
 	pub name: String,
 	/// What the archive is written as.
 	pub format: CompressFormat,
-	/// Storage still free on the account, if known: a bare tar that would reach it is refused
-	/// up front with `MaxStorageReached`, its size in the report's `neededBytes`; any other
-	/// format as soon as its written bytes would, leaving nothing behind.
+	/// Storage still free on the account, if known. A job that needs more fails with
+	/// `MaxStorageReached`; one that needs exactly this much fits. A bare tar that needs more is
+	/// refused up front, its size in the report's `neededBytes`; any other format as soon as its
+	/// written bytes would pass it, leaving nothing behind.
 	#[uniffi(default = None)]
 	pub max_bytes: Option<u64>,
 	/// Removes the items once the archive is registered and verified. Before anything is

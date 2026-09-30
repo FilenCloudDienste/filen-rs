@@ -297,7 +297,7 @@ impl Reporter {
 		self.with_state(|state| {
 			state.totals = totals;
 			for entry in skipped {
-				state.counts.entries_skipped += 1;
+				state.counts.entries_skipped += entry.entries();
 				state.counts.bytes_skipped += entry.bytes;
 				state.core.push(CompressEvent::Skipped(entry.clone()));
 			}

@@ -25,7 +25,7 @@ pub use crate::job::report::RunState;
 
 use crate::fs::drive_job::{
 	listing::{FailedSource, ScanProgress},
-	plan::{PlanTotals, RenamedEntry, SkipReason, SkippedEntry},
+	plan::{PlanTotals, RenamedEntry, SkippedEntry},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,10 +359,7 @@ impl Reporter {
 		self.with_state(|state| {
 			state.totals = totals;
 			for entry in skipped {
-				state.counts.entries_skipped += match entry.reason {
-					SkipReason::UndecryptableFile { .. } => 1,
-					SkipReason::Unreachable { count } => count,
-				};
+				state.counts.entries_skipped += entry.entries();
 				state.counts.bytes_skipped += entry.bytes;
 				// the report keeps the entry too
 				state.core.push(CopyEvent::Skipped(entry.clone()));

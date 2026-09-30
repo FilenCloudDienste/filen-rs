@@ -463,6 +463,27 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_exactly_as_large_as_the_free_storage_fits() {
+	let tar = CompressFormat::Tar { compression: None };
+	let setup = setup(|_, _| {});
+	let size = start(&setup, "a.tar", tar, JobControl::default(), None)
+		.running
+		.await
+		.unwrap()
+		.unwrap()
+		.counts
+		.bytes_done;
+
+	let exact = start(&setup, "b.tar", tar, JobControl::default(), Some(size));
+	let report = exact.running.await.unwrap().unwrap();
+	assert_eq!(report.counts.bytes_done, size);
+
+	let short = start(&setup, "c.tar", tar, JobControl::default(), Some(size - 1));
+	let failed = short.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_that_ends_early_leaves_nothing_behind() {
 	// running out of storage while writing
 	let setup_storage = setup(|_, _| {});
@@ -2137,4 +2158,29 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	);
 	assert_eq!(report.counts.bytes_verified, report.counts.bytes_done);
 	setup.backend.assert_released(&job.reporter);
+}
+
+#[test]
+fn an_unreachable_record_counts_every_entry_it_stands_for() {
+	let reporter = Reporter::new(Arc::new(Recorder::default()));
+	reporter.set_plan(
+		PlanTotals::default(),
+		&[
+			SkippedEntry {
+				source_path: "orphans".into(),
+				bytes: 0,
+				reason: SkipReason::Unreachable { count: 3 },
+			},
+			SkippedEntry {
+				source_path: "docs/locked.bin".into(),
+				bytes: 7,
+				reason: SkipReason::UndecryptableFile {
+					uuid: Uuid::from_u128(0x5D),
+				},
+			},
+		],
+		&[],
+	);
+	assert_eq!(reporter.counts().entries_skipped, 4);
+	assert_eq!(reporter.counts().bytes_skipped, 7);
 }

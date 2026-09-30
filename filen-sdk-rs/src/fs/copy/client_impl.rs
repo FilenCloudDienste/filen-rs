@@ -11,6 +11,7 @@ use crate::{
 		categories::{DirType, Normal, fs::CategoryFS},
 		drive_job::{
 			backend::ClientBackend,
+			exceeds_limit,
 			listing::{ItemSource, ItemSourceDir, ListingBytes, ScanError, watch_listing},
 			plan::{ItemPlan, ItemPlanner, PlanRequest, PlanSource, PlanTotals},
 		},
@@ -39,10 +40,10 @@ pub struct CopyRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct CopyConfig {
-	/// Storage still free on the account, if the caller knows it: a copy larger than this fails
-	/// with [`ErrorKind::MaxStorageReached`] before anything is written. Its report still
-	/// carries the totals, counted as not attempted, so the caller can tell how much storage the
-	/// copy needs.
+	/// Storage still free on the account, if the caller knows it. A job that needs more fails
+	/// with [`ErrorKind::MaxStorageReached`]; one that needs exactly this much fits. A copy is
+	/// checked before anything is written, and its report still carries the totals, counted as
+	/// not attempted, so the caller can tell how much storage the copy needs.
 	pub max_bytes: Option<u64>,
 }
 
@@ -187,7 +188,7 @@ fn plan_to_run(
 ) -> Result<ItemPlan<ItemSourceDir>, Box<CopyFailed>> {
 	let (phase, error, totals) = match plan {
 		Ok(plan) => match max_bytes {
-			Some(max_bytes) if plan.totals.bytes > max_bytes => (
+			Some(max_bytes) if exceeds_limit(plan.totals.bytes, max_bytes) => (
 				CopyPhase::Failed,
 				Error::custom(
 					ErrorKind::MaxStorageReached,

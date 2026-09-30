@@ -19,7 +19,8 @@ use std::io::{self, Read};
 
 use tar::{EntryType, Header};
 
-use super::{format::is_tar_header, limits::exceeds_limit};
+use super::format::is_tar_header;
+use crate::fs::drive_job::exceeds_limit;
 
 /// Bytes of a tar block: headers, and member data padded to a whole number of them.
 pub(crate) const TAR_BLOCK_LEN: usize = 512;

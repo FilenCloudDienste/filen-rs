@@ -372,6 +372,31 @@ async fn directories_implied_past_the_member_cap_end_the_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extraction_that_needs_exactly_the_free_storage_fits() {
+	let tar = tar_of(&[("a.txt", &pattern(1000, 0)), ("b.txt", b"b")]);
+
+	let setup_exact = setup("a.tar", tar.clone(), |_| {});
+	let options = Options {
+		max_bytes: Some(1001),
+		..Options::default()
+	};
+	let report = start(&setup_exact, options).running.await.unwrap().unwrap();
+	assert_eq!(report.counts.files_done, 2);
+
+	let setup_short = setup("a.tar", tar, |_| {});
+	let options = Options {
+		max_bytes: Some(1000),
+		..Options::default()
+	};
+	let failed = start(&setup_short, options)
+		.running
+		.await
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 	let entries: [(&str, Option<&[u8]>); 3] = [
 		("docs", None),
@@ -382,10 +407,10 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 		("s.zip", zip_of(&entries, None)),
 		("s.7z", sevenz_of(&entries, LZMA2, true, None)),
 	] {
-		// what the index states, 9 bytes, reaches the limit
+		// what the index states, 9 bytes, is more than the limit
 		let refused = setup(name, archive.clone(), |_| {});
 		let options = Options {
-			max_bytes: Some(9),
+			max_bytes: Some(8),
 			..Options::default()
 		};
 		let failed = start(&refused, options).running.await.unwrap().unwrap_err();
@@ -393,9 +418,10 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 		assert!(created_dirs(&refused).is_empty(), "{name}");
 		assert!(finished(&refused).is_empty(), "{name}");
 
+		// exactly the limit fits
 		let fits = setup(name, archive, |_| {});
 		let options = Options {
-			max_bytes: Some(10),
+			max_bytes: Some(9),
 			..Options::default()
 		};
 		let report = start(&fits, options).running.await.unwrap().unwrap();
