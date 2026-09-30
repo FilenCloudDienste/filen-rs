@@ -164,18 +164,20 @@ pub struct ListTotals {
 }
 
 impl ListTotals {
+	/// Counts `entry` in. The sizes are the archive's word, so their sums saturate rather than
+	/// overflow, as an extraction's do.
 	fn count(&mut self, entry: &ArchiveEntry) {
 		self.entries += 1;
 		let size = entry.size.unwrap_or(0);
 		match (&entry.skip, &entry.kind) {
 			(Some(_), _) => {
 				self.skipped += 1;
-				self.bytes_skipped += size;
+				self.bytes_skipped = self.bytes_skipped.saturating_add(size);
 			}
 			(None, ArchiveEntryKind::Dir) => self.dirs += 1,
 			(None, _) => {
 				self.files += 1;
-				self.bytes += size;
+				self.bytes = self.bytes.saturating_add(size);
 			}
 		}
 	}

@@ -9,6 +9,7 @@
 //! A name listed twice keeps its last entry, as zip tools do, and the duplicates are reported.
 
 use std::{
+	borrow::Cow,
 	cell::RefCell,
 	io::{self, BufReader, Read, Seek, SeekFrom},
 	mem,
@@ -49,6 +50,10 @@ const LOCAL_HEADER_LEN_U64: u64 = LOCAL_HEADER_LEN as u64;
 /// A comment may be up to this long, so the end record is in the file's last 64 KiB and change.
 const MAX_COMMENT_LEN: u64 = 0xFFFF;
 /// End-record candidates tried before giving up: a comment can hold the record's signature.
+/// Telling whether one can be the zip's reads two signatures it points at (see [`plausible`]):
+/// free when they are in the file's tail, read already, and otherwise one fetch each, so at most
+/// 32 fetches, all before the index budget is checked. A candidate is only probed when that can
+/// change which one is taken.
 const MAX_EOCD_CANDIDATES: usize = 16;
 /// Names kept one by one when a name is listed twice; beyond that they are counted.
 const MAX_DUPLICATE_NAMES: usize = 100;
@@ -172,6 +177,33 @@ fn read_at<R: Read + Seek>(source: &mut R, offset: u64, len: usize) -> Result<Ve
 	Ok(buf)
 }
 
+/// The file's tail, read whole to find the end record, which the records around that are read
+/// from when they are in it rather than fetched again.
+struct Tail {
+	bytes: Vec<u8>,
+	/// Where it starts in the file.
+	at: u64,
+}
+
+impl Tail {
+	/// The `len` bytes of the file at `pos`: from the tail when it holds them.
+	fn read<R: Read + Seek>(
+		&self,
+		source: &mut R,
+		pos: u64,
+		len: usize,
+	) -> Result<Cow<'_, [u8]>, ZipError> {
+		match pos
+			.checked_sub(self.at)
+			.and_then(|at| usize::try_from(at).ok())
+			.and_then(|at| self.bytes.get(at..at.checked_add(len)?))
+		{
+			Some(bytes) => Ok(Cow::Borrowed(bytes)),
+			None => read_at(source, pos, len).map(Cow::Owned),
+		}
+	}
+}
+
 /// Where the central directory is, and what it says of itself.
 struct Directory {
 	/// Where it starts in the file.
@@ -193,24 +225,29 @@ fn find_directory<R: Read + Seek>(
 		return Err(ZipError::Corrupt("too short to be a zip"));
 	}
 	let window = len.min(EOCD_LEN_U64 + MAX_COMMENT_LEN);
-	let tail = read_at(source, len - window, window as usize)?;
-	let comment_end = |at: usize| at as u64 + EOCD_LEN_U64 + u64::from(u16_at(&tail, at + 20));
+	let tail = Tail {
+		bytes: read_at(source, len - window, window as usize)?,
+		at: len - window,
+	};
+	let comment_end =
+		|at: usize| at as u64 + EOCD_LEN_U64 + u64::from(u16_at(&tail.bytes, at + 20));
 	// the record whose comment ends the file, or else the last one whose comment fits (other
 	// tools open a zip with bytes after its comment); either only if its directory can be where
 	// it says, since a comment, and the bytes after one, can hold the record's signature too
 	let mut candidates = 0;
 	let (mut exact, mut fitting, mut implausible) = (None, None, None);
-	for at in (0..=tail.len() - EOCD_LEN).rev() {
-		if u32_at(&tail, at) != EOCD_SIG {
+	for at in (0..=tail.bytes.len() - EOCD_LEN).rev() {
+		if u32_at(&tail.bytes, at) != EOCD_SIG {
 			continue;
 		}
 		candidates += 1;
 		let end = comment_end(at);
-		if end <= window {
-			let record = &tail[at..at + EOCD_LEN];
+		// a later record that fits is taken over this one unless this one ends the file
+		if end <= window && (end == window || fitting.is_none()) {
+			let record = &tail.bytes[at..at + EOCD_LEN];
 			match (
 				end == window,
-				plausible(source, len - window + at as u64, record)?,
+				plausible(source, &tail, tail.at + at as u64, record)?,
 			) {
 				(true, true) => {
 					exact = Some(at);
@@ -235,8 +272,8 @@ fn find_directory<R: Read + Seek>(
 		.or(implausible)
 		.ok_or(ZipError::Corrupt("no end of central directory record"))?;
 	let trailing = window - comment_end(at);
-	let eocd_pos = len - window + at as u64;
-	let eocd = &tail[at..at + EOCD_LEN];
+	let eocd_pos = tail.at + at as u64;
+	let eocd = &tail.bytes[at..at + EOCD_LEN];
 	if u16_at(eocd, 4) != 0 || u16_at(eocd, 6) != 0 {
 		return Err(ZipError::Unsupported("a zip split across several files"));
 	}
@@ -247,7 +284,7 @@ fn find_directory<R: Read + Seek>(
 
 	// zip64: a locator right before the end record points at the zip64 end record
 	if eocd_pos >= EOCD64_LOCATOR_LEN_U64 + EOCD64_LEN_U64 {
-		let locator = read_at(
+		let locator = tail.read(
 			source,
 			eocd_pos - EOCD64_LOCATOR_LEN_U64,
 			EOCD64_LOCATOR_LEN,
@@ -258,12 +295,12 @@ fn find_directory<R: Read + Seek>(
 			let recorded = u64_at(&locator, 8);
 			let before = eocd_pos - EOCD64_LOCATOR_LEN_U64 - EOCD64_LEN_U64;
 			let record_at =
-				if read_at(source, before, 4).map(|b| u32_at(&b, 0)).ok() == Some(EOCD64_SIG) {
+				if tail.read(source, before, 4).map(|b| u32_at(&b, 0)).ok() == Some(EOCD64_SIG) {
 					before
 				} else {
 					recorded
 				};
-			let record = read_at(source, record_at, EOCD64_LEN)?;
+			let record = tail.read(source, record_at, EOCD64_LEN)?;
 			if u32_at(&record, 0) != EOCD64_SIG {
 				return Err(ZipError::Corrupt("the zip64 end record is missing"));
 			}
@@ -312,9 +349,15 @@ fn find_directory<R: Read + Seek>(
 
 /// Whether the end record at `eocd_pos` can be the zip's: it has a zip64 locator before it, or
 /// its central directory fits before it and starts with a record's signature.
-fn plausible<R: Read + Seek>(source: &mut R, eocd_pos: u64, eocd: &[u8]) -> Result<bool, ZipError> {
+fn plausible<R: Read + Seek>(
+	source: &mut R,
+	tail: &Tail,
+	eocd_pos: u64,
+	eocd: &[u8],
+) -> Result<bool, ZipError> {
+	let mut signature = |pos: u64| tail.read(source, pos, 4).map(|bytes| u32_at(&bytes, 0));
 	if eocd_pos >= EOCD64_LOCATOR_LEN_U64
-		&& u32_at(&read_at(source, eocd_pos - EOCD64_LOCATOR_LEN_U64, 4)?, 0) == EOCD64_LOCATOR_SIG
+		&& signature(eocd_pos - EOCD64_LOCATOR_LEN_U64)? == EOCD64_LOCATOR_SIG
 	{
 		return Ok(true);
 	}
@@ -323,7 +366,7 @@ fn plausible<R: Read + Seek>(source: &mut R, eocd_pos: u64, eocd: &[u8]) -> Resu
 	let Some(start) = eocd_pos.checked_sub(size).filter(|&start| offset <= start) else {
 		return Ok(false);
 	};
-	Ok(size == 0 || u32_at(&read_at(source, start, 4)?, 0) == CENTRAL_HEADER_SIG)
+	Ok(size == 0 || signature(start)? == CENTRAL_HEADER_SIG)
 }
 
 /// Reads a zip's central directory.
@@ -780,6 +823,11 @@ fn stream_entry<'s>(
 /// A stream decoder whose input is the entry's stored data and nothing else: bytes after its
 /// stream, which the decoder reads to its end, belong to no data, and damage the entry. Zero
 /// bytes there are padding, as behind a standalone stream.
+///
+/// Stricter than the other methods on purpose. Their decoders stop at their stream's end and
+/// never see what follows it, which [`Checked`] drains unread, as other zip readers do. A
+/// whole-stream decoder reads on to its input's end to take every frame of a stream of
+/// several, so it sees and counts what follows the last one, and an entry holds one stream.
 struct WholeStream<'s>(Box<dyn StreamDecoder + 's>);
 
 impl Read for WholeStream<'_> {

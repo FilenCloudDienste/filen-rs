@@ -374,3 +374,38 @@ fn tar_failure(error: TarError) -> Error {
 		Err(error) => failure(error),
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::{ListedFiles, Shadow, Shadowed};
+	use crate::alloc_meter;
+
+	#[test]
+	fn a_tar_listings_link_bookkeeping_takes_at_most_96_bytes_a_member() {
+		// the bound ArchiveConfig::max_members states
+		const BYTES_A_MEMBER: u64 = 96;
+		const MEMBERS: u64 = 1_000_000;
+		// every member a file a later link may name, or every one standing at its path
+		for listed in [true, false] {
+			let ((), peak) = alloc_meter::peak_bytes(|| {
+				let mut files = ListedFiles::default();
+				let mut shadowed = Shadowed::default();
+				for ordinal in 0..MEMBERS {
+					// as spread as a hash's first bytes
+					let key = ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+					if listed {
+						files.insert(key, (ordinal, ordinal));
+						shadowed.note(Some(key), None);
+					} else {
+						shadowed.note(Some(key), Some(Shadow::Other));
+					}
+				}
+			});
+			assert!(
+				peak <= MEMBERS * BYTES_A_MEMBER,
+				"listed {listed}: {} bytes a member",
+				peak / MEMBERS
+			);
+		}
+	}
+}

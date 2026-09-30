@@ -130,6 +130,74 @@ fn an_end_record_signature_after_the_comment_is_not_taken_for_one() {
 	assert_eq!(read_all(&padded, None).unwrap()[0].2, b"alpha");
 }
 
+/// A `Read + Seek` over `bytes` that counts its seeks: one per record read.
+struct CountingSeeks<'b> {
+	inner: Cursor<&'b [u8]>,
+	seeks: usize,
+}
+
+impl Read for CountingSeeks<'_> {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		self.inner.read(buf)
+	}
+}
+
+impl Seek for CountingSeeks<'_> {
+	fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+		self.seeks += 1;
+		self.inner.seek(pos)
+	}
+}
+
+#[test]
+fn candidate_end_records_are_told_from_the_tail_alone() {
+	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);
+	// two more signatures after the real record, neither of them one
+	let mut padded = zip.clone();
+	for _ in 0..2 {
+		padded.extend_from_slice(&EOCD_SIG.to_le_bytes());
+		padded.extend_from_slice(&[0xFF; 30]);
+	}
+	let mut source = CountingSeeks {
+		inner: Cursor::new(&padded[..]),
+		seeks: 0,
+	};
+	let index = read_index(&mut source, padded.len() as u64, LIMITS).unwrap();
+	assert_eq!(index.entries.len(), 1);
+	// the tail, then the central directory: nothing fetched to probe the candidates
+	assert_eq!(source.seeks, 2);
+}
+
+#[test]
+fn a_record_whose_comment_ends_the_zip_is_taken_over_a_later_one() {
+	// a plausible end record inside the real one's comment, whose own comment does not end the
+	// zip: the real one is taken, where CPython and Go take the last plausible record
+	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);
+	let eocd = zip.len() - EOCD_LEN;
+	let size = u32_at(&zip, eocd + 12);
+	let offset = u32_at(&zip, eocd + 16);
+	// its directory would run from the real one's start through the real end record
+	let hidden = [
+		&EOCD_SIG.to_le_bytes()[..],
+		&[0; 4],
+		&1u16.to_le_bytes(),
+		&1u16.to_le_bytes(),
+		&(size + u32::try_from(EOCD_LEN).unwrap()).to_le_bytes(),
+		&offset.to_le_bytes(),
+		&0u16.to_le_bytes(),
+	]
+	.concat();
+	let comment = [&hidden[..], b"the rest of the comment"].concat();
+	let mut commented = zip.clone();
+	commented[zip.len() - 2..]
+		.copy_from_slice(&u16::try_from(comment.len()).unwrap().to_le_bytes());
+	commented.extend_from_slice(&comment);
+	let mut source = Cursor::new(&commented);
+	let index = read_index(&mut source, commented.len() as u64, LIMITS).unwrap();
+	assert_eq!(index.trailing_bytes, 0);
+	assert_eq!(read_all(&commented, None).unwrap()[0].2, b"alpha");
+}
+
 #[test]
 fn bytes_after_the_end_record_are_counted() {
 	let zip = ours(&[("a.txt", Some(&b"alpha"[..]))], ZipMethod::Stored, None);

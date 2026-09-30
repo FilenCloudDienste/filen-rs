@@ -5,6 +5,8 @@ use std::{
 	io::{Cursor, Write},
 };
 
+use filen_types::fs::Uuid;
+
 use super::*;
 use crate::{
 	ErrorKind,
@@ -272,4 +274,32 @@ async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 	);
 	assert_eq!(kept as u64 + listed.omitted_entries, names.len() as u64);
 	assert_eq!(listing.recorder.entries.lock().unwrap().len(), names.len());
+}
+
+#[test]
+fn stated_sizes_add_up_without_overflowing() {
+	let entry = |skip| ArchiveEntry {
+		id: ArchiveEntryId {
+			archive: Uuid::nil(),
+			index: 0,
+		},
+		stored_path: "big.bin".to_owned(),
+		stored_path_truncated: false,
+		path: Some("big.bin".to_owned()),
+		size: Some(1 << 63),
+		modified: None,
+		encrypted: false,
+		method: None,
+		skip,
+		path_rewritten: false,
+		misleading_name: false,
+		mac_metadata: false,
+		kind: ArchiveEntryKind::File,
+	};
+	let mut totals = ListTotals::default();
+	for skip in [None, Some(ExtractSkipReason::UnsupportedMethod)] {
+		totals.count(&entry(skip.clone()));
+		totals.count(&entry(skip));
+	}
+	assert_eq!((totals.bytes, totals.bytes_skipped), (u64::MAX, u64::MAX));
 }

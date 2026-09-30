@@ -471,6 +471,18 @@ fn limits_are_checked_before_allocating() {
 		None,
 	);
 	assert_eq!(read_with(&small, None, tiny_codec).unwrap()[0].2, b"abc");
+	// nor does a budget as large as a client may set overflow what a folder is given
+	let unbounded = SevenZLimits {
+		decoder_memory: u64::MAX,
+		..LIMITS
+	};
+	let stored = ours(
+		&[("a".into(), Some(b"abc".to_vec()))],
+		SevenZMethod::Copy,
+		true,
+		None,
+	);
+	assert_eq!(read_with(&stored, None, unbounded).unwrap()[0].2, b"abc");
 }
 
 #[test]
@@ -742,4 +754,22 @@ fn every_coder_has_to_feed_the_folders_output() {
 		check_acyclic(&folder(vec![(1, 2), (2, 1)], vec![0])),
 		Err(SevenZError::Corrupt(_))
 	));
+}
+
+#[test]
+fn a_reparse_name_of_an_odd_length_is_no_link() {
+	// a mount point whose print name, "ab" in UTF-16, is said to be 3 bytes long
+	let mut body = Vec::new();
+	for field in [0u16, 0, 0, 3] {
+		body.extend(field.to_le_bytes());
+	}
+	body.extend(b"a\0b\0");
+	let mut data = 0xA000_0003u32.to_le_bytes().to_vec();
+	data.extend(u16::try_from(body.len()).unwrap().to_le_bytes());
+	data.extend([0, 0]);
+	data.extend(body);
+	assert_eq!(windows_link_target(&data), None);
+	// the print name's length, even
+	data[14] = 2;
+	assert_eq!(windows_link_target(&data).as_deref(), Some("a"));
 }

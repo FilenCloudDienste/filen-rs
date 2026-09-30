@@ -1306,7 +1306,8 @@ pub(crate) fn open_folder<'s, R: Read + Seek + 's>(
 		offsets,
 		sizes,
 		keys,
-		zstd_memory: ZSTD_BASE_BYTES + (decoder_memory - memory) / zstd_coders.max(1),
+		// the budget is the caller's to set, up to u64::MAX
+		zstd_memory: ZSTD_BASE_BYTES.saturating_add((decoder_memory - memory) / zstd_coders.max(1)),
 	};
 	builder.output(folder.main)
 }
@@ -1575,21 +1576,32 @@ pub(crate) fn wrong_key(error: SevenZError) -> SevenZError {
 pub(crate) fn windows_link_target(data: &[u8]) -> Option<String> {
 	const SYMLINK: u32 = 0xA000_000C;
 	const MOUNT_POINT: u32 = 0xA000_0003;
+	// the tag, the length of what follows the header, and a reserved field
+	const HEADER: usize = 8;
+	const LENGTH_AT: usize = 4;
+	// then each name's offset and length, the substitute name's first
+	const SUBSTITUTE: usize = HEADER;
+	const PRINT: usize = HEADER + 4;
+	const NAME_FIELDS: usize = 8;
+	// a symlink's flags come after those, before its names
+	const SYMLINK_FLAGS: usize = 4;
 	let u16_at = |at: usize| Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?));
 	let tag = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
-	// the tag, the data's length and a reserved field, then the names' offsets and lengths
-	if usize::from(u16_at(4)?) + 8 != data.len() {
+	if usize::from(u16_at(LENGTH_AT)?) + HEADER != data.len() {
 		return None;
 	}
 	let names = match tag {
-		// a symlink's flags come before its names
-		SYMLINK => 8 + 8 + 4,
-		MOUNT_POINT => 8 + 8,
+		SYMLINK => HEADER + NAME_FIELDS + SYMLINK_FLAGS,
+		MOUNT_POINT => HEADER + NAME_FIELDS,
 		_ => return None,
 	};
 	let name = |field: usize| -> Option<String> {
-		let offset = usize::from(u16_at(8 + field)?);
-		let len = usize::from(u16_at(10 + field)?);
+		let offset = usize::from(u16_at(field)?);
+		let len = usize::from(u16_at(field + 2)?);
+		// UTF-16, as `read_names` refuses a name of an odd length
+		if len % 2 != 0 {
+			return None;
+		}
 		let bytes = data.get(names + offset..names + offset + len)?;
 		let units = bytes
 			.chunks_exact(2)
@@ -1598,7 +1610,7 @@ pub(crate) fn windows_link_target(data: &[u8]) -> Option<String> {
 			.collect::<Result<String, _>>()
 			.ok()
 	};
-	let (substitute, print) = (name(0)?, name(4)?);
+	let (substitute, print) = (name(SUBSTITUTE)?, name(PRINT)?);
 	Some(if print.is_empty() {
 		substitute
 			.strip_prefix(r"\??\")
