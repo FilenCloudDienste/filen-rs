@@ -271,7 +271,7 @@ impl ItemPlanner {
 			if !self.destinations.contains_key(&request.destination) {
 				return Err(Error::custom(
 					ErrorKind::Internal,
-					"a destination was not registered with the planner",
+					"copy destination was not registered with the planner",
 				));
 			}
 			if let PlanSource::Dir { root, dirs, .. } = &request.source
@@ -280,7 +280,7 @@ impl ItemPlanner {
 			{
 				return Err(Error::custom(
 					ErrorKind::InvalidState,
-					"cannot place a directory inside itself or one of its subdirectories",
+					"cannot copy a directory into itself or one of its subdirectories",
 				));
 			}
 		}
@@ -881,6 +881,12 @@ mod tests {
 				.plan(vec![request(source(), destination)])
 				.unwrap_err();
 			assert_eq!(error.kind(), ErrorKind::InvalidState);
+			assert!(
+				error
+					.to_string()
+					.contains("cannot copy a directory into itself or one of its subdirectories"),
+				"{error}"
+			);
 		}
 	}
 
