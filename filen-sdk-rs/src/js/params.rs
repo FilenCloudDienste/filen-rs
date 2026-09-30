@@ -161,8 +161,8 @@ pub struct UploadFileStreamParams {
 	pub reader: web_sys::ReadableStream,
 	pub known_size: Option<u64>,
 	#[tsify(type = "(bytes: bigint) => void", optional)]
-	#[serde(default, with = "serde_wasm_bindgen::preserve")]
-	pub progress: js_sys::Function,
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub progress: Option<js_sys::Function>,
 	// Direct (non-flattened) field so serde_wasm_bindgen::preserve keeps the abort/pause
 	// signals as live JS references. Flattening buffers the params into a serde map, which
 	// strips the preserved values — the download stream params keep it direct for the same reason.

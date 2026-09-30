@@ -51,15 +51,11 @@ impl ServiceWorkerClient {
 
 		// we handle the progress callback here because it's easier to not have to spawn another local task
 		// to pass through the progress updates
-		let progress_callback = if params.progress.is_undefined() {
-			None
-		} else {
-			Some(move |bytes: u64| {
-				let _ = params
-					.progress
-					.call1(&wasm_bindgen::JsValue::UNDEFINED, &bytes.into());
-			})
-		};
+		let progress_callback = params.progress.map(|progress| {
+			move |bytes: u64| {
+				let _ = progress.call1(&wasm_bindgen::JsValue::UNDEFINED, &bytes.into());
+			}
+		});
 
 		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
 
