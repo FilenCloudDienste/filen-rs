@@ -112,6 +112,9 @@ const EDITS_BASE_BYTES: u64 = 4 * 1024;
 /// What ONE edit — a folded directory move, a confirmed push — may add to that: a layer holding two
 /// paths, or a marker entry keyed by one, with room for the map's slack. A move that wrote the rows
 /// it carries is hundreds of bytes per ROW, and fails this at any subtree past a handful of rows.
+///
+/// What a move's pass READS is bounded beside this, per file the move carries and per scenario
+/// (see [`Scenario::read_rows_per_carried_file`]).
 const EDIT_BYTES: u64 = 1024;
 
 /// Samples per scenario when `SYNC_BENCH_SAMPLES` is unset. Three is the floor a median means
@@ -476,6 +479,15 @@ fn validate(scenario: &Scenario, changed: usize, nodes: usize) {
 			scenario.name
 		);
 	}
+	// A move without a read bound would read its subtree any number of times unnoticed, and a bound
+	// on any other class has no carried files to be multiplied by.
+	assert_eq!(
+		scenario.read_rows_per_carried_file.is_some(),
+		scenario.change == Change::MoveDir,
+		"{}: a directory move, and only a directory move, declares the rows its pass may read per \
+		 file it carries",
+		scenario.name
+	);
 	match scenario.change {
 		// The floor: the one scenario that plans nothing, and it has to say so outright.
 		Change::Idle => {
@@ -668,6 +680,21 @@ pub struct Scenario {
 	pub read: ExpectRead,
 	/// The plan the pass must produce, checked every sample.
 	pub expect: Expect,
+	/// For a directory move, the baseline rows its pass may read per file the move carries: the
+	/// memory child fails the run when `walk:baseline_read_rows` goes past this times the carried
+	/// files, as it fails one whose edits go past `EDIT_BYTES` per move. Each read of the moved
+	/// subtree costs a row per file, so a bound set at the multiple the scenario measured, rounded
+	/// up to the next whole one, fails a pass that reads the subtree once more. Per scenario rather
+	/// than one constant, because the multiple is not one: a directory holding half the pair reads
+	/// eleven rows a file, while a leaf of twenty files reads twenty to thirty-seven, most of them
+	/// the page the fold's cursor reads ahead past the leaf (208 of the 10k tree's 393). Lower it
+	/// when a read is removed. `None` for every other change class; `validate` holds the two
+	/// together.
+	///
+	/// Not in [`definition_hash`](Self::definition_hash): it decides what a run REFUSES, not what
+	/// it measures, and a hash it moved would orphan a scenario's published rows each time a read
+	/// was removed and the bound lowered after it.
+	pub read_rows_per_carried_file: Option<u64>,
 }
 
 /// FNV-1a over a spec string. Small, dependency-free and stable across builds, which is all a
@@ -761,6 +788,7 @@ const fn balanced(
 		reps,
 		read,
 		expect,
+		read_rows_per_carried_file: None,
 	}
 }
 
@@ -895,20 +923,24 @@ pub const SCENARIOS: &[Scenario] = &[
 		ExpectRead::Scoped,
 		PER_CHANGED,
 	),
-	balanced(
-		"twoway_dir_move_10k",
-		10_000,
-		Change::MoveDir,
-		SyncMode::TwoWay,
-		4,
-		ExpectRead::Scoped,
-		Expect {
-			actions: Count::PerChanged,
-			held: Count::Exactly(0),
-			conflicts: Count::Exactly(0),
-			dir_moves: Count::PerChanged,
-		},
-	),
+	Scenario {
+		// 393 rows for the twenty files the leaf carries.
+		read_rows_per_carried_file: Some(20),
+		..balanced(
+			"twoway_dir_move_10k",
+			10_000,
+			Change::MoveDir,
+			SyncMode::TwoWay,
+			4,
+			ExpectRead::Scoped,
+			Expect {
+				actions: Count::PerChanged,
+				held: Count::Exactly(0),
+				conflicts: Count::Exactly(0),
+				dir_moves: Count::PerChanged,
+			},
+		)
+	},
 	balanced(
 		"twoway_both_changelists_10k",
 		10_000,
@@ -964,6 +996,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		reps: 1,
 		read: ExpectRead::Scoped,
 		expect: PER_CHANGED,
+		read_rows_per_carried_file: None,
 	},
 	Scenario {
 		name: "twoway_deep_narrow_100_edits_10k",
@@ -979,6 +1012,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		reps: 1,
 		read: ExpectRead::Scoped,
 		expect: PER_CHANGED,
+		read_rows_per_carried_file: None,
 	},
 	Scenario {
 		name: "twoway_long_paths_100_edits_10k",
@@ -993,6 +1027,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		reps: 1,
 		read: ExpectRead::Scoped,
 		expect: PER_CHANGED,
+		read_rows_per_carried_file: None,
 	},
 	Scenario {
 		name: "twoway_unicode_100_edits_10k",
@@ -1007,6 +1042,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		reps: 1,
 		read: ExpectRead::Scoped,
 		expect: PER_CHANGED,
+		read_rows_per_carried_file: None,
 	},
 	// ----- bytes rather than nodes: its own group of one -----
 	//
@@ -1029,6 +1065,7 @@ pub const SCENARIOS: &[Scenario] = &[
 		reps: 1,
 		read: ExpectRead::Scoped,
 		expect: PER_CHANGED,
+		read_rows_per_carried_file: None,
 	},
 	// ----- modes, 10k -----
 	balanced(
@@ -1113,26 +1150,31 @@ pub const SCENARIOS: &[Scenario] = &[
 		ExpectRead::Scoped,
 		PER_CHANGED,
 	),
-	balanced(
-		"twoway_dir_move_100k",
-		100_000,
-		Change::MoveDir,
-		SyncMode::TwoWay,
-		4,
-		ExpectRead::Scoped,
-		Expect {
-			actions: Count::PerChanged,
-			held: Count::Exactly(0),
-			conflicts: Count::Exactly(0),
-			dir_moves: Count::PerChanged,
-		},
-	),
+	Scenario {
+		// 582 rows for the twenty files the leaf carries.
+		read_rows_per_carried_file: Some(30),
+		..balanced(
+			"twoway_dir_move_100k",
+			100_000,
+			Change::MoveDir,
+			SyncMode::TwoWay,
+			4,
+			ExpectRead::Scoped,
+			Expect {
+				actions: Count::PerChanged,
+				held: Count::Exactly(0),
+				conflicts: Count::Exactly(0),
+				dir_moves: Count::PerChanged,
+			},
+		)
+	},
 	// A directory holding HALF the pair renamed: two top-level directories of 50k files each, one
 	// of them moved. The move above carries the deepest directory, a leaf of twenty files, so its
 	// cost says nothing about how a fold scales with what the moved directory holds; this is the
 	// other end of that, with the other half left untouched for the fixture checks to verify. A pass
 	// that folded the move by writing the rows it carries holds every one of them in its edits, and
-	// the memory child's bound on those fails it.
+	// the memory child's bound on those fails it; one that reads the moved subtree once more than it
+	// needs to reads 50,000 more rows, and the bound on its reads fails that.
 	Scenario {
 		name: "twoway_top_dir_move_100k",
 		version: 1,
@@ -1151,6 +1193,8 @@ pub const SCENARIOS: &[Scenario] = &[
 			conflicts: Count::Exactly(0),
 			dir_moves: Count::PerChanged,
 		},
+		// 550,076 rows for 50,000 files: the moved subtree, read eleven times.
+		read_rows_per_carried_file: Some(12),
 	},
 	balanced(
 		"twoway_after_upload_100k",
@@ -1205,20 +1249,24 @@ pub const SCENARIOS: &[Scenario] = &[
 	// The two passes that edit their own view of the baseline — a folded directory move and a
 	// confirmed push — at the size where a copy of the tree was the pass's widest point, before
 	// those edits moved beside the tree instead of into a copy of it.
-	balanced(
-		"twoway_dir_move_1m",
-		1_000_000,
-		Change::MoveDir,
-		SyncMode::TwoWay,
-		1,
-		ExpectRead::Scoped,
-		Expect {
-			actions: Count::PerChanged,
-			held: Count::Exactly(0),
-			conflicts: Count::Exactly(0),
-			dir_moves: Count::PerChanged,
-		},
-	),
+	Scenario {
+		// 738 rows for the twenty files the leaf carries.
+		read_rows_per_carried_file: Some(37),
+		..balanced(
+			"twoway_dir_move_1m",
+			1_000_000,
+			Change::MoveDir,
+			SyncMode::TwoWay,
+			1,
+			ExpectRead::Scoped,
+			Expect {
+				actions: Count::PerChanged,
+				held: Count::Exactly(0),
+				conflicts: Count::Exactly(0),
+				dir_moves: Count::PerChanged,
+			},
+		)
+	},
 	balanced(
 		"twoway_after_upload_1m",
 		1_000_000,
@@ -1503,6 +1551,9 @@ struct Applied {
 	/// How many unconfirmed pushes of ours the fixture's baseline holds, every one of which the
 	/// pass must confirm (see [`Change::AfterUpload`]).
 	pushes: usize,
+	/// The file rows under the directory a [`MoveDir`](Change::MoveDir) moved: what its folded move
+	/// carries, and what [`Scenario::read_rows_per_carried_file`] is a multiple of.
+	carried: usize,
 }
 
 impl Applied {
@@ -1515,6 +1566,7 @@ impl Applied {
 			remote: Vec::new(),
 			changed: 0,
 			pushes: 0,
+			carried: 0,
 		}
 	}
 }
@@ -1946,9 +1998,18 @@ fn apply_change(fixture: &Fixture, rows: &[BaselineEntry], scenario: &Scenario) 
 			let to = prefixed(&moved.rel_path, "moved_");
 			fs::rename(root.join(&moved.rel_path), root.join(&to))
 				.expect("moving a fixture directory");
+			let carried = files
+				.iter()
+				.filter(|row| {
+					row.rel_path
+						.strip_prefix(moved.rel_path.as_str())
+						.is_some_and(|rest| rest.starts_with('/'))
+				})
+				.count();
 			Applied {
 				changed: 1,
 				renamed: vec![(moved.rel_path.clone(), to)],
+				carried,
 				..Applied::nothing()
 			}
 		}
@@ -2167,6 +2228,7 @@ struct Handover {
 	remote: Vec<RemoteLine>,
 	changed: usize,
 	pushes: usize,
+	carried: usize,
 	/// Where the child writes its answer.
 	answer: PathBuf,
 }
@@ -2370,6 +2432,7 @@ fn measure_memory(bed: &Bed, scenario: &Scenario, samples: usize) -> Vec<MemAnsw
 				remote: bed.applied.remote.clone(),
 				changed: bed.applied.changed,
 				pushes: bed.applied.pushes,
+				carried: bed.applied.carried,
 				answer: answer.clone(),
 			};
 			fs::write(
@@ -2523,6 +2586,7 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 			remote: handover.remote.clone(),
 			changed: handover.changed,
 			pushes: handover.pushes,
+			carried: handover.carried,
 		},
 		fixture_hash: handover.fixture_hash,
 	};
@@ -2600,6 +2664,22 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 		plan.dir_moves,
 		plan.confirmed,
 	);
+	// What a directory move's pass READS, bounded per file the move carries the way its edits are
+	// bounded per move (see `Scenario::read_rows_per_carried_file`). A read of the moved subtree
+	// that an earlier one already answered holds nothing afterwards, so neither the edits nor a
+	// resident set shows it; the row count does, and the bound fails the run on it.
+	if let Some(per_file) = scenario.read_rows_per_carried_file {
+		let read_bound = per_file * handover.carried as u64;
+		assert!(
+			baseline_reads.1 <= read_bound,
+			"{}: the pass read {} baseline row(s) for a directory move carrying {} file(s), over \
+			 the {read_bound} ({per_file} a file) the scenario allows — it reads the moved subtree \
+			 more times than it did when the bound was set",
+			scenario.name,
+			baseline_reads.1,
+			handover.carried,
+		);
+	}
 	drop(bed);
 	// A high-water mark cannot sit BELOW a sample of the same process's resident set. Zero is what
 	// `peak_rss_bytes` answers where it cannot ask — `getrusage` failing, or a target that has none
