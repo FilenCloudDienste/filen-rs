@@ -73,7 +73,7 @@ pub(in super::super) fn reset_reads() {
 /// What one statement handed back, counted in rows for [`ROWS_READ`].
 trait Answer {
 	// Counted only where there is a counter to count into.
-	#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
+	#[cfg_attr(not(any(test, feature = "bench-internals")), allow(dead_code))]
 	fn rows(&self) -> usize;
 }
 
@@ -132,6 +132,10 @@ pub(in super::super) struct Snapshot {
 	ahead: Mutex<Ahead<Page>>,
 	/// The same for the questions about one folded path (see [`Snapshot::folded_at`]).
 	folded_ahead: Mutex<Ahead<FoldedPage>>,
+	/// `(statements, rows)` read through THIS snapshot, where the benchmark's counters count every
+	/// one in the process: what a test holds the reads of one pass over its rows to.
+	#[cfg(test)]
+	reads: Mutex<(usize, usize)>,
 }
 
 /// The page a kind of question read last, and what the questions made of it (see
@@ -420,6 +424,8 @@ impl Snapshot {
 			last_page: Mutex::new(None),
 			ahead: Mutex::new(Ahead::default()),
 			folded_ahead: Mutex::new(Ahead::default()),
+			#[cfg(test)]
+			reads: Mutex::new((0, 0)),
 		})
 	}
 
@@ -430,6 +436,14 @@ impl Snapshot {
 	) -> T {
 		#[cfg(feature = "bench-internals")]
 		STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		#[cfg(test)]
+		let read = |conn: &Connection| {
+			read(conn).inspect(|answer| {
+				let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+				reads.0 += 1;
+				reads.1 += answer.rows();
+			})
+		};
 		let guard = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
 		let conn = guard
 			.as_ref()
@@ -717,6 +731,12 @@ impl Snapshot {
 					.collect()
 			}
 		})
+	}
+
+	/// What [`reads`](Self::reads) has counted so far.
+	#[cfg(test)]
+	pub(super) fn reads_for_test(&self) -> (usize, usize) {
+		*self.reads.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
 	/// Write `entry` into the rows a test built this snapshot over, and re-read the counts.
