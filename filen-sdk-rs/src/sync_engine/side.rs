@@ -39,7 +39,9 @@
 //! [`Side::rekey_subtree`] touches the OVERLAY only. A carried side's nodes come off rows, and
 //! `Baseline::move_subtree` moves those rows, so the carried half re-keys ITSELF — re-keying it
 //! here as well would move it twice. The order is therefore load-bearing: re-key the side, THEN
-//! move the rows, while the source path still names them.
+//! move the rows, while the source path still names them. The same rows are under the OTHER side
+//! too, which a whole map would leave untouched and a carried side would let follow them, so
+//! that side is told to stay where it is first ([`Side::stay_put`]).
 //!
 //! [`Side::retain`] is a whole-side edit by construction — it asks about every node — so a carried
 //! side pays the tree for it, exactly as [`Nodes`] says in its own docs. A caller that knows which
@@ -464,6 +466,60 @@ impl<T: FromRow> Side<T> {
 				}
 			}
 		}
+	}
+
+	/// Keep this side where it is while the rows at and under `from` move onto `to` beneath it:
+	/// the half of a directory move [`rekey_subtree`](Self::rekey_subtree) is not, for the side
+	/// the move does NOT carry.
+	///
+	/// A whole side derives nothing from the rows, so moving them leaves it as it was. A carried
+	/// side reads its nodes off those very rows and would follow them: it would stop holding what
+	/// it carried at each source path, and start holding a node at each destination the row
+	/// lands on — a node no observation of this side ever found there. So before the rows move,
+	/// every path they leave or land on that this side recorded nothing at gets what the side
+	/// answers there NOW: the node the row at it carries, or — where a row lands on a path that
+	/// carried nothing — a tombstone.
+	///
+	/// Hands back those paths. Each is one where the side no longer holds what the row there
+	/// carries once the rows have moved, which is what a change-scoped pass has to decide (see
+	/// [`PassPaths::Changed`](super::plan::PassPaths::Changed)).
+	///
+	/// A walk of the rows under `from`, which is why a move whose match already proved this side
+	/// holds nothing at the source and a recorded node at every destination does not ask for it.
+	pub(crate) fn stay_put(&mut self, baseline: &Baseline, from: &str, to: &str) -> Vec<String> {
+		let Self::Carried(overlay) = self else {
+			return Vec::new();
+		};
+		// The rows the move overwrites, by the path it overwrites them at: none where the
+		// destination was free, which is every move but one onto rows it has to merge with. Keyed
+		// by a copy of the path the row holds, as the lookups below are by path.
+		let mut landed_on: HashMap<String, BaselineEntry> = baseline
+			.get(to)
+			.into_iter()
+			.chain(baseline.subtree(to))
+			.map(|row| (row.rel_path.clone(), row))
+			.collect();
+		let mut recorded = Vec::new();
+		for row in baseline.get(from).into_iter().chain(baseline.subtree(from)) {
+			let Some(landing) = moved_path(&row.rel_path, from, to) else {
+				continue;
+			};
+			// Each path recorded is handed back as well, hence the copies of it below. Where the
+			// path carried nothing before the rows land, the `None` recorded is the tombstone.
+			if overlay.get(&landing).is_none() {
+				let now = landed_on.remove(&landing).as_ref().and_then(T::from_row);
+				overlay.edits.insert(landing.clone(), now);
+				recorded.push(landing);
+			}
+			// A source path is left with no row at all, so only a node the row carried is lost.
+			if overlay.get(&row.rel_path).is_none()
+				&& let Some(node) = T::from_row(&row)
+			{
+				overlay.edits.insert(row.rel_path.clone(), Some(node));
+				recorded.push(row.rel_path);
+			}
+		}
+		recorded
 	}
 }
 

@@ -1869,7 +1869,7 @@ impl Prepared {
 	/// Carry each directory move across as one move — a case-only rename included — and read the
 	/// rest of the pass where those subtrees end up (see [`plan::fold_dir_moves`]).
 	fn fold_dir_moves(&mut self) {
-		self.dir_moves = plan::fold_dir_moves(
+		let (moves, stayed) = plan::fold_dir_moves(
 			self.record.mode,
 			&mut self.baseline,
 			&mut self.local_scan.nodes,
@@ -1877,6 +1877,7 @@ impl Prepared {
 			&self.holds.held_remote,
 			self.read.paths(),
 		);
+		self.dir_moves = moves;
 		// What this pass blocks and reports is keyed by path too, and has to follow the fold, or a
 		// block stays behind at a path nothing is keyed by any more while its item reads as absent at
 		// the new one: a remote item the view cannot place would have its local copy quarantined.
@@ -1922,6 +1923,11 @@ impl Prepared {
 					}
 				}
 			}
+		}
+		// What the side a move did not carry recorded to stay put, which the replay above cannot
+		// produce: decided as well, and already keyed where the moves left it.
+		if let PassRead::Scoped(decided) = &mut self.read {
+			decided.extend(stayed);
 		}
 	}
 
