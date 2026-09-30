@@ -114,7 +114,7 @@ impl PixelSink for BoxAccumulator {
 		if !rgba.len().is_multiple_of(row_bytes) {
 			return Err(ThumbError::Geometry);
 		}
-		let rows = (rgba.len() / row_bytes) as u32;
+		let rows = u32::try_from(rgba.len() / row_bytes).map_err(|_| ThumbError::Geometry)?;
 		if x.checked_add(w).is_none_or(|end| end > self.src_w)
 			|| y.checked_add(rows).is_none_or(|end| end > self.src_h)
 		{
