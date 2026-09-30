@@ -51,7 +51,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
 	borrow::Cow,
-	collections::{HashMap, hash_map},
+	collections::{HashMap, HashSet, hash_map},
 };
 
 use itertools::Either;
@@ -152,31 +152,61 @@ pub(super) trait FromRow: Clone {
 
 /// What a change-scoped pass observed, over the side the baseline rows already describe.
 ///
-/// One entry per path the pass actually read: `Some(node)` where it found something, `None` where
-/// it found nothing. That `None` is a TOMBSTONE, and it is the only thing that can take a carried
-/// row's node out of the side — invariant I1 as a data structure, since the only writer of one is
-/// an observation about that very path.
+/// One record per path the pass actually read: the node where it found something, a TOMBSTONE
+/// where it found nothing. The tombstone is the only thing that can take a carried row's node out
+/// of the side — invariant I1 as a data structure, since the only writer of one is an observation
+/// about that very path.
 ///
-/// A path with NO entry is one the pass got no evidence for, and its row still speaks for it.
-/// That is the whole difference between "observed absent" and "not looked at", which is why this
-/// is a map to `Option<T>` rather than a map plus a set of removals.
+/// A path with NO record is one the pass got no evidence for, and its row still speaks for it.
+/// That is the whole difference between "observed absent" and "not looked at", so every write
+/// keeps a path in at most one of the two collections, and [`get`](Self::get) answers all three.
+///
+/// Two collections where one map to `Option<T>` would say the same, because a tombstone in such a
+/// map costs a node's whole slot — 104 bytes for a local node, against a path's 24 in a set — and
+/// a directory renamed away tombstones every row under it. On a 50k-file directory rename that
+/// was half the local overlay, and what doubled its table to 131,072 buckets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Overlay<T> {
-	edits: HashMap<String, Option<T>>,
+	/// Where the pass found a node.
+	nodes: HashMap<String, T>,
+	/// Where it found nothing: the tombstones.
+	gone: HashSet<String>,
 }
 
 impl<T> Default for Overlay<T> {
 	fn default() -> Self {
 		Self {
-			edits: HashMap::new(),
+			nodes: HashMap::new(),
+			gone: HashSet::new(),
 		}
 	}
 }
 
 impl<T> Overlay<T> {
-	/// What the pass recorded at `path`; `None` when it recorded nothing there at all.
-	fn get(&self, path: &str) -> Option<&Option<T>> {
-		self.edits.get(path)
+	/// What the pass recorded at `path`: `Some(Some(node))` where it found one, `Some(None)` — a
+	/// tombstone — where it found nothing, and `None` where it recorded nothing at all.
+	fn get(&self, path: &str) -> Option<Option<&T>> {
+		match self.nodes.get(path) {
+			Some(node) => Some(Some(node)),
+			None => self.gone.contains(path).then_some(None),
+		}
+	}
+
+	/// Record `node` at `path`, over whatever was recorded there.
+	fn put(&mut self, path: String, node: T) {
+		self.gone.remove(&path);
+		self.nodes.insert(path, node);
+	}
+
+	/// Record that nothing is at `path`, over whatever was recorded there.
+	fn tombstone(&mut self, path: String) {
+		self.nodes.remove(&path);
+		self.gone.insert(path);
+	}
+
+	/// Every path the pass recorded anything at.
+	fn paths(&self) -> impl Iterator<Item = &String> {
+		self.nodes.keys().chain(&self.gone)
 	}
 
 	/// Whether the side this overlay corrects holds `path`: what the pass recorded there, or —
@@ -188,16 +218,6 @@ impl<T> Overlay<T> {
 			Some(edit) => edit.is_some(),
 			None => baseline.carryable(path),
 		}
-	}
-
-	fn iter(&self) -> impl Iterator<Item = (&String, &Option<T>)> {
-		self.edits.iter()
-	}
-
-	/// How many paths the pass recorded — the size of the per-pass data, never of the side.
-	#[cfg(feature = "bench-internals")]
-	fn capacity(&self) -> usize {
-		self.edits.capacity()
 	}
 }
 
@@ -225,13 +245,25 @@ impl<T> Side<T> {
 		Self::Carried(Overlay::default())
 	}
 
-	/// How many nodes this side has room for. Only the probe's memory accounting asks. For a
-	/// CARRIED side this is the per-pass data and not the tree, which is the whole point of it.
-	#[cfg(feature = "bench-internals")]
+	/// How many nodes this side has room for. Only the probe's memory accounting asks, and the
+	/// tests. For a CARRIED side this is the per-pass data and not the tree, which is the whole
+	/// point of it.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(crate) fn capacity(&self) -> usize {
 		match self {
 			Self::Whole(map) => map.capacity(),
-			Self::Carried(overlay) => overlay.capacity(),
+			Self::Carried(overlay) => overlay.nodes.capacity(),
+		}
+	}
+
+	/// How many tombstones this side has room for, beside [`capacity`](Self::capacity)'s nodes:
+	/// a carried side keeps them in a set of paths of their own. None for a whole side, which
+	/// records no absence. Only the probe's memory accounting asks.
+	#[cfg(feature = "bench-internals")]
+	pub(crate) fn tombstone_capacity(&self) -> usize {
+		match self {
+			Self::Whole(_) => 0,
+			Self::Carried(overlay) => overlay.gone.capacity(),
 		}
 	}
 
@@ -268,15 +300,17 @@ impl<T> Side<T> {
 	/// added: the local observation, the remote delta, the fold of unacknowledged writes.
 	///
 	/// A whole side answers with every path it holds, which is all it has. A carried one answers
-	/// with its OVERLAY alone, and that is exact rather than a shortcut:
+	/// with its OVERLAY's nodes alone, and that is exact rather than a shortcut:
 	/// [`derive::from_baseline`](super::derive::from_baseline) places nothing, so every other path
 	/// such a side holds IS a baseline row answering for itself. That is what lets the assembly
 	/// check cost the change rather than the tree.
-	pub(super) fn own_keys(&self) -> OwnKeys<'_, T> {
+	pub(super) fn own_keys(&self) -> impl Iterator<Item = &str> {
 		match self {
-			Self::Whole(map) => OwnKeys::Whole(map.keys()),
-			Self::Carried(overlay) => OwnKeys::Carried(overlay.edits.iter()),
+			Self::Whole(map) => map.keys(),
+			// A tombstone holds nothing, so it is not a key this side has.
+			Self::Carried(overlay) => overlay.nodes.keys(),
 		}
+		.map(String::as_str)
 	}
 
 	/// This side's nodes by value, for a test that owns a WHOLE one and wants to feed them
@@ -301,9 +335,7 @@ impl<T> Side<T> {
 			Self::Whole(map) => {
 				map.insert(path, node);
 			}
-			Self::Carried(overlay) => {
-				overlay.edits.insert(path, Some(node));
-			}
+			Self::Carried(overlay) => overlay.put(path, node),
 		}
 	}
 
@@ -311,7 +343,7 @@ impl<T> Side<T> {
 	pub(super) fn reserve(&mut self, additional: usize) {
 		match self {
 			Self::Whole(map) => map.reserve(additional),
-			Self::Carried(overlay) => overlay.edits.reserve(additional),
+			Self::Carried(overlay) => overlay.nodes.reserve(additional),
 		}
 	}
 }
@@ -325,16 +357,18 @@ impl<T: FromRow> Side<T> {
 		match self {
 			Self::Whole(map) => map.remove(path),
 			Self::Carried(overlay) => {
-				let was = match overlay.edits.get(path) {
-					// Already a tombstone: nothing to take, and the tombstone stands.
-					Some(None) => return None,
-					Some(Some(node)) => Some(node.clone()),
-					None => baseline.get(path).as_ref().and_then(T::from_row),
-				};
+				// Already a tombstone: nothing to take, and the tombstone stands.
+				if overlay.gone.contains(path) {
+					return None;
+				}
+				let was = overlay
+					.nodes
+					.remove(path)
+					.or_else(|| baseline.get(path).as_ref().and_then(T::from_row));
 				// Recorded either way: a `remove` is an observation about this path, and a path
 				// the side was not describing is one nothing is carried at. Writing the tombstone
 				// unconditionally keeps `holds` false there whatever the rows later say.
-				overlay.edits.insert(path.to_owned(), None);
+				overlay.gone.insert(path.to_owned());
 				was
 			}
 		}
@@ -351,15 +385,15 @@ impl<T: FromRow> Side<T> {
 		match self {
 			Self::Whole(map) => map.remove(&row.rel_path).is_some(),
 			Self::Carried(overlay) => {
-				let held = match overlay.edits.get(&row.rel_path) {
-					// Already a tombstone: nothing held, and the tombstone stands.
-					Some(None) => return false,
-					Some(Some(_)) => true,
-					// What the tree's carryable index answers at the row's path, from the row.
-					None => row.carryable(),
-				};
+				// Already a tombstone: nothing held, and the tombstone stands.
+				if overlay.gone.contains(&row.rel_path) {
+					return false;
+				}
+				// A node the pass put there, or else what the tree's carryable index answers at
+				// the row's path, from the row.
+				let held = overlay.nodes.remove(&row.rel_path).is_some() || row.carryable();
 				// A key of its own: the caller goes on to record the row's path as decided.
-				overlay.edits.insert(row.rel_path.clone(), None);
+				overlay.gone.insert(row.rel_path.clone());
 				held
 			}
 		}
@@ -401,7 +435,7 @@ impl<T: FromRow> Side<T> {
 					unreachable!("the backing was just matched as carried")
 				};
 				for path in dropping {
-					overlay.edits.insert(path, None);
+					overlay.tombstone(path);
 				}
 			}
 		}
@@ -431,9 +465,10 @@ impl<T: FromRow> Side<T> {
 				// What the pass PUT somewhere under `dir`, which no row need name.
 				out.extend(
 					overlay
-						.iter()
-						.filter(|(path, edit)| edit.is_some() && is_under(path, dir))
-						.map(|(path, _)| path.clone()),
+						.nodes
+						.keys()
+						.filter(|path| is_under(path, dir))
+						.cloned(),
 				);
 				out
 			}
@@ -486,8 +521,7 @@ impl<T: FromRow> Side<T> {
 			}
 			Self::Carried(overlay) => {
 				let moving: Vec<(String, String)> = overlay
-					.edits
-					.keys()
+					.paths()
 					.filter_map(|key| Some((key.clone(), moved_path(key, from, to)?)))
 					.collect();
 				// The landing paths first — the destinations a row arrives at, and no other path
@@ -496,8 +530,7 @@ impl<T: FromRow> Side<T> {
 				// pass observed there, rather than a walk of the rows about to move, which is the
 				// size of the subtree and would make a folded move of a large directory cost it.
 				let landing: Vec<String> = overlay
-					.edits
-					.keys()
+					.paths()
 					.filter(|key| {
 						moved_path(key, to, from)
 							.is_some_and(|source| baseline.contains_key(&source))
@@ -505,16 +538,16 @@ impl<T: FromRow> Side<T> {
 					.cloned()
 					.collect();
 				for key in landing {
-					overlay.edits.remove(&key);
+					overlay.nodes.remove(&key);
+					overlay.gone.remove(&key);
 				}
 				for (old, new) in moving {
-					let Some(mut edit) = overlay.edits.remove(&old) else {
-						continue;
-					};
-					if let Some(node) = &mut edit {
-						set_path(node, &new);
+					if let Some(mut node) = overlay.nodes.remove(&old) {
+						set_path(&mut node, &new);
+						overlay.put(new, node);
+					} else if overlay.gone.remove(&old) {
+						overlay.tombstone(new);
 					}
-					overlay.edits.insert(new, edit);
 				}
 			}
 		}
@@ -556,18 +589,19 @@ impl<T: FromRow> Side<T> {
 			let Some(landing) = moved_path(&row.rel_path, from, to) else {
 				continue;
 			};
-			// Each path recorded is handed back as well, hence the copies of it below. Where the
-			// path carried nothing before the rows land, the `None` recorded is the tombstone.
+			// Each path recorded is handed back as well, hence the copies of it below.
 			if overlay.get(&landing).is_none() {
-				let now = landed_on.remove(&landing).as_ref().and_then(T::from_row);
-				overlay.edits.insert(landing.clone(), now);
+				match landed_on.remove(&landing).as_ref().and_then(T::from_row) {
+					Some(node) => overlay.put(landing.clone(), node),
+					None => overlay.tombstone(landing.clone()),
+				}
 				recorded.push(landing);
 			}
 			// A source path is left with no row at all, so only a node the row carried is lost.
 			if overlay.get(&row.rel_path).is_none()
 				&& let Some(node) = T::from_row(&row)
 			{
-				overlay.edits.insert(row.rel_path.clone(), Some(node));
+				overlay.put(row.rel_path.clone(), node);
 				recorded.push(row.rel_path);
 			}
 		}
@@ -597,33 +631,10 @@ impl<T> Extend<(String, T)> for Side<T> {
 	fn extend<I: IntoIterator<Item = (String, T)>>(&mut self, nodes: I) {
 		match self {
 			Self::Whole(map) => map.extend(nodes),
-			Self::Carried(overlay) => overlay
-				.edits
-				.extend(nodes.into_iter().map(|(path, node)| (path, Some(node)))),
-		}
-	}
-}
-
-/// The keys a side holds that no baseline row placed there (see [`Side::own_keys`]).
-pub(super) enum OwnKeys<'a, T> {
-	Whole(hash_map::Keys<'a, String, T>),
-	Carried(hash_map::Iter<'a, String, Option<T>>),
-}
-
-impl<'a, T> Iterator for OwnKeys<'a, T> {
-	type Item = &'a str;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		match self {
-			Self::Whole(keys) => keys.next().map(String::as_str),
-			// A tombstone holds nothing, so it is not a key this side has.
-			Self::Carried(edits) => {
-				for (path, edit) in edits.by_ref() {
-					if edit.is_some() {
-						return Some(path.as_str());
-					}
+			Self::Carried(overlay) => {
+				for (path, node) in nodes {
+					overlay.put(path, node);
 				}
-				None
 			}
 		}
 	}
@@ -727,9 +738,12 @@ impl<T: FromRow> SideRef<'_, T> {
 						out.push((row.rel_path.clone(), node));
 					}
 				});
-				out.extend(overlay.iter().filter_map(|(path, edit)| {
-					edit.as_ref().map(|node| (path.clone(), node.clone()))
-				}));
+				out.extend(
+					overlay
+						.nodes
+						.iter()
+						.map(|(path, node)| (path.clone(), node.clone())),
+				);
 				Entries::Carried(out.into_iter())
 			}
 		}
@@ -769,11 +783,13 @@ impl<T: FromRow> SideRef<'_, T> {
 				}
 				#[cfg(feature = "bench-internals")]
 				CARRIED_SUBTREE_ROWS.fetch_add(out.len() as u64, Ordering::Relaxed);
-				out.extend(overlay.iter().filter_map(|(path, edit)| {
-					(is_under(path, dir))
-						.then(|| edit.as_ref().map(|node| (path.clone(), node.clone())))
-						.flatten()
-				}));
+				out.extend(
+					overlay
+						.nodes
+						.iter()
+						.filter(|(path, _)| is_under(path, dir))
+						.map(|(path, node)| (path.clone(), node.clone())),
+				);
 				Entries::Carried(out.into_iter())
 			}
 		}
@@ -838,8 +854,9 @@ impl<T: FromRow> NodesAt for SideRef<'_, T> {
 				// What the pass observed is the only part of this side that is not a row, so it is
 				// the only part folded key by key — and it is the per-pass data, not the tree.
 				if overlay
-					.iter()
-					.any(|(key, edit)| edit.is_some() && at_or_under_folded(key, path))
+					.nodes
+					.keys()
+					.any(|key| at_or_under_folded(key, path))
 				{
 					return true;
 				}
@@ -864,8 +881,10 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 				// Asked in path order: the baseline then reads the rows a page at a time, where the
 				// map's own order is a row per question.
 				let mut edits: Vec<(&String, bool)> = overlay
-					.iter()
-					.map(|(path, edit)| (path, edit.is_some()))
+					.nodes
+					.keys()
+					.map(|path| (path, true))
+					.chain(overlay.gone.iter().map(|path| (path, false)))
 					.collect();
 				edits.sort_unstable_by_key(|&(path, _)| path);
 				let mut added = 0usize;
@@ -1509,6 +1528,31 @@ mod tests {
 			"only {uncarried_rows} uncarryable row(s)"
 		);
 		assert!(moves > 100, "only {moves} directory move(s)");
+	}
+
+	/// A tombstone is a path, not a node's slot: what a carried side reserves for the nodes a pass
+	/// puts in it is not spent on the paths it found empty beside them. A directory renamed away
+	/// tombstones every row under it, so a table sized for the walk of its new name and shared with
+	/// those tombstones is a table that doubles on the way.
+	#[test]
+	fn tombstones_take_no_room_from_the_nodes() {
+		let rows = Baseline::default();
+		let mut side: Side<u32> = Side::carried();
+		side.reserve(1000);
+		let room = side.capacity();
+		for at in 0..1000u32 {
+			side.remove(&rows, &format!("gone/{at}"));
+			side.insert(format!("found/{at}"), at);
+		}
+
+		assert_eq!(
+			side.capacity(),
+			room,
+			"a thousand tombstones took the room reserved for a thousand nodes"
+		);
+		let read = side.of(&rows);
+		assert!(!read.holds("gone/7") && read.holds("found/7"));
+		assert_eq!(Nodes::len(&read), 1000);
 	}
 
 	/// A row at an arbitrary path, in the one shape both sides carry.
