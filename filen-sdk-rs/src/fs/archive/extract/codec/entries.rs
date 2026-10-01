@@ -399,7 +399,7 @@ impl<'p> Walk<'p> {
 		};
 		let mut found = 0;
 		for (ordinal, stored, is_dir) in entries {
-			if chooser.selection.ordinals.binary_search(&ordinal).is_err() {
+			if !chooser.chosen(ordinal) {
 				continue;
 			}
 			found += 1;
@@ -417,6 +417,15 @@ impl<'p> Walk<'p> {
 			return Err(not_held());
 		}
 		Ok(())
+	}
+
+	/// Whether an extraction takes entry `ordinal`, stored at `stored`, as [`Self::judge`] decides
+	/// it: every entry, or those a partial one chose and what is below a directory it chose. For
+	/// a zip or a 7z, once [`Self::check_selection`] noted the directories chosen; nothing is
+	/// noted here.
+	pub(super) fn takes(&self, ordinal: u64, stored: &str) -> bool {
+		self.chooser()
+			.is_none_or(|chooser| chooser.takes(ordinal, &entry_path(stored)))
 	}
 
 	/// What an extraction does with `found`.
@@ -761,6 +770,25 @@ impl Chooser {
 		}
 	}
 
+	/// Whether entry `ordinal` was chosen.
+	fn chosen(&self, ordinal: u64) -> bool {
+		self.selection.ordinals.binary_search(&ordinal).is_ok()
+	}
+
+	/// Whether the path of collision `keys` is a directory chosen, or below one.
+	fn in_chosen_dir(&self, keys: &[String]) -> bool {
+		prefix_digests(keys).any(|digest| self.dirs.contains(&digest))
+	}
+
+	/// Whether [`Self::choose`] takes entry `ordinal`, at `path` (or fails the job on it), by
+	/// the directories chosen so far, which it does not note.
+	fn takes(&self, ordinal: u64, path: &Result<ArchivePath, PathRejection>) -> bool {
+		self.chosen(ordinal)
+			|| path
+				.as_ref()
+				.is_ok_and(|path| self.in_chosen_dir(&collision_keys(path)))
+	}
+
 	/// The path below the base that entry `ordinal`, at `path`, is extracted at when it was
 	/// chosen or is below a directory that was; `None` when it is not extracted.
 	fn choose(
@@ -769,7 +797,7 @@ impl Chooser {
 		path: &Result<ArchivePath, PathRejection>,
 		is_dir: bool,
 	) -> Result<Option<Result<ArchivePath, PathRejection>>, Error> {
-		let chosen = self.selection.ordinals.binary_search(&ordinal).is_ok();
+		let chosen = self.chosen(ordinal);
 		if chosen {
 			self.met += 1;
 		}
@@ -779,7 +807,7 @@ impl Chooser {
 			Err(rejection) => return Ok(chosen.then_some(Err(*rejection))),
 		};
 		let keys = collision_keys(path);
-		let in_chosen_dir = prefix_digests(&keys).any(|digest| self.dirs.contains(&digest));
+		let in_chosen_dir = self.in_chosen_dir(&keys);
 		if !chosen && !in_chosen_dir {
 			return Ok(None);
 		}

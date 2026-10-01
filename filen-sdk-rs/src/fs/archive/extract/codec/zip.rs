@@ -79,18 +79,25 @@ fn zip_found<'e>(entry: &'e ZipEntry, overlapping: bool, target: Option<String>)
 	}
 }
 
-/// What checking the password up front finds for a zip: whether it needs one, and whether
-/// `password` opens the encrypted entry quickest to read in full, when one is small enough.
+/// What checking the password up front finds for a zip: whether the entries `walk` takes need
+/// one, and whether `password` opens the encrypted one of them quickest to read in full, when
+/// one is small enough. A partial extraction leaves the others unread, so they neither need the
+/// password nor have it checked on them.
 fn check_zip_password<R: Read + Seek>(
 	source: &mut R,
 	index: &ZipIndex,
+	walk: &Walk,
 	password: Option<&ArchivePassword>,
 	limits: EntryLimits,
 ) -> Result<PasswordCheck, Error> {
 	let mut encrypted = index
 		.entries
 		.iter()
-		.filter(|entry| entry.kind == ZipKind::File && entry.encryption != ZipEncryption::None)
+		.filter(|entry| {
+			entry.kind == ZipKind::File
+				&& entry.encryption != ZipEncryption::None
+				&& walk.takes(entry.ordinal, &entry.name)
+		})
 		.peekable();
 	if encrypted.peek().is_none() {
 		return Ok(PasswordCheck::NotNeeded);
@@ -179,7 +186,7 @@ pub(super) fn extract_zip(
 		return Err(error);
 	}
 	// set once an encrypted entry read back whole against its CRC-32 or authentication code
-	let mut verified = check_zip_password(&mut source, &index, password, entry_limits)?
+	let mut verified = check_zip_password(&mut source, &index, walk, password, entry_limits)?
 		.verified(ZipError::PasswordRequired, ZipError::WrongPassword)
 		.map_err(Error::from)?;
 
@@ -277,7 +284,7 @@ fn list_zip(
 	limits: EntryLimits,
 	duplicates: Option<DuplicateEntries>,
 ) -> Result<ArchiveEnd, Error> {
-	let checked = check_zip_password(source, index, password, limits)?;
+	let checked = check_zip_password(source, index, walk, password, limits)?;
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
 		.map_err(read_failure)?;

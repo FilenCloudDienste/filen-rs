@@ -242,6 +242,9 @@ impl JsClient {
 	/// stores after it below it (every tool stores a directory before its contents); a zip's or
 	/// 7z's everything below it. The archive is
 	/// never removed afterwards.
+	///
+	/// A zip or 7z needs `password` only when an entry the call takes is encrypted (or the 7z's
+	/// header is), and has it checked on those entries alone.
 	pub async fn extract_archive_entries(
 		&self,
 		archive: AnyFile,

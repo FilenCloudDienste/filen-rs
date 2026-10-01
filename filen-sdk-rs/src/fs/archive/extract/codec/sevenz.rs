@@ -52,31 +52,32 @@ fn sevenz_method(index: &SevenZIndex, entry: &SevenZEntry) -> Option<String> {
 /// What checking the password up front finds for a 7z: an encrypted header only decodes with the
 /// right password; encrypted data is checked on the entry cheapest to reach that has a CRC-32,
 /// when that takes at most [`PASSWORD_PROBE_BYTES`]. An empty entry proves nothing: decoding
-/// nothing matches its CRC-32 under any key.
+/// nothing matches its CRC-32 under any key. Only the entries `walk` takes count: a partial
+/// extraction leaves the others unread, so they neither need the password nor have it checked
+/// on them.
 fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
+	walk: &Walk,
 	keys: &mut Keys<'_>,
 ) -> Result<PasswordCheck, Error> {
 	if index.headers_encrypted {
 		return Ok(PasswordCheck::Right);
 	}
-	if !index.entries.iter().any(|entry| index.encrypted(entry)) {
+	let mut encrypted = index
+		.entries
+		.iter()
+		.filter(|entry| index.encrypted(entry) && walk.takes(entry.ordinal, &entry.name))
+		.peekable();
+	if encrypted.peek().is_none() {
 		return Ok(PasswordCheck::NotNeeded);
 	}
 	if !keys.has_password() {
 		return Ok(PasswordCheck::Required);
 	}
-	let Some(probe) = index
-		.entries
-		.iter()
+	let Some(probe) = encrypted
 		.filter_map(|entry| Some((entry, entry.stream?)))
-		.filter(|(entry, stream)| {
-			index.encrypted(entry)
-				&& entry.size > 0
-				&& stream.crc.is_some()
-				&& index.supported(entry)
-		})
+		.filter(|(entry, stream)| entry.size > 0 && stream.crc.is_some() && index.supported(entry))
 		.min_by_key(|(entry, stream)| stream.offset + entry.size)
 		.filter(|(entry, stream)| stream.offset + entry.size <= PASSWORD_PROBE_BYTES)
 		.map(|(entry, _)| entry)
@@ -178,7 +179,7 @@ pub(super) fn extract_sevenz(
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
 	}
-	let mut verified = check_sevenz_password(&mut cursor, &index, &mut keys)?
+	let mut verified = check_sevenz_password(&mut cursor, &index, walk, &mut keys)?
 		.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
 		.map_err(Error::from)?;
 
@@ -281,7 +282,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 	keys: &mut Keys<'_>,
 	job: &StreamJob,
 ) -> Result<ArchiveEnd, Error> {
-	let checked = check_sevenz_password(cursor, index, keys)?;
+	let checked = check_sevenz_password(cursor, index, walk, keys)?;
 	walk.port
 		.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(read_failure)?;

@@ -744,6 +744,12 @@ pub(crate) mod test_support {
 		) -> io::Result<Self> {
 			Self::build(out, method, solid, encryption, cycles_power)
 		}
+
+		/// Writes the folders opened from here on unencrypted, for an archive that mixes
+		/// encrypted folders with plain ones. A folder already open stays as it was.
+		pub(crate) fn stop_encrypting(&mut self) {
+			self.encryption = None;
+		}
 	}
 }
 

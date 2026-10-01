@@ -2119,6 +2119,32 @@ fn what_is_below_a_chosen_zip_directory_is_chosen_wherever_it_is_stored() {
 	assert_eq!(outline(&seen), ["file docs/a.txt 1", "dir docs"]);
 }
 
+#[test]
+fn a_partial_extraction_needs_the_password_of_a_file_below_a_chosen_directory_up_front() {
+	// files first, as the SDK's 7z writer stores them, so the directory is entry 1 of both
+	let entries: &[(&str, Option<&[u8]>)] = &[("docs/a.txt", Some(b"alpha")), ("docs", None)];
+	let sevenz = sevenz_of(
+		entries,
+		SevenZMethod::Lzma2 { level: 1 },
+		true,
+		Some((SevenZEncryption::Entries, "right")),
+	);
+	for (name, archive) in [("s.zip", zip_of(entries, Some("right"))), ("s.7z", sevenz)] {
+		for (password, expected) in [
+			(None, ErrorKind::ArchivePasswordRequired),
+			(Some("wrong"), ErrorKind::ArchiveWrongPassword),
+		] {
+			let job = StreamJob {
+				password: password.map(archive_password),
+				..job_of(&archive, name, true, chosen(&[1], &[]))
+			};
+			let (seen, end, _) = run_job(&archive, job);
+			assert!(seen.is_empty(), "{name} {password:?}: {seen:?}");
+			assert_eq!(kind(end), expected, "{name} {password:?}");
+		}
+	}
+}
+
 /// A solid 7z of a file of the bytes `before`, then a symlink to `target`.
 fn sevenz_link_after(before: &[u8], target: &[u8]) -> Vec<u8> {
 	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();

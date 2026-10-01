@@ -1,11 +1,15 @@
 //! Encrypted zips and 7zs: extracted with their password, refused up front without it or with a
-//! wrong one, and cleaned up after when a wrong one only shows once entries were read.
+//! wrong one, and cleaned up after when a wrong one only shows once entries were read. A partial
+//! extraction needs and checks the password on the entries it takes alone.
 
 use super::{
 	dispose::{disposable, disposition},
 	*,
 };
-use crate::fs::archive::extract::engine::finish::LATE_TRASH_LOCK_WAIT;
+use crate::fs::archive::{
+	extract::engine::finish::LATE_TRASH_LOCK_WAIT,
+	test_support::{sevenz_partly_encrypted, zip_with_passwords},
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extracts_an_encrypted_zip_and_removes_it() {
@@ -308,4 +312,87 @@ async fn a_wrong_password_found_late_keeps_the_directories_when_the_lock_does_no
 		1,
 		"the report still lists the folder it kept"
 	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_entries_of_a_zip_are_extracted_without_the_password_its_other_entries_need() {
+	let zip = zip_with_passwords(&[
+		("secret.txt", Some(b"secret"), Some("pw")),
+		("plain.txt", Some(b"plain"), None),
+	]);
+	let setup = setup("mixed.zip", zip, |_| {});
+	let job = start(&setup, chosen(&[1], &[]));
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([("plain.txt".to_owned(), (5, 1, hash(b"plain")))])
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_entries_of_a_7z_are_extracted_without_the_password_its_other_entries_need() {
+	let archive = sevenz_partly_encrypted(
+		&[("secret.txt", b"secret")],
+		&[("plain.txt", b"plain")],
+		"pw",
+	);
+	let setup = setup("mixed.7z", archive, |_| {});
+	let job = start(&setup, chosen(&[1], &[]));
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([("plain.txt".to_owned(), (5, 1, hash(b"plain")))])
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_extraction_checks_the_password_on_a_zip_entry_it_takes() {
+	// the smallest encrypted entry, which the password would be checked on first, is under
+	// another password and not chosen
+	let zip = zip_with_passwords(&[
+		("small.txt", Some(b"s"), Some("other")),
+		("chosen.txt", Some(b"chosen data"), Some("pw")),
+	]);
+	let setup = setup("mixed.zip", zip, |_| {});
+	let options = Options {
+		password: Some(archive_password("pw")),
+		..chosen(&[1], &[])
+	};
+	let job = start(&setup, options);
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([("chosen.txt".to_owned(), (11, 1, hash(b"chosen data")))])
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_extraction_checks_the_password_on_a_7z_entry_it_takes() {
+	let mut archive = sevenz_of(
+		&[
+			("small.txt", Some(b"s")),
+			("chosen.txt", Some(b"chosen data")),
+		],
+		LZMA2,
+		false,
+		Some((SevenZEncryption::Entries, "pw")),
+	);
+	// the smallest encrypted entry, which the password would be checked on first, is not
+	// chosen: its folder, right after the start header, damaged reads as under a wrong key
+	archive[START_HEADER_LEN] ^= 0x01;
+	let setup = setup("mixed.7z", archive, |_| {});
+	let options = Options {
+		password: Some(archive_password("pw")),
+		..chosen(&[1], &[])
+	};
+	let job = start(&setup, options);
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		finished(&setup),
+		BTreeMap::from([("chosen.txt".to_owned(), (11, 1, hash(b"chosen data")))])
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
 }

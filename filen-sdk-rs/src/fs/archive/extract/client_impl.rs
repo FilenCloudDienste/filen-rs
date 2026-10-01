@@ -56,6 +56,9 @@ pub struct ExtractConfig {
 	/// then, the job tries to move the folders it created to the trash. It keeps any that now
 	/// hold a file (someone else may have put one there meanwhile) or that it could not list or
 	/// trash, and all of them when it cannot get the drive lock in time.
+	///
+	/// A partial extraction ([`ExtractWhat::Entries`]) of a zip or 7z needs it only when an entry
+	/// it takes is encrypted (or the 7z's header is), and checks it on those entries alone.
 	pub password: Option<ArchivePassword>,
 	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them,
 	/// reported skipped as [`ExtractSkipReason::MacMetadata`](super::ExtractSkipReason::MacMetadata):

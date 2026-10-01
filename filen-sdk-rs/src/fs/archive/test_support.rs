@@ -266,12 +266,26 @@ pub(crate) fn tar_members<R: Read>(tar: &mut TarReader<R>) -> Vec<(tar_iter::Tar
 /// A zip of `entries` (a directory where there is no data), deflated, and encrypted with
 /// AES-256 under `password` when there is one.
 pub(crate) fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) -> Vec<u8> {
-	let password = password.map(archive_password);
+	let entries: Vec<_> = entries
+		.iter()
+		.map(|&(path, data)| (path, data, password))
+		.collect();
+	zip_with_passwords(&entries)
+}
+
+/// An entry of [`zip_with_passwords`]: its path, its data (none for a directory), and the
+/// password its data is encrypted under, if any.
+pub(crate) type ZipEntryUnder<'a> = (&'a str, Option<&'a [u8]>, Option<&'a str>);
+
+/// A zip of `entries` (a directory where there is no data), deflated, each file encrypted with
+/// AES-256 under its own password when it has one.
+pub(crate) fn zip_with_passwords(entries: &[ZipEntryUnder]) -> Vec<u8> {
 	let mut writer = ZipWriter::new(Vec::new());
-	for (path, data) in entries {
+	for &(path, data, password) in entries {
 		match data {
 			None => writer.add_dir(path, None).unwrap(),
 			Some(data) => {
+				let password = password.map(archive_password);
 				let encryption = password.as_ref().map(|password| Encryption {
 					password,
 					strength: AesStrength::Aes256,
@@ -319,6 +333,37 @@ pub(crate) fn sevenz_of(
 					.unwrap();
 			}
 		}
+	}
+	sevenz_finished(writer)
+}
+
+/// A 7z of the `encrypted` files, each in a folder of its own encrypted under `password`, then
+/// the `plain` ones, each in a plain folder; its header stays readable. Compressed and keyed as
+/// [`sevenz_of`]'s are.
+pub(crate) fn sevenz_partly_encrypted(
+	encrypted: &[(&str, &[u8])],
+	plain: &[(&str, &[u8])],
+	password: &str,
+) -> Vec<u8> {
+	let password = archive_password(password);
+	let mut writer = SevenZWriter::with_cycles_power(
+		Vec::new(),
+		SevenZMethod::Lzma2 { level: 1 },
+		false,
+		Some((SevenZEncryption::Entries, &password)),
+		4,
+	)
+	.unwrap();
+	for (path, data) in encrypted {
+		writer
+			.add_file(path, None, data.len() as u64, &mut &data[..])
+			.unwrap();
+	}
+	writer.stop_encrypting();
+	for (path, data) in plain {
+		writer
+			.add_file(path, None, data.len() as u64, &mut &data[..])
+			.unwrap();
 	}
 	sevenz_finished(writer)
 }
