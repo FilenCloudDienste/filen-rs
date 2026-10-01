@@ -952,7 +952,8 @@ fn dirty_local(local: &mut Side<LocalNode>, from: usize, to: usize) -> BTreeSet<
 			.expect("the side holds what it just named")
 			.into_owned();
 		node.size += 1;
-		node.content_hash = Some(Blake3Hash::from([(index % 251) as u8; 32]));
+		let fill = u8::try_from(index % 251).expect("a remainder of 251 fits a byte");
+		node.content_hash = Some(Blake3Hash::from([fill; 32]));
 		changed.insert(node.rel_path.clone());
 		local.insert(path, node);
 	}

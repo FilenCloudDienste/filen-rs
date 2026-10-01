@@ -1460,7 +1460,10 @@ async fn conflict_24_conflict_copy_bytes_exact_binary() {
 
 	// 1 MiB deterministic pseudo-random base payload.
 	let base: Vec<u8> = (0..(1024 * 1024))
-		.map(|i| ((i * 2654435761usize) >> 13) as u8)
+		.map(|i| {
+			u8::try_from(((i * 2654435761usize) >> 13) % 256)
+				.expect("a remainder of 256 fits a byte")
+		})
 		.collect();
 	std::fs::write(tc.local_a.join("blob.bin"), &base).unwrap();
 	converge(

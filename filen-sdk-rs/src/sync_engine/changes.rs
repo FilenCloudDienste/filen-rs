@@ -905,7 +905,7 @@ pub(super) mod tests {
 	/// A removal of `uuid`, as the cache announces one.
 	fn removed(uuid: u128) -> CacheEvent<'static> {
 		cache_event(
-			Some(uuid as u64),
+			Some(u64::try_from(uuid).expect("a test uuid fits an event id")),
 			CacheEventType::File(FileEvent::Removed(Uuid::from_u128(uuid))),
 		)
 	}
