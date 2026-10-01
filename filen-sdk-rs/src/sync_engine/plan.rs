@@ -2171,10 +2171,14 @@ pub(super) fn is_under(path: &str, prefix: &str) -> bool {
 /// An ancestor walk never yields `""`, so a root of `""` covers only the pair root itself here. The
 /// one caller for which it means "everything is under it" asks for that separately (`drop_blocked`).
 pub(super) fn at_or_under_root(roots: &BTreeSet<String>, path: &str) -> bool {
-	roots.contains(path)
-		|| path
-			.match_indices('/')
-			.any(|(i, _)| roots.contains(&path[..i]))
+	roots.contains(path) || ancestors(path).any(|at| roots.contains(at))
+}
+
+/// Every proper ancestor of `path`, shallowest first: `a/b/c` yields `a`, then `a/b`. Never the pair
+/// root `""`, and nothing for a top-level path.
+pub(super) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+	// Each cut is at a `/`, which is one byte and so a character boundary: `get` never refuses one.
+	path.match_indices('/').filter_map(|(at, _)| path.get(..at))
 }
 
 /// The key range of everything strictly under `dir`: `dir/` up to `dir0`. `/` is 0x2F and `0` is
@@ -2202,7 +2206,8 @@ fn touches_held(end: &str, held: &BTreeSet<String>) -> bool {
 /// Where `path` lands when the directory at `from` moves to `to`; `None` when it is neither `from`
 /// nor under it.
 pub(super) fn moved_path(path: &str, from: &str, to: &str) -> Option<String> {
-	(path == from || is_under(path, from)).then(|| format!("{to}{}", &path[from.len()..]))
+	let rest = path.strip_prefix(from)?;
+	(rest.is_empty() || rest.starts_with('/')).then(|| format!("{to}{rest}"))
 }
 
 /// Drop every action that falls under a path this pass reports as a conflict — freshly surfaced or
@@ -2953,11 +2958,13 @@ fn new_local_dir_signatures<'m>(
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
 		let explained = gone.iter().any(|(_, sig)| *sig == full);
 		for inner in &new_dirs {
+			// A nested directory, and its path below this one, separator first, as the signature's
+			// keys are.
 			if !explained
-				&& is_under(&inner.path, &path)
+				&& let Some(inner_rel) = inner.path.strip_prefix(&*path)
+				&& inner_rel.starts_with('/')
 				&& gone.iter().any(|(_, sig)| inner.matches(sig))
 			{
-				let inner_rel = &inner.path[path.len()..];
 				// The only copy of the signature, made once per directory that holds a nested move.
 				without_nested_moves
 					.get_or_insert_with(|| full.clone())
@@ -2986,7 +2993,10 @@ fn dir_signature(local: &impl Nodes<Node = LocalNode>, root: &str) -> Option<Sig
 				NodeKind::File => (Some(node.content_hash?), node.size),
 				NodeKind::Dir => (None, 0),
 			};
-			Some((path[root.len()..].to_string(), (node.kind, hash, size)))
+			Some((
+				path.strip_prefix(root)?.to_string(),
+				(node.kind, hash, size),
+			))
 		})
 		.collect()
 }
@@ -3006,7 +3016,7 @@ fn baseline_dir_signature(baseline: &Baseline, root: &str) -> Option<Signature> 
 				NodeKind::Dir => (None, 0),
 			};
 			Some((
-				row.rel_path[root.len()..].to_string(),
+				row.rel_path.strip_prefix(root)?.to_string(),
 				(row.kind, hash, size),
 			))
 		})
@@ -8603,7 +8613,8 @@ mod tests {
 				let Some(node) = local.remove(baseline, &path) else {
 					continue;
 				};
-				let to = format!("moved{}", &path[dir.len()..]);
+				let to = moved_path(&path, dir, "moved")
+					.expect("every path staged is the moved directory or under it");
 				local.insert(to.clone(), at(&to, node));
 				decided.insert(path);
 				decided.insert(to);
