@@ -182,14 +182,29 @@ impl<T> Default for Overlay<T> {
 	}
 }
 
+/// What an [`Overlay`] recorded at one path.
+enum Recorded<'o, T> {
+	/// The pass found this node there.
+	Node(&'o T),
+	/// The pass found nothing there: a tombstone, which the row behind it does not get past.
+	Tombstone,
+	/// The pass recorded nothing there, so the path's row still speaks for it.
+	Nothing,
+}
+
 impl<T> Overlay<T> {
-	/// What the pass recorded at `path`: `Some(Some(node))` where it found one, `Some(None)` — a
-	/// tombstone — where it found nothing, and `None` where it recorded nothing at all.
-	fn get(&self, path: &str) -> Option<Option<&T>> {
+	/// What the pass recorded at `path`.
+	fn get(&self, path: &str) -> Recorded<'_, T> {
 		match self.nodes.get(path) {
-			Some(node) => Some(Some(node)),
-			None => self.gone.contains(path).then_some(None),
+			Some(node) => Recorded::Node(node),
+			None if self.gone.contains(path) => Recorded::Tombstone,
+			None => Recorded::Nothing,
 		}
+	}
+
+	/// Whether the pass recorded anything at `path`, a node or a tombstone.
+	fn records(&self, path: &str) -> bool {
+		!matches!(self.get(path), Recorded::Nothing)
 	}
 
 	/// Record `node` at `path`, over whatever was recorded there.
@@ -215,8 +230,9 @@ impl<T> Overlay<T> {
 	/// The ONE implementation of that question, answered without building a node.
 	fn holds(&self, baseline: &Baseline, path: &str) -> bool {
 		match self.get(path) {
-			Some(edit) => edit.is_some(),
-			None => baseline.carryable(path),
+			Recorded::Node(_) => true,
+			Recorded::Tombstone => false,
+			Recorded::Nothing => baseline.carryable(path),
 		}
 	}
 }
@@ -319,7 +335,7 @@ impl<T> Side<T> {
 	pub(super) fn untouched(&self, path: &str) -> bool {
 		match self {
 			Self::Whole(_) => false,
-			Self::Carried(overlay) => overlay.get(path).is_none(),
+			Self::Carried(overlay) => !overlay.records(path),
 		}
 	}
 
@@ -468,7 +484,7 @@ impl<T: FromRow> Side<T> {
 				// The rows, from the baseline's own subtree walk — the size of the directory
 				// rather than of the tree — minus whatever this pass observed away.
 				baseline.visit_subtree_paths(dir, |path| {
-					if overlay.get(path).is_none() && baseline.carryable(path) {
+					if !overlay.records(path) && baseline.carryable(path) {
 						out.push(path.to_owned());
 					}
 				});
@@ -600,7 +616,7 @@ impl<T: FromRow> Side<T> {
 				continue;
 			};
 			// Each path recorded is handed back as well, hence the copies of it below.
-			if overlay.get(&landing).is_none() {
+			if !overlay.records(&landing) {
 				match landed_on.remove(&landing).as_ref().and_then(T::from_row) {
 					Some(node) => overlay.put(landing.clone(), node),
 					None => overlay.tombstone(landing.clone()),
@@ -608,7 +624,7 @@ impl<T: FromRow> Side<T> {
 				recorded.push(landing);
 			}
 			// A source path is left with no row at all, so only a node the row carried is lost.
-			if overlay.get(&row.rel_path).is_none()
+			if !overlay.records(&row.rel_path)
 				&& let Some(node) = T::from_row(&row)
 			{
 				overlay.put(row.rel_path.clone(), node);
@@ -742,7 +758,7 @@ impl<T: FromRow> SideRef<'_, T> {
 				}
 				self.baseline.visit_rows(|row| {
 					// A path the pass observed is answered from the overlay below, whichever way.
-					if overlay.get(&row.rel_path).is_some() {
+					if overlay.records(&row.rel_path) {
 						return;
 					}
 					if let Some(node) = T::from_row(row) {
@@ -762,9 +778,9 @@ impl<T: FromRow> SideRef<'_, T> {
 		match self.side {
 			Side::Whole(map) => map.get(&row.rel_path).map(Cow::Borrowed),
 			Side::Carried(overlay) => match overlay.get(&row.rel_path) {
-				Some(Some(node)) => Some(Cow::Borrowed(node)),
-				Some(None) => None,
-				None => T::from_row(row).map(Cow::Owned),
+				Recorded::Node(node) => Some(Cow::Borrowed(node)),
+				Recorded::Tombstone => None,
+				Recorded::Nothing => T::from_row(row).map(Cow::Owned),
 			},
 		}
 	}
@@ -783,7 +799,7 @@ impl<T: FromRow> SideRef<'_, T> {
 				#[cfg(feature = "bench-internals")]
 				CARRIED_SUBTREE_CALLS.fetch_add(1, Ordering::Relaxed);
 				for row in self.baseline.subtree(dir) {
-					if overlay.get(&row.rel_path).is_some() {
+					if overlay.records(&row.rel_path) {
 						continue;
 					}
 					if let Some(node) = T::from_row(&row) {
@@ -836,10 +852,10 @@ impl<T: FromRow> NodesAt for SideRef<'_, T> {
 		match self.side {
 			Side::Whole(map) => map.get(path).map(Cow::Borrowed),
 			Side::Carried(overlay) => match overlay.get(path) {
-				Some(Some(node)) => Some(Cow::Borrowed(node)),
+				Recorded::Node(node) => Some(Cow::Borrowed(node)),
 				// Observed absent: the tombstone answers, and the row behind it does not.
-				Some(None) => None,
-				None => self
+				Recorded::Tombstone => None,
+				Recorded::Nothing => self
 					.baseline
 					.get(path)
 					.as_ref()
@@ -1318,9 +1334,9 @@ mod tests {
 			let overlay_at = |path: &str| match carried {
 				Side::Whole(_) => "<whole>".to_owned(),
 				Side::Carried(overlay) => match overlay.get(path) {
-					None => "no-entry".to_owned(),
-					Some(None) => "TOMBSTONE".to_owned(),
-					Some(Some(_)) => "live".to_owned(),
+					Recorded::Nothing => "no-entry".to_owned(),
+					Recorded::Tombstone => "TOMBSTONE".to_owned(),
+					Recorded::Node(_) => "live".to_owned(),
 				},
 			};
 			for path in pw.iter().chain(pc.iter()) {
