@@ -60,7 +60,8 @@
 //! under it" mean the same thing.
 
 // Under `bench-internals` alone only the probe's handful of these is called; the rest is the
-// oracle's, and the tests call every one.
+// oracle's, and the tests call every one. Allowed for the module rather than gated item by item:
+// the gates would cover most of the file and say no more than this does.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::{

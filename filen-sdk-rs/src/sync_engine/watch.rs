@@ -364,9 +364,16 @@ impl SyncEngine {
 		// In the caller's span: every pass the loop runs logs `pair N`, and pair ids are per engine
 		// database, so two engines in one process are otherwise indistinguishable in the log.
 		let loop_done = tokio::spawn(
-			run_loop(
-				engine, pair, config, dirty, rules, stop, observer, status_tx,
-			)
+			run_loop(WatchLoop {
+				engine,
+				pair,
+				config,
+				dirty,
+				rules,
+				stop,
+				observer,
+				status: status_tx,
+			})
 			.in_current_span(),
 		);
 
@@ -414,22 +421,36 @@ impl Stop {
 	}
 }
 
+/// Everything the background loop of one watch owns (see [`run_loop`]).
+struct WatchLoop {
+	engine: Arc<SyncEngine>,
+	pair: PairId,
+	config: WatchConfig,
+	/// The one signal both trigger sources ring: the local watcher and the remote sync root.
+	dirty: Arc<Notify>,
+	/// Changes whenever the engine's user ignore rules do.
+	rules: tokio::sync::watch::Receiver<u64>,
+	stop: Stop,
+	observer: SyncObserver,
+	status: tokio::sync::watch::Sender<WatchStatus>,
+}
+
 /// The background loop: an initial pass, then debounced passes on `dirty`, plus a periodic pass,
 /// until the watch is stopped or its pair removed (see [`Stop`]). A pass that fails outright backs
 /// the loop off (see [`backoff`]) so a persistent error does not hot-loop at the debounce cadence;
 /// that backoff is also the retry timer, since an outage over a quiescent tree produces no trigger
 /// of its own.
-#[allow(clippy::too_many_arguments)]
-async fn run_loop(
-	engine: Arc<SyncEngine>,
-	pair: PairId,
-	config: WatchConfig,
-	dirty: Arc<Notify>,
-	mut rules: tokio::sync::watch::Receiver<u64>,
-	mut stop: Stop,
-	mut observer: SyncObserver,
-	status: tokio::sync::watch::Sender<WatchStatus>,
-) {
+async fn run_loop(watch: WatchLoop) {
+	let WatchLoop {
+		engine,
+		pair,
+		config,
+		dirty,
+		mut rules,
+		mut stop,
+		mut observer,
+		status,
+	} = watch;
 	let mut failures: u32 = 0;
 	// When a pass last read both sides whole — what the safety net measures from (see [`net_due`]).
 	// The initial pass below is one: a pair's first pass of a process has no changelist to narrow
