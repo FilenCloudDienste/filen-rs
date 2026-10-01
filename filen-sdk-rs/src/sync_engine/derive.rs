@@ -1027,12 +1027,12 @@ mod tests {
 	/// is why this is asserted on the rows rather than on disk.)
 	#[test]
 	fn case_only_siblings_stay_two_rows_in_both_maps() {
-		let uuid = |at: u128| Uuid::from_u128(700 + at);
-		let row = |rel_path: &str, at: u128| BaselineEntry {
+		let uuid = |at: u8| Uuid::from_u128(700 + u128::from(at));
+		let row = |rel_path: &str, at: u8| BaselineEntry {
 			rel_path: rel_path.to_string(),
 			kind: NodeKind::File,
 			remote_uuid: Some(uuid(at)),
-			content_hash: Some(Blake3Hash::from([at as u8; 32])),
+			content_hash: Some(Blake3Hash::from([at; 32])),
 			size: Some(3),
 			local_mtime: Some(10),
 			remote_modified: Some(20),
@@ -1042,7 +1042,7 @@ mod tests {
 			remote_hash: None,
 			remote_size: None,
 			remote_stable_uuid: Some(StableUuid::new_for_test(uuid(at))),
-			agreed_hash: Some(Blake3Hash::from([at as u8; 32])),
+			agreed_hash: Some(Blake3Hash::from([at; 32])),
 		};
 		let baseline = Baseline::from_rows([row("A.txt", 1), row("a.txt", 2)]);
 

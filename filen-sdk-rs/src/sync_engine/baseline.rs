@@ -11,6 +11,7 @@
 
 use std::{
 	collections::{BTreeSet, HashMap},
+	fmt::Display,
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex, PoisonError},
 };
@@ -880,7 +881,7 @@ fn open_error(error: rusqlite::Error) -> crate::Error {
 	)
 }
 
-fn corrupt(what: &str, value: i64) -> rusqlite::Error {
+fn corrupt(what: &str, value: impl Display) -> rusqlite::Error {
 	rusqlite::Error::FromSqlConversionFailure(
 		0,
 		Type::Integer,
@@ -1386,8 +1387,12 @@ impl BaselineStore {
 			row.get::<_, Option<i64>>("guard_floor")?,
 			row.get::<_, Option<f64>>("guard_ratio")?,
 		) {
-			(Some(floor), Some(ratio)) => DeleteGuard::new(floor.max(0) as usize, ratio)
-				.map_err(|_| corrupt("guard ratio", ratio as i64))?,
+			// The floor saturates as `set_delete_guard` wrote it: `unlimited`'s `usize::MAX` is
+			// stored as `i64::MAX`, which a 32-bit `usize` reads back as its own maximum.
+			(Some(floor), Some(ratio)) => {
+				DeleteGuard::new(usize::try_from(floor.max(0)).unwrap_or(usize::MAX), ratio)
+					.map_err(|_| corrupt("guard ratio", ratio))?
+			}
 			_ => DeleteGuard::default(),
 		};
 		Ok(PairRecord {
@@ -1797,7 +1802,8 @@ impl BaselineStore {
 				Ok((
 					row.get::<_, String>("rel_path")?,
 					PathFailure {
-						attempts: attempts.max(0) as u32,
+						// A streak past `u32::MAX` failures is still past the threshold.
+						attempts: u32::try_from(attempts.max(0)).unwrap_or(u32::MAX),
 						last_error: row.get("last_error")?,
 						last_failure_at: row.get("last_failure_at")?,
 					},

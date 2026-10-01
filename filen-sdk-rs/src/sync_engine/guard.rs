@@ -14,6 +14,8 @@
 
 use std::{collections::HashSet, fmt};
 
+use num_traits::ToPrimitive;
+
 use super::plan::SyncAction;
 use crate::{Error, ErrorKind};
 
@@ -87,7 +89,11 @@ impl DeleteGuard {
 	}
 
 	fn limit(&self, tracked: usize) -> usize {
-		let ratio_limit = (self.ratio * tracked as f64) as usize;
+		// Rounded down, and never NaN or negative: `new` keeps the ratio in `0.0..=1.0`. Only a
+		// product past `usize::MAX` has no value, and it saturates.
+		let ratio_limit = (self.ratio * tracked as f64)
+			.to_usize()
+			.unwrap_or(usize::MAX);
 		self.floor.max(ratio_limit)
 	}
 }

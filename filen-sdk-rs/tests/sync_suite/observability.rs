@@ -1442,7 +1442,7 @@ fn assert_byte_progress(
 #[shared_test_runtime]
 async fn observ_22_byte_size_accounting_matches_transferred() {
 	const MIB: usize = 1024 * 1024;
-	let body = |size: usize| (0..size).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+	let body = |size: usize| (0..=250u8).cycle().take(size).collect::<Vec<u8>>();
 	let sc = single_client(SyncMode::TwoWay).await;
 
 	let up: [(&str, usize); 4] = [
