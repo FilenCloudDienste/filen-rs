@@ -1,3 +1,9 @@
+#[cfg(unix)]
+use std::{
+	process::{Command, Stdio},
+	time::{Duration, Instant},
+};
+
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{HasName, categories::NonRootFileType};
 use filen_types::api::v3::notes::NoteType;
@@ -250,4 +256,84 @@ async fn cmd_export_notes() {
 	for note in notes {
 		client.delete_note(note).await.unwrap();
 	}
+}
+
+// Unix only: the CLI is stopped the way a user stops it, with SIGINT, so the engine finishes its pass
+// and releases the drive lock instead of leaving it to expire on the shared test account.
+#[cfg(unix)]
+#[shared_test_runtime]
+async fn cmd_sync() {
+	// Not `get_resources_with_lock`: the CLI's sync engine takes the drive lock for every pass, and
+	// would wait on this test holding it.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let test_dir_name = test_dir.name().unwrap();
+
+	// one file on each side, which a two-way sync must bring across to the other
+	let file = client
+		.make_file_builder("from_remote.txt", test_dir.uuid)
+		.unwrap();
+	client
+		.upload_file(file, b"from the remote side")
+		.await
+		.unwrap();
+	let local = assert_fs::TempDir::new().unwrap();
+	std::fs::write(local.path().join("from_local.txt"), "from the local side").unwrap();
+
+	// its own config dir, so the engine's database starts empty and is deleted afterwards
+	let config_dir = assert_fs::TempDir::new().unwrap();
+	let (_auth_config_dir, auth_config) = test_utils::cli::prepare_cli_auth_config().await;
+	let mut cli = Command::new(env!("CARGO_BIN_EXE_filen-cli"))
+		.args([
+			"--auth-config-path",
+			auth_config.to_str().unwrap(),
+			"--config-dir",
+			config_dir.path().to_str().unwrap(),
+			"--skip-update",
+			"sync",
+			local.path().to_str().unwrap(),
+			test_dir_name,
+		])
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+
+	let uploaded_path = format!("{test_dir_name}/from_local.txt");
+	let deadline = Instant::now() + Duration::from_secs(300);
+	loop {
+		let downloaded = std::fs::read_to_string(local.path().join("from_remote.txt")).ok();
+		let uploaded = matches!(
+			client.find_item_at_path(&uploaded_path).await.unwrap(),
+			Some(NonRootFileType::File(_))
+		);
+		if downloaded.as_deref() == Some("from the remote side") && uploaded {
+			break;
+		}
+		if Instant::now() >= deadline || cli.try_wait().unwrap().is_some() {
+			let _ = cli.kill();
+			let output = cli.wait_with_output().unwrap();
+			panic!(
+				"sync did not bring both files across (downloaded: {downloaded:?}, uploaded: {uploaded})\nstdout:\n{}\nstderr:\n{}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+		}
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+
+	let interrupted = Command::new("kill")
+		.args(["-INT", &cli.id().to_string()])
+		.status()
+		.unwrap();
+	assert!(interrupted.success());
+	let output = cli.wait_with_output().unwrap();
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	assert!(
+		output.status.success(),
+		"the CLI did not stop cleanly:\n{stdout}"
+	);
+	assert!(stdout.contains("upload    from_local.txt"), "{stdout}");
+	assert!(stdout.contains("download  from_remote.txt"), "{stdout}");
 }
