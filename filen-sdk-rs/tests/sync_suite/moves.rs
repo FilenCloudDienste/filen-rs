@@ -651,10 +651,8 @@ async fn move14_twoway_divergent_move_conflicts() {
 	// Seed the shared file and converge so both baselines record m.txt.
 	write_file(&tc.local_a, "m.txt", b"shared-C1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"move14-baseline",
@@ -717,10 +715,8 @@ async fn move15_twoway_move_vs_edit() {
 
 	write_file(&tc.local_a, "e.txt", b"shared-C1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"move15-baseline",
@@ -1390,10 +1386,8 @@ async fn move_a2_twoway_move_vs_delete() {
 
 	write_file(&tc.local_a, "d.txt", b"shared-C1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"move_a2-baseline",
@@ -1514,10 +1508,8 @@ async fn move_a3_twoway_divergent_directory_rename() {
 
 	write_file(&tc.local_a, "d/c.txt", b"child-C1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"move_a3-baseline",

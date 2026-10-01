@@ -77,13 +77,6 @@ impl SyncMode {
 		)
 	}
 
-	/// Whether a true both-sides-changed conflict can arise (only bidirectional sync).
-	// Companion predicate to `pushes`/`pulls`/`propagates_deletes`; exercised by the mode unit tests.
-	#[allow(dead_code)]
-	pub(crate) fn can_conflict(self) -> bool {
-		matches!(self, Self::TwoWay)
-	}
-
 	/// Stable integer encoding for the `sync_pairs.mode` column.
 	pub(crate) fn as_i64(self) -> i64 {
 		match self {
@@ -136,10 +129,8 @@ mod tests {
 		assert!(SyncMode::RemoteBackup.pulls());
 		assert!(!SyncMode::RemoteBackup.pushes());
 		assert!(!SyncMode::RemoteBackup.propagates_deletes());
-		// Mirror modes propagate deletes; only TwoWay can conflict.
+		// Mirror modes propagate deletes.
 		assert!(SyncMode::LocalToRemote.propagates_deletes());
 		assert!(SyncMode::RemoteToLocal.propagates_deletes());
-		assert!(SyncMode::TwoWay.can_conflict());
-		assert!(!SyncMode::LocalToRemote.can_conflict());
 	}
 }

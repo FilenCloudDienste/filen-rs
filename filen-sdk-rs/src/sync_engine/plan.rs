@@ -2760,32 +2760,25 @@ fn next_dir_move<'m>(
 			remote_dir_at.insert(uuid, path);
 		});
 	}
-	// The sources gone locally with their signatures, and the new local directories with theirs,
-	// built only once a pushed move is possible — and each read once for every source it answers.
-	let mut gone: Option<Vec<(&str, Signature)>> = None;
-	let mut new_local_dirs: Option<Vec<NewLocalDir<'m>>> = None;
+	let mut search = DirMoveSearch {
+		mode,
+		baseline,
+		local,
+		remote,
+		held,
+		dirs,
+		sources: &sources,
+		remote_dir_at,
+		gone: None,
+		new_local_dirs: None,
+	};
 
 	// Every move that holds up but for the parents of its destination. A missing parent another of
 	// them is moving into place is not one the pass creates: that move goes first, or this one would
 	// fill its destination and refuse it.
 	let candidates: Vec<(SyncAction, Matched)> = sources
 		.iter()
-		.filter_map(|(from, uuid)| {
-			dir_move_from(
-				mode,
-				baseline,
-				local,
-				remote,
-				held,
-				&sources,
-				&remote_dir_at,
-				&mut gone,
-				&mut new_local_dirs,
-				from,
-				*uuid,
-				dirs,
-			)
-		})
+		.filter_map(|(from, uuid)| dir_move_from(&mut search, from, *uuid))
 		.collect();
 	let pending: HashSet<String> = candidates
 		.iter()
@@ -2802,23 +2795,41 @@ fn next_dir_move<'m>(
 	})
 }
 
+/// One [`next_dir_move`] search: the pass's inputs and the indexes it builds once for every source.
+struct DirMoveSearch<'a, 'm, L, R> {
+	mode: super::SyncMode,
+	baseline: &'a Baseline,
+	local: &'m L,
+	remote: &'a R,
+	held: &'a BTreeSet<String>,
+	dirs: &'a FoldDirs<'m>,
+	sources: &'a [(String, Uuid)],
+	remote_dir_at: HashMap<Uuid, Cow<'m, str>>,
+	/// The sources gone locally with their signatures, and the new local directories with theirs,
+	/// built only once a pushed move is possible — and each read once for every source it answers.
+	gone: Option<Vec<(&'a str, Signature)>>,
+	new_local_dirs: Option<Vec<NewLocalDir<'m>>>,
+}
+
 /// The directory move of the baseline directory `from` (remote uuid `uuid`), checked against
 /// everything [`next_dir_move`] requires except the parents of its destination.
-#[allow(clippy::too_many_arguments)] // the pass's inputs plus the indexes built once per call
-fn dir_move_from<'m, 's>(
-	mode: super::SyncMode,
-	baseline: &Baseline,
-	local: &'m impl Nodes<Node = LocalNode>,
-	remote: &impl Nodes<Node = RemoteNode>,
-	held: &BTreeSet<String>,
-	sources: &'s [(String, Uuid)],
-	remote_dir_at: &HashMap<Uuid, Cow<'m, str>>,
-	gone: &mut Option<Vec<(&'s str, Signature)>>,
-	new_local_dirs: &mut Option<Vec<NewLocalDir<'m>>>,
+fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
+	search: &mut DirMoveSearch<'_, '_, L, R>,
 	from: &str,
 	uuid: Uuid,
-	dirs: &FoldDirs<'m>,
 ) -> Option<(SyncAction, Matched)> {
+	let DirMoveSearch {
+		mode,
+		baseline,
+		local,
+		remote,
+		held,
+		dirs,
+		sources,
+		ref remote_dir_at,
+		ref mut gone,
+		ref mut new_local_dirs,
+	} = *search;
 	let (action, matched) = if local.at(from).is_some_and(|n| n.kind == NodeKind::Dir) {
 		let to = remote_dir_at.get(&uuid)?.as_ref();
 		// The steady-state answer, before the scan that would reach it the slow way: the directory

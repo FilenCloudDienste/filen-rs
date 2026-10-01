@@ -123,7 +123,6 @@ async fn list_remote_root(
 
 /// Upload `data` to the remote root under `name` (versioning any same-name file in place),
 /// returning the created RemoteFile. Uses the SHARED resources client (ground-truth writer).
-#[allow(dead_code)]
 async fn upload_remote(tc: &TwoClients, name: &str, data: &[u8]) -> RemoteFile {
 	let builder = tc
 		.resources
@@ -184,10 +183,8 @@ async fn conflict_01_both_modify_surfaces_conflict_both_versions_preserved() {
 	// Converge a shared "BASE" baseline on both sides.
 	write_file(&tc.local_a, "notes.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c01-baseline",
@@ -249,10 +246,8 @@ async fn conflict_02_persists_across_reruns_without_copy_growth() {
 
 	write_file(&tc.local_a, "notes.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c02-baseline",
@@ -339,10 +334,8 @@ async fn conflict_03_local_modify_vs_remote_delete_preserves_local_edit() {
 
 	write_file(&tc.local_a, "report.doc", b"V1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c03-baseline",
@@ -440,10 +433,8 @@ async fn conflict_04_remote_modify_vs_local_delete_preserves_remote_edit() {
 
 	write_file(&tc.local_a, "budget.csv", b"V1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c04-baseline",
@@ -632,10 +623,8 @@ async fn conflict_06_create_vs_create_identical_content_no_conflict() {
 	write_file(&tc.local_b, "same.txt", b"SAME");
 
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::Concurrent,
 		&mut conflicts,
 		"c06-converge",
@@ -680,10 +669,8 @@ async fn conflict_07_rename_vs_rename_file() {
 
 	write_file(&tc.local_a, "doc.txt", b"X");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c07-baseline",
@@ -738,10 +725,8 @@ async fn conflict_08_file_edit_vs_remote_type_flip_to_dir() {
 
 	write_file(&tc.local_a, "thing", b"FILE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c08-baseline",
@@ -813,10 +798,8 @@ async fn conflict_09_double_type_flip_file_to_dir_both_sides() {
 
 	write_file(&tc.local_a, "item", b"C");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c09-baseline",
@@ -1222,10 +1205,8 @@ async fn conflict_20_convergent_edit_not_a_conflict() {
 
 	write_file(&tc.local_a, "agree.txt", b"OLD");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c20-baseline",
@@ -1239,10 +1220,8 @@ async fn conflict_20_convergent_edit_not_a_conflict() {
 
 	let mut conflicts2 = BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::Concurrent,
 		&mut conflicts2,
 		"c20-converge",
@@ -1350,10 +1329,8 @@ async fn conflict_22_local_rename_vs_remote_modify() {
 
 	write_file(&tc.local_a, "m.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c22-baseline",
@@ -1406,10 +1383,8 @@ async fn conflict_23_dir_delete_vs_new_child() {
 
 	write_file(&tc.local_a, "d/old.txt", b"OLD");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c23-baseline",
@@ -1467,10 +1442,8 @@ async fn conflict_24_conflict_copy_bytes_exact_binary() {
 		.collect();
 	std::fs::write(tc.local_a.join("blob.bin"), &base).unwrap();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c24-baseline",
@@ -1534,10 +1507,8 @@ async fn conflict_add_move_vs_modify() {
 
 	write_file(&tc.local_a, "proj/spec.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"cA1-baseline",
@@ -1589,10 +1560,8 @@ async fn conflict_add_dir_rename_vs_rename() {
 	write_file(&tc.local_a, "docs/a.txt", b"AA");
 	write_file(&tc.local_a, "docs/b.txt", b"BB");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"cA2-baseline",
@@ -1656,10 +1625,8 @@ async fn conflict_add_remote_rename_vs_local_modify() {
 
 	write_file(&tc.local_a, "r.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"cA3-baseline",
@@ -1756,10 +1723,8 @@ async fn conflict_add_pair_isolation() {
 	write_file(&tc.local_a, "a-shared.txt", b"BASE-A");
 	write_file(&tc.local_b, "b-shared.txt", b"BASE-B");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"cA5-baseline",
@@ -1843,10 +1808,8 @@ async fn conflict_add_subthreshold_dir_delete_vs_edited_child() {
 
 	write_file(&tc.local_a, "d/keep.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"cA6-baseline",
@@ -1928,10 +1891,14 @@ async fn conflict_25_watch_mode_conflict_does_not_loop() {
 	let mut conflicts = BTreeSet::new();
 	write_file(&local_a, "watched.txt", b"BASE");
 	converge(
-		&engine_a,
-		pair_a,
-		&engine_b,
-		pair_b,
+		Peer {
+			engine: &engine_a,
+			pair: pair_a,
+		},
+		Peer {
+			engine: &engine_b,
+			pair: pair_b,
+		},
 		Order::AFirst,
 		&mut conflicts,
 		"c25-baseline",
@@ -2623,10 +2590,8 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	// Converge a shared "BASE" on both sides.
 	write_file(&tc.local_a, "race.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c26-baseline",
@@ -2805,10 +2770,8 @@ async fn conflict_26_same_round_edits_surface_on_the_superseded_client() {
 	);
 
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c26-resolved",
@@ -3014,10 +2977,8 @@ async fn conflict_28_keep_remote_restores_the_buried_edit() {
 	// that observation is what records BASE as the content both sides hold (see CONFLICT-26).
 	write_file(&tc.local_a, "race.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c28-baseline",

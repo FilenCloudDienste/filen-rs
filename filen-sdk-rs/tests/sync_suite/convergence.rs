@@ -267,10 +267,8 @@ async fn run_05_trial(order: Order) -> TreeMap {
 	std::fs::create_dir_all(tc.local_b.join("d2")).unwrap();
 
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		order,
 		&mut conflicts,
 		"converge-05",
@@ -577,10 +575,8 @@ async fn converge_11_two_clients_identical_trees() {
 	write_file(&tc.local_a, "s1.txt", b"a");
 	write_file(&tc.local_a, "subdir/s2.txt", b"b");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c11-push-a",
@@ -594,10 +590,8 @@ async fn converge_11_two_clients_identical_trees() {
 
 	write_file(&tc.local_b, "s3.txt", b"c");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::BFirst,
 		&mut conflicts,
 		"c11-push-b",
@@ -752,10 +746,8 @@ async fn converge_14_same_dir_disjoint_adds_merge() {
 	// Converge a shared/ dir with base.txt (seeded on A).
 	write_file(&tc.local_a, "shared/base.txt", b"base");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c14-baseline",
@@ -767,10 +759,8 @@ async fn converge_14_same_dir_disjoint_adds_merge() {
 	write_file(&tc.local_a, "shared/fromC1.txt", b"1");
 	write_file(&tc.local_b, "shared/fromC2.txt", b"2");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c14-merge",
@@ -1334,10 +1324,8 @@ async fn run_25_trial(order: Order) -> TreeMap {
 	write_file(&tc.local_a, "dir/old.txt", b"old");
 	write_file(&tc.local_a, "dir/keep.txt", b"keep");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"c25-baseline",
@@ -1353,10 +1341,8 @@ async fn run_25_trial(order: Order) -> TreeMap {
 	std::fs::remove_file(tc.local_a.join("dir/old.txt")).unwrap();
 	write_file(&tc.local_b, "dir/added.txt", b"added");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		order,
 		&mut conflicts,
 		"c25-mix",
@@ -1537,10 +1523,8 @@ async fn run_a4_trial(order: Order) -> TreeMap {
 	write_file(&tc.local_a, "p.txt", b"p0");
 	write_file(&tc.local_a, "q.txt", b"q0");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"a4-baseline",
@@ -1583,10 +1567,8 @@ async fn run_a4_trial(order: Order) -> TreeMap {
 	write_file(&tc.local_a, "p.txt", b"p1");
 	write_file(&tc.local_b, "q.txt", b"q1");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		order,
 		&mut conflicts,
 		"a4-mods",

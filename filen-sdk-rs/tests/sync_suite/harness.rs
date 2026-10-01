@@ -7,7 +7,6 @@
 //!
 //! These are LIVE tests against the real backend (via `test_utils::RESOURCES`); each test scopes to
 //! its own fresh remote dir (auto-cleaned) so they stay account-size-independent.
-#![allow(dead_code)]
 
 use std::{
 	collections::BTreeMap,
@@ -277,6 +276,20 @@ pub struct TwoClients {
 }
 
 impl TwoClients {
+	pub fn peer_a(&self) -> Peer<'_> {
+		Peer {
+			engine: &self.engine_a,
+			pair: self.pair_a,
+		}
+	}
+
+	pub fn peer_b(&self) -> Peer<'_> {
+		Peer {
+			engine: &self.engine_b,
+			pair: self.pair_b,
+		}
+	}
+
 	pub fn cleanup(&self) {
 		std::fs::remove_dir_all(&self.local_a).ok();
 		std::fs::remove_dir_all(&self.local_b).ok();
@@ -361,15 +374,18 @@ pub async fn sync_round(
 	}
 }
 
+/// One client of a two-client test: its engine and the pair it syncs.
+pub struct Peer<'a> {
+	pub engine: &'a SyncEngine,
+	pub pair: i64,
+}
+
 /// Run sync rounds (in `order`) on two clients until `done` holds, panicking after a bound. Each
 /// pass must be error-free; surfaced conflicts are accumulated into `conflicts`. A short settle
 /// between rounds lets each client's cache observe the other's just-committed remote writes.
-#[allow(clippy::too_many_arguments)]
 pub async fn converge(
-	ea: &SyncEngine,
-	pa: i64,
-	eb: &SyncEngine,
-	pb: i64,
+	a: Peer<'_>,
+	b: Peer<'_>,
 	order: Order,
 	conflicts: &mut std::collections::BTreeSet<String>,
 	label: &str,
@@ -377,7 +393,7 @@ pub async fn converge(
 ) {
 	const MAX_ROUNDS: usize = 20;
 	for _ in 0..MAX_ROUNDS {
-		let (ra, rb) = sync_round(ea, pa, eb, pb, order).await;
+		let (ra, rb) = sync_round(a.engine, a.pair, b.engine, b.pair, order).await;
 		assert!(
 			ra.errors.is_empty(),
 			"{label}: engine A errors {:?}",
