@@ -11,22 +11,15 @@ use std::{
 	io::{Cursor, Write},
 };
 
-use ::zip::{AesMode, CompressionMethod, write::SimpleFileOptions};
+use ::zip::{
+	AesMode, CompressionMethod, unstable::write::FileOptionsExt, write::SimpleFileOptions,
+};
 use chrono::TimeZone;
 
 use super::*;
 use crate::fs::archive::{
-	test_support::{archive_password, damaged_copies, pattern},
+	test_support::{READ_BACK_ZIP, READ_BACK_ZIP_ENTRY, archive_password, damaged_copies, pattern},
 	zip::write::{Encryption, ZipMethod, ZipWriter},
-};
-
-const LIMITS: ZipLimits = ZipLimits {
-	max_index_bytes: 32 << 20,
-	max_entries: 1_000_000,
-};
-
-const ENTRY: EntryLimits = EntryLimits {
-	decoder_memory: 64 << 20,
 };
 
 /// Every entry of `zip`, read through the reader: name, kind and data.
@@ -44,20 +37,20 @@ fn read_source<R: Read + Seek>(
 	password: Option<&str>,
 ) -> Result<Vec<(String, ZipKind, Vec<u8>)>, ZipError> {
 	let password = password.map(archive_password);
-	let index = read_index(source, len, LIMITS)?;
+	let index = read_index(source, len, READ_BACK_ZIP)?;
 	let mut out = Vec::new();
 	for entry in &index.entries {
 		let mut data = Vec::new();
 		if entry.kind == ZipKind::File {
-			open_entry(source, index.shift, entry, password.as_ref(), ENTRY)?
-				.read_to_end(&mut data)
-				.map_err(
-					|e| match e.into_inner().map(|inner| inner.downcast::<ZipError>()) {
-						Some(Ok(zip)) => *zip,
-						Some(Err(other)) => ZipError::Read(io::Error::other(other)),
-						None => ZipError::Corrupt("read failed"),
-					},
-				)?;
+			open_entry(
+				source,
+				index.shift,
+				entry,
+				password.as_ref(),
+				READ_BACK_ZIP_ENTRY,
+			)?
+			.read_to_end(&mut data)
+			.map_err(|error| error.downcast().unwrap_or_else(ZipError::Read))?;
 		}
 		out.push((entry.name.clone(), entry.kind, data));
 	}
@@ -218,7 +211,6 @@ fn we_read_the_zip_crates_zips() {
 
 #[test]
 fn we_read_the_zip_crates_zip_crypto() {
-	use ::zip::unstable::write::FileOptionsExt;
 	// a second implementation of the key schedule: a mistake the reader shares with the tests'
 	// own encryptor would cancel out
 	let sample = sample();
@@ -237,7 +229,7 @@ fn we_read_the_zip_crates_zip_crypto() {
 		}
 		let zip = writer.finish().unwrap().into_inner();
 		let mut source = Cursor::new(&zip);
-		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 		assert!(
 			index
 				.entries
@@ -286,7 +278,7 @@ fn the_index_stays_within_its_limits() {
 	let mut source = Cursor::new(&zip);
 	let exactly = ZipLimits {
 		max_entries: 3,
-		..LIMITS
+		..READ_BACK_ZIP
 	};
 	assert_eq!(
 		read_index(&mut source, zip.len() as u64, exactly)
@@ -297,7 +289,7 @@ fn the_index_stays_within_its_limits() {
 	);
 	let few = ZipLimits {
 		max_entries: 2,
-		..LIMITS
+		..READ_BACK_ZIP
 	};
 	assert!(matches!(
 		read_index(&mut source, zip.len() as u64, few),
@@ -305,7 +297,7 @@ fn the_index_stays_within_its_limits() {
 	));
 	let small = ZipLimits {
 		max_index_bytes: 100,
-		..LIMITS
+		..READ_BACK_ZIP
 	};
 	assert!(matches!(
 		read_index(&mut source, zip.len() as u64, small),
@@ -324,7 +316,7 @@ fn duplicates_keep_the_last_and_are_reported() {
 		None,
 	);
 	let mut source = Cursor::new(&zip);
-	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.entries.len(), 1);
 	assert_eq!(
 		(index.duplicate_count, index.duplicate_names.clone()),
@@ -344,7 +336,7 @@ fn prepended_data_is_skipped_and_counted() {
 	let prefix = sfx.len() as u64;
 	sfx.extend_from_slice(&zip);
 	let mut source = Cursor::new(&sfx);
-	let index = read_index(&mut source, sfx.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, sfx.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!((index.shift, index.prefix_bytes), (prefix, prefix));
 	assert_eq!(read_all(&sfx, None).unwrap()[0].2, b"alpha");
 }
@@ -360,8 +352,15 @@ fn entries_are_visited_in_local_header_order_and_overlaps_refused() {
 		None,
 	);
 	// swap the two central directory records: the order they are visited in stays the same
-	let mut source = Cursor::new(&zip);
-	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+	let (at, records, end) = central_records(&zip);
+	let swapped = with_central_records(&zip[..at], &[records[1], records[0]], end);
+	assert_eq!(
+		&swapped[at + CENTRAL_HEADER_LEN..][..6],
+		b"second",
+		"the central directory lists the second entry first"
+	);
+	let mut source = Cursor::new(&swapped);
+	let index = read_index(&mut source, swapped.len() as u64, READ_BACK_ZIP).unwrap();
 	let names: Vec<_> = index.entries.iter().map(|e| e.name.as_str()).collect();
 	assert_eq!(names, ["first", "second"]);
 
@@ -373,9 +372,46 @@ fn entries_are_visited_in_local_header_order_and_overlaps_refused() {
 	let mut overlapping = zip.clone();
 	overlapping[cd + 42..cd + 46].copy_from_slice(&0u32.to_le_bytes());
 	let mut source = Cursor::new(&overlapping);
-	let index = read_index(&mut source, overlapping.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, overlapping.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.entries.len(), 1);
 	assert_eq!(index.overlapping.len(), 1);
+}
+
+/// Where `zip`'s central directory starts, its records, and its end record. The zip has no
+/// zip64 records or comment.
+fn central_records(zip: &[u8]) -> (usize, Vec<&[u8]>, &[u8]) {
+	let eocd = zip.len() - EOCD_LEN;
+	assert_eq!(u32_at(zip, eocd), EOCD_SIG, "no zip64 or comment here");
+	let cd_size = u32_at(zip, eocd + 12) as usize;
+	let cd_start = u32_at(zip, eocd + 16) as usize;
+	let mut records = Vec::new();
+	let mut at = cd_start;
+	while at < cd_start + cd_size {
+		let len = CENTRAL_HEADER_LEN
+			+ usize::from(u16_at(zip, at + 28))
+			+ usize::from(u16_at(zip, at + 30))
+			+ usize::from(u16_at(zip, at + 32));
+		records.push(&zip[at..at + len]);
+		at += len;
+	}
+	(cd_start, records, &zip[eocd..])
+}
+
+/// The zip whose entries are `entries`, with `records` as its central directory and `end` as
+/// its end record, counts and size set to match.
+fn with_central_records(entries: &[u8], records: &[&[u8]], end: &[u8]) -> Vec<u8> {
+	let mut out = entries.to_vec();
+	let size: usize = records.iter().map(|record| record.len()).sum();
+	for record in records {
+		out.extend_from_slice(record);
+	}
+	let mut end = end.to_vec();
+	let count = u16::try_from(records.len()).unwrap();
+	end[8..10].copy_from_slice(&count.to_le_bytes());
+	end[10..12].copy_from_slice(&count.to_le_bytes());
+	end[12..16].copy_from_slice(&u32::try_from(size).unwrap().to_le_bytes());
+	out.extend_from_slice(&end);
+	out
 }
 
 /// The MS-DOS version-made-by host, which the reader has no use for.

@@ -2,43 +2,52 @@
 //! archive, events collected in order.
 
 use std::{
-	io::Write,
-	sync::{
-		Arc,
-		atomic::{AtomicBool, Ordering},
-	},
-	time::{Duration, Instant},
+	io::{Cursor, Write},
+	sync::mpsc,
+	time::Duration,
 };
 
 // the crate, which the codec's own `tar` would shadow through `super::*`
 use ::tar;
+use ::zip::{AesMode, CompressionMethod, write::SimpleFileOptions};
 use chrono::DateTime;
 use filen_types::fs::Uuid;
+use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+use sevenz_rust2::{
+	ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod, SourceReader,
+	encoder_options::AesEncoderOptions,
+};
 
 use super::*;
 use crate::{
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
-	fs::archive::{
-		decode::CodecError,
-		extract::{
-			ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, ListedPath,
-			PasswordCheck,
+	fs::{
+		archive::{
+			decode::{CodecError, SKIPPABLE_FRAME_MAGIC},
+			encode::{Compression, open_encoder},
+			extract::{
+				ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, ListedPath,
+				ListedSkipReason, PasswordCheck,
+			},
+			format::StreamCodec,
+			sevenz::{
+				SevenZError,
+				header::ATTRIBUTE_REPARSE_POINT,
+				write::{SevenZEncryption, SevenZMethod},
+			},
+			tar_iter::TarError,
+			test_support::{
+				APPLE_DOUBLE, READ_BACK_ZIP, TarMember, archive_password, gzip, incompressible,
+				pattern, sevenz_of, skippable_frame, tar_of, tar_with, zip_of, zstd_raw_frame,
+			},
+			worker,
+			zip::{
+				crypto::{ZipCryptoReader, test_support::zip_crypto_encrypt},
+				read::{ZipError, read_index as zip_read_index},
+			},
 		},
-		format::StreamCodec,
-		password::ArchivePassword,
-		sevenz::{
-			SevenZError,
-			write::{SevenZEncryption, SevenZMethod},
-		},
-		tar_iter::TarError,
-		test_support::{
-			TarMember, archive_password, gzip, incompressible, pattern, sevenz_of, tar_of,
-			tar_with, zip_of,
-		},
-		worker,
-		zip::read::ZipError,
+		name::ValidatedName,
 	},
-	fs::name::ValidatedName,
 };
 
 const LIMITS: CodecLimits = CodecLimits {
@@ -102,7 +111,7 @@ fn run_counting(
 			name: name.to_owned(),
 			len: archive.len() as u64,
 			limits,
-			password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+			password: password.map(archive_password),
 			skip_mac_metadata: false,
 			task: Task::Extract(None),
 		},
@@ -178,17 +187,7 @@ fn run_job_answering(
 		}
 	}
 	// the result follows the events closing, once the codec's thread hands it over
-	let deadline = Instant::now() + Duration::from_secs(10);
-	let result = loop {
-		match link.done.try_recv() {
-			Ok(result) => break result,
-			Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-				assert!(Instant::now() < deadline, "the codec never returned");
-				std::thread::sleep(Duration::from_millis(1));
-			}
-			Err(tokio::sync::oneshot::error::TryRecvError::Closed) => panic!("the codec died"),
-		}
-	};
+	let result = futures::executor::block_on(&mut link.done).expect("the codec died");
 	(seen, result, link.shared.input_bytes())
 }
 
@@ -380,8 +379,11 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 		})]
 	);
 	assert_eq!(end.unwrap(), nothing);
-	// without a tar's name, zeros are a file of zeros
-	let (seen, _) = run(&gzip(&empty), "zeros.gz");
+}
+
+#[test]
+fn zeros_without_a_tars_name_are_a_file_of_zeros() {
+	let (seen, _) = run(&gzip(&[0u8; 10 * 1024]), "zeros.gz");
 	assert_eq!(
 		seen[0],
 		Seen::Opened(ArchiveFormat::Single {
@@ -392,8 +394,8 @@ fn an_empty_tar_is_an_archive_of_nothing() {
 
 #[test]
 fn a_zstd_tar_is_read_through_its_frames() {
-	let mut encoder = crate::fs::archive::encode::open_encoder(
-		crate::fs::archive::encode::Compression {
+	let mut encoder = open_encoder(
+		Compression {
 			codec: StreamCodec::Zstd,
 			level: None,
 		},
@@ -491,27 +493,37 @@ fn what_the_codec_cannot_read_is_refused() {
 	assert_eq!(kind(end), ErrorKind::ArchiveCorrupt);
 }
 
-#[test]
-fn archives_beyond_the_limits_are_refused() {
-	let zeros = gzip(&vec![0u8; 4 << 20]);
-	let bomb = CodecLimits {
-		expansion: Some(ExpansionLimit {
-			ratio: 10,
-			floor: 1 << 20,
-		}),
-		..LIMITS
-	};
-	let (_, end) = run_with(&zeros, "zeros.gz", bomb);
-	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
+/// Limits under which 4 MiB of zeros decode past what their archive may expand to.
+const BOMB: CodecLimits = CodecLimits {
+	expansion: Some(ExpansionLimit {
+		ratio: 10,
+		floor: 1 << 20,
+	}),
+	..LIMITS
+};
 
-	let few = CodecLimits {
-		max_members: 2,
-		..LIMITS
-	};
-	let (seen, end) = run_with(&sample_tar(), "sample.tar", few);
+/// Limits under which [`sample_tar`] has too many members.
+const FEW_MEMBERS: CodecLimits = CodecLimits {
+	max_members: 2,
+	..LIMITS
+};
+
+#[test]
+fn a_stream_decoding_past_its_expansion_limit_is_refused() {
+	let zeros = gzip(&vec![0u8; 4 << 20]);
+	let (_, end) = run_with(&zeros, "zeros.gz", BOMB);
+	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
+}
+
+#[test]
+fn a_tar_of_more_members_than_the_limit_is_refused() {
+	let (seen, end) = run_with(&sample_tar(), "sample.tar", FEW_MEMBERS);
 	assert_eq!(kind(end), ErrorKind::ArchiveTooLarge);
 	assert_eq!(seen.len(), 3, "the members before the limit were sent");
+}
 
+#[test]
+fn a_decoder_needing_more_memory_than_the_limit_is_refused() {
 	let small_memory = CodecLimits {
 		decoder_memory: 128 << 10,
 		..LIMITS
@@ -545,22 +557,11 @@ fn a_refusal_keeps_the_readers_own_error() {
 	assert!(failed_with::<CodecError>(
 		run(&archive[..archive.len() - 10], "sample.tgz").1
 	));
-	let few = CodecLimits {
-		max_members: 2,
-		..LIMITS
-	};
 	assert!(failed_with::<TarError>(
-		run_with(&sample_tar(), "sample.tar", few).1
+		run_with(&sample_tar(), "sample.tar", FEW_MEMBERS).1
 	));
-	let bomb = CodecLimits {
-		expansion: Some(ExpansionLimit {
-			ratio: 10,
-			floor: 1 << 20,
-		}),
-		..LIMITS
-	};
 	assert!(failed_with::<ExpansionExceeded>(
-		run_with(&gzip(&vec![0u8; 4 << 20]), "zeros.gz", bomb).1
+		run_with(&gzip(&vec![0u8; 4 << 20]), "zeros.gz", BOMB).1
 	));
 }
 
@@ -568,24 +569,21 @@ fn a_refusal_keeps_the_readers_own_error() {
 fn the_codec_stops_once_its_driver_is_gone() {
 	let archive = sample_tar();
 	let len = archive.len() as u64;
-	let exited = Arc::new(AtomicBool::new(false));
-	let mut link = worker::start({
-		let exited = Arc::clone(&exited);
-		move |port| {
-			let result = extract_stream(
-				&port,
-				StreamJob {
-					name: "sample.tar".into(),
-					len,
-					limits: LIMITS,
-					password: None,
-					skip_mac_metadata: false,
-					task: Task::Extract(None),
-				},
-			);
-			exited.store(true, Ordering::SeqCst);
-			result
-		}
+	let (exited, has_exited) = mpsc::channel();
+	let mut link = worker::start(move |port| {
+		let result = extract_stream(
+			&port,
+			StreamJob {
+				name: "sample.tar".into(),
+				len,
+				limits: LIMITS,
+				password: None,
+				skip_mac_metadata: false,
+				task: Task::Extract(None),
+			},
+		);
+		let _ = exited.send(());
+		result
 	})
 	.unwrap();
 	let Some(WorkerEvent::Ask { reply, .. }) = link.events.blocking_recv() else {
@@ -593,11 +591,9 @@ fn the_codec_stops_once_its_driver_is_gone() {
 	};
 	reply.send(archive).unwrap();
 	drop(link);
-	let deadline = Instant::now() + Duration::from_secs(10);
-	while !exited.load(Ordering::SeqCst) {
-		assert!(Instant::now() < deadline, "the codec thread kept running");
-		std::thread::sleep(Duration::from_millis(5));
-	}
+	has_exited
+		.recv_timeout(Duration::from_secs(10))
+		.expect("the codec thread kept running");
 }
 
 fn zip_sample() -> (Vec<u8>, Vec<Seen>) {
@@ -680,7 +676,7 @@ fn an_encrypted_zip_needs_the_right_password_before_anything_is_sent() {
 }
 
 #[test]
-fn zip_duplicates_symlinks_and_bombs() {
+fn the_last_of_duplicate_zip_entries_wins() {
 	let zip = zip_of(&[("same", Some(b"one")), ("same", Some(b"two"))], None);
 	let (seen, end) = run(&zip, "d.zip");
 	let end = end.unwrap();
@@ -692,8 +688,11 @@ fn zip_duplicates_symlinks_and_bombs() {
 		})
 	);
 	assert_eq!(seen[1], file(1, "same", b"two"), "the last one listed wins");
+}
 
-	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+#[test]
+fn a_zip_symlink_is_skipped_with_its_target() {
+	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 	writer
 		.add_symlink(
 			"link",
@@ -718,16 +717,12 @@ fn zip_duplicates_symlinks_and_bombs() {
 			),
 		]
 	);
+}
 
+#[test]
+fn a_zip_stating_sizes_past_its_expansion_limit_is_refused_up_front() {
 	let zeros = zip_of(&[("zeros", Some(&vec![0u8; 4 << 20]))], None);
-	let bomb = CodecLimits {
-		expansion: Some(ExpansionLimit {
-			ratio: 10,
-			floor: 1 << 20,
-		}),
-		..LIMITS
-	};
-	let (seen, end) = run_with(&zeros, "z.zip", bomb);
+	let (seen, end) = run_with(&zeros, "z.zip", BOMB);
 	assert!(
 		seen.is_empty(),
 		"refused on its stated sizes, before anything is sent"
@@ -848,8 +843,7 @@ fn an_encrypted_7z_needs_the_right_password_before_anything_is_sent() {
 
 #[test]
 fn sevenz_symlinks_and_anti_items_are_skipped() {
-	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
-	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
 	let mut link = SevenZEntry::new_file("link");
 	link.has_windows_attributes = true;
 	link.windows_attributes = 0x8000 | (0o120_777 << 16);
@@ -908,13 +902,11 @@ fn reparse_data(tag: u32, substitute: &str, print: &str) -> Vec<u8> {
 
 #[test]
 fn a_7z_reparse_point_is_a_link_only_when_its_data_says_so() {
-	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter};
-	const REPARSE_POINT: u32 = 0x400;
-	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
 	let mut push = |name: &str, data: Option<&[u8]>| {
 		let mut entry = SevenZEntry::new_file(name);
 		entry.has_windows_attributes = true;
-		entry.windows_attributes = REPARSE_POINT | 0x20;
+		entry.windows_attributes = ATTRIBUTE_REPARSE_POINT | 0x20;
 		entry.has_stream = data.is_some();
 		writer.push_archive_entry(entry, data).unwrap();
 	};
@@ -981,10 +973,9 @@ fn damaged_data_is_reported_as_a_damaged_archive() {
 
 #[test]
 fn a_filtered_7z_spanning_chunks_decodes() {
-	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod};
 	// the x86 branch filter over LZMA2, across several of the source's chunks
 	let data = pattern(3 * CHUNK_SIZE, 9);
-	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
 	writer.set_content_methods(vec![
 		EncoderMethod::BCJ_X86_FILTER.into(),
 		EncoderMethod::LZMA2.into(),
@@ -1025,8 +1016,7 @@ fn data_under_a_tar_directory_is_unaccounted() {
 /// A zip written by the `zip` crate, directories stored as "files" named with a trailing slash,
 /// deflated, as `java.util.zip` and Python write them.
 fn zip_with_deflated_dirs(dir_data: &[u8]) -> Vec<u8> {
-	use ::zip::{CompressionMethod, write::SimpleFileOptions};
-	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 	let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 	writer.start_file("docs/", options).unwrap();
 	writer.write_all(dir_data).unwrap();
@@ -1038,16 +1028,8 @@ fn zip_with_deflated_dirs(dir_data: &[u8]) -> Vec<u8> {
 #[test]
 fn an_empty_deflated_directory_is_no_hidden_data() {
 	let zip = zip_with_deflated_dirs(b"");
-	let mut source = std::io::Cursor::new(&zip[..]);
-	let index = crate::fs::archive::zip::read::read_index(
-		&mut source,
-		zip.len() as u64,
-		crate::fs::archive::zip::read::ZipLimits {
-			max_index_bytes: 1 << 20,
-			max_entries: 10,
-		},
-	)
-	.unwrap();
+	let mut source = Cursor::new(&zip[..]);
+	let index = zip_read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 	assert!(
 		index.entries[0].compressed_size > 0,
 		"the directory is stored as a deflate stream, as Java writes it"
@@ -1077,14 +1059,10 @@ fn a_wrong_password_on_lzma_entries_reads_as_one() {
 
 #[test]
 fn an_empty_7z_entry_proves_no_password() {
-	use sevenz_rust2::{
-		ArchiveEntry as SevenZEntry, ArchiveWriter, EncoderMethod,
-		encoder_options::AesEncoderOptions,
-	};
 	// sevenz-rust2 gives an empty file added with a reader a data stream of its own; decoding
 	// nothing matches its CRC-32 under any key, and LZMA2 reads nothing before its first output
 	let data = pattern(64 << 10, 5);
-	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
 	writer.set_content_methods(vec![
 		AesEncoderOptions::new("right".into()).into(),
 		EncoderMethod::LZMA2.into(),
@@ -1118,7 +1096,6 @@ fn an_empty_7z_entry_proves_no_password() {
 /// A zip of stored, ZipCrypto-encrypted files (no data descriptors, so each check byte is the
 /// high byte of its CRC-32), built by hand: no writer the tests have writes ZipCrypto.
 fn zip_crypto_zip(files: &[(&str, &[u8])], password: &[u8]) -> Vec<u8> {
-	use crate::fs::archive::zip::crypto::test_support::zip_crypto_encrypt;
 	let mut zip = Vec::new();
 	let mut central = Vec::new();
 	for (name, data) in files {
@@ -1166,9 +1143,8 @@ fn zip_crypto_zip(files: &[(&str, &[u8])], password: &[u8]) -> Vec<u8> {
 
 #[test]
 fn an_empty_zip_crypto_entry_proves_no_password() {
-	use crate::fs::archive::zip::crypto::{ZipCryptoReader, test_support::zip_crypto_encrypt};
 	// the one file with data is too large to probe, so the entries themselves decide
-	let data = pattern((16 << 20) + 1, 7);
+	let data = pattern(usize::try_from(PASSWORD_PROBE_BYTES).unwrap() + 1, 7);
 	let zip = zip_crypto_zip(&[("empty.txt", b""), ("data.bin", &data)], b"right");
 	// a wrong password that both check bytes let through (1 in 65536)
 	let passes = |password: &str, data: &[u8]| {
@@ -1194,8 +1170,7 @@ fn an_empty_zip_crypto_entry_proves_no_password() {
 /// A zip whose directory entry is encrypted with AES, as the `zip` crate writes one started as a
 /// file named with a trailing slash.
 fn zip_with_encrypted_dir(method: ::zip::CompressionMethod, dir_data: &[u8]) -> Vec<u8> {
-	use ::zip::{AesMode, write::SimpleFileOptions};
-	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 	let options = SimpleFileOptions::default()
 		.compression_method(method)
 		.with_aes_encryption(AesMode::Aes256, "pw");
@@ -1208,7 +1183,6 @@ fn zip_with_encrypted_dir(method: ::zip::CompressionMethod, dir_data: &[u8]) -> 
 
 #[test]
 fn an_encrypted_directory_is_judged_by_its_length() {
-	use ::zip::CompressionMethod;
 	for method in [
 		CompressionMethod::Stored,
 		CompressionMethod::Deflated,
@@ -1231,57 +1205,60 @@ const FIXTURE_PASSWORD: &str = "fixture password";
 /// checksum covered against the directory's `manifest.tsv`, which was written from the inputs
 /// rather than from what the SDK reads.
 fn check_fixtures(dir: &str) {
-	let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-		.join("tests/fixtures/archives")
-		.join(dir);
-	let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
+	let manifest = String::from_utf8(fixture(dir, "manifest.tsv")).unwrap();
 	let mut expected = std::collections::BTreeMap::<&str, Vec<String>>::new();
 	for line in manifest.lines().filter(|line| !line.starts_with('#')) {
 		let (archive, row) = line.split_once('\t').unwrap();
 		expected.entry(archive).or_default().push(row.to_owned());
 	}
-	for (archive, mut rows) in expected {
-		let bytes = std::fs::read(root.join(archive)).unwrap();
-		let password = archive.starts_with("encrypted").then_some(FIXTURE_PASSWORD);
-		let (seen, end) = run_full(&bytes, archive, LIMITS, password);
-		let end = end.unwrap_or_else(|error| panic!("{archive}: {error}"));
-		let mut found: Vec<String> = seen
-			.into_iter()
-			.filter_map(|seen| match seen {
-				Seen::Opened(_) => None,
-				Seen::Dir(_, path) => Some(format!("dir\t{path}")),
-				Seen::File {
-					path, data, ended, ..
-				} => {
-					assert!(ended, "{archive}: {path} did not end");
-					Some(format!(
-						"file\t{path}\t{}\t{:08x}",
-						data.len(),
-						crc32fast::hash(&data)
-					))
-				}
-				Seen::Skipped(_, path, _, ExtractSkipReason::Symlink { target }) => {
-					Some(format!("symlink\t{path}\t{target}"))
-				}
-				Seen::Skipped(_, path, _, ExtractSkipReason::Hardlink { target }) => {
-					Some(format!("hardlink\t{path}\t{target}"))
-				}
-				Seen::Skipped(_, path, _, reason) => Some(format!("skip\t{path}\t{reason:?}")),
-				// the driver extracts it as a copy of its target
-				Seen::Link(_, path, target) => Some(format!("hardlink\t{path}\t{target}")),
-				Seen::Listed(entry) => panic!("{archive}: an extraction listed {entry:?}"),
-			})
-			.collect();
-		if end.unaccounted_bytes > 0 {
-			found.push(format!("unaccounted\t\t{}", end.unaccounted_bytes));
-		}
-		if end.unchecked_entries > 0 {
-			found.push(format!("unchecked\t\t{}", end.unchecked_entries));
-		}
-		rows.sort();
-		found.sort();
-		assert_eq!(found, rows, "{archive}");
+	for (archive, rows) in expected {
+		check_archive(archive, &fixture(dir, archive), rows);
 	}
+}
+
+/// Extracts `bytes`, the archive `archive`, and checks what the codec sends, the bytes that belong
+/// to no entry and the entries no checksum covered against `rows`, written as a `manifest.tsv`
+/// row is, less the archive's name.
+fn check_archive(archive: &str, bytes: &[u8], mut rows: Vec<String>) {
+	let password = archive.starts_with("encrypted").then_some(FIXTURE_PASSWORD);
+	let (seen, end) = run_full(bytes, archive, LIMITS, password);
+	let end = end.unwrap_or_else(|error| panic!("{archive}: {error}"));
+	let mut found: Vec<String> = seen
+		.into_iter()
+		.filter_map(|seen| match seen {
+			Seen::Opened(_) => None,
+			Seen::Dir(_, path) => Some(format!("dir\t{path}")),
+			Seen::File {
+				path, data, ended, ..
+			} => {
+				assert!(ended, "{archive}: {path} did not end");
+				Some(format!(
+					"file\t{path}\t{}\t{:08x}",
+					data.len(),
+					crc32fast::hash(&data)
+				))
+			}
+			Seen::Skipped(_, path, _, ExtractSkipReason::Symlink { target }) => {
+				Some(format!("symlink\t{path}\t{target}"))
+			}
+			Seen::Skipped(_, path, _, ExtractSkipReason::Hardlink { target }) => {
+				Some(format!("hardlink\t{path}\t{target}"))
+			}
+			Seen::Skipped(_, path, _, reason) => Some(format!("skip\t{path}\t{reason:?}")),
+			// the driver extracts it as a copy of its target
+			Seen::Link(_, path, target) => Some(format!("hardlink\t{path}\t{target}")),
+			Seen::Listed(entry) => panic!("{archive}: an extraction listed {entry:?}"),
+		})
+		.collect();
+	if end.unaccounted_bytes > 0 {
+		found.push(format!("unaccounted\t\t{}", end.unaccounted_bytes));
+	}
+	if end.unchecked_entries > 0 {
+		found.push(format!("unchecked\t\t{}", end.unchecked_entries));
+	}
+	rows.sort();
+	found.sort();
+	assert_eq!(found, rows, "{archive}");
 }
 
 #[test]
@@ -1296,11 +1273,7 @@ fn sevenz_fixtures_extract_to_their_manifest() {
 
 #[test]
 fn a_zip_of_zstd_entries_is_extracted() {
-	let zip = std::fs::read(
-		std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-			.join("tests/fixtures/archives/zip/zstd-python.zip"),
-	)
-	.unwrap();
+	let zip = fixture("zip", "zstd-python.zip");
 	let (seen, end) = run(&zip, "zstd-python.zip");
 	assert_eq!(end.unwrap().unaccounted_bytes, 0);
 	let files: Vec<(String, usize, bool)> = seen
@@ -1325,6 +1298,101 @@ fn a_zip_of_zstd_entries_is_extracted() {
 #[test]
 fn stream_fixtures_extract_to_their_manifest() {
 	check_fixtures("streams");
+}
+
+/// A stream codec's output at `level`, from the crates the SDK decodes it with.
+fn gzip_at(data: &[u8], level: u32) -> Vec<u8> {
+	let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+	encoder.write_all(data).unwrap();
+	encoder.finish().unwrap()
+}
+
+fn bzip2_at(data: &[u8], level: u32) -> Vec<u8> {
+	let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(level));
+	encoder.write_all(data).unwrap();
+	encoder.finish().unwrap()
+}
+
+fn lz4_frame(data: &[u8], info: FrameInfo) -> Vec<u8> {
+	let mut encoder = FrameEncoder::with_frame_info(info, Vec::new());
+	encoder.write_all(data).unwrap();
+	encoder.finish().unwrap()
+}
+
+/// The magic numbers of the skippable frames the streams below carry: the first and the last of
+/// the range lz4 and zstd share.
+const LZ4_SKIPPABLE: u32 = *SKIPPABLE_FRAME_MAGIC.start();
+const ZSTD_SKIPPABLE: u32 = *SKIPPABLE_FRAME_MAGIC.end();
+
+#[test]
+fn streams_of_several_members_or_frames_extract_to_one_file() {
+	let (bin, text) = (incompressible(4096, 7), pattern(2110, 0));
+	let both = [&bin[..], &text].concat();
+	let file = |name: &str| {
+		format!(
+			"file\t{name}\t{}\t{:08x}",
+			both.len(),
+			crc32fast::hash(&both)
+		)
+	};
+	let lz4_metadata = skippable_frame(LZ4_SKIPPABLE, b"lz4 metadata");
+	let zstd_metadata = skippable_frame(ZSTD_SKIPPABLE, b"zstd metadata");
+	let linked = FrameInfo::new()
+		.block_size(BlockSize::Max64KB)
+		.block_mode(BlockMode::Linked)
+		.content_checksum(true)
+		.content_size(Some(bin.len() as u64));
+	for (name, archive, rows) in [
+		// two members at different levels
+		(
+			"two-members.bin.gz",
+			[gzip_at(&bin, 6), gzip_at(&text, 9)].concat(),
+			vec![file("two-members.bin")],
+		),
+		(
+			"two-members.bin.bz2",
+			[bzip2_at(&bin, 9), bzip2_at(&text, 1)].concat(),
+			vec![file("two-members.bin")],
+		),
+		// a skippable frame, a frame of linked blocks stating its size, then one without a
+		// content checksum: the skippable frame's 20 bytes belong to no file, which one frame
+		// leaves unchecked
+		(
+			"skippable-frames.bin.lz4",
+			[
+				lz4_metadata,
+				lz4_frame(&bin, linked),
+				lz4_frame(&text, FrameInfo::new()),
+			]
+			.concat(),
+			vec![
+				file("skippable-frames.bin"),
+				"unaccounted\t\t20".to_owned(),
+				"unchecked\t\t1".to_owned(),
+			],
+		),
+		// skippable frames of 21 bytes around a frame with a checksum and one without
+		(
+			"frames.bin.zst",
+			[
+				&zstd_metadata[..],
+				&ruzstd::encoding::compress_to_vec(
+					&bin[..],
+					ruzstd::encoding::CompressionLevel::Fastest,
+				),
+				&zstd_metadata,
+				&zstd_raw_frame(&text, 17, true, None),
+			]
+			.concat(),
+			vec![
+				file("frames.bin"),
+				"unaccounted\t\t42".to_owned(),
+				"unchecked\t\t1".to_owned(),
+			],
+		),
+	] {
+		check_archive(name, &archive, rows);
+	}
 }
 
 /// A `task` over `archive`, named `name`, leaving macOS metadata out when `skip_mac_metadata`.
@@ -1365,20 +1433,36 @@ fn fixture(dir: &str, name: &str) -> Vec<u8> {
 
 /// An AppleDouble file's first bytes, then whatever it holds.
 fn apple_double_data() -> Vec<u8> {
-	[
-		&[0x00, 0x05, 0x16, 0x07][..],
-		b"\x00\x02\x00\x00Mac OS X        ",
-	]
-	.concat()
+	[&APPLE_DOUBLE[..], b"Mac OS X        "].concat()
 }
 
 #[test]
-fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
-	// bsdtar's AppleDouble member, ahead of the file it belongs to
+fn bsdtars_apple_double_member_is_left_out_only_when_asked() {
+	// bsdtar's AppleDouble member, ahead of the file it belongs to; its size depends on the
+	// attributes macOS gave the file it was made from, so it is taken from the manifest written
+	// along with the archive
 	let tar = fixture("tar", "appledouble.tar");
+	let manifest = String::from_utf8(fixture("tar", "manifest.tsv")).unwrap();
+	let apple_double_size = manifest
+		.lines()
+		.find_map(|row| row.strip_prefix("appledouble.tar\tfile\t._note.txt\t"))
+		.and_then(|rest| rest.split('\t').next())
+		.unwrap();
 	for (skip, expected) in [
-		(true, ["skip ._note.txt MacMetadata", "file note.txt 39"]),
-		(false, ["file ._note.txt 197", "file note.txt 39"]),
+		(
+			true,
+			[
+				"skip ._note.txt MacMetadata".to_owned(),
+				"file note.txt 39".to_owned(),
+			],
+		),
+		(
+			false,
+			[
+				format!("file ._note.txt {apple_double_size}"),
+				"file note.txt 39".to_owned(),
+			],
+		),
 	] {
 		let (seen, end, _) = run_job(
 			&tar,
@@ -1387,16 +1471,20 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		end.unwrap();
 		assert_eq!(outline(&seen), expected, "{skip}");
 	}
+}
 
-	// a `._` name alone is no AppleDouble: the file is sent whole, the bytes read to tell
-	// included
+#[test]
+fn a_dot_underscore_name_alone_is_no_apple_double() {
+	// the file is sent whole, the bytes read to tell included
 	let tar = tar_of(&[("._notes.txt", b"just text")]);
 	let (seen, end, _) = run_job(&tar, job_of(&tar, "a.tar", true, Task::Extract(None)));
 	end.unwrap();
 	assert_eq!(seen[1..], [file(0, "._notes.txt", b"just text")]);
+}
 
-	// the same in a zip and a 7z, whose data is read to tell: its magic and version, not the
-	// magic alone
+/// A zip and a 7z of a file, its AppleDouble twin, a `._` file of plain text and a `._` file
+/// with AppleDouble's magic but another version.
+fn apple_double_archives() -> [(&'static str, Vec<u8>); 2] {
 	let data = apple_double_data();
 	let other_version = [&data[..4], b"\x00\x01\x00\x00"].concat();
 	let entries = [
@@ -1405,13 +1493,18 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		("._b.txt", Some(&b"b"[..])),
 		("._c.txt", Some(&other_version[..])),
 	];
-	for (name, archive) in [
+	[
 		("m.zip", zip_of(&entries, None)),
 		(
 			"m.7z",
 			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
 		),
-	] {
+	]
+}
+
+#[test]
+fn a_zip_or_7z_apple_double_file_is_told_by_its_magic_and_version() {
+	for (name, archive) in apple_double_archives() {
 		let (seen, end, _) = run_job(&archive, job_of(&archive, name, true, Task::Extract(None)));
 		end.unwrap();
 		assert_eq!(
@@ -1425,15 +1518,11 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 			"{name}"
 		);
 	}
+}
 
-	// a listing reads the same bytes to tell
-	for (name, archive) in [
-		("m.zip", zip_of(&entries, None)),
-		(
-			"m.7z",
-			sevenz_of(&entries, SevenZMethod::Lzma2 { level: 1 }, true, None),
-		),
-	] {
+#[test]
+fn a_zip_or_7z_listing_reads_the_bytes_an_extraction_tells_apple_double_by() {
+	for (name, archive) in apple_double_archives() {
 		let (shown, end) = listed(
 			&archive,
 			job_of(&archive, name, true, Task::List { archive: LISTED }),
@@ -1442,19 +1531,21 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		assert_eq!(
 			shown
 				.iter()
-				.map(|entry| (entry.stored_path.as_str(), entry.skip.clone()))
+				.map(|entry| (entry.stored_path.as_str(), entry.skip))
 				.collect::<Vec<_>>(),
 			[
 				("a.txt", None),
-				("._a.txt", Some(ExtractSkipReason::MacMetadata)),
+				("._a.txt", Some(ListedSkipReason::MacMetadata)),
 				("._b.txt", None),
 				("._c.txt", None),
 			],
 			"{name}"
 		);
 	}
+}
 
-	// Finder's __MACOSX folder, every entry in it
+#[test]
+fn every_entry_in_finders_mac_folder_is_left_out() {
 	let zip = fixture("zip", "finder-ditto.zip");
 	let (seen, end, _) = run_job(&zip, job_of(&zip, "finder.zip", true, Task::Extract(None)));
 	end.unwrap();
@@ -1470,26 +1561,25 @@ fn mac_metadata_is_left_out_when_asked_and_told_by_its_data() {
 		rest.iter().all(|line| !line.ends_with("MacMetadata")),
 		"{rest:?}"
 	);
+}
 
-	// a listing reads what tells the AppleDouble files: the 3 files an extraction creates, and
-	// the 5 it leaves out
+#[test]
+fn a_finder_zip_listing_tells_the_apple_double_files_an_extraction_leaves_out() {
+	// the 3 files an extraction creates, and the 5 it leaves out
+	let zip = fixture("zip", "finder-ditto.zip");
 	let (entries, end) = listed(
 		&zip,
 		job_of(&zip, "finder.zip", true, Task::List { archive: LISTED }),
 	);
 	end.unwrap();
-	let files = |skip: Option<ExtractSkipReason>| {
+	let files = |skip: Option<ListedSkipReason>| {
 		entries
 			.iter()
 			.filter(|entry| entry.kind == ArchiveEntryKind::File && entry.skip == skip)
 			.count()
 	};
 	assert_eq!(files(None), 3, "{entries:?}");
-	assert_eq!(
-		files(Some(ExtractSkipReason::MacMetadata)),
-		5,
-		"{entries:?}"
-	);
+	assert_eq!(files(Some(ListedSkipReason::MacMetadata)), 5, "{entries:?}");
 }
 
 /// What a listing of `archive` sent: its entries, and how it ended.
@@ -1516,7 +1606,7 @@ fn listed_entry(
 	path: Option<&str>,
 	kind: ArchiveEntryKind,
 	size: Option<u64>,
-	skip: Option<ExtractSkipReason>,
+	skip: Option<ListedSkipReason>,
 ) -> ArchiveEntry {
 	ArchiveEntry {
 		id: ArchiveEntryId {
@@ -1576,9 +1666,7 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 				},
 				Some(0),
 				// the target is the kind's
-				Some(ExtractSkipReason::Symlink {
-					target: String::new()
-				}),
+				Some(ListedSkipReason::Symlink),
 			),
 			// extracted as a copy of the file it names, at that file's size
 			listed_entry(
@@ -1601,12 +1689,15 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 				None,
 				ArchiveEntryKind::File,
 				Some(4),
-				Some(ExtractSkipReason::UnsafePath),
+				Some(ListedSkipReason::UnsafePath),
 			),
 		]
 	);
+}
 
-	// a hard link to a file that is not extracted has nothing to be a copy of
+#[test]
+fn a_listed_hard_link_to_a_file_not_extracted_is_skipped() {
+	// it has nothing to be a copy of
 	let mut builder = tar::Builder::new(Vec::new());
 	let mut hard = header(tar::EntryType::Link, 0);
 	builder.append_link(&mut hard, "hard", "gone.txt").unwrap();
@@ -1622,13 +1713,13 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 				target: "gone.txt".into(),
 				target_id: None,
 			},
-			&Some(ExtractSkipReason::Hardlink {
-				target: String::new()
-			})
+			&Some(ListedSkipReason::Hardlink)
 		)
 	);
+}
 
-	// an AppleDouble member is told by its data, and marked whether it is left out or not
+#[test]
+fn a_listed_apple_double_member_is_told_by_its_data_and_skipped_only_when_asked() {
 	let tar = fixture("tar", "appledouble.tar");
 	for skip in [true, false] {
 		let (entries, _) = listed(
@@ -1638,11 +1729,14 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 		assert!(entries[0].mac_metadata && !entries[1].mac_metadata);
 		assert_eq!(
 			entries[0].skip,
-			skip.then_some(ExtractSkipReason::MacMetadata)
+			skip.then_some(ListedSkipReason::MacMetadata)
 		);
 	}
-	// so is a file in a `__MACOSX` folder, which is no metadata when its data is ordinary; the
-	// folder, listed once every entry was, is created for it as an extraction creates it
+}
+
+#[test]
+fn a_listed_file_in_a_mac_folder_is_no_metadata_when_its_data_is_ordinary() {
+	// the folder, listed once every entry was, is created for it as an extraction creates it
 	let tar = tar_of(&[("__MACOSX/", b""), ("__MACOSX/notes.txt", b"plain")]);
 	let (entries, _) = listed(
 		&tar,
@@ -1651,11 +1745,7 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 	assert_eq!(
 		entries
 			.iter()
-			.map(|entry| (
-				entry.stored_path.as_str(),
-				entry.mac_metadata,
-				entry.skip.clone()
-			))
+			.map(|entry| (entry.stored_path.as_str(), entry.mac_metadata, entry.skip))
 			.collect::<Vec<_>>(),
 		[
 			("__MACOSX/notes.txt", false, None),
@@ -1669,14 +1759,14 @@ fn a_tar_is_listed_member_by_member_without_its_data() {
 fn zip_of_spread_links(links: usize) -> Vec<u8> {
 	let stored = ::zip::write::SimpleFileOptions::default()
 		.compression_method(::zip::CompressionMethod::Stored);
-	let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
 	for link in 0..links {
 		writer
 			.add_symlink(format!("link{link}"), "target", stored)
 			.unwrap();
 		writer.start_file(format!("filler{link}"), stored).unwrap();
 		writer
-			.write_all(&incompressible(CHUNK_SIZE, link as u64))
+			.write_all(&incompressible(CHUNK_SIZE, link as u64 + 1))
 			.unwrap();
 	}
 	writer.finish().unwrap().into_inner()
@@ -1808,7 +1898,11 @@ fn a_zip_listing_reads_no_padded_symlink_past_its_budget() {
 		fetched <= INDEX_CHUNKS + usize::try_from(LIST_READ_BYTES).unwrap() / CHUNK_SIZE,
 		"{fetched} chunks fetched"
 	);
-	// a target of a few bytes in a short stream is still read
+}
+
+#[test]
+fn a_zip_listing_reads_a_short_symlink_target_through_its_padding() {
+	// a target of a few bytes in a short stream
 	let zip = zip_of_padded_symlink(b"target", 4);
 	let (entries, end) = listed(
 		&zip,
@@ -1838,7 +1932,7 @@ fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 		(None, PasswordCheck::Required),
 	] {
 		let job = StreamJob {
-			password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+			password: password.map(archive_password),
 			..job_of(&zip, "z.zip", true, Task::List { archive: LISTED })
 		};
 		let (entries, end) = listed(&zip, job);
@@ -1867,21 +1961,17 @@ fn a_zip_is_listed_from_its_index_with_its_password_checked() {
 		);
 	}
 
+	let ppmd = fixture("zip", "ppmd.zip");
 	let (entries, _) = listed(
-		&fixture("zip", "ppmd.zip"),
-		job_of(
-			&fixture("zip", "ppmd.zip"),
-			"p.zip",
-			true,
-			Task::List { archive: LISTED },
-		),
+		&ppmd,
+		job_of(&ppmd, "p.zip", true, Task::List { archive: LISTED }),
 	);
 	// 7-Zip stores what PPMd would not shrink
-	let methods: Vec<(&str, Option<&ExtractSkipReason>)> = entries
+	let methods: Vec<(&str, Option<&ListedSkipReason>)> = entries
 		.iter()
 		.filter_map(|entry| Some((entry.method.as_deref()?, entry.skip.as_ref())))
 		.collect();
-	assert!(methods.contains(&("PPMd", Some(&ExtractSkipReason::UnsupportedMethod))));
+	assert!(methods.contains(&("PPMd", Some(&ListedSkipReason::UnsupportedMethod))));
 	assert!(methods.contains(&("Stored", None)));
 }
 
@@ -1895,7 +1985,7 @@ fn a_7z_is_listed_from_its_index() {
 		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
 	);
 	let job = |password: Option<&str>| StreamJob {
-		password: password.map(|p| ArchivePassword::new(p.to_owned()).unwrap()),
+		password: password.map(archive_password),
 		..job_of(&sevenz, "s.7z", true, Task::List { archive: LISTED })
 	};
 	let (listed_entries, end) = listed(&sevenz, job(Some("pw")));
@@ -1993,20 +2083,29 @@ fn a_partial_extraction_sends_what_was_chosen_below_its_base() {
 		end.unwrap();
 		assert_eq!(outline(&seen), expected, "{task:?}");
 	}
+}
 
-	// an entry the archive does not hold is only found missing at a tar's end
+#[test]
+fn a_chosen_entry_a_tar_does_not_hold_is_found_missing_at_its_end() {
+	let tar = sample_tar();
 	let (seen, end, _) = run_job(&tar, job_of(&tar, "s.tar", true, chosen(&[1, 99], &[])));
 	assert_eq!(outline(&seen), ["file docs/a.txt 5"]);
 	assert_eq!(kind(end), ErrorKind::InvalidState);
+}
 
-	// a zip's entries are known up front: nothing is sent, not even what it is
+#[test]
+fn a_zip_missing_a_chosen_entry_sends_nothing() {
+	// its entries are known up front: nothing is sent, not even what it is
 	let (zip, _) = zip_sample();
 	for task in [chosen(&[1, 99], &[]), chosen(&[1], &["other"])] {
 		let (seen, end, _) = run_job(&zip, job_of(&zip, "z.zip", true, task.clone()));
 		assert!(seen.is_empty(), "{task:?}: {seen:?}");
 		assert_eq!(kind(end), ErrorKind::InvalidState, "{task:?}");
 	}
-	// and what is below a chosen directory is chosen wherever the zip stores it
+}
+
+#[test]
+fn what_is_below_a_chosen_zip_directory_is_chosen_wherever_it_is_stored() {
 	let zip = zip_of(
 		&[
 			("docs/a.txt", Some(b"a")),
@@ -2022,8 +2121,7 @@ fn a_partial_extraction_sends_what_was_chosen_below_its_base() {
 
 /// A solid 7z of a file of the bytes `before`, then a symlink to `target`.
 fn sevenz_link_after(before: &[u8], target: &[u8]) -> Vec<u8> {
-	use sevenz_rust2::{ArchiveEntry as SevenZEntry, ArchiveWriter, SourceReader};
-	let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+	let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
 	let mut link = SevenZEntry::new_file("link");
 	link.has_windows_attributes = true;
 	link.windows_attributes = 0x8000 | (0o120_777 << 16);
@@ -2055,9 +2153,11 @@ fn a_7z_link_is_listed_unread_past_what_a_listing_decodes() {
 			target: "there".into()
 		}
 	);
-	// past 16 MiB into its solid block, the link would cost decoding all that first
+	// past what a listing decodes into its solid block, the link would cost decoding all that
+	// first
+	let past = usize::try_from(LIST_READ_BYTES).unwrap() + (1 << 20);
 	assert_eq!(
-		target(&sevenz_link_after(&vec![0; 17 << 20], b"there")),
+		target(&sevenz_link_after(&vec![0; past], b"there")),
 		ArchiveEntryKind::Symlink {
 			target: String::new()
 		}
@@ -2096,7 +2196,10 @@ fn a_7z_listing_says_whether_the_password_opens_its_entries() {
 		true,
 		Some((SevenZEncryption::Entries, "pw")),
 	);
-	let big = incompressible(17 << 20, 0x3);
+	let big = incompressible(
+		usize::try_from(PASSWORD_PROBE_BYTES).unwrap() + (1 << 20),
+		0x3,
+	);
 	// the only encrypted entry is too large to check the password on
 	let unchecked = sevenz_of(
 		&[("big.bin", Some(&big[..]))],
@@ -2110,7 +2213,7 @@ fn a_7z_listing_says_whether_the_password_opens_its_entries() {
 		(&unchecked, "pw", PasswordCheck::Unchecked),
 	] {
 		let job = StreamJob {
-			password: Some(ArchivePassword::new(password.to_owned()).unwrap()),
+			password: Some(archive_password(password)),
 			..job_of(archive, "s.7z", true, Task::List { archive: LISTED })
 		};
 		let (entries, end) = listed(archive, job);
@@ -2175,23 +2278,19 @@ fn a_listed_hard_link_to_mac_metadata_is_metadata() {
 	assert_eq!(
 		entries
 			.iter()
-			.map(|entry| (
-				entry.stored_path.as_str(),
-				entry.mac_metadata,
-				entry.skip.clone()
-			))
+			.map(|entry| (entry.stored_path.as_str(), entry.mac_metadata, entry.skip))
 			.collect::<Vec<_>>(),
 		[
 			("a.txt", false, None),
 			(
 				"__MACOSX/._a.txt",
 				true,
-				Some(ExtractSkipReason::MacMetadata)
+				Some(ListedSkipReason::MacMetadata)
 			),
 			(
 				"__MACOSX/._b.txt",
 				true,
-				Some(ExtractSkipReason::MacMetadata)
+				Some(ListedSkipReason::MacMetadata)
 			),
 			("__MACOSX/copy.txt", false, None),
 		]
@@ -2199,7 +2298,7 @@ fn a_listed_hard_link_to_mac_metadata_is_metadata() {
 }
 
 /// The listing's skip of every entry of `tar`, by stored path.
-fn listed_skips(tar: &[u8]) -> Vec<(String, Option<ExtractSkipReason>)> {
+fn listed_skips(tar: &[u8]) -> Vec<(String, Option<ListedSkipReason>)> {
 	let (entries, end) = listed(
 		tar,
 		job_of(tar, "s.tar", true, Task::List { archive: LISTED }),
@@ -2232,7 +2331,7 @@ fn a_hard_link_to_metadata_stored_over_a_file_is_left_out() {
 	let skips = listed_skips(&tar);
 	assert_eq!(
 		skips[2],
-		("b".to_owned(), Some(ExtractSkipReason::MacMetadata))
+		("b".to_owned(), Some(ListedSkipReason::MacMetadata))
 	);
 }
 
@@ -2268,15 +2367,7 @@ fn a_hard_link_names_the_last_member_at_its_target() {
 		]
 	);
 	let skips = listed_skips(&tar);
-	assert_eq!(
-		skips[2],
-		(
-			"b".to_owned(),
-			Some(ExtractSkipReason::Hardlink {
-				target: String::new()
-			})
-		)
-	);
+	assert_eq!(skips[2], ("b".to_owned(), Some(ListedSkipReason::Hardlink)));
 	assert_eq!(skips[4], ("c".to_owned(), None));
 }
 

@@ -67,6 +67,7 @@ impl ReadBack {
 				let dirs = entries
 					.iter()
 					.filter_map(|entry| match entry {
+						// copies: the job keeps its entries for the codec writing them
 						ArchiveEntry::Dir { path, .. } => Some(path.clone()),
 						ArchiveEntry::File { .. } => None,
 					})

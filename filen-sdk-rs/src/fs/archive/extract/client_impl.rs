@@ -58,12 +58,13 @@ pub struct ExtractConfig {
 	/// trash, and all of them when it cannot get the drive lock in time.
 	pub password: Option<ArchivePassword>,
 	/// Leaves out the metadata macOS writes beside files where it cannot keep it with them,
-	/// reported skipped as [`ExtractSkipReason::MacMetadata`](super::ExtractSkipReason::MacMetadata): AppleDouble files (named `._name`
-	/// or kept in a `__MACOSX` folder of Finder's zips, told by the 8 bytes they start with), a
-	/// tar's hard links to them, and the `__MACOSX` folders (and folders in them) that hold
-	/// nothing else. A folder there that holds anything of the user's, or nothing at all, is
-	/// created. Left out on purpose, they keep nothing from removing the archive once the rest is
-	/// extracted. `true` by default; `false` extracts them as ordinary files.
+	/// reported skipped as [`ExtractSkipReason::MacMetadata`](super::ExtractSkipReason::MacMetadata):
+	/// AppleDouble files (named `._name` or kept in a `__MACOSX` folder of Finder's zips, told by
+	/// the 8 bytes they start with), a tar's hard links to them, and the `__MACOSX` folders (and
+	/// folders in them) that hold nothing else. A folder there that holds anything of the
+	/// user's, or nothing at all, is created. Left out on purpose, they keep nothing from
+	/// removing the archive once the rest is extracted. `true` by default; `false` extracts them
+	/// as ordinary files.
 	pub skip_mac_metadata: bool,
 }
 
@@ -144,15 +145,20 @@ impl Client {
 	/// archive, as [`Client::list_archive`] lists it, or again what failed.
 	///
 	/// Up to [`ArchiveConfig::job_concurrency`] archive jobs run at once; a later one waits,
-	/// reporting [`ExtractPhase::WaitingForWorker`]. It
+	/// reporting [`ExtractPhase::WaitingForWorker`](super::ExtractPhase::WaitingForWorker). It
 	/// reports its progress to `callback` and can be paused, resumed and cancelled through
 	/// `control`. A failed entry does not stop the others; a damaged archive, running out of
 	/// storage or the codec dying does.
 	///
+	/// While paused the job holds no drive lock and no reservation from the client's memory
+	/// budget, but it keeps its archive job slot, its decoders' state (up to the client's
+	/// archive codec budget) and a chunk each of input and output, so it can go on where it
+	/// stopped.
+	///
 	/// Returns the report (what was created, failed, skipped or renamed). An extraction that
 	/// ended early fails with the report so far: what it created stays.
 	///
-	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::config::ArchiveConfig::job_concurrency
+	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn extract_archive(
 		self: Arc<Self>,
 		request: ExtractRequest,
@@ -214,17 +220,19 @@ impl Client {
 	/// [`ListReport::password`]), and what tells a link's target: each zip symlink's data (at
 	/// most 4096 bytes, unencrypted ones only), and a 7z symlink's or reparse point's when it is
 	/// within the first 16 MiB of its folder and the archive states no more than the
-	/// [`ExpansionLimit`](super::ExpansionLimit) allows; past that, a 7z link is listed without
+	/// [`ExpansionLimit`] allows; past that, a 7z link is listed without
 	/// its target and a reparse point as a file. A tar's members, or what a single compressed
 	/// file decodes to, are only known by reading it all, which takes as long as downloading it;
-	/// that is reported as it goes, and can be paused and cancelled.
+	/// that is reported as it goes, and can be paused and cancelled. While paused the listing
+	/// holds no drive lock and no reservation from the client's memory budget, but it keeps its
+	/// archive job slot and its decoders' state (up to the client's archive codec budget).
 	///
 	/// Entries are delivered to `callback` in batches as they are read, and the listing keeps the
 	/// first [`MAX_LISTED_ENTRIES`](super::MAX_LISTED_ENTRIES) of them within
 	/// [`MAX_LISTED_BYTES`](super::MAX_LISTED_BYTES): see [`ListReport`].
 	/// A listing takes one of the [`ArchiveConfig::job_concurrency`] archive jobs.
 	///
-	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::config::ArchiveConfig::job_concurrency
+	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
 	pub async fn list_archive(
 		self: Arc<Self>,
 		archive: RemoteFileType<'static>,
@@ -284,6 +292,7 @@ mod tests {
 				ArchiveEntry, ArchiveEntryId, EntrySelection, ExtractRoot, ExtractUpdate,
 				ExtractedTopLevel, ListUpdate,
 			},
+			categories::{DirType, Normal},
 			drive_job::test_support::remote_file,
 		},
 	};
@@ -321,8 +330,8 @@ mod tests {
 	/// which needs `Send` futures.
 	fn _extract_future_is_send(
 		client: Arc<Client>,
-		archive: crate::fs::file::enums::RemoteFileType<'static>,
-		destination: crate::fs::categories::DirType<'static, crate::fs::categories::Normal>,
+		archive: RemoteFileType<'static>,
+		destination: DirType<'static, Normal>,
 	) {
 		fn assert_send<T: Send>(_: T) {}
 		assert_send(client.clone().extract_archive(

@@ -132,6 +132,7 @@ impl TakenNames {
 				{
 					add_run(self.taken_runs.entry(walked).or_default(), from, n);
 				}
+				// a copy: `key` is still looked up and its run recorded below
 				(from, walked) = (n, key.clone());
 			}
 			if let Some(end) = key
@@ -270,47 +271,44 @@ fn numbered_candidate(
 
 #[cfg(test)]
 mod tests {
+	use rand::{Rng, SeedableRng, rngs::StdRng};
+
 	use super::*;
 
 	fn source_name(name: &str) -> ValidatedName {
 		SourceName::parse(name).unwrap().into_name()
 	}
 
-	fn allocate(taken: &[&str], name: &str, is_dir: bool) -> String {
-		let shape = if is_dir {
-			NameShape::Dir
-		} else {
-			NameShape::File
-		};
+	fn allocate(taken: &[&str], name: &str, shape: NameShape) -> String {
 		let mut names = TakenNames::new(taken.iter().copied());
 		names.allocate(source_name(name), shape).unwrap().into()
 	}
 
 	#[test]
 	fn free_name_is_kept() {
-		assert_eq!(allocate(&["other.txt"], "a.txt", false), "a.txt");
-		assert_eq!(allocate(&[], "dir", true), "dir");
+		assert_eq!(allocate(&["other.txt"], "a.txt", NameShape::File), "a.txt");
+		assert_eq!(allocate(&[], "dir", NameShape::Dir), "dir");
 	}
 
 	#[test]
 	fn clashing_name_gets_the_next_free_counter() {
-		assert_eq!(allocate(&["a.txt"], "a.txt", false), "a (1).txt");
+		assert_eq!(allocate(&["a.txt"], "a.txt", NameShape::File), "a (1).txt");
 		assert_eq!(
-			allocate(&["a.txt", "a (1).txt"], "a.txt", false),
+			allocate(&["a.txt", "a (1).txt"], "a.txt", NameShape::File),
 			"a (2).txt"
 		);
-		assert_eq!(allocate(&["docs"], "docs", true), "docs (1)");
+		assert_eq!(allocate(&["docs"], "docs", NameShape::Dir), "docs (1)");
 	}
 
 	#[test]
 	fn collisions_are_case_insensitive_like_the_server() {
-		assert_eq!(allocate(&["A.TXT"], "a.txt", false), "a (1).txt");
+		assert_eq!(allocate(&["A.TXT"], "a.txt", NameShape::File), "a (1).txt");
 		assert_eq!(
-			allocate(&["ÄRGER.txt"], "ärger.txt", false),
+			allocate(&["ÄRGER.txt"], "ärger.txt", NameShape::File),
 			"ärger (1).txt"
 		);
 		assert_eq!(
-			allocate(&["a (1).TXT", "a.txt"], "A.txt", false),
+			allocate(&["a (1).TXT", "a.txt"], "A.txt", NameShape::File),
 			"A (2).txt"
 		);
 		// the key is exactly `to_lowercase`, which `hash_name` uses: it maps `İ` to `i` plus a
@@ -320,27 +318,43 @@ mod tests {
 
 	#[test]
 	fn existing_counter_is_continued() {
-		assert_eq!(allocate(&["a (1).txt"], "a (1).txt", false), "a (2).txt");
-		assert_eq!(allocate(&["photos (9)"], "photos (9)", true), "photos (10)");
+		assert_eq!(
+			allocate(&["a (1).txt"], "a (1).txt", NameShape::File),
+			"a (2).txt"
+		);
+		assert_eq!(
+			allocate(&["photos (9)"], "photos (9)", NameShape::Dir),
+			"photos (10)"
+		);
 		// only a well-formed ` (digits)` counts as a counter
 		assert_eq!(
-			allocate(&["a (x).txt"], "a (x).txt", false),
+			allocate(&["a (x).txt"], "a (x).txt", NameShape::File),
 			"a (x) (1).txt"
 		);
-		assert_eq!(allocate(&["(1).txt"], "(1).txt", false), "(1) (1).txt");
-		assert_eq!(allocate(&["a(1).txt"], "a(1).txt", false), "a(1) (1).txt");
+		assert_eq!(
+			allocate(&["(1).txt"], "(1).txt", NameShape::File),
+			"(1) (1).txt"
+		);
+		assert_eq!(
+			allocate(&["a(1).txt"], "a(1).txt", NameShape::File),
+			"a(1) (1).txt"
+		);
 	}
 
 	#[test]
 	fn a_counter_that_cannot_grow_becomes_part_of_the_stem() {
 		let max = format!("a ({}).txt", u64::MAX);
 		assert_eq!(
-			allocate(&[max.as_str()], &max, false),
+			allocate(&[max.as_str()], &max, NameShape::File),
 			format!("a ({}) (1).txt", u64::MAX)
 		);
 		let below_max = format!("a ({}).txt", u64::MAX - 1);
 		assert_eq!(
-			allocate(&[below_max.as_str(), max.as_str()], &below_max, false),
+			allocate(
+				&[below_max.as_str(), max.as_str()],
+				&below_max,
+				NameShape::File
+			),
 			format!("a ({}) (1).txt", u64::MAX - 1)
 		);
 	}
@@ -407,10 +421,22 @@ mod tests {
 
 	#[test]
 	fn only_a_files_last_extension_is_kept_apart() {
-		assert_eq!(allocate(&["a.tar.gz"], "a.tar.gz", false), "a.tar (1).gz");
-		assert_eq!(allocate(&["Makefile"], "Makefile", false), "Makefile (1)");
-		assert_eq!(allocate(&[".bashrc"], ".bashrc", false), ".bashrc (1)");
-		assert_eq!(allocate(&["my.folder"], "my.folder", true), "my.folder (1)");
+		assert_eq!(
+			allocate(&["a.tar.gz"], "a.tar.gz", NameShape::File),
+			"a.tar (1).gz"
+		);
+		assert_eq!(
+			allocate(&["Makefile"], "Makefile", NameShape::File),
+			"Makefile (1)"
+		);
+		assert_eq!(
+			allocate(&[".bashrc"], ".bashrc", NameShape::File),
+			".bashrc (1)"
+		);
+		assert_eq!(
+			allocate(&["my.folder"], "my.folder", NameShape::Dir),
+			"my.folder (1)"
+		);
 	}
 
 	#[test]
@@ -439,7 +465,10 @@ mod tests {
 	fn names_are_nfc_normalized_before_comparison() {
 		let decomposed = "e\u{301}.txt";
 		let composed = "\u{e9}.txt";
-		assert_eq!(allocate(&[composed], decomposed, false), "\u{e9} (1).txt");
+		assert_eq!(
+			allocate(&[composed], decomposed, NameShape::File),
+			"\u{e9} (1).txt"
+		);
 	}
 
 	#[test]
@@ -453,7 +482,10 @@ mod tests {
 			SourceName::parse("a.txt").unwrap(),
 			SourceName::Valid(ValidatedName::try_from("a.txt").unwrap())
 		);
-		assert_eq!(allocate(&[], "a:b.txt", false), String::from(encoded));
+		assert_eq!(
+			allocate(&[], "a:b.txt", NameShape::File),
+			String::from(encoded)
+		);
 		let mut names = TakenNames::default();
 		names
 			.allocate(source_name("a:b.txt"), NameShape::File)
@@ -470,7 +502,7 @@ mod tests {
 	fn long_names_are_trimmed_to_the_limit_at_char_boundaries() {
 		let long = format!("{}.txt", "é".repeat(125)); // 250 + 4 bytes
 		assert_eq!(long.len(), 254);
-		let renamed = allocate(&[long.as_str()], &long, false);
+		let renamed = allocate(&[long.as_str()], &long, NameShape::File);
 		assert!(renamed.len() <= MAX_BYTES, "{} bytes", renamed.len());
 		assert!(renamed.ends_with(" (1).txt"), "{renamed}");
 		assert!(ValidatedName::try_from(renamed.as_str()).is_ok());
@@ -480,7 +512,7 @@ mod tests {
 	fn a_huge_extension_is_trimmed_rather_than_emptying_the_base() {
 		let long = format!("a.{}", "x".repeat(253));
 		assert_eq!(long.len(), MAX_BYTES);
-		let renamed = allocate(&[long.as_str()], &long, false);
+		let renamed = allocate(&[long.as_str()], &long, NameShape::File);
 		assert!(renamed.len() <= MAX_BYTES, "{} bytes", renamed.len());
 		assert!(renamed.starts_with("a."), "{renamed}");
 		assert!(renamed.ends_with(" (1)"), "{renamed}");
@@ -534,8 +566,6 @@ mod tests {
 
 	#[test]
 	fn long_and_encoded_names_get_what_trying_every_counter_would_give() {
-		use rand::{Rng, SeedableRng, rngs::StdRng};
-
 		// characters of every UTF-8 length, ones whose case changes their length, and ones a
 		// name gets encoded for
 		const ALPHABET: &[&str] = &[

@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-	Driver, FilePhase, FileSource, LinkPhase, LinkSource, MAX_OPEN_FILES, NewFile, SlotSource,
+	Driver, FilePhase, FileSource, LinkPhase, LinkSource, MAX_OPEN_ENTRIES, NewFile, SlotSource,
 };
 
 /// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
@@ -207,18 +207,19 @@ impl<B: DisposalBackend> Driver<B> {
 				self.feed.bytes_read(),
 				self.links.bytes.saturating_add(size),
 			) {
-			return self.stop_with(Error::custom(
+			self.stop_with(Error::custom(
 				ErrorKind::ArchiveTooLarge,
 				format!(
 					"the archive's hard links copy more than {} times its size",
 					limit.ratio
 				),
 			));
+			return;
 		}
 		self.links.bytes = self.links.bytes.saturating_add(size);
 		let entry = self.entry_id(ordinal);
 		self.report_path(entry, &path);
-		let Some(mut file) = self.new_file(ordinal, &path, Some(size), modified) else {
+		let Ok(mut file) = self.new_file(ordinal, &path, Some(size), modified) else {
 			return;
 		};
 		// a link may be named by the links after it, as the file it copies is
@@ -258,7 +259,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Opens the hard links whose file is registered, while the files open leave room and the
 	/// fetches of their targets are as many at once as other small requests.
 	pub(super) fn open_ready_links(&mut self) {
-		while self.files.len() < MAX_OPEN_FILES
+		while self.files.len() < MAX_OPEN_ENTRIES
 			&& self.links.sources.len() < MAX_SMALL_PARALLEL_REQUESTS
 			&& let Some((TakenLink { file }, target)) = self.links.ready.pop_front()
 		{

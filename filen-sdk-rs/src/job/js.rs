@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::Error;
@@ -19,7 +20,7 @@ pub type SdkError = Arc<Error>;
 /// the job runs on; that the type is not `Send` keeps it so.
 #[cfg(not(feature = "uniffi"))]
 #[derive(Debug, Clone)]
-#[filen_macros::js_type(export, no_deser, no_default)]
+#[js_type(export, no_deser, no_default)]
 pub struct SdkError(
 	#[cfg_attr(
 		feature = "wasm-full",
@@ -46,7 +47,7 @@ pub(crate) fn sdk_error(error: Arc<Error>) -> SdkError {
 /// A created item a job could not finish: it could not get its color, or could not be added to
 /// one of the destination's public links or shares.
 #[derive(Debug, Clone)]
-#[filen_macros::js_type(export, no_deser, no_default)]
+#[js_type(export, no_deser, no_default)]
 pub struct ItemError {
 	/// The created item.
 	pub dest_uuid: Uuid,

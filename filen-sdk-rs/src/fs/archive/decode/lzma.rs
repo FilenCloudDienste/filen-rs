@@ -142,7 +142,8 @@ pub(super) struct LzipDecoder<R> {
 
 impl<R: Read> LzipDecoder<R> {
 	pub(super) fn new(input: Input<R>, budget: Budget) -> Self {
-		// the crate checks every member's dictionary against this before allocating for it
+		// the crate checks every member's dictionary against this before allocating for it; to
+		// the crate `u32::MAX` is no limit at all, so a larger budget becomes the largest limit
 		let limit_kib = u32::try_from(budget.available / 1024).unwrap_or(u32::MAX - 1);
 		Self {
 			input,

@@ -1,7 +1,10 @@
 //! Reading a zip: its central directory first, then its entries in the order of their local
 //! headers.
 
-use std::io::{self, Read, Seek};
+use std::{
+	io::{self, Read, Seek},
+	mem,
+};
 
 use microthumb::BorrowedSeqReader;
 
@@ -137,13 +140,13 @@ pub(super) fn extract_zip(
 		max_index_bytes: job.limits.max_index_bytes,
 		max_entries: job.limits.max_members,
 	};
-	let index = read_index(&mut source, job.len, limits).map_err(Error::from)?;
+	let mut index = read_index(&mut source, job.len, limits).map_err(Error::from)?;
 	let entry_limits = EntryLimits {
 		decoder_memory: job.limits.decoder_memory,
 	};
 	let password = job.password.as_ref();
 	let duplicates = (index.duplicate_count > 0).then(|| DuplicateEntries {
-		names: index.duplicate_names.clone(),
+		names: mem::take(&mut index.duplicate_names),
 		count: index.duplicate_count,
 	});
 	if walk.listing() {
@@ -380,7 +383,7 @@ fn key_unproven(entry: &ZipEntry) -> bool {
 
 /// Whether a directory entry's stored bytes are an empty stream (as `java.util.zip` and Python
 /// deflate directories: two bytes), checked against its size and CRC-32 to the end.
-fn decodes_to_nothing<R: Read + std::io::Seek>(
+fn decodes_to_nothing<R: Read + Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
@@ -490,7 +493,7 @@ fn zip_pre_read(
 /// Whether an unencrypted file entry is AppleDouble, by its first bytes, as an extraction
 /// tells it; `false` when its data cannot be read. Fails only on an error of the archive's
 /// source.
-fn zip_apple_double<R: Read + std::io::Seek>(
+fn zip_apple_double<R: Read + Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,
@@ -516,7 +519,7 @@ const MAX_TARGET_COMPRESSED: u64 = 2 * MAX_ARCHIVE_PATH_BYTES as u64;
 
 /// A symlink entry's target, for reporting: its data, when small and readable; `None` when not.
 /// Fails only on an error of the archive's source, not of the entry's data.
-fn zip_symlink_target<R: Read + std::io::Seek>(
+fn zip_symlink_target<R: Read + Seek>(
 	source: &mut R,
 	shift: u64,
 	entry: &ZipEntry,

@@ -2,7 +2,12 @@
 //! small archives made by the SDK's own writers and the `tar` crate; and the fake drive's side of
 //! removing a job's sources.
 
-use std::{io::Write, ops::RangeInclusive, sync::atomic::Ordering};
+use std::{
+	collections::HashSet,
+	io::{self, Read, Seek, Write},
+	ops::RangeInclusive,
+	sync::atomic::Ordering,
+};
 
 use filen_types::{
 	crypto::Blake3Hash,
@@ -12,20 +17,46 @@ use filen_types::{
 use crate::{
 	Error, ErrorKind,
 	consts::CHUNK_SIZE_U64,
-	fs::drive_job::test_support::{FakeBackend, Request},
+	fs::drive_job::test_support::{FakeBackend, FakeLog, Quirk, Request},
 };
 
 use super::{
+	bytes::read_at,
 	dispose::{DirState, DisposalBackend, FileState, Tree},
 	format::TAR_CHECKSUM,
 	password::ArchivePassword,
-	sevenz::write::{SevenZEncryption, SevenZMethod, SevenZWriter},
-	tar_iter::TAR_BLOCK_LEN,
+	sevenz::{
+		read::SevenZLimits,
+		write::{SevenZEncryption, SevenZMethod, SevenZWriter},
+	},
+	tar_iter::{self, TAR_BLOCK, TarReader},
 	zip::{
 		crypto::AesStrength,
+		read::{EntryLimits, LOCAL_HEADER_LEN, LOCAL_HEADER_LEN_U64, ZipEntry, ZipLimits},
 		write::{Encryption, ZipMethod, ZipWriter},
 	},
 };
+
+/// A decoder budget that reads back anything a test writes.
+pub(crate) const READ_BACK_MEMORY: u64 = 512 << 20;
+/// Zip index limits that read back anything a test writes.
+pub(crate) const READ_BACK_ZIP: ZipLimits = ZipLimits {
+	max_index_bytes: 32 << 20,
+	max_entries: 1_000_000,
+};
+pub(crate) const READ_BACK_ZIP_ENTRY: EntryLimits = EntryLimits {
+	decoder_memory: READ_BACK_MEMORY,
+};
+/// 7z index limits that read back anything a test writes.
+pub(crate) const READ_BACK_SEVEN_Z: SevenZLimits = SevenZLimits {
+	max_index_bytes: 32 << 20,
+	max_entries: 1_000_000,
+	decoder_memory: READ_BACK_MEMORY,
+};
+
+/// The head of an AppleDouble file (the `._` twin holding a file's macOS metadata): its magic
+/// number, then version 2.
+pub(crate) const APPLE_DOUBLE: [u8; 8] = [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00];
 
 /// `password`, checked.
 pub(crate) fn archive_password(password: &str) -> ArchivePassword {
@@ -86,8 +117,9 @@ pub(crate) fn pattern(len: usize, seed: u8) -> Vec<u8> {
 		.collect()
 }
 
-/// Bytes no codec compresses: xorshift64 from `seed` (which must not be 0).
+/// Bytes no codec compresses: xorshift64 from `seed`, which must not be 0 (xorshift stays at 0).
 pub(crate) fn incompressible(len: usize, seed: u64) -> Vec<u8> {
+	assert_ne!(seed, 0, "xorshift from 0 gives only zeros");
 	let mut state = seed;
 	(0..len)
 		.map(|_| {
@@ -105,8 +137,50 @@ pub(crate) fn gzip(data: &[u8]) -> Vec<u8> {
 	encoder.finish().unwrap()
 }
 
+/// A zstd frame of raw blocks, written by hand: a window of `1 << window_log` bytes, the content
+/// size in the header when `states_size`, and a dictionary id when `dictionary` is given.
+pub(crate) fn zstd_raw_frame(
+	data: &[u8],
+	window_log: u8,
+	states_size: bool,
+	dictionary: Option<u8>,
+) -> Vec<u8> {
+	let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+	// FCS_flag 2 (4 bytes) when stating the size, Dictionary_ID_flag 1 (1 byte) with one
+	let descriptor = if states_size { 2 << 6 } else { 0 } | u8::from(dictionary.is_some());
+	frame.push(descriptor);
+	frame.push((window_log - 10) << 3);
+	frame.extend(dictionary);
+	if states_size {
+		frame.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+	}
+	let block_max = (1usize << window_log).min(128 << 10);
+	let mut blocks = data.chunks(block_max).peekable();
+	if blocks.peek().is_none() {
+		frame.extend_from_slice(&[1, 0, 0]);
+	}
+	while let Some(block) = blocks.next() {
+		// raw blocks: the last-block bit, type 0, and the size above them
+		let header = u32::from(blocks.peek().is_none()) | u32::try_from(block.len()).unwrap() << 3;
+		frame.extend_from_slice(&header.to_le_bytes()[..3]);
+		frame.extend_from_slice(block);
+	}
+	frame
+}
+
+/// A skippable frame, as lz4 and zstd share them: `magic` (one of 16 each format reserves), the
+/// length of `data`, then `data`, which a decoder passes over.
+pub(crate) fn skippable_frame(magic: u32, data: &[u8]) -> Vec<u8> {
+	[
+		&magic.to_le_bytes()[..],
+		&u32::try_from(data.len()).unwrap().to_le_bytes(),
+		data,
+	]
+	.concat()
+}
+
 /// `block` with its tar header checksum set to the sum of its bytes, as after an edit.
-pub(crate) fn tar_checksummed(mut block: [u8; TAR_BLOCK_LEN]) -> [u8; TAR_BLOCK_LEN] {
+pub(crate) fn tar_checksummed(mut block: [u8; TAR_BLOCK]) -> [u8; TAR_BLOCK] {
 	block[TAR_CHECKSUM].fill(b' ');
 	let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
 	block[TAR_CHECKSUM][..7].copy_from_slice(format!("{sum:06o}\0").as_bytes());
@@ -170,6 +244,25 @@ pub(crate) fn tar_with(members: &[TarMember]) -> Vec<u8> {
 	builder.into_inner().unwrap()
 }
 
+/// Every member of a tar with its data, read back through the SDK's reader in small pieces, so
+/// a body is read in many.
+pub(crate) fn tar_members<R: Read>(tar: &mut TarReader<R>) -> Vec<(tar_iter::TarMember, Vec<u8>)> {
+	let mut members = Vec::new();
+	while let Some(member) = tar.next_member().unwrap() {
+		let mut data = Vec::new();
+		let mut buf = [0u8; 100];
+		loop {
+			let read = tar.read_body(&mut buf).unwrap();
+			if read == 0 {
+				break;
+			}
+			data.extend_from_slice(&buf[..read]);
+		}
+		members.push((member, data));
+	}
+	members
+}
+
 /// A zip of `entries` (a directory where there is no data), deflated, and encrypted with
 /// AES-256 under `password` when there is one.
 pub(crate) fn zip_of(entries: &[(&str, Option<&[u8]>)], password: Option<&str>) -> Vec<u8> {
@@ -227,9 +320,100 @@ pub(crate) fn sevenz_of(
 			}
 		}
 	}
+	sevenz_finished(writer)
+}
+
+/// The 7z `writer` wrote, finished, with its start header written over the zeros it began with.
+pub(crate) fn sevenz_finished(writer: SevenZWriter<Vec<u8>>) -> Vec<u8> {
 	let (mut archive, start) = writer.finish().unwrap();
-	archive[..32].copy_from_slice(&start);
+	archive[..start.len()].copy_from_slice(&start);
 	archive
+}
+
+/// What a zip entry's local header and data descriptor say of it, read from the bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LocalRecords {
+	/// The local header's compressed and uncompressed sizes.
+	pub(crate) sizes: (u32, u32),
+	/// The values of its zip64 extra field, if it has one.
+	pub(crate) zip64: Option<Vec<u64>>,
+	/// The descriptor's compressed and uncompressed sizes, 8 bytes each with zip64, else 4.
+	pub(crate) descriptor: (u64, u64),
+}
+
+/// The local records of `entry`, which ends in a data descriptor, in a zip that starts `shift`
+/// bytes into `source`. Read by the zip specification's offsets, not the reader's.
+pub(crate) fn local_records<R: Read + Seek>(
+	source: &mut R,
+	shift: u64,
+	entry: &ZipEntry,
+) -> LocalRecords {
+	const ZIP64_EXTRA_ID: u16 = 0x0001;
+	const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
+	let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+	let u32_at =
+		|bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+	let u64_at =
+		|bytes: &[u8], at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+	let mut read = |at: u64, len: usize| {
+		read_at(
+			source,
+			shift + at,
+			len,
+			io::Error::from(io::ErrorKind::UnexpectedEof),
+		)
+		.unwrap()
+	};
+	let header = read(entry.header_offset, LOCAL_HEADER_LEN);
+	let (name_len, extra_len) = (
+		usize::from(u16_at(&header, 26)),
+		usize::from(u16_at(&header, 28)),
+	);
+	let extra = read(
+		entry.header_offset + LOCAL_HEADER_LEN_U64 + name_len as u64,
+		extra_len,
+	);
+	let mut zip64 = None;
+	let mut fields = &extra[..];
+	while fields.len() >= 4 {
+		let len = usize::from(u16_at(fields, 2));
+		if u16_at(fields, 0) == ZIP64_EXTRA_ID {
+			zip64 = Some(
+				fields[4..4 + len]
+					.chunks_exact(8)
+					.map(|value| u64_at(value, 0))
+					.collect(),
+			);
+		}
+		fields = &fields[4 + len..];
+	}
+	let wide = zip64.is_some();
+	let descriptor = read(
+		entry.header_offset
+			+ LOCAL_HEADER_LEN_U64
+			+ (name_len + extra_len) as u64
+			+ entry.compressed_size,
+		if wide { 24 } else { 16 },
+	);
+	assert_eq!(
+		u32_at(&descriptor, 0),
+		DATA_DESCRIPTOR_SIG,
+		"{}",
+		entry.name
+	);
+	assert_eq!(u32_at(&descriptor, 4), entry.crc, "{}", entry.name);
+	LocalRecords {
+		sizes: (u32_at(&header, 18), u32_at(&header, 22)),
+		zip64,
+		descriptor: if wide {
+			(u64_at(&descriptor, 8), u64_at(&descriptor, 16))
+		} else {
+			(
+				u64::from(u32_at(&descriptor, 8)),
+				u64::from(u32_at(&descriptor, 12)),
+			)
+		},
+	}
 }
 
 impl FakeBackend {
@@ -251,20 +435,42 @@ impl FakeBackend {
 			"removals hold the drive lock"
 		);
 	}
+
+	fn fail_state(&self, uuid: Uuid) -> Result<(), Error> {
+		if self.fail_state_of.contains(&uuid) {
+			return Err(Error::custom(ErrorKind::Server, "state failed"));
+		}
+		Ok(())
+	}
+}
+
+/// Every directory below `dir` in the fake drive.
+fn subtree(log: &FakeLog, dir: Uuid) -> HashSet<Uuid> {
+	let mut found = HashSet::new();
+	let mut below = vec![dir];
+	while let Some(parent) = below.pop() {
+		for (&child, &of) in &log.dir_parents {
+			if of == parent && found.insert(child) {
+				below.push(child);
+			}
+		}
+	}
+	found
 }
 
 impl DisposalBackend for FakeBackend {
 	async fn file_state(&self, uuid: Uuid) -> Result<FileState, Error> {
 		self.hold(Request::State, uuid).await;
 		tokio::time::sleep(self.delay).await;
+		self.fail_state(uuid)?;
 		let log = self.log();
 		match log.file_parents.get(&uuid) {
 			Some(&(parent, size, chunks)) => Ok(FileState {
 				size,
 				chunks,
 				parent: ParentUuid::Uuid(parent),
-				versioned: false,
-				trash: false,
+				versioned: self.superseded.contains(&uuid),
+				trash: self.in_trash.contains(&uuid),
 			}),
 			None if log.trashed_files.contains(&uuid) => {
 				Err(Error::custom(ErrorKind::FileNotFound, "trashed"))
@@ -276,10 +482,11 @@ impl DisposalBackend for FakeBackend {
 	async fn dir_state(&self, uuid: Uuid) -> Result<DirState, Error> {
 		self.hold(Request::State, uuid).await;
 		tokio::time::sleep(self.delay).await;
+		self.fail_state(uuid)?;
 		match self.log().dir_parents.get(&uuid) {
 			Some(&parent) => Ok(DirState {
 				parent: ParentUuid::Uuid(parent),
-				trash: false,
+				trash: self.in_trash.contains(&uuid),
 			}),
 			None => Err(Error::custom(
 				ErrorKind::FolderNotFound,
@@ -291,22 +498,21 @@ impl DisposalBackend for FakeBackend {
 	async fn list_tree(&self, dir: Uuid) -> Result<Tree, Error> {
 		self.hold(Request::List, dir).await;
 		tokio::time::sleep(self.delay).await;
+		if self.quirks.contains(&Quirk::FailTrees) {
+			return Err(Error::custom(ErrorKind::Server, "listing failed"));
+		}
 		let log = self.log();
-		let mut tree = Tree::default();
-		let mut below = vec![dir];
-		while let Some(parent) = below.pop() {
-			for (&child, &of) in &log.dir_parents {
-				if of == parent && tree.dirs.insert(child) {
-					below.push(child);
-				}
-			}
-		}
-		for (&file, &(parent, size, _)) in &log.file_parents {
-			if parent == dir || tree.dirs.contains(&parent) {
-				tree.files.insert(file, size);
-			}
-		}
-		Ok(tree)
+		let dirs = subtree(&log, dir);
+		let files = log
+			.file_parents
+			.iter()
+			.filter(|(_, (parent, ..))| *parent == dir || dirs.contains(parent))
+			.map(|(&file, &(_, size, _))| (file, size))
+			.collect();
+		Ok(Tree {
+			files,
+			dirs: dirs.into_iter().collect(),
+		})
 	}
 
 	async fn trash_file(&self, uuid: Uuid) -> Result<(), Error> {
@@ -333,18 +539,8 @@ impl DisposalBackend for FakeBackend {
 		self.assert_locked();
 		let mut log = self.log();
 		// the whole subtree goes with it
-		let mut gone = vec![uuid];
-		let mut index = 0;
-		while index < gone.len() {
-			let parent = gone[index];
-			gone.extend(
-				log.dir_parents
-					.iter()
-					.filter(|(_, of)| **of == parent)
-					.map(|(child, _)| *child),
-			);
-			index += 1;
-		}
+		let mut gone = subtree(&log, uuid);
+		gone.insert(uuid);
 		log.dir_parents.retain(|dir, _| !gone.contains(dir));
 		log.file_parents
 			.retain(|_, (parent, ..)| !gone.contains(parent));

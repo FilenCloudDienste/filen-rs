@@ -26,8 +26,15 @@ pub(crate) const WRITE_CYCLES_POWER: u8 = 19;
 /// the time a derivation takes, and an archive picks its own. 7-Zip writes 19.
 pub(crate) const MAX_CYCLES_POWER: u8 = 22;
 
-/// The marker 7z uses for "no derivation: the key is salt and password as they are".
-pub(crate) const RAW_KEY_POWER: u8 = 0x3F;
+/// The marker 7z uses for "no derivation: the key is salt and password as they are": the
+/// largest power the properties can hold.
+pub(crate) const RAW_KEY_POWER: u8 = PROPS_CYCLES_POWER;
+
+// The first property byte: the cycles power in its low bits, then whether a salt and an IV
+// follow (each with one byte more than the second property byte states).
+const PROPS_CYCLES_POWER: u8 = 0x3F;
+const PROPS_HAS_IV: u8 = 0x40;
+const PROPS_HAS_SALT: u8 = 0x80;
 
 /// A derived AES-256 key.
 pub(crate) struct Key([u8; 32]);
@@ -65,16 +72,16 @@ impl AesProps {
 		let corrupt = || SevenZError::Corrupt("invalid 7z AES properties");
 		let (&first, rest) = props.split_first().ok_or_else(corrupt)?;
 		let mut parsed = Self {
-			cycles_power: first & 0x3F,
+			cycles_power: first & PROPS_CYCLES_POWER,
 			salt: Vec::new(),
 			iv: [0; BLOCK],
 		};
-		if first & 0xC0 == 0 {
+		if first & (PROPS_HAS_SALT | PROPS_HAS_IV) == 0 {
 			return Ok(parsed);
 		}
 		let (&second, rest) = rest.split_first().ok_or_else(corrupt)?;
-		let salt_len = usize::from(first >> 7) + usize::from(second >> 4);
-		let iv_len = usize::from((first >> 6) & 1) + usize::from(second & 0x0F);
+		let salt_len = usize::from(first & PROPS_HAS_SALT != 0) + usize::from(second >> 4);
+		let iv_len = usize::from(first & PROPS_HAS_IV != 0) + usize::from(second & 0x0F);
 		if rest.len() != salt_len + iv_len || iv_len > BLOCK {
 			return Err(corrupt());
 		}
@@ -86,16 +93,17 @@ impl AesProps {
 
 /// The properties the SDK writes: the cycles power, then a 16-byte salt and IV.
 pub(crate) fn encode_props(cycles_power: u8, salt: &[u8; BLOCK], iv: &[u8; BLOCK]) -> Vec<u8> {
-	let mut props = vec![cycles_power | 0xC0, 0xFF];
+	// 15 more bytes of each
+	let mut props = vec![cycles_power | PROPS_HAS_SALT | PROPS_HAS_IV, 0xFF];
 	props.extend_from_slice(salt);
 	props.extend_from_slice(iv);
 	props
 }
 
 /// Derives the key for `password` from its UTF-16LE form, `salt` and `2^cycles_power` rounds.
-/// `on_round` is called
-/// every 2^16 rounds, so a long derivation (2^22 rounds of a long password take a minute on
-/// wasm) can show it is progressing and be stopped: its error ends the derivation.
+/// `on_round` is called every 2^16 rounds, so a long derivation (2^22 rounds of a long password
+/// take a minute on wasm) can show it is progressing and be stopped: its error ends the
+/// derivation.
 pub(crate) fn derive_key(
 	password: &ArchivePassword,
 	cycles_power: u8,
@@ -263,7 +271,7 @@ mod tests {
 		let bare = AesProps::parse(&[19]).unwrap();
 		assert!(bare.salt.is_empty() && bare.iv == [0; BLOCK]);
 		// a 17-byte IV cannot be
-		assert!(AesProps::parse(&[0x40 | 19, 0x10]).is_err());
+		assert!(AesProps::parse(&[PROPS_HAS_IV | 19, 0x10]).is_err());
 	}
 
 	#[test]

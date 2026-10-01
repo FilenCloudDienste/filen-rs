@@ -3,22 +3,16 @@
 
 use super::*;
 
-/// An archive with a hash in its metadata, placed in the fake drive in `parent`.
+/// An archive with `hash` in its metadata, placed in the fake drive in [`ARCHIVE_PARENT`].
 pub(super) fn disposable(
 	bytes: Vec<u8>,
 	hash: Option<Blake3Hash>,
 	configure: impl FnOnce(&mut FakeBackend),
-) -> (Setup, Uuid) {
-	let parent = ARCHIVE_PARENT;
-	let mut s = setup("bundle.tar", bytes.clone(), configure);
-	let archive = archive_file_with("bundle.tar", &bytes, hash);
-	let backend = Arc::get_mut(&mut s.backend).unwrap();
-	let data = backend.contents.remove(&s.archive.uuid()).unwrap();
-	backend.contents.insert(archive.uuid(), data);
-	s.archive = archive;
-	s.backend
-		.place_file(s.archive.uuid(), parent, bytes.len() as u64);
-	(s, parent)
+) -> Setup {
+	let size = bytes.len() as u64;
+	let setup = setup_in(DESTINATION, "bundle.tar", bytes, hash, configure);
+	setup.backend.place_file(ARCHIVE, ARCHIVE_PARENT, size);
+	setup
 }
 
 pub(super) fn disposition(report: &ExtractReport) -> DisposalOutcome {
@@ -40,10 +34,13 @@ async fn extract_disposing(
 	root: ExtractRoot,
 	configure: impl FnOnce(&mut FakeBackend),
 ) -> (Setup, ExtractReport) {
-	let (setup, parent) = disposable(bytes, hash, configure);
+	let setup = disposable(bytes, hash, configure);
 	let options = Options {
 		root,
-		dispose: Some(ArchiveDisposal::Remove { how, parent }),
+		dispose: Some(ArchiveDisposal::Remove {
+			how,
+			parent: ARCHIVE_PARENT,
+		}),
 		..Options::default()
 	};
 	let job = start(&setup, options);
@@ -93,11 +90,10 @@ async fn a_verified_archive_is_trashed_or_deleted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mac_metadata_left_out_keeps_nothing_from_removing_the_archive() {
-	let apple_double = [&[0x00, 0x05, 0x16, 0x07][..], b"\x00\x02\x00\x00"].concat();
 	let tar = tar_of(&[
 		("__MACOSX/", b""),
-		("__MACOSX/._a.txt", &apple_double),
-		("._a.txt", &apple_double),
+		("__MACOSX/._a.txt", &APPLE_DOUBLE),
+		("._a.txt", &APPLE_DOUBLE),
 		("a.txt", b"alpha"),
 	]);
 	let (setup, report) = extract_disposing(
@@ -131,11 +127,10 @@ async fn mac_metadata_left_out_keeps_nothing_from_removing_the_archive() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mac_folder_holding_anything_of_the_users_is_created_and_reported_so() {
-	let apple_double = [&[0x00, 0x05, 0x16, 0x07][..], b"\x00\x02\x00\x00"].concat();
 	let tar = tar_of(&[
 		("__MACOSX/", b""),
 		("__MACOSX/meta/", b""),
-		("__MACOSX/meta/._a.txt", &apple_double),
+		("__MACOSX/meta/._a.txt", &APPLE_DOUBLE),
 		// no metadata: an empty folder, and a file that is not AppleDouble, of the user's
 		("__MACOSX/empty/", b""),
 		("__MACOSX/user/", b""),
@@ -199,45 +194,44 @@ async fn an_ordinary_file_in_a_mac_folder_is_extracted_before_the_archive_goes()
 	));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_that_cannot_be_verified_is_kept() {
-	let tar = good_tar();
-	let new_folder = || ExtractRoot::NewFolder { name: None };
+/// Extracts `archive`, with `hash` in its metadata, into a new folder, removing it as `how` says.
+async fn extract_into_a_new_folder(
+	archive: Vec<u8>,
+	hash: Option<Blake3Hash>,
+	how: SourceDisposal,
+) -> (Setup, ExtractReport) {
+	let root = ExtractRoot::NewFolder { name: None };
+	extract_disposing(archive, hash, how, root, |_| {}).await
+}
 
-	// no hash to check the read against, which only a permanent deletion needs
-	let (_, report) = extract_disposing(
-		tar.clone(),
-		None,
-		SourceDisposal::DeletePermanently,
-		new_folder(),
-		|_| {},
-	)
-	.await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_without_a_hash_is_kept_from_a_permanent_deletion() {
+	let (setup, report) =
+		extract_into_a_new_folder(good_tar(), None, SourceDisposal::DeletePermanently).await;
 	assert!(matches!(
 		kept(disposition(&report)),
 		KeptReason::HashUnavailable
 	));
-	let (setup, report) = extract_disposing(
-		tar.clone(),
-		None,
-		SourceDisposal::Trash,
-		new_folder(),
-		|_| {},
-	)
-	.await;
+	assert!(setup.backend.log().deleted_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_without_a_hash_is_still_trashed() {
+	// only a permanent deletion needs a hash to check the read against
+	let (setup, report) = extract_into_a_new_folder(good_tar(), None, SourceDisposal::Trash).await;
 	assert!(matches!(
 		disposition(&report),
 		DisposalOutcome::Disposed { .. }
 	));
 	assert_eq!(setup.backend.log().trashed_files.len(), 1);
+}
 
-	// a hash that does not match what was read
-	let (setup, report) = extract_disposing(
-		tar.clone(),
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_whose_hash_is_not_of_what_was_read_is_kept() {
+	let (setup, report) = extract_into_a_new_folder(
+		good_tar(),
 		Some(hash(b"something else")),
 		SourceDisposal::Trash,
-		new_folder(),
-		|_| {},
 	)
 	.await;
 	assert!(matches!(
@@ -245,51 +239,44 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 		KeptReason::HashMismatch
 	));
 	assert!(setup.backend.log().trashed_files.is_empty());
+}
 
-	// data behind the tar
-	let mut junk = tar.clone();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_behind_the_tar_keeps_the_archive() {
+	let mut junk = good_tar();
 	junk.extend_from_slice(b"junk");
-	let (_, report) = extract_disposing(
-		junk.clone(),
-		Some(hash(&junk)),
-		SourceDisposal::Trash,
-		new_folder(),
-		|_| {},
-	)
-	.await;
+	let (setup, report) =
+		extract_into_a_new_folder(junk.clone(), Some(hash(&junk)), SourceDisposal::Trash).await;
 	assert!(matches!(
 		kept(disposition(&report)),
 		KeptReason::UnaccountedData { bytes: 4 }
 	));
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
 
-	// an entry that was skipped
-	let mut builder = tar::Builder::new(Vec::new());
-	let mut link = tar::Header::new_gnu();
-	link.set_entry_type(tar::EntryType::Symlink);
-	link.set_size(0);
-	builder.append_link(&mut link, "link", "x").unwrap();
-	let linked = builder.into_inner().unwrap();
-	let (_, report) = extract_disposing(
-		linked.clone(),
-		Some(hash(&linked)),
-		SourceDisposal::Trash,
-		new_folder(),
-		|_| {},
-	)
-	.await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skipped_entry_keeps_the_archive_as_incomplete() {
+	let linked = tar_with(&[TarMember::Symlink {
+		path: "link",
+		target: "x",
+	}]);
+	let (setup, report) =
+		extract_into_a_new_folder(linked.clone(), Some(hash(&linked)), SourceDisposal::Trash).await;
 	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
 
-	// a compressed tar whose codec carries no checksum (an lz4 frame without one): the archive's
-	// hash matches the bytes read, but nothing checked what they decoded to
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_whose_codec_checks_nothing_is_kept_as_unconfirmed() {
+	// an lz4 frame without a checksum: the archive's hash matches the bytes read, but nothing
+	// checked what they decoded to
 	let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
-	encoder.write_all(&tar).unwrap();
+	encoder.write_all(&good_tar()).unwrap();
 	let unchecked = encoder.finish().unwrap();
-	let (setup, report) = extract_disposing(
+	let (setup, report) = extract_into_a_new_folder(
 		unchecked.clone(),
 		Some(hash(&unchecked)),
 		SourceDisposal::Trash,
-		new_folder(),
-		|_| {},
 	)
 	.await;
 	assert!(matches!(
@@ -297,25 +284,23 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 		KeptReason::Unconfirmed
 	));
 	assert!(setup.backend.log().trashed_files.is_empty());
+}
 
-	// a file that failed to upload
-	let (setup, report) = {
-		let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_that_failed_to_upload_keeps_the_archive_as_incomplete() {
+	let tar = good_tar();
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::Trash,
+		ExtractRoot::NewFolder { name: None },
+		|backend| {
 			backend
 				.fail_upload
 				.insert("a.txt".to_owned(), ErrorKind::Server);
-		});
-		let options = Options {
-			dispose: Some(ArchiveDisposal::Remove {
-				how: SourceDisposal::Trash,
-				parent,
-			}),
-			..Options::default()
-		};
-		let job = start(&setup, options);
-		let report = job.running.await.unwrap().unwrap();
-		(setup, report)
-	};
+		},
+	)
+	.await;
 	assert!(matches!(kept(disposition(&report)), KeptReason::Incomplete));
 	assert!(setup.backend.log().trashed_files.is_empty());
 }
@@ -323,20 +308,23 @@ async fn an_archive_that_cannot_be_verified_is_kept() {
 /// The archive's dispositions the updates carried.
 fn disposition_events(recorder: &Recorder) -> Vec<DisposalOutcome> {
 	recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.flat_map(|update| &update.events)
+		.events()
+		.into_iter()
 		.filter_map(|event| match event {
-			ExtractEvent::SourceDisposition(disposition) => Some(disposition.outcome.clone()),
+			ExtractEvent::SourceDisposition(disposition) => Some(disposition.outcome),
 			_ => None,
 		})
 		.collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
+/// A tar of a file that uploads and one that may be held: what the cancel tests extract.
+fn cancelled_tar() -> Vec<u8> {
+	tar_of(&[("done.txt", b"done"), ("stuck.bin", b"stuck")])
+}
+
+/// Checks that `failed`, the job `recorder` saw, ended cancelled with its archive kept as
+/// interrupted, in its report and in the one disposition its updates carried.
+fn assert_kept_as_interrupted(failed: &ExtractFailed, recorder: &Recorder) {
 	let interrupted = |outcome: &DisposalOutcome| {
 		matches!(
 			outcome,
@@ -346,11 +334,17 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 			}
 		)
 	};
-	let tar = tar_of(&[("done.txt", b"done"), ("stuck.bin", b"stuck")]);
+	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
+	assert!(interrupted(&disposition(&failed.report)));
+	let events = disposition_events(recorder);
+	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+}
 
-	// cancelled while it extracts
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
-		backend.blocked_uploads.insert("stuck.bin".to_owned());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extraction_cancelled_while_it_extracts_keeps_its_archive_as_interrupted() {
+	let tar = cancelled_tar();
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |backend| {
+		backend.hold_named(Request::Upload, ["stuck.bin"]);
 	});
 	let (_pause, cancel, control) = controls();
 	let job = start(
@@ -359,7 +353,7 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 			control,
 			dispose: Some(ArchiveDisposal::Remove {
 				how: SourceDisposal::DeletePermanently,
-				parent,
+				parent: ARCHIVE_PARENT,
 			}),
 			..Options::default()
 		},
@@ -371,19 +365,19 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 	.await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
-	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	assert!(interrupted(&disposition(&failed.report)));
-	let events = disposition_events(&job.recorder);
-	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+	assert_kept_as_interrupted(&failed, &job.recorder);
 	assert!(setup.backend.log().deleted_files.is_empty());
 	assert_released(&setup, &job.reporter, &job.recorder);
+}
 
-	// cancelled while it waits for a slot
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extraction_cancelled_while_it_waits_for_a_slot_keeps_its_archive_as_interrupted() {
 	let config = one_slot();
 	// another job holds the slot
 	let other = Reporter::new(Recorder::default(), 0);
 	let _running = config.admit(&JobControl::default(), &other.ops()).await;
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let tar = cancelled_tar();
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	let (_pause, cancel, control) = controls();
 	let job = start(
 		&setup,
@@ -392,17 +386,14 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 			config: config.clone(),
 			dispose: Some(ArchiveDisposal::Remove {
 				how: SourceDisposal::Trash,
-				parent,
+				parent: ARCHIVE_PARENT,
 			}),
 			..Options::default()
 		},
 	);
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
-	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	assert!(interrupted(&disposition(&failed.report)));
-	let events = disposition_events(&job.recorder);
-	assert!(events.len() == 1 && interrupted(&events[0]), "{events:?}");
+	assert_kept_as_interrupted(&failed, &job.recorder);
 	assert!(setup.backend.log().trashed_files.is_empty());
 }
 
@@ -410,7 +401,7 @@ async fn a_cancelled_extraction_keeps_its_archive_as_interrupted() {
 /// verified, with a cancel for it.
 fn start_disposing(members: &[(&str, &[u8])]) -> (Setup, Job, watch::Sender<bool>) {
 	let tar = tar_of(members);
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	let (_pause, cancel, control) = controls();
 	let job = start(
 		&setup,
@@ -419,7 +410,7 @@ fn start_disposing(members: &[(&str, &[u8])]) -> (Setup, Job, watch::Sender<bool
 			control,
 			dispose: Some(ArchiveDisposal::Remove {
 				how: SourceDisposal::Trash,
-				parent,
+				parent: ARCHIVE_PARENT,
 			}),
 			..Options::default()
 		},
@@ -497,7 +488,7 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 		.map(|name| (name.as_str(), &b"x"[..]))
 		.collect();
 	let tar = tar_of(&members);
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	let config = test_config();
 	let (pause, _cancel, control) = controls();
 	let job = start(
@@ -508,7 +499,7 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 			config: config.clone(),
 			dispose: Some(ArchiveDisposal::Remove {
 				how: SourceDisposal::Trash,
-				parent,
+				parent: ARCHIVE_PARENT,
 			}),
 			..Options::default()
 		},
@@ -544,19 +535,18 @@ async fn a_pause_while_the_output_is_checked_is_waited_out() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
+async fn an_archive_moved_while_it_was_extracted_is_kept_as_changed() {
 	let tar = good_tar();
-	// moved elsewhere while it was extracted
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	setup
 		.backend
-		.place_file(setup.archive.uuid(), Uuid::from_u128(0xF), tar.len() as u64);
+		.place_file(ARCHIVE, Uuid::from_u128(0xF), tar.len() as u64);
 	let job = start(
 		&setup,
 		Options {
 			dispose: Some(ArchiveDisposal::Remove {
 				how: SourceDisposal::Trash,
-				parent,
+				parent: ARCHIVE_PARENT,
 			}),
 			..Options::default()
 		},
@@ -564,23 +554,23 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 	let report = job.running.await.unwrap().unwrap();
 	assert!(matches!(kept(disposition(&report)), KeptReason::Changed));
 	assert!(setup.backend.log().trashed_files.is_empty());
+}
 
-	// the extracted folder lost a file before the check: the fake drive forgets every file
-	// registered from now on, so the re-listing finds fewer than were created
-	let (setup, parent) = disposable(tar.clone(), Some(hash(&tar)), |backend| {
-		backend.quirks.insert(Quirk::ForgetRegistered);
-	});
-	let job = start(
-		&setup,
-		Options {
-			dispose: Some(ArchiveDisposal::Remove {
-				how: SourceDisposal::DeletePermanently,
-				parent,
-			}),
-			..Options::default()
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_whose_output_lost_a_file_is_kept_as_unconfirmed() {
+	// the fake drive forgets every file registered, so the re-listing finds fewer than were
+	// created, as when the extracted folder lost a file before the check
+	let tar = good_tar();
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::DeletePermanently,
+		ExtractRoot::NewFolder { name: None },
+		|backend| {
+			backend.quirks.insert(Quirk::ForgetRegistered);
 		},
-	);
-	let report = job.running.await.unwrap().unwrap();
+	)
+	.await;
 	assert!(matches!(
 		kept(disposition(&report)),
 		KeptReason::Unconfirmed
@@ -591,7 +581,7 @@ async fn an_archive_that_changed_or_whose_output_is_gone_is_kept() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_in_the_trash_is_kept_as_changed() {
 	let tar = good_tar();
-	let (setup, _) = disposable(tar.clone(), Some(hash(&tar)), |_| {});
+	let setup = disposable(tar.clone(), Some(hash(&tar)), |_| {});
 	let job = start(
 		&setup,
 		Options {
@@ -608,13 +598,52 @@ async fn an_archive_in_the_trash_is_kept_as_changed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_moved_to_the_trash_meanwhile_is_kept_as_changed() {
+	let tar = good_tar();
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::DeletePermanently,
+		ExtractRoot::NewFolder { name: None },
+		|backend| {
+			backend.in_trash.insert(ARCHIVE);
+		},
+	)
+	.await;
+	assert!(matches!(kept(disposition(&report)), KeptReason::Changed));
+	let log = setup.backend.log();
+	assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_extraction_whose_output_cannot_be_listed_keeps_its_archive() {
+	let tar = good_tar();
+	let (setup, report) = extract_disposing(
+		tar.clone(),
+		Some(hash(&tar)),
+		SourceDisposal::Trash,
+		ExtractRoot::NewFolder { name: None },
+		|backend| {
+			backend.quirks.insert(Quirk::FailTrees);
+		},
+	)
+	.await;
+	assert_eq!(finished_paths(&setup).len(), 2, "everything was extracted");
+	assert!(matches!(
+		kept(disposition(&report)),
+		KeptReason::Unconfirmed
+	));
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zip_with_duplicate_names_is_kept() {
 	let zip = zip_of(&[("same", Some(b"1")), ("same", Some(b"2"))], None);
-	let (setup, parent) = disposable(zip, None, |_| {});
+	let setup = disposable(zip, None, |_| {});
 	let options = Options {
 		dispose: Some(ArchiveDisposal::Remove {
 			how: SourceDisposal::Trash,
-			parent,
+			parent: ARCHIVE_PARENT,
 		}),
 		..Options::default()
 	};

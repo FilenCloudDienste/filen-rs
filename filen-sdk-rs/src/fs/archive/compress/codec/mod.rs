@@ -11,7 +11,7 @@ use crate::{
 		encode::{StreamEncoder, open_encoder},
 		password::ArchivePassword,
 		sevenz::write::SevenZWriter,
-		tar_iter::{TAR_BLOCK, USTAR_NAME_LEN},
+		tar_iter::{TAR_BLOCK_U64, USTAR_NAME_LEN},
 		worker::{ChunkInput, ChunkSink, HeadSink, JobEnded, WorkerEvent, WorkerPort},
 		zip::{
 			crypto::AesStrength,
@@ -214,7 +214,7 @@ fn write_tar<W: Write>(
 pub(crate) fn tar_size(entries: &[ArchiveEntry]) -> u64 {
 	let long_name = |stored: usize| {
 		if stored > USTAR_NAME_LEN {
-			TAR_BLOCK + (stored as u64 + 1).div_ceil(TAR_BLOCK) * TAR_BLOCK
+			TAR_BLOCK_U64 + (stored as u64 + 1).div_ceil(TAR_BLOCK_U64) * TAR_BLOCK_U64
 		} else {
 			0
 		}
@@ -222,13 +222,13 @@ pub(crate) fn tar_size(entries: &[ArchiveEntry]) -> u64 {
 	let members: u64 = entries
 		.iter()
 		.map(|entry| match entry {
-			ArchiveEntry::Dir { path, .. } => TAR_BLOCK + long_name(path.len() + 1),
+			ArchiveEntry::Dir { path, .. } => TAR_BLOCK_U64 + long_name(path.len() + 1),
 			ArchiveEntry::File { path, size, .. } => {
-				TAR_BLOCK + long_name(path.len()) + size.div_ceil(TAR_BLOCK) * TAR_BLOCK
+				TAR_BLOCK_U64 + long_name(path.len()) + size.div_ceil(TAR_BLOCK_U64) * TAR_BLOCK_U64
 			}
 		})
 		.sum();
-	members + 2 * TAR_BLOCK
+	members + 2 * TAR_BLOCK_U64
 }
 
 fn header(

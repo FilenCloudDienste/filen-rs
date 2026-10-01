@@ -9,6 +9,7 @@ use filen_types::fs::Uuid;
 use crate::{
 	Error,
 	fs::{
+		archive::dispose::SourceDisposition,
 		categories::{DirType, NonRootItemType, Normal},
 		drive_job::counts::ItemCounts,
 		name::ValidatedName,
@@ -23,7 +24,6 @@ use crate::{
 pub use crate::job::report::RunState;
 
 use super::{DuplicateEntries, ExtractSkipReason};
-use crate::fs::archive::dispose::SourceDisposition;
 
 /// Where an extraction is. The last three are where it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

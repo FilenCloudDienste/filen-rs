@@ -41,10 +41,13 @@ use crate::{
 	job::report::{JobState, Reporter},
 };
 
-use super::backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec};
+use super::{
+	backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec},
+	plan::SourceDir,
+};
 
 /// Bytes of memory semaphore that hold `chunks` chunks.
-pub(crate) fn budget(chunks: usize) -> usize {
+fn budget(chunks: usize) -> usize {
 	chunks * FULL_CHUNK_BYTES
 }
 
@@ -53,6 +56,15 @@ pub(crate) fn chunk_data(uuid: Uuid, index: u64, size: u64) -> Vec<u8> {
 	// The low byte of each, on purpose: a fill pattern distinct per file and per chunk.
 	let fill = uuid.as_u128().to_le_bytes()[0] ^ index.to_le_bytes()[0];
 	vec![fill; usize::try_from(chunk_plaintext_len(size, index)).unwrap()]
+}
+
+/// The hash of the source file `uuid` whose chunks hold [`chunk_data`].
+pub(crate) fn source_hash(uuid: Uuid, size: u64) -> Blake3Hash {
+	let mut hasher = blake3::Hasher::new();
+	for index in 0..size.div_ceil(CHUNK_SIZE_U64) {
+		hasher.update(&chunk_data(uuid, index, size));
+	}
+	Blake3Hash::from(hasher.finalize())
 }
 
 /// A file `name` in `parent` holding `bytes`, with `hash` in its metadata.
@@ -64,6 +76,26 @@ pub(crate) fn remote_file(
 	hash: Option<Blake3Hash>,
 ) -> RemoteFileType<'static> {
 	let size = bytes.len() as u64;
+	stored_file(
+		uuid,
+		parent,
+		name,
+		size,
+		size.div_ceil(CHUNK_SIZE_U64),
+		hash,
+	)
+}
+
+/// A file `name` in `parent` of `size` bytes stored as `chunks` chunks, with `hash` in its
+/// metadata.
+pub(crate) fn stored_file(
+	uuid: Uuid,
+	parent: Uuid,
+	name: &str,
+	size: u64,
+	chunks: u64,
+	hash: Option<Blake3Hash>,
+) -> RemoteFileType<'static> {
 	let meta = FileMeta::Decoded(DecryptedFileMeta {
 		name: Cow::Owned(name.to_owned()),
 		size,
@@ -78,7 +110,7 @@ pub(crate) fn remote_file(
 		(),
 		parent.into(),
 		size,
-		size.div_ceil(CHUNK_SIZE_U64),
+		chunks,
 		"de-1",
 		"bucket",
 		Utc::now(),
@@ -86,6 +118,17 @@ pub(crate) fn remote_file(
 		meta,
 	);
 	RemoteFileType::File(Cow::Owned(file))
+}
+
+/// A directory `name` a job reads as one of its sources, colored so a copy has a color to keep.
+pub(crate) fn source_dir(name: &str) -> SourceDir<()> {
+	SourceDir {
+		uuid: Uuid::new_v4(),
+		name: Some(name.to_owned()),
+		created: Some(Utc::now()),
+		color: DirColor::Blue,
+		handle: (),
+	}
 }
 
 /// Waits until `condition` holds, panicking with `what` if it does not within a generous time.
@@ -99,8 +142,8 @@ pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) 
 	panic!("timed out waiting until {what}");
 }
 
-/// Counts one of several calls running at once, for as long as it lives.
-struct Running(Arc<AtomicUsize>);
+/// Counts one of several calls running, or locks held, at once, for as long as it lives.
+pub(crate) struct Running(Arc<AtomicUsize>);
 
 impl Running {
 	/// Counts a call in `running`, handing `peak` how many run now.
@@ -116,12 +159,8 @@ impl Drop for Running {
 	}
 }
 
-pub(crate) struct FakeLock(Arc<AtomicUsize>);
-impl Drop for FakeLock {
-	fn drop(&mut self) {
-		self.0.fetch_sub(1, Ordering::SeqCst);
-	}
-}
+/// A drive lock the fake hands out, counted in [`FakeBackend::live_locks`] while held.
+pub(crate) type FakeLock = Running;
 
 #[derive(Default)]
 pub(crate) struct FakeLog {
@@ -197,6 +236,8 @@ pub(crate) enum Quirk {
 	FailColor,
 	/// Every propagation to a share or link fails.
 	FailPropagate,
+	/// Listing any directory's tree fails.
+	FailTrees,
 	/// Later chunks of a file download faster than earlier ones.
 	ReverseChunks,
 	/// Keep every uploaded chunk's bytes in [`FakeLog::uploaded_data`].
@@ -215,7 +256,6 @@ pub(crate) struct FakeBackend {
 	pub(crate) slow: HashMap<String, Duration>,
 	pub(crate) fail_fetch: HashMap<String, ErrorKind>,
 	pub(crate) fail_upload: HashMap<String, ErrorKind>,
-	pub(crate) blocked_uploads: HashSet<String>,
 	pub(crate) fail_create: HashMap<String, ErrorKind>,
 	pub(crate) fail_finish: HashMap<String, ErrorKind>,
 	/// Files whose last chunk comes back one byte short.
@@ -232,6 +272,12 @@ pub(crate) struct FakeBackend {
 	pub(crate) versioned_files: HashSet<Uuid>,
 	/// Files whose permanent deletion fails.
 	pub(crate) fail_deletes_of: HashSet<Uuid>,
+	/// Files and directories the server says are in the trash, wherever the fake drive has them.
+	pub(crate) in_trash: HashSet<Uuid>,
+	/// Files the server says a newer version superseded.
+	pub(crate) superseded: HashSet<Uuid>,
+	/// Files and directories whose state cannot be fetched.
+	pub(crate) fail_state_of: HashSet<Uuid>,
 	/// Requests about an item that wait while they are in the set, each wait logged in
 	/// [`FakeLog::held`]. Held by kind as well as item, as one job sends several kinds about
 	/// the same item and a test means to stop it at one of them.
@@ -261,7 +307,7 @@ pub(crate) struct FakeBackend {
 }
 
 /// Chunks of memory a [`FakeBackend`] has unless a test asks for [`FakeBackend::with_memory`].
-pub(crate) const DEFAULT_MEMORY_CHUNKS: usize = 4;
+const DEFAULT_MEMORY_CHUNKS: usize = 4;
 
 impl FakeBackend {
 	/// A backend for a job writing into `destination`, the one directory that exists before it.
@@ -276,7 +322,6 @@ impl FakeBackend {
 			slow: HashMap::new(),
 			fail_fetch: HashMap::new(),
 			fail_upload: HashMap::new(),
-			blocked_uploads: HashSet::new(),
 			fail_create: HashMap::new(),
 			fail_finish: HashMap::new(),
 			short_reads: HashSet::new(),
@@ -288,6 +333,9 @@ impl FakeBackend {
 			later_targets: None,
 			versioned_files: HashSet::new(),
 			fail_deletes_of: HashSet::new(),
+			in_trash: HashSet::new(),
+			superseded: HashSet::new(),
+			fail_state_of: HashSet::new(),
 			held: watch::Sender::new(HashSet::new()),
 			held_named: watch::Sender::new(HashSet::new()),
 			existing: Mutex::new(HashSet::new()),
@@ -426,8 +474,7 @@ impl DriveBackend for FakeBackend {
 				.wait_for(|from| from.is_none_or(|from| call < from))
 				.await;
 		}
-		self.live_locks.fetch_add(1, Ordering::SeqCst);
-		Ok(FakeLock(Arc::clone(&self.live_locks)))
+		Ok(Running::start(&self.live_locks, |_| {}))
 	}
 
 	async fn connected_targets(&self, _dir: Uuid) -> Result<ConnectedTargets, Error> {
@@ -627,9 +674,6 @@ impl DriveBackend for FakeBackend {
 	) -> Result<RemoteFileInfo, Error> {
 		let name = upload.spec.name.as_ref();
 		self.log().upload_starts.push((upload.spec.uuid, index));
-		if self.blocked_uploads.contains(name) {
-			std::future::pending::<()>().await;
-		}
 		self.hold_name(Request::Upload, name).await;
 		self.wait(name).await;
 		if let Some(kind) = self.fail_upload.get(name) {

@@ -2,7 +2,7 @@
 //! file, a damaged archive, a limit; and where a failed entry is extracted again.
 
 use super::*;
-use crate::fs::archive::format::TAR_CHECKSUM;
+use crate::fs::archive::{format::TAR_CHECKSUM, tar_iter::TAR_BLOCK};
 
 #[tokio::test(start_paused = true)]
 async fn a_failed_codec_gives_back_its_own_error() {
@@ -58,14 +58,11 @@ async fn the_sizes_of_skipped_entries_add_up_without_overflowing() {
 /// The failure events the updates carried: whether of a directory, path, stage, error kind.
 fn failure_events(recorder: &Recorder) -> Vec<(bool, String, ExtractStage, ErrorKind)> {
 	let mut events: Vec<_> = recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.flat_map(|update| &update.events)
+		.events()
+		.into_iter()
 		.filter_map(|event| match event {
-			ExtractEvent::DirFailed(f) => Some((true, f.path.clone(), f.stage, f.error.kind())),
-			ExtractEvent::FileFailed(f) => Some((false, f.path.clone(), f.stage, f.error.kind())),
+			ExtractEvent::DirFailed(f) => Some((true, f.path, f.stage, f.error.kind())),
+			ExtractEvent::FileFailed(f) => Some((false, f.path, f.stage, f.error.kind())),
 			_ => None,
 		})
 		.collect();
@@ -270,7 +267,7 @@ async fn a_file_registered_as_a_version_is_a_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_archive_fetch_or_lock_ends_the_job() {
+async fn a_failed_archive_fetch_ends_the_job() {
 	let setup_fetch = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |backend| {
 		backend
 			.fail_fetch
@@ -282,9 +279,11 @@ async fn a_failed_archive_fetch_or_lock_ends_the_job() {
 	assert!(created_dirs(&setup_fetch).is_empty());
 	assert_eq!(job.recorder.last().phase, ExtractPhase::Failed);
 	assert_released(&setup_fetch, &job.reporter, &job.recorder);
+}
 
-	// the drive lock is lost after the folder was created: its entries fail, and the job with
-	// the first error that ends it
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drive_lock_lost_after_the_folder_was_created_ends_the_job() {
+	// the folder's entries fail, and the job with the first error that ends it
 	let setup_lock = setup(
 		"bundle.tar",
 		tar_of(&[("a.txt", b"a"), ("d/b.txt", b"b")]),
@@ -320,7 +319,7 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 			files_done: 1,
 			bytes_done: 5,
 			files_not_attempted: 1,
-			bytes_not_attempted: 3 * CHUNK_SIZE as u64,
+			bytes_not_attempted: 3 * CHUNK_SIZE_U64,
 			..ItemCounts::default()
 		}
 	);
@@ -332,7 +331,7 @@ async fn a_damaged_archive_ends_the_job_keeping_what_it_extracted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
 	/// Where `second.bin`'s header starts: past `first.txt`'s header and its data block.
-	const SECOND_HEADER: usize = 2 * 512;
+	const SECOND_HEADER: usize = 2 * TAR_BLOCK;
 	let mut tar = tar_of(&[
 		("first.txt", b"first"),
 		("second.bin", &pattern(3 * CHUNK_SIZE, 3)),
@@ -352,11 +351,14 @@ async fn damage_before_the_archives_end_leaves_no_time_to_wait_for() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_limits_end_the_job() {
-	let tar = tar_of(&[("a.txt", &pattern(1000, 0)), ("b.txt", b"b")]);
+/// A tar of a 1000-byte file and a 1-byte one.
+fn two_files() -> Vec<u8> {
+	tar_of(&[("a.txt", &pattern(1000, 0)), ("b.txt", b"b")])
+}
 
-	let setup_bytes = setup("a.tar", tar.clone(), |_| {});
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_bytes_ends_the_job_before_the_file_that_would_not_fit() {
+	let setup_bytes = setup("a.tar", two_files(), |_| {});
 	let options = Options {
 		max_bytes: Some(500),
 		..Options::default()
@@ -385,8 +387,11 @@ async fn the_limits_end_the_job() {
 		"the file that would not fit is not attempted"
 	);
 	assert_released(&setup_bytes, &job.reporter, &job.recorder);
+}
 
-	let setup_items = setup("a.tar", tar, |_| {});
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_items_ends_the_job() {
+	let setup_items = setup("a.tar", two_files(), |_| {});
 	let options = Options {
 		max_items: Some(1),
 		..Options::default()
@@ -477,8 +482,10 @@ async fn an_indexed_archive_stating_more_than_max_bytes_creates_nothing() {
 		let report = start(&fits, options).running.await.unwrap().unwrap();
 		assert_eq!(report.counts.bytes_done, 9, "{name}");
 	}
+}
 
-	// an entry skipped for its path takes no storage
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_indexed_entry_skipped_for_its_path_takes_no_storage() {
 	let with_unsafe: [(&str, Option<&[u8]>); 2] = [
 		("../outside.txt", Some(&[7; 100])),
 		("a.txt", Some(b"alpha")),
@@ -535,7 +542,7 @@ async fn a_failed_entry_is_extracted_again_where_it_was_meant_to_go() {
 	);
 
 	// with the right drive now, into the directory the first job created
-	let retry = setup_in(docs, "bundle.tar", tar, |_| {});
+	let retry = setup_in(docs, "bundle.tar", tar, None, |_| {});
 	let indices: Vec<u32> = report.failures.iter().map(|f| f.entry.index).collect();
 	let job = start(&retry, chosen(&indices, &["docs"]));
 	job.running.await.unwrap().unwrap();
@@ -594,7 +601,7 @@ async fn a_failure_of_a_partial_extraction_is_retried_below_its_base() {
 	let sub = log_dir(&setup, "sub");
 	assert_eq!(retry_target(failure), (sub, vec!["docs", "sub"]));
 
-	let retry = setup_in(sub, "bundle.tar", tar, |_| {});
+	let retry = setup_in(sub, "bundle.tar", tar, None, |_| {});
 	let job = start(&retry, chosen(&[failure.entry.index], &["docs", "sub"]));
 	job.running.await.unwrap().unwrap();
 	assert_eq!(finished_paths(&retry), ["b.txt"]);

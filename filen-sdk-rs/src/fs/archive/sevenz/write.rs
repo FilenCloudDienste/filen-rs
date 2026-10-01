@@ -185,7 +185,10 @@ impl<W: Write> Write for Packer<W> {
 	}
 
 	fn flush(&mut self) -> io::Result<()> {
-		Ok(())
+		match self {
+			Self::Plain(inner) => inner.flush(),
+			Self::Aes(inner) => inner.flush(),
+		}
 	}
 }
 
@@ -220,6 +223,9 @@ impl<W: Write> Write for Encoder<W> {
 		}
 	}
 
+	/// Flushes nothing: flushing makes deflate write a sync block, bzip2 end its block early and
+	/// PPMd write its range coder's final bytes mid-stream, so the encoders are only ever
+	/// finished ([`Encoder::finish`]).
 	fn flush(&mut self) -> io::Result<()> {
 		Ok(())
 	}
@@ -305,12 +311,10 @@ impl<W: Write> SevenZWriter<W> {
 		solid: bool,
 		encryption: Option<(SevenZEncryption, &ArchivePassword)>,
 	) -> io::Result<Self> {
-		Self::with_cycles_power(out, method, solid, encryption, WRITE_CYCLES_POWER)
+		Self::build(out, method, solid, encryption, WRITE_CYCLES_POWER)
 	}
 
-	/// [`SevenZWriter::new`] with a key derivation of `2^cycles_power` rounds, which tests
-	/// lower to stay fast.
-	pub(crate) fn with_cycles_power(
+	fn build(
 		mut out: W,
 		method: SevenZMethod,
 		solid: bool,
@@ -520,13 +524,17 @@ impl<W: Write> SevenZWriter<W> {
 		let next_offset = out.written;
 		out.write_all(&next)?;
 		let mut start = [0u8; START_HEADER_LEN];
-		start[..6].copy_from_slice(&SIGNATURE);
-		start[7] = 4;
-		start[12..20].copy_from_slice(&next_offset.to_le_bytes());
-		start[20..28].copy_from_slice(&(next.len() as u64).to_le_bytes());
-		start[28..32].copy_from_slice(&crc32fast::hash(&next).to_le_bytes());
-		let start_crc = crc32fast::hash(&start[12..]);
-		start[8..12].copy_from_slice(&start_crc.to_le_bytes());
+		start[..SIGNATURE.len()].copy_from_slice(&SIGNATURE);
+		start[VERSION_AT + 1] = FORMAT_MINOR;
+		let fields = [
+			&next_offset.to_le_bytes()[..],
+			&(next.len() as u64).to_le_bytes(),
+			&crc32fast::hash(&next).to_le_bytes(),
+		]
+		.concat();
+		start[START_FIELDS_AT..].copy_from_slice(&fields);
+		let start_crc = crc32fast::hash(&start[START_FIELDS_AT..]);
+		start[START_CRC_AT..START_FIELDS_AT].copy_from_slice(&start_crc.to_le_bytes());
 		Ok((out.inner, start))
 	}
 
@@ -600,7 +608,7 @@ impl<W: Write> SevenZWriter<W> {
 					FileKind::Dir => {
 						ATTRIBUTE_DIRECTORY | ATTRIBUTE_UNIX_EXTENSION | ((UNIX_DIR | 0o755) << 16)
 					}
-					FileKind::File { .. } => ATTRIBUTE_UNIX_EXTENSION | (0o100_644 << 16),
+					FileKind::File { .. } => ATTRIBUTE_UNIX_EXTENSION | ((UNIX_FILE | 0o644) << 16),
 				};
 				attributes.extend_from_slice(&attribute.to_le_bytes());
 			}
@@ -654,7 +662,11 @@ fn write_streams(out: &mut Vec<u8>, pack_pos: u64, folders: &[FolderRecord], sub
 			let id = coder.method.id().to_be_bytes();
 			let skip = id.iter().take(7).take_while(|&&byte| byte == 0).count();
 			let id = &id[skip..];
-			let props_flag = if coder.props.is_empty() { 0 } else { 0x20 };
+			let props_flag = if coder.props.is_empty() {
+				0
+			} else {
+				CODER_HAS_PROPS
+			};
 			let id_len = u8::try_from(id.len())
 				.expect("a method id is at most the 8 bytes of a u64 (should be impossible)");
 			out.push(id_len | props_flag);
@@ -712,6 +724,27 @@ fn write_streams(out: &mut Vec<u8>, pack_pos: u64, folders: &[FolderRecord], sub
 		out.push(K_END);
 	}
 	out.push(K_END);
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::io::{self, Write};
+
+	use super::{ArchivePassword, SevenZEncryption, SevenZMethod, SevenZWriter};
+
+	impl<W: Write> SevenZWriter<W> {
+		/// [`SevenZWriter::new`] with a key derivation of `2^cycles_power` rounds, which tests
+		/// lower to stay fast.
+		pub(crate) fn with_cycles_power(
+			out: W,
+			method: SevenZMethod,
+			solid: bool,
+			encryption: Option<(SevenZEncryption, &ArchivePassword)>,
+			cycles_power: u8,
+		) -> io::Result<Self> {
+			Self::build(out, method, solid, encryption, cycles_power)
+		}
+	}
 }
 
 #[cfg(test)]

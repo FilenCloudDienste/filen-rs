@@ -98,16 +98,15 @@ pub struct ClientConfig {
 	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
 	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`.
 	thumbnail_decode_concurrency: usize,
-	#[cfg(feature = "archive")]
 	/// See [`ClientConfig::with_archive_codec_mem_budget`].
-	pub(crate) archive_codec_mem_budget: u64,
 	#[cfg(feature = "archive")]
+	pub(crate) archive_codec_mem_budget: u64,
 	/// See [`ClientConfig::with_archive_job_concurrency`].
+	#[cfg(feature = "archive")]
 	pub(crate) archive_job_concurrency: usize,
 }
 
 impl ClientConfig {
-	#[cfg(feature = "archive")]
 	/// Memory for one archive job's codec state (a dictionary, window or model). Extracting an
 	/// archive whose decoder needs more fails with
 	/// [`ErrorKind::ArchiveTooLarge`](crate::ErrorKind::ArchiveTooLarge); compressing into a
@@ -116,14 +115,15 @@ impl ClientConfig {
 	/// ([`CompressFormat::max_level_within`] finds the highest level that fits).
 	///
 	/// [`CompressFormat::max_level_within`]: crate::fs::archive::CompressFormat::max_level_within
+	#[cfg(feature = "archive")]
 	pub fn with_archive_codec_mem_budget(mut self, archive_codec_mem_budget: u64) -> Self {
 		self.archive_codec_mem_budget = archive_codec_mem_budget;
 		self
 	}
 
-	#[cfg(feature = "archive")]
 	/// How many archive jobs (extracting, compressing) run at once, at least 1; later ones
 	/// wait. Ignored on wasm, where one runs at a time per page.
+	#[cfg(feature = "archive")]
 	pub fn with_archive_job_concurrency(mut self, archive_job_concurrency: usize) -> Self {
 		self.archive_job_concurrency = archive_job_concurrency;
 		self

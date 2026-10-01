@@ -70,10 +70,12 @@ use crate::{
 	util::{MaybeArc, MaybeSendBoxFuture, sleep},
 };
 
-use super::read_back::{ReadBack, reads_back};
-use super::report::{
-	CompressActiveFile, CompressEvent, CompressFailed, CompressPhase, CompressReport, HashMismatch,
-	Reporter,
+use super::{
+	read_back::{ReadBack, reads_back},
+	report::{
+		CompressActiveFile, CompressEvent, CompressFailed, CompressPhase, CompressReport,
+		HashMismatch, Reporter,
+	},
 };
 
 /// Archive chunks uploading at once.
@@ -598,7 +600,7 @@ impl<B: DisposalBackend> Driver<B> {
 			keep(
 				&mut self.hash_mismatches,
 				&mut self.omitted_hash_mismatches,
-				mismatch.clone(),
+				&mismatch,
 			);
 			self.reporter
 				.event(CompressEvent::SourceHashMismatch(mismatch));
@@ -990,7 +992,7 @@ impl<B: DisposalBackend> Driver<B> {
 			// the destination may hold the name by now
 			recheck: Some(&mut retry),
 			completion,
-			info: self.info.clone().unwrap_or_default(),
+			info: self.info.take().unwrap_or_default(),
 			targets: &targets,
 		})
 		.await;

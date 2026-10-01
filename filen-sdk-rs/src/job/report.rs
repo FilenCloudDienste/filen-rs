@@ -217,9 +217,11 @@ pub(crate) trait JobState: MaybeSend + 'static {
 /// What in-flight operations report to, independent of the job: the handle the shared helpers
 /// (lock waits, reservations, listings) hold, so they need not be generic over the job.
 pub(crate) trait JobTick: MaybeSendSync {
-	/// Settles whether the job counts as paused, and sends an update when one is due.
-	fn tick(&self);
-	fn ops_in_flight(&self) -> &AtomicU64;
+	/// Counts an operation as in flight, then ticks: a job reported paused stops being paused
+	/// once anything starts.
+	fn op_started(&self);
+	/// Counts an operation as done, then ticks.
+	fn op_finished(&self);
 	/// Records whether a pause is requested; the job counts as paused once no operation is in
 	/// flight.
 	fn set_pause_requested(&self, requested: bool);
@@ -241,9 +243,7 @@ impl fmt::Debug for Ops {
 impl Ops {
 	/// Counts an operation as in flight; taken before the operation holds anything.
 	pub(crate) fn op(&self) -> OpGuard {
-		self.0.ops_in_flight().fetch_add(1, Ordering::SeqCst);
-		// a job reported paused stops being paused once anything starts
-		self.0.tick();
+		self.0.op_started();
 		OpGuard(self.clone())
 	}
 
@@ -283,8 +283,7 @@ pub(crate) struct OpGuard(Ops);
 
 impl Drop for OpGuard {
 	fn drop(&mut self) {
-		(self.0).0.ops_in_flight().fetch_sub(1, Ordering::SeqCst);
-		(self.0).0.tick();
+		(self.0).0.op_finished();
 	}
 }
 
@@ -487,12 +486,14 @@ impl<S: JobState> Reporter<S> {
 }
 
 impl<S: JobState> JobTick for Reporter<S> {
-	fn tick(&self) {
-		Reporter::tick(self);
+	fn op_started(&self) {
+		self.ops_in_flight.fetch_add(1, Ordering::SeqCst);
+		self.tick();
 	}
 
-	fn ops_in_flight(&self) -> &AtomicU64 {
-		&self.ops_in_flight
+	fn op_finished(&self) {
+		self.ops_in_flight.fetch_sub(1, Ordering::SeqCst);
+		self.tick();
 	}
 
 	fn set_pause_requested(&self, requested: bool) {
@@ -505,35 +506,25 @@ impl<S: JobState> JobTick for Reporter<S> {
 }
 
 /// A job's report, named in the message of the [`JobFailed`] that carries it.
-pub trait JobReport: fmt::Debug {
+pub trait JobReport {
 	/// What the job is called in messages, e.g. "copy".
 	const NAME: &'static str;
 }
 
 /// A job that ended early: cancelled, or stopped by an error that affects the whole job.
-#[derive(Debug)]
-pub struct JobFailed<R> {
+#[derive(Debug, thiserror::Error)]
+#[error("the {} ended early: {error}", R::NAME)]
+pub struct JobFailed<R: JobReport> {
 	/// What the job did before it ended.
 	pub report: R,
 	/// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) after a cancel, or the error that
 	/// ended the job. Shared with the failure it came from when one item's error ended the whole
 	/// job, since [`Error`] is not `Clone`.
+	#[source]
 	pub error: Arc<Error>,
 }
 
-impl<R: JobReport> fmt::Display for JobFailed<R> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "the {} ended early: {}", R::NAME, self.error)
-	}
-}
-
-impl<R: JobReport> std::error::Error for JobFailed<R> {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		Some(&*self.error)
-	}
-}
-
-impl<R> From<JobFailed<R>> for Error {
+impl<R: JobReport> From<JobFailed<R>> for Error {
 	/// The error that ended the job: the original once nothing else holds it, or else an error of
 	/// the same kind wrapping the shared one.
 	fn from(failed: JobFailed<R>) -> Self {

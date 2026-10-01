@@ -2,14 +2,15 @@
 //! at its end): every later chunk is hashed as it streams by, as a subtree of BLAKE3's tree, and
 //! the first chunk's subtree is merged in once it arrives. Nothing but chaining values is kept.
 
-use blake3::hazmat::{
-	ChainingValue, HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root,
+use blake3::{
+	CHUNK_LEN,
+	hazmat::{ChainingValue, HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root},
 };
 
 use crate::consts::CHUNK_SIZE_U64;
 
 // every chunk but the last is a whole BLAKE3 subtree: a power of two of its 1 KiB chunks
-const _: () = assert!(CHUNK_SIZE_U64.is_power_of_two() && CHUNK_SIZE_U64 >= 1024);
+const _: () = assert!(CHUNK_SIZE_U64.is_power_of_two() && CHUNK_SIZE_U64 >= CHUNK_LEN as u64);
 
 /// Chunks `1..` arrive in order, then the head (chunk 0); each chunk but the last is exactly
 /// [`CHUNK_SIZE_U64`] bytes.
@@ -44,7 +45,7 @@ impl HeadLastHasher {
 		self.chunks += 1;
 		let mut hasher = blake3::Hasher::new();
 		hasher.set_input_offset(self.chunks * CHUNK_SIZE_U64);
-		hasher.update(data);
+		hasher.update_rayon(data);
 		self.pending = Some(hasher.finalize_non_root());
 	}
 
@@ -74,7 +75,7 @@ impl HeadLastHasher {
 		};
 		let mut hasher = blake3::Hasher::new();
 		hasher.set_input_offset(0);
-		hasher.update(head);
+		hasher.update_rayon(head);
 		let left = self
 			.head_siblings
 			.iter()
@@ -91,10 +92,10 @@ impl HeadLastHasher {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::fs::archive::test_support::pattern;
+	use crate::{consts::CHUNK_SIZE, fs::archive::test_support::pattern};
 
 	fn hash_head_last(data: &[u8]) -> blake3::Hash {
-		let chunk = usize::try_from(CHUNK_SIZE_U64).unwrap();
+		let chunk = CHUNK_SIZE;
 		let mut hasher = HeadLastHasher::new();
 		for piece in data.chunks(chunk).skip(1) {
 			hasher.update(piece);
@@ -104,9 +105,18 @@ mod tests {
 
 	#[test]
 	fn matches_hashing_in_order_at_every_shape() {
-		let chunk = usize::try_from(CHUNK_SIZE_U64).unwrap();
+		let chunk = CHUNK_SIZE;
 		let data = pattern(9 * chunk + 1, 0);
-		let mut lens = vec![0, 1, 1024, 1025, chunk - 1, chunk, chunk + 1, chunk + 1024];
+		let mut lens = vec![
+			0,
+			1,
+			CHUNK_LEN,
+			CHUNK_LEN + 1,
+			chunk - 1,
+			chunk,
+			chunk + 1,
+			chunk + CHUNK_LEN,
+		];
 		for chunks in 2..=9 {
 			lens.extend([chunks * chunk - 1, chunks * chunk, chunks * chunk + 1]);
 		}

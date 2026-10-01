@@ -18,12 +18,6 @@ use std::{
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 
-use super::{
-	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
-	FLAG_ENCRYPTED, FLAG_UTF8, HOST_OS_X, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES, METHOD_BZIP2,
-	METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_STORED, METHOD_XZ, METHOD_ZSTD, cp437,
-	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
-};
 use crate::{
 	Error, ErrorKind,
 	fs::{
@@ -42,19 +36,24 @@ use crate::{
 	util::SeededMap,
 };
 
-/// For LZMA: the stream ends with an end marker (a general-purpose flag).
-const FLAG_LZMA_END_MARKER: u16 = 0x0002;
-const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
+use super::{
+	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, EXTRA_AES, EXTRA_NTFS,
+	EXTRA_UNICODE_PATH, EXTRA_ZIP64, FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_LZMA_END_MARKER,
+	FLAG_STRONG_ENCRYPTION, FLAG_UTF8, HOST_OS_X, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES,
+	METHOD_BZIP2, METHOD_DEFLATE, METHOD_DEFLATE64, METHOD_LZMA, METHOD_STORED, METHOD_XZ,
+	METHOD_ZSTD, ZIP64_MARKER, cp437,
+	crypto::{AesReader, AesStrength, CryptoError, ZipCryptoReader},
+};
 
-const EOCD_LEN: usize = 22;
+pub(crate) const EOCD_LEN: usize = 22;
 const EOCD_LEN_U64: u64 = EOCD_LEN as u64;
 const EOCD64_LEN: usize = 56;
 const EOCD64_LEN_U64: u64 = EOCD64_LEN as u64;
 const EOCD64_LOCATOR_LEN: usize = 20;
 const EOCD64_LOCATOR_LEN_U64: u64 = EOCD64_LOCATOR_LEN as u64;
-const CENTRAL_HEADER_LEN: usize = 46;
-const LOCAL_HEADER_LEN: usize = 30;
-const LOCAL_HEADER_LEN_U64: u64 = LOCAL_HEADER_LEN as u64;
+pub(crate) const CENTRAL_HEADER_LEN: usize = 46;
+pub(crate) const LOCAL_HEADER_LEN: usize = 30;
+pub(crate) const LOCAL_HEADER_LEN_U64: u64 = LOCAL_HEADER_LEN as u64;
 /// A comment may be up to this long, so the end record is in the file's last 64 KiB and change.
 const MAX_COMMENT_LEN: u64 = 0xFFFF;
 /// End-record candidates tried before giving up: a comment can hold the record's signature.
@@ -552,27 +551,27 @@ fn parse_central_header(
 			break;
 		};
 		match id {
-			// zip64: the values the fixed fields hold 0xFFFFFFFF for, in this order
-			0x0001 => {
+			// zip64: the values the fixed fields hold the marker for, in this order
+			EXTRA_ZIP64 => {
 				let mut values = data.chunks_exact(8).map(|value| u64_at(value, 0));
-				if size == 0xFFFF_FFFF {
+				if size == u64::from(ZIP64_MARKER) {
 					size = values
 						.next()
 						.ok_or(ZipError::Corrupt("a short zip64 field"))?;
 				}
-				if compressed_size == 0xFFFF_FFFF {
+				if compressed_size == u64::from(ZIP64_MARKER) {
 					compressed_size = values
 						.next()
 						.ok_or(ZipError::Corrupt("a short zip64 field"))?;
 				}
-				if header_offset == 0xFFFF_FFFF {
+				if header_offset == u64::from(ZIP64_MARKER) {
 					header_offset = values
 						.next()
 						.ok_or(ZipError::Corrupt("a short zip64 field"))?;
 				}
 			}
 			// NTFS times: a tag of mtime, atime and ctime as FILETIMEs
-			0x000A if data.len() >= 32 && u16_at(data, 4) == 1 && u16_at(data, 6) >= 24 => {
+			EXTRA_NTFS if data.len() >= 32 && u16_at(data, 4) == 1 && u16_at(data, 6) >= 24 => {
 				modified = nt_time_to_datetime(u64_at(data, 8));
 			}
 			// Unix extended timestamp: flags, then the modification time when flagged
@@ -581,13 +580,13 @@ fn parse_central_header(
 				unix_modified = DateTime::from_timestamp(i64::from(secs), 0);
 			}
 			// Info-ZIP Unicode path, valid only for the name it was written with
-			0x7075 if data.len() >= 5 && data[0] == 1 => {
+			EXTRA_UNICODE_PATH if data.len() >= 5 && data[0] == 1 => {
 				if u32_at(data, 1) == crc32fast::hash(raw_name) {
 					unicode_name = std::str::from_utf8(&data[5..]).ok().map(str::to_owned);
 				}
 			}
 			// WinZip AES: vendor version, "AE", strength, the method under the encryption
-			0x9901 if data.len() >= 7 => {
+			EXTRA_AES if data.len() >= 7 => {
 				let strength = AesStrength::try_from(data[4])
 					.map_err(|_| ZipError::Unsupported("an AES strength"))?;
 				aes = Some((strength, u16_at(data, 0) == 2, u16_at(data, 5)));

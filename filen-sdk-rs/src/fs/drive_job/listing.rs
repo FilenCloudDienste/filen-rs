@@ -102,10 +102,10 @@ where
 /// Bytes of listing responses received by earlier sources, and by the one being listed.
 #[derive(Default)]
 pub(crate) struct ListingBytes {
-	pub(crate) done: AtomicU64,
-	pub(crate) current: AtomicU64,
+	done: AtomicU64,
+	current: AtomicU64,
 	/// `u64::MAX` while unknown.
-	pub(crate) current_total: AtomicU64,
+	current_total: AtomicU64,
 }
 
 impl ListingBytes {
@@ -370,9 +370,36 @@ pub(crate) enum ScanError {
 	Failed(Error),
 }
 
-/// For a stop the reporter was already told about, as `Reporter::checkpoint` does.
+/// For a stop the reporter was already told about, as
+/// [`Reporter::checkpoint`](crate::job::report::Reporter::checkpoint) does.
 impl From<Stopped> for ScanError {
 	fn from(_: Stopped) -> Self {
 		Self::Stopped
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn listing_bytes_add_up_across_sources() {
+		let bytes = ListingBytes::default();
+		bytes.current_total.store(u64::MAX, Ordering::Relaxed);
+		assert_eq!(bytes.scan(0, 3).listing_total_bytes, None);
+		bytes.current.store(40, Ordering::Relaxed);
+		bytes.current_total.store(100, Ordering::Relaxed);
+		let scan = bytes.scan(1, 3);
+		assert_eq!(
+			(scan.listing_bytes, scan.listing_total_bytes),
+			(40, Some(100))
+		);
+		assert_eq!((scan.sources_done, scan.sources_total), (1, 3));
+
+		bytes.current.store(100, Ordering::Relaxed);
+		bytes.next_source();
+		bytes.current.store(5, Ordering::Relaxed);
+		let scan = bytes.scan(2, 3);
+		assert_eq!((scan.listing_bytes, scan.listing_total_bytes), (105, None));
 	}
 }

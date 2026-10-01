@@ -618,6 +618,8 @@ const CRC64_TABLE: [u64; 256] = {
 
 #[cfg(test)]
 mod tests {
+	use std::{io::Write, num::NonZeroU64};
+
 	use super::*;
 
 	#[test]
@@ -637,8 +639,6 @@ mod tests {
 
 	#[test]
 	fn every_block_is_counted_against_the_index() {
-		use std::{io::Write, num::NonZeroU64};
-
 		let data: Vec<u8> = (0..300_000u32)
 			.map(|i| (i % 251).to_le_bytes()[0] ^ (i >> 12).to_le_bytes()[0])
 			.collect();

@@ -10,7 +10,7 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 		("stuck.bin", &pattern(CHUNK_SIZE, 9)),
 	]);
 	let setup = setup("c.tar", tar, |backend| {
-		backend.blocked_uploads.insert("stuck.bin".to_owned());
+		backend.hold_named(Request::Upload, ["stuck.bin"]);
 	});
 	let (_pause, cancel, control) = controls();
 	let job = start(
@@ -39,7 +39,7 @@ async fn a_cancel_drops_the_transfers_and_reports_what_exists() {
 			bytes_done: 4,
 			// the dropped file, at the size the archive states
 			files_not_attempted: 1,
-			bytes_not_attempted: CHUNK_SIZE as u64,
+			bytes_not_attempted: CHUNK_SIZE_U64,
 			..ItemCounts::default()
 		}
 	);
@@ -101,7 +101,7 @@ async fn a_job_paused_before_it_starts_takes_no_slot() {
 async fn a_job_paused_while_queued_leaves_the_slot_to_the_next() {
 	let config = one_slot();
 	let setup_first = setup("first.tar", tar_of(&[("stuck.bin", b"stuck")]), |backend| {
-		backend.blocked_uploads.insert("stuck.bin".to_owned());
+		backend.hold_named(Request::Upload, ["stuck.bin"]);
 	});
 	let (_pause, cancel_first, control) = controls();
 	let first = start(

@@ -18,7 +18,7 @@ use crate::{
 		drive_job::{
 			listing::{ListingBytes, SourceLister},
 			plan::{Listed, PlanSource, PlanTotals, SourceDir},
-			test_support::{remote_file, wait_until},
+			test_support::{remote_file, source_dir, wait_until},
 		},
 		file::{RemoteFile, enums::RemoteFileType},
 	},
@@ -54,16 +54,6 @@ fn _compress_future_is_send(client: Arc<Client>, destination: DirType<'static, N
 		Ignore,
 		JobControl::default(),
 	));
-}
-
-fn source_dir(name: &str) -> SourceDir<()> {
-	SourceDir {
-		uuid: Uuid::new_v4(),
-		name: Some(name.to_owned()),
-		created: None,
-		color: DirColor::Default,
-		handle: (),
-	}
 }
 
 /// The folder the test files and folders say they are in.

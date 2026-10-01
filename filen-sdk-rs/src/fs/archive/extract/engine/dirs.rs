@@ -159,10 +159,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.await?;
 		let (listed, targets) = match (listed, targets) {
 			(Ok(listed), Ok(targets)) => (listed, targets),
-			(Err(error), _) | (_, Err(error)) => {
-				self.stop_with(error);
-				return Err(Stopped);
-			}
+			(Err(error), _) | (_, Err(error)) => return Err(self.stop_with(error)),
 		};
 		self.targets = Arc::new(targets);
 		self.unverified = listed.unverified;
@@ -187,10 +184,7 @@ impl<B: DisposalBackend> Driver<B> {
 				let mut taken = TakenNames::new(listed.names.iter().map(String::as_str));
 				let name = match taken.allocate(wanted, NameShape::Dir) {
 					Ok(name) => name,
-					Err(error) => {
-						self.stop_with(error.into());
-						return Err(Stopped);
-					}
+					Err(error) => return Err(self.stop_with(error.into())),
 				};
 				let folder = self.create_root(name).await?;
 				let resolver = PathResolver::new(std::iter::empty());
@@ -231,6 +225,7 @@ impl<B: DisposalBackend> Driver<B> {
 				targets: Arc::clone(&self.targets),
 				parent: self.destination.uuid(),
 				uuid: Uuid::new_v4(),
+				// a copy: a create that never started is tried again under the same name
 				name: name.clone(),
 				created: Utc::now(),
 				color: DirColor::Default,
@@ -255,22 +250,19 @@ impl<B: DisposalBackend> Driver<B> {
 					return Ok(dir);
 				}
 				Err(DirError::NotStarted) => {}
-				Err(DirError::Failed(error)) => {
-					self.stop_with(error);
-					return Err(Stopped);
-				}
+				Err(DirError::Failed(error)) => return Err(self.stop_with(error)),
 			}
 		}
 	}
 
-	/// The directory `segments` names, planning the ones not seen before; `None` once the job
+	/// The directory `segments` names, planning the ones not seen before; `Err` once the job
 	/// ended.
 	pub(super) fn resolve_dirs(
 		&mut self,
 		segments: &[ValidatedName],
 		entry: ArchiveEntryId,
 		modified: Option<DateTime<Utc>>,
-	) -> Option<DirId> {
+	) -> Result<DirId, Stopped> {
 		let mut planned = Vec::new();
 		let resolved = self
 			.opened_mut()
@@ -278,10 +270,7 @@ impl<B: DisposalBackend> Driver<B> {
 			.resolve_dirs(segments, &mut planned);
 		let dir = match resolved {
 			Ok(dir) => dir,
-			Err(error) => {
-				self.stop_with(error.into());
-				return None;
-			}
+			Err(error) => return Err(self.stop_with(error.into())),
 		};
 		for PlannedDir {
 			id,
@@ -290,29 +279,25 @@ impl<B: DisposalBackend> Driver<B> {
 			archive_name,
 		} in planned
 		{
-			if !self.count_item() {
-				return None;
-			}
+			self.count_item()?;
 			// every planned directory is kept for the whole job, and one entry can imply 256:
 			// they are capped like members, before they cost more
 			if exceeds_limit(self.dirs.slots.len() as u64, self.config.max_members) {
-				self.stop_with(Error::custom(
+				return Err(self.stop_with(Error::custom(
 					ErrorKind::ArchiveTooLarge,
 					format!(
 						"the archive names more than {} directories",
 						self.config.max_members
 					),
-				));
-				return None;
+				)));
 			}
 			// the resolver numbers directories in the order it plans them, parents first
 			let next = self.dirs.slots.len();
 			let Some(parent_slot) = self.dirs.slots.get_mut(parent).filter(|_| id == next) else {
-				self.stop_with(Error::custom(
+				return Err(self.stop_with(Error::custom(
 					ErrorKind::Internal,
 					"a directory was planned out of order",
-				));
-				return None;
+				)));
 			};
 			parent_slot.children.push(id);
 			let state = match &parent_slot.state {
@@ -346,7 +331,7 @@ impl<B: DisposalBackend> Driver<B> {
 				children: Vec::new(),
 			});
 		}
-		Some(dir)
+		Ok(dir)
 	}
 
 	pub(super) fn start_dir(&mut self, dir: DirId) {
@@ -363,6 +348,7 @@ impl<B: DisposalBackend> Driver<B> {
 			targets: Arc::clone(&self.targets),
 			parent,
 			uuid: slot.uuid,
+			// a copy: the slot keeps its name for the entries below it
 			name: named.name.clone(),
 			created: named.created,
 			color: DirColor::Default,
@@ -518,6 +504,7 @@ impl<B: DisposalBackend> Driver<B> {
 		let slot = &self.dirs.slots[dir];
 		match &slot.place {
 			DirPlace::Root(root) => DirType::clone(root),
+			// a copy: the slot keeps its name for the entries below it
 			DirPlace::Named(named) => DirType::Dir(Cow::Owned(RemoteDirectory::new_from_parts(
 				slot.uuid,
 				RemoteDirectory::make_meta(named.name.clone(), named.created),

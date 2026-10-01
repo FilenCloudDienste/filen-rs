@@ -16,7 +16,10 @@ use filen_macros::js_type;
 
 use crate::fs::name::{ValidatedName, keep_both::SourceName};
 
-use super::{decode::SKIPPABLE_FRAME_MAGIC, tar_iter::TAR_BLOCK_LEN};
+use super::{
+	decode::SKIPPABLE_FRAME_MAGIC, sevenz::header::SIGNATURE as SEVEN_Z_SIGNATURE,
+	tar_iter::TAR_BLOCK,
+};
 
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
@@ -84,13 +87,12 @@ pub(crate) enum Detected {
 }
 
 /// Bytes of the head of a file that [`detect`] looks at: enough for a tar header's checksum.
-pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK_LEN;
+pub(crate) const DETECT_HEAD_LEN: usize = TAR_BLOCK;
 /// Where a tar header keeps its checksum.
 pub(crate) const TAR_CHECKSUM: Range<usize> = 148..156;
 
-const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 pub(crate) const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
-const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+pub(crate) const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
 pub(crate) const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Tells the format of a file from its first bytes (up to [`DETECT_HEAD_LEN`]) and its name.
@@ -98,7 +100,7 @@ pub(crate) fn detect(head: &[u8], name: &str) -> Option<Detected> {
 	if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
 		return Some(Detected::Zip);
 	}
-	if head.starts_with(&SEVEN_Z_MAGIC) {
+	if head.starts_with(&SEVEN_Z_SIGNATURE) {
 		return Some(Detected::SevenZ);
 	}
 	if head.first_chunk().is_some_and(is_tar_header) {
@@ -176,7 +178,7 @@ fn after_skippable_frames(mut head: &[u8]) -> Option<&[u8]> {
 /// Whether `block` is a tar header: its checksum field matches the sum of its bytes with that
 /// field counted as spaces. Old tars summed signed bytes, so both sums are accepted, as GNU tar
 /// does. An all-zero block (the end-of-archive marker) is not a header.
-pub(crate) fn is_tar_header(block: &[u8; TAR_BLOCK_LEN]) -> bool {
+pub(crate) fn is_tar_header(block: &[u8; TAR_BLOCK]) -> bool {
 	let Some(stored) = parse_octal(&block[TAR_CHECKSUM]) else {
 		return false;
 	};

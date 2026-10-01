@@ -19,7 +19,7 @@ use crate::{
 	},
 	io::{RemoteDirectory, RemoteFile},
 	socket::DecryptedSocketEvent,
-	util::PeekableReceiver,
+	util::{PeekableReceiver, panic_message},
 };
 use filen_types::{fs::StableUuid, traits::CowHelpers};
 use futures::StreamExt;
@@ -3102,16 +3102,6 @@ fn dispatch_presnapshot_target(event: &CacheEventType<'_>) -> Option<Uuid> {
 		CacheEventType::Dir(DirEvent::Move(d)) => Some(d.uuid),
 		CacheEventType::Dir(DirEvent::Removed(uuid)) => Some(*uuid),
 		_ => None,
-	}
-}
-
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-	if let Some(s) = panic.downcast_ref::<&str>() {
-		(*s).to_string()
-	} else if let Some(s) = panic.downcast_ref::<String>() {
-		s.clone()
-	} else {
-		"non-string panic payload".to_string()
 	}
 }
 

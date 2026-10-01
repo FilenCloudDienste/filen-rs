@@ -467,17 +467,16 @@ pub struct CompressReport {
 
 impl From<dispose::KeptReason> for ArchiveKeptReason {
 	fn from(reason: dispose::KeptReason) -> Self {
-		use dispose::KeptReason as Kept;
 		match reason {
-			Kept::Incomplete => Self::Incomplete,
-			Kept::UnaccountedData { bytes } => Self::UnaccountedData { bytes },
-			Kept::HashMismatch => Self::HashMismatch,
-			Kept::HashUnavailable => Self::HashUnavailable,
-			Kept::Changed => Self::Changed,
-			Kept::Unconfirmed => Self::Unconfirmed,
-			Kept::HasVersions => Self::HasVersions,
-			Kept::Interrupted => Self::Interrupted,
-			Kept::Failed { error } => Self::Failed {
+			dispose::KeptReason::Incomplete => Self::Incomplete,
+			dispose::KeptReason::UnaccountedData { bytes } => Self::UnaccountedData { bytes },
+			dispose::KeptReason::HashMismatch => Self::HashMismatch,
+			dispose::KeptReason::HashUnavailable => Self::HashUnavailable,
+			dispose::KeptReason::Changed => Self::Changed,
+			dispose::KeptReason::Unconfirmed => Self::Unconfirmed,
+			dispose::KeptReason::HasVersions => Self::HasVersions,
+			dispose::KeptReason::Interrupted => Self::Interrupted,
+			dispose::KeptReason::Failed { error } => Self::Failed {
 				error: sdk_error(error),
 			},
 		}
@@ -530,9 +529,8 @@ impl From<extract::ExtractFailure> for ExtractFailureInfo {
 
 impl From<extract::ExtractEvent> for ExtractEvent {
 	fn from(event: extract::ExtractEvent) -> Self {
-		use extract::ExtractEvent as Event;
 		match event {
-			Event::DirCreated {
+			extract::ExtractEvent::DirCreated {
 				dest_uuid,
 				dest_parent,
 				name,
@@ -541,9 +539,9 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 				dest_parent,
 				name,
 			}),
-			Event::DirFailed(failure) => Self::DirFailed(failure.into()),
-			Event::FileStarted(file) => Self::FileStarted(file),
-			Event::FileDone {
+			extract::ExtractEvent::DirFailed(failure) => Self::DirFailed(failure.into()),
+			extract::ExtractEvent::FileStarted(file) => Self::FileStarted(file),
+			extract::ExtractEvent::FileDone {
 				entry,
 				dest_uuid,
 				dest_parent,
@@ -556,15 +554,17 @@ impl From<extract::ExtractEvent> for ExtractEvent {
 				name,
 				size,
 			}),
-			Event::FileFailed(failure) => Self::FileFailed(failure.into()),
-			Event::Skipped(entry) => Self::Skipped(entry),
-			Event::Renamed(entry) => Self::Renamed(entry),
-			Event::MisleadingName(entry) => Self::MisleadingName(entry),
-			Event::TopLevelTrashed { dest_uuid } => {
+			extract::ExtractEvent::FileFailed(failure) => Self::FileFailed(failure.into()),
+			extract::ExtractEvent::Skipped(entry) => Self::Skipped(entry),
+			extract::ExtractEvent::Renamed(entry) => Self::Renamed(entry),
+			extract::ExtractEvent::MisleadingName(entry) => Self::MisleadingName(entry),
+			extract::ExtractEvent::TopLevelTrashed { dest_uuid } => {
 				Self::TopLevelTrashed(ExtractTopLevelTrashed { dest_uuid })
 			}
-			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
-			Event::PropagationFailed { dest_uuid, error } => {
+			extract::ExtractEvent::SourceDisposition(disposition) => {
+				Self::SourceDisposition(disposition.into())
+			}
+			extract::ExtractEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))
 			}
 		}
@@ -679,13 +679,16 @@ impl ListReport {
 
 impl From<compress::CompressEvent> for CompressEvent {
 	fn from(event: compress::CompressEvent) -> Self {
-		use compress::CompressEvent as Event;
 		match event {
-			Event::Skipped(entry) => Self::Skipped(entry),
-			Event::Renamed(entry) => Self::Renamed(entry),
-			Event::SourceHashMismatch(mismatch) => Self::SourceHashMismatch(mismatch),
-			Event::SourceDisposition(disposition) => Self::SourceDisposition(disposition.into()),
-			Event::PropagationFailed { dest_uuid, error } => {
+			compress::CompressEvent::Skipped(entry) => Self::Skipped(entry),
+			compress::CompressEvent::Renamed(entry) => Self::Renamed(entry),
+			compress::CompressEvent::SourceHashMismatch(mismatch) => {
+				Self::SourceHashMismatch(mismatch)
+			}
+			compress::CompressEvent::SourceDisposition(disposition) => {
+				Self::SourceDisposition(disposition.into())
+			}
+			compress::CompressEvent::PropagationFailed { dest_uuid, error } => {
 				Self::PropagationFailed(ItemError::new(dest_uuid, error))
 			}
 		}

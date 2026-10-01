@@ -184,7 +184,7 @@ fn what_a_call_leaves_out_is_the_sdks_default() {
 }
 
 #[test]
-fn names_and_passwords_are_checked_at_the_edge() {
+fn an_extraction_folder_name_is_checked_at_the_edge() {
 	let error = extract_request(
 		AnyFile::File(remote_file().into()),
 		destination(),
@@ -195,65 +195,84 @@ fn names_and_passwords_are_checked_at_the_edge() {
 	)
 	.unwrap_err();
 	assert_eq!(error.kind(), ErrorKind::InvalidName);
+}
+
+#[test]
+fn an_empty_password_is_refused_at_the_edge() {
 	assert_eq!(
 		checked_password(Some(String::new())).unwrap_err().kind(),
 		ErrorKind::InvalidState
 	);
 	assert!(checked_password(None).unwrap().is_none());
-	let call = |name, format, budget| {
-		CompressCall::new(
-			Vec::new(),
-			destination(),
-			name,
-			CompressConfig {
-				format,
-				max_bytes: None,
-				password: None,
-			},
-			None,
-			budget,
-		)
-	};
+}
+
+/// A compress call of `items` into an archive `name` of `format`, on a client whose codec
+/// budget is `budget`.
+fn compress_call(
+	items: Vec<AnyItemWithContext>,
+	name: &str,
+	format: CompressFormat,
+	budget: u64,
+) -> Result<CompressCall, Error> {
+	CompressCall::new(
+		items,
+		destination(),
+		name,
+		CompressConfig {
+			format,
+			max_bytes: None,
+			password: None,
+		},
+		None,
+		budget,
+	)
+}
+
+#[test]
+fn a_compress_name_is_checked_at_the_edge() {
 	let stored = CompressFormat::Zip {
 		method: ZipMethod::Stored,
 		encryption: None,
 	};
 	assert_eq!(
-		call("a/b.zip", stored, CODEC_MEM_BUDGET)
+		compress_call(Vec::new(), "a/b.zip", stored, CODEC_MEM_BUDGET)
 			.err()
 			.unwrap()
 			.kind(),
 		ErrorKind::InvalidName
 	);
-	// the encoder has to fit the client's budget: 7z PPMd 8 needs 129 MiB
+}
+
+#[test]
+fn a_compress_encoder_has_to_fit_the_clients_budget() {
+	// 7z PPMd 8 needs 129 MiB
 	let ppmd = CompressFormat::SevenZ {
 		method: SevenZMethod::Ppmd { level: 8 },
 		solid: false,
 		encryption: None,
 	};
 	assert_eq!(
-		call("a.7z", ppmd, 128 << 20).err().unwrap().kind(),
+		compress_call(Vec::new(), "a.7z", ppmd, 128 << 20)
+			.err()
+			.unwrap()
+			.kind(),
 		ErrorKind::InsufficientMemory
 	);
-	assert!(call("a.7z", ppmd, 256 << 20).is_ok());
+	assert!(compress_call(Vec::new(), "a.7z", ppmd, 256 << 20).is_ok());
+}
 
-	// a single compressed file is one file, which the kind of each item tells up front
+#[test]
+fn a_single_compressed_file_takes_one_file_which_each_items_kind_tells_up_front() {
 	let one = |item| {
-		CompressCall::new(
+		compress_call(
 			vec![item],
-			destination(),
 			"a.gz",
-			CompressConfig {
-				format: CompressFormat::Single {
-					compression: Compression {
-						codec: StreamCodec::Gzip,
-						level: None,
-					},
+			CompressFormat::Single {
+				compression: Compression {
+					codec: StreamCodec::Gzip,
+					level: None,
 				},
-				max_bytes: None,
-				password: None,
 			},
-			None,
 			CODEC_MEM_BUDGET,
 		)
 	};
@@ -327,7 +346,7 @@ fn helpers_name_the_formats() {
 	assert_eq!(archive_default_name("photos.tar.gz".into()), "photos");
 	assert_eq!(
 		archive_default_name("..zip".into()),
-		String::from(super::super::format::archive_default_name("..zip")),
+		String::from(super::super::archive_default_name("..zip")),
 		"the name extraction gives the folder"
 	);
 }

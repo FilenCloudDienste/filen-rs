@@ -97,7 +97,7 @@ async fn files_are_read_only_as_fast_as_they_are_registered() {
 		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
 		.await
 		.unwrap();
-	let count = MAX_OPEN_FILES + 10;
+	let count = MAX_OPEN_ENTRIES + 10;
 	let mut taken = None;
 	for ordinal in 0..count {
 		let entry = || file_entry(ordinal as u64, &format!("e{ordinal:03}"), 0);
@@ -115,7 +115,7 @@ async fn files_are_read_only_as_fast_as_they_are_registered() {
 	// the last file taken ended in the channel, not yet taken either
 	assert_eq!(
 		taken,
-		Some(MAX_OPEN_FILES),
+		Some(MAX_OPEN_ENTRIES),
 		"the codec waits for the files to be registered"
 	);
 	drop(events);

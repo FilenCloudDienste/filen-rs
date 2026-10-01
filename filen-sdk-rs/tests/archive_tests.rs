@@ -11,18 +11,19 @@ use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
-	consts::CHUNK_SIZE,
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::{
 		HasName, HasUUID,
 		archive::{
 			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchivePassword,
-			ArchiveSource, CompressCallback, CompressConfig, CompressFormat, CompressReport,
-			CompressRequest, CompressSources, CompressUpdate, Compression, DisposalOutcome,
-			EntrySelection, ExtractCallback, ExtractConfig, ExtractRenameReason, ExtractReport,
-			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractWhat,
-			ExtractedTopLevel, KeptReason, ListCallback, ListConfig, ListReport, ListTotals,
-			ListUpdate, PasswordCheck, SevenZEncryption, SevenZMethod, SourceDisposal, StreamCodec,
-			ZipMethod,
+			ArchiveSource, CompressCallback, CompressConfig, CompressFormat, CompressPhase,
+			CompressReport, CompressRequest, CompressSources, CompressUpdate, Compression,
+			DisposalOutcome, EntrySelection, ExtractCallback, ExtractConfig, ExtractFailed,
+			ExtractPhase, ExtractRenameReason, ExtractReport, ExtractRequest, ExtractRoot,
+			ExtractSkipReason, ExtractUpdate, ExtractWhat, ExtractedTopLevel, KeptReason,
+			ListCallback, ListConfig, ListFailed, ListPhase, ListReport, ListTotals, ListUpdate,
+			ListedSkipReason, PasswordCheck, SevenZEncryption, SevenZMethod, SourceDisposal,
+			StreamCodec, ZipMethod,
 		},
 		categories::{DirType, NonRootItemType},
 		copy::{ItemSource, ItemSourceDir, JobControl},
@@ -36,13 +37,16 @@ use filen_sdk_rs::{
 	},
 	io::client_impl::IoSharedClientExt,
 };
+use filen_types::fs::Uuid;
 
 mod drive_helpers;
 use drive_helpers::{assert_same_files, contents, data, dir_link_info, linked_file, noise, upload};
 
+/// What a compress job told its callback.
 #[derive(Default)]
 struct CompressRecorder {
 	archives: Mutex<Vec<RemoteFile>>,
+	updates: Mutex<Vec<CompressUpdate>>,
 }
 
 impl CompressCallback for CompressRecorder {
@@ -50,12 +54,16 @@ impl CompressCallback for CompressRecorder {
 		self.archives.lock().unwrap().push(archive);
 	}
 
-	fn on_update(&self, _: CompressUpdate) {}
+	fn on_update(&self, update: CompressUpdate) {
+		self.updates.lock().unwrap().push(update);
+	}
 }
 
+/// What an extraction told its callback.
 #[derive(Default)]
 struct ExtractRecorder {
 	top_level: Mutex<Vec<ExtractedTopLevel>>,
+	updates: Mutex<Vec<ExtractUpdate>>,
 }
 
 impl ExtractCallback for ExtractRecorder {
@@ -63,14 +71,22 @@ impl ExtractCallback for ExtractRecorder {
 		self.top_level.lock().unwrap().extend(items);
 	}
 
-	fn on_update(&self, _: ExtractUpdate) {}
+	fn on_update(&self, update: ExtractUpdate) {
+		self.updates.lock().unwrap().push(update);
+	}
 }
 
-/// A folder with a file over a chunk, a small one, an empty one and a subfolder.
-async fn tree(client: &Client, parent: &RemoteDirectory) -> (RemoteDirectory, Vec<RemoteFile>) {
+/// The uuids of `items`, in order.
+fn uuids<'a>(items: impl IntoIterator<Item = &'a ExtractedTopLevel>) -> Vec<Uuid> {
+	items.into_iter().map(|top| top.item.uuid()).collect()
+}
+
+/// A folder with a file over a chunk, a small one, an empty one and a subfolder: the folder, and
+/// `big.bin`, `notes.txt` and `sub/empty`.
+async fn tree(client: &Client, parent: &RemoteDirectory) -> (RemoteDirectory, [RemoteFile; 3]) {
 	let source = client.create_dir(&parent.into(), "source").await.unwrap();
 	let sub = client.create_dir(&(&source).into(), "sub").await.unwrap();
-	let files = vec![
+	let files = [
 		upload(client, &source, "big.bin", &data(CHUNK_SIZE + 4321, 7)).await,
 		upload(client, &source, "notes.txt", b"hello archive").await,
 		upload(client, &sub, "empty", b"").await,
@@ -86,6 +102,7 @@ async fn compress(
 	format: CompressFormat,
 	password: Option<&str>,
 ) -> (RemoteFile, CompressReport) {
+	let recorder = Arc::new(CompressRecorder::default());
 	let report = client
 		.clone()
 		.compress_items(
@@ -99,7 +116,7 @@ async fn compress(
 				max_bytes: None,
 				password: password.map(|p| ArchivePassword::new(p.into()).unwrap()),
 			},
-			CompressRecorder::default(),
+			Arc::clone(&recorder),
 			JobControl::default(),
 		)
 		.await
@@ -108,6 +125,25 @@ async fn compress(
 		.archive
 		.clone()
 		.expect("a compression that ran to its end holds its archive");
+	let told: Vec<Uuid> = recorder
+		.archives
+		.lock()
+		.unwrap()
+		.iter()
+		.map(HasUUID::uuid)
+		.collect();
+	assert_eq!(
+		told,
+		[archive.uuid()],
+		"{name}: the callback got the archive"
+	);
+	let phase = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.last()
+		.map(|update| update.phase);
+	assert_eq!(phase, Some(CompressPhase::Done), "{name}");
 	(archive, report)
 }
 
@@ -117,7 +153,7 @@ async fn extract(
 	archive: ArchiveSource,
 	destination: &RemoteDirectory,
 	password: Option<&str>,
-) -> Result<ExtractReport, ErrorKind> {
+) -> Result<ExtractReport, ExtractFailed> {
 	extract_into(
 		client,
 		archive,
@@ -134,7 +170,7 @@ async fn extract_into(
 	destination: &RemoteDirectory,
 	root: ExtractRoot,
 	password: Option<&str>,
-) -> Result<ExtractReport, ErrorKind> {
+) -> Result<ExtractReport, ExtractFailed> {
 	run_extract(
 		client,
 		ExtractRequest {
@@ -151,17 +187,30 @@ async fn run_extract(
 	client: &Arc<Client>,
 	request: ExtractRequest,
 	config: ExtractConfig,
-) -> Result<ExtractReport, ErrorKind> {
-	client
+) -> Result<ExtractReport, ExtractFailed> {
+	let recorder = Arc::new(ExtractRecorder::default());
+	let report = client
 		.clone()
 		.extract_archive(
 			request,
 			config,
-			ExtractRecorder::default(),
+			Arc::clone(&recorder),
 			JobControl::default(),
 		)
-		.await
-		.map_err(|failed| failed.error.kind())
+		.await?;
+	assert_eq!(
+		uuids(recorder.top_level.lock().unwrap().iter()),
+		uuids(&report.top_level),
+		"the callback got every top-level item"
+	);
+	let phase = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.last()
+		.map(|update| update.phase);
+	assert_eq!(phase, Some(ExtractPhase::Done));
+	Ok(report)
 }
 
 fn with_password(password: Option<&str>) -> ExtractConfig {
@@ -171,9 +220,11 @@ fn with_password(password: Option<&str>) -> ExtractConfig {
 	}
 }
 
+/// What a listing told its callback.
 #[derive(Default)]
 struct ListRecorder {
 	entries: Mutex<Vec<ArchiveEntry>>,
+	updates: Mutex<Vec<ListUpdate>>,
 }
 
 impl ListCallback for ListRecorder {
@@ -181,16 +232,18 @@ impl ListCallback for ListRecorder {
 		self.entries.lock().unwrap().extend(entries);
 	}
 
-	fn on_update(&self, _: ListUpdate) {}
+	fn on_update(&self, update: ListUpdate) {
+		self.updates.lock().unwrap().push(update);
+	}
 }
 
 /// Lists `archive` as `config` would extract it, checking the callback was handed the entries
-/// the listing keeps.
+/// the listing keeps and told it was done.
 async fn list(
 	client: &Arc<Client>,
 	archive: RemoteFileType<'static>,
 	config: ExtractConfig,
-) -> Result<ListReport, ErrorKind> {
+) -> Result<ListReport, ListFailed> {
 	let config = ListConfig {
 		expansion_limit: config.expansion_limit,
 		skip_mac_metadata: config.skip_mac_metadata,
@@ -205,9 +258,15 @@ async fn list(
 			Arc::clone(&recorder),
 			JobControl::default(),
 		)
-		.await
-		.map_err(|failed| failed.error.kind())?;
+		.await?;
 	assert_eq!(*recorder.entries.lock().unwrap(), listing.entries);
+	let phase = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.last()
+		.map(|update| update.phase);
+	assert_eq!(phase, Some(ListPhase::Done));
 	Ok(listing)
 }
 
@@ -252,7 +311,7 @@ fn listed_files(listing: &ListReport) -> Vec<&str> {
 	files
 }
 
-/// The paths of the files in `dir`'s tree, sorted.
+/// The paths of `files`, sorted.
 fn file_paths(files: &[(String, RemoteFile)]) -> Vec<&str> {
 	let mut paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
 	paths.sort_unstable();
@@ -285,7 +344,7 @@ async fn every_format_family_round_trips_through_the_drive() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
-	let (source, files) = tree(&client, test_dir).await;
+	let (source, [big, notes, empty]) = tree(&client, test_dir).await;
 	let formats: [(&str, CompressFormat, Option<&str>); 4] = [
 		(
 			"bundle.tar.gz",
@@ -340,30 +399,24 @@ async fn every_format_family_round_trips_through_the_drive() {
 		assert_eq!(report.counts.files_done, 3, "{name}");
 
 		if password.is_some() {
-			assert_eq!(
-				extract(
+			for (given, kind) in [
+				(None, ErrorKind::ArchivePasswordRequired),
+				(Some("wrong"), ErrorKind::ArchiveWrongPassword),
+			] {
+				let failed = extract(
 					&client,
 					ArchiveSource::Keep(archive.clone().into()),
 					&destination,
-					None
+					given,
 				)
 				.await
-				.unwrap_err(),
-				ErrorKind::ArchivePasswordRequired,
-				"{name}"
-			);
-			assert_eq!(
-				extract(
-					&client,
-					ArchiveSource::Keep(archive.clone().into()),
-					&destination,
-					Some("wrong")
-				)
-				.await
-				.unwrap_err(),
-				ErrorKind::ArchiveWrongPassword,
-				"{name}"
-			);
+				.unwrap_err();
+				assert_eq!(failed.error.kind(), kind, "{name} with {given:?}");
+				assert!(
+					failed.report.top_level.is_empty(),
+					"{name} with {given:?}: nothing created"
+				);
+			}
 		}
 		let report = extract(
 			&client,
@@ -372,7 +425,7 @@ async fn every_format_family_round_trips_through_the_drive() {
 			password,
 		)
 		.await
-		.unwrap_or_else(|kind| panic!("extracting {name}: {kind:?}"));
+		.unwrap_or_else(|failed| panic!("extracting {name}: {}", failed.error));
 		let folder = created_folder(&report);
 		assert_eq!(folder.name(), Some("bundle"), "{name}");
 		let (dirs, extracted) = contents(&client, &folder).await;
@@ -382,9 +435,9 @@ async fn every_format_family_round_trips_through_the_drive() {
 			&client,
 			&extracted,
 			[
-				("source/big.bin", &files[0]),
-				("source/notes.txt", &files[1]),
-				("source/sub/empty", &files[2]),
+				("source/big.bin", &big),
+				("source/notes.txt", &notes),
+				("source/sub/empty", &empty),
 			],
 		)
 		.await;
@@ -406,9 +459,7 @@ async fn sources_are_trashed_and_the_archive_deleted_once_verified() {
 		&client,
 		CompressSources::Dispose {
 			how: SourceDisposal::Trash,
-			items: vec![NonRootItemType::Dir(std::borrow::Cow::Owned(
-				source.clone(),
-			))],
+			items: vec![NonRootItemType::Dir(Cow::Owned(source.clone()))],
 		},
 		&destination,
 		"bundle.tar",
@@ -518,7 +569,7 @@ async fn archives_of_several_chunks_keep_their_hash_and_contents() {
 		.await
 		.0;
 		assert!(
-			archive.size() > 2 * CHUNK_SIZE as u64,
+			archive.size() > 2 * CHUNK_SIZE_U64,
 			"{name} spans three chunks: {} bytes",
 			archive.size()
 		);
@@ -537,7 +588,7 @@ async fn archives_of_several_chunks_keep_their_hash_and_contents() {
 			None,
 		)
 		.await
-		.unwrap_or_else(|kind| panic!("extracting {name}: {kind:?}"));
+		.unwrap_or_else(|failed| panic!("extracting {name}: {}", failed.error));
 		let (_, extracted) = contents(&client, &created_folder(&report)).await;
 		assert_same_files(
 			&client,
@@ -651,7 +702,7 @@ async fn linked_sources_compress_and_a_linked_archive_extracts() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
-	let (source, files) = tree(&client, test_dir).await;
+	let (source, [big, notes, empty]) = tree(&client, test_dir).await;
 	let loose = upload(&client, test_dir, "loose.txt", b"a linked file").await;
 	let linked_source = dir_link_info(&client, &source).await;
 	let destination = client.create_dir(&test_dir.into(), "linked").await.unwrap();
@@ -691,9 +742,9 @@ async fn linked_sources_compress_and_a_linked_archive_extracts() {
 		&client,
 		&extracted,
 		[
-			("source/big.bin", &files[0]),
-			("source/notes.txt", &files[1]),
-			("source/sub/empty", &files[2]),
+			("source/big.bin", &big),
+			("source/notes.txt", &notes),
+			("source/sub/empty", &empty),
 			("loose.txt", &loose),
 		],
 	)
@@ -755,7 +806,7 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
-	let (source, files) = tree(&client, test_dir).await;
+	let (source, [big, notes, empty]) = tree(&client, test_dir).await;
 	let readme = upload(&client, test_dir, "Readme.txt", b"read me").await;
 	let archives = client
 		.create_dir(&test_dir.into(), "archives")
@@ -838,9 +889,9 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 		&client,
 		&extracted,
 		[
-			("source (1)/big.bin", &files[0]),
-			("source (1)/notes.txt", &files[1]),
-			("source (1)/sub/empty", &files[2]),
+			("source (1)/big.bin", &big),
+			("source (1)/notes.txt", &notes),
+			("source (1)/sub/empty", &empty),
 			("Readme (1).txt", &readme),
 		],
 	)
@@ -870,9 +921,9 @@ async fn extracting_keeps_both_where_a_name_is_taken() {
 		&client,
 		&extracted,
 		[
-			("source/big.bin", &files[0]),
-			("source/notes.txt", &files[1]),
-			("source/sub/empty", &files[2]),
+			("source/big.bin", &big),
+			("source/notes.txt", &notes),
+			("source/sub/empty", &empty),
 			("Readme.txt", &readme),
 		],
 	)
@@ -887,9 +938,9 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
-	let (source, files) = tree(&client, test_dir).await;
+	let (source, [big, notes, _]) = tree(&client, test_dir).await;
 	let destination = client.create_dir(&test_dir.into(), "listed").await.unwrap();
-	let big = files[0].size();
+	let big = big.size();
 	let expected = [
 		("source", &ArchiveEntryKind::Dir),
 		("source/big.bin", &ArchiveEntryKind::File),
@@ -901,7 +952,7 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 		entries: 5,
 		dirs: 2,
 		files: 3,
-		bytes: big + files[1].size(),
+		bytes: big + notes.size(),
 		skipped: 0,
 		bytes_skipped: 0,
 	};
@@ -956,7 +1007,7 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 		let archive = compress_source(name, format, password).await;
 		let listing = list(&client, archive.clone(), ExtractConfig::default())
 			.await
-			.unwrap_or_else(|kind| panic!("listing {name}: {kind:?}"));
+			.unwrap_or_else(|failed| panic!("listing {name}: {}", failed.error));
 		assert_eq!(listing.format, Some(listed_as), "{name}");
 		assert_eq!(outline(&listing), expected, "{name}");
 		assert_eq!(entry(&listing, "source/big.bin").size, Some(big), "{name}");
@@ -974,7 +1025,7 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 		] {
 			let listing = list(&client, archive.clone(), with_password(Some(given)))
 				.await
-				.unwrap_or_else(|kind| panic!("listing {name} with {given}: {kind:?}"));
+				.unwrap_or_else(|failed| panic!("listing {name} with {given}: {}", failed.error));
 			assert_eq!(listing.password, check, "{name} with {given}");
 			assert_eq!(outline(&listing), expected, "{name} with {given}");
 		}
@@ -997,7 +1048,9 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 		assert_eq!(
 			list(&client, hidden.clone(), with_password(given))
 				.await
-				.unwrap_err(),
+				.unwrap_err()
+				.error
+				.kind(),
 			kind,
 			"{given:?}"
 		);
@@ -1027,7 +1080,7 @@ async fn part_of_an_archive_extracts_below_its_base() {
 	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
 	let client = resources.client.clone();
 	let test_dir = &resources.dir;
-	let (source, files) = tree(&client, test_dir).await;
+	let (source, [_, notes, empty]) = tree(&client, test_dir).await;
 	let archives = client
 		.create_dir(&test_dir.into(), "archives")
 		.await
@@ -1084,7 +1137,7 @@ async fn part_of_an_archive_extracts_below_its_base() {
 	assert_same_files(
 		&client,
 		&extracted,
-		[("notes.txt", &files[1]), ("sub/empty", &files[2])],
+		[("notes.txt", &notes), ("sub/empty", &empty)],
 	)
 	.await;
 
@@ -1117,7 +1170,7 @@ async fn part_of_an_archive_extracts_below_its_base() {
 		file_paths(&extracted),
 		["source/big.bin", "source/notes.txt", "source/sub/empty"]
 	);
-	assert_same_files(&client, &extracted, [("source/notes.txt", &files[1])]).await;
+	assert_same_files(&client, &extracted, [("source/notes.txt", &notes)]).await;
 }
 
 /// A tar's hard link is extracted as a copy of the file it names, a file of its own with the same
@@ -1148,7 +1201,15 @@ async fn a_tar_hard_link_is_extracted_as_a_copy_of_its_target() {
 	);
 	assert_eq!(hard.size, Some(2110), "as large as the file it names");
 	assert_eq!(hard.skip, None);
-	assert_eq!(entry(&listing, "tree/dir/link").skip, Some(symlink.clone()));
+	let link = entry(&listing, "tree/dir/link");
+	assert_eq!(
+		link.kind,
+		ArchiveEntryKind::Symlink {
+			target: "text.txt".to_owned(),
+		}
+	);
+	// a listed link's target is in its kind
+	assert_eq!(link.skip, Some(ListedSkipReason::Symlink));
 
 	let report = extract(&client, ArchiveSource::Keep(archive.into()), &links, None)
 		.await
@@ -1223,7 +1284,7 @@ async fn a_finder_zips_mac_metadata_is_left_out_unless_asked_for() {
 			metadata
 				.iter()
 				.all(|entry| entry.stored_path.starts_with("__MACOSX/")
-					&& (entry.skip == Some(ExtractSkipReason::MacMetadata)) == skip),
+					&& (entry.skip == Some(ListedSkipReason::MacMetadata)) == skip),
 			"skip {skip}: {metadata:?}"
 		);
 		let expected = listed_files(&listing);
@@ -1313,7 +1374,7 @@ async fn a_zip_of_zstd_entries_extracts() {
 	}
 }
 
-/// What the zip fixtures' script (`tests/fixtures/archives/zip/README.md`) calls `noise(seed, n)`:
+/// What the zip fixtures' script (`tests/fixtures/archives/zip/generate.sh`) calls `noise(seed, n)`:
 /// the high bits of a C `rand`-style linear congruential generator.
 fn fixture_noise(mut seed: u32, len: usize) -> Vec<u8> {
 	(0..len)

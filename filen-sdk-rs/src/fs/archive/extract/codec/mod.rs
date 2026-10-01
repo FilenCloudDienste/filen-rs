@@ -23,7 +23,7 @@ use crate::{
 		},
 		limits::display_path,
 		password::ArchivePassword,
-		tar_iter::TAR_BLOCK_LEN,
+		tar_iter::TAR_BLOCK,
 		worker::{
 			CachedInput, ChunkInput, EntryKind, WorkerEvent, WorkerPort, from_source,
 			send_file_data,
@@ -46,17 +46,17 @@ use zip::extract_zip;
 pub(crate) struct CodecLimits {
 	/// Memory for the decoder's state.
 	pub(crate) decoder_memory: u64,
-	/// Most tar headers read, every record counted.
+	/// Most members read, of any format; in a tar every record counts.
 	pub(crate) max_members: u64,
 	pub(crate) expansion: Option<ExpansionLimit>,
-	/// Most bytes of a zip's central directory read.
+	/// Most bytes of an archive's index (a zip's central directory, a 7z's header) read.
 	pub(crate) max_index_bytes: u64,
 	/// Storage free for the files, which an archive stating its sizes up front is refused for
 	/// before anything is created (see [`ExtractConfig::max_bytes`](super::ExtractConfig)).
 	pub(crate) max_bytes: Option<u64>,
 }
 
-/// A streaming archive to extract.
+/// An archive to extract.
 pub(crate) struct StreamJob {
 	/// The archive's file name, for the formats told by their extension and for naming the file
 	/// a single compressed file decodes to.
@@ -100,14 +100,14 @@ impl ArchiveEnd {
 
 /// Encrypted zip entries up to this size are read in full to check the password before anything
 /// is created; a larger smallest one is checked as it is extracted.
-const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
+pub(super) const PASSWORD_PROBE_BYTES: u64 = 16 << 20;
 
 /// Most a listing decodes of a 7z folder to read a symlink's target, or tell whether a reparse
 /// point is a link: a link past it (at the end of a solid block, say) is listed unread. For a
 /// zip, most of the archive it fetches for symlink targets, and most it holds of them.
 const LIST_READ_BYTES: u64 = 16 << 20;
 
-/// Reads a streaming archive through `port`, sending its entries. An error the driver caused
+/// Reads an archive through `port`, sending its entries. An error the driver caused
 /// (it went away, or a fetch failed and stopped the job) comes back as
 /// [`ErrorKind::Cancelled`]; the driver knows the real one.
 pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<ArchiveEnd, Error> {
@@ -141,7 +141,7 @@ pub(crate) fn extract_stream(port: &WorkerPort, job: StreamJob) -> Result<Archiv
 				limit: job.limits.expansion,
 				decoded: 0,
 			};
-			let mut block = [0u8; TAR_BLOCK_LEN];
+			let mut block = [0u8; TAR_BLOCK];
 			let block_len = read_full(&mut decoded, &mut block).map_err(read_failure)?;
 			let block = &block[..block_len];
 			// both refuse a block cut short. An empty tar decodes to its end-of-archive marker

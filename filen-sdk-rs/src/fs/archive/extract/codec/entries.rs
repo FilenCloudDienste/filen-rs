@@ -19,7 +19,7 @@ use crate::{
 			error::read_failure,
 			extract::{
 				ExtractSkipReason,
-				list::{ArchiveEntry, ArchiveEntryKind, ListedPath},
+				list::{ArchiveEntry, ArchiveEntryKind, ListedPath, ListedSkipReason},
 				report::ArchiveEntryId,
 			},
 			limits::display_path,
@@ -138,6 +138,7 @@ impl MacFolders {
 			return;
 		};
 		self.held.push(HeldMacFolder {
+			// a copy: judging only borrows `found`
 			stored: stored.clone(),
 			sent: HeldAs::Extracted {
 				skipped: found.skip_record(ExtractSkipReason::MacMetadata),
@@ -206,6 +207,7 @@ pub(super) fn found_path(stored: &str, rewritten: bool) -> Result<ArchivePath, P
 pub(super) fn symlink(target: Option<String>) -> (ArchiveEntryKind, Option<ExtractSkipReason>) {
 	let target = target.unwrap_or_default();
 	(
+		// both the kind and the skip show the target
 		ArchiveEntryKind::Symlink {
 			target: target.clone(),
 		},
@@ -286,7 +288,7 @@ impl Found<'_> {
 #[derive(Debug)]
 pub(super) enum Listed {
 	Extracted,
-	Skipped(ExtractSkipReason),
+	Skipped(ListedSkipReason),
 	/// Nothing: the directory is the root the others land in.
 	Root,
 	/// A folder in a `__MACOSX` folder, listed once every entry was
@@ -338,6 +340,8 @@ impl<'p> Walk<'p> {
 		max_members: u64,
 	) -> Self {
 		let mode = match task {
+			// a copy: the zip and 7z readers borrow the whole job the task is part of, so it
+			// cannot be moved out, and choosing advances the chooser
 			Task::Extract(selection) => Mode::Extract {
 				chooser: selection.clone().map(Chooser::new),
 			},
@@ -501,7 +505,7 @@ impl<'p> Walk<'p> {
 				}
 				HeldAs::Extracted { skipped, .. } => WorkerEvent::Skipped(skipped),
 				HeldAs::Listed(mut entry) => {
-					entry.skip = (!create).then_some(ExtractSkipReason::MacMetadata);
+					entry.skip = (!create).then_some(ListedSkipReason::MacMetadata);
 					WorkerEvent::Listed(entry)
 				}
 			})?;
@@ -555,18 +559,15 @@ impl<'p> Walk<'p> {
 				(linked, false)
 			}
 		};
-		let skip = match &found.unreadable {
-			// the target is the kind's already
-			Some(ExtractSkipReason::Symlink { .. }) => Some(ExtractSkipReason::Symlink {
-				target: String::new(),
-			}),
-			Some(ExtractSkipReason::Hardlink { .. }) => Some(ExtractSkipReason::Hardlink {
-				target: String::new(),
-			}),
-			other => other.clone(),
-		}
-		.or_else(|| found.path.as_ref().err().map(|e| path_skip_reason(*e)))
-		.or((left_out && self.skip_mac_metadata).then_some(ExtractSkipReason::MacMetadata));
+		let skip = found
+			.unreadable
+			.as_ref()
+			.map(ListedSkipReason::from)
+			.or_else(|| {
+				let rejection = *found.path.as_ref().err()?;
+				Some((&path_skip_reason(rejection)).into())
+			})
+			.or((left_out && self.skip_mac_metadata).then_some(ListedSkipReason::MacMetadata));
 		let (stored_path, stored_path_truncated) = display_path(found.stored);
 		let path = found.path.as_ref().ok();
 		let entry = ArchiveEntry {
@@ -586,16 +587,16 @@ impl<'p> Walk<'p> {
 			mac_metadata,
 			kind: found.kind,
 		};
-		if held && let Some(stored) = path {
+		if held && let Ok(stored) = found.path {
 			self.mac_folders.held.push(HeldMacFolder {
-				stored: stored.clone(),
+				stored,
 				sent: HeldAs::Listed(Box::new(entry)),
 			});
 			return Ok(Listed::Held);
 		}
 		let listed = match &entry.skip {
 			None => Listed::Extracted,
-			Some(reason) => Listed::Skipped(reason.clone()),
+			Some(reason) => Listed::Skipped(*reason),
 		};
 		self.port
 			.send(WorkerEvent::Listed(Box::new(entry)))
@@ -631,6 +632,7 @@ impl<'p> Walk<'p> {
 		&self,
 		files: impl Iterator<Item = (u64, &'e str, u64)>,
 	) -> u64 {
+		// a copy: choosing advances a chooser, and the walk's own must stay unused for the walk
 		let mut chooser = self.chooser().cloned();
 		files
 			.filter(|&(ordinal, stored, _)| {

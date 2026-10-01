@@ -4,7 +4,6 @@
 
 use super::*;
 
-/// Appends a tar hard link at `path` to the member at `target`.
 /// A hard link at `path` to the file at `target`.
 fn hard_link<'a>(path: &'a str, target: &'a str) -> TarMember<'a> {
 	TarMember::HardLink { path, target }
@@ -114,8 +113,7 @@ async fn link_after(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hard_link_copies_its_target_whenever_that_is_registered() {
-	// the file is registered before the link comes
+async fn a_hard_link_copies_a_file_registered_before_it() {
 	let setup = setup("bundle.tar", Vec::new(), |backend| {
 		backend.quirks.insert(Quirk::KeepUploads);
 	});
@@ -126,8 +124,10 @@ async fn a_hard_link_copies_its_target_whenever_that_is_registered() {
 	assert_eq!(report.counts.files_done, 2);
 	let files = finished(&setup);
 	assert_eq!(files["bundle/a.txt"], files["bundle/b.txt"]);
+}
 
-	// the link comes while the file is being registered, and waits for it
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hard_link_waits_for_the_file_being_registered_when_it_comes() {
 	let setup = setup_registering();
 	let report = link_after(&setup, |setup| !setup.backend.log().held_named.is_empty())
 		.await
@@ -144,22 +144,23 @@ fn setup_registering() -> Setup {
 	})
 }
 
+/// Whether `report` skipped just the link `b.txt` to `a.txt`.
+fn skipped_link(report: &ExtractReport) -> bool {
+	report
+		.skipped
+		.iter()
+		.map(|skipped| (skipped.path.clone(), skipped.reason.clone()))
+		.collect::<Vec<_>>()
+		== [(
+			"b.txt".to_owned(),
+			ExtractSkipReason::Hardlink {
+				target: "a.txt".into(),
+			},
+		)]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hard_link_to_a_file_that_failed_is_skipped() {
-	let skipped_link = |report: &ExtractReport| {
-		report
-			.skipped
-			.iter()
-			.map(|skipped| (skipped.path.clone(), skipped.reason.clone()))
-			.collect::<Vec<_>>()
-			== [(
-				"b.txt".to_owned(),
-				ExtractSkipReason::Hardlink {
-					target: "a.txt".into(),
-				},
-			)]
-	};
-	// failed before the link comes
+async fn a_hard_link_to_a_file_that_failed_before_it_is_skipped() {
 	let failed = setup("bundle.tar", Vec::new(), |backend| {
 		backend
 			.fail_upload
@@ -172,8 +173,10 @@ async fn a_hard_link_to_a_file_that_failed_is_skipped() {
 	.unwrap();
 	assert!(skipped_link(&report), "{:?}", report.skipped);
 	assert!(finished_paths(&failed).is_empty());
+}
 
-	// failing to register while the link waits for it
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hard_link_to_a_file_failing_to_register_while_it_waits_is_skipped() {
 	let unregistered = setup("bundle.tar", Vec::new(), |backend| {
 		backend.hold_named(Request::Finish, ["a.txt"]);
 		backend
@@ -222,9 +225,11 @@ async fn hard_links_copy_no_more_than_the_expansion_limit_allows() {
 	let uploaded: u64 = finished(&bomb).values().map(|(size, ..)| size).sum();
 	assert!(uploaded <= 12 << 20, "{uploaded} bytes uploaded");
 	assert_released(&bomb, &job.reporter, &job.recorder);
+}
 
-	// with no limit, every link is copied
-	let unlimited = setup("links.tar", tar_with_links(&data[..10], 400), |_| {});
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_expansion_limit_every_hard_link_is_copied() {
+	let unlimited = setup("links.tar", tar_with_links(&pattern(10, 3), 400), |_| {});
 	let job = start(
 		&unlimited,
 		Options {
@@ -623,10 +628,9 @@ async fn links_past_a_tight_limit_end_the_job_with_what_they_created() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hard_link_to_mac_metadata_is_left_out_as_metadata() {
-	let apple_double = [&[0x00, 0x05, 0x16, 0x07][..], b"\x00\x02\x00\x00"].concat();
 	let tar = tar_with(&[
 		TarMember::Data("a.txt", b"alpha"),
-		TarMember::Data("__MACOSX/._a.txt", &apple_double),
+		TarMember::Data("__MACOSX/._a.txt", &APPLE_DOUBLE),
 		// a copy of metadata left out is left out; a copy of a file of the user's is extracted,
 		// in a __MACOSX folder or not
 		hard_link("__MACOSX/._b.txt", "__MACOSX/._a.txt"),

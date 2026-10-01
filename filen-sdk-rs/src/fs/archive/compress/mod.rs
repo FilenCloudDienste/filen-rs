@@ -9,6 +9,24 @@
 //!
 //! [`ArchiveConfig::job_concurrency`]: super::ArchiveConfig::job_concurrency
 
+use std::ops::RangeInclusive;
+
+use filen_macros::js_type;
+
+use crate::{
+	Error, ErrorKind,
+	fs::{
+		archive::dispose::SourceDisposal,
+		categories::{NonRootItemType, Normal},
+		drive_job::listing::ItemSource,
+	},
+};
+
+use super::{
+	AesStrength, ArchiveFormat, ArchivePassword, Compression, SevenZEncryption, SevenZMethod,
+	StreamCodec, ZipMethod, format::match_extension,
+};
+
 mod client_impl;
 mod codec;
 mod engine;
@@ -19,26 +37,6 @@ pub use client_impl::{CompressConfig, CompressRequest};
 pub use report::{
 	CompressActiveFile, CompressCallback, CompressCounts, CompressEvent, CompressFailed,
 	CompressPhase, CompressReport, CompressUpdate, HashMismatch,
-};
-
-use std::ops::RangeInclusive;
-
-use filen_macros::js_type;
-
-use crate::{
-	Error, ErrorKind,
-	fs::{
-		archive::dispose::SourceDisposal,
-		categories::{NonRootItemType, Normal},
-	},
-};
-
-pub use super::{encode::Compression, zip::write::ZipMethod};
-pub use crate::fs::drive_job::listing::ItemSource;
-
-use super::{
-	AesStrength, ArchiveFormat, ArchivePassword, SevenZEncryption, SevenZMethod, StreamCodec,
-	format::match_extension,
 };
 
 /// What to compress, and whether to remove it afterwards.
@@ -455,7 +453,12 @@ mod tests {
 	use filen_types::fs::Uuid;
 
 	use super::*;
-	use crate::fs::drive_job::test_support::remote_file;
+	use crate::fs::{
+		archive::test_support::archive_password, drive_job::test_support::remote_file,
+	};
+
+	/// The smallest codec budget a platform runs jobs with: iOS's and wasm's.
+	const SMALLEST_BUDGET: u64 = 128 << 20;
 
 	fn compression(codec: StreamCodec) -> Compression {
 		Compression { codec, level: None }
@@ -496,7 +499,7 @@ mod tests {
 		assert_eq!(zip(ZipMethod::Stored, None).extension(), ".zip");
 		assert_eq!(zip(ZipMethod::Stored, None).check_name("a.ZIP").unwrap(), 4);
 		assert!(zip(ZipMethod::Stored, None).check_name("a.7z").is_err());
-		let password = || Some(ArchivePassword::new("pw".to_owned()).unwrap());
+		let password = || Some(archive_password("pw"));
 		zip(ZipMethod::Stored, None).check(None).unwrap();
 		let checked = zip(ZipMethod::Deflate { level: 9 }, aes)
 			.check(password())
@@ -553,7 +556,6 @@ mod tests {
 
 	#[test]
 	fn a_formats_default_level_is_one_it_takes_and_fits_every_budget() {
-		const SMALLEST_BUDGET: u64 = 128 << 20;
 		let zip = |method| CompressFormat::Zip {
 			method,
 			encryption: None,
@@ -636,7 +638,6 @@ mod tests {
 
 	#[test]
 	fn a_formats_levels_and_what_fits_a_budget_are_known_up_front() {
-		const SMALLEST_BUDGET: u64 = 128 << 20;
 		let tar = |codec| CompressFormat::Tar {
 			compression: Some(compression(codec)),
 		};
@@ -708,10 +709,7 @@ mod tests {
 		);
 		assert_eq!(
 			deflate
-				.check_within(
-					Some(ArchivePassword::new("pw".to_owned()).unwrap()),
-					SMALLEST_BUDGET,
-				)
+				.check_within(Some(archive_password("pw")), SMALLEST_BUDGET,)
 				.unwrap_err()
 				.kind(),
 			ErrorKind::InvalidState,
@@ -721,8 +719,6 @@ mod tests {
 
 	#[test]
 	fn every_formats_default_fits_the_smallest_codec_budget() {
-		// iOS and wasm budget 128 MiB for a job's codec
-		const SMALLEST_BUDGET: u64 = 128 << 20;
 		let codecs = [
 			StreamCodec::Gzip,
 			StreamCodec::Bzip2,

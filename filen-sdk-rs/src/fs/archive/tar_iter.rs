@@ -24,9 +24,9 @@ use crate::{Error, ErrorKind, fs::drive_job::exceeds_limit};
 use super::{bytes::read_full, error::read_failure, format::is_tar_header};
 
 /// Bytes of a tar block: headers, and member data padded to a whole number of them.
-pub(crate) const TAR_BLOCK_LEN: usize = 512;
-/// [`TAR_BLOCK_LEN`] as a size in a stream.
-pub(crate) const TAR_BLOCK: u64 = TAR_BLOCK_LEN as u64;
+pub(crate) const TAR_BLOCK: usize = 512;
+/// [`TAR_BLOCK`] as a size in a stream.
+pub(crate) const TAR_BLOCK_U64: u64 = TAR_BLOCK as u64;
 /// Bytes of a ustar header's name field; a longer path needs a GNU long-name or PAX record.
 pub(crate) const USTAR_NAME_LEN: usize = 100;
 /// Largest GNU long name or long link record read.
@@ -317,8 +317,8 @@ impl<R: Read> TarReader<R> {
 
 	/// The next header block, or `None` at the end-of-archive marker or a stream that ends at a
 	/// block boundary.
-	fn read_header_block(&mut self) -> Result<Option<[u8; TAR_BLOCK_LEN]>, TarError> {
-		let mut block = [0u8; TAR_BLOCK_LEN];
+	fn read_header_block(&mut self) -> Result<Option<[u8; TAR_BLOCK]>, TarError> {
+		let mut block = [0u8; TAR_BLOCK];
 		let read = read_full(&mut self.inner, &mut block)?;
 		if read == 0 {
 			return Ok(None);
@@ -371,7 +371,7 @@ impl<R: Read> TarReader<R> {
 				return Err(TarError::Corrupt("a sparse member's map is too long"));
 			}
 			let mut block = GnuExtSparseHeader::new();
-			if read_full(&mut self.inner, block.as_mut_bytes())? != TAR_BLOCK_LEN {
+			if read_full(&mut self.inner, block.as_mut_bytes())? != TAR_BLOCK {
 				return Err(TarError::Corrupt("a sparse member's map ends early"));
 			}
 			extended = block.isextended[0] != 0;
@@ -381,7 +381,7 @@ impl<R: Read> TarReader<R> {
 }
 
 fn padding(size: u64) -> u64 {
-	(TAR_BLOCK - size % TAR_BLOCK) % TAR_BLOCK
+	(TAR_BLOCK_U64 - size % TAR_BLOCK_U64) % TAR_BLOCK_U64
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), TarError> {
@@ -495,12 +495,12 @@ mod tests {
 	use super::*;
 	use crate::fs::archive::{
 		format::TAR_CHECKSUM,
-		test_support::{damaged_copies, tar_checksummed},
+		test_support::{damaged_copies, tar_checksummed, tar_members},
 	};
 
 	/// A tar header block of `kind` for `name` with `size`, checksummed.
-	fn header(name: &[u8], kind: u8, size: u64) -> [u8; 512] {
-		let mut block = [0u8; 512];
+	fn header(name: &[u8], kind: u8, size: u64) -> [u8; TAR_BLOCK] {
+		let mut block = [0u8; TAR_BLOCK];
 		block[..name.len()].copy_from_slice(name);
 		block[100..108].copy_from_slice(b"0000644\0");
 		block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
@@ -512,7 +512,7 @@ mod tests {
 	}
 
 	/// `header` with the old GNU magic, as GNU tar writes for its own extensions.
-	fn gnu_header(name: &[u8], kind: u8, size: u64) -> [u8; 512] {
+	fn gnu_header(name: &[u8], kind: u8, size: u64) -> [u8; TAR_BLOCK] {
 		let mut block = header(name, kind, size);
 		block[257..265].copy_from_slice(b"ustar  \0");
 		tar_checksummed(block)
@@ -520,7 +520,7 @@ mod tests {
 
 	fn padded(data: &[u8]) -> Vec<u8> {
 		let mut out = data.to_vec();
-		out.resize(data.len().div_ceil(512) * 512, 0);
+		out.resize(data.len().div_ceil(TAR_BLOCK) * TAR_BLOCK, 0);
 		out
 	}
 
@@ -538,32 +538,15 @@ mod tests {
 		format!("{len}{body}")
 	}
 
-	fn read_all(reader: &mut TarReader<&[u8]>) -> Vec<(TarMember, Vec<u8>)> {
-		let mut out = Vec::new();
-		while let Some(member) = reader.next_member().unwrap() {
-			let mut data = Vec::new();
-			let mut buf = [0u8; 100];
-			loop {
-				let read = reader.read_body(&mut buf).unwrap();
-				if read == 0 {
-					break;
-				}
-				data.extend_from_slice(&buf[..read]);
-			}
-			out.push((member, data));
-		}
-		out
-	}
-
 	#[test]
 	fn members_and_their_data_are_read_in_order() {
 		let mut archive = Vec::new();
 		member(&mut archive, b"dir/", b'5', b"");
 		member(&mut archive, b"dir/a.txt", b'0', b"hello");
 		member(&mut archive, b"b.bin", b'0', &[7u8; 1000]);
-		archive.extend([0u8; 1024]);
+		archive.extend([0u8; 2 * TAR_BLOCK]);
 		let mut reader = TarReader::new(archive.as_slice(), 100);
-		let members = read_all(&mut reader);
+		let members = tar_members(&mut reader);
 		let summary: Vec<(&str, MemberKind, Vec<u8>)> = members
 			.iter()
 			.map(|(m, d)| (m.path.as_str(), m.kind.clone(), d.clone()))
@@ -610,7 +593,7 @@ mod tests {
 		member(&mut archive, b"truncated", b'0', b"data");
 		member(&mut archive, b"././@LongLink", b'K', b"target/of/link\0");
 		member(&mut archive, b"link", b'2', b"");
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let members = tar_members(&mut TarReader::new(archive.as_slice(), 100));
 		assert_eq!(members[0].0.path, long);
 		assert_eq!(members[0].1, b"data");
 		assert_eq!(
@@ -643,7 +626,7 @@ mod tests {
 		);
 		// POSIX lets a hard link in a pax archive carry the file's data
 		member(&mut archive, b"with-data", b'1', b"its own copy");
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let members = tar_members(&mut TarReader::new(archive.as_slice(), 100));
 		let links: Vec<(&str, &MemberKind, &[u8])> = members
 			.iter()
 			.map(|(m, d)| (m.path.as_str(), &m.kind, d.as_slice()))
@@ -704,8 +687,8 @@ mod tests {
 		// link is read as a header, and junk there is damage
 		let mut archive = Vec::new();
 		member(&mut archive, b"target", b'0', b"t");
-		archive.extend_from_slice(&header(b"link", b'1', 4 * 512));
-		archive.extend_from_slice(&[b'j'; 512]);
+		archive.extend_from_slice(&header(b"link", b'1', 4 * TAR_BLOCK_U64));
+		archive.extend_from_slice(&[b'j'; TAR_BLOCK]);
 		member(&mut archive, b"hidden", b'0', b"hidden");
 		member(&mut archive, b"after", b'0', b"a");
 		assert_eq!(
@@ -716,8 +699,8 @@ mod tests {
 			)
 		);
 		// nor can the end-of-archive marker right after a link be taken for its data
-		let mut archive = header(b"link", b'1', 512).to_vec();
-		archive.extend([0u8; 1024]);
+		let mut archive = header(b"link", b'1', TAR_BLOCK_U64).to_vec();
+		archive.extend([0u8; 2 * TAR_BLOCK]);
 		assert_eq!(walk(&archive), (sized(&[("link", 0)]), None));
 	}
 
@@ -732,16 +715,19 @@ mod tests {
 		pax(&mut archive, &pax_record("mtime", "1"));
 		member(&mut archive, b"first", b'0', b"a");
 		member(&mut archive, b"././@LongLink", b'K', b"target\0");
-		member(&mut archive, b"link", b'1', &[5u8; 512]);
+		member(&mut archive, b"link", b'1', &[5u8; TAR_BLOCK]);
 		member(&mut archive, b"after", b'0', b"z");
 		assert_eq!(
 			walk(&archive),
-			(sized(&[("first", 1), ("link", 512), ("after", 1)]), None)
+			(
+				sized(&[("first", 1), ("link", TAR_BLOCK_U64), ("after", 1)]),
+				None
+			)
 		);
 		// a GNU header after it makes the archive GNU again
 		let mut archive = Vec::new();
 		pax(&mut archive, &pax_record("mtime", "1"));
-		archive.extend_from_slice(&gnu_header(b"link", b'1', 512));
+		archive.extend_from_slice(&gnu_header(b"link", b'1', TAR_BLOCK_U64));
 		member(&mut archive, b"after", b'0', b"z");
 		assert_eq!(walk(&archive), (sized(&[("link", 0), ("after", 1)]), None));
 		// but a link's own PAX `size` holds on any header, as libarchive applies it last
@@ -764,7 +750,7 @@ mod tests {
 		archive.extend_from_slice(&header(b"shortname", b'0', 0));
 		archive.extend(padded(&data));
 		member(&mut archive, b"after", b'0', b"z");
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let members = tar_members(&mut TarReader::new(archive.as_slice(), 100));
 		assert_eq!(members.len(), 2);
 		assert_eq!(members[0].0.path, "real/name.bin");
 		assert_eq!(members[0].1, data);
@@ -798,7 +784,7 @@ mod tests {
 		header.set_cksum();
 		assert_eq!(header.as_old().size[0] & 0x80, 0x80, "written in base-256");
 		let mut archive = header.as_bytes().to_vec();
-		archive.extend_from_slice(&[5u8; 1024]);
+		archive.extend_from_slice(&[5u8; 2 * TAR_BLOCK]);
 		let mut reader = TarReader::new(archive.as_slice(), 100);
 		assert_eq!(reader.next_member().unwrap().unwrap().size, size);
 		// the data it promises is not there
@@ -839,7 +825,7 @@ mod tests {
 		member(&mut archive, b"./GNUSparseFile.1/vm.img", b'0', b"map+data");
 		archive.extend_from_slice(&gnu_header(b"old-sparse", b'S', 4));
 		archive.extend(padded(b"data"));
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let members = tar_members(&mut TarReader::new(archive.as_slice(), 100));
 		assert_eq!(members[0].0.kind, MemberKind::Sparse);
 		assert_eq!(members[1].0.kind, MemberKind::Sparse);
 	}
@@ -921,10 +907,10 @@ mod tests {
 		let mut sparse = gnu_header(b"s", b'S', 4);
 		sparse[482] = 1;
 		archive.extend_from_slice(&tar_checksummed(sparse));
-		archive.extend_from_slice(&[0u8; 512]);
+		archive.extend_from_slice(&[0u8; TAR_BLOCK]);
 		archive.extend(padded(b"data"));
 		member(&mut archive, b"dir/", b'5', b"");
-		archive.extend([0u8; 1024]);
+		archive.extend([0u8; 2 * TAR_BLOCK]);
 
 		let walk = |archive: &[u8]| {
 			let mut reader = TarReader::new(archive, 100);
@@ -938,10 +924,11 @@ mod tests {
 		};
 		assert_eq!(walk(&archive), ["p/q.txt", "a/long/name", "s", "dir/"]);
 		for (at, bit, mut damaged) in damaged_copies(&archive, 0..archive.len()) {
-			let block = at / 512 * 512;
+			let block = at / TAR_BLOCK * TAR_BLOCK;
 			// a header whose checksum no longer matches is refused before it is parsed, so
 			// the damaged header gets a matching checksum to reach its fields
-			let header: &mut [u8; 512] = (&mut damaged[block..block + 512]).try_into().unwrap();
+			let header: &mut [u8; TAR_BLOCK] =
+				(&mut damaged[block..block + TAR_BLOCK]).try_into().unwrap();
 			if archive[block..].first_chunk().is_some_and(is_tar_header)
 				&& !TAR_CHECKSUM.contains(&(at - block))
 			{
@@ -956,7 +943,7 @@ mod tests {
 	fn non_utf8_paths_decode_as_latin1() {
 		let mut archive = Vec::new();
 		member(&mut archive, b"caf\xe9.txt", b'0', b"");
-		let members = read_all(&mut TarReader::new(archive.as_slice(), 100));
+		let members = tar_members(&mut TarReader::new(archive.as_slice(), 100));
 		assert_eq!(members[0].0.path, "café.txt");
 		assert!(members[0].0.path_rewritten);
 	}

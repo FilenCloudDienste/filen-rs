@@ -44,8 +44,8 @@ pub use extract::{
 	ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractRequest, ExtractRetry,
 	ExtractRoot, ExtractSkipReason, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
 	ExtractUpdate, ExtractWhat, ExtractedTopLevel, ListCallback, ListConfig, ListFailed, ListPhase,
-	ListReport, ListTotals, ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,
-	OmittedRecords, PasswordCheck,
+	ListReport, ListTotals, ListUpdate, ListedPath, ListedSkipReason, MAX_LISTED_BYTES,
+	MAX_LISTED_ENTRIES, OmittedRecords, PasswordCheck,
 };
 pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;

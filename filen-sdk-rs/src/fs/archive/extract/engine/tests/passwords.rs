@@ -19,13 +19,13 @@ async fn extracts_an_encrypted_zip_and_removes_it() {
 		Some("pw"),
 	);
 	// a zip's entries are checked one by one, so no hash of the whole archive is needed
-	let (setup, parent) = disposable(zip, None, |_| {});
+	let setup = disposable(zip, None, |_| {});
 	let options = Options {
 		dispose: Some(ArchiveDisposal::Remove {
 			how: SourceDisposal::DeletePermanently,
-			parent,
+			parent: ARCHIVE_PARENT,
 		}),
-		password: Some(ArchivePassword::new("pw".into()).unwrap()),
+		password: Some(archive_password("pw")),
 		..Options::default()
 	};
 	let job = start(&setup, options);
@@ -61,7 +61,7 @@ async fn a_zip_without_its_password_creates_nothing() {
 	assert_eq!(failed.error.kind(), ErrorKind::ArchivePasswordRequired);
 	assert!(created_dirs(&setup).is_empty());
 	let options = Options {
-		password: Some(ArchivePassword::new("nope".into()).unwrap()),
+		password: Some(archive_password("nope")),
 		..Options::default()
 	};
 	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
@@ -83,13 +83,13 @@ async fn extracts_an_encrypted_7z_and_removes_it() {
 		Some((SevenZEncryption::EntriesAndHeaders, "pw")),
 	);
 	// a 7z's entries are checked one by one, so no hash of the whole archive is needed
-	let (setup, parent) = disposable(archive, None, |_| {});
+	let setup = disposable(archive, None, |_| {});
 	let options = Options {
 		dispose: Some(ArchiveDisposal::Remove {
 			how: SourceDisposal::DeletePermanently,
-			parent,
+			parent: ARCHIVE_PARENT,
 		}),
-		password: Some(ArchivePassword::new("pw".into()).unwrap()),
+		password: Some(archive_password("pw")),
 		..Options::default()
 	};
 	let job = start(&setup, options);
@@ -124,7 +124,7 @@ async fn a_7z_with_a_wrong_password_creates_nothing() {
 	);
 	let setup = setup("s.7z", archive, |_| {});
 	let options = Options {
-		password: Some(ArchivePassword::new("nope".into()).unwrap()),
+		password: Some(archive_password("nope")),
 		..Options::default()
 	};
 	let failed = start(&setup, options).running.await.unwrap().unwrap_err();
@@ -153,13 +153,16 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 		.expect("the header's AES coder");
 	archive[at + 5] = 0xC0 | MAX_CYCLES_POWER;
 	// the start header's CRC-32 of the header, then its own
-	let next =
-		32 + usize::try_from(u64::from_le_bytes(archive[12..20].try_into().unwrap())).unwrap();
-	let len = usize::try_from(u64::from_le_bytes(archive[20..28].try_into().unwrap())).unwrap();
+	let start_len = START_HEADER_LEN;
+	let field = |at: usize| {
+		usize::try_from(u64::from_le_bytes(archive[at..at + 8].try_into().unwrap())).unwrap()
+	};
+	let next = start_len + field(START_FIELDS_AT);
+	let len = field(START_FIELDS_AT + 8);
 	let crc = crc32fast::hash(&archive[next..next + len]);
-	archive[28..32].copy_from_slice(&crc.to_le_bytes());
-	let crc = crc32fast::hash(&archive[12..32]);
-	archive[8..12].copy_from_slice(&crc.to_le_bytes());
+	archive[START_FIELDS_AT + 16..start_len].copy_from_slice(&crc.to_le_bytes());
+	let crc = crc32fast::hash(&archive[START_FIELDS_AT..start_len]);
+	archive[START_CRC_AT..START_FIELDS_AT].copy_from_slice(&crc.to_le_bytes());
 
 	let setup = setup("slow.7z", archive, |_| {});
 	let (_pause, cancel, control) = controls();
@@ -168,7 +171,7 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 		let codec = Arc::clone(&codec);
 		let options = Options {
 			control,
-			password: Some(ArchivePassword::new(password).unwrap()),
+			password: Some(archive_password(&password)),
 			..Options::default()
 		};
 		let job = stream_job(&setup, &options);
@@ -186,7 +189,7 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 	let shared = codec.lock().unwrap().take().unwrap();
 	// the codec shows it is alive while it derives, which exchanges nothing with the driver:
 	// past the two exchanges each of the archive's chunks takes
-	let fetching = 2 * setup.archive.size().div_ceil(CHUNK_SIZE as u64);
+	let fetching = 2 * setup.archive.size().div_ceil(CHUNK_SIZE_U64);
 	wait_until("the codec derives the key", || shared.progress() > fetching).await;
 	cancel.send_replace(true);
 	let failed = job.running.await.unwrap().unwrap_err();
@@ -208,7 +211,10 @@ async fn a_cancel_stops_a_codec_deriving_a_7z_key() {
 async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	// too large (incompressible, so compressed too) to check the password on up front: it
 	// shows once the entry is opened
-	let big = incompressible(17 << 20, 0x9E37_79B9_7F4A_7C15);
+	let big = incompressible(
+		usize::try_from(PASSWORD_PROBE_BYTES).unwrap() + (1 << 20),
+		0x9E37_79B9_7F4A_7C15,
+	);
 	let zip = zip_of(
 		&[("docs", None), ("docs/big.bin", Some(&big))],
 		Some("right"),
@@ -218,7 +224,7 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 		backend.quirks.insert(Quirk::ReverseChunks);
 	});
 	let options = Options {
-		password: Some(ArchivePassword::new("wrong".into()).unwrap()),
+		password: Some(archive_password("wrong")),
 		..Options::default()
 	};
 	let job = start(&setup, options);
@@ -257,13 +263,10 @@ async fn a_wrong_password_found_late_trashes_the_directories_it_left() {
 	);
 	let trashed: Vec<Uuid> = job
 		.recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.flat_map(|update| &update.events)
+		.events()
+		.into_iter()
 		.filter_map(|event| match event {
-			ExtractEvent::TopLevelTrashed { dest_uuid } => Some(*dest_uuid),
+			ExtractEvent::TopLevelTrashed { dest_uuid } => Some(dest_uuid),
 			_ => None,
 		})
 		.collect();

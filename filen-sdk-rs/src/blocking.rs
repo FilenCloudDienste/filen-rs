@@ -123,8 +123,8 @@ mod panic_reports {
 ///   fresh wasm module and its thread state in the shared linear memory that is never returned to
 ///   the host, and retains the worker's JS wrapper for the life of the spawning thread. A worker
 ///   per job would grow exactly the memory these jobs are budgeted to bound. A replacement is
-///   spawned only when the previous worker is retired for going silent (see
-///   [`WorkerSlot::retire`]).
+///   spawned only when the previous worker is retired: for a job that panicked (which traps the
+///   worker), or for going silent (see [`WorkerSlot::retire`]).
 ///
 /// Parking there is legal: `wasm-full` builds with `+atomics`, where `std` selects the futex
 /// parker, and the worker is a dedicated one rather than the JS main thread.

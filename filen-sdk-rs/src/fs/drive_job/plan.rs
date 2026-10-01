@@ -403,13 +403,13 @@ fn allocate_name(
 	taken: &mut TakenNames,
 	uuid: Uuid,
 	name: Option<&str>,
-	is_dir: bool,
+	shape: NameShape,
 ) -> (ValidatedName, Option<RenameReason>) {
 	let uuid_name =
 		|| ValidatedName::try_from(uuid.to_string().as_str()).expect("a uuid is a valid name");
 	let by_uuid = |taken: &mut TakenNames| {
 		taken
-			.allocate(uuid_name(), shape(is_dir))
+			.allocate(uuid_name(), shape)
 			.unwrap_or_else(|_| uuid_name())
 	};
 	let Some(name) = name else {
@@ -422,7 +422,7 @@ fn allocate_name(
 	let encoded = matches!(source_name, SourceName::Encoded(_));
 	let valid = source_name.into_name();
 	// Kept to tell a keep-both rename from the name itself.
-	let Ok(allocated) = taken.allocate(valid.clone(), shape(is_dir)) else {
+	let Ok(allocated) = taken.allocate(valid.clone(), shape) else {
 		return (by_uuid(taken), Some(RenameReason::InvalidName));
 	};
 	let reason = if allocated != valid {
@@ -433,15 +433,6 @@ fn allocate_name(
 		None
 	};
 	(allocated, reason)
-}
-
-/// How keep-both numbers an item's name: a directory's whole, a file's before its extension.
-fn shape(is_dir: bool) -> NameShape {
-	if is_dir {
-		NameShape::Dir
-	} else {
-		NameShape::File
-	}
 }
 
 /// An item's segment of a source path: its name, or its uuid when its metadata could not be
@@ -496,7 +487,12 @@ impl<D> ItemPlan<D> {
 			});
 			return None;
 		}
-		let (name, reason) = allocate_name(taken, source_uuid, preferred.or(file.name()), false);
+		let (name, reason) = allocate_name(
+			taken,
+			source_uuid,
+			preferred.or(file.name()),
+			NameShape::File,
+		);
 		self.note_rename(source_uuid, &source_path, &name, reason, top_level);
 		self.files.push(PlannedFile {
 			request,
@@ -521,8 +517,12 @@ impl<D> ItemPlan<D> {
 		source_path: String,
 		top_level: bool,
 	) -> usize {
-		let (name, reason) =
-			allocate_name(taken, dir.uuid, preferred.or(dir.name.as_deref()), true);
+		let (name, reason) = allocate_name(
+			taken,
+			dir.uuid,
+			preferred.or(dir.name.as_deref()),
+			NameShape::Dir,
+		);
 		self.note_rename(dir.uuid, &source_path, &name, reason, top_level);
 		self.dirs.push(PlannedDir {
 			request,

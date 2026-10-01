@@ -4,36 +4,25 @@ use std::{
 	time::Duration,
 };
 
-use filen_types::{api::v3::dir::color::DirColor, crypto::EncryptedString, error::ResponseError};
+use filen_types::{crypto::EncryptedString, error::ResponseError};
 use tokio::task::JoinHandle;
 
 use super::*;
 use crate::{
-	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::drive_job::plan::{ItemPlanner, Listed, PlanRequest, PlanSource, SourceDir},
 	fs::{
 		copy::report::{CopyCallback, CopyUpdate, RunState},
 		dir::RootDirectory,
 		drive_job::{
 			name_retry::TOP_LEVEL_NAME_ATTEMPTS,
-			test_support::{FakeBackend, Quirk, Request, chunk_data, wait_until},
+			test_support::{
+				FakeBackend, Quirk, Request, source_dir, source_hash, stored_file, wait_until,
+			},
 		},
-		file::{
-			AnonymousRemoteFile,
-			enums::RemoteFileType,
-			meta::{DecryptedFileMeta, FileMeta},
-		},
+		file::{enums::RemoteFileType, meta::FileMeta},
 	},
 	job::test_support::controls,
 };
-
-fn file_hash(uuid: Uuid, size: u64) -> Blake3Hash {
-	let mut hasher = blake3::Hasher::new();
-	for index in 0..size.div_ceil(CHUNK_SIZE_U64) {
-		hasher.update(&chunk_data(uuid, index, size));
-	}
-	Blake3Hash::from(hasher.finalize())
-}
 
 fn source_file(name: &str, size: u64) -> RemoteFileType<'static> {
 	source_file_with_chunks(name, size, size.div_ceil(CHUNK_SIZE_U64))
@@ -42,38 +31,8 @@ fn source_file(name: &str, size: u64) -> RemoteFileType<'static> {
 /// A source file whose stored chunk count is `chunks`.
 fn source_file_with_chunks(name: &str, size: u64, chunks: u64) -> RemoteFileType<'static> {
 	let uuid = Uuid::new_v4();
-	let meta = FileMeta::Decoded(DecryptedFileMeta {
-		name: Cow::Owned(name.to_owned()),
-		size,
-		mime: Cow::Borrowed("text/plain"),
-		key: FileKey::V3(EncryptionKey::generate()),
-		last_modified: Utc::now(),
-		created: None,
-		hash: Some(file_hash(uuid, size)),
-	});
-	let file: AnonymousRemoteFile = RemoteFile::from_meta(
-		uuid,
-		(),
-		Uuid::new_v4().into(),
-		size,
-		chunks,
-		"de-1",
-		"bucket",
-		Utc::now(),
-		false,
-		meta,
-	);
-	RemoteFileType::File(Cow::Owned(file))
-}
-
-fn source_dir(name: &str) -> SourceDir<()> {
-	SourceDir {
-		uuid: Uuid::new_v4(),
-		name: Some(name.to_owned()),
-		created: Some(Utc::now()),
-		color: DirColor::Blue,
-		handle: (),
-	}
+	let hash = source_hash(uuid, size);
+	stored_file(uuid, Uuid::new_v4(), name, size, chunks, Some(hash))
 }
 
 #[derive(Default)]
@@ -187,7 +146,7 @@ fn start(
 	(running, recorder, reporter)
 }
 
-/// Everything a finished job must have given back.
+/// No chunk was fetched or uploaded twice.
 fn assert_each_chunk_once(backend: &FakeBackend) {
 	let log = backend.log();
 	let fetched: HashSet<_> = log.fetched.iter().copied().collect();
@@ -261,7 +220,7 @@ async fn copies_a_tree_parent_first_with_every_chunk_once() {
 				.unwrap();
 			assert_eq!(completion.written, size);
 			assert_eq!(completion.num_chunks, size.div_ceil(CHUNK_SIZE_U64));
-			assert_eq!(completion.hash, file_hash(source.uuid(), size));
+			assert_eq!(completion.hash, source_hash(source.uuid(), size));
 		}
 		assert!(
 			!log.fetched
@@ -386,7 +345,7 @@ async fn copy_many(memory_chunks: usize, files: usize, chunks_per_file: u64) {
 			.values()
 			.find(|(name, _)| name == source.name().unwrap())
 			.unwrap();
-		assert_eq!(completion.hash, file_hash(source.uuid(), source.size()));
+		assert_eq!(completion.hash, source_hash(source.uuid(), source.size()));
 	}
 }
 
@@ -424,7 +383,7 @@ async fn hashes_chunks_in_order_when_they_complete_out_of_order() {
 		"chunks completed out of order"
 	);
 	let (_, completion) = log.finished.values().next().unwrap();
-	assert_eq!(completion.hash, file_hash(source.uuid(), source.size()));
+	assert_eq!(completion.hash, source_hash(source.uuid(), source.size()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -768,8 +727,8 @@ async fn cancel_during_file_copies_drops_transfers_and_keeps_finished_files() {
 	let destination = Uuid::new_v4();
 	let small = source_file("small", 10);
 	let big = source_file("big", 5 * CHUNK_SIZE_U64);
-	let mut backend = FakeBackend::new(destination);
-	backend.blocked_uploads.insert("big".to_owned());
+	let backend = FakeBackend::new(destination);
+	backend.hold_named(Request::Upload, ["big"]);
 	let backend = Arc::new(backend);
 	let (_pause, cancel, control) = controls();
 	let (running, recorder, reporter) = start(
@@ -842,7 +801,7 @@ async fn a_job_cancelled_during_file_copies_counts_what_it_never_copied() {
 	];
 	sources.extend((0..40).map(|i| source_file(&format!("later{i}"), 100)));
 	let mut backend = FakeBackend::new(destination);
-	backend.blocked_uploads.insert("big".to_owned());
+	backend.hold_named(Request::Upload, ["big"]);
 	backend.delay = Duration::from_secs(1);
 	let backend = Arc::new(backend);
 	let (_pause, cancel, control) = controls();
@@ -1796,7 +1755,7 @@ async fn a_hash_mismatch_is_logged_and_the_copy_kept() {
 	let (_, completion) = backend.log().finished.values().next().unwrap().clone();
 	assert_eq!(
 		completion.hash,
-		file_hash(source.uuid(), source.size()),
+		source_hash(source.uuid(), source.size()),
 		"the copy is registered with the hash of what was read"
 	);
 }

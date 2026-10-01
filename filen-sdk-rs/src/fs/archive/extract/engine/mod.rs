@@ -89,7 +89,7 @@ const MAX_UNCREATED_DIRS: usize = 16 * MAX_SMALL_PARALLEL_REQUESTS;
 
 /// File entries open (reading, uploading or waiting to be registered) past which the codec is
 /// kept waiting: an archive of empty or tiny files is read only as fast as they are registered.
-const MAX_OPEN_FILES: usize = 4 * MAX_SMALL_PARALLEL_REQUESTS;
+const MAX_OPEN_ENTRIES: usize = 4 * MAX_SMALL_PARALLEL_REQUESTS;
 
 /// What the codec returns.
 pub(crate) type CodecResult = Result<ArchiveEnd, Error>;
@@ -432,7 +432,7 @@ fn report_kept_on_early_end(
 /// Records `record` in `list`, or counts it in `omitted` past the records a report keeps (see
 /// [`keep`]); `record` back for its event while the report keeps them.
 fn record<T: Clone>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> Option<T> {
-	keep(list, omitted, record.clone()).then_some(record)
+	keep(list, omitted, &record).then_some(record)
 }
 
 impl<B: DisposalBackend> Driver<B> {
@@ -511,9 +511,10 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// Ends the job with `error`, unless an earlier error already did.
-	fn stop_with(&mut self, error: Error) {
+	fn stop_with(&mut self, error: Error) -> Stopped {
 		self.fatal
 			.stop(Arc::new(error), &self.control, &*self.reporter);
+		Stopped
 	}
 
 	fn entry_id(&self, ordinal: u64) -> ArchiveEntryId {
@@ -598,7 +599,7 @@ impl<B: DisposalBackend> Driver<B> {
 	/// Whether the codec waits for what it sent so far to be worked off first: hard links not
 	/// opened yet count as open files.
 	fn backlogged(&self) -> bool {
-		self.dirs.uncreated >= MAX_UNCREATED_DIRS || self.open_files() >= MAX_OPEN_FILES
+		self.dirs.uncreated >= MAX_UNCREATED_DIRS || self.open_files() >= MAX_OPEN_ENTRIES
 	}
 
 	/// Files open, and hard links taken on that will be.
@@ -749,7 +750,7 @@ impl<B: DisposalBackend> Driver<B> {
 		if !keep(
 			&mut self.report.top_level,
 			&mut self.report.omitted.top_level,
-			top.clone(),
+			&top,
 		) {
 			self.top_level_beyond.push((top.item.uuid(), is_dir));
 		}
@@ -787,19 +788,18 @@ impl<B: DisposalBackend> Driver<B> {
 		}
 	}
 
-	/// Counts an item against `max_items`; `false` once that ended the job.
-	fn count_item(&mut self) -> bool {
+	/// Counts an item against `max_items`; `Err` once that ended the job.
+	fn count_item(&mut self) -> Result<(), Stopped> {
 		self.items += 1;
 		if let Some(max) = self.max_items
 			&& exceeds_limit(self.items, max)
 		{
-			self.stop_with(Error::custom(
+			return Err(self.stop_with(Error::custom(
 				ErrorKind::ArchiveTooLarge,
 				format!("the archive holds more than {max} items"),
-			));
-			return false;
+			)));
 		}
-		true
+		Ok(())
 	}
 
 	fn on_skipped(&mut self, member: SkippedMember) {
@@ -824,12 +824,13 @@ impl<B: DisposalBackend> Driver<B> {
 	fn on_entry(&mut self, head: EntryHead) {
 		let entry = self.entry_id(head.ordinal);
 		self.report_path(entry, &head.path);
+		// a stop has recorded its error, and the run loop winds the job down
 		match head.kind {
 			EntryKind::Dir => {
-				self.resolve_dirs(head.path.segments(), entry, head.modified);
+				let _ = self.resolve_dirs(head.path.segments(), entry, head.modified);
 			}
 			EntryKind::File { size } => {
-				let Some(mut file) = self.new_file(head.ordinal, &head.path, size, head.modified)
+				let Ok(mut file) = self.new_file(head.ordinal, &head.path, size, head.modified)
 				else {
 					return;
 				};
@@ -882,24 +883,23 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	/// A file entry at `path`: its directories planned and a free name taken for it in the last;
-	/// `None` once the job ended.
+	/// `Err` once the job ended.
 	fn new_file(
 		&mut self,
 		ordinal: u64,
 		path: &ArchivePath,
 		size: Option<u64>,
 		modified: Option<DateTime<Utc>>,
-	) -> Option<NewFile> {
+	) -> Result<NewFile, Stopped> {
 		let entry = self.entry_id(ordinal);
 		let (name, parents) = path.split_last();
 		let parent = self.resolve_dirs(parents, entry, None)?;
-		if !self.count_item() {
-			return None;
-		}
+		self.count_item()?;
+		// a copy: the name is borrowed from the entry's path
 		let allocated = self.opened_mut().resolver.file_name(parent, name.clone());
 		// a keep-both name is reported once the file is registered, under the name it got then
 		match allocated {
-			Ok(name) => Some(NewFile {
+			Ok(name) => Ok(NewFile {
 				ordinal,
 				entry,
 				path: self.archive_joined(path.segments()),
@@ -910,10 +910,7 @@ impl<B: DisposalBackend> Driver<B> {
 				source: FileSource::Codec,
 				link_key: None,
 			}),
-			Err(error) => {
-				self.stop_with(error.into());
-				None
-			}
+			Err(error) => Err(self.stop_with(error.into())),
 		}
 	}
 }

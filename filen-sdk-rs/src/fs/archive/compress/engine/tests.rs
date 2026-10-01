@@ -18,7 +18,7 @@ use tokio::{
 use super::*;
 use crate::{
 	auth::http::ClientConfig,
-	consts::{CHUNK_SIZE, FULL_CHUNK_BYTES},
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 	fs::{
 		HasName,
 		archive::{
@@ -38,11 +38,13 @@ use crate::{
 			format::{ArchiveFormat, StreamCodec},
 			password::ArchivePassword,
 			sevenz::{
-				read::{FolderCursor, Keys, SevenZLimits, read_index},
+				read::{FolderCursor, Keys, read_index},
 				write::{SevenZEncryption, SevenZMethod},
 			},
-			tar_iter::TarReader,
-			test_support::{hash, pattern},
+			tar_iter::{TAR_BLOCK, TarReader},
+			test_support::{
+				READ_BACK_MEMORY, READ_BACK_SEVEN_Z, archive_password, hash, pattern, tar_members,
+			},
 			worker::{self, ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind},
 			zip::{crypto::AesStrength, write::ZipMethod},
 		},
@@ -225,37 +227,47 @@ struct Job {
 	reporter: MaybeArc<Reporter>,
 }
 
-fn start_with(
-	setup: &Setup,
-	name: &str,
+/// A job a test starts: the archive's name and format, and whatever else the test sets.
+struct Run {
+	name: &'static str,
 	format: CompressFormat,
 	control: JobControl,
 	max_bytes: Option<u64>,
-	start: CodecStart<CodecResult>,
-) -> Job {
-	start_disposing(
-		setup,
+	disposal: Option<(SourceDisposal, Vec<DisposalSource>)>,
+	report: CompressReport,
+	/// Starts in place of the real codec compressing the setup's entries in `format`.
+	codec: Option<CodecStart<CodecResult>>,
+}
+
+impl Run {
+	fn new(name: &'static str, format: CompressFormat) -> Self {
+		Self {
+			name,
+			format,
+			control: JobControl::default(),
+			max_bytes: None,
+			disposal: None,
+			report: CompressReport::default(),
+			codec: None,
+		}
+	}
+
+	/// An uncompressed `b.tar`.
+	fn tar() -> Self {
+		Self::new("b.tar", CompressFormat::Tar { compression: None })
+	}
+}
+
+fn start(setup: &Setup, run: Run) -> Job {
+	let Run {
 		name,
 		format,
 		control,
 		max_bytes,
-		start,
-		None,
-		CompressReport::default(),
-	)
-}
-
-#[expect(clippy::too_many_arguments)]
-fn start_disposing(
-	setup: &Setup,
-	name: &str,
-	format: CompressFormat,
-	control: JobControl,
-	max_bytes: Option<u64>,
-	start: CodecStart<CodecResult>,
-	disposal: Option<(SourceDisposal, Vec<DisposalSource>)>,
-	report: CompressReport,
-) -> Job {
+		disposal,
+		report,
+		codec,
+	} = run;
 	let recorder = Arc::new(Recorder {
 		memory: Some(Arc::clone(&setup.backend.memory)),
 		hold_when_created: Some(HoldWhenCreated {
@@ -268,11 +280,11 @@ fn start_disposing(
 	let reporter = Reporter::new(Arc::clone(&recorder));
 	let extension_len = format.check_name(name).unwrap();
 	let config = setup.config.clone();
+	let written = job(format, setup.entries.clone(), setup.password.clone());
 	let disposal = disposal.map(|(how, sources)| CompressDisposal {
 		removal: match how {
 			SourceDisposal::Trash => Removal::Trash,
 			SourceDisposal::DeletePermanently => {
-				let written = job(format, setup.entries.clone(), setup.password.clone());
 				let mut read_back = ReadBack::as_extracting(&written, &config);
 				if let Some(start) = setup.reader.lock().unwrap().take() {
 					read_back.start = start;
@@ -282,6 +294,8 @@ fn start_disposing(
 		},
 		sources,
 	});
+	let start = codec
+		.unwrap_or_else(|| Box::new(move || worker::start(move |port| compress(&port, written))));
 	let running = tokio::spawn(run_compress(CompressTask {
 		backend: Arc::clone(&setup.backend),
 		control,
@@ -328,24 +342,6 @@ fn job(
 	}
 }
 
-fn start(
-	setup: &Setup,
-	name: &str,
-	format: CompressFormat,
-	control: JobControl,
-	max_bytes: Option<u64>,
-) -> Job {
-	let job = job(format, setup.entries.clone(), None);
-	start_with(
-		setup,
-		name,
-		format,
-		control,
-		max_bytes,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-	)
-}
-
 fn gzip_tar() -> CompressFormat {
 	CompressFormat::Tar {
 		compression: Some(Compression {
@@ -370,23 +366,12 @@ fn uploaded(setup: &Setup, uuid: Uuid) -> Vec<u8> {
 fn members(archive: &[u8], codec: Option<StreamCodec>) -> Vec<(String, Vec<u8>)> {
 	let reader: Box<dyn Read> = match codec {
 		None => Box::new(archive),
-		Some(codec) => Box::new(open_stream(codec, archive, 64 << 20).unwrap()),
+		Some(codec) => Box::new(open_stream(codec, archive, READ_BACK_MEMORY).unwrap()),
 	};
-	let mut tar = TarReader::new(reader, 100);
-	let mut members = Vec::new();
-	while let Some(member) = tar.next_member().unwrap() {
-		let mut data = Vec::new();
-		let mut buf = [0u8; 4096];
-		loop {
-			let n = tar.read_body(&mut buf).unwrap();
-			if n == 0 {
-				break;
-			}
-			data.extend_from_slice(&buf[..n]);
-		}
-		members.push((member.path, data));
-	}
-	members
+	tar_members(&mut TarReader::new(reader, 100))
+		.into_iter()
+		.map(|(member, data)| (member.path, data))
+		.collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -397,13 +382,7 @@ async fn compresses_the_sources_into_one_new_file() {
 			unverified: false,
 		};
 	});
-	let job = start(
-		&setup,
-		"bundle.tar.gz",
-		gzip_tar(),
-		JobControl::default(),
-		None,
-	);
+	let job = start(&setup, Run::new("bundle.tar.gz", gzip_tar()));
 	let report = job.running.await.unwrap().unwrap();
 	let archive = report.archive.as_ref().unwrap();
 
@@ -465,13 +444,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		// the fake serves other bytes than the ones the metadata's hash is of
 		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
 	});
-	let job = start(
-		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-	);
+	let job = start(&setup, Run::tar());
 	let report = job.running.await.unwrap().unwrap();
 	assert_eq!(
 		report
@@ -499,7 +472,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 async fn an_archive_exactly_as_large_as_the_free_storage_fits() {
 	let tar = CompressFormat::Tar { compression: None };
 	let setup = setup(|_, _| {});
-	let size = start(&setup, "a.tar", tar, JobControl::default(), None)
+	let size = start(&setup, Run::new("a.tar", tar))
 		.running
 		.await
 		.unwrap()
@@ -507,25 +480,36 @@ async fn an_archive_exactly_as_large_as_the_free_storage_fits() {
 		.counts
 		.archive_bytes;
 
-	let exact = start(&setup, "b.tar", tar, JobControl::default(), Some(size));
+	let exact = start(
+		&setup,
+		Run {
+			max_bytes: Some(size),
+			..Run::new("b.tar", tar)
+		},
+	);
 	let report = exact.running.await.unwrap().unwrap();
 	assert_eq!(report.counts.archive_bytes, size);
 
-	let short = start(&setup, "c.tar", tar, JobControl::default(), Some(size - 1));
+	let short = start(
+		&setup,
+		Run {
+			max_bytes: Some(size - 1),
+			..Run::new("c.tar", tar)
+		},
+	);
 	let failed = short.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_job_that_ends_early_leaves_nothing_behind() {
-	// running out of storage while writing
+async fn a_job_out_of_storage_while_writing_leaves_nothing_behind() {
 	let setup_storage = setup(|_, _| {});
 	let job = start(
 		&setup_storage,
-		"b.tar.gz",
-		gzip_tar(),
-		JobControl::default(),
-		Some(100),
+		Run {
+			max_bytes: Some(100),
+			..Run::new("b.tar.gz", gzip_tar())
+		},
 	);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::MaxStorageReached);
@@ -533,36 +517,34 @@ async fn a_job_that_ends_early_leaves_nothing_behind() {
 	setup_storage.backend.assert_released(&job.reporter);
 	// ended by an error, not cancelled
 	assert_eq!(job.recorder.run_states(), [RunState::Running]);
+}
 
-	// a source that cannot be read
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_with_a_source_that_cannot_be_read_leaves_nothing_behind() {
 	let setup_fetch = setup(|backend, _| {
 		backend
 			.fail_fetch
 			.insert("big.bin".to_owned(), ErrorKind::Server);
 	});
-	let job = start(
-		&setup_fetch,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-	);
+	let job = start(&setup_fetch, Run::tar());
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Server);
 	assert!(setup_fetch.backend.log().finished.is_empty());
 	setup_fetch.backend.assert_released(&job.reporter);
+}
 
-	// a cancel while the archive is uploading
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_cancelled_while_the_archive_uploads_leaves_nothing_behind() {
 	let setup_cancel = setup(|backend, _| {
-		backend.blocked_uploads.insert("b.tar".to_owned());
+		backend.hold_named(Request::Upload, ["b.tar"]);
 	});
 	let (_pause, cancel, control) = controls();
 	let job = start(
 		&setup_cancel,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		control,
-		None,
+		Run {
+			control,
+			..Run::tar()
+		},
 	);
 	// every source is read, and the archive's first chunk is stuck uploading
 	let total: u64 = setup_cancel.contents.iter().map(|c| c.len() as u64).sum();
@@ -585,13 +567,7 @@ async fn a_source_chunk_that_comes_back_short_ends_the_job() {
 		backend.contents.remove(&files[1].uuid());
 		backend.short_reads.insert("big.bin".to_owned());
 	});
-	let job = start(
-		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-	);
+	let job = start(&setup, Run::tar());
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Response);
 	assert!(
@@ -610,13 +586,12 @@ async fn a_source_chunk_that_comes_back_short_ends_the_job() {
 async fn a_silent_codec_is_given_up_on() {
 	let setup = setup(|_, _| {});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	let failed = job.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWorkerDied);
@@ -629,13 +604,12 @@ async fn a_silent_codec_is_given_up_on() {
 async fn a_failed_codec_gives_back_its_own_error() {
 	let setup = setup(|_, _| {});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	drop(events);
 	result
@@ -663,13 +637,12 @@ async fn a_chunk_after_the_head_is_an_internal_error() {
 		solid: false,
 		encryption: None,
 	};
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.7z",
-		format,
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::new("b.7z", format)
+		},
 	);
 	// the head is the archive's last chunk: nothing may follow it
 	events.send(WorkerEvent::Head(vec![1; 32])).await.unwrap();
@@ -685,13 +658,12 @@ async fn a_chunk_after_the_head_is_an_internal_error() {
 async fn an_event_only_an_extracting_codec_sends_is_an_internal_error() {
 	let setup = setup(|_, _| {});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	events
 		.send(WorkerEvent::Opened(ArchiveFormat::Zip))
@@ -711,13 +683,13 @@ async fn a_codec_waiting_for_its_chunk_is_not_given_up_on() {
 	});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let (_pause, cancel, control) = controls();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		control,
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			control,
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	let (reply, answer) = oneshot::channel();
 	events
@@ -799,20 +771,13 @@ async fn compress_disposing(
 ) -> CompressReport {
 	let placed = place(setup);
 	let disposal = (how, sources(targets(setup, &placed), &hashed));
-	let job = job(
-		CompressFormat::Tar { compression: None },
-		setup.entries.clone(),
-		None,
-	);
-	let job = start_disposing(
+	let job = start(
 		setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some(disposal),
-		report,
+		Run {
+			disposal: Some(disposal),
+			report,
+			..Run::tar()
+		},
 	);
 	let report = job.running.await.unwrap().unwrap();
 	setup.backend.assert_released(&job.reporter);
@@ -827,6 +792,17 @@ fn outcomes(report: &CompressReport) -> Vec<DisposalOutcome> {
 		.collect()
 }
 
+/// Asserts that every source was removed, saying `what` case failed if one was not.
+fn assert_all_disposed(report: &CompressReport, what: &str) {
+	assert!(
+		outcomes(report)
+			.iter()
+			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
+		"{what}: {:?}",
+		report.dispositions
+	);
+}
+
 fn all_kept_for(report: &CompressReport, expected: fn(&KeptReason) -> bool) {
 	assert_eq!(report.dispositions.len(), 2);
 	for outcome in outcomes(report) {
@@ -835,6 +811,23 @@ fn all_kept_for(report: &CompressReport, expected: fn(&KeptReason) -> bool) {
 			other => panic!("expected the source kept, got {other:?}"),
 		}
 	}
+}
+
+/// The outcomes of the two sources, the folder `docs` and the file `top.txt`.
+fn docs_and_top(report: &CompressReport) -> [DisposalOutcome; 2] {
+	outcomes(report)
+		.try_into()
+		.unwrap_or_else(|outcomes| panic!("two sources: {outcomes:?}"))
+}
+
+fn is_changed(outcome: &DisposalOutcome) -> bool {
+	matches!(
+		outcome,
+		DisposalOutcome::Kept {
+			reason: KeptReason::Changed,
+			bytes_freed: 0
+		}
+	)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -895,6 +888,163 @@ async fn a_permanent_removal_deletes_what_was_read_and_trashes_the_emptied_direc
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_is_kept_once_the_archive_is_gone_by_its_turn() {
+	let mut setup = setup(|_, _| {});
+	let placed = place(&setup);
+	// the folder goes first: its recheck waits under the lock, after the archive's
+	setup
+		.hold_after_registering
+		.push((Request::State, placed.docs));
+	let job = run_disposal(
+		&setup,
+		SourceDisposal::Trash,
+		targets(&setup, &placed),
+		JobControl::default(),
+	);
+	wait_until("the folder's removal is under way", || {
+		setup
+			.backend
+			.log()
+			.held
+			.contains(&(Request::State, placed.docs))
+	})
+	.await;
+	// the archive, the one file in the destination, goes before the top file's turn
+	let destination = setup.destination;
+	setup
+		.backend
+		.log()
+		.file_parents
+		.retain(|_, (parent, ..)| *parent != destination);
+	setup.backend.release_all();
+	let report = job.running.await.unwrap().unwrap();
+	let [docs, top] = docs_and_top(&report);
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(
+		matches!(
+			top,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Unconfirmed,
+				bytes_freed: 0
+			}
+		),
+		"{top:?}"
+	);
+	assert!(setup.backend.log().trashed_files.is_empty());
+	setup.backend.assert_released(&job.reporter);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_file_in_the_trash_is_kept_as_changed() {
+	let setup = setup(|backend, _| {
+		backend.in_trash.insert(SOURCE_UUIDS[2]);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::Trash,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = docs_and_top(&report);
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(is_changed(&top), "{top:?}");
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_file_with_a_newer_version_is_kept_as_changed() {
+	let setup = setup(|backend, _| {
+		backend.superseded.insert(SOURCE_UUIDS[2]);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = docs_and_top(&report);
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	assert!(is_changed(&top), "{top:?}");
+	assert!(!setup.backend.log().deleted_files.contains(&SOURCE_UUIDS[2]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_folder_in_the_trash_is_kept_as_changed() {
+	let setup = setup(|backend, _| {
+		backend.in_trash.insert(PLACED_DOCS);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = docs_and_top(&report);
+	assert!(is_changed(&docs), "{docs:?}");
+	assert!(matches!(top, DisposalOutcome::Disposed { .. }), "{top:?}");
+	let log = setup.backend.log();
+	assert_eq!(log.deleted_files, [SOURCE_UUIDS[2]]);
+	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_whose_state_cannot_be_fetched_is_kept_with_the_error() {
+	let setup = setup(|backend, _| {
+		backend.fail_state_of.insert(SOURCE_UUIDS[2]);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::Trash,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = docs_and_top(&report);
+	assert!(matches!(docs, DisposalOutcome::Disposed { .. }), "{docs:?}");
+	let DisposalOutcome::Kept {
+		reason: KeptReason::Failed { error },
+		bytes_freed: 0,
+	} = top
+	else {
+		panic!("{top:?}");
+	};
+	assert_eq!(error.kind(), ErrorKind::Server);
+	assert!(setup.backend.log().trashed_files.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_folder_that_cannot_be_listed_is_kept_with_the_error() {
+	let setup = setup(|backend, _| {
+		backend.quirks.insert(Quirk::FailTrees);
+	});
+	let report = compress_disposing(
+		&setup,
+		SourceDisposal::DeletePermanently,
+		[true; 2],
+		CompressReport::default(),
+	)
+	.await;
+	let [docs, top] = docs_and_top(&report);
+	assert!(
+		matches!(
+			docs,
+			DisposalOutcome::Kept {
+				reason: KeptReason::Failed { .. },
+				bytes_freed: 0
+			}
+		),
+		"{docs:?}"
+	);
+	assert!(matches!(top, DisposalOutcome::Disposed { .. }), "{top:?}");
+	let log = setup.backend.log();
+	assert_eq!(log.deleted_files, [SOURCE_UUIDS[2]]);
+	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_source_that_changed_is_kept_on_its_own() {
 	let setup = setup(|_, _| {});
 	let placed = place(&setup);
@@ -906,20 +1056,12 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 		SourceDisposal::DeletePermanently,
 		sources(targets(&setup, &placed), &[true; 2]),
 	);
-	let job = job(
-		CompressFormat::Tar { compression: None },
-		setup.entries.clone(),
-		None,
-	);
-	let job = start_disposing(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some(disposal),
-		CompressReport::default(),
+		Run {
+			disposal: Some(disposal),
+			..Run::tar()
+		},
 	);
 	let report = job.running.await.unwrap().unwrap();
 	let outcomes = outcomes(&report);
@@ -941,8 +1083,7 @@ async fn a_source_that_changed_is_kept_on_its_own() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
-	// a source whose data did not match its hash
+async fn only_the_source_whose_data_differs_from_its_hash_is_kept() {
 	let setup_mismatch = setup(|backend, files| {
 		backend.contents.insert(files[2].uuid(), b"TOP".to_vec());
 	});
@@ -970,8 +1111,17 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	);
 	assert_eq!(setup_mismatch.backend.log().trashed_dirs.len(), 1);
 	assert!(setup_mismatch.backend.log().trashed_files.is_empty());
+}
 
-	// a source without hashes is kept on its own under a permanent removal
+/// Asserts that nothing was removed from the fake drive.
+fn assert_nothing_removed(setup: &Setup) {
+	let log = setup.backend.log();
+	assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
+	assert!(log.trashed_dirs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_without_hashes_is_kept_on_its_own_from_a_permanent_removal() {
 	let setup_half = setup(|_, _| {});
 	let report = compress_disposing(
 		&setup_half,
@@ -994,8 +1144,10 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 		),
 		"{top:?}"
 	);
+}
 
-	// no hash to check a permanent deletion against
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sources_without_hashes_are_kept_from_a_permanent_removal() {
 	let setup_unhashed = setup(|_, _| {});
 	let report = compress_disposing(
 		&setup_unhashed,
@@ -1007,8 +1159,11 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	all_kept_for(&report, |reason| {
 		matches!(reason, KeptReason::HashUnavailable)
 	});
+	assert_nothing_removed(&setup_unhashed);
+}
 
-	// an entry that was skipped while planning
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_skipped_while_planning_keeps_every_source() {
 	let setup_skipped = setup(|_, _| {});
 	let skipped = CompressReport {
 		skipped: vec![SkippedEntry {
@@ -1023,8 +1178,11 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	let report =
 		compress_disposing(&setup_skipped, SourceDisposal::Trash, [true; 2], skipped).await;
 	all_kept_for(&report, |reason| matches!(reason, KeptReason::Incomplete));
+	assert_nothing_removed(&setup_skipped);
+}
 
-	// the archive is not in the drive as it was registered
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_not_in_the_drive_as_registered_keeps_every_source() {
 	let setup_gone = setup(|backend, _| {
 		backend.quirks.insert(Quirk::ForgetRegistered);
 	});
@@ -1036,21 +1194,12 @@ async fn sources_are_kept_when_the_archive_cannot_be_trusted() {
 	)
 	.await;
 	all_kept_for(&report, |reason| matches!(reason, KeptReason::Unconfirmed));
-
-	for setup in [setup_unhashed, setup_skipped, setup_gone] {
-		let log = setup.backend.log();
-		assert!(log.trashed_files.is_empty() && log.deleted_files.is_empty());
-		assert!(log.trashed_dirs.is_empty());
-	}
+	assert_nothing_removed(&setup_gone);
 }
 
 /// The entries of a 7z read back through the SDK's reader, every CRC-32 checked.
 fn sevenz_entries(archive: &[u8]) -> Vec<(String, Vec<u8>)> {
-	let limits = SevenZLimits {
-		max_index_bytes: 1 << 20,
-		max_entries: 100,
-		decoder_memory: 64 << 20,
-	};
+	let limits = READ_BACK_SEVEN_Z;
 	let mut keys = Keys::new(None);
 	let mut source = std::io::Cursor::new(archive);
 	let index = read_index(&mut source, archive.len() as u64, limits, &mut keys).unwrap();
@@ -1085,7 +1234,7 @@ async fn a_7z_uploads_its_first_chunk_last() {
 			solid,
 			encryption: None,
 		};
-		let job = start(&setup, "bundle.7z", format, JobControl::default(), None);
+		let job = start(&setup, Run::new("bundle.7z", format));
 		let report = job.running.await.unwrap().unwrap();
 		let archive = report.archive.as_ref().unwrap();
 		let (_, completion) = setup.backend.log().finished[&archive.uuid()].clone();
@@ -1093,7 +1242,7 @@ async fn a_7z_uploads_its_first_chunk_last() {
 		assert_eq!(completion.written, bytes.len() as u64, "{method:?}");
 		assert_eq!(
 			completion.num_chunks,
-			(bytes.len() as u64).div_ceil(CHUNK_SIZE as u64),
+			(bytes.len() as u64).div_ceil(CHUNK_SIZE_U64),
 			"{method:?}"
 		);
 		// the hash merged around the late first chunk is the whole archive's
@@ -1246,20 +1395,12 @@ async fn a_source_inside_another_goes_with_it() {
 		SourceDisposal::DeletePermanently,
 		sources(targets, &[true; 4]),
 	);
-	let job = job(
-		CompressFormat::Tar { compression: None },
-		setup.entries.clone(),
-		None,
-	);
-	let job = start_disposing(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some(disposal),
-		CompressReport::default(),
+		Run {
+			disposal: Some(disposal),
+			..Run::tar()
+		},
 	);
 	let report = job.running.await.unwrap().unwrap();
 	let outcomes = outcomes(&report);
@@ -1296,20 +1437,13 @@ fn run_disposal(
 	control: JobControl,
 ) -> Job {
 	let hashed = vec![true; targets.len()];
-	let job = job(
-		CompressFormat::Tar { compression: None },
-		setup.entries.clone(),
-		None,
-	);
-	start_disposing(
+	start(
 		setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		control,
-		None,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some((how, sources(targets, &hashed))),
-		CompressReport::default(),
+		Run {
+			control,
+			disposal: Some((how, sources(targets, &hashed))),
+			..Run::tar()
+		},
 	)
 }
 
@@ -1619,7 +1753,7 @@ async fn a_cancel_during_a_folders_removal_says_what_it_deleted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_compressing_keeps_every_source() {
 	let setup = setup(|backend, _| {
-		backend.blocked_uploads.insert("b.tar".to_owned());
+		backend.hold_named(Request::Upload, ["b.tar"]);
 	});
 	let placed = place(&setup);
 	let (_pause, cancel, control) = controls();
@@ -1686,13 +1820,12 @@ async fn a_cancel_before_the_archive_is_named_ends_cancelling() {
 async fn a_codec_reading_its_sources_out_of_order_fails_the_job() {
 	let setup = setup(|_, _| {});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	// the second source before the first
 	let (reply, _answer) = oneshot::channel();
@@ -1733,13 +1866,13 @@ async fn a_paused_compress_holds_nothing_of_the_clients_budget() {
 	let setup = setup(|_, _| {});
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
 	let (pause, cancel, control) = controls();
-	let job = start_with(
+	let job = start(
 		&setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		control,
-		None,
-		Box::new(move || Ok(link)),
+		Run {
+			control,
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	// the first source's chunk takes the job's own slot; the chunk being read and the two
 	// fetched ahead of it take the client's budget
@@ -1778,7 +1911,13 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 		ArchiveConfig::new(&ClientConfig::default().with_archive_job_concurrency(1));
 	let (pause, _cancel, control) = controls();
 	pause.send_replace(true);
-	let paused = start(&setup_paused, "paused.tgz", gzip_tar(), control, None);
+	let paused = start(
+		&setup_paused,
+		Run {
+			control,
+			..Run::new("paused.tgz", gzip_tar())
+		},
+	);
 	wait_until("the job reports itself paused", || {
 		paused.reporter.is_paused()
 	})
@@ -1787,13 +1926,7 @@ async fn a_compress_paused_before_it_starts_takes_no_slot() {
 	// the only slot is free for a job started later
 	let mut setup_other = setup(|_, _| {});
 	setup_other.config = setup_paused.config.clone();
-	let other = start(
-		&setup_other,
-		"other.tgz",
-		gzip_tar(),
-		JobControl::default(),
-		None,
-	);
+	let other = start(&setup_other, Run::new("other.tgz", gzip_tar()));
 	tokio::time::timeout(Duration::from_secs(20), other.running)
 		.await
 		.expect("the unpaused job runs")
@@ -1829,7 +1962,13 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	let big = (Request::Fetch, big.unwrap());
 	let (pause, _cancel, control) = controls();
 	let format = CompressFormat::Tar { compression: None };
-	let job = start(&setup_paused, "b.tar", format, control, None);
+	let job = start(
+		&setup_paused,
+		Run {
+			control,
+			..Run::new("b.tar", format)
+		},
+	);
 	wait_until("the second source is being read", || {
 		setup_paused.backend.log().held.contains(&big)
 	})
@@ -1848,13 +1987,7 @@ async fn a_resumed_compress_writes_the_archive_it_would_have() {
 	);
 
 	let setup_straight = setup(|_, _| {});
-	let job = start(
-		&setup_straight,
-		"b.tar",
-		format,
-		JobControl::default(),
-		None,
-	);
+	let job = start(&setup_straight, Run::new("b.tar", format));
 	let archive = job.running.await.unwrap().unwrap().archive.unwrap();
 	assert_eq!(
 		paused,
@@ -1899,13 +2032,7 @@ async fn a_pause_while_registering_holds_the_disposal_back() {
 
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
-	assert!(
-		outcomes(&report)
-			.iter()
-			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
-		"{:?}",
-		report.dispositions
-	);
+	assert_all_disposed(&report, "");
 }
 
 /// The phases the callback saw, each change once.
@@ -1922,27 +2049,23 @@ fn phases(recorder: &Recorder) -> Vec<CompressPhase> {
 }
 
 /// Compresses the setup into `name` in `format`, removing the sources for good.
-fn dispose_permanently_as(setup: &Setup, name: &str, format: CompressFormat) -> Job {
+fn dispose_permanently_as(setup: &Setup, name: &'static str, format: CompressFormat) -> Job {
 	let placed = place(setup);
-	let job = job(format, setup.entries.clone(), setup.password.clone());
-	start_disposing(
+	start(
 		setup,
-		name,
-		format,
-		JobControl::default(),
-		None,
-		Box::new(move || worker::start(move |port| compress(&port, job))),
-		Some((
-			SourceDisposal::DeletePermanently,
-			sources(targets(setup, &placed), &[true; 2]),
-		)),
-		CompressReport::default(),
+		Run {
+			disposal: Some((
+				SourceDisposal::DeletePermanently,
+				sources(targets(setup, &placed), &[true; 2]),
+			)),
+			..Run::new(name, format)
+		},
 	)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_permanent_removal_reads_the_archive_back_first() {
-	let password = || Some(ArchivePassword::new("hunter2".to_owned()).unwrap());
+	let password = || Some(archive_password("hunter2"));
 	for (name, format, password) in [
 		("b.tar.gz", gzip_tar(), None),
 		(
@@ -1969,13 +2092,7 @@ async fn a_permanent_removal_reads_the_archive_back_first() {
 		let report = job.running.await.unwrap().unwrap();
 		let archive = report.archive.as_ref().unwrap();
 		let archive = archive.uuid();
-		assert!(
-			outcomes(&report)
-				.iter()
-				.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
-			"{name}: {:?}",
-			report.dispositions
-		);
+		assert_all_disposed(&report, name);
 		assert!(
 			setup
 				.backend
@@ -2003,17 +2120,11 @@ async fn a_permanent_removal_reads_the_archive_back_first() {
 async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 	// the archive a codec writes for the same sources, with one byte of a.txt's data off
 	let straight = setup(|_, _| {});
-	let job = start(
-		&straight,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-	);
+	let job = start(&straight, Run::tar());
 	let archive = job.running.await.unwrap().unwrap().archive.unwrap();
 	let mut damaged = uploaded(&straight, archive.uuid());
 	// the directory's header, then a.txt's, then its data
-	let data = 2 * 512;
+	let data = 2 * TAR_BLOCK;
 	assert_eq!(&damaged[data..data + 5], b"alpha");
 	damaged[data] ^= 1;
 
@@ -2028,18 +2139,16 @@ async fn sources_are_kept_when_the_archive_does_not_read_back_as_them() {
 async fn dispose_scripted(setup: &Setup, archive: &[u8]) -> Job {
 	let placed = place(setup);
 	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
-	let job = start_disposing(
+	let job = start(
 		setup,
-		"b.tar",
-		CompressFormat::Tar { compression: None },
-		JobControl::default(),
-		None,
-		Box::new(move || Ok(link)),
-		Some((
-			SourceDisposal::DeletePermanently,
-			sources(targets(setup, &placed), &[true; 2]),
-		)),
-		CompressReport::default(),
+		Run {
+			disposal: Some((
+				SourceDisposal::DeletePermanently,
+				sources(targets(setup, &placed), &[true; 2]),
+			)),
+			codec: Some(Box::new(move || Ok(link))),
+			..Run::tar()
+		},
 	);
 	// each source's chunks, and whether it is the source's last
 	for (source, index, last) in [(0, 0, true), (1, 0, false), (1, 1, true), (2, 0, true)] {
@@ -2170,13 +2279,7 @@ async fn a_slow_read_back_is_not_given_up_on() {
 		.unwrap();
 
 	let report = job.running.await.unwrap().unwrap();
-	assert!(
-		outcomes(&report)
-			.iter()
-			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
-		"{:?}",
-		report.dispositions
-	);
+	assert_all_disposed(&report, "");
 	setup.backend.assert_released(&job.reporter);
 }
 
@@ -2269,7 +2372,7 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	let fetched = archive_fetches(&setup, archive);
 	assert_eq!(fetched, 1, "the first chunk is read, the second waits");
 	assert_eq!(
-		last.counts.bytes_verified, CHUNK_SIZE as u64,
+		last.counts.bytes_verified, CHUNK_SIZE_U64,
 		"the read back reports its progress"
 	);
 	// the plan's totals, which the engine is handed with its report
@@ -2283,19 +2386,13 @@ async fn a_paused_read_back_holds_nothing_and_reports_its_progress() {
 	let units = job.reporter.read(|state| state.progress().units);
 	assert_eq!(
 		units.total - units.settled,
-		setup.backend.log().finished[&archive].1.written - CHUNK_SIZE as u64,
+		setup.backend.log().finished[&archive].1.written - CHUNK_SIZE_U64,
 		"what is left of the archive to read is the work left"
 	);
 
 	pause.send_replace(false);
 	let report = job.running.await.unwrap().unwrap();
-	assert!(
-		outcomes(&report)
-			.iter()
-			.all(|outcome| matches!(outcome, DisposalOutcome::Disposed { .. })),
-		"{:?}",
-		report.dispositions
-	);
+	assert_all_disposed(&report, "");
 	assert_eq!(report.counts.bytes_verified, report.counts.archive_bytes);
 	setup.backend.assert_released(&job.reporter);
 }

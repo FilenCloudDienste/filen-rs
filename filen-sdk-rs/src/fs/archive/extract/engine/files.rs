@@ -267,14 +267,11 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn start_finalize(&mut self, ordinal: u64) {
-		let top_level = {
-			let file = &self.files[&ordinal];
-			file.parent == ROOT && self.into_destination
-		};
-		let parent = self.dirs.slots[self.files[&ordinal].parent]
+		let file = self.files.get_mut(&ordinal).expect("checked by the caller");
+		let top_level = file.parent == ROOT && self.into_destination;
+		let parent = self.dirs.slots[file.parent]
 			.created_uuid()
 			.expect("checked by the caller");
-		let file = self.files.get_mut(&ordinal).expect("checked by the caller");
 		file.phase = FilePhase::Finalizing;
 		let modified = file.modified.unwrap_or_else(Utc::now);
 		let completion = UploadCompletion {
@@ -284,6 +281,7 @@ impl<B: DisposalBackend> Driver<B> {
 			final_times: (modified, modified),
 		};
 		let upload = Arc::clone(&file.upload);
+		// copied, not taken: a finalize a pause stopped is started again with the same info
 		let info = file.info.clone().unwrap_or_default();
 		let name = file.name.clone();
 		let backend = Arc::clone(&self.backend);
@@ -334,7 +332,7 @@ impl<B: DisposalBackend> Driver<B> {
 				if name.as_ref() != file.archive_name() {
 					self.renamed(
 						file.active.entry,
-						file.path.clone(),
+						file.path,
 						&name,
 						ExtractRenameReason::DuplicateName,
 					);

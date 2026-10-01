@@ -205,7 +205,7 @@ mod tests {
 			copy::report::{CopiedTopLevel, CopyUpdate, PlannedTopLevelItem},
 			drive_job::{
 				counts::ItemCounts,
-				listing::{ListingBytes, ScanProgress, watch_listing},
+				listing::{ScanProgress, watch_listing},
 				plan::{SkipReason, SkippedEntry},
 			},
 		},
@@ -324,27 +324,6 @@ mod tests {
 				(phase, PlanTotals::default(), ItemCounts::default())
 			);
 		}
-	}
-
-	#[test]
-	fn listing_bytes_add_up_across_sources() {
-		let bytes = ListingBytes::default();
-		bytes.current_total.store(u64::MAX, Ordering::Relaxed);
-		assert_eq!(bytes.scan(0, 3).listing_total_bytes, None);
-		bytes.current.store(40, Ordering::Relaxed);
-		bytes.current_total.store(100, Ordering::Relaxed);
-		let scan = bytes.scan(1, 3);
-		assert_eq!(
-			(scan.listing_bytes, scan.listing_total_bytes),
-			(40, Some(100))
-		);
-		assert_eq!((scan.sources_done, scan.sources_total), (1, 3));
-
-		bytes.current.store(100, Ordering::Relaxed);
-		bytes.next_source();
-		bytes.current.store(5, Ordering::Relaxed);
-		let scan = bytes.scan(2, 3);
-		assert_eq!((scan.listing_bytes, scan.listing_total_bytes), (105, None));
 	}
 
 	#[tokio::test(start_paused = true)]

@@ -34,7 +34,7 @@ const MAGIC: u32 = u32::from_le_bytes(ZSTD_MAGIC);
 
 /// The largest block a frame holds, decoded (RFC 8878 §3.1.1.2.4), which the forked ruzstd
 /// enforces.
-const MAX_BLOCK_BYTES: u64 = 128 * 1024;
+pub(super) const MAX_BLOCK_BYTES: u64 = 128 * 1024;
 
 /// The decoder's state besides its window: the literals and block buffers (a block each), the
 /// sequences of a block (at most 43690 of 12 bytes, a match copying 3 bytes at least), and the

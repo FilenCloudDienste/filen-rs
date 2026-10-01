@@ -69,7 +69,12 @@ pub(super) fn check_level(
 /// The brotli window: 4 MiB, a common default that keeps the encoder's memory modest.
 const BROTLI_LGWIN: u32 = 22;
 
+/// The brotli writer's buffer between the caller and the encoder.
+const BROTLI_BUFFER_BYTES: usize = 64 << 10;
+
 /// lz4 blocks are written 256 KiB at a time, which decoders at any setting accept.
+const LZ4_BLOCK: BlockSize = BlockSize::Max256KB;
+/// The size of [`LZ4_BLOCK`], which lz4_flex does not expose.
 const LZ4_BLOCK_BYTES: u64 = 256 << 10;
 
 /// zstd is written a frame per this much input (see [`ZstdEncoder`]).
@@ -265,13 +270,13 @@ pub(crate) fn open_encoder<'a, W: Write + 'a>(
 		StreamCodec::Lzip => Box::new(LzipWriter::new(sink, LzipOptions::with_preset(level))),
 		StreamCodec::Lz4 => Box::new(FrameEncoder::with_frame_info(
 			FrameInfo::new()
-				.block_size(BlockSize::Max256KB)
+				.block_size(LZ4_BLOCK)
 				.content_checksum(true),
 			sink,
 		)),
 		StreamCodec::Brotli => Box::new(brotli::CompressorWriter::new(
 			sink,
-			64 << 10,
+			BROTLI_BUFFER_BYTES,
 			level,
 			BROTLI_LGWIN,
 		)),
@@ -286,7 +291,10 @@ mod tests {
 	use super::*;
 	use crate::{
 		alloc_meter::peak_bytes,
-		fs::archive::decode::{StreamCheck, open_stream},
+		fs::archive::{
+			decode::{StreamCheck, open_stream},
+			test_support::{READ_BACK_MEMORY, incompressible},
+		},
 	};
 
 	const CODECS: [StreamCodec; 8] = [
@@ -322,7 +330,7 @@ mod tests {
 					level: Some(level),
 				};
 				let encoded = encode(compression, &data);
-				let mut decoder = open_stream(codec, &encoded[..], 512 << 20).unwrap();
+				let mut decoder = open_stream(codec, &encoded[..], READ_BACK_MEMORY).unwrap();
 				let mut decoded = Vec::new();
 				decoder.read_to_end(&mut decoded).unwrap();
 				assert_eq!(decoded, data, "{codec:?} level {level}");
@@ -450,7 +458,7 @@ mod tests {
 		let empty = encode(compression, b"");
 		assert_eq!(frames(&empty), 1);
 		let mut decoded = Vec::new();
-		open_stream(StreamCodec::Zstd, &empty[..], 64 << 20)
+		open_stream(StreamCodec::Zstd, &empty[..], READ_BACK_MEMORY)
 			.unwrap()
 			.read_to_end(&mut decoded)
 			.unwrap();
@@ -459,15 +467,7 @@ mod tests {
 		let data = mixed_input(ZSTD_FRAME_BYTES * 2 + 5);
 		assert_eq!(frames(&encode(compression, &data)), 3);
 		// data that does not compress costs no more than what is stated
-		let mut state = 0x9E37_79B9_7F4A_7C15u64;
-		let noise: Vec<u8> = (0..ZSTD_FRAME_BYTES * 2)
-			.map(|_| {
-				state ^= state << 13;
-				state ^= state >> 7;
-				state ^= state << 17;
-				(state >> 24).to_le_bytes()[0]
-			})
-			.collect();
+		let noise = incompressible(ZSTD_FRAME_BYTES * 2, 0x9E37_79B9_7F4A_7C15);
 		let ((), peak) = peak_bytes(|| {
 			let mut encoder = open_encoder(compression, io::sink()).unwrap();
 			encoder.write_all(&noise).unwrap();

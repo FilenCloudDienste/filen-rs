@@ -1,6 +1,10 @@
 //! Zip64: archives past 4 GiB, entries of more than 4 GiB, and more than 65,535 entries.
 
 use super::*;
+use crate::fs::archive::{
+	test_support::{LocalRecords, local_records},
+	zip::write::ZIP64_ENTRY_THRESHOLD,
+};
 
 #[test]
 fn many_entries_use_zip64_end_records() {
@@ -9,7 +13,7 @@ fn many_entries_use_zip64_end_records() {
 		names.iter().map(|n| (n.as_str(), Some(&b""[..]))).collect();
 	let zip = ours(&entries, ZipMethod::Stored, None);
 	let mut source = Cursor::new(&zip);
-	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.entries.len(), 70_000);
 	assert_eq!(
 		::zip::ZipArchive::new(Cursor::new(&zip)).unwrap().len(),
@@ -121,70 +125,6 @@ impl Seek for Sparse {
 /// Past 4 GiB: every offset is a zip64 one.
 pub(super) const PAST_4_GIB: u64 = 5 << 30;
 
-/// What `entry`'s local header and data descriptor say of it, read from the bytes.
-#[derive(Debug, PartialEq, Eq)]
-struct LocalRecords {
-	/// The local header's compressed and uncompressed sizes.
-	sizes: (u32, u32),
-	/// The values of its zip64 extra field, if it has one.
-	zip64: Option<Vec<u64>>,
-	/// The descriptor's compressed and uncompressed sizes, 8 bytes each with zip64, else 4.
-	descriptor: (u64, u64),
-}
-
-fn local_records<R: Read + Seek>(source: &mut R, shift: u64, entry: &ZipEntry) -> LocalRecords {
-	let header = read_at(source, shift + entry.header_offset, LOCAL_HEADER_LEN).unwrap();
-	let (name_len, extra_len) = (
-		usize::from(u16_at(&header, 26)),
-		usize::from(u16_at(&header, 28)),
-	);
-	let extra = read_at(
-		source,
-		shift + entry.header_offset + LOCAL_HEADER_LEN_U64 + name_len as u64,
-		extra_len,
-	)
-	.unwrap();
-	let mut zip64 = None;
-	let mut fields = &extra[..];
-	while fields.len() >= 4 {
-		let len = usize::from(u16_at(fields, 2));
-		if u16_at(fields, 0) == 0x0001 {
-			zip64 = Some(
-				fields[4..4 + len]
-					.chunks_exact(8)
-					.map(|value| u64_at(value, 0))
-					.collect(),
-			);
-		}
-		fields = &fields[4 + len..];
-	}
-	let wide = zip64.is_some();
-	let descriptor = read_at(
-		source,
-		shift
-			+ entry.header_offset
-			+ LOCAL_HEADER_LEN_U64
-			+ (name_len + extra_len) as u64
-			+ entry.compressed_size,
-		if wide { 24 } else { 16 },
-	)
-	.unwrap();
-	assert_eq!(u32_at(&descriptor, 0), 0x0807_4b50, "{}", entry.name);
-	assert_eq!(u32_at(&descriptor, 4), entry.crc, "{}", entry.name);
-	LocalRecords {
-		sizes: (u32_at(&header, 18), u32_at(&header, 22)),
-		zip64,
-		descriptor: if wide {
-			(u64_at(&descriptor, 8), u64_at(&descriptor, 16))
-		} else {
-			(
-				u64::from(u32_at(&descriptor, 8)),
-				u64::from(u32_at(&descriptor, 12)),
-			)
-		},
-	}
-}
-
 #[test]
 fn zip64_sizes_and_offsets_read_back() {
 	let sample = sample();
@@ -205,7 +145,7 @@ fn zip64_sizes_and_offsets_read_back() {
 			);
 			let mut source = Sparse::past(skipped, zip.into());
 			let len = source.len();
-			let index = read_index(&mut source, len, LIMITS).unwrap();
+			let index = read_index(&mut source, len, READ_BACK_ZIP).unwrap();
 			assert_eq!(index.prefix_bytes, skipped, "{case}");
 			for entry in index.entries.iter().filter(|e| e.kind == ZipKind::File) {
 				// the local header leaves the sizes to the descriptor: zip64 ones when it has
@@ -255,7 +195,6 @@ fn zip64_sizes_and_offsets_read_back() {
 
 #[test]
 fn an_entry_of_over_4_gib_reads_back() {
-	use crate::fs::archive::zip::write::ZIP64_ENTRY_THRESHOLD;
 	const BIG: u64 = (4 << 30) + 1;
 	// past 4 GiB, so the central record's zip64 field holds all three values
 	let mut writer = ZipWriter::past(Sparse::default(), PAST_4_GIB, ZIP64_ENTRY_THRESHOLD);
@@ -270,7 +209,7 @@ fn an_entry_of_over_4_gib_reads_back() {
 	}
 	let mut source = Sparse::past(PAST_4_GIB, writer.finish().unwrap());
 	let len = source.len();
-	let index = read_index(&mut source, len, LIMITS).unwrap();
+	let index = read_index(&mut source, len, READ_BACK_ZIP).unwrap();
 	let big = &index.entries[1];
 	assert_eq!(
 		(big.name.as_str(), big.size, big.compressed_size),
@@ -287,7 +226,7 @@ fn an_entry_of_over_4_gib_reads_back() {
 	);
 	let mut read = 0u64;
 	let mut buf = vec![0u8; 1 << 20];
-	let mut entry = open_entry(&mut source, index.shift, big, None, ENTRY).unwrap();
+	let mut entry = open_entry(&mut source, index.shift, big, None, READ_BACK_ZIP_ENTRY).unwrap();
 	loop {
 		let n = entry.read(&mut buf).unwrap();
 		if n == 0 {

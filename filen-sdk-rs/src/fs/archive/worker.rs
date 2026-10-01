@@ -27,6 +27,8 @@ use filen_types::fs::Uuid;
 use microthumb::ByteSource;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::blocking::WorkerSlot;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use crate::blocking::send_catching_panic;
 use crate::{
@@ -376,7 +378,7 @@ fn channels() -> (WorkerPort, mpsc::Receiver<WorkerEvent>, Arc<WorkerShared>) {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-static ARCHIVE_CODECS: crate::blocking::WorkerSlot = crate::blocking::WorkerSlot::new();
+static ARCHIVE_CODECS: WorkerSlot = WorkerSlot::new();
 
 /// Runs `job` on a codec worker: a thread of its own natively, the archive worker on wasm. The
 /// caller holds the archive job lease, so on wasm no other job is queued on the worker.

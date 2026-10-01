@@ -10,7 +10,11 @@ use crate::{
 	Error,
 	fs::{
 		categories::{DirType, NonRootItemType, Normal},
-		drive_job::counts::ItemCounts,
+		drive_job::{
+			counts::ItemCounts,
+			listing::{FailedSource, ScanProgress},
+			plan::{PlanState, PlanTotals, RenamedEntry, SkippedEntry},
+		},
 	},
 	job::{
 		self,
@@ -20,13 +24,7 @@ use crate::{
 	util::{MaybeArc, MaybeSendSync},
 };
 
-pub(crate) use crate::job::report::OpGuard;
 pub use crate::job::report::RunState;
-
-use crate::fs::drive_job::{
-	listing::{FailedSource, ScanProgress},
-	plan::{PlanState, PlanTotals, RenamedEntry, SkippedEntry},
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
@@ -210,7 +208,7 @@ impl<D> Default for CopyReport<D> {
 	}
 }
 
-impl<D: std::fmt::Debug> JobReport for CopyReport<D> {
+impl<D> JobReport for CopyReport<D> {
 	const NAME: &'static str = "copy";
 }
 

@@ -148,22 +148,23 @@ pub async fn copy(
 		.await
 }
 
-/// Asserts that every file at `path` in `copied` has the bytes of the matching original.
+/// Asserts that every file at `path` in `found` (a tree read back from the drive) has the bytes
+/// of the matching original.
 pub async fn assert_same_files<'a>(
 	client: &Client,
-	copied: &[(String, RemoteFile)],
+	found: &[(String, RemoteFile)],
 	originals: impl IntoIterator<Item = (impl AsRef<str>, &'a RemoteFile)>,
 ) {
 	for (path, original) in originals {
 		let path = path.as_ref();
-		let (_, copy) = copied
+		let (_, file) = found
 			.iter()
 			.find(|(p, _)| p == path)
-			.unwrap_or_else(|| panic!("{path} was copied"));
-		assert_ne!(copy.uuid(), original.uuid());
-		assert_eq!(copy.size(), original.size(), "{path} has the same size");
+			.unwrap_or_else(|| panic!("{path} is in the tree"));
+		assert_ne!(file.uuid(), original.uuid());
+		assert_eq!(file.size(), original.size(), "{path} has the same size");
 		assert_eq!(
-			client.download_file(copy).await.unwrap(),
+			client.download_file(file).await.unwrap(),
 			client.download_file(original).await.unwrap(),
 			"{path} has the same contents"
 		);

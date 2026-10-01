@@ -32,6 +32,10 @@ use super::{
 	likely_wrong_password, link_target, take_file,
 };
 
+/// The most chunks a 7z's input keeps at hand: enough for a BCJ2 folder's four packed streams
+/// and one more. A folder of several BCJ2 coders refetches rather than hold more.
+const MAX_SEVEN_Z_SLOTS: usize = 5;
+
 /// How a 7z entry's data is compressed, for display: its folder's coders, outermost first.
 fn sevenz_method(index: &SevenZIndex, entry: &SevenZEntry) -> Option<String> {
 	let stream = entry.stream?;
@@ -151,8 +155,7 @@ pub(super) fn extract_sevenz(
 	)
 	.map_err(Error::from)?;
 	// a folder's packed streams are read in turns (BCJ2 has four)
-	// (at most 5 chunks: a folder of several BCJ2 coders refetches rather than hold more)
-	input.set_slots((index.max_packed_streams() + 1).min(5));
+	input.set_slots((index.max_packed_streams() + 1).min(MAX_SEVEN_Z_SLOTS));
 	let mut cursor = FolderCursor::new(BorrowedSeqReader::new(&mut input), limits.decoder_memory);
 	if walk.listing() {
 		return list_sevenz(walk, &mut cursor, &index, &mut keys, job);
@@ -354,7 +357,7 @@ fn sevenz_unread<'e>(index: &SevenZIndex, entry: &'e SevenZEntry) -> Found<'e> {
 /// Whether a file entry that may be AppleDouble is, by its first bytes; `None` when its data
 /// cannot be read (a wrong password), so it may be. Fails only on an error of the archive's
 /// source.
-fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
+fn sevenz_apple_double<'s, R: Read + Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	entry: &SevenZEntry,
@@ -374,7 +377,7 @@ fn sevenz_apple_double<'s, R: Read + std::io::Seek + 's>(
 
 /// A symlink entry's target, for reporting: its data, when small and readable; `None` when it
 /// is not. Fails only on an error of the archive's source.
-fn sevenz_symlink_target<'s, R: Read + std::io::Seek + 's>(
+fn sevenz_symlink_target<'s, R: Read + Seek + 's>(
 	cursor: &mut FolderCursor<'s, R>,
 	index: &SevenZIndex,
 	entry: &SevenZEntry,

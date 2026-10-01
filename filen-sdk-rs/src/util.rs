@@ -266,6 +266,50 @@ impl<T> PeekableReceiver<T> {
 	}
 }
 
+/// A [`BuildHasher`] keyed with fresh randomness per map, for maps keyed by names an archive or
+/// a drive listing chose.
+///
+/// std's default `RandomState` is not used for them because it has no entropy source on
+/// `wasm32-unknown-unknown`: there it takes its keys from the address of a stack slot and of a
+/// fresh heap allocation, which a wasm module's linear memory hands out the same way run after
+/// run, so its keys are in effect fixed and can be guessed, and such a map could be made to
+/// collide on purpose. `rand::random` draws on the browser's `crypto.getRandomValues` there.
+#[derive(Clone)]
+pub(crate) struct SeededState {
+	keys: (u64, u64),
+}
+
+impl Default for SeededState {
+	fn default() -> Self {
+		Self {
+			keys: (rand::random(), rand::random()),
+		}
+	}
+}
+
+impl BuildHasher for SeededState {
+	type Hasher = siphasher::sip::SipHasher13;
+
+	fn build_hasher(&self) -> Self::Hasher {
+		siphasher::sip::SipHasher13::new_with_keys(self.keys.0, self.keys.1)
+	}
+}
+
+pub(crate) type SeededMap<K, V> = HashMap<K, V, SeededState>;
+pub(crate) type SeededSet<K> = HashSet<K, SeededState>;
+
+/// A panic's message, when its payload is text (what `panic!` makes).
+#[cfg(any(feature = "archive", feature = "cache"))]
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(s) = payload.downcast_ref::<&str>() {
+		(*s).to_string()
+	} else if let Some(s) = payload.downcast_ref::<String>() {
+		s.clone()
+	} else {
+		"non-string panic payload".to_string()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -369,44 +413,5 @@ mod peekable_receiver_tests {
 		drop(tx);
 		assert_eq!(rx.peek().await, None);
 		assert_eq!(rx.recv().await, None);
-	}
-}
-
-/// A [`BuildHasher`] keyed with fresh randomness per map. std's `RandomState` has no entropy
-/// source on `wasm32-unknown-unknown` and hashes with fixed keys there, so a map keyed by names
-/// an archive or a drive listing chose could be made to collide on purpose.
-#[derive(Clone)]
-pub(crate) struct SeededState {
-	keys: (u64, u64),
-}
-
-impl Default for SeededState {
-	fn default() -> Self {
-		Self {
-			keys: (rand::random(), rand::random()),
-		}
-	}
-}
-
-impl BuildHasher for SeededState {
-	type Hasher = siphasher::sip::SipHasher13;
-
-	fn build_hasher(&self) -> Self::Hasher {
-		siphasher::sip::SipHasher13::new_with_keys(self.keys.0, self.keys.1)
-	}
-}
-
-pub(crate) type SeededMap<K, V> = HashMap<K, V, SeededState>;
-pub(crate) type SeededSet<K> = HashSet<K, SeededState>;
-
-/// A panic's message, when its payload is text (what `panic!` makes).
-#[cfg(feature = "archive")]
-pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-	if let Some(s) = payload.downcast_ref::<&str>() {
-		(*s).to_string()
-	} else if let Some(s) = payload.downcast_ref::<String>() {
-		s.clone()
-	} else {
-		"non-string panic payload".to_string()
 	}
 }

@@ -22,34 +22,32 @@ use tokio::{sync::watch, task::JoinHandle};
 use super::*;
 use crate::{
 	auth::http::ClientConfig,
-	consts::CHUNK_SIZE,
+	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::{
+		HasName,
 		archive::{
 			dispose::{DisposalOutcome, KeptReason, SourceDisposal},
-			extract::ExtractFailure,
-			limits::display_path,
-			password::ArchivePassword,
-			sevenz::{
-				crypto::MAX_CYCLES_POWER,
-				write::{SevenZEncryption, SevenZMethod},
-			},
-			test_support::{
-				TarMember, gzip, hash, incompressible, pattern, sevenz_of, tar_of, tar_with, zip_of,
-			},
-			worker::{ARCHIVE_STALL_TIMEOUT, LinkHead},
-		},
-		archive::{
 			entry_path::entry_path,
 			extract::{
-				ArchiveEntryKind, ExpansionLimit, ExtractCallback, ExtractEvent, ExtractSkipReason,
-				ExtractStage, ExtractUpdate, PasswordCheck,
-				codec::{Selection, extract_stream},
+				ArchiveEntryKind, ExpansionLimit, ExtractCallback, ExtractEvent, ExtractFailure,
+				ExtractSkipReason, ExtractStage, ExtractUpdate, PasswordCheck,
+				codec::{PASSWORD_PROBE_BYTES, Selection, extract_stream},
 				test_support::{
-					ARCHIVE_PARENT, MAX_MEMBERS, Options, Setup, archive_file_with, list, setup,
+					ARCHIVE, ARCHIVE_PARENT, DESTINATION, MAX_MEMBERS, Options, Setup, list, setup,
 					setup_in, stream_job, test_config,
 				},
 			},
-			worker,
+			limits::display_path,
+			sevenz::{
+				crypto::MAX_CYCLES_POWER,
+				header::{START_CRC_AT, START_FIELDS_AT, START_HEADER_LEN},
+				write::{SevenZEncryption, SevenZMethod},
+			},
+			test_support::{
+				APPLE_DOUBLE, TarMember, archive_password, gzip, hash, incompressible, pattern,
+				sevenz_of, tar_of, tar_with, zip_of,
+			},
+			worker::{self, ARCHIVE_STALL_TIMEOUT, LinkHead},
 		},
 		dir::RootDirectory,
 		drive_job::{
@@ -103,6 +101,15 @@ impl ExtractCallback for Recorder {
 }
 
 impl Recorder {
+	/// Every event the updates carried, in order.
+	fn events(&self) -> Vec<ExtractEvent> {
+		let updates = self.updates.lock().unwrap();
+		updates
+			.iter()
+			.flat_map(|update| update.events.clone())
+			.collect()
+	}
+
 	fn last(&self) -> ExtractUpdate {
 		self.updates.lock().unwrap().last().unwrap().clone()
 	}
@@ -439,13 +446,10 @@ async fn names_that_read_as_something_else_are_kept_and_reported() {
 	assert_eq!(report.misleading_names, expected);
 	let events: Vec<ExtractMisleadingName> = job
 		.recorder
-		.updates
-		.lock()
-		.unwrap()
-		.iter()
-		.flat_map(|update| &update.events)
+		.events()
+		.into_iter()
 		.filter_map(|event| match event {
-			ExtractEvent::MisleadingName(name) => Some(name.clone()),
+			ExtractEvent::MisleadingName(name) => Some(name),
 			_ => None,
 		})
 		.collect();
@@ -498,7 +502,6 @@ async fn a_directory_renamed_twice_is_reported_once_by_its_archive_path() {
 		]
 	);
 	// both go again into the directory as it was created, under the name it got
-	use crate::fs::HasName;
 	let docs = log_dir(&setup, "docs (2)");
 	for failure in &report.failures {
 		let retry = failure.retry.as_ref().expect("a failed entry goes again");

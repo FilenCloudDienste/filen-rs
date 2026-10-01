@@ -28,7 +28,7 @@ use codec::Selection;
 pub use client_impl::{ExtractConfig, ListConfig};
 pub use list::{
 	ArchiveEntry, ArchiveEntryKind, ListCallback, ListFailed, ListPhase, ListReport, ListTotals,
-	ListUpdate, ListedPath, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
+	ListUpdate, ListedPath, ListedSkipReason, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, PasswordCheck,
 };
 pub use report::{
 	ArchiveEntryId, ExtractActiveFile, ExtractCallback, ExtractEvent, ExtractFailed,

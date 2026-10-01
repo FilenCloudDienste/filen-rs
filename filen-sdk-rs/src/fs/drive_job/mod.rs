@@ -113,8 +113,23 @@ impl Fatal {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicBool, Ordering};
+
 	use super::*;
 	use crate::job::test_support::controls;
+
+	/// A job that only tells whether it was wound down.
+	#[derive(Default)]
+	struct WindsDown(AtomicBool);
+
+	impl JobTick for WindsDown {
+		fn op_started(&self) {}
+		fn op_finished(&self) {}
+		fn set_pause_requested(&self, _: bool) {}
+		fn wind_down(&self, _: &JobControl) {
+			self.0.store(true, Ordering::SeqCst);
+		}
+	}
 
 	/// A job's phases, as few as [`Fatal::end`] needs.
 	#[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +143,46 @@ mod tests {
 		const DONE: Self = Self::Done;
 		const CANCELLED: Self = Self::Cancelled;
 		const FAILED: Self = Self::Failed;
+	}
+
+	#[test]
+	fn a_job_ending_error_stops_only_a_job_no_error_has_ended_yet() {
+		let full = Arc::new(Error::custom(ErrorKind::MaxStorageReached, "full"));
+		let (control, job, mut fatal) = (
+			JobControl::default(),
+			WindsDown::default(),
+			Fatal::default(),
+		);
+		fatal.note(&full, &control, &job);
+		assert!(control.is_stopping());
+		assert!(job.0.load(Ordering::SeqCst));
+		assert!(fatal.0.is_some_and(|error| Arc::ptr_eq(&error, &full)));
+
+		// a damaged archive holds its error without stopping, so its complete files can finish
+		let damaged = Arc::new(Error::custom(ErrorKind::ArchiveCorrupt, "damaged"));
+		let (control, job, mut fatal) = (
+			JobControl::default(),
+			WindsDown::default(),
+			Fatal::default(),
+		);
+		fatal.record(Arc::clone(&damaged));
+		fatal.note(&full, &control, &job);
+		assert!(!control.is_stopping());
+		assert!(!job.0.load(Ordering::SeqCst));
+		assert!(fatal.0.is_some_and(|error| Arc::ptr_eq(&error, &damaged)));
+
+		// an error the job goes on after stays the item's
+		let (control, job, mut fatal) = (
+			JobControl::default(),
+			WindsDown::default(),
+			Fatal::default(),
+		);
+		fatal.note(
+			&Arc::new(Error::custom(ErrorKind::Server, "one item")),
+			&control,
+			&job,
+		);
+		assert!(!control.is_stopping() && fatal.0.is_none());
 	}
 
 	#[test]

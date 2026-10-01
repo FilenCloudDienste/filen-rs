@@ -43,7 +43,6 @@ use crate::{
 	consts::{
 		CALLBACK_INTERVAL, CHUNK_SIZE_U64, FILE_CHUNK_SIZE_EXTRA, MAX_SMALL_PARALLEL_REQUESTS,
 	},
-	fs::name::keep_both::NameShape,
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -53,8 +52,10 @@ use crate::{
 			backend::{DriveBackend, UploadSpec},
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
+			listing::FailedSource,
 			lock::{HeldLock, LockWait, wait_for_lock},
 			name_retry::NameRetry,
+			plan::{DestParent, ItemPlan, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 		},
 		file::{
 			RemoteFile,
@@ -62,19 +63,18 @@ use crate::{
 			traits::{HasFileInfo, HasRemoteFileInfo},
 			write::{RemoteFileInfo, UploadCompletion},
 		},
-		name::ValidatedName,
+		name::{ValidatedName, keep_both::NameShape},
 	},
-	job::{JobControl, JobTasks, Stopped, report::JobReport},
+	job::{
+		JobControl, JobTasks, Stopped,
+		report::{JobReport, OpGuard},
+	},
 	util::{MaybeArc, MaybeSendBoxFuture, MaybeSendSync, sleep},
 };
 
 use super::report::{
 	ActiveFile, CopiedTopLevel, CopyEvent, CopyFailed, CopyFailure, CopyPhase, CopyReport,
-	CopyStage, FailureInfo, OpGuard, PlannedTopLevelItem, Reporter,
-};
-use crate::fs::drive_job::{
-	listing::FailedSource,
-	plan::{DestParent, ItemPlan, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
+	CopyStage, FailureInfo, PlannedTopLevelItem, Reporter,
 };
 
 /// A created directory with the name it got, or why it was not created.

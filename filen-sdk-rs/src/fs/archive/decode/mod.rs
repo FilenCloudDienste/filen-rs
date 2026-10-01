@@ -81,7 +81,7 @@ pub(crate) trait StreamDecoder: Read {
 }
 
 /// Why decoding stopped, other than the input failing.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CodecError {
 	#[error("the compressed data is damaged: {0}")]
 	Corrupt(&'static str),

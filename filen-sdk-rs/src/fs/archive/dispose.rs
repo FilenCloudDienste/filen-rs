@@ -17,6 +17,7 @@
 //! restored.
 
 use std::{
+	borrow::Cow,
 	collections::{BTreeMap, BTreeSet},
 	future::Future,
 	sync::Arc,
@@ -241,7 +242,7 @@ impl DisposalBackend for ClientBackend {
 		let dir = client.get_dir(dir).await?;
 		let (dirs, files) = Normal::list_dir_recursive(
 			client,
-			&DirType::Dir(std::borrow::Cow::Owned(dir)),
+			&DirType::Dir(Cow::Owned(dir)),
 			None::<&fn(u64, Option<u64>)>,
 			(),
 		)
@@ -636,11 +637,13 @@ async fn remove_dir<B: DisposalBackend>(
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use super::{
+		Nest::{Cyclic, Outermost, Within},
+		*,
+	};
 
 	#[test]
 	fn a_source_goes_with_the_outermost_one_it_lies_within() {
-		use Nest::{Cyclic, Outermost, Within};
 		// 2 in 1 in 0, and 3 on its own
 		assert_eq!(
 			nesting(&[None, Some(0), Some(1), None]),

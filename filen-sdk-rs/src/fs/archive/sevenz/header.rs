@@ -8,6 +8,14 @@ pub(crate) const SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 /// The signature, the format version (0.4) and the start header after it.
 pub(crate) const START_HEADER_LEN: usize = 32;
 pub(crate) const START_HEADER_LEN_U64: u64 = START_HEADER_LEN as u64;
+/// Where the format version's major and minor bytes sit.
+pub(crate) const VERSION_AT: usize = SIGNATURE.len();
+/// The minor format version the SDK writes, as 7-Zip does.
+pub(crate) const FORMAT_MINOR: u8 = 4;
+/// Where the start header's CRC sits, and the fields it covers after it: the next header's
+/// offset, size and CRC.
+pub(crate) const START_CRC_AT: usize = 8;
+pub(crate) const START_FIELDS_AT: usize = 12;
 
 pub(crate) const K_END: u8 = 0x00;
 pub(crate) const K_HEADER: u8 = 0x01;
@@ -31,6 +39,16 @@ pub(crate) const K_MTIME: u8 = 0x14;
 pub(crate) const K_WIN_ATTRIBUTES: u8 = 0x15;
 pub(crate) const K_ENCODED_HEADER: u8 = 0x17;
 
+// A folder coder's flags byte.
+/// The length of the coder's method id.
+pub(crate) const CODER_ID_LEN: u8 = 0x0F;
+/// The coder states its input and output counts (otherwise it has one of each).
+pub(crate) const CODER_COMPLEX: u8 = 0x10;
+/// The coder's properties follow its id.
+pub(crate) const CODER_HAS_PROPS: u8 = 0x20;
+/// Alternative methods follow; no 7-Zip writes them.
+pub(crate) const CODER_ALTERNATIVES: u8 = 0xC0;
+
 /// Windows' directory attribute.
 pub(crate) const ATTRIBUTE_DIRECTORY: u32 = 0x10;
 /// A reparse point, which is how Windows stores a symbolic link.
@@ -40,6 +58,7 @@ pub(crate) const ATTRIBUTE_UNIX_EXTENSION: u32 = 0x8000;
 pub(crate) const UNIX_TYPE_MASK: u32 = 0o170_000;
 pub(crate) const UNIX_SYMLINK: u32 = 0o120_000;
 pub(crate) const UNIX_DIR: u32 = 0o040_000;
+pub(crate) const UNIX_FILE: u32 = 0o100_000;
 
 /// A read position in a decoded header.
 pub(crate) struct HeaderReader<'a> {

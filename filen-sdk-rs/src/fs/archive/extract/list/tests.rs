@@ -13,9 +13,10 @@ use crate::{
 	consts::CHUNK_SIZE,
 	fs::{
 		archive::{
-			extract::test_support::{list, setup, test_config},
+			extract::test_support::{ListRecorder, Listing, Setup, list, setup, test_config},
 			format::StreamCodec,
 			test_support::{gzip, incompressible, tar_of, zip_of},
+			zip::read::{CENTRAL_HEADER_LEN, EOCD_LEN},
 		},
 		drive_job::test_support::{Request, wait_until},
 	},
@@ -80,14 +81,7 @@ async fn a_zip_is_listed_from_its_index_alone() {
 		!fetched.contains(&1) && !fetched.contains(&2),
 		"{fetched:?}"
 	);
-	let last = listing
-		.recorder
-		.updates
-		.lock()
-		.unwrap()
-		.last()
-		.unwrap()
-		.clone();
+	let last = listing.recorder.last();
 	assert_eq!((last.phase, last.entries), (ListPhase::Done, 3));
 	assert!(last.bytes_read < zip.len() as u64);
 	assert_eq!(listing.reporter.ops_in_flight(), 0);
@@ -101,8 +95,6 @@ async fn a_zip_is_listed_from_its_index_alone() {
 /// whose index lists the runs' links in turns: taken in index order, every link is in another
 /// chunk from the one before it.
 fn zip_of_scattered_symlinks(runs: usize, per_run: usize) -> Vec<u8> {
-	const EOCD_LEN: usize = 22;
-	const CENTRAL_HEADER_LEN: usize = 46;
 	let stored = ::zip::write::SimpleFileOptions::default()
 		.compression_method(::zip::CompressionMethod::Stored);
 	let mut writer = ::zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -114,7 +106,7 @@ fn zip_of_scattered_symlinks(runs: usize, per_run: usize) -> Vec<u8> {
 		}
 		writer.start_file(format!("filler{run}"), stored).unwrap();
 		writer
-			.write_all(&incompressible(CHUNK_SIZE, run as u64))
+			.write_all(&incompressible(CHUNK_SIZE, run as u64 + 1))
 			.unwrap();
 	}
 	let zip = writer.finish().unwrap().into_inner();
@@ -167,20 +159,24 @@ async fn a_zips_symlinks_are_listed_reading_it_front_to_back() {
 	);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_tar_listing_reads_it_all_and_can_be_paused_and_cancelled() {
+/// A gzipped tar of three chunks and a small file, listed with its first fetch held: its setup
+/// and the listing, under `control`.
+async fn tar_listing_held_at_a_fetch(control: JobControl) -> (Setup, Listing, Vec<u8>) {
 	let data = incompressible(3 * CHUNK_SIZE, 0x99);
 	let tar = gzip(&tar_of(&[("a.bin", &data), ("b.txt", b"b")]));
-	let config = test_config();
-
-	// paused while it reads: it gives back its memory, and goes on once resumed
-	let paused = setup("bundle.tar.gz", tar.clone(), |_| {});
-	paused
+	let setup = setup("bundle.tar.gz", tar.clone(), |_| {});
+	setup
 		.backend
-		.hold_requests(Request::Fetch, [paused.archive.uuid()]);
+		.hold_requests(Request::Fetch, [setup.archive.uuid()]);
+	let listing = list(&setup, control, test_config());
+	wait_until("a fetch is held", || !setup.backend.log().held.is_empty()).await;
+	(setup, listing, tar)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_listing_paused_while_it_reads_gives_back_its_memory_and_goes_on_once_resumed() {
 	let (pause, _cancel, control) = controls();
-	let listing = list(&paused, control, config.clone());
-	wait_until("a fetch is held", || !paused.backend.log().held.is_empty()).await;
+	let (paused, listing, tar) = tar_listing_held_at_a_fetch(control).await;
 	pause.send_replace(true);
 	paused.backend.release_all();
 	wait_until("the listing is paused", || listing.reporter.is_paused()).await;
@@ -197,38 +193,18 @@ async fn a_tar_listing_reads_it_all_and_can_be_paused_and_cancelled() {
 		})
 	);
 	assert_eq!(listed.totals.files, 2);
-	let last = listing
-		.recorder
-		.updates
-		.lock()
-		.unwrap()
-		.last()
-		.unwrap()
-		.clone();
+	let last = listing.recorder.last();
 	assert_eq!(last.bytes_read, tar.len() as u64);
+}
 
-	// cancelled while it reads: what was listed so far comes back with the cancel
-	let cancelled = setup("bundle.tar.gz", tar, |_| {});
-	cancelled
-		.backend
-		.hold_requests(Request::Fetch, [cancelled.archive.uuid()]);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_listing_cancelled_while_it_reads_ends_cancelled() {
 	let (_pause, cancel, control) = controls();
-	let listing = list(&cancelled, control, config.clone());
-	wait_until("a fetch is held", || {
-		!cancelled.backend.log().held.is_empty()
-	})
-	.await;
+	let (_cancelled, listing, _) = tar_listing_held_at_a_fetch(control).await;
 	cancel.send_replace(true);
 	let failed = listing.running.await.unwrap().unwrap_err();
 	assert_eq!(failed.error.kind(), ErrorKind::Cancelled);
-	let last = listing
-		.recorder
-		.updates
-		.lock()
-		.unwrap()
-		.last()
-		.unwrap()
-		.clone();
+	let last = listing.recorder.last();
 	assert_eq!(
 		(last.phase, last.eta),
 		(ListPhase::Cancelled, Some(Duration::ZERO))
@@ -236,38 +212,41 @@ async fn a_tar_listing_reads_it_all_and_can_be_paused_and_cancelled() {
 	assert_eq!(listing.reporter.ops_in_flight(), 0);
 }
 
+/// Lists a tar of an empty file at each of `names`, with room for three times as many members.
+async fn list_tar_of_empty_files(names: &[String]) -> (ListReport, Arc<ListRecorder>) {
+	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+	let setup = setup("names.tar", tar_of(&members), |_| {});
+	// a GNU long-name record may come before each
+	let mut config = test_config();
+	config.max_members = 3 * names.len() as u64;
+	let listing = list(&setup, JobControl::default(), config);
+	let listed = listing.running.await.unwrap().unwrap();
+	(listed, listing.recorder)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 	let names: Vec<String> = (0..MAX_LISTED_ENTRIES + 3)
 		.map(|i| format!("f{i:05}"))
 		.collect();
-	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
-	let many = setup("many.tar", tar_of(&members), |_| {});
-	let mut config = test_config();
-	config.max_members = 2 * MAX_LISTED_ENTRIES as u64;
-	let listing = list(&many, JobControl::default(), config);
-	let listed = listing.running.await.unwrap().unwrap();
+	let (listed, recorder) = list_tar_of_empty_files(&names).await;
 
 	assert_eq!(listed.entries.len(), MAX_LISTED_ENTRIES);
 	assert_eq!(listed.omitted_entries, 3);
 	assert_eq!(listed.totals.files, names.len() as u64);
-	assert_eq!(listing.recorder.entries.lock().unwrap().len(), names.len());
-	let batches = listing.recorder.batches.lock().unwrap().clone();
+	assert_eq!(recorder.entries.lock().unwrap().len(), names.len());
+	let batches = recorder.batches.lock().unwrap().clone();
 	assert!(
 		batches.iter().all(|&batch| batch <= CALLBACK_BATCH),
 		"{batches:?}"
 	);
+}
 
-	// long paths fill the listing's bytes before its count
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_paths_fill_a_listings_bytes_before_its_count() {
 	let dir = vec!["d".repeat(250); 16].join("/");
 	let names: Vec<String> = (0..2200).map(|i| format!("{dir}/f{i:04}")).collect();
-	let members: Vec<(&str, &[u8])> = names.iter().map(|name| (name.as_str(), &b""[..])).collect();
-	let long = setup("long.tar", tar_of(&members), |_| {});
-	// a GNU long-name record before each
-	let mut config = test_config();
-	config.max_members = 3 * names.len() as u64;
-	let listing = list(&long, JobControl::default(), config);
-	let listed = listing.running.await.unwrap().unwrap();
+	let (listed, recorder) = list_tar_of_empty_files(&names).await;
 	// each keeps its stored path and its drive path, some 8 KB in all
 	let kept = listed.entries.len();
 	assert!(
@@ -275,7 +254,7 @@ async fn a_listing_keeps_the_first_entries_and_hands_over_them_all() {
 		"{kept}"
 	);
 	assert_eq!(kept as u64 + listed.omitted_entries, names.len() as u64);
-	assert_eq!(listing.recorder.entries.lock().unwrap().len(), names.len());
+	assert_eq!(recorder.entries.lock().unwrap().len(), names.len());
 }
 
 #[test]
@@ -297,8 +276,8 @@ fn stated_sizes_add_up_without_overflowing() {
 		kind: ArchiveEntryKind::File,
 	};
 	let mut totals = ListTotals::default();
-	for skip in [None, Some(ExtractSkipReason::UnsupportedMethod)] {
-		totals.count(&entry(skip.clone()));
+	for skip in [None, Some(ListedSkipReason::UnsupportedMethod)] {
+		totals.count(&entry(skip));
 		totals.count(&entry(skip));
 	}
 	assert_eq!((totals.bytes, totals.bytes_skipped), (u64::MAX, u64::MAX));

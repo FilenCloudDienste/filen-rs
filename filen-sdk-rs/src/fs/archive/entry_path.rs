@@ -174,6 +174,7 @@ fn is_suspicious(c: char) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::fs::name::encode_name;
 
 	fn names(path: &ArchivePath) -> Vec<&str> {
 		path.segments.iter().map(|s| s.as_ref()).collect()
@@ -252,10 +253,7 @@ mod tests {
 	fn invalid_names_are_encoded_and_fullwidth_forms_kept() {
 		let path = entry_path("a:b.txt").unwrap();
 		assert!(path.rewritten);
-		assert_eq!(
-			path.segments[0],
-			crate::fs::name::encode_name("a:b.txt").unwrap()
-		);
+		assert_eq!(path.segments[0], encode_name("a:b.txt").unwrap());
 		// full-width `／` and `＼` are ordinary characters in a drive name
 		let path = entry_path("資料／2024.pdf").unwrap();
 		assert_eq!(names(&path), ["資料／2024.pdf"]);

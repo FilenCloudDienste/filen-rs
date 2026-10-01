@@ -42,35 +42,9 @@ fn damage_is_caught() {
 /// `zip` with its `drop`-th central directory record left out, as an in-place edit that
 /// forgot an entry leaves it: the entry's local header and data stay where they were.
 fn without_central_record(zip: &[u8], drop: usize) -> Vec<u8> {
-	let eocd = zip.len() - 22;
-	assert_eq!(u32_at(zip, eocd), EOCD_SIG, "no zip64 or comment here");
-	let cd_size = u32_at(zip, eocd + 12) as usize;
-	let cd_start = u32_at(zip, eocd + 16) as usize;
-	let mut records = Vec::new();
-	let mut at = cd_start;
-	while at < cd_start + cd_size {
-		let len = 46
-			+ usize::from(u16_at(zip, at + 28))
-			+ usize::from(u16_at(zip, at + 30))
-			+ usize::from(u16_at(zip, at + 32));
-		records.push(&zip[at..at + len]);
-		at += len;
-	}
-	let kept: Vec<u8> = records
-		.iter()
-		.enumerate()
-		.filter(|&(i, _)| i != drop)
-		.flat_map(|(_, record)| record.iter().copied())
-		.collect();
-	let mut out = zip[..cd_start].to_vec();
-	out.extend_from_slice(&kept);
-	let mut end = zip[eocd..].to_vec();
-	let count = u16::try_from(records.len() - 1).unwrap();
-	end[8..10].copy_from_slice(&count.to_le_bytes());
-	end[10..12].copy_from_slice(&count.to_le_bytes());
-	end[12..16].copy_from_slice(&(u32::try_from(kept.len()).unwrap()).to_le_bytes());
-	out.extend_from_slice(&end);
-	out
+	let (at, mut records, end) = central_records(zip);
+	records.remove(drop);
+	with_central_records(&zip[..at], &records, end)
 }
 
 #[test]
@@ -83,7 +57,7 @@ fn bytes_between_entries_belong_to_nothing() {
 	let zip = ours(&entries, ZipMethod::Stored, None);
 	let unaccounted = |zip: &[u8]| {
 		let mut source = Cursor::new(zip);
-		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 		index
 			.entries
 			.iter()
@@ -125,7 +99,7 @@ fn an_end_record_signature_after_the_comment_is_not_taken_for_one() {
 	let mut padded = zip.clone();
 	padded.extend_from_slice(&fake);
 	let mut source = Cursor::new(&padded);
-	let index = read_index(&mut source, padded.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, padded.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.trailing_bytes, fake.len() as u64);
 	assert_eq!(read_all(&padded, None).unwrap()[0].2, b"alpha");
 }
@@ -162,7 +136,7 @@ fn candidate_end_records_are_told_from_the_tail_alone() {
 		inner: Cursor::new(&padded[..]),
 		seeks: 0,
 	};
-	let index = read_index(&mut source, padded.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, padded.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.entries.len(), 1);
 	// the tail, then the central directory: nothing fetched to probe the candidates
 	assert_eq!(source.seeks, 2);
@@ -193,7 +167,7 @@ fn a_record_whose_comment_ends_the_zip_is_taken_over_a_later_one() {
 		.copy_from_slice(&u16::try_from(comment.len()).unwrap().to_le_bytes());
 	commented.extend_from_slice(&comment);
 	let mut source = Cursor::new(&commented);
-	let index = read_index(&mut source, commented.len() as u64, LIMITS).unwrap();
+	let index = read_index(&mut source, commented.len() as u64, READ_BACK_ZIP).unwrap();
 	assert_eq!(index.trailing_bytes, 0);
 	assert_eq!(read_all(&commented, None).unwrap()[0].2, b"alpha");
 }
@@ -211,7 +185,7 @@ fn bytes_after_the_end_record_are_counted() {
 	short_comment.extend_from_slice(comment);
 	for (zip, trailing) in [(&zip, 0), (&padded, 100), (&short_comment, 7)] {
 		let mut source = Cursor::new(zip);
-		let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
+		let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
 		assert_eq!(index.trailing_bytes, trailing);
 		assert_eq!(read_all(zip, None).unwrap()[0].2, b"alpha");
 	}
@@ -259,8 +233,15 @@ fn an_understated_bomb_stops_at_its_stated_size() {
 		STATED,
 	);
 	let mut source = Cursor::new(&zip);
-	let index = read_index(&mut source, zip.len() as u64, LIMITS).unwrap();
-	let mut entry = open_entry(&mut source, index.shift, &index.entries[0], None, ENTRY).unwrap();
+	let index = read_index(&mut source, zip.len() as u64, READ_BACK_ZIP).unwrap();
+	let mut entry = open_entry(
+		&mut source,
+		index.shift,
+		&index.entries[0],
+		None,
+		READ_BACK_ZIP_ENTRY,
+	)
+	.unwrap();
 	let mut buf = [0u8; 4096];
 	let mut delivered = 0;
 	let error = loop {

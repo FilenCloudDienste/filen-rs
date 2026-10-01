@@ -12,10 +12,10 @@ use lzma_rust2::{
 
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 
-use super::*;
+use super::{zstd::MAX_BLOCK_BYTES, *};
 use crate::{
 	alloc_meter::peak_bytes,
-	fs::archive::test_support::{damaged_copies, gzip},
+	fs::archive::test_support::{READ_BACK_MEMORY, damaged_copies, gzip, zstd_raw_frame},
 };
 
 const MIB_USIZE: usize = 1024 * 1024;
@@ -56,12 +56,7 @@ fn codec_error(error: &io::Error) -> Option<&CodecError> {
 
 fn codec_err(result: io::Result<(Vec<u8>, StreamEnd)>) -> CodecError {
 	let error = result.expect_err("decoding should fail");
-	match codec_error(&error) {
-		Some(CodecError::Corrupt(what)) => CodecError::Corrupt(what),
-		Some(CodecError::Unsupported(what)) => CodecError::Unsupported(what),
-		Some(CodecError::OverBudget { limit }) => CodecError::OverBudget { limit: *limit },
-		None => panic!("not a codec error: {error}"),
-	}
+	*codec_error(&error).unwrap_or_else(|| panic!("not a codec error: {error}"))
 }
 
 fn corrupt(result: io::Result<(Vec<u8>, StreamEnd)>) -> &'static str {
@@ -106,38 +101,6 @@ const ZSTD_INVALID: &str = "invalid zstd data";
 
 fn zstd(data: &[u8]) -> Vec<u8> {
 	compress_to_vec(data, CompressionLevel::Fastest)
-}
-
-/// A zstd frame of raw blocks, written by hand: a window of `1 << window_log` bytes, the content
-/// size in the header when `states_size`, and a dictionary id when `dictionary` is given.
-fn zstd_raw_frame(
-	data: &[u8],
-	window_log: u8,
-	states_size: bool,
-	dictionary: Option<u8>,
-) -> Vec<u8> {
-	let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
-	// FCS_flag 2 (4 bytes) when stating the size, Dictionary_ID_flag 1 (1 byte) with one
-	let descriptor = if states_size { 2 << 6 } else { 0 } | u8::from(dictionary.is_some());
-	frame.push(descriptor);
-	frame.push((window_log - 10) << 3);
-	frame.extend(dictionary);
-	if states_size {
-		frame.extend_from_slice(&(u32::try_from(data.len()).unwrap()).to_le_bytes());
-	}
-	let block_max = (1usize << window_log).min(128 << 10);
-	let mut blocks = data.chunks(block_max).peekable();
-	if blocks.peek().is_none() {
-		frame.extend_from_slice(&[1, 0, 0]);
-	}
-	while let Some(block) = blocks.next() {
-		// raw blocks: the last-block bit, type 0, and the size above them
-		let header =
-			u32::from(blocks.peek().is_none()) | (u32::try_from(block.len()).unwrap()) << 3;
-		frame.extend_from_slice(&header.to_le_bytes()[..3]);
-		frame.extend_from_slice(block);
-	}
-	frame
 }
 
 fn brotli(data: &[u8]) -> Vec<u8> {
@@ -194,10 +157,10 @@ fn bzip2_members_and_budget() {
 	assert_eq!(out, [a, b].concat());
 	assert_eq!(end, VERIFIED);
 
-	assert!(matches!(
+	assert_eq!(
 		codec_err(decode(StreamCodec::Bzip2, &bytes, 2 * MIB)),
-		CodecError::OverBudget { limit } if limit == 2 * MIB
-	));
+		CodecError::OverBudget { limit: 2 * MIB }
+	);
 }
 
 #[test]
@@ -376,10 +339,10 @@ fn lzip_members() {
 	let mut writer = LzipWriter::new(Vec::new(), LzipOptions::with_preset(6));
 	writer.write_all(&data).unwrap();
 	let big_dict = writer.finish().unwrap();
-	assert!(matches!(
+	assert_eq!(
 		codec_err(decode(StreamCodec::Lzip, &big_dict, 2 * MIB)),
-		CodecError::OverBudget { limit } if limit == 2 * MIB
-	));
+		CodecError::OverBudget { limit: 2 * MIB }
+	);
 }
 
 #[test]
@@ -461,10 +424,10 @@ fn lz4_damage() {
 
 	let mut legacy = bytes.clone();
 	legacy[..4].copy_from_slice(&[0x02, 0x21, 0x4C, 0x18]);
-	assert!(matches!(
+	assert_eq!(
 		codec_err(decode(StreamCodec::Lz4, &legacy, BUDGET)),
 		CodecError::Unsupported("the legacy lz4 format")
-	));
+	);
 }
 
 #[test]
@@ -637,14 +600,14 @@ fn zstd_damage() {
 		corrupt(decode(StreamCodec::Zstd, &wrong_size, BUDGET)),
 		"a zstd frame's size differs from its header"
 	);
-	assert!(matches!(
+	assert_eq!(
 		codec_err(decode(
 			StreamCodec::Zstd,
 			&zstd_raw_frame(b"x", 17, false, Some(7)),
 			BUDGET
 		)),
 		CodecError::Unsupported("a zstd frame that needs a dictionary")
-	));
+	);
 }
 
 #[test]
@@ -653,10 +616,7 @@ fn a_zstd_window_is_charged_before_it_is_allocated() {
 	// allocating for it
 	let frame = zstd_raw_frame(b"small", 26, false, None);
 	let (result, peak) = peak_bytes(|| decode(StreamCodec::Zstd, &frame, BUDGET));
-	assert!(matches!(
-		codec_err(result),
-		CodecError::OverBudget { limit } if limit == BUDGET
-	));
+	assert_eq!(codec_err(result), CodecError::OverBudget { limit: BUDGET });
 	assert!(peak < MIB, "took {peak} bytes");
 	assert_eq!(
 		decode(StreamCodec::Zstd, &frame, 256 * MIB).unwrap().0,
@@ -687,7 +647,7 @@ impl Write for Hashed {
 fn zstd_peak(bytes: &[u8]) -> ((u64, u32), u64) {
 	let mut hashed = Hashed::default();
 	let ((), peak) = peak_bytes(|| {
-		let mut decoder = open_stream(StreamCodec::Zstd, bytes, 512 * MIB).unwrap();
+		let mut decoder = open_stream(StreamCodec::Zstd, bytes, READ_BACK_MEMORY).unwrap();
 		io::copy(&mut decoder, &mut hashed).unwrap();
 	});
 	((hashed.len, hashed.crc.finalize()), peak)
@@ -697,7 +657,7 @@ fn zstd_peak(bytes: &[u8]) -> ((u64, u32), u64) {
 fn a_zstd_decoder_stays_within_what_its_window_is_charged() {
 	// what `max_window` holds a budget to: the ring at its peak (the power of two above a window
 	// and a block, and the half-size one before it) and the decoder's state
-	let charged = |window: u64| (window + 128 * 1024).next_power_of_two() * 3 / 2 + 2 * MIB;
+	let charged = |window: u64| (window + MAX_BLOCK_BYTES).next_power_of_two() * 3 / 2 + 2 * MIB;
 	for (window_log, len) in [(23, 9 * MIB_USIZE), (17, 2 * MIB_USIZE)] {
 		let data = sample(len);
 		let (decoded, peak) = zstd_peak(&zstd_raw_frame(&data, window_log, true, None));
@@ -714,7 +674,7 @@ fn a_zstd_decoder_stays_within_what_its_window_is_charged() {
 	assert!(peak <= charged(128 * 1024), "took {peak} bytes");
 	// the most sequences a block holds, 43690 matches of 3 bytes: the sequence buffer at its
 	// largest, in a frame of the smallest window a full block fits
-	let count: u32 = 128 * 1024 / 3;
+	let count = u32::try_from(MAX_BLOCK_BYTES / 3).unwrap();
 	let mut block = vec![0, 255];
 	block.extend_from_slice(&u16::try_from(count - 0x7F00).unwrap().to_le_bytes());
 	block.extend_from_slice(&[0b0101_0100, 0, 0, 0, 1]);
@@ -784,8 +744,11 @@ fn a_zstd_block_decoding_past_its_maximum_is_refused_before_it_is_written() {
 
 	// more sequences than a block has room for, each copying the least a match can (3 bytes)
 	let mut many = vec![0, 255, 0xAB, 0x2A, 0b0101_0100, 0, 0, 0, 1];
-	many[2..4]
-		.copy_from_slice(&(u16::try_from(128 * 1024 / 3 + 1 - 0x7F00).unwrap()).to_le_bytes());
+	many[2..4].copy_from_slice(
+		&u16::try_from(MAX_BLOCK_BYTES / 3 + 1 - 0x7F00)
+			.unwrap()
+			.to_le_bytes(),
+	);
 	assert_eq!(
 		corrupt(decode(
 			StreamCodec::Zstd,
@@ -834,7 +797,7 @@ fn a_zstd_block_of_exactly_its_maximum_decodes() {
 	// literals and matches of 128 KiB in all: 131074 - 2
 	let frame = zstd_crafted_frame(17, &zstd_sequences_block(1, 2));
 	let (decoded, _) = decode(StreamCodec::Zstd, &frame, BUDGET).unwrap();
-	assert_eq!(decoded.len(), 8 + 128 * 1024);
+	assert_eq!(decoded.len() as u64, 8 + MAX_BLOCK_BYTES);
 	// the second repeated offset starts as 4: the raw block's last four bytes, over and over
 	assert!(
 		decoded[8..]
@@ -889,8 +852,8 @@ fn input_errors_pass_through_unchanged() {
 
 #[test]
 fn a_budget_below_the_input_buffer_is_refused() {
-	assert!(matches!(
+	assert_eq!(
 		open_stream(StreamCodec::Gzip, &[][..], 1024).err(),
 		Some(CodecError::OverBudget { limit: 1024 })
-	));
+	);
 }

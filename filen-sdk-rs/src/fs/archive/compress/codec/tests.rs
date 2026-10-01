@@ -1,10 +1,7 @@
 //! The codec on its real thread, driven from the test thread, and what it writes read back
 //! through the SDK's own decoders and tar reader.
 
-use std::{
-	collections::HashMap,
-	time::{Duration, Instant},
-};
+use std::collections::HashMap;
 
 use chrono::TimeZone;
 
@@ -17,11 +14,14 @@ use crate::{
 		encode::Compression,
 		format::StreamCodec,
 		tar_iter::{MemberKind, TarReader},
-		test_support::{archive_password, pattern},
+		test_support::{
+			LocalRecords, READ_BACK_MEMORY, READ_BACK_ZIP, READ_BACK_ZIP_ENTRY, archive_password,
+			local_records, pattern, tar_members,
+		},
 		worker::{self, WorkerLink},
 		zip::{
 			crypto::AesStrength,
-			read::{EntryLimits, ZipEntry, ZipKind, ZipLimits, open_entry, read_index},
+			read::{ZipKind, open_entry, read_index},
 			write::ZipMethod,
 		},
 	},
@@ -117,17 +117,8 @@ fn drive(
 			other => panic!("the compressing codec sent {other:?}"),
 		}
 	}
-	let deadline = Instant::now() + Duration::from_secs(10);
-	written.result = loop {
-		match link.done.try_recv() {
-			Ok(result) => break result,
-			Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-				assert!(Instant::now() < deadline, "the codec never returned");
-				std::thread::sleep(Duration::from_millis(1));
-			}
-			Err(tokio::sync::oneshot::error::TryRecvError::Closed) => panic!("the codec died"),
-		}
-	};
+	// the codec's thread hands its result over right after the events close
+	written.result = futures::executor::block_on(&mut link.done).expect("the codec died");
 	written
 }
 
@@ -143,28 +134,17 @@ struct Member {
 fn read_tar(archive: &[u8], codec: Option<StreamCodec>) -> Vec<Member> {
 	let reader: Box<dyn Read> = match codec {
 		None => Box::new(archive),
-		Some(codec) => Box::new(open_stream(codec, archive, 512 << 20).unwrap()),
+		Some(codec) => Box::new(open_stream(codec, archive, READ_BACK_MEMORY).unwrap()),
 	};
-	let mut tar = TarReader::new(reader, 1000);
-	let mut members = Vec::new();
-	while let Some(member) = tar.next_member().unwrap() {
-		let mut data = Vec::new();
-		let mut buf = [0u8; 8192];
-		loop {
-			let n = tar.read_body(&mut buf).unwrap();
-			if n == 0 {
-				break;
-			}
-			data.extend_from_slice(&buf[..n]);
-		}
-		members.push(Member {
+	tar_members(&mut TarReader::new(reader, 1000))
+		.into_iter()
+		.map(|(member, data)| Member {
 			dir: member.kind == MemberKind::Dir,
 			path: member.path,
 			mtime: member.modified.map_or(0, |time| time.secs),
 			data,
-		});
-	}
-	members
+		})
+		.collect()
 }
 
 fn when(secs: i64) -> Option<DateTime<Utc>> {
@@ -205,7 +185,7 @@ fn sample() -> (Vec<ArchiveEntry>, HashMap<u32, Vec<u8>>, Vec<Member>) {
 		ArchiveEntry::File {
 			source: 2,
 			path: "big.bin".into(),
-			size: CHUNK_SIZE as u64 + 1234,
+			size: CHUNK_SIZE_U64 + 1234,
 			modified: None,
 		},
 		ArchiveEntry::File {
@@ -309,7 +289,7 @@ fn a_single_file_compresses_on_its_own() {
 	assert_eq!(written.result.unwrap(), written.archive.len() as u64);
 	assert_eq!(written.file_ends, 1);
 	let mut decoded = Vec::new();
-	open_stream(StreamCodec::Xz, &written.archive[..], 512 << 20)
+	open_stream(StreamCodec::Xz, &written.archive[..], READ_BACK_MEMORY)
 		.unwrap()
 		.read_to_end(&mut decoded)
 		.unwrap();
@@ -399,15 +379,7 @@ fn zip_crate_entries(archive: &[u8], password: Option<&[u8]>) -> Vec<(String, Ve
 /// Reads a zip back through our own reader, which checks every CRC and AES code.
 fn our_entries(archive: &[u8], password: Option<&ArchivePassword>) -> Vec<(String, Vec<u8>)> {
 	let mut source = std::io::Cursor::new(archive);
-	let index = read_index(
-		&mut source,
-		archive.len() as u64,
-		ZipLimits {
-			max_index_bytes: 32 << 20,
-			max_entries: 1000,
-		},
-	)
-	.unwrap();
+	let index = read_index(&mut source, archive.len() as u64, READ_BACK_ZIP).unwrap();
 	assert!(index.overlapping.is_empty() && index.duplicate_count == 0);
 	assert_eq!(index.prefix_bytes, 0);
 	index
@@ -421,9 +393,7 @@ fn our_entries(archive: &[u8], password: Option<&ArchivePassword>) -> Vec<(Strin
 					index.shift,
 					entry,
 					password,
-					EntryLimits {
-						decoder_memory: 64 << 20,
-					},
+					READ_BACK_ZIP_ENTRY,
 				)
 				.unwrap()
 				.read_to_end(&mut data)
@@ -484,57 +454,6 @@ fn every_zip_method_and_encryption_reads_back_entry_for_entry() {
 	}
 }
 
-/// A zip entry's records around its data, as its local header and data descriptor state them.
-#[derive(Debug, PartialEq)]
-struct EntryRecords {
-	/// The local header's compressed size and size fields.
-	local_sizes: (u32, u32),
-	/// The data of the local header's zip64 extra field, if it has one.
-	local_zip64: Option<Vec<u8>>,
-	/// The data descriptor's compressed size and size, and whether they are 8 bytes each.
-	descriptor: (u64, u64, bool),
-}
-
-/// The records of the file `entry` of `archive`, reading its descriptor as zip64 when `zip64`.
-fn entry_records(archive: &[u8], entry: &ZipEntry, zip64: bool) -> EntryRecords {
-	const ZIP64_EXTRA_ID: u16 = 0x0001;
-	const DATA_DESCRIPTOR_SIG: u32 = 0x0807_4b50;
-	let u16_at = |at: usize| u16::from_le_bytes(archive[at..at + 2].try_into().unwrap());
-	let u32_at = |at: usize| u32::from_le_bytes(archive[at..at + 4].try_into().unwrap());
-	let u64_at = |at: usize| u64::from_le_bytes(archive[at..at + 8].try_into().unwrap());
-	let at = usize::try_from(entry.header_offset).unwrap();
-	let name_len = usize::from(u16_at(at + 26));
-	let extra_len = usize::from(u16_at(at + 28));
-	let mut extra = &archive[at + 30 + name_len..at + 30 + name_len + extra_len];
-	let mut local_zip64 = None;
-	while !extra.is_empty() {
-		let (id, len) = (
-			u16::from_le_bytes([extra[0], extra[1]]),
-			usize::from(u16::from_le_bytes([extra[2], extra[3]])),
-		);
-		if id == ZIP64_EXTRA_ID {
-			local_zip64 = Some(extra[4..4 + len].to_vec());
-		}
-		extra = &extra[4 + len..];
-	}
-	let descriptor =
-		at + 30 + name_len + extra_len + usize::try_from(entry.compressed_size).unwrap();
-	assert_eq!(u32_at(descriptor), DATA_DESCRIPTOR_SIG, "{}", entry.name);
-	EntryRecords {
-		local_sizes: (u32_at(at + 18), u32_at(at + 22)),
-		local_zip64,
-		descriptor: if zip64 {
-			(u64_at(descriptor + 8), u64_at(descriptor + 16), true)
-		} else {
-			(
-				u64::from(u32_at(descriptor + 8)),
-				u64::from(u32_at(descriptor + 12)),
-				false,
-			)
-		},
-	}
-}
-
 #[test]
 fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 	// lowered from 4 GiB, so the sample's file over a chunk is written as an entry that large
@@ -546,7 +465,7 @@ fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 		(ZipMethod::Bzip2 { level: 1 }, None),
 	] {
 		let (entries, sources, members) = sample();
-		let password = encryption.map(|_| ArchivePassword::new("zip64".to_owned()).unwrap());
+		let password = encryption.map(|_| archive_password("zip64"));
 		let job = job(
 			CompressFormat::Zip { method, encryption },
 			entries,
@@ -571,15 +490,7 @@ fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 		// a zip64 entry's local header leaves its sizes to its zip64 data descriptor, and
 		// carries the zip64 field that says so; every other entry's leaves them at 0
 		let mut source = std::io::Cursor::new(&written.archive[..]);
-		let index = read_index(
-			&mut source,
-			written.archive.len() as u64,
-			ZipLimits {
-				max_index_bytes: 1 << 20,
-				max_entries: 100,
-			},
-		)
-		.unwrap();
+		let index = read_index(&mut source, written.archive.len() as u64, READ_BACK_ZIP).unwrap();
 		let mut zip64_entries = Vec::new();
 		for entry in index.entries.iter().filter(|e| e.kind == ZipKind::File) {
 			let zip64 = entry.size >= ZIP64_FROM;
@@ -587,11 +498,11 @@ fn a_zips_entries_from_the_zip64_threshold_up_read_back_entry_for_entry() {
 				zip64_entries.push(entry.name.as_str());
 			}
 			assert_eq!(
-				entry_records(&written.archive, entry, zip64),
-				EntryRecords {
-					local_sizes: if zip64 { (u32::MAX, u32::MAX) } else { (0, 0) },
-					local_zip64: zip64.then(|| vec![0; 16]),
-					descriptor: (entry.compressed_size, entry.size, zip64),
+				local_records(&mut source, 0, entry),
+				LocalRecords {
+					sizes: if zip64 { (u32::MAX, u32::MAX) } else { (0, 0) },
+					zip64: zip64.then(|| vec![0; 2]),
+					descriptor: (entry.compressed_size, entry.size),
 				},
 				"{} {case}",
 				entry.name
@@ -631,15 +542,7 @@ fn every_zip_entry_gets_its_own_salt() {
 	);
 	written.result.unwrap();
 	let mut source = std::io::Cursor::new(&written.archive[..]);
-	let index = read_index(
-		&mut source,
-		written.archive.len() as u64,
-		ZipLimits {
-			max_index_bytes: 1 << 20,
-			max_entries: 100,
-		},
-	)
-	.unwrap();
+	let index = read_index(&mut source, written.archive.len() as u64, READ_BACK_ZIP).unwrap();
 	// a stored AES entry's data starts with its 16-byte salt
 	let salts: std::collections::HashSet<Vec<u8>> = index
 		.entries

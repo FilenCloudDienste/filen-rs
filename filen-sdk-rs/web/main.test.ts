@@ -2512,9 +2512,9 @@ test("an encrypted archive needs its password: none and a wrong one fail before 
 	const source = await archiveSource(parent, 11)
 	const format: CompressFormat = { type: "zip", method: { type: "deflate", level: 1 }, encryption: "aes128" }
 	// an encrypted format refuses a call without a password before anything runs
-	await expect(
-		state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format })
-	).rejects.toMatchObject({ kind: "ArchivePasswordRequired" })
+	await expect(state.compressItems({ items: [source.root], destination: parent, name: "locked.zip", format })).rejects.toMatchObject({
+		kind: "ArchivePasswordRequired"
+	})
 	// a single compressed file of a folder, before anything is listed
 	await expect(
 		state.compressItems({

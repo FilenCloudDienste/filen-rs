@@ -26,9 +26,9 @@ use crate::{
 };
 
 use super::{
-	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, FLAG_DATA_DESCRIPTOR,
-	FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES, METHOD_BZIP2,
-	METHOD_DEFLATE, METHOD_STORED,
+	CENTRAL_HEADER_SIG, EOCD_SIG, EOCD64_LOCATOR_SIG, EOCD64_SIG, EXTRA_AES, EXTRA_ZIP64,
+	FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, LOCAL_HEADER_SIG, METHOD_AES,
+	METHOD_BZIP2, METHOD_DEFLATE, METHOD_STORED, ZIP64_MARKER,
 	crypto::{AesStrength, AesWriter},
 };
 
@@ -116,8 +116,8 @@ struct CentralEntry {
 pub(crate) struct ZipWriter<W> {
 	out: Counting<W>,
 	entries: Vec<CentralEntry>,
-	/// [`ZIP64_ENTRY_THRESHOLD`], lowered by tests that cannot write 4 GiB to reach it.
-	#[cfg(test)]
+	/// The size from which an entry is written with zip64 sizes: [`ZIP64_ENTRY_THRESHOLD`],
+	/// lowered by tests that cannot write 4 GiB to reach it.
 	zip64_entry_threshold: u64,
 }
 
@@ -126,17 +126,8 @@ impl<W: Write> ZipWriter<W> {
 		Self {
 			out: Counting::new(out, 0),
 			entries: Vec::new(),
-			#[cfg(test)]
 			zip64_entry_threshold: ZIP64_ENTRY_THRESHOLD,
 		}
-	}
-
-	/// The size from which an entry is written with zip64 sizes.
-	fn zip64_entry_threshold(&self) -> u64 {
-		#[cfg(test)]
-		return self.zip64_entry_threshold;
-		#[cfg(not(test))]
-		ZIP64_ENTRY_THRESHOLD
 	}
 
 	/// Adds a directory; `path` without its trailing `/`.
@@ -173,7 +164,7 @@ impl<W: Write> ZipWriter<W> {
 		encryption: Option<Encryption<'_>>,
 		data: &mut dyn Read,
 	) -> io::Result<u64> {
-		let zip64 = size >= self.zip64_entry_threshold();
+		let zip64 = size >= self.zip64_entry_threshold;
 		let mut entry = CentralEntry {
 			name: path.as_bytes().to_vec(),
 			flags: FLAG_UTF8
@@ -269,7 +260,9 @@ impl<W: Write> ZipWriter<W> {
 		}
 		let cd_size = self.out.written - cd_start;
 		let count = self.entries.len() as u64;
-		let needs_zip64 = count >= 0xFFFF || cd_size >= 0xFFFF_FFFF || cd_start >= 0xFFFF_FFFF;
+		let needs_zip64 = count >= 0xFFFF
+			|| cd_size >= u64::from(ZIP64_MARKER)
+			|| cd_start >= u64::from(ZIP64_MARKER);
 		let out = &mut self.out;
 		if needs_zip64 {
 			let record_at = out.written;
@@ -303,13 +296,13 @@ impl<W: Write> ZipWriter<W> {
 }
 
 fn clamp32(value: u64) -> u32 {
-	u32::try_from(value).unwrap_or(0xFFFF_FFFF)
+	u32::try_from(value).unwrap_or(ZIP64_MARKER)
 }
 
-fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
+fn extras(entry: &CentralEntry, zip64: Option<&[u64]>) -> Vec<u8> {
 	let mut extra = Vec::new();
 	if let Some(values) = zip64 {
-		extra.extend_from_slice(&0x0001u16.to_le_bytes());
+		extra.extend_from_slice(&EXTRA_ZIP64.to_le_bytes());
 		let len = u16::try_from(values.len() * 8)
 			.expect("at most three zip64 values, 24 bytes (should be impossible)");
 		extra.extend_from_slice(&len.to_le_bytes());
@@ -331,7 +324,7 @@ fn extras(entry: &CentralEntry, zip64: Option<Vec<u64>>) -> Vec<u8> {
 		extra.extend_from_slice(&data);
 	}
 	if let Some((strength, actual)) = entry.aes {
-		extra.extend_from_slice(&0x9901u16.to_le_bytes());
+		extra.extend_from_slice(&EXTRA_AES.to_le_bytes());
 		extra.extend_from_slice(&7u16.to_le_bytes());
 		// AE-2
 		extra.extend_from_slice(&2u16.to_le_bytes());
@@ -380,7 +373,7 @@ fn field_lens(entry: &CentralEntry, extra: &[u8]) -> io::Result<[u16; 2]> {
 }
 
 fn write_local_header<W: Write>(out: &mut W, entry: &CentralEntry, zip64: bool) -> io::Result<()> {
-	let extra = extras(entry, zip64.then(|| vec![0, 0]));
+	let extra = extras(entry, zip64.then_some(&[0, 0]));
 	// checked before anything is written, so a name too long leaves no partial header
 	let [name_len, extra_len] = field_lens(entry, &extra)?;
 	out.write_all(&LOCAL_HEADER_SIG.to_le_bytes())?;
@@ -391,7 +384,7 @@ fn write_local_header<W: Write>(out: &mut W, entry: &CentralEntry, zip64: bool) 
 	out.write_all(&entry.dos.0.to_le_bytes())?;
 	// CRC-32 and sizes follow the data in its descriptor (or are zero, for a directory)
 	out.write_all(&0u32.to_le_bytes())?;
-	let size_field: u32 = if zip64 { 0xFFFF_FFFF } else { 0 };
+	let size_field = if zip64 { ZIP64_MARKER } else { 0 };
 	out.write_all(&size_field.to_le_bytes())?;
 	out.write_all(&size_field.to_le_bytes())?;
 	out.write_all(&name_len.to_le_bytes())?;
@@ -404,17 +397,17 @@ fn write_central_header<W: Write>(out: &mut W, entry: &CentralEntry) -> io::Resu
 	// each value too large for its field goes to the zip64 field, in this order
 	let mut zip64 = Vec::new();
 	let mut field = |value: u64| match u32::try_from(value) {
-		Ok(value) if value != 0xFFFF_FFFF => value,
+		Ok(value) if value != ZIP64_MARKER => value,
 		_ => {
 			zip64.push(value);
-			0xFFFF_FFFF
+			ZIP64_MARKER
 		}
 	};
 	let size = field(entry.size);
 	let compressed_size = field(entry.compressed_size);
 	let offset = field(entry.offset);
 	let has_zip64 = !zip64.is_empty();
-	let extra = extras(entry, has_zip64.then_some(zip64));
+	let extra = extras(entry, has_zip64.then_some(&zip64));
 	let [name_len, extra_len] = field_lens(entry, &extra)?;
 	let mode: u32 = if entry.dir { 0o040_755 } else { 0o100_644 };
 	let external = (mode << 16) | if entry.dir { 0x10 } else { 0 };
@@ -635,7 +628,7 @@ mod tests {
 			let u32_at = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
 			assert_eq!((u32_at(20), u32_at(24), u32_at(42)), fixed);
 			let extra = &record[46 + entry.name.len()..];
-			let values: Vec<u64> = if extra.starts_with(&0x0001u16.to_le_bytes()) {
+			let values: Vec<u64> = if extra.starts_with(&EXTRA_ZIP64.to_le_bytes()) {
 				let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
 				extra[4..4 + len]
 					.chunks_exact(8)

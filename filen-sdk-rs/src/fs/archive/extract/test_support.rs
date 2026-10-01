@@ -35,18 +35,6 @@ pub(super) const ARCHIVE: Uuid = Uuid::from_u128(0xA);
 pub(super) const ARCHIVE_PARENT: Uuid = Uuid::from_u128(0xA0);
 pub(super) const DESTINATION: Uuid = Uuid::from_u128(0xD);
 
-pub(super) fn archive_file(name: &str, bytes: &[u8]) -> RemoteFileType<'static> {
-	archive_file_with(name, bytes, None)
-}
-
-pub(super) fn archive_file_with(
-	name: &str,
-	bytes: &[u8],
-	hash: Option<Blake3Hash>,
-) -> RemoteFileType<'static> {
-	remote_file(ARCHIVE, ARCHIVE_PARENT, name, bytes, hash)
-}
-
 pub(super) struct Setup {
 	pub(super) backend: Arc<FakeBackend>,
 	pub(super) destination: Uuid,
@@ -54,17 +42,18 @@ pub(super) struct Setup {
 }
 
 pub(super) fn setup(name: &str, bytes: Vec<u8>, configure: impl FnOnce(&mut FakeBackend)) -> Setup {
-	setup_in(DESTINATION, name, bytes, configure)
+	setup_in(DESTINATION, name, bytes, None, configure)
 }
 
-/// [`setup`] for a job that extracts into `destination`.
+/// [`setup`] for a job that extracts into `destination`, with `hash` in the archive's metadata.
 pub(super) fn setup_in(
 	destination: Uuid,
 	name: &str,
 	bytes: Vec<u8>,
+	hash: Option<Blake3Hash>,
 	configure: impl FnOnce(&mut FakeBackend),
 ) -> Setup {
-	let archive = archive_file(name, &bytes);
+	let archive = remote_file(ARCHIVE, ARCHIVE_PARENT, name, &bytes, hash);
 	let mut backend = FakeBackend::new(destination);
 	backend.contents.insert(archive.uuid(), bytes);
 	configure(&mut backend);
@@ -139,6 +128,12 @@ pub(super) struct ListRecorder {
 	pub(super) batches: Mutex<Vec<usize>>,
 	pub(super) entries: Mutex<Vec<ArchiveEntry>>,
 	pub(super) updates: Mutex<Vec<ListUpdate>>,
+}
+
+impl ListRecorder {
+	pub(super) fn last(&self) -> ListUpdate {
+		self.updates.lock().unwrap().last().unwrap().clone()
+	}
 }
 
 impl ListCallback for ListRecorder {

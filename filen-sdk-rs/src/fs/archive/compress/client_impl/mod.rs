@@ -1,7 +1,7 @@
 //! The public compress API on [`Client`]: lists and plans the sources, checks the archive can be
 //! written and extracted again, and runs the job.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, mem, sync::Arc};
 
 use filen_types::fs::Uuid;
 
@@ -94,7 +94,10 @@ impl Client {
 	/// listed once the job runs, so a missing or trashed one fails it then, after any such wait.
 	/// It reports its progress to `callback` and can be paused, resumed and cancelled through
 	/// `control`; a job paused before it starts waits in [`CompressPhase::Scanning`], having
-	/// listed nothing, until it is resumed or cancelled.
+	/// listed nothing, until it is resumed or cancelled. While paused the job holds no drive lock
+	/// and no reservation from the client's memory budget, but it keeps its archive job slot, its
+	/// encoder's state (up to the client's archive codec budget) and a chunk each of input and
+	/// output, so it can go on where it stopped.
 	///
 	/// Returns the report, the registered archive in it; a job that ended early fails with the
 	/// report so far.
@@ -208,6 +211,7 @@ async fn plan_compression(
 	let (sources, dispose) = match sources {
 		CompressSources::Keep(sources) => (sources, None),
 		CompressSources::Dispose { how, items } => {
+			// copies: `items` itself is kept for the disposal once the archive is verified
 			let sources = items
 				.iter()
 				.map(|item| match item {
@@ -327,8 +331,8 @@ fn plan_to_run<D>(
 	let top_level_renamed = top_level_renames(&plan);
 	// the plan's records move into the report; nothing reads them in the plan again
 	let mut report = CompressReport {
-		skipped: std::mem::take(&mut plan.skipped),
-		renamed: std::mem::take(&mut plan.renamed),
+		skipped: mem::take(&mut plan.skipped),
+		renamed: mem::take(&mut plan.renamed),
 		totals: plan.totals,
 		..CompressReport::default()
 	};
@@ -501,9 +505,8 @@ fn top_level_renames<D>(plan: &ItemPlan<D>) -> Vec<RenamedEntry> {
 		.collect()
 }
 
-/// The archive's entries (directories parent first, then files) and the files the codec reads,
-/// with every path checked against what extracting accepts.
-/// What the codec writes for `plan` in `format`, and the files it reads, by source number.
+/// What the codec writes for `plan` in `format`, and the files it reads, by source number, with
+/// every path checked against what extracting accepts.
 fn compress_job<D>(
 	plan: ItemPlan<D>,
 	format: CheckedFormat,
@@ -537,19 +540,26 @@ fn compress_job<D>(
 	}
 }
 
-/// The entries of an archive of `plan`, and the files it reads, by source number.
+/// The entries of an archive of `plan` (directories parent first, then files), and the files it
+/// reads, by source number.
 fn archive_entries<D>(plan: ItemPlan<D>) -> Result<(Vec<ArchiveEntry>, Vec<Source>), Error> {
-	let mut dir_paths: Vec<String> = Vec::with_capacity(plan.dirs.len());
-	let path_in = |parent: DestParent, name: &ValidatedName, dir_paths: &[String]| match parent {
-		DestParent::Existing(_) => name.as_ref().to_owned(),
-		DestParent::Planned(index) => format!("{}/{}", dir_paths[index], name.as_ref()),
-	};
 	let mut entries = Vec::with_capacity(plan.dirs.len() + plan.files.len());
+	// directories come first, so planned directory `index` is entry `index`
+	let path_in = |parent: DestParent, name: &ValidatedName, entries: &[ArchiveEntry]| match parent
+	{
+		DestParent::Existing(_) => Ok(name.as_ref().to_owned()),
+		DestParent::Planned(index) => match entries.get(index) {
+			Some(ArchiveEntry::Dir { path, .. }) => Ok(format!("{path}/{}", name.as_ref())),
+			_ => Err(Error::custom(
+				ErrorKind::Internal,
+				"an item was planned before its directory",
+			)),
+		},
+	};
 	for dir in &plan.dirs {
-		let path = path_in(dir.parent, &dir.name, &dir_paths);
+		let path = path_in(dir.parent, &dir.name, &entries)?;
 		// a directory's stored path ends in a `/`
 		check_path(&path, 1)?;
-		dir_paths.push(path.clone());
 		entries.push(ArchiveEntry::Dir {
 			path,
 			modified: dir.created,
@@ -557,12 +567,13 @@ fn archive_entries<D>(plan: ItemPlan<D>) -> Result<(Vec<ArchiveEntry>, Vec<Sourc
 	}
 	let mut sources = Vec::with_capacity(plan.files.len());
 	for (index, file) in plan.files.into_iter().enumerate() {
-		let path = path_in(file.parent, &file.name, &dir_paths);
+		let path = path_in(file.parent, &file.name, &entries)?;
 		check_path(&path, 0)?;
 		entries.push(ArchiveEntry::File {
 			source: u32::try_from(index).map_err(|_| {
 				Error::custom(ErrorKind::InvalidState, "too many files for one archive")
 			})?,
+			// the codec writes the path, the driver reports it
 			path: path.clone(),
 			size: file.size,
 			modified: file.source.last_modified(),

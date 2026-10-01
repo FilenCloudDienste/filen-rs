@@ -13,17 +13,13 @@ use crate::{
 	Error, ErrorKind,
 	fs::archive::{
 		sevenz::{
-			crypto::RAW_KEY_POWER,
+			crypto::WRITE_CYCLES_POWER,
 			write::{SevenZEncryption, SevenZMethod, SevenZWriter},
 		},
-		test_support::{archive_password, damaged_copies, pattern},
+		test_support::{
+			READ_BACK_SEVEN_Z, archive_password, damaged_copies, pattern, sevenz_finished,
+		},
 	},
-};
-
-const LIMITS: SevenZLimits = SevenZLimits {
-	max_index_bytes: 32 << 20,
-	max_entries: 1_000_000,
-	decoder_memory: 256 << 20,
 };
 
 /// An entry as read back: path, kind and data.
@@ -31,7 +27,7 @@ type Read7z = (String, SevenZKind, Vec<u8>);
 
 /// Every entry of `archive`, its data read through the folder cursor (CRCs checked).
 fn read_all(archive: &[u8], password: Option<&str>) -> Result<Vec<Read7z>, SevenZError> {
-	read_with(archive, password, LIMITS)
+	read_with(archive, password, READ_BACK_SEVEN_Z)
 }
 
 fn read_with(
@@ -135,9 +131,7 @@ fn ours_with(
 			}
 		}
 	}
-	let (mut archive, start) = writer.finish().unwrap();
-	archive[..32].copy_from_slice(&start);
-	archive
+	sevenz_finished(writer)
 }
 
 const METHODS: [SevenZMethod; 7] = [
@@ -170,7 +164,7 @@ fn our_7z_reads_back_with_every_method_blocking_and_encryption() {
 				let index = read_index(
 					&mut source,
 					archive.len() as u64,
-					LIMITS,
+					READ_BACK_SEVEN_Z,
 					&mut Keys::new(password.as_ref()),
 				)
 				.unwrap();
@@ -209,13 +203,7 @@ fn sevenz_rust2_reads_ours() {
 			{
 				continue;
 			}
-			let archive = ours_with(
-				&sample,
-				method,
-				true,
-				encryption,
-				crate::fs::archive::sevenz::crypto::WRITE_CYCLES_POWER,
-			);
+			let archive = ours_with(&sample, method, true, encryption, WRITE_CYCLES_POWER);
 			let password = encryption.map_or_else(Password::empty, |(_, pw)| pw.into());
 			let mut reader = ArchiveReader::new(Cursor::new(&archive), password)
 				.unwrap_or_else(|error| panic!("{case}: {error}"));
@@ -300,7 +288,9 @@ fn theirs(
 #[test]
 fn we_read_sevenz_rust2s_7z() {
 	let sample = sample();
-	let mut in_their_order: Vec<_> = sample.clone();
+	// sevenz-rust2 writes a solid block's entries after the ones written alone: compared by name
+	let mut by_name = expected(&sample);
+	by_name.sort_by(|a, b| a.0.cmp(&b.0));
 	for (n, (methods, solid, encrypt_header, password)) in [
 		(vec![EncoderMethod::LZMA2.into()], false, false, None),
 		(vec![EncoderMethod::LZMA2.into()], true, false, None),
@@ -353,10 +343,8 @@ fn we_read_sevenz_rust2s_7z() {
 		let archive = theirs(&sample, methods, solid, encrypt_header);
 		let mut read =
 			read_all(&archive, password).unwrap_or_else(|error| panic!("{case}: {error}"));
-		// sevenz-rust2 writes a solid block's entries after the ones written alone
 		read.sort_by(|a, b| a.0.cmp(&b.0));
-		in_their_order.sort_by(|a, b| a.0.cmp(&b.0));
-		assert_eq!(read, expected(&in_their_order), "{case}");
+		assert_eq!(read, by_name, "{case}");
 	}
 }
 
@@ -374,7 +362,7 @@ fn passwords_are_asked_for_and_checked() {
 	let index = read_index(
 		&mut source,
 		entries.len() as u64,
-		LIMITS,
+		READ_BACK_SEVEN_Z,
 		&mut Keys::new(None),
 	)
 	.unwrap();
@@ -435,7 +423,7 @@ fn limits_are_checked_before_allocating() {
 	let archive = ours(&sample(), SevenZMethod::Lzma2 { level: 6 }, true, None);
 	let too_few_entries = SevenZLimits {
 		max_entries: 3,
-		..LIMITS
+		..READ_BACK_SEVEN_Z
 	};
 	assert!(matches!(
 		read_with(&archive, None, too_few_entries),
@@ -443,7 +431,7 @@ fn limits_are_checked_before_allocating() {
 	));
 	let tiny_index = SevenZLimits {
 		max_index_bytes: 16,
-		..LIMITS
+		..READ_BACK_SEVEN_Z
 	};
 	assert!(matches!(
 		read_with(&archive, None, tiny_index),
@@ -452,7 +440,7 @@ fn limits_are_checked_before_allocating() {
 	// the level-6 dictionary is clamped to the 190 kB of data, which still needs more than this
 	let tiny_codec = SevenZLimits {
 		decoder_memory: 128 << 10,
-		..LIMITS
+		..READ_BACK_SEVEN_Z
 	};
 	assert!(matches!(
 		read_with(&archive, None, tiny_codec),
@@ -461,7 +449,7 @@ fn limits_are_checked_before_allocating() {
 	// and a folder of a few bytes decodes in little memory whatever dictionary it states
 	let tiny_codec = SevenZLimits {
 		decoder_memory: 256 << 10,
-		..LIMITS
+		..READ_BACK_SEVEN_Z
 	};
 	let small = ours(
 		&[("a".into(), Some(b"abc".to_vec()))],
@@ -473,7 +461,7 @@ fn limits_are_checked_before_allocating() {
 	// nor does a budget as large as a client may set overflow what a folder is given
 	let unbounded = SevenZLimits {
 		decoder_memory: u64::MAX,
-		..LIMITS
+		..READ_BACK_SEVEN_Z
 	};
 	let stored = ours(
 		&[("a".into(), Some(b"abc".to_vec()))],
@@ -547,7 +535,7 @@ fn trailing_data_is_unaccounted() {
 	let index = read_index(
 		&mut source,
 		archive.len() as u64,
-		LIMITS,
+		READ_BACK_SEVEN_Z,
 		&mut Keys::new(None),
 	)
 	.unwrap();
@@ -571,8 +559,14 @@ fn entries_read_out_of_order_reopen_their_folder() {
 	let archive = ours(&sample, SevenZMethod::Lzma2 { level: 1 }, true, None);
 	let mut source = Cursor::new(&archive[..]);
 	let mut keys = Keys::new(None);
-	let index = read_index(&mut source, archive.len() as u64, LIMITS, &mut keys).unwrap();
-	let mut cursor = FolderCursor::new(source, LIMITS.decoder_memory);
+	let index = read_index(
+		&mut source,
+		archive.len() as u64,
+		READ_BACK_SEVEN_Z,
+		&mut keys,
+	)
+	.unwrap();
+	let mut cursor = FolderCursor::new(source, READ_BACK_SEVEN_Z.decoder_memory);
 	let expected = in_our_order(&sample);
 	// the last file first, then the first, then skipping one
 	for at in [3, 0, 2, 1] {

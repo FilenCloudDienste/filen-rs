@@ -101,9 +101,8 @@ pub struct ArchiveEntry {
 	/// which the archive's own compression covers (see the listing's `format`).
 	pub method: Option<String>,
 	/// Why extracting it would skip it; `None` for an entry an extraction creates (or may: an
-	/// AppleDouble file told by its name alone). A link's target is in `kind`, and left empty
-	/// here.
-	pub skip: Option<ExtractSkipReason>,
+	/// AppleDouble file told by its name alone).
+	pub skip: Option<ListedSkipReason>,
 	/// macOS metadata: a `__MACOSX` folder, an AppleDouble file (named `._name`, or any file in
 	/// a `__MACOSX` folder), or a tar's hard link to one. A file is told by its first bytes,
 	/// which a listing leaving metadata out reads as an extraction does: a tar's always, a
@@ -114,6 +113,56 @@ pub struct ArchiveEntry {
 	/// does, once every entry was listed: skipped when everything in it is left out, not when it
 	/// holds anything of the user's, or nothing. See the extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
+}
+
+/// Why extracting a listed entry would skip it: an [`ExtractSkipReason`] without a link's
+/// target, which the entry's `kind` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, tagged, no_default)]
+pub enum ListedSkipReason {
+	/// See [`ExtractSkipReason::Symlink`].
+	Symlink,
+	/// See [`ExtractSkipReason::Hardlink`].
+	Hardlink,
+	/// See [`ExtractSkipReason::Device`].
+	Device,
+	/// See [`ExtractSkipReason::Sparse`].
+	Sparse,
+	/// See [`ExtractSkipReason::UnsupportedType`].
+	UnsupportedType,
+	/// See [`ExtractSkipReason::PathTooLong`].
+	PathTooLong,
+	/// See [`ExtractSkipReason::PathTooDeep`].
+	PathTooDeep,
+	/// See [`ExtractSkipReason::UnsafePath`].
+	UnsafePath,
+	/// See [`ExtractSkipReason::OverlappingData`].
+	OverlappingData,
+	/// See [`ExtractSkipReason::UnsupportedMethod`].
+	UnsupportedMethod,
+	/// See [`ExtractSkipReason::AntiItem`].
+	AntiItem,
+	/// See [`ExtractSkipReason::MacMetadata`].
+	MacMetadata,
+}
+
+impl From<&ExtractSkipReason> for ListedSkipReason {
+	fn from(reason: &ExtractSkipReason) -> Self {
+		match reason {
+			ExtractSkipReason::Symlink { .. } => Self::Symlink,
+			ExtractSkipReason::Hardlink { .. } => Self::Hardlink,
+			ExtractSkipReason::Device => Self::Device,
+			ExtractSkipReason::Sparse => Self::Sparse,
+			ExtractSkipReason::UnsupportedType => Self::UnsupportedType,
+			ExtractSkipReason::PathTooLong => Self::PathTooLong,
+			ExtractSkipReason::PathTooDeep => Self::PathTooDeep,
+			ExtractSkipReason::UnsafePath => Self::UnsafePath,
+			ExtractSkipReason::OverlappingData => Self::OverlappingData,
+			ExtractSkipReason::UnsupportedMethod => Self::UnsupportedMethod,
+			ExtractSkipReason::AntiItem => Self::AntiItem,
+			ExtractSkipReason::MacMetadata => Self::MacMetadata,
+		}
+	}
 }
 
 /// Where extracting an archive entry puts it.
@@ -394,6 +443,7 @@ fn add_entry(listing: &mut ListReport, kept_bytes: &mut usize, entry: &ArchiveEn
 		&& *kept_bytes + bytes <= MAX_LISTED_BYTES
 	{
 		*kept_bytes += bytes;
+		// a copy: the caller also hands the entry to the listing's callback
 		listing.entries.push(entry.clone());
 	} else {
 		listing.omitted_entries += 1;

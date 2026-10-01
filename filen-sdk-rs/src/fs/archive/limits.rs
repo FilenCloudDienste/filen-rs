@@ -13,14 +13,16 @@ pub(crate) const MAX_ARCHIVE_PATH_DEPTH: usize = 256;
 pub(crate) const HEAP_PER_INDEX_BYTE: u64 = 3;
 
 /// Most skipped, renamed or failed entries a report keeps one by one; beyond that they are only
-/// counted, so an archive of a million symlinks cannot build a million-record report.
+/// counted, so an archive of a million symlinks cannot build a million-record report. The public
+/// report docs and the bindings' say 1000 in words; change them with it.
 pub(crate) const MAX_REPORT_RECORDS: usize = 1000;
 
-/// Adds `record` to `list` unless it holds [`MAX_REPORT_RECORDS`] already, then only counting
-/// it in `omitted`; whether it was kept.
-pub(crate) fn keep<T>(list: &mut Vec<T>, omitted: &mut u64, record: T) -> bool {
+/// Adds a copy of `record` to `list` unless it holds [`MAX_REPORT_RECORDS`] already, then only
+/// counting it in `omitted`; whether it was kept. The caller keeps `record` for its event, so a
+/// record past the cap is never copied.
+pub(crate) fn keep<T: Clone>(list: &mut Vec<T>, omitted: &mut u64, record: &T) -> bool {
 	if list.len() < MAX_REPORT_RECORDS {
-		list.push(record);
+		list.push(record.clone());
 		true
 	} else {
 		*omitted += 1;
@@ -48,7 +50,7 @@ mod tests {
 	fn records_past_the_cap_are_only_counted() {
 		let (mut list, mut omitted) = (Vec::new(), 0);
 		for record in 0..MAX_REPORT_RECORDS + 2 {
-			let kept = keep(&mut list, &mut omitted, record);
+			let kept = keep(&mut list, &mut omitted, &record);
 			assert_eq!(kept, record < MAX_REPORT_RECORDS, "{record}");
 		}
 		assert_eq!((list.len(), omitted), (MAX_REPORT_RECORDS, 2));

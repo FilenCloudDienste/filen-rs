@@ -9,7 +9,10 @@ use crate::{
 	fs::archive::{
 		entry_path::{ArchivePath, PathRejection, entry_path},
 		error::read_failure,
-		extract::{ExtractSkipReason, list::ArchiveEntryKind},
+		extract::{
+			ExtractSkipReason,
+			list::{ArchiveEntryKind, ListedSkipReason},
+		},
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
 		worker::{EntryKind, LinkHead, WorkerEvent},
@@ -58,6 +61,7 @@ pub(super) fn walk_tar<R: Read>(
 		// a hard link names an earlier file, the same whatever else it is stored with
 		let link_target = match (&member.kind, &found.kind) {
 			(MemberKind::Hardlink { target }, ArchiveEntryKind::Hardlink { target: shown, .. }) => {
+				// a copy: `found` keeps the target it shows
 				Some((entry_path(target), shown.clone()))
 			}
 			_ => None,
@@ -80,7 +84,7 @@ pub(super) fn walk_tar<R: Read>(
 				continue;
 			}
 			Verdict::Skip(reason) => {
-				shadowed.note(key, Some(Shadow::of(&reason)));
+				shadowed.note(key, Some(Shadow::of((&reason).into())));
 				walk.port
 					.send(found.skipped(reason))
 					.map_err(read_failure)?;
@@ -197,8 +201,8 @@ enum Shadow {
 
 impl Shadow {
 	/// What a member skipped for `reason` leaves at its path.
-	fn of(reason: &ExtractSkipReason) -> Self {
-		if *reason == ExtractSkipReason::MacMetadata {
+	fn of(reason: ListedSkipReason) -> Self {
+		if reason == ListedSkipReason::MacMetadata {
 			Self::MacMetadata
 		} else {
 			Self::Other
@@ -288,7 +292,7 @@ fn list_member<R: Read>(
 			}
 			None
 		}
-		Listed::Skipped(reason) => Some(Shadow::of(&reason)),
+		Listed::Skipped(reason) => Some(Shadow::of(reason)),
 		Listed::Root | Listed::Held => Some(Shadow::Other),
 	};
 	shadowed.note(key, shadow);

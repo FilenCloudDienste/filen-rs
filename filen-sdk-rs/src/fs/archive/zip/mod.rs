@@ -21,7 +21,11 @@ const EOCD64_LOCATOR_SIG: u32 = 0x0706_4b50;
 
 /// General-purpose flags (zip specification 4.4.4).
 const FLAG_ENCRYPTED: u16 = 0x0001;
+/// For LZMA: the stream ends with an end marker.
+const FLAG_LZMA_END_MARKER: u16 = 0x0002;
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+/// PKWARE strong encryption, which the SDK does not read.
+const FLAG_STRONG_ENCRYPTION: u16 = 0x0040;
 const FLAG_UTF8: u16 = 0x0800;
 
 /// The version-made-by hosts (zip specification 4.4.2.2) whose external attributes carry a Unix
@@ -40,6 +44,16 @@ pub(crate) const METHOD_ZSTD: u16 = 93;
 pub(crate) const METHOD_XZ: u16 = 95;
 pub(crate) const METHOD_PPMD: u16 = 98;
 const METHOD_AES: u16 = 99;
+
+/// Extra field ids (zip specification 4.5.2); the extended timestamp's is
+/// `fs::zip::ZipExtendedTime::HEADER_ID`.
+const EXTRA_ZIP64: u16 = 0x0001;
+const EXTRA_NTFS: u16 = 0x000A;
+const EXTRA_UNICODE_PATH: u16 = 0x7075;
+const EXTRA_AES: u16 = 0x9901;
+
+/// What a 32-bit size or offset field holds when the zip64 extra field has the value.
+const ZIP64_MARKER: u32 = 0xFFFF_FFFF;
 
 /// A compression method's name, for display; `None` for one without a name here.
 pub(crate) fn method_name(method: u16) -> Option<&'static str> {

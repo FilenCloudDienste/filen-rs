@@ -19,12 +19,15 @@ use std::{
 use lz4_flex::block::{decompress_into, decompress_into_with_dict};
 use twox_hash::XxHash32;
 
+use crate::fs::archive::format::LZ4_MAGIC;
+
 use super::{
 	Budget, CodecError, Describe, Input, SKIPPABLE_FRAME_MAGIC, StreamCheck, StreamDecoder,
 	StreamEnd, skip_skippable_frame,
 };
 
-const MAGIC: u32 = 0x184D_2204;
+/// A frame's magic number, as the little-endian word the frame starts with.
+const MAGIC: u32 = u32::from_le_bytes(LZ4_MAGIC);
 const LEGACY_MAGIC: u32 = 0x184C_2102;
 
 /// How far back a linked block may refer.

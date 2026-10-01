@@ -14,11 +14,6 @@ use std::{
 
 use chrono::{DateTime, Utc};
 
-use super::{
-	SevenZError,
-	crypto::{AES_ID, AesCbcReader, AesProps, BLOCK, Key, derive_key},
-	header::*,
-};
 use crate::{
 	fs::archive::{
 		bytes,
@@ -35,6 +30,16 @@ use crate::{
 	io::nt_time_to_datetime,
 };
 
+use super::{
+	SevenZError,
+	crypto::{
+		AES_ID, AesCbcReader, AesProps, BLOCK, Key, MAX_CYCLES_POWER, RAW_KEY_POWER, derive_key,
+	},
+	header::*,
+};
+
+/// Heap charged per bind pair, packed stream and unpack size of a folder: the largest of them.
+const FOLDER_STREAM_BYTES: usize = 16;
 /// Most coders in one folder; 7-Zip writes at most four (BCJ2 with its three LZMA coders).
 const MAX_CODERS: u64 = 8;
 /// Most input streams of one coder (BCJ2 has four).
@@ -369,8 +374,8 @@ impl<'p> Keys<'p> {
 		}
 		let rounds = match cycles_power {
 			// every key costs at least a round, so salts alone cannot make keys without end
-			0x3F => 1,
-			power if power <= super::crypto::MAX_CYCLES_POWER => 1u64 << power,
+			RAW_KEY_POWER => 1,
+			power if power <= MAX_CYCLES_POWER => 1u64 << power,
 			_ => {
 				return Err(SevenZError::Unsupported(
 					"a 7z key derivation over the rounds the SDK spends",
@@ -404,15 +409,15 @@ pub(crate) fn read_index<R: Read + Seek>(
 	keys: &mut Keys<'_>,
 ) -> Result<SevenZIndex, SevenZError> {
 	let start = read_at(source, 0, START_HEADER_LEN)?;
-	if start[..6] != SIGNATURE {
+	if start[..SIGNATURE.len()] != SIGNATURE {
 		return Err(SevenZError::Corrupt("not a 7z archive"));
 	}
-	if start[6] != 0 {
+	if start[VERSION_AT] != 0 {
 		return Err(SevenZError::Unsupported("a 7z format version after 0.x"));
 	}
-	let mut fields = HeaderReader::new(&start[8..]);
+	let mut fields = HeaderReader::new(&start[START_CRC_AT..]);
 	let start_crc = fields.u32()?;
-	if crc32fast::hash(&start[12..]) != start_crc {
+	if crc32fast::hash(&start[START_FIELDS_AT..]) != start_crc {
 		return Err(SevenZError::Corrupt(
 			"the 7z start header's CRC does not match",
 		));
@@ -657,7 +662,7 @@ fn read_streams_info(
 	if id == K_PACK_INFO {
 		info.pack_pos = reader.number()?;
 		let count = reader.count(limits.max_entries)?;
-		heap.charge(count as u64 * 8)?;
+		heap.charge(count as u64 * mem::size_of::<u64>() as u64)?;
 		reader.wait_for(K_SIZE)?;
 		info.pack_sizes = (0..count)
 			.map(|_| reader.number())
@@ -740,10 +745,10 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 	let mut coders = Vec::with_capacity(coder_count);
 	for _ in 0..coder_count {
 		let flags = reader.byte()?;
-		if flags & 0xC0 != 0 {
+		if flags & CODER_ALTERNATIVES != 0 {
 			return Err(SevenZError::Unsupported("7z alternative coder methods"));
 		}
-		let id_len = usize::from(flags & 0x0F);
+		let id_len = usize::from(flags & CODER_ID_LEN);
 		if id_len > 8 {
 			return Err(SevenZError::Unsupported("a 7z coder id over 8 bytes"));
 		}
@@ -751,7 +756,7 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 			.bytes(id_len)?
 			.iter()
 			.fold(0u64, |id, &byte| (id << 8) | u64::from(byte));
-		let (inputs, outputs) = if flags & 0x10 != 0 {
+		let (inputs, outputs) = if flags & CODER_COMPLEX != 0 {
 			(
 				reader.count(MAX_CODER_INPUTS)?,
 				reader.count(MAX_CODER_INPUTS)?,
@@ -769,7 +774,7 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 		if inputs != 1 && !(Method::from_id(id) == Some(Method::Bcj2) && inputs == 4) {
 			return Err(SevenZError::Unsupported("a 7z coder with several inputs"));
 		}
-		let props: Box<[u8]> = if flags & 0x20 != 0 {
+		let props: Box<[u8]> = if flags & CODER_HAS_PROPS != 0 {
 			let len = reader.length()?;
 			if len > MAX_PROPS {
 				return Err(SevenZError::Unsupported(
@@ -835,7 +840,8 @@ fn read_folder(reader: &mut HeaderReader<'_>, heap: &mut Heap) -> Result<Folder,
 		.find(|&coder| bind_pairs.iter().all(|&(_, output)| output != coder))
 		.expect("one output is left unbound");
 	heap.charge(
-		(mem::size_of::<Folder>() + 16 * (bind_count + packed_count + coder_count)) as u64,
+		(mem::size_of::<Folder>() + FOLDER_STREAM_BYTES * (bind_count + packed_count + coder_count))
+			as u64,
 	)?;
 	let folder = Folder {
 		coders,
@@ -906,7 +912,10 @@ fn read_substreams(
 		.try_fold(0u64, |total, &count| total.checked_add(count))
 		.filter(|&total| !exceeds_limit(total, limits.max_entries))
 		.ok_or(SevenZError::TooLarge("a 7z header lists too many items"))?;
-	heap.charge(total * 24)?;
+	// each substream, and its digest while the digests are read
+	heap.charge(
+		total.saturating_mul((mem::size_of::<Substream>() + mem::size_of::<Option<u32>>()) as u64),
+	)?;
 	let mut substreams: Vec<Substreams> = Vec::with_capacity(folders.len());
 	for (folder, &count) in folders.iter().zip(&counts) {
 		let mut sizes = Vec::with_capacity(
