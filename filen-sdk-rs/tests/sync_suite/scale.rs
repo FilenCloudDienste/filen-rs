@@ -344,7 +344,8 @@ async fn scale_03_many_tiny_files_one_wide_dir() {
 	}
 	for i in 0..ONES {
 		// Distinct single byte value derived from index.
-		write_file(&sc.local, &format!("wide/o{i:03}.dat"), &[(i % 256) as u8]);
+		let byte = u8::try_from(i % 256).expect("a remainder of 256 fits a byte");
+		write_file(&sc.local, &format!("wide/o{i:03}.dat"), &[byte]);
 	}
 
 	let r1 = sc.sync().await;
