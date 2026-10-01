@@ -32,6 +32,8 @@ use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::dir::color::DirColor, auth::FileEncryptionVersion, crypto::Blake3Hash, fs::StableUuid,
 };
+#[cfg(unix)]
+use nix::sys::resource::{UsageWho, getrusage};
 use uuid::Uuid;
 
 use crate::{
@@ -589,40 +591,18 @@ pub(super) fn pass_structures_bytes(
 ///
 /// `getrusage(RUSAGE_SELF).ru_maxrss` is the kernel's own high-water mark: an external sampler
 /// misses every spike shorter than its interval, and the peak of a pass is exactly such a spike.
-/// macOS reports bytes, Linux kibibytes. Returns 0 where the call is unavailable.
+/// macOS reports bytes, Linux kibibytes. Returns 0 where the call fails or is unavailable.
 #[cfg(unix)]
 pub(super) fn peak_rss_bytes() -> u64 {
-	// The real `struct rusage` is two `timeval`s (16 bytes each on every 64-bit target: macOS pads
-	// its 32-bit `suseconds_t` up, Linux has a 64-bit one) followed by 14 `c_long`s, of which
-	// `ru_maxrss` is the first. The trailing array is only here so the struct cannot be smaller
-	// than the one the kernel writes.
-	#[repr(C)]
-	struct Rusage {
-		user_time: [i64; 2],
-		system_time: [i64; 2],
-		max_rss: i64,
-		rest: [i64; 15],
-	}
-	unsafe extern "C" {
-		fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-	}
-	let mut usage = Rusage {
-		user_time: [0; 2],
-		system_time: [0; 2],
-		max_rss: 0,
-		rest: [0; 15],
-	};
-	// SAFETY: `getrusage` writes exactly one `struct rusage` through the pointer and reads nothing
-	// else; `Rusage` is `repr(C)` and at least as large as the platform's, and the local outlives
-	// the call. `RUSAGE_SELF` is 0 on macOS, Linux and the BSDs.
-	if unsafe { getrusage(0, &mut usage) } != 0 {
+	let Ok(usage) = getrusage(UsageWho::RUSAGE_SELF) else {
 		return 0;
-	}
-	let max_rss = usage.max_rss.max(0) as u64;
+	};
+	// Never negative from a kernel; a negative figure reads as no figure, as a failed call does.
+	let max_rss = u64::try_from(usage.max_rss()).unwrap_or(0);
 	if cfg!(target_os = "macos") {
 		max_rss
 	} else {
-		max_rss * 1024
+		max_rss.saturating_mul(1024)
 	}
 }
 
