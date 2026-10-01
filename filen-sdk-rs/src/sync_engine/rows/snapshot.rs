@@ -199,9 +199,29 @@ pub(super) struct Page {
 	pub(super) rows: Vec<BaselineEntry>,
 }
 
+/// What a [`Page`] says about one path.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PageAnswer<'p> {
+	/// The path lies outside the stretch the page read, so the page cannot say.
+	Outside,
+	/// The page spans the path and so speaks for the table there: the row at it, or `None` where
+	/// the table holds none.
+	Spans(Option<&'p BaselineEntry>),
+}
+
+impl<'p> PageAnswer<'p> {
+	/// `read` of the row or its absence, where the page spans the path; `None` where it cannot say.
+	pub(super) fn map<T>(self, read: impl FnOnce(Option<&'p BaselineEntry>) -> T) -> Option<T> {
+		match self {
+			Self::Spans(row) => Some(read(row)),
+			Self::Outside => None,
+		}
+	}
+}
+
 impl Page {
-	/// `Some(row or none)` where this page answers for `rel_path`; `None` where it cannot say.
-	pub(super) fn answer(&self, rel_path: &str) -> Option<Option<&BaselineEntry>> {
+	/// What this page says about `rel_path` (see [`PageAnswer`]).
+	pub(super) fn answer(&self, rel_path: &str) -> PageAnswer<'_> {
 		let past_from = if self.inclusive {
 			rel_path >= self.from.as_str()
 		} else {
@@ -211,12 +231,15 @@ impl Page {
 			Some(last) if rel_path <= last.rel_path.as_str() => true,
 			_ => self.complete && self.to.as_deref().is_none_or(|to| rel_path < to),
 		};
-		(past_from && before_end).then(|| {
+		if !(past_from && before_end) {
+			return PageAnswer::Outside;
+		}
+		PageAnswer::Spans(
 			self.rows
 				.binary_search_by(|row| row.rel_path.as_str().cmp(rel_path))
 				.ok()
-				.map(|at| &self.rows[at])
-		})
+				.map(|at| &self.rows[at]),
+		)
 	}
 
 	/// Whether the read stopped at its limit, so the range goes on past the last row.
@@ -536,10 +559,10 @@ impl Snapshot {
 		}
 		ahead.want = want;
 		let page = self.read_page(rel_path, true, None, ahead.want);
-		let found = answer(
-			page.answer(rel_path)
-				.expect("a page read from a path answers for that path"),
-		);
+		let found = page
+			.answer(rel_path)
+			.map(answer)
+			.expect("a page read from a path answers for that path");
 		ahead.page = Some(page);
 		ahead.answered = 1;
 		found
