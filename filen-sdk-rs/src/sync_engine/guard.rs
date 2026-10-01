@@ -164,17 +164,27 @@ pub(crate) struct GuardDecision {
 	pub(crate) reason: Option<GuardReason>,
 }
 
+/// What the remote view a pass read can say about absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteEvidence {
+	/// The view has never converged (the cache snapshot carried no watermark), so its apparent
+	/// emptiness is untrustworthy, whatever it lists.
+	Unconverged,
+	/// The view has converged and holds NO items at all while the baseline still tracks at least
+	/// one item with a remote uuid — an all-empty listing that would delete the whole pair (see
+	/// `GuardReason::RemoteEmptied`: a one-item pair's last deletion is still released).
+	Emptied,
+	/// The view has converged and lists something, or the baseline tracks nothing remote.
+	Listed,
+}
+
 /// Inputs to [`screen`] describing how trustworthy this pass's state is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScreenState {
 	/// The local scan finished without errors (a partial scan must not be read as deletions).
 	pub(crate) scan_complete: bool,
-	/// The remote view has converged at least once (the cache snapshot carried a watermark).
-	pub(crate) remote_converged: bool,
-	/// The remote view holds NO items at all while the baseline still tracks at least one item
-	/// with a remote uuid — an all-empty listing that would delete the whole pair.
-	pub(crate) remote_emptied: bool,
-	// (see `GuardReason::RemoteEmptied`: a one-item pair's last deletion is still released)
+	/// What the remote view can say about absence.
+	pub(crate) remote: RemoteEvidence,
 	/// This is the pair's first sync (the baseline is empty — no established relationship).
 	pub(crate) first_sync: bool,
 	/// How many items the pair's baseline currently tracks (the ratio denominator).
@@ -187,13 +197,13 @@ impl ScreenState {
 	/// dropped on untrustworthy absence resurrects the item on the next healthy pass, which reads
 	/// the surviving side as a fresh creation.
 	///
-	/// `remote_converged` only records that the view converged ONCE, so it stays true straight
-	/// through a transient all-empty listing; `remote_emptied` is what catches that fault. The
-	/// price is that a pair whose items all vanished from both sides keeps their rows until the
-	/// remote lists something again — dead bookkeeping that costs nothing, where the row the fault
-	/// would have dropped costs a resurrected file.
+	/// Convergence is recorded ONCE, so a view stays converged straight through a transient
+	/// all-empty listing; [`RemoteEvidence::Emptied`] is what catches that fault. The price is that a
+	/// pair whose items all vanished from both sides keeps their rows until the remote lists
+	/// something again — dead bookkeeping that costs nothing, where the row the fault would have
+	/// dropped costs a resurrected file.
 	pub(crate) fn absence_trusted(&self) -> bool {
-		self.scan_complete && self.remote_converged && !self.remote_emptied
+		self.scan_complete && self.remote == RemoteEvidence::Listed
 	}
 }
 
@@ -219,9 +229,9 @@ pub(crate) fn screen(
 		Some(GuardReason::ScanIncomplete)
 	} else if state.first_sync {
 		Some(GuardReason::FirstSyncWithDeletions { deletions })
-	} else if !state.remote_converged {
+	} else if state.remote == RemoteEvidence::Unconverged {
 		Some(GuardReason::RemoteUnconverged { deletions })
-	} else if state.remote_emptied && deletions > 1 {
+	} else if state.remote == RemoteEvidence::Emptied && deletions > 1 {
 		Some(GuardReason::RemoteEmptied { deletions })
 	} else {
 		let limit = guard.limit(state.tracked);
@@ -305,8 +315,7 @@ mod tests {
 	fn established(tracked: usize) -> ScreenState {
 		ScreenState {
 			scan_complete: true,
-			remote_converged: true,
-			remote_emptied: false,
+			remote: RemoteEvidence::Listed,
 			first_sync: false,
 			tracked,
 		}
@@ -365,7 +374,7 @@ mod tests {
 		// is untrustworthy, so deletions are held until it converges.
 		let actions = vec![del("maybe_gone")];
 		let state = ScreenState {
-			remote_converged: false,
+			remote: RemoteEvidence::Unconverged,
 			..established(5)
 		};
 		let decision = screen(actions, state, DeleteGuard::default());
@@ -382,7 +391,7 @@ mod tests {
 		// small pair's wipe (2 deletions) is under the volume floor, so only this reason stops it.
 		let actions = vec![del("a"), del("b")];
 		let state = ScreenState {
-			remote_emptied: true,
+			remote: RemoteEvidence::Emptied,
 			..established(2)
 		};
 		let decision = screen(actions, state, DeleteGuard::default());
@@ -399,7 +408,7 @@ mod tests {
 		// holding it would never release and the local copy would survive the deletion forever.
 		let actions = vec![del("only")];
 		let state = ScreenState {
-			remote_emptied: true,
+			remote: RemoteEvidence::Emptied,
 			..established(1)
 		};
 		let decision = screen(actions, state, DeleteGuard::default());
@@ -411,7 +420,7 @@ mod tests {
 	fn a_wholly_empty_remote_view_is_not_trusted_absence_evidence() {
 		let mut state = established(4);
 		assert!(state.absence_trusted(), "a converged, fully scanned pass");
-		state.remote_emptied = true;
+		state.remote = RemoteEvidence::Emptied;
 		assert!(
 			!state.absence_trusted(),
 			"a wholly empty remote view may be a transient fault; the baseline row is the only \

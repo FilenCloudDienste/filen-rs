@@ -364,16 +364,12 @@ fn at_or_under<'p>(path: &'p str, rel_path: &str) -> Option<&'p str> {
 }
 
 /// `row`, read at `rel_path`, with `mark` advanced on it where a layer above advanced one.
-fn placed(
-	mut row: BaselineEntry,
-	rel_path: &str,
-	mark: Option<Option<Blake3Hash>>,
-) -> BaselineEntry {
+fn placed(mut row: BaselineEntry, rel_path: &str, mark: Option<Agreed>) -> BaselineEntry {
 	if row.rel_path != rel_path {
 		rel_path.clone_into(&mut row.rel_path);
 	}
-	if let Some(hash) = mark {
-		row.agreed_hash = hash;
+	if let Some(agreed) = mark {
+		row.agreed_hash = agreed.hash;
 	}
 	row
 }
@@ -666,9 +662,13 @@ impl Cursor<'_> {
 
 	/// The table's row at `rel_path`, out of the current page or a new one.
 	fn stored(&mut self, snapshot: &Snapshot, rel_path: &str) -> Option<BaselineEntry> {
-		if let Some(answer) = self.page.as_deref().and_then(|page| page.answer(rel_path)) {
+		if let Some(answer) = self
+			.page
+			.as_deref()
+			.and_then(|page| page.answer(rel_path).map(|row| row.cloned()))
+		{
 			self.answered += 1;
-			return answer.cloned();
+			return answer;
 		}
 		if let Some(page) = self.page.as_deref() {
 			match self.read {
@@ -718,8 +718,8 @@ impl Cursor<'_> {
 		let page = snapshot.page(rel_path, true, None, limit);
 		let answer = page
 			.answer(rel_path)
-			.expect("a page read from a path answers for that path")
-			.cloned();
+			.map(|row| row.cloned())
+			.expect("a page read from a path answers for that path");
 		self.page = Some(page);
 		self.read = read;
 		answer
@@ -803,11 +803,7 @@ impl Baseline {
 	/// Where the view `depth` layers deep answers for `rel_path`, and the marker the top-most layer
 	/// that advanced one there advanced. One step per layer and no more: a move maps a path to ONE
 	/// path below it, because its destination held nothing of its own.
-	fn lookup<'a>(
-		&'a self,
-		depth: usize,
-		rel_path: &'a str,
-	) -> (Lookup<'a>, Option<Option<Blake3Hash>>) {
+	fn lookup<'a>(&'a self, depth: usize, rel_path: &'a str) -> (Lookup<'a>, Option<Agreed>) {
 		let mut path: Cow<'a, str> = Cow::Borrowed(rel_path);
 		let mut mark = None;
 		let Some(edits) = self.edits.as_deref() else {
@@ -823,7 +819,7 @@ impl Baseline {
 						return (Lookup::Absent, mark);
 					}
 					if mark.is_none() {
-						mark = block.agreed.get(path.as_ref()).map(|agreed| agreed.hash);
+						mark = block.agreed.get(path.as_ref()).copied();
 					}
 				}
 				Layer::Moved { from, to } => {

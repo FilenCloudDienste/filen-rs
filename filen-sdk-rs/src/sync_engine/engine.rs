@@ -5309,7 +5309,7 @@ fn adoption_refusal(refused: Option<RefuseReason>, state: &guard::ScreenState) -
 	Some(
 		if !state.scan_complete {
 			"the local scan is incomplete"
-		} else if !state.remote_converged {
+		} else if state.remote == guard::RemoteEvidence::Unconverged {
 			"the remote view has never converged"
 		} else {
 			"the remote view came back wholly empty"
@@ -5660,10 +5660,14 @@ fn deletion_batch_token(held: &[SyncAction]) -> String {
 fn screen_state(prep: &Prepared) -> guard::ScreenState {
 	guard::ScreenState {
 		scan_complete: prep.local_scan.complete,
-		remote_converged: prep.remote_converged,
 		// A wholly empty remote snapshot while the baseline still tracks remote items: what a
 		// transient backend/cache fault looks like, and it would otherwise delete the whole pair.
-		remote_emptied: prep.remote_emptied,
+		// A view that never converged is untrustworthy before it is anything else.
+		remote: match (prep.remote_converged, prep.remote_emptied) {
+			(false, _) => guard::RemoteEvidence::Unconverged,
+			(true, true) => guard::RemoteEvidence::Emptied,
+			(true, false) => guard::RemoteEvidence::Listed,
+		},
 		first_sync: prep.baseline.is_empty(),
 		tracked: prep.baseline.len(),
 	}
@@ -5931,8 +5935,7 @@ mod tests {
 		);
 		let healthy = guard::ScreenState {
 			scan_complete: true,
-			remote_converged: true,
-			remote_emptied: false,
+			remote: guard::RemoteEvidence::Listed,
 			first_sync: false,
 			tracked: 1,
 		};
@@ -7944,8 +7947,7 @@ mod tests {
 	fn adopting_the_destination_is_refused_on_evidence_a_pass_would_not_act_on() {
 		let healthy = guard::ScreenState {
 			scan_complete: true,
-			remote_converged: true,
-			remote_emptied: false,
+			remote: guard::RemoteEvidence::Listed,
 			first_sync: false,
 			tracked: 5,
 		};
@@ -7961,14 +7963,14 @@ mod tests {
 			),
 			(
 				guard::ScreenState {
-					remote_converged: false,
+					remote: guard::RemoteEvidence::Unconverged,
 					..healthy
 				},
 				"the remote view has never converged",
 			),
 			(
 				guard::ScreenState {
-					remote_emptied: true,
+					remote: guard::RemoteEvidence::Emptied,
 					..healthy
 				},
 				"the remote view came back wholly empty",
