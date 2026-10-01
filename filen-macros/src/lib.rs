@@ -1430,174 +1430,201 @@ fn default_enum_serde_repr(item_enum: &ItemEnum) -> proc_macro2::TokenStream {
 	}
 }
 
-fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
+fn parse_enum(item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
+	enum_tokens(item_enum, state).into()
+}
+
+fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
 	let name = &item_enum.ident;
 	let vis = &item_enum.vis;
 	let derives = default_derives(state.no_default);
 	let wasm_condition = &state.wasm_condition;
+	// An exported enum of unit variants only is written as its variant's name, as an
+	// import-only one is read: it needs no tagged twin.
+	let string_enum = is_fieldless_enum(&item_enum) && !state.tagged && !state.untagged;
+	let tag_serde = if state.camel_case_fields {
+		quote! { serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase") }
+	} else {
+		quote! { serde(tag = "type", rename_all = "camelCase") }
+	};
 
-	let (tagged, tagged_attrs) = if !state.into_abi.is_empty() && (!state.tagged && !state.untagged)
-	{
-		let tagged_name = format_ident!("{}Tagged", name);
+	let (tagged, tagged_attrs) =
+		if !state.into_abi.is_empty() && (!state.tagged && !state.untagged) && !string_enum {
+			let tagged_name = format_ident!("{}Tagged", name);
 
-		// Build match arms AND the tagged enum's variants simultaneously,
-		// stripping #[js_type(tagged)] from the real enum's fields as we go.
-		let mut match_arms = Vec::new();
-		let mut tagged_variants: syn::punctuated::Punctuated<syn::Variant, syn::Token![,]> =
-			syn::punctuated::Punctuated::new();
+			// Build match arms AND the tagged enum's variants simultaneously,
+			// stripping #[js_type(tagged)] from the real enum's fields as we go.
+			let mut match_arms = Vec::new();
+			let mut tagged_variants: syn::punctuated::Punctuated<syn::Variant, syn::Token![,]> =
+				syn::punctuated::Punctuated::new();
 
-		for variant in item_enum.variants.iter_mut() {
-			let ident = &variant.ident;
+			for variant in item_enum.variants.iter_mut() {
+				let ident = &variant.ident;
 
-			match &mut variant.fields {
-				Fields::Unnamed(unnamed) => {
-					// Capture paren_token and build tagged_fields while the
-					// mutable borrow of `variant.fields` is still active.
-					// We must NOT call variant.clone() inside this arm.
-					let paren_token = unnamed.paren_token;
-					let tagged_fields: Vec<syn::Field> = unnamed
-						.unnamed
-						.iter_mut()
-						.map(|field| {
-							let mut f = field.clone();
-							let is_tagged = extract_tagged_attr(&mut field.attrs);
-							if is_tagged {
-								f.ty = make_tagged_type(&f.ty);
-								// strip from the copy too
-								extract_tagged_attr(&mut f.attrs);
+				match &mut variant.fields {
+					Fields::Unnamed(unnamed) => {
+						// Capture paren_token and build tagged_fields while the
+						// mutable borrow of `variant.fields` is still active.
+						// We must NOT call variant.clone() inside this arm.
+						let paren_token = unnamed.paren_token;
+						let tagged_fields: Vec<syn::Field> = unnamed
+							.unnamed
+							.iter_mut()
+							.map(|field| {
+								let mut f = field.clone();
+								let is_tagged = extract_tagged_attr(&mut field.attrs);
+								if is_tagged {
+									f.ty = make_tagged_type(&f.ty);
+									// strip from the copy too
+									extract_tagged_attr(&mut f.attrs);
+								}
+								f
+							})
+							.collect();
+						// Mutable borrow of variant.fields ends here — safe to clone now.
+						let mut tagged_variant = variant.clone();
+						tagged_variant.fields = Fields::Unnamed(syn::FieldsUnnamed {
+							paren_token,
+							unnamed: tagged_fields.into_iter().collect(),
+						});
+						// Strip any remaining js_type attrs from the tagged copy
+						tagged_variant
+							.attrs
+							.retain(|a| !a.path().is_ident("js_type"));
+						tagged_variants.push(tagged_variant);
+
+						match_arms.push(quote! {
+							#name::#ident(inner) =>
+								#tagged_name::#ident(inner.into())
+						});
+					}
+					Fields::Unit => {
+						let mut tagged_variant = variant.clone();
+						tagged_variant
+							.attrs
+							.retain(|a| !a.path().is_ident("js_type"));
+						tagged_variants.push(tagged_variant);
+
+						match_arms.push(quote! {
+							#name::#ident =>
+								#tagged_name::#ident
+						});
+					}
+					Fields::Named(_) => {
+						let mut tagged_variant = variant.clone();
+						tagged_variant
+							.attrs
+							.retain(|a| !a.path().is_ident("js_type"));
+						tagged_variants.push(tagged_variant);
+
+						match_arms.push(quote! {
+							#name::#ident { .. } => {
+								unreachable!("Struct variants not supported yet")
 							}
-							f
-						})
-						.collect();
-					// Mutable borrow of variant.fields ends here — safe to clone now.
-					let mut tagged_variant = variant.clone();
-					tagged_variant.fields = Fields::Unnamed(syn::FieldsUnnamed {
-						paren_token,
-						unnamed: tagged_fields.into_iter().collect(),
-					});
-					// Strip any remaining js_type attrs from the tagged copy
-					tagged_variant
-						.attrs
-						.retain(|a| !a.path().is_ident("js_type"));
-					tagged_variants.push(tagged_variant);
-
-					match_arms.push(quote! {
-						#name::#ident(inner) =>
-							#tagged_name::#ident(inner.into())
-					});
-				}
-				Fields::Unit => {
-					let mut tagged_variant = variant.clone();
-					tagged_variant
-						.attrs
-						.retain(|a| !a.path().is_ident("js_type"));
-					tagged_variants.push(tagged_variant);
-
-					match_arms.push(quote! {
-						#name::#ident =>
-							#tagged_name::#ident
-					});
-				}
-				Fields::Named(_) => {
-					let mut tagged_variant = variant.clone();
-					tagged_variant
-						.attrs
-						.retain(|a| !a.path().is_ident("js_type"));
-					tagged_variants.push(tagged_variant);
-
-					match_arms.push(quote! {
-						#name::#ident { .. } => {
-							unreachable!("Struct variants not supported yet")
-						}
-					});
-				}
-			}
-		}
-
-		let into_abi = state.into_abi;
-
-		let serialize = if state.no_ser {
-			quote! {}
-		} else {
-			quote! {, serde::Serialize}
-		};
-
-		(
-			quote! {
-				#[cfg(#wasm_condition)]
-				#derives
-				#[derive(tsify::Tsify #serialize)]
-				#[#into_abi]
-				#[serde(tag = "type", rename_all = "camelCase")]
-				#vis enum #tagged_name {
-					#tagged_variants
-				}
-
-				#[cfg(#wasm_condition)]
-				impl<T> From<T> for #tagged_name where T: Into<#name> {
-					fn from(value: T) -> Self {
-						let value = value.into();
-						match value {
-							#( #match_arms ),*
-						}
+						});
 					}
 				}
+			}
 
-				#[cfg(feature = "uniffi")]
-				#vis type #tagged_name = #name;
-			},
-			quote! {
-				serde(untagged)
-			},
-		)
-	} else if state.tagged {
-		let into_abi = if state.no_ser {
-			quote! {}
-		} else if state.into_abi.is_empty() {
-			quote! {
-				derive(serde::Serialize),
-				serde(tag = "type", rename_all = "camelCase")
-			}
-		} else {
-			let into_abi = add_comma_if_needed(state.into_abi);
-			quote! {
-				#into_abi
-				derive(serde::Serialize),
-				serde(tag = "type", rename_all = "camelCase")
-			}
-		};
+			let into_abi = state.into_abi;
 
-		(
-			quote! {},
-			quote! {
-				#into_abi
-			},
-		)
-	} else if state.untagged {
-		let into_abi = if state.no_ser {
-			quote! {}
-		} else if state.into_abi.is_empty() {
-			quote! {
-				derive(serde::Serialize),
-				serde(untagged, rename_all = "camelCase")
-			}
-		} else {
+			let serialize = if state.no_ser {
+				quote! {}
+			} else {
+				quote! {, serde::Serialize}
+			};
+
+			(
+				quote! {
+					#[cfg(#wasm_condition)]
+					#derives
+					#[derive(tsify::Tsify #serialize)]
+					#[#into_abi]
+					#[serde(tag = "type", rename_all = "camelCase")]
+					#vis enum #tagged_name {
+						#tagged_variants
+					}
+
+					#[cfg(#wasm_condition)]
+					impl<T> From<T> for #tagged_name where T: Into<#name> {
+						fn from(value: T) -> Self {
+							let value = value.into();
+							match value {
+								#( #match_arms ),*
+							}
+						}
+					}
+
+					#[cfg(feature = "uniffi")]
+					#vis type #tagged_name = #name;
+				},
+				quote! {
+					serde(untagged)
+				},
+			)
+		} else if state.tagged {
+			let into_abi = if state.no_ser {
+				quote! {}
+			} else if state.into_abi.is_empty() {
+				quote! {
+					derive(serde::Serialize),
+					#tag_serde
+				}
+			} else {
+				let into_abi = add_comma_if_needed(state.into_abi);
+				quote! {
+					#into_abi
+					derive(serde::Serialize),
+					#tag_serde
+				}
+			};
+
+			(
+				quote! {},
+				quote! {
+					#into_abi
+				},
+			)
+		} else if state.untagged {
+			let into_abi = if state.no_ser {
+				quote! {}
+			} else if state.into_abi.is_empty() {
+				quote! {
+					derive(serde::Serialize),
+					serde(untagged, rename_all = "camelCase")
+				}
+			} else {
+				let into_abi = add_comma_if_needed(state.into_abi);
+				quote! {
+					#into_abi
+					derive(serde::Serialize),
+					serde(untagged, rename_all = "camelCase")
+				}
+			};
+			(
+				quote! {},
+				quote! {
+					#into_abi
+				},
+			)
+		} else if string_enum && !state.into_abi.is_empty() {
+			let serialize = if state.no_ser {
+				quote! {}
+			} else {
+				quote! { derive(serde::Serialize), }
+			};
 			let into_abi = add_comma_if_needed(state.into_abi);
-			quote! {
-				#into_abi
-				derive(serde::Serialize),
-				serde(untagged, rename_all = "camelCase")
-			}
+			(
+				quote! {},
+				quote! {
+					#serialize
+					#into_abi
+					serde(rename_all = "camelCase")
+				},
+			)
+		} else {
+			(quote! {}, default_enum_serde_repr(&item_enum))
 		};
-		(
-			quote! {},
-			quote! {
-				#into_abi
-			},
-		)
-	} else {
-		(quote! {}, default_enum_serde_repr(&item_enum))
-	};
 
 	let from_abi = add_comma_if_needed(state.from_abi);
 
@@ -1611,7 +1638,11 @@ fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 		quote! {, serde::Deserialize}
 	};
 
-	let expanded = quote! {
+	// the enum's own attributes, its docs among them
+	let attrs = &item_enum.attrs;
+
+	quote! {
+		#(#attrs)*
 		#derives
 		#[cfg_attr(
 			#wasm_condition,
@@ -1625,9 +1656,7 @@ fn parse_enum(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 		}
 
 		#tagged
-	};
-
-	expanded.into()
+	}
 }
 
 fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
@@ -1640,6 +1669,7 @@ fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
 		no_default: false,
 		tagged: false,
 		untagged: false,
+		camel_case_fields: false,
 	};
 
 	for arg in args {
@@ -1665,6 +1695,9 @@ fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
 			}
 			Meta::Path(path) if path.is_ident("untagged") => {
 				state.untagged = true;
+			}
+			Meta::Path(path) if path.is_ident("camel_case_fields") => {
+				state.camel_case_fields = true;
 			}
 			Meta::Path(path) if path.is_ident("wasm_all") => {
 				state.wasm_condition = quote! {all(target_family = "wasm", target_os = "unknown")};
@@ -1726,6 +1759,9 @@ struct JsTypeState {
 	no_default: bool,
 	tagged: bool,
 	untagged: bool,
+	/// A tagged enum's struct-variant fields are written in camelCase too, like a struct's;
+	/// without it they keep their Rust names, as the enums that shipped that way do.
+	camel_case_fields: bool,
 	wasm_condition: TokenStream2,
 }
 
@@ -1838,6 +1874,62 @@ mod js_type_enum_tests {
 		};
 		assert!(!is_fieldless_enum(&item));
 		assert_eq!(compact(default_enum_serde_repr(&item)), "serde(untagged)");
+	}
+
+	fn expand(args: proc_macro2::TokenStream, item: ItemEnum) -> String {
+		let args = syn::parse::Parser::parse2(
+			syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+			args,
+		)
+		.unwrap();
+		let state = parse_args(args.into_iter().collect()).unwrap();
+		compact(enum_tokens(item, state))
+	}
+
+	#[test]
+	fn an_exported_unit_enum_is_written_as_its_variants_name_without_a_twin() {
+		let item: ItemEnum = syn::parse_quote! {
+			/// The phase.
+			enum Phase {
+				Running,
+				Done,
+			}
+		};
+		let tokens = expand(quote!(export, no_deser), item);
+		assert!(
+			tokens.contains(
+				r#"derive(serde::Serialize),tsify(into_wasm_abi,large_number_types_as_bigints,hashmap_as_object),serde(rename_all="camelCase")"#
+			),
+			"{tokens}"
+		);
+		assert!(!tokens.contains("PhaseTagged"), "{tokens}");
+		assert!(!tokens.contains("untagged"), "{tokens}");
+		assert!(tokens.starts_with(r#"#[doc=r"Thephase."]"#), "{tokens}");
+	}
+
+	#[test]
+	fn a_tagged_enum_writes_its_fields_in_camel_case_only_when_asked() {
+		let item: ItemEnum = syn::parse_quote! {
+			enum Outcome {
+				Kept { bytes_freed: u64 },
+			}
+		};
+		let camel = expand(
+			quote!(export, no_deser, tagged, camel_case_fields),
+			item.clone(),
+		);
+		assert!(
+			camel.contains(
+				r#"serde(tag="type",rename_all="camelCase",rename_all_fields="camelCase")"#
+			),
+			"{camel}"
+		);
+		let plain = expand(quote!(export, no_deser, tagged), item);
+		assert!(
+			plain.contains(r#"serde(tag="type",rename_all="camelCase")"#),
+			"{plain}"
+		);
+		assert!(!plain.contains("rename_all_fields"), "{plain}");
 	}
 
 	#[test]

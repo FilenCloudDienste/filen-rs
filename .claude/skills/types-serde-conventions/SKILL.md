@@ -61,6 +61,7 @@ hand-written `Serialize` impl in `shared/out_root.rs`) are skipped.
 | `no_ser` / `no_deser` | Suppress the `derive(serde::Serialize)` / `Deserialize` inside the cfg_attr — use when serde is provided unconditionally |
 | `no_default` | Suppress the default `#[derive(Debug, Clone, PartialEq, Eq)]` |
 | `tagged` | Force tagged enum mode |
+| `camel_case_fields` | With `tagged`: struct-variant fields are written in camelCase too (`rename_all_fields`); without it they keep their Rust names, as the enums that shipped that way do |
 
 Key invariant: `no_ser` suppresses only the serde derive, **not** `tsify(into_wasm_abi, …)`.
 That is what makes the pattern below work.
@@ -100,4 +101,6 @@ If struct fields carry `#[js_type(tagged)]`, the macro emits a companion `{Name}
 struct for WASM with those field types replaced by their tagged equivalents, gated on the
 wasm condition; UniFFI gets a `type {Name}Tagged = {Name}` alias. For enums with `export`,
 the macro emits a `{Name}Tagged` enum for WASM serialization while the main enum takes the
-`uniffi::Enum` derive.
+`uniffi::Enum` derive. An exported enum of unit variants only (and neither `tagged` nor
+`untagged`) gets no twin: it is written as its variant's name in camelCase, as an import-only
+one is read.
