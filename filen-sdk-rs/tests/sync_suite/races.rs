@@ -476,10 +476,8 @@ async fn race_16_twoway_divergence_conflicts_without_loss() {
 	// Establish a shared baseline of shared.txt=BASE on both sides.
 	write_file(&tc.local_a, "shared.txt", b"BASE");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"baseline",
@@ -549,10 +547,8 @@ async fn race_25_same_content_rewrite_no_false_conflict() {
 
 	write_file(&tc.local_a, "idem.txt", b"IDENTICAL");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"baseline",

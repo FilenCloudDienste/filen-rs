@@ -72,7 +72,8 @@ pub(in super::super) fn reset_reads() {
 
 /// What one statement handed back, counted in rows for [`ROWS_READ`].
 trait Answer {
-	// Counted only where there is a counter to count into.
+	// Counted only where there is a counter to count into (tests and `bench-internals`). Allowed
+	// rather than gated: a gate here would have to be repeated on every implementation below.
 	#[cfg_attr(not(any(test, feature = "bench-internals")), allow(dead_code))]
 	fn rows(&self) -> usize;
 }

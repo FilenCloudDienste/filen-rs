@@ -318,10 +318,8 @@ async fn observ_06_conflict_count_and_no_overwrite() {
 	write_file(&tc.local_a, "x.txt", b"base-x");
 	write_file(&tc.local_a, "y.txt", b"base-y");
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"baseline",
@@ -345,10 +343,8 @@ async fn observ_06_conflict_count_and_no_overwrite() {
 	// Run rounds; x.txt must surface as a conflict and y.txt must propagate.
 	let mut conflicts2 = BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts2,
 		"diverge",

@@ -613,16 +613,20 @@ async fn sync_round(
 	}
 }
 
+/// One of the two clients: its engine and the pair it syncs.
+#[derive(Clone, Copy)]
+struct Peer<'a> {
+	engine: &'a SyncEngine,
+	pair: i64,
+}
+
 /// Run sync rounds in `order` until `done` holds, panicking after a bound. Every pass must be
 /// error-free; any surfaced conflict is recorded into `conflicts` (a NON-colliding scenario must
 /// surface none — the caller asserts that). A short settle between rounds lets each client's cache
 /// observe the other's just-committed remote writes before the next pass.
-#[allow(clippy::too_many_arguments)]
 async fn converge(
-	ea: &SyncEngine,
-	pa: i64,
-	eb: &SyncEngine,
-	pb: i64,
+	a: Peer<'_>,
+	b: Peer<'_>,
 	order: Order,
 	conflicts: &mut BTreeSet<String>,
 	label: &str,
@@ -630,7 +634,7 @@ async fn converge(
 ) {
 	const MAX_ROUNDS: usize = 20;
 	for _ in 0..MAX_ROUNDS {
-		let (ra, rb) = sync_round(ea, pa, eb, pb, order).await;
+		let (ra, rb) = sync_round(a.engine, a.pair, b.engine, b.pair, order).await;
 		assert!(
 			ra.errors.is_empty(),
 			"{label}: engine A reported errors {:?}",
@@ -693,15 +697,21 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 		.add_pair(local_b.clone(), remote, SyncMode::TwoWay)
 		.await
 		.unwrap();
+	let peer_a = Peer {
+		engine: &engine_a,
+		pair: pa,
+	};
+	let peer_b = Peer {
+		engine: &engine_b,
+		pair: pb,
+	};
 
 	let mut conflicts = BTreeSet::new();
 
 	// Establish the shared baseline.
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"baseline",
@@ -716,10 +726,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S1 — A creates a new file. [A-first]
 	write_file(&local_a, "a/new1.txt", b"new-one");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"S1 A-creates",
@@ -730,10 +738,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S2 — B creates a new nested file (+ dirs). [B-first]
 	write_file(&local_b, "b/deep/new2.txt", b"new-two");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::BFirst,
 		&mut conflicts,
 		"S2 B-creates-nested",
@@ -744,10 +750,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S3 — A modifies an existing file. [concurrent]
 	write_file(&local_a, "top.txt", b"top-modified");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::Concurrent,
 		&mut conflicts,
 		"S3 A-modifies",
@@ -758,10 +762,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S4 — B renames a file in place (unique content -> uuid move). [A-first]
 	move_file(&local_b, "base/s0.txt", "base/renamed0.txt");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"S4 B-renames",
@@ -776,10 +778,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S5 — A moves a file across directories. [B-first]
 	move_file(&local_a, "base/s1.txt", "moved/s1.txt");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::BFirst,
 		&mut conflicts,
 		"S5 A-moves",
@@ -794,10 +794,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S6 — A deletes a file (one-sided delete propagates). [concurrent]
 	std::fs::remove_file(local_a.join("base/s2.txt")).unwrap();
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::Concurrent,
 		&mut conflicts,
 		"S6 A-deletes",
@@ -808,10 +806,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S7 — B creates an empty directory. [A-first]
 	std::fs::create_dir_all(local_b.join("emptydir")).unwrap();
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"S7 B-empty-dir",
@@ -822,10 +818,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S8 — B deletes the (now-converged) empty directory. [B-first]
 	std::fs::remove_dir(local_b.join("emptydir")).unwrap();
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::BFirst,
 		&mut conflicts,
 		"S8 B-deletes-empty-dir",
@@ -837,10 +831,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	write_file(&local_a, "a/x.txt", b"x");
 	write_file(&local_b, "b/y.txt", b"y");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::Concurrent,
 		&mut conflicts,
 		"S9 disjoint-creates",
@@ -856,10 +848,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	write_file(&local_a, "a/new1.txt", b"new-one-edited");
 	write_file(&local_b, "top.txt", b"top-modified-again");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::Concurrent,
 		&mut conflicts,
 		"S10 disjoint-edits",
@@ -876,10 +866,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	write_file(&local_a, "shared/same.txt", b"identical");
 	write_file(&local_b, "shared/same.txt", b"identical");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::Concurrent,
 		&mut conflicts,
 		"S11 identical-both-create",
@@ -894,10 +882,8 @@ async fn twoway_noncolliding_changes_propagate_both_ways_in_any_order() {
 	// S12 — A creates a zero-byte file. [A-first]
 	write_file(&local_a, "a/empty.txt", b"");
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"S12 zero-byte",
@@ -966,13 +952,19 @@ async fn converge_disjoint_under(order: Order) -> TreeMap {
 		.add_pair(local_b.clone(), remote, SyncMode::TwoWay)
 		.await
 		.unwrap();
+	let peer_a = Peer {
+		engine: &engine_a,
+		pair: pa,
+	};
+	let peer_b = Peer {
+		engine: &engine_b,
+		pair: pb,
+	};
 
 	let mut conflicts = BTreeSet::new();
 	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
+		peer_a,
+		peer_b,
 		Order::AFirst,
 		&mut conflicts,
 		"oi-baseline",
@@ -984,21 +976,12 @@ async fn converge_disjoint_under(order: Order) -> TreeMap {
 	write_file(&local_a, "from_a.txt", b"a");
 	write_file(&local_a, "seed.txt", b"seed-v2");
 	write_file(&local_b, "from_b.txt", b"b");
-	converge(
-		&engine_a,
-		pa,
-		&engine_b,
-		pb,
-		order,
-		&mut conflicts,
-		"oi-converge",
-		|| {
-			trees_equal(&local_a, &local_b)
-				&& local_a.join("from_b.txt").is_file()
-				&& local_b.join("from_a.txt").is_file()
-				&& read_eq(&local_b, "seed.txt", b"seed-v2")
-		},
-	)
+	converge(peer_a, peer_b, order, &mut conflicts, "oi-converge", || {
+		trees_equal(&local_a, &local_b)
+			&& local_a.join("from_b.txt").is_file()
+			&& local_b.join("from_a.txt").is_file()
+			&& read_eq(&local_b, "seed.txt", b"seed-v2")
+	})
 	.await;
 
 	assert!(

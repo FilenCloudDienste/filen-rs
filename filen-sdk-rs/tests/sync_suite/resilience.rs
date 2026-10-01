@@ -523,10 +523,8 @@ async fn resil_25_two_way_conflict_persists_across_reruns_nondestructive() {
 	write_file(&tc.local_a, "t.txt", b"base");
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"resil25-baseline",

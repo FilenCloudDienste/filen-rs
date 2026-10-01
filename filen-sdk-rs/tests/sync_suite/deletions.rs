@@ -780,10 +780,8 @@ async fn delete_14_twoway_one_sided_delete_no_conflict() {
 	write_file(&tc.local_a, "shared.txt", b"C");
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"delete14 baseline",
@@ -794,10 +792,8 @@ async fn delete_14_twoway_one_sided_delete_no_conflict() {
 	// Delete on A only; remote copy untouched. B should mirror the delete.
 	std::fs::remove_file(tc.local_a.join("shared.txt")).unwrap();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"delete14 propagate",
@@ -824,10 +820,8 @@ async fn delete_15_twoway_delete_vs_edit_conflict() {
 	write_file(&tc.local_a, "doc.txt", b"base");
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"delete15 baseline",
@@ -1055,10 +1049,8 @@ async fn delete_20_twoway_guard_fires_on_local_side_fraction() {
 	}
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"delete20 baseline",
@@ -1333,10 +1325,8 @@ async fn delete_a2_twoway_both_sides_delete_converges() {
 	write_file(&tc.local_a, "dual.txt", b"C");
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"deleteA2 baseline",
@@ -1349,10 +1339,8 @@ async fn delete_a2_twoway_both_sides_delete_converges() {
 	std::fs::remove_file(tc.local_a.join("dual.txt")).unwrap();
 	std::fs::remove_file(tc.local_b.join("dual.txt")).unwrap();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::Concurrent,
 		&mut conflicts,
 		"deleteA2 both-delete",
@@ -1389,10 +1377,8 @@ async fn delete_a3_twoway_guard_fires_on_remote_side_fraction() {
 	}
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"deleteA3 baseline",
