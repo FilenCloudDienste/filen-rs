@@ -593,6 +593,9 @@ impl<B: DisposalBackend> Driver<B> {
 			&& self.held.is_none()
 			&& self.files.is_empty()
 			&& self.links.ready.is_empty()
+			// a hard link that failed is let go with its file's lookup or chunk still in flight
+			&& self.links.sources.is_empty()
+			&& self.links.chunks.is_empty()
 			&& self.codec_done
 	}
 

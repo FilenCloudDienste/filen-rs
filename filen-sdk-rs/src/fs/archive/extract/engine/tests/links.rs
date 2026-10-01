@@ -658,3 +658,117 @@ async fn a_hard_link_to_mac_metadata_is_left_out_as_metadata() {
 		]
 	);
 }
+
+/// How long a job of two small files may take before it counts as hung.
+const NO_HANG: Duration = Duration::from_secs(20);
+
+/// Waits for `job` to end, failing the test rather than hanging it when it never does.
+async fn ended(job: Running) -> ExtractReport {
+	tokio::time::timeout(NO_HANG, job)
+		.await
+		.expect("the job ends")
+		.unwrap()
+		.unwrap()
+}
+
+/// Asserts `report` of a tar of `a.bin`, `size` bytes, and a hard link `link` to it tells that
+/// `a.bin` was extracted and the link failed, once, at `stage`: every file counted once.
+fn assert_link_failed(
+	setup: &Setup,
+	report: &ExtractReport,
+	link: &str,
+	size: u64,
+	stage: ExtractStage,
+) {
+	assert_eq!(finished_paths(setup), ["bundle/a.bin"]);
+	let link_failures: Vec<_> = failures(report)
+		.into_iter()
+		.filter(|(path, ..)| *path == link)
+		.map(|(_, _, stage, kind)| (stage, kind))
+		.collect();
+	assert_eq!(link_failures, [(stage, ErrorKind::Server)]);
+	let counts = report.counts;
+	assert_eq!(
+		(
+			counts.files_done,
+			counts.files_failed,
+			counts.files_not_attempted
+		),
+		(1, 1, 0)
+	);
+	assert_eq!(
+		(
+			counts.bytes_done,
+			counts.bytes_failed,
+			counts.bytes_not_attempted
+		),
+		(size, size, 0)
+	);
+}
+
+/// Extracts `a.bin`, holding `data`, and a hard link `b.txt` to it, on a drive `configure` sets
+/// up so the link's copy fails before all its data came: the job still ends, the link failed.
+async fn a_link_copy_failing(data: &[u8], configure: impl FnOnce(&mut FakeBackend)) {
+	let tar = tar_with(&[TarMember::Data("a.bin", data), hard_link("b.txt", "a.bin")]);
+	let setup = setup("bundle.tar", tar, configure);
+	let job = start(&setup, Options::default());
+	let report = ended(job.running).await;
+	let size = data.len() as u64;
+	assert_link_failed(&setup, &report, "b.txt", size, ExtractStage::Upload);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_whose_file_cannot_be_looked_up_fails() {
+	a_link_copy_failing(b"alpha", |backend| {
+		backend.fail_items = Some(ErrorKind::Server);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_whose_files_chunk_cannot_be_fetched_fails() {
+	// the fake drive names every file fetched by uuid so
+	a_link_copy_failing(b"alpha", |backend| {
+		backend
+			.fail_fetch
+			.insert("fetched".to_owned(), ErrorKind::Server);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_whose_upload_fails_before_its_last_chunk_is_fetched_fails() {
+	let data = incompressible(2 * CHUNK_SIZE + 1, 0x2D);
+	a_link_copy_failing(&data, |backend| {
+		// the first chunk's upload fails while the next one is still being fetched
+		backend
+			.slow
+			.insert("fetched".to_owned(), Duration::from_millis(300));
+		backend
+			.fail_upload
+			.insert("b.txt".to_owned(), ErrorKind::Server);
+	})
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_into_a_directory_that_failed_fails_once() {
+	let tar = tar_with(&[
+		TarMember::Data("a.bin", b"alpha"),
+		hard_link("d/b.txt", "a.bin"),
+	]);
+	let setup = setup("bundle.tar", tar, |backend| {
+		backend.fail_create.insert("d".into(), ErrorKind::Server);
+		// its file's lookup, already in flight when the link fails, fails as well
+		backend.fail_items = Some(ErrorKind::Server);
+		backend.hold_named(Request::Finish, ["a.bin"]);
+	});
+	let job = start(&setup, Options::default());
+	// the link opens, once a.bin is registered, into the directory that failed
+	wait_until("d failed", || job.reporter.counts().dirs_failed == 1).await;
+	setup.backend.release_all();
+	let report = ended(job.running).await;
+	assert_link_failed(&setup, &report, "d/b.txt", 5, ExtractStage::CreateDirectory);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}

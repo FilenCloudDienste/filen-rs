@@ -31,7 +31,8 @@ use crate::{
 };
 
 use super::{
-	Driver, FilePhase, FileSource, LinkPhase, LinkSource, MAX_OPEN_ENTRIES, NewFile, SlotSource,
+	Driver, FilePhase, FileSlot, FileSource, LinkPhase, LinkSource, MAX_OPEN_ENTRIES, NewFile,
+	SlotSource,
 };
 
 /// The files a tar's hard links may name, by [`LinkKeys`] of the path each was sent at: one the
@@ -346,6 +347,10 @@ impl<B: DisposalBackend> Driver<B> {
 		ordinal: u64,
 		result: Result<NonRootItemType<'static, Normal>, Error>,
 	) {
+		// a link that failed while its file was looked up (its directory did) is done with
+		if self.files.get(&ordinal).is_none_or(FileSlot::failed) {
+			return;
+		}
 		let source = match result {
 			Ok(NonRootItemType::File(file)) => RemoteFileType::from(file.into_owned()),
 			Ok(NonRootItemType::Dir(_)) => {
@@ -358,9 +363,7 @@ impl<B: DisposalBackend> Driver<B> {
 				return self.fail_file(ordinal, ExtractStage::Upload, error);
 			}
 		};
-		let Some(file) = self.files.get_mut(&ordinal) else {
-			return;
-		};
+		let file = self.files.get_mut(&ordinal).expect("checked above");
 		// an empty file has no chunk to copy
 		if source.chunks() == 0 {
 			file.phase = file.phase.end();

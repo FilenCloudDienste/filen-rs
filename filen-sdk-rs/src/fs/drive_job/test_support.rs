@@ -255,6 +255,8 @@ pub(crate) struct FakeBackend {
 	pub(crate) delay: Duration,
 	pub(crate) slow: HashMap<String, Duration>,
 	pub(crate) fail_fetch: HashMap<String, ErrorKind>,
+	/// Fetching any item by its uuid fails with this kind.
+	pub(crate) fail_items: Option<ErrorKind>,
 	pub(crate) fail_upload: HashMap<String, ErrorKind>,
 	pub(crate) fail_create: HashMap<String, ErrorKind>,
 	pub(crate) fail_finish: HashMap<String, ErrorKind>,
@@ -321,6 +323,7 @@ impl FakeBackend {
 			delay: Duration::from_millis(10),
 			slow: HashMap::new(),
 			fail_fetch: HashMap::new(),
+			fail_items: None,
 			fail_upload: HashMap::new(),
 			fail_create: HashMap::new(),
 			fail_finish: HashMap::new(),
@@ -587,6 +590,9 @@ impl DriveBackend for FakeBackend {
 			log.peak_item_fetches = log.peak_item_fetches.max(running);
 		});
 		tokio::time::sleep(self.delay).await;
+		if let Some(kind) = self.fail_items {
+			return Err(Error::custom(kind, "item fetch failed"));
+		}
 		// a file in the fake drive is fetched at its size; any other is one byte
 		let (size, chunks) = {
 			let mut log = self.log();

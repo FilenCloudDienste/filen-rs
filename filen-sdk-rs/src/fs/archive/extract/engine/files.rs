@@ -221,7 +221,9 @@ impl<B: DisposalBackend> Driver<B> {
 			.expect("a failed file is known");
 		file.phase = FilePhase::Failed {
 			ended: match file.phase {
-				FilePhase::Receiving => false,
+				// the codec still ends the file it sends, but a hard link's copy stops for good:
+				// nothing more comes for it
+				FilePhase::Receiving => matches!(file.source, SlotSource::Link(_)),
 				FilePhase::Ended | FilePhase::Finalizing => true,
 				FilePhase::Failed { ended } => ended,
 			},
