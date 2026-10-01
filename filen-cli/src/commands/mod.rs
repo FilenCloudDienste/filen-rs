@@ -18,6 +18,7 @@ mod notes_cmds;
 mod public_links_cmds;
 mod rclone_cmds;
 mod search_cmd;
+mod sync_cmd;
 mod transfer_cmds;
 
 #[derive(Debug, Subcommand)]
@@ -127,6 +128,15 @@ pub(crate) enum Commands {
 		/// Local destination directory (default: the current local directory)
 		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
 		destination: Option<String>,
+	},
+	/// Keep a local directory and a directory in the Filen drive in sync (two-way), until Ctrl-C
+	Sync {
+		/// Local directory to sync
+		#[arg(add = ArgValueCompleter::new(PathCompleter::dir()))]
+		local: String,
+		/// Directory in the Filen drive to sync with (not the drive root)
+		#[arg(add = FilenCompleter::directory())]
+		remote: String,
 	},
 	/// Export all notes to a local directory
 	ExportNotes {
@@ -342,6 +352,10 @@ pub(crate) async fn execute_command(
 		} => {
 			transfer_cmds::download(ui, client, working_path, &source, destination.as_deref())
 				.await?;
+			None
+		}
+		Commands::Sync { local, remote } => {
+			sync_cmd::sync(config, ui, client, working_path, &local, &remote).await?;
 			None
 		}
 		Commands::ExportNotes { path } => {

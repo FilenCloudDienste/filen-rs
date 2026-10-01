@@ -108,6 +108,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 				DocElement::DocFragment("transfers"),
 				DocElement::CommandHelp("upload"),
 				DocElement::CommandHelp("download"),
+				DocElement::CommandHelp("sync"),
 			],
 		},
 		DocSection {
