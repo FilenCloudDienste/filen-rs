@@ -227,8 +227,8 @@ pub(super) fn name_rejection(rel_path: &str) -> Option<String> {
 /// subtree that is already reported and must be skipped silently.
 fn under_invalid_name(invalid: &BTreeMap<String, String>, rel_path: &str) -> bool {
 	let mut path = rel_path;
-	while let Some(cut) = path.rfind('/') {
-		path = &path[..cut];
+	while let Some((parent, _)) = path.rsplit_once('/') {
+		path = parent;
 		if invalid.contains_key(path) {
 			return true;
 		}

@@ -59,7 +59,7 @@ use unicode_normalization::UnicodeNormalization;
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	ignore::{FILENIGNORE, IgnoreDecision, IgnoreRules, rule_file_dir},
-	plan::is_under,
+	plan::{ancestors, is_under},
 	rows::Baseline,
 	scan::{
 		LocalNode, LocalScan, RuleFiles, ScanError, collision_key, fast_path_hash, hash_file,
@@ -649,8 +649,7 @@ fn walk_ancestors<'p>(
 	walked: &mut BTreeSet<String>,
 	out: &mut LocalObservations,
 ) -> Ancestors<'p> {
-	for (cut, _) in path.match_indices('/') {
-		let ancestor = &path[..cut];
+	for ancestor in ancestors(path) {
 		if walked.contains(ancestor) {
 			continue;
 		}
@@ -707,9 +706,7 @@ fn walk_ancestors<'p>(
 fn covered(observed: &BTreeMap<String, LocalObservation>, path: &str) -> bool {
 	observed.contains_key("")
 		|| observed.contains_key(path)
-		|| path
-			.match_indices('/')
-			.any(|(cut, _)| observed.contains_key(&path[..cut]))
+		|| ancestors(path).any(|ancestor| observed.contains_key(ancestor))
 }
 
 /// File one observation, and — once per directory — the folded names of the directory it sits in.

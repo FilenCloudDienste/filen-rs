@@ -1635,7 +1635,9 @@ async fn scale_e_long_and_unicode_filenames() {
 	for name in &names {
 		let f = find_file(&files, name)
 			.unwrap_or_else(|| panic!("name not preserved exactly: {name:?}"));
-		let i: usize = name[name.len() - 7..name.len() - 4].parse().unwrap();
+		// Every name ends `_{i:03}.txt`.
+		let (_, index) = name.strip_suffix(".txt").unwrap().rsplit_once('_').unwrap();
+		let i: usize = index.parse().unwrap();
 		assert_eq!(
 			f.size,
 			format!("content-{i}").len() as u64,
