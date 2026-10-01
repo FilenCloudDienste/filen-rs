@@ -129,6 +129,15 @@ struct Node {
 	remote_modified: i64,
 }
 
+/// `node`'s leaf name in the arena `names`. The span is one whole name [`Tree::push_name`]
+/// appended, so it starts and ends on a character boundary.
+fn leaf_name<'n>(names: &'n str, node: &Node) -> &'n str {
+	names
+		.get(node.name_at as usize..)
+		.and_then(|rest| rest.get(..node.name_len as usize))
+		.expect("a node's span is a whole name the arena holds (should be impossible)")
+}
+
 impl Node {
 	/// A node with no name yet: [`Tree::insert_node`] puts one in the arena and points the node
 	/// at it, so the arena stays the only place a name is ever written.
@@ -396,8 +405,7 @@ impl Tree {
 	}
 
 	fn name(&self, id: NodeId) -> &str {
-		let node = &self.nodes[id.index()];
-		&self.names[node.name_at as usize..][..node.name_len as usize]
+		leaf_name(&self.names, &self.nodes[id.index()])
 	}
 
 	fn is_row(&self, id: NodeId) -> bool {
@@ -1059,11 +1067,7 @@ impl Tree {
 		let (names, nodes) = (&self.names, &self.nodes);
 		let kids = self.children.entry(parent).or_default();
 		let at = kids
-			.binary_search_by(|&other| {
-				let other = &nodes[other.index()];
-				let other = &names[other.name_at as usize..][..other.name_len as usize];
-				sibling_cmp(other, name)
-			})
+			.binary_search_by(|&other| sibling_cmp(leaf_name(names, &nodes[other.index()]), name))
 			.unwrap_or_else(|at| at);
 		kids.insert(at, id);
 		id
@@ -1124,11 +1128,9 @@ impl Tree {
 		// created into its parent's list, and one taken out of it is freed in the same breath.
 		let mut stack = vec![NodeId::ROOT];
 		while let Some(id) = stack.pop() {
-			let node = &self.nodes[id.index()];
-			let (at, len) = (node.name_at as usize, node.name_len as usize);
 			let moved_to =
 				u32::try_from(arena.len()).expect("the live names fit where they already fit");
-			arena.push_str(&self.names[at..at + len]);
+			arena.push_str(leaf_name(&self.names, &self.nodes[id.index()]));
 			self.nodes[id.index()].name_at = moved_to;
 			if let Some(kids) = self.children.get(&id) {
 				stack.extend(kids);

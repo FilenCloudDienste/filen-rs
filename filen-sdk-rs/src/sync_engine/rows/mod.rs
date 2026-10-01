@@ -115,6 +115,7 @@ use self::snapshot::{Counts, MAX_PAGE, PAGE, Page};
 pub(super) use self::snapshot::{reads, reset_reads};
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
+	plan::ancestors,
 	scan::collision_key,
 };
 
@@ -193,9 +194,7 @@ impl Block {
 		if self.vacated.is_empty() {
 			return None;
 		}
-		rel_path
-			.match_indices('/')
-			.map(|(at, _)| &rel_path[..at])
+		ancestors(rel_path)
 			.chain([rel_path])
 			.find_map(|at| self.vacated.get(at).map(String::as_str))
 	}
@@ -906,12 +905,12 @@ impl Baseline {
 				} else {
 					Box::new(
 						self.rows_in(depth - 1, under_to.moved_back(to, from), dirs)
-							.map(move |row| {
-								let path = format!("{to}{}", &row.rel_path[from.len()..]);
-								BaselineEntry {
-									rel_path: path,
+							.filter_map(move |row| {
+								let rest = at_or_under(&row.rel_path, from)?;
+								Some(BaselineEntry {
+									rel_path: format!("{to}{rest}"),
 									..row
-								}
+								})
 							}),
 					)
 				};
@@ -1015,7 +1014,10 @@ impl Baseline {
 					return (self.carry_flag_at(depth - 1, from).is_some() && visit(to))
 						|| self
 							.rows_in(depth - 1, Span::under(from), false)
-							.any(|row| visit(&format!("{to}{}", &row.rel_path[from.len()..])));
+							.any(|row| {
+								at_or_under(&row.rel_path, from)
+									.is_some_and(|rest| visit(&format!("{to}{rest}")))
+							});
 				}
 				match at_or_under(folded, &folded_to) {
 					// `folded` IS the destination's folded path, and only an exact question gets here.
@@ -1200,7 +1202,7 @@ impl Baseline {
 					out.extend(
 						self.unsynced_in(depth - 1, from)
 							.iter()
-							.map(|path| moved(&path[from.len()..])),
+							.filter_map(|path| at_or_under(path, from).map(moved)),
 					);
 				} else if let Some(rest) = at_or_under(root, to) {
 					// `root` is `to` or under it: the moved rows under it are those under the same
@@ -1208,7 +1210,7 @@ impl Baseline {
 					out.extend(
 						self.unsynced_in(depth - 1, &format!("{from}{rest}"))
 							.iter()
-							.map(|path| moved(&path[from.len()..])),
+							.filter_map(|path| at_or_under(path, from).map(moved)),
 					);
 				}
 				out
@@ -1275,7 +1277,7 @@ impl Baseline {
 		// `""` too: the pair root holds no row, and a parent lookup of a top-level path asks it.
 		let mut asked: BTreeSet<&str> = BTreeSet::from([""]);
 		for path in paths {
-			asked.extend(path.match_indices('/').map(|(at, _)| &path[..at]));
+			asked.extend(ancestors(path));
 			asked.insert(path);
 		}
 		let frozen: HashMap<String, Option<BaselineEntry>> = {
@@ -1539,9 +1541,12 @@ impl Baseline {
 				..row
 			})
 			.into_iter()
-			.chain(self.subtree(from).map(|row| BaselineEntry {
-				rel_path: format!("{to}{}", &row.rel_path[from.len()..]),
-				..row
+			.chain(self.subtree(from).filter_map(|row| {
+				let rest = at_or_under(&row.rel_path, from)?;
+				Some(BaselineEntry {
+					rel_path: format!("{to}{rest}"),
+					..row
+				})
 			}))
 			.collect();
 		let edits = self.edits_mut();
