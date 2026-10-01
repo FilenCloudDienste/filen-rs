@@ -1013,8 +1013,8 @@ mod tests {
 		let of = |paths: &[&str]| -> Side<u32> {
 			paths
 				.iter()
-				.enumerate()
-				.map(|(at, path)| ((*path).to_owned(), at as u32))
+				.zip(0..)
+				.map(|(path, at)| ((*path).to_owned(), at))
 				.collect()
 		};
 
@@ -1035,8 +1035,8 @@ mod tests {
 	fn map(paths: &[&str]) -> HashMap<String, u32> {
 		paths
 			.iter()
-			.enumerate()
-			.map(|(at, path)| ((*path).to_owned(), at as u32))
+			.zip(0..)
+			.map(|(path, at)| ((*path).to_owned(), at))
 			.collect()
 	}
 
@@ -1199,7 +1199,9 @@ mod tests {
 		}
 		let (path, is_dir) = PATHS[index];
 		let uuid = uuid_at(index);
-		let hash = Blake3Hash::from([(index % 251) as u8; 32]);
+		let hash = Blake3Hash::from(
+			[u8::try_from(index % 251).expect("a remainder of 251 fits a byte"); 32],
+		);
 		let mut row = BaselineEntry {
 			rel_path: path.to_owned(),
 			kind: if is_dir {
@@ -1432,14 +1434,14 @@ mod tests {
 			let mut carried = Side::carried();
 			assert_answers_alike(seed, "assembly", &baseline, &whole, &carried);
 
-			for step in 0..8u32 {
+			for step in 0..8u8 {
 				let index = rng.random_range(0..PATHS.len());
 				let path = PATHS[index].0;
 				let what;
 				match rng.random_range(0..5) {
 					0 => {
 						what = format!("insert({path:?})");
-						let node = node_at(index, step as u8 + 1);
+						let node = node_at(index, step + 1);
 						whole.insert(path.to_owned(), node.clone());
 						carried.insert(path.to_owned(), node);
 					}
@@ -1447,7 +1449,7 @@ mod tests {
 						// A path NO row tracks, which only the overlay can hold.
 						let fresh = format!("{path}/fresh{step}");
 						what = format!("insert-fresh({fresh:?})");
-						let node = node_at(index, step as u8 + 1);
+						let node = node_at(index, step + 1);
 						whole.insert(fresh.clone(), node.clone());
 						carried.insert(fresh, node);
 					}

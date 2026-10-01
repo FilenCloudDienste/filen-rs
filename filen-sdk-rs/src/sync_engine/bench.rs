@@ -1875,7 +1875,7 @@ fn remote_edits(
 				parent: parent.to_string(),
 				name: name.to_owned(),
 				stable_uuid: row.remote_stable_uuid.map(|id| id.to_string()),
-				hash_fill: (index % 251) as u8,
+				hash_fill: u8::try_from(index % 251).expect("a remainder of 251 fits a byte"),
 				size: row.size.unwrap_or_default().saturating_add(1),
 				modified_millis: row.remote_modified.unwrap_or_default().saturating_add(1),
 			})
@@ -3788,6 +3788,8 @@ pub fn compare(before: &Path, after: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+	use num_traits::ToPrimitive;
+
 	use super::*;
 
 	/// Every scenario's name is unique and its hash distinct — the two things a result file is keyed
@@ -3824,7 +3826,11 @@ mod tests {
 
 	/// One memory child's stage samples, as a run file the accounting table can be asked to render.
 	fn accounting_run(loaded_mib: f64, tree_mib: f64) -> RunFile {
-		let mib = |value: f64| (value * 1024.0 * 1024.0) as u64;
+		let mib = |value: f64| {
+			(value * 1024.0 * 1024.0)
+				.to_u64()
+				.expect("a test's MiB figure fits a byte count")
+		};
 		let record = |metric: &str, bytes: u64| Record {
 			scenario: "twoway_idle_1m".to_owned(),
 			scenario_version: 1,

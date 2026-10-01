@@ -899,7 +899,7 @@ impl PendingWrites {
 
 /// [`PENDING_CREATE_GRACE`] as the journal stores it: wall-clock millis.
 fn grace_millis() -> i64 {
-	PENDING_CREATE_GRACE.as_millis() as i64
+	i64::try_from(PENDING_CREATE_GRACE.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Take the journal a previous engine persisted back into memory, each row aged by the wall clock
@@ -8238,7 +8238,7 @@ mod tests {
 	#[test]
 	fn an_exhausted_streak_is_retried_once_its_last_failure_is_an_interval_old() {
 		const NOW: i64 = 1_800_000_000_000;
-		let interval = PATH_FAILURE_RETRY_INTERVAL.as_millis() as i64;
+		let interval = i64::try_from(PATH_FAILURE_RETRY_INTERVAL.as_millis()).unwrap();
 		let exhausted_at = NOW - interval;
 
 		assert!(

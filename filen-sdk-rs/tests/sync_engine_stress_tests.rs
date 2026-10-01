@@ -120,7 +120,9 @@ fn content_for(rel: &str) -> Vec<u8> {
 /// Layout: ~sqrt(n) top-level subdirs, each with a nested sub-subdir, files spread across both
 /// levels, plus a handful of empty dirs. File contents are deterministic from the relative path.
 fn build_tree(root: &Path, n: usize) -> (usize, usize) {
-	let buckets = ((n as f64).sqrt().ceil() as usize).max(1);
+	// ⌈√n⌉, so `buckets²` covers every file.
+	let sqrt = n.isqrt();
+	let buckets = if sqrt * sqrt < n { sqrt + 1 } else { sqrt }.max(1);
 	let mut files = 0usize;
 	let mut dirs = 0usize;
 

@@ -8468,7 +8468,8 @@ mod tests {
 		}
 
 		fn hash_at(index: usize, version: u8) -> [u8; 32] {
-			[(index as u8).wrapping_mul(7).wrapping_add(version); 32]
+			let index = u8::try_from(index).expect("the tree has fewer than 256 paths");
+			[index.wrapping_mul(7).wrapping_add(version); 32]
 		}
 
 		/// The row a converged pass would have written for `index`, bent into `shape`.
@@ -9210,7 +9211,7 @@ mod tests {
 			/// shape the narrowing can be wrong at; a generator that stopped producing one would
 			/// otherwise let the property pass by proving nothing.
 			fn assert_reached(&self) {
-				assert!(self.cases == CASES as usize, "{self:?}");
+				assert_eq!(u64::try_from(self.cases), Ok(CASES), "{self:?}");
 				assert!(self.fold_classes > 300, "{self:?}");
 				assert!(self.partner_not_decided > 100, "{self:?}");
 				assert!(self.held_folds > 70, "{self:?}");
