@@ -495,10 +495,10 @@ pub(crate) struct CachedInput<'p> {
 	/// The most recent chunks, most recent first.
 	cache: Vec<(u64, Vec<u8>)>,
 	slots: usize,
-	/// One bit per chunk, set once it was fetched, so one fetched again counts as read once: 16
-	/// KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
+	/// One bit per chunk, set once it was first read, so one fetched again counts as read once:
+	/// 16 KiB for a 128 GiB archive. Grown only as far as a fetch that succeeded reaches, so a
 	/// length the archive does not have never sizes it.
-	fetched: Vec<u64>,
+	read_chunks: Vec<u64>,
 	/// Bytes at the source's start already counted by the reader before this one.
 	counted_prefix: u64,
 }
@@ -511,19 +511,27 @@ impl<'p> CachedInput<'p> {
 			len,
 			cache: Vec::new(),
 			slots: 2,
-			fetched: Vec::new(),
+			read_chunks: Vec::new(),
 			counted_prefix: 0,
 		}
 	}
 
 	/// Reads `input`'s source again from its start, as a zip or 7z told by the head a stream
-	/// reader read. The bytes `input` counted are not counted again when their chunks are
-	/// fetched here, which would take the bytes read past the source's length.
+	/// reader read. The chunk `input` holds is kept rather than fetched again, and the bytes it
+	/// counted are not counted again when their chunks are read here, which would take the bytes
+	/// read past the source's length.
 	pub(crate) fn rereading(input: ChunkInput<'p>) -> Self {
-		Self {
+		let mut rereading = Self {
 			counted_prefix: input.read,
 			..Self::new(input.port, input.source, input.len)
+		};
+		// the chunk the stream reader fetched last, if it fetched any
+		if let Some(index) = input.next.checked_sub(1)
+			&& !input.chunk.is_empty()
+		{
+			rereading.cache.push((index, input.chunk));
 		}
+		rereading
 	}
 
 	/// Keeps up to `slots` chunks (at least 2: a read across a chunk boundary needs both), for
@@ -538,34 +546,36 @@ impl<'p> CachedInput<'p> {
 			Some(at) => self.cache[..=at].rotate_right(1),
 			None => {
 				let data = self.port.fetch(self.source, index)?;
-				if self.first_fetch(index) {
-					let len = data.len() as u64;
-					let counted = self
-						.counted_prefix
-						.saturating_sub(index * CHUNK_SIZE_U64)
-						.min(len);
-					self.port
-						.shared
-						.input_bytes
-						.fetch_add(len - counted, Ordering::Relaxed);
-				}
 				self.cache.truncate(self.slots - 1);
 				self.cache.insert(0, (index, data));
 			}
 		}
+		// counted when first read rather than when fetched: the chunk a stream reader handed
+		// over may never be read here at all
+		if self.first_read(index) {
+			let len = self.cache[0].1.len() as u64;
+			let counted = self
+				.counted_prefix
+				.saturating_sub(index * CHUNK_SIZE_U64)
+				.min(len);
+			self.port
+				.shared
+				.input_bytes
+				.fetch_add(len - counted, Ordering::Relaxed);
+		}
 		Ok(&self.cache[0].1)
 	}
 
-	/// Marks chunk `index` fetched; whether it was not yet.
-	fn first_fetch(&mut self, index: u64) -> bool {
+	/// Marks chunk `index` read; whether it was not yet.
+	fn first_read(&mut self, index: u64) -> bool {
 		let word = usize::try_from(index / u64::BITS as u64)
 			.expect("an archive has fewer chunks than 64 times the address space");
 		let bit = 1 << (index % u64::BITS as u64);
-		if word >= self.fetched.len() {
-			self.fetched.resize(word + 1, 0);
+		if word >= self.read_chunks.len() {
+			self.read_chunks.resize(word + 1, 0);
 		}
-		let first = self.fetched[word] & bit == 0;
-		self.fetched[word] |= bit;
+		let first = self.read_chunks[word] & bit == 0;
+		self.read_chunks[word] |= bit;
 		first
 	}
 }
@@ -845,8 +855,42 @@ mod tests {
 			Ok(port.shared().input_bytes())
 		})
 		.await;
-		assert_eq!(asked, [0, 1, 0, 1, 2]);
+		// the second chunk, which the stream reader held, is not fetched again
+		assert_eq!(asked, [0, 1, 0, 2]);
 		assert_eq!(read.unwrap(), len);
+	}
+
+	#[tokio::test]
+	async fn a_head_read_within_the_first_chunk_does_not_fetch_it_again() {
+		let len = 2 * CHUNK_SIZE_U64 + 100;
+		let (asked, read) = with_source(len, move |port| {
+			let mut input = ChunkInput::new(port, 0, len);
+			input.read_exact(&mut [0u8; 7])?;
+			let mut input = CachedInput::rereading(input);
+			BorrowedSeqReader::new(&mut input).read_to_end(&mut Vec::new())?;
+			Ok(port.shared().input_bytes())
+		})
+		.await;
+		assert_eq!(asked, [0, 1, 2]);
+		assert_eq!(read.unwrap(), len);
+	}
+
+	#[tokio::test]
+	async fn a_head_never_read_again_counts_only_its_own_bytes() {
+		let len = 2 * CHUNK_SIZE_U64 + 100;
+		let (asked, read) = with_source(len, move |port| {
+			let mut input = ChunkInput::new(port, 0, len);
+			input.read_exact(&mut [0u8; 7])?;
+			let mut input = CachedInput::rereading(input);
+			let mut source = BorrowedSeqReader::new(&mut input);
+			source.seek(SeekFrom::Start(len - 1))?;
+			source.read_exact(&mut [0u8])?;
+			Ok(port.shared().input_bytes())
+		})
+		.await;
+		assert_eq!(asked, [0, 2]);
+		// the head, and the last chunk
+		assert_eq!(read.unwrap(), 7 + 100);
 	}
 
 	#[tokio::test]

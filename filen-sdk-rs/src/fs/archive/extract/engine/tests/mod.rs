@@ -697,6 +697,23 @@ async fn chosen_entries_are_extracted_with_the_directories_that_hold_them() {
 	}
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_or_7z_fetches_its_first_chunk_once() {
+	let entries: &[(&str, Option<&[u8]>)] = &[("a.txt", Some(b"alpha"))];
+	for (name, archive) in [
+		("one.zip", zip_of(entries, None)),
+		("one.7z", sevenz_of(entries, LZMA2, true, None)),
+	] {
+		let setup = setup(name, archive, |_| {});
+		let job = start(&setup, Options::default());
+		job.running.await.unwrap().unwrap();
+		assert_eq!(finished_paths(&setup), ["one/a.txt"], "{name}");
+		// its head, index and entry all in its one chunk
+		assert_eq!(setup.backend.log().fetched, [(ARCHIVE, 0)], "{name}");
+		assert_released(&setup, &job.reporter, &job.recorder);
+	}
+}
+
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn a_directory_slot_holds_no_directory() {
