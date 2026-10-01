@@ -195,10 +195,8 @@ async fn matrix_03_self_write_loop_free_two_way() {
 
 	let mut conflicts = std::collections::BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::Concurrent,
 		&mut conflicts,
 		"matrix03-converge",
@@ -637,8 +635,7 @@ async fn matrix_10_baseline_persists_restart_r2l() {
 	assert_noop(&r2);
 
 	// Local files unchanged: same bytes AND no rewrite churn (mtime preserved).
-	#[allow(clippy::needless_range_loop)]
-	for i in 0..4 {
+	for (i, before) in mtimes.iter().enumerate() {
 		assert!(read_eq(
 			&local,
 			&format!("r{i}.txt"),
@@ -648,7 +645,7 @@ async fn matrix_10_baseline_persists_restart_r2l() {
 			.unwrap()
 			.modified()
 			.unwrap();
-		assert_eq!(now, mtimes[i], "r{i}.txt was rewritten on a no-op restart");
+		assert_eq!(now, *before, "r{i}.txt was rewritten on a no-op restart");
 	}
 	assert!(
 		!local.join(".filen-sync-trash").exists(),

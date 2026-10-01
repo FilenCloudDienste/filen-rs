@@ -1563,18 +1563,20 @@ async fn apply_transfer(
 			};
 			upsert_file_baseline(
 				ctx,
-				rel_path,
-				Some(*remote_uuid),
-				remote.and_then(|n| n.stable_uuid),
-				landed_hash,
-				remote.map(|n| n.size).unwrap_or(0),
-				local_mtime_of(&path),
-				remote.map(|n| n.modified_millis),
-				// A pull is the moment both sides demonstrably hold the same bytes: the content just
-				// fetched IS the agreed content. The two stay equal — a row whose recorded content
-				// and agreed content differ is one holding an unconfirmed local edit
-				// (`is_unconfirmed_concurrent_edit`), which a fresh pull is not.
-				landed_hash,
+				FileRow {
+					rel_path,
+					remote_uuid: Some(*remote_uuid),
+					remote_stable_uuid: remote.and_then(|n| n.stable_uuid),
+					content_hash: landed_hash,
+					size: remote.map(|n| n.size).unwrap_or(0),
+					local_mtime: local_mtime_of(&path),
+					remote_modified: remote.map(|n| n.modified_millis),
+					// A pull is the moment both sides demonstrably hold the same bytes: the content
+					// just fetched IS the agreed content. The two stay equal — a row whose recorded
+					// content and agreed content differ is one holding an unconfirmed local edit
+					// (`is_unconfirmed_concurrent_edit`), which a fresh pull is not.
+					agreed_hash: landed_hash,
+				},
 			)
 			.await?;
 		}
@@ -1657,22 +1659,22 @@ async fn apply_transfer(
 					unrecorded,
 				});
 			}
-			let entry = file_entry(
+			let entry = file_entry(FileRow {
 				rel_path,
-				Some(new_uuid),
+				remote_uuid: Some(new_uuid),
 				// The upload reports the lineage it landed in: the same one when it versioned an
 				// existing file at this name, a brand-new one when it created a file.
-				Some(uploaded.stable_uuid()),
-				local.and_then(|n| n.content_hash),
-				local.map(|n| n.size).unwrap_or(0),
-				local.map(|n| n.mtime_millis),
-				Some(uploaded.timestamp.timestamp_millis()),
+				remote_stable_uuid: Some(uploaded.stable_uuid()),
+				content_hash: local.and_then(|n| n.content_hash),
+				size: local.map(|n| n.size).unwrap_or(0),
+				local_mtime: local.map(|n| n.mtime_millis),
+				remote_modified: Some(uploaded.timestamp.timestamp_millis()),
 				// A push does NOT make its own content agreed: the server took our bytes, but
 				// another client's edit may already be on its way to the same path. The marker stays
 				// on the previous agreed content until a snapshot lists this version at this path
 				// (`plan::confirm_agreed_content`), and the gap is what surfaces a concurrent edit.
-				ctx.baseline.get(rel_path).and_then(|b| b.agreed_hash),
-			);
+				agreed_hash: ctx.baseline.get(rel_path).and_then(|b| b.agreed_hash),
+			});
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
 		}
 		_ => return Err(internal("apply_transfer called with a non-transfer action")),
@@ -1877,18 +1879,18 @@ async fn apply_one(
 				from: from_path.clone(),
 				to: to_path.clone(),
 			};
-			let entry = file_entry(
-				to_path,
-				Some(*remote_uuid),
-				Some(remote_file.stable_uuid()),
-				local.and_then(|n| n.content_hash),
-				local.map(|n| n.size).unwrap_or(0),
-				local.map(|n| n.mtime_millis),
-				Some(remote_file.timestamp.timestamp_millis()),
+			let entry = file_entry(FileRow {
+				rel_path: to_path,
+				remote_uuid: Some(*remote_uuid),
+				remote_stable_uuid: Some(remote_file.stable_uuid()),
+				content_hash: local.and_then(|n| n.content_hash),
+				size: local.map(|n| n.size).unwrap_or(0),
+				local_mtime: local.map(|n| n.mtime_millis),
+				remote_modified: Some(remote_file.timestamp.timestamp_millis()),
 				// A move changes no content, so whatever the two sides agreed on at the old path
 				// they still agree on at the new one.
-				ctx.baseline.get(from_path).and_then(|b| b.agreed_hash),
-			);
+				agreed_hash: ctx.baseline.get(from_path).and_then(|b| b.agreed_hash),
+			});
 			commit_remote_write(
 				ctx,
 				*remote_uuid,
@@ -2368,16 +2370,17 @@ fn dir_entry(rel_path: &str, remote_uuid: Option<Uuid>, local_mtime: Option<i64>
 	}
 }
 
-/// The synced baseline row a file write leaves behind.
+/// What a file write decides about the synced baseline row it leaves behind; the rest of the row
+/// is the same for every write (see [`file_entry`]). Named fields, because two of them are
+/// `Option<i64>` timestamps that a positional argument list would let a caller swap.
 ///
 /// `agreed_hash` is the caller's to decide, because only the caller knows what its write proved:
 /// a pull records the content it just fetched (both sides demonstrably hold it), a push carries
 /// the PREVIOUS agreed content forward (the upload says nothing about what the remote holds by the
 /// time we look again), and a move carries the moved row's marker to its new path. See
 /// [`BaselineEntry::agreed_hash`].
-#[allow(clippy::too_many_arguments)]
-fn file_entry(
-	rel_path: &str,
+struct FileRow<'p> {
+	rel_path: &'p str,
 	remote_uuid: Option<Uuid>,
 	remote_stable_uuid: Option<StableUuid>,
 	content_hash: Option<filen_types::crypto::Blake3Hash>,
@@ -2385,22 +2388,25 @@ fn file_entry(
 	local_mtime: Option<i64>,
 	remote_modified: Option<i64>,
 	agreed_hash: Option<filen_types::crypto::Blake3Hash>,
-) -> BaselineEntry {
+}
+
+/// The synced baseline row a file write leaves behind.
+fn file_entry(row: FileRow<'_>) -> BaselineEntry {
 	BaselineEntry {
-		rel_path: rel_path.to_string(),
+		rel_path: row.rel_path.to_string(),
 		kind: NodeKind::File,
-		remote_uuid,
-		content_hash,
-		size: Some(size),
-		local_mtime,
-		remote_modified,
+		remote_uuid: row.remote_uuid,
+		content_hash: row.content_hash,
+		size: Some(row.size),
+		local_mtime: row.local_mtime,
+		remote_modified: row.remote_modified,
 		state: BaselineState::Synced,
 		local_kind: None,
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
-		remote_stable_uuid,
-		agreed_hash,
+		remote_stable_uuid: row.remote_stable_uuid,
+		agreed_hash: row.agreed_hash,
 	}
 }
 
@@ -2435,20 +2441,22 @@ pub(super) fn moved_file_row(
 		),
 		None => (None, 0, None),
 	};
-	file_entry(
-		to_path,
-		base.and_then(|b| b.remote_uuid)
+	file_entry(FileRow {
+		rel_path: to_path,
+		remote_uuid: base
+			.and_then(|b| b.remote_uuid)
 			.or_else(|| remote.map(|n| n.remote_uuid)),
-		base.and_then(|b| b.remote_stable_uuid)
+		remote_stable_uuid: base
+			.and_then(|b| b.remote_stable_uuid)
 			.or_else(|| remote.and_then(|n| n.stable_uuid)),
 		content_hash,
 		size,
 		local_mtime,
-		remote.map(|n| n.modified_millis),
+		remote_modified: remote.map(|n| n.modified_millis),
 		// The row follows the moved file, and so does its agreed content. A move that carried an
 		// edit is paired with a download, which re-records both.
-		base.and_then(|b| b.agreed_hash),
-	)
+		agreed_hash: base.and_then(|b| b.agreed_hash),
+	})
 }
 
 async fn upsert_dir_baseline(
@@ -2460,32 +2468,11 @@ async fn upsert_dir_baseline(
 	upsert_baseline(ctx, &dir_entry(rel_path, remote_uuid, local_mtime)).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn upsert_file_baseline(
 	ctx: &ApplyContext<'_>,
-	rel_path: &str,
-	remote_uuid: Option<Uuid>,
-	remote_stable_uuid: Option<StableUuid>,
-	content_hash: Option<filen_types::crypto::Blake3Hash>,
-	size: u64,
-	local_mtime: Option<i64>,
-	remote_modified: Option<i64>,
-	agreed_hash: Option<filen_types::crypto::Blake3Hash>,
+	row: FileRow<'_>,
 ) -> Result<(), crate::Error> {
-	upsert_baseline(
-		ctx,
-		&file_entry(
-			rel_path,
-			remote_uuid,
-			remote_stable_uuid,
-			content_hash,
-			size,
-			local_mtime,
-			remote_modified,
-			agreed_hash,
-		),
-	)
-	.await
+	upsert_baseline(ctx, &file_entry(row)).await
 }
 
 /// Journal a remote write together with the baseline rows it produced — ONE transaction, so a

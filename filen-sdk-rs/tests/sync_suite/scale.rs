@@ -1344,10 +1344,8 @@ async fn scale_c_two_way_both_sides_disjoint_changes() {
 	}
 	let mut conflicts = BTreeSet::new();
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"scale_c baseline",
@@ -1393,10 +1391,8 @@ async fn scale_c_two_way_both_sides_disjoint_changes() {
 	}
 
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::Concurrent,
 		&mut conflicts,
 		"scale_c converge",
@@ -1488,10 +1484,8 @@ async fn scale_d_many_simultaneous_conflicts_all_surfaced() {
 	let mut conflicts = BTreeSet::new();
 	// Converge the baseline so both engines record identical bytes for every c-file + the clean set.
 	converge(
-		&tc.engine_a,
-		tc.pair_a,
-		&tc.engine_b,
-		tc.pair_b,
+		tc.peer_a(),
+		tc.peer_b(),
 		Order::AFirst,
 		&mut conflicts,
 		"scale_d baseline",
