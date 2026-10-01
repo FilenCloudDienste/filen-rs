@@ -1108,10 +1108,12 @@ fn fold_move(
 	if carries_subtree {
 		let children = nodes.subtree_paths(baseline, from);
 		for old in children {
+			let Some(new) = plan::moved_path(&old, from, to) else {
+				continue;
+			};
 			let Some(mut child) = nodes.remove(baseline, &old) else {
 				continue;
 			};
-			let new = format!("{to}{}", &old[from.len()..]);
 			child.rel_path = new.clone();
 			changed.insert(old);
 			changed.insert(new.clone());
@@ -2070,16 +2072,12 @@ impl Prepared {
 	fn hides(&self, path: &str) -> bool {
 		self.facts.ignore_blocked.contains("")
 			|| self.remote_blocked.contains("")
-			|| path
-				.match_indices('/')
-				.map(|(i, _)| &path[..i])
-				.chain([path])
-				.any(|at| {
-					self.facts.ignored_local.contains_key(at)
-						|| self.facts.ignored_remote.contains_key(at)
-						|| self.facts.ignore_blocked.contains(at)
-						|| self.remote_blocked.contains(at)
-				})
+			|| plan::ancestors(path).chain([path]).any(|at| {
+				self.facts.ignored_local.contains_key(at)
+					|| self.facts.ignored_remote.contains_key(at)
+					|| self.facts.ignore_blocked.contains(at)
+					|| self.remote_blocked.contains(at)
+			})
 	}
 
 	/// The roots the pair's previous pass ignored that nothing hides any more, neither a rule nor
@@ -2125,9 +2123,6 @@ impl Prepared {
 	/// every folder) and is left out, unless a baseline row sits at or under it, which this pass
 	/// drops.
 	fn ignored(&self) -> Vec<IgnoredPath> {
-		fn parents(path: &str) -> impl Iterator<Item = &str> {
-			path.match_indices('/').map(|(i, _)| &path[..i])
-		}
 		let mut roots: BTreeMap<&str, (&IgnoreDecision, bool)> = BTreeMap::new();
 		for (path, decision) in self
 			.facts
@@ -2143,7 +2138,7 @@ impl Prepared {
 		// Each side records only its own top-most paths; one side's can still sit under the other's.
 		let nested: Vec<&str> = roots
 			.keys()
-			.filter(|path| parents(path).any(|parent| roots.contains_key(parent)))
+			.filter(|path| plan::ancestors(path).any(|parent| roots.contains_key(parent)))
 			.copied()
 			.collect();
 		for path in nested {
@@ -5396,9 +5391,7 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 			&& executable.iter().any(|action| {
 				let path = action.rel_path();
 				action.is_delete()
-					&& path
-						.match_indices('/')
-						.map(|(i, _)| &path[..i])
+					&& plan::ancestors(path)
 						.chain([path])
 						.any(|at| unignored.contains(at))
 			}));
@@ -5660,7 +5653,7 @@ fn deletion_batch_token(held: &[SyncAction]) -> String {
 		hasher.update(line.as_bytes());
 		hasher.update(b"\n");
 	}
-	hasher.finalize().to_hex()[..16].to_string()
+	hasher.finalize().to_hex().chars().take(16).collect()
 }
 
 /// How trustworthy this pass's inputs are, for the guard.

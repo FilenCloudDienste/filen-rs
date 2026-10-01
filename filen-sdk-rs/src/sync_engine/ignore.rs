@@ -34,7 +34,7 @@ use uuid::Uuid;
 use super::{
 	SyncMode,
 	baseline::NodeKind,
-	plan::{RemoteNode, RemoteView},
+	plan::{RemoteNode, RemoteView, ancestors},
 	rows::Baseline,
 	scan::collision_key,
 	side::{Nodes, NodesAt},
@@ -320,10 +320,13 @@ impl IgnoreRules {
 		let mut dir = parent(rel_path);
 		loop {
 			if let Some((key, source)) = self.files.get_key_value(dir) {
-				let rel = if dir.is_empty() {
-					rel_path
-				} else {
-					&rel_path[dir.len() + 1..]
+				// A pattern in `dir`'s file sees the path below `dir`.
+				let rel = match dir {
+					"" => rel_path,
+					dir => rel_path
+						.strip_prefix(dir)
+						.and_then(|rest| rest.strip_prefix('/'))
+						.expect("`dir` is an ancestor of `rel_path` (should be impossible)"),
 				};
 				let origin = Origin::File { dir: key };
 				match source.matched(rel, is_dir) {
@@ -363,8 +366,7 @@ impl IgnoreRules {
 		if rel_path.is_empty() {
 			return None;
 		}
-		for (i, _) in rel_path.match_indices('/') {
-			let ancestor = &rel_path[..i];
+		for ancestor in ancestors(rel_path) {
 			if !memo.contains_key(ancestor) {
 				let decision = self.decide(ancestor, true).map(IgnoreDecision::from);
 				memo.insert(ancestor.to_owned(), decision);
