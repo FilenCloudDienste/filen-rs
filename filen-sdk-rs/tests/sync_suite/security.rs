@@ -522,13 +522,12 @@ async fn sec09_created_files_use_restrictive_permissions() {
 	std::fs::remove_file(&baseline_db).ok();
 }
 
-/// The running user's uid via a minimal libc FFI (avoids adding the `libc` crate just for this).
+/// The running user's uid: the owner of a file this process creates, which is the process's
+/// effective uid.
 #[cfg(unix)]
 fn current_uid() -> u32 {
-	unsafe extern "C" {
-		fn getuid() -> u32;
-	}
-	unsafe { getuid() }
+	let probe = tempfile::tempfile().unwrap();
+	std::os::unix::fs::MetadataExt::uid(&probe.metadata().unwrap())
 }
 
 // ============================================================================
