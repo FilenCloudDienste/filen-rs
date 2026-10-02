@@ -810,8 +810,9 @@ async fn scale_12_remote_delete_batch_quarantined_recoverable() {
 }
 
 /// SCALE-22 — deleting an entire remote subdirectory removes its whole local subtree (quarantined
-/// recoverably) while files outside it are untouched. Scaled; the design's "efficient subtree, not
-/// per-file thrash" perf claim is not asserted (no perf instrumentation), only the correctness.
+/// recoverably) while files outside it are untouched. The subtree goes as one item, not per file: it
+/// lands in the quarantine bin whole, where it stood, rather than as loose files beside a second,
+/// emptied copy of the directory.
 #[shared_test_runtime]
 async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 	let sc = single_client(SyncMode::RemoteToLocal).await;
@@ -847,6 +848,7 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.locally_deleted, 1, "the directory goes whole: {r2:?}");
 	// Files outside the subtree are untouched.
 	assert!(
 		read_eq(&sc.local, "outside.txt", b"survivor"),
@@ -860,13 +862,27 @@ async fn scale_22_remote_subtree_delete_removes_local_subtree() {
 		);
 	}
 	let q = quarantine_files(&sc.local);
-	for i in 0..N {
-		let want = format!("inside-{i}").into_bytes();
-		assert!(
-			q.values().any(|v| *v == want),
-			"subtree file g{i:02}.txt not recoverable in quarantine"
-		);
-	}
+	let expected: std::collections::BTreeMap<String, Vec<u8>> = (0..N)
+		.map(|i| {
+			(
+				format!("doomed/g{i:02}.txt"),
+				format!("inside-{i}").into_bytes(),
+			)
+		})
+		.collect();
+	assert_eq!(
+		q, expected,
+		"the subtree must sit in the quarantine bin whole, where it stood"
+	);
+	let bin_top: Vec<String> = std::fs::read_dir(sc.local.join(".filen-sync-trash"))
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	assert_eq!(
+		bin_top,
+		["doomed"],
+		"one copy of the directory in the bin, not a second, emptied one beside it"
+	);
 
 	let r3 = sc.sync().await;
 	assert!(r3.errors.is_empty(), "{r3:?}");
