@@ -156,15 +156,23 @@ pub enum FullPassReason {
 	/// The previous pass refused to run (a name collision on either side), which is whole-tree
 	/// state.
 	PreviousRefusal,
-	/// The previous pass held deletions back.
+	/// The previous pass held deletions back, and something else has since given the pair a pass
+	/// to run.
 	///
-	/// Three of the holds want evidence only a whole-tree read supplies: an incomplete scan, an
-	/// unconverged remote, or a remote that listed nothing at all. The other two — a volume
-	/// threshold, a first sync against a populated destination — want something else: the approval
-	/// a caller gives names ONE exact batch by its token, so the pass that offers that batch again
-	/// has to reproduce it exactly, and the absences it was built from were observations the
-	/// holding pass consumed. Until a carry-over set carries those paths, reading everything is
-	/// the only way to reproduce them.
+	/// A hold alone does not make a pass due: re-reading two trees nothing has changed in only
+	/// holds the identical batch again, so a watch wake that announced nothing new while a hold
+	/// stands is skipped like any idle one (see `PairChanges::is_idle`). The pass that does run —
+	/// for a change on either side, or the safety net — reads both sides whole, and this is its
+	/// reason when nothing more specific is.
+	///
+	/// Whole, because three of the holds want evidence only a whole-tree read supplies: an
+	/// incomplete scan, an unconverged remote, or a remote that listed nothing at all. The other
+	/// two — a volume threshold, a first sync against a populated destination — want something
+	/// else: the approval a caller gives names ONE exact batch by its token, so the pass that
+	/// offers that batch again has to reproduce it exactly, and the absences it was built from were
+	/// observations the holding pass consumed. Reading everything is the only way to reproduce
+	/// them, which is also why a held batch's paths are not carried over as owed
+	/// (`facts::carry_over`): the whole read already looks at them.
 	DeletionHold,
 	/// The previous pass was cut short while reading both sides WHOLE, so what it did not get to
 	/// is evidence no changelist holds.
@@ -496,6 +504,13 @@ struct ChangeState {
 	/// a reason and then failed, or did not apply what it planned, forces one again on its way out
 	/// (`next_pass_scope`).
 	forced: Option<FullPassReason>,
+	/// Set by a pass that ended holding deletions back: the next pass to RUN reads both sides
+	/// whole ([`FullPassReason::DeletionHold`]). Taken by that pass like [`forced`](Self::forced),
+	/// and kept apart from it for two reasons. It is not a reason to run a pass at all, so
+	/// [`PairChanges::is_idle`] ignores it and a wake with nothing new leaves it in place. And
+	/// `forced` keeps the FIRST reason recorded, so a hold parked there would swallow the reason
+	/// that actually made the next pass due.
+	held: bool,
 	/// A trigger source that no longer reports everything. Never cleared: the coverage does not
 	/// come back for the life of the watch.
 	degraded: Option<FullPassReason>,
@@ -525,6 +540,17 @@ struct ChangeState {
 	/// whatever arrived since, which is the order the cache dispatched them in. Bounded all the
 	/// same — see [`note_owed_remote`](PairChanges::note_owed_remote).
 	owed_remote: Vec<RemoteDeltaEntry>,
+}
+
+impl ChangeState {
+	/// See [`PairChanges::full_pending`].
+	fn full_pending(&self) -> bool {
+		self.degraded.is_some()
+			|| !self.local_covered
+			|| self.local.full.is_some()
+			|| self.remote.full.is_some()
+			|| self.forced.is_some()
+	}
 }
 
 impl PairChanges {
@@ -669,12 +695,28 @@ impl PairChanges {
 	/// while it was reading (a kernel-dropped event, a watcher that stopped) says the list it
 	/// narrowed itself with may be missing exactly what it is about to act on.
 	pub(super) fn full_pending(&self) -> bool {
+		self.state().full_pending()
+	}
+
+	/// Whether the next pass would have nothing to look at: nothing announced on either side,
+	/// nothing owed by the last plan, and no reason pending to read everything. Asked WITHOUT
+	/// taking anything, so a wake that skips its pass leaves every list and reason to the pass that
+	/// does run.
+	///
+	/// A pending deletion hold deliberately does not count (see [`FullPassReason::DeletionHold`]):
+	/// re-reading two trees nothing has changed in only holds the identical batch again. It stays
+	/// recorded, and makes the next pass that runs a whole one.
+	///
+	/// The one row of the trigger table it cannot see is the empty baseline, which is why a caller
+	/// that acts on this is deciding whether to READ the pair at all — a pair with an empty
+	/// baseline and nothing announced has nothing to do either.
+	pub(super) fn is_idle(&self) -> bool {
 		let state = self.state();
-		state.degraded.is_some()
-			|| !state.local_covered
-			|| state.local.full.is_some()
-			|| state.remote.full.is_some()
-			|| state.forced.is_some()
+		!state.full_pending()
+			&& state.local.paths.is_empty()
+			&& state.remote.entries.is_empty()
+			&& state.owed.is_empty()
+			&& state.owed_remote.is_empty()
 	}
 
 	/// Record that the NEXT pass must read both sides whole. Keeps the first reason recorded.
@@ -683,6 +725,13 @@ impl PairChanges {
 		if state.forced.is_none() {
 			state.forced = Some(reason);
 		}
+	}
+
+	/// Record that the pass that just ended held deletions back, so the next pass to run reads both
+	/// sides whole and can offer the same batch again. Unlike [`force`](Self::force) it does not
+	/// make that pass due (see [`is_idle`](Self::is_idle)).
+	pub(super) fn note_deletion_hold(&self) {
+		self.state().held = true;
 	}
 
 	/// Take both changelists for a pass — called BEFORE it reads either side (see the module docs
@@ -697,14 +746,18 @@ impl PairChanges {
 		let owed_remote = mem::take(&mut state.owed_remote);
 		// Taken with the lists, so what is recorded from here on is the NEXT pass's (see `forced`).
 		let forced = mem::take(&mut state.forced);
+		let held = mem::take(&mut state.held).then_some(FullPassReason::DeletionHold);
 		// Most specific first: a permanently degraded source, then no watcher at all, then evidence
-		// that events were lost, then what the engine itself recorded about the previous pass.
+		// that events were lost, then what the engine itself recorded about the previous pass, and
+		// a deletion hold last: it only needs this pass to read whole, which any reason above
+		// already makes it.
 		let full = state
 			.degraded
 			.or((!state.local_covered).then_some(FullPassReason::LocalEventsUnwatched))
 			.or(local.full)
 			.or(remote.full)
-			.or(forced);
+			.or(forced)
+			.or(held);
 		let mut paths = local.paths;
 		paths.extend(owed);
 		// Replayed FIRST: they were dispatched before anything that arrived while the pass ran,
@@ -773,16 +826,6 @@ impl PassScope {
 	/// blocking thread and owns what it is given.
 	pub(super) fn take_remote(&mut self) -> Vec<RemoteDeltaEntry> {
 		mem::take(&mut self.remote)
-	}
-
-	/// Whether this pass has nothing to look at: nothing announced on either side, nothing owed by
-	/// the last plan, and no reason forcing a whole read.
-	///
-	/// The one row of the trigger table it cannot see is the empty baseline, which is why a caller
-	/// that acts on this is deciding whether to READ the pair at all — a pair with an empty
-	/// baseline and nothing announced has nothing to do either.
-	pub(super) fn is_idle(&self) -> bool {
-		self.full.is_none() && self.local.is_empty() && self.remote.is_empty()
 	}
 
 	/// How many local paths and remote changes this pass took, for its log line.
@@ -993,35 +1036,112 @@ pub(super) mod tests {
 		);
 	}
 
-	/// What a wake has to look at, and what the pass may therefore skip entirely.
+	/// What a wake has to look at, and what the pass may therefore skip entirely — asked without
+	/// taking any of it.
 	#[test]
-	fn a_scope_with_nothing_announced_is_idle() {
+	fn a_pair_with_nothing_announced_is_idle() {
 		let changes = sized_pair();
 		assert!(
-			changes.take().is_idle(),
+			changes.is_idle(),
 			"a quiet watched pair has nothing to look at"
 		);
 
 		note(&changes, &create("a.txt"));
+		assert!(!changes.is_idle(), "a changed path is something to look at");
+		assert!(!changes.is_idle(), "and asking took nothing");
+		let _ = changes.take();
+		assert!(changes.is_idle(), "the pass that ran took it");
+
+		changes.note_remote_batch(&mut [removed(1)].iter());
 		assert!(
-			!changes.take().is_idle(),
-			"a changed path is something to look at"
+			!changes.is_idle(),
+			"an announced remote change is something to look at"
 		);
+		let _ = changes.take();
 
 		changes.note_owed(BTreeSet::from(["owed.txt".to_string()]));
 		assert!(
-			!changes.take().is_idle(),
+			!changes.is_idle(),
 			"a path the last plan left owing is something to look at"
 		);
+		let _ = changes.take();
+
+		changes.note_owed_remote(minted_delta(&[2]));
+		assert!(
+			!changes.is_idle(),
+			"a change a cut-short pass handed back is something to look at"
+		);
+		let _ = changes.take();
 
 		changes.force(FullPassReason::SafetyNet);
-		assert!(!changes.take().is_idle(), "a forced whole read is not idle");
+		assert!(!changes.is_idle(), "a forced whole read is not idle");
+		let _ = changes.take();
+		assert!(changes.is_idle());
 
 		let unwatched = PairChanges::new();
 		assert!(
-			!unwatched.take().is_idle(),
+			!unwatched.is_idle(),
 			"with no watcher an empty list is no evidence, so there is always something to read"
 		);
+	}
+
+	/// Re-reading two trees nothing has changed in only holds the identical batch again, so a
+	/// hold by itself gives a wake nothing to do.
+	#[test]
+	fn a_held_batch_alone_leaves_the_pair_idle() {
+		let changes = sized_pair();
+		changes.note_deletion_hold();
+		assert!(changes.is_idle());
+	}
+
+	/// A wake that skips its pass leaves the hold for the next pass that runs, which must read
+	/// whole to offer the same batch again.
+	#[test]
+	fn an_idle_check_leaves_the_hold_for_the_next_pass() {
+		let changes = sized_pair();
+		changes.note_deletion_hold();
+		assert!(changes.is_idle());
+		assert!(changes.is_idle());
+		assert_eq!(taken(&changes).1, Some(R::DeletionHold));
+	}
+
+	/// A change on either side while a batch is held makes the pair due, and the pass it gets reads
+	/// whole for the hold — a narrowed read could not reproduce the batch.
+	#[test]
+	fn a_held_batch_with_an_announced_change_reads_whole() {
+		let local = sized_pair();
+		local.note_deletion_hold();
+		note(&local, &create("a.txt"));
+		assert!(!local.is_idle(), "a local change");
+		assert_eq!(local.take().full_pass_reason(10), Some(R::DeletionHold));
+
+		let remote = sized_pair();
+		remote.note_deletion_hold();
+		remote.note_remote_batch(&mut [removed(1)].iter());
+		assert!(!remote.is_idle(), "a remote change");
+		assert_eq!(remote.take().full_pass_reason(10), Some(R::DeletionHold));
+	}
+
+	/// The safety net still comes due with a hold pending, and is the reason its pass reports: kept
+	/// in `forced`, the hold would have swallowed it.
+	#[test]
+	fn the_safety_net_with_a_hold_pending_reads_whole_for_itself() {
+		let changes = sized_pair();
+		changes.note_deletion_hold();
+		changes.force(R::SafetyNet);
+		assert!(!changes.is_idle());
+		assert_eq!(taken(&changes).1, Some(R::SafetyNet));
+	}
+
+	/// The pass that runs takes the hold with everything else; only a pass that holds again
+	/// records it again.
+	#[test]
+	fn a_pass_takes_the_hold() {
+		let changes = sized_pair();
+		changes.note_deletion_hold();
+		note(&changes, &create("a.txt"));
+		assert_eq!(taken(&changes).1, Some(R::DeletionHold));
+		assert_eq!(taken(&changes), (Vec::new(), None));
 	}
 
 	/// What a change-scoped pass asks before it trusts an absence: has anything already made the

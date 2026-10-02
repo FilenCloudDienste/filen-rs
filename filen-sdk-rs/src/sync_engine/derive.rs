@@ -332,6 +332,7 @@ mod tests {
 			},
 			engine::assembly_bounds,
 			facts::carry_over,
+			guard::GuardDecision,
 			ignore::{FILENIGNORE, IgnoreRules},
 			observe::observe_local,
 			plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
@@ -929,7 +930,11 @@ mod tests {
 		// It is cut short before applying it, so no row was written and the file is still on disk.
 		// What it owes is its plan's paths...
 		let owed = carry_over(
-			&planned,
+			&GuardDecision {
+				safe: planned.clone(),
+				held: Vec::new(),
+				reason: None,
+			},
 			&[],
 			&BTreeSet::new(),
 			&std::collections::HashMap::new(),
