@@ -13,7 +13,6 @@ use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
 	Error,
 	auth::{Client, shared_client::SharedClient},
-	consts::CHUNK_SIZE,
 	fs::file::{
 		BaseFile, FileBuilder, RemoteFile,
 		client_impl::{FileReaderSharedClientExt, build_exif_tee_from_builder},
@@ -37,6 +36,15 @@ use crate::{
 };
 
 const IO_BUFFER_SIZE: usize = 1024 * 64; // 64 KiB
+
+/// The buffer a reader-to-writer copy of `len` bytes (unknown when `None`) reads through:
+/// [`IO_BUFFER_SIZE`] at most, never a whole chunk. The buffer lives outside the memory budget
+/// for the whole copy, including while the copy waits for that budget; the file writer and
+/// reader assemble their chunks on their own.
+fn copy_buffer_len(len: Option<u64>) -> usize {
+	len.and_then(|len| usize::try_from(len).ok())
+		.map_or(IO_BUFFER_SIZE, |len| len.min(IO_BUFFER_SIZE))
+}
 
 impl Client {
 	/// Internal entry point used by `upload_file*`. Takes a `FileBuilder`
@@ -94,12 +102,9 @@ impl Client {
 			confirm_completion_callback,
 			exif_tee,
 		);
-		let buffer_size = known_size
-			.map(|size| usize::try_from(size).unwrap_or(usize::MAX).min(CHUNK_SIZE))
-			.unwrap_or(IO_BUFFER_SIZE);
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
-		let mut buffer = vec![0u8; buffer_size];
+		let mut buffer = vec![0u8; copy_buffer_len(known_size)];
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;
 			if bytes_read == 0 {
@@ -720,12 +725,9 @@ where
 		T: 'b + AsyncWrite + Unpin,
 	{
 		let (mut reader, progress) = reader_with_progress(self, file, start, end, callback);
-		let buffer_size = usize::try_from(end.saturating_sub(start))
-			.unwrap_or(usize::MAX)
-			.min(CHUNK_SIZE);
 		// change to BorrowedBuf when `core_io_borrowed_buf` is stabilized
 		// https://github.com/rust-lang/rust/issues/117693
-		let mut buffer = vec![0u8; buffer_size];
+		let mut buffer = vec![0u8; copy_buffer_len(Some(end.saturating_sub(start)))];
 		loop {
 			let bytes_read = reader.read(&mut buffer).await?;
 			if bytes_read == 0 {
@@ -768,6 +770,70 @@ where
 		)
 		.await;
 		res
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod copy_buffer_tests {
+	use filen_types::fs::Uuid;
+
+	use super::{
+		IoSharedClientExt, copy_buffer_len, path_transfer_tests::peak_bytes_parked_on_the_budget,
+	};
+	use crate::{
+		auth::{http::ClientConfig, test_support::offline_client, unauth::UnauthClient},
+		consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
+		fs::drive_job::test_support::stored_file,
+	};
+
+	#[test]
+	fn a_copy_reads_through_at_most_64_kib() {
+		assert_eq!(copy_buffer_len(Some(10 * 1024 * 1024)), 65_536);
+		assert_eq!(copy_buffer_len(Some(u64::MAX)), 65_536);
+		assert_eq!(copy_buffer_len(None), 65_536);
+	}
+
+	#[test]
+	fn a_copy_shorter_than_64_kib_reads_through_its_own_length() {
+		assert_eq!(copy_buffer_len(Some(100)), 100);
+	}
+
+	#[test]
+	fn a_reader_upload_waiting_for_the_memory_budget_holds_one_copy_buffer() {
+		let client = offline_client();
+		let data = vec![7u8; CHUNK_SIZE];
+		let mut reader = &data[..];
+		let builder = client
+			.make_file_builder("payload.bin", Uuid::from_u128(1))
+			.unwrap();
+
+		let peak = peak_bytes_parked_on_the_budget(
+			client.client().state().memory_semaphore(),
+			client.upload_file_from_reader(builder, &mut reader, None, Some(CHUNK_SIZE_U64)),
+		);
+
+		assert!(peak < 128 * 1024, "the waiting upload held {peak} bytes");
+	}
+
+	#[test]
+	fn a_writer_download_waiting_for_the_memory_budget_holds_one_copy_buffer() {
+		let client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		let file = stored_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"payload.bin",
+			CHUNK_SIZE_U64,
+			1,
+			None,
+		);
+		let mut writer = Vec::new();
+
+		let peak = peak_bytes_parked_on_the_budget(
+			client.state().memory_semaphore(),
+			client.download_file_to_writer(&file, &mut writer, None),
+		);
+
+		assert!(peak < 128 * 1024, "the waiting download held {peak} bytes");
 	}
 }
 
@@ -1024,7 +1090,7 @@ mod path_transfer_tests {
 	/// The most bytes `transfer` holds while it waits for its first chunk: the whole memory `budget`
 	/// is held, so the chunk is never granted. The paused clock only runs out once the transfer is
 	/// parked on the budget with no disk I/O in flight; everything polled on this thread is metered.
-	fn peak_bytes_parked_on_the_budget<T>(
+	pub(super) fn peak_bytes_parked_on_the_budget<T>(
 		budget: &Semaphore,
 		transfer: impl Future<Output = T>,
 	) -> u64 {
