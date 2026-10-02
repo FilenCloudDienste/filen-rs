@@ -1,0 +1,2 @@
+# sqlfluff does not read .gitignore.
+/.claude/worktrees/

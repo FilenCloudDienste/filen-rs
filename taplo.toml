@@ -1,4 +1,10 @@
-exclude = ["**/node_modules/**", "**/target/**", "**/dist/**"]
+# taplo does not read .gitignore.
+exclude = [
+	"**/node_modules/**",
+	"**/target/**",
+	"**/dist/**",
+	".claude/worktrees/**",
+]
 
 [formatting]
 indent_string = "	"

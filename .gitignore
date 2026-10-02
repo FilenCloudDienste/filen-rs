@@ -6,3 +6,7 @@
 
 # Pinned RAW sample files (fetched on demand, never committed).
 /.fixture-cache
+
+# Claude Code worktrees. taplo and sqlfluff do not read this file, so
+# taplo.toml and .sqlfluffignore exclude them too.
+/.claude/worktrees/
