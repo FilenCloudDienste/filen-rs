@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeZone, Utc};
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::{HasName, HasUUID};
+use filen_sdk_rs::fs::{HasName, HasUUID, file::FileBuilderOptionalName};
 
 /// JPEG with `EXIF:DateTimeOriginal = 2020:06:15 10:30:00`
 /// (`CreateDate` and `ModifyDate` also set to the same value).
@@ -71,6 +71,29 @@ async fn exif_default_overrides_created() {
 		file_created(&file),
 		Some(known_exif_time()),
 		"EXIF DateTimeOriginal should override default created time"
+	);
+}
+
+#[shared_test_runtime]
+async fn exif_from_a_path_overrides_created() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let local_dir = tempfile::tempdir().unwrap();
+	let path = local_dir.path().join("exif_from_path.jpg");
+	std::fs::write(&path, EXIF_SAMPLE_JPEG).unwrap();
+
+	let (file, _local) = resources
+		.client
+		.upload_file_from_path_with_builder(
+			FileBuilderOptionalName::new(resources.dir.uuid()),
+			path,
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		file_created(&file),
+		Some(known_exif_time()),
+		"EXIF DateTimeOriginal should override the local file's created time"
 	);
 }
 

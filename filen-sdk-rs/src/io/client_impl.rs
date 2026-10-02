@@ -1,6 +1,8 @@
 use std::sync::Arc;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::{
+	future::poll_fn,
+	io::Read,
 	ops::Deref,
 	path::{Path, PathBuf},
 };
@@ -8,7 +10,7 @@ use std::{
 use filen_types::crypto::Blake3Hash;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::{
 	Error,
@@ -30,7 +32,7 @@ use crate::{
 	error::ErrorExt,
 	fs::{
 		categories::{DirType, Normal},
-		file::FileBuilderOptionalName,
+		file::{FileBuilderOptionalName, chunk::Chunk},
 	},
 	io::{CanonicalPath, FilenMetaExt, meta_ext::FileTimesExt},
 };
@@ -292,47 +294,131 @@ impl Client {
 
 		let original_size = FilenMetaExt::size(&meta);
 
-		let mut reader = tokio::fs::File::from_std(file).compat();
-
-		let uploaded = self
-			.inner_upload_from_builder(
-				file_builder,
-				&mut reader,
-				callback,
-				Some(original_size),
-				Some(move |_hash, size| async move {
-					if original_size != size {
-						return Err(Error::custom(
-							ErrorKind::FileChangedDuringSync,
-							format!("File at path {} was modified during upload", path.display()),
-						));
+		let (exif_tee, base_file) = build_exif_tee_from_builder(file_builder);
+		let mut writer = self.inner_get_file_writer(
+			Arc::new(base_file),
+			callback,
+			Some(original_size),
+			Some(move |_hash, size| async move {
+				if original_size != size {
+					return Err(Error::custom(
+						ErrorKind::FileChangedDuringSync,
+						format!("File at path {} was modified during upload", path.display()),
+					));
+				}
+				let res = tokio::task::spawn_blocking(move || (std::fs::metadata(&path), path))
+					.await
+					.unwrap();
+				let (new_meta, path) = match res.0 {
+					Ok(meta) => (meta, res.1),
+					Err(e) => {
+						return Err(e.with_context(format!(
+							"File at path {} was modified during upload",
+							res.1.display()
+						)));
 					}
-					let res = tokio::task::spawn_blocking(move || (std::fs::metadata(&path), path))
-						.await
-						.unwrap();
-					let (new_meta, path) = match res.0 {
-						Ok(meta) => (meta, res.1),
-						Err(e) => {
-							return Err(e.with_context(format!(
-								"File at path {} was modified during upload",
-								res.1.display()
-							)));
-						}
-					};
-					let modified = FilenMetaExt::modified(&new_meta);
-					let expected_modified = FilenMetaExt::modified(&meta);
-					if modified != expected_modified {
-						return Err(Error::custom(
-							ErrorKind::FileChangedDuringSync,
-							format!("File at path {} was modified during upload", path.display()),
-						));
-					}
-					Ok(())
-				}),
-			)
-			.await?;
-		Ok((uploaded, reader.into_inner().into_std().await))
+				};
+				let modified = FilenMetaExt::modified(&new_meta);
+				let expected_modified = FilenMetaExt::modified(&meta);
+				if modified != expected_modified {
+					return Err(Error::custom(
+						ErrorKind::FileChangedDuringSync,
+						format!("File at path {} was modified during upload", path.display()),
+					));
+				}
+				Ok(())
+			}),
+			exif_tee,
+		);
+		let file = read_file_into_chunks(&mut writer, file, original_size).await?;
+		writer.close().await?;
+		let uploaded = writer
+			.into_remote_file()
+			.expect("a closed writer holds the uploaded file (should be impossible)");
+		Ok((uploaded, file))
 	}
+}
+
+/// Reads `file`'s declared `size` bytes straight into `writer`'s chunks, one blocking task per
+/// chunk, and returns `file`. No buffer outside the memory budget: an upload waiting for the
+/// budget to grant its next chunk holds nothing the size of a chunk.
+///
+/// A file that ends early leaves the shortfall to the writer's completion check. One that goes on
+/// past `size` fails as any reader yielding more than its declared size does.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn read_file_into_chunks<'a, F, Fut>(
+	writer: &mut FileWriter<'a, F, Fut>,
+	mut file: std::fs::File,
+	size: u64,
+) -> Result<std::fs::File, Error>
+where
+	F: 'a + FnOnce(Blake3Hash, u64) -> Fut + MaybeSend,
+	Fut: 'a + Future<Output = Result<(), Error>> + MaybeSend,
+	FileWriter<'a, F, Fut>: Unpin,
+{
+	let mut remaining = size;
+	while remaining > 0 {
+		let chunk = poll_fn(|cx| writer.poll_next_chunk(cx)).await?;
+		let len = chunk
+			.capacity()
+			.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+		let (data, permit) = chunk.into_parts();
+		let (returned, data) = fill_on_blocking_thread(file, data, len).await?;
+		file = returned;
+		let filled = data.len();
+		writer.submit_chunk(Chunk::from_parts(data, permit))?;
+		if filled < len {
+			return Ok(file);
+		}
+		remaining -= filled as u64;
+	}
+	if size == 0 {
+		return Ok(file);
+	}
+	// the read that finds the end, as any reader's last; a byte there means the file grew
+	let (file, past_end) = fill_on_blocking_thread(file, Vec::with_capacity(1), 1).await?;
+	writer.write_all(&past_end).await?;
+	Ok(file)
+}
+
+/// [`fill_from`] on a blocking thread, handing `file` and `data` back.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn fill_on_blocking_thread(
+	mut file: std::fs::File,
+	mut data: Vec<u8>,
+	len: usize,
+) -> Result<(std::fs::File, Vec<u8>), Error> {
+	let (file, data, read) = tokio::task::spawn_blocking(move || {
+		let read = fill_from(&mut file, &mut data, len);
+		(file, data, read)
+	})
+	.await
+	.map_err(std::io::Error::from)?;
+	read?;
+	Ok((file, data))
+}
+
+/// Appends what `reader` yields to `data` until `data` holds `len` bytes or `reader` ends,
+/// reading into `data`'s own memory.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn fill_from(reader: &mut impl Read, data: &mut Vec<u8>, len: usize) -> std::io::Result<()> {
+	let mut filled = data.len();
+	// zeroed first: reading into spare capacity needs `core_io_borrowed_buf`
+	// https://github.com/rust-lang/rust/issues/117693
+	data.resize(len.max(filled), 0);
+	let read = loop {
+		let Some(rest) = data.get_mut(filled..).filter(|rest| !rest.is_empty()) else {
+			break Ok(());
+		};
+		match reader.read(rest) {
+			Ok(0) => break Ok(()),
+			Ok(n) => filled += n,
+			Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+			Err(e) => break Err(e),
+		}
+	};
+	data.truncate(filled);
+	read
 }
 
 /// A temp file written beside its destination, removed on drop unless
@@ -702,5 +788,221 @@ mod tmp_file_guard_tests {
 		};
 		assert_eq!(e.kind(), ErrorKind::InvalidInput);
 		assert_eq!(e.to_string(), "Provided path has no parent directory");
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod upload_from_path_tests {
+	use std::{
+		io::{ErrorKind as IoErrorKind, Read, Seek},
+		sync::Arc,
+		time::Duration,
+	};
+
+	use filen_types::fs::Uuid;
+	use tempfile::TempDir;
+
+	use super::{fill_from, read_file_into_chunks};
+	use crate::{
+		ErrorKind,
+		alloc_meter::peak_bytes,
+		auth::{Client, test_support::offline_client},
+		consts::CHUNK_SIZE,
+		fs::file::{FileBuilderOptionalName, write::FileWriterDefault},
+	};
+
+	/// Yields `bytes` at most `step` at a time; past them, fails once with `end` if set.
+	struct Trickle<'a> {
+		bytes: &'a [u8],
+		step: usize,
+		end: Option<IoErrorKind>,
+	}
+
+	impl Read for Trickle<'_> {
+		fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+			if self.bytes.is_empty()
+				&& let Some(kind) = self.end.take()
+			{
+				return Err(kind.into());
+			}
+			let n = buf.len().min(self.step).min(self.bytes.len());
+			let (head, rest) = self.bytes.split_at(n);
+			buf[..n].copy_from_slice(head);
+			self.bytes = rest;
+			Ok(n)
+		}
+	}
+
+	#[test]
+	fn fill_from_fills_in_place_across_short_reads() {
+		let mut reader = Trickle {
+			bytes: b"0123456789",
+			step: 3,
+			end: None,
+		};
+		let mut data = Vec::with_capacity(16);
+		let memory = data.as_ptr();
+
+		fill_from(&mut reader, &mut data, 10).unwrap();
+
+		assert_eq!(data, b"0123456789");
+		assert_eq!((data.as_ptr(), data.capacity()), (memory, 16));
+	}
+
+	#[test]
+	fn fill_from_stops_at_the_length_and_leaves_the_rest_unread() {
+		let mut reader = Trickle {
+			bytes: b"0123456789",
+			step: 3,
+			end: None,
+		};
+		let mut data = Vec::with_capacity(16);
+
+		fill_from(&mut reader, &mut data, 4).unwrap();
+
+		assert_eq!(data, b"0123");
+		assert_eq!(reader.bytes, b"456789");
+	}
+
+	#[test]
+	fn fill_from_stops_where_a_shorter_reader_ends() {
+		let mut reader = Trickle {
+			bytes: b"012",
+			step: 2,
+			end: None,
+		};
+		let mut data = Vec::with_capacity(16);
+
+		fill_from(&mut reader, &mut data, 10).unwrap();
+
+		assert_eq!(data, b"012");
+	}
+
+	#[test]
+	fn fill_from_retries_an_interrupted_read() {
+		let mut reader = Trickle {
+			bytes: b"012",
+			step: 3,
+			end: Some(IoErrorKind::Interrupted),
+		};
+		let mut data = Vec::with_capacity(16);
+
+		fill_from(&mut reader, &mut data, 10).unwrap();
+
+		assert_eq!(data, b"012");
+	}
+
+	#[test]
+	fn fill_from_keeps_the_bytes_read_before_a_failed_read() {
+		let mut reader = Trickle {
+			bytes: b"012",
+			step: 3,
+			end: Some(IoErrorKind::PermissionDenied),
+		};
+		let mut data = Vec::with_capacity(16);
+
+		let err = fill_from(&mut reader, &mut data, 10).unwrap_err();
+
+		assert_eq!(err.kind(), IoErrorKind::PermissionDenied);
+		assert_eq!(data, b"012");
+	}
+
+	fn file_holding(contents: &[u8]) -> (TempDir, std::fs::File) {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("payload.bin");
+		std::fs::write(&path, contents).unwrap();
+		let file = std::fs::File::open(path).unwrap();
+		(dir, file)
+	}
+
+	fn writer_declaring(client: &Client, size: u64) -> FileWriterDefault<'_> {
+		let file = client
+			.make_file_builder("payload.bin", Uuid::from_u128(1))
+			.unwrap()
+			.build();
+		client.inner_get_file_writer(Arc::new(file), None, Some(size), None, None)
+	}
+
+	#[tokio::test]
+	async fn a_zero_byte_upload_reads_nothing() {
+		let client = offline_client();
+		let (_dir, file) = file_holding(b"written after the stat");
+		let mut writer = writer_declaring(&client, 0);
+
+		let mut file = read_file_into_chunks(&mut writer, file, 0).await.unwrap();
+
+		assert_eq!(file.stream_position().unwrap(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_file_of_exactly_one_chunk_is_read_to_its_end() {
+		let client = offline_client();
+		let (_dir, file) = file_holding(&vec![7u8; CHUNK_SIZE]);
+		let mut writer = writer_declaring(&client, CHUNK_SIZE as u64);
+
+		let mut file = read_file_into_chunks(&mut writer, file, CHUNK_SIZE as u64)
+			.await
+			.unwrap();
+
+		assert_eq!(file.stream_position().unwrap(), CHUNK_SIZE as u64);
+	}
+
+	#[tokio::test]
+	async fn a_file_that_grew_past_its_declared_size_fails_the_upload() {
+		let client = offline_client();
+		let (_dir, file) = file_holding(b"0123456789");
+		let mut writer = writer_declaring(&client, 5);
+
+		let err = read_file_into_chunks(&mut writer, file, 5)
+			.await
+			.unwrap_err();
+
+		assert_eq!(err.kind(), ErrorKind::IO);
+		assert_eq!(
+			err.downcast_ref::<std::io::Error>()
+				.map(std::io::Error::kind),
+			Some(IoErrorKind::InvalidData)
+		);
+		assert_eq!(
+			err.inner_message().as_deref(),
+			Some("reader produced more bytes than the declared size of 5 bytes")
+		);
+	}
+
+	#[test]
+	fn an_upload_waiting_for_the_memory_budget_holds_no_read_buffer() {
+		let client = offline_client();
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("payload.bin");
+		std::fs::write(&path, vec![7u8; CHUNK_SIZE]).unwrap();
+		// hold the whole budget, so the upload's first chunk is never granted
+		let budget = client.client().state().memory_semaphore();
+		let _held = budget
+			.try_acquire_many(u32::try_from(budget.available_permits()).unwrap())
+			.unwrap();
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.start_paused(true)
+			.build()
+			.unwrap();
+
+		// the paused clock only runs out once the upload is parked on the budget with no read in
+		// flight; everything polled on this thread is metered
+		let (waited, peak) = peak_bytes(|| {
+			runtime.block_on(async {
+				tokio::time::timeout(
+					Duration::from_secs(60),
+					client.upload_file_from_path_with_builder(
+						FileBuilderOptionalName::new(Uuid::from_u128(1)),
+						path.clone(),
+						None,
+					),
+				)
+				.await
+			})
+		});
+
+		assert!(waited.is_err(), "the upload got past the exhausted budget");
+		assert!(peak < 64 * 1024, "the waiting upload held {peak} bytes");
 	}
 }
