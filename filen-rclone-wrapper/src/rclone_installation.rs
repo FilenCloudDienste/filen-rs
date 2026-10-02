@@ -83,22 +83,36 @@ impl RcloneInstallation {
 		Ok(status)
 	}
 
-	/// Executes an rclone command in the background, exposing the Rclone RC API.
+	/// Executes an rclone command in the background, exposing the Rclone RC API and piping stdout/stderr to logs.
 	pub async fn execute_in_background(&self, args: &[&str]) -> Result<(Child, RcloneApiClient)> {
 		let rc_port = free_local_ipv4_port()
 			.ok_or(anyhow::anyhow!("Failed to find free port for Rclone RC"))?;
+		let rc_username = "filen-rclone-wrapper".to_string();
+		let rc_password = {
+			let random_bytes: [u8; 16] = rand::random();
+			random_bytes
+				.iter()
+				.map(|b| format!("{:02x}", b))
+				.collect::<String>()
+		};
 		debug!(
-			"Executing rclone with args: {} --rc --rc-no-auth --rc-addr 127.0.0.1:{}",
+			"Executing rclone with args: {} --rc --rc-user {} --rc-pass (omitted) --rc-addr :{} --rc-min-tls-version 1.2",
 			args.join(" "),
+			rc_username,
 			rc_port
 		);
-		let process = self
+		let mut process = self
 			.configured_rclone(args)
 			.args([
 				"--rc",
-				"--rc-no-auth", // otherwise, certain endpoints are inaccessible
+				"--rc-user",
+				&rc_username,
+				"--rc-pass",
+				&rc_password,
 				"--rc-addr",
 				&format!("127.0.0.1:{}", rc_port),
+				"--rc-min-tls-version",
+				"1.2",
 			])
 			.stdout(Stdio::piped())
 			.stderr(Stdio::piped())
@@ -106,24 +120,32 @@ impl RcloneInstallation {
 			.spawn()
 			.context("Failed to execute rclone command")?;
 
-		Ok((process, RcloneApiClient::new(rc_port)))
-	}
-
-	pub fn pipe_output_to_logs(process: &mut Child) {
-		let process_stdout = process.stdout.take().unwrap();
+		// pipe stdout and stderr to logs
+		let process_stdout = process
+			.stdout
+			.take()
+			.context("Failed to take stdout of rclone process")?;
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(process_stdout).lines();
 			while let Ok(Some(line)) = reader.next_line().await {
 				info!("[rclone stdout] {}", line);
 			}
 		});
-		let process_stderr = process.stderr.take().unwrap();
+		let process_stderr = process
+			.stderr
+			.take()
+			.context("Failed to take stderr of rclone process")?;
 		tokio::spawn(async move {
 			let mut reader = BufReader::new(process_stderr).lines();
 			while let Ok(Some(line)) = reader.next_line().await {
 				info!("[rclone stderr] {}", line);
 			}
 		});
+
+		Ok((
+			process,
+			RcloneApiClient::new(rc_port, rc_username, rc_password),
+		))
 	}
 
 	fn configured_rclone(&self, args: &[&str]) -> Command {

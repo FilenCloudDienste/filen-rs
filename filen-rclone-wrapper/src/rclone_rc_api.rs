@@ -38,13 +38,17 @@ pub struct VfsListResponse {
 pub struct RcloneApiClient {
 	client: reqwest::Client,
 	root: String,
+	username: String,
+	password: String,
 }
 
 impl RcloneApiClient {
-	pub(crate) fn new(port: u16) -> Self {
+	pub(crate) fn new(port: u16, username: String, password: String) -> Self {
 		Self {
 			client: reqwest::Client::new(),
 			root: format!("http://127.0.0.1:{}", port),
+			username,
+			password,
 		}
 	}
 
@@ -56,6 +60,7 @@ impl RcloneApiClient {
 		let response = self
 			.client
 			.post(format!("{}/{}", self.root, endpoint))
+			.basic_auth(self.username.clone(), Some(self.password.clone()))
 			.body(if let Some(body) = body {
 				body.to_string()
 			} else {
