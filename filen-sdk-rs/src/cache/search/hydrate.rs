@@ -22,7 +22,7 @@ use uuid::Uuid;
 // Native-only: the engine opens its own read connection here (wasm routes reads through the
 // worker), so these are unused on the wasm cache build.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use {rusqlite::OpenFlags, std::path::Path};
+use {crate::cache::sql::bound_memory, rusqlite::OpenFlags, std::path::Path};
 
 use crate::{
 	crypto::file::FileKey,
@@ -185,9 +185,7 @@ pub(in crate::cache) fn open_read_connection(path: &Path) -> rusqlite::Result<Co
 		OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
 	)?;
 	conn.busy_timeout(Duration::from_millis(5000))?;
-	// Scan-heavy reader: give it the same page-cache/mmap budget as the worker connection (a
-	// subtree query touches most of a ~100MB DB at scale; the 2MB default thrashes).
-	conn.execute_batch("PRAGMA cache_size = -32768; PRAGMA mmap_size = 268435456;")?;
+	bound_memory(&conn)?;
 	register_name_matches(&conn)?;
 	Ok(conn)
 }
@@ -451,10 +449,32 @@ mod tests {
 	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 	use uuid::Uuid;
 
-	use crate::cache::CacheState;
+	use crate::cache::{
+		CacheState,
+		sql::columns::{PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE, PRAGMA_TEMP_STORE},
+	};
 
 	use super::super::config::{SearchConfig, SearchItemType};
 	use super::*;
+
+	/// A read connection holds no more in memory than the worker's does: the PRAGMAs that bound it
+	/// are per connection, so the opener has to apply them itself.
+	#[test]
+	fn a_read_connection_opens_with_the_cache_memory_bounds() {
+		let path = temp_db_path();
+		let _state = CacheState::new_on_path(&path, Uuid::new_v4());
+		let conn = open_read_connection(&path).unwrap();
+
+		let pragma = |name: &str| -> i64 {
+			conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(name))
+				.unwrap()
+		};
+		// A 4 MiB page cache (a negative `cache_size` is KiB), no memory map, and TEMP storage in a
+		// file (1 = FILE).
+		assert_eq!(pragma(PRAGMA_CACHE_SIZE), -4096, "page-cache budget");
+		assert_eq!(pragma(PRAGMA_MMAP_SIZE), 0, "no memory map");
+		assert_eq!(pragma(PRAGMA_TEMP_STORE), 1, "TEMP storage in a file");
+	}
 
 	#[test]
 	fn matcher_handles_ascii_unicode_and_the_case_toggle() {

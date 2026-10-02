@@ -38,6 +38,65 @@ pub(in crate::cache) mod statements;
 // requires CHUNK_SIZE to be a multiple of its `MULTI_ROW_CHUNK`.
 pub(crate) const CHUNK_SIZE: usize = 50_000;
 
+/// The page cache each connection to the cache DB keeps, in KiB (a negative `cache_size` counts
+/// KiB, not pages).
+///
+/// A ceiling, paid per connection for as long as it is open, and at scale every one of them
+/// fills: a million-item cache DB is ~450 MiB, so the 32 MiB this used to be was 32 MiB of heap
+/// per connection, the transient ones a sync pass opens included. What a statement revisits is
+/// the interior pages of the b-trees it walks, under a hundredth of the file by a 4 KiB page's
+/// fan-out; the leaves under them are read through the OS page cache, which is the kernel's to
+/// evict and not this process's. Twice SQLite's stock default. At a million items a warm
+/// whole-subtree read took 7.5-7.8 s with it, 7.1 s with 8 MiB and 6.4-8.9 s with 32: 8 MiB buys
+/// that read 5-9%, at twice the ceiling on every connection that fills it.
+const PAGE_CACHE_KIB: i64 = 4 * 1024;
+
+/// Where SQLite keeps TEMP tables (the resync's `diff_incoming` staging), transient indexes (the
+/// recursive walks' de-duplication) and the spill of a large sort. In a file, so that they page
+/// through a bounded cache (SQLite's stock ~2 MB each) instead of holding a whole resync's listing
+/// in RAM, where it stayed at its high-water mark after the next `DELETE`. The read connections
+/// already had this, SQLite's native default; the worker's kept them in memory. The price is
+/// their file I/O: with TEMP in memory, a warm whole-subtree read of a million items took
+/// 4.0-5.2 s instead of 7.5-7.8 s, holding its de-duplication index in RAM. On unix the files go
+/// to `SQLITE_TMPDIR`, `TMPDIR` or the first of `/var/tmp`, `/usr/tmp` and `/tmp`; where that is
+/// a tmpfs, they are held in RAM after all. Not on Android, where the bundled SQLite is built with
+/// `SQLITE_TEMP_STORE=3` and keeps TEMP in memory whatever this says: it has no temp directory it
+/// can find.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const TEMP_STORE: &str = "FILE";
+/// On the web the DB file itself lives in memory (the wasm build's default VFS, `memvfs`, keeps
+/// every file in the heap), so a TEMP file there is the same bytes in RAM plus a second copy of
+/// its pages in that file's page cache.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+const TEMP_STORE: &str = "MEMORY";
+
+/// Bound what one connection to the cache DB holds in memory: a [`PAGE_CACHE_KIB`] page cache,
+/// [`TEMP_STORE`], and no memory map of the DB file.
+///
+/// A mapped page of the DB counts in the process's resident set, up to the whole map: it was
+/// 256 MiB a connection, and a million-item DB fills it. SQLite maps the file from its first byte
+/// up to the limit and reads the rest through `pread`, so a bound small enough to fit a memory
+/// target still reads most of a large walk without it (64 MiB is a seventh of a million-item DB).
+/// The price of none is time: the DB's pages come through `pread` and this page cache instead of
+/// in place, and a warm whole-subtree read of a million items took 7.5-7.8 s, against 4.7-4.9 s
+/// with the same page cache and the 256 MiB map. Those mapped pages were clean and file-backed,
+/// pages the kernel can drop under pressure, but they are counted in the resident set, which is
+/// what the sync probe reports.
+///
+/// TEMP databases and transient indexes are never mapped whatever this says: their pager opens its
+/// file on the first page it writes out, after the limit was applied. With TEMP in a file, a sort
+/// that outgrows its in-memory budget, which is this connection's `cache_size`, spills to files
+/// the sorter maps whatever `mmap_size` says.
+///
+/// None of it persists in the file, so every connection applies it when it opens: the worker's in
+/// [`CacheState::init_db`], every read connection in `open_read_connection`.
+pub(in crate::cache) fn bound_memory(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+	conn.execute_batch(&format!(
+		"PRAGMA cache_size = -{PAGE_CACHE_KIB}; PRAGMA mmap_size = 0; \
+		 PRAGMA temp_store = {TEMP_STORE};"
+	))
+}
+
 /// A listed record whose metadata did not decrypt or decode, so it has no cacheable form. Kept (see
 /// `undecodable_items` in `raw/init.sql`) so a reader can tell an item that still exists from one
 /// that is gone.
@@ -285,25 +344,22 @@ impl CacheState {
 		// EVERY open — before the version check below, which early-returns on a matching reopen without
 		// running `INIT`. `foreign_keys` + `recursive_triggers` are what make the cascade-on-delete
 		// trigger recurse through a whole subtree (and the `files`/`dirs` FK cascades fire); skipping them
-		// on a reopen would silently leave the cascade non-recursive after a restart. `temp_store=MEMORY`
-		// keeps the resync staging TEMP table in RAM; `busy_timeout` retries a transient `SQLITE_BUSY`
-		// instead of surfacing it as a mis-quarantined poison event in the drain. (`journal_mode=WAL`
-		// DOES persist in the file header, so it stays in `INIT`.)
+		// on a reopen would silently leave the cascade non-recursive after a restart. `busy_timeout`
+		// retries a transient `SQLITE_BUSY` instead of surfacing it as a mis-quarantined poison event
+		// in the drain. (`journal_mode=WAL` DOES persist in the file header, so it stays in `INIT`.)
 		//
 		// `synchronous=NORMAL` is the canonical WAL pairing (fsync per checkpoint, not per
 		// commit — the bundled SQLite defaults to FULL, which dominated bulk-apply cost). Safe
 		// here: WAL guarantees the DB stays CONSISTENT across power loss either way, and since
 		// the watermark/needs_resync commit only after the rows they describe, rolling back to
 		// an earlier consistent state just re-applies or re-lists — the cache is
-		// server-reconstructible by design. `cache_size`/`mmap_size` size the page cache for a
-		// ~100MB+ working set at scale (mmap is plain page-cache-backed reads — cheap on mobile;
-		// the wasm in-memory VFS ignores both, harmlessly).
+		// server-reconstructible by design. The memory bounds are `bound_memory`'s.
 		self.db
 			.busy_timeout(std::time::Duration::from_millis(5000))?;
 		self.db.execute_batch(
-			"PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA temp_store = MEMORY; \
-			 PRAGMA synchronous = NORMAL; PRAGMA cache_size = -32768; PRAGMA mmap_size = 268435456;",
+			"PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON; PRAGMA synchronous = NORMAL;",
 		)?;
+		bound_memory(&self.db)?;
 
 		let version: i64 = self.db.query_one(statements::GET_USER_VERSION, (), |row| {
 			row.get(PRAGMA_USER_VERSION)

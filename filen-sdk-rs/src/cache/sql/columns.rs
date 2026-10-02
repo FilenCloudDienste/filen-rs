@@ -112,3 +112,5 @@ pub(in crate::cache) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
 pub(in crate::cache) const PRAGMA_CACHE_SIZE: &str = "cache_size";
 #[cfg(test)]
 pub(in crate::cache) const PRAGMA_MMAP_SIZE: &str = "mmap_size";
+#[cfg(test)]
+pub(in crate::cache) const PRAGMA_TEMP_STORE: &str = "temp_store";
