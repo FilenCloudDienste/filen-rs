@@ -134,8 +134,14 @@ pub(super) struct Baseline {
 	/// (see [`freeze`](Baseline::freeze)), when `rows` and `edits` are gone. A path it does not
 	/// hold is a question the apply layer was never meant to ask, and asking it panics rather than
 	/// answer "no row".
-	frozen: Option<Arc<HashMap<String, Option<BaselineEntry>>>>,
+	frozen: Option<Arc<Frozen>>,
 }
+
+/// The rows [`freeze`](Baseline::freeze) keeps, by path: `None` where the path holds no row.
+///
+/// Each row is boxed and each path a `Box<str>`: on a first sync nearly every path the plan names
+/// holds no row, and a slot holding the row inline would cost a whole row's bytes for each of them.
+type Frozen = HashMap<Box<str>, Option<Box<BaselineEntry>>>;
 
 /// What a pass changed about the rows (see the module doc): LAYERS over the table, bottom first,
 /// each read over the view the table and the layers beneath it make — plus the edited view's
@@ -729,10 +735,7 @@ impl Cursor<'_> {
 /// The row the frozen rows hold at `rel_path` — and a panic where they hold nothing, because a path
 /// the plan did not name is a question nothing after the plan was meant to ask. Answering "no row"
 /// there would read a tracked path as untracked (see the module doc).
-fn frozen_row(
-	frozen: &HashMap<String, Option<BaselineEntry>>,
-	rel_path: &str,
-) -> Option<BaselineEntry> {
+fn frozen_row(frozen: &Frozen, rel_path: &str) -> Option<BaselineEntry> {
 	frozen
 		.get(rel_path)
 		.unwrap_or_else(|| {
@@ -741,7 +744,8 @@ fn frozen_row(
 				 names — refusing to answer from rows the pass no longer reads"
 			)
 		})
-		.clone()
+		.as_deref()
+		.cloned()
 }
 
 impl Baseline {
@@ -1276,11 +1280,11 @@ impl Baseline {
 			asked.extend(ancestors(path));
 			asked.insert(path);
 		}
-		let frozen: HashMap<String, Option<BaselineEntry>> = {
+		let frozen: Frozen = {
 			let mut cursor = self.cursor();
 			asked
 				.into_iter()
-				.map(|path| (path.to_string(), cursor.get(path)))
+				.map(|path| (path.into(), cursor.get(path).map(Box::new)))
 				.collect()
 		};
 		if let Some(rows) = &self.rows
@@ -1646,12 +1650,14 @@ impl Baseline {
 			handle: self.rows.as_ref().map_or(0, |_| size_of::<Snapshot>()),
 			edits: self.edits.as_deref().map_or(0, Edits::bytes)
 				+ self.frozen.as_deref().map_or(0, |frozen| {
-					frozen.capacity() * size_of::<(String, Option<BaselineEntry>)>()
+					frozen.capacity() * size_of::<(Box<str>, Option<Box<BaselineEntry>>)>()
 						+ frozen
 							.iter()
 							.map(|(path, row)| {
-								path.capacity()
-									+ row.as_ref().map_or(0, |row| row.rel_path.capacity())
+								path.len()
+									+ row.as_deref().map_or(0, |row| {
+										size_of::<BaselineEntry>() + row.rel_path.capacity()
+									})
 							})
 							.sum::<usize>()
 				}),
@@ -1698,6 +1704,7 @@ pub(super) mod tests {
 		},
 		*,
 	};
+	use crate::alloc_meter;
 
 	fn file(rel_path: &str, hash: u8) -> BaselineEntry {
 		let uuid = Uuid::new_v4();
@@ -2321,5 +2328,28 @@ pub(super) mod tests {
 		view.move_subtree("big/moved", "elsewhere");
 		oracle.move_subtree("big/moved", "elsewhere");
 		assert_alike("with a paged subtree moved away", &view, &oracle, &probes);
+	}
+
+	/// A first sync's plan names paths the baseline holds no row at — nearly every one of them — and
+	/// the rows frozen for its apply keep an answer for each, alive through the whole apply. That
+	/// answer is "no row", and it costs a pointer, not the room a row takes.
+	#[test]
+	fn freezing_paths_that_hold_no_row_keeps_a_pointer_for_each() {
+		let paths: Vec<String> = (0..10_000)
+			.map(|n| format!("d{:02}/f{n:05}.txt", n % 100))
+			.collect();
+		let (frozen, peak) = alloc_meter::peak_bytes(|| {
+			Baseline::default().freeze(paths.iter().map(String::as_str))
+		});
+		assert!(paths.iter().all(|path| frozen.get(path).is_none()));
+		assert!(frozen.get("d07").is_none() && frozen.get("").is_none());
+		// 10_101 asked paths (the files, their 100 directories and the pair root) in a table of 16_384
+		// slots. A slot holding the row inline would be 256 bytes, 4 MiB before a single key; one
+		// that boxes it is 24, and the keys and the transient set of asked paths add about a third
+		// of a MiB.
+		assert!(
+			peak < 1 << 20,
+			"freezing 10_000 absent paths peaked at {peak} bytes, past 1 MiB"
+		);
 	}
 }
