@@ -1,21 +1,24 @@
 use std::sync::Arc;
 
 use filen_macros::js_type;
-use wasm_bindgen::prelude::wasm_bindgen;
+use serde::{Deserializer, de};
+use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 use web_sys::js_sys;
 
 use crate::{
-	Error,
+	Error, ErrorKind,
 	auth::JsClient,
-	js::{AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback},
+	job::report::JobFailed,
+	js::{AnyFile, AnyItemWithContext, AnyNormalDir, ManagedFuture, call_callback, stream_writer},
 };
 
 use super::{
 	ArchiveEntryId, Client, CompressCall, CompressConfig, CompressDelivery, CompressFormat,
-	CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
-	ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate, ExtractedTopLevelItem,
-	ListDelivery, ListReport, RemoteFileType, SourceDisposal, checked_password, compress_job,
-	entries_request, extract_job, extract_request, list_job,
+	CompressReport, CompressUpdate, EntryDownloadCall, EntryDownloadReport, EntryDownloadUpdate,
+	ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport, ExtractRequest, ExtractRoot,
+	ExtractSettings, ExtractUpdate, ExtractedTopLevelItem, ListDelivery, ListReport,
+	RemoteFileType, SourceDisposal, checked_password, compress_job, entries_request, extract,
+	extract_job, extract_request, list_job,
 };
 
 /// What `extractArchive` extracts, where to, and how.
@@ -170,6 +173,56 @@ pub struct ListArchiveParams {
 	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
 	#[serde(default)]
 	pub managed_future: ManagedFuture,
+}
+
+/// What `downloadArchiveEntry` downloads, and where to.
+#[js_type(import, no_ser, no_default)]
+pub struct DownloadArchiveEntryParams {
+	/// The archive: any file the client can read.
+	pub archive: AnyFile,
+	/// The entry, a file of the archive, from `listArchive`.
+	pub entry: ArchiveEntryId,
+	/// Where the entry's data goes, as it is decoded. Closed once the whole entry was written;
+	/// aborted when the download ends early, so what reached it is never taken for the whole
+	/// entry.
+	#[tsify(type = "WritableStream<Uint8Array>")]
+	#[serde(with = "serde_wasm_bindgen::preserve")]
+	pub writer: web_sys::WritableStream,
+	/// Most bytes a 7z solid block may decode and throw away before the entry: the
+	/// `skippedBytes` of its listed `solidBlock` access, the cost the app accepted. An entry
+	/// stored after more fails with `ArchiveSolidSkipExceeded` once the index is read, before any
+	/// of its block is fetched; `null` allows any skip. Required, so that no app starts a large
+	/// download without deciding to: a call leaving it out, or setting it to `undefined`, is
+	/// refused (`Conversion`). A zip entry, or a 7z entry stored alone or first in its block,
+	/// skips nothing.
+	#[tsify(type = "bigint | number | null")]
+	#[serde(deserialize_with = "required_solid_skip")]
+	pub max_solid_skip: Option<u64>,
+	/// See `ExtractArchiveParams.expansionLimit`.
+	#[serde(default)]
+	#[tsify(optional)]
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// The download's progress, throttled; the last one comes once the download ended.
+	#[tsify(type = "(update: EntryDownloadUpdate) => void", optional)]
+	#[serde(default, deserialize_with = "crate::js::optional_function")]
+	pub on_update: Option<js_sys::Function>,
+	/// The signals that pause and cancel the job.
+	// A direct (never flattened) field, so the abort and pause signals stay live JS values.
+	#[serde(default)]
+	pub managed_future: ManagedFuture,
+}
+
+/// Reads `maxSolidSkip`, which has no default. Serde refuses the property left out, as the
+/// field has neither `default` nor a plain `Option` deserializer; one set to `undefined` reaches
+/// this, and is refused the same way rather than read as `null`.
+fn required_solid_skip<'de, D: Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+	let value: JsValue = serde_wasm_bindgen::preserve::deserialize(deserializer)?;
+	if value.is_undefined() {
+		return Err(de::Error::missing_field("maxSolidSkip"));
+	}
+	serde_wasm_bindgen::from_value(value).map_err(de::Error::custom)
 }
 
 /// What `compressItems` compresses, into what, where to, and how.
@@ -424,6 +477,84 @@ impl JsClient {
 			)
 			.await
 			.map(|(result, undelivered)| ListReport::new(result, undelivered))
+	}
+
+	/// Writes an entry, a file of a zip or 7z, to a stream, entirely in this browser: only the
+	/// archive's first chunk (which tells its format), its index and the entry are downloaded and
+	/// decoded, and for a 7z entry stored in a solid block, what the block stores before it as
+	/// well (see `maxSolidSkip`). The entry's data reaches the stream as it is decoded, before the
+	/// CRC-32 or authentication code at its end is checked (the report's `checked`, `false` for a
+	/// 7z entry whose header lists no CRC-32): the stream is closed once the whole entry was
+	/// written, and aborted when the download ends early. A stream that fails to close fails the
+	/// download (`IO`).
+	///
+	/// `password` opens an encrypted entry, or any entry of a 7z whose header is encrypted, and
+	/// is checked on this entry alone. The call is refused before anything runs for params that
+	/// do not parse (`Conversion`) and for an entry of another archive (`InvalidState`). The
+	/// download fails before it writes anything for a directory or a link (`InvalidState`), an
+	/// entry an extraction would skip (an unsafe path, an unsupported method, overlapping data),
+	/// a solid entry past `maxSolidSkip` (`ArchiveSolidSkipExceeded`), and a tar's member or a
+	/// single compressed file (`ArchiveUnsupported`), which are only read front to back. It takes
+	/// one of the archive job slots, and can be paused and cancelled through `managedFuture`.
+	///
+	/// Unlike `downloadFileToWriter`, which rejects with the error, this resolves with the
+	/// report whether the download completed, was cancelled or failed, as the other archive
+	/// calls do: a download that ended early resolves with its `error` set.
+	#[wasm_bindgen(js_name = "downloadArchiveEntry")]
+	pub async fn download_archive_entry(
+		&self,
+		params: DownloadArchiveEntryParams,
+		password: Option<String>,
+	) -> Result<EntryDownloadReport, Error> {
+		let call = EntryDownloadCall::new(
+			params.archive,
+			params.entry,
+			params.expansion_limit,
+			params.max_solid_skip,
+			password,
+		)?;
+		// the stream stays on this thread, which only the writer leaves
+		let (mut writer, closed) = stream_writer(
+			params.writer,
+			None::<fn(u64)>,
+			"failed to convert WritableStream to AsyncWrite",
+		)?;
+		let on_update = params.on_update;
+		let client = self.inner();
+		params
+			.managed_future
+			.into_ordered_job(
+				move |update: extract::EntryDownloadUpdate| {
+					call_callback(on_update.as_ref(), &EntryDownloadUpdate::from(update))
+				},
+				move |sender, control| async move {
+					let result = call.run(client, &mut writer, sender, control).await;
+					// a download that ended early left the writer unclosed: dropped, it aborts
+					// the stream
+					drop(writer);
+					let Ok(report) = result else {
+						return Ok(result);
+					};
+					// the download closed the writer; the stream closes once its last data is
+					// written
+					Ok(match closed.await {
+						Ok(Ok(())) => Ok(report),
+						Ok(Err(error)) => Err(JobFailed {
+							report,
+							error: Arc::new(error),
+						}),
+						Err(_) => Err(JobFailed {
+							report,
+							error: Arc::new(Error::custom(
+								ErrorKind::Cancelled,
+								"the task writing the stream ended before closing it",
+							)),
+						}),
+					})
+				},
+			)
+			.await
+			.map(EntryDownloadReport::new)
 	}
 
 	/// Compresses items into a new archive in a directory, entirely in this browser. `name`

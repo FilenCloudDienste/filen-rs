@@ -1,19 +1,26 @@
-use std::sync::Arc;
+use std::{
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use filen_macros::js_type;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{
 	Error,
 	auth::{Client, JsClient},
+	io::client_impl::TmpFileGuard,
+	job::report::JobFailed,
 	js::{AnyFile, AnyItemWithContext, AnyNormalDir, File, ManagedFuture},
 };
 
 use super::{
 	ArchiveEntry, ArchiveEntryId, CompressCall, CompressConfig, CompressDelivery, CompressFormat,
-	CompressReport, CompressUpdate, ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport,
-	ExtractRequest, ExtractRoot, ExtractSettings, ExtractUpdate, ExtractedTopLevelItem,
-	ListDelivery, ListReport, ListUpdate, RemoteFileType, SourceDisposal, checked_password,
-	compress_job, entries_request, extract_job, extract_request, list_job,
+	CompressReport, CompressUpdate, EntryDownloadCall, EntryDownloadReport, EntryDownloadUpdate,
+	ExpansionLimit, ExtractConfig, ExtractDelivery, ExtractReport, ExtractRequest, ExtractRoot,
+	ExtractSettings, ExtractUpdate, ExtractedTopLevelItem, ListDelivery, ListReport, ListUpdate,
+	RemoteFileType, SourceDisposal, Uuid, checked_password, compress_job, entries_request, extract,
+	extract_job, extract_request, list_job,
 };
 
 /// Receives an extract's progress, in the order the extract made it, before the call
@@ -40,6 +47,15 @@ pub trait ListArchiveCallback: Send + Sync {
 	/// `ListUpdate.undelivered_entries`).
 	fn on_entries_batch(&self, entries: Vec<ArchiveEntry>);
 	fn on_update(&self, update: ListUpdate);
+}
+
+/// Receives a download's progress, in the order the download made it, before the call returns.
+#[uniffi::export(with_foreign)]
+pub trait DownloadArchiveEntryCallback: Send + Sync {
+	/// The download's progress, throttled; the last one comes once the download ended. Its
+	/// counts are running totals, as the other archive calls report theirs, where
+	/// `JsFileDownloadCallback` is handed what was downloaded since its last call.
+	fn on_update(&self, update: EntryDownloadUpdate);
 }
 
 /// Receives a compress's progress, in the order the compress made it, before the call
@@ -128,6 +144,26 @@ pub struct ListArchiveConfig {
 	pub skip_mac_metadata: Option<bool>,
 }
 
+/// What `download_archive_entry` downloads, and where to.
+#[js_type(import, no_ser, no_default)]
+pub struct DownloadArchiveEntryConfig {
+	/// The entry, a file of the archive, from `list_archive`.
+	pub entry: ArchiveEntryId,
+	/// The file the entry is written to, in a directory that exists. A file there is replaced
+	/// once the whole entry was written, and kept as it was otherwise.
+	pub path: String,
+	/// Most bytes a 7z solid block may decode and throw away before the entry: the
+	/// `skipped_bytes` of its listed `EntryAccess::SolidBlock`, the cost the app accepted. An
+	/// entry stored after more fails with `ArchiveSolidSkipExceeded` once the index is read,
+	/// before any of its block is fetched; `None` allows any skip. Required, with no default, so
+	/// that no app starts a large download without deciding to; a zip entry, or a 7z entry
+	/// stored alone or first in its block, skips nothing.
+	pub max_solid_skip: Option<u64>,
+	/// See `ExtractArchiveConfig.expansion_limit`.
+	#[uniffi(default = None)]
+	pub expansion_limit: Option<ExpansionLimit>,
+}
+
 /// What `compress_items` writes, and how.
 #[js_type(import, no_ser, no_default)]
 pub struct CompressItemsConfig {
@@ -173,6 +209,42 @@ pub(super) fn deliver_compress(callback: &dyn CompressItemsCallback, delivery: C
 		CompressDelivery::ArchiveCreated(archive) => callback.on_archive_created(archive),
 		CompressDelivery::Update(update) => callback.on_update(update.into()),
 	}
+}
+
+pub(super) fn deliver_entry_download(
+	callback: &dyn DownloadArchiveEntryCallback,
+	update: extract::EntryDownloadUpdate,
+) {
+	callback.on_update(update.into());
+}
+
+/// Runs `download` into a new temp file beside `path`, which is renamed onto `path` once the
+/// download returned `Ok`, so a file at `path` is only ever replaced by a whole entry, and is
+/// removed otherwise. The download owns the file, so the file is closed before the rename
+/// (Windows renames no open file). Creating the temp file fails the call; a failed rename fails
+/// the download, with its report.
+pub(super) async fn download_into<F, Fut>(
+	path: &Path,
+	download: F,
+) -> Result<Result<extract::EntryDownloadReport, extract::EntryDownloadFailed>, Error>
+where
+	F: FnOnce(Compat<tokio::fs::File>) -> Fut,
+	Fut: Future<Output = Result<extract::EntryDownloadReport, extract::EntryDownloadFailed>>,
+{
+	// a name of its own, for downloads of the same entry beside each other
+	let (guard, file) =
+		TmpFileGuard::create_beside(path, &format!("{}.filendl", Uuid::new_v4())).await?;
+	let report = match download(file.compat_write()).await {
+		Ok(report) => report,
+		failed => return Ok(failed),
+	};
+	Ok(match guard.commit(path).await {
+		Ok(()) => Ok(report),
+		Err(error) => Err(JobFailed {
+			report,
+			error: Arc::new(error.into()),
+		}),
+	})
 }
 
 async fn run_extract(
@@ -311,6 +383,62 @@ impl JsClient {
 			)
 			.await
 			.map(|(result, undelivered)| ListReport::new(result, undelivered))
+	}
+
+	/// Writes the config's `entry`, a file of the zip or 7z `archive`, to the file at its
+	/// `path`, entirely on this device: only the archive's first chunk (which tells its format),
+	/// its index and the entry are downloaded and decoded, and for a 7z entry stored in a solid
+	/// block, what the block stores before it as well (see the config's `max_solid_skip`). The
+	/// entry is written beside `path`, checked against the archive's CRC-32 or authentication
+	/// code as it is read (the report's `checked`, `false` for a 7z entry whose header lists no
+	/// CRC-32), and renamed onto `path` once whole, so `path` never holds part of an entry: what
+	/// a download that ended early wrote is removed.
+	///
+	/// `password` opens an encrypted entry, or any entry of a 7z whose header is encrypted, and
+	/// is checked on this entry alone. The call is refused before anything runs for an entry of
+	/// another archive (`InvalidState`), and for a `path` no file can be created beside. The
+	/// download fails before it writes anything for a directory or a link (`InvalidState`), an
+	/// entry an extraction would skip (an unsafe path, an unsupported method, overlapping data),
+	/// a solid entry past `max_solid_skip` (`ArchiveSolidSkipExceeded`), and a tar's member or a
+	/// single compressed file (`ArchiveUnsupported`), which are only read front to back. It takes
+	/// one of the archive job slots, and can be paused and cancelled through `managed_future`.
+	///
+	/// Unlike `download_file_to_path`, which fails with the error, this returns the report
+	/// whether the download completed, was cancelled or failed, as the other archive calls do;
+	/// and its callback reports running totals, where `download_file_to_path`'s is handed what
+	/// was downloaded since its last call. Only an abort through `managed_future` gets that
+	/// report: cancelling the calling coroutine or task drops the call, and with it the report
+	/// (the job is stopped at once).
+	pub async fn download_archive_entry(
+		&self,
+		archive: AnyFile,
+		config: DownloadArchiveEntryConfig,
+		password: Option<String>,
+		callback: Arc<dyn DownloadArchiveEntryCallback>,
+		managed_future: ManagedFuture,
+	) -> Result<EntryDownloadReport, Error> {
+		let call = EntryDownloadCall::new(
+			archive,
+			config.entry,
+			config.expansion_limit,
+			config.max_solid_skip,
+			password,
+		)?;
+		let path = PathBuf::from(config.path);
+		let client = self.inner();
+		managed_future
+			.into_ordered_job(
+				move |update| deliver_entry_download(callback.as_ref(), update),
+				// the temp file is created in the job: `tokio::fs` needs the SDK's runtime
+				move |sender, control| async move {
+					download_into(&path, |mut file| async move {
+						call.run(client, &mut file, sender, control).await
+					})
+					.await
+				},
+			)
+			.await
+			.map(EntryDownloadReport::new)
 	}
 
 	/// Compresses `items` into a new archive in `destination`, named as the config says,

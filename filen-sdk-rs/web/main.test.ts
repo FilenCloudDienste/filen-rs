@@ -28,6 +28,7 @@ import init, {
 	type ArchiveEntry,
 	type CompressFormat,
 	type CompressUpdate,
+	type EntryDownloadUpdate,
 	type ExtractedTopLevelItem,
 	type ExtractRetry,
 	type ExtractUpdate,
@@ -367,6 +368,40 @@ test("File", async () => {
 	await state.deleteFilePermanently(file)
 })
 
+/// A stream to download into: what reached it, and whether it was closed or aborted.
+function recordingStream() {
+	const chunks: Uint8Array[] = []
+	const ended = { closed: false, aborted: false }
+	const writer = new WritableStream<Uint8Array>({
+		write(chunk: Uint8Array) {
+			chunks.push(chunk)
+		},
+		close() {
+			ended.closed = true
+		},
+		abort() {
+			ended.aborted = true
+		}
+	})
+	const bytes = () => {
+		const result = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0))
+		let offset = 0
+		for (const chunk of chunks) {
+			result.set(chunk, offset)
+			offset += chunk.length
+		}
+		return result
+	}
+	return { writer, ended, bytes }
+}
+
+/// What `download` wrote to its stream, once it resolved.
+async function collectBytes(download: (writer: WritableStream<Uint8Array>) => Promise<unknown>): Promise<Uint8Array> {
+	const stream = recordingStream()
+	await download(stream.writer)
+	return stream.bytes()
+}
+
 test("File Streams", async () => {
 	const data = "test file data"
 	const blob = new Blob([data])
@@ -384,27 +419,6 @@ test("File Streams", async () => {
 	})
 
 	expect(progress).toBe(BigInt(data.length))
-
-	// Helper to collect stream into bytes
-	const collectBytes = async (downloadFn: (writer: WritableStream<Uint8Array>) => Promise<void>): Promise<Uint8Array> => {
-		const chunks: Uint8Array[] = []
-		await downloadFn(
-			new WritableStream<Uint8Array>({
-				write(chunk: Uint8Array) {
-					chunks.push(chunk)
-				}
-			})
-		)
-		// Manually concatenate chunks to avoid type issues
-		const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
-		const result = new Uint8Array(totalLength)
-		let offset = 0
-		for (const chunk of chunks) {
-			result.set(chunk, offset)
-			offset += chunk.length
-		}
-		return result
-	}
 
 	// Full download test
 	let downloadProgress = 0n
@@ -2611,6 +2625,172 @@ test("listArchive lists an archive's entries and checks its password", async () 
 	expect(files.map(entry => entry.access?.type)).toStrictEqual(["direct", "direct"])
 	expect(listing.totals).toMatchObject({ files: 2n, bytes: BigInt(source.notes.length + source.data.length), skipped: 0n })
 	expect(listing.entries.every(entry => entry.id.archive === archive!.uuid)).toBe(true)
+})
+
+test("downloadArchiveEntry streams one zip entry to a WritableStream, and resolves a refusal or a stream that fails to close with its error", async () => {
+	const parent = await state.createDir(testDir, "archive-download")
+	const source = await archiveSource(parent, 16)
+	const format: CompressFormat = { type: "zip", method: { type: "deflate", level: 6 }, encryption: "aes256" }
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "entries.zip", format }, "open up")
+	const { entries } = await state.listArchive({ archive: archive! })
+	const entry = (path: string) => entries.find(e => e.path?.path === path)!
+
+	// the entry, checked, in a stream closed by the time the call resolves
+	const stream = recordingStream()
+	const updates: EntryDownloadUpdate[] = []
+	const downloaded = callbackLog()
+	const report = await state.downloadArchiveEntry(
+		{
+			archive: archive!,
+			entry: entry("archived/sub/data.bin").id,
+			writer: stream.writer,
+			maxSolidSkip: 0,
+			onUpdate: update => {
+				downloaded.note(update.phase)
+				updates.push(update)
+			}
+		},
+		"open up"
+	)
+	expect(await downloaded.resolved()).toBe(0)
+	expect(report.error).toBeUndefined()
+	expect([report.bytesWritten, report.checked]).toStrictEqual([BigInt(source.data.length), true])
+	expect(stream.ended).toStrictEqual({ closed: true, aborted: false })
+	expect(stream.bytes()).toStrictEqual(source.data)
+	// progress is a running total, as the other archive calls report theirs: the last update
+	// counts every byte of the entry
+	const written = updates.map(update => update.bytesWritten)
+	expect(written).toStrictEqual([...written].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)))
+	expect(updates.at(-1)).toMatchObject({
+		phase: "done",
+		bytesWritten: BigInt(source.data.length),
+		entryBytes: BigInt(source.data.length)
+	})
+
+	// a stream that fails to close fails the download once every byte reached it, unchecked
+	const unclosable = new WritableStream<Uint8Array>({
+		close() {
+			throw new Error("the disk is full")
+		}
+	})
+	const unclosed = await state.downloadArchiveEntry(
+		{ archive: archive!, entry: entry("archived/sub/data.bin").id, writer: unclosable, maxSolidSkip: 0 },
+		"open up"
+	)
+	expect(unclosed.error).toBeInstanceOf(FilenSdkError)
+	expect(unclosed.error?.kind).toBe("IO")
+	expect([unclosed.bytesWritten, unclosed.checked]).toStrictEqual([BigInt(source.data.length), false])
+
+	// a directory, and an encrypted entry without its password, fail before anything is written:
+	// the call resolves with the error, where downloadFileToWriter rejects, and the stream is
+	// aborted. Not a wrong password: one gets past an AES entry's 2-byte verifier 1 time in 65536,
+	// and the download checks it on this entry alone
+	const refusals: [string, string | undefined, string][] = [
+		["archived/sub", "open up", "InvalidState"],
+		["archived/notes.txt", undefined, "ArchivePasswordRequired"]
+	]
+	for (const [path, password, kind] of refusals) {
+		const refused = recordingStream()
+		const failed = await state.downloadArchiveEntry({ archive: archive!, entry: entry(path).id, writer: refused.writer, maxSolidSkip: 0 }, password)
+		expect(failed.error).toBeInstanceOf(FilenSdkError)
+		expect(failed.error?.kind).toBe(kind)
+		expect([failed.bytesWritten, failed.checked]).toStrictEqual([0n, false])
+		await vi.waitFor(() => expect(refused.ended).toStrictEqual({ closed: false, aborted: true }), { timeout: 15_000 })
+	}
+
+	// a call has to say what a solid entry may cost: leaving maxSolidSkip out is refused, and so is
+	// setting it to undefined, which is not the null that allows any skip
+	const withoutSkip = { archive: archive!, entry: entry("archived/notes.txt").id, writer: recordingStream().writer }
+	await expect((async () => state.downloadArchiveEntry(withoutSkip as any, "open up"))()).rejects.toThrow("missing field `maxSolidSkip`")
+	const undefinedSkip = { ...withoutSkip, maxSolidSkip: undefined }
+	await expect((async () => state.downloadArchiveEntry(undefinedSkip as any, "open up"))()).rejects.toThrow("missing field `maxSolidSkip`")
+})
+
+test("downloadArchiveEntry aborts its stream and resolves cancelled when aborted through managedFuture", async () => {
+	const parent = await state.createDir(testDir, "archive-download-abort")
+	const source = await state.createDir(parent, "big")
+	const size = 4 * 1024 * 1024
+	await state.uploadFile(fixtureBytes(size, 30), { parent: source, name: "big.bin" })
+	const { archive } = await state.compressItems({
+		items: [source],
+		destination: parent,
+		name: "big.zip",
+		format: { type: "zip", method: { type: "stored" } }
+	})
+	const { entries } = await state.listArchive({ archive: archive! })
+	const big = entries.find(e => e.path?.path === "big/big.bin")!
+
+	const controller = new AbortController()
+	let closed = false
+	let aborted = false
+	const writer = new WritableStream<Uint8Array>({
+		write() {
+			// abort on the first data, then stall the sink: the download blocks on the full stream
+			// until the cancel reaches it
+			controller.abort()
+			return new Promise(resolve => setTimeout(resolve, 100))
+		},
+		close() {
+			closed = true
+		},
+		abort() {
+			aborted = true
+		}
+	})
+	const updates: EntryDownloadUpdate[] = []
+	const report = await state.downloadArchiveEntry({
+		archive: archive!,
+		entry: big.id,
+		writer,
+		maxSolidSkip: 0,
+		onUpdate: update => updates.push(update),
+		managedFuture: { abortSignal: controller.signal }
+	})
+	// resolved with the report, where downloadFileToWriter rejects
+	expect(report.error).toBeInstanceOf(FilenSdkError)
+	expect(report.error?.kind).toBe("Cancelled")
+	expect(report.checked).toBe(false)
+	expect(report.bytesWritten).toBeLessThan(BigInt(size))
+	expect(updates.at(-1)!.phase).toBe("cancelled")
+	// the stream drains what was handed to it, then is aborted, never closed
+	await vi.waitFor(() => expect(aborted).toBe(true), { timeout: 15_000 })
+	expect(closed).toBe(false)
+})
+
+test("listArchive reports SolidBlock access for a solid 7z entry; downloadArchiveEntry refuses it with maxSolidSkip 0 and downloads it with the listed skippedBytes", async () => {
+	const parent = await state.createDir(testDir, "archive-download-solid")
+	const source = await archiveSource(parent, 17)
+	const format: CompressFormat = { type: "sevenZ", method: { type: "lzma2", level: 1 }, solid: true }
+	const { archive } = await state.compressItems({ items: [source.root], destination: parent, name: "solid.7z", format })
+	const { entries } = await state.listArchive({ archive: archive! })
+	// both files are in one solid block: the one stored second skips the first
+	const files = entries.filter(entry => entry.kind.type === "file")
+	expect(files.map(entry => entry.access?.type)).toStrictEqual(["solidBlock", "solidBlock"])
+	const later = files.find(entry => entry.access?.type === "solidBlock" && entry.access.skippedBytes > 0n)!
+	if (later.access?.type !== "solidBlock") {
+		throw new Error(`expected a solid entry, got ${JSON.stringify(later.access, jsonBigIntReplacer)}`)
+	}
+	const notesLater = later.path?.path === "archived/notes.txt"
+	const [skipped, expected] = notesLater ? [source.data, source.notes] : [source.notes, source.data]
+	const skippedBytes = later.access.skippedBytes
+	expect(skippedBytes).toBe(BigInt(skipped.length))
+
+	// past the cost the call accepted: refused before any of the block is fetched
+	const refused = recordingStream()
+	const report = await state.downloadArchiveEntry({ archive: archive!, entry: later.id, writer: refused.writer, maxSolidSkip: 0 })
+	expect(report.error?.kind).toBe("ArchiveSolidSkipExceeded")
+	expect(report.bytesWritten).toBe(0n)
+	await vi.waitFor(() => expect(refused.ended.aborted).toBe(true), { timeout: 15_000 })
+
+	// at exactly the listed skip it downloads, as with null, which allows any
+	for (const maxSolidSkip of [skippedBytes, null]) {
+		const accepted = recordingStream()
+		const downloaded = await state.downloadArchiveEntry({ archive: archive!, entry: later.id, writer: accepted.writer, maxSolidSkip })
+		expect(downloaded.error).toBeUndefined()
+		expect(downloaded.checked).toBe(true)
+		expect(accepted.ended.closed).toBe(true)
+		expect(accepted.bytes()).toStrictEqual(expected)
+	}
 })
 
 test("extractArchiveEntries extracts the entries chosen below a base, one again into a retry's directory, and refuses a bad call", async () => {

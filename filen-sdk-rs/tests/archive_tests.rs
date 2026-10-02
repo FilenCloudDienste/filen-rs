@@ -18,12 +18,13 @@ use filen_sdk_rs::{
 			AesStrength, ArchiveEntry, ArchiveEntryKind, ArchiveFormat, ArchivePassword,
 			ArchiveSource, CompressCallback, CompressConfig, CompressFormat, CompressPhase,
 			CompressReport, CompressRequest, CompressSources, CompressUpdate, Compression,
-			DisposalOutcome, EntrySelection, ExtractCallback, ExtractConfig, ExtractFailed,
-			ExtractPhase, ExtractRenameReason, ExtractReport, ExtractRequest, ExtractRoot,
-			ExtractSkipReason, ExtractUpdate, ExtractWhat, ExtractedTopLevel, KeptReason,
-			ListCallback, ListConfig, ListFailed, ListPhase, ListReport, ListTotals, ListUpdate,
-			ListedSkipReason, PasswordCheck, SevenZEncryption, SevenZMethod, SourceDisposal,
-			StreamCodec, ZipMethod,
+			DisposalOutcome, EntryDownloadCallback, EntryDownloadConfig, EntryDownloadPhase,
+			EntryDownloadReport, EntryDownloadUpdate, EntrySelection, ExtractCallback,
+			ExtractConfig, ExtractFailed, ExtractPhase, ExtractRenameReason, ExtractReport,
+			ExtractRequest, ExtractRoot, ExtractSkipReason, ExtractUpdate, ExtractWhat,
+			ExtractedTopLevel, KeptReason, ListCallback, ListConfig, ListFailed, ListPhase,
+			ListReport, ListTotals, ListUpdate, ListedSkipReason, PasswordCheck, SevenZEncryption,
+			SevenZMethod, SourceDisposal, StreamCodec, ZipMethod,
 		},
 		categories::{DirType, NonRootItemType},
 		copy::{ItemSource, ItemSourceDir, JobControl},
@@ -268,6 +269,50 @@ async fn list(
 		.map(|update| update.phase);
 	assert_eq!(phase, Some(ListPhase::Done));
 	Ok(listing)
+}
+
+/// What a download told its callback.
+#[derive(Default)]
+struct EntryDownloadRecorder {
+	updates: Mutex<Vec<EntryDownloadUpdate>>,
+}
+
+impl EntryDownloadCallback for EntryDownloadRecorder {
+	fn on_update(&self, update: EntryDownloadUpdate) {
+		self.updates.lock().unwrap().push(update);
+	}
+}
+
+/// Downloads the entry `listing` lists at `path` into memory with the default config, checking
+/// the callback was told it was done.
+async fn download_entry(
+	client: &Arc<Client>,
+	archive: RemoteFileType<'static>,
+	listing: &ListReport,
+	path: &str,
+) -> (Vec<u8>, EntryDownloadReport) {
+	let recorder = Arc::new(EntryDownloadRecorder::default());
+	let mut bytes = Vec::new();
+	let report = client
+		.clone()
+		.download_archive_entry(
+			archive,
+			entry(listing, path).id,
+			&mut bytes,
+			EntryDownloadConfig::default(),
+			Arc::clone(&recorder),
+			JobControl::default(),
+		)
+		.await
+		.unwrap_or_else(|failed| panic!("downloading {path}: {}", failed.error));
+	let phase = recorder
+		.updates
+		.lock()
+		.unwrap()
+		.last()
+		.map(|update| update.phase);
+	assert_eq!(phase, Some(EntryDownloadPhase::Done), "{path}");
+	(bytes, report)
 }
 
 /// Each listed entry's extracted path and kind, sorted by path.
@@ -1068,6 +1113,79 @@ async fn a_listing_tells_the_entries_and_whether_the_password_opens_them() {
 		file_paths(&archives),
 		["hidden.7z", "listed.7z", "listed.tar.gz", "listed.zip"]
 	);
+}
+
+/// One entry of a zip in the drive downloads alone: the archive's index and the entry are read,
+/// not the rest of the archive.
+#[shared_test_runtime]
+async fn one_entry_of_an_uploaded_zip_downloads_reading_less_than_the_archive() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let source = client.create_dir(&test_dir.into(), "noise").await.unwrap();
+	upload(&client, &source, "a.bin", &noise(2 * CHUNK_SIZE + 17, 1)).await;
+	let small = noise(CHUNK_SIZE / 2 + 3, 2);
+	upload(&client, &source, "b.bin", &small).await;
+	let (archive, _) = compress(
+		&client,
+		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
+		test_dir,
+		"noise.zip",
+		CompressFormat::Zip {
+			method: ZipMethod::Stored,
+			encryption: None,
+		},
+		None,
+	)
+	.await;
+	let archive = RemoteFileType::from(archive);
+	let listing = list(&client, archive.clone(), ExtractConfig::default())
+		.await
+		.unwrap();
+
+	let (bytes, report) = download_entry(&client, archive.clone(), &listing, "noise/b.bin").await;
+	assert_eq!(bytes, small);
+	assert_eq!(
+		(report.bytes_written, report.checked),
+		(small.len() as u64, true)
+	);
+	assert!(
+		report.bytes_read < archive.size(),
+		"{} of {} bytes read",
+		report.bytes_read,
+		archive.size()
+	);
+}
+
+/// An entry of a 7z read through a public link to it downloads through a logged-in client, as
+/// one of a 7z in the drive does.
+#[shared_test_runtime]
+async fn an_entry_of_a_linked_7z_downloads_through_a_logged_in_client() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = resources.client.clone();
+	let test_dir = &resources.dir;
+	let (source, [big, ..]) = tree(&client, test_dir).await;
+	let (archive, _) = compress(
+		&client,
+		CompressSources::Keep(vec![ItemSource::Dir(ItemSourceDir::Normal(source))]),
+		test_dir,
+		"linked.7z",
+		CompressFormat::SevenZ {
+			method: SevenZMethod::Lzma2 { level: 1 },
+			solid: false,
+			encryption: None,
+		},
+		None,
+	)
+	.await;
+	let linked = linked_file(&client, &archive).await;
+	let listing = list(&client, linked.clone(), ExtractConfig::default())
+		.await
+		.unwrap();
+
+	let (bytes, report) = download_entry(&client, linked, &listing, "source/big.bin").await;
+	assert_eq!(bytes, client.download_file(&big).await.unwrap());
+	assert_eq!((report.bytes_written, report.checked), (big.size(), true));
 }
 
 /// Part of an archive extracts below the directory named as its base. An entry gone from where

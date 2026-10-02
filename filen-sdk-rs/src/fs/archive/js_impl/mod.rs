@@ -1,9 +1,11 @@
-//! `extractArchive` / `extractArchiveEntries` / `listArchive` / `compressItems` for the wasm and
-//! uniffi bindings, and the archive helpers (`archiveExtension`, `archiveEncoderMemory`,
-//! `archiveFormatLevels`, `archiveMaxLevel`, `archiveFormatOfName`, `archiveDefaultName`). Both
-//! platforms take the same arguments and report the same types; a job's callbacks reach the
-//! caller in the order the job made them, all before the call returns, and the call resolves
-//! with the job's report even when the job failed or was cancelled.
+//! `extractArchive` / `extractArchiveEntries` / `listArchive` / `downloadArchiveEntry` /
+//! `compressItems` for the wasm and uniffi bindings, and the archive helpers
+//! (`archiveExtension`, `archiveEncoderMemory`, `archiveFormatLevels`, `archiveMaxLevel`,
+//! `archiveFormatOfName`, `archiveDefaultName`). Both platforms take the same arguments, but for
+//! where a download writes (a file path on uniffi, a `WritableStream` on wasm), and report the
+//! same types; a job's callbacks reach the caller in the order the job made them, all before the
+//! call returns, and the call resolves with the job's report even when the job failed or was
+//! cancelled.
 //!
 //! A report or update carries an error as the SDK error itself ([`SdkError`]), as the calls throw
 //! it. On wasm only the JS thread can make one, so every record here is built from the job's own
@@ -23,6 +25,7 @@ use std::{
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
+use futures::AsyncWrite;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -44,6 +47,7 @@ use crate::{
 	js::{
 		AnyDirWithContext, AnyFile, AnyItemWithContext, AnyNormalDir, File, NonRootNormalItemTagged,
 	},
+	util::MaybeSend,
 };
 
 use super::{
@@ -55,11 +59,12 @@ use super::{
 	dispose::{self, SourceDisposal},
 	entry_path::joined,
 	extract::{
-		self, ArchiveEntry, ArchiveEntryId, ArchiveSource, DuplicateEntries, EntrySelection,
-		ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig, ExtractMisleadingName,
-		ExtractPhase, ExtractRenamedEntry, ExtractRequest, ExtractSkippedEntry, ExtractStage,
-		ExtractTopLevelKey, ExtractWhat, ListCallback, ListConfig, ListPhase, ListTotals,
-		MAX_LISTED_BYTES, OmittedRecords, PasswordCheck,
+		self, ArchiveEntry, ArchiveEntryId, ArchiveSource, DuplicateEntries, EntryDownloadCallback,
+		EntryDownloadConfig, EntryDownloadPhase, EntrySelection, ExpansionLimit, ExtractActiveFile,
+		ExtractCallback, ExtractConfig, ExtractMisleadingName, ExtractPhase, ExtractRenamedEntry,
+		ExtractRequest, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey, ExtractWhat,
+		ListCallback, ListConfig, ListPhase, ListTotals, MAX_LISTED_BYTES, OmittedRecords,
+		PasswordCheck,
 	},
 	password::ArchivePassword,
 };
@@ -390,6 +395,52 @@ pub struct ListReport {
 	pub error: Option<SdkError>,
 }
 
+/// One progress callback of an entry's download. Its counts are running totals.
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct EntryDownloadUpdate {
+	/// Where the download is.
+	pub phase: EntryDownloadPhase,
+	/// Whether it runs, is paused or winds down.
+	pub run_state: RunState,
+	/// Bytes of the archive read so far, each counted once, of `archiveBytes`.
+	pub bytes_read: u64,
+	/// The archive's size in bytes.
+	pub archive_bytes: u64,
+	/// Bytes of the entry written so far.
+	pub bytes_written: u64,
+	/// The entry's size in bytes as the archive states it; `undefined` until the download
+	/// reached the entry.
+	pub entry_bytes: Option<u64>,
+	/// Bytes of the archive read per second, over the last 10 seconds of running time;
+	/// `undefined` until there is a rate.
+	pub bytes_per_second: Option<u64>,
+	/// Estimated time left to write the rest of the entry, in milliseconds. `undefined` until
+	/// the download reached the entry and there is a rate, and while it winds down after an
+	/// error or a cancel stopped it; 0 on the final update, whether the download completed, was
+	/// cancelled or failed.
+	pub eta_ms: Option<u64>,
+	/// Time spent running, paused time left out, in milliseconds.
+	pub active_time_ms: u64,
+}
+
+/// What an entry's download did, whether it completed, was cancelled or failed.
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct EntryDownloadReport {
+	/// Bytes of the entry written.
+	pub bytes_written: u64,
+	/// Bytes of the archive read, each counted once.
+	pub bytes_read: u64,
+	/// The archive's checksum for the entry matched every byte written: `false` whenever
+	/// `error` is set, and for a 7z entry whose header lists no CRC-32.
+	pub checked: bool,
+	/// Why the download failed: kind `Cancelled` when cancelled, or the error that stopped it,
+	/// a file that could not take the path's place or a stream that failed to close included.
+	/// `undefined` when the whole entry reached its destination.
+	pub error: Option<SdkError>,
+}
+
 /// Something that happened to one item, reported in the next update.
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, tagged, no_default)]
@@ -672,6 +723,41 @@ impl ListReport {
 			totals: listing.totals,
 			unaccounted_bytes: listing.unaccounted_bytes,
 			duplicates: listing.duplicates,
+			error,
+		}
+	}
+}
+
+impl From<extract::EntryDownloadUpdate> for EntryDownloadUpdate {
+	fn from(update: extract::EntryDownloadUpdate) -> Self {
+		Self {
+			phase: update.phase,
+			run_state: update.run_state,
+			bytes_read: update.bytes_read,
+			archive_bytes: update.archive_bytes,
+			bytes_written: update.bytes_written,
+			entry_bytes: update.entry_bytes,
+			bytes_per_second: update.bytes_per_second,
+			eta_ms: update.eta.map(millis),
+			active_time_ms: millis(update.active_time),
+		}
+	}
+}
+
+impl EntryDownloadReport {
+	/// How a download ended, for the bindings: one that ended early still resolves, with the
+	/// report of what it did.
+	fn new(result: Result<extract::EntryDownloadReport, extract::EntryDownloadFailed>) -> Self {
+		let (report, error) = match result {
+			Ok(report) => (report, None),
+			Err(failed) => (failed.report, Some(sdk_error(failed.error))),
+		};
+		Self {
+			bytes_written: report.bytes_written,
+			bytes_read: report.bytes_read,
+			// a binding fails a download that completed when its file cannot take the path's
+			// place or its stream fails to close, the entry checked but never delivered
+			checked: report.checked && error.is_none(),
 			error,
 		}
 	}
@@ -1023,6 +1109,71 @@ async fn list_job(
 	let undelivered = Arc::clone(&channel.undelivered);
 	let result = client.list_archive(archive, config, channel, control).await;
 	Ok((result, undelivered.load(Ordering::Relaxed)))
+}
+
+/// Passes a download's updates to the binding's delivery task over one channel, which keeps
+/// their order.
+struct EntryDownloadChannel(UnboundedSender<extract::EntryDownloadUpdate>);
+
+impl EntryDownloadCallback for EntryDownloadChannel {
+	fn on_update(&self, update: extract::EntryDownloadUpdate) {
+		let _ = self.0.send(update);
+	}
+}
+
+/// What `downloadArchiveEntry` downloads, checked before it starts.
+struct EntryDownloadCall {
+	archive: RemoteFileType<'static>,
+	entry: ArchiveEntryId,
+	config: EntryDownloadConfig,
+}
+
+impl EntryDownloadCall {
+	/// The call's arguments, checked: an entry of another archive is refused as
+	/// `extractArchiveEntries` refuses one. A call that leaves out `expansion_limit` gets the
+	/// SDK's; `max_solid_skip` has no default in the bindings, where `None` allows any skip.
+	fn new(
+		archive: AnyFile,
+		entry: ArchiveEntryId,
+		expansion_limit: Option<ExpansionLimit>,
+		max_solid_skip: Option<u64>,
+		password: Option<String>,
+	) -> Result<Self, Error> {
+		let password = checked_password(password)?;
+		let (archive, _) =
+			EntrySelection::new(RemoteFileType::try_from(archive)?, vec![entry], Vec::new())?
+				.into_parts();
+		Ok(Self {
+			archive,
+			entry,
+			config: EntryDownloadConfig {
+				expansion_limit: expansion_limit.or(EntryDownloadConfig::default().expansion_limit),
+				password,
+				max_solid_skip,
+			},
+		})
+	}
+
+	/// Runs the download as the job of a managed future, writing the entry to `writer`, its
+	/// updates going to `sender`.
+	async fn run<W: AsyncWrite + Unpin + MaybeSend>(
+		self,
+		client: Arc<Client>,
+		writer: &mut W,
+		sender: UnboundedSender<extract::EntryDownloadUpdate>,
+		control: JobControl,
+	) -> Result<extract::EntryDownloadReport, extract::EntryDownloadFailed> {
+		client
+			.download_archive_entry(
+				self.archive,
+				self.entry,
+				writer,
+				self.config,
+				EntryDownloadChannel(sender),
+				control,
+			)
+			.await
+	}
 }
 
 /// A compress's callback, as the job made it: the binding's delivery task converts the update

@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
+
+use futures::AsyncWriteExt;
+use tokio_util::compat::Compat;
 
 use super::{
 	uniffi_impl::{
-		CompressItemsCallback, ExtractArchiveCallback, ListArchiveCallback, deliver_compress,
-		deliver_extract, deliver_list,
+		CompressItemsCallback, DownloadArchiveEntryCallback, ExtractArchiveCallback,
+		ListArchiveCallback, deliver_compress, deliver_entry_download, deliver_extract,
+		deliver_list, download_into,
 	},
 	*,
 };
@@ -839,6 +843,233 @@ fn list_callbacks_are_delivered_in_order_until_the_job_lets_go() {
 			}
 			sent
 		},
+	);
+}
+
+fn entry_download_update(millis: u64) -> extract::EntryDownloadUpdate {
+	extract::EntryDownloadUpdate {
+		phase: EntryDownloadPhase::Reading,
+		run_state: RunState::Running,
+		bytes_read: 40,
+		archive_bytes: 100,
+		bytes_written: 12,
+		entry_bytes: Some(30),
+		bytes_per_second: None,
+		eta: None,
+		active_time: Duration::from_millis(millis),
+	}
+}
+
+#[test]
+fn an_entry_download_update_reports_milliseconds() {
+	let update = EntryDownloadUpdate::from(extract::EntryDownloadUpdate {
+		bytes_per_second: Some(9),
+		eta: Some(Duration::from_millis(1500)),
+		..entry_download_update(2500)
+	});
+	assert_eq!(
+		(
+			update.phase,
+			update.bytes_read,
+			update.archive_bytes,
+			update.bytes_written,
+			update.entry_bytes,
+			update.bytes_per_second,
+			update.eta_ms,
+			update.active_time_ms
+		),
+		(
+			EntryDownloadPhase::Reading,
+			40,
+			100,
+			12,
+			Some(30),
+			Some(9),
+			Some(1500),
+			2500
+		)
+	);
+}
+
+#[test]
+fn an_entry_download_report_carries_why_it_ended() {
+	let written = extract::EntryDownloadReport {
+		bytes_written: 7,
+		bytes_read: 9,
+		checked: true,
+	};
+	let report = EntryDownloadReport::new(Ok(written.clone()));
+	assert_eq!(
+		(report.bytes_written, report.bytes_read, report.checked),
+		(7, 9, true)
+	);
+	assert!(report.error.is_none());
+	let ended = Arc::new(Error::custom(ErrorKind::ArchiveWrongPassword, "wrong"));
+	let failed = EntryDownloadReport::new(Err(JobFailed {
+		report: extract::EntryDownloadReport {
+			checked: false,
+			..written
+		},
+		error: Arc::clone(&ended),
+	}));
+	assert_eq!(
+		(failed.bytes_written, failed.bytes_read, failed.checked),
+		(7, 9, false)
+	);
+	assert!(Arc::ptr_eq(failed.error.as_ref().unwrap(), &ended));
+
+	// a download the binding failed once it completed (its file could not take the path's
+	// place, its stream failed to close) delivered nothing checked
+	let undelivered = EntryDownloadReport::new(Err(JobFailed {
+		report: written,
+		error: Arc::new(Error::custom(ErrorKind::IO, "not closed")),
+	}));
+	assert_eq!((undelivered.bytes_written, undelivered.checked), (7, false));
+}
+
+impl DownloadArchiveEntryCallback for Recorder {
+	fn on_update(&self, update: EntryDownloadUpdate) {
+		self.push(update.active_time_ms);
+	}
+}
+
+#[test]
+fn entry_download_updates_are_delivered_in_order_until_the_job_lets_go() {
+	delivered_in_order(
+		|recorder, update| deliver_entry_download(recorder, update),
+		|sender| {
+			let channel = EntryDownloadChannel(sender);
+			let mut sent = Vec::new();
+			for i in 0..300 {
+				channel.on_update(entry_download_update(i));
+				sent.push(i);
+			}
+			sent
+		},
+	);
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+	let mut names: Vec<String> = std::fs::read_dir(dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	names.sort_unstable();
+	names
+}
+
+#[tokio::test]
+async fn an_entry_download_lands_at_its_path_only_once_whole() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("entry.bin");
+	std::fs::write(&path, b"old").unwrap();
+	let written = extract::EntryDownloadReport {
+		bytes_written: 3,
+		bytes_read: 5,
+		checked: true,
+	};
+	let whole = |report: extract::EntryDownloadReport| {
+		move |mut file: Compat<tokio::fs::File>| async move {
+			file.write_all(b"new").await.unwrap();
+			file.close().await.unwrap();
+			Ok(report)
+		}
+	};
+
+	// a download that ends early leaves the file at its path as it was, and nothing beside it
+	let failed = download_into(&path, |mut file| async move {
+		file.write_all(b"partial").await.unwrap();
+		Err(JobFailed {
+			report: extract::EntryDownloadReport::default(),
+			error: Arc::new(Error::custom(ErrorKind::ArchiveCorrupt, "damaged")),
+		})
+	})
+	.await
+	.unwrap();
+	assert_eq!(failed.unwrap_err().error.kind(), ErrorKind::ArchiveCorrupt);
+	assert_eq!(std::fs::read(&path).unwrap(), b"old");
+	assert_eq!(names_in(dir.path()), ["entry.bin"]);
+
+	// one that completes replaces it
+	let landed = download_into(&path, whole(written.clone())).await.unwrap();
+	assert_eq!(landed.unwrap(), written);
+	assert_eq!(std::fs::read(&path).unwrap(), b"new");
+	assert_eq!(names_in(dir.path()), ["entry.bin"]);
+
+	// one whose file cannot take the path's place fails with its report, its file removed
+	let taken = dir.path().join("taken");
+	std::fs::create_dir(&taken).unwrap();
+	std::fs::write(taken.join("inside"), b"kept").unwrap();
+	let refused = download_into(&taken, whole(written.clone()))
+		.await
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(
+		(refused.report, refused.error.kind()),
+		(written, ErrorKind::IO)
+	);
+	assert_eq!(names_in(dir.path()), ["entry.bin", "taken"]);
+	assert_eq!(names_in(&taken), ["inside"]);
+}
+
+#[test]
+fn a_foreign_entry_is_refused_before_the_download_starts() {
+	let call = |entry| {
+		EntryDownloadCall::new(
+			AnyFile::File(remote_file().into()),
+			entry,
+			None,
+			Some(0),
+			None,
+		)
+	};
+	let of_another = ArchiveEntryId {
+		archive: Uuid::from_u128(0xb),
+		index: 0,
+	};
+	let error = call(of_another).err().unwrap();
+	assert_eq!(error.kind(), ErrorKind::InvalidState);
+	assert!(
+		error
+			.to_string()
+			.contains("an entry chosen to extract is of another archive"),
+		"{error}"
+	);
+	let chosen = call(entry_id(3)).unwrap();
+	assert_eq!(
+		(chosen.archive.uuid(), chosen.entry),
+		(ARCHIVE, entry_id(3))
+	);
+}
+
+#[test]
+fn a_download_call_takes_the_sdks_expansion_limit_unless_it_names_one_but_never_a_solid_skip() {
+	let config = |expansion_limit, max_solid_skip| {
+		EntryDownloadCall::new(
+			AnyFile::File(remote_file().into()),
+			entry_id(0),
+			expansion_limit,
+			max_solid_skip,
+			None,
+		)
+		.unwrap()
+		.config
+	};
+	let left_out = config(None, None);
+	assert_eq!(
+		(left_out.expansion_limit, left_out.max_solid_skip),
+		(EntryDownloadConfig::default().expansion_limit, None),
+		"`None` allows any skip, unlike the Rust default"
+	);
+	let limit = ExpansionLimit {
+		ratio: 10,
+		floor: 1 << 20,
+	};
+	let named = config(Some(limit), Some(5));
+	assert_eq!(
+		(named.expansion_limit, named.max_solid_skip),
+		(Some(limit), Some(5))
 	);
 }
 
