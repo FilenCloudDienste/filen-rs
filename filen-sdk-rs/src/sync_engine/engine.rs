@@ -4542,9 +4542,11 @@ impl SyncEngine {
 	/// [`SyncEvent::DeletionsHeld`]).
 	///
 	/// The approval is ONE-SHOT and batch-specific: the next pass whose held deletions hash to the
-	/// same token applies them; any other batch — different paths, or a different reason to hold —
-	/// is held again under a fresh token, so an approval can never leak onto deletions the caller
-	/// never saw.
+	/// same token applies them; any other batch — different paths, or the same paths held for a
+	/// different kind of reason — is held again under a fresh token, so an approval can never leak
+	/// onto deletions the caller never saw, nor onto a hold it was never told about. The counts a
+	/// reason carries are not part of the token: a volume limit that moved because the tracked set
+	/// grew is still the same hold.
 	pub async fn approve_deletions(&self, pair: PairId, pass_token: &str) {
 		self.approvals
 			.lock()
@@ -5403,7 +5405,11 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		},
 		prep.record.delete_guard,
 	);
-	let pass_token = (!decision.held.is_empty()).then(|| deletion_batch_token(&decision.held));
+	// The guard names a reason exactly when it holds something, so a held batch always has one.
+	let pass_token = decision
+		.reason
+		.as_ref()
+		.map(|reason| deletion_batch_token(&decision.held, reason));
 	Screened {
 		conflicts,
 		all,
@@ -5635,10 +5641,26 @@ fn creates_before_dir_moves(actions: Vec<SyncAction>) -> Vec<SyncAction> {
 	ordered
 }
 
-/// A stable identifier for one held deletion batch: the sorted `(side, path)` lines hashed. The
-/// same set of held deletions always yields the same token, and adding, dropping or re-siding a
-/// single deletion yields a different one — which is what makes an approval batch-specific.
-fn deletion_batch_token(held: &[SyncAction]) -> String {
+/// A stable identifier for one held deletion batch: the kind of reason the guard held it for, then
+/// the sorted `(side, path)` lines, hashed. The same deletions held for the same kind of reason
+/// always yield the same token; adding, dropping or re-siding a single deletion yields a different
+/// one, and so does holding the very same deletions for another reason — which is what makes an
+/// approval specific to the batch AND to what the caller was told about it. Approving deletions
+/// over the volume limit must not release the same paths once they are held because the remote
+/// listed nothing at all.
+///
+/// The reason enters by its kind alone: the counts it carries are not something a caller approves.
+/// The deletion count is the batch's own size, which the lines already pin, and the limit moves
+/// with the tracked-item count, which an unrelated upload landing between the hold and the
+/// approval changes.
+fn deletion_batch_token(held: &[SyncAction], reason: &GuardReason) -> String {
+	let kind = match reason {
+		GuardReason::ScanIncomplete => "scan-incomplete",
+		GuardReason::FirstSyncWithDeletions { .. } => "first-sync",
+		GuardReason::RemoteUnconverged { .. } => "remote-unconverged",
+		GuardReason::RemoteEmptied { .. } => "remote-emptied",
+		GuardReason::ExceededThreshold { .. } => "over-limit",
+	};
 	let mut lines: Vec<String> = held
 		.iter()
 		.map(|action| match action {
@@ -5649,6 +5671,8 @@ fn deletion_batch_token(held: &[SyncAction]) -> String {
 		.collect();
 	lines.sort_unstable();
 	let mut hasher = blake3::Hasher::new();
+	hasher.update(kind.as_bytes());
+	hasher.update(b"\n");
 	for line in &lines {
 		hasher.update(line.as_bytes());
 		hasher.update(b"\n");
@@ -5852,6 +5876,68 @@ mod tests {
 				"{label}"
 			);
 		}
+	}
+
+	/// An approval names one batch AND the kind of reason it was held for: the same deletions held
+	/// for another reason are a hold the caller was never shown, so they get a token of their own.
+	/// The order the plan listed them in, and the counts a reason carries, are not part of it.
+	#[test]
+	fn a_held_batchs_token_names_its_deletions_and_the_kind_of_hold() {
+		let trash = |rel: &str| SyncAction::TrashRemote {
+			rel_path: rel.to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::from_u128(1),
+		};
+		let batch = vec![
+			trash("a.txt"),
+			trash("b/c.txt"),
+			SyncAction::DeleteLocal {
+				rel_path: "d.txt".to_string(),
+				kind: NodeKind::File,
+			},
+		];
+		let over = GuardReason::ExceededThreshold {
+			deletions: 3,
+			limit: 2,
+		};
+		let token = deletion_batch_token(&batch, &over);
+		assert_eq!(token.len(), 16);
+
+		let reordered: Vec<SyncAction> = batch.iter().rev().cloned().collect();
+		assert_eq!(
+			deletion_batch_token(&reordered, &over),
+			token,
+			"the same batch in another order"
+		);
+		assert_eq!(
+			deletion_batch_token(
+				&batch,
+				&GuardReason::ExceededThreshold {
+					deletions: 3,
+					limit: 1,
+				}
+			),
+			token,
+			"a limit that moved with the tracked set is still the same hold"
+		);
+
+		for other in [
+			GuardReason::ScanIncomplete,
+			GuardReason::FirstSyncWithDeletions { deletions: 3 },
+			GuardReason::RemoteUnconverged { deletions: 3 },
+			GuardReason::RemoteEmptied { deletions: 3 },
+		] {
+			assert_ne!(
+				deletion_batch_token(&batch, &other),
+				token,
+				"the same deletions held for {other:?} must not take an approval of the volume hold"
+			);
+		}
+		assert_ne!(
+			deletion_batch_token(&batch[..2], &over),
+			token,
+			"a batch with one deletion fewer is another batch"
+		);
 	}
 
 	#[test]

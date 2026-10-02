@@ -331,7 +331,7 @@ pub struct PlanOutcome {
 	pub held: Vec<PlannedAction>,
 	/// Why the guard would hold; set exactly when `held` is non-empty.
 	pub held_reason: Option<GuardReason>,
-	/// The token identifying the held batch, for
+	/// The token identifying the held batch and the kind of reason it is held for, for
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). Set alongside
 	/// `held`.
 	pub pass_token: Option<String>,
