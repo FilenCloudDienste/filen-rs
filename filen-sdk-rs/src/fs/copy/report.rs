@@ -294,8 +294,7 @@ impl<D> From<CopyFailed<D>> for Error {
 		let CopyFailed { report, error } = failed;
 		// the report may hold the error too, in the failure it came from
 		drop(report);
-		Arc::try_unwrap(error)
-			.unwrap_or_else(|shared| Error::custom_with_source(shared.kind(), shared, None::<&str>))
+		Error::unshared(error)
 	}
 }
 

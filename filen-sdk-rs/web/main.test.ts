@@ -2287,6 +2287,7 @@ test("copyItems pauses, resumes and cancels through managedFuture", async () => 
 		onTopLevelPlanned: () => controller.abort(),
 		managedFuture: { abortSignal: controller.signal }
 	})
+	expect(cancelled.error).toBeInstanceOf(FilenSdkError)
 	expect(cancelled.error?.kind).toBe("Cancelled")
 	expect(cancelled.counts.filesDone + cancelled.counts.filesFailed + cancelled.counts.filesNotAttempted).toBe(cancelled.totals.files)
 })
@@ -2298,12 +2299,21 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	const missing = { ...real, uuid: crypto.randomUUID() }
 	const destination = await state.createDir(parent, "destination")
 
-	const report = await state.copyItems({ items: [missing, real], destination })
+	const updates: CopyUpdate[] = []
+	const report = await state.copyItems({ items: [missing, real], destination, onUpdate: update => updates.push(update) })
 	expect(report.error).toBeUndefined()
 	expect(report.failures).toHaveLength(1)
 	const [failure] = report.failures
 	expect(failure.info.stage.type).toBe("download")
+	expect(failure.info.error).toBeInstanceOf(FilenSdkError)
 	expect(failure.info.error.kind).toBe("FileChunkNotFound")
+	// the update's event carries the same error, read the same, though the report still held it then
+	const failed = updates.flatMap(u => u.events).filter(e => e.type === "fileFailed")
+	expect(failed).toHaveLength(1)
+	expect(failed[0].error).toBeInstanceOf(FilenSdkError)
+	expect(failed[0].error.kind).toBe("FileChunkNotFound")
+	expect(failed[0].error.message).toBe(failure.info.error.message)
+	expect(failed[0].error.inner_message()).toBe(failure.info.error.inner_message())
 	expect(failure.info.destParent).toBe(destination.uuid)
 	expect(failure.info.destParentDir.uuid).toBe(destination.uuid)
 	expect((failure.item as { uuid: string }).uuid).toBe(missing.uuid)

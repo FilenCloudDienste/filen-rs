@@ -262,6 +262,9 @@ impl FilenSdkError {
 		wasm_bindgen::prelude::wasm_bindgen
 	)]
 	pub fn inner_message(&self) -> Option<String> {
+		if let Some(shared) = self.stand_in_for() {
+			return shared.inner_message();
+		}
 		self.inner.as_ref().map(|inner| inner.to_string())
 	}
 }
@@ -317,6 +320,24 @@ impl FilenSdkError {
 			inner: Some(Box::new(source)),
 			context: context.map(Into::into),
 		}
+	}
+
+	/// The error `shared` holds: the original once nothing else holds it, or else an error of
+	/// the same kind wrapping the shared one, which reads as it (its message, inner message and
+	/// server code) and keeps its downcasting.
+	pub(crate) fn unshared(shared: Arc<Self>) -> Self {
+		Arc::try_unwrap(shared)
+			.unwrap_or_else(|shared| Self::custom_with_source(shared.kind(), shared, None::<&str>))
+	}
+
+	/// The shared error this one stands in for, made by [`Self::unshared`]: one of the same kind,
+	/// with no context of its own, wrapping nothing but it.
+	fn stand_in_for(&self) -> Option<&Self> {
+		if self.context.is_some() {
+			return None;
+		}
+		let shared = self.inner.as_deref()?.downcast_ref::<Arc<Self>>()?;
+		(shared.kind == self.kind).then_some(shared)
 	}
 
 	/// Tries to downcast the error to a specific type
@@ -398,6 +419,9 @@ impl FilenSdkError {
 
 impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if let Some(shared) = self.stand_in_for() {
+			return shared.fmt(f);
+		}
 		write!(f, "Error of kind {:?}", self.kind)?;
 		if let Some(context) = &self.context {
 			write!(f, ": context: {}", context)?;
@@ -793,6 +817,43 @@ mod tests {
 		let source = returned.inner.as_deref().unwrap();
 		assert!(source.downcast_ref::<Arc<Error>>().is_some());
 		assert!(returned.downcast_ref::<io::Error>().is_some());
+	}
+
+	#[test]
+	fn an_unshared_error_still_held_elsewhere_reads_as_the_shared_one() {
+		let shared = Arc::new(
+			Error::from(filen_types::error::ResponseError::ApiError {
+				message: Some("Max storage reached".into()),
+				code: Some("max_storage_reached".into()),
+			})
+			.with_context("upload"),
+		);
+		let unshared = Error::unshared(Arc::clone(&shared));
+		assert!(
+			unshared.downcast_ref::<Arc<Error>>().is_some(),
+			"a stand-in"
+		);
+		assert_eq!(unshared.kind(), ErrorKind::MaxStorageReached);
+		assert_eq!(unshared.message(), shared.message());
+		assert_eq!(unshared.inner_message(), shared.inner_message());
+		assert_eq!(
+			unshared.server_code().as_deref(),
+			Some("max_storage_reached")
+		);
+		assert_eq!(
+			unshared.server_message().as_deref(),
+			Some("Max storage reached")
+		);
+	}
+
+	#[test]
+	fn an_error_wrapping_a_shared_one_with_its_own_context_reads_as_itself() {
+		let shared = Arc::new(Error::custom(ErrorKind::IO, "leaf"));
+		let outer = Error::custom_with_source(ErrorKind::IO, Arc::clone(&shared), Some("outer"));
+		assert_eq!(
+			outer.message(),
+			"Error of kind IO: context: outer, error: Error of kind IO: context: leaf"
+		);
 	}
 
 	#[test]

@@ -1,6 +1,11 @@
 //! `copyItems` / `copyItemsTo` for the wasm and uniffi bindings. Both platforms take the same
 //! items and report the same types; the job's callbacks reach the caller in the order the job
 //! made them, all before the call returns.
+//!
+//! A report or update carries an error as the SDK error itself ([`CopyError`]), as the calls
+//! throw it. On wasm only the JS thread can make one, so the updates and the report are built
+//! from the job's own types as they are delivered, or once the job has returned, never on the
+//! commander thread the job runs on.
 
 use std::{sync::Arc, time::Duration};
 
@@ -42,26 +47,27 @@ pub struct CopyEntry {
 	pub name: Option<String>,
 }
 
-/// An error in a copy's progress or report. On uniffi it is the SDK error itself, as in the
-/// other uniffi records that carry one (`UploadError`, `DownloadError`).
+/// An error in a copy's progress or report: the SDK error itself, as the calls throw it. On
+/// uniffi it is the error's `Arc`, as in the other uniffi records that carry one
+/// (`UploadError`, `DownloadError`).
 #[cfg(feature = "uniffi")]
 pub type CopyError = Arc<Error>;
 
-/// An error in a copy's progress or report: the parts of the SDK error, not the error itself. A
-/// tsify record cannot hold the wasm_bindgen `FilenSdkError` class, and the `JsValue` that
-/// could carry one cannot be made on the commander thread, where the copy builds its updates and
-/// its report.
+/// An error in a copy's progress or report: the SDK error itself, the `FilenSdkError` class the
+/// calls throw. Only the JS thread can make one, so the records holding it are built there, as
+/// their callbacks are delivered and once the copy has returned, never on the commander thread
+/// the copy runs on; that the type is not `Send` keeps it so.
 #[cfg(not(feature = "uniffi"))]
-#[js_type(export, no_deser)]
-pub struct CopyError {
-	pub kind: ErrorKind,
-	pub message: String,
-	/// The server's message, for errors the server returned.
-	pub server_message: Option<String>,
-	pub server_code: Option<String>,
-	/// The wrapped error's message, without the `Error of kind ...` of `message`.
-	pub inner_message: Option<String>,
-}
+#[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
+pub struct CopyError(
+	#[cfg_attr(
+		feature = "wasm-full",
+		serde(with = "serde_wasm_bindgen::preserve"),
+		tsify(type = "FilenSdkError")
+	)]
+	wasm_bindgen::JsValue,
+);
 
 #[derive(Debug, Clone)]
 #[js_type(export, no_deser, no_default)]
@@ -281,21 +287,18 @@ fn requests_to(entries: Vec<CopyEntry>) -> Result<Vec<CopyRequest>, Error> {
 	entries.into_iter().map(TryFrom::try_from).collect()
 }
 
+/// `error` for a copy's record.
 #[cfg(feature = "uniffi")]
 fn copy_error(error: Arc<Error>) -> CopyError {
 	error
 }
 
-// Takes the Arc, though it only reads the error, to share its signature with the uniffi twin.
+/// `error` for a copy's record, made on the JS thread (see [`CopyError`]): the error itself when
+/// nothing else holds it, else an error of the same kind wrapping the shared one, which reads as
+/// it.
 #[cfg(not(feature = "uniffi"))]
 fn copy_error(error: Arc<Error>) -> CopyError {
-	CopyError {
-		kind: error.kind(),
-		message: error.message(),
-		server_message: error.server_message(),
-		server_code: error.server_code(),
-		inner_message: error.inner_message(),
-	}
+	CopyError(wasm_bindgen::JsValue::from(Error::unshared(error)))
 }
 
 impl From<FailureInfo> for CopyFailureInfo {
@@ -449,11 +452,23 @@ impl From<CopyFailed> for CopyReport {
 	}
 }
 
-/// A callback of the job, converted for the bindings.
+impl CopyReport {
+	/// How a copy ended, for the bindings: one that ended early still resolves, with the report
+	/// of what it did.
+	fn new(result: Result<super::CopyReport, CopyFailed>) -> Self {
+		match result {
+			Ok(report) => report.into(),
+			Err(failed) => failed.into(),
+		}
+	}
+}
+
+/// A callback of the job, for the bindings: the binding's delivery task converts the update (see
+/// the module docs).
 enum Delivery {
 	TopLevelPlanned(Vec<CopyPlannedItem>),
 	TopLevelCreated(CopiedTopLevelItem),
-	Update(CopyUpdate),
+	Update(super::CopyUpdate),
 }
 
 /// Passes the job's callbacks to the binding's delivery task over one channel, which keeps
@@ -472,31 +487,27 @@ impl CopyCallback for DeliveryChannel {
 	}
 
 	fn on_update(&self, update: super::CopyUpdate) {
-		let _ = self.0.send(Delivery::Update(update.into()));
+		let _ = self.0.send(Delivery::Update(update));
 	}
 }
 
-/// Runs the copy as the job of a managed future, its callbacks going to `sender`.
+/// Runs the copy as the job of a managed future, its callbacks going to `sender`. Its result
+/// becomes the binding's report once the job has returned (see the module docs).
 async fn copy_job(
 	client: Arc<Client>,
 	requests: Vec<CopyRequest>,
 	max_bytes: Option<u64>,
 	sender: UnboundedSender<Delivery>,
 	control: JobControl,
-) -> Result<CopyReport, Error> {
-	let result = client
+) -> Result<Result<super::CopyReport, CopyFailed>, Error> {
+	Ok(client
 		.copy_items_to(
 			requests,
 			CopyConfig { max_bytes },
 			DeliveryChannel(sender),
 			control,
 		)
-		.await;
-	// a copy that ended early still resolves, with the report of what it did
-	Ok(match result {
-		Ok(report) => report.into(),
-		Err(failed) => failed.into(),
-	})
+		.await)
 }
 
 #[cfg(feature = "uniffi")]
@@ -537,7 +548,7 @@ mod uniffi_impl {
 		match delivery {
 			Delivery::TopLevelPlanned(items) => callback.on_top_level_planned(items),
 			Delivery::TopLevelCreated(item) => callback.on_top_level_created(item),
-			Delivery::Update(update) => callback.on_update(update),
+			Delivery::Update(update) => callback.on_update(update.into()),
 		}
 	}
 
@@ -560,7 +571,7 @@ mod uniffi_impl {
 		// the job has ended and dropped its sender: this returns once everything it reported
 		// was delivered
 		let _ = delivered.await;
-		result
+		result.map(CopyReport::new)
 	}
 
 	#[uniffi::export]
@@ -615,7 +626,8 @@ mod wasm_impl {
 	};
 
 	use super::{
-		Client, CopyEntry, CopyReport, CopyRequest, Delivery, copy_job, requests_into, requests_to,
+		Client, CopyEntry, CopyReport, CopyRequest, CopyUpdate, Delivery, copy_job, requests_into,
+		requests_to,
 	};
 
 	#[js_type(import, no_ser, no_default)]
@@ -680,7 +692,9 @@ mod wasm_impl {
 					call(self.on_top_level_planned.as_ref(), &items)
 				}
 				Delivery::TopLevelCreated(item) => call(self.on_top_level_created.as_ref(), &item),
-				Delivery::Update(update) => call(self.on_update.as_ref(), &update),
+				Delivery::Update(update) => {
+					call(self.on_update.as_ref(), &CopyUpdate::from(update))
+				}
 			}
 		}
 	}
@@ -724,7 +738,7 @@ mod wasm_impl {
 		// the job has ended and dropped its sender: everything it reported reaches its
 		// callback before the result does
 		let _ = drained_receiver.await;
-		result
+		result.map(CopyReport::new)
 	}
 
 	#[wasm_bindgen(js_class = "Client")]
