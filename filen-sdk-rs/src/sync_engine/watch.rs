@@ -277,7 +277,12 @@ impl SyncEngine {
 		let (record, removed) = self.watchable_pair(pair).await?;
 		let local_root = PathBuf::from(&record.local_root);
 
-		let dirty = Arc::new(Notify::new());
+		// The pair's changelists. The local handler below records what changed into them and a pass
+		// takes them; the engine holds the same ones, so a one-shot `sync_once` reads the same set.
+		let changes = self.pair_changes(pair).await;
+		// The pair's own doorbell rather than one of this watch's: the engine rings it too, when a
+		// caller approves held deletions (`approve_deletions`).
+		let dirty = changes.doorbell();
 		// Created before either trigger source, so a source that fails to start can say so.
 		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
 
@@ -313,9 +318,6 @@ impl SyncEngine {
 		// Local-change trigger: a recursive filesystem watcher on the local root. The watcher
 		// reports canonicalized paths, so the root it filters against must be canonical too.
 		let watch_root = std::fs::canonicalize(&local_root).unwrap_or_else(|_| local_root.clone());
-		// The pair's changelists. The handler below records what changed into them and a pass takes
-		// them; the engine holds the same ones, so a one-shot `sync_once` reads the same set.
-		let changes = self.pair_changes(pair).await;
 		let handler = local_event_handler(
 			pair,
 			watch_root,
@@ -426,7 +428,9 @@ struct WatchLoop {
 	engine: Arc<SyncEngine>,
 	pair: PairId,
 	config: WatchConfig,
-	/// The one signal both trigger sources ring: the local watcher and the remote sync root.
+	/// The one signal both trigger sources ring — the local watcher and the remote sync root — and
+	/// the engine rings on an approval of held deletions: the pair's doorbell
+	/// (`PairChanges::doorbell`).
 	dirty: Arc<Notify>,
 	/// Changes whenever the engine's user ignore rules do.
 	rules: tokio::sync::watch::Receiver<u64>,

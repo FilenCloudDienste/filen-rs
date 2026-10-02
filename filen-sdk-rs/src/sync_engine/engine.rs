@@ -4547,11 +4547,23 @@ impl SyncEngine {
 	/// onto deletions the caller never saw, nor onto a hold it was never told about. The counts a
 	/// reason carries are not part of the token: a volume limit that moved because the tracked set
 	/// grew is still the same hold.
+	///
+	/// The pair's next pass is made due and whole, since a hold on its own leaves a watched pair
+	/// idle (see [`FullPassReason::DeletionHold`]), and a [`watch`](Self::watch) running on the
+	/// pair is woken for it, so the approved batch is applied within the watch's debounce rather
+	/// than at its next change or safety-net pass. Without a watch, the next
+	/// [`sync_once`](Self::sync_once) is that pass.
 	pub async fn approve_deletions(&self, pair: PairId, pass_token: &str) {
 		self.approvals
 			.lock()
 			.await
 			.insert(pair, pass_token.to_string());
+		// After the approval is stored, so the pass this wakes finds it. A pair with no changelist
+		// is gone, or has not passed yet: its next pass reads everything anyway.
+		if let Some(changes) = self.existing_pair_changes(pair).await {
+			changes.force(FullPassReason::DeletionHold);
+			changes.ring();
+		}
 	}
 
 	/// Consume a pending approval for `pair` if it names exactly this batch.
@@ -8935,6 +8947,49 @@ mod tests {
 			Err(error) => error.to_string(),
 		};
 		assert!(unknown.contains("unknown sync pair"), "{unknown}");
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A hold leaves a watched pair idle, so an approval has to give the pair its next pass itself:
+	/// due, whole, and announced on the doorbell its watch waits on — or the approved batch waits
+	/// for whatever wakes the watch next, often the safety net minutes later.
+	#[tokio::test]
+	async fn an_approval_makes_the_next_pass_due_and_wakes_the_watch() {
+		let path = std::env::temp_dir().join(format!("filen_sync_approve_{}.db", Uuid::new_v4()));
+		let engine = SyncEngine::open(offline_client(), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let changes = engine.pair_changes(pair).await;
+		changes.cover_local();
+		changes.note_deletion_hold();
+		let doorbell = changes.doorbell();
+		assert!(changes.is_idle(), "a hold alone wakes nothing");
+		assert!(
+			doorbell.notified().now_or_never().is_none(),
+			"nothing has rung yet"
+		);
+
+		engine.approve_deletions(pair, "0123456789abcdef").await;
+
+		assert!(
+			doorbell.notified().now_or_never().is_some(),
+			"the approval must wake the pair's watch"
+		);
+		assert!(!changes.is_idle(), "the approved pass is due");
+		assert_eq!(
+			changes.take().full_pass_reason(10),
+			Some(FullPassReason::DeletionHold),
+			"and reads whole, the only read that reproduces the batch"
+		);
+		assert!(
+			engine.take_approval(pair, "0123456789abcdef").await,
+			"the approval itself is stored for that pass"
+		);
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
