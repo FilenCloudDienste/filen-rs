@@ -1,7 +1,8 @@
 //! The archive as a reading codec gets it, for an extraction, a listing and a compression's
 //! read-back alike: fetched chunk by chunk as the codec asks, a few chunks ahead when the
-//! client's memory has room right now, and hashed as it is read; and the one loop their drivers
-//! share to serve it, take its events and its result, and give it up when it stops moving.
+//! client's memory has room right now, and hashed as it is read; and the driver of a job that
+//! only reads its archive (a listing), which serves it, takes its events and its result, and
+//! gives it up when it stops moving.
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -11,14 +12,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::{
 	Error, ErrorKind,
-	consts::{CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
+	consts::{CALLBACK_INTERVAL, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
 	fs::{
 		HasUUID,
 		archive::{
 			config::ArchiveConfig,
-			worker::{StallWatch, WorkerEvent, WorkerLink, worker_died},
+			extract::report::ReadsArchive,
+			worker::{StallWatch, WorkerEvent, WorkerLink, codec_failed, worker_died},
 		},
-		drive_job::{backend::DriveBackend, cancelled},
+		drive_job::{Fatal, backend::DriveBackend, cancelled},
 		file::{
 			enums::RemoteFileType,
 			read::{check_chunks_consistent, chunk_plaintext_len},
@@ -29,7 +31,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{JobPhase, JobState, OpGuard, Ops, Reporter},
 	},
-	util::{MaybeArc, MaybeSendBoxFuture},
+	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, sleep},
 };
 
 /// Chunks fetched ahead of a codec, memory permitting: of the archive it reads, or of the
@@ -475,6 +477,116 @@ pub(crate) async fn start_reading<B: DriveBackend, S: JobState, T>(
 	reporter.set_phase(reading);
 	let link = start().map_err(|error| (S::Phase::FAILED, Arc::new(error)))?;
 	Ok((lease, CodecFeed::new(backend, archive, link, reporter.op())))
+}
+
+/// Takes a read-only job's codec events, one at a time, in archive order.
+pub(crate) trait FeedSink {
+	/// Takes `event`; `Err` ends the job with that error.
+	fn take(&mut self, event: WorkerEvent) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+}
+
+/// The driver of a job that only reads its archive (a listing): it creates nothing.
+pub(crate) struct ReadingDriver<'j, B, S: JobState, T> {
+	feed: CodecFeed<B, T>,
+	control: &'j JobControl,
+	reporter: &'j MaybeArc<Reporter<S>>,
+	/// How the archive ended, once the codec returned it.
+	pub(crate) end: Option<T>,
+	pub(crate) fatal: Fatal,
+}
+
+impl<'j, B: DriveBackend, S: ReadsArchive, T> ReadingDriver<'j, B, S, T> {
+	pub(crate) fn new(
+		feed: CodecFeed<B, T>,
+		control: &'j JobControl,
+		reporter: &'j MaybeArc<Reporter<S>>,
+	) -> Self {
+		Self {
+			feed,
+			control,
+			reporter,
+			end: None,
+			fatal: Fatal::default(),
+		}
+	}
+
+	/// Serves the codec until it has returned, handing its events to `sink`; `Err` when stopped.
+	pub(crate) async fn run(&mut self, sink: &mut impl FeedSink) -> Result<(), Stopped> {
+		loop {
+			let pause_requested = self.control.is_pause_requested();
+			self.reporter.set_pause_requested(pause_requested);
+			if self.control.is_stopping() {
+				// nothing a job that only reads has to finish
+				self.feed.drop_all();
+				self.reporter.wind_down(self.control);
+				return Err(Stopped);
+			}
+			if self.feed.events_closed() && (self.end.is_some() || self.fatal.error().is_some()) {
+				self.feed.release();
+				return Ok(());
+			}
+			if pause_requested {
+				if !self.feed.fetching() {
+					self.feed
+						.wait_out_pause(self.reporter, self.control)
+						.await?;
+					continue;
+				}
+			} else {
+				self.feed.advance(&self.reporter.ops());
+				self.report_bytes_read();
+			}
+			tokio::select! {
+				biased;
+				() = self.control.stopping() => {},
+				() = self.control.pause_changed(pause_requested) => {},
+				fed = self.feed.next(!pause_requested, true) => match fed {
+					Fed::Fetched(result) => {
+						if let Err(error) = result {
+							self.fatal.stop(Arc::new(error), self.control, &**self.reporter);
+						}
+						self.report_bytes_read();
+					}
+					Fed::Asked => self.report_bytes_read(),
+					Fed::Event(event) => {
+						if let Err(error) = sink.take(event).await {
+							self.fatal.stop(Arc::new(error), self.control, &**self.reporter);
+						}
+					}
+					Fed::EventsClosed => {}
+					Fed::Finished(result) => self.codec_finished(result),
+				},
+				() = sleep(CALLBACK_INTERVAL) => self.tick(pause_requested),
+			}
+		}
+	}
+
+	fn codec_finished(&mut self, result: Result<T, Error>) {
+		match result {
+			Ok(end) => self.end = Some(end),
+			Err(error) => {
+				// an error the driver caused (it failed a fetch) is already the job's
+				let archive = self.feed.archive().uuid();
+				if codec_failed(archive, &error, self.fatal.error().is_some()) {
+					self.fatal.record(Arc::new(error));
+				}
+			}
+		}
+	}
+
+	/// Reports the bytes of the archive the codec has read.
+	fn report_bytes_read(&self) {
+		self.reporter.set_bytes_read(self.feed.bytes_read());
+	}
+
+	fn tick(&mut self, pause_requested: bool) {
+		self.report_bytes_read();
+		self.reporter.tick();
+		if self.feed.give_up_if_stalled(pause_requested) {
+			self.fatal
+				.stop(Arc::new(worker_died()), self.control, &**self.reporter);
+		}
+	}
 }
 
 #[cfg(test)]

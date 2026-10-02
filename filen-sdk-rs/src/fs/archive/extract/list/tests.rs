@@ -12,6 +12,7 @@ use crate::{
 	ErrorKind,
 	consts::CHUNK_SIZE,
 	fs::{
+		HasUUID,
 		archive::{
 			extract::test_support::{ListRecorder, Listing, Setup, list, setup, test_config},
 			format::StreamCodec,

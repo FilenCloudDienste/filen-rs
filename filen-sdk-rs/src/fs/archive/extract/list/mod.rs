@@ -7,28 +7,26 @@ use chrono::{DateTime, Utc};
 use filen_macros::js_type;
 
 use crate::{
-	consts::CALLBACK_INTERVAL,
+	Error,
 	fs::{
-		HasUUID,
 		archive::{
 			config::ArchiveConfig,
 			format::ArchiveFormat,
-			input::{CodecFeed, Fed, ReadingJob, start_reading},
-			worker::{CodecStart, WorkerEvent, codec_failed, unexpected_event, worker_died},
+			input::{FeedSink, ReadingDriver, ReadingJob, start_reading},
+			worker::{CodecStart, WorkerEvent, unexpected_event},
 		},
-		drive_job::{Fatal, backend::DriveBackend},
+		drive_job::backend::DriveBackend,
 		file::enums::RemoteFileType,
 	},
 	job::{
-		self, JobControl, Stopped,
+		self, JobControl,
 		report::{JobFailed, JobPhase, JobReport, JobState, Progress, RunCore, Snapshot, Units},
 	},
-	util::{MaybeArc, MaybeSendSync, sleep},
+	util::{MaybeArc, MaybeSendSync},
 };
 
 use super::{
 	DuplicateEntries, ExtractSkipReason,
-	codec::ArchiveEnd,
 	engine::CodecResult,
 	report::{ArchiveEntryId, CALLBACK_BATCH, ReadsArchive, RunState},
 };
@@ -520,28 +518,20 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 			});
 		}
 	};
-	let mut lister = Lister {
-		feed,
-		kept_bytes: 0,
-		control,
-		reporter,
-		end: None,
-		fatal: Fatal::default(),
-	};
-	let outcome = lister.run(&mut listing).await;
-	let Lister {
-		control,
-		reporter,
-		fatal,
-		end,
-		..
-	} = lister;
-	if let Some(end) = end {
+	let mut driver = ReadingDriver::new(feed, &control, &reporter);
+	let outcome = driver
+		.run(&mut ListSink {
+			listing: &mut listing,
+			kept_bytes: 0,
+			reporter: &reporter,
+		})
+		.await;
+	if let Some(end) = driver.end {
 		listing.password = end.password;
 		listing.unaccounted_bytes = end.unaccounted_bytes;
 		listing.duplicates = end.duplicates;
 	}
-	let (phase, result) = fatal.end(outcome, &control, ListReport::NAME);
+	let (phase, result) = driver.fatal.end(outcome, &control, ListReport::NAME);
 	reporter.finish(phase);
 	match result {
 		Ok(()) => Ok(listing),
@@ -552,71 +542,21 @@ pub(crate) async fn run_list<B: DriveBackend>(task: ListTask<B>) -> Result<ListR
 	}
 }
 
-/// The async driver of a listing's codec: it only ever reads the archive, and creates nothing.
-struct Lister<B> {
-	feed: CodecFeed<B, ArchiveEnd>,
+/// Takes a listing's codec events: the entries it lists, kept in `listing` and handed to the
+/// callback.
+struct ListSink<'l> {
+	listing: &'l mut ListReport,
 	/// The text of the entries the listing keeps.
 	kept_bytes: usize,
-	control: JobControl,
-	reporter: MaybeArc<ListReporter>,
-	/// How the archive ended, once the codec returned it.
-	end: Option<ArchiveEnd>,
-	fatal: Fatal,
+	reporter: &'l ListReporter,
 }
 
-impl<B: DriveBackend> Lister<B> {
-	/// Serves the codec until it has returned; `Err` when stopped.
-	async fn run(&mut self, listing: &mut ListReport) -> Result<(), Stopped> {
-		loop {
-			let pause_requested = self.control.is_pause_requested();
-			self.reporter.set_pause_requested(pause_requested);
-			if self.control.is_stopping() {
-				// nothing a listing does has to finish
-				self.feed.drop_all();
-				self.reporter.wind_down(&self.control);
-				return Err(Stopped);
-			}
-			if self.feed.events_closed() && (self.end.is_some() || self.fatal.error().is_some()) {
-				self.feed.release();
-				return Ok(());
-			}
-			if pause_requested {
-				if !self.feed.fetching() {
-					self.feed
-						.wait_out_pause(&self.reporter, &self.control)
-						.await?;
-					continue;
-				}
-			} else {
-				self.feed.advance(&self.reporter.ops());
-				self.report_bytes_read();
-			}
-			tokio::select! {
-				biased;
-				() = self.control.stopping() => {},
-				() = self.control.pause_changed(pause_requested) => {},
-				fed = self.feed.next(!pause_requested, true) => match fed {
-					Fed::Fetched(result) => {
-						if let Err(error) = result {
-							self.fatal.stop(Arc::new(error), &self.control, &*self.reporter);
-						}
-						self.report_bytes_read();
-					}
-					Fed::Asked => self.report_bytes_read(),
-					Fed::Event(event) => self.on_event(event, listing),
-					Fed::EventsClosed => {}
-					Fed::Finished(result) => self.codec_finished(result),
-				},
-				() = sleep(CALLBACK_INTERVAL) => self.tick(pause_requested),
-			}
-		}
-	}
-
-	fn on_event(&mut self, event: WorkerEvent, listing: &mut ListReport) {
+impl FeedSink for ListSink<'_> {
+	async fn take(&mut self, event: WorkerEvent) -> Result<(), Error> {
 		match event {
-			WorkerEvent::Opened(format) => listing.format = Some(format),
+			WorkerEvent::Opened(format) => self.listing.format = Some(format),
 			WorkerEvent::Listed(entry) => {
-				add_entry(listing, &mut self.kept_bytes, &entry);
+				add_entry(self.listing, &mut self.kept_bytes, &entry);
 				self.reporter.listed(*entry);
 			}
 			// the feed answers asks, and a listing's codec sends nothing else
@@ -626,38 +566,9 @@ impl<B: DriveBackend> Lister<B> {
 			| WorkerEvent::Data(_)
 			| WorkerEvent::FileEnd
 			| WorkerEvent::Link(_)
-			| WorkerEvent::Head(_) => {
-				self.fatal
-					.stop(Arc::new(unexpected_event()), &self.control, &*self.reporter);
-			}
+			| WorkerEvent::Head(_) => return Err(unexpected_event()),
 		}
-	}
-
-	fn codec_finished(&mut self, result: CodecResult) {
-		match result {
-			Ok(end) => self.end = Some(end),
-			Err(error) => {
-				// an error the driver caused (it failed a fetch) is already the job's
-				let archive = self.feed.archive().uuid();
-				if codec_failed(archive, &error, self.fatal.error().is_some()) {
-					self.fatal.record(Arc::new(error));
-				}
-			}
-		}
-	}
-
-	/// Reports the bytes of the archive the codec has read.
-	fn report_bytes_read(&self) {
-		self.reporter.set_bytes_read(self.feed.bytes_read());
-	}
-
-	fn tick(&mut self, pause_requested: bool) {
-		self.report_bytes_read();
-		self.reporter.tick();
-		if self.feed.give_up_if_stalled(pause_requested) {
-			self.fatal
-				.stop(Arc::new(worker_died()), &self.control, &*self.reporter);
-		}
+		Ok(())
 	}
 }
 
