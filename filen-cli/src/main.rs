@@ -92,9 +92,9 @@ pub(crate) struct CliArgs {
 	#[arg(long)]
 	memory_budget_bytes: Option<usize>,
 
-	/// Connection timeout
+	/// Connection timeout, in seconds
 	#[arg(long)]
-	connect_timeout: Option<u64>,
+	connect_timeout_secs: Option<u64>,
 
 	/// Skip checking for updates
 	#[arg(long)]
@@ -281,7 +281,7 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		upload_bandwidth_kbps: cli_args.upload_bandwidth_kbps,
 		download_bandwidth_kbps: cli_args.download_bandwidth_kbps,
 		memory_budget_bytes: cli_args.memory_budget_bytes,
-		connect_timeout_secs: cli_args.connect_timeout,
+		connect_timeout_secs: cli_args.connect_timeout_secs,
 	};
 
 	let mut client = auth::LazyClient::new(
