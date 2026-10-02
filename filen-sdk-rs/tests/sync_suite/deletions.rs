@@ -224,15 +224,58 @@ async fn delete_03_nonempty_directory_subtree_removed() {
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, 4, "{r1:?}");
 	assert_eq!(r1.remote_dirs_created, 2, "docs + docs/sub: {r1:?}");
+	let (dirs, _) = list_root(&sc).await;
+	let docs = find_dir(&dirs, "docs").expect("docs/ missing on remote");
+	let (sub_dirs, docs_files) = list_dir(&sc, docs).await;
+	let sub = find_dir(&sub_dirs, "sub").expect("docs/sub missing on remote");
+	let (_, sub_files) = list_dir(&sc, sub).await;
+	let under_docs: Vec<Uuid> = docs_files
+		.iter()
+		.map(HasUUID::uuid)
+		.chain(std::iter::once(sub.uuid()))
+		.chain(sub_files.iter().map(HasUUID::uuid))
+		.collect();
+	assert_eq!(under_docs.len(), 4, "a.txt, b.txt, sub, sub/c.txt");
 
+	// Held across the pass and the listing: another leg's account-wide empty-trash would otherwise
+	// take `docs` out of the trash before the listing finds it.
+	let _trash_lock = sc
+		.resources
+		.client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
 	std::fs::remove_dir_all(sc.local.join("docs")).unwrap();
 	let r2 = sc.sync().await;
 	assert!(r2.errors.is_empty(), "{r2:?}");
-	assert!(
-		r2.remotely_trashed > 0,
-		"the directory delete must remove items, not zero: {r2:?}"
+	assert_eq!(
+		r2.remotely_trashed, 1,
+		"the directory is trashed whole, its subtree with it: {r2:?}"
 	);
 	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
+
+	// One entry in the Filen trash, the directory, holding everything that was in it — not each
+	// file trashed loose beside an emptied folder.
+	let (trashed_dirs, trashed_files) = sc
+		.resources
+		.client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert!(
+		trashed_dirs.iter().any(|dir| dir.uuid() == docs.uuid()),
+		"docs/ is not in the Filen trash"
+	);
+	let loose: Vec<Uuid> = trashed_dirs
+		.iter()
+		.map(HasUUID::uuid)
+		.chain(trashed_files.iter().map(HasUUID::uuid))
+		.filter(|uuid| under_docs.contains(uuid))
+		.collect();
+	assert!(
+		loose.is_empty(),
+		"items under docs/ were trashed one by one: {loose:?}"
+	);
 
 	let (dirs, files) = list_root(&sc).await;
 	assert!(find_dir(&dirs, "docs").is_none(), "docs/ survived");
