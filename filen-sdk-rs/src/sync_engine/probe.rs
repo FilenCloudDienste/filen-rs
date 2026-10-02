@@ -568,9 +568,8 @@ fn side_owned_bytes<V: FromRow>(
 /// The same convention as [`Baseline::resident_bytes`] and [`side_owned_bytes`] — capacities and heap
 /// allocations summed by the structures themselves — which is what lets the three be added up and
 /// set against a resident set. It is an ATTRIBUTION and not a measurement of the process: it
-/// cannot see table slack above `capacity`, the allocator's retention or the cache DB's mapped
-/// pages, and those are exactly the remainder a memory table has to print beside it rather than
-/// fold in.
+/// cannot see table slack above `capacity`, the allocator's retention or SQLite's page caches,
+/// and those are exactly the remainder a memory table has to print beside it rather than fold in.
 ///
 /// O(nodes): every path of both sides is visited. Called only where nothing is being timed.
 pub(super) fn pass_structures_bytes(
@@ -676,8 +675,7 @@ struct ChildSample {
 	/// Its own high-water mark, which the transients of BUILDING that thing sit in — the gap
 	/// between this and `widest` is what was allocated and freed on the way.
 	peak: u64,
-	/// After dropping all of it, including the store: what the allocator kept and what the mapped
-	/// DB pages cost.
+	/// After dropping all of it, including the store: what the allocator kept.
 	after: u64,
 	rows: usize,
 	elapsed_ms: f64,
@@ -731,7 +729,7 @@ impl ChildSample {
 		let structures = self.baseline_bytes + self.view_bytes + self.scan_bytes;
 		format!(
 			"baseline {:.1} + view {:.1} + scan {:.1} = {:.1} MiB computed, {:.1} MiB floor, \
-			 {:.1} MiB neither (allocator retention, mapped DB pages, table slack)",
+			 {:.1} MiB neither (allocator retention, SQLite page caches, table slack)",
 			mib(self.baseline_bytes as u64),
 			mib(self.view_bytes as u64),
 			mib(self.scan_bytes as u64),
@@ -966,7 +964,7 @@ fn plain_row(rel_path: &str) -> BaselineEntry {
 /// question. `widest` is what the process actually holds with every structure of the pass alive;
 /// the computed figures say which structure holds it. What the two do not account for between
 /// them is the answer to "where is the rest" — table slack above `capacity`, the allocator's
-/// retention, and the cache DB's mapped pages.
+/// retention, and SQLite's page caches.
 struct PassFootprint {
 	actions: usize,
 	rows: usize,
@@ -2403,7 +2401,7 @@ pub fn run() -> String {
 			&format!(
 				"{} action(s); {:.1} MiB resident at the widest point of a FRESH process, peak \
 				 {:.1} MiB, {:.1} MiB still resident once every structure and the store are \
-				 dropped; {}; cache.db {:.1} MiB (mapped up to 256 MiB, page cache 32 MiB), \
+				 dropped; {}; cache.db {:.1} MiB (no mmap, 4 MiB page cache), \
 				 baseline.db {:.1} MiB (no mmap, 2 MiB page cache)",
 				child.actions,
 				mib(child.widest),

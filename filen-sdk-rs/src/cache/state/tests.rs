@@ -1,7 +1,7 @@
 use super::*;
 use crate::cache::sql::columns::{
 	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
-	PRAGMA_SYNCHRONOUS,
+	PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
 };
 use crate::fs::{dir::meta::DirectoryMeta, file::meta::FileMeta};
 use filen_types::{crypto::EncryptedString, fs::ParentUuid};
@@ -1936,21 +1936,30 @@ fn init_db_applies_per_connection_pragmas_on_reopen() {
 	drop(CacheState::new_on_path(&path, root)); // first open: full INIT
 	let state = CacheState::new_on_path(&path, root); // reopen: INIT skipped
 
-	let synchronous: i64 = state
-		.db
-		.query_row("PRAGMA synchronous", [], |row| row.get(PRAGMA_SYNCHRONOUS))
-		.unwrap();
-	assert_eq!(synchronous, 1, "synchronous = NORMAL on every open");
-	let cache_size: i64 = state
-		.db
-		.query_row("PRAGMA cache_size", [], |row| row.get(PRAGMA_CACHE_SIZE))
-		.unwrap();
-	assert_eq!(cache_size, -32768, "page-cache budget on every open");
-	let mmap_size: i64 = state
-		.db
-		.query_row("PRAGMA mmap_size", [], |row| row.get(PRAGMA_MMAP_SIZE))
-		.unwrap();
-	assert_eq!(mmap_size, 268_435_456, "mmap budget on every open");
+	let pragma = |name: &str| -> i64 {
+		state
+			.db
+			.query_row(&format!("PRAGMA {name}"), [], |row| row.get(name))
+			.unwrap()
+	};
+	assert_eq!(
+		pragma(PRAGMA_SYNCHRONOUS),
+		1,
+		"synchronous = NORMAL on every open"
+	);
+	// The memory bounds: a 4 MiB page cache (a negative `cache_size` is KiB), no memory map, and
+	// TEMP storage in a file (1 = FILE).
+	assert_eq!(
+		pragma(PRAGMA_CACHE_SIZE),
+		-4096,
+		"page-cache budget on every open"
+	);
+	assert_eq!(pragma(PRAGMA_MMAP_SIZE), 0, "no memory map on any open");
+	assert_eq!(
+		pragma(PRAGMA_TEMP_STORE),
+		1,
+		"TEMP storage in a file on every open"
+	);
 
 	drop(state);
 	let _ = std::fs::remove_dir_all(&dir);
