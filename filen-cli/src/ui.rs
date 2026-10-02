@@ -11,7 +11,7 @@ use inquire::{
 };
 use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr};
 
 use crate::{
 	CliArgs, EXIT_CODE_ERROR_PREFIX, completion::async_completions_available, util::RemotePath,
@@ -551,6 +551,29 @@ pub(crate) fn format_size(size: u64) -> String {
 	humansize::format_size(size, humansize::BINARY)
 }
 
+/// Cut `line` down to `width` display columns. An over-long line would wrap onto a second row,
+/// and the in-place redraw only ever clears one row.
+pub(crate) fn truncate_to_width(line: &str, width: usize) -> String {
+	if line.width() <= width {
+		return line.to_string();
+	}
+	if width == 0 {
+		return String::new();
+	}
+	let mut truncated = String::new();
+	let mut used = 0;
+	for c in line.chars() {
+		let char_width = c.width().unwrap_or(0);
+		if used + char_width > width - 1 {
+			break;
+		}
+		truncated.push(c);
+		used += char_width;
+	}
+	truncated.push('…');
+	truncated
+}
+
 #[derive(Clone)]
 struct InquireCompleter {
 	client: Arc<Client>,
@@ -661,5 +684,31 @@ mod tests {
 		no_color_ui.initialize(false, false, Some(100), true, false);
 		test(&mut no_color_ui);
 		insta::assert_snapshot!(no_color_ui.output.join("\n"));
+	}
+
+	#[test]
+	fn truncate_to_width_keeps_short_lines() {
+		assert_eq!(truncate_to_width("Uploading", 20), "Uploading");
+		assert_eq!(truncate_to_width("Uploading", 9), "Uploading");
+	}
+
+	#[test]
+	fn truncate_to_width_cuts_long_lines() {
+		let truncated = truncate_to_width("Uploading 1 MiB / 2 MiB", 10);
+		assert_eq!(truncated, "Uploading…");
+		assert_eq!(truncated.width(), 10);
+	}
+
+	#[test]
+	fn truncate_to_width_handles_wide_chars() {
+		// Each of these is two columns wide, so only two of them fit alongside the ellipsis.
+		let truncated = truncate_to_width("上传上传上传", 5);
+		assert_eq!(truncated, "上传…");
+		assert!(truncated.width() <= 5);
+	}
+
+	#[test]
+	fn truncate_to_width_zero_is_empty() {
+		assert_eq!(truncate_to_width("Uploading", 0), "");
 	}
 }
