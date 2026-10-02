@@ -20,7 +20,7 @@ use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	ConflictResolution, IgnoreLevel, IgnoredPath, PlannedActionKind, PlannedConflict,
-	PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
+	PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport, TransferDirection,
 };
 use uuid::Uuid;
 
@@ -1375,12 +1375,13 @@ async fn observ_21_report_emitted_exactly_once_even_with_errors() {
 	// and the pass terminates cleanly. Needs fault injection to produce the error path deterministically.
 }
 
-/// The byte progress `events` carry for each `(name, size)`: every tick names the file's true size as
-/// its total, comes before the event `finished` recognises as that transfer's own, never goes down,
-/// and ends at the size. An empty file moves no bytes and reports none.
+/// The byte progress `events` carry for each `(name, size)`: every tick goes `direction`, names the
+/// file's true size as its total, comes before the event `finished` recognises as that transfer's
+/// own, never goes down, and ends at the size. An empty file moves no bytes and reports none.
 fn assert_byte_progress(
 	events: &[SyncEvent],
 	sizes: &[(&str, usize)],
+	direction: TransferDirection,
 	finished: impl Fn(&SyncEvent) -> Option<&str>,
 ) {
 	for &(name, size) in sizes {
@@ -1389,15 +1390,16 @@ fn assert_byte_progress(
 			.iter()
 			.position(|e| finished(e) == Some(name))
 			.unwrap_or_else(|| panic!("no completion event for {name}: {events:?}"));
-		let ticks: Vec<(usize, u64, u64)> = events
+		let ticks: Vec<(usize, TransferDirection, u64, u64)> = events
 			.iter()
 			.enumerate()
 			.filter_map(|(i, e)| match e {
 				SyncEvent::Progress {
 					rel_path,
+					direction,
 					bytes,
 					total,
-				} if rel_path == name => Some((i, *bytes, *total)),
+				} if rel_path == name => Some((i, *direction, *bytes, *total)),
 				_ => None,
 			})
 			.collect();
@@ -1409,7 +1411,11 @@ fn assert_byte_progress(
 			continue;
 		}
 		assert!(!ticks.is_empty(), "no progress for {name}: {events:?}");
-		for &(at, bytes, total) in &ticks {
+		for &(at, tick_direction, bytes, total) in &ticks {
+			assert_eq!(
+				tick_direction, direction,
+				"{name}: progress labelled the wrong way: {ticks:?}"
+			);
 			assert_eq!(total, size, "{name}: total is not the file size: {ticks:?}");
 			assert!(
 				bytes <= size,
@@ -1421,11 +1427,11 @@ fn assert_byte_progress(
 			);
 		}
 		assert!(
-			ticks.windows(2).all(|w| w[0].1 <= w[1].1),
+			ticks.windows(2).all(|w| w[0].2 <= w[1].2),
 			"{name}: progress went backwards: {ticks:?}"
 		);
 		assert_eq!(
-			ticks.last().unwrap().1,
+			ticks.last().unwrap().2,
 			size,
 			"{name}: progress must end at the file size: {ticks:?}"
 		);
@@ -1458,7 +1464,7 @@ async fn observ_22_byte_size_accounting_matches_transferred() {
 		.unwrap();
 	assert!(r1.errors.is_empty(), "{r1:?}");
 	assert_eq!(r1.uploaded, 4, "{r1:?}");
-	assert_byte_progress(&events, &up, |e| match e {
+	assert_byte_progress(&events, &up, TransferDirection::Upload, |e| match e {
 		SyncEvent::Uploading { rel_path } => Some(rel_path),
 		_ => None,
 	});
@@ -1500,7 +1506,7 @@ async fn observ_22_byte_size_accounting_matches_transferred() {
 		.unwrap();
 	assert!(r2.errors.is_empty(), "{r2:?}");
 	assert_eq!(r2.downloaded, 4, "{r2:?}");
-	assert_byte_progress(&events, &down, |e| match e {
+	assert_byte_progress(&events, &down, TransferDirection::Download, |e| match e {
 		SyncEvent::Downloading { rel_path } => Some(rel_path),
 		_ => None,
 	});

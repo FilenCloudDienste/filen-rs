@@ -60,7 +60,8 @@ pub enum SyncEvent {
 	Downloading { rel_path: String },
 	/// Bytes moved so far by the upload or download of `rel_path`. File transfers run concurrently
 	/// and report their [`Uploading`](Self::Uploading) / [`Downloading`](Self::Downloading) event
-	/// once they finish, so a transfer's progress comes BEFORE that event.
+	/// once they finish, so a transfer's progress comes BEFORE that event; `direction` says which
+	/// of the two it is while it runs.
 	///
 	/// `bytes` is cumulative and never decreases within one transfer. `total` is the file size the
 	/// pass planned with: the remote file's size for a download, the size the local scan read for
@@ -70,6 +71,9 @@ pub enum SyncEvent {
 	/// `total`.
 	Progress {
 		rel_path: String,
+		/// The way the transfer goes: the same as the [`Uploading`](Self::Uploading) /
+		/// [`Downloading`](Self::Downloading) event a successful transfer ends with.
+		direction: TransferDirection,
 		bytes: u64,
 		total: u64,
 	},
@@ -130,6 +134,15 @@ pub enum SyncEvent {
 	/// of that pass; no [`PassCompleted`](Self::PassCompleted) follows. Failures of single actions
 	/// are [`ActionFailed`](Self::ActionFailed) instead.
 	PassFailed { error: String },
+}
+
+/// Which way a file transfer moves its bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+	/// A local file going to the remote.
+	Upload,
+	/// A remote file coming into the local tree.
+	Download,
 }
 
 /// A sink for [`SyncEvent`]s, owned for the lifetime of a continuous
