@@ -231,17 +231,36 @@ pub(crate) fn tar_with(members: &[TarMember]) -> Vec<u8> {
 			}
 			TarMember::Symlink { path, target } => {
 				header.set_entry_type(tar::EntryType::Symlink);
-				header.set_size(0);
-				builder.append_link(&mut header, path, target).unwrap();
+				append_link_verbatim(&mut builder, header, path, target);
 			}
 			TarMember::HardLink { path, target } => {
 				header.set_entry_type(tar::EntryType::Link);
-				header.set_size(0);
-				builder.append_link(&mut header, path, target).unwrap();
+				append_link_verbatim(&mut builder, header, path, target);
 			}
 		}
 	}
 	builder.into_inner().unwrap()
+}
+
+/// Appends a link member with `path` and `target` stored byte for byte. The `tar` crate's own
+/// `append_link` parses both as host paths, and on Windows a name such as `d:e` parses as a drive
+/// prefix, which it refuses as not relative.
+fn append_link_verbatim(
+	builder: &mut tar::Builder<Vec<u8>>,
+	mut header: tar::Header,
+	path: &str,
+	target: &str,
+) {
+	header.set_size(0);
+	header
+		.as_old_mut()
+		.name
+		.get_mut(..path.len())
+		.expect("a link fixture's path fits the header's name field")
+		.copy_from_slice(path.as_bytes());
+	header.set_link_name_literal(target).unwrap();
+	header.set_cksum();
+	builder.append(&header, io::empty()).unwrap();
 }
 
 /// Every member of a tar with its data, read back through the SDK's reader in small pieces, so
