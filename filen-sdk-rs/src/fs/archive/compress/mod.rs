@@ -43,7 +43,7 @@ pub use crate::fs::drive_job::{
 	plan::{PlanTotals, RenameReason, RenamedEntry, SkipReason, SkippedEntry},
 };
 
-use super::format::{ExtensionFormat, match_extension};
+use super::format::{ArchiveFormat, match_extension};
 
 /// What to compress, and whether to remove it afterwards.
 #[derive(Debug, Clone)]
@@ -73,6 +73,38 @@ pub enum CompressSources {
 		items: Vec<NonRootItemType<'static, Normal>>,
 	},
 }
+
+impl CompressSources {
+	/// Checks the sources can be written in `format` as far as their kinds tell, before anything
+	/// is listed: a single compressed file is made of exactly one file.
+	pub(crate) fn check_for(&self, format: CompressFormat) -> Result<(), Error> {
+		if !matches!(format, CompressFormat::Single { .. }) {
+			return Ok(());
+		}
+		let one_file = match self {
+			Self::Keep(sources) => matches!(sources.as_slice(), [ItemSource::File(_)]),
+			Self::Dispose { items, .. } => matches!(items.as_slice(), [NonRootItemType::File(_)]),
+		};
+		if one_file {
+			Ok(())
+		} else {
+			Err(single_is_one_file())
+		}
+	}
+}
+
+/// The error for a single compressed file asked of anything but one file.
+pub(crate) fn single_is_one_file() -> Error {
+	Error::custom(
+		ErrorKind::InvalidState,
+		"a single compressed file is made of exactly one file",
+	)
+}
+
+/// The level a 7z method is written at unless a UI chooses another: 7-Zip's own default
+/// ("normal", its `-mx5`), whose levels the SDK's follow, but for BZip2's (see
+/// [`CompressFormat::default_level`]).
+const SEVEN_Z_DEFAULT_LEVEL: u32 = 5;
 
 /// What an archive is written as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +263,43 @@ impl CompressFormat {
 		}
 	}
 
+	/// The level for a UI to preselect among the format's [levels](CompressFormat::levels): a
+	/// stream codec's own default (what `level: None` writes), which a zip's Deflate and BZip2
+	/// and a 7z's BZip2 share with gzip and bzip2, and 7-Zip's for any other 7z method; `None`
+	/// for a format without levels. A 7z's BZip2 levels are bzip2's block sizes, and 7-Zip's
+	/// default writes the largest, 900 KB, as bzip2's does.
+	pub fn default_level(self) -> Option<u32> {
+		let codec = match self {
+			Self::Tar { compression: None }
+			| Self::Zip {
+				method: ZipMethod::Stored,
+				..
+			}
+			| Self::SevenZ {
+				method: SevenZMethod::Copy,
+				..
+			} => return None,
+			Self::SevenZ {
+				method: SevenZMethod::Bzip2 { .. },
+				..
+			} => StreamCodec::Bzip2,
+			Self::SevenZ { .. } => return Some(SEVEN_Z_DEFAULT_LEVEL),
+			Self::Tar {
+				compression: Some(compression),
+			}
+			| Self::Single { compression } => compression.codec,
+			Self::Zip {
+				method: ZipMethod::Deflate { .. },
+				..
+			} => StreamCodec::Gzip,
+			Self::Zip {
+				method: ZipMethod::Bzip2 { .. },
+				..
+			} => StreamCodec::Bzip2,
+		};
+		Some(codec.levels().1)
+	}
+
 	/// The format at `level`, unchecked; the same format when it has no levels.
 	pub fn with_level(self, level: u32) -> Self {
 		match self {
@@ -291,13 +360,14 @@ impl CompressFormat {
 	/// (`.tgz` is a `.tar.gz`): readers tell brotli and LZMA streams by their extension alone.
 	pub(crate) fn check_name(self, name: &str) -> Result<usize, Error> {
 		let expected = match self {
-			Self::Tar { compression: None } => ExtensionFormat::Tar,
-			Self::Tar {
-				compression: Some(compression),
-			} => ExtensionFormat::CompressedTar(compression.codec),
-			Self::Single { compression } => ExtensionFormat::Stream(compression.codec),
-			Self::Zip { .. } => ExtensionFormat::Zip,
-			Self::SevenZ { .. } => ExtensionFormat::SevenZ,
+			Self::Tar { compression } => ArchiveFormat::Tar {
+				codec: compression.map(|compression| compression.codec),
+			},
+			Self::Single { compression } => ArchiveFormat::Single {
+				codec: compression.codec,
+			},
+			Self::Zip { .. } => ArchiveFormat::Zip,
+			Self::SevenZ { .. } => ArchiveFormat::SevenZ,
 		};
 		match match_extension(name) {
 			Some((extension, format)) if format == expected => Ok(extension.len()),
@@ -322,7 +392,10 @@ fn within_budget(memory: u64, budget: u64) -> Result<u64, Error> {
 
 #[cfg(test)]
 mod tests {
+	use filen_types::fs::Uuid;
+
 	use super::*;
+	use crate::fs::archive::test_support::remote_file;
 
 	fn compression(codec: StreamCodec) -> Compression {
 		Compression { codec, level: None }
@@ -402,6 +475,89 @@ mod tests {
 				.unwrap(),
 			7_600_000
 		);
+	}
+
+	#[test]
+	fn a_formats_default_level_is_one_it_takes_and_fits_every_budget() {
+		const SMALLEST_BUDGET: u64 = 128 << 20;
+		let zip = |method| CompressFormat::Zip {
+			method,
+			encryption: None,
+		};
+		let sevenz = |method| CompressFormat::SevenZ {
+			method,
+			solid: true,
+			encryption: None,
+		};
+		let leveled = [
+			(
+				CompressFormat::Tar {
+					compression: Some(compression(StreamCodec::Xz)),
+				},
+				6,
+			),
+			(
+				CompressFormat::Single {
+					compression: compression(StreamCodec::Brotli),
+				},
+				9,
+			),
+			(zip(ZipMethod::Deflate { level: 1 }), 6),
+			(zip(ZipMethod::Bzip2 { level: 1 }), 9),
+			(sevenz(SevenZMethod::Lzma2 { level: 0 }), 5),
+			(sevenz(SevenZMethod::Ppmd { level: 1 }), 5),
+			(sevenz(SevenZMethod::Bzip2 { level: 1 }), 9),
+		];
+		for (format, default) in leveled {
+			assert_eq!(format.default_level(), Some(default), "{format:?}");
+			assert!(format.levels().unwrap().contains(&default), "{format:?}");
+			assert!(
+				format
+					.with_level(default)
+					.check_budget(SMALLEST_BUDGET)
+					.is_ok(),
+				"{format:?}"
+			);
+		}
+		for format in [
+			CompressFormat::Tar { compression: None },
+			zip(ZipMethod::Stored),
+			sevenz(SevenZMethod::Copy),
+		] {
+			assert_eq!(format.default_level(), None, "{format:?}");
+		}
+	}
+
+	#[test]
+	fn a_single_compressed_file_is_made_of_one_file() {
+		let single = CompressFormat::Single {
+			compression: compression(StreamCodec::Gzip),
+		};
+		let file = |name: &str| {
+			ItemSource::File(remote_file(
+				Uuid::from_u128(1),
+				Uuid::from_u128(2),
+				name,
+				b"data",
+				None,
+			))
+		};
+		let sources = CompressSources::Keep;
+		assert!(sources(vec![file("a.txt")]).check_for(single).is_ok());
+		for sources in [
+			sources(Vec::new()),
+			sources(vec![file("a.txt"), file("b.txt")]),
+		] {
+			assert_eq!(
+				sources.check_for(single).unwrap_err().kind(),
+				ErrorKind::InvalidState
+			);
+			assert!(
+				sources
+					.check_for(CompressFormat::Tar { compression: None })
+					.is_ok()
+			);
+		}
 	}
 
 	#[test]

@@ -10,8 +10,9 @@ use crate::{
 	Error,
 	fs::{
 		archive::limits::MAX_REPORT_RECORDS,
-		categories::{NonRootItemType, Normal},
+		categories::{DirType, NonRootItemType, Normal},
 		drive_job::counts::ItemCounts,
+		name::ValidatedName,
 	},
 	job::{
 		self,
@@ -55,7 +56,7 @@ impl JobPhase for ExtractPhase {
 
 /// An archive entry. Only meaningful with the archive it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[js_type(export, no_deser, no_default)]
+#[js_type(import, export, no_default)]
 pub struct ArchiveEntryId {
 	/// The archive's uuid.
 	pub archive: Uuid,
@@ -121,23 +122,16 @@ pub enum ExtractStage {
 
 /// Where to extract an entry that failed again, for it to land where it was meant to:
 /// [`ExtractRequest::Entries`](super::ExtractRequest::Entries) with the entry's id, this
-/// `destination` (fetched by its uuid), this `base`, and
-/// [`ExtractRoot::Destination`](super::ExtractRoot::Destination). Failures that share a retry
-/// go again in one request.
-///
-/// A tar's hard link that failed does not go again this way: it is a copy of a file stored
-/// before it, and a tar is read front to back, so a request that does not take that file too
-/// has nothing to copy, and skips the link as
-/// [`ExtractSkipReason::Hardlink`](super::ExtractSkipReason::Hardlink); taking the file too
-/// extracts it a second time. The file is in the drive by then, where it can be copied.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[js_type(export, no_deser, no_default)]
+/// `destination`, this `base`, and [`ExtractRoot::Destination`](super::ExtractRoot::Destination).
+/// Failures that share a retry go again in one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractRetry {
-	/// The directory nearest the entry that the extraction created (or extracted into): its
-	/// parent, unless that failed too.
-	pub destination: Uuid,
-	/// That directory's path in the archive, as drive names.
-	pub base: String,
+	/// The directory nearest the entry that the extraction created, or extracted into (the
+	/// drive's root, say): its parent, unless that failed too.
+	pub destination: DirType<'static, Normal>,
+	/// That directory's path in the archive, as drive names: the extraction's own base, then
+	/// the directories below it.
+	pub base: Vec<ValidatedName>,
 }
 
 /// An entry that was not extracted because something went wrong.
@@ -153,7 +147,12 @@ pub struct ExtractFailure {
 	pub dest_name: String,
 	/// What failed.
 	pub stage: ExtractStage,
-	pub retry: ExtractRetry,
+	/// Where to extract it again; `None` only for a tar's hard link, which does not go again
+	/// this way. It is a copy of a file stored before it, and a tar is read front to back, so a
+	/// request that does not take that file too has nothing to copy, and skips the link as
+	/// [`ExtractSkipReason::Hardlink`]; taking the file too extracts it a second time. The file
+	/// is in the drive by then, where it can be copied.
+	pub retry: Option<ExtractRetry>,
 	/// Shared because [`Error`] is not `Clone`, and one failure goes both into an event and into
 	/// the report.
 	pub error: Arc<Error>,
@@ -238,7 +237,7 @@ pub struct ExtractedTopLevel {
 	pub item: NonRootItemType<'static, Normal>,
 }
 
-/// Records a report only counts, past [`MAX_REPORT_RECORDS`] of each kind.
+/// Records a report only counts, past the first 1000 of each kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
 pub struct OmittedRecords {

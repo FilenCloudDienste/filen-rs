@@ -11,9 +11,9 @@ pub(crate) mod progress;
 pub(crate) mod report;
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub use js::JobError;
+pub use js::{ItemError, SdkError};
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub(crate) use js::job_error;
+pub(crate) use js::{millis, sdk_error};
 
 use std::{
 	future::Future,

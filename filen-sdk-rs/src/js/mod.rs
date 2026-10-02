@@ -8,6 +8,8 @@ mod params;
 mod returned_types;
 #[cfg(all(target_family = "wasm", target_os = "unknown",))]
 mod service_worker;
+#[cfg(all(test, feature = "uniffi"))]
+pub(crate) mod test_support;
 #[cfg(feature = "uniffi")]
 mod uniffi;
 #[cfg(feature = "wasm-full")]
@@ -38,7 +40,7 @@ pub(crate) use categories::{
 	normal::NonRootNormalItemTagged,
 };
 
-#[cfg(feature = "uniffi")]
+#[cfg(all(feature = "uniffi", feature = "cache"))]
 pub(crate) use self::uniffi::spawn_ordered_dispatch;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
@@ -51,3 +53,5 @@ pub use returned_types::*;
 pub(crate) use service_worker::impls::*;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use service_worker::shared::*;
+#[cfg(feature = "wasm-full")]
+pub(crate) use wasm::call_callback;

@@ -3,9 +3,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use filen_macros::js_type;
-
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 
 use crate::{
 	Error, ErrorKind,
@@ -63,11 +62,13 @@ pub enum ArchiveEntryKind {
 
 /// An entry of an archive, and what extracting it would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 // Independent facts a listing reports about one entry, each a field of the bindings' record:
 // they are not one state, so no enum stands in for them.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ArchiveEntry {
-	/// What [`ExtractRequest::Entries`](super::ExtractRequest::Entries) takes to extract it.
+	/// What extracting some entries (`ExtractRequest::Entries`, `extractArchiveEntries`) takes
+	/// to extract it.
 	pub id: ArchiveEntryId,
 	/// Its path as the archive stores it, cut to at most 4096 bytes.
 	pub stored_path: String,
@@ -82,28 +83,36 @@ pub struct ArchiveEntry {
 	/// target's, and for a single compressed file what it decodes to, in bytes. `None` for a
 	/// directory.
 	pub size: Option<u64>,
+	/// When it was last changed, as the archive states it.
+	#[cfg_attr(
+		feature = "wasm-full",
+		tsify(type = "bigint", optional),
+		serde(
+			with = "filen_types::serde::time::optional",
+			skip_serializing_if = "Option::is_none"
+		)
+	)]
 	pub modified: Option<DateTime<Utc>>,
 	/// Its data is encrypted.
 	pub encrypted: bool,
 	/// How a zip's or 7z's entry is compressed, for display (`Deflate`, `LZMA2`, `BCJ+LZMA`,
 	/// `method 98`); `None` for an entry without data, and for a tar's members or a single file,
-	/// which the archive's own compression covers (see [`ArchiveListing::format`]).
+	/// which the archive's own compression covers (see the listing's `format`).
 	pub method: Option<String>,
 	/// Why extracting it would skip it; `None` for an entry an extraction creates (or may: an
 	/// AppleDouble file told by its name alone). A link's target is in `kind`, and left empty
 	/// here.
 	pub skip: Option<ExtractSkipReason>,
 	/// Its stored path was made into valid drive names (an extraction reports it renamed, for
-	/// [`ExtractRenameReason::PathRewritten`](super::ExtractRenameReason::PathRewritten)).
+	/// `PathRewritten`).
 	pub path_rewritten: bool,
-	/// Its path reads as something it is not (see
-	/// [`ExtractMisleadingName`](super::ExtractMisleadingName)).
+	/// Its path reads as something it is not (an extraction reports it as a misleading name).
 	pub misleading_name: bool,
 	/// macOS metadata: a `__MACOSX` folder, or an AppleDouble file (named `._name`, or any file
 	/// in a `__MACOSX` folder). A tar's file is told by its data, which a listing reads; a
 	/// zip's, 7z's or single file's by its path alone, so `skip` leaves it out: an extraction
-	/// checks its data, and extracts it when it is an ordinary file after all. See
-	/// [`ExtractConfig::skip_mac_metadata`](super::ExtractConfig::skip_mac_metadata).
+	/// checks its data, and extracts it when it is an ordinary file after all. See the
+	/// extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
 }
 
@@ -387,7 +396,7 @@ pub(crate) fn add_entry(
 
 impl ArchiveEntry {
 	/// The bytes of text it holds.
-	fn text_bytes(&self) -> usize {
+	pub(crate) fn text_bytes(&self) -> usize {
 		let target = match &self.kind {
 			ArchiveEntryKind::Symlink { target } | ArchiveEntryKind::Hardlink { target } => {
 				target.len()

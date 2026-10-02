@@ -71,8 +71,8 @@ pub struct CompressCounts {
 	pub bytes_written: u64,
 	/// The archive's size once it is registered; 0 before.
 	pub bytes_done: u64,
-	/// Bytes of the archive read back to check it before the sources are deleted for good (see
-	/// [`CompressPhase::Verifying`]); up to `bytes_done`, and 0 when nothing is read back.
+	/// Bytes of the archive read back to check it before the sources are deleted for good (in
+	/// the phase `Verifying`); up to `bytes_done`, and 0 when nothing is read back.
 	pub bytes_verified: u64,
 }
 
@@ -102,7 +102,7 @@ pub enum CompressEvent {
 	Renamed(RenamedEntry),
 	/// A source's data does not match the hash in its metadata. It is in the archive as it was
 	/// read; the source itself may be damaged.
-	SourceHashMismatch { source_uuid: Uuid, path: String },
+	SourceHashMismatch(HashMismatch),
 	/// What became of a source, when the sources were to be removed.
 	SourceDisposition(SourceDisposition),
 	/// The archive was registered but could not be added to one of the destination's public
@@ -167,6 +167,7 @@ pub struct CompressReport {
 
 /// A source file whose data did not match the hash in its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct HashMismatch {
 	/// The source file's uuid.
 	pub source_uuid: Uuid,

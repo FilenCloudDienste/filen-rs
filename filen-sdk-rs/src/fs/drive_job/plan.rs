@@ -183,6 +183,7 @@ pub enum RenameReason {
 }
 
 #[derive(Debug, Clone)]
+#[js_type(export, no_deser, no_default)]
 pub struct RenamedEntry {
 	pub source_uuid: Uuid,
 	pub source_path: String,

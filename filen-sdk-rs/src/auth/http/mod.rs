@@ -305,9 +305,9 @@ pub struct JsClientConfig {
 	pub log_level: Option<LogLevel>,
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub file_io_memory_budget: Option<u64>,
-	// These three carry `uniffi(default = None)` where the fields above do not: a bare new field
-	// on a `uniffi::Record` changes the generated Kotlin/Swift constructor arity, so every
-	// existing caller would stop compiling.
+	// The fields from here on carry `uniffi(default = None)` where the fields above do not: a
+	// bare new field on a `uniffi::Record` changes the generated Kotlin/Swift constructor arity,
+	// so every existing caller would stop compiling.
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub thumbnail_mem_budget: Option<u64>,
@@ -317,6 +317,29 @@ pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub thumbnail_decode_concurrency: Option<u32>,
+	/// Memory for one archive job's codec state, in bytes, the platform's when left out (128 MiB
+	/// on iOS and the web, 192 MiB on Android, 256 MiB elsewhere; never below 16 MiB).
+	/// Extracting an archive whose decoder needs more fails with `ArchiveTooLarge`; compressing
+	/// into a format whose encoder needs more is refused with `InsufficientMemory`
+	/// (`archiveMaxLevel` finds the highest level that fits, `archiveCodecMemBudget` reads the
+	/// budget in effect).
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub archive_codec_mem_budget: Option<u64>,
+	/// How many archive jobs (extracting, listing, compressing) run at once, later ones waiting;
+	/// the platform's when left out (1 on mobile, 2 elsewhere; at least 1). Ignored on the web,
+	/// where one runs at a time per page.
+	#[cfg(any(
+		not(all(target_family = "wasm", target_os = "unknown")),
+		feature = "wasm-full"
+	))]
+	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
+	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
+	pub archive_job_concurrency: Option<u32>,
 }
 
 #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
@@ -373,6 +396,19 @@ impl From<JsClientConfig> for ClientConfig {
 			// assumption from FFI callers) as a floor of 1.
 			config = config
 				.with_thumbnail_decode_concurrency((thumbnail_decode_concurrency as usize).max(1));
+		}
+		// no clamping here: ArchiveConfig clamps both to their range
+		#[cfg(any(
+			not(all(target_family = "wasm", target_os = "unknown")),
+			feature = "wasm-full"
+		))]
+		{
+			if let Some(budget) = value.archive_codec_mem_budget {
+				config = config.with_archive_codec_mem_budget(budget);
+			}
+			if let Some(concurrency) = value.archive_job_concurrency {
+				config = config.with_archive_job_concurrency(concurrency as usize);
+			}
 		}
 		config
 	}
@@ -1704,7 +1740,38 @@ mod js_client_config_tests {
 			thumbnail_mem_budget: None,
 			thumbnail_max_source_bytes: None,
 			thumbnail_decode_concurrency: None,
+			archive_codec_mem_budget: None,
+			archive_job_concurrency: None,
 		}
+	}
+
+	#[test]
+	fn archive_settings_reach_the_client_config() {
+		let config = ClientConfig::from(JsClientConfig {
+			archive_codec_mem_budget: Some(512 << 20),
+			archive_job_concurrency: Some(3),
+			..base()
+		});
+		assert_eq!(
+			(
+				config.archive_codec_mem_budget,
+				config.archive_job_concurrency
+			),
+			(512 << 20, 3)
+		);
+		let defaults = ClientConfig::from(base());
+		let platform = ClientConfig::default();
+		assert_eq!(
+			(
+				defaults.archive_codec_mem_budget,
+				defaults.archive_job_concurrency
+			),
+			(
+				platform.archive_codec_mem_budget,
+				platform.archive_job_concurrency
+			),
+			"left out, both stay the platform's"
+		);
 	}
 
 	/// concurrency 0 (a natural "unlimited" assumption from FFI callers) must not become a

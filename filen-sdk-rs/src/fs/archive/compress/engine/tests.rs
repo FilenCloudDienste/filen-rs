@@ -476,7 +476,7 @@ async fn a_source_that_does_not_match_its_hash_is_reported() {
 		.events()
 		.into_iter()
 		.filter_map(|event| match event {
-			CompressEvent::SourceHashMismatch { path, .. } => Some(path),
+			CompressEvent::SourceHashMismatch(mismatch) => Some(mismatch.path),
 			_ => None,
 		})
 		.collect();
