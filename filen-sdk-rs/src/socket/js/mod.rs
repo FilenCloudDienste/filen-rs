@@ -146,7 +146,12 @@ mod wasm {
 		)]
 		pub async fn is_socket_connected(&self) -> bool {
 			let this = self.inner();
-			runtime::do_on_commander(move || async move { this.is_socket_connected() }).await
+			runtime::do_on_commander(
+				move || async move { Ok::<_, Error>(this.is_socket_connected()) },
+			)
+			.await
+			// A commander worker that never started never connected the socket either.
+			.unwrap_or(false)
 		}
 	}
 }

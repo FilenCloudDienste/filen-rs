@@ -10,6 +10,7 @@ use crate::{
 	auth::{Client, http::AuthClient},
 	crypto::shared::MetaCrypter,
 	error::ResultExt,
+	runtime::WorkerStart,
 };
 
 use super::{
@@ -38,6 +39,7 @@ use super::wasm;
 #[derive(Default)]
 pub(crate) struct WebSocketHandle {
 	request_sender: Option<tokio::sync::mpsc::WeakSender<SocketRequest>>,
+	start: WorkerStart,
 }
 
 impl WebSocketHandle {
@@ -64,17 +66,23 @@ impl WebSocketHandle {
 		client: &Client,
 	) -> RequestSender {
 		if let Some(sender) = self.live_sender() {
-			return RequestSender(sender);
+			return RequestSender {
+				sender,
+				start: self.start.clone(),
+			};
 		}
 
-		let sender = spawn_websocket_thread(
+		// A worker given up on before it started dropped its receiver, so `live_sender` rejects
+		// it and a fresh one is spawned here.
+		let (sender, start) = spawn_websocket_thread(
 			Arc::clone(auth_client),
 			client.crypter(),
 			client.arc_private_key(),
 			client.user_id,
 		);
 		self.request_sender = Some(sender.downgrade());
-		RequestSender(sender)
+		self.start = start.clone();
+		RequestSender { sender, start }
 	}
 
 	// todo rework this because it only shows connected status not authenticated status
@@ -83,7 +91,10 @@ impl WebSocketHandle {
 	}
 }
 
-pub(super) struct RequestSender(tokio::sync::mpsc::Sender<SocketRequest>);
+pub(super) struct RequestSender {
+	sender: tokio::sync::mpsc::Sender<SocketRequest>,
+	start: WorkerStart,
+}
 
 impl RequestSender {
 	pub(super) async fn add_event_listener(
@@ -102,8 +113,9 @@ impl RequestSender {
 
 		let guard = ListenerRegisterGuard {
 			receiver: id_receiver,
-			request_sender: Some(self.0),
+			request_sender: Some(self.sender),
 			canceller: Some(canceller),
+			start: self.start,
 		};
 		guard
 			.request_sender
@@ -111,9 +123,7 @@ impl RequestSender {
 			.expect("we set this above")
 			.send(request)
 			.await
-			.map_err(|_| {
-				Error::custom(ErrorKind::InvalidState, "websocket thread has been closed")
-			})?;
+			.map_err(|_| thread_closed_error(&guard.start))?;
 		guard.await
 	}
 
@@ -138,8 +148,9 @@ impl RequestSender {
 
 		let guard = ListenerRegisterGuard {
 			receiver: id_receiver,
-			request_sender: Some(self.0),
+			request_sender: Some(self.sender),
 			canceller: Some(canceller),
+			start: self.start,
 		};
 		guard
 			.request_sender
@@ -147,11 +158,17 @@ impl RequestSender {
 			.expect("we set this above")
 			.send(request)
 			.await
-			.map_err(|_| {
-				Error::custom(ErrorKind::InvalidState, "websocket thread has been closed")
-			})?;
+			.map_err(|_| thread_closed_error(&guard.start))?;
 		guard.await
 	}
+}
+
+/// The error for a request the websocket thread can no longer take or answer: why its worker never
+/// started, if it did not.
+fn thread_closed_error(start: &WorkerStart) -> Error {
+	start.failure().unwrap_or_else(|| {
+		Error::custom(ErrorKind::InvalidState, "websocket thread has been closed")
+	})
 }
 
 pub(super) enum SocketRequest {
@@ -233,6 +250,7 @@ pin_project_lite::pin_project! {
 		receiver: tokio::sync::oneshot::Receiver<Result<u64, Error>>,
 		request_sender: Option<tokio::sync::mpsc::Sender<SocketRequest>>,
 		canceller: Option<tokio::sync::oneshot::Sender<()>>,
+		start: WorkerStart,
 	}
 
 	impl PinnedDrop for ListenerRegisterGuard {
@@ -270,10 +288,9 @@ impl Future for ListenerRegisterGuard {
 				remove_listener_sender: this.request_sender.take(),
 			})),
 			std::task::Poll::Ready(Ok(Err(e))) => std::task::Poll::Ready(Err(e)),
-			std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(Error::custom(
-				ErrorKind::InvalidState,
-				"websocket thread has been closed",
-			))),
+			std::task::Poll::Ready(Err(_)) => {
+				std::task::Poll::Ready(Err(thread_closed_error(this.start)))
+			}
 			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
 	}
@@ -291,7 +308,7 @@ fn spawn_websocket_thread(
 	crypter: Arc<impl MetaCrypter + 'static>,
 	private_key: Arc<RsaPrivateKey>,
 	user_id: u64,
-) -> tokio::sync::mpsc::Sender<SocketRequest> {
+) -> (tokio::sync::mpsc::Sender<SocketRequest>, WorkerStart) {
 	let (request_sender, request_receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
 
 	let config = WebSocketConfig {
@@ -302,7 +319,7 @@ fn spawn_websocket_thread(
 	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	let f = || {
+	let f = |request_receiver| {
 		run_async_websocket_task::<native::NativeSocket, _, _, _, _, _, _, _, _>(
 			config,
 			request_receiver,
@@ -312,7 +329,7 @@ fn spawn_websocket_thread(
 	};
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	let f = || {
+	let f = |request_receiver| {
 		run_async_websocket_task::<wasm::WasmSocket, _, _, _, _, _, _, _, _>(
 			config,
 			request_receiver,
@@ -321,9 +338,9 @@ fn spawn_websocket_thread(
 		)
 	};
 
-	crate::runtime::spawn_async(f);
+	let start = crate::runtime::spawn_async_claiming("websocket", request_receiver, f);
 
-	request_sender
+	(request_sender, start)
 }
 
 /// Handles the initialized websocket connection, processing incoming messages and managing listeners.
@@ -840,6 +857,7 @@ mod tests {
 		let _zombie_handle = sender.clone();
 		let handle = WebSocketHandle {
 			request_sender: Some(sender.downgrade()),
+			start: WorkerStart::default(),
 		};
 
 		// While the websocket task (the receiver) is alive, the cached sender is usable.
@@ -858,6 +876,49 @@ mod tests {
 			!handle.is_connected(),
 			"a websocket thread whose receiver was dropped must not report connected"
 		);
+	}
+
+	// A websocket worker that never starts is given up on: everything waiting on it fails with
+	// why, and the handle stops treating it as live so the next caller spawns a fresh one.
+	#[test]
+	fn requests_to_a_worker_given_up_on_fail_with_the_startup_error() {
+		use futures::FutureExt;
+
+		use crate::{error::WorkerStartupError, runtime::WorkerInbox};
+
+		fn assert_startup_error(result: Option<Result<ListenerHandle, Error>>) {
+			let Some(Err(error)) = result else {
+				panic!("the request must fail at once");
+			};
+			assert_eq!(
+				error.downcast_ref::<WorkerStartupError>(),
+				Some(&WorkerStartupError::LoadUnreported)
+			);
+		}
+
+		let (sender, receiver) = tokio::sync::mpsc::channel::<SocketRequest>(16);
+		let inbox = WorkerInbox::new(receiver);
+		let handle = WebSocketHandle {
+			request_sender: Some(sender.downgrade()),
+			start: inbox.start().clone(),
+		};
+		let request_sender = || RequestSender {
+			sender: sender.clone(),
+			start: inbox.start().clone(),
+		};
+
+		let mut queued = Box::pin(request_sender().add_event_listener(Box::new(|_| {}), None));
+		assert!(queued.as_mut().now_or_never().is_none());
+
+		assert!(inbox.abandon(WorkerStartupError::LoadUnreported));
+
+		assert_startup_error(queued.now_or_never());
+		assert_startup_error(
+			request_sender()
+				.add_event_listener_sync(Box::new(|_| {}), None)
+				.now_or_never(),
+		);
+		assert!(!handle.is_connected());
 	}
 
 	#[test]

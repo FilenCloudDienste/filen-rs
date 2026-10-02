@@ -78,7 +78,13 @@ impl JsClient {
 	)]
 	pub async fn to_stringified(&self) -> StringifiedClient {
 		let this = self.inner();
-		crate::runtime::do_on_commander(move || async move { this.to_stringified() }).await
+		crate::runtime::do_on_commander(
+			move || async move { Ok::<_, Error>(this.to_stringified()) },
+		)
+		.await
+		// Only a commander worker that never started fails a call, and with it gone nothing
+		// else can be holding the client's locks, so reading the client here cannot block.
+		.unwrap_or_else(|_| self.inner_ref().to_stringified())
 	}
 
 	#[cfg_attr(
@@ -159,9 +165,11 @@ impl JsClient {
 				"requests per second rate limit needs to be > 0",
 			)
 		})?;
-		do_on_commander(move || async move { this.set_request_rate_limit(requests_per_sec).await })
-			.await;
-		Ok(())
+		do_on_commander(move || async move {
+			this.set_request_rate_limit(requests_per_sec).await;
+			Ok(())
+		})
+		.await
 	}
 
 	/// Upload limits below 16 KB/s are clamped up to 16 KB/s, the upload chunking granularity.

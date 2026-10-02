@@ -521,6 +521,29 @@ impl_from!(AbortedError, ErrorKind::Cancelled);
 
 impl_from!(EntryNameError, ErrorKind::InvalidName);
 
+/// Why a web worker the SDK spawned never started running its task.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[cfg(any(
+	test,
+	all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+))]
+pub(crate) enum WorkerStartupError {
+	#[error("worker could not be created: {0}")]
+	Spawn(String),
+	#[error("worker failed to load: {0}")]
+	Load(String),
+	/// A worker whose script fails to load fires a plain `Event`, which carries no message.
+	#[error("worker failed to load (no error details)")]
+	LoadUnreported,
+	#[error("worker did not start within {0:?}")]
+	TimedOut(std::time::Duration),
+}
+#[cfg(any(
+	test,
+	all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+))]
+impl_from!(WorkerStartupError, ErrorKind::Internal);
+
 #[cfg(test)]
 mod tests {
 	use std::io;

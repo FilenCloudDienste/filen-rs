@@ -393,17 +393,20 @@ mod managed {
 	}
 
 	impl ManagedFuture {
-		pub(crate) fn into_js_managed_commander_future<F, Fut>(
+		pub(crate) fn into_js_managed_commander_future<F, Fut, T>(
 			self,
 			f: F,
 		) -> Result<
-			JSManagedFuture<CommanderFutHandle<Fut::Output>, impl Future<Output = AbortedError>>,
+			JSManagedFuture<
+				CommanderFutHandle<Result<T, Error>>,
+				impl Future<Output = AbortedError>,
+			>,
 			Error,
 		>
 		where
 			F: FnOnce() -> Fut + Send + 'static,
-			Fut: Future + 'static,
-			Fut::Output: Send + 'static,
+			Fut: Future<Output = Result<T, Error>> + 'static,
+			T: Send + 'static,
 		{
 			let abort_fut = self.abort_signal.into_future()?;
 			let pausable = self.pause_signal.into_pausable_on_commander(f)?;

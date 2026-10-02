@@ -229,18 +229,305 @@ mod worker_handle {
 	}
 }
 
+/// Why a worker spawned by `spawn_async_claiming` never started, for whatever waits on it to fail
+/// with. Never set on native, where a spawned thread always starts.
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
+#[derive(Clone, Default)]
+pub(crate) struct WorkerStart {
+	#[cfg(any(
+		test,
+		all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+	))]
+	failure: std::sync::Arc<std::sync::OnceLock<crate::error::WorkerStartupError>>,
+}
+
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
+impl WorkerStart {
+	#[cfg(any(
+		test,
+		all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+	))]
+	fn reason(&self) -> Option<&crate::error::WorkerStartupError> {
+		self.failure.get()
+	}
+
+	/// The error to fail a waiter with, once the spawner has given up on the worker.
+	pub(crate) fn failure(&self) -> Option<crate::Error> {
+		cfg_select! {
+			any(
+				test,
+				all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+			) => {
+				self.reason().cloned().map(Into::into)
+			}
+			_ => {
+				None
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+pub(crate) use worker_start::WorkerInbox;
+
+// A web worker that never starts (its script fails to load, or it never gets as far as running its
+// task) drops nothing: the closure it was handed, and every channel end inside, simply leaks. So
+// whoever waits on such a worker hears silence, not an error, unless the spawner gives up on it.
+#[cfg(any(
+	test,
+	all(feature = "wasm-full", target_family = "wasm", target_os = "unknown")
+))]
+mod worker_start {
+	use std::{
+		sync::{Mutex, PoisonError, TryLockError},
+		time::Duration,
+	};
+
+	use super::WorkerStart;
+	use crate::{Error, ErrorKind, error::WorkerStartupError};
+
+	/// How long a spawned worker may take to start before it is presumed dead. Starting means
+	/// fetching and compiling the SDK's wasm module again in the new worker, which takes seconds
+	/// on a slow phone, never this long.
+	pub(super) const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
+
+	/// The error for a worker `error` event, given the message it carried, if it was an
+	/// `ErrorEvent` at all.
+	pub(super) fn load_error(message: Option<String>) -> WorkerStartupError {
+		match message {
+			Some(message) if !message.is_empty() => WorkerStartupError::Load(message),
+			_ => WorkerStartupError::LoadUnreported,
+		}
+	}
+
+	/// A spawned worker's receiving end, held until the worker claims it. Exactly one side gets
+	/// it: the worker, which then runs, or the spawner, which drops it so every sender sees the
+	/// channel close and everything queued on it is dropped. A worker that starts after that
+	/// finds nothing to claim and exits.
+	pub(crate) struct WorkerInbox<R> {
+		receiver: Mutex<Option<R>>,
+		start: WorkerStart,
+	}
+
+	impl<R> WorkerInbox<R> {
+		pub(crate) fn new(receiver: R) -> Self {
+			Self {
+				receiver: Mutex::new(Some(receiver)),
+				start: WorkerStart::default(),
+			}
+		}
+
+		/// Called by the worker as it starts; `None` once the spawner has given up on it.
+		pub(super) fn claim(&self) -> Option<R> {
+			self.receiver
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.take()
+		}
+
+		/// Gives up on a worker that has not claimed the inbox yet, recording why; `false` if it
+		/// already has, or is claiming it right now. Never blocks: the spawning thread can be a
+		/// page's main thread, which may not wait on a lock.
+		pub(crate) fn abandon(&self, reason: WorkerStartupError) -> bool {
+			let mut slot = match self.receiver.try_lock() {
+				Ok(slot) => slot,
+				Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+				Err(TryLockError::WouldBlock) => return false,
+			};
+			let Some(receiver) = slot.take() else {
+				return false;
+			};
+			// Recorded before the receiver drops, so a sender that sees the channel close can
+			// read why.
+			let _ = self.start.failure.set(reason);
+			drop(slot);
+			drop(receiver);
+			true
+		}
+
+		/// What whoever waits on the worker reads why it never started from.
+		pub(crate) fn start(&self) -> &WorkerStart {
+			&self.start
+		}
+	}
+
+	/// The value a commander call settles with when the commander worker could not run it.
+	pub(crate) trait CommanderOutput {
+		fn commander_unavailable(error: Error) -> Self;
+	}
+
+	impl<T, E: From<Error>> CommanderOutput for Result<T, E> {
+		fn commander_unavailable(error: Error) -> Self {
+			Err(error.into())
+		}
+	}
+
+	/// The error for a call whose result sender was dropped unsent, given the commander's start.
+	pub(super) fn commander_unavailable_error(start: &WorkerStart) -> Error {
+		start.failure().unwrap_or_else(|| {
+			Error::custom(
+				ErrorKind::Internal,
+				"commander worker dropped a call without a result",
+			)
+		})
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		#[test]
+		fn an_error_event_message_becomes_the_load_error() {
+			assert_eq!(
+				load_error(Some("SyntaxError: unexpected token".to_owned())),
+				WorkerStartupError::Load("SyntaxError: unexpected token".to_owned())
+			);
+		}
+
+		#[test]
+		fn an_event_without_a_message_is_still_a_load_error() {
+			assert_eq!(load_error(None), WorkerStartupError::LoadUnreported);
+			assert_eq!(
+				load_error(Some(String::new())),
+				WorkerStartupError::LoadUnreported
+			);
+		}
+
+		#[test]
+		fn a_startup_error_says_why_the_worker_never_ran() {
+			assert_eq!(
+				WorkerStartupError::Spawn("SecurityError".to_owned()).to_string(),
+				"worker could not be created: SecurityError"
+			);
+			assert_eq!(
+				WorkerStartupError::Load("NetworkError".to_owned()).to_string(),
+				"worker failed to load: NetworkError"
+			);
+			assert_eq!(
+				WorkerStartupError::LoadUnreported.to_string(),
+				"worker failed to load (no error details)"
+			);
+			assert_eq!(
+				WorkerStartupError::TimedOut(WORKER_START_TIMEOUT).to_string(),
+				"worker did not start within 30s"
+			);
+		}
+
+		#[test]
+		fn abandoning_an_unclaimed_inbox_fails_everything_queued_on_it() {
+			let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+			let (result_sender, mut result_receiver) = tokio::sync::oneshot::channel::<()>();
+			sender.send(result_sender).unwrap();
+			let inbox = WorkerInbox::new(receiver);
+
+			assert!(inbox.abandon(WorkerStartupError::TimedOut(WORKER_START_TIMEOUT)));
+
+			assert!(sender.is_closed());
+			assert_eq!(
+				result_receiver.try_recv(),
+				Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+			);
+			assert_eq!(
+				inbox.start().reason(),
+				Some(&WorkerStartupError::TimedOut(Duration::from_secs(30)))
+			);
+		}
+
+		#[test]
+		fn a_worker_starting_after_it_was_abandoned_claims_nothing() {
+			let inbox = WorkerInbox::new(());
+			assert!(inbox.abandon(WorkerStartupError::LoadUnreported));
+			assert_eq!(inbox.claim(), None);
+		}
+
+		#[test]
+		fn a_claimed_inbox_cannot_be_abandoned() {
+			let inbox = WorkerInbox::new(());
+			assert_eq!(inbox.claim(), Some(()));
+			assert!(!inbox.abandon(WorkerStartupError::LoadUnreported));
+			assert_eq!(inbox.start().reason(), None);
+		}
+
+		#[test]
+		fn an_inbox_being_claimed_is_left_to_the_worker() {
+			let inbox = WorkerInbox::new(());
+			let claiming = inbox.receiver.lock().unwrap();
+			assert!(!inbox.abandon(WorkerStartupError::LoadUnreported));
+			drop(claiming);
+			assert_eq!(inbox.claim(), Some(()));
+		}
+
+		#[test]
+		fn the_first_reason_to_abandon_an_inbox_is_kept() {
+			let inbox = WorkerInbox::new(());
+			assert!(inbox.abandon(WorkerStartupError::LoadUnreported));
+			assert!(!inbox.abandon(WorkerStartupError::TimedOut(WORKER_START_TIMEOUT)));
+			assert_eq!(
+				inbox.start().reason(),
+				Some(&WorkerStartupError::LoadUnreported)
+			);
+		}
+
+		#[test]
+		fn a_call_on_an_abandoned_commander_fails_with_the_startup_error() {
+			let inbox = WorkerInbox::new(());
+			inbox.abandon(WorkerStartupError::Load("NetworkError".to_owned()));
+
+			let result = Result::<(), Error>::commander_unavailable(commander_unavailable_error(
+				inbox.start(),
+			));
+
+			let error = result.unwrap_err();
+			assert_eq!(error.kind(), ErrorKind::Internal);
+			assert_eq!(
+				error.downcast_ref::<WorkerStartupError>(),
+				Some(&WorkerStartupError::Load("NetworkError".to_owned()))
+			);
+		}
+	}
+}
+
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 mod commander_thread {
-	use std::{mem::ManuallyDrop, pin::Pin, sync::OnceLock};
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use std::sync::OnceLock;
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use std::sync::{Mutex, PoisonError};
+	use std::{mem::ManuallyDrop, pin::Pin};
 
 	use futures::Stream;
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use futures::{StreamExt, stream::FuturesUnordered};
 
 	use pin_project_lite::pin_project;
 
-	use crate::util::{MaybeSend, WasmResultExt};
+	use super::WorkerStart;
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use crate::runtime::{
+		spawn_async_claiming,
+		worker_start::{CommanderOutput, commander_unavailable_error},
+	};
+	use crate::util::MaybeSend;
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use crate::util::WasmResultExt;
 
-	// Sender for commander worker tasks
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	static COMMANDER_RUNTIME_HANDLE: OnceLock<RuntimeHandle> = OnceLock::new();
+	// Replaceable on wasm: a commander worker that never started is given up on, and the next
+	// call spawns a fresh one.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	static COMMANDER_RUNTIME_HANDLE: Mutex<Option<RuntimeHandle>> = Mutex::new(None);
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	type TaskReceiver = tokio::sync::mpsc::UnboundedReceiver<Box<dyn FnOnceBox>>;
 
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	trait FnOnceBox: Send + 'static {
@@ -261,6 +548,9 @@ mod commander_thread {
 	struct RuntimeHandle {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		sender: tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnceBox>>,
+		// Handed to every call, which reads from it why it failed if the worker never started.
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		start: WorkerStart,
 		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 		tokio_handle: tokio::runtime::Handle,
 		// Held only for its Drop: closing this oneshot signals the commander runtime
@@ -273,45 +563,10 @@ mod commander_thread {
 		fn new() -> Self {
 			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 			{
-				use super::{spawn, spawn_local};
-				use futures::{StreamExt, stream::FuturesUnordered};
-
-				let (sender, mut receiver) =
+				let (sender, receiver) =
 					tokio::sync::mpsc::unbounded_channel::<Box<dyn FnOnceBox>>();
-
-				spawn(move || {
-					spawn_local(async move {
-						let mut futures = FuturesUnordered::new();
-
-						loop {
-							tokio::select! {
-								val = receiver.recv() => {
-									match val {
-										Some(task_constructor) => {
-											// Construct the future on THIS thread
-											let fut = task_constructor.call_box();
-											futures.push(fut);
-										},
-										None => {
-											while (futures.next().await).is_some() {}
-											tracing::debug!("Commander worker shutting down");
-											break;
-										},
-									}
-								},
-								// The guard is load-bearing: `FuturesUnordered::next()` on an EMPTY set
-								// is `Ready(None)` IMMEDIATELY, so without it this select never returns
-								// `Pending` once the last resident future completes — the commander then
-								// busy-spins and never yields to its JS event loop, starving every
-								// `spawn_local` task on this thread (and nested-worker startup, which the
-								// browser runs as parent-thread event-loop tasks).
-								_ = futures.next(), if !futures.is_empty() => {}
-							}
-						}
-					});
-				});
-
-				Self { sender }
+				let start = spawn_async_claiming("commander", receiver, run_commander);
+				Self { sender, start }
 			}
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
@@ -356,13 +611,13 @@ mod commander_thread {
 		{
 			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 			{
-				self.sender
-					.send(Box::new(move || {
-						Box::pin(async move {
-							fut_builder.build().await;
-						}) as Pin<Box<dyn Future<Output = ()> + 'static>>
-					}))
-					.expect_or_throw("Failed to send task to commander worker");
+				// Fails only once the worker was given up on: the task drops here, and its
+				// handle reports why.
+				let _ = self.sender.send(Box::new(move || {
+					Box::pin(async move {
+						fut_builder.build().await;
+					}) as Pin<Box<dyn Future<Output = ()> + 'static>>
+				}));
 			}
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			{
@@ -372,8 +627,41 @@ mod commander_thread {
 		}
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	fn get_or_init_async_runtime() -> &'static RuntimeHandle {
 		COMMANDER_RUNTIME_HANDLE.get_or_init(RuntimeHandle::new)
+	}
+
+	/// Runs the commander worker's tasks until every sender is gone.
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn run_commander(mut receiver: TaskReceiver) {
+		let mut futures = FuturesUnordered::new();
+
+		loop {
+			tokio::select! {
+				val = receiver.recv() => {
+					match val {
+						Some(task_constructor) => {
+							// Construct the future on THIS thread
+							let fut = task_constructor.call_box();
+							futures.push(fut);
+						},
+						None => {
+							while (futures.next().await).is_some() {}
+							tracing::debug!("Commander worker shutting down");
+							break;
+						},
+					}
+				},
+				// The guard is load-bearing: `FuturesUnordered::next()` on an EMPTY set
+				// is `Ready(None)` IMMEDIATELY, so without it this select never returns
+				// `Pending` once the last resident future completes — the commander then
+				// busy-spins and never yields to its JS event loop, starving every
+				// `spawn_local` task on this thread (and nested-worker startup, which the
+				// browser runs as parent-thread event-loop tasks).
+				_ = futures.next(), if !futures.is_empty() => {}
+			}
+		}
 	}
 
 	pin_project! {
@@ -384,6 +672,7 @@ mod commander_thread {
 			paused: bool,
 			pause_signal: tokio::sync::watch::Sender<bool>,
 			cancel_signal: ManuallyDrop<tokio::sync::oneshot::Sender<()>>,
+			start: WorkerStart,
 			#[pin]
 			result_receiver: tokio::sync::oneshot::Receiver<T>,
 		}
@@ -424,6 +713,7 @@ mod commander_thread {
 		}
 	}
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	impl<T> Future for CommanderFutHandle<T> {
 		type Output = T;
 
@@ -435,6 +725,25 @@ mod commander_thread {
 			this.result_receiver
 				.poll(cx)
 				.map(|res| res.expect_or_throw("CommanderFuture panicked"))
+		}
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	impl<T: CommanderOutput> Future for CommanderFutHandle<T> {
+		type Output = T;
+
+		fn poll(
+			self: Pin<&mut Self>,
+			cx: &mut std::task::Context<'_>,
+		) -> std::task::Poll<Self::Output> {
+			let this = self.project();
+			// wasm panics abort rather than unwind, so the commander drops a result sender unsent
+			// only when its worker was given up on before it started.
+			this.result_receiver.poll(cx).map(|res| {
+				res.unwrap_or_else(|_| {
+					T::commander_unavailable(commander_unavailable_error(this.start))
+				})
+			})
 		}
 	}
 
@@ -545,6 +854,7 @@ mod commander_thread {
 			tokio::sync::watch::Receiver<bool>,
 		)>,
 		fut_builder: F,
+		start: WorkerStart,
 	) -> (
 		CommanderFutBuilder<F, Fut, Fut::Output>,
 		CommanderFutHandle<Fut::Output>,
@@ -570,6 +880,7 @@ mod commander_thread {
 			paused: false,
 			pause_signal: pause_signal_tx,
 			cancel_signal: ManuallyDrop::new(cancel_signal_tx),
+			start,
 			result_receiver,
 		};
 
@@ -588,13 +899,38 @@ mod commander_thread {
 		Fut: Future + MaybeSend + 'static,
 		Fut::Output: Send + 'static,
 	{
-		let runtime = get_or_init_async_runtime();
+		#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+		{
+			let runtime = get_or_init_async_runtime();
 
-		let (fut_builder, handle) = make_future_builder_with_handle(pause_signal, f);
+			let (fut_builder, handle) =
+				make_future_builder_with_handle(pause_signal, f, WorkerStart::default());
 
-		runtime.build_and_spawn(fut_builder);
+			runtime.build_and_spawn(fut_builder);
 
-		handle
+			handle
+		}
+		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+		{
+			let mut slot = COMMANDER_RUNTIME_HANDLE
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner);
+			// A worker given up on dropped its inbox, closing the channel.
+			if slot
+				.as_ref()
+				.is_some_and(|runtime| runtime.sender.is_closed())
+			{
+				*slot = None;
+			}
+			let runtime = slot.get_or_insert_with(RuntimeHandle::new);
+
+			let (fut_builder, handle) =
+				make_future_builder_with_handle(pause_signal, f, runtime.start.clone());
+
+			runtime.build_and_spawn(fut_builder);
+
+			handle
+		}
 	}
 
 	/// Runs an async function on a dedicated 'commander' worker thread, returning the result.
@@ -640,7 +976,11 @@ mod wasm_threading {
 	use filen_macros::js_type;
 	use wasm_bindgen::prelude::*;
 
-	use super::worker_handle::{WORKER_HANDLE, WorkerHandle};
+	use super::{
+		worker_handle::{WORKER_HANDLE, WorkerHandle},
+		worker_start::load_error,
+	};
+	use crate::error::WorkerStartupError;
 
 	#[js_type(export, no_deser, no_default)]
 	pub struct WorkerInitEvent {
@@ -698,7 +1038,13 @@ mod wasm_threading {
 	/// Spawns a web worker to run the given closure.
 	///
 	/// Currently hangs around forever unless manually terminated.
-	pub(super) fn spawn_worker(f: impl FnOnce() + Send + 'static) -> Result<(), JsValue> {
+	///
+	/// `on_error` gets every `error` event the worker raises, including the one for a script that
+	/// failed to load.
+	pub(super) fn spawn_worker(
+		f: impl FnOnce() + Send + 'static,
+		on_error: impl Fn(WorkerStartupError) + 'static,
+	) -> Result<(), JsValue> {
 		let options = web_sys::WorkerOptions::new();
 		options.set_type(web_sys::WorkerType::Module);
 		let worker = web_sys::Worker::new_with_options("./filen-sdk-worker-thread.js", &options)?;
@@ -723,16 +1069,14 @@ mod wasm_threading {
 		// the only direct evidence of the death (it pairs with the cache's init-ack timeout).
 		// Not always an ErrorEvent: a worker whose script fails to load fires a plain Event (Firefox), and
 		// reading `message` off that hands undefined to wasm, throwing inside the handler and losing the log.
-		let onerror =
-			Closure::<dyn FnMut(web_sys::Event)>::new(|e: web_sys::Event| match e
-				.dyn_ref::<web_sys::ErrorEvent>()
-			{
-				Some(error) => tracing::error!("worker startup/runtime error: {}", error.message()),
-				None => tracing::error!(
-					"worker startup/runtime error: {} event without details",
-					e.type_()
-				),
-			});
+		let onerror = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+			let error = load_error(
+				e.dyn_ref::<web_sys::ErrorEvent>()
+					.map(web_sys::ErrorEvent::message),
+			);
+			tracing::error!("worker startup/runtime error: {error}");
+			on_error(error);
+		});
 		worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 		// The handler must outlive the worker; one small leaked closure per spawn is acceptable.
 		onerror.forget();
@@ -779,7 +1123,7 @@ where
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
 		use wasm_bindgen::UnwrapThrowExt;
-		wasm_threading::spawn_worker(f).expect_throw("Failed to spawn worker");
+		wasm_threading::spawn_worker(f, |_| {}).expect_throw("Failed to spawn worker");
 	}
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	{
@@ -861,9 +1205,12 @@ where
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	{
 		use wasm_bindgen::UnwrapThrowExt;
-		wasm_threading::spawn_worker(|| {
-			spawn_local_on_worker(f());
-		})
+		wasm_threading::spawn_worker(
+			|| {
+				spawn_local_on_worker(f());
+			},
+			|_| {},
+		)
 		.expect_throw("Failed to spawn worker");
 	}
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -876,6 +1223,76 @@ where
 
 			runtime.block_on(f());
 		});
+	}
+}
+
+/// [`spawn_async`] for a worker that is waited on through `input`, typically the receiving end of
+/// its request channel: `f` gets `input` only once the worker runs. On wasm a worker that cannot
+/// be created, fails to load or has not started within `WORKER_START_TIMEOUT` is given up on
+/// instead, and `input` dropped, so its senders see the channel close; the returned
+/// [`WorkerStart`] says why. `name` labels the worker in wasm logs.
+#[cfg(not(all(
+	target_family = "wasm",
+	target_os = "unknown",
+	not(feature = "wasm-full")
+)))]
+pub(crate) fn spawn_async_claiming<R, F, Fut>(name: &'static str, input: R, f: F) -> WorkerStart
+where
+	R: Send + 'static,
+	F: FnOnce(R) -> Fut + Send + 'static,
+	Fut: Future<Output = ()> + 'static,
+{
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	{
+		use std::sync::Arc;
+
+		use worker_start::{WORKER_START_TIMEOUT, WorkerInbox};
+
+		use crate::error::WorkerStartupError;
+
+		fn give_up<R>(name: &str, inbox: &WorkerInbox<R>, reason: WorkerStartupError) {
+			if inbox.abandon(reason)
+				&& let Some(reason) = inbox.start().reason()
+			{
+				tracing::error!(
+					"giving up on the {name} worker, failing what waits on it: {reason}"
+				);
+			}
+		}
+
+		let inbox = Arc::new(WorkerInbox::new(input));
+		let start = inbox.start().clone();
+		let worker_inbox = Arc::clone(&inbox);
+		let error_inbox = Arc::clone(&inbox);
+
+		let spawned = wasm_threading::spawn_worker(
+			move || {
+				let Some(input) = worker_inbox.claim() else {
+					tracing::warn!("{name} worker started after it was given up on; exiting");
+					return;
+				};
+				spawn_local_on_worker(f(input));
+			},
+			move |error| give_up(name, &error_inbox, error),
+		);
+		match spawned {
+			Ok(()) => spawn_local_on_worker(async move {
+				crate::util::sleep(WORKER_START_TIMEOUT).await;
+				give_up(
+					name,
+					&inbox,
+					WorkerStartupError::TimedOut(WORKER_START_TIMEOUT),
+				);
+			}),
+			Err(e) => give_up(name, &inbox, WorkerStartupError::Spawn(format!("{e:?}"))),
+		}
+		start
+	}
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	{
+		let _ = name;
+		spawn_async(move || f(input));
+		WorkerStart::default()
 	}
 }
 
