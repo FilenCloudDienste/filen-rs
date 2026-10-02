@@ -99,7 +99,9 @@ pub struct SyncReport {
 	pub guard: Option<GuardReason>,
 	/// Set when the guard held deletions: the token identifying THIS held batch, to hand back to
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions). It changes if the
-	/// batch changes, so an approval can never leak onto a different set of deletions.
+	/// batch changes or is held for another kind of [`guard`](Self::guard) reason, so an approval
+	/// can never leak onto a different set of deletions, nor onto the same ones held for a reason
+	/// the caller was never shown.
 	pub deletion_token: Option<String>,
 	/// Per-action failures (the pass continues past them; one that ran out of room also holds back
 	/// the transfers behind it, see [`halted`](Self::halted)).
