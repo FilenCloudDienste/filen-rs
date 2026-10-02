@@ -156,8 +156,39 @@ pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<(
 	});
 // todo: might we also be able to use this for general cancellability? (e.g. for long-running commands like upload/download)
 
-#[tokio::main]
-async fn main() {
+/// The most blocking threads the runtime runs at once, in place of tokio's default of 512.
+///
+/// Every `tokio::fs` call (each read and write of a transferred file, its open, metadata and
+/// rename), every DNS lookup and every `spawn_blocking` takes one, and an idle one lives on for
+/// 10 s. With `--concurrency 256` a transfer or `sync` would burst to hundreds of threads, and on
+/// Linux glibc gives each new thread its own malloc arena (up to 8 per core) and keeps what is
+/// freed there for reuse, so resident memory ratchets up with every burst. Tasks past the cap
+/// queue instead of failing.
+///
+/// The cap only has to stay above the threads that can sit waiting on work that needs one too.
+/// The blocking tasks on the sync path touch the disk or the baseline database and never wait on
+/// async work. The held-deletion and search prompts hold one each until the user answers, and on
+/// Windows a running rclone's stdout and stderr readers hold one each. A directory download's
+/// walker holds one while it blocks on a channel that its downloads drain, and those downloads
+/// write through `tokio::fs`, so they need threads of their own.
+///
+/// That walker only holds its thread while its download runs, and the REPL runs one command at a
+/// time. Ctrl-C at the REPL drops the download, which aborts its downloads and closes the walker's
+/// channel, so the walker stops at its next entry and gives the thread back rather than staying
+/// blocked after the REPL has moved on.
+const MAX_BLOCKING_THREADS: usize = 32;
+
+fn main() {
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.max_blocking_threads(MAX_BLOCKING_THREADS)
+		.build()
+		// The panic `#[tokio::main]` raised: nothing runs without the runtime.
+		.expect("Failed building the Runtime")
+		.block_on(async_main());
+}
+
+async fn async_main() {
 	let mut ui = ui::UI::new();
 	// call ui.initialize() later after parsing args
 
