@@ -191,6 +191,10 @@ pub enum ErrorKind {
 	/// all of them when it cannot get the drive lock in time; its report's top-level items list
 	/// the folders it kept.
 	ArchiveWrongPassword,
+	/// A 7z entry is stored in a solid block after more bytes of other files than the download
+	/// allowed to decode and throw away before it. Its source, a `SolidSkipExceeded` reached with
+	/// [`Error::downcast_ref`], carries the numbers.
+	ArchiveSolidSkipExceeded,
 }
 
 /// Custom error type for the SDK

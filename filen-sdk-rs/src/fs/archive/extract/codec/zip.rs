@@ -105,6 +105,11 @@ fn check_zip_password<R: Read + Seek>(
 	let Some(password) = password else {
 		return Ok(PasswordCheck::Required);
 	};
+	// a download's one entry proves the password as it is read: probing it first would read it
+	// twice
+	if !walk.probes_password() {
+		return Ok(PasswordCheck::Unchecked);
+	}
 	// a password verifier alone lets a wrong password through now and then; reading the smallest
 	// entry in full checks it against the CRC-32 or authentication code too. An empty entry
 	// proves little (ZipCrypto's check byte lets 1 in 256 wrong passwords through, and its CRC

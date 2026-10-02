@@ -3,6 +3,7 @@
 
 mod client_impl;
 pub(super) mod codec;
+mod download;
 mod engine;
 mod list;
 pub(super) mod report;
@@ -25,7 +26,11 @@ use crate::{
 
 use codec::Selection;
 
-pub use client_impl::{ExtractConfig, ListConfig};
+pub use client_impl::{EntryDownloadConfig, ExtractConfig, ListConfig};
+pub use download::{
+	EntryDownloadCallback, EntryDownloadFailed, EntryDownloadPhase, EntryDownloadReport,
+	EntryDownloadUpdate, SolidSkipExceeded,
+};
 pub use list::{
 	ArchiveEntry, ArchiveEntryKind, EntryAccess, ListCallback, ListFailed, ListPhase, ListReport,
 	ListTotals, ListUpdate, ListedPath, ListedSkipReason, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES,

@@ -19,6 +19,7 @@ use crate::{
 			error::read_failure,
 			extract::{
 				ExtractSkipReason,
+				download::EntryDownloadError,
 				list::{ArchiveEntry, ArchiveEntryKind, EntryAccess, ListedPath, ListedSkipReason},
 				report::ArchiveEntryId,
 			},
@@ -37,6 +38,15 @@ pub(crate) enum Task {
 	Extract(Option<Selection>),
 	/// Sends what every entry of the archive `archive` is, and none of their data.
 	List { archive: Uuid },
+	/// Sends one file entry with its data, as a partial extraction of it alone does, without
+	/// checking the password on an entry up front: nothing is created that a wrong password
+	/// would have to undo, and the entry proves the password as it is read. A 7z entry its
+	/// solid block stores after more than `max_solid_skip` bytes of other files is refused
+	/// before any of the block is read; `None` allows any.
+	Download {
+		selection: Selection,
+		max_solid_skip: Option<u64>,
+	},
 }
 
 /// The entries a partial extraction takes, and the directory they are extracted relative to.
@@ -330,6 +340,11 @@ enum Mode {
 	Extract { chooser: Option<Chooser> },
 	/// A listing of `archive`.
 	List { archive: Uuid },
+	/// A download of the one file entry chosen (see [`Task::Download`]).
+	Download {
+		chooser: Chooser,
+		max_solid_skip: Option<u64>,
+	},
 }
 
 impl<'p> Walk<'p> {
@@ -346,6 +361,13 @@ impl<'p> Walk<'p> {
 				chooser: selection.clone().map(Chooser::new),
 			},
 			Task::List { archive } => Mode::List { archive: *archive },
+			Task::Download {
+				selection,
+				max_solid_skip,
+			} => Mode::Download {
+				chooser: Chooser::new(selection.clone()),
+				max_solid_skip: *max_solid_skip,
+			},
 		};
 		Self {
 			port,
@@ -359,10 +381,11 @@ impl<'p> Walk<'p> {
 		matches!(self.mode, Mode::List { .. })
 	}
 
-	/// What a partial extraction chose.
+	/// What a partial extraction, or a download, chose.
 	fn chooser(&self) -> Option<&Chooser> {
 		match &self.mode {
 			Mode::Extract { chooser } => chooser.as_ref(),
+			Mode::Download { chooser, .. } => Some(chooser),
 			Mode::List { .. } => None,
 		}
 	}
@@ -370,8 +393,30 @@ impl<'p> Walk<'p> {
 	fn chooser_mut(&mut self) -> Option<&mut Chooser> {
 		match &mut self.mode {
 			Mode::Extract { chooser } => chooser.as_mut(),
+			Mode::Download { chooser, .. } => Some(chooser),
 			Mode::List { .. } => None,
 		}
+	}
+
+	/// Whether the password is checked on an entry up front, before any is sent: not for a
+	/// download, whose one entry proves it as it is read.
+	pub(super) fn probes_password(&self) -> bool {
+		!matches!(self.mode, Mode::Download { .. })
+	}
+
+	/// Most a download's 7z solid block may decode and throw away before its entry; `None` when
+	/// any skip is allowed, and for anything but a download.
+	pub(super) fn max_solid_skip(&self) -> Option<u64> {
+		match self.mode {
+			Mode::Download { max_solid_skip, .. } => max_solid_skip,
+			Mode::Extract { .. } | Mode::List { .. } => None,
+		}
+	}
+
+	/// Whether entry `ordinal` was chosen (by a partial extraction or a download).
+	pub(super) fn chose(&self, ordinal: u64) -> bool {
+		self.chooser()
+			.is_some_and(|chooser| chooser.chosen(ordinal))
 	}
 
 	/// Whether AppleDouble files are left out (see [`Verdict::Take`]).
@@ -383,17 +428,19 @@ impl<'p> Walk<'p> {
 	pub(super) fn listed_id(&self, ordinal: u64) -> ArchiveEntryId {
 		match self.mode {
 			Mode::List { archive } => ArchiveEntryId::of(archive, ordinal),
-			Mode::Extract { .. } => unreachable!("only a listing lists"),
+			Mode::Extract { .. } | Mode::Download { .. } => unreachable!("only a listing lists"),
 		}
 	}
 
 	/// Checks, before anything is created, a partial extraction of an archive whose entries are
 	/// all known up front (a zip's or 7z's): that it holds every entry chosen, each below the
-	/// base. Directories chosen are noted, so what is below one is chosen wherever it is stored.
+	/// base. Directories chosen are noted, so what is below one is chosen wherever it is stored;
+	/// a download refuses one, as it takes a file alone.
 	pub(super) fn check_selection<'e>(
 		&mut self,
 		entries: impl Iterator<Item = (u64, &'e str, bool)>,
 	) -> Result<(), Error> {
+		let downloading = matches!(self.mode, Mode::Download { .. });
 		let Some(chooser) = self.chooser_mut() else {
 			return Ok(());
 		};
@@ -403,6 +450,11 @@ impl<'p> Walk<'p> {
 				continue;
 			}
 			found += 1;
+			// refused here rather than at its first event: what is below it would be sent first,
+			// and a 7z would decode a solid block up to that
+			if downloading && is_dir {
+				return Err(EntryDownloadError::NotAFile.into());
+			}
 			if let Ok(path) = entry_path(stored) {
 				let keys = chooser.below_base(&path)?;
 				if is_dir {

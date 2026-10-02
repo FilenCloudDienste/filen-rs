@@ -39,13 +39,15 @@ pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition
 pub use encode::Compression;
 pub use extract::{
 	ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ArchiveSource, DuplicateEntries, EntryAccess,
-	EntrySelection, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
-	ExtractEvent, ExtractFailed, ExtractFailure, ExtractMisleadingName, ExtractPhase,
-	ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractRequest, ExtractRetry,
-	ExtractRoot, ExtractSkipReason, ExtractSkippedEntry, ExtractStage, ExtractTopLevelKey,
-	ExtractUpdate, ExtractWhat, ExtractedTopLevel, ListCallback, ListConfig, ListFailed, ListPhase,
-	ListReport, ListTotals, ListUpdate, ListedPath, ListedSkipReason, MAX_LISTED_BYTES,
-	MAX_LISTED_ENTRIES, OmittedRecords, PasswordCheck,
+	EntryDownloadCallback, EntryDownloadConfig, EntryDownloadFailed, EntryDownloadPhase,
+	EntryDownloadReport, EntryDownloadUpdate, EntrySelection, ExpansionLimit, ExtractActiveFile,
+	ExtractCallback, ExtractConfig, ExtractEvent, ExtractFailed, ExtractFailure,
+	ExtractMisleadingName, ExtractPhase, ExtractRenameReason, ExtractRenamedEntry, ExtractReport,
+	ExtractRequest, ExtractRetry, ExtractRoot, ExtractSkipReason, ExtractSkippedEntry,
+	ExtractStage, ExtractTopLevelKey, ExtractUpdate, ExtractWhat, ExtractedTopLevel, ListCallback,
+	ListConfig, ListFailed, ListPhase, ListReport, ListTotals, ListUpdate, ListedPath,
+	ListedSkipReason, MAX_LISTED_BYTES, MAX_LISTED_ENTRIES, OmittedRecords, PasswordCheck,
+	SolidSkipExceeded,
 };
 pub use format::{ArchiveFormat, StreamCodec, archive_default_name};
 pub use password::ArchivePassword;

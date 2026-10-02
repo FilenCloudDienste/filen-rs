@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use filen_types::fs::Uuid;
+use futures::AsyncWrite;
 
 use crate::{
 	auth::Client,
@@ -17,12 +18,14 @@ use crate::{
 		file::{enums::RemoteFileType, traits::HasFileInfo},
 	},
 	job::JobControl,
+	util::MaybeSend,
 };
 
 use super::{
-	ArchiveSource, ExpansionLimit, ExtractCallback, ExtractFailed, ExtractReport, ExtractRequest,
-	ExtractWhat,
+	ArchiveEntryId, ArchiveSource, EntryDownloadCallback, EntryDownloadFailed, EntryDownloadReport,
+	ExpansionLimit, ExtractCallback, ExtractFailed, ExtractReport, ExtractRequest, ExtractWhat,
 	codec::{CodecLimits, StreamJob, Task, extract_stream},
+	download::{DownloadTask, EntryDownloadReporter, choose_entry, run_download},
 	engine::{ArchiveDisposal, CodecResult, ExtractTask, run_extract},
 	list::{ListCallback, ListFailed, ListReport, ListReporter, ListTask, run_list},
 	report::Reporter,
@@ -123,6 +126,41 @@ impl ListConfig {
 			expansion_limit: self.expansion_limit,
 			skip_mac_metadata: self.skip_mac_metadata,
 			password: self.password,
+		}
+	}
+}
+
+/// How [`Client::download_archive_entry`] reads its archive. The client's [`ArchiveConfig`] sets
+/// the rest (codec memory, and how many archive jobs run at once).
+#[derive(Debug, Clone)]
+pub struct EntryDownloadConfig {
+	/// As [`ExtractConfig::expansion_limit`]: an archive whose entries state more in all than it
+	/// allows is refused before the entry is read; `None` turns the guard off.
+	pub expansion_limit: Option<ExpansionLimit>,
+	/// For an encrypted entry, or any entry of a 7z whose header is encrypted. Checked on the
+	/// entry itself as it is read, never on another entry first: a plain entry needs none.
+	pub password: Option<ArchivePassword>,
+	/// Most bytes a 7z solid block may decode and throw away before the entry: its
+	/// [`EntryAccess::SolidBlock`](super::EntryAccess::SolidBlock) `skipped_bytes`, as a
+	/// listing shows them. An entry stored after more fails with
+	/// [`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded) once
+	/// the index is read, before any of its block is fetched. `None` allows any skip. `Some(0)`
+	/// by default: a solid entry stored after others is downloaded only once the caller accepted
+	/// what it costs.
+	pub max_solid_skip: Option<u64>,
+}
+
+impl Default for EntryDownloadConfig {
+	fn default() -> Self {
+		let ExtractConfig {
+			expansion_limit,
+			password,
+			..
+		} = ExtractConfig::default();
+		Self {
+			expansion_limit,
+			password,
+			max_solid_skip: Some(0),
 		}
 	}
 }
@@ -258,6 +296,82 @@ impl Client {
 		})
 		.await
 	}
+
+	/// Writes the data of `entry`, a file of the zip or 7z `archive`, to `writer`, then closes
+	/// `writer`. Only the archive's first chunk (which tells its format), its index and the entry
+	/// are read, and for a 7z entry stored in a solid block, what the block stores before it as
+	/// well, decoded and thrown away (see [`EntryDownloadConfig::max_solid_skip`]).
+	///
+	/// Data reaches `writer` as it is decoded, before the CRC-32 or authentication code at its
+	/// end is checked: on `Err`, `writer` is left unclosed, and what it holds is unverified.
+	/// `report.checked` is `false` for a 7z entry whose header lists no CRC-32.
+	///
+	/// Fails before a byte is written for:
+	/// - a directory or a link, with [`ErrorKind::InvalidState`](crate::ErrorKind::InvalidState);
+	/// - an entry an extraction would skip (an unsafe path, an unsupported method, overlapping
+	///   data), with the kind its reason maps to;
+	/// - an id of another archive ([`ErrorKind::InvalidState`](crate::ErrorKind::InvalidState));
+	/// - a 7z entry stored after more of its solid block than `config.max_solid_skip` allows
+	///   ([`ErrorKind::ArchiveSolidSkipExceeded`](crate::ErrorKind::ArchiveSolidSkipExceeded)),
+	///   before any of its block is fetched;
+	/// - a tar or a single compressed file
+	///   ([`ErrorKind::ArchiveUnsupported`](crate::ErrorKind::ArchiveUnsupported)), which are
+	///   only read front to back.
+	///
+	/// The password is checked on this entry alone, as it is read: a plain entry needs none.
+	/// The download takes one of the [`ArchiveConfig::job_concurrency`] archive job slots,
+	/// reports its progress to `callback`, and can be paused and cancelled through `control`; a
+	/// pause takes effect between two writes to `writer`. It takes no drive lock and creates
+	/// nothing in the drive.
+	///
+	/// [`ArchiveConfig::job_concurrency`]: crate::fs::archive::ArchiveConfig::job_concurrency
+	pub async fn download_archive_entry<W>(
+		self: Arc<Self>,
+		archive: RemoteFileType<'static>,
+		entry: ArchiveEntryId,
+		writer: &mut W,
+		config: EntryDownloadConfig,
+		callback: impl EntryDownloadCallback,
+		control: JobControl,
+	) -> Result<EntryDownloadReport, EntryDownloadFailed>
+	where
+		W: AsyncWrite + Unpin + MaybeSend,
+	{
+		let reporter = EntryDownloadReporter::new(callback, archive.size());
+		let (archive, selection) = choose_entry(archive, entry, &reporter)?;
+		let archives = self.archives().clone();
+		let EntryDownloadConfig {
+			expansion_limit,
+			password,
+			max_solid_skip,
+		} = config;
+		// the entry was chosen by its id, so macOS metadata is not left out
+		let extraction = ExtractConfig {
+			max_bytes: None,
+			max_items: None,
+			expansion_limit,
+			password,
+			skip_mac_metadata: false,
+		};
+		let task = Task::Download {
+			selection,
+			max_solid_skip,
+		};
+		let start = start_codec(&archive, &archives, extraction, task);
+		run_download(
+			DownloadTask {
+				backend: Arc::new(ClientBackend::new(self)),
+				control,
+				reporter,
+				archive,
+				ordinal: u64::from(entry.index),
+				config: archives,
+				start,
+			},
+			writer,
+		)
+		.await
+	}
 }
 
 /// Starts the codec that reads `archive` for `task`, under the client's `archives` settings and
@@ -292,7 +406,7 @@ mod tests {
 		ErrorKind,
 		fs::{
 			archive::extract::{
-				ArchiveEntry, ArchiveEntryId, EntrySelection, ExtractRoot, ExtractUpdate,
+				ArchiveEntry, EntryDownloadUpdate, EntrySelection, ExtractRoot, ExtractUpdate,
 				ExtractedTopLevel, ListUpdate,
 			},
 			categories::{DirType, Normal},
@@ -313,6 +427,10 @@ mod tests {
 		fn on_update(&self, _: ListUpdate) {}
 	}
 
+	impl EntryDownloadCallback for Ignore {
+		fn on_update(&self, _: EntryDownloadUpdate) {}
+	}
+
 	#[test]
 	fn the_entries_chosen_are_checked_before_anything_runs() {
 		let archive = Uuid::from_u128(1);
@@ -329,8 +447,8 @@ mod tests {
 		}
 	}
 
-	/// The bindings run the extraction and the listing on the SDK's multi-threaded runtime,
-	/// which needs `Send` futures.
+	/// The bindings run the extraction, the listing and the download on the SDK's
+	/// multi-threaded runtime, which needs `Send` futures.
 	fn _extract_future_is_send(
 		client: Arc<Client>,
 		archive: RemoteFileType<'static>,
@@ -347,9 +465,21 @@ mod tests {
 			Ignore,
 			JobControl::default(),
 		));
-		assert_send(client.list_archive(
-			archive,
+		assert_send(client.clone().list_archive(
+			archive.clone(),
 			ListConfig::default(),
+			Ignore,
+			JobControl::default(),
+		));
+		let entry = ArchiveEntryId {
+			archive: archive.uuid(),
+			index: 0,
+		};
+		assert_send(client.download_archive_entry(
+			archive,
+			entry,
+			&mut futures::io::sink(),
+			EntryDownloadConfig::default(),
 			Ignore,
 			JobControl::default(),
 		));

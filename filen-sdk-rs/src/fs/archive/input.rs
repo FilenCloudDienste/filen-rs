@@ -1,8 +1,8 @@
 //! The archive as a reading codec gets it, for an extraction, a listing and a compression's
 //! read-back alike: fetched chunk by chunk as the codec asks, a few chunks ahead when the
 //! client's memory has room right now, and hashed as it is read; and the driver of a job that
-//! only reads its archive (a listing), which serves it, takes its events and its result, and
-//! gives it up when it stops moving.
+//! only reads its archive (a listing, an entry's download), which serves it, takes its events and
+//! its result, and gives it up when it stops moving.
 
 use std::{collections::VecDeque, sync::Arc};
 
@@ -485,7 +485,8 @@ pub(crate) trait FeedSink {
 	fn take(&mut self, event: WorkerEvent) -> impl Future<Output = Result<(), Error>> + MaybeSend;
 }
 
-/// The driver of a job that only reads its archive (a listing): it creates nothing.
+/// The driver of a job that only reads its archive (a listing, an entry's download): it creates
+/// nothing in the drive.
 pub(crate) struct ReadingDriver<'j, B, S: JobState, T> {
 	feed: CodecFeed<B, T>,
 	control: &'j JobControl,
@@ -574,9 +575,14 @@ impl<'j, B: DriveBackend, S: ReadsArchive, T> ReadingDriver<'j, B, S, T> {
 		}
 	}
 
+	/// Bytes of the archive the codec has read, each counted once.
+	pub(crate) fn bytes_read(&self) -> u64 {
+		self.feed.bytes_read()
+	}
+
 	/// Reports the bytes of the archive the codec has read.
 	fn report_bytes_read(&self) {
-		self.reporter.set_bytes_read(self.feed.bytes_read());
+		self.reporter.set_bytes_read(self.bytes_read());
 	}
 
 	fn tick(&mut self, pause_requested: bool) {

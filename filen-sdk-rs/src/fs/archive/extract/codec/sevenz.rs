@@ -6,23 +6,27 @@ use microthumb::BorrowedSeqReader;
 
 use crate::{
 	Error, ErrorKind,
-	fs::archive::{
-		error::read_failure,
-		extract::{
-			ExtractSkipReason,
-			list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
-			storage_exceeded,
-		},
-		format::ArchiveFormat,
-		limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
-		sevenz::{
-			SevenZError,
-			read::{
-				FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind, SevenZLimits, read_error,
-				read_index as read_sevenz_index, windows_link_target, wrong_key,
+	fs::{
+		archive::{
+			error::read_failure,
+			extract::{
+				ExtractSkipReason,
+				download::SolidSkipExceeded,
+				list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
+				storage_exceeded,
 			},
+			format::ArchiveFormat,
+			limits::{MAX_ARCHIVE_PATH_BYTES, display_path},
+			sevenz::{
+				SevenZError,
+				read::{
+					FolderCursor, Keys, SevenZEntry, SevenZIndex, SevenZKind, SevenZLimits,
+					read_error, read_index as read_sevenz_index, windows_link_target, wrong_key,
+				},
+			},
+			worker::{CachedInput, EntryKind, WorkerEvent, from_source},
 		},
-		worker::{CachedInput, EntryKind, WorkerEvent, from_source},
+		drive_job::exceeds_limit,
 	},
 };
 
@@ -74,6 +78,11 @@ fn check_sevenz_password<'s, R: Read + Seek + 's>(
 	}
 	if !keys.has_password() {
 		return Ok(PasswordCheck::Required);
+	}
+	// a download's one entry proves the password as it is read: probing it first would read it
+	// twice
+	if !walk.probes_password() {
+		return Ok(PasswordCheck::Unchecked);
 	}
 	let Some(probe) = encrypted
 		.filter_map(|entry| Some((entry, entry.stream?)))
@@ -178,6 +187,9 @@ pub(super) fn extract_sevenz(
 	);
 	if let Some(error) = storage_exceeded(job.limits.max_bytes, extracted) {
 		return Err(error);
+	}
+	if let Some(limit) = walk.max_solid_skip() {
+		check_solid_skip(&index, walk, limit)?;
 	}
 	let mut verified = check_sevenz_password(&mut cursor, &index, walk, &mut keys)?
 		.verified(SevenZError::PasswordRequired, SevenZError::WrongPassword)
@@ -363,6 +375,34 @@ fn sevenz_access(index: &SevenZIndex, entry: &SevenZEntry, folder_files: &[u64])
 		),
 		block_packed_bytes: packed_bytes,
 	}
+}
+
+/// Refuses a download of an entry its solid block stores after more than `limit` bytes of other
+/// files, from the index alone: before any of the block is fetched. The numbers are the ones the
+/// listing shows for it ([`sevenz_access`]).
+fn check_solid_skip(index: &SevenZIndex, walk: &Walk, limit: u64) -> Result<(), Error> {
+	let folder_files = folder_files(index);
+	for entry in index
+		.entries
+		.iter()
+		.filter(|entry| walk.chose(entry.ordinal))
+	{
+		if let EntryAccess::SolidBlock {
+			skipped_bytes,
+			estimated_packed_bytes,
+			..
+		} = sevenz_access(index, entry, &folder_files)
+			&& exceeds_limit(skipped_bytes, limit)
+		{
+			return Err(SolidSkipExceeded {
+				skipped_bytes,
+				limit,
+				estimated_packed_bytes,
+			}
+			.into());
+		}
+	}
+	Ok(())
 }
 
 /// Archive bytes fetched to reach the end of a file `size` bytes long, `skipped` bytes into a
