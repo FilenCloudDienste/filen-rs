@@ -12,11 +12,11 @@
 //! unit: executing half of it only produces a server rejection every pass. Pure and synchronous so
 //! the policy is fully unit-testable.
 
-use std::{collections::HashSet, fmt};
+use std::fmt;
 
 use num_traits::ToPrimitive;
 
-use super::plan::SyncAction;
+use super::plan::{SyncAction, replaced_paths};
 use crate::{Error, ErrorKind};
 
 /// Deletion-volume policy for one sync pair. The limit for a pass is
@@ -251,16 +251,7 @@ pub(crate) fn screen(
 			// A delete whose path is also (re)created this pass is half of a type flip: the create
 			// is rejected while the old item still exists, so releasing it alone would fail every
 			// pass and never let the baseline advance. Hold both halves together.
-			let deleted_paths: HashSet<&str> = actions
-				.iter()
-				.filter(|a| a.is_delete())
-				.map(SyncAction::rel_path)
-				.collect();
-			let replaced: HashSet<String> = actions
-				.iter()
-				.filter(|a| a.is_create() && deleted_paths.contains(a.rel_path()))
-				.map(|a| a.rel_path().to_string())
-				.collect();
+			let replaced = replaced_paths(&actions);
 			let (held, safe): (Vec<_>, Vec<_>) = actions
 				.into_iter()
 				.partition(|a| a.is_delete() || (a.is_create() && replaced.contains(a.rel_path())));

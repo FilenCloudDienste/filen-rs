@@ -147,7 +147,7 @@ impl SyncAction {
 	/// transfer). A delete whose path matches one of these in the SAME pass is a "replace" (a type
 	/// flip — old item removed, new-kind item created at the same path), and the delete must run
 	/// BEFORE the create or the server rejects it (the old same-name item still exists). See
-	/// [`order_actions`] and the apply layer.
+	/// [`replaced_paths`], which pairs them, [`order_actions`] and the apply layer.
 	pub(super) fn is_create(&self) -> bool {
 		matches!(
 			self,
@@ -3379,10 +3379,10 @@ const PHASE_TRANSFER: u8 = 5;
 const PHASE_DELETE: u8 = 6;
 const PHASE_CONFLICT: u8 = 7;
 
-/// The apply phase of an action given the set of paths the pass materializes (`create_targets`).
-/// See the `PHASE_*` constants; other deletes run LAST (child-before-parent) so a directory delete
-/// cannot strand an item an earlier move/transfer still needs.
-fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<String>) -> u8 {
+/// The apply phase of an action given the paths the pass deletes and creates again
+/// ([`replaced_paths`]). See the `PHASE_*` constants; other deletes run LAST (child-before-parent)
+/// so a directory delete cannot strand an item an earlier move/transfer still needs.
+fn action_phase(action: &SyncAction, replaced: &HashSet<String>) -> u8 {
 	match action {
 		SyncAction::MoveRemote {
 			kind: NodeKind::Dir,
@@ -3401,7 +3401,7 @@ fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<
 		| SyncAction::TrashRemote {
 			kind: NodeKind::File,
 			..
-		} if create_targets.contains(action.rel_path()) => PHASE_FILE_REPLACE_DELETE,
+		} if replaced.contains(action.rel_path()) => PHASE_FILE_REPLACE_DELETE,
 		// Baseline bookkeeping, no transfer/dependency — order is irrelevant; runs in `pre`.
 		SyncAction::AdoptBaseline { .. } => PHASE_CREATE,
 		// Directories that may host a move/transfer destination — created early, parent-before-child.
@@ -3411,7 +3411,7 @@ fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<
 		// Replace-delete of a DIRECTORY: recursive, so it runs only after the moves that carry
 		// items out of it — but still before the transfer that recreates the path as a file.
 		SyncAction::DeleteLocal { .. } | SyncAction::TrashRemote { .. }
-			if create_targets.contains(action.rel_path()) =>
+			if replaced.contains(action.rel_path()) =>
 		{
 			PHASE_DIR_REPLACE_DELETE
 		}
@@ -3424,12 +3424,34 @@ fn action_phase(action: &SyncAction, create_targets: &std::collections::HashSet<
 	}
 }
 
-/// Paths that a create/transfer materializes this pass (see [`SyncAction::is_create`]).
-pub(super) fn create_target_paths(actions: &[SyncAction]) -> std::collections::HashSet<String> {
-	actions
-		.iter()
-		.filter(|a| a.is_create())
-		.map(|a| a.rel_path().to_string())
+/// The paths a deletion of this pass empties and a create of the same pass fills again: the paths
+/// of its type flips (see [`SyncAction::is_create`]). A lookup for either half tells whether the
+/// action is part of one; a first sync, all creates, and a mass deletion, all deletions, hold none.
+pub(super) fn replaced_paths(actions: &[SyncAction]) -> HashSet<String> {
+	let paths = |deletions: bool| {
+		actions
+			.iter()
+			.filter(move |a| {
+				if deletions {
+					a.is_delete()
+				} else {
+					a.is_create()
+				}
+			})
+			.map(SyncAction::rel_path)
+	};
+	// Index the smaller side and probe it with the other: a first sync is all creates and a mass
+	// deletion all deletions, and neither indexes a single path.
+	let (deletions, creates) = (paths(true).count(), paths(false).count());
+	let index_deletions = deletions <= creates;
+	let mut index: HashSet<&str> = HashSet::with_capacity(deletions.min(creates));
+	index.extend(paths(index_deletions));
+	paths(!index_deletions)
+		.filter(|path| index.contains(path))
+		// Owned, not borrowed from `actions`: `order_actions` sorts them, and `apply` and the guard's
+		// `screen` move out of them, while the set is still read. It holds only the type flips,
+		// usually none.
+		.map(str::to_owned)
 		.collect()
 }
 
@@ -3539,12 +3561,9 @@ pub(super) fn fold_subsumed_deletes(actions: &mut Vec<SyncAction>) -> Subsumed {
 /// put the old item's removal ahead of the create at that path, with the directory case held back
 /// until after the moves because trashing a directory takes its whole subtree with it.
 fn order_actions(actions: &mut [SyncAction]) {
-	let create_targets = create_target_paths(actions);
+	let replaced = replaced_paths(actions);
 	actions.sort_by(|a, b| {
-		let (pa, pb) = (
-			action_phase(a, &create_targets),
-			action_phase(b, &create_targets),
-		);
+		let (pa, pb) = (action_phase(a, &replaced), action_phase(b, &replaced));
 		if pa != pb {
 			pa.cmp(&pb)
 		} else if pa == PHASE_DIR_REPLACE_DELETE || pa == PHASE_DELETE {
@@ -3571,7 +3590,7 @@ mod tests {
 		},
 		*,
 	};
-	use crate::sync_engine::SyncMode;
+	use crate::{alloc_meter, sync_engine::SyncMode};
 
 	/// Reconcile with no pending writes — the ordinary case; the cache-lag window has its own tests.
 	fn plan(
@@ -6902,6 +6921,76 @@ mod tests {
 			],
 			"a recursive dir trash must follow the moves out of it, and precede the create at its path"
 		);
+	}
+
+	/// The paths a pass both deletes and creates are the first halves of its type flips; a path
+	/// only one side of that touches is not among them.
+	#[test]
+	fn the_replaced_paths_are_the_deletions_a_create_fills_again() {
+		let actions = [
+			SyncAction::TrashRemote {
+				rel_path: "x".to_owned(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(1),
+			},
+			SyncAction::DeleteLocal {
+				rel_path: "y".to_owned(),
+				kind: NodeKind::Dir,
+			},
+			SyncAction::TrashRemote {
+				rel_path: "z".to_owned(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(2),
+			},
+			SyncAction::DeleteLocal {
+				rel_path: "v".to_owned(),
+				kind: NodeKind::File,
+			},
+			SyncAction::CreateRemoteDir {
+				rel_path: "x".to_owned(),
+			},
+			SyncAction::DownloadFile {
+				rel_path: "y".to_owned(),
+				remote_uuid: Uuid::from_u128(3),
+			},
+			SyncAction::UploadFile {
+				rel_path: "w".to_owned(),
+			},
+		];
+		assert_eq!(
+			replaced_paths(&actions),
+			HashSet::from(["x".to_owned(), "y".to_owned()])
+		);
+	}
+
+	/// A first sync plans nothing but creates, so it replaces nothing, and finding that out
+	/// allocates nothing — not an owned path per planned item, which apply would keep until the
+	/// pass ends.
+	#[test]
+	fn a_first_sync_keeps_no_path_for_its_replaced_deletions() {
+		let actions: Vec<SyncAction> = (0..10_000)
+			.map(|n| SyncAction::UploadFile {
+				rel_path: format!("d{:02}/f{n:05}.txt", n % 100),
+			})
+			.collect();
+		let (replaced, peak) = alloc_meter::peak_bytes(|| replaced_paths(&actions));
+		assert_eq!(peak, 0, "10_000 uploads and no deletion");
+		assert!(replaced.is_empty());
+	}
+
+	/// The same holds the other way round: a pass that deletes a whole tree and creates nothing
+	/// replaces nothing, and allocates nothing to find that out.
+	#[test]
+	fn a_mass_deletion_keeps_no_path_for_its_replaced_deletions() {
+		let actions: Vec<SyncAction> = (0..10_000)
+			.map(|n| SyncAction::DeleteLocal {
+				rel_path: format!("d{:02}/f{n:05}.txt", n % 100),
+				kind: NodeKind::File,
+			})
+			.collect();
+		let (replaced, peak) = alloc_meter::peak_bytes(|| replaced_paths(&actions));
+		assert_eq!(peak, 0, "10_000 deletions and no create");
+		assert!(replaced.is_empty());
 	}
 
 	#[test]
