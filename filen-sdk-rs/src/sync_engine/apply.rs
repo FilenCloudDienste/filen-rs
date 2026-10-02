@@ -32,7 +32,7 @@ use super::{
 		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SharedStore,
 		locked, off_store,
 	},
-	events::SyncEvent,
+	events::{SyncEvent, TransferDirection},
 	guard::GuardReason,
 	ignore::IgnoredPath,
 	outcome::{
@@ -1511,6 +1511,7 @@ async fn apply_transfer(
 					Some(progress_callback(
 						progress,
 						rel_path,
+						TransferDirection::Download,
 						ctx.remote.at(rel_path).map_or(0, |node| node.size),
 					)),
 				))
@@ -1596,6 +1597,7 @@ async fn apply_transfer(
 					Some(progress_callback(
 						progress,
 						rel_path,
+						TransferDirection::Upload,
 						ctx.local.at(rel_path).map_or(0, |node| node.size),
 					)),
 				))
@@ -1682,13 +1684,14 @@ async fn apply_transfer(
 	Ok(Transfer::Done)
 }
 
-/// The SDK progress callback for the transfer of `rel_path`. The SDK hands it byte deltas, already
-/// throttled to one call per 200 ms plus a final flush; it adds them up and queues a
+/// The SDK progress callback for the transfer of `rel_path` going `direction`. The SDK hands it byte
+/// deltas, already throttled to one call per 200 ms plus a final flush; it adds them up and queues a
 /// [`SyncEvent::Progress`] for the apply loop to deliver. The running total is updated and sent
 /// under one lock, so the queued `bytes` never go down even if two chunk futures report at once.
 fn progress_callback<'a>(
 	progress: &'a UnboundedSender<SyncEvent>,
 	rel_path: &'a str,
+	direction: TransferDirection,
 	total: u64,
 ) -> MaybeSendCallback<'a, u64> {
 	let bytes = std::sync::Mutex::new(0u64);
@@ -1699,6 +1702,7 @@ fn progress_callback<'a>(
 		// while one is still reporting.
 		let _ = progress.send(SyncEvent::Progress {
 			rel_path: rel_path.to_string(),
+			direction,
 			bytes: *bytes,
 			total,
 		});
@@ -2823,16 +2827,17 @@ mod tests {
 	}
 
 	/// The SDK reports byte deltas; the engine turns them into a running total for the path, with
-	/// the planned size alongside.
+	/// the transfer's direction and the planned size alongside.
 	#[test]
 	fn progress_callback_reports_a_running_total() {
 		let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-		let callback = progress_callback(&sender, "dir/f.bin", 12);
+		let callback = progress_callback(&sender, "dir/f.bin", TransferDirection::Upload, 12);
 		callback(5);
 		callback(7);
 		drop(callback);
 		let progress = |bytes| SyncEvent::Progress {
 			rel_path: "dir/f.bin".to_string(),
+			direction: TransferDirection::Upload,
 			bytes,
 			total: 12,
 		};
