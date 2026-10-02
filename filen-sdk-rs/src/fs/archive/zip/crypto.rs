@@ -8,6 +8,7 @@ use ctr::{
 	Ctr128LE,
 	cipher::{KeyIvInit, StreamCipher},
 };
+use filen_macros::js_type;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use zeroize::Zeroizing;
@@ -28,6 +29,7 @@ pub(crate) const ZIP_CRYPTO_HEADER_LEN_U64: u64 = ZIP_CRYPTO_HEADER_LEN as u64;
 
 /// The key size of a WinZip AES entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub enum AesStrength {
 	Aes128,
 	Aes192,

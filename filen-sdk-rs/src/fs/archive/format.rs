@@ -10,9 +10,14 @@
 //! codecs': a plain tar starts with its first member's path, which can spell `LZIP` or `BZh9`,
 //! while a compressed stream passing a header checksum by chance is all but impossible.
 
+use filen_macros::js_type;
+
+use crate::fs::name::{ValidatedName, keep_both::SourceName};
+
 /// A single-stream compression codec: a standalone compressed file, or the outer layer of a
 /// compressed tar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[js_type(import, export, no_default)]
 pub enum StreamCodec {
 	/// gzip (`.gz`).
 	Gzip,
@@ -215,6 +220,14 @@ pub fn archive_default_name(name: &str) -> &str {
 		),
 		None => name,
 	}
+}
+
+/// The folder an archive named `name` is extracted into by default: [`archive_default_name`],
+/// made into a valid name, or `Archive` when nothing of it is left.
+pub(crate) fn extract_folder_name(name: Option<&str>) -> ValidatedName {
+	SourceName::parse(name.map(archive_default_name).unwrap_or(""))
+		.map(SourceName::into_name)
+		.unwrap_or_else(|_| ValidatedName::try_from("Archive").expect("a valid name"))
 }
 
 #[cfg(test)]

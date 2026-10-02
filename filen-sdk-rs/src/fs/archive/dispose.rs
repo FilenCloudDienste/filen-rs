@@ -12,6 +12,7 @@
 //! directory is not seen, and ends up in the trash with the directory, where it can be
 //! restored.
 
+use filen_macros::js_type;
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	future::Future,
@@ -34,6 +35,7 @@ use crate::{
 
 /// What to do with a job's sources once its result is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub enum SourceDisposal {
 	/// Move them to the trash, where they can be restored. Frees no storage until the trash is
 	/// emptied.

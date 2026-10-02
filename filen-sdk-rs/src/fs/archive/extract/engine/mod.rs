@@ -52,7 +52,7 @@ use crate::{
 				DisposalBackend, DisposalOutcome, ExpectedFile, KeptReason, SourceDisposal,
 				SourceDisposition, Tree, dir_digest, dispose_file, file_digest,
 			},
-			format::archive_default_name,
+			format::extract_folder_name,
 			names::{DirId, PathResolver, PlannedDir, ROOT},
 			worker::{
 				ARCHIVE_STALL_TIMEOUT, EntryHead, EntryKind, SkippedMember, StreamLayout,
@@ -77,7 +77,7 @@ use crate::{
 		},
 		name::{
 			ValidatedName,
-			keep_both::{NameShape, SourceName, TakenNames},
+			keep_both::{NameShape, TakenNames},
 		},
 	},
 	job::{JobControl, Stopped, report::OpGuard},
@@ -1040,10 +1040,7 @@ impl<B: DisposalBackend> Driver<B> {
 	}
 
 	fn default_folder_name(&self) -> ValidatedName {
-		let name = self.archive.name().map(archive_default_name).unwrap_or("");
-		SourceName::parse(name)
-			.map(SourceName::into_name)
-			.unwrap_or_else(|_| ValidatedName::try_from("Archive").expect("a valid name"))
+		extract_folder_name(self.archive.name())
 	}
 
 	/// Creates the folder entries are extracted into.

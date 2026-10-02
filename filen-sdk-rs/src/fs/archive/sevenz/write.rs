@@ -7,6 +7,7 @@
 use std::io::{self, Read, Write};
 
 use chrono::{DateTime, Utc};
+use filen_macros::js_type;
 
 use super::{
 	crypto::{AesCbcWriter, AesProps, Key, WRITE_CYCLES_POWER, derive_key},
@@ -36,6 +37,7 @@ const PPMD_ORDERS: [u8; 10] = [3, 4, 4, 5, 5, 6, 8, 16, 24, 32];
 
 /// How a 7z's files are compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, tagged, camel_case_fields, no_default)]
 pub enum SevenZMethod {
 	/// Stored as they are.
 	Copy,
@@ -111,6 +113,7 @@ fn ppmd_memory(level: u32) -> u32 {
 
 /// What a 7z's encryption covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub enum SevenZEncryption {
 	/// The files' data; names, sizes and CRCs stay readable.
 	Entries,

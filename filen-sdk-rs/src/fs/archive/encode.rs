@@ -8,6 +8,7 @@ use std::{
 	ops::RangeInclusive,
 };
 
+use filen_macros::js_type;
 use lz4_flex::frame::{BlockSize, FrameEncoder, FrameInfo};
 use lzma_rust2::{LzipOptions, LzipWriter, LzmaOptions, LzmaWriter, XzOptions, XzWriter};
 
@@ -17,9 +18,12 @@ use super::format::StreamCodec;
 
 /// A codec and its level; `None` is the codec's default level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub struct Compression {
 	/// The codec that compresses the stream.
 	pub codec: StreamCodec,
+	/// The codec's level, in its own scale (see [`CompressFormat::levels`](super::CompressFormat::levels)).
+	#[cfg_attr(feature = "wasm-full", serde(default), tsify(optional))]
 	pub level: Option<u32>,
 }
 

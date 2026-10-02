@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::{
@@ -26,6 +27,7 @@ use crate::fs::archive::dispose::SourceDisposition;
 
 /// Where an extraction is. The last three are where it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum ExtractPhase {
 	/// Waiting for another archive job to finish; nothing is held meanwhile.
 	WaitingForWorker,
@@ -53,6 +55,7 @@ impl JobPhase for ExtractPhase {
 
 /// An archive entry. Only meaningful with the archive it came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[js_type(export, no_deser, no_default)]
 pub struct ArchiveEntryId {
 	/// The archive's uuid.
 	pub archive: Uuid,
@@ -62,6 +65,17 @@ pub struct ArchiveEntryId {
 
 /// How much there is to extract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+	feature = "wasm-full",
+	derive(serde::Serialize, tsify::Tsify),
+	tsify(into_wasm_abi, large_number_types_as_bigints),
+	serde(
+		tag = "type",
+		rename_all = "camelCase",
+		rename_all_fields = "camelCase"
+	)
+)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum ArchiveTotals {
 	/// An archive read front to back, whose entries are only known as they come: progress is
 	/// how much of the archive has been read.
@@ -70,6 +84,7 @@ pub enum ArchiveTotals {
 
 /// A file being extracted right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractActiveFile {
 	/// The entry being extracted.
 	pub entry: ArchiveEntryId,
@@ -87,6 +102,7 @@ pub struct ExtractActiveFile {
 
 /// What failed for an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
 pub enum ExtractStage {
 	/// Creating the directory, or for a file the directory it goes in.
 	CreateDirectory,
@@ -123,6 +139,7 @@ pub struct ExtractFailure {
 
 /// An entry the extraction left out on purpose.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractSkippedEntry {
 	/// The entry left out.
 	pub entry: ArchiveEntryId,
@@ -138,6 +155,7 @@ pub struct ExtractSkippedEntry {
 
 /// Why an entry was created under another name than the archive gives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum ExtractRenameReason {
 	/// The name was taken in its directory (by another entry, or an item already there), so
 	/// the entry got the next keep-both name.
@@ -150,6 +168,7 @@ pub enum ExtractRenameReason {
 /// An entry created under another name than the archive gives it; recorded once it is created,
 /// with the name it got then.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct ExtractRenamedEntry {
 	/// The renamed entry.
 	pub entry: ArchiveEntryId,
@@ -163,6 +182,7 @@ pub struct ExtractRenamedEntry {
 
 /// Which created item a top-level item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
 pub enum ExtractTopLevelKey {
 	/// The folder the archive was extracted into.
 	Root,
@@ -185,6 +205,7 @@ pub struct ExtractedTopLevel {
 
 /// Records a report only counts, past [`MAX_REPORT_RECORDS`] of each kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct OmittedRecords {
 	/// Skipped entries left out of `skipped`.
 	pub skipped: u64,

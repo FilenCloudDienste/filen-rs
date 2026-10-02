@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use filen_macros::js_type;
 use filen_types::fs::Uuid;
 
 use crate::{
@@ -26,6 +27,7 @@ pub use crate::job::report::RunState;
 
 /// Where a compression is. The last three are where it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum CompressPhase {
 	/// Listing the sources.
 	Scanning,
@@ -52,6 +54,7 @@ impl JobPhase for CompressPhase {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct CompressCounts {
 	/// Files written into the archive.
 	pub files_done: u64,

@@ -8,6 +8,7 @@
 use std::io::{self, Read, Write};
 
 use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use filen_macros::js_type;
 
 use super::{
 	crypto::{AesStrength, AesWriter},
@@ -30,6 +31,7 @@ const ZIP64_ENTRY_THRESHOLD: u64 = 0xF000_0000;
 
 /// How a zip entry's data is compressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, tagged, camel_case_fields, no_default)]
 pub enum ZipMethod {
 	/// The data as it is. Every entry ends in a data descriptor (its CRC-32 is only known once
 	/// the data is written), which readers that go through a zip front to back without its
@@ -49,6 +51,15 @@ pub enum ZipMethod {
 }
 
 impl ZipMethod {
+	/// The method's level, checked against its range.
+	pub(crate) fn check(self) -> Result<(), &'static str> {
+		match self {
+			Self::Stored => Ok(()),
+			Self::Deflate { level } | Self::Bzip2 { level } if (1..=9).contains(&level) => Ok(()),
+			Self::Deflate { .. } | Self::Bzip2 { .. } => Err("zip compression takes levels 1 to 9"),
+		}
+	}
+
 	fn code(self) -> u16 {
 		match self {
 			Self::Stored => METHOD_STORED,
