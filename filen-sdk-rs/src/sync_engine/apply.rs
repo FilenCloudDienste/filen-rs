@@ -40,7 +40,7 @@ use super::{
 		RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
-	plan::{RemoteNode, Subsumed, SyncAction, create_target_paths, is_under},
+	plan::{RemoteNode, Subsumed, SyncAction, is_under, replaced_paths},
 	rows::Baseline,
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::NodesAt,
@@ -420,12 +420,12 @@ pub(super) async fn apply(
 	// A "replace-delete" (a delete whose path is (re)created this pass — a file<->dir type flip) is
 	// routed into `pre` so it runs BEFORE the create at that path (the actions are already ordered
 	// so it sorts ahead of the create); otherwise the server rejects the create (old item exists).
-	let create_targets = create_target_paths(&actions);
+	let replaced = replaced_paths(&actions);
 	let mut pre = Vec::new();
 	let mut transfers = Vec::new();
 	let mut post = Vec::new();
 	for action in actions {
-		if action.is_delete() && create_targets.contains(action.rel_path()) {
+		if action.is_delete() && replaced.contains(action.rel_path()) {
 			pre.push(action);
 		} else if is_transfer(&action) {
 			transfers.push(action);
@@ -444,7 +444,7 @@ pub(super) async fn apply(
 	// Where the drive lock may be let go: before an action no earlier one is still waiting on.
 	let releasable = {
 		let order: Vec<&SyncAction> = pre.iter().chain(&transfers).chain(&post).collect();
-		release_points(&order, &create_targets)
+		release_points(&order, &replaced)
 	};
 	let (pre_release, rest) = releasable.split_at(pre.len());
 	let (transfer_release, post_release) = rest.split_at(transfers.len());
@@ -832,7 +832,7 @@ fn moved_dir(action: &SyncAction) -> Option<&str> {
 /// transfer) assumes the move has just happened. A deletion under a moved directory names its item
 /// by uuid and ties nothing. Every other boundary is between independent actions — each one's write
 /// already committed — and so is every boundary between phases that no such tie crosses.
-fn release_points(order: &[&SyncAction], create_targets: &HashSet<String>) -> Vec<bool> {
+fn release_points(order: &[&SyncAction], replaced: &HashSet<String>) -> Vec<bool> {
 	// The last position at which each path is created, transferred or moved from or to.
 	let mut last: BTreeMap<&str, usize> = BTreeMap::new();
 	for (position, action) in order.iter().enumerate() {
@@ -848,7 +848,7 @@ fn release_points(order: &[&SyncAction], create_targets: &HashSet<String>) -> Ve
 		.enumerate()
 		.map(|(position, action)| {
 			let releasable = reach.is_none_or(|reach| reach < position);
-			let tied_until = if action.is_delete() && create_targets.contains(action.rel_path()) {
+			let tied_until = if action.is_delete() && replaced.contains(action.rel_path()) {
 				last.get(action.rel_path()).copied()
 			} else if let Some(dir) = moved_dir(action) {
 				let prefix = format!("{dir}/");
@@ -2756,7 +2756,7 @@ mod tests {
 
 	fn release_points_of(order: &[SyncAction]) -> Vec<bool> {
 		let refs: Vec<&SyncAction> = order.iter().collect();
-		release_points(&refs, &create_target_paths(order))
+		release_points(&refs, &replaced_paths(order))
 	}
 
 	/// Between independent actions — and across phases no tie crosses — the lock may go anywhere.
