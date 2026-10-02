@@ -4757,8 +4757,16 @@ impl SyncEngine {
 			Ok(report) => next_pass_scope(report),
 			Err(_) => Some(FullPassReason::InterruptedPass),
 		};
-		if let Some(reason) = next_scope {
-			self.force_full_pass(pair, reason).await;
+		match next_scope {
+			// A hold makes the next pass whole without making it due (see
+			// `PairChanges::note_deletion_hold`).
+			Some(FullPassReason::DeletionHold) => {
+				if let Some(changes) = self.existing_pair_changes(pair).await {
+					changes.note_deletion_hold();
+				}
+			}
+			Some(reason) => self.force_full_pass(pair, reason).await,
+			None => {}
 		}
 		if let Err(error) = &result {
 			observer(SyncEvent::PassFailed {
@@ -4840,7 +4848,7 @@ impl SyncEngine {
 			Err(_) => HashMap::new(),
 		};
 		let owed = facts::carry_over(
-			decision.safe.iter().chain(&decision.held),
+			decision,
 			&report.conflicts,
 			&prep.holds.held_remote,
 			&failures,
@@ -4887,24 +4895,29 @@ impl SyncEngine {
 		// land in between and be overwritten by a row written from a read that predates it. Taken
 		// under the gate: a cancel reaches a pass waiting for it as well as one reading.
 		let reading = self.reading_lock(pair).await;
-		// Both changelists, taken BEFORE either side is read: everything in them is either already
-		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
-		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
 		let changes = self.pair_changes(pair).await;
-		let mut scope = changes.take();
-		let (dirty_local, dirty_remote) = scope.sizes();
 		// Nothing announced on either side, nothing owed by the last plan, and nothing forcing a
 		// whole read: there is no pass to run. A watch wake that lands here does nothing at all —
 		// no `PassStarted`, and the safety net goes on measuring from the last whole read — because
 		// reading two trees to discover there was nothing to do is the cost this scoping exists to
 		// remove. An explicit `sync_once` still runs: its caller asked for a pass and wants the
 		// report, and may well have beaten its own watcher's event.
-		if when_idle == WhenIdle::Skip && scope.is_idle() {
+		//
+		// Asked BEFORE anything is taken, so a skipped wake leaves every list and reason to the
+		// pass that runs — a deletion hold among them, which by itself is no reason to run one:
+		// two trees nothing has changed in would only hold the identical batch again (see
+		// `FullPassReason::DeletionHold`).
+		if when_idle == WhenIdle::Skip && changes.is_idle() {
 			tracing::debug!(
 				"sync_once[pair {pair}]: nothing announced since the last pass — no pass run"
 			);
 			return Ok(SyncReport::default());
 		}
+		// Both changelists, taken BEFORE either side is read: everything in them is either already
+		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
+		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
+		let mut scope = changes.take();
+		let (dirty_local, dirty_remote) = scope.sizes();
 		// What reading both sides costs this pair — measured over the read and nothing else, since
 		// the watch's safety net scales its interval by it (see `SyncReport::read_cost`).
 		let read_started = Instant::now();
@@ -5272,7 +5285,9 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	// EVERY deletion hold, including the volume threshold and the first-sync hold: an approval
 	// names one exact batch, and the pass that offers it again has to reproduce it from the same
 	// absences — which were observations the holding pass consumed (see
-	// [`FullPassReason::DeletionHold`]).
+	// [`FullPassReason::DeletionHold`]). The caller records this row apart from the others: it
+	// makes the next pass whole without making it due, so a wake that announced nothing new does
+	// not re-read two unchanged trees only to hold the identical batch again.
 	if report.guard.is_some() {
 		return Some(FullPassReason::DeletionHold);
 	}
