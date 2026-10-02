@@ -5225,6 +5225,9 @@ impl SyncEngine {
 			};
 			screened.pass_token = None;
 		}
+		// The unscreened plan is read only to release an approved batch, just above: freed here
+		// rather than carried through the apply as a second copy of the plan.
+		drop(screened.all);
 		let mut decision = screened.decision;
 		report.conflicts = screened.conflicts;
 		// `held` can also carry the create half of a held type flip; `held_deletions()` counts only
