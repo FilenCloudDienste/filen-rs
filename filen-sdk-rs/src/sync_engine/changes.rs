@@ -72,7 +72,7 @@ use std::{
 	collections::BTreeSet,
 	fmt, mem,
 	path::Path,
-	sync::{Mutex, MutexGuard, PoisonError},
+	sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use filen_types::crypto::Blake3Hash;
@@ -80,6 +80,7 @@ use notify::{
 	Event, EventKind,
 	event::{AccessKind, AccessMode},
 };
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::{ignore::FILENIGNORE, scan::normalize_rel_path};
@@ -162,8 +163,10 @@ pub enum FullPassReason {
 	/// A hold alone does not make a pass due: re-reading two trees nothing has changed in only
 	/// holds the identical batch again, so a watch wake that announced nothing new while a hold
 	/// stands is skipped like any idle one (see `PairChanges::is_idle`). The pass that does run —
-	/// for a change on either side, or the safety net — reads both sides whole, and this is its
-	/// reason when nothing more specific is.
+	/// for a change on either side, the safety net, or an
+	/// [`approval`](super::SyncEngine::approve_deletions), which forces this reason itself and
+	/// wakes the pair's watch — reads both sides whole, and this is its reason when nothing more
+	/// specific is.
 	///
 	/// Whole, because three of the holds want evidence only a whole-tree read supplies: an
 	/// incomplete scan, an unconverged remote, or a remote that listed nothing at all. The other
@@ -486,7 +489,15 @@ impl RemoteChange {
 /// compare and a push — both callbacks run on threads that must not be held up (`notify` delivers
 /// on its own thread; the cache callback runs inline on the worker between commits).
 #[derive(Debug, Default)]
-pub(super) struct PairChanges(Mutex<ChangeState>);
+pub(super) struct PairChanges {
+	state: Mutex<ChangeState>,
+	/// The pair's doorbell: rung by whatever gives its next pass something to do — the filesystem
+	/// watcher, the cache, an approval of held deletions — and waited on by the pair's watch loop.
+	/// Owned here, with the changelists, so the engine can ring it without knowing whether a watch
+	/// is running: rung with nobody waiting, it keeps one wake for the next wait. `Arc`: the watch's
+	/// trigger callbacks and its loop each hold it on their own threads.
+	doorbell: Arc<Notify>,
+}
 
 #[derive(Debug, Default)]
 struct ChangeState {
@@ -734,6 +745,17 @@ impl PairChanges {
 		self.state().held = true;
 	}
 
+	/// The pair's doorbell, for a watch to wait on and to hand its trigger sources.
+	pub(super) fn doorbell(&self) -> Arc<Notify> {
+		Arc::clone(&self.doorbell)
+	}
+
+	/// Wake the pair's watch, if one is running, for a pass at its debounce rather than its next
+	/// trigger.
+	pub(super) fn ring(&self) {
+		self.doorbell.notify_one();
+	}
+
 	/// Take both changelists for a pass — called BEFORE it reads either side (see the module docs
 	/// on alignment). What arrives afterwards belongs to the next pass.
 	pub(super) fn take(&self) -> PassScope {
@@ -788,7 +810,7 @@ impl PairChanges {
 
 	fn state(&self) -> MutexGuard<'_, ChangeState> {
 		// Plain data behind the lock: a panic while holding it cannot leave the state inconsistent.
-		self.0.lock().unwrap_or_else(PoisonError::into_inner)
+		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 }
 
