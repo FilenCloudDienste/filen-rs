@@ -76,7 +76,7 @@ pub use changes::FullPassReason;
 pub use engine::{
 	CONFIRM_TENURE, ConflictResolution, PATH_FAILURE_RETRY_INTERVAL, PairOverlap, SyncEngine,
 };
-pub use events::{SyncEvent, SyncObserver};
+pub use events::{SyncEvent, SyncObserver, TransferDirection};
 pub use guard::{DeleteGuard, GuardReason};
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
