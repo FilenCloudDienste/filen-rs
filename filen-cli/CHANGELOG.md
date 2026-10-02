@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - /
 
+## 0.2.9 - 2026-10-02
+
+### Security
+
+- authenticate rclone process with a random password to prevent unauthorized access to the Rclone RC API
+
 ## 0.2.8 - 2026-09-29
 
 ### Added
