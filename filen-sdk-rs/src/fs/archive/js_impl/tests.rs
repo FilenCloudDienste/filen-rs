@@ -569,6 +569,9 @@ fn archive_entry(index: u32) -> ArchiveEntry {
 		method: Some("Deflate".into()),
 		skip: None,
 		mac_metadata: false,
+		access: Some(extract::EntryAccess::Direct {
+			packed_bytes: u64::from(index) * 2,
+		}),
 	}
 }
 

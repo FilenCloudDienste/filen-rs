@@ -10,7 +10,7 @@ use crate::{
 		error::read_failure,
 		extract::{
 			ExtractSkipReason,
-			list::{ArchiveEntryKind, PasswordCheck},
+			list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
 			storage_exceeded,
 		},
 		format::ArchiveFormat,
@@ -287,12 +287,14 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		.send(WorkerEvent::Opened(ArchiveFormat::SevenZ))
 		.map_err(read_failure)?;
 	let within_limit = check_stated_size(job, index.entries.iter().map(|entry| entry.size)).is_ok();
+	let folder_files = folder_files(index);
 	for entry in &index.entries {
+		let access = sevenz_access(index, entry, &folder_files);
 		let cheap = entry
 			.stream
 			.is_some_and(|stream| stream.offset.saturating_add(entry.size) <= LIST_READ_BYTES);
 		if !(within_limit && cheap) {
-			walk.list(sevenz_unread(index, entry), None)?;
+			walk.list(sevenz_unread(index, entry), None, access)?;
 			continue;
 		}
 		// an encrypted link's data unread for a wrong or missing password leaves it listed as
@@ -318,7 +320,7 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		} else {
 			None
 		};
-		walk.list(found, apple_double)?;
+		walk.list(found, apple_double, access)?;
 	}
 	walk.send_mac_folders().map_err(read_failure)?;
 	Ok(ArchiveEnd {
@@ -327,6 +329,57 @@ fn list_sevenz<'s, R: Read + Seek + 's>(
 		unchecked_entries: 0,
 		password: checked,
 	})
+}
+
+/// How many files store their data in each of `index`'s folders.
+fn folder_files(index: &SevenZIndex) -> Vec<u64> {
+	let mut files = vec![0u64; index.folders.len()];
+	for stream in index.entries.iter().filter_map(|entry| entry.stream) {
+		// a stream's folder is one of the index's, and the index bounds the entries counted
+		files[stream.folder] += 1;
+	}
+	files
+}
+
+/// What reading `entry` alone costs, given how many files each folder holds
+/// ([`folder_files`]): its folder's packed streams when it is the folder's only file, otherwise
+/// what the block stores before it as well.
+fn sevenz_access(index: &SevenZIndex, entry: &SevenZEntry, folder_files: &[u64]) -> EntryAccess {
+	let Some(stream) = entry.stream else {
+		return EntryAccess::Direct { packed_bytes: 0 };
+	};
+	let folder = &index.folders[stream.folder];
+	let packed_bytes = folder.packed_bytes(&index.pack_sizes);
+	if folder_files[stream.folder] <= 1 {
+		return EntryAccess::Direct { packed_bytes };
+	}
+	EntryAccess::SolidBlock {
+		skipped_bytes: stream.offset,
+		estimated_packed_bytes: solid_estimate(
+			packed_bytes,
+			folder.size(),
+			stream.offset,
+			entry.size,
+		),
+		block_packed_bytes: packed_bytes,
+	}
+}
+
+/// Archive bytes fetched to reach the end of a file `size` bytes long, `skipped` bytes into a
+/// solid block of `block_size` bytes packed into `block_packed`, at the block's average ratio:
+/// ⌈block_packed × (skipped + size) ÷ block_size⌉, at most `block_packed`; a block stating no
+/// size gives `block_packed`.
+pub(super) fn solid_estimate(block_packed: u64, block_size: u64, skipped: u64, size: u64) -> u64 {
+	if block_size == 0 {
+		return block_packed;
+	}
+	let reached = u128::from(skipped) + u128::from(size);
+	// a product past u128, divided by a u64, is still past `block_packed`
+	u128::from(block_packed)
+		.checked_mul(reached)
+		.map(|bytes| bytes.div_ceil(u128::from(block_size)))
+		.and_then(|estimate| u64::try_from(estimate).ok())
+		.map_or(block_packed, |estimate| estimate.min(block_packed))
 }
 
 /// What a 7z entry is by its header alone: before its data is read, or when it cannot be (a

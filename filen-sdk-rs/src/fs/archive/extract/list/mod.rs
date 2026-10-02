@@ -63,6 +63,38 @@ pub enum ArchiveEntryKind {
 	Other,
 }
 
+/// What reading one entry alone (extracting only it, with
+/// [`ExtractWhat::Entries`](super::ExtractWhat::Entries)) reads of the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, tagged, camel_case_fields, no_default)]
+pub enum EntryAccess {
+	/// Only its own data is fetched and decoded: any zip entry, and a 7z entry stored alone
+	/// in its folder (the archive, or this part of it, is not solid).
+	Direct {
+		/// Archive bytes its data takes: a zip entry's compressed size (its local header, 30
+		/// bytes plus its name and extra field, comes on top); a 7z folder's packed size, 0
+		/// for an empty 7z file, which no folder stores.
+		packed_bytes: u64,
+	},
+	/// A 7z entry in a solid block: a folder storing several files as one compressed
+	/// stream. The files the block stores before it are fetched and decoded first, then
+	/// thrown away.
+	SolidBlock {
+		/// Bytes decoded and thrown away before the entry's first byte: the sizes of the
+		/// files the block stores before it. Exact. 0 for the block's first file.
+		skipped_bytes: u64,
+		/// Archive bytes fetched to reach the entry's end, at the block's average
+		/// compression ratio: ⌈block_packed_bytes × (skipped_bytes + size) ÷ the block's
+		/// unpacked size⌉, at most `block_packed_bytes`. An estimate: compression is rarely
+		/// even across a block.
+		estimated_packed_bytes: u64,
+		/// The block's packed size: the most a read of this entry fetches. Exact.
+		block_packed_bytes: u64,
+	},
+	/// Only read front to back: a tar's member, or a single compressed file.
+	Sequential,
+}
+
 /// An entry of an archive, and what extracting it would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]
@@ -111,6 +143,9 @@ pub struct ArchiveEntry {
 	/// does, once every entry was listed: skipped when everything in it is left out, not when it
 	/// holds anything of the user's, or nothing. See the extraction's `skip_mac_metadata`.
 	pub mac_metadata: bool,
+	/// What reading it alone costs; `None` unless `kind` is `File` (a directory, link, device or
+	/// other entry holds no file to read).
+	pub access: Option<EntryAccess>,
 }
 
 /// Why extracting a listed entry would skip it: an [`ExtractSkipReason`] without a link's

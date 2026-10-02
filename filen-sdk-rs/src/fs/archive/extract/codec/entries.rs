@@ -19,7 +19,7 @@ use crate::{
 			error::read_failure,
 			extract::{
 				ExtractSkipReason,
-				list::{ArchiveEntry, ArchiveEntryKind, ListedPath, ListedSkipReason},
+				list::{ArchiveEntry, ArchiveEntryKind, EntryAccess, ListedPath, ListedSkipReason},
 				report::ArchiveEntryId,
 			},
 			limits::display_path,
@@ -531,11 +531,13 @@ impl<'p> Walk<'p> {
 	}
 
 	/// Sends what a listing says of `found`; what an extraction does with it. `apple_double` is
-	/// what its data told, when read; otherwise its name decides.
+	/// what its data told, when read; otherwise its name decides. `access` is what reading it
+	/// alone costs, listed for a file only.
 	pub(super) fn list(
 		&mut self,
 		found: Found,
 		apple_double: Option<bool>,
+		access: EntryAccess,
 	) -> Result<Listed, Error> {
 		if found.is_dir() && matches!(found.path, Err(PathRejection::Empty)) {
 			// the archive's own root, which no extraction creates
@@ -594,6 +596,7 @@ impl<'p> Walk<'p> {
 			method: found.method,
 			skip,
 			mac_metadata,
+			access: (found.kind == ArchiveEntryKind::File).then_some(access),
 			kind: found.kind,
 		};
 		if held && let Ok(stored) = found.path {

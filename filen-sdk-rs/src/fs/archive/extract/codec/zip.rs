@@ -15,7 +15,7 @@ use crate::{
 		error::read_failure,
 		extract::{
 			DuplicateEntries, ExtractSkipReason,
-			list::{ArchiveEntryKind, PasswordCheck},
+			list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
 			storage_exceeded,
 		},
 		format::ArchiveFormat,
@@ -306,7 +306,10 @@ fn list_zip(
 			Some(PreRead::AppleDouble(apple_double)) => (None, Some(apple_double)),
 			Some(PreRead::Unread) | None => (None, None),
 		};
-		walk.list(zip_found(entry, overlapping, target), apple_double)?;
+		let access = EntryAccess::Direct {
+			packed_bytes: entry.compressed_size,
+		};
+		walk.list(zip_found(entry, overlapping, target), apple_double, access)?;
 	}
 	walk.send_mac_folders().map_err(read_failure)?;
 	// what the index shows: the bytes around and between entries would take reading every

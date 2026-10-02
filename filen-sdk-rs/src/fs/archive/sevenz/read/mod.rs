@@ -200,6 +200,16 @@ impl Folder {
 		self.coders.iter().all(|coder| coder.method.is_some())
 	}
 
+	/// The bytes of its packed streams in the archive. `pack_sizes` are the archive's, which
+	/// `first_pack` indexes.
+	pub(crate) fn packed_bytes(&self, pack_sizes: &[u64]) -> u64 {
+		// the folders take the packed streams in turn, each as many as it has inputs fed from
+		// them, which the index checked add up to `pack_sizes`
+		pack_sizes[self.first_pack..self.first_pack + self.packed.len()]
+			.iter()
+			.fold(0, |total, &size| total.saturating_add(size))
+	}
+
 	fn first_input(&self, coder: usize) -> usize {
 		self.coders[..coder].iter().map(|c| c.inputs).sum()
 	}
@@ -531,10 +541,9 @@ pub(crate) fn read_index<R: Read + Seek>(
 		used[stream.folder] = true;
 	}
 	for (folder, _) in index.folders.iter().zip(used).filter(|(_, used)| !used) {
-		let packed = &index.pack_sizes[folder.first_pack..folder.first_pack + folder.packed.len()];
-		index.unaccounted_bytes = packed.iter().fold(index.unaccounted_bytes, |total, &size| {
-			total.saturating_add(size)
-		});
+		index.unaccounted_bytes = index
+			.unaccounted_bytes
+			.saturating_add(folder.packed_bytes(&index.pack_sizes));
 	}
 	Ok(index)
 }

@@ -38,7 +38,7 @@ pub use config::ArchiveConfig;
 pub use dispose::{DisposalOutcome, KeptReason, SourceDisposal, SourceDisposition};
 pub use encode::Compression;
 pub use extract::{
-	ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ArchiveSource, DuplicateEntries,
+	ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ArchiveSource, DuplicateEntries, EntryAccess,
 	EntrySelection, ExpansionLimit, ExtractActiveFile, ExtractCallback, ExtractConfig,
 	ExtractEvent, ExtractFailed, ExtractFailure, ExtractMisleadingName, ExtractPhase,
 	ExtractRenameReason, ExtractRenamedEntry, ExtractReport, ExtractRequest, ExtractRetry,

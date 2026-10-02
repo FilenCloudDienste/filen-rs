@@ -33,7 +33,7 @@ use crate::{
 
 use super::{
 	DuplicateEntries, ExpansionLimit, ExtractSkipReason,
-	list::{ArchiveEntryKind, PasswordCheck},
+	list::{ArchiveEntryKind, EntryAccess, PasswordCheck},
 };
 use entries::{Found, Verdict, Walk, apple_double};
 pub(crate) use entries::{LinkKeys, Selection, Task};
@@ -220,7 +220,7 @@ fn extract_single(
 	let files = if walk.listing() {
 		// what it decodes to is only known once it is decoded
 		found.size = io::copy(&mut decoded, &mut io::sink()).map_err(read_failure)?;
-		walk.list(found, None)?;
+		walk.list(found, None, EntryAccess::Sequential)?;
 		0
 	} else {
 		match walk.judge(&found)? {

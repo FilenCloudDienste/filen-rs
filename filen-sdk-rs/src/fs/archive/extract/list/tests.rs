@@ -16,8 +16,12 @@ use crate::{
 		archive::{
 			extract::test_support::{ListRecorder, Listing, Setup, list, setup, test_config},
 			format::StreamCodec,
-			test_support::{gzip, incompressible, tar_of, zip_of},
-			zip::read::{CENTRAL_HEADER_LEN, EOCD_LEN},
+			sevenz::write::SevenZMethod,
+			test_support::{gzip, incompressible, pattern, sevenz_of, tar_of, zip_of},
+			zip::{
+				read::{CENTRAL_HEADER_LEN, EOCD_LEN},
+				write::{ZipMethod, ZipWriter},
+			},
 		},
 		drive_job::test_support::{Request, wait_until},
 	},
@@ -258,6 +262,158 @@ async fn long_paths_fill_a_listings_bytes_before_its_count() {
 	assert_eq!(recorder.entries.lock().unwrap().len(), names.len());
 }
 
+/// Each entry `archive`, named `name`, lists: its stored path, and what reading it alone costs.
+async fn listed_access(name: &str, archive: Vec<u8>) -> Vec<(String, Option<EntryAccess>)> {
+	let setup = setup(name, archive, |_| {});
+	let listing = list(&setup, JobControl::default(), test_config());
+	let listed = listing.running.await.unwrap().unwrap();
+	listed
+		.entries
+		.into_iter()
+		.map(|entry| (entry.stored_path, entry.access))
+		.collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zip_entry_lists_direct_access_with_its_compressed_size() {
+	// stored, so its compressed size is its size
+	let mut writer = ZipWriter::new(Vec::new());
+	writer.add_dir("docs", None).unwrap();
+	writer
+		.add_file(
+			"docs/a.bin",
+			None,
+			300,
+			ZipMethod::Stored,
+			None,
+			&mut &pattern(300, 1)[..],
+		)
+		.unwrap();
+	let zip = writer.finish().unwrap();
+	assert_eq!(
+		listed_access("stored.zip", zip).await,
+		[
+			("docs/".to_owned(), None),
+			(
+				"docs/a.bin".to_owned(),
+				Some(EntryAccess::Direct { packed_bytes: 300 })
+			),
+		]
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_7z_file_alone_in_its_folder_lists_direct_access_with_the_folders_packed_size() {
+	// copied, so a folder's packed size is its file's size; an empty file has no folder
+	let (a, b) = (pattern(100, 1), pattern(200, 2));
+	let sevenz = sevenz_of(
+		&[("a", Some(&a)), ("b", Some(&b)), ("empty", Some(b""))],
+		SevenZMethod::Copy,
+		false,
+		None,
+	);
+	assert_eq!(
+		listed_access("apart.7z", sevenz).await,
+		[
+			(
+				"a".to_owned(),
+				Some(EntryAccess::Direct { packed_bytes: 100 })
+			),
+			(
+				"b".to_owned(),
+				Some(EntryAccess::Direct { packed_bytes: 200 })
+			),
+			(
+				"empty".to_owned(),
+				Some(EntryAccess::Direct { packed_bytes: 0 })
+			),
+		]
+	);
+}
+
+/// What reading each file of a solid, copied 7z of `a` (100 bytes), `b` (200) and `c` (50)
+/// alone costs: its one block is 350 bytes, packed as unpacked.
+async fn solid_access() -> Vec<(String, Option<EntryAccess>)> {
+	let (a, b, c) = (pattern(100, 1), pattern(200, 2), pattern(50, 3));
+	let sevenz = sevenz_of(
+		&[("a", Some(&a)), ("b", Some(&b)), ("c", Some(&c))],
+		SevenZMethod::Copy,
+		true,
+		None,
+	);
+	listed_access("solid.7z", sevenz).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_7z_file_after_others_in_a_solid_block_lists_their_sizes_as_skipped() {
+	let listed = solid_access().await;
+	assert_eq!(
+		listed[1..],
+		[
+			(
+				"b".to_owned(),
+				Some(EntryAccess::SolidBlock {
+					skipped_bytes: 100,
+					estimated_packed_bytes: 300,
+					block_packed_bytes: 350,
+				})
+			),
+			(
+				"c".to_owned(),
+				Some(EntryAccess::SolidBlock {
+					skipped_bytes: 300,
+					estimated_packed_bytes: 350,
+					block_packed_bytes: 350,
+				})
+			),
+		]
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_file_of_a_solid_block_lists_nothing_skipped() {
+	let listed = solid_access().await;
+	assert_eq!(
+		listed[0],
+		(
+			"a".to_owned(),
+			Some(EntryAccess::SolidBlock {
+				skipped_bytes: 0,
+				estimated_packed_bytes: 100,
+				block_packed_bytes: 350,
+			})
+		)
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_member_lists_sequential_access() {
+	let tar = tar_of(&[("a.txt", b"a")]);
+	let single = gzip(b"note");
+	assert_eq!(
+		listed_access("bundle.tar", tar).await,
+		[("a.txt".to_owned(), Some(EntryAccess::Sequential))]
+	);
+	assert_eq!(
+		listed_access("note.txt.gz", single).await,
+		[("note.txt".to_owned(), Some(EntryAccess::Sequential))]
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_lists_no_access() {
+	let tar = tar_of(&[("docs/", b"")]);
+	let zip = zip_of(&[("docs", None)], None);
+	assert_eq!(
+		listed_access("dir.tar", tar).await,
+		[("docs/".to_owned(), None)]
+	);
+	assert_eq!(
+		listed_access("dir.zip", zip).await,
+		[("docs/".to_owned(), None)]
+	);
+}
+
 #[test]
 fn stated_sizes_add_up_without_overflowing() {
 	let entry = |skip| ArchiveEntry {
@@ -275,6 +431,7 @@ fn stated_sizes_add_up_without_overflowing() {
 		skip,
 		mac_metadata: false,
 		kind: ArchiveEntryKind::File,
+		access: Some(EntryAccess::Sequential),
 	};
 	let mut totals = ListTotals::default();
 	for skip in [None, Some(ListedSkipReason::UnsupportedMethod)] {

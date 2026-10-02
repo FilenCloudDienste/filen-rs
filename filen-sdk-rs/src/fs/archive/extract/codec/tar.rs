@@ -11,7 +11,7 @@ use crate::{
 		error::read_failure,
 		extract::{
 			ExtractSkipReason,
-			list::{ArchiveEntryKind, ListedSkipReason},
+			list::{ArchiveEntryKind, EntryAccess, ListedSkipReason},
 		},
 		limits::display_path,
 		tar_iter::{MemberKind, TarError, TarMember, TarReader},
@@ -284,7 +284,7 @@ fn list_member<R: Read>(
 	let key = shadowed.key(&found.path);
 	let size = found.size;
 	let is_dir = found.kind == ArchiveEntryKind::Dir;
-	let shadow = match walk.list(found, apple_double)? {
+	let shadow = match walk.list(found, apple_double, EntryAccess::Sequential)? {
 		_ if is_dir => Some(Shadow::Other),
 		Listed::Extracted => {
 			if let Some(key) = key {

@@ -26,8 +26,8 @@ use crate::{
 			decode::{CodecError, SKIPPABLE_FRAME_MAGIC},
 			encode::{Compression, open_encoder},
 			extract::{
-				ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, ExpansionLimit, ListedPath,
-				ListedSkipReason, PasswordCheck,
+				ArchiveEntry, ArchiveEntryId, ArchiveEntryKind, EntryAccess, ExpansionLimit,
+				ListedPath, ListedSkipReason, PasswordCheck,
 			},
 			format::StreamCodec,
 			sevenz::{
@@ -1599,7 +1599,8 @@ fn listed(archive: &[u8], job: StreamJob) -> (Vec<ArchiveEntry>, Result<ArchiveE
 /// The archive the listing tests list.
 const LISTED: Uuid = Uuid::from_u128(0x15);
 
-/// An entry of [`LISTED`], extracted to `path` (none when it cannot be), with no flag set.
+/// An entry of [`LISTED`], a tar or single compressed file, extracted to `path` (none when it
+/// cannot be), with no flag set: a file is read front to back.
 fn listed_entry(
 	index: u32,
 	stored: &str,
@@ -1616,6 +1617,7 @@ fn listed_entry(
 		stored_path: stored.to_owned(),
 		stored_path_truncated: false,
 		path: path.map(ListedPath::plain),
+		access: (kind == ArchiveEntryKind::File).then_some(EntryAccess::Sequential),
 		kind,
 		size,
 		modified: None,
@@ -2247,6 +2249,19 @@ fn a_7z_listing_says_whether_the_password_opens_its_entries() {
 		assert_eq!(entries.len(), 1);
 		assert!(entries[0].encrypted);
 	}
+}
+
+#[test]
+fn the_estimate_never_exceeds_the_blocks_packed_size() {
+	// (block packed, block size, skipped, size): a product past u128, a block stating no size,
+	// an even ratio, and a fraction of a byte rounded up
+	assert_eq!(
+		sevenz::solid_estimate(u64::MAX, 1, u64::MAX, u64::MAX),
+		u64::MAX
+	);
+	assert_eq!(sevenz::solid_estimate(10, 0, 5, 5), 10);
+	assert_eq!(sevenz::solid_estimate(350, 350, 100, 200), 300);
+	assert_eq!(sevenz::solid_estimate(3, 10, 0, 1), 1);
 }
 
 #[test]

@@ -2607,6 +2607,8 @@ test("listArchive lists an archive's entries and checks its password", async () 
 		["archived/notes.txt", BigInt(source.notes.length), true, undefined],
 		["archived/sub/data.bin", BigInt(source.data.length), true, undefined]
 	])
+	// a zip entry is read alone, from its own data
+	expect(files.map(entry => entry.access?.type)).toStrictEqual(["direct", "direct"])
 	expect(listing.totals).toMatchObject({ files: 2n, bytes: BigInt(source.notes.length + source.data.length), skipped: 0n })
 	expect(listing.entries.every(entry => entry.id.archive === archive!.uuid)).toBe(true)
 })
