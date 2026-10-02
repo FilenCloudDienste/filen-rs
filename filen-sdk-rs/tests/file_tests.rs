@@ -12,9 +12,10 @@ use filen_sdk_rs::{
 		categories::NonRootFileType,
 		dir::RemoteDirectory,
 		file::{
+			FileBuilderOptionalName,
 			client_impl::FileReaderSharedClientExt,
 			meta::{FileMeta, FileMetaChanges},
-			traits::{HasFileInfo, HasFileMeta},
+			traits::{HasFileInfo, HasFileMeta, HasRemoteFileInfo},
 		},
 		name::{EntryNameError, EntryNameErrorKind},
 	},
@@ -72,6 +73,59 @@ async fn file_upload_download() {
 	assert_file_upload_download_equal("big_not_chunk_aligned_under.exe", 1024 * 1024 * 8 - 1).await;
 	assert_file_upload_download_equal("empty.json", 0).await;
 	assert_file_upload_download_equal("one_chunk", 1024 * 1024).await;
+}
+
+async fn assert_file_upload_from_path_download_equal(name: &str, contents_len: usize) {
+	let mut contents = vec![0u8; contents_len];
+	rand::rng().try_fill_bytes(&mut contents).unwrap();
+	let local_dir = tempfile::tempdir().unwrap();
+	let path = local_dir.path().join(name);
+	std::fs::write(&path, &contents).unwrap();
+
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
+	let (file, _local) = client
+		.upload_file_from_path_with_builder(
+			FileBuilderOptionalName::new(resources.dir.uuid()),
+			path,
+			Some(Arc::new(move |bytes: u64| {
+				sender.send(bytes).unwrap();
+			}) as MaybeSendCallback<u64>),
+		)
+		.await
+		.unwrap();
+
+	assert_eq!(file.name(), Some(name));
+	assert_eq!(
+		file.size(),
+		contents_len as u64,
+		"File size mismatch for {name}"
+	);
+	assert_eq!(
+		file.hash(),
+		Some(blake3::hash(&contents).into()),
+		"File hash mismatch for {name}"
+	);
+	assert_eq!(
+		receiver.try_iter().sum::<u64>(),
+		contents_len as u64,
+		"Progress mismatch for {name}"
+	);
+	let buf = client.download_file(&file).await.unwrap();
+	assert_eq!(buf, contents, "File contents mismatch for {name}");
+}
+
+#[shared_test_runtime]
+async fn file_upload_from_path_download() {
+	assert_file_upload_from_path_download_equal("small.txt", 10).await;
+	assert_file_upload_from_path_download_equal("one_chunk", 1024 * 1024).await;
+	assert_file_upload_from_path_download_equal("chunk_aligned.exe", 1024 * 1024 * 8).await;
+	assert_file_upload_from_path_download_equal("not_chunk_aligned_over.exe", 1024 * 1024 * 8 + 1)
+		.await;
+	assert_file_upload_from_path_download_equal("not_chunk_aligned_under.exe", 1024 * 1024 * 8 - 1)
+		.await;
+	assert_file_upload_from_path_download_equal("empty.json", 0).await;
 }
 
 #[shared_test_runtime]

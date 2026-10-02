@@ -1006,3 +1006,40 @@ mod tests {
 		assert!(auth_info.convert_into_exportable(1).is_err());
 	}
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use base64::{Engine, prelude::BASE64_STANDARD};
+	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
+
+	use super::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
+
+	/// A client with no account and no network behind it, for tests that build files, keys and
+	/// writers but never send a request.
+	///
+	/// 512 bits because the key only has to parse: `from_stringified` derives a public key and an
+	/// HMAC key from it, and a 2048-bit key would cost each test half a second to generate.
+	pub(crate) fn offline_client() -> Client {
+		let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
+			.expect("generating a throwaway RSA key");
+		UnauthClient::from_config(ClientConfig::default())
+			.expect("building an unauthenticated client makes no network call")
+			.from_stringified(StringifiedClient {
+				email: "offline@example.invalid".to_owned(),
+				user_id: 1,
+				root_uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+				auth_info: "0".repeat(64),
+				private_key: BASE64_STANDARD.encode(
+					private_key
+						.to_pkcs8_der()
+						.expect("a freshly generated key encodes")
+						.as_bytes(),
+				),
+				api_key: String::new(),
+				auth_version: 2,
+				max_parallel_requests: None,
+				max_io_memory_usage: None,
+			})
+			.expect("the offline credentials parse")
+	}
+}

@@ -391,6 +391,66 @@ where
 		Ok(written)
 	}
 
+	/// See [`FileWriter::poll_next_chunk`].
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn poll_next_chunk(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<Chunk<'a>>> {
+		// a chunk with room left was the file's last, and a declared size is the file's end
+		let open = self.curr_chunk.is_none() && self.size.is_none_or(|size| self.written < size);
+		let Some(chunk_size) = open.then(|| self.next_chunk_size()).flatten() else {
+			return std::task::Poll::Ready(Err(std::io::Error::other(
+				"Cannot add a chunk past the end of the file",
+			)));
+		};
+		// EXIF backpressure, as in `poll_write`: no new chunk while the tee still holds bytes
+		if let Some(tee) = self.exif_tee.as_mut()
+			&& tee.poll_tee(cx, &[]).is_pending()
+		{
+			return std::task::Poll::Pending;
+		}
+		// an uploaded chunk's buffer is reused, and a failed upload fails the file
+		while let std::task::Poll::Ready(Some(uploaded)) = self.futures.poll_next_unpin(cx) {
+			self.allocated_chunks
+				.push(uploaded.map_err(std::io::Error::other)?);
+		}
+		if let Some(chunk) = self.allocated_chunks.pop() {
+			return std::task::Poll::Ready(Ok(chunk));
+		}
+		let client = self.client;
+		let alloc = self
+			.alloc_future
+			.get_or_insert_with(|| Box::pin(Chunk::acquire(chunk_size, client.client().state())));
+		let chunk = std::task::ready!(alloc.poll_unpin(cx));
+		self.alloc_future = None;
+		std::task::Poll::Ready(Ok(chunk))
+	}
+
+	/// See [`FileWriter::submit_chunk`].
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn submit_chunk(&mut self, chunk: Chunk<'a>) {
+		if chunk.as_ref().is_empty() {
+			// nothing to upload, and the budget gets the memory back
+			return;
+		}
+		self.written += chunk.len() as u64;
+		if let Some(tee) = self.exif_tee.as_mut() {
+			// No waker needed: on Pending the tee keeps the bytes, and the next `poll_next_chunk`
+			// or `poll_close` sends them first and waits on the parser then, with the caller's.
+			let _ = tee.poll_tee(
+				&mut std::task::Context::from_waker(std::task::Waker::noop()),
+				chunk.as_ref(),
+			);
+		}
+		if chunk.len() < CHUNK_SIZE {
+			// the file's last chunk, uploaded on close like a partly written one
+			self.curr_chunk = Some(chunk);
+		} else {
+			self.push_upload_next_chunk(chunk);
+		}
+	}
+
 	fn poll_write(
 		&mut self,
 		cx: &mut std::task::Context<'_>,
@@ -755,6 +815,23 @@ where
 	}
 }
 
+impl<'a, F, Fut> FileWriterState<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
+	/// The uploading phase, or the error writing in any later phase answers with.
+	fn uploading(&mut self) -> std::io::Result<&mut FileWriterUploadingState<'a, F, Fut>> {
+		match self {
+			FileWriterState::Uploading(uploading) => Ok(uploading),
+			FileWriterState::WaitingForDriveLock(_)
+			| FileWriterState::Completing(_)
+			| FileWriterState::Finalizing(_)
+			| FileWriterState::Complete(_) => Err(std::io::Error::other("Cannot write to a completed file")),
+			FileWriterState::Error(e) => Err(std::io::Error::other(*e)),
+		}
+	}
+}
+
 pub struct FileWriter<'a, F, Fut>
 where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
@@ -798,6 +875,39 @@ where
 	}
 }
 
+// Chunk by chunk, for a caller that reads the file's bytes into its chunks itself instead of
+// writing them through `AsyncWrite`. A file is written one way or the other, not both.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl<'a, F, Fut> FileWriter<'a, F, Fut>
+where
+	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
+{
+	/// The file's next chunk, empty: one an earlier chunk's upload is done with, or a new one
+	/// once the client's memory budget grants it. Fill it to its [`Chunk::capacity`] or to the
+	/// file's end, whichever comes first, and hand it back with [`Self::submit_chunk`].
+	///
+	/// Fails once the file is complete: a chunk with room left was submitted, or the declared
+	/// size is reached.
+	pub(crate) fn poll_next_chunk(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<Chunk<'a>>> {
+		match self.state.uploading() {
+			Ok(uploading) => uploading.poll_next_chunk(cx),
+			Err(e) => std::task::Poll::Ready(Err(e)),
+		}
+	}
+
+	/// Uploads `chunk`, filled from [`Self::poll_next_chunk`], as the file's next chunk: hashed,
+	/// teed to the EXIF parser and reported as progress like the bytes [`AsyncWrite`] takes.
+	/// A chunk with room left is the file's last and is uploaded on close; an empty one is
+	/// dropped.
+	pub(crate) fn submit_chunk(&mut self, chunk: Chunk<'a>) -> std::io::Result<()> {
+		self.state.uploading()?.submit_chunk(chunk);
+		Ok(())
+	}
+}
+
 impl<'a, F, Fut> AsyncWrite for FileWriter<'a, F, Fut>
 where
 	F: FnOnce(Blake3Hash, u64) -> Fut + MaybeSend + 'a,
@@ -809,18 +919,9 @@ where
 		cx: &mut std::task::Context<'_>,
 		buf: &[u8],
 	) -> std::task::Poll<std::io::Result<usize>> {
-		match &mut self.state {
-			FileWriterState::Uploading(uploading) => uploading.poll_write(cx, buf),
-			FileWriterState::WaitingForDriveLock(_)
-			| FileWriterState::Completing(_)
-			| FileWriterState::Finalizing(_)
-			| FileWriterState::Complete(_) => {
-				// we are in the completing state, we can't write anymore
-				std::task::Poll::Ready(Err(std::io::Error::other(
-					"Cannot write to a completed file",
-				)))
-			}
-			FileWriterState::Error(e) => std::task::Poll::Ready(Err(std::io::Error::other(*e))),
+		match self.state.uploading() {
+			Ok(uploading) => uploading.poll_write(cx, buf),
+			Err(e) => std::task::Poll::Ready(Err(e)),
 		}
 	}
 
