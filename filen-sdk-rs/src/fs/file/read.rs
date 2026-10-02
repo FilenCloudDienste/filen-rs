@@ -375,6 +375,52 @@ impl<'a> FileReader<'a> {
 	}
 }
 
+// Chunk by chunk, for a caller that writes each chunk's bytes out itself instead of reading them
+// through `AsyncRead`. A file is read one way or the other, not both.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+impl<'a> FileReader<'a> {
+	/// The range's next decrypted chunk, holding only the range's bytes, or `None` past the
+	/// range's end. Hand it back with [`Self::recycle_chunk`] once its bytes are used, so its memory
+	/// fetches a later chunk.
+	pub(crate) fn poll_next_chunk(
+		&mut self,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<Option<Chunk<'a>>>> {
+		if let Err(error) = check_chunks_consistent(self.file.chunks(), self.file.size()) {
+			return std::task::Poll::Ready(Err(std::io::Error::other(error)));
+		}
+		// A chunk the caller dropped instead of handing back fetches nothing, so with nothing in
+		// flight the read would end here. Keep one acquire armed, as the reader always does.
+		if self.futures.is_empty() && self.allocate_chunk_future.is_none() {
+			self.allocate_chunk_future = self.allocate_next_chunk();
+		}
+		let waiting_for_memory = self.poll_read_ahead(cx);
+		match std::task::ready!(self.futures.poll_next_unpin(cx)) {
+			Some(Ok(cursor)) => {
+				// the first chunk is read from the range's start, and any chunk up to its end
+				let skip = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
+				let wanted =
+					usize::try_from(self.limit.saturating_sub(self.index)).unwrap_or(usize::MAX);
+				let mut chunk = cursor.into_inner();
+				let data: &mut Vec<u8> = chunk.as_mut();
+				data.truncate(skip.saturating_add(wanted));
+				data.drain(..skip.min(data.len()));
+				self.index += data.len() as u64;
+				std::task::Poll::Ready(Ok(Some(chunk)))
+			}
+			Some(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
+			None if waiting_for_memory => std::task::Poll::Pending,
+			None => std::task::Poll::Ready(Ok(None)),
+		}
+	}
+
+	/// Fetches a later chunk with the memory of `chunk`, one from [`Self::poll_next_chunk`] whose
+	/// bytes are used.
+	pub(crate) fn recycle_chunk(&mut self, chunk: Chunk<'a>) {
+		self.push_fetch_next_chunk(chunk);
+	}
+}
+
 impl FileReader<'_> {
 	/// Queues as many chunk fetches as the read-ahead budget allows and polls the pending
 	/// allocation. Returns whether that allocation is still pending with chunks left to fetch,
@@ -914,6 +960,82 @@ mod tests {
 			"a single-chunk reader whose budget is below one encrypted chunk must still prime a fetch"
 		);
 		assert!(reader.futures.is_empty());
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	mod chunk_by_chunk {
+		use std::task::{Context, Poll, Waker};
+
+		use tokio::sync::SemaphorePermit;
+
+		use super::*;
+
+		/// A reader over `start..end` of `file` that fetches nothing, as the whole memory budget is
+		/// held, with the bytes 0 to 19 queued as its next chunk: downloaded, decrypted and placed at
+		/// `start`, as a fetch leaves it.
+		fn reader_with_a_queued_chunk<'a>(
+			client: &'a UnauthClient,
+			file: &'a FakeFile,
+			start: u64,
+			end: u64,
+		) -> (FileReader<'a>, SemaphorePermit<'a>) {
+			let mut chunk = Chunk::try_acquire(NonZeroU32::MIN, client.state()).unwrap();
+			AsMut::<Vec<u8>>::as_mut(&mut chunk).extend(0..20);
+			let budget = client.state().memory_semaphore();
+			let held = budget
+				.try_acquire_many(u32::try_from(budget.available_permits()).unwrap())
+				.unwrap();
+			let mut reader = FileReaderBuilder::new(client, file)
+				.with_start(start)
+				.with_end(end)
+				.build();
+			let mut cursor = Cursor::new(chunk);
+			cursor.set_position(start % CHUNK_SIZE_U64);
+			reader
+				.futures
+				.push_back(Box::pin(std::future::ready(Ok::<_, Error>(cursor))));
+			reader.next_chunk_idx += 1;
+			(reader, held)
+		}
+
+		#[test]
+		fn a_chunk_read_from_a_range_holds_only_the_ranged_bytes() {
+			let client = test_client();
+			let file = FakeFile::new(20, 1);
+			let (mut reader, _held) = reader_with_a_queued_chunk(&client, &file, 3, 10);
+			let mut cx = Context::from_waker(Waker::noop());
+
+			let Poll::Ready(Ok(Some(chunk))) = reader.poll_next_chunk(&mut cx) else {
+				panic!("the queued chunk is ready");
+			};
+			assert_eq!(chunk.as_ref(), [3, 4, 5, 6, 7, 8, 9]);
+			reader.recycle_chunk(chunk);
+
+			assert!(matches!(
+				reader.poll_next_chunk(&mut cx),
+				Poll::Ready(Ok(None))
+			));
+		}
+
+		#[test]
+		fn a_chunk_dropped_instead_of_handed_back_does_not_end_the_read() {
+			let client = test_client();
+			let file = FakeFile::new(CHUNK_SIZE_U64 + 20, 2);
+			let (mut reader, _held) = reader_with_a_queued_chunk(&client, &file, 0, file.size);
+			// as after the read-ahead budget declined to queue the next acquire
+			reader.allocate_chunk_future = None;
+			let mut cx = Context::from_waker(Waker::noop());
+			let Poll::Ready(Ok(Some(chunk))) = reader.poll_next_chunk(&mut cx) else {
+				panic!("the queued chunk is ready");
+			};
+
+			drop(chunk);
+
+			assert!(
+				reader.poll_next_chunk(&mut cx).is_pending(),
+				"the second chunk waits for memory"
+			);
+		}
 	}
 
 	#[test]
