@@ -35,7 +35,6 @@ use filen_sdk_rs::{
 	util::MaybeSendCallback,
 };
 use tokio::select;
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::{
 	auth::LazyClient,
@@ -485,35 +484,12 @@ impl TransferProgress {
 				state.total_files
 			)
 		};
-		let line = truncate_to_width(&line, self.term.size().1 as usize);
+		let line = ui::truncate_to_width(&line, self.term.size().1 as usize);
 		let _ = self.term.clear_line();
 		let _ = self.term.write_str(&style(line).dim().to_string());
 		let _ = self.term.flush();
 		state.line_shown = true;
 	}
-}
-
-/// Cut `line` down to `width` display columns. An over-long line would wrap onto a second row,
-/// and the in-place redraw only ever clears one row.
-fn truncate_to_width(line: &str, width: usize) -> String {
-	if line.width() <= width {
-		return line.to_string();
-	}
-	if width == 0 {
-		return String::new();
-	}
-	let mut truncated = String::new();
-	let mut used = 0;
-	for c in line.chars() {
-		let char_width = c.width().unwrap_or(0);
-		if used + char_width > width - 1 {
-			break;
-		}
-		truncated.push(c);
-		used += char_width;
-	}
-	truncated.push('…');
-	truncated
 }
 
 impl DirUploadCallback for TransferProgress {
@@ -573,36 +549,5 @@ impl DirDownloadCallback<Normal> for TransferProgress {
 
 	fn on_download_errors(&self, errors: Vec<(Error, String, NonRootItemType<'static, Normal>)>) {
 		self.push_errors(errors.iter().map(|(e, path, _)| format!("{}: {}", path, e)));
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn truncate_to_width_keeps_short_lines() {
-		assert_eq!(truncate_to_width("Uploading", 20), "Uploading");
-		assert_eq!(truncate_to_width("Uploading", 9), "Uploading");
-	}
-
-	#[test]
-	fn truncate_to_width_cuts_long_lines() {
-		let truncated = truncate_to_width("Uploading 1 MiB / 2 MiB", 10);
-		assert_eq!(truncated, "Uploading…");
-		assert_eq!(truncated.width(), 10);
-	}
-
-	#[test]
-	fn truncate_to_width_handles_wide_chars() {
-		// Each of these is two columns wide, so only two of them fit alongside the ellipsis.
-		let truncated = truncate_to_width("上传上传上传", 5);
-		assert_eq!(truncated, "上传…");
-		assert!(truncated.width() <= 5);
-	}
-
-	#[test]
-	fn truncate_to_width_zero_is_empty() {
-		assert_eq!(truncate_to_width("Uploading", 0), "");
 	}
 }
