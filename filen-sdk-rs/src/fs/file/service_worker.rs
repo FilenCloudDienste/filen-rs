@@ -1,7 +1,7 @@
 use futures::{AsyncWrite, future::BoxFuture};
 
 /// A frame sent from a [`StreamWriter`] to the buffered write task
-/// ([`crate::js::spawn_buffered_write_future`]). The explicit [`WriteFrame::Done`]
+/// [`crate::js::stream_writer`] spawns. The explicit [`WriteFrame::Done`]
 /// sentinel lets the task distinguish a stream that completed (close the JS
 /// `WritableStream`) from a sender dropped mid-stream by an error or abort (abort
 /// the stream) — a bare channel close cannot tell the two apart.

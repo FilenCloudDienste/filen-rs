@@ -2,11 +2,12 @@
 use crate::js::{AnyFile, ManagedFuture};
 use crate::{
 	Error, ErrorKind,
-	fs::file::service_worker::{MAX_BUFFER_SIZE_BEFORE_FLUSH, WriteFrame},
+	fs::file::service_worker::{MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter, WriteFrame},
 };
 
 use filen_macros::js_type;
 use futures::AsyncWriteExt;
+use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::js_sys;
 
@@ -133,7 +134,30 @@ pub(crate) fn optional_function<'de, D: serde::Deserializer<'de>>(
 // 	pub managed_future: ManagedFuture,
 // }
 
-pub(crate) fn spawn_buffered_write_future(
+/// Bridges `stream` to a `Send` writer: a task on this thread owns the stream, writes what the
+/// [`StreamWriter`] flushes, closes it once the writer is closed and aborts it when the writer
+/// is dropped first. The receiver answers once the stream is closed, failed or aborted. A stream
+/// that cannot be written fails with `Conversion`, its message starting with `conversion_failure`.
+pub(crate) fn stream_writer(
+	stream: web_sys::WritableStream,
+	progress: Option<impl Fn(u64) + 'static>,
+	conversion_failure: &'static str,
+) -> Result<(StreamWriter, oneshot::Receiver<Result<(), Error>>), Error> {
+	let writer = wasm_streams::WritableStream::from_raw(stream)
+		.try_into_async_write()
+		.map_err(|(e, _)| {
+			Error::custom(
+				ErrorKind::Conversion,
+				format!("{conversion_failure}: {e:?}"),
+			)
+		})?;
+	let (data_sender, data_receiver) = mpsc::channel(10);
+	let (result_sender, result_receiver) = oneshot::channel();
+	spawn_buffered_write_future(data_receiver, writer, progress, result_sender);
+	Ok((StreamWriter::new(data_sender), result_receiver))
+}
+
+fn spawn_buffered_write_future(
 	mut data_receiver: tokio::sync::mpsc::Receiver<WriteFrame>,
 	mut writer: wasm_streams::writable::IntoAsyncWrite<'static>,
 	progress_callback: Option<impl Fn(u64) + 'static>,

@@ -27,9 +27,6 @@ use futures::{AsyncRead, AsyncReadExt};
 use wasm_bindgen::prelude::JsValue;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-pub(crate) use super::service_worker::{StreamWriter, WriteFrame};
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 struct StreamReader {
 	receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
 	current_chunk: Option<Vec<u8>>,
@@ -393,17 +390,6 @@ async fn download_file_to_writer_generic<T>(
 where
 	T: SharedClient + Send + Sync + 'static,
 {
-	let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-
-	let writer = wasm_streams::WritableStream::from_raw(params.writer)
-		.try_into_async_write()
-		.map_err(|(e, _)| {
-			Error::custom(
-				ErrorKind::Conversion,
-				format!("got error when converting to WritableStream: {:?}", e),
-			)
-		})?;
-
 	// we handle the progress callback here because it's easier to not have to spawn another local task
 	// to pass through the progress updates
 	let progress_callback = params.progress.map(|progress| {
@@ -412,15 +398,15 @@ where
 		}
 	});
 
-	let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-	crate::js::spawn_buffered_write_future(data_receiver, writer, progress_callback, result_sender);
+	let (mut writer, result_receiver) = crate::js::stream_writer(
+		params.writer,
+		progress_callback,
+		"got error when converting to WritableStream",
+	)?;
 
 	params
 		.managed_future
 		.into_js_managed_commander_future(move || async move {
-			let mut writer = StreamWriter::new(data_sender);
-
 			let file = RemoteFileType::try_from(params.file)?;
 			client
 				.download_file_to_writer_for_range(

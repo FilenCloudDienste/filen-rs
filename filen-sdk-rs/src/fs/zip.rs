@@ -791,11 +791,8 @@ mod js_client_impl {
 	use crate::{
 		Error, ErrorKind,
 		auth::JsClient,
-		fs::{
-			file::service_worker::{StreamWriter, WriteFrame},
-			zip::js_impl::download_zip_items,
-		},
-		js::{AnyItemWithContext, ManagedFuture, spawn_buffered_write_future},
+		fs::zip::js_impl::download_zip_items,
+		js::{AnyItemWithContext, ManagedFuture, stream_writer},
 	};
 
 	#[filen_macros::js_exports]
@@ -813,21 +810,11 @@ mod js_client_impl {
 			progress: web_sys::js_sys::Function,
 			managed_future: ManagedFuture,
 		) -> Result<(), Error> {
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-
-			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
-				.try_into_async_write()
-				.map_err(|(e, _)| {
-					Error::custom(
-						ErrorKind::Conversion,
-						format!("failed to convert WritableStream to AsyncWrite: {:?}", e),
-					)
-				})?;
-
-			let (result_sender, result_receiver) =
-				tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-			spawn_buffered_write_future(data_receiver, writer, None::<fn(u64)>, result_sender);
+			let (writer, result_receiver) = stream_writer(
+				writable_stream,
+				None::<fn(u64)>,
+				"failed to convert WritableStream to AsyncWrite",
+			)?;
 
 			let progress_callback = if progress.is_undefined() {
 				None
@@ -856,7 +843,6 @@ mod js_client_impl {
 
 			managed_future
 				.into_js_managed_commander_future(move || async move {
-					let writer = StreamWriter::new(data_sender);
 					download_zip_items(&this, items, writer, progress_callback.as_ref()).await?;
 					result_receiver.await.unwrap_or_else(|e| {
 						Err(Error::custom(
@@ -876,11 +862,8 @@ mod service_worker_impl {
 
 	use crate::{
 		Error, ErrorKind,
-		fs::{
-			file::service_worker::{StreamWriter, WriteFrame},
-			zip::js_impl::download_zip_items,
-		},
-		js::{AnyItemWithContext, ManagedFuture, ServiceWorkerClient, spawn_buffered_write_future},
+		fs::zip::js_impl::download_zip_items,
+		js::{AnyItemWithContext, ManagedFuture, ServiceWorkerClient, stream_writer},
 	};
 
 	#[filen_macros::js_exports]
@@ -900,21 +883,11 @@ mod service_worker_impl {
 		) -> Result<(), Error> {
 			use wasm_bindgen::JsValue;
 
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-
-			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
-				.try_into_async_write()
-				.map_err(|(e, _)| {
-					Error::custom(
-						ErrorKind::Conversion,
-						format!("failed to convert WritableStream to AsyncWrite: {:?}", e),
-					)
-				})?;
-
-			let (result_sender, result_receiver) =
-				tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-			spawn_buffered_write_future(data_receiver, writer, None::<fn(u64)>, result_sender);
+			let (writer, result_receiver) = stream_writer(
+				writable_stream,
+				None::<fn(u64)>,
+				"failed to convert WritableStream to AsyncWrite",
+			)?;
 
 			let progress_callback = if progress.is_undefined() {
 				None
@@ -941,7 +914,6 @@ mod service_worker_impl {
 
 			managed_future
 				.into_js_managed_future(async move {
-					let writer = StreamWriter::new(data_sender);
 					download_zip_items(this, items, writer, progress_callback.as_ref()).await?;
 					result_receiver.await.unwrap_or_else(|e| {
 						Err(Error::custom(
@@ -1046,27 +1018,13 @@ mod unauth_js_client_impl {
 			progress: web_sys::js_sys::Function,
 			managed_future: crate::js::ManagedFuture,
 		) -> Result<(), Error> {
-			use crate::{
-				ErrorKind,
-				fs::file::service_worker::{StreamWriter, WriteFrame},
-				js::spawn_buffered_write_future,
-			};
+			use crate::{ErrorKind, js::stream_writer};
 
-			let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-
-			let writer = wasm_streams::WritableStream::from_raw(writable_stream)
-				.try_into_async_write()
-				.map_err(|(e, _)| {
-					Error::custom(
-						ErrorKind::Conversion,
-						format!("failed to convert WritableStream to AsyncWrite: {:?}", e),
-					)
-				})?;
-
-			let (result_sender, result_receiver) =
-				tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-			spawn_buffered_write_future(data_receiver, writer, None::<fn(u64)>, result_sender);
+			let (writer, result_receiver) = stream_writer(
+				writable_stream,
+				None::<fn(u64)>,
+				"failed to convert WritableStream to AsyncWrite",
+			)?;
 
 			let progress_callback = if progress.is_undefined() {
 				None
@@ -1097,7 +1055,6 @@ mod unauth_js_client_impl {
 
 			managed_future
 				.into_js_managed_commander_future(move || async move {
-					let writer = StreamWriter::new(data_sender);
 					let items = [NonRootFileType::<Linked>::from(parsed_dir)];
 					this.download_items_to_zip::<Linked, _>(
 						&items,

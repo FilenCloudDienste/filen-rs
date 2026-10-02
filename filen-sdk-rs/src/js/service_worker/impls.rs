@@ -3,11 +3,7 @@ use std::rc::Rc;
 use crate::{
 	Error, ErrorKind,
 	auth::{Client, StringifiedClient},
-	fs::file::{
-		enums::RemoteFileType,
-		service_worker::{StreamWriter, WriteFrame},
-		traits::HasFileInfo,
-	},
+	fs::file::{enums::RemoteFileType, traits::HasFileInfo},
 	io::client_impl::IoSharedClientExt,
 };
 
@@ -39,17 +35,6 @@ impl ServiceWorkerClient {
 		&self,
 		params: DownloadFileStreamParams,
 	) -> Result<(), Error> {
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-
-		let writer = wasm_streams::WritableStream::from_raw(params.writer)
-			.try_into_async_write()
-			.map_err(|(e, _)| {
-				Error::custom(
-					ErrorKind::Conversion,
-					format!("got error when converting to WritableStream: {:?}", e),
-				)
-			})?;
-
 		// we handle the progress callback here because it's easier to not have to spawn another local task
 		// to pass through the progress updates
 		let progress_callback = params.progress.map(|progress| {
@@ -58,22 +43,17 @@ impl ServiceWorkerClient {
 			}
 		});
 
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
-
-		super::shared::spawn_buffered_write_future(
-			data_receiver,
-			writer,
+		let (mut writer, result_receiver) = stream_writer(
+			params.writer,
 			progress_callback,
-			result_sender,
-		);
+			"got error when converting to WritableStream",
+		)?;
 
 		let this = self.inner();
 
 		params
 			.managed_future
 			.into_js_managed_future(async move {
-				let mut writer = StreamWriter::new(data_sender);
-
 				let file = RemoteFileType::try_from(params.file)?;
 				this.download_file_to_writer_for_range(
 					&file,

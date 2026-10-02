@@ -1741,33 +1741,19 @@ mod js_impls {
 	where
 		C: SharedClient + Send + Sync + 'static,
 	{
-		use crate::fs::file::service_worker::{StreamWriter, WriteFrame};
-
 		// The same bridge `downloadFileToWriter` uses: frames cross to a
 		// local task that owns the JS stream, so nothing here ever holds
 		// more than one flush buffer of the preview.
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-		let writer = wasm_streams::WritableStream::from_raw(params.writer)
-			.try_into_async_write()
-			.map_err(|(e, _)| {
-				Error::custom(
-					crate::ErrorKind::Conversion,
-					format!("got error when converting to WritableStream: {:?}", e),
-				)
-			})?;
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
-		crate::js::spawn_buffered_write_future(
-			data_receiver,
-			writer,
+		let (mut writer, result_receiver) = crate::js::stream_writer(
+			params.writer,
 			None::<fn(u64)>,
-			result_sender,
-		);
+			"got error when converting to WritableStream",
+		)?;
 
 		params
 			.managed_future
 			.into_js_managed_commander_future(move || async move {
 				let file = RemoteFileType::try_from(params.file)?;
-				let mut writer = StreamWriter::new(data_sender);
 				let preview = write_embedded_preview_remote(client, file, &mut writer).await?;
 				// The close above sent the Done frame; wait for the JS
 				// side to have taken every byte before answering, or a
@@ -1991,31 +1977,18 @@ mod js_impls {
 	where
 		C: SharedClient + Send + Sync + 'static,
 	{
-		use crate::fs::file::service_worker::{
-			MAX_BUFFER_SIZE_BEFORE_FLUSH, StreamWriter, WriteFrame,
-		};
+		use crate::fs::file::service_worker::MAX_BUFFER_SIZE_BEFORE_FLUSH;
 		use futures::AsyncWriteExt;
 
 		let mut chunks = spawn_stream_pump(params.reader)?;
 		// The same bridge `writeEmbeddedPreview` uses: frames cross to a local
 		// task that owns the JS stream, so the copy never holds more than one
 		// flush buffer on top of the source buffer.
-		let (data_sender, data_receiver) = tokio::sync::mpsc::channel::<WriteFrame>(10);
-		let writer = wasm_streams::WritableStream::from_raw(params.writer)
-			.try_into_async_write()
-			.map_err(|(e, _)| {
-				Error::custom(
-					crate::ErrorKind::Conversion,
-					format!("got error when converting to WritableStream: {e:?}"),
-				)
-			})?;
-		let (result_sender, result_receiver) = tokio::sync::oneshot::channel::<Result<(), Error>>();
-		crate::js::spawn_buffered_write_future(
-			data_receiver,
-			writer,
+		let (mut writer, result_receiver) = crate::js::stream_writer(
+			params.writer,
 			None::<fn(u64)>,
-			result_sender,
-		);
+			"got error when converting to WritableStream",
+		)?;
 		let known_size = params.known_size;
 
 		params
@@ -2037,7 +2010,6 @@ mod js_impls {
 					Ok((located, source.0))
 				})
 				.await?;
-				let mut writer = StreamWriter::new(data_sender);
 				if let Some(preview) = &located {
 					for segment in preview.segments() {
 						match segment {
