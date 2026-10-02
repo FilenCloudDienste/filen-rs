@@ -56,15 +56,16 @@ pub(crate) fn resolve_final_times(
 }
 
 mod imp {
+	use std::io::{self, SeekFrom};
 	use std::panic::AssertUnwindSafe;
 	use std::pin::Pin;
-	use std::task::{Context, Poll};
+	use std::task::{Context, Poll, ready};
 
-	use bytes::Bytes;
+	use bytes::{Buf, Bytes};
 	use chrono::{DateTime, Utc};
 	use futures::FutureExt;
 	use nom_exif::{AsyncMediaSource, EntryValue, Exif, ExifTag, MediaParser, TrackInfoTag};
-	use tokio::io::{AsyncRead, ReadBuf};
+	use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 	use tokio::sync::mpsc;
 	use tokio_util::sync::PollSender;
 
@@ -75,9 +76,17 @@ mod imp {
 	use super::{ExifMediaKind, ExifTimes, resolve_final_times};
 	use chrono::SubsecRound;
 
+	/// The bytes the tee forwards, read in order. It seeks forward only, by discarding: nom-exif
+	/// skips what it does not need (a video's media data ahead of a trailing `moov`, a PNG's image
+	/// data) by seeking, and from a source it cannot seek it reads the skipped bytes into its parse
+	/// buffer instead, up to 1 GiB at a time.
 	pub(crate) struct ExifChannelReader {
 		rx: mpsc::Receiver<Bytes>,
 		leftover: Bytes,
+		/// Bytes read or skipped so far, the position `poll_complete` reports.
+		position: u64,
+		/// Bytes the seek in progress has still to discard.
+		to_skip: u64,
 	}
 
 	impl ExifChannelReader {
@@ -85,6 +94,8 @@ mod imp {
 			Self {
 				rx,
 				leftover: Bytes::new(),
+				position: 0,
+				to_skip: 0,
 			}
 		}
 	}
@@ -94,7 +105,9 @@ mod imp {
 			mut self: Pin<&mut Self>,
 			cx: &mut Context<'_>,
 			buf: &mut ReadBuf<'_>,
-		) -> Poll<std::io::Result<()>> {
+		) -> Poll<io::Result<()>> {
+			// a read after a seek nobody completed starts where that seek lands
+			ready!(self.as_mut().poll_complete(cx))?;
 			if self.leftover.is_empty() {
 				match self.rx.poll_recv(cx) {
 					Poll::Ready(Some(chunk)) => self.leftover = chunk,
@@ -105,7 +118,42 @@ mod imp {
 			let take = self.leftover.len().min(buf.remaining());
 			let bytes = self.leftover.split_to(take);
 			buf.put_slice(&bytes);
+			self.position += take as u64;
 			Poll::Ready(Ok(()))
+		}
+	}
+
+	impl AsyncSeek for ExifChannelReader {
+		fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+			let forward = match position {
+				SeekFrom::Current(n) if self.to_skip == 0 => u64::try_from(n).ok(),
+				_ => None,
+			};
+			self.to_skip = forward.ok_or_else(|| {
+				io::Error::new(
+					io::ErrorKind::Unsupported,
+					"the EXIF stream seeks only forward, one seek at a time",
+				)
+			})?;
+			Ok(())
+		}
+
+		fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+			while self.to_skip > 0 {
+				if self.leftover.is_empty() {
+					match ready!(self.rx.poll_recv(cx)) {
+						Some(chunk) => self.leftover = chunk,
+						None => return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into())),
+					}
+				}
+				let n = usize::try_from(self.to_skip).map_or(self.leftover.len(), |to_skip| {
+					to_skip.min(self.leftover.len())
+				});
+				self.leftover.advance(n);
+				self.to_skip -= n as u64;
+				self.position += n as u64;
+			}
+			Poll::Ready(Ok(self.position))
 		}
 	}
 
@@ -313,7 +361,7 @@ mod imp {
 		kind: ExifMediaKind,
 	) -> Result<ExifTimes, Error> {
 		let reader = ExifChannelReader::new(rx);
-		let ms = AsyncMediaSource::unseekable(reader).await.map_err(|e| {
+		let ms = AsyncMediaSource::seekable(reader).await.map_err(|e| {
 			Error::custom_with_source(
 				ErrorKind::Internal,
 				e,
@@ -362,6 +410,12 @@ mod imp {
 mod tests {
 	use super::*;
 	use chrono::TimeZone;
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use {
+		std::io::{ErrorKind, SeekFrom},
+		std::pin::Pin,
+		tokio::io::{AsyncReadExt, AsyncSeek, AsyncSeekExt},
+	};
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test]
@@ -386,6 +440,68 @@ mod tests {
 		assert_eq!(buf, b"hello, world!");
 	}
 
+	/// A reader over `chunks`, whose stream ends after the last one.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn reader_over(chunks: &[&'static [u8]]) -> imp::ExifChannelReader {
+		let (tx, rx) = tokio::sync::mpsc::channel(chunks.len());
+		for chunk in chunks {
+			tx.try_send(bytes::Bytes::from_static(chunk)).unwrap();
+		}
+		imp::ExifChannelReader::new(rx)
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn channel_reader_skips_across_chunks_and_reads_on_from_inside_one() {
+		let mut reader = reader_over(&[b"hello, ", b"world!"]);
+
+		assert_eq!(reader.seek(SeekFrom::Current(9)).await.unwrap(), 9);
+		let mut rest = Vec::new();
+		reader.read_to_end(&mut rest).await.unwrap();
+		assert_eq!(rest, b"rld!");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn channel_reader_refuses_any_seek_but_forward_from_the_current_position() {
+		let mut reader = reader_over(&[b"hello"]);
+
+		for refused in [SeekFrom::Current(-1), SeekFrom::Start(0), SeekFrom::End(0)] {
+			let err = reader.seek(refused).await.unwrap_err();
+			assert_eq!(err.kind(), ErrorKind::Unsupported, "{refused:?}");
+		}
+		// a second seek while the first is still in progress
+		Pin::new(&mut reader)
+			.start_seek(SeekFrom::Current(1))
+			.unwrap();
+		let err = Pin::new(&mut reader)
+			.start_seek(SeekFrom::Current(1))
+			.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Unsupported);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn channel_reader_fails_a_skip_past_the_end_of_the_stream() {
+		let mut reader = reader_over(&[b"hello"]);
+
+		let err = reader.seek(SeekFrom::Current(6)).await.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn channel_reader_finishes_a_started_seek_before_reading() {
+		let mut reader = reader_over(&[b"hello, ", b"world!"]);
+
+		Pin::new(&mut reader)
+			.start_seek(SeekFrom::Current(3))
+			.unwrap();
+		let mut rest = Vec::new();
+		reader.read_to_end(&mut rest).await.unwrap();
+		assert_eq!(rest, b"lo, world!");
+	}
+
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test]
 	async fn parse_exif_stream_returns_err_on_garbage() {
@@ -402,6 +518,72 @@ mod tests {
 		imp::parse_exif_stream(rx, ExifMediaKind::Image)
 			.await
 			.unwrap_err();
+	}
+
+	/// An ISO-BMFF box: its 32-bit size, its type, then `body`.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn bmff_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+		let size = u32::try_from(8 + body.len()).expect("a test box fits a 32-bit size");
+		[&size.to_be_bytes(), &kind[..], body].concat()
+	}
+
+	// Many cameras and phones write the `moov` (where the creation time is) after the media data.
+	// The parser skips that data by seeking; were the stream not seekable, it would read all of it
+	// into its buffer first.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[test]
+	fn a_video_whose_moov_follows_its_media_data_is_parsed_without_buffering_the_media_data() {
+		const CHUNK: usize = 64 * 1024;
+		// 32 MiB of media data
+		const MDAT_CHUNKS: usize = 512;
+		static ZEROS: [u8; CHUNK] = [0; CHUNK];
+		// 2024-02-03T07:05:38Z in seconds since 1904-01-01, the epoch `mvhd` counts from
+		const CREATED: u32 = 3_789_788_738;
+
+		let mvhd = [
+			&[0; 4][..],            // version and flags
+			&CREATED.to_be_bytes(), // creation time
+			&CREATED.to_be_bytes(), // modification time
+			&1000u32.to_be_bytes(), // time scale
+			&0u32.to_be_bytes(),    // duration
+			&[0; 76],               // rate, volume, matrix and the reserved fields
+			&2u32.to_be_bytes(),    // next track id
+		]
+		.concat();
+		let ftyp = bmff_box(b"ftyp", b"isom\0\0\x02\0isommp41");
+		let mdat_size = u32::try_from(8 + CHUNK * MDAT_CHUNKS).expect("32 MiB fits a box size");
+		let head = bytes::Bytes::from([&ftyp[..], &mdat_size.to_be_bytes(), b"mdat"].concat());
+		let moov = bytes::Bytes::from(bmff_box(b"moov", &bmff_box(b"mvhd", &mvhd)));
+
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.build()
+			.unwrap();
+		let (times, peak) = crate::alloc_meter::peak_bytes(|| {
+			runtime.block_on(async {
+				// the bound the upload's tee uses
+				let (tx, rx) = tokio::sync::mpsc::channel(4);
+				let feed = async move {
+					let chunks = std::iter::once(head)
+						.chain(std::iter::repeat_n(
+							bytes::Bytes::from_static(&ZEROS),
+							MDAT_CHUNKS,
+						))
+						.chain(std::iter::once(moov));
+					for chunk in chunks {
+						if tx.send(chunk).await.is_err() {
+							break;
+						}
+					}
+				};
+				tokio::join!(feed, imp::parse_exif_stream(rx, ExifMediaKind::Track)).1
+			})
+		});
+
+		assert_eq!(
+			times.unwrap().created,
+			Some(Utc.with_ymd_and_hms(2024, 2, 3, 7, 5, 38).unwrap())
+		);
+		assert!(peak < 4 * 1024 * 1024, "the parse held {peak} bytes");
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
