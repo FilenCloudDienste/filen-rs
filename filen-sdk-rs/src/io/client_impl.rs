@@ -2,15 +2,13 @@ use std::sync::Arc;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::{
 	future::poll_fn,
-	io::Read,
+	io::{Read, Write},
 	ops::Deref,
 	path::{Path, PathBuf},
 };
 
 use filen_types::crypto::Blake3Hash;
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use crate::{
 	Error,
@@ -20,6 +18,7 @@ use crate::{
 		BaseFile, FileBuilder, RemoteFile,
 		client_impl::{FileReaderSharedClientExt, build_exif_tee_from_builder},
 		exif::ExifTeeState,
+		read::FileReader,
 		traits::File,
 		write::{DummyFuture, FileWriter},
 	},
@@ -363,7 +362,8 @@ where
 			.capacity()
 			.min(usize::try_from(remaining).unwrap_or(usize::MAX));
 		let (data, permit) = chunk.into_parts();
-		let (returned, data) = fill_on_blocking_thread(file, data, len).await?;
+		let (returned, data) =
+			on_blocking_thread(file, data, move |file, data| fill_from(file, data, len)).await?;
 		file = returned;
 		let filled = data.len();
 		writer.submit_chunk(Chunk::from_parts(data, permit))?;
@@ -376,25 +376,56 @@ where
 		return Ok(file);
 	}
 	// the read that finds the end, as any reader's last; a byte there means the file grew
-	let (file, past_end) = fill_on_blocking_thread(file, Vec::with_capacity(1), 1).await?;
+	let (file, past_end) = on_blocking_thread(file, Vec::with_capacity(1), |file, data| {
+		fill_from(file, data, 1)
+	})
+	.await?;
 	writer.write_all(&past_end).await?;
 	Ok(file)
 }
 
-/// [`fill_from`] on a blocking thread, handing `file` and `data` back.
+/// Downloads `remote_file` into `file`, writing each decrypted chunk from its own memory on a
+/// blocking thread, and returns `file`. No buffer outside the memory budget: a download waiting
+/// for the budget to grant its next chunk holds nothing the size of a chunk.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-async fn fill_on_blocking_thread(
+async fn download_into_file<SC>(
+	client: &SC,
+	remote_file: &dyn File,
+	mut file: std::fs::File,
+	callback: Option<MaybeSendCallback<'_, u64>>,
+) -> Result<std::fs::File, Error>
+where
+	SC: SharedClient,
+{
+	let (mut reader, progress) =
+		reader_with_progress(client, remote_file, 0, remote_file.size(), callback);
+	while let Some(chunk) = poll_fn(|cx| reader.poll_next_chunk(cx)).await? {
+		let (data, permit) = chunk.into_parts();
+		let (returned, data) =
+			on_blocking_thread(file, data, |file, data| file.write_all(data)).await?;
+		file = returned;
+		reader.recycle_chunk(Chunk::from_parts(data, permit));
+	}
+	if let Some(progress) = &progress {
+		progress.flush();
+	}
+	Ok(file)
+}
+
+/// Runs `op` over `file` and `data` on a blocking thread, handing both back.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+async fn on_blocking_thread(
 	mut file: std::fs::File,
 	mut data: Vec<u8>,
-	len: usize,
+	op: impl FnOnce(&mut std::fs::File, &mut Vec<u8>) -> std::io::Result<()> + Send + 'static,
 ) -> Result<(std::fs::File, Vec<u8>), Error> {
-	let (file, data, read) = tokio::task::spawn_blocking(move || {
-		let read = fill_from(&mut file, &mut data, len);
-		(file, data, read)
+	let (file, data, done) = tokio::task::spawn_blocking(move || {
+		let done = op(&mut file, &mut data);
+		(file, data, done)
 	})
 	.await
 	.map_err(std::io::Error::from)?;
-	read?;
+	done?;
 	Ok((file, data))
 }
 
@@ -501,15 +532,17 @@ where
 		&format!("{}.{}", remote_file.uuid(), super::DOWNLOAD_TMP_EXT),
 	)
 	.await?;
-	let mut writer = tmp_file.compat_write();
 
-	unauth_client
-		.download_file_to_writer(remote_file, &mut writer, callback)
-		.await?;
+	let tmp_file = download_into_file(
+		unauth_client,
+		remote_file,
+		tmp_file.into_std().await,
+		callback,
+	)
+	.await?;
 
 	let file_times = FileTimesExt::get_file_times(remote_file);
 
-	let tmp_file = writer.into_inner().into_std().await;
 	tokio::task::spawn_blocking(move || tmp_file.set_times(file_times))
 		.await
 		.unwrap()?;
@@ -597,6 +630,29 @@ where
 	}
 }
 
+/// A reader over bytes `start..end` of `file`, and the throttled progress it reports to
+/// `callback`, which needs a flush once the bytes are written. Progress is driven from each
+/// chunk's download inside the reader (smooth, concurrent) rather than from read-out (bursty: the
+/// ordered reader releases head-of-line-blocked chunks together). The throttle still rate-limits
+/// the actual callback to one per CALLBACK_INTERVAL.
+fn reader_with_progress<'a, SC>(
+	client: &'a SC,
+	file: &'a dyn File,
+	start: u64,
+	end: u64,
+	callback: Option<MaybeSendCallback<'a, u64>>,
+) -> (FileReader<'a>, Option<MaybeArc<ThrottledProgress<'a>>>)
+where
+	SC: SharedClient,
+{
+	let progress = ThrottledProgress::new(callback);
+	let reader_callback = progress
+		.clone()
+		.map(|p| MaybeArc::new(move |bytes| p.report(bytes)) as MaybeSendCallback<u64>);
+	let reader = client.get_file_reader_for_range_with_callback(file, start, end, reader_callback);
+	(reader, progress)
+}
+
 #[allow(private_bounds, async_fn_in_trait)]
 pub trait IoSharedClientExt<'a>: SharedClient {
 	// todo make private, use download_file_to_path instead
@@ -663,15 +719,7 @@ where
 	where
 		T: 'b + AsyncWrite + Unpin,
 	{
-		let progress = ThrottledProgress::new(callback);
-		// Drive the throttle from chunk-download completion inside the reader (smooth, concurrent)
-		// rather than from read-out (bursty: the ordered reader releases head-of-line-blocked chunks
-		// together). The throttle still rate-limits the actual callback to one per CALLBACK_INTERVAL.
-		let reader_callback = progress
-			.clone()
-			.map(|p| MaybeArc::new(move |bytes| p.report(bytes)) as MaybeSendCallback<u64>);
-		let mut reader =
-			self.get_file_reader_for_range_with_callback(file, start, end, reader_callback);
+		let (mut reader, progress) = reader_with_progress(self, file, start, end, callback);
 		let buffer_size = usize::try_from(end.saturating_sub(start))
 			.unwrap_or(usize::MAX)
 			.min(CHUNK_SIZE);
@@ -792,7 +840,7 @@ mod tmp_file_guard_tests {
 }
 
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
-mod upload_from_path_tests {
+mod path_transfer_tests {
 	use std::{
 		io::{ErrorKind as IoErrorKind, Read, Seek},
 		sync::Arc,
@@ -801,14 +849,18 @@ mod upload_from_path_tests {
 
 	use filen_types::fs::Uuid;
 	use tempfile::TempDir;
+	use tokio::sync::Semaphore;
 
-	use super::{fill_from, read_file_into_chunks};
+	use super::{IoSharedClientExt, fill_from, read_file_into_chunks};
 	use crate::{
 		ErrorKind,
 		alloc_meter::peak_bytes,
-		auth::{Client, test_support::offline_client},
-		consts::CHUNK_SIZE,
-		fs::file::{FileBuilderOptionalName, write::FileWriterDefault},
+		auth::{Client, http::ClientConfig, test_support::offline_client, unauth::UnauthClient},
+		consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
+		fs::{
+			drive_job::test_support::stored_file,
+			file::{FileBuilderOptionalName, write::FileWriterDefault},
+		},
 	};
 
 	/// Yields `bytes` at most `step` at a time; past them, fails once with `end` if set.
@@ -969,14 +1021,13 @@ mod upload_from_path_tests {
 		);
 	}
 
-	#[test]
-	fn an_upload_waiting_for_the_memory_budget_holds_no_read_buffer() {
-		let client = offline_client();
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("payload.bin");
-		std::fs::write(&path, vec![7u8; CHUNK_SIZE]).unwrap();
-		// hold the whole budget, so the upload's first chunk is never granted
-		let budget = client.client().state().memory_semaphore();
+	/// The most bytes `transfer` holds while it waits for its first chunk: the whole memory `budget`
+	/// is held, so the chunk is never granted. The paused clock only runs out once the transfer is
+	/// parked on the budget with no disk I/O in flight; everything polled on this thread is metered.
+	fn peak_bytes_parked_on_the_budget<T>(
+		budget: &Semaphore,
+		transfer: impl Future<Output = T>,
+	) -> u64 {
 		let _held = budget
 			.try_acquire_many(u32::try_from(budget.available_permits()).unwrap())
 			.unwrap();
@@ -986,23 +1037,55 @@ mod upload_from_path_tests {
 			.build()
 			.unwrap();
 
-		// the paused clock only runs out once the upload is parked on the budget with no read in
-		// flight; everything polled on this thread is metered
 		let (waited, peak) = peak_bytes(|| {
-			runtime.block_on(async {
-				tokio::time::timeout(
-					Duration::from_secs(60),
-					client.upload_file_from_path_with_builder(
-						FileBuilderOptionalName::new(Uuid::from_u128(1)),
-						path.clone(),
-						None,
-					),
-				)
-				.await
-			})
+			runtime
+				.block_on(async { tokio::time::timeout(Duration::from_secs(60), transfer).await })
 		});
 
-		assert!(waited.is_err(), "the upload got past the exhausted budget");
+		assert!(
+			waited.is_err(),
+			"the transfer got past the exhausted budget"
+		);
+		peak
+	}
+
+	#[test]
+	fn an_upload_waiting_for_the_memory_budget_holds_no_read_buffer() {
+		let client = offline_client();
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("payload.bin");
+		std::fs::write(&path, vec![7u8; CHUNK_SIZE]).unwrap();
+
+		let peak = peak_bytes_parked_on_the_budget(
+			client.client().state().memory_semaphore(),
+			client.upload_file_from_path_with_builder(
+				FileBuilderOptionalName::new(Uuid::from_u128(1)),
+				path,
+				None,
+			),
+		);
+
 		assert!(peak < 64 * 1024, "the waiting upload held {peak} bytes");
+	}
+
+	#[test]
+	fn a_download_waiting_for_the_memory_budget_holds_no_write_buffer() {
+		let client = UnauthClient::from_config(ClientConfig::default()).unwrap();
+		let file = stored_file(
+			Uuid::from_u128(1),
+			Uuid::from_u128(2),
+			"payload.bin",
+			CHUNK_SIZE_U64,
+			1,
+			None,
+		);
+		let dir = tempfile::tempdir().unwrap();
+
+		let peak = peak_bytes_parked_on_the_budget(
+			client.state().memory_semaphore(),
+			client.download_file_to_path(&file, &dir.path().join("payload.bin"), None),
+		);
+
+		assert!(peak < 64 * 1024, "the waiting download held {peak} bytes");
 	}
 }

@@ -114,6 +114,29 @@ async fn assert_file_upload_from_path_download_equal(name: &str, contents_len: u
 	);
 	let buf = client.download_file(&file).await.unwrap();
 	assert_eq!(buf, contents, "File contents mismatch for {name}");
+
+	let downloaded = local_dir.path().join("downloaded");
+	let (sender, receiver) = std::sync::mpsc::channel::<u64>();
+	client
+		.download_file_to_path(
+			&file,
+			&downloaded,
+			Some(Arc::new(move |bytes: u64| {
+				sender.send(bytes).unwrap();
+			}) as MaybeSendCallback<u64>),
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		std::fs::read(&downloaded).unwrap(),
+		contents,
+		"Downloaded file mismatch for {name}"
+	);
+	assert_eq!(
+		receiver.try_iter().sum::<u64>(),
+		contents_len as u64,
+		"Download progress mismatch for {name}"
+	);
 }
 
 #[shared_test_runtime]
