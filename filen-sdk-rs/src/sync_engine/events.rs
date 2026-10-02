@@ -45,9 +45,9 @@ pub enum SyncEvent {
 	Planned { actions: usize },
 	/// A two-way path where both sides diverged; left untouched for the caller to resolve.
 	Conflict { rel_path: String },
-	/// The guard held some deletions back this pass (mass-delete volume, first sync, or an
-	/// un-converged remote). `reason` is the guard's `Debug` rendering; `pass_token` identifies
-	/// this exact batch for
+	/// The guard held some deletions back this pass (see [`GuardReason`](super::GuardReason) for
+	/// why it can). `reason` is that reason as a sentence (its `Display`); `pass_token` identifies
+	/// this exact batch, held for this kind of reason, for
 	/// [`SyncEngine::approve_deletions`](super::SyncEngine::approve_deletions).
 	DeletionsHeld {
 		count: usize,
