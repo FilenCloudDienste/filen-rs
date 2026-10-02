@@ -1,6 +1,9 @@
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
-	fmt, mem,
+	fmt,
+	io::IsTerminal,
+	mem,
+	ops::ControlFlow,
 	path::PathBuf,
 	sync::Arc,
 	time::{Duration, Instant},
@@ -11,7 +14,8 @@ use console::{Term, style};
 use filen_sdk_rs::{
 	fs::{HasUUID as _, categories::NonRootFileType},
 	sync_engine::{
-		SyncEngine, SyncEvent, SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
+		PairId, SyncEngine, SyncEvent, SyncMode, SyncReport, TransferDirection, WatchState,
+		WatchStatus,
 	},
 };
 use tokio::{
@@ -20,6 +24,7 @@ use tokio::{
 	time::{MissedTickBehavior, interval},
 };
 
+use self::held::{Answer, Held, Update};
 use crate::{
 	CliConfig,
 	auth::LazyClient,
@@ -27,7 +32,9 @@ use crate::{
 	util::RemotePath,
 };
 
-// todo: pair management, conflict resolution, deletion approval, other sync modes, --json output
+mod held;
+
+// todo: pair management, conflict resolution, other sync modes, --json output
 
 /// How far back the transfer rates on the status line look.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
@@ -38,7 +45,8 @@ const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Two-way sync between a local directory and a directory in the Filen drive, printing every event
 /// the engine reports, until Ctrl-C. On a terminal, a status line under the events shows the live
-/// upload and download rates while a pass runs.
+/// upload and download rates while a pass runs, and deletions the engine holds back for approval are
+/// put to the user as a question (see [`held`]).
 pub(crate) async fn sync(
 	config: &CliConfig,
 	ui: &mut UI,
@@ -110,54 +118,229 @@ pub(crate) async fn sync(
 		"Syncing {local} with {remote_path} (Ctrl-C to stop)"
 	));
 	let mut status = watch.status();
-	let mut last_status = WatchStatus::default();
-	let mut printed_failures = HashSet::new();
-	let mut status_line = StatusLine::new(ui);
+	// The question needs someone to answer it: a terminal to read from, and terminals to draw it on
+	// (the prompt draws on stderr, everything else is printed to stdout).
+	let can_ask = !ui.json
+		&& std::io::stdin().is_terminal()
+		&& std::io::stdout().is_terminal()
+		&& std::io::stderr().is_terminal();
+	let mut output = Output {
+		status_line: StatusLine::new(ui),
+		printed_failures: HashSet::new(),
+		last_status: WatchStatus::default(),
+		held: Held::new(can_ask),
+	};
 	let mut redraw = interval(STATUS_REDRAW_INTERVAL);
 	redraw.set_missed_tick_behavior(MissedTickBehavior::Skip);
-	loop {
+	let end = loop {
+		let flow = select! {
+			Some(event) = events_rx.recv() => output.deliver(ui, Update::Event(event)),
+			_ = redraw.tick() => {
+				output.redraw();
+				ControlFlow::Continue(())
+			}
+			changed = status.changed() => match changed {
+				Ok(()) => output.deliver(ui, Update::Status(status.borrow_and_update().clone())),
+				Err(_) => ControlFlow::Break(LoopEnd::WatchEnded),
+			},
+			_ = stop_rx.recv() => ControlFlow::Break(LoopEnd::Stop),
+			(answer, deferred) = output.held.answered(), if output.held.is_asking() => {
+				output.answered(ui, &engine, pair, answer, deferred).await
+			}
+		};
+		if let ControlFlow::Break(end) = flow {
+			break end;
+		}
+	};
+	// Nothing new is asked from here on. A question still open stays open (see `Held::stop`), and
+	// what is printed meanwhile waits for its answer. A watch that ended among the updates it held
+	// back changes nothing once they are printed: the command is ending either way.
+	output.held.stop();
+	if let LoopEnd::Stop = end {
+		let _ = output.print(
+			ui,
+			Update::Notice("Stopping after the current pass (Ctrl-C again to quit immediately)..."),
+		);
+		// Keep printing while the pass finishes: its last events are the ones being waited for.
+		let stop = watch.stop();
+		tokio::pin!(stop);
+		loop {
+			select! {
+				() = &mut stop => break,
+				Some(event) = events_rx.recv() => {
+					// The watch is being stopped already: whether it ended is not news.
+					let _ = output.deliver(ui, Update::Event(event));
+				}
+				_ = redraw.tick() => output.redraw(),
+				(answer, deferred) = output.held.answered(), if output.held.is_asking() => {
+					let _ = output.answered(ui, &engine, pair, answer, deferred).await;
+				}
+				// Leaves the drive lock to expire on the server rather than wait for the pass.
+				_ = stop_rx.recv() => {
+					output.status_line.clear();
+					std::process::exit(130);
+				}
+			}
+		}
+	}
+	// The prompt of a question still open cannot be cancelled: left behind, it would go on reading
+	// the terminal after this returns, and in the REPL take keys typed for the next command. So the
+	// command ends once it is answered. Quitting at once here, on a further SIGINT from outside,
+	// leaves the terminal in the prompt's raw mode.
+	if output.held.is_asking() {
 		select! {
-			Some(event) = events_rx.recv() => status_line.show(ui, &mut printed_failures, event),
-			_ = redraw.tick() => status_line.draw(),
-			changed = status.changed() => {
-				if changed.is_err() {
-					break;
-				}
-				let current = status.borrow_and_update().clone();
-				status_line.print_above(|| print_status_change(ui, &last_status, &current));
-				if matches!(current.state, WatchState::Stopped | WatchState::PairRemoved) {
-					break;
-				}
-				last_status = current;
+			(answer, deferred) = output.held.answered() => {
+				let _ = output.answered(ui, &engine, pair, answer, deferred).await;
 			}
 			_ = stop_rx.recv() => {
-				status_line.print_above(|| {
-					ui.print_muted("Stopping after the current pass (Ctrl-C again to quit immediately)...");
-				});
-				// Keep printing while the pass finishes: its last events are the ones being waited for.
-				let stop = watch.stop();
-				tokio::pin!(stop);
-				loop {
-					select! {
-						() = &mut stop => break,
-						Some(event) = events_rx.recv() => status_line.show(ui, &mut printed_failures, event),
-						_ = redraw.tick() => status_line.draw(),
-						// Leaves the drive lock to expire on the server rather than wait for the pass.
-						_ = stop_rx.recv() => {
-							status_line.clear();
-							std::process::exit(130);
-						}
-					}
-				}
-				break;
+				output.status_line.clear();
+				std::process::exit(130);
 			}
 		}
 	}
 	while let Ok(event) = events_rx.try_recv() {
-		status_line.show(ui, &mut printed_failures, event);
+		let _ = output.deliver(ui, Update::Event(event));
 	}
-	status_line.clear();
+	output.status_line.clear();
 	Ok(())
+}
+
+/// Why the main loop of [`sync`] ended.
+enum LoopEnd {
+	/// Ctrl-C: stop the watch after its current pass.
+	Stop,
+	/// The watch ended by itself: its pair was removed.
+	WatchEnded,
+}
+
+/// Everything `sync` shows: the printed events, the status line under them, and the question about
+/// held deletions, which has the terminal to itself while it is open.
+struct Output {
+	status_line: StatusLine,
+	/// This pass's failures already printed as they happened (see [`print_event`]).
+	printed_failures: HashSet<String>,
+	/// The watch's health as last printed, so only what changed is printed.
+	last_status: WatchStatus,
+	held: Held,
+}
+
+impl Output {
+	/// Count `update` into the rates as it arrives, then [`print`](Self::print) it.
+	fn deliver(&mut self, ui: &mut UI, update: Update) -> ControlFlow<LoopEnd> {
+		if let Update::Event(event) = &update {
+			// Counted now rather than when printed, so the rates keep to the time things happened
+			// while a question holds the printing back.
+			self.status_line.record(event);
+			// A progress tick prints nothing: the rates are all it is for.
+			if matches!(event, SyncEvent::Progress { .. }) {
+				return ControlFlow::Continue(());
+			}
+		}
+		self.print(ui, update)
+	}
+
+	/// Print `update`, or keep it for after the answer while a question is open.
+	fn print(&mut self, ui: &mut UI, update: Update) -> ControlFlow<LoopEnd> {
+		let Some(update) = self.held.defer(update) else {
+			return ControlFlow::Continue(());
+		};
+		match update {
+			Update::Event(event) => {
+				let printed_failures = &mut self.printed_failures;
+				self.status_line
+					.print_above(|| print_event(ui, printed_failures, &event));
+				// A held batch is raised once the pass is over, with the report that lists it.
+				if let SyncEvent::PassCompleted { report } = &event {
+					let held = &mut self.held;
+					self.status_line.print_above(|| held.raise(ui, report));
+					if self.held.is_asking() {
+						self.status_line.clear();
+					}
+				}
+			}
+			Update::Status(current) => {
+				self.status_line
+					.print_above(|| print_status_change(ui, &self.last_status, &current));
+				if matches!(current.state, WatchState::Stopped | WatchState::PairRemoved) {
+					return ControlFlow::Break(LoopEnd::WatchEnded);
+				}
+				self.last_status = current;
+			}
+			Update::Notice(notice) => self.status_line.print_above(|| ui.print_muted(notice)),
+		}
+		ControlFlow::Continue(())
+	}
+
+	/// Redraw the status line, unless a question has the terminal.
+	fn redraw(&mut self) {
+		if !self.held.is_asking() {
+			self.status_line.draw();
+		}
+	}
+
+	/// Act on the answer about a held batch, then print what the question held back.
+	async fn answered(
+		&mut self,
+		ui: &mut UI,
+		engine: &SyncEngine,
+		pair: PairId,
+		answer: Answer,
+		deferred: Vec<Update>,
+	) -> ControlFlow<LoopEnd> {
+		let after = match answer {
+			Answer::Approve(token) => {
+				// The engine runs the pass that applies them right away.
+				engine.approve_deletions(pair, &token).await;
+				self.status_line
+					.print_above(|| ui.print_success("Approved, applying the held deletions"));
+				ControlFlow::Continue(())
+			}
+			Answer::Keep => {
+				self.status_line.print_above(|| {
+					ui.print_muted(
+						"The deletions stay held, and are not asked about again unless they change",
+					);
+				});
+				ControlFlow::Continue(())
+			}
+			// The first Ctrl-C of the command, typed while the prompt had the terminal. Nothing may
+			// be asked from here on, including about a batch among the updates replayed below.
+			Answer::Interrupted => {
+				self.held.stop();
+				ControlFlow::Break(LoopEnd::Stop)
+			}
+			Answer::Failed(error) => {
+				self.status_line.print_above(|| {
+					ui.print_failure(&format!("Could not ask about the held deletions: {error}"));
+					ui.print_warning(held::NO_TERMINAL);
+				});
+				ControlFlow::Continue(())
+			}
+			Answer::TooLate => {
+				self.status_line.print_above(|| {
+					ui.print_muted(
+						"Not acted on: the sync is stopping, so the deletions stay held",
+					);
+				});
+				ControlFlow::Continue(())
+			}
+		};
+		self.replay(ui, deferred)?;
+		after
+	}
+
+	/// Print the updates a question held back, in the order they arrived. One of them may raise a
+	/// new question, which holds back the rest in turn.
+	fn replay(&mut self, ui: &mut UI, deferred: Vec<Update>) -> ControlFlow<LoopEnd> {
+		let mut flow = ControlFlow::Continue(());
+		for update in deferred {
+			// Counted into the rates when it arrived.
+			if let ControlFlow::Break(end) = self.print(ui, update) {
+				flow = ControlFlow::Break(end);
+			}
+		}
+		flow
+	}
 }
 
 /// The dim line kept under the printed events while a pass runs, redrawn in place with the live
@@ -198,14 +381,10 @@ impl StatusLine {
 		}
 	}
 
-	/// Count `event` into the rates and print it above the line.
-	fn show(&mut self, ui: &mut UI, printed_failures: &mut HashSet<String>, event: SyncEvent) {
+	/// Count `event` into the rates, as it arrives.
+	fn record(&mut self, event: &SyncEvent) {
 		if self.state != LineState::Disabled {
-			self.rates.record(&event, Instant::now());
-		}
-		// A progress tick prints nothing, so the line stays as it is until the next redraw.
-		if !matches!(event, SyncEvent::Progress { .. }) {
-			self.print_above(|| print_event(ui, printed_failures, event));
+			self.rates.record(event, Instant::now());
 		}
 	}
 
@@ -433,7 +612,7 @@ impl fmt::Display for Rate {
 
 /// `printed_failures` holds this pass's failures already printed as they happened, so the report at
 /// the end of the pass prints only the ones no event carried (e.g. the drive lock being unavailable).
-fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: SyncEvent) {
+fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: &SyncEvent) {
 	match event {
 		SyncEvent::PassStarted { .. } => {
 			printed_failures.clear();
@@ -444,9 +623,8 @@ fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: SyncE
 		SyncEvent::Conflict { rel_path } => ui.print_warning(&format!(
 			"Conflict: {rel_path} changed on both sides and is left untouched"
 		)),
-		SyncEvent::DeletionsHeld { count, reason, .. } => ui.print_warning(&format!(
-			"Held back {count} deletion(s) ({reason}); approving them is not supported here yet"
-		)),
+		// Listed, and put to the user, with the report of the pass that held them (see `held`).
+		SyncEvent::DeletionsHeld { .. } => {}
 		SyncEvent::Uploading { rel_path } => ui.print(&format!("upload    {rel_path}")),
 		SyncEvent::Downloading { rel_path } => ui.print(&format!("download  {rel_path}")),
 		SyncEvent::CreatingRemoteDir { rel_path } => ui.print(&format!("mkdir ↑   {rel_path}")),
@@ -469,7 +647,7 @@ fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: SyncE
 		SyncEvent::Interrupted { actions } => ui.print_warning(&format!(
 			"Sync pass interrupted, {actions} action(s) left for the next pass"
 		)),
-		SyncEvent::PassCompleted { report } => print_report(ui, printed_failures, &report),
+		SyncEvent::PassCompleted { report } => print_report(ui, printed_failures, report),
 		SyncEvent::PassFailed { error } => ui.print_failure(&format!("Sync pass failed: {error}")),
 		// Byte counts per transfer, several per second: too noisy for a line each, they add up to the
 		// rates on the status line instead.
@@ -817,6 +995,41 @@ mod tests {
 				upload: rate(0, 2, 2),
 				download: rate(0, 0, 4),
 			})
+		);
+	}
+
+	#[tokio::test]
+	async fn transfers_count_as_they_arrive_while_a_question_holds_the_printing_back() {
+		let mut ui = UI::new();
+		let mut output = Output {
+			status_line: StatusLine {
+				term: Term::stdout(),
+				state: LineState::Hidden,
+				rates: TransferRates::default(),
+			},
+			printed_failures: HashSet::new(),
+			last_status: WatchStatus::default(),
+			held: held::test_support::asking("t1", tokio::spawn(async { Ok(false) })),
+		};
+		for event in [
+			SyncEvent::PassStarted {
+				mode: SyncMode::TwoWay,
+			},
+			progress("a", TransferDirection::Upload, 4000),
+		] {
+			let _ = output.deliver(&mut ui, Update::Event(event));
+		}
+		let rates = &output.status_line.rates;
+		assert!(rates.pass_started.is_some(), "the pass runs from its start");
+		let moved: Vec<u64> = rates.upload.moved.iter().map(|&(_, bytes)| bytes).collect();
+		assert_eq!(moved, [4000]);
+		let (_, deferred) = output.held.answered().await;
+		assert!(
+			matches!(
+				deferred.as_slice(),
+				[Update::Event(SyncEvent::PassStarted { .. })]
+			),
+			"a progress tick prints nothing, so nothing of it is held back"
 		);
 	}
 
