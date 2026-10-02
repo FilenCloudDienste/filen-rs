@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+	io::{self, Write},
+	sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, builder::Styles};
@@ -73,7 +76,8 @@ pub(crate) struct UI {
 	quiet: bool,
 	history: Vec<String>,
 	override_terminal_width: Option<usize>,
-	output: Vec<String>,
+	/// Where printed lines go: stdout, except in the tests.
+	out: Box<dyn Write + Send + Sync>,
 	/// Whether to output machine-readable JSON where applicable
 	pub(crate) json: bool,
 	disable_suggestions: bool,
@@ -83,11 +87,15 @@ pub(crate) struct UI {
 
 impl UI {
 	pub(crate) fn new() -> Self {
+		Self::with_writer(io::stdout())
+	}
+
+	fn with_writer(out: impl Write + Send + Sync + 'static) -> Self {
 		UI {
 			quiet: false,
 			history: Vec::new(),
 			override_terminal_width: None,
-			output: Vec::new(),
+			out: Box::new(out),
 			json: false,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
@@ -151,9 +159,11 @@ impl UI {
 
 	pub(crate) fn print(&mut self, msg: &str) {
 		let msg = self.redact_for_replay_testing(msg.to_string());
-		println!("{}", msg);
+		// A failed write panics, with the message `println!` panics with.
+		if let Err(e) = writeln!(self.out, "{}", msg) {
+			panic!("failed printing to stdout: {e}");
+		}
 		info!("[PRINT] {}", msg);
-		self.output.push(msg);
 	}
 	pub(crate) fn print_hidden(&self, msg: &str) {
 		info!("[PRINT] {}", msg);
@@ -642,7 +652,34 @@ impl UI {
 
 #[cfg(test)]
 mod tests {
+	use std::sync::Mutex;
+
 	use super::*;
+
+	/// What a UI printed. Its clones are handles to one buffer, so the test keeps one to read back
+	/// what the UI wrote through another.
+	#[derive(Clone, Default)]
+	struct Printed(Arc<Mutex<Vec<u8>>>);
+
+	impl Write for Printed {
+		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(buf);
+			Ok(buf.len())
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	impl Printed {
+		/// The printed lines joined by `\n`, without the one ending the last line.
+		fn lines(&self) -> String {
+			let bytes = self.0.lock().unwrap();
+			let text = str::from_utf8(&bytes).unwrap();
+			text.strip_suffix('\n').unwrap().to_owned()
+		}
+	}
 
 	// run using: cargo insta test --review -- --test test_ui
 
@@ -668,22 +705,21 @@ mod tests {
 			]);
 		}
 
+		fn printed(terminal_width: usize) -> String {
+			let printed = Printed::default();
+			let mut ui = UI::with_writer(printed.clone());
+			ui.initialize(false, false, Some(terminal_width), true, false);
+			test(&mut ui);
+			printed.lines()
+		}
+
 		// different terminal sizes
-		let mut small_ui = UI::new();
-		small_ui.initialize(false, false, Some(30), true, false);
-		test(&mut small_ui);
-		insta::assert_snapshot!(small_ui.output.join("\n"));
-		let mut large_ui = UI::new();
-		large_ui.initialize(false, false, Some(100), true, false);
-		test(&mut large_ui);
-		insta::assert_snapshot!(large_ui.output.join("\n"));
+		insta::assert_snapshot!(printed(30));
+		insta::assert_snapshot!(printed(100));
 
 		// no color
 		console::set_colors_enabled(false);
-		let mut no_color_ui = UI::new();
-		no_color_ui.initialize(false, false, Some(100), true, false);
-		test(&mut no_color_ui);
-		insta::assert_snapshot!(no_color_ui.output.join("\n"));
+		insta::assert_snapshot!(printed(100));
 	}
 
 	#[test]
