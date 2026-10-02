@@ -335,12 +335,13 @@ impl Client {
 	}
 }
 
-/// Removes a partially-written `.filendl` temp file on drop unless the download
-/// committed it with a rename. Without this, any early return mid-download
-/// (network error, `FileChangedDuringSync`, task cancellation) would leave
-/// `<uuid>.filendl` inside the sync tree, where the next scan pass — which only
-/// filters the quarantine dir — would treat it as a new local file and upload
-/// the partial garbage.
+/// A temp file written beside its destination, removed on drop unless
+/// [`commit`](Self::commit) renamed it onto the destination, so the
+/// destination only ever holds a whole file. Without the removal, any early
+/// return before the commit (network error, `FileChangedDuringSync`, task
+/// cancellation) would leave the partial file behind — inside a sync tree,
+/// where the next scan pass, which only filters the quarantine dir, would
+/// treat it as a new local file and upload the partial garbage.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) struct TmpFileGuard {
 	path: Option<PathBuf>,
@@ -348,14 +349,37 @@ pub(crate) struct TmpFileGuard {
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 impl TmpFileGuard {
-	pub(crate) fn new(path: PathBuf) -> Self {
-		Self { path: Some(path) }
+	/// Creates `name` in `destination`'s directory, truncating a file an
+	/// earlier run left there under that name (a download killed before its
+	/// guard ran), and arms its removal.
+	pub(crate) async fn create_beside(
+		destination: &Path,
+		name: &str,
+	) -> std::io::Result<(Self, tokio::fs::File)> {
+		let parent = destination.parent().ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"Provided path has no parent directory",
+			)
+		})?;
+		let path = parent.join(name);
+		let file = tokio::fs::OpenOptions::new()
+			.write(true)
+			.create(true)
+			.truncate(true)
+			.open(&path)
+			.await?;
+		Ok((Self { path: Some(path) }, file))
 	}
 
-	/// Call once the temp file has been committed (renamed into place) so drop
-	/// does not remove the now-final file.
-	pub(crate) fn disarm(&mut self) {
+	/// Renames the temp file onto `destination`; from then on dropping the
+	/// guard leaves it be. On `Err` the temp file is removed as the guard drops.
+	pub(crate) async fn commit(mut self, destination: &Path) -> std::io::Result<()> {
+		if let Some(tmp) = &self.path {
+			tokio::fs::rename(tmp, destination).await?;
+		}
 		self.path = None;
+		Ok(())
 	}
 }
 
@@ -384,25 +408,11 @@ where
 		Err(e) => return Err(e.into()),
 	};
 
-	let parent = path.as_ref().parent().ok_or_else(|| {
-		std::io::Error::new(
-			std::io::ErrorKind::InvalidInput,
-			"Provided path has no parent directory",
-		)
-	})?;
-	let tmp_path = parent
-		.join(remote_file.uuid().to_string())
-		.with_extension("filendl");
-	let tmp_file = tokio::fs::OpenOptions::new()
-		.write(true)
-		.create(true)
-		.truncate(true)
-		.open(&tmp_path)
-		.await?;
-	// Arm cleanup now that the temp file exists: every path out of this function
-	// before the final rename must unlink it rather than leak it into the sync
-	// tree.
-	let mut tmp_guard = TmpFileGuard::new(tmp_path.clone());
+	// Every path out of this function before the commit unlinks the temp file
+	// rather than leak it into the sync tree.
+	let (tmp_guard, tmp_file) =
+		TmpFileGuard::create_beside(path.as_ref(), &format!("{}.filendl", remote_file.uuid()))
+			.await?;
 	let mut writer = tmp_file.compat_write();
 
 	unauth_client
@@ -434,10 +444,7 @@ where
 		}
 	}
 
-	tokio::fs::rename(&tmp_path, path).await?;
-	// Committed: the temp file no longer exists under its old name, so disarm
-	// cleanup to avoid removing the file we just placed.
-	tmp_guard.disarm();
+	tmp_guard.commit(path.as_ref()).await?;
 	Ok(())
 }
 
@@ -630,32 +637,68 @@ where
 
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod tmp_file_guard_tests {
+	use std::{ffi::OsString, io::ErrorKind, path::Path};
+
+	use tokio::io::AsyncWriteExt;
+
 	use super::TmpFileGuard;
 
-	#[test]
-	fn armed_guard_removes_temp_file_on_drop() {
+	#[tokio::test]
+	async fn a_temp_file_beside_its_destination_is_removed_unless_committed() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("abc.filendl");
-		std::fs::write(&path, b"partial download").unwrap();
-		assert!(path.exists());
+		let destination = dir.path().join("photo.jpg");
+		std::fs::write(&destination, b"old").unwrap();
+		let tmp_path = dir.path().join("photo.jpg.part");
 		{
-			// Dropping the still-armed guard simulates an early return
-			// mid-download; the leaked temp file must be unlinked.
-			let _guard = TmpFileGuard::new(path.clone());
+			// Dropping the guard uncommitted is every early return mid-download.
+			let (_guard, mut file) = TmpFileGuard::create_beside(&destination, "photo.jpg.part")
+				.await
+				.unwrap();
+			file.write_all(b"partial").await.unwrap();
+			file.flush().await.unwrap();
+			assert!(tmp_path.exists());
 		}
-		assert!(!path.exists(), "leaked temp file must be removed on drop");
+		assert!(!tmp_path.exists());
+		assert_eq!(std::fs::read(&destination).unwrap(), b"old");
 	}
 
-	#[test]
-	fn disarmed_guard_keeps_committed_file() {
+	#[tokio::test]
+	async fn a_committed_temp_file_replaces_its_destination() {
 		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("abc.filendl");
-		std::fs::write(&path, b"committed").unwrap();
-		{
-			let mut guard = TmpFileGuard::new(path.clone());
-			// Committing (rename) disarms the guard; the final file must survive.
-			guard.disarm();
-		}
-		assert!(path.exists(), "committed file must survive after disarm");
+		let destination = dir.path().join("photo.jpg");
+		std::fs::write(&destination, b"old").unwrap();
+		let (guard, mut file) = TmpFileGuard::create_beside(&destination, "photo.jpg.part")
+			.await
+			.unwrap();
+		file.write_all(b"new").await.unwrap();
+		file.flush().await.unwrap();
+		drop(file);
+		guard.commit(&destination).await.unwrap();
+		assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+		let names = std::fs::read_dir(dir.path())
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>();
+		assert_eq!(names, vec![OsString::from("photo.jpg")]);
+	}
+
+	#[tokio::test]
+	async fn a_temp_file_left_by_an_earlier_run_is_truncated() {
+		let dir = tempfile::tempdir().unwrap();
+		let destination = dir.path().join("photo.jpg");
+		std::fs::write(dir.path().join("photo.jpg.part"), b"stale").unwrap();
+		let (_guard, file) = TmpFileGuard::create_beside(&destination, "photo.jpg.part")
+			.await
+			.unwrap();
+		assert_eq!(file.metadata().await.unwrap().len(), 0);
+	}
+
+	#[tokio::test]
+	async fn a_destination_without_a_parent_is_refused() {
+		let Err(e) = TmpFileGuard::create_beside(Path::new("/"), "root.part").await else {
+			panic!("a temp file beside / was created");
+		};
+		assert_eq!(e.kind(), ErrorKind::InvalidInput);
+		assert_eq!(e.to_string(), "Provided path has no parent directory");
 	}
 }

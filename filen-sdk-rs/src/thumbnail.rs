@@ -2268,31 +2268,18 @@ mod js_impls {
 	#[cfg(feature = "uniffi")]
 	async fn create_tmp_beside(
 		path: &std::path::Path,
-	) -> Result<
-		(
-			std::path::PathBuf,
-			crate::io::client_impl::TmpFileGuard,
-			tokio::fs::File,
-		),
-		Error,
-	> {
+	) -> Result<(crate::io::client_impl::TmpFileGuard, tokio::fs::File), Error> {
 		let file_name = path
 			.file_name()
-			.map(|name| name.to_string_lossy().into_owned())
+			.map(|name| name.to_string_lossy())
 			.ok_or_else(|| {
 				Error::custom(
 					crate::ErrorKind::IO,
 					"preview path has no file name".to_string(),
 				)
 			})?;
-		let tmp_path = path.with_file_name(format!("{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-		let tmp_file = tokio::fs::OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(&tmp_path)
-			.await?;
-		let guard = crate::io::client_impl::TmpFileGuard::new(tmp_path.clone());
-		Ok((tmp_path, guard, tmp_file))
+		let tmp_name = format!("{file_name}.{}.tmp", uuid::Uuid::new_v4());
+		Ok(crate::io::client_impl::TmpFileGuard::create_beside(path, &tmp_name).await?)
 	}
 
 	#[cfg(feature = "uniffi")]
@@ -2308,7 +2295,7 @@ mod js_impls {
 		managed_future
 			.into_js_managed_commander_future(move || async move {
 				let path = std::path::PathBuf::from(preview_path);
-				let (tmp_path, mut tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
+				let (tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
 				let mut tmp_file = tmp_file.into_std().await;
 				// One blocking job for both halves. The locate is what the decode
 				// gate is for — the copy that follows rides along on the same
@@ -2323,8 +2310,7 @@ mod js_impls {
 				})
 				.await?;
 				if preview.is_some() {
-					tokio::fs::rename(&tmp_path, &path).await?;
-					tmp_guard.disarm();
+					tmp_guard.commit(&path).await?;
 				}
 				Ok(EmbeddedPreviewResult::from(preview))
 			})
@@ -2347,13 +2333,12 @@ mod js_impls {
 			.into_js_managed_commander_future(move || async move {
 				let file = RemoteFileType::try_from(file)?;
 				let path = std::path::PathBuf::from(file_path);
-				let (tmp_path, mut tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
+				let (tmp_guard, tmp_file) = create_tmp_beside(&path).await?;
 				let mut writer = tmp_file.compat_write();
 				let preview = write_embedded_preview_remote(client, file, &mut writer).await?;
 				drop(writer);
 				if preview.is_some() {
-					tokio::fs::rename(&tmp_path, &path).await?;
-					tmp_guard.disarm();
+					tmp_guard.commit(&path).await?;
 				}
 				Ok(EmbeddedPreviewResult::from(preview))
 			})
