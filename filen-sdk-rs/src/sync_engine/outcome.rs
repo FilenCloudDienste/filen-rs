@@ -327,7 +327,9 @@ pub struct PlanOutcome {
 	/// Every action the pass would apply, in apply order. Empty when `refused` is set.
 	pub actions: Vec<PlannedAction>,
 	/// Deletions the mass-delete guard would hold back — plus the create half of a held type flip,
-	/// which is only meaningful together with its delete. Not included in `actions`.
+	/// which is only meaningful together with its delete. Not included in `actions`. One per item:
+	/// the guard counts what a pass deletes, so a held directory lists every deletion under it, all
+	/// of which `actions` would leave to the directory's own.
 	pub held: Vec<PlannedAction>,
 	/// Why the guard would hold; set exactly when `held` is non-empty.
 	pub held_reason: Option<GuardReason>,

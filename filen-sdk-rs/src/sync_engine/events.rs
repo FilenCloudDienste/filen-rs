@@ -81,9 +81,11 @@ pub enum SyncEvent {
 	CreatingRemoteDir { rel_path: String },
 	/// Creating a directory in the local tree.
 	CreatingLocalDir { rel_path: String },
-	/// Trashing an item on the remote (a propagated local deletion).
+	/// Trashing an item on the remote (a propagated local deletion). A directory goes with its
+	/// whole subtree, which gets no event of its own.
 	TrashingRemote { rel_path: String },
 	/// Moving a locally-removed item into the pair's quarantine dir (a propagated remote deletion).
+	/// A directory goes with its whole subtree, which gets no event of its own.
 	DeletingLocal { rel_path: String },
 	/// Re-parenting/renaming a file on the remote in place of a re-upload (a detected local move).
 	MovingRemote { from: String, to: String },

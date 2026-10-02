@@ -40,7 +40,7 @@ use super::{
 		RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
-	plan::{RemoteNode, SyncAction, create_target_paths, is_under},
+	plan::{RemoteNode, Subsumed, SyncAction, create_target_paths, is_under},
 	rows::Baseline,
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::NodesAt,
@@ -68,7 +68,10 @@ pub struct SyncReport {
 	pub uploaded: usize,
 	pub local_dirs_created: usize,
 	pub remote_dirs_created: usize,
+	/// Items moved into the pair's local quarantine bin — a directory counts once, whatever its
+	/// subtree holds.
 	pub locally_deleted: usize,
+	/// Items moved to the Filen trash — a directory counts once, whatever its subtree holds.
 	pub remotely_trashed: usize,
 	/// Items re-parented/renamed on the remote in place of a re-upload — a directory counts once,
 	/// whatever its subtree holds.
@@ -250,6 +253,9 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) gate: &'a PassGate,
 	/// The bounds of each hold of the drive-write lock (see [`Lease`]).
 	pub(super) lock_budget: LockBudget,
+	/// The deletions each directory deletion of the plan carries out along with its own, whose
+	/// baseline rows it drops (see [`plan::fold_subsumed_deletes`](super::plan)).
+	pub(super) subsumed: &'a Subsumed,
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -1757,7 +1763,17 @@ async fn apply_one(
 				)));
 			}
 			let _stashed = quarantine_local(ctx.local_root, rel_path)?;
-			delete_baseline(ctx, rel_path).await?;
+			match ctx.subsumed.under(action) {
+				[] => delete_baseline(ctx, rel_path).await?,
+				subsumed => {
+					let (pair, paths) = (ctx.pair, dropped_paths(rel_path, subsumed));
+					off_store(ctx.store, move |store| {
+						store.apply_changes(pair, &deletes(&paths))
+					})
+					.await?
+					.map_err(db_err)?;
+				}
+			}
 			report.locally_deleted += 1;
 		}
 		SyncAction::CreateRemoteDir { rel_path } => {
@@ -1840,15 +1856,7 @@ async fn apply_one(
 			// The row is about to go, so a snapshot that has not applied the trash yet reads this
 			// item as an untracked remote file with nothing local — a deletion to make all over
 			// again. Record the trash so the next pass suppresses that.
-			commit_remote_write(
-				ctx,
-				*remote_uuid,
-				PendingKind::Trashed {
-					path: (*rel_path).to_string(),
-				},
-				&[BaselineChange::Delete(rel_path)],
-			)
-			.await?;
+			commit_trash(ctx, *remote_uuid, rel_path, ctx.subsumed.under(action)).await?;
 			report.remotely_trashed += 1;
 		}
 		SyncAction::MoveRemote {
@@ -2510,6 +2518,50 @@ async fn upsert_baseline(
 	locked(ctx.store)
 		.upsert_entry(ctx.pair, entry)
 		.map_err(db_err)
+}
+
+/// Journal a remote trash at `rel_path` and drop the rows it removes — its own, and those of the
+/// deletions it carried out along with its own (`subsumed`) — in one transaction. Those rows scale
+/// with the trashed subtree, so a commit that carries them runs off the runtime thread and is
+/// published to the in-memory journal once it has committed, as [`commit_dir_move`]'s is (see there
+/// for what that means for a caller that drops the pass mid-commit).
+async fn commit_trash(
+	ctx: &ApplyContext<'_>,
+	uuid: Uuid,
+	rel_path: &str,
+	subsumed: &[String],
+) -> Result<(), crate::Error> {
+	let kind = PendingKind::Trashed {
+		path: rel_path.to_string(),
+	};
+	if subsumed.is_empty() {
+		return commit_remote_write(ctx, uuid, kind, &[BaselineChange::Delete(rel_path)]).await;
+	}
+	let (pair, committed, paths) = (ctx.pair, kind.clone(), dropped_paths(rel_path, subsumed));
+	let at = Utc::now().timestamp_millis();
+	off_store(ctx.store, move |store| {
+		store.record_pending(pair, uuid, &committed, at, &deletes(&paths))
+	})
+	.await?
+	.map_err(db_err)?;
+	ctx.pending.record(ctx.observed, pair, uuid, kind);
+	Ok(())
+}
+
+/// `rel_path` and the paths of the deletions it carried out along with its own: the rows a
+/// directory deletion drops, owned for the store thread.
+fn dropped_paths(rel_path: &str, subsumed: &[String]) -> Vec<String> {
+	let mut paths = Vec::with_capacity(subsumed.len() + 1);
+	paths.push(rel_path.to_owned());
+	paths.extend_from_slice(subsumed);
+	paths
+}
+
+fn deletes(paths: &[String]) -> Vec<BaselineChange<'_>> {
+	paths
+		.iter()
+		.map(|path| BaselineChange::Delete(path))
+		.collect()
 }
 
 async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), crate::Error> {

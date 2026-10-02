@@ -41,7 +41,7 @@ use super::{
 		UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
-	plan::{self, RemoteNode, RemoteView, SyncAction},
+	plan::{self, RemoteNode, RemoteView, Subsumed, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
@@ -4030,7 +4030,9 @@ impl SyncEngine {
 				..PlanOutcome::default()
 			});
 		}
-		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		let mut screened = reconcile_and_screen(&prep, screen_state(&prep));
+		// What the pass would apply, which takes each deletion under a deleted directory along with it.
+		plan::fold_subsumed_deletes(&mut screened.decision.safe);
 		Ok(PlanOutcome {
 			actions: prep.planned(&screened.decision.safe),
 			held: prep.planned(&screened.decision.held),
@@ -4581,10 +4583,15 @@ impl SyncEngine {
 	/// ends it. Once a streak reaches [`MAX_PATH_FAILURES`] the path stops being planned and is
 	/// reported as [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever —
 	/// until [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
+	///
+	/// A directory deletion that succeeded also ends the streaks of the deletions it carried out
+	/// (`subsumed`): they happened with it. One that failed leaves theirs alone, since none of them
+	/// was attempted on its own.
 	async fn note_path_outcomes(
 		&self,
 		pair: PairId,
 		attempted: &[String],
+		subsumed: &Subsumed,
 		report: &mut SyncReport,
 	) {
 		if attempted.is_empty() {
@@ -4604,6 +4611,7 @@ impl SyncEngine {
 				attempted
 					.iter()
 					.filter(|path| !failed.contains_key(path.as_str()))
+					.flat_map(|path| std::iter::once(path).chain(subsumed.carried_by(path)))
 					.cloned()
 					.collect()
 			});
@@ -5060,7 +5068,7 @@ impl SyncEngine {
 			};
 			screened.pass_token = None;
 		}
-		let decision = screened.decision;
+		let mut decision = screened.decision;
 		report.conflicts = screened.conflicts;
 		// `held` can also carry the create half of a held type flip; `held_deletions()` counts only
 		// the deletions.
@@ -5129,12 +5137,15 @@ impl SyncEngine {
 				pass_token: report.deletion_token.clone().unwrap_or_default(),
 			});
 		}
-		observer(SyncEvent::Planned {
-			actions: decision.safe.len(),
-		});
 		// Before the early return below: a pass with nothing to apply still made a plan, and still
 		// owes the next one everything that plan named.
 		self.carry_forward(pair, &prep, &report, &decision).await;
+		// After the guard counted every item the plan deletes and the carry-over owed each of their
+		// paths: what is left is what the apply runs.
+		let subsumed = plan::fold_subsumed_deletes(&mut decision.safe);
+		observer(SyncEvent::Planned {
+			actions: decision.safe.len(),
+		});
 
 		// The return below hands back the LOCAL half alone: `note_owed_remote` sits after the
 		// apply, since `report.interrupted` is what gates it and nothing has applied anything yet.
@@ -5186,6 +5197,7 @@ impl SyncEngine {
 			observed: &self.observed,
 			gate: &gate,
 			lock_budget: self.lock_budget,
+			subsumed: &subsumed,
 		};
 		let attempted: Vec<String> = decision
 			.safe
@@ -5193,7 +5205,8 @@ impl SyncEngine {
 			.map(|action| action.rel_path().to_string())
 			.collect();
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
-		self.note_path_outcomes(pair, &attempted, &mut report).await;
+		self.note_path_outcomes(pair, &attempted, &subsumed, &mut report)
+			.await;
 		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
 		// above recorded the paths the plan named; this puts the announced changes back with them,
 		// and without them the next pass would derive those paths' remote side from baseline rows
@@ -9708,7 +9721,7 @@ mod tests {
 			&mut |event| events.push(event),
 		);
 		engine
-			.note_path_outcomes(pair, &attempted, &mut report)
+			.note_path_outcomes(pair, &attempted, &Subsumed::default(), &mut report)
 			.await;
 
 		assert_eq!(
@@ -9729,6 +9742,78 @@ mod tests {
 				actions: attempted.len()
 			}]
 		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pass with `docs/a.txt`'s earlier failed trash on record, whose plan folded that trash into
+	/// the trash of `docs`: the engine, the pair, the store's file, and the folded deletions.
+	async fn streak_under_a_folded_directory(tag: &str) -> (SyncEngine, PairId, PathBuf, Subsumed) {
+		let (engine, pair, path) = engine_with_pair(tag).await;
+		locked(&engine.pair_store(pair).await.unwrap())
+			.record_failure(pair, "docs/a.txt", "boom", Utc::now().timestamp_millis())
+			.unwrap();
+		let trash = |rel_path: &str, kind| SyncAction::TrashRemote {
+			rel_path: rel_path.to_string(),
+			kind,
+			remote_uuid: Uuid::from_u128(1),
+		};
+		let subsumed = plan::fold_subsumed_deletes(&mut vec![
+			trash("docs/a.txt", NodeKind::File),
+			trash("docs", NodeKind::Dir),
+		]);
+		(engine, pair, path, subsumed)
+	}
+
+	/// The deletions a directory deletion carried out happened with it: when it succeeds, their
+	/// failure streaks end with its own, or a later item at one of those paths would inherit a
+	/// streak it never earned.
+	#[tokio::test]
+	async fn a_directory_deletion_that_succeeds_ends_the_streaks_of_the_deletions_it_carried() {
+		let (engine, pair, path, subsumed) =
+			streak_under_a_folded_directory("folded_streak_cleared").await;
+
+		let mut report = SyncReport::default();
+		engine
+			.note_path_outcomes(pair, &["docs".to_string()], &subsumed, &mut report)
+			.await;
+
+		assert!(report.errors.is_empty(), "{:?}", report.errors);
+		assert_eq!(
+			locked(&engine.pair_store(pair).await.unwrap())
+				.failures(pair)
+				.unwrap(),
+			HashMap::new()
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A directory deletion that failed attempted none of the deletions it carried on their own, so
+	/// their streaks stay exactly as they were, and only the directory's grows.
+	#[tokio::test]
+	async fn a_directory_deletion_that_fails_leaves_the_streaks_of_the_deletions_it_carried() {
+		let (engine, pair, path, subsumed) =
+			streak_under_a_folded_directory("folded_streak_kept").await;
+		let before = locked(&engine.pair_store(pair).await.unwrap())
+			.failures(pair)
+			.unwrap();
+
+		let mut report = SyncReport {
+			failed_paths: vec![("docs".to_string(), "boom".to_string())],
+			..SyncReport::default()
+		};
+		engine
+			.note_path_outcomes(pair, &["docs".to_string()], &subsumed, &mut report)
+			.await;
+
+		let after = locked(&engine.pair_store(pair).await.unwrap())
+			.failures(pair)
+			.unwrap();
+		assert_eq!(after.get("docs/a.txt"), before.get("docs/a.txt"));
+		assert_eq!(after.get("docs").map(|failure| failure.attempts), Some(1));
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
