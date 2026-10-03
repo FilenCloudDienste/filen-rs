@@ -81,6 +81,14 @@ jobs:
       - name: Build React Native Bundle
         run: npm run ubrn:release
         working-directory: ./filen-sdk-rs/web
+      # DWARF is ~200 MB per static library and pushes the tarball past the registry's upload
+      # limit (413). A debug-only strip keeps every symbol, so linking is unaffected.
+      - name: Strip debug info from the iOS static libraries
+        run: |
+          set -- FilenSdkRsFramework.xcframework/*/libfilen_sdk_rs.a
+          [ -f "$1" ] || { echo "no static libraries found to strip" >&2; exit 1; }
+          xcrun strip -S "$@"
+        working-directory: ./filen-sdk-rs/web
       - name: Configure npm for publishing
         run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_PUBLISH_TOKEN }}" > ~/.npmrc
       - name: Publish
