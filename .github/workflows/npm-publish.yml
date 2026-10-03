@@ -23,6 +23,7 @@ jobs:
         with:
           toolchain: nightly-2026-02-20
           targets: wasm32-unknown-unknown, aarch64-linux-android, x86_64-linux-android, aarch64-apple-ios, aarch64-apple-ios-sim
+          components: llvm-tools
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
@@ -81,13 +82,17 @@ jobs:
       - name: Build React Native Bundle
         run: npm run ubrn:release
         working-directory: ./filen-sdk-rs/web
-      # DWARF is ~200 MB per static library and pushes the tarball past the registry's upload
-      # limit (413). A debug-only strip keeps every symbol, so linking is unaffected.
-      - name: Strip debug info from the iOS static libraries
+      # Embedded bitcode (__LLVM,__bitcode) is ~200 MB per static library and pushes the tarball
+      # past the registry's upload limit (413). Nothing links or reads it since Apple dropped
+      # bitcode; the machine code, symbols and debug info stay. Rust's llvm-objcopy, because the
+      # runner's Xcode `strip` leaves the section in place.
+      - name: Remove embedded bitcode from the iOS static libraries
         run: |
           set -- FilenSdkRsFramework.xcframework/*/libfilen_sdk_rs.a
-          [ -f "$1" ] || { echo "no static libraries found to strip" >&2; exit 1; }
-          xcrun strip -S "$@"
+          [ -f "$1" ] || { echo "no static libraries found" >&2; exit 1; }
+          objcopy="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
+          for lib in "$@"; do "$objcopy" --remove-section=__LLVM,__bitcode "$lib"; done
+          du -h "$@"
         working-directory: ./filen-sdk-rs/web
       - name: Configure npm for publishing
         run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_PUBLISH_TOKEN }}" > ~/.npmrc
