@@ -31,7 +31,9 @@ mod state;
 	feature = "sync-engine",
 	not(all(target_family = "wasm", target_os = "unknown"))
 ))]
-pub(crate) use enumerate::{RemoteItem, SnapshotSink, hydrate_by_uuids, read_ancestors};
+pub(crate) use enumerate::{
+	RemoteItem, SnapshotSink, hydrate_by_uuids, hydrate_cached_items_at, read_ancestors,
+};
 pub(crate) use handle::CacheSlot;
 #[cfg(all(
 	feature = "sync-engine",

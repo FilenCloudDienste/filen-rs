@@ -466,16 +466,26 @@ impl Client {
 		dir: &mut RemoteDirectory,
 		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
+		self.inner_move_dir(dir, new_parent.uuid()).await
+	}
+
+	/// [`move_dir`](Self::move_dir) into the directory `new_parent`, by its uuid alone, which is all
+	/// a move reads of it.
+	pub(crate) async fn inner_move_dir(
+		&self,
+		dir: &mut RemoteDirectory,
+		new_parent: Uuid,
+	) -> Result<(), Error> {
 		let _lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {
 				uuid: dir.uuid(),
-				to: new_parent.uuid(),
+				to: new_parent,
 			},
 		)
 		.await?;
-		dir.set_parent((new_parent.uuid()).into());
+		dir.set_parent(new_parent.into());
 		// Mirror the moved subtree's metadata into the new parent's shares/links (as
 		// create/upload do); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in items.

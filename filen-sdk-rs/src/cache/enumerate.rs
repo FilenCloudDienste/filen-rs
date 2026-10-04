@@ -18,7 +18,7 @@
 //! Native only: like the search engine it opens its OWN read-only connection, which the wasm
 //! single-connection VFS does not support — and the sync engine that consumes it is native-only.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -235,9 +235,9 @@ pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result
 	})
 }
 
-/// How many uuids one [`hydrate_by_uuids`] statement binds. A plan names a handful of items; a
-/// first pull names one per item of the tree, and chunking keeps both the statement and SQLite's
-/// bound-parameter limit bounded either way.
+/// How many uuids one [`hydrate_by_uuids`] statement binds. The sync engine's apply asks for what
+/// one page of its plan acts on, its other callers for a handful of items; chunking keeps both the
+/// statement and SQLite's bound-parameter limit bounded whatever a caller passes.
 const HYDRATE_CHUNK: usize = 500;
 
 /// Hydrate the FULL payload of `uuids` from the cache DB at `path`: the rows the sync engine's
@@ -268,6 +268,37 @@ pub(crate) fn hydrate_by_uuids(path: &Path, uuids: &[Uuid]) -> rusqlite::Result<
 		}
 	}
 	Ok(out)
+}
+
+/// The full cached payloads of `uuids` (see [`hydrate_by_uuids`]) — the items a sync pass actually
+/// acts on, which its subtree snapshot carries only the view's columns of — read from the cache DB
+/// at `path` on a blocking thread.
+///
+/// It takes the path rather than reading the client's: the sync engine's apply reads here with
+/// transfers in flight, and must not wait on the client's cache slot then (see the apply's
+/// `ApplyContext::cache_db`). No uuids is no read: an apply page of uploads asks for none.
+pub(crate) async fn hydrate_cached_items_at(
+	path: PathBuf,
+	uuids: Vec<Uuid>,
+) -> Result<Vec<SearchResult>, Error> {
+	if uuids.is_empty() {
+		return Ok(Vec::new());
+	}
+	tokio::task::spawn_blocking(move || hydrate_by_uuids(&path, &uuids))
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("cached item read task failed: {e}"),
+			)
+		})?
+		.map_err(|e| {
+			Error::custom_with_source(
+				ErrorKind::Internal,
+				CacheError::db(e, "hydrating cached items by uuid".to_string()),
+				Some("reading cached items".to_string()),
+			)
+		})
 }
 
 /// The cached upward ancestor chain of `uuid` — the item itself plus every ancestor up to the
@@ -311,37 +342,19 @@ impl Client {
 			})
 	}
 
-	/// The full cached payloads of `uuids` (see [`hydrate_by_uuids`]) — the items a sync pass
-	/// actually acts on, which its subtree snapshot carries only the view's columns of. Errors if
-	/// the cache was never configured. The blocking SQLite read runs on a blocking thread.
+	/// The full cached payloads of `uuids`, read from the cache DB this client is configured with
+	/// (see [`hydrate_cached_items_at`]). Errors if the cache was never configured.
 	pub(crate) async fn hydrate_cached_items(
 		&self,
 		uuids: Vec<Uuid>,
 	) -> Result<Vec<SearchResult>, Error> {
-		if uuids.is_empty() {
-			return Ok(Vec::new());
-		}
 		let path = self.cache_slot.lock().await.db_path().ok_or_else(|| {
 			Error::custom(
 				ErrorKind::InvalidState,
 				"cache is not configured; call configure_cache first",
 			)
 		})?;
-		tokio::task::spawn_blocking(move || hydrate_by_uuids(&path, &uuids))
-			.await
-			.map_err(|e| {
-				Error::custom(
-					ErrorKind::Internal,
-					format!("cached item read task failed: {e}"),
-				)
-			})?
-			.map_err(|e| {
-				Error::custom_with_source(
-					ErrorKind::Internal,
-					CacheError::db(e, "hydrating cached items by uuid".to_string()),
-					Some("reading cached items".to_string()),
-				)
-			})
+		hydrate_cached_items_at(path, uuids).await
 	}
 
 	/// Stream a consistent snapshot of the cached subtree under sync root `root` into `sink` — the
@@ -405,7 +418,7 @@ mod tests {
 
 	use super::*;
 
-	fn temp_db_path() -> std::path::PathBuf {
+	fn temp_db_path() -> PathBuf {
 		std::env::temp_dir().join(format!("filen_enumerate_test_{}.db", Uuid::new_v4()))
 	}
 
@@ -449,7 +462,7 @@ mod tests {
 
 	/// account_root → { f1, A(dir) → { a1, AA(dir) → { aa1 } }, B(dir) → { b1 } }.
 	struct Fixture {
-		path: std::path::PathBuf,
+		path: PathBuf,
 		root: Uuid,
 		a: CacheableDir<'static>,
 		aa: CacheableDir<'static>,
