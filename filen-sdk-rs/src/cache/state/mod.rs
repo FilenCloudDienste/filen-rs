@@ -1564,10 +1564,25 @@ impl CacheState {
 		self.dispatch_batch(dispatch_buffer);
 	}
 
-	/// Run the write-locked resync, surfacing any error to the main thread.
+	/// Run the write-locked resync, surfacing any error to the main thread, then give back the page
+	/// cache it filled.
+	///
+	/// A resync diffs the whole listing against the DB, which pages every row it compares through
+	/// this connection's cache and leaves it at its ceiling (see `PAGE_CACHE_KIB`), where it would
+	/// otherwise stay for the life of the worker. The drains between resyncs touch a few pages each
+	/// and read them back from the OS page cache, so the cost is a cold first drain.
+	///
+	/// On native the release reaches further than this connection. The bundled SQLite is built with
+	/// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which puts every connection's pages in one shared cache,
+	/// and a release empties all of it that no statement is using: every other connection in the
+	/// process (the search and snapshot readers, a sync engine's baseline) loses its cached pages
+	/// too, and reads them back the same way. Only clean pages are dropped.
 	async fn run_resync_surfacing_errors(&mut self) {
 		if let Err(e) = self.run_resync().await {
 			self.surface_one(e);
+		}
+		if let Err(e) = self.db.release_memory() {
+			tracing::warn!("cache: could not give back the page cache a resync filled: {e}");
 		}
 	}
 

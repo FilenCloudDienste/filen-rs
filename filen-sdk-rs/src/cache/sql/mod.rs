@@ -48,7 +48,9 @@ pub(crate) const CHUNK_SIZE: usize = 50_000;
 /// fan-out; the leaves under them are read through the OS page cache, which is the kernel's to
 /// evict and not this process's. Twice SQLite's stock default. At a million items a warm
 /// whole-subtree read took 7.5-7.8 s with it, 7.1 s with 8 MiB and 6.4-8.9 s with 32: 8 MiB buys
-/// that read 5-9%, at twice the ceiling on every connection that fills it.
+/// that read 5-9%, at twice the ceiling on every connection that fills it. The worker's connection
+/// lives as long as the client, so it gives its cache back once each resync, which pages the whole
+/// listing through it, is over.
 const PAGE_CACHE_KIB: i64 = 4 * 1024;
 
 /// Where SQLite keeps TEMP tables (the resync's `diff_incoming` staging), transient indexes (the
