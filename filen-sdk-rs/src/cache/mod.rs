@@ -50,3 +50,52 @@ pub use {
 		CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, RootKey, SyncRootCallback,
 	},
 };
+
+#[cfg(test)]
+pub(crate) mod test_support {
+	use std::{
+		fs::{self, OpenOptions},
+		io::{Seek, SeekFrom, Write},
+		path::Path,
+	};
+
+	/// Overwrite the one place `from` sits in the database file at `path` with `to`, behind every
+	/// open connection's back.
+	///
+	/// Neither the file's change counter nor the WAL index moves, so SQLite has no reason to doubt a
+	/// page a connection already holds: one that still caches the page keeps answering `from`, and
+	/// only one that has given its page cache back reads `to` off the file. That is how a test tells
+	/// a released page cache from a kept one, which rusqlite has no safe way to measure (it does not
+	/// wrap `sqlite3_db_status`). The page has to be in the main file, not the WAL, so a test
+	/// checkpoints before it reads the page in.
+	///
+	/// Only the read after the release under test is worth asserting. The bundled SQLite shares one
+	/// page cache among every connection in the process (it is built with
+	/// `SQLITE_ENABLE_MEMORY_MANAGEMENT`), so a release by any other test running alongside evicts
+	/// the page too: a read asserting the page is STILL cached is a race with those tests.
+	pub(crate) fn rewrite_behind_sqlite(path: &Path, from: &[u8], to: &[u8]) {
+		assert_eq!(from.len(), to.len(), "a rewrite in place keeps the length");
+		let bytes = fs::read(path).expect("reading the database file");
+		let found: Vec<usize> = bytes
+			.windows(from.len())
+			.enumerate()
+			.filter_map(|(at, window)| (window == from).then_some(at))
+			.collect();
+		let [at] = found[..] else {
+			panic!(
+				"{:?} sits {} times in the database file, not once",
+				String::from_utf8_lossy(from),
+				found.len()
+			);
+		};
+		let mut file = OpenOptions::new()
+			.write(true)
+			.open(path)
+			.expect("opening the database file");
+		file.seek(SeekFrom::Start(
+			u64::try_from(at).expect("a file offset fits in a u64"),
+		))
+		.expect("seeking to the page");
+		file.write_all(to).expect("rewriting the page");
+	}
+}

@@ -3,6 +3,7 @@ use crate::cache::sql::columns::{
 	FILES_SIZE, ITEM_EXISTS, ITEMS_CONTENT_HASH, ITEMS_ID, PRAGMA_CACHE_SIZE, PRAGMA_MMAP_SIZE,
 	PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
 };
+use crate::cache::test_support::rewrite_behind_sqlite;
 use crate::fs::{dir::meta::DirectoryMeta, file::meta::FileMeta};
 use filen_types::{crypto::EncryptedString, fs::ParentUuid};
 use std::borrow::Cow;
@@ -1963,6 +1964,39 @@ fn init_db_applies_per_connection_pragmas_on_reopen() {
 
 	drop(state);
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A resync walks the whole listing through the worker's connection and leaves its page cache
+/// full; once the resync is over the worker gives that cache back, so the next read of a page
+/// goes to the file again.
+#[test]
+fn a_finished_resync_gives_back_the_workers_page_cache() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("cache.db");
+	let mut state = CacheState::new_on_path(&path, Uuid::new_v4());
+	state
+		.db
+		.execute_batch(
+			"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
+			 PRAGMA wal_checkpoint(TRUNCATE);",
+		)
+		.unwrap();
+	let read = |state: &CacheState| -> String {
+		state
+			.db
+			.query_row("SELECT v FROM probe", [], |row| row.get(0))
+			.unwrap()
+	};
+	assert_eq!(read(&state), "kept-page");
+	rewrite_behind_sqlite(&path, b"kept-page", b"gone-page");
+
+	drive(state.run_resync_surfacing_errors());
+
+	assert_eq!(
+		read(&state),
+		"gone-page",
+		"the page cache was given back, so the read went to the file"
+	);
 }
 
 /// a failing apply aborts the batched fast path WITHOUT surfacing errors, and the per-event
