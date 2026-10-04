@@ -11,7 +11,7 @@
 //! the scanner's fast-path stays stable.
 
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	collections::{BTreeSet, HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::{
 		Arc, PoisonError,
@@ -40,10 +40,11 @@ use super::{
 		RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
-	plan::{RemoteNode, Subsumed, SyncAction, is_under, replaced_paths},
+	plan::{RemoteNode, Subsumed, SyncAction, is_under},
 	rows::{Baseline, Cursor},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::{NodesAt, Side},
+	stage::{Pager, PlanWriter, Run, Stage, Staged, StagedPlan},
 };
 use crate::{
 	auth::Client,
@@ -130,8 +131,8 @@ pub struct SyncReport {
 	/// [`PauseMode::Cancel`](super::PauseMode::Cancel) while it ran — the transfer dropped in
 	/// flight plus everything queued behind it — because the pass could not take the drive lock, in
 	/// which case it is every planned action and `errors` says why, or because a record of work
-	/// already done could not be written, which stops the pass admitting anything more (see
-	/// `admits_more`). Those actions recorded
+	/// already done could not be written or the pass's staged plan could not be read, either of
+	/// which stops the pass admitting anything more (see `admits_more`). Those actions recorded
 	/// nothing — a row is written only after its action succeeded, and a transfer that succeeded is
 	/// never dropped before its row — and the next pass re-plans them. Zero on a pass that ran to
 	/// the end, including one that was merely SUSPENDED and resumed.
@@ -146,8 +147,9 @@ pub struct SyncReport {
 	/// trash — and the store's own answer is in `errors`, naming the path. Such a pass is a FAILED
 	/// pass: a watch loop backs off rather than running the next one into the same wedged DB, and the
 	/// pass after it re-derives or redoes what the lost record described (see the baseline store's
-	/// `record_write`).
-	pub(super) store_failed: bool,
+	/// `record_write`). So is a pass that could not read its staged plan, the only copy of what it is
+	/// applying (see `note_unread_plan`).
+	pub(super) store_failed: Option<StoreFailure>,
 	/// How many actions this pass planned and then DROPPED before applying anything: a path it may
 	/// not act on (`drop_blocked`) or a deletion over content it cannot reach
 	/// (`withhold_deletions_over_unreachable`). Making the plan consumed both changelists, so a
@@ -251,12 +253,12 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) subsumed: &'a Subsumed,
 }
 
-/// One action of the plan, with what the apply reads for it as the pass started (see
-/// [`PlannedEntry::plan`], the only way to make one).
-#[derive(Debug)]
+/// One action of the plan, with what the apply reads for it as the pass started: made by
+/// [`PlannedEntry::stage`] and staged with it, and read back out of the stage by the apply.
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct PlannedEntry {
-	action: SyncAction,
-	start: PassStart,
+	pub(super) action: SyncAction,
+	pub(super) start: PassStart,
 }
 
 /// What the apply reads for one action, read when the plan was made: a variant per kind of action,
@@ -321,8 +323,9 @@ pub(super) enum PassStart {
 	Nothing,
 }
 
-/// Where [`PassStart::of`] reads an action's inputs: the pass's own trees as its plan is made
-/// ([`PassTrees`]). Asked only for what the action's kind reads, and each at most once.
+/// Where [`PassStart::of`] reads an action's inputs: the pass's own trees as its plan is staged
+/// ([`PassTrees`]), or the stage once it is (`stage::StagedInputs`). Asked only for what the action's
+/// kind reads, and each at most once.
 pub(super) trait StartInputs {
 	/// The local node at `path`.
 	fn local(&mut self, path: &str) -> Option<Box<LocalNode>>;
@@ -372,45 +375,44 @@ where
 
 impl PlannedEntry {
 	/// The plan's `actions`, each with what the apply reads for it out of the pass's `baseline` and
-	/// its two sides.
+	/// its two sides, staged in `stage` one at a time and ordered there for the apply (see
+	/// [`StagedPlan`]): what the apply holds of its plan is then the page of it it is in.
 	///
 	/// It takes those three, and drops them: the scan and the view are a node per item of the tree,
 	/// and the baseline's snapshot is the pass's read transaction, which has to END before the first
 	/// action commits (see [`Baseline::close`]). Every answer an entry carries is the one the plan was
 	/// made from, the pass's own commits landing in none of them.
-	pub(super) fn plan(
+	pub(super) fn stage(
 		actions: Vec<SyncAction>,
 		baseline: Baseline,
 		local: Side<LocalNode>,
 		remote: Side<RemoteNode>,
-	) -> Vec<Self> {
-		let entries = {
-			let (local, remote) = (local.of(&baseline), remote.of(&baseline));
-			let mut trees = PassTrees {
-				local: &local,
-				remote: &remote,
-				rows: baseline.cursor(),
-			};
-			actions
-				.into_iter()
-				.map(|action| {
-					let start = PassStart::of(&action, &mut trees);
-					Self { action, start }
-				})
-				.collect()
-		};
+		stage: Stage,
+	) -> rusqlite::Result<StagedPlan> {
+		let staged = Self::write(actions, &baseline, local, remote, stage);
 		baseline.close();
-		entries
+		staged
 	}
 
-	/// The row the pass started with at the path of a download or an upload, for a test holding the
-	/// rows to the pass.
-	#[cfg(test)]
-	pub(super) fn base(&self) -> Option<&BaselineEntry> {
-		match &self.start {
-			PassStart::Download { base, .. } | PassStart::Upload { base, .. } => base.as_deref(),
-			other => panic!("not a transfer's inputs: {other:?}"),
+	fn write(
+		actions: Vec<SyncAction>,
+		baseline: &Baseline,
+		local: Side<LocalNode>,
+		remote: Side<RemoteNode>,
+		stage: Stage,
+	) -> rusqlite::Result<StagedPlan> {
+		let (local, remote) = (local.of(baseline), remote.of(baseline));
+		let mut trees = PassTrees {
+			local: &local,
+			remote: &remote,
+			rows: baseline.cursor(),
+		};
+		let mut plan = PlanWriter::new(stage)?;
+		for action in actions {
+			let start = PassStart::of(&action, &mut trees);
+			plan.push(&Self { action, start })?;
 		}
+		plan.finish()
 	}
 }
 
@@ -602,18 +604,20 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 	DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
 }
 
-/// Execute `entries` (already ordered + guard-screened) against the remote and local tree.
+/// Execute the staged `plan` (guard-screened, ordered in its stage) against the remote and local
+/// tree, reading it a page at a time in the order the stage gives it (see [`StagedPlan`]).
 ///
 /// Each entry carries what its action reads as the pass started, so the apply reads neither the
 /// pass's rows nor its two sides — and holds no read transaction open behind the commits it makes
-/// (see [`PlannedEntry::plan`]).
+/// (see [`PlannedEntry::stage`]).
 ///
 /// The drive-write lock is held per bounded BATCH of remote writes (see [`Lease`]) so the per-op
 /// `lock_drive` calls inside upload/create become free clones of the held lock instead of each
 /// doing an acquire+release server round-trip — the dominant per-file cost at scale — while no other
 /// device of the account waits on it for longer than about [`PASS_LOCK_MAX_HOLD`](super::engine::PASS_LOCK_MAX_HOLD). It is let go
-/// only between actions that do not depend on one another (see [`release_points`]), once no remote
-/// write is in flight, and taken again before the next remote write; a pure pull never takes it.
+/// only between actions that do not depend on one another (see [`Staged::releasable`]), once no
+/// remote write is in flight, and taken again before the next remote write; a pure pull never takes
+/// it.
 ///
 /// File transfers (uploads/downloads) — the bulk of the work and independent of one another — run
 /// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
@@ -632,10 +636,11 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// records it (see [`apply_transfer`]), so the two always agree.
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
-	entries: Vec<PlannedEntry>,
+	plan: StagedPlan,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
+	let mut plan = plan.pager();
 	// uuid -> the remote file object, for every file this plan acts on: hydrated from the cache
 	// by [`resolve_folded_objects`], and from the server for what this engine wrote and the cache
 	// has not listed yet.
@@ -646,57 +651,28 @@ pub(super) async fn apply(
 	// clone per directory — tens of thousands of them on a large pair — to answer a few lookups.
 	let mut dir_by_path: HashMap<String, RemoteDirectory> = HashMap::new();
 	dir_by_path.insert(String::new(), ctx.root_remote.clone());
-	resolve_folded_objects(&ctx, &entries, &mut files, &mut dir_by_path).await;
-
-	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
-	// parent-before-child), then transfers (concurrent), then deletes (serial — descendant-first).
-	// A "replace-delete" (a delete whose path is (re)created this pass — a file<->dir type flip) is
-	// routed into `pre` so it runs BEFORE the create at that path (the actions are already ordered
-	// so it sorts ahead of the create); otherwise the server rejects the create (old item exists).
-	let replaced = replaced_paths(entries.iter().map(|entry| &entry.action));
-	let mut pre = Vec::new();
-	let mut transfers = Vec::new();
-	let mut post = Vec::new();
-	for entry in entries {
-		let action = &entry.action;
-		if action.is_delete() && replaced.contains(action.rel_path()) {
-			pre.push(entry);
-		} else if is_transfer(action) {
-			transfers.push(entry);
-		} else if action.is_delete() {
-			post.push(entry);
-		} else {
-			pre.push(entry);
-		}
+	if let Err(error) = resolve_folded_objects(&ctx, &mut plan, &mut files, &mut dir_by_path).await
+	{
+		note_unread_plan(report, &page_err(error));
 	}
-	order_transfers(&pre, &mut transfers);
 
 	// What the pass still owes if it is cancelled part-way: everything it has not carried out.
-	let total = pre.len() + transfers.len() + post.len();
+	let total = plan.len();
 	let mut applied = 0usize;
-
-	// Where the drive lock may be let go: before an action no earlier one is still waiting on.
-	let releasable = {
-		let order: Vec<&SyncAction> = pre
-			.iter()
-			.chain(&transfers)
-			.chain(&post)
-			.map(|entry| &entry.action)
-			.collect();
-		release_points(&order, &replaced)
-	};
-	let (pre_release, rest) = releasable.split_at(pre.len());
-	let (transfer_release, post_release) = rest.split_at(transfers.len());
 	let mut lease = Lease::Unheld;
 
 	let mut writes = PassWrites::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
-	for (entry, &releasable) in pre.iter().zip(pre_release) {
+	// Creates and moves first, one at a time: they fill `dir_by_path` and run parent before child.
+	// The deletion half of a type flip runs among them, before the create at its path, or the server
+	// rejects that create (the old item still exists).
+	while admits_more(report)
+		&& let Some(Staged {
+			entry, releasable, ..
+		}) = unless_unread(plan.next_in(Run::Before), report)
+	{
 		let action = &entry.action;
-		if !admits_more(report) {
-			break;
-		}
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
@@ -710,7 +686,7 @@ pub(super) async fn apply(
 			}
 			if let Some(reason) = apply_serial(
 				&ctx,
-				entry,
+				&entry,
 				&files,
 				&mut dir_by_path,
 				&mut writes,
@@ -725,36 +701,41 @@ pub(super) async fn apply(
 		applied += 1;
 	}
 
-	let pending: Vec<(&PlannedEntry, bool)> = transfers
-		.iter()
-		.zip(transfer_release.iter().copied())
-		.filter(|(entry, _)| !writes.skips(&entry.action, report, observer))
-		.collect();
-	applied += transfers.len() - pending.len();
+	// The transfers under a directory whose move just failed are failed before any transfer starts,
+	// and passed over below.
+	if !writes.failed_dir_moves.is_empty() {
+		let swept = plan.sweep(Some(Run::Transfers), |entry| {
+			if writes.skips(&entry.action, report, observer) {
+				applied += 1;
+			}
+		});
+		if let Err(error) = swept {
+			note_unread_plan(report, &page_err(error));
+		}
+	}
 
-	if !pending.is_empty() {
+	if admits_more(report) && unless_unread(next_transfer(&mut plan, &writes), report).is_some() {
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
 		// Byte progress comes from inside the SDK's transfer futures, which cannot reach the
 		// observer this loop holds: they queue it here and the loop delivers it — between
 		// completions, and all of a transfer's progress ahead of that transfer's own event.
 		let (progress, mut progress_events) = tokio::sync::mpsc::unbounded_channel();
-		let mut pending = pending.into_iter().peekable();
 		let mut in_flight = FuturesUnordered::new();
 		// Uploads in flight use the lock, so it is let go only once none is; downloads do not.
 		let mut remote_in_flight = 0usize;
 		loop {
 			while in_flight.len() < concurrency
 				&& admits_more(report)
-				&& let Some(&(entry, releasable)) = pending.peek()
+				&& let Some(staged) = unless_unread(next_transfer(&mut plan, &writes), report)
 			{
-				let action = &entry.action;
+				let (action, releasable) = (&staged.entry.action, staged.releasable);
 				// Once an action finds a side full, the transfers already running finish, and the ones
 				// not started yet that write to that side never start (they record nothing). Held back
 				// for want of room: carried out as far as this pass can, owed to no pause.
 				if full.holds(action) {
-					pending.next();
-					applied += 1;
 					tracing::debug!("apply: {} held, its side is full", action.describe());
+					unless_unread(plan.next_in(Run::Transfers), report);
+					applied += 1;
 					continue;
 				}
 				let now = Instant::now();
@@ -764,9 +745,13 @@ pub(super) async fn apply(
 				if !lease.admits(&ctx.lock_budget, action, releasable, now) {
 					break;
 				}
-				lease.note_start(action);
-				pending.next();
-				remote_in_flight += usize::from(mutates_remote(action));
+				let Some(Staged { entry, .. }) =
+					unless_unread(plan.next_in(Run::Transfers), report)
+				else {
+					break;
+				};
+				lease.note_start(&entry.action);
+				remote_in_flight += usize::from(mutates_remote(&entry.action));
 				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
 			}
 			let next = tokio::select! {
@@ -782,7 +767,13 @@ pub(super) async fn apply(
 				if !admits_more(report) {
 					break;
 				}
-				let Some((entry, releasable)) = pending.next() else {
+				if unless_unread(next_transfer(&mut plan, &writes), report).is_none() {
+					break;
+				}
+				let Some(Staged {
+					entry, releasable, ..
+				}) = unless_unread(plan.next_in(Run::Transfers), report)
+				else {
 					break;
 				};
 				match lease.prepare(&ctx, &entry.action, releasable).await {
@@ -796,7 +787,7 @@ pub(super) async fn apply(
 				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
 				continue;
 			};
-			remote_in_flight -= usize::from(mutates_remote(action));
+			remote_in_flight -= usize::from(mutates_remote(&action));
 			// A transfer queues its last progress before it resolves.
 			while let Ok(event) = progress_events.try_recv() {
 				observer(event);
@@ -813,7 +804,7 @@ pub(super) async fn apply(
 				}
 				Ok(Transfer::Done) => {
 					applied += 1;
-					writes.note(action);
+					writes.note(&action);
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
 					match action {
@@ -829,7 +820,7 @@ pub(super) async fn apply(
 					unrecorded,
 				}) => {
 					applied += 1;
-					writes.note(action);
+					writes.note(&action);
 					observer(action.to_event());
 					observer(SyncEvent::Conflict {
 						rel_path: conflict.rel_path.clone(),
@@ -851,11 +842,13 @@ pub(super) async fn apply(
 		}
 	}
 
-	for (entry, &releasable) in post.iter().zip(post_release) {
+	// The other deletions, one at a time, children before parents.
+	while admits_more(report)
+		&& let Some(Staged {
+			entry, releasable, ..
+		}) = unless_unread(plan.next_in(Run::After), report)
+	{
 		let action = &entry.action;
-		if !admits_more(report) {
-			break;
-		}
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
@@ -869,7 +862,7 @@ pub(super) async fn apply(
 			}
 			apply_serial(
 				&ctx,
-				entry,
+				&entry,
 				&files,
 				&mut dir_by_path,
 				&mut writes,
@@ -883,26 +876,52 @@ pub(super) async fn apply(
 	note_interrupted(report, total - applied, observer);
 }
 
+/// The next transfer of `plan` to start, past the ones under a directory whose move failed this
+/// pass, which `apply` has already failed.
+fn next_transfer<'p>(
+	plan: &'p mut Pager,
+	writes: &PassWrites,
+) -> rusqlite::Result<Option<&'p Staged>> {
+	while plan
+		.peek_in(Run::Transfers)?
+		.is_some_and(|staged| writes.holds_back(&staged.entry.action).is_some())
+	{
+		plan.next_in(Run::Transfers)?;
+	}
+	plan.peek_in(Run::Transfers)
+}
+
 /// One transfer, paired with the action it ran and with whatever local copy it moved aside — named
 /// so every transfer of a pass is the same future type and they can share one [`FuturesUnordered`].
 ///
 /// The quarantine travels beside the result, not inside it: the apply loop accounts for it whether
 /// the transfer ended in [`Transfer::Done`] or in an error from the bookkeeping that followed its
 /// landed write (see [`apply_transfer`]).
-async fn run_transfer<'a>(
+///
+/// It owns its entry, so the apply holds the entry of each transfer in flight and the page it reads
+/// from, and nothing else of its plan.
+async fn run_transfer(
 	ctx: &ApplyContext<'_>,
-	planned: &'a PlannedEntry,
+	planned: PlannedEntry,
 	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 	progress: &UnboundedSender<SyncEvent>,
 ) -> (
-	&'a SyncAction,
+	SyncAction,
 	Option<(String, PathBuf)>,
 	Result<Transfer, crate::Error>,
 ) {
 	let mut quarantined = None;
-	let result = apply_transfer(ctx, planned, files, dir_by_path, progress, &mut quarantined).await;
-	(&planned.action, quarantined, result)
+	let result = apply_transfer(
+		ctx,
+		&planned,
+		files,
+		dir_by_path,
+		progress,
+		&mut quarantined,
+	)
+	.await;
+	(planned.action, quarantined, result)
 }
 
 /// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
@@ -1024,93 +1043,6 @@ fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) 
 	now.saturating_duration_since(since) >= budget.hold || writes >= budget.batch
 }
 
-/// Put the transfers — independent of one another, so their order is free — in the order that lets
-/// the pass hold the drive lock least: first the ones that finish a compound step of `pre` (the create
-/// half of a replace-delete, anything under a moved directory), so that step ends as early as it can
-/// (see [`release_points`]); then downloads, which need no lock; then uploads, which do.
-fn order_transfers(pre: &[PlannedEntry], transfers: &mut [PlannedEntry]) {
-	let replaced: HashSet<&str> = pre
-		.iter()
-		.map(|entry| &entry.action)
-		.filter(|action| action.is_delete())
-		.map(SyncAction::rel_path)
-		.collect();
-	let moved_dirs: Vec<&str> = pre
-		.iter()
-		.filter_map(|entry| moved_dir(&entry.action))
-		.collect();
-	transfers.sort_by_key(|entry| {
-		let path = entry.action.rel_path();
-		let completes_step = replaced.contains(path)
-			|| moved_dirs
-				.iter()
-				.any(|dir| path == *dir || is_under(path, dir));
-		(
-			!completes_step,
-			matches!(entry.action, SyncAction::UploadFile { .. }),
-		)
-	});
-}
-
-/// Where a directory move is headed, for a directory move.
-fn moved_dir(action: &SyncAction) -> Option<&str> {
-	match action {
-		SyncAction::MoveRemote {
-			to_path,
-			kind: NodeKind::Dir,
-			..
-		}
-		| SyncAction::MoveLocal {
-			to_path,
-			kind: NodeKind::Dir,
-			..
-		} => Some(to_path),
-		_ => None,
-	}
-}
-
-/// For each position of the pass's execution `order`, whether the drive lock may be let go just
-/// before it: `false` where an action already run is still waiting on one at or after it.
-///
-/// Two shapes tie actions together. A replace-delete is half of a type flip: the path stays empty
-/// until the create at it runs, and another client let in between would find it free. A directory
-/// move carries its subtree: what the plan names under the destination (a create, a move, a
-/// transfer) assumes the move has just happened. A deletion under a moved directory names its item
-/// by uuid and ties nothing. Every other boundary is between independent actions — each one's write
-/// already committed — and so is every boundary between phases that no such tie crosses.
-fn release_points(order: &[&SyncAction], replaced: &HashSet<String>) -> Vec<bool> {
-	// The last position at which each path is created, transferred or moved from or to.
-	let mut last: BTreeMap<&str, usize> = BTreeMap::new();
-	for (position, action) in order.iter().enumerate() {
-		if !action.is_delete() {
-			let (from, to) = action.endpoints();
-			last.insert(from, position);
-			last.insert(to, position);
-		}
-	}
-	let mut reach: Option<usize> = None;
-	order
-		.iter()
-		.enumerate()
-		.map(|(position, action)| {
-			let releasable = reach.is_none_or(|reach| reach < position);
-			let tied_until = if action.is_delete() && replaced.contains(action.rel_path()) {
-				last.get(action.rel_path()).copied()
-			} else if let Some(dir) = moved_dir(action) {
-				let prefix = format!("{dir}/");
-				last.range(prefix.as_str()..)
-					.take_while(|(path, _)| path.starts_with(&prefix))
-					.map(|(_, &position)| position)
-					.max()
-			} else {
-				None
-			};
-			reach = reach.max(tied_until);
-			releasable
-		})
-		.collect()
-}
-
 /// What this pass has written so far, so that no later action of the SAME pass takes it down.
 ///
 /// The server dedups a create against an existing item case-insensitively and hands back that
@@ -1172,20 +1104,29 @@ impl PassWrites {
 		holds_key_at_or_under(&self.local_keys, rel_path)
 	}
 
-	/// Skip `action` when it sits under a directory whose move failed this pass — the plan names that
-	/// subtree by a path neither side carries — recording it as a failure of its own.
+	/// The directory whose move failed this pass at or above either end of `action`: the plan names
+	/// that subtree by a path neither side carries.
+	fn holds_back(&self, action: &SyncAction) -> Option<&str> {
+		let (from, to) = action.endpoints();
+		self.failed_dir_moves
+			.iter()
+			.map(String::as_str)
+			.find(|dir| {
+				[from, to]
+					.into_iter()
+					.any(|path| path == *dir || is_under(path, dir))
+			})
+	}
+
+	/// Skip `action` when a directory move that failed this pass holds it back (see
+	/// [`holds_back`](Self::holds_back)), recording it as a failure of its own.
 	fn skips(
 		&self,
 		action: &SyncAction,
 		report: &mut SyncReport,
 		observer: &mut (dyn FnMut(SyncEvent) + Send),
 	) -> bool {
-		let (from, to) = action.endpoints();
-		let Some(dir) = self.failed_dir_moves.iter().find(|dir| {
-			[from, to]
-				.into_iter()
-				.any(|path| path == dir.as_str() || is_under(path, dir))
-		}) else {
+		let Some(dir) = self.holds_back(action) else {
 			return false;
 		};
 		let error = internal_owned(format!(
@@ -1285,6 +1226,31 @@ pub(super) const LOCK_FAILURE: &str = "failed to acquire the drive lock";
 /// naming the path, and the store's own answer, is already in [`SyncReport::errors`].
 pub(super) const STORE_FAILURE: &str = "a record of work already done could not be written";
 
+/// How a pass whose staged plan could not be read reports that to a watch loop. The store's own
+/// answer is already in [`SyncReport::errors`].
+pub(super) const UNREAD_PLAN: &str = "the plan this pass staged could not be read";
+
+/// What stopped a pass admitting more work ([`SyncReport::store_failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreFailure {
+	/// A write recording work already done did not land (see [`record_not_written`]). It outranks
+	/// an [`UnreadPlan`](Self::UnreadPlan) in the same pass: it leaves an act no record describes,
+	/// where an unread plan only stops the pass short.
+	RecordNotWritten,
+	/// A read of the pass's staged plan failed (see [`note_unread_plan`]).
+	UnreadPlan,
+}
+
+impl StoreFailure {
+	/// How a pass it stopped reports that to a watch loop.
+	pub(super) fn line(self) -> &'static str {
+		match self {
+			Self::RecordNotWritten => STORE_FAILURE,
+			Self::UnreadPlan => UNREAD_PLAN,
+		}
+	}
+}
+
 /// Whether `error` is a baseline or journal write that did not land — the record of an act that has
 /// already happened, which makes the pass a failed one whatever else it managed.
 ///
@@ -1314,6 +1280,32 @@ fn note_interrupted(
 	observer(SyncEvent::Interrupted { actions: remaining });
 }
 
+/// A page of the pass's staged plan that could not be read (see [`unless_unread`]). Its
+/// `rusqlite::Error` stays the source.
+fn page_err(error: rusqlite::Error) -> crate::Error {
+	super::engine::db_error(error, "reading a page of the pass's staged plan")
+}
+
+/// What a read of the pass's staged plan found — and for one that failed, nothing more to take,
+/// with the failure recorded (see [`note_unread_plan`]).
+fn unless_unread<T>(read: rusqlite::Result<Option<T>>, report: &mut SyncReport) -> Option<T> {
+	read.unwrap_or_else(|error| {
+		note_unread_plan(report, &page_err(error));
+		None
+	})
+}
+
+/// Record a read of the pass's staged plan that failed. The plan has no other copy, so the pass
+/// fails as one that lost a record of its work does, for a reason of its own
+/// ([`StoreFailure::UnreadPlan`]): it starts nothing more ([`admits_more`]), the transfers already
+/// in flight finish and record what they did, and what it has not carried out is owed to the next
+/// pass, which plans afresh ([`SyncReport::interrupted`]).
+fn note_unread_plan(report: &mut SyncReport, error: &crate::Error) {
+	tracing::error!("apply: {error}; the pass starts nothing more");
+	report.errors.push(error.to_string());
+	report.store_failed.get_or_insert(StoreFailure::UnreadPlan);
+}
+
 /// Resolve the remote objects this plan acts on that the cache snapshot cannot supply.
 ///
 /// The remote view carries the writes this engine made that the cache has not listed yet, so an
@@ -1327,22 +1319,29 @@ fn note_interrupted(
 /// about: the parent of an upload or a create, the target of a trash, and both ends of a move. Each
 /// is the directory the view listed there, as its entry read it (see [`PassStart`]); a path the
 /// view held no directory at is left out, and the action that wanted it fails.
+///
+/// An error is a page of the plan that could not be read, and nothing is resolved then (see
+/// [`note_unread_plan`]).
 async fn resolve_folded_objects(
 	ctx: &ApplyContext<'_>,
-	entries: &[PlannedEntry],
+	// `&mut` though only read: a stage's connection is `Send` but not `Sync`, and this future holds
+	// the pager across its awaits.
+	plan: &mut Pager,
 	files: &mut HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
-) {
+) -> rusqlite::Result<()> {
 	let mut wanted_files: HashSet<Uuid> = HashSet::new();
 	// Path -> the directory the view listed there. Every entry naming a path read it from the same
 	// view, so the first answer is every answer.
-	let mut wanted_dirs: HashMap<&str, Uuid> = HashMap::new();
-	let mut want_dir = |path, uuid: Option<Uuid>| {
-		if let Some(uuid) = uuid {
-			wanted_dirs.entry(path).or_insert(uuid);
+	let mut wanted_dirs: HashMap<String, Uuid> = HashMap::new();
+	let mut want_dir = |path: &str, uuid: Option<Uuid>| {
+		if let Some(uuid) = uuid
+			&& !wanted_dirs.contains_key(path)
+		{
+			wanted_dirs.insert(path.to_owned(), uuid);
 		}
 	};
-	for PlannedEntry { action, start } in entries {
+	plan.sweep(None, |PlannedEntry { action, start }| {
 		match (action, start) {
 			(
 				SyncAction::DownloadFile { remote_uuid, .. }
@@ -1353,7 +1352,7 @@ async fn resolve_folded_objects(
 				},
 				_,
 			) => {
-				wanted_files.insert(*remote_uuid);
+				wanted_files.insert(remote_uuid);
 			}
 			(
 				SyncAction::TrashRemote {
@@ -1362,7 +1361,7 @@ async fn resolve_folded_objects(
 					..
 				},
 				PassStart::Remote { remote },
-			) => want_dir(rel_path.as_str(), dir_uuid(remote.as_deref())),
+			) => want_dir(&rel_path, dir_uuid(remote.as_deref())),
 			(
 				SyncAction::MoveRemote {
 					to_path,
@@ -1372,8 +1371,8 @@ async fn resolve_folded_objects(
 				},
 				PassStart::MoveRemoteFile { parent_uuid, .. },
 			) => {
-				wanted_files.insert(*remote_uuid);
-				want_dir(parent_and_name(to_path).0, *parent_uuid);
+				wanted_files.insert(remote_uuid);
+				want_dir(parent_and_name(&to_path).0, parent_uuid);
 			}
 			(
 				SyncAction::MoveRemote {
@@ -1387,23 +1386,23 @@ async fn resolve_folded_objects(
 				},
 			) => {
 				// The view already lists the directory at the path it moves to.
-				want_dir(to_path.as_str(), dir_uuid(remote.as_deref()));
-				want_dir(parent_and_name(to_path).0, *parent_uuid);
+				want_dir(&to_path, dir_uuid(remote.as_deref()));
+				want_dir(parent_and_name(&to_path).0, parent_uuid);
 			}
 			(SyncAction::UploadFile { rel_path }, PassStart::Upload { parent_uuid, .. })
 			| (
 				SyncAction::CreateRemoteDir { rel_path },
 				PassStart::CreateRemoteDir { parent_uuid, .. },
-			) => want_dir(parent_and_name(rel_path).0, *parent_uuid),
+			) => want_dir(parent_and_name(&rel_path).0, parent_uuid),
 			_ => {}
 		}
-	}
+	})?;
 
 	// What the plan names and the map has not got: the root is in it already, and a directory this
 	// very pass creates is filled in as it goes.
-	let missing_dirs: Vec<(&str, Uuid)> = wanted_dirs
+	let missing_dirs: Vec<(String, Uuid)> = wanted_dirs
 		.into_iter()
-		.filter(|(path, _)| !dir_by_path.contains_key(*path))
+		.filter(|(path, _)| !dir_by_path.contains_key(path))
 		.collect();
 	// One cache read for every object this plan acts on, files and directories together: the
 	// pass's snapshot carries only the columns its view reads (see `cache::enumerate`), so the
@@ -1450,18 +1449,19 @@ async fn resolve_folded_objects(
 	for (path, uuid) in missing_dirs {
 		// The cache held this one, so there is nothing to ask the server for.
 		if let Some(cacheable) = cached_dirs.remove(&uuid) {
-			dir_by_path.insert(path.to_string(), RemoteDirectory::from(cacheable));
+			dir_by_path.insert(path, RemoteDirectory::from(cacheable));
 			continue;
 		}
 		match ctx.client.get_dir(uuid).await {
 			Ok(dir) => {
-				dir_by_path.insert(path.to_string(), dir);
+				dir_by_path.insert(path, dir);
 			}
 			Err(error) => tracing::debug!(
 				"apply: cannot resolve the remote dir {path:?} this engine created ({error}); its actions fail this pass"
 			),
 		}
 	}
+	Ok(())
 }
 
 /// Whether an action writes to the remote (so the pass must hold the drive-write lock).
@@ -1472,14 +1472,6 @@ fn mutates_remote(action: &SyncAction) -> bool {
 			| SyncAction::CreateRemoteDir { .. }
 			| SyncAction::TrashRemote { .. }
 			| SyncAction::MoveRemote { .. }
-	)
-}
-
-/// Whether an action is a file transfer (the concurrently-applied bulk).
-fn is_transfer(action: &SyncAction) -> bool {
-	matches!(
-		action,
-		SyncAction::UploadFile { .. } | SyncAction::DownloadFile { .. }
 	)
 }
 
@@ -1550,7 +1542,7 @@ fn note_failure(
 ) -> Option<HaltReason> {
 	report.errors.push(format!("{rel_path}: {error}"));
 	if record_not_written(error) {
-		report.store_failed = true;
+		report.store_failed = Some(StoreFailure::RecordNotWritten);
 	}
 	let Some(reason) = pass_halt(error) else {
 		report
@@ -1604,10 +1596,13 @@ fn note_overwrote(
 /// [`interrupted`](SyncReport::interrupted) instead: they ran nothing, the next pass re-plans them,
 /// and the watch loop waits out its backoff first because the pass reports a failure.
 ///
+/// Nor may it once a read of its staged plan has failed (see [`note_unread_plan`]): that plan is the
+/// only copy of what it is applying.
+///
 /// Transfers already in flight are left to finish: their network op is done, and dropping one there
 /// would leave the remote holding a write nothing records at all.
 fn admits_more(report: &SyncReport) -> bool {
-	!report.store_failed
+	report.store_failed.is_none()
 }
 
 /// The sides of a pass found full so far, read by the transfers as they start. Atomics, because
@@ -3105,112 +3100,12 @@ mod tests {
 		}
 	}
 
-	fn create_dir(rel_path: &str) -> SyncAction {
-		SyncAction::CreateRemoteDir {
-			rel_path: rel_path.to_string(),
-		}
-	}
-
 	fn trash(rel_path: &str, kind: NodeKind) -> SyncAction {
 		SyncAction::TrashRemote {
 			rel_path: rel_path.to_string(),
 			kind,
 			remote_uuid: Uuid::new_v4(),
 		}
-	}
-
-	fn move_dir(from_path: &str, to_path: &str) -> SyncAction {
-		SyncAction::MoveRemote {
-			from_path: from_path.to_string(),
-			to_path: to_path.to_string(),
-			kind: NodeKind::Dir,
-			remote_uuid: Uuid::new_v4(),
-		}
-	}
-
-	/// `action` with nothing read for it, for a test of the order the apply runs entries in.
-	fn entry(action: SyncAction) -> PlannedEntry {
-		PlannedEntry::bare(action)
-	}
-
-	fn release_points_of(order: &[SyncAction]) -> Vec<bool> {
-		let refs: Vec<&SyncAction> = order.iter().collect();
-		release_points(&refs, &replaced_paths(order))
-	}
-
-	/// Between independent actions — and across phases no tie crosses — the lock may go anywhere.
-	#[test]
-	fn independent_actions_may_release_between_any_two() {
-		let order = [
-			create_dir("a"),
-			create_dir("a/b"),
-			upload("a/x"),
-			download("y"),
-			trash("old", NodeKind::File),
-		];
-		assert_eq!(release_points_of(&order), vec![true; order.len()]);
-	}
-
-	/// A type flip empties its path until the create at it runs: no release may land in between,
-	/// whatever runs between the two halves.
-	#[test]
-	fn a_release_never_splits_a_replace_delete_from_its_create() {
-		let order = [
-			trash("x", NodeKind::File),
-			create_dir("a"),
-			create_dir("x"),
-			create_dir("z"),
-		];
-		assert_eq!(release_points_of(&order), vec![true, false, false, true]);
-
-		// The directory half of a flip is recreated by a TRANSFER, in the next phase.
-		let order = [trash("x", NodeKind::Dir), upload("x"), upload("y")];
-		assert_eq!(release_points_of(&order), vec![true, false, true]);
-	}
-
-	/// What the plan names under a moved directory — a nested move, a create, a transfer — assumes
-	/// the move just happened; a deletion under it names its item by uuid and waits on nothing.
-	#[test]
-	fn a_release_never_splits_a_directory_move_from_what_it_carries() {
-		let order = [
-			move_dir("d", "e"),
-			move_dir("e/in", "e/in2"),
-			create_dir("a"),
-			create_dir("e/in2/new"),
-			upload("e/in2/f"),
-			upload("g"),
-			trash("e/old", NodeKind::File),
-		];
-		assert_eq!(
-			release_points_of(&order),
-			vec![true, false, false, false, false, true, true]
-		);
-
-		// A sibling that only shares the name's prefix is not under the moved directory.
-		let order = [move_dir("d", "e"), upload("ex"), upload("e2/f")];
-		assert_eq!(release_points_of(&order), vec![true, true, true]);
-	}
-
-	/// The transfers that finish a compound step go first, so the step — and the stretch the lock
-	/// cannot be let go in — ends as early as it can; then the downloads, which need no lock, then the
-	/// uploads.
-	#[test]
-	fn transfers_that_finish_a_compound_step_run_first_then_downloads_then_uploads() {
-		let pre = [trash("flip", NodeKind::Dir), move_dir("d", "e")].map(entry);
-		let mut transfers = [
-			upload("a"),
-			download("b"),
-			upload("e/child"),
-			download("c"),
-			upload("flip"),
-		]
-		.map(entry);
-		order_transfers(&pre, &mut transfers);
-		let paths: Vec<&str> = transfers
-			.iter()
-			.map(|entry| entry.action.rel_path())
-			.collect();
-		assert_eq!(paths, ["e/child", "flip", "b", "c", "a"]);
 	}
 
 	/// Each entry carries what its action reads, read as the pass started, and nothing else: a
@@ -3271,30 +3166,46 @@ mod tests {
 				kind: NodeKind::File,
 			},
 		];
-		let entries = PlannedEntry::plan(actions, baseline, local, remote);
-		let read: Vec<&PassStart> = entries
+		let (_dir, stage) = Stage::in_temp_dir();
+		let plan = PlannedEntry::stage(actions, baseline, local, remote, stage).unwrap();
+		let mut entries = Vec::new();
+		plan.pager()
+			.sweep(None, |entry| entries.push(entry))
+			.unwrap();
+		let read: Vec<(&str, &PassStart)> = entries
 			.iter()
-			.map(|PlannedEntry { start, .. }| start)
+			.map(|PlannedEntry { action, start }| (action.rel_path(), start))
 			.collect();
+		// In the order the apply runs them: the move, the two transfers (the download first), and
+		// the deletion last.
 		assert_eq!(
 			read,
 			[
-				&PassStart::Download {
-					remote: Some(Box::new(pulled)),
-					base: Some(Box::new(row_a)),
-				},
-				&PassStart::Upload {
-					local: Some(local_at("docs/new.txt")),
-					remote: Some(Box::new(versioned)),
-					base: None,
-					parent_uuid: Some(docs),
-				},
-				&PassStart::MoveRemoteFile {
-					local: Some(local_at("docs/renamed.txt")),
-					base_from: Some(Box::new(row_old)),
-					parent_uuid: Some(docs),
-				},
-				&PassStart::Nothing,
+				(
+					"docs/renamed.txt",
+					&PassStart::MoveRemoteFile {
+						local: Some(local_at("docs/renamed.txt")),
+						base_from: Some(Box::new(row_old)),
+						parent_uuid: Some(docs),
+					}
+				),
+				(
+					"docs/a.txt",
+					&PassStart::Download {
+						remote: Some(Box::new(pulled)),
+						base: Some(Box::new(row_a)),
+					}
+				),
+				(
+					"docs/new.txt",
+					&PassStart::Upload {
+						local: Some(local_at("docs/new.txt")),
+						remote: Some(Box::new(versioned)),
+						base: None,
+						parent_uuid: Some(docs),
+					}
+				),
+				("gone.txt", &PassStart::Nothing),
 			]
 		);
 	}
@@ -3568,8 +3479,9 @@ mod tests {
 			"the buried version must be surfaced even though its row was lost: {:?}",
 			report.errors
 		);
-		assert!(
+		assert_eq!(
 			report.store_failed,
+			Some(StoreFailure::RecordNotWritten),
 			"and the lost row must still fail the pass: {:?}",
 			report.errors
 		);
@@ -3583,7 +3495,7 @@ mod tests {
 		note_overwrote(&mut recorded, "b.txt", conflict("b.txt"), None);
 		assert_eq!(recorded.conflicts.len(), 1);
 		assert!(
-			!recorded.store_failed && recorded.errors.is_empty(),
+			recorded.store_failed.is_none() && recorded.errors.is_empty(),
 			"a row that landed is no failure: {:?}",
 			recorded.errors
 		);
@@ -3619,6 +3531,21 @@ mod tests {
 		);
 	}
 
+	/// A plan the pass could not read stops it as a lost record does, but for a reason of its own;
+	/// a lost record in the same pass, before or after, is what it reports.
+	#[test]
+	fn an_unread_plan_stops_the_pass_for_a_reason_a_lost_record_outranks() {
+		let unread = internal("reading a page of the pass's staged plan");
+		let mut report = SyncReport::default();
+		note_unread_plan(&mut report, &unread);
+		assert_eq!(report.store_failed, Some(StoreFailure::UnreadPlan));
+		assert!(!admits_more(&report));
+		note_failure(&mut report, "docs/a.txt", &contended_write_error());
+		assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+		note_unread_plan(&mut report, &unread);
+		assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+	}
+
 	/// The baseline write of an applied action records something that has already happened, so when
 	/// it cannot land the pass is a failed one: the store's answer reaches the report under the path,
 	/// and `store_failed` is what tells a watch loop to back off instead of reading the pass as
@@ -3645,8 +3572,9 @@ mod tests {
 			assert!(record_not_written(&error), "{error}");
 			note_failure(&mut report, "docs", &error);
 		}
-		assert!(
+		assert_eq!(
 			report.store_failed,
+			Some(StoreFailure::RecordNotWritten),
 			"a lost record must mark the pass failed: {:?}",
 			report.errors
 		);

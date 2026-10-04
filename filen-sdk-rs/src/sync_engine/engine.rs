@@ -11,7 +11,10 @@ use std::{
 	iter, mem,
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
-	sync::{Arc, MutexGuard, PoisonError},
+	sync::{
+		Arc, MutexGuard, PoisonError,
+		atomic::{AtomicU64, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -47,6 +50,7 @@ use super::{
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	side::{Nodes, NodesAt, Side},
+	stage::{self, Stage, StagedPlan},
 };
 use crate::{
 	Error, ErrorKind,
@@ -205,7 +209,7 @@ pub const CONFIRM_TENURE: Duration = Duration::from_secs(10);
 pub(super) const PASS_LOCK_MAX_SLEEP: Duration = Duration::from_secs(5);
 
 /// How long a pass keeps the account-wide drive-write lock before it lets it go at the next action
-/// boundary where a release splits nothing (see `apply::release_points`), and takes it again before
+/// boundary where a release splits nothing (see `stage::Staged::releasable`), and takes it again before
 /// its next remote write.
 ///
 /// The lock is what makes every other device of the account wait to write, so a pass that held it
@@ -1416,6 +1420,9 @@ pub struct SyncEngine {
 	/// loop must see the change (a `Notify` wakes one waiter), a burst of setter calls coalesces
 	/// into one wake-up, and a version nobody is subscribed to is still a valid send.
 	user_ignore_changed: tokio::sync::watch::Sender<u64>,
+	/// How many stages this engine has made: the number the next one is named by (see
+	/// [`stage`](super::stage)).
+	stages: AtomicU64,
 	/// The lock that keeps every other engine off the baseline DB while this one lives (see
 	/// [`BaselineLock::take`]), or `None` where the platform has no file locks. Last, as fields drop
 	/// in order: the engine lets go of its connections to the baseline before it lets go of this.
@@ -2115,19 +2122,38 @@ impl Prepared {
 		}
 	}
 
-	/// The plan's `actions`, each with what the apply reads for it (see [`PlannedEntry::plan`]).
+	/// The plan's `actions`, each with what the apply reads for it, staged in `stage` in the order
+	/// the apply runs them (see [`PlannedEntry::stage`]).
 	///
 	/// Takes the pass's rows and both its sides out of `self` to do it: the scan, the view and the
 	/// snapshot are dropped here, and the pass's read transaction with the snapshot. What is left
 	/// answers nothing about either side or any row, and nothing after the plan asks it to: only
 	/// what the pass records once its apply is done.
-	fn plan_entries(&mut self, actions: Vec<SyncAction>) -> Vec<PlannedEntry> {
-		PlannedEntry::plan(
-			actions,
+	///
+	/// Off the runtime thread: it writes a row per action, and a first sync plans the whole tree. A
+	/// stage that cannot be written (a full disk) fails the pass before it has applied anything.
+	async fn stage_plan(
+		&mut self,
+		actions: Vec<SyncAction>,
+		stage: Stage,
+	) -> Result<StagedPlan, Error> {
+		let at = stage.path().display().to_string();
+		let (baseline, local, remote) = (
 			mem::take(&mut self.baseline),
 			mem::replace(&mut self.local_scan.nodes, Side::carried()),
 			mem::replace(&mut self.remote_view.nodes, Side::carried()),
-		)
+		);
+		tokio::task::spawn_blocking(move || {
+			PlannedEntry::stage(actions, baseline, local, remote, stage)
+		})
+		.await
+		.map_err(|e| {
+			Error::custom(
+				ErrorKind::Internal,
+				format!("staging the pass's plan panicked: {e}"),
+			)
+		})?
+		.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))
 	}
 
 	/// Map internal actions onto the public [`PlannedAction`] shape, resolving each one's size from
@@ -2621,13 +2647,20 @@ impl SyncEngine {
 	pub async fn open(client: Arc<Client>, db_path: PathBuf) -> Result<Self, Error> {
 		// First, so an engine that is refused touches nothing of the baseline another one holds.
 		let lock = BaselineLock::take(&db_path)?;
-		let store = {
+		let (store, lock) = {
 			let db_path = db_path.clone();
-			tokio::task::spawn_blocking(move || BaselineStore::open(&db_path))
-				.await
-				.map_err(|e| {
-					Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
-				})??
+			tokio::task::spawn_blocking(move || {
+				let store = BaselineStore::open(&db_path)?;
+				// Before this engine has made a stage of its own, so none found is this engine's.
+				stage::sweep(&db_path);
+				// Handed back rather than held by `open`, so an open cancelled while this runs still
+				// holds the lock until its sweep is done.
+				Ok::<_, Error>((store, lock))
+			})
+			.await
+			.map_err(|e| {
+				Error::custom(ErrorKind::Internal, format!("baseline open panicked: {e}"))
+			})??
 		};
 		// A pair paused by an earlier session stays paused: read the flags before the store moves
 		// into the engine, so no pass can run against an empty map in the meantime. The pass that
@@ -2663,6 +2696,7 @@ impl SyncEngine {
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
+			stages: AtomicU64::new(0),
 			_lock: lock,
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
@@ -5220,6 +5254,14 @@ impl SyncEngine {
 		);
 	}
 
+	/// A new stage for a pass of `pair` (see [`stage`](super::stage)), numbered by this engine so
+	/// that no two of its passes share one — nor a dry run that stages its own work, whatever pass of
+	/// the same pair is running.
+	fn stage(&self, pair: PairId) -> Result<Stage, Error> {
+		let number = self.stages.fetch_add(1, Ordering::Relaxed);
+		Stage::create(stage::stage_path(&self.db_path, pair, number))
+	}
+
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
 	/// already contained.
 	///
@@ -5481,7 +5523,9 @@ impl SyncEngine {
 				// The conflict is not held, so the next pass surfaces it again — but a pass whose
 				// record did not land is a failed pass, not a healthy one that mentions a problem.
 				report.errors.push(format!("{rel_path}: {error}"));
-				report.store_failed |= apply::record_not_written(&error);
+				if apply::record_not_written(&error) {
+					report.store_failed = Some(apply::StoreFailure::RecordNotWritten);
+				}
 			}
 			observer(SyncEvent::Conflict {
 				rel_path: rel_path.clone(),
@@ -5555,11 +5599,11 @@ impl SyncEngine {
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
 		let ends = endable_streaks(&decision.safe, &subsumed, streaks.as_ref());
-		// The plan is made: each action takes what the apply reads for it, and the rest of the scan,
-		// the view and the rows goes — the rows' read transaction with them, before the first action
-		// commits, since holding it open would pin the WAL through every upload (see
-		// `Baseline::close`).
-		let entries = prep.plan_entries(decision.safe);
+		// The plan is made: each action takes what the apply reads for it into the pass's stage, and
+		// the rest of the scan, the view and the rows goes — the rows' read transaction with them,
+		// before the first action commits, since holding it open would pin the WAL through every
+		// upload (see `Baseline::close`).
+		let plan = prep.stage_plan(decision.safe, self.stage(pair)?).await?;
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
@@ -5575,7 +5619,7 @@ impl SyncEngine {
 			lock_budget: self.lock_budget,
 			subsumed: &subsumed,
 		};
-		apply::apply(ctx, entries, &mut report, observer).await;
+		apply::apply(ctx, plan, &mut report, observer).await;
 		self.note_path_outcomes(pair, ends, &mut report).await;
 		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
 		// above recorded the paths the plan named; this puts the announced changes back with them,
@@ -5673,7 +5717,7 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	// observation or an announcement this pass consumed, and a derived map rebuilds neither — the
 	// baseline row it would derive from is the one that says the change never happened.
 	if report.lock_failed
-		|| report.store_failed
+		|| report.store_failed.is_some()
 		|| report.halted.is_some()
 		|| !report.failed_paths.is_empty()
 		|| report.dropped_actions > 0
@@ -6288,7 +6332,7 @@ mod tests {
 			(
 				"a record that did not land",
 				SyncReport {
-					store_failed: true,
+					store_failed: Some(apply::StoreFailure::RecordNotWritten),
 					..SyncReport::default()
 				},
 			),
@@ -8866,8 +8910,8 @@ mod tests {
 	/// a first push of 20_000 files into 100 directories the remote already has hands the apply an
 	/// entry per upload, and what the pass still holds beside them is a few small sets, not the
 	/// local scan, the remote view or a row per planned path.
-	#[test]
-	fn the_apply_inputs_leave_the_pass_none_of_its_trees() {
+	#[tokio::test]
+	async fn the_apply_inputs_leave_the_pass_none_of_its_trees() {
 		const CREATES: u32 = 20_000;
 		let hash = Blake3Hash::from([1; 32]);
 		let dirs: Vec<String> = (0..100u32).map(|d| format!("d{d:02}")).collect();
@@ -8895,8 +8939,9 @@ mod tests {
 			HashMap::new(),
 		);
 		let actions: Vec<SyncAction> = files.iter().map(|file| upload(file)).collect();
-		let entries = prep.plan_entries(actions);
-		assert_eq!(entries.len(), 20_000);
+		let (_dir, stage) = Stage::in_temp_dir();
+		let plan = prep.stage_plan(actions, stage).await.unwrap();
+		assert_eq!(plan.pager().len(), 20_000);
 		let ((), net) = alloc_meter::net_bytes(|| drop(prep));
 		assert!(
 			net > -4096,
@@ -9489,6 +9534,29 @@ mod tests {
 		drop(other);
 	}
 
+	/// An engine refused a baseline sweeps nothing beside it: what would pass for a crash's leftover
+	/// stage there is a live pass of the engine that has the baseline open.
+	#[tokio::test]
+	async fn an_engine_refused_a_baseline_leaves_the_stages_beside_it_alone() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("baseline.db");
+		let first = SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap();
+		let live = dir.path().join("baseline.db-stage-1-0");
+		std::fs::write(&live, b"a stage of the first engine's pass").unwrap();
+
+		match SyncEngine::open(Arc::new(offline_client()), path).await {
+			Ok(_) => panic!("a second engine opened a baseline the first one has open"),
+			Err(error) => assert!(error.downcast_ref::<BaselineInUse>().is_some(), "{error}"),
+		}
+		assert!(
+			live.exists(),
+			"a refused open swept a stage of the engine that has the baseline open"
+		);
+		drop(first);
+	}
+
 	/// Where the platform has no file locks (Android's std has no `try_lock`), the engine opens
 	/// without one rather than refusing every open.
 	#[test]
@@ -9648,6 +9716,52 @@ mod tests {
 		);
 		// No file at all when the name matched no test: libtest then runs none and exits 0.
 		std::fs::read_to_string(&answer).expect("the test run alone wrote no answer")
+	}
+
+	/// Every stage an engine makes for a pair is a file of its own beside the baseline, so a second
+	/// one — a dry run's, or the next pass's — never opens or truncates a stage that is still being
+	/// read; each goes when it is dropped, and an engine opening the baseline removes those a crash
+	/// left behind.
+	#[tokio::test]
+	async fn each_stage_of_a_pair_is_a_file_of_its_own() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("baseline.db");
+		let leftover = dir.path().join("baseline.db-stage-1-0");
+		std::fs::write(&leftover, b"a crashed pass's stage").unwrap();
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap();
+		assert!(!leftover.exists(), "the open left a stage behind");
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+
+		let live = engine.stage(pair).unwrap();
+		let live_path = live.path().to_owned();
+		assert_eq!(
+			live_path,
+			dir.path().join(format!("baseline.db-stage-{pair}-0"))
+		);
+		let mut live = stage::PlanWriter::new(live).unwrap();
+		live.push(&PlannedEntry::bare(upload("kept.txt"))).unwrap();
+
+		let other = engine.stage(pair).unwrap();
+		let other_path = other.path().to_owned();
+		assert_eq!(
+			other_path,
+			dir.path().join(format!("baseline.db-stage-{pair}-1"))
+		);
+		stage::PlanWriter::new(other).unwrap();
+		assert!(!other_path.exists(), "a dropped stage left its file");
+
+		let mut read = Vec::new();
+		live.finish()
+			.unwrap()
+			.pager()
+			.sweep(None, |entry| read.push(entry.action))
+			.unwrap();
+		assert_eq!(read, [upload("kept.txt")]);
+		assert!(!live_path.exists(), "a dropped stage left its file");
 	}
 
 	/// A hold leaves a watched pair idle, so an approval has to give the pair its next pass itself:

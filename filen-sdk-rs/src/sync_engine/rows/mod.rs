@@ -86,7 +86,7 @@
 //! The snapshot is one read transaction, so a pass's PLAN reads one state of the table throughout
 //! (see `rows/snapshot.rs`) — the state before anything the pass itself commits. The transaction
 //! ends with the plan: each action takes the rows the apply reads for it out of the snapshot (see
-//! `apply::PlannedEntry::plan`), and [`close`](Baseline::close) drops it, so the apply layer
+//! `apply::PlannedEntry::stage`), and [`close`](Baseline::close) drops it, so the apply layer
 //! answers from the plan's rows while the WAL checkpoints behind it. A pass clones its baseline into
 //! the local scan's blocking thread; the connection sits behind a mutex, so a clone is readable from
 //! any thread and two readers take turns.
@@ -1223,7 +1223,7 @@ impl Baseline {
 	}
 
 	/// End the pass's read transaction, once the rows its apply reads have been read out of it (see
-	/// `apply::PlannedEntry::plan`): the snapshot this baseline read through is dropped here, before
+	/// `apply::PlannedEntry::stage`): the snapshot this baseline read through is dropped here, before
 	/// the first action commits. Held through the apply, it would pin the store's WAL for as long as
 	/// the apply runs — a suspended pass included — so that no checkpoint could reach past it and
 	/// every commit meanwhile, this pass's and every other pair's, would grow the `-wal` file (see

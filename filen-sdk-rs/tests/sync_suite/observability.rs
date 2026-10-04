@@ -19,8 +19,9 @@ use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
-	ConflictResolution, IgnoreLevel, IgnoredPath, PlannedActionKind, PlannedConflict,
-	PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport, TransferDirection,
+	ConflictResolution, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, PlannedActionKind,
+	PlannedConflict, PlannedNodeKind, SyncEngine, SyncEvent, SyncMode, SyncReport,
+	TransferDirection,
 };
 use uuid::Uuid;
 
@@ -1288,6 +1289,103 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 	assert_eq!(report.remote_dirs_created, 1, "{report:?}");
 
 	sc.cleanup();
+}
+
+/// A dry run beside a pass that is applying leaves that pass's plan alone. The pass stages its plan
+/// in a file of its own beside the baseline, named for the pass; `plan_pair` stages nothing and
+/// touches nothing of it, the pass applies all of its plan once resumed, and its file goes with it.
+#[shared_test_runtime]
+async fn observ_add_a_dry_run_beside_an_applying_pass_leaves_its_staged_plan_alone() {
+	/// Twice the client's transfer window, so the pass still has uploads to start once suspended.
+	const FILES: usize = 32;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let remote: Uuid = resources.dir.uuid();
+	let cache = TestCache::new(&resources.client, remote).await;
+	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	let local = fresh_local_dir("dry_beside_pass");
+	for n in 0..FILES {
+		write_file(
+			&local,
+			&format!("sub/f{n:02}.txt"),
+			format!("file {n}").as_bytes(),
+		);
+	}
+	let db = temp_cache_path();
+	let db_name = db.file_name().unwrap().to_str().unwrap().to_owned();
+	let engine = Arc::new(
+		SyncEngine::open(cache.client.clone(), db.clone())
+			.await
+			.unwrap(),
+	);
+	let pair = engine
+		.add_pair(local.clone(), remote, SyncMode::LocalToRemote)
+		.await
+		.unwrap();
+	let stages = || -> Vec<String> {
+		let prefix = format!("{db_name}-stage-");
+		let mut names: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+			.unwrap()
+			.filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+			.filter(|name| name.starts_with(&prefix))
+			.collect();
+		names.sort();
+		names
+	};
+
+	// Suspended as its apply starts: the directory create is its first action, and is announced
+	// before it runs.
+	let applying = Arc::new(tokio::sync::Notify::new());
+	let pass = tokio::spawn({
+		let (engine, applying) = (Arc::clone(&engine), Arc::clone(&applying));
+		async move {
+			engine
+				.sync_once_observed(pair, &mut |event| {
+					if matches!(event, SyncEvent::CreatingRemoteDir { .. }) {
+						applying.notify_one();
+					}
+				})
+				.await
+				.unwrap()
+		}
+	});
+	applying.notified().await;
+	engine
+		.pause_pair_with(
+			pair,
+			PauseOptions {
+				mode: PauseMode::Suspend,
+				cancel_after: None,
+			},
+		)
+		.await
+		.unwrap();
+
+	let live = vec![format!("{db_name}-stage-{pair}-0")];
+	assert_eq!(
+		stages(),
+		live,
+		"the pass's plan is staged under its own name"
+	);
+	let plan = engine.plan_pair(pair).await.unwrap();
+	assert!(plan.refused.is_none(), "{plan:?}");
+	assert_eq!(
+		stages(),
+		live,
+		"the dry run staged something of its own, or removed the pass's stage"
+	);
+
+	engine.resume_pair(pair).await.unwrap();
+	let report = pass.await.unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(report.remote_dirs_created, 1, "{report:?}");
+	assert_eq!(report.uploaded, FILES, "{report:?}");
+	assert_eq!(
+		stages(),
+		Vec::<String>::new(),
+		"the pass's stage outlived it"
+	);
+
+	std::fs::remove_dir_all(&local).ok();
 }
 
 /// `plan_pair` and the pass report the same ignored paths: the top of each subtree a `.filenignore`

@@ -374,7 +374,7 @@ impl NodeKind {
 		}
 	}
 
-	fn from_i64(value: i64) -> Option<Self> {
+	pub(super) fn from_i64(value: i64) -> Option<Self> {
 		match value {
 			1 => Some(Self::Dir),
 			2 => Some(Self::File),
@@ -414,7 +414,7 @@ pub(crate) enum BaselineState {
 }
 
 impl BaselineState {
-	const fn as_i64(self) -> i64 {
+	pub(super) const fn as_i64(self) -> i64 {
 		match self {
 			Self::Synced => 0,
 			Self::Conflicted => 1,
@@ -2008,7 +2008,12 @@ impl BaselineStore {
 #[cfg(test)]
 mod tests {
 	use super::{
-		super::{apply::PlannedEntry, plan::SyncAction, side::Side},
+		super::{
+			apply::{PassStart, PlannedEntry},
+			plan::SyncAction,
+			side::Side,
+			stage::Stage,
+		},
 		*,
 	};
 	use crate::cache::test_support::rewrite_behind_sqlite;
@@ -3221,7 +3226,8 @@ mod tests {
 		// time while it goes on reading the rows its actions took.
 		let pass = store.baseline(pair).unwrap();
 		assert!(pass.get("d0/f00000.txt").is_some());
-		let applying = PlannedEntry::plan(
+		let (_dir, stage) = Stage::in_temp_dir();
+		let applying = PlannedEntry::stage(
 			vec![
 				SyncAction::DownloadFile {
 					rel_path: "d0/f00000.txt".to_string(),
@@ -3234,7 +3240,9 @@ mod tests {
 			pass,
 			Side::Whole(HashMap::new()),
 			Side::Whole(HashMap::new()),
-		);
+			stage,
+		)
+		.unwrap();
 		for n in 0..1_500_u64 {
 			let path = format!("new/f{n:05}.txt");
 			store
@@ -3249,13 +3257,19 @@ mod tests {
 				.unwrap();
 		}
 		// Still the rows the plan was made from, not the ones the pass has since committed.
-		assert_eq!(
-			applying
-				.iter()
-				.map(|entry| entry.base().map(|row| row.rel_path.as_str()))
-				.collect::<Vec<_>>(),
-			[Some("d0/f00000.txt"), None]
-		);
+		let mut read = Vec::new();
+		applying
+			.pager()
+			.sweep(None, |entry| {
+				read.push(match entry.start {
+					PassStart::Download { base, .. } | PassStart::Upload { base, .. } => {
+						base.map(|row| row.rel_path)
+					}
+					other => panic!("a transfer staged as {other:?}"),
+				})
+			})
+			.unwrap();
+		assert_eq!(read, [Some("d0/f00000.txt".to_string()), None]);
 		// Autocheckpoint lets the log reach 1000 pages before it copies them back and rewinds.
 		let bound = 2 * 1000 * PAGE_SIZE as u64;
 		let grown = std::fs::metadata(&wal).unwrap().len();

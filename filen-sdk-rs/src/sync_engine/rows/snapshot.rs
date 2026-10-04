@@ -18,7 +18,7 @@
 //! It ends when the plan does. An open reader is a mark no checkpoint can pass, so held through the
 //! apply it would grow the `-wal` file by every commit the apply made — one per action — and by every
 //! other pair's, for as long as the apply ran, a suspended one included. So each of the pass's
-//! actions takes the rows its apply reads out of it (`apply::PlannedEntry::plan`) — the apply reads
+//! actions takes the rows its apply reads out of it (`apply::PlannedEntry::stage`) — the apply reads
 //! nothing else, and the plan's rows are what it has to read — and the last clone of the snapshot
 //! is dropped there ([`Baseline::close`](super::Baseline::close)), handing the connection back to
 //! the store for the next pass.
