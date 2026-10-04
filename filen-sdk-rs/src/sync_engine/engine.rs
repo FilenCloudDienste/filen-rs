@@ -8,7 +8,7 @@ use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	hash::Hash,
-	mem,
+	iter, mem,
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	sync::{Arc, MutexGuard, PoisonError},
@@ -2334,6 +2334,30 @@ where
 fn streak_blocks(failure: &PathFailure, now: i64) -> bool {
 	let interval = i64::try_from(PATH_FAILURE_RETRY_INTERVAL.as_millis()).unwrap_or(i64::MAX);
 	failure.attempts >= MAX_PATH_FAILURES && now.saturating_sub(failure.last_failure_at) < interval
+}
+
+/// The failure streaks applying `actions` can end, each as the path of the action whose success
+/// ends it and the path whose streak that is: the action's own, and those of the deletions a
+/// directory deletion carries out (`subsumed`), which happen with it.
+///
+/// Only paths in `streaks` are kept. Ending a streak that does not exist deletes no row, and a
+/// first sync's plan is the whole tree. `None` is a store that could not say which paths have one:
+/// every path is then kept, as if each had.
+fn endable_streaks(
+	actions: &[SyncAction],
+	subsumed: &Subsumed,
+	streaks: Option<&HashMap<String, PathFailure>>,
+) -> Vec<(String, String)> {
+	actions
+		.iter()
+		.map(SyncAction::rel_path)
+		.flat_map(|path| {
+			iter::once(path)
+				.chain(subsumed.carried_by(path).map(String::as_str))
+				.filter(move |ended| streaks.is_none_or(|streaks| streaks.contains_key(*ended)))
+				.map(move |ended| (path.to_owned(), ended.to_owned()))
+		})
+		.collect()
 }
 
 /// Which side wins when a caller resolves a held two-way conflict via
@@ -4854,24 +4878,20 @@ impl SyncEngine {
 		}
 	}
 
-	/// Record what this pass's attempted paths did: a failure extends that path's streak, a success
-	/// ends it. Once a streak reaches [`MAX_PATH_FAILURES`] the path stops being planned and is
-	/// reported as [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever —
-	/// until [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
+	/// Record what this pass's actions did: a failure extends that path's streak, and a success ends
+	/// the streaks `ends` pairs it with (see [`endable_streaks`]). Once a streak reaches
+	/// [`MAX_PATH_FAILURES`] the path stops being planned and is reported as
+	/// [`UnsyncableReason::RepeatedFailure`] instead of failing on every pass forever — until
+	/// [`PATH_FAILURE_RETRY_INTERVAL`] after its last failure, when it is tried once more.
 	///
-	/// A directory deletion that succeeded also ends the streaks of the deletions it carried out
-	/// (`subsumed`): they happened with it. One that failed leaves theirs alone, since none of them
-	/// was attempted on its own.
+	/// A directory deletion that failed leaves the streaks of the deletions it carried alone, since
+	/// none of them was attempted on its own.
 	async fn note_path_outcomes(
 		&self,
 		pair: PairId,
-		attempted: &[String],
-		subsumed: &Subsumed,
+		ends: Vec<(String, String)>,
 		report: &mut SyncReport,
 	) {
-		if attempted.is_empty() {
-			return;
-		}
 		let failed: HashMap<&str, &str> = report
 			.failed_paths
 			.iter()
@@ -4883,11 +4903,9 @@ impl SyncEngine {
 		// pass that found a side full held back transfers the same way.
 		let cleared: Option<Vec<String>> = (report.interrupted == 0 && report.halted.is_none())
 			.then(|| {
-				attempted
-					.iter()
-					.filter(|path| !failed.contains_key(path.as_str()))
-					.flat_map(|path| std::iter::once(path).chain(subsumed.carried_by(path)))
-					.cloned()
+				ends.into_iter()
+					.filter(|(by, _)| !failed.contains_key(by.as_str()))
+					.map(|(_, ended)| ended)
 					.collect()
 			});
 		let recorded: Vec<(String, String)> = failed
@@ -4904,9 +4922,8 @@ impl SyncEngine {
 			}
 		};
 		let now = Utc::now().timestamp_millis();
-		// One statement per attempted path, so this scales with the plan rather than with the
-		// tree — but a first sync's plan IS the tree. Off the runtime thread, with the paths owned
-		// by the closure that writes them.
+		// One statement per failure and per streak ended, so this scales with the failing paths.
+		// Off the runtime thread, with the paths owned by the closure that writes them.
 		let outcome = off_store(&store, move |store| {
 			let mut problems = Vec::new();
 			for (path, error) in &recorded {
@@ -5119,7 +5136,8 @@ impl SyncEngine {
 
 	/// What a pass that made a plan leaves the next one: the facts it blocked with, the two
 	/// whole-tree judgements only a whole read makes, and the paths its plan owes a second look at
-	/// (the optimization plan's section 3.4 step 7, and its carry-over set in 3.6).
+	/// (the optimization plan's section 3.4 step 7, and its carry-over set in 3.6). `streaks` is
+	/// every failure streak the pair has, not only the blocking ones.
 	///
 	/// Not called by a pass that REFUSED: a refusal forces the next pass whole, which rebuilds all
 	/// of this from a read of both sides.
@@ -5129,24 +5147,14 @@ impl SyncEngine {
 		prep: &Prepared,
 		report: &SyncReport,
 		decision: &guard::GuardDecision,
+		streaks: &HashMap<String, PathFailure>,
 	) {
-		// The UNFILTERED streaks, not `Prepared::failures`: a path whose attempts are below the
-		// blocking threshold is filtered out of the pass, and filtering it out here too would mean
-		// no later pass ever looks at it again and its retry never comes.
-		let failures = match self.pair_store(pair).await {
-			Ok(store) => off_store(&store, move |store| store.failures(pair))
-				.await
-				.ok()
-				.and_then(Result::ok)
-				.unwrap_or_default(),
-			Err(_) => HashMap::new(),
-		};
 		if let Some(changes) = self.existing_pair_changes(pair).await {
 			changes.note_owed(facts::carry_over(
 				decision,
 				&report.conflicts,
 				&prep.holds.held_remote,
-				&failures,
+				streaks,
 			));
 		}
 		self.carried.lock().await.insert(
@@ -5413,9 +5421,27 @@ impl SyncEngine {
 				pass_token: report.deletion_token.clone().unwrap_or_default(),
 			});
 		}
+		// The UNFILTERED streaks, not `Prepared::failures`: a path whose attempts are below the
+		// blocking threshold is filtered out of the pass, and filtering it out of the carry-over too
+		// would mean no later pass ever looks at it again and its retry never comes. A success ends
+		// such a streak as well, so the apply below reads the same set.
+		let streaks = match self.pair_store(pair).await {
+			Ok(store) => off_store(&store, move |store| store.failures(pair))
+				.await
+				.ok()
+				.and_then(Result::ok),
+			Err(_) => None,
+		};
 		// Before the early return below: a pass with nothing to apply still made a plan, and still
 		// owes the next one everything that plan named.
-		self.carry_forward(pair, &prep, &report, &decision).await;
+		self.carry_forward(
+			pair,
+			&prep,
+			&report,
+			&decision,
+			streaks.as_ref().unwrap_or(&HashMap::new()),
+		)
+		.await;
 		// After the guard counted every item the plan deletes and the carry-over owed each of their
 		// paths: what is left is what the apply runs.
 		let subsumed = plan::fold_subsumed_deletes(&mut decision.safe);
@@ -5475,14 +5501,9 @@ impl SyncEngine {
 			lock_budget: self.lock_budget,
 			subsumed: &subsumed,
 		};
-		let attempted: Vec<String> = decision
-			.safe
-			.iter()
-			.map(|action| action.rel_path().to_string())
-			.collect();
+		let ends = endable_streaks(&decision.safe, &subsumed, streaks.as_ref());
 		apply::apply(ctx, decision.safe, &mut report, observer).await;
-		self.note_path_outcomes(pair, &attempted, &subsumed, &mut report)
-			.await;
+		self.note_path_outcomes(pair, ends, &mut report).await;
 		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
 		// above recorded the paths the plan named; this puts the announced changes back with them,
 		// and without them the next pass would derive those paths' remote side from baseline rows
@@ -8698,6 +8719,76 @@ mod tests {
 		}
 	}
 
+	/// `a.txt` and `b.txt` uploaded, and `docs` trashed with the two files under it folded in.
+	fn uploads_and_a_folded_trash() -> (Vec<SyncAction>, Subsumed) {
+		let trash = |rel_path: &str, kind| SyncAction::TrashRemote {
+			rel_path: rel_path.to_string(),
+			kind,
+			remote_uuid: Uuid::from_u128(1),
+		};
+		let mut actions = vec![
+			upload("a.txt"),
+			upload("b.txt"),
+			trash("docs", NodeKind::Dir),
+			trash("docs/x.txt", NodeKind::File),
+			trash("docs/y.txt", NodeKind::File),
+		];
+		let subsumed = plan::fold_subsumed_deletes(&mut actions);
+		(actions, subsumed)
+	}
+
+	fn pairs(ends: &[(&str, &str)]) -> Vec<(String, String)> {
+		ends.iter()
+			.map(|(by, ended)| ((*by).to_string(), (*ended).to_string()))
+			.collect()
+	}
+
+	/// Only a path with a streak has one to end: its own action ends it, and so does the directory
+	/// deletion that carries it out.
+	#[test]
+	fn a_pass_ends_only_the_streaks_the_store_has() {
+		let (actions, subsumed) = uploads_and_a_folded_trash();
+		let streaks = HashMap::from([
+			("a.txt".to_string(), failure(1, 0)),
+			("docs/x.txt".to_string(), failure(2, 0)),
+		]);
+		assert_eq!(
+			endable_streaks(&actions, &subsumed, Some(&streaks)),
+			pairs(&[("a.txt", "a.txt"), ("docs", "docs/x.txt")])
+		);
+	}
+
+	/// A store that could not say which paths have a streak leaves every path's to be ended, as if
+	/// each had one.
+	#[test]
+	fn a_pass_that_could_not_read_the_streaks_treats_every_path_as_having_one() {
+		let (actions, subsumed) = uploads_and_a_folded_trash();
+		assert_eq!(
+			endable_streaks(&actions, &subsumed, None),
+			pairs(&[
+				("a.txt", "a.txt"),
+				("b.txt", "b.txt"),
+				("docs", "docs"),
+				("docs", "docs/x.txt"),
+				("docs", "docs/y.txt"),
+			])
+		);
+	}
+
+	/// A first sync plans the whole tree and no path of it has failed: what the pass keeps to end
+	/// failure streaks with is nothing, not an owned path per planned item held until it ends.
+	#[test]
+	fn a_pass_with_no_failure_streak_keeps_no_path_to_end_one() {
+		let actions: Vec<SyncAction> = (0..10_000)
+			.map(|n| upload(&format!("d{:02}/f{n:05}.txt", n % 100)))
+			.collect();
+		let (subsumed, streaks) = (Subsumed::default(), HashMap::new());
+		let (ends, peak) =
+			alloc_meter::peak_bytes(|| endable_streaks(&actions, &subsumed, Some(&streaks)));
+		assert_eq!(peak, 0, "10_000 successful actions and no streak");
+		assert_eq!(ends, Vec::new());
+	}
+
 	#[test]
 	fn local_roots_overlap_only_when_one_actually_contains_the_other() {
 		let existing = Path::new("/sync/data");
@@ -10062,7 +10153,7 @@ mod tests {
 			.failures(pair)
 			.unwrap();
 
-		let attempted = vec!["broken.txt".to_string(), "fine.txt".to_string()];
+		let attempted = [upload("broken.txt"), upload("fine.txt")];
 		let mut report = SyncReport::default();
 		let mut events = Vec::new();
 		apply::note_lock_failure(
@@ -10071,9 +10162,8 @@ mod tests {
 			&Error::custom(ErrorKind::RetryFailed, "the drive lock is held elsewhere"),
 			&mut |event| events.push(event),
 		);
-		engine
-			.note_path_outcomes(pair, &attempted, &Subsumed::default(), &mut report)
-			.await;
+		let ends = endable_streaks(&attempted, &Subsumed::default(), Some(&before));
+		engine.note_path_outcomes(pair, ends, &mut report).await;
 
 		assert_eq!(
 			locked(&engine.pair_store(pair).await.unwrap())
@@ -10099,22 +10189,32 @@ mod tests {
 	}
 
 	/// A pass with `docs/a.txt`'s earlier failed trash on record, whose plan folded that trash into
-	/// the trash of `docs`: the engine, the pair, the store's file, and the folded deletions.
-	async fn streak_under_a_folded_directory(tag: &str) -> (SyncEngine, PairId, PathBuf, Subsumed) {
+	/// the trash of `docs`: the engine, the pair, the store's file, and the streaks the folded plan
+	/// can end.
+	async fn streak_under_a_folded_directory(
+		tag: &str,
+	) -> (SyncEngine, PairId, PathBuf, Vec<(String, String)>) {
 		let (engine, pair, path) = engine_with_pair(tag).await;
-		locked(&engine.pair_store(pair).await.unwrap())
-			.record_failure(pair, "docs/a.txt", "boom", Utc::now().timestamp_millis())
-			.unwrap();
+		let streaks = {
+			let pair_store = engine.pair_store(pair).await.unwrap();
+			let store = locked(&pair_store);
+			store
+				.record_failure(pair, "docs/a.txt", "boom", Utc::now().timestamp_millis())
+				.unwrap();
+			store.failures(pair).unwrap()
+		};
 		let trash = |rel_path: &str, kind| SyncAction::TrashRemote {
 			rel_path: rel_path.to_string(),
 			kind,
 			remote_uuid: Uuid::from_u128(1),
 		};
-		let subsumed = plan::fold_subsumed_deletes(&mut vec![
+		let mut actions = vec![
 			trash("docs/a.txt", NodeKind::File),
 			trash("docs", NodeKind::Dir),
-		]);
-		(engine, pair, path, subsumed)
+		];
+		let subsumed = plan::fold_subsumed_deletes(&mut actions);
+		let ends = endable_streaks(&actions, &subsumed, Some(&streaks));
+		(engine, pair, path, ends)
 	}
 
 	/// The deletions a directory deletion carried out happened with it: when it succeeds, their
@@ -10122,13 +10222,11 @@ mod tests {
 	/// streak it never earned.
 	#[tokio::test]
 	async fn a_directory_deletion_that_succeeds_ends_the_streaks_of_the_deletions_it_carried() {
-		let (engine, pair, path, subsumed) =
+		let (engine, pair, path, ends) =
 			streak_under_a_folded_directory("folded_streak_cleared").await;
 
 		let mut report = SyncReport::default();
-		engine
-			.note_path_outcomes(pair, &["docs".to_string()], &subsumed, &mut report)
-			.await;
+		engine.note_path_outcomes(pair, ends, &mut report).await;
 
 		assert!(report.errors.is_empty(), "{:?}", report.errors);
 		assert_eq!(
@@ -10146,7 +10244,7 @@ mod tests {
 	/// their streaks stay exactly as they were, and only the directory's grows.
 	#[tokio::test]
 	async fn a_directory_deletion_that_fails_leaves_the_streaks_of_the_deletions_it_carried() {
-		let (engine, pair, path, subsumed) =
+		let (engine, pair, path, ends) =
 			streak_under_a_folded_directory("folded_streak_kept").await;
 		let before = locked(&engine.pair_store(pair).await.unwrap())
 			.failures(pair)
@@ -10156,15 +10254,41 @@ mod tests {
 			failed_paths: vec![("docs".to_string(), "boom".to_string())],
 			..SyncReport::default()
 		};
-		engine
-			.note_path_outcomes(pair, &["docs".to_string()], &subsumed, &mut report)
-			.await;
+		engine.note_path_outcomes(pair, ends, &mut report).await;
 
 		let after = locked(&engine.pair_store(pair).await.unwrap())
 			.failures(pair)
 			.unwrap();
 		assert_eq!(after.get("docs/a.txt"), before.get("docs/a.txt"));
 		assert_eq!(after.get("docs").map(|failure| failure.attempts), Some(1));
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A pass whose actions end no streak still starts one for each path that failed: a first
+	/// failure has no streak to end, and is the one that begins it.
+	#[tokio::test]
+	async fn a_pass_that_ends_no_streak_still_records_its_failures() {
+		let (engine, pair, path) = engine_with_pair("first_failure_recorded").await;
+
+		let mut report = SyncReport {
+			failed_paths: vec![("broken.txt".to_string(), "boom".to_string())],
+			..SyncReport::default()
+		};
+		engine
+			.note_path_outcomes(pair, Vec::new(), &mut report)
+			.await;
+
+		assert!(report.errors.is_empty(), "{:?}", report.errors);
+		let after = locked(&engine.pair_store(pair).await.unwrap())
+			.failures(pair)
+			.unwrap();
+		assert_eq!(
+			after.get("broken.txt").map(|failure| failure.attempts),
+			Some(1)
+		);
+		assert_eq!(after.len(), 1);
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
