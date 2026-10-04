@@ -833,14 +833,18 @@ impl PendingWrites {
 		let now = Instant::now();
 		let mut journal = self.journal();
 		let map = &mut journal.writes;
-		// Only this pair's OWN records consult the snapshot, and indexing every remote node for a
+		// Only this pair's OWN records consult the snapshot, and walking every remote node for a
 		// pass that journalled none is the whole cost of this call on a large tree. The two rules
 		// above the pair check read the record by itself, so they still run — from an empty index —
 		// and still retire what the cache has demonstrably caught up to, whoever wrote it.
+		//
+		// The walk keeps only the nodes a record names: the index is asked about nothing else, and
+		// the pass after a big push walks a view of the whole tree to settle a few records.
 		let snapshot_path: HashMap<Uuid, Cow<'_, str>> =
 			if map.values().any(|write| write.pair == pair) {
 				remote
 					.iter()
+					.filter(|(_, node)| map.contains_key(&node.remote_uuid))
 					.map(|(path, node)| (node.remote_uuid, path))
 					.collect()
 			} else {
@@ -944,8 +948,8 @@ impl PendingWrites {
 	/// fold never paints over somebody else's write.
 	///
 	/// Nothing about the view is indexed up front: every record names where it expects its item to
-	/// be, and [`ViewIndex`] falls back to the whole-view index only for the one record shape that
-	/// cannot be answered that way.
+	/// be, and [`ViewIndex`] falls back to a walk of the whole view only for the one record shape
+	/// that cannot be answered that way.
 	pub(super) fn fold_into(
 		&self,
 		pair: PairId,
@@ -965,7 +969,7 @@ impl PendingWrites {
 		// Oldest first: two writes can name one path (a re-upload on the very next pass), and the
 		// later one has to land on top.
 		writes.sort_unstable_by_key(|(_, write)| write.at);
-		let mut path_of = ViewIndex::default();
+		let mut path_of = ViewIndex::new(&journal.writes);
 		let mut folded = 0;
 		for (uuid, write) in writes {
 			let applied = match &write.kind {
@@ -1046,8 +1050,8 @@ pub(super) fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> 
 	})
 }
 
-/// Where the view holds each uuid — built only when a record cannot be answered from the paths it
-/// names itself.
+/// Where the view holds each uuid the journal names — built only when a record cannot be answered
+/// from the paths it names itself.
 ///
 /// Every record says where it expects its item to be: a move its two ends, a trash the path it
 /// emptied, a create its own path (which it looks up directly, and never asks this). That is where
@@ -1057,18 +1061,33 @@ pub(super) fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> 
 ///
 /// Only a foreign edit puts the item on a third path. Then the index is built, once, and kept in
 /// step by [`place_node`] and by the removals for the rest of the fold — a scan per record would be
-/// quadratic on a large tree right after a large pass.
-#[derive(Default)]
-struct ViewIndex(Option<HashMap<Uuid, String>>);
+/// quadratic on a large tree right after a large pass. The walk keeps only the nodes whose uuid
+/// `journal` names, the only uuids the fold looks up, so the index starts at one entry per record
+/// rather than one per node of the tree.
+struct ViewIndex<'a> {
+	journal: &'a HashMap<Uuid, PendingWrite>,
+	index: Option<HashMap<Uuid, String>>,
+}
 
-impl ViewIndex {
-	/// Where `nodes` holds `uuid`, building the index if it is not built yet.
+impl<'a> ViewIndex<'a> {
+	/// An index, not built yet, for a fold of `journal`'s records.
+	fn new(journal: &'a HashMap<Uuid, PendingWrite>) -> Self {
+		Self {
+			journal,
+			index: None,
+		}
+	}
+
+	/// Where `nodes` holds `uuid`, a uuid `journal` names, building the index if it is not built
+	/// yet.
 	fn at(&mut self, nodes: &Side<RemoteNode>, baseline: &Baseline, uuid: Uuid) -> Option<String> {
-		self.0
+		let journal = self.journal;
+		self.index
 			.get_or_insert_with(|| {
 				nodes
 					.of(baseline)
 					.iter()
+					.filter(|(_, node)| journal.contains_key(&node.remote_uuid))
 					.map(|(path, node)| (node.remote_uuid, path.into_owned()))
 					.collect()
 			})
@@ -1077,13 +1096,13 @@ impl ViewIndex {
 	}
 
 	fn placed(&mut self, uuid: Uuid, path: &str) {
-		if let Some(index) = self.0.as_mut() {
+		if let Some(index) = self.index.as_mut() {
 			index.insert(uuid, path.to_owned());
 		}
 	}
 
 	fn gone(&mut self, uuid: Uuid) {
-		if let Some(index) = self.0.as_mut() {
+		if let Some(index) = self.index.as_mut() {
 			index.remove(&uuid);
 		}
 	}
@@ -1097,7 +1116,7 @@ impl ViewIndex {
 fn held_at(
 	nodes: &Side<RemoteNode>,
 	baseline: &Baseline,
-	path_of: &mut ViewIndex,
+	path_of: &mut ViewIndex<'_>,
 	uuid: Uuid,
 	hints: &[&str],
 ) -> Option<String> {
@@ -1117,7 +1136,7 @@ fn held_at(
 fn place_node(
 	nodes: &mut Side<RemoteNode>,
 	baseline: &Baseline,
-	path_of: &mut ViewIndex,
+	path_of: &mut ViewIndex<'_>,
 	path: String,
 	node: RemoteNode,
 ) {
@@ -1141,7 +1160,7 @@ fn place_node(
 /// first one to run wins.
 fn fold_create(
 	nodes: &mut Side<RemoteNode>,
-	path_of: &mut ViewIndex,
+	path_of: &mut ViewIndex<'_>,
 	baseline: &Baseline,
 	uuid: Uuid,
 	path: &str,
@@ -1180,7 +1199,7 @@ fn fold_create(
 /// old path along with it.
 fn fold_move(
 	nodes: &mut Side<RemoteNode>,
-	path_of: &mut ViewIndex,
+	path_of: &mut ViewIndex<'_>,
 	baseline: &Baseline,
 	uuid: Uuid,
 	from: &str,
@@ -1247,7 +1266,7 @@ fn fold_move(
 fn fold_trash(
 	nodes: &mut Side<RemoteNode>,
 	baseline: &Baseline,
-	path_of: &mut ViewIndex,
+	path_of: &mut ViewIndex<'_>,
 	uuid: Uuid,
 	at: &str,
 	changed: &mut BTreeSet<String>,
@@ -8889,7 +8908,17 @@ mod tests {
 		]
 		.into_iter()
 		.collect();
-		let mut path_of = ViewIndex::default();
+		// The move is the journal's one record, so the index holds the directory at its old path.
+		let journal = HashMap::from([(
+			dir,
+			PendingWrite {
+				at: Instant::now(),
+				pair: PAIR,
+				seq: 0,
+				kind: moved("Docs", "docs"),
+			},
+		)]);
+		let mut path_of = ViewIndex::new(&journal);
 		// Built BEFORE the fold, as it is for a fold that has already answered one record the two
 		// paths it names could not: the assertions below are then about the index being kept in
 		// step, which is what they were about when it was built unconditionally.
@@ -11554,6 +11583,109 @@ mod tests {
 		assert!(
 			peak < 320 * 1024,
 			"{ANNOUNCED} announcements held {peak} bytes at once"
+		);
+	}
+
+	/// A remote view of `nodes` files, `dir/file-{i}.txt` under uuid `i`.
+	fn wide_view(nodes: u32) -> Side<RemoteNode> {
+		(0..nodes)
+			.map(|i| {
+				let path = format!("dir/file-{i}.txt");
+				let node = RemoteNode {
+					rel_path: path.clone(),
+					kind: NodeKind::File,
+					remote_uuid: Uuid::from_u128(u128::from(i)),
+					stable_uuid: None,
+					content_hash: None,
+					size: 0,
+					modified_millis: 0,
+				};
+				(path, node)
+			})
+			.collect()
+	}
+
+	/// The pass after a big push settles a handful of records against the whole view. Only the
+	/// uuids those records name are worth finding in it, so that is all the settle keeps.
+	#[test]
+	fn settling_a_few_writes_against_a_wide_view_keeps_only_their_uuids() {
+		const NODES: u32 = 100_000;
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (listed, moved_away, trashed, unlisted) = (
+			Uuid::from_u128(7),
+			Uuid::from_u128(8),
+			Uuid::from_u128(9),
+			Uuid::from_u128(u128::from(NODES) + 1),
+		);
+		pending.record(&observations, PAIR, listed, created("dir/file-7.txt", None));
+		pending.record(
+			&observations,
+			PAIR,
+			moved_away,
+			moved("dir/file-8.txt", "elsewhere.txt"),
+		);
+		pending.record(
+			&observations,
+			PAIR,
+			trashed,
+			PendingKind::Trashed {
+				path: "dir/file-9.txt".to_string(),
+			},
+		);
+		pending.record(&observations, PAIR, unlisted, created("new.txt", None));
+		let remote = wide_view(NODES);
+		let observed = observations.snapshot();
+
+		let (holds, peak) =
+			alloc_meter::peak_bytes(|| pending.settle(PAIR, &observed, &remote.whole()));
+
+		assert_eq!(
+			pending.uuids(),
+			HashSet::from([moved_away, trashed, unlisted]),
+			"the create the view lists is settled; the cache is behind on the other three"
+		);
+		assert_eq!(holds.trashed, HashSet::from([trashed]));
+		assert!(
+			peak < 4 * 1024,
+			"settling 4 writes against {NODES} nodes held {peak} bytes at once"
+		);
+	}
+
+	/// A record whose item a foreign rename put on a path it does not name is looked up by uuid,
+	/// over the whole view. Only the uuids the journal names are worth indexing for that.
+	#[test]
+	fn folding_a_write_its_paths_miss_indexes_only_the_journalled_uuids() {
+		const NODES: u32 = 100_000;
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		// We trashed it at `gone.txt`; the cache lists it at the path it was renamed to.
+		let trashed = Uuid::from_u128(9);
+		pending.record(
+			&observations,
+			PAIR,
+			trashed,
+			PendingKind::Trashed {
+				path: "gone.txt".to_string(),
+			},
+		);
+		let mut remote = wide_view(NODES);
+		let baseline = Baseline::default();
+		let mut changed = BTreeSet::new();
+
+		let (folded, peak) = alloc_meter::peak_bytes(|| {
+			pending.fold_into(PAIR, &baseline, &mut remote, &mut changed)
+		});
+
+		assert_eq!(folded, 1);
+		assert!(
+			!remote.whole().holds("dir/file-9.txt"),
+			"the trashed item is taken out wherever the view holds it"
+		);
+		assert_eq!(remote.whole().len(), 99_999);
+		assert!(
+			peak < 4 * 1024,
+			"folding 1 write into {NODES} nodes held {peak} bytes at once"
 		);
 	}
 
