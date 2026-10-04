@@ -128,8 +128,8 @@ misquoting these replace came from names that did not:
   its pair and its counts, 272 bytes, not counting the pages its questions last
   read (up to 1,024 rows each, dropped with the pass) — and the pass's own edits
   over the table:
-  its folded directory moves and confirmed pushes, or the rows frozen for its
-  apply. Between passes the pair is the handle and nothing else, at every size;
+  its folded directory moves and confirmed pushes. Between passes the pair is the
+  handle and nothing else, at every size;
   the store holds no rows in memory. A run asserts that the pass's figure is at
   least the pair's, and that its edits stay within `EDITS_BASE_BYTES` plus
   `EDIT_BYTES` per folded move or confirmed push, so a fold that wrote the rows it

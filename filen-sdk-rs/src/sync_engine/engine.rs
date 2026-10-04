@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use super::{
 	Backlog, SyncEvent, SyncMode,
-	apply::{self, ApplyContext, SyncReport},
+	apply::{self, ApplyContext, PlannedEntry, SyncReport},
 	baseline::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
 		PathFailure, PendingRow, SyncedPaths,
@@ -2113,6 +2113,21 @@ impl Prepared {
 				}
 			}
 		}
+	}
+
+	/// The plan's `actions`, each with what the apply reads for it (see [`PlannedEntry::plan`]).
+	///
+	/// Takes the pass's rows and both its sides out of `self` to do it: the scan, the view and the
+	/// snapshot are dropped here, and the pass's read transaction with the snapshot. What is left
+	/// answers nothing about either side or any row, and nothing after the plan asks it to: only
+	/// what the pass records once its apply is done.
+	fn plan_entries(&mut self, actions: Vec<SyncAction>) -> Vec<PlannedEntry> {
+		PlannedEntry::plan(
+			actions,
+			mem::take(&mut self.baseline),
+			mem::replace(&mut self.local_scan.nodes, Side::carried()),
+			mem::replace(&mut self.remote_view.nodes, Side::carried()),
+		)
 	}
 
 	/// Map internal actions onto the public [`PlannedAction`] shape, resolving each one's size from
@@ -5539,14 +5554,12 @@ impl SyncEngine {
 		// is not a reachable subfolder.
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
-		// The plan is made: end the pass's read transaction before the first action commits. The
-		// apply reads only the rows at the paths its actions name, and holding the transaction open
-		// for the rest would pin the WAL through every upload (see `Baseline::freeze`).
-		prep.baseline =
-			mem::take(&mut prep.baseline).freeze(decision.safe.iter().flat_map(|action| {
-				let (from, to) = action.endpoints();
-				[from, to]
-			}));
+		let ends = endable_streaks(&decision.safe, &subsumed, streaks.as_ref());
+		// The plan is made: each action takes what the apply reads for it, and the rest of the scan,
+		// the view and the rows goes — the rows' read transaction with them, before the first action
+		// commits, since holding it open would pin the WAL through every upload (see
+		// `Baseline::close`).
+		let entries = prep.plan_entries(decision.safe);
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
@@ -5554,9 +5567,6 @@ impl SyncEngine {
 			pair,
 			mode: prep.record.mode,
 			store: &store,
-			local: &prep.local_scan.nodes.of(&prep.baseline),
-			baseline: &prep.baseline,
-			remote: &prep.remote_view.nodes.of(&prep.baseline),
 			root_remote,
 			absence_trusted: state.absence_trusted(),
 			pending: &self.pending,
@@ -5565,8 +5575,7 @@ impl SyncEngine {
 			lock_budget: self.lock_budget,
 			subsumed: &subsumed,
 		};
-		let ends = endable_streaks(&decision.safe, &subsumed, streaks.as_ref());
-		apply::apply(ctx, decision.safe, &mut report, observer).await;
+		apply::apply(ctx, entries, &mut report, observer).await;
 		self.note_path_outcomes(pair, ends, &mut report).await;
 		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
 		// above recorded the paths the plan named; this puts the announced changes back with them,
@@ -8851,6 +8860,49 @@ mod tests {
 			alloc_meter::peak_bytes(|| endable_streaks(&actions, &subsumed, Some(&streaks)));
 		assert_eq!(peak, 0, "10_000 successful actions and no streak");
 		assert_eq!(ends, Vec::new());
+	}
+
+	/// Once the apply has what its actions read, the pass keeps none of the trees it planned from:
+	/// a first push of 20_000 files into 100 directories the remote already has hands the apply an
+	/// entry per upload, and what the pass still holds beside them is a few small sets, not the
+	/// local scan, the remote view or a row per planned path.
+	#[test]
+	fn the_apply_inputs_leave_the_pass_none_of_its_trees() {
+		const CREATES: u32 = 20_000;
+		let hash = Blake3Hash::from([1; 32]);
+		let dirs: Vec<String> = (0..100u32).map(|d| format!("d{d:02}")).collect();
+		let files: Vec<String> = (0..CREATES)
+			.map(|n| format!("d{:02}/f{n:05}.txt", n % 100))
+			.collect();
+		let local: Vec<LocalNode> = dirs
+			.iter()
+			.map(|dir| local_dir(dir))
+			.chain(files.iter().map(|file| local_file(file, hash)))
+			.collect();
+		let remote = view(
+			(0..100u32)
+				.zip(&dirs)
+				.map(|(d, dir)| remote_dir(dir, Uuid::from_u128(u128::from(d) + 1)))
+				.collect(),
+			Vec::new(),
+			&[],
+		);
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			HashMap::new(),
+			local,
+			remote,
+			HashMap::new(),
+		);
+		let actions: Vec<SyncAction> = files.iter().map(|file| upload(file)).collect();
+		let entries = prep.plan_entries(actions);
+		assert_eq!(entries.len(), 20_000);
+		let ((), net) = alloc_meter::net_bytes(|| drop(prep));
+		assert!(
+			net > -4096,
+			"the pass still held {} bytes beside the apply's inputs",
+			-net
+		);
 	}
 
 	#[test]
