@@ -2127,6 +2127,7 @@ dependencies = [
  "inquire",
  "insta",
  "keyring",
+ "libc",
  "log",
  "manuel",
  "open",
