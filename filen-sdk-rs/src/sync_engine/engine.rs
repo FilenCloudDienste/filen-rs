@@ -5106,6 +5106,23 @@ impl SyncEngine {
 		result
 	}
 
+	/// Give back the page caches a finished pass left on `pair`'s writing connection and its parked
+	/// reader (see [`BaselineStore::release_page_caches`]), wherever the pass ended.
+	///
+	/// Only a store that is already open: a pass that never opened one filled no cache, and opening
+	/// one here would pay the schema parse that keeping it open saves. Off the runtime thread,
+	/// because the store's lock may be held by another verb's whole-tree work.
+	async fn release_pair_cache(&self, pair: PairId) {
+		let Some(store) = self.stores.lock().await.get(&pair).map(Arc::clone) else {
+			return;
+		};
+		if let Err(error) = off_store(&store, BaselineStore::release_page_caches).await {
+			tracing::warn!(
+				"sync_once[pair {pair}]: giving back the pass's page cache failed: {error}"
+			);
+		}
+	}
+
 	/// Drop the baseline rows at or under every path this pass found ignored, touching neither tree:
 	/// the path stops syncing, and once no rule hides it any more it is read like a first sync. Then
 	/// record the ignored roots the next pass needs to tell when that happens (see
@@ -5190,6 +5207,12 @@ impl SyncEngine {
 
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
 	/// already contained.
+	///
+	/// A pass that reads gives back the pair's page caches once it is over (see
+	/// [`release_pair_cache`](Self::release_pair_cache)); one that never starts does not. A paused
+	/// pair, and a watch wake with nothing announced, read neither side, so their release would give
+	/// back none of the pair's pages and only make every other connection in the process read its
+	/// own back.
 	async fn run_pass(
 		&self,
 		pair: PairId,
@@ -5233,6 +5256,28 @@ impl SyncEngine {
 			);
 			return Ok(SyncReport::default());
 		}
+		// From here the pass reads: whichever way it ends — a panic included, which is how a failed
+		// baseline read ends — it gives back what that read cached.
+		let ran = pass_panics_as_errors(
+			pair,
+			"the pass",
+			self.run_started_pass(pair, observer, gate, reading, changes),
+		)
+		.await;
+		self.release_pair_cache(pair).await;
+		ran
+	}
+
+	/// The pass [`run_pass`](Self::run_pass) found to run, from its first read on, holding `gate`
+	/// and `reading` as that does.
+	async fn run_started_pass(
+		&self,
+		pair: PairId,
+		observer: &mut (dyn FnMut(SyncEvent) + Send),
+		gate: PassGate,
+		reading: Arc<Mutex<()>>,
+		changes: Arc<PairChanges>,
+	) -> Result<SyncReport, Error> {
 		// Both changelists, taken BEFORE either side is read: everything in them is either already
 		// in the snapshot this pass is about to read (a harmless duplicate) or not yet, and this
 		// pass has it. What arrives from here on belongs to the next pass (see `changes`).
@@ -6109,7 +6154,7 @@ mod tests {
 	use crate::{
 		alloc_meter,
 		auth::test_support::offline_client,
-		cache::CacheState,
+		cache::{CacheState, test_support::rewrite_behind_sqlite},
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
 			PauseMode,
@@ -9428,6 +9473,129 @@ mod tests {
 				.contains("locking the sync engine's lock file baseline.db-lock"),
 			"{refused}"
 		);
+	}
+
+	/// A pass leaves its pair's writing connection holding the pages it wrote through, and a watch
+	/// then idles on them; every pass that reads gives that cache back on its way out, so the
+	/// writer's next read of a page goes to the file again.
+	#[tokio::test]
+	async fn a_finished_pass_gives_back_the_pair_writers_page_cache() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("baseline.db");
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let store = engine.pair_store(pair).await.unwrap();
+		locked(&store)
+			.writer()
+			.execute_batch(
+				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
+				 PRAGMA wal_checkpoint(TRUNCATE);",
+			)
+			.unwrap();
+		let read = || -> String {
+			locked(&store)
+				.writer()
+				.query_row("SELECT v FROM probe", [], |row| row.get(0))
+				.unwrap()
+		};
+		assert_eq!(read(), "kept-page");
+		rewrite_behind_sqlite(&path, b"kept-page", b"gone-page");
+
+		// Offline, so the pass reads the baseline and then fails at the remote side: the way out is
+		// what is under test, and every pass that reads takes the same one.
+		engine
+			.sync_once(pair)
+			.await
+			.expect_err("an offline pass reads no remote side");
+
+		assert_eq!(
+			read(),
+			"gone-page",
+			"the page cache was given back, so the read went to the file"
+		);
+	}
+
+	/// A watch wake with nothing announced runs no pass, so it gives back no page cache: it read
+	/// nothing, and a release reaches every connection in the process.
+	///
+	/// A page STILL cached is evicted by a release from any test running alongside as well (see
+	/// `rewrite_behind_sqlite`), so the scenario runs again in a process of its own (see
+	/// [`answer_alone`]) and answers with what the writer read.
+	#[tokio::test]
+	async fn an_idle_wake_keeps_the_pair_writers_page_cache() {
+		let Some(answer) = std::env::var_os(ALONE) else {
+			assert_eq!(
+				answer_alone("an_idle_wake_keeps_the_pair_writers_page_cache"),
+				"kept-page",
+				"the idle wake gave the page cache back"
+			);
+			return;
+		};
+		let (engine, pair, path) = engine_with_pair("idle_wake_release").await;
+		// Watched, with nothing announced on either side: the wake a quiet tree's watch makes.
+		let changes = engine.pair_changes(pair).await;
+		changes.cover_local();
+		assert!(changes.is_idle());
+		let store = engine.pair_store(pair).await.unwrap();
+		locked(&store)
+			.writer()
+			.execute_batch(
+				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
+				 PRAGMA wal_checkpoint(TRUNCATE);",
+			)
+			.unwrap();
+		let read = || -> String {
+			locked(&store)
+				.writer()
+				.query_row("SELECT v FROM probe", [], |row| row.get(0))
+				.unwrap()
+		};
+		assert_eq!(read(), "kept-page");
+		rewrite_behind_sqlite(&path, b"kept-page", b"gone-page");
+
+		// Offline, so a pass that read would fail at the remote side: `Ok` is a pass never started.
+		engine
+			.sync_pass(pair, &mut |_| {}, WhenIdle::Skip)
+			.await
+			.expect("an idle wake runs no pass");
+
+		std::fs::write(answer, read()).unwrap();
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// Where [`answer_alone`] tells the test it runs to write its answer.
+	const ALONE: &str = "FILEN_SYNC_ENGINE_TEST_ALONE";
+
+	/// Run this module's test `name` again, alone in a process of its own with [`ALONE`] naming a
+	/// file, and return what it wrote there: for an assertion no other test may disturb, such as a
+	/// page still cached in the page cache every connection in a process shares.
+	fn answer_alone(name: &str) -> String {
+		let dir = tempfile::tempdir().unwrap();
+		let answer = dir.path().join("answer");
+		let (_, module) = module_path!()
+			.split_once("::")
+			.expect("a module path starts with its crate");
+		let test = format!("{module}::{name}");
+		let alone = std::process::Command::new(
+			std::env::current_exe().expect("a test binary knows its own path"),
+		)
+		.args([test.as_str(), "--exact", "--test-threads=1"])
+		.env(ALONE, &answer)
+		.output()
+		.expect("running the test alone");
+		assert!(
+			alone.status.success(),
+			"{test}, run alone, exited {}:\n{}",
+			alone.status,
+			String::from_utf8_lossy(&alone.stdout)
+		);
+		// No file at all when the name matched no test: libtest then runs none and exits 0.
+		std::fs::read_to_string(&answer).expect("the test run alone wrote no answer")
 	}
 
 	/// A hold leaves a watched pair idle, so an approval has to give the pair its next pass itself:

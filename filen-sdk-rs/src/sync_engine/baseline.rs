@@ -766,13 +766,14 @@ const PAGE_SIZE: usize = 8192;
 /// through the OS page cache, which is the kernel's to evict and is not this process's resident
 /// set. 8 MiB keeps every interior page of a million-row pair resident with room for the leaves a
 /// directory's worth of lookups revisits, and it is a CEILING: a pair smaller than that never
-/// grows the cache to it. A whole pass pages the entire table through it and leaves it full.
+/// grows the cache to it. A whole pass pages the entire table through it and leaves it full, until
+/// the pass is over (see [`BaselineStore::release_page_caches`]).
 const READER_CACHE_KIB: i64 = 8 * 1024;
 
 /// The page cache of the store's own WRITING connection, in KiB. SQLite's default, stated: the
 /// writer reads a few pages per statement and a first sync's million-row transaction spills to the
 /// WAL whatever its cache, so a larger one buys that transaction little and costs every pair the
-/// difference for the life of the process.
+/// difference for as long as a pass runs (see [`BaselineStore::release_page_caches`]).
 const WRITER_CACHE_KIB: i64 = 2 * 1024;
 
 /// What the `-wal` file is cut back to once a checkpoint has emptied it, in bytes.
@@ -805,15 +806,36 @@ impl Readers {
 	}
 
 	/// A connection whose read transaction has ended, back for the next pass — kept only when no
-	/// other is idle. Each keeps its own page cache (up to [`READER_CACHE_KIB`]) for as long as it
-	/// is kept, and a pair runs one pass at a time: a second snapshot open at once (a dry run
+	/// other is idle. A pair runs one pass at a time: a second snapshot open at once (a dry run
 	/// beside a pass that is still planning — a pass hands its own back once its plan is made) is
 	/// a moment, not a steady state, and the connection it opened is closed rather than kept for
 	/// the life of the store.
+	///
+	/// The one kept is parked with its page cache (up to [`READER_CACHE_KIB`]) still full, and gives
+	/// it back once the pass is over (see [`BaselineStore::release_page_caches`]), not here: a pass
+	/// parks its reader once its plan is made, with the apply still to run, and a release reaches
+	/// every connection in the process (see [`release_page_cache`]), so one here would drop the
+	/// pages that pass's own apply is still reading. The end spares only that pass: whatever else
+	/// is reading when a release lands, another pair's pass in flight included, loses its cached
+	/// pages all the same.
 	pub(super) fn give(&self, conn: Connection) {
 		let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
 		if idle.is_empty() {
 			idle.push(conn);
+		}
+	}
+
+	/// Give back the page cache of every parked reader. The connections stay open, with their
+	/// parsed schema and prepared statements; the next pass reads the interior pages it needs back
+	/// from the OS page cache.
+	fn release_idle(&self) {
+		for conn in self
+			.idle
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.iter()
+		{
+			release_page_cache(conn, "a parked reader");
 		}
 	}
 }
@@ -831,6 +853,21 @@ fn open_reader(path: &Path) -> rusqlite::Result<Connection> {
 	// uses all of them, and re-preparing is the cost the cache exists to remove.
 	conn.set_prepared_statement_cache_capacity(32);
 	Ok(conn)
+}
+
+/// Give back the pages `conn` caches. A failure is memory kept, not a pass lost, so it is logged.
+///
+/// It reaches further than `conn`. The bundled SQLite is built with
+/// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which puts every connection's pages in one shared cache, and
+/// a release empties all of it that no statement is using: the other pairs' connections and the
+/// cache's lose their cached pages too, and read them back from the OS page cache. Only clean pages
+/// are dropped. A pass calls this once it is over, when its own reads are done (see
+/// [`BaselineStore::release_page_caches`]), but not once every pass is: another pair's pass still
+/// in flight when it lands loses its cached pages all the same.
+fn release_page_cache(conn: &Connection, whose: &str) {
+	if let Err(error) = conn.release_memory() {
+		tracing::warn!("baseline store: could not give back the page cache of {whose}: {error}");
+	}
 }
 
 /// The states a row can hold other than `Synced`, as stored: what the reader's "is every row under
@@ -1099,6 +1136,12 @@ impl BaselineStore {
 		// The INSERT is what takes the write lock; `BEGIN DEFERRED` alone takes nothing.
 		self.upsert_entry_once(pair, entry)?;
 		Ok(tx)
+	}
+
+	/// The writing connection, for a test that reads a page through it.
+	#[cfg(test)]
+	pub(super) fn writer(&self) -> &Connection {
+		&self.conn
 	}
 
 	/// Shorten this connection's busy timeout, so a test reaches the contended answer in
@@ -1536,6 +1579,21 @@ impl BaselineStore {
 		)?))
 	}
 
+	/// Give back the pages the store's connections cache, once a pass is over: the writing
+	/// connection's, which hold what the pass wrote through it (up to [`WRITER_CACHE_KIB`]), and
+	/// the parked reader's, which hold the rows the pass read (up to [`READER_CACHE_KIB`]). Both
+	/// would otherwise stay cached while the pair idles.
+	///
+	/// At the end and not sooner: the reader is parked once the plan is made, but a release reaches
+	/// every connection in the process (see [`release_page_cache`]), and one before the apply would
+	/// drop the pages the pass's own apply is still reading. The end spares only that pass's reads:
+	/// another pair's pass still in flight when the release lands loses its cached pages all the
+	/// same.
+	pub(crate) fn release_page_caches(&self) {
+		release_page_cache(&self.conn, "the writing connection");
+		self.readers.release_idle();
+	}
+
 	/// The rows `pair` is holding in conflict — both flavours — ordered by path.
 	///
 	/// A `WHERE` on the state rather than a read of the whole pair filtered in Rust: what a caller
@@ -1950,6 +2008,7 @@ impl BaselineStore {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::cache::test_support::rewrite_behind_sqlite;
 
 	fn file_entry(rel_path: &str, hash: [u8; 32], size: u64) -> BaselineEntry {
 		BaselineEntry {
@@ -2944,7 +3003,7 @@ mod tests {
 	}
 
 	/// Two snapshots open at once — a dry run beside a pass — leave ONE reader connection behind
-	/// when they end, not two: each idle reader keeps its page cache for the life of the store.
+	/// when they end, not two: each idle reader is a connection held open for the life of the store.
 	#[test]
 	fn overlapping_snapshots_leave_one_idle_reader() {
 		let store = BaselineStore::open_in_memory().unwrap();
@@ -2972,6 +3031,50 @@ mod tests {
 		// And the next pass reuses it.
 		assert!(store.baseline(pair).unwrap().contains_key("a"));
 		assert_eq!(idle(), 1);
+	}
+
+	/// A pass pages the pair's rows through its reader's cache and parks the reader with that cache
+	/// full; the end of the pass gives it back, so the parked connection's next read of a page goes
+	/// to the file again. A release reaches every connection on this build (see
+	/// [`release_page_cache`]), so the writer's half alone passes this too: it fails when the end of
+	/// a pass gives nothing back.
+	#[test]
+	fn the_end_of_a_pass_gives_back_the_parked_readers_page_cache() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		store
+			.conn
+			.execute_batch(
+				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
+				 PRAGMA wal_checkpoint(TRUNCATE);",
+			)
+			.unwrap();
+		let read = |conn: &Connection| -> String {
+			conn.query_row("SELECT v FROM probe", [], |row| row.get(0))
+				.unwrap()
+		};
+		let idle = || {
+			store
+				.readers
+				.idle
+				.lock()
+				.unwrap_or_else(PoisonError::into_inner)
+				.len()
+		};
+		let reader = store.readers.take().unwrap();
+		assert_eq!(read(&reader), "kept-page");
+		rewrite_behind_sqlite(&store.readers.path, b"kept-page", b"gone-page");
+
+		store.readers.give(reader);
+		assert_eq!(idle(), 1, "the reader is parked, not closed");
+		store.release_page_caches();
+		let reader = store.readers.take().unwrap();
+		assert_eq!(idle(), 0, "the parked reader is the one taken back");
+
+		assert_eq!(
+			read(&reader),
+			"gone-page",
+			"the page cache was given back, so the read went to the file"
+		);
 	}
 
 	/// The rules [`Derived`] computes its columns by, pinned against the schema version the stored
