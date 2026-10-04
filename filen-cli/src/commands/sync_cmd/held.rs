@@ -16,6 +16,17 @@ use crate::ui::UI;
 /// How many held items are listed before the rest are only counted.
 const MAX_LISTED: usize = 20;
 
+/// How many updates about single items an open question holds back for after its answer, before the
+/// rest are only counted. A pass reports one per item it touches, and nothing bounds how long the
+/// question stays open, so keeping them all could grow without limit. A failure left out still
+/// shows in its pass's report if the pass completes, which prints every failure no printed event
+/// carried.
+///
+/// Only those are bounded: the updates about a pass or the watch as a whole are all kept, a few for
+/// every pass the watch runs while the question is open (one of them that pass's whole report), so
+/// a question left unanswered for long still adds that much per pass.
+const MAX_DEFERRED_ITEMS: usize = 1000;
+
 /// Said instead of asking when nobody can answer.
 pub(super) const NO_TERMINAL: &str =
 	"The deletions stay held: approving them needs `filen sync` running in a terminal";
@@ -29,6 +40,40 @@ pub(super) enum Update {
 	Status(WatchStatus),
 	/// A line of the command's own, such as that it is stopping.
 	Notice(&'static str),
+	/// How many updates about single items a question dropped beyond the first
+	/// [`MAX_DEFERRED_ITEMS`], which are not printed.
+	NotPrinted(usize),
+}
+
+impl Update {
+	/// Whether this is about a single item, of which a pass reports any number, and may be dropped
+	/// past [`MAX_DEFERRED_ITEMS`]. Everything else is kept, so a new per-item [`SyncEvent`] variant
+	/// has to be added here to be bounded.
+	///
+	/// [`SyncEvent::Quarantined`] is about one item but always kept: it is the only place the bin
+	/// path of a copy moved aside is named (the pass report does not print it), and no later pass
+	/// says it again. Each one is a copy really moved, so they are as many as the data says, not as
+	/// many as the time the question stays open allows.
+	fn is_item(&self) -> bool {
+		matches!(
+			self,
+			Self::Event(
+				SyncEvent::Conflict { .. }
+					| SyncEvent::Uploading { .. }
+					| SyncEvent::Downloading { .. }
+					// Never reaches a question: `Output::deliver` drops progress ticks first.
+					| SyncEvent::Progress { .. }
+					| SyncEvent::CreatingRemoteDir { .. }
+					| SyncEvent::CreatingLocalDir { .. }
+					| SyncEvent::TrashingRemote { .. }
+					| SyncEvent::DeletingLocal { .. }
+					| SyncEvent::MovingRemote { .. }
+					| SyncEvent::MovingLocal { .. }
+					| SyncEvent::ActionFailed { .. }
+					| SyncEvent::AdoptedBaseline { .. }
+			)
+		)
+	}
 }
 
 /// What became of a question about a held batch.
@@ -73,8 +118,11 @@ struct Question {
 	token: String,
 	/// The prompt, which blocks a thread on the terminal until it is answered.
 	answer: JoinHandle<Result<bool, InquireError>>,
-	/// Everything the engine and the watch reported while the prompt had the terminal, in order.
+	/// What the engine and the watch reported while the prompt had the terminal, in order: all of it
+	/// but the updates about single items past the first [`MAX_DEFERRED_ITEMS`].
 	deferred: Vec<Update>,
+	/// How many updates about single items arrived while the prompt had the terminal, kept or not.
+	items: usize,
 }
 
 /// The held batches this `sync` has reported, and the question it may have open about one.
@@ -101,16 +149,21 @@ impl Held {
 		self.question.is_some()
 	}
 
-	/// Keep `update` for after the answer while a question is open; otherwise hand it back to be
+	/// Keep `update` for after the answer while a question is open, or only count it once the
+	/// question holds [`MAX_DEFERRED_ITEMS`] updates about single items; otherwise hand it back to be
 	/// printed now.
 	pub(super) fn defer(&mut self, update: Update) -> Option<Update> {
-		match &mut self.question {
-			Some(question) => {
-				question.deferred.push(update);
-				None
+		let Some(question) = &mut self.question else {
+			return Some(update);
+		};
+		if update.is_item() {
+			question.items = question.items.saturating_add(1);
+			if question.items > MAX_DEFERRED_ITEMS {
+				return None;
 			}
-			None => Some(update),
 		}
+		question.deferred.push(update);
+		None
 	}
 
 	/// Report the batch `report`'s pass held back, if it is one not reported before: list it and
@@ -138,13 +191,15 @@ impl Held {
 					token: token.clone(),
 					answer: ask(count),
 					deferred: Vec::new(),
+					items: 0,
 				});
 			}
 		}
 	}
 
 	/// Wait for the open question's answer, and close it: what was answered, and the updates held
-	/// back while it was open. Never resolves while no question is open.
+	/// back while it was open, ending with how many were not kept if any were not. Never resolves
+	/// while no question is open.
 	///
 	/// Cancel-safe: dropped before the answer, it leaves the question open.
 	pub(super) async fn answered(&mut self) -> (Answer, Vec<Update>) {
@@ -157,7 +212,11 @@ impl Held {
 			Mode::Stopping => Answer::TooLate,
 			Mode::Ask | Mode::Announce => answer_from(mem::take(&mut question.token), result),
 		};
-		let deferred = mem::take(&mut question.deferred);
+		let mut deferred = mem::take(&mut question.deferred);
+		let not_printed = question.items.saturating_sub(MAX_DEFERRED_ITEMS);
+		if not_printed > 0 {
+			deferred.push(Update::NotPrinted(not_printed));
+		}
 		self.question = None;
 		(answer, deferred)
 	}
@@ -251,6 +310,7 @@ pub(super) mod test_support {
 				token: token.to_owned(),
 				answer,
 				deferred: Vec::new(),
+				items: 0,
 			}),
 		}
 	}
@@ -404,7 +464,7 @@ mod tests {
 			.iter()
 			.map(|update| match update {
 				Update::Notice(notice) => *notice,
-				Update::Event(_) | Update::Status(_) => "not a notice",
+				Update::Event(_) | Update::Status(_) | Update::NotPrinted(_) => "not a notice",
 			})
 			.collect()
 	}
@@ -423,6 +483,84 @@ mod tests {
 			held.defer(Update::Notice("third")).is_some(),
 			"nothing is held back once it is answered"
 		);
+	}
+
+	fn uploading(i: usize) -> Update {
+		Update::Event(SyncEvent::Uploading {
+			rel_path: format!("file {i}"),
+		})
+	}
+
+	fn uploaded_paths(updates: &[Update]) -> Vec<&str> {
+		updates
+			.iter()
+			.filter_map(|update| match update {
+				Update::Event(SyncEvent::Uploading { rel_path }) => Some(rel_path.as_str()),
+				_ => None,
+			})
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn a_question_keeps_a_thousand_item_updates_and_only_counts_the_rest() {
+		let mut held = asking("t1", tokio::spawn(async { Ok(false) }));
+		for i in 0..100_000 {
+			assert!(held.defer(uploading(i)).is_none());
+		}
+		assert!(held.defer(Update::Notice("stopping")).is_none());
+		let (_, deferred) = held.answered().await;
+		assert_eq!(deferred.len(), 1002);
+		let uploaded = uploaded_paths(&deferred);
+		assert_eq!(uploaded.len(), 1000);
+		assert_eq!(uploaded.first(), Some(&"file 0"));
+		assert_eq!(uploaded.last(), Some(&"file 999"));
+		assert!(
+			matches!(
+				deferred.as_slice(),
+				[.., Update::Notice("stopping"), Update::NotPrinted(99_000)]
+			),
+			"what is not about one item is kept past the limit, and the count comes last"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_copy_moved_aside_is_kept_past_the_limit() {
+		let mut held = asking("t1", tokio::spawn(async { Ok(false) }));
+		for i in 0..1000 {
+			assert!(held.defer(uploading(i)).is_none());
+		}
+		let quarantined = SyncEvent::Quarantined {
+			rel_path: "a".to_owned(),
+			bin_path: ".filen-sync-trash/a".into(),
+		};
+		assert!(held.defer(Update::Event(quarantined.clone())).is_none());
+		assert!(held.defer(uploading(1000)).is_none());
+		let (_, deferred) = held.answered().await;
+		assert_eq!(uploaded_paths(&deferred).len(), 1000);
+		assert!(
+			matches!(
+				deferred.as_slice(),
+				[.., Update::Event(event), Update::NotPrinted(1)] if *event == quarantined
+			),
+			"the only notice that a copy went to the bin is kept, and only the upload is counted"
+		);
+	}
+
+	#[tokio::test]
+	async fn the_limit_is_a_thousand_item_updates_and_only_more_are_counted() {
+		for (items, kept, not_printed) in [(1000, 1000, None), (1001, 1000, Some(1))] {
+			let mut held = asking("t1", tokio::spawn(async { Ok(false) }));
+			for i in 0..items {
+				assert!(held.defer(uploading(i)).is_none());
+			}
+			let (_, deferred) = held.answered().await;
+			assert_eq!(uploaded_paths(&deferred).len(), kept, "{items} items");
+			let counted = deferred.iter().find_map(|update| match update {
+				Update::NotPrinted(count) => Some(*count),
+				_ => None,
+			});
+			assert_eq!(counted, not_printed, "{items} items");
+		}
 	}
 
 	#[tokio::test]

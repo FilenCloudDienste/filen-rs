@@ -272,6 +272,11 @@ impl Output {
 				self.last_status = current;
 			}
 			Update::Notice(notice) => self.status_line.print_above(|| ui.print_muted(notice)),
+			Update::NotPrinted(count) => self.status_line.print_above(|| {
+				ui.print_muted(&format!(
+					"{count} more update(s) from while the question was open are not printed"
+				));
+			}),
 		}
 		ControlFlow::Continue(())
 	}
@@ -335,7 +340,8 @@ impl Output {
 	}
 
 	/// Print the updates a question held back, in the order they arrived. One of them may raise a
-	/// new question, which holds back the rest in turn.
+	/// new question, which holds back the rest in turn: they count against its limit, and the line
+	/// saying how many the first question dropped waits for that answer too.
 	fn replay(&mut self, ui: &mut UI, deferred: Vec<Update>) -> ControlFlow<LoopEnd> {
 		let mut flow = ControlFlow::Continue(());
 		for update in deferred {
@@ -617,10 +623,12 @@ impl fmt::Display for Rate {
 
 /// `printed_failures` holds this pass's failures already printed as they happened, so the report at
 /// the end of the pass prints only the ones no event carried (e.g. the drive lock being unavailable).
+/// It is let go of, memory and all, once the pass is over: a `clear` would keep the room the pass
+/// grew it to while the watch waits for the next one.
 fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: &SyncEvent) {
 	match event {
 		SyncEvent::PassStarted { .. } => {
-			printed_failures.clear();
+			*printed_failures = HashSet::new();
 			ui.print_muted("Sync pass started")
 		}
 		SyncEvent::Planned { actions } => ui.print_muted(&format!("Planned {actions} action(s)")),
@@ -652,8 +660,13 @@ fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: &Sync
 		SyncEvent::Interrupted { actions } => ui.print_warning(&format!(
 			"Sync pass interrupted, {actions} action(s) left for the next pass"
 		)),
-		SyncEvent::PassCompleted { report } => print_report(ui, printed_failures, report),
-		SyncEvent::PassFailed { error } => ui.print_failure(&format!("Sync pass failed: {error}")),
+		SyncEvent::PassCompleted { report } => {
+			print_report(ui, &mem::take(printed_failures), report);
+		}
+		SyncEvent::PassFailed { error } => {
+			*printed_failures = HashSet::new();
+			ui.print_failure(&format!("Sync pass failed: {error}"));
+		}
 		// Byte counts per transfer, several per second: too noisy for a line each, they add up to the
 		// rates on the status line instead.
 		SyncEvent::Progress { .. } => {}
@@ -1035,6 +1048,104 @@ mod tests {
 				[Update::Event(SyncEvent::PassStarted { .. })]
 			),
 			"a progress tick prints nothing, so nothing of it is held back"
+		);
+	}
+
+	#[tokio::test]
+	async fn a_failure_a_question_dropped_is_printed_with_its_report_and_the_drop_is_counted() {
+		let printed = ui::test_support::Printed::default();
+		let mut ui = printed.ui();
+		let mut output = Output {
+			status_line: StatusLine {
+				term: Term::stdout(),
+				state: LineState::Disabled,
+				rates: TransferRates::default(),
+			},
+			printed_failures: HashSet::new(),
+			last_status: WatchStatus::default(),
+			held: held::test_support::asking("t1", tokio::spawn(async { Ok(false) })),
+		};
+		let mut report = SyncReport::default();
+		report.errors.push("b: denied".to_owned());
+		let uploads = (0..1000).map(|i| SyncEvent::Uploading {
+			rel_path: format!("file {i}"),
+		});
+		let events = [SyncEvent::PassStarted {
+			mode: SyncMode::TwoWay,
+		}]
+		.into_iter()
+		.chain(uploads)
+		.chain([
+			SyncEvent::ActionFailed {
+				rel_path: "b".to_owned(),
+				error: "denied".to_owned(),
+			},
+			SyncEvent::PassCompleted { report },
+		]);
+		for event in events {
+			let _ = output.deliver(&mut ui, Update::Event(event));
+		}
+		let (_, deferred) = output.held.answered().await;
+		let _ = output.replay(&mut ui, deferred);
+
+		let lines = console::strip_ansi_codes(&printed.lines()).into_owned();
+		let tail: Vec<&str> = lines.lines().skip(1000).collect();
+		assert_eq!(
+			tail,
+			[
+				"upload    file 999",
+				"✘ b: denied",
+				"⚠ Sync pass completed: 1 errors",
+				"1 more update(s) from while the question was open are not printed",
+			]
+		);
+	}
+
+	#[test]
+	fn a_pass_lets_go_of_the_failures_it_printed_and_the_next_pass_prints_them_again() {
+		let printed = ui::test_support::Printed::default();
+		let mut ui = printed.ui();
+		let mut printed_failures = HashSet::new();
+		let started = SyncEvent::PassStarted {
+			mode: SyncMode::TwoWay,
+		};
+		let mut report = SyncReport::default();
+		report.errors.push("a: denied".to_owned());
+		let completed = SyncEvent::PassCompleted { report };
+
+		for event in [
+			started.clone(),
+			SyncEvent::ActionFailed {
+				rel_path: "a".to_owned(),
+				error: "denied".to_owned(),
+			},
+		] {
+			print_event(&mut ui, &mut printed_failures, &event);
+		}
+		assert_eq!(
+			printed_failures,
+			HashSet::from(["a: denied".to_owned()]),
+			"a failure printed as it happens is left out of the report"
+		);
+		print_event(&mut ui, &mut printed_failures, &completed);
+		assert_eq!(
+			printed_failures.capacity(),
+			0,
+			"nothing of the pass is kept while the watch waits for the next one"
+		);
+
+		// The same failure again, this time only in the report.
+		print_event(&mut ui, &mut printed_failures, &started);
+		assert_eq!(printed_failures.capacity(), 0);
+		print_event(&mut ui, &mut printed_failures, &completed);
+		assert_eq!(
+			console::strip_ansi_codes(&printed.lines()),
+			"Sync pass started\n\
+			 ✘ a: denied\n\
+			 ⚠ Sync pass completed: 1 errors\n\
+			 Sync pass started\n\
+			 ✘ a: denied\n\
+			 ⚠ Sync pass completed: 1 errors"
 		);
 	}
 
