@@ -82,3 +82,16 @@ pub(crate) fn peak_bytes<T>(f: impl FnOnce() -> T) -> (T, u64) {
 	MEASURING.set(false);
 	(out, PEAK.get().max(0) as u64)
 }
+
+/// What `f` returns, and how many bytes it left allocated on this thread: what it allocated less
+/// what it freed. Negative when it freed more than it allocated.
+///
+/// Built with the sync engine only, whose tests are the ones measuring what a structure keeps.
+#[cfg(feature = "sync-engine")]
+pub(crate) fn net_bytes<T>(f: impl FnOnce() -> T) -> (T, isize) {
+	LIVE.set(0);
+	MEASURING.set(true);
+	let out = f();
+	MEASURING.set(false);
+	(out, LIVE.get())
+}
