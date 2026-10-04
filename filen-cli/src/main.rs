@@ -12,7 +12,7 @@ use std::{fs, num::NonZeroU32, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use ftail::Ftail;
-use log::{LevelFilter, info};
+use log::{LevelFilter, info, warn};
 
 use crate::{
 	commands::{Commands, execute_command},
@@ -26,6 +26,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
+mod memory;
 mod ui;
 mod updater;
 mod util;
@@ -177,21 +178,24 @@ pub(crate) static CTRLC_TX: std::sync::LazyLock<tokio::sync::broadcast::Sender<(
 const MAX_BLOCKING_THREADS: usize = 32;
 
 fn main() {
+	// Before the runtime starts its threads, so that none of them has an arena of its own yet.
+	let arenas_limited = memory::limit_arenas();
 	tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.max_blocking_threads(MAX_BLOCKING_THREADS)
 		.build()
 		// The panic `#[tokio::main]` raised: nothing runs without the runtime.
 		.expect("Failed building the Runtime")
-		.block_on(async_main());
+		.block_on(async_main(arenas_limited));
 }
 
-async fn async_main() {
+/// `arenas_limited`: whether [`memory::limit_arenas`] took, reported once logging is set up.
+async fn async_main(arenas_limited: bool) {
 	let mut ui = ui::UI::new();
 	// call ui.initialize() later after parsing args
 
 	// translate errors to non-zero exit code
-	match inner_main(&mut ui).await {
+	match inner_main(&mut ui, arenas_limited).await {
 		Ok(_) => {}
 		Err(e) if e.to_string().starts_with(EXIT_CODE_ERROR_PREFIX) => {
 			ui.print_failure_or_error(&e);
@@ -209,7 +213,7 @@ async fn async_main() {
 	}
 }
 
-async fn inner_main(ui: &mut ui::UI) -> Result<()> {
+async fn inner_main(ui: &mut ui::UI, arenas_limited: bool) -> Result<()> {
 	let cli_args = CliArgs::parse();
 
 	let is_dev = cfg!(debug_assertions);
@@ -268,6 +272,9 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	info!("Full log file: {}", log_file.display());
 
 	info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+	if !arenas_limited {
+		warn!("glibc did not take the malloc arena cap, so freed memory may stay with the process");
+	}
 
 	ui.initialize(
 		cli_args.quiet,

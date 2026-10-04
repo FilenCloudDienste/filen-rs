@@ -82,6 +82,10 @@ manuel = { git = "https://github.com/JupiterPi/manuel" }
 [target.'cfg(target_os = "linux")'.dependencies]
 rexpect = "0.6.2"
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+# glibc's malloc tuning, see src/memory.rs
+libc = "0.2.188"
+
 [features]
 default = []
 is_docker = []
