@@ -651,7 +651,7 @@ impl UI {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
 	use std::sync::Mutex;
 
 	use super::*;
@@ -659,7 +659,7 @@ mod tests {
 	/// What a UI printed. Its clones are handles to one buffer, so the test keeps one to read back
 	/// what the UI wrote through another.
 	#[derive(Clone, Default)]
-	struct Printed(Arc<Mutex<Vec<u8>>>);
+	pub(crate) struct Printed(Arc<Mutex<Vec<u8>>>);
 
 	impl Write for Printed {
 		fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -673,13 +673,23 @@ mod tests {
 	}
 
 	impl Printed {
+		/// A UI that prints into this buffer.
+		pub(crate) fn ui(&self) -> UI {
+			UI::with_writer(self.clone())
+		}
+
 		/// The printed lines joined by `\n`, without the one ending the last line.
-		fn lines(&self) -> String {
+		pub(crate) fn lines(&self) -> String {
 			let bytes = self.0.lock().unwrap();
 			let text = str::from_utf8(&bytes).unwrap();
 			text.strip_suffix('\n').unwrap().to_owned()
 		}
 	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{test_support::Printed, *};
 
 	// run using: cargo insta test --review -- --test test_ui
 
@@ -707,7 +717,7 @@ mod tests {
 
 		fn printed(terminal_width: usize) -> String {
 			let printed = Printed::default();
-			let mut ui = UI::with_writer(printed.clone());
+			let mut ui = printed.ui();
 			ui.initialize(false, false, Some(terminal_width), true, false);
 			test(&mut ui);
 			printed.lines()
