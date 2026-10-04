@@ -1620,6 +1620,11 @@ impl BaselineStore {
 	/// remote view, and the baseline row is the written state it folds. A crash between them leaves
 	/// the next pass either re-doing the write or folding a row that describes nothing.
 	///
+	/// The same transaction retires `expired`, the journal rows the in-memory journal has just
+	/// dropped as past their grace ([`PendingWrites::expire`](super::engine::PendingWrites::expire)),
+	/// so the table holds the window memory does. Before the write's own row: a uuid written again
+	/// once its earlier record expired is named there too.
+	///
 	/// Fails loudly rather than waiting when another connection holds the write lock: the remote
 	/// write this journals has already happened (see [`record_write`]).
 	pub(crate) fn record_pending(
@@ -1629,6 +1634,7 @@ impl BaselineStore {
 		kind: &PendingKind,
 		recorded_at: i64,
 		changes: &[BaselineChange<'_>],
+		expired: &[Uuid],
 	) -> rusqlite::Result<()> {
 		record_write(
 			pair,
@@ -1644,7 +1650,7 @@ impl BaselineStore {
 					describe_changes(changes)
 				)
 			},
-			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes),
+			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes, expired),
 		)
 	}
 
@@ -1655,8 +1661,10 @@ impl BaselineStore {
 		kind: &PendingKind,
 		recorded_at: i64,
 		changes: &[BaselineChange<'_>],
+		expired: &[Uuid],
 	) -> rusqlite::Result<()> {
 		let tx = self.conn.unchecked_transaction()?;
+		self.delete_pending_rows(expired)?;
 		let (kind_id, path, replaced, from_path, to_path) = match kind {
 			PendingKind::Created { path, replaced } => {
 				(KIND_CREATED, Some(path.as_str()), *replaced, None, None)
@@ -1822,17 +1830,21 @@ impl BaselineStore {
 			|| format!("the retirement of {} journal row(s)", uuids.len()),
 			|| {
 				let tx = self.conn.unchecked_transaction()?;
-				{
-					let mut stmt = self
-						.conn
-						.prepare_cached("DELETE FROM pending_writes WHERE uuid = ?1")?;
-					for uuid in uuids {
-						stmt.execute(params![uuid])?;
-					}
-				}
+				self.delete_pending_rows(uuids)?;
 				tx.commit()
 			},
 		)
+	}
+
+	/// The DELETEs behind [`delete_pending`](Self::delete_pending), inside the caller's transaction.
+	fn delete_pending_rows(&self, uuids: &[Uuid]) -> rusqlite::Result<()> {
+		let mut stmt = self
+			.conn
+			.prepare_cached("DELETE FROM pending_writes WHERE uuid = ?1")?;
+		for uuid in uuids {
+			stmt.execute(params![uuid])?;
+		}
+		Ok(())
 	}
 
 	/// The journal a previous engine left behind, minus the rows no engine may act on any more —
@@ -2037,7 +2049,7 @@ mod tests {
 				.unwrap();
 			let started = std::time::Instant::now();
 			let error = writer
-				.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+				.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
 				.expect_err("the contended journal write must fail rather than wait for the lock");
 			assert!(
 				is_write_lock_contention(&error),
@@ -2054,7 +2066,7 @@ mod tests {
 		// With the lock free the same write lands, so the failure above was the contention and not a
 		// connection this test broke.
 		writer
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
 			.expect("the write must land once the lock is free");
 		assert_eq!(pending_count(&writer), 1);
 
@@ -2420,7 +2432,7 @@ mod tests {
 		let uuids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
 		for uuid in &uuids {
 			store
-				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[])
+				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[], &[])
 				.unwrap();
 		}
 
@@ -2434,6 +2446,68 @@ mod tests {
 				.map(|row| row.uuid)
 				.collect::<Vec<_>>(),
 			vec![uuids[3]]
+		);
+	}
+
+	/// The records the in-memory journal dropped as past their grace leave the DB in the
+	/// transaction that journals the next write, so the table holds the window memory does.
+	#[test]
+	fn journalling_a_write_retires_the_expired_records_it_names() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let uuids: Vec<Uuid> = (1..=4).map(Uuid::from_u128).collect();
+		for uuid in &uuids[..3] {
+			store
+				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[], &[])
+				.unwrap();
+		}
+
+		store
+			.record_pending(pair, uuids[3], &created("b.txt"), NOW, &[], &uuids[..2])
+			.unwrap();
+		assert_eq!(
+			store
+				.load_pending(NOW, GRACE)
+				.unwrap()
+				.iter()
+				.map(|row| row.uuid)
+				.collect::<BTreeSet<_>>(),
+			BTreeSet::from([uuids[2], uuids[3]])
+		);
+	}
+
+	/// A uuid written twice minutes apart — a file moved, then moved again — names its own expired
+	/// record among the ones to retire. The retirement runs first, or the transaction would drop
+	/// the write it is journalling.
+	#[test]
+	fn a_write_whose_own_earlier_record_expired_survives_its_retirement() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let uuid = Uuid::from_u128(1);
+		let moved = |from: &str, to: &str| PendingKind::Moved {
+			from: from.to_string(),
+			to: to.to_string(),
+		};
+		store
+			.record_pending(pair, uuid, &moved("a.txt", "b.txt"), NOW, &[], &[])
+			.unwrap();
+
+		let later = NOW + GRACE + 1;
+		store
+			.record_pending(pair, uuid, &moved("b.txt", "c.txt"), later, &[], &[uuid])
+			.unwrap();
+		assert_eq!(
+			store.load_pending(later, GRACE).unwrap(),
+			vec![PendingRow {
+				pair,
+				uuid,
+				kind: moved("b.txt", "c.txt"),
+				recorded_at: later,
+			}]
 		);
 	}
 
@@ -2813,6 +2887,7 @@ mod tests {
 					BaselineChange::Upsert(&file_entry("B/x.txt", [4; 32], 4)),
 					BaselineChange::Delete("B/sub/y.txt"),
 				],
+				&[],
 			)
 			.unwrap();
 		agrees(&store, "record_pending");
@@ -3049,6 +3124,7 @@ mod tests {
 					&created(&path),
 					NOW,
 					&[BaselineChange::Upsert(&file_entry(&path, [2; 32], n))],
+					&[],
 				)
 				.unwrap();
 		}
@@ -3163,6 +3239,7 @@ mod tests {
 				&created("boom.txt"),
 				NOW,
 				&[BaselineChange::Upsert(&boom)],
+				&[],
 			)
 			.expect_err("the insert trigger must refuse the row this journals");
 		agrees("record_pending");
@@ -3737,6 +3814,7 @@ mod tests {
 					&created("a.txt"),
 					NOW,
 					&[BaselineChange::Upsert(&entry)],
+					&[],
 				)
 				.unwrap();
 			pair
@@ -3791,7 +3869,9 @@ mod tests {
 		];
 		let uuids: Vec<Uuid> = kinds.iter().map(|_| Uuid::new_v4()).collect();
 		for (uuid, kind) in uuids.iter().zip(&kinds) {
-			store.record_pending(pair, *uuid, kind, NOW, &[]).unwrap();
+			store
+				.record_pending(pair, *uuid, kind, NOW, &[], &[])
+				.unwrap();
 		}
 
 		let mut loaded = store.load_pending(NOW, GRACE).unwrap();
@@ -3817,11 +3897,12 @@ mod tests {
 				&created("old.txt"),
 				NOW - GRACE - 1,
 				&[],
+				&[],
 			)
 			.unwrap();
 		let fresh = Uuid::new_v4();
 		store
-			.record_pending(pair, fresh, &created("new.txt"), NOW - 1_000, &[])
+			.record_pending(pair, fresh, &created("new.txt"), NOW - 1_000, &[], &[])
 			.unwrap();
 
 		let loaded = store.load_pending(NOW, GRACE).unwrap();
@@ -3843,11 +3924,11 @@ mod tests {
 			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
 			.unwrap();
 		let kept = Uuid::new_v4();
 		store
-			.record_pending(other, kept, &created("b.txt"), NOW, &[])
+			.record_pending(other, kept, &created("b.txt"), NOW, &[], &[])
 			.unwrap();
 
 		store.delete_pair(pair).unwrap();
@@ -3873,7 +3954,7 @@ mod tests {
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[])
+			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
 			.unwrap();
 
 		store

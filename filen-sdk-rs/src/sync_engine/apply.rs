@@ -996,6 +996,7 @@ async fn commit_dir_move(
 	let committed = kind.clone();
 	let (from, to) = (from.to_string(), to.to_string());
 	let at = Utc::now().timestamp_millis();
+	let expired = ctx.pending.expire();
 	off_store(ctx.store, move |store| {
 		store.record_pending(
 			pair,
@@ -1006,6 +1007,7 @@ async fn commit_dir_move(
 				from: &from,
 				to: &to,
 			}],
+			&expired,
 		)
 	})
 	.await?
@@ -2495,12 +2497,18 @@ async fn upsert_file_baseline(
 /// Journal a remote write together with the baseline rows it produced — ONE transaction, so a
 /// crash cannot leave the write recorded without its state or the state without its record — and
 /// then publish the write to the in-memory journal the current process folds from.
+///
+/// Every journalled write first drops the records past their grace, from memory and then, in that
+/// same transaction, from the DB ([`PendingWrites::expire`]): a pass keeps about one grace window
+/// of its writes however long it runs. A transaction that fails leaves those rows in the DB, and
+/// the next open drops them as expired.
 async fn commit_remote_write(
 	ctx: &ApplyContext<'_>,
 	uuid: Uuid,
 	kind: PendingKind,
 	changes: &[BaselineChange<'_>],
 ) -> Result<(), crate::Error> {
+	let expired = ctx.pending.expire();
 	locked(ctx.store)
 		.record_pending(
 			ctx.pair,
@@ -2508,6 +2516,7 @@ async fn commit_remote_write(
 			&kind,
 			Utc::now().timestamp_millis(),
 			changes,
+			&expired,
 		)
 		.map_err(db_err)?;
 	ctx.pending.record(ctx.observed, ctx.pair, uuid, kind);
@@ -2542,8 +2551,9 @@ async fn commit_trash(
 	}
 	let (pair, committed, paths) = (ctx.pair, kind.clone(), dropped_paths(rel_path, subsumed));
 	let at = Utc::now().timestamp_millis();
+	let expired = ctx.pending.expire();
 	off_store(ctx.store, move |store| {
-		store.record_pending(pair, uuid, &committed, at, &deletes(&paths))
+		store.record_pending(pair, uuid, &committed, at, &deletes(&paths), &expired)
 	})
 	.await?
 	.map_err(db_err)?;

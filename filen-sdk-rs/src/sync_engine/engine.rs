@@ -7,6 +7,7 @@
 use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
+	hash::Hash,
 	mem,
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
@@ -65,6 +66,16 @@ use crate::{
 /// where neither ever arrives — past it the snapshot is believed again, so an item genuinely
 /// deleted elsewhere is picked up late, never ignored.
 const PENDING_CREATE_GRACE: Duration = Duration::from_secs(180);
+
+/// How often the engine's journal — its own recent writes ([`PendingWrites`]) and the cache's
+/// announcements ([`Observations`]) — is swept of what has aged past every question still asked
+/// of it.
+///
+/// Nothing else drops those entries until the next pass, so a long pass would otherwise keep one
+/// per item it wrote or heard about. A sweep walks the whole journal, which is why it runs at most
+/// this often rather than on every write: the journal then holds the grace window's entries plus
+/// at most this interval's.
+const JOURNAL_SWEEP_EVERY: Duration = Duration::from_secs(45);
 
 /// How many CONSECUTIVE failures at one path the engine retries before it stops planning that path
 /// and reports it as [`UnsyncableReason::RepeatedFailure`].
@@ -315,7 +326,8 @@ impl PushTenure {
 ///
 /// The timestamps are what confirms a push no snapshot ever caught as the head (see
 /// [`CONFIRM_TENURE`]). Both are recorded on the cache worker thread, so this type never does more
-/// than take a lock and look a couple of uuids up.
+/// than take a lock and look a couple of uuids up — and, once per [`JOURNAL_SWEEP_EVERY`], drop
+/// what has aged out (see [`ObservationState::sweep`]).
 #[derive(Debug, Default)]
 pub(super) struct Observations(std::sync::Mutex<ObservationState>);
 
@@ -345,14 +357,19 @@ struct ObservationState {
 	/// spurious conflict, cleared with KeepLocal. Persisting it would mean a table for a fact that
 	/// matters for [`MINTED_TTL`].
 	minted: HashMap<Uuid, Instant>,
+	/// When [`ObservationState::sweep`] last ran.
+	swept: Option<Instant>,
 }
 
 impl Observations {
 	/// Record every uuid a committed cache batch touched, and time-stamp what it says about a push
-	/// of ours. Runs on the cache worker thread, so it does nothing but take a lock and insert.
+	/// of ours. Runs on the cache worker thread, so it does nothing but take a lock and insert,
+	/// plus the periodic [`ObservationState::sweep`].
 	fn note(&self, events: &mut dyn Iterator<Item = &CacheEvent<'_>>) {
-		let now = Instant::now();
 		let mut state = self.state();
+		// Read under the lock, after every counter value handed out before it: an announcement that
+		// retires a write is then never older than the write (see `ObservationState::sweep`).
+		let now = Instant::now();
 		for event in events {
 			for uuid in event_uuids(event).into_iter().flatten() {
 				state.see(uuid, now);
@@ -381,24 +398,8 @@ impl Observations {
 		lineage: Option<filen_types::fs::StableUuid>,
 		replaced: Option<Uuid>,
 	) {
-		let now = Instant::now();
-		let mut state = self.state();
-		if let Some(replaced) = replaced {
-			state.drop_push(replaced);
-		}
-		// The cache can announce our own upload before the call that made it has returned; the
-		// announcement map is the only place that moment survives.
-		let announced = state.seen.get(&uuid).map(|(_, at)| *at);
-		state.minted.insert(uuid, now);
-		state.insert_push(
-			uuid,
-			PushTenure {
-				lineage,
-				recorded: now,
-				announced,
-				superseded: None,
-			},
-		);
+		self.state()
+			.watch_push(uuid, lineage, replaced, Instant::now());
 	}
 
 	/// Record a push of ours that the cache announced long enough ago to have stood its
@@ -452,9 +453,12 @@ impl Observations {
 		for uuid in decided.iter().chain(&expired) {
 			state.drop_push(*uuid);
 		}
-		state
-			.minted
-			.retain(|_, at| now.saturating_duration_since(*at) < MINTED_TTL);
+		// The pass after a first sync retires a record per uploaded file here.
+		state.pushes.shrink_to_fit();
+		state.pushes_by_lineage.shrink_to_fit();
+		retain_shrunk(&mut state.minted, |_, at| {
+			now.saturating_duration_since(*at) < MINTED_TTL
+		});
 	}
 
 	/// The current counter — the stamp a write recorded now must be beaten by to retire.
@@ -477,11 +481,9 @@ impl Observations {
 	/// than a write retires it, so everything up to the oldest live write's stamp is dead weight
 	/// (and with no write left, so is the whole map).
 	fn prune_before(&self, oldest: Option<u64>) {
-		let mut state = self.state();
-		match oldest {
-			Some(seq) => state.seen.retain(|_, (stamp, _)| *stamp > seq),
-			None => state.seen.clear(),
-		}
+		retain_shrunk(&mut self.state().seen, |_, (stamp, _)| {
+			oldest.is_some_and(|seq| *stamp > seq)
+		});
 	}
 
 	fn state(&self) -> std::sync::MutexGuard<'_, ObservationState> {
@@ -495,9 +497,61 @@ impl Observations {
 impl ObservationState {
 	/// Stamp one announced uuid with the next observation counter and the moment it arrived.
 	fn see(&mut self, uuid: Uuid, now: Instant) {
+		self.sweep(now);
 		self.seq += 1;
 		let seq = self.seq;
 		self.seen.insert(uuid, (seq, now));
+	}
+
+	/// Drop the announcements and the minted uuids nothing will ask about again, at most once per
+	/// [`JOURNAL_SWEEP_EVERY`]. Only the next pass would prune either otherwise, so a long pass
+	/// would keep one of each per item it uploaded or heard about.
+	///
+	/// An announcement retires only a write it is no older than: [`PendingWrites::record`] reads the
+	/// clock before the counter and [`Observations::note`] after it. No write outlives
+	/// [`PENDING_CREATE_GRACE`], so neither does any announcement a write could still need. (A write
+	/// restored at open is dated back by its age, and an announcement that arrives while the engine
+	/// opens can be older than that date by as long as the open took; such a write runs out its
+	/// grace that much later than the announcement, so dropping the announcement only lets the
+	/// grace retire the write instead.) The other reader, [`Observations::watch_push`], looks only
+	/// for an announcement that beat the upload call's own response.
+	fn sweep(&mut self, now: Instant) {
+		if !sweep_due(&mut self.swept, now) {
+			return;
+		}
+		retain_shrunk(&mut self.seen, |_, (_, at)| {
+			now.saturating_duration_since(*at) < PENDING_CREATE_GRACE
+		});
+		retain_shrunk(&mut self.minted, |_, at| {
+			now.saturating_duration_since(*at) < MINTED_TTL
+		});
+	}
+
+	/// [`Observations::watch_push`], at `now`.
+	fn watch_push(
+		&mut self,
+		uuid: Uuid,
+		lineage: Option<filen_types::fs::StableUuid>,
+		replaced: Option<Uuid>,
+		now: Instant,
+	) {
+		self.sweep(now);
+		if let Some(replaced) = replaced {
+			self.drop_push(replaced);
+		}
+		// The cache can announce our own upload before the call that made it has returned; the
+		// announcement map is the only place that moment survives.
+		let announced = self.seen.get(&uuid).map(|(_, at)| *at);
+		self.minted.insert(uuid, now);
+		self.insert_push(
+			uuid,
+			PushTenure {
+				lineage,
+				recorded: now,
+				announced,
+				superseded: None,
+			},
+		);
 	}
 
 	/// Start watching a push, filed under its lineage as well as its own uuid.
@@ -659,10 +713,18 @@ fn observed_confirmations(
 
 /// Remote writes this engine made recently. The apply layer records every item it creates or
 /// moves; [`settle`](PendingWrites::settle) drops the records the cache has demonstrably caught up
-/// to and the ones past [`PENDING_CREATE_GRACE`], so the map only ever holds one grace window of
-/// writes.
+/// to and the ones past [`PENDING_CREATE_GRACE`], and [`expire`](PendingWrites::expire) drops the
+/// latter as the writes after them are recorded, so the map holds about one grace window of writes
+/// even while a long pass is still making them.
 #[derive(Debug, Default)]
-pub(super) struct PendingWrites(std::sync::Mutex<HashMap<Uuid, PendingWrite>>);
+pub(super) struct PendingWrites(std::sync::Mutex<Journal>);
+
+#[derive(Debug, Default)]
+struct Journal {
+	writes: HashMap<Uuid, PendingWrite>,
+	/// When [`PendingWrites::expire`] last swept `writes`.
+	swept: Option<Instant>,
+}
 
 impl PendingWrites {
 	/// Record a remote write this pass just made. The apply layer persists the same write to the
@@ -674,7 +736,10 @@ impl PendingWrites {
 		uuid: Uuid,
 		kind: PendingKind,
 	) {
-		self.insert(pair, uuid, kind, observations.stamp(), Instant::now());
+		// The clock before the counter: an announcement that retires this write is then never
+		// older than it, which is what lets the old announcements go (see `ObservationState::sweep`).
+		let at = Instant::now();
+		self.insert(pair, uuid, kind, observations.stamp(), at);
 	}
 
 	/// Take a write a PREVIOUS engine journalled back into memory, `age` after it was made.
@@ -693,8 +758,37 @@ impl PendingWrites {
 		self.insert(pair, uuid, kind, 0, at);
 	}
 
+	/// Drop the records past [`PENDING_CREATE_GRACE`] and return their uuids, for the transaction
+	/// that journals the next write to retire from the DB as well
+	/// ([`BaselineStore::record_pending`]).
+	///
+	/// `settle`'s grace rule, applied as the apply journals each write instead of at the next pass:
+	/// a pass that writes for hours would otherwise keep every record it made until it ends. The
+	/// rule reads a record by itself, so it drops whichever pair's records it finds. A sweep walks
+	/// every record, so it runs at most once per [`JOURNAL_SWEEP_EVERY`] and returns nothing in
+	/// between.
+	pub(super) fn expire(&self) -> Vec<Uuid> {
+		self.expire_at(Instant::now())
+	}
+
+	fn expire_at(&self, now: Instant) -> Vec<Uuid> {
+		let mut journal = self.journal();
+		if !sweep_due(&mut journal.swept, now) {
+			return Vec::new();
+		}
+		let mut expired = Vec::new();
+		retain_shrunk(&mut journal.writes, |uuid, write| {
+			let live = now.duration_since(write.at) < PENDING_CREATE_GRACE;
+			if !live {
+				expired.push(*uuid);
+			}
+			live
+		});
+		expired
+	}
+
 	fn insert(&self, pair: PairId, uuid: Uuid, kind: PendingKind, seq: u64, at: Instant) {
-		self.map().insert(
+		self.journal().writes.insert(
 			uuid,
 			PendingWrite {
 				at,
@@ -708,18 +802,18 @@ impl PendingWrites {
 	/// The uuids currently journalled, for diffing what a [`settle`](Self::settle) retired — and for
 	/// the probe, which has to show that the record it is timing a fold over is actually there.
 	pub(super) fn uuids(&self) -> std::collections::HashSet<Uuid> {
-		self.map().keys().copied().collect()
+		self.journal().writes.keys().copied().collect()
 	}
 
 	/// Drop every record for `pair` — the pair is gone, so nothing may fold on its behalf (a
 	/// re-registration of the same roots gets the same id back).
 	fn forget_pair(&self, pair: PairId) {
-		self.map().retain(|_, write| write.pair != pair);
+		retain_shrunk(&mut self.journal().writes, |_, write| write.pair != pair);
 	}
 
 	/// The oldest live write's observation stamp, for pruning [`Observations`].
 	fn oldest_stamp(&self) -> Option<u64> {
-		self.map().values().map(|write| write.seq).min()
+		self.journal().writes.values().map(|write| write.seq).min()
 	}
 
 	/// Drop the records the cache has demonstrably caught up to and the ones past
@@ -737,7 +831,8 @@ impl PendingWrites {
 		remote: &impl Nodes<Node = RemoteNode>,
 	) -> plan::PassHolds {
 		let now = Instant::now();
-		let mut map = self.map();
+		let mut journal = self.journal();
+		let map = &mut journal.writes;
 		// Only this pair's OWN records consult the snapshot, and indexing every remote node for a
 		// pass that journalled none is the whole cost of this call on a large tree. The two rules
 		// above the pair check read the record by itself, so they still run — from an empty index —
@@ -751,7 +846,7 @@ impl PendingWrites {
 			} else {
 				HashMap::new()
 			};
-		map.retain(|uuid, write| {
+		retain_shrunk(map, |uuid, write| {
 			// The cache announced this uuid after we wrote it: it has caught up, whether the item
 			// still exists, was superseded by a re-upload, or has since been trashed.
 			if observed.get(uuid).is_some_and(|stamp| *stamp > write.seq) {
@@ -807,7 +902,8 @@ impl PendingWrites {
 		baseline: &Baseline,
 		nodes: &impl NodesAt<Node = RemoteNode>,
 	) -> Vec<(Uuid, String, Uuid, Uuid)> {
-		self.map()
+		self.journal()
+			.writes
 			.iter()
 			.filter(|(_, write)| write.pair == pair)
 			.filter_map(|(uuid, write)| {
@@ -830,7 +926,7 @@ impl PendingWrites {
 
 	/// Drop one record: whatever it was waiting for has been answered another way.
 	fn retire(&self, uuid: Uuid) {
-		self.map().remove(&uuid);
+		self.journal().writes.remove(&uuid);
 	}
 
 	/// Fold this pair's surviving records into `nodes` — the path-keyed remote view built from the
@@ -857,9 +953,12 @@ impl PendingWrites {
 		nodes: &mut Side<RemoteNode>,
 		changed: &mut BTreeSet<String>,
 	) -> usize {
-		let map = self.map();
-		let mut writes: Vec<(&Uuid, &PendingWrite)> =
-			map.iter().filter(|(_, write)| write.pair == pair).collect();
+		let journal = self.journal();
+		let mut writes: Vec<(&Uuid, &PendingWrite)> = journal
+			.writes
+			.iter()
+			.filter(|(_, write)| write.pair == pair)
+			.collect();
 		if writes.is_empty() {
 			return 0;
 		}
@@ -891,12 +990,30 @@ impl PendingWrites {
 		folded
 	}
 
-	fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, PendingWrite>> {
+	fn journal(&self) -> std::sync::MutexGuard<'_, Journal> {
 		// Plain data behind the lock: a panic while holding it cannot leave the map inconsistent.
 		self.0
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
+}
+
+/// Whether a sweep last run at `swept` is due again at `now` — once per [`JOURNAL_SWEEP_EVERY`] —
+/// and if so, date it `now`.
+fn sweep_due(swept: &mut Option<Instant>, now: Instant) -> bool {
+	if swept.is_some_and(|swept| now.saturating_duration_since(swept) < JOURNAL_SWEEP_EVERY) {
+		return false;
+	}
+	*swept = Some(now);
+	true
+}
+
+/// [`HashMap::retain`], then hand back the capacity the dropped entries held. A map never shrinks
+/// by itself, so a journal map that once held a first sync's worth of records would keep that much
+/// allocated for as long as the engine runs, long after every record in it was retired.
+fn retain_shrunk<K: Eq + Hash, V>(map: &mut HashMap<K, V>, keep: impl FnMut(&K, &mut V) -> bool) {
+	map.retain(keep);
+	map.shrink_to_fit();
 }
 
 /// [`PENDING_CREATE_GRACE`] as the journal stores it: wall-clock millis.
@@ -5950,6 +6067,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		alloc_meter,
 		auth::test_support::offline_client,
 		cache::CacheState,
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
@@ -9040,6 +9158,7 @@ mod tests {
 					&created("a.txt", None),
 					Utc::now().timestamp_millis(),
 					&[BaselineChange::Upsert(&baseline["a.txt"])],
+					&[],
 				)
 				.unwrap();
 			pair
@@ -11219,6 +11338,98 @@ mod tests {
 		assert!(
 			observations.snapshot().is_empty(),
 			"with no pending write left there is nothing to remember at all"
+		);
+	}
+
+	/// A long pass journals one record per remote write, and no settle runs until the next pass.
+	/// A record past [`PENDING_CREATE_GRACE`] is one no settle would keep, so it goes as the
+	/// writes after it are journalled: however many writes a pass makes, it holds about one grace
+	/// window of them.
+	#[test]
+	fn a_long_pass_holds_about_one_grace_window_of_its_writes() {
+		const WRITES: u32 = 20_000;
+		let pending = PendingWrites::default();
+		let start = Instant::now();
+		let ((), peak) = alloc_meter::peak_bytes(|| {
+			// One write a second, so all but the last few minutes' worth are past the grace by the
+			// end — journalled the way the apply does it, retiring what has expired first.
+			for i in 0..WRITES {
+				let at = start + Duration::from_secs(u64::from(i));
+				pending.expire_at(at);
+				pending.insert(
+					PAIR,
+					Uuid::from_u128(u128::from(i)),
+					created(&format!("dir/file-{i}.txt"), None),
+					u64::from(i),
+					at,
+				);
+			}
+		});
+		assert!(
+			peak < 128 * 1024,
+			"journalling {WRITES} writes held {peak} bytes at once"
+		);
+	}
+
+	/// The pass after a first sync is what retires that sync's push records: it persists what the
+	/// announcements confirmed and forgets them, and with no pending write left it keeps none of
+	/// the announcements either. A map keeps its capacity when its entries go, so the journal has
+	/// to hand that back too, or an idle watch keeps a whole first sync's worth of it allocated.
+	#[test]
+	fn a_settled_push_journal_gives_its_memory_back() {
+		const PUSHES: u32 = 20_000;
+		let observations = Observations::default();
+		// On some platforms the lock allocates on first use, which is not what is measured here.
+		observations.stamp();
+		let uuids: Vec<Uuid> = (0..PUSHES)
+			.map(|i| Uuid::from_u128(u128::from(i)))
+			.collect();
+		let start = Instant::now();
+		// One upload every 150 ms, each announced by the cache as it lands.
+		let at = |i: u32| start + Duration::from_millis(150) * i;
+		let ((), retained) = alloc_meter::net_bytes(|| {
+			{
+				let mut state = observations.state();
+				for (i, uuid) in (0..PUSHES).zip(&uuids) {
+					state.see(*uuid, at(i));
+					state.watch_push(*uuid, Some(StableUuid::new_for_test(*uuid)), None, at(i));
+				}
+			}
+			// The pass after it, once nothing it uploaded is recent enough to be asked about: every
+			// push confirmed and persisted, and every pending write retired.
+			let settled = at(PUSHES) + MINTED_TTL;
+			observations.forget_pushes(&uuids, settled);
+			observations.prune_before(None);
+		});
+		assert_eq!(
+			retained, 0,
+			"the journal kept bytes allocated for {PUSHES} pushes it has retired"
+		);
+	}
+
+	/// A long pass is announced item by item, and an announcement is only ever consulted by a
+	/// write inside the grace window. Older ones go as new ones arrive, so however long the pass,
+	/// the journal holds about one grace window of announcements.
+	#[test]
+	fn a_long_stream_of_announcements_holds_about_one_grace_window_of_them() {
+		const ANNOUNCED: u32 = 20_000;
+		let observations = Observations::default();
+		observations.stamp();
+		let start = Instant::now();
+		let ((), peak) = alloc_meter::peak_bytes(|| {
+			let mut state = observations.state();
+			for i in 0..ANNOUNCED {
+				state.see(
+					Uuid::from_u128(u128::from(i)),
+					start + Duration::from_millis(150) * i,
+				);
+			}
+		});
+		// The window is 1,500 announcements of 40 bytes. The rest is the map: a swept one grows
+		// over the slots its removals leave behind, so it briefly holds two tables at twice that.
+		assert!(
+			peak < 320 * 1024,
+			"{ANNOUNCED} announcements held {peak} bytes at once"
 		);
 	}
 
