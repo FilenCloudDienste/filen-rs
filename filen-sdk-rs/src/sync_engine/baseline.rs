@@ -1776,7 +1776,7 @@ impl BaselineStore {
 	}
 
 	/// Forget the failure streaks of every path in `rel_paths`, in ONE transaction: a pass clears
-	/// one per path it applied, and each on its own is a commit of its own.
+	/// one per streak its actions ended, and each on its own is a commit of its own.
 	pub(crate) fn clear_failures(&self, pair: PairId, rel_paths: &[&str]) -> rusqlite::Result<()> {
 		let tx = self.conn.unchecked_transaction()?;
 		{
