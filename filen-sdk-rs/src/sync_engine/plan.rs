@@ -3560,7 +3560,7 @@ fn action_phase(action: &SyncAction, replaced: &HashSet<String>) -> u8 {
 			kind: NodeKind::File,
 			..
 		} if replaced.contains(action.rel_path()) => PHASE_FILE_REPLACE_DELETE,
-		// Baseline bookkeeping, no transfer/dependency — order is irrelevant; runs in `pre`.
+		// Baseline bookkeeping, no transfer/dependency — order is irrelevant.
 		SyncAction::AdoptBaseline { .. } => PHASE_CREATE,
 		// Directories that may host a move/transfer destination — created early, parent-before-child.
 		SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => PHASE_CREATE,
@@ -3609,9 +3609,8 @@ pub(super) fn replaced_paths<'a>(
 	index.extend(paths(index_deletions));
 	paths(!index_deletions)
 		.filter(|path| index.contains(path))
-		// Owned, not borrowed from `actions`: `order_actions` sorts them, and `apply` and the guard's
-		// `screen` move out of them, while the set is still read. It holds only the type flips,
-		// usually none.
+		// Owned, not borrowed from `actions`: `order_actions` sorts them while the set is still read.
+		// It holds only the type flips, usually none.
 		.map(str::to_owned)
 		.collect()
 }

@@ -45,7 +45,7 @@ use tracing::Instrument;
 
 use super::{
 	SyncEvent, SyncObserver, SyncReport,
-	apply::{LOCK_FAILURE, STORE_FAILURE},
+	apply::LOCK_FAILURE,
 	baseline::PairId,
 	changes::{FullPassReason, PairChanges},
 	engine::SyncEngine,
@@ -784,8 +784,10 @@ fn net_interval(floor: Duration, cost: Duration) -> Duration {
 /// A pass that could not take the drive lock returns a report but applied nothing, so it is a
 /// failed pass. Its backoff is the retry timer, which is why it owes no re-armed trigger on top.
 /// A pass [`halted`](SyncReport::halted) for want of space is a failed pass too, so it backs off.
-/// So is one whose baseline or journal write did not land (`store_failed`): the act that write was
-/// recording stands, and the next pass would run straight into the same wedged store.
+/// So is one whose baseline or journal write did not land, or whose staged plan could not be read
+/// (`store_failed`): the act that write was recording stands, and the next pass would run straight
+/// into the same wedged store, or stage its plan beside it on the same disk. Each publishes a line
+/// of its own ([`StoreFailure::line`](super::apply::StoreFailure::line)).
 fn pass_outcome(report: SyncReport) -> PassEnd {
 	let read_whole = read_both_sides_whole(&report);
 	let read_cost = report.read_cost;
@@ -793,7 +795,7 @@ fn pass_outcome(report: SyncReport) -> PassEnd {
 		let error = report
 			.halted
 			.map(|reason| reason.held_line())
-			.or_else(|| report.store_failed.then(|| STORE_FAILURE.to_string()));
+			.or_else(|| report.store_failed.map(|failure| failure.line().into()));
 		return PassEnd {
 			error,
 			owed: owes_a_pass(&report),
@@ -969,7 +971,9 @@ mod tests {
 	};
 	use crate::{
 		Error, ErrorKind,
-		sync_engine::apply::{LOCK_FAILURE, STORE_FAILURE, note_lock_failure},
+		sync_engine::apply::{
+			LOCK_FAILURE, STORE_FAILURE, StoreFailure, UNREAD_PLAN, note_lock_failure,
+		},
 	};
 
 	fn watch_limit() -> notify::Error {
@@ -1617,7 +1621,7 @@ mod tests {
 	fn a_pass_whose_record_did_not_land_counts_as_a_failure() {
 		let report = SyncReport {
 			uploaded: 1,
-			store_failed: true,
+			store_failed: Some(StoreFailure::RecordNotWritten),
 			..SyncReport::default()
 		};
 		let end = pass_outcome(report);
@@ -1626,6 +1630,23 @@ mod tests {
 			Some(STORE_FAILURE),
 			"a pass that lost a record must publish a cause, not read as healthy"
 		);
+		assert!(
+			!end.owed,
+			"a failed pass is retried on the backoff, not re-armed at the debounce"
+		);
+	}
+
+	/// A pass that could not read its staged plan is a failed pass too, and publishes that it could
+	/// not READ its plan: no record of work it did went missing.
+	#[test]
+	fn a_pass_whose_plan_could_not_be_read_counts_as_a_failure_of_its_own() {
+		let report = SyncReport {
+			uploaded: 1,
+			store_failed: Some(StoreFailure::UnreadPlan),
+			..SyncReport::default()
+		};
+		let end = pass_outcome(report);
+		assert_eq!(end.error.as_deref(), Some(UNREAD_PLAN));
 		assert!(
 			!end.owed,
 			"a failed pass is retried on the backoff, not re-armed at the debounce"
