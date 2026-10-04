@@ -131,16 +131,26 @@ impl Client {
 		file: &mut RemoteFile,
 		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
+		self.inner_move_file(file, new_parent.uuid()).await
+	}
+
+	/// [`move_file`](Self::move_file) into the directory `new_parent`, by its uuid alone, which is
+	/// all a move reads of it.
+	pub(crate) async fn inner_move_file(
+		&self,
+		file: &mut RemoteFile,
+		new_parent: Uuid,
+	) -> Result<(), Error> {
 		let lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(
 			self.client(),
 			&api::v3::file::r#move::Request {
 				uuid: file.uuid(),
-				new_parent: new_parent.uuid(),
+				new_parent,
 			},
 		)
 		.await?;
-		file.parent = (new_parent.uuid()).into();
+		file.parent = new_parent.into();
 		// Mirror the moved file's metadata into the new parent's shares/links (as
 		// upload does); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in file.

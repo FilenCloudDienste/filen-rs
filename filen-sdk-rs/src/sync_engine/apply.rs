@@ -48,12 +48,11 @@ use super::{
 };
 use crate::{
 	auth::Client,
-	cache::SearchResult,
+	cache::{SearchResult, hydrate_cached_items_at},
 	fs::{
 		HasUUID,
-		categories::{DirType, Normal},
-		dir::{cache::CacheableDir, meta::DirectoryMetaChanges},
-		file::{cache::CacheableFile, meta::FileMetaChanges},
+		dir::meta::DirectoryMetaChanges,
+		file::{FileBuilderOptionalName, meta::FileMetaChanges},
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
 	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock},
@@ -233,6 +232,17 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) store: &'a SharedStore,
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
+	/// The cache DB each page of the plan reads the remote objects it acts on from (see
+	/// [`PageObjects::hydrate`]); `None` when the client has no cache configured, and every action
+	/// then asks the server for its own.
+	///
+	/// Taken from the client once, before the first action, because the client's cache slot is a
+	/// lock a page turn must never wait on. A page turns with transfers in flight, which only the
+	/// apply's own loop polls, and [`Client::flush_cache`] holds the slot until the cache worker
+	/// has exited: a worker in the middle of a resync listing exits once its requests are answered,
+	/// and those wait on request permits the transfers in flight hold. The pass and the flush would
+	/// each wait on the other for good.
+	pub(super) cache_db: Option<PathBuf>,
 	/// Whether this pass's absence evidence is trustworthy (see
 	/// [`ScreenState::absence_trusted`](super::guard::ScreenState::absence_trusted)) — gates
 	/// dropping a baseline row because both sides look gone.
@@ -267,7 +277,8 @@ pub(super) struct PlannedEntry {
 ///
 /// The inputs are: the local and the remote node at the action's path (a move's destination), the
 /// baseline row there and at the path a move starts from, and `parent_uuid`, the remote directory
-/// the view listed at the parent of the action's path.
+/// the view listed at the parent of the action's path — where it lands, unless this pass created a
+/// directory there (see [`PagedPlan::parent_of`]).
 ///
 /// Nodes and rows boxed: a kind reads at most three of them, and slots holding each inline would
 /// cost every entry the room of the largest variant.
@@ -417,8 +428,8 @@ impl PlannedEntry {
 }
 
 impl PassStart {
-	/// What the apply reads for `action` — in `apply_one`, `apply_transfer` and
-	/// `resolve_folded_objects` — read out of `inputs`, and nothing else.
+	/// What the apply reads for `action` — in `apply_one`, `apply_transfer` and `Wanted::of` — read
+	/// out of `inputs`, and nothing else.
 	pub(super) fn of(action: &SyncAction, inputs: &mut impl StartInputs) -> Self {
 		let path = action.rel_path();
 		match action {
@@ -605,7 +616,8 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 }
 
 /// Execute the staged `plan` (guard-screened, ordered in its stage) against the remote and local
-/// tree, reading it a page at a time in the order the stage gives it (see [`StagedPlan`]).
+/// tree, reading it a page at a time in the order the stage gives it (see [`StagedPlan`]), with the
+/// remote objects each page acts on (see [`PagedPlan`]).
 ///
 /// Each entry carries what its action reads as the pass started, so the apply reads neither the
 /// pass's rows nor its two sides — and holds no read transaction open behind the commits it makes
@@ -621,9 +633,9 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 ///
 /// File transfers (uploads/downloads) — the bulk of the work and independent of one another — run
 /// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
-/// default 16) and the global request rate limiter. Directory creates/moves (which populate the
-/// parent map and have parent-before-child ordering) and deletes (descendant-first for cascade
-/// safety) stay serial.
+/// default 16) and the global request rate limiter. Directory creates/moves (which make the
+/// directories later actions land in, parent before child) and deletes (descendant-first for
+/// cascade safety) stay serial.
 ///
 /// Each action emits its [`SyncEvent`] to `observer` (and an [`ActionFailed`](SyncEvent::ActionFailed)
 /// if it errors): serial actions when they start, concurrent transfers as each completes.
@@ -640,21 +652,7 @@ pub(super) async fn apply(
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
-	let mut plan = plan.pager();
-	// uuid -> the remote file object, for every file this plan acts on: hydrated from the cache
-	// by [`resolve_folded_objects`], and from the server for what this engine wrote and the cache
-	// has not listed yet.
-	let mut files: HashMap<Uuid, RemoteFile> = HashMap::new();
-	// path -> remote directory, for resolving the parent of an item. Seeded with the root at "";
-	// [`resolve_folded_objects`] adds the ones this plan actually names, and a new dir joins as it
-	// is created. Building one for every directory of the tree up front was a `RemoteDirectory`
-	// clone per directory — tens of thousands of them on a large pair — to answer a few lookups.
-	let mut dir_by_path: HashMap<String, RemoteDirectory> = HashMap::new();
-	dir_by_path.insert(String::new(), ctx.root_remote.clone());
-	if let Err(error) = resolve_folded_objects(&ctx, &mut plan, &mut files, &mut dir_by_path).await
-	{
-		note_unread_plan(report, &page_err(error));
-	}
+	let mut plan = PagedPlan::new(plan, ctx.root_remote.uuid());
 
 	// What the pass still owes if it is cancelled part-way: everything it has not carried out.
 	let total = plan.len();
@@ -664,13 +662,13 @@ pub(super) async fn apply(
 	let mut writes = PassWrites::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
-	// Creates and moves first, one at a time: they fill `dir_by_path` and run parent before child.
-	// The deletion half of a type flip runs among them, before the create at its path, or the server
-	// rejects that create (the old item still exists).
+	// Creates and moves first, one at a time: they make the directories the transfers land in, and
+	// run parent before child. The deletion half of a type flip runs among them, before the create at
+	// its path, or the server rejects that create (the old item still exists).
 	while admits_more(report)
 		&& let Some(Staged {
 			entry, releasable, ..
-		}) = unless_unread(plan.next_in(Run::Before), report)
+		}) = unless_unread(plan.next_in(&ctx, Run::Before).await, report)
 	{
 		let action = &entry.action;
 		if !ctx.gate.wait_to_start().await {
@@ -684,16 +682,8 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			if let Some(reason) = apply_serial(
-				&ctx,
-				&entry,
-				&files,
-				&mut dir_by_path,
-				&mut writes,
-				report,
-				observer,
-			)
-			.await
+			if let Some(reason) =
+				apply_serial(&ctx, &entry, &mut plan, &mut writes, report, observer).await
 			{
 				full.note(reason);
 			}
@@ -710,11 +700,13 @@ pub(super) async fn apply(
 			}
 		});
 		if let Err(error) = swept {
-			note_unread_plan(report, &page_err(error));
+			note_unread_plan(report, &error);
 		}
 	}
 
-	if admits_more(report) && unless_unread(next_transfer(&mut plan, &writes), report).is_some() {
+	if admits_more(report)
+		&& unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report).is_some()
+	{
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
 		// Byte progress comes from inside the SDK's transfer futures, which cannot reach the
 		// observer this loop holds: they queue it here and the loop delivers it — between
@@ -726,7 +718,8 @@ pub(super) async fn apply(
 		loop {
 			while in_flight.len() < concurrency
 				&& admits_more(report)
-				&& let Some(staged) = unless_unread(next_transfer(&mut plan, &writes), report)
+				&& let Some(staged) =
+					unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report)
 			{
 				let (action, releasable) = (&staged.entry.action, staged.releasable);
 				// Once an action finds a side full, the transfers already running finish, and the ones
@@ -734,7 +727,7 @@ pub(super) async fn apply(
 				// for want of room: carried out as far as this pass can, owed to no pause.
 				if full.holds(action) {
 					tracing::debug!("apply: {} held, its side is full", action.describe());
-					unless_unread(plan.next_in(Run::Transfers), report);
+					unless_unread(plan.next_in(&ctx, Run::Transfers).await, report);
 					applied += 1;
 					continue;
 				}
@@ -746,13 +739,21 @@ pub(super) async fn apply(
 					break;
 				}
 				let Some(Staged { entry, .. }) =
-					unless_unread(plan.next_in(Run::Transfers), report)
+					unless_unread(plan.next_in(&ctx, Run::Transfers).await, report)
 				else {
 					break;
 				};
+				let target = match plan.transfer_target(&entry) {
+					Ok(target) => target,
+					Err(error) => {
+						applied += 1;
+						note_transfer_failed(&entry.action, &error, &full, report, observer);
+						continue;
+					}
+				};
 				lease.note_start(&entry.action);
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
-				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
+				in_flight.push(run_transfer(&ctx, entry, target, &progress));
 			}
 			let next = tokio::select! {
 				biased;
@@ -767,14 +768,22 @@ pub(super) async fn apply(
 				if !admits_more(report) {
 					break;
 				}
-				if unless_unread(next_transfer(&mut plan, &writes), report).is_none() {
+				if unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report).is_none() {
 					break;
 				}
 				let Some(Staged {
 					entry, releasable, ..
-				}) = unless_unread(plan.next_in(Run::Transfers), report)
+				}) = unless_unread(plan.next_in(&ctx, Run::Transfers).await, report)
 				else {
 					break;
+				};
+				let target = match plan.transfer_target(&entry) {
+					Ok(target) => target,
+					Err(error) => {
+						applied += 1;
+						note_transfer_failed(&entry.action, &error, &full, report, observer);
+						continue;
+					}
 				};
 				match lease.prepare(&ctx, &entry.action, releasable).await {
 					Some(Ok(())) => {}
@@ -784,7 +793,7 @@ pub(super) async fn apply(
 					None => return note_interrupted(report, total - applied, observer),
 				}
 				remote_in_flight += usize::from(mutates_remote(&entry.action));
-				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
+				in_flight.push(run_transfer(&ctx, entry, target, &progress));
 				continue;
 			};
 			remote_in_flight -= usize::from(mutates_remote(&action));
@@ -829,14 +838,7 @@ pub(super) async fn apply(
 				}
 				Err(error) => {
 					applied += 1;
-					tracing::debug!("apply: {} FAILED — {error}", action.describe());
-					observer(SyncEvent::ActionFailed {
-						rel_path: action.rel_path().to_string(),
-						error: error.to_string(),
-					});
-					if let Some(reason) = note_failure(report, action.rel_path(), &error) {
-						full.note(reason);
-					}
+					note_transfer_failed(&action, &error, &full, report, observer);
 				}
 			}
 		}
@@ -846,7 +848,7 @@ pub(super) async fn apply(
 	while admits_more(report)
 		&& let Some(Staged {
 			entry, releasable, ..
-		}) = unless_unread(plan.next_in(Run::After), report)
+		}) = unless_unread(plan.next_in(&ctx, Run::After).await, report)
 	{
 		let action = &entry.action;
 		if !ctx.gate.wait_to_start().await {
@@ -860,16 +862,7 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			apply_serial(
-				&ctx,
-				&entry,
-				&files,
-				&mut dir_by_path,
-				&mut writes,
-				report,
-				observer,
-			)
-			.await;
+			apply_serial(&ctx, &entry, &mut plan, &mut writes, report, observer).await;
 		}
 		applied += 1;
 	}
@@ -878,17 +871,19 @@ pub(super) async fn apply(
 
 /// The next transfer of `plan` to start, past the ones under a directory whose move failed this
 /// pass, which `apply` has already failed.
-fn next_transfer<'p>(
-	plan: &'p mut Pager,
+async fn next_transfer<'p>(
+	plan: &'p mut PagedPlan,
+	ctx: &ApplyContext<'_>,
 	writes: &PassWrites,
-) -> rusqlite::Result<Option<&'p Staged>> {
+) -> Result<Option<&'p Staged>, crate::Error> {
 	while plan
-		.peek_in(Run::Transfers)?
+		.peek_in(ctx, Run::Transfers)
+		.await?
 		.is_some_and(|staged| writes.holds_back(&staged.entry.action).is_some())
 	{
-		plan.next_in(Run::Transfers)?;
+		plan.next_in(ctx, Run::Transfers).await?;
 	}
-	plan.peek_in(Run::Transfers)
+	plan.peek_in(ctx, Run::Transfers).await
 }
 
 /// One transfer, paired with the action it ran and with whatever local copy it moved aside — named
@@ -898,13 +893,12 @@ fn next_transfer<'p>(
 /// the transfer ended in [`Transfer::Done`] or in an error from the bookkeeping that followed its
 /// landed write (see [`apply_transfer`]).
 ///
-/// It owns its entry, so the apply holds the entry of each transfer in flight and the page it reads
-/// from, and nothing else of its plan.
+/// It owns its entry and its target, so the apply holds the entry and the target of each transfer
+/// in flight and the page it reads from, and nothing else of its plan.
 async fn run_transfer(
 	ctx: &ApplyContext<'_>,
 	planned: PlannedEntry,
-	files: &HashMap<Uuid, RemoteFile>,
-	dir_by_path: &HashMap<String, RemoteDirectory>,
+	target: TransferTarget,
 	progress: &UnboundedSender<SyncEvent>,
 ) -> (
 	SyncAction,
@@ -912,16 +906,27 @@ async fn run_transfer(
 	Result<Transfer, crate::Error>,
 ) {
 	let mut quarantined = None;
-	let result = apply_transfer(
-		ctx,
-		&planned,
-		files,
-		dir_by_path,
-		progress,
-		&mut quarantined,
-	)
-	.await;
+	let result = apply_transfer(ctx, &planned, target, progress, &mut quarantined).await;
 	(planned.action, quarantined, result)
+}
+
+/// Record a transfer that failed — its event and its failure (see [`note_failure`]), and the side
+/// it found full, which holds back the transfers after it.
+fn note_transfer_failed(
+	action: &SyncAction,
+	error: &crate::Error,
+	full: &FullSides,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) {
+	tracing::debug!("apply: {} FAILED — {error}", action.describe());
+	observer(SyncEvent::ActionFailed {
+		rel_path: action.rel_path().to_string(),
+		error: error.to_string(),
+	});
+	if let Some(reason) = note_failure(report, action.rel_path(), error) {
+		full.note(reason);
+	}
 }
 
 /// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
@@ -1259,7 +1264,10 @@ impl StoreFailure {
 /// an action makes (the row read back before a download quarantines what sits at its target, which
 /// reaches here through the same `?`). A read that failed lost nothing, so the pass would be failed
 /// for no reason; the consequence is one backoff, which is the safe direction, and separating the
-/// two would mean marking every write for the sake of a read failure nobody has seen.
+/// two would mean marking every write for the sake of a read failure nobody has seen. The read of
+/// where an action lands out of the pass's stage ([`stage_err`]) is failed here on purpose: the
+/// stage is the only record of the directories the pass created, and the pass admits nothing more
+/// once it cannot read it.
 pub(super) fn record_not_written(error: &crate::Error) -> bool {
 	error.downcast_ref::<rusqlite::Error>().is_some()
 }
@@ -1280,17 +1288,170 @@ fn note_interrupted(
 	observer(SyncEvent::Interrupted { actions: remaining });
 }
 
-/// A page of the pass's staged plan that could not be read (see [`unless_unread`]). Its
-/// `rusqlite::Error` stays the source.
+/// The staged plan as the apply takes it: a page at a time, with the remote objects that page acts
+/// on hydrated as it is read (see [`PageObjects`]). What the apply holds of its plan, and of the
+/// remote tree, is then the page in hand.
+///
+/// Every action is taken through [`peek_in`](Self::peek_in) and [`next_in`](Self::next_in), which
+/// turn the page and hydrate it before handing out the first action of it.
+struct PagedPlan {
+	pager: Pager,
+	objects: PageObjects,
+	/// The sync root's uuid: the remote directory every top-level item lands in.
+	root: Uuid,
+}
+
+impl PagedPlan {
+	fn new(plan: StagedPlan, root: Uuid) -> Self {
+		Self {
+			pager: plan.pager(),
+			objects: PageObjects::default(),
+			root,
+		}
+	}
+
+	fn len(&self) -> usize {
+		self.pager.len()
+	}
+
+	/// The next action, when it is in `run`, the objects of its page hydrated. An error is a page
+	/// that could not be read (see [`unless_unread`]).
+	async fn peek_in(
+		&mut self,
+		ctx: &ApplyContext<'_>,
+		run: Run,
+	) -> Result<Option<&Staged>, crate::Error> {
+		if let Some(wanted) = self.turn()? {
+			self.objects.hydrate(ctx, wanted).await;
+		}
+		self.pager.peek_in(run).map_err(page_err)
+	}
+
+	/// Turn to the next page once the one in hand is used up (see [`Pager::turn`]): drop the objects
+	/// the page before acted on, and say what this one acts on, for [`PageObjects::hydrate`]. `None`
+	/// while the page in hand has actions left, and at the end of the plan.
+	fn turn(&mut self) -> Result<Option<Wanted>, crate::Error> {
+		let Some(page) = self.pager.turn().map_err(page_err)? else {
+			return Ok(None);
+		};
+		let wanted = Wanted::of(page);
+		self.objects.clear();
+		Ok(Some(wanted))
+	}
+
+	/// Take the next action, when it is in `run`, the objects of its page hydrated.
+	async fn next_in(
+		&mut self,
+		ctx: &ApplyContext<'_>,
+		run: Run,
+	) -> Result<Option<Staged>, crate::Error> {
+		if self.peek_in(ctx, run).await?.is_none() {
+			return Ok(None);
+		}
+		self.pager.next_in(run).map_err(page_err)
+	}
+
+	/// See [`Pager::sweep`].
+	fn sweep(&self, run: Option<Run>, each: impl FnMut(PlannedEntry)) -> Result<(), crate::Error> {
+		self.pager.sweep(run, each).map_err(page_err)
+	}
+
+	/// The remote file `uuid` an action of the page in hand acts on, if the cache held it when the
+	/// page was read (else see [`file_or_fetch`]).
+	///
+	/// A copy, here and in [`dir`](Self::dir): a trash or a move updates the object it is handed, and
+	/// a transfer runs on past the page; the page's own stays as hydrated for any other action of it
+	/// that names the same object.
+	fn file(&self, uuid: Uuid) -> Option<RemoteFile> {
+		self.objects.files.get(&uuid).cloned()
+	}
+
+	/// The remote directory `uuid` an action of the page in hand acts on, if the cache held it when
+	/// the page was read (else see [`dir_or_fetch`]).
+	fn dir(&self, uuid: Uuid) -> Option<RemoteDirectory> {
+		self.objects.dirs.get(&uuid).cloned()
+	}
+
+	/// The uuid of the remote directory the item at `rel_path` lands in: the sync root for a
+	/// top-level item, the directory this pass created there, or else `listed`, the one the view
+	/// listed there (the entry's `parent_uuid`). `None` where there is none of the three, and the
+	/// action fails.
+	///
+	/// The plan creates a directory only where the view listed none, so at most one of the last two
+	/// answers.
+	///
+	/// An error is a read of the stage that failed, and fails the action that asked, and with it the
+	/// pass (see [`stage_err`]).
+	fn parent_of(
+		&self,
+		rel_path: &str,
+		listed: Option<Uuid>,
+	) -> Result<Option<Uuid>, crate::Error> {
+		let parent = match parent_and_name(rel_path).0 {
+			"" => return Ok(Some(self.root)),
+			parent => parent,
+		};
+		let created = self.pager.created_at(parent).map_err(|error| {
+			stage_err(
+				error,
+				format!("reading the directory created at {parent:?} from the pass's stage"),
+			)
+		})?;
+		Ok(created.or(listed))
+	}
+
+	/// Record the directory the create at `rel_path` made, or merged into, for the actions under it.
+	fn record_created(&mut self, rel_path: &str, uuid: Uuid) -> Result<(), crate::Error> {
+		self.pager.record_created(rel_path, uuid).map_err(|error| {
+			stage_err(
+				error,
+				format!("recording the directory created at {rel_path:?} in the pass's stage"),
+			)
+		})
+	}
+
+	/// What the transfer of `planned` reads that its entry does not carry (see [`TransferTarget`]).
+	/// An error is where an upload lands, which the stage could not read (see
+	/// [`parent_of`](Self::parent_of)): the apply fails that upload without starting it, before it
+	/// counts as a remote write or takes the drive lock for one.
+	fn transfer_target(&self, planned: &PlannedEntry) -> Result<TransferTarget, crate::Error> {
+		Ok(match (&planned.action, &planned.start) {
+			(SyncAction::DownloadFile { remote_uuid, .. }, _) => TransferTarget {
+				file: self.file(*remote_uuid),
+				..TransferTarget::default()
+			},
+			(SyncAction::UploadFile { rel_path }, PassStart::Upload { parent_uuid, .. }) => {
+				TransferTarget {
+					parent: self.parent_of(rel_path, *parent_uuid)?,
+					..TransferTarget::default()
+				}
+			}
+			_ => TransferTarget::default(),
+		})
+	}
+}
+
+/// A read or a write of the pass's stage that failed, as the error of the action that made it. Its
+/// `rusqlite::Error` stays the source, so the action fails as a record that could not be kept, and
+/// the pass with it (see [`record_not_written`]): what the stage holds is the only copy of where the
+/// pass's own directories are.
+fn stage_err(error: rusqlite::Error, context: String) -> crate::Error {
+	super::engine::db_error(error, &context)
+}
+
+/// A page of the pass's staged plan that could not be read (see [`unless_unread`]).
 fn page_err(error: rusqlite::Error) -> crate::Error {
-	super::engine::db_error(error, "reading a page of the pass's staged plan")
+	stage_err(
+		error,
+		"reading a page of the pass's staged plan".to_string(),
+	)
 }
 
 /// What a read of the pass's staged plan found — and for one that failed, nothing more to take,
 /// with the failure recorded (see [`note_unread_plan`]).
-fn unless_unread<T>(read: rusqlite::Result<Option<T>>, report: &mut SyncReport) -> Option<T> {
+fn unless_unread<T>(read: Result<Option<T>, crate::Error>, report: &mut SyncReport) -> Option<T> {
 	read.unwrap_or_else(|error| {
-		note_unread_plan(report, &page_err(error));
+		note_unread_plan(report, &error);
 		None
 	})
 }
@@ -1306,162 +1467,175 @@ fn note_unread_plan(report: &mut SyncReport, error: &crate::Error) {
 	report.store_failed.get_or_insert(StoreFailure::UnreadPlan);
 }
 
-/// Resolve the remote objects this plan acts on that the cache snapshot cannot supply.
+/// What a transfer reads that its entry does not carry, looked up as the apply takes it: the remote
+/// file a download fetches, and the remote directory an upload lands in. Only what the action's kind
+/// reads is filled in. The file is `None` where the cache held none, and the download asks the
+/// server for it (see [`file_or_fetch`]); the parent is `None` where the pass has none, which fails
+/// the upload.
+///
+/// The transfer holds its own copy rather than reading the page's: it runs on while the apply turns
+/// to the next page.
+#[derive(Default)]
+struct TransferTarget {
+	file: Option<RemoteFile>,
+	parent: Option<Uuid>,
+}
+
+/// The uuids of the remote objects one page of the plan acts on (see [`PageObjects`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Wanted {
+	files: HashSet<Uuid>,
+	dirs: HashSet<Uuid>,
+}
+
+impl Wanted {
+	/// What the actions of `page` act on: the file of a download, a file trash or a file move, and
+	/// the directory of a directory trash or move — the one the view listed at its path, which its
+	/// entry carries.
+	fn of<'p>(page: impl Iterator<Item = &'p PlannedEntry>) -> Self {
+		let mut wanted = Self::default();
+		for PlannedEntry { action, start } in page {
+			match (action, start) {
+				(
+					SyncAction::DownloadFile { remote_uuid, .. }
+					| SyncAction::TrashRemote {
+						kind: NodeKind::File,
+						remote_uuid,
+						..
+					}
+					| SyncAction::MoveRemote {
+						kind: NodeKind::File,
+						remote_uuid,
+						..
+					},
+					_,
+				) => {
+					wanted.files.insert(*remote_uuid);
+				}
+				(
+					SyncAction::TrashRemote {
+						kind: NodeKind::Dir,
+						..
+					},
+					PassStart::Remote { remote },
+				)
+				| (
+					SyncAction::MoveRemote {
+						kind: NodeKind::Dir,
+						..
+					},
+					PassStart::MoveRemoteDir { remote, .. },
+				) => wanted.dirs.extend(dir_uuid(remote.as_deref())),
+				_ => {}
+			}
+		}
+		wanted
+	}
+}
+
+/// The remote objects the actions of the page in hand act on, by uuid, as the cache holds them:
+/// read as the page is turned to, and replaced when the next one is.
 ///
 /// The remote view carries the writes this engine made that the cache has not listed yet, so an
-/// action can name an item no snapshot entry describes. The server is authoritative about those
-/// (it minted them), and only the few the plan actually touches are fetched. One that cannot be
-/// fetched is left out: its own action then fails and the pass carries on, exactly as it did when
-/// the snapshot entry was missing.
+/// action can name an item no cache row describes. Those are not here: the action that needs one
+/// asks the server for it (see [`file_or_fetch`]).
 ///
-/// Directories the snapshot DOES describe are built from its rows here, for the same handful of
-/// paths, which is why every parent lookup in the apply below is a path this function was asked
-/// about: the parent of an upload or a create, the target of a trash, and both ends of a move. Each
-/// is the directory the view listed there, as its entry read it (see [`PassStart`]); a path the
-/// view held no directory at is left out, and the action that wanted it fails.
-///
-/// An error is a page of the plan that could not be read, and nothing is resolved then (see
-/// [`note_unread_plan`]).
-async fn resolve_folded_objects(
-	ctx: &ApplyContext<'_>,
-	// `&mut` though only read: a stage's connection is `Send` but not `Sync`, and this future holds
-	// the pager across its awaits.
-	plan: &mut Pager,
-	files: &mut HashMap<Uuid, RemoteFile>,
-	dir_by_path: &mut HashMap<String, RemoteDirectory>,
-) -> rusqlite::Result<()> {
-	let mut wanted_files: HashSet<Uuid> = HashSet::new();
-	// Path -> the directory the view listed there. Every entry naming a path read it from the same
-	// view, so the first answer is every answer.
-	let mut wanted_dirs: HashMap<String, Uuid> = HashMap::new();
-	let mut want_dir = |path: &str, uuid: Option<Uuid>| {
-		if let Some(uuid) = uuid
-			&& !wanted_dirs.contains_key(path)
-		{
-			wanted_dirs.insert(path.to_owned(), uuid);
-		}
-	};
-	plan.sweep(None, |PlannedEntry { action, start }| {
-		match (action, start) {
-			(
-				SyncAction::DownloadFile { remote_uuid, .. }
-				| SyncAction::TrashRemote {
-					kind: NodeKind::File,
-					remote_uuid,
-					..
-				},
-				_,
-			) => {
-				wanted_files.insert(remote_uuid);
-			}
-			(
-				SyncAction::TrashRemote {
-					rel_path,
-					kind: NodeKind::Dir,
-					..
-				},
-				PassStart::Remote { remote },
-			) => want_dir(&rel_path, dir_uuid(remote.as_deref())),
-			(
-				SyncAction::MoveRemote {
-					to_path,
-					kind: NodeKind::File,
-					remote_uuid,
-					..
-				},
-				PassStart::MoveRemoteFile { parent_uuid, .. },
-			) => {
-				wanted_files.insert(remote_uuid);
-				want_dir(parent_and_name(&to_path).0, parent_uuid);
-			}
-			(
-				SyncAction::MoveRemote {
-					to_path,
-					kind: NodeKind::Dir,
-					..
-				},
-				PassStart::MoveRemoteDir {
-					remote,
-					parent_uuid,
-				},
-			) => {
-				// The view already lists the directory at the path it moves to.
-				want_dir(&to_path, dir_uuid(remote.as_deref()));
-				want_dir(parent_and_name(&to_path).0, parent_uuid);
-			}
-			(SyncAction::UploadFile { rel_path }, PassStart::Upload { parent_uuid, .. })
-			| (
-				SyncAction::CreateRemoteDir { rel_path },
-				PassStart::CreateRemoteDir { parent_uuid, .. },
-			) => want_dir(parent_and_name(&rel_path).0, parent_uuid),
-			_ => {}
-		}
-	})?;
+/// Where an action LANDS — the parent of an upload, a create or a move — is not among them: that
+/// takes only the directory's uuid (see [`PagedPlan::parent_of`]).
+#[derive(Default)]
+struct PageObjects {
+	files: HashMap<Uuid, RemoteFile>,
+	dirs: HashMap<Uuid, RemoteDirectory>,
+}
 
-	// What the plan names and the map has not got: the root is in it already, and a directory this
-	// very pass creates is filled in as it goes.
-	let missing_dirs: Vec<(String, Uuid)> = wanted_dirs
-		.into_iter()
-		.filter(|(path, _)| !dir_by_path.contains_key(path))
-		.collect();
-	// One cache read for every object this plan acts on, files and directories together: the
-	// pass's snapshot carries only the columns its view reads (see `cache::enumerate`), so the
-	// whole payloads are hydrated here, by uuid, and only for the handful the plan names.
-	let wanted: Vec<Uuid> = wanted_files
-		.iter()
-		.copied()
-		.chain(missing_dirs.iter().map(|&(_, uuid)| uuid))
-		.collect();
-	let mut cached_files: HashMap<Uuid, CacheableFile<'static>> = HashMap::new();
-	let mut cached_dirs: HashMap<Uuid, CacheableDir<'static>> = HashMap::new();
-	match ctx.client.hydrate_cached_items(wanted).await {
-		Ok(items) => {
-			for item in items {
-				match item {
-					SearchResult::File(file) => {
-						cached_files.insert(file.uuid, file);
-					}
-					SearchResult::Dir(dir) => {
-						cached_dirs.insert(dir.uuid, dir);
-					}
+impl PageObjects {
+	/// Fill in what the cache holds of `wanted`, once [`PagedPlan::turn`] has dropped what the page
+	/// before held: one local read of the cache DB the pass took at its start
+	/// ([`ApplyContext::cache_db`]), and neither a server call nor a wait on the client. A page turns
+	/// while transfers are in flight, and those are polled only once the apply's loop gets back to
+	/// them, holding the client's request permits until then; a server call made here could wait for
+	/// a permit only they can give back, and the client's cache slot can be held by a flush that
+	/// waits on one too.
+	async fn hydrate(&mut self, ctx: &ApplyContext<'_>, wanted: Wanted) {
+		let Some(cache_db) = &ctx.cache_db else {
+			tracing::debug!(
+				"apply: no cache is configured; each action of this page asks the server for its own object"
+			);
+			return;
+		};
+		// The pass's snapshot carries only the columns its view reads (see `cache::enumerate`), so
+		// the whole payloads are read here, by uuid — on a blocking thread, which takes its own copy
+		// of the path.
+		let uuids: Vec<Uuid> = wanted.files.into_iter().chain(wanted.dirs).collect();
+		match hydrate_cached_items_at(cache_db.clone(), uuids).await {
+			Ok(items) => self.extend(items),
+			Err(error) => tracing::debug!(
+				"apply: could not read the cached objects this page acts on ({error}); each of its actions asks the server for its own"
+			),
+		}
+	}
+
+	/// Drop what the page before held.
+	fn clear(&mut self) {
+		self.files.clear();
+		self.dirs.clear();
+	}
+
+	/// Take in what the cache holds of what the page acts on.
+	fn extend(&mut self, cached: Vec<SearchResult>) {
+		for item in cached {
+			match item {
+				SearchResult::File(file) => {
+					self.files.insert(file.uuid, RemoteFile::from(file));
+				}
+				SearchResult::Dir(dir) => {
+					self.dirs.insert(dir.uuid, RemoteDirectory::from(dir));
 				}
 			}
 		}
-		Err(error) => tracing::debug!(
-			"apply: could not read the cached objects this plan acts on ({error}); the server is asked for each of them"
-		),
 	}
+}
 
-	for uuid in wanted_files {
-		if let Some(cacheable) = cached_files.remove(&uuid) {
-			files.insert(uuid, RemoteFile::from(cacheable));
-			continue;
-		}
-		match ctx.client.get_file(uuid).await {
-			Ok(file) => {
-				files.insert(uuid, file);
-			}
-			Err(error) => tracing::debug!(
-				"apply: cannot resolve the file {uuid} this engine wrote ({error}); its action fails this pass"
-			),
-		}
+/// The remote file `uuid` an action acts on: `hydrated`, the copy its page read from the cache, or
+/// else the server's. The cache lacks a file this engine wrote that it has not listed yet, and the
+/// server is authoritative about those (it minted them). Asked by the action itself, never at a page
+/// turn (see [`PageObjects::hydrate`]). A file that cannot be fetched fails the action with
+/// `missing`, and the pass carries on.
+async fn file_or_fetch(
+	ctx: &ApplyContext<'_>,
+	hydrated: Option<RemoteFile>,
+	uuid: Uuid,
+	missing: &'static str,
+) -> Result<RemoteFile, crate::Error> {
+	if let Some(file) = hydrated {
+		return Ok(file);
 	}
-	for (path, uuid) in missing_dirs {
-		// The cache held this one, so there is nothing to ask the server for.
-		if let Some(cacheable) = cached_dirs.remove(&uuid) {
-			dir_by_path.insert(path, RemoteDirectory::from(cacheable));
-			continue;
-		}
-		match ctx.client.get_dir(uuid).await {
-			Ok(dir) => {
-				dir_by_path.insert(path, dir);
-			}
-			Err(error) => tracing::debug!(
-				"apply: cannot resolve the remote dir {path:?} this engine created ({error}); its actions fail this pass"
-			),
-		}
+	ctx.client.get_file(uuid).await.map_err(|error| {
+		tracing::debug!(
+			"apply: cannot resolve the file {uuid} this engine wrote ({error}); its action fails this pass"
+		);
+		internal(missing)
+	})
+}
+
+/// The remote directory `uuid` an action acts on, as [`file_or_fetch`] finds a file. `None` for
+/// `uuid` is a directory the view listed none for, and fails the action with `missing` unasked.
+async fn dir_or_fetch(
+	ctx: &ApplyContext<'_>,
+	hydrated: Option<RemoteDirectory>,
+	uuid: Option<Uuid>,
+	missing: &'static str,
+) -> Result<RemoteDirectory, crate::Error> {
+	if let Some(dir) = hydrated {
+		return Ok(dir);
 	}
-	Ok(())
+	let uuid = uuid.ok_or_else(|| internal(missing))?;
+	ctx.client.get_dir(uuid).await.map_err(|error| {
+		tracing::debug!(
+			"apply: cannot resolve the remote dir {uuid} this engine wrote ({error}); its action fails this pass"
+		);
+		internal(missing)
+	})
 }
 
 /// Whether an action writes to the remote (so the pass must hold the drive-write lock).
@@ -1480,8 +1654,7 @@ fn mutates_remote(action: &SyncAction) -> bool {
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
-	files: &HashMap<Uuid, RemoteFile>,
-	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+	plan: &mut PagedPlan,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
@@ -1489,17 +1662,7 @@ async fn apply_serial(
 	let action = &planned.action;
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
-	let error = match apply_one(
-		ctx,
-		planned,
-		files,
-		dir_by_path,
-		writes,
-		report,
-		&mut *observer,
-	)
-	.await
-	{
+	let error = match apply_one(ctx, planned, plan, writes, report, &mut *observer).await {
 		Ok(()) => {
 			writes.note(action);
 			return None;
@@ -1715,11 +1878,13 @@ fn note_quarantined(
 }
 
 /// Perform a transfer (download or upload): the network op + baseline write only. It touches no
-/// shared mutable state — it READS `dir_by_path` and the baseline store is internally locked — so
-/// transfers run concurrently; the caller does the report/event accounting as each completes.
+/// shared mutable state — what it reads of the remote tree is its own `target`, and the baseline
+/// store is internally locked — so transfers run concurrently; the caller does the report/event
+/// accounting as each completes.
 ///
 /// The pair's pause gates it in two places, and only those two: nothing starts while the pass is
-/// suspended, and the NETWORK op alone is raced against a cancel. The bookkeeping after that op is
+/// suspended, and the NETWORK op alone is raced against a cancel (for a download, that includes
+/// the server read of a file the cache lacks, which comes first). The bookkeeping after that op is
 /// deliberately outside the race — it waits on the store lock every other transfer of the pass
 /// contends for, and a cancel landing in that window would leave the remote holding a write no
 /// baseline row describes and no report counts.
@@ -1732,8 +1897,7 @@ fn note_quarantined(
 async fn apply_transfer(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
-	files: &HashMap<Uuid, RemoteFile>,
-	dir_by_path: &HashMap<String, RemoteDirectory>,
+	target: TransferTarget,
 	progress: &UnboundedSender<SyncEvent>,
 	quarantined: &mut Option<(String, PathBuf)>,
 ) -> Result<Transfer, crate::Error> {
@@ -1748,10 +1912,21 @@ async fn apply_transfer(
 			},
 			PassStart::Download { remote, base },
 		) => {
-			let remote_file = files
-				.get(remote_uuid)
-				.cloned()
-				.ok_or_else(|| internal("download target missing from the snapshot"))?;
+			// The server read for a file the cache lacks is network work like the download, and
+			// leaves nothing behind when dropped, so a cancel cuts it short too.
+			let Some(remote_file) = ctx
+				.gate
+				.guard(file_or_fetch(
+					ctx,
+					target.file,
+					*remote_uuid,
+					"download target missing from the snapshot",
+				))
+				.await
+			else {
+				return Ok(Transfer::Interrupted);
+			};
+			let remote_file = remote_file?;
 			let path = confined_local_target(ctx.local_root, rel_path)?;
 			if let Some(parent) = path.parent() {
 				std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -1860,17 +2035,14 @@ async fn apply_transfer(
 				..
 			},
 		) => {
-			let (parent_path, _) = parent_and_name(rel_path);
-			let parent = dir_by_path
-				.get(parent_path)
-				.ok_or_else(|| internal("remote parent dir for upload is missing"))?
-				.clone();
-			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
+			let parent = target
+				.parent
+				.ok_or_else(|| internal("remote parent dir for upload is missing"))?;
 			let path = local_path(ctx.local_root, rel_path);
 			let Some(upload) = ctx
 				.gate
-				.guard(ctx.client.upload_file_from_path(
-					&parent_type,
+				.guard(ctx.client.upload_file_from_path_with_builder(
+					FileBuilderOptionalName::new(parent),
 					path,
 					Some(progress_callback(
 						progress,
@@ -1992,8 +2164,7 @@ fn progress_callback<'a>(
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
-	files: &HashMap<Uuid, RemoteFile>,
-	dir_by_path: &mut HashMap<String, RemoteDirectory>,
+	plan: &mut PagedPlan,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
@@ -2016,8 +2187,7 @@ async fn apply_one(
 			let outcome = apply_transfer(
 				ctx,
 				planned,
-				files,
-				dir_by_path,
+				plan.transfer_target(planned)?,
 				&tokio::sync::mpsc::unbounded_channel().0,
 				&mut quarantined,
 			)
@@ -2051,32 +2221,35 @@ async fn apply_one(
 		}
 		(
 			SyncAction::CreateRemoteDir { rel_path },
-			PassStart::CreateRemoteDir { local, remote, .. },
+			PassStart::CreateRemoteDir {
+				local,
+				remote,
+				parent_uuid,
+			},
 		) => {
-			let (parent_path, name) = parent_and_name(rel_path);
-			let parent = dir_by_path
-				.get(parent_path)
-				.ok_or_else(|| internal("remote parent dir not yet created"))?
-				.clone();
+			let parent = plan
+				.parent_of(rel_path, *parent_uuid)?
+				.ok_or_else(|| internal("remote parent dir not yet created"))?;
 			let created = local
 				.as_deref()
 				.map(|n| millis_to_dt(n.mtime_millis))
 				.unwrap_or_else(Utc::now);
-			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
-			let new_dir = ctx
+			let new_uuid: Uuid = ctx
 				.client
-				.create_dir_with_created(&parent_type, name, created)
-				.await?;
-			let new_uuid: Uuid = new_dir.uuid();
+				.inner_create_dir_with_created(parent, parent_and_name(rel_path).1, created)
+				.await?
+				.uuid();
 			// When the dedup answered with an existing directory, this is ITS uuid.
 			writes.remote_uuids.insert(new_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
 				replaced: remote.as_deref().map(|node| node.remote_uuid),
 			};
-			dir_by_path.insert(rel_path.clone(), new_dir);
 			let entry = dir_entry(rel_path, Some(new_uuid), None);
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
+			// What lands under the directory finds it here. A record that failed fails the action,
+			// and so the pass (see `record_not_written`), before anything is put under it.
+			plan.record_created(rel_path, new_uuid)?;
 			report.remote_dirs_created += 1;
 		}
 		(SyncAction::UploadFile { .. }, _) => {
@@ -2084,8 +2257,7 @@ async fn apply_one(
 			let outcome = apply_transfer(
 				ctx,
 				planned,
-				files,
-				dir_by_path,
+				plan.transfer_target(planned)?,
 				&tokio::sync::mpsc::unbounded_channel().0,
 				&mut quarantined,
 			)
@@ -2108,28 +2280,36 @@ async fn apply_one(
 				kind,
 				remote_uuid,
 			},
-			_,
+			start,
 		) => {
 			if writes.shields_remote(rel_path, *remote_uuid) {
 				return Err(internal_owned(format!(
 					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
 				)));
 			}
-			match kind {
-				NodeKind::File => {
-					let mut remote_file = files
-						.get(remote_uuid)
-						.cloned()
-						.ok_or_else(|| internal("trash target file missing from the snapshot"))?;
+			match (kind, start) {
+				(NodeKind::File, _) => {
+					let mut remote_file = file_or_fetch(
+						ctx,
+						plan.file(*remote_uuid),
+						*remote_uuid,
+						"trash target file missing from the snapshot",
+					)
+					.await?;
 					ctx.client.trash_file(&mut remote_file).await?;
 				}
-				NodeKind::Dir => {
-					let mut remote_dir = dir_by_path
-						.get(rel_path)
-						.cloned()
-						.ok_or_else(|| internal("trash target dir missing from the snapshot"))?;
+				(NodeKind::Dir, PassStart::Remote { remote }) => {
+					let uuid = dir_uuid(remote.as_deref());
+					let mut remote_dir = dir_or_fetch(
+						ctx,
+						uuid.and_then(|uuid| plan.dir(uuid)),
+						uuid,
+						"trash target dir missing from the snapshot",
+					)
+					.await?;
 					ctx.client.trash_dir(&mut remote_dir).await?;
 				}
+				(NodeKind::Dir, _) => return Err(unpaired()),
 			}
 			// The row is about to go, so a snapshot that has not applied the trash yet reads this
 			// item as an untracked remote file with nothing local — a deletion to make all over
@@ -2145,22 +2325,25 @@ async fn apply_one(
 				remote_uuid,
 			},
 			PassStart::MoveRemoteFile {
-				local, base_from, ..
+				local,
+				base_from,
+				parent_uuid,
 			},
 		) => {
-			let mut remote_file = files
-				.get(remote_uuid)
-				.cloned()
-				.ok_or_else(|| internal("move-source file missing from the snapshot"))?;
+			let mut remote_file = file_or_fetch(
+				ctx,
+				plan.file(*remote_uuid),
+				*remote_uuid,
+				"move-source file missing from the snapshot",
+			)
+			.await?;
 			let (from_parent, from_name) = parent_and_name(from_path);
 			let (to_parent, to_name) = parent_and_name(to_path);
 			if to_parent != from_parent {
-				let parent = dir_by_path
-					.get(to_parent)
-					.ok_or_else(|| internal("move-target parent dir is missing"))?
-					.clone();
-				let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
-				ctx.client.move_file(&mut remote_file, &parent_type).await?;
+				let parent = plan
+					.parent_of(to_path, *parent_uuid)?
+					.ok_or_else(|| internal("move-target parent dir is missing"))?;
+				ctx.client.inner_move_file(&mut remote_file, parent).await?;
 			}
 			if to_name != from_name {
 				let changes = FileMetaChanges::default()
@@ -2255,14 +2438,20 @@ async fn apply_one(
 				kind: NodeKind::Dir,
 				remote_uuid,
 			},
-			_,
+			PassStart::MoveRemoteDir {
+				remote,
+				parent_uuid,
+			},
 		) => {
-			// The view — and so this map — already lists the directory at the path it moves to.
-			let mut dir = dir_by_path
-				.get(to_path)
-				.filter(|dir| dir.uuid() == *remote_uuid)
-				.cloned()
-				.ok_or_else(|| internal("move-source dir missing from the snapshot"))?;
+			// The view already lists the directory at the path it moves to.
+			let uuid = dir_uuid(remote.as_deref()).filter(|uuid| uuid == remote_uuid);
+			let mut dir = dir_or_fetch(
+				ctx,
+				uuid.and_then(|uuid| plan.dir(uuid)),
+				uuid,
+				"move-source dir missing from the snapshot",
+			)
+			.await?;
 			let (from_parent, from_name) = parent_and_name(from_path);
 			let (to_parent, to_name) = parent_and_name(to_path);
 			// Validated before anything moves, so a name the rename would refuse fails the action
@@ -2273,12 +2462,10 @@ async fn apply_one(
 				.map_err(crate::Error::from)?;
 			let reparented = to_parent != from_parent;
 			if reparented {
-				let parent = dir_by_path
-					.get(to_parent)
-					.ok_or_else(|| internal("move-target parent dir is missing"))?
-					.clone();
-				let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
-				ctx.client.move_dir(&mut dir, &parent_type).await?;
+				let parent = plan
+					.parent_of(to_path, *parent_uuid)?
+					.ok_or_else(|| internal("move-target parent dir is missing"))?;
+				ctx.client.inner_move_dir(&mut dir, parent).await?;
 			}
 			if let Some(changes) = rename
 				&& let Err(error) = ctx.client.update_dir_metadata(&mut dir, changes).await
@@ -2297,7 +2484,6 @@ async fn apply_one(
 				}
 				return Err(error);
 			}
-			dir_by_path.insert(to_path.clone(), dir);
 			commit_dir_move(ctx, *remote_uuid, from_path, to_path).await?;
 			report.moved_remote += 1;
 		}
@@ -3079,13 +3265,23 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
-	use std::time::Duration;
+	use std::{sync::Mutex, time::Duration};
 
 	use filen_types::crypto::Blake3Hash;
 	use uuid::Uuid;
 
 	use super::*;
-	use crate::sync_engine::baseline::BaselineStore;
+	use crate::{
+		alloc_meter,
+		auth::test_support::offline_client,
+		cache::{CacheState, hydrate_by_uuids},
+		sync_engine::{
+			SyncMode,
+			baseline::BaselineStore,
+			changes::tests::{cacheable_dir, cacheable_file},
+			stage::PAGE_ROWS,
+		},
+	};
 
 	fn upload(rel_path: &str) -> SyncAction {
 		SyncAction::UploadFile {
@@ -4298,5 +4494,406 @@ mod tests {
 		);
 
 		std::fs::remove_dir_all(&root).ok();
+	}
+
+	/// A page wants the file each download, file trash and file move names, and the directory the
+	/// view listed at the path of each directory trash and move; nothing for what only lands in a
+	/// directory, nor for a directory action the view listed no directory for.
+	#[test]
+	fn a_page_wants_the_objects_its_actions_act_on() {
+		let uuid = Uuid::from_u128;
+		let at_dir = |remote_uuid| {
+			Some(Box::new(RemoteNode {
+				kind: NodeKind::Dir,
+				remote_uuid,
+				..remote_node("d", None)
+			}))
+		};
+		let entry = |action, start| PlannedEntry { action, start };
+		let page = [
+			PlannedEntry::bare(SyncAction::DownloadFile {
+				rel_path: "a".to_string(),
+				remote_uuid: uuid(1),
+			}),
+			PlannedEntry::bare(SyncAction::TrashRemote {
+				rel_path: "b".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid(2),
+			}),
+			PlannedEntry::bare(SyncAction::MoveRemote {
+				from_path: "c0".to_string(),
+				to_path: "c".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: uuid(3),
+			}),
+			entry(
+				SyncAction::TrashRemote {
+					rel_path: "d".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: uuid(14),
+				},
+				PassStart::Remote {
+					remote: at_dir(uuid(4)),
+				},
+			),
+			entry(
+				SyncAction::MoveRemote {
+					from_path: "e0".to_string(),
+					to_path: "e".to_string(),
+					kind: NodeKind::Dir,
+					remote_uuid: uuid(5),
+				},
+				PassStart::MoveRemoteDir {
+					remote: at_dir(uuid(5)),
+					parent_uuid: None,
+				},
+			),
+			PlannedEntry::bare(SyncAction::TrashRemote {
+				rel_path: "f".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: uuid(6),
+			}),
+			entry(
+				upload("g"),
+				PassStart::Upload {
+					local: None,
+					remote: at_dir(uuid(7)),
+					base: None,
+					parent_uuid: None,
+				},
+			),
+			entry(
+				SyncAction::CreateRemoteDir {
+					rel_path: "h".to_string(),
+				},
+				PassStart::CreateRemoteDir {
+					local: None,
+					remote: at_dir(uuid(8)),
+					parent_uuid: None,
+				},
+			),
+		];
+		assert_eq!(
+			Wanted::of(page.iter()),
+			Wanted {
+				files: HashSet::from([uuid(1), uuid(2), uuid(3)]),
+				dirs: HashSet::from([uuid(4), uuid(5)]),
+			}
+		);
+	}
+
+	/// What lands in a directory lands in the sync root at the top, in the directory this pass
+	/// created at its parent once that create has run, and otherwise in the one the view listed
+	/// there; with none of the three it has nowhere to go.
+	#[test]
+	fn an_item_lands_in_the_root_a_directory_this_pass_created_or_the_views() {
+		let (root, made, listed) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		for action in [
+			SyncAction::CreateRemoteDir {
+				rel_path: "made".to_string(),
+			},
+			SyncAction::CreateRemoteDir {
+				rel_path: "pending".to_string(),
+			},
+			upload("uploaded"),
+		] {
+			writer.push(&PlannedEntry::bare(action)).unwrap();
+		}
+		let mut plan = PagedPlan::new(writer.finish().unwrap(), root);
+		plan.record_created("made", made).unwrap();
+		// Only a directory create records what it made.
+		plan.record_created("uploaded", Uuid::from_u128(4)).unwrap();
+		let (viewed, unlisted) = (Some(listed), None);
+		let landing = [
+			plan.parent_of("top.txt", viewed).unwrap(),
+			plan.parent_of("made/x.txt", viewed).unwrap(),
+			plan.parent_of("made/x.txt", unlisted).unwrap(),
+			plan.parent_of("pending/x.txt", viewed).unwrap(),
+			plan.parent_of("pending/x.txt", unlisted).unwrap(),
+			plan.parent_of("uploaded/x.txt", unlisted).unwrap(),
+			plan.parent_of("made/deeper/x.txt", unlisted).unwrap(),
+		];
+		assert_eq!(
+			landing,
+			[
+				Some(root),
+				Some(made),
+				Some(made),
+				Some(listed),
+				None,
+				None,
+				None
+			]
+		);
+		let target = plan
+			.transfer_target(&PlannedEntry::bare(upload("made/x.txt")))
+			.unwrap();
+		assert_eq!((target.file, target.parent), (None, Some(made)));
+	}
+
+	/// Hydrating a 20,000-download pull page by page holds the objects of a page at a time, not the
+	/// pull's: every download finds its file in the page it is in. The plan is the apply's own
+	/// [`PagedPlan`], turned and read through the methods the apply uses; only the cache read is
+	/// made here, directly, where the apply makes it on a blocking thread the meter cannot see. The
+	/// cache holds every file, so the server is never asked.
+	#[test]
+	fn hydrating_a_page_at_a_time_holds_a_page_of_the_objects() {
+		const DOWNLOADS: u32 = 20_000;
+		let cache_dir = tempfile::tempdir().unwrap();
+		let cache = cache_dir.path().join("cache.db");
+		let root = Uuid::from_u128(u128::MAX);
+		let file_uuid = |n: u32| Uuid::from_u128(u128::from(n) + 1);
+		let name = |n: u32| format!("f{n:05}.txt");
+		let mut state = CacheState::new_on_path(&cache, root);
+		state
+			.upsert_files((0..DOWNLOADS).map(|n| cacheable_file(file_uuid(n), root, &name(n))))
+			.unwrap();
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		for n in 0..DOWNLOADS {
+			let remote = RemoteNode {
+				remote_uuid: file_uuid(n),
+				..remote_node(&name(n), None)
+			};
+			writer
+				.push(&PlannedEntry {
+					action: SyncAction::DownloadFile {
+						rel_path: name(n),
+						remote_uuid: file_uuid(n),
+					},
+					start: PassStart::Download {
+						remote: Some(Box::new(remote)),
+						base: None,
+					},
+				})
+				.unwrap();
+		}
+		let staged = writer.finish().unwrap();
+		let (found, peak) = alloc_meter::peak_bytes(|| {
+			let mut plan = PagedPlan::new(staged, root);
+			let mut found = 0u32;
+			loop {
+				if let Some(wanted) = plan.turn().unwrap() {
+					let uuids: Vec<Uuid> =
+						wanted.files.iter().chain(&wanted.dirs).copied().collect();
+					plan.objects
+						.extend(hydrate_by_uuids(&cache, &uuids).unwrap());
+				}
+				let Some(staged) = plan.pager.next_in(Run::Transfers).unwrap() else {
+					break;
+				};
+				let SyncAction::DownloadFile { remote_uuid, .. } = staged.entry.action else {
+					panic!("only downloads were staged");
+				};
+				found += u32::from(plan.file(remote_uuid).is_some());
+			}
+			found
+		});
+		assert_eq!(found, DOWNLOADS);
+		assert!(
+			peak < 2 * 1024 * 1024,
+			"hydrating held {peak} bytes at once"
+		);
+	}
+
+	/// What an [`ApplyContext`] borrows, for steps of the apply run with no account behind them: an
+	/// offline client, an empty baseline, an empty local root and a gate nothing pauses.
+	struct Borrowed {
+		client: Client,
+		local: tempfile::TempDir,
+		store: SharedStore,
+		pending: PendingWrites,
+		observed: Observations,
+		gate: PassGate,
+		subsumed: Subsumed,
+	}
+
+	impl Borrowed {
+		fn new() -> Self {
+			Self {
+				client: offline_client(),
+				local: tempfile::tempdir().unwrap(),
+				store: Arc::new(Mutex::new(BaselineStore::open_in_memory().unwrap())),
+				pending: PendingWrites::default(),
+				observed: Observations::default(),
+				gate: PassGate::default(),
+				subsumed: Subsumed::default(),
+			}
+		}
+
+		/// A pass over the sync root `root` that took `cache_db` as its cache.
+		fn ctx(&self, root: Uuid, cache_db: Option<PathBuf>) -> ApplyContext<'_> {
+			ApplyContext {
+				client: &self.client,
+				local_root: self.local.path(),
+				pair: 1,
+				mode: SyncMode::TwoWay,
+				store: &self.store,
+				root_remote: RemoteDirectory::from(cacheable_dir(root, root, "root")),
+				cache_db,
+				absence_trusted: true,
+				pending: &self.pending,
+				observed: &self.observed,
+				gate: &self.gate,
+				lock_budget: LockBudget::default(),
+				subsumed: &self.subsumed,
+			}
+		}
+	}
+
+	/// A page turn reads the cache DB the pass took at its start, and never waits on the client's
+	/// cache slot: a flush holds that until the cache worker exits, which can wait on the request
+	/// permits of the transfers in flight, and only the loop turning the page polls those.
+	#[tokio::test]
+	async fn a_page_turn_reads_the_cache_while_the_client_holds_its_cache_slot() {
+		let cache_dir = tempfile::tempdir().unwrap();
+		let cache = cache_dir.path().join("cache.db");
+		let (root, file) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let mut state = CacheState::new_on_path(&cache, root);
+		state
+			.upsert_files(std::iter::once(cacheable_file(file, root, "a.txt")))
+			.unwrap();
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		writer
+			.push(&PlannedEntry::bare(SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: file,
+			}))
+			.unwrap();
+		let mut plan = PagedPlan::new(writer.finish().unwrap(), root);
+		let borrowed = Borrowed::new();
+		let ctx = borrowed.ctx(root, Some(cache));
+		// Held through the turn, as a flush waiting out the cache worker holds it.
+		let _slot = borrowed.client.cache_slot.lock().await;
+		let staged =
+			tokio::time::timeout(Duration::from_secs(30), plan.next_in(&ctx, Run::Transfers))
+				.await
+				.expect("the page turn waited on the client's cache slot")
+				.expect("reading the plan's one page")
+				.expect("the download is the plan's one transfer");
+		assert_eq!(staged.entry.action.rel_path(), "a.txt");
+		assert!(
+			plan.file(file).is_some(),
+			"the page did not hydrate the file its download fetches"
+		);
+	}
+
+	/// Where an upload lands, when the pass's stage cannot be read, fails that upload — as a record
+	/// the pass could not keep, so it starts nothing more — rather than panicking in the loop that
+	/// holds the other transfers in flight.
+	#[test]
+	fn a_landing_the_stage_cannot_read_fails_the_upload_and_the_pass() {
+		let root = Uuid::from_u128(1);
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		writer
+			.push(&PlannedEntry::bare(SyncAction::CreateRemoteDir {
+				rel_path: "made".to_string(),
+			}))
+			.unwrap();
+		let plan = PagedPlan::new(writer.finish().unwrap(), root);
+		plan.pager.break_stage();
+		let entry = PlannedEntry::bare(upload("made/x.txt"));
+		let Err(error) = plan.transfer_target(&entry) else {
+			panic!("an upload with nowhere to land found somewhere to");
+		};
+		let mut report = SyncReport::default();
+		let mut events = Vec::new();
+		note_transfer_failed(
+			&entry.action,
+			&error,
+			&FullSides::default(),
+			&mut report,
+			&mut |event| events.push(event),
+		);
+		assert!(matches!(
+			events.as_slice(),
+			[SyncEvent::ActionFailed { rel_path, .. }] if rel_path == "made/x.txt"
+		));
+		assert_eq!(report.failed_paths.len(), 1);
+		assert_eq!(report.failed_paths[0].0, "made/x.txt");
+		assert_eq!(report.halted, None);
+		assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+		assert!(!admits_more(&report));
+	}
+
+	/// A page of the plan the stage cannot read fails the pass, rather than panicking in the loop
+	/// that holds the transfers in flight as it turns to that page: each transfer already started
+	/// finishes and records what it did, and the action on the unread page is owed to the next
+	/// pass.
+	///
+	/// A page of downloads and one more, so the loop turns to the second page once, with the default
+	/// concurrency's worth of the first page's downloads still in flight. Each download finds its
+	/// file in the cache and fails before it reaches the network, on a path no write may take.
+	#[tokio::test]
+	async fn a_page_the_stage_cannot_read_fails_the_pass_once_the_transfers_in_flight_finish() {
+		let downloads = PAGE_ROWS + 1;
+		let cache_dir = tempfile::tempdir().unwrap();
+		let cache = cache_dir.path().join("cache.db");
+		let root = Uuid::from_u128(u128::MAX);
+		let file_uuid = |n: usize| Uuid::from_u128(u128::try_from(n).unwrap() + 1);
+		let rel_path = |n: usize| format!("up/../f{n}");
+		let mut state = CacheState::new_on_path(&cache, root);
+		state
+			.upsert_files(
+				(0..downloads).map(|n| cacheable_file(file_uuid(n), root, &format!("f{n}"))),
+			)
+			.unwrap();
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		for n in 0..downloads {
+			writer
+				.push(&PlannedEntry::bare(SyncAction::DownloadFile {
+					rel_path: rel_path(n),
+					remote_uuid: file_uuid(n),
+				}))
+				.unwrap();
+		}
+		let plan = writer.finish().unwrap();
+		plan.spoil_from(PAGE_ROWS);
+		let borrowed = Borrowed::new();
+		let mut report = SyncReport::default();
+		let mut events = Vec::new();
+		apply(
+			borrowed.ctx(root, Some(cache)),
+			plan,
+			&mut report,
+			&mut |event| events.push(event),
+		)
+		.await;
+		let mut failed: Vec<&str> = report
+			.failed_paths
+			.iter()
+			.map(|(path, _)| path.as_str())
+			.collect();
+		failed.sort_unstable();
+		let mut started: Vec<String> = (0..PAGE_ROWS).map(rel_path).collect();
+		started.sort_unstable();
+		assert_eq!(failed, started);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(event, SyncEvent::ActionFailed { .. }))
+				.count(),
+			PAGE_ROWS
+		);
+		assert_eq!(report.downloaded, 0);
+		assert_eq!(report.interrupted, 1);
+		assert!(matches!(
+			events.last(),
+			Some(SyncEvent::Interrupted { actions: 1 })
+		));
+		assert_eq!(report.store_failed, Some(StoreFailure::UnreadPlan));
+		assert!(
+			report
+				.errors
+				.iter()
+				.any(|line| line.contains("reading a page of the pass's staged plan")),
+			"{:?}",
+			report.errors.last()
+		);
 	}
 }

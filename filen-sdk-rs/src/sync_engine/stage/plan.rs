@@ -5,7 +5,9 @@
 //! # Tables
 //!
 //! - `plan`: one row per action, keyed by `seq`, its position in the plan as the reconcile ordered
-//!   it, with the local and the remote node its [`PassStart`] carries.
+//!   it, with the local and the remote node its [`PassStart`] carries, and — once the apply has run
+//!   it — the uuid of the directory a remote directory create made (`result_uuid`), which the
+//!   actions under that directory land in ([`Pager::created_at`]).
 //! - `plan_base`: the baseline rows its [`PassStart`] carries — at the action's path (`endpoint`
 //!   [`AT_PATH`]) and at the path a move starts from ([`AT_SOURCE`]).
 //! - `exec`: the order the apply runs the plan in (`ord`, from 0), and how far each action ties the
@@ -38,7 +40,7 @@
 use std::{collections::VecDeque, sync::LazyLock};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
-use rusqlite::{Connection, Row, ffi, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, Row, ffi, params, types::Type};
 use uuid::Uuid;
 
 use super::{
@@ -73,8 +75,11 @@ CREATE TABLE plan (
 	r_hash BLOB,
 	r_size INTEGER,
 	r_modified INTEGER,
-	parent_uuid BLOB
+	parent_uuid BLOB,
+	result_uuid BLOB
 );
+-- The remote directory creates, by path: op 3 is OP_CREATE_REMOTE_DIR.
+CREATE INDEX plan_created ON plan (path) WHERE op = 3;
 CREATE TABLE plan_base (
 	seq INTEGER NOT NULL,
 	endpoint INTEGER NOT NULL,
@@ -109,6 +114,10 @@ const OP_ADOPT: i64 = 7;
 const OP_MOVE_REMOTE: i64 = 8;
 const OP_MOVE_LOCAL: i64 = 9;
 
+// `plan_created` in SCHEMA spells this op out: with any other value every created-directory
+// lookup would scan the plan instead of seeking the index.
+const _: () = assert!(OP_CREATE_REMOTE_DIR == 3);
+
 /// The ops of [`SyncAction::is_delete`] and of [`SyncAction::is_create`], for the statements below.
 const DELETES: &str = "(2, 5)";
 const CREATES: &str = "(0, 1, 3, 4)";
@@ -137,6 +146,15 @@ static INSERT_BASE: LazyLock<String> = LazyLock::new(|| {
 });
 static READ_BASES: LazyLock<String> =
 	LazyLock::new(|| format!("SELECT {ENTRY_COLUMNS}, endpoint FROM plan_base WHERE seq = ?1"));
+
+/// Where a remote directory create's result is recorded and read, both seeking on `plan_created`,
+/// whose condition each repeats.
+static RECORD_CREATED: LazyLock<String> = LazyLock::new(|| {
+	format!("UPDATE plan SET result_uuid = ?2 WHERE op = {OP_CREATE_REMOTE_DIR} AND path = ?1")
+});
+static READ_CREATED: LazyLock<String> = LazyLock::new(|| {
+	format!("SELECT result_uuid FROM plan WHERE op = {OP_CREATE_REMOTE_DIR} AND path = ?1")
+});
 
 /// A page of the plan in apply order, with what [`entry_of`] reads by position.
 const READ_PAGE: &str = "SELECT x.ord, x.tie_until, p.seq, p.op, p.kind, p.path, p.from_path,
@@ -650,16 +668,30 @@ impl Pager {
 		self.plan.len
 	}
 
-	/// The next action, when it is in `run`.
+	/// Read the next page once the one in hand is used up, and hand back the actions it holds. Every
+	/// action [`peek_in`](Self::peek_in) and [`next_in`](Self::next_in) hand out comes from a page
+	/// read here, so a caller that turns before it takes anything can ready what a page acts on
+	/// before any of it runs. `None` while the page in hand has actions left, and at the end of the
+	/// plan.
 	///
 	/// A read that fails is an error, not a panic (see the module docs of [`stage`](super)): the
-	/// apply reads pages with transfers in flight, and a panic would drop them between their network
+	/// apply turns pages with transfers in flight, and a panic would drop them between their network
 	/// op and the row that records it. The page in hand stays used up, so the next call reads the
 	/// same page again.
-	pub(in super::super) fn peek_in(&mut self, run: Run) -> rusqlite::Result<Option<&Staged>> {
-		if self.page.is_empty() && self.next < self.plan.len {
-			self.read_page()?;
+	pub(in super::super) fn turn(
+		&mut self,
+	) -> rusqlite::Result<Option<impl Iterator<Item = &PlannedEntry>>> {
+		if !self.page.is_empty() || self.next >= self.plan.len {
+			return Ok(None);
 		}
+		self.read_page()?;
+		Ok(Some(self.page.iter().map(|staged| &staged.entry)))
+	}
+
+	/// The next action, when it is in `run`, turning to the next page if need be (see
+	/// [`turn`](Self::turn)).
+	pub(in super::super) fn peek_in(&mut self, run: Run) -> rusqlite::Result<Option<&Staged>> {
+		self.turn()?;
 		Ok(self.page.front().filter(|staged| staged.run == run))
 	}
 
@@ -692,6 +724,40 @@ impl Pager {
 			}
 		}
 		Ok(())
+	}
+
+	/// Record that the remote directory create at `path` made — or merged into — the directory
+	/// `uuid`.
+	pub(in super::super) fn record_created(
+		&mut self,
+		path: &str,
+		uuid: Uuid,
+	) -> rusqlite::Result<()> {
+		self.plan
+			.stage
+			.conn
+			.prepare_cached(&RECORD_CREATED)?
+			.execute(params![path, uuid])?;
+		Ok(())
+	}
+
+	/// The remote directory this pass's create at `path` made (see [`record_created`]), if the plan
+	/// creates one there and the create has run and landed.
+	///
+	/// A read that fails is an error, not a panic (see the module docs of [`stage`](super)): the
+	/// apply asks where an upload lands with other transfers in flight, and a panic would drop them
+	/// between their network op and the row that records it.
+	///
+	/// [`record_created`]: Self::record_created
+	pub(in super::super) fn created_at(&self, path: &str) -> rusqlite::Result<Option<Uuid>> {
+		Ok(self
+			.plan
+			.stage
+			.conn
+			.prepare_cached(&READ_CREATED)?
+			.query_row([path], |row| row.get::<_, Option<Uuid>>(0))
+			.optional()?
+			.flatten())
 	}
 
 	fn read_page(&mut self) -> rusqlite::Result<()> {
@@ -867,4 +933,36 @@ fn corrupt(what: &str, value: i64) -> rusqlite::Error {
 		Type::Integer,
 		format!("invalid {what} in the staged plan: {value}").into(),
 	)
+}
+
+/// What the apply's tests do to a staged plan they cannot do through it.
+#[cfg(test)]
+mod test_support {
+	use super::{Pager, StagedPlan};
+
+	impl StagedPlan {
+		/// Spoil every action from position `ord` on, so that the page holding it fails to read
+		/// while the pages before it read as staged.
+		pub(in crate::sync_engine) fn spoil_from(&self, ord: usize) {
+			self.stage
+				.conn
+				.execute(
+					"UPDATE plan SET op = -1 WHERE seq IN (SELECT seq FROM exec WHERE ord >= ?1)",
+					[ord],
+				)
+				.expect("spoiling the staged plan");
+		}
+	}
+
+	impl Pager {
+		/// Take the plan's table out from under the pager, so that every read of the stage that
+		/// asks it fails from here on, the way one on a full or failing disk would.
+		pub(in crate::sync_engine) fn break_stage(&self) {
+			self.plan
+				.stage
+				.conn
+				.execute_batch("DROP TABLE plan")
+				.expect("dropping the staged plan's table");
+		}
+	}
 }

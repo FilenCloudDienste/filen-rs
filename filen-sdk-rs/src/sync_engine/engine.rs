@@ -5607,6 +5607,8 @@ impl SyncEngine {
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
+			// Before the first action, and never again this pass (see `ApplyContext::cache_db`).
+			cache_db: self.client.cache_slot.lock().await.db_path(),
 			local_root: &local_root,
 			pair,
 			mode: prep.record.mode,

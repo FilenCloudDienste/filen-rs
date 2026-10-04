@@ -39,10 +39,11 @@
 //! end of the plan. A write that fails — a full disk while the plan is staged — is an error the pass
 //! returns, before it has applied anything.
 //!
-//! A read that fails is an error as well: the apply reads the next page with transfers in flight,
-//! and a panic would drop those transfers between their network op and the row that records it. A
-//! page that fails to read ([`Pager::peek_in`], and [`Pager::sweep`], which reads its pages alike)
-//! stops the apply admitting anything more: the transfers in flight finish, and the pass fails.
+//! The reads the apply makes with transfers in flight answer with an error, since a panic would
+//! drop those transfers between their network op and the row that records it. A page that fails to
+//! read ([`Pager::turn`], and [`Pager::sweep`], which reads its pages alike) stops the apply
+//! admitting anything more: the transfers in flight finish, and the pass fails. Where an upload
+//! lands, failing to read ([`Pager::created_at`]), fails that upload and the pass with it.
 
 mod plan;
 #[cfg(test)]
