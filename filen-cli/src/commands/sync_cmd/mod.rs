@@ -140,7 +140,12 @@ pub(crate) async fn sync(
 				ControlFlow::Continue(())
 			}
 			changed = status.changed() => match changed {
-				Ok(()) => output.deliver(ui, Update::Status(status.borrow_and_update().clone())),
+				Ok(()) => {
+					// The watch publishes its status after every pass, once the pass has returned
+					// and dropped what it held: what it freed can go back to the OS now.
+					tokio::task::spawn_blocking(crate::memory::release_free_memory);
+					output.deliver(ui, Update::Status(status.borrow_and_update().clone()))
+				}
 				Err(_) => ControlFlow::Break(LoopEnd::WatchEnded),
 			},
 			_ = stop_rx.recv() => ControlFlow::Break(LoopEnd::Stop),
