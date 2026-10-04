@@ -986,15 +986,17 @@ mod tests {
 	}
 }
 
-#[cfg(test)]
+// Also compiled for the sync engine's benchmark harness (`sync_engine::bench`), which opens real
+// engines with no account behind them. A shipping build has neither the harness nor this module.
+#[cfg(any(test, all(feature = "sync-engine", feature = "bench-internals")))]
 pub(crate) mod test_support {
 	use base64::{Engine, prelude::BASE64_STANDARD};
 	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 
 	use super::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient};
 
-	/// A client with no account and no network behind it, for tests that build files, keys and
-	/// writers but never send a request.
+	/// A client with no account and no network behind it, for tests and benchmarks that build
+	/// files, keys, writers or sync engines but never send a request.
 	///
 	/// 512 bits because the key only has to parse: `from_stringified` derives a public key and an
 	/// HMAC key from it, and a 2048-bit key would cost each test half a second to generate.
