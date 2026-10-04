@@ -66,7 +66,9 @@
 //! # Bounds
 //!
 //! Both lists are bounded (see [`dirty_cap`]) and collapse to a full pass past it: a `git checkout`
-//! of half the tree costs a full pass, which is what it would cost anyway.
+//! of half the tree costs a full pass, which is what it would cost anyway. What a pass hands the
+//! next one is bounded by the absolute [`DIRTY_CAP`] instead, and past it the next pass reads both
+//! sides whole too ([`FullPassReason::CarriedOver`], [`FullPassReason::RemoteOverflow`]).
 
 use std::{
 	collections::BTreeSet,
@@ -192,6 +194,14 @@ pub enum FullPassReason {
 	/// Making that plan consumed both changelists, so the paths it named are in no list any more —
 	/// only a whole-tree read finds them again.
 	UnappliedWork,
+	/// The previous pass's plan named more paths than a pass carries over to the next one — as many
+	/// as a changelist holds at most, whatever the tree size — so none of them was kept. Kept, they
+	/// would hold memory for as long as the pair waits for its next pass (after a first sync, one
+	/// path for every item in the tree), and a whole read finds every one of them again.
+	///
+	/// It says nothing about whether that plan was carried out: a first sync that applied every
+	/// action reports it too.
+	CarriedOver,
 	/// A conflict was resolved
 	/// ([`resolve_conflict`](super::SyncEngine::resolve_conflict)): the baseline row at that path
 	/// is re-anchored so the winning side reads as the changed one, which is a change neither a
@@ -229,6 +239,9 @@ impl fmt::Display for FullPassReason {
 			Self::InterruptedPass => "the previous pass was cancelled part-way through",
 			Self::RulesChanged => "the ignore patterns or the pair's mode changed",
 			Self::UnappliedWork => "the previous pass planned work it did not apply",
+			Self::CarriedOver => {
+				"the previous pass's plan named too many paths to carry over individually"
+			}
 			Self::ConflictResolved => "a conflict resolution has to be applied at its path",
 			Self::IncompleteObservation => {
 				"the previous pass could not re-observe every path it narrowed its read to"
@@ -544,7 +557,8 @@ struct ChangeState {
 	/// pair last RECORDED it, which is 1 before a first sync, so feeding a plan's paths through the
 	/// cap would collapse the next pass to a whole-tree read and report work as owing that was in
 	/// fact applied. Replaced by every pass that made a plan, never accumulated: it is rebuilt from
-	/// that pass's own plan.
+	/// that pass's own plan. Bounded all the same, by the absolute cap — see
+	/// [`note_owed`](PairChanges::note_owed).
 	owed: BTreeSet<String>,
 	/// The other half of [`owed`](Self::owed): the announced changes the previous pass consumed,
 	/// handed back when it was cut short before it applied them (see the module docs).
@@ -678,7 +692,23 @@ impl PairChanges {
 	/// [`carry_over`](super::facts::carry_over)). REPLACES the previous set rather than adding to
 	/// it: each pass rebuilds it from its own plan, so a path drops out as soon as a pass gets
 	/// through it.
-	pub(super) fn note_owed(&self, owed: BTreeSet<String>) {
+	///
+	/// Bounded by the absolute [`DIRTY_CAP`], like the remote half
+	/// ([`note_owed_remote`](Self::note_owed_remote)) and for the same reason it is not the
+	/// tree-scaled [`dirty_cap`]. Past it no set is kept and the next pass reads both sides whole
+	/// ([`FullPassReason::CarriedOver`]): the set lives for as long as the pair waits for that pass,
+	/// and after a first sync it names every item in the tree. Counted as it is built, so a plan
+	/// of any size never costs more than one path past the cap here.
+	pub(super) fn note_owed<'a>(&self, paths: impl IntoIterator<Item = &'a str>) {
+		let mut owed = BTreeSet::new();
+		for path in paths {
+			owed.insert(path.to_owned());
+			if owed.len() > DIRTY_CAP {
+				self.state().owed = BTreeSet::new();
+				self.force(FullPassReason::CarriedOver);
+				return;
+			}
+		}
 		self.state().owed = owed;
 	}
 
@@ -944,7 +974,7 @@ pub(super) mod tests {
 		changes.cover_local();
 		// Nothing recorded yet, so `dirty_cap` sits at its floor of one path.
 		let owed: BTreeSet<String> = (0..50).map(|i| format!("owed{i:02}.txt")).collect();
-		changes.note_owed(owed.clone());
+		changes.note_owed(owed.iter().map(String::as_str));
 
 		let (paths, full) = taken(&changes);
 		assert_eq!(
@@ -964,9 +994,48 @@ pub(super) mod tests {
 	#[test]
 	fn each_pass_replaces_what_the_last_one_left_owing() {
 		let changes = sized_pair();
-		changes.note_owed(BTreeSet::from(["first.txt".to_string()]));
-		changes.note_owed(BTreeSet::from(["second.txt".to_string()]));
+		changes.note_owed(["first.txt"]);
+		changes.note_owed(["second.txt"]);
 		assert_eq!(taken(&changes).0, vec!["second.txt".to_string()]);
+	}
+
+	/// The carry-over set is bounded all the same, by the absolute cap rather than the tree-scaled
+	/// one: kept, it sits in memory for as long as the pair idles, and after a first sync it names
+	/// every item in the tree. Up to the cap it is carried path by path; one past it, the next pass
+	/// reads both sides whole instead and no set is kept.
+	#[test]
+	fn a_carry_over_set_past_the_cap_is_a_whole_read_and_keeps_nothing() {
+		let paths: Vec<String> = (0..=DIRTY_CAP).map(|i| format!("owed{i:06}.txt")).collect();
+
+		// A plan of uploads names every path twice, as both endpoints of its action: the cap counts
+		// paths, not mentions.
+		let at_cap = sized_pair();
+		at_cap.note_owed(
+			paths
+				.iter()
+				.take(DIRTY_CAP)
+				.flat_map(|path| [path.as_str(), path.as_str()]),
+		);
+		let (carried, full) = taken(&at_cap);
+		assert_eq!(
+			(carried.len(), full),
+			(50_000, None),
+			"at the cap the set is carried"
+		);
+
+		let past = sized_pair();
+		past.note_owed(paths.iter().map(String::as_str));
+		assert_eq!(
+			past.state().owed.len(),
+			0,
+			"one past the cap, no set is kept"
+		);
+		assert!(
+			!past.is_idle(),
+			"the whole read owed instead is a pass to run"
+		);
+		let (carried, full) = taken(&past);
+		assert_eq!((carried.len(), full), (0, Some(R::CarriedOver)));
 	}
 
 	/// A removal of `uuid`, as the cache announces one.
@@ -993,7 +1062,7 @@ pub(super) mod tests {
 		let handed = minted_delta(&[100, 101]);
 		let newer = [removed(102)];
 		let changes = sized_pair();
-		changes.note_owed(BTreeSet::from(["gone.txt".to_string()]));
+		changes.note_owed(["gone.txt"]);
 		changes.note_owed_remote(handed.clone());
 		changes.note_remote_batch(&mut newer.iter());
 
@@ -1083,7 +1152,7 @@ pub(super) mod tests {
 		);
 		let _ = changes.take();
 
-		changes.note_owed(BTreeSet::from(["owed.txt".to_string()]));
+		changes.note_owed(["owed.txt"]);
 		assert!(
 			!changes.is_idle(),
 			"a path the last plan left owing is something to look at"

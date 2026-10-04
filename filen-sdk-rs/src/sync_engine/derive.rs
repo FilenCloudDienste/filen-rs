@@ -929,16 +929,15 @@ mod tests {
 
 		// It is cut short before applying it, so no row was written and the file is still on disk.
 		// What it owes is its plan's paths...
-		let owed = carry_over(
-			&GuardDecision {
-				safe: planned.clone(),
-				held: Vec::new(),
-				reason: None,
-			},
-			&[],
-			&BTreeSet::new(),
-			&std::collections::HashMap::new(),
-		);
+		let decision = GuardDecision {
+			safe: planned.clone(),
+			held: Vec::new(),
+			reason: None,
+		};
+		let (no_paths, no_failures) = (BTreeSet::new(), std::collections::HashMap::new());
+		let owed: BTreeSet<String> = carry_over(&decision, &[], &no_paths, &no_failures)
+			.map(str::to_owned)
+			.collect();
 		assert_eq!(owed, BTreeSet::from(["docs/Ärger.txt".to_string()]));
 
 		// ...and handing back that half ALONE — the shape this stage's first attempt shipped —
@@ -952,7 +951,7 @@ mod tests {
 		// Both halves, through the changelist the next pass takes from: the same action again.
 		let changes = PairChanges::new();
 		changes.cover_local();
-		changes.note_owed(owed);
+		changes.note_owed(owed.iter().map(String::as_str));
 		changes.note_owed_remote(announced);
 		let mut scope = changes.take();
 		assert_eq!(
