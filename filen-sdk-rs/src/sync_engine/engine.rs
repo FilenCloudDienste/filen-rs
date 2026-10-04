@@ -5946,13 +5946,11 @@ mod tests {
 		sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 	};
 
-	use base64::{Engine as _, prelude::BASE64_STANDARD};
 	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
-	use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 
 	use super::*;
 	use crate::{
-		auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+		auth::test_support::offline_client,
 		cache::CacheState,
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
@@ -8644,31 +8642,6 @@ mod tests {
 		action.describe()
 	}
 
-	/// A client with no account and no network behind it. [`SyncEngine::open`] only hands it to
-	/// the cache to subscribe each pair's remote root, and a subscription the cache refuses leaves
-	/// that pair on the grace window instead of failing the open (see
-	/// [`SyncEngine::observe_pair`]) — which is exactly what an unconfigured cache answers.
-	fn offline_client() -> Arc<Client> {
-		let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).unwrap();
-		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
-		Arc::new(
-			unauthed
-				.from_stringified(StringifiedClient {
-					email: "sync-engine@example.invalid".to_string(),
-					user_id: 1,
-					root_uuid: Uuid::nil().to_string(),
-					auth_info: "0".repeat(64),
-					private_key: BASE64_STANDARD
-						.encode(private_key.to_pkcs8_der().unwrap().as_bytes()),
-					api_key: String::new(),
-					auth_version: 2,
-					max_parallel_requests: None,
-					max_io_memory_usage: None,
-				})
-				.unwrap(),
-		)
-	}
-
 	fn created(path: &str, replaced: Option<Uuid>) -> PendingKind {
 		PendingKind::Created {
 			path: path.to_string(),
@@ -9076,7 +9049,7 @@ mod tests {
 		// The restart itself: a real `open` on the same DB, so what is under test is the wiring
 		// the reopened engine actually runs — loading the journal and aging it — not a
 		// hand-assembled stand-in for it.
-		let engine = SyncEngine::open(offline_client(), path.clone())
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 			.await
 			.unwrap();
 
@@ -9119,7 +9092,7 @@ mod tests {
 		let path =
 			std::env::temp_dir().join(format!("filen_sync_watch_paused_{}.db", Uuid::new_v4()));
 		let engine = Arc::new(
-			SyncEngine::open(offline_client(), path.clone())
+			SyncEngine::open(Arc::new(offline_client()), path.clone())
 				.await
 				.unwrap(),
 		);
@@ -9153,11 +9126,11 @@ mod tests {
 	async fn a_second_engine_on_an_open_baseline_is_refused_until_the_first_is_dropped() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("baseline.db");
-		let first = SyncEngine::open(offline_client(), path.clone())
+		let first = SyncEngine::open(Arc::new(offline_client()), path.clone())
 			.await
 			.unwrap();
 
-		let refused = match SyncEngine::open(offline_client(), path.clone()).await {
+		let refused = match SyncEngine::open(Arc::new(offline_client()), path.clone()).await {
 			Ok(_) => panic!("a second engine opened a baseline the first one has open"),
 			Err(error) => error,
 		};
@@ -9170,11 +9143,13 @@ mod tests {
 			"{refused}"
 		);
 
-		let other = SyncEngine::open(offline_client(), dir.path().join("other.db"))
+		let other = SyncEngine::open(Arc::new(offline_client()), dir.path().join("other.db"))
 			.await
 			.unwrap();
 		drop(first);
-		SyncEngine::open(offline_client(), path).await.unwrap();
+		SyncEngine::open(Arc::new(offline_client()), path)
+			.await
+			.unwrap();
 		drop(other);
 	}
 
@@ -9222,7 +9197,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_approval_makes_the_next_pass_due_and_wakes_the_watch() {
 		let path = std::env::temp_dir().join(format!("filen_sync_approve_{}.db", Uuid::new_v4()));
-		let engine = SyncEngine::open(offline_client(), path.clone())
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 			.await
 			.unwrap();
 		let (pair, _) = locked(&engine.control)
@@ -9269,7 +9244,7 @@ mod tests {
 		let path =
 			std::env::temp_dir().join(format!("filen_sync_watch_race_{}.db", Uuid::new_v4()));
 		let engine = Arc::new(
-			SyncEngine::open(offline_client(), path.clone())
+			SyncEngine::open(Arc::new(offline_client()), path.clone())
 				.await
 				.unwrap(),
 		);
@@ -9318,7 +9293,7 @@ mod tests {
 		let path =
 			std::env::temp_dir().join(format!("filen_sync_pause_race_{}.db", Uuid::new_v4()));
 		let engine = Arc::new(
-			SyncEngine::open(offline_client(), path.clone())
+			SyncEngine::open(Arc::new(offline_client()), path.clone())
 				.await
 				.unwrap(),
 		);
@@ -9473,9 +9448,15 @@ mod tests {
 	}
 
 	/// A fresh engine on a throwaway baseline DB, with one pair registered.
+	///
+	/// An offline client is enough to open an engine, here and in every test that opens one:
+	/// [`SyncEngine::open`] only hands it to the cache to subscribe each pair's remote root, and a
+	/// subscription the cache refuses leaves that pair on the grace window instead of failing the
+	/// open (see [`SyncEngine::observe_pair`]) — which is exactly what an unconfigured cache
+	/// answers.
 	async fn engine_with_pair(tag: &str) -> (SyncEngine, PairId, PathBuf) {
 		let path = std::env::temp_dir().join(format!("filen_sync_{tag}_{}.db", Uuid::new_v4()));
-		let engine = SyncEngine::open(offline_client(), path.clone())
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 			.await
 			.unwrap();
 		let (pair, _) = locked(&engine.control)
@@ -10325,7 +10306,7 @@ mod tests {
 			std::env::temp_dir().join(format!("filen_sync_keep_remote_{}.db", Uuid::new_v4()));
 		let root = std::env::temp_dir().join(format!("filen_sync_keep_remote_{}", Uuid::new_v4()));
 		std::fs::create_dir_all(&root).unwrap();
-		let engine = SyncEngine::open(offline_client(), path.clone())
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
 			.await
 			.unwrap();
 		let (pair, _) = locked(&engine.control)
@@ -10415,7 +10396,7 @@ mod tests {
 		let dir = tempfile::tempdir().unwrap();
 		let cache = dir.path().join("cache.db");
 		drop(CacheState::new_on_path(&cache, Uuid::from_u128(1)));
-		let client = offline_client();
+		let client = Arc::new(offline_client());
 		client.configure_cache(cache, |_| {}).await.unwrap();
 		let db = dir.path().join("sync.db");
 		let engine = SyncEngine::open(client, db.clone()).await.unwrap();

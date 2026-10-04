@@ -11,7 +11,8 @@
 //! a path into a slot, which is the one thing `prepare_scoped` asks the client for; and on a
 //! converged fixture holding no `.filenignore` and no unconfirmed row, the two paths that WOULD dial
 //! the server — the remote rule-file fetch and `confirm_pushes`' version chain — are unreachable.
-//! The engine's own unit tests already open engines this way (`offline_client` in `engine.rs`).
+//! So the harness opens its engines on the same offline client the engine's own unit tests use
+//! (`auth::test_support::offline_client`), whose credentials only have to parse.
 //!
 //! # How the pieces answer the ways a microbenchmark lies
 //!
@@ -72,13 +73,11 @@ use std::{
 	time::{Duration, Instant},
 };
 
-use base64::{Engine as _, prelude::BASE64_STANDARD};
 use filen_types::crypto::Blake3Hash;
 use notify::{
 	Event, EventKind,
 	event::{DataChange, ModifyKind, RemoveKind, RenameMode},
 };
-use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -92,7 +91,7 @@ use super::{
 	scan::{self, RuleFiles},
 };
 use crate::{
-	auth::{Client, StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+	auth::test_support::offline_client,
 	cache::{RemoteItem, bench_support},
 };
 
@@ -1488,43 +1487,6 @@ async fn mark_overhead_ns() -> f64 {
 // Running a scenario
 // ---------------------------------------------------------------------------------------------
 
-/// A client with no account and no network behind it, for an engine that will never dial one.
-///
-/// A pass's READ path asks the client for exactly one thing — the configured cache DB path — and the
-/// two paths that would reach the server (the remote `.filenignore` fetch and `confirm_pushes`'
-/// version chain) are unreachable on a converged fixture holding no rule file and no unconfirmed
-/// row. So the credentials here only have to PARSE; nothing ever authenticates with them.
-///
-/// 512 bits because this key is never used to encrypt anything: `from_stringified` derives a public
-/// key and an HMAC key from it and that is all. A real 2048-bit key would cost every run half a
-/// second to generate and measure nothing.
-fn offline_client() -> Arc<Client> {
-	let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
-		.expect("generating the harness's throwaway RSA key");
-	let unauthed = UnauthClient::from_config(ClientConfig::default())
-		.expect("building an unauthenticated client makes no network call");
-	Arc::new(
-		unauthed
-			.from_stringified(StringifiedClient {
-				email: "sync-engine-bench@example.invalid".to_owned(),
-				user_id: 1,
-				root_uuid: uuid::Uuid::nil().to_string(),
-				auth_info: "0".repeat(64),
-				private_key: BASE64_STANDARD.encode(
-					private_key
-						.to_pkcs8_der()
-						.expect("a freshly generated key encodes")
-						.as_bytes(),
-				),
-				api_key: String::new(),
-				auth_version: 2,
-				max_parallel_requests: None,
-				max_io_memory_usage: None,
-			})
-			.expect("the harness's own credentials parse"),
-	)
-}
-
 /// What a watcher reports for a file whose contents were rewritten.
 const EDIT: EventKind = EventKind::Modify(ModifyKind::Data(DataChange::Any));
 
@@ -1644,7 +1606,7 @@ fn fixture_signature(fixture: &Fixture, rows: &[BaselineEntry]) -> u64 {
 async fn prepare_bed(scenario: &Scenario) -> Bed {
 	let fixture = Fixture::build(scenario.nodes, &scenario.shape());
 
-	let client = offline_client();
+	let client = Arc::new(offline_client());
 	client
 		.configure_cache(fixture.cache_db().to_path_buf(), |_| {})
 		.await
@@ -2513,7 +2475,7 @@ async fn measure_in_child(floor: u64, handover: &Handover) -> MemAnswer {
 	let rss_after_runtime = probe::current_rss_bytes();
 	let scenario = scenario(&handover.scenario)
 		.unwrap_or_else(|| panic!("no scenario named {:?}", handover.scenario));
-	let client = offline_client();
+	let client = Arc::new(offline_client());
 	client
 		.configure_cache(handover.place.cache_db.clone(), |_| {})
 		.await
