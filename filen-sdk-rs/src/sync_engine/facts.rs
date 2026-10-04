@@ -261,9 +261,12 @@ fn prune_reports(reports: &mut Vec<UnsyncablePath>, at: &str) {
 }
 
 /// The paths the NEXT pass owes a look at whatever its changelists say — the carry-over set of the
-/// optimization plan's section 3.6.
+/// optimization plan's section 3.6 — as a list that may name a path more than once (an action that
+/// is not a move names its one path as both endpoints).
+/// [`PairChanges::note_owed`](super::changes::PairChanges::note_owed) makes the set, and decides
+/// whether to keep one at all.
 ///
-/// Built at the end of every pass out of that pass's own plan, and consumed as an INPUT to the next
+/// Drawn at the end of every pass out of that pass's own plan, and consumed as an INPUT to the next
 /// pass's dirty set. What is in it:
 ///
 /// - every path this pass's plan released past the guard, both endpoints of a move included,
@@ -294,29 +297,28 @@ fn prune_reports(reports: &mut Vec<UnsyncablePath>, at: &str) {
 /// It is not a changelist entry. Feeding it through the capped local list is the mistake the first
 /// attempt at this made: the cap is a quarter of the tree size as the pair last RECORDED it, which
 /// is zero before a pair's first sync, so a plan of any size collapsed the next pass to a
-/// whole-tree read and reported that pass as owing work it had in fact applied. The set is also not
-/// a reason on its own: the full-pass triggers of section 3.5 are unchanged by it, and an
+/// whole-tree read and reported that pass as owing work it had in fact applied. It is bounded
+/// instead by the absolute cap the changelists' own cap tops out at: a plan that names more paths
+/// than that leaves no set behind, and the next pass reads both sides whole
+/// ([`FullPassReason::CarriedOver`](super::FullPassReason::CarriedOver)). Within that bound the set
+/// is not a reason on its own: the full-pass triggers of section 3.5 are unchanged by it, and an
 /// interrupted pass still forces the next one full in this round.
-pub(super) fn carry_over(
-	decision: &GuardDecision,
-	conflicts: &[PlannedConflict],
-	held_remote: &BTreeSet<String>,
-	failures: &HashMap<String, PathFailure>,
-) -> BTreeSet<String> {
-	let mut owed: BTreeSet<String> = BTreeSet::new();
-	for action in &decision.safe {
-		let (from, to) = action.endpoints();
-		owed.insert(from.to_owned());
-		owed.insert(to.to_owned());
-	}
-	owed.extend(
-		conflicts
-			.iter()
-			.map(|conflict| conflict.rel_path.clone())
-			.chain(held_remote.iter().cloned())
-			.chain(failures.keys().cloned()),
-	);
-	owed
+pub(super) fn carry_over<'a>(
+	decision: &'a GuardDecision,
+	conflicts: &'a [PlannedConflict],
+	held_remote: &'a BTreeSet<String>,
+	failures: &'a HashMap<String, PathFailure>,
+) -> impl Iterator<Item = &'a str> {
+	decision
+		.safe
+		.iter()
+		.flat_map(|action| {
+			let (from, to) = action.endpoints();
+			[from, to]
+		})
+		.chain(conflicts.iter().map(|conflict| conflict.rel_path.as_str()))
+		.chain(held_remote.iter().map(String::as_str))
+		.chain(failures.keys().map(String::as_str))
 }
 
 #[cfg(test)]
@@ -758,19 +760,17 @@ mod tests {
 			),
 		]);
 
-		let owed = carry_over(
-			&GuardDecision {
-				safe: released,
-				held: Vec::new(),
-				reason: None,
-			},
-			&conflicts,
-			&BTreeSet::from(["midflight.txt".to_owned()]),
-			&failures,
-		);
+		let decision = GuardDecision {
+			safe: released,
+			held: Vec::new(),
+			reason: None,
+		};
+		let midflight = BTreeSet::from(["midflight.txt".to_owned()]);
+		let owed: BTreeSet<&str> =
+			carry_over(&decision, &conflicts, &midflight, &failures).collect();
 
 		assert_eq!(
-			listed(&owed),
+			Vec::from_iter(owed),
 			vec![
 				"clash.txt",
 				"flaky.txt",
@@ -790,25 +790,26 @@ mod tests {
 	/// hold from ever being idle, and every wake would re-read both trees to hold it again.
 	#[test]
 	fn a_held_batch_is_not_carried_over() {
-		let owed = carry_over(
-			&GuardDecision {
-				safe: vec![SyncAction::UploadFile {
-					rel_path: "up.txt".to_owned(),
-				}],
-				held: vec![SyncAction::TrashRemote {
-					rel_path: "gone.txt".to_owned(),
-					kind: NodeKind::File,
-					remote_uuid: Uuid::from_u128(8),
-				}],
-				reason: Some(GuardReason::ExceededThreshold {
-					deletions: 1,
-					limit: 0,
-				}),
-			},
-			&[],
-			&BTreeSet::new(),
-			&HashMap::new(),
+		let decision = GuardDecision {
+			safe: vec![SyncAction::UploadFile {
+				rel_path: "up.txt".to_owned(),
+			}],
+			held: vec![SyncAction::TrashRemote {
+				rel_path: "gone.txt".to_owned(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(8),
+			}],
+			reason: Some(GuardReason::ExceededThreshold {
+				deletions: 1,
+				limit: 0,
+			}),
+		};
+		let (no_paths, no_failures) = (BTreeSet::new(), HashMap::new());
+		let owed: Vec<&str> = carry_over(&decision, &[], &no_paths, &no_failures).collect();
+		assert_eq!(
+			owed,
+			vec!["up.txt", "up.txt"],
+			"an upload names its one path as both endpoints; the held trash names nothing"
 		);
-		assert_eq!(listed(&owed), vec!["up.txt"]);
 	}
 }

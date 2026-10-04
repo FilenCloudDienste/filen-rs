@@ -5024,14 +5024,13 @@ impl SyncEngine {
 				.unwrap_or_default(),
 			Err(_) => HashMap::new(),
 		};
-		let owed = facts::carry_over(
-			decision,
-			&report.conflicts,
-			&prep.holds.held_remote,
-			&failures,
-		);
 		if let Some(changes) = self.existing_pair_changes(pair).await {
-			changes.note_owed(owed);
+			changes.note_owed(facts::carry_over(
+				decision,
+				&report.conflicts,
+				&prep.holds.held_remote,
+				&failures,
+			));
 		}
 		self.carried.lock().await.insert(
 			pair,
@@ -5445,7 +5444,8 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	// nothing to show for them: no plan named the paths, and the lists went with the pass.
 	//
 	// A plan abandoned part-way (`interrupted`) does: `carry_forward` recorded the paths it named
-	// and the apply handed its announced changes back (`note_owed_remote`), so the next pass
+	// (or, past the cap, made the next pass whole itself — `PairChanges::note_owed`) and the apply
+	// handed its announced changes back (`note_owed_remote`), so the next pass
 	// re-plans what this one did not reach from the same evidence. That holds only for a pass that
 	// PLANNED from its changelists — one that read both sides whole planned from a snapshot and a
 	// walk, which no list can hand back, so its remainder still wants a whole read. `full_pass` is
