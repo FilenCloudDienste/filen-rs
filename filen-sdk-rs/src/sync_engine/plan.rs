@@ -3585,10 +3585,13 @@ fn action_phase(action: &SyncAction, replaced: &HashSet<String>) -> u8 {
 /// The paths a deletion of this pass empties and a create of the same pass fills again: the paths
 /// of its type flips (see [`SyncAction::is_create`]). A lookup for either half tells whether the
 /// action is part of one; a first sync, all creates, and a mass deletion, all deletions, hold none.
-pub(super) fn replaced_paths(actions: &[SyncAction]) -> HashSet<String> {
+pub(super) fn replaced_paths<'a>(
+	actions: impl IntoIterator<Item = &'a SyncAction> + Clone,
+) -> HashSet<String> {
 	let paths = |deletions: bool| {
 		actions
-			.iter()
+			.clone()
+			.into_iter()
 			.filter(move |a| {
 				if deletions {
 					a.is_delete()
@@ -3719,7 +3722,7 @@ pub(super) fn fold_subsumed_deletes(actions: &mut Vec<SyncAction>) -> Subsumed {
 /// put the old item's removal ahead of the create at that path, with the directory case held back
 /// until after the moves because trashing a directory takes its whole subtree with it.
 fn order_actions(actions: &mut [SyncAction]) {
-	let replaced = replaced_paths(actions);
+	let replaced = replaced_paths(&*actions);
 	actions.sort_by(|a, b| {
 		let (pa, pb) = (action_phase(a, &replaced), action_phase(b, &replaced));
 		if pa != pb {

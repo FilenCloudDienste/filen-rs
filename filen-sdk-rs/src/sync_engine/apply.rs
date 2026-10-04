@@ -41,9 +41,9 @@ use super::{
 	},
 	pause::PassGate,
 	plan::{RemoteNode, Subsumed, SyncAction, is_under, replaced_paths},
-	rows::Baseline,
+	rows::{Baseline, Cursor},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
-	side::NodesAt,
+	side::{NodesAt, Side},
 };
 use crate::{
 	auth::Client,
@@ -216,8 +216,8 @@ impl SyncReport {
 	}
 }
 
-/// Everything the apply pass needs besides the actions: the resolved remote-side objects and the
-/// scan/view maps.
+/// Everything the apply pass needs besides its actions and what each of them reads (see
+/// [`PlannedEntry`]).
 pub(super) struct ApplyContext<'a> {
 	pub(super) client: &'a Client,
 	pub(super) local_root: &'a Path,
@@ -229,16 +229,6 @@ pub(super) struct ApplyContext<'a> {
 	/// runs on the caller's thread; the exception is a directory move's subtree re-key, which does
 	/// not (see [`commit_dir_move`]).
 	pub(super) store: &'a SharedStore,
-	/// The pass's local side. A trait object rather than a type parameter: every read here is one
-	/// path per action, next to the network and disk work that action does, so the vtable call is
-	/// unmeasurable — and the alternative is two type parameters threaded through every function
-	/// in this module.
-	pub(super) local: &'a (dyn NodesAt<Node = LocalNode> + Send + Sync),
-	/// The pair's baseline as of the start of the pass — what the local side is expected to hold —
-	/// FROZEN at the paths the plan's actions name and their ancestors (see `Baseline::freeze`):
-	/// every lookup here, and every carried node `local` and `remote` derive, is one of those.
-	pub(super) baseline: &'a Baseline,
-	pub(super) remote: &'a (dyn NodesAt<Node = RemoteNode> + Send + Sync),
 	/// The sync root resolved to a remote directory (every top-level parent).
 	pub(super) root_remote: RemoteDirectory,
 	/// Whether this pass's absence evidence is trustworthy (see
@@ -259,6 +249,251 @@ pub(super) struct ApplyContext<'a> {
 	/// The deletions each directory deletion of the plan carries out along with its own, whose
 	/// baseline rows it drops (see [`plan::fold_subsumed_deletes`](super::plan)).
 	pub(super) subsumed: &'a Subsumed,
+}
+
+/// One action of the plan, with what the apply reads for it as the pass started (see
+/// [`PlannedEntry::plan`], the only way to make one).
+#[derive(Debug)]
+pub(super) struct PlannedEntry {
+	action: SyncAction,
+	start: PassStart,
+}
+
+/// What the apply reads for one action, read when the plan was made: a variant per kind of action,
+/// carrying exactly what that kind reads (see [`PassStart::of`]), so the apply's arm for a kind
+/// reaches nothing its entry was not given. Each input is `None` where the pass held nothing.
+///
+/// The inputs are: the local and the remote node at the action's path (a move's destination), the
+/// baseline row there and at the path a move starts from, and `parent_uuid`, the remote directory
+/// the view listed at the parent of the action's path.
+///
+/// Nodes and rows boxed: a kind reads at most three of them, and slots holding each inline would
+/// cost every entry the room of the largest variant.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PassStart {
+	/// A local directory create, or a remote directory trash: the remote directory at its path.
+	Remote { remote: Option<Box<RemoteNode>> },
+	/// A download: the remote file it fetches, and the row the local copy at its path answers to.
+	Download {
+		remote: Option<Box<RemoteNode>>,
+		base: Option<Box<BaselineEntry>>,
+	},
+	/// An upload: the local file it sends, the remote one it versions, the row whose agreed content
+	/// it keeps, and where it lands.
+	Upload {
+		local: Option<Box<LocalNode>>,
+		remote: Option<Box<RemoteNode>>,
+		base: Option<Box<BaselineEntry>>,
+		parent_uuid: Option<Uuid>,
+	},
+	/// A remote directory create: the local directory it mirrors, the remote item it replaces, and
+	/// where it lands.
+	CreateRemoteDir {
+		local: Option<Box<LocalNode>>,
+		remote: Option<Box<RemoteNode>>,
+		parent_uuid: Option<Uuid>,
+	},
+	/// A remote file move: the local file at its destination, the row it moves from, and where it
+	/// lands.
+	MoveRemoteFile {
+		local: Option<Box<LocalNode>>,
+		base_from: Option<Box<BaselineEntry>>,
+		parent_uuid: Option<Uuid>,
+	},
+	/// A remote directory move: the remote directory at its destination, and where it lands.
+	MoveRemoteDir {
+		remote: Option<Box<RemoteNode>>,
+		parent_uuid: Option<Uuid>,
+	},
+	/// A local file move: the remote file at its destination, the row there, and the row it moves
+	/// from.
+	MoveLocalFile {
+		remote: Option<Box<RemoteNode>>,
+		base: Option<Box<BaselineEntry>>,
+		base_from: Option<Box<BaselineEntry>>,
+	},
+	/// A conflict, or a baseline adoption: both nodes at its path.
+	Sides {
+		local: Option<Box<LocalNode>>,
+		remote: Option<Box<RemoteNode>>,
+	},
+	/// A local deletion, a remote file trash, or a local directory move: nothing.
+	Nothing,
+}
+
+/// Where [`PassStart::of`] reads an action's inputs: the pass's own trees as its plan is made
+/// ([`PassTrees`]). Asked only for what the action's kind reads, and each at most once.
+pub(super) trait StartInputs {
+	/// The local node at `path`.
+	fn local(&mut self, path: &str) -> Option<Box<LocalNode>>;
+	/// The remote node at `path`.
+	fn remote(&mut self, path: &str) -> Option<Box<RemoteNode>>;
+	/// The baseline row at `path`, the action's own.
+	fn base(&mut self, path: &str) -> Option<Box<BaselineEntry>>;
+	/// The baseline row at `from_path`, where a move starts.
+	fn base_from(&mut self, from_path: &str) -> Option<Box<BaselineEntry>>;
+	/// The remote directory the view listed at the parent of `path`.
+	fn parent_uuid(&mut self, path: &str) -> Option<Uuid>;
+}
+
+/// The pass's two sides and its rows, asked for one action at a time in plan order — which is path
+/// order within each phase, so the questions in a row walk the pages the cursor reads.
+struct PassTrees<'a, L, R> {
+	local: &'a L,
+	remote: &'a R,
+	rows: Cursor<'a>,
+}
+
+impl<L, R> StartInputs for PassTrees<'_, L, R>
+where
+	L: NodesAt<Node = LocalNode>,
+	R: NodesAt<Node = RemoteNode>,
+{
+	fn local(&mut self, path: &str) -> Option<Box<LocalNode>> {
+		self.local.at(path).map(|node| Box::new(node.into_owned()))
+	}
+
+	fn remote(&mut self, path: &str) -> Option<Box<RemoteNode>> {
+		self.remote.at(path).map(|node| Box::new(node.into_owned()))
+	}
+
+	fn base(&mut self, path: &str) -> Option<Box<BaselineEntry>> {
+		self.rows.get(path).map(Box::new)
+	}
+
+	fn base_from(&mut self, from_path: &str) -> Option<Box<BaselineEntry>> {
+		self.base(from_path)
+	}
+
+	fn parent_uuid(&mut self, path: &str) -> Option<Uuid> {
+		dir_uuid(self.remote.at(parent_and_name(path).0).as_deref())
+	}
+}
+
+impl PlannedEntry {
+	/// The plan's `actions`, each with what the apply reads for it out of the pass's `baseline` and
+	/// its two sides.
+	///
+	/// It takes those three, and drops them: the scan and the view are a node per item of the tree,
+	/// and the baseline's snapshot is the pass's read transaction, which has to END before the first
+	/// action commits (see [`Baseline::close`]). Every answer an entry carries is the one the plan was
+	/// made from, the pass's own commits landing in none of them.
+	pub(super) fn plan(
+		actions: Vec<SyncAction>,
+		baseline: Baseline,
+		local: Side<LocalNode>,
+		remote: Side<RemoteNode>,
+	) -> Vec<Self> {
+		let entries = {
+			let (local, remote) = (local.of(&baseline), remote.of(&baseline));
+			let mut trees = PassTrees {
+				local: &local,
+				remote: &remote,
+				rows: baseline.cursor(),
+			};
+			actions
+				.into_iter()
+				.map(|action| {
+					let start = PassStart::of(&action, &mut trees);
+					Self { action, start }
+				})
+				.collect()
+		};
+		baseline.close();
+		entries
+	}
+
+	/// The row the pass started with at the path of a download or an upload, for a test holding the
+	/// rows to the pass.
+	#[cfg(test)]
+	pub(super) fn base(&self) -> Option<&BaselineEntry> {
+		match &self.start {
+			PassStart::Download { base, .. } | PassStart::Upload { base, .. } => base.as_deref(),
+			other => panic!("not a transfer's inputs: {other:?}"),
+		}
+	}
+}
+
+impl PassStart {
+	/// What the apply reads for `action` — in `apply_one`, `apply_transfer` and
+	/// `resolve_folded_objects` — read out of `inputs`, and nothing else.
+	pub(super) fn of(action: &SyncAction, inputs: &mut impl StartInputs) -> Self {
+		let path = action.rel_path();
+		match action {
+			SyncAction::CreateLocalDir { .. }
+			| SyncAction::TrashRemote {
+				kind: NodeKind::Dir,
+				..
+			} => Self::Remote {
+				remote: inputs.remote(path),
+			},
+			SyncAction::DownloadFile { .. } => Self::Download {
+				remote: inputs.remote(path),
+				base: inputs.base(path),
+			},
+			SyncAction::UploadFile { .. } => Self::Upload {
+				local: inputs.local(path),
+				remote: inputs.remote(path),
+				base: inputs.base(path),
+				parent_uuid: inputs.parent_uuid(path),
+			},
+			SyncAction::CreateRemoteDir { .. } => Self::CreateRemoteDir {
+				local: inputs.local(path),
+				remote: inputs.remote(path),
+				parent_uuid: inputs.parent_uuid(path),
+			},
+			SyncAction::MoveRemote {
+				from_path,
+				kind: NodeKind::File,
+				..
+			} => Self::MoveRemoteFile {
+				local: inputs.local(path),
+				base_from: inputs.base_from(from_path),
+				parent_uuid: inputs.parent_uuid(path),
+			},
+			SyncAction::MoveRemote {
+				kind: NodeKind::Dir,
+				..
+			} => Self::MoveRemoteDir {
+				remote: inputs.remote(path),
+				parent_uuid: inputs.parent_uuid(path),
+			},
+			SyncAction::MoveLocal {
+				from_path,
+				kind: NodeKind::File,
+				..
+			} => Self::MoveLocalFile {
+				remote: inputs.remote(path),
+				base: inputs.base(path),
+				base_from: inputs.base_from(from_path),
+			},
+			SyncAction::Conflict { .. } | SyncAction::AdoptBaseline { .. } => Self::Sides {
+				local: inputs.local(path),
+				remote: inputs.remote(path),
+			},
+			SyncAction::DeleteLocal { .. }
+			| SyncAction::TrashRemote {
+				kind: NodeKind::File,
+				..
+			}
+			| SyncAction::MoveLocal {
+				kind: NodeKind::Dir,
+				..
+			} => Self::Nothing,
+		}
+	}
+}
+
+/// The uuid of `node`, when it is a directory.
+fn dir_uuid(node: Option<&RemoteNode>) -> Option<Uuid> {
+	node.filter(|node| node.kind == NodeKind::Dir)
+		.map(|node| node.remote_uuid)
+}
+
+/// An entry whose inputs are not the ones its action's kind reads. [`PassStart::of`] makes every
+/// entry's, so this is a bug, and fails the action rather than reading inputs it was not given.
+fn unpaired() -> crate::Error {
+	internal("an entry's pass-start inputs are not its action's (should be impossible)")
 }
 
 fn local_path(root: &Path, rel_path: &str) -> PathBuf {
@@ -367,7 +602,11 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 	DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
 }
 
-/// Execute `actions` (already ordered + guard-screened) against the remote and local tree.
+/// Execute `entries` (already ordered + guard-screened) against the remote and local tree.
+///
+/// Each entry carries what its action reads as the pass started, so the apply reads neither the
+/// pass's rows nor its two sides — and holds no read transaction open behind the commits it makes
+/// (see [`PlannedEntry::plan`]).
 ///
 /// The drive-write lock is held per bounded BATCH of remote writes (see [`Lease`]) so the per-op
 /// `lock_drive` calls inside upload/create become free clones of the held lock instead of each
@@ -393,16 +632,10 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// records it (see [`apply_transfer`]), so the two always agree.
 pub(super) async fn apply(
 	ctx: ApplyContext<'_>,
-	actions: Vec<SyncAction>,
+	entries: Vec<PlannedEntry>,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
-	// Every commit below would otherwise land behind the pass's open read transaction, which no
-	// checkpoint can reach past (see `Baseline::freeze`).
-	assert!(
-		ctx.baseline.is_frozen(),
-		"the apply layer runs on the rows its plan named, frozen, never on the pass's open snapshot"
-	);
 	// uuid -> the remote file object, for every file this plan acts on: hydrated from the cache
 	// by [`resolve_folded_objects`], and from the server for what this engine wrote and the cache
 	// has not listed yet.
@@ -413,26 +646,27 @@ pub(super) async fn apply(
 	// clone per directory — tens of thousands of them on a large pair — to answer a few lookups.
 	let mut dir_by_path: HashMap<String, RemoteDirectory> = HashMap::new();
 	dir_by_path.insert(String::new(), ctx.root_remote.clone());
-	resolve_folded_objects(&ctx, &actions, &mut files, &mut dir_by_path).await;
+	resolve_folded_objects(&ctx, &entries, &mut files, &mut dir_by_path).await;
 
 	// Split the phase-ordered plan: creates+moves first (serial — they fill `dir_by_path` and are
 	// parent-before-child), then transfers (concurrent), then deletes (serial — descendant-first).
 	// A "replace-delete" (a delete whose path is (re)created this pass — a file<->dir type flip) is
 	// routed into `pre` so it runs BEFORE the create at that path (the actions are already ordered
 	// so it sorts ahead of the create); otherwise the server rejects the create (old item exists).
-	let replaced = replaced_paths(&actions);
+	let replaced = replaced_paths(entries.iter().map(|entry| &entry.action));
 	let mut pre = Vec::new();
 	let mut transfers = Vec::new();
 	let mut post = Vec::new();
-	for action in actions {
+	for entry in entries {
+		let action = &entry.action;
 		if action.is_delete() && replaced.contains(action.rel_path()) {
-			pre.push(action);
-		} else if is_transfer(&action) {
-			transfers.push(action);
+			pre.push(entry);
+		} else if is_transfer(action) {
+			transfers.push(entry);
 		} else if action.is_delete() {
-			post.push(action);
+			post.push(entry);
 		} else {
-			pre.push(action);
+			pre.push(entry);
 		}
 	}
 	order_transfers(&pre, &mut transfers);
@@ -443,7 +677,12 @@ pub(super) async fn apply(
 
 	// Where the drive lock may be let go: before an action no earlier one is still waiting on.
 	let releasable = {
-		let order: Vec<&SyncAction> = pre.iter().chain(&transfers).chain(&post).collect();
+		let order: Vec<&SyncAction> = pre
+			.iter()
+			.chain(&transfers)
+			.chain(&post)
+			.map(|entry| &entry.action)
+			.collect();
 		release_points(&order, &replaced)
 	};
 	let (pre_release, rest) = releasable.split_at(pre.len());
@@ -453,7 +692,8 @@ pub(super) async fn apply(
 	let mut writes = PassWrites::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
-	for (action, &releasable) in pre.iter().zip(pre_release) {
+	for (entry, &releasable) in pre.iter().zip(pre_release) {
+		let action = &entry.action;
 		if !admits_more(report) {
 			break;
 		}
@@ -470,7 +710,7 @@ pub(super) async fn apply(
 			}
 			if let Some(reason) = apply_serial(
 				&ctx,
-				action,
+				entry,
 				&files,
 				&mut dir_by_path,
 				&mut writes,
@@ -485,10 +725,10 @@ pub(super) async fn apply(
 		applied += 1;
 	}
 
-	let pending: Vec<(&SyncAction, bool)> = transfers
+	let pending: Vec<(&PlannedEntry, bool)> = transfers
 		.iter()
 		.zip(transfer_release.iter().copied())
-		.filter(|(action, _)| !writes.skips(action, report, observer))
+		.filter(|(entry, _)| !writes.skips(&entry.action, report, observer))
 		.collect();
 	applied += transfers.len() - pending.len();
 
@@ -505,8 +745,9 @@ pub(super) async fn apply(
 		loop {
 			while in_flight.len() < concurrency
 				&& admits_more(report)
-				&& let Some(&(action, releasable)) = pending.peek()
+				&& let Some(&(entry, releasable)) = pending.peek()
 			{
+				let action = &entry.action;
 				// Once an action finds a side full, the transfers already running finish, and the ones
 				// not started yet that write to that side never start (they record nothing). Held back
 				// for want of room: carried out as far as this pass can, owed to no pause.
@@ -526,7 +767,7 @@ pub(super) async fn apply(
 				lease.note_start(action);
 				pending.next();
 				remote_in_flight += usize::from(mutates_remote(action));
-				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path, &progress));
+				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
 			}
 			let next = tokio::select! {
 				biased;
@@ -541,18 +782,18 @@ pub(super) async fn apply(
 				if !admits_more(report) {
 					break;
 				}
-				let Some((action, releasable)) = pending.next() else {
+				let Some((entry, releasable)) = pending.next() else {
 					break;
 				};
-				match lease.prepare(&ctx, action, releasable).await {
+				match lease.prepare(&ctx, &entry.action, releasable).await {
 					Some(Ok(())) => {}
 					Some(Err(error)) => {
 						return note_lock_failure(report, total - applied, &error, observer);
 					}
 					None => return note_interrupted(report, total - applied, observer),
 				}
-				remote_in_flight += usize::from(mutates_remote(action));
-				in_flight.push(run_transfer(&ctx, action, &files, &dir_by_path, &progress));
+				remote_in_flight += usize::from(mutates_remote(&entry.action));
+				in_flight.push(run_transfer(&ctx, entry, &files, &dir_by_path, &progress));
 				continue;
 			};
 			remote_in_flight -= usize::from(mutates_remote(action));
@@ -610,7 +851,8 @@ pub(super) async fn apply(
 		}
 	}
 
-	for (action, &releasable) in post.iter().zip(post_release) {
+	for (entry, &releasable) in post.iter().zip(post_release) {
+		let action = &entry.action;
 		if !admits_more(report) {
 			break;
 		}
@@ -627,7 +869,7 @@ pub(super) async fn apply(
 			}
 			apply_serial(
 				&ctx,
-				action,
+				entry,
 				&files,
 				&mut dir_by_path,
 				&mut writes,
@@ -649,7 +891,7 @@ pub(super) async fn apply(
 /// landed write (see [`apply_transfer`]).
 async fn run_transfer<'a>(
 	ctx: &ApplyContext<'_>,
-	action: &'a SyncAction,
+	planned: &'a PlannedEntry,
 	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 	progress: &UnboundedSender<SyncEvent>,
@@ -659,8 +901,8 @@ async fn run_transfer<'a>(
 	Result<Transfer, crate::Error>,
 ) {
 	let mut quarantined = None;
-	let result = apply_transfer(ctx, action, files, dir_by_path, progress, &mut quarantined).await;
-	(action, quarantined, result)
+	let result = apply_transfer(ctx, planned, files, dir_by_path, progress, &mut quarantined).await;
+	(&planned.action, quarantined, result)
 }
 
 /// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
@@ -786,22 +1028,26 @@ fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) 
 /// the pass hold the drive lock least: first the ones that finish a compound step of `pre` (the create
 /// half of a replace-delete, anything under a moved directory), so that step ends as early as it can
 /// (see [`release_points`]); then downloads, which need no lock; then uploads, which do.
-fn order_transfers(pre: &[SyncAction], transfers: &mut [SyncAction]) {
+fn order_transfers(pre: &[PlannedEntry], transfers: &mut [PlannedEntry]) {
 	let replaced: HashSet<&str> = pre
 		.iter()
+		.map(|entry| &entry.action)
 		.filter(|action| action.is_delete())
 		.map(SyncAction::rel_path)
 		.collect();
-	let moved_dirs: Vec<&str> = pre.iter().filter_map(moved_dir).collect();
-	transfers.sort_by_key(|action| {
-		let path = action.rel_path();
+	let moved_dirs: Vec<&str> = pre
+		.iter()
+		.filter_map(|entry| moved_dir(&entry.action))
+		.collect();
+	transfers.sort_by_key(|entry| {
+		let path = entry.action.rel_path();
 		let completes_step = replaced.contains(path)
 			|| moved_dirs
 				.iter()
 				.any(|dir| path == *dir || is_under(path, dir));
 		(
 			!completes_step,
-			matches!(action, SyncAction::UploadFile { .. }),
+			matches!(entry.action, SyncAction::UploadFile { .. }),
 		)
 	});
 }
@@ -1078,61 +1324,86 @@ fn note_interrupted(
 ///
 /// Directories the snapshot DOES describe are built from its rows here, for the same handful of
 /// paths, which is why every parent lookup in the apply below is a path this function was asked
-/// about: the parent of an upload or a create, the target of a trash, and both ends of a move.
+/// about: the parent of an upload or a create, the target of a trash, and both ends of a move. Each
+/// is the directory the view listed there, as its entry read it (see [`PassStart`]); a path the
+/// view held no directory at is left out, and the action that wanted it fails.
 async fn resolve_folded_objects(
 	ctx: &ApplyContext<'_>,
-	actions: &[SyncAction],
+	entries: &[PlannedEntry],
 	files: &mut HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 ) {
 	let mut wanted_files: HashSet<Uuid> = HashSet::new();
-	let mut wanted_dirs: HashSet<&str> = HashSet::new();
-	for action in actions {
-		match action {
-			SyncAction::DownloadFile { remote_uuid, .. } => {
+	// Path -> the directory the view listed there. Every entry naming a path read it from the same
+	// view, so the first answer is every answer.
+	let mut wanted_dirs: HashMap<&str, Uuid> = HashMap::new();
+	let mut want_dir = |path, uuid: Option<Uuid>| {
+		if let Some(uuid) = uuid {
+			wanted_dirs.entry(path).or_insert(uuid);
+		}
+	};
+	for PlannedEntry { action, start } in entries {
+		match (action, start) {
+			(
+				SyncAction::DownloadFile { remote_uuid, .. }
+				| SyncAction::TrashRemote {
+					kind: NodeKind::File,
+					remote_uuid,
+					..
+				},
+				_,
+			) => {
 				wanted_files.insert(*remote_uuid);
 			}
-			SyncAction::TrashRemote {
-				rel_path,
-				kind,
-				remote_uuid,
-			} => match kind {
-				NodeKind::File => {
-					wanted_files.insert(*remote_uuid);
-				}
-				NodeKind::Dir => {
-					wanted_dirs.insert(rel_path);
-				}
-			},
-			SyncAction::MoveRemote {
-				to_path,
-				kind,
-				remote_uuid,
-				..
-			} => {
-				match kind {
-					NodeKind::File => {
-						wanted_files.insert(*remote_uuid);
-					}
-					// The view already lists the directory at the path it moves to.
-					NodeKind::Dir => {
-						wanted_dirs.insert(to_path);
-					}
-				}
-				wanted_dirs.insert(parent_and_name(to_path).0);
+			(
+				SyncAction::TrashRemote {
+					rel_path,
+					kind: NodeKind::Dir,
+					..
+				},
+				PassStart::Remote { remote },
+			) => want_dir(rel_path.as_str(), dir_uuid(remote.as_deref())),
+			(
+				SyncAction::MoveRemote {
+					to_path,
+					kind: NodeKind::File,
+					remote_uuid,
+					..
+				},
+				PassStart::MoveRemoteFile { parent_uuid, .. },
+			) => {
+				wanted_files.insert(*remote_uuid);
+				want_dir(parent_and_name(to_path).0, *parent_uuid);
 			}
-			SyncAction::UploadFile { rel_path } | SyncAction::CreateRemoteDir { rel_path } => {
-				wanted_dirs.insert(parent_and_name(rel_path).0);
+			(
+				SyncAction::MoveRemote {
+					to_path,
+					kind: NodeKind::Dir,
+					..
+				},
+				PassStart::MoveRemoteDir {
+					remote,
+					parent_uuid,
+				},
+			) => {
+				// The view already lists the directory at the path it moves to.
+				want_dir(to_path.as_str(), dir_uuid(remote.as_deref()));
+				want_dir(parent_and_name(to_path).0, *parent_uuid);
 			}
+			(SyncAction::UploadFile { rel_path }, PassStart::Upload { parent_uuid, .. })
+			| (
+				SyncAction::CreateRemoteDir { rel_path },
+				PassStart::CreateRemoteDir { parent_uuid, .. },
+			) => want_dir(parent_and_name(rel_path).0, *parent_uuid),
 			_ => {}
 		}
 	}
 
 	// What the plan names and the map has not got: the root is in it already, and a directory this
 	// very pass creates is filled in as it goes.
-	let missing_dirs: Vec<&str> = wanted_dirs
+	let missing_dirs: Vec<(&str, Uuid)> = wanted_dirs
 		.into_iter()
-		.filter(|path| !dir_by_path.contains_key(*path))
+		.filter(|(path, _)| !dir_by_path.contains_key(*path))
 		.collect();
 	// One cache read for every object this plan acts on, files and directories together: the
 	// pass's snapshot carries only the columns its view reads (see `cache::enumerate`), so the
@@ -1140,12 +1411,7 @@ async fn resolve_folded_objects(
 	let wanted: Vec<Uuid> = wanted_files
 		.iter()
 		.copied()
-		.chain(missing_dirs.iter().filter_map(|path| {
-			ctx.remote
-				.at(path)
-				.filter(|node| node.kind == NodeKind::Dir)
-				.map(|node| node.remote_uuid)
-		}))
+		.chain(missing_dirs.iter().map(|&(_, uuid)| uuid))
 		.collect();
 	let mut cached_files: HashMap<Uuid, CacheableFile<'static>> = HashMap::new();
 	let mut cached_dirs: HashMap<Uuid, CacheableDir<'static>> = HashMap::new();
@@ -1181,20 +1447,13 @@ async fn resolve_folded_objects(
 			),
 		}
 	}
-	for path in missing_dirs {
-		let Some(node) = ctx
-			.remote
-			.at(path)
-			.filter(|node| node.kind == NodeKind::Dir)
-		else {
-			continue;
-		};
+	for (path, uuid) in missing_dirs {
 		// The cache held this one, so there is nothing to ask the server for.
-		if let Some(cacheable) = cached_dirs.remove(&node.remote_uuid) {
+		if let Some(cacheable) = cached_dirs.remove(&uuid) {
 			dir_by_path.insert(path.to_string(), RemoteDirectory::from(cacheable));
 			continue;
 		}
-		match ctx.client.get_dir(node.remote_uuid).await {
+		match ctx.client.get_dir(uuid).await {
 			Ok(dir) => {
 				dir_by_path.insert(path.to_string(), dir);
 			}
@@ -1228,18 +1487,19 @@ fn is_transfer(action: &SyncAction) -> bool {
 /// Returns the side its failure found full, if it did (see [`note_failure`]).
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
-	action: &SyncAction,
+	planned: &PlannedEntry,
 	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Option<HaltReason> {
+	let action = &planned.action;
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
 	let error = match apply_one(
 		ctx,
-		action,
+		planned,
 		files,
 		dir_by_path,
 		writes,
@@ -1476,7 +1736,7 @@ fn note_quarantined(
 /// observer is theirs to touch (see [`note_quarantined`]).
 async fn apply_transfer(
 	ctx: &ApplyContext<'_>,
-	action: &SyncAction,
+	planned: &PlannedEntry,
 	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &HashMap<String, RemoteDirectory>,
 	progress: &UnboundedSender<SyncEvent>,
@@ -1485,11 +1745,14 @@ async fn apply_transfer(
 	if !ctx.gate.wait_to_start().await {
 		return Ok(Transfer::Interrupted);
 	}
-	match action {
-		SyncAction::DownloadFile {
-			rel_path,
-			remote_uuid,
-		} => {
+	match (&planned.action, &planned.start) {
+		(
+			SyncAction::DownloadFile {
+				rel_path,
+				remote_uuid,
+			},
+			PassStart::Download { remote, base },
+		) => {
 			let remote_file = files
 				.get(remote_uuid)
 				.cloned()
@@ -1502,20 +1765,20 @@ async fn apply_transfer(
 			// overwrites it, the same way a propagated deletion is quarantined rather than
 			// destroyed. An unmodified copy still matching its baseline row is just refreshed.
 			//
-			// `ctx.baseline` is the PASS-START snapshot, so it has no row for a path this same pass
+			// The row this action took is the PASS-START one, so there is none for a path this pass
 			// moved a file onto — a remote move that carried a content edit is a `MoveLocal` paired
 			// with this very download, and the move already wrote the moved file's row. Read that
-			// row back before deciding; without it the download would quarantine the copy the move
-			// just renamed into place. Only when something is actually sitting at the target: an
-			// ordinary download onto free space has nothing to lose and skips the read.
-			let base = match ctx.baseline.get(rel_path) {
-				Some(base) => Some(base),
+			// row back from the store before deciding; without it the download would quarantine the
+			// copy the move just renamed into place. Only when something is actually sitting at the
+			// target: an ordinary download onto free space has nothing to lose and skips the read.
+			let written = match base {
 				None if path.exists() => locked(ctx.store)
 					.entry(ctx.pair, rel_path)
 					.map_err(db_err)?,
-				None => None,
+				_ => None,
 			};
-			let stashed = stash_local_target(ctx.local_root, rel_path, base.as_ref()).await?;
+			let base = base.as_deref().or(written.as_ref());
+			let stashed = stash_local_target(ctx.local_root, rel_path, base).await?;
 			let Some(downloaded) = ctx
 				.gate
 				.guard(ctx.client.download_file_to_path(
@@ -1525,7 +1788,7 @@ async fn apply_transfer(
 						progress,
 						rel_path,
 						TransferDirection::Download,
-						ctx.remote.at(rel_path).map_or(0, |node| node.size),
+						remote.as_deref().map_or(0, |node| node.size),
 					)),
 				))
 				.await
@@ -1546,7 +1809,6 @@ async fn apply_transfer(
 			// Set BEFORE the row this writes, which can fail — the copy is in the bin either way,
 			// and a failure that swallowed the only word of it is what this is out here for.
 			*quarantined = stashed.map(|bin| (rel_path.clone(), bin));
-			let remote = ctx.remote.at(rel_path);
 			let remote = remote.as_deref();
 			// The row this writes has to carry a hash of what landed. Where the remote declares one
 			// it is that hash — the same one every later pass compares the path against. Where it
@@ -1594,7 +1856,15 @@ async fn apply_transfer(
 			)
 			.await?;
 		}
-		SyncAction::UploadFile { rel_path } => {
+		(
+			SyncAction::UploadFile { rel_path },
+			PassStart::Upload {
+				local,
+				remote,
+				base,
+				..
+			},
+		) => {
 			let (parent_path, _) = parent_and_name(rel_path);
 			let parent = dir_by_path
 				.get(parent_path)
@@ -1611,7 +1881,7 @@ async fn apply_transfer(
 						progress,
 						rel_path,
 						TransferDirection::Upload,
-						ctx.local.at(rel_path).map_or(0, |node| node.size),
+						local.as_deref().map_or(0, |node| node.size),
 					)),
 				))
 				.await
@@ -1619,13 +1889,12 @@ async fn apply_transfer(
 				return Ok(Transfer::Interrupted);
 			};
 			let (uploaded, _file) = upload?;
-			let local = ctx.local.at(rel_path);
 			let local = local.as_deref();
 			let new_uuid: Uuid = uploaded.uuid();
 			// A same-name upload versions whatever the path held: record that uuid, so the next
 			// pass can tell a cache that has not caught up (the old uuid still at the path) from
 			// someone ELSE having written there since (a third uuid).
-			let replaced = ctx.remote.at(rel_path).map(|node| node.remote_uuid);
+			let replaced = remote.as_deref().map(|node| node.remote_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
 				replaced,
@@ -1688,9 +1957,12 @@ async fn apply_transfer(
 				// another client's edit may already be on its way to the same path. The marker stays
 				// on the previous agreed content until a snapshot lists this version at this path
 				// (`plan::confirm_agreed_content`), and the gap is what surfaces a concurrent edit.
-				agreed_hash: ctx.baseline.get(rel_path).and_then(|b| b.agreed_hash),
+				agreed_hash: base.as_deref().and_then(|b| b.agreed_hash),
 			});
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
+		}
+		(SyncAction::DownloadFile { .. } | SyncAction::UploadFile { .. }, _) => {
+			return Err(unpaired());
 		}
 		_ => return Err(internal("apply_transfer called with a non-transfer action")),
 	}
@@ -1724,30 +1996,31 @@ fn progress_callback<'a>(
 
 async fn apply_one(
 	ctx: &ApplyContext<'_>,
-	action: &SyncAction,
+	planned: &PlannedEntry,
 	files: &HashMap<Uuid, RemoteFile>,
 	dir_by_path: &mut HashMap<String, RemoteDirectory>,
 	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Result<(), crate::Error> {
-	match action {
-		SyncAction::CreateLocalDir { rel_path } => {
+	let action = &planned.action;
+	match (action, &planned.start) {
+		(SyncAction::CreateLocalDir { rel_path }, PassStart::Remote { remote }) => {
 			let path = confined_local_target(ctx.local_root, rel_path)?;
 			std::fs::create_dir_all(&path).map_err(io_err)?;
-			let remote_uuid = ctx.remote.at(rel_path).map(|n| n.remote_uuid);
+			let remote_uuid = remote.as_deref().map(|n| n.remote_uuid);
 			upsert_dir_baseline(ctx, rel_path, remote_uuid, local_mtime_of(&path)).await?;
 			report.local_dirs_created += 1;
 		}
 		// Transfers normally run via the concurrent path in `apply`; these arms keep `apply_one`
 		// total and correct if a transfer is ever applied serially.
-		SyncAction::DownloadFile { .. } => {
+		(SyncAction::DownloadFile { .. }, _) => {
 			// Nothing drains the progress channel on this fallback, so its `Progress` events go
 			// nowhere; what it moved aside still reaches the observer below.
 			let mut quarantined = None;
 			let outcome = apply_transfer(
 				ctx,
-				action,
+				planned,
 				files,
 				dir_by_path,
 				&tokio::sync::mpsc::unbounded_channel().0,
@@ -1761,7 +2034,7 @@ async fn apply_one(
 				report.downloaded += 1;
 			}
 		}
-		SyncAction::DeleteLocal { rel_path, .. } => {
+		(SyncAction::DeleteLocal { rel_path, .. }, _) => {
 			if writes.shields_local(rel_path) {
 				return Err(internal_owned(format!(
 					"refusing to quarantine {rel_path:?}: this pass already wrote there, under this or another spelling"
@@ -1781,15 +2054,17 @@ async fn apply_one(
 			}
 			report.locally_deleted += 1;
 		}
-		SyncAction::CreateRemoteDir { rel_path } => {
+		(
+			SyncAction::CreateRemoteDir { rel_path },
+			PassStart::CreateRemoteDir { local, remote, .. },
+		) => {
 			let (parent_path, name) = parent_and_name(rel_path);
 			let parent = dir_by_path
 				.get(parent_path)
 				.ok_or_else(|| internal("remote parent dir not yet created"))?
 				.clone();
-			let created = ctx
-				.local
-				.at(rel_path)
+			let created = local
+				.as_deref()
 				.map(|n| millis_to_dt(n.mtime_millis))
 				.unwrap_or_else(Utc::now);
 			let parent_type = DirType::<Normal>::Dir(std::borrow::Cow::Owned(parent));
@@ -1802,18 +2077,18 @@ async fn apply_one(
 			writes.remote_uuids.insert(new_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
-				replaced: ctx.remote.at(rel_path).map(|node| node.remote_uuid),
+				replaced: remote.as_deref().map(|node| node.remote_uuid),
 			};
 			dir_by_path.insert(rel_path.clone(), new_dir);
 			let entry = dir_entry(rel_path, Some(new_uuid), None);
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
 			report.remote_dirs_created += 1;
 		}
-		SyncAction::UploadFile { .. } => {
+		(SyncAction::UploadFile { .. }, _) => {
 			let mut quarantined = None;
 			let outcome = apply_transfer(
 				ctx,
-				action,
+				planned,
 				files,
 				dir_by_path,
 				&tokio::sync::mpsc::unbounded_channel().0,
@@ -1832,11 +2107,14 @@ async fn apply_one(
 				Transfer::Interrupted => {}
 			}
 		}
-		SyncAction::TrashRemote {
-			rel_path,
-			kind,
-			remote_uuid,
-		} => {
+		(
+			SyncAction::TrashRemote {
+				rel_path,
+				kind,
+				remote_uuid,
+			},
+			_,
+		) => {
 			if writes.shields_remote(rel_path, *remote_uuid) {
 				return Err(internal_owned(format!(
 					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
@@ -1864,12 +2142,17 @@ async fn apply_one(
 			commit_trash(ctx, *remote_uuid, rel_path, ctx.subsumed.under(action)).await?;
 			report.remotely_trashed += 1;
 		}
-		SyncAction::MoveRemote {
-			from_path,
-			to_path,
-			kind: NodeKind::File,
-			remote_uuid,
-		} => {
+		(
+			SyncAction::MoveRemote {
+				from_path,
+				to_path,
+				kind: NodeKind::File,
+				remote_uuid,
+			},
+			PassStart::MoveRemoteFile {
+				local, base_from, ..
+			},
+		) => {
 			let mut remote_file = files
 				.get(remote_uuid)
 				.cloned()
@@ -1892,7 +2175,6 @@ async fn apply_one(
 					.update_file_metadata(&mut remote_file, changes)
 					.await?;
 			}
-			let local = ctx.local.at(to_path);
 			let local = local.as_deref();
 			let kind = PendingKind::Moved {
 				from: from_path.clone(),
@@ -1908,7 +2190,7 @@ async fn apply_one(
 				remote_modified: Some(remote_file.timestamp.timestamp_millis()),
 				// A move changes no content, so whatever the two sides agreed on at the old path
 				// they still agree on at the new one.
-				agreed_hash: ctx.baseline.get(from_path).and_then(|b| b.agreed_hash),
+				agreed_hash: base_from.as_deref().and_then(|b| b.agreed_hash),
 			});
 			commit_remote_write(
 				ctx,
@@ -1922,11 +2204,18 @@ async fn apply_one(
 			.await?;
 			report.moved_remote += 1;
 		}
-		SyncAction::MoveLocal {
-			from_path,
-			to_path,
-			kind: NodeKind::File,
-		} => {
+		(
+			SyncAction::MoveLocal {
+				from_path,
+				to_path,
+				kind: NodeKind::File,
+			},
+			PassStart::MoveLocalFile {
+				remote,
+				base,
+				base_from,
+			},
+		) => {
 			let from = local_path(ctx.local_root, from_path);
 			let to = confined_local_target(ctx.local_root, to_path)?;
 			// The reconciler only plans a move onto a destination the SCAN saw free, but a pass
@@ -1936,7 +2225,7 @@ async fn apply_one(
 			stash_move_target(
 				ctx.local_root,
 				to_path,
-				ctx.baseline.get(to_path).as_ref(),
+				base.as_deref(),
 				report,
 				&mut *observer,
 			)
@@ -1947,8 +2236,8 @@ async fn apply_one(
 			std::fs::rename(&from, &to).map_err(io_err)?;
 			let row = moved_file_row(
 				to_path,
-				ctx.baseline.get(from_path).as_ref(),
-				ctx.remote.at(to_path).as_deref(),
+				base_from.as_deref(),
+				remote.as_deref(),
 				local_mtime_of(&to),
 			);
 			// One transaction, delete before upsert: a crash between the two would leave the file
@@ -1964,12 +2253,15 @@ async fn apply_one(
 				.map_err(db_err)?;
 			report.moved_local += 1;
 		}
-		SyncAction::MoveRemote {
-			from_path,
-			to_path,
-			kind: NodeKind::Dir,
-			remote_uuid,
-		} => {
+		(
+			SyncAction::MoveRemote {
+				from_path,
+				to_path,
+				kind: NodeKind::Dir,
+				remote_uuid,
+			},
+			_,
+		) => {
 			// The view — and so this map — already lists the directory at the path it moves to.
 			let mut dir = dir_by_path
 				.get(to_path)
@@ -2014,11 +2306,14 @@ async fn apply_one(
 			commit_dir_move(ctx, *remote_uuid, from_path, to_path).await?;
 			report.moved_remote += 1;
 		}
-		SyncAction::MoveLocal {
-			from_path,
-			to_path,
-			kind: NodeKind::Dir,
-		} => {
+		(
+			SyncAction::MoveLocal {
+				from_path,
+				to_path,
+				kind: NodeKind::Dir,
+			},
+			_,
+		) => {
 			let from = local_path(ctx.local_root, from_path);
 			let to = confined_local_target(ctx.local_root, to_path)?;
 			// The destination can have become a directory of its own since the scan, and a rename
@@ -2061,26 +2356,26 @@ async fn apply_one(
 			.map_err(db_err)?;
 			report.moved_local += 1;
 		}
-		SyncAction::Conflict { rel_path } => {
+		(SyncAction::Conflict { rel_path }, PassStart::Sides { local, remote }) => {
 			// The engine screens conflicts out of the applied plan and records them itself; this
 			// arm keeps `apply_one` total and correct if one is ever routed through here.
 			record_conflict(
 				ctx.store,
 				ctx.pair,
 				rel_path,
-				ctx.local.at(rel_path).as_deref(),
-				ctx.remote.at(rel_path).as_deref(),
+				local.as_deref(),
+				remote.as_deref(),
 			)
 			.await?;
 		}
-		SyncAction::AdoptBaseline { rel_path } => {
+		(SyncAction::AdoptBaseline { rel_path }, PassStart::Sides { local, remote }) => {
 			// Record the converged state into the baseline with no transfer, so a later one-sided
 			// change at this path is classified correctly. Both sides agree here (the reconciler
 			// only emits this when they do).
 			match adopt_outcome(
 				rel_path,
-				ctx.local.at(rel_path).as_deref(),
-				ctx.remote.at(rel_path).as_deref(),
+				local.as_deref(),
+				remote.as_deref(),
 				ctx.absence_trusted,
 			) {
 				AdoptOutcome::Record(entry) => upsert_baseline(ctx, &entry).await?,
@@ -2088,6 +2383,18 @@ async fn apply_one(
 				AdoptOutcome::Keep => {}
 			}
 		}
+		(
+			SyncAction::CreateLocalDir { .. }
+			| SyncAction::CreateRemoteDir { .. }
+			| SyncAction::MoveRemote { .. }
+			| SyncAction::MoveLocal {
+				kind: NodeKind::File,
+				..
+			}
+			| SyncAction::Conflict { .. }
+			| SyncAction::AdoptBaseline { .. },
+			_,
+		) => return Err(unpaired()),
 	}
 	Ok(())
 }
@@ -2718,6 +3025,63 @@ fn internal_owned(message: String) -> crate::Error {
 	crate::Error::custom(crate::ErrorKind::Internal, message)
 }
 
+/// Entries with nothing read, for the tests.
+#[cfg(test)]
+mod test_support {
+	use uuid::Uuid;
+
+	use super::{
+		super::{
+			baseline::BaselineEntry,
+			plan::{RemoteNode, SyncAction},
+			scan::LocalNode,
+		},
+		PassStart, PlannedEntry, StartInputs,
+	};
+
+	/// A pass that held nothing at any path.
+	struct Unread;
+
+	impl StartInputs for Unread {
+		fn local(&mut self, _: &str) -> Option<Box<LocalNode>> {
+			None
+		}
+
+		fn remote(&mut self, _: &str) -> Option<Box<RemoteNode>> {
+			None
+		}
+
+		fn base(&mut self, _: &str) -> Option<Box<BaselineEntry>> {
+			None
+		}
+
+		fn base_from(&mut self, _: &str) -> Option<Box<BaselineEntry>> {
+			None
+		}
+
+		fn parent_uuid(&mut self, _: &str) -> Option<Uuid> {
+			None
+		}
+	}
+
+	impl PassStart {
+		/// What `action`'s kind reads, with nothing read at any of it.
+		pub(in crate::sync_engine) fn bare(action: &SyncAction) -> Self {
+			Self::of(action, &mut Unread)
+		}
+	}
+
+	impl PlannedEntry {
+		/// `action`, with nothing read for it (see [`PassStart::bare`]).
+		pub(in crate::sync_engine) fn bare(action: SyncAction) -> Self {
+			Self {
+				start: PassStart::bare(&action),
+				action,
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
@@ -2762,6 +3126,11 @@ mod tests {
 			kind: NodeKind::Dir,
 			remote_uuid: Uuid::new_v4(),
 		}
+	}
+
+	/// `action` with nothing read for it, for a test of the order the apply runs entries in.
+	fn entry(action: SyncAction) -> PlannedEntry {
+		PlannedEntry::bare(action)
 	}
 
 	fn release_points_of(order: &[SyncAction]) -> Vec<bool> {
@@ -2827,17 +3196,107 @@ mod tests {
 	/// uploads.
 	#[test]
 	fn transfers_that_finish_a_compound_step_run_first_then_downloads_then_uploads() {
-		let pre = [trash("flip", NodeKind::Dir), move_dir("d", "e")];
+		let pre = [trash("flip", NodeKind::Dir), move_dir("d", "e")].map(entry);
 		let mut transfers = [
 			upload("a"),
 			download("b"),
 			upload("e/child"),
 			download("c"),
 			upload("flip"),
-		];
+		]
+		.map(entry);
 		order_transfers(&pre, &mut transfers);
-		let paths: Vec<&str> = transfers.iter().map(SyncAction::rel_path).collect();
+		let paths: Vec<&str> = transfers
+			.iter()
+			.map(|entry| entry.action.rel_path())
+			.collect();
 		assert_eq!(paths, ["e/child", "flip", "b", "c", "a"]);
+	}
+
+	/// Each entry carries what its action reads, read as the pass started, and nothing else: a
+	/// download its remote node and its row; an upload its local node, the remote node it versions
+	/// and the directory it lands in; a remote file move its local node, the row it moves from and
+	/// the directory it lands in; a local deletion nothing at all.
+	#[test]
+	fn each_entry_carries_what_its_action_reads() {
+		let docs = Uuid::from_u128(1);
+		let pulled = RemoteNode {
+			remote_uuid: Uuid::from_u128(2),
+			..remote_node("docs/a.txt", None)
+		};
+		let versioned = RemoteNode {
+			remote_uuid: Uuid::from_u128(3),
+			..remote_node("docs/new.txt", None)
+		};
+		let remote = Side::Whole(HashMap::from([
+			(
+				"docs".to_string(),
+				RemoteNode {
+					kind: NodeKind::Dir,
+					remote_uuid: docs,
+					..remote_node("docs", None)
+				},
+			),
+			("docs/a.txt".to_string(), pulled.clone()),
+			("docs/new.txt".to_string(), versioned.clone()),
+		]));
+		let local_at = |path: &str| Box::new(local_node(path, 10, None));
+		let local = Side::Whole(HashMap::from(
+			["docs/new.txt", "docs/renamed.txt", "gone.txt"]
+				.map(|path| (path.to_string(), *local_at(path))),
+		));
+		let (row_a, row_old) = (
+			baseline_file("docs/a.txt", None),
+			baseline_file("old.txt", None),
+		);
+		let baseline = Baseline::from_rows([
+			row_a.clone(),
+			row_old.clone(),
+			baseline_file("gone.txt", None),
+		]);
+		let actions = vec![
+			SyncAction::DownloadFile {
+				rel_path: "docs/a.txt".to_string(),
+				remote_uuid: pulled.remote_uuid,
+			},
+			upload("docs/new.txt"),
+			SyncAction::MoveRemote {
+				from_path: "old.txt".to_string(),
+				to_path: "docs/renamed.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(4),
+			},
+			SyncAction::DeleteLocal {
+				rel_path: "gone.txt".to_string(),
+				kind: NodeKind::File,
+			},
+		];
+		let entries = PlannedEntry::plan(actions, baseline, local, remote);
+		let read: Vec<&PassStart> = entries
+			.iter()
+			.map(|PlannedEntry { start, .. }| start)
+			.collect();
+		assert_eq!(
+			read,
+			[
+				&PassStart::Download {
+					remote: Some(Box::new(pulled)),
+					base: Some(Box::new(row_a)),
+				},
+				&PassStart::Upload {
+					local: Some(local_at("docs/new.txt")),
+					remote: Some(Box::new(versioned)),
+					base: None,
+					parent_uuid: Some(docs),
+				},
+				&PassStart::MoveRemoteFile {
+					local: Some(local_at("docs/renamed.txt")),
+					base_from: Some(Box::new(row_old)),
+					parent_uuid: Some(docs),
+				},
+				&PassStart::Nothing,
+			]
+		);
 	}
 
 	/// A hold runs its course on time or on count, whichever comes first.

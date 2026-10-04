@@ -60,7 +60,7 @@ every size):
 
 ```
 handle   192   the snapshot handle: a pooled connection, its pair and its counts
-edits      0   a pass's moves and confirmations, or the rows frozen for its apply
+edits      0   a pass's moves and confirmations
 total    192
 ```
 

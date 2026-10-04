@@ -73,7 +73,7 @@
 //! the pass's view and the database DISAGREE on purpose: the moved subtree is keyed under its
 //! destination here and under its source in the table. `occupied(to)` in `plan::next_dir_move` and
 //! `occupied(parent)` in `plan::parents_ready` are asked INSIDE that window, and so is every read
-//! after it — the reconcile, the apply layer's `get`s, a carried side's rows. Answered from the
+//! after it — the reconcile, the apply layer's rows, a carried side's rows. Answered from the
 //! table alone, they would consult rows the fold has already re-keyed away and approve a directory
 //! move onto an occupied destination. So every method answers against the edited view, the folded
 //! questions included: folding is per character, so the folded path of `to/rest` is the folded `to`
@@ -85,11 +85,11 @@
 //!
 //! The snapshot is one read transaction, so a pass's PLAN reads one state of the table throughout
 //! (see `rows/snapshot.rs`) — the state before anything the pass itself commits. The transaction
-//! ends with the plan: [`freeze`](Baseline::freeze) reads the rows at the paths the plan's actions
-//! name into a baseline of their own and drops the snapshot, so the apply layer answers from the
-//! plan's rows while the WAL checkpoints behind it. A pass clones its baseline into the local scan's
-//! blocking thread; the connection sits behind a mutex, so a clone is readable from any thread and
-//! two readers take turns.
+//! ends with the plan: each action takes the rows the apply reads for it out of the snapshot (see
+//! `apply::PlannedEntry::plan`), and [`close`](Baseline::close) drops it, so the apply layer
+//! answers from the plan's rows while the WAL checkpoints behind it. A pass clones its baseline into
+//! the local scan's blocking thread; the connection sits behind a mutex, so a clone is readable from
+//! any thread and two readers take turns.
 
 use std::{
 	borrow::Cow,
@@ -130,18 +130,7 @@ pub(super) struct Baseline {
 	/// What this pass changed about `rows`; `None` until it changes anything, which is almost every
 	/// pass, and every read then goes straight to the table.
 	edits: Option<Arc<Edits>>,
-	/// The rows at the paths the pass's plan names, and nothing else — set once the plan is made
-	/// (see [`freeze`](Baseline::freeze)), when `rows` and `edits` are gone. A path it does not
-	/// hold is a question the apply layer was never meant to ask, and asking it panics rather than
-	/// answer "no row".
-	frozen: Option<Arc<Frozen>>,
 }
-
-/// The rows [`freeze`](Baseline::freeze) keeps, by path: `None` where the path holds no row.
-///
-/// Each row is boxed and each path a `Box<str>`: on a first sync nearly every path the plan names
-/// holds no row, and a slot holding the row inline would cost a whole row's bytes for each of them.
-type Frozen = HashMap<Box<str>, Option<Box<BaselineEntry>>>;
 
 /// What a pass changed about the rows (see the module doc): LAYERS over the table, bottom first,
 /// each read over the view the table and the layers beneath it make — plus the edited view's
@@ -651,9 +640,6 @@ impl Cursor<'_> {
 
 	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
 		let baseline = self.baseline;
-		if let Some(frozen) = baseline.frozen.as_deref() {
-			return frozen_row(frozen, rel_path);
-		}
 		let (at, mark) = baseline.lookup(baseline.depth(), rel_path);
 		let row = match at {
 			Lookup::Written(row) => row.clone(),
@@ -732,29 +718,12 @@ impl Cursor<'_> {
 	}
 }
 
-/// The row the frozen rows hold at `rel_path` — and a panic where they hold nothing, because a path
-/// the plan did not name is a question nothing after the plan was meant to ask. Answering "no row"
-/// there would read a tracked path as untracked (see the module doc).
-fn frozen_row(frozen: &Frozen, rel_path: &str) -> Option<BaselineEntry> {
-	frozen
-		.get(rel_path)
-		.unwrap_or_else(|| {
-			panic!(
-				"the apply layer asked the baseline about {rel_path:?}, which no planned action \
-				 names — refusing to answer from rows the pass no longer reads"
-			)
-		})
-		.as_deref()
-		.cloned()
-}
-
 impl Baseline {
 	/// The table's rows as `snapshot` reads them.
 	pub(super) fn stored(snapshot: Snapshot) -> Self {
 		Self {
 			rows: Some(Arc::new(snapshot)),
 			edits: None,
-			frozen: None,
 		}
 	}
 
@@ -766,13 +735,8 @@ impl Baseline {
 		Self::stored(snapshot::standalone(rows))
 	}
 
-	/// The table, for every read but a point lookup — which a FROZEN baseline cannot serve.
+	/// The table; `None` for a pair with no rows.
 	fn table(&self) -> Option<&Snapshot> {
-		assert!(
-			self.frozen.is_none(),
-			"a baseline frozen for the apply layer answers point lookups at the paths its plan \
-			 names, and nothing else"
-		);
 		self.rows.as_deref()
 	}
 
@@ -1231,17 +1195,11 @@ impl Baseline {
 
 	/// The row at exactly `rel_path`.
 	pub(super) fn get(&self, rel_path: &str) -> Option<BaselineEntry> {
-		if let Some(frozen) = self.frozen.as_deref() {
-			return frozen_row(frozen, rel_path);
-		}
 		self.get_at(self.depth(), rel_path)
 	}
 
 	/// Whether a row sits at exactly `rel_path`, and whether it is carryable.
 	fn carry_flag(&self, rel_path: &str) -> Option<bool> {
-		if let Some(frozen) = self.frozen.as_deref() {
-			return frozen_row(frozen, rel_path).map(|row| row.carryable());
-		}
 		self.carry_flag_at(self.depth(), rel_path)
 	}
 
@@ -1264,50 +1222,24 @@ impl Baseline {
 		}
 	}
 
-	/// The rows at `paths` and at every ancestor of each — what the apply layer reads after the
-	/// plan is made, and nothing else — as a baseline that holds only those.
-	///
-	/// This is what ENDS the pass's read transaction: the snapshot this baseline read through is
-	/// dropped here, before the first action commits. Held through the apply, it would pin the
-	/// store's WAL for as long as the apply runs — a suspended pass included — so that no
-	/// checkpoint could reach past it and every commit meanwhile, this pass's and every other
-	/// pair's, would grow the `-wal` file (see `rows/snapshot.rs`). The frozen rows still answer as
-	/// the plan's rows did: the pass's own commits are in none of them.
-	pub(super) fn freeze<'p>(self, paths: impl IntoIterator<Item = &'p str>) -> Self {
-		// `""` too: the pair root holds no row, and a parent lookup of a top-level path asks it.
-		let mut asked: BTreeSet<&str> = BTreeSet::from([""]);
-		for path in paths {
-			asked.extend(ancestors(path));
-			asked.insert(path);
-		}
-		let frozen: Frozen = {
-			let mut cursor = self.cursor();
-			asked
-				.into_iter()
-				.map(|path| (path.into(), cursor.get(path).map(Box::new)))
-				.collect()
-		};
+	/// End the pass's read transaction, once the rows its apply reads have been read out of it (see
+	/// `apply::PlannedEntry::plan`): the snapshot this baseline read through is dropped here, before
+	/// the first action commits. Held through the apply, it would pin the store's WAL for as long as
+	/// the apply runs — a suspended pass included — so that no checkpoint could reach past it and
+	/// every commit meanwhile, this pass's and every other pair's, would grow the `-wal` file (see
+	/// `rows/snapshot.rs`).
+	pub(super) fn close(self) {
 		if let Some(rows) = &self.rows
 			&& Arc::strong_count(rows) > 1
 		{
 			// Not a wrong answer, so not a panic in a shipped build: the apply still reads the rows
-			// frozen here. But the transaction stays open for as long as that clone lives.
+			// its entries took. But the transaction stays open for as long as that clone lives.
 			tracing::error!(
 				"baseline: a clone of the pass's snapshot outlives its plan — its read transaction \
 				 stays open through the apply and pins the WAL"
 			);
 			debug_assert!(false, "a clone of the pass's snapshot outlives its plan");
 		}
-		Self {
-			rows: None,
-			edits: None,
-			frozen: Some(Arc::new(frozen)),
-		}
-	}
-
-	/// Whether this is the apply layer's frozen baseline (see [`freeze`](Self::freeze)).
-	pub(super) fn is_frozen(&self) -> bool {
-		self.frozen.is_some()
 	}
 
 	/// Every row, parent before child, in path order (see the module doc).
@@ -1648,19 +1580,7 @@ impl Baseline {
 	pub(super) fn resident_terms(&self) -> ResidentTerms {
 		ResidentTerms {
 			handle: self.rows.as_ref().map_or(0, |_| size_of::<Snapshot>()),
-			edits: self.edits.as_deref().map_or(0, Edits::bytes)
-				+ self.frozen.as_deref().map_or(0, |frozen| {
-					frozen.capacity() * size_of::<(Box<str>, Option<Box<BaselineEntry>>)>()
-						+ frozen
-							.iter()
-							.map(|(path, row)| {
-								path.len()
-									+ row.as_deref().map_or(0, |row| {
-										size_of::<BaselineEntry>() + row.rel_path.capacity()
-									})
-							})
-							.sum::<usize>()
-				}),
+			edits: self.edits.as_deref().map_or(0, Edits::bytes),
 		}
 	}
 }
@@ -1672,8 +1592,7 @@ pub(super) struct ResidentTerms {
 	/// The snapshot handle: a connection, its pair and its counts. Not the pages it keeps to answer
 	/// point and folded questions out of — up to [`MAX_PAGE`] rows each, dropped with the pass.
 	pub(super) handle: usize,
-	/// The pass's edits over the table — what it moved and confirmed — or the rows frozen for its
-	/// apply. Zero on a pair between passes.
+	/// The pass's edits over the table — what it moved and confirmed. Zero on a pair between passes.
 	pub(super) edits: usize,
 }
 
@@ -1704,7 +1623,6 @@ pub(super) mod tests {
 		},
 		*,
 	};
-	use crate::alloc_meter;
 
 	fn file(rel_path: &str, hash: u8) -> BaselineEntry {
 		let uuid = Uuid::new_v4();
@@ -2328,28 +2246,5 @@ pub(super) mod tests {
 		view.move_subtree("big/moved", "elsewhere");
 		oracle.move_subtree("big/moved", "elsewhere");
 		assert_alike("with a paged subtree moved away", &view, &oracle, &probes);
-	}
-
-	/// A first sync's plan names paths the baseline holds no row at — nearly every one of them — and
-	/// the rows frozen for its apply keep an answer for each, alive through the whole apply. That
-	/// answer is "no row", and it costs a pointer, not the room a row takes.
-	#[test]
-	fn freezing_paths_that_hold_no_row_keeps_a_pointer_for_each() {
-		let paths: Vec<String> = (0..10_000)
-			.map(|n| format!("d{:02}/f{n:05}.txt", n % 100))
-			.collect();
-		let (frozen, peak) = alloc_meter::peak_bytes(|| {
-			Baseline::default().freeze(paths.iter().map(String::as_str))
-		});
-		assert!(paths.iter().all(|path| frozen.get(path).is_none()));
-		assert!(frozen.get("d07").is_none() && frozen.get("").is_none());
-		// 10_101 asked paths (the files, their 100 directories and the pair root) in a table of 16_384
-		// slots. A slot holding the row inline would be 256 bytes, 4 MiB before a single key; one
-		// that boxes it is 24, and the keys and the transient set of asked paths add about a third
-		// of a MiB.
-		assert!(
-			peak < 1 << 20,
-			"freezing 10_000 absent paths peaked at {peak} bytes, past 1 MiB"
-		);
 	}
 }
