@@ -41,13 +41,19 @@ use super::{
 /// How many rows a walk of the side reads a statement, and the most a question's read-ahead does.
 pub(super) const PAGE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is not zero");
 
+/// How many rows a directory move re-keys a statement (see [`StagedSide::rekey`]).
+const REKEY_SLICE: NonZeroUsize = NonZeroUsize::new(65_536).expect("65,536 is not zero");
+
 /// How many rows each statement that stages a side or reads one takes at most: a pass's
-/// ([`PASS`](Self::PASS)), or a handful, for a test that walks and places a few nodes across
-/// several statements. None is zero, which would leave a walk with nothing to read.
+/// ([`PASS`](Self::PASS)), or a handful, for a test that walks, moves and places a few nodes across
+/// several statements. None is zero, which would leave a walk with nothing to read and a move with
+/// nothing to re-key.
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct Paging {
 	/// How many rows a walk of a side reads a statement, and the most a question's read-ahead does.
 	pub(super) page: NonZeroUsize,
+	/// How many rows a directory move re-keys a statement (see [`StagedSide::rekey`]).
+	pub(super) rekey: NonZeroUsize,
 	/// How many children of a directory placing a remote snapshot reads a statement (see
 	/// [`RemoteSink::finish`](super::RemoteSink::finish)).
 	pub(super) children: NonZeroUsize,
@@ -57,6 +63,7 @@ impl Paging {
 	/// What a pass stages and reads its sides with.
 	pub(in super::super) const PASS: Self = Self {
 		page: PAGE,
+		rekey: REKEY_SLICE,
 		children: CHILDREN_PAGE,
 	};
 }
@@ -73,6 +80,10 @@ pub(super) struct Sql {
 	pub(super) page_from_below: &'static str,
 	/// [`page_after`](Self::page_after), below the path `?2`; the limit is `?3`.
 	pub(super) page_after_below: &'static str,
+	/// [`page_from`](Self::page_from), of directories only, off the table's partial index of them.
+	pub(super) dirs_from: &'static str,
+	/// [`page_after`](Self::page_after), of directories only, off the same index.
+	pub(super) dirs_after: &'static str,
 	/// A row, unless a row already holds its path (or, where the table keeps one spelling of each
 	/// folded name, its folded name).
 	pub(super) insert: &'static str,
@@ -89,8 +100,9 @@ pub(super) struct Sql {
 	pub(super) occupied: &'static str,
 	/// A directory move: the directory's own row (`?1` onto `?2`)...
 	pub(super) rekey_at: &'static str,
-	/// ...then every row under it, each statement on one seek. `length` and `substr` count
-	/// characters on text, so the rest of a path is cut where its prefix ends.
+	/// ...then up to `?3` of the rows under it, on one seek: a slice of the subtree, which moves
+	/// its rows out of the source's range, so the next slice starts on what is left. `length` and
+	/// `substr` count characters on text, so the rest of a path is cut where its prefix ends.
 	pub(super) rekey_under: &'static str,
 }
 
@@ -117,12 +129,22 @@ impl<T> Clone for Table<T> {
 
 impl<T> Copy for Table<T> {}
 
-/// Up to `limit` nodes from `from` on, below `below` when there is one, in path order.
+/// Which of a table's rows a walk of it reads.
+enum Over {
+	/// Every row.
+	All,
+	/// The rows below this path.
+	Below(String),
+	/// The directories' rows, off the table's index of them.
+	Dirs,
+}
+
+/// Up to `limit` of the nodes `over` reads, from `from` on, in path order.
 fn read_page<T>(
 	conn: &Connection,
 	table: &Table<T>,
 	from: Bound<&str>,
-	below: Option<&str>,
+	over: &Over,
 	limit: usize,
 ) -> rusqlite::Result<Vec<T>> {
 	let (inclusive, from) = match from {
@@ -131,16 +153,18 @@ fn read_page<T>(
 		// Every path is at or after the empty one.
 		Bound::Unbounded => (true, ""),
 	};
-	let sql = match (inclusive, below) {
-		(true, None) => table.sql.page_from,
-		(false, None) => table.sql.page_after,
-		(true, Some(_)) => table.sql.page_from_below,
-		(false, Some(_)) => table.sql.page_after_below,
+	let sql = match (over, inclusive) {
+		(Over::All, true) => table.sql.page_from,
+		(Over::All, false) => table.sql.page_after,
+		(Over::Below(_), true) => table.sql.page_from_below,
+		(Over::Below(_), false) => table.sql.page_after_below,
+		(Over::Dirs, true) => table.sql.dirs_from,
+		(Over::Dirs, false) => table.sql.dirs_after,
 	};
 	let mut statement = conn.prepare_cached(sql)?;
-	let rows = match below {
-		Some(below) => statement.query(params![from, below, limit])?,
-		None => statement.query(params![from, limit])?,
+	let rows = match over {
+		Over::Below(below) => statement.query(params![from, below, limit])?,
+		Over::All | Over::Dirs => statement.query(params![from, limit])?,
 	};
 	rows.mapped(table.node).collect()
 }
@@ -157,6 +181,8 @@ pub(crate) struct StagedSide<T> {
 	ahead: Mutex<Ahead<T>>,
 	/// [`Paging::page`]: how many rows a walk reads a statement.
 	page: NonZeroUsize,
+	/// [`Paging::rekey`]: how many rows a directory move re-keys a statement.
+	rekey: NonZeroUsize,
 	table: Table<T>,
 }
 
@@ -169,13 +195,14 @@ impl<T> fmt::Debug for StagedSide<T> {
 }
 
 impl<T> StagedSide<T> {
-	/// The `len` nodes `stage` holds in `table`, read as `paging` says.
+	/// The `len` nodes `stage` holds in `table`, read and re-keyed as `paging` says.
 	pub(super) fn new(stage: Stage, len: usize, table: Table<T>, paging: Paging) -> Self {
 		Self {
 			stage: Mutex::new(stage),
 			len,
 			ahead: Mutex::new(Ahead::default()),
 			page: paging.page,
+			rekey: paging.rekey,
 			table,
 		}
 	}
@@ -204,7 +231,7 @@ impl<T> StagedSide<T> {
 	pub(in super::super) fn pages(&self) -> Pages<'_, T> {
 		Pages {
 			side: self,
-			cursor: Cursor::from(Bound::Unbounded, None),
+			cursor: Cursor::from(Bound::Unbounded, Over::All),
 		}
 	}
 
@@ -213,7 +240,16 @@ impl<T> StagedSide<T> {
 		let bounds = subtree_bounds(dir);
 		Pages {
 			side: self,
-			cursor: Cursor::from(Bound::Included(bounds.start), Some(bounds.end)),
+			cursor: Cursor::from(Bound::Included(bounds.start), Over::Below(bounds.end)),
+		}
+	}
+
+	/// Every directory node with its path, in path order, off the table's index of directories:
+	/// none of the files is read.
+	pub(in super::super) fn dir_pages(&self) -> Pages<'_, T> {
+		Pages {
+			side: self,
+			cursor: Cursor::from(Bound::Unbounded, Over::Dirs),
 		}
 	}
 
@@ -221,7 +257,7 @@ impl<T> StagedSide<T> {
 	pub(in super::super) fn into_pages(self) -> IntoPages<T> {
 		IntoPages {
 			side: self,
-			cursor: Cursor::from(Bound::Unbounded, None),
+			cursor: Cursor::from(Bound::Unbounded, Over::All),
 		}
 	}
 
@@ -308,7 +344,7 @@ impl<T> StagedSide<T> {
 		// up the stack, and a node is under a dropped subtree only where it is under the top one
 		// still ahead of it.
 		let mut gone: Vec<Range<String>> = Vec::new();
-		let mut cursor = Cursor::from(Bound::Unbounded, None);
+		let mut cursor = Cursor::from(Bound::Unbounded, Over::All);
 		while let Some((path, node)) = cursor.next(self) {
 			while gone
 				.last()
@@ -345,13 +381,20 @@ impl<T> StagedSide<T> {
 
 	/// Move the node at `from` and everything under it onto `to`. The destination must be free
 	/// under every spelling, as a directory move's is, or the edit fails (see the module docs).
+	///
+	/// The rows under `from` go [`Paging::rekey`] a statement ([`REKEY_SLICE`] in a pass). An
+	/// update that rewrites the very index it finds its rows by has SQLite collect them before it
+	/// writes any, so what one statement over the whole subtree holds in memory grows with the
+	/// subtree; a slice bounds it.
 	pub(in super::super) fn rekey(&mut self, from: &str, to: &str) {
-		let table = self.table;
+		let (table, slice) = (self.table, self.rekey.get());
 		self.edit("a directory move", |conn| {
 			conn.prepare_cached(table.sql.rekey_at)?
 				.execute([from, to])?;
-			conn.prepare_cached(table.sql.rekey_under)?
-				.execute([from, to])
+			let mut under = conn.prepare_cached(table.sql.rekey_under)?;
+			// A slice that came back short was the last: no row is left in the source's range.
+			while under.execute(params![from, to, slice])? == slice {}
+			Ok(())
 		});
 	}
 
@@ -410,7 +453,7 @@ impl<T> StagedSide<T> {
 		}
 		let want = ahead.next_want(&self.table, path, self.page.get());
 		let nodes = self.read("a path", |conn| {
-			read_page(conn, &self.table, Bound::Included(path), None, want)
+			read_page(conn, &self.table, Bound::Included(path), &Over::All, want)
 		});
 		let page = Page {
 			from: path.to_owned(),
@@ -534,17 +577,17 @@ enum Span<'p, T> {
 /// Where a walk of a staged side is: the page in hand, and where the next one starts.
 struct Cursor<T> {
 	next: Bound<String>,
-	below: Option<String>,
+	over: Over,
 	page: vec::IntoIter<T>,
 	/// Whether the last page read ran to the end of what the walk covers.
 	done: bool,
 }
 
 impl<T> Cursor<T> {
-	fn from(next: Bound<String>, below: Option<String>) -> Self {
+	fn from(next: Bound<String>, over: Over) -> Self {
 		Self {
 			next,
-			below,
+			over,
 			page: Vec::new().into_iter(),
 			done: false,
 		}
@@ -557,7 +600,7 @@ impl<T> Cursor<T> {
 					conn,
 					&side.table,
 					self.next.as_ref().map(String::as_str),
-					self.below.as_deref(),
+					&self.over,
 					side.page.get(),
 				)
 			});

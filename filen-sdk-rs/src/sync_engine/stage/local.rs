@@ -16,6 +16,9 @@
 //! what an in-memory set of digests and a list of claims did before, with no copy of any path kept
 //! in memory to do it. An identical path folds identically, so it is refused the same way. The
 //! claims go once the walk is done, so the side reads nodes and nothing else.
+//!
+//! And a partial index of the directories' paths, which the directory-move fold walks for its
+//! candidates without reading a file (see `plan::fold_dir_moves`).
 
 use rusqlite::{Connection, Row, Statement, functions::FunctionFlags, params, types::Type};
 
@@ -38,12 +41,16 @@ CREATE TABLE local (
 	hash BLOB
 );
 CREATE UNIQUE INDEX local_fold ON local (fold(path));
+CREATE INDEX local_dirs ON local (path) WHERE kind = 1;
 ";
 
 /// `local.kind` of a claim, which no [`NodeKind`] has. [`DELETE_CLAIMS`] spells it out.
 const CLAIM: i64 = 0;
 const _: () =
 	assert!(CLAIM == 0 && NodeKind::Dir.as_i64() != CLAIM && NodeKind::File.as_i64() != CLAIM);
+/// The `kind = 1` both staged tables' index of directories and the statements that read it spell
+/// out (see `Sql::dirs_from`).
+const _: () = assert!(NodeKind::Dir.as_i64() == 1);
 
 /// The path holding `?1`'s folded name, on the folded index.
 const TWIN: &str = "SELECT path FROM local WHERE fold(path) = fold(?1)";
@@ -59,6 +66,10 @@ const LOCAL_SQL: Sql = Sql {
 		 WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT ?3",
 	page_after_below: "SELECT path, kind, size, mtime, hash FROM local
 		 WHERE path > ?1 AND path < ?2 ORDER BY path LIMIT ?3",
+	dirs_from: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE kind = 1 AND path >= ?1 ORDER BY path LIMIT ?2",
+	dirs_after: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE kind = 1 AND path > ?1 ORDER BY path LIMIT ?2",
 	insert: "INSERT INTO local (path, kind, size, mtime, hash) VALUES (?1, ?2, ?3, ?4, ?5)
 		 ON CONFLICT DO NOTHING",
 	update: "UPDATE local SET kind = ?2, size = ?3, mtime = ?4, hash = ?5 WHERE path = ?1",
@@ -69,7 +80,8 @@ const LOCAL_SQL: Sql = Sql {
 		 OR EXISTS (SELECT 1 FROM local WHERE fold(path) >= ?1 || '/' AND fold(path) < ?1 || '0')",
 	rekey_at: "UPDATE local SET path = ?2 WHERE path = ?1",
 	rekey_under: "UPDATE local SET path = ?2 || substr(path, length(?1) + 1)
-		 WHERE path >= ?1 || '/' AND path < ?1 || '0'",
+		 WHERE rowid IN (SELECT rowid FROM local WHERE path >= ?1 || '/' AND path < ?1 || '0'
+		 LIMIT ?3)",
 };
 
 /// The local walk's table (see the module docs). Its insert refuses a row whose path or folded name
@@ -254,8 +266,8 @@ mod tests {
 		}
 	}
 
-	/// A side staged in a fresh stage of its own, through the walk's sink, read as `paging` says;
-	/// with the directory its stage is in.
+	/// A side staged in a fresh stage of its own, through the walk's sink, read and re-keyed as
+	/// `paging` says; with the directory its stage is in.
 	fn staged(
 		nodes: impl IntoIterator<Item = LocalNode>,
 		paging: Paging,
@@ -406,6 +418,16 @@ mod tests {
 			sorted(s.paths().map(Cow::into_owned)),
 			"{at}: paths"
 		);
+		// In path order on both, which is what the directory-move fold walks them in.
+		assert_eq!(
+			w.dirs()
+				.map(|(path, node)| (path.into_owned(), node.into_owned()))
+				.collect::<Vec<_>>(),
+			s.dirs()
+				.map(|(path, node)| (path.into_owned(), node.into_owned()))
+				.collect::<Vec<_>>(),
+			"{at}: dirs"
+		);
 		assert_eq!(Nodes::len(&w), Nodes::len(&s), "{at}: len");
 		assert_eq!(Nodes::is_empty(&w), Nodes::is_empty(&s), "{at}: is_empty");
 		assert_eq!(sorted_entries(&w), sorted_entries(&s), "{at}: iter");
@@ -432,9 +454,14 @@ mod tests {
 				s.at_row(&row(&path)).map(Cow::into_owned),
 				"{at}: at_row({path:?})"
 			);
+			// In path order on both, which is what a signature is read in.
 			assert_eq!(
-				sorted(w.under(&path).map(|(path, _)| path.into_owned())),
-				sorted(s.under(&path).map(|(path, _)| path.into_owned())),
+				w.under(&path)
+					.map(|(path, node)| (path.into_owned(), node.into_owned()))
+					.collect::<Vec<_>>(),
+				s.under(&path)
+					.map(|(path, node)| (path.into_owned(), node.into_owned()))
+					.collect::<Vec<_>>(),
 				"{at}: under({path:?})"
 			);
 			assert_eq!(
@@ -446,8 +473,8 @@ mod tests {
 	}
 
 	/// A staged side answers every read exactly as the map a walk into memory would have made,
-	/// through every edit a side has, read one, two and seven rows at a time as well as a pass's
-	/// pages: the expectation is not written down here, it is whatever the map answers.
+	/// through every edit a side has, read and re-keyed one, two and seven rows at a time as well
+	/// as a pass's pages: the expectation is not written down here, it is whatever the map answers.
 	#[test]
 	fn a_staged_side_answers_exactly_as_the_materialised_one() {
 		let mut moves = 0usize;

@@ -16,7 +16,9 @@
 //! under its path. Then `remote` gets its folded index — `fold(path)`, as the local walk's table has,
 //! but not unique: two remote items whose names fold together are what `RemoteView::filter` refuses
 //! the pass over — and `remote_raw` goes. An index on the uuid is built by the first question about
-//! a uuid, which only a pass with writes of its own to settle asks.
+//! a uuid, which only a pass with writes of its own to settle asks. A partial index of the
+//! directories' paths is kept as the walk writes them, as the local table's is, for the
+//! directory-move fold to walk without reading a file.
 //!
 //! # What the walk places, and what it leaves
 //!
@@ -84,6 +86,7 @@ CREATE TABLE remote (
 	size INTEGER NOT NULL,
 	modified INTEGER NOT NULL
 );
+CREATE INDEX remote_dirs ON remote (path) WHERE kind = 1;
 ";
 
 const RAW_INSERT: &str =
@@ -131,6 +134,10 @@ const REMOTE_SQL: Sql = Sql {
 		 WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT ?3",
 	page_after_below: "SELECT path, kind, uuid, lineage, hash, size, modified FROM remote
 		 WHERE path > ?1 AND path < ?2 ORDER BY path LIMIT ?3",
+	dirs_from: "SELECT path, kind, uuid, lineage, hash, size, modified FROM remote
+		 WHERE kind = 1 AND path >= ?1 ORDER BY path LIMIT ?2",
+	dirs_after: "SELECT path, kind, uuid, lineage, hash, size, modified FROM remote
+		 WHERE kind = 1 AND path > ?1 ORDER BY path LIMIT ?2",
 	insert: "INSERT INTO remote (path, kind, uuid, lineage, hash, size, modified)
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
 	update: "UPDATE remote SET kind = ?2, uuid = ?3, lineage = ?4, hash = ?5, size = ?6,
@@ -143,7 +150,8 @@ const REMOTE_SQL: Sql = Sql {
 		 OR EXISTS (SELECT 1 FROM remote WHERE fold(path) >= ?1 || '/' AND fold(path) < ?1 || '0')",
 	rekey_at: "UPDATE remote SET path = ?2 WHERE path = ?1",
 	rekey_under: "UPDATE remote SET path = ?2 || substr(path, length(?1) + 1)
-		 WHERE path >= ?1 || '/' AND path < ?1 || '0'",
+		 WHERE rowid IN (SELECT rowid FROM remote WHERE path >= ?1 || '/' AND path < ?1 || '0'
+		 LIMIT ?3)",
 };
 
 /// The remote view's table (see the module docs).
@@ -554,23 +562,6 @@ fn replay(
 	Ok(ViewBuilder::replay(root, dir_index, undecodable, left).finish_unplaced())
 }
 
-/// A view staged from `items` and `undecodable`, handed over in that order as a read hands them, in
-/// a stage of its own and placed under `root`; with the directory its stage is in.
-#[cfg(test)]
-pub(in super::super) fn staged_view(
-	root: Uuid,
-	items: impl IntoIterator<Item = (bool, RemoteItem)>,
-	undecodable: &[UndecodableItem],
-) -> (tempfile::TempDir, RemoteView) {
-	let (dir, stage) = Stage::in_temp_dir();
-	let mut sink = RemoteSink::new(stage, Paging::PASS).expect("a stage for the remote snapshot");
-	sink.undecodable(undecodable.to_vec());
-	for (is_dir, item) in items {
-		sink.item(is_dir, item);
-	}
-	(dir, sink.finish(root).expect("placing the staged snapshot"))
-}
-
 impl StagedSide<RemoteNode> {
 	/// Where it holds each of `uuids` it holds, a seek of the uuid index each; the first call builds
 	/// the index.
@@ -627,12 +618,12 @@ mod tests {
 			super::{
 				changes::tests::{cacheable_dir, cacheable_file},
 				ignore::{IgnoreRules, IgnoreSource, Origin},
-				plan::{ViewFilter, assert_views_alike, place_remote_items},
+				plan::{ViewFilter, place_remote_items},
 				rows::Baseline,
 				scan::QUARANTINE_DIR,
 				side::Nodes,
 			},
-			paging_of,
+			assert_views_alike, paging_of,
 			tests::row,
 		},
 		*,

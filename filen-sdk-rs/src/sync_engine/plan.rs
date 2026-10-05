@@ -8,12 +8,12 @@
 
 use std::{
 	borrow::Cow,
-	cmp::Reverse,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map},
 	hash::Hash,
 };
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
+use itertools::{EitherOrBoth, Itertools};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ use super::{
 	outcome::{UnsyncablePath, UnsyncableReason},
 	rows::Baseline,
 	scan::{LocalNode, QUARANTINE_DIR, collision_hash, collision_key},
-	side::{Nodes, NodesAt, Side},
+	side::{Nodes, NodesAt, Side, SideRef},
 };
 use crate::cache::{RemoteItem, UndecodableItem};
 
@@ -995,7 +995,7 @@ impl RemoteView {
 ///
 /// Every test that builds a view this way builds its staged twin too — the same items copied into
 /// a stage and placed there, as a whole pass reads them, then filtered alike — and holds it to the
-/// one returned (see [`assert_views_alike`]).
+/// one returned (see `stage::assert_views_alike`).
 #[cfg(test)]
 pub(crate) fn build_remote_view(
 	root: Uuid,
@@ -1012,81 +1012,8 @@ pub(crate) fn build_remote_view(
 		.chain(files.iter().map(|file| (false, file.clone())));
 	let (_dir, mut staged) = super::stage::staged_view(root, items, undecodable);
 	staged.filter(filter);
-	assert_views_alike("the staged twin", &view, &staged);
+	super::stage::assert_views_alike("the staged twin", &view, &staged);
 	view
-}
-
-/// Hold a view a whole pass staged to the one [`ViewBuilder`] built from the same items: the same
-/// nodes at the same paths, the same held paths, ignored roots and count of untracked default hits,
-/// and the same records in any order (nothing reads them in order: `unknown_remote_paths` keys them
-/// by path). Where the views found collisions, each kept one node of every folded name, and which
-/// one is the one thing they may differ in: the pass is refused either way.
-#[cfg(test)]
-pub(super) fn assert_views_alike(at: &str, resident: &RemoteView, staged: &RemoteView) {
-	assert!(
-		matches!(staged.nodes, Side::Staged(_)),
-		"{at}: the staged view is staged"
-	);
-	assert_eq!(
-		staged.has_collisions, resident.has_collisions,
-		"{at}: has_collisions"
-	);
-	assert_eq!(staged.held_paths, resident.held_paths, "{at}: held_paths");
-	assert_eq!(staged.ignored, resident.ignored, "{at}: ignored");
-	assert_eq!(
-		staged.ignored_default_untracked, resident.ignored_default_untracked,
-		"{at}: ignored_default_untracked"
-	);
-	let records = |view: &RemoteView| {
-		let mut records = view.skipped.clone();
-		records.sort_by_key(|record| record.remote_uuid);
-		records
-	};
-	assert_eq!(records(staged), records(resident), "{at}: skipped");
-	let nodes = |view: &RemoteView| -> BTreeMap<String, RemoteNode> {
-		view.nodes
-			.whole()
-			.iter()
-			.map(|(path, node)| (path.into_owned(), node.into_owned()))
-			.collect()
-	};
-	let (resident_nodes, staged_nodes) = (nodes(resident), nodes(staged));
-	assert_eq!(
-		staged.nodes.whole().len(),
-		staged_nodes.len(),
-		"{at}: the staged view counts what it holds"
-	);
-	if !resident.has_collisions {
-		assert_eq!(staged_nodes, resident_nodes, "{at}: nodes");
-		return;
-	}
-	let folded = |nodes: &BTreeMap<String, RemoteNode>| -> BTreeMap<String, RemoteNode> {
-		let folded: BTreeMap<String, RemoteNode> = nodes
-			.values()
-			.map(|node| (collision_key(&node.rel_path), node.clone()))
-			.collect();
-		assert_eq!(
-			folded.len(),
-			nodes.len(),
-			"{at}: two nodes left fold together"
-		);
-		folded
-	};
-	let (resident_folded, staged_folded) = (folded(&resident_nodes), folded(&staged_nodes));
-	assert_eq!(
-		staged_folded.keys().collect::<Vec<_>>(),
-		resident_folded.keys().collect::<Vec<_>>(),
-		"{at}: the folded names left"
-	);
-	for (key, kept) in &resident_folded {
-		let twin = staged_folded
-			.get(key)
-			.expect("the folded names were just compared");
-		// The same node, or the other of two twins.
-		if twin.rel_path == kept.rel_path {
-			assert_eq!(twin, kept, "{at}: the node at {key:?}");
-		}
-	}
 }
 
 /// The skipped items of a view being built: the ones recorded with a reason of their own, and the
@@ -2641,9 +2568,16 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// index, which keeps the set whole. And no two decided `Synced` rows may record one remote uuid
 /// or one lineage, which the move detection already assumes (see [`visit_move_sources`]).
 ///
-/// What still costs the whole map either way is the destination check (`occupied`) and the re-key
-/// itself, both of which walk a side map that has no order to bisect. Those go when the side maps
-/// stop being path-keyed whole-tree maps.
+/// On a whole pass's staged sides nothing here costs the tree: the detectors walk each side's
+/// directories off its stage's index of them, the destination check (`occupied`) is two seeks of
+/// the folded index, the re-key a statement per slice of the moved subtree, and a pushed move is
+/// matched by digests of the candidates' subtrees, read in one ordered walk per side (see
+/// [`next_dir_move`]). What the fold holds is per directory that MOVED, or that one side no longer
+/// holds where its row records it: the move sources the walk of the rows and both sides' directories
+/// side by side leaves (see [`FoldDirs::visit_sources`]), the remote's directories of those sources'
+/// uuids, and a digest per candidate. A converged pair's fold holds the pages its walks read. On a
+/// whole map the destination check and the re-key walk the map, which has no order to bisect: what
+/// the tests compare the stage against.
 ///
 /// A CARRIED side the move does not carry records a node or a tombstone at every row it would
 /// otherwise follow (`Side::stay_put`), so a move over more rows than a change-scoped pass expands
@@ -2754,8 +2688,9 @@ enum Matched {
 /// What one iteration of [`fold_dir_moves`] enumerates for its two detectors: the directories each
 /// side holds, and the directory rows a move can start from.
 ///
-/// A whole pass enumerates each side's map and the directory rows, and a detector walks what it
-/// asks about only once the one before it has left something to find. A change-scoped pass
+/// A whole pass enumerates each side's directories — off its stage's index of them, which reads
+/// none of its files — and the directory rows, and a detector walks what it asks about only once
+/// the one before it has left something to find. A change-scoped pass
 /// enumerates its own paths for all of them, and asked one detector at a time it read the rows at
 /// those paths once per walk: after a directory rename, the remote's directories twice and the move
 /// sources once, three reads of the renamed rows an iteration. So a scoped iteration reads them in
@@ -2763,7 +2698,7 @@ enum Matched {
 /// the cursor just read, and keeps only what the detectors ask about: the directories, a few among
 /// the paths.
 enum FoldDirs<'m> {
-	/// A whole pass: each detector walks the maps and the directory rows itself.
+	/// A whole pass: each detector walks the sides' directories and the directory rows itself.
 	Whole,
 	/// A change-scoped pass: its own paths, read once.
 	Changed(ChangedDirs<'m>),
@@ -2851,19 +2786,75 @@ impl<'m> FoldDirs<'m> {
 		Self::Changed(dirs)
 	}
 
-	/// Hand `visit` the path and remote uuid of every row a directory move can start from. A whole
-	/// pass reads them off the index that holds nothing but directory rows: a few per cent of the
-	/// rows, where a walk of every row would read all of them once per move the fold carries.
-	fn visit_sources(&self, baseline: &Baseline, mut visit: impl FnMut(&str, Uuid)) {
+	/// Hand `visit` every row a directory move in `mode` can start from (see [`MoveSource`]): one
+	/// with a local directory at its path only where `mode` pulls, which is the only move it can
+	/// start, and any other only where `mode` pushes.
+	///
+	/// A whole pass reads them off the index that holds nothing but directory rows — a few per cent
+	/// of the rows, where a walk of every row would read all of them once per move the fold carries
+	/// — with both sides' directories beside them, all three in path order, rather than asking a side
+	/// about each row. Where the local side holds the row's directory and the remote holds a
+	/// directory of the row's uuid at its path, the directory is where the row records it on both
+	/// sides, and the row is not handed over: the fold takes a whole pass's remote view to hold a
+	/// directory's uuid at one path, as the cache keys its items by uuid, so that path is where a
+	/// pull would look for it and find no move. What is handed over is then what a side changed: a
+	/// converged pair hands over nothing, where every directory row was held for a pull to look up
+	/// and find unmoved. A mode that does not pull reads none of the remote's directories here.
+	fn visit_sources(
+		&self,
+		mode: super::SyncMode,
+		baseline: &Baseline,
+		local: &SideRef<'_, LocalNode>,
+		remote: &SideRef<'_, RemoteNode>,
+		mut visit: impl FnMut(MoveSource),
+	) {
+		let wanted = |local_dir| match local_dir {
+			true => mode.pulls(),
+			false => mode.pushes(),
+		};
 		match self {
-			Self::Whole => baseline.visit_dir_rows(|row| {
-				if let Some(uuid) = dir_move_source(row) {
-					visit(&row.rel_path, uuid);
-				}
-			}),
+			Self::Whole => {
+				let mut local_dirs = local.dirs().peekable();
+				let mut remote_dirs = mode.pulls().then(|| remote.dirs().peekable());
+				baseline.visit_dir_rows(|row| {
+					let Some(uuid) = dir_move_source(row) else {
+						return;
+					};
+					let path = row.rel_path.as_str();
+					while local_dirs.next_if(|(at, _)| at.as_ref() < path).is_some() {}
+					let local_dir = local_dirs.peek().is_some_and(|(at, _)| at == path);
+					if !wanted(local_dir) {
+						return;
+					}
+					if local_dir && let Some(remote_dirs) = &mut remote_dirs {
+						while remote_dirs.next_if(|(at, _)| at.as_ref() < path).is_some() {}
+						if remote_dirs
+							.peek()
+							.is_some_and(|(at, node)| at == path && node.remote_uuid == uuid)
+						{
+							return;
+						}
+					}
+					visit(MoveSource {
+						// A copy: the row is lent for this visit only.
+						path: row.rel_path.clone(),
+						uuid,
+						local_dir,
+					});
+				});
+			}
 			Self::Changed(dirs) => {
 				for &(path, uuid) in &dirs.sources {
-					visit(path, uuid);
+					let local_dir = local
+						.at(path)
+						.is_some_and(|node| node.kind == NodeKind::Dir);
+					if wanted(local_dir) {
+						visit(MoveSource {
+							path: path.to_string(),
+							uuid,
+							local_dir,
+						});
+					}
 				}
 			}
 		}
@@ -2872,14 +2863,21 @@ impl<'m> FoldDirs<'m> {
 	/// Hand `visit` every local directory the remote holds nothing at under that exact spelling.
 	fn visit_local_only(
 		&self,
-		local: &'m impl Nodes<Node = LocalNode>,
-		remote: &impl NodesAt<Node = RemoteNode>,
+		local: &'m SideRef<'m, LocalNode>,
+		remote: &SideRef<'_, RemoteNode>,
 		mut visit: impl FnMut(Cow<'m, str>),
 	) {
 		match self {
 			Self::Whole => {
-				for (path, node) in local.iter() {
-					if node.kind == NodeKind::Dir && !remote.holds(&path) {
+				// The two sides' directories side by side, in path order: one the remote holds a
+				// directory at is held there, and only the others are asked about.
+				for pair in local
+					.dirs()
+					.merge_join_by(remote.dirs(), |(left, _), (right, _)| left.cmp(right))
+				{
+					if let EitherOrBoth::Left((path, _)) = pair
+						&& !remote.holds(&path)
+					{
 						visit(path);
 					}
 				}
@@ -2895,14 +2893,14 @@ impl<'m> FoldDirs<'m> {
 	/// Hand `visit` every local directory no row records.
 	fn visit_local_new(
 		&self,
-		local: &'m impl Nodes<Node = LocalNode>,
+		local: &'m SideRef<'m, LocalNode>,
 		baseline: &Baseline,
 		mut visit: impl FnMut(Cow<'m, str>),
 	) {
 		match self {
 			Self::Whole => {
-				for (path, node) in local.iter() {
-					if node.kind == NodeKind::Dir && !baseline.contains_key(&path) {
+				for (path, _) in local.dirs() {
+					if !baseline.contains_key(&path) {
 						visit(path);
 					}
 				}
@@ -2918,15 +2916,13 @@ impl<'m> FoldDirs<'m> {
 	/// Hand `visit` every remote directory, with its uuid.
 	fn visit_remote(
 		&self,
-		remote: &'m impl Nodes<Node = RemoteNode>,
+		remote: &'m SideRef<'m, RemoteNode>,
 		mut visit: impl FnMut(Cow<'m, str>, Uuid),
 	) {
 		match self {
 			Self::Whole => {
-				for (path, node) in remote.iter() {
-					if node.kind == NodeKind::Dir {
-						visit(path, node.remote_uuid);
-					}
+				for (path, node) in remote.dirs() {
+					visit(path, node.remote_uuid);
 				}
 			}
 			Self::Changed(dirs) => {
@@ -2941,14 +2937,20 @@ impl<'m> FoldDirs<'m> {
 	/// spelling, with its uuid.
 	fn visit_remote_only(
 		&self,
-		remote: &'m impl Nodes<Node = RemoteNode>,
-		local: &impl NodesAt<Node = LocalNode>,
+		remote: &'m SideRef<'m, RemoteNode>,
+		local: &SideRef<'_, LocalNode>,
 		mut visit: impl FnMut(Cow<'m, str>, Uuid),
 	) {
 		match self {
 			Self::Whole => {
-				for (path, node) in remote.iter() {
-					if node.kind == NodeKind::Dir && !local.holds(&path) {
+				// As [`visit_local_only`](Self::visit_local_only) walks them.
+				for pair in remote
+					.dirs()
+					.merge_join_by(local.dirs(), |(left, _), (right, _)| left.cmp(right))
+				{
+					if let EitherOrBoth::Left((path, node)) = pair
+						&& !local.holds(&path)
+					{
 						visit(path, node.remote_uuid);
 					}
 				}
@@ -2962,6 +2964,14 @@ impl<'m> FoldDirs<'m> {
 	}
 }
 
+/// A row a directory move can start from: a synced directory row, with its remote uuid.
+struct MoveSource {
+	path: String,
+	uuid: Uuid,
+	/// Whether the local side holds a directory at its path.
+	local_dir: bool,
+}
+
 /// The remote uuid of `row` where a directory move can start from it: a synced directory row's.
 fn dir_move_source(row: &BaselineEntry) -> Option<Uuid> {
 	(row.kind == NodeKind::Dir && row.state == BaselineState::Synced)
@@ -2973,8 +2983,8 @@ fn dir_move_source(row: &BaselineEntry) -> Option<Uuid> {
 fn next_case_only_dir_rename<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &'m impl Nodes<Node = LocalNode>,
-	remote: &'m impl Nodes<Node = RemoteNode>,
+	local: &'m SideRef<'m, LocalNode>,
+	remote: &'m SideRef<'m, RemoteNode>,
 	held: &BTreeSet<String>,
 	dirs: &FoldDirs<'m>,
 ) -> Option<SyncAction> {
@@ -3051,7 +3061,7 @@ fn next_case_only_dir_rename<'m>(
 ///   server's own identity for the directory, so the match is certain. It becomes a `MoveLocal`.
 /// - Pushed (a mode that pushes): a `Synced` baseline directory gone locally, still on the remote
 ///   under the recorded uuid at the recorded path, whose subtree reappears under exactly one new
-///   local directory ([`dir_signature`]: the same relative paths and kinds, and every file with the
+///   local directory (its [`Signature`]: the same relative paths and kinds, and every file with the
 ///   same hash and size). The subtree has to hold at least one file — a subtree of empty
 ///   directories says nothing about identity — and a second match on either end is ambiguous. It
 ///   becomes a `MoveRemote`. A directory nested in the new one that is itself such a move does not
@@ -3071,30 +3081,41 @@ fn next_case_only_dir_rename<'m>(
 fn next_dir_move<'m>(
 	mode: super::SyncMode,
 	baseline: &Baseline,
-	local: &'m impl Nodes<Node = LocalNode>,
-	remote: &'m impl Nodes<Node = RemoteNode>,
+	local: &'m SideRef<'m, LocalNode>,
+	remote: &'m SideRef<'m, RemoteNode>,
 	held: &BTreeSet<String>,
 	dirs: &FoldDirs<'m>,
 ) -> Option<(SyncAction, Matched)> {
-	// Only a synced directory can be the source of a directory move, and at any ordinary shape the
-	// directories are a small fraction of the rows — so a path is copied only for a row that is
-	// actually a candidate.
-	let mut sources: Vec<(String, Uuid)> = Vec::new();
-	dirs.visit_sources(baseline, |path, uuid| {
-		sources.push((path.to_string(), uuid))
-	});
+	// Only a synced directory can be the source of a directory move, and a whole pass hands over
+	// only the ones a side no longer holds where their row records them — so a path is copied only
+	// for a row that is actually a candidate.
+	let mut sources: Vec<MoveSource> = Vec::new();
+	dirs.visit_sources(mode, baseline, local, remote, |source| sources.push(source));
 	if sources.is_empty() {
 		return None;
 	}
-	sources.sort_unstable_by(|(a, _), (b, _)| {
-		(a.matches('/').count(), a.as_str()).cmp(&(b.matches('/').count(), b.as_str()))
+	sources.sort_unstable_by(|a, b| {
+		let (a, b) = (a.path.as_str(), b.path.as_str());
+		(a.matches('/').count(), a).cmp(&(b.matches('/').count(), b))
 	});
-	let mut remote_dir_at: HashMap<Uuid, Cow<'m, str>> = HashMap::new();
-	if mode.pulls() {
-		dirs.visit_remote(remote, |path, uuid| {
-			remote_dir_at.insert(uuid, path);
-		});
-	}
+	// Where the remote holds each directory a pull is looked for, and only those: the last of each
+	// uuid's directories in path order, as a walk keeping every one would leave it.
+	let remote_dir_at: HashMap<Uuid, Cow<'m, str>> = {
+		let pulled: HashSet<Uuid> = sources
+			.iter()
+			.filter(|source| source.local_dir)
+			.map(|source| source.uuid)
+			.collect();
+		let mut at = HashMap::new();
+		if !pulled.is_empty() {
+			dirs.visit_remote(remote, |path, uuid| {
+				if pulled.contains(&uuid) {
+					at.insert(uuid, path);
+				}
+			});
+		}
+		at
+	};
 	let mut search = DirMoveSearch {
 		mode,
 		baseline,
@@ -3113,7 +3134,7 @@ fn next_dir_move<'m>(
 	// fill its destination and refuse it.
 	let candidates: Vec<(SyncAction, Matched)> = sources
 		.iter()
-		.filter_map(|(from, uuid)| dir_move_from(&mut search, from, *uuid))
+		.filter_map(|source| dir_move_from(&mut search, source))
 		.collect();
 	let pending: HashSet<String> = candidates
 		.iter()
@@ -3131,28 +3152,28 @@ fn next_dir_move<'m>(
 }
 
 /// One [`next_dir_move`] search: the pass's inputs and the indexes it builds once for every source.
-struct DirMoveSearch<'a, 'm, L, R> {
+struct DirMoveSearch<'a> {
 	mode: super::SyncMode,
 	baseline: &'a Baseline,
-	local: &'m L,
-	remote: &'a R,
+	local: &'a SideRef<'a, LocalNode>,
+	remote: &'a SideRef<'a, RemoteNode>,
 	held: &'a BTreeSet<String>,
-	dirs: &'a FoldDirs<'m>,
-	sources: &'a [(String, Uuid)],
-	remote_dir_at: HashMap<Uuid, Cow<'m, str>>,
+	dirs: &'a FoldDirs<'a>,
+	sources: &'a [MoveSource],
+	remote_dir_at: HashMap<Uuid, Cow<'a, str>>,
 	/// The sources gone locally with their signatures, and the new local directories with theirs,
 	/// built only once a pushed move is possible — and each read once for every source it answers.
-	gone: Option<Vec<(&'a str, Signature)>>,
-	new_local_dirs: Option<Vec<NewLocalDir<'m>>>,
+	gone: Option<Gone<'a>>,
+	new_local_dirs: Option<NewLocalDirs<'a>>,
 }
 
-/// The directory move of the baseline directory `from` (remote uuid `uuid`), checked against
-/// everything [`next_dir_move`] requires except the parents of its destination.
-fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
-	search: &mut DirMoveSearch<'_, '_, L, R>,
-	from: &str,
-	uuid: Uuid,
+/// The directory move of the baseline directory at `source`, checked against everything
+/// [`next_dir_move`] requires except the parents of its destination.
+fn dir_move_from(
+	search: &mut DirMoveSearch<'_>,
+	source: &MoveSource,
 ) -> Option<(SyncAction, Matched)> {
+	let (from, uuid) = (source.path.as_str(), source.uuid);
 	let DirMoveSearch {
 		mode,
 		baseline,
@@ -3165,7 +3186,7 @@ fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
 		ref mut gone,
 		ref mut new_local_dirs,
 	} = *search;
-	let (action, matched) = if local.at(from).is_some_and(|n| n.kind == NodeKind::Dir) {
+	let (action, matched) = if source.local_dir {
 		let to = remote_dir_at.get(&uuid)?.as_ref();
 		// The steady-state answer, before the scan that would reach it the slow way: the directory
 		// is where the baseline recorded it. `occupied(local, from)` is true whenever it is — the
@@ -3188,28 +3209,23 @@ fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
 	{
 		// Nothing local is at `from` under any spelling, so it holds nothing there either: it is one
 		// of the sources gone locally, and in `gone` exactly when the baseline vouches for it. The
-		// first source to get here reads its own signature first, and only one the baseline vouches
-		// for goes on to read the others'.
-		let gone: &[(&str, Signature)] = match gone {
-			Some(gone) => gone,
-			None => {
-				let signature = baseline_dir_signature(baseline, from)?;
-				gone.insert(gone_signatures(baseline, local, sources, from, signature))
-			}
-		};
-		let (_, signature) = gone.iter().find(|(path, _)| *path == from)?;
+		// first source to get here reads every such source's signature, in one walk of the rows.
+		let gone = gone.get_or_insert_with(|| gone_signatures(baseline, local, sources));
+		let signature = *gone.by_path.get(from)?;
 		let new_dirs = new_local_dirs
 			.get_or_insert_with(|| new_local_dir_signatures(baseline, local, gone, dirs));
-		let mut matches = new_dirs.iter().filter(|dir| dir.matches(signature));
-		let dir = matches.next()?;
+		let mut matches = new_dirs.matching(baseline, local, from, signature);
+		let (dir, full) = matches.next()?;
 		if matches.next().is_some() {
 			return None;
 		}
 		let to = dir.path.as_ref();
 		// The same subtree vanished from somewhere else too: which of the two moved is a guess.
-		let twin = gone
-			.iter()
-			.any(|(other, other_signature)| *other != from && other_signature == signature);
+		let twin = gone.by_signature.get(&signature).is_some_and(|others| {
+			others
+				.iter()
+				.any(|other| *other != from && same_rows(baseline, from, other))
+		});
 		let (to_parent, to_name) = (parent_path(to), leaf(to));
 		let via = match to_parent.is_empty() {
 			true => leaf(from).to_string(),
@@ -3224,7 +3240,6 @@ fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
 				kind: NodeKind::Dir,
 				remote_uuid: uuid,
 			})?;
-		let full = dir.full == *signature;
 		(action, Matched::Signature { full })
 	} else {
 		return None;
@@ -3240,42 +3255,339 @@ fn dir_move_from<L: Nodes<Node = LocalNode>, R: Nodes<Node = RemoteNode>>(
 	clear.then_some((action, matched))
 }
 
-/// A new local directory and the signatures a pushed move into it is matched by: everything it holds,
-/// and — when a directory nested in it is a move of its own — what it holds without that one.
-struct NewLocalDir<'a> {
-	path: Cow<'a, str>,
-	full: Signature,
-	without_nested_moves: Option<Signature>,
+/// What a directory holds, relative to it, as a digest: every path under it in path order, each
+/// with what it adds to the signature ([`SignatureEntry`]). Two directories that hold the same tree
+/// have the same signature. Two with the same signature are only NOMINATED as holding the same
+/// tree: [`same_tree`] and [`same_rows`] compare the two subtrees path for path, and decide.
+///
+/// A digest rather than the tree itself, so that what a fold holds for a pushed move is a few
+/// bytes per candidate directory: a copy of each candidate's subtree was what every directory
+/// above a path held again, the tree's depth over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Signature([u8; 32]);
+
+/// What one path under a directory adds to the directory's signature: its kind and, for a file,
+/// its content hash and size. `None` for a path no signature can be read over (see
+/// [`row_signature_entry`] and [`local_signature_entry`]).
+type SignatureEntry = Option<(NodeKind, Option<Blake3Hash>, u64)>;
+
+/// What a baseline row adds to its directory's signature: `None` where the baseline cannot vouch for
+/// the row — one that is not `Synced`, or a file row without a hash or a size.
+fn row_signature_entry(row: &BaselineEntry) -> SignatureEntry {
+	if row.state != BaselineState::Synced {
+		return None;
+	}
+	Some(match row.kind {
+		NodeKind::File => (NodeKind::File, Some(row.content_hash?), row.size?),
+		NodeKind::Dir => (NodeKind::Dir, None, 0),
+	})
 }
 
-impl NewLocalDir<'_> {
-	fn matches(&self, signature: &Signature) -> bool {
-		self.full == *signature || self.without_nested_moves.as_ref() == Some(signature)
+/// What a local node adds to its directory's signature: `None` for a file without a hash.
+fn local_signature_entry(node: &LocalNode) -> SignatureEntry {
+	Some(match node.kind {
+		NodeKind::File => (NodeKind::File, Some(node.content_hash?), node.size),
+		NodeKind::Dir => (NodeKind::Dir, None, 0),
+	})
+}
+
+/// A [`Signature`] being read, a path at a time in path order. A path that adds `None` spoils it.
+struct SignatureReader {
+	hasher: Option<blake3::Hasher>,
+	/// Whether a file was among the paths read.
+	files: bool,
+}
+
+impl SignatureReader {
+	fn new() -> Self {
+		Self {
+			hasher: Some(blake3::Hasher::new()),
+			files: false,
+		}
+	}
+
+	/// Add the path `rel` below the directory, with what it adds. Each field is written whole and
+	/// the path with its length first, so no two sequences of paths read the same bytes.
+	fn add(&mut self, rel: &str, entry: SignatureEntry) {
+		let Some(hasher) = &mut self.hasher else {
+			return;
+		};
+		let Some((kind, hash, size)) = entry else {
+			self.hasher = None;
+			return;
+		};
+		hasher.update(&rel.len().to_le_bytes());
+		hasher.update(rel.as_bytes());
+		hasher.update(&kind.as_i64().to_le_bytes());
+		match hash {
+			Some(hash) => hasher.update(&[1]).update(hash.as_ref()),
+			None => hasher.update(&[0]),
+		};
+		hasher.update(&size.to_le_bytes());
+		self.files |= kind == NodeKind::File;
+	}
+
+	/// The signature read, and whether a file was among it; `None` once spoilt.
+	fn finish(self) -> Option<(Signature, bool)> {
+		let hasher = self.hasher?;
+		Some((Signature(*hasher.finalize().as_bytes()), self.files))
 	}
 }
 
-/// Every one of `sources` gone locally whose subtree the baseline vouches for, with its signature,
-/// in `sources`' order: what a pushed move is matched from, and what makes one a guess. `from`'s is
-/// the `signature` already in hand, and is not read again.
+/// The signature of every directory in `roots`, and whether it holds a file, in ONE walk of each
+/// outermost root's subtree: `walk` hands `add` every path strictly under the root it is given, in
+/// path order, with what the path adds. Each path is added to the signature of every root it is
+/// under, so a nested root's paths are read once rather than once per root above them.
+///
+/// A root's subtree is the run of paths from `root/` to `root0` (see [`subtree_bounds`]), and two
+/// roots' runs are nested or apart, so the roots are taken up in the order their runs start: a
+/// root is opened at the first path inside its run and closed at the first path past it, and the
+/// open ones are always the roots the path in hand is under, outermost first.
+fn read_signatures<'r>(
+	roots: impl IntoIterator<Item = &'r str>,
+	mut walk: impl FnMut(&str, &mut dyn FnMut(&str, SignatureEntry)),
+) -> HashMap<&'r str, Option<(Signature, bool)>> {
+	let mut roots: Vec<&str> = roots.into_iter().collect();
+	roots.sort_unstable_by(|a, b| run_start(a).cmp(run_start(b)));
+	roots.dedup();
+	let mut read = HashMap::with_capacity(roots.len());
+	let mut rest = roots.as_slice();
+	while let Some((&outer, after)) = rest.split_first() {
+		let (nested, next) = after.split_at(after.partition_point(|root| is_under(root, outer)));
+		let mut nested = nested.iter().copied().peekable();
+		let mut open = vec![(outer, SignatureReader::new())];
+		walk(outer, &mut |path, entry| {
+			// Never the outer root: the walk is its subtree.
+			while open.len() > 1
+				&& let Some((root, reader)) = open.pop_if(|(root, _)| !is_under(path, root))
+			{
+				read.insert(root, reader.finish());
+			}
+			while let Some(root) = nested.next_if(|root| run_start(root).le(path.bytes())) {
+				match is_under(path, root) {
+					true => open.push((root, SignatureReader::new())),
+					// Its run lies before this path, with nothing in it.
+					false => {
+						read.insert(root, SignatureReader::new().finish());
+					}
+				}
+			}
+			for (root, reader) in &mut open {
+				if let Some(rel) = path.strip_prefix(*root) {
+					reader.add(rel, entry);
+				}
+			}
+		});
+		for (root, reader) in open {
+			read.insert(root, reader.finish());
+		}
+		for root in nested {
+			read.insert(root, SignatureReader::new().finish());
+		}
+		rest = next;
+	}
+	read
+}
+
+/// Where the run of paths under `root` starts in path order: `root/`.
+fn run_start(root: &str) -> impl Iterator<Item = u8> + Clone + '_ {
+	root.bytes().chain([b'/'])
+}
+
+/// The signature of the local directory at `root` less everything at or under `excluded`; `None`
+/// when a file it holds has no hash.
+fn local_signature(
+	local: &SideRef<'_, LocalNode>,
+	root: &str,
+	excluded: &BTreeSet<String>,
+) -> Option<Signature> {
+	let mut reader = SignatureReader::new();
+	for (path, node) in local.under(root) {
+		if !at_or_under_root(excluded, &path) {
+			reader.add(path.strip_prefix(root)?, local_signature_entry(&node));
+		}
+	}
+	reader.finish().map(|(signature, _)| signature)
+}
+
+/// Whether the baseline's subtree at `from` and the local one at `to`, less everything at or under
+/// `excluded`, hold the same tree: path for path in path order, each the same below its root and
+/// adding the same to its signature. What decides a match equal signatures only nominate.
+fn same_tree(
+	baseline: &Baseline,
+	from: &str,
+	local: &SideRef<'_, LocalNode>,
+	to: &str,
+	excluded: &BTreeSet<String>,
+) -> bool {
+	same_entries(
+		row_entries(baseline, from),
+		from,
+		local
+			.under(to)
+			.filter(|(path, _)| !at_or_under_root(excluded, path))
+			.map(|(path, node)| (local_signature_entry(&node), path)),
+		to,
+	)
+}
+
+/// Whether the baseline's subtrees at `a` and `b` hold the same tree (see [`same_tree`]).
+fn same_rows(baseline: &Baseline, a: &str, b: &str) -> bool {
+	same_entries(row_entries(baseline, a), a, row_entries(baseline, b), b)
+}
+
+/// Every row strictly under `root`, with what it adds to the signature, in path order.
+fn row_entries<'b>(
+	baseline: &'b Baseline,
+	root: &'b str,
+) -> impl Iterator<Item = (SignatureEntry, Cow<'static, str>)> + 'b {
+	baseline
+		.subtree(root)
+		.map(|row| (row_signature_entry(&row), Cow::Owned(row.rel_path)))
+}
+
+/// Whether `left` under `left_root` and `right` under `right_root` are the same paths below their
+/// roots, in the same order, each adding the same.
+fn same_entries<'l, 'r>(
+	mut left: impl Iterator<Item = (SignatureEntry, Cow<'l, str>)>,
+	left_root: &str,
+	mut right: impl Iterator<Item = (SignatureEntry, Cow<'r, str>)>,
+	right_root: &str,
+) -> bool {
+	loop {
+		match (left.next(), right.next()) {
+			(None, None) => return true,
+			(Some((left_entry, left_path)), Some((right_entry, right_path)))
+				if left_entry == right_entry
+					&& left_path.strip_prefix(left_root) == right_path.strip_prefix(right_root) => {}
+			_ => return false,
+		}
+	}
+}
+
+/// The move sources gone locally whose subtree the baseline vouches for, each with its signature
+/// (see [`gone_signatures`]).
+struct Gone<'s> {
+	by_path: HashMap<&'s str, Signature>,
+	/// The sources with each signature.
+	by_signature: HashMap<Signature, Vec<&'s str>>,
+}
+
+impl<'s> Gone<'s> {
+	/// The source that holds what the local directory `to` holds less `excluded`, whose signature is
+	/// `signature`, if one does.
+	fn explaining(
+		&self,
+		baseline: &Baseline,
+		signature: Signature,
+		local: &SideRef<'_, LocalNode>,
+		to: &str,
+		excluded: &BTreeSet<String>,
+	) -> Option<&'s str> {
+		self.by_signature
+			.get(&signature)?
+			.iter()
+			.copied()
+			.find(|from| same_tree(baseline, from, local, to, excluded))
+	}
+}
+
+/// Every one of `sources` gone locally whose subtree the baseline vouches for, with its signature:
+/// what a pushed move is matched from, and what makes one a guess. Read in one walk of the rows
+/// under the outermost of them (see [`read_signatures`]).
 fn gone_signatures<'s>(
 	baseline: &Baseline,
-	local: &impl NodesAt<Node = LocalNode>,
-	sources: &'s [(String, Uuid)],
-	from: &str,
-	signature: Signature,
-) -> Vec<(&'s str, Signature)> {
-	let mut in_hand = Some(signature);
-	sources
-		.iter()
-		.filter(|(path, _)| !local.holds(path))
-		.filter_map(|(path, _)| {
-			let signature = match path == from {
-				true => in_hand.take(),
-				false => baseline_dir_signature(baseline, path),
-			};
-			Some((path.as_str(), signature?))
-		})
-		.collect()
+	local: &SideRef<'_, LocalNode>,
+	sources: &'s [MoveSource],
+) -> Gone<'s> {
+	let read = read_signatures(
+		sources
+			.iter()
+			.filter(|source| !source.local_dir && !local.holds(&source.path))
+			.map(|source| source.path.as_str()),
+		|root, add| {
+			for row in baseline.subtree(root) {
+				add(&row.rel_path, row_signature_entry(&row));
+			}
+		},
+	);
+	let mut gone = Gone {
+		by_path: HashMap::new(),
+		by_signature: HashMap::new(),
+	};
+	for (path, read) in read {
+		// A subtree without a file says nothing about identity.
+		let Some((signature, true)) = read else {
+			continue;
+		};
+		gone.by_path.insert(path, signature);
+		gone.by_signature.entry(signature).or_default().push(path);
+	}
+	gone
+}
+
+/// A new local directory and the signatures a pushed move into it is matched by: everything it holds,
+/// and — when a directory nested in it is a move of its own — what it holds without those ones.
+struct NewLocalDir<'a> {
+	path: Cow<'a, str>,
+	full: Signature,
+	/// What it holds less the nested directories that are moves of their own, and those
+	/// directories.
+	without_nested_moves: Option<(Signature, BTreeSet<String>)>,
+	/// The source its full signature was found to match, path for path, which a match of that
+	/// source here need not check again.
+	explained_by: Option<&'a str>,
+	/// Whether it is a move of its own: one of its signatures is a source's.
+	moved: bool,
+}
+
+impl NewLocalDir<'_> {
+	/// Whether the source `from`, whose signature is `signature`, moved here — and then whether it
+	/// was the directory's full signature that matched.
+	fn matched(
+		&self,
+		baseline: &Baseline,
+		local: &SideRef<'_, LocalNode>,
+		from: &str,
+		signature: Signature,
+	) -> Option<bool> {
+		if self.full == signature
+			&& (self.explained_by == Some(from)
+				|| same_tree(baseline, from, local, &self.path, &BTreeSet::new()))
+		{
+			return Some(true);
+		}
+		let (without, excluded) = self.without_nested_moves.as_ref()?;
+		(*without == signature && same_tree(baseline, from, local, &self.path, excluded))
+			.then_some(false)
+	}
+}
+
+/// The new local directories, and each by every signature it is matched by.
+struct NewLocalDirs<'a> {
+	dirs: Vec<NewLocalDir<'a>>,
+	by_signature: HashMap<Signature, Vec<usize>>,
+}
+
+impl NewLocalDirs<'_> {
+	/// Every directory the source `from`, whose signature is `signature`, moved to, with whether its
+	/// full signature matched.
+	fn matching<'d>(
+		&'d self,
+		baseline: &'d Baseline,
+		local: &'d SideRef<'_, LocalNode>,
+		from: &'d str,
+		signature: Signature,
+	) -> impl Iterator<Item = (&'d NewLocalDir<'d>, bool)> {
+		self.by_signature
+			.get(&signature)
+			.into_iter()
+			.flatten()
+			.filter_map(move |&at| {
+				let dir = self.dirs.get(at)?;
+				Some((dir, dir.matched(baseline, local, from, signature)?))
+			})
+	}
 }
 
 /// The local directories the baseline does not record, with their signatures (see [`NewLocalDir`]).
@@ -3283,94 +3595,90 @@ fn gone_signatures<'s>(
 /// directory gone locally (`gone`, see [`gone_signatures`]); `mv z new; mv b new/b` then matches
 /// `new` to `z` and `new/b` to `b`, while a subdirectory that moved along inside its parent still
 /// leaves the parent's full signature to match. A directory whose full signature matches a gone one
-/// gets no reduced signature at all: the full match already explains it. Computed deepest first, so
-/// a chain of such moves reduces from the inside out.
-fn new_local_dir_signatures<'m>(
+/// gets no reduced signature at all: the full match already explains it.
+///
+/// The full signatures are read in one walk of each outermost new directory (see
+/// [`read_signatures`]), the reduced ones each in a walk of its directory; then the directories are
+/// taken up in reverse path order, which puts every one after the directories nested in it, so a
+/// chain of such moves reduces from the inside out.
+fn new_local_dir_signatures<'a>(
 	baseline: &Baseline,
-	local: &'m impl Nodes<Node = LocalNode>,
-	gone: &[(&str, Signature)],
-	dirs: &FoldDirs<'m>,
-) -> Vec<NewLocalDir<'m>> {
-	let mut candidates: Vec<Cow<'m, str>> = Vec::new();
-	dirs.visit_local_new(local, baseline, |path| candidates.push(path));
-	candidates.sort_unstable_by_key(|path| Reverse(path.matches('/').count()));
-	let mut new_dirs: Vec<NewLocalDir<'m>> = Vec::with_capacity(candidates.len());
-	for path in candidates {
-		let Some(full) = dir_signature(local, &path) else {
+	local: &'a SideRef<'a, LocalNode>,
+	gone: &Gone<'a>,
+	dirs: &FoldDirs<'a>,
+) -> NewLocalDirs<'a> {
+	let mut paths: Vec<Cow<'a, str>> = Vec::new();
+	dirs.visit_local_new(local, baseline, |path| paths.push(path));
+	let read = read_signatures(paths.iter().map(AsRef::as_ref), |root, add| {
+		for (path, node) in local.under(root) {
+			add(&path, local_signature_entry(&node));
+		}
+	});
+	let fulls: Vec<Option<Signature>> = paths
+		.iter()
+		.map(|path| Some(read.get(path.as_ref()).copied()??.0))
+		.collect();
+	drop(read);
+	// A directory under which a file has no hash has no signature to match.
+	let mut new_dirs: Vec<NewLocalDir<'a>> = paths
+		.into_iter()
+		.zip(fulls)
+		.filter_map(|(path, full)| {
+			Some(NewLocalDir {
+				path,
+				full: full?,
+				without_nested_moves: None,
+				explained_by: None,
+				moved: false,
+			})
+		})
+		.collect();
+	new_dirs.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+	for at in (0..new_dirs.len()).rev() {
+		let (upto, after) = new_dirs.split_at_mut(at + 1);
+		let Some(dir) = upto.last_mut() else {
 			continue;
 		};
-		let mut without_nested_moves: Option<Signature> = None;
 		// A directory whose whole tree already matches one gone locally is that move, its nested
 		// directories included: stripping one would let a deleted directory holding the rest claim it.
-		let explained = gone.iter().any(|(_, sig)| *sig == full);
-		for inner in &new_dirs {
-			// A nested directory, and its path below this one, separator first, as the signature's
-			// keys are.
-			if !explained
-				&& let Some(inner_rel) = inner.path.strip_prefix(&*path)
-				&& inner_rel.starts_with('/')
-				&& gone.iter().any(|(_, sig)| inner.matches(sig))
-			{
-				// The only copy of the signature, made once per directory that holds a nested move.
-				without_nested_moves
-					.get_or_insert_with(|| full.clone())
-					.retain(|rel, _| rel != inner_rel && !is_under(rel, inner_rel));
-			}
+		dir.explained_by = gone.explaining(baseline, dir.full, local, &dir.path, &BTreeSet::new());
+		dir.moved = dir.explained_by.is_some();
+		if dir.moved {
+			continue;
 		}
-		new_dirs.push(NewLocalDir {
-			path,
-			full,
-			without_nested_moves,
-		});
+		// The new directories nested in it: the run of them from `dir/` on, in path order.
+		let bounds = subtree_bounds(&dir.path);
+		let excluded: BTreeSet<String> = after
+			.iter()
+			.skip_while(|inner| *inner.path < *bounds.start)
+			.take_while(|inner| *inner.path < *bounds.end)
+			.filter(|inner| inner.moved)
+			.map(|inner| inner.path.to_string())
+			.collect();
+		if excluded.is_empty() {
+			continue;
+		}
+		let Some(without) = local_signature(local, &dir.path, &excluded) else {
+			continue;
+		};
+		dir.moved = gone
+			.explaining(baseline, without, local, &dir.path, &excluded)
+			.is_some();
+		dir.without_nested_moves = Some((without, excluded));
 	}
-	new_dirs
-}
-
-/// What a directory holds, relative to it: every path under it with its kind and, for a file, its
-/// content hash and size. Two directories with equal signatures hold the same tree.
-type Signature = BTreeMap<String, (NodeKind, Option<Blake3Hash>, u64)>;
-
-/// The signature of the local directory at `root`; `None` when a file under it has no hash.
-fn dir_signature(local: &impl Nodes<Node = LocalNode>, root: &str) -> Option<Signature> {
-	local
-		.under(root)
-		.map(|(path, node)| {
-			let (hash, size) = match node.kind {
-				NodeKind::File => (Some(node.content_hash?), node.size),
-				NodeKind::Dir => (None, 0),
-			};
-			Some((
-				path.strip_prefix(root)?.to_string(),
-				(node.kind, hash, size),
-			))
-		})
-		.collect()
-}
-
-/// The signature the baseline recorded for the directory at `root` — `None` when it cannot vouch
-/// for the subtree: a row under it that is not `Synced`, a file row without a hash or a size, or no
-/// file at all.
-fn baseline_dir_signature(baseline: &Baseline, root: &str) -> Option<Signature> {
-	let signature: Signature = baseline
-		.subtree(root)
-		.map(|row| {
-			if row.state != BaselineState::Synced {
-				return None;
-			}
-			let (hash, size) = match row.kind {
-				NodeKind::File => (Some(row.content_hash?), row.size?),
-				NodeKind::Dir => (None, 0),
-			};
-			Some((
-				row.rel_path.strip_prefix(root)?.to_string(),
-				(row.kind, hash, size),
-			))
-		})
-		.collect::<Option<_>>()?;
-	signature
-		.values()
-		.any(|(kind, ..)| *kind == NodeKind::File)
-		.then_some(signature)
+	let mut by_signature: HashMap<Signature, Vec<usize>> = HashMap::new();
+	for (at, dir) in new_dirs.iter().enumerate() {
+		by_signature.entry(dir.full).or_default().push(at);
+		if let Some((without, _)) = &dir.without_nested_moves
+			&& *without != dir.full
+		{
+			by_signature.entry(*without).or_default().push(at);
+		}
+	}
+	NewLocalDirs {
+		dirs: new_dirs,
+		by_signature,
+	}
 }
 
 /// Whether every directory above `to` exists on `side`, or is one the reconcile creates there
@@ -3928,6 +4236,7 @@ mod tests {
 			engine::{Observations, PendingKind, PendingWrites},
 			ignore::{IgnoreLevel, IgnoreSource, Origin},
 			side::{FromRow, test_support::copied},
+			stage::staged_sides,
 		},
 		*,
 	};
@@ -4023,7 +4332,63 @@ mod tests {
 			plan_scoped(mode, &rows, twin_local, twin_remote, decided),
 			"{mode:?}: the carried, change-scoped twin planned something else"
 		);
+		for page in [1, 2, 1024] {
+			assert_eq!(
+				actions,
+				plan_staged(mode, baseline, local, remote, page),
+				"{mode:?}: the staged sides, read {page} row(s) a statement, planned something else"
+			);
+		}
 		actions
+	}
+
+	/// [`plan_with_renames`]'s whole fold and reconcile, over the sides a whole pass stages, read
+	/// `page` rows a statement.
+	fn plan_staged(
+		mode: SyncMode,
+		baseline: &HashMap<String, BaselineEntry>,
+		local: &HashMap<String, LocalNode>,
+		remote: &HashMap<String, RemoteNode>,
+		page: usize,
+	) -> Vec<SyncAction> {
+		let mut rows = tree(baseline);
+		let (_stages, mut local, mut remote) =
+			staged_sides(local.values().cloned(), remote.values().cloned(), page);
+		let mut actions = fold_dir_moves(
+			mode,
+			&mut rows,
+			&mut local,
+			&mut remote,
+			&BTreeSet::new(),
+			None,
+		)
+		.unwrap();
+		actions.extend(
+			reconcile(
+				mode,
+				&rows,
+				&local.of(&rows),
+				&remote.of(&rows),
+				&PassHolds::default(),
+				PassPaths::Whole,
+			)
+			.actions,
+		);
+		actions
+	}
+
+	/// The two sides of a test case as a whole map each, or as the sides a whole pass stages, read
+	/// a row a statement; with the directory of the stages, which must outlive the sides.
+	fn backed(
+		local: HashMap<String, LocalNode>,
+		remote: HashMap<String, RemoteNode>,
+		staged: bool,
+	) -> (Option<tempfile::TempDir>, Side<LocalNode>, Side<RemoteNode>) {
+		if !staged {
+			return (None, Side::from(local), Side::from(remote));
+		}
+		let (stages, local, remote) = staged_sides(local.into_values(), remote.into_values(), 1);
+		(Some(stages), local, remote)
 	}
 
 	/// The two sides a change-scoped pass would hold over `rows` where a whole read found `local`
@@ -4284,23 +4649,26 @@ mod tests {
 	/// A path held in conflict is not renamed: the conflict hold decides it.
 	#[test]
 	fn a_conflicted_dir_is_not_case_renamed() {
-		let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
-		let (mut baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
-		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
-		baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
-		let mut baseline = tree(&baseline);
-		assert!(
-			fold_dir_moves(
-				SyncMode::TwoWay,
-				&mut baseline,
-				&mut local,
-				&mut remote,
-				&BTreeSet::new(),
-				None,
-			)
-			.unwrap()
-			.is_empty()
-		);
+		for staged in [false, true] {
+			let (dir, file) = (Uuid::new_v4(), Uuid::new_v4());
+			let (mut baseline, local, remote) = case_tree("Docs", "docs", "Docs", dir, file);
+			let (_stages, mut local, mut remote) = backed(local, remote, staged);
+			baseline.get_mut("Docs").unwrap().state = BaselineState::Conflicted;
+			let mut baseline = tree(&baseline);
+			assert!(
+				fold_dir_moves(
+					SyncMode::TwoWay,
+					&mut baseline,
+					&mut local,
+					&mut remote,
+					&BTreeSet::new(),
+					None,
+				)
+				.unwrap()
+				.is_empty(),
+				"staged: {staged}"
+			);
+		}
 	}
 
 	/// The uuids of a synced directory tree `<dir>/a.txt`, `<dir>/sub/`, `<dir>/sub/b.txt`.
@@ -4665,22 +5033,25 @@ mod tests {
 	/// A path the cache is holding at either end keeps the directory where it is.
 	#[test]
 	fn a_dir_under_a_held_remote_path_is_not_moved() {
-		let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
-		let (mut local, mut remote) = (Side::from(local), Side::from(remote));
-		let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
-		let mut baseline = tree(&baseline);
-		assert!(
-			fold_dir_moves(
-				SyncMode::TwoWay,
-				&mut baseline,
-				&mut local,
-				&mut remote,
-				&held,
-				None,
-			)
-			.unwrap()
-			.is_empty()
-		);
+		for staged in [false, true] {
+			let (baseline, local, remote) = moved_tree(TreeIds::new(), "docs", "documents");
+			let (_stages, mut local, mut remote) = backed(local, remote, staged);
+			let held = BTreeSet::from(["documents/sub/b.txt".to_string()]);
+			let mut baseline = tree(&baseline);
+			assert!(
+				fold_dir_moves(
+					SyncMode::TwoWay,
+					&mut baseline,
+					&mut local,
+					&mut remote,
+					&held,
+					None,
+				)
+				.unwrap()
+				.is_empty(),
+				"staged: {staged}"
+			);
+		}
 	}
 
 	/// A pushed directory move is carried at the scope a pass read, not just at the whole map. The
@@ -4695,8 +5066,11 @@ mod tests {
 			Side::from(local.clone()),
 			Side::from(remote.clone()),
 		);
-		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) =
-			(tree(&baseline), Side::from(local), Side::from(remote));
+		let (mut scoped_baseline, mut scoped_local, mut scoped_remote) = (
+			tree(&baseline),
+			Side::from(local.clone()),
+			Side::from(remote.clone()),
+		);
 		let by_whole = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut whole_baseline,
@@ -4722,6 +5096,22 @@ mod tests {
 		assert_eq!(by_whole, by_scope, "the narrowed fold missed the move");
 		assert_eq!(whole_local, scoped_local);
 		assert_eq!(whole_remote, scoped_remote);
+
+		// And whole over the sides a whole pass stages.
+		let (_stages, mut staged_local, mut staged_remote) = backed(local, remote, true);
+		let mut staged_baseline = tree(&baseline);
+		let by_stage = fold_dir_moves(
+			SyncMode::TwoWay,
+			&mut staged_baseline,
+			&mut staged_local,
+			&mut staged_remote,
+			&BTreeSet::new(),
+			None,
+		)
+		.unwrap();
+		assert_eq!(by_whole, by_stage, "the staged fold missed the move");
+		assert_eq!(whole_local.into_whole(), staged_local.into_whole());
+		assert_eq!(whole_remote.into_whole(), staged_remote.into_whole());
 	}
 
 	/// What a change-scoped pass plans from carried sides: the fold at the pass's own set, then the
@@ -5291,11 +5681,12 @@ mod tests {
 
 	/// A change-scoped pass folding a directory rename reads the renamed directory's rows a fixed
 	/// number of times, whatever it holds. On the first iteration: once for the move sources and
-	/// both sides' directories together, once for whether anything local is left at the source, and
-	/// once for the source's signature — which the twin check and the new directories' match reuse
-	/// rather than read again. The second, which finds nothing, reads only what the move did not
-	/// prove unchanged: here the renamed directory itself, since the remote side recorded nothing
-	/// under it (see [`fold_dir_moves`]).
+	/// both sides' directories together, once for whether anything local is left at the source,
+	/// once for the source's signature, and once to check, path for path, that the new directory
+	/// whose signature it matched holds the same tree — which the twin check and the match of the
+	/// source reuse rather than read again. The second, which finds nothing, reads only what the
+	/// move did not prove unchanged: here the renamed directory itself, since the remote side
+	/// recorded nothing under it (see [`fold_dir_moves`]).
 	#[test]
 	fn a_scoped_directory_rename_fold_reads_the_renamed_rows_a_fixed_number_of_times() {
 		const FILES: usize = 2_000;
@@ -5342,10 +5733,109 @@ mod tests {
 		);
 		let (statements, rows) = (after.0 - before.0, after.1 - before.1);
 		assert!(
-			rows < 7 * FILES / 2,
-			"the fold read {rows} row(s) in {statements} statement(s): more than three and a half \
+			rows < 9 * FILES / 2,
+			"the fold read {rows} row(s) in {statements} statement(s): more than four and a half \
 			 times the {FILES} file(s) it moved"
 		);
+	}
+
+	/// A whole fold over staged sides of a directory renamed locally holds a digest per directory it
+	/// matches, not a copy of each one's subtree: 20,000 files in 200 directories, which as maps of
+	/// every path under every candidate were megabytes, fold holding under 1 MiB.
+	#[test]
+	fn a_staged_fold_of_a_pushed_rename_holds_no_copy_of_its_subtree() {
+		const DIRS: u32 = 200;
+		const FILES: u32 = 100;
+		let root = Uuid::from_u128(1);
+		let (mut rows, mut local, mut remote) = (
+			vec![base_dir("a", root)],
+			vec![local_dir("b")],
+			vec![remote_dir_node("a", root)],
+		);
+		for dir in 0..DIRS {
+			let (from, to) = (format!("a/d{dir:03}"), format!("b/d{dir:03}"));
+			let dir_uuid = Uuid::from_u128(1_000 + u128::from(dir));
+			rows.push(base_dir(&from, dir_uuid));
+			local.push(local_dir(&to));
+			remote.push(remote_dir_node(&from, dir_uuid));
+			for file in 0..FILES {
+				let (from, to) = (
+					format!("{from}/f{file:03}.txt"),
+					format!("{to}/f{file:03}.txt"),
+				);
+				let uuid = Uuid::from_u128(100_000 + u128::from(dir * FILES + file));
+				let hash = [u8::try_from(file).expect("fewer than 256 files a directory"); 32];
+				rows.push(base_file(&from, uuid, hash));
+				local.push(local_file(&to, hash));
+				remote.push(remote_file(&from, uuid, hash));
+			}
+		}
+		let mut rows = Baseline::from_rows(rows);
+		let (_stages, mut local, mut remote) = staged_sides(local, remote, 1024);
+		let (moves, peak) = alloc_meter::peak_bytes(|| {
+			fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut rows,
+				&mut local,
+				&mut remote,
+				&BTreeSet::new(),
+				None,
+			)
+			.unwrap()
+		});
+		assert_eq!(
+			moves,
+			vec![SyncAction::MoveRemote {
+				from_path: "a".to_string(),
+				to_path: "b".to_string(),
+				kind: NodeKind::Dir,
+				remote_uuid: root,
+			}]
+		);
+		assert!(peak < 1024 * 1024, "the fold held {peak} bytes at once");
+	}
+
+	/// A whole fold over staged sides that finds no move holds nothing per directory: 20,000
+	/// synced directories, each where its row records it on both sides, fold holding the pages
+	/// its walks read and no list of the rows or of the remote's directories.
+	#[test]
+	fn a_staged_fold_that_finds_no_move_holds_nothing_per_directory() {
+		const TOP: u32 = 200;
+		const NESTED: u32 = 99;
+		let (mut rows, mut local, mut remote) = (Vec::new(), Vec::new(), Vec::new());
+		for top in 0..TOP {
+			for nested in 0..=NESTED {
+				let path = match nested {
+					0 => format!("d{top:03}"),
+					_ => format!("d{top:03}/e{nested:02}"),
+				};
+				let uuid = Uuid::from_u128(u128::from(top * 1_000 + nested) + 1);
+				rows.push(base_dir(&path, uuid));
+				local.push(local_dir(&path));
+				remote.push(remote_dir_node(&path, uuid));
+			}
+		}
+		assert_eq!(rows.len(), 20_000);
+		let mut rows = Baseline::from_rows(rows);
+		let (_stages, mut local, mut remote) = staged_sides(local, remote, 1024);
+		for mode in ALL_MODES {
+			let (moves, peak) = alloc_meter::peak_bytes(|| {
+				fold_dir_moves(
+					mode,
+					&mut rows,
+					&mut local,
+					&mut remote,
+					&BTreeSet::new(),
+					None,
+				)
+				.unwrap()
+			});
+			assert_eq!(moves, Vec::new(), "{mode:?}");
+			assert!(
+				peak < 512 * 1024,
+				"{mode:?}: the fold held {peak} bytes at once"
+			);
+		}
 	}
 
 	/// A remote move whose local subtree was edited meanwhile is still one move: the edit is
@@ -9881,6 +10371,227 @@ mod tests {
 				"only {} pushed directory move(s) carried a file, so the carried subtree was barely \
 				 tested",
 				seen.pushed_folds
+			);
+		}
+
+		/// The case's two sides as whole maps, read off its carried ones, less the shapes a whole
+		/// pass never folds over and a whole map folds in no fixed order: a second spelling of a
+		/// folded name on either side — the walk refuses it, the view's filter drops it — and a
+		/// second remote directory of one uuid. The first of each in path order is kept.
+		fn whole_maps(case: &Case) -> (HashMap<String, LocalNode>, HashMap<String, RemoteNode>) {
+			fn first_of_each<T>(
+				nodes: impl Iterator<Item = (String, T)>,
+				dir_uuid: impl Fn(&T) -> Option<Uuid>,
+			) -> HashMap<String, T> {
+				let mut nodes: Vec<(String, T)> = nodes.collect();
+				nodes.sort_by(|(left, _), (right, _)| left.cmp(right));
+				let (mut names, mut uuids) = (HashSet::new(), HashSet::new());
+				nodes
+					.into_iter()
+					.filter(|(path, node)| {
+						names.insert(collision_key(path))
+							&& dir_uuid(node).is_none_or(|uuid| uuids.insert(uuid))
+					})
+					.collect()
+			}
+			(
+				first_of_each(
+					case.local
+						.of(&case.baseline)
+						.iter()
+						.map(|(path, node)| (path.into_owned(), node.into_owned())),
+					|_| None,
+				),
+				first_of_each(
+					case.remote
+						.of(&case.baseline)
+						.iter()
+						.map(|(path, node)| (path.into_owned(), node.into_owned())),
+					|node: &RemoteNode| (node.kind == NodeKind::Dir).then_some(node.remote_uuid),
+				),
+			)
+		}
+
+		/// The fold over the sides a whole pass stages carries exactly the moves the fold over
+		/// whole maps carries, and leaves both sides and the rows as that one leaves them, over
+		/// every generated case in every mode: read a row, two, seven and a page a statement, and
+		/// re-keyed as many a statement.
+		#[test]
+		fn a_staged_directory_move_fold_carries_what_a_whole_map_one_carries() {
+			let mut seen = Coverage::default();
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				let (local, remote) = whole_maps(&case);
+				for mode in MODES {
+					let mut rows = case.baseline.clone();
+					let (mut whole_local, mut whole_remote) =
+						(Side::from(local.clone()), Side::from(remote.clone()));
+					let by_map = fold_dir_moves(
+						mode,
+						&mut rows,
+						&mut whole_local,
+						&mut whole_remote,
+						&case.holds.held_remote,
+						None,
+					)
+					.unwrap();
+					seen.folds += by_map.len();
+					seen.pushed_folds += by_map
+						.iter()
+						.filter(|action| pushed_with_files(&rows, action))
+						.count();
+					let (whole_local, whole_remote) =
+						(whole_local.into_whole(), whole_remote.into_whole());
+					let rows: Vec<BaselineEntry> = rows.iter().collect();
+					for page in [1, 2, 7, 1024] {
+						let context = format!("seed {seed}, {mode:?}, page {page}");
+						let (_stages, mut staged_local, mut staged_remote) =
+							staged_sides(local.values().cloned(), remote.values().cloned(), page);
+						let mut staged_rows = case.baseline.clone();
+						let by_stage = fold_dir_moves(
+							mode,
+							&mut staged_rows,
+							&mut staged_local,
+							&mut staged_remote,
+							&case.holds.held_remote,
+							None,
+						)
+						.unwrap();
+						assert_eq!(
+							by_map, by_stage,
+							"{context}: the staged fold carried other moves"
+						);
+						assert_eq!(
+							whole_local,
+							staged_local.into_whole(),
+							"{context}: another local side"
+						);
+						assert_eq!(
+							whole_remote,
+							staged_remote.into_whole(),
+							"{context}: another remote side"
+						);
+						assert_eq!(
+							rows,
+							staged_rows.iter().collect::<Vec<_>>(),
+							"{context}: other rows"
+						);
+					}
+				}
+			}
+			assert!(
+				seen.folds > 100,
+				"only {} directory move(s) were folded, so this tested almost nothing",
+				seen.folds
+			);
+			assert!(
+				seen.pushed_folds > 50,
+				"only {} pushed directory move(s) carried a file",
+				seen.pushed_folds
+			);
+		}
+
+		/// The signatures a pushed move is matched by, held to what they digest: every path under a
+		/// directory, relative to it, with its kind, hash and size — the map each candidate's
+		/// signature was before it was a digest. Over every generated case, every directory either
+		/// the rows or the local side could hold, read all at once as the fold reads them: a
+		/// signature is there exactly where the map is, says a file is under it exactly where the
+		/// map holds one, two are equal exactly where their maps are, and the path-for-path
+		/// comparisons that decide a match agree with the maps.
+		#[test]
+		fn signatures_are_equal_exactly_where_the_trees_they_digest_are() {
+			type Tree = BTreeMap<String, (NodeKind, Option<Blake3Hash>, u64)>;
+			fn tree_of(
+				root: &str,
+				entries: impl Iterator<Item = (SignatureEntry, String)>,
+			) -> Option<Tree> {
+				entries
+					.map(|(entry, path)| Some((path.strip_prefix(root)?.to_string(), entry?)))
+					.collect()
+			}
+			let roots: Vec<&str> = TREE
+				.iter()
+				.filter(|(_, is_dir)| *is_dir)
+				.map(|(path, _)| *path)
+				.chain(["moved", "nothing-here"])
+				.collect();
+			let mut seen = Coverage::default();
+			let (mut equal, mut matched) = (0, 0);
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				let local = Side::from(whole_maps(&case).0);
+				let local = local.of(&case.baseline);
+				let by_rows = read_signatures(roots.iter().copied(), |root, add| {
+					for row in case.baseline.subtree(root) {
+						add(&row.rel_path, row_signature_entry(&row));
+					}
+				});
+				let by_local = read_signatures(roots.iter().copied(), |root, add| {
+					for (path, node) in local.under(root) {
+						add(&path, local_signature_entry(&node));
+					}
+				});
+				// `(on the rows, root, its signature, its tree)` for both sides.
+				let mut read = Vec::new();
+				for &root in &roots {
+					let rows = tree_of(
+						root,
+						case.baseline
+							.subtree(root)
+							.map(|row| (row_signature_entry(&row), row.rel_path)),
+					);
+					let on_disk = tree_of(
+						root,
+						local
+							.under(root)
+							.map(|(path, node)| (local_signature_entry(&node), path.into_owned())),
+					);
+					for (on_rows, by, tree) in [(true, &by_rows, rows), (false, &by_local, on_disk)]
+					{
+						let signature = by[root];
+						assert_eq!(
+							signature.map(|(_, files)| files),
+							tree.as_ref().map(|tree| {
+								tree.values().any(|(kind, ..)| *kind == NodeKind::File)
+							}),
+							"seed {seed}: {root:?} on the rows: {on_rows}"
+						);
+						read.push((on_rows, root, signature.map(|(digest, _)| digest), tree));
+					}
+				}
+				for (left_rows, left, left_signature, left_tree) in &read {
+					for (right_rows, right, right_signature, right_tree) in &read {
+						let (Some(left_tree), Some(right_tree)) = (left_tree, right_tree) else {
+							continue;
+						};
+						let same = left_tree == right_tree;
+						let at = format!(
+							"seed {seed}: {left:?} (rows: {left_rows}) and {right:?} (rows: \
+							 {right_rows})"
+						);
+						assert_eq!(left_signature == right_signature, same, "{at}");
+						let decided = match (left_rows, right_rows) {
+							(true, true) => same_rows(&case.baseline, left, right),
+							(true, false) => {
+								same_tree(&case.baseline, left, &local, right, &BTreeSet::new())
+							}
+							_ => continue,
+						};
+						assert_eq!(decided, same, "{at}: compared path for path");
+						if same && !left_tree.is_empty() && (left, left_rows) != (right, right_rows)
+						{
+							equal += 1;
+							matched += usize::from(left != right && *left_rows != *right_rows);
+						}
+					}
+				}
+			}
+			// A corpus whose trees never matched would let the equalities above pass by proving
+			// nothing about them.
+			assert!(equal > 500, "only {equal} pair(s) of equal trees");
+			assert!(
+				matched > 50,
+				"only {matched} tree(s) on the rows matched one on disk"
 			);
 		}
 

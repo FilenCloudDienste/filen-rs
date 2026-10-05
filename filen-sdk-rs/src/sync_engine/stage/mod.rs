@@ -62,10 +62,10 @@ mod plan;
 mod remote;
 mod side;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-use std::num::NonZeroUsize;
 use std::{
 	ffi::OsString,
 	fs,
@@ -81,9 +81,9 @@ pub(super) use local::StageSink;
 pub(super) use plan::PAGE_ROWS;
 pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
 pub(super) use remote::RemoteSink;
-#[cfg(test)]
-pub(super) use remote::staged_view;
 pub(super) use side::{Pages, Paging, StagedSide};
+#[cfg(test)]
+pub(super) use test_support::{assert_views_alike, paging_of, staged_sides, staged_view};
 
 use super::baseline::PairId;
 use crate::{Error, ErrorKind};
@@ -154,26 +154,6 @@ impl Stage {
 	/// Where the stage's file is.
 	pub(super) fn path(&self) -> &Path {
 		&self.file.0
-	}
-
-	/// A stage beside a baseline in a directory of its own, which goes with the directory.
-	#[cfg(test)]
-	pub(super) fn in_temp_dir() -> (tempfile::TempDir, Self) {
-		let dir = tempfile::tempdir().expect("a temp dir for the stage");
-		let stage = Self::create(stage_path(&dir.path().join("baseline.db"), 1, 0))
-			.expect("creating a stage");
-		(dir, stage)
-	}
-}
-
-/// Every statement over a staged side taking `rows` rows at most, for a test that walks and places a
-/// handful of nodes across several statements.
-#[cfg(test)]
-pub(super) fn paging_of(rows: usize) -> Paging {
-	let rows = NonZeroUsize::new(rows).expect("a test pages at least one row a statement");
-	Paging {
-		page: rows,
-		children: rows,
 	}
 }
 

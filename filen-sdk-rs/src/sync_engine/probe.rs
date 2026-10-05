@@ -53,7 +53,7 @@ use super::{
 		IgnoreRules, Origin, RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
 	observe,
-	plan::{self, PassHolds, RemoteNode, RemoteView},
+	plan::{self, PassHolds, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, observe_remote},
 	rows::Baseline,
 	scan::{self, LocalNode, LocalScan, RuleFiles},
@@ -1735,7 +1735,8 @@ pub fn run() -> String {
 		"the rules hide from the staged view what they hide from the map"
 	);
 	assert_eq!(staged.ignored, view.ignored);
-	drop(staged);
+	// Kept for the directory-move fold below, which a whole pass runs over what it staged.
+	let mut staged_remote = staged.nodes;
 	probe.record(
 		"view_stage_filter",
 		nodes,
@@ -2178,7 +2179,8 @@ pub fn run() -> String {
 		warm_scan.nodes.whole().len(),
 		"the staged walk holds what the walk into a map holds"
 	);
-	drop(staged_scan);
+	// Kept, with the staged view, for the directory-move fold below.
+	let mut staged_local = staged_scan.0.nodes;
 	probe.record(
 		"scan_warm_staged",
 		nodes,
@@ -2200,12 +2202,16 @@ pub fn run() -> String {
 	let mut local = warm_scan.nodes;
 	let mut remote = view.nodes;
 	let held = BTreeSet::new();
+	let set_path = |node: &mut LocalNode, path: &str| node.rel_path = path.to_string();
+	let set_remote_path = |node: &mut RemoteNode, path: &str| node.rel_path = path.to_string();
+	// The fold a whole pass runs, over the sides it staged. The whole-scope fold rows timed the
+	// in-memory maps until the fold read the stage's indexes; the scoped ones still time the maps.
 	let (moves, fold) = timed(|| {
 		plan::fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut baseline,
-			&mut local,
-			&mut remote,
+			&mut staged_local,
+			&mut staged_remote,
 			&held,
 			None,
 		)
@@ -2215,7 +2221,7 @@ pub fn run() -> String {
 		"fold_dir_moves_zero",
 		fixture.dirs,
 		fold,
-		&format!("{} moves found", moves.len()),
+		&format!("{} moves found, over the staged sides", moves.len()),
 	);
 
 	// The same fold at the scope a change-scoped pass gives it. The pair is converged, so both find
@@ -2246,56 +2252,105 @@ pub fn run() -> String {
 		&format!("{} moves found, one changed path", scoped_moves.len()),
 	);
 
-	// The widest single move a pass can fold: a whole top-level directory moved on the remote, so
-	// one action carries every row under it. Measured at both scopes over the same subtree in the
-	// same run — the remote's copy is moved to the other name before each, so the second fold
-	// carries the directory back and the three structures end where they started. The fold writes
-	// its moves as the pass's own edits beside the resident tree, never into a copy of it, so
-	// neither figure carries a whole-tree clone whoever else holds the tree.
+	// The widest single move a pass can fold: a whole top-level directory moved, so one action
+	// carries every row under it. The fold writes its moves as the pass's own edits beside the
+	// resident tree, never into a copy of it, so no figure carries a whole-tree clone whoever else
+	// holds the tree.
+	//
+	// First renamed locally, which only the signatures of the subtrees can match, over the staged
+	// sides and a copy of the rows; then the staged sides are put back.
 	let moved_root = format!("{rename_root}-moved");
-	let mut remote_at = rename_root.clone();
-	for (phase, mut scope) in [
-		("fold_dir_moves_dir_whole", None),
-		(
-			"fold_dir_moves_dir_scoped",
-			Some(BTreeSet::from([rename_root.clone(), moved_root.clone()])),
-		),
-	] {
-		let to = if remote_at == rename_root {
-			moved_root.clone()
-		} else {
-			rename_root.clone()
-		};
-		remote.rekey_subtree(&baseline, &remote_at, &to, |node, path| {
-			node.rel_path = path.to_string()
-		});
-		remote_at = to;
-		let (dir_moves, dir_fold) = timed(|| {
+	{
+		let mut rows = baseline.clone();
+		staged_local.rekey_subtree(&rows, &rename_root, &moved_root, set_path);
+		let before = current_rss_bytes();
+		let (pushed, pushed_fold) = timed(|| {
 			plan::fold_dir_moves(
 				SyncMode::TwoWay,
-				&mut baseline,
-				&mut local,
-				&mut remote,
+				&mut rows,
+				&mut staged_local,
+				&mut staged_remote,
 				&held,
-				scope.as_mut(),
+				None,
 			)
 			.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
 		});
-		assert_eq!(
-			dir_moves.len(),
-			1,
-			"{phase}: the moved directory must fold as exactly one move"
+		let after = current_rss_bytes();
+		assert!(
+			matches!(pushed.as_slice(), [SyncAction::MoveRemote { to_path, .. }] if *to_path == moved_root),
+			"the renamed directory must fold as exactly one remote move: {pushed:?}"
 		);
 		probe.record(
-			phase,
+			"fold_dir_moves_dir_pushed_whole",
 			rename_rows,
-			dir_fold,
-			"one directory move carrying a whole top-level subtree",
+			pushed_fold,
+			&format!(
+				"one top-level directory renamed locally, matched by its subtree's signature, over the \
+				 staged sides; {:+.1} MiB resident across it",
+				mib(after) - mib(before)
+			),
 		);
+		staged_local.rekey_subtree(&rows, &moved_root, &rename_root, set_path);
+		staged_remote.rekey_subtree(&rows, &moved_root, &rename_root, set_remote_path);
 	}
+	// Then moved on the remote, matched by the directory's uuid: the whole scope over the staged
+	// sides, then the change scope over the maps, which carries the directory back. Before it the
+	// local map is moved as the whole fold moved the staged local side, and the remote map holds
+	// the directory where the scoped fold is to find it, so that fold starts from what it started
+	// from when both ran over the maps, and everything ends where it started.
+	staged_remote.rekey_subtree(&baseline, &rename_root, &moved_root, set_remote_path);
+	let before = current_rss_bytes();
+	let (dir_moves, dir_fold) = timed(|| {
+		plan::fold_dir_moves(
+			SyncMode::TwoWay,
+			&mut baseline,
+			&mut staged_local,
+			&mut staged_remote,
+			&held,
+			None,
+		)
+		.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
+	});
+	let after = current_rss_bytes();
 	assert_eq!(
-		remote_at, rename_root,
-		"the two folds must leave the tree where they found it"
+		dir_moves.len(),
+		1,
+		"fold_dir_moves_dir_whole: the moved directory must fold as exactly one move"
+	);
+	probe.record(
+		"fold_dir_moves_dir_whole",
+		rename_rows,
+		dir_fold,
+		&format!(
+			"one directory move carrying a whole top-level subtree, over the staged sides; {:+.1} MiB \
+			 resident across it",
+			mib(after) - mib(before)
+		),
+	);
+	drop((staged_local, staged_remote));
+	local.rekey_subtree(&baseline, &rename_root, &moved_root, set_path);
+	let mut scope = BTreeSet::from([rename_root.clone(), moved_root.clone()]);
+	let (dir_moves, dir_fold) = timed(|| {
+		plan::fold_dir_moves(
+			SyncMode::TwoWay,
+			&mut baseline,
+			&mut local,
+			&mut remote,
+			&held,
+			Some(&mut scope),
+		)
+		.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
+	});
+	assert!(
+		matches!(dir_moves.as_slice(), [SyncAction::MoveLocal { to_path, .. }] if *to_path == rename_root),
+		"fold_dir_moves_dir_scoped: the moved directory must fold back as exactly one move: \
+		 {dir_moves:?}"
+	);
+	probe.record(
+		"fold_dir_moves_dir_scoped",
+		rename_rows,
+		dir_fold,
+		"one directory move carrying a whole top-level subtree",
 	);
 
 	// Where the reconcile's time actually goes. The phase below times the whole of it, which cannot
