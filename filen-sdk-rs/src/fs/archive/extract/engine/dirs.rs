@@ -237,16 +237,17 @@ impl<B: DisposalBackend> Driver<B> {
 				Ok(outcome) => {
 					let dir = outcome.dir;
 					self.report_propagation(dir.uuid(), outcome.propagation_errors);
+					// handed over before the update that counts it
+					self.top_level_created(
+						ExtractTopLevelKey::Root,
+						NonRootItemType::Dir(Cow::Owned(dir.clone())),
+					);
 					self.reporter.dir_created(
 						dir.uuid(),
 						self.destination.uuid(),
 						outcome.name.as_ref(),
 					);
 					self.created_digest = self.created_digest.wrapping_add(dir_digest(dir.uuid()));
-					self.top_level_created(
-						ExtractTopLevelKey::Root,
-						NonRootItemType::Dir(Cow::Owned(dir.clone())),
-					);
 					return Ok(dir);
 				}
 				Err(DirError::NotStarted) => {}
@@ -373,33 +374,34 @@ impl<B: DisposalBackend> Driver<B> {
 				color_error: _,
 				propagation_errors,
 			}) => {
-				self.report_propagation(created.uuid(), propagation_errors);
+				let uuid = created.uuid();
+				self.report_propagation(uuid, propagation_errors);
 				// one record, with the name it got in the end (a keep-both name the resolver
 				// picked, then possibly another the destination turned out to need)
 				if name != *self.dirs.slots[dir].named().archive_name() {
 					let path = self.archive_path(dir);
 					self.renamed(entry, path, &name, ExtractRenameReason::DuplicateName);
 				}
-				self.reporter
-					.dir_created(created.uuid(), parent, name.as_ref());
-				// the name a retry into it finds it under; the archive's stays where it was
-				let named = self.dirs.slots[dir].named_mut();
-				if name != named.name {
-					let planned = std::mem::replace(&mut named.name, name);
-					named.archive_name.get_or_insert(planned);
-				}
-				self.created_digest = self.created_digest.wrapping_add(dir_digest(created.uuid()));
-				self.dirs.slots[dir].state = DirState::Created(created.uuid());
-				self.dirs.uncreated -= 1;
-				self.dirs
-					.ready
-					.extend(self.dirs.slots[dir].children.iter().copied());
+				// handed over before the update that counts it
 				if parent_dir == ROOT && self.into_destination {
 					self.top_level_created(
 						ExtractTopLevelKey::Entry { id: entry },
 						NonRootItemType::Dir(Cow::Owned(created)),
 					);
 				}
+				self.reporter.dir_created(uuid, parent, name.as_ref());
+				// the name a retry into it finds it under; the archive's stays where it was
+				let named = self.dirs.slots[dir].named_mut();
+				if name != named.name {
+					let planned = std::mem::replace(&mut named.name, name);
+					named.archive_name.get_or_insert(planned);
+				}
+				self.created_digest = self.created_digest.wrapping_add(dir_digest(uuid));
+				self.dirs.slots[dir].state = DirState::Created(uuid);
+				self.dirs.uncreated -= 1;
+				self.dirs
+					.ready
+					.extend(self.dirs.slots[dir].children.iter().copied());
 				self.finalize_ready();
 			}
 			// tried again once the pause is over

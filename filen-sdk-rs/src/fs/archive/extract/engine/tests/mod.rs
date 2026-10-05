@@ -22,7 +22,7 @@ use tokio::{sync::watch, task::JoinHandle};
 use super::*;
 use crate::{
 	auth::http::ClientConfig,
-	consts::{CHUNK_SIZE, CHUNK_SIZE_U64},
+	consts::{CALLBACK_INTERVAL, CHUNK_SIZE, CHUNK_SIZE_U64},
 	fs::{
 		HasName,
 		archive::{
@@ -79,6 +79,8 @@ struct Recorder {
 	/// The size of each `on_top_level_batch` batch.
 	batches: Mutex<Vec<usize>>,
 	updates: Mutex<Vec<ExtractUpdate>>,
+	/// How many top-level items the callback had been given at each update.
+	given_at_update: Mutex<Vec<usize>>,
 	probe: Option<Probe>,
 	/// What the job held at each update reporting it paused, told by `probe`.
 	held_while_paused: Mutex<Vec<HeldWhilePaused>>,
@@ -96,6 +98,8 @@ impl ExtractCallback for Recorder {
 		{
 			self.held_while_paused.lock().unwrap().push(probe());
 		}
+		let given = self.top_level.lock().unwrap().len();
+		self.given_at_update.lock().unwrap().push(given);
 		self.updates.lock().unwrap().push(update);
 	}
 }
@@ -591,6 +595,73 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 			.chain(&beyond)
 			.all(|uuid| propagated.contains(uuid)),
 		"every top-level item reaches the new share"
+	);
+}
+
+/// How many top-level items the callback had been given when the first update whose `counted`
+/// is above zero came.
+fn given_at_first_count(recorder: &Recorder, counted: impl Fn(&ItemCounts) -> u64) -> usize {
+	let updates = recorder.updates.lock().unwrap();
+	let first = updates
+		.iter()
+		.position(|update| counted(&update.counts) > 0)
+		.expect("an update counted it");
+	recorder.given_at_update.lock().unwrap()[first]
+}
+
+/// Long enough that the update interval passes while a request takes it.
+const SLOWER_THAN_AN_UPDATE: Duration = CALLBACK_INTERVAL.saturating_mul(5);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_folder_reaches_the_callback_before_an_update_counts_it() {
+	let setup = setup("one.tar", tar_of(&[("a.txt", b"alpha")]), |backend| {
+		backend.slow.insert("one".into(), SLOWER_THAN_AN_UPDATE);
+	});
+	let job = start(&setup, Options::default());
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		given_at_first_count(&job.recorder, |counts| counts.dirs_created),
+		1
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directory_at_the_top_reaches_the_callback_before_an_update_counts_it() {
+	let setup = setup("bundle.tar", tar_of(&[("docs/", b"")]), |backend| {
+		backend.slow.insert("docs".into(), SLOWER_THAN_AN_UPDATE);
+	});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		given_at_first_count(&job.recorder, |counts| counts.dirs_created),
+		1
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_at_the_top_reaches_the_callback_before_an_update_counts_it() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"alpha")]), |backend| {
+		backend.hold_named(Request::Finish, ["a.txt"]);
+	});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	wait_until("a.txt registers", || {
+		!setup.backend.log().held_named.is_empty()
+	})
+	.await;
+	tokio::time::sleep(SLOWER_THAN_AN_UPDATE).await;
+	setup.backend.release_all();
+	job.running.await.unwrap().unwrap();
+	assert_eq!(
+		given_at_first_count(&job.recorder, |counts| counts.files_done),
+		1
 	);
 }
 

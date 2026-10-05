@@ -330,7 +330,8 @@ impl<B: DisposalBackend> Driver<B> {
 				name,
 				propagation_errors,
 			}) => {
-				self.report_propagation(registered.uuid(), propagation_errors);
+				let uuid = registered.uuid();
+				self.report_propagation(uuid, propagation_errors);
 				if name.as_ref() != file.archive_name() {
 					self.renamed(
 						file.active.entry,
@@ -343,24 +344,18 @@ impl<B: DisposalBackend> Driver<B> {
 					name: name.as_ref().to_owned(),
 					..file.active
 				};
-				self.reporter.file_done(&active, file.written);
-				self.link_target_registered(
-					ordinal,
-					file.link_key,
-					registered.uuid(),
-					file.written,
-				);
-				self.created_digest = self
-					.created_digest
-					.wrapping_add(file_digest(active.dest_uuid, file.written));
+				// handed over before the update that counts it
 				if file.parent == ROOT && self.into_destination {
 					self.top_level_created(
-						ExtractTopLevelKey::Entry {
-							id: file.active.entry,
-						},
+						ExtractTopLevelKey::Entry { id: active.entry },
 						NonRootItemType::File(Cow::Owned(registered)),
 					);
 				}
+				self.reporter.file_done(&active, file.written);
+				self.link_target_registered(ordinal, file.link_key, uuid, file.written);
+				self.created_digest = self
+					.created_digest
+					.wrapping_add(file_digest(active.dest_uuid, file.written));
 			}
 			Err(FinalizeError::Stopped) => self
 				.reporter
