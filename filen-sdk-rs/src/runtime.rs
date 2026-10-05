@@ -1277,7 +1277,10 @@ where
 		);
 		match spawned {
 			Ok(()) => spawn_local_on_worker(async move {
-				crate::util::sleep(WORKER_START_TIMEOUT).await;
+				// Not `util::sleep`: this runs on the spawning thread, the page's main thread for
+				// the commander, and wasmtimer's timer callback locks a mutex every worker shares,
+				// which is an `Atomics.wait` the page forbids. This is one `setTimeout`.
+				futures_timer::Delay::new(WORKER_START_TIMEOUT).await;
 				give_up(
 					name,
 					&inbox,
