@@ -12,6 +12,7 @@
 //!   [`AT_PATH`]) and at the path a move starts from ([`AT_SOURCE`]).
 //! - `exec`: the order the apply runs the plan in (`ord`, from 0), and how far each action ties the
 //!   drive lock (`tie_until`).
+//! - `written`: what the apply has written so far, when the plan deletes anything (see below).
 //!
 //! # The order
 //!
@@ -36,6 +37,22 @@
 //! move has just happened: it ties up to the last such action under it. Any other deletion names
 //! its item by uuid and ties nothing. `tie_until` holds where each action's tie ends, and the pager
 //! carries the furthest one reached so far as it hands the plan out.
+//!
+//! # What the pass wrote
+//!
+//! The server dedups a create against an existing item case-insensitively and hands back that
+//! item, and a case-insensitive filesystem resolves two spellings to one entry, so a deletion
+//! planned for one path can land on what another action of the pass just created, moved or renamed.
+//! The planner does not plan that shape (see `plan::fold_dir_moves`); what the apply records here
+//! is the net under it: a remote trash or local quarantine whose target is, or holds, something the
+//! pass already wrote is refused ([`Pager::shields_remote`], [`Pager::shields_local`]), and the
+//! next pass re-plans from what is really there.
+//!
+//! Only a deletion asks, so a plan that deletes nothing — a first sync, every upload of it —
+//! records nothing. One that does records, as each write lands, the collision key of the path it
+//! wrote on the side it wrote it (`written`), and the remote item a remote move moved; the
+//! directory a create made, or the existing one the dedup answered it with, is its `result_uuid`,
+//! which the plan records anyway.
 
 use std::{collections::VecDeque, sync::LazyLock};
 
@@ -48,7 +65,7 @@ use super::{
 		apply::{PassStart, PlannedEntry, StartInputs},
 		baseline::{BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind},
 		plan::{RemoteNode, SyncAction},
-		scan::LocalNode,
+		scan::{LocalNode, collision_key},
 	},
 	BatchWriter, Stage,
 };
@@ -80,6 +97,8 @@ CREATE TABLE plan (
 );
 -- The remote directory creates, by path: op 3 is OP_CREATE_REMOTE_DIR.
 CREATE INDEX plan_created ON plan (path) WHERE op = 3;
+-- The directories those creates made, by uuid, for a deletion to ask about.
+CREATE INDEX plan_result ON plan (result_uuid) WHERE result_uuid IS NOT NULL;
 CREATE TABLE plan_base (
 	seq INTEGER NOT NULL,
 	endpoint INTEGER NOT NULL,
@@ -100,6 +119,9 @@ CREATE TABLE plan_base (
 	PRIMARY KEY (seq, endpoint)
 ) WITHOUT ROWID;
 CREATE TABLE exec (ord INTEGER PRIMARY KEY, seq INTEGER NOT NULL, tie_until INTEGER);
+CREATE TABLE written (side INTEGER NOT NULL, key TEXT NOT NULL, uuid BLOB);
+CREATE INDEX written_key ON written (side, key);
+CREATE INDEX written_uuid ON written (uuid) WHERE uuid IS NOT NULL;
 ";
 
 /// `plan.op`: which [`SyncAction`] the row is.
@@ -155,6 +177,20 @@ static RECORD_CREATED: LazyLock<String> = LazyLock::new(|| {
 static READ_CREATED: LazyLock<String> = LazyLock::new(|| {
 	format!("SELECT result_uuid FROM plan WHERE op = {OP_CREATE_REMOTE_DIR} AND path = ?1")
 });
+
+/// `written.side`: the side a write landed on.
+const WROTE_LOCAL: i64 = 0;
+const WROTE_REMOTE: i64 = 1;
+
+const INSERT_WRITTEN: &str = "INSERT INTO written (side, key, uuid) VALUES (?1, ?2, ?3)";
+
+/// Whether the pass wrote the remote item `?2` (none for a local deletion), or anything on side
+/// `?1` whose collision key is `?3` or lies under it. One `EXISTS` per index it seeks: an `OR` of a
+/// point and a range would not seek.
+const SHIELDS: &str = "SELECT EXISTS (SELECT 1 FROM plan WHERE result_uuid = ?2)
+	 OR EXISTS (SELECT 1 FROM written WHERE uuid = ?2)
+	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key = ?3)
+	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key >= ?3 || '/' AND key < ?3 || '0')";
 
 /// A page of the plan in apply order, with what [`entry_of`] reads by position.
 const READ_PAGE: &str = "SELECT x.ord, x.tie_until, p.seq, p.op, p.kind, p.path, p.from_path,
@@ -316,6 +352,7 @@ impl PlanWriter {
 			before: before + flips,
 			transfers,
 			len: before + transfers + after,
+			deletes: after > 0,
 		})
 	}
 }
@@ -626,6 +663,9 @@ pub(in super::super) struct StagedPlan {
 	before: usize,
 	transfers: usize,
 	len: usize,
+	/// Whether the plan deletes anything: only then does the apply record what it writes, which only
+	/// a deletion asks about (see the module docs).
+	deletes: bool,
 }
 
 impl StagedPlan {
@@ -758,6 +798,82 @@ impl Pager {
 			.query_row([path], |row| row.get::<_, Option<Uuid>>(0))
 			.optional()?
 			.flatten())
+	}
+
+	/// Record that `action` has landed, for the deletions after it to ask about (see the module
+	/// docs). A plan that deletes nothing has nobody to ask, and records nothing.
+	///
+	/// A remote directory create is recorded where its `result_uuid` is ([`record_created`]): that
+	/// is the item the deletions must not take down, and the key here is where it sits.
+	///
+	/// [`record_created`]: Self::record_created
+	pub(in super::super) fn note_written(&self, action: &SyncAction) -> rusqlite::Result<()> {
+		if !self.plan.deletes {
+			return Ok(());
+		}
+		let (side, path, uuid) = match action {
+			SyncAction::CreateLocalDir { rel_path } | SyncAction::DownloadFile { rel_path, .. } => {
+				(WROTE_LOCAL, rel_path, None)
+			}
+			SyncAction::MoveLocal { to_path, .. } => (WROTE_LOCAL, to_path, None),
+			SyncAction::CreateRemoteDir { rel_path } | SyncAction::UploadFile { rel_path } => {
+				(WROTE_REMOTE, rel_path, None)
+			}
+			SyncAction::MoveRemote {
+				to_path,
+				remote_uuid,
+				..
+			} => (WROTE_REMOTE, to_path, Some(*remote_uuid)),
+			SyncAction::DeleteLocal { .. }
+			| SyncAction::TrashRemote { .. }
+			| SyncAction::Conflict { .. }
+			| SyncAction::AdoptBaseline { .. } => return Ok(()),
+		};
+		self.plan
+			.stage
+			.conn
+			.prepare_cached(INSERT_WRITTEN)?
+			.execute(params![side, collision_key(path), uuid])?;
+		Ok(())
+	}
+
+	/// Whether quarantining the local item at `rel_path` would take down something this pass wrote:
+	/// a local write at that path or under it, under any spelling.
+	///
+	/// A read that fails panics: only a deletion asks, in a run the apply takes one action at a time,
+	/// so nothing is in flight to drop (see the module docs of [`stage`](super)).
+	pub(in super::super) fn shields_local(&self, rel_path: &str) -> bool {
+		self.shields(WROTE_LOCAL, rel_path, None)
+	}
+
+	/// Whether trashing the remote item `remote_uuid` at `rel_path` would take down something this
+	/// pass wrote: the item itself, which the pass created — a create the dedup answered with an
+	/// existing directory names that directory — or moved, or a remote write at that path or under
+	/// it, under any spelling.
+	///
+	/// A read that fails panics: only a deletion asks, in a run the apply takes one action at a time,
+	/// so nothing is in flight to drop (see the module docs of [`stage`](super)).
+	pub(in super::super) fn shields_remote(&self, rel_path: &str, remote_uuid: Uuid) -> bool {
+		self.shields(WROTE_REMOTE, rel_path, Some(remote_uuid))
+	}
+
+	fn shields(&self, side: i64, rel_path: &str, uuid: Option<Uuid>) -> bool {
+		let read = || -> rusqlite::Result<bool> {
+			self.plan
+				.stage
+				.conn
+				.prepare_cached(SHIELDS)?
+				.query_row(params![side, uuid, collision_key(rel_path)], |row| {
+					row.get(0)
+				})
+		};
+		read().unwrap_or_else(|error| {
+			panic!(
+				"reading the pass's staged plan in {} for what it wrote at {rel_path:?} failed: \
+				 {error} — a deletion cannot tell whether it takes down a write of its own pass",
+				self.plan.stage.path().display()
+			)
+		})
 	}
 
 	fn read_page(&mut self) -> rusqlite::Result<()> {
@@ -955,14 +1071,15 @@ mod test_support {
 	}
 
 	impl Pager {
-		/// Take the plan's table out from under the pager, so that every read of the stage that
-		/// asks it fails from here on, the way one on a full or failing disk would.
+		/// Take the plan's tables out from under the pager, so that every read of the stage that
+		/// asks them and every write it records fails from here on, the way one on a full or
+		/// failing disk would.
 		pub(in crate::sync_engine) fn break_stage(&self) {
 			self.plan
 				.stage
 				.conn
-				.execute_batch("DROP TABLE plan")
-				.expect("dropping the staged plan's table");
+				.execute_batch("DROP TABLE plan; DROP TABLE written")
+				.expect("dropping the staged plan's tables");
 		}
 	}
 }
