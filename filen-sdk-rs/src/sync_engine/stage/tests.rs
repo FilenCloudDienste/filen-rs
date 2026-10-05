@@ -52,22 +52,37 @@ fn move_dir(from_path: &str, to_path: &str) -> SyncAction {
 	}
 }
 
-fn file_row(rel_path: &str) -> BaselineEntry {
+/// A synced file's row at `rel_path`, with no remote item, hash or stamp of its own: what a staged
+/// side's reads and edits by row are asked with, and what a rule's hit is a root of.
+pub(super) fn row(rel_path: &str) -> BaselineEntry {
 	BaselineEntry {
-		rel_path: rel_path.to_string(),
+		rel_path: rel_path.to_owned(),
 		kind: NodeKind::File,
-		remote_uuid: Some(Uuid::from_u128(11)),
-		content_hash: Some(Blake3Hash::from([1; 32])),
-		size: Some(3),
-		local_mtime: Some(10),
-		remote_modified: Some(20),
+		remote_uuid: None,
+		content_hash: None,
+		size: Some(0),
+		local_mtime: Some(0),
+		remote_modified: None,
 		state: BaselineState::Synced,
 		local_kind: None,
 		remote_kind: None,
 		remote_hash: None,
 		remote_size: None,
 		remote_stable_uuid: None,
+		agreed_hash: None,
+	}
+}
+
+/// [`row`], of a file both sides agree on: a remote item, a hash and its stamps.
+fn file_row(rel_path: &str) -> BaselineEntry {
+	BaselineEntry {
+		remote_uuid: Some(Uuid::from_u128(11)),
+		content_hash: Some(Blake3Hash::from([1; 32])),
+		size: Some(3),
+		local_mtime: Some(10),
+		remote_modified: Some(20),
 		agreed_hash: Some(Blake3Hash::from([1; 32])),
+		..row(rel_path)
 	}
 }
 

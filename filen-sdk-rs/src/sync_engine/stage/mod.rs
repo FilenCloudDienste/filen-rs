@@ -1,5 +1,6 @@
 //! A pass's scratch database: an SQLite file of the pass's own for what it would otherwise hold in
-//! memory between making its plan and finishing its apply (see [`plan`] for what it stages today).
+//! memory while it plans and applies. A whole pass stages its local scan ([`local`]) from the walk
+//! to the end of the plan, and every pass its plan ([`plan`]) from the plan to the end of the apply.
 //!
 //! # One file per pass
 //!
@@ -10,6 +11,9 @@
 //! would truncate the plan a live pass is applying. Named after the baseline FILE rather than kept
 //! in a directory of stages, because baselines share directories — every test's sits in the temp
 //! dir — and two engines number their pairs and passes alike, from 1 and 0.
+//!
+//! The scan and the plan of one pass take a number each, so a whole pass has two files: the scan's
+//! goes once the plan is staged, before the apply begins, and the plan's when the apply is done.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).
@@ -50,10 +54,13 @@
 //! [`Pager::carried`]) panics instead, as the baseline's rows do (see `rows::snapshot`): only the
 //! runs the apply takes one action at a time ask it, so nothing is in flight to drop.
 
+mod local;
 mod plan;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+use std::num::NonZeroUsize;
 use std::{
 	ffi::OsString,
 	fs,
@@ -61,8 +68,10 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use rusqlite::Connection;
+use filen_types::crypto::Blake3Hash;
+use rusqlite::{Connection, Row};
 
+pub(super) use local::{Pages, Paging, StageSink, StagedSide};
 #[cfg(test)]
 pub(super) use plan::PAGE_ROWS;
 pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
@@ -146,6 +155,14 @@ impl Stage {
 			.expect("creating a stage");
 		(dir, stage)
 	}
+}
+
+/// Every statement over a staged side taking `rows` rows at most, for a test that walks a handful of
+/// nodes across several statements.
+#[cfg(test)]
+pub(super) fn paging_of(rows: usize) -> Paging {
+	let rows = NonZeroUsize::new(rows).expect("a test pages at least one row a statement");
+	Paging { page: rows }
 }
 
 /// Where the stage of pass `pass` of `pair` goes, for the baseline at `db_path`.
@@ -264,4 +281,16 @@ impl BatchWriter {
 		}
 		Ok(self.stage)
 	}
+}
+
+/// A content hash as the stage's `BLOB` column holds it.
+fn hash_bytes(hash: Option<&Blake3Hash>) -> Option<&[u8]> {
+	hash.map(|hash| hash.as_ref().as_slice())
+}
+
+/// The content hash in `row`'s `column`, as [`hash_bytes`] wrote it.
+fn hash_at(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Blake3Hash>> {
+	Ok(row
+		.get::<_, Option<[u8; 32]>>(column)?
+		.map(Blake3Hash::from))
 }

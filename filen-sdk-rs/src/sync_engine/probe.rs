@@ -58,6 +58,7 @@ use super::{
 	rows::Baseline,
 	scan::{self, LocalNode, LocalScan, RuleFiles},
 	side::{FromRow, Nodes, NodesAt, Side},
+	stage::Stage,
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -548,17 +549,23 @@ fn heap(bytes: usize) -> usize {
 /// An overlay's TOMBSTONES (a path observed absent) sit in a set of their own, counted here by its
 /// slots. What it cannot see, and names rather than folds in, is each tombstone's key: they are
 /// not among the side's own keys.
+///
+/// A STAGED side owns no node in memory: its nodes are rows of its stage's file, and what it costs
+/// the process is that connection's page cache, which the resident set shows and no structure owns.
 fn side_owned_bytes<V: FromRow>(
 	side: &Side<V>,
 	baseline: &Baseline,
 	node_heap: impl Fn(&V) -> usize,
 ) -> usize {
+	if matches!(side, Side::Staged(_)) {
+		return 0;
+	}
 	let slots = side.capacity() * (size_of::<String>() + size_of::<V>() + 1)
 		+ side.tombstone_capacity() * (size_of::<String>() + 1);
 	let read = side.of(baseline);
 	let owned: usize = side
 		.own_keys()
-		.map(|path| heap(path.len()) + read.at(path).map_or(0, |node| node_heap(&node)))
+		.map(|path| heap(path.len()) + read.at(&path).map_or(0, |node| node_heap(&node)))
 		.sum();
 	slots + owned
 }
@@ -978,6 +985,12 @@ struct PassFootprint {
 	scan_bytes: usize,
 }
 
+/// A stage of its own for a probe scan, in the temp dir, removed with it.
+fn probe_stage() -> Stage {
+	Stage::create(std::env::temp_dir().join(format!("filen_probe_stage_{}", Uuid::new_v4())))
+		.expect("creating a stage for the probe's scan")
+}
+
 /// Everything a pass does locally, end to end, on inputs it re-reads itself: the phases above in
 /// the order `prepare` runs them, minus the network and the apply.
 fn pass_pure(
@@ -992,8 +1005,15 @@ fn pass_pure(
 	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut builder)
 		.expect("streaming the cache snapshot");
 	let mut view = builder.finish();
-	let (scan, rules_used) =
-		scan::scan_local(&place.root, &baseline, probe_rules(), RuleFiles::Read);
+	// Into a stage, as `prepare_whole` walks a whole pass's tree.
+	let (scan, rules_used) = scan::scan_local_staged(
+		&place.root,
+		&baseline,
+		probe_rules(),
+		RuleFiles::Read,
+		probe_stage(),
+	)
+	.expect("staging the probe's scan");
 	drop(rules_used);
 	view.filter(Some(plan::ViewFilter {
 		rules,
@@ -2066,6 +2086,35 @@ pub fn run() -> String {
 	let ((warm_scan, _), warm_time) =
 		timed(|| scan::scan_local(&fixture.root, &baseline, probe_rules(), RuleFiles::Read));
 	probe.record("scan_warm", nodes, warm_time, "fast path, no re-hashing");
+	// The walk a whole pass makes: the same scan, into a stage rather than a map. Timed with the
+	// stage's creation, as `prepare_whole` pays it.
+	let (staged_scan, staged_time) = timed(|| {
+		scan::scan_local_staged(
+			&fixture.root,
+			&baseline,
+			probe_rules(),
+			RuleFiles::Read,
+			probe_stage(),
+		)
+		.expect("staging the probe's scan")
+	});
+	let staged_nodes = staged_scan.0.nodes.whole().len();
+	assert_eq!(
+		staged_nodes,
+		warm_scan.nodes.whole().len(),
+		"the staged walk holds what the walk into a map holds"
+	);
+	drop(staged_scan);
+	probe.record(
+		"scan_warm_staged",
+		nodes,
+		staged_time,
+		&format!(
+			"fast path, into the pass's stage: {staged_nodes} row(s) on disk and none in memory, \
+			 {:+.1} % on scan_warm",
+			(staged_time.as_secs_f64() / warm_time.as_secs_f64() - 1.0) * 100.0
+		),
+	);
 	probe.record(
 		"hashing_only",
 		fixture.files,
@@ -2369,10 +2418,10 @@ pub fn run() -> String {
 		nodes,
 		whole,
 		&format!(
-			"{} actions; baseline read + streamed snapshot + view + warm scan + fold + reconcile, \
-			 no network and no apply; {:.1} MiB resident at its widest point, {:.1} MiB of it this \
-			 pass; the structures alive there: baseline {:.1} + view {:.1} + scan {:.1} = {:.1} \
-			 MiB computed",
+			"{} actions; baseline read + streamed snapshot + view + warm scan into the stage + fold \
+			 + reconcile, no network and no apply; {:.1} MiB resident at its widest point, {:.1} \
+			 MiB of it this pass; the structures alive there: baseline {:.1} + view {:.1} + scan \
+			 {:.1} = {:.1} MiB computed",
 			footprint.actions,
 			mib(footprint.widest),
 			mib(footprint.widest.saturating_sub(before_pass)),

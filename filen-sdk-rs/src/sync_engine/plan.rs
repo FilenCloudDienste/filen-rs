@@ -3338,7 +3338,15 @@ fn reconcile_keys<'m>(
 	held: &BTreeSet<String>,
 ) -> BTreeSet<Cow<'m, str>> {
 	let PassPaths::Changed(changed) = paths else {
-		let mut keys: BTreeSet<Cow<'m, str>> = local.paths().chain(remote.paths()).collect();
+		// The remote's paths first, and the local side's put in one at a time: `insert` keeps the key
+		// a set already holds, so where both sides hold a path the key is the remote map's, lent, and
+		// the local side's copy — a staged side reads each path out of its stage — is dropped as soon
+		// as it is made. Only the paths the local side alone holds are kept as copies, where
+		// collecting both sides would hold a copy of every local path at once.
+		let mut keys: BTreeSet<Cow<'m, str>> = remote.paths().collect();
+		for path in local.paths() {
+			keys.insert(path);
+		}
 		baseline.visit_row_paths(|path| {
 			if !local.holds(path) && !remote.holds(path) {
 				keys.insert(Cow::Owned(path.to_string()));
@@ -3763,7 +3771,7 @@ mod tests {
 			derive,
 			engine::{Observations, PendingKind, PendingWrites},
 			ignore::{IgnoreLevel, IgnoreSource, Origin},
-			side::FromRow,
+			side::{FromRow, test_support::copied},
 		},
 		*,
 	};
@@ -4615,7 +4623,7 @@ mod tests {
 		decided: BTreeSet<String>,
 	) -> (Vec<SyncAction>, BTreeSet<String>) {
 		let (mut folded, mut folded_local, mut folded_remote) =
-			(rows.clone(), local.clone(), remote.clone());
+			(rows.clone(), copied(&local), copied(&remote));
 		let mut pruned = decided.clone();
 		let moves = fold_dir_moves(
 			mode,
@@ -9542,8 +9550,8 @@ mod tests {
 			scoped: bool,
 		) -> (Case, Vec<SyncAction>, BTreeSet<String>) {
 			let mut baseline = case.baseline.clone();
-			let mut local = case.local.clone();
-			let mut remote = case.remote.clone();
+			let mut local = copied(&case.local);
+			let mut remote = copied(&case.remote);
 			let mut decided = case.decided.clone();
 			let moves = fold_dir_moves(
 				mode,
@@ -9885,7 +9893,7 @@ mod tests {
 			/// can be handed what the other left.
 			fn view(&self) -> RemoteView {
 				RemoteView {
-					nodes: self.nodes.clone(),
+					nodes: copied(&self.nodes),
 					has_collisions: false,
 					held_paths: self.held_paths.clone(),
 					skipped: self.skipped.clone(),
@@ -10075,7 +10083,7 @@ mod tests {
 			// Its own stream, so the case's draws do not shift when this one changes.
 			let mut rng = StdRng::seed_from_u64(seed ^ 0x7fff_ffff_0000_0001);
 			let mut out = ViewCase {
-				nodes: case.remote.clone(),
+				nodes: copied(&case.remote),
 				held_paths: BTreeSet::new(),
 				skipped: Vec::new(),
 				decided: case.decided.clone(),
