@@ -1,6 +1,6 @@
 //! A whole pass's local scan, staged: a row per entry the walk found, in the pass's stage, where a
 //! map held a node per entry in memory from the walk to the end of the plan. The walk writes it
-//! ([`StageSink`]) and the pass reads it as its local side ([`StagedSide`]).
+//! ([`StageSink`]) and the pass reads it as its local side (a [`StagedSide`] over [`LOCAL`]).
 //!
 //! # The table
 //!
@@ -16,43 +16,17 @@
 //! what an in-memory set of digests and a list of claims did before, with no copy of any path kept
 //! in memory to do it. An identical path folds identically, so it is refused the same way. The
 //! claims go once the walk is done, so the side reads nodes and nothing else.
-//!
-//! # Reads
-//!
-//! Every read takes the connection for one statement and lets it go before it hands anything out,
-//! as the baseline's own reads do (see `rows::snapshot`), so a caller asking the side something
-//! while it is handed a page of it never waits on itself. A walk of the side reads [`PAGE`] rows a
-//! statement. A question about one path is answered out of the page the last such question read
-//! when that page spans the path, and that page doubles, up to [`PAGE`], while the questions walk
-//! it in path order: the reconcile asks about every path it decides, one after the next, and pays a
-//! statement a page rather than one a path.
-//!
-//! # A failed read or edit
-//!
-//! A read that fails panics, as a baseline read does: "nothing here" is an answer the pass acts on,
-//! and a failed read must not become it. An edit that fails panics too: the table is the pass's only
-//! record of the local tree, and one that no longer matches the pass leaves it nothing to plan from.
-//! Both can happen only while the pass plans, before it has applied anything. A walk that cannot
-//! write its rows is an error instead ([`StageSink`]), which fails the pass before it plans.
 
-use std::{
-	fmt,
-	num::NonZeroUsize,
-	ops::Bound,
-	sync::{Mutex, PoisonError},
-	vec,
-};
-
-use rusqlite::{Connection, OptionalExtension, Row, functions::FunctionFlags, params, types::Type};
+use rusqlite::{Connection, Row, Statement, functions::FunctionFlags, params, types::Type};
 
 use super::{
 	super::{
 		baseline::NodeKind,
-		plan::subtree_bounds,
 		scan::{Collision, Found, LocalNode, ScanSink, collision_key},
 		side::Side,
 	},
 	BatchWriter, Stage, hash_at, hash_bytes,
+	side::{Paging, Sql, StagedSide, Table},
 };
 
 const SCHEMA: &str = "
@@ -71,55 +45,45 @@ const CLAIM: i64 = 0;
 const _: () =
 	assert!(CLAIM == 0 && NodeKind::Dir.as_i64() != CLAIM && NodeKind::File.as_i64() != CLAIM);
 
-/// How many rows a walk of the side reads a statement, and the most a question's read-ahead does.
-const PAGE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is not zero");
-
-/// How many rows each statement that reads a staged side takes at most: a pass's
-/// ([`PASS`](Self::PASS)), or a handful, for a test that walks a few nodes across several
-/// statements. None is zero, which would leave a walk with nothing to read.
-#[derive(Debug, Clone, Copy)]
-pub(in super::super) struct Paging {
-	/// How many rows a walk of a side reads a statement, and the most a question's read-ahead does.
-	pub(super) page: NonZeroUsize,
-}
-
-impl Paging {
-	/// What a pass stages and reads its sides with.
-	pub(in super::super) const PASS: Self = Self { page: PAGE };
-}
-
-/// A row, unless a row already holds its path or its folded name.
-const INSERT: &str = "INSERT INTO local (path, kind, size, mtime, hash) VALUES (?1, ?2, ?3, ?4, ?5)
-	 ON CONFLICT DO NOTHING";
-const UPDATE: &str = "UPDATE local SET kind = ?2, size = ?3, mtime = ?4, hash = ?5 WHERE path = ?1";
 /// The path holding `?1`'s folded name, on the folded index.
 const TWIN: &str = "SELECT path FROM local WHERE fold(path) = fold(?1)";
 const DELETE_CLAIMS: &str = "DELETE FROM local WHERE kind = 0";
-const REMOVE: &str = "DELETE FROM local WHERE path = ?1 RETURNING path, kind, size, mtime, hash";
-const FORGET: &str = "DELETE FROM local WHERE path = ?1";
-/// Whether a row's folded path is `?1` or lies under it, one `EXISTS` per seek of the folded index:
-/// an `OR` of a point and a range would not seek.
-const OCCUPIED: &str = "SELECT EXISTS (SELECT 1 FROM local WHERE fold(path) = ?1)
-	 OR EXISTS (SELECT 1 FROM local WHERE fold(path) >= ?1 || '/' AND fold(path) < ?1 || '0')";
-/// A directory move: the directory's own row, then every row under it, each statement on one seek.
-/// `length` and `substr` count characters on text, so the rest of a path is cut where its prefix ends.
-const REKEY_AT: &str = "UPDATE local SET path = ?2 WHERE path = ?1";
-const REKEY_UNDER: &str = "UPDATE local SET path = ?2 || substr(path, length(?1) + 1)
-	 WHERE path >= ?1 || '/' AND path < ?1 || '0'";
 
-/// A page in path order: from a path on (`>=`) or after one (`>`), below a bound or not.
-const PAGE_FROM: &str = "SELECT path, kind, size, mtime, hash FROM local
-	 WHERE path >= ?1 ORDER BY path LIMIT ?2";
-const PAGE_AFTER: &str = "SELECT path, kind, size, mtime, hash FROM local
-	 WHERE path > ?1 ORDER BY path LIMIT ?2";
-const PAGE_FROM_BELOW: &str = "SELECT path, kind, size, mtime, hash FROM local
-	 WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT ?3";
-const PAGE_AFTER_BELOW: &str = "SELECT path, kind, size, mtime, hash FROM local
-	 WHERE path > ?1 AND path < ?2 ORDER BY path LIMIT ?3";
+/// The statements of [`LOCAL`].
+const LOCAL_SQL: Sql = Sql {
+	page_from: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE path >= ?1 ORDER BY path LIMIT ?2",
+	page_after: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE path > ?1 ORDER BY path LIMIT ?2",
+	page_from_below: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT ?3",
+	page_after_below: "SELECT path, kind, size, mtime, hash FROM local
+		 WHERE path > ?1 AND path < ?2 ORDER BY path LIMIT ?3",
+	insert: "INSERT INTO local (path, kind, size, mtime, hash) VALUES (?1, ?2, ?3, ?4, ?5)
+		 ON CONFLICT DO NOTHING",
+	update: "UPDATE local SET kind = ?2, size = ?3, mtime = ?4, hash = ?5 WHERE path = ?1",
+	remove: "DELETE FROM local WHERE path = ?1 RETURNING path, kind, size, mtime, hash",
+	forget: "DELETE FROM local WHERE path = ?1",
+	forget_under: "DELETE FROM local WHERE path >= ?1 || '/' AND path < ?1 || '0'",
+	occupied: "SELECT EXISTS (SELECT 1 FROM local WHERE fold(path) = ?1)
+		 OR EXISTS (SELECT 1 FROM local WHERE fold(path) >= ?1 || '/' AND fold(path) < ?1 || '0')",
+	rekey_at: "UPDATE local SET path = ?2 WHERE path = ?1",
+	rekey_under: "UPDATE local SET path = ?2 || substr(path, length(?1) + 1)
+		 WHERE path >= ?1 || '/' AND path < ?1 || '0'",
+};
 
-/// Register `fold` on `conn`: [`collision_key`], which the folded index is built on and every query
-/// of it asks. Deterministic, as an index expression has to be.
-fn register_fold(conn: &Connection) -> rusqlite::Result<()> {
+/// The local walk's table (see the module docs). Its insert refuses a row whose path or folded name
+/// a row already holds.
+pub(super) const LOCAL: Table<LocalNode> = Table {
+	sql: &LOCAL_SQL,
+	node: node_of,
+	write: write_node,
+	path: |node| &node.rel_path,
+};
+
+/// Register `fold` on `conn`: [`collision_key`], which a folded index is built on and every query
+/// of one asks. Deterministic, as an index expression has to be.
+pub(super) fn register_fold(conn: &Connection) -> rusqlite::Result<()> {
 	conn.create_scalar_function(
 		"fold",
 		1,
@@ -136,49 +100,42 @@ fn register_fold(conn: &Connection) -> rusqlite::Result<()> {
 	)
 }
 
-/// Up to `limit` nodes from `from` on, below `below` when there is one, in path order.
-fn read_page(
-	conn: &Connection,
-	from: Bound<&str>,
-	below: Option<&str>,
-	limit: usize,
-) -> rusqlite::Result<Vec<LocalNode>> {
-	let (inclusive, from) = match from {
-		Bound::Included(path) => (true, path),
-		Bound::Excluded(path) => (false, path),
-		// Every path is at or after the empty one.
-		Bound::Unbounded => (true, ""),
-	};
-	let sql = match (inclusive, below) {
-		(true, None) => PAGE_FROM,
-		(false, None) => PAGE_AFTER,
-		(true, Some(_)) => PAGE_FROM_BELOW,
-		(false, Some(_)) => PAGE_AFTER_BELOW,
-	};
-	let mut statement = conn.prepare_cached(sql)?;
-	let rows = match below {
-		Some(below) => statement.query(params![from, below, limit])?,
-		None => statement.query(params![from, limit])?,
-	};
-	rows.mapped(node_of).collect()
-}
-
 /// The node a page row holds.
 fn node_of(row: &Row<'_>) -> rusqlite::Result<LocalNode> {
-	let kind: i64 = row.get(1)?;
 	Ok(LocalNode {
 		rel_path: row.get(0)?,
-		kind: NodeKind::from_i64(kind).ok_or_else(|| {
-			rusqlite::Error::FromSqlConversionFailure(
-				1,
-				Type::Integer,
-				format!("invalid kind in the staged scan: {kind}").into(),
-			)
-		})?,
+		kind: kind_at(row, 1)?,
 		size: row.get(2)?,
 		mtime_millis: row.get(3)?,
 		content_hash: hash_at(row, 4)?,
 	})
+}
+
+/// The [`NodeKind`] in `row`'s `column`, as a staged table writes it.
+pub(super) fn kind_at(row: &Row<'_>, column: usize) -> rusqlite::Result<NodeKind> {
+	let kind: i64 = row.get(column)?;
+	NodeKind::from_i64(kind).ok_or_else(|| {
+		rusqlite::Error::FromSqlConversionFailure(
+			column,
+			Type::Integer,
+			format!("invalid kind in a staged side: {kind}").into(),
+		)
+	})
+}
+
+/// [`Table::write`] for the local table.
+fn write_node(
+	statement: &mut Statement<'_>,
+	path: &str,
+	node: &LocalNode,
+) -> rusqlite::Result<usize> {
+	statement.execute(params![
+		path,
+		node.kind.as_i64(),
+		node.size,
+		node.mtime_millis,
+		hash_bytes(node.content_hash.as_ref()),
+	])
 }
 
 /// The [`ScanSink`] a whole pass's walk writes into: a row per entry into the pass's stage, a batch
@@ -214,15 +171,9 @@ impl ScanSink for StageSink {
 	fn put(&mut self, found: Found) -> rusqlite::Result<Option<Collision>> {
 		let mut taken = None;
 		self.batch.row(|conn| {
-			let mut insert = conn.prepare_cached(INSERT)?;
+			let mut insert = conn.prepare_cached(LOCAL_SQL.insert)?;
 			let written = match &found {
-				Found::Node(node) => insert.execute(params![
-					node.rel_path,
-					node.kind.as_i64(),
-					node.size,
-					node.mtime_millis,
-					hash_bytes(node.content_hash.as_ref()),
-				])?,
+				Found::Node(node) => write_node(&mut insert, &node.rel_path, node)?,
 				Found::Claim(rel_path) => insert.execute(params![
 					rel_path,
 					CLAIM,
@@ -258,394 +209,12 @@ impl ScanSink for StageSink {
 		if self.claims {
 			stage.conn.execute(DELETE_CLAIMS, [])?;
 		}
-		Ok(Side::Staged(StagedSide::local(
+		Ok(Side::Staged(StagedSide::new(
 			stage,
 			self.nodes,
+			LOCAL,
 			self.paging,
 		)))
-	}
-}
-
-/// That a staged side's `T` is [`LocalNode`], the one node a side stages: how the generic [`Side`]
-/// hands out and takes in what the table holds. Made only by [`StagedSide::local`], where both
-/// directions are the identity.
-struct LocalIs<T> {
-	from: fn(LocalNode) -> T,
-	to: fn(&T) -> &LocalNode,
-}
-
-/// [`LocalIs::to`] for a `LocalNode` itself.
-fn same(node: &LocalNode) -> &LocalNode {
-	node
-}
-
-/// The nodes a whole pass's walk staged, read out of the stage (see the module docs): what a
-/// [`Side::Staged`] holds.
-///
-/// A node's path is the row's: what it was filed under, and what a directory move re-keys it to.
-pub(crate) struct StagedSide<T> {
-	stage: Mutex<Stage>,
-	/// How many nodes the table holds.
-	len: usize,
-	/// The page the questions about one path read last (see the module docs).
-	ahead: Mutex<Ahead>,
-	/// [`Paging::page`]: how many rows a walk reads a statement.
-	page: NonZeroUsize,
-	is: LocalIs<T>,
-}
-
-impl<T> fmt::Debug for StagedSide<T> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("StagedSide")
-			.field("len", &self.len)
-			.finish_non_exhaustive()
-	}
-}
-
-impl StagedSide<LocalNode> {
-	/// The `len` nodes `stage` holds, read as `paging` says.
-	fn local(stage: Stage, len: usize, paging: Paging) -> Self {
-		Self {
-			stage: Mutex::new(stage),
-			len,
-			ahead: Mutex::new(Ahead::default()),
-			page: paging.page,
-			is: LocalIs {
-				from: std::convert::identity,
-				to: same,
-			},
-		}
-	}
-}
-
-impl<T> StagedSide<T> {
-	/// How many nodes it holds.
-	pub(in super::super) fn len(&self) -> usize {
-		self.len
-	}
-
-	/// The node at `path`.
-	pub(in super::super) fn at(&self, path: &str) -> Option<T> {
-		self.point(path, |node| node.cloned()).map(self.is.from)
-	}
-
-	/// Whether it holds a node at `path`.
-	pub(in super::super) fn holds(&self, path: &str) -> bool {
-		self.point(path, |node| node.is_some())
-	}
-
-	/// Whether it holds `path` under any spelling, or anything under it (see
-	/// [`NodesAt::occupied`](super::super::side::NodesAt::occupied)).
-	pub(in super::super) fn occupied(&self, path: &str) -> bool {
-		let folded = collision_key(path);
-		self.read("whether a folded path is occupied", |conn| {
-			conn.prepare_cached(OCCUPIED)?
-				.query_row([folded], |row| row.get(0))
-		})
-	}
-
-	/// Every node with its path, in path order.
-	pub(in super::super) fn pages(&self) -> Pages<'_, T> {
-		Pages {
-			side: self,
-			cursor: Cursor::from(Bound::Unbounded, None),
-		}
-	}
-
-	/// Every node strictly under `dir`, with its path, in path order.
-	pub(in super::super) fn pages_under(&self, dir: &str) -> Pages<'_, T> {
-		let bounds = subtree_bounds(dir);
-		Pages {
-			side: self,
-			cursor: Cursor::from(Bound::Included(bounds.start), Some(bounds.end)),
-		}
-	}
-
-	/// [`pages`](Self::pages), handing the nodes over.
-	pub(in super::super) fn into_pages(self) -> IntoPages<T> {
-		IntoPages {
-			side: self,
-			cursor: Cursor::from(Bound::Unbounded, None),
-		}
-	}
-
-	/// Every path strictly under `dir`.
-	pub(in super::super) fn subtree_paths(&self, dir: &str) -> Vec<String> {
-		self.pages_under(dir).map(|(path, _)| path).collect()
-	}
-
-	/// File `node` at `path`, over whatever was there.
-	///
-	/// A staged side holds one spelling of each folded name, as the walk that made it does, so a
-	/// node at another spelling of a name it holds is refused, and that panics as a failed edit
-	/// does (see the module docs): no pass puts one there, as no pass adds a node to a whole side.
-	pub(in super::super) fn insert(&mut self, path: &str, node: &T) {
-		let node = (self.is.to)(node);
-		let added = self.edit("a node put", |conn| {
-			let row = params![
-				path,
-				node.kind.as_i64(),
-				node.size,
-				node.mtime_millis,
-				hash_bytes(node.content_hash.as_ref()),
-			];
-			if conn.prepare_cached(INSERT)?.execute(row)? == 1 {
-				return Ok(Some(true));
-			}
-			Ok((conn.prepare_cached(UPDATE)?.execute(row)? == 1).then_some(false))
-		});
-		match added {
-			Some(added) => self.len += usize::from(added),
-			None => panic!(
-				"the staged scan holds another spelling of {path:?}, and a staged side holds one \
-				 spelling of each folded name"
-			),
-		}
-	}
-
-	/// Take the node at `path` out, returning it.
-	pub(in super::super) fn remove(&mut self, path: &str) -> Option<T> {
-		let removed = self.edit("a node taken out", |conn| {
-			conn.prepare_cached(REMOVE)?
-				.query_row([path], node_of)
-				.optional()
-		});
-		self.len -= usize::from(removed.is_some());
-		removed.map(self.is.from)
-	}
-
-	/// Take the node at `path` out, saying whether there was one.
-	pub(in super::super) fn forget(&mut self, path: &str) -> bool {
-		let forgot = self.edit("a node dropped", |conn| {
-			conn.prepare_cached(FORGET)?.execute([path])
-		}) == 1;
-		self.len -= usize::from(forgot);
-		forgot
-	}
-
-	/// Keep the nodes `keep` answers `true` for: a walk of every node, and an edit per node dropped.
-	pub(in super::super) fn retain(&mut self, mut keep: impl FnMut(&str, &T) -> bool) {
-		let dropping: Vec<String> = self
-			.pages()
-			.filter(|(path, node)| !keep(path, node))
-			.map(|(path, _)| path)
-			.collect();
-		for path in dropping {
-			self.forget(&path);
-		}
-	}
-
-	/// Move the node at `from` and everything under it onto `to`. The destination must be free
-	/// under every spelling, as a directory move's is, or the edit fails (see the module docs).
-	pub(in super::super) fn rekey(&mut self, from: &str, to: &str) {
-		self.edit("a directory move", |conn| {
-			conn.prepare_cached(REKEY_AT)?.execute([from, to])?;
-			conn.prepare_cached(REKEY_UNDER)?.execute([from, to])
-		});
-	}
-
-	/// The node at exactly `path`, handed to `answer`: out of the page the last question read when
-	/// it spans the path, else out of a new one read from the path (see the module docs).
-	fn point<R>(&self, path: &str, answer: impl Fn(Option<&LocalNode>) -> R) -> R {
-		let mut ahead = self.ahead.lock().unwrap_or_else(PoisonError::into_inner);
-		if let Some(Span::Inside(found)) = ahead.page.as_ref().map(|page| page.answer(path)) {
-			let found = answer(found);
-			ahead.answered += 1;
-			return found;
-		}
-		let want = ahead.next_want(path, self.page.get());
-		let nodes = self.read("a path", |conn| {
-			read_page(conn, Bound::Included(path), None, want)
-		});
-		let page = Page {
-			from: path.to_owned(),
-			complete: nodes.len() < want,
-			nodes,
-		};
-		let Span::Inside(found) = page.answer(path) else {
-			unreachable!("a page read from a path spans that path")
-		};
-		let found = answer(found);
-		*ahead = Ahead {
-			page: Some(page),
-			answered: 1,
-			want,
-		};
-		found
-	}
-
-	/// What `read` answers on the connection, which a failed read panics instead of answering (see
-	/// the module docs).
-	fn read<R>(&self, what: &str, read: impl FnOnce(&Connection) -> rusqlite::Result<R>) -> R {
-		let stage = self.stage.lock().unwrap_or_else(PoisonError::into_inner);
-		read(&stage.conn).unwrap_or_else(|error| {
-			panic!(
-				"reading the pass's staged scan in {} ({what}) failed: {error} — refusing to read a \
-				 failed read as an absent node",
-				stage.path().display()
-			)
-		})
-	}
-
-	/// What `edit` answers on the connection, which a failed edit panics instead of answering (see
-	/// the module docs). The read-ahead goes with it: it no longer says what the table holds.
-	fn edit<R>(&mut self, what: &str, edit: impl FnOnce(&Connection) -> rusqlite::Result<R>) -> R {
-		*self.ahead.get_mut().unwrap_or_else(PoisonError::into_inner) = Ahead::default();
-		let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
-		edit(&stage.conn).unwrap_or_else(|error| {
-			panic!(
-				"editing the pass's staged scan in {} ({what}) failed: {error} — it is the pass's \
-				 only record of the local tree",
-				stage.path().display()
-			)
-		})
-	}
-}
-
-/// Two staged sides are equal when they hold the same nodes at the same paths, as two maps are: a
-/// walk of each, in path order.
-#[cfg(any(test, feature = "bench-internals"))]
-impl<T: PartialEq> PartialEq for StagedSide<T> {
-	fn eq(&self, other: &Self) -> bool {
-		self.len == other.len && self.pages().eq(other.pages())
-	}
-}
-
-#[cfg(any(test, feature = "bench-internals"))]
-impl<T: Eq> Eq for StagedSide<T> {}
-
-/// The page the questions about one path read last, and how they used it (see
-/// [`StagedSide::point`]).
-#[derive(Default)]
-struct Ahead {
-	page: Option<Page>,
-	/// How many questions `page` answered.
-	answered: usize,
-	/// How many nodes `page` was read for.
-	want: usize,
-}
-
-impl Ahead {
-	/// How many nodes the page read for a question at `path` asks for: twice the last one's, up to
-	/// `most`, when that one answered as many questions as it holds nodes and `path` lies past it — a
-	/// walk in path order — and one otherwise, which is what a lookup of the one path reads.
-	fn next_want(&self, path: &str, most: usize) -> usize {
-		match &self.page {
-			Some(page)
-				if self.answered >= page.nodes.len()
-					&& page
-						.nodes
-						.last()
-						.is_some_and(|last| last.rel_path.as_str() < path) =>
-			{
-				(self.want * 2).min(most)
-			}
-			_ => 1,
-		}
-	}
-}
-
-/// Nodes read from a path on, in path order.
-struct Page {
-	from: String,
-	nodes: Vec<LocalNode>,
-	/// Whether it ran to the end of the table: fewer nodes came back than were asked for.
-	complete: bool,
-}
-
-impl Page {
-	/// What the table holds at `path`, where this page can say: `path` is at or after where it was
-	/// read from, and not past its last node unless it ran to the end of the table.
-	fn answer(&self, path: &str) -> Span<'_> {
-		let past = self
-			.nodes
-			.last()
-			.is_none_or(|last| path > last.rel_path.as_str());
-		if path < self.from.as_str() || (past && !self.complete) {
-			return Span::Outside;
-		}
-		Span::Inside(
-			self.nodes
-				.binary_search_by(|node| node.rel_path.as_str().cmp(path))
-				.ok()
-				.and_then(|at| self.nodes.get(at)),
-		)
-	}
-}
-
-/// What a [`Page`] says about one path.
-enum Span<'p> {
-	/// The page spans the path, and holds this node there, or none.
-	Inside(Option<&'p LocalNode>),
-	/// The page does not reach the path.
-	Outside,
-}
-
-/// Where a walk of a staged side is: the page in hand, and where the next one starts.
-struct Cursor {
-	next: Bound<String>,
-	below: Option<String>,
-	page: vec::IntoIter<LocalNode>,
-	/// Whether the last page read ran to the end of what the walk covers.
-	done: bool,
-}
-
-impl Cursor {
-	fn from(next: Bound<String>, below: Option<String>) -> Self {
-		Self {
-			next,
-			below,
-			page: Vec::new().into_iter(),
-			done: false,
-		}
-	}
-
-	fn next<T>(&mut self, side: &StagedSide<T>) -> Option<(String, T)> {
-		if self.page.len() == 0 && !self.done {
-			let nodes = side.read("a page", |conn| {
-				read_page(
-					conn,
-					self.next.as_ref().map(String::as_str),
-					self.below.as_deref(),
-					side.page.get(),
-				)
-			});
-			self.done = nodes.len() < side.page.get();
-			if let Some(last) = nodes.last() {
-				self.next = Bound::Excluded(last.rel_path.clone());
-			}
-			self.page = nodes.into_iter();
-		}
-		let node = self.page.next()?;
-		Some((node.rel_path.clone(), (side.is.from)(node)))
-	}
-}
-
-/// A staged side's nodes with their paths, a page at a time.
-pub(crate) struct Pages<'s, T> {
-	side: &'s StagedSide<T>,
-	cursor: Cursor,
-}
-
-impl<T> Iterator for Pages<'_, T> {
-	type Item = (String, T);
-
-	fn next(&mut self) -> Option<(String, T)> {
-		self.cursor.next(self.side)
-	}
-}
-
-/// [`Pages`], over a side it owns.
-pub(crate) struct IntoPages<T> {
-	side: StagedSide<T>,
-	cursor: Cursor,
-}
-
-impl<T> Iterator for IntoPages<T> {
-	type Item = (String, T);
-
-	fn next(&mut self) -> Option<(String, T)> {
-		self.cursor.next(&self.side)
 	}
 }
 

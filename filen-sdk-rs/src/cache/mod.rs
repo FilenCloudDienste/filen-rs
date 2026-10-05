@@ -34,6 +34,8 @@ mod state;
 pub(crate) use enumerate::{
 	RemoteItem, SnapshotSink, hydrate_by_uuids, hydrate_cached_items_at, read_ancestors,
 };
+#[cfg(all(test, feature = "sync-engine"))]
+pub(crate) use enumerate::{read_subtree_snapshot, read_subtree_snapshot_into};
 pub(crate) use handle::CacheSlot;
 #[cfg(all(
 	feature = "sync-engine",
