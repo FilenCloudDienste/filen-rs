@@ -2314,8 +2314,10 @@ test("copyItems pauses, resumes and cancels through managedFuture", async () => 
 test("a copy failure's item and parent can be passed back to copyItemsTo", async () => {
 	const parent = await state.createDir(testDir, "copy-retry")
 	const real = await state.uploadFile(new TextEncoder().encode("real"), { parent, name: "real.txt" })
-	// the same file under a uuid the server holds no chunks for
-	const missing = { ...real, uuid: crypto.randomUUID() }
+	// the same file under a fresh uuid, claiming no chunks for its four bytes: the copy fails it
+	// before fetching anything (a missing chunk's 404 would come back without a status a browser
+	// can read)
+	const missing = { ...real, uuid: crypto.randomUUID(), chunks: 0n }
 	const destination = await state.createDir(parent, "destination")
 
 	const updates: CopyUpdate[] = []
@@ -2325,12 +2327,13 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	const [failure] = report.failures
 	expect(failure.info.stage.type).toBe("download")
 	expect(failure.info.error).toBeInstanceOf(FilenSdkError)
-	expect(failure.info.error.kind).toBe("FileChunkNotFound")
+	expect(failure.info.error.kind).toBe("Response")
+	expect(failure.info.error.message).toContain("is inconsistent with file size")
 	// the update's event carries the same error, read the same, though the report still held it then
 	const failed = updates.flatMap(u => u.events).filter(e => e.type === "fileFailed")
 	expect(failed).toHaveLength(1)
 	expect(failed[0].error).toBeInstanceOf(FilenSdkError)
-	expect(failed[0].error.kind).toBe("FileChunkNotFound")
+	expect(failed[0].error.kind).toBe("Response")
 	expect(failed[0].error.message).toBe(failure.info.error.message)
 	expect(failed[0].error.inner_message()).toBe(failure.info.error.inner_message())
 	expect(failure.info.destParent).toBe(destination.uuid)
@@ -2343,7 +2346,7 @@ test("a copy failure's item and parent can be passed back to copyItemsTo", async
 	})
 	expect(retry.error).toBeUndefined()
 	expect(retry.failures).toHaveLength(1)
-	expect(retry.failures[0].info.error.kind).toBe("FileChunkNotFound")
+	expect(retry.failures[0].info.error.kind).toBe("Response")
 	expect(retry.failures[0].info.destParent).toBe(destination.uuid)
 
 	// a created directory, as reported, is a copy source too
