@@ -13,6 +13,10 @@
 //! - `exec`: the order the apply runs the plan in (`ord`, from 0), and how far each action ties the
 //!   drive lock (`tie_until`).
 //! - `written`: what the apply has written so far, when the plan deletes anything (see below).
+//! - `carried`: the deletions each directory deletion carries out along with its own (see
+//!   `plan::fold_subsumed_deletes`), by the deletion's `op` and the directory's path. They are in
+//!   no run: the apply runs the directory's deletion, and drops their rows with its own
+//!   ([`Pager::carried`]).
 //!
 //! # The order
 //!
@@ -54,7 +58,10 @@
 //! directory a create made, or the existing one the dedup answered it with, is its `result_uuid`,
 //! which the plan records anyway.
 
-use std::{collections::VecDeque, sync::LazyLock};
+use std::{
+	collections::VecDeque,
+	sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
+};
 
 use filen_types::{crypto::Blake3Hash, fs::StableUuid};
 use rusqlite::{Connection, OptionalExtension, Row, ffi, params, types::Type};
@@ -63,7 +70,7 @@ use uuid::Uuid;
 use super::{
 	super::{
 		apply::{PassStart, PlannedEntry, StartInputs},
-		baseline::{BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind},
+		baseline::{BaselineEntry, BaselineStore, DropRow, ENTRY_COLUMNS, NodeKind},
 		plan::{RemoteNode, SyncAction},
 		scan::{LocalNode, collision_key},
 	},
@@ -122,6 +129,7 @@ CREATE TABLE exec (ord INTEGER PRIMARY KEY, seq INTEGER NOT NULL, tie_until INTE
 CREATE TABLE written (side INTEGER NOT NULL, key TEXT NOT NULL, uuid BLOB);
 CREATE INDEX written_key ON written (side, key);
 CREATE INDEX written_uuid ON written (uuid) WHERE uuid IS NOT NULL;
+CREATE TABLE carried (op INTEGER NOT NULL, dir TEXT NOT NULL, path TEXT NOT NULL);
 ";
 
 /// `plan.op`: which [`SyncAction`] the row is.
@@ -192,6 +200,13 @@ const SHIELDS: &str = "SELECT EXISTS (SELECT 1 FROM plan WHERE result_uuid = ?2)
 	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key = ?3)
 	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key >= ?3 || '/' AND key < ?3 || '0')";
 
+const INSERT_CARRIED: &str = "INSERT INTO carried (op, dir, path) VALUES (?1, ?2, ?3)";
+
+/// Whether the deletion `?1` of the directory at `?2` carries anything, and what: both seek
+/// `carried_by`.
+const CARRIES: &str = "SELECT EXISTS (SELECT 1 FROM carried WHERE op = ?1 AND dir = ?2)";
+const READ_CARRIED: &str = "SELECT path FROM carried WHERE op = ?1 AND dir = ?2";
+
 /// A page of the plan in apply order, with what [`entry_of`] reads by position.
 const READ_PAGE: &str = "SELECT x.ord, x.tie_until, p.seq, p.op, p.kind, p.path, p.from_path,
 	 p.remote_uuid, p.l_path, p.l_kind, p.l_size, p.l_mtime, p.l_hash,
@@ -242,6 +257,8 @@ pub(in super::super) struct PlanWriter {
 	/// How many entries create at their path, and how many move a directory.
 	creates: usize,
 	dir_moves: usize,
+	/// How many deletions the directory deletions carry.
+	carried: usize,
 }
 
 impl PlanWriter {
@@ -254,7 +271,30 @@ impl PlanWriter {
 			after: 0,
 			creates: 0,
 			dir_moves: 0,
+			carried: 0,
 		})
+	}
+
+	/// Stage `paths`, the deletions the directory deletion `action` carries out along with its own
+	/// (see `plan::fold_subsumed_deletes`). Nothing for an action that is no deletion.
+	pub(in super::super) fn carry(
+		&mut self,
+		action: &SyncAction,
+		paths: &[String],
+	) -> rusqlite::Result<()> {
+		if !action.is_delete() {
+			return Ok(());
+		}
+		let (op, dir) = (action_columns(action).0, action.rel_path());
+		for path in paths {
+			self.batch.row(|conn| {
+				conn.prepare_cached(INSERT_CARRIED)?
+					.execute(params![op, dir, path])?;
+				Ok(())
+			})?;
+		}
+		self.carried += paths.len();
+		Ok(())
 	}
 
 	/// Stage `entry`, next in plan order.
@@ -281,9 +321,13 @@ impl PlanWriter {
 			after,
 			creates,
 			dir_moves,
+			carried,
 		} = self;
 		let stage = batch.finish()?;
 		let conn = &stage.conn;
+		if carried > 0 {
+			conn.execute_batch("CREATE INDEX carried_by ON carried (op, dir)")?;
+		}
 		let deletes_flip = after > 0 && creates > 0;
 		// The paths the statements below seek on — only when there is something to seek: a first
 		// sync, all creates, and a mass deletion, all deletions, neither flips a type nor moves a
@@ -348,11 +392,12 @@ impl PlanWriter {
 			tie(conn)?;
 		}
 		Ok(StagedPlan {
-			stage,
+			stage: SharedStage(Arc::new(Mutex::new(stage))),
 			before: before + flips,
 			transfers,
 			len: before + transfers + after,
 			deletes: after > 0,
+			carries: carried > 0,
 		})
 	}
 }
@@ -658,7 +703,7 @@ fn action_columns(action: &SyncAction) -> (i64, Option<NodeKind>, Option<&str>, 
 
 /// A pass's plan, staged and ordered (see the module docs).
 pub(in super::super) struct StagedPlan {
-	stage: Stage,
+	stage: SharedStage,
 	/// How many actions run in [`Run::Before`], and in [`Run::Transfers`] after them.
 	before: usize,
 	transfers: usize,
@@ -666,6 +711,50 @@ pub(in super::super) struct StagedPlan {
 	/// Whether the plan deletes anything: only then does the apply record what it writes, which only
 	/// a deletion asks about (see the module docs).
 	deletes: bool,
+	/// Whether any directory deletion of the plan carries other deletions.
+	carries: bool,
+}
+
+/// A staged plan's stage, shared with the blocking thread a directory deletion commits on, which
+/// reads the deletions it carries out of the stage inside that commit (see [`Carried`]): an `Arc`
+/// for that thread's `'static` bound, a `Mutex` because a connection is not `Sync`. Nothing waits on
+/// it: the apply reads its stage between actions, and awaits that commit before it reads again.
+#[derive(Clone)]
+struct SharedStage(Arc<Mutex<Stage>>);
+
+impl SharedStage {
+	/// The stage. One a panic left locked — a read of what a deletion asks that failed, which panics
+	/// (see the module docs of [`stage`](super)) — is taken all the same: every write to it is a
+	/// single statement, so a panic leaves none half made.
+	fn lock(&self) -> MutexGuard<'_, Stage> {
+		self.0.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+}
+
+/// The deletions a directory deletion carries out along with its own, staged with the plan (see
+/// [`Pager::carried`]), read out of the stage a row at a time by [`each`](Self::each). Owned, with a
+/// handle on the stage, for the blocking thread the deletion's commit runs on.
+pub(in super::super) struct Carried {
+	stage: SharedStage,
+	op: i64,
+	dir: String,
+}
+
+impl Carried {
+	/// Hand `visit` the path of every deletion carried, stopping at the first error.
+	///
+	/// A read that fails here is an error, not a panic: `visit` drops a baseline row per path inside
+	/// the deletion's commit, and an error rolls that commit back, which fails the deletion as a
+	/// record that could not be written. A failed step is never read as the end of the rows.
+	pub(in super::super) fn each(self, visit: &mut DropRow<'_>) -> rusqlite::Result<()> {
+		let stage = self.stage.lock();
+		let mut read = stage.conn.prepare_cached(READ_CARRIED)?;
+		let mut rows = read.query(params![self.op, self.dir])?;
+		while let Some(row) = rows.next()? {
+			visit(row.get_ref(0)?.as_str()?)?;
+		}
+		Ok(())
+	}
 }
 
 impl StagedPlan {
@@ -757,7 +846,8 @@ impl Pager {
 			Some(Run::After) => (self.plan.before + self.plan.transfers, self.plan.len),
 		};
 		while at < end {
-			let page = read_page(&self.plan.stage, at, end)?;
+			// Read under the lock and visited without it, so `each` may ask the stage itself.
+			let page = read_page(&self.plan.stage.lock(), at, end)?;
 			at += page.len();
 			for (_, _, entry) in page {
 				each(entry);
@@ -775,6 +865,7 @@ impl Pager {
 	) -> rusqlite::Result<()> {
 		self.plan
 			.stage
+			.lock()
 			.conn
 			.prepare_cached(&RECORD_CREATED)?
 			.execute(params![path, uuid])?;
@@ -793,6 +884,7 @@ impl Pager {
 		Ok(self
 			.plan
 			.stage
+			.lock()
 			.conn
 			.prepare_cached(&READ_CREATED)?
 			.query_row([path], |row| row.get::<_, Option<Uuid>>(0))
@@ -831,6 +923,7 @@ impl Pager {
 		};
 		self.plan
 			.stage
+			.lock()
 			.conn
 			.prepare_cached(INSERT_WRITTEN)?
 			.execute(params![side, collision_key(path), uuid])?;
@@ -857,10 +950,41 @@ impl Pager {
 		self.shields(WROTE_REMOTE, rel_path, Some(remote_uuid))
 	}
 
-	fn shields(&self, side: i64, rel_path: &str, uuid: Option<Uuid>) -> bool {
+	/// The deletions `action` carries out along with its own, when it is a directory deletion that
+	/// carries any (see the module docs).
+	///
+	/// A read that fails panics: only a deletion asks, in a run the apply takes one action at a time,
+	/// so nothing is in flight to drop (see the module docs of [`stage`](super)).
+	pub(in super::super) fn carried(&self, action: &SyncAction) -> Option<Carried> {
+		if !self.plan.carries || !action.is_delete() {
+			return None;
+		}
+		let (op, dir) = (action_columns(action).0, action.rel_path());
+		let stage = self.plan.stage.lock();
 		let read = || -> rusqlite::Result<bool> {
-			self.plan
-				.stage
+			stage
+				.conn
+				.prepare_cached(CARRIES)?
+				.query_row(params![op, dir], |row| row.get(0))
+		};
+		let carries = read().unwrap_or_else(|error| {
+			panic!(
+				"reading the pass's staged plan in {} for the deletions {dir:?} carries failed: \
+				 {error} — the plan has no other copy to apply",
+				stage.path().display()
+			)
+		});
+		carries.then(|| Carried {
+			stage: self.plan.stage.clone(),
+			op,
+			dir: dir.to_owned(),
+		})
+	}
+
+	fn shields(&self, side: i64, rel_path: &str, uuid: Option<Uuid>) -> bool {
+		let stage = self.plan.stage.lock();
+		let read = || -> rusqlite::Result<bool> {
+			stage
 				.conn
 				.prepare_cached(SHIELDS)?
 				.query_row(params![side, uuid, collision_key(rel_path)], |row| {
@@ -871,13 +995,13 @@ impl Pager {
 			panic!(
 				"reading the pass's staged plan in {} for what it wrote at {rel_path:?} failed: \
 				 {error} — a deletion cannot tell whether it takes down a write of its own pass",
-				self.plan.stage.path().display()
+				stage.path().display()
 			)
 		})
 	}
 
 	fn read_page(&mut self) -> rusqlite::Result<()> {
-		let page = read_page(&self.plan.stage, self.next, self.plan.len)?;
+		let page = read_page(&self.plan.stage.lock(), self.next, self.plan.len)?;
 		self.next += page.len();
 		for (ord, tie_until, entry) in page {
 			let releasable = self.reach.is_none_or(|reach| reach < ord);
@@ -1061,6 +1185,7 @@ mod test_support {
 		/// while the pages before it read as staged.
 		pub(in crate::sync_engine) fn spoil_from(&self, ord: usize) {
 			self.stage
+				.lock()
 				.conn
 				.execute(
 					"UPDATE plan SET op = -1 WHERE seq IN (SELECT seq FROM exec WHERE ord >= ?1)",
@@ -1077,6 +1202,7 @@ mod test_support {
 		pub(in crate::sync_engine) fn break_stage(&self) {
 			self.plan
 				.stage
+				.lock()
 				.conn
 				.execute_batch("DROP TABLE plan; DROP TABLE written")
 				.expect("dropping the staged plan's tables");

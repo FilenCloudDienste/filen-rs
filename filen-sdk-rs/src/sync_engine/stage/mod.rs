@@ -43,11 +43,12 @@
 //! drop those transfers between their network op and the row that records it. A page that fails to
 //! read ([`Pager::turn`], and [`Pager::sweep`], which reads its pages alike) stops the apply
 //! admitting anything more: the transfers in flight finish, and the pass fails. Where an upload
-//! lands, failing to read ([`Pager::created_at`]), fails that upload and the pass with it.
+//! lands, failing to read ([`Pager::created_at`]), fails that upload and the pass with it. The read
+//! inside a baseline commit is an error too, which rolls that commit back ([`Carried::each`]).
 //!
-//! What a deletion asks before it runs ([`Pager::shields_local`], [`Pager::shields_remote`])
-//! panics instead, as the baseline's rows do (see `rows::snapshot`): only the runs the apply takes
-//! one action at a time ask it, so nothing is in flight to drop.
+//! What a deletion asks before it runs ([`Pager::shields_local`], [`Pager::shields_remote`],
+//! [`Pager::carried`]) panics instead, as the baseline's rows do (see `rows::snapshot`): only the
+//! runs the apply takes one action at a time ask it, so nothing is in flight to drop.
 
 mod plan;
 #[cfg(test)]
@@ -64,7 +65,7 @@ use rusqlite::Connection;
 
 #[cfg(test)]
 pub(super) use plan::PAGE_ROWS;
-pub(super) use plan::{Pager, PlanWriter, Run, Staged, StagedPlan};
+pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
 
 use super::baseline::PairId;
 use crate::{Error, ErrorKind};

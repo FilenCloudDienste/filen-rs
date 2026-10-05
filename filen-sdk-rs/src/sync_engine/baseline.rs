@@ -604,6 +604,13 @@ pub(crate) enum BaselineChange<'a> {
 	},
 }
 
+/// What drops one baseline row inside a commit, by its path: the visitor the commit of a directory
+/// deletion hands the rows of the deletions it carried out along with its own
+/// ([`BaselineStore::apply_changes_carrying`], [`BaselineStore::record_pending_carrying`]). They are
+/// streamed through it rather than collected first: the deletion of the tree's top directory
+/// carries a row per item of the tree.
+pub(crate) type DropRow<'a> = dyn FnMut(&str) -> rusqlite::Result<()> + 'a;
+
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairRecord {
@@ -1687,41 +1694,58 @@ impl BaselineStore {
 	/// write this journals has already happened (see [`record_write`]).
 	pub(crate) fn record_pending(
 		&self,
-		pair: PairId,
-		uuid: Uuid,
-		kind: &PendingKind,
-		recorded_at: i64,
+		row: &PendingRow,
 		changes: &[BaselineChange<'_>],
 		expired: &[Uuid],
 	) -> rusqlite::Result<()> {
+		self.record_pending_carrying(row, changes, expired, |_| Ok(()))
+	}
+
+	/// [`record_pending`](Self::record_pending) for a directory trash that carries other deletions
+	/// out along with its own: the same transaction also drops the row of every path `carried` hands
+	/// the visitor it is given (see [`DropRow`]).
+	pub(crate) fn record_pending_carrying(
+		&self,
+		row: &PendingRow,
+		changes: &[BaselineChange<'_>],
+		expired: &[Uuid],
+		carried: impl FnOnce(&mut DropRow<'_>) -> rusqlite::Result<()>,
+	) -> rusqlite::Result<()> {
 		record_write(
-			pair,
+			row.pair,
 			|| {
-				let what = match kind {
+				let what = match &row.kind {
 					PendingKind::Created { path, .. } => format!("create at {path:?}"),
 					PendingKind::Moved { from, to } => format!("move {from:?} -> {to:?}"),
 					PendingKind::Trashed { path } => format!("trash of {path:?}"),
 				};
 				format!(
-					"the journal row for the {what} of {uuid}, and the baseline change(s) it commits \
-					 with ({})",
+					"the journal row for the {what} of {}, the baseline change(s) it commits with \
+					 ({}), and the rows of any deletions it carried",
+					row.uuid,
 					describe_changes(changes)
 				)
 			},
-			|| self.record_pending_once(pair, uuid, kind, recorded_at, changes, expired),
+			|| {
+				let tx = self.conn.unchecked_transaction()?;
+				self.write_pending(row.pair, row.uuid, &row.kind, row.recorded_at, expired)?;
+				self.write_changes(row.pair, changes)?;
+				carried(&mut |path| self.delete_entry_once(row.pair, path))?;
+				tx.commit()
+			},
 		)
 	}
 
-	fn record_pending_once(
+	/// A remote write's journal row, after the retirement of `expired`: inside a transaction the
+	/// caller opened, with the baseline changes it commits with.
+	fn write_pending(
 		&self,
 		pair: PairId,
 		uuid: Uuid,
 		kind: &PendingKind,
 		recorded_at: i64,
-		changes: &[BaselineChange<'_>],
 		expired: &[Uuid],
 	) -> rusqlite::Result<()> {
-		let tx = self.conn.unchecked_transaction()?;
 		self.delete_pending_rows(expired)?;
 		let (kind_id, path, replaced, from_path, to_path) = match kind {
 			PendingKind::Created { path, replaced } => {
@@ -1751,8 +1775,7 @@ impl BaselineStore {
 				recorded_at
 			],
 		)?;
-		self.write_changes(pair, changes)?;
-		tx.commit()
+		Ok(())
 	}
 
 	/// Apply several baseline edits in ONE transaction — for a local write that re-keys a whole
@@ -1765,12 +1788,30 @@ impl BaselineStore {
 		pair: PairId,
 		changes: &[BaselineChange<'_>],
 	) -> rusqlite::Result<()> {
+		self.apply_changes_carrying(pair, changes, |_| Ok(()))
+	}
+
+	/// [`apply_changes`](Self::apply_changes) for a local directory deletion that carries other
+	/// deletions out along with its own: the same transaction also drops the row of every path
+	/// `carried` hands the visitor it is given (see [`DropRow`]).
+	pub(crate) fn apply_changes_carrying(
+		&self,
+		pair: PairId,
+		changes: &[BaselineChange<'_>],
+		carried: impl FnOnce(&mut DropRow<'_>) -> rusqlite::Result<()>,
+	) -> rusqlite::Result<()> {
 		record_write(
 			pair,
-			|| format!("the baseline change(s) {}", describe_changes(changes)),
+			|| {
+				format!(
+					"the baseline change(s) {} and the rows of any deletions they carried",
+					describe_changes(changes)
+				)
+			},
 			|| {
 				let tx = self.conn.unchecked_transaction()?;
 				self.write_changes(pair, changes)?;
+				carried(&mut |path| self.delete_entry_once(pair, path))?;
 				tx.commit()
 			},
 		)
@@ -2010,7 +2051,7 @@ mod tests {
 	use super::{
 		super::{
 			apply::{PassStart, PlannedEntry},
-			plan::SyncAction,
+			plan::{Subsumed, SyncAction},
 			side::Side,
 			stage::Stage,
 		},
@@ -2079,6 +2120,15 @@ mod tests {
 		}
 	}
 
+	fn journal_row(pair: PairId, uuid: Uuid, kind: PendingKind, recorded_at: i64) -> PendingRow {
+		PendingRow {
+			pair,
+			uuid,
+			kind,
+			recorded_at,
+		}
+	}
+
 	/// The `PRAGMA user_version` a store's connection reports.
 	fn version_of(store: &BaselineStore) -> i64 {
 		store
@@ -2116,7 +2166,11 @@ mod tests {
 				.unwrap();
 			let started = std::time::Instant::now();
 			let error = writer
-				.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
+				.record_pending(
+					&journal_row(pair, Uuid::new_v4(), created("a.txt"), NOW),
+					&[],
+					&[],
+				)
 				.expect_err("the contended journal write must fail rather than wait for the lock");
 			assert!(
 				is_write_lock_contention(&error),
@@ -2133,7 +2187,11 @@ mod tests {
 		// With the lock free the same write lands, so the failure above was the contention and not a
 		// connection this test broke.
 		writer
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
+			.record_pending(
+				&journal_row(pair, Uuid::new_v4(), created("a.txt"), NOW),
+				&[],
+				&[],
+			)
 			.expect("the write must land once the lock is free");
 		assert_eq!(pending_count(&writer), 1);
 
@@ -2499,7 +2557,7 @@ mod tests {
 		let uuids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
 		for uuid in &uuids {
 			store
-				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[], &[])
+				.record_pending(&journal_row(pair, *uuid, created("a.txt"), NOW), &[], &[])
 				.unwrap();
 		}
 
@@ -2527,12 +2585,16 @@ mod tests {
 		let uuids: Vec<Uuid> = (1..=4).map(Uuid::from_u128).collect();
 		for uuid in &uuids[..3] {
 			store
-				.record_pending(pair, *uuid, &created("a.txt"), NOW, &[], &[])
+				.record_pending(&journal_row(pair, *uuid, created("a.txt"), NOW), &[], &[])
 				.unwrap();
 		}
 
 		store
-			.record_pending(pair, uuids[3], &created("b.txt"), NOW, &[], &uuids[..2])
+			.record_pending(
+				&journal_row(pair, uuids[3], created("b.txt"), NOW),
+				&[],
+				&uuids[..2],
+			)
 			.unwrap();
 		assert_eq!(
 			store
@@ -2560,12 +2622,20 @@ mod tests {
 			to: to.to_string(),
 		};
 		store
-			.record_pending(pair, uuid, &moved("a.txt", "b.txt"), NOW, &[], &[])
+			.record_pending(
+				&journal_row(pair, uuid, moved("a.txt", "b.txt"), NOW),
+				&[],
+				&[],
+			)
 			.unwrap();
 
 		let later = NOW + GRACE + 1;
 		store
-			.record_pending(pair, uuid, &moved("b.txt", "c.txt"), later, &[], &[uuid])
+			.record_pending(
+				&journal_row(pair, uuid, moved("b.txt", "c.txt"), later),
+				&[],
+				&[uuid],
+			)
 			.unwrap();
 		assert_eq!(
 			store.load_pending(later, GRACE).unwrap(),
@@ -2946,10 +3016,7 @@ mod tests {
 
 		store
 			.record_pending(
-				pair,
-				Uuid::new_v4(),
-				&created("B/x.txt"),
-				NOW,
+				&journal_row(pair, Uuid::new_v4(), created("B/x.txt"), NOW),
 				&[
 					BaselineChange::Upsert(&file_entry("B/x.txt", [4; 32], 4)),
 					BaselineChange::Delete("B/sub/y.txt"),
@@ -3237,6 +3304,7 @@ mod tests {
 					rel_path: "new/f00000.txt".to_string(),
 				},
 			],
+			Subsumed::default(),
 			pass,
 			Side::Whole(HashMap::new()),
 			Side::Whole(HashMap::new()),
@@ -3247,10 +3315,7 @@ mod tests {
 			let path = format!("new/f{n:05}.txt");
 			store
 				.record_pending(
-					pair,
-					Uuid::new_v4(),
-					&created(&path),
-					NOW,
+					&journal_row(pair, Uuid::new_v4(), created(&path), NOW),
 					&[BaselineChange::Upsert(&file_entry(&path, [2; 32], n))],
 					&[],
 				)
@@ -3373,10 +3438,7 @@ mod tests {
 
 		store
 			.record_pending(
-				pair,
-				Uuid::new_v4(),
-				&created("boom.txt"),
-				NOW,
+				&journal_row(pair, Uuid::new_v4(), created("boom.txt"), NOW),
 				&[BaselineChange::Upsert(&boom)],
 				&[],
 			)
@@ -3948,10 +4010,7 @@ mod tests {
 				.unwrap();
 			store
 				.record_pending(
-					pair,
-					uuid,
-					&created("a.txt"),
-					NOW,
+					&journal_row(pair, uuid, created("a.txt"), NOW),
 					&[BaselineChange::Upsert(&entry)],
 					&[],
 				)
@@ -4009,7 +4068,7 @@ mod tests {
 		let uuids: Vec<Uuid> = kinds.iter().map(|_| Uuid::new_v4()).collect();
 		for (uuid, kind) in uuids.iter().zip(&kinds) {
 			store
-				.record_pending(pair, *uuid, kind, NOW, &[], &[])
+				.record_pending(&journal_row(pair, *uuid, kind.clone(), NOW), &[], &[])
 				.unwrap();
 		}
 
@@ -4031,17 +4090,18 @@ mod tests {
 			.unwrap();
 		store
 			.record_pending(
-				pair,
-				Uuid::new_v4(),
-				&created("old.txt"),
-				NOW - GRACE - 1,
+				&journal_row(pair, Uuid::new_v4(), created("old.txt"), NOW - GRACE - 1),
 				&[],
 				&[],
 			)
 			.unwrap();
 		let fresh = Uuid::new_v4();
 		store
-			.record_pending(pair, fresh, &created("new.txt"), NOW - 1_000, &[], &[])
+			.record_pending(
+				&journal_row(pair, fresh, created("new.txt"), NOW - 1_000),
+				&[],
+				&[],
+			)
 			.unwrap();
 
 		let loaded = store.load_pending(NOW, GRACE).unwrap();
@@ -4063,11 +4123,15 @@ mod tests {
 			.create_pair("/other", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
+			.record_pending(
+				&journal_row(pair, Uuid::new_v4(), created("a.txt"), NOW),
+				&[],
+				&[],
+			)
 			.unwrap();
 		let kept = Uuid::new_v4();
 		store
-			.record_pending(other, kept, &created("b.txt"), NOW, &[], &[])
+			.record_pending(&journal_row(other, kept, created("b.txt"), NOW), &[], &[])
 			.unwrap();
 
 		store.delete_pair(pair).unwrap();
@@ -4093,7 +4157,11 @@ mod tests {
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
 		store
-			.record_pending(pair, Uuid::new_v4(), &created("a.txt"), NOW, &[], &[])
+			.record_pending(
+				&journal_row(pair, Uuid::new_v4(), created("a.txt"), NOW),
+				&[],
+				&[],
+			)
 			.unwrap();
 
 		store
@@ -4195,5 +4263,64 @@ mod tests {
 		assert!(reopened.paused_pairs().unwrap().is_empty());
 		drop(reopened);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// A directory deletion's rows go in one transaction with the rows of the deletions it carried:
+	/// a carried row that cannot be read back leaves every row where it was, the directory's own
+	/// and those already dropped included, and so does a trash's journal row.
+	#[test]
+	fn a_carried_row_that_fails_rolls_the_whole_deletion_back() {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let rows = ["docs", "docs/a.txt", "docs/b.txt"].map(|path| file_entry(path, [1; 32], 1));
+		for row in &rows {
+			store.upsert_entry(pair, row).unwrap();
+		}
+		let carried_then_failed = |drop: &mut DropRow<'_>| {
+			drop("docs/a.txt")?;
+			Err(rusqlite::Error::InvalidQuery)
+		};
+		let paths = |store: &BaselineStore| -> Vec<String> {
+			store
+				.entries(pair)
+				.unwrap()
+				.into_iter()
+				.map(|row| row.rel_path)
+				.collect()
+		};
+
+		assert!(
+			store
+				.apply_changes_carrying(
+					pair,
+					&[BaselineChange::Delete("docs")],
+					carried_then_failed
+				)
+				.is_err()
+		);
+		assert_eq!(paths(&store), ["docs", "docs/a.txt", "docs/b.txt"]);
+
+		let trash = PendingRow {
+			pair,
+			uuid: Uuid::new_v4(),
+			kind: PendingKind::Trashed {
+				path: "docs".to_string(),
+			},
+			recorded_at: NOW,
+		};
+		assert!(
+			store
+				.record_pending_carrying(
+					&trash,
+					&[BaselineChange::Delete("docs")],
+					&[],
+					carried_then_failed
+				)
+				.is_err()
+		);
+		assert_eq!(paths(&store), ["docs", "docs/a.txt", "docs/b.txt"]);
+		assert_eq!(pending_count(&store), 0);
 	}
 }

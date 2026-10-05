@@ -26,7 +26,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use uuid::Uuid;
 
 use super::{
-	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId},
+	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId, PendingRow},
 	changes::FullPassReason,
 	engine::{
 		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SharedStore,
@@ -44,7 +44,7 @@ use super::{
 	rows::{Baseline, Cursor},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::{NodesAt, Side},
-	stage::{Pager, PlanWriter, Run, Stage, Staged, StagedPlan},
+	stage::{Carried, Pager, PlanWriter, Run, Stage, Staged, StagedPlan},
 };
 use crate::{
 	auth::Client,
@@ -259,9 +259,6 @@ pub(super) struct ApplyContext<'a> {
 	pub(super) gate: &'a PassGate,
 	/// The bounds of each hold of the drive-write lock (see [`Lease`]).
 	pub(super) lock_budget: LockBudget,
-	/// The deletions each directory deletion of the plan carries out along with its own, whose
-	/// baseline rows it drops (see [`plan::fold_subsumed_deletes`](super::plan)).
-	pub(super) subsumed: &'a Subsumed,
 }
 
 /// One action of the plan, with what the apply reads for it as the pass started: made by
@@ -388,26 +385,30 @@ where
 impl PlannedEntry {
 	/// The plan's `actions`, each with what the apply reads for it out of the pass's `baseline` and
 	/// its two sides, staged in `stage` one at a time and ordered there for the apply (see
-	/// [`StagedPlan`]): what the apply holds of its plan is then the page of it it is in.
+	/// [`StagedPlan`]), with the deletions each directory deletion carries out along with its own
+	/// (`subsumed`): what the apply holds of its plan is then the page of it it is in.
 	///
-	/// It takes those three, and drops them: the scan and the view are a node per item of the tree,
-	/// and the baseline's snapshot is the pass's read transaction, which has to END before the first
-	/// action commits (see [`Baseline::close`]). Every answer an entry carries is the one the plan was
-	/// made from, the pass's own commits landing in none of them.
+	/// It takes those four, and drops them: the scan and the view are a node per item of the tree,
+	/// and so are the carried deletions of a deletion of the whole tree; the baseline's snapshot is
+	/// the pass's read transaction, which has to END before the first action commits (see
+	/// [`Baseline::close`]). Every answer an entry carries is the one the plan was made from, the
+	/// pass's own commits landing in none of them.
 	pub(super) fn stage(
 		actions: Vec<SyncAction>,
+		subsumed: Subsumed,
 		baseline: Baseline,
 		local: Side<LocalNode>,
 		remote: Side<RemoteNode>,
 		stage: Stage,
 	) -> rusqlite::Result<StagedPlan> {
-		let staged = Self::write(actions, &baseline, local, remote, stage);
+		let staged = Self::write(actions, &subsumed, &baseline, local, remote, stage);
 		baseline.close();
 		staged
 	}
 
 	fn write(
 		actions: Vec<SyncAction>,
+		subsumed: &Subsumed,
 		baseline: &Baseline,
 		local: Side<LocalNode>,
 		remote: Side<RemoteNode>,
@@ -422,7 +423,9 @@ impl PlannedEntry {
 		let mut plan = PlanWriter::new(stage)?;
 		for action in actions {
 			let start = PassStart::of(&action, &mut trees);
-			plan.push(&Self { action, start })?;
+			let entry = Self { action, start };
+			plan.push(&entry)?;
+			plan.carry(&entry.action, subsumed.under(&entry.action))?;
 		}
 		plan.finish()
 	}
@@ -1117,17 +1120,17 @@ async fn commit_dir_move(
 	// it — but off the runtime thread, because this re-key covers every row of the moved
 	// directory's subtree rather than a single row. Owned copies for the closure, and the
 	// in-memory journal is published only once that transaction has committed, as it is there.
-	let pair = ctx.pair;
-	let committed = kind.clone();
+	let row = PendingRow {
+		pair: ctx.pair,
+		uuid,
+		kind: kind.clone(),
+		recorded_at: Utc::now().timestamp_millis(),
+	};
 	let (from, to) = (from.to_string(), to.to_string());
-	let at = Utc::now().timestamp_millis();
 	let expired = ctx.pending.expire();
 	off_store(ctx.store, move |store| {
 		store.record_pending(
-			pair,
-			uuid,
-			&committed,
-			at,
+			&row,
 			&[BaselineChange::MoveSubtree {
 				from: &from,
 				to: &to,
@@ -1137,7 +1140,7 @@ async fn commit_dir_move(
 	})
 	.await?
 	.map_err(db_err)?;
-	ctx.pending.record(ctx.observed, pair, uuid, kind);
+	ctx.pending.record(ctx.observed, ctx.pair, uuid, kind);
 	Ok(())
 }
 
@@ -2156,13 +2159,20 @@ async fn apply_one(
 					"refusing to quarantine {rel_path:?}: this pass already wrote there, under this or another spelling"
 				)));
 			}
+			// Read before the act, which nothing then stands between and its record.
+			let carried = plan.pager.carried(action);
 			let _stashed = quarantine_local(ctx.local_root, rel_path)?;
-			match ctx.subsumed.under(action) {
-				[] => delete_baseline(ctx, rel_path).await?,
-				subsumed => {
-					let (pair, paths) = (ctx.pair, dropped_paths(rel_path, subsumed));
+			match carried {
+				None => delete_baseline(ctx, rel_path).await?,
+				// The carried rows scale with the subtree, so they are dropped off the runtime thread.
+				Some(carried) => {
+					let (pair, path) = (ctx.pair, rel_path.clone());
 					off_store(ctx.store, move |store| {
-						store.apply_changes(pair, &deletes(&paths))
+						store.apply_changes_carrying(
+							pair,
+							&[BaselineChange::Delete(&path)],
+							|drop| carried.each(drop),
+						)
 					})
 					.await?
 					.map_err(db_err)?;
@@ -2238,6 +2248,8 @@ async fn apply_one(
 					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
 				)));
 			}
+			// Read before the act, which nothing then stands between and its record.
+			let carried = plan.pager.carried(action);
 			match (kind, start) {
 				(NodeKind::File, _) => {
 					let mut remote_file = file_or_fetch(
@@ -2265,7 +2277,7 @@ async fn apply_one(
 			// The row is about to go, so a snapshot that has not applied the trash yet reads this
 			// item as an untracked remote file with nothing local — a deletion to make all over
 			// again. Record the trash so the next pass suppresses that.
-			commit_trash(ctx, *remote_uuid, rel_path, ctx.subsumed.under(action)).await?;
+			commit_trash(ctx, *remote_uuid, rel_path, carried).await?;
 			report.remotely_trashed += 1;
 		}
 		(
@@ -2948,17 +2960,16 @@ async fn commit_remote_write(
 	changes: &[BaselineChange<'_>],
 ) -> Result<(), crate::Error> {
 	let expired = ctx.pending.expire();
+	let row = PendingRow {
+		pair: ctx.pair,
+		uuid,
+		kind,
+		recorded_at: Utc::now().timestamp_millis(),
+	};
 	locked(ctx.store)
-		.record_pending(
-			ctx.pair,
-			uuid,
-			&kind,
-			Utc::now().timestamp_millis(),
-			changes,
-			&expired,
-		)
+		.record_pending(&row, changes, &expired)
 		.map_err(db_err)?;
-	ctx.pending.record(ctx.observed, ctx.pair, uuid, kind);
+	ctx.pending.record(ctx.observed, ctx.pair, uuid, row.kind);
 	Ok(())
 }
 
@@ -2972,48 +2983,43 @@ async fn upsert_baseline(
 }
 
 /// Journal a remote trash at `rel_path` and drop the rows it removes — its own, and those of the
-/// deletions it carried out along with its own (`subsumed`) — in one transaction. Those rows scale
-/// with the trashed subtree, so a commit that carries them runs off the runtime thread and is
-/// published to the in-memory journal once it has committed, as [`commit_dir_move`]'s is (see there
-/// for what that means for a caller that drops the pass mid-commit).
+/// deletions it carried out along with its own (`carried`), read out of the pass's stage as they
+/// are dropped — in one transaction. Those rows scale with the trashed subtree, so a commit that
+/// carries them runs off the runtime thread and is published to the in-memory journal once it has
+/// committed, as [`commit_dir_move`]'s is (see there for what that means for a caller that drops the
+/// pass mid-commit).
 async fn commit_trash(
 	ctx: &ApplyContext<'_>,
 	uuid: Uuid,
 	rel_path: &str,
-	subsumed: &[String],
+	carried: Option<Carried>,
 ) -> Result<(), crate::Error> {
 	let kind = PendingKind::Trashed {
 		path: rel_path.to_string(),
 	};
-	if subsumed.is_empty() {
+	let Some(carried) = carried else {
 		return commit_remote_write(ctx, uuid, kind, &[BaselineChange::Delete(rel_path)]).await;
-	}
-	let (pair, committed, paths) = (ctx.pair, kind.clone(), dropped_paths(rel_path, subsumed));
-	let at = Utc::now().timestamp_millis();
+	};
+	// Owned for the store thread, as the journal's own copy is.
+	let (path, row) = (
+		rel_path.to_owned(),
+		PendingRow {
+			pair: ctx.pair,
+			uuid,
+			kind: kind.clone(),
+			recorded_at: Utc::now().timestamp_millis(),
+		},
+	);
 	let expired = ctx.pending.expire();
 	off_store(ctx.store, move |store| {
-		store.record_pending(pair, uuid, &committed, at, &deletes(&paths), &expired)
+		store.record_pending_carrying(&row, &[BaselineChange::Delete(&path)], &expired, |drop| {
+			carried.each(drop)
+		})
 	})
 	.await?
 	.map_err(db_err)?;
-	ctx.pending.record(ctx.observed, pair, uuid, kind);
+	ctx.pending.record(ctx.observed, ctx.pair, uuid, kind);
 	Ok(())
-}
-
-/// `rel_path` and the paths of the deletions it carried out along with its own: the rows a
-/// directory deletion drops, owned for the store thread.
-fn dropped_paths(rel_path: &str, subsumed: &[String]) -> Vec<String> {
-	let mut paths = Vec::with_capacity(subsumed.len() + 1);
-	paths.push(rel_path.to_owned());
-	paths.extend_from_slice(subsumed);
-	paths
-}
-
-fn deletes(paths: &[String]) -> Vec<BaselineChange<'_>> {
-	paths
-		.iter()
-		.map(|path| BaselineChange::Delete(path))
-		.collect()
 }
 
 async fn delete_baseline(ctx: &ApplyContext<'_>, rel_path: &str) -> Result<(), crate::Error> {
@@ -3314,7 +3320,9 @@ mod tests {
 			},
 		];
 		let (_dir, stage) = Stage::in_temp_dir();
-		let plan = PlannedEntry::stage(actions, baseline, local, remote, stage).unwrap();
+		let plan =
+			PlannedEntry::stage(actions, Subsumed::default(), baseline, local, remote, stage)
+				.unwrap();
 		let mut entries = Vec::new();
 		plan.pager()
 			.sweep(None, |entry| entries.push(entry))
@@ -3899,6 +3907,117 @@ mod tests {
 		assert!(
 			!plan.pager.shields_remote("d00", Uuid::from_u128(1)),
 			"the stage recorded the uploads"
+		);
+	}
+
+	/// A plan of `action` alone, a directory deletion, staged with the deletions it carries.
+	fn carrying(action: SyncAction, carried: &[String]) -> (tempfile::TempDir, PagedPlan) {
+		let (dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		let entry = PlannedEntry::bare(action);
+		writer.push(&entry).unwrap();
+		writer.carry(&entry.action, carried).unwrap();
+		let plan = PagedPlan::new(writer.finish().unwrap(), Uuid::from_u128(u128::MAX));
+		(dir, plan)
+	}
+
+	/// A store holding one pair, with a row at each of `paths`.
+	fn store_with<'p>(paths: impl IntoIterator<Item = &'p str>) -> (BaselineStore, PairId) {
+		let store = BaselineStore::open_in_memory().unwrap();
+		let (pair, _) = store
+			.create_pair("/local", Uuid::from_u128(1), super::super::SyncMode::TwoWay)
+			.unwrap();
+		let rows: Vec<BaselineEntry> = paths
+			.into_iter()
+			.map(|path| baseline_file(path, None))
+			.collect();
+		let upserts: Vec<BaselineChange<'_>> = rows.iter().map(BaselineChange::Upsert).collect();
+		store.apply_changes(pair, &upserts).unwrap();
+		(store, pair)
+	}
+
+	fn rows_of(store: &BaselineStore, pair: PairId) -> Vec<String> {
+		store
+			.entries(pair)
+			.unwrap()
+			.into_iter()
+			.map(|entry| entry.rel_path)
+			.collect()
+	}
+
+	/// A directory deletion's commit drops its own row and the rows of exactly the deletions it
+	/// carried, read out of the stage: a row under the directory that no deletion of the plan names
+	/// stays. A local deletion's commit and a remote trash's alike, the trash's journal row with it.
+	#[test]
+	fn a_directory_deletion_drops_exactly_the_rows_it_carried() {
+		let carried = ["docs/a.txt".to_string(), "docs/sub/b.txt".to_string()];
+		let paths = [
+			"docs",
+			"docs/a.txt",
+			"docs/kept.txt",
+			"docs/sub/b.txt",
+			"other.txt",
+		];
+
+		let deleted = delete_local("docs", NodeKind::Dir);
+		let (store, pair) = store_with(paths);
+		let (_dir, plan) = carrying(deleted.clone(), &carried);
+		let rows = plan.pager.carried(&deleted).unwrap();
+		store
+			.apply_changes_carrying(pair, &[BaselineChange::Delete("docs")], |drop| {
+				rows.each(drop)
+			})
+			.unwrap();
+		assert_eq!(rows_of(&store, pair), ["docs/kept.txt", "other.txt"]);
+
+		let trashed = trash("docs", NodeKind::Dir);
+		let (store, pair) = store_with(paths);
+		let (_dir, plan) = carrying(trashed.clone(), &carried);
+		let rows = plan.pager.carried(&trashed).unwrap();
+		let journal = PendingRow {
+			pair,
+			uuid: Uuid::from_u128(2),
+			kind: PendingKind::Trashed {
+				path: "docs".to_string(),
+			},
+			recorded_at: 1,
+		};
+		store
+			.record_pending_carrying(&journal, &[BaselineChange::Delete("docs")], &[], |drop| {
+				rows.each(drop)
+			})
+			.unwrap();
+		assert_eq!(rows_of(&store, pair), ["docs/kept.txt", "other.txt"]);
+		assert_eq!(store.load_pending(1, 1_000).unwrap(), [journal]);
+	}
+
+	/// A directory deletion that carries 20,000 others streams their rows from the stage into its
+	/// commit: what it holds at once is a path, not the subtree's paths.
+	#[test]
+	fn a_directory_deletion_streams_the_rows_it_carried() {
+		const CARRIED: u32 = 20_000;
+		let carried: Vec<String> = (0..CARRIED)
+			.map(|n| format!("docs/d{:02}/f{n:05}.txt", n % 100))
+			.collect();
+		let (store, pair) = store_with(
+			["docs"]
+				.into_iter()
+				.chain(carried.iter().map(String::as_str)),
+		);
+		let deleted = delete_local("docs", NodeKind::Dir);
+		let (_dir, plan) = carrying(deleted.clone(), &carried);
+		let rows = plan.pager.carried(&deleted).unwrap();
+		let ((), peak) = alloc_meter::peak_bytes(|| {
+			store
+				.apply_changes_carrying(pair, &[BaselineChange::Delete("docs")], |drop| {
+					rows.each(drop)
+				})
+				.unwrap();
+		});
+		assert_eq!(rows_of(&store, pair), Vec::<String>::new());
+		assert!(
+			peak < 64 * 1024,
+			"dropping the carried rows held {peak} bytes at once"
 		);
 	}
 
@@ -4750,7 +4869,6 @@ mod tests {
 		pending: PendingWrites,
 		observed: Observations,
 		gate: PassGate,
-		subsumed: Subsumed,
 	}
 
 	impl Borrowed {
@@ -4762,7 +4880,6 @@ mod tests {
 				pending: PendingWrites::default(),
 				observed: Observations::default(),
 				gate: PassGate::default(),
-				subsumed: Subsumed::default(),
 			}
 		}
 
@@ -4781,7 +4898,6 @@ mod tests {
 				observed: &self.observed,
 				gate: &self.gate,
 				lock_budget: LockBudget::default(),
-				subsumed: &self.subsumed,
 			}
 		}
 	}

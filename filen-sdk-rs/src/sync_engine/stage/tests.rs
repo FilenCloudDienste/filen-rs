@@ -437,6 +437,56 @@ fn every_entry_reads_back_as_it_was_staged() {
 	}
 }
 
+/// What a directory deletion carries is staged under it, by its side and its path, and in no run:
+/// the apply is handed the directory's deletion alone, and reads what it carries out of the stage.
+#[test]
+fn a_directory_deletion_reads_back_the_deletions_it_carries() {
+	let delete_docs = SyncAction::DeleteLocal {
+		rel_path: "docs".to_string(),
+		kind: NodeKind::Dir,
+	};
+	let plan = [
+		(
+			trash("docs", NodeKind::Dir),
+			vec!["docs/a.txt", "docs/sub", "docs/sub/b.txt"],
+		),
+		(delete_docs, vec!["docs/c.txt"]),
+		(trash("other", NodeKind::Dir), vec![]),
+		(upload("docs2/x"), vec![]),
+	];
+	let (_dir, stage) = Stage::in_temp_dir();
+	let mut writer = PlanWriter::new(stage).unwrap();
+	for (action, carried) in &plan {
+		writer.push(&PlannedEntry::bare(action.clone())).unwrap();
+		let carried: Vec<String> = carried.iter().map(|path| (*path).to_string()).collect();
+		writer.carry(action, &carried).unwrap();
+	}
+	let mut pager = writer.finish().unwrap().pager();
+	for (action, carried) in &plan {
+		let read = pager.carried(action).map(|rows| {
+			let mut read = Vec::new();
+			rows.each(&mut |path| {
+				read.push(path.to_string());
+				Ok(())
+			})
+			.unwrap();
+			read.sort();
+			read
+		});
+		let staged: Option<Vec<String>> =
+			(!carried.is_empty()).then(|| carried.iter().map(|path| (*path).to_string()).collect());
+		assert_eq!(read, staged, "{action:?}");
+	}
+	let mut handed = Vec::new();
+	for run in [Run::Before, Run::Transfers, Run::After] {
+		while let Some(staged) = pager.next_in(run).unwrap() {
+			handed.push(staged.entry.action);
+		}
+	}
+	assert_eq!(handed.len(), plan.len(), "{handed:?}");
+	assert_eq!(pager.len(), plan.len());
+}
+
 /// Between independent actions — and across runs no tie crosses — the lock may go anywhere.
 #[test]
 fn independent_actions_may_release_between_any_two() {

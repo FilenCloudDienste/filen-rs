@@ -3616,7 +3616,8 @@ pub(super) fn replaced_paths<'a>(
 }
 
 /// The deletions [`fold_subsumed_deletes`] took out of a plan, by the directory deletion of the same
-/// side that carries each one out.
+/// side that carries each one out. Held while the plan is made, and staged with it
+/// (`apply::PlannedEntry::stage`): the apply reads them out of its stage, not out of this.
 #[derive(Debug, Default)]
 pub(super) struct Subsumed {
 	local: HashMap<String, Vec<String>>,
@@ -3651,10 +3652,10 @@ impl Subsumed {
 /// every file loose beside an emptied folder, and the quarantine bin a second, empty copy of the
 /// directory beside the files.
 ///
-/// The directory's apply drops the baseline rows of the deletions it took, so the rows end where
-/// the per-item plan left them. None of them is the first half of a type flip, which would have to
-/// run before the create it pairs with: nothing is created on a side under a directory that side
-/// deletes.
+/// The directory's apply drops the baseline rows of the deletions it took — exactly those, by path,
+/// and not every row under the directory — so the rows end where the per-item plan left them. None
+/// of them is the first half of a type flip, which would have to run before the create it pairs
+/// with: nothing is created on a side under a directory that side deletes.
 ///
 /// Runs on what the guard let through: the guard counts the items a pass deletes, not the calls
 /// that delete them. The price is that the subtree goes in one piece or not at all: a directory
