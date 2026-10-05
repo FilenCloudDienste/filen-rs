@@ -1,4 +1,6 @@
 mod categories;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+mod js_param;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 mod managed_futures;
 mod meta_changes;
@@ -42,6 +44,8 @@ pub(crate) use categories::{
 
 #[cfg(all(feature = "uniffi", feature = "cache"))]
 pub(crate) use self::uniffi::spawn_ordered_dispatch;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub use js_param::{JsParam, parse_tsify};
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
 pub use meta_changes::*;
