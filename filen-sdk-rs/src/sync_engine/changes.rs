@@ -69,6 +69,16 @@
 //! of half the tree costs a full pass, which is what it would cost anyway. What a pass hands the
 //! next one is bounded by the absolute [`DIRTY_CAP`] instead, and past it the next pass reads both
 //! sides whole too ([`FullPassReason::CarriedOver`], [`FullPassReason::RemoteOverflow`]).
+//!
+//! One entry can still name a whole directory, and a change-scoped pass holds a node or a
+//! tombstone for every path under a directory it sees renamed, moved, trashed or deleted. So the
+//! pass that finds one change spanning more than [`SUBTREE_CAP`] paths reads both sides whole
+//! instead ([`FullPassReason::LocalOverflow`], [`FullPassReason::RemoteOverflow`]): what it
+//! expands each change into is bounded by that cap rather than by the largest directory in the
+//! tree. The cap is per change, so several large ones add up, and a directory renamed more than
+//! once before a pass leaves a set of tombstones per name. The rows that stand in for neither
+//! side are not a change's: every pass holds and observes them, and the subtree of each, whatever
+//! changed (`derive::from_baseline`).
 
 use std::{
 	collections::BTreeSet,
@@ -89,8 +99,27 @@ use super::{ignore::FILENIGNORE, scan::normalize_rel_path};
 use crate::cache::{CacheEvent, CacheEventType, DirEvent, FileEvent, GlobalEvent, RemoteItem};
 
 /// The most entries a changelist holds before it collapses to a full pass, whatever the tree size.
-/// Chosen so the list itself can never be the pass's memory problem.
-const DIRTY_CAP: usize = 50_000;
+///
+/// Sized by what a change-scoped pass holds with BOTH lists this full, the lists themselves
+/// included: the most entries a list for which that pass stays within 16 MiB
+/// (`derive`'s `a_scoped_pass_at_both_changelist_caps_peaks_under_16_mib`, where 7,700 peak at
+/// 15.90 MiB and 7,800 at 16.02). A list also sits in memory for as long as the pair waits for its
+/// next pass, which this bounds too.
+pub(super) const DIRTY_CAP: usize = 7_700;
+
+/// The most paths a change-scoped pass expands one change into: the baseline rows strictly under a
+/// directory the change renamed, moved, trashed or deleted, or the entries one walk of a dirty
+/// directory lists below it. A change past it makes the pass read both sides whole instead, so
+/// what the pass holds for each change is bounded by this rather than by the largest directory in
+/// the tree. The local observation does not count the rows that stand in for neither side, which
+/// every pass holds whatever changed (`observe::cap_under`).
+pub(super) const SUBTREE_CAP: usize = 16_384;
+
+/// Whether `count` is past `cap`. A cap is the most a pass may hold, so it is exceeded only above
+/// it; every cap the engine bounds a pass with is checked through this one comparison.
+pub(super) fn past_cap(count: usize, cap: usize) -> bool {
+	count > cap
+}
 
 /// The FSEvents `info` string marking the watch root itself renamed or removed (`notify` 8.2.0's
 /// `fsevent.rs`, `StreamFlags::ROOT_CHANGED`). It is part of that backend's interface.
@@ -125,9 +154,13 @@ pub enum FullPassReason {
 	/// A local event named a path that cannot be keyed against the scan — outside the watch root,
 	/// or not a plain UTF-8 path.
 	UnmappedLocalPath,
-	/// More local paths changed than [`dirty_cap`] allows.
+	/// More local paths changed than a change-scoped pass narrows itself to: more than
+	/// [`dirty_cap`] allows, or one directory among them renamed, moved or deleted with more than
+	/// 16,384 paths under it.
 	LocalOverflow,
-	/// More remote changes arrived than [`dirty_cap`] allows.
+	/// More remote changes arrived than a change-scoped pass narrows itself to: more than
+	/// [`dirty_cap`] allows, or one of them a directory renamed, moved or trashed with more than
+	/// 16,384 paths under it.
 	RemoteOverflow,
 	/// The account was wiped (`GlobalEvent::DeleteAll`).
 	RemoteWiped,
@@ -623,7 +656,7 @@ impl PairChanges {
 						return;
 					}
 					state.local.paths.insert(rel);
-					if state.local.paths.len() > cap {
+					if past_cap(state.local.paths.len(), cap) {
 						state.local.collapse(FullPassReason::LocalOverflow);
 						return;
 					}
@@ -651,7 +684,7 @@ impl PairChanges {
 						id: event.id,
 						change,
 					});
-					if state.remote.entries.len() > cap {
+					if past_cap(state.remote.entries.len(), cap) {
 						state.remote.collapse(FullPassReason::RemoteOverflow);
 						return;
 					}
@@ -703,7 +736,7 @@ impl PairChanges {
 		let mut owed = BTreeSet::new();
 		for path in paths {
 			owed.insert(path.to_owned());
-			if owed.len() > DIRTY_CAP {
+			if past_cap(owed.len(), DIRTY_CAP) {
 				self.state().owed = BTreeSet::new();
 				self.force(FullPassReason::CarriedOver);
 				return;
@@ -724,7 +757,7 @@ impl PairChanges {
 	/// them, and never the first sync whose cap sits at its floor.
 	pub(super) fn note_owed_remote(&self, delta: Vec<RemoteDeltaEntry>) {
 		let mut state = self.state();
-		if delta.len() > DIRTY_CAP {
+		if past_cap(delta.len(), DIRTY_CAP) {
 			state.remote.collapse(FullPassReason::RemoteOverflow);
 			return;
 		}
@@ -1019,7 +1052,7 @@ pub(super) mod tests {
 		let (carried, full) = taken(&at_cap);
 		assert_eq!(
 			(carried.len(), full),
-			(50_000, None),
+			(7_700, None),
 			"at the cap the set is carried"
 		);
 
@@ -1424,7 +1457,7 @@ pub(super) mod tests {
 		);
 		assert_eq!(dirty_cap(4), 1);
 		assert_eq!(dirty_cap(400), 100);
-		assert_eq!(dirty_cap(usize::MAX), DIRTY_CAP);
+		assert_eq!(dirty_cap(usize::MAX), 7_700);
 	}
 
 	/// Past the cap the local set collapses rather than growing without bound.

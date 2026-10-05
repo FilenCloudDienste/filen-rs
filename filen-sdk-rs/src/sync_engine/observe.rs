@@ -46,8 +46,16 @@
 //! local evidence for (an unreadable ancestor, a directory replaced by a file, a file that vanished
 //! between the `stat` and the hash, a socket where a row sits). Its baseline row is carried
 //! unchanged and the next pass looks again.
+//!
+//! A path observed gone, hidden or walked takes every row under it out of the derived local map one
+//! by one, and a walk holds a node per entry it lists. So past [`SUBTREE_CAP`] rows under such a
+//! path, or entries below a walked one, the observation stops and the pass reads the local side
+//! whole instead ([`FullPassReason::LocalOverflow`]). So does a walk paired with a directory that
+//! large, before it takes a hash from those rows. The rows under the path that stand in for
+//! neither side are not counted: every pass holds those whatever changed (see [`cap_under`]).
 
 use std::{
+	cell::RefCell,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	io::ErrorKind,
 	path::Path,
@@ -58,8 +66,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
+	changes::{FullPassReason, SUBTREE_CAP, past_cap},
 	ignore::{FILENIGNORE, IgnoreDecision, IgnoreRules, rule_file_dir},
-	plan::{ancestors, is_under},
+	plan::{ancestors, is_under, subtree_bounds},
 	rows::Baseline,
 	scan::{
 		LocalNode, LocalScan, RuleFiles, ScanError, collision_key, fast_path_hash, hash_file,
@@ -198,6 +207,10 @@ enum Source {
 	Unprobed,
 	/// Not a rename this pass can prove: every file is read.
 	Refused,
+	/// Renamed from the one gone directory [`Renames::bind`] found, which holds more rows than
+	/// [`cap_under`] allows: the walk stops at its next entry, and the pass reads the local side
+	/// whole instead of reading those rows into memory.
+	Oversized,
 	/// Renamed from the one gone directory [`Renames::bind`] found: its rows keyed by their path
 	/// below it — `""` is that directory itself, and every other key starts with `/`, as a walked
 	/// path does below the walked directory — each with its [`Stamp`] where it has one, and how many
@@ -318,7 +331,11 @@ impl<'a> Renames<'a> {
 		{
 			return Source::Refused;
 		}
-		let mut rows = HashMap::with_capacity(baseline.count_subtree(from) + 1);
+		let under = baseline.count_subtree(from);
+		if past_cap(under, cap_under(baseline, self.dirty, from)) {
+			return Source::Oversized;
+		}
+		let mut rows = HashMap::with_capacity(under + 1);
 		rows.insert(String::new(), (NodeKind::Dir, None));
 		for row in baseline.subtree(from) {
 			let stamp = Stamp::of(&row);
@@ -397,13 +414,16 @@ impl<'a> Origins<'a> {
 /// ancestors of each dirty path, top down, and whatever its subtree walks found. Loading the
 /// ancestors first is what makes the rules in force the same ones a whole-tree walk would have
 /// applied at that depth.
+///
+/// `Err` is a dirty path whose subtree is too large to narrow a pass to (see the module docs): the
+/// observation stops there, and the pass reads the local side whole instead.
 pub(super) fn observe_local(
 	root: &Path,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
 	rule_files: &RuleFiles,
 	dirty: &BTreeSet<String>,
-) -> (LocalObservations, IgnoreRules) {
+) -> Result<(LocalObservations, IgnoreRules), FullPassReason> {
 	let mut out = LocalObservations {
 		observed: BTreeMap::new(),
 		siblings: BTreeMap::new(),
@@ -424,7 +444,7 @@ pub(super) fn observe_local(
 				source,
 			},
 		);
-		return (out, rules);
+		return Ok((out, rules));
 	}
 	if rule_files.reads("") {
 		load_rule_file(
@@ -469,6 +489,7 @@ pub(super) fn observe_local(
 		match walk_ancestors(root, path, &mut rules, rule_files, &mut walked, &mut out) {
 			Ancestors::Walked => {}
 			Ancestors::Gone(at) => {
+				within_cap(baseline, &dirty, at)?;
 				let absence = Absence {
 					gone: at.to_owned(),
 				};
@@ -476,6 +497,7 @@ pub(super) fn observe_local(
 				continue;
 			}
 			Ancestors::Hidden(at, decision) => {
+				within_cap(baseline, &dirty, at)?;
 				insert(&mut out, root, at, LocalObservation::Hidden(decision));
 				continue;
 			}
@@ -502,12 +524,18 @@ pub(super) fn observe_local(
 		if !path.is_empty()
 			&& let Some(hit) = rules.decide(path, is_dir)
 		{
+			within_cap(baseline, &dirty, path)?;
 			insert(&mut out, root, path, LocalObservation::Hidden(hit.into()));
 			continue;
 		}
 		match stat {
 			Ok(_) if is_dir => {
-				let mut source = Source::Unprobed;
+				// Asked before the walk: a directory whose rows are past the cap is a whole read
+				// however little of it is still on disk. The walk stops past the same cap.
+				let cap = within_cap(baseline, &dirty, path)?;
+				// Shared between the two hooks the walk is handed: the pairing writes it, and the
+				// walk stops once it says the directory paired with is too large.
+				let source = RefCell::new(Source::Unprobed);
 				let (mut scan, mut carried) = scan_subtree(
 					root,
 					path,
@@ -515,9 +543,14 @@ pub(super) fn observe_local(
 					rules,
 					rule_files,
 					&mut |rel_path, size, mtime| {
-						renames.hash(path, &mut source, rel_path, size, mtime)
+						renames.hash(path, &mut source.borrow_mut(), rel_path, size, mtime)
 					},
-				);
+					&|listed| {
+						past_cap(listed, cap) || matches!(*source.borrow(), Source::Oversized)
+					},
+				)
+				.ok_or(FullPassReason::LocalOverflow)?;
+				let source = source.into_inner();
 				if !source.fits(path, &scan, baseline) {
 					// Walked twice, rather than re-reading only the files that took a hash: a rename
 					// that also changed what the directory holds is the rare case, and the second
@@ -530,10 +563,16 @@ pub(super) fn observe_local(
 						 it was paired with; walking it again, reading every file",
 						root.display()
 					);
-					(scan, carried) =
-						scan_subtree(root, path, baseline, carried, rule_files, &mut |_, _, _| {
-							None
-						});
+					(scan, carried) = scan_subtree(
+						root,
+						path,
+						baseline,
+						carried,
+						rule_files,
+						&mut |_, _, _| None,
+						&|listed| past_cap(listed, cap),
+					)
+					.ok_or(FullPassReason::LocalOverflow)?;
 				}
 				rules = carried;
 				out.complete &= scan.complete;
@@ -597,6 +636,7 @@ pub(super) fn observe_local(
 				// The one place an absence is minted. The root's own disappearance is not this: it
 				// is checked above and again below, because every path under a removed volume
 				// answers `NotFound`.
+				within_cap(baseline, &dirty, path)?;
 				let absence = Absence {
 					gone: path.to_owned(),
 				};
@@ -632,7 +672,45 @@ pub(super) fn observe_local(
 		out.observed
 			.retain(|_, observation| !matches!(observation, LocalObservation::Absent(_)));
 	}
-	(out, rules)
+	Ok((out, rules))
+}
+
+/// Whether the rows strictly under `at` are few enough for an observation there: one that `at` is
+/// gone, hidden or walked takes each of them out of the derived local map (`derive::merge_local`),
+/// leaving a tombstone per row. Past [`cap_under`] the pass reads the local side whole instead.
+///
+/// Hands back that cap, which also bounds the entries a walk of `at` lists.
+fn within_cap(
+	baseline: &Baseline,
+	dirty: &BTreeSet<&str>,
+	at: &str,
+) -> Result<usize, FullPassReason> {
+	let cap = cap_under(baseline, dirty, at);
+	if past_cap(baseline.count_subtree(at), cap) {
+		return Err(FullPassReason::LocalOverflow);
+	}
+	Ok(cap)
+}
+
+/// The most rows strictly under `at` an observation there may take out of the derived local map,
+/// or entries a walk of `at` may list below it: [`SUBTREE_CAP`], plus the rows under `at` that stand
+/// in for neither side.
+///
+/// Those rows are no change's expansion. `derive::from_baseline` puts every one of them in the
+/// dirty set of every pass, which is where they are counted from, so a pass holds a path for each
+/// whether or not anything changed, and a whole read need not retire them: a one-way mode leaves
+/// the destination's adopted copy where it is. Counted, a directory of them past the cap would
+/// make every pass read whole. What else lies under `at` still counts.
+fn cap_under(baseline: &Baseline, dirty: &BTreeSet<&str>, at: &str) -> usize {
+	// Every path is below the pair root, where `subtree_bounds("")` spans none. Bound out here, as
+	// the range borrows the bounds.
+	let bounds = subtree_bounds(at);
+	let under = if at.is_empty() {
+		dirty.range::<&str, _>(..)
+	} else {
+		dirty.range::<&str, _>(bounds.start.as_str()..bounds.end.as_str())
+	};
+	SUBTREE_CAP.saturating_add(under.filter(|path| baseline.uncarryable(path)).count())
 }
 
 /// Stat every ancestor of `path`, top down, loading each one's `.filenignore` before descending —
@@ -789,11 +867,12 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 mod tests {
 	use std::fs;
 
-	use super::super::side::NodesAt;
+	use super::super::{derive::from_baseline, side::NodesAt};
 
 	use uuid::Uuid;
 
 	use super::*;
+	use crate::alloc_meter;
 
 	fn temp_root() -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!("filen_observe_test_{}", Uuid::new_v4()));
@@ -826,6 +905,15 @@ mod tests {
 	}
 
 	fn observe_with(root: &Path, baseline: &Baseline, paths: &[&str]) -> LocalObservations {
+		observed_or_whole(root, baseline, paths).expect("a dirty set the caps narrow a pass to")
+	}
+
+	/// [`observe_with`], or the reason the pass reads the local side whole instead.
+	fn observed_or_whole(
+		root: &Path,
+		baseline: &Baseline,
+		paths: &[&str],
+	) -> Result<LocalObservations, FullPassReason> {
 		let dirty: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
 		observe_local(
 			root,
@@ -834,7 +922,7 @@ mod tests {
 			&RuleFiles::Read,
 			&dirty,
 		)
-		.0
+		.map(|(observed, _)| observed)
 	}
 
 	fn sorted_nodes(scan: &LocalScan) -> Vec<String> {
@@ -1542,5 +1630,217 @@ mod tests {
 		);
 
 		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A `Synced` file row at `rel_path` recording a one-byte file as remote item `n`, both sides
+	/// on record, with nothing on disk behind it.
+	fn recorded_file(rel_path: &str, n: usize) -> BaselineEntry {
+		BaselineEntry {
+			remote_uuid: Some(Uuid::from_u128(10_000 + n as u128)),
+			content_hash: Some(Blake3Hash::from([3; 32])),
+			size: Some(1),
+			local_mtime: Some(1),
+			remote_modified: Some(1),
+			..row(rel_path, NodeKind::File)
+		}
+	}
+
+	/// The rows of a `Synced` directory at `dir` holding `files` files, both sides on record.
+	fn recorded_dir(dir: &str, files: usize) -> Vec<BaselineEntry> {
+		let dir_row = BaselineEntry {
+			remote_uuid: Some(Uuid::from_u128(1)),
+			..row(dir, NodeKind::Dir)
+		};
+		std::iter::once(dir_row)
+			.chain((0..files).map(|n| recorded_file(&format!("{dir}/{n:05}"), n)))
+			.collect()
+	}
+
+	/// A path observed gone or hidden takes every row under it out of the derived local map, so
+	/// past the cap the observation is a whole read instead — whether the dirty path is the
+	/// directory itself or something under it, and whichever way the rules hide it. At the cap it
+	/// is still observed.
+	#[test]
+	fn a_path_gone_or_hidden_with_more_rows_under_it_than_the_cap_is_a_whole_read() {
+		for (label, hidden, dirty) in [
+			("gone", false, "d"),
+			("gone above the dirty path", false, "d/00000"),
+			("hidden", true, "d"),
+		] {
+			for (files, expected) in [
+				(SUBTREE_CAP, Ok("d")),
+				(SUBTREE_CAP + 1, Err(FullPassReason::LocalOverflow)),
+			] {
+				let root = temp_root();
+				if hidden {
+					fs::create_dir(root.join("d")).unwrap();
+					fs::write(root.join(FILENIGNORE), "d/\n").unwrap();
+				}
+				let baseline = Baseline::from_rows(recorded_dir("d", files));
+
+				let observed = observed_or_whole(&root, &baseline, &[dirty]);
+
+				assert_eq!(
+					observed.as_ref().map(keys).map_err(|reason| *reason),
+					expected.map(|at| vec![at]),
+					"{label}, {files} row(s) under it"
+				);
+				fs::remove_dir_all(&root).ok();
+			}
+		}
+	}
+
+	/// A walk holds a node for every entry it lists, so one that lists more than the cap below the
+	/// directory it walks stops there and the pass reads the local side whole. At the cap the walk
+	/// stands, the directory itself among its nodes.
+	#[test]
+	fn a_walk_listing_more_entries_than_the_cap_is_a_whole_read() {
+		let root = temp_root();
+		fs::create_dir(root.join("d")).unwrap();
+		for n in 0..SUBTREE_CAP {
+			fs::write(root.join("d").join(format!("{n:05}")), b"").unwrap();
+		}
+
+		let out = observe(&root, &["d"]);
+		let LocalObservation::Dir(scan) = &out.observed["d"] else {
+			panic!("{:?}", out.observed);
+		};
+		assert_eq!(sorted_nodes(scan).len(), SUBTREE_CAP + 1);
+
+		fs::write(root.join("d").join("one-more"), b"").unwrap();
+		assert_eq!(
+			observed_or_whole(&root, &Baseline::default(), &["d"]).map(|out| keys(&out).len()),
+			Err(FullPassReason::LocalOverflow)
+		);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A walk paired with a directory past the cap holds neither that directory's rows nor much of a
+	/// walk of its own: the pairing counts the rows instead of reading them, and the walk stops at
+	/// the next entry it lists. The renamed directory sorts first, so the source's own absence is
+	/// not what stops the observation.
+	#[test]
+	fn a_walk_paired_with_a_directory_past_the_cap_stops_without_reading_its_rows() {
+		const WALKED: usize = 8_192;
+		let root = temp_root();
+		fs::create_dir(root.join("b")).unwrap();
+		let mut rows = vec![row("z", NodeKind::Dir)];
+		for n in 0..=SUBTREE_CAP {
+			let name = format!("{n:05}");
+			if n < WALKED {
+				let file = root.join("b").join(&name);
+				fs::write(&file, b"x").unwrap();
+				rows.push(stamped(&format!("z/{name}"), &file, sentinel("x")));
+			} else {
+				rows.push(recorded_file(&format!("z/{name}"), n));
+			}
+		}
+		let baseline = Baseline::from_rows(rows);
+
+		let (observed, peak) = alloc_meter::peak_bytes(|| {
+			observed_or_whole(&root, &baseline, &["b", "z"]).map(|_| ())
+		});
+
+		assert_eq!(observed, Err(FullPassReason::LocalOverflow));
+		assert!(
+			peak < 512 << 10,
+			"the observation peaked at {peak} bytes: it read the {} rows it was paired with, or \
+			 walked on through the {WALKED} files",
+			SUBTREE_CAP + 1
+		);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// At the cap the pairing binds and the walk stands: every file takes the hash its row recorded,
+	/// unread, and the directory it was paired with is observed gone.
+	#[test]
+	fn a_walk_paired_with_a_directory_at_the_cap_takes_its_rows_hashes() {
+		let root = temp_root();
+		fs::create_dir(root.join("b")).unwrap();
+		let mut rows = vec![row("z", NodeKind::Dir)];
+		for n in 0..SUBTREE_CAP {
+			let name = format!("{n:05}");
+			let file = root.join("b").join(&name);
+			fs::write(&file, b"x").unwrap();
+			rows.push(stamped(&format!("z/{name}"), &file, sentinel("x")));
+		}
+
+		let out = observe_with(&root, &Baseline::from_rows(rows), &["b", "z"]);
+
+		assert!(out.complete, "{:?}", out.errors);
+		assert!(
+			matches!(out.observed["z"], LocalObservation::Absent(_)),
+			"{:?}",
+			keys(&out)
+		);
+		let LocalObservation::Dir(scan) = &out.observed["b"] else {
+			panic!("{:?}", keys(&out));
+		};
+		let nodes = scan.nodes.whole();
+		assert_eq!(
+			(0..SUBTREE_CAP)
+				.filter(|n| {
+					nodes
+						.at(&format!("b/{n:05}"))
+						.and_then(|node| node.content_hash)
+						== Some(sentinel("x"))
+				})
+				.count(),
+			SUBTREE_CAP,
+			"each file takes the hash its row recorded"
+		);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A directory adopted at a mode switch, with more adopted rows under it than the cap, is in the
+	/// dirty set of every pass whether or not anything changed, and a whole read would not retire it.
+	/// So with nothing announced the pass stays narrowed: its rows are not counted toward the cap,
+	/// whether the directory is gone from disk (the destination is the remote) or still there and
+	/// walked (the destination is the disk). The synced rows under it still count: as many as the
+	/// cap leave it narrowed, one more is a whole read.
+	#[test]
+	fn a_standing_adopted_directory_past_the_cap_leaves_the_pass_narrowed() {
+		let adopted = |rel_path: &str, kind| BaselineEntry {
+			state: BaselineState::Adopted,
+			..row(rel_path, kind)
+		};
+		for (on_disk, synced, expected) in [
+			(false, 0, Ok(("archive".to_owned(), true))),
+			(true, 0, Ok(("archive".to_owned(), true))),
+			(false, SUBTREE_CAP, Ok(("archive".to_owned(), true))),
+			(false, SUBTREE_CAP + 1, Err(FullPassReason::LocalOverflow)),
+		] {
+			let root = temp_root();
+			let mut rows = vec![adopted("archive", NodeKind::Dir)];
+			if on_disk {
+				fs::create_dir(root.join("archive")).unwrap();
+			}
+			for n in 0..=SUBTREE_CAP {
+				let rel_path = format!("archive/{n:05}");
+				if on_disk {
+					fs::write(root.join(&rel_path), b"").unwrap();
+				}
+				rows.push(adopted(&rel_path, NodeKind::File));
+			}
+			rows.extend((0..synced).map(|n| recorded_file(&format!("archive/s{n:05}"), n)));
+			let baseline = Baseline::from_rows(rows);
+			let dirty = from_baseline(&baseline, BTreeSet::new()).dirty;
+			assert_eq!(dirty.len(), SUBTREE_CAP + 2, "every adopted row is dirty");
+
+			let observed = observe_local(
+				&root,
+				&baseline,
+				IgnoreRules::default(),
+				&RuleFiles::Read,
+				&dirty,
+			)
+			.map(|(out, _)| (keys(&out).join(","), out.complete));
+
+			assert_eq!(
+				observed, expected,
+				"on disk: {on_disk}, {synced} synced row(s) beside the adopted ones"
+			);
+			fs::remove_dir_all(&root).ok();
+		}
 	}
 }

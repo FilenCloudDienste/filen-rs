@@ -229,6 +229,11 @@ run like `run_q`, where the tree's one-percent pass alone spanned 261.1-497.6 ms
   are the snapshot handle plus the pass's edits since; `compare` prints the tree's terms as ONLY IN
   BEFORE. Read them against `mem:*_rss`, not against a run of the tree.
 - Result files written by an earlier harness version are refused by `compare` rather than misread.
+- `twoway_one_percent_1m`, `twoway_ten_percent_100k` and `twoway_top_dir_move_100k` are version 1
+  of those scenarios here. In version 2 the first two read both sides whole (their changelists are
+  past `DIRTY_CAP`), and the third moves a directory of 16,384 files (`SUBTREE_CAP`) instead of
+  half the pair, so every figure above for the three, the `twoway_one_percent_1m` guardrail
+  included, is superseded. `compare` prints them `INCOMPARABLE` against a version 2 run.
 
 ## Reproducing it
 

@@ -1281,9 +1281,9 @@ impl Baseline {
 
 	/// How many rows lie STRICTLY under `root` (`""` is every row): what
 	/// [`visit_subtree_paths`](Self::visit_subtree_paths) visits, counted by the table rather than
-	/// read out of it. Through the pass's edits it is that walk, counted — both callers, the
-	/// assembly check and the pairing of a renamed directory with the rows it left, ask before the
-	/// pass has edited anything.
+	/// read out of it. Through the pass's edits it is that walk, counted: the assembly check, the
+	/// observations and `Side::stay_put` ask it of a pass's view, and the last of them after the
+	/// fold has edited it.
 	pub(super) fn count_subtree(&self, root: &str) -> usize {
 		if self.depth() > 0 {
 			let mut rows = 0;
@@ -1407,6 +1407,12 @@ impl Baseline {
 	/// Whether the row at `rel_path` stands in for both sides.
 	pub(super) fn carryable(&self, rel_path: &str) -> bool {
 		self.carry_flag(rel_path) == Some(true)
+	}
+
+	/// Whether a row sits at `rel_path` and stands in for neither side: one
+	/// [`uncarryable_paths`](Self::uncarryable_paths) lists.
+	pub(super) fn uncarryable(&self, rel_path: &str) -> bool {
+		self.carry_flag(rel_path) == Some(false)
 	}
 
 	/// The path of every `.filenignore` row, in no order.

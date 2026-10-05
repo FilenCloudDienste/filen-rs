@@ -28,6 +28,7 @@ use std::{
 	ffi::OsStr,
 	fmt,
 	io::{ErrorKind, Read},
+	ops::ControlFlow,
 	path::{Component, Path},
 };
 
@@ -453,22 +454,23 @@ pub(crate) fn scan_local(
 		baseline,
 		rules,
 		&rule_files,
-		&mut |_| {},
+		&mut |_| ControlFlow::Continue(()),
 		&mut |_, _, _| None,
 	)
 }
 
 /// [`scan_local`], with a hook called for every entry the walker lists, just before the scan reads
-/// it. It exists for the tests: an entry that is there when the walk lists it and gone when the
-/// scan reads it is a race no test can produce from the outside, and it is the one this scan has
-/// to survive without calling the tree partial. `moved_hash` is [`scan_subtree`]'s.
+/// it. The tests use it to produce a race: an entry that is there when the walk lists it and gone
+/// when the scan reads it cannot be produced from the outside, and it is the one this scan has to
+/// survive without calling the tree partial. [`scan_subtree`] uses it to stop a walk that has
+/// listed too much: a `Break` ends the walk there, incomplete. `moved_hash` is [`scan_subtree`]'s.
 fn scan_local_watched(
 	root: &Path,
 	start: &str,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
 	rule_files: &RuleFiles,
-	on_listed: &mut dyn FnMut(&Path),
+	on_listed: &mut dyn FnMut(&Path) -> ControlFlow<()>,
 	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
 ) -> (LocalScan, IgnoreRules) {
 	// Where the walk begins, and how far below the root that is. Every entry is keyed against the
@@ -642,7 +644,11 @@ fn scan_local_watched(
 			}
 		};
 
-		on_listed(entry.path());
+		if on_listed(entry.path()).is_break() {
+			// Cut short: what the walk did not get to is evidence of nothing.
+			complete = false;
+			break;
+		}
 
 		// The root itself is the pair's anchor, not a synced item. A subtree walk's start IS one.
 		if start_depth + entry.depth() == 0 {
@@ -845,6 +851,11 @@ fn scan_local_watched(
 /// the hashes of the rows its files left. An answer skips the read and with it any error the read
 /// would have reported, so what the hook answers for is the caller's trust; a caller with no rename
 /// to offer passes `&mut |_, _, _| None`, and the walk is the one it always was.
+///
+/// `None` for a walk `stop` cut short. It is asked before each entry is read, with how many entries
+/// below `start` the walk has listed by then, that one included: a change-scoped pass stops a walk
+/// that lists more than it would hold a node for each of, and reads whole instead. What such a
+/// walk found is evidence of nothing, so none of it is handed back.
 pub(crate) fn scan_subtree(
 	root: &Path,
 	start: &str,
@@ -852,16 +863,30 @@ pub(crate) fn scan_subtree(
 	rules: IgnoreRules,
 	rule_files: &RuleFiles,
 	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
-) -> (LocalScan, IgnoreRules) {
-	scan_local_watched(
+	stop: &dyn Fn(usize) -> bool,
+) -> Option<(LocalScan, IgnoreRules)> {
+	let start_path = root.join(start);
+	let mut listed = 0usize;
+	let mut cut = false;
+	let walked = scan_local_watched(
 		root,
 		start,
 		baseline,
 		rules,
 		rule_files,
-		&mut |_| {},
+		&mut |at| {
+			// The start is listed too, and is no entry below it.
+			listed += usize::from(at != start_path);
+			cut = stop(listed);
+			if cut {
+				ControlFlow::Break(())
+			} else {
+				ControlFlow::Continue(())
+			}
+		},
 		moved_hash,
-	)
+	);
+	(!cut).then_some(walked)
 }
 
 #[cfg(test)]
@@ -1271,6 +1296,7 @@ mod tests {
 				if path.ends_with("temp.txt") {
 					fs::remove_file(path).unwrap();
 				}
+				ControlFlow::Continue(())
 			},
 			&mut |_, _, _| None,
 		);
@@ -1330,6 +1356,7 @@ mod tests {
 						fs::remove_dir_all(child.unwrap().path()).unwrap();
 					}
 				}
+				ControlFlow::Continue(())
 			},
 			&mut |_, _, _| None,
 		);
@@ -1393,6 +1420,7 @@ mod tests {
 					blocked = true;
 					fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
 				}
+				ControlFlow::Continue(())
 			},
 			&mut |_, _, _| None,
 		);
@@ -1442,6 +1470,7 @@ mod tests {
 					gone = true;
 					fs::remove_dir_all(&root).unwrap();
 				}
+				ControlFlow::Continue(())
 			},
 			&mut |_, _, _| None,
 		);
@@ -1970,7 +1999,9 @@ mod tests {
 			IgnoreRules::default(),
 			&RuleFiles::Read,
 			&mut |_, _, _| None,
-		);
+			&|_| false,
+		)
+		.expect("a walk nothing stops");
 
 		assert!(scan.complete, "{:?}", scan.errors);
 		assert_eq!(
@@ -2021,7 +2052,9 @@ mod tests {
 			IgnoreRules::default(),
 			&RuleFiles::Read,
 			&mut |_, _, _| None,
-		);
+			&|_| false,
+		)
+		.expect("a walk nothing stops");
 		let whole = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read).0;
 
 		assert_eq!(sorted_paths(&subtree), vec!["sub", "sub/a.txt"]);
