@@ -61,11 +61,11 @@ use itertools::Either;
 use uuid::Uuid;
 
 use super::{
-	baseline::BaselineEntry,
+	baseline::{BaselineEntry, NodeKind},
 	changes::{SUBTREE_CAP, past_cap},
 	plan::{RemoteNode, is_under, moved_path},
 	rows::Baseline,
-	scan::at_or_under_folded,
+	scan::{LocalNode, at_or_under_folded},
 	stage::{Pages, StagedSide},
 };
 
@@ -98,8 +98,39 @@ pub(super) trait Nodes: NodesAt {
 	/// Every path with its node, in no order.
 	fn iter(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, Self::Node>)>;
 
-	/// Everything STRICTLY under `dir` (`dir/...`), in no order.
+	/// Everything STRICTLY under `dir` (`dir/...`), in path order: what a directory's signature is
+	/// read over, path after path (see `plan::fold_dir_moves`). A staged side reads it in that order;
+	/// the others sort the subtree.
 	fn under(&self, dir: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, Self::Node>)>;
+}
+
+/// A node that says what kind of item it is: what a walk of a side's directories keeps.
+pub(super) trait Kinded {
+	fn kind(&self) -> NodeKind;
+}
+
+impl Kinded for LocalNode {
+	fn kind(&self) -> NodeKind {
+		self.kind
+	}
+}
+
+impl Kinded for RemoteNode {
+	fn kind(&self) -> NodeKind {
+		self.kind
+	}
+}
+
+/// `nodes` in path order.
+fn in_path_order<'a, T>(
+	nodes: impl Iterator<Item = (Cow<'a, str>, Cow<'a, T>)>,
+) -> std::vec::IntoIter<(Cow<'a, str>, Cow<'a, T>)>
+where
+	T: Clone + 'a,
+{
+	let mut nodes: Vec<_> = nodes.collect();
+	nodes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+	nodes.into_iter()
 }
 
 impl<V: Clone> NodesAt for HashMap<String, V> {
@@ -142,7 +173,7 @@ impl<V: Clone> Nodes for HashMap<String, V> {
 	}
 
 	fn under(&self, dir: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, V>)> {
-		Nodes::iter(self).filter(move |(path, _)| is_under(path, dir))
+		in_path_order(Nodes::iter(self).filter(|(path, _)| is_under(path, dir)))
 	}
 }
 
@@ -1043,9 +1074,33 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 	}
 
 	fn under(&self, dir: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, T>)> {
-		let under = dir.to_owned();
-		self.entries_under(dir)
-			.filter(move |(path, _)| is_under(path, &under))
+		let dir = dir.to_owned();
+		let under = self
+			.entries_under(&dir)
+			.filter(move |(path, _)| is_under(path, &dir));
+		match self.side {
+			// Read off the stage in path order, a page at a time.
+			Side::Staged(_) => Either::Left(under),
+			Side::Whole(_) | Side::Carried(_) => Either::Right(in_path_order(under)),
+		}
+	}
+}
+
+impl<T: FromRow + Kinded> SideRef<'_, T> {
+	/// Every directory this side holds, with its node, in path order: what the directory-move fold
+	/// walks the two sides and the rows side by side in (see `plan::fold_dir_moves`). A staged side
+	/// reads them off its stage's index of directories, in that order and reading none of its
+	/// files; the others walk every node and sort the directories.
+	pub(super) fn dirs(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, T>)> {
+		let is_dir = |(_, node): &(Cow<'_, str>, Cow<'_, T>)| node.kind() == NodeKind::Dir;
+		match self.side {
+			Side::Staged(staged) => {
+				Either::Left(Entries::Staged(staged.dir_pages()).filter(is_dir))
+			}
+			Side::Whole(_) | Side::Carried(_) => {
+				Either::Right(in_path_order(self.entries().filter(is_dir)))
+			}
+		}
 	}
 }
 
@@ -1205,15 +1260,25 @@ mod tests {
 	}
 
 	#[test]
-	fn under_is_the_subtree_and_not_the_directory_itself() {
-		let side = map(&["docs", "docs/a.txt", "docs/deep/b.txt", "docsx", "other"]);
+	fn under_is_the_subtree_in_path_order_and_not_the_directory_itself() {
+		let side = map(&[
+			"docs",
+			"docs/z.txt",
+			"docs/a.txt",
+			"docs/deep/b.txt",
+			"docs/deep",
+			"docsx",
+			"other",
+		]);
 
-		let mut under: Vec<String> = side
+		let under: Vec<String> = side
 			.under("docs")
 			.map(|(path, _)| path.into_owned())
 			.collect();
-		under.sort();
-		assert_eq!(under, vec!["docs/a.txt", "docs/deep/b.txt"]);
+		assert_eq!(
+			under,
+			vec!["docs/a.txt", "docs/deep", "docs/deep/b.txt", "docs/z.txt"]
+		);
 	}
 
 	#[test]
