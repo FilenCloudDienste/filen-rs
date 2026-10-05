@@ -58,6 +58,7 @@ use itertools::Either;
 
 use super::{
 	baseline::BaselineEntry,
+	changes::{SUBTREE_CAP, past_cap},
 	plan::{is_under, moved_path},
 	rows::Baseline,
 	scan::at_or_under_folded,
@@ -597,10 +598,27 @@ impl<T: FromRow> Side<T> {
 	///
 	/// A walk of the rows under `from`, which is why a move whose match already proved this side
 	/// holds nothing at the source and a recorded node at every destination does not ask for it.
-	pub(crate) fn stay_put(&mut self, baseline: &Baseline, from: &str, to: &str) -> Vec<String> {
+	///
+	/// `None`, with nothing recorded, where the rows strictly under the two ends number more than
+	/// [`SUBTREE_CAP`]: a record at each of them is the subtree's worth of memory a change-scoped
+	/// pass reads both sides whole rather than hold.
+	pub(crate) fn stay_put(
+		&mut self,
+		baseline: &Baseline,
+		from: &str,
+		to: &str,
+	) -> Option<Vec<String>> {
 		let Self::Carried(overlay) = self else {
-			return Vec::new();
+			return Some(Vec::new());
 		};
+		if past_cap(
+			baseline
+				.count_subtree(from)
+				.saturating_add(baseline.count_subtree(to)),
+			SUBTREE_CAP,
+		) {
+			return None;
+		}
 		// The rows the move overwrites, by the path it overwrites them at: none where the
 		// destination was free, which is every move but one onto rows it has to merge with. Keyed
 		// by a copy of the path the row holds, as the lookups below are by path.
@@ -631,7 +649,7 @@ impl<T: FromRow> Side<T> {
 				recorded.push(row.rel_path);
 			}
 		}
-		recorded
+		Some(recorded)
 	}
 }
 

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind, SyncedPaths},
+	changes::FullPassReason,
 	events::SyncEvent,
 	ignore::{IgnoreDecision, IgnoreLevel, IgnoreRules},
 	outcome::{UnsyncablePath, UnsyncableReason},
@@ -2487,6 +2488,12 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 /// What still costs the whole map either way is the destination check (`occupied`) and the re-key
 /// itself, both of which walk a side map that has no order to bisect. Those go when the side maps
 /// stop being path-keyed whole-tree maps.
+///
+/// A CARRIED side the move does not carry records a node or a tombstone at every row it would
+/// otherwise follow (`Side::stay_put`), so a move over more rows than a change-scoped pass expands
+/// one change into is not folded at all: the fold hands back the reason the pass reads both sides
+/// whole instead, before it re-keys anything for that move. A whole pass's sides derive nothing
+/// from the rows, so it never gets one.
 pub(crate) fn fold_dir_moves(
 	mode: super::SyncMode,
 	baseline: &mut Baseline,
@@ -2494,7 +2501,7 @@ pub(crate) fn fold_dir_moves(
 	remote: &mut Side<RemoteNode>,
 	held: &BTreeSet<String>,
 	mut decided: Option<&mut BTreeSet<String>>,
-) -> Vec<SyncAction> {
+) -> Result<Vec<SyncAction>, FullPassReason> {
 	let mut renames = Vec::new();
 	loop {
 		// An immutable reborrow, scoped so it is dead before `move_subtree` below wants the
@@ -2526,18 +2533,26 @@ pub(crate) fn fold_dir_moves(
 		// The side the move carries is re-keyed, and the other one told to stay where it is: both
 		// read the rows about to move (see `Side::stay_put`). A push matched by its signature asks
 		// for no walk of them, because the match already proved what staying put would record — no
-		// local node at the source, and one at every path a row lands on.
+		// local node at the source, and one at every path a row lands on. Staying put goes first:
+		// it is the half that can refuse, and then neither side has moved. The reason names the
+		// side the change came from, which is the one staying put.
 		let stayed = {
 			let bl: &Baseline = baseline;
 			if matches!(action, SyncAction::MoveRemote { .. }) {
-				remote.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
-				match matched {
-					Matched::Identity => local.stay_put(bl, from, to),
+				let stayed = match matched {
+					Matched::Identity => local
+						.stay_put(bl, from, to)
+						.ok_or(FullPassReason::LocalOverflow)?,
 					Matched::Signature { .. } => Vec::new(),
-				}
+				};
+				remote.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
+				stayed
 			} else {
+				let stayed = remote
+					.stay_put(bl, from, to)
+					.ok_or(FullPassReason::RemoteOverflow)?;
 				local.rekey_subtree(bl, from, to, |node, path| node.rel_path = path.to_string());
-				remote.stay_put(bl, from, to)
+				stayed
 			}
 		};
 		// Written only once a move is actually being folded: the rows the pass reads are shared
@@ -2562,7 +2577,7 @@ pub(crate) fn fold_dir_moves(
 		);
 		renames.push(action);
 	}
-	renames
+	Ok(renames)
 }
 
 /// How a directory move was matched, which is what [`fold_dir_moves`] may take as known about the
@@ -3744,6 +3759,7 @@ mod tests {
 
 	use super::{
 		super::{
+			changes::SUBTREE_CAP,
 			derive,
 			engine::{Observations, PendingKind, PendingWrites},
 			ignore::{IgnoreLevel, IgnoreSource, Origin},
@@ -3822,7 +3838,8 @@ mod tests {
 			&mut whole_remote,
 			&BTreeSet::new(),
 			None,
-		);
+		)
+		.unwrap();
 		actions.extend(
 			reconcile(
 				mode,
@@ -4117,6 +4134,7 @@ mod tests {
 				&BTreeSet::new(),
 				None,
 			)
+			.unwrap()
 			.is_empty()
 		);
 	}
@@ -4496,6 +4514,7 @@ mod tests {
 				&held,
 				None,
 			)
+			.unwrap()
 			.is_empty()
 		);
 	}
@@ -4521,7 +4540,8 @@ mod tests {
 			&mut whole_remote,
 			&BTreeSet::new(),
 			None,
-		);
+		)
+		.unwrap();
 		let by_scope = fold_dir_moves(
 			SyncMode::TwoWay,
 			&mut scoped_baseline,
@@ -4529,7 +4549,8 @@ mod tests {
 			&mut scoped_remote,
 			&BTreeSet::new(),
 			Some(&mut scope),
-		);
+		)
+		.unwrap();
 		assert!(
 			!by_whole.is_empty(),
 			"the whole fold carried no directory move, so this compared nothing"
@@ -4556,7 +4577,8 @@ mod tests {
 			&mut remote,
 			&BTreeSet::new(),
 			Some(&mut decided),
-		);
+		)
+		.unwrap();
 		actions.extend(
 			reconcile(
 				mode,
@@ -4602,7 +4624,8 @@ mod tests {
 			&mut folded_remote,
 			&BTreeSet::new(),
 			Some(&mut pruned),
-		);
+		)
+		.unwrap();
 		// What staying put recorded is in the fold's set and in no replay of the moves.
 		let unpruned: BTreeSet<String> = rekeyed(decided, &moves).union(&pruned).cloned().collect();
 		let plan_at = |paths| {
@@ -4634,7 +4657,8 @@ mod tests {
 			&mut whole_remote,
 			&BTreeSet::new(),
 			None,
-		);
+		)
+		.unwrap();
 		whole.extend(
 			reconcile(
 				mode,
@@ -4906,7 +4930,8 @@ mod tests {
 				&mut remote,
 				&BTreeSet::new(),
 				Some(&mut decided),
-			);
+			)
+			.unwrap();
 			assert_eq!(
 				moves,
 				vec![SyncAction::MoveRemote {
@@ -4992,6 +5017,56 @@ mod tests {
 				plan_scoped(mode, &baseline, Side::carried(), remote, decided),
 				expected,
 				"scoped, {mode:?}"
+			);
+		}
+	}
+
+	/// The side a pulled directory move does not carry stays put by recording a node or a tombstone
+	/// at each row the move would otherwise take with it. Past the cap a change-scoped pass reads
+	/// both sides whole instead, refused before either side is re-keyed; at the cap the move folds.
+	#[test]
+	fn a_move_whose_side_staying_put_reads_more_rows_than_the_cap_is_a_whole_read() {
+		let dir = Uuid::from_u128(1);
+		for (count, expected) in [
+			(SUBTREE_CAP, Ok(1)),
+			(SUBTREE_CAP + 1, Err(FullPassReason::RemoteOverflow)),
+		] {
+			let files: Vec<(String, Uuid)> = (0..count)
+				.map(|n| (format!("{n:05}.txt"), Uuid::from_u128(10_000 + n as u128)))
+				.collect();
+			let mut baseline = Baseline::from_rows(
+				std::iter::once(base_dir("docs", dir)).chain(
+					files
+						.iter()
+						.map(|(name, uuid)| base_file(&format!("docs/{name}"), *uuid, [1; 32])),
+				),
+			);
+			// What the delta leaves on a carried view: the directory and what it holds moved across.
+			let mut remote = Side::carried();
+			let mut decided = BTreeSet::from(["docs".to_string(), "documents".to_string()]);
+			remote.remove(&baseline, "docs");
+			remote.insert("documents".to_string(), remote_dir_node("documents", dir));
+			for (name, uuid) in &files {
+				let (from, to) = (format!("docs/{name}"), format!("documents/{name}"));
+				remote.remove(&baseline, &from);
+				remote.insert(to.clone(), remote_file(&to, *uuid, [1; 32]));
+				decided.extend([from, to]);
+			}
+
+			let moves = fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut baseline,
+				&mut Side::carried(),
+				&mut remote,
+				&BTreeSet::new(),
+				Some(&mut decided),
+			);
+
+			assert_eq!(moves.map(|moves| moves.len()), expected, "{count} file(s)");
+			assert_eq!(
+				decided.contains("docs"),
+				expected.is_err(),
+				"{count} file(s): the set is re-keyed only by a move that folded"
 			);
 		}
 	}
@@ -5089,7 +5164,8 @@ mod tests {
 			&mut remote,
 			&BTreeSet::new(),
 			Some(&mut decided),
-		);
+		)
+		.unwrap();
 		let after = baseline.reads_for_test();
 		assert_eq!(
 			moves,
@@ -9476,7 +9552,8 @@ mod tests {
 				&mut remote,
 				&case.holds.held_remote,
 				scoped.then_some(&mut decided),
-			);
+			)
+			.unwrap();
 			let replayed = rekeyed(case.decided.clone(), &moves);
 			let decided = if scoped {
 				decided

@@ -1140,15 +1140,20 @@ pub const SCENARIOS: &[Scenario] = &[
 		ExpectRead::Scoped,
 		PER_CHANGED,
 	),
-	balanced(
-		"twoway_ten_percent_100k",
-		100_000,
-		Change::PerMille(100),
-		SyncMode::TwoWay,
-		1,
-		ExpectRead::Scoped,
-		PER_CHANGED,
-	),
+	// 9,826 files: past the changelist's absolute cap (`DIRTY_CAP`, 7,700), which a change-scoped
+	// pass at both caps is sized to, so a burst this size reads both sides whole.
+	Scenario {
+		version: 2,
+		..balanced(
+			"twoway_ten_percent_100k",
+			100_000,
+			Change::PerMille(100),
+			SyncMode::TwoWay,
+			1,
+			ExpectRead::Whole(FullPassReason::LocalOverflow),
+			PER_CHANGED,
+		)
+	},
 	Scenario {
 		// 541 rows for the twenty files the leaf carries.
 		read_rows_per_carried_file: Some(30),
@@ -1167,17 +1172,18 @@ pub const SCENARIOS: &[Scenario] = &[
 			},
 		)
 	},
-	// A directory holding HALF the pair renamed: two top-level directories of 50k files each, one
-	// of them moved. The move above carries the deepest directory, a leaf of twenty files, so its
-	// cost says nothing about how a fold scales with what the moved directory holds; this is the
-	// other end of that, with the other half left untouched for the fixture checks to verify. A pass
-	// that folded the move by writing the rows it carries holds every one of them in its edits, and
-	// the memory child's bound on those fails it; one that reads the moved subtree once more than it
-	// needs to reads 50,000 more rows, and the bound on its reads fails that.
+	// The largest directory a change-scoped pass moves: seven top-level directories of 16,384 files
+	// each (`SUBTREE_CAP`; one file more and the pass reads both sides whole), one of them moved.
+	// The move above carries the deepest directory, a leaf of twenty files, so its cost says nothing
+	// about how a fold scales with what the moved directory holds; this is the other end of that,
+	// with the other six left untouched for the fixture checks to verify. A pass that folded the move
+	// by writing the rows it carries holds every one of them in its edits, and the memory child's
+	// bound on those fails it; one that reads the moved subtree once more than it needs to reads
+	// 16,384 more rows, and the bound on its reads fails that.
 	Scenario {
 		name: "twoway_top_dir_move_100k",
-		version: 1,
-		files_per_leaf: 50_000,
+		version: 2,
+		files_per_leaf: 16_384,
 		depth: 1,
 		file_bytes: 73,
 		names: NameStyle::Ascii,
@@ -1192,9 +1198,9 @@ pub const SCENARIOS: &[Scenario] = &[
 			conflicts: Count::Exactly(0),
 			dir_moves: Count::PerChanged,
 		},
-		// 400,075 rows for 50,000 files: the moved subtree, read eight times. One of them is the
+		// 131,116 rows for 16,384 files: the moved subtree, read eight times. One of them is the
 		// observation's read of the rows the renamed directory's files take their hashes from,
-		// which is what spares it opening and reading those 50,000 files.
+		// which is what spares it opening and reading those 16,384 files.
 		read_rows_per_carried_file: Some(9),
 	},
 	balanced(
@@ -1238,15 +1244,19 @@ pub const SCENARIOS: &[Scenario] = &[
 		ExpectRead::Scoped,
 		PER_CHANGED,
 	),
-	balanced(
-		"twoway_one_percent_1m",
-		1_000_000,
-		Change::PerMille(10),
-		SyncMode::TwoWay,
-		1,
-		ExpectRead::Scoped,
-		PER_CHANGED,
-	),
+	// 10,130 files: past the changelist's absolute cap, like `twoway_ten_percent_100k`.
+	Scenario {
+		version: 2,
+		..balanced(
+			"twoway_one_percent_1m",
+			1_000_000,
+			Change::PerMille(10),
+			SyncMode::TwoWay,
+			1,
+			ExpectRead::Whole(FullPassReason::LocalOverflow),
+			PER_CHANGED,
+		)
+	},
 	// The two passes that edit their own view of the baseline — a folded directory move and a
 	// confirmed push — at the size where a copy of the tree was the pass's widest point, before
 	// those edits moved beside the tree instead of into a copy of it.

@@ -14,6 +14,10 @@
 //! Each of those would otherwise have to invent where something went, and an invented answer on
 //! this side ends in a deletion.
 //!
+//! What is too LARGE to derive asks for one as well ([`FullPassReason::RemoteOverflow`]): a
+//! directory moved or trashed with more than [`SUBTREE_CAP`] rows under it, which the view would
+//! otherwise re-key or drop path by path.
+//!
 //! Entries are applied IN ORDER. Two of them can name the same path — a create over a path a
 //! removal just vacated, a rename onto a name a move freed — and the LAST one is the current
 //! state, so the order the cache dispatched them in is the order they are applied in.
@@ -30,7 +34,7 @@ use uuid::Uuid;
 
 use super::{
 	baseline::{NodeKind, SyncedPaths},
-	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry},
+	changes::{FullPassReason, RemoteChange, RemoteDeltaEntry, SUBTREE_CAP, past_cap},
 	ignore::rule_file_dir,
 	plan::{self, RemoteNode, in_quarantine, is_safe_name, join_path},
 	rows::Baseline,
@@ -283,7 +287,7 @@ impl RemoteObservation {
 				let removed = self.detach(baseline, &path);
 				// The server takes a directory's subtree with it, and so does the view.
 				if removed.is_some_and(|node| node.kind == NodeKind::Dir) {
-					self.drop_subtree(baseline, &path);
+					self.drop_subtree(baseline, &path)?;
 				}
 				self.touch(&path);
 				if let Some(successor) = gone.successor() {
@@ -376,8 +380,7 @@ impl RemoteObservation {
 		// The engine's own bin is in no view (`place_remote_items`), so an item moved into it
 		// leaves, exactly as a whole-tree read would show it leaving.
 		if in_quarantine(&path) {
-			self.vacate(baseline, uuid);
-			return Ok(());
+			return self.vacate(baseline, uuid);
 		}
 		// A held path is one the pass may not act on; a third item arriving on it changes nothing
 		// about that.
@@ -403,7 +406,7 @@ impl RemoteObservation {
 				// path until it catches up, so the view re-keys them here (`fold_move` does the
 				// same for this engine's own moves).
 				if moved.is_some_and(|node| node.kind == NodeKind::Dir) {
-					self.rekey_subtree(baseline, &from, &path);
+					self.rekey_subtree(baseline, &from, &path)?;
 				}
 				self.touch(&from);
 			}
@@ -454,17 +457,18 @@ impl RemoteObservation {
 	/// Only for a destination the derivation KNOWS: a path that is no part of any view, which is
 	/// what a whole-tree read would show too. [`vacate_unplaced`](Self::vacate_unplaced) is the
 	/// form for a destination it could not work out.
-	fn vacate(&mut self, baseline: &Baseline, uuid: Uuid) {
+	fn vacate(&mut self, baseline: &Baseline, uuid: Uuid) -> Result<(), FullPassReason> {
 		let Some(from) = self.path_of(baseline, uuid) else {
-			return;
+			return Ok(());
 		};
 		if self
 			.detach(baseline, &from)
 			.is_some_and(|node| node.kind == NodeKind::Dir)
 		{
-			self.drop_subtree(baseline, &from);
+			self.drop_subtree(baseline, &from)?;
 		}
 		self.touch(&from);
+		Ok(())
 	}
 
 	/// Vacate an item this pass could NOT place at a path. A directory whose subtree the view still
@@ -478,17 +482,12 @@ impl RemoteObservation {
 				.of(baseline)
 				.at(&from)
 				.is_some_and(|node| node.kind == NodeKind::Dir)
-				&& self
-					.nodes
-					.of(baseline)
-					.paths()
-					.any(|key| plan::is_under(&key, &from));
+				&& !self.subtree(baseline, &from)?.is_empty();
 			if carries_subtree {
 				return Err(FullPassReason::RemoteUnplaceable);
 			}
 		}
-		self.vacate(baseline, uuid);
-		Ok(())
+		self.vacate(baseline, uuid)
 	}
 
 	/// Put `node` at `path`, displacing whatever the view had there. The other half of
@@ -510,17 +509,21 @@ impl RemoteObservation {
 	}
 
 	/// Everything strictly under `path` leaves the view with it.
-	fn drop_subtree(&mut self, baseline: &Baseline, path: &str) {
-		let under = self.nodes.subtree_paths(baseline, path);
-		for key in under {
+	fn drop_subtree(&mut self, baseline: &Baseline, path: &str) -> Result<(), FullPassReason> {
+		for key in self.subtree(baseline, path)? {
 			self.detach(baseline, &key);
 		}
+		Ok(())
 	}
 
 	/// Re-key everything the cache still lists under `from` to sit under `to`.
-	fn rekey_subtree(&mut self, baseline: &Baseline, from: &str, to: &str) {
-		let under = self.nodes.subtree_paths(baseline, from);
-		for key in under {
+	fn rekey_subtree(
+		&mut self,
+		baseline: &Baseline,
+		from: &str,
+		to: &str,
+	) -> Result<(), FullPassReason> {
+		for key in self.subtree(baseline, from)? {
 			let Some(mut node) = self.detach(baseline, &key) else {
 				continue;
 			};
@@ -530,6 +533,19 @@ impl RemoteObservation {
 			node.rel_path = moved.clone();
 			self.insert(moved, node);
 		}
+		Ok(())
+	}
+
+	/// Every path the view holds strictly under `path` — the one listing of a subtree this module
+	/// makes. A directory with more than [`SUBTREE_CAP`] rows under it is not listed: re-keying or
+	/// dropping it would leave a node or a tombstone at every one of those paths, so the pass reads
+	/// the remote whole instead. Counted before anything is listed, so such a subtree is never read
+	/// into memory to find that out.
+	fn subtree(&self, baseline: &Baseline, path: &str) -> Result<Vec<String>, FullPassReason> {
+		if past_cap(baseline.count_subtree(path), SUBTREE_CAP) {
+			return Err(FullPassReason::RemoteOverflow);
+		}
+		Ok(self.nodes.subtree_paths(baseline, path))
 	}
 
 	/// Record a path the delta acted on — and, where it is a rule file, the directory whose rules
@@ -616,8 +632,11 @@ mod tests {
 
 	use uuid::Uuid;
 
+	use filen_types::crypto::Blake3Hash;
+
 	use super::*;
 	use crate::{
+		alloc_meter,
 		cache::{CacheEvent, CacheEventType, DirEvent, FileEvent},
 		fs::file::{cache::CacheableFile, meta::DecryptedFileMeta},
 		sync_engine::{
@@ -1056,6 +1075,119 @@ mod tests {
 			"top/d/a.txt"
 		);
 		assert_eq!(listed(&out.touched), vec!["d", "top/d"]);
+	}
+
+	/// A directory moved or trashed with more rows under it than a change-scoped pass expands one
+	/// change into is a whole read: the view would otherwise hold a node or a tombstone at every one
+	/// of those paths. At the cap it is still derived, path by path; one row past it, it is not.
+	#[test]
+	fn a_directory_changed_with_more_rows_under_it_than_the_cap_is_a_whole_read() {
+		let top = Uuid::from_u128(1_001);
+		let dir = Uuid::from_u128(1_002);
+		let tree = |files: usize| {
+			derived(
+				[dir_node("top", top), dir_node("d", dir)]
+					.into_iter()
+					.chain((0..files).map(|n| {
+						file_node(
+							&format!("d/{n:05}.txt"),
+							Uuid::from_u128(10_000 + n as u128),
+						)
+					})),
+			)
+		};
+		let moved = || {
+			cache_event(
+				Some(1),
+				CacheEventType::Dir(DirEvent::Move(cacheable_dir(dir, top, "d"))),
+			)
+		};
+		let trashed = || cache_event(Some(1), CacheEventType::Dir(DirEvent::Removed(dir)));
+		// The directory and every file, at both ends of the move; the directory and every file,
+		// where it was trashed.
+		for (label, event, changed_at_cap) in [
+			("moved", moved(), 2 * SUBTREE_CAP + 2),
+			("trashed", trashed(), SUBTREE_CAP + 1),
+		] {
+			let (baseline, nodes) = tree(SUBTREE_CAP);
+			let events = [event];
+			let out = applied(observed_with(
+				&baseline,
+				nodes,
+				&delta(&events),
+				&[],
+				&mut no_ancestry(),
+			));
+			assert_eq!(out.changed.len(), changed_at_cap, "{label}");
+
+			let (baseline, nodes) = tree(SUBTREE_CAP + 1);
+			match observed_with(&baseline, nodes, &delta(&events), &[], &mut no_ancestry()) {
+				RemoteObserved::Full(reason) => {
+					assert_eq!(reason, FullPassReason::RemoteOverflow, "{label}");
+				}
+				RemoteObserved::Applied(out) => panic!(
+					"{label}: a subtree past the cap was derived path by path ({} path(s) changed)",
+					out.changed.len()
+				),
+			}
+		}
+	}
+
+	/// A directory that cannot be placed is refused for the subtree it carries, and that subtree is
+	/// all that is listed to find out: a carried side answers it off the rows under the directory,
+	/// where listing every path the side holds builds a node for every row of the pair.
+	#[test]
+	fn an_unplaceable_directory_lists_only_its_own_subtree() {
+		const ROWS: u128 = 50_000;
+		let dir = Uuid::from_u128(2_001);
+		let taken = Uuid::from_u128(2_002);
+		let synced_dir = |path: &str, uuid: Uuid| row(path, NodeKind::Dir, Some(uuid));
+		let synced_file = BaselineEntry {
+			content_hash: Some(Blake3Hash::from([7; 32])),
+			size: Some(7),
+			local_mtime: Some(1_234),
+			remote_modified: Some(1_234),
+			..row("taken", NodeKind::File, Some(taken))
+		};
+		let baseline = Baseline::from_rows(
+			[
+				synced_dir("d", dir),
+				synced_dir("d/s", Uuid::from_u128(2_003)),
+				synced_file,
+			]
+			.into_iter()
+			.chain(
+				(0..ROWS).map(|n| synced_dir(&format!("w/{n:05}"), Uuid::from_u128(100_000 + n))),
+			),
+		);
+		let entries = vec![RemoteDeltaEntry {
+			id: Some(1),
+			change: RemoteChange::Renamed {
+				uuid: dir,
+				name: "taken".to_owned(),
+				content: None,
+			},
+		}];
+
+		let (observed, peak) = alloc_meter::peak_bytes(|| {
+			observed_with(
+				&baseline,
+				Side::carried(),
+				&entries,
+				&[],
+				&mut no_ancestry(),
+			)
+		});
+		match observed {
+			RemoteObserved::Full(reason) => assert_eq!(reason, FullPassReason::RemoteUnplaceable),
+			RemoteObserved::Applied(out) => {
+				panic!("a subtree was dropped instead: {:?}", out.nodes)
+			}
+		}
+		assert!(
+			peak < 1 << 20,
+			"refusing one directory of one subdirectory peaked at {peak} bytes over a {ROWS}-row pair"
+		);
 	}
 
 	/// A rule file's CONTENTS decide what is hidden for its whole directory, so a change to one

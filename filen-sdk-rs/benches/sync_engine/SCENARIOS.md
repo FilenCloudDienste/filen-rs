@@ -147,12 +147,12 @@ misquoting these replace came from names that did not:
   file; a scoped pass that decides many paths asks about them in path order and
   reads them a page at a time, so the count follows how the paths cluster:
   `twoway_one_percent_100k` runs 745 statements for its 982 changed paths,
-  `twoway_top_dir_move_100k`, whose moved directory holds half the pair, 1,048.
+  `twoway_top_dir_move_100k`, whose moved directory holds 16,384 files, 396.
   A directory move's rows are bounded the way its edits are: each move scenario
   declares the rows its pass may read per file the move carries
   (`read_rows_per_carried_file`), set at the multiple it measured rounded up, so a
   pass that reads the moved subtree once more fails the run. It is 9 for
-  `twoway_top_dir_move_100k` (400,075 rows for 50,000 files, eight reads of the
+  `twoway_top_dir_move_100k` (131,116 rows for 16,384 files, eight reads of the
   moved subtree; one of them is the observation's read of the rows the renamed
   directory's files take their hashes from instead of opening them), and 20, 30
   and 37 for the leaf moves at 10k, 100k and 1M, set when they read 393, 582 and
@@ -242,8 +242,8 @@ measured.
 |---|---|
 | `twoway_idle_*` | The floor: what the machinery costs with an empty changelist. The number to beat for a watch wake that has nothing to do. |
 | `twoway_one_file_*` | One changed file — the case change-scoping exists for. Read against the yardstick: the ratio is the whole value of the design. |
-| `twoway_one_percent_*` | A realistic working session. The class that refused to collapse when others did, which is why the last round's headline was believable. |
-| `twoway_ten_percent_*` | Ten times the change, still under the changelist cap. Says whether scoped cost grows with the change or with the tree. |
+| `twoway_one_percent_*` | A realistic working session. The class that refused to collapse when others did, which is why the last round's headline was believable. At 1M its 10,130 files are past the changelist's absolute cap of 7,700 (`DIRTY_CAP`, sized so a change-scoped pass at both caps stays within 16 MiB), so that row reads both sides whole for `LocalOverflow`. |
+| `twoway_ten_percent_*` | Ten times the change. Says whether scoped cost grows with the change or with the tree at 10k, which stays under the changelist cap; at 100k its 9,826 files are past the absolute cap, so that row reads both sides whole for `LocalOverflow`, as `twoway_one_percent_1m` does. |
 | `twoway_one_percent_scattered_10k` | Same count of edits, maximally different locality — one per directory instead of clustered. Isolates locality from volume against the row above. Meaningful only because `prepare_bed` sorts the baseline rows into path order first: in `HashMap` order both rows drew the same random permutation and the pair measured nothing. |
 | `twoway_small_delete_10k` | Ten deletions: under the guard's floor, so they are PLANNED. The control for the mass delete below. |
 | `twoway_mass_delete_10k` | Sixty per cent deleted. Past the guard's limit (half the tracked set) — and past the changelist cap (a quarter) on the way, which is why a guard-tripping delete is necessarily a WHOLE pass on a watched pair. Asserts `actions: 0` AND `held: one per deleted file`, so "the guard held everything" cannot read as "the pass did nothing". |
@@ -304,16 +304,18 @@ The three headline classes at 1k, 10k, 100k and 1M, plus the two passes that edi
 their own view of the baseline — `twoway_dir_move_*` and `twoway_after_upload_*`
 — at 100k and 1M.
 
-`twoway_top_dir_move_100k` renames a directory holding HALF the pair: its own shape,
-two top-level directories of 50k files each (50000/1/73 ASCII), one of them moved. It
-is what a folded move costs as the moved directory grows. The memory child bounds the
-pass's baseline edits by what it edited (one move, one confirmation: a fixed number of
-bytes each), so a fold that wrote the rows it carries fails there rather than printing
+`twoway_top_dir_move_100k` renames the largest directory a change-scoped pass folds:
+its own shape, seven top-level directories of 16,384 files each (16384/1/73 ASCII), one
+of them moved. One file more and the pass reads both sides whole (`SUBTREE_CAP`), so it
+is what a folded move costs at the most it is allowed to carry. Until that cap it held
+half the pair (50000/1/73), and its figures before the cap are not comparable. The
+memory child bounds the pass's baseline edits by what it edited (one move, one
+confirmation: a fixed number of bytes each), so a fold that wrote the rows it carries fails there rather than printing
 a large widest point, and it bounds the rows the pass reads by the files the move carries
 (`read_rows_per_carried_file`, under `walk:` above), so a pass that reads the moved
-subtree once more fails there too. Its local observation of the 50k files it finds at the
-new path is per-pass data and still scales with the move — that is the scan, not the
-baseline — and so does the observation's one read of the 50k rows those files left, whose
+subtree once more fails there too. Its local observation of the 16,384 files it finds at
+the new path is per-pass data and still scales with the move — that is the scan, not the
+baseline — and so does the observation's one read of the rows those files left, whose
 kinds, sizes, mtimes and hashes it keeps by path while it walks, so that a file whose
 size and mtime its row still records takes the row's hash instead of being opened.
 

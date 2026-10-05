@@ -322,12 +322,14 @@ mod tests {
 
 	use super::*;
 	use crate::{
+		alloc_meter,
 		cache::{CacheEvent, CacheEventType, FileEvent, RemoteItem},
+		io::FilenMetaExt,
 		sync_engine::{
 			SyncMode,
 			baseline::BaselineState,
 			changes::{
-				PairChanges, RemoteDeltaEntry,
+				DIRTY_CAP, PairChanges, RemoteChange, RemoteDeltaEntry, SUBTREE_CAP,
 				tests::{cache_event, cacheable_file},
 			},
 			engine::assembly_bounds,
@@ -506,39 +508,50 @@ mod tests {
 			dirty: BTreeSet<String>,
 			delta: &[RemoteDeltaEntry],
 		) -> Derived {
-			let mut derived = from_baseline(baseline, dirty);
-			let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
-				panic!("no ancestry read was expected, but one was made for {uuid}")
-			};
-			let placed = baseline.synced_paths(&delta_uuids(delta), &[]);
-			let mut observed = match observe_remote(
-				REMOTE_ROOT,
-				baseline,
-				std::mem::take(&mut derived.remote),
-				delta,
-				placed,
-				&mut ancestry,
-			) {
-				RemoteObserved::Applied(observation) => *observation,
-				RemoteObserved::Full(reason) => panic!("expected a derived view: {reason}"),
-			};
-			derived.remote = observed.nodes;
-			derived.held.extend(observed.held_paths);
-			derived.dirty.extend(observed.touched);
-			// The exact keys the delta moved, as `prepare_scoped` records them: what the pass
-			// DECIDES, where `dirty` says where to look.
-			derived.decided.append(&mut observed.changed);
-			let (mut local, _) = observe_local(
-				&self.root,
-				baseline,
-				IgnoreRules::default(),
-				&RuleFiles::Read,
-				&derived.dirty,
-			);
-			assert!(local.complete, "{:?}", local.errors);
-			merge_local(&mut derived, baseline, &mut local);
-			derived
+			assembled(&self.root, baseline, dirty, delta)
 		}
+	}
+
+	/// [`Pair::derived`] over any tree on disk at `root`.
+	fn assembled(
+		root: &Path,
+		baseline: &Baseline,
+		dirty: BTreeSet<String>,
+		delta: &[RemoteDeltaEntry],
+	) -> Derived {
+		let mut derived = from_baseline(baseline, dirty);
+		let mut ancestry = |uuid: Uuid| -> rusqlite::Result<Vec<RemoteItem>> {
+			panic!("no ancestry read was expected, but one was made for {uuid}")
+		};
+		let placed = baseline.synced_paths(&delta_uuids(delta), &[]);
+		let mut observed = match observe_remote(
+			REMOTE_ROOT,
+			baseline,
+			std::mem::take(&mut derived.remote),
+			delta,
+			placed,
+			&mut ancestry,
+		) {
+			RemoteObserved::Applied(observation) => *observation,
+			RemoteObserved::Full(reason) => panic!("expected a derived view: {reason}"),
+		};
+		derived.remote = observed.nodes;
+		derived.held.extend(observed.held_paths);
+		derived.dirty.extend(observed.touched);
+		// The exact keys the delta moved, as `prepare_scoped` records them: what the pass
+		// DECIDES, where `dirty` says where to look.
+		derived.decided.append(&mut observed.changed);
+		let (mut local, _) = observe_local(
+			root,
+			baseline,
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			&derived.dirty,
+		)
+		.expect("a dirty set the caps narrow a pass to");
+		assert!(local.complete, "{:?}", local.errors);
+		merge_local(&mut derived, baseline, &mut local);
+		derived
 	}
 
 	impl Drop for Pair {
@@ -1148,7 +1161,8 @@ mod tests {
 			IgnoreRules::default(),
 			&RuleFiles::Read,
 			&derived.dirty,
-		);
+		)
+		.unwrap();
 		assert!(
 			matches!(observed.observed["docs/deep"], LocalObservation::Hidden(_)),
 			"the rule has to be what the observation reports: {:?}",
@@ -1223,7 +1237,8 @@ mod tests {
 			IgnoreRules::default(),
 			&RuleFiles::Read,
 			&derived.dirty,
-		);
+		)
+		.unwrap();
 		fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 		assert!(!observed.complete, "the walk could not read a subtree");
 		merge_local(&mut derived, &baseline, &mut observed);
@@ -1396,6 +1411,7 @@ mod tests {
 				&RuleFiles::Read,
 				&dirty,
 			)
+			.unwrap()
 			.0
 		};
 		let (mut merged, untouched) = (observe(), observe());
@@ -1435,5 +1451,169 @@ mod tests {
 			"the merged map ({} node(s)) is outside {bounds:?}",
 			local.len()
 		);
+	}
+
+	/// A change-scoped pass as `prepare_scoped` and the plan run it, on this thread: assembled from
+	/// the changelists `lists` builds, its directory moves folded, and reconciled at the set it
+	/// decided. Hands back how many actions it planned and the most bytes it held at once — the
+	/// changelists it took included, since they are built inside.
+	fn scoped_pass_peak(
+		root: &Path,
+		baseline: &Baseline,
+		lists: impl FnOnce() -> (BTreeSet<String>, Vec<RemoteDeltaEntry>),
+	) -> (usize, u64) {
+		alloc_meter::peak_bytes(|| {
+			let (dirty, delta) = lists();
+			let mut derived = assembled(root, baseline, dirty, &delta);
+			let mut rows = baseline.clone();
+			let mut planned = plan::fold_dir_moves(
+				SyncMode::TwoWay,
+				&mut rows,
+				&mut derived.local,
+				&mut derived.remote,
+				&derived.held,
+				Some(&mut derived.decided),
+			)
+			.expect("a pass within the caps folds its moves");
+			planned.extend(scoped_plan(&rows, &derived));
+			planned.len()
+		})
+	}
+
+	/// `entries` new local files on disk under `root` and as many new remote ones announced, and the
+	/// peak of the change-scoped pass that takes both lists full.
+	fn both_lists_full(entries: usize) -> (usize, u64) {
+		let root = temp_root();
+		let local: Vec<String> = (0..entries).map(|n| format!("l{n:05}.txt")).collect();
+		for path in &local {
+			fs::write(root.join(path), b"x").unwrap();
+		}
+		let measured = scoped_pass_peak(&root, &Baseline::default(), || {
+			let delta = (0..entries)
+				.map(|n| {
+					let uuid = Uuid::from_u128(10_000 + n as u128);
+					RemoteDeltaEntry {
+						id: None,
+						change: RemoteChange::Upsert(RemoteItem {
+							uuid,
+							parent: REMOTE_ROOT,
+							name: format!("r{n:05}.txt"),
+							stable_uuid: Some(StableUuid::new_for_test(uuid)),
+							hash: Some(Blake3Hash::from([5; 32])),
+							size: 1,
+							modified_millis: 1_234,
+						}),
+					}
+				})
+				.collect();
+			(local.iter().cloned().collect(), delta)
+		});
+		fs::remove_dir_all(&root).ok();
+		measured
+	}
+
+	/// A change-scoped pass at both changelists' caps — as many new local files as the local list
+	/// holds and as many new remote ones as the remote list holds, each of them planned — fits in
+	/// 16 MiB, its changelists included. This is what sizes [`DIRTY_CAP`]: 7,700 entries a list
+	/// peak at 15.90 MiB here, 7,800 at 16.02.
+	#[test]
+	fn a_scoped_pass_at_both_changelist_caps_peaks_under_16_mib() {
+		let (planned, peak) = both_lists_full(DIRTY_CAP);
+		assert_eq!(
+			planned,
+			2 * DIRTY_CAP,
+			"an upload per local file and a download per remote one"
+		);
+		assert!(
+			peak <= 16 << 20,
+			"the pass peaked at {peak} bytes at the changelists' cap of {DIRTY_CAP}"
+		);
+	}
+
+	/// A change-scoped pass over one directory holding as many files as a pass expands one change
+	/// into, renamed on the remote and still under its old name on disk: the view re-keys every row,
+	/// the walk lists every file, and the fold carries them across as one move. The heaviest shape
+	/// one change at [`SUBTREE_CAP`] takes, and it peaks at 16.66 MiB — past the 16 MiB the
+	/// changelists' cap is sized to, by a hash table doubling between 14,000 files (10.81 MiB) and
+	/// 14,336, and bounded here at 17 MiB.
+	#[test]
+	fn a_scoped_pass_at_the_subtree_cap_peaks_under_17_mib() {
+		let (planned, peak) = renamed_dir_peak(SUBTREE_CAP);
+		assert_eq!(planned, 1, "the rename, carried across as one move");
+		assert!(
+			peak <= 17 << 20,
+			"the pass peaked at {peak} bytes over a directory of {SUBTREE_CAP} files"
+		);
+	}
+
+	/// `files` files under `d`, synced and still there on disk, with the remote renaming `d` to `e`;
+	/// and the peak of the change-scoped pass that takes the rename.
+	fn renamed_dir_peak(files: usize) -> (usize, u64) {
+		let root = temp_root();
+		let dir = Uuid::from_u128(2);
+		fs::create_dir(root.join("d")).unwrap();
+		let dir_local = LocalNode {
+			rel_path: "d".to_owned(),
+			kind: NodeKind::Dir,
+			size: 0,
+			mtime_millis: 99,
+			content_hash: None,
+		};
+		let dir_remote = RemoteNode {
+			rel_path: "d".to_owned(),
+			kind: NodeKind::Dir,
+			remote_uuid: dir,
+			stable_uuid: None,
+			content_hash: None,
+			size: 0,
+			modified_millis: 99,
+		};
+		let mut rows = vec![synced_row(&dir_local, &dir_remote)];
+		for n in 0..files {
+			let rel_path = format!("d/{n:05}");
+			let file = root.join(&rel_path);
+			fs::write(&file, b"x").unwrap();
+			let mtime_millis =
+				FilenMetaExt::modified(&fs::metadata(&file).unwrap()).timestamp_millis();
+			let uuid = Uuid::from_u128(10_000 + n as u128);
+			let hash = Blake3Hash::from([6; 32]);
+			let local = LocalNode {
+				rel_path: rel_path.clone(),
+				kind: NodeKind::File,
+				size: 1,
+				mtime_millis,
+				content_hash: Some(hash),
+			};
+			let remote = RemoteNode {
+				rel_path,
+				kind: NodeKind::File,
+				remote_uuid: uuid,
+				stable_uuid: Some(StableUuid::new_for_test(uuid)),
+				content_hash: Some(hash),
+				size: 1,
+				modified_millis: mtime_millis,
+			};
+			rows.push(synced_row(&local, &remote));
+		}
+		let baseline = Baseline::from_rows(rows);
+
+		let (planned, peak) = scoped_pass_peak(&root, &baseline, || {
+			let renamed = RemoteDeltaEntry {
+				id: None,
+				change: RemoteChange::Upsert(RemoteItem {
+					uuid: dir,
+					parent: REMOTE_ROOT,
+					name: "e".to_owned(),
+					stable_uuid: None,
+					hash: None,
+					size: 0,
+					modified_millis: 99,
+				}),
+			};
+			(BTreeSet::new(), vec![renamed])
+		});
+
+		fs::remove_dir_all(&root).ok();
+		(planned, peak)
 	}
 }

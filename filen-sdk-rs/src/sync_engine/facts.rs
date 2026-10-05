@@ -386,6 +386,7 @@ mod tests {
 			&RuleFiles::Read,
 			&dirty,
 		)
+		.unwrap()
 		.0
 	}
 

@@ -2069,7 +2069,10 @@ impl Prepared {
 	///
 	/// The fold re-keys the paths a scoped pass decides itself, move by move as it folds them; what
 	/// is replayed here is everything else this pass keys by path.
-	fn fold_dir_moves(&mut self) {
+	///
+	/// `Err` only on a change-scoped pass, for a move over more rows than it narrows itself to (see
+	/// [`plan::fold_dir_moves`]): the pass then reads both sides whole instead.
+	fn fold_dir_moves(&mut self) -> Result<(), FullPassReason> {
 		let decided = match &mut self.read {
 			PassRead::Scoped(decided) => Some(decided),
 			PassRead::Whole(_) => None,
@@ -2081,7 +2084,7 @@ impl Prepared {
 			&mut self.remote_view.nodes,
 			&self.holds.held_remote,
 			decided,
-		);
+		)?;
 		// What this pass blocks and reports is keyed by path too, and has to follow the fold, or a
 		// block stays behind at a path nothing is keyed by any more while its item reads as absent at
 		// the new one: a remote item the view cannot place would have its local copy quarantined.
@@ -2120,6 +2123,7 @@ impl Prepared {
 				}
 			}
 		}
+		Ok(())
 	}
 
 	/// The plan's `actions`, each with what the apply reads for it, staged in `stage` in the order
@@ -3858,7 +3862,7 @@ impl SyncEngine {
 		let for_local = inputs.baseline.clone();
 		let dirty = mem::take(&mut derived.dirty);
 		let pass_rules = remote_rules.rules;
-		let (mut observations, rules) = tokio::task::spawn_blocking(move || {
+		let observed = tokio::task::spawn_blocking(move || {
 			observe::observe_local(&local_root, &for_local, pass_rules, &rule_files, &dirty)
 		})
 		.await
@@ -3868,6 +3872,11 @@ impl SyncEngine {
 				format!("re-observing the local paths panicked: {e}"),
 			)
 		})?;
+		// A dirty path with a subtree too large to narrow this pass to.
+		let (mut observations, rules) = match observed {
+			Ok(observed) => observed,
+			Err(reason) => return Ok(Scoped::Whole(Box::new(inputs), reason)),
+		};
 		super::step("observe_local");
 		// Plan 3.6's self-check, bounded before the merge empties the walks it counts and checked
 		// before anything plans against these maps.
@@ -4135,7 +4144,15 @@ impl SyncEngine {
 			confirmed,
 		};
 		super::step("local_scan_assembly");
-		prepared.fold_dir_moves();
+		if let Err(reason) = prepared.fold_dir_moves() {
+			// The fold may already have moved rows in this pass's view of them, so the whole read
+			// starts from the store's own — once this pass's maps and snapshot are let go.
+			drop(prepared);
+			return Ok(Scoped::Whole(
+				Box::new(self.pass_inputs(pair).await?),
+				reason,
+			));
+		}
 		super::step("fold_dir_moves");
 		Ok(Scoped::Prepared(Box::new(prepared)))
 	}
@@ -4370,7 +4387,10 @@ impl SyncEngine {
 		};
 		// AFTER the pending-write fold: a move of ours the cache has not shown yet must read as done,
 		// not as the remote moving the directory back.
-		prepared.fold_dir_moves();
+		prepared.fold_dir_moves().expect(
+			"a whole read's sides derive nothing from the rows, so no move asks one to stay put \
+			 (should be impossible)",
+		);
 		Ok(prepared)
 	}
 
@@ -6244,6 +6264,20 @@ mod tests {
 			None,
 			"a pass that ran to the end leaves the next one to its changelists"
 		);
+		for reason in [
+			FullPassReason::LocalOverflow,
+			FullPassReason::RemoteOverflow,
+		] {
+			assert_eq!(
+				next_pass_scope(&SyncReport {
+					full_pass: Some(reason),
+					..SyncReport::default()
+				}),
+				None,
+				"{reason:?}: a pass that read whole for a change too large to narrow it to read \
+				 everything that change named, so the next one narrows again"
+			);
+		}
 		assert_eq!(
 			next_pass_scope(&SyncReport {
 				dropped_actions: 1,
@@ -6544,7 +6578,7 @@ mod tests {
 
 	/// Fold and screen `prep` as a pass does.
 	fn run_prepared(mut prep: Prepared) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
-		prep.fold_dir_moves();
+		prep.fold_dir_moves().unwrap();
 		let screened = reconcile_and_screen(&prep, screen_state(&prep));
 		let mut actions = screened.decision.safe;
 		actions.extend(screened.decision.held);
@@ -8409,7 +8443,7 @@ mod tests {
 		prep.facts
 			.ignore_blocked
 			.insert("docs/unreadable".to_string());
-		prep.fold_dir_moves();
+		prep.fold_dir_moves().unwrap();
 		assert_eq!(
 			prep.dir_moves,
 			vec![SyncAction::MoveLocal {
@@ -8448,7 +8482,7 @@ mod tests {
 		prep.facts
 			.ignore_blocked
 			.insert("docs/unreadable".to_string());
-		prep.fold_dir_moves();
+		prep.fold_dir_moves().unwrap();
 		assert!(
 			matches!(&prep.dir_moves[..], [SyncAction::MoveRemote { to_path, .. }] if to_path == "documents"),
 			"{:?}",

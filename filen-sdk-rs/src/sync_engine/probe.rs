@@ -1010,7 +1010,8 @@ fn pass_pure(
 		&mut remote,
 		&held,
 		None,
-	);
+	)
+	.expect("whole sides derive nothing from the rows, so their fold refuses nothing");
 	let planned = plan::reconcile(
 		SyncMode::TwoWay,
 		&baseline,
@@ -1278,7 +1279,8 @@ fn prepare_scoped(
 		remote_rules.rules,
 		&rule_files,
 		&dirty,
-	);
+	)
+	.expect("the probe's dirty paths are files, which no subtree cap reaches");
 	costs.push(
 		"observe_local",
 		mark.elapsed(),
@@ -1433,7 +1435,8 @@ fn prepare_scoped(
 		&mut remote,
 		&held,
 		Some(&mut decided),
-	);
+	)
+	.expect("the probe's change-scoped pass moves no directory, so its fold has nothing to refuse");
 	costs.push(
 		"dir_move_fold",
 		mark.elapsed(),
@@ -2083,6 +2086,7 @@ pub fn run() -> String {
 			&held,
 			None,
 		)
+		.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
 	});
 	probe.record(
 		"fold_dir_moves_zero",
@@ -2110,6 +2114,7 @@ pub fn run() -> String {
 			&held,
 			Some(&mut idle_scope),
 		)
+		.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
 	});
 	probe.record(
 		"fold_dir_moves_scoped_zero",
@@ -2151,6 +2156,7 @@ pub fn run() -> String {
 				&held,
 				scope.as_mut(),
 			)
+			.expect("whole sides derive nothing from the rows, so their fold refuses nothing")
 		});
 		assert_eq!(
 			dir_moves.len(),
@@ -2485,6 +2491,9 @@ pub fn run() -> String {
 	// of the files edited on disk and named in its dirty set.
 	// `scoped_twoway_one_file_changed` above is the same machinery at its floor and `pass_pure`
 	// the whole-read yardstick — same fixture, same run, so the three numbers are comparable.
+	// The set is built here, not by a changelist, so `changes::DIRTY_CAP` does not collapse it:
+	// past 770,000 files (10,130 paths at 1M) the engine reads such a pass whole, and this row
+	// times a narrowed pass it no longer runs, kept so the row stays comparable with older runs.
 	let percent_changed: Vec<String> = store
 		.entries(pair)
 		.expect("reading the baseline")
