@@ -31,6 +31,7 @@ impl ServiceWorkerClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl ServiceWorkerClient {
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "downloadFileToWriter")]

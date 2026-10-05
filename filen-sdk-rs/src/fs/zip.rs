@@ -798,6 +798,7 @@ mod js_client_impl {
 		js::{AnyItemWithContext, ManagedFuture, spawn_buffered_write_future},
 	};
 
+	#[filen_macros::js_exports]
 	#[wasm_bindgen(js_class = "Client")]
 	impl JsClient {
 		#[wasm_bindgen(js_name = "downloadItemsToZip")]
@@ -882,6 +883,7 @@ mod service_worker_impl {
 		js::{AnyItemWithContext, ManagedFuture, ServiceWorkerClient, spawn_buffered_write_future},
 	};
 
+	#[filen_macros::js_exports]
 	#[wasm_bindgen(js_class = "Client")]
 	impl ServiceWorkerClient {
 		#[wasm_bindgen(js_name = "downloadItemsToZip")]
@@ -1028,6 +1030,7 @@ mod unauth_js_client_impl {
 		}
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
 	impl UnauthJsClient {

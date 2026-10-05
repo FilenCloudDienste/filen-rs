@@ -1625,6 +1625,7 @@ mod js_impls {
 		.await
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -1648,6 +1649,7 @@ mod js_impls {
 		}
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
@@ -2087,6 +2089,7 @@ mod js_impls {
 			.await
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 	impl JsClient {
@@ -2133,6 +2136,7 @@ mod js_impls {
 		}
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	#[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
 	impl UnauthJsClient {

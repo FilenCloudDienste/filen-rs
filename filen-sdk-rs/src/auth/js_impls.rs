@@ -66,6 +66,7 @@ pub fn set_log_level(level: crate::auth::http::LogLevel) {
 	crate::obs::set_log_level(level);
 }
 
+#[filen_macros::js_exports]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen(js_class = "Client")
@@ -283,6 +284,7 @@ impl UnauthJsClient {
 #[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
 impl UnauthClient {}
 
+#[filen_macros::js_exports]
 #[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(

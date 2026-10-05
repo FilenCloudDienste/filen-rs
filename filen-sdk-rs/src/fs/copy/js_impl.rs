@@ -619,6 +619,7 @@ mod wasm_impl {
 			.map(CopyReport::new)
 	}
 
+	#[filen_macros::js_exports]
 	#[wasm_bindgen(js_class = "Client")]
 	impl JsClient {
 		/// Copies `items` into `destination`. There is no server-side copy: every file is

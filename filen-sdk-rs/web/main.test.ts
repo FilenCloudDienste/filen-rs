@@ -326,6 +326,22 @@ test("Directory", async () => {
 	await state.deleteDirPermanently(dir)
 })
 
+test("an async call whose params do not parse rejects with Conversion, and the client keeps working", { timeout: cap(15_000) }, async () => {
+	const calls: [string, () => Promise<unknown>][] = [
+		["a params struct", () => state.listArchive({} as any)],
+		["a uuid", () => state.getDir("not a uuid")],
+		["a list", () => state.createChat([1] as any)],
+		["a list of strings", () => state.addEventListener(() => {}, [1] as any)],
+		["an optional param", () => state.listOutShared(1 as any)]
+	]
+	for (const [param, call] of calls) {
+		const error = await call().catch((e: unknown) => e)
+		expect(error, param).toBeInstanceOf(FilenSdkError)
+		expect((error as FilenSdkError).kind, param).toBe("Conversion")
+	}
+	expect((await state.getDir(testDir.uuid)).uuid).toBe(testDir.uuid)
+})
+
 test("File", async () => {
 	const created = BigInt(new Date().getTime())
 	const before = BigInt(new Date().getTime())

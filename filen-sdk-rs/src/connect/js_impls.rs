@@ -305,6 +305,7 @@ impl JsClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {
@@ -397,6 +398,7 @@ impl JsClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
@@ -1047,6 +1049,7 @@ where
 	list_linked_dir_recursive_inner_generic(client, dir, link, callback).await
 }
 
+#[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {
@@ -1077,6 +1080,7 @@ impl JsClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")]
 impl UnauthJsClient {
@@ -1124,6 +1128,7 @@ impl From<crate::connect::DirPublicInfo> for DirPublicInfo {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",
@@ -1162,6 +1167,7 @@ impl JsClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	feature = "wasm-full",

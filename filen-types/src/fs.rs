@@ -253,24 +253,16 @@ mod uuid {
 			// throw_str instead of panicking: a panic traps and poisons the
 			// whole wasm instance, so every subsequent call would fail.
 			//
-			// This does NOT make the error catchable by the JS caller: every
-			// exported fn taking UuidStr by value in this workspace is async,
-			// and wasm-bindgen-futures runs argument conversion inside
-			// future_to_promise on the first poll, so the throw surfaces as an
-			// uncaught microtask error and the returned Promise never settles
-			// (caller try/catch does not fire). That is parity with the old
-			// trap's error surface — the gain is that the instance stays
-			// usable.
+			// An async export never converts a UuidStr here: #[js_exports] has it
+			// take the uuid as a JS string and parse it inside the call (JsParam in
+			// filen-sdk-rs), so a malformed one rejects the call with Conversion.
+			// Only a sync export taking a UuidStr would reach this throw, which
+			// its caller sees as an exception; none takes one today.
 			//
-			// Deliberate trade-off: wasm-bindgen documents that destructors
-			// are skipped at the throw, so each hostile call leaks the
-			// receiver RcRef anchor (leaving the exported class
-			// un-free()-able), the Box<str> anchor `s`, and the message
-			// String — bounded per call, identical to the old trap path.
-			//
-			// The complete fix is a fallible boundary (accept String and
-			// parse inside the fn, returning Result); that requires exported
-			// signature changes and is deferred as a follow-up.
+			// wasm-bindgen documents that destructors are skipped at the throw,
+			// so each such call leaks the receiver RcRef anchor (leaving the
+			// exported class un-free()-able), the Box<str> anchor `s`, and the
+			// message String, bounded per call.
 			UuidStr::from_str(&s)
 				.unwrap_or_else(|_| throw_str(&format!("invalid UUID string passed from JS: {s}")))
 		}

@@ -284,6 +284,7 @@ async fn run_extract(
 		.map(ExtractReport::new)
 }
 
+#[filen_macros::js_exports]
 #[wasm_bindgen(js_class = "Client")]
 impl JsClient {
 	/// Extracts an archive (zip, 7z, tar and its compressed forms, or one compressed file)

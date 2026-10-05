@@ -313,6 +313,7 @@ impl CacheSearch {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen]
 impl CacheSearch {
@@ -455,6 +456,7 @@ impl JsClient {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 #[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
 impl JsClient {

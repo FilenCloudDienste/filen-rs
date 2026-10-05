@@ -977,6 +977,7 @@ pub mod js_impls {
 
 	use super::{Chat, ChatMessage, ChatMessagePartial};
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")

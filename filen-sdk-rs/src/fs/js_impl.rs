@@ -8,6 +8,7 @@ use crate::{
 	runtime::do_on_commander,
 };
 
+#[filen_macros::js_exports]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")

@@ -371,6 +371,7 @@ mod js_impl {
 		timestamp.and_then(DateTime::<Utc>::from_timestamp_millis)
 	}
 
+	#[filen_macros::js_exports]
 	#[cfg_attr(
 		feature = "wasm-full",
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")

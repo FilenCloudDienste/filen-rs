@@ -158,6 +158,7 @@ mod js_impl {
 	// `js_class = "Client"` is load-bearing: `JsClient` is exported under the JS name
 	// "Client" (auth/js_impls.rs), and without the matching js_class this block's methods
 	// land on a separate, unconstructible "JsClient" class — unreachable from JS.
+	#[filen_macros::js_exports]
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")
