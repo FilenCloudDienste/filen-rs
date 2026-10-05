@@ -2123,7 +2123,8 @@ impl Prepared {
 	}
 
 	/// The plan's `actions`, each with what the apply reads for it, staged in `stage` in the order
-	/// the apply runs them (see [`PlannedEntry::stage`]).
+	/// the apply runs them, with the deletions each directory deletion carries (`subsumed`, see
+	/// [`PlannedEntry::stage`]).
 	///
 	/// Takes the pass's rows and both its sides out of `self` to do it: the scan, the view and the
 	/// snapshot are dropped here, and the pass's read transaction with the snapshot. What is left
@@ -2135,6 +2136,7 @@ impl Prepared {
 	async fn stage_plan(
 		&mut self,
 		actions: Vec<SyncAction>,
+		subsumed: Subsumed,
 		stage: Stage,
 	) -> Result<StagedPlan, Error> {
 		let at = stage.path().display().to_string();
@@ -2144,7 +2146,7 @@ impl Prepared {
 			mem::replace(&mut self.remote_view.nodes, Side::carried()),
 		);
 		tokio::task::spawn_blocking(move || {
-			PlannedEntry::stage(actions, baseline, local, remote, stage)
+			PlannedEntry::stage(actions, subsumed, baseline, local, remote, stage)
 		})
 		.await
 		.map_err(|e| {
@@ -5603,7 +5605,9 @@ impl SyncEngine {
 		// the rest of the scan, the view and the rows goes — the rows' read transaction with them,
 		// before the first action commits, since holding it open would pin the WAL through every
 		// upload (see `Baseline::close`).
-		let plan = prep.stage_plan(decision.safe, self.stage(pair)?).await?;
+		let plan = prep
+			.stage_plan(decision.safe, subsumed, self.stage(pair)?)
+			.await?;
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
@@ -5619,7 +5623,6 @@ impl SyncEngine {
 			observed: &self.observed,
 			gate: &gate,
 			lock_budget: self.lock_budget,
-			subsumed: &subsumed,
 		};
 		apply::apply(ctx, plan, &mut report, observer).await;
 		self.note_path_outcomes(pair, ends, &mut report).await;
@@ -8942,7 +8945,10 @@ mod tests {
 		);
 		let actions: Vec<SyncAction> = files.iter().map(|file| upload(file)).collect();
 		let (_dir, stage) = Stage::in_temp_dir();
-		let plan = prep.stage_plan(actions, stage).await.unwrap();
+		let plan = prep
+			.stage_plan(actions, Subsumed::default(), stage)
+			.await
+			.unwrap();
 		assert_eq!(plan.pager().len(), 20_000);
 		let ((), net) = alloc_meter::net_bytes(|| drop(prep));
 		assert!(
@@ -9417,10 +9423,12 @@ mod tests {
 				.unwrap();
 			store
 				.record_pending(
-					pair,
-					uuid,
-					&created("a.txt", None),
-					Utc::now().timestamp_millis(),
+					&PendingRow {
+						pair,
+						uuid,
+						kind: created("a.txt", None),
+						recorded_at: Utc::now().timestamp_millis(),
+					},
 					&[BaselineChange::Upsert(&baseline["a.txt"])],
 					&[],
 				)
