@@ -4,8 +4,8 @@
 //! on, the full [`CacheableDir`]/[`CacheableFile`] payload read back by uuid
 //! ([`hydrate_by_uuids`], which shares the search engine's column contract).
 //!
-//! The read is STREAMED into a [`SnapshotSink`]: the engine places each row into its view as it
-//! arrives, so the whole subtree never exists as a second copy beside the view built from it.
+//! The read is STREAMED into a [`SnapshotSink`]: the engine copies each row into its pass's stage as
+//! it arrives, so the whole subtree never exists in memory beside the view built from it.
 //! [`read_subtree_snapshot`] collects the same rows into `Vec`s for the probe and the tests.
 //!
 //! Pairing the snapshot with its watermark is the point: the sync engine subscribes to the root's
@@ -131,9 +131,11 @@ fn slim_item(row: &Row<'_>) -> rusqlite::Result<(bool, RemoteItem)> {
 
 /// Where a streamed subtree read hands the rows it reads.
 ///
-/// A sink that PLACES each item as it arrives (`sync_engine::plan::ViewBuilder`) is what keeps a
-/// million-item subtree from existing twice at the widest point of a full pass: once as this
-/// read's `Vec`s, once as the structure built out of them.
+/// A sink that takes each item as it arrives — copied into a pass's stage
+/// (`sync_engine::stage::RemoteSink`), or placed into a view in memory
+/// (`sync_engine::plan::ViewBuilder`) — is what keeps a million-item subtree from existing twice at
+/// the widest point of a full pass: once as this read's `Vec`s, once as the structure built out of
+/// them.
 pub(crate) trait SnapshotSink {
 	/// Every undecodable record, handed over BEFORE the first item: which directories the cache
 	/// could not decode governs where anything under them can be placed, so a sink that places on

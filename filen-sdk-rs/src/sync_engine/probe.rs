@@ -58,7 +58,7 @@ use super::{
 	rows::Baseline,
 	scan::{self, LocalNode, LocalScan, RuleFiles},
 	side::{FromRow, Nodes, NodesAt, Side},
-	stage::Stage,
+	stage::{Paging, RemoteSink, Stage},
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -1000,11 +1000,14 @@ fn pass_pure(
 	rules: &IgnoreRules,
 ) -> PassFootprint {
 	let baseline = store.baseline(pair).expect("reading the baseline");
-	// Streamed into the view, as `prepare_whole` streams it: no `Vec` of the subtree in between.
-	let mut builder = plan::ViewBuilder::with_capacity(place.remote_root, baseline.len());
-	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut builder)
+	// Copied into a stage as it is read and placed there, as `prepare_whole` stages it.
+	let mut copied =
+		RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
+	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
 		.expect("streaming the cache snapshot");
-	let mut view = builder.finish();
+	let mut view = copied
+		.finish(place.remote_root)
+		.expect("placing the probe's staged snapshot");
 	// Into a stage, as `prepare_whole` walks a whole pass's tree.
 	let (scan, rules_used) = scan::scan_local_staged(
 		&place.root,
@@ -1616,10 +1619,10 @@ pub fn run() -> String {
 		"place_remote_items, the view before the rules",
 	);
 
-	// The same view, built the way a pass builds it: every row placed as it arrives, with no copy
-	// of the subtree in between. Comparable to `snapshot_sql_warm` + `view_place`, the two steps
-	// it replaces — and the assertion below is the equivalence, checked at this run's scale
-	// rather than only on the handful of items a unit test can spell out.
+	// The same view, built the way a pass built it before it staged it: every row placed in memory
+	// as it arrives, with no copy of the subtree in between. Comparable to `snapshot_sql_warm` +
+	// `view_place`, the two steps it replaces — and the assertion below is the equivalence, checked
+	// at this run's scale rather than only on the handful of items a unit test can spell out.
 	let before_stream = current_rss_bytes();
 	let ((streamed, streamed_watermark), streamed_time) = timed(|| {
 		let mut builder = plan::ViewBuilder::with_capacity(fixture.remote_root, nodes);
@@ -1650,6 +1653,57 @@ pub fn run() -> String {
 	);
 	drop(streamed);
 
+	// The view a whole pass reads: the snapshot copied into the pass's stage as it is read, then
+	// placed there. Comparable to `view_stream`, which it replaces, and held to the view the
+	// slices build, node for node, at this run's scale.
+	let before_staged = current_rss_bytes();
+	let (copied, copy_time) = timed(|| {
+		let mut copied =
+			RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
+		bench_support::snapshot_into(&fixture.cache_db, fixture.remote_root, &mut copied)
+			.expect("copying the snapshot into the stage");
+		copied
+	});
+	probe.record(
+		"view_stage_copy",
+		nodes,
+		copy_time,
+		"the snapshot read, each row copied into the pass's stage as it arrives",
+	);
+	let (mut staged, place_time) = timed(|| {
+		copied
+			.finish(fixture.remote_root)
+			.expect("placing the staged snapshot")
+	});
+	let holding_staged = current_rss_bytes();
+	assert_eq!(
+		staged.nodes.whole().len(),
+		view.nodes.whole().len(),
+		"the staged view holds as many nodes as the view the slices build"
+	);
+	for (path, node) in staged.nodes.whole().iter() {
+		assert_eq!(
+			view.nodes.whole().at(&path).as_deref(),
+			Some(node.as_ref()),
+			"the staged view holds at {path:?} what the view the slices build holds"
+		);
+	}
+	assert_eq!(staged.held_paths, view.held_paths);
+	assert_eq!(staged.skipped.len(), view.skipped.len());
+	probe.record(
+		"view_stage_place",
+		nodes,
+		place_time,
+		&format!(
+			"the copied rows walked from the root and placed, indexed, the copy dropped: {:+.1} % \
+			 with the copy on view_stream; {:.1} MiB resident for the staged view, against {:.1} \
+			 MiB for the streamed view's map",
+			((copy_time + place_time).as_secs_f64() / streamed_time.as_secs_f64() - 1.0) * 100.0,
+			mib(holding_staged.saturating_sub(before_staged)),
+			mib(holding_stream.saturating_sub(before_stream)),
+		),
+	);
+
 	// The baseline writes, batched and per action. The rows come off the placed view, which is
 	// what a pass records them from.
 	let entries = baseline_rows(&cold_scan, &view.nodes);
@@ -1669,11 +1723,31 @@ pub fn run() -> String {
 		hidden,
 		"RemoteView::filter, 5 user rules + defaults",
 	);
+	let ((), staged_hidden) = timed(|| {
+		staged.filter(Some(plan::ViewFilter {
+			rules: &rules,
+			baseline: &no_baseline,
+		}));
+	});
+	assert_eq!(
+		staged.nodes.whole().len(),
+		view.nodes.whole().len(),
+		"the rules hide from the staged view what they hide from the map"
+	);
+	assert_eq!(staged.ignored, view.ignored);
+	drop(staged);
+	probe.record(
+		"view_stage_filter",
+		nodes,
+		staged_hidden,
+		"RemoteView::filter over the staged view: one walk in path order, a hidden subtree \
+		 dropped in two statements, the collisions grouped on the folded index",
+	);
 	probe.record(
 		"view_once",
 		nodes,
 		placed + hidden,
-		"derived: what one pass actually builds",
+		"derived: the map a pass built before it staged its view",
 	);
 
 	let store = BaselineStore::open(&fixture.baseline_db).expect("opening the baseline DB");
@@ -2418,8 +2492,8 @@ pub fn run() -> String {
 		nodes,
 		whole,
 		&format!(
-			"{} actions; baseline read + streamed snapshot + view + warm scan into the stage + fold \
-			 + reconcile, no network and no apply; {:.1} MiB resident at its widest point, {:.1} \
+			"{} actions; baseline read + snapshot staged and placed + warm scan into the stage + \
+			 fold + reconcile, no network and no apply; {:.1} MiB resident at its widest point, {:.1} \
 			 MiB of it this pass; the structures alive there: baseline {:.1} + view {:.1} + scan \
 			 {:.1} = {:.1} MiB computed",
 			footprint.actions,

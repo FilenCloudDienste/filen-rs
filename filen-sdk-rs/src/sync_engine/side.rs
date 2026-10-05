@@ -22,8 +22,9 @@
 //! [`Overlay`] — one entry per path THIS pass read — over the rows the resident baseline already
 //! describes: a carried row's local and remote nodes are both derived from that row on demand, so
 //! a change-scoped pass holds per-PASS data instead of a second copy of the tree. [`Side::Staged`]
-//! is what a whole pass's local walk produces now: the map's nodes as rows of the pass's stage,
-//! read a page at a time, so a whole pass holds no copy of the local tree in memory either.
+//! is what a whole pass's local walk and remote snapshot produce now: the map's nodes as rows of the
+//! pass's stage, read a page at a time, so a whole pass holds no copy of either tree in memory
+//! either.
 //!
 //! That is the whole of the change-scoped pass's cost. At a million rows, materializing the two
 //! maps and then freeing them was 395 ms of a 397 ms pass, against 0.226 ms for every other step
@@ -57,11 +58,12 @@ use std::{
 };
 
 use itertools::Either;
+use uuid::Uuid;
 
 use super::{
 	baseline::BaselineEntry,
 	changes::{SUBTREE_CAP, past_cap},
-	plan::{is_under, moved_path},
+	plan::{RemoteNode, is_under, moved_path},
 	rows::Baseline,
 	scan::at_or_under_folded,
 	stage::{Pages, StagedSide},
@@ -262,9 +264,9 @@ pub(crate) enum Side<T> {
 	Whole(HashMap<String, T>),
 	/// What this pass observed, over the rows the baseline carries.
 	Carried(Overlay<T>),
-	/// Every node, as a whole pass's walk staged it: a row each in the pass's stage, read a page at
-	/// a time (see [`StagedSide`]). What a whole read produces on the local side, where a whole map
-	/// held a node per item of the tree in memory for the rest of the plan.
+	/// Every node, as a whole pass staged it: a row each in the pass's stage, read a page at a time
+	/// (see [`StagedSide`]). What a whole read produces on either side, where a whole map held a
+	/// node per item of the tree in memory for the rest of the plan.
 	Staged(StagedSide<T>),
 }
 
@@ -374,8 +376,9 @@ impl<T> Side<T> {
 	/// (`engine::place_node`) asks through [`NodesAt::at`] first, which is one lookup on the
 	/// path it is already holding.
 	///
-	/// A staged side files the node under `path` and hands it back with that path, and holds one
-	/// spelling of each folded name (see [`StagedSide::insert`]).
+	/// A staged side files the node under `path`, over whatever is there (see
+	/// [`StagedSide::insert`]). The local walk's table holds one spelling of each folded name; the
+	/// remote one does not, since two spellings of one name are what its collision check looks for.
 	pub(crate) fn insert(&mut self, path: String, node: T) {
 		match self {
 			Self::Whole(map) => {
@@ -870,6 +873,25 @@ impl<T: FromRow> SideRef<'_, T> {
 				Entries::Carried(out.into_iter(), overlay.nodes.iter())
 			}
 		}
+	}
+}
+
+impl SideRef<'_, RemoteNode> {
+	/// Where this side holds each of `uuids` it holds: what a pass's journal of its own writes asks
+	/// of the view (see `PendingWrites::settle`). A staged side seeks its uuid index once per uuid;
+	/// the others are walked, keeping only the nodes asked about.
+	pub(super) fn paths_of(&self, uuids: &HashSet<Uuid>) -> HashMap<Uuid, Cow<'_, str>> {
+		if let Side::Staged(staged) = self.side {
+			return staged
+				.paths_of(uuids)
+				.into_iter()
+				.map(|(uuid, path)| (uuid, Cow::Owned(path)))
+				.collect();
+		}
+		self.entries()
+			.filter(|(_, node)| uuids.contains(&node.remote_uuid))
+			.map(|(path, node)| (node.remote_uuid, path))
+			.collect()
 	}
 }
 

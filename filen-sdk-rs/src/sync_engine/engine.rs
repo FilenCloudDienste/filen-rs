@@ -49,7 +49,7 @@ use super::{
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
-	side::{Nodes, NodesAt, Side},
+	side::{Nodes, NodesAt, Side, SideRef},
 	stage::{self, Stage, StagedPlan},
 };
 use crate::{
@@ -832,7 +832,7 @@ impl PendingWrites {
 		&self,
 		pair: PairId,
 		observed: &HashMap<Uuid, u64>,
-		remote: &impl Nodes<Node = RemoteNode>,
+		remote: &SideRef<'_, RemoteNode>,
 	) -> plan::PassHolds {
 		let now = Instant::now();
 		let mut journal = self.journal();
@@ -842,15 +842,12 @@ impl PendingWrites {
 		// above the pair check read the record by itself, so they still run — from an empty index —
 		// and still retire what the cache has demonstrably caught up to, whoever wrote it.
 		//
-		// The walk keeps only the nodes a record names: the index is asked about nothing else, and
-		// the pass after a big push walks a view of the whole tree to settle a few records.
+		// Only the nodes a record names are looked up: the index is asked about nothing else, and
+		// the pass after a big push would otherwise walk a view of the whole tree to settle a few
+		// records. A staged view answers off its uuid index.
 		let snapshot_path: HashMap<Uuid, Cow<'_, str>> =
 			if map.values().any(|write| write.pair == pair) {
-				remote
-					.iter()
-					.filter(|(_, node)| map.contains_key(&node.remote_uuid))
-					.map(|(path, node)| (node.remote_uuid, path))
-					.collect()
+				remote.paths_of(&map.keys().copied().collect())
 			} else {
 				HashMap::new()
 			};
@@ -1065,9 +1062,10 @@ pub(super) fn written_node(entry: Option<&BaselineEntry>) -> Option<RemoteNode> 
 ///
 /// Only a foreign edit puts the item on a third path. Then the index is built, once, and kept in
 /// step by [`place_node`] and by the removals for the rest of the fold — a scan per record would be
-/// quadratic on a large tree right after a large pass. The walk keeps only the nodes whose uuid
+/// quadratic on a large tree right after a large pass. It holds only the nodes whose uuid
 /// `journal` names, the only uuids the fold looks up, so the index starts at one entry per record
-/// rather than one per node of the tree.
+/// rather than one per node of the tree: a staged view seeks its uuid index for each, any other is
+/// walked once (see [`SideRef::paths_of`]).
 struct ViewIndex<'a> {
 	journal: &'a HashMap<Uuid, PendingWrite>,
 	index: Option<HashMap<Uuid, String>>,
@@ -1090,9 +1088,9 @@ impl<'a> ViewIndex<'a> {
 			.get_or_insert_with(|| {
 				nodes
 					.of(baseline)
-					.iter()
-					.filter(|(_, node)| journal.contains_key(&node.remote_uuid))
-					.map(|(path, node)| (node.remote_uuid, path.into_owned()))
+					.paths_of(&journal.keys().copied().collect())
+					.into_iter()
+					.map(|(uuid, path)| (uuid, path.into_owned()))
 					.collect()
 			})
 			.get(&uuid)
@@ -3999,9 +3997,11 @@ impl SyncEngine {
 			// SNAPSHOT shows at its path, and this pass has no snapshot. The derived view shows our
 			// own write because the baseline row records it, so reading it there would retire the
 			// record against itself (I5). The announcement rule and the grace ceiling still apply.
-			let holds =
-				self.pending
-					.settle(pair, &announced, &HashMap::<String, RemoteNode>::new());
+			let holds = self.pending.settle(
+				pair,
+				&announced,
+				&Side::<RemoteNode>::default().of(&inputs.baseline),
+			);
 			let retired: Vec<Uuid> = before.difference(&self.pending.uuids()).copied().collect();
 			if !retired.is_empty() {
 				journal
@@ -4180,23 +4180,35 @@ impl SyncEngine {
 		// `.filenignore` files on disk. Those reads come first; then the very rules the scan
 		// matched with hide what they hide, in place (see `RemoteView::filter`).
 		//
-		// Built from the cache's rows AS THEY ARRIVE. A materialized read hands back two `Vec`s
-		// of the whole subtree, and at a million items that is a second copy of the tree, alive
-		// beside the view built out of it at the widest point the pass ever reaches. The
-		// baseline's row count sizes the map, so a converged pair's view never grows one.
+		// Copied from the cache's rows AS THEY ARRIVE into the pass's stage, inside the cache's one
+		// read transaction, and placed there once the copy is done (see `stage::remote`): the view
+		// is a row per item of the tree on disk, where a map held a node per item in memory from
+		// here to the end of the plan.
 		//
-		// A read that fails partway takes the builder with it (see `stream_sync_root_snapshot`):
-		// this pass gets an error, never a view with holes in it.
-		let (built, watermark) = self
+		// A read that fails partway takes the stage with it (see `stream_sync_root_snapshot`):
+		// this pass gets an error, never a view with holes in it. So does a stage that cannot be
+		// written (a full disk): the sink keeps the error of the first row it could not write, and
+		// placing the copy returns it.
+		let stage = self.stage(pair)?;
+		let at = stage.path().display().to_string();
+		let sink = stage::RemoteSink::new(stage, stage::Paging::PASS)
+			.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
+		let (copied, watermark) = self
 			.client
-			.stream_sync_root_snapshot(
-				record.remote_root,
-				plan::ViewBuilder::with_capacity(record.remote_root, baseline.len()),
-			)
+			.stream_sync_root_snapshot(record.remote_root, sink)
 			.await?;
 		// Every row the pass still needs is in the view now; the objects it ACTS on are read back
 		// whole by uuid, for the handful a plan names.
-		let mut view = built.finish();
+		let root = record.remote_root;
+		let mut view = tokio::task::spawn_blocking(move || copied.finish(root))
+			.await
+			.map_err(|e| {
+				Error::custom(
+					ErrorKind::Internal,
+					format!("placing the remote snapshot panicked: {e}"),
+				)
+			})?
+			.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
 		let remote_converged = watermark.is_some();
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
@@ -4208,7 +4220,7 @@ impl SyncEngine {
 		// out.
 		let mut confirmed = Vec::new();
 		if baseline.any_unconfirmed() {
-			// A WHOLE view, whose backing derives nothing — so reading it against an empty tree is
+			// A STAGED view, whose backing derives nothing — so reading it against an empty tree is
 			// exact, and leaves the rows free to be borrowed mutably beside it.
 			let no_rows = Baseline::default();
 			let raw = view.nodes.of(&no_rows);
@@ -11847,7 +11859,11 @@ mod tests {
 		pending.record(&observations, PAIR, uuid, created("a.txt", None));
 		observations.note_uuids([uuid]);
 
-		let holds = pending.settle(PAIR + 1, &observations.snapshot(), &HashMap::new());
+		let holds = pending.settle(
+			PAIR + 1,
+			&observations.snapshot(),
+			&Side::<RemoteNode>::default().whole(),
+		);
 
 		assert!(
 			holds.trashed.is_empty(),
@@ -11876,7 +11892,11 @@ mod tests {
 		);
 
 		observations.note_uuids([uuid]);
-		pending.settle(PAIR, &observations.snapshot(), &HashMap::new());
+		pending.settle(
+			PAIR,
+			&observations.snapshot(),
+			&Side::<RemoteNode>::default().whole(),
+		);
 		observations.prune_before(pending.oldest_stamp());
 		assert!(
 			observations.snapshot().is_empty(),
@@ -12076,6 +12096,115 @@ mod tests {
 		assert!(
 			peak < 4 * 1024,
 			"folding 1 write into {NODES} nodes held {peak} bytes at once"
+		);
+	}
+
+	/// [`wide_view`], as a whole pass reads it: staged, under a `dir` directory of its own; with the
+	/// directory its stage is in.
+	fn staged_wide_view(nodes: u32) -> (tempfile::TempDir, Side<RemoteNode>) {
+		let (root, dir) = (Uuid::from_u128(1 << 64), Uuid::from_u128((1 << 64) + 1));
+		let item = |uuid, parent, name: String| crate::cache::RemoteItem {
+			uuid,
+			parent,
+			name,
+			stable_uuid: None,
+			hash: None,
+			size: 0,
+			modified_millis: 0,
+		};
+		let items =
+			std::iter::once((true, item(dir, root, "dir".to_owned()))).chain((0..nodes).map(|i| {
+				let uuid = Uuid::from_u128(u128::from(i));
+				(false, item(uuid, dir, format!("file-{i}.txt")))
+			}));
+		let (stage_dir, view) = super::stage::staged_view(root, items, &[]);
+		(stage_dir, view.nodes)
+	}
+
+	/// [`settling_a_few_writes_against_a_wide_view_keeps_only_their_uuids`] over a staged view,
+	/// which seeks the records' uuids in its index instead of walking the tree.
+	#[test]
+	fn settling_a_few_writes_against_a_staged_view_seeks_only_their_uuids() {
+		const NODES: u32 = 100_000;
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let (listed, moved_away, trashed, unlisted) = (
+			Uuid::from_u128(7),
+			Uuid::from_u128(8),
+			Uuid::from_u128(9),
+			Uuid::from_u128(u128::from(NODES) + 1),
+		);
+		pending.record(&observations, PAIR, listed, created("dir/file-7.txt", None));
+		pending.record(
+			&observations,
+			PAIR,
+			moved_away,
+			moved("dir/file-8.txt", "elsewhere.txt"),
+		);
+		pending.record(
+			&observations,
+			PAIR,
+			trashed,
+			PendingKind::Trashed {
+				path: "dir/file-9.txt".to_string(),
+			},
+		);
+		pending.record(&observations, PAIR, unlisted, created("new.txt", None));
+		let (_dir, remote) = staged_wide_view(NODES);
+		let observed = observations.snapshot();
+
+		let (holds, peak) =
+			alloc_meter::peak_bytes(|| pending.settle(PAIR, &observed, &remote.whole()));
+
+		assert_eq!(
+			pending.uuids(),
+			HashSet::from([moved_away, trashed, unlisted]),
+			"the create the view lists is settled; the cache is behind on the other three"
+		);
+		assert_eq!(holds.trashed, HashSet::from([trashed]));
+		assert!(
+			peak < 4 * 1024,
+			"settling 4 writes against {NODES} staged nodes held {peak} bytes at once"
+		);
+	}
+
+	/// [`folding_a_write_its_paths_miss_indexes_only_the_journalled_uuids`] over a staged view: the
+	/// item a foreign rename moved is found by its uuid, and taken out where the view holds it.
+	#[test]
+	fn folding_a_write_its_paths_miss_over_a_staged_view_seeks_its_uuid() {
+		const NODES: u32 = 100_000;
+		let observations = Observations::default();
+		let pending = PendingWrites::default();
+		let trashed = Uuid::from_u128(9);
+		pending.record(
+			&observations,
+			PAIR,
+			trashed,
+			PendingKind::Trashed {
+				path: "gone.txt".to_string(),
+			},
+		);
+		let (_dir, mut remote) = staged_wide_view(NODES);
+		let baseline = Baseline::default();
+		let mut changed = BTreeSet::new();
+
+		let (folded, peak) = alloc_meter::peak_bytes(|| {
+			pending.fold_into(PAIR, &baseline, &mut remote, &mut changed)
+		});
+
+		assert_eq!(folded, 1);
+		assert!(
+			!remote.whole().holds("dir/file-9.txt"),
+			"the trashed item is taken out wherever the view holds it"
+		);
+		assert_eq!(
+			remote.whole().len(),
+			100_000,
+			"the directory and 99,999 files"
+		);
+		assert!(
+			peak < 4 * 1024,
+			"folding 1 write into {NODES} staged nodes held {peak} bytes at once"
 		);
 	}
 

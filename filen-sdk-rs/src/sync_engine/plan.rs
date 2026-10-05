@@ -30,7 +30,7 @@ use super::{
 use crate::cache::{RemoteItem, UndecodableItem};
 
 /// Guards against a malformed (cyclic) remote parent chain when resolving a path.
-const MAX_REMOTE_DEPTH: usize = 256;
+pub(super) const MAX_REMOTE_DEPTH: usize = 256;
 
 /// One item in the remote view, keyed (like [`LocalNode`]) by its NFC-normalized `/`-joined path
 /// relative to the sync root.
@@ -378,9 +378,17 @@ pub(crate) struct SkippedRemote {
 	pub(crate) reason: UnsyncableReason,
 }
 
+/// How many directories [`RemoteView::hide`] keeps a decision for at once.
+const HIDE_MEMO: usize = 4096;
+
 /// Builds a [`RemoteView`] out of a cache subtree snapshot's items AS THEY ARRIVE, so the whole
 /// subtree never exists as a `Vec` beside the view built from it. Names are NFC-normalized so
 /// they key 1:1 against the local scan.
+///
+/// A whole pass no longer builds its view in memory: it stages it (see `stage::remote`), and this is
+/// what that staged view is held to, node for node and record for record, in the tests and the
+/// probe. It is also what records the items the staged walk cannot place
+/// ([`replay`](Self::replay)), so the records are this builder's own.
 ///
 /// An item that cannot be placed — an unsafe name, a broken parent chain, or metadata the cache
 /// could not decode (the undecodable records, which may hold other roots' too: only those whose
@@ -420,9 +428,12 @@ pub(crate) struct ViewBuilder {
 }
 
 impl ViewBuilder {
-	/// A builder for `root`'s subtree, sized for a tree of `items`. A pass knows its baseline's
-	/// row count, which is the size of a converged pair's view — and a map that never grows is
-	/// one that never holds its old table and its new one at once.
+	/// A builder for `root`'s subtree, its map sized for `items` nodes: one sized for the whole tree
+	/// never grows, so it never holds its old table and its new one at once.
+	///
+	/// What a pass built its view with before it staged it (see `stage::remote`): the tests and the
+	/// probe build one beside the staged view, which has to come out the same.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(crate) fn with_capacity(root: Uuid, items: usize) -> Self {
 		Self {
 			root,
@@ -434,6 +445,43 @@ impl ViewBuilder {
 			skipped: Skipped::default(),
 			deferred: Vec::new(),
 		}
+	}
+
+	/// A builder that answers for the rows a staged walk could not place, `items`, and for the
+	/// `undecodable` records (see `stage::remote`), with `dir_index` holding every directory their
+	/// chains climb. Their answers depend on nothing else, so [`finish`](Self::finish) records each
+	/// exactly as it does with the whole snapshot's index.
+	pub(super) fn replay(
+		root: Uuid,
+		dir_index: HashMap<Uuid, (String, Uuid)>,
+		undecodable: Vec<UndecodableItem>,
+		items: Vec<(bool, RemoteItem)>,
+	) -> Self {
+		let mut builder = Self {
+			root,
+			dir_index,
+			undecodable: Vec::new(),
+			undecodable_dirs: HashSet::new(),
+			nodes: HashMap::new(),
+			held_paths: BTreeSet::new(),
+			skipped: Skipped::default(),
+			deferred: items,
+		};
+		builder.take_undecodable(undecodable);
+		builder
+	}
+
+	/// [`finish`](Self::finish) for a [`replay`](Self::replay), whose items resolve under no chain
+	/// of placeable directories: the walk placed every item that does. So what comes of it is
+	/// records, and never a node or a held path.
+	pub(super) fn finish_unplaced(self) -> Vec<SkippedRemote> {
+		let view = self.finish();
+		assert!(
+			view.held_paths.is_empty()
+				&& matches!(&view.nodes, Side::Whole(nodes) if nodes.is_empty()),
+			"an item the staged walk left resolved to a path (should be impossible)"
+		);
+		view.skipped
 	}
 
 	/// The records the cache could not decode, taken before the first item (see
@@ -690,7 +738,10 @@ impl RemoteView {
 	///
 	/// `paths` says which nodes to ASK the rules about: every one of them
 	/// ([`PassPaths::Whole`], what a pass that read the remote whole owes), or only the keys a
-	/// change-scoped pass decided (see [`filter_changed`](Self::filter_changed)).
+	/// change-scoped pass decided (see [`filter_changed`](Self::filter_changed)). A whole STAGED
+	/// view is asked in path order, and only the first node of each subtree the rules hide is
+	/// asked: the rest goes with it unasked, each node counted as an untracked default hit where
+	/// that first one's hit is one.
 	///
 	/// A change-scoped pass gets back the decided keys the view still holds, in the set's order:
 	/// what [`resolve_collisions_changed`](Self::resolve_collisions_changed) folds. Asking the
@@ -705,32 +756,46 @@ impl RemoteView {
 		let mut memo = HashMap::new();
 		let mut ignored = BTreeMap::new();
 		let mut untracked = 0usize;
-		// Whether the rules hide `rel_path`, recording the root of what they hide as the pass
-		// reports and untracks one (see [`Baseline::tracked`]).
+		// The root of what the rules hide at or above `rel_path`, if they hide it, recording it as
+		// the pass reports and untracks one (see [`Baseline::tracked`]); and whether the item counts
+		// on its own, as an untracked default hit does.
 		let mut hidden = |rel_path: &str, is_dir: bool| {
-			let Some((ignored_root, decision)) =
-				filter.rules.ignored_root(rel_path, is_dir, &mut memo)
-			else {
-				return false;
-			};
+			// The memo caches a decision per directory asked about, and a staged view is walked in
+			// path order, where a directory's subtree is asked about together: a bound costs it
+			// nothing, and keeps the memo from growing with the tree's directories.
+			if memo.len() >= HIDE_MEMO {
+				memo.clear();
+			}
+			let (ignored_root, decision) =
+				filter.rules.ignored_root(rel_path, is_dir, &mut memo)?;
 			// A root the rules hid ABOVE this item is a directory; the item's own hit is a root of
 			// whatever kind the item is.
 			let root_is_dir = ignored_root != rel_path || is_dir;
 			// Hidden either way — but only a tracked default hit is a ROOT (see `Baseline::tracked`).
-			if decision.level == IgnoreLevel::Default
-				&& !filter.baseline.tracked(ignored_root, root_is_dir)
-			{
+			let each = decision.level == IgnoreLevel::Default
+				&& !filter.baseline.tracked(ignored_root, root_is_dir);
+			if each {
 				untracked += 1;
 			} else if !ignored.contains_key(ignored_root) {
 				ignored.insert(ignored_root.to_owned(), decision);
 			}
-			true
+			Some((ignored_root.to_owned(), each))
 		};
 		let kept = match paths {
 			PassPaths::Whole => {
-				self.nodes.retain(filter.baseline, |rel_path, node| {
-					!hidden(rel_path, node.kind == NodeKind::Dir)
-				});
+				match &mut self.nodes {
+					// In path order, so a directory the rules hide is met before anything under it,
+					// which goes with it unasked and is counted as it would have been asked about.
+					Side::Staged(staged) => {
+						let also = staged.drop_hidden(|rel_path, node| {
+							hidden(rel_path, node.kind == NodeKind::Dir)
+						});
+						untracked += also;
+					}
+					nodes => nodes.retain(filter.baseline, |rel_path, node| {
+						hidden(rel_path, node.kind == NodeKind::Dir).is_none()
+					}),
+				}
 				Vec::new()
 			}
 			PassPaths::Changed(decided) => {
@@ -745,7 +810,7 @@ impl RemoteView {
 					else {
 						continue;
 					};
-					if hidden(rel_path, is_dir) {
+					if hidden(rel_path, is_dir).is_some() {
 						roots.push(rel_path);
 					} else {
 						kept.push(rel_path);
@@ -810,6 +875,13 @@ impl RemoteView {
 	/// case-insensitively have no 1:1 local mapping, so the loser leaves the view and the pass is
 	/// refused ([`has_collisions`](Self::has_collisions)).
 	pub(super) fn resolve_collisions(&mut self, baseline: &Baseline) {
+		// A staged view groups its folded index instead: the first of each group in path order
+		// stays, where this keeps whichever the map's order met first. The pass is refused either
+		// way, and neither keeps a node per item to find the groups.
+		if let Side::Staged(staged) = &mut self.nodes {
+			self.has_collisions |= staged.drop_fold_twins(&self.held_paths);
+			return;
+		}
 		// A digest of every collision key taken so far. The keys themselves are not kept: a hit is
 		// rare and is resolved against the paths already placed, which is what tells a real
 		// case-twin from two keys that merely share a digest — a pass is never refused over that.
@@ -920,6 +992,10 @@ impl RemoteView {
 /// [`place_remote_items`] + [`RemoteView::filter`] in one call, for a caller that already has the
 /// rules to hand. A pass builds the two halves apart, so the reads it owes the unfiltered view can
 /// happen in between.
+///
+/// Every test that builds a view this way builds its staged twin too — the same items copied into
+/// a stage and placed there, as a whole pass reads them, then filtered alike — and holds it to the
+/// one returned (see [`assert_views_alike`]).
 #[cfg(test)]
 pub(crate) fn build_remote_view(
 	root: Uuid,
@@ -930,7 +1006,87 @@ pub(crate) fn build_remote_view(
 ) -> RemoteView {
 	let mut view = place_remote_items(root, dirs, files, undecodable);
 	view.filter(filter);
+	let items = dirs
+		.iter()
+		.map(|dir| (true, dir.clone()))
+		.chain(files.iter().map(|file| (false, file.clone())));
+	let (_dir, mut staged) = super::stage::staged_view(root, items, undecodable);
+	staged.filter(filter);
+	assert_views_alike("the staged twin", &view, &staged);
 	view
+}
+
+/// Hold a view a whole pass staged to the one [`ViewBuilder`] built from the same items: the same
+/// nodes at the same paths, the same held paths, ignored roots and count of untracked default hits,
+/// and the same records in any order (nothing reads them in order: `unknown_remote_paths` keys them
+/// by path). Where the views found collisions, each kept one node of every folded name, and which
+/// one is the one thing they may differ in: the pass is refused either way.
+#[cfg(test)]
+pub(super) fn assert_views_alike(at: &str, resident: &RemoteView, staged: &RemoteView) {
+	assert!(
+		matches!(staged.nodes, Side::Staged(_)),
+		"{at}: the staged view is staged"
+	);
+	assert_eq!(
+		staged.has_collisions, resident.has_collisions,
+		"{at}: has_collisions"
+	);
+	assert_eq!(staged.held_paths, resident.held_paths, "{at}: held_paths");
+	assert_eq!(staged.ignored, resident.ignored, "{at}: ignored");
+	assert_eq!(
+		staged.ignored_default_untracked, resident.ignored_default_untracked,
+		"{at}: ignored_default_untracked"
+	);
+	let records = |view: &RemoteView| {
+		let mut records = view.skipped.clone();
+		records.sort_by_key(|record| record.remote_uuid);
+		records
+	};
+	assert_eq!(records(staged), records(resident), "{at}: skipped");
+	let nodes = |view: &RemoteView| -> BTreeMap<String, RemoteNode> {
+		view.nodes
+			.whole()
+			.iter()
+			.map(|(path, node)| (path.into_owned(), node.into_owned()))
+			.collect()
+	};
+	let (resident_nodes, staged_nodes) = (nodes(resident), nodes(staged));
+	assert_eq!(
+		staged.nodes.whole().len(),
+		staged_nodes.len(),
+		"{at}: the staged view counts what it holds"
+	);
+	if !resident.has_collisions {
+		assert_eq!(staged_nodes, resident_nodes, "{at}: nodes");
+		return;
+	}
+	let folded = |nodes: &BTreeMap<String, RemoteNode>| -> BTreeMap<String, RemoteNode> {
+		let folded: BTreeMap<String, RemoteNode> = nodes
+			.values()
+			.map(|node| (collision_key(&node.rel_path), node.clone()))
+			.collect();
+		assert_eq!(
+			folded.len(),
+			nodes.len(),
+			"{at}: two nodes left fold together"
+		);
+		folded
+	};
+	let (resident_folded, staged_folded) = (folded(&resident_nodes), folded(&staged_nodes));
+	assert_eq!(
+		staged_folded.keys().collect::<Vec<_>>(),
+		resident_folded.keys().collect::<Vec<_>>(),
+		"{at}: the folded names left"
+	);
+	for (key, kept) in &resident_folded {
+		let twin = staged_folded
+			.get(key)
+			.expect("the folded names were just compared");
+		// The same node, or the other of two twins.
+		if twin.rel_path == kept.rel_path {
+			assert_eq!(twin, kept, "{at}: the node at {key:?}");
+		}
+	}
 }
 
 /// The skipped items of a view being built: the ones recorded with a reason of their own, and the

@@ -1,6 +1,7 @@
 //! A pass's scratch database: an SQLite file of the pass's own for what it would otherwise hold in
-//! memory while it plans and applies. A whole pass stages its local scan ([`local`]) from the walk
-//! to the end of the plan, and every pass its plan ([`plan`]) from the plan to the end of the apply.
+//! memory while it plans and applies. A whole pass stages its remote snapshot ([`remote`]) and its
+//! local scan ([`local`]) from the read to the end of the plan, both read as a [`StagedSide`]
+//! ([`side`]), and every pass its plan ([`plan`]) from the plan to the end of the apply.
 //!
 //! # One file per pass
 //!
@@ -12,8 +13,10 @@
 //! in a directory of stages, because baselines share directories — every test's sits in the temp
 //! dir — and two engines number their pairs and passes alike, from 1 and 0.
 //!
-//! The scan and the plan of one pass take a number each, so a whole pass has two files: the scan's
-//! goes once the plan is staged, before the apply begins, and the plan's when the apply is done.
+//! The snapshot, the scan and the plan of one pass take a number each, in that order, so a whole
+//! pass has three files: the snapshot's and the scan's go once the plan is staged, before the apply
+//! begins, or with the pass's inputs when it stops before that (a dry run, a refusal), and the
+//! plan's when the apply is done.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).
@@ -56,6 +59,8 @@
 
 mod local;
 mod plan;
+mod remote;
+mod side;
 #[cfg(test)]
 mod tests;
 
@@ -71,10 +76,14 @@ use std::{
 use filen_types::crypto::Blake3Hash;
 use rusqlite::{Connection, Row};
 
-pub(super) use local::{Pages, Paging, StageSink, StagedSide};
+pub(super) use local::StageSink;
 #[cfg(test)]
 pub(super) use plan::PAGE_ROWS;
 pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
+pub(super) use remote::RemoteSink;
+#[cfg(test)]
+pub(super) use remote::staged_view;
+pub(super) use side::{Pages, Paging, StagedSide};
 
 use super::baseline::PairId;
 use crate::{Error, ErrorKind};
@@ -157,12 +166,15 @@ impl Stage {
 	}
 }
 
-/// Every statement over a staged side taking `rows` rows at most, for a test that walks a handful of
-/// nodes across several statements.
+/// Every statement over a staged side taking `rows` rows at most, for a test that walks and places a
+/// handful of nodes across several statements.
 #[cfg(test)]
 pub(super) fn paging_of(rows: usize) -> Paging {
 	let rows = NonZeroUsize::new(rows).expect("a test pages at least one row a statement");
-	Paging { page: rows }
+	Paging {
+		page: rows,
+		children: rows,
+	}
 }
 
 /// Where the stage of pass `pass` of `pair` goes, for the baseline at `db_path`.
@@ -272,6 +284,11 @@ impl BatchWriter {
 			self.open = 0;
 		}
 		Ok(())
+	}
+
+	/// The stage's connection, for a read between the rows: it sees the rows of the open batch.
+	pub(super) fn conn(&self) -> &Connection {
+		&self.stage.conn
 	}
 
 	/// The stage, with every row written committed.
