@@ -1,12 +1,16 @@
+use std::mem;
+
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use proc_macro2::{TokenStream as TokenStream2, TokenTree};
+use quote::{ToTokens, format_ident, quote};
+use syn::ext::IdentExt;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::token::Comma;
 use syn::{
-	Attribute, Block, Data, DeriveInput, Fields, FnArg, GenericParam, Ident, ItemEnum, ItemFn,
-	ItemStruct, Lifetime, LifetimeParam, Meta, Type, TypePath, Variant, parse_macro_input,
+	Attribute, Block, Data, DeriveInput, Fields, FnArg, GenericParam, Generics, Ident, ImplItem,
+	ImplItemFn, ItemEnum, ItemFn, ItemImpl, ItemStruct, Lifetime, LifetimeParam, Meta, Pat, Type,
+	TypePath, Variant, Visibility, parse_macro_input,
 };
 use syn::{Item, WherePredicate};
 
@@ -252,6 +256,186 @@ pub fn create_uniffi_wrapper(_attr: TokenStream, item: TokenStream) -> TokenStre
 		.into_compile_error()
 		.into(),
 	}
+}
+
+/// Makes the async exports of a `#[wasm_bindgen]` impl block read their params inside the call,
+/// so a param that does not parse rejects the call with `Conversion`.
+///
+/// wasm-bindgen converts an async export's params inside the promise it returns, where a
+/// conversion that fails throws out of the promise's task and leaves the promise pending forever.
+/// So each `pub async fn` with params is exported through a wrapper, `js_export_<name>`, that
+/// takes each param as its `crate::js::JsParam::Wire` type and parses it before calling the
+/// original. The wrapper keeps the method's attributes and its params' (its docs, JS name and
+/// TypeScript types), and gets `js_name = "<name>"` when it has no JS name, the name wasm-bindgen
+/// gave the method. The original moves to a plain impl block, so Rust callers still reach it.
+/// Every other item stays as written.
+///
+/// List it first, ahead of the block's `wasm_bindgen` attribute. rustc expands the block's
+/// `cfg_attr`s before it runs, so it finds `wasm_bindgen` only on the builds that export the
+/// block, and passes the block through unchanged on every other build.
+#[proc_macro_attribute]
+pub fn js_exports(attr: TokenStream, item: TokenStream) -> TokenStream {
+	if !attr.is_empty() {
+		return syn::Error::new(
+			proc_macro2::Span::call_site(),
+			"#[js_exports] takes no arguments",
+		)
+		.to_compile_error()
+		.into();
+	}
+	let item = parse_macro_input!(item as ItemImpl);
+	js_exports_tokens(item)
+		.unwrap_or_else(syn::Error::into_compile_error)
+		.into()
+}
+
+fn js_exports_tokens(mut item: ItemImpl) -> syn::Result<TokenStream2> {
+	if let Some(attr) = item
+		.attrs
+		.iter()
+		.find(|attr| attr.path().is_ident("cfg_attr") && mentions(attr, "wasm_bindgen"))
+	{
+		// rustc expands the cfg_attrs first, so this cannot happen today. If it ever does, the
+		// block has to be written out once per side of the cfg.
+		return Err(syn::Error::new_spanned(
+			attr,
+			"#[js_exports] cannot tell whether this cfg_attr exports the block",
+		));
+	}
+	let marker = item
+		.items
+		.iter()
+		.filter_map(|item| match item {
+			ImplItem::Fn(method) => Some(method),
+			_ => None,
+		})
+		.flat_map(|method| &method.attrs)
+		.find(|attr| path_ends_with(attr, "__wasm_bindgen_class_marker"));
+	if let Some(marker) = marker {
+		return Err(syn::Error::new_spanned(
+			marker,
+			"list #[js_exports] before #[wasm_bindgen], which has already expanded this block",
+		));
+	}
+	if !item
+		.attrs
+		.iter()
+		.any(|attr| path_ends_with(attr, "wasm_bindgen"))
+	{
+		return Ok(item.into_token_stream());
+	}
+
+	let items = mem::take(&mut item.items);
+	let mut plain = item.clone();
+	plain
+		.attrs
+		.retain(|attr| !path_ends_with(attr, "wasm_bindgen"));
+	for impl_item in items {
+		match impl_item {
+			ImplItem::Fn(method) if reads_params(&method) => {
+				item.items.push(ImplItem::Fn(js_export_wrapper(&method)?));
+				plain.items.push(ImplItem::Fn(without_wasm_bindgen(method)));
+			}
+			other => item.items.push(other),
+		}
+	}
+	if plain.items.is_empty() {
+		return Ok(item.into_token_stream());
+	}
+	Ok(quote! {
+		#item
+		#plain
+	})
+}
+
+/// Whether wasm-bindgen exports `method` as an async fn that takes params.
+fn reads_params(method: &ImplItemFn) -> bool {
+	matches!(method.vis, Visibility::Public(_))
+		&& method.sig.asyncness.is_some()
+		&& method
+			.sig
+			.inputs
+			.iter()
+			.any(|input| matches!(input, FnArg::Typed(_)))
+}
+
+/// The export that reads `method`'s params as their wire types and parses them in the call.
+fn js_export_wrapper(method: &ImplItemFn) -> syn::Result<ImplItemFn> {
+	let name = &method.sig.ident;
+	let mut wrapper = method.clone();
+	wrapper.sig.ident = format_ident!("js_export_{}", name);
+	if !method.attrs.iter().any(|attr| mentions(attr, "js_name")) {
+		let js_name = name.unraw().to_string();
+		wrapper.attrs.push(syn::parse_quote!(
+			#[wasm_bindgen::prelude::wasm_bindgen(js_name = #js_name)]
+		));
+	}
+
+	let mut parses = Vec::new();
+	let mut args = Vec::new();
+	for input in &mut wrapper.sig.inputs {
+		let FnArg::Typed(param) = input else {
+			continue;
+		};
+		let ident = match &mut *param.pat {
+			Pat::Ident(pat) if pat.by_ref.is_none() && pat.subpat.is_none() => {
+				// the wrapper only passes the param on; the original keeps its `mut`
+				pat.mutability = None;
+				pat.ident.clone()
+			}
+			pat => {
+				return Err(syn::Error::new_spanned(
+					pat,
+					"#[js_exports] needs each param of an async export to be a plain name",
+				));
+			}
+		};
+		let ty = &param.ty;
+		parses.push(quote!(let #ident = <#ty as crate::js::JsParam>::parse(#ident)?;));
+		*param.ty = syn::parse_quote!(<#ty as crate::js::JsParam>::Wire);
+		args.push(ident);
+	}
+	let call = if method.sig.receiver().is_some() {
+		quote!(self.#name)
+	} else {
+		quote!(Self::#name)
+	};
+	wrapper.block = syn::parse_quote!({
+		#(#parses)*
+		#call(#(#args),*).await
+	});
+	Ok(wrapper)
+}
+
+/// `method` as a plain impl block's: without the attributes only wasm-bindgen reads, on it and on
+/// its params.
+fn without_wasm_bindgen(mut method: ImplItemFn) -> ImplItemFn {
+	method.attrs.retain(|attr| !mentions(attr, "wasm_bindgen"));
+	for input in &mut method.sig.inputs {
+		if let FnArg::Typed(param) = input {
+			param.attrs.retain(|attr| !mentions(attr, "wasm_bindgen"));
+		}
+	}
+	method
+}
+
+/// Whether `name` appears as an identifier anywhere in `tokens`.
+fn mentions(tokens: impl ToTokens, name: &str) -> bool {
+	tokens
+		.into_token_stream()
+		.into_iter()
+		.any(|tree| match tree {
+			TokenTree::Ident(ident) => ident == name,
+			TokenTree::Group(group) => mentions(group.stream(), name),
+			TokenTree::Punct(_) | TokenTree::Literal(_) => false,
+		})
+}
+
+fn path_ends_with(attr: &Attribute, name: &str) -> bool {
+	attr.path()
+		.segments
+		.last()
+		.is_some_and(|segment| segment.ident == name)
 }
 
 #[proc_macro_attribute]
@@ -1213,7 +1397,28 @@ fn extract_tagged_attr(attrs: &mut Vec<syn::Attribute>) -> bool {
 	found
 }
 
-fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream {
+/// With `import`, the `JsParam` impl an async export reads the type through (see `js_exports`):
+/// from the tsify JS type, which wasm-bindgen converts without failing.
+fn js_param_impl(name: &Ident, generics: &Generics, state: &JsTypeState) -> TokenStream2 {
+	if state.from_abi.is_empty() {
+		return quote!();
+	}
+	let wasm_condition = &state.wasm_condition;
+	let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+	quote! {
+		#[cfg(#wasm_condition)]
+		impl #impl_generics crate::js::JsParam for #name #ty_generics #where_clause {
+			type Wire = <Self as tsify::Tsify>::JsType;
+
+			fn parse(wire: Self::Wire) -> ::std::result::Result<Self, crate::Error> {
+				crate::js::parse_tsify(wire)
+			}
+		}
+	}
+}
+
+fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream2 {
+	let js_param = js_param_impl(&item_struct.ident, &item_struct.generics, &state);
 	let from_abi = add_comma_if_needed(state.from_abi);
 
 	let mut any_tagged = false;
@@ -1388,7 +1593,7 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream 
 		quote! { serde(rename_all = "camelCase") }
 	};
 
-	let expanded = quote! {
+	quote! {
 		#(#attrs)*
 		#derives
 		#[cfg_attr(
@@ -1402,9 +1607,9 @@ fn parse_struct(mut item_struct: ItemStruct, state: JsTypeState) -> TokenStream 
 		#vis struct #name #generics #fields #semi
 
 		#tagged_struct
-	};
 
-	expanded.into()
+		#js_param
+	}
 }
 
 /// Returns true if every variant of the enum is a fieldless (unit) variant.
@@ -1435,6 +1640,7 @@ fn parse_enum(item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
 }
 
 fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
+	let js_param = js_param_impl(&item_enum.ident, &item_enum.generics, &state);
 	let name = &item_enum.ident;
 	let vis = &item_enum.vis;
 	let derives = default_derives(state.no_default);
@@ -1656,6 +1862,8 @@ fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
 		}
 
 		#tagged
+
+		#js_param
 	}
 }
 
@@ -1736,7 +1944,7 @@ pub fn js_type(attr: TokenStream, item: TokenStream) -> TokenStream {
 	};
 
 	match input {
-		Item::Struct(item_struct) => parse_struct(item_struct, state),
+		Item::Struct(item_struct) => parse_struct(item_struct, state).into(),
 		Item::Enum(item_enum) => parse_enum(item_enum, state),
 		_ => syn::Error::new_spanned(input, "#[js_type] can only be used on structs or enums")
 			.to_compile_error()
@@ -1942,5 +2150,371 @@ mod js_type_enum_tests {
 		};
 		assert!(!is_fieldless_enum(&item));
 		assert_eq!(compact(default_enum_serde_repr(&item)), "serde(untagged)");
+	}
+}
+
+#[cfg(test)]
+mod js_exports_tests {
+	use super::*;
+
+	fn compact(tokens: impl ToTokens) -> String {
+		tokens
+			.into_token_stream()
+			.to_string()
+			.chars()
+			.filter(|c| !c.is_whitespace())
+			.collect()
+	}
+
+	fn expand(item: ItemImpl) -> String {
+		compact(js_exports_tokens(item).unwrap())
+	}
+
+	fn error(item: ItemImpl) -> String {
+		js_exports_tokens(item).unwrap_err().to_string()
+	}
+
+	#[test]
+	fn a_block_without_wasm_bindgen_passes_through_unchanged() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[uniffi::export]
+			impl JsClient {
+				pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
+					self.inner_get_dir(uuid).await
+				}
+			}
+		};
+		assert_eq!(expand(item.clone()), compact(item));
+	}
+
+	#[test]
+	fn an_async_export_reads_its_params_in_a_wrapper_and_the_original_moves_out() {
+		let item: ItemImpl = syn::parse_quote! {
+			/// The client.
+			#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				pub fn root(&self) -> Dir {
+					self.inner_root()
+				}
+
+				/// Gets a dir.
+				#[wasm_bindgen::prelude::wasm_bindgen(js_name = "getDir")]
+				pub async fn get_dir(&self, uuid: UuidStr, color: Option<DirColor>) -> Result<Dir, Error> {
+					self.inner_get_dir(uuid, color).await
+				}
+
+				#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listRoot")]
+				pub async fn list_root(&self) -> Result<Vec<Dir>, Error> {
+					self.inner_list_root().await
+				}
+
+				pub(crate) async fn trash(&self, dir: Dir) -> Result<(), Error> {
+					self.inner_trash(dir).await
+				}
+			}
+		};
+		let expected = quote! {
+			/// The client.
+			#[wasm_bindgen::prelude::wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				pub fn root(&self) -> Dir {
+					self.inner_root()
+				}
+
+				/// Gets a dir.
+				#[wasm_bindgen::prelude::wasm_bindgen(js_name = "getDir")]
+				pub async fn js_export_get_dir(
+					&self,
+					uuid: <UuidStr as crate::js::JsParam>::Wire,
+					color: <Option<DirColor> as crate::js::JsParam>::Wire
+				) -> Result<Dir, Error> {
+					let uuid = <UuidStr as crate::js::JsParam>::parse(uuid)?;
+					let color = <Option<DirColor> as crate::js::JsParam>::parse(color)?;
+					self.get_dir(uuid, color).await
+				}
+
+				#[wasm_bindgen::prelude::wasm_bindgen(js_name = "listRoot")]
+				pub async fn list_root(&self) -> Result<Vec<Dir>, Error> {
+					self.inner_list_root().await
+				}
+
+				pub(crate) async fn trash(&self, dir: Dir) -> Result<(), Error> {
+					self.inner_trash(dir).await
+				}
+			}
+
+			/// The client.
+			impl JsClient {
+				/// Gets a dir.
+				pub async fn get_dir(&self, uuid: UuidStr, color: Option<DirColor>) -> Result<Dir, Error> {
+					self.inner_get_dir(uuid, color).await
+				}
+			}
+		};
+		assert_eq!(expand(item), compact(expected));
+	}
+
+	#[test]
+	fn an_export_without_a_js_name_is_given_its_rust_name() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[wasm_bindgen(js_class = "UnauthClient")]
+			impl UnauthJsClient {
+				pub async fn login(&self, params: LoginParams) -> Result<JsClient, Error> {
+					self.inner_login(params).await
+				}
+			}
+		};
+		let expected = quote! {
+			#[wasm_bindgen(js_class = "UnauthClient")]
+			impl UnauthJsClient {
+				#[wasm_bindgen::prelude::wasm_bindgen(js_name = "login")]
+				pub async fn js_export_login(
+					&self,
+					params: <LoginParams as crate::js::JsParam>::Wire
+				) -> Result<JsClient, Error> {
+					let params = <LoginParams as crate::js::JsParam>::parse(params)?;
+					self.login(params).await
+				}
+			}
+
+			impl UnauthJsClient {
+				pub async fn login(&self, params: LoginParams) -> Result<JsClient, Error> {
+					self.inner_login(params).await
+				}
+			}
+		};
+		assert_eq!(expand(item), compact(expected));
+	}
+
+	#[test]
+	fn a_js_name_behind_a_cfg_attr_stays_on_the_wrapper_alone() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				#[cfg_attr(
+					all(target_family = "wasm", target_os = "unknown"),
+					wasm_bindgen(js_name = "deleteAccount")
+				)]
+				#[cfg_attr(feature = "uniffi", uniffi::method(name = "delete_account"))]
+				pub async fn delete_account(&self, two_factor_code: Option<String>) -> Result<(), Error> {
+					self.inner_delete_account(two_factor_code).await
+				}
+			}
+		};
+		let expected = quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				#[cfg_attr(
+					all(target_family = "wasm", target_os = "unknown"),
+					wasm_bindgen(js_name = "deleteAccount")
+				)]
+				#[cfg_attr(feature = "uniffi", uniffi::method(name = "delete_account"))]
+				pub async fn js_export_delete_account(
+					&self,
+					two_factor_code: <Option<String> as crate::js::JsParam>::Wire
+				) -> Result<(), Error> {
+					let two_factor_code = <Option<String> as crate::js::JsParam>::parse(two_factor_code)?;
+					self.delete_account(two_factor_code).await
+				}
+			}
+
+			impl JsClient {
+				#[cfg_attr(feature = "uniffi", uniffi::method(name = "delete_account"))]
+				pub async fn delete_account(&self, two_factor_code: Option<String>) -> Result<(), Error> {
+					self.inner_delete_account(two_factor_code).await
+				}
+			}
+		};
+		assert_eq!(expand(item), compact(expected));
+	}
+
+	#[test]
+	fn a_params_attributes_stay_on_the_wrapper_and_its_mut_on_the_original() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				#[wasm_bindgen(js_name = "listDirRecursive")]
+				pub async fn list_dir_recursive(
+					&self,
+					mut dir: AnyDirWithContext,
+					#[wasm_bindgen(unchecked_param_type = "() => void")]
+					callback: web_sys::js_sys::Function,
+				) -> Result<DirsAndFiles, Error> {
+					dir.prepare();
+					self.inner_list_dir_recursive(dir, callback).await
+				}
+			}
+		};
+		let expected = quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				#[wasm_bindgen(js_name = "listDirRecursive")]
+				pub async fn js_export_list_dir_recursive(
+					&self,
+					dir: <AnyDirWithContext as crate::js::JsParam>::Wire,
+					#[wasm_bindgen(unchecked_param_type = "() => void")]
+					callback: <web_sys::js_sys::Function as crate::js::JsParam>::Wire,
+				) -> Result<DirsAndFiles, Error> {
+					let dir = <AnyDirWithContext as crate::js::JsParam>::parse(dir)?;
+					let callback = <web_sys::js_sys::Function as crate::js::JsParam>::parse(callback)?;
+					self.list_dir_recursive(dir, callback).await
+				}
+			}
+
+			impl JsClient {
+				pub async fn list_dir_recursive(
+					&self,
+					mut dir: AnyDirWithContext,
+					callback: web_sys::js_sys::Function,
+				) -> Result<DirsAndFiles, Error> {
+					dir.prepare();
+					self.inner_list_dir_recursive(dir, callback).await
+				}
+			}
+		};
+		assert_eq!(expand(item), compact(expected));
+	}
+
+	#[test]
+	fn a_static_export_calls_the_original_through_self() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				#[wasm_bindgen(js_name = "fromStringified")]
+				pub async fn from_stringified(client: StringifiedClient) -> Result<JsClient, Error> {
+					Self::inner_from_stringified(client).await
+				}
+			}
+		};
+		let tokens = expand(item);
+		assert!(
+			tokens.contains(&compact(quote! {
+				pub async fn js_export_from_stringified(
+					client: <StringifiedClient as crate::js::JsParam>::Wire
+				) -> Result<JsClient, Error> {
+					let client = <StringifiedClient as crate::js::JsParam>::parse(client)?;
+					Self::from_stringified(client).await
+				}
+			})),
+			"{tokens}"
+		);
+	}
+
+	#[test]
+	fn a_block_wasm_bindgen_has_already_expanded_is_an_error() {
+		let item: ItemImpl = syn::parse_quote! {
+			impl JsClient {
+				#[wasm_bindgen::prelude::__wasm_bindgen_class_marker(
+					JsClient = "Client",
+					wasm_bindgen = wasm_bindgen,
+					wasm_bindgen_futures = wasm_bindgen_futures
+				)]
+				pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
+					self.inner_get_dir(uuid).await
+				}
+			}
+		};
+		assert_eq!(
+			error(item),
+			"list #[js_exports] before #[wasm_bindgen], which has already expanded this block"
+		);
+	}
+
+	#[test]
+	fn an_unexpanded_cfg_attr_holding_wasm_bindgen_is_an_error() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[cfg_attr(
+				all(target_family = "wasm", target_os = "unknown"),
+				wasm_bindgen(js_class = "Client")
+			)]
+			impl JsClient {
+				pub async fn get_dir(&self, uuid: UuidStr) -> Result<Dir, Error> {
+					self.inner_get_dir(uuid).await
+				}
+			}
+		};
+		assert_eq!(
+			error(item),
+			"#[js_exports] cannot tell whether this cfg_attr exports the block"
+		);
+	}
+
+	#[test]
+	fn a_param_that_is_not_a_plain_name_is_an_error() {
+		let item: ItemImpl = syn::parse_quote! {
+			#[wasm_bindgen(js_class = "Client")]
+			impl JsClient {
+				pub async fn resize(&self, (width, height): (u32, u32)) -> Result<(), Error> {
+					self.inner_resize(width, height).await
+				}
+			}
+		};
+		assert_eq!(
+			error(item),
+			"#[js_exports] needs each param of an async export to be a plain name"
+		);
+	}
+
+	fn js_type_state(args: proc_macro2::TokenStream) -> JsTypeState {
+		let args =
+			syn::parse::Parser::parse2(Punctuated::<Meta, Comma>::parse_terminated, args).unwrap();
+		parse_args(args.into_iter().collect()).unwrap()
+	}
+
+	fn js_param_impl_of(name: &str) -> String {
+		let name = format_ident!("{}", name);
+		compact(quote! {
+			#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+			impl crate::js::JsParam for #name {
+				type Wire = <Self as tsify::Tsify>::JsType;
+
+				fn parse(wire: Self::Wire) -> ::std::result::Result<Self, crate::Error> {
+					crate::js::parse_tsify(wire)
+				}
+			}
+		})
+	}
+
+	#[test]
+	fn an_imported_struct_is_read_through_js_param() {
+		let item: ItemStruct = syn::parse_quote! {
+			pub struct LoginParams {
+				pub email: String,
+			}
+		};
+		let tokens = compact(parse_struct(item, js_type_state(quote!(import, wasm_all))));
+		assert!(
+			tokens.ends_with(&js_param_impl_of("LoginParams")),
+			"{tokens}"
+		);
+	}
+
+	#[test]
+	fn an_imported_enum_is_read_through_js_param() {
+		let item: ItemEnum = syn::parse_quote! {
+			pub enum SharingRole {
+				Sharer(u64),
+				Receiver(u64),
+			}
+		};
+		let tokens = compact(enum_tokens(
+			item,
+			js_type_state(quote!(import, export, wasm_all)),
+		));
+		assert!(
+			tokens.ends_with(&js_param_impl_of("SharingRole")),
+			"{tokens}"
+		);
+	}
+
+	#[test]
+	fn an_export_only_type_is_not_a_js_param() {
+		let item: ItemStruct = syn::parse_quote! {
+			pub struct CopyReport {
+				pub copied: u64,
+			}
+		};
+		let tokens = compact(parse_struct(item, js_type_state(quote!(export, wasm_all))));
+		assert!(!tokens.contains("JsParam"), "{tokens}");
 	}
 }
