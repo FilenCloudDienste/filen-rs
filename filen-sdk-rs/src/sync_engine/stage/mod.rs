@@ -44,6 +44,10 @@
 //! read ([`Pager::turn`], and [`Pager::sweep`], which reads its pages alike) stops the apply
 //! admitting anything more: the transfers in flight finish, and the pass fails. Where an upload
 //! lands, failing to read ([`Pager::created_at`]), fails that upload and the pass with it.
+//!
+//! What a deletion asks before it runs ([`Pager::shields_local`], [`Pager::shields_remote`])
+//! panics instead, as the baseline's rows do (see `rows::snapshot`): only the runs the apply takes
+//! one action at a time ask it, so nothing is in flight to drop.
 
 mod plan;
 #[cfg(test)]

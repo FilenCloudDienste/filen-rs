@@ -11,7 +11,7 @@
 //! the scanner's fast-path stays stable.
 
 use std::{
-	collections::{BTreeSet, HashMap, HashSet},
+	collections::{HashMap, HashSet},
 	path::{Path, PathBuf},
 	sync::{
 		Arc, PoisonError,
@@ -142,12 +142,13 @@ pub struct SyncReport {
 	/// in `errors` that starts with [`LOCK_FAILURE`].
 	pub(super) lock_failed: bool,
 	/// Set when a write that RECORDS work already done could not be persisted: a baseline row, a
-	/// journal row, or a journal retirement. The act itself stands — the transfer, the rename, the
-	/// trash — and the store's own answer is in `errors`, naming the path. Such a pass is a FAILED
-	/// pass: a watch loop backs off rather than running the next one into the same wedged DB, and the
-	/// pass after it re-derives or redoes what the lost record described (see the baseline store's
-	/// `record_write`). So is a pass that could not read its staged plan, the only copy of what it is
-	/// applying (see `note_unread_plan`).
+	/// journal row, a journal retirement, or the pass's own record in its stage of a directory it
+	/// created or of a write a later deletion must not take down. The act itself stands — the
+	/// transfer, the rename, the trash — and the store's own answer is in `errors`, naming the path.
+	/// Such a pass is a FAILED pass: a watch loop backs off rather than running the next one into
+	/// the same wedged DB, and the pass after it re-derives or redoes what the lost record described
+	/// (see the baseline store's `record_write`). So is a pass that could not read its staged plan,
+	/// the only copy of what it is applying (see `note_unread_plan`).
 	pub(super) store_failed: Option<StoreFailure>,
 	/// How many actions this pass planned and then DROPPED before applying anything: a path it may
 	/// not act on (`drop_blocked`) or a deletion over content it cannot reach
@@ -659,7 +660,7 @@ pub(super) async fn apply(
 	let mut applied = 0usize;
 	let mut lease = Lease::Unheld;
 
-	let mut writes = PassWrites::default();
+	let mut failed = FailedDirMoves::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
 	// Creates and moves first, one at a time: they make the directories the transfers land in, and
@@ -674,7 +675,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !writes.skips(action, report, observer) {
+		if !failed.skips(action, report, observer) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -683,7 +684,7 @@ pub(super) async fn apply(
 				None => return note_interrupted(report, total - applied, observer),
 			}
 			if let Some(reason) =
-				apply_serial(&ctx, &entry, &mut plan, &mut writes, report, observer).await
+				apply_serial(&ctx, &entry, &mut plan, &mut failed, report, observer).await
 			{
 				full.note(reason);
 			}
@@ -693,9 +694,9 @@ pub(super) async fn apply(
 
 	// The transfers under a directory whose move just failed are failed before any transfer starts,
 	// and passed over below.
-	if !writes.failed_dir_moves.is_empty() {
+	if !failed.dirs.is_empty() {
 		let swept = plan.sweep(Some(Run::Transfers), |entry| {
-			if writes.skips(&entry.action, report, observer) {
+			if failed.skips(&entry.action, report, observer) {
 				applied += 1;
 			}
 		});
@@ -705,7 +706,7 @@ pub(super) async fn apply(
 	}
 
 	if admits_more(report)
-		&& unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report).is_some()
+		&& unless_unread(next_transfer(&mut plan, &ctx, &failed).await, report).is_some()
 	{
 		let concurrency = ctx.client.unauthed().state().max_concurrency().max(1);
 		// Byte progress comes from inside the SDK's transfer futures, which cannot reach the
@@ -719,7 +720,7 @@ pub(super) async fn apply(
 			while in_flight.len() < concurrency
 				&& admits_more(report)
 				&& let Some(staged) =
-					unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report)
+					unless_unread(next_transfer(&mut plan, &ctx, &failed).await, report)
 			{
 				let (action, releasable) = (&staged.entry.action, staged.releasable);
 				// Once an action finds a side full, the transfers already running finish, and the ones
@@ -768,7 +769,7 @@ pub(super) async fn apply(
 				if !admits_more(report) {
 					break;
 				}
-				if unless_unread(next_transfer(&mut plan, &ctx, &writes).await, report).is_none() {
+				if unless_unread(next_transfer(&mut plan, &ctx, &failed).await, report).is_none() {
 					break;
 				}
 				let Some(Staged {
@@ -813,7 +814,7 @@ pub(super) async fn apply(
 				}
 				Ok(Transfer::Done) => {
 					applied += 1;
-					writes.note(&action);
+					note_written(&plan, &action, report);
 					tracing::debug!("apply: {} done", action.describe());
 					observer(action.to_event());
 					match action {
@@ -829,7 +830,7 @@ pub(super) async fn apply(
 					unrecorded,
 				}) => {
 					applied += 1;
-					writes.note(&action);
+					note_written(&plan, &action, report);
 					observer(action.to_event());
 					observer(SyncEvent::Conflict {
 						rel_path: conflict.rel_path.clone(),
@@ -854,7 +855,7 @@ pub(super) async fn apply(
 		if !ctx.gate.wait_to_start().await {
 			return note_interrupted(report, total - applied, observer);
 		}
-		if !writes.skips(action, report, observer) {
+		if !failed.skips(action, report, observer) {
 			match lease.prepare(&ctx, action, releasable).await {
 				Some(Ok(())) => {}
 				Some(Err(error)) => {
@@ -862,7 +863,7 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			apply_serial(&ctx, &entry, &mut plan, &mut writes, report, observer).await;
+			apply_serial(&ctx, &entry, &mut plan, &mut failed, report, observer).await;
 		}
 		applied += 1;
 	}
@@ -874,12 +875,12 @@ pub(super) async fn apply(
 async fn next_transfer<'p>(
 	plan: &'p mut PagedPlan,
 	ctx: &ApplyContext<'_>,
-	writes: &PassWrites,
+	failed: &FailedDirMoves,
 ) -> Result<Option<&'p Staged>, crate::Error> {
 	while plan
 		.peek_in(ctx, Run::Transfers)
 		.await?
-		.is_some_and(|staged| writes.holds_back(&staged.entry.action).is_some())
+		.is_some_and(|staged| failed.holds_back(&staged.entry.action).is_some())
 	{
 		plan.next_in(ctx, Run::Transfers).await?;
 	}
@@ -1048,79 +1049,23 @@ fn hold_spent(budget: &LockBudget, since: Instant, writes: usize, now: Instant) 
 	now.saturating_duration_since(since) >= budget.hold || writes >= budget.batch
 }
 
-/// What this pass has written so far, so that no later action of the SAME pass takes it down.
-///
-/// The server dedups a create against an existing item case-insensitively and hands back that
-/// item, and a case-insensitive filesystem resolves two spellings to one entry, so a delete planned
-/// for one path can land on what another action of the pass just created, moved or renamed. The
-/// planner does not plan that shape (see [`plan::fold_dir_moves`](super::plan)); this
-/// is the net under it: a remote trash or local quarantine whose target is, or holds, something the
-/// pass already wrote is refused, and the next pass re-plans from what is really there.
+/// Where the directory moves that failed this pass were headed: nothing under those paths is
+/// attempted. As many as moves failed, which the fold makes one per moved subtree.
 #[derive(Debug, Default)]
-struct PassWrites {
-	/// Remote uuids the pass created, moved or renamed — including a create the dedup answered with
-	/// an existing directory's uuid.
-	remote_uuids: HashSet<Uuid>,
-	/// Collision keys of the remote paths the pass wrote.
-	remote_keys: BTreeSet<String>,
-	/// Collision keys of the local paths the pass wrote.
-	local_keys: BTreeSet<String>,
-	/// Where the directory moves that failed were headed: nothing under those paths is attempted.
-	failed_dir_moves: Vec<String>,
+struct FailedDirMoves {
+	dirs: Vec<String>,
 }
 
-impl PassWrites {
-	/// Record a successfully applied action.
-	fn note(&mut self, action: &SyncAction) {
-		match action {
-			SyncAction::CreateLocalDir { rel_path } | SyncAction::DownloadFile { rel_path, .. } => {
-				self.local_keys.insert(collision_key(rel_path));
-			}
-			SyncAction::MoveLocal { to_path, .. } => {
-				self.local_keys.insert(collision_key(to_path));
-			}
-			SyncAction::CreateRemoteDir { rel_path } | SyncAction::UploadFile { rel_path } => {
-				self.remote_keys.insert(collision_key(rel_path));
-			}
-			SyncAction::MoveRemote {
-				to_path,
-				remote_uuid,
-				..
-			} => {
-				self.remote_keys.insert(collision_key(to_path));
-				self.remote_uuids.insert(*remote_uuid);
-			}
-			SyncAction::DeleteLocal { .. }
-			| SyncAction::TrashRemote { .. }
-			| SyncAction::Conflict { .. }
-			| SyncAction::AdoptBaseline { .. } => {}
-		}
-	}
-
-	/// Whether trashing the remote item `remote_uuid` at `rel_path` would take down something this
-	/// pass wrote.
-	fn shields_remote(&self, rel_path: &str, remote_uuid: Uuid) -> bool {
-		self.remote_uuids.contains(&remote_uuid)
-			|| holds_key_at_or_under(&self.remote_keys, rel_path)
-	}
-
-	/// Whether quarantining the local item at `rel_path` would take down something this pass wrote.
-	fn shields_local(&self, rel_path: &str) -> bool {
-		holds_key_at_or_under(&self.local_keys, rel_path)
-	}
-
+impl FailedDirMoves {
 	/// The directory whose move failed this pass at or above either end of `action`: the plan names
 	/// that subtree by a path neither side carries.
 	fn holds_back(&self, action: &SyncAction) -> Option<&str> {
 		let (from, to) = action.endpoints();
-		self.failed_dir_moves
-			.iter()
-			.map(String::as_str)
-			.find(|dir| {
-				[from, to]
-					.into_iter()
-					.any(|path| path == *dir || is_under(path, dir))
-			})
+		self.dirs.iter().map(String::as_str).find(|dir| {
+			[from, to]
+				.into_iter()
+				.any(|path| path == *dir || is_under(path, dir))
+		})
 	}
 
 	/// Skip `action` when a directory move that failed this pass holds it back (see
@@ -1144,18 +1089,6 @@ impl PassWrites {
 		note_failure(report, action.rel_path(), &error);
 		true
 	}
-}
-
-/// Whether `keys` holds the collision key of `rel_path` or of something under it.
-fn holds_key_at_or_under(keys: &BTreeSet<String>, rel_path: &str) -> bool {
-	let key = collision_key(rel_path);
-	if keys.contains(&key) {
-		return true;
-	}
-	let prefix = format!("{key}/");
-	keys.range(prefix.clone()..)
-		.next()
-		.is_some_and(|next| next.starts_with(&prefix))
 }
 
 /// Journal a remote directory move from `from` to `to` and carry its subtree's rows along, in one
@@ -1655,16 +1588,16 @@ async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
 	plan: &mut PagedPlan,
-	writes: &mut PassWrites,
+	failed: &mut FailedDirMoves,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Option<HaltReason> {
 	let action = &planned.action;
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
-	let error = match apply_one(ctx, planned, plan, writes, report, &mut *observer).await {
+	let error = match apply_one(ctx, planned, plan, report, &mut *observer).await {
 		Ok(()) => {
-			writes.note(action);
+			note_written(plan, action, report);
 			return None;
 		}
 		Err(error) => error,
@@ -1681,13 +1614,32 @@ async fn apply_serial(
 		..
 	} = action
 	{
-		writes.failed_dir_moves.push(to_path.clone());
+		failed.dirs.push(to_path.clone());
 	}
 	observer(SyncEvent::ActionFailed {
 		rel_path: action.rel_path().to_string(),
 		error: error.to_string(),
 	});
 	note_failure(report, action.rel_path(), &error)
+}
+
+/// Record that `action` landed, for the deletions after it (see [`Pager::note_written`]).
+///
+/// A record the stage cannot take leaves that write unshielded, so the pass then admits nothing
+/// more, as it does once a baseline row is lost ([`admits_more`]): no deletion runs after it to
+/// take the write down. The write itself stands, and its path keeps no failure streak for it.
+fn note_written(plan: &PagedPlan, action: &SyncAction, report: &mut SyncReport) {
+	if let Err(error) = plan.pager.note_written(action) {
+		let error = super::engine::db_error(error, "recording what this pass wrote in its stage");
+		tracing::error!(
+			"apply: {} landed, but {error}; the pass starts nothing more",
+			action.describe()
+		);
+		report
+			.errors
+			.push(format!("{}: {error}", action.rel_path()));
+		report.store_failed = Some(StoreFailure::RecordNotWritten);
+	}
 }
 
 /// Record one action failure: the human-readable line AND the `(path, error)` pair the engine's
@@ -2165,7 +2117,6 @@ async fn apply_one(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
 	plan: &mut PagedPlan,
-	writes: &mut PassWrites,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) -> Result<(), crate::Error> {
@@ -2200,7 +2151,7 @@ async fn apply_one(
 			}
 		}
 		(SyncAction::DeleteLocal { rel_path, .. }, _) => {
-			if writes.shields_local(rel_path) {
+			if plan.pager.shields_local(rel_path) {
 				return Err(internal_owned(format!(
 					"refusing to quarantine {rel_path:?}: this pass already wrote there, under this or another spelling"
 				)));
@@ -2239,16 +2190,16 @@ async fn apply_one(
 				.inner_create_dir_with_created(parent, parent_and_name(rel_path).1, created)
 				.await?
 				.uuid();
-			// When the dedup answered with an existing directory, this is ITS uuid.
-			writes.remote_uuids.insert(new_uuid);
 			let kind = PendingKind::Created {
 				path: rel_path.clone(),
 				replaced: remote.as_deref().map(|node| node.remote_uuid),
 			};
 			let entry = dir_entry(rel_path, Some(new_uuid), None);
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
-			// What lands under the directory finds it here. A record that failed fails the action,
-			// and so the pass (see `record_not_written`), before anything is put under it.
+			// What lands under the directory finds it here, and a later deletion of the pass that
+			// names it is refused: when the dedup answered with an existing directory, this is ITS
+			// uuid. A record that failed fails the action, and so the pass (see
+			// `record_not_written`), before anything is put under it or deleted.
 			plan.record_created(rel_path, new_uuid)?;
 			report.remote_dirs_created += 1;
 		}
@@ -2282,7 +2233,7 @@ async fn apply_one(
 			},
 			start,
 		) => {
-			if writes.shields_remote(rel_path, *remote_uuid) {
+			if plan.pager.shields_remote(rel_path, *remote_uuid) {
 				return Err(internal_owned(format!(
 					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
 				)));
@@ -3798,52 +3749,95 @@ mod tests {
 		dir
 	}
 
+	/// `actions` staged as they stand, with nothing read for any of them, for the apply to page
+	/// through; the sync root is `u128::MAX`.
+	fn paged(actions: impl IntoIterator<Item = SyncAction>) -> (tempfile::TempDir, PagedPlan) {
+		let (dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		for action in actions {
+			writer.push(&PlannedEntry::bare(action)).unwrap();
+		}
+		let plan = PagedPlan::new(writer.finish().unwrap(), Uuid::from_u128(u128::MAX));
+		(dir, plan)
+	}
+
+	fn delete_local(rel_path: &str, kind: NodeKind) -> SyncAction {
+		SyncAction::DeleteLocal {
+			rel_path: rel_path.to_string(),
+			kind,
+		}
+	}
+
 	/// The shape a case-only directory rename planned per path takes on the remote: the create at
 	/// the new spelling is answered by the dedup with the EXISTING directory's uuid, and the trash
 	/// at the old spelling then names that same uuid. The trash must be refused.
 	#[test]
 	fn a_trash_of_a_directory_this_pass_created_is_refused() {
-		let existing = Uuid::new_v4();
-		let mut writes = PassWrites::default();
-		writes.note(&SyncAction::CreateRemoteDir {
+		let existing = Uuid::from_u128(1);
+		let create = SyncAction::CreateRemoteDir {
 			rel_path: "docs".to_string(),
-		});
-		writes.remote_uuids.insert(existing);
-		assert!(writes.shields_remote("Docs", existing), "same uuid");
+		};
+		let (_dir, mut plan) = paged([create.clone(), trash("Docs", NodeKind::Dir)]);
+		plan.record_created("docs", existing).unwrap();
+		plan.pager.note_written(&create).unwrap();
 		assert!(
-			writes.shields_remote("Docs", Uuid::new_v4()),
+			plan.pager.shields_remote("Other", existing),
+			"the directory the dedup answered with, under any name"
+		);
+		assert!(
+			plan.pager.shields_remote("Docs", Uuid::from_u128(2)),
 			"same name under another spelling"
 		);
 		assert!(
-			!writes.shields_remote("Other", Uuid::new_v4()),
+			!plan.pager.shields_remote("Other", Uuid::from_u128(2)),
 			"an unrelated trash is not held"
 		);
 	}
 
 	/// A trash or quarantine of a directory that now holds something this pass wrote — a child
-	/// moved or downloaded into it under another spelling — would take that write down with it.
+	/// moved or downloaded into it under another spelling — would take that write down with it, and
+	/// a trash of the item a move moved would take down the item itself.
 	#[test]
 	fn a_delete_above_a_write_of_this_pass_is_refused() {
-		let mut writes = PassWrites::default();
-		writes.note(&SyncAction::MoveRemote {
-			from_path: "Docs/a.txt".to_string(),
-			to_path: "docs/a.txt".to_string(),
-			kind: NodeKind::File,
-			remote_uuid: Uuid::new_v4(),
-		});
-		writes.note(&SyncAction::DownloadFile {
-			rel_path: "docs/b.txt".to_string(),
-			remote_uuid: Uuid::new_v4(),
-		});
-		assert!(writes.shields_remote("Docs", Uuid::new_v4()));
-		assert!(writes.shields_local("Docs"));
+		let moved = Uuid::from_u128(1);
+		let writes = [
+			SyncAction::MoveRemote {
+				from_path: "Docs/a.txt".to_string(),
+				to_path: "docs/a.txt".to_string(),
+				kind: NodeKind::File,
+				remote_uuid: moved,
+			},
+			SyncAction::DownloadFile {
+				rel_path: "docs/b.txt".to_string(),
+				remote_uuid: Uuid::from_u128(2),
+			},
+		];
+		let (_dir, plan) = paged(
+			writes
+				.iter()
+				.cloned()
+				.chain([delete_local("Docs", NodeKind::Dir)]),
+		);
+		for write in &writes {
+			plan.pager.note_written(write).unwrap();
+		}
+		assert!(plan.pager.shields_remote("Docs", Uuid::from_u128(3)));
 		assert!(
-			!writes.shields_local("Docs/c.txt"),
+			plan.pager.shields_remote("elsewhere.txt", moved),
+			"the moved item"
+		);
+		assert!(plan.pager.shields_local("Docs"));
+		assert!(
+			!plan.pager.shields_local("Docs/c.txt"),
 			"a sibling of the write is not held"
 		);
 		assert!(
-			!writes.shields_local("doc"),
+			!plan.pager.shields_local("doc"),
 			"a name sharing only a prefix is not held"
+		);
+		assert!(
+			!plan.pager.shields_remote("docs/b.txt", Uuid::from_u128(3)),
+			"a local write does not hold a remote trash"
 		);
 	}
 
@@ -3851,12 +3845,61 @@ mod tests {
 	fn a_key_sorting_between_a_dir_and_its_children_does_not_hide_them() {
 		// `docs-x` sorts after `docs` but before `docs/`, so a range read has to start at the
 		// child prefix rather than at the key itself.
-		let keys = BTreeSet::from(["docs-x".to_string(), "docs/a.txt".to_string()]);
-		assert!(holds_key_at_or_under(&keys, "Docs"));
-		assert!(!holds_key_at_or_under(
-			&BTreeSet::from(["docs-x".to_string()]),
-			"Docs"
-		));
+		let shields_docs = |written: &[&str]| {
+			let downloads: Vec<SyncAction> = written.iter().map(|path| download(path)).collect();
+			let (_dir, plan) = paged(
+				downloads
+					.iter()
+					.cloned()
+					.chain([delete_local("Docs", NodeKind::Dir)]),
+			);
+			for download in &downloads {
+				plan.pager.note_written(download).unwrap();
+			}
+			plan.pager.shields_local("Docs")
+		};
+		assert!(shields_docs(&["docs-x", "docs/a.txt"]));
+		assert!(!shields_docs(&["docs-x"]));
+	}
+
+	/// A write the stage cannot record is left unshielded, so the pass admits nothing more after
+	/// it. The write itself landed: its path keeps no failure streak for it.
+	#[test]
+	fn a_write_the_stage_cannot_record_fails_the_pass_but_not_its_path() {
+		let (_dir, plan) = paged([upload("up.txt"), trash("Up.txt", NodeKind::File)]);
+		plan.pager.break_stage();
+		let mut report = SyncReport::default();
+		note_written(&plan, &upload("up.txt"), &mut report);
+		assert_eq!(report.store_failed, Some(StoreFailure::RecordNotWritten));
+		assert!(!admits_more(&report));
+		assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+		assert!(
+			report.errors[0].starts_with("up.txt: ")
+				&& report.errors[0].contains("recording what this pass wrote in its stage"),
+			"{}",
+			report.errors[0]
+		);
+		assert!(report.failed_paths.is_empty());
+	}
+
+	/// A pass that deletes nothing has nothing a write of its own needs shielding from: a first push
+	/// of 10,000 files keeps none of them, in memory or in its stage.
+	#[test]
+	fn a_plan_that_deletes_nothing_keeps_nothing_of_its_writes() {
+		let uploads: Vec<SyncAction> = (0..10_000)
+			.map(|n| upload(&format!("d{:02}/f{n:05}.txt", n % 100)))
+			.collect();
+		let (_dir, plan) = paged(uploads.iter().cloned());
+		let ((), peak) = alloc_meter::peak_bytes(|| {
+			for action in &uploads {
+				plan.pager.note_written(action).unwrap();
+			}
+		});
+		assert_eq!(peak, 0, "10_000 uploads landed and nothing is deleted");
+		assert!(
+			!plan.pager.shields_remote("d00", Uuid::from_u128(1)),
+			"the stage recorded the uploads"
+		);
 	}
 
 	/// A move nested inside another commits the rows of its own step only: after the outer move the
