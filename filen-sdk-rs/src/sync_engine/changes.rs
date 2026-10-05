@@ -330,9 +330,10 @@ fn is_rule_file(rel: &str) -> bool {
 
 /// The paths a pass has to re-observe locally, or the reason it cannot narrow them down.
 ///
-/// Paths are root-relative, NFC, `/`-joined — the keys [`scan_local`](super::scan::scan_local)
-/// produces — so a path recorded here names the same node the scan and the baseline do. There is
-/// deliberately nothing here to express "absent": a path is something to LOOK at.
+/// Paths are root-relative, NFC, `/`-joined — the keys
+/// [`scan_local_staged`](super::scan::scan_local_staged) produces — so a path recorded here names
+/// the same node the scan and the baseline do. There is deliberately nothing here to express
+/// "absent": a path is something to LOOK at.
 #[derive(Debug, Default)]
 struct LocalDirty {
 	paths: BTreeSet<String>,

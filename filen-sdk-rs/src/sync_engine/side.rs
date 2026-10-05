@@ -16,12 +16,14 @@
 //! reference to what it already holds — no allocation, which is what keeps a whole pass's cost
 //! where it was — and a derived one hands out what it just built, and lends what it holds.
 //!
-//! # The two backings
+//! # The backings
 //!
 //! [`Side::Whole`] is the path-keyed map a whole read produces. [`Side::Carried`] is an
 //! [`Overlay`] — one entry per path THIS pass read — over the rows the resident baseline already
 //! describes: a carried row's local and remote nodes are both derived from that row on demand, so
-//! a change-scoped pass holds per-PASS data instead of a second copy of the tree.
+//! a change-scoped pass holds per-PASS data instead of a second copy of the tree. [`Side::Staged`]
+//! is what a whole pass's local walk produces now: the map's nodes as rows of the pass's stage,
+//! read a page at a time, so a whole pass holds no copy of the local tree in memory either.
 //!
 //! That is the whole of the change-scoped pass's cost. At a million rows, materializing the two
 //! maps and then freeing them was 395 ms of a 397 ms pass, against 0.226 ms for every other step
@@ -62,6 +64,7 @@ use super::{
 	plan::{is_under, moved_path},
 	rows::Baseline,
 	scan::at_or_under_folded,
+	stage::{Pages, StagedSide},
 };
 
 /// One side of a pass, addressed by path.
@@ -248,12 +251,21 @@ impl<T> Overlay<T> {
 /// Nothing hands out a borrow of a stored node (`&T`) or of a stored path (`&str`), which is the
 /// whole discipline: a backing that builds a node on demand has nothing to lend. Reads come back
 /// as [`Cow`], so a materialized side still lends what it holds and allocates nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Compared only by the tests and the probe. Never cloned: a staged side is its pass's own table,
+/// so a test that wants a second side to edit asks for a copy of its nodes
+/// (`test_support::copied`).
+#[derive(Debug)]
+#[cfg_attr(any(test, feature = "bench-internals"), derive(PartialEq, Eq))]
 pub(crate) enum Side<T> {
 	/// Every node, as a whole read produced it.
 	Whole(HashMap<String, T>),
 	/// What this pass observed, over the rows the baseline carries.
 	Carried(Overlay<T>),
+	/// Every node, as a whole pass's walk staged it: a row each in the pass's stage, read a page at
+	/// a time (see [`StagedSide`]). What a whole read produces on the local side, where a whole map
+	/// held a node per item of the tree in memory for the rest of the plan.
+	Staged(StagedSide<T>),
 }
 
 impl<T> Side<T> {
@@ -262,24 +274,25 @@ impl<T> Side<T> {
 		Self::Carried(Overlay::default())
 	}
 
-	/// How many nodes this side has room for. Only the probe's memory accounting asks, and the
-	/// tests. For a CARRIED side this is the per-pass data and not the tree, which is the whole
-	/// point of it.
+	/// How many nodes this side has room for in memory. Only the probe's memory accounting asks,
+	/// and the tests. For a CARRIED side this is the per-pass data and not the tree, which is the
+	/// whole point of it; a STAGED side holds its nodes in its stage, and none in memory.
 	#[cfg(any(test, feature = "bench-internals"))]
 	pub(crate) fn capacity(&self) -> usize {
 		match self {
 			Self::Whole(map) => map.capacity(),
 			Self::Carried(overlay) => overlay.nodes.capacity(),
+			Self::Staged(_) => 0,
 		}
 	}
 
 	/// How many tombstones this side has room for, beside [`capacity`](Self::capacity)'s nodes:
-	/// a carried side keeps them in a set of paths of their own. None for a whole side, which
-	/// records no absence. Only the probe's memory accounting asks.
+	/// a carried side keeps them in a set of paths of their own. None for a whole or a staged side,
+	/// which record no absence. Only the probe's memory accounting asks.
 	#[cfg(feature = "bench-internals")]
 	pub(crate) fn tombstone_capacity(&self) -> usize {
 		match self {
-			Self::Whole(_) => 0,
+			Self::Whole(_) | Self::Staged(_) => 0,
 			Self::Carried(overlay) => overlay.gone.capacity(),
 		}
 	}
@@ -295,18 +308,19 @@ impl<T> Side<T> {
 		}
 	}
 
-	/// Read a WHOLE side against an empty tree, for a test that has no baseline to hand.
+	/// Read a WHOLE or a STAGED side against an empty tree, for a test that has no baseline to
+	/// hand.
 	///
-	/// Exact rather than a stand-in: a whole side's backing never consults a baseline. It ASSERTS
-	/// the backing, because a carried side read this way would answer "holds nothing" for every
-	/// row it carries and turn the assertions that follow into ones that cannot fail.
+	/// Exact rather than a stand-in: neither backing ever consults a baseline. It ASSERTS the
+	/// backing, because a carried side read this way would answer "holds nothing" for every row it
+	/// carries and turn the assertions that follow into ones that cannot fail.
 	///
 	/// The probe reads its whole-pass sides through this too, which is why it is not `cfg(test)`:
 	/// that module is compiled into a binary built WITHOUT `cfg(test)`.
 	#[cfg(any(test, feature = "bench-internals"))]
 	pub(super) fn whole(&self) -> SideRef<'_, T> {
 		assert!(
-			matches!(self, Self::Whole(_)),
+			!matches!(self, Self::Carried(_)),
 			"a carried side must be read against the baseline it derives from, not an empty one"
 		);
 		static EMPTY: std::sync::OnceLock<Baseline> = std::sync::OnceLock::new();
@@ -316,37 +330,39 @@ impl<T> Side<T> {
 	/// The paths this side holds that no baseline row put there — what THIS pass's own producers
 	/// added: the local observation, the remote delta, the fold of unacknowledged writes.
 	///
-	/// A whole side answers with every path it holds, which is all it has. A carried one answers
-	/// with its OVERLAY's nodes alone, and that is exact rather than a shortcut:
+	/// A whole or a staged side answers with every path it holds, which is all it has. A carried
+	/// one answers with its OVERLAY's nodes alone, and that is exact rather than a shortcut:
 	/// [`derive::from_baseline`](super::derive::from_baseline) places nothing, so every other path
 	/// such a side holds IS a baseline row answering for itself. That is what lets the assembly
 	/// check cost the change rather than the tree.
-	pub(super) fn own_keys(&self) -> impl Iterator<Item = &str> {
+	pub(super) fn own_keys(&self) -> impl Iterator<Item = Cow<'_, str>> {
 		match self {
-			Self::Whole(map) => map.keys(),
+			Self::Whole(map) => Either::Left(map.keys()),
 			// A tombstone holds nothing, so it is not a key this side has.
-			Self::Carried(overlay) => overlay.nodes.keys(),
+			Self::Carried(overlay) => Either::Left(overlay.nodes.keys()),
+			Self::Staged(staged) => Either::Right(staged.pages().map(|(path, _)| Cow::Owned(path))),
 		}
-		.map(String::as_str)
+		.map_left(|held| held.map(|path| Cow::Borrowed(path.as_str())))
 	}
 
 	/// Whether this pass recorded nothing at `path`, so that whatever this side holds there is the
-	/// node its row carries. No row is read to say so. A whole side records everything it holds
-	/// and never answers `true`.
+	/// node its row carries. No row is read to say so. A whole or a staged side records everything
+	/// it holds and never answers `true`.
 	pub(super) fn untouched(&self, path: &str) -> bool {
 		match self {
-			Self::Whole(_) => false,
+			Self::Whole(_) | Self::Staged(_) => false,
 			Self::Carried(overlay) => !overlay.records(path),
 		}
 	}
 
-	/// This side's nodes by value, for a test that owns a WHOLE one and wants to feed them
-	/// somewhere. Asserts the backing for the reason [`whole`](Self::whole) does: a carried side's
-	/// nodes are not held anywhere to be handed over.
+	/// This side's nodes by value, for a test that owns a WHOLE or a STAGED one and wants to feed
+	/// them somewhere. Asserts the backing for the reason [`whole`](Self::whole) does: a carried
+	/// side's nodes are not held anywhere to be handed over.
 	#[cfg(test)]
 	pub(super) fn into_whole(self) -> HashMap<String, T> {
 		match self {
 			Self::Whole(map) => map,
+			Self::Staged(staged) => staged.into_pages().collect(),
 			Self::Carried(_) => panic!("a carried side holds no map to hand over"),
 		}
 	}
@@ -357,20 +373,26 @@ impl<T> Side<T> {
 	/// have to DERIVE the displaced node, and the one caller that wanted it
 	/// (`engine::place_node`) asks through [`NodesAt::at`] first, which is one lookup on the
 	/// path it is already holding.
+	///
+	/// A staged side files the node under `path` and hands it back with that path, and holds one
+	/// spelling of each folded name (see [`StagedSide::insert`]).
 	pub(crate) fn insert(&mut self, path: String, node: T) {
 		match self {
 			Self::Whole(map) => {
 				map.insert(path, node);
 			}
 			Self::Carried(overlay) => overlay.put(path, node),
+			Self::Staged(staged) => staged.insert(&path, &node),
 		}
 	}
 
 	/// Make room for `additional` more nodes, for a caller that knows how many it is about to put.
+	/// A staged side's room is its stage's file.
 	pub(super) fn reserve(&mut self, additional: usize) {
 		match self {
 			Self::Whole(map) => map.reserve(additional),
 			Self::Carried(overlay) => overlay.nodes.reserve(additional),
+			Self::Staged(_) => {}
 		}
 	}
 }
@@ -383,6 +405,7 @@ impl<T: FromRow> Side<T> {
 	pub(crate) fn remove(&mut self, baseline: &Baseline, path: &str) -> Option<T> {
 		match self {
 			Self::Whole(map) => map.remove(path),
+			Self::Staged(staged) => staged.remove(path),
 			Self::Carried(overlay) => {
 				// Already a tombstone: nothing to take, and the tombstone stands.
 				if overlay.gone.contains(path) {
@@ -411,6 +434,7 @@ impl<T: FromRow> Side<T> {
 	pub(super) fn forget(&mut self, row: &BaselineEntry) -> bool {
 		match self {
 			Self::Whole(map) => map.remove(&row.rel_path).is_some(),
+			Self::Staged(staged) => staged.forget(&row.rel_path),
 			Self::Carried(overlay) => {
 				// Already a tombstone: nothing held, and the tombstone stands.
 				if overlay.gone.contains(&row.rel_path) {
@@ -431,15 +455,16 @@ impl<T: FromRow> Side<T> {
 	pub(super) fn into_entries(self, baseline: &Baseline) -> impl Iterator<Item = (String, T)> {
 		match self {
 			Self::Whole(map) => Either::Left(map.into_iter()),
+			Self::Staged(staged) => Either::Right(Either::Left(staged.into_pages())),
 			// A carried side holds its rows' nodes nowhere to hand over, so they are built as a
 			// walk of it builds them.
-			Self::Carried(_) => Either::Right(
+			Self::Carried(_) => Either::Right(Either::Right(
 				self.of(baseline)
 					.iter()
 					.map(|(path, node)| (path.into_owned(), node.into_owned()))
 					.collect::<Vec<_>>()
 					.into_iter(),
-			),
+			)),
 		}
 	}
 
@@ -451,6 +476,7 @@ impl<T: FromRow> Side<T> {
 	pub(crate) fn retain(&mut self, baseline: &Baseline, mut keep: impl FnMut(&str, &T) -> bool) {
 		match self {
 			Self::Whole(map) => map.retain(|path, node| keep(path, node)),
+			Self::Staged(staged) => staged.retain(keep),
 			Self::Carried(_) => {
 				let dropping: Vec<String> = self
 					.of(baseline)
@@ -480,6 +506,7 @@ impl<T: FromRow> Side<T> {
 				.filter(|path| is_under(path, dir))
 				.cloned()
 				.collect(),
+			Self::Staged(staged) => staged.subtree_paths(dir),
 			Self::Carried(overlay) => {
 				let mut out: Vec<String> = Vec::new();
 				// The rows, from the baseline's own subtree walk — the size of the directory
@@ -525,6 +552,10 @@ impl<T: FromRow> Side<T> {
 	/// observation about the row still sitting there, and a node placed beside the landing paths
 	/// was never this move's to drop. Sweeping the whole destination subtree would resurrect the
 	/// first and lose the second.
+	///
+	/// A STAGED side re-keys its rows in its stage, where a node's path is its row's, so there is
+	/// no node for `set_path` to tell. Its destination must be free under every spelling, which a
+	/// directory move's is (see [`StagedSide::rekey`]).
 	pub(crate) fn rekey_subtree(
 		&mut self,
 		baseline: &Baseline,
@@ -546,6 +577,7 @@ impl<T: FromRow> Side<T> {
 					map.insert(new, node);
 				}
 			}
+			Self::Staged(staged) => staged.rekey(from, to),
 			Self::Carried(overlay) => {
 				let moving: Vec<(String, String)> = overlay
 					.paths()
@@ -584,11 +616,11 @@ impl<T: FromRow> Side<T> {
 	/// the half of a directory move [`rekey_subtree`](Self::rekey_subtree) is not, for the side
 	/// the move does NOT carry.
 	///
-	/// A whole side derives nothing from the rows, so moving them leaves it as it was. A carried
-	/// side reads its nodes off those very rows and would follow them: it would stop holding what
-	/// it carried at each source path, and start holding a node at each destination the row
-	/// lands on — a node no observation of this side ever found there. So before the rows move,
-	/// every path they leave or land on that this side recorded nothing at gets what the side
+	/// A whole or a staged side derives nothing from the rows, so moving them leaves it as it was.
+	/// A carried side reads its nodes off those very rows and would follow them: it would stop
+	/// holding what it carried at each source path, and start holding a node at each destination
+	/// the row lands on — a node no observation of this side ever found there. So before the rows
+	/// move, every path they leave or land on that this side recorded nothing at gets what the side
 	/// answers there NOW: the node the row at it carries, or — where a row lands on a path that
 	/// carried nothing — a tombstone.
 	///
@@ -680,6 +712,11 @@ impl<T> Extend<(String, T)> for Side<T> {
 					overlay.put(path, node);
 				}
 			}
+			Self::Staged(staged) => {
+				for (path, node) in nodes {
+					staged.insert(&path, &node);
+				}
+			}
 		}
 	}
 }
@@ -766,6 +803,7 @@ impl<T: FromRow> SideRef<'_, T> {
 	fn entries(&self) -> Entries<'_, T> {
 		match self.side {
 			Side::Whole(map) => Entries::Whole(map.iter()),
+			Side::Staged(staged) => Entries::Staged(staged.pages()),
 			Side::Carried(overlay) => {
 				let mut out: Vec<(String, T)> = Vec::with_capacity(self.baseline.carryable_rows());
 				#[cfg(feature = "bench-internals")]
@@ -795,6 +833,7 @@ impl<T: FromRow> SideRef<'_, T> {
 	pub(super) fn at_row(&self, row: &BaselineEntry) -> Option<Cow<'_, T>> {
 		match self.side {
 			Side::Whole(map) => map.get(&row.rel_path).map(Cow::Borrowed),
+			Side::Staged(staged) => staged.at(&row.rel_path).map(Cow::Owned),
 			Side::Carried(overlay) => match overlay.get(&row.rel_path) {
 				Recorded::Node(node) => Some(Cow::Borrowed(node)),
 				Recorded::Tombstone => None,
@@ -812,6 +851,8 @@ impl<T: FromRow> SideRef<'_, T> {
 	fn entries_under(&self, dir: &str) -> Entries<'_, T> {
 		match self.side {
 			Side::Whole(map) => Entries::Whole(map.iter()),
+			// The subtree's own range of the table, rather than a walk of the whole of it.
+			Side::Staged(staged) => Entries::Staged(staged.pages_under(dir)),
 			Side::Carried(overlay) => {
 				let mut out: Vec<(String, T)> = Vec::new();
 				#[cfg(feature = "bench-internals")]
@@ -832,7 +873,7 @@ impl<T: FromRow> SideRef<'_, T> {
 	}
 }
 
-/// The two backings' entries as one iterator, so [`Nodes`] can return a single type without the
+/// The backings' entries as one iterator, so [`Nodes`] can return a single type without the
 /// materialized side paying an allocation it did not pay before.
 enum Entries<'a, T> {
 	Whole(hash_map::Iter<'a, String, T>),
@@ -842,6 +883,8 @@ enum Entries<'a, T> {
 		std::vec::IntoIter<(String, T)>,
 		hash_map::Iter<'a, String, T>,
 	),
+	/// The nodes a staged side reads out of its stage, a page at a time.
+	Staged(Pages<'a, T>),
 }
 
 impl<'a, T: Clone> Iterator for Entries<'a, T> {
@@ -854,6 +897,9 @@ impl<'a, T: Clone> Iterator for Entries<'a, T> {
 				.next()
 				.map(|(path, node)| (Cow::Owned(path), Cow::Owned(node)))
 				.or_else(|| held.next().map(lent)),
+			Self::Staged(read) => read
+				.next()
+				.map(|(path, node)| (Cow::Owned(path), Cow::Owned(node))),
 		}
 	}
 }
@@ -869,6 +915,7 @@ impl<T: FromRow> NodesAt for SideRef<'_, T> {
 	fn at(&self, path: &str) -> Option<Cow<'_, T>> {
 		match self.side {
 			Side::Whole(map) => map.get(path).map(Cow::Borrowed),
+			Side::Staged(staged) => staged.at(path).map(Cow::Owned),
 			Side::Carried(overlay) => match overlay.get(path) {
 				Recorded::Node(node) => Some(Cow::Borrowed(node)),
 				// Observed absent: the tombstone answers, and the row behind it does not.
@@ -886,6 +933,7 @@ impl<T: FromRow> NodesAt for SideRef<'_, T> {
 	fn holds(&self, path: &str) -> bool {
 		match self.side {
 			Side::Whole(map) => map.contains_key(path),
+			Side::Staged(staged) => staged.holds(path),
 			// Answered WITHOUT building the node, which is the whole reason `holds` exists apart
 			// from `at().is_some()`.
 			Side::Carried(overlay) => overlay.holds(self.baseline, path),
@@ -895,6 +943,8 @@ impl<T: FromRow> NodesAt for SideRef<'_, T> {
 	fn occupied(&self, path: &str) -> bool {
 		match self.side {
 			Side::Whole(map) => map.keys().any(|key| at_or_under_folded(key, path)),
+			// Two seeks of the folded index, where a map folds its keys one by one.
+			Side::Staged(staged) => staged.occupied(path),
 			Side::Carried(overlay) => {
 				// What the pass observed is the only part of this side that is not a row, so it is
 				// the only part folded key by key — and it is the per-pass data, not the tree.
@@ -920,6 +970,7 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 	fn len(&self) -> usize {
 		match self.side {
 			Side::Whole(map) => map.len(),
+			Side::Staged(staged) => staged.len(),
 			Side::Carried(overlay) => {
 				// The rows this side carries, corrected by what the pass recorded over them. Each
 				// overlay key is distinct, so a tombstone can only cancel a row that was counted.
@@ -957,7 +1008,7 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 	fn is_empty(&self) -> bool {
 		match self.side {
 			Side::Whole(map) => map.is_empty(),
-			Side::Carried(_) => Nodes::len(self) == 0,
+			Side::Carried(_) | Side::Staged(_) => Nodes::len(self) == 0,
 		}
 	}
 
@@ -976,9 +1027,39 @@ impl<T: FromRow> Nodes for SideRef<'_, T> {
 	}
 }
 
+/// What the tests copy and read sides with.
+#[cfg(test)]
+pub(super) mod test_support {
+	use super::{FromRow, Nodes, Side, SideRef};
+
+	/// A side holding what `side` holds, for a test that edits one and keeps the other: a whole or
+	/// a carried side's backing copied, and a staged side's nodes in a [`Side::Whole`], since a
+	/// staged side is its pass's own table and has no second one to copy into.
+	pub(in super::super) fn copied<T: Clone>(side: &Side<T>) -> Side<T> {
+		match side {
+			Side::Whole(map) => Side::Whole(map.clone()),
+			Side::Carried(overlay) => Side::Carried(overlay.clone()),
+			Side::Staged(staged) => Side::Whole(staged.pages().collect()),
+		}
+	}
+
+	/// Every node `side` holds, with its path, in path order.
+	pub(in super::super) fn sorted_entries<T: FromRow>(side: &SideRef<'_, T>) -> Vec<(String, T)> {
+		let mut out: Vec<(String, T)> = side
+			.iter()
+			.map(|(path, node)| (path.into_owned(), node.into_owned()))
+			.collect();
+		out.sort_by(|left, right| left.0.cmp(&right.0));
+		out
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::*;
+	use super::{
+		test_support::{copied, sorted_entries},
+		*,
+	};
 
 	/// A marker node is never derived from a row — it is not either side of a pass — so a carried
 	/// side of one holds exactly its overlay, which is what the overlay tests below want.
@@ -1324,15 +1405,6 @@ mod tests {
 		out
 	}
 
-	fn sorted_entries(side: &SideRef<'_, RemoteNode>) -> Vec<(String, RemoteNode)> {
-		let mut out: Vec<(String, RemoteNode)> = side
-			.iter()
-			.map(|(path, node)| (path.into_owned(), node.into_owned()))
-			.collect();
-		out.sort_by(|left, right| left.0.cmp(&right.0));
-		out
-	}
-
 	/// Every read the two traits expose, asked of both backings.
 	///
 	/// ITERATION ORDER is deliberately not compared: a map has the hash order of its table and a
@@ -1351,6 +1423,7 @@ mod tests {
 		if pw != pc {
 			let overlay_at = |path: &str| match carried {
 				Side::Whole(_) => "<whole>".to_owned(),
+				Side::Staged(_) => "<staged>".to_owned(),
 				Side::Carried(overlay) => match overlay.get(path) {
 					Recorded::Nothing => "no-entry".to_owned(),
 					Recorded::Tombstone => "TOMBSTONE".to_owned(),
@@ -1493,7 +1566,7 @@ mod tests {
 						// both backings, it must say whether `remove` hands a node back and leave
 						// the side `remove` leaves.
 						let forgotten = baseline.get(path).map(|row| {
-							let (mut w, mut c) = (whole.clone(), carried.clone());
+							let (mut w, mut c) = (copied(&whole), copied(&carried));
 							((w.forget(&row), w), (c.forget(&row), c))
 						});
 						let removed = (

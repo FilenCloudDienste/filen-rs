@@ -1292,8 +1292,10 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 }
 
 /// A dry run beside a pass that is applying leaves that pass's plan alone. The pass stages its plan
-/// in a file of its own beside the baseline, named for the pass; `plan_pair` stages nothing and
-/// touches nothing of it, the pass applies all of its plan once resumed, and its file goes with it.
+/// in a file of its own beside the baseline, named for the pass; its scan took a file of its own
+/// before it, numbered first and gone once the plan was staged. `plan_pair` stages its own scan
+/// under a number of its own, removes it before it returns and touches nothing of the pass's plan;
+/// the pass applies all of its plan once resumed, and its file goes with it.
 #[shared_test_runtime]
 async fn observ_add_a_dry_run_beside_an_applying_pass_leaves_its_staged_plan_alone() {
 	/// Twice the client's transfer window, so the pass still has uploads to start once suspended.
@@ -1360,18 +1362,19 @@ async fn observ_add_a_dry_run_beside_an_applying_pass_leaves_its_staged_plan_alo
 		.await
 		.unwrap();
 
-	let live = vec![format!("{db_name}-stage-{pair}-0")];
+	// The pass's scan was staged under 0, and went once its plan was staged under 1.
+	let live = vec![format!("{db_name}-stage-{pair}-1")];
 	assert_eq!(
 		stages(),
 		live,
-		"the pass's plan is staged under its own name"
+		"the pass's plan is staged under its own name, and nothing else of the pass is left"
 	);
 	let plan = engine.plan_pair(pair).await.unwrap();
 	assert!(plan.refused.is_none(), "{plan:?}");
 	assert_eq!(
 		stages(),
 		live,
-		"the dry run staged something of its own, or removed the pass's stage"
+		"the dry run left a stage of its own behind, or removed the pass's stage"
 	);
 
 	engine.resume_pair(pair).await.unwrap();

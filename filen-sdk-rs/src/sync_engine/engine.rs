@@ -2006,8 +2006,8 @@ pub(super) fn unaccounted_key(
 	local
 		.own_keys()
 		.chain(remote.own_keys())
-		.find(|path| !decided.contains(*path) && !baseline.contains_key(path))
-		.map(str::to_owned)
+		.find(|path| !decided.contains(path.as_ref()) && !baseline.contains_key(path))
+		.map(Cow::into_owned)
 }
 
 /// The read-only inputs to a pass, shared by planning and applying.
@@ -4256,11 +4256,22 @@ impl SyncEngine {
 					.collect(),
 			)
 		};
+		// Into the pass's stage, a row per entry, rather than a node per entry in memory for the rest
+		// of the plan: a whole walk is the tree.
+		let stage = self.stage(pair)?;
+		let at = stage.path().display().to_string();
 		let (mut local_scan, rules) = tokio::task::spawn_blocking(move || {
-			scan::scan_local(&local_root, &scan_baseline, remote_rules.rules, rule_files)
+			scan::scan_local_staged(
+				&local_root,
+				&scan_baseline,
+				remote_rules.rules,
+				rule_files,
+				stage,
+			)
 		})
 		.await
-		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?;
+		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?
+		.map_err(|e| db_error(e, &format!("staging the local scan in {at}")))?;
 		// This pass's facts, computed whole: `""` answers for every path, so the merge replaces
 		// whatever the previous pass carried (see `PairFacts::merge_local_scan`). Kept on the pass,
 		// where directory moves re-key them along with everything else it blocks.
@@ -6241,6 +6252,7 @@ mod tests {
 			ignore::IgnoreRules,
 			plan::RemoteNode,
 			scan::LocalNode,
+			side::test_support::copied,
 		},
 	};
 
@@ -11796,7 +11808,7 @@ mod tests {
 			pending.fold_into(
 				PAIR + 1,
 				&Baseline::default(),
-				&mut foreign.clone(),
+				&mut copied(&foreign),
 				&mut BTreeSet::new()
 			),
 			0,

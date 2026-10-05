@@ -1,4 +1,5 @@
-//! The local-side scan: walk a pair's local root into a `rel_path -> LocalNode` map, applying the
+//! The local-side scan: walk a pair's local root into a `rel_path -> LocalNode` map — or, for a
+//! whole pass, into the pass's stage ([`scan_local_staged`]) — applying the
 //! mtime+size fast-path so an unchanged file is never re-hashed. An edit that kept BOTH its size
 //! and its mtime is therefore invisible here; what protects it from being overwritten is the
 //! pre-download stash hashing its target (`apply::local_holds_unsynced_content`), not the scan.
@@ -25,6 +26,7 @@
 use std::{
 	cell::RefCell,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	convert::Infallible,
 	ffi::OsStr,
 	fmt,
 	io::{ErrorKind, Read},
@@ -43,6 +45,7 @@ use super::{
 	},
 	rows::Baseline,
 	side::Side,
+	stage::{Paging, Stage, StageSink},
 };
 use crate::{
 	fs::name::ValidatedName,
@@ -115,6 +118,115 @@ impl fmt::Display for ScanError {
 			}
 			Self::IgnoreRules(error) => error.fmt(f),
 		}
+	}
+}
+
+/// What the walk found at one path, handed to a [`ScanSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Found {
+	/// An entry the scan read.
+	Node(LocalNode),
+	/// An entry that took its folded name and then could not become a node: a file whose hash could
+	/// not be read, and a rule file the scan could not use. The name stays taken — the claim is what
+	/// says so — with nothing at it. An entry skipped because it VANISHED is never one: it is gone,
+	/// so its name is free.
+	Claim(String),
+}
+
+impl Found {
+	pub(super) fn rel_path(&self) -> &str {
+		match self {
+			Self::Node(node) => &node.rel_path,
+			Self::Claim(rel_path) => rel_path,
+		}
+	}
+
+	pub(super) fn into_rel_path(self) -> String {
+		match self {
+			Self::Node(node) => node.rel_path,
+			Self::Claim(rel_path) => rel_path,
+		}
+	}
+}
+
+/// Two entries whose paths fold to one name ([`collision_key`]): the one that took it, and the one a
+/// [`ScanSink`] refused for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Collision {
+	pub(super) taken: String,
+	pub(super) refused: String,
+}
+
+/// Where a scan puts what it finds: a map in memory ([`MapSink`]), or a whole pass's stage
+/// ([`StageSink`]), which holds what a whole tree's walk finds in a file rather than in memory.
+///
+/// Either one is the walk's collision check: an entry whose path folds to a name another entry
+/// already took is refused, and the walk reports the two.
+pub(super) trait ScanSink {
+	/// What can fail in putting an entry: nothing for a map.
+	type Error;
+
+	/// Take `found`'s folded name for it, or — when another entry has it — refuse it and say which.
+	fn put(&mut self, found: Found) -> Result<Option<Collision>, Self::Error>;
+
+	/// The nodes put, as the side a pass reads.
+	fn finish(self) -> Result<Side<LocalNode>, Self::Error>;
+}
+
+/// A [`ScanSink`] into a path-keyed map: a subtree walk's, and the tests'.
+pub(super) struct MapSink {
+	nodes: HashMap<String, LocalNode>,
+	/// A digest of every collision key taken so far, to spot a second entry folding the same way.
+	/// The keys themselves are not kept: a hit is rare and is resolved against the paths already
+	/// taken, so this costs 16 bytes a node instead of a second copy of every path.
+	claimed: HashSet<u128>,
+	/// The claims ([`Found::Claim`]): the lookup a hit makes has to find them too — a walk with
+	/// nothing wrong puts none.
+	claims: Vec<String>,
+}
+
+impl MapSink {
+	pub(super) fn with_capacity(capacity: usize) -> Self {
+		Self {
+			nodes: HashMap::with_capacity(capacity),
+			claimed: HashSet::with_capacity(capacity),
+			claims: Vec::new(),
+		}
+	}
+}
+
+impl ScanSink for MapSink {
+	type Error = Infallible;
+
+	fn put(&mut self, found: Found) -> Result<Option<Collision>, Infallible> {
+		let key = collision_key(found.rel_path());
+		// Naming the twin means folding the paths already taken, which is why it happens on a
+		// digest hit only. Finding none means the digests collided rather than the names, and a pair
+		// is never refused over that.
+		if !self.claimed.insert(collision_hash(&key))
+			&& let Some(taken) = self
+				.nodes
+				.keys()
+				.chain(&self.claims)
+				.find(|taken| collision_key(taken) == key)
+				.cloned()
+		{
+			return Ok(Some(Collision {
+				taken,
+				refused: found.into_rel_path(),
+			}));
+		}
+		match found {
+			Found::Node(node) => {
+				self.nodes.insert(node.rel_path.clone(), node);
+			}
+			Found::Claim(rel_path) => self.claims.push(rel_path),
+		}
+		Ok(None)
+	}
+
+	fn finish(self) -> Result<Side<LocalNode>, Infallible> {
+		Ok(Side::Whole(self.nodes))
 	}
 }
 
@@ -435,44 +547,91 @@ pub(super) fn load_rule_file(
 	}
 }
 
-/// Walk `root` into a `rel_path -> LocalNode` map. `baseline` (keyed by rel_path) drives the
-/// fast-path and is read for the symlink rule on [`LocalScan::complete`]. Blocking work — the
-/// engine calls this on a blocking thread.
-///
-/// Entries `rules` ignore are pruned: recorded in [`LocalScan::ignored`] and never descended into.
-/// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
-/// matched. The rules come back as the scan used them, for the rest of the pass to match with.
+/// [`scan_local_staged`]'s walk into a `rel_path -> LocalNode` map: the form the tests and the
+/// probe hold the staged walk to.
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn scan_local(
 	root: &Path,
 	baseline: &Baseline,
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
 ) -> (LocalScan, IgnoreRules) {
+	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
+	// estimate worth having; a pair with none still gets a walk's worth of room up front.
+	let Ok(scanned) = scan_local_watched(
+		root,
+		"",
+		baseline,
+		rules,
+		&rule_files,
+		Hooks {
+			on_listed: &mut |_| ControlFlow::Continue(()),
+			moved_hash: &mut |_, _, _| None,
+		},
+		MapSink::with_capacity(baseline.len().max(1024)),
+	);
+	scanned
+}
+
+/// Walk `root` into `stage`: what a whole pass walks, as a row per entry in the pass's stage (see
+/// [`StageSink`]). The nodes come back as a [`Side::Staged`], read out of the stage a page at a
+/// time, so the tree is in the file rather than in memory from the walk to the end of the plan.
+/// `baseline` (keyed by rel_path) drives the fast-path and is read for the symlink rule on
+/// [`LocalScan::complete`]. Blocking work.
+///
+/// Entries `rules` ignore are pruned: recorded in [`LocalScan::ignored`] and never descended into.
+/// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
+/// matched. The rules come back as the scan used them, for the rest of the pass to match with.
+///
+/// `Err` when the stage cannot be written — a full disk — which fails the pass before it has
+/// planned anything.
+pub(crate) fn scan_local_staged(
+	root: &Path,
+	baseline: &Baseline,
+	rules: IgnoreRules,
+	rule_files: RuleFiles,
+	stage: Stage,
+) -> rusqlite::Result<(LocalScan, IgnoreRules)> {
 	scan_local_watched(
 		root,
 		"",
 		baseline,
 		rules,
 		&rule_files,
-		&mut |_| ControlFlow::Continue(()),
-		&mut |_, _, _| None,
+		Hooks {
+			on_listed: &mut |_| ControlFlow::Continue(()),
+			moved_hash: &mut |_, _, _| None,
+		},
+		StageSink::new(stage, Paging::PASS)?,
 	)
 }
 
-/// [`scan_local`], with a hook called for every entry the walker lists, just before the scan reads
-/// it. The tests use it to produce a race: an entry that is there when the walk lists it and gone
+/// What a walk asks its caller as it goes (see [`scan_local_watched`]).
+struct Hooks<'h> {
+	/// Called for every entry the walker lists, just before the scan reads it; a `Break` ends the
+	/// walk there, incomplete.
+	on_listed: &'h mut dyn FnMut(&Path) -> ControlFlow<()>,
+	/// [`scan_subtree`]'s: the hash of a file the fast path missed, by its path, size and mtime.
+	moved_hash: &'h mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
+}
+
+/// [`scan_local_staged`]'s walk, from `start`, with [`Hooks`] and into the `sink` it is handed. The
+/// tests use `on_listed` to produce a race: an entry that is there when the walk lists it and gone
 /// when the scan reads it cannot be produced from the outside, and it is the one this scan has to
 /// survive without calling the tree partial. [`scan_subtree`] uses it to stop a walk that has
-/// listed too much: a `Break` ends the walk there, incomplete. `moved_hash` is [`scan_subtree`]'s.
-fn scan_local_watched(
+/// listed too much.
+fn scan_local_watched<S: ScanSink>(
 	root: &Path,
 	start: &str,
 	baseline: &Baseline,
 	mut rules: IgnoreRules,
 	rule_files: &RuleFiles,
-	on_listed: &mut dyn FnMut(&Path) -> ControlFlow<()>,
-	moved_hash: &mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
-) -> (LocalScan, IgnoreRules) {
+	Hooks {
+		on_listed,
+		moved_hash,
+	}: Hooks<'_>,
+	mut sink: S,
+) -> Result<(LocalScan, IgnoreRules), S::Error> {
 	// Where the walk begins, and how far below the root that is. Every entry is keyed against the
 	// ROOT, so a subtree walk produces the very keys a whole-tree walk would; the two rules that go
 	// by depth — the pair's own quarantine directory and the alias rule's exemption for the anchor
@@ -487,34 +646,12 @@ fn scan_local_watched(
 	} else {
 		start.split('/').count()
 	};
-	// The tree is what the baseline tracks plus whatever changed since, so the baseline is the one
-	// estimate worth having; a pair with none still gets a walk's worth of room up front.
-	//
-	// For the WHOLE tree only. A subtree walk covers one directory, and the pair's count sizes its
-	// table to the tree instead: a 50k-entry directory of a 100k-row pair was walked into a 13.8 MB
-	// table where the entries it found need half that, and the gap grows with the pair. It starts
-	// at a walk's worth and grows to what it finds.
-	let capacity = if start.is_empty() {
-		baseline.len().max(1024)
-	} else {
-		1024
-	};
 	// The walk asks about one directory's entries at a time, so the lookup keeps that directory in
 	// hand instead of resolving every path from the root again.
 	let mut rows = baseline.cursor();
-	let mut nodes: HashMap<String, LocalNode> = HashMap::with_capacity(capacity);
 	let mut errors = Vec::new();
 	let mut invalid_names = BTreeMap::new();
 	let mut complete = true;
-	// A digest of every collision key taken so far, to spot a second entry folding the same way.
-	// The keys themselves are not kept: a hit is rare and is resolved against the paths already
-	// taken, so this costs 16 bytes a node instead of a second copy of every path.
-	let mut claimed: HashSet<u128> = HashSet::with_capacity(capacity);
-	// Paths that claimed a folded name and then bailed before becoming a node: a file whose hash
-	// could not be read, and a rule file the scan could not use. The claim is what says the name is
-	// taken, so the lookup below has to find them too — a walk with nothing wrong pushes none. An
-	// entry skipped because it VANISHED is deliberately not here: it is gone, so its name is free.
-	let mut bailed: Vec<String> = Vec::new();
 
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
@@ -719,87 +856,76 @@ fn scan_local_watched(
 			invalid_names.insert(rel_path.clone(), reason);
 		}
 
-		let key = collision_key(&rel_path);
-		// Naming the twin means folding the paths already taken, which is why it happens on the
-		// error path only. Finding none means the digests collided rather than the names, and a
-		// pair is never refused over that.
-		if !claimed.insert(collision_hash(&key))
-			&& let Some(previous) = nodes
-				.keys()
-				.chain(bailed.iter())
-				.find(|taken| collision_key(taken.as_str()) == key)
-				.cloned()
-		{
-			complete = false;
-			record(
-				&mut errors,
-				root,
-				ScanError::DuplicateName {
-					rel_path: format!("{previous} / {rel_path}"),
-				},
-			);
-			continue;
-		}
-
-		let node = match kind {
-			NodeKind::Dir => LocalNode {
-				rel_path: rel_path.clone(),
+		let found = match kind {
+			NodeKind::Dir => Found::Node(LocalNode {
+				rel_path,
 				kind,
 				size: 0,
 				mtime_millis: FilenMetaExt::modified(&metadata).timestamp_millis(),
 				content_hash: None,
-			},
+			}),
 			NodeKind::File => {
 				let size = metadata.len();
 				let mtime = FilenMetaExt::modified(&metadata).timestamp_millis();
 				let reused = fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime)
 					.or_else(|| moved_hash(&rel_path, size, mtime));
-				let content_hash = match reused {
-					Some(hash) => Some(hash),
-					None => match hash_file(entry.path()) {
-						Ok(hash) => Some(hash),
-						// A rule file the scan could not read has blocked its directory and been
-						// reported already. Nothing is planned under a blocked directory, so the
-						// missing node cannot read as a deletion.
-						Err(_)
-							if rule_files
-								.reads(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir))
-								&& entry.file_name() == OsStr::new(FILENIGNORE)
-								&& ignore_blocked.borrow().contains(
-									rel_path.rsplit_once('/').map_or("", |(dir, _)| dir),
-								) =>
-						{
-							bailed.push(rel_path);
-							continue;
-						}
-						// Removed between the walk listing it and the hash reading it: the same
-						// race as the `metadata` call above, and the same answer.
-						Err(source) if source.kind() == ErrorKind::NotFound => {
-							tracing::debug!(
-								"local scan of {}: {rel_path:?} vanished after the walk listed it",
-								root.display()
-							);
-							continue;
-						}
-						Err(source) => {
-							complete = false;
-							// It claimed the folded name above, so that name is still taken.
-							bailed.push(rel_path.clone());
-							record(&mut errors, root, ScanError::Io { rel_path, source });
-							continue;
-						}
-					},
-				};
-				LocalNode {
-					rel_path: rel_path.clone(),
-					kind,
-					size,
-					mtime_millis: mtime,
-					content_hash,
+				match reused.map_or_else(|| hash_file(entry.path()), Ok) {
+					Ok(hash) => Found::Node(LocalNode {
+						rel_path,
+						kind,
+						size,
+						mtime_millis: mtime,
+						content_hash: Some(hash),
+					}),
+					// A rule file the scan could not read has blocked its directory and been
+					// reported already. Nothing is planned under a blocked directory, so the
+					// missing node cannot read as a deletion.
+					Err(_)
+						if rule_files
+							.reads(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir))
+							&& entry.file_name() == OsStr::new(FILENIGNORE)
+							&& ignore_blocked
+								.borrow()
+								.contains(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir)) =>
+					{
+						Found::Claim(rel_path)
+					}
+					// Removed between the walk listing it and the hash reading it: the same race as
+					// the `metadata` call above, and the same answer.
+					Err(source) if source.kind() == ErrorKind::NotFound => {
+						tracing::debug!(
+							"local scan of {}: {rel_path:?} vanished after the walk listed it",
+							root.display()
+						);
+						continue;
+					}
+					Err(source) => {
+						complete = false;
+						record(
+							&mut errors,
+							root,
+							ScanError::Io {
+								rel_path: rel_path.clone(),
+								source,
+							},
+						);
+						Found::Claim(rel_path)
+					}
 				}
 			}
 		};
-		nodes.insert(rel_path, node);
+		// Put once the entry is read, so a file is hashed before its name is claimed: a twin that
+		// vanishes before its hash read is not one, and a twin whose read fails is reported for both.
+		if let Some(Collision { taken, refused }) = sink.put(found)? {
+			complete = false;
+			record(
+				&mut errors,
+				root,
+				ScanError::DuplicateName {
+					rel_path: format!("{taken} / {refused}"),
+				},
+			);
+		}
 	}
 
 	// A directory that went away DURING the walk answers `NotFound` for every entry it had already
@@ -821,7 +947,7 @@ fn scan_local_watched(
 
 	errors.extend(rule_errors);
 	let scan = LocalScan {
-		nodes: nodes.into(),
+		nodes: sink.finish()?,
 		complete,
 		errors,
 		invalid_names,
@@ -830,12 +956,12 @@ fn scan_local_watched(
 		ignored_default_untracked,
 		ignore_blocked: ignore_blocked.into_inner(),
 	};
-	(scan, rules)
+	Ok((scan, rules))
 }
 
-/// [`scan_local`] started at the root-relative directory `start` instead of the pair root: the same
-/// walk over one subtree, producing the same ROOT-relative keys — the directory-level
-/// re-observation of a change-scoped pass (`observe::observe_local`).
+/// [`scan_local_staged`]'s walk started at the root-relative directory `start` instead of the pair
+/// root: the same walk over one subtree, producing the same ROOT-relative keys — the
+/// directory-level re-observation of a change-scoped pass (`observe::observe_local`).
 ///
 /// `rules` must already carry the `.filenignore` files of `start`'s ancestors, and `start` must not
 /// itself be hidden by them: what a whole-tree walk would have had in force when it reached `start`
@@ -868,23 +994,30 @@ pub(crate) fn scan_subtree(
 	let start_path = root.join(start);
 	let mut listed = 0usize;
 	let mut cut = false;
-	let walked = scan_local_watched(
+	let Ok(walked) = scan_local_watched(
 		root,
 		start,
 		baseline,
 		rules,
 		rule_files,
-		&mut |at| {
-			// The start is listed too, and is no entry below it.
-			listed += usize::from(at != start_path);
-			cut = stop(listed);
-			if cut {
-				ControlFlow::Break(())
-			} else {
-				ControlFlow::Continue(())
-			}
+		Hooks {
+			on_listed: &mut |at| {
+				// The start is listed too, and is no entry below it.
+				listed += usize::from(at != start_path);
+				cut = stop(listed);
+				if cut {
+					ControlFlow::Break(())
+				} else {
+					ControlFlow::Continue(())
+				}
+			},
+			moved_hash,
 		},
-		moved_hash,
+		// Sized to the walk and not to the pair: a subtree walk covers one directory, and the pair's
+		// count would size its table to the tree instead — a 50k-entry directory of a 100k-row pair
+		// was walked into a 13.8 MB table where the entries it found need half that, and the gap
+		// grows with the pair. It starts at a walk's worth and grows to what it finds.
+		MapSink::with_capacity(1024),
 	);
 	(!cut).then_some(walked)
 }
@@ -893,8 +1026,9 @@ pub(crate) fn scan_subtree(
 mod tests {
 	use std::fs;
 
-	use super::super::side::{Nodes, NodesAt};
+	use super::super::side::{Nodes, NodesAt, test_support::sorted_entries};
 
+	use rand::{Rng, SeedableRng, rngs::StdRng};
 	use uuid::Uuid;
 
 	use super::*;
@@ -1285,12 +1419,9 @@ mod tests {
 		fs::write(root.join("temp.txt"), b"y").unwrap();
 
 		let baseline = HashMap::new();
-		let (scan, _) = scan_local_watched(
+		let scan = scan_watched(
 			&root,
-			"",
 			&tree(&baseline),
-			IgnoreRules::default(),
-			&RuleFiles::Read,
 			// Removed the moment the walker hands the entry over, before the scan stats it.
 			&mut |path| {
 				if path.ends_with("temp.txt") {
@@ -1298,7 +1429,6 @@ mod tests {
 				}
 				ControlFlow::Continue(())
 			},
-			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1341,12 +1471,9 @@ mod tests {
 
 		let baseline = HashMap::new();
 		let mut swept = false;
-		let (scan, _) = scan_local_watched(
+		let scan = scan_watched(
 			&root,
-			"",
 			&tree(&baseline),
-			IgnoreRules::default(),
-			&RuleFiles::Read,
 			// The first time a child of `outer` is listed, every child of `outer` goes — while the
 			// walk still holds that directory's open stream and has yet to descend into any of them.
 			&mut |path| {
@@ -1358,7 +1485,6 @@ mod tests {
 				}
 				ControlFlow::Continue(())
 			},
-			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1376,6 +1502,26 @@ mod tests {
 		fs::remove_dir_all(&root).ok();
 	}
 
+	/// `A.txt` and `a.txt` in `root`, two names that fold together; `None` where the filesystem
+	/// folds case and holds one file for the two.
+	///
+	/// No pair of names such a filesystem keeps apart folds together either, since it folds the
+	/// way the key does, so no walk there can meet a twin. The cases the twin tests guard are
+	/// reachable wherever the filesystem is case-sensitive, which is where a twin can exist at all.
+	#[cfg(unix)]
+	fn case_twins(root: &Path) -> Option<[std::path::PathBuf; 2]> {
+		let (upper, lower) = ("A.txt", "a.txt");
+		assert_eq!(
+			collision_key(upper),
+			collision_key(lower),
+			"the fixture needs two names that fold together"
+		);
+		let twins = [root.join(upper), root.join(lower)];
+		fs::write(&twins[0], b"x").unwrap();
+		fs::write(&twins[1], b"y").unwrap();
+		(fs::read_dir(root).unwrap().count() == 2).then_some(twins)
+	}
+
 	/// A twin whose first spelling claimed the folded name and then bailed — a file the scan could
 	/// not read — must still refuse the pass. The claim is what says the name is taken; forgetting
 	/// it lets the second spelling through as an ordinary new file, and since the server folds case
@@ -1385,33 +1531,17 @@ mod tests {
 	fn a_twin_whose_first_spelling_could_not_be_read_is_still_a_collision() {
 		use std::os::unix::fs::PermissionsExt;
 
-		let (upper, lower) = ("A.txt", "a.txt");
-		assert_eq!(
-			collision_key(upper),
-			collision_key(lower),
-			"the fixture needs two names that fold together"
-		);
 		let root = temp_root();
-		let (upper, lower) = (root.join(upper), root.join(lower));
-		fs::write(&upper, b"x").unwrap();
-		fs::write(&lower, b"y").unwrap();
-		// A filesystem that folds case holds one file, not two, and then there is no collision to
-		// put in front of the scan — no pair of names it keeps apart folds together either, since
-		// it folds the same way the key does. The case this guards is reachable wherever the
-		// filesystem is case-sensitive, which is where the twin can exist at all.
-		if fs::read_dir(&root).unwrap().count() < 2 {
+		let Some([upper, lower]) = case_twins(&root) else {
 			fs::remove_dir_all(&root).ok();
 			return;
-		}
+		};
 
 		let baseline = HashMap::new();
 		let mut blocked = false;
-		let (scan, _) = scan_local_watched(
+		let scan = scan_watched(
 			&root,
-			"",
 			&tree(&baseline),
-			IgnoreRules::default(),
-			&RuleFiles::Read,
 			// Whichever of the two the walk lists FIRST is made unreadable before the scan hashes
 			// it, so it claims the folded name and then bails. Which one that is depends on the
 			// directory's order, and the answer must not.
@@ -1422,7 +1552,6 @@ mod tests {
 				}
 				ControlFlow::Continue(())
 			},
-			&mut |_, _, _| None,
 		);
 
 		assert!(
@@ -1443,6 +1572,106 @@ mod tests {
 		fs::remove_dir_all(&root).ok();
 	}
 
+	/// A twin that vanishes once the walk has listed and stat'ed it, before its hash is read, is
+	/// gone, as any file that vanishes then is: the other spelling is a node, and the pass is not
+	/// refused over a twin that is no longer there. A name is taken once its entry is read, not
+	/// before its hash is.
+	#[cfg(unix)]
+	#[test]
+	fn a_twin_that_vanishes_before_its_hash_is_read_is_no_collision() {
+		let root = temp_root();
+		if case_twins(&root).is_none() {
+			fs::remove_dir_all(&root).ok();
+			return;
+		}
+
+		let mut asked: Vec<String> = Vec::new();
+		let Ok((scan, _)) = scan_local_watched(
+			&root,
+			"",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			Hooks {
+				on_listed: &mut |_| ControlFlow::Continue(()),
+				// Asked about each file between its stat and its hash read, with no baseline to
+				// take a hash from: the second of the two is removed there.
+				moved_hash: &mut |rel_path, _, _| {
+					asked.push(rel_path.to_owned());
+					if asked.len() == 2 {
+						fs::remove_file(root.join(rel_path)).unwrap();
+					}
+					None
+				},
+			},
+			MapSink::with_capacity(4),
+		);
+
+		let [first, _] = asked.as_slice() else {
+			panic!("the walk reads both twins: {asked:?}")
+		};
+		assert!(scan.complete, "{:?}", scan.errors);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		assert_eq!(sorted_paths(&scan), vec![first.clone()]);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A twin whose hash cannot be read, reached once the other spelling holds the name, reports
+	/// both what stopped the read and the collision: the pass is refused over the twin, and told
+	/// why that file was not read.
+	#[cfg(unix)]
+	#[test]
+	fn a_twin_whose_second_spelling_could_not_be_read_reports_the_read_and_the_collision() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = temp_root();
+		let Some(twins) = case_twins(&root) else {
+			fs::remove_dir_all(&root).ok();
+			return;
+		};
+
+		let baseline = HashMap::new();
+		let mut listed: Vec<String> = Vec::new();
+		let scan = scan_watched(
+			&root,
+			&tree(&baseline),
+			// The second of the two the walk lists is made unreadable before the scan hashes it.
+			&mut |path| {
+				if twins.iter().any(|twin| twin == path) {
+					let name = path.file_name().and_then(OsStr::to_str).unwrap();
+					listed.push(name.to_owned());
+					if listed.len() == 2 {
+						fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+					}
+				}
+				ControlFlow::Continue(())
+			},
+		);
+
+		for twin in &twins {
+			fs::set_permissions(twin, fs::Permissions::from_mode(0o644)).ok();
+		}
+		let [first, second] = listed.as_slice() else {
+			panic!("the walk lists both twins: {listed:?}")
+		};
+		assert!(!scan.complete);
+		let [
+			ScanError::Io {
+				rel_path: unread, ..
+			},
+			ScanError::DuplicateName { rel_path: named },
+		] = scan.errors.as_slice()
+		else {
+			panic!("the read error, then the collision: {:?}", scan.errors)
+		};
+		assert_eq!(unread, second);
+		assert_eq!(named, &format!("{first} / {second}"));
+		assert_eq!(sorted_paths(&scan), vec![first.clone()]);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
 	/// A root that goes away DURING the walk — a removed volume, an unreachable share — answers
 	/// `NotFound` for every entry it had already listed, which on its own is indistinguishable from
 	/// each of those entries being deleted. One stat after the walk tells the two apart; without it
@@ -1459,21 +1688,13 @@ mod tests {
 
 		let baseline = HashMap::new();
 		let mut gone = false;
-		let (scan, _) = scan_local_watched(
-			&root,
-			"",
-			&tree(&baseline),
-			IgnoreRules::default(),
-			&RuleFiles::Read,
-			&mut |path| {
-				if !gone && path.parent() == Some(root.as_path()) {
-					gone = true;
-					fs::remove_dir_all(&root).unwrap();
-				}
-				ControlFlow::Continue(())
-			},
-			&mut |_, _, _| None,
-		);
+		let scan = scan_watched(&root, &tree(&baseline), &mut |path| {
+			if !gone && path.parent() == Some(root.as_path()) {
+				gone = true;
+				fs::remove_dir_all(&root).unwrap();
+			}
+			ControlFlow::Continue(())
+		});
 
 		assert!(
 			!scan.complete,
@@ -2071,6 +2292,165 @@ mod tests {
 		);
 
 		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A whole walk into the pass's stage finds what a walk into a map finds — the nodes, every fact
+	/// the walk reports and every error — over generated trees: nested directories, a non-ASCII
+	/// name, a name the remote rejects, entries a `.filenignore` hides, a fast path that takes a
+	/// hash off the baseline rather than the file, and, where a file can be made unreadable, one
+	/// whose hash cannot be read: a claim, which neither side holds as a node.
+	///
+	/// Collisions are the sinks' own test (`stage::local`): a case-insensitive volume — this one, on
+	/// macOS — cannot hold the twins a walk would have to meet.
+	#[test]
+	fn a_whole_walk_into_the_stage_finds_what_a_walk_into_a_map_finds() {
+		// No two of these fold together, so any volume holds every one of them.
+		const NAMES: &[&str] = &[
+			"a",
+			"b",
+			"docs",
+			"notes.md",
+			"x.log",
+			"\u{c4}rger",
+			"CON",
+			"bad.",
+			"z.txt",
+			"keep",
+		];
+		let mut unreadable = 0usize;
+		for seed in 0..16u64 {
+			let mut rng = StdRng::seed_from_u64(seed);
+			let root = temp_root();
+			let mut dirs = vec![root.clone()];
+			let mut files = Vec::new();
+			for _ in 0..rng.random_range(8..40) {
+				let parent = dirs[rng.random_range(0..dirs.len())].clone();
+				let path = parent.join(NAMES[rng.random_range(0..NAMES.len())]);
+				if path.exists() {
+					continue;
+				}
+				if rng.random_range(0..3) == 0 {
+					fs::create_dir(&path).unwrap();
+					dirs.push(path);
+				} else {
+					let size = rng.random_range(0..64);
+					fs::write(&path, vec![b'x'; size]).unwrap();
+					files.push(path);
+				}
+			}
+			if rng.random_range(0..2) == 0 {
+				fs::write(root.join(FILENIGNORE), "*.log\n").unwrap();
+			}
+			// Half the cases take every hash the baseline vouches for off the baseline: a hash
+			// no file has, so that only the fast path can have produced it.
+			let baseline = if rng.random_range(0..2) == 0 {
+				Baseline::default()
+			} else {
+				let walked = scan_local(
+					&root,
+					&Baseline::default(),
+					IgnoreRules::default(),
+					RuleFiles::Read,
+				)
+				.0;
+				Baseline::from_rows(sorted_entries(&walked.nodes.whole()).into_iter().map(
+					|(rel_path, node)| BaselineEntry {
+						rel_path,
+						kind: node.kind,
+						remote_uuid: None,
+						content_hash: Some(Blake3Hash::from([0xAB; 32])),
+						size: Some(node.size),
+						local_mtime: Some(node.mtime_millis),
+						remote_modified: None,
+						state: BaselineState::Synced,
+						local_kind: None,
+						remote_kind: None,
+						remote_hash: None,
+						remote_size: None,
+						remote_stable_uuid: None,
+						agreed_hash: None,
+					},
+				))
+			};
+			#[cfg(unix)]
+			let locked = (!files.is_empty() && rng.random_range(0..2) == 0).then(|| {
+				use std::os::unix::fs::PermissionsExt;
+				let file = files[rng.random_range(0..files.len())].clone();
+				fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+				file
+			});
+
+			let (map, _) = scan_local(&root, &baseline, IgnoreRules::default(), RuleFiles::Read);
+			let (_dir, stage) = Stage::in_temp_dir();
+			let (staged, _) = scan_local_staged(
+				&root,
+				&baseline,
+				IgnoreRules::default(),
+				RuleFiles::Read,
+				stage,
+			)
+			.unwrap();
+
+			#[cfg(unix)]
+			if let Some(file) = locked {
+				use std::os::unix::fs::PermissionsExt;
+				fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+				unreadable += usize::from(!map.complete);
+			}
+			assert!(matches!(staged.nodes, Side::Staged(_)), "seed {seed}");
+			assert_eq!(
+				sorted_entries(&staged.nodes.whole()),
+				sorted_entries(&map.nodes.whole()),
+				"seed {seed}: nodes"
+			);
+			assert_eq!(staged.complete, map.complete, "seed {seed}: complete");
+			let errors = |scan: &LocalScan| -> Vec<String> {
+				scan.errors.iter().map(ToString::to_string).collect()
+			};
+			assert_eq!(errors(&staged), errors(&map), "seed {seed}: errors");
+			assert_eq!(staged.invalid_names, map.invalid_names, "seed {seed}");
+			assert_eq!(staged.aliased_dirs, map.aliased_dirs, "seed {seed}");
+			assert_eq!(staged.ignored, map.ignored, "seed {seed}");
+			assert_eq!(
+				staged.ignored_default_untracked, map.ignored_default_untracked,
+				"seed {seed}"
+			);
+			assert_eq!(staged.ignore_blocked, map.ignore_blocked, "seed {seed}");
+			let held = Nodes::len(&staged.nodes.whole());
+			assert!(
+				held > 4,
+				"seed {seed}: a tree of {held} node(s) proves little"
+			);
+			fs::remove_dir_all(&root).ok();
+		}
+		#[cfg(unix)]
+		assert!(
+			unreadable > 2,
+			"only {unreadable} case(s) with an unreadable file"
+		);
+		#[cfg(not(unix))]
+		let _ = unreadable;
+	}
+
+	/// A walk of `root` into a map, with `on_listed` called for each entry it lists.
+	fn scan_watched(
+		root: &Path,
+		baseline: &Baseline,
+		on_listed: &mut dyn FnMut(&Path) -> ControlFlow<()>,
+	) -> LocalScan {
+		let Ok((scan, _)) = scan_local_watched(
+			root,
+			"",
+			baseline,
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			Hooks {
+				on_listed,
+				moved_hash: &mut |_, _, _| None,
+			},
+			MapSink::with_capacity(1024),
+		);
+		scan
 	}
 
 	/// The rows a test spells as a path-keyed map, as the pass's resident baseline.

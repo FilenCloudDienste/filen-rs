@@ -63,7 +63,7 @@ use std::{
 	sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
 };
 
-use filen_types::{crypto::Blake3Hash, fs::StableUuid};
+use filen_types::fs::StableUuid;
 use rusqlite::{Connection, OptionalExtension, Row, ffi, params, types::Type};
 use uuid::Uuid;
 
@@ -74,7 +74,7 @@ use super::{
 		plan::{RemoteNode, SyncAction},
 		scan::{LocalNode, collision_key},
 	},
-	BatchWriter, Stage,
+	BatchWriter, Stage, hash_at, hash_bytes,
 };
 
 const SCHEMA: &str = "
@@ -665,10 +665,6 @@ fn write_base(
 	Ok(())
 }
 
-fn hash_bytes(hash: Option<&Blake3Hash>) -> Option<&[u8]> {
-	hash.map(|hash| hash.as_ref().as_slice())
-}
-
 /// `(op, kind, from_path, remote_uuid)` of `action`, whose path is [`SyncAction::rel_path`].
 fn action_columns(action: &SyncAction) -> (i64, Option<NodeKind>, Option<&str>, Option<Uuid>) {
 	match action {
@@ -1159,12 +1155,6 @@ fn action_of(row: &Row<'_>, path: String) -> rusqlite::Result<SyncAction> {
 
 fn kind_of(raw: i64) -> rusqlite::Result<NodeKind> {
 	NodeKind::from_i64(raw).ok_or_else(|| corrupt("kind", raw))
-}
-
-fn hash_at(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Blake3Hash>> {
-	Ok(row
-		.get::<_, Option<[u8; 32]>>(column)?
-		.map(Blake3Hash::from))
 }
 
 fn corrupt(what: &str, value: i64) -> rusqlite::Error {
