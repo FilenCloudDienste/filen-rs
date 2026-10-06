@@ -221,6 +221,11 @@ pub(crate) enum Commands {
 	},
 	/// Set up an MCP server that exposes tools for AI agents to interact with your Filen drive.
 	Mcp,
+	/// Runs a JSON-RPC server exposing endpoints for interacting with your Filen drive programmatically
+	JsonRpcServer {
+		#[arg(long = "addr")]
+		address: Option<String>,
+	},
 	/// Exports your user API key (for use with non-managed Rclone)
 	ExportApiKey,
 	/// View the documentation (same as --help) locally in a browser rendered as HTML
@@ -498,6 +503,24 @@ pub(crate) async fn execute_command(
 		}
 		Commands::Mcp => {
 			crate::rpc_servers::mcp_cmd(ui).await?;
+			None
+		}
+		Commands::JsonRpcServer { address } => {
+			let client = client.get(ui).await?.clone();
+			let address = address
+				.map(|address| address.parse::<std::net::SocketAddr>())
+				.transpose()
+				.context(
+					"Invalid address format (expected format: host:port, e.g. 127.0.0.1:8080)",
+				)?;
+			crate::rpc_servers::json_rpc_server::run_json_rpc_server(client, address, |addr| {
+				ui.print_success(&format!(
+				"JSON-RPC server started successfully at {} (its OpenRPC document is served by `rpc.discover`)",
+				addr
+			));
+			})
+			.await
+			.context("Failed to run JSON-RPC server")?;
 			None
 		}
 		Commands::ExportApiKey => {

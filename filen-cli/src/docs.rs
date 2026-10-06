@@ -132,6 +132,7 @@ static PARSED_DOC_OUTLINE: LazyLock<Result<Vec<ParsedDocSection>>> = LazyLock::n
 			elements: vec![
 				DocElement::DocFragment("mcp-server"),
 				DocElement::CommandHelp("mcp"),
+				DocElement::CommandHelp("json-rpc-server"), // todo: sort this somewhere else?
 			],
 		},
 	];

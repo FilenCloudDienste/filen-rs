@@ -34,11 +34,19 @@ pub trait Endpoint {
 	fn description() -> &'static str {
 		"No description provided"
 	}
+	/// Generates the input schema using `generator`, so that several endpoints can share one
+	/// generator (and therefore one set of definitions and one `$ref` location).
+	fn input_schema_with(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		generator.root_schema_for::<Self::Input>()
+	}
+	fn output_schema_with(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		generator.root_schema_for::<Self::Output>()
+	}
 	fn input_schema() -> schemars::Schema {
-		schemars::schema_for!(Self::Input)
+		Self::input_schema_with(&mut schemars::SchemaGenerator::default())
 	}
 	fn output_schema() -> schemars::Schema {
-		schemars::schema_for!(Self::Output)
+		Self::output_schema_with(&mut schemars::SchemaGenerator::default())
 	}
 	fn handle(
 		&self,
@@ -52,6 +60,8 @@ pub trait AnyEndpoint: Send + Sync {
 	fn description(&self) -> &'static str;
 	fn input_schema(&self) -> schemars::Schema;
 	fn output_schema(&self) -> schemars::Schema;
+	fn input_schema_with(&self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema;
+	fn output_schema_with(&self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema;
 	fn handle<'a>(
 		&'a self,
 		client: &'a filen_sdk_rs::auth::Client,
@@ -74,6 +84,14 @@ impl<T: Endpoint + Send + Sync> AnyEndpoint for T {
 
 	fn output_schema(&self) -> schemars::Schema {
 		<T as Endpoint>::output_schema()
+	}
+
+	fn input_schema_with(&self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		<T as Endpoint>::input_schema_with(generator)
+	}
+
+	fn output_schema_with(&self, generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+		<T as Endpoint>::output_schema_with(generator)
 	}
 
 	fn handle<'a>(

@@ -2137,6 +2137,7 @@ dependencies = [
  "log",
  "manuel",
  "open",
+ "openrpc-types",
  "port_check",
  "predicates",
  "rand 0.9.2",
@@ -4528,6 +4529,19 @@ dependencies = [
  "is-wsl",
  "libc",
  "pathdiff",
+]
+
+[[package]]
+name = "openrpc-types"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673c1e7e37c496011686862fa4eeb4650e74bd1588c5c41ca1de203104e3b37d"
+dependencies = [
+ "schemars",
+ "semver",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
