@@ -16,7 +16,17 @@ on:
     branches: ['**']
 
 concurrency:
-  group: test-${{ github.ref }}
+  # The [test] gate below is a job-level `if` (Actions has no workflow-level one), so every
+  # push still creates a run here. A run whose jobs are all gated off gets a group of its
+  # own: in the shared one it would cancel the nightly, or a [test] run, on its way to
+  # skipping. Keep this condition in step with the jobs' `if`.
+  group: >-
+    ${{ (github.event_name == 'schedule' ||
+    github.event_name == 'workflow_dispatch' ||
+    contains(github.event.head_commit.message, '[test]') ||
+    contains(github.event.pull_request.title, '[test]') ||
+    contains(github.event.pull_request.body, '[test]'))
+    && format('{0}-{1}', github.workflow, github.ref) || github.run_id }}
   cancel-in-progress: true
 
 jobs:
