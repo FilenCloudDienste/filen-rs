@@ -34,6 +34,7 @@ use filen_types::{
 };
 #[cfg(unix)]
 use nix::sys::resource::{UsageWho, getrusage};
+use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::{
@@ -48,7 +49,10 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, SyncedPaths,
 	},
 	derive::{self, Derived},
-	engine::{PendingKind, PendingWrites, assembly_bounds, unaccounted_key},
+	engine::{
+		Confirming, Evidence, Observations, PendingKind, PendingWrites, assembly_bounds,
+		confirm_here, unaccounted_key,
+	},
 	ignore::{
 		IgnoreRules, Origin, RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir,
 	},
@@ -659,6 +663,9 @@ enum ChildAsk {
 	/// ONE FULL PASS over the fixture and nothing else: the widest point an engine ever reaches,
 	/// in a process whose resident set IS that pass rather than a run's history.
 	FullPass,
+	/// The full pass after a whole-tree push: every file row awaits confirmation, and the pass
+	/// confirms and persists them before it plans (see [`pass_after_push`]).
+	AfterPush,
 }
 
 impl ChildAsk {
@@ -666,6 +673,7 @@ impl ChildAsk {
 		match self {
 			Self::Pair => "pair",
 			Self::FullPass => "pass",
+			Self::AfterPush => "after-push",
 		}
 	}
 }
@@ -690,14 +698,19 @@ struct ChildSample {
 	view_bytes: usize,
 	scan_bytes: usize,
 	actions: usize,
+	/// The rows a pass after a push confirmed, how long confirming them took, and how long
+	/// persisting them did.
+	confirmed: usize,
+	confirm_ms: f64,
+	persist_ms: f64,
 }
 
 impl ChildSample {
-	const FIELDS: usize = 10;
+	const FIELDS: usize = 13;
 
 	fn encode(&self) -> String {
 		format!(
-			"{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}",
+			"{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}",
 			self.floor,
 			self.widest,
 			self.peak,
@@ -708,6 +721,9 @@ impl ChildSample {
 			self.view_bytes,
 			self.scan_bytes,
 			self.actions,
+			self.confirmed,
+			self.confirm_ms,
+			self.persist_ms,
 		)
 	}
 
@@ -727,6 +743,9 @@ impl ChildSample {
 			view_bytes: fields[7].parse().ok()?,
 			scan_bytes: fields[8].parse().ok()?,
 			actions: fields[9].parse().ok()?,
+			confirmed: fields[10].parse().ok()?,
+			confirm_ms: fields[11].parse().ok()?,
+			persist_ms: fields[12].parse().ok()?,
 		})
 	}
 
@@ -828,6 +847,24 @@ fn answer_child(spec: &str) {
 			// The store keeps its own copy of the pair, so both go — what is left is neither the
 			// pair nor the read that built it.
 			drop(resident);
+			drop(store);
+			sample.after = current_rss_bytes();
+		}
+		"after-push" => {
+			let rules = probe_rules();
+			let ((footprint, confirmed, confirming, persisting), elapsed) =
+				timed(|| pass_after_push(&place, &store, pair, &rules));
+			sample.rows = footprint.rows;
+			sample.actions = footprint.actions;
+			sample.widest = footprint.widest;
+			sample.peak = footprint.peak;
+			sample.baseline_bytes = footprint.baseline_bytes;
+			sample.view_bytes = footprint.view_bytes;
+			sample.scan_bytes = footprint.scan_bytes;
+			sample.elapsed_ms = elapsed.as_secs_f64() * 1e3;
+			sample.confirmed = confirmed;
+			sample.confirm_ms = confirming.as_secs_f64() * 1e3;
+			sample.persist_ms = persisting.as_secs_f64() * 1e3;
 			drop(store);
 			sample.after = current_rss_bytes();
 		}
@@ -1046,6 +1083,128 @@ fn pass_pure(
 	}
 }
 
+/// [`pass_pure`], on the pass after a whole-tree push: every file row awaits confirmation of a push
+/// of ours, and the snapshot lists each one's own version at its path. The pass confirms them against
+/// its staged snapshot as `prepare_whole` does — a window of rows at a time, staged past the window
+/// — and persists them in one transaction, as `run_pass` does before it reconciles; then it scans
+/// and plans over the confirmed rows. With no account the cache's announcements are empty and the
+/// server is asked nothing, which this fixture never needs: every row is confirmed by the snapshot.
+///
+/// Returns the pass's footprint, how many rows it confirmed, how long confirming them took and how
+/// long persisting them did.
+fn pass_after_push(
+	place: &PassPlace,
+	store: &BaselineStore,
+	pair: i64,
+	rules: &IgnoreRules,
+) -> (PassFootprint, usize, Duration, Duration) {
+	let mut baseline = store.baseline(pair).expect("reading the baseline");
+	let mut view = stage_snapshot(place);
+	let (confirmed, confirming) = timed(|| {
+		let lent = Evidence::Snapshot(mem::replace(&mut view.nodes, Side::carried()));
+		let (confirmed, lent) = confirm_here(Confirming::new(
+			baseline.clone(),
+			lent,
+			Arc::new(Observations::default()),
+			|| Ok(probe_stage()),
+			stage::WINDOW,
+		))
+		.expect("confirming the probe's pushes");
+		lent.put_back(&mut view.nodes);
+		confirmed
+	});
+	let ((), persisting) = timed(|| {
+		store
+			.upsert_streamed(pair, |put| {
+				confirmed.each_page(|rows| rows.iter().try_for_each(&mut *put))
+			})
+			.expect("persisting the probe's confirmations");
+	});
+	let confirmed_rows = confirmed.len();
+	// As `prepare_whole` hands them out: the scan reads the rows as the pass found them, the rest of
+	// the pass reads them confirmed.
+	let scan_baseline = baseline.clone();
+	baseline.confirm(&confirmed);
+	drop(confirmed);
+	let (scan, rules_used) = scan::scan_local_staged(
+		&place.root,
+		&scan_baseline,
+		probe_rules(),
+		RuleFiles::Read,
+		probe_stage(),
+	)
+	.expect("staging the probe's scan");
+	drop((rules_used, scan_baseline));
+	view.filter(Some(plan::ViewFilter {
+		rules,
+		baseline: &baseline,
+	}));
+	let (mut local, mut remote) = (scan.nodes, view.nodes);
+	plan::fold_dir_moves(
+		SyncMode::TwoWay,
+		&mut baseline,
+		&mut local,
+		&mut remote,
+		&BTreeSet::new(),
+		None,
+	)
+	.expect("whole sides derive nothing from the rows, so their fold refuses nothing");
+	let planned = screened(&baseline, &local, &remote);
+	let widest = current_rss_bytes();
+	(
+		PassFootprint {
+			actions: planned,
+			rows: baseline.len(),
+			widest,
+			peak: peak_rss_bytes(),
+			baseline_bytes: baseline.resident_bytes(),
+			view_bytes: side_owned_bytes(&remote, &baseline, |node| heap(node.rel_path.len())),
+			scan_bytes: side_owned_bytes(&local, &baseline, |node| heap(node.rel_path.len())),
+		},
+		confirmed_rows,
+		confirming,
+		persisting,
+	)
+}
+
+/// Leave every synced file row of `pair` the way a push of ours leaves it until something confirms
+/// it — the content this side holds, and no agreed content on record — in one transaction, read
+/// out of the store a page at a time. How many rows that was.
+fn leave_unconfirmed(store: &BaselineStore, pair: i64) -> usize {
+	let rows = store.baseline(pair).expect("reading the baseline");
+	let mut left = 0;
+	store
+		.upsert_streamed(pair, |put| {
+			for row in rows.iter() {
+				if row.kind == NodeKind::File
+					&& row.state == BaselineState::Synced
+					&& row.content_hash.is_some()
+				{
+					put(&BaselineEntry {
+						agreed_hash: None,
+						..row
+					})?;
+					left += 1;
+				}
+			}
+			Ok(())
+		})
+		.expect("leaving the probe's rows unconfirmed");
+	left
+}
+
+/// The remote snapshot of a whole pass, staged as `prepare_whole` stages it: copied into a stage as
+/// it is read, and placed there.
+fn stage_snapshot(place: &PassPlace) -> RemoteView {
+	let mut copied =
+		RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
+	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
+		.expect("streaming the cache snapshot");
+	copied
+		.finish(place.remote_root)
+		.expect("placing the probe's staged snapshot")
+}
+
 /// A whole pass's two sides, staged as `prepare_whole` stages them: the snapshot copied into a stage
 /// as it is read and placed there, the tree walked into another, and the rules applied to the view.
 fn stage_pass_sides(
@@ -1053,13 +1212,7 @@ fn stage_pass_sides(
 	baseline: &Baseline,
 	rules: &IgnoreRules,
 ) -> (Side<LocalNode>, Side<RemoteNode>) {
-	let mut copied =
-		RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
-	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
-		.expect("streaming the cache snapshot");
-	let mut view = copied
-		.finish(place.remote_root)
-		.expect("placing the probe's staged snapshot");
+	let mut view = stage_snapshot(place);
 	let (scan, rules_used) = scan::scan_local_staged(
 		&place.root,
 		baseline,
@@ -2904,6 +3057,16 @@ pub fn run() -> String {
 		),
 	}
 
+	// A copy of the pair's DB for `confirm_after_push`, taken while it is still the converged pair
+	// the phases above read. The phase itself runs last (see there), so the phases below write to the
+	// pair's own file as they always have. Written page by page into a file of its own: `fs::copy`
+	// clones the file on APFS, and every page the phases below then write to the original would be
+	// a copy-on-write of a block the clone shares.
+	let pushed_db = fixture.dir.join("baseline-after-push.db");
+	Connection::open(&fixture.baseline_db)
+		.and_then(|conn| conn.execute("VACUUM INTO ?1", [pushed_db.to_string_lossy()]))
+		.expect("copying the baseline DB");
+
 	// What `untrack_ignored` pays per pass at the shape the built-in rules produce on macOS: a
 	// `.DS_Store` root per synced directory, so G = D and not one of them matches a row. Measured
 	// after the pass phases because it is the pass's last step.
@@ -3050,9 +3213,10 @@ pub fn run() -> String {
 	// it carries into the destination directory, so a move into a flat directory pays this per row
 	// — which is the ceiling that answers "what if somebody keeps 100k files in one folder".
 	//
-	// Last in the run, and on a tree of its own, because every phase above reports the process's
-	// peak RSS: a structure built earlier would raise that high-water mark for all of them and make
-	// this run's memory column incomparable with the ones already recorded.
+	// Last of the phases this process measures itself (the one after it measures a child), and on a
+	// tree of its own, because every phase above reports the process's peak RSS: a structure built
+	// earlier would raise that high-water mark for all of them and make this run's memory column
+	// incomparable with the ones already recorded.
 	const FLAT_CHILDREN: usize = 100_000;
 	const FLAT_INSERTS: usize = 1_000;
 	let mut flat = super::tree::Tree::from_rows(
@@ -3072,6 +3236,67 @@ pub fn run() -> String {
 		&format!("one row at the front of a directory holding {FLAT_CHILDREN} children"),
 	);
 	drop(flat);
+
+	// The pass after a whole-tree push: every file row awaits confirmation of a push of ours, and
+	// the cache lists each one's own version at its path. The pass confirms them all against its
+	// staged snapshot, persists them in one transaction and plans over the confirmed rows. In a
+	// fresh process, for the reason `pass_pure_fresh` gives: its peak is the figure. What it plans
+	// is the files the scoped phases changed on disk; `pass_pure_fresh` ran before they did, so it
+	// plans none.
+	//
+	// On the copy taken after `steady_state_rss_fresh`, and last: it rewrites every row twice, and
+	// a phase after it would read a page cache those writes have churned through.
+	let unconfirmed = {
+		let pushed = BaselineStore::open(&pushed_db).expect("opening the copied baseline DB");
+		assert_eq!(
+			pushed.baseline(pair).expect("reading the copy").len(),
+			nodes,
+			"the copy holds the pair's rows"
+		);
+		leave_unconfirmed(&pushed, pair)
+	};
+	match child_sample(ChildAsk::AfterPush, &pushed_db, pair, &fixture.place()) {
+		Some(child) => {
+			assert!(
+				!BaselineStore::open(&pushed_db)
+					.expect("reopening the copied baseline DB")
+					.baseline(pair)
+					.expect("reading the copy back")
+					.any_unconfirmed(),
+				"the pass after the push persisted every confirmation"
+			);
+			probe.record(
+				"confirm_after_push",
+				child.rows,
+				Duration::from_secs_f64(child.elapsed_ms / 1e3),
+				&format!(
+					"{} of {unconfirmed} unconfirmed row(s) confirmed in {:.0} ms and persisted in \
+					 {:.0} ms, then {} action(s) planned; {:.1} MiB resident at the widest point of \
+					 a FRESH process, peak {:.1} MiB, {:.1} MiB still resident once every structure \
+					 and the store are dropped; {}",
+					child.confirmed,
+					child.confirm_ms,
+					child.persist_ms,
+					child.actions,
+					mib(child.widest),
+					mib(child.peak),
+					mib(child.after),
+					child.accounting(),
+				),
+			);
+		}
+		None => probe.record(
+			"confirm_after_push",
+			0,
+			Duration::ZERO,
+			"the child process could not be asked",
+		),
+	}
+	for suffix in ["", "-wal", "-shm"] {
+		let mut path = pushed_db.clone().into_os_string();
+		path.push(suffix);
+		fs::remove_file(path).ok();
+	}
 
 	drop(store);
 	fs::remove_dir_all(&fixture.dir).ok();

@@ -611,6 +611,11 @@ pub(crate) enum BaselineChange<'a> {
 /// carries a row per item of the tree.
 pub(crate) type DropRow<'a> = dyn FnMut(&str) -> rusqlite::Result<()> + 'a;
 
+/// What writes one baseline row inside a commit: the visitor [`BaselineStore::upsert_streamed`]
+/// hands the rows of a pass's confirmations, a row per push the pass confirmed — on the pass after a
+/// whole-tree push, a row per item of the tree.
+pub(crate) type PutRow<'a> = dyn FnMut(&BaselineEntry) -> rusqlite::Result<()> + 'a;
+
 /// A registered sync pair, as returned by [`SyncEngine::list_pairs`](super::SyncEngine::list_pairs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairRecord {
@@ -1789,6 +1794,25 @@ impl BaselineStore {
 		changes: &[BaselineChange<'_>],
 	) -> rusqlite::Result<()> {
 		self.apply_changes_carrying(pair, changes, |_| Ok(()))
+	}
+
+	/// Write every row `rows` hands the visitor it is given ([`PutRow`]) in ONE transaction, as
+	/// [`apply_changes`](Self::apply_changes) writes its upserts: streamed through it rather than
+	/// collected first. An error out of `rows` rolls back everything it wrote.
+	pub(crate) fn upsert_streamed(
+		&self,
+		pair: PairId,
+		rows: impl FnOnce(&mut PutRow<'_>) -> rusqlite::Result<()>,
+	) -> rusqlite::Result<()> {
+		record_write(
+			pair,
+			|| "the rows a pass confirmed".to_string(),
+			|| {
+				let tx = self.conn.unchecked_transaction()?;
+				rows(&mut |entry| self.upsert_entry_once(pair, entry))?;
+				tx.commit()
+			},
+		)
 	}
 
 	/// [`apply_changes`](Self::apply_changes) for a local directory deletion that carries other

@@ -74,7 +74,7 @@ use super::{
 		plan::{RemoteNode, SyncAction},
 		scan::{LocalNode, collision_key},
 	},
-	BatchWriter, Stage, hash_at, hash_bytes,
+	BatchWriter, Stage, bind_entry, hash_at, hash_bytes,
 };
 
 const SCHEMA: &str = "
@@ -637,24 +637,11 @@ fn write_base(
 	endpoint: i64,
 	row: &BaselineEntry,
 ) -> rusqlite::Result<()> {
-	conn.prepare_cached(&INSERT_BASE)?.execute(params![
-		seq,
-		endpoint,
-		row.rel_path,
-		row.kind.as_i64(),
-		row.remote_uuid,
-		hash_bytes(row.content_hash.as_ref()),
-		row.size,
-		row.local_mtime,
-		row.remote_modified,
-		row.state.as_i64(),
-		row.local_kind.map(NodeKind::as_i64),
-		row.remote_kind.map(NodeKind::as_i64),
-		hash_bytes(row.remote_hash.as_ref()),
-		row.remote_size,
-		row.remote_stable_uuid,
-		hash_bytes(row.agreed_hash.as_ref()),
-	])?;
+	let mut statement = conn.prepare_cached(&INSERT_BASE)?;
+	statement.raw_bind_parameter(1, seq)?;
+	statement.raw_bind_parameter(2, endpoint)?;
+	bind_entry(&mut statement, 3, row)?;
+	statement.raw_execute()?;
 	Ok(())
 }
 

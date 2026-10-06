@@ -42,8 +42,9 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::super::baseline::{
-	BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind, PairId, Readers,
+use super::super::{
+	baseline::{BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind, PairId, Readers},
+	page,
 };
 
 /// How many statements the pass's reads ran, and how many rows they handed back, in this process —
@@ -183,71 +184,17 @@ impl<P> Ahead<P> {
 	}
 }
 
-/// A contiguous stretch of the table as the snapshot reads it: every row from `from` on, up to the
-/// last row read — or, when the read ran out of rows before its limit, up to the end of the range
-/// it asked for. Within that stretch the page is AUTHORITATIVE: a path it holds no row for has no
-/// row in the table either, because the transaction the page was read in has not moved.
+/// A contiguous stretch of the table as the snapshot reads it (see [`page::Page`]): authoritative
+/// within it because the transaction the page was read in has not moved.
 ///
 /// That is what lets a point question about a path the pass is enumerating past cost a binary
 /// search instead of a statement. A whole pass visits every row and, for each, asks the carried
 /// side whether it holds that path — which asks here, about the row just handed out.
-#[derive(Debug)]
-pub(super) struct Page {
-	from: String,
-	inclusive: bool,
-	to: Option<String>,
-	/// Whether the read reached the end of its range rather than its limit.
-	complete: bool,
-	pub(super) rows: Vec<BaselineEntry>,
-}
+pub(super) type Page = page::Page<BaselineEntry>;
 
-/// What a [`Page`] says about one path.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum PageAnswer<'p> {
-	/// The path lies outside the stretch the page read, so the page cannot say.
-	Outside,
-	/// The page spans the path and so speaks for the table there: the row at it, or `None` where
-	/// the table holds none.
-	Spans(Option<&'p BaselineEntry>),
-}
-
-impl<'p> PageAnswer<'p> {
-	/// `read` of the row or its absence, where the page spans the path; `None` where it cannot say.
-	pub(super) fn map<T>(self, read: impl FnOnce(Option<&'p BaselineEntry>) -> T) -> Option<T> {
-		match self {
-			Self::Spans(row) => Some(read(row)),
-			Self::Outside => None,
-		}
-	}
-}
-
-impl Page {
-	/// What this page says about `rel_path` (see [`PageAnswer`]).
-	pub(super) fn answer(&self, rel_path: &str) -> PageAnswer<'_> {
-		let past_from = if self.inclusive {
-			rel_path >= self.from.as_str()
-		} else {
-			rel_path > self.from.as_str()
-		};
-		let before_end = match self.rows.last() {
-			Some(last) if rel_path <= last.rel_path.as_str() => true,
-			_ => self.complete && self.to.as_deref().is_none_or(|to| rel_path < to),
-		};
-		if !(past_from && before_end) {
-			return PageAnswer::Outside;
-		}
-		PageAnswer::Spans(
-			self.rows
-				.binary_search_by(|row| row.rel_path.as_str().cmp(rel_path))
-				.ok()
-				.map(|at| &self.rows[at]),
-		)
-	}
-
-	/// Whether the read stopped at its limit, so the range goes on past the last row.
-	pub(super) fn is_full(&self) -> bool {
-		!self.complete
-	}
+/// The path a row is filed at, which every page of rows is read in the order of.
+fn row_path(row: &BaselineEntry) -> &str {
+	&row.rel_path
 }
 
 /// A stretch of `baseline_folded` as the folded questions read it: every `(folded_path, rel_path)`
@@ -413,10 +360,12 @@ fn dirs_sql(inclusive: bool, bounded: bool) -> String {
 	)
 }
 
+/// The unconfirmed rows after a path, in path order, off the partial index that holds nothing else.
+/// Stepped and stopped rather than `LIMIT`ed, for the reason [`range_sql`] gives.
 fn unconfirmed_sql() -> String {
 	format!(
 		"SELECT {ENTRY_COLUMNS} FROM baseline INDEXED BY baseline_unconfirmed
-		 WHERE pair_id = ?1 AND unconfirmed = 1"
+		 WHERE pair_id = ?1 AND unconfirmed = 1 AND rel_path > ?2 ORDER BY rel_path"
 	)
 }
 
@@ -591,13 +540,7 @@ impl Snapshot {
 	/// [`page`](Self::page), without keeping it.
 	fn read_page(&self, from: &str, inclusive: bool, to: Option<&str>, limit: usize) -> Arc<Page> {
 		let rows = self.rows_from(from, inclusive, to, limit);
-		Arc::new(Page {
-			from: from.to_string(),
-			inclusive,
-			to: to.map(str::to_string),
-			complete: rows.len() < limit,
-			rows,
-		})
+		Arc::new(Page::read(from, inclusive, to, limit, rows, row_path))
 	}
 
 	/// Up to `limit` DIRECTORY rows from `from` on, strictly below `to` when there is one, in path
@@ -622,13 +565,7 @@ impl Snapshot {
 			};
 			rows.take(limit).collect()
 		});
-		Arc::new(Page {
-			from: from.to_string(),
-			inclusive,
-			to: to.map(str::to_string),
-			complete: rows.len() < limit,
-			rows,
-		})
+		Arc::new(Page::read(from, inclusive, to, limit, rows, row_path))
 	}
 
 	fn rows_from(
@@ -740,10 +677,13 @@ impl Snapshot {
 		self.paths("the rule-file rows", RULE_FILES)
 	}
 
-	pub(super) fn unconfirmed(&self) -> Vec<BaselineEntry> {
-		self.with("the unconfirmed rows", |conn| {
+	/// Up to `limit` of the unconfirmed rows strictly after `after` (`""`: from the first), in path
+	/// order: the set is a page at a time, because on the pass after a whole-tree push it is the tree.
+	pub(super) fn unconfirmed_after(&self, after: &str, limit: usize) -> Vec<BaselineEntry> {
+		self.with("a page of the unconfirmed rows", |conn| {
 			conn.prepare_cached(&UNCONFIRMED)?
-				.query_map(params![self.pair], BaselineStore::row_to_entry)?
+				.query_map(params![self.pair, after], BaselineStore::row_to_entry)?
+				.take(limit)
 				.collect()
 		})
 	}
@@ -953,9 +893,9 @@ mod tests {
 			),
 			(
 				unconfirmed_sql(),
-				vec![&1_i64],
+				vec![&1_i64, &"a"],
 				"baseline_unconfirmed",
-				"(pair_id=?)",
+				"(pair_id=? AND rel_path>?)",
 			),
 			(
 				unsynced_sql(false),
@@ -1044,6 +984,8 @@ mod tests {
 		snapshot.unsynced_under("d1");
 		snapshot.count_under("d0");
 		snapshot.count_under("d1");
+		snapshot.unconfirmed_after("", 2);
+		snapshot.unconfirmed_after("d1/f01", 2);
 		let guard = snapshot.conn.lock().unwrap();
 		let conn = guard.as_ref().unwrap();
 		for sql in [
@@ -1055,6 +997,7 @@ mod tests {
 			FOLDED_UNDER,
 			&UNSYNCED[1],
 			&COUNT_UNDER[1],
+			&UNCONFIRMED,
 		] {
 			let statement = conn.prepare_cached(sql).unwrap();
 			assert_eq!(

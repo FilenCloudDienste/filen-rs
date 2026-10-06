@@ -37,6 +37,8 @@ mod mode;
 // The local half of a change-scoped pass: re-observe the paths the changelist names.
 mod observe;
 mod outcome;
+// A page of rows read in path order, and the read-ahead a question about one path reads pages with.
+mod page;
 mod pause;
 mod plan;
 // The remote half: apply the announced changes to the derived remote view.

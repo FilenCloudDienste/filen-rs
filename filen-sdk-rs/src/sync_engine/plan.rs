@@ -1488,8 +1488,17 @@ fn create_local(rel_path: &str, remote: &RemoteNode) -> SyncAction {
 	}
 }
 
-/// Advance every baseline row's agreed-content marker that this pass's RAW cache snapshot
-/// confirms, and return the rows that moved so the caller can persist them.
+/// `row`, confirmed: its agreed-content marker advanced to the content it records. What a
+/// confirmation IS, whatever the evidence — and the row as the caller persists it.
+pub(super) fn confirm_agreed(row: BaselineEntry) -> BaselineEntry {
+	BaselineEntry {
+		agreed_hash: row.content_hash,
+		..row
+	}
+}
+
+/// Rule (c): whether this pass's RAW cache snapshot confirms `entry`, a row awaiting confirmation —
+/// `at` being what the snapshot holds at the row's path.
 ///
 /// The confirmation is one specific observation: the snapshot lists the row's own version uuid at
 /// the row's path. That is the remote saying it holds exactly what the row records, which is what
@@ -1500,49 +1509,35 @@ fn create_local(rel_path: &str, remote: &RemoteNode) -> SyncAction {
 /// [`PendingWrites::fold_into`](super::engine::PendingWrites::fold_into) has corrected: the fold
 /// synthesises our own just-written version at the path from the very row being confirmed, so a
 /// folded view would confirm every push against itself and the marker would mean nothing.
-pub(super) fn confirm_agreed_content(
-	baseline: &mut Baseline,
-	raw_remote: &impl NodesAt<Node = RemoteNode>,
-) -> Vec<BaselineEntry> {
-	// Only the rows that await confirmation are candidates, and the baseline indexes those, so a
-	// converged pair reads no row at all.
-	baseline.confirm_where(|entry| {
-		let confirmed =
-			raw_remote.at(&entry.rel_path).map(|node| node.remote_uuid) == entry.remote_uuid;
-		if confirmed {
-			tracing::debug!(
-				"plan: the remote confirms {:?} — both sides hold what the baseline records",
-				entry.rel_path
-			);
-		}
-		confirmed
-	})
+pub(super) fn snapshot_confirms(at: Option<&RemoteNode>, entry: &BaselineEntry) -> bool {
+	let confirmed = at.map(|node| node.remote_uuid) == entry.remote_uuid;
+	if confirmed {
+		tracing::debug!(
+			"plan: the remote confirms {:?} — both sides hold what the baseline records",
+			entry.rel_path
+		);
+	}
+	confirmed
 }
 
-/// Advance the agreed-content marker of every unconfirmed row whose version uuid is in `confirmed`
-/// — the pushes some other evidence than a snapshot has vouched for (a tenure as the remote head,
-/// or the server's own version chain) — and return the rows that moved so the caller can persist
-/// them.
+/// Whether `entry`, a row awaiting confirmation, carries a version uuid in `vouched` — the pushes
+/// some other evidence than a snapshot has vouched for (a tenure as the remote head, or the server's
+/// own version chain).
 ///
-/// Split from [`confirm_agreed_content`] because the evidence comes from outside the plan (the
-/// cache's announcement timestamps, a version listing) while the row rule is the same; keeping the
-/// rule here keeps the pass's confirmation policy in one place and unit-testable.
-pub(super) fn confirm_agreed_pushes(
-	baseline: &mut Baseline,
-	confirmed: &HashSet<Uuid>,
-) -> Vec<BaselineEntry> {
-	baseline.confirm_where(|entry| {
-		let stood = entry
-			.remote_uuid
-			.is_some_and(|uuid| confirmed.contains(&uuid));
-		if stood {
-			tracing::debug!(
-				"plan: {:?} — this engine's push stood as the remote head long enough to count as agreed",
-				entry.rel_path
-			);
-		}
-		stood
-	})
+/// Split from [`snapshot_confirms`] because the evidence comes from outside the plan (the cache's
+/// announcement timestamps, a version listing) while the row rule is the same; keeping the rule
+/// here keeps the pass's confirmation policy in one place and unit-testable.
+pub(super) fn push_vouched(vouched: &HashSet<Uuid>, entry: &BaselineEntry) -> bool {
+	let stood = entry
+		.remote_uuid
+		.is_some_and(|uuid| vouched.contains(&uuid));
+	if stood {
+		tracing::debug!(
+			"plan: {:?} — this engine's push stood as the remote head long enough to count as agreed",
+			entry.rel_path
+		);
+	}
+	stood
 }
 
 /// What the server's version chain says about a push of ours: how long it stood before anything
@@ -4263,12 +4258,18 @@ pub(super) fn replaced_paths<'a>(
 		.collect()
 }
 
-/// The oracle the plans folded in a stage are held to.
+/// The oracles the tests hold a pass to: the plan it folds in its stage, and the confirmations it
+/// makes a page of rows at a time.
 #[cfg(test)]
 pub(super) mod test_support {
 	use std::collections::{HashMap, HashSet};
 
-	use super::{NodeKind, SyncAction, ancestors};
+	use uuid::Uuid;
+
+	use super::{
+		Baseline, BaselineEntry, NodeKind, NodesAt, RemoteNode, SyncAction, ancestors,
+		push_vouched, snapshot_confirms,
+	};
 
 	/// The deletions [`fold_subsumed_deletes`] took out of a plan, by the directory deletion of the
 	/// same side that carries each one out.
@@ -4403,6 +4404,26 @@ pub(super) mod test_support {
 		carried.sort();
 		(actions, carried)
 	}
+
+	/// Rule (c) over a whole view: advance every row of `baseline` awaiting confirmation that
+	/// [`snapshot_confirms`] accepts, and return the rows that moved. The engine applies the rule a
+	/// page of rows at a time (`SyncEngine::confirm`); this is the rule as the tests state it.
+	pub(in super::super) fn confirm_agreed_content(
+		baseline: &mut Baseline,
+		raw_remote: &impl NodesAt<Node = RemoteNode>,
+	) -> Vec<BaselineEntry> {
+		baseline.confirm_where(|entry| {
+			snapshot_confirms(raw_remote.at(&entry.rel_path).as_deref(), entry)
+		})
+	}
+
+	/// [`push_vouched`] over a whole view, as [`confirm_agreed_content`] is rule (c) over one.
+	pub(in super::super) fn confirm_agreed_pushes(
+		baseline: &mut Baseline,
+		confirmed: &HashSet<Uuid>,
+	) -> Vec<BaselineEntry> {
+		baseline.confirm_where(|entry| push_vouched(confirmed, entry))
+	}
 }
 
 /// Order the plan so it applies safely: file replace-deletes → creates (parent-before-child) →
@@ -4445,7 +4466,7 @@ mod tests {
 			side::{FromRow, test_support::copied},
 			stage::{Stage, WINDOW, reconcile_windows, staged_sides},
 		},
-		test_support::fold_subsumed_deletes,
+		test_support::{confirm_agreed_content, confirm_agreed_pushes, fold_subsumed_deletes},
 		*,
 	};
 	use crate::{alloc_meter, sync_engine::SyncMode};

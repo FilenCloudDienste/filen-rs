@@ -10,8 +10,8 @@
 //! while it is handed a page of it never waits on itself. A walk of the side reads [`PAGE`] rows a
 //! statement. A question about one path is answered out of the page the last such question read
 //! when that page spans the path, and that page doubles, up to [`PAGE`], while the questions walk
-//! it in path order: the reconcile asks about every path it decides, one after the next, and pays a
-//! statement a page rather than one a path.
+//! it in path order (see `page`): the reconcile asks about every path it decides, one after the
+//! next, and pays a statement a page rather than one a path.
 //!
 //! # A failed read or edit
 //!
@@ -34,7 +34,12 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Row, Statement, params};
 
 use super::{
-	super::{plan::subtree_bounds, scan::collision_key, side::NodesAt},
+	super::{
+		page::{Page, ReadAhead},
+		plan::subtree_bounds,
+		scan::collision_key,
+		side::NodesAt,
+	},
 	Stage,
 	remote::CHILDREN_PAGE,
 };
@@ -179,7 +184,7 @@ pub(crate) struct StagedSide<T> {
 	/// How many nodes the table holds.
 	len: usize,
 	/// The page the questions about one path read last (see the module docs).
-	ahead: Mutex<Ahead<T>>,
+	ahead: Mutex<ReadAhead<Page<T>>>,
 	/// [`Paging::page`]: how many rows a walk reads a statement.
 	page: NonZeroUsize,
 	/// [`Paging::rekey`]: how many rows a directory move re-keys a statement.
@@ -201,7 +206,7 @@ impl<T> StagedSide<T> {
 		Self {
 			stage: Mutex::new(stage),
 			len,
-			ahead: Mutex::new(Ahead::default()),
+			ahead: Mutex::new(ReadAhead::default()),
 			page: paging.page,
 			rekey: paging.rekey,
 			table,
@@ -423,7 +428,7 @@ impl<T> StagedSide<T> {
 		what: &str,
 		edit: impl FnOnce(&Connection) -> rusqlite::Result<R>,
 	) -> R {
-		*self.ahead.get_mut().unwrap_or_else(PoisonError::into_inner) = Ahead::default();
+		*self.ahead.get_mut().unwrap_or_else(PoisonError::into_inner) = ReadAhead::default();
 		let stage = self.stage.get_mut().unwrap_or_else(PoisonError::into_inner);
 		edit(&stage.conn).unwrap_or_else(|error| {
 			panic!(
@@ -442,35 +447,20 @@ impl<T> StagedSide<T> {
 	/// The node at exactly `path`, handed to `answer`: out of the page the last question read when
 	/// it spans the path, else out of a new one read from the path (see the module docs).
 	fn point<R>(&self, path: &str, answer: impl Fn(Option<&T>) -> R) -> R {
-		let mut ahead = self.ahead.lock().unwrap_or_else(PoisonError::into_inner);
-		if let Some(Span::Inside(found)) = ahead
-			.page
-			.as_ref()
-			.map(|page| page.answer(&self.table, path))
-		{
-			let found = answer(found);
-			ahead.answered += 1;
-			return found;
-		}
-		let want = ahead.next_want(&self.table, path, self.page.get());
-		let nodes = self.read("a path", |conn| {
-			read_page(conn, &self.table, Bound::Included(path), &Over::All, want)
-		});
-		let page = Page {
-			from: path.to_owned(),
-			complete: nodes.len() < want,
-			nodes,
-		};
-		let Span::Inside(found) = page.answer(&self.table, path) else {
-			unreachable!("a page read from a path spans that path")
-		};
-		let found = answer(found);
-		*ahead = Ahead {
-			page: Some(page),
-			answered: 1,
-			want,
-		};
-		found
+		self.ahead
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.ask(
+				path,
+				self.page,
+				|page| page.answer(path).map(&answer),
+				|want| {
+					let nodes = self.read("a path", |conn| {
+						read_page(conn, &self.table, Bound::Included(path), &Over::All, want)
+					});
+					Page::read(path, true, None, want, nodes, self.table.path)
+				},
+			)
 	}
 }
 
@@ -510,88 +500,6 @@ impl<T: PartialEq> PartialEq for StagedSide<T> {
 
 #[cfg(any(test, feature = "bench-internals"))]
 impl<T: Eq> Eq for StagedSide<T> {}
-
-/// The page the questions about one path read last, and how they used it (see
-/// [`StagedSide::point`]).
-struct Ahead<T> {
-	page: Option<Page<T>>,
-	/// How many questions `page` answered.
-	answered: usize,
-	/// How many nodes `page` was read for.
-	want: usize,
-}
-
-impl<T> Default for Ahead<T> {
-	fn default() -> Self {
-		Self {
-			page: None,
-			answered: 0,
-			want: 0,
-		}
-	}
-}
-
-impl<T> Ahead<T> {
-	/// How many nodes the page read for a question at `path` asks for: twice the last one's, up to
-	/// `most`, when that one answered at least half as many questions as it holds nodes and `path`
-	/// lies past it — a walk in path order, which may pass over the nodes it does not ask about, as
-	/// the move detection asks about files and passes the directories — and one otherwise, which is
-	/// what a lookup of the one path reads. Lookups of scattered paths read a page of at most four.
-	///
-	/// Half and not all: a walk that passes over a node or two of each page would otherwise read one
-	/// node a statement again, page after page, and over a tree's directories that was a statement
-	/// for every few files.
-	fn next_want(&self, table: &Table<T>, path: &str, most: usize) -> usize {
-		match &self.page {
-			Some(page)
-				if self.answered * 2 >= page.nodes.len()
-					&& page
-						.nodes
-						.last()
-						.is_some_and(|last| (table.path)(last) < path) =>
-			{
-				(self.want * 2).min(most)
-			}
-			_ => 1,
-		}
-	}
-}
-
-/// Nodes read from a path on, in path order.
-struct Page<T> {
-	from: String,
-	nodes: Vec<T>,
-	/// Whether it ran to the end of the table: fewer nodes came back than were asked for.
-	complete: bool,
-}
-
-impl<T> Page<T> {
-	/// What the table holds at `path`, where this page can say: `path` is at or after where it was
-	/// read from, and not past its last node unless it ran to the end of the table.
-	fn answer(&self, table: &Table<T>, path: &str) -> Span<'_, T> {
-		let past = self
-			.nodes
-			.last()
-			.is_none_or(|last| path > (table.path)(last));
-		if path < self.from.as_str() || (past && !self.complete) {
-			return Span::Outside;
-		}
-		Span::Inside(
-			self.nodes
-				.binary_search_by(|node| (table.path)(node).cmp(path))
-				.ok()
-				.and_then(|at| self.nodes.get(at)),
-		)
-	}
-}
-
-/// What a [`Page`] says about one path.
-enum Span<'p, T> {
-	/// The page spans the path, and holds this node there, or none.
-	Inside(Option<&'p T>),
-	/// The page does not reach the path.
-	Outside,
-}
 
 /// Where a walk of a staged side is: the page in hand, and where the next one starts.
 struct Cursor<T> {
