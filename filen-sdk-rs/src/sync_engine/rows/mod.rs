@@ -699,7 +699,7 @@ enum Read {
 impl Cursor<'_> {
 	fn adapt(want: &mut usize, rows: usize, answered: usize) {
 		if answered * 2 >= rows.max(1) {
-			*want = (*want * 2).min(MAX_PAGE);
+			*want = (*want * 2).min(MAX_PAGE.get());
 		} else if answered <= 1 {
 			*want = (*want / 2).max(1);
 		}
