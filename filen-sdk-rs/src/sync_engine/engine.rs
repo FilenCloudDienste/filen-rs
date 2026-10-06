@@ -1339,6 +1339,19 @@ where
 		})
 }
 
+/// Run `work` on a blocking thread, for what a pass does to its own stages and rows whose cost
+/// scales with the tree — the reconcile — as [`off_store`] runs the store's. `work` owns what it
+/// reads and hands back whatever the pass still needs. A panic in it is the pass's error, which
+/// `what` names.
+async fn off_runtime<T>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> Result<T, Error>
+where
+	T: Send + 'static,
+{
+	tokio::task::spawn_blocking(work)
+		.await
+		.map_err(|e| Error::custom(ErrorKind::Internal, format!("{what} panicked: {e}")))
+}
+
 /// A configured sync engine: an `Arc<Client>` (whose cache supplies the remote view) plus one
 /// baseline connection per pair.
 pub struct SyncEngine {
@@ -1643,7 +1656,14 @@ impl SyncEngine {
 	) -> Result<BenchPass, Error> {
 		let prep = self.prepare(pair, scope).await?;
 		super::step("prepare_tail");
-		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		let state = screen_state(&prep);
+		let at = self.stage_at(pair);
+		let (prep, screened) = off_runtime("screening the pass's plan", move || {
+			let screened = reconcile_and_screen(&prep, state, || Stage::create(at));
+			(prep, screened)
+		})
+		.await?;
+		let screened = screened?;
 		super::step("reconcile_and_screen");
 		// Summed HERE, at the pass's widest point: every structure it built is still alive and the
 		// drop below is what frees them. Only a memory child asks — the sum is O(nodes), and it is
@@ -4409,8 +4429,14 @@ impl SyncEngine {
 			confirmed,
 		};
 		// AFTER the pending-write fold: a move of ours the cache has not shown yet must read as done,
-		// not as the remote moving the directory back.
-		prepared.fold_dir_moves().expect(
+		// not as the remote moving the directory back. On a blocking thread: the fold reads and
+		// re-keys both staged sides.
+		let (prepared, folded) = off_runtime("folding the pass's directory moves", move || {
+			let folded = prepared.fold_dir_moves();
+			(prepared, folded)
+		})
+		.await?;
+		folded.expect(
 			"a whole read's sides derive nothing from the rows, so no move asks one to stay put \
 			 (should be impossible)",
 		);
@@ -4439,20 +4465,27 @@ impl SyncEngine {
 					..PlanOutcome::default()
 				});
 			}
-			let mut screened = reconcile_and_screen(&prep, screen_state(&prep));
-			// What the pass would apply, which takes each deletion under a deleted directory along
-			// with it.
-			plan::fold_subsumed_deletes(&mut screened.decision.safe);
-			Ok(PlanOutcome {
-				actions: prep.planned(&screened.decision.safe),
-				held: prep.planned(&screened.decision.held),
-				held_reason: screened.decision.reason,
-				pass_token: screened.pass_token,
-				conflicts: screened.conflicts,
-				unsyncable: prep.unsyncable(),
-				ignored: prep.ignored(),
-				refused: None,
+			let state = screen_state(&prep);
+			let at = self.stage_at(pair);
+			// On a blocking thread, as a pass reconciles its plan: the reconcile reads and writes
+			// the plan's stage.
+			off_runtime("planning the pair", move || {
+				let mut screened = reconcile_and_screen(&prep, state, || Stage::create(at))?;
+				// What the pass would apply, which takes each deletion under a deleted directory
+				// along with it.
+				plan::fold_subsumed_deletes(&mut screened.decision.safe);
+				Ok(PlanOutcome {
+					actions: prep.planned(&screened.decision.safe),
+					held: prep.planned(&screened.decision.held),
+					held_reason: screened.decision.reason,
+					pass_token: screened.pass_token,
+					conflicts: screened.conflicts,
+					unsyncable: prep.unsyncable(),
+					ignored: prep.ignored(),
+					refused: None,
+				})
 			})
+			.await?
 		})
 		.await
 	}
@@ -5299,12 +5332,17 @@ impl SyncEngine {
 		);
 	}
 
-	/// A new stage for a pass of `pair` (see [`stage`](super::stage)), numbered by this engine so
-	/// that no two of its passes share one — nor a dry run that stages its own work, whatever pass of
-	/// the same pair is running.
-	fn stage(&self, pair: PairId) -> Result<Stage, Error> {
+	/// Where a new stage for a pass of `pair` goes (see [`stage`](super::stage)), numbered by this
+	/// engine so that no two of its passes share one — nor a dry run that stages its own work,
+	/// whatever pass of the same pair is running. A number never made into a stage is skipped.
+	fn stage_at(&self, pair: PairId) -> PathBuf {
 		let number = self.stages.fetch_add(1, Ordering::Relaxed);
-		Stage::create(stage::stage_path(&self.db_path, pair, number))
+		stage::stage_path(&self.db_path, pair, number)
+	}
+
+	/// A new stage for a pass of `pair`, at [`stage_at`](Self::stage_at).
+	fn stage(&self, pair: PairId) -> Result<Stage, Error> {
+		Stage::create(self.stage_at(pair))
 	}
 
 	/// The body of [`sync_pass`](Self::sync_pass), reporting to an observer whose panics are
@@ -5499,7 +5537,18 @@ impl SyncEngine {
 		}
 
 		let state = screen_state(&prep);
-		let mut screened = reconcile_and_screen(&prep, state);
+		let at = self.stage_at(pair);
+		// The reconcile reads and writes the plan's stage, which scales with the plan, so it runs on
+		// a blocking thread, handed what it reads and handing it back.
+		let screened;
+		(prep, screened) = off_runtime("screening the pass's plan", move || {
+			let screened = reconcile_and_screen(&prep, state, || Stage::create(at));
+			(prep, screened)
+		})
+		.await?;
+		let mut screened = screened?;
+		// Where a whole pass reconciled its plan, which the plan is staged in below.
+		let reconciled_in = screened.stage.take();
 		// A one-shot approval releases the held batch it names — and only that batch.
 		if let Some(token) = screened.pass_token.clone()
 			&& self.take_approval(pair, &token).await
@@ -5648,9 +5697,11 @@ impl SyncEngine {
 		// the rest of the scan, the view and the rows goes — the rows' read transaction with them,
 		// before the first action commits, since holding it open would pin the WAL through every
 		// upload (see `Baseline::close`).
-		let plan = prep
-			.stage_plan(decision.safe, subsumed, self.stage(pair)?)
-			.await?;
+		let stage = match reconciled_in {
+			Some(stage) => stage,
+			None => self.stage(pair)?,
+		};
+		let plan = prep.stage_plan(decision.safe, subsumed, stage).await?;
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
@@ -5838,18 +5889,57 @@ struct Screened {
 	deferred_paths: usize,
 	/// Actions this pass planned and then dropped (see [`SyncReport::dropped_actions`]).
 	dropped: usize,
+	/// The stage a whole pass reconciled its plan in, for the plan to be staged in once it is
+	/// screened; `None` for a pass that reconciled in memory.
+	stage: Option<Stage>,
 }
 
 /// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
-fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened {
-	let plan = plan::reconcile(
-		prep.record.mode,
-		&prep.baseline,
-		&prep.local_scan.nodes.of(&prep.baseline),
-		&prep.remote_view.nodes.of(&prep.baseline),
-		&prep.holds,
+///
+/// A pass that read both sides whole into its stage reconciles them window by window into a stage
+/// of its own, which `new_stage` makes (see [`stage::reconcile_windows`]): the plan is decided
+/// without a set of the tree's paths in memory, and the stage is the one the plan is staged in. Any
+/// other pass reconciles in memory, over what it read.
+///
+/// A stage that cannot be made or written (a full disk) is an error, before anything is applied.
+fn reconcile_and_screen(
+	prep: &Prepared,
+	state: guard::ScreenState,
+	new_stage: impl FnOnce() -> Result<Stage, Error>,
+) -> Result<Screened, Error> {
+	let (plan, stage) = match (
 		prep.read.paths(),
-	);
+		&prep.local_scan.nodes,
+		&prep.remote_view.nodes,
+	) {
+		(plan::PassPaths::Whole, Side::Staged(local), Side::Staged(remote)) => {
+			let stage = new_stage()?;
+			let at = stage.path().display().to_string();
+			let (plan, stage) = stage::reconcile_windows(
+				prep.record.mode,
+				&prep.baseline,
+				local,
+				remote,
+				&prep.holds,
+				stage,
+				stage::WINDOW,
+			)
+			.and_then(|windows| windows.into_plan(&prep.holds))
+			.map_err(|e| db_error(e, &format!("reconciling the pass in {at}")))?;
+			(plan, Some(stage))
+		}
+		_ => (
+			plan::reconcile(
+				prep.record.mode,
+				&prep.baseline,
+				&prep.local_scan.nodes.of(&prep.baseline),
+				&prep.remote_view.nodes.of(&prep.baseline),
+				&prep.holds,
+				prep.read.paths(),
+			),
+			None,
+		),
+	};
 	// The directory moves run before everything else in the plan, which already names their
 	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
 	let mut actions = prep.dir_moves.clone();
@@ -5915,14 +6005,15 @@ fn reconcile_and_screen(prep: &Prepared, state: guard::ScreenState) -> Screened 
 		.reason
 		.as_ref()
 		.map(|reason| deletion_batch_token(&decision.held, reason));
-	Screened {
+	Ok(Screened {
 		conflicts,
 		all,
 		decision,
 		pass_token,
 		deferred_paths,
 		dropped,
-	}
+		stage,
+	})
 }
 
 /// Drop every action at a blocked path, and everything under it.
@@ -6603,10 +6694,64 @@ mod tests {
 	/// Fold and screen `prep` as a pass does.
 	fn run_prepared(mut prep: Prepared) -> (Vec<SyncAction>, Vec<UnsyncablePath>) {
 		prep.fold_dir_moves().unwrap();
-		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		let screened = screened_both(&mut prep);
 		let mut actions = screened.decision.safe;
 		actions.extend(screened.decision.held);
 		(actions, prep.unsyncable())
+	}
+
+	/// What [`reconcile_and_screen`] hands back for `prep`, whose two sides are whole maps, reconciled
+	/// in memory — and held to what a whole pass gets from the same two sides staged, which it
+	/// reconciles window by window: the same actions, held and safe, the same conflicts, hold and
+	/// token, and the same counts. `prep` is left with its maps.
+	fn screened_both(prep: &mut Prepared) -> Screened {
+		let in_memory = reconcile_and_screen(prep, screen_state(prep), || {
+			panic!("a pass over whole maps reconciles in memory, and makes no stage")
+		})
+		.unwrap();
+		let (whole_local, whole_remote) = (
+			copied(&prep.local_scan.nodes),
+			copied(&prep.remote_view.nodes),
+		);
+		let (_stages, local, remote) = stage::staged_sides(
+			copied(&whole_local).into_whole().into_values(),
+			copied(&whole_remote).into_whole().into_values(),
+			2,
+		);
+		prep.local_scan.nodes = local;
+		prep.remote_view.nodes = remote;
+		let (_plan_dir, plan_stage) = Stage::in_temp_dir();
+		let windowed = reconcile_and_screen(prep, screen_state(prep), || Ok(plan_stage)).unwrap();
+		prep.local_scan.nodes = whole_local;
+		prep.remote_view.nodes = whole_remote;
+		assert!(
+			in_memory.stage.is_none() && windowed.stage.is_some(),
+			"only the staged sides are reconciled into a stage"
+		);
+		assert_eq!(windowed.all, in_memory.all, "every executable action");
+		assert_eq!(
+			windowed.decision.safe, in_memory.decision.safe,
+			"the actions safe to apply"
+		);
+		assert_eq!(
+			windowed.decision.held, in_memory.decision.held,
+			"the held ones"
+		);
+		assert_eq!(
+			windowed.decision.reason, in_memory.decision.reason,
+			"why they are held"
+		);
+		assert_eq!(
+			windowed.pass_token, in_memory.pass_token,
+			"the held batch's token"
+		);
+		assert_eq!(windowed.conflicts, in_memory.conflicts, "the conflicts");
+		assert_eq!(
+			windowed.deferred_paths, in_memory.deferred_paths,
+			"the deferred paths"
+		);
+		assert_eq!(windowed.dropped, in_memory.dropped, "the dropped actions");
+		in_memory
 	}
 
 	/// A pass's inputs before the fold, with a complete scan that found nothing it could not sync.
@@ -7946,7 +8091,7 @@ mod tests {
 			);
 		}
 
-		let prep = prepared(
+		let mut prep = prepared(
 			SyncMode::TwoWay,
 			baseline,
 			docs.local("docs"),
@@ -7958,7 +8103,7 @@ mod tests {
 			)),
 			HashMap::new(),
 		);
-		let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		let screened = screened_both(&mut prep);
 		assert_eq!(
 			screened
 				.conflicts
@@ -8079,8 +8224,8 @@ mod tests {
 				hidden_by(level.clone(), "node_modules/"),
 			);
 
-			for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
-				let screened = reconcile_and_screen(&prep, screen_state(&prep));
+			for (side, mut prep) in [("pulled", pulled), ("pushed", pushed)] {
+				let screened = screened_both(&mut prep);
 				let actions: Vec<&SyncAction> = screened
 					.decision
 					.safe
@@ -8155,8 +8300,8 @@ mod tests {
 			("pushed", &pushed as &dyn Fn() -> Prepared),
 			("pulled", &pulled),
 		] {
-			let plain = build();
-			let screened = reconcile_and_screen(&plain, screen_state(&plain));
+			let mut plain = build();
+			let screened = screened_both(&mut plain);
 			assert!(
 				screened.decision.reason.is_none() && deletes_psd(&screened),
 				"{side}: {:?}",
@@ -8165,7 +8310,7 @@ mod tests {
 
 			let mut unignored = build();
 			unignored.last_ignored.insert("a.psd".to_string());
-			let screened = reconcile_and_screen(&unignored, screen_state(&unignored));
+			let screened = screened_both(&mut unignored);
 			assert_eq!(
 				screened.decision.reason,
 				Some(GuardReason::FirstSyncWithDeletions { deletions: 1 }),
@@ -8191,7 +8336,7 @@ mod tests {
 				.facts
 				.ignored_remote
 				.insert("a.psd".to_string(), hidden_by(IgnoreLevel::User, "*.psd"));
-			let screened = reconcile_and_screen(&still, screen_state(&still));
+			let screened = screened_both(&mut still);
 			assert!(
 				screened.decision.reason.is_none() && !deletes_psd(&screened),
 				"{side}: {:?}",
@@ -8326,8 +8471,8 @@ mod tests {
 		);
 		pushed.facts.ignore_blocked.insert("docs/sub".to_string());
 
-		for (side, prep) in [("pulled", pulled), ("pushed", pushed)] {
-			let screened = reconcile_and_screen(&prep, screen_state(&prep));
+		for (side, mut prep) in [("pulled", pulled), ("pushed", pushed)] {
+			let screened = screened_both(&mut prep);
 			let actions: Vec<&SyncAction> = screened
 				.decision
 				.safe

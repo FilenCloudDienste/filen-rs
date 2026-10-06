@@ -2101,16 +2101,8 @@ fn detect_moves<'m>(
 	actions: &mut Vec<SyncAction>,
 	consumed: &mut HashSet<String>,
 ) {
-	// A local file a LOCAL move can end at, by the content it is matched on: one not in the baseline
-	// and not on the remote. Its hash is keyed by the raw bytes since `Blake3Hash` is not
-	// `std::hash::Hash`.
 	let created = |path: &str, node: &LocalNode| {
-		// The side map first: on a whole pass it is a hash lookup and the baseline is a read of the
-		// store, and almost every local file is on the remote too.
-		if node.kind != NodeKind::File || remote.holds(path) || baseline.contains_key(path) {
-			return None;
-		}
-		node.content_hash.map(|hash| *hash.as_ref())
+		push_target(node, || remote.holds(path), || baseline.contains_key(path))
 	};
 	// How many keys each index's targets carry, which decides the side each is keyed from, and
 	// whether a half has anything to join at all. Counted over the same walk that fills the indexes
@@ -2144,39 +2136,20 @@ fn detect_moves<'m>(
 	let mut remote_path_of_lineage: MoveTargets<StableUuid, Option<Cow<'m, str>>> =
 		MoveTargets::new(remote_lineages);
 
-	// The rows the PULL half can move, and the uuid each is matched on: synced files whose uuid the
-	// remote no longer holds at the row's own path. One still there would find its own path in
-	// either index — a uuid names one remote file, the view placing each item once and the
-	// pending-write fold keeping it so — and a move onto `from` is none.
-	let pull_source = |base: &BaselineEntry| {
-		if base.kind != NodeKind::File || base.state != BaselineState::Synced {
-			return None;
-		}
-		let uuid = base.remote_uuid?;
-		let stayed = remote
-			.at(&base.rel_path)
-			.is_some_and(|node| node.kind == NodeKind::File && node.remote_uuid == uuid);
-		(!stayed).then_some(uuid)
-	};
-	// The rows the PUSH half can move, and the content each is matched on: synced files the local
-	// side no longer holds, whose original the remote still holds at the row's path.
-	let push_source = |base: &BaselineEntry| {
-		if base.kind != NodeKind::File
-			|| base.state != BaselineState::Synced
-			|| local.holds(&base.rel_path)
-		{
-			return None;
-		}
-		let (hash, uuid) = (base.content_hash?, base.remote_uuid?);
-		(remote.at(&base.rel_path).map(|node| node.remote_uuid) == Some(uuid))
-			.then(|| *hash.as_ref())
+	let pull_uuid = |base: &BaselineEntry| pull_source(base, || remote.at(&base.rel_path));
+	let push_hash = |base: &BaselineEntry| {
+		push_source(
+			base,
+			|| local.holds(&base.rel_path),
+			|| remote.at(&base.rel_path),
+		)
 	};
 	// The sources ask for their keys first, so a pass with none — a first sync, a converged tree —
 	// indexes no target at all.
 	if remote_files > 0 || created_files > 0 {
 		visit_move_sources(paths, baseline, |base| {
 			if remote_files > 0
-				&& let Some(uuid) = pull_source(base)
+				&& let Some(uuid) = pull_uuid(base)
 			{
 				remote_path_of_uuid.want(uuid);
 				if let Some(lineage) = base.remote_stable_uuid {
@@ -2184,7 +2157,7 @@ fn detect_moves<'m>(
 				}
 			}
 			if created_files > 0
-				&& let Some(hash) = push_source(base)
+				&& let Some(hash) = push_hash(base)
 			{
 				created_by_hash.want(hash);
 			}
@@ -2234,9 +2207,15 @@ fn detect_moves<'m>(
 	// pull half is done with it, exactly as that walk would judge them. Only a row with somewhere to
 	// move to is kept: a mass deletion keeps none.
 	let local_source = |base: &BaselineEntry| {
-		push_source(base)
+		push_hash(base)
 			.and_then(|hash| created_by_hash.get(&hash))
 			.is_some_and(|at| !at.is_empty())
+	};
+	let sides = MoveSides {
+		mode,
+		local,
+		remote,
+		baseline,
 	};
 	let mut local_sources: Vec<BaselineEntry> = Vec::new();
 	visit_move_sources(paths, baseline, |base| {
@@ -2246,158 +2225,296 @@ fn detect_moves<'m>(
 		if !pulls {
 			return;
 		}
-		let from = &base.rel_path;
-		if consumed.contains(from) {
-			return;
-		}
-		let Some(uuid) = pull_source(base) else {
+		let Some(uuid) = pull_uuid(base) else {
 			return;
 		};
-		// Only where the local side still matches the baseline — for EITHER match. With a local
-		// edit at `from` this is a genuine both-sides divergence, and consuming it as a move
-		// would rename the local copy and then write over it, laundering a conflict into a
-		// silent overwrite. The mode decides what it becomes instead; see the doc comment.
-		//
-		// A row with NO local content on record is not such an edit: it is a row waiting for a
-		// push (a `KeepLocal` resolution anchors the baseline to the remote and clears the
-		// local half on purpose). Comparing a hash against `None` reports "changed" for every
-		// one of them, which would turn a remote rename landing before that push into a second
-		// conflict at the source plus a download at the new name. No local evidence is not
-		// evidence of a local change: carry the move across and let the pending push follow at
-		// the new name. The waiver is for the RENAME only — a move that also carried an EDIT is
-		// refused below, where the kept copy would end up under the download.
-		let local_at_from = local.at(from);
-		if base.content_hash.is_some()
-			&& classify_local(local_at_from.as_deref(), Some(base)) != SideState::Unchanged
-		{
-			return;
-		}
-		// `carries_edit`: the lineage moved AND changed version, so the local copy this move
-		// renames is the pre-edit one and still has to be refreshed.
-		let (to, carries_edit) = match remote_path_of_uuid.get(&uuid).and_then(Option::as_ref) {
-			Some(to) => (to.as_ref(), false),
-			None => match base.remote_stable_uuid.and_then(|lineage| {
-				remote_path_of_lineage
-					.get(&lineage)
-					.and_then(Option::as_ref)
-			}) {
-				Some(to) => (to.as_ref(), true),
-				None => return,
-			},
+		// The file the row records by its uuid, else by its lineage, which a move that carried an
+		// edit keeps (see `pull_move`).
+		let target = || match remote_path_of_uuid.get(&uuid).and_then(Option::as_ref) {
+			Some(to) => Some((Cow::Borrowed(to.as_ref()), false)),
+			None => base
+				.remote_stable_uuid
+				.and_then(|lineage| {
+					remote_path_of_lineage
+						.get(&lineage)
+						.and_then(Option::as_ref)
+				})
+				.map(|to| (Cow::Borrowed(to.as_ref()), true)),
 		};
-		// The edit a move carried is measured by the same rule as one that stayed put: over a
-		// push no snapshot ever confirmed it is a divergence, not an item to carry across.
-		// Consuming it would rename our unconfirmed copy to the destination for the paired
-		// download to write over — the loss the rule exists to stop, one rename away — and
-		// leaving the pair to the reconcile is no better, since the source would then read as a
-		// remote-side deletion. So the source is surfaced here and its path consumed; the moved
-		// version is untracked at its new name and downloads there through the ordinary
-		// reconcile, which is the same outcome the uuid branch produces for a two-sided change.
-		//
-		// A row with no local content on record is measured the same way, and has to be spelled
-		// out because [`is_unconfirmed_concurrent_edit`] has no hash of ours to compare: being
-		// excused from the local-change guard above is not agreement. The copy a `KeepLocal`
-		// resolution kept is diverged from what the remote holds by construction, so a remote
-		// change that renamed AND edited the file is the same divergence one rename away.
-		let remote_at_to = remote.at(to);
-		if carries_edit
-			&& mode.pushes()
-			&& (base.content_hash.is_none()
-				|| is_unconfirmed_concurrent_edit(
-					local_at_from.as_deref(),
-					remote_at_to.as_deref(),
-					Some(base),
-				)) {
-			let action = SyncAction::Conflict {
-				rel_path: from.clone(),
-			};
-			tracing::debug!(
-				"plan: {} — the moved version is a foreign edit over a push this engine never saw confirmed",
-				action.describe()
-			);
-			actions.push(action);
-			consumed.insert(from.clone());
-			return;
-		}
-		if to != from
-			&& !baseline.contains_key(to)
-			&& local_at_from.is_some()
-			&& !local.holds(to)
-			&& !consumed.contains(to)
-		{
-			let action = SyncAction::MoveLocal {
-				from_path: from.clone(),
-				to_path: to.to_string(),
-				kind: NodeKind::File,
-			};
-			tracing::debug!(
-				"plan: {} — remote item moved (matched by {}); renaming locally instead of re-downloading",
-				action.describe(),
-				if carries_edit { "lineage" } else { "uuid" }
-			);
-			actions.push(action);
-			if carries_edit {
-				// The move brought a new version with it: pull it onto the renamed copy in this
-				// same pass. Without this the pass would leave the pre-edit bytes at the new
-				// path with a baseline row that has to describe them as stale, and the next
-				// pass would have to re-pull anyway.
-				let download = SyncAction::DownloadFile {
-					rel_path: to.to_string(),
-					// The lineage index named this path, so the node is there.
-					remote_uuid: remote_at_to
-						.as_deref()
-						.expect("the moved item's new path is in the remote side")
-						.remote_uuid,
-				};
-				tracing::debug!(
-					"plan: {} — the move carried a content edit",
-					download.describe()
-				);
-				actions.push(download);
-			}
-			consumed.insert(from.clone());
-			consumed.insert(to.to_string());
+		if let Some(took) = pull_move(
+			&sides,
+			|path| consumed.contains(path),
+			base,
+			target,
+			actions,
+		) {
+			took.consume(&base.rel_path, consumed);
 		}
 	});
 
 	for base in &local_sources {
-		let from = &base.rel_path;
-		if consumed.contains(from) {
-			continue;
-		}
-		let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
-			continue;
+		let candidates = |hash: &[u8; 32]| {
+			created_by_hash
+				.get(hash)
+				.map(|at| at.iter().map(Cow::as_ref))
 		};
-		let Some(candidates) = created_by_hash.get(hash.as_ref()) else {
-			continue;
-		};
-		let fresh: Vec<&str> = candidates
-			.iter()
-			.map(Cow::as_ref)
-			.filter(|to| !consumed.contains(*to) && !remote.holds(to))
-			.collect();
-		// Only an UNAMBIGUOUS match is a move; otherwise fall back to delete + create.
-		if let [to] = fresh[..] {
-			let action = SyncAction::MoveRemote {
-				from_path: from.clone(),
-				to_path: to.to_string(),
-				kind: NodeKind::File,
-				remote_uuid: uuid,
-			};
-			tracing::debug!(
-				"plan: {} — local file moved (matched by content hash); re-parenting/renaming on the remote instead of re-uploading",
-				action.describe()
-			);
-			actions.push(action);
-			consumed.insert(from.clone());
-			consumed.insert(to.to_string());
+		if let Some(took) = push_move(
+			&sides,
+			|path| consumed.contains(path),
+			base,
+			candidates,
+			actions,
+		) {
+			took.consume(&base.rel_path, consumed);
 		}
 	}
 }
 
+/// Whether `base` is a row the PULL half of the move join can move from, and the uuid it is matched
+/// on: a synced file whose uuid the remote no longer holds at the row's own path, which `remote_at`
+/// reads, and only for such a row. One still there would find its own path by either key — a uuid
+/// names one remote file, the view placing each item once and the pending-write fold keeping it so
+/// — and a move onto `from` is none.
+pub(super) fn pull_source<'n>(
+	base: &BaselineEntry,
+	remote_at: impl FnOnce() -> Option<Cow<'n, RemoteNode>>,
+) -> Option<Uuid> {
+	if base.kind != NodeKind::File || base.state != BaselineState::Synced {
+		return None;
+	}
+	let uuid = base.remote_uuid?;
+	let stayed =
+		remote_at().is_some_and(|node| node.kind == NodeKind::File && node.remote_uuid == uuid);
+	(!stayed).then_some(uuid)
+}
+
+/// Whether `base` is a row the PUSH half of the move join can move from, and the content it is
+/// matched on: a synced file the local side no longer holds (`local_holds`), whose original the
+/// remote still holds at the row's path (`remote_at`). Its hash is keyed by the raw bytes, since
+/// `Blake3Hash` is not `std::hash::Hash`.
+pub(super) fn push_source<'n>(
+	base: &BaselineEntry,
+	local_holds: impl FnOnce() -> bool,
+	remote_at: impl FnOnce() -> Option<Cow<'n, RemoteNode>>,
+) -> Option<[u8; 32]> {
+	if base.kind != NodeKind::File || base.state != BaselineState::Synced || local_holds() {
+		return None;
+	}
+	let (hash, uuid) = (base.content_hash?, base.remote_uuid?);
+	(remote_at().map(|node| node.remote_uuid) == Some(uuid)).then(|| *hash.as_ref())
+}
+
+/// Whether the local `node` is one a move of the PUSH half can end at, and the content it is matched
+/// on: a file the remote does not hold (`remote_holds`) at a path no row tracks (`tracked`). The
+/// remote is asked first: on a whole pass it is a hash lookup and the baseline is a read of the
+/// store, and almost every local file is on the remote too.
+pub(super) fn push_target(
+	node: &LocalNode,
+	remote_holds: impl FnOnce() -> bool,
+	tracked: impl FnOnce() -> bool,
+) -> Option<[u8; 32]> {
+	if node.kind != NodeKind::File || remote_holds() || tracked() {
+		return None;
+	}
+	node.content_hash.map(|hash| *hash.as_ref())
+}
+
+/// What a move of the join is decided against beyond its source row: the pass's mode, its two
+/// sides and its rows, asked about the paths a source could move to.
+pub(super) struct MoveSides<'s, L, R> {
+	pub(super) mode: super::SyncMode,
+	pub(super) local: &'s L,
+	pub(super) remote: &'s R,
+	pub(super) baseline: &'s Baseline,
+}
+
+/// What a source of the move join took: its own path alone, where it surfaced a conflict, or its
+/// path and the one it moved to.
+pub(super) enum Took {
+	Source,
+	Move { to: String },
+}
+
+impl Took {
+	/// Record in `consumed` the paths taken from `from`.
+	fn consume(self, from: &str, consumed: &mut HashSet<String>) {
+		consumed.insert(from.to_owned());
+		if let Self::Move { to } = self {
+			consumed.insert(to);
+		}
+	}
+}
+
+/// The PULL half of the move join for one source row, `base`: a remote move becomes a local one —
+/// one the resident [`detect_moves`] and a whole pass's staged reconcile (see `stage::reconcile`)
+/// both decide here. `consumed` says whether an earlier move of the join, or a path the pass
+/// withholds, has taken a path. `target` is where the remote holds the row's file now: by the uuid
+/// the row records, else by its lineage, which a move that carried an edit keeps (`true`).
+///
+/// What the source took, if anything: a conflict surfaced at it, or the move.
+pub(super) fn pull_move<'t, L, R>(
+	sides: &MoveSides<'_, L, R>,
+	consumed: impl Fn(&str) -> bool,
+	base: &BaselineEntry,
+	target: impl FnOnce() -> Option<(Cow<'t, str>, bool)>,
+	actions: &mut Vec<SyncAction>,
+) -> Option<Took>
+where
+	L: NodesAt<Node = LocalNode>,
+	R: NodesAt<Node = RemoteNode>,
+{
+	let from = &base.rel_path;
+	if consumed(from) {
+		return None;
+	}
+	// Only where the local side still matches the baseline — for EITHER match. With a local
+	// edit at `from` this is a genuine both-sides divergence, and consuming it as a move
+	// would rename the local copy and then write over it, laundering a conflict into a
+	// silent overwrite. The mode decides what it becomes instead; see `detect_moves`.
+	//
+	// A row with NO local content on record is not such an edit: it is a row waiting for a
+	// push (a `KeepLocal` resolution anchors the baseline to the remote and clears the
+	// local half on purpose). Comparing a hash against `None` reports "changed" for every
+	// one of them, which would turn a remote rename landing before that push into a second
+	// conflict at the source plus a download at the new name. No local evidence is not
+	// evidence of a local change: carry the move across and let the pending push follow at
+	// the new name. The waiver is for the RENAME only — a move that also carried an EDIT is
+	// refused below, where the kept copy would end up under the download.
+	let local_at_from = sides.local.at(from);
+	if base.content_hash.is_some()
+		&& classify_local(local_at_from.as_deref(), Some(base)) != SideState::Unchanged
+	{
+		return None;
+	}
+	// `carries_edit`: the lineage moved AND changed version, so the local copy this move
+	// renames is the pre-edit one and still has to be refreshed.
+	let (to, carries_edit) = target()?;
+	let to: &str = &to;
+	// The edit a move carried is measured by the same rule as one that stayed put: over a
+	// push no snapshot ever confirmed it is a divergence, not an item to carry across.
+	// Consuming it would rename our unconfirmed copy to the destination for the paired
+	// download to write over — the loss the rule exists to stop, one rename away — and
+	// leaving the pair to the reconcile is no better, since the source would then read as a
+	// remote-side deletion. So the source is surfaced here and its path consumed; the moved
+	// version is untracked at its new name and downloads there through the ordinary
+	// reconcile, which is the same outcome the uuid branch produces for a two-sided change.
+	//
+	// A row with no local content on record is measured the same way, and has to be spelled
+	// out because [`is_unconfirmed_concurrent_edit`] has no hash of ours to compare: being
+	// excused from the local-change guard above is not agreement. The copy a `KeepLocal`
+	// resolution kept is diverged from what the remote holds by construction, so a remote
+	// change that renamed AND edited the file is the same divergence one rename away.
+	let remote_at_to = sides.remote.at(to);
+	if carries_edit
+		&& sides.mode.pushes()
+		&& (base.content_hash.is_none()
+			|| is_unconfirmed_concurrent_edit(
+				local_at_from.as_deref(),
+				remote_at_to.as_deref(),
+				Some(base),
+			)) {
+		let action = SyncAction::Conflict {
+			rel_path: from.clone(),
+		};
+		tracing::debug!(
+			"plan: {} — the moved version is a foreign edit over a push this engine never saw confirmed",
+			action.describe()
+		);
+		actions.push(action);
+		return Some(Took::Source);
+	}
+	if to == from
+		|| sides.baseline.contains_key(to)
+		|| local_at_from.is_none()
+		|| sides.local.holds(to)
+		|| consumed(to)
+	{
+		return None;
+	}
+	let action = SyncAction::MoveLocal {
+		from_path: from.clone(),
+		to_path: to.to_string(),
+		kind: NodeKind::File,
+	};
+	tracing::debug!(
+		"plan: {} — remote item moved (matched by {}); renaming locally instead of re-downloading",
+		action.describe(),
+		if carries_edit { "lineage" } else { "uuid" }
+	);
+	actions.push(action);
+	if carries_edit {
+		// The move brought a new version with it: pull it onto the renamed copy in this
+		// same pass. Without this the pass would leave the pre-edit bytes at the new
+		// path with a baseline row that has to describe them as stale, and the next
+		// pass would have to re-pull anyway.
+		let download = SyncAction::DownloadFile {
+			rel_path: to.to_string(),
+			// The lineage index named this path, so the node is there.
+			remote_uuid: remote_at_to
+				.as_deref()
+				.expect("the moved item's new path is in the remote side")
+				.remote_uuid,
+		};
+		tracing::debug!(
+			"plan: {} — the move carried a content edit",
+			download.describe()
+		);
+		actions.push(download);
+	}
+	Some(Took::Move { to: to.to_owned() })
+}
+
+/// The PUSH half of the move join for one source row, `base`: a local move becomes a remote one, by
+/// content — decided here for [`detect_moves`] and a whole pass's staged reconcile alike (see
+/// [`pull_move`]). `candidates` are the new local files carrying a content hash, in path order.
+///
+/// Only an UNAMBIGUOUS match is a move: a content hash that more than one new file carries, none
+/// of them taken, falls back to delete + create.
+pub(super) fn push_move<L, R, I>(
+	sides: &MoveSides<'_, L, R>,
+	consumed: impl Fn(&str) -> bool,
+	base: &BaselineEntry,
+	candidates: impl FnOnce(&[u8; 32]) -> Option<I>,
+	actions: &mut Vec<SyncAction>,
+) -> Option<Took>
+where
+	R: NodesAt<Node = RemoteNode>,
+	I: IntoIterator,
+	I::Item: AsRef<str>,
+{
+	let from = &base.rel_path;
+	if consumed(from) {
+		return None;
+	}
+	let (Some(hash), Some(uuid)) = (base.content_hash, base.remote_uuid) else {
+		return None;
+	};
+	let mut fresh = candidates(hash.as_ref())?
+		.into_iter()
+		.filter(|to| !consumed(to.as_ref()) && !sides.remote.holds(to.as_ref()));
+	let to = fresh.next()?;
+	if fresh.next().is_some() {
+		return None;
+	}
+	let action = SyncAction::MoveRemote {
+		from_path: from.clone(),
+		to_path: to.as_ref().to_owned(),
+		kind: NodeKind::File,
+		remote_uuid: uuid,
+	};
+	tracing::debug!(
+		"plan: {} — local file moved (matched by content hash); re-parenting/renaming on the remote instead of re-uploading",
+		action.describe()
+	);
+	actions.push(action);
+	Some(Took::Move {
+		to: to.as_ref().to_owned(),
+	})
+}
+
 /// Whether `key` is one of `held` or lives under one. A path the view cannot resolve makes
 /// everything the snapshot would otherwise resolve beneath it unresolvable too.
-fn is_under_held_path(key: &str, held: &BTreeSet<String>) -> bool {
+pub(super) fn is_under_held_path(key: &str, held: &BTreeSet<String>) -> bool {
 	at_or_under_root(held, key)
 }
 
@@ -3786,7 +3903,9 @@ pub(crate) struct Plan {
 /// do not already carry — a row both sides still hold is keyed by a `String` that exists, and
 /// borrowing it is the difference between one allocation per row and three — and it is exactly the
 /// set the both-absent arm retires. So the tree is walked for it against one reused buffer and
-/// only a row in neither side is copied: a converged pair copies no path here.
+/// only a row in neither side is copied: a converged pair copies no path here. A staged side lends
+/// no path, though, so over a whole pass's staged sides this set holds a copy of every path: a
+/// whole pass reconciles them window by window instead (see `stage::reconcile`).
 ///
 /// [`Changed`](PassPaths::Changed) is that same union intersected with the pass's own set. Nothing
 /// is left unretired by the intersection: the both-absent arm retires a row whose path neither
@@ -3846,6 +3965,11 @@ fn reconcile_keys<'m>(
 /// Reconcile a pair's three inputs into an ordered action plan. `baseline`/`local`/`remote` are all
 /// keyed by the same NFC-normalized relative path; `holds` is what the pass must leave alone, and
 /// `paths` which paths it decides (see [`PassPaths`]).
+///
+/// A whole pass's staged sides are reconciled window by window into the pass's stage instead (see
+/// `stage::reconcile`), which plans what this plans over them: the per-path decision
+/// ([`decide_path`]), the move join's ([`pull_move`], [`push_move`]) and the plan's tail
+/// ([`finish_plan`]) are this one's.
 pub(crate) fn reconcile(
 	mode: super::SyncMode,
 	baseline: &Baseline,
@@ -3916,65 +4040,90 @@ pub(crate) fn reconcile(
 			continue;
 		}
 		let base = rows.get(key);
-		let base = base.as_ref();
-		// A held conflict is never acted on until the caller resolves it — but it IS re-reported
-		// every pass, so a caller watching the reports keeps seeing what is outstanding. Its
-		// subtree is suppressed below, along with any conflict surfaced by this pass.
-		if base.is_some_and(|b| b.state.is_conflict()) {
-			actions.push(SyncAction::Conflict {
-				rel_path: key.to_string(),
-			});
-			continue;
-		}
-		let local_at = local.at(key);
-		let remote_at = remote.at(key);
-		let (local_node, remote_node) = (local_at.as_deref(), remote_at.as_deref());
+		decide_path(
+			mode,
+			key,
+			base.as_ref(),
+			|| (local.at(key), remote.at(key)),
+			&mut actions,
+		);
+	}
+	finish_plan(actions, deferred_paths, holds)
+}
 
-		// A path adopted from the destination at a mode switch (see
-		// [`adopt_destination_rows`]). The row is never a baseline for classification — whatever
-		// still holds the path reads as newly created — and in a one-way mode it holds off the
-		// destination-side deletion for as long as the source has nothing there.
-		let mut base = base;
-		if base.is_some_and(|b| b.state == BaselineState::Adopted) {
-			let source_holds = match mode {
-				super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
-					local_node.is_some()
-				}
-				super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
-					remote_node.is_some()
-				}
-				// Both sides are sources; the surviving copy flows back to the other one.
-				super::SyncMode::TwoWay => local_node.is_some() || remote_node.is_some(),
-			};
-			if local_node.is_some() || remote_node.is_some() {
-				if !source_holds {
-					tracing::debug!(
-						"reconcile: leaving {key:?} alone — the destination's copy was adopted at a mode switch and the source is still empty here"
-					);
-					continue;
-				}
-				base = None;
-			}
-			// Neither side holds the path any more: the real row falls through below, where the
-			// both-absent arm retires it.
-		}
+/// Decide one path from the three inputs at it, and nothing else: what [`reconcile`] plans at every
+/// path it decides that no move took, and what the windows of a whole pass's staged reconcile plan
+/// at each of theirs (see `stage::reconcile`). `nodes` reads the path's local and remote nodes, and
+/// is not asked at a path the baseline holds in conflict.
+pub(super) fn decide_path<'n>(
+	mode: super::SyncMode,
+	key: &str,
+	base: Option<&BaselineEntry>,
+	nodes: impl FnOnce() -> (Option<Cow<'n, LocalNode>>, Option<Cow<'n, RemoteNode>>),
+	actions: &mut Vec<SyncAction>,
+) {
+	// A held conflict is never acted on until the caller resolves it — but it IS re-reported every
+	// pass, so a caller watching the reports keeps seeing what is outstanding. Its subtree is
+	// suppressed once the plan is made, along with any conflict surfaced by this pass (see
+	// [`finish_plan`]).
+	if base.is_some_and(|b| b.state.is_conflict()) {
+		actions.push(SyncAction::Conflict {
+			rel_path: key.to_string(),
+		});
+		return;
+	}
+	let (local_at, remote_at) = nodes();
+	let (local_node, remote_node) = (local_at.as_deref(), remote_at.as_deref());
 
-		// A backup mode is its mirror mode minus deletions on the destination — the ONE difference,
-		// so the two share an arm and the deletion policy is read off the mode itself.
-		let delete_ok = mode.propagates_deletes();
-		match mode {
-			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
-				push_to_remote(key, local_node, remote_node, base, delete_ok, &mut actions)
+	// A path adopted from the destination at a mode switch (see [`adopt_destination_rows`]). The
+	// row is never a baseline for classification — whatever still holds the path reads as newly
+	// created — and in a one-way mode it holds off the destination-side deletion for as long as the
+	// source has nothing there.
+	let mut base = base;
+	if base.is_some_and(|b| b.state == BaselineState::Adopted) {
+		let source_holds = match mode {
+			super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => local_node.is_some(),
+			super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => remote_node.is_some(),
+			// Both sides are sources; the surviving copy flows back to the other one.
+			super::SyncMode::TwoWay => local_node.is_some() || remote_node.is_some(),
+		};
+		if local_node.is_some() || remote_node.is_some() {
+			if !source_holds {
+				tracing::debug!(
+					"reconcile: leaving {key:?} alone — the destination's copy was adopted at a mode switch and the source is still empty here"
+				);
+				return;
 			}
-			super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
-				pull_to_local(key, local_node, remote_node, base, delete_ok, &mut actions)
-			}
-			super::SyncMode::TwoWay => {
-				reconcile_two_way(key, local_node, remote_node, base, &mut actions)
-			}
+			base = None;
 		}
+		// Neither side holds the path any more: the real row falls through below, where the
+		// both-absent arm retires it.
 	}
 
+	// A backup mode is its mirror mode minus deletions on the destination — the ONE difference, so
+	// the two share an arm and the deletion policy is read off the mode itself.
+	let delete_ok = mode.propagates_deletes();
+	match mode {
+		super::SyncMode::LocalToRemote | super::SyncMode::LocalBackup => {
+			push_to_remote(key, local_node, remote_node, base, delete_ok, actions)
+		}
+		super::SyncMode::RemoteToLocal | super::SyncMode::RemoteBackup => {
+			pull_to_local(key, local_node, remote_node, base, delete_ok, actions)
+		}
+		super::SyncMode::TwoWay => reconcile_two_way(key, local_node, remote_node, base, actions),
+	}
+}
+
+/// The plan, from the actions a reconcile planned in the order it planned them — the moves it
+/// detected, then each path's in path order — and the paths it deferred: a deletion of a remote
+/// item this engine already trashed dropped and counted as deferred, everything under a conflict
+/// dropped, and the rest ordered for the apply. The tail of [`reconcile`], and of a whole pass's
+/// staged reconcile once its windows are read back (see `stage::reconcile`).
+pub(super) fn finish_plan(
+	mut actions: Vec<SyncAction>,
+	mut deferred_paths: usize,
+	holds: &PassHolds,
+) -> Plan {
 	if !holds.trashed.is_empty() {
 		actions.retain(|action| {
 			let SyncAction::TrashRemote {
@@ -4226,6 +4375,7 @@ fn order_actions(actions: &mut [SyncAction]) {
 
 #[cfg(test)]
 mod tests {
+	use std::num::NonZeroUsize;
 
 	use chrono::{DateTime, Utc};
 
@@ -4236,28 +4386,73 @@ mod tests {
 			engine::{Observations, PendingKind, PendingWrites},
 			ignore::{IgnoreLevel, IgnoreSource, Origin},
 			side::{FromRow, test_support::copied},
-			stage::staged_sides,
+			stage::{Stage, WINDOW, reconcile_windows, staged_sides},
 		},
 		*,
 	};
 	use crate::{alloc_meter, sync_engine::SyncMode};
 
 	/// Reconcile with no pending writes — the ordinary case; the cache-lag window has its own tests.
+	///
+	/// Planned twice, and required to come out the same: in memory over the maps, and as a whole pass
+	/// plans it, window by window over the same sides staged (see [`windowed`]), a window of one
+	/// entry and one of [`WINDOW`]. So every test written against this holds the windowed reconcile
+	/// to the resident one as well.
 	fn plan(
 		mode: SyncMode,
 		baseline: &HashMap<String, BaselineEntry>,
 		local: &HashMap<String, LocalNode>,
 		remote: &HashMap<String, RemoteNode>,
 	) -> Vec<SyncAction> {
-		reconcile(
+		let rows = tree(baseline);
+		let actions = reconcile(
 			mode,
-			&tree(baseline),
+			&rows,
 			local,
 			remote,
 			&PassHolds::default(),
 			PassPaths::Whole,
 		)
-		.actions
+		.actions;
+		let (_stages, staged_local, staged_remote) =
+			staged_sides(local.values().cloned(), remote.values().cloned(), 2);
+		for window in [1, WINDOW.get()] {
+			assert_eq!(
+				actions,
+				windowed(
+					mode,
+					&rows,
+					&staged_local,
+					&staged_remote,
+					&PassHolds::default(),
+					window
+				)
+				.actions,
+				"{mode:?}: the windowed reconcile, {window} entries a window, planned something else"
+			);
+		}
+		actions
+	}
+
+	/// The plan a whole pass makes of its two staged sides, reconciled `window` entries of each input
+	/// a window into a stage of its own (see [`reconcile_windows`]).
+	fn windowed(
+		mode: SyncMode,
+		rows: &Baseline,
+		local: &Side<LocalNode>,
+		remote: &Side<RemoteNode>,
+		holds: &PassHolds,
+		window: usize,
+	) -> Plan {
+		let (Side::Staged(local), Side::Staged(remote)) = (local, remote) else {
+			panic!("only a whole pass's staged sides are reconciled window by window")
+		};
+		let window = NonZeroUsize::new(window).expect("a test's window holds an entry");
+		let (_dir, stage) = Stage::in_temp_dir();
+		reconcile_windows(mode, rows, local, remote, holds, stage, window)
+			.and_then(|windows| windows.into_plan(holds))
+			.expect("reconciling into a temp stage")
+			.0
 	}
 
 	/// The pair the fold tests write as.
@@ -4363,17 +4558,24 @@ mod tests {
 			None,
 		)
 		.unwrap();
-		actions.extend(
-			reconcile(
-				mode,
-				&rows,
-				&local.of(&rows),
-				&remote.of(&rows),
-				&PassHolds::default(),
-				PassPaths::Whole,
-			)
-			.actions,
-		);
+		let reconciled = reconcile(
+			mode,
+			&rows,
+			&local.of(&rows),
+			&remote.of(&rows),
+			&PassHolds::default(),
+			PassPaths::Whole,
+		)
+		.actions;
+		for window in [1, 7] {
+			assert_eq!(
+				reconciled,
+				windowed(mode, &rows, &local, &remote, &PassHolds::default(), window).actions,
+				"{mode:?}: the folded sides, read {page} row(s) a statement and reconciled {window} \
+				 a window, planned something else"
+			);
+		}
+		actions.extend(reconciled);
 		actions
 	}
 
@@ -10488,6 +10690,108 @@ mod tests {
 				seen.pushed_folds > 50,
 				"only {} pushed directory move(s) carried a file",
 				seen.pushed_folds
+			);
+		}
+
+		/// A whole pass's reconcile, window by window over its staged sides, plans what the resident
+		/// reconcile plans over the same sides — every action, in order, and every deferral — over
+		/// every generated case in every mode, before and after the directory-move fold, a window of
+		/// one entry of each input, two, seven and sixty-four.
+		///
+		/// Nothing the corpus generates is left out: the resident reconcile is given the staged sides,
+		/// as a whole pass gives them, so both read the remote in path order. Two files of one lineage,
+		/// which a move finds in no fixed order over a map, are pinned on their own (see
+		/// `stage::reconcile`'s tests).
+		#[test]
+		fn a_windowed_reconcile_plans_what_the_resident_one_plans() {
+			let mut seen = Coverage::default();
+			let (mut file_moves, mut deferred) = (0, 0);
+			for seed in 0..CASES {
+				let case = generate(seed, &mut seen);
+				let (local, remote) = whole_maps(&case);
+				for mode in MODES {
+					for folded in [false, true] {
+						let (_stages, mut staged_local, mut staged_remote) =
+							staged_sides(local.values().cloned(), remote.values().cloned(), 2);
+						let mut rows = case.baseline.clone();
+						if folded {
+							seen.folds += fold_dir_moves(
+								mode,
+								&mut rows,
+								&mut staged_local,
+								&mut staged_remote,
+								&case.holds.held_remote,
+								None,
+							)
+							.unwrap()
+							.len();
+						}
+						let resident = reconcile(
+							mode,
+							&rows,
+							&staged_local.of(&rows),
+							&staged_remote.of(&rows),
+							&case.holds,
+							PassPaths::Whole,
+						);
+						for window in [1, 2, 7, 64] {
+							let context =
+								format!("seed {seed}, {mode:?}, folded {folded}, window {window}");
+							let windowed = windowed(
+								mode,
+								&rows,
+								&staged_local,
+								&staged_remote,
+								&case.holds,
+								window,
+							);
+							assert_eq!(
+								resident.actions, windowed.actions,
+								"{context}: the windowed reconcile planned something else"
+							);
+							assert_eq!(
+								resident.deferred_paths, windowed.deferred_paths,
+								"{context}: the windowed reconcile counted other deferrals"
+							);
+						}
+						seen.actions += resident.actions.len();
+						deferred += resident.deferred_paths;
+						file_moves += resident
+							.actions
+							.iter()
+							.filter(|action| {
+								matches!(
+									action,
+									SyncAction::MoveLocal {
+										kind: NodeKind::File,
+										..
+									} | SyncAction::MoveRemote {
+										kind: NodeKind::File,
+										..
+									}
+								)
+							})
+							.count();
+					}
+				}
+			}
+			assert!(
+				seen.actions > 1_000,
+				"the corpus planned only {} action(s)",
+				seen.actions
+			);
+			assert!(
+				file_moves > 50,
+				"only {file_moves} file move(s) were joined, so the join was barely tested"
+			);
+			assert!(
+				deferred > 50,
+				"only {deferred} path(s) were deferred, so the held paths were barely tested"
+			);
+			assert!(
+				seen.folds > 100,
+				"only {} directory move(s) were folded first",
+				seen.folds
 			);
 		}
 

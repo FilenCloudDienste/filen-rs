@@ -23,6 +23,7 @@
 //! which fails the pass before it plans.
 
 use std::{
+	borrow::Cow,
 	fmt,
 	num::NonZeroUsize,
 	ops::{Bound, Range},
@@ -33,7 +34,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Row, Statement, params};
 
 use super::{
-	super::{plan::subtree_bounds, scan::collision_key},
+	super::{plan::subtree_bounds, scan::collision_key, side::NodesAt},
 	Stage,
 	remote::CHILDREN_PAGE,
 };
@@ -477,6 +478,24 @@ impl<T: Clone> StagedSide<T> {
 	/// The node at `path`.
 	pub(in super::super) fn at(&self, path: &str) -> Option<T> {
 		self.point(path, |node| node.cloned())
+	}
+}
+
+/// A staged side answers about a path on its own: it derives nothing from the rows, so the move
+/// join of a whole pass's staged reconcile asks it directly (see `stage::reconcile`).
+impl<T: Clone> NodesAt for StagedSide<T> {
+	type Node = T;
+
+	fn at(&self, path: &str) -> Option<Cow<'_, T>> {
+		Self::at(self, path).map(Cow::Owned)
+	}
+
+	fn holds(&self, path: &str) -> bool {
+		Self::holds(self, path)
+	}
+
+	fn occupied(&self, path: &str) -> bool {
+		Self::occupied(self, path)
 	}
 }
 

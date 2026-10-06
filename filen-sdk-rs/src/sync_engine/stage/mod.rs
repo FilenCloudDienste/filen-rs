@@ -1,7 +1,8 @@
 //! A pass's scratch database: an SQLite file of the pass's own for what it would otherwise hold in
 //! memory while it plans and applies. A whole pass stages its remote snapshot ([`remote`]) and its
 //! local scan ([`local`]) from the read to the end of the plan, both read as a [`StagedSide`]
-//! ([`side`]), and every pass its plan ([`plan`]) from the plan to the end of the apply.
+//! ([`side`]), and reconciles them window by window ([`reconcile`]); every pass stages its plan
+//! ([`plan`]) from the plan to the end of the apply.
 //!
 //! # One file per pass
 //!
@@ -16,7 +17,8 @@
 //! The snapshot, the scan and the plan of one pass take a number each, in that order, so a whole
 //! pass has three files: the snapshot's and the scan's go once the plan is staged, before the apply
 //! begins, or with the pass's inputs when it stops before that (a dry run, a refusal), and the
-//! plan's when the apply is done.
+//! plan's when the apply is done. A whole pass makes the plan's file when it reconciles, which
+//! writes the plan there before it is screened, and stages the screened plan in that same file.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).
@@ -59,6 +61,7 @@
 
 mod local;
 mod plan;
+mod reconcile;
 mod remote;
 mod side;
 #[cfg(test)]
@@ -80,6 +83,7 @@ pub(super) use local::StageSink;
 #[cfg(test)]
 pub(super) use plan::PAGE_ROWS;
 pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
+pub(super) use reconcile::{WINDOW, reconcile_windows};
 pub(super) use remote::RemoteSink;
 pub(super) use side::{Pages, Paging, StagedSide};
 #[cfg(test)]
