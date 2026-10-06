@@ -1025,15 +1025,16 @@ fn pass_pure(
 		None,
 	)
 	.expect("whole sides derive nothing from the rows, so their fold refuses nothing");
-	// Window by window into a stage of its own, as a whole pass reconciles its staged sides.
-	let planned = windowed(&baseline, &local, &remote);
+	// Window by window into a stage of its own, and finished there, as a whole pass reconciles its
+	// staged sides: the plan stays in the stage.
+	let planned = screened(&baseline, &local, &remote);
 	// Everything a full pass holds at once is alive right here: the resident baseline, the view,
 	// the scan and the plan. The peak column cannot say what that costs — `ru_maxrss` is a
 	// high-water mark every phase before this one has already raised — and the CURRENT resident
 	// set can, at this one moment, before any of it is dropped.
 	let widest = current_rss_bytes();
 	PassFootprint {
-		actions: planned.actions.len(),
+		actions: planned,
 		rows: baseline.len(),
 		widest,
 		peak: peak_rss_bytes(),
@@ -1072,8 +1073,29 @@ fn stage_pass_sides(
 	(scan.nodes, view.nodes)
 }
 
+/// How many actions a whole pass plans from its two staged sides, reconciled window by window into a
+/// stage of its own and finished there, as `reconcile_and_screen` reconciles them: the plan is
+/// counted where it is staged, not read back.
+fn screened(baseline: &Baseline, local: &Side<LocalNode>, remote: &Side<RemoteNode>) -> usize {
+	let (Side::Staged(local), Side::Staged(remote)) = (local, remote) else {
+		panic!("only a whole pass's staged sides are reconciled window by window")
+	};
+	stage::reconcile_windows(
+		SyncMode::TwoWay,
+		baseline,
+		local,
+		remote,
+		&PassHolds::default(),
+		probe_stage(),
+		stage::WINDOW,
+	)
+	.and_then(|windows| windows.screen(&PassHolds::default(), &[]))
+	.and_then(|(screen, _)| screen.count(stage::Rows::All))
+	.expect("reconciling the probe's staged sides")
+}
+
 /// The plan a whole pass makes of its two staged sides, reconciled window by window into a stage of
-/// its own and read back, as `reconcile_and_screen` reconciles them.
+/// its own and finished there, as `reconcile_and_screen` reconciles them, then read back.
 fn windowed(baseline: &Baseline, local: &Side<LocalNode>, remote: &Side<RemoteNode>) -> plan::Plan {
 	let (Side::Staged(local), Side::Staged(remote)) = (local, remote) else {
 		panic!("only a whole pass's staged sides are reconciled window by window")
@@ -2570,7 +2592,8 @@ pub fn run() -> String {
 	);
 
 	// The same plans as a whole pass makes them: window by window over its two sides, staged as
-	// `prepare_whole` stages them, into a stage of its own, then read back. After every in-memory row
+	// `prepare_whole` stages them, into a stage of its own, finished there — ordered in the stage, as
+	// the pass orders it — then read back. After every in-memory row
 	// rather than beside each, so nothing staged is alive or edited while those run. The tree on disk
 	// is what the maps held before `dirty_local`, so each scale's edits go into the staged local side
 	// before its row: none, the 1 % ones, then all of them.

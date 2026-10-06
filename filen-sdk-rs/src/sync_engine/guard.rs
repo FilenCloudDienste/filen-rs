@@ -11,12 +11,16 @@
 //! is a delete paired with a create at the SAME path — a file<->dir type flip — which is held as a
 //! unit: executing half of it only produces a server rejection every pass. Pure and synchronous so
 //! the policy is fully unit-testable.
+//!
+//! The policy is a COUNT and a rule, not a pass over a list: [`reason_for`] decides from how many
+//! items a pass deletes, and what it holds is every deletion and every create at a path one of
+//! them empties. A pass applies that rule to its plan where the plan is staged (see
+//! `stage::Screen::hold`).
 
 use std::fmt;
 
 use num_traits::ToPrimitive;
 
-use super::plan::{SyncAction, replaced_paths};
 use crate::{Error, ErrorKind};
 
 /// Deletion-volume policy for one sync pair. The limit for a pass is
@@ -155,14 +159,6 @@ impl fmt::Display for GuardReason {
 	}
 }
 
-/// The screened plan: the actions safe to apply now, plus any deletions held back (and why).
-#[derive(Debug)]
-pub(crate) struct GuardDecision {
-	pub(crate) safe: Vec<SyncAction>,
-	pub(crate) held: Vec<SyncAction>,
-	pub(crate) reason: Option<GuardReason>,
-}
-
 /// What the remote view a pass read can say about absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteEvidence {
@@ -177,7 +173,7 @@ pub(crate) enum RemoteEvidence {
 	Listed,
 }
 
-/// Inputs to [`screen`] describing how trustworthy this pass's state is.
+/// Inputs to [`reason_for`] describing how trustworthy this pass's state is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScreenState {
 	/// The local scan finished without errors (a partial scan must not be read as deletions).
@@ -206,25 +202,25 @@ impl ScreenState {
 	}
 }
 
-/// Screen a plan: hold its deletions when the pass's state is not trustworthy enough to act on
-/// them (incomplete scan, first sync against a non-empty destination, un-converged or wholly empty
-/// remote) or the deletion volume exceeds the guard's limit; otherwise pass everything through. Non-destructive
-/// actions (creates/transfers) always proceed.
-pub(crate) fn screen(
-	actions: Vec<SyncAction>,
+/// Why the guard holds the deletions of a pass that deletes `deletions` items, if it does: when
+/// the pass's state is not trustworthy enough to act on them (incomplete scan, first sync against a
+/// non-empty destination, un-converged or wholly empty remote) or their volume exceeds the guard's
+/// limit. `None` lets everything through, and so does a pass that deletes nothing.
+///
+/// What a reason holds is every deletion of the pass and every create at a path one of them
+/// empties: a delete whose path is also (re)created this pass is half of a type flip, the create is
+/// rejected while the old item still exists, so releasing it alone would fail every pass and never
+/// let the baseline advance. Both halves are held together. Every other non-destructive action
+/// (creates and transfers) proceeds.
+pub(crate) fn reason_for(
+	deletions: usize,
 	state: ScreenState,
 	guard: DeleteGuard,
-) -> GuardDecision {
-	let deletions = actions.iter().filter(|a| a.is_delete()).count();
+) -> Option<GuardReason> {
 	if deletions == 0 {
-		return GuardDecision {
-			safe: actions,
-			held: Vec::new(),
-			reason: None,
-		};
+		return None;
 	}
-
-	let reason = if !state.scan_complete {
+	if !state.scan_complete {
 		Some(GuardReason::ScanIncomplete)
 	} else if state.first_sync {
 		Some(GuardReason::FirstSyncWithDeletions { deletions })
@@ -234,44 +230,58 @@ pub(crate) fn screen(
 		Some(GuardReason::RemoteEmptied { deletions })
 	} else {
 		let limit = guard.limit(state.tracked);
-		if deletions > limit {
-			Some(GuardReason::ExceededThreshold { deletions, limit })
-		} else {
-			None
-		}
+		(deletions > limit).then_some(GuardReason::ExceededThreshold { deletions, limit })
+	}
+}
+
+/// The guard's rule over a plan held as a list: what the tests hold a staged plan's screen to.
+#[cfg(test)]
+pub(crate) mod test_support {
+	use super::{
+		super::plan::{SyncAction, replaced_paths},
+		DeleteGuard, GuardReason, ScreenState, reason_for,
 	};
 
-	match reason {
-		None => GuardDecision {
-			safe: actions,
-			held: Vec::new(),
-			reason: None,
-		},
-		Some(reason) => {
-			// A delete whose path is also (re)created this pass is half of a type flip: the create
-			// is rejected while the old item still exists, so releasing it alone would fail every
-			// pass and never let the baseline advance. Hold both halves together.
-			let replaced = replaced_paths(&actions);
-			let (held, safe): (Vec<_>, Vec<_>) = actions
-				.into_iter()
-				.partition(|a| a.is_delete() || (a.is_create() && replaced.contains(a.rel_path())));
-			tracing::debug!(
-				"guard: holding {} action(s) back this pass — {reason:?}",
-				held.len()
-			);
-			GuardDecision {
-				safe,
-				held,
-				reason: Some(reason),
-			}
+	/// A plan screened as a list (see [`screen`]): the actions safe to apply now, plus any
+	/// deletions held back (and why).
+	#[derive(Debug)]
+	pub(crate) struct GuardDecision {
+		pub(crate) safe: Vec<SyncAction>,
+		pub(crate) held: Vec<SyncAction>,
+		pub(crate) reason: Option<GuardReason>,
+	}
+
+	/// Screen a plan held as a list: [`reason_for`] its deletions, and what a reason holds (see
+	/// there) split out of it. The rule a pass applies to its staged plan, over a `Vec`.
+	pub(crate) fn screen(
+		actions: Vec<SyncAction>,
+		state: ScreenState,
+		guard: DeleteGuard,
+	) -> GuardDecision {
+		let deletions = actions.iter().filter(|a| a.is_delete()).count();
+		let Some(reason) = reason_for(deletions, state, guard) else {
+			return GuardDecision {
+				safe: actions,
+				held: Vec::new(),
+				reason: None,
+			};
+		};
+		let replaced = replaced_paths(&actions);
+		let (held, safe): (Vec<_>, Vec<_>) = actions
+			.into_iter()
+			.partition(|a| a.is_delete() || (a.is_create() && replaced.contains(a.rel_path())));
+		GuardDecision {
+			safe,
+			held,
+			reason: Some(reason),
 		}
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::sync_engine::baseline::NodeKind;
+	use super::{test_support::screen, *};
+	use crate::sync_engine::{baseline::NodeKind, plan::SyncAction};
 
 	fn del(rel: &str) -> SyncAction {
 		SyncAction::DeleteLocal {

@@ -1,8 +1,9 @@
 //! A pass's scratch database: an SQLite file of the pass's own for what it would otherwise hold in
 //! memory while it plans and applies. A whole pass stages its remote snapshot ([`remote`]) and its
 //! local scan ([`local`]) from the read to the end of the plan, both read as a [`StagedSide`]
-//! ([`side`]), and reconciles them window by window ([`reconcile`]); every pass stages its plan
-//! ([`plan`]) from the plan to the end of the apply.
+//! ([`side`]), and reconciles them window by window ([`reconcile`]); every pass that plans anything
+//! screens its plan where it is staged ([`screen`]), and stages what it applies ([`plan`]) from the
+//! plan to the end of the apply.
 //!
 //! # One file per pass
 //!
@@ -17,8 +18,9 @@
 //! The snapshot, the scan and the plan of one pass take a number each, in that order, so a whole
 //! pass has three files: the snapshot's and the scan's go once the plan is staged, before the apply
 //! begins, or with the pass's inputs when it stops before that (a dry run, a refusal), and the
-//! plan's when the apply is done. A whole pass makes the plan's file when it reconciles, which
-//! writes the plan there before it is screened, and stages the screened plan in that same file.
+//! plan's when the apply is done. The plan's file is made when the pass reconciles — a whole pass
+//! writes its plan there window by window, a change-scoped one once it has planned it in memory —
+//! and the plan is screened there and staged for the apply in that same file.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).
@@ -63,6 +65,7 @@ mod local;
 mod plan;
 mod reconcile;
 mod remote;
+mod screen;
 mod side;
 #[cfg(test)]
 mod test_support;
@@ -80,11 +83,14 @@ use filen_types::crypto::Blake3Hash;
 use rusqlite::{Connection, Row};
 
 pub(super) use local::StageSink;
+pub(super) use plan::{Carried, Pager, Run, Staged, StagedPlan};
 #[cfg(test)]
-pub(super) use plan::PAGE_ROWS;
-pub(super) use plan::{Carried, Pager, PlanWriter, Run, Staged, StagedPlan};
+pub(super) use plan::{PAGE_ROWS, PlanWriter};
+#[cfg(test)]
+pub(super) use reconcile::test_support::windows_of;
 pub(super) use reconcile::{WINDOW, reconcile_windows};
 pub(super) use remote::RemoteSink;
+pub(super) use screen::{Rows, Screen, ScreenError};
 pub(super) use side::{Pages, Paging, StagedSide};
 #[cfg(test)]
 pub(super) use test_support::{assert_views_alike, paging_of, staged_sides, staged_view};

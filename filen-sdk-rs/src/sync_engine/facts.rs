@@ -51,7 +51,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
 	baseline::{PathFailure, SyncedPaths},
-	guard::GuardDecision,
 	ignore::IgnoreDecision,
 	observe::{LocalObservation, LocalObservations},
 	outcome::{PlannedConflict, UnsyncablePath, UnsyncableReason},
@@ -163,7 +162,7 @@ impl PairFacts {
 			// records a root among those and no other — while the prune still takes the subtree, so
 			// a carried root strictly under `at` would go on the strength of a reading that never
 			// looked there. What goes with it is the withholding that keeps a deletion off ignored
-			// content (`withhold_deletions_over_unreachable`) and the root's place in `last_ignored`.
+			// content (`engine::Withholding`) and the root's place in `last_ignored`.
 			//
 			// Re-supplied where the baseline still names a row at or under the root: those rows are
 			// the evidence that what the rule hides is still there and still untracked — the very
@@ -269,13 +268,15 @@ fn prune_reports(reports: &mut Vec<UnsyncablePath>, at: &str) {
 /// Drawn at the end of every pass out of that pass's own plan, and consumed as an INPUT to the next
 /// pass's dirty set. What is in it:
 ///
-/// - every path this pass's plan released past the guard, both endpoints of a move included,
-///   whether the action was applied, failed or never reached. A superset of the work left owing is
-///   the safe direction — re-observing a path that was applied costs a stat and plans nothing —
-///   and it is what lets an interrupted pass find its remainder and a failed action be re-planned.
-///   An APPLIED path is in it for a reason of its own: a pass whose baseline write did not land
-///   (`store_failed`) carried the act out and has no row saying so, and only a fresh reading of
-///   that path corrects it.
+/// - every path this pass's plan released past the guard (`released`: both endpoints of each
+///   action, a move's two included), whether the action was applied, failed or never reached. The
+///   pass reads them out of its staged plan only until there are more than
+///   [`PairChanges::note_owed`](super::changes::PairChanges::note_owed) keeps, so a plan of any
+///   size costs that set and no more. A superset of the work left owing is the safe direction —
+///   re-observing a path that was applied costs a stat and plans nothing — and it is what lets an
+///   interrupted pass find its remainder and a failed action be re-planned. An APPLIED path is in
+///   it for a reason of its own: a pass whose baseline write did not land (`store_failed`) carried
+///   the act out and has no row saying so, and only a fresh reading of that path corrects it.
 /// - every path this pass DEFERRED because the cache was mid-transition there (`held_remote`).
 /// - every path with a failure streak, expired or not. Not only the ones whose retry interval runs
 ///   out next: the set is rebuilt from each pass's own read, so a path filtered out here is one no
@@ -304,18 +305,13 @@ fn prune_reports(reports: &mut Vec<UnsyncablePath>, at: &str) {
 /// is not a reason on its own: the full-pass triggers of section 3.5 are unchanged by it, and an
 /// interrupted pass still forces the next one full in this round.
 pub(super) fn carry_over<'a>(
-	decision: &'a GuardDecision,
+	released: impl IntoIterator<Item = &'a str>,
 	conflicts: &'a [PlannedConflict],
 	held_remote: &'a BTreeSet<String>,
 	failures: &'a HashMap<String, PathFailure>,
 ) -> impl Iterator<Item = &'a str> {
-	decision
-		.safe
-		.iter()
-		.flat_map(|action| {
-			let (from, to) = action.endpoints();
-			[from, to]
-		})
+	released
+		.into_iter()
 		.chain(conflicts.iter().map(|conflict| conflict.rel_path.as_str()))
 		.chain(held_remote.iter().map(String::as_str))
 		.chain(failures.keys().map(String::as_str))
@@ -332,7 +328,6 @@ mod tests {
 	use super::*;
 	use crate::sync_engine::{
 		baseline::{BaselineEntry, BaselineState, NodeKind},
-		guard::GuardReason,
 		ignore::{FILENIGNORE, IgnoreLevel, IgnoreRules},
 		observe::observe_local,
 		outcome::PlannedNodeKind,
@@ -726,7 +721,7 @@ mod tests {
 	/// carrying a failure streak.
 	#[test]
 	fn the_carry_over_set_names_every_released_action_and_every_streak() {
-		let released = vec![
+		let released = [
 			SyncAction::UploadFile {
 				rel_path: "up.txt".to_owned(),
 			},
@@ -761,14 +756,12 @@ mod tests {
 			),
 		]);
 
-		let decision = GuardDecision {
-			safe: released,
-			held: Vec::new(),
-			reason: None,
-		};
 		let midflight = BTreeSet::from(["midflight.txt".to_owned()]);
-		let owed: BTreeSet<&str> =
-			carry_over(&decision, &conflicts, &midflight, &failures).collect();
+		let ends = released.iter().flat_map(|action| {
+			let (from, to) = action.endpoints();
+			[from, to]
+		});
+		let owed: BTreeSet<&str> = carry_over(ends, &conflicts, &midflight, &failures).collect();
 
 		assert_eq!(
 			Vec::from_iter(owed),
@@ -783,34 +776,6 @@ mod tests {
 			],
 			"a move owes BOTH its endpoints, and a streak below the block threshold is owed too — \
 			 nothing else would ever look at it again"
-		);
-	}
-
-	/// A batch the guard held is not owed: the hold sends the next pass that runs to a whole read,
-	/// which reproduces it. Owing its paths as well would keep a pair whose only business is the
-	/// hold from ever being idle, and every wake would re-read both trees to hold it again.
-	#[test]
-	fn a_held_batch_is_not_carried_over() {
-		let decision = GuardDecision {
-			safe: vec![SyncAction::UploadFile {
-				rel_path: "up.txt".to_owned(),
-			}],
-			held: vec![SyncAction::TrashRemote {
-				rel_path: "gone.txt".to_owned(),
-				kind: NodeKind::File,
-				remote_uuid: Uuid::from_u128(8),
-			}],
-			reason: Some(GuardReason::ExceededThreshold {
-				deletions: 1,
-				limit: 0,
-			}),
-		};
-		let (no_paths, no_failures) = (BTreeSet::new(), HashMap::new());
-		let owed: Vec<&str> = carry_over(&decision, &[], &no_paths, &no_failures).collect();
-		assert_eq!(
-			owed,
-			vec!["up.txt", "up.txt"],
-			"an upload names its one path as both endpoints; the held trash names nothing"
 		);
 	}
 }

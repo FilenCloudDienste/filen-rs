@@ -36,14 +36,14 @@
 //! first.
 //!
 //! A window plans at a path a move later takes all the same — the move is found after it — so the
-//! plan is read back without the windows' actions at any path in `consumed` ([`Windows::into_plan`]):
-//! what the resident reconcile, which joins first, never plans there.
+//! windows' actions at any path in `consumed` are taken out of the plan before it is finished
+//! ([`Windows::screen`]): what the resident reconcile, which joins first, never plans there.
 //!
 //! # What the pass holds
 //!
 //! The three windows and a page of each input's read behind them: about a megabyte at [`WINDOW`],
-//! whatever the tree holds. The plan is read back whole into memory for the screening that follows,
-//! which reads the actions as a list; only the planning holds a window.
+//! whatever the tree holds. The plan stays in the stage: it is finished and screened there (see
+//! `stage::Screen`), and never read back into memory whole.
 //!
 //! # A failed read or write
 //!
@@ -61,18 +61,19 @@ use std::{
 use rusqlite::{Connection, params};
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "bench-internals"))]
+use super::super::plan::Plan;
 use super::{
 	super::{
 		SyncMode,
 		baseline::{BaselineEntry, NodeKind},
-		plan::{
-			self, MoveSides, PassHolds, Plan, RemoteNode, SyncAction, Took, is_under_held_path,
-		},
+		plan::{self, MoveSides, PassHolds, RemoteNode, SyncAction, Took, is_under_held_path},
 		rows::Baseline,
 		scan::LocalNode,
 	},
 	BatchWriter, Stage,
-	plan::{action_columns, action_of},
+	plan::action_columns,
+	screen::{Rows, Screen},
 	side::StagedSide,
 };
 
@@ -120,10 +121,9 @@ const BY_CONTENT: &str = "CREATE INDEX cand_content ON cand (key) WHERE role = 2
 const PUSH_TARGETS: &str = "SELECT path FROM cand WHERE role = 2 AND key = ?1 ORDER BY rowid";
 const CONSUME: &str = "INSERT OR IGNORE INTO consumed (path) VALUES (?1)";
 const IS_CONSUMED: &str = "SELECT EXISTS (SELECT 1 FROM consumed WHERE path = ?1)";
-/// The plan in the order it was made, but for a window's action at a path a move took.
-const READ_BACK: &str = "SELECT op, kind, path, from_path, remote_uuid FROM reconciled AS r
-	 WHERE r.seq < ?1 OR NOT EXISTS (SELECT 1 FROM consumed AS c WHERE c.path = r.path)
-	 ORDER BY r.seq";
+/// A window's actions at a path a move took.
+const DROP_CONSUMED: &str = "DELETE FROM reconciled
+	 WHERE seq >= ?1 AND path IN (SELECT path FROM consumed)";
 const DROP_TABLES: &str = "DROP TABLE reconciled; DROP TABLE cand; DROP TABLE consumed;";
 
 // The statements above spell `PUSH_TO` out.
@@ -134,7 +134,7 @@ const _: () = assert!(PUSH_TO == 2);
 /// tests shrink to cut a handful of paths into several windows.
 ///
 /// Plans what [`plan::reconcile`] plans over the same inputs, deciding every path, and defers what
-/// it defers, once read back ([`Windows::into_plan`]).
+/// it defers, once finished ([`Windows::screen`]).
 pub(in super::super) fn reconcile_windows(
 	mode: SyncMode,
 	baseline: &Baseline,
@@ -162,6 +162,7 @@ pub(in super::super) fn reconcile_windows(
 		pull_sources: 0,
 		push_sources: 0,
 		push_targets: 0,
+		consumed: false,
 	};
 	// The nodes alone: each carries its path, which the page hands out a copy of beside it.
 	let (mut locals, mut remotes, mut rows) = (
@@ -212,6 +213,7 @@ pub(in super::super) fn reconcile_windows(
 	Ok(Windows {
 		stage: pass.out.batch.finish()?,
 		deferred: pass.deferred,
+		consumed: pass.consumed,
 	})
 }
 
@@ -219,22 +221,57 @@ pub(in super::super) fn reconcile_windows(
 pub(in super::super) struct Windows {
 	stage: Stage,
 	deferred: usize,
+	/// Whether a move of the join took a path, whose window actions are then out of the plan.
+	consumed: bool,
 }
 
 impl Windows {
-	/// The plan, read back in the order it was made without the windows' actions at a path a move
-	/// took, and finished as the resident reconcile finishes its own (`plan::finish_plan`): what it
-	/// plans over the same inputs. Hands the stage back with the reconcile's tables gone, for the plan
-	/// to be staged in.
+	/// The plan, finished in the stage as the resident reconcile finishes its own
+	/// (`plan::finish_plan`) — the windows' actions at a path a move took left out, the deletions of
+	/// what this engine already trashed and everything under a conflict taken out, the rest ordered —
+	/// and led by the directory moves the pass folded (`dir_moves`): what [`plan::reconcile`] plans
+	/// over the same inputs, behind those moves. With the paths the reconcile deferred, and the
+	/// reconcile's own tables gone from the stage.
+	pub(in super::super) fn screen(
+		self,
+		holds: &PassHolds,
+		dir_moves: &[SyncAction],
+	) -> rusqlite::Result<(Screen, usize)> {
+		let Self {
+			stage,
+			mut deferred,
+			consumed,
+		} = self;
+		if consumed {
+			stage.conn.execute(DROP_CONSUMED, [WINDOW_SEQ])?;
+		}
+		let mut screen = Screen::order(stage)?;
+		screen.conn().execute_batch(DROP_TABLES)?;
+		deferred += screen.retire_trashed(&holds.trashed)?;
+		screen.suppress_conflicted()?;
+		if tracing::enabled!(tracing::Level::DEBUG) {
+			tracing::debug!(
+				"reconcile: planned {} action(s), {deferred} path(s) deferred",
+				screen.count(Rows::All)?
+			);
+		}
+		screen.lead_with(dir_moves)?;
+		Ok((screen, deferred))
+	}
+
+	/// The plan, finished as [`screen`](Self::screen) finishes it and read back whole, with the
+	/// stage: what the tests and the probe hold to the resident reconcile's plan.
+	#[cfg(any(test, feature = "bench-internals"))]
 	pub(in super::super) fn into_plan(self, holds: &PassHolds) -> rusqlite::Result<(Plan, Stage)> {
-		let Self { stage, deferred } = self;
-		let actions = stage
-			.conn
-			.prepare(READ_BACK)?
-			.query_map([WINDOW_SEQ], |row| action_of(row, 0, row.get(2)?))?
-			.collect::<rusqlite::Result<Vec<SyncAction>>>()?;
-		stage.conn.execute_batch(DROP_TABLES)?;
-		Ok((plan::finish_plan(actions, deferred, holds), stage))
+		let (screen, deferred_paths) = self.screen(holds, &[])?;
+		let actions = screen.read(Rows::All)?;
+		Ok((
+			Plan {
+				actions,
+				deferred_paths,
+			},
+			screen.into_stage(),
+		))
 	}
 }
 
@@ -321,6 +358,8 @@ struct Pass<'h> {
 	/// How many new local files the windows noted as the push half's targets: with none, no push
 	/// source has anywhere to move to.
 	push_targets: usize,
+	/// Whether a source of the join took a path.
+	consumed: bool,
 }
 
 impl Pass<'_> {
@@ -525,6 +564,7 @@ impl Pass<'_> {
 		for action in self.actions.drain(..) {
 			self.out.action(&action)?;
 		}
+		self.consumed |= took.is_some();
 		match took {
 			None => {}
 			Some(Took::Source) => self.out.consume(from)?,
@@ -601,6 +641,36 @@ fn failed_read(conn: &Connection, what: &str, error: &rusqlite::Error) -> ! {
 		 failed read as no answer",
 		conn.path().unwrap_or("its stage")
 	)
+}
+
+/// A plan written as the windows write one, for the tests that screen it.
+#[cfg(test)]
+pub(super) mod test_support {
+	use super::{
+		super::{super::plan::SyncAction, BatchWriter, Stage},
+		Out, SCHEMA, WINDOW_SEQ, Windows,
+	};
+
+	/// `actions` written into `stage` as a whole pass's windows write their plan — each a window's,
+	/// in the order given — for a test to finish and screen ([`Windows::screen`]).
+	pub(in crate::sync_engine) fn windows_of(stage: Stage, actions: &[SyncAction]) -> Windows {
+		stage
+			.conn
+			.execute_batch(SCHEMA)
+			.expect("the reconcile's tables");
+		let mut out = Out {
+			batch: BatchWriter::new(stage),
+			next: WINDOW_SEQ,
+		};
+		for action in actions {
+			out.action(action).expect("writing a window's action");
+		}
+		Windows {
+			stage: out.batch.finish().expect("committing the windows"),
+			deferred: 0,
+			consumed: false,
+		}
+	}
 }
 
 #[cfg(test)]
