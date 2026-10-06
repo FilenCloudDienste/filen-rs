@@ -38,13 +38,16 @@
 //! not re-entrant, so no statement is ever stepped while a caller's code runs: every enumeration
 //! reads a PAGE of rows, lets the connection go, and only then hands them out.
 
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::{
+	num::NonZeroUsize,
+	sync::{Arc, LazyLock, Mutex, PoisonError},
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::super::{
 	baseline::{BaselineEntry, BaselineStore, ENTRY_COLUMNS, NodeKind, PairId, Readers},
-	page,
+	page::{self, AheadPage, ReadAhead},
 };
 
 /// How many statements the pass's reads ran, and how many rows they handed back, in this process —
@@ -113,7 +116,7 @@ pub(super) const PAGE: usize = 256;
 
 /// The most rows a page read for a caller that keeps to it holds, however well it keeps to it: the
 /// cursor's pages and the point questions' read-ahead both double up to this.
-pub(super) const MAX_PAGE: usize = 1024;
+pub(super) const MAX_PAGE: NonZeroUsize = NonZeroUsize::new(1024).expect("1024 is not zero");
 
 /// The whole-set counts a pass asks for, as `baseline_counts` recorded them when the snapshot
 /// began.
@@ -139,49 +142,13 @@ pub(in super::super) struct Snapshot {
 	/// The last page the point questions read for themselves (see [`Snapshot::point`]). Apart from
 	/// `last_page`, so that a question about some other path, asked while an enumeration is being
 	/// handed out, does not take away the page the questions about the enumerated rows answer from.
-	ahead: Mutex<Ahead<Page>>,
+	ahead: Mutex<ReadAhead<Page>>,
 	/// The same for the questions about one folded path (see [`Snapshot::folded_at`]).
-	folded_ahead: Mutex<Ahead<FoldedPage>>,
+	folded_ahead: Mutex<ReadAhead<FoldedPage>>,
 	/// `(statements, rows)` read through THIS snapshot, where the benchmark's counters count every
 	/// one in the process: what a test holds the reads of one pass over its rows to.
 	#[cfg(test)]
 	reads: Mutex<(usize, usize)>,
-}
-
-/// The page a kind of question read last, and what the questions made of it (see
-/// [`Snapshot::point`]).
-#[derive(Debug)]
-struct Ahead<P> {
-	page: Option<Arc<P>>,
-	/// How many questions `page` answered.
-	answered: usize,
-	/// How many rows `page` was read for.
-	want: usize,
-}
-
-impl<P> Default for Ahead<P> {
-	fn default() -> Self {
-		Self {
-			page: None,
-			answered: 0,
-			want: 0,
-		}
-	}
-}
-
-impl<P> Ahead<P> {
-	/// How many rows the page read after this one does: twice as many when it answered as many
-	/// questions as it has `rows` and the question that missed it lies `past` its last row — a walk
-	/// in order — and one otherwise, which is what a lookup of the one row reads. It counts
-	/// questions, not distinct rows: a sparse walk asking each path several times grows its pages
-	/// past the one row a path needs, reading a few rows more per path, never a wrong answer.
-	fn next_want(&self, rows: usize, past: bool) -> usize {
-		if past && self.answered >= rows {
-			(self.want * 2).min(MAX_PAGE)
-		} else {
-			1
-		}
-	}
 }
 
 /// A contiguous stretch of the table as the snapshot reads it (see [`page::Page`]): authoritative
@@ -210,15 +177,19 @@ struct FoldedPage {
 }
 
 impl FoldedPage {
-	/// `Some(the path of every row folded to `folded`)` where this page answers for it.
-	fn answer(&self, folded: &str) -> Option<Vec<String>> {
-		let spanned = folded >= self.from.as_str()
+	/// Whether this page answers for `folded`.
+	fn spans(&self, folded: &str) -> bool {
+		folded >= self.from.as_str()
 			&& (self.complete
 				|| self
 					.rows
 					.last()
-					.is_some_and(|(last, _)| folded < last.as_str()));
-		spanned.then(|| {
+					.is_some_and(|(last, _)| folded < last.as_str()))
+	}
+
+	/// `Some(the path of every row folded to `folded`)` where this page answers for it.
+	fn answer(&self, folded: &str) -> Option<Vec<String>> {
+		self.spans(folded).then(|| {
 			let at = self.rows.partition_point(|(key, _)| key.as_str() < folded);
 			self.rows[at..]
 				.iter()
@@ -227,21 +198,16 @@ impl FoldedPage {
 				.collect()
 		})
 	}
+}
 
-	/// How many of its rows this page can hand out: all of them once it reached the end, and
-	/// otherwise every one before its last folded path.
-	fn answerable(&self) -> usize {
-		match self.rows.last() {
-			Some((last, _)) if !self.complete => self
-				.rows
-				.partition_point(|(key, _)| key.as_str() < last.as_str()),
-			_ => self.rows.len(),
-		}
+impl AheadPage for FoldedPage {
+	fn len(&self) -> usize {
+		self.rows.len()
 	}
 
 	/// Whether every folded path this page can answer for sorts before `folded`: the question lies
 	/// past the page, where a walk in order goes on.
-	fn answerable_below(&self, folded: &str) -> bool {
+	fn passed_by(&self, folded: &str) -> bool {
 		self.rows
 			.last()
 			.is_some_and(|(last, _)| last.as_str() <= folded)
@@ -415,8 +381,8 @@ impl Snapshot {
 			pair,
 			counts,
 			last_page: Mutex::new(None),
-			ahead: Mutex::new(Ahead::default()),
-			folded_ahead: Mutex::new(Ahead::default()),
+			ahead: Mutex::new(ReadAhead::default()),
+			folded_ahead: Mutex::new(ReadAhead::default()),
 			#[cfg(test)]
 			reads: Mutex::new((0, 0)),
 		})
@@ -481,42 +447,23 @@ impl Snapshot {
 	/// enumeration read where it spans the path, else out of the last page these questions read,
 	/// else out of a new page read FROM the path.
 	///
-	/// The new page is sized to how the last one was used. A question past the last row of a page
-	/// every row of which was asked about is a walk in path order — a pass asking about its decided
-	/// set, which it holds sorted — and reads twice as many rows as that page did; any other
-	/// question reads one row, which is the one row a point lookup reads. So a walk over a moved
+	/// The new page is sized to how the last one was used (see [`ReadAhead`]): a pass asking about
+	/// its decided set, which it holds sorted, walks in path order. So a walk over a moved
 	/// directory's fifty thousand paths is a few hundred statements rather than fifty thousand, and
 	/// the pages it keeps are never larger than [`MAX_PAGE`] rows.
 	fn point<T>(&self, rel_path: &str, answer: impl Fn(Option<&BaselineEntry>) -> T) -> T {
 		if let Some(found) = self.remembered(rel_path, &answer) {
 			return found;
 		}
-		let mut ahead = self.ahead.lock().unwrap_or_else(PoisonError::into_inner);
-		let (found, want) = match ahead.page.as_deref() {
-			Some(page) => (
-				page.answer(rel_path).map(&answer),
-				ahead.next_want(
-					page.rows.len(),
-					page.rows
-						.last()
-						.is_some_and(|last| last.rel_path.as_str() < rel_path),
-				),
-			),
-			None => (None, 1),
-		};
-		if let Some(found) = found {
-			ahead.answered += 1;
-			return found;
-		}
-		ahead.want = want;
-		let page = self.read_page(rel_path, true, None, ahead.want);
-		let found = page
-			.answer(rel_path)
-			.map(answer)
-			.expect("a page read from a path answers for that path");
-		ahead.page = Some(page);
-		ahead.answered = 1;
-		found
+		self.ahead
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.ask(
+				rel_path,
+				MAX_PAGE,
+				|page| page.answer(rel_path).map(&answer),
+				|want| self.read_page(rel_path, true, None, want),
+			)
 	}
 
 	/// Up to `limit` rows from `from` on (`inclusive` or not), strictly below `to` when there is
@@ -529,7 +476,7 @@ impl Snapshot {
 		to: Option<&str>,
 		limit: usize,
 	) -> Arc<Page> {
-		let page = self.read_page(from, inclusive, to, limit);
+		let page = Arc::new(self.read_page(from, inclusive, to, limit));
 		*self
 			.last_page
 			.lock()
@@ -538,9 +485,9 @@ impl Snapshot {
 	}
 
 	/// [`page`](Self::page), without keeping it.
-	fn read_page(&self, from: &str, inclusive: bool, to: Option<&str>, limit: usize) -> Arc<Page> {
+	fn read_page(&self, from: &str, inclusive: bool, to: Option<&str>, limit: usize) -> Page {
 		let rows = self.rows_from(from, inclusive, to, limit);
-		Arc::new(Page::read(from, inclusive, to, limit, rows, row_path))
+		Page::read(from, inclusive, to, limit, rows, row_path)
 	}
 
 	/// Up to `limit` DIRECTORY rows from `from` on, strictly below `to` when there is one, in path
@@ -592,51 +539,47 @@ impl Snapshot {
 	/// The path of every row whose folded path is exactly `folded`: out of the page these questions
 	/// read last where it spans `folded`, else out of a new one read from `folded` on and sized as a
 	/// point question's is ([`point`](Self::point)) — so a pass folding its decided set in order reads
-	/// the folded index a page at a time rather than a statement a path.
+	/// the folded index a page at a time rather than a statement a path. A question counts once
+	/// however many rows fold to its path: a walk visiting every folded path still covers half of
+	/// each page while no more than two rows fold to each path on average.
 	pub(super) fn folded_at(&self, folded: &str) -> Vec<String> {
-		let mut ahead = self
-			.folded_ahead
+		self.folded_ahead
 			.lock()
-			.unwrap_or_else(PoisonError::into_inner);
-		let (found, want) = match ahead.page.as_deref() {
-			Some(page) => (
-				page.answer(folded),
-				ahead.next_want(page.answerable(), page.answerable_below(folded)),
-			),
-			None => (None, 1),
-		};
-		// Counted in rows handed out rather than questions, which for a folded path can be several.
-		if let Some(found) = found {
-			ahead.answered += found.len().max(1);
-			return found;
-		}
-		// Never one row: a page that stops at its limit cannot answer for its last folded path, and
-		// a one-row page read from a folded path some row holds stops on that very path — so it
-		// would take a second statement to answer what the one after it can.
-		let mut want = want.max(2);
-		loop {
-			let rows: Vec<(String, String)> = self.with("the rows from a folded path", |conn| {
-				conn.prepare_cached(FOLDED_FROM)?
-					.query_map(params![self.pair, folded], |row| {
-						Ok((row.get(0)?, row.get(1)?))
-					})?
-					.take(want)
-					.collect()
-			});
-			let page = FoldedPage {
-				from: folded.to_string(),
-				complete: rows.len() < want,
-				rows,
-			};
-			if let Some(found) = page.answer(folded) {
-				ahead.page = Some(Arc::new(page));
-				ahead.answered = found.len().max(1);
-				ahead.want = want;
-				return found;
-			}
-			// Every row it read is folded to `folded` itself, and more may follow: read past them.
-			want *= 2;
-		}
+			.unwrap_or_else(PoisonError::into_inner)
+			.ask(
+				folded,
+				MAX_PAGE,
+				|page| page.answer(folded),
+				|want| {
+					// Never one row: a page that stops at its limit cannot answer for its last folded
+					// path, and a one-row page read from a folded path some row holds stops on that
+					// very path — so it would take a second statement to answer what the one after
+					// it can.
+					let mut want = want.max(2);
+					loop {
+						let rows: Vec<(String, String)> =
+							self.with("the rows from a folded path", |conn| {
+								conn.prepare_cached(FOLDED_FROM)?
+									.query_map(params![self.pair, folded], |row| {
+										Ok((row.get(0)?, row.get(1)?))
+									})?
+									.take(want)
+									.collect()
+							});
+						let page = FoldedPage {
+							from: folded.to_string(),
+							complete: rows.len() < want,
+							rows,
+						};
+						if page.spans(folded) {
+							return page;
+						}
+						// Every row it read is folded to `folded` itself, and more may follow: read
+						// past them.
+						want *= 2;
+					}
+				},
+			)
 	}
 
 	/// Up to `limit` rows STRICTLY under the folded path `folded`, as `(folded_path, rel_path)`,
@@ -758,14 +701,11 @@ impl Snapshot {
 			.last_page
 			.get_mut()
 			.unwrap_or_else(PoisonError::into_inner) = None;
-		self.ahead
+		*self.ahead.get_mut().unwrap_or_else(PoisonError::into_inner) = ReadAhead::default();
+		*self
+			.folded_ahead
 			.get_mut()
-			.unwrap_or_else(PoisonError::into_inner)
-			.page = None;
-		self.folded_ahead
-			.get_mut()
-			.unwrap_or_else(PoisonError::into_inner)
-			.page = None;
+			.unwrap_or_else(PoisonError::into_inner) = ReadAhead::default();
 	}
 }
 
@@ -1026,7 +966,7 @@ mod tests {
 		};
 		let mut rows: Vec<BaselineEntry> = Vec::new();
 		let mut folded: Vec<(String, Vec<String>)> = Vec::new();
-		for n in 0..(MAX_PAGE * 3) {
+		for n in 0..(MAX_PAGE.get() * 3) {
 			let path = format!("d/f{n:05}");
 			let mut at = vec![path.clone()];
 			if n % 3 == 0 {
@@ -1084,8 +1024,7 @@ mod tests {
 					.ahead
 					.lock()
 					.unwrap()
-					.page
-					.as_ref()
+					.page()
 					.map_or(0, |page| page.rows.len());
 				assert!(
 					!reversed || held <= 1,
@@ -1103,8 +1042,7 @@ mod tests {
 					.folded_ahead
 					.lock()
 					.unwrap()
-					.page
-					.as_ref()
+					.page()
 					.map_or(0, |page| page.rows.len());
 				let bound = 2 * expected.len().max(1);
 				assert!(

@@ -117,6 +117,28 @@ impl<T> Page<T> {
 	}
 }
 
+/// What [`ReadAhead`] asks of a page to size the one read after it.
+pub(super) trait AheadPage {
+	/// How many rows the read handed back.
+	fn len(&self) -> usize;
+
+	/// Whether `path` sorts past every row a question can be answered from: where a walk in path
+	/// order goes on.
+	fn passed_by(&self, path: &str) -> bool;
+}
+
+impl<T> AheadPage for Page<T> {
+	fn len(&self) -> usize {
+		self.rows.len()
+	}
+
+	fn passed_by(&self, path: &str) -> bool {
+		self.rows
+			.last()
+			.is_some_and(|last| (self.path)(last) < path)
+	}
+}
+
 /// The page the questions of one kind read last, and how many of them it answered (see the module
 /// docs).
 pub(super) struct ReadAhead<P> {
@@ -135,7 +157,7 @@ impl<P> Default for ReadAhead<P> {
 	}
 }
 
-impl<T> ReadAhead<Page<T>> {
+impl<P: AheadPage> ReadAhead<P> {
 	/// What `answer` makes of the page in hand where that page spans `path`, else of the page `read`
 	/// reads from `path` on for as many rows as it is handed, at most `most` (see the module docs).
 	/// `answer` is `None` for a page that does not span `path`, and a page read from `path` does.
@@ -143,22 +165,16 @@ impl<T> ReadAhead<Page<T>> {
 		&mut self,
 		path: &str,
 		most: NonZeroUsize,
-		answer: impl Fn(&Page<T>) -> Option<R>,
-		read: impl FnOnce(usize) -> Page<T>,
+		answer: impl Fn(&P) -> Option<R>,
+		read: impl FnOnce(usize) -> P,
 	) -> R {
 		if let Some(found) = self.page.as_deref().and_then(&answer) {
 			self.answered += 1;
 			return found;
 		}
 		let want = match self.page.as_deref() {
-			Some(page)
-				if self.answered.saturating_mul(2) >= page.rows.len()
-					&& page
-						.rows
-						.last()
-						.is_some_and(|last| (page.path)(last) < path) =>
-			{
-				page.rows.len().saturating_mul(2).min(most.get())
+			Some(page) if self.answered.saturating_mul(2) >= page.len() && page.passed_by(path) => {
+				page.len().saturating_mul(2).min(most.get())
 			}
 			_ => 1,
 		};
@@ -172,8 +188,8 @@ impl<T> ReadAhead<Page<T>> {
 	}
 
 	/// The page the last question it could not answer read.
-	#[cfg(feature = "bench-internals")]
-	pub(super) fn page(&self) -> Option<&Page<T>> {
+	#[cfg(any(test, feature = "bench-internals"))]
+	pub(super) fn page(&self) -> Option<&P> {
 		self.page.as_deref()
 	}
 }
