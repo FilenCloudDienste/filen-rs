@@ -58,7 +58,7 @@ use super::{
 	rows::Baseline,
 	scan::{self, LocalNode, LocalScan, RuleFiles},
 	side::{FromRow, Nodes, NodesAt, Side},
-	stage::{Paging, RemoteSink, Stage},
+	stage::{self, Paging, RemoteSink, Stage},
 };
 
 /// Node count when `SYNC_PROBE_N` is unset — small enough to run on a laptop in seconds.
@@ -945,6 +945,19 @@ fn dirty_local(local: &mut Side<LocalNode>, from: usize, to: usize) -> BTreeSet<
 	changed
 }
 
+/// Put the nodes `dirty_local` edited at `paths` on `map` into `staged`, a staged copy of `map`
+/// without some or all of those edits.
+fn mirror(map: &Side<LocalNode>, staged: &mut Side<LocalNode>, paths: &BTreeSet<String>) {
+	for path in paths {
+		let node = map
+			.whole()
+			.at(path)
+			.expect("the map holds what it just edited")
+			.into_owned();
+		staged.insert(path.clone(), node);
+	}
+}
+
 /// A synced file row, for a phase that needs rows to exist and nothing more of them.
 fn plain_row(rel_path: &str) -> BaselineEntry {
 	BaselineEntry {
@@ -1000,31 +1013,8 @@ fn pass_pure(
 	rules: &IgnoreRules,
 ) -> PassFootprint {
 	let baseline = store.baseline(pair).expect("reading the baseline");
-	// Copied into a stage as it is read and placed there, as `prepare_whole` stages it.
-	let mut copied =
-		RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
-	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
-		.expect("streaming the cache snapshot");
-	let mut view = copied
-		.finish(place.remote_root)
-		.expect("placing the probe's staged snapshot");
-	// Into a stage, as `prepare_whole` walks a whole pass's tree.
-	let (scan, rules_used) = scan::scan_local_staged(
-		&place.root,
-		&baseline,
-		probe_rules(),
-		RuleFiles::Read,
-		probe_stage(),
-	)
-	.expect("staging the probe's scan");
-	drop(rules_used);
-	view.filter(Some(plan::ViewFilter {
-		rules,
-		baseline: &baseline,
-	}));
+	let (mut local, mut remote) = stage_pass_sides(place, &baseline, rules);
 	let mut baseline = baseline;
-	let mut local = scan.nodes;
-	let mut remote = view.nodes;
 	let held = BTreeSet::new();
 	plan::fold_dir_moves(
 		SyncMode::TwoWay,
@@ -1035,14 +1025,8 @@ fn pass_pure(
 		None,
 	)
 	.expect("whole sides derive nothing from the rows, so their fold refuses nothing");
-	let planned = plan::reconcile(
-		SyncMode::TwoWay,
-		&baseline,
-		&local.whole(),
-		&remote.whole(),
-		&PassHolds::default(),
-		plan::PassPaths::Whole,
-	);
+	// Window by window into a stage of its own, as a whole pass reconciles its staged sides.
+	let planned = windowed(&baseline, &local, &remote);
 	// Everything a full pass holds at once is alive right here: the resident baseline, the view,
 	// the scan and the plan. The peak column cannot say what that costs — `ru_maxrss` is a
 	// high-water mark every phase before this one has already raised — and the CURRENT resident
@@ -1059,6 +1043,54 @@ fn pass_pure(
 		view_bytes: side_owned_bytes(&remote, &baseline, |node| heap(node.rel_path.len())),
 		scan_bytes: side_owned_bytes(&local, &baseline, |node| heap(node.rel_path.len())),
 	}
+}
+
+/// A whole pass's two sides, staged as `prepare_whole` stages them: the snapshot copied into a stage
+/// as it is read and placed there, the tree walked into another, and the rules applied to the view.
+fn stage_pass_sides(
+	place: &PassPlace,
+	baseline: &Baseline,
+	rules: &IgnoreRules,
+) -> (Side<LocalNode>, Side<RemoteNode>) {
+	let mut copied =
+		RemoteSink::new(probe_stage(), Paging::PASS).expect("a stage for the probe's snapshot");
+	bench_support::snapshot_into(&place.cache_db, place.remote_root, &mut copied)
+		.expect("streaming the cache snapshot");
+	let mut view = copied
+		.finish(place.remote_root)
+		.expect("placing the probe's staged snapshot");
+	let (scan, rules_used) = scan::scan_local_staged(
+		&place.root,
+		baseline,
+		probe_rules(),
+		RuleFiles::Read,
+		probe_stage(),
+	)
+	.expect("staging the probe's scan");
+	drop(rules_used);
+	view.filter(Some(plan::ViewFilter { rules, baseline }));
+	(scan.nodes, view.nodes)
+}
+
+/// The plan a whole pass makes of its two staged sides, reconciled window by window into a stage of
+/// its own and read back, as `reconcile_and_screen` reconciles them.
+fn windowed(baseline: &Baseline, local: &Side<LocalNode>, remote: &Side<RemoteNode>) -> plan::Plan {
+	let (Side::Staged(local), Side::Staged(remote)) = (local, remote) else {
+		panic!("only a whole pass's staged sides are reconciled window by window")
+	};
+	let holds = PassHolds::default();
+	stage::reconcile_windows(
+		SyncMode::TwoWay,
+		baseline,
+		local,
+		remote,
+		&holds,
+		probe_stage(),
+		stage::WINDOW,
+	)
+	.and_then(|windows| windows.into_plan(&holds))
+	.expect("reconciling the probe's staged sides")
+	.0
 }
 
 /// What a CHANGE-SCOPED pass does locally, end to end: every phase of
@@ -2439,7 +2471,10 @@ pub fn run() -> String {
 	// twins below are what carry the claim that a narrowed reconcile plans what a whole one plans.
 
 	let one_percent = fixture.files / 100;
-	changed_paths.extend(dirty_local(&mut local, 0, one_percent));
+	let dirtied_1 = dirty_local(&mut local, 0, one_percent);
+	// Copied, not moved: the windowed rows below put these edits, and only these, into the staged
+	// local side before they plan the 1 % scale.
+	changed_paths.extend(dirtied_1.iter().cloned());
 	let (plan_1, reconcile_1) = timed(|| {
 		plan::reconcile(
 			SyncMode::TwoWay,
@@ -2533,6 +2568,48 @@ pub fn run() -> String {
 		dirty_10.actions, plan_10.actions,
 		"the narrowed reconcile must plan what the whole one plans, at this scale too"
 	);
+
+	// The same plans as a whole pass makes them: window by window over its two sides, staged as
+	// `prepare_whole` stages them, into a stage of its own, then read back. After every in-memory row
+	// rather than beside each, so nothing staged is alive or edited while those run. The tree on disk
+	// is what the maps held before `dirty_local`, so each scale's edits go into the staged local side
+	// before its row: none, the 1 % ones, then all of them.
+	let (mut staged_local, staged_remote) = stage_pass_sides(&fixture.place(), &baseline, &rules);
+	let unedited = BTreeSet::new();
+	for (phase, edited, resident, in_memory) in [
+		(
+			"reconcile_windowed_0pct",
+			&unedited,
+			&converged,
+			reconcile_0,
+		),
+		("reconcile_windowed_1pct", &dirtied_1, &plan_1, reconcile_1),
+		(
+			"reconcile_windowed_10pct",
+			&changed_paths,
+			&plan_10,
+			reconcile_10,
+		),
+	] {
+		mirror(&local, &mut staged_local, edited);
+		let (planned, elapsed) = timed(|| windowed(&baseline, &staged_local, &staged_remote));
+		assert_eq!(
+			planned.actions, resident.actions,
+			"{phase}: the windowed reconcile must plan what the resident one plans"
+		);
+		probe.record(
+			phase,
+			nodes,
+			elapsed,
+			&format!(
+				"{} actions; window by window over the staged sides, into a stage, {:+.1} % on the \
+				 maps in memory",
+				planned.actions.len(),
+				(elapsed.as_secs_f64() / in_memory.as_secs_f64() - 1.0) * 100.0
+			),
+		);
+	}
+	drop((staged_local, staged_remote, dirtied_1));
 
 	// The whole local half of a pass, on inputs it re-reads itself — so this line's peak RSS is a
 	// pass's peak, not the sum of the phases above.

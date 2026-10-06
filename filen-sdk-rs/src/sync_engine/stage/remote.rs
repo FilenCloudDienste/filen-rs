@@ -16,9 +16,11 @@
 //! under its path. Then `remote` gets its folded index — `fold(path)`, as the local walk's table has,
 //! but not unique: two remote items whose names fold together are what `RemoteView::filter` refuses
 //! the pass over — and `remote_raw` goes. An index on the uuid is built by the first question about
-//! a uuid, which only a pass with writes of its own to settle asks. A partial index of the
-//! directories' paths is kept as the walk writes them, as the local table's is, for the
-//! directory-move fold to walk without reading a file.
+//! a uuid, which a pass with writes of its own to settle asks, and so does the move join of a whole
+//! pass's windowed reconcile for a row whose file left its path (`stage::reconcile`). That join asks
+//! by a file's lineage too where its uuid finds nothing, and the first such question builds a partial
+//! index on the lineage. A partial index of the directories' paths is kept as the walk writes them,
+//! as the local table's is, for the directory-move fold to walk without reading a file.
 //!
 //! # What the walk places, and what it leaves
 //!
@@ -47,6 +49,7 @@ use std::{
 	num::NonZeroUsize,
 };
 
+use filen_types::fs::StableUuid;
 use rusqlite::{Connection, OptionalExtension, Row, Statement, params};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -107,12 +110,26 @@ const RAW_DIR: &str = "SELECT name, parent FROM remote_raw WHERE uuid = ?1 AND d
 const PLACED: &str = "CREATE INDEX remote_fold ON remote (fold(path));
 	 DROP TABLE remote_raw;";
 
-/// Built by the first question about a uuid: only a pass whose pair has writes of its own in the
-/// journal asks one (see `PendingWrites::settle`).
+/// Built by the first question about a uuid: a pass whose pair has writes of its own in the journal
+/// asks one (see `PendingWrites::settle`), and so does a whole pass's move join for a row whose file
+/// left its path (`StagedSide::file_of_uuid`).
 const BY_UUID: &str = "CREATE INDEX IF NOT EXISTS remote_uuid ON remote (uuid)";
 /// Where the view holds the item `?1`. One row unless a pass has put a second node of one uuid in
 /// (see `PendingWrites::fold_into`), and then the first in path order, so the answer is one answer.
 const PATH_OF: &str = "SELECT path FROM remote WHERE uuid = ?1 ORDER BY path LIMIT 1";
+/// Where the view holds the FILE `?1` (`kind = 2`): the last of them in path order.
+const FILE_OF_UUID: &str =
+	"SELECT path FROM remote WHERE uuid = ?1 AND kind = 2 ORDER BY path DESC LIMIT 1";
+/// Built by the first question about a lineage, which only a whole pass's move join asks, for a row
+/// whose file left its path and whose uuid finds nothing (`StagedSide::file_of_lineage`). Directories
+/// carry none.
+const BY_LINEAGE: &str =
+	"CREATE INDEX IF NOT EXISTS remote_lineage ON remote (lineage) WHERE lineage IS NOT NULL";
+/// [`FILE_OF_UUID`], by lineage.
+const FILE_OF_LINEAGE: &str =
+	"SELECT path FROM remote WHERE lineage = ?1 AND kind = 2 ORDER BY path DESC LIMIT 1";
+// The two statements above spell a file's kind out.
+const _: () = assert!(NodeKind::File.as_i64() == 2);
 /// Every folded path two or more nodes have, off the folded index.
 const TWIN_KEYS: &str = "SELECT fold(path) FROM remote GROUP BY fold(path) HAVING count(*) > 1";
 /// Every node with the folded path `?1` but the first in path order.
@@ -563,6 +580,30 @@ fn replay(
 }
 
 impl StagedSide<RemoteNode> {
+	/// Where it holds the FILE `uuid`, off the uuid index, which the first question about a uuid
+	/// builds: where the move join of a whole pass's staged reconcile finds a row's file now (see
+	/// `stage::reconcile`). Of two files of one uuid, which no view holds but a test can, the last in
+	/// path order, as a walk of the side keeping the last one it met answers.
+	pub(in super::super) fn file_of_uuid(&self, uuid: Uuid) -> Option<String> {
+		self.read("where a file is", |conn| {
+			conn.execute_batch(BY_UUID)?;
+			conn.prepare_cached(FILE_OF_UUID)?
+				.query_row([uuid], |row| row.get(0))
+				.optional()
+		})
+	}
+
+	/// [`file_of_uuid`](Self::file_of_uuid), by the file's lineage: what a move that carried an edit,
+	/// which re-mints the uuid, keeps. The lineage index is built by the first question about one.
+	pub(in super::super) fn file_of_lineage(&self, lineage: StableUuid) -> Option<String> {
+		self.read("where a file of a lineage is", |conn| {
+			conn.execute_batch(BY_LINEAGE)?;
+			conn.prepare_cached(FILE_OF_LINEAGE)?
+				.query_row([lineage], |row| row.get(0))
+				.optional()
+		})
+	}
+
 	/// Where it holds each of `uuids` it holds, a seek of the uuid index each; the first call builds
 	/// the index.
 	pub(in super::super) fn paths_of(&self, uuids: &HashSet<Uuid>) -> HashMap<Uuid, String> {

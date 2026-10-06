@@ -1294,9 +1294,9 @@ async fn observ_14_dry_run_reports_intent_mutates_nothing() {
 /// A dry run beside a pass that is applying leaves that pass's plan alone. The pass stages its plan
 /// in a file of its own beside the baseline, named for the pass; its remote snapshot and its scan
 /// took a file each before it, numbered first and second and gone once the plan was staged.
-/// `plan_pair` stages its own snapshot and scan under numbers of its own, removes them before it
-/// returns and touches nothing of the pass's plan; the pass applies all of its plan once resumed,
-/// and its file goes with it.
+/// `plan_pair` stages its own snapshot, scan and reconcile under numbers of its own, removes them
+/// before it returns and touches nothing of the pass's plan; the pass applies all of its plan once
+/// resumed, and its file goes with it.
 #[shared_test_runtime]
 async fn observ_add_a_dry_run_beside_an_applying_pass_leaves_its_staged_plan_alone() {
 	/// Twice the client's transfer window, so the pass still has uploads to start once suspended.

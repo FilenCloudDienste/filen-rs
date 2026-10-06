@@ -666,7 +666,9 @@ fn write_base(
 }
 
 /// `(op, kind, from_path, remote_uuid)` of `action`, whose path is [`SyncAction::rel_path`].
-fn action_columns(action: &SyncAction) -> (i64, Option<NodeKind>, Option<&str>, Option<Uuid>) {
+pub(super) fn action_columns(
+	action: &SyncAction,
+) -> (i64, Option<NodeKind>, Option<&str>, Option<Uuid>) {
 	match action {
 		SyncAction::CreateLocalDir { .. } => (OP_CREATE_LOCAL_DIR, None, None, None),
 		SyncAction::DownloadFile { remote_uuid, .. } => {
@@ -1101,22 +1103,23 @@ fn entry_of(row: &Row<'_>) -> rusqlite::Result<(SyncAction, StagedInputs)> {
 		base_from: None,
 		parent_uuid: row.get(20)?,
 	};
-	Ok((action_of(row, path)?, inputs))
+	Ok((action_of(row, 3, path)?, inputs))
 }
 
-/// The action a [`READ_PAGE`] row stages, at `path`.
-fn action_of(row: &Row<'_>, path: String) -> rusqlite::Result<SyncAction> {
-	let op: i64 = row.get(3)?;
+/// The action a row stages at `path`, its columns from `first` on in [`READ_PAGE`]'s order: `op`,
+/// `kind`, `path` (not read here), `from_path` and `remote_uuid`.
+pub(super) fn action_of(row: &Row<'_>, first: usize, path: String) -> rusqlite::Result<SyncAction> {
+	let op: i64 = row.get(first)?;
 	let kind = || -> rusqlite::Result<NodeKind> {
-		let raw: Option<i64> = row.get(4)?;
+		let raw: Option<i64> = row.get(first + 1)?;
 		kind_of(raw.ok_or_else(|| corrupt("missing kind for op", op))?)
 	};
 	let from_path = || -> rusqlite::Result<String> {
-		row.get::<_, Option<String>>(6)?
+		row.get::<_, Option<String>>(first + 3)?
 			.ok_or_else(|| corrupt("missing from_path for op", op))
 	};
 	let remote_uuid = || -> rusqlite::Result<Uuid> {
-		row.get::<_, Option<Uuid>>(7)?
+		row.get::<_, Option<Uuid>>(first + 4)?
 			.ok_or_else(|| corrupt("missing remote_uuid for op", op))
 	};
 	Ok(match op {
