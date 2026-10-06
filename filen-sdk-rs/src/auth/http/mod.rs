@@ -1,6 +1,7 @@
 use std::{
 	borrow::Cow,
 	fmt::Debug,
+	io,
 	num::NonZeroU32,
 	sync::{Arc, RwLock},
 	time::Duration,
@@ -689,11 +690,21 @@ async fn execute_request(
 			if is_pre_send_connect_failure(&e) {
 				return retry::RetryError::RetryAfterBackoff(Error::from(e));
 			}
+			let dead_connection = dead_connection_io_error(&e);
+			if let Some(io_error) = dead_connection {
+				// The request's own log line reports only the final error, by Display, so a failure
+				// the retry absorbs would otherwise leave no trace of what killed the connection.
+				tracing::warn!(
+					kind = ?io_error.kind(),
+					os_error = ?io_error.raw_os_error(),
+					"connection died during the request",
+				);
+			}
 			let retryable = is_attempt_retryable(
 				e.status(),
 				e.is_builder(),
 				e.is_request(),
-				is_dispatch_gone(&e) || is_incomplete_message(&e),
+				is_dispatch_gone(&e) || is_incomplete_message(&e) || dead_connection.is_some(),
 			);
 			retry::RetryError::from_retryable(retryable, Error::from(e))
 		})
@@ -713,15 +724,30 @@ async fn execute_request(
 /// errors instead arrive as HTTP 200 + `{status:false}` JSON, so they never reach this branch.)
 ///
 /// When `status` is `None` the failure is a transport/connection error with no HTTP response.
-/// `dispatch_gone` flags a *dead pooled connection* — hyper `DispatchGone` (its dispatch task was
-/// dropped before the request was written) or `IncompleteMessage` (the server closed an idle
-/// keep-alive the SDK then reused): the connection died at the request boundary, so retrying is safe
-/// (the request never reached the server, or is replayable for this SDK's idempotent-by-construction
-/// endpoints). It is retryable, as is anything that is neither a builder nor a request error. A
-/// builder or request error may have been partially sent, so it stays non-retryable — EXCEPT when
-/// `dispatch_gone` already marked it a dead-pool failure. A connect or read timeout also surfaces as
-/// a `Kind::Request` error (`is_request`) but is not a dead-pool failure, so timeouts fall here and
-/// are NOT retried — fail fast rather than spend another full timeout on a stalled host.
+/// `dispatch_gone` flags a *dead connection* — hyper `DispatchGone` (its dispatch task was dropped
+/// before the request was written), `IncompleteMessage` (the server closed an idle keep-alive the
+/// SDK then reused), or an I/O error that killed the connection once the request was handed to it,
+/// while or after it was written ([`dead_connection_io_error`]). Only the first proves the request
+/// never reached the server; after the other two it may already have been processed, and the retry
+/// replays it byte for byte (the serialize layer sits outside the retry layer). A replay is a no-op
+/// only when the request carries a key the client generated and the first answer holds nothing the
+/// server minted or decided once: a client-generated uuid, name-hash dedup, uuid+index chunk
+/// uploads, GETs. A replayed `v3/upload/done` is unverified: it carries a client uuid, but the
+/// server versions same-name files by `(parent, name_hashed)`, and its answer to a second `done`
+/// has not been observed. Everything else is exposed, for example: a replayed
+/// `v3/notes/tags/create` or `v3/contacts/requests/send` can create a second tag or request, a
+/// replayed `v3/trash/empty` or `v3/user/delete/*` also removes what arrived between the two
+/// sends, a replayed `v3/confirmation/send`, `v3/user/password/forgot` or
+/// `v3/user/settings/email/change` mails the user twice, and a replayed
+/// `v3/user/settings/password/change` or `v3/user/2fa/enable` answers differently, because the
+/// first send already changed what it checks. A new endpoint should carry a client-generated key
+/// so that replaying it is a no-op. The transient-5xx and mid-body
+/// retries carry the same exposure. A dead connection is retryable, as is anything that is neither
+/// a builder nor a request error. A builder or request error may have been partially sent, so it
+/// stays non-retryable — EXCEPT when `dispatch_gone` already marked it a dead connection. A connect
+/// or read timeout also surfaces as a `Kind::Request` error (`is_request`) but is not a dead
+/// connection, so timeouts fall here and are NOT retried — fail fast rather than spend another
+/// full timeout on a stalled host.
 ///
 /// A connect failure that is *not* a timeout never reaches this function at all:
 /// [`execute_request`] classifies it as [`retry::RetryError::RetryAfterBackoff`] first. See
@@ -745,19 +771,20 @@ fn is_attempt_retryable(
 	}
 }
 
-/// Walks `err` and its [`source`](std::error::Error::source) chain, returning true if any link's
-/// `Display` contains one of `needles`. Used to detect a specific lower-layer error that the
-/// public error API does not otherwise expose.
+/// `err` followed by its [`source`](std::error::Error::source) chain.
+fn error_chain<'a>(
+	err: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+	std::iter::successors(Some(err), |e| e.source())
+}
+
+/// True if any link of `err`'s [`error_chain`] has a `Display` containing one of `needles`. Used
+/// to detect a specific lower-layer error that the public error API does not otherwise expose.
 fn error_chain_mentions(err: &(dyn std::error::Error + 'static), needles: &[&str]) -> bool {
-	let mut source = Some(err);
-	while let Some(e) = source {
+	error_chain(err).any(|e| {
 		let msg = e.to_string();
-		if needles.iter().any(|needle| msg.contains(needle)) {
-			return true;
-		}
-		source = e.source();
-	}
-	false
+		needles.iter().any(|needle| msg.contains(needle))
+	})
 }
 
 /// True for hyper's `DispatchGone` (`Kind::User(DispatchGone)`, Display "dispatch task is gone",
@@ -780,15 +807,58 @@ fn is_dispatch_gone(err: &reqwest::Error) -> bool {
 /// — the classic stale-pool race. Like [`is_dispatch_gone`] this surfaces as a request-kind error,
 /// but UNLIKE `DispatchGone` (which fails provably *before* the request is written) `IncompleteMessage`
 /// surfaces when the *response* read hits EOF, so the server may already have received and processed
-/// the request — receipt is genuinely ambiguous (hyperium/hyper#2136). Retrying is nonetheless safe
-/// because every endpoint reached through [`execute_request`] is idempotent-by-construction: the
-/// serialize layer sits *outside* the retry layer, so a retry replays byte-identical bytes
-/// (client-generated uuid + server-side name-hash dedup; content-addressed chunk uploads; idempotent
-/// GETs). A future endpoint whose identical-byte replay is not a no-op must carry a client
-/// idempotency key before relying on this. reqwest does not re-export hyper's
-/// `Error::is_incomplete_message()`, so — like [`is_dispatch_gone`] — we match the stable `Display`.
+/// the request — receipt is genuinely ambiguous (hyperium/hyper#2136). The retry replays it anyway;
+/// [`is_attempt_retryable`] says which endpoints that is a no-op for and which it is not. reqwest
+/// does not re-export hyper's `Error::is_incomplete_message()`, so — like [`is_dispatch_gone`] — we
+/// match the stable `Display`.
 fn is_incomplete_message(err: &reqwest::Error) -> bool {
 	error_chain_mentions(err, &["connection closed before message completed"])
+}
+
+/// The I/O error that killed a connection once the request was handed to it, while or after it was
+/// written, if that is why the attempt failed: reset or aborted by the peer or the local stack, a
+/// broken pipe, a vanished local
+/// address, or an EOF before the response. hyper-util replays only a request that never left the
+/// pool and reqwest only an h2 refusal, so a keep-alive connection that died mid-request failed the
+/// call although fresh connections made soon after worked. On the 2026-09-26, 09-28 and 09-29
+/// nightlies macOS runners lost pooled connections this way: three lock polls failed with
+/// EADDRNOTAVAIL 20-27s after the send, and an egest read on a reused connection failed after ~15s,
+/// its errno unlogged. As with [`is_incomplete_message`] receipt is ambiguous; see
+/// [`is_attempt_retryable`] for what a replay means. `TimedOut` is deliberately absent: a stalled
+/// connection fails fast like every other timeout here. `reqwest::Error::is_connect` exists only
+/// off wasm, and the fetch backend surfaces no socket errors, so the class is empty there.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn dead_connection_io_error(err: &reqwest::Error) -> Option<&io::Error> {
+	if err.is_connect() {
+		return None;
+	}
+	dead_connection_in_chain(err)
+}
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn dead_connection_io_error(_err: &reqwest::Error) -> Option<&io::Error> {
+	None
+}
+
+/// The first I/O error in `err`'s [`source`](std::error::Error::source) chain whose kind means the
+/// connection is dead: the walk behind [`dead_connection_io_error`], minus its connect-phase guard.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn dead_connection_in_chain<'a>(
+	err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a io::Error> {
+	error_chain(err).find_map(|e| {
+		e.downcast_ref::<io::Error>().filter(|io_error| {
+			matches!(
+				io_error.kind(),
+				io::ErrorKind::ConnectionReset
+					| io::ErrorKind::BrokenPipe
+					| io::ErrorKind::ConnectionAborted
+					| io::ErrorKind::NotConnected
+					| io::ErrorKind::AddrNotAvailable
+					| io::ErrorKind::UnexpectedEof
+			)
+		})
+	})
 }
 
 /// True for a connect failure that is not a timeout: the name did not resolve, or the TCP connect
@@ -813,8 +883,13 @@ fn is_pre_send_connect_failure(_err: &reqwest::Error) -> bool {
 
 #[cfg(test)]
 mod retry_classification_tests {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use std::io;
+
 	use reqwest::StatusCode;
 
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use super::dead_connection_in_chain;
 	use super::{error_chain_mentions, is_attempt_retryable};
 
 	/// A permanent 4xx (the egest `404 Not Found` for a missing chunk) must NOT be retried — this
@@ -908,6 +983,59 @@ mod retry_classification_tests {
 			&["dispatch task is gone", "runtime dropped the dispatch task"]
 		));
 		assert!(!error_chain_mentions(&err, &["connection refused"]));
+	}
+
+	/// The kinds that mark a connection dead during the request, found directly and
+	/// below an outer error the way hyper nests the socket error. `AddrNotAvailable` is the
+	/// EADDRNOTAVAIL the macOS runners' lock polls failed with; `TimedOut` stays out so a stalled
+	/// host keeps failing fast.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[test]
+	fn dead_connection_kinds_are_found_through_the_chain() {
+		#[derive(Debug)]
+		struct Outer(io::Error);
+
+		impl std::fmt::Display for Outer {
+			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				f.write_str("client error (SendRequest)")
+			}
+		}
+
+		impl std::error::Error for Outer {
+			fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+				Some(&self.0)
+			}
+		}
+
+		for kind in [
+			io::ErrorKind::ConnectionReset,
+			io::ErrorKind::BrokenPipe,
+			io::ErrorKind::ConnectionAborted,
+			io::ErrorKind::NotConnected,
+			io::ErrorKind::AddrNotAvailable,
+			io::ErrorKind::UnexpectedEof,
+		] {
+			assert_eq!(
+				dead_connection_in_chain(&io::Error::from(kind)).map(io::Error::kind),
+				Some(kind),
+				"{kind:?} must mark the connection dead"
+			);
+			assert_eq!(
+				dead_connection_in_chain(&Outer(io::Error::from(kind))).map(io::Error::kind),
+				Some(kind),
+				"{kind:?} must be found below an outer error"
+			);
+		}
+		for kind in [
+			io::ErrorKind::TimedOut,
+			io::ErrorKind::ConnectionRefused,
+			io::ErrorKind::Other,
+		] {
+			assert!(
+				dead_connection_in_chain(&io::Error::from(kind)).is_none(),
+				"{kind:?} must not mark the connection dead"
+			);
+		}
 	}
 }
 
@@ -1367,14 +1495,22 @@ impl From<Request<Bytes, reqwest::Url>> for RequestBuilder {
 // local TCP server.
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod client_timeout_tests {
-	use std::time::{Duration, Instant};
-
-	use tokio::{
-		io::{AsyncReadExt, AsyncWriteExt},
-		net::TcpListener,
+	use std::{
+		borrow::Cow,
+		sync::{Arc, RwLock},
+		time::{Duration, Instant},
 	};
 
-	use super::{ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
+	use bytes::Bytes;
+	use filen_types::auth::APIKey;
+	use tokio::{
+		io::{AsyncReadExt, AsyncWriteExt},
+		net::{TcpListener, TcpStream},
+	};
+
+	use super::{
+		AuthClient, ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, UnauthClient,
+	};
 
 	#[test]
 	fn default_config_enables_both_timeouts_and_builds() {
@@ -1475,10 +1611,11 @@ mod client_timeout_tests {
 	/// A pooled keep-alive connection the server has closed surfaces, on reuse, as hyper's
 	/// `IncompleteMessage` ("connection closed before message completed") — reqwest models it as a
 	/// request-kind error (`status()==None`, `is_request()==true`). It is the classic stale-pool race
-	/// and must be RETRYABLE: the request is idempotent-by-construction for this SDK's endpoints
-	/// (client-generated uuid + server name-hash dedup), so a transient connection close must not
-	/// fail the call on the first attempt. Modelled by a server that reads the request then closes
-	/// without responding, which makes the client's response read hit the same IncompleteMessage.
+	/// and must be RETRYABLE: the request is idempotent-by-construction for this SDK's client-keyed
+	/// endpoints (client-generated uuid + server name-hash dedup), so a transient connection close
+	/// must not fail the call on the first attempt. Modelled by a server that reads the request then
+	/// closes without responding, which makes the client's response read hit the same
+	/// IncompleteMessage.
 	#[tokio::test]
 	async fn incomplete_message_is_retryable() {
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1522,6 +1659,65 @@ mod client_timeout_tests {
 				 but was NoRetry: {e}"
 			),
 		}
+	}
+
+	/// A keep-alive connection that dies AFTER the next request was written to it surfaces as
+	/// hyper's `SendRequest(Io)`, which hyper-util does not replay. On macOS runners pooled
+	/// connections died this way: lock polls failed with EADDRNOTAVAIL 20-27s after the send while
+	/// fresh connections made soon after worked. Modelled by a server that answers one request,
+	/// reads the next in full, then resets: the SDK must replay it on a fresh connection. The reset
+	/// has to follow the second request — one sent while the connection sits idle is noticed by
+	/// hyper before reuse and never reaches the SDK, so it would pass without the fix.
+	#[tokio::test]
+	async fn connection_reset_after_request_written_is_retried() {
+		async fn read_head(socket: &mut TcpStream) {
+			let mut head = Vec::new();
+			let mut byte = [0u8; 1];
+			while !head.ends_with(b"\r\n\r\n") {
+				socket.read_exact(&mut byte).await.unwrap();
+				head.push(byte[0]);
+			}
+		}
+		async fn respond(socket: &mut TcpStream) {
+			let body = r#"{"status":true}"#;
+			let response = format!(
+				"HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+				body.len()
+			);
+			socket.write_all(response.as_bytes()).await.unwrap();
+		}
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		// Scripted, so running to the end proves the exact sequence: two requests on the first
+		// connection, the second one reset, then one more on a fresh connection.
+		let server = tokio::spawn(async move {
+			let (mut pooled, _) = listener.accept().await.unwrap();
+			read_head(&mut pooled).await;
+			respond(&mut pooled).await;
+			read_head(&mut pooled).await;
+			// A reset, not a close: a FIN surfaces as IncompleteMessage, which is already retried.
+			pooled.set_zero_linger().unwrap();
+			drop(pooled);
+			let (mut fresh, _) = listener.accept().await.unwrap();
+			read_head(&mut fresh).await;
+			respond(&mut fresh).await;
+		});
+
+		let client = AuthClient::from_unauthed(
+			UnauthClient::from_config(ClientConfig::default()).unwrap(),
+			Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-key")))),
+		);
+		let url = format!("http://{addr}/v3/user/lock");
+		for call in 1..=2 {
+			// An empty body keeps each request to one header block: a non-empty one is streamed
+			// chunked by the upload limiter, and the reset could then land before it is all read.
+			client
+				.post_raw_bytes_auth::<()>(Bytes::new(), &url, "v3/user/lock".into())
+				.await
+				.unwrap_or_else(|e| panic!("call {call} must succeed, got {e:?}"));
+		}
+		server.await.unwrap();
 	}
 }
 
