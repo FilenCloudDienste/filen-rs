@@ -2145,7 +2145,7 @@ test("getItemPath", async () => {
 	expect(topLevelDirResult.ancestors.length).toBe(0)
 })
 
-test("cache search", async () => {
+test("cache search", { timeout: cap(300_000) }, async () => {
 	const statusMessages: CacheStatusMessage[] = []
 	await state.configureCache("wasm-test-cache.db", (messages: CacheStatusMessage[]) => {
 		statusMessages.push(...messages)
@@ -2179,7 +2179,11 @@ test("cache search", async () => {
 		return false
 	}
 
-	expect(await poll(async () => (await search.total()) === 2n, 90000)).toBe(true)
+	// The resync behind this takes drive-write, which the native V2 legs hold on the same account,
+	// so these waits are on the shared account and scale like the rest. A resync that started but
+	// never listed was waiting for that lock; one that listed and converged short has stale data.
+	const statusDump = () => JSON.stringify(statusMessages, jsonBigIntReplacer)
+	expect(await poll(async () => (await search.total()) === 2n, cap(90_000)), statusDump()).toBe(true)
 
 	const snapshots: CacheSearchSnapshot[] = []
 	const window = await search.getRange(0n, 10n, (snapshot: CacheSearchSnapshot) => {
@@ -2201,7 +2205,7 @@ test("cache search", async () => {
 		parent: searchDir,
 		name: "gamma.txt"
 	})
-	expect(await poll(() => snapshots.some(snapshot => snapshot.total === 3n && snapshot.live), 120000)).toBe(true)
+	expect(await poll(() => snapshots.some(snapshot => snapshot.total === 3n && snapshot.live), cap(120_000)), statusDump()).toBe(true)
 
 	// Engine-local refilter.
 	await search.setConfig({
@@ -2213,7 +2217,7 @@ test("cache search", async () => {
 	expect(await search.total()).toBe(1n)
 
 	// The uncovered add ran a resync; its progress arrived on the status listener.
-	expect(await poll(() => statusMessages.some(message => message.type === "resyncProgress"), 60000)).toBe(true)
+	expect(await poll(() => statusMessages.some(message => message.type === "resyncProgress"), cap(60_000)), statusDump()).toBe(true)
 
 	await search.close()
 	expect(await search.isLive()).toBe(false)
