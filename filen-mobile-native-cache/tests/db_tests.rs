@@ -5467,6 +5467,11 @@ pub async fn test_trashing_a_marked_file_does_not_strand_its_marker() {
 	);
 }
 
+/// How long a test waits for a permanent folder delete to propagate (the trash listing dropping
+/// the folder, `v3/dir` no longer answering for it). On the 2026-10-03 nightly neither had
+/// happened on the V1 account after the 30 one-second polls these tests used to give it.
+const PERMANENT_DELETE_PURGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 // A dir trashed here and permanently deleted elsewhere still sheltered an unsent edit. The
 // probe's FolderNotFound answer must release the subtree's markers, or the pending guard
 // re-spares the phantom on every refresh: a trash entry nothing can drain, restore, or
@@ -5509,17 +5514,19 @@ pub async fn test_a_dead_dirs_phantom_converges_despite_a_pending_edit_below_it(
 	// NEVER converges (the pending guard re-spares it every round), so the poll
 	// separates server lag from the bug.
 	let phantom: FfiId = format!("trash/{dir_uuid}").into();
-	let mut reaped = false;
-	for _ in 0..30 {
+	let deadline = std::time::Instant::now() + PERMANENT_DELETE_PURGE_TIMEOUT;
+	let reaped = loop {
 		db.update_trash().await.unwrap();
 
 		if db.query_item(&phantom).unwrap().is_none() {
-			reaped = true;
-			break;
+			break true;
+		}
+		if std::time::Instant::now() >= deadline {
+			break false;
 		}
 
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-	}
+	};
 	assert!(
 		reaped,
 		"the released subtree must let the sweep reap the phantom"
@@ -7613,14 +7620,16 @@ pub async fn test_a_stable_id_relist_still_answers_not_found_for_a_dead_containe
 	// has stopped. Both the path walk this replaces and the row-direct branch key their not-found
 	// off exactly that answer, so wait for the server to agree with itself before asserting on it —
 	// otherwise this measures replication lag, not the branch.
-	let mut gone = false;
-	for _ in 0..30 {
+	let deadline = std::time::Instant::now() + PERMANENT_DELETE_PURGE_TIMEOUT;
+	let gone = loop {
 		if rss.client.get_dir(dir_uuid).await.is_err() {
-			gone = true;
-			break;
+			break true;
+		}
+		if std::time::Instant::now() >= deadline {
+			break false;
 		}
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-	}
+	};
 	assert!(
 		gone,
 		"the server never stopped answering for the deleted dir"
