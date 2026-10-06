@@ -5,6 +5,7 @@
 /sdk-rs.d.ts
 /snippets
 /__screenshots__
+/.vitest
 /browser
 /react-native
 /android

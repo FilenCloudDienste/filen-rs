@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url"
 import { playwright } from "@vitest/browser-playwright"
 import type { Plugin } from "vite"
 import { defineConfig, mergeConfig } from "vitest/config"
-import viteConfig from "./vite.config"
+import viteConfig from "./vite.config.ts"
 
 // The pinned RAW samples microthumb's characterisation suite keeps outside target/
 // (microthumb/tests/raw_fixtures/mod.rs `cache_dir`): `<repo>/.fixture-cache/raw/<name>`.

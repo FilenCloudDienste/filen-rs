@@ -705,10 +705,10 @@ test("Zip Download", async () => {
 		if (entry.directory) {
 			throw new Error("Expected entry to be a FileEntry, but it was a directory")
 		}
-		// zip.js has bad precision for dates, so we compare in seconds
+		// zip.js reads both from the NTFS extra field, which the SDK writes to the millisecond
 		const meta = getFileMeta(expectedFile.meta)
 		expect(BigInt(entry.creationDate!.getTime())).toEqual(meta?.created)
-		expect(entry.lastModDate.getTime() / 1000).toEqual(Math.floor(Number(meta?.modified) / 1000))
+		expect(BigInt(entry.lastModDate.getTime())).toEqual(meta?.modified)
 		expect(BigInt(entry.uncompressedSize)).toEqual(expectedFile.size)
 		const data = await entry.getData(new Uint8ArrayWriter())
 		expect(data).toEqual(expected)

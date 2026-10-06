@@ -2,7 +2,6 @@ import { defineConfig } from "vite"
 import { VitePWA } from "vite-plugin-pwa"
 import wasm from "vite-plugin-wasm"
 import { nodePolyfills } from "vite-plugin-node-polyfills"
-import topLevelAwait from "vite-plugin-top-level-await"
 
 const now = Date.now()
 
@@ -31,7 +30,7 @@ export default defineConfig({
 				rollupFormat: "iife",
 				minify: false,
 				sourcemap: false,
-				target: "es2018",
+				target: "esnext",
 				buildPlugins: {
 					vite: [
 						nodePolyfills({
@@ -41,31 +40,33 @@ export default defineConfig({
 							},
 							protocolImports: true
 						}),
-						wasm(),
-						topLevelAwait({
-							promiseExportName: "__tla",
-							promiseImportName: i => `__tla_${i}`
-						})
+						wasm()
 					]
 				}
 			},
 			devOptions: {
 				enabled: false
 			}
-		}),
-		topLevelAwait({
-			promiseExportName: "__tla",
-			promiseImportName: i => `__tla_${i}`
 		})
 	],
+	// Under Vite 8, vite-plugin-node-polyfills injects these shim imports into pre-bundled deps
+	// but excludes them from the optimizer, so a cold dev server discovers them mid-run and
+	// reloads the page, which loses vitest's runner ("Vitest failed to find the runner").
+	optimizeDeps: {
+		include: [
+			"vite-plugin-node-polyfills/shims/buffer",
+			"vite-plugin-node-polyfills/shims/global",
+			"vite-plugin-node-polyfills/shims/process"
+		]
+	},
 	build: {
 		target: "esnext",
 		sourcemap: false,
-		cssMinify: "esbuild",
-		minify: "esbuild",
+		cssMinify: "lightningcss",
+		minify: "oxc",
 		outDir: "./dist",
 		chunkSizeWarningLimit: Infinity,
-		rollupOptions: {
+		rolldownOptions: {
 			output: {
 				chunkFileNames() {
 					return `[name].[hash].${now}.js`
@@ -89,11 +90,7 @@ export default defineConfig({
 				},
 				protocolImports: true
 			}),
-			wasm(),
-			topLevelAwait({
-				promiseExportName: "__tla",
-				promiseImportName: i => `__tla_${i}`
-			})
+			wasm()
 		]
 	},
 	server: {
