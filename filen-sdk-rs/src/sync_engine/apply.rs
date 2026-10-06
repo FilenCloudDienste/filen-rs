@@ -2066,7 +2066,7 @@ async fn apply_transfer(
 				// A push does NOT make its own content agreed: the server took our bytes, but
 				// another client's edit may already be on its way to the same path. The marker stays
 				// on the previous agreed content until a snapshot lists this version at this path
-				// (`plan::confirm_agreed_content`), and the gap is what surfaces a concurrent edit.
+				// (`plan::snapshot_confirms`), and the gap is what surfaces a concurrent edit.
 				agreed_hash: base.as_deref().and_then(|b| b.agreed_hash),
 			});
 			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;

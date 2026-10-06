@@ -23,10 +23,11 @@
 //! | [`count_subtree`](Baseline::count_subtree) | subtree, counted | one `COUNT` over the primary key's range `(p/, p0)`; through edits, the walk above |
 //! | [`iter`](Baseline::iter), [`visit_rows`](Baseline::visit_rows), [`visit_row_paths`](Baseline::visit_row_paths) | whole pair | the primary key, paged |
 //! | [`len`](Baseline::len), [`carryable_rows`](Baseline::carryable_rows), [`has_remote_rows`](Baseline::has_remote_rows) | count | `baseline_counts`, read once when the snapshot begins |
-//! | [`any_unconfirmed`](Baseline::any_unconfirmed), [`unconfirmed`](Baseline::unconfirmed) | small set | the partial index `baseline_unconfirmed` |
+//! | [`any_unconfirmed`](Baseline::any_unconfirmed) | whether any row is unconfirmed | the partial index `baseline_unconfirmed`, one row of it |
+//! | [`unconfirmed`](Baseline::unconfirmed), [`unconfirmed_page`](Baseline::unconfirmed_page) | the unconfirmed rows | the partial index `baseline_unconfirmed`, keyset-paged: on the pass after a whole-tree push it is the tree |
 //! | [`uncarryable_paths`](Baseline::uncarryable_paths) | small set | the partial index `baseline_uncarryable` |
 //! | [`rule_file_rows`](Baseline::rule_file_rows) | small set | the partial index `baseline_rule_files` |
-//! | [`confirm_where`](Baseline::confirm_where), [`move_subtree`](Baseline::move_subtree) | pass-private WRITE | a layer of [`Edits`], never a store write (see below) |
+//! | [`confirm`](Baseline::confirm), [`move_subtree`](Baseline::move_subtree) | pass-private WRITE | a layer of [`Edits`], never a store write (see below) |
 //!
 //! The whole-set questions a pass asks before it reads either side — the counts, whether anything
 //! is unconfirmed, which rows are uncarryable or rule files — are a counts row and three partial
@@ -56,12 +57,14 @@
 //! # The two writes, and the fold window
 //!
 //! [`move_subtree`](Baseline::move_subtree) (`plan::fold_dir_moves`) and
-//! [`confirm_where`](Baseline::confirm_where) (the three confirmation steps) edit the PASS's view of
+//! [`confirm`](Baseline::confirm) (the confirmation, `SyncEngine::confirm`) edit the PASS's view of
 //! the rows, never the store's: a dry run persists neither, and a real pass persists the
 //! confirmations itself and commits the move when it applies it. Each is a LAYER of the pass's
 //! [`Edits`], read over the table and the layers beneath it, and each costs what the pass changed:
 //!
-//! - a confirmation is a marker entry keyed by the path it advanced ([`Block`]);
+//! - a confirmation is a marker keyed by the path it advanced ([`Block`]) — held one by one up to a
+//!   window of them, and past that read out of the stage the confirmation wrote them into
+//!   ([`Marks::Staged`]), as the bottom layer, keyed by the paths the pass began with;
 //! - a folded directory move is the MAPPING it is ([`Layer::Moved`]) — two paths, whatever the moved
 //!   directory holds: a path under the destination is read as the same path under the source, one
 //!   step per layer. That holds because the destination held nothing once the source had left it,
@@ -117,6 +120,7 @@ use super::{
 	baseline::{BaselineEntry, BaselineState, NodeKind},
 	plan::ancestors,
 	scan::collision_key,
+	stage::{Confirmed, StagedConfirmations},
 };
 
 /// One pair's baseline rows as a pass reads them (see the module doc).
@@ -169,9 +173,50 @@ struct Block {
 	/// The paths below moved away, each standing for itself and its whole subtree: no row below at
 	/// or under one is in the view.
 	vacated: BTreeSet<String>,
-	/// The marker a confirmation advanced on a row below — the one field a confirmation changes, so
-	/// a confirmed push costs an entry here rather than a written row.
-	agreed: HashMap<String, Agreed>,
+	/// The markers a confirmation advanced on rows below — the one field a confirmation changes, so
+	/// a confirmed push costs a marker here rather than a written row.
+	agreed: Marks,
+}
+
+/// The markers a confirmation advanced on the rows below a [`Block`], keyed by the path each row has
+/// there.
+#[derive(Debug, Clone)]
+enum Marks {
+	/// Held one by one: a confirmation of up to a window of rows (see `stage::ConfirmedRows`), and
+	/// any marker a test sets.
+	Held(HashMap<String, Agreed>),
+	/// A confirmation of more rows than a window, read out of the stage it was confirmed into. Only
+	/// ever the bottom layer's, over the table — so its paths are the ones the pass began with, which
+	/// the moves above it translate to as they translate every other read — and never written into
+	/// again: an edit after it goes into a block above it (see [`Edits::top_block`]). Each of its
+	/// markers advanced a row to the row's own content, so no row carrying one awaits confirmation.
+	Staged(Arc<StagedConfirmations>),
+}
+
+impl Default for Marks {
+	fn default() -> Self {
+		Self::Held(HashMap::new())
+	}
+}
+
+impl Marks {
+	fn get(&self, rel_path: &str) -> Option<Agreed> {
+		match self {
+			Self::Held(marks) => marks.get(rel_path).copied(),
+			Self::Staged(staged) => staged.marker_at(rel_path).map(|marker| Agreed {
+				hash: marker.agreed_hash,
+				awaits: false,
+			}),
+		}
+	}
+
+	/// The markers held one by one; `None` for staged ones, none of which awaits confirmation.
+	fn held(&self) -> Option<&HashMap<String, Agreed>> {
+		match self {
+			Self::Held(marks) => Some(marks),
+			Self::Staged(_) => None,
+		}
+	}
 }
 
 /// A marker the pass advanced on a row, and whether the row, carrying it, still awaits
@@ -208,6 +253,19 @@ impl Block {
 		row
 	}
 
+	/// Advance the marker on the row below at `rel_path`.
+	fn advance(&mut self, rel_path: String, agreed: Agreed) {
+		match &mut self.agreed {
+			Marks::Held(marks) => {
+				marks.insert(rel_path, agreed);
+			}
+			Marks::Staged(_) => unreachable!(
+				"a staged confirmation takes no edit: one goes into a block above it (see \
+				 `Edits::top_block`)"
+			),
+		}
+	}
+
 	fn write(&mut self, row: BaselineEntry) {
 		self.folded
 			.insert((collision_key(&row.rel_path), row.rel_path.clone()));
@@ -232,7 +290,7 @@ impl Block {
 	}
 
 	/// The rows written here inside `span`, in path order.
-	fn written_in<'b>(&'b self, span: &Span) -> impl Iterator<Item = &'b BaselineEntry> + 'b {
+	fn written_in<'b>(&'b self, span: &Span) -> impl Iterator<Item = &'b BaselineEntry> + use<'b> {
 		let lo = if span.inclusive {
 			Bound::Included(span.lo.clone())
 		} else {
@@ -273,9 +331,11 @@ impl Edits {
 		}
 	}
 
-	/// The block an edit is written into: the top layer, or a new one over a move.
+	/// The block an edit is written into: the top layer, or a new one over a move or over a staged
+	/// confirmation, which takes no edit.
 	fn top_block(&mut self) -> &mut Block {
-		if !matches!(self.layers.last(), Some(Layer::Block(_))) {
+		if !matches!(self.layers.last(), Some(Layer::Block(block)) if block.agreed.held().is_some())
+		{
 			self.layers.push(Layer::Block(Block::default()));
 		}
 		match self.layers.last_mut() {
@@ -338,8 +398,13 @@ impl Edits {
 							.iter()
 							.map(|(key, path)| string(key) + string(path))
 							.sum::<usize>() + block.vacated.iter().map(string).sum::<usize>()
-							+ block.agreed.capacity() * size_of::<(String, Agreed)>()
-							+ block.agreed.keys().map(String::capacity).sum::<usize>()
+							+ match &block.agreed {
+								Marks::Held(marks) => {
+									marks.capacity() * size_of::<(String, Agreed)>()
+										+ marks.keys().map(String::capacity).sum::<usize>()
+								}
+								Marks::Staged(staged) => staged.bytes(),
+							}
 					}
 					Layer::Moved { from, to } => from.capacity() + to.capacity(),
 				})
@@ -640,7 +705,7 @@ impl Cursor<'_> {
 
 	pub(super) fn get(&mut self, rel_path: &str) -> Option<BaselineEntry> {
 		let baseline = self.baseline;
-		let (at, mark) = baseline.lookup(baseline.depth(), rel_path);
+		let (at, mark) = baseline.lookup(baseline.depth(), rel_path, true);
 		let row = match at {
 			Lookup::Written(row) => row.clone(),
 			Lookup::Absent => return None,
@@ -768,10 +833,16 @@ impl Baseline {
 		)
 	}
 
-	/// Where the view `depth` layers deep answers for `rel_path`, and the marker the top-most layer
-	/// that advanced one there advanced. One step per layer and no more: a move maps a path to ONE
-	/// path below it, because its destination held nothing of its own.
-	fn lookup<'a>(&'a self, depth: usize, rel_path: &'a str) -> (Lookup<'a>, Option<Agreed>) {
+	/// Where the view `depth` layers deep answers for `rel_path`, and — when `marked` — the marker
+	/// the top-most layer that advanced one there advanced. One step per layer and no more: a move
+	/// maps a path to ONE path below it, because its destination held nothing of its own. A caller
+	/// that reads no marker asks for none, which a staged confirmation would read out of its stage.
+	fn lookup<'a>(
+		&'a self,
+		depth: usize,
+		rel_path: &'a str,
+		marked: bool,
+	) -> (Lookup<'a>, Option<Agreed>) {
 		let mut path: Cow<'a, str> = Cow::Borrowed(rel_path);
 		let mut mark = None;
 		let Some(edits) = self.edits.as_deref() else {
@@ -786,8 +857,8 @@ impl Baseline {
 					if block.vacated_over(&path).is_some() {
 						return (Lookup::Absent, mark);
 					}
-					if mark.is_none() {
-						mark = block.agreed.get(path.as_ref()).copied();
+					if marked && mark.is_none() {
+						mark = block.agreed.get(path.as_ref());
 					}
 				}
 				Layer::Moved { from, to } => {
@@ -804,7 +875,7 @@ impl Baseline {
 	}
 
 	fn get_at(&self, depth: usize, rel_path: &str) -> Option<BaselineEntry> {
-		let (at, mark) = self.lookup(depth, rel_path);
+		let (at, mark) = self.lookup(depth, rel_path, true);
 		let row = match at {
 			Lookup::Written(row) => row.clone(),
 			Lookup::Absent => return None,
@@ -816,7 +887,7 @@ impl Baseline {
 	/// Whether a row sits at exactly `rel_path` in the view `depth` layers deep, and whether it is
 	/// carryable.
 	fn carry_flag_at(&self, depth: usize, rel_path: &str) -> Option<bool> {
-		match self.lookup(depth, rel_path).0 {
+		match self.lookup(depth, rel_path, false).0 {
 			Lookup::Written(row) => Some(row.carryable()),
 			Lookup::Absent => None,
 			Lookup::Table(path) => self.table()?.carryable_at(&path),
@@ -839,11 +910,18 @@ impl Baseline {
 						.filter(move |row| !dirs || row.kind == NodeKind::Dir)
 						.cloned(),
 				);
-				let below: Rows<'_> = Box::new(
-					self.rows_in(depth - 1, span, dirs)
-						.filter(move |row| block.shows_below(&row.rel_path))
-						.map(move |row| block.mark(row)),
-				);
+				let shown = self
+					.rows_in(depth - 1, span.clone(), dirs)
+					.filter(move |row| block.shows_below(&row.rel_path));
+				let below: Rows<'_> = match &block.agreed {
+					Marks::Held(_) => Box::new(shown.map(move |row| block.mark(row))),
+					// The table's rows, under the paths the markers are keyed by (see
+					// `Marks::Staged`): their markers are read beside them, in their order, rather
+					// than looked up one row at a time.
+					Marks::Staged(staged) => {
+						Box::new(staged.mark_in_order(span.lo, span.inclusive, span.hi, shown))
+					}
+				};
 				merge(below, written)
 			}
 			Layer::Moved { from, to } => {
@@ -999,10 +1077,33 @@ impl Baseline {
 		}
 	}
 
+	/// The table's rows awaiting confirmation of a push of ours, in path order, a page at a time.
+	fn table_unconfirmed(&self) -> impl Iterator<Item = BaselineEntry> + '_ {
+		let mut after = String::new();
+		let mut page = Vec::new().into_iter();
+		let mut done = false;
+		std::iter::from_fn(move || {
+			loop {
+				if let Some(row) = page.next() {
+					return Some(row);
+				}
+				if done {
+					return None;
+				}
+				let read = self.table()?.unconfirmed_after(&after, PAGE);
+				done = read.len() < PAGE;
+				if let Some(last) = read.last() {
+					after.clone_from(&last.rel_path);
+				}
+				page = read.into_iter();
+			}
+		})
+	}
+
 	/// The rows of the view `depth` layers deep awaiting confirmation of a push of ours.
 	fn unconfirmed_in(&self, depth: usize) -> Vec<BaselineEntry> {
 		if depth == 0 {
-			return self.table().map(Snapshot::unconfirmed).unwrap_or_default();
+			return self.table_unconfirmed().collect();
 		}
 		let below = self.unconfirmed_in(depth - 1);
 		match self.layer(depth) {
@@ -1013,7 +1114,9 @@ impl Baseline {
 					below.iter().map(|row| row.rel_path.as_str()).collect();
 				let joined: Vec<BaselineEntry> = block
 					.agreed
-					.iter()
+					.held()
+					.into_iter()
+					.flatten()
 					.filter(|(path, agreed)| agreed.awaits && !listed.contains(path.as_str()))
 					.filter_map(|(path, _)| self.get_at(depth - 1, path))
 					.collect();
@@ -1064,7 +1167,9 @@ impl Baseline {
 					.any(BaselineEntry::awaits_confirmation)
 					|| block
 						.agreed
-						.iter()
+						.held()
+						.into_iter()
+						.flatten()
 						.any(|(path, agreed)| agreed.awaits && block.shows_below(path))
 					|| {
 						let below: Vec<String> = if depth == 1 {
@@ -1077,9 +1182,9 @@ impl Baseline {
 								.map(|row| row.rel_path)
 								.collect()
 						};
-						below.iter().any(|path| {
-							block.shows_below(path) && !block.agreed.contains_key(path.as_str())
-						})
+						below
+							.iter()
+							.any(|path| block.shows_below(path) && block.agreed.get(path).is_none())
 					}
 			}
 		}
@@ -1294,50 +1399,95 @@ impl Baseline {
 			.map_or(0, |snapshot| snapshot.count_under(root))
 	}
 
-	/// The rows awaiting confirmation of a push of ours. Empty on a converged pair.
+	/// The rows awaiting confirmation of a push of ours, in path order. Empty on a converged pair.
+	///
+	/// Read a page at a time off the table's index while the pass has edited nothing — which is
+	/// where every confirmation reads them, and on the pass after a whole-tree push the set is the
+	/// tree. Through the pass's edits, which nothing but the tests asks it through, it is read whole.
 	pub(super) fn unconfirmed(&self) -> impl Iterator<Item = BaselineEntry> + '_ {
-		self.unconfirmed_in(self.depth()).into_iter()
+		let rows: Rows<'_> = if self.depth() == 0 {
+			Box::new(self.table_unconfirmed())
+		} else {
+			let mut rows = self.unconfirmed_in(self.depth());
+			rows.sort_unstable_by(|a, b| a.rel_path.cmp(&b.rel_path));
+			Box::new(rows.into_iter())
+		};
+		rows
+	}
+
+	/// Up to `limit` of [`unconfirmed`](Self::unconfirmed)'s rows strictly after `after` (`""`: from
+	/// the first): its pages, for a caller that cannot hold the iterator between them — one that
+	/// awaits the server about each page.
+	pub(super) fn unconfirmed_page(&self, after: &str, limit: usize) -> Vec<BaselineEntry> {
+		if self.depth() == 0 {
+			return self
+				.table()
+				.map(|snapshot| snapshot.unconfirmed_after(after, limit))
+				.unwrap_or_default();
+		}
+		self.unconfirmed()
+			.filter(|row| row.rel_path.as_str() > after)
+			.take(limit)
+			.collect()
 	}
 
 	pub(super) fn any_unconfirmed(&self) -> bool {
 		self.any_unconfirmed_in(self.depth())
 	}
 
-	/// Advance the marker of every row awaiting confirmation that `confirms` accepts to the content
-	/// the row records — what a confirmation IS — and hand back each row as it now stands, for the
-	/// caller to persist. An edit to THIS view, like [`set_agreed`](Self::set_agreed), which it
-	/// is for a set of rows at once: the rows come from this view's own
-	/// [`unconfirmed`](Self::unconfirmed), so none is read back to be advanced.
-	pub(super) fn confirm_where(
-		&mut self,
-		mut confirms: impl FnMut(&BaselineEntry) -> bool,
-	) -> Vec<BaselineEntry> {
-		let rows: Vec<BaselineEntry> = self.unconfirmed().filter(|row| confirms(row)).collect();
-		if rows.is_empty() {
-			return rows;
+	/// Advance the marker of every row `confirmed` holds — rows this view's own
+	/// [`unconfirmed`](Self::unconfirmed) handed out, each as it stands confirmed (see
+	/// `plan::confirm_agreed`) — in THIS view: an edit, like [`move_subtree`](Self::move_subtree),
+	/// which a real pass persists itself and a dry run never does.
+	///
+	/// Staged confirmations become the view's bottom layer as they stand, read out of their stage
+	/// ([`Marks::Staged`]), on a view the pass has not edited — which is where a pass confirms,
+	/// before its fold moves anything — so they are keyed by the paths the table holds the rows at.
+	/// On a view already edited, which only a test confirms on, they are read into markers held one
+	/// by one instead.
+	pub(super) fn confirm(&mut self, confirmed: &Confirmed) {
+		if confirmed.is_empty() {
+			return;
 		}
-		let block = self.edits_mut().top_block();
-		rows.into_iter()
-			.map(|row| {
-				let agreed = row.content_hash;
-				if let Some(written) = block.written.get_mut(&row.rel_path) {
-					written.agreed_hash = agreed;
-					return written.clone();
-				}
-				let row = BaselineEntry {
-					agreed_hash: agreed,
-					..row
-				};
-				block.agreed.insert(
-					row.rel_path.clone(),
-					Agreed {
-						hash: agreed,
-						awaits: row.awaits_confirmation(),
-					},
-				);
-				row
+		if let Confirmed::Staged(staged) = confirmed
+			&& self.depth() == 0
+		{
+			self.edits_mut().layers.push(Layer::Block(Block {
+				agreed: Marks::Staged(Arc::clone(staged)),
+				..Block::default()
+			}));
+			return;
+		}
+		confirmed
+			.each_page(|rows| {
+				self.advance(rows);
+				Ok(())
 			})
-			.collect()
+			.unwrap_or_else(|error| {
+				panic!(
+					"reading the pass's staged confirmations failed: {error} — refusing to plan \
+					 without the markers they advanced"
+				)
+			});
+	}
+
+	/// Advance the marker of each of `rows` — this view's own, each as it stands confirmed — in the
+	/// top block.
+	fn advance(&mut self, rows: &[BaselineEntry]) {
+		let block = self.edits_mut().top_block();
+		for row in rows {
+			if let Some(written) = block.written.get_mut(&row.rel_path) {
+				written.agreed_hash = row.agreed_hash;
+				continue;
+			}
+			block.advance(
+				row.rel_path.clone(),
+				Agreed {
+					hash: row.agreed_hash,
+					awaits: row.awaits_confirmation(),
+				},
+			);
+		}
 	}
 
 	/// Whether any row records a remote item.
@@ -1516,8 +1666,8 @@ impl Baseline {
 	/// Advance the agreed-content marker of the row at `rel_path` in THIS view, and hand back the
 	/// row as it now stands. `None` when nothing is there. An edit, like
 	/// [`move_subtree`](Self::move_subtree). The engine confirms through
-	/// [`confirm_where`](Self::confirm_where); this is the tests' way of setting ANY marker, which is
-	/// what reaches the shapes a confirmation alone never makes.
+	/// [`confirm`](Self::confirm); this is the tests' way of setting ANY marker, which is what
+	/// reaches the shapes a confirmation alone never makes.
 	#[cfg(test)]
 	pub(super) fn set_agreed(
 		&mut self,
@@ -1534,7 +1684,7 @@ impl Baseline {
 			agreed_hash,
 			..current
 		};
-		block.agreed.insert(
+		block.advance(
 			rel_path.to_string(),
 			Agreed {
 				hash: agreed_hash,
@@ -1614,6 +1764,30 @@ impl ResidentTerms {
 	}
 }
 
+/// A pass's confirmations as the tests make them: by a predicate over every row, where a pass
+/// confirms a page of rows at a time.
+#[cfg(test)]
+mod test_support {
+	use super::{super::plan::confirm_agreed, Baseline, BaselineEntry};
+
+	impl Baseline {
+		/// Confirm every row awaiting confirmation that `confirms` accepts, and hand back each row as
+		/// it now stands: [`confirm`](Self::confirm) for a test that names the rows by a predicate.
+		pub(in super::super) fn confirm_where(
+			&mut self,
+			mut confirms: impl FnMut(&BaselineEntry) -> bool,
+		) -> Vec<BaselineEntry> {
+			let rows: Vec<BaselineEntry> = self
+				.unconfirmed()
+				.filter(|row| confirms(row))
+				.map(confirm_agreed)
+				.collect();
+			self.advance(&rows);
+			rows
+		}
+	}
+}
+
 #[cfg(test)]
 pub(super) mod tests {
 	use std::collections::BTreeSet;
@@ -1625,6 +1799,8 @@ pub(super) mod tests {
 	use super::{
 		super::{
 			baseline::{BaselineEntry, BaselineState, NodeKind},
+			plan::confirm_agreed,
+			stage::{ConfirmedRows, Stage},
 			tree::Tree,
 		},
 		*,
@@ -2080,6 +2256,36 @@ pub(super) mod tests {
 		}
 	}
 
+	/// A confirmation as a whole pass makes one of more rows than a window: every unconfirmed row
+	/// `takes` accepts, advanced to its own content, moved into `stage` and put into the view out of
+	/// it. The tree's form of it is one `set_agreed` per row. Whether it confirmed anything.
+	fn confirm_staged(
+		view: &mut Baseline,
+		oracle: &mut Tree,
+		takes: impl Fn(&BaselineEntry) -> bool,
+		stage: Stage,
+	) -> bool {
+		let mut stage = Some(stage);
+		let mut confirmed = ConfirmedRows::new(0);
+		for row in view.unconfirmed().filter(|row| takes(row)) {
+			confirmed
+				.push(confirm_agreed(row), || {
+					Ok(stage.take().expect("one stage per confirmation"))
+				})
+				.expect("staging a confirmed row");
+		}
+		let confirmed = confirmed.finish().expect("staging the confirmed rows");
+		view.confirm(&confirmed);
+		for row in oracle
+			.unconfirmed()
+			.filter(|row| takes(row))
+			.collect::<Vec<_>>()
+		{
+			oracle.set_agreed(&row.rel_path, row.content_hash);
+		}
+		matches!(confirmed, Confirmed::Staged(_))
+	}
+
 	/// How many layers the view's edits have, and whether the top one is a mapped move.
 	fn layers(view: &Baseline) -> (usize, bool) {
 		view.edits.as_deref().map_or((0, false), |edits| {
@@ -2112,12 +2318,20 @@ pub(super) mod tests {
 			&everything,
 		);
 		let (mut mapped, mut written, mut confirms, mut deepest) = (0, 0, 0, 0);
+		let mut staged = 0;
 		for (seeds, steps) in [(0..60, 8), (1000..1020, 24)] {
 			for seed in seeds {
 				let mut rng = StdRng::seed_from_u64(seed);
 				let mut view = Baseline::from_rows(rows.clone());
 				let mut oracle = Tree::from_rows(rows.clone());
 				let mut probes = everything.clone();
+				// A whole pass's confirmation past its window, read out of its stage as the bottom
+				// layer, under everything the sequence then stacks on it.
+				let (_stage_dir, stage) = Stage::in_temp_dir();
+				if seed % 3 == 0 && confirm_staged(&mut view, &mut oracle, |_| true, stage) {
+					staged += 1;
+					assert_alike(&format!("seed {seed} staged"), &view, &oracle, &probes);
+				}
 				for step in 0..steps {
 					let (before, _) = layers(&view);
 					let (what, moved) =
@@ -2146,9 +2360,9 @@ pub(super) mod tests {
 		// Both kinds of move, and views many layers deep, or the comparison above proved less than it
 		// says.
 		assert!(
-			mapped > 150 && written > 100 && confirms > 100 && deepest >= 8,
-			"{mapped} mapped move(s), {written} written, {confirms} confirmation(s), {deepest} \
-			 layer(s) at most"
+			mapped > 150 && written > 100 && confirms > 100 && deepest >= 8 && staged > 20,
+			"{mapped} mapped move(s), {written} written, {confirms} confirmation(s), {staged} \
+			 staged, {deepest} layer(s) at most"
 		);
 	}
 
@@ -2230,6 +2444,55 @@ pub(super) mod tests {
 		);
 		assert_eq!(before.iter().collect::<Vec<_>>(), rows);
 		assert!(!pass.contains_key("docs/a.txt") && pass.contains_key("moved/a.txt"));
+	}
+
+	/// A staged confirmation of more markers than the stage reads a page — every other row of a
+	/// directory larger than that — reads as markers held one by one do, through a walk across the
+	/// stage's page boundaries, lookups in and out of order, and a move of part of it on top.
+	#[test]
+	fn a_staged_confirmation_answers_across_its_page_boundaries() {
+		let mut rows = vec![dir("big"), dir("big/moved"), file("other.txt", 3)];
+		for n in 0..2600 {
+			let at = if n % 5 == 0 { "big/moved" } else { "big" };
+			rows.push(BaselineEntry {
+				agreed_hash: None,
+				..file(&format!("{at}/{n:05}.txt"), 1)
+			});
+		}
+		let mut view = Baseline::from_rows(rows.clone());
+		let mut oracle = Tree::from_rows(rows);
+		let (_stage_dir, stage) = Stage::in_temp_dir();
+		assert!(confirm_staged(
+			&mut view,
+			&mut oracle,
+			|row| !row.rel_path.ends_with("3.txt"),
+			stage
+		));
+		let probes = probes(
+			[
+				"big/00001.txt",
+				"big/00003.txt",
+				"big/moved/00005.txt",
+				"big/02598.txt",
+				"elsewhere/00005.txt",
+			]
+			.map(String::from),
+		);
+		assert_alike("staged", &view, &oracle, &probes);
+		// Every row, by lookup: backwards, which reads a row a statement, then forwards.
+		let paths: Vec<String> = oracle.paths().collect();
+		for path in paths.iter().rev().chain(&paths) {
+			assert_eq!(view.get(path), oracle.get(path), "{path}");
+		}
+		view.move_subtree("big/moved", "elsewhere");
+		oracle.move_subtree("big/moved", "elsewhere");
+		assert_alike("staged, then moved", &view, &oracle, &probes);
+		// A second staged confirmation, of the rest, over a view already edited: read into markers
+		// held one by one, above the move.
+		let (_rest_dir, rest) = Stage::in_temp_dir();
+		assert!(confirm_staged(&mut view, &mut oracle, |_| true, rest));
+		assert!(!view.any_unconfirmed());
+		assert_alike("staged, moved, staged again", &view, &oracle, &probes);
 	}
 
 	/// A page boundary falls inside every range the reader pages over: more rows than a page under

@@ -6,9 +6,10 @@
 
 use std::{
 	borrow::Cow,
-	collections::{BTreeMap, BTreeSet, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	hash::Hash,
 	mem,
+	num::NonZeroUsize,
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	sync::{
@@ -28,8 +29,8 @@ use super::{
 	Backlog, SyncEvent, SyncMode,
 	apply::{self, ApplyContext, PlannedEntry, SyncReport},
 	baseline::{
-		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
-		PathFailure, PendingRow, SyncedPaths,
+		BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord, PathFailure,
+		PendingRow, SyncedPaths,
 	},
 	changes::{DIRTY_CAP, FullPassReason, PairChanges, PassScope, RemoteDeltaEntry, past_cap},
 	derive,
@@ -50,7 +51,7 @@ use super::{
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	side::{Nodes, NodesAt, Side, SideRef},
-	stage::{self, Rows, Screen, ScreenError, Stage, StagedPlan},
+	stage::{self, Confirmed, Rows, Screen, ScreenError, Stage, StagedPlan},
 };
 use crate::{
 	Error, ErrorKind,
@@ -445,6 +446,15 @@ impl Observations {
 		self.state().minted.contains_key(&uuid)
 	}
 
+	/// Drop the push records of `decided`, a page of a pass's persisted confirmations at a time;
+	/// [`forget_pushes`](Self::forget_pushes) once they are all dropped hands their memory back.
+	fn drop_pushes(&self, decided: impl IntoIterator<Item = Uuid>) {
+		let mut state = self.state();
+		for uuid in decided {
+			state.drop_push(uuid);
+		}
+	}
+
 	/// Forget the push records a pass has finished with, and any that no pass will ever read again.
 	fn forget_pushes(&self, decided: &[Uuid], now: Instant) {
 		let mut state = self.state();
@@ -670,22 +680,23 @@ fn observation_callback(
 	})
 }
 
-/// Read what the cache's announcements say about every unconfirmed push in `unconfirmed` — the rows
-/// [`Baseline::unconfirmed`] hands out, read once by the caller: the version uuids they confirm, and
-/// the rows (`rel_path`, ours, the foreign version at the path) they say nothing about that are
-/// worth asking the server about.
+/// Read what the cache's announcements say about every unconfirmed push in `unconfirmed` — rows
+/// [`Baseline::unconfirmed`] hands out, a page of them at a time (see [`SyncEngine::confirm`]): the
+/// version uuids they confirm, and the rows (`rel_path`, ours, the foreign version `view` holds at
+/// the path) they say nothing about that are worth asking the server about. `view` is what the
+/// evidence reads ([`Evidence::view`]); `None` has nothing to ask about.
 ///
 /// Purely a READ of the observations. The records it consulted stay put, because the caller may be
 /// a dry run: [`SyncEngine::plan_pair`] reaches this through `prepare` and persists nothing, and a
 /// record dropped there would leave the pass that follows with no evidence at all that the push was
 /// ever confirmed. Only the callers that write the advanced rows retire the records
 /// ([`Observations::forget_pushes`]).
-fn observed_confirmations(
+fn observed_confirmations<'r>(
 	observed: &Observations,
-	unconfirmed: &[BaselineEntry],
-	raw_remote: &impl NodesAt<Node = RemoteNode>,
+	unconfirmed: impl IntoIterator<Item = &'r BaselineEntry>,
+	view: Option<&SideRef<'_, RemoteNode>>,
 	now: Instant,
-) -> (std::collections::HashSet<Uuid>, Vec<(String, Uuid, Uuid)>) {
+) -> (std::collections::HashSet<Uuid>, Vec<ChainQuestion>) {
 	let mut confirmed = std::collections::HashSet::new();
 	// rel_path is only for the log; the lookup runs on the foreign version sitting at it.
 	let mut ask_server = Vec::new();
@@ -702,7 +713,7 @@ fn observed_confirmations(
 			// Nothing observed. Worth a round trip only where the answer changes this pass:
 			// a foreign version of the same file already sitting at the row's path.
 			PushVerdict::Unknown => {
-				if let Some(node) = raw_remote.at(rel_path)
+				if let Some(node) = view.and_then(|view| view.at_row(entry))
 					&& node.remote_uuid != ours
 					&& node.stable_uuid.is_some()
 					&& node.stable_uuid == entry.remote_stable_uuid
@@ -713,6 +724,207 @@ fn observed_confirmations(
 		}
 	}
 	(confirmed, ask_server)
+}
+
+/// What a confirmation reads besides the cache's announcements (see [`SyncEngine::confirm`]).
+///
+/// It holds the pass's remote side for as long as the confirmation reads it, which is on a blocking
+/// thread, and [`put_back`](Self::put_back) returns the side to the pass.
+pub(super) enum Evidence {
+	/// A whole pass's RAW snapshot, read before this engine's own writes are folded into it: it
+	/// confirms a row by listing the row's own version at its path ([`plan::snapshot_confirms`]),
+	/// and a foreign version of the same file there is what the version chain is asked about.
+	Snapshot(Side<RemoteNode>),
+	/// A change-scoped pass's view. Never rule (c): that would confirm rows against a view derived
+	/// from those very rows (I6). What this still costs is a confirmation delayed to the next whole
+	/// pass, never one granted early — the verdicts come from announcements, and the view is only
+	/// read to spot a FOREIGN version at a row's path.
+	Derived(Side<RemoteNode>),
+	/// No view at all, between passes: the announcements alone, so nothing asks the server either.
+	Announcements,
+}
+
+impl Evidence {
+	/// The view to read: a derived side against `rows`, the rows it derives from, and a snapshot
+	/// against `no_rows`, an empty tree — it derives nothing, so that is exact.
+	fn view<'v>(
+		&'v self,
+		rows: &'v Baseline,
+		no_rows: &'v Baseline,
+	) -> Option<SideRef<'v, RemoteNode>> {
+		match self {
+			Self::Snapshot(side) => Some(side.of(no_rows)),
+			Self::Derived(side) => Some(side.of(rows)),
+			Self::Announcements => None,
+		}
+	}
+
+	/// Return the side this evidence read to `nodes`, which lent it.
+	pub(super) fn put_back(self, nodes: &mut Side<RemoteNode>) {
+		if let Self::Snapshot(side) | Self::Derived(side) = self {
+			*nodes = side;
+		}
+	}
+}
+
+/// A row worth asking the server's version chain about (see [`observed_confirmations`]): its path,
+/// for the log, our version, and the foreign version at the path.
+type ChainQuestion = (String, Uuid, Uuid);
+
+/// A page of unconfirmed rows a confirmation has read (see [`Confirming::page`]).
+struct ReadPage {
+	/// Each row, with whether the snapshot lists it.
+	rows: Vec<(BaselineEntry, bool)>,
+	/// The versions the announcements vouched for.
+	vouched: HashSet<Uuid>,
+}
+
+/// A confirmation of the pushes of ours `baseline` holds unconfirmed (see [`SyncEngine::confirm`]),
+/// between the pages it reads: what it has confirmed, and where it has got to. It owns everything it
+/// reads, so a page is read and staged on a blocking thread while the server is asked about the
+/// page before it on the runtime's.
+pub(super) struct Confirming<S> {
+	baseline: Baseline,
+	evidence: Evidence,
+	observed: Arc<Observations>,
+	/// Makes the stage the confirmed rows move into past a window of them.
+	stage: S,
+	confirmed: stage::ConfirmedRows,
+	window: usize,
+	now: Instant,
+	/// The path the next page starts after; `None` once a page came back short, as the last does.
+	after: Option<String>,
+	/// The page read last, while the server is asked about it.
+	asking: Option<ReadPage>,
+	/// The versions the server's chain vouched for so far: one per lookup it answered yes to.
+	chained: HashSet<Uuid>,
+}
+
+impl<S: FnMut() -> Result<Stage, Error>> Confirming<S> {
+	pub(super) fn new(
+		baseline: Baseline,
+		evidence: Evidence,
+		observed: Arc<Observations>,
+		stage: S,
+		window: NonZeroUsize,
+	) -> Self {
+		Self {
+			baseline,
+			evidence,
+			observed,
+			stage,
+			confirmed: stage::ConfirmedRows::new(window.get()),
+			window: window.get(),
+			now: Instant::now(),
+			after: Some(String::new()),
+			asking: None,
+			chained: HashSet::new(),
+		}
+	}
+
+	/// Stage the page read last, then read the next one and stage what the evidence vouches for in
+	/// it. Its rows worth asking the server about come back instead, and the page waits for the
+	/// answer, which the caller adds to [`chained`](Self::chained) before the next call stages it.
+	/// `None` once every page is read and staged.
+	fn page(&mut self) -> Result<Option<Vec<ChainQuestion>>, Error> {
+		if let Some(page) = self.asking.take() {
+			self.stage_page(page)?;
+		}
+		let Some(after) = &self.after else {
+			return Ok(None);
+		};
+		let page = self.baseline.unconfirmed_page(after, self.window);
+		// Owned: the cursor outlives the page, whose rows are staged.
+		self.after = page
+			.last()
+			.filter(|_| page.len() == self.window)
+			.map(|last| last.rel_path.clone());
+		if page.is_empty() {
+			return Ok(None);
+		}
+		let no_rows = Baseline::default();
+		let view = self.evidence.view(&self.baseline, &no_rows);
+		let listed: Vec<bool> = page
+			.iter()
+			.map(|row| {
+				matches!(self.evidence, Evidence::Snapshot(_))
+					&& plan::snapshot_confirms(
+						view.as_ref().and_then(|view| view.at_row(row)).as_deref(),
+						row,
+					)
+			})
+			.collect();
+		let rest = page
+			.iter()
+			.zip(&listed)
+			.filter(|(_, listed)| !**listed)
+			.map(|(row, _)| row);
+		let (vouched, ask_server) =
+			observed_confirmations(&self.observed, rest, view.as_ref(), self.now);
+		let page = ReadPage {
+			rows: page.into_iter().zip(listed).collect(),
+			vouched,
+		};
+		if ask_server.is_empty() {
+			self.stage_page(page)?;
+		} else {
+			self.asking = Some(page);
+		}
+		Ok(Some(ask_server))
+	}
+
+	/// Stage each row of `page` the snapshot lists, or whose version the announcements or the
+	/// server's chain vouched for.
+	fn stage_page(&mut self, ReadPage { rows, mut vouched }: ReadPage) -> Result<(), Error> {
+		vouched.extend(&self.chained);
+		for (row, listed) in rows {
+			if listed || plan::push_vouched(&vouched, &row) {
+				self.confirmed
+					.push(plan::confirm_agreed(row), &mut self.stage)?;
+			}
+		}
+		Ok(())
+	}
+
+	/// The rows confirmed, once [`page`](Self::page) has staged every page, with the evidence for
+	/// the pass to take its side back from. A version the chain vouched for after the page of a row
+	/// carrying it was staged confirms that row on a second read of the rows, which runs only when
+	/// the server vouched for anything.
+	fn finish(mut self) -> Result<(Confirmed, Evidence), Error> {
+		if !self.chained.is_empty() {
+			let mut after = String::new();
+			loop {
+				let page = self.baseline.unconfirmed_page(&after, self.window);
+				let Some(last) = page.last() else {
+					break;
+				};
+				after.clone_from(&last.rel_path);
+				let full = page.len() == self.window;
+				for row in page {
+					if plan::push_vouched(&self.chained, &row)
+						&& !self.confirmed.holds(&row.rel_path)?
+					{
+						self.confirmed
+							.push(plan::confirm_agreed(row), &mut self.stage)?;
+					}
+				}
+				if !full {
+					break;
+				}
+			}
+		}
+		Ok((self.confirmed.finish()?, self.evidence))
+	}
+}
+
+/// [`SyncEngine::confirm`] on this thread, with no server to ask: a row worth asking about stays as
+/// the announcements left it. What the probe and the tests measure a confirmation by.
+#[cfg(any(test, feature = "bench-internals"))]
+pub(super) fn confirm_here<S: FnMut() -> Result<Stage, Error>>(
+	mut confirming: Confirming<S>,
+) -> Result<(Confirmed, Evidence), Error> {
+	while confirming.page()?.is_some() {}
+	confirming.finish()
 }
 
 /// Remote writes this engine made recently. The apply layer records every item it creates or
@@ -1340,9 +1552,9 @@ where
 }
 
 /// Run `work` on a blocking thread, for what a pass does to its own stages and rows whose cost
-/// scales with the tree — the reconcile and the screening — as [`off_store`] runs the store's.
-/// `work` owns what it reads and hands back whatever the pass still needs. A panic in it is the
-/// pass's error, which `what` names.
+/// scales with the tree — the reconcile, the screening and the confirmation — as [`off_store`] runs
+/// the store's. `work` owns what it reads and hands back whatever the pass still needs. A panic in
+/// it is the pass's error, which `what` names.
 async fn off_runtime<T>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> Result<T, Error>
 where
 	T: Send + 'static,
@@ -2075,10 +2287,10 @@ struct Prepared {
 	/// The ignored roots the pair's previous pass recorded (see
 	/// [`ignored_roots_to_record`](Self::ignored_roots_to_record)).
 	last_ignored: BTreeSet<String>,
-	/// Baseline rows whose agreed-content marker this pass's raw snapshot advanced (see
-	/// [`plan::confirm_agreed_content`]). Already applied to `baseline`, so planning reads them
-	/// either way; a real pass persists them, a dry run writes nothing.
-	confirmed: Vec<BaselineEntry>,
+	/// Baseline rows whose agreed-content marker this pass advanced (see
+	/// [`SyncEngine::confirm`]). Already applied to `baseline`, so planning reads them either way;
+	/// a real pass persists them, a dry run writes nothing.
+	confirmed: Confirmed,
 }
 
 impl Prepared {
@@ -3393,13 +3605,21 @@ impl SyncEngine {
 		}
 	}
 
-	/// Retire the confirmation gap this engine's own pushes leave, from the evidence a snapshot
-	/// listing our version at its path ([`plan::confirm_agreed_content`]) cannot supply.
+	/// Confirm every push of ours `baseline` holds unconfirmed that the evidence vouches for, and
+	/// hand back the rows that moved, each as it now stands, for the caller to put into its view of
+	/// the rows ([`Baseline::confirm`]) and to persist — and to retire their push records with
+	/// ([`Observations::forget_pushes`]) once it has — along with the evidence, whose side the
+	/// caller takes back ([`Evidence::put_back`]). Reading a verdict does not consume it: `prepare`
+	/// runs for [`plan_pair`](Self::plan_pair) too, which writes nothing.
 	///
-	/// Two sources, cheapest first:
+	/// A row is confirmed by any of, cheapest first:
+	/// - rule (c), on a whole pass's raw snapshot only ([`plan::snapshot_confirms`]): the snapshot
+	///   lists the row's own version at its path. It must be the RAW snapshot: a view with this
+	///   engine's own writes folded in shows our version at its own path and would confirm every
+	///   push against itself.
 	/// - the cache's announcements. A version of ours that stood as the remote head for
-	///   [`CONFIRM_TENURE`] before anything superseded it is content both sides held, whether or
-	///   not a pass ever happened to run while it was the head. This is what confirms the backlog a
+	///   [`CONFIRM_TENURE`] before anything superseded it is content both sides held, whether or not
+	///   a pass ever happened to run while it was the head. This is what confirms the backlog a
 	///   PAUSED pair accumulated: no pass runs, so nothing else ever could.
 	/// - the server's version chain, for a row the announcements say nothing about (this engine was
 	///   restarted, or the announcement never arrived) whose path now carries a foreign version of
@@ -3407,22 +3627,68 @@ impl SyncEngine {
 	///   row, and only for a row that is actually about to be reconciled against a foreign version;
 	///   a lookup that fails leaves the row unconfirmed, exactly as before.
 	///
-	/// Returns the rows that moved, for the caller to persist — and to retire their push records
-	/// with ([`Observations::forget_pushes`]) once it has. Reading a verdict does not consume it:
-	/// `prepare` runs for [`plan_pair`](Self::plan_pair) too, which writes nothing.
+	/// The last two vouch for a version uuid, and every unconfirmed row carrying it is confirmed
+	/// ([`plan::push_vouched`]).
 	///
-	/// `raw_remote` must be the RAW snapshot: a view with this engine's own writes folded in shows
-	/// our version at its own path and would confirm every push against itself.
-	async fn confirm_pushes(
+	/// `window` rows at a time: the rows are read a page at a time, asked about, and what the
+	/// evidence accepts is added to the confirmed rows ([`stage::ConfirmedRows`]), which move into
+	/// a stage of the pass's own past a window of them. On the pass after a whole-tree push the
+	/// unconfirmed rows are the tree, so held whole they were the tree in memory — twice over, the
+	/// rows and the markers. A version the chain vouches for after the page of a row carrying it
+	/// was asked about confirms that row on a second read of the rows, which runs only when the
+	/// server vouched for anything.
+	///
+	/// Each page is read and staged on a blocking thread (see [`Confirming`]), and only the
+	/// server's chain is asked on the caller's: on that same pass, reading and staging the tree's
+	/// rows takes seconds.
+	async fn confirm(
 		&self,
-		baseline: &mut Baseline,
-		unconfirmed: &[BaselineEntry],
-		raw_remote: &impl NodesAt<Node = RemoteNode>,
-	) -> Vec<BaselineEntry> {
-		let (mut confirmed, ask_server) =
-			observed_confirmations(&self.observed, unconfirmed, raw_remote, Instant::now());
+		pair: PairId,
+		baseline: &Baseline,
+		evidence: Evidence,
+		window: NonZeroUsize,
+	) -> Result<(Confirmed, Evidence), Error> {
+		let at = self.stage_at(pair);
+		let mut confirming = Confirming::new(
+			// Shares the snapshot and the pass's edits, for the blocking threads to read.
+			baseline.clone(),
+			evidence,
+			Arc::clone(&self.observed),
+			// The path is cloned so the maker can be called again; a confirmation stages its rows
+			// once at most, past its window.
+			move || Stage::create(at.clone()),
+			window,
+		);
+		loop {
+			let asking;
+			(confirming, asking) = off_runtime("confirming this engine's pushes", move || {
+				let asking = confirming.page();
+				(confirming, asking)
+			})
+			.await?;
+			let Some(asking) = asking? else {
+				break;
+			};
+			if !asking.is_empty() {
+				let vouched = self.date_by_version_chain(asking).await;
+				confirming.chained.extend(vouched);
+			}
+		}
+		off_runtime("confirming this engine's pushes", move || {
+			confirming.finish()
+		})
+		.await?
+	}
 
-		// The foreign versions this dates our pushes against, read whole in one go.
+	/// The version uuids of ours the server's version chain vouches for, out of `ask_server` —
+	/// `(rel_path, ours, the foreign version at the path)` per row the announcements say nothing
+	/// about (see [`observed_confirmations`]). A page's worth at a time: the foreign versions are
+	/// read whole in one go, then each chain is one lookup.
+	async fn date_by_version_chain(&self, ask_server: Vec<(String, Uuid, Uuid)>) -> HashSet<Uuid> {
+		let mut confirmed = HashSet::new();
+		if ask_server.is_empty() {
+			return confirmed;
+		}
 		let foreign = self
 			.hydrate_files(ask_server.iter().map(|(_, _, uuid)| *uuid).collect())
 			.await;
@@ -3460,8 +3726,7 @@ impl SyncEngine {
 				),
 			}
 		}
-
-		plan::confirm_agreed_pushes(baseline, &confirmed)
+		confirmed
 	}
 
 	/// Ask the server which version is current at the path of a pending create whose snapshot shows
@@ -3540,54 +3805,73 @@ impl SyncEngine {
 
 	/// Advance what the cache's announcements have confirmed since the last pass, and persist it.
 	///
-	/// The announcement half of [`confirm_pushes`](Self::confirm_pushes) alone: with no snapshot
-	/// there is no foreign version to date a push against, so nothing here talks to the server.
-	/// A pass does this itself; this is for the stretches where none runs.
+	/// [`confirm`](Self::confirm) on the announcements alone: with no snapshot there is no foreign
+	/// version to date a push against, so nothing here talks to the server. A pass does this
+	/// itself; this is for the stretches where none runs.
 	async fn sweep_confirmations(&self, pair: PairId) -> Result<(), Error> {
 		let store = self.pair_store(pair).await?;
-		let mut baseline = off_store(&store, move |store| store.baseline(pair))
+		let baseline = off_store(&store, move |store| store.baseline(pair))
 			.await?
 			.map_err(|e| db_error(e, "loading the baseline"))?;
 		// A pair with nothing awaiting confirmation is the steady state, and the sweep runs in the
 		// stretches where no pass does: it must not read a row to find that out. The
-		// gate `prepare` uses, and the filter all three confirmation steps already apply.
+		// gate `prepare` uses, and the filter every confirmation step already applies.
 		if !baseline.any_unconfirmed() {
 			return Ok(());
 		}
-		let unconfirmed: Vec<BaselineEntry> = baseline.unconfirmed().collect();
-		let advanced = self
-			.confirm_pushes(&mut baseline, &unconfirmed, &HashMap::new())
-			.await;
+		let (advanced, _) = self
+			.confirm(pair, &baseline, Evidence::Announcements, stage::WINDOW)
+			.await?;
+		// Its read transaction ends here, not after the write below: nothing reads the rows again.
+		drop(baseline);
 		if advanced.is_empty() {
 			return Ok(());
 		}
-		// The rows come back out of the closure: the push records they retire are named by them.
-		let advanced = off_store(&store, move |store| {
-			for entry in &advanced {
-				store
-					.upsert_entry(pair, entry)
-					.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
-			}
-			Ok::<_, Error>(advanced)
-		})
-		.await??;
-		self.forget_settled_pushes(&advanced);
-		Ok(())
+		self.persist_confirmed(pair, &store, advanced).await
 	}
 
-	/// Retire the push records of rows this caller has just PERSISTED as agreed — the ones a
-	/// snapshot listed at their own path as well as the ones a tenure dated — plus any record no
-	/// pass will ever read again (see [`PUSH_RECORD_TTL`]).
+	/// Write the rows a confirmation advanced into the store in ONE transaction, read out of where
+	/// it put them a page at a time — and only then retire the push records they name, plus any
+	/// record no pass will ever read again (see [`PUSH_RECORD_TTL`]).
 	///
-	/// Only a caller that wrote the rows may do this. The record is the only evidence a push was
-	/// ever confirmed, and dropping it without recording what it proved leaves the next pass
-	/// reading the row as an unconfirmed push again — with a foreign edit on top, a false conflict.
-	fn forget_settled_pushes(&self, persisted: &[BaselineEntry]) {
-		let decided: Vec<Uuid> = persisted
-			.iter()
-			.filter_map(|entry| entry.remote_uuid)
-			.collect();
-		self.observed.forget_pushes(&decided, Instant::now());
+	/// One transaction for the lot: the pass after a first sync confirms every row it pushed, and a
+	/// transaction per row is a transaction per item of the tree — which is also why it does not run
+	/// on a runtime thread. The records go only once the rows are written: a record is the only
+	/// evidence a push was ever confirmed, and dropping it without recording what it proved leaves
+	/// the next pass reading the row as an unconfirmed push again — with a foreign edit on top, a
+	/// false conflict.
+	async fn persist_confirmed(
+		&self,
+		pair: PairId,
+		store: &SharedStore,
+		confirmed: Confirmed,
+	) -> Result<(), Error> {
+		if confirmed.is_empty() {
+			self.observed.forget_pushes(&[], Instant::now());
+			return Ok(());
+		}
+		let observed = Arc::clone(&self.observed);
+		off_store(store, move |store| {
+			store
+				.upsert_streamed(pair, |put| {
+					confirmed.each_page(|rows| rows.iter().try_for_each(&mut *put))
+				})
+				.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
+			// The rows are written, so a record this cannot read back to drop is only memory kept:
+			// it goes with the push record TTL, and the pass carries on.
+			if let Err(error) = confirmed.each_page(|rows| {
+				observed.drop_pushes(rows.iter().filter_map(|row| row.remote_uuid));
+				Ok(())
+			}) {
+				tracing::warn!(
+					"sync_once[pair {pair}]: could not read back the confirmed rows to retire their \
+					 push records, which now wait out their TTL: {error}"
+				);
+			}
+			observed.forget_pushes(&[], Instant::now());
+			Ok::<_, Error>(())
+		})
+		.await?
 	}
 
 	/// Read the remote `.filenignore` files `record`'s mode takes rules from (see
@@ -3982,33 +4266,19 @@ impl SyncEngine {
 		facts.observe_local(&observations);
 		super::step("facts_merge");
 
-		// Tenure and the server's version chain ONLY, never `confirm_agreed_content`: that would
-		// confirm rows against a view derived from those very rows (I6). What this still costs is a
-		// confirmation delayed to the next whole pass, never one granted early — the verdicts come
-		// from announcements, and the view is only read to spot a FOREIGN version at a row's path.
-		let mut confirmed = Vec::new();
+		// Tenure and the server's version chain ONLY, never rule (c) (see `Evidence::Derived`).
+		let mut confirmed = Confirmed::default();
 		if inputs.baseline.any_unconfirmed() {
-			// Read BEFORE the rows are borrowed mutably: a change-scoped view derives its nodes
-			// from those very rows, so it cannot be read across the confirmation's writes. Only
-			// the unconfirmed rows' own paths are looked up — `observed_confirmations` asks about
-			// no other — so this is the per-push work the confirmation already was, never the tree.
-			// Read once for both: each is a seek into the table per row off a partial index, and
-			// the carried view's node at a row's path is that very row's.
-			let unconfirmed: Vec<BaselineEntry> = inputs.baseline.unconfirmed().collect();
-			let at_unconfirmed: HashMap<String, RemoteNode> = {
-				let nodes = view.nodes.of(&inputs.baseline);
-				unconfirmed
-					.iter()
-					.filter_map(|row| {
-						nodes
-							.at_row(row)
-							.map(|node| (row.rel_path.clone(), node.into_owned()))
-					})
-					.collect()
-			};
-			confirmed = self
-				.confirm_pushes(&mut inputs.baseline, &unconfirmed, &at_unconfirmed)
-				.await;
+			// Read off the rows unedited, and put into them once read: a change-scoped view derives
+			// its nodes from those very rows, so it cannot be read across the confirmation's edits.
+			// Only the unconfirmed rows' own paths are looked up, each against the row in hand, so
+			// this is the per-push work the confirmation already was, never the tree.
+			let lent = Evidence::Derived(mem::replace(&mut view.nodes, Side::carried()));
+			let (rows, lent) = self
+				.confirm(pair, &inputs.baseline, lent, stage::WINDOW)
+				.await?;
+			lent.put_back(&mut view.nodes);
+			confirmed = rows;
 		}
 		super::step("confirm_pushes");
 
@@ -4075,9 +4345,9 @@ impl SyncEngine {
 		// key the reconcile never visits is one nothing is planned or reported at.
 		//
 		// What the fallback re-does: `pending.settle` and `retire_superseded_creates` have already
-		// run, and the `confirmed` rows this pass advanced are dropped. A whole pass redoes all
-		// three against a real snapshot, which is the stricter evidence anyway — the cost is one
-		// wasted settle/retire round trip and a confirmation deferred by a pass.
+		// run, and the `confirmed` rows this pass found are dropped before they reach its view of
+		// the rows. A whole pass redoes all three against a real snapshot, which is the stricter
+		// evidence anyway — the cost is one wasted settle/retire round trip.
 		if let Some(key) = unaccounted_key(
 			&inputs.baseline,
 			&derived.local,
@@ -4095,6 +4365,9 @@ impl SyncEngine {
 			));
 		}
 		super::step("decided_check");
+		// Past the last fallback to a whole read, which starts from the rows as the store holds them
+		// and confirms on them itself: nothing before here reads a row's agreed content.
+		inputs.baseline.confirm(&confirmed);
 		holds.held_remote = view.held_paths.clone();
 		self.observed.prune_before(self.pending.oldest_stamp());
 
@@ -4234,23 +4507,21 @@ impl SyncEngine {
 		let remote_converged = watermark.is_some();
 
 		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
-		// view — before this engine's own writes are folded into it, and before the baseline is
-		// shared (immutably) with the scan. A row the snapshot confirms is one both sides
-		// demonstrably hold, which is what a later foreign edit is measured against.
-		// Asked before the map is touched: the confirmation advances the rows an unconfirmed push
-		// left behind, and a pair with none — the steady state — must not read a row to find that
-		// out.
-		let mut confirmed = Vec::new();
+		// view — before this engine's own writes are folded into it. A row the snapshot confirms is
+		// one both sides demonstrably hold, which is what a later foreign edit is measured against.
+		// Asked before a row is read: the confirmation advances the rows an unconfirmed push left
+		// behind, and a pair with none — the steady state — must not read a row to find that out.
+		let mut confirmed = Confirmed::default();
 		if baseline.any_unconfirmed() {
-			// A STAGED view, whose backing derives nothing — so reading it against an empty tree is
-			// exact, and leaves the rows free to be borrowed mutably beside it.
-			let no_rows = Baseline::default();
-			let raw = view.nodes.of(&no_rows);
-			confirmed = plan::confirm_agreed_content(&mut baseline, &raw);
-			// Read after the confirmation above, whose edits take rows out of the set.
-			let unconfirmed: Vec<BaselineEntry> = baseline.unconfirmed().collect();
-			confirmed.extend(self.confirm_pushes(&mut baseline, &unconfirmed, &raw).await);
+			let lent = Evidence::Snapshot(mem::replace(&mut view.nodes, Side::carried()));
+			let (rows, lent) = self.confirm(pair, &baseline, lent, stage::WINDOW).await?;
+			lent.put_back(&mut view.nodes);
+			confirmed = rows;
 		}
+		// The scan reads a row's kind, size, mtime and hash, none of which a confirmation changes, so
+		// it reads the rows as the pass found them: its walk of the tree reads no marker.
+		let scan_baseline = baseline.clone();
+		baseline.confirm(&confirmed);
 		let baseline = baseline;
 
 		// `set_user_ignore` refuses a text that does not compile, so a stored one fails only if this
@@ -4274,7 +4545,6 @@ impl SyncEngine {
 			remote_rules.errors.push(error.to_string());
 		}
 		let local_root = PathBuf::from(&record.local_root);
-		let scan_baseline = baseline.clone();
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
 		// `.filenignore` files on disk, over any remote copy read for the same directory. A mode that
 		// pulls alone reads on disk only the synced ones the remote has lost: they govern until that
@@ -5457,28 +5727,12 @@ impl SyncEngine {
 		let read_cost = read_started.elapsed();
 		let mut prep = prepared?;
 		let store = self.pair_store(pair).await?;
-		// Persist what this pass confirmed. Only a real pass writes it: `plan_pair` stays a pure
-		// read, so a dry run inside the confirmation window just leaves it for the next pass — and
-		// leaves the evidence with it, which is why the records are retired HERE and not in the
-		// reading step.
-		let confirmed = mem::take(&mut prep.confirmed);
-		let confirmed = if confirmed.is_empty() {
-			confirmed
-		} else {
-			// One transaction for the lot: pass two of a first sync confirms every row it pushed,
-			// and a transaction per row is a transaction per item of the tree — which is also why
-			// it does not run on a runtime thread. The rows come back out of the closure, since
-			// the push records they retire are named by them.
-			let (written, confirmed) = off_store(&store, move |store| {
-				let changes: Vec<BaselineChange<'_>> =
-					confirmed.iter().map(BaselineChange::Upsert).collect();
-				(store.apply_changes(pair, &changes), confirmed)
-			})
+		// Persist what this pass confirmed, before anything is reconciled. Only a real pass writes
+		// it: `plan_pair` stays a pure read, so a dry run inside the confirmation window just leaves
+		// it for the next pass — and leaves the evidence with it, which is why the records are
+		// retired HERE and not in the reading step.
+		self.persist_confirmed(pair, &store, mem::take(&mut prep.confirmed))
 			.await?;
-			written.map_err(|e| db_error(e, "recording the confirmed agreed content"))?;
-			confirmed
-		};
-		self.forget_settled_pushes(&confirmed);
 		// One decision in one place: the changelists' own reasons plus the two facts only the pass
 		// knows. `prepare` above has already acted on it — a pass with no reason read only what its
 		// changelists named — and the report carries it on, for the safety net and for the caller.
@@ -7560,7 +7814,7 @@ mod tests {
 			remote_blocked: BTreeSet::new(),
 			remote_rule_errors: Vec::new(),
 			last_ignored: BTreeSet::new(),
-			confirmed: Vec::new(),
+			confirmed: Confirmed::default(),
 		}
 	}
 
@@ -13234,6 +13488,226 @@ mod tests {
 		);
 	}
 
+	/// A push of ours the cache announced long enough ago to have stood its tenure, and still the
+	/// remote head.
+	fn stood(observations: &Observations, uuid: Uuid) {
+		let announced = Instant::now()
+			.checked_sub(past_window())
+			.expect("the monotonic clock has run longer than two confirmation windows");
+		observations.state().insert_push(
+			uuid,
+			PushTenure {
+				lineage: None,
+				recorded: announced,
+				announced: Some(announced),
+				superseded: None,
+			},
+		);
+	}
+
+	/// Every rule a confirmation applies, read a page of rows at a time and staged past its window:
+	/// the snapshot listing our own version (rule (c), a whole pass's only), the cache's
+	/// announcements dating a push, and no evidence at all. Then what a real pass makes of it: the
+	/// rows the store holds once they are persisted, and the push records of exactly those rows
+	/// retired.
+	#[tokio::test]
+	async fn a_confirmation_pages_its_rows_stages_them_past_a_window_and_persists_them() {
+		const EACH: u128 = 4;
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_confirm_pages_{}.db", Uuid::new_v4()));
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let store = engine.pair_store(pair).await.unwrap();
+		let mut remote = Side::<RemoteNode>::default();
+		let mut rows = Vec::new();
+		// Listed: the snapshot holds our version at the row's path.
+		// Stood: a foreign version is there, but the cache dates ours past its tenure.
+		// Ripening: the same, but ours has not stood long enough yet.
+		// Silent: nothing listed, nothing announced.
+		for (kind, at) in [("listed", 0), ("stood", 1), ("ripening", 2), ("silent", 3)] {
+			for n in 0..EACH {
+				let uuid = Uuid::from_u128(at * 100 + n);
+				let rel = format!("{kind}/{n}.txt");
+				rows.push(written_at(&rel, uuid, NodeKind::File, Some(hash(1))));
+				match kind {
+					"listed" => {
+						remote.insert(rel.clone(), remote_file(&rel, uuid, hash(1), 5));
+					}
+					"stood" | "ripening" => {
+						let foreign = Uuid::from_u128(1000 + at * 100 + n);
+						remote.insert(rel.clone(), remote_file(&rel, foreign, hash(2), 5));
+						if kind == "stood" {
+							stood(&engine.observed, uuid);
+						} else {
+							// Announced just now, before the upload call returned.
+							engine.observed.note_uuids([uuid]);
+							engine.observed.watch_push(uuid, None, None);
+						}
+					}
+					_ => {}
+				}
+			}
+		}
+		// Held in conflict, and listed: never confirmed.
+		let conflicted = BaselineEntry {
+			state: BaselineState::Conflicted,
+			..written_at(
+				"listed/held.txt",
+				Uuid::from_u128(99),
+				NodeKind::File,
+				Some(hash(1)),
+			)
+		};
+		remote.insert(
+			conflicted.rel_path.clone(),
+			remote_file(&conflicted.rel_path, Uuid::from_u128(99), hash(1), 5),
+		);
+		rows.push(conflicted);
+		{
+			let store = locked(&store);
+			let changes: Vec<BaselineChange<'_>> =
+				rows.iter().map(BaselineChange::Upsert).collect();
+			store.apply_changes(pair, &changes).unwrap();
+		}
+		let baseline = locked(&store).baseline(pair).unwrap();
+		let window = NonZeroUsize::new(3).unwrap();
+		let agreed = |view: &Baseline, kind: &str| {
+			(0..EACH)
+				.map(|n| view.get(&format!("{kind}/{n}.txt")).unwrap().agreed_hash)
+				.collect::<Vec<_>>()
+		};
+
+		// A change-scoped pass reads no rule (c): the listed rows wait for the next whole pass.
+		let (derived, lent) = engine
+			.confirm(
+				pair,
+				&baseline,
+				Evidence::Derived(mem::take(&mut remote)),
+				window,
+			)
+			.await
+			.unwrap();
+		lent.put_back(&mut remote);
+		assert_eq!(derived.len(), 4, "the stood rows alone");
+
+		let (confirmed, _) = engine
+			.confirm(pair, &baseline, Evidence::Snapshot(remote), window)
+			.await
+			.unwrap();
+		assert!(
+			matches!(confirmed, Confirmed::Staged(_)),
+			"{} rows past a window of 3 are held",
+			confirmed.len()
+		);
+		assert_eq!(confirmed.len(), 8, "the listed rows and the stood ones");
+		let mut view = baseline.clone();
+		view.confirm(&confirmed);
+		let confirmed_at = vec![Some(hash(1)); 4];
+		assert_eq!(agreed(&view, "listed"), confirmed_at);
+		assert_eq!(agreed(&view, "stood"), confirmed_at);
+		assert_eq!(agreed(&view, "ripening"), vec![None; 4]);
+		assert_eq!(agreed(&view, "silent"), vec![None; 4]);
+		assert_eq!(view.get("listed/held.txt").unwrap().agreed_hash, None);
+		assert_eq!(
+			view.unconfirmed()
+				.map(|row| row.rel_path)
+				.filter(|rel| !rel.starts_with("ripening/") && !rel.starts_with("silent/"))
+				.collect::<Vec<_>>(),
+			Vec::<String>::new(),
+			"every row it confirmed has left the unconfirmed set"
+		);
+		drop((view, baseline, derived));
+
+		engine
+			.persist_confirmed(pair, &store, confirmed)
+			.await
+			.unwrap();
+		let persisted = locked(&store).baseline(pair).unwrap();
+		assert_eq!(agreed(&persisted, "listed"), confirmed_at);
+		assert_eq!(agreed(&persisted, "stood"), confirmed_at);
+		assert_eq!(agreed(&persisted, "ripening"), vec![None; 4]);
+		assert_eq!(persisted.unconfirmed().count(), 8);
+		let later = Instant::now() + past_window();
+		assert_eq!(
+			engine.observed.push_verdict(Uuid::from_u128(100), later),
+			PushVerdict::Unknown,
+			"a persisted row's push record is retired"
+		);
+		assert_eq!(
+			engine.observed.push_verdict(Uuid::from_u128(200), later),
+			PushVerdict::Confirmed,
+			"an unconfirmed row's record stays for the pass that confirms it"
+		);
+		drop((persisted, store, engine));
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// The pass after a whole-tree push finds every row unconfirmed and confirms them all. It holds a
+	/// window of them at a time: the rows it reads, and those it confirmed until they move into a
+	/// stage, where its view of the rows then reads their markers.
+	#[test]
+	fn confirming_twenty_thousand_pushes_holds_a_window_of_them() {
+		const ROWS: u128 = 20_000;
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let path =
+			std::env::temp_dir().join(format!("filen_sync_confirm_peak_{}.db", Uuid::new_v4()));
+		let engine = runtime
+			.block_on(SyncEngine::open(Arc::new(offline_client()), path.clone()))
+			.unwrap();
+		let mut remote = Side::<RemoteNode>::default();
+		let rows: Vec<BaselineEntry> = (0..ROWS)
+			.map(|n| {
+				let uuid = Uuid::from_u128(n);
+				let rel = format!("d{:03}/f{n:05}.txt", n % 100);
+				remote.insert(rel.clone(), remote_file(&rel, uuid, hash(1), 5));
+				written_at(&rel, uuid, NodeKind::File, Some(hash(1)))
+			})
+			.collect();
+		let baseline = Baseline::from_rows(rows);
+		// On some platforms the lock allocates on first use, which is not what is measured here.
+		engine.observed.stamp();
+		// On this thread, which is the thread the meter counts: a pass reads and stages the same
+		// pages on blocking threads (see `SyncEngine::confirm`). Nothing here waits on the network —
+		// no row has a foreign version to ask the server about. The view's markers are put in inside
+		// it too: they are the other half of what is held. The snapshot comes back out, so its nodes
+		// are not freed inside the measurement.
+		let ((confirmed, view, snapshot), peak) = alloc_meter::peak_bytes(|| {
+			let (confirmed, snapshot) = confirm_here(Confirming::new(
+				baseline.clone(),
+				Evidence::Snapshot(remote),
+				Arc::clone(&engine.observed),
+				|| engine.stage(PAIR),
+				stage::WINDOW,
+			))
+			.unwrap();
+			let mut view = baseline.clone();
+			view.confirm(&confirmed);
+			(confirmed, view, snapshot)
+		});
+		assert_eq!(confirmed.len(), 20_000);
+		// A window is 1,024 rows of about 250 bytes, read and held once each: half a MiB, and the
+		// view reads its markers out of the stage. Read and held whole, with a marker per row held
+		// in a map, the same rows came to 18 MiB.
+		assert!(
+			peak < 1024 * 1024,
+			"confirming {ROWS} pushes held {peak} bytes at once"
+		);
+		assert!(!view.any_unconfirmed());
+		assert_eq!(
+			view.get("d007/f00007.txt").unwrap().agreed_hash,
+			Some(hash(1))
+		);
+		drop((view, baseline, confirmed, snapshot, engine));
+		std::fs::remove_file(&path).ok();
+	}
+
 	#[test]
 	fn a_push_forgotten_after_a_pass_read_it_has_no_verdict_left() {
 		let observations = Observations::default();
@@ -13261,7 +13735,7 @@ mod tests {
 		let ripe = Instant::now() + past_window();
 
 		let unconfirmed: Vec<BaselineEntry> = tree(&baseline).unconfirmed().collect();
-		let read = || observed_confirmations(&observations, &unconfirmed, &HashMap::new(), ripe).0;
+		let read = || observed_confirmations(&observations, &unconfirmed, None, ripe).0;
 		assert_eq!(read(), std::collections::HashSet::from([uuid]));
 		assert_eq!(
 			read(),

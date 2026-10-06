@@ -3,7 +3,8 @@
 //! local scan ([`local`]) from the read to the end of the plan, both read as a [`StagedSide`]
 //! ([`side`]), and reconciles them window by window ([`reconcile`]); every pass that plans anything
 //! screens its plan where it is staged ([`screen`]), and stages what it applies ([`plan`]) from the
-//! plan to the end of the apply.
+//! plan to the end of the apply. A pass that confirms more pushes of ours than a window holds stages
+//! those as well ([`confirmed`]), from the confirmation to the end of the plan.
 //!
 //! # One file per pass
 //!
@@ -20,7 +21,9 @@
 //! begins, or with the pass's inputs when it stops before that (a dry run, a refusal), and the
 //! plan's when the apply is done. The plan's file is made when the pass reconciles — a whole pass
 //! writes its plan there window by window, a change-scoped one once it has planned it in memory —
-//! and the plan is screened there and staged for the apply in that same file.
+//! and the plan is screened there and staged for the apply in that same file. A pass that confirms
+//! more than a window of pushes takes a number for them too, before its scan's, and that file goes
+//! with the pass's view of the rows, once the plan is staged.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).
@@ -61,6 +64,7 @@
 //! [`Pager::carried`]) panics instead, as the baseline's rows do (see `rows::snapshot`): only the
 //! runs the apply takes one action at a time ask it, so nothing is in flight to drop.
 
+mod confirmed;
 mod local;
 mod plan;
 mod reconcile;
@@ -80,8 +84,9 @@ use std::{
 };
 
 use filen_types::crypto::Blake3Hash;
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, Row, Statement, ToSql};
 
+pub(super) use confirmed::{Confirmed, ConfirmedRows, StagedConfirmations};
 pub(super) use local::StageSink;
 pub(super) use plan::{Carried, Pager, Run, Staged, StagedPlan};
 #[cfg(test)]
@@ -95,7 +100,7 @@ pub(super) use side::{Pages, Paging, StagedSide};
 #[cfg(test)]
 pub(super) use test_support::{assert_views_alike, paging_of, staged_sides, staged_view};
 
-use super::baseline::PairId;
+use super::baseline::{BaselineEntry, NodeKind, PairId};
 use crate::{Error, ErrorKind};
 
 /// Every pragma of a stage's connection, set before its first page is written (see the module
@@ -293,6 +298,36 @@ impl BatchWriter {
 /// A content hash as the stage's `BLOB` column holds it.
 fn hash_bytes(hash: Option<&Blake3Hash>) -> Option<&[u8]> {
 	hash.map(|hash| hash.as_ref().as_slice())
+}
+
+/// Bind `row`'s columns, in `ENTRY_COLUMNS` order, to `statement`'s parameters from `first` on: what
+/// a staged row of the baseline's own shape is written with, for `BaselineStore::row_to_entry` to
+/// read back.
+fn bind_entry(
+	statement: &mut Statement<'_>,
+	first: usize,
+	row: &BaselineEntry,
+) -> rusqlite::Result<()> {
+	let columns: [&dyn ToSql; 14] = [
+		&row.rel_path,
+		&row.kind.as_i64(),
+		&row.remote_uuid,
+		&hash_bytes(row.content_hash.as_ref()),
+		&row.size,
+		&row.local_mtime,
+		&row.remote_modified,
+		&row.state.as_i64(),
+		&row.local_kind.map(NodeKind::as_i64),
+		&row.remote_kind.map(NodeKind::as_i64),
+		&hash_bytes(row.remote_hash.as_ref()),
+		&row.remote_size,
+		&row.remote_stable_uuid,
+		&hash_bytes(row.agreed_hash.as_ref()),
+	];
+	for (at, column) in columns.into_iter().enumerate() {
+		statement.raw_bind_parameter(first + at, column)?;
+	}
+	Ok(())
 }
 
 /// The content hash in `row`'s `column`, as [`hash_bytes`] wrote it.
