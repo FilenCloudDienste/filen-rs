@@ -2534,7 +2534,8 @@ pub(super) fn is_under(path: &str, prefix: &str) -> bool {
 /// an ancestor of it, while the ancestor `a` lies further back still.
 ///
 /// An ancestor walk never yields `""`, so a root of `""` covers only the pair root itself here. The
-/// one caller for which it means "everything is under it" asks for that separately (`drop_blocked`).
+/// one caller for which it means "everything is under it" asks for that separately
+/// (`engine::Blocking`).
 pub(super) fn at_or_under_root(roots: &BTreeSet<String>, path: &str) -> bool {
 	roots.contains(path) || ancestors(path).any(|at| roots.contains(at))
 }
@@ -2591,22 +2592,46 @@ fn suppress_conflicted_subtrees(actions: &mut Vec<SyncAction>) {
 	if conflicted.is_empty() {
 		return;
 	}
-	actions.retain(|action| {
-		if matches!(action, SyncAction::Conflict { .. }) {
-			return true;
-		}
-		let (from, to) = action.endpoints();
-		let held = conflicted
-			.iter()
-			.any(|c| is_under(from, c) || is_under(to, c));
-		if held {
-			tracing::debug!(
-				"plan: dropping {} — it sits under a path held in conflict this pass",
-				action.describe()
-			);
-		}
-		!held
-	});
+	actions.retain(|action| !under_conflict(action, &conflicted));
+}
+
+/// Whether [`suppress_conflicted_subtrees`] drops `action` for one of `conflicted`, the paths the
+/// plan surfaces as conflicts: an end of it sits under one. A conflict itself never does.
+pub(super) fn under_conflict(action: &SyncAction, conflicted: &[String]) -> bool {
+	if matches!(action, SyncAction::Conflict { .. }) {
+		return false;
+	}
+	let (from, to) = action.endpoints();
+	let held = conflicted
+		.iter()
+		.any(|c| is_under(from, c) || is_under(to, c));
+	if held {
+		tracing::debug!(
+			"plan: dropping {} — it sits under a path held in conflict this pass",
+			action.describe()
+		);
+	}
+	held
+}
+
+/// Whether [`finish_plan`] drops `action` as a deletion of a remote item this engine already sent to
+/// the trash (`trashed`), which the cache has not caught up with: the path is deferred.
+pub(super) fn already_trashed(action: &SyncAction, trashed: &HashSet<Uuid>) -> bool {
+	let SyncAction::TrashRemote {
+		rel_path,
+		remote_uuid,
+		..
+	} = action
+	else {
+		return false;
+	};
+	if !trashed.contains(remote_uuid) {
+		return false;
+	}
+	tracing::debug!(
+		"reconcile: skipping the remote deletion of {rel_path:?} — this engine already trashed it and the cache has not caught up"
+	);
+	true
 }
 
 /// Carry every directory move the pass can identify across as ONE move of the directory, and re-key
@@ -4117,8 +4142,8 @@ pub(super) fn decide_path<'n>(
 /// The plan, from the actions a reconcile planned in the order it planned them — the moves it
 /// detected, then each path's in path order — and the paths it deferred: a deletion of a remote
 /// item this engine already trashed dropped and counted as deferred, everything under a conflict
-/// dropped, and the rest ordered for the apply. The tail of [`reconcile`], and of a whole pass's
-/// staged reconcile once its windows are read back (see `stage::reconcile`).
+/// dropped, and the rest ordered for the apply. The tail of [`reconcile`]; a whole pass's staged
+/// reconcile finishes its plan the same way in its stage (see `stage::Screen`).
 pub(super) fn finish_plan(
 	mut actions: Vec<SyncAction>,
 	mut deferred_paths: usize,
@@ -4126,22 +4151,9 @@ pub(super) fn finish_plan(
 ) -> Plan {
 	if !holds.trashed.is_empty() {
 		actions.retain(|action| {
-			let SyncAction::TrashRemote {
-				rel_path,
-				remote_uuid,
-				..
-			} = action
-			else {
-				return true;
-			};
-			if !holds.trashed.contains(remote_uuid) {
-				return true;
-			}
-			tracing::debug!(
-				"reconcile: skipping the remote deletion of {rel_path:?} — this engine already trashed it and the cache has not caught up"
-			);
-			deferred_paths += 1;
-			false
+			let trashed = already_trashed(action, &holds.trashed);
+			deferred_paths += usize::from(trashed);
+			!trashed
 		});
 	}
 
@@ -4164,14 +4176,14 @@ pub(super) fn finish_plan(
 ///
 /// A directory move runs before all of them: the rest of the plan already names its subtree by the
 /// path it moves to (see [`fold_dir_moves`]).
-const PHASE_DIR_MOVE: u8 = 0;
-const PHASE_FILE_REPLACE_DELETE: u8 = 1;
-const PHASE_CREATE: u8 = 2;
-const PHASE_MOVE: u8 = 3;
-const PHASE_DIR_REPLACE_DELETE: u8 = 4;
-const PHASE_TRANSFER: u8 = 5;
-const PHASE_DELETE: u8 = 6;
-const PHASE_CONFLICT: u8 = 7;
+pub(super) const PHASE_DIR_MOVE: u8 = 0;
+pub(super) const PHASE_FILE_REPLACE_DELETE: u8 = 1;
+pub(super) const PHASE_CREATE: u8 = 2;
+pub(super) const PHASE_MOVE: u8 = 3;
+pub(super) const PHASE_DIR_REPLACE_DELETE: u8 = 4;
+pub(super) const PHASE_TRANSFER: u8 = 5;
+pub(super) const PHASE_DELETE: u8 = 6;
+pub(super) const PHASE_CONFLICT: u8 = 7;
 
 /// The apply phase of an action given the paths the pass deletes and creates again
 /// ([`replaced_paths`]). See the `PHASE_*` constants; other deletes run LAST (child-before-parent)
@@ -4251,101 +4263,146 @@ pub(super) fn replaced_paths<'a>(
 		.collect()
 }
 
-/// The deletions [`fold_subsumed_deletes`] took out of a plan, by the directory deletion of the same
-/// side that carries each one out. Held while the plan is made, and staged with it
-/// (`apply::PlannedEntry::stage`): the apply reads them out of its stage, not out of this.
-#[derive(Debug, Default)]
-pub(super) struct Subsumed {
-	local: HashMap<String, Vec<String>>,
-	remote: HashMap<String, Vec<String>>,
-}
+/// The oracle the plans folded in a stage are held to.
+#[cfg(test)]
+pub(super) mod test_support {
+	use std::collections::{HashMap, HashSet};
 
-impl Subsumed {
-	/// The paths whose deletion `action` carries out along with its own: empty for anything but a
-	/// directory deletion that took others with it.
-	pub(super) fn under(&self, action: &SyncAction) -> &[String] {
-		let by_dir = match action {
-			SyncAction::DeleteLocal { .. } => &self.local,
-			SyncAction::TrashRemote { .. } => &self.remote,
-			_ => return &[],
-		};
-		by_dir.get(action.rel_path()).map_or(&[], Vec::as_slice)
+	use super::{NodeKind, SyncAction, ancestors};
+
+	/// The deletions [`fold_subsumed_deletes`] took out of a plan, by the directory deletion of the
+	/// same side that carries each one out.
+	#[derive(Debug, Default)]
+	pub(in super::super) struct Subsumed {
+		local: HashMap<String, Vec<String>>,
+		remote: HashMap<String, Vec<String>>,
 	}
 
-	/// The paths whose deletion the deletion of the directory at `dir` carries out, on either side.
-	pub(super) fn carried_by(&self, dir: &str) -> impl Iterator<Item = &String> {
-		[&self.local, &self.remote]
-			.into_iter()
-			.filter_map(move |by_dir| by_dir.get(dir))
-			.flatten()
+	impl Subsumed {
+		/// The paths whose deletion `action` carries out along with its own: empty for anything but
+		/// a directory deletion that took others with it.
+		pub(in super::super) fn under(&self, action: &SyncAction) -> &[String] {
+			let by_dir = match action {
+				SyncAction::DeleteLocal { .. } => &self.local,
+				SyncAction::TrashRemote { .. } => &self.remote,
+				_ => return &[],
+			};
+			by_dir.get(action.rel_path()).map_or(&[], Vec::as_slice)
+		}
 	}
-}
 
-/// Take out of `actions` every deletion that a directory deletion of the same side, also in
-/// `actions`, carries out anyway, and hand it to the top-most such directory. The server trashes a
-/// directory with its whole subtree and a local deletion quarantines the directory in one rename,
-/// so deleting each item under it first spent a call per item and left the remote trash holding
-/// every file loose beside an emptied folder, and the quarantine bin a second, empty copy of the
-/// directory beside the files.
-///
-/// The directory's apply drops the baseline rows of the deletions it took — exactly those, by path,
-/// and not every row under the directory — so the rows end where the per-item plan left them. None
-/// of them is the first half of a type flip, which would have to run before the create it pairs
-/// with: nothing is created on a side under a directory that side deletes.
-///
-/// Runs on what the guard let through: the guard counts the items a pass deletes, not the calls
-/// that delete them. The price is that the subtree goes in one piece or not at all: a directory
-/// that cannot go (a file held open inside it, where Windows refuses the rename) keeps every item
-/// under it until it can, where deleting item by item left only that file behind.
-pub(super) fn fold_subsumed_deletes(actions: &mut Vec<SyncAction>) -> Subsumed {
-	let mut subsumed = Subsumed::default();
-	// Owned: the sets are read inside the `retain` below, which borrows `actions` mutably.
-	let (mut local_dirs, mut remote_dirs) = (HashSet::new(), HashSet::new());
-	for action in actions.iter() {
-		match action {
-			SyncAction::DeleteLocal {
-				rel_path,
-				kind: NodeKind::Dir,
-			} => {
-				local_dirs.insert(rel_path.clone());
+	/// Take out of `actions` every deletion that a directory deletion of the same side, also in
+	/// `actions`, carries out anyway, and hand it to the top-most such directory. The server
+	/// trashes a directory with its whole subtree and a local deletion quarantines the directory in
+	/// one rename, so deleting each item under it first spent a call per item and left the remote
+	/// trash holding every file loose beside an emptied folder, and the quarantine bin a second,
+	/// empty copy of the directory beside the files.
+	///
+	/// The directory's apply drops the baseline rows of the deletions it took — exactly those, by
+	/// path, and not every row under the directory — so the rows end where the per-item plan left
+	/// them. None of them is the first half of a type flip, which would have to run before the
+	/// create it pairs with: nothing is created on a side under a directory that side deletes.
+	///
+	/// Runs on what the guard let through: the guard counts the items a pass deletes, not the calls
+	/// that delete them. The price is that the subtree goes in one piece or not at all: a directory
+	/// that cannot go (a file held open inside it, where Windows refuses the rename) keeps every
+	/// item under it until it can, where deleting item by item left only that file behind.
+	///
+	/// A pass folds its plan in its stage (see `stage::Screen::fold_subsumed`); this folds a list,
+	/// and is what the tests hold that one to.
+	pub(in super::super) fn fold_subsumed_deletes(actions: &mut Vec<SyncAction>) -> Subsumed {
+		let mut subsumed = Subsumed::default();
+		// Owned: the sets are read inside the `retain` below, which borrows `actions` mutably.
+		let (mut local_dirs, mut remote_dirs) = (HashSet::new(), HashSet::new());
+		for action in actions.iter() {
+			match action {
+				SyncAction::DeleteLocal {
+					rel_path,
+					kind: NodeKind::Dir,
+				} => {
+					local_dirs.insert(rel_path.clone());
+				}
+				SyncAction::TrashRemote {
+					rel_path,
+					kind: NodeKind::Dir,
+					..
+				} => {
+					remote_dirs.insert(rel_path.clone());
+				}
+				_ => {}
 			}
-			SyncAction::TrashRemote {
-				rel_path,
+		}
+		if local_dirs.is_empty() && remote_dirs.is_empty() {
+			return subsumed;
+		}
+		actions.retain(|action| {
+			let (dirs, by_dir) = match action {
+				SyncAction::DeleteLocal { .. } => (&local_dirs, &mut subsumed.local),
+				SyncAction::TrashRemote { .. } => (&remote_dirs, &mut subsumed.remote),
+				_ => return true,
+			};
+			let path = action.rel_path();
+			// Shallowest first, so the directory found is one no deletion above takes with it.
+			let Some(dir) = ancestors(path).find(|dir| dirs.contains(*dir)) else {
+				return true;
+			};
+			tracing::debug!(
+				"plan: {} — the deletion of {dir:?} takes it along",
+				action.describe()
+			);
+			match by_dir.get_mut(dir) {
+				Some(paths) => paths.push(path.to_owned()),
+				None => {
+					by_dir.insert(dir.to_owned(), vec![path.to_owned()]);
+				}
+			}
+			false
+		});
+		subsumed
+	}
+
+	/// Whether `action` is the first deletion of a directory at its side and path that `filed` has
+	/// seen: what [`Subsumed`] files carried deletions under, by that side and
+	/// path alone, so a plan that deletes one twice — or a file at the same path — would read them
+	/// out twice.
+	pub(in super::super) fn first_dir_deletion(
+		filed: &mut HashSet<(bool, String)>,
+		action: &SyncAction,
+	) -> bool {
+		let local = match action {
+			SyncAction::DeleteLocal {
 				kind: NodeKind::Dir,
 				..
-			} => {
-				remote_dirs.insert(rel_path.clone());
-			}
-			_ => {}
-		}
-	}
-	if local_dirs.is_empty() && remote_dirs.is_empty() {
-		return subsumed;
-	}
-	actions.retain(|action| {
-		let (dirs, by_dir) = match action {
-			SyncAction::DeleteLocal { .. } => (&local_dirs, &mut subsumed.local),
-			SyncAction::TrashRemote { .. } => (&remote_dirs, &mut subsumed.remote),
-			_ => return true,
+			} => true,
+			SyncAction::TrashRemote {
+				kind: NodeKind::Dir,
+				..
+			} => false,
+			_ => return false,
 		};
-		let path = action.rel_path();
-		// Shallowest first, so the directory found is one no deletion above takes with it.
-		let Some(dir) = ancestors(path).find(|dir| dirs.contains(*dir)) else {
-			return true;
-		};
-		tracing::debug!(
-			"plan: {} — the deletion of {dir:?} takes it along",
-			action.describe()
-		);
-		match by_dir.get_mut(dir) {
-			Some(paths) => paths.push(path.to_owned()),
-			None => {
-				by_dir.insert(dir.to_owned(), vec![path.to_owned()]);
-			}
-		}
-		false
-	});
-	subsumed
+		filed.insert((local, action.rel_path().to_owned()))
+	}
+
+	/// What [`fold_subsumed_deletes`] folds of `actions`: the actions left, and the carried
+	/// deletions by directory, sorted.
+	pub(in super::super) fn folded(
+		mut actions: Vec<SyncAction>,
+	) -> (Vec<SyncAction>, Vec<(String, String)>) {
+		let subsumed = fold_subsumed_deletes(&mut actions);
+		let mut filed = HashSet::new();
+		let mut carried: Vec<(String, String)> = actions
+			.iter()
+			.filter(|action| first_dir_deletion(&mut filed, action))
+			.flat_map(|action| {
+				subsumed
+					.under(action)
+					.iter()
+					.map(|path| (action.rel_path().to_owned(), path.clone()))
+			})
+			.collect();
+		carried.sort();
+		(actions, carried)
+	}
 }
 
 /// Order the plan so it applies safely: file replace-deletes → creates (parent-before-child) →
@@ -4388,6 +4445,7 @@ mod tests {
 			side::{FromRow, test_support::copied},
 			stage::{Stage, WINDOW, reconcile_windows, staged_sides},
 		},
+		test_support::fold_subsumed_deletes,
 		*,
 	};
 	use crate::{alloc_meter, sync_engine::SyncMode};

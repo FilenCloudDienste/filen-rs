@@ -40,11 +40,11 @@ use super::{
 		RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
-	plan::{RemoteNode, Subsumed, SyncAction, is_under},
+	plan::{RemoteNode, SyncAction, is_under},
 	rows::{Baseline, Cursor},
 	scan::{LocalNode, QUARANTINE_DIR, collision_key, hash_file},
 	side::{NodesAt, Side},
-	stage::{Carried, Pager, PlanWriter, Run, Stage, Staged, StagedPlan},
+	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
 use crate::{
 	auth::Client,
@@ -151,8 +151,8 @@ pub struct SyncReport {
 	/// the only copy of what it is applying (see `note_unread_plan`).
 	pub(super) store_failed: Option<StoreFailure>,
 	/// How many actions this pass planned and then DROPPED before applying anything: a path it may
-	/// not act on (`drop_blocked`) or a deletion over content it cannot reach
-	/// (`withhold_deletions_over_unreachable`). Making the plan consumed both changelists, so a
+	/// not act on (`engine::Blocking`) or a deletion over content it cannot reach
+	/// (`engine::Withholding`). Making the plan consumed both changelists, so a
 	/// dropped action is named nowhere any more — the next pass reads both sides whole to find it
 	/// again (see `next_pass_scope`). Distinct from [`deferred_paths`](Self::deferred_paths),
 	/// which counts what the reconcile itself left alone, whether or not it planned anything there.
@@ -383,36 +383,31 @@ where
 }
 
 impl PlannedEntry {
-	/// The plan's `actions`, each with what the apply reads for it out of the pass's `baseline` and
-	/// its two sides, staged in `stage` one at a time and ordered there for the apply (see
-	/// [`StagedPlan`]), with the deletions each directory deletion carries out along with its own
-	/// (`subsumed`): what the apply holds of its plan is then the page of it it is in.
+	/// The plan the pass screened (`screen`), each action with what the apply reads for it out of
+	/// the pass's `baseline` and its two sides, staged in the same stage one at a time and ordered
+	/// there for the apply (see [`StagedPlan`]), with the deletions each directory deletion carries
+	/// out along with its own: what the apply holds of its plan is then the page of it it is in.
 	///
-	/// It takes those four, and drops them: the scan and the view are a node per item of the tree,
-	/// and so are the carried deletions of a deletion of the whole tree; the baseline's snapshot is
-	/// the pass's read transaction, which has to END before the first action commits (see
-	/// [`Baseline::close`]). Every answer an entry carries is the one the plan was made from, the
-	/// pass's own commits landing in none of them.
+	/// It takes those four, and drops them: the scan and the view are a node per item of the tree;
+	/// the baseline's snapshot is the pass's read transaction, which has to END before the first
+	/// action commits (see [`Baseline::close`]). Every answer an entry carries is the one the plan
+	/// was made from, the pass's own commits landing in none of them.
 	pub(super) fn stage(
-		actions: Vec<SyncAction>,
-		subsumed: Subsumed,
+		screen: Screen,
 		baseline: Baseline,
 		local: Side<LocalNode>,
 		remote: Side<RemoteNode>,
-		stage: Stage,
 	) -> rusqlite::Result<StagedPlan> {
-		let staged = Self::write(actions, &subsumed, &baseline, local, remote, stage);
+		let staged = Self::write(screen, &baseline, local, remote);
 		baseline.close();
 		staged
 	}
 
 	fn write(
-		actions: Vec<SyncAction>,
-		subsumed: &Subsumed,
+		screen: Screen,
 		baseline: &Baseline,
 		local: Side<LocalNode>,
 		remote: Side<RemoteNode>,
-		stage: Stage,
 	) -> rusqlite::Result<StagedPlan> {
 		let (local, remote) = (local.of(baseline), remote.of(baseline));
 		let mut trees = PassTrees {
@@ -420,14 +415,7 @@ impl PlannedEntry {
 			remote: &remote,
 			rows: baseline.cursor(),
 		};
-		let mut plan = PlanWriter::new(stage)?;
-		for action in actions {
-			let start = PassStart::of(&action, &mut trees);
-			let entry = Self { action, start };
-			plan.push(&entry)?;
-			plan.carry(&entry.action, subsumed.under(&entry.action))?;
-		}
-		plan.finish()
+		screen.stage_plan(|action| PassStart::of(action, &mut trees))
 	}
 }
 
@@ -3163,7 +3151,7 @@ fn internal_owned(message: String) -> crate::Error {
 	crate::Error::custom(crate::ErrorKind::Internal, message)
 }
 
-/// Entries with nothing read, for the tests.
+/// A plan the tests stage for the apply without screening it, and entries with nothing read.
 #[cfg(test)]
 mod test_support {
 	use uuid::Uuid;
@@ -3172,7 +3160,10 @@ mod test_support {
 		super::{
 			baseline::BaselineEntry,
 			plan::{RemoteNode, SyncAction},
+			rows::Baseline,
 			scan::LocalNode,
+			side::Side,
+			stage::{Screen, Stage, StagedPlan},
 		},
 		PassStart, PlannedEntry, StartInputs,
 	};
@@ -3210,6 +3201,17 @@ mod test_support {
 	}
 
 	impl PlannedEntry {
+		/// `actions`, a plan as it stands, staged as [`stage`](Self::stage) stages a screened one.
+		pub(in crate::sync_engine) fn stage_actions(
+			actions: &[SyncAction],
+			baseline: Baseline,
+			local: Side<LocalNode>,
+			remote: Side<RemoteNode>,
+			stage: Stage,
+		) -> rusqlite::Result<StagedPlan> {
+			Self::stage(Screen::new(stage, &[], actions)?, baseline, local, remote)
+		}
+
 		/// `action`, with nothing read for it (see [`PassStart::bare`]).
 		pub(in crate::sync_engine) fn bare(action: SyncAction) -> Self {
 			Self {
@@ -3236,7 +3238,7 @@ mod tests {
 			SyncMode,
 			baseline::BaselineStore,
 			changes::tests::{cacheable_dir, cacheable_file},
-			stage::PAGE_ROWS,
+			stage::{PAGE_ROWS, PlanWriter, Stage},
 		},
 	};
 
@@ -3320,9 +3322,7 @@ mod tests {
 			},
 		];
 		let (_dir, stage) = Stage::in_temp_dir();
-		let plan =
-			PlannedEntry::stage(actions, Subsumed::default(), baseline, local, remote, stage)
-				.unwrap();
+		let plan = PlannedEntry::stage_actions(&actions, baseline, local, remote, stage).unwrap();
 		let mut entries = Vec::new();
 		plan.pager()
 			.sweep(None, |entry| entries.push(entry))

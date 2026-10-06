@@ -8,7 +8,7 @@ use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
 	hash::Hash,
-	iter, mem,
+	mem,
 	ops::RangeInclusive,
 	path::{Path, PathBuf},
 	sync::{
@@ -31,7 +31,7 @@ use super::{
 		BaselineChange, BaselineEntry, BaselineState, BaselineStore, NodeKind, PairId, PairRecord,
 		PathFailure, PendingRow, SyncedPaths,
 	},
-	changes::{FullPassReason, PairChanges, PassScope, RemoteDeltaEntry},
+	changes::{DIRTY_CAP, FullPassReason, PairChanges, PassScope, RemoteDeltaEntry, past_cap},
 	derive,
 	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
@@ -45,12 +45,12 @@ use super::{
 		UnsyncableReason, planned_action, planned_conflict,
 	},
 	pause::{PassControl, PassGate, PauseOptions, cancel_suspension},
-	plan::{self, RemoteNode, RemoteView, Subsumed, SyncAction},
+	plan::{self, RemoteNode, RemoteView, SyncAction},
 	remote::{RemoteObserved, cache_ancestry, delta_uuids, observe_remote},
 	rows::Baseline,
 	scan::{self, LocalScan, RuleFiles, ScanError},
 	side::{Nodes, NodesAt, Side, SideRef},
-	stage::{self, Stage, StagedPlan},
+	stage::{self, Rows, Screen, ScreenError, Stage, StagedPlan},
 };
 use crate::{
 	Error, ErrorKind,
@@ -1340,9 +1340,9 @@ where
 }
 
 /// Run `work` on a blocking thread, for what a pass does to its own stages and rows whose cost
-/// scales with the tree — the reconcile — as [`off_store`] runs the store's. `work` owns what it
-/// reads and hands back whatever the pass still needs. A panic in it is the pass's error, which
-/// `what` names.
+/// scales with the tree — the reconcile and the screening — as [`off_store`] runs the store's.
+/// `work` owns what it reads and hands back whatever the pass still needs. A panic in it is the
+/// pass's error, which `what` names.
 async fn off_runtime<T>(what: &str, work: impl FnOnce() -> T + Send + 'static) -> Result<T, Error>
 where
 	T: Send + 'static,
@@ -1683,8 +1683,8 @@ impl SyncEngine {
 		let pass = BenchPass {
 			scoped: prep.read.is_scoped(),
 			full_reason: prep.read.full_pass_reason(),
-			actions: screened.decision.safe.len(),
-			held: screened.decision.held.len(),
+			actions: screened.count(Rows::Safe)?,
+			held: screened.count(Rows::Held)?,
 			conflicts: screened.conflicts.len(),
 			dir_moves: prep.dir_moves.len(),
 			confirmed: prep.confirmed.len(),
@@ -2144,9 +2144,9 @@ impl Prepared {
 		Ok(())
 	}
 
-	/// The plan's `actions`, each with what the apply reads for it, staged in `stage` in the order
-	/// the apply runs them, with the deletions each directory deletion carries (`subsumed`, see
-	/// [`PlannedEntry::stage`]).
+	/// The plan the pass screened (`screen`), each action with what the apply reads for it, staged in
+	/// the same stage in the order the apply runs them, with the deletions each directory deletion
+	/// carries (see [`PlannedEntry::stage`]).
 	///
 	/// Takes the pass's rows and both its sides out of `self` to do it: the scan, the view and the
 	/// snapshot are dropped here, and the pass's read transaction with the snapshot. What is left
@@ -2155,44 +2155,40 @@ impl Prepared {
 	///
 	/// Off the runtime thread: it writes a row per action, and a first sync plans the whole tree. A
 	/// stage that cannot be written (a full disk) fails the pass before it has applied anything.
-	async fn stage_plan(
-		&mut self,
-		actions: Vec<SyncAction>,
-		subsumed: Subsumed,
-		stage: Stage,
-	) -> Result<StagedPlan, Error> {
-		let at = stage.path().display().to_string();
+	async fn stage_plan(&mut self, screen: Screen) -> Result<StagedPlan, Error> {
+		let at = screen.path().display().to_string();
 		let (baseline, local, remote) = (
 			mem::take(&mut self.baseline),
 			mem::replace(&mut self.local_scan.nodes, Side::carried()),
 			mem::replace(&mut self.remote_view.nodes, Side::carried()),
 		);
-		tokio::task::spawn_blocking(move || {
-			PlannedEntry::stage(actions, subsumed, baseline, local, remote, stage)
-		})
-		.await
-		.map_err(|e| {
-			Error::custom(
-				ErrorKind::Internal,
-				format!("staging the pass's plan panicked: {e}"),
-			)
-		})?
-		.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))
+		tokio::task::spawn_blocking(move || PlannedEntry::stage(screen, baseline, local, remote))
+			.await
+			.map_err(|e| {
+				Error::custom(
+					ErrorKind::Internal,
+					format!("staging the pass's plan panicked: {e}"),
+				)
+			})?
+			.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))
 	}
 
-	/// Map internal actions onto the public [`PlannedAction`] shape, resolving each one's size from
-	/// whichever side of this pass knows it.
-	fn planned(&self, actions: &[SyncAction]) -> Vec<PlannedAction> {
-		actions
-			.iter()
-			.map(|action| {
-				planned_action(
-					action,
-					&self.local_scan.nodes.of(&self.baseline),
-					&self.remote_view.nodes.of(&self.baseline),
-				)
-			})
-			.collect()
+	/// The `rows` of the screened plan in the public [`PlannedAction`] shape, in plan order, each
+	/// one's size resolved from whichever side of this pass knows it.
+	fn planned(&self, screened: &Screened, rows: Rows) -> Result<Vec<PlannedAction>, Error> {
+		let Some(plan) = &screened.plan else {
+			return Ok(Vec::new());
+		};
+		let (local, remote) = (
+			self.local_scan.nodes.of(&self.baseline),
+			self.remote_view.nodes.of(&self.baseline),
+		);
+		let mut planned = Vec::new();
+		plan.each(rows, |action| {
+			planned.push(planned_action(&action, &local, &remote));
+		})
+		.map_err(|e| db_error(e, "reading the pass's screened plan"))?;
+		Ok(planned)
 	}
 
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
@@ -2420,28 +2416,34 @@ fn streak_blocks(failure: &PathFailure, now: i64) -> bool {
 	failure.attempts >= MAX_PATH_FAILURES && now.saturating_sub(failure.last_failure_at) < interval
 }
 
-/// The failure streaks applying `actions` can end, each as the path of the action whose success
-/// ends it and the path whose streak that is: the action's own, and those of the deletions a
-/// directory deletion carries out (`subsumed`), which happen with it.
+/// The failure streaks applying the screened plan `plan` can end, each as the path of the action
+/// whose success ends it and the path whose streak that is: every action's own, then those of the
+/// deletions a directory deletion carries out, which happen with it.
 ///
-/// Only paths in `streaks` are kept. Ending a streak that does not exist deletes no row, and a
-/// first sync's plan is the whole tree. `None` is a store that could not say which paths have one:
-/// every path is then kept, as if each had.
+/// Only paths in `streaks` are kept, and a plan is not read at all when there is none. Ending a
+/// streak that does not exist deletes no row, and a first sync's plan is the whole tree. `None` is a
+/// store that could not say which paths have one: every path is then kept, as if each had.
 fn endable_streaks(
-	actions: &[SyncAction],
-	subsumed: &Subsumed,
+	plan: &Screen,
 	streaks: Option<&HashMap<String, PathFailure>>,
-) -> Vec<(String, String)> {
-	actions
-		.iter()
-		.map(SyncAction::rel_path)
-		.flat_map(|path| {
-			iter::once(path)
-				.chain(subsumed.carried_by(path).map(String::as_str))
-				.filter(move |ended| streaks.is_none_or(|streaks| streaks.contains_key(*ended)))
-				.map(move |ended| (path.to_owned(), ended.to_owned()))
-		})
-		.collect()
+) -> rusqlite::Result<Vec<(String, String)>> {
+	if streaks.is_some_and(HashMap::is_empty) {
+		return Ok(Vec::new());
+	}
+	let has_streak = |path: &str| streaks.is_none_or(|streaks| streaks.contains_key(path));
+	let mut ends = Vec::new();
+	plan.each(Rows::Safe, |action| {
+		let path = action.rel_path();
+		if has_streak(path) {
+			ends.push((path.to_owned(), path.to_owned()));
+		}
+	})?;
+	plan.each_carried(|dir, path| {
+		if has_streak(path) {
+			ends.push((dir.to_owned(), path.to_owned()));
+		}
+	})?;
+	Ok(ends)
 }
 
 /// Which side wins when a caller resolves a held two-way conflict via
@@ -3938,7 +3940,7 @@ impl SyncEngine {
 		// untracked those rows. Where it does — an `untrack_ignored` whose `delete_subtrees`
 		// failed leaves rows at hidden paths and forces nothing — the two absences would read as a
 		// convergent delete and retire a live row, so `merge_local` holds those paths as well and
-		// the reconcile decides nothing at them. `drop_blocked` still drops anything planned at or
+		// the reconcile decides nothing at them. `Blocking` still drops anything planned at or
 		// under an ignored root (they are all in `blocked_paths()`, from
 		// `facts.ignored_local`/`ignored_remote`, which this pass fills from this very filter and
 		// from `LocalObservation::Hidden`) — it is the belt to this, not the thing standing
@@ -4467,17 +4469,17 @@ impl SyncEngine {
 			}
 			let state = screen_state(&prep);
 			let at = self.stage_at(pair);
-			// On a blocking thread, as a pass reconciles its plan: the reconcile reads and writes
-			// the plan's stage.
+			// On a blocking thread, as a pass screens its plan: the reconcile, the screening and the
+			// lists all read and write the plan's stage.
 			off_runtime("planning the pair", move || {
 				let mut screened = reconcile_and_screen(&prep, state, || Stage::create(at))?;
 				// What the pass would apply, which takes each deletion under a deleted directory
 				// along with it.
-				plan::fold_subsumed_deletes(&mut screened.decision.safe);
+				screened.fold_subsumed()?;
 				Ok(PlanOutcome {
-					actions: prep.planned(&screened.decision.safe),
-					held: prep.planned(&screened.decision.held),
-					held_reason: screened.decision.reason,
+					actions: prep.planned(&screened, Rows::Safe)?,
+					held: prep.planned(&screened, Rows::Held)?,
+					held_reason: screened.reason,
 					pass_token: screened.pass_token,
 					conflicts: screened.conflicts,
 					unsyncable: prep.unsyncable(),
@@ -5304,17 +5306,19 @@ impl SyncEngine {
 	///
 	/// Not called by a pass that REFUSED: a refusal forces the next pass whole, which rebuilds all
 	/// of this from a read of both sides.
+	///
+	/// `released` is what the plan released past the guard (see [`released_paths`]).
 	async fn carry_forward(
 		&self,
 		pair: PairId,
 		prep: &Prepared,
 		report: &SyncReport,
-		decision: &guard::GuardDecision,
+		released: &BTreeSet<String>,
 		streaks: &HashMap<String, PathFailure>,
 	) {
 		if let Some(changes) = self.existing_pair_changes(pair).await {
 			changes.note_owed(facts::carry_over(
-				decision,
+				released.iter().map(String::as_str),
 				&report.conflicts,
 				&prep.holds.held_remote,
 				streaks,
@@ -5538,8 +5542,8 @@ impl SyncEngine {
 
 		let state = screen_state(&prep);
 		let at = self.stage_at(pair);
-		// The reconcile reads and writes the plan's stage, which scales with the plan, so it runs on
-		// a blocking thread, handed what it reads and handing it back.
+		// Every read and write of the plan's stage from here to the apply scales with the plan, so
+		// each runs on a blocking thread, handed what it reads and handing it back.
 		let screened;
 		(prep, screened) = off_runtime("screening the pass's plan", move || {
 			let screened = reconcile_and_screen(&prep, state, || Stage::create(at));
@@ -5547,33 +5551,36 @@ impl SyncEngine {
 		})
 		.await?;
 		let mut screened = screened?;
-		// Where a whole pass reconciled its plan, which the plan is staged in below.
-		let reconciled_in = screened.stage.take();
 		// A one-shot approval releases the held batch it names — and only that batch.
 		if let Some(token) = screened.pass_token.clone()
 			&& self.take_approval(pair, &token).await
 		{
+			let released;
+			(screened, released) = off_runtime("releasing the approved batch", move || {
+				let released = screened.approve();
+				(screened, released)
+			})
+			.await?;
+			// Unwrapped before the log: tracing evaluates an event's arguments only when it is
+			// enabled.
+			let released = released?;
 			tracing::debug!(
-				"sync_once[pair {pair}]: approval {token} matched — applying {} held deletion(s)",
-				screened.decision.held.len(),
+				"sync_once[pair {pair}]: approval {token} matched — applying {released} held \
+				 deletion(s)"
 			);
-			screened.decision = guard::GuardDecision {
-				safe: std::mem::take(&mut screened.all),
-				held: Vec::new(),
-				reason: None,
-			};
-			screened.pass_token = None;
 		}
-		// The unscreened plan is read only to release an approved batch, just above: freed here
-		// rather than carried through the apply as a second copy of the plan.
-		drop(screened.all);
-		let mut decision = screened.decision;
-		report.conflicts = screened.conflicts;
+		report.conflicts = mem::take(&mut screened.conflicts);
 		// `held` can also carry the create half of a held type flip; `held_deletions()` counts only
 		// the deletions.
-		report.held = prep.planned(&decision.held);
-		report.guard = decision.reason.clone();
-		report.deletion_token = screened.pass_token;
+		let held;
+		(prep, screened, held) = off_runtime("listing the held actions", move || {
+			let held = prep.planned(&screened, Rows::Held);
+			(prep, screened, held)
+		})
+		.await?;
+		report.held = held?;
+		report.guard = screened.reason.clone();
+		report.deletion_token = screened.pass_token.take();
 		report.deferred_paths = screened.deferred_paths;
 		report.dropped_actions = screened.dropped;
 
@@ -5650,31 +5657,46 @@ impl SyncEngine {
 			Err(_) => None,
 		};
 		// Before the early return below: a pass with nothing to apply still made a plan, and still
-		// owes the next one everything that plan named.
+		// owes the next one everything that plan named. A plan that cannot be read back is the pass's
+		// error, as any read of its stage is.
+		let released;
+		(screened, released) = off_runtime("reading the pass's screened plan", move || {
+			let released = released_paths(&screened);
+			(screened, released)
+		})
+		.await?;
+		let released = released.map_err(|e| db_error(e, "reading the pass's screened plan"))?;
 		self.carry_forward(
 			pair,
 			&prep,
 			&report,
-			&decision,
+			&released,
 			streaks.as_ref().unwrap_or(&HashMap::new()),
 		)
 		.await;
+		drop(released);
 		// After the guard counted every item the plan deletes and the carry-over owed each of their
 		// paths: what is left is what the apply runs.
-		let subsumed = plan::fold_subsumed_deletes(&mut decision.safe);
-		observer(SyncEvent::Planned {
-			actions: decision.safe.len(),
-		});
+		let applies;
+		(screened, applies) = off_runtime("folding the pass's deletions", move || {
+			let applies = screened
+				.fold_subsumed()
+				.and_then(|()| screened.count(Rows::Safe));
+			(screened, applies)
+		})
+		.await?;
+		let applies = applies?;
+		observer(SyncEvent::Planned { actions: applies });
 
 		// The return below hands back the LOCAL half alone: `note_owed_remote` sits after the
 		// apply, since `report.interrupted` is what gates it and nothing has applied anything yet.
 		// That is the shape this stage's first attempt was reverted for, and it is safe here only
-		// because a pass with an empty `safe` list either planned nothing at all or had every
-		// action held or dropped — a hold sets `decision.reason`, which `next_pass_scope` reads as
+		// because a pass with nothing safe to apply either planned nothing at all or had every
+		// action held or dropped — a hold sets the guard's reason, which `next_pass_scope` reads as
 		// `DeletionHold`, and a drop counts in `dropped_actions`, which it reads as
 		// `UnappliedWork`. Both send the next pass to a whole read, which needs no hand-back. A
 		// change that let an action reach `held` without a reason would break that silently.
-		if decision.safe.is_empty() {
+		let Some(screen) = screened.plan.take().filter(|_| applies > 0) else {
 			tracing::debug!(
 				"sync_once[pair {pair}]: nothing to apply ({} deletion(s) held, {} conflict(s), {} path(s) deferred)",
 				report.held_deletions(),
@@ -5686,22 +5708,23 @@ impl SyncEngine {
 				report: report.clone(),
 			});
 			return Ok(report);
-		}
+		};
 
 		// Resolve the sync root to a remote directory (every top-level parent). Errors if the root
 		// is not a reachable subfolder.
 		let root_remote = self.client.get_dir(prep.record.remote_root).await?;
 
-		let ends = endable_streaks(&decision.safe, &subsumed, streaks.as_ref());
+		let (screen, ends) = off_runtime("reading the pass's screened plan", move || {
+			let ends = endable_streaks(&screen, streaks.as_ref());
+			(screen, ends)
+		})
+		.await?;
+		let ends = ends.map_err(|e| db_error(e, "reading the pass's screened plan"))?;
 		// The plan is made: each action takes what the apply reads for it into the pass's stage, and
 		// the rest of the scan, the view and the rows goes — the rows' read transaction with them,
 		// before the first action commits, since holding it open would pin the WAL through every
 		// upload (see `Baseline::close`).
-		let stage = match reconciled_in {
-			Some(stage) => stage,
-			None => self.stage(pair)?,
-		};
-		let plan = prep.stage_plan(decision.safe, subsumed, stage).await?;
+		let plan = prep.stage_plan(screen).await?;
 		let local_root = PathBuf::from(&prep.record.local_root);
 		let ctx = ApplyContext {
 			client: &self.client,
@@ -5811,7 +5834,7 @@ fn next_pass_scope(report: &SyncReport) -> Option<FullPassReason> {
 	// A pass that planned work and did not apply it: the drive-write lock it could not take (its
 	// whole plan), a side that filled up (the transfers held behind it), a record of work already
 	// done that did not land (nothing more is admitted after it), a single action that failed, or an
-	// action screened out before it ran (`drop_blocked`, `withhold_deletions_over_unreachable`).
+	// action screened out before it ran (`Blocking`, `Withholding`).
 	// Each leaves paths owed with nothing left holding them: a dropped action's evidence was an
 	// observation or an announcement this pass consumed, and a derived map rebuilds neither — the
 	// baseline row it would derive from is the one that says the change never happened.
@@ -5880,34 +5903,73 @@ fn adoption_refusal(refused: Option<RefuseReason>, state: &guard::ScreenState) -
 struct Screened {
 	/// Paths surfaced as two-way conflicts (held, never applied).
 	conflicts: Vec<PlannedConflict>,
-	/// Every executable action in apply order — what an APPROVED pass runs, held deletions and all.
-	all: Vec<SyncAction>,
-	decision: guard::GuardDecision,
+	/// Every executable action in apply order, screened in the pass's stage: what the guard holds
+	/// ([`Rows::Held`]) and what it lets through ([`Rows::Safe`]) — what an APPROVED pass runs is
+	/// both. `None` for a change-scoped pass that planned nothing, which makes no stage.
+	plan: Option<Screen>,
+	/// Why the guard holds part of the plan, exactly when it holds any.
+	reason: Option<GuardReason>,
 	/// Identifies the held batch, when the guard held one.
 	pass_token: Option<String>,
 	/// Paths this pass deliberately left alone (see [`SyncReport::deferred_paths`]).
 	deferred_paths: usize,
 	/// Actions this pass planned and then dropped (see [`SyncReport::dropped_actions`]).
 	dropped: usize,
-	/// The stage a whole pass reconciled its plan in, for the plan to be staged in once it is
-	/// screened; `None` for a pass that reconciled in memory.
-	stage: Option<Stage>,
 }
 
-/// Reconcile the prepared inputs and screen deletions through the guard, splitting out conflicts.
+impl Screened {
+	/// How many actions of `rows` the plan holds.
+	fn count(&self, rows: Rows) -> Result<usize, Error> {
+		self.plan
+			.as_ref()
+			.map_or(Ok(0), |plan| plan.count(rows))
+			.map_err(|e| db_error(e, "reading the pass's screened plan"))
+	}
+
+	/// Release the held batch, which an approval names: the pass runs it all. Says how many actions
+	/// that releases.
+	fn approve(&mut self) -> Result<usize, Error> {
+		let released = match &mut self.plan {
+			Some(plan) => plan
+				.release_held()
+				.map_err(|e| db_error(e, "releasing the approved batch"))?,
+			None => 0,
+		};
+		self.reason = None;
+		self.pass_token = None;
+		Ok(released)
+	}
+
+	/// Fold every deletion a directory deletion of the same side carries out anyway into that
+	/// directory's (see [`Screen::fold_subsumed`]): what is left is what the apply runs. After the
+	/// guard counted every item the plan deletes, and the carry-over owed each of their paths.
+	fn fold_subsumed(&mut self) -> Result<(), Error> {
+		if let Some(plan) = &mut self.plan {
+			plan.fold_subsumed()
+				.map_err(|e| db_error(e, "folding the pass's deletions"))?;
+		}
+		Ok(())
+	}
+}
+
+/// Reconcile the prepared inputs, and screen the plan in the pass's stage: the actions this pass
+/// may not run screened out of it, the conflicts split out, and the deletions through the guard.
 ///
 /// A pass that read both sides whole into its stage reconciles them window by window into a stage
 /// of its own, which `new_stage` makes (see [`stage::reconcile_windows`]): the plan is decided
-/// without a set of the tree's paths in memory, and the stage is the one the plan is staged in. Any
-/// other pass reconciles in memory, over what it read.
+/// without a set of the tree's paths in memory. Any other pass reconciles in memory, over what it
+/// read, and writes the plan it made into a stage `new_stage` makes, unless it planned nothing.
+/// Either way the plan is screened where it is staged, a page at a time (see [`screen_plan`]), and
+/// that stage is the one the plan the apply runs is staged in.
 ///
-/// A stage that cannot be made or written (a full disk) is an error, before anything is applied.
+/// A stage that cannot be made, written or read (a full disk) is an error, before anything is
+/// applied.
 fn reconcile_and_screen(
 	prep: &Prepared,
 	state: guard::ScreenState,
 	new_stage: impl FnOnce() -> Result<Stage, Error>,
 ) -> Result<Screened, Error> {
-	let (plan, stage) = match (
+	let (screen, deferred) = match (
 		prep.read.paths(),
 		&prep.local_scan.nodes,
 		&prep.remote_view.nodes,
@@ -5915,7 +5977,9 @@ fn reconcile_and_screen(
 		(plan::PassPaths::Whole, Side::Staged(local), Side::Staged(remote)) => {
 			let stage = new_stage()?;
 			let at = stage.path().display().to_string();
-			let (plan, stage) = stage::reconcile_windows(
+			// The directory moves run before everything else in the plan, which already names their
+			// subtrees by the paths they move to.
+			stage::reconcile_windows(
 				prep.record.mode,
 				&prep.baseline,
 				local,
@@ -5924,76 +5988,109 @@ fn reconcile_and_screen(
 				stage,
 				stage::WINDOW,
 			)
-			.and_then(|windows| windows.into_plan(&prep.holds))
-			.map_err(|e| db_error(e, &format!("reconciling the pass in {at}")))?;
-			(plan, Some(stage))
+			.and_then(|windows| windows.screen(&prep.holds, &prep.dir_moves))
+			.map_err(|e| db_error(e, &format!("reconciling the pass in {at}")))?
 		}
-		_ => (
-			plan::reconcile(
+		_ => {
+			let plan = plan::reconcile(
 				prep.record.mode,
 				&prep.baseline,
 				&prep.local_scan.nodes.of(&prep.baseline),
 				&prep.remote_view.nodes.of(&prep.baseline),
 				&prep.holds,
 				prep.read.paths(),
-			),
-			None,
-		),
+			);
+			if plan.actions.is_empty() && prep.dir_moves.is_empty() {
+				return Ok(Screened {
+					conflicts: Vec::new(),
+					plan: None,
+					reason: None,
+					pass_token: None,
+					deferred_paths: plan.deferred_paths,
+					dropped: 0,
+				});
+			}
+			let stage = new_stage()?;
+			let at = stage.path().display().to_string();
+			let screen = Screen::new(stage, &prep.dir_moves, &plan.actions)
+				.map_err(|e| db_error(e, &format!("staging the pass's plan in {at}")))?;
+			(screen, plan.deferred_paths)
+		}
 	};
-	// The directory moves run before everything else in the plan, which already names their
-	// subtrees by the paths they move to. Copied: the dry run plans from the same borrowed `Prepared`.
-	let mut actions = prep.dir_moves.clone();
-	actions.extend(plan.actions);
-	// Both filters only ever REMOVE actions, so the difference is what this pass planned and will
+	let context = format!("screening the pass's plan in {}", screen.path().display());
+	screen_plan(prep, state, screen, deferred).map_err(|e| match e {
+		ScreenError::Sql(e) => db_error(e, &context),
+		invariant => Error::custom_with_source(ErrorKind::Internal, invariant, Some(context)),
+	})
+}
+
+/// Screen `screen`, the reconciled plan with the directory moves leading it, where it is staged —
+/// `deferred` being the paths the reconcile deferred — in the order a pass always screened it:
+///
+/// - drop what this pass may not act on ([`Blocking`]), and the deletions, and the creates of a
+///   type flip, it withholds ([`Withholding`]); each is decided by the paths the pass blocks and
+///   withholds and a first sweep of the moves or the deletions, which are all a decision reads
+///   beyond the action itself;
+/// - run each directory move right after the creates above its destination
+///   ([`Screen::lead_creates`]);
+/// - split the conflicts out;
+/// - COUNT the deletions, which is all the guard decides from ([`guard::reason_for`]); when it holds
+///   them, mark what its reason holds ([`Screen::hold`]) and name the held batch by a token hashed
+///   from its lines as they stream out of the stage in sorted order ([`BatchToken`]).
+///
+/// What this holds is a page of the plan and those sets of paths; never the plan, a copy of it, or a
+/// line per held deletion.
+fn screen_plan(
+	prep: &Prepared,
+	state: guard::ScreenState,
+	mut screen: Screen,
+	deferred: usize,
+) -> Result<Screened, ScreenError> {
+	// Both filters only ever REMOVE actions, and what they remove is what this pass planned and will
 	// not carry out. The next pass has to read everything to find those paths again: the evidence
 	// that planned them — a local observation, an announced remote change — was consumed here.
-	let planned = actions.len();
-	let actions = drop_blocked(actions, &prep.blocked_paths(), &prep.ignored_roots());
-	let (actions, over_ignored) = withhold_deletions_over_unreachable(
-		actions,
+	let mut dropped = 0;
+	let (blocked, ignored) = (prep.blocked_paths(), prep.ignored_roots());
+	if let Some(mut blocking) = Blocking::new(&blocked, &ignored) {
+		screen.each(Rows::Moves, |action| blocking.note(&action))?;
+		dropped += screen.retain(Rows::All, |action| blocking.keeps(action))?;
+	}
+	let blocked_rules = prep.blocked_rules();
+	let mut withholding = Withholding::new(
 		&prep.facts.unknown_remote,
 		&prep.holds.held_remote,
 		[&prep.facts.ignored_local, &prep.facts.ignored_remote],
-		&prep.blocked_rules(),
+		&blocked_rules,
 	);
-	let dropped = planned - actions.len();
-	let deferred_paths = plan.deferred_paths + over_ignored;
-	let actions = creates_before_dir_moves(actions);
-	let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
-		.into_iter()
-		.partition(|a| matches!(a, SyncAction::Conflict { .. }));
-	let conflicts = conflict_actions
-		.iter()
-		.map(|a| {
-			planned_conflict(
-				a.rel_path(),
-				&prep.local_scan.nodes.of(&prep.baseline),
-				&prep.remote_view.nodes.of(&prep.baseline),
-			)
-		})
-		.collect();
-	// The unscreened list is only needed to release an approved batch, which cannot happen unless
-	// the pass plans a deletion at all — so a pure-transfer pass (a first sync, say) never pays for
-	// the copy.
-	let all = if executable.iter().any(SyncAction::is_delete) {
-		executable.clone()
-	} else {
-		Vec::new()
-	};
+	if withholding.may_withhold() {
+		screen.each(Rows::Deletes, |action| withholding.note(&action))?;
+		if withholding.withholds() {
+			dropped += screen.retain(Rows::All, |action| withholding.keeps(action))?;
+		}
+	}
+	let deferred_paths = deferred + withholding.over_ignored;
+	screen.lead_creates()?;
+	let (local, remote) = (
+		prep.local_scan.nodes.of(&prep.baseline),
+		prep.remote_view.nodes.of(&prep.baseline),
+	);
+	let mut conflicts = Vec::new();
+	screen.take_conflicts(|path| conflicts.push(planned_conflict(path, &local, &remote)))?;
 	// A path that stops being ignored has no rows and syncs like a first sync, whose deletions are held
 	// for approval: the rows the pair tracks elsewhere say nothing about what sits there.
+	let mut first_sync = state.first_sync;
 	let unignored = prep.unignored();
-	let first_sync = state.first_sync
-		|| (!unignored.is_empty()
-			&& executable.iter().any(|action| {
-				let path = action.rel_path();
-				action.is_delete()
-					&& plan::ancestors(path)
-						.chain([path])
-						.any(|at| unignored.contains(at))
-			}));
-	let decision = guard::screen(
-		executable,
+	if !first_sync && !unignored.is_empty() {
+		screen.each_while(Rows::Deletes, |action| {
+			let path = action.rel_path();
+			first_sync = plan::ancestors(path)
+				.chain([path])
+				.any(|at| unignored.contains(at));
+			!first_sync
+		})?;
+	}
+	let reason = guard::reason_for(
+		screen.count(Rows::Deletes)?,
 		guard::ScreenState {
 			first_sync,
 			..state
@@ -6001,22 +6098,47 @@ fn reconcile_and_screen(
 		prep.record.delete_guard,
 	);
 	// The guard names a reason exactly when it holds something, so a held batch always has one.
-	let pass_token = decision
-		.reason
-		.as_ref()
-		.map(|reason| deletion_batch_token(&decision.held, reason));
+	let pass_token = match &reason {
+		None => None,
+		Some(reason) => {
+			let held = screen.hold()?;
+			tracing::debug!("guard: holding {held} action(s) back this pass — {reason:?}");
+			let mut token = BatchToken::new(reason);
+			screen.each_held_by_line(|action| token.line(action))?;
+			Some(token.finish())
+		}
+	};
 	Ok(Screened {
 		conflicts,
-		all,
-		decision,
+		plan: Some(screen),
+		reason,
 		pass_token,
 		deferred_paths,
 		dropped,
-		stage,
 	})
 }
 
-/// Drop every action at a blocked path, and everything under it.
+/// The paths the screened plan released past the guard — both ends of each action it lets through —
+/// read only until they number more than [`DIRTY_CAP`], past which
+/// [`PairChanges::note_owed`] keeps no set at all: what the next pass owes a look at costs that
+/// many paths, whatever the plan holds (see [`facts::carry_over`]).
+fn released_paths(screened: &Screened) -> rusqlite::Result<BTreeSet<String>> {
+	let mut released = BTreeSet::new();
+	if let Some(plan) = &screened.plan {
+		plan.each_while(Rows::Safe, |action| {
+			let (from, to) = action.endpoints();
+			for end in [from, to] {
+				if !released.contains(end) {
+					released.insert(end.to_owned());
+				}
+			}
+			!past_cap(released.len(), DIRTY_CAP)
+		})?;
+	}
+	Ok(released)
+}
+
+/// Drop every action at a blocked path, and everything under it, decided an action at a time.
 ///
 /// A path is blocked when the remote would reject its name, when its failure streak ran out (and
 /// stays blocked until a [`retry_path`](SyncEngine::retry_path) or a rename clears it, or
@@ -6029,81 +6151,93 @@ fn reconcile_and_screen(
 /// unknown as the directory.
 ///
 /// Dropping the destination half of a MOVE takes the deletions that would strand its source with it
-/// (see below): an unrelocatable item must not be deleted from the side that still holds it.
+/// (see below): an unrelocatable item must not be deleted from the side that still holds it. So
+/// every move is [`note`](Self::note)d before any action is asked about.
 ///
 /// A move whose SOURCE is at or under an `ignored` root (a subset of `blocked`) goes too: the tracked
 /// copy there is no longer synced, so it must not be moved away. Nothing is stranded by that, since
 /// the deletions at the source are blocked already, and whether a directory above it may still be
-/// deleted is for [`withhold_deletions_over_unreachable`] to decide.
-fn drop_blocked(
-	actions: Vec<SyncAction>,
-	blocked: &BTreeSet<String>,
-	ignored: &BTreeSet<String>,
-) -> Vec<SyncAction> {
-	if blocked.is_empty() && ignored.is_empty() {
-		return actions;
+/// deleted is for [`Withholding`] to decide.
+struct Blocking<'s> {
+	blocked: &'s BTreeSet<String>,
+	ignored: &'s BTreeSet<String>,
+	/// The sources of the moves this drops: their content is staying exactly where it is.
+	stranded: Vec<String>,
+}
+
+impl<'s> Blocking<'s> {
+	/// What drops actions for `blocked` and `ignored`; `None` when both are empty, and nothing is
+	/// dropped.
+	fn new(blocked: &'s BTreeSet<String>, ignored: &'s BTreeSet<String>) -> Option<Self> {
+		(!blocked.is_empty() || !ignored.is_empty()).then(|| Self {
+			blocked,
+			ignored,
+			stranded: Vec::new(),
+		})
 	}
-	// `""` is the pair root, whose rules can be unreadable too: everything is under it. Every other
-	// root is found by walking the path's own ancestors, rather than reading every root per action.
-	let at_or_under = |roots: &BTreeSet<String>, path: &str| {
+
+	/// Whether `path` is at or under one of `roots`. `""` is the pair root, whose rules can be
+	/// unreadable too: everything is under it. Every other root is found by walking the path's own
+	/// ancestors, rather than reading every root per action.
+	fn at_or_under(roots: &BTreeSet<String>, path: &str) -> bool {
 		roots.contains("") || plan::at_or_under_root(roots, path)
-	};
-	// The sources of the moves this dropped: their content is staying exactly where it is.
-	let mut stranded: Vec<String> = Vec::new();
-	let kept: Vec<SyncAction> = actions
-		.into_iter()
-		.filter(|action| {
-			let path = action.rel_path();
-			if let SyncAction::MoveRemote { from_path, .. }
-			| SyncAction::MoveLocal { from_path, .. } = action
-				&& at_or_under(ignored, from_path)
-			{
-				tracing::debug!(
-					"reconcile: skipping {} — it moves an ignored item",
-					action.describe()
-				);
-				return false;
-			}
-			if !at_or_under(blocked, path) {
-				return true;
-			}
+	}
+
+	/// Whether `action` is a move whose source is ignored.
+	fn moves_ignored(&self, action: &SyncAction) -> bool {
+		matches!(
+			action,
+			SyncAction::MoveRemote { from_path, .. } | SyncAction::MoveLocal { from_path, .. }
+				if Self::at_or_under(self.ignored, from_path)
+		)
+	}
+
+	/// Note the source `action` strands, when it is a move this drops for the path it moves to.
+	fn note(&mut self, action: &SyncAction) {
+		if let SyncAction::MoveRemote { from_path, .. } | SyncAction::MoveLocal { from_path, .. } =
+			action && !self.moves_ignored(action)
+			&& Self::at_or_under(self.blocked, action.rel_path())
+		{
+			self.stranded.push(from_path.clone());
+		}
+	}
+
+	/// Whether `action` is kept.
+	fn keeps(&self, action: &SyncAction) -> bool {
+		if self.moves_ignored(action) {
+			tracing::debug!(
+				"reconcile: skipping {} — it moves an ignored item",
+				action.describe()
+			);
+			return false;
+		}
+		let path = action.rel_path();
+		if Self::at_or_under(self.blocked, path) {
 			tracing::debug!(
 				"reconcile: skipping {} — its path is blocked (a name the remote rejects, \
 				 {MAX_PATH_FAILURES} consecutive failures, or an ignore rule)",
 				action.describe()
 			);
-			if let SyncAction::MoveRemote { from_path, .. }
-			| SyncAction::MoveLocal { from_path, .. } = action
-			{
-				stranded.push(from_path.clone());
-			}
-			false
-		})
-		.collect();
-	if stranded.is_empty() {
-		return kept;
+			return false;
+		}
+		// A move the pass could not make leaves its source in place — and the source reads as "gone"
+		// on the other side, which is what planned the deletion in the first place. Deleting it now
+		// (or deleting the directory above it, which is recursive) would destroy the only copy of
+		// content this pass just refused to relocate. Renaming a synced item into a name the remote
+		// rejects is exactly that shape.
+		let strands = action.is_delete()
+			&& self
+				.stranded
+				.iter()
+				.any(|from| from == path || plan::is_under(from, path));
+		if strands {
+			tracing::debug!(
+				"reconcile: skipping {} — it still holds content a blocked move could not relocate",
+				action.describe()
+			);
+		}
+		!strands
 	}
-	// A move the pass could not make leaves its source in place — and the source reads as "gone" on
-	// the other side, which is what planned the deletion in the first place. Deleting it now (or
-	// deleting the directory above it, which is recursive) would destroy the only copy of content
-	// this pass just refused to relocate. Renaming a synced item into a name the remote rejects is
-	// exactly that shape.
-	kept.into_iter()
-		.filter(|action| {
-			let path = action.rel_path();
-			let strands = action.is_delete()
-				&& stranded
-					.iter()
-					.any(|from| from == path || plan::is_under(from, path));
-			if strands {
-				tracing::debug!(
-					"reconcile: skipping {} — it still holds content a blocked move could not relocate",
-					action.describe()
-				);
-			}
-			!strands
-		})
-		.collect()
 }
 
 /// Drop a deletion of a directory above a path whose item still exists where this pass cannot act on
@@ -6121,159 +6255,181 @@ fn drop_blocked(
 ///   (`[ignored_local, ignored_remote]`), the deletion waits for as long as the rule stands: ignored
 ///   content is never deleted, so the directory stays, holding only it. Content only the built-in
 ///   defaults hide does not keep a directory, or every folder deleted elsewhere would survive on
-///   each Mac for its `.DS_Store`. Returned as the second value, counted as deferred.
+///   each Mac for its `.DS_Store`. Counted as deferred (`over_ignored`).
 /// - Over a subtree whose ignore rules could not be read (`ignore_blocked`), on either side, the
 ///   same: what those rules hide cannot be told apart from what they do not.
 ///
 /// A deletion around a path blocked for any other reason (a rejected name, an alias, a park) runs as
 /// it did, into the recoverable quarantine or trash.
-fn withhold_deletions_over_unreachable(
-	actions: Vec<SyncAction>,
-	unknown: &BTreeMap<String, UnsyncableReason>,
-	held: &BTreeSet<String>,
-	[ignored_local, ignored_remote]: [&BTreeMap<String, IgnoreDecision>; 2],
-	ignore_blocked: &BTreeSet<String>,
-) -> (Vec<SyncAction>, usize) {
-	// By level alone: which line matched says nothing about whether the content must be kept. Each
-	// question is "is anything under this directory", which a sorted map answers by seeking to it.
-	let keeps_ignored = |ignored: &BTreeMap<String, IgnoreDecision>, dir: &str| {
-		ignore_blocked
+///
+/// Which paths wait is decided by the deletions alone, so every deletion is
+/// [`note`](Self::note)d before any action is asked about.
+struct Withholding<'s> {
+	unknown: &'s BTreeMap<String, UnsyncableReason>,
+	held: &'s BTreeSet<String>,
+	ignored: [&'s BTreeMap<String, IgnoreDecision>; 2],
+	ignore_blocked: &'s BTreeSet<String>,
+	/// The paths whose deletions and creates wait: the directories withheld, and the `.filenignore`
+	/// files whose rules keep one — deleted, they would leave the next pass no rule there, and the
+	/// ignored content would go down with the directory after all.
+	withheld: BTreeSet<String>,
+	/// How many deletions wait over ignored content alone, which the pass counts as deferred.
+	over_ignored: usize,
+}
+
+impl<'s> Withholding<'s> {
+	fn new(
+		unknown: &'s BTreeMap<String, UnsyncableReason>,
+		held: &'s BTreeSet<String>,
+		ignored: [&'s BTreeMap<String, IgnoreDecision>; 2],
+		ignore_blocked: &'s BTreeSet<String>,
+	) -> Self {
+		Self {
+			unknown,
+			held,
+			ignored,
+			ignore_blocked,
+			withheld: BTreeSet::new(),
+			over_ignored: 0,
+		}
+	}
+
+	/// Whether any deletion can wait: none does with nothing held, unknown, ignored or under rules
+	/// that could not be read.
+	fn may_withhold(&self) -> bool {
+		!self.held.is_empty()
+			|| !self.unknown.is_empty()
+			|| self.ignored.iter().any(|ignored| !ignored.is_empty())
+			|| !self.ignore_blocked.is_empty()
+	}
+
+	/// Whether a deletion noted so far waits.
+	fn withholds(&self) -> bool {
+		!self.withheld.is_empty()
+	}
+
+	/// Whether the directory at `dir` keeps content `ignored` hides. By level alone: which line
+	/// matched says nothing about whether the content must be kept. Each question is "is anything
+	/// under this directory", which a sorted map answers by seeking to it.
+	fn keeps_ignored(&self, ignored: &BTreeMap<String, IgnoreDecision>, dir: &str) -> bool {
+		self.ignore_blocked
 			.range(plan::subtree_bounds(dir))
 			.next()
 			.is_some()
 			|| plan::under_dir(ignored, dir)
 				.any(|(_, decision)| decision.level != IgnoreLevel::Default)
-	};
-	let mut over_ignored = 0;
-	// The `.filenignore` files whose rules keep a withheld directory. Deleted, they would leave the
-	// next pass no rule there, and the ignored content would go down with the directory after all.
-	let mut kept_rule_files = Vec::new();
-	let mut withheld: BTreeSet<String> = actions
-		.iter()
-		.filter(|action| {
-			let dir = action.rel_path();
-			let above_held = held.range(plan::subtree_bounds(dir)).next().is_some();
-			let (unreachable, ignored, side) = match action {
-				SyncAction::DeleteLocal { .. } => (
-					above_held || plan::under_dir(unknown, dir).next().is_some(),
-					keeps_ignored(ignored_local, dir),
-					ignored_local,
-				),
-				SyncAction::TrashRemote { .. } => (
-					above_held,
-					keeps_ignored(ignored_remote, dir),
-					ignored_remote,
-				),
-				_ => return false,
-			};
-			if ignored {
-				kept_rule_files.extend(side.values().filter_map(
-					|decision| match &decision.level {
-						IgnoreLevel::File { dir: rules }
-							if rules == dir || plan::is_under(rules, dir) =>
-						{
-							Some(Origin::File { dir: rules }.to_string())
-						}
-						IgnoreLevel::Default | IgnoreLevel::User | IgnoreLevel::File { .. } => None,
-					},
-				));
-				if !unreachable {
-					over_ignored += 1;
-				}
-			}
-			unreachable || ignored
-		})
-		.map(|action| action.rel_path().to_string())
-		.collect();
-	withheld.extend(kept_rule_files);
-	if withheld.is_empty() {
-		return (actions, over_ignored);
 	}
-	let kept = actions
-		.into_iter()
-		.filter(|action| {
-			let waits =
-				(action.is_delete() || action.is_create()) && withheld.contains(action.rel_path());
-			if waits {
-				tracing::debug!(
-					"reconcile: skipping {} — the directory holds an item this pass cannot act on",
-					action.describe()
-				);
+
+	/// Note `action`, when it is a deletion that waits.
+	fn note(&mut self, action: &SyncAction) {
+		let dir = action.rel_path();
+		let above_held = self.held.range(plan::subtree_bounds(dir)).next().is_some();
+		let [ignored_local, ignored_remote] = self.ignored;
+		let (unreachable, ignored, side) = match action {
+			SyncAction::DeleteLocal { .. } => (
+				above_held || plan::under_dir(self.unknown, dir).next().is_some(),
+				self.keeps_ignored(ignored_local, dir),
+				ignored_local,
+			),
+			SyncAction::TrashRemote { .. } => (
+				above_held,
+				self.keeps_ignored(ignored_remote, dir),
+				ignored_remote,
+			),
+			_ => return,
+		};
+		if ignored {
+			self.withheld
+				.extend(side.values().filter_map(|decision| match &decision.level {
+					IgnoreLevel::File { dir: rules }
+						if rules == dir || plan::is_under(rules, dir) =>
+					{
+						Some(Origin::File { dir: rules }.to_string())
+					}
+					IgnoreLevel::Default | IgnoreLevel::User | IgnoreLevel::File { .. } => None,
+				}));
+			if !unreachable {
+				self.over_ignored += 1;
 			}
-			!waits
-		})
-		.collect();
-	(kept, over_ignored)
+		}
+		if unreachable || ignored {
+			self.withheld.insert(dir.to_owned());
+		}
+	}
+
+	/// Whether `action` is kept.
+	fn keeps(&self, action: &SyncAction) -> bool {
+		let waits =
+			(action.is_delete() || action.is_create()) && self.withheld.contains(action.rel_path());
+		if waits {
+			tracing::debug!(
+				"reconcile: skipping {} — the directory holds an item this pass cannot act on",
+				action.describe()
+			);
+		}
+		!waits
+	}
 }
 
-/// Run each directory move right after the creates of the new directories above its destination, on
-/// the side it moves (see `plan::parents_ready`); everything else keeps its order. Those creates
-/// are planned with the rest of the pass, which runs after the moves.
-fn creates_before_dir_moves(actions: Vec<SyncAction>) -> Vec<SyncAction> {
-	let (moves, mut rest): (Vec<_>, Vec<_>) = actions.into_iter().partition(|action| {
-		matches!(
-			action,
-			SyncAction::MoveLocal {
-				kind: NodeKind::Dir,
-				..
-			} | SyncAction::MoveRemote {
-				kind: NodeKind::Dir,
-				..
-			}
-		)
-	});
-	let mut ordered = Vec::with_capacity(moves.len() + rest.len());
-	for action in moves {
-		let local = matches!(action, SyncAction::MoveLocal { .. });
-		let to = action.rel_path();
-		ordered.extend(rest.extract_if(.., |create| match create {
-			SyncAction::CreateLocalDir { rel_path } => local && plan::is_under(to, rel_path),
-			SyncAction::CreateRemoteDir { rel_path } => !local && plan::is_under(to, rel_path),
-			_ => false,
-		}));
-		ordered.push(action);
-	}
-	ordered.extend(rest);
-	ordered
-}
-
-/// A stable identifier for one held deletion batch: the kind of reason the guard held it for, then
-/// the sorted `(side, path)` lines, hashed. The same deletions held for the same kind of reason
-/// always yield the same token; adding, dropping or re-siding a single deletion yields a different
-/// one, and so does holding the very same deletions for another reason — which is what makes an
-/// approval specific to the batch AND to what the caller was told about it. Approving deletions
-/// over the volume limit must not release the same paths once they are held because the remote
-/// listed nothing at all.
+/// A stable identifier for one held deletion batch, hashed as it is read: the kind of reason the
+/// guard held it for, then the `(side, path)` line of each held action, in sorted order. The same
+/// deletions held for the same kind of reason always yield the same token; adding, dropping or
+/// re-siding a single deletion yields a different one, and so does holding the very same deletions
+/// for another reason — which is what makes an approval specific to the batch AND to what the caller
+/// was told about it. Approving deletions over the volume limit must not release the same paths once
+/// they are held because the remote listed nothing at all.
 ///
 /// The reason enters by its kind alone: the counts it carries are not something a caller approves.
-/// The deletion count is the batch's own size, which the lines already pin, and the limit moves
-/// with the tracked-item count, which an unrelated upload landing between the hold and the
-/// approval changes.
-fn deletion_batch_token(held: &[SyncAction], reason: &GuardReason) -> String {
-	let kind = match reason {
+/// The deletion count is the batch's own size, which the lines already pin, and the limit moves with
+/// the tracked-item count, which an unrelated upload landing between the hold and the approval
+/// changes.
+///
+/// The lines are fed in as a staged plan reads them out ([`Screen::each_held_by_line`]), so a
+/// batch of any size is hashed without a line of it held.
+struct BatchToken(blake3::Hasher);
+
+impl BatchToken {
+	fn new(reason: &GuardReason) -> Self {
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(token_kind(reason).as_bytes());
+		hasher.update(b"\n");
+		Self(hasher)
+	}
+
+	/// Hash the line of `action`, the next held action in the lines' sorted order.
+	fn line(&mut self, action: &SyncAction) {
+		let (side, path) = token_line(action);
+		self.0.update(side.as_bytes());
+		self.0.update(b"\t");
+		self.0.update(path.as_bytes());
+		self.0.update(b"\n");
+	}
+
+	fn finish(self) -> String {
+		self.0.finalize().to_hex().chars().take(16).collect()
+	}
+}
+
+/// The kind of `reason`, as a held batch's token names it.
+fn token_kind(reason: &GuardReason) -> &'static str {
+	match reason {
 		GuardReason::ScanIncomplete => "scan-incomplete",
 		GuardReason::FirstSyncWithDeletions { .. } => "first-sync",
 		GuardReason::RemoteUnconverged { .. } => "remote-unconverged",
 		GuardReason::RemoteEmptied { .. } => "remote-emptied",
 		GuardReason::ExceededThreshold { .. } => "over-limit",
-	};
-	let mut lines: Vec<String> = held
-		.iter()
-		.map(|action| match action {
-			SyncAction::DeleteLocal { rel_path, .. } => format!("local\t{rel_path}"),
-			SyncAction::TrashRemote { rel_path, .. } => format!("remote\t{rel_path}"),
-			other => format!("other\t{}", other.rel_path()),
-		})
-		.collect();
-	lines.sort_unstable();
-	let mut hasher = blake3::Hasher::new();
-	hasher.update(kind.as_bytes());
-	hasher.update(b"\n");
-	for line in &lines {
-		hasher.update(line.as_bytes());
-		hasher.update(b"\n");
 	}
-	hasher.finalize().to_hex().chars().take(16).collect()
+}
+
+/// The line a held action is named by in its batch's token: its side and its path. The sides sort
+/// `local`, `other`, `remote`, and no side is a prefix of another, so the lines sort by side and
+/// then by path.
+fn token_line(action: &SyncAction) -> (&'static str, &str) {
+	match action {
+		SyncAction::DeleteLocal { rel_path, .. } => ("local", rel_path),
+		SyncAction::TrashRemote { rel_path, .. } => ("remote", rel_path),
+		other => ("other", other.rel_path()),
+	}
 }
 
 /// How trustworthy this pass's inputs are, for the guard.
@@ -6341,6 +6497,7 @@ mod tests {
 	};
 
 	use filen_types::{crypto::Blake3Hash, fs::StableUuid};
+	use rand::{Rng, SeedableRng, rngs::StdRng};
 
 	use super::*;
 	use crate::{
@@ -6350,14 +6507,203 @@ mod tests {
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
 			PauseMode,
+			apply::PassStart,
 			baseline::{BaselineChange, NodeKind},
 			derive::Derived,
 			ignore::IgnoreRules,
-			plan::RemoteNode,
+			plan::{
+				RemoteNode,
+				test_support::{first_dir_deletion, folded},
+			},
 			scan::LocalNode,
 			side::test_support::copied,
 		},
 	};
+
+	/// A pass reconciled and screened as a list, in memory: what [`reconcile_and_screen`] screens in
+	/// the stage is held to this.
+	struct ResidentScreened {
+		conflicts: Vec<PlannedConflict>,
+		/// Every executable action in apply order — what an APPROVED pass runs, held deletions and
+		/// all. Empty when the plan deletes nothing, which no approval can release.
+		all: Vec<SyncAction>,
+		decision: guard::test_support::GuardDecision,
+		pass_token: Option<String>,
+		deferred_paths: usize,
+		dropped: usize,
+	}
+
+	/// The prepared inputs reconciled in memory and screened as a list, as a pass screened its plan
+	/// before it screened it in its stage (see [`ResidentScreened`]).
+	fn reconcile_and_screen_resident(
+		prep: &Prepared,
+		state: guard::ScreenState,
+	) -> ResidentScreened {
+		let plan = plan::reconcile(
+			prep.record.mode,
+			&prep.baseline,
+			&prep.local_scan.nodes.of(&prep.baseline),
+			&prep.remote_view.nodes.of(&prep.baseline),
+			&prep.holds,
+			prep.read.paths(),
+		);
+		let mut actions = prep.dir_moves.clone();
+		actions.extend(plan.actions);
+		let planned = actions.len();
+		let actions = drop_blocked(actions, &prep.blocked_paths(), &prep.ignored_roots());
+		let (actions, over_ignored) = withhold_deletions_over_unreachable(
+			actions,
+			&prep.facts.unknown_remote,
+			&prep.holds.held_remote,
+			[&prep.facts.ignored_local, &prep.facts.ignored_remote],
+			&prep.blocked_rules(),
+		);
+		let dropped = planned - actions.len();
+		let deferred_paths = plan.deferred_paths + over_ignored;
+		let actions = creates_before_dir_moves(actions);
+		let (conflict_actions, executable): (Vec<_>, Vec<_>) = actions
+			.into_iter()
+			.partition(|a| matches!(a, SyncAction::Conflict { .. }));
+		let conflicts = conflict_actions
+			.iter()
+			.map(|a| {
+				planned_conflict(
+					a.rel_path(),
+					&prep.local_scan.nodes.of(&prep.baseline),
+					&prep.remote_view.nodes.of(&prep.baseline),
+				)
+			})
+			.collect();
+		let all = if executable.iter().any(SyncAction::is_delete) {
+			executable.clone()
+		} else {
+			Vec::new()
+		};
+		let unignored = prep.unignored();
+		let first_sync = state.first_sync
+			|| (!unignored.is_empty()
+				&& executable.iter().any(|action| {
+					let path = action.rel_path();
+					action.is_delete()
+						&& plan::ancestors(path)
+							.chain([path])
+							.any(|at| unignored.contains(at))
+				}));
+		let decision = guard::test_support::screen(
+			executable,
+			guard::ScreenState {
+				first_sync,
+				..state
+			},
+			prep.record.delete_guard,
+		);
+		let pass_token = decision
+			.reason
+			.as_ref()
+			.map(|reason| deletion_batch_token(&decision.held, reason));
+		ResidentScreened {
+			conflicts,
+			all,
+			decision,
+			pass_token,
+			deferred_paths,
+			dropped,
+		}
+	}
+
+	/// [`Blocking`] over a list.
+	fn drop_blocked(
+		actions: Vec<SyncAction>,
+		blocked: &BTreeSet<String>,
+		ignored: &BTreeSet<String>,
+	) -> Vec<SyncAction> {
+		let Some(mut blocking) = Blocking::new(blocked, ignored) else {
+			return actions;
+		};
+		for action in &actions {
+			blocking.note(action);
+		}
+		actions
+			.into_iter()
+			.filter(|action| blocking.keeps(action))
+			.collect()
+	}
+
+	/// [`Withholding`] over a list, with the deletions it counts as deferred.
+	fn withhold_deletions_over_unreachable(
+		actions: Vec<SyncAction>,
+		unknown: &BTreeMap<String, UnsyncableReason>,
+		held: &BTreeSet<String>,
+		ignored: [&BTreeMap<String, IgnoreDecision>; 2],
+		ignore_blocked: &BTreeSet<String>,
+	) -> (Vec<SyncAction>, usize) {
+		let mut withholding = Withholding::new(unknown, held, ignored, ignore_blocked);
+		for action in &actions {
+			withholding.note(action);
+		}
+		if !withholding.withholds() {
+			return (actions, withholding.over_ignored);
+		}
+		let kept = actions
+			.into_iter()
+			.filter(|action| withholding.keeps(action))
+			.collect();
+		(kept, withholding.over_ignored)
+	}
+
+	/// Run each directory move right after the creates of the new directories above its
+	/// destination, on the side it moves (see `plan::parents_ready`); everything else keeps its
+	/// order. Those creates are planned with the rest of the pass, which runs after the moves. Over
+	/// a list: what [`Screen::lead_creates`] does in the stage.
+	fn creates_before_dir_moves(actions: Vec<SyncAction>) -> Vec<SyncAction> {
+		let (moves, mut rest): (Vec<_>, Vec<_>) = actions.into_iter().partition(|action| {
+			matches!(
+				action,
+				SyncAction::MoveLocal {
+					kind: NodeKind::Dir,
+					..
+				} | SyncAction::MoveRemote {
+					kind: NodeKind::Dir,
+					..
+				}
+			)
+		});
+		let mut ordered = Vec::with_capacity(moves.len() + rest.len());
+		for action in moves {
+			let local = matches!(action, SyncAction::MoveLocal { .. });
+			let to = action.rel_path();
+			ordered.extend(rest.extract_if(.., |create| match create {
+				SyncAction::CreateLocalDir { rel_path } => local && plan::is_under(to, rel_path),
+				SyncAction::CreateRemoteDir { rel_path } => !local && plan::is_under(to, rel_path),
+				_ => false,
+			}));
+			ordered.push(action);
+		}
+		ordered.extend(rest);
+		ordered
+	}
+
+	/// A held batch's token over a list of it, its lines sorted in memory: what [`BatchToken`]
+	/// hashes as a staged plan streams them.
+	fn deletion_batch_token(held: &[SyncAction], reason: &GuardReason) -> String {
+		let mut lines: Vec<String> = held
+			.iter()
+			.map(|action| match action {
+				SyncAction::DeleteLocal { rel_path, .. } => format!("local\t{rel_path}"),
+				SyncAction::TrashRemote { rel_path, .. } => format!("remote\t{rel_path}"),
+				other => format!("other\t{}", other.rel_path()),
+			})
+			.collect();
+		lines.sort_unstable();
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(token_kind(reason).as_bytes());
+		hasher.update(b"\n");
+		for line in &lines {
+			hasher.update(line.as_bytes());
+			hasher.update(b"\n");
+		}
+		hasher.finalize().to_hex().chars().take(16).collect()
+	}
 
 	/// The pair whose writes the pending-write tests record.
 	const PAIR: PairId = 1;
@@ -6654,9 +7000,13 @@ mod tests {
 			tracked: 1,
 		};
 		assert!(
-			guard::screen(reconciled.actions.clone(), healthy, DeleteGuard::default())
-				.held
-				.is_empty(),
+			guard::test_support::screen(
+				reconciled.actions.clone(),
+				healthy,
+				DeleteGuard::default()
+			)
+			.held
+			.is_empty(),
 			"the guard alone lets that one delete through"
 		);
 
@@ -6700,15 +7050,17 @@ mod tests {
 		(actions, prep.unsyncable())
 	}
 
-	/// What [`reconcile_and_screen`] hands back for `prep`, whose two sides are whole maps, reconciled
-	/// in memory — and held to what a whole pass gets from the same two sides staged, which it
-	/// reconciles window by window: the same actions, held and safe, the same conflicts, hold and
-	/// token, and the same counts. `prep` is left with its maps.
-	fn screened_both(prep: &mut Prepared) -> Screened {
-		let in_memory = reconcile_and_screen(prep, screen_state(prep), || {
-			panic!("a pass over whole maps reconciles in memory, and makes no stage")
-		})
-		.unwrap();
+	/// What a pass makes of `prep`, whose two sides are whole maps, reconciled and screened as a list
+	/// in memory ([`reconcile_and_screen_resident`]) — and held to what a pass screens in its stage
+	/// from the same inputs: reconciled in memory, as a change-scoped pass reconciles, and window by
+	/// window over the same two sides staged, as a whole pass does. Each must come out with the same
+	/// actions, safe and held, in the same order, the same conflicts, hold, token and counts, and the
+	/// same folded plan, approved or not (see [`assert_screened_as`]). `prep` is left with its maps.
+	fn screened_both(prep: &mut Prepared) -> ResidentScreened {
+		let resident = reconcile_and_screen_resident(prep, screen_state(prep));
+		let (_dir, stage) = Stage::in_temp_dir();
+		let in_memory = reconcile_and_screen(prep, screen_state(prep), || Ok(stage)).unwrap();
+		assert_screened_as(in_memory, &resident, "reconciled in memory");
 		let (whole_local, whole_remote) = (
 			copied(&prep.local_scan.nodes),
 			copied(&prep.remote_view.nodes),
@@ -6724,34 +7076,433 @@ mod tests {
 		let windowed = reconcile_and_screen(prep, screen_state(prep), || Ok(plan_stage)).unwrap();
 		prep.local_scan.nodes = whole_local;
 		prep.remote_view.nodes = whole_remote;
+		assert_screened_as(windowed, &resident, "reconciled window by window");
+		resident
+	}
+
+	/// Every action of `rows` a screened plan holds, in plan order.
+	fn read(screened: &Screened, rows: Rows) -> Vec<SyncAction> {
+		screened
+			.plan
+			.as_ref()
+			.map_or_else(Vec::new, |plan| plan.read(rows).unwrap())
+	}
+
+	/// What a plan screened in its stage folded into its directory deletions, by directory, sorted.
+	fn carried(screened: &Screened) -> Vec<(String, String)> {
+		let mut carried = Vec::new();
+		if let Some(plan) = &screened.plan {
+			plan.each_carried(|dir, path| carried.push((dir.to_owned(), path.to_owned())))
+				.unwrap();
+		}
+		carried.sort();
+		carried
+	}
+
+	/// `staged`, a plan screened in its stage, is `resident`, the same plan screened as a list:
+	/// the same actions, safe and held, in the same order, the same conflicts, hold, token and counts
+	/// — and, folded as a pass folds it once the guard has let it through, the same plan to apply and
+	/// the same deletions carried. A held plan is folded as an approval releases it.
+	fn assert_screened_as(mut staged: Screened, resident: &ResidentScreened, how: &str) {
+		assert_eq!(
+			read(&staged, Rows::Safe),
+			resident.decision.safe,
+			"{how}: the actions safe to apply"
+		);
+		assert_eq!(
+			read(&staged, Rows::Held),
+			resident.decision.held,
+			"{how}: the held ones"
+		);
+		assert_eq!(
+			staged.reason, resident.decision.reason,
+			"{how}: why they are held"
+		);
+		assert_eq!(
+			staged.pass_token, resident.pass_token,
+			"{how}: the held batch's token"
+		);
+		assert_eq!(staged.conflicts, resident.conflicts, "{how}: the conflicts");
+		assert_eq!(
+			staged.deferred_paths, resident.deferred_paths,
+			"{how}: the deferred paths"
+		);
+		assert_eq!(
+			staged.dropped, resident.dropped,
+			"{how}: the dropped actions"
+		);
+		let released = if staged.reason.is_some() {
+			staged.approve().unwrap();
+			assert_eq!(
+				read(&staged, Rows::Safe),
+				resident.all,
+				"{how}: what an approval releases"
+			);
+			resident.all.clone()
+		} else {
+			resident.decision.safe.clone()
+		};
+		staged.fold_subsumed().unwrap();
+		assert_eq!(
+			(read(&staged, Rows::Safe), carried(&staged)),
+			folded(released),
+			"{how}: what the apply runs, and what its directory deletions carry"
+		);
+	}
+
+	/// A random action a reconcile plans — any but a directory move, which only the fold plans —
+	/// over a namespace small enough that plans flip types, nest, conflict and share prefixes often.
+	fn random_planned(rng: &mut StdRng) -> SyncAction {
+		let path = random_path(rng);
+		let kind = if rng.random_bool(0.5) {
+			NodeKind::Dir
+		} else {
+			NodeKind::File
+		};
+		let remote_uuid = Uuid::from_u128(rng.random_range(0..4));
+		match rng.random_range(0..10) {
+			0 => SyncAction::CreateLocalDir { rel_path: path },
+			1 => SyncAction::DownloadFile {
+				rel_path: path,
+				remote_uuid,
+			},
+			2 => SyncAction::DeleteLocal {
+				rel_path: path,
+				kind,
+			},
+			3 => SyncAction::CreateRemoteDir { rel_path: path },
+			4 => upload(&path),
+			5 => SyncAction::TrashRemote {
+				rel_path: path,
+				kind,
+				remote_uuid,
+			},
+			6 => SyncAction::Conflict { rel_path: path },
+			7 => SyncAction::AdoptBaseline { rel_path: path },
+			8 => SyncAction::MoveRemote {
+				from_path: random_path(rng),
+				to_path: path,
+				kind: NodeKind::File,
+				remote_uuid,
+			},
+			_ => SyncAction::MoveLocal {
+				from_path: random_path(rng),
+				to_path: path,
+				kind: NodeKind::File,
+			},
+		}
+	}
+
+	fn random_path(rng: &mut StdRng) -> String {
+		(0..rng.random_range(1..=3))
+			.map(|_| ["a", "a-b", "b", "e"][rng.random_range(0..4)])
+			.collect::<Vec<_>>()
+			.join("/")
+	}
+
+	/// A random directory move, as the fold plans one.
+	fn random_dir_move(rng: &mut StdRng) -> SyncAction {
+		let (from_path, to_path) = (random_path(rng), random_path(rng));
+		if rng.random_bool(0.5) {
+			SyncAction::MoveLocal {
+				from_path,
+				to_path,
+				kind: NodeKind::Dir,
+			}
+		} else {
+			SyncAction::MoveRemote {
+				from_path,
+				to_path,
+				kind: NodeKind::Dir,
+				remote_uuid: Uuid::from_u128(9),
+			}
+		}
+	}
+
+	/// A staged plan as the apply is handed it: each action in apply order, with its run and whether
+	/// the lock may be let go before it; and what each directory deletion carries, sorted.
+	fn apply_order(plan: StagedPlan) -> (Vec<(SyncAction, stage::Run, bool)>, Vec<String>) {
+		let mut pager = plan.pager();
+		let mut order = Vec::new();
+		for run in [stage::Run::Before, stage::Run::Transfers, stage::Run::After] {
+			while let Some(staged) = pager.next_in(run).unwrap() {
+				order.push((staged.entry.action, staged.run, staged.releasable));
+			}
+		}
+		let mut carried = Vec::new();
+		for (action, _, _) in &order {
+			if let Some(rows) = pager.carried(action) {
+				rows.each(&mut |path| {
+					carried.push(format!("{} carries {path}", action.rel_path()));
+					Ok(())
+				})
+				.unwrap();
+			}
+		}
+		carried.sort();
+		(order, carried)
+	}
+
+	/// The screen a pass runs in its stage — the plan finished and ordered, led by the directory
+	/// moves and the creates above their destinations, the conflicts split out, the deletions counted
+	/// and held, the held batch's token streamed, an approval, the fold, and the plan staged for the
+	/// apply — is the one a pass ran over a list, step for step, over plans of every shape: the same
+	/// actions in the same order, the same token, and the same order the apply runs them in.
+	#[test]
+	fn the_staged_screen_is_the_resident_one_over_generated_plans() {
+		for seed in 0..400u64 {
+			let mut rng = StdRng::seed_from_u64(seed);
+			let actions: Vec<SyncAction> = (0..rng.random_range(0..=40))
+				.map(|_| random_planned(&mut rng))
+				.collect();
+			let dir_moves: Vec<SyncAction> = (0..rng.random_range(0..=3))
+				.map(|_| random_dir_move(&mut rng))
+				.collect();
+			let mut trashed = HashSet::new();
+			for action in &actions {
+				if let SyncAction::TrashRemote { remote_uuid, .. } = action
+					&& rng.random_bool(0.3)
+				{
+					trashed.insert(*remote_uuid);
+				}
+			}
+			let holds = plan::PassHolds {
+				trashed,
+				held_remote: BTreeSet::new(),
+			};
+			// An incomplete scan holds every deletion; a complete one under no limit holds none.
+			let state = guard::ScreenState {
+				scan_complete: rng.random_bool(0.5),
+				remote: guard::RemoteEvidence::Listed,
+				first_sync: false,
+				tracked: 100,
+			};
+			let guard = DeleteGuard::unlimited();
+			let context = format!("seed {seed}: {dir_moves:?} then {actions:?}");
+
+			// As a list, the way a pass screened its plan before it screened it in its stage.
+			let finished = plan::finish_plan(actions.clone(), 0, &holds);
+			let mut listed = dir_moves.clone();
+			listed.extend(finished.actions);
+			let (conflicts, executable): (Vec<_>, Vec<_>) = creates_before_dir_moves(listed)
+				.into_iter()
+				.partition(|action| matches!(action, SyncAction::Conflict { .. }));
+			let decision = guard::test_support::screen(executable.clone(), state, guard);
+			let token = decision
+				.reason
+				.as_ref()
+				.map(|reason| deletion_batch_token(&decision.held, reason));
+
+			// In the stage, from the plan as a whole pass's windows write it.
+			let (_dir, stage) = Stage::in_temp_dir();
+			let (mut screen, deferred) = stage::windows_of(stage, &actions)
+				.screen(&holds, &dir_moves)
+				.unwrap();
+			assert_eq!(deferred, finished.deferred_paths, "{context}");
+			screen.lead_creates().unwrap();
+			let mut staged_conflicts = Vec::new();
+			screen
+				.take_conflicts(|path| {
+					staged_conflicts.push(SyncAction::Conflict {
+						rel_path: path.to_owned(),
+					});
+				})
+				.unwrap();
+			assert_eq!(staged_conflicts, conflicts, "{context}");
+			assert_eq!(screen.read(Rows::All).unwrap(), executable, "{context}");
+			let reason = guard::reason_for(screen.count(Rows::Deletes).unwrap(), state, guard);
+			assert_eq!(reason, decision.reason, "{context}");
+			if let Some(reason) = &reason {
+				screen.hold().unwrap();
+				let mut streamed = BatchToken::new(reason);
+				screen
+					.each_held_by_line(|action| streamed.line(action))
+					.unwrap();
+				assert_eq!(Some(streamed.finish()), token, "{context}");
+			}
+			assert_eq!(screen.read(Rows::Held).unwrap(), decision.held, "{context}");
+			assert_eq!(screen.read(Rows::Safe).unwrap(), decision.safe, "{context}");
+
+			// Approved, folded and staged for the apply.
+			screen.release_held().unwrap();
+			screen.fold_subsumed().unwrap();
+			let mut released = executable;
+			let subsumed = plan::test_support::fold_subsumed_deletes(&mut released);
+			assert_eq!(screen.read(Rows::Safe).unwrap(), released, "{context}");
+			let staged = screen.stage_plan(PassStart::bare).unwrap();
+			let (_dir, stage) = Stage::in_temp_dir();
+			let mut writer = stage::PlanWriter::new(stage).unwrap();
+			let mut filed = HashSet::new();
+			for action in &released {
+				writer.push(&PlannedEntry::bare(action.clone())).unwrap();
+				if first_dir_deletion(&mut filed, action) {
+					writer.carry(action, subsumed.under(action)).unwrap();
+				}
+			}
+			assert_eq!(
+				apply_order(staged),
+				apply_order(writer.finish().unwrap()),
+				"{context}"
+			);
+		}
+	}
+
+	/// A held batch's token, hashed line by line as the stage reads the held actions out in sorted
+	/// order, is the token of the same lines sorted in memory: byte for byte, over paths whose bytes
+	/// sort otherwise than their characters seem to and the create half of a type flip.
+	#[test]
+	fn a_streamed_token_is_the_token_of_the_sorted_lines() {
+		let mut actions: Vec<SyncAction> = ["Zeta", "zeta", "Äpfel", "a b", "a-b", "a/b", "é", "a"]
+			.into_iter()
+			.flat_map(|path| {
+				[
+					SyncAction::DeleteLocal {
+						rel_path: path.to_owned(),
+						kind: NodeKind::File,
+					},
+					SyncAction::TrashRemote {
+						rel_path: format!("r/{path}"),
+						kind: NodeKind::Dir,
+						remote_uuid: Uuid::from_u128(1),
+					},
+				]
+			})
+			.collect();
+		actions.push(SyncAction::CreateRemoteDir {
+			rel_path: "r/a".to_owned(),
+		});
+		actions.push(upload("kept.txt"));
+		let reason = GuardReason::ExceededThreshold {
+			deletions: 16,
+			limit: 10,
+		};
+		let held: Vec<SyncAction> = actions[..17].to_vec();
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut screen = Screen::new(stage, &[], &actions).unwrap();
+		assert_eq!(
+			screen.hold().unwrap(),
+			17,
+			"16 deletions and the create a flip pairs"
+		);
+		assert_eq!(screen.read(Rows::Held).unwrap(), held);
+		let mut streamed = BatchToken::new(&reason);
+		screen
+			.each_held_by_line(|action| streamed.line(action))
+			.unwrap();
+		let streamed = streamed.finish();
+		assert_eq!(streamed, deletion_batch_token(&held, &reason));
+		assert_eq!(streamed.len(), 16);
+	}
+
+	/// A batch the guard held is not owed: the hold sends the next pass that runs to a whole read,
+	/// which reproduces it. Owing its paths as well would keep a pair whose only business is the
+	/// hold from ever being idle, and every wake would re-read both trees to hold it again.
+	#[test]
+	fn a_held_batch_is_not_carried_over() {
+		let actions = [
+			upload("up.txt"),
+			SyncAction::TrashRemote {
+				rel_path: "gone.txt".to_owned(),
+				kind: NodeKind::File,
+				remote_uuid: Uuid::from_u128(8),
+			},
+		];
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut plan = Screen::new(stage, &[], &actions).unwrap();
+		assert_eq!(plan.hold().unwrap(), 1);
+		let screened = Screened {
+			conflicts: Vec::new(),
+			plan: Some(plan),
+			reason: Some(GuardReason::ExceededThreshold {
+				deletions: 1,
+				limit: 0,
+			}),
+			pass_token: None,
+			deferred_paths: 0,
+			dropped: 0,
+		};
+		assert_eq!(
+			released_paths(&screened).unwrap(),
+			BTreeSet::from(["up.txt".to_owned()]),
+			"the upload is owed; the held trash is not"
+		);
+	}
+
+	/// What the next pass owes is read out of the plan only until it is more than the changelists
+	/// keep, past which they keep nothing: a first sync's plan of the whole tree costs that many
+	/// paths, not one per item.
+	#[test]
+	fn the_released_paths_are_read_only_up_to_the_cap() {
+		let actions: Vec<SyncAction> = (0..DIRTY_CAP * 3)
+			.map(|n| upload(&format!("d{:02}/f{n:06}.txt", n % 100)))
+			.collect();
+		let (_dir, stage) = Stage::in_temp_dir();
+		let screened = Screened {
+			conflicts: Vec::new(),
+			plan: Some(Screen::new(stage, &[], &actions).unwrap()),
+			reason: None,
+			pass_token: None,
+			deferred_paths: 0,
+			dropped: 0,
+		};
+		assert_eq!(released_paths(&screened).unwrap().len(), DIRTY_CAP + 1);
+	}
+
+	/// A local deletion of 100,000 synced files, which the guard holds for the volume, screened as a
+	/// whole pass screens it: what the pass holds while it plans, counts, holds and names the batch
+	/// is a page of the plan, not the plan, a copy of it, or a line per deletion for the token.
+	#[test]
+	fn a_held_mass_deletion_is_screened_holding_a_page_not_the_plan() {
+		const FILES: u128 = 100_000;
+		let hash = Blake3Hash::from([1; 32]);
+		let files: Vec<(String, Uuid)> = (0..FILES)
+			.map(|n| {
+				(
+					format!("d{:02}/f{n:06}.txt", n % 100),
+					Uuid::from_u128(n + 1),
+				)
+			})
+			.collect();
+		let baseline = files
+			.iter()
+			.map(|(path, uuid)| (path.clone(), synced_file(path, *uuid, hash, 4)))
+			.collect();
+		let remote: Vec<RemoteNode> = files
+			.iter()
+			.map(|(path, uuid)| remote_file(path, *uuid, hash, 4))
+			.collect();
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			baseline,
+			Vec::new(),
+			view(Vec::new(), Vec::new(), &[]),
+			HashMap::new(),
+		);
+		prep.record.delete_guard = DeleteGuard::default();
+		let (_stages, local, remote) =
+			stage::staged_sides(std::iter::empty(), remote, stage::WINDOW.get());
+		prep.local_scan.nodes = local;
+		prep.remote_view.nodes = remote;
+		let (_dir, stage) = Stage::in_temp_dir();
+		let (screened, peak) = alloc_meter::peak_bytes(|| {
+			reconcile_and_screen(&prep, screen_state(&prep), || Ok(stage)).unwrap()
+		});
+		assert!(screened.pass_token.is_some(), "the batch is held");
+		assert_eq!(
+			screened.reason,
+			Some(GuardReason::ExceededThreshold {
+				deletions: 100_000,
+				limit: 50_000,
+			})
+		);
+		assert_eq!(screened.count(Rows::Held).unwrap(), 100_000);
+		assert_eq!(screened.count(Rows::Safe).unwrap(), 0);
+		// Screened as a list, the same pass held 29,075,796 bytes: the plan, the copy an approval
+		// would release, the guard's partition and a line per deletion for the token.
 		assert!(
-			in_memory.stage.is_none() && windowed.stage.is_some(),
-			"only the staged sides are reconciled into a stage"
+			peak < 4 << 20,
+			"screening {FILES} deletions held {peak} bytes at once"
 		);
-		assert_eq!(windowed.all, in_memory.all, "every executable action");
-		assert_eq!(
-			windowed.decision.safe, in_memory.decision.safe,
-			"the actions safe to apply"
-		);
-		assert_eq!(
-			windowed.decision.held, in_memory.decision.held,
-			"the held ones"
-		);
-		assert_eq!(
-			windowed.decision.reason, in_memory.decision.reason,
-			"why they are held"
-		);
-		assert_eq!(
-			windowed.pass_token, in_memory.pass_token,
-			"the held batch's token"
-		);
-		assert_eq!(windowed.conflicts, in_memory.conflicts, "the conflicts");
-		assert_eq!(
-			windowed.deferred_paths, in_memory.deferred_paths,
-			"the deferred paths"
-		);
-		assert_eq!(windowed.dropped, in_memory.dropped, "the dropped actions");
-		in_memory
 	}
 
 	/// A pass's inputs before the fold, with a complete scan that found nothing it could not sync.
@@ -8288,7 +9039,7 @@ mod tests {
 				HashMap::new(),
 			)
 		};
-		let deletes_psd = |screened: &Screened| {
+		let deletes_psd = |screened: &ResidentScreened| {
 			screened
 				.decision
 				.safe
@@ -9044,22 +9795,25 @@ mod tests {
 		}
 	}
 
-	/// `a.txt` and `b.txt` uploaded, and `docs` trashed with the two files under it folded in.
-	fn uploads_and_a_folded_trash() -> (Vec<SyncAction>, Subsumed) {
+	/// `a.txt` and `b.txt` uploaded, and `docs` trashed with the two files under it folded in,
+	/// screened in a stage of their own.
+	fn uploads_and_a_folded_trash() -> (tempfile::TempDir, Screen) {
 		let trash = |rel_path: &str, kind| SyncAction::TrashRemote {
 			rel_path: rel_path.to_string(),
 			kind,
 			remote_uuid: Uuid::from_u128(1),
 		};
-		let mut actions = vec![
+		let actions = [
 			upload("a.txt"),
 			upload("b.txt"),
 			trash("docs", NodeKind::Dir),
 			trash("docs/x.txt", NodeKind::File),
 			trash("docs/y.txt", NodeKind::File),
 		];
-		let subsumed = plan::fold_subsumed_deletes(&mut actions);
-		(actions, subsumed)
+		let (dir, stage) = Stage::in_temp_dir();
+		let mut screen = Screen::new(stage, &[], &actions).unwrap();
+		assert_eq!(screen.fold_subsumed().unwrap(), 2);
+		(dir, screen)
 	}
 
 	fn pairs(ends: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -9072,13 +9826,13 @@ mod tests {
 	/// deletion that carries it out.
 	#[test]
 	fn a_pass_ends_only_the_streaks_the_store_has() {
-		let (actions, subsumed) = uploads_and_a_folded_trash();
+		let (_dir, screen) = uploads_and_a_folded_trash();
 		let streaks = HashMap::from([
 			("a.txt".to_string(), failure(1, 0)),
 			("docs/x.txt".to_string(), failure(2, 0)),
 		]);
 		assert_eq!(
-			endable_streaks(&actions, &subsumed, Some(&streaks)),
+			endable_streaks(&screen, Some(&streaks)).unwrap(),
 			pairs(&[("a.txt", "a.txt"), ("docs", "docs/x.txt")])
 		);
 	}
@@ -9087,9 +9841,9 @@ mod tests {
 	/// each had one.
 	#[test]
 	fn a_pass_that_could_not_read_the_streaks_treats_every_path_as_having_one() {
-		let (actions, subsumed) = uploads_and_a_folded_trash();
+		let (_dir, screen) = uploads_and_a_folded_trash();
 		assert_eq!(
-			endable_streaks(&actions, &subsumed, None),
+			endable_streaks(&screen, None).unwrap(),
 			pairs(&[
 				("a.txt", "a.txt"),
 				("b.txt", "b.txt"),
@@ -9107,9 +9861,11 @@ mod tests {
 		let actions: Vec<SyncAction> = (0..10_000)
 			.map(|n| upload(&format!("d{:02}/f{n:05}.txt", n % 100)))
 			.collect();
-		let (subsumed, streaks) = (Subsumed::default(), HashMap::new());
+		let (_dir, stage) = Stage::in_temp_dir();
+		let screen = Screen::new(stage, &[], &actions).unwrap();
+		let streaks = HashMap::new();
 		let (ends, peak) =
-			alloc_meter::peak_bytes(|| endable_streaks(&actions, &subsumed, Some(&streaks)));
+			alloc_meter::peak_bytes(|| endable_streaks(&screen, Some(&streaks)).unwrap());
 		assert_eq!(peak, 0, "10_000 successful actions and no streak");
 		assert_eq!(ends, Vec::new());
 	}
@@ -9148,10 +9904,9 @@ mod tests {
 		);
 		let actions: Vec<SyncAction> = files.iter().map(|file| upload(file)).collect();
 		let (_dir, stage) = Stage::in_temp_dir();
-		let plan = prep
-			.stage_plan(actions, Subsumed::default(), stage)
-			.await
-			.unwrap();
+		let screen = Screen::new(stage, &[], &actions).unwrap();
+		drop(actions);
+		let plan = prep.stage_plan(screen).await.unwrap();
 		assert_eq!(plan.pager().len(), 20_000);
 		let ((), net) = alloc_meter::net_bytes(|| drop(prep));
 		assert!(
@@ -10738,7 +11493,9 @@ mod tests {
 			&Error::custom(ErrorKind::RetryFailed, "the drive lock is held elsewhere"),
 			&mut |event| events.push(event),
 		);
-		let ends = endable_streaks(&attempted, &Subsumed::default(), Some(&before));
+		let (_dir, stage) = Stage::in_temp_dir();
+		let screen = Screen::new(stage, &[], &attempted).unwrap();
+		let ends = endable_streaks(&screen, Some(&before)).unwrap();
 		engine.note_path_outcomes(pair, ends, &mut report).await;
 
 		assert_eq!(
@@ -10784,12 +11541,14 @@ mod tests {
 			kind,
 			remote_uuid: Uuid::from_u128(1),
 		};
-		let mut actions = vec![
+		let actions = [
 			trash("docs/a.txt", NodeKind::File),
 			trash("docs", NodeKind::Dir),
 		];
-		let subsumed = plan::fold_subsumed_deletes(&mut actions);
-		let ends = endable_streaks(&actions, &subsumed, Some(&streaks));
+		let (_dir, stage) = Stage::in_temp_dir();
+		let mut screen = Screen::new(stage, &[], &actions).unwrap();
+		screen.fold_subsumed().unwrap();
+		let ends = endable_streaks(&screen, Some(&streaks)).unwrap();
 		(engine, pair, path, ends)
 	}
 

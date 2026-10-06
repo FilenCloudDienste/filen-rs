@@ -2051,7 +2051,7 @@ mod tests {
 	use super::{
 		super::{
 			apply::{PassStart, PlannedEntry},
-			plan::{Subsumed, SyncAction},
+			plan::SyncAction,
 			side::Side,
 			stage::Stage,
 		},
@@ -3294,8 +3294,8 @@ mod tests {
 		let pass = store.baseline(pair).unwrap();
 		assert!(pass.get("d0/f00000.txt").is_some());
 		let (_dir, stage) = Stage::in_temp_dir();
-		let applying = PlannedEntry::stage(
-			vec![
+		let applying = PlannedEntry::stage_actions(
+			&[
 				SyncAction::DownloadFile {
 					rel_path: "d0/f00000.txt".to_string(),
 					remote_uuid: Uuid::new_v4(),
@@ -3304,7 +3304,6 @@ mod tests {
 					rel_path: "new/f00000.txt".to_string(),
 				},
 			],
-			Subsumed::default(),
 			pass,
 			Side::Whole(HashMap::new()),
 			Side::Whole(HashMap::new()),

@@ -14,8 +14,8 @@
 //!   drive lock (`tie_until`).
 //! - `written`: what the apply has written so far, when the plan deletes anything (see below).
 //! - `carried`: the deletions each directory deletion carries out along with its own (see
-//!   `plan::fold_subsumed_deletes`), by the deletion's `op` and the directory's path. They are in
-//!   no run: the apply runs the directory's deletion, and drops their rows with its own
+//!   `Screen::fold_subsumed`), by the deletion's `op` and the directory's path. They are in no run:
+//!   the apply runs the directory's deletion, and drops their rows with its own
 //!   ([`Pager::carried`]).
 //!
 //! # The order
@@ -133,25 +133,25 @@ CREATE TABLE carried (op INTEGER NOT NULL, dir TEXT NOT NULL, path TEXT NOT NULL
 ";
 
 /// `plan.op`: which [`SyncAction`] the row is.
-const OP_CREATE_LOCAL_DIR: i64 = 0;
-const OP_DOWNLOAD: i64 = 1;
-const OP_DELETE_LOCAL: i64 = 2;
-const OP_CREATE_REMOTE_DIR: i64 = 3;
-const OP_UPLOAD: i64 = 4;
-const OP_TRASH_REMOTE: i64 = 5;
-const OP_CONFLICT: i64 = 6;
-const OP_ADOPT: i64 = 7;
-const OP_MOVE_REMOTE: i64 = 8;
-const OP_MOVE_LOCAL: i64 = 9;
+pub(super) const OP_CREATE_LOCAL_DIR: i64 = 0;
+pub(super) const OP_DOWNLOAD: i64 = 1;
+pub(super) const OP_DELETE_LOCAL: i64 = 2;
+pub(super) const OP_CREATE_REMOTE_DIR: i64 = 3;
+pub(super) const OP_UPLOAD: i64 = 4;
+pub(super) const OP_TRASH_REMOTE: i64 = 5;
+pub(super) const OP_CONFLICT: i64 = 6;
+pub(super) const OP_ADOPT: i64 = 7;
+pub(super) const OP_MOVE_REMOTE: i64 = 8;
+pub(super) const OP_MOVE_LOCAL: i64 = 9;
 
 // `plan_created` in SCHEMA spells this op out: with any other value every created-directory
 // lookup would scan the plan instead of seeking the index.
 const _: () = assert!(OP_CREATE_REMOTE_DIR == 3);
 
 /// The ops of [`SyncAction::is_delete`] and of [`SyncAction::is_create`], for the statements below.
-const DELETES: &str = "(2, 5)";
-const CREATES: &str = "(0, 1, 3, 4)";
-const MOVES: &str = "(8, 9)";
+pub(super) const DELETES: &str = "(2, 5)";
+pub(super) const CREATES: &str = "(0, 1, 3, 4)";
+pub(super) const MOVES: &str = "(8, 9)";
 
 /// `plan_base.endpoint`: the row at the action's path, and the row at a move's source.
 const AT_PATH: i64 = 0;
@@ -199,8 +199,6 @@ const SHIELDS: &str = "SELECT EXISTS (SELECT 1 FROM plan WHERE result_uuid = ?2)
 	 OR EXISTS (SELECT 1 FROM written WHERE uuid = ?2)
 	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key = ?3)
 	 OR EXISTS (SELECT 1 FROM written WHERE side = ?1 AND key >= ?3 || '/' AND key < ?3 || '0')";
-
-const INSERT_CARRIED: &str = "INSERT INTO carried (op, dir, path) VALUES (?1, ?2, ?3)";
 
 /// Whether the deletion `?1` of the directory at `?2` carries anything, and what: both seek
 /// `carried_by`.
@@ -275,25 +273,20 @@ impl PlanWriter {
 		})
 	}
 
-	/// Stage `paths`, the deletions the directory deletion `action` carries out along with its own
-	/// (see `plan::fold_subsumed_deletes`). Nothing for an action that is no deletion.
-	pub(in super::super) fn carry(
-		&mut self,
-		action: &SyncAction,
-		paths: &[String],
-	) -> rusqlite::Result<()> {
-		if !action.is_delete() {
-			return Ok(());
-		}
-		let (op, dir) = (action_columns(action).0, action.rel_path());
-		for path in paths {
-			self.batch.row(|conn| {
-				conn.prepare_cached(INSERT_CARRIED)?
-					.execute(params![op, dir, path])?;
-				Ok(())
-			})?;
-		}
-		self.carried += paths.len();
+	/// The stage's connection, for a read of what else the stage holds between two entries.
+	pub(super) fn conn(&self) -> &Connection {
+		self.batch.conn()
+	}
+
+	/// Stage what the screened plan in the same stage folded into its directory deletions (see
+	/// `Screen::fold_subsumed`): each carried deletion by its side's `op`, which is the directory
+	/// deletion's own, and the directory's path.
+	pub(super) fn carry_screened(&mut self) -> rusqlite::Result<()> {
+		self.carried += self.batch.conn().execute(
+			"INSERT INTO carried (op, dir, path)
+			 SELECT op, carried_by, path FROM screen WHERE carried_by IS NOT NULL",
+			[],
+		)?;
 		Ok(())
 	}
 
@@ -1168,10 +1161,36 @@ fn corrupt(what: &str, value: i64) -> rusqlite::Error {
 	)
 }
 
-/// What the apply's tests do to a staged plan they cannot do through it.
+/// What the tests do to a staged plan they cannot do through it.
 #[cfg(test)]
 mod test_support {
-	use super::{Pager, StagedPlan};
+	use rusqlite::params;
+
+	use super::{super::super::plan::SyncAction, Pager, PlanWriter, StagedPlan, action_columns};
+
+	impl PlanWriter {
+		/// Stage `paths`, the deletions the directory deletion `action` carries out along with its
+		/// own. Nothing for an action that is no deletion.
+		pub(in crate::sync_engine) fn carry(
+			&mut self,
+			action: &SyncAction,
+			paths: &[String],
+		) -> rusqlite::Result<()> {
+			if !action.is_delete() {
+				return Ok(());
+			}
+			let (op, dir) = (action_columns(action).0, action.rel_path());
+			for path in paths {
+				self.batch.row(|conn| {
+					conn.prepare_cached("INSERT INTO carried (op, dir, path) VALUES (?1, ?2, ?3)")?
+						.execute(params![op, dir, path])?;
+					Ok(())
+				})?;
+			}
+			self.carried += paths.len();
+			Ok(())
+		}
+	}
 
 	impl StagedPlan {
 		/// Spoil every action from position `ord` on, so that the page holding it fails to read

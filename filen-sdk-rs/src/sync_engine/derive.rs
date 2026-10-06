@@ -334,7 +334,6 @@ mod tests {
 			},
 			engine::assembly_bounds,
 			facts::carry_over,
-			guard::GuardDecision,
 			ignore::{FILENIGNORE, IgnoreRules},
 			observe::observe_local,
 			plan::{PassHolds, RemoteView, SyncAction, place_remote_items},
@@ -942,13 +941,12 @@ mod tests {
 
 		// It is cut short before applying it, so no row was written and the file is still on disk.
 		// What it owes is its plan's paths...
-		let decision = GuardDecision {
-			safe: planned.clone(),
-			held: Vec::new(),
-			reason: None,
-		};
 		let (no_paths, no_failures) = (BTreeSet::new(), std::collections::HashMap::new());
-		let owed: BTreeSet<String> = carry_over(&decision, &[], &no_paths, &no_failures)
+		let ends = planned.iter().flat_map(|action| {
+			let (from, to) = action.endpoints();
+			[from, to]
+		});
+		let owed: BTreeSet<String> = carry_over(ends, &[], &no_paths, &no_failures)
 			.map(str::to_owned)
 			.collect();
 		assert_eq!(owed, BTreeSet::from(["docs/Ärger.txt".to_string()]));
@@ -1146,7 +1144,7 @@ mod tests {
 	/// The shape that reaches this is an `untrack_ignored` whose `delete_subtrees` failed: rows
 	/// survive under a root the rules hide. Carrying the local node while the view's filter drops
 	/// the remote one reads as a remote deletion — a local delete planned on a file the user still
-	/// has, with only `drop_blocked` standing in front of it.
+	/// has, with only the pass's `Blocking` standing in front of it.
 	#[test]
 	fn a_hidden_path_with_a_carried_row_is_dropped_held_and_plans_nothing() {
 		let pair = Pair::converged();
