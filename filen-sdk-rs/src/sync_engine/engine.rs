@@ -2695,7 +2695,8 @@ impl SyncEngine {
 	///
 	/// Errors if the pair is unknown, and — for [`Backlog::AdoptDestination`] only — if that read
 	/// cannot be trusted to say what either side no longer has: a name collision, an incomplete local
-	/// scan, or a remote view that has never converged or came back wholly empty. The mode is left
+	/// scan, or a remote view that has never converged or came back wholly empty — or if the read
+	/// fails, a failed baseline read included (see [`plan_pair`](Self::plan_pair)). The mode is left
 	/// exactly as it was, so the call is safe to retry. Re-registering an existing pair through
 	/// [`add_pair`](Self::add_pair) with a different mode is an error rather than a silent switch,
 	/// so a mode change is always this explicit call.
@@ -2709,28 +2710,32 @@ impl SyncEngine {
 		// destination holds NOW, and the switch must not take effect without it.
 		let adopted = match backlog {
 			Backlog::Propagate => Vec::new(),
+			// A read that fails panics as a pass's does, and is this call's error as a pass's is.
 			Backlog::AdoptDestination => {
-				let prep = self.prepare(pair, None).await?;
-				// The adoption rewrites baseline rows from this one read, and every row it writes is
-				// for a path it reads as GONE on the source side — so it needs the same evidence a
-				// pass needs before acting on an absence. Read through an incomplete scan or an
-				// unconverged/transiently-empty remote view it does the opposite of what was asked:
-				// it adopts nothing and the switch then propagates the very backlog the caller wanted
-				// kept, or it adopts a whole pair from whichever side still lists something and drops
-				// the other side's anchors. Refuse instead — the mode is left as it was, and the
-				// caller can retry once the view is healthy.
-				if let Some(reason) = adoption_refusal(refusal(&prep), &screen_state(&prep)) {
-					return Err(Error::custom(
-						ErrorKind::InvalidState,
-						format!("cannot adopt the destination: {reason}"),
-					));
-				}
-				plan::adopt_destination_rows(
-					mode,
-					&prep.baseline,
-					&prep.local_scan.nodes.of(&prep.baseline),
-					&prep.remote_view.nodes.of(&prep.baseline),
-				)
+				pass_panics_as_errors(pair, "the adoption read", async {
+					let prep = self.prepare(pair, None).await?;
+					// The adoption rewrites baseline rows from this one read, and every row it writes
+					// is for a path it reads as GONE on the source side — so it needs the same
+					// evidence a pass needs before acting on an absence. Read through an incomplete
+					// scan or an unconverged/transiently-empty remote view it does the opposite of
+					// what was asked: it adopts nothing and the switch then propagates the very
+					// backlog the caller wanted kept, or it adopts a whole pair from whichever side
+					// still lists something and drops the other side's anchors. Refuse instead — the
+					// mode is left as it was, and the caller can retry once the view is healthy.
+					if let Some(reason) = adoption_refusal(refusal(&prep), &screen_state(&prep)) {
+						return Err(Error::custom(
+							ErrorKind::InvalidState,
+							format!("cannot adopt the destination: {reason}"),
+						));
+					}
+					Ok(plan::adopt_destination_rows(
+						mode,
+						&prep.baseline,
+						&prep.local_scan.nodes.of(&prep.baseline),
+						&prep.remote_view.nodes.of(&prep.baseline),
+					))
+				})
+				.await?
 			}
 		};
 		let adopted_rows = adopted.len();
@@ -4024,27 +4029,34 @@ impl SyncEngine {
 	/// server calls and retires the journal records that read settles. What it does NOT do is
 	/// persist the confirmations it observed. A [`paused`](Self::pause_pair) pair is planned like
 	/// any other.
+	///
+	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
+	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		let prep = self.prepare(pair, None).await?;
-		if let Some(reason) = refusal(&prep) {
-			return Ok(PlanOutcome {
-				refused: Some(reason),
-				..PlanOutcome::default()
-			});
-		}
-		let mut screened = reconcile_and_screen(&prep, screen_state(&prep));
-		// What the pass would apply, which takes each deletion under a deleted directory along with it.
-		plan::fold_subsumed_deletes(&mut screened.decision.safe);
-		Ok(PlanOutcome {
-			actions: prep.planned(&screened.decision.safe),
-			held: prep.planned(&screened.decision.held),
-			held_reason: screened.decision.reason,
-			pass_token: screened.pass_token,
-			conflicts: screened.conflicts,
-			unsyncable: prep.unsyncable(),
-			ignored: prep.ignored(),
-			refused: None,
+		pass_panics_as_errors(pair, "the dry run", async {
+			let prep = self.prepare(pair, None).await?;
+			if let Some(reason) = refusal(&prep) {
+				return Ok(PlanOutcome {
+					refused: Some(reason),
+					..PlanOutcome::default()
+				});
+			}
+			let mut screened = reconcile_and_screen(&prep, screen_state(&prep));
+			// What the pass would apply, which takes each deletion under a deleted directory along
+			// with it.
+			plan::fold_subsumed_deletes(&mut screened.decision.safe);
+			Ok(PlanOutcome {
+				actions: prep.planned(&screened.decision.safe),
+				held: prep.planned(&screened.decision.held),
+				held_reason: screened.decision.reason,
+				pass_token: screened.pass_token,
+				conflicts: screened.conflicts,
+				unsyncable: prep.unsyncable(),
+				ignored: prep.ignored(),
+				refused: None,
+			})
 		})
+		.await
 	}
 
 	/// Set `pair`'s mass-delete threshold, from the next pass on. Persisted with the pair, so it
@@ -4771,7 +4783,8 @@ impl SyncEngine {
 		// the caller, and a watch loop backs off and runs the next one instead of dying with the
 		// pass and leaving the pair silently unsynced. Everything the pass held is released by the
 		// unwind; the next pass is forced whole below, like any failed one.
-		let result = pass_panics_as_errors(pair, self.run_pass(pair, observer, when_idle)).await;
+		let result =
+			pass_panics_as_errors(pair, "the pass", self.run_pass(pair, observer, when_idle)).await;
 		// What this pass's outcome means for the NEXT one's scope, wherever it ended. A pass that
 		// failed outright took both changelists and applied nothing, so what it took is reflected
 		// nowhere and the next pass cannot rely on them.
@@ -5245,24 +5258,26 @@ impl SyncEngine {
 	}
 }
 
-/// `pass`, with a panic inside it answered as the pass's error (see [`SyncEngine::sync_pass`]).
+/// `pass` — a pass, or a call that reads the pair as one does — with a panic inside it answered as
+/// its error, which `what` names (see [`SyncEngine::sync_pass`]).
 async fn pass_panics_as_errors<T>(
 	pair: PairId,
+	what: &str,
 	pass: impl std::future::Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
 	std::panic::AssertUnwindSafe(pass)
 		.catch_unwind()
 		.await
 		.unwrap_or_else(|panic| {
-			let what = panic
+			let message = panic
 				.downcast_ref::<&str>()
 				.map(|message| (*message).to_string())
 				.or_else(|| panic.downcast_ref::<String>().cloned())
 				.unwrap_or_else(|| "a panic with no message".to_string());
-			tracing::error!("sync_once[pair {pair}]: the pass panicked: {what}");
+			tracing::error!("sync pair {pair}: {what} panicked: {message}");
 			Err(Error::custom(
 				ErrorKind::Internal,
-				format!("the pass panicked: {what}"),
+				format!("{what} panicked: {message}"),
 			))
 		})
 }
@@ -5776,6 +5791,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		auth::{StringifiedClient, http::ClientConfig, unauth::UnauthClient},
+		cache::CacheState,
 		sync::lock::MAX_SLEEP_TIME_DEFAULT,
 		sync_engine::{
 			PauseMode,
@@ -8841,7 +8857,7 @@ mod tests {
 	/// and ending it without a word.
 	#[tokio::test]
 	async fn a_panicking_pass_fails_as_a_pass() {
-		let failed = pass_panics_as_errors::<()>(7, async {
+		let failed = pass_panics_as_errors::<()>(7, "the pass", async {
 			panic!("reading pair 7's baseline rows failed: disk I/O error")
 		})
 		.await
@@ -8852,15 +8868,17 @@ mod tests {
 				.contains("the pass panicked: reading pair 7's baseline rows failed"),
 			"{failed}"
 		);
-		let owned = pass_panics_as_errors::<()>(7, async { panic!("{}", String::from("owned")) })
-			.await
-			.expect_err("a pass that panicked is a failed pass");
+		let owned = pass_panics_as_errors::<()>(7, "the pass", async {
+			panic!("{}", String::from("owned"))
+		})
+		.await
+		.expect_err("a pass that panicked is a failed pass");
 		assert!(
 			owned.to_string().contains("the pass panicked: owned"),
 			"{owned}"
 		);
 		assert!(
-			pass_panics_as_errors(7, async { Ok(3) })
+			pass_panics_as_errors(7, "the pass", async { Ok(3) })
 				.await
 				.is_ok_and(|n| n == 3)
 		);
@@ -10156,6 +10174,70 @@ mod tests {
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// An engine whose one pair's read gets as far as the baseline — the cache it reads the remote
+	/// from holds nothing under the pair's root, so no server is asked — and fails there: the index
+	/// the read asks first, whether a push of ours awaits confirmation, is gone. A baseline read
+	/// that fails panics on purpose, rather than read as an absent row.
+	async fn engine_whose_baseline_read_fails() -> (SyncEngine, PairId, tempfile::TempDir) {
+		let dir = tempfile::tempdir().unwrap();
+		let cache = dir.path().join("cache.db");
+		drop(CacheState::new_on_path(&cache, Uuid::from_u128(1)));
+		let client = offline_client();
+		client.configure_cache(cache, |_| {}).await.unwrap();
+		let db = dir.path().join("sync.db");
+		let engine = SyncEngine::open(client, db.clone()).await.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::from_u128(2), SyncMode::TwoWay)
+			.unwrap();
+		// Once the pair's store is open, which creates the index.
+		engine.pair_store(pair).await.unwrap();
+		rusqlite::Connection::open(&db)
+			.unwrap()
+			.execute_batch("DROP INDEX baseline_unconfirmed")
+			.unwrap();
+		(engine, pair, dir)
+	}
+
+	/// A dry run whose read fails comes back as the call's error, as a pass's does, instead of
+	/// unwinding into the caller.
+	#[tokio::test]
+	async fn a_dry_run_whose_read_fails_returns_the_failure() {
+		let (engine, pair, _dir) = engine_whose_baseline_read_fails().await;
+		let failed = engine
+			.plan_pair(pair)
+			.await
+			.expect_err("the dry run read no baseline to plan from");
+		assert!(
+			failed
+				.to_string()
+				.contains("the dry run panicked: reading pair"),
+			"{failed}"
+		);
+		drop(engine);
+	}
+
+	/// So does the read an adoption makes before it switches the mode, and the mode is left as it
+	/// was.
+	#[tokio::test]
+	async fn an_adoption_whose_read_fails_returns_the_failure_and_keeps_the_mode() {
+		let (engine, pair, _dir) = engine_whose_baseline_read_fails().await;
+		let failed = engine
+			.reconfigure_pair(pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
+			.await
+			.expect_err("the adoption read no baseline to adopt into");
+		assert!(
+			failed
+				.to_string()
+				.contains("the adoption read panicked: reading pair"),
+			"{failed}"
+		);
+		assert_eq!(
+			locked(&engine.control).pair(pair).unwrap().unwrap().mode,
+			SyncMode::TwoWay
+		);
+		drop(engine);
 	}
 
 	/// A control verb refuses the state it cannot act on rather than returning `Ok` for nothing:
