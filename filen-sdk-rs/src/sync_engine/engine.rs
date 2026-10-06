@@ -3297,6 +3297,25 @@ impl SyncEngine {
 		mode: SyncMode,
 		backlog: Backlog,
 	) -> Result<(), Error> {
+		let reconfigured = self.reconfigure_pair_unreleased(pair, mode, backlog).await;
+		// An adoption read the rows a pass reads, through the same parked reader, and wrote the rows
+		// it adopted through the pair's writer: what those cached goes now, whatever came of the
+		// switch, as a pass's does when it ends (see `release_pair_cache`). A plain switch writes one
+		// row and reads none.
+		if backlog == Backlog::AdoptDestination {
+			self.release_pair_cache(pair).await;
+		}
+		reconfigured
+	}
+
+	/// [`reconfigure_pair`](Self::reconfigure_pair), up to giving back the page caches an adoption
+	/// filled.
+	async fn reconfigure_pair_unreleased(
+		&self,
+		pair: PairId,
+		mode: SyncMode,
+		backlog: Backlog,
+	) -> Result<(), Error> {
 		// Read both sides before touching the mode: the adoption is anchored to what the
 		// destination holds NOW, and the switch must not take effect without it.
 		let adopted = match backlog {
@@ -3819,15 +3838,22 @@ impl SyncEngine {
 		if !baseline.any_unconfirmed() {
 			return Ok(());
 		}
-		let (advanced, _) = self
+		let advanced = self
 			.confirm(pair, &baseline, Evidence::Announcements, stage::WINDOW)
-			.await?;
+			.await
+			.map(|(advanced, _)| advanced);
 		// Its read transaction ends here, not after the write below: nothing reads the rows again.
 		drop(baseline);
-		if advanced.is_empty() {
-			return Ok(());
-		}
-		self.persist_confirmed(pair, &store, advanced).await
+		let swept = match advanced {
+			Ok(advanced) if advanced.is_empty() => Ok(()),
+			Ok(advanced) => self.persist_confirmed(pair, &store, advanced).await,
+			Err(error) => Err(error),
+		};
+		// It read every unconfirmed row, and wrote what it confirmed: what that cached goes now, as a
+		// pass's does when it ends, rather than when the pair's next pass ends (see
+		// `release_pair_cache`).
+		self.release_pair_cache(pair).await;
+		swept
 	}
 
 	/// Write the rows a confirmation advanced into the store in ONE transaction, read out of where
@@ -4729,37 +4755,45 @@ impl SyncEngine {
 	/// A read that fails is the call's error, as it is a pass's: a baseline read that fails panics
 	/// on purpose, and that panic comes back here as an [`ErrorKind::Internal`] error.
 	pub async fn plan_pair(&self, pair: PairId) -> Result<PlanOutcome, Error> {
-		pass_panics_as_errors(pair, "the dry run", async {
-			let prep = self.prepare(pair, None).await?;
-			if let Some(reason) = refusal(&prep) {
-				return Ok(PlanOutcome {
-					refused: Some(reason),
-					..PlanOutcome::default()
-				});
-			}
-			let state = screen_state(&prep);
-			let at = self.stage_at(pair);
-			// On a blocking thread, as a pass screens its plan: the reconcile, the screening and the
-			// lists all read and write the plan's stage.
-			off_runtime("planning the pair", move || {
-				let mut screened = reconcile_and_screen(&prep, state, || Stage::create(at))?;
-				// What the pass would apply, which takes each deletion under a deleted directory
-				// along with it.
-				screened.fold_subsumed()?;
-				Ok(PlanOutcome {
-					actions: prep.planned(&screened, Rows::Safe)?,
-					held: prep.planned(&screened, Rows::Held)?,
-					held_reason: screened.reason,
-					pass_token: screened.pass_token,
-					conflicts: screened.conflicts,
-					unsyncable: prep.unsyncable(),
-					ignored: prep.ignored(),
-					refused: None,
-				})
+		let planned =
+			pass_panics_as_errors(pair, "the dry run", self.plan_pair_unreleased(pair)).await;
+		// The dry run read the rows a pass reads, through the same parked reader: what that cached
+		// goes now, as a pass's does when it ends, rather than when the pair's next pass ends (see
+		// `release_pair_cache`).
+		self.release_pair_cache(pair).await;
+		planned
+	}
+
+	/// [`plan_pair`](Self::plan_pair), up to giving back the page caches its read filled.
+	async fn plan_pair_unreleased(&self, pair: PairId) -> Result<PlanOutcome, Error> {
+		let prep = self.prepare(pair, None).await?;
+		if let Some(reason) = refusal(&prep) {
+			return Ok(PlanOutcome {
+				refused: Some(reason),
+				..PlanOutcome::default()
+			});
+		}
+		let state = screen_state(&prep);
+		let at = self.stage_at(pair);
+		// On a blocking thread, as a pass screens its plan: the reconcile, the screening and the
+		// lists all read and write the plan's stage.
+		off_runtime("planning the pair", move || {
+			let mut screened = reconcile_and_screen(&prep, state, || Stage::create(at))?;
+			// What the pass would apply, which takes each deletion under a deleted directory along
+			// with it.
+			screened.fold_subsumed()?;
+			Ok(PlanOutcome {
+				actions: prep.planned(&screened, Rows::Safe)?,
+				held: prep.planned(&screened, Rows::Held)?,
+				held_reason: screened.reason,
+				pass_token: screened.pass_token,
+				conflicts: screened.conflicts,
+				unsyncable: prep.unsyncable(),
+				ignored: prep.ignored(),
+				refused: None,
 			})
-			.await?
 		})
-		.await
+		.await?
 	}
 
 	/// Set `pair`'s mass-delete threshold, from the next pass on. Persisted with the pair, so it
@@ -5506,7 +5540,18 @@ impl SyncEngine {
 	}
 
 	/// Give back the page caches a finished pass left on `pair`'s writing connection and its parked
-	/// reader (see [`BaselineStore::release_page_caches`]), wherever the pass ended.
+	/// reader (see [`BaselineStore::release_page_caches`]), wherever the pass ended — and those a dry
+	/// run ([`plan_pair`](Self::plan_pair)), an adoption
+	/// ([`reconfigure_pair`](Self::reconfigure_pair) with [`Backlog::AdoptDestination`]) and a
+	/// confirmation sweep left, which read as much.
+	///
+	/// A release reaches every connection in the process, so one landing while another pair's pass
+	/// reads makes that pass read its interior pages back from the OS page cache: a few MiB at most,
+	/// against the reader's and the writer's whole caches (`baseline::READER_CACHE_KIB`,
+	/// `baseline::WRITER_CACHE_KIB`) the pair would otherwise keep until its next pass ends — on a
+	/// watched pair nothing changes in, the watch's next safety-net read, and on an unwatched one,
+	/// whenever its caller next syncs it. The end of every pass that reads already releases while
+	/// other pairs read.
 	///
 	/// Only a store that is already open: a pass that never opened one filled no cache, and opening
 	/// one here would pay the schema parse that keeping it open saves. Off the runtime thread,
@@ -10830,22 +10875,7 @@ mod tests {
 		let (pair, _) = locked(&engine.control)
 			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
 			.unwrap();
-		let store = engine.pair_store(pair).await.unwrap();
-		locked(&store)
-			.writer()
-			.execute_batch(
-				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
-				 PRAGMA wal_checkpoint(TRUNCATE);",
-			)
-			.unwrap();
-		let read = || -> String {
-			locked(&store)
-				.writer()
-				.query_row("SELECT v FROM probe", [], |row| row.get(0))
-				.unwrap()
-		};
-		assert_eq!(read(), "kept-page");
-		rewrite_behind_sqlite(&path, b"kept-page", b"gone-page");
+		let store = cache_a_rewritten_page(&engine, pair, &path).await;
 
 		// Offline, so the pass reads the baseline and then fails at the remote side: the way out is
 		// what is under test, and every pass that reads takes the same one.
@@ -10855,7 +10885,7 @@ mod tests {
 			.expect_err("an offline pass reads no remote side");
 
 		assert_eq!(
-			read(),
+			writers_page(&store),
 			"gone-page",
 			"the page cache was given back, so the read went to the file"
 		);
@@ -10882,22 +10912,7 @@ mod tests {
 		let changes = engine.pair_changes(pair).await;
 		changes.cover_local();
 		assert!(changes.is_idle());
-		let store = engine.pair_store(pair).await.unwrap();
-		locked(&store)
-			.writer()
-			.execute_batch(
-				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
-				 PRAGMA wal_checkpoint(TRUNCATE);",
-			)
-			.unwrap();
-		let read = || -> String {
-			locked(&store)
-				.writer()
-				.query_row("SELECT v FROM probe", [], |row| row.get(0))
-				.unwrap()
-		};
-		assert_eq!(read(), "kept-page");
-		rewrite_behind_sqlite(&path, b"kept-page", b"gone-page");
+		let store = cache_a_rewritten_page(&engine, pair, &path).await;
 
 		// Offline, so a pass that read would fail at the remote side: `Ok` is a pass never started.
 		engine
@@ -10905,7 +10920,7 @@ mod tests {
 			.await
 			.expect("an idle wake runs no pass");
 
-		std::fs::write(answer, read()).unwrap();
+		std::fs::write(answer, writers_page(&store)).unwrap();
 		drop(engine);
 		std::fs::remove_file(&path).ok();
 	}
@@ -10938,6 +10953,103 @@ mod tests {
 		);
 		// No file at all when the name matched no test: libtest then runs none and exits 0.
 		std::fs::read_to_string(&answer).expect("the test run alone wrote no answer")
+	}
+
+	/// A dry run reads what a pass reads and gives back what that cached when it ends, as a pass
+	/// does, whatever its read came to.
+	#[tokio::test]
+	async fn a_dry_run_gives_back_the_pair_writers_page_cache() {
+		let (engine, pair, path) = engine_with_pair("plan_release").await;
+		let store = cache_a_rewritten_page(&engine, pair, &path).await;
+
+		// Offline, so the read fails before anything is planned: the way out is what is under test.
+		engine
+			.plan_pair(pair)
+			.await
+			.expect_err("an offline dry run reads no remote side");
+
+		assert_eq!(
+			writers_page(&store),
+			"gone-page",
+			"the dry run kept the page cache"
+		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// So does an adoption, which reads both sides as a dry run does before it writes the rows it
+	/// adopted.
+	#[tokio::test]
+	async fn an_adoption_gives_back_the_pair_writers_page_cache() {
+		let (engine, pair, path) = engine_with_pair("adopt_release").await;
+		let store = cache_a_rewritten_page(&engine, pair, &path).await;
+
+		// Offline, as the dry run above.
+		engine
+			.reconfigure_pair(pair, SyncMode::LocalToRemote, Backlog::AdoptDestination)
+			.await
+			.expect_err("an offline adoption reads no remote side");
+
+		assert_eq!(
+			writers_page(&store),
+			"gone-page",
+			"the adoption kept the page cache"
+		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// And so does the confirmation sweep a resume runs, which reads every unconfirmed row.
+	#[tokio::test]
+	async fn a_confirmation_sweep_gives_back_the_pair_writers_page_cache() {
+		let (engine, pair, path) = engine_with_pair("sweep_release").await;
+		// A push no announcement has confirmed, so the sweep reads the rows instead of returning at
+		// its first look.
+		let pushed = synced_file(
+			"pushed.txt",
+			Uuid::from_u128(1),
+			Blake3Hash::from([1; 32]),
+			4,
+		);
+		locked(&engine.pair_store(pair).await.unwrap())
+			.upsert_entry(pair, &pushed)
+			.unwrap();
+		let store = cache_a_rewritten_page(&engine, pair, &path).await;
+
+		engine.sweep_confirmations(pair).await.unwrap();
+
+		assert_eq!(
+			writers_page(&store),
+			"gone-page",
+			"the sweep kept the page cache"
+		);
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// Leave `pair`'s writing connection holding a page, then change that page's bytes on disk
+	/// behind SQLite's back: [`writers_page`] answers `"kept-page"` from the writer's cache until
+	/// that cache is given back, and `"gone-page"` from the file after.
+	async fn cache_a_rewritten_page(engine: &SyncEngine, pair: PairId, path: &Path) -> SharedStore {
+		let store = engine.pair_store(pair).await.unwrap();
+		locked(&store)
+			.writer()
+			.execute_batch(
+				"CREATE TABLE probe (v TEXT); INSERT INTO probe VALUES ('kept-page'); \
+				 PRAGMA wal_checkpoint(TRUNCATE);",
+			)
+			.unwrap();
+		assert_eq!(writers_page(&store), "kept-page");
+		rewrite_behind_sqlite(path, b"kept-page", b"gone-page");
+		store
+	}
+
+	/// The page [`cache_a_rewritten_page`] left, read through the pair's writing connection.
+	fn writers_page(store: &SharedStore) -> String {
+		locked(store)
+			.writer()
+			.query_row("SELECT v FROM probe", [], |row| row.get(0))
+			.unwrap()
 	}
 
 	/// Every stage an engine makes for a pair is a file of its own beside the baseline, so a second
