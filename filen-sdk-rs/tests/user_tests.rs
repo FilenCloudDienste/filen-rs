@@ -36,19 +36,24 @@ fn dir_meta_name<'a>(meta: &'a DirectoryMeta<'_>) -> Option<&'a str> {
 #[shared_test_runtime]
 async fn upload_avatar() {
 	let client = test_utils::RESOURCES.client().await;
-	// `test:chats` is the avatar exclusion lock. The avatar is embedded in every
-	// chat-message snapshot (`sender_avatar`) and surfaced by contact-request events, so
-	// rotating it mid-flight breaks any avatar-bearing equality assert running on a
-	// sibling CI leg (chat_tests::chat_msgs and socket_tests::chat both raced exactly
-	// this on the 2026-08-06/07 nightlies). Every such observer — and any concurrent
-	// upload_avatar, which this test's own before/after asserts race — already holds
-	// `test:chats` for its window, so one hold here serializes them all; a dedicated
-	// avatar lock would add nothing. Observers must also re-read the avatar once INSIDE
-	// their window (`chat_tests::lock_chat` does): the client caches it for its lifetime,
-	// so a snapshot taken before queueing for the lock is stale after this rotates it.
+	// The avatar is embedded in every chat-message snapshot (`sender_avatar`), surfaced by
+	// contact-request events and carried by note participants, so rotating it mid-flight
+	// breaks any avatar-bearing equality assert running on a sibling CI leg
+	// (chat_tests::chat_msgs and socket_tests::chat raced this on the 2026-08-06/07
+	// nightlies, note_tests::note_tagging on the 2026-10-06 one). Chat and contact-request
+	// observers hold `test:chats` for their window and note observers `test:notes`, so
+	// holding both here serializes them all, and any concurrent upload_avatar, whose own
+	// before/after asserts race too. `test:notes` comes second: contact, chats, notes is
+	// the order every test keeps. Observers must also re-read the avatar once INSIDE their
+	// window (`chat_tests::lock_chat` does): the client caches it for its lifetime, so a
+	// snapshot taken before queueing for the lock is stale after this rotates it.
 	// Held across before-fetch → upload → after-fetch.
-	let _lock = client
+	let _chat_lock = client
 		.acquire_lock_with_default(test_utils::locks::CHATS)
+		.await
+		.unwrap();
+	let _note_lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
 		.await
 		.unwrap();
 	let before = client.get_user_info().await.unwrap();

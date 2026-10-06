@@ -1516,9 +1516,9 @@ test("color", async () => {
 test("notes", async () => {
 	// Hold the same account-wide `test:notes` server lock the native note tests take: this suite
 	// shares the V2 account with the native matrix legs, where user_tests.rs
-	// `set_nickname_round_trip` rotates the nickname the server joins into every note
-	// participant (breaking the toEqual below), note_tag_manipulation deletes every tag and
-	// cmd_export_notes deletes every note.
+	// `set_nickname_round_trip` and `upload_avatar` rotate the nickname and avatar the server
+	// joins into every note participant (breaking the toEqual below), note_tag_manipulation
+	// deletes every tag and cmd_export_notes deletes every note.
 	using _lock = await state.acquireLock({ resource: "test:notes" })
 	let note = await state.createNote()
 	expect(note).toBeDefined()

@@ -1080,6 +1080,12 @@ async fn note() {
 	let client = test_utils::RESOURCES.client().await;
 	let shared_client = test_utils::SHARE_RESOURCES.client().await;
 	let _locks = test_utils::set_up_contact(&client, &shared_client).await;
+	// The participant compared with its ParticipantNew event carries the owner's avatar, which
+	// user_tests::upload_avatar rotates under `test:notes`.
+	let _note_lock = client
+		.acquire_lock_with_default(test_utils::locks::NOTES)
+		.await
+		.unwrap();
 
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 	let _handle = client
