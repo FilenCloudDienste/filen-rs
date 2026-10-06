@@ -821,6 +821,11 @@ async fn chat() {
 	let client = test_utils::RESOURCES.client().await;
 	let share_client = test_utils::SHARE_RESOURCES.client().await;
 
+	// Both accounts' `test:contact` before `test:chats`, the order chat_tests::lock_chats takes
+	// them in. This test used to take `test:chats` first: on the 2026-10-05 nightly it and a
+	// chat test on another leg each held one lock and waited for the other until the job timeout.
+	let _contact_locks = test_utils::set_up_contact_no_add(&client, &share_client).await;
+
 	// Serialize with chat_tests on the account-wide chat lock and start from a clean slate:
 	// leaked conversations feed the server's `conversations/create` rate limit (see
 	// chat_tests.rs for the same guard).
@@ -864,7 +869,7 @@ async fn chat() {
 	// 2026-08-06 nightly). No extra lock needed: `_chat_lock` above is held for the whole
 	// test and `upload_avatar` holds `test:chats` while rotating, so the avatar cannot
 	// change between emission and the get_user_info fetch.
-	let _locks = test_utils::set_up_contact(&client, &share_client).await;
+	test_utils::add_contact(&client, &share_client).await;
 
 	let event = await_map_event(
 		&mut share_receiver,

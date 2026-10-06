@@ -183,8 +183,8 @@ async fn lock_chats(
 	// meant a V2 chat test held an account-wide lock while queueing behind V1 legs on the share
 	// account, which every leg shares: that inversion kept `test:chats` shut for 27 minutes on the
 	// 2026-09-19 nightly and starved the wasm suite's `chats` test into its 1800s vitest timeout.
-	// No new cycle: `test:chats` is only ever acquired in `lock_chat`, and `test:contact` only in
-	// `set_up_contact*` and compat_tests, so nothing takes the two in the opposite order.
+	// Every test that holds both takes `test:contact` first; socket_tests::chat once took them the
+	// other way round and deadlocked against this on the 2026-10-05 nightly.
 	let (lock3, lock4) = set_up_contact(client, share_client).await;
 	let lock2 = lock_chat(share_client).await;
 	let lock1 = lock_chat(client).await;

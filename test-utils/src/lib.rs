@@ -284,7 +284,13 @@ pub async fn set_up_contact<'a>(
 	share_client: &'a Client,
 ) -> (Arc<ResourceLock>, Arc<ResourceLock>) {
 	let (lock1, lock2) = set_up_contact_no_add(client, share_client).await;
+	add_contact(client, share_client).await;
+	(lock1, lock2)
+}
 
+/// Makes `share_client` a contact of `client`: sends the request and accepts it. The caller holds
+/// both accounts' `test:contact` locks from [`set_up_contact_no_add`].
+pub async fn add_contact(client: &Client, share_client: &Client) {
 	let request_uuid = client
 		.send_contact_request(share_client.email())
 		.await
@@ -298,8 +304,6 @@ pub async fn set_up_contact<'a>(
 		.accept_contact_request(request_uuid)
 		.await
 		.unwrap();
-
-	(lock1, lock2)
 }
 
 pub async fn await_event<F, T>(
