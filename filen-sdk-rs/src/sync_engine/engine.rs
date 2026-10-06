@@ -10215,6 +10215,45 @@ mod tests {
 		);
 	}
 
+	/// Staging the plan ends the pass's read transaction: once the apply has its entries, neither
+	/// the plan nor what the pass keeps beside it holds a clone of the baseline's snapshot, which
+	/// would keep that transaction open through the apply and pin the WAL (see `Baseline::close`).
+	#[tokio::test]
+	async fn staging_the_plan_leaves_no_clone_of_the_pass_snapshot() {
+		let (old, new) = (Blake3Hash::from([1; 32]), Blake3Hash::from([2; 32]));
+		let uuid = Uuid::from_u128(1);
+		let mut prep = prepared(
+			SyncMode::TwoWay,
+			HashMap::from([("a.txt".to_string(), synced_file("a.txt", uuid, old, 4))]),
+			vec![local_file("a.txt", old), local_file("b.txt", new)],
+			view(vec![remote_file("a.txt", uuid, new, 4)], Vec::new(), &[]),
+			HashMap::new(),
+		);
+		let snapshot = prep
+			.baseline
+			.snapshot_for_test()
+			.expect("a stored baseline reads through a snapshot");
+		// Each entry takes what the apply reads for it out of the snapshot: the download its row,
+		// the upload the absence of one.
+		let actions = [
+			SyncAction::DownloadFile {
+				rel_path: "a.txt".to_string(),
+				remote_uuid: uuid,
+			},
+			upload("b.txt"),
+		];
+		let (_dir, stage) = Stage::in_temp_dir();
+		let screen = Screen::new(stage, &[], &actions).unwrap();
+		let plan = prep.stage_plan(screen).await.unwrap();
+		assert_eq!(plan.pager().len(), 2);
+		assert_eq!(
+			snapshot.strong_count(),
+			0,
+			"a clone of the pass's snapshot outlives its plan"
+		);
+		drop(prep);
+	}
+
 	#[test]
 	fn local_roots_overlap_only_when_one_actually_contains_the_other() {
 		let existing = Path::new("/sync/data");

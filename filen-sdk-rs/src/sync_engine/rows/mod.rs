@@ -94,6 +94,8 @@
 //! the local scan's blocking thread; the connection sits behind a mutex, so a clone is readable from
 //! any thread and two readers take turns.
 
+#[cfg(test)]
+use std::sync::Weak;
 use std::{
 	borrow::Cow,
 	collections::{BTreeMap, BTreeSet, HashMap},
@@ -1337,14 +1339,22 @@ impl Baseline {
 		if let Some(rows) = &self.rows
 			&& Arc::strong_count(rows) > 1
 		{
-			// Not a wrong answer, so not a panic in a shipped build: the apply still reads the rows
-			// its entries took. But the transaction stays open for as long as that clone lives.
+			// Not a wrong answer, so not a panic: the apply still reads the rows its entries took.
+			// But the transaction stays open for as long as that clone lives. The engine's tests
+			// hold its plan to leaving none (see `snapshot_for_test`).
 			tracing::error!(
 				"baseline: a clone of the pass's snapshot outlives its plan — its read transaction \
 				 stays open through the apply and pins the WAL"
 			);
-			debug_assert!(false, "a clone of the pass's snapshot outlives its plan");
 		}
+	}
+
+	/// A handle on the snapshot behind this baseline that does not keep it alive: once the
+	/// baseline is gone, its strong count is how many clones still hold the snapshot, and with it
+	/// the pass's read transaction (see [`close`](Self::close)).
+	#[cfg(test)]
+	pub(super) fn snapshot_for_test(&self) -> Option<Weak<Snapshot>> {
+		self.rows.as_ref().map(Arc::downgrade)
 	}
 
 	/// Every row, parent before child, in path order (see the module doc).
