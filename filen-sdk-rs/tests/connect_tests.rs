@@ -1317,6 +1317,10 @@ async fn copy_with_shares(
 
 	// A destination shared while the copy runs: paused once the copy's directory exists,
 	// shared, then resumed; the finished copy reaches the other account.
+	// The pause is only requested once the copy holds drive-write, and wait_until_paused gives
+	// that a minute. Holding the lock here lets the copy reuse it, so another holder on the
+	// shared account cannot use up that minute (it did on the 2026-10-05 nightly).
+	let drive_lock = client.lock_drive().await.unwrap();
 	let recorder = Arc::new(Recorder::default());
 	let (control, controller) = JobControl::new();
 	let running = tokio::spawn({
@@ -1349,6 +1353,7 @@ async fn copy_with_shares(
 		.unwrap();
 	controller.resume();
 	running.await.unwrap().unwrap();
+	drop(drive_lock);
 	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 	let (in_dirs, _) = share_client
 		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
