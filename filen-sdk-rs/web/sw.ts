@@ -1,7 +1,6 @@
 /// <reference types="@types/serviceworker" />
 
 import init, { Client, fromStringified, type StringifiedClient, type File } from "./service-worker/sdk-rs.js"
-import filenSdkRsWasmPath from "./service-worker/sdk-rs_bg.wasm?url"
 
 self.addEventListener("install", () => {
 	console.log("Installing service worker...")
@@ -29,7 +28,7 @@ self.addEventListener("activate", (event: ExtendableEvent) => {
 // /serviceWorker/init is gone by the time a page that waited on the network comes back.
 let state: Client | undefined
 
-async function download(client: Client, file: File): Promise<Uint8Array> {
+async function download(client: Client, file: File): Promise<Uint8Array<ArrayBuffer>> {
 	return await collectBytes((writer: WritableStream<Uint8Array>) =>
 		client.downloadFileToWriter({
 			file: file,
@@ -41,7 +40,7 @@ async function download(client: Client, file: File): Promise<Uint8Array> {
 export async function initClient(client: StringifiedClient): Promise<Client> {
 	console.log("Initializing state in service worker...")
 
-	await init(dataURItoBuffer(filenSdkRsWasmPath))
+	await init()
 
 	state = fromStringified(client)
 
@@ -102,7 +101,7 @@ self.addEventListener("fetch", (e: FetchEvent) => {
 					const client = await ensureClient(url)
 					const data = await download(client, JSON.parse(decodeURIComponent(file), jsonBigIntReviver) as File)
 
-					return new Response(Buffer.from(data))
+					return new Response(data)
 				})
 
 				break
@@ -140,7 +139,7 @@ self.addEventListener("fetch", (e: FetchEvent) => {
 	}
 })
 
-export async function collectBytes(downloadFn: (writer: WritableStream<Uint8Array>) => Promise<void>): Promise<Uint8Array> {
+export async function collectBytes(downloadFn: (writer: WritableStream<Uint8Array>) => Promise<void>): Promise<Uint8Array<ArrayBuffer>> {
 	const chunks: Uint8Array[] = []
 
 	await downloadFn(
@@ -170,23 +169,4 @@ export function jsonBigIntReviver(_: string, value: unknown) {
 	}
 
 	return value
-}
-
-export function dataURItoBuffer(dataURI: string): ArrayBuffer {
-	const parts = dataURI.split(",")
-
-	if (parts.length !== 2) {
-		throw new Error("Invalid data URI format.")
-	}
-
-	const base64Payload = parts[1]
-	const binaryString = atob(base64Payload)
-	const len = binaryString.length
-	const bytes = new Uint8Array(len)
-
-	for (let i = 0; i < len; i++) {
-		bytes[i] = binaryString.charCodeAt(i)
-	}
-
-	return bytes.buffer
 }

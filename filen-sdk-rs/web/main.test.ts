@@ -1806,7 +1806,7 @@ test("service worker", async () => {
 
 	const serviceWorker = await window.navigator.serviceWorker.register("/sw.js", {
 		scope: "/",
-		type: "classic"
+		type: "module"
 	})
 
 	await serviceWorker.update()

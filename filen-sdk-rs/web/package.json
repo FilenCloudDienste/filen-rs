@@ -4,7 +4,7 @@
 	"description": "Filen JS SDK using filen-sdk-rs",
 	"type": "module",
 	"scripts": {
-		"build": "vite build",
+		"build": "vite build -c vite.sw.config.ts",
 		"test": "npm run build && vitest run --browser.name=chromium && vitest run --browser.name=firefox",
 		"ubrn:ios": "ubrn build ios --and-generate",
 		"ubrn:android": "ubrn build android --and-generate",
@@ -98,9 +98,6 @@
 		"prettier": "^3.9.9",
 		"typescript": "~7.0.2",
 		"vite": "^8.3.3",
-		"vite-plugin-node-polyfills": "^0.28.0",
-		"vite-plugin-pwa": "^2.0.0",
-		"vite-plugin-wasm": "^3.6.0",
 		"vitest": "^5.0.3"
 	},
 	"codegenConfig": {
