@@ -221,7 +221,7 @@ pub(crate) enum Commands {
 	},
 	/// Set up an MCP server that exposes tools for AI agents to interact with your Filen drive.
 	Mcp,
-	/// Runs a JSON-RPC server exposing endpoints for interacting with your Filen drive programmatically
+	/// Runs a JSON-RPC server exposing endpoints for interacting with your Filen drive programmatically.
 	JsonRpcServer {
 		#[arg(long = "addr")]
 		address: Option<String>,

@@ -6,7 +6,7 @@ use jsonrpsee::{
 use openrpc_types::{
 	Components, ContentDescriptor, Info, Method, OpenRPC, ParamStructure, ReferenceOr,
 };
-use schemars::{Schema, SchemaGenerator, generate::SchemaSettings};
+use schemars::{Schema, SchemaGenerator, generate::SchemaSettings, transform::RecursiveTransform};
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tokio::select;
 
@@ -115,6 +115,58 @@ fn method_for(endpoint: &dyn AnyEndpoint, generator: &mut SchemaGenerator) -> Me
 	}
 }
 
+/// Keywords that annotate a schema as a whole rather than constrain one of its types; they stay
+/// on the outer schema when [`nullable_type_to_any_of`] splits it.
+const ANNOTATION_KEYWORDS: &[&str] = &[
+	"title",
+	"description",
+	"default",
+	"examples",
+	"deprecated",
+	"readOnly",
+	"writeOnly",
+	"$comment",
+];
+
+/// Rewrites a nullable type list like `{"type": ["integer", "null"], "minimum": 0}` into the
+/// equivalent `{"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}`.
+///
+/// Both are valid JSON Schema, and schemars emits the former for every `Option<T>` of a
+/// primitive `T`. But tooling built on the OpenRPC spec handles `type` lists poorly (e.g.
+/// `openrpc-md` silently drops such fields), while `anyOf` is supported everywhere.
+fn nullable_type_to_any_of(schema: &mut Schema) {
+	let Some(object) = schema.as_object_mut() else {
+		return;
+	};
+	let Some(serde_json::Value::Array(types)) = object.get("type") else {
+		return;
+	};
+	if !types.iter().any(|ty| ty == "null") {
+		return;
+	}
+	let mut non_null: Vec<serde_json::Value> =
+		types.iter().filter(|ty| *ty != "null").cloned().collect();
+	let non_null_type = match non_null.len() {
+		0 => return,
+		1 => non_null.remove(0),
+		_ => serde_json::Value::Array(non_null),
+	};
+
+	// Everything but the annotations constrains the non-null type (`format`, `minimum`,
+	// `items`, `properties`, ...), so it moves into that branch.
+	let mut branch = std::mem::take(object);
+	for keyword in ANNOTATION_KEYWORDS {
+		if let Some(value) = branch.remove(*keyword) {
+			object.insert(keyword.to_string(), value);
+		}
+	}
+	branch.insert("type".to_string(), non_null_type);
+	object.insert(
+		"anyOf".to_string(),
+		serde_json::json!([branch, { "type": "null" }]),
+	);
+}
+
 /// Describes the endpoints as an OpenRPC document (https://spec.open-rpc.org), for serving from
 /// `rpc.discover`.
 fn build_openrpc_document(endpoints: &[Arc<dyn AnyEndpoint>], addr: SocketAddr) -> OpenRPC {
@@ -124,7 +176,9 @@ fn build_openrpc_document(endpoints: &[Arc<dyn AnyEndpoint>], addr: SocketAddr) 
 	let mut settings = SchemaSettings::draft07();
 	settings.definitions_path = SCHEMAS_POINTER.into();
 	settings.meta_schema = None;
-	let mut generator = settings.into_generator();
+	let mut generator = settings
+		.with_transform(RecursiveTransform(nullable_type_to_any_of))
+		.into_generator();
 
 	let methods = endpoints
 		.iter()
@@ -278,6 +332,45 @@ mod tests {
 			}
 			_ => {}
 		}
+	}
+
+	#[test]
+	fn nullable_types_become_any_of() {
+		let mut schema = schemars::json_schema!({
+			"description": "Size in bytes",
+			"type": ["integer", "null"],
+			"format": "uint64",
+			"minimum": 0,
+		});
+		nullable_type_to_any_of(&mut schema);
+		assert_eq!(
+			schema,
+			schemars::json_schema!({
+				"description": "Size in bytes",
+				"anyOf": [
+					{ "type": "integer", "format": "uint64", "minimum": 0 },
+					{ "type": "null" },
+				],
+			})
+		);
+	}
+
+	#[test]
+	fn document_has_no_type_lists() {
+		fn check(value: &serde_json::Value) {
+			match value {
+				serde_json::Value::Object(object) => {
+					assert!(
+						!object.get("type").is_some_and(|ty| ty.is_array()),
+						"{value}"
+					);
+					object.values().for_each(check);
+				}
+				serde_json::Value::Array(array) => array.iter().for_each(check),
+				_ => {}
+			}
+		}
+		check(&serde_json::to_value(document()).unwrap());
 	}
 
 	#[test]
