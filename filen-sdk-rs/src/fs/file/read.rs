@@ -183,6 +183,24 @@ pub(crate) fn check_chunks_consistent(chunks: u64, size: u64) -> Result<(), Erro
 	))
 }
 
+/// Bytes chunk `chunk_idx` of `file` takes to download (its plaintext plus the AES tag and
+/// nonce), or `None` past its last chunk.
+fn encrypted_chunk_size(file: &dyn File, chunk_idx: u64) -> Option<NonZeroU32> {
+	let last_chunk_idx = file.chunks().checked_sub(1)?;
+	if chunk_idx < last_chunk_idx {
+		Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
+	} else if chunk_idx == last_chunk_idx {
+		let size: u64 = chunk_idx
+			.checked_mul(u64::from(FILE_CHUNK_SIZE.get()))
+			.and_then(|chunk_start| file.size().checked_sub(chunk_start))?
+			.saturating_add(u64::from(FILE_CHUNK_SIZE_EXTRA.get()));
+		let size: u32 = size.try_into().ok()?;
+		NonZeroU32::new(size)
+	} else {
+		None
+	}
+}
+
 /// Plaintext length of chunk `index` of a `size`-byte file.
 pub(crate) fn chunk_plaintext_len(size: u64, index: u64) -> u64 {
 	size.saturating_sub(index * CHUNK_SIZE_U64)
@@ -207,9 +225,6 @@ impl<'a> FileReader<'a> {
 	}
 
 	fn next_chunk_size(&self) -> Option<NonZeroU32> {
-		if self.file.chunks() == 0 {
-			return None;
-		}
 		// Once the read position reaches the range limit no further bytes are ever
 		// wanted — without this an empty range (start == end mid-chunk) still fetches
 		// the chunk containing that position.
@@ -226,19 +241,7 @@ impl<'a> FileReader<'a> {
 		{
 			return None;
 		}
-		if self.next_chunk_idx < self.file.chunks() - 1 {
-			Some(FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()))
-		} else if self.next_chunk_idx == self.file.chunks() - 1 {
-			let size: u64 = self
-				.next_chunk_idx
-				.checked_mul(u64::from(FILE_CHUNK_SIZE.get()))
-				.and_then(|chunk_start| self.file.size().checked_sub(chunk_start))?
-				.saturating_add(u64::from(FILE_CHUNK_SIZE_EXTRA.get()));
-			let size: u32 = size.try_into().ok()?;
-			NonZeroU32::new(size)
-		} else {
-			None
-		}
+		encrypted_chunk_size(self.file, self.next_chunk_idx)
 	}
 
 	/// Whether reserving one more `chunk_size`-byte chunk keeps the in-flight pipeline (already
@@ -340,6 +343,40 @@ impl<'a> FileReader<'a> {
 	}
 }
 
+impl FileReader<'_> {
+	/// Queues as many chunk fetches as the read-ahead budget allows and polls the pending
+	/// allocation. Returns whether that allocation is still pending with chunks left to fetch,
+	/// in which case the reader must wait for it rather than report EOF.
+	fn poll_read_ahead(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+		// first try to queue more chunks
+		while let Some(chunk) = self.try_allocate_next_chunk() {
+			self.push_fetch_next_chunk(chunk);
+		}
+
+		// then see if our allocation future is ready
+		let Some(mut fut) = self.allocate_chunk_future.take() else {
+			return false;
+		};
+		match fut.as_mut().poll(cx) {
+			std::task::Poll::Ready(chunk) => {
+				self.push_fetch_next_chunk(chunk);
+				self.allocate_chunk_future = self.allocate_next_chunk();
+				false
+			}
+			std::task::Poll::Pending => {
+				// allocation is still pending, we can't read anything yet
+				if self.next_chunk_size().is_some() {
+					// we have more chunks to allocate, so we put the future back
+					self.allocate_chunk_future = Some(fut);
+					return true;
+				}
+				// if we don't have more chunks to allocate, we can drop the future
+				false
+			}
+		}
+	}
+}
+
 impl futures::io::AsyncRead for FileReader<'_> {
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
@@ -350,31 +387,7 @@ impl futures::io::AsyncRead for FileReader<'_> {
 			return std::task::Poll::Ready(Err(std::io::Error::other(error)));
 		}
 
-		// first try to queue more chunks
-		while let Some(chunk) = self.try_allocate_next_chunk() {
-			self.push_fetch_next_chunk(chunk);
-		}
-
-		// first see if our allocation future is ready
-		let mut should_pend = false;
-		if let Some(mut fut) = self.allocate_chunk_future.take() {
-			match fut.as_mut().poll(cx) {
-				std::task::Poll::Ready(chunk) => {
-					// we have a new chunk, set it to curr_chunk
-					self.push_fetch_next_chunk(chunk);
-					self.allocate_chunk_future = self.allocate_next_chunk();
-				}
-				std::task::Poll::Pending => {
-					// allocation is still pending, we can't read anything yet
-					if self.next_chunk_size().is_some() {
-						// we have more chunks to allocate, so we put the future back
-						self.allocate_chunk_future = Some(fut);
-						should_pend = true;
-					}
-					// if we don't have more chunks to allocate, we can drop the future
-				}
-			}
-		}
+		let should_pend = self.poll_read_ahead(cx);
 
 		// then see if we have a stored chunk
 		let mut read = self.read_next_chunk(buf)?;
