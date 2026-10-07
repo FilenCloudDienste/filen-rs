@@ -6,7 +6,7 @@ use crate::cache::sql::columns::{
 use crate::cache::test_support::rewrite_behind_sqlite;
 use crate::fs::{
 	dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
-	file::meta::FileMeta,
+	file::meta::{DecryptedFileMeta, FileMeta},
 };
 use crate::socket::{DecryptedDriveEvent, FolderRestore, FolderSubCreated};
 use chrono::DateTime;
@@ -522,6 +522,7 @@ fn resync_self_heals_cache_to_listing_and_is_idempotent() {
 	state
 		.apply_resync(
 			vec![(root, dirs.clone(), files.clone())],
+			&[],
 			Vec::new(),
 			100,
 			false,
@@ -588,6 +589,7 @@ fn resync_move_out_of_deleted_parent_preserves_subtree() {
 	state
 		.apply_resync(
 			vec![(root, vec![m_moved], vec![f.clone()])],
+			&[],
 			Vec::new(),
 			100,
 			false,
@@ -838,7 +840,7 @@ fn apply_resync_converges_each_sync_root_independently() {
 		(b.uuid, vec![], vec![fb1.clone(), fb2.clone()]),
 	];
 	state
-		.apply_resync(per_root, Vec::new(), 500, false)
+		.apply_resync(per_root, &[], Vec::new(), 500, false)
 		.unwrap();
 
 	// A converged.
@@ -879,7 +881,9 @@ fn apply_resync_with_no_listings_advances_and_clears_without_deleting() {
 	state.mark_needs_resync().unwrap();
 
 	// Every configured root was skipped (e.g. all unreachable) → nothing listed.
-	state.apply_resync(vec![], Vec::new(), 777, false).unwrap();
+	state
+		.apply_resync(vec![], &[], Vec::new(), 777, false)
+		.unwrap();
 
 	assert!(
 		item_exists(&state, a.uuid),
@@ -1290,6 +1294,7 @@ fn apply_resync_dispatches_synthetics_through_both_owner_paths() {
 	state
 		.apply_resync(
 			vec![(root, vec![new_dir.clone()], vec![])],
+			&[],
 			Vec::new(),
 			50,
 			false,
@@ -3530,4 +3535,1038 @@ fn convert_listing_keeps_the_undecodable_records_on_file() {
 			},
 		]
 	);
+}
+
+/// Add `root` the way the worker does — through a control burst — and report whether the burst
+/// relisted. Unit construction has no client, so the relist itself is a no-op: what it leaves behind
+/// is the durable flag the burst marks before it, which is why the flag must start clear.
+fn add_root_relists(state: &mut CacheState, root: Uuid) -> bool {
+	assert!(
+		!state.needs_resync().unwrap(),
+		"the flag is what shows a relist, so it must start clear"
+	);
+	let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
+	let shutdown = drive(
+		state.process_control_burst(CacheControlMessage::AddSyncRoot {
+			key: RootKey::Dir(root),
+			registration_id: 0,
+			callback: Box::new(|_| {}),
+			ack,
+		}),
+	);
+	assert!(!shutdown);
+	assert!(matches!(ack_rx.try_recv(), Ok(Ok(()))), "the add is acked");
+	assert!(
+		state.sync_roots.contains_key(&root),
+		"the root is registered"
+	);
+	state.needs_resync().unwrap()
+}
+
+/// List `root` whole at drive id `at`, the way a converged resync leaves it: its node materialized,
+/// then its listing applied and committed.
+fn list_root(
+	state: &mut CacheState,
+	root: &CacheableDir<'static>,
+	files: Vec<CacheableFile<'static>>,
+	at: u64,
+) {
+	state.upsert_dirs(once(root)).unwrap();
+	state
+		.apply_resync(
+			vec![(root.uuid, Vec::new(), files)],
+			&[],
+			Vec::new(),
+			at,
+			false,
+		)
+		.unwrap();
+	assert!(!state.needs_resync().unwrap(), "the listing converged");
+}
+
+fn only_root(root: Uuid) -> HashMap<Uuid, SyncRootCallback> {
+	let mut roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	roots.insert(root, Box::new(|_| {}));
+	roots
+}
+
+/// A cache reopened on a DB that already holds a root's whole subtree at its watermark registers
+/// that root without relisting it, and still announces it converged so a caller waiting on the
+/// progress pair is not left waiting.
+#[test]
+fn a_reopened_cache_adds_a_root_it_listed_whole_without_relisting_it() {
+	let path = std::env::temp_dir().join(format!("filen-cache-listed-{}.db", Uuid::new_v4()));
+	let account = Uuid::new_v4();
+	let root = cache_dir(1, account);
+	let child = cache_file(2, root.uuid, 100);
+	{
+		let mut state = CacheState::new_on_path(&path, account);
+		state.set_test_sync_roots(only_root(root.uuid));
+		list_root(&mut state, &root, vec![child.clone()], 100);
+	}
+
+	{
+		let mut state = CacheState::new_on_path(&path, account);
+		let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(8);
+		state.msg_sender = msg_tx;
+		state.set_test_sync_roots(HashMap::new());
+
+		assert!(
+			!add_root_relists(&mut state, root.uuid),
+			"a root this DB already holds whole at its watermark is not relisted"
+		);
+		assert!(
+			item_exists(&state, child.uuid),
+			"the listed subtree is kept"
+		);
+		let started = msg_rx.try_recv().expect("a Started message");
+		assert!(
+			matches!(
+				&started[..],
+				[CacheMessage::ResyncProgress(ResyncProgress::Started { roots })] if *roots == [root.uuid]
+			),
+			"the add announces the root it converges, got {started:?}"
+		);
+		let finished = msg_rx.try_recv().expect("a Finished message");
+		assert!(
+			matches!(
+				&finished[..],
+				[CacheMessage::ResyncProgress(ResyncProgress::Finished {
+					converged: true
+				})]
+			),
+			"and that it converged, got {finished:?}"
+		);
+	}
+
+	let _ = std::fs::remove_file(&path);
+	let _ = std::fs::remove_file(path.with_extension("db-wal"));
+	let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+/// A root whose rows are cached only because an enclosing root was listed was never listed itself,
+/// so adding it relists.
+#[test]
+fn adding_a_root_the_cache_never_listed_relists_it() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let root = cache_dir(1, account);
+	let child = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(account));
+	state
+		.apply_resync(
+			vec![(account, vec![root.clone()], vec![child])],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A root listed whole by one resync, whose next resync then failed to list it, relists on its next
+/// add: the failed attempt may have left anything between the two listings.
+#[test]
+fn adding_a_root_whose_last_resync_failed_relists_it() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw: Vec::new(),
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: Vec::new(),
+			any_transient: true,
+			remote_under_lock: 200,
+		})
+		.unwrap();
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// Events drained while a listed root was not registered were gated out of its subtree, so its
+/// listing no longer holds at the watermark they advanced, and its next add relists.
+#[test]
+fn a_drain_while_a_listed_root_was_unregistered_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let root = cache_dir(1, account);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	state.set_test_sync_roots(HashMap::new());
+
+	let missed = cache_file(2, root.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::New(missed.clone())),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert!(
+		!item_exists(&state, missed.uuid),
+		"gated out of the unregistered root"
+	);
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// Events drained while a listed root WAS registered landed in its subtree, so its listing still
+/// holds at the watermark they advanced, and a later re-add does not relist.
+#[test]
+fn a_drain_while_a_listed_root_was_registered_keeps_its_listing() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	let arrived = cache_file(2, root.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::New(arrived.clone())),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert!(
+		item_exists(&state, arrived.uuid),
+		"applied under the registered root"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, root.uuid));
+}
+
+/// Evicting a listed root deletes its subtree without moving the watermark, so its next add
+/// relists.
+#[test]
+fn evicting_a_listed_root_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let child = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, vec![child.clone()], 100);
+	drive(state.handle_remove_registration(RootKey::Dir(root.uuid), 0, true, None));
+	assert!(!item_exists(&state, child.uuid), "evicted");
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A root held whole at the watermark is only current while the remote drive id has not moved past
+/// it: a change made while no cache ran moves the id, and the add must relist to catch it.
+#[test]
+fn a_listed_root_relists_once_the_drive_moved_past_the_watermark() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	assert!(
+		state.listings_current(&[root.uuid], Some(100)).unwrap(),
+		"the remote drive id still at the watermark: held whole"
+	);
+	assert!(
+		!state.listings_current(&[root.uuid], Some(101)).unwrap(),
+		"the remote drive id past the watermark: relist"
+	);
+	assert!(
+		!state
+			.listings_current(&[root.uuid, Uuid::from_u128(99)], Some(100))
+			.unwrap(),
+		"a burst with one unlisted root relists them all"
+	);
+}
+
+/// A dir trashed and restored under a listed root comes back as a `Restored` of the dir alone: the
+/// trash cascaded its contents out, and no later event carries them. The listing no longer holds, so
+/// the root's next add relists.
+#[test]
+fn a_dir_restored_under_a_listed_root_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let sub = cache_dir(2, root.uuid);
+	let child = cache_file(3, sub.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	state.upsert_dirs(once(&root)).unwrap();
+	state
+		.apply_resync(
+			vec![(root.uuid, vec![sub.clone()], vec![child.clone()])],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Removed(sub.uuid)),
+	);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::Dir(DirEvent::Restored(sub.clone())),
+	);
+	assert!(item_exists(&state, sub.uuid), "the restored dir is back");
+	assert!(!item_exists(&state, child.uuid), "its contents are not");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A dir created under a listed root has no contents yet: what goes into it arrives as events of
+/// its own, which the root applies. The listing still holds, so the root's next add does not
+/// relist.
+#[test]
+fn a_dir_created_under_a_listed_root_keeps_its_listing() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let sub = cache_dir(2, root.uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	state.upsert_dirs(once(&root)).unwrap();
+	state
+		.apply_resync(
+			vec![(root.uuid, vec![sub.clone()], Vec::new())],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+
+	let created = cache_dir(3, sub.uuid);
+	let child = cache_file(4, created.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::New(created.clone())),
+	);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::File(FileEvent::New(child.clone())),
+	);
+	assert!(
+		item_exists(&state, child.uuid),
+		"what goes into the new dir arrives on its own"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, root.uuid));
+}
+
+/// A dir created where no registered root held whole holds its parent: here the listed root is not
+/// registered, and the dir is admitted by the registered account root around it. What goes into the
+/// dir is admitted the same way, but nothing kept the listed root current, so the dir takes it out
+/// of the record.
+#[test]
+fn a_dir_created_under_a_parent_no_registered_listed_root_holds_takes_its_roots_out() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let root = cache_dir(1, account);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+	state.set_test_sync_roots(only_root(account));
+	assert_eq!(state.roots_held_whole().unwrap(), vec![root.uuid]);
+
+	let created = cache_dir(2, root.uuid);
+	state
+		.apply_event(
+			CacheEventType::Dir(DirEvent::New(created.clone())),
+			EventTrust::Checked,
+		)
+		.unwrap();
+	assert!(
+		item_exists(&state, created.uuid),
+		"admitted by the account root"
+	);
+
+	assert_eq!(state.roots_held_whole().unwrap(), Vec::<Uuid>::new());
+}
+
+/// A dir restored under one of two listed roots takes only that root out of the record: the other
+/// one's listing still holds, and only the root the dir came back to relists on its next add.
+#[test]
+fn a_dir_restored_under_one_listed_root_keeps_the_other_ones_listing() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let restored_in = cache_dir(1, account);
+	let untouched = cache_dir(2, account);
+	let sub = cache_dir(3, restored_in.uuid);
+	finalize_listings(
+		&mut state,
+		vec![
+			(
+				&restored_in,
+				vec![listed_dir(3, restored_in.uuid)],
+				Vec::new(),
+			),
+			(&untouched, Vec::new(), Vec::new()),
+		],
+	);
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Removed(sub.uuid)),
+	);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::Dir(DirEvent::Restored(sub.clone())),
+	);
+	assert!(item_exists(&state, sub.uuid), "the restored dir is back");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, untouched.uuid));
+	assert!(add_root_relists(&mut state, restored_in.uuid));
+}
+
+/// A dir restored two levels under a listed root, inside one of its subdirs, takes that root out of
+/// the record too: the roots it lands in are found through the parent's ancestry, not just the
+/// parent.
+#[test]
+fn a_dir_restored_inside_a_subdir_of_a_listed_root_takes_that_root_out() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let restored_in = cache_dir(1, account);
+	let untouched = cache_dir(2, account);
+	let sub = cache_dir(3, restored_in.uuid);
+	let deeper = cache_dir(4, sub.uuid);
+	finalize_listings(
+		&mut state,
+		vec![
+			(
+				&restored_in,
+				vec![listed_dir(3, restored_in.uuid), listed_dir(4, sub.uuid)],
+				Vec::new(),
+			),
+			(&untouched, Vec::new(), Vec::new()),
+		],
+	);
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Removed(deeper.uuid)),
+	);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::Dir(DirEvent::Restored(deeper.clone())),
+	);
+	assert!(item_exists(&state, deeper.uuid), "the restored dir is back");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, untouched.uuid));
+	assert!(add_root_relists(&mut state, restored_in.uuid));
+}
+
+/// The file twin: a file restored under one of two listed roots takes only that root out of the
+/// record.
+#[test]
+fn a_file_restored_under_one_listed_root_keeps_the_other_ones_listing() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let restored_in = cache_dir(1, account);
+	let untouched = cache_dir(2, account);
+	finalize_listings(
+		&mut state,
+		vec![
+			(&restored_in, Vec::new(), Vec::new()),
+			(&untouched, Vec::new(), Vec::new()),
+		],
+	);
+
+	let restored = cache_file(3, restored_in.uuid, 50);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::Changed(restored.clone())),
+	);
+	assert!(
+		item_exists(&state, restored.uuid),
+		"the restored file is cached"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, untouched.uuid));
+	assert!(add_root_relists(&mut state, restored_in.uuid));
+}
+
+/// A dir the cache never held, moved into a listed root, lands as its own row: its contents were
+/// never listed, and no later event carries them. The root's next add relists.
+#[test]
+fn a_dir_moved_into_a_listed_root_from_outside_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	let moved = cache_dir(2, root.uuid);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved.clone())),
+	);
+	assert!(item_exists(&state, moved.uuid), "the moved dir is cached");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A dir the cache holds only under a root that is not registered was kept current by nothing, so
+/// moving it into a listed root brings in a subtree that may be stale. The root's next add relists.
+#[test]
+fn a_dir_moved_in_from_an_unregistered_root_makes_the_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let root = cache_dir(1, account);
+	let elsewhere = cache_dir(2, account);
+	let moved = cache_dir(3, elsewhere.uuid);
+	state.upsert_dirs([&elsewhere, &moved].into_iter()).unwrap();
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	let mut moved_in = moved.clone();
+	moved_in.parent = root.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_in)),
+	);
+	assert_eq!(item_parent(&state, moved.uuid), Some(root.uuid));
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A dir moved between two places inside a listed root takes its contents along, so the listing
+/// still holds and the root's next add does not relist.
+#[test]
+fn a_dir_moved_within_a_listed_root_keeps_its_listing() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let from = cache_dir(2, root.uuid);
+	let to = cache_dir(3, root.uuid);
+	let moved = cache_dir(4, from.uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	state.upsert_dirs(once(&root)).unwrap();
+	state
+		.apply_resync(
+			vec![(root.uuid, vec![from, to.clone(), moved.clone()], Vec::new())],
+			&[],
+			Vec::new(),
+			100,
+			false,
+		)
+		.unwrap();
+
+	let mut moved_on = moved.clone();
+	moved_on.parent = to.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_on)),
+	);
+	assert_eq!(item_parent(&state, moved.uuid), Some(to.uuid));
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, root.uuid));
+}
+
+/// A `Changed` of a file the cache did not hold restores it, from the trash or as an older version.
+/// A version restore can leave the version it replaced cached beside it, so the root's next add
+/// relists.
+#[test]
+fn a_file_restored_under_a_listed_root_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let current = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, vec![current.clone()], 100);
+
+	let mut restored = cache_file(3, root.uuid, 50);
+	restored.stable_uuid = current.stable_uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::Changed(restored.clone())),
+	);
+	assert!(
+		item_exists(&state, restored.uuid),
+		"the restored version is cached"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A version restored under one listed root while the version it replaced is cached under another
+/// leaves that row behind wherever it is, so the restore takes both roots out of the record.
+#[test]
+fn a_version_restored_takes_out_the_root_holding_the_version_it_replaced() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let restored_in = cache_dir(1, account);
+	let replaced_in = cache_dir(2, account);
+	let untouched = cache_dir(3, account);
+	let current = cache_file(4, replaced_in.uuid, 100);
+	finalize_listings(
+		&mut state,
+		vec![
+			(&restored_in, Vec::new(), Vec::new()),
+			(
+				&replaced_in,
+				Vec::new(),
+				vec![head_of(&current, ParentUuid::Uuid(replaced_in.uuid))],
+			),
+			(&untouched, Vec::new(), Vec::new()),
+		],
+	);
+
+	let mut restored = cache_file(5, restored_in.uuid, 50);
+	restored.stable_uuid = current.stable_uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::Changed(restored.clone())),
+	);
+	assert!(
+		item_exists(&state, current.uuid),
+		"the version it replaced is still cached"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, untouched.uuid));
+	assert!(add_root_relists(&mut state, replaced_in.uuid));
+}
+
+/// A drive event the cache could not apply (a `FrontierAdvance`, drained as a `NoOp` marker) may have
+/// changed a listed root's subtree, so the root's next add relists.
+#[test]
+fn a_drive_event_the_cache_could_not_apply_makes_the_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	state.drain_pending(Some(CacheThreadEvent::Socket(
+		CacheEventMaybeDecrypted::FrontierAdvance { id: 101 },
+	)));
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// Evicting a file root deletes its row when no REGISTERED dir root covers it, which includes a row
+/// under a listed root that is not registered now. That root's next add relists.
+#[test]
+fn evicting_a_file_root_under_a_listed_unregistered_root_makes_its_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let file = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, vec![file.clone()], 100);
+	state.set_test_sync_roots(HashMap::new());
+
+	let (ack, _ack_rx) = tokio::sync::oneshot::channel();
+	assert!(state.handle_add_file_sync_root(file.stable_uuid, 7, Box::new(|_| {}), ack));
+	drive(state.handle_remove_registration(RootKey::File(file.stable_uuid), 7, true, None));
+	assert!(!item_exists(&state, file.uuid), "the file row was evicted");
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A manual listing upserts what it is given with no watermark to order it against, so it can put
+/// back an item a listed root no longer has. The root's next add relists.
+#[test]
+fn a_manual_listing_makes_the_next_add_of_a_listed_root_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let gone = cache_file(2, root.uuid, 100);
+	state.set_test_sync_roots(only_root(root.uuid));
+	list_root(&mut state, &root, Vec::new(), 100);
+
+	state
+		.handle_manual_event(ManualEvent::ListDirRecursive(
+			Vec::new(),
+			vec![head_of(&gone, ParentUuid::Uuid(root.uuid))],
+		))
+		.unwrap();
+	assert!(
+		item_exists(&state, gone.uuid),
+		"the manual listing put it back"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A listed dir whose metadata does not decode.
+fn undecodable_dir(uuid: u128, parent: Uuid) -> RemoteDirectory {
+	RemoteDirectory::from_meta(
+		Uuid::from_u128(uuid),
+		ParentUuid::Uuid(parent),
+		Default::default(),
+		false,
+		DateTime::UNIX_EPOCH,
+		DirectoryMeta::Encrypted(EncryptedString(Cow::Borrowed("not metadata"))),
+	)
+}
+
+/// A listed dir whose metadata decodes.
+fn listed_dir(uuid: u128, parent: Uuid) -> RemoteDirectory {
+	RemoteDirectory::from_meta(
+		Uuid::from_u128(uuid),
+		ParentUuid::Uuid(parent),
+		Default::default(),
+		false,
+		DateTime::UNIX_EPOCH,
+		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+			name: Cow::Owned(format!("dir-{uuid}")),
+			created: None,
+		}),
+	)
+}
+
+/// A listed file whose metadata does not decode.
+fn undecodable_file(uuid: u128, parent: Uuid) -> RemoteFile {
+	RemoteFile::from_meta(
+		Uuid::from_u128(uuid),
+		StableUuid::new_for_test(Uuid::from_u128(uuid)),
+		ParentUuid::Uuid(parent),
+		0,
+		1,
+		"region",
+		"bucket",
+		DateTime::UNIX_EPOCH,
+		false,
+		FileMeta::Encrypted(EncryptedString(Cow::Borrowed("not metadata"))),
+	)
+}
+
+/// Resync the registered `roots` at drive id 100 through `finalize_resync`, each with its listing.
+fn finalize_listings(
+	state: &mut CacheState,
+	roots: Vec<(
+		&CacheableDir<'static>,
+		Vec<RemoteDirectory>,
+		Vec<RemoteFile>,
+	)>,
+) {
+	let mut registered: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	let mut per_root_raw = Vec::new();
+	for (root, dirs, files) in roots {
+		state.upsert_dirs(once(root)).unwrap();
+		registered.insert(root.uuid, Box::new(|_| {}));
+		per_root_raw.push((root.uuid, None, dirs, files));
+	}
+	state.set_test_sync_roots(registered);
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw,
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: Vec::new(),
+			any_transient: false,
+			remote_under_lock: 100,
+		})
+		.unwrap();
+	assert_eq!(
+		state.watermark().unwrap(),
+		Some(100),
+		"the listing committed"
+	);
+	assert!(!state.needs_resync().unwrap(), "the listing converged");
+}
+
+/// A dir whose metadata did not decode has no row, only a record. A rename that makes it readable
+/// patches no row, so the dir and its contents stay out of the cache until a relist brings them in:
+/// the root's next add relists.
+#[test]
+fn an_undecodable_dir_renamed_readable_makes_its_roots_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let undecodable = undecodable_dir(2, root.uuid);
+	let child = cache_file(3, undecodable.uuid, 100);
+	finalize_listings(
+		&mut state,
+		vec![(
+			&root,
+			vec![undecodable.clone()],
+			vec![head_of(&child, ParentUuid::Uuid(undecodable.uuid))],
+		)],
+	);
+	assert!(
+		item_exists(&state, child.uuid),
+		"the readable child is cached"
+	);
+
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::MetadataChanged {
+			uuid: undecodable.uuid,
+			meta: DecryptedDirectoryMeta {
+				name: Cow::Borrowed("readable"),
+				created: None,
+			},
+		}),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert!(
+		!item_exists(&state, undecodable.uuid),
+		"the rename patched no row"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// The file twin: a rename that makes an undecodable file readable patches no row either, so the
+/// root's next add relists.
+#[test]
+fn an_undecodable_file_renamed_readable_makes_its_roots_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let undecodable = undecodable_file(2, root.uuid);
+	finalize_listings(
+		&mut state,
+		vec![(&root, Vec::new(), vec![undecodable.clone()])],
+	);
+
+	let readable = cache_file(2, root.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::MetadataChanged {
+			uuid: undecodable.uuid,
+			meta: DecryptedFileMeta {
+				name: Cow::Borrowed("readable.txt"),
+				size: readable.size,
+				mime: Cow::Borrowed("text/plain"),
+				key: readable.key,
+				last_modified: readable.last_modified,
+				created: None,
+				hash: None,
+			},
+		}),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert!(
+		!item_exists(&state, undecodable.uuid),
+		"the rename patched no row"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// A file created under a dir whose metadata did not decode is gated out: the dir has no row, so
+/// the membership walk never reaches the root. The root's next add relists.
+#[test]
+fn a_file_created_under_an_undecodable_dir_makes_its_roots_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let root = cache_dir(1, state.root_uuid);
+	let undecodable = undecodable_dir(2, root.uuid);
+	finalize_listings(
+		&mut state,
+		vec![(&root, vec![undecodable.clone()], Vec::new())],
+	);
+
+	let created = cache_file(3, undecodable.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::File(FileEvent::New(created.clone())),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(101));
+	assert!(!item_exists(&state, created.uuid), "gated out");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, root.uuid));
+}
+
+/// Only the root whose listing held an item the cache could not store loses its claim: a root
+/// listed cleanly in the same resync is still held whole and its next add does not relist.
+#[test]
+fn a_root_listed_cleanly_beside_one_holding_an_undecodable_item_keeps_its_listing() {
+	let mut state = CacheState::new_in_memory();
+	let clean = cache_dir(1, state.root_uuid);
+	let child = cache_file(2, clean.uuid, 100);
+	let holding = cache_dir(3, state.root_uuid);
+	finalize_listings(
+		&mut state,
+		vec![
+			(
+				&clean,
+				Vec::new(),
+				vec![head_of(&child, ParentUuid::Uuid(clean.uuid))],
+			),
+			(&holding, vec![undecodable_dir(4, holding.uuid)], Vec::new()),
+		],
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(!add_root_relists(&mut state, clean.uuid));
+	assert!(add_root_relists(&mut state, holding.uuid));
+}
+
+/// A root whose listing held an item the cache could not store keeps nothing whole, so a dir moved
+/// out of it brings that gap along: `outer` holds `moved`, under which sits a dir whose metadata
+/// does not decode. Once `moved` is in `inner`, events under the undecodable dir are gated out of
+/// `inner` too, and `inner`'s next add relists.
+#[test]
+fn a_dir_moved_in_from_a_root_holding_an_undecodable_item_makes_the_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let outer = cache_dir(1, account);
+	let inner = cache_dir(2, account);
+	let moved = cache_dir(3, outer.uuid);
+	let hidden = undecodable_dir(4, moved.uuid);
+	finalize_listings(
+		&mut state,
+		vec![
+			(
+				&outer,
+				vec![listed_dir(3, outer.uuid), hidden.clone()],
+				Vec::new(),
+			),
+			(&inner, Vec::new(), Vec::new()),
+		],
+	);
+	assert!(item_exists(&state, moved.uuid));
+	assert!(!item_exists(&state, hidden.uuid), "undecodable: no row");
+
+	let mut moved_in = moved.clone();
+	moved_in.parent = inner.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_in)),
+	);
+	assert_eq!(item_parent(&state, moved.uuid), Some(inner.uuid));
+	let created = cache_file(5, hidden.uuid, 100);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::File(FileEvent::New(created.clone())),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(102));
+	assert!(!item_exists(&state, created.uuid), "gated out");
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, inner.uuid));
+}
+
+/// The whole-drive twin: the account root's listing held an undecodable dir, a root nested in it
+/// was listed whole in the same resync, and the dir holding the undecodable one moves from
+/// elsewhere in the drive into the nested root. The nested root's next add relists.
+#[test]
+fn a_dir_moved_from_a_partly_stored_whole_drive_root_into_a_nested_root_makes_it_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let sub = cache_dir(1, account);
+	let moved = cache_dir(2, account);
+	let mut registered: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	registered.insert(account, Box::new(|_| {}));
+	registered.insert(sub.uuid, Box::new(|_| {}));
+	state.upsert_dirs(once(&sub)).unwrap();
+	state.set_test_sync_roots(registered);
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw: vec![
+				(
+					account,
+					None,
+					vec![
+						listed_dir(1, account),
+						listed_dir(2, account),
+						undecodable_dir(3, moved.uuid),
+					],
+					Vec::new(),
+				),
+				(sub.uuid, None, Vec::new(), Vec::new()),
+			],
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: Vec::new(),
+			any_transient: false,
+			remote_under_lock: 100,
+		})
+		.unwrap();
+	assert!(!state.needs_resync().unwrap(), "the listing converged");
+
+	let mut moved_in = moved.clone();
+	moved_in.parent = sub.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_in)),
+	);
+	assert_eq!(item_parent(&state, moved.uuid), Some(sub.uuid));
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, sub.uuid));
+}
+
+/// What the moved-in gap costs: once the dir holding the undecodable one has moved from the root
+/// that listed it into a root listed whole, a rename that makes the undecodable dir readable
+/// patches no row, so it stays missing from the root it moved into until that root relists.
+#[test]
+fn an_undecodable_dir_moved_in_and_renamed_readable_makes_the_next_add_relist() {
+	let mut state = CacheState::new_in_memory();
+	let account = state.root_uuid;
+	let outer = cache_dir(1, account);
+	let inner = cache_dir(2, account);
+	let moved = cache_dir(3, outer.uuid);
+	let hidden = undecodable_dir(4, moved.uuid);
+	finalize_listings(
+		&mut state,
+		vec![
+			(
+				&outer,
+				vec![listed_dir(3, outer.uuid), hidden.clone()],
+				Vec::new(),
+			),
+			(&inner, Vec::new(), Vec::new()),
+		],
+	);
+
+	let mut moved_in = moved.clone();
+	moved_in.parent = inner.uuid;
+	drain_socket_event(
+		&mut state,
+		101,
+		CacheEventType::Dir(DirEvent::Move(moved_in)),
+	);
+	drain_socket_event(
+		&mut state,
+		102,
+		CacheEventType::Dir(DirEvent::MetadataChanged {
+			uuid: hidden.uuid,
+			meta: DecryptedDirectoryMeta {
+				name: Cow::Borrowed("readable"),
+				created: None,
+			},
+		}),
+	);
+	assert_eq!(state.watermark().unwrap(), Some(102));
+	assert!(
+		!item_exists(&state, hidden.uuid),
+		"the rename patched no row"
+	);
+	state.set_test_sync_roots(HashMap::new());
+
+	assert!(add_root_relists(&mut state, inner.uuid));
 }

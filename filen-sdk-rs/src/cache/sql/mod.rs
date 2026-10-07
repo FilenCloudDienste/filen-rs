@@ -276,8 +276,10 @@ impl CacheState {
 
 	/// Wipe every non-root item (cascading to `dirs`/`files` via FK + trigger). The account-root item,
 	/// the `events` store, and the `cache_meta` watermark are intentionally left intact — so the caller
-	/// is responsible for scheduling a resync to re-converge the now-empty item cache.
+	/// is responsible for scheduling a resync to re-converge the now-empty item cache. No sync root is
+	/// held whole afterwards, so the listed-roots record is cleared first.
 	pub(crate) fn delete_all_non_root(&mut self) -> rusqlite::Result<()> {
+		event::forget_listed_roots_on(&self.db)?;
 		self.db.execute(statements::ITEM_DELETE_ALL_NON_ROOT, [])?;
 		self.db.execute(statements::UNDECODABLE_DELETE_ALL, [])?;
 		Ok(())

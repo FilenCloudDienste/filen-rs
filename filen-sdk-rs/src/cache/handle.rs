@@ -62,7 +62,15 @@ pub enum CacheMessage {
 /// gap-healing resyncs run with no add in flight at all — so progress is keyed by ROOT uuid
 /// rather than by caller; correlate with [`SyncRootHandle::uuid`] /
 /// [`Search::root_uuid`](crate::cache::Search::root_uuid). A COVERED add (a uuid already cached
-/// under an active root) triggers no resync and therefore no progress messages at all.
+/// under an active root) triggers no resync and therefore no progress messages at all. An add of
+/// a root this cache DB already holds whole — listed by an earlier resync with no item in it the
+/// cache could not read, registered for every event applied since, none of which could have left
+/// its subtree short (a restore, a dir moved in from where nothing kept it current, an event the
+/// cache could not apply; a dir created in it cannot), no resync pending — is confirmed with one
+/// remote drive-id read instead of a listing: if the drive has not moved past what the cache
+/// holds, it reports [`Started`](Self::Started) and [`Finished { converged: true }`](Self::Finished)
+/// with no [`Listing`](Self::Listing) or [`Applying`](Self::Applying) in between; otherwise it
+/// relists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResyncProgress {
@@ -311,8 +319,9 @@ impl Client {
 	/// [`SyncRootHandle`] — the cache analog of
 	/// [`add_event_listener`](Client::add_event_listener). The first registration lazily opens the
 	/// configured DB and starts the cache worker; dropping the last handle shuts it down again
-	/// (drain + DB close — the next add respawns it, and the add-triggered convergence resync
-	/// populates whatever it registers, retried durably until it succeeds).
+	/// (drain + DB close — the next add respawns it, and the add-triggered convergence populates
+	/// whatever it registers, retried durably until it succeeds; a root the DB already holds whole
+	/// at the remote drive id converges without being listed again, see [`ResyncProgress`]).
 	///
 	/// Multiple live handles may target the same `uuid`: each gets its own registration whose
 	/// callback is notified independently, and the uuid stops being synced only when the last one
@@ -442,7 +451,7 @@ impl Client {
 	/// flushed and nothing keeps decrypting socket events. The stored configuration is retained and
 	/// existing [`SyncRootHandle`]s become INERT (their drops are no-ops); the next
 	/// [`add_sync_root`](Client::add_sync_root) respawns the worker, and the add-triggered
-	/// convergence resync populates whatever it registers.
+	/// convergence populates whatever it registers.
 	///
 	/// NOT required for correctness: an un-joined drop (or an outright process kill) is recovered
 	/// on the next startup by the gap-check — the watermark was never advanced for any un-drained

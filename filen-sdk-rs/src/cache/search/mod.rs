@@ -121,12 +121,13 @@ impl Client {
 	///
 	/// Registers `uuid` as a sync root — CHEAP (zero network, zero resync) when `uuid` is
 	/// already an active sync root or is covered by one (cached under it); otherwise the worker
-	/// validates it remotely and runs a convergence resync of the registered roots, which can
-	/// take a while on large accounts — its progress (per-root listing byte ticks) is reported
-	/// as [`CacheMessage::ResyncProgress`](crate::cache::CacheMessage::ResyncProgress) on the
+	/// validates it remotely and converges it — with one drive-id read when the cache already
+	/// holds that subtree whole and the drive has not moved since, else with a resync of the
+	/// registered roots, which can take a while on large accounts — its progress (per-root
+	/// listing byte ticks) is reported as
+	/// [`CacheMessage::ResyncProgress`](crate::cache::CacheMessage::ResyncProgress) on the
 	/// [`configure_cache`](Client::configure_cache) status callback, keyed by root uuid. Change
-	/// filters with [`Search::set_config`] — do NOT drop + recreate the search per filter
-	/// change.
+	/// filters with [`Search::set_config`] — do NOT drop + recreate the search per filter change.
 	///
 	/// Errors if [`configure_cache`](Client::configure_cache) was never called, or if
 	/// validation rejects `uuid` — downcast to [`CacheError`](crate::cache::CacheError) to

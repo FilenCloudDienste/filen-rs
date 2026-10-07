@@ -91,6 +91,10 @@ pub(crate) const WATERMARK_KEY: &str = "last_drive_message_id";
 /// a corrupt row, or a failed persist — so a resync recovers it even across a restart). Set to `1`;
 /// cleared by the resync.
 pub(crate) const NEEDS_RESYNC_KEY: &str = "needs_resync";
+/// Key for the sync roots whose whole subtree the cache holds, and the watermark it holds them at
+/// (see `ListedRoots` in `event.rs`). Absent or NULL when it holds none. Like `needs_resync` it has
+/// no seed row, so a DB written before it existed reads as holding none.
+pub(crate) const LISTED_ROOTS_KEY: &str = "listed_roots";
 
 pub(crate) const DIR_UPDATE_COLOR: &str = include_str!("raw/dir_update_color.sql");
 pub(crate) const DIR_UPDATE_NAME: &str = include_str!("raw/dir_update_name.sql");

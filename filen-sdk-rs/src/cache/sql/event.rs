@@ -2,8 +2,11 @@
 //! `events.payload` column, plus the persist/load/commit queries the drain and resync run against it.
 //! Each event is stored as an rkyv archive; this module is the single place that encodes/decodes it.
 
+use std::collections::HashMap;
+
 use rkyv::rancor::Error;
 use rusqlite::{OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::cache::{
 	CacheError, CacheState,
@@ -55,6 +58,93 @@ fn set_needs_resync_on(conn: &rusqlite::Connection, on: bool) -> rusqlite::Resul
 		super::statements::CACHE_META_SET,
 		params![super::statements::NEEDS_RESYNC_KEY, on as i64],
 	)
+}
+
+/// The sync roots whose whole subtree the cache holds as the drive stood at watermark `at`: each
+/// was listed by a resync that committed and stored every record of its listing, and every event
+/// drained since applied in full while it was registered. A root whose listing held a record the
+/// cache could not store (metadata that does not decode) is never recorded: with no row for that
+/// record, events under it are gated out, a move into it deletes what moved, and a rename that
+/// makes it readable patches nothing. Every write that can leave a recorded root's rows short of
+/// that takes that root out of the record. A socket upsert takes out the roots it lands in: of a
+/// dir that no registered root the cache holds whole kept current (a restore, a move in from
+/// outside the registered roots or from a root that is not recorded, whose gaps move along) or of
+/// a file it held no row for (a restore). A new dir takes out nothing when such a root holds its
+/// parent, as it has no contents yet. The writes that cannot name the roots they touch clear the
+/// record whole: a drained `NoOp` marker (an event the cache could not apply), and the row writes
+/// that move no watermark (evictions, wipes, a manual listing, a resync's apply until its commit).
+/// Any watermark move that does not carry the record forward leaves `at` behind, which voids it,
+/// so a watermark writer that predates the record can only cost a relist. A build that predates it
+/// and changes rows without moving the watermark (an eviction through `SyncRootHandle::evict`)
+/// leaves the record standing.
+///
+/// Stored under [`LISTED_ROOTS_KEY`](super::statements::LISTED_ROOTS_KEY) as `at` (8 bytes, little
+/// endian) followed by each root's 16 uuid bytes.
+struct ListedRoots {
+	at: u64,
+	roots: Vec<Uuid>,
+}
+
+impl ListedRoots {
+	fn decode(bytes: &[u8]) -> Option<Self> {
+		let (at, rest) = bytes.split_first_chunk::<8>()?;
+		let (uuids, []) = rest.as_chunks::<16>() else {
+			return None;
+		};
+		Some(Self {
+			at: u64::from_le_bytes(*at),
+			roots: uuids.iter().map(|bytes| Uuid::from_bytes(*bytes)).collect(),
+		})
+	}
+
+	fn encode(at: u64, roots: &[Uuid]) -> Vec<u8> {
+		let mut bytes = at.to_le_bytes().to_vec();
+		for root in roots {
+			bytes.extend_from_slice(root.as_bytes());
+		}
+		bytes
+	}
+}
+
+/// The listed-roots record on `conn`, if there is one. A value that does not decode reads as none,
+/// which only costs a relist.
+fn listed_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<Option<ListedRoots>> {
+	let value: Option<Option<Vec<u8>>> = conn
+		.prepare_cached(super::statements::CACHE_META_GET)?
+		.query_row(params![super::statements::LISTED_ROOTS_KEY], |row| {
+			row.get(CACHE_META_VALUE)
+		})
+		.optional()?;
+	let Some(bytes) = value.flatten() else {
+		return Ok(None);
+	};
+	let listed = ListedRoots::decode(&bytes);
+	if listed.is_none() {
+		tracing::debug!(
+			"the listed-roots record ({} bytes) does not decode; reading it as none",
+			bytes.len()
+		);
+	}
+	Ok(listed)
+}
+
+/// Record `roots` as held whole at watermark `at` on `conn`; none clears the record.
+fn set_listed_roots_on(
+	conn: &rusqlite::Connection,
+	at: u64,
+	roots: &[Uuid],
+) -> rusqlite::Result<()> {
+	let value = (!roots.is_empty()).then(|| ListedRoots::encode(at, roots));
+	conn.execute(
+		super::statements::CACHE_META_SET,
+		params![super::statements::LISTED_ROOTS_KEY, value],
+	)?;
+	Ok(())
+}
+
+/// Clear the listed-roots record on `conn`: every root relists on its next add.
+pub(super) fn forget_listed_roots_on(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+	set_listed_roots_on(conn, 0, &[])
 }
 
 impl CacheState {
@@ -206,6 +296,56 @@ impl CacheState {
 		Ok(row.flatten().is_some_and(|v| v != 0))
 	}
 
+	/// Whether this cache holds the whole subtree of every one of `roots` as the drive stood at its
+	/// watermark, with no resync pending: each was listed by a resync that committed and stayed
+	/// registered for every event applied since (see `ListedRoots`). Says nothing about what the
+	/// drive did after the watermark — that is the remote drive id's to tell.
+	pub(crate) fn holds_listings_of(&self, roots: &[Uuid]) -> Result<bool, Box<CacheError>> {
+		if self.needs_resync()? {
+			return Ok(false);
+		}
+		let held = self.roots_held_whole()?;
+		Ok(roots.iter().all(|root| held.contains(root)))
+	}
+
+	/// The roots the listed-roots record holds whole at the current watermark (see `ListedRoots`);
+	/// none when there is no record or it is void.
+	pub(crate) fn roots_held_whole(&self) -> Result<Vec<Uuid>, Box<CacheError>> {
+		let Some(listed) =
+			listed_roots_on(&self.db).map_err(|e| db_err(e, "reading the listed roots"))?
+		else {
+			return Ok(Vec::new());
+		};
+		if Some(listed.at) != self.watermark()? {
+			return Ok(Vec::new());
+		}
+		Ok(listed.roots)
+	}
+
+	/// Clear the listed-roots record, ahead of a change that can leave a root's cached rows short of
+	/// a listing (see `ListedRoots`): every root relists on its next add.
+	pub(crate) fn forget_listed_roots(&self) -> Result<(), Box<CacheError>> {
+		forget_listed_roots_on(&self.db).map_err(|e| db_err(e, "clearing the listed roots"))
+	}
+
+	/// Take `roots` out of the listed-roots record, ahead of a change that can leave their cached
+	/// rows short of a listing (see `ListedRoots`): each relists on its next add, and every other
+	/// root keeps its claim. With no record, or none of `roots` in it, nothing is written.
+	pub(crate) fn forget_listed_roots_among(&self, roots: &[Uuid]) -> Result<(), Box<CacheError>> {
+		let Some(mut listed) =
+			listed_roots_on(&self.db).map_err(|e| db_err(e, "reading the listed roots"))?
+		else {
+			return Ok(());
+		};
+		let before = listed.roots.len();
+		listed.roots.retain(|root| !roots.contains(root));
+		if listed.roots.len() == before {
+			return Ok(());
+		}
+		set_listed_roots_on(&self.db, listed.at, &listed.roots)
+			.map_err(|e| db_err(e, "taking roots out of the listed roots"))
+	}
+
 	/// Remove one consumed event from the durable store by its `seq` (rowid).
 	#[cfg(test)] // the drain deletes inline in `commit_drain_batch`
 	pub(crate) fn delete_event(&self, seq: i64) -> Result<(), Box<CacheError>> {
@@ -261,11 +401,17 @@ impl CacheState {
 	/// NESTING-AWARE like `execute_chunked`: inside an already-open transaction (the drain's
 	/// batched fast path) the statements run bare and the caller's commit is the atomicity
 	/// boundary; standalone (the per-event fallback path) it commits its own transaction.
-	pub(crate) fn commit_drain_batch(
-		&mut self,
+	///
+	/// An advance also carries the listed-roots record forward, in the same transaction: a root keeps
+	/// its claim only if it is in `registered`, the registrations that gated the events this batch
+	/// applied — an unregistered root's subtree missed them. A record not made at the watermark this
+	/// batch starts from is already void, and is cleared.
+	pub(crate) fn commit_drain_batch<V>(
+		&self,
 		new_watermark: Option<u64>,
 		deleted_seqs: &[i64],
 		mark_resync: bool,
+		registered: &HashMap<Uuid, V>,
 	) -> Result<(), Box<CacheError>> {
 		let ambient = !self.db.is_autocommit();
 		let tx = if ambient {
@@ -279,6 +425,17 @@ impl CacheState {
 		};
 		let conn: &rusqlite::Connection = tx.as_deref().unwrap_or(&self.db);
 		if let Some(id) = new_watermark {
+			let listed = listed_roots_on(conn)
+				.map_err(|e| db_err(e, "reading the listed roots in drain commit"))?;
+			if let Some(mut listed) = listed {
+				if Some(listed.at) == self.watermark()? {
+					listed.roots.retain(|root| registered.contains_key(root));
+				} else {
+					listed.roots.clear();
+				}
+				set_listed_roots_on(conn, id, &listed.roots)
+					.map_err(|e| db_err(e, "carrying the listed roots in drain commit"))?;
+			}
 			set_watermark_on(conn, id)
 				.map_err(|e| db_err(e, "advancing watermark in drain commit"))?;
 		}
@@ -338,15 +495,21 @@ impl CacheState {
 	/// for a partial resync, keep) the `needs_resync` flag — atomically, and strictly AFTER the
 	/// synthetics were applied (see `apply_synthetics_direct`). A crash before this leaves the
 	/// old watermark and the durable flag/startup gap-check to force a fresh listing.
+	///
+	/// `listed` — the dir roots this resync listed and stored whole — replaces the listed-roots
+	/// record in the same transaction: a root it did not list missed the events the jump skips.
 	pub(crate) fn commit_resync_watermark(
 		&mut self,
 		remote_under_lock: u64,
 		mark_resync: bool,
+		listed: &[Uuid],
 	) -> Result<(), Box<CacheError>> {
 		let tx = self
 			.db
 			.transaction()
 			.map_err(|e| db_err(e, "begin resync-commit transaction"))?;
+		set_listed_roots_on(&tx, remote_under_lock, listed)
+			.map_err(|e| db_err(e, "recording the listed roots in resync commit"))?;
 		set_watermark_on(&tx, remote_under_lock)
 			.map_err(|e| db_err(e, "advancing watermark in resync commit"))?;
 		set_needs_resync_on(&tx, mark_resync)
@@ -774,7 +937,7 @@ mod tests {
 		let mut state = CacheState::new_in_memory();
 		state.mark_needs_resync().unwrap();
 
-		state.commit_resync_watermark(99, false).unwrap();
+		state.commit_resync_watermark(99, false, &[]).unwrap();
 
 		// Watermark advanced to the snapshot id; resync flag cleared — atomically, with no
 		// events-store traffic (synthetics apply directly from RAM now).
@@ -796,7 +959,7 @@ mod tests {
 		let mut state = CacheState::new_in_memory();
 		assert!(!state.needs_resync().unwrap());
 
-		state.commit_resync_watermark(42, true).unwrap();
+		state.commit_resync_watermark(42, true, &[]).unwrap();
 
 		assert_eq!(state.watermark().unwrap(), Some(42), "progress committed");
 		assert!(

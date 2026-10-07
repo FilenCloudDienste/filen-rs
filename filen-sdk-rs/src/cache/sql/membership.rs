@@ -59,12 +59,16 @@ impl CacheState {
 	/// `cascade_on_delete` trigger can never reach a still-active nested root via a deleted intermediate
 	/// dir. The root's own node and the account-root item are kept (see the SQL). The protected set is
 	/// in-memory, so it is staged through a TEMP table for the delete to join against.
+	///
+	/// The eviction also takes rows from any unregistered root nested under `root` or enclosing it, so
+	/// it clears the listed-roots record in the same transaction.
 	pub(crate) fn evict_sync_root_subtree(
 		&mut self,
 		root: Uuid,
 		protected_roots: &[Uuid],
 	) -> rusqlite::Result<()> {
 		let tx = self.db.transaction()?;
+		super::event::forget_listed_roots_on(&tx)?;
 		// The TEMP table lives for the whole connection (not just this transaction), so CREATE uses
 		// IF NOT EXISTS to be idempotent across calls and the explicit CLEAR purges any rows left by a
 		// prior eviction on this connection before we repopulate it below.
