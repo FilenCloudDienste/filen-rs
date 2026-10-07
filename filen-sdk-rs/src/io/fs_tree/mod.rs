@@ -17,6 +17,9 @@ pub(crate) use entry::{
 
 pub(crate) use tree::{FSTree, remote::build_fs_tree_from_remote_iterator};
 
+#[cfg(test)]
+pub(crate) use tree::remote::test_support;
+
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use tree::local::build_fs_tree_from_walkdir_iterator;
 

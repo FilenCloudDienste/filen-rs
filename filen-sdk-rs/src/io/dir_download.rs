@@ -11,7 +11,8 @@ use crate::{
 	error::{ErrorExt, ResultExt},
 	fs::categories::{Category, DirType, NonRootItemType, fs::CategoryFSExt},
 	io::{
-		CanonicalPath, client_impl::inner_download_to_path_with_hash_check,
+		CanonicalPath, abort_on_drop::AbortOnDropHandle,
+		client_impl::inner_download_to_path_with_hash_check,
 		fs_tree::build_fs_tree_from_remote_iterator, meta_ext::DirTimesExt,
 	},
 };
@@ -257,12 +258,19 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 			path,
 		);
 
-		let file_handle = Self::spawn_file_downloader_task(
+		// Tie the downloads to this future, as the directory upload does: dropping it aborts the
+		// downloader and, through its `JoinSet`, every download it started. The walker is a
+		// blocking task that an abort cannot stop, so it is the downloader's receiver closing with
+		// it that ends the walk: the walker's next send fails, or the one it is blocked in wakes
+		// with an error, and it returns its thread. Left detached, the downloader would go on
+		// draining the walker's channel, and the walker would hold a blocking thread for every
+		// file left in a large flat directory.
+		let file_handle = AbortOnDropHandle::new(Self::spawn_file_downloader_task(
 			client,
 			file_download_request_receiver,
 			entry_complete_sender,
 			Arc::clone(&downloaded_bytes),
-		);
+		));
 
 		let mut completed_files = Vec::new();
 		let mut completed_dirs = Vec::new();
@@ -310,7 +318,7 @@ pub(crate) trait CategoryDirDownloadExt: CategoryFSExt {
 
 		// make sure everything is finalized
 		dir_handle.await.unwrap()?;
-		file_handle.await.unwrap();
+		file_handle.join().await.unwrap();
 
 		if !errors.is_empty() {
 			error_callback(std::mem::take(&mut errors));
@@ -393,3 +401,108 @@ pub trait CategoryDirDownloadExtPub: CategoryDirDownloadExt {
 }
 
 impl<T> CategoryDirDownloadExtPub for T where T: CategoryDirDownloadExt {}
+
+#[cfg(test)]
+mod tests {
+	use std::{borrow::Cow, sync::Arc, time::Duration};
+
+	use chrono::{DateTime, Utc};
+	use filen_types::fs::{ParentUuid, StableUuid};
+	use uuid::Uuid;
+
+	use super::CategoryDirDownloadExt;
+	use crate::{
+		auth::test_support::offline_client,
+		crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+		fs::{
+			categories::{DirType, Normal},
+			dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
+			file::{
+				RemoteFile,
+				meta::{DecryptedFileMeta, FileMeta},
+			},
+		},
+		io::fs_tree::test_support::tree_of_files,
+	};
+
+	/// More files than the walker can hand over before it blocks: the request channel and the
+	/// download permits each hold the client's concurrency, 16 by default.
+	const FILES: u128 = 64;
+
+	const ROOT: Uuid = Uuid::from_u128(0xD1);
+
+	fn file_in(parent: Uuid, n: u128) -> RemoteFile {
+		let uuid = Uuid::from_u128(n);
+		RemoteFile::from_meta(
+			uuid,
+			StableUuid::new_for_test(uuid),
+			ParentUuid::Uuid(parent),
+			1,
+			1,
+			"de-1",
+			"bucket",
+			DateTime::<Utc>::UNIX_EPOCH,
+			false,
+			FileMeta::Decoded(DecryptedFileMeta {
+				name: Cow::Owned(format!("file-{n}")),
+				size: 1,
+				mime: Cow::Borrowed("application/octet-stream"),
+				key: FileKey::V3(EncryptionKey::generate()),
+				last_modified: DateTime::<Utc>::UNIX_EPOCH,
+				created: None,
+				hash: None,
+			}),
+		)
+	}
+
+	#[test]
+	fn dropping_a_dir_download_gives_back_its_walkers_blocking_thread() {
+		// One blocking thread, as when every thread under the cap is taken: the walker holds it,
+		// so no download can open its file and the walker blocks once its channel is full. Only
+		// stopping the walker frees the thread for anything else.
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.max_blocking_threads(1)
+			.build()
+			.expect("building a test runtime");
+		runtime.block_on(async {
+			let local = tempfile::tempdir().expect("creating a temp dir");
+			let root = RemoteDirectory::new_from_parts(
+				ROOT,
+				DecryptedDirectoryMeta {
+					name: Cow::Borrowed("root"),
+					created: None,
+				},
+				ParentUuid::Uuid(Uuid::from_u128(0xD0)),
+				DateTime::<Utc>::UNIX_EPOCH,
+			);
+			let files = (1..=FILES).map(|n| file_in(ROOT, n)).collect();
+			let tree = tree_of_files(ROOT, files);
+
+			let (mut on_errors, mut on_progress) = (|_| {}, |_, _, _| {});
+			let mut download = Box::pin(Normal::download_fs_tree_from_target_into_path(
+				Arc::new(offline_client()),
+				&mut on_errors,
+				&mut on_progress,
+				local
+					.path()
+					.join("root")
+					.into_os_string()
+					.into_string()
+					.expect("a UTF-8 temp dir"),
+				tree,
+				DirType::Dir(Cow::Owned(root)),
+			));
+			// The first poll starts the walker and the downloads; nothing can finish.
+			assert!(futures::poll!(download.as_mut()).is_pending());
+			drop(download);
+
+			let probe = tokio::task::spawn_blocking(|| ());
+			// Only bounds a failure: a walker left running never lets the probe run.
+			tokio::time::timeout(Duration::from_secs(30), probe)
+				.await
+				.expect("the dropped download's walker gave back its blocking thread")
+				.expect("the probe ran");
+		});
+	}
+}
