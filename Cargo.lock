@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "filen-sdk-rs"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm",
  "argon2",
