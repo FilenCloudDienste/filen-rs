@@ -1131,11 +1131,13 @@ async function removeOnceReleased(root: FileSystemDirectoryHandle, name: string)
 	}
 }
 
-/// On wasm every decode and locate runs on ONE worker thread that blocks on chunk replies
+/// On wasm every decode and locate runs on a decode worker thread that blocks on chunk replies
 /// from the caller's driver task. Aborting a preview mid-fetch drops that driver; the worker
 /// must see its reply channel close and give the job up, not park on an answer that is
 /// never coming with every later thumbnail queued behind it for a 60 s stall deadline. The
-/// clock on the follow-up thumbnail is the assertion: a parked worker costs a minute.
+/// clock on the follow-up thumbnail is the assertion: a parked worker costs a minute. Both
+/// calls go through a client whose gate is one wide, so they share the page's first worker;
+/// a wider one would route the thumbnail around a parked worker to a fresh one.
 test("an aborted preview does not park the decode worker", async () => {
 	const fixture = RAW_FIXTURES.find(f => f.name === "7008.RW2")!
 	const res = await fetch(`raw-fixtures/${fixture.name}/${fixture.path}`)
@@ -1149,12 +1151,13 @@ test("an aborted preview does not park the decode worker", async () => {
 	const bytes = new Uint8Array(await res.arrayBuffer())
 	expect(await sha256Hex(bytes)).toBe(fixture.sha256)
 	const file = await state.uploadFile(bytes, { parent: testDir, name: `abort-${fixture.name}` })
+	const oneWorker = UnauthClient.from_config({ thumbnailDecodeConcurrency: 1 }).fromStringified(await state.toStringified())
 
 	const root = await navigator.storage.getDirectory()
 	const opfsName = `abort-${fixture.name}.preview.jpg`
 	const handle = await root.getFileHandle(opfsName, { create: true })
 	const abortController = new AbortController()
-	const aborted = state.writeEmbeddedPreview({
+	const aborted = oneWorker.writeEmbeddedPreview({
 		file,
 		writer: await handle.createWritable(),
 		managedFuture: { abortSignal: abortController.signal }
@@ -1170,7 +1173,7 @@ test("an aborted preview does not park the decode worker", async () => {
 	await removeOnceReleased(root, opfsName)
 
 	const started = Date.now()
-	expectThumbnail(await state.makeThumbnailInMemory({ file, maxHeight: 128, maxWidth: 128 }))
+	expectThumbnail(await oneWorker.makeThumbnailInMemory({ file, maxHeight: 128, maxWidth: 128 }))
 	// Not cap()-scaled: it only means something while it stays under the worker's 60 s stall deadline.
 	expect(Date.now() - started, "a thumbnail after an aborted preview waited on a dead worker").toBeLessThan(30_000)
 })
@@ -1280,12 +1283,12 @@ test("thumbnails and previews for shared and linked files", { timeout: cap(600_0
 })
 
 test("a queued thumbnail is not expired by another caller's decode", async () => {
-	// On wasm every decode runs on ONE worker thread that takes jobs strictly in turn, and each
-	// caller arms its stall deadline the moment it QUEUES — deferring it to when its own job
-	// starts would put a caller behind a trapped worker with no deadline at all, the exact hang
-	// the deadline exists to break. So a caller routinely sits armed for far longer than its own
-	// decode takes, and the only thing stopping it from declaring a perfectly healthy worker dead
-	// is the process-global activity stamp the worker bumps for whoever it is currently serving.
+	// On wasm decodes run on at most four workers per page, each taking its jobs strictly in
+	// turn, and each caller arms its stall deadline the moment it QUEUES — deferring it to when
+	// its own job starts would put a caller behind a trapped worker with no deadline at all, the
+	// exact hang the deadline exists to break. So a caller routinely sits armed for far longer
+	// than its own decode takes, and the only thing stopping it from declaring a perfectly
+	// healthy worker dead is the activity stamp its worker bumps for whoever it is serving.
 	//
 	// Reaching that state means keeping the queue busy past DECODE_STALL_TIMEOUT (60 s). Two
 	// config knobs do it with no production change: `thumbnailDecodeConcurrency` admits every

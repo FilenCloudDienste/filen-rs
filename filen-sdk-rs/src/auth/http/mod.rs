@@ -97,7 +97,9 @@ pub struct ClientConfig {
 	/// embedded previews only, never a full decode off the network.
 	thumbnail_max_source_bytes: u64,
 	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
-	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`.
+	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`. On the web
+	/// they run on the page's decode workers, of which there are at most four whatever this
+	/// says: past four, decodes wait their turn on a worker.
 	thumbnail_decode_concurrency: usize,
 	/// See [`ClientConfig::with_archive_codec_mem_budget`].
 	#[cfg(feature = "archive")]
@@ -296,6 +298,8 @@ pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub thumbnail_max_source_bytes: Option<u64>,
+	/// How many thumbnail decodes run at once for this client, later ones waiting; 2 when left
+	/// out, at least 1. On the web they share the page's decode workers, at most four.
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	#[cfg_attr(feature = "uniffi", uniffi(default = None))]
 	pub thumbnail_decode_concurrency: Option<u32>,
@@ -408,24 +412,44 @@ pub struct ThumbnailConfig {
 	/// so a permit can be `acquire_owned`ed and MOVED INTO the blocking decode closure — see
 	/// [`decode_permit`](Self::decode_permit).
 	gate: Arc<tokio::sync::Semaphore>,
+	/// How many decodes the gate admits at once.
+	#[cfg(any(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		test
+	))]
+	concurrency: usize,
 }
 
 impl ThumbnailConfig {
 	fn new(config: &ClientConfig) -> Self {
+		// A zero-permit gate parks every decode forever; floor it here so no FFI or builder
+		// path can produce one. tokio's Semaphore panics above MAX_PERMITS, which a 32-bit
+		// `usize` (wasm32) puts within reach of a plausible config typo, so clamp there too.
+		// Both ends belong here rather than at the call sites: every construction path
+		// (default, builder, `From<JsClientConfig>`) converges on this one constructor.
+		let concurrency = config
+			.thumbnail_decode_concurrency
+			.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
 		Self {
 			mem_budget: config.thumbnail_mem_budget,
 			max_source_bytes: config.thumbnail_max_source_bytes,
-			// A zero-permit gate parks every decode forever; floor it here so no FFI or builder
-			// path can produce one. tokio's Semaphore panics above MAX_PERMITS, which a 32-bit
-			// `usize` (wasm32) puts within reach of a plausible config typo, so clamp there too.
-			// Both ends belong here rather than at the call sites: every construction path
-			// (default, builder, `From<JsClientConfig>`) converges on this one constructor.
-			gate: Arc::new(tokio::sync::Semaphore::new(
-				config
-					.thumbnail_decode_concurrency
-					.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
-			)),
+			gate: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+			#[cfg(any(
+				all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+				test
+			))]
+			concurrency,
 		}
+	}
+
+	/// How many decodes the gate admits at once: on the web, how many of the page's decode
+	/// workers this client's jobs may spread over.
+	#[cfg(any(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		test
+	))]
+	pub(crate) fn decode_concurrency(&self) -> usize {
+		self.concurrency
 	}
 
 	/// Spec for bytes that are already local: the whole budget, and a full decode is free.
@@ -480,12 +504,12 @@ impl ThumbnailConfig {
 	/// - **native**: MOVE it into the closure. A cancelled caller drops its future while the
 	///   detached closure keeps decoding, and a permit released by the dropped future would let
 	///   fresh decodes stack on the orphans.
-	/// - **wasm**: KEEP it in the driver future. The decode runs on one long-lived worker that
+	/// - **wasm**: KEEP it in the driver future. The decode runs on a long-lived worker that
 	///   can trap — the build is `panic=abort`, so a trap runs no destructor — and a permit
 	///   moved into the job would be leaked for the life of the page; two traps would close a
-	///   2-permit gate for good. Holding it costs nothing there: every decode goes through that
-	///   one worker in turn, so an early-released permit buys a place in its queue rather than
-	///   any extra concurrency.
+	///   2-permit gate for good. Holding it costs little there: a client's jobs only spread over
+	///   as many of the page's decode workers as its gate is wide, so an early-released permit
+	///   buys a place in a worker's queue rather than any extra concurrency.
 	pub async fn decode_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
 		self.gate
 			.clone()

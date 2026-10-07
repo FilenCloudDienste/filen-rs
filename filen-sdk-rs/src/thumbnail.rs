@@ -933,7 +933,7 @@ mod remote_chunks {
 		/// The wasm bridge: a miss posts the range to the async runtime and
 		/// parks this thread on the reply.
 		///
-		/// Only ever driven from the [`DECODES`] worker, which is where the parking
+		/// Only ever driven from a [`DECODES`] worker, which is where the parking
 		/// is legal; the driver side is [`thumbnail_remote_file`].
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		fn over_requests(
@@ -1032,17 +1032,34 @@ mod remote_chunks {
 		reply: std::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
 	}
 
-	/// The worker the synchronous pipeline runs on (see [`WorkerSlot`](crate::blocking::WorkerSlot)).
+	/// Most decode workers a page ever runs, whatever the clients on it ask for.
+	///
+	/// The decode gate is per client (`thumbnailDecodeConcurrency`), the pool is
+	/// per page: a job may use as many of its workers as its client's gate is
+	/// wide, so a page holds no more workers than its widest gate, nor more
+	/// than this. That also caps the decodes running at once on the page,
+	/// however many clients it has: past it, jobs queue on a worker in turn.
+	/// Each worker costs a wasm instance and its thread's stack and TLS in the
+	/// shared memory, none of it ever returned, and each running decode up to
+	/// its client's thumbnail memory budget, resident chunks or buffered source
+	/// included: 64 MiB by default, so four at once peak at 256 MiB of the
+	/// tab's 1 GiB. Four is one more than the three a thumbnail grid needs (see
+	/// microthumb's `APP_PROCESS_MEM_BUDGET`).
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-	static DECODES: crate::blocking::WorkerSlot = crate::blocking::WorkerSlot::new();
+	const MAX_DECODE_WORKERS: usize = 4;
 
-	/// How long the wasm decode worker may go silent — no chunk request to any
+	/// The workers the synchronous pipeline runs on (see [`WorkerPool`](crate::blocking::WorkerPool)).
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	static DECODES: crate::blocking::WorkerPool<MAX_DECODE_WORKERS> =
+		crate::blocking::WorkerPool::new();
+
+	/// How long a wasm decode worker may go silent — no chunk request to any
 	/// driver, no job finished — before the driver whose deadline expires
 	/// declares it dead and retires it.
 	///
-	/// It measures worker-side silence ACROSS ALL DRIVERS, not the expiring
-	/// caller's own progress. That distinction is the whole reason for
-	/// [`WorkerSlot::note_activity`](crate::blocking::WorkerSlot::note_activity): several drivers can wait on the one
+	/// It measures worker-side silence ACROSS ALL DRIVERS of that worker, not
+	/// the expiring caller's own progress. That distinction is the whole reason for
+	/// [`WorkerSlot::note_activity`](crate::blocking::WorkerSlot::note_activity): several drivers can wait on one
 	/// worker at once, and the ones queued behind another caller's decode never
 	/// see a chunk reply of their own to reset on. Each driver still ARMS its
 	/// deadline at submit time — deferring it to when the job starts would put a
@@ -1087,8 +1104,9 @@ mod remote_chunks {
 	///
 	/// What IS pinned by tests is the queued-caller half: the browser suite's
 	/// "a queued thumbnail is not expired by another caller's decode". Worker
-	/// death and respawn are NOT exercised anywhere — no test has ever trapped
-	/// this worker, so [`WorkerSlot::retire`](crate::blocking::WorkerSlot::retire) and the respawn after it are
+	/// death is NOT exercised anywhere — no test has ever trapped a decode
+	/// worker. `blocking`'s native tests retire one by hand and see the next job
+	/// get a fresh one, but the deadline that would retire a trapped one is
 	/// unproven code on an untaken path.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1208,16 +1226,16 @@ mod remote_chunks {
 			// would be lost for the life of the page and the gate would close for good — the
 			// same wedge this deadline exists to remove, one step earlier. The accounting the
 			// native arm buys by moving it (a cancelled caller must not free a slot while its
-			// orphaned job still runs) is worth nothing here: every job goes through the one
-			// worker in turn, so a spare permit buys no extra concurrency, only an earlier
-			// place in that queue.
-			let _decode_permit = client
-				.get_unauth_client()
-				.thumbnails()
-				.decode_permit()
-				.await;
-			let (generation, mut done) =
-				DECODES.submit(move || job(Box::new(source)), decode_panicked);
+			// orphaned job still runs) costs little here: the job such a permit admits runs on
+			// one of the gate's width of workers, queued behind a busy one when none is free,
+			// so no more decodes run at once than the gate is wide.
+			let thumbnails = client.get_unauth_client().thumbnails();
+			let _decode_permit = thumbnails.decode_permit().await;
+			let (worker, mut done) = DECODES.submit(
+				thumbnails.decode_concurrency(),
+				move || job(Box::new(source)),
+				decode_panicked,
+			);
 			let died = || {
 				Error::custom(
 					ErrorKind::ImageError,
@@ -1226,14 +1244,14 @@ mod remote_chunks {
 			};
 			// A panic answers `done` from the panic hook. A worker that trapped any other way
 			// (libheif's stubbed `__cxa_throw`) drops nothing: `done` never resolves, `incoming`
-			// never closes, and the next `submit` would queue behind it forever. This deadline
-			// is the only thing that notices, so every wait below is under it.
+			// never closes, and every job queued on that worker would wait behind it forever.
+			// This deadline is the only thing that notices, so every wait below is under it.
 			let deadline = sleep_until(TimerInstant::now() + DECODE_STALL_TIMEOUT);
 			tokio::pin!(deadline);
-			// The stamp as of arming. Our job may not have STARTED — the worker takes jobs in
-			// turn and other drivers hold the other decode permits — so what we watch for is
-			// the worker serving anyone, not ourselves being served.
-			let mut last_activity = DECODES.activity();
+			// The stamp as of arming. Our job may not have STARTED — a worker takes its jobs in
+			// turn, and ours may be queued behind another — so what we watch for is the worker
+			// serving anyone, not ourselves being served.
+			let mut last_activity = worker.activity();
 			// Set once the source is dropped inside the worker: no further chunk can be asked
 			// for, only a result. The arm is disabled rather than left to spin on a channel
 			// that now returns `None` immediately.
@@ -1256,7 +1274,7 @@ mod remote_chunks {
 						// NOW rather than after a fetch that may take minutes on a bad
 						// connection — which is time another driver must not count against
 						// the worker.
-						DECODES.note_activity();
+						worker.note_activity();
 						let data =
 							serve_chunk(client.get_unauth_client(), file, &mut stream, request.ask)
 								.await
@@ -1266,12 +1284,12 @@ mod remote_chunks {
 						// dates the worker's next silence from when the worker resumed, not
 						// from when it asked. Recording both means a slow fetch and a slow
 						// stretch of decode each get the full timeout instead of sharing one.
-						last_activity = DECODES.note_activity();
+						last_activity = worker.note_activity();
 						deadline.as_mut().reset(TimerInstant::now() + DECODE_STALL_TIMEOUT);
 					}
 					() = &mut deadline => {
-						let seen = DECODES.activity();
-						if seen != last_activity && DECODES.is_live(generation) {
+						let seen = worker.activity();
+						if seen != last_activity && worker.is_live() {
 							// Someone else's decode moved the stamp, so the worker is alive
 							// and merely busy ahead of us. Retiring it here would kill a
 							// healthy generation mid-decode and cost a second wasm module.
@@ -1288,7 +1306,7 @@ mod remote_chunks {
 						// then no-ops. The permit is ours and drops with this future; the
 						// job's own state (source, spec, buffers) is abandoned with the dead
 						// thread's stack and cannot be reclaimed.
-						DECODES.retire(generation);
+						worker.retire();
 						return Err(died());
 					}
 				}
@@ -1297,15 +1315,15 @@ mod remote_chunks {
 	}
 
 	/// Runs a synchronous job that needs NO chunk service — its bytes are
-	/// already in memory — on the same decode worker, under the same gate and
+	/// already in memory — on the same decode workers, under the same gate and
 	/// the same stall deadline.
 	///
 	/// This is [`over_remote_chunks`]'s wasm arm minus the chunk-serving select
 	/// arm: a `MemSource` job never asks for a chunk, so the only two events
 	/// left are the result and the deadline. Read that loop for why each piece
-	/// is here — the deadline watches worker-side silence ACROSS ALL DRIVERS,
-	/// and a stamp that moved while our generation is still live means the
-	/// worker is merely busy ahead of us.
+	/// is here — the deadline watches worker-side silence ACROSS ALL DRIVERS of
+	/// the worker, and a stamp that moved while our generation is still live
+	/// means the worker is merely busy ahead of us.
 	///
 	/// The permit is the CALLER's, taken by reference rather than acquired
 	/// here. The buffer the job decodes is as much of the page's memory as the
@@ -1313,7 +1331,8 @@ mod remote_chunks {
 	/// a gate held only around the decode would bound neither. It stays in the
 	/// driver rather than moving into the job for the reason the sibling gives:
 	/// a trapped worker runs no destructor, so a permit inside the job would be
-	/// lost for the life of the page.
+	/// lost for the life of the page. `workers` is the width of the caller's
+	/// gate: how many decode workers its jobs may spread over.
 	///
 	/// With no chunk traffic to observe, nothing re-arms the deadline once the
 	/// job starts: [`DECODE_STALL_TIMEOUT`] is a ceiling on the WHOLE decode
@@ -1324,12 +1343,13 @@ mod remote_chunks {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	pub(super) async fn local_decode_job<R>(
 		_decode_permit: &tokio::sync::OwnedSemaphorePermit,
+		workers: usize,
 		job: impl FnOnce() -> Result<R, Error> + Send + 'static,
 	) -> Result<R, Error>
 	where
 		R: Send + 'static,
 	{
-		let (generation, mut done) = DECODES.submit(job, decode_panicked);
+		let (worker, mut done) = DECODES.submit(workers, job, decode_panicked);
 		let died = || {
 			Error::custom(
 				ErrorKind::ImageError,
@@ -1338,19 +1358,19 @@ mod remote_chunks {
 		};
 		let deadline = sleep_until(TimerInstant::now() + DECODE_STALL_TIMEOUT);
 		tokio::pin!(deadline);
-		let mut last_activity = DECODES.activity();
+		let mut last_activity = worker.activity();
 		loop {
 			tokio::select! {
 				biased;
 				result = &mut done => return result.map_err(|_| died())?,
 				() = &mut deadline => {
-					let seen = DECODES.activity();
-					if seen != last_activity && DECODES.is_live(generation) {
+					let seen = worker.activity();
+					if seen != last_activity && worker.is_live() {
 						last_activity = seen;
 						deadline.as_mut().reset(TimerInstant::now() + DECODE_STALL_TIMEOUT);
 						continue;
 					}
-					DECODES.retire(generation);
+					worker.retire();
 					return Err(died());
 				}
 			}
@@ -1930,7 +1950,8 @@ mod js_impls {
 				// under the decode, so it comes off the budget the way a remote
 				// source's chunk slots do. What is left bounds the DECODE.
 				let spec = thumbnails.spec_in_memory(max_width, max_height, buf.len());
-				let (outcome, webp_data) = local_decode_job(&decode_permit, move || {
+				let workers = thumbnails.decode_concurrency();
+				let (outcome, webp_data) = local_decode_job(&decode_permit, workers, move || {
 					let mut webp = Vec::new();
 					let outcome = make_thumbnail_from_source(
 						Box::new(MemSource(buf)),
@@ -2004,7 +2025,8 @@ mod js_impls {
 						.await?;
 				// The locate is what the gate bounds; the buffer comes back out
 				// of the source so the copy can slice it.
-				let (located, buf) = local_decode_job(&decode_permit, move || {
+				let workers = thumbnails.decode_concurrency();
+				let (located, buf) = local_decode_job(&decode_permit, workers, move || {
 					let mut source = MemSource(buf);
 					let located = locate_embedded_preview(&mut source)?;
 					Ok((located, source.0))
@@ -2082,8 +2104,8 @@ mod js_impls {
 		/// The stream is buffered whole, up to the client's `max_source_bytes`
 		/// — past that the call fails with `InsufficientMemory` rather than
 		/// settling a verdict, since the uploaded file's embedded preview still
-		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on the one
-		/// decode worker, in turn with every other decode on the page.
+		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on one of
+		/// the page's decode workers, like every other decode on the page.
 		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailFromStream")]
 		pub async fn make_thumbnail_from_stream(
 			&self,
@@ -2129,8 +2151,8 @@ mod js_impls {
 		/// The stream is buffered whole, up to the client's `max_source_bytes`
 		/// — past that the call fails with `InsufficientMemory` rather than
 		/// settling a verdict, since the uploaded file's embedded preview still
-		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on the one
-		/// decode worker, in turn with every other decode on the page.
+		/// costs `makeThumbnailInMemory` a chunk or two — and decoded on one of
+		/// the page's decode workers, like every other decode on the page.
 		#[wasm_bindgen::prelude::wasm_bindgen(js_name = "makeThumbnailFromStream")]
 		pub async fn make_thumbnail_from_stream(
 			&self,
@@ -3106,6 +3128,23 @@ mod tests {
 		let _reacquired = tokio::time::timeout(Duration::from_secs(30), thumbs.decode_permit())
 			.await
 			.expect("dropping a decode permit must return it to the gate");
+	}
+
+	/// On the web the gate's width is also how many of the page's decode workers a client's jobs
+	/// spread over, so it is the clamped width the gate really has, never a 0 that would leave
+	/// a job no worker.
+	#[test]
+	fn the_decode_concurrency_is_the_gates_clamped_width() {
+		let width = |concurrency| {
+			SharedClientState::new(
+				ClientConfig::default().with_thumbnail_decode_concurrency(concurrency),
+			)
+			.expect("valid config")
+			.thumbnails()
+			.decode_concurrency()
+		};
+		assert_eq!(width(0), 1);
+		assert_eq!(width(3), 3);
 	}
 
 	#[test]
