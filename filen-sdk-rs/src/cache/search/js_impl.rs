@@ -436,8 +436,9 @@ impl JsClient {
 	/// Create a live, windowed search over the subtree rooted at `uuid`, served from the local
 	/// cache ([`configure_cache`](JsClient::configure_cache) must have run first). CHEAP (zero
 	/// network, zero resync) when `uuid` is already an active sync root or is covered by one;
-	/// otherwise the worker validates it remotely and runs a convergence resync — observable as
-	/// `ResyncProgress` messages keyed by this uuid on the cache status listener. Change
+	/// otherwise the worker validates it remotely and converges it — a resync, or one drive-id
+	/// read when the cache already holds that subtree whole — observable as `ResyncProgress`
+	/// messages keyed by this uuid on the cache status listener. Change
 	/// filters with [`CacheSearch::set_config`], not by recreating the search.
 	pub async fn create_search(
 		&self,
@@ -463,8 +464,9 @@ impl JsClient {
 	/// Create a live, windowed search over the subtree rooted at `uuid`, served from the local
 	/// cache (`configureCache` must have run first). CHEAP (zero network, zero resync) when
 	/// `uuid` is already an active sync root or is covered by one; otherwise the worker
-	/// validates it remotely and runs a convergence resync — observable as `ResyncProgress`
-	/// messages on the cache status listener.
+	/// validates it remotely and converges it — a resync, or one drive-id read when the cache
+	/// already holds that subtree whole — observable as `ResyncProgress` messages on the cache
+	/// status listener.
 	#[wasm_bindgen::prelude::wasm_bindgen(js_name = "createSearch")]
 	pub async fn create_search(
 		&self,

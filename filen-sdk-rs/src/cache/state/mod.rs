@@ -846,8 +846,10 @@ impl CacheState {
 			CacheEventType::File(file_event) => self.handle_file_event(file_event, trust),
 			CacheEventType::Dir(dir_event) => self.handle_dir_event(dir_event, trust),
 			CacheEventType::Global(global_event) => self.handle_global_event(global_event),
-			// Frontier-advance marker: no DB mutation; the drain still advances the watermark for it.
-			CacheEventType::NoOp => Ok(()),
+			// Frontier-advance marker: no item mutation; the drain still advances the watermark for
+			// it. It stands for a drive event the cache could not apply, which may have changed a
+			// listed root's subtree, so no root is held whole past it.
+			CacheEventType::NoOp => self.forget_listed_roots().map_err(|e| vec![*e]),
 		}
 	}
 
@@ -1020,7 +1022,7 @@ impl CacheState {
 		// failed best-effort write after the hole's evidence is already deleted. The
 		// flag write is idempotent across batches.
 		let committed = self
-			.commit_drain_batch(advanced, &to_delete, cursor.resync_needed)
+			.commit_drain_batch(advanced, &to_delete, cursor.resync_needed, &self.sync_roots)
 			.and_then(|()| {
 				if bulk {
 					self.db
@@ -1060,6 +1062,10 @@ impl CacheState {
 	/// `mark_resync` keeps the durable `needs_resync` flag SET in the commit (instead of clearing
 	/// it) — passed when the listing pass skipped at least one root transiently, so the skipped
 	/// root gets a durable retry while the converged roots' progress still commits.
+	///
+	/// `partial` names the roots whose listing held a record the cache could not store (see
+	/// [`finalize_resync`](Self::finalize_resync)): they converge like the rest, but the commit
+	/// does not record them as held whole, so their next add relists.
 	fn apply_resync(
 		&mut self,
 		per_root: Vec<(
@@ -1067,6 +1073,7 @@ impl CacheState {
 			Vec<CacheableDir<'static>>,
 			Vec<CacheableFile<'static>>,
 		)>,
+		partial: &[Uuid],
 		file_root_heads: Vec<RemoteFile>,
 		remote_under_lock: u64,
 		mark_resync: bool,
@@ -1142,6 +1149,11 @@ impl CacheState {
 			.sync_roots
 			.keys()
 			.all(|root| per_root_synthetics.iter().any(|(anchor, _)| anchor == root));
+		let listed: Vec<Uuid> = per_root_synthetics
+			.iter()
+			.map(|(anchor, _)| *anchor)
+			.filter(|anchor| !partial.contains(anchor))
+			.collect();
 		for (anchor, synthetics) in per_root_synthetics {
 			self.apply_synthetics_direct(anchor, synthetics, all_roots_listed)?;
 		}
@@ -1149,7 +1161,7 @@ impl CacheState {
 		// The watermark jump + flag write commit LAST — strictly after every synthetic landed —
 		// so a crash anywhere above leaves the old watermark and a detectable gap (the durable
 		// flag for triggered resyncs; the startup gap-check otherwise), forcing a fresh listing.
-		self.commit_resync_watermark(remote_under_lock, mark_resync)?;
+		self.commit_resync_watermark(remote_under_lock, mark_resync, &listed)?;
 
 		// Drain any REAL events persisted before or during the resync. If the drain observes a
 		// FRESH hole (a buffered event above the snapshot id broke the frontier),
@@ -1666,13 +1678,15 @@ impl CacheState {
 		}
 	}
 
-	/// Process `first` plus every control message already queued behind it, then run AT MOST ONE
-	/// convergence resync if the burst added any new sync root — so a multi-root startup (N
-	/// `add_sync_root` calls in quick succession) converges with a single listing pass instead of N.
+	/// Process `first` plus every control message already queued behind it, then converge the new
+	/// sync roots the burst added AT MOST ONCE — so a multi-root startup (N `add_sync_root` calls in
+	/// quick succession) converges with a single listing pass instead of N, and with none at all when
+	/// this cache already holds every new root whole and the drive has not moved (see
+	/// [`converge_listed_roots`](Self::converge_listed_roots)).
 	/// Returns `true` if a `Shutdown` was encountered (the caller drains and exits; messages queued
 	/// behind the Shutdown are intentionally not processed).
 	async fn process_control_burst(&mut self, first: CacheControlMessage) -> bool {
-		let mut added_new_dir_root = false;
+		let mut new_dir_roots: Vec<Uuid> = Vec::new();
 		let mut new_file_roots: Vec<StableUuid> = Vec::new();
 		let mut message = Some(first);
 		while let Some(msg) = message {
@@ -1685,9 +1699,12 @@ impl CacheState {
 					ack,
 				} => match key {
 					RootKey::Dir(uuid) => {
-						added_new_dir_root |= self
+						if self
 							.handle_add_sync_root(uuid, registration_id, callback, ack)
-							.await;
+							.await
+						{
+							new_dir_roots.push(uuid);
+						}
 					}
 					RootKey::File(stable) => {
 						if self.handle_add_file_sync_root(stable, registration_id, callback, ack) {
@@ -1707,7 +1724,7 @@ impl CacheState {
 			}
 			message = self.control_receiver.try_recv();
 		}
-		if added_new_dir_root {
+		if !new_dir_roots.is_empty() && !self.converge_listed_roots(&new_dir_roots).await {
 			// Durably schedule the convergence FIRST: the adds were already acked Ok, and a
 			// transient resync failure returns Ok after only a log — without the flag the new
 			// root(s) would silently stay unpopulated for the session (live events for them are
@@ -1717,14 +1734,90 @@ impl CacheState {
 			// Resync ALL roots so the new root(s) are populated AND the watermark stays accurate for
 			// every root. Resyncing only the new roots could advance the watermark past a pending gap
 			// in an existing root and clear `needs_resync`, masking it. Redundant listings of
-			// already-current roots are accepted in v1; a per-root-bookmark skip is a future
-			// optimization. (The full pass also covers `new_file_roots`, so no separate populate.)
+			// already-current roots are accepted. (The full pass also covers `new_file_roots`, so no
+			// separate populate.)
 			tracing::debug!("sync root(s) added; resyncing to populate");
 			self.run_resync_surfacing_errors().await;
 		} else if !new_file_roots.is_empty() {
 			self.populate_new_file_roots(new_file_roots).await;
 		}
 		false
+	}
+
+	/// Converge a burst's new dir `roots` without listing them, when [`listings_current`] says this
+	/// cache already holds every one whole as the drive stands now. Returns `false` when they still
+	/// need the relist, which the caller then runs as it always did.
+	///
+	/// The remote drive id is read here, after the adds, so a converged answer means what one after
+	/// a relist means: the cache held each subtree as the server had it at a moment after the root
+	/// was added. A change after that read arrives on the live socket, or — when the socket has not
+	/// subscribed yet — is caught by the startup gap-check, which still runs then. Announced with the
+	/// same `Started` / `Finished { converged: true }` pair as a relist, minus `Listing` and
+	/// `Applying`, so a caller waiting for the root to converge is not left waiting.
+	///
+	/// [`listings_current`]: Self::listings_current
+	async fn converge_listed_roots(&mut self, roots: &[Uuid]) -> bool {
+		let current = |state: &Self, remote_drive_id| {
+			state
+				.listings_current(roots, remote_drive_id)
+				.unwrap_or_else(|e| {
+					state.surface_one(e);
+					false
+				})
+		};
+		// The local evidence first, so a root that relists anyway costs no request.
+		if !current(self, None) {
+			return false;
+		}
+		// Unit-test construction has no client to ask, so the local evidence decides, as in
+		// `run_gap_check`.
+		if let Some(deps) = self.resync.clone() {
+			let remote = match deps.client.get_last_event_ids().await {
+				Ok(ids) => ids.drive,
+				Err(e) => {
+					tracing::debug!(
+						"sync root(s) added; could not read the remote drive id ({e}), relisting"
+					);
+					return false;
+				}
+			};
+			if !current(self, Some(remote)) {
+				return false;
+			}
+		}
+		tracing::debug!(
+			"sync root(s) {roots:?} added; already held whole at the remote drive id, no relist"
+		);
+		Self::send_resync_progress(
+			&self.msg_sender,
+			ResyncProgress::Started {
+				roots: roots.to_vec(),
+			},
+		);
+		Self::send_resync_progress(
+			&self.msg_sender,
+			ResyncProgress::Finished { converged: true },
+		);
+		true
+	}
+
+	/// Whether this cache holds the whole subtree of every one of `roots` as the drive stands at
+	/// `remote_drive_id`: it holds them at its watermark (see
+	/// [`holds_listings_of`](Self::holds_listings_of)), and the remote has not moved past that
+	/// watermark ([`should_resync_for_remote`](Self::should_resync_for_remote)). `None` asks the
+	/// local evidence alone.
+	fn listings_current(
+		&self,
+		roots: &[Uuid],
+		remote_drive_id: Option<u64>,
+	) -> Result<bool, Box<CacheError>> {
+		if !self.holds_listings_of(roots)? {
+			return Ok(false);
+		}
+		match remote_drive_id {
+			Some(remote) => Ok(!self.should_resync_for_remote(remote)?),
+			None => Ok(true),
+		}
 	}
 
 	/// Populate ONLY a burst's newly-tracked file lineages: one head fetch per NEW lineage,
@@ -1807,7 +1900,7 @@ impl CacheState {
 
 	/// Handle `AddSyncRoot`: register `(registration_id, callback)` for `uuid`, validating the
 	/// uuid first when it is not already an active sync root. Returns whether `uuid` is NEWLY active
-	/// (the caller runs the convergence resync once per control burst).
+	/// (the caller converges the burst's new roots once).
 	///
 	/// VALIDATION: a subdir `uuid` is checked with `get_dir` BEFORE it is inserted, so a bad key
 	/// can never enter `sync_roots` and make every later resync's `get_dir` fail (which would
@@ -1868,13 +1961,19 @@ impl CacheState {
 				// (the cascade trigger recurses). The cascade also wipes any still-registered
 				// NESTED root, so snapshot + drop + notify those first, exactly like the socket
 				// `DirEvent::Removed` arm. A delete of an uncached uuid is an idempotent no-op.
+				// The wipe may take rows of a listed root nested under `uuid`, so the record goes
+				// first; if even that fails, the wipe waits for the next add.
 				let dead_roots = self.sync_roots_deleted_by(uuid);
-				match self.delete_items(once(uuid)) {
-					Ok(()) => self.handle_deleted_sync_roots(dead_roots),
-					Err(del_e) => self.surface_errors(db_err_vec(
+				match self
+					.forget_listed_roots()
+					.map(|()| self.delete_items(once(uuid)))
+				{
+					Ok(Ok(())) => self.handle_deleted_sync_roots(dead_roots),
+					Ok(Err(del_e)) => self.surface_errors(db_err_vec(
 						del_e,
 						format!("wiping the stale subtree of deleted sync root {uuid}"),
 					)),
+					Err(e) => self.surface_one(e),
 				}
 				CacheError::invalid_sync_root(uuid, e.to_string())
 			} else {
@@ -2048,6 +2147,9 @@ impl CacheState {
 		if victims.is_empty() {
 			return Ok(false);
 		}
+		// A row no registered root covers can still sit under a listed root that is not registered
+		// now, and the delete moves no watermark.
+		self.forget_listed_roots()?;
 		self.delete_items(victims.into_iter())
 			.map_err(|e| db_err(e, &format!("evicting file root {stable_uuid}")))?;
 		Ok(true)
@@ -2440,7 +2542,8 @@ impl CacheState {
 		// worker startup — taking the account-wide WRITE lock there is pure waste and serializes
 		// the whole suite. SAFE: with zero dir roots the cache mirrors no SUBTREE, so jumping the
 		// watermark cannot skip an event that affects one, and a later add's convergence resync
-		// re-reads a fresh snapshot UNDER the lock to populate its root consistently.
+		// re-reads a fresh snapshot UNDER the lock to populate its root consistently (the commit
+		// below records no listed root, so that add relists).
 		//
 		// FILE roots do not change that: each one's whole state is a single head record fetched by
 		// its lineage id, which needs no consistent snapshot with anything (there is no listing to
@@ -2461,7 +2564,7 @@ impl CacheState {
 					self.reap_deleted_file_roots(heads.deleted);
 					match self
 						.apply_file_root_heads(heads.heads)
-						.and_then(|()| self.commit_resync_watermark(ids.drive, any_transient))
+						.and_then(|()| self.commit_resync_watermark(ids.drive, any_transient, &[]))
 					{
 						Ok(()) => !any_transient,
 						Err(e) => {
@@ -2761,6 +2864,10 @@ impl CacheState {
 			file_transient,
 			remote_under_lock,
 		} = listing;
+		// Every write below moves rows ahead of the watermark until the commit at the end records
+		// what was listed; until then no root is held whole at the watermark, and an apply that
+		// stops partway (an error, a crash) must leave its roots to relist.
+		self.forget_listed_roots()?;
 		let any_transient = any_transient
 			| self.note_head_fetch_round(&file_root_heads, &deleted_file_roots, &file_transient);
 		// Same rule as `deleted_roots`, for lineages: a not-found is definitive, so reap
@@ -2805,6 +2912,10 @@ impl CacheState {
 			Vec<CacheableDir<'static>>,
 			Vec<CacheableFile<'static>>,
 		)> = Vec::with_capacity(per_root_raw.len());
+		// Roots whose listing held a record the cache could not store. The cache has no row for it,
+		// so events under it are gated out, a move into it deletes what moved, and a rename that makes
+		// it readable patches nothing: only a relist brings it in, so these are not held whole.
+		let mut partial = Vec::new();
 		for (root, root_node, dirs, files) in per_root_raw {
 			if let Some(node) = root_node {
 				// Materialize the subdir root's own node so the diff CTE + the membership ancestry walk
@@ -2822,6 +2933,7 @@ impl CacheState {
 					continue;
 				}
 			}
+			let errors_before = errors.len();
 			let mut undecodable = Vec::new();
 			let (cdirs, cfiles) = convert_listing(dirs, files, &mut errors, &mut undecodable);
 			// Before the diff deletes the rows these records used to be: a reader never sees such an
@@ -2831,6 +2943,9 @@ impl CacheState {
 					e,
 					format!("recording the undecodable items of sync root {root}"),
 				));
+			}
+			if errors.len() > errors_before {
+				partial.push(root);
 			}
 			per_root.push((root, cdirs, cfiles));
 		}
@@ -2842,7 +2957,13 @@ impl CacheState {
 		// progress but keeps `needs_resync` SET in the same transaction, so the skipped roots are
 		// durably retried by a later drain instead of stranded stale (or, for a freshly added
 		// root, stranded empty) until the next unrelated gap.
-		self.apply_resync(per_root, file_root_heads, remote_under_lock, any_transient)
+		self.apply_resync(
+			per_root,
+			&partial,
+			file_root_heads,
+			remote_under_lock,
+			any_transient,
+		)
 	}
 
 	/// Membership gate: is the upsert target's `parent` inside any configured sync root? An
@@ -2872,11 +2993,89 @@ impl CacheState {
 			})
 	}
 
+	/// Before a socket event upserts `dir` into a sync root, take the roots it lands in (those
+	/// holding its parent, and the dir itself if it is one) out of the listed-roots record, unless a
+	/// root the cache holds whole, and that is registered, already holds `kept_through`: the item
+	/// whose position decides whether what comes in with the dir is current. For a created dir that
+	/// is its parent: it has no contents yet, and what goes into it arrives as events of its own,
+	/// which that root applies. For a moved or changed dir it is the dir itself, whose contents come
+	/// along from where they were. A restored dir has none: the trash cascaded its contents out of
+	/// the cache, and the restore does not send them again. Anything not kept lands as the dir's row
+	/// alone, and its contents never arrive: a dir moved in from outside was never listed, or was
+	/// left by a root nothing kept current or by one whose listing held an item the cache could not
+	/// store. The roots it lands in relist on their next add; every other root keeps its claim. In
+	/// the drain's bulk transaction the write rolls back with the batch. With no record there is
+	/// nothing to take out, and no write.
+	fn forget_listings_unless_kept(
+		&self,
+		dir: &CacheableDir<'_>,
+		kept_through: Option<Uuid>,
+	) -> Result<(), Vec<CacheError>> {
+		let held = self.roots_held_whole().map_err(|e| vec![*e])?;
+		if held.is_empty() {
+			return Ok(());
+		}
+		if let Some(seed) = kept_through {
+			let keepers: HashMap<Uuid, ()> = held
+				.into_iter()
+				.filter(|root| self.sync_roots.contains_key(root))
+				.map(|root| (root, ()))
+				.collect();
+			let kept = self
+				.in_any_sync_root(seed, &keepers)
+				.map_err(|e| db_err_vec(e, format!("checking sync-root membership of {seed}")))?;
+			if kept {
+				return Ok(());
+			}
+		}
+		let mut landing = self.roots_holding(dir.parent)?;
+		landing.push(dir.uuid);
+		self.forget_listed_roots_among(&landing)
+			.map_err(|e| vec![*e])
+	}
+
+	/// The roots an item put under `parent` joins, for the listed-roots record: `parent` and every
+	/// cached ancestor of it. Every row under a root the cache holds whole is cached, so the walk
+	/// reaches each such root that holds `parent`.
+	fn roots_holding(&self, parent: Uuid) -> Result<Vec<Uuid>, Vec<CacheError>> {
+		let mut holding = self
+			.ancestors_of(parent)
+			.map_err(|e| db_err_vec(e, format!("reading the ancestry of {parent}")))?;
+		holding.push(parent);
+		Ok(holding)
+	}
+
+	/// Upsert the dir of a socket `New`, `Restored` or `Changed`, gated like every socket upsert,
+	/// taking the roots it lands in out of the listed-roots record unless `kept_through` is held
+	/// (see [`forget_listings_unless_kept`](Self::forget_listings_unless_kept)).
+	fn upsert_event_dir(
+		&mut self,
+		dir: &CacheableDir<'_>,
+		kept_through: Option<Uuid>,
+		trust: EventTrust,
+	) -> Result<(), Vec<CacheError>> {
+		// Skip the upsert for an out-of-root dir, but still advance the watermark. A dir that IS
+		// itself a sync root is the exception (same as the Move arm): a root whose own parent is
+		// out-of-root must still apply its own New/Changed, else its metadata goes stale.
+		if trust == EventTrust::Checked
+			&& !self.sync_roots.contains_key(&dir.uuid)
+			&& !self.parent_in_sync_root(dir.parent)?
+		{
+			return Ok(());
+		}
+		if trust == EventTrust::Checked {
+			self.forget_listings_unless_kept(dir, kept_through)?;
+		}
+		self.upsert_dirs(once(dir))
+			.map_err(|e| db_err_vec(e, format!("failed to upsert dir: {}", dir.uuid)))
+	}
+
 	fn handle_file_event(
 		&mut self,
 		event: FileEvent,
 		trust: EventTrust,
 	) -> Result<(), Vec<CacheError>> {
+		let changed = matches!(event, FileEvent::Changed(_));
 		match event {
 			FileEvent::New(file) | FileEvent::Changed(file) => {
 				// skip the upsert for an out-of-root file, but still advance the watermark. (A
@@ -2887,6 +3086,29 @@ impl CacheState {
 					&& !self.parent_in_sync_root(file.parent)?
 				{
 					return Ok(());
+				}
+				// A `Changed` of a file the cache holds no row for restores it, from the trash or as
+				// an older version, and a version restore can leave the version it replaced cached
+				// beside it, under the same lineage wherever that row is: no root holding either
+				// is held whole after it.
+				if changed
+					&& trust == EventTrust::Checked
+					&& self
+						.stable_of_uuid(file.uuid)
+						.map_err(|e| db_err_vec(e, format!("looking up file {}", file.uuid)))?
+						.is_none()
+				{
+					let mut touched = self.roots_holding(file.parent)?;
+					let replaced = self.uuids_of_stable(file.stable_uuid).map_err(|e| {
+						db_err_vec(e, format!("looking up the lineage of file {}", file.uuid))
+					})?;
+					for uuid in replaced {
+						touched.extend(self.ancestors_of(uuid).map_err(|e| {
+							db_err_vec(e, format!("reading the ancestry of file {uuid}"))
+						})?);
+					}
+					self.forget_listed_roots_among(&touched)
+						.map_err(|e| vec![*e])?;
 				}
 				self.upsert_files(once(&file)).map_err(|e| {
 					// Identify the item by uuid only — the file payload carries the FileKey, which must
@@ -2970,19 +3192,14 @@ impl CacheState {
 		trust: EventTrust,
 	) -> Result<(), Vec<CacheError>> {
 		match event {
-			DirEvent::New(dir) | DirEvent::Restored(dir) | DirEvent::Changed(dir) => {
-				// Skip the upsert for an out-of-root dir, but still advance the watermark. A dir that IS
-				// itself a sync root is the exception (same as the Move arm): a root whose own parent is
-				// out-of-root must still apply its own New/Changed, else its metadata goes stale.
-				if trust == EventTrust::Checked
-					&& !self.sync_roots.contains_key(&dir.uuid)
-					&& !self.parent_in_sync_root(dir.parent)?
-				{
-					return Ok(());
-				}
-				self.upsert_dirs(once(&dir))
-					.map_err(|e| db_err_vec(e, format!("failed to upsert dir: {}", dir.uuid)))
-			}
+			// What a registered root held whole must hold for the dir to leave the listed-roots
+			// record standing: for a created dir, which has no contents yet, its parent;
+			DirEvent::New(dir) => self.upsert_event_dir(&dir, Some(dir.parent), trust),
+			// for a restored one nothing, as the trash cascaded its contents out of the cache and
+			// the restore does not send them again;
+			DirEvent::Restored(dir) => self.upsert_event_dir(&dir, None, trust),
+			// for a changed one the dir itself, its contents where they were.
+			DirEvent::Changed(dir) => self.upsert_event_dir(&dir, Some(dir.uuid), trust),
 			DirEvent::Move(dir) => {
 				// As for files: a move OUT of every sync root deletes the stale cached
 				// subtree (cascade handles its children) rather than leaving it under the old parent.
@@ -2995,6 +3212,9 @@ impl CacheState {
 					|| self.sync_roots.contains_key(&dir.uuid)
 					|| self.parent_in_sync_root(dir.parent)?
 				{
+					if trust == EventTrust::Checked {
+						self.forget_listings_unless_kept(&dir, Some(dir.uuid))?;
+					}
 					self.upsert_dirs(once(&dir)).map_err(|e| {
 						db_err_vec(e, format!("failed to upsert moved dir: {}", dir.uuid))
 					})
@@ -3066,6 +3286,9 @@ impl CacheState {
 	fn handle_manual_event(&mut self, event: ManualEvent) -> Result<(), Vec<CacheError>> {
 		match event {
 			ManualEvent::ListDirRecursive(dirs, files) => {
+				// The upserts are not ordered against the watermark and can put back what a listed
+				// root no longer has, so no root is held whole after them.
+				self.forget_listed_roots().map_err(|e| vec![*e])?;
 				// Eagerly convert FIRST (collecting any per-item conversion errors), then upsert, so a DB
 				// error on the bulk insert is surfaced ALONGSIDE the conversion errors rather than
 				// discarding the ones accumulated so far.

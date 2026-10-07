@@ -1,16 +1,22 @@
 use std::{
+	borrow::Cow,
+	path::Path,
 	sync::{Arc, Mutex},
 	time::Duration,
 };
 
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::cache::{CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback};
+use filen_sdk_rs::cache::{
+	CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback, SyncRootHandle,
+};
 use filen_sdk_rs::{
 	ErrorKind,
-	fs::{HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
+	auth::Client,
+	fs::{HasParent, HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
 	io::{RemoteDirectory, RemoteFile},
+	socket::{DecryptedDriveEvent, DecryptedSocketEvent, FileNew, FolderSubCreated},
 };
-use filen_types::api::v3::dir::color::DirColor;
+use filen_types::{api::v3::dir::color::DirColor, fs::ParentUuid, traits::CowHelpersExt};
 use rusqlite::params;
 use uuid::Uuid;
 
@@ -556,6 +562,369 @@ async fn test_cache_resyncs_on_restart_after_offline_change() {
 	let _ = client.trash_dir(&mut offline_dir).await;
 }
 
+/// Whether a progress message from index `since` on shows `root`'s subtree being listed: a
+/// `Listing` tick for it (native always sends a final one per listing) or an `Applying`.
+fn listed_since(log: &MessageLog, root: Uuid, since: usize) -> bool {
+	log.lock().unwrap().iter().skip(since).any(|msg| match msg {
+		CacheMessage::ResyncProgress(ResyncProgress::Applying) => true,
+		CacheMessage::ResyncProgress(ResyncProgress::Listing { root: listed, .. }) => {
+			*listed == root
+		}
+		_ => false,
+	})
+}
+
+/// The drive id the cache DB at `path` holds the drive at (its watermark).
+fn cached_watermark(path: &Path) -> u64 {
+	let watermark: i64 = open_read_db(path)
+		.unwrap()
+		.query_row(
+			"SELECT value FROM cache_meta WHERE meta_key = 'last_drive_message_id'",
+			[],
+			|row| row.get(0),
+		)
+		.unwrap();
+	u64::try_from(watermark).unwrap()
+}
+
+/// One cache session on `root`: add it to the cache on `client` and wait until the add converges.
+/// Returns the handle, whose drop ends the session, and the index of the session's first message.
+async fn open_session(
+	client: &Arc<Client>,
+	root: Uuid,
+	messages: &MessageLog,
+) -> (SyncRootHandle, usize) {
+	let since = messages_len(messages);
+	let handle = client
+		.clone()
+		.add_sync_root(root, noop_sync_root_callback())
+		.await
+		.unwrap();
+	assert!(
+		wait_for_converged_resync(messages, root, since, CACHE_CONVERGE_TIMEOUT).await,
+		"the add converges"
+	);
+	(handle, since)
+}
+
+/// End a session from [`open_session`]: drop its handle and join the worker, so the DB is closed
+/// before the next session opens it.
+async fn close_session(client: &Client, session: SyncRootHandle) {
+	drop(session);
+	client.flush_cache().await;
+}
+
+/// Wait until the cache at `path` holds the drive at least at the remote drive id as read now, which
+/// the events of every write made so far bring it to. Returns that id.
+async fn wait_until_caught_up(client: &Client, path: &Path) -> u64 {
+	let remote = client.get_last_event_ids().await.unwrap().drive;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || cached_watermark(path) >= remote).await,
+		"the cache catches up with drive id {remote}, still at {}",
+		cached_watermark(path)
+	);
+	remote
+}
+
+/// Whether every resync whose start is logged from index `since` on has finished.
+fn no_resync_in_flight(log: &MessageLog, since: usize) -> bool {
+	let mut in_flight = false;
+	for msg in log.lock().unwrap().iter().skip(since) {
+		match msg {
+			CacheMessage::ResyncProgress(ResyncProgress::Started { .. }) => in_flight = true,
+			CacheMessage::ResyncProgress(ResyncProgress::Finished { .. }) => in_flight = false,
+			_ => {}
+		}
+	}
+	!in_flight
+}
+
+/// Let a session's startup check settle before the writes a test is about. Once its socket
+/// subscribes, the worker reads the remote drive id and lists every root if the drive is ahead of
+/// what it holds, so a write landing before that read turns into a listing. This makes one write
+/// under `parent`, waits until the cache has it and no listing runs, and returns the index of the
+/// next message: the check runs once per session, so nothing after it lists for that reason.
+async fn settle_session_start(
+	client: &Client,
+	parent: &RemoteDirectory,
+	path: &Path,
+	messages: &MessageLog,
+) -> usize {
+	ensure_socket_ready(client).await;
+	let since = messages_len(messages);
+	client
+		.create_dir(&parent.into(), &format!("settle-{}", Uuid::new_v4()))
+		.await
+		.unwrap();
+	wait_until_caught_up(client, path).await;
+	assert!(
+		poll_until(CACHE_CONVERGE_TIMEOUT, || no_resync_in_flight(
+			messages, since
+		))
+		.await,
+		"a listing the settling write set off finishes"
+	);
+	messages_len(messages)
+}
+
+/// Make the dir `name` under `parent` with a file in it, the way clients do: the dir, then an
+/// upload into it.
+async fn create_dir_with_file(
+	client: &Client,
+	parent: &RemoteDirectory,
+	name: &str,
+) -> (RemoteDirectory, RemoteFile) {
+	let dir = client.create_dir(&parent.into(), name).await.unwrap();
+	let file = client.make_file_builder("inside.txt", dir.uuid()).unwrap();
+	let file = client.upload_file(file, b"inside").await.unwrap();
+	(dir, file)
+}
+
+/// Reopening a cache whose sync root an earlier session listed whole confirms the root with one
+/// drive-id read instead of listing it again, and a change made while no cache ran still makes the
+/// next add list it and pick the change up.
+///
+/// The account's drive id moves with every write anyone makes, so the test holds the drive-write
+/// lock throughout, taken by the very client the cache runs on: the cache's own resyncs and this
+/// test's write share it in-process, while every other test's drive write waits for it. A favorite
+/// toggle does not take the lock; the test checks the drive id did not move rather than assume it.
+#[shared_test_runtime]
+async fn test_cache_reopen_confirms_a_listed_root_without_listing_it() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let root: Uuid = resources.dir.uuid();
+	let path = temp_cache_path();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
+	let lock = client.lock_drive().await.unwrap();
+
+	// Session 1: the first add lists the root.
+	let (session, since) = open_session(&client, root, &messages).await;
+	close_session(&client, session).await;
+	assert!(
+		listed_since(&messages, root, since),
+		"the first add lists the root"
+	);
+
+	// Session 2, nothing changed remotely: the add converges without a listing.
+	let held_at = cached_watermark(&path);
+	let (session, since) = open_session(&client, root, &messages).await;
+	close_session(&client, session).await;
+	assert_eq!(
+		client.get_last_event_ids().await.unwrap().drive,
+		held_at,
+		"the drive id moved during the re-add (a write that skips the drive lock, such as a \
+		 concurrent test's favorite toggle), so whether it listed proves nothing"
+	);
+	assert!(
+		!listed_since(&messages, root, since),
+		"a root held whole at an unmoved drive id is not listed again: {:?}",
+		&messages.lock().unwrap()[since..]
+	);
+
+	// A change while no cache runs moves the drive id past the cache's watermark.
+	let made_offline = client
+		.create_dir(&(&resources.dir).into(), "made_while_closed")
+		.await
+		.unwrap();
+
+	// Session 3: the add lists the root and picks the change up.
+	let (session, since) = open_session(&client, root, &messages).await;
+	assert!(
+		poll_for_item(&path, made_offline.uuid(), Duration::from_secs(5)).await,
+		"the dir made while no cache ran is cached"
+	);
+	close_session(&client, session).await;
+	assert!(
+		listed_since(&messages, root, since),
+		"the drive moved, so the add lists the root"
+	);
+	drop(lock);
+}
+
+/// A dir made, with a file in it, under a root the cache holds whole while the cache runs leaves the
+/// root held whole: the socket announces the dir alone, and the file in an event of its own after
+/// it, so the next session confirms the root without listing it and holds both.
+///
+/// The drive lock keeps the drive id still between sessions, as in the test above.
+#[shared_test_runtime]
+async fn test_cache_reopen_confirms_a_listed_root_a_dir_was_made_in() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let root: Uuid = resources.dir.uuid();
+	let path = temp_cache_path();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
+	let lock = client.lock_drive().await.unwrap();
+
+	let (session, _) = open_session(&client, root, &messages).await;
+	close_session(&client, session).await;
+
+	// Session 2: the dir and its file arrive from the socket while the cache runs.
+	let (session, _) = open_session(&client, root, &messages).await;
+	let since = settle_session_start(&client, &resources.dir, &path, &messages).await;
+	let (sender, mut announced) = tokio::sync::mpsc::unbounded_channel();
+	let _listener = client
+		.add_event_listener(
+			Box::new(move |event| {
+				let _ = sender.send(event.to_owned_cow());
+			}),
+			Some(vec![
+				Cow::Borrowed("folderSubCreated"),
+				Cow::Borrowed("fileNew"),
+			]),
+		)
+		.await
+		.unwrap();
+	let (made, file) = create_dir_with_file(&client, &resources.dir, "made_while_open").await;
+	let held_at = wait_until_caught_up(&client, &path).await;
+	close_session(&client, session).await;
+	assert!(
+		!listed_since(&messages, root, since),
+		"the dir and its file came from the socket, not a listing: {:?}",
+		&messages.lock().unwrap()[since..]
+	);
+
+	let mut order = Vec::new();
+	while order.len() < 2 {
+		let event = tokio::time::timeout(Duration::from_secs(30), announced.recv())
+			.await
+			.expect("both events are announced")
+			.expect("the listener is registered");
+		match event {
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FolderSubCreated(FolderSubCreated(dir)),
+				..
+			} if dir.uuid() == made.uuid() => order.push("folderSubCreated"),
+			DecryptedSocketEvent::Drive {
+				inner: DecryptedDriveEvent::FileNew(FileNew(new)),
+				..
+			} if new.uuid() == file.uuid() => {
+				assert_eq!(new.parent(), &ParentUuid::Uuid(made.uuid()));
+				order.push("fileNew");
+			}
+			_ => {}
+		}
+	}
+	assert_eq!(
+		order,
+		["folderSubCreated", "fileNew"],
+		"the dir is announced alone, before the file in it"
+	);
+
+	// Session 3: the add confirms the root without listing it.
+	let (session, since) = open_session(&client, root, &messages).await;
+	close_session(&client, session).await;
+	assert_eq!(
+		client.get_last_event_ids().await.unwrap().drive,
+		held_at,
+		"the drive id moved during the re-add, so whether it listed proves nothing"
+	);
+	assert!(
+		!listed_since(&messages, root, since),
+		"a dir made under a root held whole leaves it held whole: {:?}",
+		&messages.lock().unwrap()[since..]
+	);
+	assert!(query_cached_dir(&path, made.uuid()).is_some());
+	assert!(query_cached_file(&path, file.uuid()).is_some());
+	drop(lock);
+}
+
+/// A dir restored from the trash under a root the cache holds whole comes back without the file
+/// the trash took out of the cache, and no event brings it back, so the next session lists the
+/// root, which does.
+///
+/// The drive lock keeps the drive id still between sessions, so the listing is down to the
+/// restore and not to a moved drive.
+#[shared_test_runtime]
+async fn test_cache_reopen_lists_a_listed_root_a_dir_was_restored_in() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let root: Uuid = resources.dir.uuid();
+	let path = temp_cache_path();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
+	// The trash lock (see the file restore test) before the drive lock, which a trash takes too:
+	// a test holding the trash lock waits for the drive lock, never the other way round.
+	let _trash_lock = client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let lock = client.lock_drive().await.unwrap();
+
+	let (session, _) = open_session(&client, root, &messages).await;
+	close_session(&client, session).await;
+
+	// Session 2: a dir with a file in it goes to the trash and comes back.
+	let (session, _) = open_session(&client, root, &messages).await;
+	settle_session_start(&client, &resources.dir, &path, &messages).await;
+	let (mut restored, file) =
+		create_dir_with_file(&client, &resources.dir, "restored_while_open").await;
+	wait_until_caught_up(&client, &path).await;
+	assert!(query_cached_file(&path, file.uuid()).is_some());
+	client.trash_dir(&mut restored).await.unwrap();
+	client.restore_dir(&mut restored).await.unwrap();
+	// For a moment after it answers the restore, the server lists the dir without what was in it.
+	// Wait until a listing of the root, read the way session 3's add reads it but by a client with
+	// no cache, has the file back in the dir.
+	let deadline = tokio::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+	loop {
+		let (_, files) = resources
+			.client
+			.list_dir_recursive::<_, fn(u64, Option<u64>)>(&(&resources.dir).into(), None, ())
+			.await
+			.unwrap();
+		if files.iter().any(|listed| {
+			listed.uuid() == file.uuid() && *listed.parent() == ParentUuid::Uuid(restored.uuid())
+		}) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the server lists {} in the restored dir",
+			file.uuid()
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	let held_at = wait_until_caught_up(&client, &path).await;
+	assert!(
+		query_cached_dir(&path, restored.uuid()).is_some(),
+		"the restored dir is back"
+	);
+	assert!(
+		query_cached_file(&path, file.uuid()).is_none(),
+		"the file in it is not"
+	);
+	close_session(&client, session).await;
+
+	// Session 3: the add lists the root, which brings the file back.
+	let (session, since) = open_session(&client, root, &messages).await;
+	assert!(
+		query_cached_file(&path, file.uuid()).is_some(),
+		"the listing brings the file back"
+	);
+	close_session(&client, session).await;
+	assert_eq!(
+		client.get_last_event_ids().await.unwrap().drive,
+		held_at,
+		"the drive id moved during the re-add, so whether it listed proves nothing"
+	);
+	assert!(
+		listed_since(&messages, root, since),
+		"a dir restored under a root held whole makes its next add list it"
+	);
+	drop(lock);
+}
+
 /// A sync root PERMANENTLY DELETED server-side while the cache is closed: registrations do not
 /// survive a worker restart, so re-adding the root on reopen runs the `add_sync_root` validation —
 /// the server answers not-found and the add is REJECTED with `CacheError::InvalidSyncRoot` (the bad
@@ -1063,7 +1432,12 @@ async fn test_cache_item_favorite_via_socket() {
 		"file should appear in cache"
 	);
 
-	client.set_file_favorite(&mut file, true).await.unwrap();
+	// A favorite toggle moves the drive id like any write but does not take the drive lock, so take
+	// it here: a test that holds the lock to keep the drive id still is not moved under its feet.
+	{
+		let _lock = client.lock_drive().await.unwrap();
+		client.set_file_favorite(&mut file, true).await.unwrap();
+	}
 
 	assert!(
 		poll_for_file_favorite(cache.db_path(), file_uuid, true, Duration::from_secs(30)).await,
