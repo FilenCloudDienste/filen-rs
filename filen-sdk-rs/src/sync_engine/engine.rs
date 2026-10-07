@@ -5762,8 +5762,25 @@ fn overlap_error(overlap: PairOverlap) -> Error {
 	)
 }
 
-fn db_error(error: rusqlite::Error, context: &str) -> Error {
-	Error::custom_with_source(ErrorKind::Internal, error, Some(context.to_string()))
+/// A failed SQLite call on a sync database, as the engine's error, with the `rusqlite::Error` kept
+/// as its source. Every rusqlite error the engine reports goes through here.
+///
+/// What the disk did is [`ErrorKind::IO`], as the same failure of a local file is: a full disk, an
+/// I/O error of any extended kind, a file SQLite cannot open, and a database it cannot write to
+/// (`SQLITE_READONLY`, plain or extended): SQLite opens a database file it may not write, such as a
+/// 0444 file or one on a read-only mount, read-only and answers every write to it with the plain
+/// code. Everything else is [`ErrorKind::Internal`].
+pub(super) fn db_error(error: rusqlite::Error, context: &str) -> Error {
+	let kind = match error.sqlite_error_code() {
+		Some(
+			rusqlite::ErrorCode::DiskFull
+			| rusqlite::ErrorCode::SystemIoFailure
+			| rusqlite::ErrorCode::CannotOpen
+			| rusqlite::ErrorCode::ReadOnly,
+		) => ErrorKind::IO,
+		_ => ErrorKind::Internal,
+	};
+	Error::custom_with_source(kind, error, Some(context.to_string()))
 }
 
 /// The refusal every control verb gets once [`SyncEngine::remove_pair`] has started on the pair: its
@@ -11254,5 +11271,101 @@ mod tests {
 
 	fn tree(rows: &HashMap<String, BaselineEntry>) -> Baseline {
 		Baseline::from_rows(rows.values().cloned())
+	}
+
+	/// A database already holding a table `t`, with `t`'s DDL.
+	fn db_with(table: &str) -> rusqlite::Connection {
+		let conn = rusqlite::Connection::open_in_memory().unwrap();
+		conn.execute_batch(&format!("CREATE TABLE t ({table});"))
+			.unwrap();
+		conn
+	}
+
+	#[test]
+	fn a_full_disk_is_an_io_error_that_keeps_sqlites_answer() {
+		let conn = db_with("v BLOB");
+		// A file at its page cap answers a write as a full disk does, with `SQLITE_FULL`.
+		conn.execute_batch("PRAGMA max_page_count = 2;").unwrap();
+		let full = conn
+			.execute("INSERT INTO t VALUES (zeroblob(1000000))", [])
+			.unwrap_err();
+		assert_eq!(
+			full.sqlite_error_code(),
+			Some(rusqlite::ErrorCode::DiskFull)
+		);
+
+		let error = db_error(full, "writing");
+		assert_eq!(error.kind(), ErrorKind::IO);
+		assert_eq!(
+			error
+				.downcast_ref::<rusqlite::Error>()
+				.and_then(rusqlite::Error::sqlite_error_code),
+			Some(rusqlite::ErrorCode::DiskFull)
+		);
+	}
+
+	#[test]
+	fn an_extended_io_error_is_an_io_error() {
+		let fsync = rusqlite::Error::SqliteFailure(
+			rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_FSYNC),
+			None,
+		);
+		assert_eq!(db_error(fsync, "committing").kind(), ErrorKind::IO);
+	}
+
+	#[test]
+	fn a_database_that_cannot_be_opened_is_an_io_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let missing =
+			rusqlite::Connection::open(dir.path().join("missing").join("baseline.db")).unwrap_err();
+		assert_eq!(
+			missing.sqlite_error_code(),
+			Some(rusqlite::ErrorCode::CannotOpen)
+		);
+		assert_eq!(db_error(missing, "opening").kind(), ErrorKind::IO);
+	}
+
+	#[test]
+	fn a_constraint_violation_stays_an_internal_error() {
+		let conn = db_with("k INTEGER PRIMARY KEY");
+		conn.execute("INSERT INTO t VALUES (1)", []).unwrap();
+		let duplicate = conn.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
+		assert_eq!(
+			duplicate.sqlite_error_code(),
+			Some(rusqlite::ErrorCode::ConstraintViolation)
+		);
+		assert_eq!(db_error(duplicate, "writing").kind(), ErrorKind::Internal);
+	}
+
+	#[test]
+	fn a_write_to_a_database_opened_read_only_is_an_io_error() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("baseline.db");
+		rusqlite::Connection::open(&path)
+			.unwrap()
+			.execute_batch("CREATE TABLE t (k INTEGER);")
+			.unwrap();
+		// How SQLite opens a file the file system will not let it write; the flag rather than a
+		// chmod, so the test holds when run as root too.
+		let conn = rusqlite::Connection::open_with_flags(
+			&path,
+			rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+		)
+		.unwrap();
+		let refused = conn.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
+		assert_eq!(
+			refused.sqlite_error().map(|failure| failure.extended_code),
+			Some(rusqlite::ffi::SQLITE_READONLY)
+		);
+		assert_eq!(db_error(refused, "writing").kind(), ErrorKind::IO);
+	}
+
+	#[test]
+	fn a_database_file_moved_away_while_open_is_an_io_error() {
+		let moved = rusqlite::Error::SqliteFailure(
+			rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY_DBMOVED),
+			None,
+		);
+		assert_eq!(db_error(moved, "writing").kind(), ErrorKind::IO);
 	}
 }
