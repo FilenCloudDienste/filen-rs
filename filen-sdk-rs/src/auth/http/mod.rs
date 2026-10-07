@@ -507,9 +507,8 @@ pub(crate) struct SharedClientState {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	download_limiter: DownloadBandwidthLimiterLayer,
 	memory_semaphore: Arc<tokio::sync::Semaphore>,
-	/// The semaphore's initial permit count (bytes). Stored so the HTTP provider can cap a
-	/// stream's read-ahead at half the total budget, which `available_permits()` cannot give.
-	#[cfg(feature = "http-provider")]
+	/// The semaphore's initial permit count (bytes). Stored so a stream can size its read-ahead
+	/// against the total budget, which `available_permits()` cannot give.
 	file_io_memory_budget: usize,
 	thumbnails: ThumbnailConfig,
 	#[cfg(feature = "archive")]
@@ -600,7 +599,6 @@ impl SharedClientState {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			download_limiter,
 			memory_semaphore: Arc::new(tokio::sync::Semaphore::new(config.file_io_memory_budget)),
-			#[cfg(feature = "http-provider")]
 			file_io_memory_budget: config.file_io_memory_budget,
 			thumbnails,
 			#[cfg(feature = "archive")]
@@ -621,9 +619,8 @@ impl SharedClientState {
 		&self.archives
 	}
 
-	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). Used by the
-	/// HTTP provider to cap a stream's read-ahead window at half the budget.
-	#[cfg(feature = "http-provider")]
+	/// Total file-IO memory budget in bytes (the semaphore's initial permit count). The HTTP
+	/// provider and zip downloads split it between a stream's read-ahead and everything else.
 	pub(crate) fn memory_budget(&self) -> usize {
 		self.file_io_memory_budget
 	}

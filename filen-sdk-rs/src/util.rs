@@ -85,6 +85,11 @@ pub type MaybeSendBoxFuture<'a, T> = futures::future::BoxFuture<'a, T>;
 pub type MaybeSendBoxFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
 
 #[cfg(not(target_family = "wasm"))]
+pub(crate) type MaybeSendBoxStream<'a, T> = futures::stream::BoxStream<'a, T>;
+#[cfg(target_family = "wasm")]
+pub(crate) type MaybeSendBoxStream<'a, T> = futures::stream::LocalBoxStream<'a, T>;
+
+#[cfg(not(target_family = "wasm"))]
 pub trait MaybeSendSync: Send + Sync {}
 #[cfg(target_family = "wasm")]
 pub trait MaybeSendSync {}

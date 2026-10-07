@@ -201,6 +201,31 @@ fn encrypted_chunk_size(file: &dyn File, chunk_idx: u64) -> Option<NonZeroU32> {
 	}
 }
 
+/// Bytes the first chunk of `file` takes to download, or `None` when the file has no bytes to
+/// download.
+pub(crate) fn first_chunk_size(file: &dyn File) -> Option<NonZeroU32> {
+	if file.size() == 0 {
+		return None;
+	}
+	encrypted_chunk_size(file, 0)
+}
+
+/// Downloads and decrypts the first chunk of `file`, charged to the shared memory budget for as
+/// long as the returned chunk lives. `None` when the file has no bytes to download.
+pub(crate) async fn fetch_first_chunk<'a>(
+	client: &'a UnauthClient,
+	file: &dyn File,
+) -> Result<Option<Chunk<'a>>, Error> {
+	check_chunks_consistent(file.chunks(), file.size())?;
+	let Some(chunk_size) = first_chunk_size(file) else {
+		return Ok(None);
+	};
+	let reservation = Chunk::acquire(chunk_size, client.state()).await;
+	fetch_decrypted_chunk(client, file, 0, reservation, None)
+		.await
+		.map(Some)
+}
+
 /// Plaintext length of chunk `index` of a `size`-byte file.
 pub(crate) fn chunk_plaintext_len(size: u64, index: u64) -> u64 {
 	size.saturating_sub(index * CHUNK_SIZE_U64)
@@ -222,6 +247,13 @@ impl<'a> FileReader<'a> {
 			.with_start(start)
 			.with_end(end)
 			.build()
+	}
+
+	/// Adds memory the caller already holds to the read-ahead, as the reservation for the next
+	/// chunk. With it the reader progresses whatever else waits on the shared budget. Released
+	/// at once when no chunk is left to fetch.
+	pub(crate) fn add_reservation(&mut self, reservation: Chunk<'a>) {
+		self.push_fetch_next_chunk(reservation);
 	}
 
 	fn next_chunk_size(&self) -> Option<NonZeroU32> {
@@ -802,6 +834,47 @@ mod tests {
 		assert!(reader.curr_chunk.is_none());
 		assert_eq!(reader.index, half);
 		assert!(block_on(reader.fill_buf()).unwrap().is_empty());
+	}
+
+	#[test]
+	fn an_added_reservation_fetches_the_next_chunk() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_start(CHUNK_SIZE_U64)
+			.with_max_buffer_size(0)
+			.build();
+		let queued = reader.futures.len();
+		let chunk = Chunk::try_acquire(
+			FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()),
+			client.state(),
+		)
+		.unwrap();
+
+		reader.add_reservation(chunk);
+
+		assert_eq!(reader.futures.len(), queued + 1);
+		assert_eq!(reader.next_chunk_idx, 2);
+	}
+
+	#[test]
+	fn a_reservation_past_the_last_chunk_is_released() {
+		let client = test_client();
+		let file = FakeFile::new(CHUNK_SIZE_U64, 1);
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_start(CHUNK_SIZE_U64)
+			.build();
+		let free = client.state().memory_semaphore().available_permits();
+		let chunk = Chunk::try_acquire(
+			FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()),
+			client.state(),
+		)
+		.unwrap();
+
+		reader.add_reservation(chunk);
+
+		assert!(reader.futures.is_empty());
+		assert_eq!(client.state().memory_semaphore().available_permits(), free);
 	}
 
 	#[test]

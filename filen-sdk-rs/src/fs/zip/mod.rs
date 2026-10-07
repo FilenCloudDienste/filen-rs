@@ -1,9 +1,12 @@
-use async_zip::spec::header::{ExtraField, UnknownExtraField};
+use std::fmt::Display;
 
-use crate::fs::{
-	dir::traits::HasDirInfo,
-	file::{enums::RemoteFileType, traits::HasFileInfo},
-};
+use async_zip::spec::header::{ExtraField, UnknownExtraField};
+use chrono::{DateTime, Utc};
+
+use crate::fs::file::{enums::RemoteFileType, traits::HasFileInfo};
+
+mod queue;
+mod walk;
 
 /// The Unix extended timestamp extra field: flags, then each time they name, in seconds since the
 /// Unix epoch.
@@ -110,10 +113,10 @@ fn add_file_times(
 }
 
 fn add_dir_times(
-	dir: &impl HasDirInfo,
+	created: Option<DateTime<Utc>>,
 	builder: async_zip::ZipEntryBuilder,
 ) -> async_zip::ZipEntryBuilder {
-	let Some(created_time) = dir.created() else {
+	let Some(created_time) = created else {
 		return builder;
 	};
 
@@ -134,16 +137,17 @@ fn add_dir_times(
 	])
 }
 
+/// An archive's progress: the totals grow as its directories are listed.
 #[derive(Clone)]
-pub(crate) struct ZipState {
-	pub(crate) bytes_written: u64,
-	pub(crate) total_bytes: u64,
-	pub(crate) items_processed: u64,
-	pub(crate) total_items: u64,
+struct ZipState {
+	bytes_written: u64,
+	total_bytes: u64,
+	items_processed: u64,
+	total_items: u64,
 }
 
 impl ZipState {
-	pub(crate) fn new(total_bytes: u64, total_items: u64) -> Self {
+	fn new(total_bytes: u64, total_items: u64) -> Self {
 		Self {
 			bytes_written: 0,
 			total_bytes,
@@ -181,293 +185,20 @@ fn is_safe_zip_component(name: &str) -> bool {
 /// Zip-Slip-unsafe name so the entry is still archived, just under a
 /// non-traversing path. `parent_path` is already composed of confined
 /// components and carries no trailing slash.
-fn zip_entry_path(parent_path: &str, name: &str, uuid: &str) -> String {
-	let component = if is_safe_zip_component(name) {
-		name
-	} else {
-		uuid
-	};
-	if parent_path.is_empty() {
-		component.to_string()
-	} else {
-		format!("{parent_path}/{component}")
-	}
-}
-
-/// Standalone zip helper functions that work with any `SharedClient` implementor
-/// (both `Client` and `UnauthClient`), enabling cross-category zip downloads.
-pub(crate) mod helpers {
-	use std::{
-		borrow::Cow,
-		cmp::min,
-		sync::{Arc, Mutex as StdMutex},
-	};
-
-	use async_zip::{ZipEntryBuilder, base::write::ZipFileWriter};
-	use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	use tokio::sync::Mutex;
-	use tracing::debug;
-
-	use crate::{
-		Error,
-		auth::shared_client::SharedClient,
-		fs::{
-			HasName, HasUUID,
-			categories::{DirType, fs::CategoryFS},
-			file::{
-				client_impl::FileReaderSharedClientExt, enums::RemoteFileType, traits::HasFileInfo,
-			},
-			zip::{ZipProgressCallback, ZipState, add_dir_times, add_file_times, zip_entry_path},
-		},
-		util::{MaybeSendBoxFuture, MaybeSendSync},
-	};
-
-	/// Parent path is assumed to not have a trailing slash.
-	/// Works with any `SharedClient` — both `Client` and `UnauthClient`.
-	pub(crate) async fn download_file_to_zip<C: SharedClient>(
-		client: &C,
-		file: &RemoteFileType<'_>,
-		zip: Arc<Mutex<ZipFileWriter<impl AsyncWrite + Unpin>>>,
-		state: Arc<StdMutex<ZipState>>,
-		progress_callback: Option<&impl ZipProgressCallback>,
-		parent_path: &str,
-	) -> Result<(), Error> {
-		let file_name = match file.name() {
-			Some(name) => name,
-			None => {
-				debug!("Skipping file with undecryptable metadata: {}", file.uuid());
-				// still update progress so counters stay consistent
-				let state_clone = {
-					let mut state = state.lock().unwrap();
-					state.bytes_written += file.size();
-					state.items_processed += 1;
-					state.clone()
-				};
-				if let Some(callback) = progress_callback {
-					callback(
-						state_clone.bytes_written,
-						state_clone.total_bytes,
-						state_clone.items_processed,
-						state_clone.total_items,
-					);
-				}
-				return Ok(());
-			}
-		};
-		// Confine a hostile decrypted name (Zip Slip): a name like "../../evil"
-		// or one containing a separator would traverse out of the target
-		// directory when the archive is extracted. Fall back to the uuid (always
-		// a safe component) rather than dropping the file.
-		let uuid = file.uuid().to_string();
-		let name = zip_entry_path(parent_path, file_name, &uuid);
-		let mut builder = ZipEntryBuilder::new(name.into(), async_zip::Compression::Stored)
-			.uncompressed_size(file.size());
-
-		if let Some(modified_time) = file.last_modified() {
-			builder = builder.last_modification_date(modified_time.into());
-		}
-
-		builder = add_file_times(file, builder);
-		let entry = builder.build();
-
-		let mut reader = client.get_file_reader(file);
-
-		// buffer start of file to minimize time holding the zip lock
-		// I hope that one day I won't have to zero initalize the buffer
-		// https://github.com/rust-lang/rust/issues/78485
-		let mut initial_buffer = vec![0u8; min(8192, file.size().try_into().unwrap_or(8192))];
-		let read = reader.read(&mut initial_buffer).await?;
-
-		let mut zip = zip.lock().await;
-		let mut writer = zip.write_entry_stream(entry).await.map_err(|e| {
-			Error::custom(
-				crate::ErrorKind::IO,
-				format!("Failed to start zip entry: {}", e),
-			)
-		})?;
-
-		// first write the initial buffer
-		writer.write_all(&initial_buffer[..read]).await?;
-
-		// then stream the rest of the file
-		// todo consider implementing AsyncBufRead for the file reader
-		futures::io::copy(reader, &mut writer).await?;
-		writer
-			.close()
-			.await
-			.map_err(|e| Error::custom(crate::ErrorKind::IO, e.to_string()))?;
-		std::mem::drop(zip);
-		let state_clone = {
-			let mut state = state.lock().unwrap();
-			state.bytes_written += file.size();
-			state.items_processed += 1;
-			state.clone()
-		};
-
-		if let Some(callback) = progress_callback {
-			callback(
-				state_clone.bytes_written,
-				state_clone.total_bytes,
-				state_clone.items_processed,
-				state_clone.total_items,
-			);
-		}
-
-		Ok(())
-	}
-
-	/// Wrapper to make the async fn fit the type alias.
-	#[allow(private_bounds)]
-	pub(crate) fn download_dir_to_zip_wrapper<'a, 'b, 'ctx, Cat, T>(
-		client: &'a Cat::Client,
-		dir: DirType<'a, Cat>,
-		zip: Arc<Mutex<ZipFileWriter<T>>>,
-		state: Arc<StdMutex<ZipState>>,
-		progress_callback: Option<&'a impl ZipProgressCallback>,
-		parent_path: &'a str,
-		context: Cat::ListDirContext<'ctx>,
-	) -> MaybeSendBoxFuture<'a, Result<(), Error>>
-	where
-		Cat: CategoryFS,
-		Cat::Client: SharedClient,
-		T: AsyncWrite + Unpin + MaybeSendSync + 'a + 'ctx,
-		'ctx: 'a,
-		RemoteFileType<'b>: From<&'b Cat::File>,
-		RemoteFileType<'static>: From<Cat::File>,
-	{
-		Box::pin(async move {
-			download_dir_to_zip::<Cat, T>(
-				client,
-				&dir,
-				zip,
-				state,
-				progress_callback,
-				parent_path,
-				context,
-			)
-			.await
-		}) as MaybeSendBoxFuture<Result<(), Error>>
-	}
-
-	/// Parent path is assumed to not have a trailing slash.
-	/// Works with any category whose `Client` implements `SharedClient`.
-	#[allow(private_bounds)]
-	pub(crate) async fn download_dir_to_zip<'a, 'b, 'ctx, Cat, T>(
-		client: &Cat::Client,
-		dir: &DirType<'_, Cat>,
-		zip: Arc<Mutex<ZipFileWriter<T>>>,
-		state: Arc<StdMutex<ZipState>>,
-		progress_callback: Option<&impl ZipProgressCallback>,
-		parent_path: &str,
-		context: Cat::ListDirContext<'ctx>,
-	) -> Result<(), Error>
-	where
-		Cat: CategoryFS,
-		Cat::Client: SharedClient,
-		T: AsyncWrite + Unpin + MaybeSendSync + 'ctx,
-		RemoteFileType<'b>: From<&'b Cat::File>,
-		RemoteFileType<'static>: From<Cat::File>,
-	{
-		let dir_path = match dir {
-			DirType::Root(_) => Cow::Borrowed(parent_path),
-			// Same Zip-Slip confinement as files: an unsafe (or absent) dir name
-			// falls back to the uuid so the whole subtree is still archived, just
-			// under a non-traversing path component.
-			DirType::Dir(dir) => {
-				let uuid = dir.uuid().to_string();
-				Cow::Owned(zip_entry_path(
-					parent_path,
-					dir.name().unwrap_or(&uuid),
-					&uuid,
-				))
-			}
-		};
-
-		let (dirs, files) =
-			Cat::list_dir(client, dir, None::<&fn(u64, Option<u64>)>, context.clone()).await?;
-		{
-			let mut state = state.lock().unwrap();
-			state.total_items +=
-				u64::try_from(dirs.len() + files.len()).expect("dir listing to fit in u64");
-			state.total_bytes += files.iter().map(|f| f.size()).sum::<u64>();
-		}
-		let mut futures: FuturesUnordered<_> = dirs
-			.into_iter()
-			.map(|d| {
-				let zip = zip.clone();
-				let state = state.clone();
-				let dir_path = &dir_path;
-				let context = context.clone();
-				download_dir_to_zip_wrapper::<Cat, T>(
-					client,
-					DirType::Dir(Cow::Owned(d)),
-					zip,
-					state,
-					progress_callback,
-					dir_path,
-					context,
-				)
-			})
-			.chain(files.into_iter().map(|f| {
-				let zip = zip.clone();
-				let state = state.clone();
-				let dir_path = &dir_path;
-				Box::pin(async move {
-					download_file_to_zip(client, &f.into(), zip, state, progress_callback, dir_path)
-						.await
-				}) as MaybeSendBoxFuture<Result<(), Error>>
-			}))
-			.collect();
-		while let Some(res) = futures.next().await {
-			res?;
-		}
-		std::mem::drop(futures);
-
-		if let DirType::Dir(dir) = dir {
-			// this is apparently how you add a directory in async-zip
-			// (you add an an empty entry with a trailing slash)
-			// todo initially allocate enough memory for this
-			let mut dir_entry_path = String::with_capacity(dir_path.len() + 1);
-			dir_entry_path.push_str(&dir_path);
-			dir_entry_path.push('/');
-			let builder =
-				ZipEntryBuilder::new(dir_entry_path.into(), async_zip::Compression::Stored);
-			let builder = add_dir_times(dir.as_ref(), builder);
-			let entry = builder.build();
-			let mut zip = zip.lock().await;
-			zip.write_entry_whole(entry, &[])
-				.await
-				.map_err(|e| Error::custom(crate::ErrorKind::IO, e.to_string()))?;
-		}
-
-		let state_clone = {
-			let mut state = state.lock().unwrap();
-			state.items_processed += 1;
-			state.clone()
-		};
-
-		if let Some(callback) = progress_callback {
-			callback(
-				state_clone.bytes_written,
-				state_clone.total_bytes,
-				state_clone.items_processed,
-				state_clone.total_items,
-			);
-		}
-		Ok(())
+fn zip_entry_path(parent_path: &str, name: &str, uuid: impl Display) -> String {
+	match (parent_path.is_empty(), is_safe_zip_component(name)) {
+		(true, true) => name.to_owned(),
+		(true, false) => uuid.to_string(),
+		(false, true) => format!("{parent_path}/{name}"),
+		(false, false) => format!("{parent_path}/{uuid}"),
 	}
 }
 
 /// Public API for typed, single-category zip downloads on any `SharedClient`.
 mod client_impl {
-	use std::{
-		borrow::Cow,
-		sync::{Arc, Mutex as StdMutex},
-	};
+	use std::{borrow::Cow, sync::Mutex};
 
-	use async_zip::base::write::ZipFileWriter;
-	use futures::{AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	use tokio::sync::Mutex;
+	use futures::{AsyncWrite, StreamExt, stream};
 
 	use crate::{
 		Error,
@@ -477,10 +208,11 @@ mod client_impl {
 			file::{enums::RemoteFileType, traits::HasFileInfo},
 			zip::{
 				ZipProgressCallback, ZipState,
-				helpers::{download_dir_to_zip, download_file_to_zip},
+				queue::write_entries,
+				walk::{ClientLister, DirWalk, Entry, dir_entries, file_entries},
 			},
 		},
-		util::{MaybeSendBoxFuture, MaybeSendSync},
+		util::MaybeSendSync,
 	};
 
 	#[allow(private_bounds)]
@@ -499,83 +231,40 @@ mod client_impl {
 		RemoteFileType<'static>: From<Cat::File>,
 		'a: 'b,
 	{
-		let writer = ZipFileWriter::new(writer);
-		let zip = Arc::new(Mutex::new(writer));
-		let state = Arc::new(StdMutex::new(ZipState::new(
+		let state = Mutex::new(ZipState::new(
 			items
 				.iter()
 				.filter_map(|i| match i {
 					NonRootFileType::File(f) => Some(f.size()),
 					_ => None,
 				})
-				.sum(),
+				.fold(0u64, u64::saturating_add),
 			items.len().try_into().expect("items to fit in u64"),
-		)));
-
-		let root_path = "";
-		let mut futures: FuturesUnordered<MaybeSendBoxFuture<Result<(), Error>>> = items
-			.iter()
-			.map(|i| {
-				let zip = zip.clone();
-				let state = state.clone();
-				let context = context.clone();
-				Box::pin(async move {
-					match i {
-						NonRootFileType::Root(root) => {
-							download_dir_to_zip::<Cat, T>(
-								client,
-								&DirType::Root(Cow::Borrowed(root.as_ref())),
-								zip,
-								state,
-								progress_callback,
-								root_path,
-								context,
-							)
-							.await
-						}
-						NonRootFileType::Dir(dir) => {
-							download_dir_to_zip::<Cat, T>(
-								client,
-								&DirType::Dir(Cow::Borrowed(dir.as_ref())),
-								zip,
-								state,
-								progress_callback,
-								root_path,
-								context,
-							)
-							.await
-						}
-						NonRootFileType::File(file) => {
-							download_file_to_zip(
-								client,
-								&Into::<RemoteFileType>::into(file.as_ref()),
-								zip,
-								state,
-								progress_callback,
-								root_path,
-							)
-							.await
-						}
+		));
+		let entries = stream::iter(items)
+			.map(|item| {
+				let dir = match item {
+					NonRootFileType::File(file) => {
+						return file_entries(Entry::file(RemoteFileType::from(file.as_ref()), ""));
 					}
-				}) as MaybeSendBoxFuture<Result<(), Error>>
+					NonRootFileType::Root(root) => DirType::Root(Cow::Borrowed(root.as_ref())),
+					NonRootFileType::Dir(dir) => DirType::Dir(Cow::Borrowed(dir.as_ref())),
+				};
+				let lister = ClientLister::<Cat> {
+					client,
+					context: context.clone(),
+				};
+				dir_entries(DirWalk::new(dir, lister, &state))
 			})
-			.collect();
-
-		while let Some(res) = futures.next().await {
-			if let Err(e) = res {
-				drop(futures);
-				return Err(e);
-			}
-		}
-		drop(futures);
-		let mut writer = Arc::into_inner(zip)
-			.expect("all futures to have run to completion in download_items_to_zip")
-			.into_inner()
-			.close()
-			.await
-			.map_err(|e| Error::custom(crate::ErrorKind::IO, e.to_string()))?;
-		writer.close().await?;
-		Ok(writer)
+			.flatten();
+		write_entries(
+			client.get_unauth_client(),
+			entries,
+			writer,
+			&state,
+			progress_callback,
+		)
+		.await
 	}
 
 	impl Client {
@@ -623,80 +312,87 @@ mod client_impl {
 /// JS/WASM bindings for cross-category zip downloads.
 #[cfg(any(feature = "wasm-full", feature = "service-worker"))]
 pub(crate) mod js_impl {
-	use std::{
-		borrow::Cow,
-		sync::{Arc, Mutex as StdMutex},
-	};
+	use std::{borrow::Cow, sync::Mutex};
 
-	use async_zip::base::write::ZipFileWriter;
-	use futures::{AsyncWrite, AsyncWriteExt, StreamExt, stream::FuturesUnordered};
-	use tokio::sync::Mutex;
+	use filen_types::traits::CowHelpers;
+	use futures::{AsyncWrite, StreamExt, stream};
 
 	use crate::{
 		Error,
 		auth::Client,
+		connect::{DirPublicLink, fs::SharingRole},
 		fs::{
-			categories::{Linked, Normal, Shared},
+			categories::{DirType, Linked, Normal, Shared},
 			file::{enums::RemoteFileType, traits::HasFileInfo},
 			zip::{
 				ZipProgressCallback, ZipState,
-				helpers::{download_dir_to_zip, download_file_to_zip},
+				queue::write_entries,
+				walk::{ClientLister, DirWalk, Entry, dir_entries, file_entries},
 			},
 		},
 		js::{AnyItemWithContext, DirByCategoryWithContext},
-		util::{MaybeSendBoxFuture, MaybeSendSync},
+		util::{MaybeSendBoxStream, MaybeSendSync},
 	};
 
-	/// Dispatches a directory zip download based on its runtime category.
-	/// Handles Normal, Shared, and Linked directories uniformly.
-	#[allow(private_bounds)]
-	async fn download_dir_by_category_to_zip<T>(
-		client: &Client,
-		dir: DirByCategoryWithContext,
-		zip: Arc<Mutex<ZipFileWriter<T>>>,
-		state: Arc<StdMutex<ZipState>>,
-		progress_callback: Option<&impl ZipProgressCallback>,
-		parent_path: &str,
-	) -> Result<(), Error>
-	where
-		T: AsyncWrite + Unpin + MaybeSendSync,
-	{
-		match dir {
-			DirByCategoryWithContext::Normal(dir) => {
-				download_dir_to_zip::<Normal, T>(
-					client,
-					&dir,
-					zip,
+	/// A requested item, with what listing it takes. A drive job's `ItemSource` without the
+	/// refusal of the drive's root, which a zip takes.
+	enum ZipItem {
+		File(RemoteFileType<'static>),
+		Normal(DirType<'static, Normal>),
+		Shared(DirType<'static, Shared>, SharingRole),
+		Linked(DirType<'static, Linked>, DirPublicLink),
+	}
+
+	impl TryFrom<AnyItemWithContext> for ZipItem {
+		type Error = Error;
+
+		fn try_from(item: AnyItemWithContext) -> Result<Self, Error> {
+			Ok(match item {
+				AnyItemWithContext::File(file) => Self::File(RemoteFileType::try_from(file)?),
+				AnyItemWithContext::Dir(dir) => match DirByCategoryWithContext::from(dir) {
+					DirByCategoryWithContext::Normal(dir) => Self::Normal(dir),
+					DirByCategoryWithContext::Shared(dir, role) => Self::Shared(dir, role),
+					DirByCategoryWithContext::Linked(dir, link) => {
+						Self::Linked(dir, link.try_into()?)
+					}
+				},
+			})
+		}
+	}
+
+	impl ZipItem {
+		/// The item's entries: the file, or the directory and everything below it.
+		fn entries<'a>(
+			&'a self,
+			client: &'a Client,
+			state: &'a Mutex<ZipState>,
+		) -> MaybeSendBoxStream<'a, Result<Entry<'a>, Error>> {
+			match self {
+				Self::File(file) => file_entries(Entry::file(file.as_borrowed_cow(), "")),
+				Self::Normal(dir) => dir_entries(DirWalk::new(
+					dir.as_borrowed_cow(),
+					ClientLister::<Normal> {
+						client,
+						context: (),
+					},
 					state,
-					progress_callback,
-					parent_path,
-					(),
-				)
-				.await
-			}
-			DirByCategoryWithContext::Shared(dir, role) => {
-				download_dir_to_zip::<Shared, T>(
-					client,
-					&dir,
-					zip,
+				)),
+				Self::Shared(dir, role) => dir_entries(DirWalk::new(
+					dir.as_borrowed_cow(),
+					ClientLister::<Shared> {
+						client,
+						context: role,
+					},
 					state,
-					progress_callback,
-					parent_path,
-					&role,
-				)
-				.await
-			}
-			DirByCategoryWithContext::Linked(dir, link) => {
-				download_dir_to_zip::<Linked, T>(
-					client.unauthed(),
-					&dir,
-					zip,
+				)),
+				Self::Linked(dir, link) => dir_entries(DirWalk::new(
+					dir.as_borrowed_cow(),
+					ClientLister::<Linked> {
+						client: client.unauthed(),
+						context: Cow::Borrowed(link),
+					},
 					state,
-					progress_callback,
-					parent_path,
-					Cow::Owned(link.try_into()?),
-				)
-				.await
+				)),
 			}
 		}
 	}
@@ -712,81 +408,38 @@ pub(crate) mod js_impl {
 	where
 		T: AsyncWrite + Unpin + MaybeSendSync,
 	{
-		let initial_file_bytes: u64 = items
+		let items = items
+			.into_iter()
+			.map(ZipItem::try_from)
+			.collect::<Result<Vec<_>, _>>()?;
+		let initial_file_bytes = items
 			.iter()
-			.filter_map(|i| match i {
-				AnyItemWithContext::File(f) => {
-					RemoteFileType::try_from(f.clone()).ok().map(|f| f.size())
-				}
+			.filter_map(|item| match item {
+				ZipItem::File(file) => Some(file.size()),
 				_ => None,
 			})
-			.sum();
-
-		let writer = ZipFileWriter::new(writer);
-		let zip = Arc::new(Mutex::new(writer));
-		let state = Arc::new(StdMutex::new(ZipState::new(
+			.fold(0u64, u64::saturating_add);
+		let state = Mutex::new(ZipState::new(
 			initial_file_bytes,
 			items.len().try_into().expect("items to fit in u64"),
-		)));
-
-		let root_path = "";
-		let mut futures: FuturesUnordered<MaybeSendBoxFuture<Result<(), Error>>> = items
-			.into_iter()
-			.map(|item| {
-				let zip = zip.clone();
-				let state = state.clone();
-				Box::pin(async move {
-					match item {
-						AnyItemWithContext::Dir(dir) => {
-							let dir = DirByCategoryWithContext::from(dir);
-							download_dir_by_category_to_zip(
-								client,
-								dir,
-								zip,
-								state,
-								progress_callback,
-								root_path,
-							)
-							.await
-						}
-						AnyItemWithContext::File(file) => {
-							let file = RemoteFileType::try_from(file)?;
-							download_file_to_zip(
-								client,
-								&file,
-								zip,
-								state,
-								progress_callback,
-								root_path,
-							)
-							.await
-						}
-					}
-				}) as MaybeSendBoxFuture<Result<(), Error>>
-			})
-			.collect();
-
-		while let Some(res) = futures.next().await {
-			if let Err(e) = res {
-				drop(futures);
-				return Err(e);
-			}
-		}
-		drop(futures);
-		let mut writer = Arc::into_inner(zip)
-			.expect("all futures to have run to completion in download_zip_items")
-			.into_inner()
-			.close()
-			.await
-			.map_err(|e| Error::custom(crate::ErrorKind::IO, e.to_string()))?;
-		writer.close().await?;
-		Ok(writer)
+		));
+		let entries = stream::iter(&items)
+			.map(|item| item.entries(client, &state))
+			.flatten();
+		write_entries(
+			client.unauthed(),
+			entries,
+			writer,
+			&state,
+			progress_callback,
+		)
+		.await
 	}
 }
 
 #[cfg(feature = "wasm-full")]
 mod js_client_impl {
-	use wasm_bindgen::prelude::wasm_bindgen;
+	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 	use crate::{
 		Error, ErrorKind,
@@ -819,8 +472,6 @@ mod js_client_impl {
 			let progress_callback = if progress.is_undefined() {
 				None
 			} else {
-				use wasm_bindgen::JsValue;
-
 				let (sender, mut receiver) =
 					tokio::sync::mpsc::unbounded_channel::<(u64, u64, u64, u64)>();
 				crate::runtime::spawn_local(async move {
@@ -858,7 +509,7 @@ mod js_client_impl {
 
 #[cfg(feature = "service-worker")]
 mod service_worker_impl {
-	use wasm_bindgen::prelude::wasm_bindgen;
+	use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 	use crate::{
 		Error, ErrorKind,
@@ -881,8 +532,6 @@ mod service_worker_impl {
 			progress: web_sys::js_sys::Function,
 			managed_future: ManagedFuture,
 		) -> Result<(), Error> {
-			use wasm_bindgen::JsValue;
-
 			let (writer, result_receiver) = stream_writer(
 				writable_stream,
 				None::<fn(u64)>,
@@ -933,14 +582,19 @@ mod unauth_js_client_impl {
 	#[cfg(feature = "uniffi")]
 	use std::sync::Arc;
 
-	#[cfg(feature = "uniffi")]
-	use crate::{js::spawn_ordered_dispatch, runtime::do_on_commander};
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use wasm_bindgen::JsValue;
+
 	use crate::{
 		Error,
 		auth::js_impls::UnauthJsClient,
 		fs::categories::{DirType, Linked, NonRootFileType},
 		js::AnyLinkedDirWithContext,
 	};
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	use crate::{ErrorKind, js::stream_writer};
+	#[cfg(feature = "uniffi")]
+	use crate::{js::spawn_ordered_dispatch, runtime::do_on_commander};
 
 	#[cfg(feature = "uniffi")]
 	impl UnauthJsClient {
@@ -1031,8 +685,6 @@ mod unauth_js_client_impl {
 			progress: web_sys::js_sys::Function,
 			managed_future: crate::js::ManagedFuture,
 		) -> Result<(), Error> {
-			use crate::{ErrorKind, js::stream_writer};
-
 			let (writer, result_receiver) = stream_writer(
 				writable_stream,
 				None::<fn(u64)>,
@@ -1042,8 +694,6 @@ mod unauth_js_client_impl {
 			let progress_callback = if progress.is_undefined() {
 				None
 			} else {
-				use wasm_bindgen::JsValue;
-
 				let (sender, mut receiver) =
 					tokio::sync::mpsc::unbounded_channel::<(u64, u64, u64, u64)>();
 				crate::runtime::spawn_local(async move {

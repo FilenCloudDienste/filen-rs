@@ -23,13 +23,16 @@ use crate::{
 			zip::crypto::AesStrength,
 		},
 		dir::{RemoteDirectory, RootDirectory},
-		drive_job::plan::RenameReason,
+		drive_job::{
+			plan::RenameReason,
+			test_support::{drive_dir, drive_file},
+		},
 		file::traits::HasFileInfo,
 	},
 	job::report::JobFailed,
 	js::{
 		Root,
-		test_support::{Recorder, delivered_in_order, drive_dir, drive_file},
+		test_support::{Recorder, delivered_in_order},
 	},
 };
 

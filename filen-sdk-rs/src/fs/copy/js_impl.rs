@@ -687,12 +687,12 @@ mod tests {
 			categories::NonRootItemType,
 			copy,
 			dir::{LinkedDirectory, RootDirectory},
-			drive_job::test_support::remote_file,
+			drive_job::test_support::{PARENT, drive_dir, remote_file},
 			file::{enums::RemoteFileType, traits::HasFileInfo},
 		},
 		js::{
 			Root,
-			test_support::{PARENT, Recorder, delivered_in_order, drive_dir},
+			test_support::{Recorder, delivered_in_order},
 		},
 	};
 

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use filen_types::{
 	api::v3::dir::color::DirColor,
 	crypto::Blake3Hash,
-	fs::{StableUuid, Uuid},
+	fs::{ParentUuid, StableUuid, Uuid},
 };
 use tokio::sync::{Semaphore, watch};
 
@@ -27,7 +27,10 @@ use crate::{
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
-		dir::{RemoteDirectory, meta::DecryptedDirectoryMeta},
+		dir::{
+			RemoteDirectory,
+			meta::{DecryptedDirectoryMeta, DirectoryMeta},
+		},
 		file::{
 			AnonymousRemoteFile, RemoteFile,
 			enums::RemoteFileType,
@@ -118,6 +121,48 @@ pub(crate) fn stored_file(
 		meta,
 	);
 	RemoteFileType::File(Cow::Owned(file))
+}
+
+/// The directory the drive items below are in.
+pub(crate) const PARENT: Uuid = Uuid::from_u128(0x9a);
+
+/// A directory `name` of the user's drive.
+pub(crate) fn drive_dir(uuid: Uuid, name: &str) -> RemoteDirectory {
+	RemoteDirectory::from_meta(
+		uuid,
+		ParentUuid::Uuid(PARENT),
+		DirColor::Blue,
+		false,
+		DateTime::<Utc>::UNIX_EPOCH,
+		DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+			name: Cow::Owned(name.to_owned()),
+			created: None,
+		}),
+	)
+}
+
+/// A file `name` of the user's drive, `size` bytes long.
+pub(crate) fn drive_file(uuid: Uuid, name: &str, size: u64) -> RemoteFile {
+	RemoteFile::from_meta(
+		uuid,
+		StableUuid::new_for_test(uuid),
+		PARENT.into(),
+		size,
+		1,
+		"de-1",
+		"bucket",
+		DateTime::<Utc>::UNIX_EPOCH,
+		false,
+		FileMeta::Decoded(DecryptedFileMeta {
+			name: Cow::Owned(name.to_owned()),
+			size,
+			mime: Cow::Borrowed("application/octet-stream"),
+			key: FileKey::V3(EncryptionKey::generate()),
+			last_modified: DateTime::<Utc>::UNIX_EPOCH,
+			created: None,
+			hash: None,
+		}),
+	)
 }
 
 /// A directory `name` a job reads as one of its sources, colored so a copy has a color to keep.
