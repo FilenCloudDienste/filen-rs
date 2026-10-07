@@ -931,7 +931,8 @@ mod remote_chunks {
 		}
 
 		/// The wasm bridge: a miss posts the range to the async runtime and
-		/// parks this thread on the reply.
+		/// parks this thread on the reply. `first` is the file's first chunk
+		/// when the driver fetched it ahead, resident from the start.
 		///
 		/// Only ever driven from a [`DECODES`] worker, which is where the parking
 		/// is legal; the driver side is [`thumbnail_remote_file`].
@@ -939,9 +940,10 @@ mod remote_chunks {
 		fn over_requests(
 			len: u64,
 			cancel: Option<Arc<AtomicBool>>,
+			first: Option<Vec<u8>>,
 			requests: tokio::sync::mpsc::UnboundedSender<ChunkRequest>,
 		) -> Self {
-			Self::with_fetcher(
+			let source = Self::with_fetcher(
 				len,
 				cancel,
 				Box::new(move |ask| {
@@ -962,7 +964,25 @@ mod remote_chunks {
 						.map_err(|_| cancelled())?;
 					replies.recv().map_err(|_| cancelled())?
 				}),
-			)
+			);
+			match first {
+				Some(first) => source.with_first_chunk(first),
+				None => source,
+			}
+		}
+
+		/// Makes `first` the file's first chunk, resident from the start, so the
+		/// decode never asks for it. Cut to what the declared size leaves of
+		/// chunk 0, as a fetch of that range would be: a chunk that decrypts
+		/// longer than the file claims never answers a read past the file's
+		/// end, nor past chunk 0's into chunk 1's.
+		#[cfg(any(all(target_family = "wasm", target_os = "unknown"), test))]
+		pub(super) fn with_first_chunk(mut self, mut first: Vec<u8>) -> Self {
+			let (_, end) = chunk_range(0, self.len);
+			first.truncate(usize::try_from(end).unwrap_or(usize::MAX));
+			self.slots[0] = Some((0, first));
+			self.next_evict = 1;
+			self
 		}
 
 		fn chunk(&mut self, index: u64) -> std::io::Result<&Vec<u8>> {
@@ -1111,6 +1131,19 @@ mod remote_chunks {
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 	const DECODE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+	/// The plaintext of `file`'s first chunk; `None` for an empty file.
+	///
+	/// Its memory comes out of the client's file-io budget while it downloads, like any chunk's,
+	/// and goes back the moment it is in hand: the driver holds it until its decode starts, and
+	/// budget held across that wait would let waiting drivers starve the decodes they wait for.
+	/// Once the decode starts it is one of the source's resident slots
+	/// ([`REMOTE_SOURCE_RESIDENT_BYTES`](super::REMOTE_SOURCE_RESIDENT_BYTES)).
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	async fn first_chunk(client: &UnauthClient, file: &dyn File) -> Result<Option<Vec<u8>>, Error> {
+		let chunk = crate::fs::file::read::fetch_first_chunk(client, file).await?;
+		Ok(chunk.map(|chunk| chunk.into_parts().0))
+	}
+
 	/// What a decode that panicked answers its driver with, at once rather than after
 	/// [`DECODE_STALL_TIMEOUT`]. Runs inside the panic hook, so it logs nothing.
 	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -1217,10 +1250,6 @@ mod remote_chunks {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]
 		{
 			let (requests, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-			// `None`, not a flag: nothing on this target can raise one (see
-			// `RemoteChunkSource::cancel`). What a dropped driver does give the
-			// job is `incoming` closing, which fails its next chunk REQUEST.
-			let source = RemoteChunkSource::over_requests(file.size(), None, requests);
 			// Same gate as the native arm, but the permit is held HERE rather than moved into
 			// the job. A trapped worker runs no destructor, so a permit living inside the job
 			// would be lost for the life of the page and the gate would close for good — the
@@ -1229,8 +1258,19 @@ mod remote_chunks {
 			// orphaned job still runs) costs little here: the job such a permit admits runs on
 			// one of the gate's width of workers, queued behind a busy one when none is free,
 			// so no more decodes run at once than the gate is wide.
+			//
+			// A driver that has to wait for a permit fetches the file's first chunk meanwhile:
+			// every job here starts by reading the file's head, so the round trip overlaps the
+			// decodes ahead of it instead of following them.
 			let thumbnails = client.get_unauth_client().thumbnails();
-			let _decode_permit = thumbnails.decode_permit().await;
+			let (_decode_permit, first) = thumbnails
+				.decode_permit_prefetching(first_chunk(client.get_unauth_client(), file))
+				.await;
+			let first = first.transpose()?.flatten();
+			// `None`, not a flag: nothing on this target can raise one (see
+			// `RemoteChunkSource::cancel`). What a dropped driver does give the
+			// job is `incoming` closing, which fails its next chunk REQUEST.
+			let source = RemoteChunkSource::over_requests(file.size(), None, first, requests);
 			let (worker, mut done) = DECODES.submit(
 				thumbnails.decode_concurrency(),
 				move || job(Box::new(source)),
@@ -2484,6 +2524,9 @@ mod js_impls {
 
 #[cfg(test)]
 mod tests {
+	use std::{cell::Cell, time::Duration};
+
+	use futures::future::join_all;
 	use microthumb::MemSource;
 
 	use super::{
@@ -2495,6 +2538,8 @@ mod tests {
 	use crate::{
 		Error, ErrorKind,
 		auth::http::{ClientConfig, SharedClientState},
+		consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
+		fs::{drive_job::test_support::full_chunk, file::chunk::Chunk},
 	};
 
 	fn png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -2864,6 +2909,68 @@ mod tests {
 		);
 	}
 
+	/// Chunk `index` of a `len`-byte file, as a fake fetcher answers it: every byte the index.
+	fn chunk_of(index: u64, len: u64) -> Vec<u8> {
+		let (start, end) = chunk_range(index, len);
+		let fill = u8::try_from(index).expect("a test file has few chunks");
+		vec![fill; usize::try_from(end - start).expect("a chunk fits in memory")]
+	}
+
+	#[test]
+	fn a_seeded_first_chunk_is_never_asked_for() {
+		let len = 2 * CHUNK_SIZE_U64 + 10;
+		let asks = Arc::new(std::sync::Mutex::new(Vec::new()));
+		let mut source = RemoteChunkSource::with_fetcher(len, None, {
+			let asks = Arc::clone(&asks);
+			Box::new(move |ask: ChunkAsk| {
+				asks.lock().expect("not poisoned").push(ask.index);
+				Ok(chunk_of(ask.index, len))
+			})
+		})
+		.with_first_chunk(chunk_of(0, len));
+		let mut buf = [9u8; 16];
+
+		// the header reads, then the decode committing and reading on from the top
+		assert_eq!(source.read_at(0, &mut buf).unwrap(), 16);
+		assert_eq!(buf, [0; 16]);
+		source.hint_bulk_sequential();
+		source.read_at(0, &mut buf).unwrap();
+		source.read_at(CHUNK_SIZE_U64, &mut buf).unwrap();
+		source.read_at(2 * CHUNK_SIZE_U64, &mut buf).unwrap();
+		assert_eq!(buf[0], 2);
+		assert_eq!(*asks.lock().expect("not poisoned"), vec![1, 2]);
+	}
+
+	#[test]
+	fn a_seeded_first_chunk_is_cut_to_the_files_declared_size() {
+		// the file says 100 bytes, its first chunk decrypts to 300: nothing past 100 is read
+		let mut source = RemoteChunkSource::with_fetcher(
+			100,
+			None,
+			Box::new(|ask: ChunkAsk| -> std::io::Result<Vec<u8>> {
+				panic!("a 100-byte file has no chunk {} to fetch", ask.index)
+			}),
+		)
+		.with_first_chunk(vec![7; 300]);
+		let mut buf = [0u8; 300];
+		assert_eq!(source.read_at(0, &mut buf).unwrap(), 100);
+		assert_eq!(source.read_at(100, &mut buf).unwrap(), 0);
+
+		// a first chunk past a chunk's size: a read up to the boundary stops there, and the
+		// bytes after it are chunk 1's, not the overlong chunk 0's
+		let len = CHUNK_SIZE_U64 + 10;
+		let mut source = RemoteChunkSource::with_fetcher(
+			len,
+			None,
+			Box::new(move |ask: ChunkAsk| Ok(chunk_of(ask.index, len))),
+		)
+		.with_first_chunk(vec![0; CHUNK_SIZE + 50]);
+		let mut buf = [9u8; 8];
+		assert_eq!(source.read_at(CHUNK_SIZE_U64 - 2, &mut buf).unwrap(), 2);
+		assert_eq!(source.read_at(CHUNK_SIZE_U64, &mut buf).unwrap(), 8);
+		assert_eq!(buf, [1; 8]);
+	}
+
 	#[test]
 	fn short_reads_at_chunk_boundaries_still_thumbnail() {
 		// A 1 KiB chunk size forces hundreds of boundary-shortened reads
@@ -3107,8 +3214,6 @@ mod tests {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
 	async fn a_dropped_decode_permit_gives_its_slot_back() {
-		use std::time::Duration;
-
 		let state =
 			SharedClientState::new(ClientConfig::default().with_thumbnail_decode_concurrency(1))
 				.expect("valid config");
@@ -3128,6 +3233,154 @@ mod tests {
 		let _reacquired = tokio::time::timeout(Duration::from_secs(30), thumbs.decode_permit())
 			.await
 			.expect("dropping a decode permit must return it to the gate");
+	}
+
+	/// How long a test waits for what a working gate gives at once. Paused time runs it out the
+	/// moment nothing else can move, so a wait that never ends fails at once instead of hanging.
+	const PATIENCE: Duration = Duration::from_secs(30);
+
+	/// One chunk downloaded the way a driver or a decode downloads it: its memory taken from the
+	/// file-io budget while it arrives, given back once its bytes are in hand.
+	async fn fetch_chunk(state: &SharedClientState) -> Vec<u8> {
+		let chunk = Chunk::acquire(full_chunk(), state).await;
+		// arrives on a later poll, as a download does
+		tokio::task::yield_now().await;
+		chunk.into_parts().0
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_driver_with_a_free_slot_fetches_nothing_ahead() {
+		let state =
+			SharedClientState::new(ClientConfig::default().with_thumbnail_decode_concurrency(1))
+				.expect("valid config");
+		let polled = Cell::new(false);
+
+		let (_permit, prefetched) = state
+			.thumbnails()
+			.decode_permit_prefetching(async { polled.set(true) })
+			.await;
+		assert_eq!(prefetched, None);
+		assert!(
+			!polled.get(),
+			"a decode that can start now fetches for itself"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_waiting_driver_fetches_ahead_and_starts_once_a_slot_frees() {
+		let state =
+			SharedClientState::new(ClientConfig::default().with_thumbnail_decode_concurrency(1))
+				.expect("valid config");
+		let thumbs = state.thumbnails();
+		let prefetched = Cell::new(false);
+
+		let decoding = thumbs.decode_permit().await;
+		let waiting = thumbs.decode_permit_prefetching(async {
+			prefetched.set(true);
+			7
+		});
+		tokio::pin!(waiting);
+		assert!(
+			tokio::time::timeout(PATIENCE, &mut waiting).await.is_err(),
+			"no slot until the decode ahead ends"
+		);
+		assert!(prefetched.get(), "the wait was spent fetching");
+
+		drop(decoding);
+		let (_permit, first) = tokio::time::timeout(PATIENCE, waiting)
+			.await
+			.expect("the freed slot is the waiting driver's");
+		assert_eq!(first, Some(7));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_dropped_wait_gives_back_its_place_and_the_memory_its_fetch_held() {
+		let budget = 2 * FULL_CHUNK_BYTES;
+		let state = SharedClientState::new(
+			ClientConfig::default()
+				.with_thumbnail_decode_concurrency(1)
+				.with_memory_budget(budget),
+		)
+		.expect("valid config");
+		let thumbs = state.thumbnails();
+		let reserved = Cell::new(false);
+
+		let decoding = thumbs.decode_permit().await;
+		// a fetch still downloading, its chunk's memory taken, when its caller goes away
+		let abandoned = thumbs.decode_permit_prefetching(async {
+			let _chunk = Chunk::acquire(full_chunk(), &state).await;
+			reserved.set(true);
+			std::future::pending::<()>().await;
+		});
+		assert!(
+			tokio::time::timeout(PATIENCE, abandoned).await.is_err(),
+			"no slot until the decode ahead ends"
+		);
+		assert!(reserved.get());
+		assert_eq!(state.memory_semaphore().available_permits(), budget);
+
+		// the place to fetch ahead is the next waiting driver's
+		let next_fetched = Cell::new(false);
+		let next = thumbs.decode_permit_prefetching(async { next_fetched.set(true) });
+		tokio::pin!(next);
+		assert!(tokio::time::timeout(PATIENCE, &mut next).await.is_err());
+		assert!(next_fetched.get());
+		drop(decoding);
+		let (_permit, first) = tokio::time::timeout(PATIENCE, next)
+			.await
+			.expect("the abandoned wait left the slot to the next driver");
+		assert_eq!(first, Some(()));
+	}
+
+	/// Decodes waiting for the gate, the decodes they wait for and transfers all draw on one
+	/// file-io budget of two chunks. A waiting driver holds no budget while it waits, only its
+	/// fetched chunk's bytes, so the decodes ahead always get the memory they need to end; and
+	/// no more drivers hold a chunk fetched ahead than the gate admits decodes.
+	#[tokio::test(start_paused = true)]
+	async fn drivers_fetching_ahead_never_starve_the_decodes_they_wait_for() {
+		const GATE: usize = 2;
+		let state = SharedClientState::new(
+			ClientConfig::default()
+				.with_thumbnail_decode_concurrency(GATE)
+				.with_memory_budget(2 * FULL_CHUNK_BYTES),
+		)
+		.expect("valid config");
+		let (state, thumbs) = (&state, state.thumbnails());
+		// drivers holding a chunk fetched ahead, from the fetch starting to their decode starting
+		let (holding, most_holding) = (&Cell::new(0usize), &Cell::new(0usize));
+
+		let decodes = (0..8).map(|_| async move {
+			let (_permit, first) = thumbs
+				.decode_permit_prefetching(async {
+					holding.set(holding.get() + 1);
+					most_holding.set(most_holding.get().max(holding.get()));
+					fetch_chunk(state).await
+				})
+				.await;
+			if first.is_some() {
+				holding.set(holding.get() - 1);
+			}
+			// the rest of the file, under the permit
+			for _ in 0..3 {
+				fetch_chunk(state).await;
+			}
+		});
+		let transfers = (0..3).map(|_| async move {
+			for _ in 0..4 {
+				// waits for one chunk's memory, and reads ahead into a second only if it is free
+				let chunk = Chunk::acquire(full_chunk(), state).await;
+				let read_ahead = Chunk::try_acquire(full_chunk(), state);
+				tokio::task::yield_now().await;
+				drop((chunk, read_ahead));
+			}
+		});
+		tokio::time::timeout(
+			PATIENCE,
+			futures::future::join(join_all(decodes), join_all(transfers)),
+		)
+		.await
+		.expect("every decode and transfer ends");
+		assert_eq!(most_holding.get(), GATE);
 	}
 
 	/// On the web the gate's width is also how many of the page's decode workers a client's jobs

@@ -537,9 +537,9 @@ mod tests {
 	use super::*;
 	use crate::{
 		auth::http::{ClientConfig, SharedClientState},
-		consts::{FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
+		consts::FILE_CHUNK_SIZE_EXTRA,
 		fs::{
-			drive_job::test_support::{chunk_data, stored_file},
+			drive_job::test_support::{chunk_data, full_chunk, stored_file},
 			file::read::chunk_plaintext_len,
 			zip::walk::DirEntry,
 		},
@@ -609,10 +609,6 @@ mod tests {
 		) -> impl Remainder<'f> + 'f {
 			FakeReader::new(self.client.state(), file, 1, read_ahead)
 		}
-	}
-
-	fn full_chunk() -> NonZeroU32 {
-		FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get())
 	}
 
 	/// Reads a file from chunk `next` on with memory as `FileReader` takes it: chunks reserved

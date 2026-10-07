@@ -99,7 +99,9 @@ pub struct ClientConfig {
 	/// How many thumbnail decodes may run at once for this client. Decode buffers, not
 	/// downloads, are the memory hazard: each one costs up to `thumbnail_mem_budget`. On the web
 	/// they run on the page's decode workers, of which there are at most four whatever this
-	/// says: past four, decodes wait their turn on a worker.
+	/// says: past four, decodes wait their turn on a worker. There, as many remote decodes again
+	/// may each hold their file's first chunk (1 MiB at most), fetched while they wait for the
+	/// gate.
 	thumbnail_decode_concurrency: usize,
 	/// See [`ClientConfig::with_archive_codec_mem_budget`].
 	#[cfg(feature = "archive")]
@@ -418,6 +420,14 @@ pub struct ThumbnailConfig {
 		test
 	))]
 	concurrency: usize,
+	/// Places for drivers that fetch ahead while they wait for the gate, as many as it admits
+	/// decodes: see [`decode_permit_prefetching`](Self::decode_permit_prefetching). `Arc` so
+	/// clones share it, as they share the gate.
+	#[cfg(any(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		test
+	))]
+	prefetching: Arc<tokio::sync::Semaphore>,
 }
 
 impl ThumbnailConfig {
@@ -439,6 +449,11 @@ impl ThumbnailConfig {
 				test
 			))]
 			concurrency,
+			#[cfg(any(
+				all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+				test
+			))]
+			prefetching: Arc::new(tokio::sync::Semaphore::new(concurrency)),
 		}
 	}
 
@@ -516,6 +531,38 @@ impl ThumbnailConfig {
 			.acquire_owned()
 			.await
 			.expect("the thumbnail decode gate is never closed")
+	}
+
+	/// [`decode_permit`](Self::decode_permit) for a remote decode on the web, whose driver
+	/// spends a wait for it running `prefetch`: a fetch of what the decode reads first, so its
+	/// round trip overlaps the decodes ahead.
+	///
+	/// A free slot is taken at once, with `None` and `prefetch` never polled: the decode starts
+	/// now and fetches for itself. Otherwise the answer comes once both the permit and
+	/// `prefetch` are in, with `Some` of what it fetched. As many drivers prefetch at once as
+	/// the gate admits decodes, the ones behind them waiting before fetching anything, so
+	/// waiting drivers hold at most that many prefetches between them. Dropped, the wait gives
+	/// its place up and drops `prefetch` with whatever it held.
+	#[cfg(any(
+		all(target_family = "wasm", target_os = "unknown", feature = "wasm-full"),
+		test
+	))]
+	pub(crate) async fn decode_permit_prefetching<P: Future>(
+		&self,
+		prefetch: P,
+	) -> (tokio::sync::OwnedSemaphorePermit, Option<P::Output>) {
+		// Only a slot nobody is queued for: a released permit goes straight to a waiter, so this
+		// never jumps the queue.
+		if let Ok(permit) = Arc::clone(&self.gate).try_acquire_owned() {
+			return (permit, None);
+		}
+		let _place = self
+			.prefetching
+			.acquire()
+			.await
+			.expect("the thumbnail prefetch gate is never closed");
+		let (permit, prefetched) = futures::join!(self.decode_permit(), prefetch);
+		(permit, Some(prefetched))
 	}
 }
 

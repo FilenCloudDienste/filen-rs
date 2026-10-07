@@ -4,6 +4,7 @@
 use std::{
 	borrow::Cow,
 	collections::{HashMap, HashSet},
+	num::NonZeroU32,
 	sync::{
 		Arc, Mutex, MutexGuard,
 		atomic::{AtomicUsize, Ordering},
@@ -22,7 +23,9 @@ use tokio::sync::{Semaphore, watch};
 use crate::{
 	Error, ErrorKind,
 	connect::ConnectedTargets,
-	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FULL_CHUNK_BYTES},
+	consts::{
+		CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA, FULL_CHUNK_BYTES,
+	},
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
 	fs::{
 		HasName, HasUUID,
@@ -52,6 +55,11 @@ use super::{
 /// Bytes of memory semaphore that hold `chunks` chunks.
 fn budget(chunks: usize) -> usize {
 	chunks * FULL_CHUNK_BYTES
+}
+
+/// A chunk's worth of the memory semaphore, as a download reserves it.
+pub(crate) fn full_chunk() -> NonZeroU32 {
+	FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get())
 }
 
 /// The plaintext of chunk `index` of the source file `uuid`.
