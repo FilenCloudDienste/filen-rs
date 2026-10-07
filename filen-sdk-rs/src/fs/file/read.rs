@@ -377,6 +377,74 @@ impl FileReader<'_> {
 	}
 }
 
+/// The bytes of `cursor` still to be read by a reader at `index` whose range ends at `limit`.
+fn unread<'c>(cursor: &'c Cursor<Chunk<'_>>, index: u64, limit: u64) -> &'c [u8] {
+	let data = cursor.get_ref().as_ref();
+	let start = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
+	let wanted = usize::try_from(limit.saturating_sub(index)).unwrap_or(usize::MAX);
+	let end = start.saturating_add(wanted).min(data.len());
+	data.get(start..end).unwrap_or_default()
+}
+
+/// Hands out each decrypted chunk in place, so a caller that only forwards the bytes copies them
+/// once instead of through an intermediate buffer.
+impl futures::io::AsyncBufRead for FileReader<'_> {
+	fn poll_fill_buf(
+		self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<&[u8]>> {
+		let this = self.get_mut();
+		if let Err(error) = check_chunks_consistent(this.file.chunks(), this.file.size()) {
+			return std::task::Poll::Ready(Err(std::io::Error::other(error)));
+		}
+
+		let should_pend = this.poll_read_ahead(cx);
+
+		// `curr_chunk` only ever holds a chunk with bytes left to read
+		let cursor = loop {
+			if let Some(cursor) = this.curr_chunk.take() {
+				break cursor;
+			}
+			match this.futures.poll_next_unpin(cx) {
+				std::task::Poll::Ready(Some(Ok(cursor))) => {
+					if !unread(&cursor, this.index, this.limit).is_empty() {
+						break cursor;
+					}
+					this.push_fetch_next_chunk(cursor.into_inner());
+				}
+				std::task::Poll::Ready(Some(Err(e))) => {
+					return std::task::Poll::Ready(Err(std::io::Error::other(e)));
+				}
+				std::task::Poll::Ready(None) => {
+					if should_pend {
+						return std::task::Poll::Pending;
+					}
+					return std::task::Poll::Ready(Ok(&[]));
+				}
+				std::task::Poll::Pending => return std::task::Poll::Pending,
+			}
+		};
+		let cursor = this.curr_chunk.insert(cursor);
+		std::task::Poll::Ready(Ok(unread(cursor, this.index, this.limit)))
+	}
+
+	fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+		let this = self.get_mut();
+		let Some(mut cursor) = this.curr_chunk.take() else {
+			return;
+		};
+		let amt = amt.min(unread(&cursor, this.index, this.limit).len());
+		let amt = u64::try_from(amt).unwrap_or(u64::MAX);
+		cursor.set_position(cursor.position().saturating_add(amt));
+		this.index = this.index.saturating_add(amt);
+		if unread(&cursor, this.index, this.limit).is_empty() {
+			this.push_fetch_next_chunk(cursor.into_inner());
+		} else {
+			this.curr_chunk = Some(cursor);
+		}
+	}
+}
+
 impl futures::io::AsyncRead for FileReader<'_> {
 	fn poll_read(
 		mut self: std::pin::Pin<&mut Self>,
@@ -433,15 +501,19 @@ impl futures::io::AsyncRead for FileReader<'_> {
 
 #[cfg(test)]
 mod tests {
-	use std::borrow::Cow;
+	use std::{borrow::Cow, io::Write};
 
 	use chrono::{DateTime, Utc};
 	use filen_types::{crypto::Blake3Hash, fs::Uuid};
-	use futures::{executor::block_on, io::AsyncReadExt};
+	use futures::{
+		executor::block_on,
+		io::{AsyncBufReadExt, AsyncReadExt},
+	};
 
 	use super::*;
 	use crate::{
 		auth::http::ClientConfig,
+		consts::CHUNK_SIZE,
 		crypto::file::FileKey,
 		fs::{
 			HasMeta, HasName, HasRemoteInfo, HasUUID,
@@ -678,6 +750,58 @@ mod tests {
 			0,
 			"reaching the range limit must not enqueue further chunk fetches"
 		);
+	}
+
+	#[test]
+	fn buffered_read_of_an_empty_file_is_empty() {
+		let client = test_client();
+		let file = FakeFile::new(0, 0);
+		let mut reader = FileReaderBuilder::new(&client, &file).build();
+		assert!(block_on(reader.fill_buf()).unwrap().is_empty());
+	}
+
+	#[test]
+	fn buffered_read_of_an_inconsistent_file_errors() {
+		let client = test_client();
+		let file = FakeFile::new(CHUNK_SIZE_U64, 3);
+		let mut reader = FileReaderBuilder::new(&client, &file).build();
+		let err = block_on(reader.fill_buf()).expect_err("read should fail");
+		let kind = err
+			.get_ref()
+			.and_then(|inner| inner.downcast_ref::<Error>())
+			.map(|e| e.kind());
+		assert_eq!(kind, Some(ErrorKind::Response));
+	}
+
+	#[test]
+	fn buffered_read_hands_out_the_chunk_up_to_the_range_limit_then_recycles_it() {
+		let client = test_client();
+		let file = FakeFile::new(10 * CHUNK_SIZE_U64, 10);
+		let half = CHUNK_SIZE_U64 / 2;
+		let mut reader = FileReaderBuilder::new(&client, &file)
+			.with_end(half)
+			.with_max_buffer_size(0)
+			.build();
+		// the state once chunk 0 is in: it is current and holds more than the range wants
+		reader.futures = FuturesOrdered::new();
+		reader.allocate_chunk_future = None;
+		reader.next_chunk_idx = 1;
+		let mut chunk = Chunk::try_acquire(
+			FILE_CHUNK_SIZE.saturating_add(FILE_CHUNK_SIZE_EXTRA.get()),
+			client.state(),
+		)
+		.unwrap();
+		chunk.write_all(&vec![7u8; CHUNK_SIZE]).unwrap();
+		reader.curr_chunk = Some(Cursor::new(chunk));
+
+		let data = block_on(reader.fill_buf()).unwrap();
+		assert_eq!(data.len(), usize::try_from(half).unwrap());
+		assert!(data.iter().all(|byte| *byte == 7));
+		reader.consume_unpin(usize::try_from(half).unwrap());
+
+		assert!(reader.curr_chunk.is_none());
+		assert_eq!(reader.index, half);
+		assert!(block_on(reader.fill_buf()).unwrap().is_empty());
 	}
 
 	#[test]
