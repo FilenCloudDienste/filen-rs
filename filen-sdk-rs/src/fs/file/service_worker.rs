@@ -103,10 +103,16 @@ impl AsyncWrite for StreamWriter {
 		let len = buf.len();
 		let current_chunk = match this.current_chunk.take() {
 			Some(mut chunk) => {
-				chunk.extend(buf);
+				chunk.extend_from_slice(buf);
 				chunk
 			}
-			None => buf.to_vec(),
+			None if len >= MAX_BUFFER_SIZE_BEFORE_FLUSH => buf.to_vec(),
+			// sized for a whole frame up front, so small writes never regrow it
+			None => {
+				let mut chunk = Vec::with_capacity(MAX_BUFFER_SIZE_BEFORE_FLUSH);
+				chunk.extend_from_slice(buf);
+				chunk
+			}
 		};
 
 		if current_chunk.len() >= MAX_BUFFER_SIZE_BEFORE_FLUSH {

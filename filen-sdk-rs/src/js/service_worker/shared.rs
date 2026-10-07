@@ -1,3 +1,5 @@
+use std::mem;
+
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use crate::js::{AnyFile, ManagedFuture};
 use crate::{
@@ -164,7 +166,9 @@ fn spawn_buffered_write_future(
 	result_sender: tokio::sync::oneshot::Sender<Result<(), Error>>,
 ) {
 	wasm_bindgen_futures::spawn_local(async move {
-		let mut local_cache = Vec::with_capacity(1024);
+		// Small frames (a flush) are gathered before writing; a frame that is big enough on its
+		// own is written as it came, without copying it.
+		let mut local_cache = Vec::new();
 		let mut read = 0u64;
 		let mut completed = false;
 
@@ -176,12 +180,18 @@ fn spawn_buffered_write_future(
 					break;
 				}
 			};
-			local_cache.extend_from_slice(&data);
+			let data = if local_cache.is_empty() {
+				data
+			} else {
+				local_cache.extend_from_slice(&data);
+				mem::take(&mut local_cache)
+			};
 
-			if local_cache.len() < MAX_BUFFER_SIZE_BEFORE_FLUSH {
+			if data.len() < MAX_BUFFER_SIZE_BEFORE_FLUSH {
+				local_cache = data;
 				continue;
 			}
-			if let Err(e) = writer.write(&local_cache).await {
+			if let Err(e) = writer.write(&data).await {
 				let _ = result_sender.send(Err(Error::custom(
 					ErrorKind::IO,
 					format!("error writing to stream: {:?}", e),
@@ -189,10 +199,9 @@ fn spawn_buffered_write_future(
 				return;
 			}
 			if let Some(callback) = &progress_callback {
-				read += local_cache.len() as u64;
+				read += data.len() as u64;
 				callback(read);
 			}
-			local_cache.clear();
 		}
 
 		if !completed {
