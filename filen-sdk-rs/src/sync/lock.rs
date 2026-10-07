@@ -322,9 +322,93 @@ fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
 	.map(|(_, a, _)| a)
 }
 
+/// How many failed requests in a row [`acquire_loop`] waits out once the server has answered
+/// one of its polls. Each is followed by that attempt's sleep, so the outage this rides out
+/// grows with the schedule: about a second right after the first answer, up to three times
+/// `max_sleep_time` late in a long wait. A count rather than a time budget like
+/// [`LOCK_LOSS_BUDGET`]: no lease is at stake while waiting, and a device that went offline
+/// mid-wait still gets its error after a few polls instead of after the whole schedule.
+const ACQUIRE_TRANSPORT_ERROR_LIMIT: usize = 3;
+
+/// Polls for the lock up to `attempts` times on [`fibonacci_iter`]'s schedule, sleeping after
+/// every poll that does not get it. Returns the send time of the granting poll, or
+/// [`ErrorKind::RetryFailed`] once the attempts run out.
+///
+/// `poll` builds the future for a single Acquire round-trip, resolving to the server's
+/// `acquired` flag. Generic over it so the schedule is unit-testable against a scripted server
+/// on a paused clock.
+///
+/// A failed request ([`ErrorKind::Reqwest`]: no response, a timeout, or an HTTP error status,
+/// 5xx/408/429 only once the retry layer gave up on them) is returned at once while no poll has
+/// been answered, so an offline caller fails fast. After an answer, up to
+/// [`ACQUIRE_TRANSPORT_ERROR_LIMIT`] of them in a row are waited out like a refusal, each using
+/// up an attempt: a wait that can last hours must not be lost to one network blip. Natively a
+/// stalled request can take the whole read timeout (300 s by default) each time. Any other error
+/// is returned as is.
+async fn acquire_loop<F, Fut>(
+	mut poll: F,
+	resource: &str,
+	max_sleep_time: Duration,
+	attempts: usize,
+) -> Result<Instant, Error>
+where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = Result<bool, Error>>,
+{
+	let mut answered = false;
+	let mut transport_errors = 0;
+	for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
+		// The server's lease clock starts when it processes this request, no
+		// earlier than now — the refresh schedule is anchored to the send time.
+		let attempt_started = Instant::now();
+		match poll().await {
+			// Always a fresh lease, even after a failed poll the server granted with only the
+			// answer lost: the server refuses an Acquire repeated with the holder's own uuid
+			// (without restarting its lease) until that lease lapses.
+			Ok(true) => return Ok(attempt_started),
+			Ok(false) => {
+				answered = true;
+				transport_errors = 0;
+				debug!(
+					"Attempt {}/{}: Failed to acquire lock on resource: {}. Retrying in {:?}",
+					i + 1,
+					attempts,
+					resource,
+					delay
+				);
+			}
+			Err(e)
+				if answered
+					&& e.kind() == ErrorKind::Reqwest
+					&& transport_errors < ACQUIRE_TRANSPORT_ERROR_LIMIT =>
+			{
+				transport_errors += 1;
+				tracing::warn!(
+					"Attempt {}/{}: lock request for resource {resource} failed, retrying in {delay:?}: {e}",
+					i + 1,
+					attempts,
+				);
+			}
+			Err(e) => return Err(e),
+		}
+		sleep(delay).await;
+	}
+
+	Err(Error::custom(
+		ErrorKind::RetryFailed,
+		format!("Failed to acquire lock on resource '{resource}' after {attempts} attempts"),
+	))
+}
+
 impl Client {
 	/// Attempts to acquire a lock on the specified resource.
 	/// If the lock is acquired, it returns a [`ResourceLock`] that releases the lock when dropped.
+	///
+	/// Polls up to `attempts` times, sleeping after each poll that does not get the lock on a
+	/// schedule that grows to `max_sleep_time`, and fails with [`ErrorKind::RetryFailed`] when
+	/// the attempts run out. An error on the first poll is returned at once; once the server has
+	/// answered, a few failed requests in a row (no response, or an HTTP error status) are
+	/// waited out like refusals.
 	#[tracing::instrument(
 		name = "acquire_lock",
 		skip_all,
@@ -346,49 +430,35 @@ impl Client {
 		})?);
 		let url = gateway_url(api::v3::user::lock::ENDPOINT);
 		let endpoint = api::v3::user::lock::ENDPOINT;
-		for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
-			// The server's lease clock starts when it processes this request, no
-			// earlier than now — the refresh schedule is anchored to the send time.
-			let attempt_started = Instant::now();
-			let resp = self
-				.arc_client()
-				.post_raw_bytes_auth::<api::v3::user::lock::Response>(
-					bytes.clone(),
-					&url,
-					endpoint.into(),
-				)
-				.await?;
-
-			if !resp.acquired {
-				debug!(
-					"Attempt {}/{}: Failed to acquire lock on resource: {}. Retrying in {:?}",
-					i + 1,
-					attempts,
-					resource,
-					delay
-				);
-				sleep(delay).await;
-			} else {
-				let lock = Arc::new(ResourceLock {
-					uuid,
-					client: self.arc_client(),
-					resource,
-					valid: tokio::sync::watch::Sender::new(true),
-					#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-					handle: tokio::runtime::Handle::try_current().ok(),
-				});
-				keep_lock_alive(&lock, attempt_started);
-				return Ok(lock);
-			}
-		}
-
-		Err(Error::custom(
-			ErrorKind::RetryFailed,
-			format!(
-				"Failed to acquire lock on resource '{}' after {attempts} attempts",
-				resource
-			),
-		))
+		let client = self.arc_client();
+		let (client_ref, bytes, url) = (&client, &bytes, url.as_str());
+		let acquired_at = acquire_loop(
+			move || async move {
+				client_ref
+					.post_raw_bytes_auth::<api::v3::user::lock::Response>(
+						// refcount bump: every poll resends the same Acquire body
+						bytes.clone(),
+						url,
+						endpoint.into(),
+					)
+					.await
+					.map(|resp| resp.acquired)
+			},
+			&resource,
+			max_sleep_time,
+			attempts,
+		)
+		.await?;
+		let lock = Arc::new(ResourceLock {
+			uuid,
+			client,
+			resource,
+			valid: tokio::sync::watch::Sender::new(true),
+			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+			handle: tokio::runtime::Handle::try_current().ok(),
+		});
+		keep_lock_alive(&lock, acquired_at);
+		Ok(lock)
 	}
 
 	pub async fn acquire_lock_with_default(
@@ -580,10 +650,10 @@ mod tests {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	type ScriptedRefreshFut = std::pin::Pin<Box<dyn Future<Output = Result<bool, Error>> + Send>>;
+	type ScriptedLockFut = std::pin::Pin<Box<dyn Future<Output = Result<bool, Error>> + Send>>;
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn scripted_refresh(steps: &[Step]) -> impl FnMut() -> Option<ScriptedRefreshFut> {
+	fn scripted_refresh(steps: &[Step]) -> impl FnMut() -> Option<ScriptedLockFut> {
 		let mut steps = std::collections::VecDeque::from(steps.to_vec());
 		move || {
 			let step = steps
@@ -713,5 +783,224 @@ mod tests {
 		// SEND (at 30s), not 15s after the response (35s) — a slow round-trip
 		// must not stretch the cadence past the server TTL
 		assert_eq!(begin.elapsed(), Duration::from_secs(30));
+	}
+
+	/// One scripted outcome for an [`acquire_loop`] poll.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[derive(Clone, Copy)]
+	enum AcquireStep {
+		/// server answers acquired: true
+		Grant,
+		/// server answers acquired: true after this many seconds
+		SlowGrant(u64),
+		/// server answers acquired: false (someone else holds the lock)
+		Refuse,
+		/// no answer: the request failed in transport
+		Unreachable,
+		/// the server answered with an error
+		Rejected,
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn scripted_acquire(polls: &[AcquireStep]) -> impl FnMut() -> ScriptedLockFut {
+		let mut polls = std::collections::VecDeque::from(polls.to_vec());
+		move || {
+			let poll = polls
+				.pop_front()
+				.expect("acquire polled more often than scripted");
+			match poll {
+				AcquireStep::Grant => Box::pin(async { Ok(true) }),
+				AcquireStep::SlowGrant(secs) => Box::pin(async move {
+					tokio::time::sleep(Duration::from_secs(secs)).await;
+					Ok(true)
+				}),
+				AcquireStep::Refuse => Box::pin(async { Ok(false) }),
+				AcquireStep::Unreachable => Box::pin(async {
+					Err(Error::custom(
+						ErrorKind::Reqwest,
+						"scripted transport failure",
+					))
+				}),
+				AcquireStep::Rejected => Box::pin(async {
+					Err(Error::custom(ErrorKind::Server, "scripted server error"))
+				}),
+			}
+		}
+	}
+
+	// With a 30s ceiling the fibonacci_iter delays run 0, 0.25s, 0.25s, 0.5s, 0.75s, 1.25s, 2s,
+	// 3.25s, ... and each is slept after the poll it belongs to.
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_refusals_use_up_the_attempts() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[AcquireStep::Refuse; 3]),
+			"r",
+			Duration::from_secs(30),
+			3,
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::RetryFailed);
+		// 0 + 0.25 + 0.25s: the last attempt's delay is still slept before RetryFailed
+		assert_eq!(begin.elapsed(), Duration::from_millis(500));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_delays_stop_growing_at_max_sleep_time() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[AcquireStep::Refuse; 5]),
+			"r",
+			Duration::from_millis(500),
+			5,
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::RetryFailed);
+		// 0 + 0.25 + 0.25 + 0.5 + 0.5s; uncapped the last delay would be 0.75s
+		assert_eq!(begin.elapsed(), Duration::from_millis(1500));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_grant_is_anchored_to_its_send_time() {
+		let begin = Instant::now();
+		let granted_at = acquire_loop(
+			scripted_acquire(&[
+				AcquireStep::Refuse,
+				AcquireStep::Refuse,
+				AcquireStep::SlowGrant(5),
+			]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap();
+		// sent at 0.25s, answered at 5.25s: the lease runs from the send
+		assert_eq!(granted_at - begin, Duration::from_millis(250));
+		assert_eq!(begin.elapsed(), Duration::from_millis(5250));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_transport_error_on_the_first_poll_fails_fast() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[AcquireStep::Unreachable]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap_err();
+		// Nothing has answered yet, so an offline device gets its error at once.
+		assert_eq!(err.kind(), ErrorKind::Reqwest);
+		assert_eq!(begin.elapsed(), Duration::ZERO);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_transport_error_after_an_answer_keeps_polling() {
+		let begin = Instant::now();
+		let granted_at = acquire_loop(
+			scripted_acquire(&[
+				AcquireStep::Refuse,
+				AcquireStep::Unreachable,
+				AcquireStep::Grant,
+			]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap();
+		// refused at 0s, unreachable at 0s, granted at 0.25s
+		assert_eq!(granted_at - begin, Duration::from_millis(250));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_transport_errors_past_the_limit_fail_the_acquisition() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[
+				AcquireStep::Refuse,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+			]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Reqwest);
+		// the fourth consecutive failure, at 0 + 0.25 + 0.25 + 0.5s, is returned
+		assert_eq!(begin.elapsed(), Duration::from_secs(1));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_answer_resets_the_transport_error_count() {
+		let begin = Instant::now();
+		let granted_at = acquire_loop(
+			scripted_acquire(&[
+				AcquireStep::Refuse,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Refuse,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Unreachable,
+				AcquireStep::Grant,
+			]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap();
+		// refused again at 1s, so three more failures are waited out; granted at 8.25s
+		assert_eq!(granted_at - begin, Duration::from_millis(8250));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_transport_error_uses_up_an_attempt() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[AcquireStep::Refuse, AcquireStep::Unreachable]),
+			"r",
+			Duration::from_secs(30),
+			2,
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::RetryFailed);
+		assert_eq!(begin.elapsed(), Duration::from_millis(250));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn acquire_server_error_after_an_answer_is_returned() {
+		let begin = Instant::now();
+		let err = acquire_loop(
+			scripted_acquire(&[AcquireStep::Refuse, AcquireStep::Rejected]),
+			"r",
+			Duration::from_secs(30),
+			10,
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Server);
+		assert_eq!(begin.elapsed(), Duration::ZERO);
 	}
 }
