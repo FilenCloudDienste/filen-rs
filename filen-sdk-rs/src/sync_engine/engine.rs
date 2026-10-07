@@ -1280,6 +1280,10 @@ pub struct SyncEngine {
 	/// loop must see the change (a `Notify` wakes one waiter), a burst of setter calls coalesces
 	/// into one wake-up, and a version nobody is subscribed to is still a valid send.
 	user_ignore_changed: tokio::sync::watch::Sender<u64>,
+	/// The lock that keeps every other engine off the baseline DB while this one lives (see
+	/// [`BaselineLock::take`]), or `None` where the platform has no file locks. Last, as fields drop
+	/// in order: the engine lets go of its connections to the baseline before it lets go of this.
+	_lock: Option<BaselineLock>,
 }
 
 #[cfg(feature = "malformed")]
@@ -2313,10 +2317,126 @@ fn resolution_entry(
 	}
 }
 
+/// Why [`SyncEngine::open`] refused a baseline DB: another engine, in this process or another, has
+/// it open. Two engines on one baseline run passes over the same pairs with nothing ordering them
+/// against each other, each planning from rows the other is rewriting under it.
+///
+/// Carried as the source of the returned [`Error`], of kind [`ErrorKind::IO`], so a caller can
+/// recover it with [`Error::downcast`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+	"another sync engine has the baseline DB {} open, and only one may have it open at a time",
+	path.display()
+)]
+pub struct BaselineInUse {
+	/// The baseline DB that was asked for.
+	pub path: PathBuf,
+}
+
+/// An exclusive OS lock on `<db>-lock`, the file beside a baseline DB that keeps every other engine
+/// off it for as long as the lock is held (see [`BaselineLock::take`]).
+struct BaselineLock(std::fs::File);
+
+impl BaselineLock {
+	/// Take the lock on the baseline DB at `db_path`, or go on without one where the platform has no
+	/// file locks.
+	///
+	/// The lock is on a file of its own rather than on the DB, which SQLite locks in its own way: on
+	/// Windows, where a lock is mandatory, one over the whole DB would refuse SQLite's own reads and
+	/// writes. The OS lets the lock go when the file is closed, by a process that crashed as well, so
+	/// a crash leaves no stale lock. The file stays behind: removing it would let one engine lock the
+	/// file it had opened, no longer the one at the path, while another locks the new one there.
+	///
+	/// Where file locks are unsupported, std says so with [`std::io::ErrorKind::Unsupported`]: on
+	/// Android on the pinned toolchain, or on a filesystem without locks. That is logged and answered
+	/// with `None`, so nothing keeps a second engine off the baseline there; refusing instead would
+	/// refuse every open on a target the engine is kept building for.
+	fn take(db_path: &Path) -> Result<Option<Self>, Error> {
+		let mut path = db_path.as_os_str().to_owned();
+		path.push("-lock");
+		let path = PathBuf::from(path);
+		let file = std::fs::File::options()
+			.create(true)
+			.write(true)
+			.truncate(false)
+			.open(&path)
+			.map_err(|error| lock_file_error(error, "opening", &path))?;
+		Self::settle(file.try_lock(), file, db_path, &path)
+	}
+
+	/// What `locked`, the answer `file` gave to [`std::fs::File::try_lock`], means for the engine
+	/// opening the baseline DB at `db_path` (see [`Self::take`]).
+	fn settle(
+		locked: Result<(), std::fs::TryLockError>,
+		file: std::fs::File,
+		db_path: &Path,
+		lock_path: &Path,
+	) -> Result<Option<Self>, Error> {
+		match locked {
+			Ok(()) => Ok(Some(Self(file))),
+			Err(std::fs::TryLockError::WouldBlock) => Err(Error::custom_with_source(
+				ErrorKind::IO,
+				BaselineInUse {
+					path: db_path.to_path_buf(),
+				},
+				None::<&str>,
+			)),
+			Err(std::fs::TryLockError::Error(error))
+				if error.kind() == std::io::ErrorKind::Unsupported =>
+			{
+				tracing::warn!(
+					"sync engine: no file lock here ({error}), so nothing keeps a second engine off \
+					 the baseline DB {}",
+					db_path.display()
+				);
+				Ok(None)
+			}
+			Err(std::fs::TryLockError::Error(error)) => {
+				Err(lock_file_error(error, "locking", lock_path))
+			}
+		}
+	}
+}
+
+impl Drop for BaselineLock {
+	/// Unlocks before the file closes rather than leaving that to the close: Windows lets go of a
+	/// lock it finds on a closing file only when its resources allow, and asks a process to unlock
+	/// what it locked itself. An engine dropped and opened again at once relies on the lock being
+	/// gone.
+	fn drop(&mut self) {
+		if let Err(error) = self.0.unlock() {
+			tracing::warn!(
+				"sync engine: could not unlock the baseline's lock file, which its close lets go of \
+				 instead: {error}"
+			);
+		}
+	}
+}
+
+/// An error opening or locking the sync engine's lock file at `lock_path`, naming it.
+fn lock_file_error(error: std::io::Error, doing: &str, lock_path: &Path) -> Error {
+	Error::custom_with_source(
+		ErrorKind::IO,
+		error,
+		Some(format!(
+			"{doing} the sync engine's lock file {}",
+			lock_path.display()
+		)),
+	)
+}
+
 impl SyncEngine {
 	/// Open the engine, creating the baseline DB at `db_path` if needed. The `client`'s cache must
 	/// be configured (it supplies the remote view).
+	///
+	/// One engine at a time has a baseline DB open, in this process or any other: while one does,
+	/// this fails with an [`ErrorKind::IO`] error carrying a [`BaselineInUse`]. The engine holds an OS
+	/// lock on the file `<db_path>-lock` until it is dropped; the file itself stays. Where the
+	/// platform has no file locks (Android, on this toolchain), the engine opens without one and
+	/// logs a warning, and a second engine is not refused.
 	pub async fn open(client: Arc<Client>, db_path: PathBuf) -> Result<Self, Error> {
+		// First, so an engine that is refused touches nothing of the baseline another one holds.
+		let lock = BaselineLock::take(&db_path)?;
 		let store = {
 			let db_path = db_path.clone();
 			tokio::task::spawn_blocking(move || BaselineStore::open(&db_path))
@@ -2359,6 +2479,7 @@ impl SyncEngine {
 			changes: Mutex::new(HashMap::new()),
 			carried: Mutex::new(HashMap::new()),
 			user_ignore_changed: tokio::sync::watch::channel(0).0,
+			_lock: lock,
 		};
 		// Pairs registered by an earlier session are live again from here on, so they need their
 		// cache subscription back too.
@@ -9000,6 +9121,75 @@ mod tests {
 
 		drop(engine);
 		std::fs::remove_file(&path).ok();
+	}
+
+	/// A second engine on a baseline another engine has open is refused, naming the baseline, and
+	/// opens once the first is dropped; an engine on another baseline opens beside it.
+	#[tokio::test]
+	async fn a_second_engine_on_an_open_baseline_is_refused_until_the_first_is_dropped() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("baseline.db");
+		let first = SyncEngine::open(offline_client(), path.clone())
+			.await
+			.unwrap();
+
+		let refused = match SyncEngine::open(offline_client(), path.clone()).await {
+			Ok(_) => panic!("a second engine opened a baseline the first one has open"),
+			Err(error) => error,
+		};
+		assert_eq!(refused.kind(), ErrorKind::IO, "{refused}");
+		assert_eq!(
+			refused
+				.downcast_ref::<BaselineInUse>()
+				.map(|in_use| in_use.path.as_path()),
+			Some(path.as_path()),
+			"{refused}"
+		);
+
+		let other = SyncEngine::open(offline_client(), dir.path().join("other.db"))
+			.await
+			.unwrap();
+		drop(first);
+		SyncEngine::open(offline_client(), path).await.unwrap();
+		drop(other);
+	}
+
+	/// Where the platform has no file locks (Android's std has no `try_lock`), the engine opens
+	/// without one rather than refusing every open.
+	#[test]
+	fn an_unsupported_file_lock_opens_the_baseline_unlocked() {
+		let settled = BaselineLock::settle(
+			Err(std::fs::TryLockError::Error(
+				std::io::ErrorKind::Unsupported.into(),
+			)),
+			tempfile::tempfile().unwrap(),
+			Path::new("baseline.db"),
+			Path::new("baseline.db-lock"),
+		);
+		assert!(matches!(settled, Ok(None)), "{:?}", settled.err());
+	}
+
+	/// Any other failure to take the lock refuses the open, naming the lock file.
+	#[test]
+	fn a_lock_that_fails_otherwise_refuses_the_open() {
+		let refused = match BaselineLock::settle(
+			Err(std::fs::TryLockError::Error(
+				std::io::ErrorKind::PermissionDenied.into(),
+			)),
+			tempfile::tempfile().unwrap(),
+			Path::new("baseline.db"),
+			Path::new("baseline.db-lock"),
+		) {
+			Ok(_) => panic!("a lock that failed opened the baseline"),
+			Err(error) => error,
+		};
+		assert_eq!(refused.kind(), ErrorKind::IO, "{refused}");
+		assert!(
+			refused
+				.to_string()
+				.contains("locking the sync engine's lock file baseline.db-lock"),
+			"{refused}"
+		);
 	}
 
 	/// A hold leaves a watched pair idle, so an approval has to give the pair its next pass itself:

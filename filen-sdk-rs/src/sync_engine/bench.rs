@@ -2414,7 +2414,12 @@ impl MemAnswer {
 /// Blocking on purpose, inside an async fn: nothing else is running on this runtime, and a child
 /// that overlapped the parent's own passes would measure a machine under a load the parent put
 /// there.
-fn measure_memory(bed: &Bed, scenario: &Scenario, samples: usize) -> Vec<MemAnswer> {
+///
+/// Takes the bed so its engine can go first: a child opens one of its own on the same baseline,
+/// which [`SyncEngine::open`] refuses while this process has one open. Its fixture stays until the
+/// last child is done.
+fn measure_memory(bed: Bed, scenario: &Scenario, samples: usize) -> Vec<MemAnswer> {
+	drop(bed.engine);
 	(0..samples)
 		.map(|sample| {
 			let dir = std::env::temp_dir();
@@ -2976,7 +2981,7 @@ pub async fn run_scenario(scenario: &Scenario, samples: usize) -> Vec<Record> {
 	// (`measure_in_child` says what else). Taken after every timed sample, so no child's work sits
 	// inside a figure this process timed.
 	let mem_samples = env_usize("SYNC_BENCH_MEM_SAMPLES", DEFAULT_MEM_SAMPLES);
-	for (sample, answer) in measure_memory(&bed, scenario, mem_samples)
+	for (sample, answer) in measure_memory(bed, scenario, mem_samples)
 		.into_iter()
 		.enumerate()
 	{
