@@ -49,7 +49,7 @@ pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
 /// fallback runtime has shut down), the release is skipped and the server expires the lock on
-/// its own after ~30 seconds.
+/// its own after ~60 seconds.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
 	uuid: Uuid,
@@ -173,9 +173,10 @@ impl Drop for ResourceLock {
 }
 
 const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
-/// Server-side lease for a held lock (confirmed in the backend code): the server
-/// auto-releases a lock 30s after the last acquire/refresh it processed.
-const LOCK_SERVER_TTL: time::Duration = time::Duration::from_secs(30);
+/// Server-side lease for a held lock: the server auto-releases a lock 60s after the last
+/// acquire/refresh it processed. Measured against the live API: another client got a resource
+/// 60s after the holder's acquire, and 90s after an acquire refreshed at 30s.
+const LOCK_SERVER_TTL: time::Duration = time::Duration::from_secs(60);
 /// How long past the last server-confirmed refresh the keep-alive keeps trusting
 /// (and retrying a failing refresh of) a held lock before declaring it lost. The
 /// margin below [`LOCK_SERVER_TTL`] absorbs the send-to-server-processing skew, so
@@ -661,7 +662,7 @@ mod tests {
 		let begin = Instant::now();
 		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), begin).await;
 		assert_eq!(exit, LoopExit::Lost);
-		// declared lost strictly before the 30s server TTL despite the hang
+		// declared lost strictly before the server TTL despite the hang
 		assert_eq!(begin.elapsed(), LOCK_LOSS_BUDGET);
 	}
 
@@ -698,8 +699,8 @@ mod tests {
 		tokio::time::advance(Duration::from_secs(26)).await;
 		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), begin).await;
 		assert_eq!(exit, LoopExit::Lost);
-		// the floored attempt gets exactly LOCK_SERVER_TTL - LOCK_LOSS_BUDGET
-		assert_eq!(begin.elapsed(), Duration::from_secs(31));
+		// the floored attempt gets exactly LOCK_SERVER_TTL - LOCK_LOSS_BUDGET, 35s
+		assert_eq!(begin.elapsed(), Duration::from_secs(61));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

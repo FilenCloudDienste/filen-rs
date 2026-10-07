@@ -231,7 +231,7 @@ fixes of pre-existing bugs before anything else, Conventional Commit messages wi
   from background tasks (socket drainers, gap checks) lands in whichever test created the tokio
   runtime. "Not in this test's dump" never proves "did not happen".
 - **Wall clock.** Every line starts with a UTC timestamp; the six native legs run concurrently on two
-  accounts with one server-side drive-write lock each (30 s TTL, renewed) and the `test:*` locks.
+  accounts with one server-side drive-write lock each (60 s lease, renewed) and the `test:*` locks.
   Whatever another leg was doing in the same minutes is part of the diagnosis — `timeline` shows it.
 - **Log source.** Always the per-job endpoint (`actions/jobs/<id>/logs`, what `fetch` uses).
   `gh run view --log` has spliced stale blocks of other jobs into a job's log and produced phantom
