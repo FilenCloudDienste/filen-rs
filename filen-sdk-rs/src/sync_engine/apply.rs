@@ -2694,11 +2694,7 @@ fn io_err(error: std::io::Error) -> crate::Error {
 }
 
 fn db_err(error: rusqlite::Error) -> crate::Error {
-	crate::Error::custom_with_source(
-		crate::ErrorKind::Internal,
-		error,
-		Some("baseline".to_string()),
-	)
+	super::engine::db_error(error, "baseline")
 }
 
 fn internal(message: &'static str) -> crate::Error {

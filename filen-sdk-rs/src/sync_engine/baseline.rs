@@ -874,11 +874,7 @@ pub(super) fn test_rows_connection(pair: PairId) -> Connection {
 }
 
 fn open_error(error: rusqlite::Error) -> crate::Error {
-	crate::Error::custom_with_source(
-		crate::ErrorKind::Internal,
-		error,
-		Some("opening the sync baseline DB".to_string()),
-	)
+	super::engine::db_error(error, "opening the sync baseline DB")
 }
 
 fn corrupt(what: &str, value: impl Display) -> rusqlite::Error {
