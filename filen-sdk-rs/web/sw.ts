@@ -42,7 +42,8 @@ export async function initClient(client: StringifiedClient): Promise<Client> {
 
 	await init()
 
-	state = fromStringified(client)
+	// Under transfer limits of its own, as filen-web hands its worker the page's.
+	state = fromStringified(client, { concurrency: 8, fileIoMemoryBudget: 16 * 1024 * 1024 })
 
 	console.log("State initialized in service worker")
 

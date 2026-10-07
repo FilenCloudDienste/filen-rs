@@ -473,6 +473,134 @@ fn master_keys_from_exportable(recovery_key: &str, user_id: u64) -> Result<Vec<M
 	.collect::<Result<Vec<MasterKey>, Error>>()
 }
 
+/// The client a service worker builds from what its page hands it: the page's stringified
+/// client, under the page's config, or under the defaults when the page sent none. The config is
+/// converted, clamped and checked as for any client, so one the client cannot be built under is
+/// refused here.
+#[cfg(any(
+	all(
+		target_family = "wasm",
+		target_os = "unknown",
+		feature = "service-worker"
+	),
+	all(test, feature = "uniffi")
+))]
+pub(crate) fn service_worker_client(
+	stringified: StringifiedClient,
+	config: Option<crate::auth::http::JsClientConfig>,
+) -> Result<Client, Error> {
+	UnauthClient::from_config(config.map(ClientConfig::from).unwrap_or_default())?
+		.from_stringified(stringified)
+}
+
+#[cfg(all(test, feature = "uniffi"))]
+mod service_worker_client_tests {
+	use rsa::pkcs8::EncodePrivateKey;
+
+	use super::*;
+	use crate::{ErrorKind, auth::http::JsClientConfig, consts::FULL_CHUNK_BYTES};
+
+	fn stringified() -> StringifiedClient {
+		// tiny key: never used for real crypto, only to make a client that parses
+		let key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).expect("a test key");
+		StringifiedClient {
+			email: "worker@example.com".to_owned(),
+			user_id: 1,
+			root_uuid: Uuid::from_u128(1).to_string(),
+			auth_info: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+				.to_owned(),
+			private_key: BASE64_STANDARD
+				.encode(key.to_pkcs8_der().expect("a test key encodes").as_bytes()),
+			api_key: "test-api-key".to_owned(),
+			auth_version: 2,
+			max_parallel_requests: None,
+			max_io_memory_usage: None,
+		}
+	}
+
+	fn config() -> JsClientConfig {
+		JsClientConfig {
+			concurrency: None,
+			rate_limit_per_sec: None,
+			upload_bandwidth_kilobytes_per_sec: None,
+			download_bandwidth_kilobytes_per_sec: None,
+			log_level: None,
+			file_io_memory_budget: None,
+			thumbnail_mem_budget: None,
+			thumbnail_max_source_bytes: None,
+			thumbnail_decode_concurrency: None,
+			#[cfg(feature = "archive")]
+			archive_codec_mem_budget: None,
+			#[cfg(feature = "archive")]
+			archive_job_concurrency: None,
+		}
+	}
+
+	/// The worker client's request concurrency and file-io budget.
+	fn limits(client: &Client) -> (usize, usize) {
+		let state = client.unauthed().state();
+		(state.max_concurrency(), state.memory_budget())
+	}
+
+	#[test]
+	fn without_a_config_the_worker_client_has_the_defaults() {
+		let defaults = SharedClientState::new(ClientConfig::default()).expect("valid defaults");
+		let client = service_worker_client(stringified(), None).expect("the client parses");
+		assert_eq!(
+			limits(&client),
+			(defaults.max_concurrency(), defaults.memory_budget())
+		);
+		assert_eq!(client.email(), "worker@example.com");
+	}
+
+	#[test]
+	fn the_pages_config_reaches_the_worker_client() {
+		let client = service_worker_client(
+			stringified(),
+			Some(JsClientConfig {
+				concurrency: Some(8),
+				file_io_memory_budget: Some(
+					u64::try_from(4 * FULL_CHUNK_BYTES).expect("fits a u64"),
+				),
+				..config()
+			}),
+		)
+		.expect("the client parses");
+		assert_eq!(limits(&client), (8, 4 * FULL_CHUNK_BYTES));
+	}
+
+	#[test]
+	fn a_config_is_clamped_as_for_any_client() {
+		let client = service_worker_client(
+			stringified(),
+			Some(JsClientConfig {
+				concurrency: Some(0),
+				file_io_memory_budget: Some(u64::MAX),
+				..config()
+			}),
+		)
+		.expect("both ends are clamped, not refused");
+		assert_eq!(limits(&client), (1, tokio::sync::Semaphore::MAX_PERMITS));
+	}
+
+	/// A budget that holds no chunk would hang every download in the worker; it is refused
+	/// with an error instead, before the client exists.
+	#[test]
+	fn a_config_whose_budget_holds_no_chunk_is_refused() {
+		let refused = service_worker_client(
+			stringified(),
+			Some(JsClientConfig {
+				file_io_memory_budget: Some(
+					u64::try_from(FULL_CHUNK_BYTES - 1).expect("fits a u64"),
+				),
+				..config()
+			}),
+		)
+		.expect_err("a budget under one chunk is refused");
+		assert_eq!(refused.kind(), ErrorKind::InvalidState);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

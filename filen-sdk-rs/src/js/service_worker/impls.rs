@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::{
 	Error, ErrorKind,
-	auth::{Client, StringifiedClient},
+	auth::{Client, StringifiedClient, http::JsClientConfig, unauth::service_worker_client},
 	fs::file::{enums::RemoteFileType, traits::HasFileInfo},
 	io::client_impl::IoSharedClientExt,
 };
@@ -127,11 +127,17 @@ impl ServiceWorkerClient {
 // 	}
 // }
 
+/// The client a page handed over with `toStringified`, under `config`: the page's own, so the
+/// worker's downloads keep to the same limits, or the defaults when left out. Of its settings
+/// `concurrency`, `rateLimitPerSec` and `fileIoMemoryBudget` apply here, clamped and checked as
+/// `UnauthClient.from_config` does them, and the rest are ignored: this build makes no
+/// thumbnails and installs no logger, and no wasm build limits bandwidth.
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")]
-pub fn from_stringified(serialized: StringifiedClient) -> Result<ServiceWorkerClient, Error> {
-	let unauth_client =
-		crate::auth::unauth::UnauthClient::from_config(crate::auth::http::ClientConfig::default())?;
-	Ok(ServiceWorkerClient::new(
-		unauth_client.from_stringified(serialized)?,
-	))
+pub fn from_stringified(
+	serialized: StringifiedClient,
+	config: Option<JsClientConfig>,
+) -> Result<ServiceWorkerClient, Error> {
+	Ok(ServiceWorkerClient::new(service_worker_client(
+		serialized, config,
+	)?))
 }
