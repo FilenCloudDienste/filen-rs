@@ -42,7 +42,7 @@ pub(crate) use categories::{
 	normal::NonRootNormalItemTagged,
 };
 
-#[cfg(all(feature = "uniffi", feature = "cache"))]
+#[cfg(feature = "uniffi")]
 pub(crate) use self::uniffi::spawn_ordered_dispatch;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub use js_param::{JsParam, parse_tsify};

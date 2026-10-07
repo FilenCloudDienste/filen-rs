@@ -930,9 +930,11 @@ mod service_worker_impl {
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod unauth_js_client_impl {
 	use std::borrow::Cow;
+	#[cfg(feature = "uniffi")]
+	use std::sync::Arc;
 
 	#[cfg(feature = "uniffi")]
-	use crate::runtime::do_on_commander;
+	use crate::{js::spawn_ordered_dispatch, runtime::do_on_commander};
 	use crate::{
 		Error,
 		auth::js_impls::UnauthJsClient,
@@ -988,17 +990,28 @@ mod unauth_js_client_impl {
 		pub async fn download_linked_dir_to_zip(
 			&self,
 			dir: AnyLinkedDirWithContext,
-			callback: Option<std::sync::Arc<dyn ZipDownloadProgressCallback>>,
+			callback: Option<Arc<dyn ZipDownloadProgressCallback>>,
 		) -> Result<Vec<u8>, Error> {
-			let callback = callback.map(|cb| {
-				move |bw: u64, tb: u64, ip: u64, ti: u64| {
-					let callback = std::sync::Arc::clone(&cb);
-					tokio::task::spawn_blocking(move || {
-						callback.on_progress(bw, tb, ip, ti);
-					});
-				}
-			});
-			self.inner_download_linked_dir_to_zip(dir, callback).await
+			let Some(callback) = callback else {
+				return self
+					.inner_download_linked_dir_to_zip(dir, None::<fn(u64, u64, u64, u64)>)
+					.await;
+			};
+			let (sender, delivered) =
+				spawn_ordered_dispatch(move |(bw, tb, ip, ti): (u64, u64, u64, u64)| {
+					callback.on_progress(bw, tb, ip, ti);
+				});
+			let result = self
+				.inner_download_linked_dir_to_zip(
+					dir,
+					Some(move |bw: u64, tb: u64, ip: u64, ti: u64| {
+						let _ = sender.send((bw, tb, ip, ti));
+					}),
+				)
+				.await;
+			// the download dropped its sender: this returns once every report was delivered
+			let _ = delivered.await;
+			result
 		}
 	}
 
