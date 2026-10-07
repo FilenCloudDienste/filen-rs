@@ -144,6 +144,33 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+	use std::sync::atomic::AtomicBool;
+
+	use uuid::Uuid;
+
+	use super::{FSTree, WalkDirFromHashMap};
+	use crate::fs::{categories::Normal, dir::RemoteDirectory, file::RemoteFile};
+
+	/// The tree a listing of `files`, all directly under `root`, builds, without listing anything.
+	pub(crate) fn tree_of_files(
+		root: Uuid,
+		files: Vec<RemoteFile>,
+	) -> FSTree<RemoteDirectory, RemoteFile> {
+		let walker = WalkDirFromHashMap::<Normal>::new(root, Vec::new(), files)
+			.expect("a listing of parented files builds a walker");
+		super::super::build_fs_tree(
+			walker,
+			&mut |_| {},
+			&mut |_, _, _| {},
+			&AtomicBool::new(false),
+		)
+		.expect("an uncancelled build of a listing succeeds")
+		.0
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use chrono::Utc;
 
