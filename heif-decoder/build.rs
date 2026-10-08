@@ -292,6 +292,13 @@ fn config_cmake_for_libcxx(config: &mut Config) {
 
 fn build_libde265() -> PathBuf {
 	let mut config = Config::new("deps/libde265");
+	// Each cmake project needs its own out dir. cmake-rs builds in
+	// `<out_dir>/build` and deletes that whole tree when its CMakeCache.txt
+	// belongs to another project, so with both sharing `OUT_DIR`, libde265
+	// and libheif wiped each other on every run. The rebuild rewrote
+	// heif_version.h, which bindgen has cargo watch, so every cargo command
+	// reran this script and rebuilt both libraries from scratch.
+	config.out_dir(PathBuf::from(env::var("OUT_DIR").unwrap()).join("libde265"));
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
 	config_cmake_for_libcxx(&mut config);
@@ -602,6 +609,8 @@ fn run(command: &mut Command, what: &str) {
 
 fn build_libheif(libde265_path: &Path, dav1d_path: &Path) -> PathBuf {
 	let mut config = Config::new("deps/libheif");
+	// Its own out dir: see `build_libde265`.
+	config.out_dir(PathBuf::from(env::var("OUT_DIR").unwrap()).join("libheif"));
 	config_cmake_for_android(&mut config);
 	config_cmake_for_macos(&mut config);
 	config_cmake_for_libcxx(&mut config);
