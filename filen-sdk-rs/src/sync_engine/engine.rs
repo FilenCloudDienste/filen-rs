@@ -2623,13 +2623,27 @@ impl SyncEngine {
 
 		// The exact answer: both chains read from the SERVER to the account root, so a nesting is
 		// refused whether or not the cache has caught up with either folder — and a chain the server
-		// will not supply refuses the registration rather than let a pair through unchecked.
+		// will not supply refuses the registration rather than let a pair through unchecked. The one
+		// exception is a registered root the server reports gone, which has no chain to compare.
 		let account_root = self.client.root().uuid();
 		let candidate_chain = self.server_ancestry(remote_root, account_root).await?;
 		for record in &others {
-			let existing_chain = self
-				.server_ancestry(record.remote_root, account_root)
-				.await?;
+			let existing_chain = match self.server_ancestry(record.remote_root, account_root).await
+			{
+				Ok(chain) => chain,
+				// Gone from the server: a folder that does not exist neither contains the candidate
+				// nor sits inside it. Only a registered root gets this leniency; the candidate's own
+				// walk above still refuses a root the server does not have.
+				Err(error) if error.kind() == ErrorKind::FolderNotFound => {
+					tracing::warn!(
+						"add_pair: sync pair {}'s remote root {} is gone from the server ({error}); it relates to nothing",
+						record.id,
+						record.remote_root
+					);
+					continue;
+				}
+				Err(error) => return Err(error),
+			};
 			if let Some(overlap) = remote_overlap(
 				remote_root,
 				&candidate_chain,
@@ -2686,10 +2700,10 @@ impl SyncEngine {
 	/// Bounded three ways: at the account root, at [`MAX_REMOTE_ANCESTRY_DEPTH`] levels, and at a
 	/// parent already on the chain (a cycle no healthy server serves). A parent that is not a folder
 	/// at all — the trash, or one of the virtual parents — ends the walk too: there is no folder
-	/// chain above it to compare against. That last stop is what keeps a registered pair whose
-	/// remote root someone else deleted from wedging every later registration: the server still
-	/// answers for such a folder, with `Trash` as its parent, so the walk yields the root alone and
-	/// the pair simply relates to nothing (CONTROL-09c).
+	/// chain above it to compare against. A remote root someone else deleted reads as trashed until
+	/// the backend purges it, so the walk yields the root alone, and as not found after that, which
+	/// [`check_roots_free`](Self::check_roots_free) passes over for a registered pair. Either way
+	/// that pair relates to nothing and does not wedge every later registration (CONTROL-09c).
 	async fn server_ancestry(&self, uuid: Uuid, account_root: Uuid) -> Result<Vec<Uuid>, Error> {
 		let mut chain = vec![uuid];
 		let mut current = uuid;
