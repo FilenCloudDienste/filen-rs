@@ -84,6 +84,13 @@ pub enum DirEvent<'a> {
 		uuid: Uuid,
 		color: DirColor<'a>,
 	},
+	/// A folder restored from the trash (`folderRestore`). Unlike [`New`](Self::New), the cache
+	/// does not hold its contents: the trash cascaded them out of the cache, and the restore does
+	/// not send them again.
+	///
+	/// Last on purpose: the events store persists this enum's archived discriminants, and a
+	/// variant appended keeps every existing one (and so every queued row) as it was.
+	Restored(CacheableDir<'a>),
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -157,10 +164,12 @@ impl<'a> CacheEventType<'a> {
 				}
 				Err(e) => return Err((e, dir.uuid())),
 			},
-			DecryptedDriveEvent::FolderSubCreated(FolderSubCreated(dir))
-			| DecryptedDriveEvent::FolderRestore(FolderRestore(dir)) => {
+			DecryptedDriveEvent::FolderSubCreated(FolderSubCreated(dir)) => {
 				CacheEventType::Dir(DirEvent::New(dir.try_into().map_err(|e| (e, dir.uuid()))?))
 			}
+			DecryptedDriveEvent::FolderRestore(FolderRestore(dir)) => CacheEventType::Dir(
+				DirEvent::Restored(dir.try_into().map_err(|e| (e, dir.uuid()))?),
+			),
 			DecryptedDriveEvent::FolderColorChanged(FolderColorChanged { uuid, color }) => {
 				CacheEventType::Dir(DirEvent::ColorChanged {
 					uuid: *uuid,

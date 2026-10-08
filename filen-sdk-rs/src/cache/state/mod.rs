@@ -1283,7 +1283,9 @@ impl CacheState {
 				&& matches!(
 					&event.event,
 					CacheEventType::File(FileEvent::New(_) | FileEvent::Changed(_))
-						| CacheEventType::Dir(DirEvent::New(_) | DirEvent::Changed(_))
+						| CacheEventType::Dir(
+							DirEvent::New(_) | DirEvent::Restored(_) | DirEvent::Changed(_)
+						)
 				) {
 				let mut owners = anchor_owners.to_vec();
 				if let CacheEventType::File(FileEvent::New(file) | FileEvent::Changed(file)) =
@@ -1298,9 +1300,9 @@ impl CacheState {
 					CacheEventType::File(FileEvent::New(file) | FileEvent::Changed(file)) => {
 						file_batch.push(file)
 					}
-					CacheEventType::Dir(DirEvent::New(dir) | DirEvent::Changed(dir)) => {
-						dir_batch.push(dir)
-					}
+					CacheEventType::Dir(
+						DirEvent::New(dir) | DirEvent::Restored(dir) | DirEvent::Changed(dir),
+					) => dir_batch.push(dir),
 					_ => unreachable!("guarded by the matches! above"),
 				}
 				continue;
@@ -2223,7 +2225,7 @@ impl CacheState {
 				}
 			},
 			CacheEventType::Dir(dir_event) => match dir_event {
-				DirEvent::New(d) | DirEvent::Changed(d) => {
+				DirEvent::New(d) | DirEvent::Restored(d) | DirEvent::Changed(d) => {
 					self.extend_owning_roots(d.uuid, &mut owners)
 				}
 				DirEvent::Move(d) => {
@@ -2968,7 +2970,7 @@ impl CacheState {
 		trust: EventTrust,
 	) -> Result<(), Vec<CacheError>> {
 		match event {
-			DirEvent::New(dir) | DirEvent::Changed(dir) => {
+			DirEvent::New(dir) | DirEvent::Restored(dir) | DirEvent::Changed(dir) => {
 				// Skip the upsert for an out-of-root dir, but still advance the watermark. A dir that IS
 				// itself a sync root is the exception (same as the Move arm): a root whose own parent is
 				// out-of-root must still apply its own New/Changed, else its metadata goes stale.

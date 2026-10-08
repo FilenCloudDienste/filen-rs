@@ -583,7 +583,9 @@ fn event_uuids(event: &CacheEvent<'_>) -> [Option<Uuid>; 2] {
 			}
 		},
 		CacheEventType::Dir(dir) => match dir {
-			DirEvent::New(d) | DirEvent::Move(d) | DirEvent::Changed(d) => [Some(d.uuid), None],
+			DirEvent::New(d) | DirEvent::Restored(d) | DirEvent::Move(d) | DirEvent::Changed(d) => {
+				[Some(d.uuid), None]
+			}
 			DirEvent::Removed(uuid)
 			| DirEvent::MetadataChanged { uuid, .. }
 			| DirEvent::ColorChanged { uuid, .. } => [Some(*uuid), None],
