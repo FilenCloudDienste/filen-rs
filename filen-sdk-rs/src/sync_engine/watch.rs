@@ -213,7 +213,6 @@ pub enum WatchState {
 /// to a single action inside it, which surfaces as [`SyncEvent::ActionFailed`]) is otherwise
 /// invisible: the loop logs it and retries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct WatchStatus {
 	/// Passes that failed back to back; reset to zero by the next successful pass.
 	pub consecutive_failures: u32,

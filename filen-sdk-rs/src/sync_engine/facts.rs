@@ -585,8 +585,14 @@ mod tests {
 				("b".to_owned(), UnsyncableReason::RemoteBrokenParent),
 			]),
 			never_synced_remote: vec![
-				UnsyncablePath::new("a/c", UnsyncableReason::RemoteBrokenParent),
-				UnsyncablePath::new("a2", UnsyncableReason::RemoteUndecodable),
+				UnsyncablePath {
+					rel_path: "a/c".to_owned(),
+					reason: UnsyncableReason::RemoteBrokenParent,
+				},
+				UnsyncablePath {
+					rel_path: "a2".to_owned(),
+					reason: UnsyncableReason::RemoteUndecodable,
+				},
 			],
 			..PairFacts::default()
 		};
@@ -728,11 +734,11 @@ mod tests {
 				remote_uuid: Uuid::from_u128(7),
 			},
 		];
-		let conflicts = [PlannedConflict::new(
-			"clash.txt",
-			Some(PlannedNodeKind::File),
-			Some(PlannedNodeKind::File),
-		)];
+		let conflicts = [PlannedConflict {
+			rel_path: "clash.txt".to_owned(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::File),
+		}];
 		let failures = HashMap::from([
 			(
 				"stuck.txt".to_owned(),
