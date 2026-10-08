@@ -197,11 +197,15 @@ impl SyncReport {
 	pub fn held_deletions(&self) -> usize {
 		self.held
 			.iter()
-			.filter(|action| {
-				matches!(
-					action.kind,
-					PlannedActionKind::TrashRemote | PlannedActionKind::DeleteLocal
-				)
+			.filter(|action| match action.kind {
+				PlannedActionKind::TrashRemote | PlannedActionKind::DeleteLocal => true,
+				PlannedActionKind::UploadFile
+				| PlannedActionKind::DownloadFile
+				| PlannedActionKind::CreateRemoteDir
+				| PlannedActionKind::CreateLocalDir
+				| PlannedActionKind::MoveRemote { .. }
+				| PlannedActionKind::MoveLocal { .. }
+				| PlannedActionKind::AdoptBaseline => false,
 			})
 			.count()
 	}

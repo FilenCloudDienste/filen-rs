@@ -192,7 +192,6 @@ impl WatchHandle {
 /// What a watch loop is doing right now — and, once it has ended, WHY, which is what a caller
 /// cannot otherwise see coming.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum WatchState {
 	/// Live: running passes, or waiting for the next trigger.
 	#[default]

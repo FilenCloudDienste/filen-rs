@@ -48,7 +48,6 @@ impl fmt::Display for PlannedNodeKind {
 
 /// What a planned action would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum PlannedActionKind {
 	/// Push a local file's content to the remote.
 	UploadFile,
@@ -160,7 +159,6 @@ impl fmt::Display for PlannedConflict {
 
 /// Why a path cannot be synced at all, so the engine stopped planning it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum UnsyncableReason {
 	/// The local name is one the Filen backend rejects (a trailing dot or space, a reserved device
 	/// name, a forbidden character, an over-long name). No upload or remote create at this path can
@@ -262,7 +260,6 @@ impl fmt::Display for UnsyncablePath {
 /// Why the engine refused to run a pass at all. Both cases make a 1:1 path mapping between the two
 /// sides impossible, so NOTHING is applied until the caller resolves the collision by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RefuseReason {
 	/// Two remote items resolve to the same case-insensitive path.
 	RemoteCollision,
@@ -283,7 +280,6 @@ impl fmt::Display for RefuseReason {
 /// those back, and the failure counts against no path's failure streak (see
 /// [`SyncReport::halted`](super::SyncReport::halted)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum HaltReason {
 	/// The local disk has no room for another write (or a disk quota on it is used up).
 	LocalStorageFull,

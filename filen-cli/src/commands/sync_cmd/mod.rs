@@ -266,8 +266,11 @@ impl Output {
 			Update::Status(current) => {
 				self.status_line
 					.print_above(|| print_status_change(ui, &self.last_status, &current));
-				if matches!(current.state, WatchState::Stopped | WatchState::PairRemoved) {
-					return ControlFlow::Break(LoopEnd::WatchEnded);
+				match current.state {
+					WatchState::Stopped | WatchState::PairRemoved => {
+						return ControlFlow::Break(LoopEnd::WatchEnded);
+					}
+					WatchState::Running | WatchState::Paused => {}
 				}
 				self.last_status = current;
 			}
@@ -519,7 +522,17 @@ impl TransferRates {
 					self.direction(direction).dirs.pop_back();
 				}
 			}
-			_ => {}
+			SyncEvent::Refused { .. }
+			| SyncEvent::Planned { .. }
+			| SyncEvent::Conflict { .. }
+			| SyncEvent::DeletionsHeld { .. }
+			| SyncEvent::TrashingRemote { .. }
+			| SyncEvent::DeletingLocal { .. }
+			| SyncEvent::MovingRemote { .. }
+			| SyncEvent::MovingLocal { .. }
+			| SyncEvent::AdoptedBaseline { .. }
+			| SyncEvent::Quarantined { .. }
+			| SyncEvent::Interrupted { .. } => {}
 		}
 	}
 
@@ -670,7 +683,6 @@ fn print_event(ui: &mut UI, printed_failures: &mut HashSet<String>, event: &Sync
 		// Byte counts per transfer, several per second: too noisy for a line each, they add up to the
 		// rates on the status line instead.
 		SyncEvent::Progress { .. } => {}
-		other => ui.print_muted(&format!("{other:?}")),
 	}
 }
 
