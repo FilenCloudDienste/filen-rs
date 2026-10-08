@@ -11,16 +11,19 @@
 //! baseline-corruption seam. Every plan item that depends on one of those — and every fault-
 //! injection item (mid-pass stop, crash, corrupted baseline) — is written as an `#[ignore]` stub
 //! that records its plan, because faking it would assert nothing real.
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::auth::http::ClientConfig;
+use filen_sdk_rs::auth::unauth::UnauthClient;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
 use filen_sdk_rs::fs::{HasName, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	Backlog, CONFIRM_TENURE, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine,
-	SyncEvent, SyncMode, WatchConfig, WatchState,
+	SyncEvent, SyncMode, TransferDirection, WatchConfig, WatchState,
 };
 use uuid::Uuid;
 
@@ -43,8 +46,24 @@ async fn raw_setup(
 	std::path::PathBuf,
 ) {
 	let resources = test_utils::RESOURCES.get_resources().await;
+	let base = Arc::clone(&resources.client);
+	raw_setup_on(resources, &base, tag).await
+}
+
+/// [`raw_setup`] on `resources` that already exist, with the cache's client derived from `base`
+/// instead of the resources' own client, for a test that needs a client config of its own.
+async fn raw_setup_on(
+	resources: test_utils::TestResources,
+	base: &Arc<filen_sdk_rs::auth::Client>,
+	tag: &str,
+) -> (
+	test_utils::TestResources,
+	TestCache,
+	Uuid,
+	std::path::PathBuf,
+) {
 	let remote: Uuid = resources.dir.uuid();
-	let cache = TestCache::new(&resources.client, remote).await;
+	let cache = TestCache::new(base, remote).await;
 	wait_for_converged_resync(&cache.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
 	let local = fresh_local_dir(tag);
 	(resources, cache, remote, local)
@@ -138,6 +157,56 @@ async fn wait_for_first_upload(log: &EventLog) {
 			"the pass never got as far as uploading"
 		);
 		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+}
+
+/// How many uploads have reported bytes but not finished yet: transfers known to be running. An
+/// upload of a non-empty file reports its bytes once they land and its `Uploading` once it is done,
+/// so this counts each one from its first `Progress` to its `Uploading`, or to its `ActionFailed`:
+/// a failed upload is over too, and the pass's report names it.
+fn unfinished_uploads(log: &EventLog) -> usize {
+	let log = log.lock().unwrap();
+	let mut running = HashSet::new();
+	for event in log.iter() {
+		match event {
+			SyncEvent::Progress {
+				rel_path,
+				direction: TransferDirection::Upload,
+				..
+			} => {
+				running.insert(rel_path);
+			}
+			SyncEvent::Uploading { rel_path } | SyncEvent::ActionFailed { rel_path, .. } => {
+				running.remove(rel_path);
+			}
+			_ => {}
+		}
+	}
+	running.len()
+}
+
+/// Wait for the transfers a suspension let run on to finish, and return how many uploads the pass
+/// has reported by then. How long they take is the server's business: it answers their
+/// `upload/done` calls one at a time, so a full window of them lands over several seconds. Drained
+/// is no upload that reported bytes still unfinished, and the count then unchanged for `quiet`,
+/// which only has to cover a transfer that had started but not yet moved its bytes.
+async fn wait_for_drain(log: &EventLog, quiet: Duration) -> usize {
+	let deadline = std::time::Instant::now() + Duration::from_secs(60);
+	let mut count = uploads(log);
+	let mut since = std::time::Instant::now();
+	loop {
+		tokio::time::sleep(Duration::from_millis(250)).await;
+		let now = uploads(log);
+		if now != count || unfinished_uploads(log) > 0 {
+			count = now;
+			since = std::time::Instant::now();
+		} else if since.elapsed() >= quiet {
+			return count;
+		}
+		assert!(
+			std::time::Instant::now() < deadline,
+			"the transfers running when the pass was suspended never finished: {count} uploads"
+		);
 	}
 }
 
@@ -1412,9 +1481,20 @@ async fn control_18_pause_mid_pass_coherent() {
 #[shared_test_runtime]
 async fn control_18b_suspend_parks_and_resume_finishes_the_pass() {
 	const N: usize = 60;
-	const PARKED: Duration = Duration::from_secs(5);
+	// The client's request concurrency, which is also the pass's window of concurrent transfers: at
+	// most this many are running when the suspension lands.
+	const TRANSFER_WINDOW: usize = 16;
+	const QUIET: Duration = Duration::from_secs(2);
 
-	let (resources, cache, remote, local) = raw_setup("c18b").await;
+	let resources = test_utils::RESOURCES.get_resources().await;
+	// The pass's client runs on a config that names its transfer window, which the bound below uses.
+	let base = Arc::new(
+		UnauthClient::from_config(ClientConfig::default().with_concurrency(TRANSFER_WINDOW))
+			.unwrap()
+			.from_stringified(resources.client.to_stringified())
+			.unwrap(),
+	);
+	let (resources, cache, remote, local) = raw_setup_on(resources, &base, "c18b").await;
 	for i in 0..N {
 		write_file(
 			&local,
@@ -1459,15 +1539,22 @@ async fn control_18b_suspend_parks_and_resume_finishes_the_pass() {
 		.await
 		.unwrap();
 
-	// Parked: the transfers already in flight drain, and then nothing else starts. Two readings a
-	// while apart, the second equal to the first, is the action loop standing still.
-	tokio::time::sleep(PARKED).await;
-	let parked_at = uploads(&log);
-	tokio::time::sleep(PARKED).await;
-	assert_eq!(
-		uploads(&log),
-		parked_at,
-		"a suspended pass kept starting actions"
+	// Parked: the transfers already running finish, and nothing else starts. The pause is in force
+	// once the call returns, so what finishes after it is at most a window's worth: checked once
+	// those have drained, and again a while later. The count need not stand still after the drain:
+	// a transfer that got past the gate just before the pause and stalled before moving its bytes
+	// can still land then, inside the window.
+	let paused_at = uploads(&log);
+	let parked_at = wait_for_drain(&log, QUIET).await;
+	assert!(
+		parked_at <= paused_at + TRANSFER_WINDOW,
+		"a suspended pass kept starting actions: {parked_at} uploads, {paused_at} of them before the pause"
+	);
+	tokio::time::sleep(QUIET).await;
+	let settled = uploads(&log);
+	assert!(
+		settled <= paused_at + TRANSFER_WINDOW,
+		"a suspended pass started actions after its transfers had drained: {settled} uploads, {parked_at} at the drain, {paused_at} before the pause"
 	);
 	assert!(
 		(1..N).contains(&parked_at),
