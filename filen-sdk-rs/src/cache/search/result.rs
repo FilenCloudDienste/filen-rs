@@ -81,7 +81,6 @@ impl SearchHit {
 /// count — never a delta. Snapshots are ephemeral full replacements; treat each delivery as the
 /// window's new truth.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct SearchSnapshot {
 	/// The window's current contents (name-ascending, directories first, ties broken by uuid),
 	/// each paired with its [`parent_path`](SearchHit::parent_path) relative to the search root.

@@ -78,12 +78,18 @@ pub struct CacheSearchConfig {
 
 impl From<CacheSearchConfig> for SearchConfig {
 	fn from(config: CacheSearchConfig) -> Self {
-		let mut out = Self::new()
-			.with_item_type(config.item_type.map(Into::into).unwrap_or_default())
-			.with_recursive(config.recursive)
-			.with_case_sensitive(config.case_sensitive);
-		out.name = config.name;
-		out
+		let CacheSearchConfig {
+			name,
+			item_type,
+			recursive,
+			case_sensitive,
+		} = config;
+		Self {
+			name,
+			item_type: item_type.map(Into::into).unwrap_or_default(),
+			recursive,
+			case_sensitive,
+		}
 	}
 }
 
@@ -123,9 +129,13 @@ pub struct CacheSearchHit {
 
 impl From<SearchHit> for CacheSearchHit {
 	fn from(hit: SearchHit) -> Self {
+		let SearchHit {
+			result,
+			parent_path,
+		} = hit;
 		Self {
-			parent_path: String::from(hit.parent_path),
-			result: hit.result.into(),
+			parent_path: String::from(parent_path),
+			result: result.into(),
 		}
 	}
 }
@@ -146,10 +156,15 @@ pub struct CacheSearchSnapshot {
 
 impl From<SearchSnapshot> for CacheSearchSnapshot {
 	fn from(snapshot: SearchSnapshot) -> Self {
+		let SearchSnapshot {
+			results,
+			total,
+			live,
+		} = snapshot;
 		Self {
-			results: snapshot.results.into_iter().map(Into::into).collect(),
-			total: snapshot.total as u64,
-			live: snapshot.live,
+			results: results.into_iter().map(Into::into).collect(),
+			total: total as u64,
+			live,
 		}
 	}
 }
