@@ -128,7 +128,8 @@ async fn main() {
 							eprintln!("cache error: {error}");
 						}
 					}
-					_ => {}
+					CacheMessage::ResyncProgress(ResyncProgress::Started { .. })
+					| CacheMessage::SyncRootsDeleted(_) => {}
 				}
 			}
 		})

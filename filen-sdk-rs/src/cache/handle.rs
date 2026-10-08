@@ -72,7 +72,6 @@ pub enum CacheMessage {
 /// with no [`Listing`](Self::Listing) or [`Applying`](Self::Applying) in between; otherwise it
 /// relists.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ResyncProgress {
 	/// A resync attempt began. It first waits (bounded) on the drive lock, which another device
 	/// may hold — a contended attempt ends in [`Finished { converged: false }`](Self::Finished)

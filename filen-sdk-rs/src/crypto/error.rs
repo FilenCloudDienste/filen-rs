@@ -2,7 +2,6 @@ use cbc::cipher::block_padding::UnpadError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum ConversionError {
 	#[error("Failed to convert hex encoded string to Vec<u8>: `{0}`")]
 	HexDecodeError(#[from] hex::FromHexError),

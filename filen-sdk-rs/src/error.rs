@@ -95,7 +95,6 @@ impl_from!(ImageError, ErrorKind::ImageError);
 impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 
 /// Enum for all the error kinds that can occur in the SDK.
-#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
