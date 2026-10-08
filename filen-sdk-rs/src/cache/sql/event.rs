@@ -526,6 +526,89 @@ mod tests {
 				color: DirColor::Red,
 			}),
 		));
+		assert_roundtrip(ev(
+			Some(7),
+			CacheEventType::Dir(DirEvent::Restored(cacheable_dir())),
+		));
+	}
+
+	/// `CacheEvent` as archived before `DirEvent::Restored` existed: what a build from then wrote
+	/// to, and reads from, the events store. Only `DirEvent` changed, so the rest is today's.
+	mod before_restored {
+		use filen_types::api::v3::dir::color::DirColor;
+		use uuid::Uuid;
+
+		use crate::{
+			cache::state::{FileEvent, GlobalEvent},
+			fs::dir::{DecryptedDirectoryMeta, cache::CacheableDir},
+		};
+
+		#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+		pub(super) struct CacheEvent<'a> {
+			pub(super) id: Option<u64>,
+			pub(super) event: CacheEventType<'a>,
+		}
+
+		#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+		pub(super) enum CacheEventType<'a> {
+			File(FileEvent<'a>),
+			Dir(DirEvent<'a>),
+			Global(GlobalEvent),
+			NoOp,
+		}
+
+		#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+		pub(super) enum DirEvent<'a> {
+			New(CacheableDir<'a>),
+			Move(CacheableDir<'a>),
+			Changed(CacheableDir<'a>),
+			Removed(Uuid),
+			MetadataChanged {
+				uuid: Uuid,
+				meta: DecryptedDirectoryMeta<'a>,
+			},
+			ColorChanged {
+				uuid: Uuid,
+				color: DirColor<'a>,
+			},
+		}
+	}
+
+	/// A row queued before `Restored` was added still reads back as the event it was: the variant
+	/// is appended, so the archived discriminants and the archived size are unchanged.
+	#[test]
+	fn a_row_queued_before_restored_existed_reads_back_unchanged() {
+		let old = before_restored::CacheEvent {
+			id: Some(1),
+			event: before_restored::CacheEventType::Dir(before_restored::DirEvent::New(
+				cacheable_dir(),
+			)),
+		};
+		let bytes = rkyv::to_bytes::<Error>(&old).expect("serialize");
+
+		match deserialize(&bytes).expect("checked deserialize") {
+			CacheEvent {
+				id: Some(1),
+				event: CacheEventType::Dir(DirEvent::New(dir)),
+			} => assert_eq!(dir, cacheable_dir()),
+			other => panic!("expected the queued Dir(New), got {other:?}"),
+		}
+	}
+
+	/// A build from before `Restored` fails the checked read of a queued `Restored` row, rather than
+	/// misreading it as another event, so its drain quarantines the row.
+	#[test]
+	fn a_build_before_restored_rejects_a_queued_restored_row() {
+		let bytes = serialize(&ev(
+			Some(1),
+			CacheEventType::Dir(DirEvent::Restored(cacheable_dir())),
+		))
+		.expect("serialize");
+
+		assert!(
+			rkyv::from_bytes::<before_restored::CacheEvent<'static>, Error>(&bytes).is_err(),
+			"the old type must not accept a discriminant it does not have"
+		);
 	}
 
 	#[test]

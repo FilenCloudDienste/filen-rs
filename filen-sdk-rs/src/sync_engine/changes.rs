@@ -446,7 +446,10 @@ impl RemoteChange {
 				})),
 			},
 			CacheEventType::Dir(dir) => match dir {
-				DirEvent::New(d) | DirEvent::Move(d) | DirEvent::Changed(d) => {
+				DirEvent::New(d)
+				| DirEvent::Restored(d)
+				| DirEvent::Move(d)
+				| DirEvent::Changed(d) => {
 					Some(Self::Upsert(RemoteItem {
 						uuid: d.uuid,
 						parent: d.parent,

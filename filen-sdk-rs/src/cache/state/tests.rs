@@ -4,8 +4,13 @@ use crate::cache::sql::columns::{
 	PRAGMA_SYNCHRONOUS, PRAGMA_TEMP_STORE,
 };
 use crate::cache::test_support::rewrite_behind_sqlite;
-use crate::fs::{dir::meta::DirectoryMeta, file::meta::FileMeta};
-use filen_types::{crypto::EncryptedString, fs::ParentUuid};
+use crate::fs::{
+	dir::meta::{DecryptedDirectoryMeta, DirectoryMeta},
+	file::meta::FileMeta,
+};
+use crate::socket::{DecryptedDriveEvent, FolderRestore, FolderSubCreated};
+use chrono::DateTime;
+use filen_types::{api::v3::dir::color::DirColor, crypto::EncryptedString, fs::ParentUuid};
 use std::borrow::Cow;
 
 /// Unit constructors have no resync deps, so these futures never touch the network — a minimal
@@ -347,6 +352,48 @@ fn folder_move_to_virtual_parent_becomes_removed() {
 			event: CacheEventType::Dir(DirEvent::Removed(removed)),
 		})) => assert_eq!(removed, expected),
 		other => panic!("expected a Dir(Removed) event, got {other:?}"),
+	}
+}
+
+/// A `folderRestore` converts to `Restored` and a `folderSubCreated` to `New`: the trash cascaded
+/// a restored folder's contents out of the cache, while a new folder has none to miss.
+#[test]
+fn folder_restore_converts_to_restored_and_folder_sub_created_to_new() {
+	let dir = |uuid: u128| {
+		RemoteDirectory::from_meta(
+			Uuid::from_u128(uuid),
+			ParentUuid::Uuid(Uuid::from_u128(1)),
+			DirColor::Default,
+			false,
+			DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid timestamp"),
+			DirectoryMeta::Decoded(DecryptedDirectoryMeta {
+				name: Cow::Borrowed("folder"),
+				created: None,
+			}),
+		)
+	};
+	let restored = DecryptedSocketEvent::Drive {
+		inner: DecryptedDriveEvent::FolderRestore(FolderRestore(dir(2))),
+		drive_message_id: 7,
+	};
+	let created = DecryptedSocketEvent::Drive {
+		inner: DecryptedDriveEvent::FolderSubCreated(FolderSubCreated(dir(3))),
+		drive_message_id: 8,
+	};
+
+	match CacheEventMaybeDecrypted::from_decrypted_event(&restored) {
+		Some(CacheEventMaybeDecrypted::Decrypted(CacheEvent {
+			id: Some(7),
+			event: CacheEventType::Dir(DirEvent::Restored(dir)),
+		})) => assert_eq!(dir.uuid, Uuid::from_u128(2)),
+		other => panic!("expected a Dir(Restored) event, got {other:?}"),
+	}
+	match CacheEventMaybeDecrypted::from_decrypted_event(&created) {
+		Some(CacheEventMaybeDecrypted::Decrypted(CacheEvent {
+			id: Some(8),
+			event: CacheEventType::Dir(DirEvent::New(dir)),
+		})) => assert_eq!(dir.uuid, Uuid::from_u128(3)),
+		other => panic!("expected a Dir(New) event, got {other:?}"),
 	}
 }
 
