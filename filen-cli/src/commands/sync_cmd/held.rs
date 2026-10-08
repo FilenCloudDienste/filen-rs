@@ -47,32 +47,44 @@ pub(super) enum Update {
 
 impl Update {
 	/// Whether this is about a single item, of which a pass reports any number, and may be dropped
-	/// past [`MAX_DEFERRED_ITEMS`]. Everything else is kept, so a new per-item [`SyncEvent`] variant
-	/// has to be added here to be bounded.
+	/// past [`MAX_DEFERRED_ITEMS`]. Everything else is kept. The match names every [`SyncEvent`]
+	/// variant, so a new one does not compile until it is sorted into one side or the other.
 	///
 	/// [`SyncEvent::Quarantined`] is about one item but always kept: it is the only place the bin
 	/// path of a copy moved aside is named (the pass report does not print it), and no later pass
 	/// says it again. Each one is a copy really moved, so they are as many as the data says, not as
 	/// many as the time the question stays open allows.
 	fn is_item(&self) -> bool {
-		matches!(
-			self,
+		match self {
 			Self::Event(
 				SyncEvent::Conflict { .. }
-					| SyncEvent::Uploading { .. }
-					| SyncEvent::Downloading { .. }
-					// Never reaches a question: `Output::deliver` drops progress ticks first.
-					| SyncEvent::Progress { .. }
-					| SyncEvent::CreatingRemoteDir { .. }
-					| SyncEvent::CreatingLocalDir { .. }
-					| SyncEvent::TrashingRemote { .. }
-					| SyncEvent::DeletingLocal { .. }
-					| SyncEvent::MovingRemote { .. }
-					| SyncEvent::MovingLocal { .. }
-					| SyncEvent::ActionFailed { .. }
-					| SyncEvent::AdoptedBaseline { .. }
+				| SyncEvent::Uploading { .. }
+				| SyncEvent::Downloading { .. }
+				// Never reaches a question: `Output::deliver` drops progress ticks first.
+				| SyncEvent::Progress { .. }
+				| SyncEvent::CreatingRemoteDir { .. }
+				| SyncEvent::CreatingLocalDir { .. }
+				| SyncEvent::TrashingRemote { .. }
+				| SyncEvent::DeletingLocal { .. }
+				| SyncEvent::MovingRemote { .. }
+				| SyncEvent::MovingLocal { .. }
+				| SyncEvent::ActionFailed { .. }
+				| SyncEvent::AdoptedBaseline { .. },
+			) => true,
+			Self::Event(
+				SyncEvent::PassStarted { .. }
+				| SyncEvent::Refused { .. }
+				| SyncEvent::Planned { .. }
+				| SyncEvent::DeletionsHeld { .. }
+				| SyncEvent::Quarantined { .. }
+				| SyncEvent::Interrupted { .. }
+				| SyncEvent::PassCompleted { .. }
+				| SyncEvent::PassFailed { .. },
 			)
-		)
+			| Self::Status(_)
+			| Self::Notice(_)
+			| Self::NotPrinted(_) => false,
+		}
 	}
 }
 
@@ -261,10 +273,12 @@ fn answer_from(token: String, result: Result<Result<bool, InquireError>, JoinErr
 /// remote view that never converged and a remote that listed nothing are what a missing mount or a
 /// backend fault look like: those batches stay held until the condition clears.
 fn approvable(reason: &GuardReason) -> bool {
-	matches!(
-		reason,
-		GuardReason::ExceededThreshold { .. } | GuardReason::FirstSyncWithDeletions { .. }
-	)
+	match reason {
+		GuardReason::ExceededThreshold { .. } | GuardReason::FirstSyncWithDeletions { .. } => true,
+		GuardReason::ScanIncomplete
+		| GuardReason::RemoteUnconverged { .. }
+		| GuardReason::RemoteEmptied { .. } => false,
+	}
 }
 
 /// The held items, one indented line each: the first [`MAX_LISTED`], then how many more there are.

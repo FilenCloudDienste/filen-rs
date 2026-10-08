@@ -796,7 +796,10 @@ impl RemoteView {
 			UnsyncableReason::RemoteUndecodable | UnsyncableReason::RemoteInvalidName { .. } => {
 				!is_hidden(&skip.rel_path, skip.path_is_dir)
 			}
-			_ => true,
+			UnsyncableReason::InvalidName { .. }
+			| UnsyncableReason::RepeatedFailure { .. }
+			| UnsyncableReason::RemoteBrokenParent
+			| UnsyncableReason::LocalAlias { .. } => true,
 		});
 		kept
 	}

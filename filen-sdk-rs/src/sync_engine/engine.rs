@@ -1556,7 +1556,6 @@ impl SyncEngine {
 /// [`SyncEngine::add_pair`] needing the network: a server error refuses the registration instead of
 /// registering a pair whose roots were never actually checked.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum PairOverlap {
 	/// Another pair already syncs this exact local folder.
 	#[error("sync pair {pair} already syncs the local root {existing:?}")]
@@ -5756,7 +5755,7 @@ fn withhold_deletions_over_unreachable(
 						{
 							Some(Origin::File { dir: rules }.to_string())
 						}
-						_ => None,
+						IgnoreLevel::Default | IgnoreLevel::User | IgnoreLevel::File { .. } => None,
 					},
 				));
 				if !unreachable {

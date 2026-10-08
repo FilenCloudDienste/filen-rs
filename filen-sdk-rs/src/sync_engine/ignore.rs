@@ -110,7 +110,6 @@ impl fmt::Display for Origin<'_> {
 
 /// The level the rule that ignores a path comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum IgnoreLevel {
 	/// [`DEFAULT_IGNORE_PATTERNS`].
 	Default,
