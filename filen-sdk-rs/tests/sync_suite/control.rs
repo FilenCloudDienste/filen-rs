@@ -20,11 +20,12 @@ use filen_sdk_rs::auth::http::ClientConfig;
 use filen_sdk_rs::auth::unauth::UnauthClient;
 use filen_sdk_rs::fs::categories::{DirType, Normal};
 use filen_sdk_rs::fs::file::traits::HasFileInfo;
-use filen_sdk_rs::fs::{HasName, HasUUID};
+use filen_sdk_rs::fs::{HasName, HasParent, HasUUID};
 use filen_sdk_rs::sync_engine::{
 	Backlog, CONFIRM_TENURE, IgnoreLevel, IgnoredPath, PauseMode, PauseOptions, SyncEngine,
 	SyncEvent, SyncMode, TransferDirection, WatchConfig, WatchState,
 };
+use filen_types::fs::ParentUuid;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -2468,17 +2469,31 @@ async fn control_09b_nested_remote_root_refused_before_the_cache_knows_it() {
 
 /// CONTROL-09c — a registered pair whose remote root someone else DELETED must not wedge every
 /// later registration. `add_pair` walks each registered root's ancestry on the server, so a root
-/// that will not resolve would refuse a registration the caller never asked about. It does not: the
-/// server keeps answering for a trashed-and-emptied folder, with `Trash` as its parent, and the
-/// walk stops there — the deleted pair relates to nothing and the new pair goes in. This pins that,
-/// because the alternative (an error out of the walk) is invisible until someone hits it.
+/// that will not resolve would refuse a registration the caller never asked about. The server
+/// answers for a deleted folder in one of two ways: as trashed (with `Trash` as its parent) until
+/// the backend purges it, then as not found. Either answer leaves the pair relating to nothing,
+/// and the new pair goes in. Both states are pinned here without waiting on the purge: a pair on a
+/// uuid the server never had stands in for the purged root (the server answers both alike), and a
+/// trashed root for the one still in the trash.
 #[shared_test_runtime]
 async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
 	let (resources, cache, _root, local_a) = raw_setup("c09ca").await;
 	let local_b = fresh_local_dir("c09cb");
-	let engine = SyncEngine::open(cache.client.clone(), temp_cache_path())
+	let local_gone = fresh_local_dir("c09cg");
+	// The engine's client has no cache, so every overlap decision below is the server walk's. With
+	// one, the cache hears of the nested folder below before its registration and refuses it first,
+	// and the walk past the gone roots to the live pair is never exercised.
+	let engine = SyncEngine::open(derive_client(&cache.client), temp_cache_path())
 		.await
 		.unwrap();
+
+	// The first pair a caller registers has no other pair to overlap, so the server is not asked
+	// about its root at all. Registered on a uuid the server never had, it is a pair whose remote
+	// root has been purged.
+	engine
+		.add_pair(local_gone.clone(), Uuid::new_v4(), SyncMode::TwoWay)
+		.await
+		.expect("the first pair registers without the server being asked about its root");
 
 	let root_dt = DirType::<Normal>::Dir(std::borrow::Cow::Borrowed(&resources.dir));
 	let mut doomed = cache
@@ -2490,18 +2505,34 @@ async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
 	engine
 		.add_pair(local_a.clone(), doomed_uuid, SyncMode::TwoWay)
 		.await
-		.unwrap();
+		.expect(
+			"a pair must register even when another pair's remote root is gone from the server",
+		);
 
-	// Another client trashes the pair's remote root and empties the trash out from under it.
-	resources.client.trash_dir(&mut doomed).await.unwrap();
-	resources
+	// Another client trashes the pair's remote root. It is deleted for good only at the end, as the
+	// backend purges a deleted folder seconds later; the first pair already stands for that state.
+	// The trash lock is held from here to that delete: another test's account-wide empty-trash
+	// would otherwise purge `doomed` mid-test, and the registrations below would never see it
+	// trashed.
+	let _trash_lock = resources
 		.client
-		.delete_dir_permanently(doomed)
+		.acquire_lock_with_default(test_utils::locks::TRASH)
 		.await
 		.unwrap();
+	resources.client.trash_dir(&mut doomed).await.unwrap();
+	assert_eq!(
+		*resources
+			.client
+			.get_dir(doomed_uuid)
+			.await
+			.unwrap()
+			.parent(),
+		ParentUuid::Trash(resources.dir.uuid()),
+		"the walks below must find the pair's root trashed, not gone"
+	);
 
-	// A brand-new sibling folder, plainly disjoint from the deleted one. Registering it must not
-	// fail on the OTHER pair's root failing to resolve.
+	// A brand-new sibling folder, plainly disjoint from the deleted ones. Registering it must not
+	// fail on the OTHER pairs' roots failing to resolve.
 	let fresh = cache
 		.client
 		.create_dir(&root_dt, "c09c_fresh")
@@ -2510,14 +2541,14 @@ async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
 	let pair_b = engine
 		.add_pair(local_b.clone(), fresh.uuid(), SyncMode::TwoWay)
 		.await
-		.expect("a disjoint pair must register even when another pair's remote root is gone");
+		.expect("a disjoint pair must register even when another pair's remote root is trashed");
 
 	let pairs = engine.list_pairs().await.unwrap();
-	assert_eq!(pairs.len(), 2, "{pairs:?}");
+	assert_eq!(pairs.len(), 3, "{pairs:?}");
 	assert!(pairs.iter().any(|p| p.id == pair_b), "{pairs:?}");
 
 	// The registration still relates what it CAN: a root nested under the surviving pair is
-	// refused, so degrading the gone root did not degrade the check itself.
+	// refused, so passing over the gone roots did not degrade the check itself.
 	let nested = resources
 		.client
 		.create_dir(
@@ -2537,9 +2568,15 @@ async fn control_09c_a_deleted_pair_root_does_not_block_a_new_pair() {
 		"the refusal must name the nesting: {error}"
 	);
 
+	resources
+		.client
+		.delete_dir_permanently(doomed)
+		.await
+		.unwrap();
 	std::fs::remove_dir_all(&local_a).ok();
 	std::fs::remove_dir_all(&local_b).ok();
 	std::fs::remove_dir_all(&local_c).ok();
+	std::fs::remove_dir_all(&local_gone).ok();
 }
 
 /// CONTROL-09 — overlapping REMOTE roots are refused: the same remote folder outright, and a
