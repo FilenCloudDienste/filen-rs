@@ -43,6 +43,31 @@ defaults, commit attribution lines included.
   `clean-rust-filen-rs` for any Rust, `types-serde-conventions` for API and binding types,
   `commit-work` and `fold-fixups` for history. Agents that do not load skills: `AGENTS.md`.
 
+## Agent sessions and workflows
+
+- Keep work queued, above all before nights and weekends. When the user has already named
+  the next stage, or your report recommends a follow-up that needs no decision, launch it
+  in the same turn. Launch the decision-independent part of a plan before asking anything,
+  and put every open question into one AskUserQuestion call instead of asking them one at a
+  time; a pending question must not hold back work that could run. Stop for the user only
+  for the maintainer-approval list under Contributing, a change to shipped behaviour, or a
+  design fork with no recommended default. A change too large for one agent is split (the
+  seam first, then one agent per call site or file, then an integrator), not declined;
+  escalate only if the split also fails.
+- Shape a multi-commit workflow as a pipeline: review increment N while N+1 is being
+  implemented. Fixers write `fixup!`/`amend!` commits against N instead of amending HEAD,
+  and the lane ends with one `fold-fixups` pass. One validator per lane runs the full live
+  suite (see Test notes). Set `model` explicitly on every agent (an unset one inherits the
+  main session's model) and give each a stable `label` such as `impl:<increment>` or
+  `fix:<increment>:<n>`.
+- Waiting on a long run: a workflow agent's prompt cache expires after about 5 minutes, so
+  a blocking wait longer than that makes the next turn re-write its whole context. In a
+  workflow agent keep each blocking wait (`sleep`, `until` loop, `timeout`) under about
+  270 s and re-issue it until the run finishes. In the main session, launch the run with
+  `run_in_background` and end the turn; its completion notification resumes you. Start a
+  fresh agent per increment with a short handoff note instead of carrying one agent past
+  about 200k tokens of context.
+
 ## Build & Test Commands
 
 ```bash
@@ -89,6 +114,17 @@ Test notes:
   drive-mutating tests (notably `cache_tests`) serialize on it. Expect long wall-clock times
   and avoid running several test binaries in one parallel pool — contention starves the
   convergence polls and tests start failing.
+- Run live tests in tiers. While iterating on an increment, run the unit tests plus only the
+  live tests for what you touched (`--test <target> -- <module or test filter>`). Run a full
+  live target once per finished stage or branch tip, and before handing the branch over,
+  not after every commit: each full drive-mutating suite takes tens of minutes and holds
+  the lock for all of it. After a failure, rerun the failing test alone
+  (`-- --exact <path::name>`) before rerunning the suite.
+- The scheduled `test.yml` run (cron 00:00 UTC, often starting late, about 4 h) takes the
+  same `drive-write` lock. If your test account is the one CI uses, do not start a full
+  live run between 00:00 and 05:00 UTC, or check
+  `gh run list -R FilenCloudDienste/filen-rs --workflow test.yml --limit 1` first: an
+  overlapping run gets about 2x slower and fails tests that pass alone.
 - `dir_tests::size` sleeps ~80 minutes waiting out the backend's throttled size
   recomputation, so it is `#[ignore]`d. Run it explicitly with
   `cargo test -p filen-sdk-rs --test dir_tests size -- --ignored` when you mean to exercise
