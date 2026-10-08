@@ -1997,38 +1997,50 @@ impl Prepared {
 	/// Every path this pass will not act on, and why — reported identically by the dry run and by
 	/// the pass itself, so a caller sees the same list either way.
 	fn unsyncable(&self) -> Vec<UnsyncablePath> {
-		let names = self.facts.invalid_names.iter().map(|(rel_path, detail)| {
-			UnsyncablePath::new(
-				rel_path.clone(),
-				UnsyncableReason::InvalidName {
+		let names = self
+			.facts
+			.invalid_names
+			.iter()
+			.map(|(rel_path, detail)| UnsyncablePath {
+				rel_path: rel_path.clone(),
+				reason: UnsyncableReason::InvalidName {
 					detail: detail.clone(),
 				},
-			)
-		});
-		let mut all: Vec<UnsyncablePath> =
-			names
-				.chain(self.failures.iter().map(|(rel_path, failure)| {
-					UnsyncablePath::new(
-						rel_path.clone(),
-						UnsyncableReason::RepeatedFailure {
+			});
+		let mut all: Vec<UnsyncablePath> = names
+			.chain(
+				self.failures
+					.iter()
+					.map(|(rel_path, failure)| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: UnsyncableReason::RepeatedFailure {
 							attempts: failure.attempts,
 							last_error: failure.last_error.clone(),
 						},
-					)
-				}))
-				.chain(self.facts.unknown_remote.iter().map(|(rel_path, reason)| {
-					UnsyncablePath::new(rel_path.clone(), reason.clone())
-				}))
-				.chain(self.facts.never_synced_remote.iter().cloned())
-				.chain(self.facts.aliased_dirs.iter().map(|(rel_path, target)| {
-					UnsyncablePath::new(
-						rel_path.clone(),
-						UnsyncableReason::LocalAlias {
+					}),
+			)
+			.chain(
+				self.facts
+					.unknown_remote
+					.iter()
+					.map(|(rel_path, reason)| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: reason.clone(),
+					}),
+			)
+			.chain(self.facts.never_synced_remote.iter().cloned())
+			.chain(
+				self.facts
+					.aliased_dirs
+					.iter()
+					.map(|(rel_path, target)| UnsyncablePath {
+						rel_path: rel_path.clone(),
+						reason: UnsyncableReason::LocalAlias {
 							target: target.clone(),
 						},
-					)
-				}))
-				.collect();
+					}),
+			)
+			.collect();
 		// One stable order, so a caller diffing consecutive reports sees only real changes.
 		all.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 		all
@@ -2157,13 +2169,11 @@ impl Prepared {
 		roots
 			.into_iter()
 			.filter(|(_, (decision, tracked))| *tracked || decision.level != IgnoreLevel::Default)
-			.map(|(path, (decision, tracked))| {
-				IgnoredPath::new(
-					path,
-					decision.level.clone(),
-					decision.pattern.clone(),
-					tracked,
-				)
+			.map(|(path, (decision, tracked))| IgnoredPath {
+				rel_path: path.to_owned(),
+				level: decision.level.clone(),
+				pattern: decision.pattern.clone(),
+				tracked,
 			})
 			.collect()
 	}
@@ -4844,12 +4854,10 @@ impl SyncEngine {
 			.await?
 			.map_err(|e| db_error(e, "loading the held conflicts"))?
 			.into_iter()
-			.map(|entry| {
-				PlannedConflict::new(
-					entry.rel_path,
-					entry.local_kind.map(PlannedNodeKind::from),
-					entry.remote_kind.map(PlannedNodeKind::from),
-				)
+			.map(|entry| PlannedConflict {
+				rel_path: entry.rel_path,
+				local: entry.local_kind.map(PlannedNodeKind::from),
+				remote: entry.remote_kind.map(PlannedNodeKind::from),
 			})
 			.collect())
 	}

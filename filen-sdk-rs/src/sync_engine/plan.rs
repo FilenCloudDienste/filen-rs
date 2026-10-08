@@ -1065,7 +1065,10 @@ pub(crate) fn unknown_remote_paths(
 			unknown.insert(path, item.reason.clone());
 			continue;
 		}
-		let report = UnsyncablePath::new(item.rel_path.clone(), item.reason.clone());
+		let report = UnsyncablePath {
+			rel_path: item.rel_path.clone(),
+			reason: item.reason.clone(),
+		};
 		// Two undecodable items in one directory, or the items under one skipped directory, report
 		// the same line; once is enough.
 		if !never_synced.contains(&report) {
