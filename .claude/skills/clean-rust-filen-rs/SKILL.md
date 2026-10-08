@@ -295,6 +295,18 @@ its second occurrence.
   approved, keep an alias and make the change a standalone commit.
 - A new job matches its sibling's semantics (limits, conflict handling, cancellation,
   error states). Document every intended difference at the site.
+- No `#[non_exhaustive]` on an enum or a struct without asking the maintainer first. A new
+  variant or field should fail to compile wherever the enum is matched or the struct is
+  built or destructured, so every consumer is updated on purpose; `#[non_exhaustive]`
+  trades that for `_ =>` arms and `..` patterns that silently swallow the addition, and a
+  `#[doc(hidden)]` constructor that exists only to get around the attribute is no
+  substitute for a struct literal. For the same reason, match the workspace's own enums
+  exhaustively, without `_ =>` or `other =>` arms, unless the arm genuinely means "every
+  other variant, now and later". Likewise, build and destructure the workspace's own
+  structs without `..` where the code should see a new field, as in a conversion between a
+  type and its FFI mirror, and keep `..` where ignoring the other fields is the intent.
+  Adding a variant to a public enum, or a public field to a public struct, is then a
+  breaking change, which the maintainer signs off on like a rename.
 
 ### Drive lock and concurrency
 
@@ -369,5 +381,5 @@ its second occurrence.
 9. `bash scripts/git-hooks/pre-commit` passes.
 10. Docs are updated in the same commit, and nothing shipped was renamed or reworded
     without sign-off.
-11. No zeroize, `unsafe`, `vendor/`, `[patch]`, binary file or new dependency went in
-    without the maintainer's approval.
+11. No zeroize, `unsafe`, `vendor/`, `[patch]`, binary file, new dependency or
+    `#[non_exhaustive]` enum or struct went in without the maintainer's approval.
