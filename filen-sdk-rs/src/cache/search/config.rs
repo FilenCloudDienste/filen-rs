@@ -2,11 +2,9 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Filter/shape configuration for a cache-backed search (see
 /// [`Client::create_search`](crate::auth::Client::create_search)). Construct via
-/// [`SearchConfig::new`] / [`Default`] plus the chainable `with_*` setters; the struct is
-/// `#[non_exhaustive]` so future filters (size, mime, date, more sort orders, …) slot in without
-/// a breaking change. v1 sorts by name ascending (directories first, ties broken by uuid).
+/// [`SearchConfig::new`] / [`Default`] plus the chainable `with_*` setters. v1 sorts by name
+/// ascending (directories first, ties broken by uuid).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct SearchConfig {
 	/// Substring match on item names. The needle is Unicode-normalized (trim + NFC) and — unless
 	/// [`case_sensitive`](Self::case_sensitive) — matched case-insensitively with Unicode simple
