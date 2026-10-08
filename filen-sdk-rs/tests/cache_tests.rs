@@ -10,7 +10,6 @@ use filen_sdk_rs::cache::{
 	CacheError, CacheEvent, CacheMessage, ResyncProgress, SyncRootCallback, SyncRootHandle,
 };
 use filen_sdk_rs::{
-	ErrorKind,
 	auth::Client,
 	fs::{HasParent, HasUUID, dir::meta::DirectoryMetaChanges, file::meta::FileMetaChanges},
 	io::{RemoteDirectory, RemoteFile},
@@ -925,18 +924,21 @@ async fn test_cache_reopen_lists_a_listed_root_a_dir_was_restored_in() {
 	drop(lock);
 }
 
-/// A sync root PERMANENTLY DELETED server-side while the cache is closed: registrations do not
+/// A sync root the server no longer has, gone while the cache is closed: registrations do not
 /// survive a worker restart, so re-adding the root on reopen runs the `add_sync_root` validation —
 /// the server answers not-found and the add is REJECTED with `CacheError::InvalidSyncRoot` (the bad
 /// key never re-enters the active set) AND the stale subtree the prior session cached under the
 /// root is wiped. The stale handle from the previous session stays inert and its drop is a harmless
 /// no-op. (The LIVE not-found classification inside a running resync — drop + wipe +
 /// `SyncRootsDeleted` — is covered deterministically by the `finalize_resync` unit tests.)
+///
+/// The gone root is a uuid the server never had, injected into the cache: `/v3/dir` answers a
+/// permanently deleted dir as trashed until the backend purges it, which has no bound (it once took
+/// over 300 s), and answers a uuid it never had with the same `folder_not_found` as a purged one.
 #[shared_test_runtime]
 async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	let resources = test_utils::RESOURCES.get_resources().await;
 	let client = derive_client(resources.client.as_ref());
-	let test_dir = &resources.dir;
 	let path = temp_cache_path();
 	let (messages, status_cb) = capturing_status_callback();
 	client
@@ -944,86 +946,61 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 		.await
 		.unwrap();
 
-	// The subdir that will be the sole sync root, plus a child so there is a populated subtree.
-	let mut root_dir = client
-		.create_dir(&test_dir.into(), "cache_resync_deleted_root")
+	// Session 1: a real dir is the sole sync root, and the cache holds the gone root under it, with
+	// a child, and a sibling of the gone root.
+	let live = client
+		.create_dir(&(&resources.dir).into(), "cache_readd_live")
 		.await
 		.unwrap();
-	let root_uuid: Uuid = root_dir.uuid();
-	let child = client
-		.create_dir(&(&root_dir).into(), "child")
+	let (stale_handle, _) = open_session(&client, live.uuid(), &messages).await;
+	// A listing of `live` wipes the injected dirs, so the session's startup check goes first.
+	settle_session_start(&client, &live, &path, &messages).await;
+	let gone = make_test_remote_dir("cache_readd_gone_root", live.uuid());
+	let child = make_test_remote_dir("child", gone.uuid());
+	let sibling = make_test_remote_dir("sibling", live.uuid());
+	let (gone_uuid, child_uuid, sibling_uuid) = (gone.uuid(), child.uuid(), sibling.uuid());
+	stale_handle
+		.update_list_dir_recursive(vec![gone, child, sibling], vec![])
 		.await
 		.unwrap();
-	let child_uuid: Uuid = child.uuid();
-
-	// Session 1: selective sync of ONLY `root_dir`; populate via the convergence resync, then flush.
-	let since = messages_len(&messages);
-	let stale_handle = client
-		.clone()
-		.add_sync_root(root_uuid, noop_sync_root_callback())
-		.await
-		.unwrap();
-	// One convergence resync lists the whole `root_dir` subtree, so awaiting its converged signal
-	// covers both the root and its child — then the rows are already committed.
-	assert!(
-		wait_for_converged_resync(&messages, root_uuid, since, CACHE_CONVERGE_TIMEOUT).await,
-		"the convergence resync should converge"
-	);
-	assert!(
-		poll_for_item(&path, root_uuid, Duration::from_secs(5)).await,
-		"the sync root should be cached after the convergence resync"
-	);
-	assert!(
-		poll_for_item(&path, child_uuid, Duration::from_secs(5)).await,
-		"the child should be cached after the convergence resync"
-	);
-	client.flush_cache().await;
-
-	// Permanently delete the root (and its subtree) while the cache is offline.
-	client.trash_dir(&mut root_dir).await.unwrap();
-	client.delete_dir_permanently(root_dir).await.unwrap();
-
-	// The `/v3/dir` metadata lookup is eventually-consistent: a permanently-deleted dir keeps resolving
-	// for a few seconds before the server reports it gone. Wait for that to settle BEFORE re-adding, so
-	// the validating `get_dir` deterministically sees the not-found.
-	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-	loop {
-		match client.get_dir(root_uuid).await {
-			Err(e) if e.kind() == ErrorKind::FolderNotFound => break,
-			_ => {
-				assert!(
-					tokio::time::Instant::now() < deadline,
-					"the server never reported the permanently-deleted root as gone"
-				);
-				tokio::time::sleep(Duration::from_millis(500)).await;
-			}
-		}
+	for uuid in [gone_uuid, child_uuid, sibling_uuid] {
+		assert!(
+			poll_for_item(&path, uuid, Duration::from_secs(10)).await,
+			"the injected dir {uuid} should be cached"
+		);
 	}
+	client.flush_cache().await;
 
 	// Session 2: the app re-adds the root it has not yet learned is gone — validation rejects it.
 	let err = client
 		.clone()
-		.add_sync_root(root_uuid, noop_sync_root_callback())
+		.add_sync_root(gone_uuid, noop_sync_root_callback())
 		.await
-		.expect_err("re-adding a permanently-deleted sync root must be rejected");
+		.expect_err("re-adding a sync root the server no longer has must be rejected");
 	assert!(
 		matches!(
 			err.downcast_ref::<CacheError>(),
-			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == root_uuid
+			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == gone_uuid
 		),
-		"the rejection should carry CacheError::InvalidSyncRoot for the deleted root, got {err:?}"
+		"the rejection should carry CacheError::InvalidSyncRoot for the gone root, got {err:?}"
 	);
 
 	// The definitive not-found also wiped the stale subtree session 1 cached under the root —
 	// without it those rows would be stranded forever (membership-gated out of live events,
 	// anchored by no resync diff), serving deleted content to any DB reader.
 	assert!(
-		poll_for_item_absent(&path, root_uuid, Duration::from_secs(30)).await,
-		"the deleted root's stale row must be wiped by the rejected re-add"
+		poll_for_item_absent(&path, gone_uuid, Duration::from_secs(30)).await,
+		"the gone root's stale row must be wiped by the rejected re-add"
 	);
 	assert!(
 		poll_for_item_absent(&path, child_uuid, Duration::from_secs(30)).await,
-		"the deleted root's stale subtree must be cascade-wiped by the rejected re-add"
+		"the gone root's stale subtree must be cascade-wiped by the rejected re-add"
+	);
+	// A listing of `live` would have taken the sibling too, so it staying shows the rows went with
+	// the rejected re-add.
+	assert!(
+		query_item_type(&path, sibling_uuid).is_some(),
+		"the gone root's sibling must survive the rejected re-add"
 	);
 
 	// The stale session-1 handle is inert (its worker is gone); dropping it must be a no-op.
