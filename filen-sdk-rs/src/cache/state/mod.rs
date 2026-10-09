@@ -1904,7 +1904,8 @@ impl CacheState {
 	///
 	/// VALIDATION: a subdir `uuid` is checked with `get_dir` BEFORE it is inserted, so a bad key
 	/// can never enter `sync_roots` and make every later resync's `get_dir` fail (which would
-	/// re-trigger a resync on each event: a tight loop). A DEFINITIVE not-found rejects with
+	/// re-trigger a resync on each event: a tight loop). A DEFINITIVE not-found, or a dir the server
+	/// reports in the trash (a live `folderTrash` drops a root the same way), rejects with
 	/// [`CacheError::InvalidSyncRoot`] and ALSO wipes any stale subtree a prior session cached under
 	/// the uuid — re-adding after a restart is the only path that learns about an offline deletion,
 	/// and without the wipe those rows would be stranded forever (membership-gated out of live
@@ -1950,13 +1951,33 @@ impl CacheState {
 		}
 		if uuid != self.root_uuid
 			&& let Some(deps) = self.resync.clone()
-			&& let Err(e) = deps.client.get_dir(uuid).await
 		{
-			let error = if matches!(
-				e.kind(),
-				ErrorKind::FolderNotFound | ErrorKind::FileNotFound
-			) {
-				tracing::warn!("AddSyncRoot {uuid}: directory no longer exists ({e}); rejecting");
+			// The server answers for a trashed dir, with the trash as its parent. A live
+			// `folderTrash` removes a root exactly like a delete does, so a trashed root is gone too.
+			let gone = match deps.client.get_dir(uuid).await {
+				Ok(dir) if dir.parent.is_trash() => {
+					Some("the directory is in the trash".to_owned())
+				}
+				Ok(_) => None,
+				Err(e)
+					if matches!(
+						e.kind(),
+						ErrorKind::FolderNotFound | ErrorKind::FileNotFound
+					) =>
+				{
+					Some(e.to_string())
+				}
+				Err(e) => {
+					tracing::warn!(
+						"AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting"
+					);
+					let error = CacheError::sync_root_unavailable(uuid, e.to_string());
+					let _ = ack.send(Err(Box::new(error)));
+					return false;
+				}
+			};
+			if let Some(message) = gone {
+				tracing::warn!("AddSyncRoot {uuid}: directory is gone ({message}); rejecting");
 				// Definitively gone: wipe the stale cached subtree from any prior session
 				// (the cascade trigger recurses). The cascade also wipes any still-registered
 				// NESTED root, so snapshot + drop + notify those first, exactly like the socket
@@ -1975,15 +1996,10 @@ impl CacheState {
 					)),
 					Err(e) => self.surface_one(e),
 				}
-				CacheError::invalid_sync_root(uuid, e.to_string())
-			} else {
-				tracing::warn!(
-					"AddSyncRoot {uuid}: validation failed transiently ({e}); rejecting"
-				);
-				CacheError::sync_root_unavailable(uuid, e.to_string())
-			};
-			let _ = ack.send(Err(Box::new(error)));
-			return false;
+				let error = CacheError::invalid_sync_root(uuid, message);
+				let _ = ack.send(Err(Box::new(error)));
+				return false;
+			}
 		}
 		// The get_dir validation above is the only network await between control-message receipt
 		// and the ack; logging its successful side too keeps the registration path gap-free for

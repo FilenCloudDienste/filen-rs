@@ -2394,7 +2394,7 @@ impl SyncEngine {
 	/// supersede events a deletion or a re-upload produces, which never make the written uuid
 	/// appear in a snapshot at all.
 	///
-	/// Best-effort: a root the cache refuses (deleted, unreachable) leaves that pair on the
+	/// Best-effort: a root the cache refuses (deleted, trashed, unreachable) leaves that pair on the
 	/// [`PENDING_CREATE_GRACE`] fallback rather than failing the whole engine. The watch loop
 	/// registers its own subscription for wakeups; the two are independent.
 	async fn observe_pair(&self, pair: PairId, remote_root: Uuid) {

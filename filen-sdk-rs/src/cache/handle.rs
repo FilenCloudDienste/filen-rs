@@ -333,8 +333,9 @@ impl Client {
 	/// Errors if [`configure_cache`](Client::configure_cache) was never called, or if validation
 	/// rejects `uuid` (it runs on the worker — the future resolves once the registration is live,
 	/// which can wait on an in-flight resync). Downcast the error to [`CacheError`] to branch:
-	/// [`CacheError::InvalidSyncRoot`] means the directory definitively no longer exists (any stale
-	/// subtree a prior session cached under it has been wiped — do not retry);
+	/// [`CacheError::InvalidSyncRoot`] means the directory definitively no longer exists or is in
+	/// the trash (any stale subtree a prior session cached under it has been wiped — do not retry
+	/// unless it is restored);
 	/// [`CacheError::SyncRootUnavailable`] means the validation itself failed (network/server —
 	/// retry the same uuid). Must be called from within the app's Tokio runtime.
 	///

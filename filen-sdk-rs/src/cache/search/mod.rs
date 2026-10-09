@@ -132,7 +132,8 @@ impl Client {
 	/// Errors if [`configure_cache`](Client::configure_cache) was never called, or if
 	/// validation rejects `uuid` — downcast to [`CacheError`](crate::cache::CacheError) to
 	/// branch: [`InvalidSyncRoot`](crate::cache::CacheError::InvalidSyncRoot) means the
-	/// directory definitively no longer exists (do not retry);
+	/// directory definitively no longer exists or is in the trash (do not retry unless it is
+	/// restored);
 	/// [`SyncRootUnavailable`](crate::cache::CacheError::SyncRootUnavailable) means the check
 	/// itself failed (network — retry the same uuid). Must be called from within the app's
 	/// Tokio runtime.
