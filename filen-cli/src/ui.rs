@@ -17,8 +17,6 @@ use crate::{
 	CliArgs, EXIT_CODE_ERROR_PREFIX, completion::async_completions_available, util::RemotePath,
 };
 
-const FILEN_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
-
 pub(crate) struct CustomLogger {
 	pub(crate) config: ftail::Config,
 	/// Whether to redact things that depend on the runtime environment, like: paths, ...
@@ -123,7 +121,13 @@ impl UI {
 
 	/// Print a colorful banner at the top of the application (contains app name and version)
 	pub(crate) fn print_banner(&mut self) {
-		self.print_banner_(FILEN_CLI_VERSION);
+		self.print_banner_(
+			if self.make_output_environment_agnostic_for_replay_testing {
+				"X.X.X"
+			} else {
+				env!("CARGO_PKG_VERSION")
+			},
+		);
 	}
 	fn print_banner_(&mut self, version: &str) {
 		let banner_text = format!("Filen CLI v{}", version);
@@ -593,10 +597,17 @@ impl Autocomplete for InquireCompleter {
 /// Redact output that depends on the runtime environment, so it can be matched in Manuel replay testing:
 /// - Environment variables: $HOME, $MANUEL_TMP, $MANUEL_REMOTE_CWD, $MANUEL_EMAIL
 fn make_output_environment_agnostic_for_replay_testing(mut output: String) -> String {
+	output = output.replace(
+		env!("CARGO_PKG_VERSION"),
+		&style(format!("{} version {}", "{{", "}}"))
+			.yellow()
+			.bold()
+			.to_string(),
+	);
 	for environment_variable in ["HOME", "MANUEL_TMP", "MANUEL_REMOTE_CWD", "MANUEL_EMAIL"] {
-		if let Ok(home_path) = std::env::var(environment_variable) {
+		if let Ok(env_var_value) = std::env::var(environment_variable) {
 			output = output.replace(
-				&home_path,
+				&env_var_value,
 				&style(format!("{} ${} {}", "{{", environment_variable, "}}"))
 					.yellow()
 					.bold()

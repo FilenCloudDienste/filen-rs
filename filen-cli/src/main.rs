@@ -236,7 +236,11 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
-	info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+	if cfg!(debug_assertions) {
+		info!("Filen CLI (version omitted for replay testing)")
+	} else {
+		info!("Filen CLI v{}", env!("CARGO_PKG_VERSION"));
+	}
 
 	ui.initialize(
 		cli_args.quiet,

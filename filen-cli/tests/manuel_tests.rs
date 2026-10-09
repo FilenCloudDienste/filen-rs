@@ -37,5 +37,6 @@ async fn run_manuel_tests() {
 		true,
 		std::time::Duration::from_secs(300),
 		!write_diffs_to_file,
+		false,
 	);
 }
