@@ -1081,6 +1081,214 @@ async fn test_cache_re_add_of_trashed_sync_root_is_rejected() {
 		.unwrap();
 }
 
+/// Whether a resync that lists `root` has run to its end from index `since` on, and if so whether it
+/// converged: a `Started` naming it, the `Applying` its listing ends with, then its `Finished`.
+fn listing_resync_outcome(log: &MessageLog, root: Uuid, since: usize) -> Option<bool> {
+	let mut covers_root = false;
+	let mut applied = false;
+	for msg in log.lock().unwrap().iter().skip(since) {
+		match msg {
+			CacheMessage::ResyncProgress(ResyncProgress::Started { roots }) => {
+				covers_root = roots.contains(&root);
+				applied = false;
+			}
+			CacheMessage::ResyncProgress(ResyncProgress::Applying) => applied = covers_root,
+			CacheMessage::ResyncProgress(ResyncProgress::Finished { converged }) if applied => {
+				return Some(*converged);
+			}
+			_ => {}
+		}
+	}
+	None
+}
+
+/// The dirs [`check_resync_drops_roots_in_an_unheard_trash`] can register: `trashed` goes to the
+/// trash, and `nested` is in it.
+struct TrashedTree {
+	trashed: Uuid,
+	nested: Uuid,
+}
+
+/// Sync roots in a dir trashed while the cache does not hear it. `/v3/dir` still answers for a dir in
+/// the trash, and for one anywhere under a trashed dir, with the trash as its parent, so the resync
+/// must read that answer the way the live `folderTrash` is read: it drops each root, wipes the subtree
+/// cached under it and reports it in `SyncRootsDeleted`, and it converges. Read as live, a root's
+/// listing fails (`folder_inside_trash`), so every resync skips it as unreachable and retries it, and
+/// its rows stay. A root directly inside another one the resync drops goes with it, even when its own
+/// reads still answer as live.
+///
+/// The tree is `name/trashed/nested/inner`, and `pick` chooses the roots among `trashed` and
+/// `nested`, outermost first. `trashed` goes to the trash while no cache runs, and the roots are
+/// registered again through the covered fast path, which does not validate: the previous session's
+/// rows still link them to `name`, added as a root just before them. Evicting it then leaves them
+/// the only roots, so no listing of an ancestor takes them out. The drive lock, held by another
+/// client than the cache's, keeps every resync from listing until then, so the first one to list
+/// reads the picked roots alone.
+async fn check_resync_drops_roots_in_an_unheard_trash(
+	name: &str,
+	pick: impl FnOnce(&TrashedTree) -> Vec<Uuid>,
+) {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let path = temp_cache_path();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
+
+	// Session 1: the parent is the sync root, and its add caches the dir to trash and the dirs in it.
+	let parent = client
+		.create_dir(&(&resources.dir).into(), name)
+		.await
+		.unwrap();
+	let mut trashed = client
+		.create_dir(&(&parent).into(), "trashed")
+		.await
+		.unwrap();
+	let nested = client
+		.create_dir(&(&trashed).into(), "nested")
+		.await
+		.unwrap();
+	let inner = client.create_dir(&(&nested).into(), "inner").await.unwrap();
+	let (session, _) = open_session(&client, parent.uuid(), &messages).await;
+	for uuid in [trashed.uuid(), nested.uuid(), inner.uuid()] {
+		assert!(
+			poll_for_item(&path, uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"the add caches {uuid}"
+		);
+	}
+	close_session(&client, session).await;
+	let mut roots = pick(&TrashedTree {
+		trashed: trashed.uuid(),
+		nested: nested.uuid(),
+	});
+	let outermost = roots[0];
+	roots.sort_unstable();
+
+	// The dir goes to the trash while no session is listening. The trash lock keeps another leg's
+	// account-wide empty-trash from purging it before the resync reads it; taken first, as the
+	// drive lock the trash also takes is shared in-process with the one held here.
+	let _trash_lock = resources
+		.client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let drive_lock = resources.client.lock_drive().await.unwrap();
+	resources.client.trash_dir(&mut trashed).await.unwrap();
+	// For a moment after a trash the server can still answer for a dir under the trashed one as
+	// live, and a root reached only through its own reads cannot be told apart from a live one then.
+	// Wait until the cache's client reads the outermost root in the trash; what lies inside it is
+	// left to the resync.
+	let deadline = tokio::time::Instant::now() + CACHE_CONVERGE_TIMEOUT;
+	while !client.get_dir(outermost).await.unwrap().parent().is_trash() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the server answers for {outermost} in the trash"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+
+	// Session 2: the parent's add acks before its resync, which waits for the drive lock. The picked
+	// dirs' cached rows hang under the now active parent, so their adds register them unchecked.
+	let since = messages_len(&messages);
+	let parent_session = client
+		.clone()
+		.add_sync_root(parent.uuid(), noop_sync_root_callback())
+		.await
+		.unwrap();
+	let mut sessions = Vec::with_capacity(roots.len());
+	for root in &roots {
+		sessions.push(
+			client
+				.clone()
+				.add_sync_root(*root, noop_sync_root_callback())
+				.await
+				.expect("the covered add registers a dir in the trash without validating it"),
+		);
+	}
+	parent_session.evict().await.unwrap();
+	drop(drive_lock);
+
+	poll_until(CACHE_CONVERGE_TIMEOUT, || {
+		listing_resync_outcome(&messages, outermost, since).is_some()
+	})
+	.await;
+	let outcome = listing_resync_outcome(&messages, outermost, since);
+	let (reported, log) = {
+		let guard = messages.lock().unwrap();
+		let log = &guard[since..];
+		let mut reported: Vec<Uuid> = log
+			.iter()
+			.filter_map(|msg| match msg {
+				CacheMessage::SyncRootsDeleted(dropped) => Some(dropped.iter().copied()),
+				_ => None,
+			})
+			.flatten()
+			.collect();
+		reported.sort_unstable();
+		(reported, format!("{log:?}"))
+	};
+	// Everything cached at or under a dropped root goes, which is `nested` and `inner` either way.
+	let left: Vec<Uuid> = roots
+		.iter()
+		.copied()
+		.chain([nested.uuid(), inner.uuid()])
+		.filter(|uuid| query_item_type(&path, *uuid).is_some())
+		.collect();
+	// Clean up before asserting, so a failure leaves nothing in the trash either.
+	drop(sessions);
+	client.flush_cache().await;
+	resources
+		.client
+		.delete_dir_permanently(trashed)
+		.await
+		.unwrap();
+
+	assert_eq!(
+		outcome,
+		Some(true),
+		"a resync lists the roots once the drive lock is free, and converges: {log:?}"
+	);
+	assert_eq!(
+		reported, roots,
+		"the resync reports exactly the roots in the trash deleted: {log:?}"
+	);
+	assert!(
+		left.is_empty(),
+		"the rows at and under the dropped roots are wiped, left: {left:?}"
+	);
+}
+
+/// A registered sync root trashed while the cache does not hear it.
+#[shared_test_runtime]
+async fn test_cache_resync_drops_a_registered_sync_root_in_the_trash() {
+	check_resync_drops_roots_in_an_unheard_trash("cache_resync_trashed_parent", |tree| {
+		vec![tree.trashed]
+	})
+	.await;
+}
+
+/// A registered sync root inside a dir, not itself a sync root, that is trashed while the cache does
+/// not hear it.
+#[shared_test_runtime]
+async fn test_cache_resync_drops_a_sync_root_under_a_trashed_dir() {
+	check_resync_drops_roots_in_an_unheard_trash("cache_resync_under_trashed_parent", |tree| {
+		vec![tree.nested]
+	})
+	.await;
+}
+
+/// A registered sync root trashed while the cache does not hear it, with another registered root
+/// nested in it: both are dropped and reported, the nested one not left registered without rows.
+#[shared_test_runtime]
+async fn test_cache_resync_drops_a_trashed_sync_root_and_one_nested_in_it() {
+	check_resync_drops_roots_in_an_unheard_trash("cache_resync_trashed_nested_parent", |tree| {
+		vec![tree.trashed, tree.nested]
+	})
+	.await;
+}
+
 #[shared_test_runtime]
 async fn test_cache_ignores_irrelevant_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;

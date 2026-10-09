@@ -1194,6 +1194,155 @@ fn finalize_resync_drops_a_server_deleted_root() {
 	assert!(!state.needs_resync().unwrap(), "the resync flag clears");
 }
 
+/// A registered root the server reported trashed, with another registered root inside it whose own
+/// reads still came back live (the server answers for a dir under a just-trashed one as live for a
+/// moment): `finalize_resync` drops and reports both, and stores nothing of the inner one's listing.
+#[test]
+fn finalize_resync_drops_a_root_listed_inside_a_dropped_root() {
+	let mut state = CacheState::new_in_memory();
+	let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(8);
+	state.msg_sender = msg_tx;
+	let trashed = cache_dir(1, state.root_uuid);
+	let nested = cache_dir(2, trashed.uuid);
+	let inner = Uuid::from_u128(3);
+	state.upsert_dirs([&trashed, &nested].into_iter()).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(trashed.uuid, Box::new(|_| {}));
+	sync_roots.insert(nested.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw: vec![(
+				nested.uuid,
+				Some(listed_dir(2, trashed.uuid)),
+				vec![listed_dir(3, nested.uuid)],
+				Vec::new(),
+			)],
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: vec![trashed.uuid],
+			any_transient: false,
+			remote_under_lock: 100,
+		})
+		.unwrap();
+
+	for uuid in [trashed.uuid, nested.uuid, inner] {
+		assert!(!item_exists(&state, uuid), "{uuid} is not cached");
+	}
+	assert!(state.sync_roots.is_empty(), "both roots are dropped");
+	let msg = msg_rx.try_recv().expect("a SyncRootsDeleted message");
+	assert!(
+		matches!(&msg[..], [CacheMessage::SyncRootsDeleted(roots)] if *roots == [trashed.uuid, nested.uuid]),
+		"the notification names both roots, got {msg:?}"
+	);
+	assert!(!state.needs_resync().unwrap(), "the resync converged");
+}
+
+/// A registered root cached inside a root the server reported trashed, but listed under another
+/// parent: it was moved out before the trash, so `finalize_resync` keeps it and stores its listing.
+#[test]
+fn finalize_resync_keeps_a_root_listed_outside_the_dropped_root_it_was_cached_in() {
+	let mut state = CacheState::new_in_memory();
+	let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(8);
+	state.msg_sender = msg_tx;
+	let trashed = cache_dir(1, state.root_uuid);
+	let moved = cache_dir(2, trashed.uuid);
+	let inner = Uuid::from_u128(3);
+	state.upsert_dirs([&trashed, &moved].into_iter()).unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(trashed.uuid, Box::new(|_| {}));
+	sync_roots.insert(moved.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw: vec![(
+				moved.uuid,
+				Some(listed_dir(2, state.root_uuid)),
+				vec![listed_dir(3, moved.uuid)],
+				Vec::new(),
+			)],
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: vec![trashed.uuid],
+			any_transient: false,
+			remote_under_lock: 100,
+		})
+		.unwrap();
+
+	assert!(
+		!item_exists(&state, trashed.uuid),
+		"the trashed root is gone"
+	);
+	assert!(item_exists(&state, moved.uuid), "the moved root is stored");
+	assert!(item_exists(&state, inner), "its listing is stored");
+	assert_eq!(
+		state.sync_roots.keys().copied().collect::<Vec<_>>(),
+		[moved.uuid],
+		"only the trashed root is dropped"
+	);
+	let msg = msg_rx.try_recv().expect("a SyncRootsDeleted message");
+	assert!(
+		matches!(&msg[..], [CacheMessage::SyncRootsDeleted(roots)] if *roots == [trashed.uuid]),
+		"the notification names the trashed root alone, got {msg:?}"
+	);
+}
+
+/// A registered root cached two levels inside a root the server reported trashed, listed as live
+/// under the dir between them. That dir may still be inside the trashed root (the server answering
+/// as live for a moment) or may have been moved out unheard, so `finalize_resync` neither drops the
+/// root nor stores its listing, and leaves the resync to retry it.
+#[test]
+fn finalize_resync_retries_a_root_listed_under_a_dir_cached_inside_the_dropped_root() {
+	let mut state = CacheState::new_in_memory();
+	let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(8);
+	state.msg_sender = msg_tx;
+	let trashed = cache_dir(1, state.root_uuid);
+	let mid = cache_dir(2, trashed.uuid);
+	let nested = cache_dir(3, mid.uuid);
+	let inner = Uuid::from_u128(4);
+	state
+		.upsert_dirs([&trashed, &mid, &nested].into_iter())
+		.unwrap();
+	let mut sync_roots: HashMap<Uuid, SyncRootCallback> = HashMap::new();
+	sync_roots.insert(trashed.uuid, Box::new(|_| {}));
+	sync_roots.insert(nested.uuid, Box::new(|_| {}));
+	state.set_test_sync_roots(sync_roots);
+
+	state
+		.finalize_resync(ResyncListing {
+			per_root_raw: vec![(
+				nested.uuid,
+				Some(listed_dir(3, mid.uuid)),
+				vec![listed_dir(4, nested.uuid)],
+				Vec::new(),
+			)],
+			file_root_heads: Vec::new(),
+			deleted_file_roots: Vec::new(),
+			file_transient: Vec::new(),
+			deleted_roots: vec![trashed.uuid],
+			any_transient: false,
+			remote_under_lock: 100,
+		})
+		.unwrap();
+
+	assert_eq!(
+		state.sync_roots.keys().copied().collect::<Vec<_>>(),
+		[nested.uuid],
+		"only the trashed root is dropped"
+	);
+	let msg = msg_rx.try_recv().expect("a SyncRootsDeleted message");
+	assert!(
+		matches!(&msg[..], [CacheMessage::SyncRootsDeleted(roots)] if *roots == [trashed.uuid]),
+		"the notification names the trashed root alone, got {msg:?}"
+	);
+	assert!(!item_exists(&state, inner), "the listing is not stored");
+	assert!(state.needs_resync().unwrap(), "the resync retries");
+}
+
 /// `finalize_resync` must NOT advance the watermark or clear `needs_resync` when EVERY root failed to
 /// list with a transient (non-not-found) error: committing an empty convergence would jump the
 /// watermark past — and clear the flag for — a gap that was never reconciled (silent data loss). A
