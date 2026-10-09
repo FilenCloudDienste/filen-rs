@@ -36,9 +36,10 @@ pub enum CacheError {
 	/// panic was caught so other roots/events still apply. The string is the root uuid + panic payload.
 	SyncRootCallbackPanic(String),
 	/// An `AddSyncRoot` uuid is DEFINITIVELY not a reachable directory (the server reported
-	/// not-found), so the root was NOT added — and any stale subtree a prior session cached under it
-	/// has been wiped. `message` is the underlying SDK error. Re-issue `add_sync_root` with a valid
-	/// uuid; retrying the same one is pointless.
+	/// not-found, or the directory is in the trash), so the root was NOT added — and any stale
+	/// subtree a prior session cached under it has been wiped. `message` is the underlying SDK error,
+	/// or says the directory is in the trash. Re-issue `add_sync_root` with a valid uuid; retrying
+	/// the same one is pointless until the directory is restored.
 	InvalidSyncRoot {
 		uuid: uuid::Uuid,
 		message: String,

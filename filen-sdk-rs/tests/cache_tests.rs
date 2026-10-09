@@ -1008,6 +1008,79 @@ async fn test_cache_re_add_of_permanently_deleted_sync_root_is_rejected() {
 	client.flush_cache().await;
 }
 
+/// A sync root trashed while the cache is closed. `/v3/dir` still answers for a trashed dir, with
+/// the trash as its parent, so re-adding the root on reopen must read that answer the way the live
+/// `folderTrash` is read: the add is REJECTED with `CacheError::InvalidSyncRoot` and the subtree the
+/// prior session cached under the root is wiped. Accepted, the root would sit in the active set with
+/// a node no resync can store (its parent is the trash) and its stale rows would never go.
+#[shared_test_runtime]
+async fn test_cache_re_add_of_trashed_sync_root_is_rejected() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = derive_client(resources.client.as_ref());
+	let path = temp_cache_path();
+	let (messages, status_cb) = capturing_status_callback();
+	client
+		.configure_cache(path.clone(), status_cb)
+		.await
+		.unwrap();
+
+	// Session 1: a real dir with a child dir is the sole sync root, and the add caches both.
+	let mut trashed = client
+		.create_dir(&(&resources.dir).into(), "cache_readd_trashed_root")
+		.await
+		.unwrap();
+	let child = client
+		.create_dir(&(&trashed).into(), "child")
+		.await
+		.unwrap();
+	let (session, _) = open_session(&client, trashed.uuid(), &messages).await;
+	for uuid in [trashed.uuid(), child.uuid()] {
+		assert!(
+			poll_for_item(&path, uuid, CACHE_CONVERGE_TIMEOUT).await,
+			"the add caches {uuid}"
+		);
+	}
+	close_session(&client, session).await;
+
+	// Another client trashes the root while no session is listening. The trash lock keeps another
+	// leg's account-wide empty-trash from purging it before session 2 reads it as trashed.
+	let _trash_lock = resources
+		.client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	resources.client.trash_dir(&mut trashed).await.unwrap();
+
+	// Session 2: the app re-adds the root it has not yet learned is trashed, and validation rejects it.
+	let err = client
+		.clone()
+		.add_sync_root(trashed.uuid(), noop_sync_root_callback())
+		.await
+		.expect_err("re-adding a sync root that is in the trash must be rejected");
+	assert!(
+		matches!(
+			err.downcast_ref::<CacheError>(),
+			Some(CacheError::InvalidSyncRoot { uuid, .. }) if *uuid == trashed.uuid()
+		),
+		"the rejection should carry CacheError::InvalidSyncRoot for the trashed root, got {err:?}"
+	);
+	assert!(
+		poll_for_item_absent(&path, trashed.uuid(), Duration::from_secs(30)).await,
+		"the trashed root's stale row must be wiped by the rejected re-add"
+	);
+	assert!(
+		poll_for_item_absent(&path, child.uuid(), Duration::from_secs(30)).await,
+		"the trashed root's stale subtree must be cascade-wiped by the rejected re-add"
+	);
+	client.flush_cache().await;
+
+	resources
+		.client
+		.delete_dir_permanently(trashed)
+		.await
+		.unwrap();
+}
+
 #[shared_test_runtime]
 async fn test_cache_ignores_irrelevant_events() {
 	let resources = test_utils::RESOURCES.get_resources().await;
