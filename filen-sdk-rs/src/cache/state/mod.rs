@@ -2221,6 +2221,64 @@ impl CacheState {
 			.collect()
 	}
 
+	/// Settle the listings in `per_root_raw` that a root in `deleted_roots` may hold, and return the
+	/// rest along with whether any root was left for a retry. Right after a dir is trashed, the server
+	/// can for a moment still answer for a dir under it as live, its listing included.
+	///
+	/// A root whose fresh parent is itself in `deleted_roots` is inside it: it moves over to
+	/// `deleted_roots`, as a live `folderTrash` takes every root nested in the trashed dir, instead of
+	/// staying registered with its rows stored again under a wiped ancestor. A root whose fresh parent
+	/// is only CACHED under one is either such a live answer or was moved out, with a dir above it,
+	/// while the cache did not hear it, and nothing fresh tells the two apart: it is neither dropped
+	/// nor stored, and the retry reads it again once the dropped root is no longer registered. MUST be
+	/// called BEFORE the delete erases that cached ancestry.
+	fn take_roots_listed_inside(
+		&self,
+		per_root_raw: Vec<RootListing>,
+		deleted_roots: &mut Vec<Uuid>,
+	) -> Result<(Vec<RootListing>, bool), Box<CacheError>> {
+		if deleted_roots.is_empty() {
+			return Ok((per_root_raw, false));
+		}
+		let mut kept = Vec::with_capacity(per_root_raw.len());
+		let mut deferred = false;
+		for listing in per_root_raw {
+			// The account root has no node and lies inside nothing.
+			let Some(ParentUuid::Uuid(parent)) = listing.1.as_ref().map(|node| node.parent) else {
+				kept.push(listing);
+				continue;
+			};
+			if deleted_roots.contains(&parent) {
+				tracing::warn!(
+					"resync: sync root {} lists inside sync root {parent}, which the server reported \
+					 gone; dropping it",
+					listing.0
+				);
+				deleted_roots.push(listing.0);
+			} else if self
+				.ancestors_of(parent)
+				.map_err(|e| {
+					CacheError::db(
+						e,
+						format!("reading the ancestry of sync root {}", listing.0),
+					)
+				})?
+				.iter()
+				.any(|ancestor| deleted_roots.contains(ancestor))
+			{
+				tracing::debug!(
+					"resync: sync root {} lists under {parent}, cached inside a sync root the server \
+					 reported gone; retrying it",
+					listing.0
+				);
+				deferred = true;
+			} else {
+				kept.push(listing);
+			}
+		}
+		Ok((kept, deferred))
+	}
+
 	/// Drop server-deleted sync roots from the active set and notify the app. After this the
 	/// roots no longer gate membership or receive dispatch; the app must re-issue `add_sync_root` to
 	/// resume syncing them (e.g. if the directory is restored from trash).
@@ -2697,9 +2755,10 @@ impl CacheState {
 		let island = async {
 			let remote_under_lock = deps.client.get_last_event_ids().await?.drive;
 			let mut per_root_raw: Vec<RootListing> = Vec::with_capacity(sync_roots.len());
-			// Roots the server reported GONE (a definitive not-found): `finalize_resync` deletes their
-			// cached subtrees, drops them from the active set, and notifies the app. Kept distinct from a
-			// transient skip so a deleted root is removed rather than re-listed (and re-failed) forever.
+			// Roots the server reported GONE (a definitive not-found, or a dir in the trash or under a
+			// trashed dir): `finalize_resync` deletes their cached subtrees, drops them from the active
+			// set, and notifies the app. Kept distinct from a transient skip so a deleted root is
+			// removed rather than re-listed (and re-failed) forever.
 			let mut deleted_roots: Vec<Uuid> = Vec::new();
 			// Set when a root fails with a NON-not-found (network/server) error. `finalize_resync` uses it
 			// to keep an all-transient resync from advancing the watermark past a gap it never reconciled.
@@ -2710,6 +2769,16 @@ impl CacheState {
 					None
 				} else {
 					match deps.client.get_dir(*root).await {
+						// The server still answers for a dir in the trash, and for one anywhere under a
+						// trashed dir, with the trash as its parent, and its listing fails
+						// (`folder_inside_trash`). A live `folderTrash` drops a root, and every root
+						// nested under it, exactly like a delete does, so such a root is gone too: drop
+						// it like the not-found below.
+						Ok(node) if node.parent.is_trash() => {
+							tracing::warn!("resync: sync root {root} is in the trash; dropping it");
+							deleted_roots.push(*root);
+							continue;
+						}
 						Ok(node) => Some(node),
 						Err(e)
 							if matches!(
@@ -2772,6 +2841,18 @@ impl CacheState {
 					{
 						tracing::warn!(
 							"resync: sync root {root} vanished during listing ({e}); dropping it"
+						);
+						deleted_roots.push(*root);
+					}
+					// Right after a dir is trashed, `get_dir` can still answer for a dir under it as
+					// live while its listing already answers that it is inside the trash: drop it
+					// like the trashed answer above instead of retrying it.
+					Err(e)
+						if *root != account_root
+							&& e.server_code().as_deref() == Some("folder_inside_trash") =>
+					{
+						tracing::warn!(
+							"resync: sync root {root} is in the trash ({e}); dropping it"
 						);
 						deleted_roots.push(*root);
 					}
@@ -2858,10 +2939,13 @@ impl CacheState {
 	/// GONE, decide whether the listing is trustworthy enough to commit, then converge the roots that
 	/// listed.
 	///
-	/// `deleted_roots` returned a definitive not-found: each is removed from the cache (subtree included),
-	/// dropped from the active set, and reported to the app, regardless of the commit decision below. A
-	/// not-found is definite, so this is done unconditionally; it is crash-idempotent (a crash before the
-	/// watermark advances just re-detects the same not-found next resync).
+	/// `deleted_roots` returned a definitive not-found, or are in the trash or under a trashed dir: each
+	/// is removed from the cache (subtree included), dropped from the active set, and reported to the
+	/// app, regardless of the commit decision below, and so is a root whose fresh parent is one of
+	/// them. Either answer is definite, so this is done unconditionally; it is crash-idempotent (a
+	/// crash before the watermark advances just re-detects the same answer next resync). A root listed
+	/// under a dir only cached inside one of them is neither dropped nor stored but retried like a
+	/// transient failure (see [`Self::take_roots_listed_inside`]).
 	///
 	/// `any_transient` records that at least one root failed with a NON-not-found (network/server) error.
 	/// If NO root listed successfully yet something failed transiently, the resync reconciled nothing it
@@ -2875,7 +2959,7 @@ impl CacheState {
 			per_root_raw,
 			file_root_heads,
 			deleted_file_roots,
-			deleted_roots,
+			mut deleted_roots,
 			any_transient,
 			file_transient,
 			remote_under_lock,
@@ -2889,6 +2973,14 @@ impl CacheState {
 		// Same rule as `deleted_roots`, for lineages: a not-found is definitive, so reap
 		// unconditionally and before the commit decision below.
 		self.reap_deleted_file_roots(deleted_file_roots);
+		let (per_root_raw, deferred) =
+			self.take_roots_listed_inside(per_root_raw, &mut deleted_roots)?;
+		if deferred {
+			// The deferred roots need the retry even when the flag did not start this resync (the
+			// gap-check runs one without it), and the early return below leaves the flag as it is.
+			self.mark_needs_resync()?;
+		}
+		let any_transient = any_transient | deferred;
 		// Remove the deleted roots' cached subtrees (the cascade trigger recurses) so we don't leak items
 		// under a root that no longer gates membership, then drop them from the active set + notify. The
 		// account root is never in `deleted_roots` (it is never `get_dir`'d and cannot be deleted).
