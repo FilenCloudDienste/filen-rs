@@ -282,9 +282,17 @@ fn config_cmake_for_libcxx(config: &mut Config) {
 	config.define("CMAKE_EXE_LINKER_FLAGS", "-stdlib=libc++");
 	config.define("CMAKE_SHARED_LINKER_FLAGS", "-stdlib=libc++");
 
-	// Ensure we're using clang++ for consistency
-	config.define("CMAKE_CXX_COMPILER", "clang++");
-	config.define("CMAKE_C_COMPILER", "clang");
+	// Ensure we're using clang++ for consistency. Not on Android: the NDK
+	// toolchain file picks the compiler and caches its absolute path, so when
+	// this script reruns over that cache a bare `clang` reads as a changed
+	// compiler. CMake then deletes the cache and reconfigures without any of
+	// our -D values (toolchain file and install prefix included) and builds
+	// for the host. cmake-rs leaves the compiler alone under a toolchain file
+	// for the same reason.
+	if env::var("CARGO_CFG_TARGET_OS").unwrap() != "android" {
+		config.define("CMAKE_CXX_COMPILER", "clang++");
+		config.define("CMAKE_C_COMPILER", "clang");
+	}
 
 	// This was causing issues on the windows runner and we don't care about documentation
 	config.define("CMAKE_DISABLE_FIND_PACKAGE_Doxygen", "TRUE");
