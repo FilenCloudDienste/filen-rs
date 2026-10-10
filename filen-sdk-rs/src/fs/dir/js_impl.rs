@@ -511,6 +511,24 @@ impl JsClient {
 
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
+		wasm_bindgen::prelude::wasm_bindgen(js_name = "findDirUuid")
+	)]
+	pub async fn find_dir_uuid(
+		&self,
+		parent: UuidStr,
+		name: String,
+	) -> Result<Option<UuidStr>, Error> {
+		let this = self.inner();
+		do_on_commander(move || async move {
+			this.find_dir_uuid(parent.into(), &name)
+				.await
+				.map(|uuid| uuid.map(UuidStr::from))
+		})
+		.await
+	}
+
+	#[cfg_attr(
+		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "findItemInDir")
 	)]
 	pub async fn find_item_in_dir(

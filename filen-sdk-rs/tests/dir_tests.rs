@@ -494,6 +494,37 @@ async fn exists() {
 	);
 }
 
+#[shared_test_runtime]
+async fn find_dir_uuid() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	assert!(
+		client
+			.find_dir_uuid(test_dir.uuid(), "a")
+			.await
+			.unwrap()
+			.is_none()
+	);
+
+	let mut dir_a = client.create_dir(&test_dir.into(), "a").await.unwrap();
+
+	assert_eq!(
+		Some(dir_a.uuid()),
+		client.find_dir_uuid(test_dir.uuid(), "a").await.unwrap()
+	);
+
+	client.trash_dir(&mut dir_a).await.unwrap();
+	assert!(
+		client
+			.find_dir_uuid(test_dir.uuid(), "a")
+			.await
+			.unwrap()
+			.is_none()
+	);
+}
+
 // create_dir stores the NFC-normalized name, so dir_exists must also normalize
 // before hashing; otherwise an NFD-decomposed query hashes to a different value
 // and wrongly reports the directory as absent.

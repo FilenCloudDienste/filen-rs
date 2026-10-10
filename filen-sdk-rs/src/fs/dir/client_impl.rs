@@ -172,6 +172,13 @@ impl Client {
 			.await
 	}
 
+	/// The uuid of `parent`'s child directory named `name`, from one name-hash lookup: no listing, no
+	/// decryption, no drive lock.
+	pub async fn find_dir_uuid(&self, parent: Uuid, name: &str) -> Result<Option<Uuid>, Error> {
+		self.inner_dir_exists(parent, &ValidatedName::try_from(name)?)
+			.await
+	}
+
 	pub(crate) async fn inner_dir_exists(
 		&self,
 		parent: Uuid,
