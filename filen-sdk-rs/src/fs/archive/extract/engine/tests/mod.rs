@@ -598,6 +598,83 @@ async fn items_past_the_reports_records_reach_new_shares_too() {
 	);
 }
 
+/// Three files extracted into a destination shared while the job ran, so that each is
+/// propagated again at its end: the first of those propagations finds the lock's lease lost.
+fn three_files_shared_meanwhile(backend: &mut FakeBackend) {
+	backend.later_targets = Some(crate::connect::ConnectedTargets::with_test_users(1));
+	backend.lose_leases_at_propagation = Some(0);
+}
+
+fn three_files() -> Vec<u8> {
+	tar_of(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")])
+}
+
+/// The propagation failures the job reported, by item.
+fn propagation_failures(recorder: &Recorder) -> Vec<(Uuid, ErrorKind)> {
+	let mut failed: Vec<(Uuid, ErrorKind)> = recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			ExtractEvent::PropagationFailed { dest_uuid, error } => Some((dest_uuid, error.kind())),
+			_ => None,
+		})
+		.collect();
+	failed.sort_by_key(|(uuid, _)| *uuid);
+	failed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_lost_while_propagating_to_new_shares_is_waited_for_again() {
+	let setup = setup("bundle.tar", three_files(), three_files_shared_meanwhile);
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	let log = setup.backend.log();
+	let propagated: HashSet<Uuid> = log.propagated_trees.iter().copied().collect();
+	let top_level: HashSet<Uuid> = report.top_level.iter().map(|top| top.item.uuid()).collect();
+	assert_eq!(top_level.len(), 3);
+	assert_eq!(propagated, top_level, "every item reaches the new share");
+	// the batch they were propagated in found the lease lost and sent nothing, then went
+	// again under the new lock
+	assert_eq!(log.unconfirmed_propagations, 3);
+	assert_eq!(log.propagated_trees.len(), 3);
+	drop(log);
+	assert!(propagation_failures(&job.recorder).is_empty());
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drive_lock_not_had_again_fails_the_propagation_of_every_extracted_item_left() {
+	let setup = setup("bundle.tar", three_files(), |backend| {
+		three_files_shared_meanwhile(backend);
+		// the three registrations and the pass take a lock each; waiting for it again fails
+		backend.fail_locks_from = Some((4, ErrorKind::Server));
+	});
+	let options = Options {
+		root: ExtractRoot::Destination,
+		..Options::default()
+	};
+	let job = start(&setup, options);
+	let report = job.running.await.unwrap().unwrap();
+	assert!(setup.backend.log().propagated_trees.is_empty());
+	let mut expected: Vec<(Uuid, ErrorKind)> = report
+		.top_level
+		.iter()
+		.map(|top| (top.item.uuid(), ErrorKind::Server))
+		.collect();
+	expected.sort_by_key(|(uuid, _)| *uuid);
+	assert_eq!(expected.len(), 3);
+	assert_eq!(
+		propagation_failures(&job.recorder),
+		expected,
+		"each item left is reported, none skipped"
+	);
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
 /// How many top-level items the callback had been given when the first update whose `counted`
 /// is above zero came.
 fn given_at_first_count(recorder: &Recorder, counted: impl Fn(&ItemCounts) -> u64) -> usize {

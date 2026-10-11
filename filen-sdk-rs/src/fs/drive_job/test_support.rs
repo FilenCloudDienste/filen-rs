@@ -50,7 +50,7 @@ use crate::{
 };
 
 use super::{
-	backend::{CreatedDir, DriveBackend, ListedNames, UploadSpec},
+	backend::{CreatedDir, DriveBackend, ListedNames, Propagated, UploadSpec},
 	plan::SourceDir,
 };
 
@@ -266,6 +266,8 @@ pub(crate) struct FakeLog {
 	pub(crate) colored: Vec<Uuid>,
 	pub(crate) propagated: Vec<Uuid>,
 	pub(crate) propagated_trees: Vec<Uuid>,
+	/// Propagations that found their drive lock's lease lost and sent nothing.
+	pub(crate) unconfirmed_propagations: usize,
 	pub(crate) target_fetches: usize,
 	pub(crate) probes: Vec<String>,
 	/// Drive-lock acquisitions that had to wait for another holder.
@@ -347,6 +349,12 @@ pub(crate) struct FakeBackend {
 	pub(crate) lost_on_arrival: HashSet<usize>,
 	/// Bumped by [`Self::lose_leases`]; a lock taken in an earlier epoch is lost.
 	lease_epoch: Arc<AtomicUsize>,
+	/// The propagation (by call index, [`DriveBackend::propagate`] and
+	/// [`DriveBackend::propagate_tree`] together) at whose start every held lease is lost.
+	pub(crate) lose_leases_at_propagation: Option<usize>,
+	propagation_calls: AtomicUsize,
+	/// Every held lease is lost right after each directory is created.
+	pub(crate) lose_leases_after_creates: bool,
 	pub(crate) merge_once: Mutex<HashSet<String>>,
 	pub(crate) targets: ConnectedTargets,
 	pub(crate) later_targets: Option<ConnectedTargets>,
@@ -413,6 +421,9 @@ impl FakeBackend {
 			fail_locks_from: None,
 			lost_on_arrival: HashSet::new(),
 			lease_epoch: Arc::default(),
+			lose_leases_at_propagation: None,
+			propagation_calls: AtomicUsize::new(0),
+			lose_leases_after_creates: false,
 			merge_once: Mutex::new(HashSet::new()),
 			targets: ConnectedTargets::default(),
 			later_targets: None,
@@ -503,10 +514,23 @@ impl FakeBackend {
 	}
 
 	/// Loses the lease of every drive lock held now; locks taken after it hold theirs.
-	// The drive job tests that use it arrive in the next commit; until then nothing does.
-	#[allow(dead_code)]
 	pub(crate) fn lose_leases(&self) {
 		self.lease_epoch.fetch_add(1, Ordering::SeqCst);
+	}
+
+	/// What the client's propagation does with the lock it is given (see
+	/// [`ClientBackend`](super::backend::ClientBackend)): confirms its lease, counting a lost one
+	/// in [`FakeLog::unconfirmed_propagations`].
+	async fn confirm_for_propagation(&self, lock: &FakeLock) -> Result<(), Error> {
+		let call = self.propagation_calls.fetch_add(1, Ordering::SeqCst);
+		if self.lose_leases_at_propagation == Some(call) {
+			self.lose_leases();
+		}
+		let confirmed = lock.confirm().await;
+		if confirmed.is_err() {
+			self.log().unconfirmed_propagations += 1;
+		}
+		confirmed
 	}
 
 	/// Waits while `request` about a directory or file named `name` is held.
@@ -628,6 +652,9 @@ impl DriveBackend for FakeBackend {
 		log.created_dirs.push((uuid, name.as_ref().to_owned()));
 		log.dir_parents.insert(uuid, parent);
 		drop(log);
+		if self.lose_leases_after_creates {
+			self.lose_leases();
+		}
 		Ok(CreatedDir::Created(RemoteDirectory::new_from_parts(
 			uuid,
 			DecryptedDirectoryMeta {
@@ -653,24 +680,29 @@ impl DriveBackend for FakeBackend {
 
 	async fn propagate(
 		&self,
+		lock: &FakeLock,
 		_targets: &ConnectedTargets,
 		item: NonRootItemType<'_, Normal>,
-	) -> Vec<Error> {
+	) -> Propagated {
+		self.confirm_for_propagation(lock).await?;
 		if self.quirks.contains(&Quirk::FailPropagate) {
-			return vec![Error::custom(ErrorKind::Server, "propagation failed")];
+			return Ok(vec![Error::custom(ErrorKind::Server, "propagation failed")]);
 		}
 		self.log().propagated.push(item.uuid());
-		Vec::new()
+		Ok(Vec::new())
 	}
 
 	async fn propagate_tree(
 		&self,
+		lock: &FakeLock,
 		_targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
-	) -> Vec<Error> {
+	) -> Propagated {
+		// held before the lease is confirmed, as the client lists the subtree first
 		self.hold(Request::Propagate, item.uuid()).await;
+		self.confirm_for_propagation(lock).await?;
 		self.log().propagated_trees.push(item.uuid());
-		Vec::new()
+		Ok(Vec::new())
 	}
 
 	#[cfg(feature = "archive")]

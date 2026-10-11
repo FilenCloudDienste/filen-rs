@@ -20,9 +20,11 @@ use crate::{
 	job::{JobControl, Stopped, report::Ops},
 };
 
+#[cfg(feature = "archive")]
+use super::lock::{LockWait, wait_for_lock};
 use super::{
 	backend::DriveBackend,
-	lock::{HeldLock, LockWait, wait_for_lock},
+	lock::{HeldLock, lock_after_pauses, propagate_after_write},
 	name_retry::NameRetry,
 };
 
@@ -73,14 +75,9 @@ impl From<Stopped> for FinalizeError {
 pub(crate) async fn finalize_new_file<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
 ) -> Result<Finalized, FinalizeError> {
-	let lock = loop {
-		task.control.checkpoint().await?;
-		match wait_for_lock(task.backend, task.control, task.ops).await? {
-			LockWait::Locked(held) => break held,
-			LockWait::Paused => {}
-			LockWait::Failed(error) => return Err(FinalizeError::Failed(error)),
-		}
-	};
+	let lock = lock_after_pauses(task.backend, task.control, task.ops)
+		.await?
+		.map_err(FinalizeError::Failed)?;
 	register(task, lock).await
 }
 
@@ -101,7 +98,8 @@ pub(crate) enum UnlessPaused {
 /// Registers an uploaded file like [`finalize_new_file`], except that a pause requested before
 /// the drive lock is held ends it with nothing sent instead of being waited out, for the caller
 /// to start it again once resumed: a job that pauses once its registrations are over is never
-/// kept from pausing by one waiting for the lock.
+/// kept from pausing by one waiting for the lock. A pause requested while it waits for the lock
+/// again, its lease not confirmed before anything was sent, is waited out.
 #[cfg(feature = "archive")]
 pub(crate) async fn finalize_new_file_unless_paused<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
@@ -117,30 +115,47 @@ pub(crate) async fn finalize_new_file_unless_paused<B: DriveBackend>(
 	UnlessPaused::Ran(register(task, lock).await)
 }
 
-/// Registers the file under the drive lock `_lock`.
+/// Registers the file under the drive lock `lock`, then adds it to `targets`: that is not
+/// skipped for a lease that cannot be confirmed (see [`propagate_after_write`]).
 async fn register<B: DriveBackend>(
 	task: FinalizeTask<'_, B>,
-	_lock: HeldLock<B::DriveLock>,
+	mut lock: HeldLock<B::DriveLock>,
 ) -> Result<Finalized, FinalizeError> {
-	// the control and ops were for waiting for the lock, which is held
 	let FinalizeTask {
 		backend,
+		control,
+		ops,
 		upload,
 		parent,
 		mut name,
-		recheck,
+		mut recheck,
 		completion,
 		info,
 		targets,
-		..
 	} = task;
-	if let Some(retry) = recheck {
-		// Registering a file under a name the parent already holds would make it a new version
-		// of that file instead of a new file, so the name is checked again here, while holding
-		// the drive lock: clients that write under the lock cannot take it in between.
-		name = retry
-			.free_name(backend, parent, name)
-			.await
+	loop {
+		if let Some(retry) = recheck.as_deref_mut() {
+			// Registering a file under a name the parent already holds would make it a new
+			// version of that file instead of a new file, so the name is checked again here,
+			// while holding the drive lock: clients that write under the lock cannot take it in
+			// between.
+			name = retry
+				.free_name(backend, parent, name)
+				.await
+				.map_err(FinalizeError::Failed)?;
+		}
+		// The wait for the lock and the name check can take long. Nothing but the name was read
+		// under the lock, so a lease that cannot be confirmed (lost, or the server answering
+		// with an error; a failed request is asked again while the lease could stand) is not
+		// the registration's end: the lock is waited for again and the name checked again under
+		// the new lease.
+		let Err(unconfirmed) = lock.confirm().await else {
+			break;
+		};
+		tracing::warn!("{unconfirmed}; waiting for the drive lock again to register a file");
+		drop(lock);
+		lock = lock_after_pauses(backend, control, ops)
+			.await?
 			.map_err(FinalizeError::Failed)?;
 	}
 	let file = backend
@@ -158,9 +173,15 @@ async fn register<B: DriveBackend>(
 	let propagation_errors = if targets.is_empty() {
 		Vec::new()
 	} else {
-		backend
-			.propagate(targets, NonRootItemType::File(Cow::Borrowed(&file)))
-			.await
+		propagate_after_write(
+			backend,
+			control,
+			ops,
+			lock,
+			targets,
+			NonRootItemType::File(Cow::Borrowed(&file)),
+		)
+		.await
 	};
 	if registered_as_version {
 		return Err(FinalizeError::RegisteredAsVersion {

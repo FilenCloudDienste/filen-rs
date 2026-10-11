@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
 	backend::{CreatedDir, DriveBackend},
-	lock::{LockWait, wait_for_lock},
+	lock::{HeldLock, LockWait, confirmed_after_write, propagate_after_write, wait_for_lock},
 	name_retry::NameRetry,
 };
 
@@ -56,6 +56,20 @@ pub(crate) enum DirError {
 	Failed(Error),
 }
 
+/// Waits for the drive lock; nothing is sent before it is held, so a pause or stop meanwhile
+/// leaves the create to be tried again.
+async fn lock_unless_paused<B: DriveBackend>(
+	backend: &B,
+	control: &JobControl,
+	ops: &Ops,
+) -> Result<HeldLock<B::DriveLock>, DirError> {
+	match wait_for_lock(backend, control, ops).await {
+		Ok(LockWait::Locked(held)) => Ok(held),
+		Ok(LockWait::Paused) | Err(Stopped) => Err(DirError::NotStarted),
+		Ok(LockWait::Failed(error)) => Err(DirError::Failed(error)),
+	}
+}
+
 /// Creates one directory. The shared lock a job holds is normally handed out at once; a fresh
 /// acquisition (its lease was lost) can wait long. Nothing is sent before the lock is held, so a
 /// pause or stop until then leaves the create to be tried again; once held, the create runs to
@@ -78,11 +92,7 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 		subject,
 	} = task;
 	let backend = &*backend;
-	let _lock = match wait_for_lock(backend, &control, &ops).await {
-		Ok(LockWait::Locked(held)) => held,
-		Ok(LockWait::Paused) | Err(Stopped) => return Err(DirError::NotStarted),
-		Ok(LockWait::Failed(error)) => return Err(DirError::Failed(error)),
-	};
+	let mut lock = lock_unless_paused(backend, &control, &ops).await?;
 	let mut retry = NameRetry::new(NameShape::Dir, subject);
 	let mut dir = loop {
 		if verify_name {
@@ -90,6 +100,17 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 				.free_name(backend, parent, name)
 				.await
 				.map_err(DirError::Failed)?;
+		}
+		// The wait for the lock and the name check can take long. Nothing but the name was read
+		// under the lock, so a lease that cannot be confirmed (lost, or the server answering
+		// with an error; a failed request is asked again while the lease could stand) is not
+		// the create's end: the lock is waited for again and the name checked again under the
+		// new lease.
+		if let Err(unconfirmed) = lock.confirm().await {
+			tracing::warn!("{unconfirmed}; waiting for the drive lock again to create a directory");
+			drop(lock);
+			lock = lock_unless_paused(backend, &control, &ops).await?;
+			continue;
 		}
 		match backend
 			.create_dir_unpropagated(parent, uuid, &name, created)
@@ -108,17 +129,49 @@ pub(crate) async fn create_dir<B: DriveBackend>(
 			}
 		}
 	};
+	// The steps below follow the create, which landed: a lease that cannot be confirmed does
+	// not skip them, the lock is waited for again.
 	let color_error = if color == DirColor::Default {
 		None
 	} else {
-		backend.set_dir_color(&mut dir, color).await.err()
+		// Coloring takes the drive lock through the client's lock cache, which hands out the
+		// job's lock while its lease is confirmed: confirmed (or waited for again) here, the
+		// cache only acquires one of its own, not stopped by the job, for a lease lost in
+		// between.
+		match confirmed_after_write(backend, &control, &ops, lock).await {
+			Ok(held) => {
+				lock = held;
+				backend.set_dir_color(&mut dir, color).await.err()
+			}
+			Err(error) => {
+				// the job stopped, or the lock could not be had: neither step is sent
+				let error = Arc::new(error);
+				let propagation_errors = if targets.is_empty() {
+					Vec::new()
+				} else {
+					vec![Error::unshared(Arc::clone(&error))]
+				};
+				return Ok(CreatedDirOutcome {
+					dir,
+					name,
+					color_error: Some(Error::unshared(error)),
+					propagation_errors,
+				});
+			}
+		}
 	};
 	let propagation_errors = if targets.is_empty() {
 		Vec::new()
 	} else {
-		backend
-			.propagate(&targets, NonRootItemType::Dir(Cow::Borrowed(&dir)))
-			.await
+		propagate_after_write(
+			backend,
+			&control,
+			&ops,
+			lock,
+			&targets,
+			NonRootItemType::Dir(Cow::Borrowed(&dir)),
+		)
+		.await
 	};
 	Ok(CreatedDirOutcome {
 		dir,

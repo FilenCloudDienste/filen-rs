@@ -97,6 +97,11 @@ impl Client {
 	where
 		C: DirUploadCallback + ?Sized,
 	{
+		// Keeps the drive lock between the steps below. Each step (creating a directory,
+		// registering a file) takes the lock again itself: it gets this one while its lease is
+		// confirmed and a fresh lease once it is lost, so no step writes under a lost lease. The
+		// steps are independent, each checked by the server against its parent's uuid, so the
+		// upload goes on across such a change of lease.
 		let _lock = self.lock_drive().await?;
 
 		let (file_upload_result_sender, mut file_upload_result_receiver) =

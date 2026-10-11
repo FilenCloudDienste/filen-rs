@@ -81,6 +81,12 @@ pub(crate) struct UploadSpec {
 	pub(crate) mime: Option<String>,
 }
 
+/// What propagating an item did: the operations that failed, or, as `Err`, why nothing was
+/// sent: the lease of the drive lock it ran under could not be confirmed (see
+/// [`Lease::confirm`]). The caller waits for the lock again then, as a job must stay stoppable
+/// while it waits.
+pub(crate) type Propagated = Result<Vec<Error>, Error>;
+
 /// The drive operations a job needs. The production implementation is the client; tests use a
 /// fake with the real memory semaphore.
 pub(crate) trait DriveBackend: MaybeSendSync + 'static {
@@ -118,19 +124,22 @@ pub(crate) trait DriveBackend: MaybeSendSync + 'static {
 		dir: &mut RemoteDirectory,
 		color: DirColor<'static>,
 	) -> impl Future<Output = Result<(), Error>> + MaybeSend;
-	/// Adds a new item to `targets`; returns the operations that failed.
+	/// Adds a new item to `targets` under the drive lock `lock`, its lease confirmed right
+	/// before.
 	fn propagate(
 		&self,
+		lock: &Self::DriveLock,
 		targets: &ConnectedTargets,
 		item: NonRootItemType<'_, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
-	/// Adds a created top-level item, and for a directory everything below it, to `targets`;
-	/// returns the operations that failed.
+	) -> impl Future<Output = Propagated> + MaybeSend;
+	/// Adds a created top-level item, and for a directory everything below it, to `targets`
+	/// under the drive lock `lock`, its lease confirmed after the subtree was listed.
 	fn propagate_tree(
 		&self,
+		lock: &Self::DriveLock,
 		targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
-	) -> impl Future<Output = Vec<Error>> + MaybeSend;
+	) -> impl Future<Output = Propagated> + MaybeSend;
 	/// An item of the user's drive, for a job that kept only its uuid: a file a tar's hard link
 	/// copies, or a top-level item to propagate again.
 	#[cfg(feature = "archive")]
@@ -233,29 +242,38 @@ impl DriveBackend for ClientBackend {
 		dir: &mut RemoteDirectory,
 		color: DirColor<'static>,
 	) -> Result<(), Error> {
+		// Takes the drive lock again through the client's lock cache: the job's lock while its
+		// lease is confirmed, which create_dir does right before (see there). It colors a
+		// directory the job just created, whatever was read under the job's lock.
 		self.client.set_dir_color(dir, color).await
 	}
 
 	async fn propagate(
 		&self,
+		lock: &Self::DriveLock,
 		targets: &ConnectedTargets,
 		item: NonRootItemType<'_, Normal>,
-	) -> Vec<Error> {
-		self.client
+	) -> Propagated {
+		lock.confirm().await?;
+		Ok(self
+			.client
 			.propagate_to_targets(targets, std::slice::from_ref(&item))
-			.await
+			.await)
 	}
 
 	async fn propagate_tree(
 		&self,
+		lock: &Self::DriveLock,
 		targets: &ConnectedTargets,
 		item: &NonRootItemType<'static, Normal>,
-	) -> Vec<Error> {
+	) -> Propagated {
 		let items = match self.client.items_with_subtree(item.as_borrowed_cow()).await {
 			Ok(items) => items,
-			Err(error) => return vec![error],
+			Err(error) => return Ok(vec![error]),
 		};
-		self.client.propagate_to_targets(targets, &items).await
+		// after the listing, which can take long
+		lock.confirm().await?;
+		Ok(self.client.propagate_to_targets(targets, &items).await)
 	}
 
 	#[cfg(feature = "archive")]

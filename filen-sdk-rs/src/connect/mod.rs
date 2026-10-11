@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Debug};
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use filen_macros::js_type;
 use filen_types::{
@@ -35,6 +35,7 @@ use crate::{
 		file::{AnonymousRemoteFile, LinkedFile, RemoteFile},
 	},
 	runtime::do_cpu_intensive,
+	sync::lock::{ResourceLock, confirm_or_retake},
 	util::MaybeSendBoxFuture,
 };
 
@@ -483,26 +484,52 @@ impl Client {
 		.await
 	}
 
-	pub(crate) async fn update_maybe_connected_item<I>(&self, item: &I) -> Result<(), Error>
+	/// Updates `item`'s metadata in the links and shares it is in, after a change to it that
+	/// already landed. The caller holds the drive lock `lock`. Once its lease is lost, the lock
+	/// is taken again and the links and shares read again under it: the update is not skipped
+	/// for the lost lease, and not sent to a link or share another client removed meanwhile.
+	pub(crate) async fn update_maybe_connected_item<I>(
+		&self,
+		lock: &Arc<ResourceLock>,
+		item: &I,
+	) -> Result<(), Error>
 	where
 		I: HasMeta + HasUUID + Send + Sync + Debug,
 	{
-		let (linked, shared) = futures::try_join!(
-			async {
-				api::v3::item::linked::post(
-					self.client(),
-					&api::v3::item::linked::Request { uuid: item.uuid() },
-				)
-				.await
-			},
-			async {
-				api::v3::item::shared::post(
-					self.client(),
-					&api::v3::item::shared::Request { uuid: item.uuid() },
-				)
-				.await
-			},
-		)?;
+		let mut retaken = None;
+		let (linked, shared) = loop {
+			let held = retaken.as_ref().unwrap_or(lock);
+			let (linked, shared) = futures::try_join!(
+				async {
+					api::v3::item::linked::post(
+						self.client(),
+						&api::v3::item::linked::Request { uuid: item.uuid() },
+					)
+					.await
+				},
+				async {
+					api::v3::item::shared::post(
+						self.client(),
+						&api::v3::item::shared::Request { uuid: item.uuid() },
+					)
+					.await
+				},
+			)?;
+			// The requests below are issued together, so the lease is confirmed once here; one
+			// the HTTP stack queues past the lease is not checked again.
+			match confirm_or_retake(held, || self.lock_drive()).await {
+				Ok(None) => break (linked, shared),
+				Ok(Some(new)) => retaken = Some(new),
+				Err(error) => {
+					tracing::warn!(
+						"could not confirm the drive lock to update {} in its links and shares, \
+						 leaving them as they are: {error}",
+						item.uuid()
+					);
+					return Ok(());
+				}
+			}
+		};
 
 		let futures = FuturesUnordered::new();
 		for link in linked.links {
@@ -566,7 +593,9 @@ impl Client {
 
 	/// Adds every item to every link and shares it with every user in `targets`. Each item's
 	/// parent must already be propagated. All operations run to completion; the errors of the
-	/// failed ones are returned rather than aborting the rest.
+	/// failed ones are returned rather than aborting the rest. The caller holds the drive lock,
+	/// its lease confirmed right before: the requests are issued together, so a lease lost while
+	/// the HTTP stack queues one of them is not noticed.
 	pub(crate) async fn propagate_to_targets(
 		&self,
 		targets: &ConnectedTargets,
@@ -589,21 +618,42 @@ impl Client {
 		drain_collecting_errors(futures).await
 	}
 
+	/// Adds `item`, and a directory's subtree, to the links and shares of its parent, after the
+	/// write that created, moved or restored it landed. The caller holds the drive lock `lock`.
+	/// Once its lease is lost, the lock is taken again and the targets and the subtree read
+	/// again under it: the item is not left out for the lost lease, and not added to a link or
+	/// share another client removed meanwhile.
 	pub(crate) async fn update_item_with_maybe_connected_parent(
 		&self,
+		lock: &Arc<ResourceLock>,
 		item: NonRootItemType<'_, Normal>,
 	) -> Result<(), Error> {
 		let uuid = (*item.parent()).try_into()?;
 
-		let targets = self.fetch_connected_targets(uuid).await?;
-		// Without a link or share there is nothing to add the item (or a directory's subtree) to,
-		// so skip the recursive listing entirely.
-		if targets.is_empty() {
-			return Ok(());
-		}
-
-		let items_to_process = self.items_with_subtree(item).await?;
-		let errors = self.propagate_to_targets(&targets, &items_to_process).await;
+		let mut retaken = None;
+		let errors = loop {
+			let held = retaken.as_ref().unwrap_or(lock);
+			let targets = self.fetch_connected_targets(uuid).await?;
+			// Without a link or share there is nothing to add the item (or a directory's
+			// subtree) to, so skip the recursive listing entirely.
+			if targets.is_empty() {
+				return Ok(());
+			}
+			let items_to_process = self.items_with_subtree(item.as_borrowed_cow()).await?;
+			// after the listing, which can take long
+			match confirm_or_retake(held, || self.lock_drive()).await {
+				Ok(None) => break self.propagate_to_targets(&targets, &items_to_process).await,
+				Ok(Some(new)) => retaken = Some(new),
+				Err(error) => {
+					tracing::warn!(
+						"could not confirm the drive lock to add {} to its parent's links and \
+						 shares, leaving them as they are: {error}",
+						item.uuid()
+					);
+					return Ok(());
+				}
+			}
+		};
 		for error in &errors {
 			tracing::warn!(
 				"failed to propagate a connected-parent update to a link or shared user: {error}"
@@ -675,7 +725,7 @@ impl Client {
 		// other mutating flows. Otherwise a concurrent upload between the listing and the posts
 		// is neither seen by the lister nor covered by its own connected-parent propagation
 		// (the link root row does not exist yet), so it is silently absent from the link.
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		let public_link = DirPublicLinkRW::new(self.make_meta_key());
 		let (dirs, files) = self
 			.list_dir_recursive::<Normal, _>(
@@ -696,6 +746,10 @@ impl Client {
 				.await,
 		};
 
+		// The listing above, which can take long, was read under this lock: once it is lost
+		// nothing is linked or shared. The posts below are issued together, so the lease is
+		// confirmed once here; one the HTTP stack queues past the lease is not checked again.
+		lock.confirm().await?;
 		let mut futures = FuturesUnordered::new();
 
 		// link main dir
@@ -973,9 +1027,13 @@ impl Client {
 		// other mutating flows. Otherwise a concurrent upload between the listing and the posts
 		// is neither seen by the lister nor covered by its own connected-parent propagation
 		// (the share root row does not exist yet), so it is silently absent from the share.
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		let (dirs, files) =
 			Normal::list_dir_recursive(self, &dir.into(), progress_callback, ()).await?;
+		// The listing above, which can take long, was read under this lock: once it is lost
+		// nothing is linked or shared. The posts below are issued together, so the lease is
+		// confirmed once here; one the HTTP stack queues past the lease is not checked again.
+		lock.confirm().await?;
 
 		let shared_user = client.into();
 		let shared_user = &shared_user;

@@ -92,7 +92,7 @@ impl Client {
 	}
 
 	pub async fn restore_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		api::v3::file::restore::post(
 			self.client(),
 			&api::v3::file::restore::Request { uuid: file.uuid() },
@@ -111,7 +111,7 @@ impl Client {
 		// Mirror the restored file's metadata into the (now current) parent's
 		// shares/links (as upload does); otherwise recipients of a connected parent
 		// cannot see or decrypt the restored file.
-		self.update_item_with_maybe_connected_parent((&*file).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*file).into())
 			.await?;
 		Ok(())
 	}
@@ -130,7 +130,7 @@ impl Client {
 		file: &mut RemoteFile,
 		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		api::v3::file::r#move::post(
 			self.client(),
 			&api::v3::file::r#move::Request {
@@ -143,7 +143,7 @@ impl Client {
 		// Mirror the moved file's metadata into the new parent's shares/links (as
 		// upload does); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in file.
-		self.update_item_with_maybe_connected_parent((&*file).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*file).into())
 			.await?;
 		Ok(())
 	}
@@ -153,7 +153,7 @@ impl Client {
 		file: &mut RemoteFile,
 		changes: FileMetaChanges,
 	) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 
 		let temp_meta = file.get_meta().borrow_with_changes(&changes)?;
 		let FileMeta::Decoded(temp_meta) = temp_meta else {
@@ -191,7 +191,7 @@ impl Client {
 
 		file.update_meta(changes)?;
 
-		self.update_maybe_connected_item(file).await?;
+		self.update_maybe_connected_item(&lock, file).await?;
 		Ok(())
 	}
 
@@ -367,7 +367,7 @@ impl Client {
 		file: &mut RemoteFile,
 		version: FileVersion,
 	) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		let response = match api::v3::file::version::restore::post(
 			self.client(),
 			&api::v3::file::version::restore::Request {
@@ -433,8 +433,48 @@ impl Client {
 		file.timestamp = version.timestamp;
 		file.meta = version.metadata;
 		// need to do this or the old sync engine doesn't work properly because it relies purely on modtime.
-		self.update_file_metadata(file, FileMetaChanges::default().last_modified(Utc::now()))
-			.await?;
+		// The touch writes back the version's metadata, as the caller read it, with a new
+		// modification time. While this lock's lease is confirmed nobody else changed it, and
+		// update_file_metadata gets this lock from the client's lock cache.
+		match lock.confirm().await {
+			Ok(()) => {
+				self.update_file_metadata(
+					file,
+					FileMetaChanges::default().last_modified(Utc::now()),
+				)
+				.await
+			}
+			Err(error) if error.kind() == ErrorKind::LockLost => {
+				drop(lock);
+				tracing::warn!("{error}; touching the restored file under a new lock");
+				self.touch_restored_file(file).await
+			}
+			Err(error) => Err(error),
+		}
+	}
+
+	/// Gives `file`, a version restore that landed, a new modification time after the drive
+	/// lock the restore was made under lost its lease. Another client may have changed the
+	/// file's metadata since (a rename), so it is read again under a new lock and only the
+	/// modification time is changed; a file that is no longer the current version is left as is.
+	async fn touch_restored_file(&self, file: &mut RemoteFile) -> Result<(), Error> {
+		// held across the read and the touch, which gets it from the client's lock cache
+		let _lock = self.lock_drive().await?;
+		let current = self.get_file_with_info(file.uuid()).await?;
+		if current.versioned {
+			tracing::warn!(
+				"{} is no longer the current version, leaving its modification time",
+				file.uuid()
+			);
+			return Ok(());
+		}
+		let mut current = current.file;
+		self.update_file_metadata(
+			&mut current,
+			FileMetaChanges::default().last_modified(Utc::now()),
+		)
+		.await?;
+		*file = current;
 		Ok(())
 	}
 

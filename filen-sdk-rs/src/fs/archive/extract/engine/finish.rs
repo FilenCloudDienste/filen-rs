@@ -2,7 +2,7 @@
 //! meanwhile, and the archive removed once what it held is verified to be in the drive; or, after
 //! a wrong password showed late, the directories it created trashed.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use filen_types::fs::Uuid;
 use futures::future::join_all;
@@ -23,13 +23,11 @@ use crate::{
 			names::ROOT,
 		},
 		categories::NonRootItemType,
-		drive_job::{
-			counts::ItemCounts,
-			lock::{LockWait, wait_for_lock},
-		},
+		drive_job::{backend::Propagated, counts::ItemCounts, lock::lock_reporting_pauses},
 		file::traits::HasRemoteFileInfo,
 	},
 	job::Stopped,
+	sync::lock::Lease,
 	util::sleep,
 };
 
@@ -67,42 +65,94 @@ impl<B: DisposalBackend> Driver<B> {
 		let items = self.report.top_level.len() + self.top_level_beyond.len();
 		let mut next = 0;
 		while next < items {
-			let _lock = loop {
-				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
-					LockWait::Locked(held) => break held,
-					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
-					LockWait::Failed(error) => {
+			let mut lock =
+				match lock_reporting_pauses(&*self.backend, &self.control, &self.reporter).await? {
+					Ok(lock) => lock,
+					Err(error) => {
 						tracing::warn!(
 							"failed to lock the drive to propagate extracted items: {error}"
 						);
 						return Ok(());
 					}
-				}
-			};
+				};
 			while next < items && !self.control.is_pause_requested() {
 				// a cancel is not kept waiting for every item
 				if self.control.is_stopping() {
 					return Err(Stopped);
 				}
 				let end = (next + MAX_SMALL_PARALLEL_REQUESTS).min(items);
-				let propagated = join_all((next..end).map(|index| {
-					propagate_top_level(
-						&*self.backend,
-						&self.report.top_level,
-						&self.top_level_beyond,
-						index,
-						&added,
-					)
-				}))
-				.await;
-				for (dest_uuid, errors) in propagated {
-					self.report_propagation(dest_uuid, errors);
+				let mut batch: Vec<usize> = (next..end).collect();
+				while !batch.is_empty() {
+					let propagated = join_all(batch.iter().map(|&index| {
+						propagate_top_level(
+							&*self.backend,
+							lock.lock(),
+							&self.report.top_level,
+							&self.top_level_beyond,
+							index,
+							&added,
+						)
+					}))
+					.await;
+					let mut unconfirmed = None;
+					let mut again = Vec::new();
+					for (&index, (dest_uuid, result)) in batch.iter().zip(propagated) {
+						match result {
+							Ok(errors) => self.report_propagation(dest_uuid, errors),
+							Err(error) => {
+								again.push(index);
+								unconfirmed = Some(error);
+							}
+						}
+					}
+					let Some(unconfirmed) = unconfirmed else {
+						break;
+					};
+					// The items exist already and nothing was read under the lock, so a lease
+					// that cannot be confirmed is waited for again, and the items it kept from
+					// being sent sent under the new one, rather than failing every item still to
+					// propagate.
+					tracing::warn!("{unconfirmed}; waiting for the drive lock again");
+					drop(lock);
+					lock =
+						match lock_reporting_pauses(&*self.backend, &self.control, &self.reporter)
+							.await?
+						{
+							Ok(lock) => lock,
+							Err(error) => {
+								let error = Arc::new(error);
+								for index in again.into_iter().chain(end..items) {
+									self.report_propagation_failed(index, &error);
+								}
+								return Ok(());
+							}
+						};
+					batch = again;
 				}
 				next = end;
 				self.reporter.tick();
 			}
 		}
 		Ok(())
+	}
+
+	/// Reports that top-level item `index` (of the report's records followed by those past
+	/// them) could not be propagated, for `error`.
+	fn report_propagation_failed(&self, index: usize, error: &Arc<Error>) {
+		let kept = &self.report.top_level;
+		let dest_uuid = match kept.get(index) {
+			Some(top) => Some(top.item.uuid()),
+			None => self
+				.top_level_beyond
+				.get(index - kept.len())
+				.map(|(uuid, _)| *uuid),
+		};
+		if let Some(dest_uuid) = dest_uuid {
+			self.reporter.event(ExtractEvent::PropagationFailed {
+				dest_uuid,
+				error: Arc::clone(error),
+			});
+		}
 	}
 
 	/// Whether every entry the archive holds is extracted: none failed, and none skipped but the
@@ -291,7 +341,7 @@ impl<B: DisposalBackend> Driver<B> {
 				return;
 			}
 		};
-		let _lock = match lock {
+		let lock = match lock {
 			Ok(lock) => lock,
 			Err(error) => {
 				tracing::warn!(
@@ -315,6 +365,16 @@ impl<B: DisposalBackend> Driver<B> {
 					);
 					continue;
 				}
+			}
+			// The listing above was read under this lock: once its lease is lost, a file someone
+			// else put in the directory meanwhile could go to the trash with it.
+			if let Err(error) = lock.confirm().await {
+				tracing::warn!(
+					"archive {}: the directories created before the wrong password showed and not \
+					 trashed yet are kept: {error}",
+					self.archive.uuid()
+				);
+				break;
 			}
 			match self.backend.trash_dir(uuid).await {
 				Ok(()) => {
@@ -340,26 +400,27 @@ impl<B: DisposalBackend> Driver<B> {
 /// Propagates top-level item `index` of `kept` followed by `beyond` (those past the report's
 /// records, fetched again: only when the destination changed, which is rare, rather than
 /// holding every one of them for the whole job) with its subtree to `added`; its uuid, and
-/// what failed.
+/// what the propagation did.
 async fn propagate_top_level<B: DisposalBackend>(
 	backend: &B,
+	lock: &B::DriveLock,
 	kept: &[ExtractedTopLevel],
 	beyond: &[(Uuid, bool)],
 	index: usize,
 	added: &ConnectedTargets,
-) -> (Uuid, Vec<Error>) {
+) -> (Uuid, Propagated) {
 	if let Some(top) = kept.get(index) {
 		return (
 			top.item.uuid(),
-			backend.propagate_tree(added, &top.item).await,
+			backend.propagate_tree(lock, added, &top.item).await,
 		);
 	}
 	let (uuid, is_dir) = beyond[index - kept.len()];
-	let errors = match backend.normal_item(uuid, is_dir).await {
-		Ok(item) => backend.propagate_tree(added, &item).await,
-		Err(error) => vec![error],
+	let propagated = match backend.normal_item(uuid, is_dir).await {
+		Ok(item) => backend.propagate_tree(lock, added, &item).await,
+		Err(error) => Ok(vec![error]),
 	};
-	(uuid, errors)
+	(uuid, propagated)
 }
 
 /// What the server holds of a top-level item the job created: itself, and everything below a

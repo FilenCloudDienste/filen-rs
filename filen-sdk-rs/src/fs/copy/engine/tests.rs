@@ -1,6 +1,6 @@
 use std::{
 	collections::{HashMap, HashSet},
-	sync::Mutex,
+	sync::{Mutex, atomic::Ordering},
 	time::Duration,
 };
 
@@ -1875,6 +1875,268 @@ async fn a_failed_drive_lock_fails_the_file_at_finalize() {
 	);
 	let report = running.await.unwrap().unwrap();
 	assert_eq!(only_failure(&report).info.stage, CopyStage::Finalize);
+	backend.assert_released(&reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drive_lock_lost_before_registering_is_taken_again_and_the_file_registered() {
+	let destination = Uuid::new_v4();
+	let mut backend = FakeBackend::new(destination);
+	// the registration's lock: its lease is lost before the file is registered
+	backend.lost_on_arrival.insert(0);
+	let backend = Arc::new(backend);
+	let (running, _recorder, reporter) = start(
+		&backend,
+		plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty(), "{:?}", report.failures);
+	assert_eq!(backend.log().finished.len(), 1);
+	// the lost lock, then the one the file was registered under
+	assert_eq!(backend.lock_calls.load(Ordering::SeqCst), 2);
+	backend.assert_released(&reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drive_lock_lost_before_creating_a_directory_is_taken_again_and_it_created() {
+	let destination = Uuid::new_v4();
+	let top = source_dir("Top");
+	let source = tree(&top, vec![], vec![]);
+	let mut backend = FakeBackend::new(destination);
+	// the creation's own lock (the first one keeps the creations' lock warm): its lease is
+	// lost before the directory is created
+	backend.lost_on_arrival.insert(1);
+	let backend = Arc::new(backend);
+	let (running, _recorder, reporter) = start(
+		&backend,
+		plan(destination, vec![source]),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty(), "{:?}", report.failures);
+	assert_eq!(backend.log().created_dirs.len(), 1);
+	// the warm lock, the lost one, then the one the directory was created under
+	assert_eq!(backend.lock_calls.load(Ordering::SeqCst), 3);
+	backend.assert_released(&reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drive_lock_lost_while_propagating_is_waited_for_again_for_the_items_left() {
+	let destination = Uuid::new_v4();
+	let mut backend = FakeBackend::new(destination);
+	backend.later_targets = Some(ConnectedTargets::with_test_users(1));
+	// lost at the first item's propagation, after the propagation pass took its lock
+	backend.lose_leases_at_propagation = Some(0);
+	let backend = Arc::new(backend);
+	let (running, recorder, reporter) = start(
+		&backend,
+		plan(
+			destination,
+			vec![
+				PlanSource::File(source_file("a", 1)),
+				PlanSource::File(source_file("b", 1)),
+				PlanSource::File(source_file("c", 1)),
+			],
+		),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+	let log = backend.log();
+	let top_level: HashSet<Uuid> = report.top_level.iter().map(|t| t.item.uuid()).collect();
+	let trees: HashSet<Uuid> = log.propagated_trees.iter().copied().collect();
+	assert_eq!(trees, top_level);
+	// the first item found the lease lost and sent nothing; the pass waited for a new lock
+	// and sent it again under that one
+	assert_eq!(log.unconfirmed_propagations, 1);
+	// three registrations, the pass's lock, the pass's new lock
+	assert_eq!(backend.lock_calls.load(Ordering::SeqCst), 5);
+	drop(log);
+	assert!(
+		!recorder
+			.events()
+			.iter()
+			.any(|event| matches!(event, CopyEvent::PropagationFailed { .. }))
+	);
+	backend.assert_released(&reporter);
+}
+
+/// Three files copied into a destination shared while the copy ran, so the pass after it
+/// propagates each of them: with `lost` the first one's propagation finds the pass's lock lost.
+fn three_files_shared_meanwhile(destination: Uuid) -> (FakeBackend, ItemPlan<()>) {
+	let mut backend = FakeBackend::new(destination);
+	backend.later_targets = Some(ConnectedTargets::with_test_users(1));
+	// lost at the first item's propagation, after the propagation pass took its lock (call 3,
+	// after the three registrations)
+	backend.lose_leases_at_propagation = Some(0);
+	let plan = plan(
+		destination,
+		vec![
+			PlanSource::File(source_file("a", 1)),
+			PlanSource::File(source_file("b", 1)),
+			PlanSource::File(source_file("c", 1)),
+		],
+	);
+	(backend, plan)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drive_lock_not_had_again_fails_the_propagation_of_every_item_left() {
+	let destination = Uuid::new_v4();
+	let (mut backend, plan) = three_files_shared_meanwhile(destination);
+	// the pass's wait for a new lock fails
+	backend.fail_locks_from = Some((4, ErrorKind::Server));
+	let backend = Arc::new(backend);
+	let (running, recorder, reporter) = start(&backend, plan, JobControl::default());
+	let report = running.await.unwrap().unwrap();
+	assert!(backend.log().propagated_trees.is_empty());
+	let mut failed: Vec<(Uuid, ErrorKind)> = recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			CopyEvent::PropagationFailed { dest_uuid, error } => Some((dest_uuid, error.kind())),
+			_ => None,
+		})
+		.collect();
+	failed.sort_by_key(|(uuid, _)| *uuid);
+	let mut expected: Vec<(Uuid, ErrorKind)> = report
+		.top_level
+		.iter()
+		.map(|top| (top.item.uuid(), ErrorKind::Server))
+		.collect();
+	expected.sort_by_key(|(uuid, _)| *uuid);
+	assert_eq!(expected.len(), 3);
+	assert_eq!(failed, expected, "each item left is reported, none skipped");
+	backend.assert_released(&reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_ends_a_wait_for_the_drive_lock_again_while_propagating() {
+	let destination = Uuid::new_v4();
+	let (backend, plan) = three_files_shared_meanwhile(destination);
+	// another client holds the lock by the time the pass waits for it again
+	backend.block_locks_from.send_replace(Some(4));
+	let backend = Arc::new(backend);
+	let (_pause, cancel, control) = controls();
+	let (running, recorder, reporter) = start(&backend, plan, control);
+
+	wait_until("the propagation waits for the drive lock again", || {
+		backend.log().lock_waits == 1
+	})
+	.await;
+	cancel.send_replace(true);
+	let CopyFailed { report, error } = tokio::time::timeout(Duration::from_secs(600), running)
+		.await
+		.expect("a cancel ends a wait for the drive lock")
+		.unwrap()
+		.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
+	backend.assert_released(&reporter);
+	assert_eq!(report.top_level.len(), 3, "the copied files are kept");
+	assert!(backend.log().propagated_trees.is_empty());
+	assert_eq!(recorder.last().phase, CopyPhase::Cancelled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_registered_file_whose_lock_was_lost_is_propagated_under_a_new_one() {
+	let destination = Uuid::new_v4();
+	let mut backend = FakeBackend::new(destination);
+	backend.targets = ConnectedTargets::with_test_users(1);
+	// lost after the registration, before its propagation
+	backend.lose_leases_at_propagation = Some(0);
+	let backend = Arc::new(backend);
+	let (running, recorder, reporter) = start(
+		&backend,
+		plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty(), "{:?}", report.failures);
+	let log = backend.log();
+	assert_eq!(log.finished.len(), 1);
+	assert_eq!(log.unconfirmed_propagations, 1);
+	assert_eq!(log.propagated, [report.top_level[0].item.uuid()]);
+	// the registration's lock, then the one the file was propagated under
+	assert_eq!(backend.lock_calls.load(Ordering::SeqCst), 2);
+	drop(log);
+	assert!(
+		!recorder
+			.events()
+			.iter()
+			.any(|event| matches!(event, CopyEvent::PropagationFailed { .. }))
+	);
+	backend.assert_released(&reporter);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_while_a_registered_file_waits_for_the_lock_again_reports_its_propagation() {
+	let destination = Uuid::new_v4();
+	let mut backend = FakeBackend::new(destination);
+	backend.targets = ConnectedTargets::with_test_users(1);
+	backend.lose_leases_at_propagation = Some(0);
+	// another client holds the lock once the registration's is lost
+	backend.block_locks_from.send_replace(Some(1));
+	let backend = Arc::new(backend);
+	let (_pause, cancel, control) = controls();
+	let (running, recorder, reporter) = start(
+		&backend,
+		plan(destination, vec![PlanSource::File(source_file("a.txt", 5))]),
+		control,
+	);
+
+	wait_until("the propagation waits for the drive lock again", || {
+		backend.log().lock_waits == 1
+	})
+	.await;
+	cancel.send_replace(true);
+	let CopyFailed { report, error } = tokio::time::timeout(Duration::from_secs(600), running)
+		.await
+		.expect("a cancel ends a wait for the drive lock")
+		.unwrap()
+		.unwrap_err();
+
+	assert_eq!(error.kind(), ErrorKind::Cancelled);
+	backend.assert_released(&reporter);
+	assert_eq!(backend.log().finished.len(), 1, "the file is registered");
+	assert!(backend.log().propagated.is_empty());
+	let file = report.top_level[0].item.uuid();
+	let failed: Vec<(Uuid, ErrorKind)> = recorder
+		.events()
+		.into_iter()
+		.filter_map(|event| match event {
+			CopyEvent::PropagationFailed { dest_uuid, error } => Some((dest_uuid, error.kind())),
+			_ => None,
+		})
+		.collect();
+	assert_eq!(failed, [(file, ErrorKind::LockLost)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_created_directory_whose_lock_was_lost_is_colored_and_propagated_under_a_new_one() {
+	let destination = Uuid::new_v4();
+	let top = source_dir("Top");
+	let source = tree(&top, vec![], vec![]);
+	let mut backend = FakeBackend::new(destination);
+	backend.targets = ConnectedTargets::with_test_users(1);
+	// the creation's own lock (the first one keeps the creations' lock warm) is lost after
+	// the create: its color and propagation wait for a new one
+	backend.lose_leases_after_creates = true;
+	let backend = Arc::new(backend);
+	let (running, _recorder, reporter) = start(
+		&backend,
+		plan(destination, vec![source]),
+		JobControl::default(),
+	);
+	let report = running.await.unwrap().unwrap();
+	assert!(report.failures.is_empty(), "{:?}", report.failures);
+	let log = backend.log();
+	assert_eq!(log.created_dirs.len(), 1);
+	assert_eq!(log.colored.len(), 1);
+	assert_eq!(log.propagated.len(), 1);
+	// the warm lock, the creation's, then the one taken again after the create
+	assert_eq!(backend.lock_calls.load(Ordering::SeqCst), 3);
+	drop(log);
 	backend.assert_released(&reporter);
 }
 

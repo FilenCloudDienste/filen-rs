@@ -24,7 +24,7 @@ use crate::{
 	fs::{categories::NonRootItemType, file::chunk::Chunk},
 	progress::ThrottledProgress,
 	runtime::{blocking_join, do_cpu_intensive},
-	sync::lock::ResourceLock,
+	sync::lock::{ResourceLock, confirm_or_retake},
 	util::{MaybeArc, MaybeSend, MaybeSendBoxFuture, MaybeSendCallback},
 };
 
@@ -573,10 +573,17 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 		let client = self.client;
 		let file = self.file.clone();
 		let upload_key = self.upload_key.clone();
-		let future: MaybeSendBoxFuture<
-			'a,
-			Result<filen_types::api::v3::upload::empty::Response, Error>,
-		> = Box::pin(async move { complete_upload(client, &file, &upload_key, completion).await });
+		let future: MaybeSendBoxFuture<'a, Result<(UploadResponse, Arc<ResourceLock>), Error>> =
+			Box::pin(async move {
+				// The lock was waited for together with the confirm callback, which can take
+				// long. Nothing was read under it, so a lost lease is taken again rather than
+				// the uploaded chunks thrown away.
+				let drive_lock = confirm_or_retake(&drive_lock, || client.lock_drive())
+					.await?
+					.unwrap_or(drive_lock);
+				let response = complete_upload(client, &file, &upload_key, completion).await?;
+				Ok((response, drive_lock))
+			});
 
 		Ok(FileWriterCompletingState {
 			file: self.file,
@@ -584,7 +591,6 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 			completion,
 			remote_file_info: self.remote_file_info,
 			client: self.client,
-			drive_lock,
 		})
 	}
 
@@ -600,10 +606,13 @@ impl<'a> FileWriterWaitingForDriveLockState<'a> {
 	}
 }
 
+/// What registering an upload answers.
+type UploadResponse = filen_types::api::v3::upload::empty::Response;
+
 struct FileWriterCompletingState<'a> {
 	file: Arc<BaseFile>,
-	drive_lock: Arc<ResourceLock>,
-	future: MaybeSendBoxFuture<'a, Result<filen_types::api::v3::upload::empty::Response, Error>>,
+	/// Registers the upload, under a drive lock it hands on to the finalizing state.
+	future: MaybeSendBoxFuture<'a, Result<(UploadResponse, Arc<ResourceLock>), Error>>,
 	completion: UploadCompletion,
 	remote_file_info: RemoteFileInfo,
 	client: &'a Client,
@@ -613,17 +622,18 @@ impl<'a> FileWriterCompletingState<'a> {
 	fn poll_close(
 		&mut self,
 		cx: &mut std::task::Context<'_>,
-	) -> std::task::Poll<std::io::Result<filen_types::api::v3::upload::empty::Response>> {
+	) -> std::task::Poll<std::io::Result<(UploadResponse, Arc<ResourceLock>)>> {
 		match self.future.poll_unpin(cx) {
 			std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::other(e))),
-			std::task::Poll::Ready(Ok(response)) => std::task::Poll::Ready(Ok(response)),
+			std::task::Poll::Ready(Ok(registered)) => std::task::Poll::Ready(Ok(registered)),
 			std::task::Poll::Pending => std::task::Poll::Pending,
 		}
 	}
 
 	fn into_finalizing_state(
 		self,
-		response: filen_types::api::v3::upload::empty::Response,
+		response: UploadResponse,
+		drive_lock: Arc<ResourceLock>,
 	) -> FileWriterFinalizingState<'a> {
 		let file = Arc::try_unwrap(self.file).unwrap_or_else(|arc| (*arc).clone());
 		let file = Arc::new(remote_file_from_upload(
@@ -636,29 +646,22 @@ impl<'a> FileWriterCompletingState<'a> {
 			FuturesUnordered::new();
 
 		let temp_file = file.clone();
+		// The future owns the drive lock, so the lock is held until the finalizing API calls
+		// complete; dropping it early would release it mid-finalize. See `ResourceLock`'s `Drop`.
 		futures.push(Box::pin(async move {
 			self.client
-				.update_item_with_maybe_connected_parent(NonRootItemType::File(Cow::Borrowed(
-					temp_file.as_ref(),
-				)))
+				.update_item_with_maybe_connected_parent(
+					&drive_lock,
+					NonRootItemType::File(Cow::Borrowed(temp_file.as_ref())),
+				)
 				.await?;
 			Ok(())
 		}) as MaybeSendBoxFuture<'a, Result<(), Error>>);
-		FileWriterFinalizingState {
-			file,
-			futures,
-			// Held (not read) to keep the server-side drive lock alive until the
-			// finalizing API calls above complete; dropping it early would release
-			// the lock mid-finalize. See `ResourceLock`'s `Drop` impl.
-			_drive_lock: self.drive_lock,
-		}
+		FileWriterFinalizingState { file, futures }
 	}
 }
 
 struct FileWriterFinalizingState<'a> {
-	// Held (not read) to keep the server-side drive lock alive for the lifetime of
-	// this state, until the finalizing API calls complete. See `ResourceLock`'s `Drop`.
-	_drive_lock: Arc<ResourceLock>,
 	file: Arc<RemoteFile>,
 	futures: FuturesUnordered<MaybeSendBoxFuture<'a, Result<(), Error>>>,
 }
@@ -882,9 +885,9 @@ where
 				unreachable!("Should be handled by the first part of this function")
 			}
 			FileWriterState::Completing(mut completing) => match completing.poll_close(cx) {
-				std::task::Poll::Ready(Ok(response)) => {
-					FileWriterState::Finalizing(completing.into_finalizing_state(response))
-				}
+				std::task::Poll::Ready(Ok((response, drive_lock))) => FileWriterState::Finalizing(
+					completing.into_finalizing_state(response, drive_lock),
+				),
 				std::task::Poll::Ready(Err(e)) => {
 					return std::task::Poll::Ready(Err(e));
 				}

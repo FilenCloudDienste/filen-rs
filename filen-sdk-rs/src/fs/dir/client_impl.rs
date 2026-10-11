@@ -54,7 +54,7 @@ impl Client {
 		name: &str,
 		created: DateTime<Utc>,
 	) -> Result<RemoteDirectory, Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		let (uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
 		let dir = match self.post_create_dir(parent, uuid, meta).await? {
@@ -67,7 +67,7 @@ impl Client {
 			CreateDirOutcome::Merged(existing) => return self.get_dir(existing).await,
 		};
 
-		self.update_item_with_maybe_connected_parent((&dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&dir).into())
 			.await?;
 		Ok(dir)
 	}
@@ -302,7 +302,7 @@ impl Client {
 	}
 
 	pub async fn restore_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		api::v3::dir::restore::post(
 			self.client(),
 			&api::v3::dir::restore::Request { uuid: dir.uuid() },
@@ -316,7 +316,7 @@ impl Client {
 		// Mirror the restored subtree's metadata into the (now current) parent's
 		// shares/links (as create/upload do); otherwise recipients of a connected
 		// parent cannot see or decrypt the restored items.
-		self.update_item_with_maybe_connected_parent((&*dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into())
 			.await?;
 		Ok(())
 	}
@@ -353,7 +353,7 @@ impl Client {
 		);
 		// Propagate a failed drive lock instead of proceeding unlocked, matching the
 		// `let _lock = self.lock_drive().await?` guard every other dir/file op uses.
-		let _lock = lock_result?;
+		let lock = lock_result?;
 
 		api::v3::dir::metadata::post(
 			self.client(),
@@ -366,7 +366,7 @@ impl Client {
 		.await?;
 
 		dir.update_meta(changes)?;
-		self.update_maybe_connected_item(dir).await?;
+		self.update_maybe_connected_item(&lock, dir).await?;
 
 		Ok(())
 	}
@@ -380,7 +380,7 @@ impl Client {
 		dir: DirType<'a, Normal>,
 		path: &str,
 	) -> Result<DirType<'a, Normal>, Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		let mut curr_dir = dir;
 		for (component, remaining_path) in path.path_iter() {
 			let (dirs, files) = self
@@ -413,6 +413,9 @@ impl Client {
 				continue;
 			}
 
+			// The listing above was read under this lock: create_dir would take a fresh one
+			// once it is lost, and create a name someone may have taken since.
+			lock.confirm().await?;
 			let new_dir = self.create_dir(&curr_dir, component).await?;
 			curr_dir = DirType::Dir(Cow::Owned(new_dir));
 		}
@@ -431,7 +434,7 @@ impl Client {
 		dir: &mut RemoteDirectory,
 		new_parent: &DirType<'_, Normal>,
 	) -> Result<(), Error> {
-		let _lock = self.lock_drive().await?;
+		let lock = self.lock_drive().await?;
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {
@@ -444,7 +447,7 @@ impl Client {
 		// Mirror the moved subtree's metadata into the new parent's shares/links (as
 		// create/upload do); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in items.
-		self.update_item_with_maybe_connected_parent((&*dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into())
 			.await?;
 		Ok(())
 	}

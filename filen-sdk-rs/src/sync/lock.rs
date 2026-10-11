@@ -793,8 +793,6 @@ impl Lease for Arc<ResourceLock> {
 /// held lease: one following a write that already landed (adding a new item to the links and
 /// shares it belongs in), or one depending on nothing read under the held lock. Any other
 /// failure to confirm or to retake is returned.
-// The drive call sites that use it arrive in the next commit; until then only its test does.
-#[allow(dead_code)]
 pub(crate) async fn confirm_or_retake<L, Fut>(
 	held: &L,
 	retake: impl FnOnce() -> Fut,

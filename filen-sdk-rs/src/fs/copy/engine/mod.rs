@@ -53,7 +53,7 @@ use crate::{
 			dir::{CreatedDirOutcome, DirError, DirTask, create_dir},
 			finalize::{FinalizeError, FinalizeTask, Finalized, finalize_new_file},
 			listing::FailedSource,
-			lock::{HeldLock, LockWait, wait_for_lock},
+			lock::{HeldLock, LockWait, lock_reporting_pauses, wait_for_lock},
 			name_retry::NameRetry,
 			plan::{DestParent, ItemPlan, PlannedFile, PlannedItem, RenameReason, RenamedEntry},
 		},
@@ -693,26 +693,56 @@ where
 			if added.is_empty() {
 				continue;
 			}
-			let _lock = loop {
-				match wait_for_lock(&*self.backend, &self.control, &self.reporter.ops()).await? {
-					LockWait::Locked(held) => break held,
-					LockWait::Paused => self.reporter.checkpoint(&self.control).await?,
-					LockWait::Failed(error) => {
+			let mut lock =
+				match lock_reporting_pauses(&*self.backend, &self.control, &self.reporter).await? {
+					Ok(lock) => lock,
+					Err(error) => {
 						tracing::warn!(
 							"failed to lock the drive to propagate copied items: {error}"
 						);
-						continue 'requests;
+						continue;
 					}
-				}
-			};
+				};
 			// the top-level items this copy created in the destination
-			let created = self
+			let created: Vec<_> = self
 				.report
 				.top_level
 				.iter()
-				.filter(|top| self.requests[top.request].destination == Some(destination));
-			for top in created {
-				for error in self.backend.propagate_tree(&added, &top.item).await {
+				.filter(|top| self.requests[top.request].destination == Some(destination))
+				.collect();
+			for (index, top) in created.iter().enumerate() {
+				let errors = loop {
+					let unconfirmed = match self
+						.backend
+						.propagate_tree(lock.lock(), &added, &top.item)
+						.await
+					{
+						Ok(errors) => break errors,
+						Err(unconfirmed) => unconfirmed,
+					};
+					// The items exist already and nothing was read under the lock, so a lease
+					// that cannot be confirmed is waited for again rather than failing every item
+					// still to propagate.
+					tracing::warn!("{unconfirmed}; waiting for the drive lock again");
+					drop(lock);
+					lock =
+						match lock_reporting_pauses(&*self.backend, &self.control, &self.reporter)
+							.await?
+						{
+							Ok(lock) => lock,
+							Err(error) => {
+								let error = Arc::new(error);
+								for top in &created[index..] {
+									self.reporter.event(CopyEvent::PropagationFailed {
+										dest_uuid: top.item.uuid(),
+										error: Arc::clone(&error),
+									});
+								}
+								continue 'requests;
+							}
+						};
+				};
+				for error in errors {
 					self.reporter.event(CopyEvent::PropagationFailed {
 						dest_uuid: top.item.uuid(),
 						error: Arc::new(error),

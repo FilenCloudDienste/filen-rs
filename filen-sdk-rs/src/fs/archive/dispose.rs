@@ -547,7 +547,7 @@ async fn remove_file<B: DisposalBackend>(
 	how: SourceDisposal,
 	removing: Removing<'_>,
 ) -> Result<(), KeptReason> {
-	let _lock = lock_for_removal(backend, removing).await?;
+	let lock = lock_for_removal(backend, removing).await?;
 	let control = removing.control;
 	if !file.matches(&checked(control, backend.file_state(file.uuid)).await?) {
 		return Err(KeptReason::Changed);
@@ -558,6 +558,9 @@ async fn remove_file<B: DisposalBackend>(
 		return Err(KeptReason::HasVersions);
 	}
 	unless_stopping(control)?;
+	// The checks above were read under this lock: once its lease is lost, another client may
+	// have changed the file since.
+	lock.confirm().await.map_err(KeptReason::failed)?;
 	match how {
 		SourceDisposal::Trash => backend.trash_file(file.uuid).await,
 		SourceDisposal::DeletePermanently => backend.delete_file_permanently(file.uuid).await,
@@ -598,7 +601,7 @@ async fn remove_dir<B: DisposalBackend>(
 	bytes_freed: &mut u64,
 ) -> Result<(), KeptReason> {
 	let (dir, read) = (expected.uuid, &expected.read);
-	let _lock = lock_for_removal(backend, removing).await?;
+	let lock = lock_for_removal(backend, removing).await?;
 	let control = removing.control;
 	if !expected.matches(&checked(control, backend.dir_state(dir)).await?)
 		|| checked(control, backend.list_tree(dir)).await? != *read
@@ -606,8 +609,8 @@ async fn remove_dir<B: DisposalBackend>(
 		return Err(KeptReason::Changed);
 	}
 	if how == SourceDisposal::DeletePermanently {
-		// every file is checked before any is deleted: a directory is removed whole or not at
-		// all for this reason
+		// every file is checked before any is deleted, so a file with older versions never leaves
+		// the directory partly removed (a stop, a failed delete or a lost lease still can)
 		for &uuid in read.files.keys() {
 			if checked(control, backend.has_older_versions(uuid)).await? {
 				return Err(KeptReason::HasVersions);
@@ -615,6 +618,9 @@ async fn remove_dir<B: DisposalBackend>(
 		}
 		for (&uuid, &size) in &read.files {
 			unless_stopping(control)?;
+			// The checks above were read under this lock: once its lease is lost, another client
+			// may have changed the directory since.
+			lock.confirm().await.map_err(KeptReason::failed)?;
 			backend
 				.delete_file_permanently(uuid)
 				.await
@@ -632,6 +638,7 @@ async fn remove_dir<B: DisposalBackend>(
 		}
 	}
 	unless_stopping(control)?;
+	lock.confirm().await.map_err(KeptReason::failed)?;
 	backend.trash_dir(dir).await.map_err(KeptReason::failed)
 }
 

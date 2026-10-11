@@ -468,6 +468,29 @@ async fn a_cancel_while_the_output_is_checked_keeps_the_archive_as_interrupted()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_lost_while_the_archive_is_checked_keeps_it_as_failed() {
+	let (setup, job, _cancel) = start_disposing(&[("a.txt", b"alpha")]);
+	// the archive's own state is asked for only right before it goes to the trash
+	setup
+		.backend
+		.hold_requests(Request::State, [setup.archive.uuid()]);
+	wait_until("the archive is checked", || {
+		!setup.backend.log().held.is_empty()
+	})
+	.await;
+	// what the check reads no longer stands under the lock, so nothing may be removed on it
+	setup.backend.lose_leases();
+	setup.backend.release_all();
+	let report = job.running.await.unwrap().unwrap();
+	match kept(disposition(&report)) {
+		KeptReason::Failed { error } => assert_eq!(error.kind(), ErrorKind::LockLost),
+		other => panic!("expected the archive kept as failed, got {other:?}"),
+	}
+	assert!(setup.backend.log().trashed_files.is_empty());
+	assert_released(&setup, &job.reporter, &job.recorder);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_while_the_archive_is_removed_keeps_it_as_interrupted() {
 	let (setup, job, cancel) = start_disposing(&[("a.txt", b"alpha")]);
 	// the archive's own state is asked for only right before it goes to the trash

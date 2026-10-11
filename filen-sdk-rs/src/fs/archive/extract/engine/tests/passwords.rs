@@ -314,6 +314,53 @@ async fn a_wrong_password_found_late_keeps_the_directories_when_the_lock_does_no
 	);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_wrong_password_found_late_keeps_the_directories_once_the_lease_is_lost() {
+	let setup = setup("bundle.tar", tar_of(&[("a.txt", b"a")]), |_| {});
+	let (events, result, link) = worker::test_support::scripted::<CodecResult>();
+	let job = start_with(&setup, Options::default(), Box::new(move || Ok(link)));
+	events
+		.send(WorkerEvent::Opened(ArchiveFormat::Tar { codec: None }))
+		.await
+		.unwrap();
+	events.send(dir_entry(0, "docs")).await.unwrap();
+	wait_until("the folders are created", || {
+		created_dirs(&setup) == ["bundle", "docs"]
+	})
+	.await;
+	let root = setup
+		.backend
+		.log()
+		.created_dirs
+		.iter()
+		.find(|(_, name)| name == "bundle")
+		.map(|(uuid, _)| *uuid)
+		.unwrap();
+	// the folder is listed under the lock before it is trashed; the lease is lost meanwhile
+	setup.backend.hold_requests(Request::List, [root]);
+	drop(events);
+	result
+		.send(Err(Error::custom(ErrorKind::ArchiveWrongPassword, "wrong")))
+		.unwrap();
+	wait_until("the folder is listed", || {
+		!setup.backend.log().held.is_empty()
+	})
+	.await;
+	setup.backend.lose_leases();
+	setup.backend.release_all();
+	let failed = job.running.await.unwrap().unwrap_err();
+	assert_eq!(failed.error.kind(), ErrorKind::ArchiveWrongPassword);
+	assert!(
+		setup.backend.log().trashed_dirs.is_empty(),
+		"what the listing read no longer stands, so the folder is not trashed on it"
+	);
+	assert_eq!(
+		failed.report.top_level.len(),
+		1,
+		"the report still lists the folder it kept"
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_entries_of_a_zip_are_extracted_without_the_password_its_other_entries_need() {
 	let zip = zip_with_passwords(&[

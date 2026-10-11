@@ -187,9 +187,10 @@ pub enum ErrorKind {
 	/// The password given does not open the archive's entries. Usually found before anything is
 	/// created. An extraction that finds it only later, before any file was extracted, tries to
 	/// move the folders it created to the trash, so a retry with the right password starts
-	/// clean. It keeps any folder that now holds a file, or that it could not list or trash, and
-	/// all of them when it cannot get the drive lock in time; its report's top-level items list
-	/// the folders it kept.
+	/// clean. It keeps any folder that now holds a file, or that it could not list or trash, all
+	/// of them when it cannot get the drive lock in time, and those not trashed yet once the
+	/// lock's lease is lost or cannot be confirmed; its report's top-level items list the folders
+	/// it kept.
 	ArchiveWrongPassword,
 	/// A 7z entry is stored in a solid block after more bytes of other files than the download
 	/// allowed to decode and throw away before it. Its source, a `SolidSkipExceeded` reached with
@@ -198,7 +199,7 @@ pub enum ErrorKind {
 	/// The operation stopped before a write because the resource lock it held lost its
 	/// server-side lease: another client may hold the resource now. Nothing was written after
 	/// the loss, and running the operation again, which takes the lock afresh, repeats no write
-	/// it made before.
+	/// it made before. A job reports it for an item whose step it did not send.
 	LockLost,
 }
 
