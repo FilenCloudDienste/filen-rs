@@ -666,3 +666,50 @@ mod tests {
 		assert_eq!(master_keys_vec, keys);
 	}
 }
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+pub(crate) mod test_support {
+	use rsa::pkcs8::EncodePrivateKey;
+
+	use super::*;
+
+	/// A client whose every request fails without leaving the machine: each one goes to a proxy
+	/// on a local port nothing listens on, which refuses the connection.
+	pub(crate) fn offline_unauthed() -> UnauthClient {
+		let mut unauthed =
+			UnauthClient::from_config(ClientConfig::default()).expect("the defaults are valid");
+		unauthed.reqwest_client = reqwest::Client::builder()
+			.proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("a valid proxy URL"))
+			.build()
+			.expect("a client with a proxy builds");
+		unauthed
+	}
+
+	/// A logged-in [`offline_unauthed`] client. The error a call fails with names the URL of the
+	/// request that failed, so a test can tell which request the call sent first.
+	pub(crate) fn offline_client() -> Client {
+		// tiny key: never used for real crypto, only to make a client that parses
+		let key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512).expect("a test key");
+		offline_unauthed()
+			.from_stringified(StringifiedClient {
+				email: "offline@example.com".to_owned(),
+				user_id: 1,
+				root_uuid: Uuid::from_u128(1).to_string(),
+				auth_info: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+					.to_owned(),
+				private_key: BASE64_STANDARD
+					.encode(key.to_pkcs8_der().expect("a test key encodes").as_bytes()),
+				api_key: "test-api-key".to_owned(),
+				auth_version: 2,
+				max_parallel_requests: None,
+				max_io_memory_usage: None,
+			})
+			.expect("the client parses")
+	}
+
+	/// Whether `error` is the failure of a lock request (`v3/user/lock`): what a call that takes
+	/// a lock before anything else fails with on an [`offline_client`].
+	pub(crate) fn is_lock_request_failure(error: &Error) -> bool {
+		error.to_string().contains(api::v3::user::lock::ENDPOINT)
+	}
+}

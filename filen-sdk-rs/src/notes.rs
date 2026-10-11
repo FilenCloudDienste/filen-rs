@@ -570,6 +570,7 @@ impl Client {
 			}),
 			self.lock_notes()
 		);
+		let _lock = _lock?;
 
 		let response = api::v3::notes::create::post(
 			self.client(),
@@ -715,6 +716,7 @@ impl Client {
 			}),
 			self.lock_notes()
 		);
+		let _lock = _lock?;
 
 		let response = api::v3::notes::content::edit::post(
 			self.client(),
@@ -742,6 +744,7 @@ impl Client {
 			do_cpu_intensive(|| NoteTitle::blocking_encrypt(key, &new_title,)),
 			self.lock_notes()
 		);
+		let _lock = _lock?;
 
 		api::v3::notes::title::edit::post(
 			self.client(),
@@ -972,6 +975,7 @@ impl Client {
 			do_cpu_intensive(|| NoteTagName::blocking_encrypt(&*crypter, &name)),
 			self.lock_notes()
 		);
+		let _lock = _lock?;
 
 		let response = api::v3::notes::tags::create::post(
 			self.client(),
@@ -996,6 +1000,7 @@ impl Client {
 			do_cpu_intensive(|| NoteTagName::blocking_encrypt(&*crypter, &new_name)),
 			self.lock_notes()
 		);
+		let _lock = _lock?;
 
 		let resp = api::v3::notes::tags::rename::post(
 			self.client(),
@@ -1444,6 +1449,8 @@ mod tests {
 	use filen_types::api::v3::notes::{Note, NoteType};
 
 	use super::*;
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use crate::auth::unauth::test_support::{is_lock_request_failure, offline_client};
 	use crate::{crypto::v2::MasterKey, fs::meta_recovery::test_support::TEST_RSA_KEY};
 
 	fn wire_note(owner_id: u64, metadata: EncryptedString<'static>) -> Note<'static> {
@@ -1494,5 +1501,74 @@ mod tests {
 		let note = wire_note(42, metadata);
 
 		assert!(blocking_decrypt_note_key_for_user(99, &TEST_RSA_KEY, &master_key, &note).is_err());
+	}
+
+	/// A note of the user's whose key is known, as listed.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn decrypted_note() -> super::Note {
+		super::Note {
+			uuid: Uuid::from_u128(1),
+			owner_id: 1,
+			last_editor_id: 1,
+			favorite: false,
+			pinned: false,
+			tags: Vec::new(),
+			note_type: NoteType::Text,
+			encryption_key: Some(NoteOrChatKey::generate()),
+			title: Some("title".to_owned()),
+			preview: Some(String::new()),
+			trash: false,
+			archive: false,
+			created_timestamp: DateTime::<Utc>::default(),
+			edited_timestamp: DateTime::<Utc>::default(),
+			participants: Vec::new(),
+		}
+	}
+
+	// On an offline client every request fails, so each call below fails at its first request:
+	// the notes lock's acquisition, which must not be dropped for the write to go ahead unlocked.
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn create_note_fails_with_its_lock_acquisition() {
+		let error = offline_client().create_note(None).await.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn set_note_content_fails_with_its_lock_acquisition() {
+		let error = offline_client()
+			.set_note_content(&mut decrypted_note(), "content", "preview".to_owned())
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn set_note_title_fails_with_its_lock_acquisition() {
+		let error = offline_client()
+			.set_note_title(&mut decrypted_note(), "new title".to_owned())
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn rename_note_tag_fails_with_its_lock_acquisition() {
+		let mut tag = NoteTag {
+			uuid: Uuid::from_u128(2),
+			name: Some("tag".to_owned()),
+			favorite: false,
+			edited_timestamp: DateTime::<Utc>::default(),
+			created_timestamp: DateTime::<Utc>::default(),
+		};
+		let error = offline_client()
+			.rename_note_tag(&mut tag, "renamed".to_owned())
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
 	}
 }
