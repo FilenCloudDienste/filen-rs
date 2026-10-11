@@ -1462,10 +1462,25 @@ impl AuthClient {
 	where
 		Res: DeserializeOwned + Debug,
 	{
+		self.post_raw_bytes_auth_with(request, url, endpoint, &self.unauthed.state.concurrency)
+			.await
+	}
+
+	/// [`Self::post_raw_bytes_auth`] under the concurrency limit `concurrency`.
+	async fn post_raw_bytes_auth_with<Res>(
+		&self,
+		request: Bytes,
+		url: &str,
+		endpoint: Cow<'static, str>,
+		concurrency: &GlobalConcurrencyLimitLayer,
+	) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+	{
 		let builder = ServiceBuilder::new()
 			.layer(logging::LogLayer::new(endpoint)) // optional logging
 			.layer(url_parser::UrlParseLayer) // required to parse URL string to reqwest::Url
-			.layer(self.unauthed.state.concurrency.clone()) // optional
+			.layer(concurrency.clone()) // optional
 			.layer(self.unauthed.state.retry.clone()) // required to map RetryError to Error
 			.layer(self.unauthed.state.rate_limiter.clone()) // optional
 			.layer(deserialize::DeserializeLayer::<Res>::new())
