@@ -196,6 +196,9 @@ impl JsClient {
 		UnauthJsClient::new(self.inner_ref().get_unauthed())
 	}
 
+	/// Takes the client's "auth" lock while it runs.
+	/// Do not call it while holding an "auth" lock taken with `acquireLock`: that
+	/// lock bypasses the client's lock sharing, so this call waits until it is released.
 	#[cfg_attr(
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen(js_name = "changeEmail")

@@ -789,6 +789,7 @@ impl Client {
 	}
 
 	pub async fn change_email(&self, password: &str, new_email: &str) -> Result<(), Error> {
+		let _lock = self.lock_auth().await?;
 		let auth_info = (**self.auth_info.read().unwrap_or_else(|e| e.into_inner())).clone();
 
 		let (derived_password, auth_version) = match auth_info {
@@ -975,6 +976,21 @@ mod tests {
 			max_io_memory_usage: None,
 		};
 		assert!(unauth.from_stringified(stringified).is_err());
+	}
+
+	// On an offline client every request fails, so the call fails at its first request: the
+	// auth lock's acquisition, taken before the password is derived and the change posted.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn change_email_takes_the_lock_first() {
+		let error = unauth::test_support::offline_client()
+			.change_email("password", "new@example.com")
+			.await
+			.unwrap_err();
+		assert!(
+			unauth::test_support::is_lock_request_failure(&error),
+			"{error}"
+		);
 	}
 
 	#[test]
