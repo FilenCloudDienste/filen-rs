@@ -33,7 +33,8 @@ pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_s
 pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
-/// The lock is released when the [`ResourceLock`] is dropped.
+/// The lock is released when the [`ResourceLock`] is dropped; its clones share the lock, which
+/// is released once the last of them is dropped.
 ///
 /// While the lock is held, no other client can acquire the lock on the same resource.
 /// The lock is automatically released [`LOCK_SERVER_TTL`] after the last refresh the
@@ -52,11 +53,18 @@ pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 /// its own after ~60 seconds.
 #[derive(Debug, Clone)]
 pub struct ResourceLock {
+	lease: Arc<SharedLease>,
+}
+
+/// The server-side lease a [`ResourceLock`] and its clones hold together, released once the
+/// last of them is dropped.
+#[derive(Debug)]
+struct SharedLease {
 	uuid: Uuid,
 	client: Arc<AuthClient>,
 	resource: String,
 	// Flipped to false (never back) by the keep-alive task once the server-side
-	// lease can no longer be trusted. See [`Self::is_valid`].
+	// lease can no longer be trusted. See [`ResourceLock::is_valid`].
 	valid: tokio::sync::watch::Sender<bool>,
 	// The runtime the lock was acquired on. The refresh task is spawned on it, and Drop —
 	// which can run on a thread with no ambient tokio runtime (e.g. a foreign FFI finalizer
@@ -67,7 +75,8 @@ pub struct ResourceLock {
 
 impl PartialEq for ResourceLock {
 	fn eq(&self, other: &Self) -> bool {
-		self.uuid == other.uuid && self.client == other.client && self.resource == other.resource
+		let (this, other) = (&self.lease, &other.lease);
+		this.uuid == other.uuid && this.client == other.client && this.resource == other.resource
 	}
 }
 
@@ -75,7 +84,7 @@ impl Eq for ResourceLock {}
 
 impl ResourceLock {
 	pub fn resource(&self) -> &str {
-		&self.resource
+		&self.lease.resource
 	}
 
 	/// Whether the background keep-alive still holds this lock's server-side lease.
@@ -85,14 +94,14 @@ impl ResourceLock {
 	/// resource and another client may already hold it. Holders should stop
 	/// relying on the lock and re-acquire. Never flips back to `true`.
 	pub fn is_valid(&self) -> bool {
-		*self.valid.borrow()
+		*self.lease.valid.borrow()
 	}
 
 	/// Resolves once the server-side lease is lost ([`Self::is_valid`] turns
 	/// false); resolves immediately if it already is. Pends indefinitely while
 	/// the lock stays healthy, so callers should race it against their work.
 	pub async fn wait_for_loss(&self) {
-		let mut receiver = self.valid.subscribe();
+		let mut receiver = self.lease.valid.subscribe();
 		// The sender is a field of `self`, so it cannot close while borrowed
 		// here; a closed channel would mean the lock is gone anyway.
 		let _ = receiver.wait_for(|valid| !*valid).await;
@@ -127,7 +136,7 @@ async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
 // everyone immediately instead of stalling it out to the TTL, and if the lease is
 // truly gone the Release is a harmless no-op keyed to our uuid.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn drop(lock: &mut ResourceLock) {
+fn drop(lock: &mut SharedLease) {
 	// Prefer the ambient runtime: it is alive by definition, while the captured handle's
 	// runtime may have shut down since acquisition (spawning there would silently cancel
 	// the release).
@@ -150,7 +159,7 @@ fn drop(lock: &mut ResourceLock) {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn drop(lock: &mut ResourceLock) {
+fn drop(lock: &mut SharedLease) {
 	let client = lock.client.clone();
 	let uuid = lock.uuid;
 	let resource = lock.resource.clone();
@@ -163,7 +172,7 @@ fn drop(lock: &mut ResourceLock) {
 	});
 }
 
-impl Drop for ResourceLock {
+impl Drop for SharedLease {
 	// async drop is not supported in Rust
 	// so we need to use a blocking executor
 	// or a tokio spawn
@@ -254,7 +263,7 @@ where
 	}
 }
 
-async fn run_keep_alive(weak: Weak<ResourceLock>, acquired_at: Instant) {
+async fn run_keep_alive(weak: Weak<SharedLease>, acquired_at: Instant) {
 	let refresh = || {
 		let lock = weak.upgrade()?;
 		Some(async move {
@@ -289,7 +298,7 @@ async fn run_keep_alive(weak: Weak<ResourceLock>, acquired_at: Instant) {
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn keep_lock_alive(lock: &Arc<ResourceLock>, acquired_at: Instant) {
+fn keep_lock_alive(lock: &Arc<SharedLease>, acquired_at: Instant) {
 	let refresh = run_keep_alive(Arc::downgrade(lock), acquired_at);
 	// Same no-ambient-runtime hazard as Drop: spawn on the runtime the lock was acquired
 	// on. The ambient fallback is unreachable through `acquire_lock` (reqwest already
@@ -302,7 +311,7 @@ fn keep_lock_alive(lock: &Arc<ResourceLock>, acquired_at: Instant) {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn keep_lock_alive(lock: &Arc<ResourceLock>, acquired_at: Instant) {
+fn keep_lock_alive(lock: &Arc<SharedLease>, acquired_at: Instant) {
 	// `runtime::spawn_local` pins the spawning SDK worker open for the life of the refresh
 	// loop (it exits when the lock drops or is lost), so the worker cannot close
 	// under a held lock and silently stop refreshing it — the server would expire the lock
@@ -449,7 +458,7 @@ impl Client {
 			attempts,
 		)
 		.await?;
-		let lock = Arc::new(ResourceLock {
+		let lease = Arc::new(SharedLease {
 			uuid,
 			client,
 			resource,
@@ -457,8 +466,8 @@ impl Client {
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			handle: tokio::runtime::Handle::try_current().ok(),
 		});
-		keep_lock_alive(&lock, acquired_at);
-		Ok(lock)
+		keep_lock_alive(&lease, acquired_at);
+		Ok(Arc::new(ResourceLock { lease }))
 	}
 
 	pub async fn acquire_lock_with_default(
@@ -505,14 +514,16 @@ mod tests {
 
 		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
 		ResourceLock {
-			uuid: Uuid::new_v4(),
-			client: Arc::new(AuthClient::from_unauthed(
-				unauthed,
-				Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
-			)),
-			resource: "test-resource".to_string(),
-			valid: tokio::sync::watch::Sender::new(true),
-			handle,
+			lease: Arc::new(SharedLease {
+				uuid: Uuid::new_v4(),
+				client: Arc::new(AuthClient::from_unauthed(
+					unauthed,
+					Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
+				)),
+				resource: "test-resource".to_string(),
+				valid: tokio::sync::watch::Sender::new(true),
+				handle,
+			}),
 		}
 	}
 
@@ -527,7 +538,7 @@ mod tests {
 			.build()
 			.unwrap();
 		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
-		assert!(lock.handle.is_some());
+		assert!(lock.lease.handle.is_some());
 		std::thread::spawn(move || std::mem::drop(lock))
 			.join()
 			.unwrap();
@@ -585,16 +596,34 @@ mod tests {
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[test]
+	fn dropping_a_clone_keeps_the_lock_until_the_last_one_goes() {
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+		let _guard = rt.enter();
+		std::mem::drop(lock.clone());
+		assert_eq!(
+			rt.metrics().num_alive_tasks(),
+			0,
+			"the lock is still held through the original, so nothing is released"
+		);
+		std::mem::drop(lock);
+		assert_eq!(rt.metrics().num_alive_tasks(), 1);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[test]
 	fn keep_lock_alive_without_ambient_runtime_does_not_panic() {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
 			.unwrap();
-		let lock =
-			rt.block_on(async { Arc::new(test_lock(tokio::runtime::Handle::try_current().ok())) });
+		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
 		// A plain thread has no ambient runtime, so the refresh task must ride the
 		// captured handle.
-		std::thread::spawn(move || keep_lock_alive(&lock, Instant::now()))
+		std::thread::spawn(move || keep_lock_alive(&lock.lease, Instant::now()))
 			.join()
 			.unwrap();
 	}
@@ -607,7 +636,7 @@ mod tests {
 			.build()
 			.unwrap();
 		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
-		lock.valid.send_replace(false);
+		lock.lease.valid.send_replace(false);
 		let _guard = rt.enter();
 		assert_eq!(rt.metrics().num_alive_tasks(), 0);
 		std::mem::drop(lock);
@@ -624,7 +653,7 @@ mod tests {
 		let wait = lock.wait_for_loss();
 		tokio::pin!(wait);
 		assert!(futures::poll!(wait.as_mut()).is_pending());
-		lock.valid.send_replace(false);
+		lock.lease.valid.send_replace(false);
 		assert!(!lock.is_valid());
 		wait.await;
 		// resolves immediately when already lost
