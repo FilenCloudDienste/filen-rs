@@ -27,6 +27,7 @@ use crate::{
 		CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA, FULL_CHUNK_BYTES,
 	},
 	crypto::{file::FileKey, shared::CreateRandom, v3::EncryptionKey},
+	error::LockLostError,
 	fs::{
 		HasName, HasUUID,
 		categories::{DirType, NonRootItemType, Normal},
@@ -45,6 +46,7 @@ use crate::{
 		name::ValidatedName,
 	},
 	job::report::{JobState, Reporter},
+	sync::lock::Lease,
 };
 
 use super::{
@@ -212,8 +214,28 @@ impl Drop for Running {
 	}
 }
 
-/// A drive lock the fake hands out, counted in [`FakeBackend::live_locks`] while held.
-pub(crate) type FakeLock = Running;
+/// A drive lock the fake hands out, counted in [`FakeBackend::live_locks`] while held. Its lease
+/// is lost once [`FakeBackend::lose_leases`] runs while it is held, or from the start for an
+/// acquisition in [`FakeBackend::lost_on_arrival`].
+pub(crate) struct FakeLock {
+	_held: Running,
+	/// [`FakeBackend::lease_epoch`] when it was taken.
+	epoch: usize,
+	current: Arc<AtomicUsize>,
+	lost_on_arrival: bool,
+}
+
+impl Lease for FakeLock {
+	async fn confirm(&self) -> Result<(), Error> {
+		if self.lost_on_arrival || self.current.load(Ordering::SeqCst) != self.epoch {
+			return Err(LockLostError {
+				resource: "drive-write".to_owned(),
+			}
+			.into());
+		}
+		Ok(())
+	}
+}
 
 #[derive(Default)]
 pub(crate) struct FakeLog {
@@ -320,6 +342,11 @@ pub(crate) struct FakeBackend {
 	pub(crate) targets_delay: Duration,
 	/// Drive-lock acquisitions from this call index on fail with this kind.
 	pub(crate) fail_locks_from: Option<(usize, ErrorKind)>,
+	/// Drive-lock acquisitions, by call index, that hand out a lock whose lease is already lost,
+	/// as if lost right after it was taken.
+	pub(crate) lost_on_arrival: HashSet<usize>,
+	/// Bumped by [`Self::lose_leases`]; a lock taken in an earlier epoch is lost.
+	lease_epoch: Arc<AtomicUsize>,
 	pub(crate) merge_once: Mutex<HashSet<String>>,
 	pub(crate) targets: ConnectedTargets,
 	pub(crate) later_targets: Option<ConnectedTargets>,
@@ -384,6 +411,8 @@ impl FakeBackend {
 			fail_targets: None,
 			targets_delay: Duration::ZERO,
 			fail_locks_from: None,
+			lost_on_arrival: HashSet::new(),
+			lease_epoch: Arc::default(),
 			merge_once: Mutex::new(HashSet::new()),
 			targets: ConnectedTargets::default(),
 			later_targets: None,
@@ -473,6 +502,13 @@ impl FakeBackend {
 		self.held_named.send_replace(HashSet::new());
 	}
 
+	/// Loses the lease of every drive lock held now; locks taken after it hold theirs.
+	// The drive job tests that use it arrive in the next commit; until then nothing does.
+	#[allow(dead_code)]
+	pub(crate) fn lose_leases(&self) {
+		self.lease_epoch.fetch_add(1, Ordering::SeqCst);
+	}
+
 	/// Waits while `request` about a directory or file named `name` is held.
 	async fn hold_name(&self, request: Request, name: &str) {
 		let key = (request, name.to_owned());
@@ -530,7 +566,12 @@ impl DriveBackend for FakeBackend {
 				.wait_for(|from| from.is_none_or(|from| call < from))
 				.await;
 		}
-		Ok(Running::start(&self.live_locks, |_| {}))
+		Ok(FakeLock {
+			_held: Running::start(&self.live_locks, |_| {}),
+			epoch: self.lease_epoch.load(Ordering::SeqCst),
+			current: Arc::clone(&self.lease_epoch),
+			lost_on_arrival: self.lost_on_arrival.contains(&call),
+		})
 	}
 
 	async fn connected_targets(&self, _dir: Uuid) -> Result<ConnectedTargets, Error> {

@@ -31,7 +31,7 @@ use crate::{
 		},
 		name::ValidatedName,
 	},
-	sync::lock::ResourceLock,
+	sync::lock::{Lease, ResourceLock},
 	util::{MaybeSend, MaybeSendSync},
 };
 
@@ -84,7 +84,7 @@ pub(crate) struct UploadSpec {
 /// The drive operations a job needs. The production implementation is the client; tests use a
 /// fake with the real memory semaphore.
 pub(crate) trait DriveBackend: MaybeSendSync + 'static {
-	type DriveLock: MaybeSendSync + 'static;
+	type DriveLock: Lease + MaybeSendSync + 'static;
 	type Upload: MaybeSendSync + 'static;
 
 	/// The client's file-IO memory semaphore, in bytes.

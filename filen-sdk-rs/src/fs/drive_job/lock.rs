@@ -7,6 +7,7 @@ use crate::{
 		JobControl, Stopped,
 		report::{OpGuard, Ops},
 	},
+	sync::lock::Lease,
 };
 
 use super::backend::DriveBackend;
@@ -14,8 +15,21 @@ use super::backend::DriveBackend;
 /// The drive lock, held as one of the job's in-flight operations. The lock is dropped before
 /// the operation ends, so the job is only reported paused once the lock is gone.
 pub(crate) struct HeldLock<L> {
-	_lock: L,
+	lock: L,
 	_op: OpGuard,
+}
+
+// The drive call sites that use these arrive in the next commit; until then nothing does.
+#[allow(dead_code)]
+impl<L: Lease> HeldLock<L> {
+	pub(crate) fn lock(&self) -> &L {
+		&self.lock
+	}
+
+	/// See [`Lease::confirm`].
+	pub(crate) async fn confirm(&self) -> Result<(), Error> {
+		self.lock.confirm().await
+	}
 }
 
 pub(crate) enum LockWait<L> {
@@ -43,10 +57,7 @@ pub(crate) async fn wait_for_lock<B: DriveBackend>(
 	};
 	Ok(match result {
 		Ok(_) if control.is_pause_requested() => LockWait::Paused,
-		Ok(lock) => LockWait::Locked(HeldLock {
-			_lock: lock,
-			_op: op,
-		}),
+		Ok(lock) => LockWait::Locked(HeldLock { lock, _op: op }),
 		Err(error) => LockWait::Failed(error),
 	})
 }

@@ -788,6 +788,31 @@ impl Lease for Arc<ResourceLock> {
 	}
 }
 
+/// `None` while the lease of `held` is confirmed; once it is lost, a lock newly taken with
+/// `retake`, for the caller to go on under. For a write that must happen whatever became of the
+/// held lease: one following a write that already landed (adding a new item to the links and
+/// shares it belongs in), or one depending on nothing read under the held lock. Any other
+/// failure to confirm or to retake is returned.
+// The drive call sites that use it arrive in the next commit; until then only its test does.
+#[allow(dead_code)]
+pub(crate) async fn confirm_or_retake<L, Fut>(
+	held: &L,
+	retake: impl FnOnce() -> Fut,
+) -> Result<Option<L>, Error>
+where
+	L: Lease,
+	Fut: Future<Output = Result<L, Error>>,
+{
+	match held.confirm().await {
+		Ok(()) => Ok(None),
+		Err(error) if error.kind() == ErrorKind::LockLost => {
+			tracing::warn!("{error}; taking the lock again to go on");
+			retake().await.map(Some)
+		}
+		Err(error) => Err(error),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1281,6 +1306,73 @@ mod tests {
 		);
 		assert_eq!(confirmed.unwrap_err().kind(), ErrorKind::LockLost);
 		assert!(!lock.is_valid());
+	}
+
+	/// A lease for [`confirm_or_retake`]: confirmed, lost, or failing to be confirmed.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[derive(Debug, PartialEq)]
+	enum ScriptedLease {
+		Held(u8),
+		Lost,
+		Failing,
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	impl Lease for ScriptedLease {
+		async fn confirm(&self) -> Result<(), Error> {
+			match self {
+				Self::Held(_) => Ok(()),
+				Self::Lost => Err(LockLostError {
+					resource: "test-resource".to_owned(),
+				}
+				.into()),
+				Self::Failing => Err(Error::custom(ErrorKind::Server, "scripted refresh")),
+			}
+		}
+	}
+
+	/// A retake handing out `ScriptedLease::Held(2)`, counted in `retaken`.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn counted_retake(
+		retaken: &std::cell::Cell<usize>,
+	) -> impl FnOnce() -> std::future::Ready<Result<ScriptedLease, Error>> {
+		move || {
+			retaken.set(retaken.get() + 1);
+			std::future::ready(Ok(ScriptedLease::Held(2)))
+		}
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn confirm_or_retake_keeps_a_confirmed_lease() {
+		let retaken = std::cell::Cell::new(0);
+		let retake = confirm_or_retake(&ScriptedLease::Held(1), counted_retake(&retaken))
+			.await
+			.unwrap();
+		assert_eq!(retake, None);
+		assert_eq!(retaken.get(), 0);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn confirm_or_retake_retakes_a_lost_lease() {
+		let retaken = std::cell::Cell::new(0);
+		let retake = confirm_or_retake(&ScriptedLease::Lost, counted_retake(&retaken))
+			.await
+			.unwrap();
+		assert_eq!(retake, Some(ScriptedLease::Held(2)));
+		assert_eq!(retaken.get(), 1);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn confirm_or_retake_returns_a_failure_to_confirm() {
+		let retaken = std::cell::Cell::new(0);
+		let error = confirm_or_retake(&ScriptedLease::Failing, counted_retake(&retaken))
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::Server);
+		assert_eq!(retaken.get(), 0);
 	}
 
 	/// One scripted outcome for a [`refresh_loop`] refresh attempt.
