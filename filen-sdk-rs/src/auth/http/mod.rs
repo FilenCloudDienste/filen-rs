@@ -566,9 +566,17 @@ impl ThumbnailConfig {
 	}
 }
 
+/// How many lock requests (acquire, refresh, release) run at once, apart from
+/// [`ClientConfig::with_concurrency`]'s limit: a refresh queued behind that limit's chunk
+/// transfers can miss the window the lock's keep-alive gives it.
+const LOCK_REQUEST_CONCURRENCY: usize = 4;
+
 #[derive(Clone)]
 pub(crate) struct SharedClientState {
 	concurrency: GlobalConcurrencyLimitLayer,
+	/// The limit lock requests are sent under instead of `concurrency`
+	/// ([`LOCK_REQUEST_CONCURRENCY`]).
+	lock_concurrency: GlobalConcurrencyLimitLayer,
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	max_concurrency: usize,
 	retry: retry::RetryMapLayer,
@@ -661,6 +669,7 @@ impl SharedClientState {
 
 		Ok(Self {
 			concurrency: GlobalConcurrencyLimitLayer::new(concurrency),
+			lock_concurrency: GlobalConcurrencyLimitLayer::new(LOCK_REQUEST_CONCURRENCY),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			max_concurrency: concurrency,
 			retry: retry::RetryMapLayer::new(retry::RetryPolicy::new(config.retry_budget)),
@@ -1466,6 +1475,26 @@ impl AuthClient {
 			.await
 	}
 
+	/// [`Self::post_raw_bytes_auth`] for a lock request: sent under the lock requests' own
+	/// concurrency limit, so it does not queue behind the client's transfers.
+	pub(crate) async fn post_raw_bytes_auth_lock<Res>(
+		&self,
+		request: Bytes,
+		url: &str,
+		endpoint: Cow<'static, str>,
+	) -> Result<Res, Error>
+	where
+		Res: DeserializeOwned + Debug,
+	{
+		self.post_raw_bytes_auth_with(
+			request,
+			url,
+			endpoint,
+			&self.unauthed.state.lock_concurrency,
+		)
+		.await
+	}
+
 	/// [`Self::post_raw_bytes_auth`] under the concurrency limit `concurrency`.
 	async fn post_raw_bytes_auth_with<Res>(
 		&self,
@@ -1585,7 +1614,7 @@ mod client_timeout_tests {
 	};
 
 	use bytes::Bytes;
-	use filen_types::auth::APIKey;
+	use filen_types::{api::v3::user::lock::LockType, auth::APIKey, fs::Uuid};
 	use tokio::{
 		io::{AsyncReadExt, AsyncWriteExt},
 		net::{TcpListener, TcpStream},
@@ -1744,6 +1773,124 @@ mod client_timeout_tests {
 		}
 	}
 
+	/// Reads one request head off a scripted server's connection.
+	async fn read_head(socket: &mut TcpStream) {
+		let mut head = Vec::new();
+		let mut byte = [0u8; 1];
+		while !head.ends_with(b"\r\n\r\n") {
+			socket.read_exact(&mut byte).await.unwrap();
+			head.push(byte[0]);
+		}
+	}
+
+	/// Answers a scripted server's request with an empty success.
+	async fn respond(socket: &mut TcpStream) {
+		respond_with(socket, r#"{"status":true}"#).await;
+	}
+
+	/// Answers a scripted server's request with `body`.
+	async fn respond_with(socket: &mut TcpStream, body: &str) {
+		let response = format!(
+			"HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+			body.len()
+		);
+		socket.write_all(response.as_bytes()).await.unwrap();
+	}
+
+	/// Sends a lock request with `send` while a request the server never answers holds the only
+	/// permit of the client's shared concurrency limit, answering it with `answer`. A lock request
+	/// must not wait for that limit, which chunk transfers can hold far longer than a refresh may
+	/// take.
+	async fn lock_request_beside_a_stalled_transfer<F, Fut>(answer: &'static str, send: F)
+	where
+		F: FnOnce(Arc<AuthClient>, String) -> Fut,
+		Fut: Future<Output = Result<(), crate::Error>>,
+	{
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let (holding, held) = tokio::sync::oneshot::channel();
+		let server = tokio::spawn(async move {
+			// the shared request: read and never answered, so it keeps the only shared permit
+			let (mut stalled, _) = listener.accept().await.unwrap();
+			read_head(&mut stalled).await;
+			holding.send(()).unwrap();
+			let (mut lock, _) = listener.accept().await.unwrap();
+			read_head(&mut lock).await;
+			respond_with(&mut lock, answer).await;
+			stalled
+		});
+
+		let client = Arc::new(AuthClient::from_unauthed(
+			UnauthClient::from_config(ClientConfig::default().with_concurrency(1)).unwrap(),
+			Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-key")))),
+		));
+		let url = format!("http://{addr}/v3/user/lock");
+		let shared = tokio::spawn({
+			let (client, url) = (Arc::clone(&client), url.clone());
+			async move {
+				let _ = client
+					.post_raw_bytes_auth::<()>(Bytes::new(), &url, "v3/upload".into())
+					.await;
+			}
+		});
+		held.await.unwrap();
+		tokio::time::timeout(Duration::from_secs(10), send(client, url))
+			.await
+			.expect("the lock request must not queue behind the shared request")
+			.unwrap();
+		shared.abort();
+		drop(server.await.unwrap());
+	}
+
+	#[tokio::test]
+	async fn lock_acquires_do_not_wait_for_the_shared_limit() {
+		lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| async move {
+			// the poll acquire_lock sends
+			crate::sync::lock::send_acquire(&client, &url, Bytes::new())
+				.await
+				.map(drop)
+		})
+		.await;
+	}
+
+	/// What the server answers a lock request with.
+	const LOCK_ANSWER: &str = r#"{"status":true,"data":{"acquired":false,"released":true,"refreshed":true,"resource":"r"}}"#;
+
+	/// A lock request of `kind`, as the lock's keep-alive and its release send it.
+	async fn send_lock_request(
+		client: Arc<AuthClient>,
+		url: String,
+		kind: LockType,
+	) -> Result<(), crate::Error> {
+		crate::api::v3::user::lock::post(
+			&client,
+			&url,
+			&crate::api::v3::user::lock::Request {
+				uuid: Uuid::new_v4(),
+				r#type: kind,
+				resource: Cow::Borrowed("r"),
+			},
+		)
+		.await
+		.map(drop)
+	}
+
+	#[tokio::test]
+	async fn lock_refreshes_do_not_wait_for_the_shared_limit() {
+		lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| {
+			send_lock_request(client, url, LockType::Refresh)
+		})
+		.await;
+	}
+
+	#[tokio::test]
+	async fn lock_releases_do_not_wait_for_the_shared_limit() {
+		lock_request_beside_a_stalled_transfer(LOCK_ANSWER, |client, url| {
+			send_lock_request(client, url, LockType::Release)
+		})
+		.await;
+	}
+
 	/// A keep-alive connection that dies AFTER the next request was written to it surfaces as
 	/// hyper's `SendRequest(Io)`, which hyper-util does not replay. On macOS runners pooled
 	/// connections died this way: lock polls failed with EADDRNOTAVAIL 20-27s after the send while
@@ -1753,23 +1900,6 @@ mod client_timeout_tests {
 	/// hyper before reuse and never reaches the SDK, so it would pass without the fix.
 	#[tokio::test]
 	async fn connection_reset_after_request_written_is_retried() {
-		async fn read_head(socket: &mut TcpStream) {
-			let mut head = Vec::new();
-			let mut byte = [0u8; 1];
-			while !head.ends_with(b"\r\n\r\n") {
-				socket.read_exact(&mut byte).await.unwrap();
-				head.push(byte[0]);
-			}
-		}
-		async fn respond(socket: &mut TcpStream) {
-			let body = r#"{"status":true}"#;
-			let response = format!(
-				"HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-				body.len()
-			);
-			socket.write_all(response.as_bytes()).await.unwrap();
-		}
-
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let addr = listener.local_addr().unwrap();
 		// Scripted, so running to the end proves the exact sequence: two requests on the first

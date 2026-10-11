@@ -81,6 +81,11 @@ fn record_confirmation(confirmed: &tokio::sync::watch::Sender<Confirmed>, sent: 
 	});
 }
 
+/// Where a lock request goes: a gateway's lock endpoint.
+fn lock_url() -> String {
+	gateway_url(api::v3::user::lock::ENDPOINT)
+}
+
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
 /// The lock is released when the [`ResourceLock`] is dropped; its clones share the lock, which
 /// is released once the last of them is dropped.
@@ -171,6 +176,7 @@ impl ResourceLock {
 async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
 	match api::v3::user::lock::post(
 		client,
+		&lock_url(),
 		&api::v3::user::lock::Request {
 			uuid,
 			r#type: LockType::Release,
@@ -342,6 +348,7 @@ async fn run_keep_alive(weak: Weak<SharedLease>, confirmed: tokio::sync::watch::
 		Some(async move {
 			let result = api::v3::user::lock::post(
 				lock.client.as_ref(),
+				&lock_url(),
 				&api::v3::user::lock::Request {
 					uuid: lock.uuid,
 					r#type: LockType::Refresh,
@@ -485,6 +492,23 @@ where
 	))
 }
 
+/// One Acquire round-trip with the serialized request `body`, sent to `url`: the server's
+/// `acquired` flag.
+pub(crate) async fn send_acquire(
+	client: &AuthClient,
+	url: &str,
+	body: Bytes,
+) -> Result<bool, Error> {
+	client
+		.post_raw_bytes_auth_lock::<api::v3::user::lock::Response>(
+			body,
+			url,
+			api::v3::user::lock::ENDPOINT.into(),
+		)
+		.await
+		.map(|response| response.acquired)
+}
+
 impl Client {
 	/// Attempts to acquire a lock on the specified resource.
 	/// If the lock is acquired, it returns a [`ResourceLock`] that releases the lock when dropped.
@@ -513,22 +537,11 @@ impl Client {
 			r#type: LockType::Acquire,
 			resource: Cow::Borrowed(&resource),
 		})?);
-		let url = gateway_url(api::v3::user::lock::ENDPOINT);
-		let endpoint = api::v3::user::lock::ENDPOINT;
+		let url = lock_url();
 		let client = self.arc_client();
-		let (client_ref, bytes, url) = (&client, &bytes, url.as_str());
 		let acquired_at = acquire_loop(
-			move || async move {
-				client_ref
-					.post_raw_bytes_auth::<api::v3::user::lock::Response>(
-						// refcount bump: every poll resends the same Acquire body
-						bytes.clone(),
-						url,
-						endpoint.into(),
-					)
-					.await
-					.map(|resp| resp.acquired)
-			},
+			// refcount bump: every poll resends the same Acquire body
+			|| send_acquire(&client, &url, bytes.clone()),
 			&resource,
 			max_sleep_time,
 			attempts,
