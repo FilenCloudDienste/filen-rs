@@ -446,9 +446,10 @@ where
 		// earlier than now — the refresh schedule is anchored to the send time.
 		let attempt_started = Confirmed::now();
 		match poll().await {
-			// Always a fresh lease, even after a failed poll the server granted with only the
-			// answer lost: the server refuses an Acquire repeated with the holder's own uuid
-			// (without restarting its lease) until that lease lapses.
+			// A lease that runs from this poll's send, even after an earlier poll the server
+			// granted with only the answer lost: a server that grants an Acquire repeated with
+			// the holder's own uuid restarts its lease, and one that refuses it grants a fresh
+			// lease once that one lapses. Either way the lease starts no earlier than now.
 			Ok(true) => return Ok(attempt_started),
 			Ok(false) => {
 				answered = true;
