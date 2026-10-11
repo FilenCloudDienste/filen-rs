@@ -34,11 +34,13 @@ impl Client {
 	) -> Result<Arc<ResourceLock>, Error> {
 		// A cached lock whose keep-alive lost the server-side lease must not be
 		// handed out again: fall through and acquire a fresh one, replacing the
-		// stale cache entry (the dead Arc stays alive for its existing holders).
+		// stale cache entry (the dead Arc stays alive for its existing holders). One whose
+		// lease is only unconfirmed is still handed out: a new acquire could not get the
+		// resource while that lease stands.
 		let read_lock = lock.read().await;
 		if let Some(weak) = read_lock.as_ref()
 			&& let Some(arc) = weak.upgrade()
-			&& arc.is_valid()
+			&& !arc.is_lost()
 		{
 			return Ok(arc);
 		}
@@ -46,7 +48,7 @@ impl Client {
 		let mut write_lock = lock.write().await;
 		if let Some(weak) = write_lock.as_ref()
 			&& let Some(arc) = weak.upgrade()
-			&& arc.is_valid()
+			&& !arc.is_lost()
 		{
 			return Ok(arc);
 		}
@@ -131,10 +133,13 @@ mod js_impl {
 			self.0.resource().to_string()
 		}
 
-		/// Whether the lock still holds its server-side lease. `false` means the
-		/// keep-alive lost it (refused refresh or none confirmed in time) and
-		/// another client may already hold the resource — re-acquire before
-		/// relying on it.
+		/// Whether the server confirmed the lock's lease recently enough to rely on it.
+		/// `false` means another client may hold the resource, or soon may: the lock is
+		/// unconfirmed (a refresh failing), which reads `true` again once its keep-alive gets
+		/// a refresh through, or lost (a refused refresh, or none confirmed while the lease
+		/// could last), which never does. Both read `false` here: do not rely on the lock
+		/// while it does, and once it has read `false` for longer than the lease (60
+		/// seconds), acquire a new lock.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "isValid")

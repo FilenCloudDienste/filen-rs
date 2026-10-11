@@ -38,14 +38,15 @@ pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 ///
 /// While the lock is held, no other client can acquire the lock on the same resource.
 /// The lock is automatically released [`LOCK_SERVER_TTL`] after the last refresh the
-/// server processed, so a background task refreshes it every
-/// [`LOCK_REFRESH_INTERVAL`], retrying failed refreshes within [`LOCK_LOSS_BUDGET`].
+/// server processed, so a background task refreshes it every [`LOCK_REFRESH_INTERVAL`],
+/// retrying a failed refresh.
 ///
-/// If the server refuses a refresh, or none could be confirmed within the budget
-/// (network outage, system suspend, ...), the lock is marked LOST: [`Self::is_valid`]
-/// turns false, [`Self::wait_for_loss`] resolves, and the cached [`Client::lock_drive`]
-/// family stops handing it out — another client may hold the resource from that point
-/// on, so long-running holders should watch for loss rather than assume exclusivity.
+/// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] is unconfirmed:
+/// [`Self::is_valid`] reads false until the server confirms it again. It is LOST once the
+/// server refuses a refresh, or no refresh was confirmed within [`LOCK_SERVER_TTL`]:
+/// [`Self::wait_for_loss`] resolves, and the cached [`Client::lock_drive`] family stops handing
+/// it out — another client may hold the resource from that point on, so long-running holders
+/// should watch for loss rather than assume exclusivity.
 ///
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
@@ -64,8 +65,11 @@ struct SharedLease {
 	client: Arc<AuthClient>,
 	resource: String,
 	// Flipped to false (never back) by the keep-alive task once the server-side
-	// lease can no longer be trusted. See [`ResourceLock::is_valid`].
+	// lease is lost. See [`ResourceLock::is_valid`].
 	valid: tokio::sync::watch::Sender<bool>,
+	// When the server last confirmed the lease: the send time of the confirming request (the
+	// acquire, or a refresh). Shared with the keep-alive task.
+	confirmed: tokio::sync::watch::Sender<Instant>,
 	// The runtime the lock was acquired on. The refresh task is spawned on it, and Drop —
 	// which can run on a thread with no ambient tokio runtime (e.g. a foreign FFI finalizer
 	// thread) — falls back to it when there is no ambient runtime to spawn the release on.
@@ -87,19 +91,26 @@ impl ResourceLock {
 		&self.lease.resource
 	}
 
-	/// Whether the background keep-alive still holds this lock's server-side lease.
+	/// Whether the server confirmed this lock's lease within [`LOCK_LOSS_BUDGET`] and has not
+	/// refused it since.
 	///
-	/// `false` means the server refused a refresh or none was confirmed within
-	/// [`LOCK_LOSS_BUDGET`]: the server has released (or is about to release) the
-	/// resource and another client may already hold it. Holders should stop
-	/// relying on the lock and re-acquire. Never flips back to `true`.
+	/// `false` means another client may already hold the resource, or soon may: the lock is
+	/// lost, or its last confirmation is too old to rely on (a refresh failing). An unconfirmed
+	/// lock turns valid again once the keep-alive gets a refresh through; a lost one never
+	/// does, and holders should re-acquire.
 	pub fn is_valid(&self) -> bool {
-		*self.lease.valid.borrow()
+		!self.is_lost() && self.lease.confirmed.borrow().elapsed() < LOCK_LOSS_BUDGET
 	}
 
-	/// Resolves once the server-side lease is lost ([`Self::is_valid`] turns
-	/// false); resolves immediately if it already is. Pends indefinitely while
-	/// the lock stays healthy, so callers should race it against their work.
+	/// Whether the lease is lost: the server refused a refresh, or none was confirmed while the
+	/// lease could last.
+	pub(crate) fn is_lost(&self) -> bool {
+		!*self.lease.valid.borrow()
+	}
+
+	/// Resolves once the server-side lease is lost; resolves immediately if it already is.
+	/// Pends indefinitely while the lock stays held, so callers should race it against their
+	/// work. An unconfirmed lock (see [`Self::is_valid`]) is not lost yet.
 	pub async fn wait_for_loss(&self) {
 		let mut receiver = self.lease.valid.subscribe();
 		// The sender is a field of `self`, so it cannot close while borrowed
@@ -186,19 +197,27 @@ const LOCK_REFRESH_INTERVAL: time::Duration = time::Duration::from_secs(15);
 /// acquire/refresh it processed. Measured against the live API: another client got a resource
 /// 60s after the holder's acquire, and 90s after an acquire refreshed at 30s.
 const LOCK_SERVER_TTL: time::Duration = time::Duration::from_secs(60);
-/// How long past the last server-confirmed refresh the keep-alive keeps trusting
-/// (and retrying a failing refresh of) a held lock before declaring it lost. The
-/// margin below [`LOCK_SERVER_TTL`] absorbs the send-to-server-processing skew, so
-/// the client stops trusting the lock strictly before the server can hand the
-/// resource to another client.
+/// How old the last server-confirmed refresh of a held lock may be for the lock to be relied on
+/// ([`ResourceLock::is_valid`]). The margin below [`LOCK_SERVER_TTL`] absorbs the
+/// send-to-server-processing skew and the time a write takes to reach the server.
 const LOCK_LOSS_BUDGET: time::Duration = time::Duration::from_secs(25);
-/// Delay between retries of a failed refresh within [`LOCK_LOSS_BUDGET`].
+/// Delay between retries of a failed refresh.
 const LOCK_RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
 
-/// How long to sleep before the first refresh, given how much of
-/// [`LOCK_REFRESH_INTERVAL`] already elapsed before the refresh task got polled.
+/// How long to sleep before the next refresh, given how long ago the lease was last confirmed.
 fn refresh_delay_after(elapsed: Duration) -> Duration {
 	LOCK_REFRESH_INTERVAL.saturating_sub(elapsed)
+}
+
+/// Records `sent` as the lease's latest confirmation unless a later one is recorded already.
+fn record_confirmation(confirmed: &tokio::sync::watch::Sender<Instant>, sent: Instant) {
+	confirmed.send_if_modified(|current| {
+		let later = sent > *current;
+		if later {
+			*current = sent;
+		}
+		later
+	});
 }
 
 /// Why a [`refresh_loop`] ended.
@@ -206,64 +225,66 @@ fn refresh_delay_after(elapsed: Duration) -> Duration {
 enum LoopExit {
 	/// Every strong reference to the lock was dropped; Drop handles the release.
 	Dropped,
-	/// The server refused a refresh, or none was confirmed within
-	/// [`LOCK_LOSS_BUDGET`] — the server-side lease can no longer be trusted.
+	/// The server refused a refresh, or none was confirmed within [`LOCK_SERVER_TTL`] — the
+	/// server-side lease can no longer be trusted.
 	Lost,
 }
 
-/// Drives the refresh schedule for one held lock until it is dropped or lost.
+/// Drives the refresh schedule for one held lock until it is dropped or lost, recording every
+/// confirmation in `confirmed`.
 ///
 /// `refresh` builds the future for a single Refresh round-trip (resolving to the
 /// server's `refreshed` flag), or returns `None` once the lock has been dropped.
-/// Generic over the refresh action so the schedule and loss budget are
-/// unit-testable against a scripted server on a paused clock.
-async fn refresh_loop<F, Fut>(mut refresh: F, acquired_at: Instant) -> LoopExit
+/// Generic over the refresh action so the schedule is unit-testable against a scripted
+/// server on a paused clock.
+///
+/// The lock is only declared lost on the server's word, or once no refresh was confirmed for
+/// [`LOCK_SERVER_TTL`], when the lease has lapsed whatever the server would answer. Before
+/// that, failing refreshes are retried: an unconfirmed lock stops being relied on through
+/// [`ResourceLock::is_valid`] and is confirmed again once a refresh gets through, so a network
+/// blip does not cost the lock.
+async fn refresh_loop<F, Fut>(
+	mut refresh: F,
+	confirmed: &tokio::sync::watch::Sender<Instant>,
+) -> LoopExit
 where
 	F: FnMut() -> Option<Fut>,
 	Fut: Future<Output = Result<bool, Error>>,
 {
-	// The request that most recently confirmed the lock server-side, timed from
-	// when it was SENT: the server's lease clock restarts when it processes a
-	// request, never earlier than its send, so this measurement only ever
-	// overestimates the lease age — erring toward declaring loss early, not late.
-	let mut last_confirmed = acquired_at;
-	let mut attempted = false;
-	sleep(refresh_delay_after(acquired_at.elapsed())).await;
+	// Confirmations are timed from when the request was SENT: the server's lease clock restarts
+	// when it processes a request, never earlier than its send, so the age only ever
+	// overestimates the lease's.
+	let age = confirmed.borrow().elapsed();
+	sleep(refresh_delay_after(age)).await;
 	loop {
-		let mut remaining = LOCK_LOSS_BUDGET.saturating_sub(last_confirmed.elapsed());
-		if remaining.is_zero() {
-			if attempted {
-				return LoopExit::Lost;
-			}
-			// The acquire anchor can already be stale before any refresh was ever
-			// attempted (its response may arrive long after the send under the
-			// shared retry/rate-limit HTTP stack). Give the server one bounded
-			// chance to confirm instead of declaring a fresh lock lost unheard:
-			// budget + this floor never exceeds LOCK_SERVER_TTL, so trust still
-			// ends no later than the lease possibly can.
-			remaining = LOCK_SERVER_TTL - LOCK_LOSS_BUDGET;
-		}
+		let age = confirmed.borrow().elapsed();
+		let Some(remaining) = LOCK_SERVER_TTL.checked_sub(age).filter(|r| !r.is_zero()) else {
+			return LoopExit::Lost;
+		};
 		let Some(fut) = refresh() else {
 			return LoopExit::Dropped;
 		};
-		attempted = true;
-		let attempt_started = Instant::now();
+		let sent = Instant::now();
 		match timeout(remaining, fut).await {
-			Ok(Ok(true)) => {
-				last_confirmed = attempt_started;
-				sleep(refresh_delay_after(last_confirmed.elapsed())).await;
+			// Only an answer received inside the lease is trusted: an older server confirms any
+			// refresh, also one for a lease that lapsed and was handed to another client.
+			Ok(Ok(true)) if confirmed.borrow().elapsed() < LOCK_SERVER_TTL => {
+				record_confirmation(confirmed, sent);
+				let age = confirmed.borrow().elapsed();
+				sleep(refresh_delay_after(age)).await;
 			}
+			Ok(Ok(true)) => return LoopExit::Lost,
 			// The server no longer recognizes the lock — authoritative loss.
 			Ok(Ok(false)) => return LoopExit::Lost,
-			// Transport error: outcome unknown, retry while budget remains.
+			// Transport error: outcome unknown, retry while the lease may still stand.
 			Ok(Err(_)) => sleep(LOCK_RETRY_INTERVAL).await,
-			// The attempt outlived the budget; the next iteration declares loss.
+			// The attempt outlived the lease; the next iteration declares loss.
 			Err(_) => {}
 		}
 	}
 }
 
-async fn run_keep_alive(weak: Weak<SharedLease>, acquired_at: Instant) {
+async fn run_keep_alive(weak: Weak<SharedLease>, confirmed: tokio::sync::watch::Sender<Instant>) {
 	let refresh = || {
 		let lock = weak.upgrade()?;
 		Some(async move {
@@ -285,7 +306,7 @@ async fn run_keep_alive(weak: Weak<SharedLease>, acquired_at: Instant) {
 			result
 		})
 	};
-	if refresh_loop(refresh, acquired_at).await == LoopExit::Lost
+	if refresh_loop(refresh, &confirmed).await == LoopExit::Lost
 		&& let Some(lock) = weak.upgrade()
 	{
 		tracing::warn!(
@@ -298,8 +319,9 @@ async fn run_keep_alive(weak: Weak<SharedLease>, acquired_at: Instant) {
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn keep_lock_alive(lock: &Arc<SharedLease>, acquired_at: Instant) {
-	let refresh = run_keep_alive(Arc::downgrade(lock), acquired_at);
+fn keep_lock_alive(lock: &Arc<SharedLease>) {
+	// a second handle on the lease's confirmation channel, not a copy of it
+	let refresh = run_keep_alive(Arc::downgrade(lock), lock.confirmed.clone());
 	// Same no-ambient-runtime hazard as Drop: spawn on the runtime the lock was acquired
 	// on. The ambient fallback is unreachable through `acquire_lock` (reqwest already
 	// requires a tokio context there) but keeps behavior identical when no handle was
@@ -311,12 +333,13 @@ fn keep_lock_alive(lock: &Arc<SharedLease>, acquired_at: Instant) {
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn keep_lock_alive(lock: &Arc<SharedLease>, acquired_at: Instant) {
+fn keep_lock_alive(lock: &Arc<SharedLease>) {
 	// `runtime::spawn_local` pins the spawning SDK worker open for the life of the refresh
 	// loop (it exits when the lock drops or is lost), so the worker cannot close
 	// under a held lock and silently stop refreshing it — the server would expire the lock
 	// while the client still believes it holds it.
-	crate::runtime::spawn_local(run_keep_alive(Arc::downgrade(lock), acquired_at));
+	// a second handle on the lease's confirmation channel, not a copy of it
+	crate::runtime::spawn_local(run_keep_alive(Arc::downgrade(lock), lock.confirmed.clone()));
 }
 
 fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
@@ -463,10 +486,11 @@ impl Client {
 			client,
 			resource,
 			valid: tokio::sync::watch::Sender::new(true),
+			confirmed: tokio::sync::watch::Sender::new(acquired_at),
 			#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 			handle: tokio::runtime::Handle::try_current().ok(),
 		});
-		keep_lock_alive(&lease, acquired_at);
+		keep_lock_alive(&lease);
 		Ok(Arc::new(ResourceLock { lease }))
 	}
 
@@ -522,6 +546,7 @@ mod tests {
 				)),
 				resource: "test-resource".to_string(),
 				valid: tokio::sync::watch::Sender::new(true),
+				confirmed: tokio::sync::watch::Sender::new(Instant::now()),
 				handle,
 			}),
 		}
@@ -623,7 +648,7 @@ mod tests {
 		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
 		// A plain thread has no ambient runtime, so the refresh task must ride the
 		// captured handle.
-		std::thread::spawn(move || keep_lock_alive(&lock.lease, Instant::now()))
+		std::thread::spawn(move || keep_lock_alive(&lock.lease))
 			.join()
 			.unwrap();
 	}
@@ -707,6 +732,23 @@ mod tests {
 		}
 	}
 
+	/// The confirmation channel of a lease confirmed at `at`.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn confirmed_at(at: Instant) -> tokio::sync::watch::Sender<Instant> {
+		tokio::sync::watch::Sender::new(at)
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn an_unconfirmed_lock_is_invalid_until_the_server_confirms_it_again() {
+		let lock = test_lock(None);
+		tokio::time::advance(LOCK_LOSS_BUDGET).await;
+		assert!(!lock.is_valid());
+		assert!(!lock.is_lost(), "the lease may still stand");
+		record_confirmation(&lock.lease.confirmed, Instant::now());
+		assert!(lock.is_valid());
+	}
+
 	// All timings below are exact: the paused tokio clock only advances by the
 	// timers the loop itself registers.
 
@@ -714,7 +756,11 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn lock_drop_ends_refresh_loop_silently() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::Confirm, Step::Drop]), begin).await;
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::Confirm, Step::Drop]),
+			&confirmed_at(begin),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Dropped);
 		// confirm at 15s, drop observed at the 30s refresh
 		assert_eq!(begin.elapsed(), Duration::from_secs(30));
@@ -724,7 +770,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn server_refusal_is_authoritative_loss() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::Refuse]), begin).await;
+		let exit = refresh_loop(scripted_refresh(&[Step::Refuse]), &confirmed_at(begin)).await;
 		assert_eq!(exit, LoopExit::Lost);
 		assert_eq!(begin.elapsed(), Duration::from_secs(15));
 	}
@@ -733,80 +779,69 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn transient_refresh_error_retries_and_recovers() {
 		let begin = Instant::now();
+		let confirmed = confirmed_at(begin);
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::TransportErr, Step::Confirm, Step::Confirm, Step::Drop]),
-			begin,
+			&confirmed,
 		)
 		.await;
-		// The old keep-alive died forever on the first transport error; the loop
-		// must instead retry within the budget and resume the normal cadence.
 		assert_eq!(exit, LoopExit::Dropped);
 		// err at 15s, retry confirms at 16s, confirm at 31s, drop observed at 46s
 		assert_eq!(begin.elapsed(), Duration::from_secs(46));
+		assert_eq!(*confirmed.borrow() - begin, Duration::from_secs(31));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
-	async fn persistent_refresh_errors_exhaust_loss_budget() {
+	async fn failing_refreshes_are_retried_until_the_lease_lapses() {
 		let begin = Instant::now();
-		// attempts at 15s..=24s, budget exhausted at 25s — exactly 10 attempts
-		let exit = refresh_loop(scripted_refresh(&[Step::TransportErr; 10]), begin).await;
+		// attempts at 15s..=59s, the lease lapses at 60s — exactly 45 attempts. Past the loss
+		// budget the lock reads unconfirmed, but is only lost once the server could no longer
+		// hold it for us.
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::TransportErr; 45]),
+			&confirmed_at(begin),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Lost);
-		assert_eq!(begin.elapsed(), LOCK_LOSS_BUDGET);
+		assert_eq!(begin.elapsed(), LOCK_SERVER_TTL);
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
-	async fn hung_refresh_is_cut_off_at_the_loss_budget() {
+	async fn hung_refresh_is_cut_off_when_the_lease_lapses() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), begin).await;
+		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), &confirmed_at(begin)).await;
 		assert_eq!(exit, LoopExit::Lost);
-		// declared lost strictly before the server TTL despite the hang
-		assert_eq!(begin.elapsed(), LOCK_LOSS_BUDGET);
+		assert_eq!(begin.elapsed(), LOCK_SERVER_TTL);
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
-	async fn stale_acquire_anchor_gets_one_bounded_refresh_attempt() {
-		// The acquire response can arrive long after its send (retry/rate-limit
-		// stack), leaving the anchor past the loss budget before the keep-alive
-		// ever ran. One confirming refresh must rescue the lock, not lose it unheard.
+	async fn a_refresh_late_past_the_budget_asks_the_server_before_any_loss() {
+		// The loop ran late (a slow acquire answer, a starved runtime): the server may still
+		// hold the lease, so it is asked rather than the lock declared lost unheard.
 		let begin = Instant::now();
-		tokio::time::advance(Duration::from_secs(26)).await;
-		let exit = refresh_loop(scripted_refresh(&[Step::Confirm, Step::Drop]), begin).await;
+		tokio::time::advance(LOCK_LOSS_BUDGET + Duration::from_secs(5)).await;
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::Confirm, Step::Drop]),
+			&confirmed_at(begin),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Dropped);
-		// floored attempt confirms at 26s, drop observed at the 41s refresh
-		assert_eq!(begin.elapsed(), Duration::from_secs(41));
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	#[tokio::test(start_paused = true)]
-	async fn stale_acquire_anchor_failed_attempt_is_lost() {
-		let begin = Instant::now();
-		tokio::time::advance(Duration::from_secs(26)).await;
-		let exit = refresh_loop(scripted_refresh(&[Step::TransportErr]), begin).await;
-		assert_eq!(exit, LoopExit::Lost);
-		// the single floored attempt fails at 26s; after the 1s retry pause the
-		// exhausted budget declares the loss — no unbounded extension of trust
-		assert_eq!(begin.elapsed(), Duration::from_secs(27));
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	#[tokio::test(start_paused = true)]
-	async fn stale_acquire_anchor_hung_attempt_is_cut_off_at_the_floor() {
-		let begin = Instant::now();
-		tokio::time::advance(Duration::from_secs(26)).await;
-		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), begin).await;
-		assert_eq!(exit, LoopExit::Lost);
-		// the floored attempt gets exactly LOCK_SERVER_TTL - LOCK_LOSS_BUDGET, 35s
-		assert_eq!(begin.elapsed(), Duration::from_secs(61));
+		// confirms at 30s, drop observed at the 45s refresh
+		assert_eq!(begin.elapsed(), Duration::from_secs(45));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
 	async fn slow_confirm_keeps_cadence_anchored_to_send_time() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::SlowConfirm(5), Step::Drop]), begin).await;
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::SlowConfirm(5), Step::Drop]),
+			&confirmed_at(begin),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Dropped);
 		// sent at 15s, confirmed at 20s: the next refresh fires 15s after the
 		// SEND (at 30s), not 15s after the response (35s) — a slow round-trip
