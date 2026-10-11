@@ -666,7 +666,7 @@ impl Client {
 		current_password: &str,
 		new_password: &str,
 	) -> Result<(), Error> {
-		let _lock = self.lock_auth().await?;
+		let lock = self.lock_auth().await?;
 		let auth_info_resp = api::v3::auth::info::post(
 			self.unauthed(),
 			&api::v3::auth::info::Request {
@@ -731,6 +731,9 @@ impl Client {
 
 		let encrypted = master_keys.to_encrypted().await;
 
+		// The session's master-key chain goes up extended, after derivations that can take long:
+		// once the lease is lost, another client may be changing the password meanwhile.
+		lock.confirm().await?;
 		let resp = api::v3::user::settings::password::change::post(
 			self.client(),
 			&api::v3::user::settings::password::change::Request {
@@ -789,7 +792,7 @@ impl Client {
 	}
 
 	pub async fn change_email(&self, password: &str, new_email: &str) -> Result<(), Error> {
-		let _lock = self.lock_auth().await?;
+		let lock = self.lock_auth().await?;
 		let auth_info = (**self.auth_info.read().unwrap_or_else(|e| e.into_inner())).clone();
 
 		let (derived_password, auth_version) = match auth_info {
@@ -826,6 +829,8 @@ impl Client {
 			}
 		};
 
+		// after the derivation, which can take long
+		lock.confirm().await?;
 		api::v3::user::settings::email::change::post(
 			self.client(),
 			&api::v3::user::settings::email::change::Request {
