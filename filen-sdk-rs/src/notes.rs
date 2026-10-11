@@ -659,15 +659,18 @@ impl Client {
 		new_type: NoteType,
 		known_content: Option<&str>,
 	) -> Result<(), Error> {
-		let _lock = self.lock_notes().await?;
+		let lock = self.lock_notes().await?;
 
-		let content = if let Some(content) = known_content {
-			Cow::Borrowed(content)
+		// Content read here is read under this lock; content passed in is the caller's, read
+		// whenever it was.
+		let (content, read_under_lock) = if let Some(content) = known_content {
+			(Cow::Borrowed(content), false)
 		} else {
-			self.get_note_content(note)
+			let content = self
+				.get_note_content(note)
 				.await?
-				.ok_or(MetadataWasNotDecryptedError)
-				.map(Cow::Owned)?
+				.ok_or(MetadataWasNotDecryptedError)?;
+			(Cow::Owned(content), true)
 		};
 
 		let note_key = note
@@ -683,6 +686,13 @@ impl Client {
 		})
 		.await;
 
+		// The content is written back with the new type. Read above, under this lock, it may
+		// have been changed by another client since once the lease is lost, and the write would
+		// revert that change. Content passed in was not read under this lock, so its lease says
+		// nothing about it.
+		if read_under_lock {
+			lock.confirm().await?;
+		}
 		let resp = api::v3::notes::r#type::change::post(
 			self.client(),
 			&api::v3::notes::r#type::change::Request {
@@ -837,7 +847,7 @@ impl Client {
 	}
 
 	pub async fn duplicate_note(&self, note: &mut Note) -> Result<Note, Error> {
-		let _lock = self.lock_notes().await?;
+		let lock = self.lock_notes().await?;
 		// `get_note_content` returns `None` only when the source content fails to decrypt
 		// (genuinely empty content is `Some("")`). Substituting "" here would silently create
 		// an empty "duplicate" and report success, so surface the failure instead.
@@ -848,6 +858,12 @@ impl Client {
 			)
 		})?;
 
+		// The source was read under this lock, so its lease is confirmed before the copy is
+		// written. The writes below take the lock again themselves (a fresh lease once this one
+		// is lost), which is safe: they only touch the new note, which no other client knows,
+		// and none of them reads under the lock what it writes, so none of them fails because of
+		// the lost lease itself once the copy exists.
+		lock.confirm().await?;
 		let mut new = self.create_note(note.title.clone()).await?;
 		self.set_note_content(&mut new, &content, note.preview.clone().unwrap_or_default())
 			.await?;
