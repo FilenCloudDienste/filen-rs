@@ -444,6 +444,7 @@ impl Client {
 		Ok(notes)
 	}
 
+	/// The caller holds the notes lock.
 	async fn inner_add_note_participant(
 		&self,
 		note: &mut Note,
@@ -495,6 +496,7 @@ impl Client {
 		contact: &Contact<'_>,
 		write: bool,
 	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		self.inner_add_note_participant(
 			note,
 			ContactUuid::Uuid(contact.uuid),
@@ -513,6 +515,7 @@ impl Client {
 		note: &mut Note,
 		participant_id: u64,
 	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		crate::api::v3::notes::participants::remove::post(
 			self.client(),
 			&crate::api::v3::notes::participants::remove::Request {
@@ -532,6 +535,7 @@ impl Client {
 		participant: &mut NoteParticipant,
 		write: bool,
 	) -> Result<(), Error> {
+		let _lock = self.lock_notes().await?;
 		crate::api::v3::notes::participants::permissions::post(
 			self.client(),
 			&crate::api::v3::notes::participants::permissions::Request {
@@ -1084,6 +1088,9 @@ pub mod js_impls {
 			do_on_commander(move || async move { this.list_notes().await }).await
 		}
 
+		/// Takes the client's "notes-write" lock while it runs.
+		/// Do not call it while holding a "notes-write" lock taken with `acquireLock`: that
+		/// lock bypasses the client's lock sharing, so this call waits until it is released.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "addNoteParticipant")
@@ -1103,6 +1110,9 @@ pub mod js_impls {
 			.await
 		}
 
+		/// Takes the client's "notes-write" lock while it runs.
+		/// Do not call it while holding a "notes-write" lock taken with `acquireLock`: that
+		/// lock bypasses the client's lock sharing, so this call waits until it is released.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "removeNoteParticipant")
@@ -1121,6 +1131,9 @@ pub mod js_impls {
 			.await
 		}
 
+		/// Takes the client's "notes-write" lock while it runs.
+		/// Do not call it while holding a "notes-write" lock taken with `acquireLock`: that
+		/// lock bypasses the client's lock sharing, so this call waits until it is released.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "setNoteParticipantPermission")
@@ -1567,6 +1580,58 @@ mod tests {
 		};
 		let error = offline_client()
 			.rename_note_tag(&mut tag, "renamed".to_owned())
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn add_note_participant_takes_the_lock_first() {
+		let public_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
+			.expect("a test key")
+			.to_public_key();
+		let contact = Contact {
+			uuid: Uuid::from_u128(3),
+			user_id: 2,
+			email: Cow::Borrowed("contact@example.com"),
+			avatar: None,
+			nick_name: None,
+			last_active: DateTime::<Utc>::default(),
+			timestamp: DateTime::<Utc>::default(),
+			public_key,
+		};
+		let error = offline_client()
+			.add_note_participant(&mut decrypted_note(), &contact, true)
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn remove_note_participant_takes_the_lock_first() {
+		let error = offline_client()
+			.remove_note_participant(&mut decrypted_note(), 2)
+			.await
+			.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn set_note_participant_permission_takes_the_lock_first() {
+		let mut participant = NoteParticipant {
+			user_id: 2,
+			is_owner: false,
+			email: "contact@example.com".to_owned(),
+			avatar: None,
+			nick_name: String::new(),
+			permissions_write: false,
+			added_timestamp: DateTime::<Utc>::default(),
+		};
+		let error = offline_client()
+			.set_note_participant_permission(Uuid::from_u128(1), &mut participant, true)
 			.await
 			.unwrap_err();
 		assert!(is_lock_request_failure(&error), "{error}");
