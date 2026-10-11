@@ -82,10 +82,12 @@ impl Client {
 	}
 
 	pub async fn delete_all_items(&self) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::user::delete::all::post(self.client()).await
 	}
 
 	pub async fn delete_all_versions(&self) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::user::delete::versions::post(self.client()).await
 	}
 
@@ -387,6 +389,10 @@ mod js_impl {
 			do_on_commander(move || async move { client.get_user_info().await }).await
 		}
 
+		/// Takes the client's "drive-write" lock while it runs.
+		/// Do not call it while holding a "drive-write" lock taken with `acquireLock`: that
+		/// lock bypasses the client's lock sharing, so this call waits until it is released.
+		/// A lock from `lockDrive` is shared and does not block it.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteAllItems")
@@ -396,6 +402,10 @@ mod js_impl {
 			do_on_commander(move || async move { client.delete_all_items().await }).await
 		}
 
+		/// Takes the client's "drive-write" lock while it runs.
+		/// Do not call it while holding a "drive-write" lock taken with `acquireLock`: that
+		/// lock bypasses the client's lock sharing, so this call waits until it is released.
+		/// A lock from `lockDrive` is shared and does not block it.
 		#[cfg_attr(
 			all(target_family = "wasm", target_os = "unknown"),
 			wasm_bindgen::prelude::wasm_bindgen(js_name = "deleteAllVersions")
@@ -540,5 +550,25 @@ mod js_impl {
 		fn cursor_out_of_range_is_none() {
 			assert_eq!(parse_events_cursor(Some(i64::MAX)), None);
 		}
+	}
+}
+
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+mod tests {
+	use crate::auth::unauth::test_support::{is_lock_request_failure, offline_client};
+
+	// On an offline client every request fails, so each call below fails at its first request:
+	// the drive lock's acquisition, taken before the deletion is posted.
+
+	#[tokio::test(start_paused = true)]
+	async fn delete_all_items_takes_the_lock_first() {
+		let error = offline_client().delete_all_items().await.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn delete_all_versions_takes_the_lock_first() {
+		let error = offline_client().delete_all_versions().await.unwrap_err();
+		assert!(is_lock_request_failure(&error), "{error}");
 	}
 }
