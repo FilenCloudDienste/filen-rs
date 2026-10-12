@@ -1550,6 +1550,11 @@ test("chats", async () => {
 	// time-windowed create budget (`rate_limited` on v3/chat/conversations/create).
 	// Released via `Symbol.dispose` at scope exit — after the deleteChat cleanup below.
 	using _lock = await state.acquireLock({ resource: "test:chats" })
+	// The client caches its avatar and nickname from its last getUserInfo and bakes them into
+	// the chats it hands back, while getChat reads the server's. A native leg's upload_avatar
+	// may have rotated the avatar while this suite queued for the lock, so re-read them inside
+	// it, as the native chat tests' `lock_chat` does.
+	await state.getUserInfo()
 	let chat = await state.createChat([])
 	expect(chat).toBeDefined()
 	try {
