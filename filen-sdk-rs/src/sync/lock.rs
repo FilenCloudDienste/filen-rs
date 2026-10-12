@@ -98,10 +98,10 @@ fn lock_url() -> String {
 /// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] (by the monotonic or
 /// the wall clock, so a system suspend counts) is unconfirmed: [`Self::is_valid`] reads false
 /// until the server confirms it again. It is LOST once the server refuses a refresh, or no
-/// refresh was confirmed within [`LOCK_SERVER_TTL`]: [`Self::wait_for_loss`] resolves, and the
-/// cached [`Client::lock_drive`] family stops handing it out — another client may hold the
-/// resource from that point on, so long-running holders should watch for loss rather than
-/// assume exclusivity.
+/// refresh was confirmed within [`LOCK_SERVER_TTL`]: [`Self::wait_for_loss`] resolves, the
+/// keep-alive stops, a release of the lease is sent in case the server still holds it after
+/// all, and the cached [`Client::lock_drive`] family acquires a new lock instead of handing it
+/// out — another client may hold the resource from that point on.
 ///
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
@@ -119,14 +119,13 @@ struct SharedLease {
 	uuid: Uuid,
 	client: Arc<AuthClient>,
 	resource: String,
-	// Flipped to false (never back) by the keep-alive task once the server-side
-	// lease is lost. See [`ResourceLock::is_valid`].
+	// Flipped to false (never back) once the lease is lost. See [`ResourceLock::is_valid`].
 	valid: tokio::sync::watch::Sender<bool>,
 	// The lease's latest confirmation, shared with the keep-alive task.
 	confirmed: tokio::sync::watch::Sender<Confirmed>,
-	// The runtime the lock was acquired on. The refresh task is spawned on it, and Drop —
-	// which can run on a thread with no ambient tokio runtime (e.g. a foreign FFI finalizer
-	// thread) — falls back to it when there is no ambient runtime to spawn the release on.
+	// The runtime the lock was acquired on. The refresh task is spawned on it, and the release —
+	// which can be sent from a thread with no ambient tokio runtime (e.g. a foreign FFI finalizer
+	// thread) — falls back to it when there is no ambient runtime to spawn it on.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	handle: Option<tokio::runtime::Handle>,
 }
@@ -153,13 +152,13 @@ impl ResourceLock {
 	/// was suspended). An unconfirmed lock turns valid again once the keep-alive gets a refresh
 	/// through; a lost one never does, and holders should re-acquire.
 	pub fn is_valid(&self) -> bool {
-		!self.is_lost() && self.lease.confirmed.borrow().age() < LOCK_LOSS_BUDGET
+		!self.lease.is_lost() && self.lease.age() < LOCK_LOSS_BUDGET
 	}
 
 	/// Whether the lease is lost: the server refused a refresh, or none was confirmed while the
 	/// lease could last.
 	pub(crate) fn is_lost(&self) -> bool {
-		!*self.lease.valid.borrow()
+		self.lease.is_lost()
 	}
 
 	/// Resolves once the server-side lease is lost; resolves immediately if it already is.
@@ -173,10 +172,110 @@ impl ResourceLock {
 	}
 }
 
-async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
+impl SharedLease {
+	fn is_lost(&self) -> bool {
+		!*self.valid.borrow()
+	}
+
+	fn age(&self) -> Duration {
+		self.confirmed.borrow().age()
+	}
+
+	/// Marks the lease lost, and sends a release for it in case the server still holds it after
+	/// all (a refresh answered too late, a suspend the clocks overstate): the release only frees a
+	/// lease this lock's uuid holds, so it never touches another client's.
+	fn mark_lost(&self) {
+		if self.valid.send_replace(false) {
+			tracing::warn!(
+				"Lost lock '{}', releasing it in case the server still holds it",
+				self.resource,
+			);
+			self.spawn_release();
+		}
+	}
+
+	// The release is attempted even for a lock marked lost: if the loss was a false positive
+	// (the server still holds our lease), releasing frees the resource for everyone immediately
+	// instead of stalling it out to the TTL, and if the lease is truly gone the Release is a
+	// harmless no-op keyed to our uuid.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn spawn_release(&self) {
+		// Prefer the ambient runtime: it is alive by definition, while the captured handle's
+		// runtime may have shut down since acquisition (spawning there would silently cancel
+		// the release).
+		let handle = tokio::runtime::Handle::try_current()
+			.ok()
+			.or_else(|| self.handle.clone());
+		let Some(handle) = handle else {
+			tracing::warn!(
+				"No tokio runtime available to release lock {}, relying on server-side expiry",
+				self.resource
+			);
+			return;
+		};
+		let client = self.client.clone();
+		let uuid = self.uuid;
+		let resource = self.resource.clone();
+		// Spawning on a handle whose runtime has shut down does not panic: the task is
+		// cancelled without being polled and the server expires the lock on its own.
+		handle.spawn(async move { release(&client, &lock_url(), uuid, &resource).await });
+	}
+
+	#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+	fn spawn_release(&self) {
+		let client = self.client.clone();
+		let uuid = self.uuid;
+		let resource = self.resource.clone();
+		// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
+		// spawning SDK worker open until the future completes, so a worker whose other tasks
+		// finish cannot close mid-request and silently skip the release. On the main thread it
+		// degrades to a plain `spawn_local`.
+		crate::runtime::spawn_local(async move {
+			release(&client, &lock_url(), uuid, &resource).await;
+		});
+	}
+}
+
+impl Drop for SharedLease {
+	// async drop is not supported in Rust, so the release is spawned
+	fn drop(&mut self) {
+		self.spawn_release();
+	}
+}
+
+/// One Refresh round-trip for the lock `uuid` on `resource`, sent to `url`: the server's
+/// `refreshed` flag.
+async fn send_refresh(
+	client: &AuthClient,
+	url: &str,
+	uuid: Uuid,
+	resource: &str,
+) -> Result<bool, Error> {
+	let result = api::v3::user::lock::post(
+		client,
+		url,
+		&api::v3::user::lock::Request {
+			uuid,
+			r#type: LockType::Refresh,
+			resource: Cow::Borrowed(resource),
+		},
+	)
+	.await
+	.map(|r| r.refreshed);
+	match &result {
+		Ok(true) => debug!("Refreshed lock: {resource}"),
+		Ok(false) => tracing::warn!("Server refused to refresh lock: {resource}"),
+		Err(e) => tracing::warn!("Failed to refresh lock {resource}: {e}"),
+	}
+	result
+}
+
+/// Releases the lock `uuid` on `resource`, sent to `url`. The server only releases it while
+/// `uuid` holds it.
+async fn release(client: &AuthClient, url: &str, uuid: Uuid, resource: &str) {
 	match api::v3::user::lock::post(
 		client,
-		&lock_url(),
+		url,
 		&api::v3::user::lock::Request {
 			uuid,
 			r#type: LockType::Release,
@@ -194,56 +293,6 @@ async fn actually_drop(client: &AuthClient, uuid: Uuid, resource: &str) {
 		Err(e) => {
 			tracing::warn!("Failed to release lock {resource}: {e}");
 		}
-	}
-}
-
-// The release is attempted even for a lock marked invalid: if the loss was a false
-// positive (the server still holds our lease), releasing frees the resource for
-// everyone immediately instead of stalling it out to the TTL, and if the lease is
-// truly gone the Release is a harmless no-op keyed to our uuid.
-#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn drop(lock: &mut SharedLease) {
-	// Prefer the ambient runtime: it is alive by definition, while the captured handle's
-	// runtime may have shut down since acquisition (spawning there would silently cancel
-	// the release).
-	let handle = tokio::runtime::Handle::try_current()
-		.ok()
-		.or_else(|| lock.handle.take());
-	let Some(handle) = handle else {
-		tracing::warn!(
-			"No tokio runtime available to release lock {}, relying on server-side expiry",
-			lock.resource
-		);
-		return;
-	};
-	let client = lock.client.clone();
-	let uuid = lock.uuid;
-	let resource = lock.resource.clone();
-	// Spawning on a handle whose runtime has shut down does not panic: the task is
-	// cancelled without being polled and the server expires the lock on its own.
-	handle.spawn(async move { actually_drop(&client, uuid, &resource).await });
-}
-
-#[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn drop(lock: &mut SharedLease) {
-	let client = lock.client.clone();
-	let uuid = lock.uuid;
-	let resource = lock.resource.clone();
-	// `runtime::spawn_local` (unlike raw `wasm_bindgen_futures::spawn_local`) holds the
-	// spawning SDK worker open until the future completes, so a worker whose other tasks
-	// finish cannot close mid-request and silently skip the release. On the main thread it
-	// degrades to a plain `spawn_local`.
-	crate::runtime::spawn_local(async move {
-		actually_drop(&client, uuid, &resource).await;
-	});
-}
-
-impl Drop for SharedLease {
-	// async drop is not supported in Rust
-	// so we need to use a blocking executor
-	// or a tokio spawn
-	fn drop(&mut self) {
-		drop(self);
 	}
 }
 
@@ -270,12 +319,18 @@ fn refresh_delay_after(elapsed: Duration) -> Duration {
 }
 
 /// Sleeps until the next refresh is due, by the age of the lease's last confirmation, in steps
-/// of at most [`LOCK_CLOCK_TICK`].
-async fn until_refresh_due(confirmed: &tokio::sync::watch::Sender<Confirmed>) {
+/// of at most [`LOCK_CLOCK_TICK`]. `false` once the lock is lost meanwhile.
+async fn until_refresh_due(
+	confirmed: &tokio::sync::watch::Sender<Confirmed>,
+	valid: &tokio::sync::watch::Sender<bool>,
+) -> bool {
 	loop {
+		if !*valid.borrow() {
+			return false;
+		}
 		let delay = refresh_delay_after(confirmed.borrow().age());
 		if delay.is_zero() {
-			return;
+			return true;
 		}
 		sleep(delay.min(LOCK_CLOCK_TICK)).await;
 	}
@@ -286,13 +341,14 @@ async fn until_refresh_due(confirmed: &tokio::sync::watch::Sender<Confirmed>) {
 enum LoopExit {
 	/// Every strong reference to the lock was dropped; Drop handles the release.
 	Dropped,
-	/// The server refused a refresh, or none was confirmed within [`LOCK_SERVER_TTL`] — the
-	/// server-side lease can no longer be trusted.
+	/// The server refused a refresh, none was confirmed within [`LOCK_SERVER_TTL`], or the lock
+	/// was marked lost otherwise — the server-side lease can no longer be trusted.
 	Lost,
 }
 
 /// Drives the refresh schedule for one held lock until it is dropped or lost, recording every
-/// confirmation in `confirmed`.
+/// confirmation in `confirmed`. `valid` is the lock's loss flag: once it is cleared, by the loop
+/// or by anyone else, the loop sends no further refresh and ends.
 ///
 /// `refresh` builds the future for a single Refresh round-trip (resolving to the
 /// server's `refreshed` flag), or returns `None` once the lock has been dropped.
@@ -307,6 +363,7 @@ enum LoopExit {
 async fn refresh_loop<F, Fut>(
 	mut refresh: F,
 	confirmed: &tokio::sync::watch::Sender<Confirmed>,
+	valid: &tokio::sync::watch::Sender<bool>,
 ) -> LoopExit
 where
 	F: FnMut() -> Option<Fut>,
@@ -316,7 +373,9 @@ where
 	// when it processes a request, never earlier than its send, so the age only ever
 	// overestimates the lease's.
 	loop {
-		until_refresh_due(confirmed).await;
+		if !until_refresh_due(confirmed, valid).await {
+			return LoopExit::Lost;
+		}
 		let age = confirmed.borrow().age();
 		let Some(remaining) = LOCK_SERVER_TTL.checked_sub(age).filter(|r| !r.is_zero()) else {
 			return LoopExit::Lost;
@@ -326,14 +385,15 @@ where
 		};
 		let sent = Confirmed::now();
 		match timeout(remaining, fut).await {
-			// Only an answer received inside the lease is trusted: an older server confirms any
-			// refresh, also one for a lease that lapsed and was handed to another client.
-			Ok(Ok(true)) if confirmed.borrow().age() < LOCK_SERVER_TTL => {
+			// Only an answer received inside the lease, for a lock not marked lost meanwhile, is
+			// trusted: an older server confirms any refresh, also one for a lease that lapsed and
+			// was handed to another client.
+			Ok(Ok(true)) if *valid.borrow() && confirmed.borrow().age() < LOCK_SERVER_TTL => {
 				record_confirmation(confirmed, sent);
 			}
-			Ok(Ok(true)) => return LoopExit::Lost,
-			// The server no longer recognizes the lock — authoritative loss.
-			Ok(Ok(false)) => return LoopExit::Lost,
+			// Refused (the server no longer recognizes the lock), answered too late, or lost
+			// meanwhile.
+			Ok(Ok(_)) => return LoopExit::Lost,
 			// Transport error: outcome unknown, retry while the lease may still stand.
 			Ok(Err(_)) => sleep(LOCK_RETRY_INTERVAL).await,
 			// The attempt outlived the lease; the next iteration declares loss.
@@ -342,63 +402,54 @@ where
 	}
 }
 
-async fn run_keep_alive(weak: Weak<SharedLease>, confirmed: tokio::sync::watch::Sender<Confirmed>) {
+async fn run_keep_alive(
+	weak: Weak<SharedLease>,
+	confirmed: tokio::sync::watch::Sender<Confirmed>,
+	valid: tokio::sync::watch::Sender<bool>,
+) {
 	let refresh = || {
-		let lock = weak.upgrade()?;
-		Some(async move {
-			let result = api::v3::user::lock::post(
-				lock.client.as_ref(),
-				&lock_url(),
-				&api::v3::user::lock::Request {
-					uuid: lock.uuid,
-					r#type: LockType::Refresh,
-					resource: Cow::Borrowed(&lock.resource),
-				},
-			)
-			.await
-			.map(|r| r.refreshed);
-			match &result {
-				Ok(true) => debug!("Refreshed lock: {}", lock.resource),
-				Ok(false) => tracing::warn!("Server refused to refresh lock: {}", lock.resource),
-				Err(e) => tracing::warn!("Failed to refresh lock {}: {e}", lock.resource),
-			}
-			result
-		})
+		let lease = weak.upgrade()?;
+		Some(
+			async move { send_refresh(&lease.client, &lock_url(), lease.uuid, &lease.resource).await },
+		)
 	};
-	if refresh_loop(refresh, &confirmed).await == LoopExit::Lost
-		&& let Some(lock) = weak.upgrade()
+	if refresh_loop(refresh, &confirmed, &valid).await == LoopExit::Lost
+		&& let Some(lease) = weak.upgrade()
 	{
-		tracing::warn!(
-			"Lost lock '{}': marking it invalid, the server releases it on its own ~{}s after the last confirmed refresh",
-			lock.resource,
-			LOCK_SERVER_TTL.as_secs(),
-		);
-		lock.valid.send_replace(false);
+		lease.mark_lost();
 	}
 }
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-fn keep_lock_alive(lock: &Arc<SharedLease>) {
-	// a second handle on the lease's confirmation channel, not a copy of it
-	let refresh = run_keep_alive(Arc::downgrade(lock), lock.confirmed.clone());
-	// Same no-ambient-runtime hazard as Drop: spawn on the runtime the lock was acquired
+fn keep_lock_alive(lease: &Arc<SharedLease>) {
+	// second handles on the lease's channels, not copies of them
+	let refresh = run_keep_alive(
+		Arc::downgrade(lease),
+		lease.confirmed.clone(),
+		lease.valid.clone(),
+	);
+	// Same no-ambient-runtime hazard as the release: spawn on the runtime the lock was acquired
 	// on. The ambient fallback is unreachable through `acquire_lock` (reqwest already
 	// requires a tokio context there) but keeps behavior identical when no handle was
 	// captured.
-	match &lock.handle {
+	match &lease.handle {
 		Some(handle) => handle.spawn(refresh),
 		None => tokio::spawn(refresh),
 	};
 }
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-fn keep_lock_alive(lock: &Arc<SharedLease>) {
+fn keep_lock_alive(lease: &Arc<SharedLease>) {
 	// `runtime::spawn_local` pins the spawning SDK worker open for the life of the refresh
 	// loop (it exits when the lock drops or is lost), so the worker cannot close
 	// under a held lock and silently stop refreshing it — the server would expire the lock
 	// while the client still believes it holds it.
-	// a second handle on the lease's confirmation channel, not a copy of it
-	crate::runtime::spawn_local(run_keep_alive(Arc::downgrade(lock), lock.confirmed.clone()));
+	// second handles on the lease's channels, not copies of them
+	crate::runtime::spawn_local(run_keep_alive(
+		Arc::downgrade(lease),
+		lease.confirmed.clone(),
+		lease.valid.clone(),
+	));
 }
 
 fn fibonacci_iter(max_retry_time: Duration) -> impl Iterator<Item = Duration> {
@@ -571,7 +622,12 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use filen_types::auth::APIKey;
+
 	use super::*;
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	use crate::auth::unauth::test_support::offline_unauthed;
 
 	#[test]
 	fn refresh_delay_saturates_when_first_poll_is_late() {
@@ -594,22 +650,22 @@ mod tests {
 		);
 	}
 
+	/// A client whose every request fails to connect without leaving the machine: a release or
+	/// refresh the tests below set off must never reach the gateway.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn offline_client() -> Arc<AuthClient> {
+		Arc::new(AuthClient::from_unauthed(
+			offline_unauthed(),
+			Arc::new(std::sync::RwLock::new(APIKey(Cow::Borrowed("")))),
+		))
+	}
+
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	fn test_lock(handle: Option<tokio::runtime::Handle>) -> ResourceLock {
-		use std::sync::RwLock;
-
-		use filen_types::auth::APIKey;
-
-		use crate::auth::{http::ClientConfig, unauth::UnauthClient};
-
-		let unauthed = UnauthClient::from_config(ClientConfig::default()).unwrap();
 		ResourceLock {
 			lease: Arc::new(SharedLease {
 				uuid: Uuid::new_v4(),
-				client: Arc::new(AuthClient::from_unauthed(
-					unauthed,
-					Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
-				)),
+				client: offline_client(),
 				resource: "test-resource".to_string(),
 				valid: tokio::sync::watch::Sender::new(true),
 				confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),
@@ -620,7 +676,7 @@ mod tests {
 
 	// The runtimes below are deliberately never driven: a `current_thread` runtime only
 	// polls tasks inside `block_on`, so the release task spawned by `Drop` is queued (or
-	// cancelled) but never runs — no request ever leaves the process.
+	// cancelled) but never runs.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[test]
 	fn drop_on_thread_without_runtime_does_not_panic() {
@@ -737,6 +793,22 @@ mod tests {
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[test]
+	fn a_lock_declared_lost_sends_a_release_once() {
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		let lock = rt.block_on(async { test_lock(tokio::runtime::Handle::try_current().ok()) });
+		let _guard = rt.enter();
+		lock.lease.mark_lost();
+		assert!(!lock.is_valid());
+		assert_eq!(rt.metrics().num_alive_tasks(), 1);
+		lock.lease.mark_lost();
+		assert_eq!(rt.metrics().num_alive_tasks(), 1, "a loss is released once");
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test]
 	async fn loss_signal_flips_is_valid_and_wakes_waiters() {
 		let lock = test_lock(None);
@@ -832,6 +904,12 @@ mod tests {
 		})
 	}
 
+	/// The loss flag of a lock that is not lost.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn held() -> tokio::sync::watch::Sender<bool> {
+		tokio::sync::watch::Sender::new(true)
+	}
+
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
 	async fn an_unconfirmed_lock_is_invalid_until_the_server_confirms_it_again() {
@@ -853,6 +931,7 @@ mod tests {
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::Confirm, Step::Drop]),
 			&confirmed_at(begin),
+			&held(),
 		)
 		.await;
 		assert_eq!(exit, LoopExit::Dropped);
@@ -864,7 +943,12 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn server_refusal_is_authoritative_loss() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::Refuse]), &confirmed_at(begin)).await;
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::Refuse]),
+			&confirmed_at(begin),
+			&held(),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Lost);
 		assert_eq!(begin.elapsed(), Duration::from_secs(15));
 	}
@@ -877,6 +961,7 @@ mod tests {
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::TransportErr, Step::Confirm, Step::Confirm, Step::Drop]),
 			&confirmed,
+			&held(),
 		)
 		.await;
 		assert_eq!(exit, LoopExit::Dropped);
@@ -895,6 +980,7 @@ mod tests {
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::TransportErr; 45]),
 			&confirmed_at(begin),
+			&held(),
 		)
 		.await;
 		assert_eq!(exit, LoopExit::Lost);
@@ -905,7 +991,12 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn hung_refresh_is_cut_off_when_the_lease_lapses() {
 		let begin = Instant::now();
-		let exit = refresh_loop(scripted_refresh(&[Step::Hang]), &confirmed_at(begin)).await;
+		let exit = refresh_loop(
+			scripted_refresh(&[Step::Hang]),
+			&confirmed_at(begin),
+			&held(),
+		)
+		.await;
 		assert_eq!(exit, LoopExit::Lost);
 		assert_eq!(begin.elapsed(), LOCK_SERVER_TTL);
 	}
@@ -920,6 +1011,7 @@ mod tests {
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::Confirm, Step::Drop]),
 			&confirmed_at(begin),
+			&held(),
 		)
 		.await;
 		assert_eq!(exit, LoopExit::Dropped);
@@ -934,7 +1026,7 @@ mod tests {
 		let confirmed = tokio::sync::watch::Sender::new(suspended_for(
 			LOCK_SERVER_TTL + Duration::from_secs(5),
 		));
-		let exit = refresh_loop(scripted_refresh(&[]), &confirmed).await;
+		let exit = refresh_loop(scripted_refresh(&[]), &confirmed, &held()).await;
 		assert_eq!(exit, LoopExit::Lost);
 	}
 
@@ -942,9 +1034,13 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn a_suspend_while_waiting_is_refreshed_after_at_once() {
 		let begin = Instant::now();
-		let confirmed = confirmed_at(begin);
+		let (confirmed, valid) = (confirmed_at(begin), held());
 		let (exit, ()) = tokio::join!(
-			refresh_loop(scripted_refresh(&[Step::Confirm, Step::Drop]), &confirmed),
+			refresh_loop(
+				scripted_refresh(&[Step::Confirm, Step::Drop]),
+				&confirmed,
+				&valid
+			),
 			async {
 				sleep(Duration::from_millis(2500)).await;
 				// a 40s suspend: the wall clock moved on, the monotonic one did not
@@ -962,11 +1058,53 @@ mod tests {
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[tokio::test(start_paused = true)]
+	async fn a_lock_lost_elsewhere_is_refreshed_no_more() {
+		let begin = Instant::now();
+		let (confirmed, valid) = (confirmed_at(begin), held());
+		let (exit, ()) = tokio::join!(
+			// one refresh is scripted: a second would panic
+			refresh_loop(scripted_refresh(&[Step::Confirm]), &confirmed, &valid),
+			async {
+				sleep(Duration::from_millis(20_500)).await;
+				valid.send_replace(false);
+			}
+		);
+		assert_eq!(exit, LoopExit::Lost);
+		// confirmed at 15s, the loss seen at the next look at the clock
+		assert_eq!(begin.elapsed(), Duration::from_secs(21));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn a_refresh_answered_after_the_lock_was_lost_does_not_confirm_it() {
+		let begin = Instant::now();
+		let confirmed = confirmed_at(begin);
+		let valid = held();
+		let (exit, ()) = tokio::join!(
+			refresh_loop(
+				scripted_refresh(&[Step::SlowConfirm(5)]),
+				&confirmed,
+				&valid
+			),
+			async {
+				sleep(Duration::from_secs(17)).await;
+				valid.send_replace(false);
+			}
+		);
+		assert_eq!(exit, LoopExit::Lost);
+		// sent at 15s, answered at 20s, after the loss at 17s
+		assert_eq!(begin.elapsed(), Duration::from_secs(20));
+		assert_eq!(confirmed.borrow().at, begin);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
 	async fn slow_confirm_keeps_cadence_anchored_to_send_time() {
 		let begin = Instant::now();
 		let exit = refresh_loop(
 			scripted_refresh(&[Step::SlowConfirm(5), Step::Drop]),
 			&confirmed_at(begin),
+			&held(),
 		)
 		.await;
 		assert_eq!(exit, LoopExit::Dropped);
