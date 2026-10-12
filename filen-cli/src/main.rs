@@ -7,7 +7,7 @@
 //! Invoke the Filen CLI with no command specified to enter interactive mode (REPL).
 //! There, you can specify absolute paths (starting with "/") or relative paths (supports "." and "..").
 
-use std::{fs, num::NonZeroU32, path::PathBuf};
+use std::{fs, num::NonZeroU32, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -17,6 +17,7 @@ use log::{LevelFilter, info};
 use crate::{
 	commands::{Commands, execute_command},
 	docs::{generate_markdown_docs, print_in_app_docs},
+	log_files::LogFiles,
 	ui::{CustomLogger, ReplPromptResult},
 	updater::check_for_updates,
 	util::RemotePath,
@@ -26,6 +27,7 @@ mod auth;
 mod commands;
 mod completion;
 mod docs;
+mod log_files;
 mod ui;
 mod updater;
 mod util;
@@ -204,7 +206,8 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 	};
 
 	// setup logging
-	fs::create_dir_all(config.config_dir.join("logs")).context("Failed to create logs dir")?;
+	let log_dir = config.config_dir.join("logs");
+	fs::create_dir_all(&log_dir).context("Failed to create logs dir")?;
 	let logging_level = if cli_args.quiet {
 		LevelFilter::Off
 	} else {
@@ -215,7 +218,14 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 			_ => LevelFilter::Trace,
 		}
 	};
-	let log_file = config.config_dir.join("logs").join("latest.log");
+	let log_file = log_dir.join(log_files::LATEST);
+	let log_files_level = LevelFilter::Debug;
+	// An `Arc` because ftail builds each channel from a `'static` `Fn`, which can only hand out
+	// clones of it.
+	let log_files = Arc::new(
+		LogFiles::open(&log_dir, log_files_level, 10 * 1024 * 1024, 3)
+			.context("Failed to open log files")?,
+	);
 	Ftail::new()
 		.custom(
 			move |config| {
@@ -227,12 +237,14 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 			},
 			logging_level,
 		)
-		.single_file(&log_file, false, LevelFilter::Debug)
-		.daily_file(&config.config_dir.join("logs"), LevelFilter::Debug)
-		.max_file_size(10) // in MB
-		.retention_days(3)
+		.custom(
+			move |_| Box::new(Arc::clone(&log_files)) as Box<dyn log::Log + Send + Sync>,
+			log_files_level,
+		)
 		.init()
 		.context("Failed to initialize logger")?;
+	// ftail passes every record on to its channels, and no channel takes one past both levels.
+	log::set_max_level(logging_level.max(log_files_level));
 	info!("Logging level: {}", logging_level);
 	info!("Full log file: {}", log_file.display());
 
