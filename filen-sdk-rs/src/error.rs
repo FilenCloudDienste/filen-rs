@@ -544,9 +544,6 @@ impl_from!(InvalidStateError, ErrorKind::InvalidState);
 /// operation holding it stopped before its next write.
 #[derive(Debug, Error)]
 #[error("Lost the lock on resource '{resource}', another client may hold it now")]
-// ResourceLock's confirmation, which returns it, arrives in the next commit; until then nothing
-// does.
-#[allow(dead_code)]
 pub(crate) struct LockLostError {
 	pub(crate) resource: String,
 }
