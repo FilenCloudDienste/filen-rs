@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
 use tracing::debug;
 
@@ -32,6 +33,54 @@ use crate::{
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
 pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 
+/// When the server last confirmed a lock's lease: the send time of the confirming request
+/// (the acquire, or a refresh) on the monotonic clock the async timers use, and on the wall
+/// clock, which keeps running while the system sleeps and the monotonic clock does not.
+#[derive(Debug, Clone, Copy)]
+struct Confirmed {
+	at: Instant,
+	wall: DateTime<Utc>,
+}
+
+impl Confirmed {
+	fn now() -> Self {
+		Self {
+			at: Instant::now(),
+			wall: Utc::now(),
+		}
+	}
+
+	/// The time since, by whichever clock ran further: the monotonic one stops during a system
+	/// suspend, the wall clock can be set back.
+	///
+	/// Neither clock covers every case. A wall clock set forward reads as a suspend, so a lock
+	/// may be taken for lost while the server still holds it; one set back while the system
+	/// is suspended hides that suspend from both clocks. Telling them apart takes a clock that
+	/// counts suspended time, which the platforms only offer through calls this crate does not
+	/// make.
+	fn age(&self) -> Duration {
+		let wall = (Utc::now() - self.wall).to_std().unwrap_or(Duration::ZERO);
+		self.at.elapsed().max(wall)
+	}
+
+	/// Whether this confirmation was sent after `other`: by the monotonic clock, which is not set
+	/// back, and on a tie (no time passed on it, as on a paused test clock) by the wall clock.
+	fn is_newer_than(&self, other: &Self) -> bool {
+		(self.at, self.wall) > (other.at, other.wall)
+	}
+}
+
+/// Records `sent` as the lease's latest confirmation unless a later one is recorded already.
+fn record_confirmation(confirmed: &tokio::sync::watch::Sender<Confirmed>, sent: Confirmed) {
+	confirmed.send_if_modified(|current| {
+		let later = sent.is_newer_than(current);
+		if later {
+			*current = sent;
+		}
+		later
+	});
+}
+
 /// Represents a lock on a resource, which can be acquired using the [`Client::acquire_lock`] method.
 /// The lock is released when the [`ResourceLock`] is dropped; its clones share the lock, which
 /// is released once the last of them is dropped.
@@ -41,12 +90,13 @@ pub(crate) const ATTEMPTS_DEFAULT: usize = 8640; // 8640
 /// server processed, so a background task refreshes it every [`LOCK_REFRESH_INTERVAL`],
 /// retrying a failed refresh.
 ///
-/// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] is unconfirmed:
-/// [`Self::is_valid`] reads false until the server confirms it again. It is LOST once the
-/// server refuses a refresh, or no refresh was confirmed within [`LOCK_SERVER_TTL`]:
-/// [`Self::wait_for_loss`] resolves, and the cached [`Client::lock_drive`] family stops handing
-/// it out — another client may hold the resource from that point on, so long-running holders
-/// should watch for loss rather than assume exclusivity.
+/// A lock whose last confirmed refresh is older than [`LOCK_LOSS_BUDGET`] (by the monotonic or
+/// the wall clock, so a system suspend counts) is unconfirmed: [`Self::is_valid`] reads false
+/// until the server confirms it again. It is LOST once the server refuses a refresh, or no
+/// refresh was confirmed within [`LOCK_SERVER_TTL`]: [`Self::wait_for_loss`] resolves, and the
+/// cached [`Client::lock_drive`] family stops handing it out — another client may hold the
+/// resource from that point on, so long-running holders should watch for loss rather than
+/// assume exclusivity.
 ///
 /// The release request is spawned onto the ambient tokio runtime at drop time when one exists,
 /// falling back to the runtime the lock was acquired on; if neither is available (or the
@@ -67,9 +117,8 @@ struct SharedLease {
 	// Flipped to false (never back) by the keep-alive task once the server-side
 	// lease is lost. See [`ResourceLock::is_valid`].
 	valid: tokio::sync::watch::Sender<bool>,
-	// When the server last confirmed the lease: the send time of the confirming request (the
-	// acquire, or a refresh). Shared with the keep-alive task.
-	confirmed: tokio::sync::watch::Sender<Instant>,
+	// The lease's latest confirmation, shared with the keep-alive task.
+	confirmed: tokio::sync::watch::Sender<Confirmed>,
 	// The runtime the lock was acquired on. The refresh task is spawned on it, and Drop —
 	// which can run on a thread with no ambient tokio runtime (e.g. a foreign FFI finalizer
 	// thread) — falls back to it when there is no ambient runtime to spawn the release on.
@@ -95,11 +144,11 @@ impl ResourceLock {
 	/// refused it since.
 	///
 	/// `false` means another client may already hold the resource, or soon may: the lock is
-	/// lost, or its last confirmation is too old to rely on (a refresh failing). An unconfirmed
-	/// lock turns valid again once the keep-alive gets a refresh through; a lost one never
-	/// does, and holders should re-acquire.
+	/// lost, or its last confirmation is too old to rely on (a refresh failing, or the system
+	/// was suspended). An unconfirmed lock turns valid again once the keep-alive gets a refresh
+	/// through; a lost one never does, and holders should re-acquire.
 	pub fn is_valid(&self) -> bool {
-		!self.is_lost() && self.lease.confirmed.borrow().elapsed() < LOCK_LOSS_BUDGET
+		!self.is_lost() && self.lease.confirmed.borrow().age() < LOCK_LOSS_BUDGET
 	}
 
 	/// Whether the lease is lost: the server refused a refresh, or none was confirmed while the
@@ -203,21 +252,27 @@ const LOCK_SERVER_TTL: time::Duration = time::Duration::from_secs(60);
 const LOCK_LOSS_BUDGET: time::Duration = time::Duration::from_secs(25);
 /// Delay between retries of a failed refresh.
 const LOCK_RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
+/// The longest the keep-alive sleeps before looking at the lease's age again. Its timers run on
+/// the monotonic clock, which stops during a system suspend: waking up this often, it sees a
+/// suspend through the wall clock in the age and refreshes right away instead of when its
+/// timer runs out.
+const LOCK_CLOCK_TICK: time::Duration = time::Duration::from_secs(1);
 
 /// How long to sleep before the next refresh, given how long ago the lease was last confirmed.
 fn refresh_delay_after(elapsed: Duration) -> Duration {
 	LOCK_REFRESH_INTERVAL.saturating_sub(elapsed)
 }
 
-/// Records `sent` as the lease's latest confirmation unless a later one is recorded already.
-fn record_confirmation(confirmed: &tokio::sync::watch::Sender<Instant>, sent: Instant) {
-	confirmed.send_if_modified(|current| {
-		let later = sent > *current;
-		if later {
-			*current = sent;
+/// Sleeps until the next refresh is due, by the age of the lease's last confirmation, in steps
+/// of at most [`LOCK_CLOCK_TICK`].
+async fn until_refresh_due(confirmed: &tokio::sync::watch::Sender<Confirmed>) {
+	loop {
+		let delay = refresh_delay_after(confirmed.borrow().age());
+		if delay.is_zero() {
+			return;
 		}
-		later
-	});
+		sleep(delay.min(LOCK_CLOCK_TICK)).await;
+	}
 }
 
 /// Why a [`refresh_loop`] ended.
@@ -242,10 +297,10 @@ enum LoopExit {
 /// [`LOCK_SERVER_TTL`], when the lease has lapsed whatever the server would answer. Before
 /// that, failing refreshes are retried: an unconfirmed lock stops being relied on through
 /// [`ResourceLock::is_valid`] and is confirmed again once a refresh gets through, so a network
-/// blip does not cost the lock.
+/// blip or a short system suspend does not cost the lock.
 async fn refresh_loop<F, Fut>(
 	mut refresh: F,
-	confirmed: &tokio::sync::watch::Sender<Instant>,
+	confirmed: &tokio::sync::watch::Sender<Confirmed>,
 ) -> LoopExit
 where
 	F: FnMut() -> Option<Fut>,
@@ -254,24 +309,21 @@ where
 	// Confirmations are timed from when the request was SENT: the server's lease clock restarts
 	// when it processes a request, never earlier than its send, so the age only ever
 	// overestimates the lease's.
-	let age = confirmed.borrow().elapsed();
-	sleep(refresh_delay_after(age)).await;
 	loop {
-		let age = confirmed.borrow().elapsed();
+		until_refresh_due(confirmed).await;
+		let age = confirmed.borrow().age();
 		let Some(remaining) = LOCK_SERVER_TTL.checked_sub(age).filter(|r| !r.is_zero()) else {
 			return LoopExit::Lost;
 		};
 		let Some(fut) = refresh() else {
 			return LoopExit::Dropped;
 		};
-		let sent = Instant::now();
+		let sent = Confirmed::now();
 		match timeout(remaining, fut).await {
 			// Only an answer received inside the lease is trusted: an older server confirms any
 			// refresh, also one for a lease that lapsed and was handed to another client.
-			Ok(Ok(true)) if confirmed.borrow().elapsed() < LOCK_SERVER_TTL => {
+			Ok(Ok(true)) if confirmed.borrow().age() < LOCK_SERVER_TTL => {
 				record_confirmation(confirmed, sent);
-				let age = confirmed.borrow().elapsed();
-				sleep(refresh_delay_after(age)).await;
 			}
 			Ok(Ok(true)) => return LoopExit::Lost,
 			// The server no longer recognizes the lock — authoritative loss.
@@ -284,7 +336,7 @@ where
 	}
 }
 
-async fn run_keep_alive(weak: Weak<SharedLease>, confirmed: tokio::sync::watch::Sender<Instant>) {
+async fn run_keep_alive(weak: Weak<SharedLease>, confirmed: tokio::sync::watch::Sender<Confirmed>) {
 	let refresh = || {
 		let lock = weak.upgrade()?;
 		Some(async move {
@@ -382,7 +434,7 @@ async fn acquire_loop<F, Fut>(
 	resource: &str,
 	max_sleep_time: Duration,
 	attempts: usize,
-) -> Result<Instant, Error>
+) -> Result<Confirmed, Error>
 where
 	F: FnMut() -> Fut,
 	Fut: Future<Output = Result<bool, Error>>,
@@ -392,7 +444,7 @@ where
 	for (i, delay) in (0..attempts).zip(fibonacci_iter(max_sleep_time)) {
 		// The server's lease clock starts when it processes this request, no
 		// earlier than now — the refresh schedule is anchored to the send time.
-		let attempt_started = Instant::now();
+		let attempt_started = Confirmed::now();
 		match poll().await {
 			// Always a fresh lease, even after a failed poll the server granted with only the
 			// answer lost: the server refuses an Acquire repeated with the holder's own uuid
@@ -546,7 +598,7 @@ mod tests {
 				)),
 				resource: "test-resource".to_string(),
 				valid: tokio::sync::watch::Sender::new(true),
-				confirmed: tokio::sync::watch::Sender::new(Instant::now()),
+				confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),
 				handle,
 			}),
 		}
@@ -685,6 +737,30 @@ mod tests {
 		lock.wait_for_loss().await;
 	}
 
+	/// A lease confirmation `ago` in the past on the wall clock only, as after a system suspend
+	/// the monotonic clock did not count.
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	fn suspended_for(ago: Duration) -> Confirmed {
+		Confirmed {
+			at: Instant::now(),
+			wall: Utc::now() - chrono::Duration::from_std(ago).unwrap(),
+		}
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test]
+	async fn a_suspend_past_the_budget_leaves_the_lock_unconfirmed_until_the_server_confirms_it() {
+		let lock = test_lock(None);
+		lock.lease
+			.confirmed
+			.send_replace(suspended_for(LOCK_LOSS_BUDGET + Duration::from_secs(5)));
+		// the monotonic clock did not see the suspend; the wall clock did
+		assert!(!lock.is_valid());
+		assert!(!lock.is_lost(), "the lease may still stand");
+		record_confirmation(&lock.lease.confirmed, Confirmed::now());
+		assert!(lock.is_valid());
+	}
+
 	/// One scripted outcome for a [`refresh_loop`] refresh attempt.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	#[derive(Clone, Copy)]
@@ -732,10 +808,14 @@ mod tests {
 		}
 	}
 
-	/// The confirmation channel of a lease confirmed at `at`.
+	/// A lease confirmed at `at` on the monotonic clock, and now on the wall clock, which the
+	/// paused test clock does not move.
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn confirmed_at(at: Instant) -> tokio::sync::watch::Sender<Instant> {
-		tokio::sync::watch::Sender::new(at)
+	fn confirmed_at(at: Instant) -> tokio::sync::watch::Sender<Confirmed> {
+		tokio::sync::watch::Sender::new(Confirmed {
+			at,
+			wall: Utc::now(),
+		})
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -745,7 +825,7 @@ mod tests {
 		tokio::time::advance(LOCK_LOSS_BUDGET).await;
 		assert!(!lock.is_valid());
 		assert!(!lock.is_lost(), "the lease may still stand");
-		record_confirmation(&lock.lease.confirmed, Instant::now());
+		record_confirmation(&lock.lease.confirmed, Confirmed::now());
 		assert!(lock.is_valid());
 	}
 
@@ -788,7 +868,7 @@ mod tests {
 		assert_eq!(exit, LoopExit::Dropped);
 		// err at 15s, retry confirms at 16s, confirm at 31s, drop observed at 46s
 		assert_eq!(begin.elapsed(), Duration::from_secs(46));
-		assert_eq!(*confirmed.borrow() - begin, Duration::from_secs(31));
+		assert_eq!(confirmed.borrow().at - begin, Duration::from_secs(31));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -831,6 +911,39 @@ mod tests {
 		assert_eq!(exit, LoopExit::Dropped);
 		// confirms at 30s, drop observed at the 45s refresh
 		assert_eq!(begin.elapsed(), Duration::from_secs(45));
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn a_suspend_past_the_ttl_is_loss_by_the_wall_clock() {
+		// the monotonic clock did not see the suspend, so only the wall clock can tell
+		let confirmed = tokio::sync::watch::Sender::new(suspended_for(
+			LOCK_SERVER_TTL + Duration::from_secs(5),
+		));
+		let exit = refresh_loop(scripted_refresh(&[]), &confirmed).await;
+		assert_eq!(exit, LoopExit::Lost);
+	}
+
+	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+	#[tokio::test(start_paused = true)]
+	async fn a_suspend_while_waiting_is_refreshed_after_at_once() {
+		let begin = Instant::now();
+		let confirmed = confirmed_at(begin);
+		let (exit, ()) = tokio::join!(
+			refresh_loop(scripted_refresh(&[Step::Confirm, Step::Drop]), &confirmed),
+			async {
+				sleep(Duration::from_millis(2500)).await;
+				// a 40s suspend: the wall clock moved on, the monotonic one did not
+				confirmed.send_replace(Confirmed {
+					at: begin,
+					wall: Utc::now() - chrono::Duration::seconds(40),
+				});
+			}
+		);
+		assert_eq!(exit, LoopExit::Dropped);
+		// refreshed at the next look at the clock (3s), not when the 15s timer ran out, and
+		// the drop observed at the refresh after (18s)
+		assert_eq!(begin.elapsed(), Duration::from_secs(18));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -946,7 +1059,7 @@ mod tests {
 		.await
 		.unwrap();
 		// sent at 0.25s, answered at 5.25s: the lease runs from the send
-		assert_eq!(granted_at - begin, Duration::from_millis(250));
+		assert_eq!(granted_at.at - begin, Duration::from_millis(250));
 		assert_eq!(begin.elapsed(), Duration::from_millis(5250));
 	}
 
@@ -984,7 +1097,7 @@ mod tests {
 		.await
 		.unwrap();
 		// refused at 0s, unreachable at 0s, granted at 0.25s
-		assert_eq!(granted_at - begin, Duration::from_millis(250));
+		assert_eq!(granted_at.at - begin, Duration::from_millis(250));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1033,7 +1146,7 @@ mod tests {
 		.await
 		.unwrap();
 		// refused again at 1s, so three more failures are waited out; granted at 8.25s
-		assert_eq!(granted_at - begin, Duration::from_millis(8250));
+		assert_eq!(granted_at.at - begin, Duration::from_millis(8250));
 	}
 
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
