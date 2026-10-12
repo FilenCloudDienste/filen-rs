@@ -229,7 +229,7 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 		)
 		.single_file(&log_file, false, LevelFilter::Debug)
 		.daily_file(&config.config_dir.join("logs"), LevelFilter::Debug)
-		.max_file_size(10 * 1024 * 1024) // 10 MB
+		.max_file_size(10) // in MB
 		.retention_days(3)
 		.init()
 		.context("Failed to initialize logger")?;
