@@ -31,6 +31,7 @@ use crate::{
 	auth::{Client, http::AuthClient},
 	consts::gateway_url,
 	error::{Error, LockLostError},
+	util::{MaybeSend, MaybeSendSync},
 };
 
 pub(crate) const MAX_SLEEP_TIME_DEFAULT: time::Duration = time::Duration::from_secs(30);
@@ -163,12 +164,6 @@ impl ResourceLock {
 		!self.lease.is_lost() && self.lease.age() < LOCK_LOSS_BUDGET
 	}
 
-	/// Whether the lease is lost: the server refused a refresh, or none was confirmed while the
-	/// lease could last.
-	pub(crate) fn is_lost(&self) -> bool {
-		self.lease.is_lost()
-	}
-
 	/// `Ok` once the lease is confirmed: at once while [`Self::is_valid`], otherwise after
 	/// asking the server with a refresh. A lost lease is an [`ErrorKind::LockLost`] error.
 	///
@@ -187,9 +182,6 @@ impl ResourceLock {
 	/// request sent while the lease is confirmed normally reaches the server inside it: the
 	/// confirmation is at most [`LOCK_LOSS_BUDGET`] old against a [`LOCK_SERVER_TTL`] lease, or,
 	/// right after the server answered this call's refresh, as old as that round trip.
-	// The client's lock cache, its first caller, arrives in the next commit; until then only the
-	// tests call it.
-	#[allow(dead_code)]
 	pub(crate) async fn confirm(&self) -> Result<(), Error> {
 		let lease = &*self.lease;
 		let url = lock_url();
@@ -783,6 +775,19 @@ impl Client {
 	}
 }
 
+/// A held lock whose server-side lease can be lost while it is held: the client's
+/// [`ResourceLock`], or a test's fake.
+pub(crate) trait Lease: MaybeSendSync {
+	/// See [`ResourceLock::confirm`].
+	fn confirm(&self) -> impl Future<Output = Result<(), Error>> + MaybeSend;
+}
+
+impl Lease for Arc<ResourceLock> {
+	fn confirm(&self) -> impl Future<Output = Result<(), Error>> + MaybeSend {
+		ResourceLock::confirm(self)
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -1347,7 +1352,7 @@ mod tests {
 		let lock = test_lock(None);
 		tokio::time::advance(LOCK_LOSS_BUDGET).await;
 		assert!(!lock.is_valid());
-		assert!(!lock.is_lost(), "the lease may still stand");
+		assert!(!lock.lease.is_lost(), "the lease may still stand");
 		record_confirmation(&lock.lease.confirmed, Confirmed::now());
 		assert!(lock.is_valid());
 	}
