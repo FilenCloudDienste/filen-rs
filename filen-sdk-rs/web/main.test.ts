@@ -749,10 +749,23 @@ async function ensureShareContact() {
 	return contact
 }
 
-test("sharing", async () => {
+/// Every native leg holds `test:contact` for minutes at a time (test-utils'
+/// `set_up_contact_no_add` settles for 300 s under it), so a contact test can queue for over an
+/// hour behind them: it gets an explicit timeout, and its lock waits give up within it. A test
+/// that times out while still polling would otherwise take the lock later anyway and run under
+/// whichever test comes next.
+const CONTACT_TEST_TIMEOUT = cap(600_000)
+const CONTACT_LOCK = {
+	resource: "test:contact",
+	maxSleepTime: 30,
+	// the poll schedule sleeps at most `maxSleepTime` seconds after each poll
+	attempts: Math.floor(CONTACT_TEST_TIMEOUT / 30_000)
+}
+
+test("sharing", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	// Same lock, same order, as the native contact tests — see the shared/linked thumbnail test.
-	using _contactLock = await state.acquireLock({ resource: "test:contact" })
-	using _shareContactLock = await shareClient.acquireLock({ resource: "test:contact" })
+	using _contactLock = await state.acquireLock(CONTACT_LOCK)
+	using _shareContactLock = await shareClient.acquireLock(CONTACT_LOCK)
 	const dir = await state.createDir(testDir, "share-test-dir")
 	const file = await state.uploadFile(new TextEncoder().encode("shared file content"), {
 		parent: dir,
@@ -780,10 +793,10 @@ test("sharing", async () => {
 	await state.deleteContact(contact.uuid)
 })
 
-test("block", async () => {
+test("block", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	// Same lock, same order, as the native contact tests — see the shared/linked thumbnail test.
-	using _contactLock = await state.acquireLock({ resource: "test:contact" })
-	using _shareContactLock = await shareClient.acquireLock({ resource: "test:contact" })
+	using _contactLock = await state.acquireLock(CONTACT_LOCK)
+	using _shareContactLock = await shareClient.acquireLock(CONTACT_LOCK)
 	const contacts = await state.getContacts()
 	let contact
 	for (const c of contacts) {
@@ -1201,12 +1214,12 @@ test("thumbnail verdicts are distinguishable", async () => {
 /// `SharedFile` of a file shared with you directly, and the `LinkedFile` behind a file link —
 /// that last one through the `UnauthClient`, which is all a link viewer has. The Rust side
 /// used to accept the drive shape only, and `canMakeThumbnail` existed on it only.
-test("thumbnails and previews for shared and linked files", { timeout: cap(600_000) }, async () => {
+test("thumbnails and previews for shared and linked files", { timeout: CONTACT_TEST_TIMEOUT }, async () => {
 	// The native suites reset contacts and shares on BOTH accounts under this lock (test-utils'
 	// set_up_contact_no_add), and the nightly runs them alongside this suite — main account
 	// first, then the share account, the order they take it in.
-	using _contactLock = await state.acquireLock({ resource: "test:contact" })
-	using _shareContactLock = await shareClient.acquireLock({ resource: "test:contact" })
+	using _contactLock = await state.acquireLock(CONTACT_LOCK)
+	using _shareContactLock = await shareClient.acquireLock(CONTACT_LOCK)
 	const dir = await state.createDir(testDir, "any-file-thumbs")
 	const parrot = await state.uploadFile(await (await fetch("imgs/parrot.jpg")).bytes(), { parent: dir, name: "parrot.jpg" })
 	const size = { maxHeight: 64, maxWidth: 64 }
