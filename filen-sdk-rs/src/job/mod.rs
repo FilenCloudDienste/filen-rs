@@ -197,10 +197,19 @@ impl JobControl {
 	/// The checkpoint before starting new work: `Err` when the job is stopping, otherwise waits
 	/// out a pause (returning `Err` if the job stops meanwhile).
 	pub(crate) async fn checkpoint(&self) -> Result<(), Stopped> {
+		self.checkpoint_observed(|_| {}).await
+	}
+
+	/// [`Self::checkpoint`], handing `observe` the pause request it acts on. The request is read
+	/// once: a pause requested after that read is left to the next checkpoint, never waited out
+	/// without `observe` having seen it.
+	async fn checkpoint_observed(&self, observe: impl FnOnce(bool)) -> Result<(), Stopped> {
 		if self.is_stopping() {
 			return Err(Stopped);
 		}
-		if !self.is_pause_requested() {
+		let requested = self.is_pause_requested();
+		observe(requested);
+		if !requested {
 			return Ok(());
 		}
 		tokio::select! {

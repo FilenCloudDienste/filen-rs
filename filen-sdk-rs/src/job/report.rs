@@ -268,8 +268,10 @@ async fn reported_checkpoint(
 	job: &(impl JobTick + ?Sized),
 	control: &JobControl,
 ) -> Result<(), Stopped> {
-	job.set_pause_requested(control.is_pause_requested());
-	let result = control.checkpoint().await;
+	// told the request the wait acts on, so a job waiting out a pause is always reported pausing
+	let result = control
+		.checkpoint_observed(|requested| job.set_pause_requested(requested))
+		.await;
 	job.set_pause_requested(control.is_pause_requested());
 	if result.is_err() {
 		job.wind_down(control);
@@ -537,6 +539,9 @@ impl<R: JobReport> From<JobFailed<R>> for Error {
 
 #[cfg(test)]
 mod tests {
+	use futures::FutureExt;
+	use tokio::sync::watch;
+
 	use super::*;
 	use crate::job::test_support::controls;
 
@@ -630,5 +635,42 @@ mod tests {
 				(RunState::Cancelling, false),
 			]
 		);
+	}
+
+	/// A job whose pause is requested the moment it is told the request the checkpoint read:
+	/// the pause lands between that read and the checkpoint's wait.
+	struct PausedOnReport {
+		pause: watch::Sender<bool>,
+		reported: Mutex<Vec<bool>>,
+	}
+
+	impl JobTick for PausedOnReport {
+		fn op_started(&self) {}
+
+		fn op_finished(&self) {}
+
+		fn set_pause_requested(&self, requested: bool) {
+			self.reported.lock().unwrap().push(requested);
+			self.pause.send_replace(true);
+		}
+
+		fn wind_down(&self, _control: &JobControl) {}
+	}
+
+	#[test]
+	fn a_pause_requested_after_the_checkpoint_read_waits_for_the_next_checkpoint() {
+		let (pause, _cancel, control) = controls();
+		let job = PausedOnReport {
+			pause,
+			reported: Mutex::default(),
+		};
+		// the checkpoint acts on the request it read, none, so it passes at once instead of
+		// waiting out a pause the job was told nothing of
+		assert_eq!(
+			reported_checkpoint(&job, &control).now_or_never(),
+			Some(Ok(()))
+		);
+		// and the pause that landed meanwhile is reported, for the next checkpoint to wait out
+		assert_eq!(*job.reported.lock().unwrap(), [false, true]);
 	}
 }
