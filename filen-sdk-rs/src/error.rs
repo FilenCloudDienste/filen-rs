@@ -195,6 +195,11 @@ pub enum ErrorKind {
 	/// allowed to decode and throw away before it. Its source, a `SolidSkipExceeded` reached with
 	/// [`Error::downcast_ref`], carries the numbers.
 	ArchiveSolidSkipExceeded,
+	/// The operation stopped before a write because the resource lock it held lost its
+	/// server-side lease: another client may hold the resource now. Nothing was written after
+	/// the loss, and running the operation again, which takes the lock afresh, repeats no write
+	/// it made before.
+	LockLost,
 }
 
 /// Custom error type for the SDK
@@ -534,6 +539,18 @@ pub(crate) struct InvalidStateError {
 	pub(crate) expected: String,
 }
 impl_from!(InvalidStateError, ErrorKind::InvalidState);
+
+/// A held [`ResourceLock`](crate::sync::lock::ResourceLock) lost its server-side lease, so the
+/// operation holding it stopped before its next write.
+#[derive(Debug, Error)]
+#[error("Lost the lock on resource '{resource}', another client may hold it now")]
+// ResourceLock's confirmation, which returns it, arrives in the next commit; until then nothing
+// does.
+#[allow(dead_code)]
+pub(crate) struct LockLostError {
+	pub(crate) resource: String,
+}
+impl_from!(LockLostError, ErrorKind::LockLost);
 
 #[derive(Debug, Error)]
 #[error("Invalid type: `{actual:?}`, expected: `{expected:?}`")]
