@@ -331,6 +331,16 @@ jobs:
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+      # The mobile binding needs `uniffi` on top, so this binary is a build of its own.
+      - name: Run sync_engine_js_tests (single-threaded)
+        if: ${{ !cancelled() }}
+        run: cargo test -p filen-sdk-rs -F uniffi,sync-engine --test sync_engine_js_tests --no-fail-fast -- --test-threads=1
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
+          TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
+          TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
+          RUST_LOG: filen_sdk_rs::sync_engine=debug,info
   test-sync-engine-stress:
     # Opt-in scale lane: dispatch the workflow with `sync_stress_n` set and only this job runs
     # (every other job skips on a non-empty input), so nothing else contends for the account's
