@@ -3,12 +3,13 @@ use std::{borrow::Cow, path::Path, time::Duration};
 
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::fs::{
-	HasName, HasUUID,
+	HasName, HasParent, HasUUID,
 	categories::{DirType, Normal},
 	dir::RemoteDirectory,
 	file::RemoteFile,
 };
 use filen_sdk_rs::sync_engine::{DeleteGuard, GuardReason, SyncEngine, SyncEvent, SyncMode};
+use filen_types::fs::ParentUuid;
 use uuid::Uuid;
 
 use crate::harness::*;
@@ -1313,6 +1314,122 @@ async fn delete_25_guard_does_not_block_mass_creations() {
 		let f = find_file(&files, &format!("c{i:03}.txt")).expect("creation missing");
 		assert_eq!(f.size, format!("content-{i}").len() as u64, "{f:?}");
 	}
+
+	sc.cleanup();
+}
+
+// ============================================================================
+// DELETE-26 — more topmost trashes than one request carries
+// ============================================================================
+
+/// 123 topmost remote trashes, more than one request carries: the 120 files of a directory that
+/// stays, and three directories with content. Each lands once, as a trash entry of its own, and
+/// the directories' content goes with them rather than as entries of its own.
+#[shared_test_runtime]
+async fn delete_26_more_topmost_trashes_than_a_chunk() {
+	const FILES: usize = 120;
+	const GONE: [&str; 3] = ["gone_a", "gone_b", "gone_c"];
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	for i in 0..FILES {
+		write_file(
+			&sc.local,
+			&format!("keep/f{i:03}.txt"),
+			format!("c{i}").as_bytes(),
+		);
+	}
+	for dir in GONE {
+		write_file(&sc.local, &format!("{dir}/x.txt"), dir.as_bytes());
+		write_file(&sc.local, &format!("{dir}/sub/y.txt"), dir.as_bytes());
+	}
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "{r1:?}");
+	assert_eq!(r1.uploaded, FILES + 2 * GONE.len(), "{r1:?}");
+	let (dirs, _) = list_root(&sc).await;
+	let keep = find_dir(&dirs, "keep").expect("keep was created").uuid();
+	let gone: Vec<Uuid> = GONE
+		.iter()
+		.map(|name| {
+			find_dir(&dirs, name)
+				.expect("a gone dir was created")
+				.uuid()
+		})
+		.collect();
+
+	for i in 0..FILES {
+		std::fs::remove_file(sc.local.join(format!("keep/f{i:03}.txt"))).unwrap();
+	}
+	for dir in GONE {
+		std::fs::remove_dir_all(sc.local.join(dir)).unwrap();
+	}
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "nothing deleted unapproved: {r2:?}");
+	let token = r2
+		.deletion_token
+		.clone()
+		.expect("a held batch must carry a token");
+
+	// Held across the trashing pass and the listing: another leg's account-global empty-trash
+	// (serialized on this lock) would remove the entries before they are counted. Taken before the
+	// pass takes the drive lock, in the order `empty_trash` takes the two.
+	let _trash_lock = sc
+		.resources
+		.client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	sc.engine.approve_deletions(sc.pair, &token).await;
+	let r3 = sc.sync().await;
+	assert!(r3.errors.is_empty(), "{r3:?}");
+	assert_eq!(r3.remotely_trashed, FILES + GONE.len(), "{r3:?}");
+	assert_eq!(r3.held_deletions(), 0, "{r3:?}");
+
+	let (dirs, files) = list_root(&sc).await;
+	assert_eq!(
+		dirs.iter().map(|dir| dir.uuid()).collect::<Vec<_>>(),
+		[keep],
+		"only the surviving dir is left"
+	);
+	assert!(files.is_empty(), "{files:?}");
+	let (sub_dirs, sub_files) = list_dir(&sc, &dirs[0]).await;
+	assert!(
+		sub_dirs.is_empty() && sub_files.is_empty(),
+		"{sub_dirs:?} {sub_files:?}"
+	);
+
+	let (trashed_dirs, trashed_files) = sc
+		.resources
+		.client
+		.list_trash(None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	let trashed_from = |parent: Uuid| {
+		trashed_dirs
+			.iter()
+			.map(HasParent::parent)
+			.chain(trashed_files.iter().map(HasParent::parent))
+			.filter(|trashed| matches!(trashed, ParentUuid::Trash(from) if *from == parent))
+			.count()
+	};
+	assert_eq!(trashed_from(keep), FILES);
+	assert_eq!(trashed_from(sc.remote), GONE.len());
+	for dir in gone {
+		assert_eq!(
+			trashed_from(dir),
+			0,
+			"the content of a trashed dir became an entry of its own"
+		);
+	}
+
+	let r4 = sc.sync().await;
+	assert!(r4.errors.is_empty(), "{r4:?}");
+	assert_eq!(r4.remotely_trashed, 0, "{r4:?}");
+	assert_eq!(r4.locally_deleted, 0, "{r4:?}");
+	assert_eq!(r4.uploaded, 0, "{r4:?}");
+	assert_eq!(r4.downloaded, 0, "{r4:?}");
+	assert_eq!(r4.remote_dirs_created, 0, "{r4:?}");
+	assert_eq!(r4.local_dirs_created, 0, "{r4:?}");
+	assert_eq!(r4.held_deletions(), 0, "{r4:?}");
 
 	sc.cleanup();
 }

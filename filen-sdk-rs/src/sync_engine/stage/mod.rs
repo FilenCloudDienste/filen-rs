@@ -62,7 +62,8 @@
 //!
 //! What a deletion asks before it runs ([`Pager::shields_local`], [`Pager::shields_remote`],
 //! [`Pager::carried`]) panics instead, as the baseline's rows do (see `rows::snapshot`): only the
-//! runs the apply takes one action at a time ask it, so nothing is in flight to drop.
+//! runs the apply takes outside the transfers ask it, before the action, or the chunk it is in,
+//! is sent, so nothing is in flight to drop.
 
 mod confirmed;
 mod local;

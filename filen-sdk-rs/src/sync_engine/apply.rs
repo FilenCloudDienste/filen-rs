@@ -21,7 +21,10 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use filen_types::fs::StableUuid;
+use filen_types::{
+	api::v3::{bulk::FileOrDir, dir, file},
+	fs::StableUuid,
+};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use uuid::Uuid;
 
@@ -46,6 +49,7 @@ use super::{
 	stage::{Carried, Pager, Run, Screen, Staged, StagedPlan},
 };
 use crate::{
+	api::v3::bulk::trash,
 	auth::Client,
 	cache::{SearchResult, hydrate_cached_items_at},
 	connect::ParentTargets,
@@ -437,8 +441,8 @@ impl PlannedEntry {
 }
 
 impl PassStart {
-	/// What the apply reads for `action` — in `apply_one`, `apply_transfer` and `Wanted::of` — read
-	/// out of `inputs`, and nothing else.
+	/// What the apply reads for `action` — in `apply_one`, `apply_transfer`, `compose_creates`,
+	/// `compose_trashes` and `Wanted::of` — read out of `inputs`, and nothing else.
 	pub(super) fn of(action: &SyncAction, inputs: &mut impl StartInputs) -> Self {
 		let path = action.rel_path();
 		match action {
@@ -644,12 +648,13 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
 /// default 16) and the global request rate limiter. Directory creates/moves (which make the
 /// directories later actions land in, parent before child) and deletes (descendant-first for
-/// cascade safety) stay in order; consecutive remote directory creates go to the server together,
-/// a chunk at a time (see [`apply_creates`]).
+/// cascade safety) stay in order; consecutive remote directory creates, and consecutive remote
+/// trashes, go to the server together, a chunk at a time (see [`apply_creates`] and
+/// [`apply_trashes`]).
 ///
 /// Each action emits its [`SyncEvent`] to `observer` (and an [`ActionFailed`](SyncEvent::ActionFailed)
-/// if it errors): serial actions when they start, a chunk's creates as it is sent, concurrent
-/// transfers as each completes.
+/// if it errors): serial actions when they start, a chunk's creates or trashes as it is sent,
+/// concurrent transfers as each completes.
 ///
 /// Pausing the pair reaches into this loop through [`ApplyContext::gate`]: a SUSPENDED pass parks
 /// before its next action — and before taking the drive lock — while a transfer already running
@@ -694,29 +699,41 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			if matches!(action, SyncAction::CreateRemoteDir { .. }) {
-				// The rest of the run goes in the same request, as far as the hold has room for.
-				let room = chunk_room(&lease, &ctx.lock_budget);
-				let more = match plan
-					.take_run(&ctx, Run::Before, room, is_remote_dir_create)
-					.await
+			if is_trash(action) {
+				let chunk =
+					match take_chunk(&ctx, &mut plan, &mut lease, Run::Before, entry, is_trash)
+						.await
+					{
+						Ok(chunk) => chunk,
+						Err(error) => {
+							note_unread_plan(report, &error);
+							continue;
+						}
+					};
+				applied +=
+					apply_trashes(&ctx, chunk, &mut plan, &failed, &full, report, observer).await;
+				continue;
+			}
+			if is_remote_dir_create(action) {
+				let chunk = match take_chunk(
+					&ctx,
+					&mut plan,
+					&mut lease,
+					Run::Before,
+					entry,
+					is_remote_dir_create,
+				)
+				.await
 				{
-					Ok(more) => more,
+					Ok(chunk) => chunk,
 					Err(error) => {
 						note_unread_plan(report, &error);
 						continue;
 					}
 				};
-				// No release inside a chunk, so a tie is never split.
-				for staged in &more {
-					lease.note_start(&staged.entry.action);
-				}
 				let hold = lease
 					.held()
 					.expect("a remote write's lease holds the lock (should be impossible)");
-				let chunk = std::iter::once(entry)
-					.chain(more.into_iter().map(|staged| staged.entry))
-					.collect();
 				let chunk_ctx = ChunkContext {
 					ctx: &ctx,
 					hold,
@@ -893,7 +910,8 @@ pub(super) async fn apply(
 		}
 	}
 
-	// The other deletions, one at a time, children before parents.
+	// The other deletions, children before parents: a local one at a time, a run of remote trashes a
+	// chunk at a time.
 	while admits_more(report)
 		&& let Some(Staged {
 			entry, releasable, ..
@@ -910,6 +928,27 @@ pub(super) async fn apply(
 					return note_lock_failure(report, total - applied, &error, observer);
 				}
 				None => return note_interrupted(report, total - applied, observer),
+			}
+			if is_trash(action) {
+				let chunk = match take_chunk(
+					&ctx,
+					&mut plan,
+					&mut lease,
+					Run::After,
+					entry,
+					is_trash,
+				)
+				.await
+				{
+					Ok(chunk) => chunk,
+					Err(error) => {
+						note_unread_plan(report, &error);
+						continue;
+					}
+				};
+				applied +=
+					apply_trashes(&ctx, chunk, &mut plan, &failed, &full, report, observer).await;
+				continue;
 			}
 			apply_serial(
 				&ctx,
@@ -1414,7 +1453,7 @@ impl PagedPlan {
 	/// The remote file `uuid` an action of the page in hand acts on, if the cache held it when the
 	/// page was read (else see [`file_or_fetch`]).
 	///
-	/// A copy, here and in [`dir`](Self::dir): a trash or a move updates the object it is handed, and
+	/// A copy, here and in [`dir`](Self::dir): a move updates the object it is handed, and
 	/// a transfer runs on past the page; the page's own stays as hydrated for any other action of it
 	/// that names the same object.
 	fn file(&self, uuid: Uuid) -> Option<RemoteFile> {
@@ -1544,20 +1583,15 @@ struct Wanted {
 }
 
 impl Wanted {
-	/// What the actions of `page` act on: the file of a download, a file trash or a file move, and
-	/// the directory of a directory trash or move — the one the view listed at its path, which its
-	/// entry carries.
+	/// What the actions of `page` act on: the file of a download or a file move, and the directory
+	/// of a directory move — the one the view listed at its path, which its entry carries. A trash
+	/// sends only a uuid, and wants nothing.
 	fn of<'p>(page: impl Iterator<Item = &'p PlannedEntry>) -> Self {
 		let mut wanted = Self::default();
 		for PlannedEntry { action, start } in page {
 			match (action, start) {
 				(
 					SyncAction::DownloadFile { remote_uuid, .. }
-					| SyncAction::TrashRemote {
-						kind: NodeKind::File,
-						remote_uuid,
-						..
-					}
 					| SyncAction::MoveRemote {
 						kind: NodeKind::File,
 						remote_uuid,
@@ -1568,13 +1602,6 @@ impl Wanted {
 					wanted.files.insert(*remote_uuid);
 				}
 				(
-					SyncAction::TrashRemote {
-						kind: NodeKind::Dir,
-						..
-					},
-					PassStart::Remote { remote },
-				)
-				| (
 					SyncAction::MoveRemote {
 						kind: NodeKind::Dir,
 						..
@@ -1746,6 +1773,34 @@ fn is_remote_dir_create(action: &SyncAction) -> bool {
 	matches!(action, SyncAction::CreateRemoteDir { .. })
 }
 
+/// Whether `action` is one [`apply_trashes`] carries out.
+fn is_trash(action: &SyncAction) -> bool {
+	matches!(action, SyncAction::TrashRemote { .. })
+}
+
+/// `first`, which the lease has already been prepared and counted for, and the rest of its run in
+/// `run` that `same` holds for, as one chunk: at most [`SYNC_BULK_CHUNK`] actions, and no more than
+/// the hold has room for. Each is counted against the hold here, with no release inside a chunk, so
+/// a tie is never split.
+async fn take_chunk(
+	ctx: &ApplyContext<'_>,
+	plan: &mut PagedPlan,
+	lease: &mut Lease,
+	run: Run,
+	first: PlannedEntry,
+	same: impl Fn(&SyncAction) -> bool,
+) -> Result<Vec<PlannedEntry>, crate::Error> {
+	let more = plan
+		.take_run(ctx, run, chunk_room(lease, &ctx.lock_budget), same)
+		.await?;
+	for staged in &more {
+		lease.note_start(&staged.entry.action);
+	}
+	Ok(std::iter::once(first)
+		.chain(more.into_iter().map(|staged| staged.entry))
+		.collect())
+}
+
 /// How many more actions a chunk takes after its first, which `lease` has been counted for: what
 /// fits in one bulk request and in the hold.
 fn chunk_room(lease: &Lease, budget: &LockBudget) -> usize {
@@ -1814,9 +1869,9 @@ async fn apply_creates(
 	settled + land_creates(chunk_ctx, &composed, answers, plan, report, observer).await
 }
 
-/// The answers to `count` creates whose request failed as a whole with `error`: a lock that could
-/// not be taken, under which nothing was sent.
-fn all_failed(error: crate::Error, count: usize) -> Vec<Result<CreatedDir, crate::Error>> {
+/// The answers to `count` items whose request failed as a whole with `error`: a lock that could not
+/// be taken, under which nothing was sent.
+fn all_failed<T>(error: crate::Error, count: usize) -> Vec<Result<T, crate::Error>> {
 	let error = Arc::new(error);
 	(0..count)
 		.map(|_| Err(crate::Error::unshared(Arc::clone(&error))))
@@ -2194,6 +2249,165 @@ async fn record_create(
 	report.remote_dirs_created += 1;
 	note_written(plan, create.action, report);
 	Ok(())
+}
+
+/// A remote trash of a chunk, ready to send (see [`compose_trashes`]).
+struct ComposedTrash<'c> {
+	action: &'c SyncAction,
+	/// The item its baseline row and journal row name.
+	remote_uuid: Uuid,
+	/// The deletions it carries out along with its own, read before it is sent.
+	carried: Option<Carried>,
+	/// What the request sends for it.
+	item: trash::Item,
+}
+
+/// Move a chunk of the plan's remote items to the trash, in plan order, with one request
+/// ([`Client::trash_items`]): compose each trash ([`compose_trashes`]), send the ones that composed,
+/// and record each answer ([`land_trashes`]). The screen keeps only the topmost trashes, so no item
+/// of a chunk is under another.
+///
+/// Returns how many of the chunk it carried out or failed, as [`apply_creates`] does.
+async fn apply_trashes(
+	ctx: &ApplyContext<'_>,
+	chunk: Vec<PlannedEntry>,
+	plan: &mut PagedPlan,
+	failed: &FailedDirMoves,
+	full: &FullSides,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> usize {
+	let (composed, settled) = compose_trashes(&chunk, plan, failed, full, report, observer);
+	if composed.is_empty() || !admits_more(report) {
+		return settled;
+	}
+	// Each item is a uuid, so the copy the request is sent from is cheap.
+	let items: Vec<trash::Item> = composed.iter().map(|trash| trash.item.clone()).collect();
+	tracing::debug!(
+		"apply: trashing {} remote items in one request",
+		items.len()
+	);
+	let answers = match ctx.client.trash_items(&items).await {
+		Ok(answers) => answers,
+		Err(error) => all_failed(error, items.len()),
+	};
+	settled + land_trashes(ctx, composed, answers, plan, full, report, observer).await
+}
+
+/// Compose each trash of `chunk`, in plan order: the item it names, and the deletions it carries.
+/// A trash that would take down something this pass wrote is refused, and fails alone.
+///
+/// Returns the trashes that composed, and how many of the chunk it skipped or failed.
+fn compose_trashes<'c>(
+	chunk: &'c [PlannedEntry],
+	plan: &PagedPlan,
+	failed: &FailedDirMoves,
+	full: &FullSides,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> (Vec<ComposedTrash<'c>>, usize) {
+	let mut composed = Vec::with_capacity(chunk.len());
+	let mut settled = 0;
+	for planned in chunk {
+		let action = &planned.action;
+		if failed.skips(action, report, observer) {
+			settled += 1;
+			continue;
+		}
+		observer(action.to_event());
+		tracing::debug!("apply: {}", action.describe());
+		match compose_trash(planned, plan) {
+			Ok(trash) => composed.push(trash),
+			Err(error) => {
+				settled += 1;
+				note_action_failed(action, &error, full, report, observer);
+			}
+		}
+	}
+	(composed, settled)
+}
+
+/// Compose the trash `planned` (see [`compose_trashes`]). A directory's item names the directory
+/// the view listed at its path.
+fn compose_trash<'c>(
+	planned: &'c PlannedEntry,
+	plan: &PagedPlan,
+) -> Result<ComposedTrash<'c>, crate::Error> {
+	let action @ SyncAction::TrashRemote {
+		rel_path,
+		kind,
+		remote_uuid,
+	} = &planned.action
+	else {
+		return Err(unpaired());
+	};
+	if plan.pager.shields_remote(rel_path, *remote_uuid) {
+		return Err(internal_owned(format!(
+			"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
+		)));
+	}
+	// Read before the act, which nothing then stands between and its record.
+	let carried = plan.pager.carried(action);
+	let item = match (kind, &planned.start) {
+		(NodeKind::File, _) => FileOrDir::File(file::trash::Request { uuid: *remote_uuid }),
+		(NodeKind::Dir, PassStart::Remote { remote }) => {
+			let uuid = dir_uuid(remote.as_deref())
+				.ok_or_else(|| internal("trash target dir missing from the snapshot"))?;
+			FileOrDir::Dir(dir::trash::Request { uuid })
+		}
+		(NodeKind::Dir, _) => return Err(unpaired()),
+	};
+	Ok(ComposedTrash {
+		action,
+		remote_uuid: *remote_uuid,
+		carried,
+		item,
+	})
+}
+
+/// Record each answer to the trashes `trashes`, in order: a trash the server answered `Ok` drops
+/// its row and the rows it carried ([`commit_trash`]); a failure is recorded as one. A missing or
+/// already trashed item is answered `Ok`, which is what the trash wanted.
+///
+/// Returns how many it recorded. It stops at the first record that could not be written, since
+/// every later one would wait out the same wedged store; the trashes behind it landed, and the next
+/// pass drops their rows or trashes them again, which changes nothing.
+async fn land_trashes(
+	ctx: &ApplyContext<'_>,
+	trashes: Vec<ComposedTrash<'_>>,
+	answers: Vec<Result<(), crate::Error>>,
+	plan: &PagedPlan,
+	full: &FullSides,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> usize {
+	let mut settled = 0;
+	for (trash, answer) in trashes.into_iter().zip(answers) {
+		settled += 1;
+		let ComposedTrash {
+			action,
+			remote_uuid,
+			carried,
+			..
+		} = trash;
+		if let Err(error) = answer {
+			note_action_failed(action, &error, full, report, observer);
+			continue;
+		}
+		// The row is about to go, so a snapshot that has not applied the trash yet reads this item
+		// as an untracked remote one with nothing local — a deletion to make all over again. Record
+		// the trash so the next pass suppresses that.
+		if let Err(error) = commit_trash(ctx, remote_uuid, action.rel_path(), carried).await {
+			note_action_failed(action, &error, full, report, observer);
+			break;
+		}
+		report.remotely_trashed += 1;
+		note_written(plan, action, report);
+		if !admits_more(report) {
+			break;
+		}
+	}
+	settled
 }
 
 /// Record that `action` landed, for the deletions after it (see [`Pager::note_written`]).
@@ -2773,51 +2987,6 @@ async fn apply_one(
 			}
 		}
 		(
-			SyncAction::TrashRemote {
-				rel_path,
-				kind,
-				remote_uuid,
-			},
-			start,
-		) => {
-			if plan.pager.shields_remote(rel_path, *remote_uuid) {
-				return Err(internal_owned(format!(
-					"refusing to trash {rel_path:?}: this pass already wrote that item, or under that name"
-				)));
-			}
-			// Read before the act, which nothing then stands between and its record.
-			let carried = plan.pager.carried(action);
-			match (kind, start) {
-				(NodeKind::File, _) => {
-					let mut remote_file = file_or_fetch(
-						ctx,
-						plan.file(*remote_uuid),
-						*remote_uuid,
-						"trash target file missing from the snapshot",
-					)
-					.await?;
-					ctx.client.trash_file(&mut remote_file).await?;
-				}
-				(NodeKind::Dir, PassStart::Remote { remote }) => {
-					let uuid = dir_uuid(remote.as_deref());
-					let mut remote_dir = dir_or_fetch(
-						ctx,
-						uuid.and_then(|uuid| plan.dir(uuid)),
-						uuid,
-						"trash target dir missing from the snapshot",
-					)
-					.await?;
-					ctx.client.trash_dir(&mut remote_dir).await?;
-				}
-				(NodeKind::Dir, _) => return Err(unpaired()),
-			}
-			// The row is about to go, so a snapshot that has not applied the trash yet reads this
-			// item as an untracked remote file with nothing local — a deletion to make all over
-			// again. Record the trash so the next pass suppresses that.
-			commit_trash(ctx, *remote_uuid, rel_path, carried).await?;
-			report.remotely_trashed += 1;
-		}
-		(
 			SyncAction::MoveRemote {
 				from_path,
 				to_path,
@@ -3067,6 +3236,7 @@ async fn apply_one(
 		(
 			SyncAction::CreateLocalDir { .. }
 			| SyncAction::CreateRemoteDir { .. }
+			| SyncAction::TrashRemote { .. }
 			| SyncAction::MoveRemote { .. }
 			| SyncAction::MoveLocal {
 				kind: NodeKind::File,
@@ -4517,12 +4687,11 @@ mod tests {
 		);
 	}
 
-	/// A plan of `action` alone, a directory deletion, staged with the deletions it carries.
-	fn carrying(action: SyncAction, carried: &[String]) -> (tempfile::TempDir, PagedPlan) {
+	/// A plan of `entry` alone, a directory deletion, staged with the deletions it carries.
+	fn carrying(entry: &PlannedEntry, carried: &[String]) -> (tempfile::TempDir, PagedPlan) {
 		let (dir, stage) = Stage::in_temp_dir();
 		let mut writer = PlanWriter::new(stage).unwrap();
-		let entry = PlannedEntry::bare(action);
-		writer.push(&entry).unwrap();
+		writer.push(entry).unwrap();
 		writer.carry(&entry.action, carried).unwrap();
 		let plan = PagedPlan::new(writer.finish().unwrap(), Uuid::from_u128(u128::MAX));
 		(dir, plan)
@@ -4534,13 +4703,22 @@ mod tests {
 		let (pair, _) = store
 			.create_pair("/local", Uuid::from_u128(1), super::super::SyncMode::TwoWay)
 			.unwrap();
+		upsert_files(&store, pair, paths);
+		(store, pair)
+	}
+
+	/// Write a file row at each of `paths` into `pair`.
+	fn upsert_files<'p>(
+		store: &BaselineStore,
+		pair: PairId,
+		paths: impl IntoIterator<Item = &'p str>,
+	) {
 		let rows: Vec<BaselineEntry> = paths
 			.into_iter()
 			.map(|path| baseline_file(path, None))
 			.collect();
 		let upserts: Vec<BaselineChange<'_>> = rows.iter().map(BaselineChange::Upsert).collect();
 		store.apply_changes(pair, &upserts).unwrap();
-		(store, pair)
 	}
 
 	fn rows_of(store: &BaselineStore, pair: PairId) -> Vec<String> {
@@ -4568,7 +4746,7 @@ mod tests {
 
 		let deleted = delete_local("docs", NodeKind::Dir);
 		let (store, pair) = store_with(paths);
-		let (_dir, plan) = carrying(deleted.clone(), &carried);
+		let (_dir, plan) = carrying(&PlannedEntry::bare(deleted.clone()), &carried);
 		let rows = plan.pager.carried(&deleted).unwrap();
 		store
 			.apply_changes_carrying(pair, &[BaselineChange::Delete("docs")], |drop| {
@@ -4579,7 +4757,7 @@ mod tests {
 
 		let trashed = trash("docs", NodeKind::Dir);
 		let (store, pair) = store_with(paths);
-		let (_dir, plan) = carrying(trashed.clone(), &carried);
+		let (_dir, plan) = carrying(&PlannedEntry::bare(trashed.clone()), &carried);
 		let rows = plan.pager.carried(&trashed).unwrap();
 		let journal = PendingRow {
 			pair,
@@ -4612,7 +4790,7 @@ mod tests {
 				.chain(carried.iter().map(String::as_str)),
 		);
 		let deleted = delete_local("docs", NodeKind::Dir);
-		let (_dir, plan) = carrying(deleted.clone(), &carried);
+		let (_dir, plan) = carrying(&PlannedEntry::bare(deleted.clone()), &carried);
 		let rows = plan.pager.carried(&deleted).unwrap();
 		let ((), peak) = alloc_meter::peak_bytes(|| {
 			store
@@ -5342,11 +5520,12 @@ mod tests {
 				},
 			),
 		];
+		// A trash sends only its uuid: neither the file nor the directory one wants its object.
 		assert_eq!(
 			Wanted::of(page.iter()),
 			Wanted {
-				files: HashSet::from([uuid(1), uuid(2), uuid(3)]),
-				dirs: HashSet::from([uuid(4), uuid(5)]),
+				files: HashSet::from([uuid(1), uuid(3)]),
+				dirs: HashSet::from([uuid(5)]),
 			}
 		);
 	}
@@ -5782,7 +5961,7 @@ mod tests {
 	}
 
 	/// `entries` staged as they stand, over the sync root [`ROOT`].
-	fn staged_creates(entries: &[PlannedEntry]) -> (tempfile::TempDir, PagedPlan) {
+	fn staged_entries(entries: &[PlannedEntry]) -> (tempfile::TempDir, PagedPlan) {
 		let (dir, stage) = Stage::in_temp_dir();
 		let mut writer = PlanWriter::new(stage).unwrap();
 		for entry in entries {
@@ -5906,7 +6085,7 @@ mod tests {
 			create_at("a/b/c", None),
 			create_at("d", None),
 		];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let landed = run_chunk(&borrowed, &hold, &[], &chunk, &mut plan, None);
 		assert_eq!(
@@ -5924,7 +6103,7 @@ mod tests {
 	#[test]
 	fn a_create_under_a_directory_an_earlier_chunk_created_names_its_answered_uuid() {
 		let answered = Uuid::from_u128(1);
-		let (_dir, mut plan) = staged_creates(&[create_at("a", None), create_at("a/b", None)]);
+		let (_dir, mut plan) = staged_entries(&[create_at("a", None), create_at("a/b", None)]);
 		plan.record_created("a", answered).unwrap();
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let chunk = [create_at("a/b", None)];
@@ -5936,7 +6115,7 @@ mod tests {
 	fn a_create_under_a_listed_directory_names_the_listed_uuid() {
 		let listed = Uuid::from_u128(1);
 		let chunk = [create_at("a/b", Some(listed))];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let landed = run_chunk(&borrowed, &hold, &[listed], &chunk, &mut plan, None);
 		assert_eq!(landed.composed, [NewDirParent::Existing(listed)]);
@@ -5949,7 +6128,7 @@ mod tests {
 			create_at("x/y", None),
 			create_at("x/y/z", None),
 		];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let landed = run_chunk(&borrowed, &hold, &[], &chunk, &mut plan, None);
 		assert_eq!(landed.composed, [NewDirParent::Existing(ROOT)]);
@@ -5974,7 +6153,7 @@ mod tests {
 			create_at("p/c", Some(listed)),
 			create_at("d", None),
 		];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
 		let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
@@ -6006,7 +6185,7 @@ mod tests {
 			create_at("d", None),
 			create_at("d/e", None),
 		];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
 		let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
@@ -6017,32 +6196,45 @@ mod tests {
 		assert_eq!(landed.settled, 1);
 	}
 
+	/// The paths of the chunks the apply's loop takes out of `run`: the first of each on its own, and
+	/// after one that `same` holds for, the rest of its run, at most `max` more.
+	fn chunks(
+		hold: &UndrivenHold,
+		ctx: &ApplyContext<'_>,
+		plan: &mut PagedPlan,
+		run: Run,
+		max: usize,
+		same: fn(&SyncAction) -> bool,
+	) -> Vec<Vec<String>> {
+		hold.runtime.block_on(async {
+			let mut chunks = Vec::new();
+			while let Some(first) = plan.next_in(ctx, run).await.unwrap() {
+				let more = if same(&first.entry.action) {
+					plan.take_run(ctx, run, max, same).await.unwrap()
+				} else {
+					Vec::new()
+				};
+				chunks.push(
+					std::iter::once(first)
+						.chain(more)
+						.map(|staged| staged.entry.action.rel_path().to_string())
+						.collect(),
+				);
+			}
+			chunks
+		})
+	}
+
 	#[test]
 	fn a_run_stops_at_another_kind_and_at_its_limit() {
 		let borrowed = Borrowed::new();
 		let ctx = borrowed.ctx(ROOT, None);
 		let hold = UndrivenHold::new();
-		// The first of a run is taken on its own, as the apply's loop takes it.
-		let runs = |plan: &mut PagedPlan, max: usize| -> Vec<Vec<String>> {
-			hold.runtime.block_on(async {
-				let mut runs = Vec::new();
-				while let Some(first) = plan.next_in(&ctx, Run::Before).await.unwrap() {
-					let more = plan
-						.take_run(&ctx, Run::Before, max, is_remote_dir_create)
-						.await
-						.unwrap();
-					runs.push(
-						std::iter::once(first)
-							.chain(more)
-							.map(|staged| staged.entry.action.rel_path().to_string())
-							.collect(),
-					);
-				}
-				runs
-			})
+		let runs = |plan: &mut PagedPlan, max: usize| {
+			chunks(&hold, &ctx, plan, Run::Before, max, is_remote_dir_create)
 		};
 
-		let (_dir, mut plan) = staged_creates(&[
+		let (_dir, mut plan) = staged_entries(&[
 			create_at("a", None),
 			create_at("b", None),
 			PlannedEntry::bare(SyncAction::CreateLocalDir {
@@ -6052,13 +6244,13 @@ mod tests {
 		]);
 		assert_eq!(
 			runs(&mut plan, SYNC_BULK_CHUNK - 1),
-			[vec!["a", "b"], vec!["c", "d"]]
+			[vec!["a", "b"], vec!["c"], vec!["d"]]
 		);
 
 		let many: Vec<PlannedEntry> = (0..120)
 			.map(|n| create_at(&format!("d{n:03}"), None))
 			.collect();
-		let (_dir, mut plan) = staged_creates(&many);
+		let (_dir, mut plan) = staged_entries(&many);
 		let lengths: Vec<usize> = runs(&mut plan, SYNC_BULK_CHUNK - 1)
 			.iter()
 			.map(Vec::len)
@@ -6075,7 +6267,7 @@ mod tests {
 			since: Instant::now(),
 			writes: 1,
 		};
-		let (_dir, mut plan) = staged_creates(&many);
+		let (_dir, mut plan) = staged_entries(&many);
 		let room = chunk_room(&lease, &budget);
 		let lengths: Vec<usize> = runs(&mut plan, room).iter().map(Vec::len).collect();
 		assert_eq!(lengths, [10; 12]);
@@ -6095,7 +6287,7 @@ mod tests {
 			parent_uuid: None,
 		};
 		let chunk = [create];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		let landed = run_chunk(
 			&borrowed,
@@ -6137,7 +6329,7 @@ mod tests {
 	#[test]
 	fn a_failed_create_records_nothing() {
 		let chunk = [create_at("a", None), create_at("a/b", None)];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		let landed = run_chunk(
 			&borrowed,
@@ -6171,7 +6363,7 @@ mod tests {
 			create_at("a/b", None),
 			create_at("c", None),
 		];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		let landed = run_chunk(
 			&borrowed,
@@ -6205,7 +6397,7 @@ mod tests {
 	fn a_fresh_directory_inherits_its_parents_targets() {
 		let (fresh, nested) = (Uuid::from_u128(1), Uuid::from_u128(2));
 		let chunk = [create_at("a", None), create_at("a/b", None)];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		let landed = run_chunk(
 			&borrowed,
@@ -6238,7 +6430,7 @@ mod tests {
 	fn a_merged_directory_inherits_nothing_and_forgets_what_the_hold_kept() {
 		let merged = Uuid::from_u128(3);
 		let chunk = [create_at("c", None)];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		let landed = run_chunk(
 			&borrowed,
@@ -6267,7 +6459,7 @@ mod tests {
 	fn a_directory_its_parents_targets_did_not_all_take_inherits_none_of_them() {
 		let (listed, fresh) = (Uuid::from_u128(1), Uuid::from_u128(2));
 		let chunk = [create_at("p/a", Some(listed))];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
 		// A 512-bit key is too small for the share's OAEP padding, so sharing the new directory with
 		// this user fails before any request is made.
@@ -6295,7 +6487,7 @@ mod tests {
 	fn a_record_that_cannot_be_written_stops_the_chunk_but_not_its_propagation() {
 		let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
 		let chunk = [create_at("a", None), create_at("b", None)];
-		let (_dir, mut plan) = staged_creates(&chunk);
+		let (_dir, mut plan) = staged_entries(&chunk);
 		// No pair in the store, so no row of it can be written.
 		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
 		let landed = run_chunk(
@@ -6317,6 +6509,355 @@ mod tests {
 				.client
 				.kept_held_targets(&hold.lock, second)
 				.is_some()
+		);
+	}
+
+	/// A remote trash at `rel_path` of the item `remote_uuid`, where the view listed the directory
+	/// `listed`, if any.
+	fn trash_at(
+		rel_path: &str,
+		kind: NodeKind,
+		remote_uuid: Uuid,
+		listed: Option<Uuid>,
+	) -> PlannedEntry {
+		let action = SyncAction::TrashRemote {
+			rel_path: rel_path.to_string(),
+			kind,
+			remote_uuid,
+		};
+		let Some(listed) = listed else {
+			return PlannedEntry::bare(action);
+		};
+		PlannedEntry {
+			action,
+			start: PassStart::Remote {
+				remote: Some(Box::new(RemoteNode {
+					kind: NodeKind::Dir,
+					remote_uuid: listed,
+					..remote_node(rel_path, None)
+				})),
+			},
+		}
+	}
+
+	/// What composing a chunk of trashes, and landing it, left behind.
+	struct Trashed {
+		/// Each item sent, as its kind and uuid.
+		sent: Vec<(&'static str, Uuid)>,
+		report: SyncReport,
+		events: Vec<SyncEvent>,
+		settled: usize,
+	}
+
+	/// Compose `chunk` over `plan` and, given `answers`, land it.
+	async fn run_trashes(
+		borrowed: &Borrowed,
+		chunk: &[PlannedEntry],
+		plan: &PagedPlan,
+		answers: Option<Vec<Result<(), crate::Error>>>,
+	) -> Trashed {
+		let ctx = borrowed.ctx(ROOT, None);
+		let full = FullSides::default();
+		let mut report = SyncReport::default();
+		let mut events = Vec::new();
+		let mut observer = |event| events.push(event);
+		let (composed, mut settled) = compose_trashes(
+			chunk,
+			plan,
+			&FailedDirMoves::default(),
+			&full,
+			&mut report,
+			&mut observer,
+		);
+		let sent = composed
+			.iter()
+			.map(|trash| match &trash.item {
+				FileOrDir::File(request) => ("file", request.uuid),
+				FileOrDir::Dir(request) => ("dir", request.uuid),
+			})
+			.collect();
+		if let Some(answers) = answers {
+			settled += land_trashes(
+				&ctx,
+				composed,
+				answers,
+				plan,
+				&full,
+				&mut report,
+				&mut observer,
+			)
+			.await;
+		}
+		Trashed {
+			sent,
+			report,
+			events,
+			settled,
+		}
+	}
+
+	/// The paths the report failed, with their errors.
+	fn failed_paths(report: &SyncReport) -> Vec<(&str, &str)> {
+		report
+			.failed_paths
+			.iter()
+			.map(|(path, error)| (path.as_str(), error.as_str()))
+			.collect()
+	}
+
+	#[tokio::test]
+	async fn a_run_of_trashes_sends_each_item_by_uuid_in_plan_order() {
+		let (file, dir, listed) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+		let chunk = [
+			trash_at("f", NodeKind::File, file, None),
+			trash_at("d", NodeKind::Dir, dir, Some(listed)),
+		];
+		let (_dir, plan) = staged_entries(&chunk);
+		let trashed = run_trashes(&Borrowed::new(), &chunk, &plan, None).await;
+		assert_eq!(trashed.sent, [("file", file), ("dir", listed)]);
+		assert_eq!(trashed.settled, 0);
+		assert_eq!(failures(&trashed.events), 0);
+	}
+
+	#[tokio::test]
+	async fn a_shielded_trash_fails_alone_and_the_rest_still_goes() {
+		let (created, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let create = SyncAction::CreateRemoteDir {
+			rel_path: "docs".to_string(),
+		};
+		let trashes = || {
+			[
+				trash_at("Docs", NodeKind::Dir, created, Some(created)),
+				trash_at("x.txt", NodeKind::File, other, None),
+			]
+		};
+		let chunk = trashes();
+		let (_dir, mut plan) = staged_entries(
+			&std::iter::once(PlannedEntry::bare(create.clone()))
+				.chain(trashes())
+				.collect::<Vec<_>>(),
+		);
+		plan.record_created("docs", created).unwrap();
+		plan.pager.note_written(&create).unwrap();
+		let trashed = run_trashes(&Borrowed::new(), &chunk, &plan, None).await;
+		assert_eq!(trashed.sent, [("file", other)]);
+		assert_eq!(trashed.settled, 1);
+		let refusal = internal(
+			"refusing to trash \"Docs\": this pass already wrote that item, or under that name",
+		)
+		.to_string();
+		assert_eq!(failed_paths(&trashed.report), [("Docs", refusal.as_str())]);
+		assert_eq!(failures(&trashed.events), 1);
+	}
+
+	#[tokio::test]
+	async fn a_directory_trash_without_its_listed_directory_fails_alone() {
+		let chunk = [
+			trash_at("d", NodeKind::Dir, Uuid::from_u128(1), None),
+			trash_at("f", NodeKind::File, Uuid::from_u128(2), None),
+		];
+		let (_dir, plan) = staged_entries(&chunk);
+		let trashed = run_trashes(&Borrowed::new(), &chunk, &plan, None).await;
+		assert_eq!(trashed.sent, [("file", Uuid::from_u128(2))]);
+		assert_eq!(trashed.settled, 1);
+		let error = internal("trash target dir missing from the snapshot").to_string();
+		assert_eq!(failed_paths(&trashed.report), [("d", error.as_str())]);
+	}
+
+	#[test]
+	fn a_run_of_trashes_stops_at_another_kind_and_at_its_limit() {
+		let borrowed = Borrowed::new();
+		let ctx = borrowed.ctx(ROOT, None);
+		let hold = UndrivenHold::new();
+		let runs =
+			|plan: &mut PagedPlan, max: usize| chunks(&hold, &ctx, plan, Run::After, max, is_trash);
+
+		// Deletions run children first, so the plan holds these in this order.
+		let (_dir, mut plan) = staged_entries(&[
+			PlannedEntry::bare(trash("c", NodeKind::File)),
+			PlannedEntry::bare(delete_local("b", NodeKind::File)),
+			PlannedEntry::bare(trash("a", NodeKind::File)),
+		]);
+		assert_eq!(
+			runs(&mut plan, SYNC_BULK_CHUNK - 1),
+			[vec!["c"], vec!["b"], vec!["a"]]
+		);
+
+		let many: Vec<PlannedEntry> = (0..120)
+			.map(|n| PlannedEntry::bare(trash(&format!("f{n:03}"), NodeKind::File)))
+			.collect();
+		let (_dir, mut plan) = staged_entries(&many);
+		let lengths: Vec<usize> = runs(&mut plan, SYNC_BULK_CHUNK - 1)
+			.iter()
+			.map(Vec::len)
+			.collect();
+		assert_eq!(lengths, [50, 50, 20]);
+
+		// A hold with room for ten writes, the first of the run already counted against it.
+		let budget = LockBudget {
+			batch: 10,
+			..LockBudget::default()
+		};
+		let lease = Lease::Held {
+			lock: Arc::clone(&hold.lock),
+			since: Instant::now(),
+			writes: 1,
+		};
+		let (_dir, mut plan) = staged_entries(&many);
+		let room = chunk_room(&lease, &budget);
+		let lengths: Vec<usize> = runs(&mut plan, room).iter().map(Vec::len).collect();
+		assert_eq!(lengths, [10; 12]);
+	}
+
+	/// The pair's baseline rows, and its journal, as (uuid, kind).
+	fn rows_and_journal(borrowed: &Borrowed) -> (Vec<String>, Vec<(Uuid, PendingKind)>) {
+		let store = locked(&borrowed.store);
+		let journal = store
+			.load_pending(0, 0)
+			.unwrap()
+			.into_iter()
+			.map(|row| (row.uuid, row.kind))
+			.collect();
+		(rows_of(&store, 1), journal)
+	}
+
+	/// A borrowed context whose store holds the pair, with a row at each of `paths`.
+	fn borrowed_with_rows(paths: &[&str]) -> Borrowed {
+		let borrowed = borrowed_with_pair();
+		upsert_files(&locked(&borrowed.store), 1, paths.iter().copied());
+		borrowed
+	}
+
+	#[tokio::test]
+	async fn a_landed_trash_drops_its_row_and_the_rows_it_carried() {
+		let docs = Uuid::from_u128(1);
+		let borrowed = borrowed_with_rows(&["docs", "docs/a.txt", "docs/sub/b.txt", "other.txt"]);
+		let entry = trash_at("docs", NodeKind::Dir, docs, Some(docs));
+		let (_dir, plan) = carrying(
+			&entry,
+			&["docs/a.txt".to_string(), "docs/sub/b.txt".to_string()],
+		);
+		let trashed = run_trashes(&borrowed, &[entry], &plan, Some(vec![Ok(())])).await;
+		assert_eq!(trashed.settled, 1);
+		assert_eq!(trashed.report.remotely_trashed, 1);
+		assert_eq!(failures(&trashed.events), 0);
+		let (rows, journal) = rows_and_journal(&borrowed);
+		assert_eq!(rows, ["other.txt"]);
+		assert_eq!(
+			journal,
+			[(
+				docs,
+				PendingKind::Trashed {
+					path: "docs".to_string()
+				}
+			)]
+		);
+	}
+
+	#[tokio::test]
+	async fn a_record_that_cannot_be_written_stops_the_chunk_of_trashes() {
+		let chunk = [
+			trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None),
+			trash_at("b.txt", NodeKind::File, Uuid::from_u128(2), None),
+		];
+		let (_dir, plan) = staged_entries(&chunk);
+		// No pair in the store, so no row of it can be written.
+		let trashed =
+			run_trashes(&Borrowed::new(), &chunk, &plan, Some(vec![Ok(()), Ok(())])).await;
+		assert_eq!(trashed.settled, 1);
+		assert_eq!(
+			trashed.report.store_failed,
+			Some(StoreFailure::RecordNotWritten)
+		);
+		assert_eq!(trashed.report.remotely_trashed, 0);
+		assert_eq!(failures(&trashed.events), 1);
+		let failed: Vec<&str> = failed_paths(&trashed.report)
+			.into_iter()
+			.map(|(path, _)| path)
+			.collect();
+		assert_eq!(failed, ["a.txt"]);
+	}
+
+	#[tokio::test]
+	async fn a_failed_trash_keeps_its_row() {
+		let borrowed = borrowed_with_rows(&["a.txt"]);
+		let chunk = [trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None)];
+		let (_dir, plan) = staged_entries(&chunk);
+		let trashed = run_trashes(
+			&borrowed,
+			&chunk,
+			&plan,
+			Some(vec![Err(internal("refused"))]),
+		)
+		.await;
+		assert_eq!(trashed.settled, 1);
+		assert_eq!(trashed.report.remotely_trashed, 0);
+		let error = internal("refused").to_string();
+		assert_eq!(failed_paths(&trashed.report), [("a.txt", error.as_str())]);
+		assert_eq!(failures(&trashed.events), 1);
+		assert_eq!(
+			rows_and_journal(&borrowed),
+			(vec!["a.txt".to_string()], vec![])
+		);
+	}
+
+	/// A trash the server answers `file_is_versioned` keeps its row and is owed to the next pass, as
+	/// a single move answered so is, and is not reported as a failure.
+	#[tokio::test]
+	async fn a_trash_of_a_file_replaced_since_the_pass_read_it_is_left_to_the_next_pass() {
+		let borrowed = borrowed_with_rows(&["a.txt"]);
+		let chunk = [trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None)];
+		let (_dir, plan) = staged_entries(&chunk);
+		let versioned = || -> crate::Error {
+			filen_types::error::ResponseError::ApiError {
+				message: None,
+				code: Some("file_is_versioned".to_string()),
+			}
+			.into()
+		};
+		let trashed = run_trashes(&borrowed, &chunk, &plan, Some(vec![Err(versioned())])).await;
+		assert_eq!(trashed.settled, 1);
+		assert_eq!(trashed.report.remotely_trashed, 0);
+		assert!(
+			trashed.report.errors.is_empty(),
+			"{:?}",
+			trashed.report.errors
+		);
+		let error = versioned().to_string();
+		assert_eq!(failed_paths(&trashed.report), [("a.txt", error.as_str())]);
+		assert_eq!(failures(&trashed.events), 0);
+		assert_eq!(
+			rows_and_journal(&borrowed),
+			(vec!["a.txt".to_string()], vec![])
+		);
+	}
+
+	#[tokio::test]
+	async fn a_whole_trash_request_failure_fails_each_item_once() {
+		let borrowed = borrowed_with_rows(&["a.txt", "b.txt"]);
+		let chunk = [
+			trash_at("a.txt", NodeKind::File, Uuid::from_u128(1), None),
+			trash_at("b.txt", NodeKind::File, Uuid::from_u128(2), None),
+		];
+		let (_dir, plan) = staged_entries(&chunk);
+		let trashed = run_trashes(
+			&borrowed,
+			&chunk,
+			&plan,
+			Some(all_failed(internal("lock refused"), chunk.len())),
+		)
+		.await;
+		assert_eq!(trashed.settled, 2);
+		assert_eq!(trashed.report.remotely_trashed, 0);
+		let error = internal("lock refused").to_string();
+		assert_eq!(
+			failed_paths(&trashed.report),
+			[("a.txt", error.as_str()), ("b.txt", error.as_str())]
+		);
+		assert_eq!(failures(&trashed.events), 2);
+		assert_eq!(
+			rows_and_journal(&borrowed),
+			(vec!["a.txt".to_string(), "b.txt".to_string()], vec![])
 		);
 	}
 }

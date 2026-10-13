@@ -20,11 +20,13 @@
 //!
 //! # The order
 //!
-//! The apply runs the plan in three [`Run`]s. First, one at a time and in plan order, everything
-//! but the transfers and the deletions — the moves and creates the transfers land in — and the
-//! deletion half of each type flip (a deletion whose path a create of the same pass fills again),
-//! which has to clear the path before that create runs. Then the transfers, concurrently. Then the
-//! other deletions, one at a time and in plan order, which is children first.
+//! The apply runs the plan in three [`Run`]s. First, in plan order, everything but the transfers
+//! and the deletions — the moves and creates the transfers land in — and the deletion half of each
+//! type flip (a deletion whose path a create of the same pass fills again), which has to clear the
+//! path before that create runs: one at a time, but a run of remote directory creates or of remote
+//! trashes a chunk at a time. Then the transfers, concurrently. Then the other deletions, in plan
+//! order, which is children first: a local one at a time, a run of remote trashes a chunk at a
+//! time.
 //!
 //! The transfers are independent of one another, so their order is free, and it is the one that
 //! lets the pass hold the drive lock least: first those that finish a compound step of the first
@@ -215,11 +217,13 @@ const READ_PAGE: &str = "SELECT x.ord, x.tie_until, p.seq, p.op, p.kind, p.path,
 /// Which part of the apply an action runs in (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in super::super) enum Run {
-	/// One at a time, before any transfer.
+	/// Before any transfer, in plan order: one at a time, but a run of remote directory creates or
+	/// of remote trashes a chunk at a time.
 	Before,
 	/// The file transfers, concurrently.
 	Transfers,
-	/// One at a time, after every transfer: the deletions that are not half of a type flip.
+	/// After every transfer, in plan order: the deletions that are not half of a type flip, a local
+	/// one at a time, a run of remote trashes a chunk at a time.
 	After,
 }
 
@@ -922,8 +926,8 @@ impl Pager {
 	/// existing directory names that directory — or moved, or a remote write at that path or under
 	/// it, under any spelling.
 	///
-	/// A read that fails panics: only a deletion asks, in a run the apply takes one action at a time,
-	/// so nothing is in flight to drop (see the module docs of [`stage`](super)).
+	/// A read that fails panics: only a trash asks, as the apply composes its chunk, before anything
+	/// is sent, so nothing is in flight to drop (see the module docs of [`stage`](super)).
 	pub(in super::super) fn shields_remote(&self, rel_path: &str, remote_uuid: Uuid) -> bool {
 		self.shields(WROTE_REMOTE, rel_path, Some(remote_uuid))
 	}
@@ -931,8 +935,9 @@ impl Pager {
 	/// The deletions `action` carries out along with its own, when it is a directory deletion that
 	/// carries any (see the module docs).
 	///
-	/// A read that fails panics: only a deletion asks, in a run the apply takes one action at a time,
-	/// so nothing is in flight to drop (see the module docs of [`stage`](super)).
+	/// A read that fails panics: only a deletion asks, before it runs — a local one alone, a trash
+	/// as the apply composes its chunk — so nothing is in flight to drop (see the module docs of
+	/// [`stage`](super)).
 	pub(in super::super) fn carried(&self, action: &SyncAction) -> Option<Carried> {
 		if !self.plan.carries || !action.is_delete() {
 			return None;
