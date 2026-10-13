@@ -247,7 +247,8 @@ The sync engine's live tests run only nightly (or on a `[test]` commit/PR), in `
 `!cancelled()` step per binary — `cache_tests`, `cache_search_tests`,
 `sync_engine_blackbox_tests` and `sync_suite`, all `-p filen-sdk-rs -F sync-engine,malformed`,
 then the mobile binding's `sync_engine_js_tests` with `-F uniffi,sync-engine`, the engine
-binaries with `--test-threads=1`.
+binaries with `--test-threads=1`, and last the desktop addon's `test:napi:live` after a
+`build:napi`.
 
 The auto-formatter some editors/agents run on save does **not** match this repo's nightly
 `cargo fmt` output and will fail the pre-commit gate. Run `cargo fmt -p <crate>` before

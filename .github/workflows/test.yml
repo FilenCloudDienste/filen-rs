@@ -341,6 +341,27 @@ jobs:
           TEST_SHARE_EMAIL: ${{ secrets['V2_SHARE_ACC_EMAIL'] }}
           TEST_SHARE_PASSWORD: ${{ secrets['V2_SHARE_ACC_PASS'] }}
           RUST_LOG: filen_sdk_rs::sync_engine=debug,info
+      # The desktop addon, driven live under node. Its test borrows its remote directory from
+      # test-utils' remote-test-dir, which it builds with cargo run.
+      - name: Install Node.js
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Build the napi addon
+        id: build-napi
+        if: ${{ !cancelled() }}
+        run: |
+          npm ci
+          npm run build:napi
+        working-directory: ./filen-sdk-rs/web
+      - name: Run the napi addon's live test
+        if: ${{ !cancelled() && steps.build-napi.outcome == 'success' }}
+        run: npm run test:napi:live
+        working-directory: ./filen-sdk-rs/web
+        env:
+          TEST_EMAIL: ${{ secrets['V2_TEST_ACC_EMAIL'] }}
+          TEST_PASSWORD: ${{ secrets['V2_TEST_ACC_PASS'] }}
   test-sync-engine-stress:
     # Opt-in scale lane: dispatch the workflow with `sync_stress_n` set and only this job runs
     # (every other job skips on a non-empty input), so nothing else contends for the account's
