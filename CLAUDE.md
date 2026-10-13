@@ -97,6 +97,10 @@ cargo clippy
 # Build with HEIF decoder support (needs meson + ninja, and nasm on x86 —
 # see Toolchain > Native build prerequisites)
 cargo build --features heif-decoder
+
+# Desktop Node-API addon (`napi` feature, package-scoped): build it into
+# filen-sdk-rs/web/node/ (build:napi:release for an optimized one)
+npm --prefix filen-sdk-rs/web run build:napi
 ```
 
 Integration tests require environment variables (can be in `.env`):
@@ -349,11 +353,29 @@ The `Client` dispatches to the correct version at runtime via `AuthInfo` enum.
 - **Native** (default) — uses Tokio multi-threaded runtime, `tokio-tungstenite`, file system access
 - **WASM** (`target_family = "wasm"`) — uses `wasm-bindgen`, `web-sys` WebSocket, `wasm-bindgen-rayon`
 - **UniFFI** (`feature = "uniffi"`) — generates FFI scaffolding for mobile; used by `filen-mobile-native-cache`
+- **napi** (`feature = "napi"`) — a Node-API addon for the desktop app (Electron main process),
+  typed like the ubrn bindings
 
 The `filen-sdk-rs/web/` directory contains the npm project for the browser WASM tests
 (`web/main.test.ts`). Build the bindings with `bash wasm-pack.sh` run from `filen-sdk-rs/`
 (the script uses relative paths and needs `WASI_SDK_PATH`), then run
 `npm --prefix filen-sdk-rs/web test`.
+
+The napi addon ships in the same `@filen/sdk-rs` package behind a custom export condition,
+`filen-desktop` (`./node/index.js` and its `index.d.ts`), listed first in `exports["."]`. Nothing
+sets it by default, so Node, Vitest, Vite SSR, jest, React Native and browser bundles resolve
+exactly as before; the desktop app keeps `import ... from "@filen/sdk-rs"` and opts in by
+configuration: `node --conditions=filen-desktop` (or in `NODE_OPTIONS`), the bundler's conditions
+(`resolve.conditions` in Vite, `conditionNames` in webpack, `conditions` in esbuild), and TS
+`customConditions: ["filen-desktop"]` with `moduleResolution` `bundler`, `node16` or `nodenext`.
+`build:napi` writes the loader, the typings (prefixed with `napi/compat.d.ts`, what napi
+cannot generate) and the host's `sdk-rs.<platform>.node` to `node/`, which is local build
+output (git-ignored, not in `files` yet). Binaries are to ship as napi's per-platform packages
+(`@filen/sdk-rs-<platform>`, in `optionalDependencies`), which the loader falls back to when
+`node/` holds no binary for the host; the release job that publishes them adds `node/` to
+`files`. The generated loader is ESM (`--esm`, the package
+is `"type": "module"`), so a CommonJS Electron main loads it with `import()`, through a bundler,
+or with `require()` on Node 22.12+ (`require(esm)`).
 
 ### Mobile Consumers
 

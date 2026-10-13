@@ -11,7 +11,9 @@
 		"ubrn:android:arm": "ubrn build android --and-generate -t arm64-v8a",
 		"ubrn:android:x86": "ubrn build android --and-generate -t x86_64",
 		"ubrn:checkout": "ubrn checkout",
-		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate"
+		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate",
+		"build:napi": "napi build --platform --manifest-path ../Cargo.toml --features napi,cache,sync-engine --output-dir node --esm",
+		"build:napi:release": "npm run build:napi -- --release"
 	},
 	"homepage": "https://github.com/FilenCloudDienste/filen-rs",
 	"author": "Filen",
@@ -40,6 +42,10 @@
 	"react-native": "./src/index.tsx",
 	"exports": {
 		".": {
+			"filen-desktop": {
+				"types": "./node/index.d.ts",
+				"default": "./node/index.js"
+			},
 			"react-native": {
 				"android": {
 					"import": "./src/index.tsx",
@@ -89,6 +95,7 @@
 		"node": ">=23"
 	},
 	"devDependencies": {
+		"@napi-rs/cli": "~3.10.8",
 		"@types/node": "^24.19.1",
 		"@types/serviceworker": "^0.0.203",
 		"@vitest/browser": "^5.0.3",
@@ -99,6 +106,20 @@
 		"typescript": "~7.0.2",
 		"vite": "^8.3.3",
 		"vitest": "^5.0.3"
+	},
+	"napi": {
+		"binaryName": "sdk-rs",
+		"targets": [
+			"aarch64-apple-darwin",
+			"x86_64-apple-darwin",
+			"x86_64-pc-windows-msvc",
+			"aarch64-pc-windows-msvc",
+			"x86_64-unknown-linux-gnu",
+			"aarch64-unknown-linux-gnu"
+		],
+		"dtsHeaderFile": "napi/compat.d.ts",
+		"constEnum": false,
+		"runtimeStringEnum": true
 	},
 	"codegenConfig": {
 		"name": "FilenSdkRsTurboModule",
