@@ -982,7 +982,12 @@ impl Client {
 	///
 	/// The `v3/dir/link/remove` endpoint identifies the link to remove by the linked directory's
 	/// uuid (matching `dir/link/{edit,status}`), not by the link's own uuid.
+	///
+	/// Holds the drive lock for the request, as [`public_link_dir`](Self::public_link_dir) does
+	/// for the additions, so another device holding the lock never sees the set of links that
+	/// contain a directory change under it.
 	pub async fn remove_dir_link(&self, dir: &RemoteDirectory) -> Result<(), Error> {
+		let _lock = self.lock_drive().await?;
 		api::v3::dir::link::remove::post(
 			self.client(),
 			&api::v3::dir::link::remove::Request { uuid: dir.uuid() },
