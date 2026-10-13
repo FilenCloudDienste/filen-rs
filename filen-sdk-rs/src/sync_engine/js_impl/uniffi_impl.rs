@@ -1,23 +1,19 @@
 //! The sync engine's UniFFI exports.
 
 use std::{
-	mem,
 	panic::{AssertUnwindSafe, catch_unwind},
-	path::PathBuf,
 	sync::Arc,
 };
 
 use super::{
-	JsSyncEngine, SyncEngineCore,
-	delivery::{Delivery, Listener},
-	spawned,
+	JsSyncEngine,
+	delivery::{Delivery, Listener, ListenerCall, listener_calls},
 	types::{SyncPassEvent, SyncRefusal, sync_refusal},
 };
 use crate::{
 	Error,
 	auth::JsClient,
 	error::FilenSdkError,
-	runtime::do_on_commander,
 	sync_engine::{DEFAULT_IGNORE_PATTERNS, WatchStatus},
 };
 
@@ -37,23 +33,13 @@ pub trait SyncEngineListener: Send + Sync {
 /// is guarded on its own, so one that throws does not lose the rest of the chunk.
 fn listener_closure(listener: Arc<dyn SyncEngineListener>) -> Listener {
 	Arc::new(move |deliveries: Vec<Delivery>| {
-		let mut events = Vec::new();
-		for delivery in deliveries {
-			match delivery {
-				Delivery::Event(event) => events.push(event),
-				Delivery::Status { pair_id, status } => {
-					if !events.is_empty() {
-						let run = mem::take(&mut events);
-						guarded("on_events", || listener.on_events(run));
-					}
-					guarded("on_watch_status", || {
-						listener.on_watch_status(pair_id, status)
-					});
-				}
+		for call in listener_calls(deliveries) {
+			match call {
+				ListenerCall::Events(events) => guarded("on_events", || listener.on_events(events)),
+				ListenerCall::Status { pair_id, status } => guarded("on_watch_status", || {
+					listener.on_watch_status(pair_id, status)
+				}),
 			}
-		}
-		if !events.is_empty() {
-			guarded("on_events", || listener.on_events(events));
 		}
 	})
 }
@@ -83,18 +69,7 @@ impl JsClient {
 		db_path: String,
 		listener: Arc<dyn SyncEngineListener>,
 	) -> Result<JsSyncEngine, Error> {
-		let client = self.inner();
-		// A task of its own, as every engine call is: a JS abort must not drop the claim on the
-		// baseline while the engine's open still runs on a blocking thread.
-		let core = do_on_commander(move || {
-			spawned(SyncEngineCore::open(
-				client,
-				PathBuf::from(db_path),
-				listener_closure(listener),
-			))
-		})
-		.await?;
-		Ok(JsSyncEngine { core })
+		JsSyncEngine::open(self.inner(), db_path, listener_closure(listener)).await
 	}
 }
 

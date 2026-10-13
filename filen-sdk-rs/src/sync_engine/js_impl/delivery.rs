@@ -12,6 +12,7 @@
 
 use std::{
 	collections::HashSet,
+	mem,
 	panic::{AssertUnwindSafe, catch_unwind},
 	sync::{Arc, Mutex, PoisonError},
 };
@@ -44,6 +45,37 @@ pub(super) type Listener = Arc<dyn Fn(Vec<Delivery>) + Send + Sync>;
 /// The listener an engine delivers to: replaced when another JS context attaches, read once per
 /// drain. `Arc`: the engine's core and its delivery thread both hold it.
 pub(super) type ListenerSlot = Arc<Mutex<Listener>>;
+
+/// One call a binding's listener makes for a chunk: the two kinds keep their order.
+#[derive(Debug, PartialEq)]
+pub(super) enum ListenerCall {
+	/// A run of consecutive pass events.
+	Events(Vec<SyncPassEvent>),
+	/// A watch's status changed (and once when it starts).
+	Status { pair_id: u64, status: WatchStatus },
+}
+
+/// The calls `deliveries` make, in order: each run of consecutive events is one
+/// [`ListenerCall::Events`], each status one [`ListenerCall::Status`].
+pub(super) fn listener_calls(deliveries: Vec<Delivery>) -> Vec<ListenerCall> {
+	let mut calls = Vec::new();
+	let mut events = Vec::new();
+	for delivery in deliveries {
+		match delivery {
+			Delivery::Event(event) => events.push(event),
+			Delivery::Status { pair_id, status } => {
+				if !events.is_empty() {
+					calls.push(ListenerCall::Events(mem::take(&mut events)));
+				}
+				calls.push(ListenerCall::Status { pair_id, status });
+			}
+		}
+	}
+	if !events.is_empty() {
+		calls.push(ListenerCall::Events(events));
+	}
+	calls
+}
 
 /// Start the delivery thread around `listener`. It ends once every returned sender (and every clone
 /// of it) is gone, after delivering what they sent.
@@ -220,6 +252,64 @@ mod tests {
 		];
 
 		assert_eq!(coalesce(deliveries.clone()), deliveries);
+	}
+
+	fn planned(pass_id: u64) -> Delivery {
+		event(pass_id, SyncEventMessage::Planned { actions: 0 })
+	}
+
+	fn pass_event(delivery: Delivery) -> SyncPassEvent {
+		match delivery {
+			Delivery::Event(event) => event,
+			Delivery::Status { .. } => panic!("not an event"),
+		}
+	}
+
+	fn status_call(pair_id: u64) -> ListenerCall {
+		match status(pair_id) {
+			Delivery::Status { pair_id, status } => ListenerCall::Status { pair_id, status },
+			Delivery::Event(_) => panic!("not a status"),
+		}
+	}
+
+	#[test]
+	fn each_run_of_events_is_one_call_and_each_status_its_own() {
+		let calls = listener_calls(vec![
+			planned(1),
+			planned(2),
+			status(1),
+			status(2),
+			planned(3),
+		]);
+
+		assert_eq!(
+			calls,
+			vec![
+				ListenerCall::Events(vec![pass_event(planned(1)), pass_event(planned(2))]),
+				status_call(1),
+				status_call(2),
+				ListenerCall::Events(vec![pass_event(planned(3))]),
+			]
+		);
+	}
+
+	#[test]
+	fn a_chunk_of_events_only_is_one_call() {
+		let calls = listener_calls(vec![planned(1), planned(2), planned(3)]);
+
+		assert_eq!(
+			calls,
+			vec![ListenerCall::Events(vec![
+				pass_event(planned(1)),
+				pass_event(planned(2)),
+				pass_event(planned(3)),
+			])]
+		);
+	}
+
+	#[test]
+	fn an_empty_chunk_makes_no_call() {
+		assert_eq!(listener_calls(Vec::new()), Vec::new());
 	}
 
 	#[test]

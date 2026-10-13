@@ -990,6 +990,24 @@ pub struct JsSyncEngine {
 	core: Arc<SyncEngineCore>,
 }
 
+impl JsSyncEngine {
+	/// The engine on the baseline DB at `db_path`, opened or attached to (see
+	/// [`SyncEngineCore::open`]), delivering to `listener`. Every binding's open calls this.
+	async fn open(client: Arc<Client>, db_path: String, listener: Listener) -> Result<Self, Error> {
+		// A task of its own, as every engine call is: a JS abort must not drop the claim on the
+		// baseline while the engine's open still runs on a blocking thread.
+		let core = do_on_commander(move || {
+			spawned(SyncEngineCore::open(
+				client,
+				PathBuf::from(db_path),
+				listener,
+			))
+		})
+		.await?;
+		Ok(Self { core })
+	}
+}
+
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsSyncEngine {
 	/// Stop every watch and let the engine go. A pass parked on a pause is cut loose; a transfer
