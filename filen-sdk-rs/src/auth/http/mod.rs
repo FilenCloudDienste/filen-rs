@@ -1817,7 +1817,9 @@ mod client_timeout_tests {
 			let (mut lock, _) = listener.accept().await.unwrap();
 			read_head(&mut lock).await;
 			respond_with(&mut lock, answer).await;
-			stalled
+			// kept open until the client has read the answer: closing a socket with the request
+			// body still unread resets the connection, which fails the request on Windows
+			(stalled, lock)
 		});
 
 		let client = Arc::new(AuthClient::from_unauthed(
