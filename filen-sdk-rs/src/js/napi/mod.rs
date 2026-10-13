@@ -59,6 +59,60 @@ impl IntoWire for auth::js_impls::UnauthJsClient {
 	}
 }
 
+#[cfg(feature = "sync-engine")]
+#[napi(js_name = "JsSyncEngine")]
+pub(crate) struct JsSyncEngine(pub(crate) crate::sync_engine::JsSyncEngine);
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl Wire for crate::sync_engine::JsSyncEngine {
+	type Wire = JsSyncEngine;
+}
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl IntoWire for crate::sync_engine::JsSyncEngine {
+	fn into_wire(self) -> JsSyncEngine {
+		JsSyncEngine(self)
+	}
+}
+
+#[cfg(feature = "sync-engine")]
+#[napi(js_name = "JsSyncPlan")]
+pub(crate) struct JsSyncPlan(pub(crate) crate::sync_engine::JsSyncPlan);
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl Wire for crate::sync_engine::JsSyncPlan {
+	type Wire = JsSyncPlan;
+}
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl IntoWire for crate::sync_engine::JsSyncPlan {
+	fn into_wire(self) -> JsSyncPlan {
+		JsSyncPlan(self)
+	}
+}
+
+#[cfg(feature = "sync-engine")]
+#[napi(js_name = "JsSyncWatch")]
+pub(crate) struct JsSyncWatch(pub(crate) crate::sync_engine::JsSyncWatch);
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl Wire for crate::sync_engine::JsSyncWatch {
+	type Wire = JsSyncWatch;
+}
+
+#[cfg(feature = "sync-engine")]
+#[deny(unsafe_code)]
+impl IntoWire for crate::sync_engine::JsSyncWatch {
+	fn into_wire(self) -> JsSyncWatch {
+		JsSyncWatch(self)
+	}
+}
+
 /// Installs the SDK's tracing subscriber (stdout on desktop) unless the host already installed
 /// one. Idempotent.
 #[napi(js_name = "init", ts_args_type = "", ts_return_type = "void")]

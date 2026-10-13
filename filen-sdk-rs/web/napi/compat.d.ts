@@ -10,7 +10,28 @@
  * required key, an asyncOpts_ whose signal is not an AbortSignal) throws napi's own error
  * synchronously, also from a method that returns a
  * Promise, where ubrn's async methods reject. So does a cache listener without an onMessages
- * method. Every SDK error of an async call rejects, as under ubrn.
+ * method, and a sync engine listener without onEvents and onWatchStatus methods. Every SDK
+ * error of an async call rejects, as under ubrn.
+ *
+ * Listener methods are called as methods of the listener (`this` is bound to it), on the JS
+ * thread, in the order their deliveries happened. They are read once, when the listener is
+ * handed over (configureCache, openSyncEngine), so replacing them on the object later has no
+ * effect. A sync engine listener method that throws is logged, and the rest of its chunk is
+ * still delivered. After an attach replaces an engine's listener, the old one may still get the
+ * rest of the delivery round in progress: the chunks already handed to the JS thread (up to two
+ * queued and the one being delivered) and those of that round not yet handed over. The next round
+ * goes to the new listener.
+ *
+ * Listener calls and promise settlement are not ordered against each other: syncOnce, stopWatch
+ * or close may resolve before the listener gets that call's last events or status. A UI reads
+ * where a pair stands from listPairs, lastReport and a watch's status, not from arrival order.
+ *
+ * A sync engine belongs to the Node environment that opened it, one environment per engine: an
+ * open of its baseline from another environment of the process is refused with BaselineInUse,
+ * where one from the same environment and account attaches. An engine closes with its
+ * environment: when that goes away (process exit, a worker ending, a reload), its teardown closes
+ * every engine it opened that is still open, waiting up to 5 s for them; one still closing after
+ * that keeps its baseline until it has. Closing an engine explicitly is still how to wait for it.
  *
  * This header declares what napi cannot generate from Rust. */
 /* eslint-disable */
@@ -23,6 +44,9 @@ export interface UniffiThrownObject<T> extends Error {
 export type JsClientInterface = JsClient
 export type UnauthJsClientInterface = UnauthJsClient
 export type FilenSdkErrorInterface = FilenSdkError
+export type JsSyncEngineInterface = JsSyncEngine
+export type JsSyncPlanInterface = JsSyncPlan
+export type JsSyncWatchInterface = JsSyncWatch
 
 /**
  * Receives every status-message batch the cache worker emits (see [`CacheStatusMessage`]).
@@ -30,4 +54,15 @@ export type FilenSdkErrorInterface = FilenSdkError
  */
 export interface CacheStatusListener {
 	onMessages(messages: Array<CacheStatusMessage>): void
+}
+
+/**
+ * Receives every pair's pass events and watch statuses, in the order they happened. Must return
+ * quickly: deliveries wait while it runs.
+ */
+export interface SyncEngineListener {
+	/** A run of consecutive pass events, at most 512. */
+	onEvents(events: Array<SyncPassEvent>): void
+	/** A watch's status changed (and once when the watch starts). */
+	onWatchStatus(pairId: bigint, status: WatchStatus): void
 }

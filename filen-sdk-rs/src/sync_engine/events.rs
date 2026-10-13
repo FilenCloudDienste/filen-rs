@@ -141,7 +141,7 @@ pub enum SyncEvent {
 
 /// Which way a file transfer moves its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default)]
+#[js_type(export, no_deser, no_default, napi)]
 pub enum TransferDirection {
 	/// A local file going to the remote.
 	Upload,

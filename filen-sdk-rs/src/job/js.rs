@@ -1,7 +1,7 @@
 //! The records of a job's progress and report in the bindings that every job (copies,
 //! archives) shares: its errors, and its times.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -91,9 +91,4 @@ mod uniffi_copy_aliases {
 
 	pub struct CopyRenamedEntry(RenamedEntry);
 	uniffi::custom_newtype!(CopyRenamedEntry, RenamedEntry);
-}
-
-/// A duration in a job's progress, in the milliseconds the bindings report it in.
-pub(crate) fn millis(duration: Duration) -> u64 {
-	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }

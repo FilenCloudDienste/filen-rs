@@ -111,7 +111,7 @@ impl fmt::Display for Origin<'_> {
 
 /// The level the rule that ignores a path comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default, tagged)]
+#[js_type(export, no_deser, no_default, tagged, napi)]
 pub enum IgnoreLevel {
 	/// [`DEFAULT_IGNORE_PATTERNS`].
 	Default,
@@ -134,7 +134,7 @@ impl fmt::Display for IgnoreLevel {
 /// The top of a subtree the ignore rules hide: nothing at or under it is synced in either direction,
 /// and neither copy is touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[js_type(export, no_deser, no_default)]
+#[js_type(export, no_deser, no_default, napi)]
 pub struct IgnoredPath {
 	pub rel_path: String,
 	pub level: IgnoreLevel,

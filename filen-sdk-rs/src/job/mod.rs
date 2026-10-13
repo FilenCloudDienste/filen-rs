@@ -11,9 +11,9 @@ pub(crate) mod progress;
 pub(crate) mod report;
 
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub use js::{ItemError, SdkError};
+pub(crate) use js::sdk_error;
 #[cfg(any(feature = "uniffi", feature = "wasm-full"))]
-pub(crate) use js::{millis, sdk_error};
+pub use js::{ItemError, SdkError};
 
 use std::{
 	future::Future,
@@ -30,6 +30,16 @@ use crate::{
 	runtime::{SpawnTaskHandle, spawn_task_maybe_send},
 	util::MaybeSend,
 };
+
+/// A duration in a job's progress, in the milliseconds the bindings report it in.
+#[cfg(any(
+	feature = "uniffi",
+	feature = "wasm-full",
+	all(feature = "napi", feature = "sync-engine")
+))]
+pub(crate) fn millis(duration: std::time::Duration) -> u64 {
+	u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Returned when a job was cancelled or stopped while waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

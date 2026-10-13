@@ -1,9 +1,9 @@
-//! The sync engine for the JS bindings: the mobile one through UniFFI today, a desktop one through
-//! napi-rs later, both handing TypeScript the same surface.
+//! The sync engine for the JS bindings: the mobile one through UniFFI and the desktop one through
+//! napi-rs, both handing TypeScript the same surface.
 //!
-//! Everything outside `uniffi_impl` is plain Rust that names no binding type, so another binding
-//! can put its own attributes on the same items. The engine's own types that need no conversion
-//! carry `#[js_type]` where they are defined; [`types`] holds the mirrors of the rest.
+//! Everything outside `uniffi_impl` and `napi_impl` is plain Rust that names no binding type, so
+//! each binding can put its own attributes on the same items. The engine's own types that need no
+//! conversion carry `#[js_type]` where they are defined; [`types`] holds the mirrors of the rest.
 //!
 //! Pair ids cross as `u64` (a `bigint` in TS on both bindings, where an `i64` would be a `number`
 //! on napi): an engine id, a positive sqlite rowid, always fits.
@@ -27,6 +27,8 @@
 //! engine: an Android app must open the engine in exactly one process.
 
 mod delivery;
+#[cfg(feature = "napi")]
+mod napi_impl;
 mod types;
 #[cfg(feature = "uniffi")]
 mod uniffi_impl;
@@ -68,6 +70,9 @@ use crate::{
 		SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState, WatchStatus,
 	},
 };
+
+#[cfg(feature = "napi")]
+pub(crate) use self::types::sync_refusal;
 
 /// How many events [`JsSyncEngine::recent_events`] keeps, engine-wide.
 const RECENT_EVENTS: usize = 500;
@@ -346,18 +351,23 @@ pub(super) struct SyncEngineCore {
 	/// The account the engine was opened for (its root folder), which a second open must match to
 	/// attach.
 	account: Uuid,
+	/// The JS environment that opened it (see [`JsSyncEngine::open`]), which a second open must
+	/// come from to attach.
+	host: u64,
 	/// Where [`Drop`] hands the shutdown: the last handle may go on the JS thread.
 	runtime: tokio::runtime::Handle,
 }
 
 impl SyncEngineCore {
 	/// The core for the baseline DB at `db_path`: the running one, if this process has it open for
-	/// the same account (its listener replaced by `listener`), or a newly opened one. Refused with
-	/// [`BaselineInUse`] when this process has it open for another account, or is still shutting
-	/// an engine on it down. Must run on a runtime, which outlives the core.
+	/// the same account from the same `host` (its listener replaced by `listener`), or a newly
+	/// opened one. Refused with [`BaselineInUse`] when this process has it open for another account
+	/// or from another host, or is still shutting an engine on it down. Must run on a runtime,
+	/// which outlives the core.
 	async fn open(
 		client: Arc<Client>,
 		db_path: PathBuf,
+		host: u64,
 		listener: Listener,
 	) -> Result<Arc<Self>, Error> {
 		let key = claim_key(&db_path)?;
@@ -376,7 +386,7 @@ impl SyncEngineCore {
 		// claim of a core dropped where its shutdown cannot be spawned takes that lock.
 		let claim = match claimed {
 			Ok(claim) => claim,
-			Err(Some(core)) if core.account == account && core.is_open() => {
+			Err(Some(core)) if core.account == account && core.host == host && core.is_open() => {
 				*lock(&core.listener) = listener;
 				return Ok(core);
 			}
@@ -404,6 +414,7 @@ impl SyncEngineCore {
 			watches: AtomicU64::new(1),
 			pausing: tokio::sync::Mutex::new(()),
 			account,
+			host,
 			runtime: tokio::runtime::Handle::current(),
 		});
 		lock(&OPEN_ENGINES).insert(key, Arc::downgrade(&core));
@@ -985,6 +996,9 @@ where
 
 /// A sync engine open on one baseline DB. Every method fails with "the sync engine is closed"
 /// after [`close`](Self::close), on every handle of the same engine.
+// `Clone` for napi, whose async methods move a clone of the receiver into the promise: it shares
+// the core, so a clone lives only while its call is in flight.
+#[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct JsSyncEngine {
 	core: Arc<SyncEngineCore>,
@@ -993,13 +1007,23 @@ pub struct JsSyncEngine {
 impl JsSyncEngine {
 	/// The engine on the baseline DB at `db_path`, opened or attached to (see
 	/// [`SyncEngineCore::open`]), delivering to `listener`. Every binding's open calls this.
-	async fn open(client: Arc<Client>, db_path: String, listener: Listener) -> Result<Self, Error> {
+	///
+	/// `host` names the JS environment opening it: an engine attaches only an open from the one
+	/// that opened it, as napi closes an engine with its Node environment. UniFFI opens from one
+	/// host, so a JS reload attaches.
+	async fn open(
+		client: Arc<Client>,
+		db_path: String,
+		host: u64,
+		listener: Listener,
+	) -> Result<Self, Error> {
 		// A task of its own, as every engine call is: a JS abort must not drop the claim on the
 		// baseline while the engine's open still runs on a blocking thread.
 		let core = do_on_commander(move || {
 			spawned(SyncEngineCore::open(
 				client,
 				PathBuf::from(db_path),
+				host,
 				listener,
 			))
 		})
@@ -1008,17 +1032,23 @@ impl JsSyncEngine {
 	}
 }
 
+#[filen_macros::js_exports]
+// On napi these are reached only through the wrappers napi-derive registers, which it does only
+// outside `cfg(test)`, and the tests do not call every one.
+#[cfg_attr(all(test, feature = "napi"), allow(dead_code))]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsSyncEngine {
 	/// Stop every watch and let the engine go. A pass parked on a pause is cut loose; a transfer
 	/// in flight (at most one per active pair) is waited for. Idempotent: a call made while another
 	/// is still closing returns once that one is done.
+	#[napi_export]
 	pub async fn close(&self) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), SyncEngineCore::close).await
 	}
 
 	/// Every pair, in registration order, with what the binding is running for each and what it
 	/// saw of its passes.
+	#[napi_export]
 	pub async fn list_pairs(&self) -> Result<Vec<SyncPairInfo>, Error> {
 		detached(Arc::clone(&self.core), |core| async move {
 			core.list_pairs().await
@@ -1028,6 +1058,7 @@ impl JsSyncEngine {
 
 	/// The report of the last pass of `pair_id` this process saw complete, capped like every
 	/// report. Not persisted.
+	#[napi_export]
 	pub async fn last_report(&self, pair_id: u64) -> Result<Option<SyncPassReport>, Error> {
 		self.core.last_report(pair_id)
 	}
@@ -1035,11 +1066,13 @@ impl JsSyncEngine {
 	/// The last 500 events of every pair, oldest first, without `Progress` and `PassCompleted`
 	/// (its report is [`last_report`](Self::last_report)), to rebuild an activity feed after a JS
 	/// reload. Not persisted.
+	#[napi_export]
 	pub async fn recent_events(&self) -> Result<Vec<SyncPassEvent>, Error> {
 		self.core.recent_events()
 	}
 
 	/// Register a pair (idempotent for the same roots and mode) and return its id.
+	#[napi_export]
 	pub async fn add_pair(
 		&self,
 		local_root: String,
@@ -1053,6 +1086,7 @@ impl JsSyncEngine {
 	}
 
 	/// Forget a pair, stopping its watch. Its files stay on both sides.
+	#[napi_export]
 	pub async fn remove_pair(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.remove_pair(pair_id).await
@@ -1063,6 +1097,7 @@ impl JsSyncEngine {
 	/// Start watching a pair: a pass now, then one on every change and on a safety-net timer.
 	/// Refused while the pair is watched, running a one-shot pass, or paused. The engine owns the
 	/// watch: dropping the returned handle does not stop it.
+	#[napi_export]
 	pub async fn watch_pair(
 		&self,
 		pair_id: u64,
@@ -1077,6 +1112,7 @@ impl JsSyncEngine {
 	/// Stop a pair's watch, for a JS context that lost its [`JsSyncWatch`]. A no-op when the pair
 	/// is not watched or already stopping. Refused while [`watch_pair`](Self::watch_pair) is still
 	/// starting the watch, which no stop can reach yet: stop it once that call has returned.
+	#[napi_export]
 	pub async fn stop_watch(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.stop_watch_for_js(pair_id).await
@@ -1087,6 +1123,7 @@ impl JsSyncEngine {
 	/// Run one pass of an unwatched pair; its events reach the listener as a watch's do. Refused
 	/// while the pair is watched (ask the watch with [`request_pass`](Self::request_pass)) or
 	/// already running one.
+	#[napi_export]
 	pub async fn sync_once(&self, pair_id: u64) -> Result<SyncPassReport, Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.sync_once(pair_id).await
@@ -1095,6 +1132,7 @@ impl JsSyncEngine {
 	}
 
 	/// Ask a watched pair's watch for a whole pass now (see [`SyncEngine::request_pass`]).
+	#[napi_export]
 	pub async fn request_pass(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.request_pass(pair_id).await
@@ -1105,6 +1143,7 @@ impl JsSyncEngine {
 	/// Switch a pair's mode; `backlog` says what becomes of what a backup mode held back. Does not
 	/// wake a watch: follow with [`request_pass`](Self::request_pass) or
 	/// [`sync_once`](Self::sync_once) to apply it now.
+	#[napi_export]
 	pub async fn reconfigure_pair(
 		&self,
 		pair_id: u64,
@@ -1119,6 +1158,7 @@ impl JsSyncEngine {
 
 	/// Hold a pass's deletions beyond `max(floor, ratio × tracked items)`, from the next pass on.
 	/// Refused for a `ratio` outside `0.0..=1.0`. A new pair starts on floor 10, ratio 0.5.
+	#[napi_export]
 	pub async fn set_delete_guard(
 		&self,
 		pair_id: u64,
@@ -1134,6 +1174,7 @@ impl JsSyncEngine {
 
 	/// Turn off the mass-delete guard's volume check for a pair; the holds for untrustworthy
 	/// evidence (an incomplete scan, a first sync, an unconverged or empty remote) still apply.
+	#[napi_export]
 	pub async fn set_delete_guard_unlimited(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.set_delete_guard(pair_id, DeleteGuard::unlimited())
@@ -1145,6 +1186,7 @@ impl JsSyncEngine {
 	/// Pause a pair (persisted). `None` suspends the pass in flight and cancels it after 300 s. A
 	/// running watch survives the pause. The pause's time and options show on the pair's
 	/// [`SyncPairInfo`] until [`resume_pair`](Self::resume_pair), in this process only.
+	#[napi_export]
 	pub async fn pause_pair(
 		&self,
 		pair_id: u64,
@@ -1159,6 +1201,7 @@ impl JsSyncEngine {
 	/// Give up the transfers a suspended pause parked now rather than at its `cancel_after_ms`. The
 	/// pair stays paused, and its [`SyncPairInfo`] shows the pause's mode as `Cancel` from then on.
 	/// Refused when it is not paused.
+	#[napi_export]
 	pub async fn cancel_paused_actions(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.cancel_paused_actions(pair_id).await
@@ -1168,6 +1211,7 @@ impl JsSyncEngine {
 
 	/// Resume a paused pair. A pair paused when the engine opened has no watch: start one with
 	/// [`watch_pair`](Self::watch_pair) afterwards.
+	#[napi_export]
 	pub async fn resume_pair(&self, pair_id: u64) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.resume_pair(pair_id).await
@@ -1177,6 +1221,7 @@ impl JsSyncEngine {
 
 	/// Let the next pass apply the deletions the guard held under `pass_token`, and only those. In
 	/// memory only: lost when the process ends.
+	#[napi_export]
 	pub async fn approve_deletions(&self, pair_id: u64, pass_token: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.approve_deletions(pair_id, &pass_token).await
@@ -1187,6 +1232,7 @@ impl JsSyncEngine {
 	/// A page of the conflicts the pair holds, in path order, read from the baseline (no network):
 	/// at most `limit` of them, and never more than 1000, from `offset` on. `limit` 0 gives only
 	/// the total.
+	#[napi_export]
 	pub async fn list_conflicts(
 		&self,
 		pair_id: u64,
@@ -1201,6 +1247,7 @@ impl JsSyncEngine {
 
 	/// Resolve the conflict held at `rel_path`, from the next pass on. Returns where the local copy
 	/// was quarantined when `KeepRemote` replaced different content.
+	#[napi_export]
 	pub async fn resolve_conflict(
 		&self,
 		pair_id: u64,
@@ -1215,6 +1262,7 @@ impl JsSyncEngine {
 
 	/// Plan a path that kept failing again on the next pass, without waiting out the engine's
 	/// hourly retry.
+	#[napi_export]
 	pub async fn retry_path(&self, pair_id: u64, rel_path: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.retry_path(pair_id, &rel_path).await
@@ -1223,6 +1271,7 @@ impl JsSyncEngine {
 	}
 
 	/// The device-wide user ignore patterns (gitignore syntax), `""` when unset.
+	#[napi_export]
 	pub async fn user_ignore(&self) -> Result<String, Error> {
 		detached(Arc::clone(&self.core), |core| async move {
 			core.user_ignore().await
@@ -1232,6 +1281,7 @@ impl JsSyncEngine {
 
 	/// Replace the device-wide user ignore patterns; a text with a line that does not parse is
 	/// refused whole, naming that line. Wakes every watch.
+	#[napi_export]
 	pub async fn set_user_ignore(&self, patterns: String) -> Result<(), Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.set_user_ignore(&patterns).await
@@ -1241,6 +1291,7 @@ impl JsSyncEngine {
 
 	/// What a pass of the pair would do now, without doing it: a dry run that reads both sides.
 	/// Works on a paused pair.
+	#[napi_export]
 	pub async fn plan_pair(&self, pair_id: u64) -> Result<JsSyncPlan, Error> {
 		detached(Arc::clone(&self.core), move |core| async move {
 			core.plan_pair(pair_id).await
@@ -1288,41 +1339,49 @@ impl Drop for JsSyncPlan {
 	}
 }
 
+#[filen_macros::js_exports]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsSyncPlan {
 	/// The plan's counts; the same after [`release`](Self::release).
+	#[napi_export]
 	pub fn summary(&self) -> SyncPlanSummary {
 		// JS gets its own copy; the plan keeps its summary.
 		self.summary.clone()
 	}
 
 	/// The actions a pass would apply, in apply order.
+	#[napi_export]
 	pub fn actions(&self, offset: u64, limit: u64) -> Vec<PlannedAction> {
 		self.page_of(|outcome| outcome.actions.as_slice(), offset, limit)
 	}
 
 	/// What the mass-delete guard would hold back.
+	#[napi_export]
 	pub fn held(&self, offset: u64, limit: u64) -> Vec<PlannedAction> {
 		self.page_of(|outcome| outcome.held.as_slice(), offset, limit)
 	}
 
 	/// The paths that would be held as conflicts.
+	#[napi_export]
 	pub fn conflicts(&self, offset: u64, limit: u64) -> Vec<PlannedConflict> {
 		self.page_of(|outcome| outcome.conflicts.as_slice(), offset, limit)
 	}
 
 	/// The paths the engine will not act on, and why.
+	#[napi_export]
 	pub fn unsyncable(&self, offset: u64, limit: u64) -> Vec<UnsyncablePath> {
 		self.page_of(|outcome| outcome.unsyncable.as_slice(), offset, limit)
 	}
 
 	/// The top of each subtree the ignore rules would hide.
+	#[napi_export]
 	pub fn ignored(&self, offset: u64, limit: u64) -> Vec<IgnoredPath> {
 		self.page_of(|outcome| outcome.ignored.as_slice(), offset, limit)
 	}
 
 	/// Let the plan's lists go now rather than when JS collects this object: every list is empty
 	/// afterwards, and [`summary`](Self::summary) stays. Idempotent.
+	#[napi_export]
 	pub fn release(&self) {
 		// Taken under the lock, and freed on a thread of its own: the call comes on the JS thread,
 		// and a first sync's lists are millions of allocations.
@@ -1333,6 +1392,8 @@ impl JsSyncPlan {
 }
 
 /// One watch of one pair. The engine owns the watch: dropping this does not stop it.
+// `Clone` for napi, as `JsSyncEngine`: every field shares what it points at.
+#[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct JsSyncWatch {
 	core: Weak<SyncEngineCore>,
@@ -1342,20 +1403,27 @@ pub struct JsSyncWatch {
 	status: watch::Receiver<WatchStatus>,
 }
 
+#[filen_macros::js_exports]
+// On napi these are reached only through the wrappers napi-derive registers, which it does only
+// outside `cfg(test)`, and the tests do not call every one.
+#[cfg_attr(all(test, feature = "napi"), allow(dead_code))]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl JsSyncWatch {
 	/// The pair this watch syncs.
+	#[napi_export]
 	pub fn pair_id(&self) -> u64 {
 		self.pair_id
 	}
 
 	/// The watch's latest status.
+	#[napi_export]
 	pub fn status(&self) -> WatchStatus {
 		self.status.borrow().clone()
 	}
 
 	/// Stop this watch and wait for its loop to end. A later watch of the same pair is left alone.
 	/// Idempotent.
+	#[napi_export]
 	pub async fn stop(&self) -> Result<(), Error> {
 		let Some(core) = self.core.upgrade() else {
 			return Ok(());

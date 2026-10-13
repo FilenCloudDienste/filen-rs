@@ -46,7 +46,7 @@ pub const DEFAULT_CANCEL_AFTER: Duration = Duration::from_secs(300);
 /// What pausing a pair does to the pass that is already running (see the [module
 /// docs](self)). Neither flavour changes what pausing does to the NEXT pass: it does not run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(import, export, no_default)]
+#[js_type(import, export, no_default, napi)]
 pub enum PauseMode {
 	/// Park the pass between actions and keep it alive; resuming continues it where it stopped.
 	Suspend,

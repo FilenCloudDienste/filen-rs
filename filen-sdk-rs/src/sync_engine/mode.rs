@@ -8,7 +8,7 @@ use filen_macros::js_type;
 /// deletion on the source side is mirrored to the destination. A "backup" mode is a one-way mirror
 /// that never deletes on its destination, so the destination only ever accumulates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(import, export, no_default)]
+#[js_type(import, export, no_default, napi)]
 pub enum SyncMode {
 	/// Local is authoritative: push local creates/edits/moves up and mirror local deletions to
 	/// the remote.
@@ -34,7 +34,7 @@ pub enum SyncMode {
 /// propagates a source deletion, so its destination accumulates copies the mirror modes would
 /// remove on their next pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[js_type(import, no_ser, no_default)]
+#[js_type(import, no_ser, no_default, napi)]
 pub enum Backlog {
 	/// Reconcile the two sides as they are, under the new rules. Every deletion the old mode left
 	/// standing is pending from the next pass and propagates at once (mass-delete-guard screened).

@@ -33,8 +33,8 @@ mod events;
 mod facts;
 mod guard;
 mod ignore;
-// The JS bindings' surface: the mobile one only, for now.
-#[cfg(feature = "uniffi")]
+// The JS bindings' surface: the mobile one (UniFFI) and the desktop one (napi).
+#[cfg(any(feature = "uniffi", feature = "napi"))]
 mod js_impl;
 mod mode;
 // The local half of a change-scoped pass: re-observe the paths the changelist names.
@@ -91,6 +91,8 @@ pub use js_impl::{
 	JsSyncEngine, JsSyncPlan, JsSyncWatch, SyncEngineListener, SyncEventMessage, SyncPairInfo,
 	SyncPassEvent, SyncPassReport, SyncRefusal,
 };
+#[cfg(feature = "napi")]
+pub(crate) use js_impl::{JsSyncEngine, JsSyncPlan, JsSyncWatch, SyncRefusal, sync_refusal};
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
 	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,

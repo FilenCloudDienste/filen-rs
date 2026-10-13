@@ -134,6 +134,27 @@ impl FilenSdkErrorNapi {
 	}
 }
 
+// In this module, below the first impl, so napi registers it on the same class (a `#[napi] impl`
+// elsewhere would register a class named after the struct); its own block for its `cfg`, which
+// napi-derive would not copy from a method.
+#[cfg(feature = "sync-engine")]
+#[napi]
+impl FilenSdkErrorNapi {
+	/// The sync refusal this error is, for a UI to act on without reading the message: a baseline
+	/// another sync engine has open, or a pair whose roots overlap an existing one's. `None` for
+	/// every other error.
+	#[napi(
+		js_name = "syncRefusal",
+		ts_args_type = "",
+		ts_return_type = "SyncRefusal | undefined"
+	)]
+	pub fn sync_refusal(
+		&self,
+	) -> Either<<crate::sync_engine::SyncRefusal as Wire>::Wire, Undefined> {
+		OptionReturn(crate::sync_engine::sync_refusal(&self.0)).into_wire()
+	}
+}
+
 // The helpers below are plain Rust, so they stay under the workspace's `unsafe_code` deny, which
 // `js` lifts for this module only for napi-derive's glue.
 

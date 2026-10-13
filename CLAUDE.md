@@ -150,7 +150,7 @@ Test notes:
 |---------|-----------------|
 | `cache` | SQLite metadata cache (`src/cache/`, `rusqlite`); gates the `cache_tests` / `cache_search_tests` test targets |
 | `uniffi` | UniFFI scaffolding for the mobile bindings |
-| `napi` | Node-API addon (napi-rs) for the desktop app, its TypeScript matching what ubrn generates for the same items (`src/js/napi/`; items opt in with `#[js_type(.., napi)]` / `#[napi_export]`). Adds the crate's `build.rs` (`napi_build::setup()`'s link args). Scope: one Node environment per process, the Electron main process (or a `utilityProcess`); the commander runtime serves it as it serves uniffi. Desktop targets with Windows on msvc only (napi-build panics on windows-gnu). Native only, and never with `uniffi`: both combinations are a `compile_error!` in `lib.rs` |
+| `napi` | Node-API addon (napi-rs) for the desktop app, its TypeScript matching what ubrn generates for the same items (`src/js/napi/`; items opt in with `#[js_type(.., napi)]` / `#[napi_export]`). Adds the crate's `build.rs` (`napi_build::setup()`'s link args). Scope: login, cache configuration and, with `sync-engine`, the sync engine (`sync_engine/js_impl/napi_impl.rs`; its listener is one weak threadsafe function the delivery thread calls in Blocking mode, and an engine belongs to the Node environment that opened it, whose cleanup hook closes it). One Node environment per process, the Electron main process (or a `utilityProcess`); the commander runtime serves it as it serves uniffi. Desktop targets with Windows on msvc only (napi-build panics on windows-gnu). Native only, and never with `uniffi`: both combinations are a `compile_error!` in `lib.rs` |
 | `http-provider` | Local `axum` server handing out `http://127.0.0.1` URLs for remote files (range requests), so platform media players can stream them |
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |
@@ -164,7 +164,8 @@ Test notes:
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache,sync-engine` (see
 `filen-sdk-rs/web/ubrn.config.yaml`); `uniffi` together with `sync-engine` compiles the sync
-engine's binding (`sync_engine::js_impl`).
+engine's binding (`sync_engine::js_impl`); so does `napi` together with `sync-engine`, for the
+desktop addon (`build:napi` enables both).
 
 ## Git Hooks
 
@@ -362,7 +363,7 @@ The `Client` dispatches to the correct version at runtime via `AuthInfo` enum.
 - **WASM** (`target_family = "wasm"`) — uses `wasm-bindgen`, `web-sys` WebSocket, `wasm-bindgen-rayon`
 - **UniFFI** (`feature = "uniffi"`) — generates FFI scaffolding for mobile; used by `filen-mobile-native-cache`
 - **napi** (`feature = "napi"`) — a Node-API addon for the desktop app (Electron main process),
-  typed like the ubrn bindings
+  typed like the ubrn bindings: login, cache configuration and the sync engine
 
 The `filen-sdk-rs/web/` directory contains the npm project for the browser WASM tests
 (`web/main.test.ts`). Build the bindings with `bash wasm-pack.sh` run from `filen-sdk-rs/`

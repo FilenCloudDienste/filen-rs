@@ -29,6 +29,9 @@ use crate::{
 	},
 };
 
+/// The JS environment the tests open from.
+const HOST: u64 = 1;
+
 /// A listener that forwards every delivery to the test.
 fn recording() -> (super::Listener, mpsc::Receiver<Delivery>) {
 	let (deliveries_tx, deliveries) = mpsc::channel();
@@ -62,7 +65,7 @@ impl Scene {
 	}
 
 	async fn open(&self, client: Client) -> Result<Arc<SyncEngineCore>, Error> {
-		SyncEngineCore::open(Arc::new(client), self.db(), recording().0).await
+		SyncEngineCore::open(Arc::new(client), self.db(), HOST, recording().0).await
 	}
 
 	/// An open core with one registered pair.
@@ -108,13 +111,18 @@ fn is_baseline_in_use(result: Result<Arc<SyncEngineCore>, Error>) -> bool {
 async fn a_second_open_of_the_same_account_attaches_and_takes_the_listener() {
 	let scene = Scene::new();
 	let (first_listener, first) = recording();
-	let core = SyncEngineCore::open(Arc::new(offline_client()), scene.db(), first_listener)
+	let core = SyncEngineCore::open(Arc::new(offline_client()), scene.db(), HOST, first_listener)
 		.await
 		.unwrap();
 	let (second_listener, second) = recording();
-	let attached = SyncEngineCore::open(Arc::new(offline_client()), scene.db(), second_listener)
-		.await
-		.unwrap();
+	let attached = SyncEngineCore::open(
+		Arc::new(offline_client()),
+		scene.db(),
+		HOST,
+		second_listener,
+	)
+	.await
+	.unwrap();
 	assert!(
 		Arc::ptr_eq(&core, &attached),
 		"the same engine, not a second one"
@@ -146,6 +154,22 @@ async fn an_open_for_another_account_is_refused_as_baseline_in_use() {
 				"00000000-0000-0000-0000-000000000001"
 			))
 			.await
+	));
+}
+
+#[tokio::test]
+async fn an_open_from_another_host_is_refused_as_baseline_in_use() {
+	let scene = Scene::new();
+	let _core = scene.open(offline_client()).await.unwrap();
+
+	assert!(is_baseline_in_use(
+		SyncEngineCore::open(
+			Arc::new(offline_client()),
+			scene.db(),
+			HOST + 1,
+			recording().0
+		)
+		.await
 	));
 }
 

@@ -17,6 +17,10 @@ use crate::{
 	sync_engine::{DEFAULT_IGNORE_PATTERNS, WatchStatus},
 };
 
+/// The host every UniFFI open names: a JS reload's runtime replaces the old one in the same
+/// process, and must attach to the engines it left open.
+const HOST: u64 = 0;
+
 /// Receives every pair's pass events and watch statuses, in the order they happened, on one
 /// delivery thread, never the thread running the pass. Must return quickly. A call that throws is
 /// logged and loses only the deliveries it carried: the rest of its chunk is still delivered.
@@ -69,7 +73,7 @@ impl JsClient {
 		db_path: String,
 		listener: Arc<dyn SyncEngineListener>,
 	) -> Result<JsSyncEngine, Error> {
-		JsSyncEngine::open(self.inner(), db_path, listener_closure(listener)).await
+		JsSyncEngine::open(self.inner(), db_path, HOST, listener_closure(listener)).await
 	}
 }
 

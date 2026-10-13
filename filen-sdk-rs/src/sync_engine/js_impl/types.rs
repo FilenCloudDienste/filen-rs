@@ -69,7 +69,7 @@ pub(super) fn path_string(path: PathBuf) -> String {
 }
 
 /// Mirror of [`GuardReason`], with its counts widened from `usize`.
-#[js_type(export, no_deser, tagged)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum SyncGuardReason {
 	/// The local scan did not complete, so every deletion is held.
 	ScanIncomplete,
@@ -107,7 +107,7 @@ impl From<GuardReason> for SyncGuardReason {
 /// A pair's mass-delete guard (mirror of [`DeleteGuard`], whose fields are private).
 // `ratio` is an `f64`, so no `Eq`, hence `no_default`.
 #[derive(Debug, Clone, PartialEq)]
-#[js_type(export, no_deser, no_default, tagged)]
+#[js_type(export, no_deser, no_default, tagged, napi)]
 pub enum DeleteGuardState {
 	/// A pass's deletions beyond `max(floor, ratio × tracked items)` are held.
 	Limited { floor: u64, ratio: f64 },
@@ -145,7 +145,7 @@ pub(super) fn delete_guard(floor: u64, ratio: f64) -> Result<DeleteGuard, Error>
 }
 
 /// What the binding is running for a pair.
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub enum SyncPairActivity {
 	/// Nothing: the pair is neither watched nor syncing once.
 	Idle,
@@ -161,7 +161,7 @@ pub enum SyncPairActivity {
 
 /// Mirror of `pausePair`'s options ([`PauseOptions`]): what it takes, and what
 /// [`SyncPairInfo::pause_options`] says it was given.
-#[js_type(import, export)]
+#[js_type(import, export, napi)]
 pub struct SyncPauseOptions {
 	/// What happens to the pass in flight.
 	pub mode: PauseMode,
@@ -191,7 +191,7 @@ impl From<PauseOptions> for SyncPauseOptions {
 
 /// Mirror of [`WatchConfig`], in milliseconds. The engine refuses a zero debounce and a safety
 /// net no longer than the debounce.
-#[js_type(import, no_ser)]
+#[js_type(import, no_ser, napi)]
 pub struct SyncWatchConfig {
 	/// Quiet window a burst of changes is coalesced over before a pass runs.
 	pub debounce_ms: u64,
@@ -211,7 +211,7 @@ impl From<SyncWatchConfig> for WatchConfig {
 /// Mirror of [`PairRecord`], plus what the binding knows live about the pair, so a screen mounted
 /// mid-pass, or after a JS reload, learns what the listener would have told it.
 #[derive(Debug, Clone, PartialEq)]
-#[js_type(export, no_deser, no_default)]
+#[js_type(export, no_deser, no_default, napi)]
 pub struct SyncPairInfo {
 	/// The pair's id, as every pair-taking call takes it.
 	pub id: u64,
@@ -275,7 +275,7 @@ impl TryFrom<PairRecord> for SyncPairInfo {
 
 /// Mirror of [`SyncReport`]. Every list holds at most 1000 entries (`REPORT_LIST_LIMIT`), the
 /// first ones in the engine's order; its `*_total` counts them all.
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct SyncPassReport {
 	pub downloaded: u64,
 	pub uploaded: u64,
@@ -408,7 +408,7 @@ impl From<SyncReport> for SyncPassReport {
 }
 
 /// Mirror of [`SyncEvent`]: the same variants in the same order, with the same meaning.
-#[js_type(export, no_deser, tagged)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum SyncEventMessage {
 	PassStarted {
 		mode: SyncMode,
@@ -542,7 +542,7 @@ impl From<SyncEvent> for SyncEventMessage {
 }
 
 /// One event of one pass of one pair.
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct SyncPassEvent {
 	/// The pair whose pass this is.
 	pub pair_id: u64,
@@ -556,7 +556,7 @@ pub struct SyncPassEvent {
 }
 
 /// What a dry run would do; its lists are paged separately.
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct SyncPlanSummary {
 	pub actions_total: u64,
 	/// Bytes the planned uploads would send (saturating; for display).
@@ -616,7 +616,7 @@ impl From<&PlanOutcome> for SyncPlanSummary {
 }
 
 /// One page of a pair's held conflicts, in path order.
-#[js_type(export, no_deser)]
+#[js_type(export, no_deser, napi)]
 pub struct SyncConflictPage {
 	pub conflicts: Vec<PlannedConflict>,
 	/// How many conflicts the pair holds in all.
@@ -624,7 +624,7 @@ pub struct SyncConflictPage {
 }
 
 /// The refusals a sync call fails with that JS can tell apart without reading the message.
-#[js_type(export, no_deser, tagged)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum SyncRefusal {
 	/// Another sync engine, in this process or another, has this baseline DB open.
 	BaselineInUse { path: String },
@@ -684,7 +684,7 @@ impl TryFrom<&PairOverlap> for SyncRefusal {
 }
 
 /// The typed refusal `error` carries, if it is one.
-pub(super) fn sync_refusal(error: &Error) -> Option<SyncRefusal> {
+pub(crate) fn sync_refusal(error: &Error) -> Option<SyncRefusal> {
 	if let Some(in_use) = error.downcast_ref::<BaselineInUse>() {
 		return Some(in_use.into());
 	}
