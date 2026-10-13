@@ -132,7 +132,7 @@ impl Backend for Scripted {
 			.map_or(item.uuid, |(_, answered)| *answered);
 		Ok(Response {
 			uuid,
-			timestamp: DateTime::UNIX_EPOCH,
+			timestamp: answered_at(),
 		})
 	}
 
@@ -157,6 +157,13 @@ fn uuid(n: u128) -> Uuid {
 }
 
 const ROOT: u128 = 1000;
+
+/// The timestamp every create is answered with, in seconds.
+const ANSWERED_AT: i64 = 1_700_000_000;
+
+fn answered_at() -> DateTime<Utc> {
+	DateTime::from_timestamp(ANSWERED_AT, 0).unwrap()
+}
 
 /// Directories named `"1"`, `"2"`, ... in these parents.
 fn dirs<'a>(names: &'a [String], parents: &[NewDirParent]) -> Vec<NewDir<'a>> {
@@ -188,7 +195,7 @@ fn bulk(results: &[String]) -> String {
 
 fn folder_created(n: u128) -> String {
 	format!(
-		r#"{{"status":true,"message":"Folder created.","code":"folder_created","data":{{"uuid":"{}","timestamp":1700000000}}}}"#,
+		r#"{{"status":true,"message":"Folder created.","code":"folder_created","data":{{"uuid":"{}","timestamp":{ANSWERED_AT}}}}}"#,
 		uuid(n)
 	)
 }
@@ -206,6 +213,7 @@ fn created(n: u128) -> Result<CreatedDir, (ErrorKind, Option<String>)> {
 	Ok(CreatedDir {
 		uuid: uuid(n),
 		merged: false,
+		timestamp: answered_at(),
 	})
 }
 
@@ -213,6 +221,7 @@ fn merged(n: u128) -> Result<CreatedDir, (ErrorKind, Option<String>)> {
 	Ok(CreatedDir {
 		uuid: uuid(n),
 		merged: true,
+		timestamp: answered_at(),
 	})
 }
 

@@ -115,6 +115,18 @@ pub const PATH_FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// id next.
 const REMOVE_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
+/// How many items of a pass one bulk request carries: the server runs a bulk request in groups of
+/// 50 items and takes its per-user lock once per group, so this is one group.
+///
+/// The server takes about 91-117 ms per directory created and 108-115 ms per item trashed, so the
+/// request takes about 6 s. A chunk already sent is not raced against a cancel, so it has to come
+/// back within [`REMOVE_CANCEL_GRACE`]. A chunk of creates also looks up the links and shares of the
+/// directories it lands in, all at once, before it is sent, and afterwards adds each new directory
+/// to the links and shares of its parent, a round trip or so per level of the chunk's tree (a
+/// level's directories at once). Under a linked or shared directory, a chunk that nests more than
+/// a few dozen levels deep can still outlast the grace.
+pub(super) const SYNC_BULK_CHUNK: usize = 50;
+
 /// How many levels [`SyncEngine::add_pair`]'s remote-ancestry walk climbs before it gives up.
 ///
 /// A flat ceiling rather than a chain read in one request, because no such endpoint exists — the
@@ -6091,6 +6103,8 @@ impl SyncEngine {
 			lock_budget: self.lock_budget,
 		};
 		apply::apply(ctx, plan, &mut report, observer).await;
+		// The pass let go of its hold of the drive lock; what it looked up during it goes too.
+		self.client.forget_ended_hold_targets();
 		self.note_path_outcomes(pair, ends, &mut report).await;
 		// Cut short mid-apply: hand the next pass BOTH halves of what this one took. `carry_forward`
 		// above recorded the paths the plan named; this puts the announced changes back with them,

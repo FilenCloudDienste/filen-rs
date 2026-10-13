@@ -22,6 +22,7 @@ use std::{
 };
 
 use filen_macros::shared_test_runtime;
+use filen_sdk_rs::connect::{DirPublicLink, PublicLinkSharedClientExt};
 use filen_sdk_rs::fs::{
 	HasName, HasUUID,
 	categories::{DirType, Normal},
@@ -508,6 +509,130 @@ async fn scale_05_deep_nesting_round_trips() {
 	assert_trees_identical(&sc.local, &local_b, "push", "pull");
 
 	std::fs::remove_dir_all(&local_b).ok();
+	sc.cleanup();
+}
+
+/// SCALE-26 — a first sync of more directories than one bulk request carries: 4 top-level
+/// directories, 5 in each and 5 in each of those (124 in 3 levels), a few holding a file. Every
+/// directory is created once, a pull of the remote reproduces the tree byte for byte, and a second
+/// pass does nothing.
+#[shared_test_runtime]
+async fn scale_26_first_sync_of_more_dirs_than_a_chunk() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+
+	let mut dirs = 0usize;
+	let mut files = 0usize;
+	for t in 0..4 {
+		let top = format!("t{t}");
+		write_file(&sc.local, &format!("{top}/top.txt"), &content_for(&top));
+		files += 1;
+		dirs += 1;
+		for m in 0..5 {
+			for l in 0..5 {
+				std::fs::create_dir_all(sc.local.join(format!("{top}/m{m}/l{l}"))).unwrap();
+				dirs += 1;
+			}
+			dirs += 1;
+		}
+	}
+	let deep = "t3/m4/l4/deep.txt";
+	write_file(&sc.local, deep, &content_for(deep));
+	files += 1;
+	assert_eq!(dirs, 124);
+
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "errors: {:?}", r1.errors);
+	assert_eq!(r1.remote_dirs_created, dirs, "{r1:?}");
+	assert_eq!(r1.uploaded, files, "{r1:?}");
+
+	let r2 = sc.sync().await;
+	assert!(r2.errors.is_empty(), "{r2:?}");
+	assert_eq!(r2.remote_dirs_created, 0, "{r2:?}");
+	assert_eq!(r2.uploaded, 0, "{r2:?}");
+	assert_eq!(r2.remotely_trashed, 0, "{r2:?}");
+	assert_eq!(r2.moved_remote, 0, "{r2:?}");
+	assert_eq!(r2.conflicts.len(), 0, "{r2:?}");
+
+	// A separate client pulls the remote into a fresh local root.
+	let remote = sc.remote;
+	let cache_b = TestCache::new(&sc.resources.client, remote).await;
+	wait_for_converged_resync(&cache_b.messages, remote, 0, CACHE_CONVERGE_TIMEOUT).await;
+	let converged = poll_until(CACHE_CONVERGE_TIMEOUT, || {
+		count_items(cache_b.db_path()) > dirs + files
+	})
+	.await;
+	assert!(converged, "pull cache did not converge on the tree");
+	let local_b = fresh_local_dir("scale26b");
+	let engine_b = SyncEngine::open(cache_b.client.clone(), temp_cache_path())
+		.await
+		.unwrap();
+	let pair_b = engine_b
+		.add_pair(local_b.clone(), remote, SyncMode::RemoteToLocal)
+		.await
+		.unwrap();
+	let pulled = engine_b.sync_once(pair_b).await.unwrap();
+	assert!(pulled.errors.is_empty(), "{pulled:?}");
+	assert_eq!(pulled.local_dirs_created, dirs, "{pulled:?}");
+	assert_eq!(pulled.downloaded, files, "{pulled:?}");
+	assert_trees_identical(&sc.local, &local_b, "push", "pull");
+
+	std::fs::remove_dir_all(&local_b).ok();
+	sc.cleanup();
+}
+
+/// SCALE-27 — a first sync into a remote root with a public link reaches the link: every
+/// directory the pass creates, and every file it uploads under them, is in the link.
+#[shared_test_runtime]
+async fn scale_27_first_sync_into_a_linked_directory_reaches_the_link() {
+	let sc = single_client(SyncMode::LocalToRemote).await;
+	let client = &sc.resources.client;
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&sc.resources.dir, None)
+		.await
+		.unwrap();
+
+	for rel in ["a/a.txt", "a/b/b.txt", "a/b/c/c.txt"] {
+		write_file(&sc.local, rel, &content_for(rel));
+	}
+	let r1 = sc.sync().await;
+	assert!(r1.errors.is_empty(), "errors: {:?}", r1.errors);
+	assert_eq!(r1.remote_dirs_created, 3, "{r1:?}");
+	assert_eq!(r1.uploaded, 3, "{r1:?}");
+
+	let (dirs, files) = client
+		.list_dir_recursive::<_, fn(u64, Option<u64>)>(&(&sc.resources.dir).into(), None, ())
+		.await
+		.unwrap();
+	let synced: BTreeSet<Uuid> = dirs
+		.iter()
+		.map(|dir| dir.uuid())
+		.chain(files.iter().map(|file| file.uuid()))
+		.collect();
+	assert_eq!(synced.len(), 6, "the pass made 3 directories and 3 files");
+
+	let link: DirPublicLink = client
+		.get_dir_link_rw(&sc.resources.dir)
+		.await
+		.unwrap()
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let unauth = client.get_unauthed();
+	let info = unauth
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+	let (linked_dirs, linked_files) = unauth
+		.list_linked_dir_recursive::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let linked: BTreeSet<Uuid> = linked_dirs
+		.iter()
+		.map(|dir| dir.inner().uuid())
+		.chain(linked_files.iter().map(|file| file.uuid()))
+		.collect();
+	assert_eq!(linked, synced);
+
 	sc.cleanup();
 }
 

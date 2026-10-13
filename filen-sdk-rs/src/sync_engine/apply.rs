@@ -22,15 +22,15 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use filen_types::fs::StableUuid;
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use uuid::Uuid;
 
 use super::{
 	baseline::{BaselineChange, BaselineEntry, BaselineState, NodeKind, PairId, PendingRow},
 	changes::FullPassReason,
 	engine::{
-		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SharedStore,
-		locked, off_store,
+		LockBudget, Observations, PASS_LOCK_MAX_SLEEP, PendingKind, PendingWrites, SYNC_BULK_CHUNK,
+		SharedStore, locked, off_store,
 	},
 	events::{SyncEvent, TransferDirection},
 	guard::GuardReason,
@@ -48,13 +48,16 @@ use super::{
 use crate::{
 	auth::Client,
 	cache::{SearchResult, hydrate_cached_items_at},
+	connect::ParentTargets,
 	fs::{
 		HasUUID,
+		bulk::create_dirs::{CreatedDir, NewDir, NewDirParent},
 		dir::meta::DirectoryMetaChanges,
 		file::{FileBuilderOptionalName, meta::FileMetaChanges},
+		name::ValidatedName,
 	},
 	io::{RemoteDirectory, RemoteFile, client_impl::IoSharedClientExt},
-	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock},
+	sync::lock::{ATTEMPTS_DEFAULT, ResourceLock, confirm_or_retake},
 	util::{MaybeArc, MaybeSendCallback},
 };
 use tokio::{sync::mpsc::UnboundedSender, time::Instant};
@@ -641,10 +644,12 @@ fn millis_to_dt(millis: i64) -> DateTime<Utc> {
 /// CONCURRENTLY, bounded by the client's configured concurrency ([`ClientConfig::with_concurrency`],
 /// default 16) and the global request rate limiter. Directory creates/moves (which make the
 /// directories later actions land in, parent before child) and deletes (descendant-first for
-/// cascade safety) stay serial.
+/// cascade safety) stay in order; consecutive remote directory creates go to the server together,
+/// a chunk at a time (see [`apply_creates`]).
 ///
 /// Each action emits its [`SyncEvent`] to `observer` (and an [`ActionFailed`](SyncEvent::ActionFailed)
-/// if it errors): serial actions when they start, concurrent transfers as each completes.
+/// if it errors): serial actions when they start, a chunk's creates as it is sent, concurrent
+/// transfers as each completes.
 ///
 /// Pausing the pair reaches into this loop through [`ApplyContext::gate`]: a SUSPENDED pass parks
 /// before its next action — and before taking the drive lock — while a transfer already running
@@ -668,9 +673,10 @@ pub(super) async fn apply(
 	let mut failed = FailedDirMoves::default();
 	// The sides found full so far: each holds back the transfers that write to it.
 	let full = FullSides::default();
-	// Creates and moves first, one at a time: they make the directories the transfers land in, and
-	// run parent before child. The deletion half of a type flip runs among them, before the create at
-	// its path, or the server rejects that create (the old item still exists).
+	// Creates and moves first, in order (a run of remote directory creates a chunk at a time): they
+	// make the directories the transfers land in, and run parent before child. The deletion half of
+	// a type flip runs among them, before the create at its path, or the server rejects that create
+	// (the old item still exists).
 	while admits_more(report)
 		&& let Some(Staged {
 			entry, releasable, ..
@@ -687,6 +693,38 @@ pub(super) async fn apply(
 					return note_lock_failure(report, total - applied, &error, observer);
 				}
 				None => return note_interrupted(report, total - applied, observer),
+			}
+			if matches!(action, SyncAction::CreateRemoteDir { .. }) {
+				// The rest of the run goes in the same request, as far as the hold has room for.
+				let room = chunk_room(&lease, &ctx.lock_budget);
+				let more = match plan
+					.take_run(&ctx, Run::Before, room, is_remote_dir_create)
+					.await
+				{
+					Ok(more) => more,
+					Err(error) => {
+						note_unread_plan(report, &error);
+						continue;
+					}
+				};
+				// No release inside a chunk, so a tie is never split.
+				for staged in &more {
+					lease.note_start(&staged.entry.action);
+				}
+				let hold = lease
+					.held()
+					.expect("a remote write's lease holds the lock (should be impossible)");
+				let chunk = std::iter::once(entry)
+					.chain(more.into_iter().map(|staged| staged.entry))
+					.collect();
+				let chunk_ctx = ChunkContext {
+					ctx: &ctx,
+					hold,
+					full: &full,
+				};
+				applied +=
+					apply_creates(&chunk_ctx, chunk, &mut plan, &failed, report, observer).await;
+				continue;
 			}
 			apply_serial(
 				&ctx,
@@ -744,7 +782,7 @@ pub(super) async fn apply(
 				}
 				let now = Instant::now();
 				if remote_in_flight == 0 {
-					lease.release_if_spent(&ctx.lock_budget, releasable, now);
+					lease.release_if_spent(&ctx, releasable, now);
 				}
 				if !lease.admits(&ctx.lock_budget, action, releasable, now) {
 					break;
@@ -1001,10 +1039,12 @@ impl Lease {
 		matches!(self, Self::Held { since, writes, .. } if hold_spent(budget, *since, *writes, now))
 	}
 
-	/// Let a spent hold go, when the next action sits where a release splits nothing.
-	fn release_if_spent(&mut self, budget: &LockBudget, releasable: bool, now: Instant) {
-		if releasable && self.spent(budget, now) {
+	/// Let a spent hold go, when the next action sits where a release splits nothing, and with it
+	/// the links and shares looked up during it, unless another holder in the process shares it.
+	fn release_if_spent(&mut self, ctx: &ApplyContext<'_>, releasable: bool, now: Instant) {
+		if releasable && self.spent(&ctx.lock_budget, now) {
 			*self = Self::Released { at: now };
+			ctx.client.forget_ended_hold_targets();
 		}
 	}
 
@@ -1021,6 +1061,22 @@ impl Lease {
 			return false;
 		}
 		!mutates_remote(action) || matches!(self, Self::Held { lock, .. } if lock.is_valid())
+	}
+
+	/// How many more remote writes the hold starts before its batch is spent; none without a hold.
+	fn room(&self, budget: &LockBudget) -> usize {
+		match self {
+			Self::Held { writes, .. } => budget.batch.saturating_sub(*writes),
+			Self::Unheld | Self::Released { .. } => 0,
+		}
+	}
+
+	/// The lock, while it is held.
+	fn held(&self) -> Option<&Arc<ResourceLock>> {
+		match self {
+			Self::Held { lock, .. } => Some(lock),
+			Self::Unheld | Self::Released { .. } => None,
+		}
 	}
 
 	/// Count `action` against the hold when it writes to the remote.
@@ -1054,7 +1110,7 @@ impl Lease {
 		releasable: bool,
 	) -> Option<Result<(), crate::Error>> {
 		let now = Instant::now();
-		self.release_if_spent(&ctx.lock_budget, releasable, now);
+		self.release_if_spent(ctx, releasable, now);
 		if !self.admits(&ctx.lock_budget, action, releasable, now) {
 			if let Self::Released { at } = *self {
 				ctx.gate
@@ -1327,6 +1383,27 @@ impl PagedPlan {
 			return Ok(None);
 		}
 		self.pager.next_in(run).map_err(page_err)
+	}
+
+	/// Take the actions at the front of `run` while `same` holds for them, at most `max`, turning
+	/// and hydrating pages as [`next_in`](Self::next_in) does.
+	async fn take_run(
+		&mut self,
+		ctx: &ApplyContext<'_>,
+		run: Run,
+		max: usize,
+		same: impl Fn(&SyncAction) -> bool,
+	) -> Result<Vec<Staged>, crate::Error> {
+		let mut taken = Vec::new();
+		while taken.len() < max
+			&& self
+				.peek_in(ctx, run)
+				.await?
+				.is_some_and(|staged| same(&staged.entry.action))
+		{
+			taken.extend(self.next_in(ctx, run).await?);
+		}
+		Ok(taken)
 	}
 
 	/// See [`Pager::sweep`].
@@ -1662,6 +1739,461 @@ async fn apply_serial(
 		failed.dirs.push(to_path.clone());
 	}
 	note_action_failed(action, &error, full, report, observer);
+}
+
+/// Whether `action` is one [`apply_creates`] carries out.
+fn is_remote_dir_create(action: &SyncAction) -> bool {
+	matches!(action, SyncAction::CreateRemoteDir { .. })
+}
+
+/// How many more actions a chunk takes after its first, which `lease` has been counted for: what
+/// fits in one bulk request and in the hold.
+fn chunk_room(lease: &Lease, budget: &LockBudget) -> usize {
+	(SYNC_BULK_CHUNK - 1).min(lease.room(budget))
+}
+
+/// What a chunk of directory creates reads besides its plan (see [`apply_creates`]).
+struct ChunkContext<'p, 'c> {
+	ctx: &'p ApplyContext<'c>,
+	/// The drive lock the pass holds for the chunk, which the links and shares looked up for it
+	/// are kept for (see [`Client::held_connected_targets`]).
+	hold: &'p Arc<ResourceLock>,
+	/// The sides found full so far.
+	full: &'p FullSides,
+}
+
+/// A remote directory create of a chunk, ready to send (see [`compose_creates`]).
+struct ComposedCreate<'c> {
+	action: &'c SyncAction,
+	/// The remote item at its path that the create replaces, for its journal row.
+	replaced: Option<Uuid>,
+	dir: NewDir<'c>,
+}
+
+/// Create a chunk of the plan's remote directories, in plan order and parents first, with one
+/// request ([`Client::create_dirs`]): compose each create ([`compose_creates`]), send the ones
+/// that composed, and record each answer ([`land_creates`]).
+///
+/// Returns how many of the chunk it carried out or failed. The creates it did not get to, behind a
+/// stage read or a record that could not be written, are not counted (see
+/// [`SyncReport::interrupted`]): the server made the ones that were sent, and the next pass adopts
+/// them.
+///
+/// Each create's event goes out as it is composed, so the events of a chunk come before the
+/// failures its answers bring.
+async fn apply_creates(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	chunk: Vec<PlannedEntry>,
+	plan: &mut PagedPlan,
+	failed: &FailedDirMoves,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> usize {
+	let (composed, settled) = compose_creates(
+		chunk_ctx,
+		&chunk,
+		plan,
+		failed,
+		&mut HashMap::new(),
+		report,
+		observer,
+	)
+	.await;
+	if composed.is_empty() || !admits_more(report) {
+		return settled;
+	}
+	let dirs: Vec<NewDir<'_>> = composed.iter().map(|create| create.dir).collect();
+	tracing::debug!(
+		"apply: creating {} remote directories in one request",
+		dirs.len()
+	);
+	let answers = match chunk_ctx.ctx.client.create_dirs(&dirs).await {
+		Ok(answers) => answers,
+		Err(error) => all_failed(error, dirs.len()),
+	};
+	settled + land_creates(chunk_ctx, &composed, answers, plan, report, observer).await
+}
+
+/// The answers to `count` creates whose request failed as a whole with `error`: a lock that could
+/// not be taken, under which nothing was sent.
+fn all_failed(error: crate::Error, count: usize) -> Vec<Result<CreatedDir, crate::Error>> {
+	let error = Arc::new(error);
+	(0..count)
+		.map(|_| Err(crate::Error::unshared(Arc::clone(&error))))
+		.collect()
+}
+
+/// Compose each create of `chunk`, in plan order: where it goes and what it is called. A create
+/// under a directory an earlier create of the chunk makes names that create; any other names the
+/// directory it lands in (see [`PagedPlan::parent_of`]).
+///
+/// The links and shares of each directory the chunk lands in are looked up once, here, all at once,
+/// before anything is created, unless `looked_up` already holds that directory's lookup. A lookup
+/// that fails fails every create under that directory, so nothing is created that would miss them,
+/// and the next pass plans those creates again.
+///
+/// A stage read that fails stops the pass (see [`admits_more`]), and so the composing: the creates
+/// of the chunk after it are left uncounted, for the next pass.
+///
+/// Returns the creates that composed, and how many of the chunk it skipped or failed.
+async fn compose_creates<'c>(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	chunk: &'c [PlannedEntry],
+	plan: &PagedPlan,
+	failed: &FailedDirMoves,
+	looked_up: &mut HashMap<Uuid, Result<(), Arc<crate::Error>>>,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> (Vec<ComposedCreate<'c>>, usize) {
+	let mut composed = Vec::with_capacity(chunk.len());
+	let mut settled = 0;
+	// Where each create that composed sits in `composed`, by its path.
+	let mut earlier = HashMap::new();
+	for planned in chunk {
+		if !admits_more(report) {
+			break;
+		}
+		let action = &planned.action;
+		if failed.skips(action, report, observer) {
+			settled += 1;
+			continue;
+		}
+		observer(action.to_event());
+		tracing::debug!("apply: {}", action.describe());
+		match compose_create(planned, plan, &earlier) {
+			Ok(create) => {
+				earlier.insert(action.rel_path(), composed.len());
+				composed.push(create);
+			}
+			Err(error) => {
+				settled += 1;
+				note_action_failed(action, &error, chunk_ctx.full, report, observer);
+			}
+		}
+	}
+	// Nothing is sent once the pass stops.
+	if !admits_more(report) {
+		return (composed, settled);
+	}
+
+	let missing: HashSet<Uuid> = composed
+		.iter()
+		.filter_map(|create| match create.dir.parent {
+			NewDirParent::Existing(dir) if !looked_up.contains_key(&dir) => Some(dir),
+			_ => None,
+		})
+		.collect();
+	let (client, hold) = (chunk_ctx.ctx.client, chunk_ctx.hold);
+	let lookups = join_all(missing.into_iter().map(|dir| async move {
+		let lookup = client.held_connected_targets(hold, dir).await;
+		(dir, lookup.map(|_| ()).map_err(Arc::new))
+	}))
+	.await;
+	looked_up.extend(lookups);
+
+	// A create dropped here moves the ones after it, so each `Earlier` parent is renumbered: by
+	// where each create of `composed` went in `sent`, or the lookup error that failed it and every
+	// create under it.
+	let mut sent = Vec::with_capacity(composed.len());
+	let mut placed: Vec<Result<usize, Arc<crate::Error>>> = Vec::with_capacity(composed.len());
+	for mut create in composed {
+		let place = match create.dir.parent {
+			NewDirParent::Existing(dir) => match looked_up.get(&dir) {
+				Some(Ok(())) => Ok(sent.len()),
+				Some(Err(error)) => Err(Arc::clone(error)),
+				None => Err(Arc::new(internal(
+					"a parent's links and shares were not looked up (should be impossible)",
+				))),
+			},
+			NewDirParent::Earlier(index) => match placed.get(index) {
+				Some(Ok(moved)) => {
+					create.dir.parent = NewDirParent::Earlier(*moved);
+					Ok(sent.len())
+				}
+				Some(Err(error)) => Err(Arc::clone(error)),
+				None => Err(Arc::new(internal(
+					"a create's parent comes after it in the chunk (should be impossible)",
+				))),
+			},
+		};
+		if let Err(error) = &place {
+			settled += 1;
+			let error = crate::Error::unshared(Arc::clone(error));
+			note_action_failed(create.action, &error, chunk_ctx.full, report, observer);
+		} else {
+			sent.push(create);
+		}
+		placed.push(place);
+	}
+	(sent, settled)
+}
+
+/// Compose the create `planned` (see [`compose_creates`]).
+fn compose_create<'c>(
+	planned: &'c PlannedEntry,
+	plan: &PagedPlan,
+	earlier: &HashMap<&str, usize>,
+) -> Result<ComposedCreate<'c>, crate::Error> {
+	let (
+		action @ SyncAction::CreateRemoteDir { rel_path },
+		PassStart::CreateRemoteDir {
+			local,
+			remote,
+			parent_uuid,
+		},
+	) = (&planned.action, &planned.start)
+	else {
+		return Err(unpaired());
+	};
+	let (parent_path, name) = parent_and_name(rel_path);
+	let parent = match earlier.get(parent_path) {
+		Some(&index) => NewDirParent::Earlier(index),
+		None => NewDirParent::Existing(
+			plan.parent_of(rel_path, *parent_uuid)?
+				.ok_or_else(|| internal("remote parent dir not yet created"))?,
+		),
+	};
+	let created = local
+		.as_deref()
+		.map(|n| millis_to_dt(n.mtime_millis))
+		.unwrap_or_else(Utc::now);
+	Ok(ComposedCreate {
+		action,
+		replaced: remote.as_deref().map(|node| node.remote_uuid),
+		dir: NewDir {
+			name,
+			created,
+			parent,
+		},
+	})
+}
+
+/// Record each answer to the creates `composed`, in order: a directory made is recorded, and a
+/// failure is recorded as one. Every directory made is first added to its parent's links and
+/// shares, and one the server merged into an existing directory to those it is missing from
+/// ([`propagate_chunk`]).
+///
+/// Returns how many it recorded. It stops at the first record that could not be written, since
+/// every later one would wait out the same wedged store. The server made the directories behind
+/// it, and they were added to their parents' links and shares; the next pass adopts them.
+async fn land_creates(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	composed: &[ComposedCreate<'_>],
+	answers: Vec<Result<CreatedDir, crate::Error>>,
+	plan: &mut PagedPlan,
+	report: &mut SyncReport,
+	observer: &mut (dyn FnMut(SyncEvent) + Send),
+) -> usize {
+	propagate_chunk(chunk_ctx, composed, &answers).await;
+	let mut settled = 0;
+	for (create, answer) in composed.iter().zip(answers) {
+		settled += 1;
+		let landed = match answer {
+			Ok(created) => record_create(chunk_ctx.ctx, create, created.uuid, plan, report).await,
+			Err(error) => Err(error),
+		};
+		if let Err(error) = landed {
+			note_action_failed(create.action, &error, chunk_ctx.full, report, observer);
+		}
+		if !admits_more(report) {
+			break;
+		}
+	}
+	settled
+}
+
+/// Add each directory the creates `composed` made to its parent's links and shares
+/// ([`propagate_created`]), and each one the server merged into an existing directory to those of
+/// them it is missing from ([`propagate_merged`]), a level of the chunk's tree at a time, each
+/// level's directories at once: a level's parents are added before it. A merged directory keeps
+/// links and shares of its own; the creates under it look them up.
+///
+/// It runs before any create is recorded, and needs no store: the server made every directory
+/// answered `Ok`, whether or not its record can be written.
+async fn propagate_chunk(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	composed: &[ComposedCreate<'_>],
+	answers: &[Result<CreatedDir, crate::Error>],
+) {
+	// The uuid each create was answered, by its place in `composed`, for the creates under it.
+	let answered: Vec<Option<Uuid>> = answers
+		.iter()
+		.map(|answer| answer.as_ref().ok().map(|created| created.uuid))
+		.collect();
+	// How far each create sits below a directory that was there before the chunk.
+	let mut depths: Vec<usize> = Vec::with_capacity(composed.len());
+	for create in composed {
+		let depth = match create.dir.parent {
+			NewDirParent::Existing(_) => 0,
+			NewDirParent::Earlier(index) => depths.get(index).map_or(0, |depth| depth + 1),
+		};
+		depths.push(depth);
+	}
+	let deepest = depths.iter().copied().max().unwrap_or(0);
+	let at_level =
+		|level: usize| {
+			composed.iter().zip(answers).zip(&depths).filter_map(
+				move |((create, answer), &depth)| match answer {
+					Ok(created) if depth == level => Some((create, created)),
+					_ => None,
+				},
+			)
+		};
+	for level in 0..=deepest {
+		// The merges first: each forgets what the hold kept once it is done, which the fresh
+		// directories of the level would otherwise keep their parents' targets into for nothing.
+		join_all(
+			at_level(level)
+				.filter(|(_, created)| created.merged)
+				.map(|(_, created)| propagate_merged(chunk_ctx, created)),
+		)
+		.await;
+		join_all(
+			at_level(level)
+				.filter(|(_, created)| !created.merged)
+				.map(|(create, created)| propagate_created(chunk_ctx, create, created, &answered)),
+		)
+		.await;
+	}
+}
+
+/// Add the directory `created` that `create` made to the links and shares of the directory it was
+/// made in, and keep those as its own for the rest of the hold, so that what goes under it later in
+/// the hold looks nothing up.
+///
+/// The lease of the hold is confirmed first, as for every write made under it after an await; once
+/// it is lost, the lock is taken again and the links and shares are looked up under the new one.
+///
+/// A failure is only logged: the directory exists, and failing its create would only make the next
+/// pass adopt it as it is.
+async fn propagate_created(
+	chunk_ctx: &ChunkContext<'_, '_>,
+	create: &ComposedCreate<'_>,
+	created: &CreatedDir,
+	answered: &[Option<Uuid>],
+) {
+	let client = chunk_ctx.ctx.client;
+	let retaken = match confirm_or_retake(chunk_ctx.hold, || client.lock_drive()).await {
+		Ok(retaken) => retaken,
+		Err(error) => {
+			tracing::warn!(
+				"apply: {} was created, but the drive lock could not be confirmed to add it to its \
+				 parent's links and shares, so it is not added to them: {error}",
+				create.action.describe()
+			);
+			return;
+		}
+	};
+	let hold = retaken.as_ref().unwrap_or(chunk_ctx.hold);
+	let parent = match create.dir.parent {
+		NewDirParent::Existing(uuid) => Some(uuid),
+		NewDirParent::Earlier(index) => answered.get(index).copied().flatten(),
+	};
+	let Some(parent) = parent else {
+		tracing::warn!(
+			"apply: {} was created under a directory with no answer (should be impossible); it is \
+			 not added to that directory's links and shares",
+			create.action.describe()
+		);
+		return;
+	};
+	let lookup = match client.held_connected_targets(hold, parent).await {
+		Ok(lookup) => lookup,
+		Err(error) => {
+			tracing::warn!(
+				"apply: {} was created, but the links and shares of its parent could not be looked \
+				 up, so it is not added to them: {error}",
+				create.action.describe()
+			);
+			return;
+		}
+	};
+	if !lookup.targets.is_empty() {
+		// `create_dirs` answers `Ok` only for a directory it minted, through the same validation.
+		let name = ValidatedName::try_from(create.dir.name)
+			.expect("create_dirs validated this name (should be impossible)");
+		let dir = RemoteDirectory::new_from_parts(
+			created.uuid,
+			RemoteDirectory::make_meta(name, create.dir.created),
+			parent.into(),
+			created.timestamp,
+		);
+		let errors = client
+			.propagate_to_targets(&lookup.targets, &[(&dir).into()])
+			.await;
+		for error in &errors {
+			tracing::warn!(
+				"failed to propagate a connected-parent update to a link or shared user: {error}"
+			);
+		}
+		// A directory missing from some of them is not one their lookup describes.
+		if !errors.is_empty() {
+			return;
+		}
+	}
+	client.inherit_connected_targets(hold, created.uuid, &lookup);
+}
+
+/// Add the existing directory `created` that a create merged into to the links and shares of its
+/// parent it is missing from, as [`Client::create_dir`] does for a merge: the create of a
+/// directory whose propagation failed comes back as one. That adds its whole subtree to them, so
+/// nothing kept for the hold is answered while it runs, and all of it is forgotten after.
+///
+/// A failure is only logged, as for [`propagate_created`].
+async fn propagate_merged(chunk_ctx: &ChunkContext<'_, '_>, created: &CreatedDir) {
+	let client = chunk_ctx.ctx.client;
+	let _change = client.connected_targets_change();
+	let dir = match client.get_dir(created.uuid).await {
+		Ok(dir) => dir,
+		Err(error) => {
+			tracing::warn!(
+				"apply: a create merged into {}, which could not be read to add it to the links and \
+				 shares of its parent it is missing from: {error}",
+				created.uuid
+			);
+			return;
+		}
+	};
+	if let Err(error) = client
+		.update_item_with_maybe_connected_parent(
+			chunk_ctx.hold,
+			(&dir).into(),
+			ParentTargets::Missing,
+		)
+		.await
+	{
+		tracing::warn!(
+			"apply: a create merged into {}, which could not be added to the links and shares of \
+			 its parent it is missing from: {error}",
+			created.uuid
+		);
+	}
+}
+
+/// Record the directory `uuid` that `create` made, or merged into: its baseline row and journal
+/// row, and where it is in the pass's stage.
+async fn record_create(
+	ctx: &ApplyContext<'_>,
+	create: &ComposedCreate<'_>,
+	uuid: Uuid,
+	plan: &mut PagedPlan,
+	report: &mut SyncReport,
+) -> Result<(), crate::Error> {
+	let rel_path = create.action.rel_path();
+	let kind = PendingKind::Created {
+		path: rel_path.to_string(),
+		replaced: create.replaced,
+	};
+	let entry = dir_entry(rel_path, Some(uuid), None);
+	commit_remote_write(ctx, uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
+	// What lands under the directory finds it here, and a later deletion of the pass that names it
+	// is refused: when the dedup answered with an existing directory, this is ITS uuid. A record
+	// that failed fails the action, and so the pass (see `record_not_written`), before anything is
+	// put under it or deleted.
+	plan.record_created(rel_path, uuid)?;
+	report.remote_dirs_created += 1;
+	note_written(plan, create.action, report);
+	Ok(())
 }
 
 /// Record that `action` landed, for the deletions after it (see [`Pager::note_written`]).
@@ -2217,39 +2749,6 @@ async fn apply_one(
 				}
 			}
 			report.locally_deleted += 1;
-		}
-		(
-			SyncAction::CreateRemoteDir { rel_path },
-			PassStart::CreateRemoteDir {
-				local,
-				remote,
-				parent_uuid,
-			},
-		) => {
-			let parent = plan
-				.parent_of(rel_path, *parent_uuid)?
-				.ok_or_else(|| internal("remote parent dir not yet created"))?;
-			let created = local
-				.as_deref()
-				.map(|n| millis_to_dt(n.mtime_millis))
-				.unwrap_or_else(Utc::now);
-			let new_uuid: Uuid = ctx
-				.client
-				.inner_create_dir_with_created(parent, parent_and_name(rel_path).1, created)
-				.await?
-				.uuid();
-			let kind = PendingKind::Created {
-				path: rel_path.clone(),
-				replaced: remote.as_deref().map(|node| node.remote_uuid),
-			};
-			let entry = dir_entry(rel_path, Some(new_uuid), None);
-			commit_remote_write(ctx, new_uuid, kind, &[BaselineChange::Upsert(&entry)]).await?;
-			// What lands under the directory finds it here, and a later deletion of the pass that
-			// names it is refused: when the dedup answered with an existing directory, this is ITS
-			// uuid. A record that failed fails the action, and so the pass (see
-			// `record_not_written`), before anything is put under it or deleted.
-			plan.record_created(rel_path, new_uuid)?;
-			report.remote_dirs_created += 1;
 		}
 		(SyncAction::UploadFile { .. }, _) => {
 			let mut quarantined = None;
@@ -3277,6 +3776,7 @@ mod tests {
 	use std::{sync::Mutex, time::Duration};
 
 	use filen_types::crypto::Blake3Hash;
+	use tokio::runtime::Runtime;
 	use uuid::Uuid;
 
 	use super::*;
@@ -3284,6 +3784,9 @@ mod tests {
 		ErrorKind, alloc_meter,
 		auth::test_support::offline_client,
 		cache::{CacheState, hydrate_by_uuids},
+		connect::ConnectedTargets,
+		fs::bulk::create_dirs::CreateDirsError,
+		sync::lock::test_support::{held_lock, undriven_runtime},
 		sync_engine::{
 			SyncMode,
 			baseline::BaselineStore,
@@ -5244,5 +5747,576 @@ mod tests {
 			..SyncReport::default()
 		};
 		assert_eq!(report.pass_error(), None);
+	}
+
+	/// A hold of the drive lock for tests that never reach a server: built in a runtime only the
+	/// test drives, so when the lock drops, its release is queued there and never sent.
+	struct UndrivenHold {
+		// Dropped first, while the runtime it queues its release on still exists.
+		lock: Arc<ResourceLock>,
+		runtime: Runtime,
+	}
+
+	impl UndrivenHold {
+		fn new() -> Self {
+			let runtime = undriven_runtime();
+			let lock = held_lock(&runtime);
+			Self { lock, runtime }
+		}
+	}
+
+	const ROOT: Uuid = Uuid::from_u128(1000);
+
+	/// A remote directory create at `rel_path`, where the view listed `parent_uuid` at its parent.
+	fn create_at(rel_path: &str, parent_uuid: Option<Uuid>) -> PlannedEntry {
+		PlannedEntry {
+			action: SyncAction::CreateRemoteDir {
+				rel_path: rel_path.to_string(),
+			},
+			start: PassStart::CreateRemoteDir {
+				local: None,
+				remote: None,
+				parent_uuid,
+			},
+		}
+	}
+
+	/// `entries` staged as they stand, over the sync root [`ROOT`].
+	fn staged_creates(entries: &[PlannedEntry]) -> (tempfile::TempDir, PagedPlan) {
+		let (dir, stage) = Stage::in_temp_dir();
+		let mut writer = PlanWriter::new(stage).unwrap();
+		for entry in entries {
+			writer.push(entry).unwrap();
+		}
+		(dir, PagedPlan::new(writer.finish().unwrap(), ROOT))
+	}
+
+	/// What a chunk of creates left behind.
+	struct Landed {
+		composed: Vec<NewDirParent>,
+		report: SyncReport,
+		events: Vec<SyncEvent>,
+		settled: usize,
+	}
+
+	/// Compose `chunk` over `plan` and, given `answers`, land it, with the links and shares of
+	/// [`ROOT`] and of each of `listed` kept empty for `hold`, so no lookup leaves the process.
+	fn run_chunk(
+		borrowed: &Borrowed,
+		hold: &UndrivenHold,
+		listed: &[Uuid],
+		chunk: &[PlannedEntry],
+		plan: &mut PagedPlan,
+		answers: Option<Vec<Result<CreatedDir, crate::Error>>>,
+	) -> Landed {
+		let looked_up = HashMap::new();
+		run_chunk_looked_up(borrowed, hold, listed, chunk, plan, answers, looked_up)
+	}
+
+	/// [`run_chunk`], with the lookups of `looked_up` made already.
+	fn run_chunk_looked_up(
+		borrowed: &Borrowed,
+		hold: &UndrivenHold,
+		listed: &[Uuid],
+		chunk: &[PlannedEntry],
+		plan: &mut PagedPlan,
+		answers: Option<Vec<Result<CreatedDir, crate::Error>>>,
+		mut looked_up: HashMap<Uuid, Result<(), Arc<crate::Error>>>,
+	) -> Landed {
+		for dir in std::iter::once(&ROOT).chain(listed) {
+			borrowed
+				.client
+				.keep_held_targets(&hold.lock, *dir, ConnectedTargets::default());
+		}
+		let ctx = borrowed.ctx(ROOT, None);
+		let full = FullSides::default();
+		let chunk_ctx = ChunkContext {
+			ctx: &ctx,
+			hold: &hold.lock,
+			full: &full,
+		};
+		let mut report = SyncReport::default();
+		let mut events = Vec::new();
+		let mut observer = |event| events.push(event);
+		let (composed, settled) = hold.runtime.block_on(async {
+			let (composed, mut settled) = compose_creates(
+				&chunk_ctx,
+				chunk,
+				plan,
+				&FailedDirMoves::default(),
+				&mut looked_up,
+				&mut report,
+				&mut observer,
+			)
+			.await;
+			if let Some(answers) = answers {
+				settled += land_creates(
+					&chunk_ctx,
+					&composed,
+					answers,
+					plan,
+					&mut report,
+					&mut observer,
+				)
+				.await;
+			}
+			(
+				composed.iter().map(|create| create.dir.parent).collect(),
+				settled,
+			)
+		});
+		Landed {
+			composed,
+			report,
+			events,
+			settled,
+		}
+	}
+
+	fn created_dir(uuid: Uuid, merged: bool) -> Result<CreatedDir, crate::Error> {
+		Ok(CreatedDir {
+			uuid,
+			merged,
+			timestamp: DateTime::UNIX_EPOCH,
+		})
+	}
+
+	fn failures(events: &[SyncEvent]) -> usize {
+		events
+			.iter()
+			.filter(|event| matches!(event, SyncEvent::ActionFailed { .. }))
+			.count()
+	}
+
+	/// A borrowed context whose store holds the pair [`Borrowed::ctx`] names.
+	fn borrowed_with_pair() -> Borrowed {
+		let borrowed = Borrowed::new();
+		let (pair, _) = locked(&borrowed.store)
+			.create_pair("/local", ROOT, SyncMode::TwoWay)
+			.unwrap();
+		assert_eq!(pair, borrowed.ctx(ROOT, None).pair);
+		borrowed
+	}
+
+	#[test]
+	fn a_run_of_creates_names_each_parent_by_its_place_in_the_chunk() {
+		let chunk = [
+			create_at("a", None),
+			create_at("a/b", None),
+			create_at("a/b/c", None),
+			create_at("d", None),
+		];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let landed = run_chunk(&borrowed, &hold, &[], &chunk, &mut plan, None);
+		assert_eq!(
+			landed.composed,
+			[
+				NewDirParent::Existing(ROOT),
+				NewDirParent::Earlier(0),
+				NewDirParent::Earlier(1),
+				NewDirParent::Existing(ROOT),
+			]
+		);
+		assert_eq!(landed.settled, 0);
+	}
+
+	#[test]
+	fn a_create_under_a_directory_an_earlier_chunk_created_names_its_answered_uuid() {
+		let answered = Uuid::from_u128(1);
+		let (_dir, mut plan) = staged_creates(&[create_at("a", None), create_at("a/b", None)]);
+		plan.record_created("a", answered).unwrap();
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let chunk = [create_at("a/b", None)];
+		let landed = run_chunk(&borrowed, &hold, &[answered], &chunk, &mut plan, None);
+		assert_eq!(landed.composed, [NewDirParent::Existing(answered)]);
+	}
+
+	#[test]
+	fn a_create_under_a_listed_directory_names_the_listed_uuid() {
+		let listed = Uuid::from_u128(1);
+		let chunk = [create_at("a/b", Some(listed))];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let landed = run_chunk(&borrowed, &hold, &[listed], &chunk, &mut plan, None);
+		assert_eq!(landed.composed, [NewDirParent::Existing(listed)]);
+	}
+
+	#[test]
+	fn a_create_with_no_parent_fails_alone_and_takes_its_children() {
+		let chunk = [
+			create_at("s", None),
+			create_at("x/y", None),
+			create_at("x/y/z", None),
+		];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let landed = run_chunk(&borrowed, &hold, &[], &chunk, &mut plan, None);
+		assert_eq!(landed.composed, [NewDirParent::Existing(ROOT)]);
+		assert_eq!(landed.settled, 2);
+		let failed: Vec<(&str, &str)> = landed
+			.report
+			.failed_paths
+			.iter()
+			.map(|(path, error)| (path.as_str(), error.as_str()))
+			.collect();
+		let error = internal("remote parent dir not yet created").to_string();
+		assert_eq!(failed, [("x/y", error.as_str()), ("x/y/z", error.as_str())]);
+		assert_eq!(failures(&landed.events), 2);
+	}
+
+	#[test]
+	fn a_failed_lookup_fails_every_create_under_its_directory_before_anything_is_sent() {
+		let listed = Uuid::from_u128(1);
+		let chunk = [
+			create_at("p/a", Some(listed)),
+			create_at("p/a/b", None),
+			create_at("p/c", Some(listed)),
+			create_at("d", None),
+		];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
+		let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
+		assert_eq!(landed.composed, [NewDirParent::Existing(ROOT)]);
+		assert_eq!(landed.settled, 3);
+		let failed: Vec<(&str, &str)> = landed
+			.report
+			.failed_paths
+			.iter()
+			.map(|(path, error)| (path.as_str(), error.as_str()))
+			.collect();
+		let error = internal("lookup refused").to_string();
+		assert_eq!(
+			failed,
+			[
+				("p/a", error.as_str()),
+				("p/a/b", error.as_str()),
+				("p/c", error.as_str())
+			]
+		);
+		assert_eq!(failures(&landed.events), 3);
+	}
+
+	#[test]
+	fn a_create_after_one_whose_lookup_failed_names_its_parent_by_its_new_place() {
+		let listed = Uuid::from_u128(1);
+		let chunk = [
+			create_at("p/a", Some(listed)),
+			create_at("d", None),
+			create_at("d/e", None),
+		];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let looked_up = HashMap::from([(listed, Err(Arc::new(internal("lookup refused"))))]);
+		let landed = run_chunk_looked_up(&borrowed, &hold, &[], &chunk, &mut plan, None, looked_up);
+		assert_eq!(
+			landed.composed,
+			[NewDirParent::Existing(ROOT), NewDirParent::Earlier(0)]
+		);
+		assert_eq!(landed.settled, 1);
+	}
+
+	#[test]
+	fn a_run_stops_at_another_kind_and_at_its_limit() {
+		let borrowed = Borrowed::new();
+		let ctx = borrowed.ctx(ROOT, None);
+		let hold = UndrivenHold::new();
+		// The first of a run is taken on its own, as the apply's loop takes it.
+		let runs = |plan: &mut PagedPlan, max: usize| -> Vec<Vec<String>> {
+			hold.runtime.block_on(async {
+				let mut runs = Vec::new();
+				while let Some(first) = plan.next_in(&ctx, Run::Before).await.unwrap() {
+					let more = plan
+						.take_run(&ctx, Run::Before, max, is_remote_dir_create)
+						.await
+						.unwrap();
+					runs.push(
+						std::iter::once(first)
+							.chain(more)
+							.map(|staged| staged.entry.action.rel_path().to_string())
+							.collect(),
+					);
+				}
+				runs
+			})
+		};
+
+		let (_dir, mut plan) = staged_creates(&[
+			create_at("a", None),
+			create_at("b", None),
+			PlannedEntry::bare(SyncAction::CreateLocalDir {
+				rel_path: "c".to_string(),
+			}),
+			create_at("d", None),
+		]);
+		assert_eq!(
+			runs(&mut plan, SYNC_BULK_CHUNK - 1),
+			[vec!["a", "b"], vec!["c", "d"]]
+		);
+
+		let many: Vec<PlannedEntry> = (0..120)
+			.map(|n| create_at(&format!("d{n:03}"), None))
+			.collect();
+		let (_dir, mut plan) = staged_creates(&many);
+		let lengths: Vec<usize> = runs(&mut plan, SYNC_BULK_CHUNK - 1)
+			.iter()
+			.map(Vec::len)
+			.collect();
+		assert_eq!(lengths, [50, 50, 20]);
+
+		// A hold with room for ten writes, the first of the run already counted against it.
+		let budget = LockBudget {
+			batch: 10,
+			..LockBudget::default()
+		};
+		let lease = Lease::Held {
+			lock: Arc::clone(&hold.lock),
+			since: Instant::now(),
+			writes: 1,
+		};
+		let (_dir, mut plan) = staged_creates(&many);
+		let room = chunk_room(&lease, &budget);
+		let lengths: Vec<usize> = runs(&mut plan, room).iter().map(Vec::len).collect();
+		assert_eq!(lengths, [10; 12]);
+		assert_eq!(Lease::Unheld.room(&budget), 0);
+	}
+
+	#[test]
+	fn an_answered_uuid_is_what_the_baseline_the_journal_and_the_stage_record() {
+		let (merged, replaced) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let mut create = create_at("a", None);
+		create.start = PassStart::CreateRemoteDir {
+			local: None,
+			remote: Some(Box::new(RemoteNode {
+				remote_uuid: replaced,
+				..remote_node("a", None)
+			})),
+			parent_uuid: None,
+		};
+		let chunk = [create];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![created_dir(merged, true)]),
+		);
+		assert_eq!(landed.settled, 1);
+		assert_eq!(landed.report.remote_dirs_created, 1);
+		let store = locked(&borrowed.store);
+		let rows: Vec<(String, Option<Uuid>)> = store
+			.entries(1)
+			.unwrap()
+			.into_iter()
+			.map(|row| (row.rel_path, row.remote_uuid))
+			.collect();
+		assert_eq!(rows, [("a".to_string(), Some(merged))]);
+		let journal: Vec<(Uuid, PendingKind)> = store
+			.load_pending(0, 0)
+			.unwrap()
+			.into_iter()
+			.map(|row| (row.uuid, row.kind))
+			.collect();
+		assert_eq!(
+			journal,
+			[(
+				merged,
+				PendingKind::Created {
+					path: "a".to_string(),
+					replaced: Some(replaced),
+				}
+			)]
+		);
+		assert_eq!(plan.pager.created_at("a").unwrap(), Some(merged));
+	}
+
+	#[test]
+	fn a_failed_create_records_nothing() {
+		let chunk = [create_at("a", None), create_at("a/b", None)];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![
+				Err(internal("refused")),
+				Err(CreateDirsError::ParentNotCreated { item: 1, parent: 0 }.into()),
+			]),
+		);
+		assert_eq!(landed.settled, 2);
+		assert!(locked(&borrowed.store).entries(1).unwrap().is_empty());
+		let failed: Vec<&str> = landed
+			.report
+			.failed_paths
+			.iter()
+			.map(|(path, _)| path.as_str())
+			.collect();
+		assert_eq!(failed, ["a", "a/b"]);
+		assert_eq!(failures(&landed.events), 2);
+		assert_eq!(landed.report.remote_dirs_created, 0);
+		assert_eq!(plan.pager.created_at("a").unwrap(), None);
+	}
+
+	#[test]
+	fn a_whole_request_failure_fails_each_item_once() {
+		let chunk = [
+			create_at("a", None),
+			create_at("a/b", None),
+			create_at("c", None),
+		];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(all_failed(internal("lock refused"), chunk.len())),
+		);
+		assert_eq!(landed.settled, 3);
+		let failed: Vec<(&str, &str)> = landed
+			.report
+			.failed_paths
+			.iter()
+			.map(|(path, error)| (path.as_str(), error.as_str()))
+			.collect();
+		let error = internal("lock refused").to_string();
+		assert_eq!(
+			failed,
+			[
+				("a", error.as_str()),
+				("a/b", error.as_str()),
+				("c", error.as_str())
+			]
+		);
+		assert_eq!(failures(&landed.events), 3);
+		assert!(locked(&borrowed.store).entries(1).unwrap().is_empty());
+	}
+
+	#[test]
+	fn a_fresh_directory_inherits_its_parents_targets() {
+		let (fresh, nested) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let chunk = [create_at("a", None), create_at("a/b", None)];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![created_dir(fresh, false), created_dir(nested, false)]),
+		);
+		assert_eq!(landed.report.remote_dirs_created, 2);
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, fresh)
+				.is_some()
+		);
+		// Only what `fresh` inherited answers the lookup of its own directory.
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, nested)
+				.is_some()
+		);
+	}
+
+	/// A merged directory is added to the links and shares of its parent it is missing from, which
+	/// changes those of its subtree: what the hold kept is forgotten, and the merged directory
+	/// inherits nothing.
+	#[test]
+	fn a_merged_directory_inherits_nothing_and_forgets_what_the_hold_kept() {
+		let merged = Uuid::from_u128(3);
+		let chunk = [create_at("c", None)];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![created_dir(merged, true)]),
+		);
+		assert_eq!(landed.report.remote_dirs_created, 1);
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, merged)
+				.is_none()
+		);
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, ROOT)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn a_directory_its_parents_targets_did_not_all_take_inherits_none_of_them() {
+		let (listed, fresh) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let chunk = [create_at("p/a", Some(listed))];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		let (borrowed, hold) = (borrowed_with_pair(), UndrivenHold::new());
+		// A 512-bit key is too small for the share's OAEP padding, so sharing the new directory with
+		// this user fails before any request is made.
+		borrowed
+			.client
+			.keep_held_targets(&hold.lock, listed, ConnectedTargets::with_test_users(1));
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![created_dir(fresh, false)]),
+		);
+		assert_eq!(landed.report.remote_dirs_created, 1);
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, fresh)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn a_record_that_cannot_be_written_stops_the_chunk_but_not_its_propagation() {
+		let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+		let chunk = [create_at("a", None), create_at("b", None)];
+		let (_dir, mut plan) = staged_creates(&chunk);
+		// No pair in the store, so no row of it can be written.
+		let (borrowed, hold) = (Borrowed::new(), UndrivenHold::new());
+		let landed = run_chunk(
+			&borrowed,
+			&hold,
+			&[],
+			&chunk,
+			&mut plan,
+			Some(vec![created_dir(first, false), created_dir(second, false)]),
+		);
+		assert_eq!(landed.settled, 1);
+		assert_eq!(
+			landed.report.store_failed,
+			Some(StoreFailure::RecordNotWritten)
+		);
+		assert_eq!(landed.report.remote_dirs_created, 0);
+		assert!(
+			borrowed
+				.client
+				.kept_held_targets(&hold.lock, second)
+				.is_some()
+		);
 	}
 }

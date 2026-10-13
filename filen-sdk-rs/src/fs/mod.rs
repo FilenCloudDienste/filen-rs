@@ -1,7 +1,7 @@
 #[cfg(feature = "archive")]
 pub mod archive;
-// Unused for now outside its tests: the sync engine, which will send its directory creates and
-// trashes through it, is not built on this branch.
+// The sync engine sends its directory creates through it. Without that feature it is unused
+// outside its tests, and its trash is unused until the engine sends its trashes through it too.
 #[allow(dead_code)]
 pub(crate) mod bulk;
 pub mod cache;

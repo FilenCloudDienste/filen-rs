@@ -1,8 +1,6 @@
 use chrono::Utc;
 use filen_macros::shared_test_runtime;
-use filen_sdk_rs::fs::{
-	CreatedDir, HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory,
-};
+use filen_sdk_rs::fs::{HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory};
 use filen_types::{
 	api::v3::{bulk::FileOrDir, dir},
 	fs::{ParentUuid, Uuid},
@@ -74,13 +72,7 @@ async fn create_dirs_merges_an_existing_dir_and_creates_its_children_in_it() {
 		.collect::<Vec<_>>()
 		.try_into()
 		.unwrap();
-	assert_eq!(
-		x,
-		CreatedDir {
-			uuid: existing.uuid(),
-			merged: true,
-		}
-	);
+	assert_eq!((x.uuid, x.merged), (existing.uuid(), true));
 	assert!(!y.merged, "{y:?}");
 
 	let found = client.get_dir(y.uuid).await.unwrap();

@@ -42,6 +42,8 @@ pub struct CreatedDir {
 	/// Whether a directory with the same name already existed in the parent: the server created
 	/// nothing and answered that directory's uuid, which differs from the one requested.
 	pub merged: bool,
+	/// The directory's timestamp, as the server answered it.
+	pub timestamp: DateTime<Utc>,
 }
 
 /// Why [`Client::create_dirs`] did not create a directory, by the indexes of the list it was given.
@@ -278,5 +280,6 @@ fn created(request: &NewDirRequest, response: &Response) -> CreatedDir {
 	CreatedDir {
 		uuid: response.uuid,
 		merged: response.uuid != request.uuid,
+		timestamp: response.timestamp,
 	}
 }

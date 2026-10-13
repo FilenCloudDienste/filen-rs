@@ -385,8 +385,13 @@ pub(crate) struct ConnectedTargets {
 /// While this client holds the drive lock no other device changes which links and shares a
 /// directory belongs to, so a lookup stays true until the hold ends, its lease is lost or goes
 /// unconfirmed ([`ResourceLock::is_valid`]), or this client changes them itself
-/// ([`Client::connected_targets_change`]). A new hold, a retaken lock included, starts empty. Nothing is answered or kept while such a change
-/// runs: the hold is shared in-process, so an upload can finalize in the middle of one.
+/// ([`Client::connected_targets_change`]). A new hold, a retaken lock included, starts empty.
+/// Nothing is answered or kept while such a change runs: the hold is shared in-process, so an
+/// upload can finalize in the middle of one.
+///
+/// Nothing kept for a hold is answered once it ends. The entries themselves go at the first lookup
+/// of the next hold, or, after a sync pass, as soon as the pass lets go of a hold nothing else in
+/// the process shares ([`Client::forget_ended_hold_targets`]).
 ///
 /// One change escapes the lock: a recipient leaving one of this account's shares
 /// ([`Client::remove_shared_item`] on their side) changes the sharer's shares without it. Until the
@@ -400,13 +405,31 @@ pub(crate) struct HeldTargets {
 	generation: u64,
 	// The [`TargetsChange`] guards alive now.
 	changing: usize,
-	dirs: HashMap<Uuid, ConnectedTargets>,
+	// Shared, so every directory created under one parent keeps its parent's allocation.
+	dirs: HashMap<Uuid, Arc<ConnectedTargets>>,
+}
+
+/// A directory's [`ConnectedTargets`] as [`Client::held_connected_targets`] answered them, with what
+/// [`Client::inherit_connected_targets`] needs to keep them for a new directory inside it.
+pub(crate) struct HeldLookup {
+	pub(crate) targets: Arc<ConnectedTargets>,
+	/// The [`HeldTargets::generation`] the lookup began in.
+	// Read only by `inherit_connected_targets`, which only the sync engine calls; gating the field
+	// as well would split every construction of the lookup by feature.
+	#[cfg_attr(
+		not(all(
+			feature = "sync-engine",
+			not(all(target_family = "wasm", target_os = "unknown"))
+		)),
+		allow(dead_code)
+	)]
+	generation: u64,
 }
 
 impl HeldTargets {
 	/// The targets of `dir` kept during `hold`, or the generation a lookup begun now must hand
 	/// to [`keep`](Self::keep).
-	fn cached(&mut self, hold: &Arc<ResourceLock>, dir: Uuid) -> Result<ConnectedTargets, u64> {
+	fn cached(&mut self, hold: &Arc<ResourceLock>, dir: Uuid) -> Result<HeldLookup, u64> {
 		if !std::ptr::eq(self.hold.as_ptr(), Arc::as_ptr(hold)) {
 			self.hold = Arc::downgrade(hold);
 			self.forget();
@@ -420,7 +443,13 @@ impl HeldTargets {
 		if self.changing > 0 {
 			return Err(self.generation);
 		}
-		self.dirs.get(&dir).cloned().ok_or(self.generation)
+		match self.dirs.get(&dir) {
+			Some(targets) => Ok(HeldLookup {
+				targets: Arc::clone(targets),
+				generation: self.generation,
+			}),
+			None => Err(self.generation),
+		}
 	}
 
 	/// Stores `targets` for `dir`, unless the hold changed or was lost, a change is running, or the
@@ -429,7 +458,7 @@ impl HeldTargets {
 		&mut self,
 		hold: &Arc<ResourceLock>,
 		dir: Uuid,
-		targets: ConnectedTargets,
+		targets: Arc<ConnectedTargets>,
 		generation: u64,
 	) {
 		if std::ptr::eq(self.hold.as_ptr(), Arc::as_ptr(hold))
@@ -694,24 +723,56 @@ impl Client {
 			.unwrap_or_else(PoisonError::into_inner)
 	}
 
+	/// Forgets what was kept for a hold of the drive lock that has ended: one that nothing in the
+	/// process holds any more. A hold still shared with another holder keeps its entries.
+	#[cfg(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	))]
+	pub(crate) fn forget_ended_hold_targets(&self) {
+		let mut held = self.lock_held_targets();
+		if held.hold.strong_count() == 0 {
+			held.forget();
+		}
+	}
+
 	/// [`fetch_connected_targets`](Self::fetch_connected_targets), answered from what was looked
 	/// up earlier in `hold` when it can be. A failed lookup is not kept.
 	pub(crate) async fn held_connected_targets(
 		&self,
 		hold: &Arc<ResourceLock>,
 		dir: Uuid,
-	) -> Result<ConnectedTargets, Error> {
+	) -> Result<HeldLookup, Error> {
 		// A statement of its own, so the guard drops before the await below.
 		let cached = self.lock_held_targets().cached(hold, dir);
 		let generation = match cached {
-			Ok(targets) => return Ok(targets),
+			Ok(lookup) => return Ok(lookup),
 			Err(generation) => generation,
 		};
-		let targets = self.fetch_connected_targets(dir).await?;
-		// Cloned: the cache keeps one copy and the caller propagates to the other.
+		let targets = Arc::new(self.fetch_connected_targets(dir).await?);
 		self.lock_held_targets()
-			.keep(hold, dir, targets.clone(), generation);
-		Ok(targets)
+			.keep(hold, dir, Arc::clone(&targets), generation);
+		Ok(HeldLookup {
+			targets,
+			generation,
+		})
+	}
+
+	/// Keeps the targets `lookup` answered for the directory `dir` created inside the directory it
+	/// looked up, which a new directory belongs to as soon as it has been added to them, for the
+	/// rest of `hold`. Nothing is kept when the entries were forgotten since `lookup` began.
+	#[cfg(all(
+		feature = "sync-engine",
+		not(all(target_family = "wasm", target_os = "unknown"))
+	))]
+	pub(crate) fn inherit_connected_targets(
+		&self,
+		hold: &Arc<ResourceLock>,
+		dir: Uuid,
+		lookup: &HeldLookup,
+	) {
+		self.lock_held_targets()
+			.keep(hold, dir, Arc::clone(&lookup.targets), lookup.generation);
 	}
 
 	/// Marks a change to which links and shares some directories belong to: until the returned
@@ -770,9 +831,10 @@ impl Client {
 		let mut retaken = None;
 		let errors = loop {
 			let held = retaken.as_ref().unwrap_or(lock);
-			let mut targets = self.held_connected_targets(held, uuid).await?;
+			let mut targets = self.held_connected_targets(held, uuid).await?.targets;
 			if matches!(which, ParentTargets::Missing) && !targets.is_empty() {
-				targets = targets.without(&self.fetch_connected_targets(item.uuid()).await?);
+				targets =
+					Arc::new(targets.without(&self.fetch_connected_targets(item.uuid()).await?));
 			}
 			// Without a link or share there is nothing to add the item (or a directory's
 			// subtree) to, so skip the recursive listing entirely.
@@ -1427,6 +1489,50 @@ pub struct DirPublicInfo {
 
 impl<T> PublicLinkSharedClientExt for T where T: SharedClient {}
 
+/// What a hold of the drive lock has kept, set and read by the sync engine's tests, which never
+/// reach a server.
+#[cfg(all(
+	test,
+	feature = "sync-engine",
+	not(all(target_family = "wasm", target_os = "unknown"))
+))]
+pub(crate) mod test_support {
+	use std::sync::Arc;
+
+	use filen_types::fs::Uuid;
+
+	use super::ConnectedTargets;
+	use crate::{auth::Client, sync::lock::ResourceLock};
+
+	impl Client {
+		/// Keeps `targets` for `dir` in `hold`, as a lookup that answered them would.
+		pub(crate) fn keep_held_targets(
+			&self,
+			hold: &Arc<ResourceLock>,
+			dir: Uuid,
+			targets: ConnectedTargets,
+		) {
+			let mut held = self.lock_held_targets();
+			// Switches the entries to `hold` first, as a lookup does.
+			let _ = held.cached(hold, dir);
+			let generation = held.generation;
+			held.keep(hold, dir, Arc::new(targets), generation);
+		}
+
+		/// The targets kept for `dir` in `hold`, if any.
+		pub(crate) fn kept_held_targets(
+			&self,
+			hold: &Arc<ResourceLock>,
+			dir: Uuid,
+		) -> Option<Arc<ConnectedTargets>> {
+			self.lock_held_targets()
+				.cached(hold, dir)
+				.ok()
+				.map(|lookup| lookup.targets)
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::borrow::Cow;
@@ -1595,26 +1701,17 @@ mod tests {
 		use std::sync::Arc;
 
 		use filen_types::fs::Uuid;
-		use tokio::runtime::{Builder, Handle, Runtime};
 
 		use super::super::{ConnectedTargets, HeldTargets};
 		use crate::{
 			auth::test_support::offline_client,
 			sync::lock::{
 				ResourceLock,
-				test_support::{lose, test_lock},
+				test_support::{held_lock, lose, undriven_runtime},
 			},
 		};
 
 		const DIR: Uuid = Uuid::from_u128(1);
-
-		fn undriven_runtime() -> Runtime {
-			Builder::new_current_thread().enable_all().build().unwrap()
-		}
-
-		fn held_lock(rt: &Runtime) -> Arc<ResourceLock> {
-			rt.block_on(async { Arc::new(test_lock(Handle::try_current().ok())) })
-		}
 
 		/// The generation a lookup that missed must keep its answer under.
 		fn miss(held: &mut HeldTargets, hold: &Arc<ResourceLock>) -> u64 {
@@ -1626,7 +1723,7 @@ mod tests {
 		fn users_kept(held: &mut HeldTargets, hold: &Arc<ResourceLock>) -> Option<usize> {
 			held.cached(hold, DIR)
 				.ok()
-				.map(|targets| targets.users.len())
+				.map(|lookup| lookup.targets.users.len())
 		}
 
 		#[test]
@@ -1635,7 +1732,12 @@ mod tests {
 			let lock = held_lock(&rt);
 			let mut held = HeldTargets::default();
 			let generation = miss(&mut held, &lock);
-			held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), generation);
+			held.keep(
+				&lock,
+				DIR,
+				Arc::new(ConnectedTargets::with_test_users(2)),
+				generation,
+			);
 			assert_eq!(users_kept(&mut held, &lock), Some(2));
 		}
 
@@ -1649,7 +1751,7 @@ mod tests {
 			held.keep(
 				&first,
 				DIR,
-				ConnectedTargets::with_test_users(2),
+				Arc::new(ConnectedTargets::with_test_users(2)),
 				generation,
 			);
 			assert_eq!(users_kept(&mut held, &second), None);
@@ -1663,13 +1765,23 @@ mod tests {
 			let lock = held_lock(&rt);
 			let mut held = HeldTargets::default();
 			let generation = miss(&mut held, &lock);
-			held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), generation);
+			held.keep(
+				&lock,
+				DIR,
+				Arc::new(ConnectedTargets::with_test_users(2)),
+				generation,
+			);
 			lose(&lock);
 			// Another device may hold the drive now: what was kept is not answered...
 			assert_eq!(users_kept(&mut held, &lock), None);
 			// ...and a lookup that began before the loss keeps nothing.
 			held.dirs.clear();
-			held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), generation);
+			held.keep(
+				&lock,
+				DIR,
+				Arc::new(ConnectedTargets::with_test_users(2)),
+				generation,
+			);
 			assert!(held.dirs.is_empty());
 		}
 
@@ -1680,7 +1792,12 @@ mod tests {
 			let mut held = HeldTargets::default();
 			let generation = miss(&mut held, &lock);
 			held.forget();
-			held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), generation);
+			held.keep(
+				&lock,
+				DIR,
+				Arc::new(ConnectedTargets::with_test_users(2)),
+				generation,
+			);
 			assert_eq!(users_kept(&mut held, &lock), None);
 		}
 
@@ -1692,7 +1809,12 @@ mod tests {
 			{
 				let mut held = client.lock_held_targets();
 				let generation = miss(&mut held, &lock);
-				held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), generation);
+				held.keep(
+					&lock,
+					DIR,
+					Arc::new(ConnectedTargets::with_test_users(2)),
+					generation,
+				);
 				assert_eq!(users_kept(&mut held, &lock), Some(2));
 			}
 			std::mem::drop(client.connected_targets_change());
@@ -1710,18 +1832,78 @@ mod tests {
 			let during = miss(&mut client.lock_held_targets(), &lock);
 			{
 				let mut held = client.lock_held_targets();
-				held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), before);
-				held.keep(&lock, DIR, ConnectedTargets::with_test_users(2), during);
+				held.keep(
+					&lock,
+					DIR,
+					Arc::new(ConnectedTargets::with_test_users(2)),
+					before,
+				);
+				held.keep(
+					&lock,
+					DIR,
+					Arc::new(ConnectedTargets::with_test_users(2)),
+					during,
+				);
 				assert!(
 					held.dirs.is_empty(),
 					"nothing is kept while the change runs"
 				);
 				// An entry already there is not answered either.
-				held.dirs.insert(DIR, ConnectedTargets::with_test_users(2));
+				held.dirs
+					.insert(DIR, Arc::new(ConnectedTargets::with_test_users(2)));
 				assert_eq!(users_kept(&mut held, &lock), None);
 			}
 			std::mem::drop(change);
 			assert_eq!(users_kept(&mut client.lock_held_targets(), &lock), None);
+		}
+
+		#[cfg(feature = "sync-engine")]
+		#[test]
+		fn an_ended_hold_forgets_what_it_kept_and_a_shared_one_does_not() {
+			let rt = undriven_runtime();
+			let lock = held_lock(&rt);
+			let client = offline_client();
+			client.keep_held_targets(&lock, DIR, ConnectedTargets::with_test_users(2));
+			// `lock` still holds it.
+			client.forget_ended_hold_targets();
+			assert!(client.kept_held_targets(&lock, DIR).is_some());
+			std::mem::drop(lock);
+			client.forget_ended_hold_targets();
+			assert!(client.lock_held_targets().dirs.is_empty());
+		}
+
+		#[cfg(feature = "sync-engine")]
+		#[test]
+		fn a_directory_inherits_what_a_kept_lookup_of_its_parent_answered() {
+			const CHILD: Uuid = Uuid::from_u128(2);
+			let rt = undriven_runtime();
+			let lock = held_lock(&rt);
+			let client = offline_client();
+			client.keep_held_targets(&lock, DIR, ConnectedTargets::with_test_users(2));
+			let lookup = client
+				.lock_held_targets()
+				.cached(&lock, DIR)
+				.expect("DIR's targets are kept");
+			client.inherit_connected_targets(&lock, CHILD, &lookup);
+			let child = client.kept_held_targets(&lock, CHILD);
+			assert_eq!(child.map(|targets| targets.users.len()), Some(2));
+		}
+
+		#[cfg(feature = "sync-engine")]
+		#[test]
+		fn a_directory_inherits_nothing_from_a_lookup_begun_before_a_change() {
+			const CHILD: Uuid = Uuid::from_u128(2);
+			let rt = undriven_runtime();
+			let lock = held_lock(&rt);
+			let client = offline_client();
+			client.keep_held_targets(&lock, DIR, ConnectedTargets::with_test_users(2));
+			let lookup = client
+				.lock_held_targets()
+				.cached(&lock, DIR)
+				.expect("DIR's targets are kept");
+			std::mem::drop(client.connected_targets_change());
+			client.inherit_connected_targets(&lock, CHILD, &lookup);
+			assert!(client.kept_held_targets(&lock, CHILD).is_none());
 		}
 	}
 }

@@ -861,6 +861,7 @@ pub(crate) mod test_support {
 	};
 
 	use filen_types::{auth::APIKey, fs::Uuid};
+	use tokio::runtime::{Builder, Handle, Runtime};
 
 	use super::{Confirmed, ResourceLock, SharedLease};
 	use crate::auth::{http::AuthClient, unauth::test_support::offline_unauthed};
@@ -888,6 +889,17 @@ pub(crate) mod test_support {
 				handle,
 			}),
 		}
+	}
+
+	/// A runtime only the test drives: a lock made in it ([`held_lock`]) queues its release there
+	/// when it drops, and the release is never sent unless the test drives it.
+	pub(crate) fn undriven_runtime() -> Runtime {
+		Builder::new_current_thread().enable_all().build().unwrap()
+	}
+
+	/// A valid lock whose release, when dropped, goes to `rt`.
+	pub(crate) fn held_lock(rt: &Runtime) -> Arc<ResourceLock> {
+		rt.block_on(async { Arc::new(test_lock(Handle::try_current().ok())) })
 	}
 
 	/// Marks `lock` lost, as its keep-alive does when the server refuses the lease, without the
