@@ -77,6 +77,22 @@ pub enum PlannedActionKind {
 	AdoptBaseline,
 }
 
+impl PlannedActionKind {
+	/// Whether the action deletes an item: what the mass-delete guard counts.
+	pub(crate) fn is_deletion(&self) -> bool {
+		match self {
+			Self::TrashRemote | Self::DeleteLocal => true,
+			Self::UploadFile
+			| Self::DownloadFile
+			| Self::CreateRemoteDir
+			| Self::CreateLocalDir
+			| Self::MoveRemote { .. }
+			| Self::MoveLocal { .. }
+			| Self::AdoptBaseline => false,
+		}
+	}
+}
+
 /// One action a pass would apply (or a held one it would not), in apply order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[js_type(export, no_deser, no_default)]

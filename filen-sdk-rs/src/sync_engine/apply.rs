@@ -36,8 +36,7 @@ use super::{
 	guard::GuardReason,
 	ignore::IgnoredPath,
 	outcome::{
-		HaltReason, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,
-		RefuseReason, UnsyncablePath,
+		HaltReason, PlannedAction, PlannedConflict, PlannedNodeKind, RefuseReason, UnsyncablePath,
 	},
 	pause::PassGate,
 	plan::{RemoteNode, SyncAction, is_under},
@@ -200,16 +199,7 @@ impl SyncReport {
 	pub fn held_deletions(&self) -> usize {
 		self.held
 			.iter()
-			.filter(|action| match action.kind {
-				PlannedActionKind::TrashRemote | PlannedActionKind::DeleteLocal => true,
-				PlannedActionKind::UploadFile
-				| PlannedActionKind::DownloadFile
-				| PlannedActionKind::CreateRemoteDir
-				| PlannedActionKind::CreateLocalDir
-				| PlannedActionKind::MoveRemote { .. }
-				| PlannedActionKind::MoveLocal { .. }
-				| PlannedActionKind::AdoptBaseline => false,
-			})
+			.filter(|action| action.kind.is_deletion())
 			.count()
 	}
 
