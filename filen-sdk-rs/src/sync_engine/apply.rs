@@ -218,6 +218,28 @@ impl SyncReport {
 	pub fn conflict_paths(&self) -> impl Iterator<Item = &str> {
 		self.conflicts.iter().map(|c| c.rel_path.as_str())
 	}
+
+	/// Why this pass FAILED as a whole, or `None` when it did not: the line a watch loop publishes
+	/// as the pair's error and backs off on.
+	///
+	/// A pass that could not take the drive lock outranks the rest, since it applied nothing: its
+	/// line is the entry in [`errors`](Self::errors) naming the lock's own answer. Then a side that
+	/// ran out of room ([`halted`](Self::halted)), then a record of work done that could not be
+	/// written or a staged plan that could not be read. Per-path failures alone do not fail a pass;
+	/// they stay in `errors`.
+	pub fn pass_error(&self) -> Option<String> {
+		if self.lock_failed {
+			return Some(
+				self.errors
+					.iter()
+					.find(|error| error.starts_with(LOCK_FAILURE))
+					.map_or_else(|| LOCK_FAILURE.to_string(), String::clone),
+			);
+		}
+		self.halted
+			.map(HaltReason::held_line)
+			.or_else(|| self.store_failed.map(|failure| failure.line().into()))
+	}
 }
 
 /// Everything the apply pass needs besides its actions and what each of them reads (see
@@ -3269,7 +3291,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		alloc_meter,
+		ErrorKind, alloc_meter,
 		auth::test_support::offline_client,
 		cache::{CacheState, hydrate_by_uuids},
 		sync_engine::{
@@ -5146,5 +5168,91 @@ mod tests {
 			"{:?}",
 			report.errors.last()
 		);
+	}
+
+	/// A pass that could not take the drive lock fails with the lock's own answer, found among
+	/// the per-path failures it carries alongside.
+	#[test]
+	fn a_pass_that_could_not_take_the_drive_lock_fails_with_the_locks_answer() {
+		let mut report = SyncReport {
+			errors: vec!["docs/a.txt: upload failed".to_string()],
+			..SyncReport::default()
+		};
+		let cause = crate::Error::custom(ErrorKind::RetryFailed, "held by another device");
+		note_lock_failure(&mut report, 2, &cause, &mut |_| {});
+		assert_eq!(
+			report.pass_error(),
+			Some(format!("failed to acquire the drive lock: {cause}"))
+		);
+	}
+
+	/// A lock failure whose line is missing from `errors` still fails the pass, with the bare
+	/// lock line.
+	#[test]
+	fn a_lock_failure_without_its_line_fails_with_the_bare_lock_line() {
+		let report = SyncReport {
+			lock_failed: true,
+			..SyncReport::default()
+		};
+		assert_eq!(
+			report.pass_error().as_deref(),
+			Some("failed to acquire the drive lock")
+		);
+	}
+
+	/// A pass that found a side full fails with the line saying which transfers it held back.
+	#[test]
+	fn a_halted_pass_fails_with_what_it_held_back() {
+		let report = SyncReport {
+			halted: Some(HaltReason::LocalStorageFull),
+			..SyncReport::default()
+		};
+		assert_eq!(
+			report.pass_error().as_deref(),
+			Some("the local disk is full: no further downloads were started this pass")
+		);
+	}
+
+	/// A pass that lost a record of work done fails with the store's line.
+	#[test]
+	fn a_pass_whose_record_did_not_land_fails_with_the_store_line() {
+		let report = SyncReport {
+			store_failed: Some(StoreFailure::RecordNotWritten),
+			..SyncReport::default()
+		};
+		assert_eq!(
+			report.pass_error().as_deref(),
+			Some("a record of work already done could not be written")
+		);
+	}
+
+	/// A lock failure outranks a full side, and a full side outranks a lost record.
+	#[test]
+	fn a_lock_failure_outranks_a_halt_and_a_halt_outranks_a_store_failure() {
+		let mut report = SyncReport {
+			lock_failed: true,
+			halted: Some(HaltReason::RemoteStorageFull),
+			store_failed: Some(StoreFailure::UnreadPlan),
+			..SyncReport::default()
+		};
+		assert_eq!(
+			report.pass_error().as_deref(),
+			Some("failed to acquire the drive lock")
+		);
+		report.lock_failed = false;
+		assert_eq!(
+			report.pass_error().as_deref(),
+			Some("the account's storage is full: no further uploads were started this pass")
+		);
+	}
+
+	/// Per-path failures alone do not fail a pass.
+	#[test]
+	fn a_pass_with_only_per_path_failures_has_no_pass_error() {
+		let report = SyncReport {
+			errors: vec!["docs/a.txt: upload failed".to_string()],
+			..SyncReport::default()
+		};
+		assert_eq!(report.pass_error(), None);
 	}
 }

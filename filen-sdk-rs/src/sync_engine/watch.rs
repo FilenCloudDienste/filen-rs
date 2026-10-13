@@ -45,7 +45,6 @@ use tracing::Instrument;
 
 use super::{
 	SyncEvent, SyncObserver, SyncReport,
-	apply::LOCK_FAILURE,
 	baseline::PairId,
 	changes::{FullPassReason, PairChanges},
 	engine::SyncEngine,
@@ -710,7 +709,7 @@ async fn run_pass(
 			if !report.errors.is_empty() {
 				tracing::warn!("sync pair {pair}: {} action error(s)", report.errors.len());
 			}
-			pass_outcome(report)
+			pass_outcome(&report)
 		}
 		Err(e) => {
 			tracing::warn!("sync pair {pair} failed: {e}");
@@ -788,33 +787,14 @@ fn net_interval(floor: Duration, cost: Duration) -> Duration {
 /// (`store_failed`): the act that write was recording stands, and the next pass would run straight
 /// into the same wedged store, or stage its plan beside it on the same disk. Each publishes a line
 /// of its own ([`StoreFailure::line`](super::apply::StoreFailure::line)).
-fn pass_outcome(report: SyncReport) -> PassEnd {
-	let read_whole = read_both_sides_whole(&report);
-	let read_cost = report.read_cost;
-	if !report.lock_failed {
-		let error = report
-			.halted
-			.map(|reason| reason.held_line())
-			.or_else(|| report.store_failed.map(|failure| failure.line().into()));
-		return PassEnd {
-			error,
-			owed: owes_a_pass(&report),
-			read_whole,
-			read_cost,
-		};
-	}
-	let error = report
-		.errors
-		.into_iter()
-		.find(|error| error.starts_with(LOCK_FAILURE))
-		.unwrap_or_else(|| LOCK_FAILURE.to_string());
-	// A pass that could not take the drive lock still READ both sides: the lock is only asked for
-	// once there is a plan to apply.
+fn pass_outcome(report: &SyncReport) -> PassEnd {
 	PassEnd {
-		error: Some(error),
-		owed: false,
-		read_whole,
-		read_cost,
+		error: report.pass_error(),
+		owed: !report.lock_failed && owes_a_pass(report),
+		// A pass that could not take the drive lock still READ both sides: the lock is only asked
+		// for once there is a plan to apply.
+		read_whole: read_both_sides_whole(report),
+		read_cost: report.read_cost,
 	}
 }
 
@@ -1597,7 +1577,7 @@ mod tests {
 		};
 		let cause = Error::custom(ErrorKind::RetryFailed, "held by another device");
 		note_lock_failure(&mut report, 3, &cause, &mut |_| {});
-		let end = pass_outcome(report);
+		let end = pass_outcome(&report);
 		assert_eq!(
 			end.error,
 			Some(format!("{LOCK_FAILURE}: {cause}")),
@@ -1624,7 +1604,7 @@ mod tests {
 			store_failed: Some(StoreFailure::RecordNotWritten),
 			..SyncReport::default()
 		};
-		let end = pass_outcome(report);
+		let end = pass_outcome(&report);
 		assert_eq!(
 			end.error.as_deref(),
 			Some(STORE_FAILURE),
@@ -1645,7 +1625,7 @@ mod tests {
 			store_failed: Some(StoreFailure::UnreadPlan),
 			..SyncReport::default()
 		};
-		let end = pass_outcome(report);
+		let end = pass_outcome(&report);
 		assert_eq!(end.error.as_deref(), Some(UNREAD_PLAN));
 		assert!(
 			!end.owed,
@@ -1694,7 +1674,7 @@ mod tests {
 	/// the backstop stays at the floor instead of being pushed out towards the ceiling.
 	#[test]
 	fn the_net_scales_by_the_read_not_by_the_whole_pass() {
-		let after_a_long_upload = pass_outcome(SyncReport {
+		let after_a_long_upload = pass_outcome(&SyncReport {
 			full_pass: Some(FullPassReason::SafetyNet),
 			read_cost: Duration::from_millis(10),
 			uploaded: 1,
@@ -1708,7 +1688,7 @@ mod tests {
 		);
 
 		// A read that genuinely costs seconds is what scales the net out.
-		let big_tree = pass_outcome(SyncReport {
+		let big_tree = pass_outcome(&SyncReport {
 			full_pass: Some(FullPassReason::SafetyNet),
 			read_cost: Duration::from_secs(30),
 			..SyncReport::default()
@@ -1722,7 +1702,7 @@ mod tests {
 		assert_eq!(
 			net_interval(
 				SAFETY_NET,
-				pass_outcome(SyncReport {
+				pass_outcome(&SyncReport {
 					paused: true,
 					..SyncReport::default()
 				})
