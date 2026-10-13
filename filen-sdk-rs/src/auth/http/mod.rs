@@ -41,6 +41,8 @@ mod limit;
 mod logging;
 mod retry;
 mod serialize;
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+pub(crate) mod test_support;
 mod tower_wasm_time;
 mod url_parser;
 
@@ -1609,19 +1611,20 @@ impl From<Request<Bytes, reqwest::Url>> for RequestBuilder {
 mod client_timeout_tests {
 	use std::{
 		borrow::Cow,
-		sync::{Arc, RwLock},
+		sync::Arc,
 		time::{Duration, Instant},
 	};
 
 	use bytes::Bytes;
-	use filen_types::{api::v3::user::lock::LockType, auth::APIKey, fs::Uuid};
+	use filen_types::{api::v3::user::lock::LockType, fs::Uuid};
 	use tokio::{
 		io::{AsyncReadExt, AsyncWriteExt},
 		net::{TcpListener, TcpStream},
 	};
 
 	use super::{
-		AuthClient, ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, UnauthClient,
+		AuthClient, ClientConfig, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT,
+		test_support::{client, read_head, respond_with},
 	};
 
 	#[test]
@@ -1773,28 +1776,9 @@ mod client_timeout_tests {
 		}
 	}
 
-	/// Reads one request head off a scripted server's connection.
-	async fn read_head(socket: &mut TcpStream) {
-		let mut head = Vec::new();
-		let mut byte = [0u8; 1];
-		while !head.ends_with(b"\r\n\r\n") {
-			socket.read_exact(&mut byte).await.unwrap();
-			head.push(byte[0]);
-		}
-	}
-
 	/// Answers a scripted server's request with an empty success.
 	async fn respond(socket: &mut TcpStream) {
 		respond_with(socket, r#"{"status":true}"#).await;
-	}
-
-	/// Answers a scripted server's request with `body`.
-	async fn respond_with(socket: &mut TcpStream, body: &str) {
-		let response = format!(
-			"HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-			body.len()
-		);
-		socket.write_all(response.as_bytes()).await.unwrap();
 	}
 
 	/// Sends a lock request with `send` while a request the server never answers holds the only
@@ -1822,10 +1806,7 @@ mod client_timeout_tests {
 			(stalled, lock)
 		});
 
-		let client = Arc::new(AuthClient::from_unauthed(
-			UnauthClient::from_config(ClientConfig::default().with_concurrency(1)).unwrap(),
-			Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-key")))),
-		));
+		let client = Arc::new(client(ClientConfig::default().with_concurrency(1)));
 		let url = format!("http://{addr}/v3/user/lock");
 		let shared = tokio::spawn({
 			let (client, url) = (Arc::clone(&client), url.clone());
@@ -1919,10 +1900,7 @@ mod client_timeout_tests {
 			respond(&mut fresh).await;
 		});
 
-		let client = AuthClient::from_unauthed(
-			UnauthClient::from_config(ClientConfig::default()).unwrap(),
-			Arc::new(RwLock::new(APIKey(Cow::Borrowed("test-key")))),
-		);
+		let client = client(ClientConfig::default());
 		let url = format!("http://{addr}/v3/user/lock");
 		for call in 1..=2 {
 			// An empty body keeps each request to one header block: a non-empty one is streamed

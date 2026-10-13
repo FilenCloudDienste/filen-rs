@@ -1,4 +1,7 @@
 pub(crate) mod auth;
+// Unused for now: the sync engine and the list operations that will send these are not built yet.
+#[allow(dead_code)]
+pub(crate) mod bulk;
 pub(crate) mod chat;
 pub(crate) mod confirmation;
 pub(crate) mod contacts;
