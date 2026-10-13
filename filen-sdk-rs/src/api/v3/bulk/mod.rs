@@ -50,7 +50,7 @@ pub(crate) enum Sent<'a, I, T> {
 	Unsupported(&'a [I]),
 }
 
-/// One item's envelope, its `data` not yet decoded as `T`: [`run_each`] decodes each item on its
+/// One item's envelope, its `data` not yet decoded as `T`: [`answered`] decodes each item on its
 /// own, so data that does not decode fails that item alone and the chunk's other items keep their
 /// results.
 pub(crate) struct Answer<T> {
@@ -124,14 +124,17 @@ pub(crate) async fn send<'a, I, T>(
 /// Whether `error` is a whole-request answer under which no item ran and the single calls can do
 /// the work.
 fn nothing_ran(error: &Error, body: Body) -> bool {
-	let Some(ResponseError::ApiError { code, .. }) = error.downcast_ref::<ResponseError>() else {
-		return false;
-	};
-	match code.as_deref() {
+	match code(error) {
 		Some("invalid_endpoint") => true,
 		Some("invalid_params") => body == Body::ItemsOnly,
 		_ => false,
 	}
+}
+
+/// The server's code for `error`, when the server answered it.
+pub(crate) fn code(error: &Error) -> Option<&str> {
+	let ResponseError::ApiError { code, .. } = error.downcast_ref::<ResponseError>()?;
+	code.as_deref()
 }
 
 /// The `data` an item's answer carries, decoded by the rule the single routes' deserialize layer
@@ -163,9 +166,18 @@ impl ItemData for () {
 	}
 }
 
-/// Each item's result, mapped by the rule the single call's answer goes through, so it has the
-/// single call's `Ok`, or its error's kind and server code. An item answered `internal_error` runs
-/// once as its `single` call, which the stack retries like any other; under
+/// An item's answer mapped by the rule its single call's answer goes through, so it has the
+/// single call's `Ok`, or its error's kind and server code. `None` for `internal_error`: the item
+/// may or may not have run, and only its single call can tell.
+pub(crate) fn answered<T: ItemData>(answer: Answer<T>) -> Option<Result<T, Error>> {
+	match T::from_answer(answer.envelope) {
+		Err(e) if code(&e) == Some("internal_error") => None,
+		result => Some(result),
+	}
+}
+
+/// Each item's result, mapped by [`answered`]. An item answered `internal_error` runs once as its
+/// `single` call, which the stack retries like any other; under
 /// [`Sent::Unsupported`] every item runs as its `single` call. Single calls run one at a time, in
 /// input order, after the whole chunk: only for items that do not depend on each other.
 pub(crate) async fn run_each<'a, I, T, F, Fut>(
@@ -181,17 +193,9 @@ where
 		Sent::Answers(answers) => {
 			let mut results = Vec::with_capacity(answers.len());
 			for (item, answer) in answers {
-				results.push(match T::from_answer(answer.envelope) {
-					Err(e)
-						if e.downcast_ref::<ResponseError>().is_some_and(
-							|ResponseError::ApiError { code, .. }| {
-								code.as_deref() == Some("internal_error")
-							},
-						) =>
-					{
-						single(item).await
-					}
-					result => result,
+				results.push(match answered(answer) {
+					Some(result) => result,
+					None => single(item).await,
 				});
 			}
 			results

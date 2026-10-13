@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use chrono::{DateTime, Utc};
 use filen_types::api::v3::dir::color::DirColor;
+use filen_types::crypto::EncryptedString;
 use filen_types::fs::{ObjectType, ParentUuid, Uuid};
 use filen_types::traits::CowHelpers;
 
@@ -37,6 +38,27 @@ pub(crate) enum CreateDirOutcome {
 	/// It merged the request into the existing directory with the same name hash, which has
 	/// this uuid.
 	Merged(Uuid),
+}
+
+/// A new directory's create request with everything but its parent, which can still change: a
+/// request built once is sent in bulk and, when that fails, as a single call into the folder the
+/// parent's create answered.
+pub(crate) struct NewDirRequest {
+	pub(crate) uuid: Uuid,
+	pub(crate) meta: EncryptedString<'static>,
+	pub(crate) name_hashed: String,
+}
+
+impl NewDirRequest {
+	/// The create request for the directory in `parent`.
+	pub(crate) fn in_parent(&self, parent: Uuid) -> api::v3::dir::create::Request<'_> {
+		api::v3::dir::create::Request {
+			uuid: self.uuid,
+			meta: EncryptedString(Cow::Borrowed(&self.meta.0)),
+			name_hashed: Cow::Borrowed(&self.name_hashed),
+			parent,
+		}
+	}
 }
 
 impl Client {
@@ -84,16 +106,9 @@ impl Client {
 		uuid: Uuid,
 		meta: DecryptedDirectoryMeta<'static>,
 	) -> Result<CreateDirOutcome, Error> {
-		let response = api::v3::dir::create::post(
-			self.client(),
-			&api::v3::dir::create::Request {
-				uuid,
-				parent,
-				name_hashed: Cow::Borrowed(&self.hash_name(&meta.name)),
-				meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
-			},
-		)
-		.await?;
+		let request = self.new_dir_request(uuid, &meta).await;
+		let response =
+			api::v3::dir::create::post(self.client(), &request.in_parent(parent)).await?;
 
 		if uuid != response.uuid {
 			return Ok(CreateDirOutcome::Merged(response.uuid));
@@ -104,6 +119,20 @@ impl Client {
 			parent.into(),
 			response.timestamp,
 		)))
+	}
+
+	/// The create request for the directory `uuid` with `meta`, its name hashed and its metadata
+	/// encrypted as every create sends them.
+	pub(crate) async fn new_dir_request(
+		&self,
+		uuid: Uuid,
+		meta: &DecryptedDirectoryMeta<'_>,
+	) -> NewDirRequest {
+		NewDirRequest {
+			uuid,
+			meta: self.crypter().encrypt_meta(&meta.to_json_string()).await,
+			name_hashed: self.hash_name(&meta.name),
+		}
 	}
 
 	pub async fn create_dir_with_created(
@@ -123,7 +152,6 @@ impl Client {
 		name: &str,
 		contents: &str,
 	) -> Result<Uuid, Error> {
-		use filen_types::crypto::EncryptedString;
 		let _lock = self.lock_drive().await?;
 
 		let uuid = Uuid::new_v4();

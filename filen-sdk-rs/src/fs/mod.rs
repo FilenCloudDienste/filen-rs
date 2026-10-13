@@ -1,5 +1,9 @@
 #[cfg(feature = "archive")]
 pub mod archive;
+// Unused for now: the sync engine, which will send its directory creates through it, is not
+// built on this branch.
+#[allow(dead_code)]
+pub(crate) mod bulk;
 pub mod cache;
 pub mod categories;
 pub mod client_impl;

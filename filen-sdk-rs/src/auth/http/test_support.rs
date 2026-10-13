@@ -9,7 +9,8 @@ use std::{
 use filen_types::auth::APIKey;
 use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
-	net::TcpStream,
+	net::{TcpListener, TcpStream},
+	task::JoinHandle,
 };
 
 use super::{AuthClient, ClientConfig, UnauthClient};
@@ -39,4 +40,19 @@ pub(crate) async fn respond_with(socket: &mut TcpStream, body: &str) {
 		body.len()
 	);
 	socket.write_all(response.as_bytes()).await.unwrap();
+}
+
+/// Serves one request with `answer` and returns the URL to send it to. The task holds the
+/// connection until it is joined: closing it with the request body unread resets it.
+pub(crate) async fn serve_once(answer: impl Into<String>) -> (String, JoinHandle<TcpStream>) {
+	let answer = answer.into();
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let server = tokio::spawn(async move {
+		let (mut socket, _) = listener.accept().await.unwrap();
+		read_head(&mut socket).await;
+		respond_with(&mut socket, &answer).await;
+		socket
+	});
+	(format!("http://{addr}/"), server)
 }

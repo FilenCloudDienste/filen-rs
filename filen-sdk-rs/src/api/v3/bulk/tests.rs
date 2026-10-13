@@ -4,16 +4,12 @@ use bytes::Bytes;
 use filen_types::api::v3::bulk::Response;
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use tokio::{
-	net::{TcpListener, TcpStream},
-	task::JoinHandle,
-};
 
 use super::{Body, BulkError, Sent, run_each, send};
 use crate::{
 	auth::http::{
 		ClientConfig,
-		test_support::{client, read_head, respond_with},
+		test_support::{client, serve_once},
 	},
 	error::{Error, ErrorKind},
 };
@@ -22,20 +18,6 @@ use crate::{
 #[derive(Deserialize, Debug, PartialEq)]
 struct Data {
 	n: u32,
-}
-
-/// Serves one request with `answer` and returns the URL to send it to. The task holds the
-/// connection until it is joined: closing it with the request body unread resets it.
-async fn serve_once(answer: &'static str) -> (String, JoinHandle<TcpStream>) {
-	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let addr = listener.local_addr().unwrap();
-	let server = tokio::spawn(async move {
-		let (mut socket, _) = listener.accept().await.unwrap();
-		read_head(&mut socket).await;
-		respond_with(&mut socket, answer).await;
-		socket
-	});
-	(format!("http://{addr}/v3/bulk/trash"), server)
 }
 
 /// Sends `items` as one chunk, through the client's whole stack, to a server that answers it with
