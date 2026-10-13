@@ -12,6 +12,8 @@
 
 use std::fmt;
 
+use filen_macros::js_type;
+
 use super::{
 	baseline::NodeKind,
 	guard::GuardReason,
@@ -23,6 +25,7 @@ use super::{
 
 /// Whether a planned action's item is a directory or a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum PlannedNodeKind {
 	Dir,
 	File,
@@ -48,6 +51,7 @@ impl fmt::Display for PlannedNodeKind {
 
 /// What a planned action would do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, tagged)]
 pub enum PlannedActionKind {
 	/// Push a local file's content to the remote.
 	UploadFile,
@@ -75,6 +79,7 @@ pub enum PlannedActionKind {
 
 /// One action a pass would apply (or a held one it would not), in apply order.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct PlannedAction {
 	pub kind: PlannedActionKind,
 	/// The item's path relative to both roots. For a move this is the SOURCE path; the destination
@@ -109,6 +114,7 @@ impl fmt::Display for PlannedAction {
 /// [`SyncEngine::resolve_conflict`](super::SyncEngine::resolve_conflict) picks a winner. The path
 /// and its subtree are excluded from planning while it is held.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct PlannedConflict {
 	pub rel_path: String,
 	/// What the local side holds, or `None` when the path is GONE locally — a delete-vs-modify
@@ -138,6 +144,7 @@ impl fmt::Display for PlannedConflict {
 
 /// Why a path cannot be synced at all, so the engine stopped planning it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default, tagged)]
 pub enum UnsyncableReason {
 	/// The local name is one the Filen backend rejects (a trailing dot or space, a reserved device
 	/// name, a forbidden character, an over-long name). No upload or remote create at this path can
@@ -208,6 +215,7 @@ impl fmt::Display for UnsyncableReason {
 
 /// One path a pass reported as unsyncable, reported once per pass for as long as it stays so.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct UnsyncablePath {
 	pub rel_path: String,
 	pub reason: UnsyncableReason,
@@ -222,6 +230,7 @@ impl fmt::Display for UnsyncablePath {
 /// Why the engine refused to run a pass at all. Both cases make a 1:1 path mapping between the two
 /// sides impossible, so NOTHING is applied until the caller resolves the collision by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum RefuseReason {
 	/// Two remote items resolve to the same case-insensitive path.
 	RemoteCollision,
@@ -242,6 +251,7 @@ impl fmt::Display for RefuseReason {
 /// those back, and the failure counts against no path's failure streak (see
 /// [`SyncReport::halted`](super::SyncReport::halted)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum HaltReason {
 	/// The local disk has no room for another write (or a disk quota on it is used up).
 	LocalStorageFull,

@@ -12,6 +12,8 @@ use std::{
 	path::PathBuf,
 };
 
+use filen_macros::js_type;
+
 use super::{SyncMode, apply::SyncReport};
 
 /// A single event from a sync pass, delivered to a [`SyncObserver`] in the order it happens.
@@ -139,6 +141,7 @@ pub enum SyncEvent {
 
 /// Which way a file transfer moves its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum TransferDirection {
 	/// A local file going to the remote.
 	Upload,

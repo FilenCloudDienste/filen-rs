@@ -39,6 +39,7 @@ use std::{
 	time::Duration,
 };
 
+use filen_macros::js_type;
 use notify::{EventHandler, RecursiveMode, Watcher};
 use tokio::{sync::Notify, time::Instant};
 use tracing::Instrument;
@@ -191,6 +192,7 @@ impl WatchHandle {
 /// What a watch loop is doing right now — and, once it has ended, WHY, which is what a caller
 /// cannot otherwise see coming.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub enum WatchState {
 	/// Live: running passes, or waiting for the next trigger.
 	#[default]
@@ -212,6 +214,7 @@ pub enum WatchState {
 /// to a single action inside it, which surfaces as [`SyncEvent::ActionFailed`]) is otherwise
 /// invisible: the loop logs it and retries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[js_type(export, no_deser, no_default)]
 pub struct WatchStatus {
 	/// Passes that failed back to back; reset to zero by the next successful pass.
 	pub consecutive_failures: u32,

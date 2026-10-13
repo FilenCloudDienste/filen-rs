@@ -20,6 +20,7 @@ use std::{
 };
 
 use chrono::Utc;
+use filen_macros::js_type;
 use filen_types::fs::ParentUuid;
 use futures::FutureExt;
 use tokio::sync::Mutex;
@@ -2661,6 +2662,7 @@ fn endable_streaks(
 /// Which side wins when a caller resolves a held two-way conflict via
 /// [`SyncEngine::resolve_conflict`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, no_ser, no_default)]
 pub enum ConflictResolution {
 	/// The local copy wins: the next pass pushes it to the remote (or, if the conflict was a
 	/// local deletion, propagates that deletion).

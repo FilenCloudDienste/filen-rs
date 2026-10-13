@@ -33,6 +33,9 @@ mod events;
 mod facts;
 mod guard;
 mod ignore;
+// The JS bindings' surface: the mobile one only, for now.
+#[cfg(feature = "uniffi")]
+mod js_impl;
 mod mode;
 // The local half of a change-scoped pass: re-observe the paths the changelist names.
 mod observe;

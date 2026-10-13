@@ -1,11 +1,14 @@
 //! How a sync pair reconciles its two sides: direction + deletion policy.
 
+use filen_macros::js_type;
+
 /// The sync direction and deletion policy for one folder pair.
 ///
 /// The five modes are two orthogonal knobs — which side's changes flow where, and whether a
 /// deletion on the source side is mirrored to the destination. A "backup" mode is a one-way mirror
 /// that never deletes on its destination, so the destination only ever accumulates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, export, no_default)]
 pub enum SyncMode {
 	/// Local is authoritative: push local creates/edits/moves up and mirror local deletions to
 	/// the remote.
@@ -31,6 +34,7 @@ pub enum SyncMode {
 /// propagates a source deletion, so its destination accumulates copies the mirror modes would
 /// remove on their next pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[js_type(import, no_ser, no_default)]
 pub enum Backlog {
 	/// Reconcile the two sides as they are, under the new rules. Every deletion the old mode left
 	/// standing is pending from the next pass and propagates at once (mass-delete-guard screened).
