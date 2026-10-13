@@ -325,3 +325,46 @@ jobs:
       - name: Build React Native Bundle
         run: npm run ubrn:release
         working-directory: ./filen-sdk-rs/web
+  ci-napi:
+    # Builds the desktop Node-API addon and smoke-tests it under node, once per OS: each
+    # links the addon its own way (dynamic_lookup on macOS, -z nodelete on linux-gnu, msvc on
+    # Windows). Package-scoped (--manifest-path ../Cargo.toml), so no heif-decoder tooling.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: CI on napi (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-02-20
+      - uses: Swatinem/rust-cache@a84bfdc502f07db5a85dd9d7a30f91a931516cc5
+        with:
+          shared-key: cargo-build-ci-napi-${{ matrix.os }}
+          prefix-key: ''
+          add-rust-environment-hash-key: 'false'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Wild linker
+        # .cargo/config.toml links every native linux-gnu target through Wild; see ci-linux.
+        if: runner.os == 'Linux'
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: wild-linker@0.9.0
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Zhigher-ranked-assumptions
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Install dependencies
+        run: npm ci
+        working-directory: ./filen-sdk-rs/web
+      - name: Build the napi addon
+        run: npm run build:napi
+        working-directory: ./filen-sdk-rs/web
+      - name: Smoke-test the napi addon
+        run: npm run test:napi
+        working-directory: ./filen-sdk-rs/web

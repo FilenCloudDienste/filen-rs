@@ -223,7 +223,8 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally lints with
 `filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache` and a
 package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache,sync-engine --lib`
-that builds the SDK without `archive`, and cross-compiles for Android, iOS and Windows — none of
+that builds the SDK without `archive`, cross-compiles for Android, iOS and Windows, and
+builds and smoke-tests the napi addon on Linux, macOS and Windows (`ci-napi`) — none of
 which the hooks attempt. `ci.yml`
 runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
 pull request into `main` or `dev` (from a fork too), runs `branch-lint.yml`, the fast checks
