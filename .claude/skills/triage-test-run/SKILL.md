@@ -239,7 +239,8 @@ fixes of pre-existing bugs before anything else, Conventional Commit messages wi
 - **Log source.** Always the per-job endpoint (`actions/jobs/<id>/logs`, what `fetch` uses).
   `gh run view --log` has spliced stale blocks of other jobs into a job's log and produced phantom
   recurrences.
-- `test.yml` runs `cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder --no-fail-fast`
+- `test.yml` runs
+  `cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/test-seams --no-fail-fast`
   at the workspace root with `RUST_LOG=debug`, `timeout-minutes: 270`, `fail-fast: false`; test-wasm
   sets `VITE_TEST_TIMEOUT_MULT=10` (30 min per test). Healthy native legs take ~2 h 20 m – 3 h 50 m.
 

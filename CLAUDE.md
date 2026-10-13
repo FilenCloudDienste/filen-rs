@@ -148,6 +148,7 @@ Test notes:
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata) — never enable in production |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark only |
+| `test-seams` | Test-only: exposes the bulk directory create and trash (`create_dirs_for_test` / `trash_items_for_test`) to the live tests — never enable in production |
 
 The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
 `filen-sdk-rs/web/ubrn.config.yaml`).

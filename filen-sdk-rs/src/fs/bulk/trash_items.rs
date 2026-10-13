@@ -30,6 +30,19 @@ impl Client {
 	}
 }
 
+// Test seam: the live tests trash items through `bulk/trash` against the server. Gated behind the
+// `test-seams` feature, which production builds never enable.
+#[cfg(feature = "test-seams")]
+impl Client {
+	/// `trash_items` for the live tests. Test code only.
+	pub async fn trash_items_for_test(
+		&self,
+		items: &[Item],
+	) -> Result<Vec<Result<(), Error>>, Error> {
+		self.trash_items(items).await
+	}
+}
+
 /// [`Client::trash_items`] without the lock, through `backend`.
 pub(super) async fn trash_items(backend: &impl Backend, items: &[Item]) -> Vec<Result<(), Error>> {
 	let mut results = Vec::with_capacity(items.len());

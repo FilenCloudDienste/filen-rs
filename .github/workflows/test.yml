@@ -171,7 +171,7 @@ jobs:
           Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\' -ErrorAction SilentlyContinue |
             Select-Object TaskName, State | Out-String -Width 120 | Write-Host
       - name: Run tests
-        run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder --no-fail-fast
+        run: cargo test -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/test-seams --no-fail-fast
         env:
           TEST_EMAIL: ${{ secrets[format('{0}_TEST_ACC_EMAIL', matrix.version)] }}
           TEST_PASSWORD: ${{ secrets[format('{0}_TEST_ACC_PASS', matrix.version)] }}

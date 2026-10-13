@@ -16,15 +16,18 @@ use crate::{
 
 /// A directory for [`Client::create_dirs`] to create.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct NewDir<'a> {
-	pub(crate) name: &'a str,
-	pub(crate) created: DateTime<Utc>,
-	pub(crate) parent: NewDirParent,
+pub struct NewDir<'a> {
+	/// The directory's name.
+	pub name: &'a str,
+	/// When the directory was created, as its metadata records it.
+	pub created: DateTime<Utc>,
+	/// Where the directory goes.
+	pub parent: NewDirParent,
 }
 
 /// Where a [`NewDir`] goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NewDirParent {
+pub enum NewDirParent {
 	/// A directory that already exists.
 	Existing(Uuid),
 	/// The directory at this index of the same list, which must come before the child.
@@ -33,16 +36,17 @@ pub(crate) enum NewDirParent {
 
 /// A directory [`Client::create_dirs`] created, or found already there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CreatedDir {
+pub struct CreatedDir {
 	/// The directory's uuid, as the server answered it.
-	pub(crate) uuid: Uuid,
+	pub uuid: Uuid,
 	/// Whether a directory with the same name already existed in the parent: the server created
 	/// nothing and answered that directory's uuid, which differs from the one requested.
-	pub(crate) merged: bool,
+	pub merged: bool,
 }
 
+/// Why [`Client::create_dirs`] did not create a directory, by the indexes of the list it was given.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum CreateDirsError {
+pub enum CreateDirsError {
 	/// A directory names a parent at its own index or after it; nothing was sent.
 	#[error(
 		"directory {item} names directory {parent} as its parent, which does not come before it"
@@ -81,6 +85,19 @@ impl Client {
 	) -> Result<Vec<Result<CreatedDir, Error>>, Error> {
 		let _lock = self.lock_drive().await?;
 		create_dirs(self, dirs).await
+	}
+}
+
+// Test seam: the live tests create directories through `bulk/dir/create` against the server.
+// Gated behind the `test-seams` feature, which production builds never enable.
+#[cfg(feature = "test-seams")]
+impl Client {
+	/// `create_dirs` for the live tests. Test code only.
+	pub async fn create_dirs_for_test(
+		&self,
+		dirs: &[NewDir<'_>],
+	) -> Result<Vec<Result<CreatedDir, Error>>, Error> {
+		self.create_dirs(dirs).await
 	}
 }
 
