@@ -189,7 +189,9 @@ pub struct SyncReport {
 	pub(super) read_cost: Duration,
 	/// The `(rel_path, error)` of every action that failed, for the engine's per-path failure
 	/// bookkeeping. `errors` is the human-facing rendering of the same failures plus the pass-level
-	/// ones (a refusal, a lock that could not be taken) that belong to no path.
+	/// ones (a refusal, a lock that could not be taken) that belong to no path, less the actions on
+	/// a file another device has since replaced, which only the next pass can re-plan (see
+	/// `note_action_failed`).
 	pub(super) failed_paths: Vec<(String, String)>,
 }
 
@@ -674,11 +676,16 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			if let Some(reason) =
-				apply_serial(&ctx, &entry, &mut plan, &mut failed, report, observer).await
-			{
-				full.note(reason);
-			}
+			apply_serial(
+				&ctx,
+				&entry,
+				&mut plan,
+				&mut failed,
+				&full,
+				report,
+				observer,
+			)
+			.await;
 		}
 		applied += 1;
 	}
@@ -739,7 +746,7 @@ pub(super) async fn apply(
 					Ok(target) => target,
 					Err(error) => {
 						applied += 1;
-						note_transfer_failed(&entry.action, &error, &full, report, observer);
+						note_action_failed(&entry.action, &error, &full, report, observer);
 						continue;
 					}
 				};
@@ -773,7 +780,7 @@ pub(super) async fn apply(
 					Ok(target) => target,
 					Err(error) => {
 						applied += 1;
-						note_transfer_failed(&entry.action, &error, &full, report, observer);
+						note_action_failed(&entry.action, &error, &full, report, observer);
 						continue;
 					}
 				};
@@ -830,7 +837,7 @@ pub(super) async fn apply(
 				}
 				Err(error) => {
 					applied += 1;
-					note_transfer_failed(&action, &error, &full, report, observer);
+					note_action_failed(&action, &error, &full, report, observer);
 				}
 			}
 		}
@@ -854,7 +861,16 @@ pub(super) async fn apply(
 				}
 				None => return note_interrupted(report, total - applied, observer),
 			}
-			apply_serial(&ctx, &entry, &mut plan, &mut failed, report, observer).await;
+			apply_serial(
+				&ctx,
+				&entry,
+				&mut plan,
+				&mut failed,
+				&full,
+				report,
+				observer,
+			)
+			.await;
 		}
 		applied += 1;
 	}
@@ -902,9 +918,16 @@ async fn run_transfer(
 	(planned.action, quarantined, result)
 }
 
-/// Record a transfer that failed — its event and its failure (see [`note_failure`]), and the side
+/// Record an action that failed — its event and its failure (see [`note_failure`]), and the side
 /// it found full, which holds back the transfers after it.
-fn note_transfer_failed(
+///
+/// A file the server holds a newer version of than the one this pass read (see [`superseded`])
+/// is not a failure the caller sees: it has no event and no line in
+/// [`errors`](SyncReport::errors). It is still owed, so it stays in
+/// [`failed_paths`](SyncReport::failed_paths): that makes the next pass read both sides whole and
+/// re-plan the path from the newer version, and a view that keeps naming the old one still runs
+/// into the path's failure streak.
+fn note_action_failed(
 	action: &SyncAction,
 	error: &crate::Error,
 	full: &FullSides,
@@ -912,6 +935,17 @@ fn note_transfer_failed(
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
 ) {
 	tracing::debug!("apply: {} FAILED — {error}", action.describe());
+	if superseded(error) {
+		tracing::debug!(
+			"apply: {} left to the next pass: the server holds a newer version of that file than \
+			 this pass read",
+			action.describe()
+		);
+		report
+			.failed_paths
+			.push((action.rel_path().to_string(), error.to_string()));
+		return;
+	}
 	observer(SyncEvent::ActionFailed {
 		rel_path: action.rel_path().to_string(),
 		error: error.to_string(),
@@ -919,6 +953,14 @@ fn note_transfer_failed(
 	if let Some(reason) = note_failure(report, action.rel_path(), error) {
 		full.note(reason);
 	}
+}
+
+/// Whether the server refused an action because the file it names is no longer the current one:
+/// another device uploaded a newer version after this pass read it, which made the uuid the plan
+/// holds an old version (`file_is_versioned`). A move or trash of that uuid is moot, since the
+/// next pass plans from the newer version.
+fn superseded(error: &crate::Error) -> bool {
+	error.server_code().as_deref() == Some("file_is_versioned")
 }
 
 /// The pass's hold on the account-wide drive-write lock, taken per bounded batch of its apply.
@@ -1573,27 +1615,27 @@ fn mutates_remote(action: &SyncAction) -> bool {
 	)
 }
 
-/// Apply one action serially: emit its in-progress event, run it, and record success/failure.
-/// Returns the side its failure found full, if it did (see [`note_failure`]).
+/// Apply one action serially: emit its in-progress event, run it, and record success/failure (see
+/// [`note_action_failed`]).
 async fn apply_serial(
 	ctx: &ApplyContext<'_>,
 	planned: &PlannedEntry,
 	plan: &mut PagedPlan,
 	failed: &mut FailedDirMoves,
+	full: &FullSides,
 	report: &mut SyncReport,
 	observer: &mut (dyn FnMut(SyncEvent) + Send),
-) -> Option<HaltReason> {
+) {
 	let action = &planned.action;
 	observer(action.to_event());
 	tracing::debug!("apply: {}", action.describe());
 	let error = match apply_one(ctx, planned, plan, report, &mut *observer).await {
 		Ok(()) => {
 			note_written(plan, action, report);
-			return None;
+			return;
 		}
 		Err(error) => error,
 	};
-	tracing::debug!("apply: {} FAILED — {error}", action.describe());
 	if let SyncAction::MoveRemote {
 		to_path,
 		kind: NodeKind::Dir,
@@ -1607,11 +1649,7 @@ async fn apply_serial(
 	{
 		failed.dirs.push(to_path.clone());
 	}
-	observer(SyncEvent::ActionFailed {
-		rel_path: action.rel_path().to_string(),
-		error: error.to_string(),
-	});
-	note_failure(report, action.rel_path(), &error)
+	note_action_failed(action, &error, full, report, observer);
 }
 
 /// Record that `action` landed, for the deletions after it (see [`Pager::note_written`]).
@@ -3546,6 +3584,60 @@ mod tests {
 		assert_eq!(report.interrupted, 0);
 	}
 
+	/// A move the server refuses because another device has since uploaded a newer version of the
+	/// file is not reported as a failure, but its path is still owed to the next pass; any other
+	/// refusal of the same move is reported.
+	#[test]
+	fn a_move_of_a_file_replaced_since_the_pass_read_it_is_left_to_the_next_pass() {
+		let action = SyncAction::MoveRemote {
+			from_path: "e.txt".to_string(),
+			to_path: "sub/e.txt".to_string(),
+			kind: NodeKind::File,
+			remote_uuid: Uuid::from_u128(1),
+		};
+		let refused = |code: &str| -> crate::Error {
+			filen_types::error::ResponseError::ApiError {
+				message: None,
+				code: Some(code.to_string()),
+			}
+			.into()
+		};
+		let full = FullSides::default();
+		let mut events = Vec::new();
+
+		let mut report = SyncReport::default();
+		note_action_failed(
+			&action,
+			&refused("file_is_versioned"),
+			&full,
+			&mut report,
+			&mut |event| events.push(event),
+		);
+		assert!(report.errors.is_empty(), "{:?}", report.errors);
+		assert!(events.is_empty());
+		assert_eq!(
+			report
+				.failed_paths
+				.iter()
+				.map(|(path, _)| path.as_str())
+				.collect::<Vec<_>>(),
+			["sub/e.txt"]
+		);
+		assert_eq!(report.halted, None);
+
+		let mut report = SyncReport::default();
+		note_action_failed(
+			&action,
+			&refused("file_not_found"),
+			&full,
+			&mut report,
+			&mut |event| events.push(event),
+		);
+		assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+		assert_eq!(report.failed_paths.len(), 1);
+		assert_eq!(events.len(), 1);
+	}
+
 	/// A full side holds back only the transfers that write to it: a full account stops uploads and
 	/// lets downloads (and every non-transfer action) through, a full disk the reverse.
 	#[test]
@@ -4961,7 +5053,7 @@ mod tests {
 		};
 		let mut report = SyncReport::default();
 		let mut events = Vec::new();
-		note_transfer_failed(
+		note_action_failed(
 			&entry.action,
 			&error,
 			&FullSides::default(),
