@@ -249,6 +249,171 @@ async fn move_into_linked_dir_propagates() {
 	);
 }
 
+// Within one hold of the drive lock a directory's links are looked up once. Linking it must drop
+// that lookup, or what is created inside it afterwards never reaches the new link.
+#[shared_test_runtime]
+async fn link_added_mid_hold_reaches_what_is_created_after_it() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let unauth_client = client.get_unauthed();
+
+	let dir = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	// Looks up `dir`'s links while it has none.
+	let f1 = client.make_file_builder("f1.txt", dir.uuid()).unwrap();
+	client.upload_file(f1, b"before the link").await.unwrap();
+
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&dir, None)
+		.await
+		.unwrap();
+
+	let sub_dir = client.create_dir(&(&dir).into(), "s").await.unwrap();
+	let f2 = client.make_file_builder("f2.txt", sub_dir.uuid()).unwrap();
+	let f2 = client.upload_file(f2, b"after the link").await.unwrap();
+
+	let link: DirPublicLink = client
+		.get_dir_link_rw(&dir)
+		.await
+		.unwrap()
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+	let (dirs, _files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let linked_sub_dir = dirs
+		.iter()
+		.find(|d| d.inner().uuid() == sub_dir.uuid())
+		.expect("the directory created after linking must be in the link");
+	let (_sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_sub_dir.into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(
+		sub_files.iter().map(|f| f.uuid()).collect::<Vec<_>>(),
+		vec![f2.uuid()],
+		"the file uploaded after linking must be in the link"
+	);
+}
+
+// Moving a directory into a linked one changes the links of its whole subtree, so the lookup
+// made before the move must be dropped, or what is uploaded into it afterwards never reaches the
+// link.
+#[shared_test_runtime]
+async fn move_into_linked_dir_mid_hold_reaches_what_is_uploaded_after_it() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let unauth_client = client.get_unauthed();
+
+	let linked = client.create_dir(&test_dir.into(), "l").await.unwrap();
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&linked, None)
+		.await
+		.unwrap();
+	let mut moved = client.create_dir(&test_dir.into(), "x").await.unwrap();
+	// Looks up `moved`'s links while it has none.
+	let f1 = client.make_file_builder("f1.txt", moved.uuid()).unwrap();
+	client.upload_file(f1, b"before the move").await.unwrap();
+
+	client
+		.move_dir(&mut moved, &(&linked).into())
+		.await
+		.unwrap();
+
+	let f2 = client.make_file_builder("f2.txt", moved.uuid()).unwrap();
+	let f2 = client.upload_file(f2, b"after the move").await.unwrap();
+
+	let link: DirPublicLink = client
+		.get_dir_link_rw(&linked)
+		.await
+		.unwrap()
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+	let (dirs, _files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	let linked_moved = dirs
+		.iter()
+		.find(|d| d.inner().uuid() == moved.uuid())
+		.expect("the moved directory must be in the link");
+	let (_sub_dirs, sub_files) = unauth_client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&linked_moved.into(), &info.link, None)
+		.await
+		.unwrap();
+	assert!(
+		sub_files.iter().any(|f| f.uuid() == f2.uuid()),
+		"the file uploaded after the move must be in the link"
+	);
+}
+
+// Within one hold of the drive lock a directory's shares are looked up once. Sharing it must drop
+// that lookup, or what is uploaded into it afterwards is never shared.
+#[shared_test_runtime]
+async fn share_added_mid_hold_reaches_what_is_uploaded_after_it() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (_lock1, _lock2) = test_utils::set_up_contact(client, &share_client).await;
+	// One hold for the whole test, taken after the contact locks: the order the other share tests
+	// take them in, so two of them never wait on each other.
+	let _drive_lock = client.lock_drive().await.unwrap();
+	let contacts = client.get_contacts().await.unwrap();
+	let contact = contacts
+		.iter()
+		.find(|contact| contact.email == share_client.email())
+		.unwrap();
+
+	let dir = client.create_dir(&test_dir.into(), "a").await.unwrap();
+	// Looks up `dir`'s shares while it has none.
+	let f1 = client.make_file_builder("f1.txt", dir.uuid()).unwrap();
+	client.upload_file(f1, b"before the share").await.unwrap();
+
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&dir, contact, None)
+		.await
+		.unwrap();
+
+	let f2 = client.make_file_builder("f2.txt", dir.uuid()).unwrap();
+	let f2 = client.upload_file(f2, b"after the share").await.unwrap();
+	// As in `share_dir`: a share can take a moment to become visible to its recipient.
+	tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+	let (shared_dirs_in, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let shared_dir_in = shared_dirs_in
+		.iter()
+		.find(|d| d.get_dir().uuid() == dir.uuid())
+		.expect("the shared directory must reach its recipient");
+	let (_, shared_files_in) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&shared_dir_in.into(),
+			shared_dir_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert!(
+		shared_files_in.iter().any(|f| f.uuid() == f2.uuid()),
+		"the file uploaded after sharing must be shared"
+	);
+}
+
 // A directory that exists in a linked parent but is missing from its link (a create whose
 // propagation failed, here one that never propagated) is added to the link when a create of
 // the same name merges into it.

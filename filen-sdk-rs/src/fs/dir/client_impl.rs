@@ -80,16 +80,24 @@ impl Client {
 		let lock = self.lock_drive().await?;
 		let (uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
-		let (dir, targets) = match self.post_create_dir(parent, uuid, meta).await? {
-			CreateDirOutcome::Created(dir) => (dir, ParentTargets::All),
+		// `_change`: see the `Merged` arm.
+		let (dir, targets, _change) = match self.post_create_dir(parent, uuid, meta).await? {
+			CreateDirOutcome::Created(dir) => (dir, ParentTargets::All, None),
 			// The server deduplicated against a pre-existing directory with the same
 			// (case-insensitive) name hash and returned its uuid. Our locally built meta
 			// carries the caller's casing and created=now, which do not match the existing
 			// directory; adopt its real metadata instead of pushing fabricated meta into
 			// the share/link mirrors. It is still added to the parent's links and shares it
-			// is missing from: a retry of a create whose propagation failed lands here.
+			// is missing from: a retry of a create whose propagation failed lands here. That
+			// changes the links and shares of its whole subtree, so what this hold of the lock
+			// kept of them is not answered meanwhile, and forgotten after.
 			CreateDirOutcome::Merged(existing) => {
-				(self.get_dir(existing).await?, ParentTargets::Missing)
+				let change = self.connected_targets_change();
+				(
+					self.get_dir(existing).await?,
+					ParentTargets::Missing,
+					Some(change),
+				)
 			}
 		};
 
@@ -377,6 +385,8 @@ impl Client {
 
 	pub async fn restore_dir(&self, dir: &mut RemoteDirectory) -> Result<(), Error> {
 		let lock = self.lock_drive().await?;
+		// The restored subtree takes the links and shares of the parent it returns to.
+		let _targets = self.connected_targets_change();
 		api::v3::dir::restore::post(
 			self.client(),
 			&api::v3::dir::restore::Request { uuid: dir.uuid() },
@@ -519,6 +529,8 @@ impl Client {
 		new_parent: Uuid,
 	) -> Result<(), Error> {
 		let lock = self.lock_drive().await?;
+		// The moved subtree takes the links and shares of its new parent.
+		let _targets = self.connected_targets_change();
 		api::v3::dir::r#move::post(
 			self.client(),
 			&api::v3::dir::r#move::Request {

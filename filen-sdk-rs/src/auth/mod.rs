@@ -3,7 +3,7 @@ use std::{
 	fmt::{Debug, Display},
 	num::NonZeroU32,
 	str::FromStr,
-	sync::{Arc, Weak},
+	sync::{Arc, Mutex, Weak},
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -24,6 +24,7 @@ use typenum::U256;
 use crate::{
 	api,
 	auth::unauth::UnauthClient,
+	connect::HeldTargets,
 	crypto::{
 		self,
 		error::ConversionError,
@@ -264,6 +265,8 @@ pub struct Client {
 	http_client: Arc<AuthClient>,
 
 	pub(crate) drive_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
+	/// Directories' links and shares, looked up during the current hold of the drive lock.
+	pub(crate) held_targets: Mutex<HeldTargets>,
 	pub(crate) notes_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) chats_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,
 	pub(crate) auth_lock: tokio::sync::RwLock<Option<Weak<ResourceLock>>>,

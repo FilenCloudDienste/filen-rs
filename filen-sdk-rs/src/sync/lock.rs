@@ -852,14 +852,56 @@ where
 	}
 }
 
+/// Locks for unit tests that never reach a server.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+pub(crate) mod test_support {
+	use std::{
+		borrow::Cow,
+		sync::{Arc, RwLock, atomic::AtomicU64},
+	};
+
+	use filen_types::{auth::APIKey, fs::Uuid};
+
+	use super::{Confirmed, ResourceLock, SharedLease};
+	use crate::auth::{http::AuthClient, unauth::test_support::offline_unauthed};
+
+	/// A client whose every request fails to connect without leaving the machine: a release or
+	/// refresh a test sets off must never reach the gateway.
+	fn offline_client() -> Arc<AuthClient> {
+		Arc::new(AuthClient::from_unauthed(
+			offline_unauthed(),
+			Arc::new(RwLock::new(APIKey(Cow::Borrowed("")))),
+		))
+	}
+
+	/// A valid lock whose release, when dropped, goes to `handle` (or the ambient runtime).
+	pub(crate) fn test_lock(handle: Option<tokio::runtime::Handle>) -> ResourceLock {
+		ResourceLock {
+			lease: Arc::new(SharedLease {
+				uuid: Uuid::new_v4(),
+				client: offline_client(),
+				resource: "test-resource".to_string(),
+				valid: tokio::sync::watch::Sender::new(true),
+				confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),
+				confirming: tokio::sync::Mutex::new(None),
+				confirmations: AtomicU64::new(0),
+				handle,
+			}),
+		}
+	}
+
+	/// Marks `lock` lost, as its keep-alive does when the server refuses the lease, without the
+	/// release [`SharedLease::mark_lost`] sends.
+	pub(crate) fn lose(lock: &ResourceLock) {
+		lock.lease.valid.send_replace(false);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	use filen_types::auth::APIKey;
-
+	use super::test_support::test_lock;
 	use super::*;
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	use crate::auth::unauth::test_support::offline_unauthed;
 
 	/// The caller-chosen ceiling is what bounds how late a contended acquisition's NEXT poll is —
 	/// the sync engine picks a short one so a pass that misses another client's release is back
@@ -894,32 +936,6 @@ mod tests {
 			refresh_delay_after(Duration::from_secs(5)),
 			LOCK_REFRESH_INTERVAL - Duration::from_secs(5)
 		);
-	}
-
-	/// A client whose every request fails to connect without leaving the machine: a release or
-	/// refresh the tests below set off must never reach the gateway.
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn offline_client() -> Arc<AuthClient> {
-		Arc::new(AuthClient::from_unauthed(
-			offline_unauthed(),
-			Arc::new(std::sync::RwLock::new(APIKey(Cow::Borrowed("")))),
-		))
-	}
-
-	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-	fn test_lock(handle: Option<tokio::runtime::Handle>) -> ResourceLock {
-		ResourceLock {
-			lease: Arc::new(SharedLease {
-				uuid: Uuid::new_v4(),
-				client: offline_client(),
-				resource: "test-resource".to_string(),
-				valid: tokio::sync::watch::Sender::new(true),
-				confirmed: tokio::sync::watch::Sender::new(Confirmed::now()),
-				confirming: tokio::sync::Mutex::new(None),
-				confirmations: AtomicU64::new(0),
-				handle,
-			}),
-		}
 	}
 
 	// The runtimes below are deliberately never driven: a `current_thread` runtime only
