@@ -10,7 +10,6 @@ use std::{
 	collections::BTreeSet,
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex},
-	time::Duration,
 };
 
 use filen_macros::shared_test_runtime;
@@ -177,7 +176,7 @@ impl Scene {
 		let remote = resources.dir.uuid();
 		// The cache refuses a root the server does not show yet, and the engine then only warns.
 		assert!(
-			wait_visible(&resources.client, remote).await,
+			resources.wait_visible().await,
 			"the server never showed the new test directory"
 		);
 		let dir = tempfile::tempdir().unwrap();
@@ -244,17 +243,6 @@ impl Scene {
 			.map(str::to_owned)
 			.collect()
 	}
-}
-
-/// Wait, a minute at most, until the server shows directory `uuid`.
-async fn wait_visible(client: &Client, uuid: Uuid) -> bool {
-	for _ in 0..60 {
-		if client.get_dir(uuid).await.is_ok() {
-			return true;
-		}
-		tokio::time::sleep(Duration::from_secs(1)).await;
-	}
-	false
 }
 
 fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {

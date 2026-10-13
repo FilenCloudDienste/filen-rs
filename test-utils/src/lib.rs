@@ -75,6 +75,18 @@ impl Drop for TestResources {
 }
 
 impl TestResources {
+	/// Wait, a minute at most, until the server shows the directory: the cache refuses a root it
+	/// does not show yet. False if it never did.
+	pub async fn wait_visible(&self) -> bool {
+		for _ in 0..60 {
+			if self.client.get_dir(self.dir.uuid()).await.is_ok() {
+				return true;
+			}
+			tokio::time::sleep(Duration::from_secs(1)).await;
+		}
+		false
+	}
+
 	async fn cleanup(client: Arc<Client>, dir: RemoteDirectory) {
 		match client.delete_dir_permanently(dir).await {
 			Ok(_) => {}

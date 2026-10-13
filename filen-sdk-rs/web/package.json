@@ -15,6 +15,7 @@
 		"build:napi": "napi build --platform --manifest-path ../Cargo.toml --features napi,cache,sync-engine --output-dir node --esm",
 		"build:napi:release": "npm run build:napi -- --release",
 		"test:napi": "node --test napi/smoke.test.mjs napi/parity.test.mjs",
+		"test:napi:live": "node --test napi/live.test.mjs",
 		"check:napi-parity": "node napi/parity.mjs"
 	},
 	"homepage": "https://github.com/FilenCloudDienste/filen-rs",

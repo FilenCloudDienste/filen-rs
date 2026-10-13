@@ -107,6 +107,10 @@ cargo build --features heif-decoder
 npm --prefix filen-sdk-rs/web run build:napi
 npm --prefix filen-sdk-rs/web run test:napi
 npm --prefix filen-sdk-rs/web run check:napi-parity
+# Live: the addon drives a real sync on a fresh remote directory, which test-utils'
+# remote-test-dir lends it (cargo run, package-scoped). TEST_EMAIL / TEST_PASSWORD from the
+# environment or the nearest .env up from the package; skipped without them
+npm --prefix filen-sdk-rs/web run test:napi:live
 ```
 
 Integration tests require environment variables (can be in `.env`):
