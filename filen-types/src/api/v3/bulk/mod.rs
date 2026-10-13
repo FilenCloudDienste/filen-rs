@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::response::FilenResponse;
 
+pub mod chat;
 pub mod delete;
 pub mod dir;
 pub mod exists;
@@ -17,6 +18,7 @@ pub mod file;
 pub mod linked;
 pub mod metadata;
 pub mod r#move;
+pub mod notes;
 pub mod present;
 pub mod rename;
 pub mod restore;

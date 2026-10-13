@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-	api::v3::{dir as single_dir, dir::link::PublicLinkExpiration, file, item},
+	api::v3::{
+		dir as single_dir, dir::link::PublicLinkExpiration, file, item, notes as single_notes,
+		notes::participants::add::ContactUuid,
+	},
 	crypto::{EncryptedMetaKey, EncryptedString, rsa::RSAEncryptedString},
 	error::ResponseError,
 	fs::{ObjectType, Uuid},
@@ -746,5 +749,263 @@ fn linked_rename_request_matches_the_documented_body() {
 	assert_eq!(
 		to_json(&linked::rename::Request { items: &items }),
 		json!({"items": [{"uuid": UUID_A, "linkUUID": UUID_B, "metadata": "enc"}]})
+	);
+}
+
+#[test]
+fn notes_pinned_and_favorite_requests_match_the_documented_bodies() {
+	let pinned = [notes::pinned::Item {
+		uuid: uuid(UUID_A),
+		pinned: true,
+	}];
+	assert_eq!(
+		to_json(&notes::pinned::Request { items: &pinned }),
+		json!({"items": [{"uuid": UUID_A, "pinned": true}]})
+	);
+	let favorite = [notes::favorite::Item {
+		uuid: uuid(UUID_A),
+		favorite: false,
+	}];
+	assert_eq!(
+		to_json(&notes::favorite::Request { items: &favorite }),
+		json!({"items": [{"uuid": UUID_A, "favorite": false}]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "code": "note_pinned_changed", "message": "Note pinned changed."},
+			{"status": false, "code": "note_not_found", "message": "Note not found."},
+		]))),
+		[
+			(Some(true), "note_pinned_changed".to_owned()),
+			(Some(false), "note_not_found".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn uuid_only_note_and_chat_requests_send_one_uuid_per_item() {
+	let expected = json!({"items": [{"uuid": UUID_A}]});
+	let uuid = uuid(UUID_A);
+	assert_eq!(
+		to_json(&notes::trash::Request {
+			items: &[notes::trash::Item { uuid }],
+		}),
+		expected
+	);
+	assert_eq!(
+		to_json(&notes::archive::Request {
+			items: &[notes::archive::Item { uuid }],
+		}),
+		expected
+	);
+	assert_eq!(
+		to_json(&notes::restore::Request {
+			items: &[notes::restore::Item { uuid }],
+		}),
+		expected
+	);
+	assert_eq!(
+		to_json(&notes::delete::Request {
+			items: &[notes::delete::Item { uuid }],
+		}),
+		expected
+	);
+	assert_eq!(
+		to_json(&chat::conversations::read::Request {
+			items: &[chat::conversations::read::Item { uuid }],
+		}),
+		expected
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "code": "note_trashed", "message": "Note trashed."},
+			{"status": true, "code": "note_archived", "message": "Note archived."},
+			{"status": true, "code": "note_restored", "message": "Note restored."},
+			{"status": false, "code": "note_not_found", "message": "Note not found."},
+			{
+				"status": true,
+				"code": "unread_chat_message_notifications_deleted",
+				"message": "Unread chat message notifications deleted.",
+			},
+		]))),
+		[
+			(Some(true), "note_trashed".to_owned()),
+			(Some(true), "note_archived".to_owned()),
+			(Some(true), "note_restored".to_owned()),
+			(Some(false), "note_not_found".to_owned()),
+			(
+				Some(true),
+				"unread_chat_message_notifications_deleted".to_owned()
+			),
+		]
+	);
+}
+
+#[test]
+fn notes_tag_answers_data_only_when_the_tag_was_added() {
+	let items = [notes::tag::Item {
+		uuid: uuid(UUID_A),
+		tag: uuid(UUID_B),
+	}];
+	assert_eq!(
+		to_json(&notes::tag::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "tag": UUID_B}]})
+	);
+
+	let results = results::<crate::api::v3::notes::tag::Response>(processed(json!([
+		{
+			"status": true,
+			"code": "note_tagged",
+			"message": "Note tagged.",
+			"data": {"editedTimestamp": 1_760_270_400_000_u64},
+		},
+		{"status": true, "code": "note_tagged", "message": "Note tagged."},
+	])));
+	let [tagged, already_tagged] = <[_; 2]>::try_from(results).unwrap();
+
+	assert_eq!(
+		tagged
+			.into_data()
+			.unwrap()
+			.edited_timestamp
+			.timestamp_millis(),
+		1_760_270_400_000
+	);
+	assert_eq!(already_tagged.code.as_deref(), Some("note_tagged"));
+	already_tagged.ignore_data().unwrap();
+}
+
+#[test]
+fn notes_untag_request_and_no_op_answer_match_the_documented_shapes() {
+	let items = [notes::untag::Item {
+		uuid: uuid(UUID_A),
+		tag: uuid(UUID_B),
+	}];
+	assert_eq!(
+		to_json(&notes::untag::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "tag": UUID_B}]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "code": "note_untagged", "message": "Note untagged."},
+			{"status": true, "code": "note_tag_not_found", "message": "Note tag not found."},
+		]))),
+		[
+			(Some(true), "note_untagged".to_owned()),
+			(Some(true), "note_tag_not_found".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn notes_participants_add_request_puts_the_note_at_the_top_level() {
+	let items = [
+		notes::participants::add::Item {
+			contact_uuid: ContactUuid::Uuid(uuid(UUID_B)),
+			metadata: rsa_enc("enc"),
+			permissions_write: true,
+		},
+		notes::participants::add::Item {
+			contact_uuid: ContactUuid::Owner,
+			metadata: rsa_enc("enc-owner"),
+			permissions_write: false,
+		},
+	];
+	let request = notes::participants::add::Request {
+		uuid: uuid(UUID_A),
+		items: &items,
+	};
+	assert_eq!(
+		to_json(&request),
+		json!({
+			"uuid": UUID_A,
+			"items": [
+				{"contactUUID": UUID_B, "metadata": "enc", "permissionsWrite": true},
+				{"contactUUID": "owner", "metadata": "enc-owner", "permissionsWrite": false},
+			],
+		})
+	);
+}
+
+#[test]
+fn notes_participants_add_answer_accepts_a_contact_without_avatar_or_nick_name() {
+	let results = results::<single_notes::participants::add::Response<'static>>(processed(json!([
+		{
+			"status": true,
+			"code": "note_participant_added",
+			"message": "Note participant added.",
+			"data": {
+				"timestamp": 1_760_270_400_000_u64,
+				"email": "c@example.com",
+				"avatar": null,
+				"nickName": null,
+				"publicKey": "<pem>",
+			},
+		},
+		{
+			"status": true,
+			"code": "note_participant_added",
+			"message": "Participant added to note.",
+			"data": {
+				"timestamp": 1_760_270_400_000_u64,
+				"email": "d@example.com",
+				"avatar": "https://example.com/a.png",
+				"nickName": "D",
+				"publicKey": "<pem>",
+			},
+		},
+		{"status": true, "code": "note_participant_added", "message": "Participant added to note."},
+	])));
+	let [bare, full, existing] = <[_; 3]>::try_from(results).unwrap();
+
+	let bare = bare.into_data().unwrap();
+	assert_eq!(bare.timestamp.timestamp_millis(), 1_760_270_400_000);
+	assert_eq!(bare.avatar, None);
+	assert_eq!(bare.nick_name, None);
+	let full = full.into_data().unwrap();
+	assert_eq!(full.avatar.as_deref(), Some("https://example.com/a.png"));
+	assert_eq!(full.nick_name.as_deref(), Some("D"));
+	existing.ignore_data().unwrap();
+}
+
+#[test]
+fn chat_participants_add_request_and_answer_match_the_documented_example() {
+	let items = [chat::conversations::participants::add::Item {
+		contact_uuid: uuid(UUID_B),
+		metadata: rsa_enc("enc"),
+	}];
+	let request = chat::conversations::participants::add::Request {
+		uuid: uuid(UUID_A),
+		items: &items,
+	};
+	assert_eq!(
+		to_json(&request),
+		json!({"uuid": UUID_A, "items": [{"contactUUID": UUID_B, "metadata": "enc"}]})
+	);
+
+	let results = results::<crate::api::v3::chat::conversations::participants::add::Response>(
+		processed(json!([
+			{
+				"status": true,
+				"code": "participant_added",
+				"message": "Participant added to conversation.",
+				"data": {
+					"timestamp": 1_760_270_400_000_u64,
+					"lastActive": 0,
+					"appearOffline": true,
+				},
+			},
+			{"status": false, "code": "contact_blocked", "message": "Contact blocked."},
+		])),
+	);
+	let [added, blocked] = <[_; 2]>::try_from(results).unwrap();
+
+	let added = added.into_data().unwrap();
+	assert_eq!(added.timestamp.timestamp_millis(), 1_760_270_400_000);
+	assert_eq!(added.last_active.timestamp_millis(), 0);
+	assert!(added.appear_offline);
+	assert_eq!(
+		api_error_code(blocked.into_data().unwrap_err()).as_deref(),
+		Some("contact_blocked")
 	);
 }
