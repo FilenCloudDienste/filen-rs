@@ -16,9 +16,14 @@ mod error;
 ))]
 mod enumerate;
 mod handle;
-// UniFFI exports on mobile, wasm-bindgen twins on web. The twins share method names, which is
-// only sound because the two never compile together (`uniffi` is a native-only dependency).
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+// UniFFI exports on mobile, wasm-bindgen twins on web, napi twins on desktop. The twins share
+// method names, which is only sound because no two of them compile together (`uniffi` and `napi`
+// are native-only and refuse each other).
+#[cfg(any(
+	feature = "uniffi",
+	feature = "napi",
+	all(target_family = "wasm", target_os = "unknown")
+))]
 pub mod js_impl;
 pub mod search;
 mod sql;

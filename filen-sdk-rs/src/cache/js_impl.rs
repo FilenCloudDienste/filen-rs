@@ -1,4 +1,5 @@
-//! FFI exposure of the cache's configuration surface, for BOTH UniFFI (mobile) and wasm (web).
+//! FFI exposure of the cache's configuration surface, for UniFFI (mobile), wasm (web) and napi
+//! (desktop).
 //!
 //! Owned MIRROR types converted from the core enums (the core
 //! [`CacheMessage`] carries payloads that cannot cross the boundary — raw `rusqlite::Error`s and
@@ -6,7 +7,8 @@
 //! display strings). On UniFFI the listener is a `with_foreign` trait whose every invocation is
 //! `spawn_blocking`'d off the runtime; on wasm it is a `js_sys::Function` fed by a channel pump
 //! on the calling thread (the socket-listener pattern), since a JS function can never leave its
-//! thread. Method bodies ship to the commander thread via `do_on_commander`.
+//! thread. On napi it is the listener object, called through a weak threadsafe function bound to
+//! it. Method bodies ship to the commander thread via `do_on_commander`.
 
 use std::path::PathBuf;
 #[cfg(feature = "uniffi")]
@@ -19,9 +21,9 @@ use wasm_bindgen::JsValue;
 
 #[cfg(feature = "uniffi")]
 use crate::js::spawn_ordered_dispatch;
+#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+use crate::{Error, auth::JsClient};
 use crate::{
-	Error,
-	auth::JsClient,
 	cache::{CacheMessage, ResyncProgress},
 	runtime::do_on_commander,
 };
@@ -29,7 +31,7 @@ use crate::{
 /// FFI mirror of [`CacheMessage`] (see its docs for the full semantics of each variant).
 /// Delivery is BEST-EFFORT on every platform (messages can drop under load): treat each message
 /// as a fresh snapshot, never as a delta to accumulate.
-#[js_type(export, no_deser, tagged)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum CacheStatusMessage {
 	/// Mirror of [`CacheMessage::Error`]: non-fatal worker errors, flattened to display strings
 	/// (the structured payloads cannot cross the FFI boundary; definitive failures still arrive
@@ -44,7 +46,7 @@ pub enum CacheStatusMessage {
 
 /// FFI mirror of [`ResyncProgress`] (see its docs for the resync lifecycle and the
 /// worker-global attribution caveats). `root_index`/`root_count` are widened from `usize`.
-#[js_type(export, no_deser, tagged)]
+#[js_type(export, no_deser, tagged, napi)]
 pub enum ResyncProgressMessage {
 	Started {
 		roots: Vec<Uuid>,
@@ -184,6 +186,112 @@ impl JsClient {
 			.await
 		})
 		.await
+	}
+}
+
+#[cfg(feature = "napi")]
+mod napi_impl {
+	use napi::{
+		Env, Status,
+		bindgen_prelude::{Function, JsObjectValue, Object, PromiseRaw},
+		threadsafe_function::ThreadsafeFunctionCallMode,
+	};
+
+	use super::{CacheStatusMessage, PathBuf, do_on_commander};
+	use crate::js::napi::{IntoWire, Wire, spawn_promise};
+
+	/// `configureCache`'s body, outside the module whose `#[napi] impl` needs the `unsafe_code`
+	/// allow. A listener without a callable `onMessages` throws napi's own error synchronously.
+	// napi-derive registers the method calling this only outside `cfg(test)`.
+	#[cfg_attr(test, allow(dead_code))]
+	fn configure_cache<'env>(
+		client: &crate::auth::JsClient,
+		env: &'env Env,
+		cache_path: String,
+		status_listener: Object<'env>,
+		async_opts: Option<Object<'env>>,
+	) -> napi::Result<PromiseRaw<'env, ()>> {
+		let on_messages: Function<'env, Vec<<CacheStatusMessage as Wire>::Wire>, ()> =
+			status_listener.get_named_property("onMessages")?;
+		// ubrn calls `onMessages` as a method of the listener, so `this` is bound to it. Weak: a
+		// configured cache never keeps Node's event loop alive.
+		let listener = on_messages
+			.bind(status_listener)?
+			.build_threadsafe_function()
+			.weak::<true>()
+			.build()?;
+		let this = client.inner();
+		spawn_promise(env, async_opts, async move {
+			do_on_commander(move || async move {
+				this.configure_cache(PathBuf::from(cache_path), move |messages| {
+					let batch: Vec<_> = messages
+						.into_iter()
+						.map(|message| CacheStatusMessage::from(message).into_wire())
+						.collect();
+					// Non-blocking calls on an unbounded queue run on the JS thread in the order
+					// they were made, so no ordered dispatch task is needed here (the uniffi twin
+					// needs one). A listener that throws is logged instead of becoming an uncaught
+					// exception, which would end the process.
+					let status = listener.call_with_return_value(
+						batch,
+						ThreadsafeFunctionCallMode::NonBlocking,
+						|result, _| {
+							if let Err(e) = result {
+								tracing::warn!("cache status listener threw: {e}");
+							}
+							Ok(())
+						},
+					);
+					// `Closing`: the Node environment is gone, so nobody is left to tell.
+					if status != Status::Ok && status != Status::Closing {
+						tracing::warn!("cache status batch not delivered: {status}");
+					}
+				})
+				.await
+			})
+			.await
+		})
+	}
+
+	// napi-derive's generated FFI glue (the raw N-API calls of the method's callback) lands in
+	// this module, which holds nothing but the napi impl forwarding to `configure_cache`.
+	#[allow(unsafe_code)]
+	mod class {
+		use napi::{
+			Env,
+			bindgen_prelude::{Object, PromiseRaw},
+		};
+		use napi_derive::napi;
+
+		use super::configure_cache;
+		use crate::js::napi::JsClient;
+
+		#[napi]
+		impl JsClient {
+			/// Pre-warm the cache: store the SQLite DB path and the global status listener on
+			/// the client. PURE STORAGE — no worker spawns, no file is opened and no network I/O
+			/// happens until the first sync root is added — and the configuration survives
+			/// worker restarts, so call this once early (e.g. at app startup right after login).
+			///
+			/// Errors with `InvalidState` if a cache worker is currently live; reconfiguring is
+			/// allowed once every sync-root handle is dropped or the cache is flushed.
+			#[napi(
+				js_name = "configureCache",
+				ts_args_type = "cachePath: string, statusListener: CacheStatusListener, asyncOpts_?: { signal: AbortSignal }",
+				ts_return_type = "Promise<void>"
+			)]
+			// napi-derive accepts only `pub` methods; the class they belong to is `pub(crate)`.
+			#[allow(unreachable_pub)]
+			pub fn __napi_configure_cache<'env>(
+				&self,
+				env: &'env Env,
+				cache_path: String,
+				status_listener: Object<'env>,
+				async_opts: Option<Object<'env>>,
+			) -> napi::Result<PromiseRaw<'env, ()>> {
+				configure_cache(&self.0, env, cache_path, status_listener, async_opts)
+			}
+		}
 	}
 }
 

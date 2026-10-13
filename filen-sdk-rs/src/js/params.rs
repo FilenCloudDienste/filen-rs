@@ -176,7 +176,7 @@ pub struct UploadFileStreamParams {
 	pub managed_future: ManagedFuture,
 }
 
-#[js_type(import)]
+#[js_type(import, napi)]
 pub struct LoginParams {
 	pub email: String,
 	pub password: String,

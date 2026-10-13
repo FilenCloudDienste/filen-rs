@@ -309,7 +309,7 @@ impl Eq for Client {}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[js_type(import, export, wasm_all, no_ser, no_deser)]
+#[js_type(import, export, wasm_all, no_ser, no_deser, napi)]
 pub struct StringifiedClient {
 	pub email: String,
 	pub user_id: u64,

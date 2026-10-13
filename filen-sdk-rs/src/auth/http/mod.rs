@@ -283,7 +283,7 @@ pub enum LogLevel {
 	feature = "napi",
 	all(target_family = "wasm", target_os = "unknown")
 ))]
-#[js_type(import, no_ser, wasm_all)]
+#[js_type(import, no_ser, wasm_all, napi)]
 pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
 	pub concurrency: Option<u32>,

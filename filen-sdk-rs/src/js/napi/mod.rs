@@ -13,8 +13,6 @@ mod error;
 // because of the glue napi-derive generates for the `#[napi]` items here and in `error`. The
 // hand-written impls and helpers beside those items carry the deny one by one.
 #[deny(unsafe_code)]
-// No `#[napi_export]` async method returns a promise yet.
-#[allow(dead_code)]
 mod promise;
 #[deny(unsafe_code)]
 mod wire;
@@ -22,8 +20,6 @@ mod wire;
 use napi_derive::napi;
 
 pub(crate) use error::throw;
-// The contract of the `#[napi_export]` wrappers `filen_macros` writes; no method is exported yet.
-#[expect(unused_imports)]
 pub(crate) use promise::spawn_promise;
 pub(crate) use wire::{FromWire, IntoWire, OptionReturn, Wire};
 
@@ -34,8 +30,6 @@ use crate::auth::{self, http::LogLevel};
 // expanded the class's struct first.
 
 #[napi(js_name = "JsClient")]
-// No `#[napi_export]` method reads the client yet.
-#[allow(dead_code)]
 pub(crate) struct JsClient(pub(crate) auth::JsClient);
 
 #[deny(unsafe_code)]
@@ -51,8 +45,6 @@ impl IntoWire for auth::JsClient {
 }
 
 #[napi(js_name = "UnauthJsClient")]
-// No `#[napi_export]` method reads the client yet.
-#[allow(dead_code)]
 pub(crate) struct UnauthJsClient(pub(crate) auth::js_impls::UnauthJsClient);
 
 #[deny(unsafe_code)]

@@ -77,6 +77,7 @@ impl JsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen(js_name = "toStringified")
 	)]
+	#[napi_export]
 	pub async fn to_stringified(&self) -> StringifiedClient {
 		let this = self.inner();
 		crate::runtime::do_on_commander(
@@ -300,6 +301,7 @@ impl UnauthClient {}
 	wasm_bindgen::prelude::wasm_bindgen(js_class = "UnauthClient")
 )]
 impl UnauthJsClient {
+	#[napi_export]
 	#[cfg_attr(feature = "uniffi", uniffi::constructor)]
 	pub fn from_config(client_config: JsClientConfig) -> Result<Self, Error> {
 		let config: ClientConfig = client_config.into();
@@ -310,6 +312,7 @@ impl UnauthJsClient {
 		all(target_family = "wasm", target_os = "unknown"),
 		wasm_bindgen::prelude::wasm_bindgen(js_name = "fromStringified")
 	)]
+	#[napi_export]
 	pub fn from_stringified(
 		&self,
 		serialized: StringifiedClient,
@@ -370,6 +373,7 @@ impl UnauthJsClient {
 	}
 
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), wasm_bindgen)]
+	#[napi_export]
 	pub async fn login(&self, params: crate::js::LoginParams) -> Result<JsClient, Error> {
 		let this = self.inner();
 		let client = do_on_commander(move || async move {
