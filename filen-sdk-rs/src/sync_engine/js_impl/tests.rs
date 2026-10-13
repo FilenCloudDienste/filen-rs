@@ -6,11 +6,14 @@ use std::{
 use tokio::sync::{mpsc::unbounded_channel, oneshot, watch};
 
 use super::{
-	JsSyncEngine, LOOP_ENDED, LiveState, OPEN_ENGINES, PairSlot, RECENT_EVENTS, StatusPump,
-	SyncEngineCore, claim_key,
+	JsSyncEngine, JsSyncPlan, LOOP_ENDED, LiveState, OPEN_ENGINES, PairSlot, PauseRecord,
+	RECENT_EVENTS, StatusPump, SyncEngineCore, claim_key,
 	delivery::Delivery,
 	lock, pump_status,
-	types::{SyncEventMessage, SyncPairActivity},
+	types::{
+		DeleteGuardState, SyncConflictPage, SyncEventMessage, SyncGuardReason, SyncPairActivity,
+		SyncPairInfo, SyncPauseOptions, SyncPlanSummary, delete_guard,
+	},
 };
 use crate::{
 	Error, ErrorKind,
@@ -19,7 +22,10 @@ use crate::{
 		test_support::{offline_client, offline_client_with_root},
 	},
 	sync_engine::{
-		BaselineInUse, SyncEvent, SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
+		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, GuardReason, PauseMode,
+		PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind, SyncEvent,
+		SyncMode, SyncReport, TransferDirection, WatchState, WatchStatus,
+		baseline::{BaselineEntry, BaselineState, BaselineStore, NodeKind},
 	},
 };
 
@@ -531,4 +537,383 @@ async fn a_loop_that_ends_with_a_terminal_status_is_reported_as_it_said() {
 		WatchState::PairRemoved
 	);
 	assert!(received.recv().await.is_none());
+}
+
+fn action(kind: PlannedActionKind, index: usize, size: Option<u64>) -> PlannedAction {
+	PlannedAction {
+		kind,
+		rel_path: format!("action-{index}"),
+		node: PlannedNodeKind::File,
+		size,
+	}
+}
+
+/// A plan of `actions` uploads, numbered from 0.
+fn plan_of(actions: usize) -> JsSyncPlan {
+	JsSyncPlan::new(PlanOutcome {
+		actions: (0..actions)
+			.map(|index| action(PlannedActionKind::UploadFile, index, Some(1)))
+			.collect(),
+		..PlanOutcome::default()
+	})
+}
+
+fn paths(actions: &[PlannedAction]) -> Vec<&str> {
+	actions
+		.iter()
+		.map(|action| action.rel_path.as_str())
+		.collect()
+}
+
+#[test]
+fn a_plan_page_runs_from_its_offset_for_its_limit() {
+	let plan = plan_of(1500);
+
+	assert_eq!(
+		paths(&plan.actions(1490, 3)),
+		["action-1490", "action-1491", "action-1492"]
+	);
+	assert_eq!(
+		paths(&plan.actions(1497, 3)),
+		["action-1497", "action-1498", "action-1499"],
+		"a page ending exactly at the end"
+	);
+	assert_eq!(paths(&plan.actions(1499, 10)), ["action-1499"]);
+}
+
+#[test]
+fn a_plan_page_past_the_end_or_of_no_entries_is_empty() {
+	let plan = plan_of(1500);
+
+	assert!(plan.actions(1500, 10).is_empty());
+	assert!(plan.actions(u64::MAX, 10).is_empty());
+	assert!(plan.actions(0, 0).is_empty());
+}
+
+#[test]
+fn a_plan_page_holds_at_most_a_thousand_entries() {
+	let plan = plan_of(1500);
+
+	let page = plan.actions(0, 5000);
+	assert_eq!(page.len(), 1000);
+	assert_eq!(
+		page.last().map(|action| action.rel_path.as_str()),
+		Some("action-999")
+	);
+	assert_eq!(plan.actions(0, u64::MAX).len(), 1000);
+}
+
+#[test]
+fn a_plans_summary_counts_its_lists_and_bytes() {
+	let plan = JsSyncPlan::new(PlanOutcome {
+		actions: vec![
+			action(PlannedActionKind::UploadFile, 0, Some(10)),
+			action(PlannedActionKind::UploadFile, 1, None),
+			action(PlannedActionKind::UploadFile, 2, Some(5)),
+			action(PlannedActionKind::DownloadFile, 3, Some(u64::MAX)),
+			action(PlannedActionKind::DownloadFile, 4, Some(1)),
+			action(
+				PlannedActionKind::MoveRemote {
+					to: "elsewhere".to_owned(),
+				},
+				5,
+				Some(100),
+			),
+		],
+		held: vec![
+			action(PlannedActionKind::TrashRemote, 6, Some(1)),
+			action(PlannedActionKind::DeleteLocal, 7, Some(1)),
+			action(PlannedActionKind::CreateLocalDir, 8, None),
+		],
+		held_reason: Some(GuardReason::ExceededThreshold {
+			deletions: 2,
+			limit: 1,
+		}),
+		pass_token: Some("token".to_owned()),
+		..PlanOutcome::default()
+	});
+
+	assert_eq!(
+		plan.summary(),
+		SyncPlanSummary {
+			actions_total: 6,
+			upload_bytes: 15,
+			download_bytes: u64::MAX,
+			held_total: 3,
+			held_deletions: 2,
+			held_reason: Some(SyncGuardReason::ExceededThreshold {
+				deletions: 2,
+				limit: 1,
+			}),
+			pass_token: Some("token".to_owned()),
+			conflicts_total: 0,
+			unsyncable_total: 0,
+			ignored_total: 0,
+			refused: None,
+		}
+	);
+}
+
+#[test]
+fn releasing_a_plan_empties_its_lists_and_keeps_its_summary() {
+	let plan = JsSyncPlan::new(PlanOutcome {
+		actions: vec![action(PlannedActionKind::UploadFile, 0, Some(1))],
+		held: vec![action(PlannedActionKind::TrashRemote, 1, None)],
+		conflicts: vec![PlannedConflict {
+			rel_path: "conflict".to_owned(),
+			local: Some(PlannedNodeKind::File),
+			remote: Some(PlannedNodeKind::File),
+		}],
+		..PlanOutcome::default()
+	});
+	let summary = plan.summary();
+	assert_eq!(plan.held(0, 10).len(), 1);
+
+	plan.release();
+	plan.release();
+
+	assert_eq!(plan.summary(), summary);
+	assert_eq!(summary.actions_total, 1);
+	assert!(plan.actions(0, 10).is_empty());
+	assert!(plan.held(0, 10).is_empty());
+	assert!(plan.conflicts(0, 10).is_empty());
+	assert!(plan.unsyncable(0, 10).is_empty());
+	assert!(plan.ignored(0, 10).is_empty());
+}
+
+#[test]
+fn a_delete_guard_ratio_above_one_is_refused() {
+	let refused = refusal_message(delete_guard(3, 1.5));
+	assert!(refused.contains("between 0.0 and 1.0"), "{refused}");
+	assert_eq!(
+		delete_guard(3, 0.25).unwrap(),
+		DeleteGuard::new(3, 0.25).unwrap()
+	);
+}
+
+async fn pair_info(core: &SyncEngineCore) -> SyncPairInfo {
+	let mut pairs = core.list_pairs().await.unwrap();
+	assert_eq!(pairs.len(), 1);
+	pairs.remove(0)
+}
+
+#[tokio::test]
+async fn a_pairs_delete_guard_reads_back_as_set() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+
+	core.set_delete_guard(pair, delete_guard(3, 0.25).unwrap())
+		.await
+		.unwrap();
+	assert_eq!(
+		pair_info(&core).await.delete_guard,
+		DeleteGuardState::Limited {
+			floor: 3,
+			ratio: 0.25
+		}
+	);
+
+	core.set_delete_guard(pair, DeleteGuard::unlimited())
+		.await
+		.unwrap();
+	assert_eq!(
+		pair_info(&core).await.delete_guard,
+		DeleteGuardState::Unlimited
+	);
+}
+
+#[tokio::test]
+async fn a_pause_without_options_records_the_default() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+
+	core.pause_pair(pair, None).await.unwrap();
+
+	let info = pair_info(&core).await;
+	assert!(info.paused);
+	assert!(info.paused_at_ms.is_some());
+	assert_eq!(
+		info.pause_options,
+		Some(SyncPauseOptions {
+			mode: PauseMode::Suspend,
+			cancel_after_ms: Some(300_000),
+		})
+	);
+}
+
+#[tokio::test]
+async fn a_pause_records_its_options_until_the_pair_resumes() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	let options = SyncPauseOptions {
+		mode: PauseMode::Cancel,
+		cancel_after_ms: Some(1500),
+	};
+
+	core.pause_pair(pair, Some(options.clone())).await.unwrap();
+	let paused = pair_info(&core).await;
+	assert!(paused.paused);
+	assert!(paused.paused_at_ms.is_some());
+	assert_eq!(paused.pause_options, Some(options));
+
+	core.resume_pair(pair).await.unwrap();
+	let resumed = pair_info(&core).await;
+	assert!(!resumed.paused);
+	assert_eq!(resumed.paused_at_ms, None);
+	assert_eq!(resumed.pause_options, None);
+}
+
+#[tokio::test]
+async fn cancelling_a_suspended_pauses_actions_shows_the_pause_as_cancel() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	core.pause_pair(pair, None).await.unwrap();
+	let paused_at_ms = pair_info(&core).await.paused_at_ms;
+
+	core.cancel_paused_actions(pair).await.unwrap();
+
+	let info = pair_info(&core).await;
+	assert_eq!(
+		info.pause_options,
+		Some(SyncPauseOptions {
+			mode: PauseMode::Cancel,
+			cancel_after_ms: Some(300_000),
+		})
+	);
+	assert_eq!(info.paused_at_ms, paused_at_ms, "the pause's time stays");
+}
+
+#[tokio::test]
+async fn a_pause_record_left_on_an_unpaused_pair_is_not_shown() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	lock(&core.live.pairs)
+		.entry(super::pair_id_in(pair).unwrap())
+		.or_default()
+		.pause = Some(PauseRecord {
+		at_ms: 1,
+		options: SyncPauseOptions {
+			mode: PauseMode::Suspend,
+			cancel_after_ms: None,
+		},
+	});
+
+	let info = pair_info(&core).await;
+
+	assert!(!info.paused);
+	assert_eq!(info.paused_at_ms, None);
+	assert_eq!(info.pause_options, None);
+}
+
+/// Hold a conflict at each of `paths` on `pair`, written to the baseline on a connection of the
+/// test's own, as a pass that surfaced them would leave them.
+fn hold_conflicts(scene: &Scene, pair: u64, paths: &[&str]) {
+	let store = BaselineStore::open(&scene.db()).unwrap();
+	let pair = super::pair_id_in(pair).unwrap();
+	for path in paths {
+		store
+			.upsert_entry(
+				pair,
+				&BaselineEntry {
+					rel_path: (*path).to_owned(),
+					kind: NodeKind::File,
+					remote_uuid: None,
+					content_hash: None,
+					size: None,
+					local_mtime: None,
+					remote_modified: None,
+					state: BaselineState::Conflicted,
+					local_kind: Some(NodeKind::File),
+					remote_kind: None,
+					remote_hash: None,
+					remote_size: None,
+					remote_stable_uuid: None,
+					agreed_hash: None,
+				},
+			)
+			.unwrap();
+	}
+}
+
+fn conflict_paths(page: &SyncConflictPage) -> Vec<&str> {
+	page.conflicts
+		.iter()
+		.map(|conflict| conflict.rel_path.as_str())
+		.collect()
+}
+
+#[tokio::test]
+async fn a_conflict_page_of_no_entries_still_counts_them_all() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	hold_conflicts(&scene, pair, &["c", "a", "b"]);
+
+	assert_eq!(
+		core.list_conflicts(pair, 0, 0).await.unwrap(),
+		SyncConflictPage {
+			conflicts: Vec::new(),
+			total: 3,
+		}
+	);
+}
+
+#[tokio::test]
+async fn a_conflict_page_runs_in_path_order_from_its_offset_for_its_limit() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	hold_conflicts(&scene, pair, &["c", "a", "b"]);
+
+	let middle = core.list_conflicts(pair, 1, 1).await.unwrap();
+	assert_eq!(conflict_paths(&middle), ["b"]);
+	assert_eq!(middle.total, 3);
+	let tail = core.list_conflicts(pair, 1, 10).await.unwrap();
+	assert_eq!(conflict_paths(&tail), ["b", "c"], "clamped at the end");
+	let past = core.list_conflicts(pair, 3, 10).await.unwrap();
+	assert!(past.conflicts.is_empty());
+	assert_eq!(past.total, 3);
+}
+
+#[tokio::test]
+async fn a_pair_without_conflicts_lists_an_empty_page() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+
+	assert_eq!(
+		core.list_conflicts(pair, 0, 0).await.unwrap(),
+		SyncConflictPage {
+			conflicts: Vec::new(),
+			total: 0,
+		}
+	);
+}
+
+#[tokio::test]
+async fn every_control_verb_is_refused_once_the_engine_is_closed() {
+	let scene = Scene::new();
+	let (core, pair) = scene.with_pair().await;
+	Arc::clone(&core).close().await.unwrap();
+
+	let refusals = [
+		refusal_message(
+			core.reconfigure_pair(pair, SyncMode::LocalToRemote, Backlog::Propagate)
+				.await,
+		),
+		refusal_message(core.set_delete_guard(pair, DeleteGuard::unlimited()).await),
+		refusal_message(core.pause_pair(pair, None).await),
+		refusal_message(core.cancel_paused_actions(pair).await),
+		refusal_message(core.resume_pair(pair).await),
+		refusal_message(core.approve_deletions(pair, "token").await),
+		refusal_message(core.list_conflicts(pair, 0, 10).await),
+		refusal_message(
+			core.resolve_conflict(pair, "a", ConflictResolution::KeepLocal)
+				.await,
+		),
+		refusal_message(core.retry_path(pair, "a").await),
+		refusal_message(core.user_ignore().await),
+		refusal_message(core.set_user_ignore("*.tmp").await),
+		refusal_message(core.plan_pair(pair).await),
+	];
+	for refused in refusals {
+		assert!(refused.contains("the sync engine is closed"), "{refused}");
+	}
 }

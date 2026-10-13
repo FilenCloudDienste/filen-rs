@@ -50,18 +50,19 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
 use self::{
 	delivery::{Delivery, Listener, ListenerSlot, spawn_delivery},
 	types::{
-		SyncEventMessage, SyncPairActivity, SyncPairInfo, SyncPassEvent, SyncPassReport,
-		SyncWatchConfig,
+		SyncConflictPage, SyncEventMessage, SyncPairActivity, SyncPairInfo, SyncPassEvent,
+		SyncPassReport, SyncPauseOptions, SyncPlanSummary, SyncWatchConfig, page, path_string,
 	},
 };
 use crate::{
 	Error, ErrorKind,
 	auth::Client,
 	fs::HasUUID,
-	runtime::do_on_commander,
+	runtime::{do_on_commander, spawn},
 	sync_engine::{
-		BaselineInUse, PairId, SyncEngine, SyncEvent, SyncMode, SyncObserver, WatchConfig,
-		WatchHandle, WatchState, WatchStatus,
+		Backlog, BaselineInUse, ConflictResolution, DeleteGuard, IgnoredPath, PairId, PauseMode,
+		PauseOptions, PlanOutcome, PlannedAction, PlannedConflict, SyncEngine, SyncEvent, SyncMode,
+		SyncObserver, UnsyncablePath, WatchConfig, WatchHandle, WatchState, WatchStatus,
 	},
 };
 
@@ -230,6 +231,16 @@ struct PairLive {
 	last_report: Option<SyncPassReport>,
 	last_pass_completed_at_ms: Option<u64>,
 	last_pass_error: Option<String>,
+	/// The last pause this process made, until a resume clears it.
+	pause: Option<PauseRecord>,
+}
+
+/// A `pause_pair` call the engine took, for a countdown to its escalation.
+struct PauseRecord {
+	/// Unix epoch milliseconds.
+	at_ms: u64,
+	/// What the pause was given, with the default filled in.
+	options: SyncPauseOptions,
 }
 
 /// The part of the core every pass's observer writes to. Its own `Arc` rather than the core's, so
@@ -326,6 +337,9 @@ pub(super) struct SyncEngineCore {
 	listener: ListenerSlot,
 	/// The next watch id.
 	watches: AtomicU64,
+	/// Held across a pause or resume and its bookkeeping, so two racing calls record their pauses
+	/// in the order the engine applied them.
+	pausing: tokio::sync::Mutex<()>,
 	/// The account the engine was opened for (its root folder), which a second open must match to
 	/// attach.
 	account: Uuid,
@@ -385,6 +399,7 @@ impl SyncEngineCore {
 			}),
 			listener,
 			watches: AtomicU64::new(1),
+			pausing: tokio::sync::Mutex::new(()),
 			account,
 			runtime: tokio::runtime::Handle::current(),
 		});
@@ -540,6 +555,15 @@ impl SyncEngineCore {
 				info.pass_in_flight = live.pass_in_flight;
 				info.last_pass_completed_at_ms = live.last_pass_completed_at_ms;
 				info.last_pass_error.clone_from(&live.last_pass_error);
+				// Only while the engine says the pair is paused: a resume whose sweep failed after
+				// the pair had resumed leaves the record behind.
+				if info.paused
+					&& let Some(pause) = &live.pause
+				{
+					info.paused_at_ms = Some(pause.at_ms);
+					// JS gets its own copy; the binding keeps the record.
+					info.pause_options = Some(pause.options.clone());
+				}
 			}
 			infos.push(info);
 		}
@@ -675,6 +699,128 @@ impl SyncEngineCore {
 			));
 		}
 		open.engine.request_pass(pair).await
+	}
+
+	async fn reconfigure_pair(
+		&self,
+		pair_id: u64,
+		mode: SyncMode,
+		backlog: Backlog,
+	) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?
+			.engine
+			.reconfigure_pair(pair, mode, backlog)
+			.await
+	}
+
+	async fn set_delete_guard(&self, pair_id: u64, guard: DeleteGuard) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?.engine.set_delete_guard(pair, guard).await
+	}
+
+	async fn pause_pair(
+		&self,
+		pair_id: u64,
+		options: Option<SyncPauseOptions>,
+	) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		let open = self.engine()?;
+		let options = options.map_or_else(PauseOptions::default, Into::into);
+		let _pausing = self.pausing.lock().await;
+		// Taken before the engine call, which sets its escalation deadline on entry and may then
+		// wait seconds behind another pair's commit: the countdown must not end after the deadline.
+		let at_ms = now_ms();
+		open.engine.pause_pair_with(pair, options).await?;
+		lock(&self.live.pairs).entry(pair).or_default().pause = Some(PauseRecord {
+			at_ms,
+			options: options.into(),
+		});
+		Ok(())
+	}
+
+	async fn cancel_paused_actions(&self, pair_id: u64) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		let open = self.engine()?;
+		let _pausing = self.pausing.lock().await;
+		open.engine.cancel_paused_actions(pair).await?;
+		// The pause has escalated: no countdown is left to show.
+		if let Some(pause) = lock(&self.live.pairs)
+			.get_mut(&pair)
+			.and_then(|live| live.pause.as_mut())
+		{
+			pause.options.mode = PauseMode::Cancel;
+		}
+		Ok(())
+	}
+
+	async fn resume_pair(&self, pair_id: u64) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		let open = self.engine()?;
+		let _pausing = self.pausing.lock().await;
+		open.engine.resume_pair(pair).await?;
+		if let Some(live) = lock(&self.live.pairs).get_mut(&pair) {
+			live.pause = None;
+		}
+		Ok(())
+	}
+
+	async fn approve_deletions(&self, pair_id: u64, pass_token: &str) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?
+			.engine
+			.approve_deletions(pair, pass_token)
+			.await;
+		Ok(())
+	}
+
+	async fn list_conflicts(
+		&self,
+		pair_id: u64,
+		offset: u64,
+		limit: u64,
+	) -> Result<SyncConflictPage, Error> {
+		let pair = pair_id_in(pair_id)?;
+		let conflicts = self.engine()?.engine.list_conflicts(pair).await?;
+		Ok(SyncConflictPage {
+			// A page's copies of at most a thousand entries; the whole list goes right after.
+			conflicts: page(&conflicts, offset, limit),
+			total: conflicts.len() as u64,
+		})
+	}
+
+	async fn resolve_conflict(
+		&self,
+		pair_id: u64,
+		rel_path: &str,
+		resolution: ConflictResolution,
+	) -> Result<Option<String>, Error> {
+		let pair = pair_id_in(pair_id)?;
+		let quarantined = self
+			.engine()?
+			.engine
+			.resolve_conflict(pair, rel_path, resolution)
+			.await?;
+		Ok(quarantined.map(path_string))
+	}
+
+	async fn retry_path(&self, pair_id: u64, rel_path: &str) -> Result<(), Error> {
+		let pair = pair_id_in(pair_id)?;
+		self.engine()?.engine.retry_path(pair, rel_path).await
+	}
+
+	async fn user_ignore(&self) -> Result<String, Error> {
+		self.engine()?.engine.user_ignore().await
+	}
+
+	async fn set_user_ignore(&self, patterns: &str) -> Result<(), Error> {
+		self.engine()?.engine.set_user_ignore(patterns).await
+	}
+
+	async fn plan_pair(&self, pair_id: u64) -> Result<JsSyncPlan, Error> {
+		let pair = pair_id_in(pair_id)?;
+		let outcome = self.engine()?.engine.plan_pair(pair).await?;
+		Ok(JsSyncPlan::new(outcome))
 	}
 }
 
@@ -933,6 +1079,235 @@ impl JsSyncEngine {
 			core.request_pass(pair_id).await
 		})
 		.await
+	}
+
+	/// Switch a pair's mode; `backlog` says what becomes of what a backup mode held back. Does not
+	/// wake a watch: follow with [`request_pass`](Self::request_pass) or
+	/// [`sync_once`](Self::sync_once) to apply it now.
+	pub async fn reconfigure_pair(
+		&self,
+		pair_id: u64,
+		mode: SyncMode,
+		backlog: Backlog,
+	) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.reconfigure_pair(pair_id, mode, backlog).await
+		})
+		.await
+	}
+
+	/// Hold a pass's deletions beyond `max(floor, ratio × tracked items)`, from the next pass on.
+	/// Refused for a `ratio` outside `0.0..=1.0`. A new pair starts on floor 10, ratio 0.5.
+	pub async fn set_delete_guard(
+		&self,
+		pair_id: u64,
+		floor: u64,
+		ratio: f64,
+	) -> Result<(), Error> {
+		let guard = types::delete_guard(floor, ratio)?;
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.set_delete_guard(pair_id, guard).await
+		})
+		.await
+	}
+
+	/// Turn off the mass-delete guard's volume check for a pair; the holds for untrustworthy
+	/// evidence (an incomplete scan, a first sync, an unconverged or empty remote) still apply.
+	pub async fn set_delete_guard_unlimited(&self, pair_id: u64) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.set_delete_guard(pair_id, DeleteGuard::unlimited())
+				.await
+		})
+		.await
+	}
+
+	/// Pause a pair (persisted). `None` suspends the pass in flight and cancels it after 300 s. A
+	/// running watch survives the pause. The pause's time and options show on the pair's
+	/// [`SyncPairInfo`] until [`resume_pair`](Self::resume_pair), in this process only.
+	pub async fn pause_pair(
+		&self,
+		pair_id: u64,
+		options: Option<SyncPauseOptions>,
+	) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.pause_pair(pair_id, options).await
+		})
+		.await
+	}
+
+	/// Give up the transfers a suspended pause parked now rather than at its `cancel_after_ms`. The
+	/// pair stays paused, and its [`SyncPairInfo`] shows the pause's mode as `Cancel` from then on.
+	/// Refused when it is not paused.
+	pub async fn cancel_paused_actions(&self, pair_id: u64) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.cancel_paused_actions(pair_id).await
+		})
+		.await
+	}
+
+	/// Resume a paused pair. A pair paused when the engine opened has no watch: start one with
+	/// [`watch_pair`](Self::watch_pair) afterwards.
+	pub async fn resume_pair(&self, pair_id: u64) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.resume_pair(pair_id).await
+		})
+		.await
+	}
+
+	/// Let the next pass apply the deletions the guard held under `pass_token`, and only those. In
+	/// memory only: lost when the process ends.
+	pub async fn approve_deletions(&self, pair_id: u64, pass_token: String) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.approve_deletions(pair_id, &pass_token).await
+		})
+		.await
+	}
+
+	/// A page of the conflicts the pair holds, in path order, read from the baseline (no network):
+	/// at most `limit` of them, and never more than 1000, from `offset` on. `limit` 0 gives only
+	/// the total.
+	pub async fn list_conflicts(
+		&self,
+		pair_id: u64,
+		offset: u64,
+		limit: u64,
+	) -> Result<SyncConflictPage, Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.list_conflicts(pair_id, offset, limit).await
+		})
+		.await
+	}
+
+	/// Resolve the conflict held at `rel_path`, from the next pass on. Returns where the local copy
+	/// was quarantined when `KeepRemote` replaced different content.
+	pub async fn resolve_conflict(
+		&self,
+		pair_id: u64,
+		rel_path: String,
+		resolution: ConflictResolution,
+	) -> Result<Option<String>, Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.resolve_conflict(pair_id, &rel_path, resolution).await
+		})
+		.await
+	}
+
+	/// Plan a path that kept failing again on the next pass, without waiting out the engine's
+	/// hourly retry.
+	pub async fn retry_path(&self, pair_id: u64, rel_path: String) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.retry_path(pair_id, &rel_path).await
+		})
+		.await
+	}
+
+	/// The device-wide user ignore patterns (gitignore syntax), `""` when unset.
+	pub async fn user_ignore(&self) -> Result<String, Error> {
+		detached(Arc::clone(&self.core), |core| async move {
+			core.user_ignore().await
+		})
+		.await
+	}
+
+	/// Replace the device-wide user ignore patterns; a text with a line that does not parse is
+	/// refused whole, naming that line. Wakes every watch.
+	pub async fn set_user_ignore(&self, patterns: String) -> Result<(), Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.set_user_ignore(&patterns).await
+		})
+		.await
+	}
+
+	/// What a pass of the pair would do now, without doing it: a dry run that reads both sides.
+	/// Works on a paused pair.
+	pub async fn plan_pair(&self, pair_id: u64) -> Result<JsSyncPlan, Error> {
+		detached(Arc::clone(&self.core), move |core| async move {
+			core.plan_pair(pair_id).await
+		})
+		.await
+	}
+}
+
+/// A dry run's outcome, read a page at a time: on a first sync of a large tree its lists run to
+/// hundreds of MB, which JS should neither copy whole nor keep alive unseen. Every page holds at
+/// most 1000 entries; one past the end is empty.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+pub struct JsSyncPlan {
+	/// Counted when the plan is made, so it outlives [`release`](Self::release).
+	summary: SyncPlanSummary,
+	/// `None` once released.
+	outcome: Mutex<Option<PlanOutcome>>,
+}
+
+impl JsSyncPlan {
+	fn new(outcome: PlanOutcome) -> Self {
+		Self {
+			summary: SyncPlanSummary::from(&outcome),
+			outcome: Mutex::new(Some(outcome)),
+		}
+	}
+
+	fn page_of<T: Clone>(
+		&self,
+		list: impl FnOnce(&PlanOutcome) -> &[T],
+		offset: u64,
+		limit: u64,
+	) -> Vec<T> {
+		lock(&self.outcome)
+			.as_ref()
+			.map(|outcome| page(list(outcome), offset, limit))
+			.unwrap_or_default()
+	}
+}
+
+/// A plan JS collects without releasing is freed like a released one, off the JS thread.
+impl Drop for JsSyncPlan {
+	fn drop(&mut self) {
+		self.release();
+	}
+}
+
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl JsSyncPlan {
+	/// The plan's counts; the same after [`release`](Self::release).
+	pub fn summary(&self) -> SyncPlanSummary {
+		// JS gets its own copy; the plan keeps its summary.
+		self.summary.clone()
+	}
+
+	/// The actions a pass would apply, in apply order.
+	pub fn actions(&self, offset: u64, limit: u64) -> Vec<PlannedAction> {
+		self.page_of(|outcome| outcome.actions.as_slice(), offset, limit)
+	}
+
+	/// What the mass-delete guard would hold back.
+	pub fn held(&self, offset: u64, limit: u64) -> Vec<PlannedAction> {
+		self.page_of(|outcome| outcome.held.as_slice(), offset, limit)
+	}
+
+	/// The paths that would be held as conflicts.
+	pub fn conflicts(&self, offset: u64, limit: u64) -> Vec<PlannedConflict> {
+		self.page_of(|outcome| outcome.conflicts.as_slice(), offset, limit)
+	}
+
+	/// The paths the engine will not act on, and why.
+	pub fn unsyncable(&self, offset: u64, limit: u64) -> Vec<UnsyncablePath> {
+		self.page_of(|outcome| outcome.unsyncable.as_slice(), offset, limit)
+	}
+
+	/// The top of each subtree the ignore rules would hide.
+	pub fn ignored(&self, offset: u64, limit: u64) -> Vec<IgnoredPath> {
+		self.page_of(|outcome| outcome.ignored.as_slice(), offset, limit)
+	}
+
+	/// Let the plan's lists go now rather than when JS collects this object: every list is empty
+	/// afterwards, and [`summary`](Self::summary) stays. Idempotent.
+	pub fn release(&self) {
+		// Taken under the lock, and freed on a thread of its own: the call comes on the JS thread,
+		// and a first sync's lists are millions of allocations.
+		if let Some(released) = lock(&self.outcome).take() {
+			spawn(move || drop(released));
+		}
 	}
 }
 

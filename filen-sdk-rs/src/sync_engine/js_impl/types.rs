@@ -3,7 +3,7 @@
 //! which crosses as is. Counts and bytes widen to `u64`, durations become milliseconds, paths
 //! become (lossy UTF-8) strings, and a report's lists are capped at [`REPORT_LIST_LIMIT`].
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use filen_macros::js_type;
 use filen_types::fs::Uuid;
@@ -13,9 +13,9 @@ use crate::{
 	job::millis,
 	sync_engine::{
 		BaselineInUse, DeleteGuard, GuardReason, HaltReason, IgnoredPath, PairId, PairOverlap,
-		PairRecord, PauseMode, PauseOptions, PlannedAction, PlannedConflict, RefuseReason,
-		SyncEvent, SyncMode, SyncReport, TransferDirection, UnsyncablePath, WatchConfig,
-		WatchStatus,
+		PairRecord, PauseMode, PauseOptions, PlanOutcome, PlannedAction, PlannedActionKind,
+		PlannedConflict, RefuseReason, SyncEvent, SyncMode, SyncReport, TransferDirection,
+		UnsyncablePath, WatchConfig, WatchStatus,
 	},
 };
 
@@ -44,6 +44,28 @@ fn capped<T>(mut list: Vec<T>) -> (Vec<T>, u64) {
 	// list's allocation alive.
 	list.shrink_to_fit();
 	(list, total)
+}
+
+/// The entries of `list` from `offset` on, at most `limit` of them and never more than
+/// [`REPORT_LIST_LIMIT`]; none past the end.
+pub(super) fn page<T: Clone>(list: &[T], offset: u64, limit: u64) -> Vec<T> {
+	let limit =
+		usize::try_from(limit).map_or(REPORT_LIST_LIMIT, |limit| limit.min(REPORT_LIST_LIMIT));
+	usize::try_from(offset)
+		.ok()
+		.and_then(|offset| list.get(offset..))
+		.unwrap_or_default()
+		.iter()
+		.take(limit)
+		.cloned()
+		.collect()
+}
+
+/// `path` as JS gets it: lossy UTF-8.
+pub(super) fn path_string(path: PathBuf) -> String {
+	path.into_os_string()
+		.into_string()
+		.unwrap_or_else(|path| path.to_string_lossy().into_owned())
 }
 
 /// Mirror of [`GuardReason`], with its counts widened from `usize`.
@@ -105,6 +127,21 @@ impl From<DeleteGuard> for DeleteGuardState {
 			}
 		}
 	}
+}
+
+/// The guard `setDeleteGuard` asks for. A floor this platform cannot count to is refused, as the
+/// engine refuses a ratio outside `0.0..=1.0`.
+pub(super) fn delete_guard(floor: u64, ratio: f64) -> Result<DeleteGuard, Error> {
+	let floor = usize::try_from(floor).map_err(|error| {
+		Error::custom_with_source(
+			ErrorKind::InvalidState,
+			error,
+			Some(format!(
+				"a delete-guard floor of {floor} does not fit this platform"
+			)),
+		)
+	})?;
+	DeleteGuard::new(floor, ratio)
 }
 
 /// What the binding is running for a pair.
@@ -489,10 +526,7 @@ impl From<SyncEvent> for SyncEventMessage {
 			SyncEvent::MovingLocal { from, to } => Self::MovingLocal { from, to },
 			SyncEvent::Quarantined { rel_path, bin_path } => Self::Quarantined {
 				rel_path,
-				bin_path: bin_path
-					.into_os_string()
-					.into_string()
-					.unwrap_or_else(|path| path.to_string_lossy().into_owned()),
+				bin_path: path_string(bin_path),
 			},
 			SyncEvent::ActionFailed { rel_path, error } => Self::ActionFailed { rel_path, error },
 			SyncEvent::Interrupted { actions } => Self::Interrupted {
@@ -539,6 +573,46 @@ pub struct SyncPlanSummary {
 	pub unsyncable_total: u64,
 	pub ignored_total: u64,
 	pub refused: Option<RefuseReason>,
+}
+
+impl From<&PlanOutcome> for SyncPlanSummary {
+	fn from(outcome: &PlanOutcome) -> Self {
+		// Whole, so a list the engine adds does not silently go uncounted.
+		let PlanOutcome {
+			actions,
+			held,
+			held_reason,
+			pass_token,
+			conflicts,
+			unsyncable,
+			ignored,
+			refused,
+		} = outcome;
+		let bytes = |kind: PlannedActionKind| {
+			actions
+				.iter()
+				.filter(|action| action.kind == kind)
+				.filter_map(|action| action.size)
+				.fold(0, u64::saturating_add)
+		};
+		Self {
+			actions_total: actions.len() as u64,
+			upload_bytes: bytes(PlannedActionKind::UploadFile),
+			download_bytes: bytes(PlannedActionKind::DownloadFile),
+			held_total: held.len() as u64,
+			held_deletions: held
+				.iter()
+				.filter(|action| action.kind.is_deletion())
+				.count() as u64,
+			// The plan keeps its own: it is paged after this.
+			held_reason: held_reason.clone().map(Into::into),
+			pass_token: pass_token.clone(),
+			conflicts_total: conflicts.len() as u64,
+			unsyncable_total: unsyncable.len() as u64,
+			ignored_total: ignored.len() as u64,
+			refused: *refused,
+		}
+	}
 }
 
 /// One page of a pair's held conflicts, in path order.
