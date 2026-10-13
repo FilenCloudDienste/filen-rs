@@ -16,7 +16,7 @@ use std::{
 use sysinfo::Disks;
 use tokio::{
 	fs,
-	io::{AsyncBufReadExt as _, BufReader},
+	io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
 	process::{Child, Command},
 };
 
@@ -96,19 +96,17 @@ impl RcloneInstallation {
 				.collect::<String>()
 		};
 		debug!(
-			"Executing rclone with args: {} --rc --rc-user {} --rc-pass (omitted) --rc-addr :{} --rc-min-tls-version 1.2",
+			"Executing rclone with args: {} --rc --rc-addr :{} --rc-min-tls-version 1.2 (RC credentials passed via environment)",
 			args.join(" "),
-			rc_username,
 			rc_port
 		);
 		let mut process = self
 			.configured_rclone(args)
+			// credentials go through the environment because argv is world-readable via /proc/<pid>/cmdline
+			.env("RCLONE_RC_USER", &rc_username)
+			.env("RCLONE_RC_PASS", &rc_password)
 			.args([
 				"--rc",
-				"--rc-user",
-				&rc_username,
-				"--rc-pass",
-				&rc_password,
 				"--rc-addr",
 				&format!("127.0.0.1:{}", rc_port),
 				"--rc-min-tls-version",
@@ -339,13 +337,34 @@ async fn write_rclone_config(
 }
 
 async fn obscure_password_for_rclone(rclone_binary_path: &Path, password: &str) -> Result<String> {
-	let obscured_password = Command::new(rclone_binary_path)
-		.args(["obscure", password])
-		.output()
+	// the password goes through stdin (`-`) because argv is world-readable via /proc/<pid>/cmdline
+	let mut child = Command::new(rclone_binary_path)
+		.args(["obscure", "-"])
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::null())
+		.kill_on_drop(true)
+		.spawn()
+		.context("Failed to spawn rclone to obscure password for Rclone config")?;
+	let mut stdin = child
+		.stdin
+		.take()
+		.context("Failed to take stdin of rclone obscure process")?;
+	stdin
+		.write_all(password.as_bytes())
 		.await
-		.context("Failed to obscure password for Rclone config")?
-		.stdout;
-	let obscured_password = String::from_utf8(obscured_password)
+		.context("Failed to write password to rclone obscure")?;
+	drop(stdin);
+	let output = child
+		.wait_with_output()
+		.await
+		.context("Failed to obscure password for Rclone config")?;
+	anyhow::ensure!(
+		output.status.success(),
+		"rclone obscure exited with {}",
+		output.status
+	);
+	let obscured_password = String::from_utf8(output.stdout)
 		.context("Failed to read obscured password for Rclone config")?;
 	Ok(obscured_password.trim().to_string())
 }
