@@ -1973,18 +1973,26 @@ struct JsTypeState {
 	wasm_condition: TokenStream2,
 }
 
+/// What the macro tests share.
 #[cfg(test)]
-mod uniffi_wrapper_tests {
-	use super::*;
+mod test_support {
+	use quote::ToTokens;
 
-	/// Whitespace-insensitive token comparison helper.
-	fn compact(item: &syn::ImplItemFn) -> String {
-		quote!(#item)
+	/// `tokens` without whitespace, so expansions compare token for token.
+	pub(crate) fn compact(tokens: impl ToTokens) -> String {
+		tokens
+			.into_token_stream()
 			.to_string()
 			.chars()
 			.filter(|c| !c.is_whitespace())
 			.collect()
 	}
+}
+
+#[cfg(test)]
+mod uniffi_wrapper_tests {
+	use super::*;
+	use crate::test_support::compact;
 
 	#[test]
 	fn arc_self_method_keeps_ffi_name_and_calls_through_self() {
@@ -2041,14 +2049,7 @@ mod uniffi_wrapper_tests {
 #[cfg(test)]
 mod js_type_enum_tests {
 	use super::*;
-
-	fn compact(tokens: proc_macro2::TokenStream) -> String {
-		tokens
-			.to_string()
-			.chars()
-			.filter(|c| !c.is_whitespace())
-			.collect()
-	}
+	use crate::test_support::compact;
 
 	#[test]
 	fn fieldless_import_enum_uses_string_repr_not_untagged() {
@@ -2156,15 +2157,7 @@ mod js_type_enum_tests {
 #[cfg(test)]
 mod js_exports_tests {
 	use super::*;
-
-	fn compact(tokens: impl ToTokens) -> String {
-		tokens
-			.into_token_stream()
-			.to_string()
-			.chars()
-			.filter(|c| !c.is_whitespace())
-			.collect()
-	}
+	use crate::test_support::compact;
 
 	fn expand(item: ItemImpl) -> String {
 		compact(js_exports_tokens(item).unwrap())
