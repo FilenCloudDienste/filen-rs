@@ -368,3 +368,9 @@ jobs:
       - name: Smoke-test the napi addon
         run: npm run test:napi
         working-directory: ./filen-sdk-rs/web
+      - name: Check the napi typings against ubrn's
+        # Builds the uniffi cdylib and the ubrn CLI to generate the reference; what they
+        # generate does not depend on the host, so one leg is enough.
+        if: runner.os == 'Linux'
+        run: npm run check:napi-parity
+        working-directory: ./filen-sdk-rs/web
