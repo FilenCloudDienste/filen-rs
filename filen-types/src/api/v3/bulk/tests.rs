@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-	api::v3::{file, item},
+	api::v3::{dir as single_dir, dir::link::PublicLinkExpiration, file, item},
+	crypto::{EncryptedMetaKey, EncryptedString, rsa::RSAEncryptedString},
 	error::ResponseError,
-	fs::Uuid,
+	fs::{ObjectType, Uuid},
 	serde::rsa::RsaDerPublicKey,
 };
 
@@ -332,4 +333,418 @@ fn shared_request_and_answers_match_the_documented_shapes() {
 	let unshared = unshared.into_data().unwrap();
 	assert!(!unshared.sharing);
 	assert!(unshared.users.is_empty());
+}
+
+fn enc(s: &str) -> EncryptedString<'_> {
+	EncryptedString(Cow::Borrowed(s))
+}
+
+fn rsa_enc(s: &str) -> RSAEncryptedString<'_> {
+	RSAEncryptedString(Cow::Borrowed(s))
+}
+
+/// Codes of the per-item envelopes of an answer whose items carry no data.
+fn codes(answer: Value) -> Vec<(Option<bool>, String)> {
+	results::<()>(answer)
+		.into_iter()
+		.map(|result| (result.status, result.code.unwrap().into_owned()))
+		.collect()
+}
+
+#[test]
+fn dir_color_request_matches_the_documented_body() {
+	let items = [dir::color::Item {
+		uuid: uuid(UUID_A),
+		color: single_dir::color::DirColor::Blue,
+	}];
+	assert_eq!(
+		to_json(&dir::color::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "color": "blue"}]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "code": "folder_color_changed", "message": "Folder color changed."},
+			{"status": false, "code": "folder_not_found", "message": "Folder not found."},
+		]))),
+		[
+			(Some(true), "folder_color_changed".to_owned()),
+			(Some(false), "folder_not_found".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn favorite_request_and_answer_carry_the_value_as_a_number() {
+	let items = [favorite::Item {
+		uuid: uuid(UUID_A),
+		r#type: ObjectType::File,
+		value: true,
+	}];
+	assert_eq!(
+		to_json(&favorite::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "type": "file", "value": 1}]})
+	);
+
+	let results = results::<item::favorite::Response>(processed(json!([
+		{
+			"status": true,
+			"code": "file_favorite_status_changed",
+			"message": "File favorite status changed.",
+			"data": {"uuid": UUID_A, "type": "file", "value": 1},
+		},
+		{"status": false, "code": "folder_in_trash", "message": "This folder is in the trash."},
+	])));
+	let [changed, in_trash] = <[_; 2]>::try_from(results).unwrap();
+	let changed = changed.into_data().unwrap();
+	assert_eq!(changed.uuid, uuid(UUID_A));
+	assert_eq!(changed.r#type, ObjectType::File);
+	assert!(changed.value);
+	assert_eq!(
+		api_error_code(in_trash.into_data().unwrap_err()).as_deref(),
+		Some("folder_in_trash")
+	);
+}
+
+#[test]
+fn trash_request_and_answers_match_the_documented_example() {
+	let items = [
+		FileOrDir::Dir(single_dir::trash::Request { uuid: uuid(UUID_A) }),
+		FileOrDir::File(file::trash::Request { uuid: uuid(UUID_B) }),
+	];
+	assert_eq!(
+		to_json(&trash::Request { items: &items }),
+		json!({"items": [{"type": "dir", "uuid": UUID_A}, {"type": "file", "uuid": UUID_B}]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "message": "Folder moved to trash.", "code": "folder_trashed"},
+			{"status": true, "message": "File moved to trash.", "code": "file_trashed"},
+			{
+				"status": true,
+				"message": "Cannot delete the default folder.",
+				"code": "cannot_delete_default_folder",
+			},
+		]))),
+		[
+			(Some(true), "folder_trashed".to_owned()),
+			(Some(true), "file_trashed".to_owned()),
+			(Some(true), "cannot_delete_default_folder".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn delete_permanent_request_matches_the_documented_example() {
+	let items = [FileOrDir::File(file::delete::permanent::Request {
+		uuid: uuid(UUID_A),
+	})];
+	assert_eq!(
+		to_json(&delete::permanent::Request { items: &items }),
+		json!({"items": [{"type": "file", "uuid": UUID_A}]})
+	);
+	assert_eq!(
+		codes(processed(json!([{
+			"status": true,
+			"message": "File deleted permanently.",
+			"code": "file_deleted_permanent",
+		}]))),
+		[(Some(true), "file_deleted_permanent".to_owned())]
+	);
+}
+
+#[test]
+fn restore_request_and_not_in_trash_answer_match_the_documented_example() {
+	let items = [
+		FileOrDir::File(file::restore::Request { uuid: uuid(UUID_A) }),
+		FileOrDir::Dir(single_dir::restore::Request { uuid: uuid(UUID_B) }),
+	];
+	assert_eq!(
+		to_json(&restore::Request { items: &items }),
+		json!({"items": [{"type": "file", "uuid": UUID_A}, {"type": "dir", "uuid": UUID_B}]})
+	);
+	assert_eq!(
+		codes(processed(json!([{
+			"status": false,
+			"message": "File is not in the trash.",
+			"code": "file_not_in_trash",
+		}]))),
+		[(Some(false), "file_not_in_trash".to_owned())]
+	);
+}
+
+#[test]
+fn rename_sends_metadata_on_file_items_only() {
+	let items = [
+		FileOrDir::File(file::metadata::Request {
+			uuid: uuid(UUID_A),
+			name: enc("enc-name"),
+			name_hashed: Cow::Borrowed("hash-a"),
+			metadata: enc("enc-metadata"),
+		}),
+		FileOrDir::Dir(single_dir::metadata::Request {
+			uuid: uuid(UUID_B),
+			name_hashed: Cow::Borrowed("hash-b"),
+			metadata: enc("enc-dir-name"),
+		}),
+	];
+	assert_eq!(
+		to_json(&rename::Request { items: &items }),
+		json!({"items": [
+			{
+				"type": "file",
+				"uuid": UUID_A,
+				"name": "enc-name",
+				"nameHashed": "hash-a",
+				"metadata": "enc-metadata",
+			},
+			{"type": "dir", "uuid": UUID_B, "name": "enc-dir-name", "nameHashed": "hash-b"},
+		]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "message": "File renamed.", "code": "file_renamed"},
+			{"status": true, "message": "File not found.", "code": "file_not_found"},
+			{"status": true, "message": "Folder renamed.", "code": "folder_renamed"},
+		]))),
+		[
+			(Some(true), "file_renamed".to_owned()),
+			(Some(true), "file_not_found".to_owned()),
+			(Some(true), "folder_renamed".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn metadata_request_matches_the_documented_example() {
+	let items = [FileOrDir::Dir(single_dir::metadata::Request {
+		uuid: uuid(UUID_A),
+		name_hashed: Cow::Borrowed("hash"),
+		metadata: enc("enc"),
+	})];
+	assert_eq!(
+		to_json(&metadata::Request { items: &items }),
+		json!({"items": [{"type": "dir", "uuid": UUID_A, "name": "enc", "nameHashed": "hash"}]})
+	);
+	assert_eq!(
+		codes(processed(json!([{
+			"status": true,
+			"message": "Folder metadata changed.",
+			"code": "folder_metadata_changed",
+		}]))),
+		[(Some(true), "folder_metadata_changed".to_owned())]
+	);
+}
+
+#[test]
+fn move_request_and_answers_match_the_documented_example() {
+	let items = [
+		FileOrDir::File(file::r#move::Request {
+			uuid: uuid(UUID_A),
+			new_parent: uuid(UUID_B),
+		}),
+		FileOrDir::Dir(single_dir::r#move::Request {
+			uuid: uuid(UUID_B),
+			to: uuid(UUID_B),
+		}),
+	];
+	assert_eq!(
+		to_json(&r#move::Request { items: &items }),
+		json!({"items": [
+			{"type": "file", "uuid": UUID_A, "to": UUID_B},
+			{"type": "dir", "uuid": UUID_B, "to": UUID_B},
+		]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "code": "file_moved", "message": "File moved."},
+			{
+				"status": false,
+				"code": "cannot_move_folder_into_itself",
+				"message": "Cannot move a folder into itself.",
+			},
+			{"status": false, "code": "rate_limited", "message": "Rate limited."},
+		]))),
+		[
+			(Some(true), "file_moved".to_owned()),
+			(Some(false), "cannot_move_folder_into_itself".to_owned()),
+			(Some(false), "rate_limited".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn dir_create_answers_the_remapped_uuid_of_the_documented_example() {
+	const ROOT: &str = "00000000-0000-4000-8000-000000000001";
+	const X: &str = "00000000-0000-4000-8000-000000000002";
+	let items = [
+		dir::create::Item {
+			uuid: uuid(UUID_A),
+			meta: enc("enc-a"),
+			name_hashed: Cow::Borrowed("hash-a"),
+			parent: uuid(ROOT),
+		},
+		dir::create::Item {
+			uuid: uuid(UUID_B),
+			meta: enc("enc-b"),
+			name_hashed: Cow::Borrowed("hash-b"),
+			parent: uuid(UUID_A),
+		},
+	];
+	assert_eq!(
+		to_json(&dir::create::Request { items: &items }),
+		json!({"items": [
+			{"uuid": UUID_A, "name": "enc-a", "nameHashed": "hash-a", "parent": ROOT},
+			{"uuid": UUID_B, "name": "enc-b", "nameHashed": "hash-b", "parent": UUID_A},
+		]})
+	);
+
+	let results = results::<single_dir::create::Response>(processed(json!([
+		{
+			"status": true,
+			"message": "Folder created.",
+			"code": "folder_created",
+			"data": {"uuid": X, "timestamp": 1_700_000_000},
+		},
+		{
+			"status": true,
+			"message": "Folder created.",
+			"code": "folder_created",
+			"data": {"uuid": UUID_B, "timestamp": 1_760_270_400},
+		},
+		{"status": false, "message": "Maximum storage reached.", "code": "max_storage_reached"},
+	])));
+	let [existing, created, no_storage] = <[_; 3]>::try_from(results).unwrap();
+
+	let existing = existing.into_data().unwrap();
+	assert_eq!(existing.uuid, uuid(X));
+	assert_eq!(existing.timestamp.timestamp(), 1_700_000_000);
+	let created = created.into_data().unwrap();
+	assert_eq!(created.uuid, uuid(UUID_B));
+	assert_eq!(created.timestamp.timestamp(), 1_760_270_400);
+	assert_eq!(
+		api_error_code(no_storage.into_data().unwrap_err()).as_deref(),
+		Some("max_storage_reached")
+	);
+}
+
+#[test]
+fn share_request_matches_the_documented_body() {
+	let items = [
+		share::Item {
+			uuid: uuid(UUID_A),
+			parent: None,
+			r#type: ObjectType::Dir,
+			metadata: rsa_enc("enc-a"),
+		},
+		share::Item {
+			uuid: uuid(UUID_B),
+			parent: Some(uuid(UUID_A)),
+			r#type: ObjectType::File,
+			metadata: rsa_enc("enc-b"),
+		},
+	];
+	let request = share::Request {
+		email: Cow::Borrowed("friend@example.com"),
+		items: &items,
+	};
+	assert_eq!(
+		to_json(&request),
+		json!({
+			"email": "friend@example.com",
+			"items": [
+				{"uuid": UUID_A, "parent": "none", "type": "folder", "metadata": "enc-a"},
+				{"uuid": UUID_B, "parent": UUID_A, "type": "file", "metadata": "enc-b"},
+			],
+		})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "message": "Item shared.", "code": "item_shared"},
+			{"status": false, "message": "File not found.", "code": "file_not_found"},
+		]))),
+		[
+			(Some(true), "item_shared".to_owned()),
+			(Some(false), "file_not_found".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn dir_link_add_request_matches_the_documented_body() {
+	let items = [
+		dir::link::add::Item {
+			uuid: uuid(UUID_A),
+			parent: None,
+			r#type: ObjectType::Dir,
+			metadata: enc("enc"),
+		},
+		dir::link::add::Item {
+			uuid: uuid(UUID_B),
+			parent: Some(uuid(UUID_A)),
+			r#type: ObjectType::File,
+			metadata: enc("enc-b"),
+		},
+	];
+	let request = dir::link::add::Request {
+		link_uuid: uuid(UUID_B),
+		key: EncryptedMetaKey(enc("enc-key")),
+		expiration: PublicLinkExpiration::Never,
+		items: &items,
+	};
+	assert_eq!(
+		to_json(&request),
+		json!({
+			"linkUUID": UUID_B,
+			"key": "enc-key",
+			"expiration": "never",
+			"items": [
+				{"uuid": UUID_A, "parent": "base", "type": "folder", "metadata": "enc"},
+				{"uuid": UUID_B, "parent": UUID_A, "type": "file", "metadata": "enc-b"},
+			],
+		})
+	);
+	assert_eq!(
+		codes(processed(json!([{
+			"status": true,
+			"message": "Item added to folder link.",
+			"code": "item_added_to_link",
+		}]))),
+		[(Some(true), "item_added_to_link".to_owned())]
+	);
+}
+
+#[test]
+fn shared_rename_request_matches_the_documented_body() {
+	let items = [shared::rename::Item {
+		uuid: uuid(UUID_A),
+		receiver_id: 123,
+		metadata: rsa_enc("enc"),
+	}];
+	assert_eq!(
+		to_json(&shared::rename::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "receiverId": 123, "metadata": "enc"}]})
+	);
+	assert_eq!(
+		codes(processed(json!([
+			{"status": true, "message": "Item renamed.", "code": "item_renamed"},
+			{"status": false, "message": "Item not found.", "code": "item_not_found"},
+		]))),
+		[
+			(Some(true), "item_renamed".to_owned()),
+			(Some(false), "item_not_found".to_owned()),
+		]
+	);
+}
+
+#[test]
+fn linked_rename_request_matches_the_documented_body() {
+	let items = [linked::rename::Item {
+		uuid: uuid(UUID_A),
+		link_uuid: uuid(UUID_B),
+		metadata: enc("enc"),
+	}];
+	assert_eq!(
+		to_json(&linked::rename::Request { items: &items }),
+		json!({"items": [{"uuid": UUID_A, "linkUUID": UUID_B, "metadata": "enc"}]})
+	);
 }

@@ -1,5 +1,7 @@
 use crate::api::v3::{bulk, item::shared};
 
+pub mod rename;
+
 pub const ENDPOINT: &str = "v3/bulk/shared";
 
 pub type Item = shared::Request;
