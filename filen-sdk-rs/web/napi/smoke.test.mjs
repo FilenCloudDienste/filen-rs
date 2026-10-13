@@ -4,17 +4,42 @@
 
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { generateKeyPairSync, randomUUID } from "node:crypto"
+import { once } from "node:events"
 import { copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { performance } from "node:perf_hooks"
 import { after, before, describe, test } from "node:test"
 import { fileURLToPath } from "node:url"
+import { Worker } from "node:worker_threads"
 
 import * as sdk from "../node/index.js"
 
-const { CacheStatusMessage_Tags, ErrorKind, FilenSdkError, JsClient, LogLevel, ResyncProgressMessage_Tags, UnauthJsClient } =
-	sdk
+const {
+	Backlog,
+	CacheStatusMessage_Tags,
+	ConflictResolution,
+	DeleteGuardState_Tags,
+	ErrorKind,
+	FilenSdkError,
+	HaltReason,
+	JsClient,
+	JsSyncEngine,
+	JsSyncPlan,
+	JsSyncWatch,
+	LogLevel,
+	PauseMode,
+	PlannedNodeKind,
+	RefuseReason,
+	ResyncProgressMessage_Tags,
+	SyncMode,
+	SyncPairActivity,
+	SyncRefusal_Tags,
+	TransferDirection,
+	UnauthJsClient,
+	WatchState
+} = sdk
 
 const webDir = join(dirname(fileURLToPath(import.meta.url)), "..")
 // A file URL, not a path: import() rejects an absolute Windows path (ERR_UNSUPPORTED_ESM_URL_SCHEME).
@@ -32,6 +57,31 @@ const malformedStringified = {
 	maxParallelRequests: undefined,
 	maxIoMemoryUsage: undefined
 }
+
+// A V2 client that parses offline, as `auth::test_support::offline_client_with_root` builds it.
+// 1024-bit rather than the Rust tests' 512: OpenSSL 3 setups may refuse 512.
+function synthStringified(rootUuid) {
+	const privateKey = generateKeyPairSync("rsa", { modulusLength: 1024 })
+		.privateKey.export({ type: "pkcs8", format: "der" })
+		.toString("base64")
+	return {
+		email: "smoke@example.com",
+		userId: 1n,
+		rootUuid,
+		authInfo: "0".repeat(64),
+		privateKey,
+		apiKey: "",
+		authVersion: 2,
+		maxParallelRequests: undefined,
+		maxIoMemoryUsage: undefined
+	}
+}
+
+// The engine stores `std::fs::canonicalize`: on Windows a verbatim `\\?\` path with 8.3 short
+// names expanded, where `realpathSync.native` strips the prefix.
+const canon = p => (process.platform === "win32" ? p.replace(/^\\\\\?\\/, "").toLowerCase() : p)
+
+const tags = names => Object.fromEntries(names.map(name => [name, name]))
 
 function assertThrownLikeUbrn(e) {
 	assert.ok(e instanceof Error)
@@ -175,6 +225,128 @@ describe("exports", () => {
 		)
 	})
 
+	test("number the sync engine's flat enums from 0 in declaration order", () => {
+		assert.deepEqual({ ...SyncMode }, { LocalToRemote: 0, RemoteToLocal: 1, TwoWay: 2, LocalBackup: 3, RemoteBackup: 4 })
+		assert.deepEqual({ ...Backlog }, { Propagate: 0, AdoptDestination: 1 })
+		assert.deepEqual({ ...PauseMode }, { Suspend: 0, Cancel: 1 })
+		assert.deepEqual({ ...ConflictResolution }, { KeepLocal: 0, KeepRemote: 1, KeepBoth: 2 })
+		assert.deepEqual({ ...TransferDirection }, { Upload: 0, Download: 1 })
+		assert.deepEqual({ ...RefuseReason }, { RemoteCollision: 0, LocalCollision: 1 })
+		assert.deepEqual({ ...HaltReason }, { LocalStorageFull: 0, RemoteStorageFull: 1 })
+		assert.deepEqual({ ...PlannedNodeKind }, { Dir: 0, File: 1 })
+		assert.deepEqual({ ...WatchState }, { Running: 0, Paused: 1, Stopped: 2, PairRemoved: 3 })
+		assert.deepEqual({ ...SyncPairActivity }, { Idle: 0, Starting: 1, Watching: 2, Stopping: 3, SyncingOnce: 4 })
+	})
+
+	test("name the sync engine's data enums' tags as strings", () => {
+		assert.deepEqual({ ...DeleteGuardState_Tags }, tags(["Limited", "Unlimited"]))
+		assert.deepEqual({ ...sdk.IgnoreLevel_Tags }, tags(["Default", "User", "File"]))
+		assert.deepEqual(
+			{ ...sdk.PlannedActionKind_Tags },
+			tags([
+				"UploadFile",
+				"DownloadFile",
+				"CreateRemoteDir",
+				"CreateLocalDir",
+				"MoveRemote",
+				"MoveLocal",
+				"TrashRemote",
+				"DeleteLocal",
+				"AdoptBaseline"
+			])
+		)
+		assert.deepEqual(
+			{ ...sdk.SyncEventMessage_Tags },
+			tags([
+				"PassStarted",
+				"Refused",
+				"Planned",
+				"Conflict",
+				"DeletionsHeld",
+				"Uploading",
+				"Downloading",
+				"Progress",
+				"CreatingRemoteDir",
+				"CreatingLocalDir",
+				"TrashingRemote",
+				"DeletingLocal",
+				"MovingRemote",
+				"MovingLocal",
+				"Quarantined",
+				"ActionFailed",
+				"Interrupted",
+				"AdoptedBaseline",
+				"PassCompleted",
+				"PassFailed"
+			])
+		)
+		assert.deepEqual(
+			{ ...sdk.SyncGuardReason_Tags },
+			tags(["ScanIncomplete", "FirstSyncWithDeletions", "RemoteUnconverged", "RemoteEmptied", "ExceededThreshold"])
+		)
+		assert.deepEqual(
+			{ ...SyncRefusal_Tags },
+			tags([
+				"BaselineInUse",
+				"LocalRootInUse",
+				"LocalRootNested",
+				"LocalRootContains",
+				"RemoteRootInUse",
+				"RemoteRootNested",
+				"RemoteRootContains"
+			])
+		)
+		assert.deepEqual(
+			{ ...sdk.UnsyncableReason_Tags },
+			tags(["InvalidName", "RepeatedFailure", "RemoteUndecodable", "RemoteInvalidName", "RemoteBrokenParent", "LocalAlias"])
+		)
+	})
+
+	test("the sync engine classes carry ubrn's methods", () => {
+		const methods = cls => {
+			assert.equal(typeof cls, "function")
+			return Object.getOwnPropertyNames(cls.prototype)
+				.filter(name => name !== "constructor")
+				.sort()
+		}
+		assert.deepEqual(methods(JsSyncEngine), [
+			"addPair",
+			"approveDeletions",
+			"cancelPausedActions",
+			"close",
+			"lastReport",
+			"listConflicts",
+			"listPairs",
+			"pausePair",
+			"planPair",
+			"recentEvents",
+			"reconfigurePair",
+			"removePair",
+			"requestPass",
+			"resolveConflict",
+			"resumePair",
+			"retryPath",
+			"setDeleteGuard",
+			"setDeleteGuardUnlimited",
+			"setUserIgnore",
+			"stopWatch",
+			"syncOnce",
+			"userIgnore",
+			"watchPair"
+		])
+		assert.deepEqual(methods(JsSyncWatch), ["pairId", "status", "stop"])
+		assert.deepEqual(methods(JsSyncPlan), ["actions", "conflicts", "held", "ignored", "release", "summary", "unsyncable"])
+		assert.equal(typeof JsClient.prototype.openSyncEngine, "function")
+	})
+
+	test("defaultSyncIgnorePatterns lists the OS clutter", () => {
+		const patterns = sdk.defaultSyncIgnorePatterns()
+		assert.ok(Array.isArray(patterns) && patterns.length > 0)
+		assert.ok(patterns.every(p => typeof p === "string"))
+		assert.ok(patterns.includes(".DS_Store"))
+		assert.ok(patterns.includes("Thumbs.db"))
+	})
+
 	test("init and setLogLevel run", () => {
 		sdk.init()
 		sdk.setLogLevel(LogLevel.Warn)
@@ -198,6 +370,9 @@ describe("UnauthJsClient", () => {
 			e => {
 				const inner = assertThrownLikeUbrn(e)
 				assert.equal(inner.kind(), ErrorKind.InvalidState)
+				// The sync-engine impl block lands on FilenSdkError too.
+				assert.equal(typeof inner.syncRefusal, "function")
+				assert.equal(inner.syncRefusal(), undefined)
 				return true
 			}
 		)
@@ -276,6 +451,268 @@ test("a process that used the addon exits by itself", () => {
 	const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 30_000 })
 	assert.equal(run.error, undefined, "the process did not exit within 30 s")
 	assert.equal(run.status, 0, run.stderr)
+})
+
+// Temp dirs for the sync engine tests; on Windows the baseline's SQLite files may still be held
+// for a moment after `close`, whose teardown finishes on the commander runtime.
+function tempDir(prefix) {
+	return realpathSync.native(mkdtempSync(join(tmpdir(), prefix)))
+}
+const removeDir = dir => rmSync(dir, { recursive: true, force: true, maxRetries: 10 })
+
+// A client of a synthesized V2 account, with no cache configured.
+const synthClient = rootUuid => UnauthJsClient.fromConfig({}).fromStringified(synthStringified(rootUuid))
+
+// A worker_thread that opens an engine on `dbPath`, adds a pair beside it and watches it, offline
+// as above, then runs until it is terminated (an engine does not keep the event loop alive). It
+// keeps the handles reachable, so only the end of its Node environment lets the engine go. It
+// posts "watching" once the watch runs.
+function watchInWorker(dbPath, rootUuid) {
+	const source = `
+		const { parentPort, workerData } = require("node:worker_threads")
+		const { mkdirSync } = require("node:fs")
+		setInterval(() => {}, 1 << 30)
+		import(workerData.addon).then(async ({ UnauthJsClient }) => {
+			const { dbPath, twoWay } = workerData
+			const client = UnauthJsClient.fromConfig({}).fromStringified(workerData.stringified)
+			globalThis.engine = await client.openSyncEngine(dbPath, { onEvents() {}, onWatchStatus() {} })
+			const local = dbPath + ".local"
+			mkdirSync(local)
+			const id = await engine.addPair(local, crypto.randomUUID(), twoWay)
+			globalThis.watch = await engine.watchPair(id, undefined)
+			parentPort.postMessage("watching")
+		})
+	`
+	return new Worker(source, {
+		eval: true,
+		workerData: { addon, dbPath, twoWay: SyncMode.TwoWay, stringified: synthStringified(rootUuid) }
+	})
+}
+
+describe("sync engine, offline", () => {
+	const listener = { onEvents() {}, onWatchStatus() {} }
+	const rootUuid = randomUUID()
+	const remoteRoot = randomUUID()
+	let dir, local, dbPath, client, engine, attached, id
+
+	before(() => {
+		dir = tempDir("filen-sdk-rs-sync-")
+		local = join(dir, "local")
+		dbPath = join(dir, "baseline.db")
+		// No cache, as on the Rust tests' offline client: `addPair` then degrades the pair's remote
+		// notifications on the spot, where a configured cache would validate the remote root over the
+		// network first.
+		client = synthClient(rootUuid)
+	})
+
+	after(() => removeDir(dir))
+
+	test("openSyncEngine opens an engine with nothing in it", async () => {
+		engine = await client.openSyncEngine(dbPath, listener)
+		assert.ok(engine instanceof JsSyncEngine)
+		assert.deepEqual(await engine.listPairs(), [])
+		assert.deepEqual(await engine.recentEvents(), [])
+		assert.equal(await engine.userIgnore(), "")
+	})
+
+	test("addPair stores the pair with its defaults", async () => {
+		mkdirSync(local)
+		id = await engine.addPair(local, remoteRoot, SyncMode.TwoWay)
+		assert.equal(typeof id, "bigint")
+		const pairs = await engine.listPairs()
+		assert.equal(pairs.length, 1)
+		const [pair] = pairs
+		assert.equal(pair.id, id)
+		assert.equal(canon(pair.localRoot), canon(realpathSync.native(local)))
+		assert.equal(pair.remoteRoot, remoteRoot)
+		assert.equal(pair.mode, SyncMode.TwoWay)
+		assert.deepEqual(pair.deleteGuard, { tag: DeleteGuardState_Tags.Limited, inner: { floor: 10n, ratio: 0.5 } })
+		assert.equal(pair.paused, false)
+		assert.equal(pair.activity, SyncPairActivity.Idle)
+		// napi leaves an absent Option's key out; read the value, as ubrn's caller would.
+		for (const key of ["watchStatus", "passInFlight", "lastPassCompletedAtMs", "lastPassError", "pausedAtMs", "pauseOptions"]) {
+			assert.equal(pair[key], undefined, key)
+		}
+	})
+
+	test("the delete guard reads back as set", async () => {
+		await engine.setDeleteGuard(id, 3n, 0.25)
+		assert.deepEqual((await engine.listPairs())[0].deleteGuard, {
+			tag: DeleteGuardState_Tags.Limited,
+			inner: { floor: 3n, ratio: 0.25 }
+		})
+		await engine.setDeleteGuardUnlimited(id)
+		const guard = (await engine.listPairs())[0].deleteGuard
+		assert.deepEqual(guard, { tag: DeleteGuardState_Tags.Unlimited })
+		assert.equal("inner" in guard, false)
+	})
+
+	test("pause, cancel and resume read back", async () => {
+		const pair = async () => (await engine.listPairs())[0]
+		await engine.pausePair(id, { mode: PauseMode.Suspend, cancelAfterMs: 60_000n })
+		let paused = await pair()
+		assert.equal(paused.paused, true)
+		assert.equal(typeof paused.pausedAtMs, "bigint")
+		assert.deepEqual(paused.pauseOptions, { mode: PauseMode.Suspend, cancelAfterMs: 60_000n })
+		await engine.cancelPausedActions(id)
+		assert.deepEqual((await pair()).pauseOptions, { mode: PauseMode.Cancel, cancelAfterMs: 60_000n })
+		await engine.resumePair(id)
+		let resumed = await pair()
+		assert.equal(resumed.paused, false)
+		assert.equal(resumed.pausedAtMs, undefined)
+		assert.equal(resumed.pauseOptions, undefined)
+
+		await engine.pausePair(id, undefined)
+		paused = await pair()
+		assert.deepEqual(paused.pauseOptions, { mode: PauseMode.Suspend, cancelAfterMs: 300_000n })
+		await engine.resumePair(id)
+		resumed = await pair()
+		assert.equal(resumed.paused, false)
+		assert.equal(resumed.pauseOptions, undefined)
+	})
+
+	test("conflicts and the last report start empty", async () => {
+		assert.deepEqual(await engine.listConflicts(id, 0n, 0n), { conflicts: [], total: 0n })
+		assert.equal(await engine.lastReport(id), undefined)
+		// The wrapper reads its params inside the promise, so an out-of-range u64 rejects.
+		await assert.rejects(engine.listConflicts(id, -1n, 0n), e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Conversion)
+			return true
+		})
+	})
+
+	test("a second open of the same baseline by the same account attaches", async () => {
+		const sameAccount = synthClient(rootUuid)
+		attached = await sameAccount.openSyncEngine(dbPath, listener)
+		assert.ok(attached instanceof JsSyncEngine)
+		assert.deepEqual(
+			(await attached.listPairs()).map(pair => pair.id),
+			[id]
+		)
+	})
+
+	test("another account's open of the same baseline is refused", async () => {
+		const otherAccount = synthClient(randomUUID())
+		await assert.rejects(otherAccount.openSyncEngine(dbPath, listener), e => {
+			const inner = assertThrownLikeUbrn(e)
+			assert.equal(inner.kind(), ErrorKind.Io)
+			assert.deepEqual(inner.syncRefusal(), { tag: SyncRefusal_Tags.BaselineInUse, inner: { path: dbPath } })
+			return true
+		})
+	})
+
+	test("a listener without onWatchStatus throws napi's own error", () => {
+		assert.throws(
+			() => client.openSyncEngine(join(dir, "never-opened.db"), { onEvents() {} }),
+			e => {
+				assert.ok(e instanceof Error)
+				assert.equal(e.code, "InvalidArg")
+				assert.equal(FilenSdkError.hasInner(e), false)
+				return true
+			}
+		)
+	})
+
+	test("an open with an already aborted signal rejects and leaves the baseline free", async () => {
+		const abortedPath = join(dir, "aborted.db")
+		await assert.rejects(client.openSyncEngine(abortedPath, listener, { signal: AbortSignal.abort() }), e => {
+			assert.ok(e instanceof Error)
+			assert.equal(e.name, "AbortError")
+			assert.equal(e.message, "A Rust future was aborted")
+			assert.equal(FilenSdkError.hasInner(e), false)
+			return true
+		})
+		const reopened = await client.openSyncEngine(abortedPath, listener)
+		await reopened.close()
+	})
+
+	test("an open in a missing directory rejects with a FilenSdkError", async () => {
+		await assert.rejects(client.openSyncEngine(join(dir, "missing", "baseline.db"), listener), e => {
+			assert.equal(assertThrownLikeUbrn(e).kind(), ErrorKind.Io)
+			return true
+		})
+	})
+
+	test("close is idempotent and ends every handle", async () => {
+		await engine.close()
+		await engine.close()
+		for (const handle of [engine, attached]) {
+			await assert.rejects(handle.listPairs(), e => {
+				const inner = assertThrownLikeUbrn(e)
+				assert.equal(inner.kind(), ErrorKind.InvalidState)
+				assert.match(inner.toDebugString(), /the sync engine is closed/)
+				return true
+			})
+		}
+	})
+})
+
+describe("a sync engine closes with its Node environment", () => {
+	const listener = { onEvents() {}, onWatchStatus() {} }
+	let dir
+
+	before(() => {
+		dir = tempDir("filen-sdk-rs-sync-env-")
+	})
+
+	after(() => removeDir(dir))
+
+	// The worker's JS handles are finalized as its environment goes, and dropping an engine lets
+	// its baseline go too, but in the background, after stopping its watches: without the close the
+	// teardown waits for, the baseline is usually still held right after the worker has exited.
+	// Usually: the first worker of a process often wins that race, hence three rounds.
+	test("one a worker leaves watching is another environment's, and free once the worker has exited", { timeout: 60_000 }, async () => {
+		for (const round of [1, 2, 3]) {
+			const dbPath = join(dir, `baseline-${round}.db`)
+			const rootUuid = randomUUID()
+			const worker = watchInWorker(dbPath, rootUuid)
+			assert.deepEqual(await once(worker, "message"), ["watching"])
+
+			// The same account, but not the environment that opened it: refused, not attached.
+			await assert.rejects(synthClient(rootUuid).openSyncEngine(dbPath, listener), e => {
+				assert.deepEqual(assertThrownLikeUbrn(e).syncRefusal(), { tag: SyncRefusal_Tags.BaselineInUse, inner: { path: dbPath } })
+				return true
+			})
+			// Another account, so its open succeeds only once the worker's engine has let the
+			// baseline go. Made first: its key generation would give a background release time.
+			const otherAccount = synthClient(randomUUID())
+			await worker.terminate()
+			const engine = await otherAccount.openSyncEngine(dbPath, listener)
+			await engine.close()
+		}
+	})
+})
+
+describe("a process with a sync engine exits by itself", () => {
+	// One failed open first, so a failed open's dropped listener is shown not to hold the process.
+	const script = `
+		import { generateKeyPairSync } from "node:crypto"
+		import { join } from "node:path"
+		const { UnauthJsClient } = await import(${JSON.stringify(addon)})
+		${synthStringified.toString()}
+		const [dir, variant] = process.argv.slice(-2)
+		const client = UnauthJsClient.fromConfig({}).fromStringified(synthStringified(crypto.randomUUID()))
+		const listener = { onEvents() {}, onWatchStatus() {} }
+		await client.openSyncEngine(join(dir, "missing", "baseline.db"), listener).catch(() => {})
+		const engine = await client.openSyncEngine(join(dir, "baseline.db"), listener)
+		if (variant === "closed") await engine.close()
+	`
+
+	for (const variant of ["unclosed", "closed"]) {
+		test(variant, () => {
+			const dir = tempDir("filen-sdk-rs-sync-exit-")
+			try {
+				const run = spawnSync(process.execPath, ["--input-type=module", "-e", script, dir, variant], {
+					encoding: "utf8",
+					timeout: 30_000
+				})
+				assert.equal(run.error, undefined, "the process did not exit within 30 s")
+				assert.equal(run.status, 0, run.stderr)
+			} finally {
+				removeDir(dir)
+			}
+		})
+	}
 })
 
 describe("package resolution", () => {
