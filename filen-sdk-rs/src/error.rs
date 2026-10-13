@@ -102,6 +102,7 @@ impl_from!(heif_decoder::HeifError, ErrorKind::HeifError);
 	tsify(into_wasm_abi)
 )]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[filen_macros::napi_mirror(export)]
 pub enum ErrorKind {
 	/// Returned by the server
 	Server,
@@ -132,7 +133,8 @@ pub enum ErrorKind {
 	MetadataWasNotDecrypted,
 	/// Operation was cancelled
 	Cancelled,
-	#[cfg(feature = "heif-decoder")]
+	// Only a build with `heif-decoder` produces it, but every build declares it, so that every
+	// binding has the same kinds with the same numbers (the napi build has no heif-decoder).
 	/// passthrough heif-decoder crate error
 	HeifError,
 	/// there was an issue with the provided recovery key

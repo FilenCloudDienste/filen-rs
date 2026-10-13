@@ -9,9 +9,12 @@ use crate::{
 		categories::{DirType, Normal},
 		file::{FileBuilder, FileBuilderOptionalName},
 	},
-	js::{AnyNormalDir, ManagedFuture},
+	js::AnyNormalDir,
 };
 
+// Managed futures are not on napi yet, nor the uploads that take one.
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+use crate::js::ManagedFuture;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use {
 	wasm_bindgen::prelude::*,
@@ -112,6 +115,7 @@ impl TryFrom<FileBuilderParamsOptionalName> for FileBuilderOptionalName {
 	}
 }
 
+#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 #[js_type(import, no_ser, no_default)]
 pub struct UploadFileParams {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(flatten))]
@@ -122,6 +126,8 @@ pub struct UploadFileParams {
 	pub managed_future: ManagedFuture,
 }
 
+// Only the upload params, which napi does not build yet, turn these into a file builder.
+#[cfg_attr(feature = "napi", allow(dead_code))]
 impl FileBuilderParams {
 	pub(crate) fn into_file_builder(self, client: &Client) -> Result<FileBuilder, Error> {
 		let mut file_builder = client.make_file_builder(

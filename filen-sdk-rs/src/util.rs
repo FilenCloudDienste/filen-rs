@@ -124,14 +124,14 @@ pub type MaybeArcWeak<T> = std::sync::Weak<T>;
 #[cfg(target_family = "wasm")]
 pub type MaybeArcWeak<T> = std::rc::Weak<T>;
 
-// Used only by the JS glue (`commander_thread` in runtime.rs and `chats::js_impls`),
-// both compiled only under `uniffi`/`wasm-full`.
-#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+// Used only by the JS glue: `commander_thread` in runtime.rs (under `uniffi`, `wasm-full` and
+// `napi`) and `chats::js_impls` (under `uniffi` and `wasm-full`).
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 pub(crate) trait WasmResultExt<T> {
 	fn expect_or_throw(self, msg: &str) -> T;
 }
 
-#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 impl<T, E: std::fmt::Debug> WasmResultExt<T> for Result<T, E> {
 	fn expect_or_throw(self, msg: &str) -> T {
 		#[cfg(all(target_family = "wasm", target_os = "unknown"))]

@@ -1,10 +1,21 @@
+// The napi build exposes the binding layer it shares with uniffi item by item, and no napi
+// export takes or returns these item types yet.
+#[cfg_attr(feature = "napi", allow(dead_code))]
 mod categories;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod js_param;
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 mod managed_futures;
 mod meta_changes;
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+// napi-derive's generated FFI glue (the raw N-API calls in the conversion impls and callbacks it
+// writes for each `#[napi]` item) lands in this module, which holds nothing but napi items and
+// what they use. napi-derive registers what it exports only outside `cfg(test)`, so the lib test
+// build reaches none of it; the lib build still reports dead code there.
+#[cfg(feature = "napi")]
+#[allow(unsafe_code)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) mod napi;
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 mod params;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 mod returned_types;
@@ -49,7 +60,7 @@ pub use js_param::{JsParam, parse_tsify};
 #[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "service-worker"))]
 pub use managed_futures::*;
 pub use meta_changes::*;
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 pub use params::*;
 #[cfg(any(feature = "wasm-full", feature = "uniffi"))]
 pub use returned_types::*;

@@ -140,6 +140,7 @@ Test notes:
 |---------|-----------------|
 | `cache` | SQLite metadata cache (`src/cache/`, `rusqlite`); gates the `cache_tests` / `cache_search_tests` test targets |
 | `uniffi` | UniFFI scaffolding for the mobile bindings |
+| `napi` | Node-API addon (napi-rs) for the desktop app, its TypeScript matching what ubrn generates for the same items (`src/js/napi/`; items opt in with `#[js_type(.., napi)]` / `#[napi_export]`). Adds the crate's `build.rs` (`napi_build::setup()`'s link args). Scope: one Node environment per process, the Electron main process (or a `utilityProcess`); the commander runtime serves it as it serves uniffi. Desktop targets with Windows on msvc only (napi-build panics on windows-gnu). Native only, and never with `uniffi`: both combinations are a `compile_error!` in `lib.rs` |
 | `http-provider` | Local `axum` server handing out `http://127.0.0.1` URLs for remote files (range requests), so platform media players can stream them |
 | `wasm-full` | Browser WASM build (with threads) |
 | `service-worker` | WASM service-worker build |

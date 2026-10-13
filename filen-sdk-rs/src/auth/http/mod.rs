@@ -267,7 +267,7 @@ impl Default for ClientConfig {
 }
 
 #[derive(Default)]
-#[js_type(import, wasm_all)]
+#[js_type(import, wasm_all, napi)]
 pub enum LogLevel {
 	Off,
 	Error,
@@ -278,7 +278,11 @@ pub enum LogLevel {
 	Trace,
 }
 
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(any(
+	feature = "uniffi",
+	feature = "napi",
+	all(target_family = "wasm", target_os = "unknown")
+))]
 #[js_type(import, no_ser, wasm_all)]
 pub struct JsClientConfig {
 	#[cfg_attr(all(target_family = "wasm", target_os = "unknown"), serde(default))]
@@ -326,7 +330,11 @@ pub struct JsClientConfig {
 	pub archive_job_concurrency: Option<u32>,
 }
 
-#[cfg(any(feature = "uniffi", all(target_family = "wasm", target_os = "unknown")))]
+#[cfg(any(
+	feature = "uniffi",
+	feature = "napi",
+	all(target_family = "wasm", target_os = "unknown")
+))]
 impl From<JsClientConfig> for ClientConfig {
 	fn from(value: JsClientConfig) -> Self {
 		let mut config = ClientConfig::default();

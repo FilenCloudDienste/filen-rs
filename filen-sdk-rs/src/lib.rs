@@ -23,6 +23,13 @@ compile_error!(
 	 turns default features off"
 );
 
+// The `napi` build is a Node-API addon, which only native Node loads, and a binding build of its
+// own next to uniffi's: their exports share names and their runtimes are set up differently.
+#[cfg(all(feature = "napi", target_family = "wasm"))]
+compile_error!("the `napi` feature builds a Node-API addon and is native-only");
+#[cfg(all(feature = "napi", feature = "uniffi"))]
+compile_error!("`napi` and `uniffi` are separate binding builds; enable one");
+
 // The lib test binary's allocator: the system one, metered so a test can bound the heap a codec
 // takes.
 #[cfg(test)]
@@ -51,7 +58,11 @@ pub mod fs;
 pub mod http_provider;
 pub mod io;
 pub(crate) mod job;
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown"),
+	feature = "uniffi",
+	feature = "napi"
+))]
 pub mod js;
 pub mod notes;
 pub mod obs;

@@ -258,6 +258,7 @@ pub struct RegisterParams {
 	pub aff_id: Option<String>,
 }
 
+#[derive(Clone)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),
@@ -288,7 +289,11 @@ impl UnauthJsClient {
 impl UnauthClient {}
 
 #[filen_macros::js_exports]
-#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+#[cfg(any(
+	all(target_family = "wasm", target_os = "unknown"),
+	feature = "uniffi",
+	feature = "napi"
+))]
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 #[cfg_attr(
 	all(target_family = "wasm", target_os = "unknown"),

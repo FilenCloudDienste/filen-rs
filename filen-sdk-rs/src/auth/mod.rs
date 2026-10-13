@@ -45,7 +45,7 @@ use crate::{
 use crate::socket::WebSocketHandle;
 
 pub mod http;
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 pub mod js_impls;
 pub mod shared_client;
 pub mod unauth;
@@ -53,7 +53,7 @@ pub mod v1;
 pub mod v2;
 pub mod v3;
 
-#[cfg(any(feature = "wasm-full", feature = "uniffi"))]
+#[cfg(any(feature = "wasm-full", feature = "uniffi", feature = "napi"))]
 pub use js_impls::JsClient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +131,11 @@ impl MetaKey {
 		Self::from_str_and_version(key, key_version)
 	}
 
-	#[cfg(any(all(target_family = "wasm", target_os = "unknown"), feature = "uniffi"))]
+	#[cfg(any(
+		all(target_family = "wasm", target_os = "unknown"),
+		feature = "uniffi",
+		feature = "napi"
+	))]
 	pub(crate) fn version(&self) -> MetaEncryptionVersion {
 		match self {
 			MetaKey::V1(_) => MetaEncryptionVersion::V1,

@@ -287,6 +287,14 @@ its second occurrence.
   commit, with the same meaning on every platform.
 - Follow the sibling's resolve/reject convention (copy resolves with the report on
   failure). Document any deviation and cover it in `web/main.test.ts`.
+- napi (`src/js/napi/`): its TypeScript must match ubrn's for the same item. Expose a type with
+  `#[js_type(.., napi)]` (`#[filen_macros::napi_mirror]` for one with hand-written derives) and a
+  method with `#[napi_export]` inside `#[filen_macros::js_exports]`; never hand-write napi types
+  for a `js_type` item. Errors cross as ubrn's `UniffiThrownObject` shape through
+  `js::napi::throw`, async calls through `js::napi::spawn_promise`. A hand-written napi item sets
+  its `js_name` and TypeScript (`ts_args_type`/`ts_return_type`/`ts_type`) explicitly and takes
+  no raw `i64`, `u64` or `f32`, only their `Wire` types: napi reads no `u64` or `f32`, and passes
+  an `i64` as a `number` where ubrn has a `bigint`.
 
 ### Compatibility and sibling semantics
 

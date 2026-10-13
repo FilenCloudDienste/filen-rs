@@ -495,7 +495,7 @@ mod worker_start {
 	}
 }
 
-#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
+#[cfg(any(feature = "uniffi", feature = "wasm-full", feature = "napi"))]
 mod commander_thread {
 	#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 	use std::sync::OnceLock;
@@ -947,6 +947,8 @@ mod commander_thread {
 		inner_do_on_commander(None, f)
 	}
 
+	// The managed futures that pause a job are not on napi yet.
+	#[cfg(any(feature = "uniffi", feature = "wasm-full"))]
 	pub(crate) fn do_with_pause_channel_on_commander<F, Fut>(
 		channel: (
 			tokio::sync::watch::Sender<bool>,
@@ -962,6 +964,8 @@ mod commander_thread {
 		inner_do_on_commander(Some(channel), f)
 	}
 }
+#[cfg(feature = "napi")]
+pub(crate) use commander_thread::do_on_commander;
 #[cfg(feature = "uniffi")]
 pub(crate) use commander_thread::{
 	CommanderFutHandle, do_on_commander, do_with_pause_channel_on_commander,
