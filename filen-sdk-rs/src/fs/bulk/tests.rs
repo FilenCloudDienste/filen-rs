@@ -3,16 +3,24 @@ use std::{collections::VecDeque, sync::Mutex};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use filen_types::{
-	api::v3::bulk::MAX_WRITE_ITEMS, crypto::EncryptedString, error::ResponseError, fs::Uuid,
+	api::v3::{
+		bulk::{FileOrDir, MAX_WRITE_ITEMS},
+		dir, file,
+	},
+	crypto::EncryptedString,
+	error::ResponseError,
+	fs::Uuid,
 };
+use serde::de::DeserializeOwned;
 
 use super::{
 	Backend,
 	create_dirs::{CreateDirsError, CreatedDir, NewDir, NewDirParent, create_dirs},
+	trash_items::trash_items,
 };
 use crate::{
 	api::v3::{
-		bulk::{Body, Sent, dir::create, send},
+		bulk::{Body, Sent, dir::create, send, trash},
 		dir::create::Response,
 	},
 	auth::http::{
@@ -37,6 +45,8 @@ struct Scripted {
 	merges: Vec<(Uuid, Uuid)>,
 	/// Single creates that fail with `cannot_create_in_this_folder`.
 	failing: Vec<Uuid>,
+	/// Each single trash, as the route and the uuid.
+	trashed: Mutex<Vec<(&'static str, Uuid)>>,
 }
 
 impl Scripted {
@@ -48,7 +58,32 @@ impl Scripted {
 			singles: Mutex::default(),
 			merges: Vec::new(),
 			failing: Vec::new(),
+			trashed: Mutex::default(),
 		}
+	}
+
+	/// Sends `items` as one chunk, through the client's whole stack, to a server that answers it
+	/// with the next scripted answer.
+	async fn answer<'a, I, T>(
+		&self,
+		items: &'a [I],
+		endpoint: &'static str,
+	) -> Result<Sent<'a, I, T>, Error>
+	where
+		T: DeserializeOwned + std::fmt::Debug,
+	{
+		let answer = self.answers.lock().unwrap().pop_front();
+		let (url, server) = serve_once(answer.expect("an answer for each request")).await;
+		let sent = send(
+			items,
+			MAX_WRITE_ITEMS,
+			Body::ItemsOnly,
+			self.client
+				.post_raw_bytes_auth(Bytes::new(), &url, endpoint.into()),
+		)
+		.await;
+		drop(server.await.unwrap());
+		sent
 	}
 
 	fn requests(&self) -> Vec<Vec<(Uuid, Uuid)>> {
@@ -78,18 +113,7 @@ impl Backend for Scripted {
 			.lock()
 			.unwrap()
 			.push(items.iter().map(|item| (item.uuid, item.parent)).collect());
-		let answer = self.answers.lock().unwrap().pop_front();
-		let (url, server) = serve_once(answer.expect("an answer for each request")).await;
-		let sent = send(
-			items,
-			MAX_WRITE_ITEMS,
-			Body::ItemsOnly,
-			self.client
-				.post_raw_bytes_auth(Bytes::new(), &url, create::ENDPOINT.into()),
-		)
-		.await;
-		drop(server.await.unwrap());
-		sent
+		self.answer(items, create::ENDPOINT).await
 	}
 
 	async fn create_one_dir(&self, item: &create::Item<'_>) -> Result<Response, Error> {
@@ -110,6 +134,21 @@ impl Backend for Scripted {
 			uuid,
 			timestamp: DateTime::UNIX_EPOCH,
 		})
+	}
+
+	async fn bulk_trash<'a>(
+		&self,
+		items: &'a [trash::Item],
+	) -> Result<Sent<'a, trash::Item, ()>, Error> {
+		self.answer(items, trash::ENDPOINT).await
+	}
+
+	async fn trash_one(&self, item: &trash::Item) -> Result<(), Error> {
+		self.trashed.lock().unwrap().push(match item {
+			FileOrDir::File(request) => ("file", request.uuid),
+			FileOrDir::Dir(request) => ("dir", request.uuid),
+		});
+		Ok(())
 	}
 }
 
@@ -370,6 +409,42 @@ async fn more_directories_than_one_request_takes_go_out_in_requests_in_list_orde
 	// a later request names the uuid the parent was answered: the server remaps only within one
 	assert_eq!(requests[1], [(uuid(count), uuid(999))]);
 	assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn trashed_items_are_answered_as_their_single_calls_would_be() {
+	let items = [
+		FileOrDir::File(file::trash::Request { uuid: uuid(1) }),
+		FileOrDir::Dir(dir::trash::Request { uuid: uuid(2) }),
+		FileOrDir::Dir(dir::trash::Request { uuid: uuid(3) }),
+		FileOrDir::File(file::trash::Request { uuid: uuid(4) }),
+		FileOrDir::Dir(dir::trash::Request { uuid: uuid(5) }),
+	];
+	let backend = Scripted::new([bulk(&[
+		r#"{"status":true,"message":"File moved to trash.","code":"file_trashed"}"#.to_owned(),
+		r#"{"status":true,"message":"Folder moved to trash.","code":"folder_trashed"}"#.to_owned(),
+		r#"{"status":true,"message":"Cannot delete the default folder.","code":"cannot_delete_default_folder"}"#.to_owned(),
+		r#"{"status":false,"message":"This file is versioned.","code":"file_is_versioned"}"#.to_owned(),
+		internal_error(),
+	])]);
+
+	let results = trash_items(&backend, &items).await;
+
+	assert_eq!(
+		results
+			.iter()
+			.map(|r| r.as_ref().map_err(|e| (e.kind(), e.server_code())))
+			.collect::<Vec<_>>(),
+		[
+			Ok(&()),
+			Ok(&()),
+			// the single route answers the default folder `status: true` too
+			Ok(&()),
+			Err((ErrorKind::Server, Some("file_is_versioned".to_owned()))),
+			Ok(&()),
+		]
+	);
+	assert_eq!(*backend.trashed.lock().unwrap(), [("dir", uuid(5))]);
 }
 
 #[tokio::test]
