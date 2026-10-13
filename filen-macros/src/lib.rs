@@ -14,6 +14,7 @@ use syn::{
 };
 use syn::{Item, WherePredicate};
 
+mod napi;
 mod rkyv_self;
 mod sdk_type_derives;
 
@@ -273,6 +274,11 @@ pub fn create_uniffi_wrapper(_attr: TokenStream, item: TokenStream) -> TokenStre
 /// List it first, ahead of the block's `wasm_bindgen` attribute. rustc expands the block's
 /// `cfg_attr`s before it runs, so it finds `wasm_bindgen` only on the builds that export the
 /// block, and passes the block through unchanged on every other build.
+///
+/// A method marked `#[napi_export]` is also exported on the `napi` build: the marker is taken off
+/// on every build (so `uniffi::export` and `wasm_bindgen` never see it), and next to the block a
+/// `#[cfg(feature = "napi")]` module per marked method holds its napi wrapper, a method of the
+/// type's class in `crate::js::napi`, which has the type's name (see `napi::exports`).
 #[proc_macro_attribute]
 pub fn js_exports(attr: TokenStream, item: TokenStream) -> TokenStream {
 	if !attr.is_empty() {
@@ -290,6 +296,15 @@ pub fn js_exports(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn js_exports_tokens(mut item: ItemImpl) -> syn::Result<TokenStream2> {
+	let napi = napi::exports(&mut item)?;
+	let wasm = wasm_exports_tokens(item)?;
+	Ok(quote! {
+		#wasm
+		#napi
+	})
+}
+
+fn wasm_exports_tokens(mut item: ItemImpl) -> syn::Result<TokenStream2> {
 	if let Some(attr) = item
 		.attrs
 		.iter()
@@ -1635,10 +1650,6 @@ fn default_enum_serde_repr(item_enum: &ItemEnum) -> proc_macro2::TokenStream {
 	}
 }
 
-fn parse_enum(item_enum: ItemEnum, state: JsTypeState) -> TokenStream {
-	enum_tokens(item_enum, state).into()
-}
-
 fn enum_tokens(mut item_enum: ItemEnum, state: JsTypeState) -> TokenStream2 {
 	let js_param = js_param_impl(&item_enum.ident, &item_enum.generics, &state);
 	let name = &item_enum.ident;
@@ -1878,6 +1889,7 @@ fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
 		tagged: false,
 		untagged: false,
 		camel_case_fields: false,
+		napi: false,
 	};
 
 	for arg in args {
@@ -1906,6 +1918,9 @@ fn parse_args(args: Vec<Meta>) -> Result<JsTypeState, syn::Error> {
 			}
 			Meta::Path(path) if path.is_ident("camel_case_fields") => {
 				state.camel_case_fields = true;
+			}
+			Meta::Path(path) if path.is_ident("napi") => {
+				state.napi = true;
 			}
 			Meta::Path(path) if path.is_ident("wasm_all") => {
 				state.wasm_condition = quote! {all(target_family = "wasm", target_os = "unknown")};
@@ -1943,13 +1958,56 @@ pub fn js_type(attr: TokenStream, item: TokenStream) -> TokenStream {
 		Err(e) => return e.to_compile_error().into(),
 	};
 
-	match input {
-		Item::Struct(item_struct) => parse_struct(item_struct, state).into(),
-		Item::Enum(item_enum) => parse_enum(item_enum, state),
-		_ => syn::Error::new_spanned(input, "#[js_type] can only be used on structs or enums")
-			.to_compile_error()
-			.into(),
-	}
+	js_type_tokens(input, state)
+		.unwrap_or_else(syn::Error::into_compile_error)
+		.into()
+}
+
+fn js_type_tokens(input: Item, state: JsTypeState) -> syn::Result<TokenStream2> {
+	let napi = if state.napi {
+		napi::mirror(
+			&input,
+			napi::Directions {
+				import: !state.from_abi.is_empty(),
+				export: !state.into_abi.is_empty(),
+			},
+		)?
+	} else {
+		quote!()
+	};
+	let tokens = match input {
+		Item::Struct(item_struct) => parse_struct(item_struct, state),
+		Item::Enum(item_enum) => enum_tokens(item_enum, state),
+		_ => {
+			return Err(syn::Error::new_spanned(
+				input,
+				"#[js_type] can only be used on structs or enums",
+			));
+		}
+	};
+	Ok(quote! {
+		#tokens
+		#napi
+	})
+}
+
+/// The napi mirror of a type whose wasm and uniffi derives are written by hand, so it is not a
+/// `#[js_type]`: `#[napi_mirror(import)]`, `(export)` or `(import, export)`. It adds what
+/// `#[js_type(napi)]` adds and leaves the item as written.
+#[proc_macro_attribute]
+pub fn napi_mirror(attr: TokenStream, item: TokenStream) -> TokenStream {
+	let args = parse_macro_input!(attr with Punctuated::<Meta, Comma>::parse_terminated);
+	let input = parse_macro_input!(item as Item);
+	napi::Directions::parse(args)
+		.and_then(|directions| napi::mirror(&input, directions))
+		.map(|napi| {
+			quote! {
+				#input
+				#napi
+			}
+		})
+		.unwrap_or_else(syn::Error::into_compile_error)
+		.into()
 }
 
 #[proc_macro_attribute]
@@ -1970,6 +2028,8 @@ struct JsTypeState {
 	/// A tagged enum's struct-variant fields are written in camelCase too, like a struct's;
 	/// without it they keep their Rust names, as the enums that shipped that way do.
 	camel_case_fields: bool,
+	/// Also generate a napi mirror (see `napi::mirror`), behind `#[cfg(feature = "napi")]`.
+	napi: bool,
 	wasm_condition: TokenStream2,
 }
 
