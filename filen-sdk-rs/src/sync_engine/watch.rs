@@ -280,6 +280,9 @@ impl SyncEngine {
 		// The pair's own doorbell rather than one of this watch's: the engine rings it too, when a
 		// caller approves held deletions (`approve_deletions`).
 		let dirty = changes.doorbell();
+		// Rung by `request_pass` alone, and heard even through a failure backoff (see
+		// `wait_for_next_pass`).
+		let requested = changes.request_signal();
 		// Created before either trigger source, so a source that fails to start can say so.
 		let (status_tx, status_rx) = tokio::sync::watch::channel(WatchStatus::default());
 
@@ -368,6 +371,7 @@ impl SyncEngine {
 				pair,
 				config,
 				dirty,
+				requested,
 				rules,
 				stop,
 				observer,
@@ -429,6 +433,9 @@ struct WatchLoop {
 	/// the engine rings on an approval of held deletions: the pair's doorbell
 	/// (`PairChanges::doorbell`).
 	dirty: Arc<Notify>,
+	/// Rung when a caller asks for a pass (`SyncEngine::request_pass`): the pair's request signal
+	/// (`PairChanges::request_signal`).
+	requested: Arc<Notify>,
 	/// Changes whenever the engine's user ignore rules do.
 	rules: tokio::sync::watch::Receiver<u64>,
 	stop: Stop,
@@ -447,6 +454,7 @@ async fn run_loop(watch: WatchLoop) {
 		pair,
 		config,
 		dirty,
+		requested,
 		mut rules,
 		mut stop,
 		mut observer,
@@ -553,6 +561,7 @@ async fn run_loop(watch: WatchLoop) {
 		if !wait_for_next_pass(
 			&mut stop,
 			&dirty,
+			&requested,
 			&mut safety_net,
 			&mut rules,
 			config.debounce,
@@ -618,11 +627,12 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 ///
 /// After a failed pass that `backoff` delay *is* the whole wait: it is the retry timer, so a
 /// persistent failure retries on the backoff schedule rather than falling through to whatever the
-/// safety net or a change event happens to offer next. While healthy the wait ends on the periodic
-/// safety-net tick, on new device-wide user ignore patterns (`rules`), or on a change event once
-/// the burst behind it has gone quiet for `debounce`. New patterns are not debounced: they arrive
-/// one deliberate call at a time, and a burst of calls is already one wake-up (the signal carries
-/// the latest version, not each one).
+/// safety net or a change event happens to offer next. Only a caller's request (`requested`) cuts
+/// it short: someone asked for this retry, typically after fixing what failed. While healthy the
+/// wait ends on the periodic safety-net tick, on new device-wide user ignore patterns (`rules`), or
+/// on a change event or a request once the burst behind it has gone quiet for `debounce`. New
+/// patterns are not debounced: they arrive one deliberate call at a time, and a burst of calls is
+/// already one wake-up (the signal carries the latest version, not each one).
 ///
 /// A burst that never goes quiet is coalesced for at most [`MAX_DEBOUNCE_BURST`] debounces, and a
 /// safety-net tick that comes due while it is being coalesced ends the wait too: neither the quiet
@@ -630,6 +640,7 @@ async fn wait_while_paused(stop: &mut Stop, poll: Duration) -> bool {
 async fn wait_for_next_pass(
 	stop: &mut Stop,
 	dirty: &Notify,
+	requested: &Notify,
 	safety_net: &mut tokio::time::Interval,
 	rules: &mut tokio::sync::watch::Receiver<u64>,
 	debounce: Duration,
@@ -639,6 +650,7 @@ async fn wait_for_next_pass(
 		return tokio::select! {
 			biased;
 			_ = stop.ended() => false,
+			_ = requested.notified() => true,
 			_ = tokio::time::sleep(delay) => true,
 		};
 	}
@@ -648,7 +660,12 @@ async fn wait_for_next_pass(
 		_ = stop.ended() => return false,
 		_ = safety_net.tick() => {}
 		_ = user_ignore_changed(rules) => {}
-		_ = dirty.notified() => {
+		_ = async {
+			tokio::select! {
+				_ = dirty.notified() => {}
+				_ = requested.notified() => {}
+			}
+		} => {
 			// Coalesce the burst: wait for `debounce` of quiet (each new event restarts it) — but
 			// for no longer than `MAX_DEBOUNCE_BURST` debounces all told, and no longer than the
 			// periodic pass was going to wait anyway. A tree something writes into continuously
@@ -936,6 +953,7 @@ mod tests {
 		time::Duration,
 	};
 
+	use futures::FutureExt;
 	use notify::{
 		EventHandler, EventKind, RecursiveMode, Watcher, WatcherKind,
 		event::{CreateKind, ModifyKind, RenameMode},
@@ -1053,6 +1071,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1207,6 +1226,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1227,6 +1247,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1238,6 +1259,63 @@ mod tests {
 			start.elapsed(),
 			BASE_BACKOFF,
 			"new patterns must not turn the backoff into an on-demand retry"
+		);
+	}
+
+	/// A caller's request for a pass ends a healthy wait at the debounce, like a change, and cuts a
+	/// failure backoff short where a change cannot: a "sync now" pressed after fixing what failed
+	/// must not wait out up to [`MAX_BACKOFF`] doing nothing.
+	#[tokio::test(start_paused = true)]
+	async fn a_requested_pass_runs_at_the_debounce_and_through_a_backoff() {
+		let (_shutdown_tx, _removed_tx, mut stop) = stop();
+		let dirty = Notify::new();
+		let requested = Notify::new();
+		let mut safety_net = safety_net().await;
+		let (_rules_tx, mut rules) = user_ignore();
+
+		requested.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&requested,
+				&mut safety_net,
+				&mut rules,
+				DEBOUNCE,
+				None
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			DEBOUNCE,
+			"a request waits out the debounce"
+		);
+
+		requested.notify_one();
+		dirty.notify_one();
+		let start = tokio::time::Instant::now();
+		assert!(
+			wait_for_next_pass(
+				&mut stop,
+				&dirty,
+				&requested,
+				&mut safety_net,
+				&mut rules,
+				DEBOUNCE,
+				Some(MAX_BACKOFF)
+			)
+			.await
+		);
+		assert_eq!(
+			start.elapsed(),
+			Duration::ZERO,
+			"a request must cut the backoff short"
+		);
+		assert!(
+			dirty.notified().now_or_never().is_some(),
+			"the change event must still be pending, not consumed by the backoff"
 		);
 	}
 
@@ -1255,6 +1333,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1269,6 +1348,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1313,6 +1393,7 @@ mod tests {
 				wait_for_next_pass(
 					&mut stop,
 					&dirty,
+					&Notify::new(),
 					&mut safety_net,
 					&mut rules,
 					DEBOUNCE,
@@ -1336,7 +1417,15 @@ mod tests {
 		assert!(
 			tokio::time::timeout(
 				DEBOUNCE * MAX_DEBOUNCE_BURST,
-				wait_for_next_pass(&mut stop, &dirty, &mut net, &mut rules, DEBOUNCE, None)
+				wait_for_next_pass(
+					&mut stop,
+					&dirty,
+					&Notify::new(),
+					&mut net,
+					&mut rules,
+					DEBOUNCE,
+					None
+				)
 			)
 			.await
 			.expect("a safety-net tick must not wait out the burst")
@@ -1364,6 +1453,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1391,6 +1481,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1403,6 +1494,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1433,6 +1525,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1472,6 +1565,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1500,6 +1594,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1544,6 +1639,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1774,6 +1870,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1803,6 +1900,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1824,6 +1922,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1839,6 +1938,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1859,6 +1959,7 @@ mod tests {
 			!wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				DEBOUNCE,
@@ -1925,6 +2026,7 @@ mod tests {
 			wait_for_next_pass(
 				&mut stop,
 				&dirty,
+				&Notify::new(),
 				&mut safety_net,
 				&mut rules,
 				debounce,

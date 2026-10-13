@@ -188,6 +188,9 @@ pub enum FullPassReason {
 	LocalEventsUnwatched,
 	/// The periodic safety-net tick — the backstop for anything both changelists silently missed.
 	SafetyNet,
+	/// A caller asked for a pass ([`request_pass`](super::SyncEngine::request_pass)), which reads
+	/// both sides whole like a [`SafetyNet`](Self::SafetyNet) tick.
+	Requested,
 	/// The previous pass refused to run (a name collision on either side), which is whole-tree
 	/// state.
 	PreviousRefusal,
@@ -267,6 +270,7 @@ impl fmt::Display for FullPassReason {
 			Self::RemoteEventsDegraded => "no remote changes are announced for this pair",
 			Self::LocalEventsUnwatched => "no filesystem watcher is attached to this pair",
 			Self::SafetyNet => "the periodic safety-net pass",
+			Self::Requested => "a caller asked for a pass",
 			Self::PreviousRefusal => "the previous pass refused to run",
 			Self::DeletionHold => "the previous pass held deletions for whole-tree evidence",
 			Self::InterruptedPass => "the previous pass was cancelled part-way through",
@@ -546,6 +550,11 @@ pub(super) struct PairChanges {
 	/// is running: rung with nobody waiting, it keeps one wake for the next wait. `Arc`: the watch's
 	/// trigger callbacks and its loop each hold it on their own threads.
 	doorbell: Arc<Notify>,
+	/// A caller's request for a pass ([`request_pass`](super::SyncEngine::request_pass)), kept
+	/// apart from the doorbell because a watch backing off after a failed pass hears only this
+	/// one: a change event must wait out the backoff, a "sync now" must not. Kept like the
+	/// doorbell, and an `Arc` for the same reason.
+	requested: Arc<Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -553,9 +562,9 @@ struct ChangeState {
 	local: LocalDirty,
 	remote: RemoteDelta,
 	/// Recorded by the engine for the NEXT pass — the previous pass's outcome, a rules change, the
-	/// safety-net tick. Keeps the FIRST reason recorded (the one that made the pass mandatory) and
-	/// is TAKEN by the next pass to start, in the same breath as the changelists
-	/// ([`PairChanges::take`]).
+	/// safety-net tick, a caller's request. Keeps the FIRST reason recorded (the one that made the
+	/// pass mandatory) and is TAKEN by the next pass to start, in the same breath as the
+	/// changelists ([`PairChanges::take`]).
 	///
 	/// Taken rather than cleared at the end, because a pass cannot honour a demand it never saw: a
 	/// reason recorded while it was already reading (a `set_user_ignore` that commits mid-pass, a
@@ -820,6 +829,17 @@ impl PairChanges {
 	/// trigger.
 	pub(super) fn ring(&self) {
 		self.doorbell.notify_one();
+	}
+
+	/// The pair's request signal, for a watch to wait on (see [`request`](Self::request)).
+	pub(super) fn request_signal(&self) -> Arc<Notify> {
+		Arc::clone(&self.requested)
+	}
+
+	/// Wake the pair's watch for a pass a caller asked for: at its debounce, or at once when it is
+	/// backing off after a failed pass.
+	pub(super) fn request(&self) {
+		self.requested.notify_one();
 	}
 
 	/// Take both changelists for a pass — called BEFORE it reads either side (see the module docs
@@ -1869,6 +1889,7 @@ pub(super) mod tests {
 			R::LocalEventsDegraded,
 			R::RemoteEventsDegraded,
 			R::SafetyNet,
+			R::Requested,
 			R::PreviousRefusal,
 			R::DeletionHold,
 			R::InterruptedPass,

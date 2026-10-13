@@ -5429,6 +5429,54 @@ impl SyncEngine {
 			.map_err(|e| db_error(e, "clearing a path's failure count"))
 	}
 
+	/// Ask `pair`'s [`watch`](Self::watch) for a pass now — a "sync now" button — rather than at
+	/// its next change or safety-net tick. The pass runs at the watch's debounce, after the pass in
+	/// flight if there is one; a watch backing off after a failed pass cuts the backoff short and
+	/// runs it at once, since the caller is asking for exactly that retry.
+	///
+	/// The pass is forced WHOLE ([`FullPassReason::Requested`]): it reads both sides in full, like
+	/// a safety-net tick, so it also finds what both changelists silently missed. On a large tree
+	/// that is the cost of a full pass, not of the changes since the last one.
+	///
+	/// Without a watch nothing runs: the request is recorded, and the next
+	/// [`sync_once`](Self::sync_once) is that whole pass. Errors if the pair is unknown, being
+	/// removed, or paused — a paused watch runs nothing, so the request would wait silently for a
+	/// resume, which already forces a whole pass of its own.
+	pub async fn request_pass(&self, pair: PairId) -> Result<(), Error> {
+		if locked(&self.control)
+			.pair(pair)
+			.map_err(|e| db_error(e, "loading the sync pair"))?
+			.is_none()
+		{
+			return Err(Error::custom(ErrorKind::InvalidState, "unknown sync pair"));
+		}
+		// Read without creating the channel, as `set_control` does. A pair on its way out is not
+		// `Run` either, but telling the caller to resume it would send them to a verb that refuses.
+		let control = self
+			.paused
+			.lock()
+			.await
+			.get(&pair)
+			.map(|control| *control.borrow());
+		match control {
+			Some(PassControl::Retired) => return Err(being_removed(pair)),
+			Some(control) if control.is_paused() => {
+				return Err(Error::custom(
+					ErrorKind::InvalidState,
+					format!("sync pair {pair} is paused: resume it before asking for a pass"),
+				));
+			}
+			_ => {}
+		}
+		// A pair with no changelist has not passed in this process yet, and its first pass reads
+		// everything anyway.
+		if let Some(changes) = self.existing_pair_changes(pair).await {
+			changes.force(FullPassReason::Requested);
+			changes.request();
+		}
+		Ok(())
+	}
+
 	/// The conflicts the engine is holding for `pair`, ordered by path: every conflict a pass
 	/// reported in [`SyncReport::conflicts`] that [`resolve_conflict`](Self::resolve_conflict) has
 	/// not resolved yet, with what each side held when it was recorded. This includes an upload of
@@ -11174,6 +11222,72 @@ mod tests {
 		assert!(
 			engine.take_approval(pair, "0123456789abcdef").await,
 			"the approval itself is stored for that pass"
+		);
+
+		drop(engine);
+		std::fs::remove_file(&path).ok();
+	}
+
+	/// A requested pass is due, whole, and announced on the request signal the pair's watch waits
+	/// on; an unknown pair, a paused one and one being removed are refused, and the paused one is
+	/// left exactly as it was.
+	#[tokio::test]
+	async fn a_requested_pass_is_due_whole_and_wakes_the_watch() {
+		let path = std::env::temp_dir().join(format!("filen_sync_request_{}.db", Uuid::new_v4()));
+		let engine = SyncEngine::open(Arc::new(offline_client()), path.clone())
+			.await
+			.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair("/root", Uuid::new_v4(), SyncMode::TwoWay)
+			.unwrap();
+		let changes = engine.pair_changes(pair).await;
+		changes.cover_local();
+		let requested = changes.request_signal();
+
+		let unknown = engine.request_pass(pair + 9_999).await.unwrap_err();
+		assert_eq!(unknown.kind(), ErrorKind::InvalidState);
+		assert!(
+			unknown.to_string().contains("unknown sync pair"),
+			"{unknown}"
+		);
+
+		engine.pause_pair(pair).await.unwrap();
+		let paused = engine.request_pass(pair).await.unwrap_err();
+		assert_eq!(paused.kind(), ErrorKind::InvalidState);
+		assert!(
+			paused.to_string().contains("paused") && paused.to_string().contains("resume"),
+			"the refusal must say what to do about it: {paused}"
+		);
+		assert!(changes.is_idle(), "a refused request forces nothing");
+		assert!(
+			requested.notified().now_or_never().is_none(),
+			"a refused request rings nothing"
+		);
+
+		engine.set_control(pair, PassControl::Run).await.unwrap();
+		engine.request_pass(pair).await.unwrap();
+		assert!(
+			requested.notified().now_or_never().is_some(),
+			"the request must wake the pair's watch"
+		);
+		assert_eq!(
+			changes.take().full_pass_reason(10),
+			Some(FullPassReason::Requested)
+		);
+
+		// A pair whose removal is under way reads as paused, but is refused as what it is.
+		engine
+			.paused
+			.lock()
+			.await
+			.get(&pair)
+			.expect("the pause made the pair's control")
+			.send_replace(PassControl::Retired);
+		let retired = engine.request_pass(pair).await.unwrap_err();
+		assert_eq!(
+			retired.to_string(),
+			being_removed(pair).to_string(),
+			"a pair being removed must not be sent to resume_pair"
 		);
 
 		drop(engine);
