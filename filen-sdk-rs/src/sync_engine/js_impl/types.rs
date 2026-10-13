@@ -195,7 +195,8 @@ pub struct SyncPairInfo {
 	pub pass_in_flight: Option<u64>,
 	/// When (Unix epoch milliseconds) the last pass this process saw complete did so.
 	pub last_pass_completed_at_ms: Option<u64>,
-	/// That pass's [`SyncPassReport::pass_error`].
+	/// Why the last pass this process saw end failed: its `PassFailed` error, or the
+	/// [`SyncPassReport::pass_error`] of its `PassCompleted`. `None` when it succeeded.
 	pub last_pass_error: Option<String>,
 	/// When (Unix epoch milliseconds) this process paused the pair; `None` while it runs, and for
 	/// a pause from before this process started (the engine persists only the flag).

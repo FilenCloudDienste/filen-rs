@@ -1022,6 +1022,12 @@ pub(crate) mod test_support {
 	/// 512 bits because the key only has to parse: `from_stringified` derives a public key and an
 	/// HMAC key from it, and a 2048-bit key would cost each test half a second to generate.
 	pub(crate) fn offline_client() -> Client {
+		offline_client_with_root("00000000-0000-0000-0000-000000000000")
+	}
+
+	/// [`offline_client`] for the account whose root folder is `root_uuid`, for a test that needs
+	/// two accounts.
+	pub(crate) fn offline_client_with_root(root_uuid: &str) -> Client {
 		let private_key = RsaPrivateKey::new(&mut old_rng::thread_rng(), 512)
 			.expect("generating a throwaway RSA key");
 		UnauthClient::from_config(ClientConfig::default())
@@ -1029,7 +1035,7 @@ pub(crate) mod test_support {
 			.from_stringified(StringifiedClient {
 				email: "offline@example.invalid".to_owned(),
 				user_id: 1,
-				root_uuid: "00000000-0000-0000-0000-000000000000".to_owned(),
+				root_uuid: root_uuid.to_owned(),
 				auth_info: "0".repeat(64),
 				private_key: BASE64_STANDARD.encode(
 					private_key
