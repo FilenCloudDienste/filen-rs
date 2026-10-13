@@ -9,9 +9,6 @@ use filen_sdk_rs::{
 	cache::{CacheMessage, ResyncProgress, SearchConfig, SearchSnapshot},
 	fs::HasUUID as _,
 };
-use serde_json::json;
-
-// todo: allow non-interactive search
 
 pub(crate) async fn search_cmd(
 	ui: &mut UI,
@@ -261,19 +258,13 @@ pub(crate) async fn search_cmd_non_interactive(
 	let results = results
 		.lock()
 		.map_err(|e| anyhow!("Failed to lock search results mutex: {}", e))?;
-	if ui.json {
-		ui.print_json(json!({
-			"results": results.clone(),
-		}))?;
-	} else {
-		ui.print_grid(
-			results
-				.iter()
-				.map(|r| r.as_str())
-				.collect::<Vec<_>>()
-				.as_slice(),
-		)
-	};
+	ui.print_grid(
+		results
+			.iter()
+			.map(|r| r.as_str())
+			.collect::<Vec<_>>()
+			.as_slice(),
+	);
 
 	Ok(())
 }

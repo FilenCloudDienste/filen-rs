@@ -2,12 +2,14 @@
 //! "look up a path", "narrow to a directory/non-root item" and "public link subscription error"
 //! boilerplate in every endpoint file.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
 	fs::categories::{DirType, NonRootFileType, NonRootItemType, Normal},
 };
+
+use crate::ui::UI;
 
 /// Looks up an item by path, turning "not found" into a friendly `"No such {what}: {path}"` error.
 pub(crate) async fn find_item_or_err<'a>(
@@ -19,7 +21,7 @@ pub(crate) async fn find_item_or_err<'a>(
 		.find_item_at_path(path)
 		.await
 		.context("Failed to look up path")?
-		.ok_or_else(|| anyhow!("No such {}: {}", what, path))
+		.ok_or_else(|| UI::failure(&format!("No such {}: {}", what, path)))
 }
 
 /// Narrows an item to a directory (the root directory counts as one), erroring on a file.
@@ -30,7 +32,7 @@ pub(crate) fn require_dir<'a>(
 	match item {
 		NonRootFileType::Dir(dir) => Ok(DirType::Dir(dir)),
 		NonRootFileType::Root(root) => Ok(DirType::Root(root)),
-		NonRootFileType::File(_) => Err(anyhow!("Not a directory: {}", path)),
+		NonRootFileType::File(_) => Err(UI::failure(&format!("Not a directory: {}", path))),
 	}
 }
 
@@ -43,7 +45,7 @@ pub(crate) fn reject_root<'a>(
 	match item {
 		NonRootFileType::File(file) => Ok(NonRootItemType::File(file)),
 		NonRootFileType::Dir(dir) => Ok(NonRootItemType::Dir(dir)),
-		NonRootFileType::Root(_) => Err(anyhow!("{}", root_err)),
+		NonRootFileType::Root(_) => Err(UI::failure(root_err)),
 	}
 }
 
@@ -51,7 +53,7 @@ pub(crate) fn reject_root<'a>(
 /// "no public-link support on this account" response into a friendlier message.
 pub(crate) fn map_link_status_err(e: filen_sdk_rs::Error) -> anyhow::Error {
 	if e.kind() == ErrorKind::Server && e.server_code().as_deref() == Some("subscription_needed") {
-		anyhow!("Public links are not available for this account (subscription required)")
+		UI::failure("Public links are not available for this account (subscription required)")
 	} else {
 		anyhow::Error::new(e).context("Failed to get public link status")
 	}

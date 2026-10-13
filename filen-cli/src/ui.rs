@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{CommandFactory, builder::Styles};
 use console::{self, style};
 use filen_sdk_rs::auth::Client;
@@ -11,7 +11,6 @@ use inquire::{
 };
 use log::{error, info, warn};
 use tiny_gradient::{GradientStr, RGB};
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
 	CliArgs, EXIT_CODE_ERROR_PREFIX, completion::async_completions_available, util::RemotePath,
@@ -72,8 +71,7 @@ pub(crate) struct UI {
 	history: Vec<String>,
 	override_terminal_width: Option<usize>,
 	output: Vec<String>,
-	/// Whether to output machine-readable JSON where applicable
-	pub(crate) json: bool,
+	// todo: instead of ui.json, introduce a command to directly use JSON-RPC endpoints without the HTTP server
 	disable_suggestions: bool,
 	/// Whether to redact things that depend on the runtime environment, like: paths, ...
 	make_output_environment_agnostic_for_replay_testing: bool,
@@ -86,7 +84,6 @@ impl UI {
 			history: Vec::new(),
 			override_terminal_width: None,
 			output: Vec::new(),
-			json: false,
 			disable_suggestions: false,
 			make_output_environment_agnostic_for_replay_testing: false,
 		}
@@ -95,13 +92,11 @@ impl UI {
 	pub(crate) fn initialize(
 		&mut self,
 		quiet: bool,
-		json: bool,
 		override_terminal_width: Option<usize>,
 		disable_suggestions: bool,
 		make_output_environment_agnostic_for_replay_testing: bool,
 	) {
 		self.quiet = quiet;
-		self.json = json;
 		self.override_terminal_width = override_terminal_width;
 		self.disable_suggestions = disable_suggestions;
 		self.make_output_environment_agnostic_for_replay_testing =
@@ -112,7 +107,7 @@ impl UI {
 		self.quiet
 	}
 
-	fn get_terminal_width(&self) -> Option<usize> {
+	pub(crate) fn get_terminal_width(&self) -> Option<usize> {
 		match self.override_terminal_width {
 			Some(size) => Some(size),
 			None => termsize::get().map(|size| size.cols as usize),
@@ -222,6 +217,23 @@ impl UI {
 		}
 	}
 
+	/// Extracts the message of user-friendly failures created with `UI::failure`,
+	/// or returns the unexpected error
+	// todo: this relies on the styled "✘" prefix of the message (breaks with colors disabled), so maybe use a typed error instead
+	pub(crate) fn extract_failure(err: anyhow::Error) -> Result<String> {
+		let err_msg = format!("{}", err);
+		let is_failure = err_msg.starts_with(&format!("{}", style("✘").red()));
+		if is_failure {
+			let failure = err_msg
+				.trim_start_matches(&format!("{}", style("✘").red()))
+				.trim()
+				.to_string();
+			Ok(failure)
+		} else {
+			Err(err)
+		}
+	}
+
 	pub(crate) fn print_muted(&mut self, msg: &str) {
 		self.print(&style(msg).dim().to_string());
 	}
@@ -232,59 +244,6 @@ impl UI {
 		for (key, value) in table {
 			self.print(&format!("{:>key_width$} {}", style(key).dim(), value));
 		}
-	}
-
-	/// Print a grid of strings (like an ls command's output)
-	pub(crate) fn print_grid(&mut self, items: &[&str]) {
-		if items.is_empty() {
-			self.print("");
-			return;
-		}
-		let terminal_width = self.get_terminal_width().unwrap_or(10);
-		let min_text_width = items.iter().map(|item| item.width()).max().unwrap_or(0);
-		if min_text_width > terminal_width {
-			// it won't fit, so just print one per line
-			self.print(&items.join("\n"));
-			return;
-		}
-		// try different column heights
-		for column_height in 1.. {
-			let columns = items.chunks(column_height).collect::<Vec<_>>();
-			let num_columns = columns.len();
-			let column_widths = columns
-				.clone()
-				.iter()
-				.map(|column| {
-					column
-						.iter()
-						.map(|item| ansi_width::ansi_width(item))
-						.max()
-						.unwrap()
-				})
-				.collect::<Vec<_>>();
-			let spacing_width = (num_columns - 1) * 2;
-			// check if it fits
-			let total_text_width = column_widths.iter().sum::<usize>();
-			if total_text_width + spacing_width <= terminal_width {
-				for row in 0..column_height {
-					let items = (0..columns.len())
-						.map(|i| {
-							let cell = columns[i].get(row).unwrap_or(&"");
-							let padding =
-								" ".repeat(column_widths[i] - ansi_width::ansi_width(cell));
-							format!("{}{}", cell, padding)
-						})
-						.collect::<Vec<_>>();
-					self.print(&items.join("  "));
-				}
-				break;
-			}
-		}
-	}
-
-	pub(crate) fn print_json(&mut self, value: serde_json::Value) -> Result<()> {
-		self.print(&serde_json::to_string_pretty(&value).context("Failed to serialize JSON")?);
-		Ok(())
 	}
 
 	// prompt
@@ -658,18 +617,18 @@ mod tests {
 
 		// different terminal sizes
 		let mut small_ui = UI::new();
-		small_ui.initialize(false, false, Some(30), true, false);
+		small_ui.initialize(false, Some(30), true, false);
 		test(&mut small_ui);
 		insta::assert_snapshot!(small_ui.output.join("\n"));
 		let mut large_ui = UI::new();
-		large_ui.initialize(false, false, Some(100), true, false);
+		large_ui.initialize(false, Some(100), true, false);
 		test(&mut large_ui);
 		insta::assert_snapshot!(large_ui.output.join("\n"));
 
 		// no color
 		console::set_colors_enabled(false);
 		let mut no_color_ui = UI::new();
-		no_color_ui.initialize(false, false, Some(100), true, false);
+		no_color_ui.initialize(false, Some(100), true, false);
 		test(&mut no_color_ui);
 		insta::assert_snapshot!(no_color_ui.output.join("\n"));
 	}

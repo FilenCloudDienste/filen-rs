@@ -1,8 +1,9 @@
 use crate::{
 	rpc_servers::endpoints::{
 		Endpoint,
-		support::{find_item_or_err, require_dir},
+		util::{find_item_or_err, require_dir},
 	},
+	ui::UI,
 	util::RemotePath,
 };
 use anyhow::{Context, Result};
@@ -41,7 +42,7 @@ impl Endpoint for WriteFile {
 		let path = RemotePath::new(&input.path);
 		let name = path
 			.basename()
-			.context("Cannot write to the root directory")?;
+			.ok_or_else(|| UI::failure("Cannot write to the root directory"))?;
 		let parent_path = path.parent();
 		let parent_dir = require_dir(
 			find_item_or_err(client, &parent_path.0, "directory").await?,
@@ -54,20 +55,20 @@ impl Endpoint for WriteFile {
 			.context("Failed to check destination")?
 		{
 			Some(NonRootFileType::Dir(_)) => {
-				return Err(anyhow::anyhow!("Path is a directory: {}", path.0));
+				return Err(UI::failure(&format!("Path is a directory: {}", path.0)));
 			}
 			Some(NonRootFileType::File(_)) if !input.overwrite.unwrap_or(false) => {
-				return Err(anyhow::anyhow!(
+				return Err(UI::failure(&format!(
 					"File already exists: {} (pass overwrite: true to replace it)",
 					path.0
-				));
+				)));
 			}
 			_ => {}
 		}
 
 		let builder = client
 			.make_file_builder(name, parent_dir.uuid())
-			.context("Invalid file name")?;
+			.map_err(|e| UI::failure(&format!("Invalid file name: {}", e)))?;
 		let file = client
 			.upload_file(builder, input.content.as_bytes())
 			.await

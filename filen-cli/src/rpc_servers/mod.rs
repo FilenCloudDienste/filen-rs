@@ -5,7 +5,7 @@
 use crate::ui::UI;
 use anyhow::{Context as _, Result};
 
-mod endpoints;
+pub(crate) mod endpoints;
 pub(crate) mod json_rpc_server;
 pub(crate) mod mcp_server;
 

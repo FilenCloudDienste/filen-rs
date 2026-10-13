@@ -28,6 +28,7 @@ mod completion;
 mod docs;
 mod rpc_servers;
 mod ui;
+mod ui_utilities;
 mod updater;
 mod util;
 
@@ -113,10 +114,6 @@ pub(crate) struct CliArgs {
 	/// Sets autocomplete to be less eager, only completing remote paths after pressing tab
 	#[arg(long)]
 	reluctant_autocomplete: bool,
-
-	/// Format command output as machine-readable JSON (where applicable)
-	#[arg(long)]
-	json: bool,
 
 	#[command(subcommand)]
 	command: Option<Commands>,
@@ -248,7 +245,6 @@ async fn inner_main(ui: &mut ui::UI) -> Result<()> {
 
 	ui.initialize(
 		cli_args.quiet,
-		cli_args.json,
 		None,
 		cli_args.reluctant_autocomplete,
 		cli_args.make_output_environment_agnostic_for_replay_testing,

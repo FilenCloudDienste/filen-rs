@@ -65,6 +65,12 @@ impl Display for RemotePath {
 	}
 }
 
+impl From<RemotePath> for String {
+	fn from(val: RemotePath) -> Self {
+		val.0
+	}
+}
+
 const KEYRING_SERVICE_NAME: &str = "filen-cli-rs";
 
 /// Provides an interface for reading and writing keyring entries that exceed the character limit.

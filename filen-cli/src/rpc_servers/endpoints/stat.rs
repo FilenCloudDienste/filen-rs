@@ -1,5 +1,10 @@
-use crate::rpc_servers::endpoints::{Endpoint, support::find_item_or_err};
+use crate::{
+	rpc_servers::endpoints::{Endpoint, util::find_item_or_err},
+	ui,
+	ui_utilities::PrintEndpointOutput,
+};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use filen_sdk_rs::fs::{
 	HasName as _, HasUUID as _,
 	categories::{DirType, NonRootFileType, Normal, fs::CategoryFS as _},
@@ -8,7 +13,7 @@ use filen_sdk_rs::fs::{
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct StatInput {
-	path: String,
+	pub path: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -24,25 +29,25 @@ pub(crate) enum ItemType {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StatOutput {
 	#[serde(rename = "type")]
-	item_type: ItemType,
+	pub item_type: ItemType,
 	/// Not set for the drive
-	name: Option<String>,
+	pub name: Option<String>,
 	/// Not set for the drive
-	uuid: Option<String>,
+	pub uuid: Option<String>,
 	/// Size in bytes (for directories, the total size of their contents)
-	size: Option<u64>,
+	pub size: Option<u64>,
 	/// RFC 3339 timestamp; only set for files
-	modified: Option<String>,
+	pub modified: Option<DateTime<Utc>>,
 	/// RFC 3339 timestamp
-	created: Option<String>,
+	pub created: Option<DateTime<Utc>>,
 	/// Number of files contained (recursively); only set for directories and the drive
-	files: Option<u64>,
+	pub files: Option<u64>,
 	/// Number of directories contained (recursively); only set for directories and the drive
-	directories: Option<u64>,
+	pub directories: Option<u64>,
 	/// Used storage in bytes; only set for the drive
-	used_storage: Option<u64>,
+	pub used_storage: Option<u64>,
 	/// Total storage in bytes; only set for the drive
-	total_storage: Option<u64>,
+	pub total_storage: Option<u64>,
 }
 
 pub(crate) struct Stat;
@@ -71,8 +76,8 @@ impl Endpoint for Stat {
 				),
 				uuid: Some(file.uuid().to_string()),
 				size: Some(file.size()),
-				modified: file.last_modified().map(|d| d.to_rfc3339()),
-				created: file.created().map(|d| d.to_rfc3339()),
+				modified: file.last_modified(),
+				created: file.created(),
 				files: None,
 				directories: None,
 				used_storage: None,
@@ -92,7 +97,7 @@ impl Endpoint for Stat {
 					uuid: Some(dir.uuid().to_string()),
 					size: Some(size_info.size),
 					modified: None,
-					created: dir.created().map(|d| d.to_rfc3339()),
+					created: dir.created(),
 					files: Some(size_info.files),
 					directories: Some(size_info.dirs),
 					used_storage: None,
@@ -121,5 +126,45 @@ impl Endpoint for Stat {
 				})
 			}
 		}
+	}
+}
+
+impl PrintEndpointOutput for StatOutput {
+	fn print_output(self, ui: &mut ui::UI) {
+		let table = [
+			Some((
+				"Type",
+				match self.item_type {
+					crate::rpc_servers::endpoints::stat::ItemType::File => "File".to_string(),
+					crate::rpc_servers::endpoints::stat::ItemType::Directory => {
+						"Directory".to_string()
+					}
+					crate::rpc_servers::endpoints::stat::ItemType::Drive => "Drive".to_string(),
+				},
+			)),
+			self.name.map(|name| ("Name", name)),
+			self.uuid.map(|uuid| ("UUID", uuid)),
+			self.size.map(|size| ("Size", ui::format_size(size))),
+			self.modified
+				.map(|modified| ("Modified", ui::format_date(&modified))),
+			self.created
+				.map(|created| ("Created", ui::format_date(&created))),
+			self.files.map(|files| ("Files", files.to_string())),
+			self.directories
+				.map(|dirs| ("Directories", dirs.to_string())),
+			self.used_storage
+				.map(|used| ("Used Storage", ui::format_size(used))),
+			self.total_storage
+				.map(|total| ("Total Storage", ui::format_size(total))),
+		]
+		.into_iter()
+		.flatten()
+		.collect::<Vec<_>>();
+		ui.print_key_value_table(
+			&table
+				.iter()
+				.map(|(k, v)| (*k, v.as_str()))
+				.collect::<Vec<_>>(),
+		);
 	}
 }

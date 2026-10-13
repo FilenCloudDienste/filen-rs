@@ -1,19 +1,22 @@
-use crate::rpc_servers::endpoints::{
-	Endpoint,
-	support::{find_item_or_err, require_dir},
+use crate::{
+	rpc_servers::endpoints::{
+		Endpoint,
+		util::{find_item_or_err, require_dir},
+	},
+	ui_utilities::PrintEndpointOutput,
 };
 use anyhow::{Context, Result};
 use filen_sdk_rs::fs::categories::Normal;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadDirectoryInput {
-	directory_path: String,
+	pub directory_path: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadDirectoryOutput {
-	files: Vec<String>,
-	directories: Vec<String>,
+	pub files_with_size: Vec<(String, u64)>,
+	pub directories: Vec<String>,
 }
 
 pub(crate) struct ReadDirectory;
@@ -53,13 +56,36 @@ impl Endpoint for ReadDirectory {
 		let files = files
 			.into_iter()
 			.map(|f| {
-				f.meta
-					.name()
-					.map(|str| str.to_string())
-					.unwrap_or("<unknown>".into())
+				(
+					f.meta
+						.name()
+						.map(|str| str.to_string())
+						.unwrap_or("<unknown>".into()),
+					f.size,
+				)
 			})
 			.collect();
 
-		Ok(ReadDirectoryOutput { files, directories })
+		Ok(ReadDirectoryOutput {
+			files_with_size: files,
+			directories,
+		})
+	}
+}
+
+impl PrintEndpointOutput for ReadDirectoryOutput {
+	fn print_output(self, ui: &mut crate::ui::UI) {
+		self.print_output(ui, false);
+	}
+}
+
+impl ReadDirectoryOutput {
+	pub(crate) fn print_output(self, ui: &mut crate::ui::UI, long: bool) {
+		ui.print_item_names(
+			self.directories,
+			self.files_with_size,
+			"Directory is empty.",
+			long,
+		);
 	}
 }

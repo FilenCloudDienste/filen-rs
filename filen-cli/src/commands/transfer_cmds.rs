@@ -371,7 +371,7 @@ pub(crate) struct TransferProgress {
 impl TransferProgress {
 	pub(crate) fn new(kind: TransferKind, ui: &UI) -> Self {
 		let term = Term::stdout();
-		let enabled = term.is_term() && !ui.is_quiet() && !ui.json;
+		let enabled = term.is_term() && !ui.is_quiet();
 		Self {
 			kind,
 			term,

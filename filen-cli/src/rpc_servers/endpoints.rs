@@ -3,24 +3,24 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
-mod copy_item;
-mod create_directory;
-mod delete_public_link;
-mod get_public_link;
-mod list_public_links;
-mod list_trash;
-mod move_item;
-mod public_link_expiration;
-mod read_directory;
-mod read_directory_recursive;
-mod read_file;
-mod restore_trash_item;
-mod set_public_link;
-mod stat;
-mod support;
-mod trash_item;
-mod who_am_i;
-mod write_file;
+pub(crate) mod copy_item;
+pub(crate) mod create_directory;
+pub(crate) mod delete_item;
+pub(crate) mod delete_public_link;
+pub(crate) mod get_public_link;
+pub(crate) mod list_public_links;
+pub(crate) mod list_trash;
+pub(crate) mod move_item;
+pub(crate) mod public_link_expiration;
+pub(crate) mod read_directory;
+pub(crate) mod read_directory_recursive;
+pub(crate) mod read_file;
+pub(crate) mod restore_trash_item;
+pub(crate) mod set_public_link;
+pub(crate) mod stat;
+pub(crate) mod util;
+pub(crate) mod who_am_i;
+pub(crate) mod write_file;
 
 pub trait Endpoint {
 	type Input: serde::Serialize + serde::de::DeserializeOwned + schemars::JsonSchema;
@@ -117,7 +117,7 @@ pub fn all_endpoints() -> Vec<Box<dyn AnyEndpoint>> {
 		Box::new(write_file::WriteFile),
 		Box::new(move_item::MoveItem),
 		Box::new(copy_item::CopyItem),
-		Box::new(trash_item::TrashItem),
+		Box::new(delete_item::DeleteItem),
 		Box::new(list_trash::ListTrash),
 		Box::new(restore_trash_item::RestoreTrashItem),
 		Box::new(list_public_links::ListPublicLinks),

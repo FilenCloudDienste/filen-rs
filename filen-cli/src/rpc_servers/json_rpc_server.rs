@@ -1,4 +1,7 @@
-use crate::rpc_servers::endpoints::{AnyEndpoint, all_endpoints};
+use crate::{
+	rpc_servers::endpoints::{AnyEndpoint, all_endpoints},
+	ui::UI,
+};
 use jsonrpsee::{
 	server::{RpcModule, Server},
 	types::{ErrorObjectOwned, Params, error::INVALID_PARAMS_CODE},
@@ -259,11 +262,18 @@ fn build_module(
 					if error.downcast_ref::<serde_json::Error>().is_some() {
 						invalid_params(error.to_string())
 					} else {
-						ErrorObjectOwned::owned(
-							ENDPOINT_ERROR_CODE,
-							format!("{error:#}"),
-							None::<()>,
-						)
+						match UI::extract_failure(error) {
+							Ok(failure) => ErrorObjectOwned::owned(
+								ENDPOINT_ERROR_CODE,
+								failure.to_string(),
+								None::<()>,
+							),
+							Err(error) => ErrorObjectOwned::owned(
+								ENDPOINT_ERROR_CODE,
+								format!("{error:#}"),
+								None::<()>,
+							),
+						}
 					}
 				})
 			}

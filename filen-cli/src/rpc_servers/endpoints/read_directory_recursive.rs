@@ -1,8 +1,11 @@
 use std::borrow::Cow;
 
-use crate::rpc_servers::endpoints::{
-	Endpoint,
-	support::{find_item_or_err, require_dir},
+use crate::{
+	rpc_servers::endpoints::{
+		Endpoint,
+		util::{find_item_or_err, require_dir},
+	},
+	ui::UI,
 };
 use anyhow::{Context, Result};
 use filen_sdk_rs::fs::categories::{DirType, Normal};
@@ -39,7 +42,7 @@ impl Endpoint for ReadDirectoryRecursive {
 		input: Self::Input,
 	) -> Result<Self::Output> {
 		if input.depth == 0 {
-			return Err(anyhow::anyhow!("Depth must be at least 1"));
+			return Err(UI::failure("Depth must be at least 1"));
 		}
 		let directory = require_dir(
 			find_item_or_err(client, &input.directory_path, "directory").await?,

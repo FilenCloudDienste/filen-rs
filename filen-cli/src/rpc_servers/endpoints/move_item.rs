@@ -1,8 +1,10 @@
 use crate::{
 	rpc_servers::endpoints::{
 		Endpoint,
-		support::{find_item_or_err, reject_root, require_dir},
+		util::{find_item_or_err, reject_root, require_dir},
 	},
+	ui::UI,
+	ui_utilities::PrintEndpointOutput,
 	util::RemotePath,
 };
 use anyhow::{Context, Result};
@@ -18,17 +20,18 @@ use filen_sdk_rs::{
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct MoveItemInput {
-	source_path: String,
+	pub source_path: String,
 	/// Following the semantics of the Unix `mv` command: if this names an existing directory,
 	/// the source is moved into it under its current name; otherwise this names the source's
 	/// new path (moving it to that path's parent directory and renaming it to that path's base
 	/// name)
-	destination_path: String,
+	pub destination_path: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct MoveItemOutput {
-	path: String,
+	pub old_path: String,
+	pub new_path: String,
 }
 
 pub(crate) struct MoveItem;
@@ -64,10 +67,10 @@ impl Endpoint for MoveItem {
 			Some(NonRootFileType::Dir(dir)) => Some(DirType::Dir(dir)),
 			Some(NonRootFileType::Root(root)) => Some(DirType::Root(root)),
 			Some(NonRootFileType::File(_)) => {
-				return Err(anyhow::anyhow!(
+				return Err(UI::failure(&format!(
 					"Destination already exists: {}",
 					destination_path.0
-				));
+				)));
 			}
 			None => None,
 		};
@@ -76,11 +79,10 @@ impl Endpoint for MoveItem {
 			Some(destination_dir) => {
 				let new_path = destination_path.navigate(&source_filename);
 				if new_path == source_path {
-					return Err(anyhow::anyhow!(
+					return Err(UI::failure(&format!(
 						"{} is already in {}",
-						source_path.0,
-						destination_path.0
-					));
+						source_path.0, destination_path.0
+					)));
 				}
 				// check that the destination doesn't already exist
 				if client
@@ -89,10 +91,10 @@ impl Endpoint for MoveItem {
 					.context("Failed to check destination")?
 					.is_some()
 				{
-					return Err(anyhow::anyhow!(
+					return Err(UI::failure(&format!(
 						"Destination already exists: {}",
 						new_path.0
-					));
+					)));
 				}
 				(destination_dir, source_filename.clone(), new_path)
 			}
@@ -100,7 +102,7 @@ impl Endpoint for MoveItem {
 			None => {
 				let new_name = destination_path
 					.basename()
-					.context("Destination cannot be the root directory")?
+					.ok_or_else(|| UI::failure("Destination cannot be the root directory"))?
 					.to_string();
 				let parent_path = destination_path.parent();
 				let destination_dir = require_dir(
@@ -112,11 +114,10 @@ impl Endpoint for MoveItem {
 		};
 
 		if new_path.0.starts_with(&format!("{}/", source_path.0)) {
-			return Err(anyhow::anyhow!(
+			return Err(UI::failure(&format!(
 				"Cannot move {} into itself: {}",
-				source_path.0,
-				new_path.0
-			));
+				source_path.0, new_path.0
+			)));
 		}
 
 		let needs_rename = new_name != source_filename;
@@ -133,9 +134,9 @@ impl Endpoint for MoveItem {
 					client
 						.update_file_metadata(
 							&mut file,
-							FileMetaChanges::default()
-								.name(&new_name)
-								.context("Invalid destination file name")?,
+							FileMetaChanges::default().name(&new_name).map_err(|e| {
+								UI::failure(&format!("Invalid destination file name: {}", e))
+							})?,
 						)
 						.await
 						.context("Failed to rename file")?;
@@ -155,7 +156,12 @@ impl Endpoint for MoveItem {
 							&mut dir,
 							DirectoryMetaChanges::default()
 								.name(&new_name)
-								.context("Invalid destination directory name")?,
+								.map_err(|e| {
+									UI::failure(&format!(
+										"Invalid destination directory name: {}",
+										e
+									))
+								})?,
 						)
 						.await
 						.context("Failed to rename directory")?;
@@ -163,6 +169,15 @@ impl Endpoint for MoveItem {
 			}
 		}
 
-		Ok(MoveItemOutput { path: new_path.0 })
+		Ok(MoveItemOutput {
+			old_path: source_path.0,
+			new_path: new_path.0,
+		})
+	}
+}
+
+impl PrintEndpointOutput for MoveItemOutput {
+	fn print_output(self, ui: &mut crate::ui::UI) {
+		ui.print_success(&format!("Moved {} to {}", self.old_path, self.new_path));
 	}
 }

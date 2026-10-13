@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 
-use crate::rpc_servers::endpoints::{Endpoint, support::resolve_full_path};
+use crate::{
+	rpc_servers::endpoints::{Endpoint, util::resolve_full_path},
+	ui::UI,
+};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,
@@ -33,7 +36,7 @@ impl Endpoint for RestoreTrashItem {
 		let uuid: filen_types::fs::Uuid = input
 			.uuid
 			.parse()
-			.context("Invalid uuid: must be a valid UUID")?;
+			.map_err(|_| UI::failure("Invalid uuid: must be a valid UUID"))?;
 
 		let (dirs, files) = client
 			.list_trash(None::<&fn(u64, Option<u64>)>)
@@ -53,7 +56,10 @@ impl Endpoint for RestoreTrashItem {
 				.context("Failed to restore file")?;
 			resolve_full_path(client, &NonRootItemType::File(Cow::Borrowed(&file))).await?
 		} else {
-			return Err(anyhow::anyhow!("No trashed item with uuid: {}", input.uuid));
+			return Err(UI::failure(&format!(
+				"No trashed item with uuid: {}",
+				input.uuid
+			)));
 		};
 
 		Ok(RestoreTrashItemOutput { path })

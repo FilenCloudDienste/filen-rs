@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::rpc_servers::endpoints::{Endpoint, support::resolve_full_path};
+use crate::rpc_servers::endpoints::{Endpoint, util::resolve_full_path};
 use anyhow::{Context, Result};
 use filen_sdk_rs::{
 	auth::Client,

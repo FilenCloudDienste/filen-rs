@@ -2,7 +2,7 @@ use crate::{
 	rpc_servers::endpoints::{
 		Endpoint,
 		public_link_expiration::PublicLinkExpiration,
-		support::{find_item_or_err, map_link_status_err, reject_root},
+		util::{find_item_or_err, map_link_status_err, reject_root},
 	},
 	util::RemotePath,
 };

@@ -1,11 +1,12 @@
 use crate::{
 	rpc_servers::endpoints::{
 		Endpoint,
-		support::{find_item_or_err, map_link_status_err, reject_root},
+		util::{find_item_or_err, map_link_status_err, reject_root},
 	},
+	ui::UI,
 	util::RemotePath,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use filen_sdk_rs::{auth::Client, fs::categories::NonRootItemType};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -39,7 +40,10 @@ impl Endpoint for DeletePublicLink {
 					.await
 					.map_err(map_link_status_err)?;
 				let Some(link) = link else {
-					return Err(anyhow!("No public link exists for: {}", path.0));
+					return Err(UI::failure(&format!(
+						"No public link exists for: {}",
+						path.0
+					)));
 				};
 				client
 					.remove_file_link(&file, link)
@@ -52,7 +56,10 @@ impl Endpoint for DeletePublicLink {
 					.await
 					.map_err(map_link_status_err)?;
 				if link.is_none() {
-					return Err(anyhow!("No public link exists for: {}", path.0));
+					return Err(UI::failure(&format!(
+						"No public link exists for: {}",
+						path.0
+					)));
 				}
 				client
 					.remove_dir_link(&dir)

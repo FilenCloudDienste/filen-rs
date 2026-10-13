@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use clap_complete::engine::{ArgValueCompleter, PathCompleter};
 use filen_rclone_wrapper::serve::BasicServerOptions;
-use serde_json::json;
 
 use crate::{
 	CliConfig, CommandResult,
 	auth::{self, LazyClient, export_auth_config},
 	completion::FilenCompleter,
 	docs::{print_in_app_docs, serve_markdown_docs_as_html},
+	rpc_servers::endpoints::{self, Endpoint},
 	ui::UI,
+	ui_utilities::PrintEndpointOutput,
 	util::RemotePath,
 };
 
@@ -88,8 +89,8 @@ pub(crate) enum Commands {
 		#[arg(add = FilenCompleter::file_or_directory())]
 		file_or_directory: String,
 		/// Permanently delete the file or directory (default: move to trash)
-		#[arg(short, long)]
-		permanent: bool,
+		#[arg(long)]
+		permanently_delete: bool,
 	},
 	/// Move and/or rename a file or directory
 	Mv {
@@ -257,82 +258,141 @@ pub(crate) async fn execute_command(
 			})
 		}
 		Commands::Ls { directory, long } => {
-			fs_cmds::list_directory(ui, client, working_path, directory, long).await?;
+			endpoints::read_directory::ReadDirectory
+				.handle(
+					client.get(ui).await?,
+					endpoints::read_directory::ReadDirectoryInput {
+						directory_path: working_path
+							.navigate(directory.as_deref().unwrap_or(""))
+							.into(),
+					},
+				)
+				.await?
+				.print_output(ui, long);
 			None
 		}
 		Commands::Cat { file } => {
-			fs_cmds::print_file(
+			if let Some(output) = endpoints::read_file::handle_large_file_confirmation(
+				client.get(ui).await?,
 				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Full,
+				endpoints::read_file::ReadFileInput {
+					file_path: working_path.navigate(&file).into(),
+					lines: endpoints::read_file::ReadFileLines::Full,
+					force_large_file: false,
+				},
 			)
-			.await?;
+			.await?
+			{
+				output.print_output(ui)
+			}
 			None
 		}
 		Commands::Head { file, lines } => {
-			fs_cmds::print_file(
+			if let Some(output) = endpoints::read_file::handle_large_file_confirmation(
+				client.get(ui).await?,
 				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Head(lines),
+				endpoints::read_file::ReadFileInput {
+					file_path: working_path.navigate(&file).into(),
+					lines: endpoints::read_file::ReadFileLines::Head(lines),
+					force_large_file: false,
+				},
 			)
-			.await?;
+			.await?
+			{
+				output.print_output(ui)
+			}
 			None
 		}
 		Commands::Tail { file, lines } => {
-			fs_cmds::print_file(
+			if let Some(output) = endpoints::read_file::handle_large_file_confirmation(
+				client.get(ui).await?,
 				ui,
-				client,
-				working_path,
-				&file,
-				fs_cmds::PrintFileLines::Tail(lines),
+				endpoints::read_file::ReadFileInput {
+					file_path: working_path.navigate(&file).into(),
+					lines: endpoints::read_file::ReadFileLines::Tail(lines),
+					force_large_file: false,
+				},
 			)
-			.await?;
+			.await?
+			{
+				output.print_output(ui)
+			}
 			None
 		}
 		Commands::Stat { file_or_directory } => {
-			fs_cmds::print_file_or_directory_info(ui, client, working_path, &file_or_directory)
-				.await?;
+			endpoints::stat::Stat
+				.handle(
+					client.get(ui).await?,
+					endpoints::stat::StatInput {
+						path: working_path.navigate(&file_or_directory).into(),
+					},
+				)
+				.await?
+				.print_output(ui);
 			None
 		}
 		Commands::Mkdir {
 			directory,
 			recursive,
 		} => {
-			fs_cmds::create_directory(ui, client, working_path, &directory, recursive).await?;
+			endpoints::create_directory::CreateDirectory
+				.handle(
+					client.get(ui).await?,
+					endpoints::create_directory::CreateDirectoryInput {
+						path: working_path.navigate(&directory).into(),
+						recursive,
+					},
+				)
+				.await?
+				.print_output(ui);
 			None
 		}
 		Commands::Rm {
 			file_or_directory,
-			permanent,
+			permanently_delete,
 		} => {
-			fs_cmds::delete_file_or_directory(
-				ui,
-				client,
-				working_path,
-				&file_or_directory,
-				permanent,
-			)
-			.await?;
+			endpoints::delete_item::DeleteItem
+				.handle(
+					client.get(ui).await?,
+					endpoints::delete_item::DeleteItemInput {
+						path: working_path.navigate(&file_or_directory).into(),
+						permanent: permanently_delete,
+					},
+				)
+				.await?
+				.print_output(ui);
 			None
 		}
 		Commands::Mv {
 			source,
 			destination,
 		} => {
-			fs_cmds::move_file_or_directory(ui, client, working_path, &source, &destination)
-				.await?;
+			endpoints::move_item::MoveItem
+				.handle(
+					client.get(ui).await?,
+					endpoints::move_item::MoveItemInput {
+						source_path: working_path.navigate(&source).into(),
+						destination_path: working_path.navigate(&destination).into(),
+					},
+				)
+				.await?
+				.print_output(ui);
 			None
 		}
 		Commands::Cp {
 			source,
 			destination,
 		} => {
-			fs_cmds::copy_file_or_directory(ui, client, working_path, &source, &destination)
-				.await?;
+			endpoints::copy_item::CopyItem
+				.handle(
+					client.get(ui).await?,
+					endpoints::copy_item::CopyItemInput {
+						source_path: working_path.navigate(&source).into(),
+						destination_parent_dir: working_path.navigate(&destination).into(),
+					},
+				)
+				.await?
+				.print_output(ui);
 			None
 		}
 		Commands::Upload {
@@ -525,18 +585,11 @@ pub(crate) async fn execute_command(
 		}
 		Commands::ExportApiKey => {
 			let client = client.get(ui).await?.to_stringified();
-			if ui.json {
-				ui.print_json(json!({
-					"email": client.email,
-					"apiKey": client.api_key,
-				}))?;
-			} else {
-				ui.print_warning("Keep your API key secret! Do not share it with anyone.");
-				ui.print_key_value_table(&[(
-					&format!("API Key for {}:", client.email),
-					client.api_key.as_str(),
-				)]);
-			}
+			ui.print_warning("Keep your API key secret! Do not share it with anyone.");
+			ui.print_key_value_table(&[(
+				&format!("API Key for {}:", client.email),
+				client.api_key.as_str(),
+			)]);
 			None
 		}
 		Commands::ViewHtmlDocs => {
