@@ -168,9 +168,10 @@ committing never triggers a vendored C++ build and needs no `meson` / `ninja` / 
 wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 - **pre-commit** — `cargo fmt --all --check`, `cargo fmt` inside `filen-sdk-rs`, `taplo
-  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then five clippy passes: workspace
+  lint`/`fmt --check`, `sqlfluff` on staged `.sql`, then six clippy passes: workspace
   (`--exclude heif-decoder --all-targets`), `-p filen-sdk-rs -F uniffi,http-provider`,
-  `-p filen-sdk-rs -F sync-engine,malformed --all-targets` (the same command as ci-linux), and
+  `-p filen-sdk-rs -F sync-engine,malformed --all-targets` and
+  `-p filen-sdk-rs -F napi,cache,sync-engine --all-targets` (the same commands as ci-linux), and
   wasm32 `-F wasm-full,cache` + `--no-default-features -F service-worker` (both run from the
   `filen-sdk-rs` directory). **On a cold cargo cache this takes several minutes** — warm the
   cache by running those clippy invocations first, or the commit may be killed by a tool/CI
@@ -203,8 +204,11 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   ships), full `sqlfluff lint .`, `cargo test --lib --no-fail-fast`, and a package-scoped
   `cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine` for the binding
   layers' tests (`fs/*/js_impl*`, `js/uniffi.rs`, `sync_engine/js_impl`), which are gated on
-  `uniffi` and so never built by the workspace run, since no workspace member turns it on.
-  This is the hook that needs `meson` / `ninja` (/ `nasm` on x86) and `WASI_SDK_PATH`; it stops with an
+  `uniffi` and so never built by the workspace run, since no workspace member turns it on, and
+  likewise `cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine` for `js/napi`'s (the test
+  binary links without Node: napi's `dyn-symbols` resolves N-API only when Node loads the addon,
+  and the tests touch none). This is the hook that needs `meson` / `ninja` (/ `nasm` on x86) and
+  `WASI_SDK_PATH`; it stops with an
   install message rather than degrading the feature set. `SKIP_HEAVY_CLIPPY=1` builds no
   vendored C++ at all — it skips the `heif-decoder` passes, native and wasm, *and* adds
   `--workspace --exclude heif-decoder` to the remaining passes, which would otherwise build

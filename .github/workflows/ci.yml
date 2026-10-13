@@ -71,6 +71,9 @@ jobs:
       # cases need `malformed`, so none of the passes above compile them.
       - name: Run clippy on sync engine targets
         run: cargo clippy -p filen-sdk-rs -F sync-engine,malformed --all-targets -- -D warnings
+      # The desktop Node-API addon's feature set; no other pass enables `napi`.
+      - name: Run clippy napi
+        run: cargo clippy -p filen-sdk-rs -F napi,cache,sync-engine --all-targets -- -D warnings
       - name: Run rustfmt
         run: cargo fmt --all -- --check
       - name: Install TOML linter

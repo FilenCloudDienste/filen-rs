@@ -217,6 +217,9 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
 	# says; the features are the mobile bindings' minus heif-decoder (matches CI).
 	run "cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine --no-fail-fast" \
 		cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine --no-fail-fast
+	# The same for the napi layer's tests (js/napi), gated on `napi`.
+	run "cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine --no-fail-fast" \
+		cargo test -p filen-sdk-rs --lib -F napi,cache,sync-engine --no-fail-fast
 else
 	printf '%sSKIP_TESTS=1, skipping cargo test --lib%s\n' "$yellow" "$reset"
 fi
