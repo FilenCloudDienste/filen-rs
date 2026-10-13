@@ -47,11 +47,14 @@ use filen_types::fs::Uuid;
 use futures::future::join_all;
 use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
 
+pub use self::types::{SyncEventMessage, SyncPairInfo, SyncPassEvent, SyncPassReport, SyncRefusal};
+#[cfg(feature = "uniffi")]
+pub use self::uniffi_impl::SyncEngineListener;
 use self::{
 	delivery::{Delivery, Listener, ListenerSlot, spawn_delivery},
 	types::{
-		SyncConflictPage, SyncEventMessage, SyncPairActivity, SyncPairInfo, SyncPassEvent,
-		SyncPassReport, SyncPauseOptions, SyncPlanSummary, SyncWatchConfig, page, path_string,
+		SyncConflictPage, SyncPairActivity, SyncPauseOptions, SyncPlanSummary, SyncWatchConfig,
+		page, path_string,
 	},
 };
 use crate::{

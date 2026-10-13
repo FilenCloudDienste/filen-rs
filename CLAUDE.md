@@ -146,7 +146,7 @@ Test notes:
 | `multi-threaded-crypto` | `rayon` / `wasm-bindgen-rayon` parallel crypto |
 | `archive` | Compress / extract (`fs::archive`) and its codec crates; `wasm-full` turns it on, and on wasm it refuses to build without `wasm-full` |
 | `malformed` | Test-only seams that put malformed state on the server on purpose (`create_malformed_dir` / `create_malformed_file` write arbitrary metadata, `create_dir_with_name_hash` bypasses the case-insensitive name dedup) — never enable in production |
-| `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets |
+| `sync-engine` | Local folder <-> remote folder sync engine (`src/sync_engine/`); implies `cache`, adds the `notify` watcher; native only. Gates the `sync_engine_blackbox_tests` / `sync_engine_stress_tests` / `sync_suite` test targets, and with `uniffi` the binding's `sync_engine_js_tests` |
 | `heif-decoder` | Thumbnail decoding for HEIF/HEIC — and AVIF, which the vendored libheif decodes through the same container path on its dav1d backend |
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
 | `test-seams` | Test-only: exposes the bulk directory create and trash (`create_dirs_for_test` / `trash_items_for_test`) to the live tests — never enable in production |

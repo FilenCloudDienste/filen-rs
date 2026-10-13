@@ -86,6 +86,11 @@ pub use engine::{
 };
 pub use events::{SyncEvent, SyncObserver, TransferDirection};
 pub use guard::{DeleteGuard, GuardReason};
+#[cfg(feature = "uniffi")]
+pub use js_impl::{
+	JsSyncEngine, JsSyncPlan, JsSyncWatch, SyncEngineListener, SyncEventMessage, SyncPairInfo,
+	SyncPassEvent, SyncPassReport, SyncRefusal,
+};
 pub use mode::{Backlog, SyncMode};
 pub use outcome::{
 	HaltReason, PlanOutcome, PlannedAction, PlannedActionKind, PlannedConflict, PlannedNodeKind,

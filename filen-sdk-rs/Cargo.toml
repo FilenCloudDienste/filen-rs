@@ -76,6 +76,11 @@ required-features = ["sync-engine"]
 name = "sync_engine_stress_tests"
 required-features = ["sync-engine"]
 
+# The sync engine's mobile binding (`sync_engine::js_impl`), driven live through its exports only.
+[[test]]
+name = "sync_engine_js_tests"
+required-features = ["uniffi", "cache", "sync-engine"]
+
 # Grouped black-box sync suite: ONE binary, one module per category (tests/sync_suite/).
 [[test]]
 name = "sync_suite"

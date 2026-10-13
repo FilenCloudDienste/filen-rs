@@ -273,8 +273,8 @@ impl TryFrom<PairRecord> for SyncPairInfo {
 	}
 }
 
-/// Mirror of [`SyncReport`]. Every list holds at most [`REPORT_LIST_LIMIT`] entries, the first
-/// ones in the engine's order; its `*_total` counts them all.
+/// Mirror of [`SyncReport`]. Every list holds at most 1000 entries (`REPORT_LIST_LIMIT`), the
+/// first ones in the engine's order; its `*_total` counts them all.
 #[js_type(export, no_deser)]
 pub struct SyncPassReport {
 	pub downloaded: u64,
