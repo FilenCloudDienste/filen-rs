@@ -60,7 +60,7 @@ jobs:
         # Package-scoped and library only: at the workspace root, or with the tests and their
         # test-utils dev-dependency, the crates that depend on filen-sdk-rs turn its default
         # features, archive among them, back on.
-        run: cargo clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache --lib -- -D warnings
+        run: cargo clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache,sync-engine --lib -- -D warnings
       - name: Run clippy
         run: cargo clippy -- -D warnings
       - name: Run clippy on tests
@@ -95,7 +95,7 @@ jobs:
       # `uniffi`, which no workspace member turns on, so the step above never
       # builds them. The mobile bindings' features, minus heif-decoder.
       - name: Run unit tests with uniffi
-        run: cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache --no-fail-fast
+        run: cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine --no-fail-fast
         env:
           TEST_EMAIL: 'test@filen.io'
           TEST_PASSWORD: 'testpassword'
@@ -199,7 +199,7 @@ jobs:
         run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy Android uniffi
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked, and
-        # `sync-engine` so it keeps compiling here even though mobile does not ship it yet.
+        # `sync-engine`, which mobile ships, so its binding (sync_engine/js_impl) does too.
         run: cargo ndk --target aarch64-linux-android clippy -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run clippy all features
         run: cargo clippy -F filen-sdk-rs/heif-decoder,filen-sdk-rs/malformed,filen-sdk-rs/multi-threaded-crypto,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
@@ -215,7 +215,7 @@ jobs:
         run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/cache -- -D warnings
       - name: Run clippy iOS uniffi
         # `cache` included so the cache FFI layer (cache/js_impl.rs) stays checked, and
-        # `sync-engine` so it keeps compiling here even though mobile does not ship it yet.
+        # `sync-engine`, which mobile ships, so its binding (sync_engine/js_impl) does too.
         run: cargo clippy --target aarch64-apple-ios -F filen-sdk-rs/malformed,filen-sdk-rs/heif-decoder,filen-sdk-rs/uniffi,filen-sdk-rs/cache,filen-sdk-rs/sync-engine -- -D warnings
       - name: Run unit tests
         run: cargo test --lib -F cache,sync-engine --no-fail-fast

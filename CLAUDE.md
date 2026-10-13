@@ -151,8 +151,9 @@ Test notes:
 | `bench-internals` | Exposes `cache::bench_support` for the insertion benchmark, and `sync_engine::probe` for the `sync_engine_probe` per-phase probe |
 | `test-seams` | Test-only: exposes the bulk directory create and trash (`create_dirs_for_test` / `trash_items_for_test`) to the live tests — never enable in production |
 
-The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache` (see
-`filen-sdk-rs/web/ubrn.config.yaml`).
+The mobile bindings build is `-F uniffi,heif-decoder,http-provider,cache,sync-engine` (see
+`filen-sdk-rs/web/ubrn.config.yaml`); `uniffi` together with `sync-engine` compiles the sync
+engine's binding (`sync_engine::js_impl`).
 
 ## Git Hooks
 
@@ -199,10 +200,10 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
   both wasm32 passes on the feature sets `ci-wasm` uses (`-F wasm-full,cache,heif-decoder`
   and `--no-default-features -F service-worker,heif-decoder`, i.e. what `wasm-pack.sh`
   ships), full `sqlfluff lint .`, `cargo test --lib --no-fail-fast`, and a package-scoped
-  `cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache` for the binding layers'
-  tests (`fs/*/js_impl*`, `js/uniffi.rs`), which are gated on `uniffi` and so never built by
-  the workspace run, since no workspace member turns it on. This is the hook
-  that needs `meson` / `ninja` (/ `nasm` on x86) and `WASI_SDK_PATH`; it stops with an
+  `cargo test -p filen-sdk-rs --lib -F uniffi,http-provider,cache,sync-engine` for the binding
+  layers' tests (`fs/*/js_impl*`, `js/uniffi.rs`, `sync_engine/js_impl`), which are gated on
+  `uniffi` and so never built by the workspace run, since no workspace member turns it on.
+  This is the hook that needs `meson` / `ninja` (/ `nasm` on x86) and `WASI_SDK_PATH`; it stops with an
   install message rather than degrading the feature set. `SKIP_HEAVY_CLIPPY=1` builds no
   vendored C++ at all — it skips the `heif-decoder` passes, native and wasm, *and* adds
   `--workspace --exclude heif-decoder` to the remaining passes, which would otherwise build
@@ -210,7 +211,7 @@ wasi-sdk. Every `heif-decoder` pass lives in pre-push.
 
 Neither hook is CI parity, by design: both run a subset. `ci.yml` additionally lints with
 `filen-sdk-rs/cache` in the all-features pass, runs `clippy --tests -F cache` and a
-package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache --lib`
+package-scoped `clippy -p filen-sdk-rs --no-default-features -F uniffi,http-provider,cache,sync-engine --lib`
 that builds the SDK without `archive`, and cross-compiles for Android, iOS and Windows — none of
 which the hooks attempt. `ci.yml`
 runs only on `main`, `dev` and pull requests into them. Every other branch push, and every
