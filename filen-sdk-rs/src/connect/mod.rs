@@ -1145,6 +1145,12 @@ impl Client {
 		list_all_in_shared(self, callback).await
 	}
 
+	/// Leaves a share someone else made with this account, or revokes one this account made.
+	///
+	/// Revoking holds the drive lock for the request, as [`share_dir`](Self::share_dir) does for
+	/// the additions, so another device holding the lock never sees the set of shares that
+	/// contain a directory change under it. Leaving takes no lock: it changes the sharer's
+	/// shares, which this account's lock does not serialize with.
 	pub async fn remove_shared_item(&self, item: &RootItemType<'_, Shared>) -> Result<(), Error> {
 		let share_role = match item {
 			RootItemType::Dir(dir) => &dir.info.sharing_role,
@@ -1159,6 +1165,7 @@ impl Client {
 				.await
 			}
 			fs::SharingRole::Receiver(share_info) => {
+				let _lock = self.lock_drive().await?;
 				api::v3::item::shared::out::remove::post(
 					self.client(),
 					&api::v3::item::shared::out::remove::Request {
