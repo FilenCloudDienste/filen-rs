@@ -5,7 +5,7 @@ import type { ReadableStream as NodeReadableStream } from "node:stream/web"
 import { fileURLToPath } from "node:url"
 import { playwright } from "@vitest/browser-playwright"
 import type { Plugin } from "vite"
-import { defineConfig, mergeConfig } from "vitest/config"
+import { configDefaults, defineConfig, mergeConfig } from "vitest/config"
 import viteConfig from "./vite.config.ts"
 
 // The pinned RAW samples microthumb's characterisation suite keeps outside target/
@@ -77,6 +77,8 @@ export default defineConfig({
 	...mergeConfig(viteConfig, {
 		plugins: [rawFixtures()],
 		test: {
+			// The napi addon's tests run under plain node (`npm run test:napi`), not in a browser.
+			exclude: [...configDefaults.exclude, "napi/**"],
 			hookTimeout: TIMEOUT,
 			testTimeout: TIMEOUT,
 			teardownTimeout: 3600_000,

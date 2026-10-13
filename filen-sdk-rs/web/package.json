@@ -13,7 +13,8 @@
 		"ubrn:checkout": "ubrn checkout",
 		"ubrn:release": "ubrn build ios --release --and-generate && ubrn build android --release --and-generate",
 		"build:napi": "napi build --platform --manifest-path ../Cargo.toml --features napi,cache,sync-engine --output-dir node --esm",
-		"build:napi:release": "npm run build:napi -- --release"
+		"build:napi:release": "npm run build:napi -- --release",
+		"test:napi": "node --test napi/smoke.test.mjs"
 	},
 	"homepage": "https://github.com/FilenCloudDienste/filen-rs",
 	"author": "Filen",

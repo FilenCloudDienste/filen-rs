@@ -99,8 +99,10 @@ cargo clippy
 cargo build --features heif-decoder
 
 # Desktop Node-API addon (`napi` feature, package-scoped): build it into
-# filen-sdk-rs/web/node/ (build:napi:release for an optimized one)
+# filen-sdk-rs/web/node/ (build:napi:release for an optimized one), then smoke-test it
+# offline under node
 npm --prefix filen-sdk-rs/web run build:napi
+npm --prefix filen-sdk-rs/web run test:napi
 ```
 
 Integration tests require environment variables (can be in `.env`):
