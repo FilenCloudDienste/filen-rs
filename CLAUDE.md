@@ -100,9 +100,13 @@ cargo build --features heif-decoder
 
 # Desktop Node-API addon (`napi` feature, package-scoped): build it into
 # filen-sdk-rs/web/node/ (build:napi:release for an optimized one), then smoke-test it
-# offline under node
+# offline under node; check:napi-parity compares its typings with what ubrn generates
+# from this tree (it builds the uniffi cdylib and the ubrn CLI first; --reference <dir>
+# takes generated ubrn TS instead) and fails on a difference not in
+# napi/parity-allowlist.json, or on an allowlist entry that no longer fails
 npm --prefix filen-sdk-rs/web run build:napi
 npm --prefix filen-sdk-rs/web run test:napi
+npm --prefix filen-sdk-rs/web run check:napi-parity
 ```
 
 Integration tests require environment variables (can be in `.env`):
