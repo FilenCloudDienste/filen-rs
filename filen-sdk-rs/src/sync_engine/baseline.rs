@@ -1437,11 +1437,16 @@ impl BaselineStore {
 			row.get::<_, Option<i64>>("guard_floor")?,
 			row.get::<_, Option<f64>>("guard_ratio")?,
 		) {
-			// The floor saturates as `set_delete_guard` wrote it: `unlimited`'s `usize::MAX` is
-			// stored as `i64::MAX`, which a 32-bit `usize` reads back as its own maximum.
+			// `set_delete_guard` saturates `unlimited`'s `usize::MAX` floor to `i64::MAX`; it reads
+			// back as `usize::MAX`, so an unlimited guard comes back equal to `unlimited()`. No
+			// tracked-item count reaches either, so a floor really set to `i64::MAX` loses nothing.
 			(Some(floor), Some(ratio)) => {
-				DeleteGuard::new(usize::try_from(floor.max(0)).unwrap_or(usize::MAX), ratio)
-					.map_err(|_| corrupt("guard ratio", ratio))?
+				let floor = if floor == i64::MAX {
+					usize::MAX
+				} else {
+					usize::try_from(floor.max(0)).unwrap_or(usize::MAX)
+				};
+				DeleteGuard::new(floor, ratio).map_err(|_| corrupt("guard ratio", ratio))?
 			}
 			_ => DeleteGuard::default(),
 		};
@@ -2426,14 +2431,15 @@ mod tests {
 			"list_pairs reports it too"
 		);
 
-		// `unlimited`'s usize::MAX floor has no SQLite representation; it must still come back as a
-		// threshold nothing can exceed rather than silently wrapping to a strict one.
+		// `unlimited`'s usize::MAX floor has no SQLite representation; it must still come back as
+		// the unlimited guard, not wrapped to a strict one nor read as a finite floor.
 		store
 			.set_delete_guard(pair, DeleteGuard::unlimited())
 			.unwrap();
-		assert!(
-			store.pair(pair).unwrap().unwrap().delete_guard.floor() > u32::MAX as usize,
-			"an unlimited floor must not wrap on the way through the DB"
+		assert_eq!(
+			store.pair(pair).unwrap().unwrap().delete_guard,
+			DeleteGuard::unlimited(),
+			"an unlimited guard must read back as one"
 		);
 		drop(store);
 		std::fs::remove_file(&path).ok();
