@@ -12,6 +12,16 @@ use serde_json::value::RawValue;
 
 use crate::error::{Error, ErrorKind};
 
+pub(crate) mod delete;
+pub(crate) mod dir;
+pub(crate) mod file;
+pub(crate) mod linked;
+pub(crate) mod metadata;
+pub(crate) mod r#move;
+pub(crate) mod share;
+pub(crate) mod shared;
+pub(crate) mod trash;
+
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 mod tests;
 
