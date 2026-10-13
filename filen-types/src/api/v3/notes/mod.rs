@@ -61,7 +61,8 @@ pub struct NoteParticipant<'a> {
 	pub is_owner: bool,
 	pub email: Cow<'a, str>,
 	pub avatar: Option<Cow<'a, str>>,
-	pub nick_name: Cow<'a, str>,
+	/// `null` for a participant who has not set a nickname.
+	pub nick_name: Option<Cow<'a, str>>,
 	pub metadata: RSAEncryptedString<'a>,
 	pub permissions_write: bool,
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
@@ -101,3 +102,26 @@ pub const ENDPOINT: &str = "v3/notes";
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(transparent)]
 pub struct Response<'a>(pub Vec<Note<'a>>);
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn participant_deserializes_without_avatar_or_nick_name() {
+		let json = r#"{
+			"userId":2,
+			"isOwner":false,
+			"email":"c@example.com",
+			"avatar":null,
+			"nickName":null,
+			"metadata":"encrypted",
+			"permissionsWrite":true,
+			"addedTimestamp":1760270400000
+		}"#;
+		let participant: NoteParticipant<'_> = serde_json::from_str(json).unwrap();
+		assert_eq!(participant.user_id, 2);
+		assert_eq!(participant.avatar, None);
+		assert_eq!(participant.nick_name, None);
+	}
+}

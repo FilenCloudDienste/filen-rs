@@ -119,7 +119,12 @@ impl From<filen_types::api::v3::notes::NoteParticipant<'_>> for NoteParticipant 
 			is_owner: participant.is_owner,
 			email: participant.email.into_owned(),
 			avatar: participant.avatar.map(|a| a.into_owned()),
-			nick_name: participant.nick_name.into_owned(),
+			// A participant without a nickname gets an empty one: this field is a `String` on
+			// every binding.
+			nick_name: participant
+				.nick_name
+				.map(Cow::into_owned)
+				.unwrap_or_default(),
 			permissions_write: participant.permissions_write,
 			added_timestamp: participant.added_timestamp,
 		}
@@ -482,7 +487,8 @@ impl Client {
 			is_owner: note_participant_parts.user_id == note.owner_id,
 			email: note_participant_parts.email,
 			avatar: response.avatar.map(Cow::into_owned),
-			nick_name: response.nick_name.into_owned(),
+			// A contact without a nickname gets an empty one, as in the notes listing.
+			nick_name: response.nick_name.map(Cow::into_owned).unwrap_or_default(),
 			permissions_write: write,
 			added_timestamp: response.timestamp,
 		});

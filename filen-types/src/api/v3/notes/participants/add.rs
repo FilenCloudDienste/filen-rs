@@ -23,7 +23,8 @@ pub struct Response<'a> {
 	#[serde(with = "crate::serde::time::seconds_or_millis")]
 	pub timestamp: DateTime<Utc>,
 	pub avatar: Option<Cow<'a, str>>,
-	pub nick_name: Cow<'a, str>,
+	/// `null` for a contact who has not set a nickname.
+	pub nick_name: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,5 +64,25 @@ impl<'de> Deserialize<'de> for ContactUuid {
 	{
 		let str = crate::serde::cow::deserialize(deserializer)?;
 		Self::from_str(&str).map_err(serde::de::Error::custom)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn response_deserializes_a_contact_without_avatar_or_nick_name() {
+		let json = r#"{
+			"timestamp":1760270400000,
+			"email":"c@example.com",
+			"avatar":null,
+			"nickName":null,
+			"publicKey":"<pem>"
+		}"#;
+		let response: Response<'_> = serde_json::from_str(json).unwrap();
+		assert_eq!(response.timestamp.timestamp_millis(), 1_760_270_400_000);
+		assert_eq!(response.avatar, None);
+		assert_eq!(response.nick_name, None);
 	}
 }
