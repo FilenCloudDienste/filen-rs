@@ -24,7 +24,7 @@ use std::{
 	fmt::Write as _,
 	fs, mem,
 	path::{Path, PathBuf},
-	sync::Arc,
+	sync::{Arc, atomic::AtomicBool},
 	time::{Duration, Instant},
 };
 
@@ -1132,6 +1132,7 @@ fn pass_after_push(
 		probe_rules(),
 		RuleFiles::Read,
 		probe_stage(),
+		&AtomicBool::new(false),
 	)
 	.expect("staging the probe's scan");
 	drop((rules_used, scan_baseline));
@@ -1219,6 +1220,7 @@ fn stage_pass_sides(
 		probe_rules(),
 		RuleFiles::Read,
 		probe_stage(),
+		&AtomicBool::new(false),
 	)
 	.expect("staging the probe's scan");
 	drop(rules_used);
@@ -2377,6 +2379,7 @@ pub fn run() -> String {
 			probe_rules(),
 			RuleFiles::Read,
 			probe_stage(),
+			&AtomicBool::new(false),
 		)
 		.expect("staging the probe's scan")
 	});

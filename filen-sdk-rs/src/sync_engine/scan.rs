@@ -33,7 +33,11 @@ use std::{
 	num::NonZero,
 	ops::ControlFlow,
 	path::{Component, Path},
-	sync::{Mutex, mpsc},
+	sync::{
+		Mutex,
+		atomic::{AtomicBool, Ordering},
+		mpsc,
+	},
 };
 
 use filen_types::crypto::Blake3Hash;
@@ -595,6 +599,7 @@ pub(crate) fn scan_local(
 		&rule_files,
 		Hooks {
 			on_listed: &mut |_| ControlFlow::Continue(()),
+			stop: None,
 			moved_hash: None,
 			max_read_workers: MAX_READ_WORKERS,
 		},
@@ -616,6 +621,10 @@ pub(crate) fn scan_local(
 /// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
 /// matched. The rules come back as the scan used them, for the rest of the pass to match with.
 ///
+/// Once `stop` is set the walk lists and hands over nothing more, and comes back incomplete once each
+/// worker has finished the read it is in, to its end (a hash read cannot be interrupted). That is
+/// how a pass gives up a walk it started before it knew the rules to walk with.
+///
 /// `Err` when the stage cannot be written — a full disk — which fails the pass before it has
 /// planned anything.
 pub(crate) fn scan_local_staged(
@@ -624,6 +633,7 @@ pub(crate) fn scan_local_staged(
 	rules: IgnoreRules,
 	rule_files: RuleFiles,
 	stage: Stage,
+	stop: &AtomicBool,
 ) -> rusqlite::Result<(LocalScan, IgnoreRules)> {
 	scan_local_watched(
 		root,
@@ -633,6 +643,7 @@ pub(crate) fn scan_local_staged(
 		&rule_files,
 		Hooks {
 			on_listed: &mut |_| ControlFlow::Continue(()),
+			stop: Some(stop),
 			moved_hash: None,
 			max_read_workers: MAX_READ_WORKERS,
 		},
@@ -665,6 +676,9 @@ struct Hooks<'h> {
 	/// Called for every entry the walker lists, just before the scan reads it; a `Break` ends the
 	/// walk there, incomplete.
 	on_listed: &'h mut dyn FnMut(&Path) -> ControlFlow<()>,
+	/// [`scan_local_staged`]'s: once set, the walk ends where it is, incomplete, whether it is still
+	/// listing or waiting on the reads of what it listed, once the reads under way end.
+	stop: Option<&'h AtomicBool>,
 	/// [`scan_subtree`]'s: the hash of a file the fast path missed, by its path, size and mtime.
 	/// It is asked in walk order, as the walk lists each file, so a walk that has one stats every
 	/// entry on its own thread; a walk with none (`None`) stats them on workers.
@@ -1012,6 +1026,7 @@ fn scan_local_watched<S: ScanSink>(
 	rule_files: &RuleFiles,
 	Hooks {
 		on_listed,
+		stop,
 		mut moved_hash,
 		max_read_workers,
 	}: Hooks<'_>,
@@ -1087,13 +1102,25 @@ fn scan_local_watched<S: ScanSink>(
 			)
 		};
 
+		let stopped = || stop.is_some_and(|stop| stop.load(Ordering::Relaxed));
+		// Set once the walk is cut short. What it did not get to is evidence of nothing, and nor is
+		// what it listed and has yet to read, so it puts none of those reads: leaving the scope
+		// drops the receiver of their answers, and each worker stops at the first answer it cannot
+		// send. The scope joins every worker, so the walk still ends only once each has finished the
+		// read it was in, to its end.
+		let mut cut = false;
+
 		// Filtered by hand rather than through `filter_entry`, so an entry is keyed once for the
 		// filter and the read alike. A refused directory is skipped as `filter_entry` skips one.
 		let mut walker = walkdir::WalkDir::new(&start_path)
 			.follow_links(true)
 			.into_iter();
-		while let Some(entry) = walker.next() {
+		'walk: while let Some(entry) = walker.next() {
 			while window.listed.len() >= READ_WINDOW {
+				if stopped() {
+					cut = true;
+					break 'walk;
+				}
 				wait(&mut window)?;
 			}
 			let entry = match entry {
@@ -1214,9 +1241,8 @@ fn scan_local_watched<S: ScanSink>(
 				continue;
 			}
 
-			if on_listed(entry.path()).is_break() {
-				// Cut short: what the walk did not get to is evidence of nothing.
-				window.complete = false;
+			if stopped() || on_listed(entry.path()).is_break() {
+				cut = true;
 				break;
 			}
 
@@ -1331,10 +1357,15 @@ fn scan_local_watched<S: ScanSink>(
 			}
 		}
 
-		// Whatever is still held waits on a read; the walk is over once every one is in.
-		while !window.listed.is_empty() {
-			wait(&mut window)?;
+		// Whatever is still held waits on a read; the walk is over once every one is in. A stop is
+		// seen between answers: a wait lasts until the next read ends.
+		while !cut && !window.listed.is_empty() {
+			cut = stopped();
+			if !cut {
+				wait(&mut window)?;
+			}
 		}
+		window.complete &= !cut;
 		Ok(window)
 	});
 	let Window {
@@ -1440,6 +1471,7 @@ pub(crate) fn scan_subtree(
 					ControlFlow::Continue(())
 				}
 			},
+			stop: None,
 			moved_hash: Some(moved_hash),
 			max_read_workers: MAX_READ_WORKERS,
 		},
@@ -2275,6 +2307,7 @@ mod tests {
 			&RuleFiles::Read,
 			Hooks {
 				on_listed: &mut |_| ControlFlow::Continue(()),
+				stop: None,
 				// Asked about each file between its stat and its hash read, with no baseline to
 				// take a hash from: the second of the two is removed there.
 				moved_hash: Some(&mut |rel_path, _, _| {
@@ -3146,6 +3179,7 @@ mod tests {
 				IgnoreRules::default(),
 				RuleFiles::Read,
 				stage,
+				&AtomicBool::new(false),
 			)
 			.unwrap();
 
@@ -3292,6 +3326,7 @@ mod tests {
 						}
 						ControlFlow::Continue(())
 					},
+					stop: None,
 					moved_hash: None,
 					max_read_workers,
 				},
@@ -3444,6 +3479,130 @@ mod tests {
 		fs::remove_dir_all(&outside).ok();
 	}
 
+	/// A root holding `files` files and nothing else.
+	fn flat_tree(files: usize) -> std::path::PathBuf {
+		let root = temp_root();
+		for file in 0..files {
+			fs::write(root.join(format!("f{file:04}.txt")), file.to_string()).unwrap();
+		}
+		root
+	}
+
+	/// A map sink that counts what it takes, and sets `stop` as it takes its `at`th entry.
+	struct StopAt<'a> {
+		map: MapSink,
+		put: usize,
+		at: usize,
+		stop: &'a AtomicBool,
+	}
+
+	impl ScanSink for StopAt<'_> {
+		type Error = Infallible;
+
+		fn put(&mut self, found: Found) -> Result<Option<Collision>, Infallible> {
+			self.put += 1;
+			if self.put == self.at {
+				self.stop.store(true, Ordering::Relaxed);
+			}
+			self.map.put(found)
+		}
+
+		fn finish(self) -> Result<Side<LocalNode>, Infallible> {
+			self.map.finish()
+		}
+	}
+
+	/// A walk its caller stops before it lists anything stages nothing, and says it is partial. The
+	/// tree is directories alone, which the walk reads on its own thread and puts as it lists them,
+	/// so a walk that went on listing would stage them.
+	#[test]
+	fn a_staged_walk_stopped_before_it_starts_stages_nothing() {
+		let root = temp_root();
+		for dir in ["a", "b", "c"] {
+			fs::create_dir(root.join(dir)).unwrap();
+		}
+		let (_dir, stage) = Stage::in_temp_dir();
+		let (scan, _) = scan_local_staged(
+			&root,
+			&Baseline::default(),
+			IgnoreRules::default(),
+			RuleFiles::Read,
+			stage,
+			&AtomicBool::new(true),
+		)
+		.unwrap();
+		assert!(!scan.complete);
+		assert_eq!(Nodes::len(&scan.nodes.whole()), 0);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A walk cut short while it lists waits for none of the reads it handed over. With one worker
+	/// and no baseline every file is read there, and the walk puts nothing before it waits on a
+	/// read, so a walk that waited would have put every file listed before the cut.
+	#[test]
+	fn a_walk_cut_short_while_listing_puts_none_of_the_reads_under_way() {
+		let root = flat_tree(300);
+		let mut listed = 0usize;
+		let Ok((scan, _)) = scan_local_watched(
+			&root,
+			"",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			Hooks {
+				on_listed: &mut |path| {
+					listed += usize::from(path != root);
+					if listed == 200 {
+						ControlFlow::Break(())
+					} else {
+						ControlFlow::Continue(())
+					}
+				},
+				stop: None,
+				moved_hash: None,
+				max_read_workers: 1,
+			},
+			Recording {
+				map: MapSink::with_capacity(300),
+				put: &mut Vec::new(),
+			},
+		);
+		assert!(!scan.complete);
+		assert_eq!(Nodes::len(&scan.nodes.whole()), 0);
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A walk stopped once it has listed everything waits for no more of its reads. One worker
+	/// answers the reads in the order they were handed over, so each answer puts exactly one file,
+	/// and the walk stops at the one put as the stop is set.
+	#[test]
+	fn a_walk_stopped_while_it_waits_on_its_reads_waits_for_no_more_of_them() {
+		let root = flat_tree(300);
+		let stop = AtomicBool::new(false);
+		let Ok((scan, _)) = scan_local_watched(
+			&root,
+			"",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			Hooks {
+				on_listed: &mut |_| ControlFlow::Continue(()),
+				stop: Some(&stop),
+				moved_hash: None,
+				max_read_workers: 1,
+			},
+			StopAt {
+				map: MapSink::with_capacity(300),
+				put: 0,
+				at: 100,
+				stop: &stop,
+			},
+		);
+		assert!(!scan.complete);
+		assert_eq!(Nodes::len(&scan.nodes.whole()), 100);
+		fs::remove_dir_all(&root).ok();
+	}
+
 	/// A walk of `root` into a map, with `on_listed` called for each entry it lists.
 	fn scan_watched(
 		root: &Path,
@@ -3458,6 +3617,7 @@ mod tests {
 			&RuleFiles::Read,
 			Hooks {
 				on_listed,
+				stop: None,
 				moved_hash: None,
 				max_read_workers: MAX_READ_WORKERS,
 			},

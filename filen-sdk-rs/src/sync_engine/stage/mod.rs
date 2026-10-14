@@ -16,14 +16,18 @@
 //! in a directory of stages, because baselines share directories — every test's sits in the temp
 //! dir — and two engines number their pairs and passes alike, from 1 and 0.
 //!
-//! The snapshot, the scan and the plan of one pass take a number each, in that order, so a whole
-//! pass has three files: the snapshot's and the scan's go once the plan is staged, before the apply
-//! begins, or with the pass's inputs when it stops before that (a dry run, a refusal), and the
-//! plan's when the apply is done. The plan's file is made when the pass reconciles — a whole pass
-//! writes its plan there window by window, a change-scoped one once it has planned it in memory —
-//! and the plan is screened there and staged for the apply in that same file. A pass that confirms
-//! more than a window of pushes takes a number for them too, before its scan's, and that file goes
-//! with the pass's view of the rows, once the plan is staged.
+//! The snapshot, the scan and the plan of one pass take a number each, so a whole pass has three
+//! files: the snapshot's and the scan's go once the plan is staged, before the apply begins, or
+//! with the pass's inputs when it stops before that (a dry run, a refusal), and the plan's when the
+//! apply is done. A pass that pulls alone numbers them in that order; one that pushes takes its
+//! scan's first, as it walks the tree while it reads the snapshot, and when the remote read finds
+//! a rule file that walk did not match with, it gives that walk and its file up and takes a number
+//! for a second walk after the snapshot's. The plan's file is made when the pass reconciles — a
+//! whole pass writes its plan there window by window, a change-scoped one once it has planned it in
+//! memory — and the plan is screened there and staged for the apply in that same file. A pass that
+//! confirms pushes takes a number for them too, after its snapshot's, but makes that file only
+//! when it confirms more than a window of them; it goes with the pass's view of the rows, once the
+//! plan is staged.
 //!
 //! The file is removed when the [`Stage`] is dropped, once its connection has closed. One a crash
 //! left behind is removed when an engine next opens the baseline ([`sweep`]).

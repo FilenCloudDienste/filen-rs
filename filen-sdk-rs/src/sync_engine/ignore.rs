@@ -286,6 +286,11 @@ impl IgnoreRules {
 		}
 	}
 
+	/// Whether any `.filenignore` has joined the user's rules.
+	pub(crate) fn has_files(&self) -> bool {
+		!self.files.is_empty()
+	}
+
 	/// Adds the `.filenignore` of `dir`, replacing any earlier one.
 	pub(crate) fn insert_file(&mut self, dir: String, source: IgnoreSource) {
 		self.files.insert(dir, source);

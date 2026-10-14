@@ -14,7 +14,7 @@ use std::{
 	path::{Path, PathBuf},
 	sync::{
 		Arc, MutexGuard, PoisonError,
-		atomic::{AtomicU64, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 	time::{Duration, Instant},
 };
@@ -38,7 +38,7 @@ use super::{
 	facts::{self, PairFacts},
 	guard::{self, DeleteGuard, GuardReason},
 	ignore::{
-		IgnoreDecision, IgnoreLevel, IgnoreSource, IgnoredPath, Origin, RemoteRules,
+		IgnoreDecision, IgnoreLevel, IgnoreRules, IgnoreSource, IgnoredPath, Origin, RemoteRules,
 		RuleCandidates, load_remote_rules, parse_user_ignore, rule_file_dir, rule_file_paths,
 	},
 	observe::{self, LocalObservation, LocalObservations},
@@ -4508,6 +4508,29 @@ impl SyncEngine {
 		// Copied BEFORE the snapshot is read: an event the cache commits afterwards describes a
 		// state this snapshot predates, so it must not retire a pending write this pass.
 		let observed = self.observed.snapshot();
+		// The scan reads a row's kind, size, mtime and hash, none of which a confirmation changes, so
+		// it reads the rows as the pass found them: its walk of the tree reads no marker.
+		let scan_baseline = baseline.clone();
+		// A mode that pushes reads every `.filenignore` on disk, whatever the remote holds, so the one
+		// thing its walk needs from the remote is the rule files read there for a directory the disk
+		// has none in, and almost every pair has none. So its walk starts now, with the user's rules
+		// alone, and runs alongside the remote read below; the rules that read comes back with decide
+		// whether it stands. A mode that pulls alone needs the view to know which rule files to read
+		// on disk, so it walks after the read.
+		let early_walk = if record.mode.pushes() {
+			// Parsed again for the remote rules below, as an `IgnoreSource` is not `Clone`. A text that
+			// does not parse is no rules on both, and blocks the pair below.
+			let user = parse_user_ignore(&user_ignore).ok();
+			Some(LocalWalk::start(
+				self.stage(pair)?,
+				PathBuf::from(&record.local_root),
+				scan_baseline.clone(),
+				IgnoreRules::new(user),
+				RuleFiles::Read,
+			))
+		} else {
+			None
+		};
 		// One view, built once and unfiltered at first: what the snapshot confirms, which remote
 		// rule files there are, which of this engine's own writes the cache has caught up to, and
 		// whether the remote reads as emptied are facts about the remote as it is, whatever the
@@ -4524,43 +4547,52 @@ impl SyncEngine {
 		// this pass gets an error, never a view with holes in it. So does a stage that cannot be
 		// written (a full disk): the sink keeps the error of the first row it could not write, and
 		// placing the copy returns it.
-		let stage = self.stage(pair)?;
-		let at = stage.path().display().to_string();
-		let sink = stage::RemoteSink::new(stage, stage::Paging::PASS)
-			.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
-		let (copied, watermark) = self
-			.client
-			.stream_sync_root_snapshot(record.remote_root, sink)
-			.await?;
-		// Every row the pass still needs is in the view now; the objects it ACTS on are read back
-		// whole by uuid, for the handful a plan names.
-		let root = record.remote_root;
-		let mut view = tokio::task::spawn_blocking(move || copied.finish(root))
-			.await
-			.map_err(|e| {
-				Error::custom(
-					ErrorKind::Internal,
-					format!("placing the remote snapshot panicked: {e}"),
-				)
-			})?
-			.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
-		let remote_converged = watermark.is_some();
+		let remote = async {
+			let stage = self.stage(pair)?;
+			let at = stage.path().display().to_string();
+			let sink = stage::RemoteSink::new(stage, stage::Paging::PASS)
+				.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
+			let (copied, watermark) = self
+				.client
+				.stream_sync_root_snapshot(record.remote_root, sink)
+				.await?;
+			// Every row the pass still needs is in the view now; the objects it ACTS on are read back
+			// whole by uuid, for the handful a plan names.
+			let root = record.remote_root;
+			let mut view = tokio::task::spawn_blocking(move || copied.finish(root))
+				.await
+				.map_err(|e| {
+					Error::custom(
+						ErrorKind::Internal,
+						format!("placing the remote snapshot panicked: {e}"),
+					)
+				})?
+				.map_err(|e| db_error(e, &format!("staging the remote snapshot in {at}")))?;
 
-		// Read the snapshot BEFORE the local scan, so the confirmation below runs against the RAW
-		// view — before this engine's own writes are folded into it. A row the snapshot confirms is
-		// one both sides demonstrably hold, which is what a later foreign edit is measured against.
-		// Asked before a row is read: the confirmation advances the rows an unconfirmed push left
-		// behind, and a pair with none — the steady state — must not read a row to find that out.
-		let mut confirmed = Confirmed::default();
-		if baseline.any_unconfirmed() {
-			let lent = Evidence::Snapshot(mem::replace(&mut view.nodes, Side::carried()));
-			let (rows, lent) = self.confirm(pair, &baseline, lent, stage::WINDOW).await?;
-			lent.put_back(&mut view.nodes);
-			confirmed = rows;
+			// The confirmation runs against the RAW view — before this engine's own writes are
+			// folded into it. A row the snapshot confirms is one both sides demonstrably hold, which
+			// is what a later foreign edit is measured against. Asked before a row is read: the
+			// confirmation advances the rows an unconfirmed push left behind, and a pair with none —
+			// the steady state — must not read a row to find that out.
+			let mut confirmed = Confirmed::default();
+			if baseline.any_unconfirmed() {
+				let lent = Evidence::Snapshot(mem::replace(&mut view.nodes, Side::carried()));
+				let (rows, lent) = self.confirm(pair, &baseline, lent, stage::WINDOW).await?;
+				lent.put_back(&mut view.nodes);
+				confirmed = rows;
+			}
+			Ok::<_, Error>((view, watermark.is_some(), confirmed))
 		}
-		// The scan reads a row's kind, size, mtime and hash, none of which a confirmation changes, so
-		// it reads the rows as the pass found them: its walk of the tree reads no marker.
-		let scan_baseline = baseline.clone();
+		.await;
+		let (mut view, remote_converged, confirmed) = match remote {
+			Ok(read) => read,
+			Err(error) => {
+				if let Some(walk) = early_walk {
+					walk.abandon().await;
+				}
+				return Err(error);
+			}
+		};
 		baseline.confirm(&confirmed);
 		let baseline = baseline;
 
@@ -4584,7 +4616,6 @@ impl SyncEngine {
 			remote_rules.blocked.insert(String::new());
 			remote_rules.errors.push(error.to_string());
 		}
-		let local_root = PathBuf::from(&record.local_root);
 		// Rules come from the side that is the source of truth: a mode that pushes reads the
 		// `.filenignore` files on disk, over any remote copy read for the same directory. A mode that
 		// pulls alone reads on disk only the synced ones the remote has lost: they govern until that
@@ -4600,22 +4631,26 @@ impl SyncEngine {
 					.collect(),
 			)
 		};
-		// Into the pass's stage, a row per entry, rather than a node per entry in memory for the rest
-		// of the plan: a whole walk is the tree.
-		let stage = self.stage(pair)?;
-		let at = stage.path().display().to_string();
-		let (mut local_scan, rules) = tokio::task::spawn_blocking(move || {
-			scan::scan_local_staged(
-				&local_root,
-				&scan_baseline,
-				remote_rules.rules,
-				rule_files,
-				stage,
-			)
-		})
-		.await
-		.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?
-		.map_err(|e| db_error(e, &format!("staging the local scan in {at}")))?;
+		// The early walk stands when the remote read added no rule file to the user's rules:
+		// `load_remote_rules` starts from those and changes them only by adding one, so the rules it
+		// came back with are then the very rules that walk matched with. Otherwise it is given up and
+		// the tree walked again, with them.
+		let walk = match early_walk {
+			Some(walk) if !remote_rules.rules.has_files() => walk,
+			early_walk => {
+				if let Some(walk) = early_walk {
+					walk.abandon().await;
+				}
+				LocalWalk::start(
+					self.stage(pair)?,
+					PathBuf::from(&record.local_root),
+					scan_baseline,
+					remote_rules.rules,
+					rule_files,
+				)
+			}
+		};
+		let (mut local_scan, rules) = walk.finish().await?;
 		// This pass's facts, computed whole: `""` answers for every path, so the merge replaces
 		// whatever the previous pass carried (see `PairFacts::merge_local_scan`). Kept on the pass,
 		// where directory moves re-key them along with everything else it blocks.
@@ -6852,6 +6887,66 @@ fn being_removed(pair: PairId) -> Error {
 	)
 }
 
+/// A whole walk of a pair's local tree into a stage of the pass, on a blocking thread (see
+/// [`scan::scan_local_staged`]): a row per entry rather than a node per entry in memory for the rest
+/// of the plan, since a whole walk is the tree. Dropped unfinished — a pass cancelled or failed
+/// while it runs — it tells the walk to stop, so the walk does not go on reading the tree for
+/// nobody.
+struct LocalWalk {
+	handle: tokio::task::JoinHandle<rusqlite::Result<(LocalScan, IgnoreRules)>>,
+	/// Shared with the walk's thread, which outlives any borrow of this.
+	stop: Arc<AtomicBool>,
+	/// Where the walk is staged, for the error a stage that cannot be written fails the pass with.
+	at: String,
+}
+
+impl LocalWalk {
+	fn start(
+		stage: Stage,
+		root: PathBuf,
+		baseline: Baseline,
+		rules: IgnoreRules,
+		rule_files: RuleFiles,
+	) -> Self {
+		let at = stage.path().display().to_string();
+		let stop = Arc::new(AtomicBool::new(false));
+		let walking = Arc::clone(&stop);
+		let handle = tokio::task::spawn_blocking(move || {
+			scan::scan_local_staged(&root, &baseline, rules, rule_files, stage, &walking)
+		});
+		Self { handle, stop, at }
+	}
+
+	/// What the walk found, and the rules it matched with.
+	async fn finish(mut self) -> Result<(LocalScan, IgnoreRules), Error> {
+		(&mut self.handle)
+			.await
+			.map_err(|e| Error::custom(ErrorKind::Internal, format!("local scan panicked: {e}")))?
+			.map_err(|e| db_error(e, &format!("staging the local scan in {}", self.at)))
+	}
+
+	/// Stop the walk and wait until it has let go of the tree and its stage, which takes until each
+	/// read it has under way has ended (see [`scan::scan_local_staged`]). What it found, or failed to
+	/// write, is no part of the pass: a pass that walks again stages its own.
+	async fn abandon(mut self) {
+		self.stop.store(true, Ordering::Relaxed);
+		match (&mut self.handle).await {
+			Ok(Ok(_)) => {}
+			Ok(Err(e)) => tracing::warn!(
+				"a local scan given up before it finished could not be staged in {}: {e}",
+				self.at
+			),
+			Err(e) => tracing::warn!("a local scan given up before it finished panicked: {e}"),
+		}
+	}
+}
+
+impl Drop for LocalWalk {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::Relaxed);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -6872,6 +6967,7 @@ mod tests {
 			PauseMode,
 			apply::PassStart,
 			baseline::{BaselineChange, NodeKind},
+			changes::tests::{cacheable_dir, cacheable_file},
 			derive::Derived,
 			ignore::IgnoreRules,
 			plan::{
@@ -14207,5 +14303,116 @@ mod tests {
 			None,
 		);
 		assert_eq!(db_error(moved, "writing").kind(), ErrorKind::IO);
+	}
+
+	/// The remote root's `.filenignore` in [`dry_run_over_a_remote_rule_file`]'s cache.
+	const REMOTE_RULE_FILE: Uuid = Uuid::from_u128(3);
+
+	/// A dry run of a pair in `mode` over a local tree holding `a.tmp`, `b.txt` and `local` (paths
+	/// and contents), whose remote root holds a `.filenignore` reading `*.tmp` and nothing else,
+	/// with `rows` for its baseline. Offline: the remote is the cache's rows, and the rule file's
+	/// body is handed over as the one the pair's last pass read, so no server is asked for it.
+	/// Answers the paths the pass ignores, each with its deciding line, and how many stage numbers
+	/// the read took: the snapshot's, the plan's, one per walk of the tree, and the confirmation's
+	/// where a row awaits one.
+	async fn dry_run_over_a_remote_rule_file(
+		mode: SyncMode,
+		local: &[(&str, &str)],
+		rows: &[BaselineEntry],
+	) -> (Vec<(String, String)>, u64) {
+		let dir = tempfile::tempdir().unwrap();
+		let root = dir.path().join("local");
+		std::fs::create_dir(&root).unwrap();
+		for (path, contents) in [("a.tmp", "scratch"), ("b.txt", "kept")]
+			.iter()
+			.chain(local)
+		{
+			std::fs::write(root.join(path), contents).unwrap();
+		}
+		let account = Uuid::from_u128(1);
+		let remote_root = Uuid::from_u128(2);
+		let cache = dir.path().join("cache.db");
+		let mut state = CacheState::new_on_path(&cache, account);
+		state
+			.upsert_dirs([&cacheable_dir(remote_root, account, "pair")].into_iter())
+			.unwrap();
+		state
+			.upsert_files(
+				[&cacheable_file(
+					REMOTE_RULE_FILE,
+					remote_root,
+					".filenignore",
+				)]
+				.into_iter(),
+			)
+			.unwrap();
+		let client = Arc::new(offline_client());
+		client.configure_cache(cache, |_| {}).await.unwrap();
+		let engine = SyncEngine::open(client, dir.path().join("sync.db"))
+			.await
+			.unwrap();
+		let (pair, _) = locked(&engine.control)
+			.create_pair(root.to_str().unwrap(), remote_root, mode)
+			.unwrap();
+		let store = engine.pair_store(pair).await.unwrap();
+		let changes: Vec<BaselineChange<'_>> = rows.iter().map(BaselineChange::Upsert).collect();
+		locked(&store).apply_changes(pair, &changes).unwrap();
+		engine.remote_rule_bodies.lock().await.insert(
+			pair,
+			HashMap::from([(REMOTE_RULE_FILE, Arc::from("*.tmp\n"))]),
+		);
+
+		let before = engine.stages.load(Ordering::Relaxed);
+		let outcome = engine.plan_pair(pair).await.unwrap();
+		let stages = engine.stages.load(Ordering::Relaxed) - before;
+		drop((engine, store, state));
+		let ignored = outcome
+			.ignored
+			.into_iter()
+			.map(|ignored| (ignored.rel_path, ignored.pattern))
+			.collect();
+		(ignored, stages)
+	}
+
+	/// A two-way pair whose only `.filenignore` is the remote's walks its tree with that file's
+	/// rules: the walk a pushing pair starts before the remote is read matched with the user's
+	/// rules alone, so it is given up and the tree walked again.
+	#[tokio::test]
+	async fn a_two_way_walk_matches_with_a_rule_file_only_the_remote_holds() {
+		let (ignored, stages) = dry_run_over_a_remote_rule_file(SyncMode::TwoWay, &[], &[]).await;
+		assert_eq!(ignored, vec![("a.tmp".to_owned(), "*.tmp".to_owned())]);
+		assert_eq!(stages, 4, "the snapshot, the plan and two walks");
+	}
+
+	/// So does a pair that only pushes, whose synced `.filenignore` the disk has lost: its rules
+	/// govern until that loss propagates.
+	#[tokio::test]
+	async fn a_push_only_walk_matches_with_a_synced_rule_file_the_disk_lost() {
+		let synced = synced_file(
+			".filenignore",
+			REMOTE_RULE_FILE,
+			Blake3Hash::from([1; 32]),
+			6,
+		);
+		let (ignored, stages) =
+			dry_run_over_a_remote_rule_file(SyncMode::LocalToRemote, &[], &[synced]).await;
+		assert_eq!(ignored, vec![("a.tmp".to_owned(), "*.tmp".to_owned())]);
+		// The row is a push the pass has yet to confirm, and the confirmation takes a number for
+		// the stage it would make past a window.
+		assert_eq!(
+			stages, 5,
+			"the confirmation, the snapshot, the plan and two walks"
+		);
+	}
+
+	/// A pair whose `.filenignore` is on disk reads no remote copy, so the walk started before the
+	/// remote was read stands: the tree is walked once, with the rules on disk.
+	#[tokio::test]
+	async fn a_walk_with_its_rule_file_on_disk_walks_the_tree_once() {
+		let (ignored, stages) =
+			dry_run_over_a_remote_rule_file(SyncMode::TwoWay, &[(".filenignore", "b.*\n")], &[])
+				.await;
+		assert_eq!(ignored, vec![("b.txt".to_owned(), "b.*".to_owned())]);
+		assert_eq!(stages, 3, "the snapshot, the plan and one walk");
 	}
 }
