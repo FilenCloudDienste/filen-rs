@@ -349,6 +349,16 @@ async fn drain_collecting_errors(
 	errors
 }
 
+/// Which of its parent's links and shares an item is added to.
+#[derive(Clone, Copy)]
+pub(crate) enum ParentTargets {
+	/// All of them: a write just created the item, or moved or restored it into the parent.
+	All,
+	/// Only those the item is not in yet: it was already in the parent, and an earlier
+	/// propagation may have reached some or none of them.
+	Missing,
+}
+
 /// A public link a directory belongs to, with its key decrypted.
 #[derive(Clone)]
 pub(crate) struct ConnectedLink {
@@ -618,8 +628,9 @@ impl Client {
 		drain_collecting_errors(futures).await
 	}
 
-	/// Adds `item`, and a directory's subtree, to the links and shares of its parent, after the
-	/// write that created, moved or restored it landed. The caller holds the drive lock `lock`.
+	/// Adds `item`, and a directory's subtree, to the links and shares of its parent (`which` of
+	/// them), after the write that created, moved or restored it landed, or that found it already
+	/// there. The caller holds the drive lock `lock`.
 	/// Once its lease is lost, the lock is taken again and the targets and the subtree read
 	/// again under it: the item is not left out for the lost lease, and not added to a link or
 	/// share another client removed meanwhile.
@@ -627,13 +638,17 @@ impl Client {
 		&self,
 		lock: &Arc<ResourceLock>,
 		item: NonRootItemType<'_, Normal>,
+		which: ParentTargets,
 	) -> Result<(), Error> {
 		let uuid = (*item.parent()).try_into()?;
 
 		let mut retaken = None;
 		let errors = loop {
 			let held = retaken.as_ref().unwrap_or(lock);
-			let targets = self.fetch_connected_targets(uuid).await?;
+			let mut targets = self.fetch_connected_targets(uuid).await?;
+			if matches!(which, ParentTargets::Missing) && !targets.is_empty() {
+				targets = targets.without(&self.fetch_connected_targets(item.uuid()).await?);
+			}
 			// Without a link or share there is nothing to add the item (or a directory's
 			// subtree) to, so skip the recursive listing entirely.
 			if targets.is_empty() {

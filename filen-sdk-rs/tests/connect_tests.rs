@@ -1,6 +1,8 @@
 use std::{borrow::Cow, sync::Arc};
 
 use filen_macros::shared_test_runtime;
+#[cfg(feature = "malformed")]
+use filen_sdk_rs::crypto::shared::MetaCrypter;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
@@ -244,6 +246,68 @@ async fn move_into_linked_dir_propagates() {
 	assert!(
 		sub_files.iter().any(|f| f.uuid() == child.uuid()),
 		"moved dir's nested file must be visible in the destination link"
+	);
+}
+
+// A directory that exists in a linked parent but is missing from its link (a create whose
+// propagation failed, here one that never propagated) is added to the link when a create of
+// the same name merges into it.
+#[cfg(feature = "malformed")]
+#[shared_test_runtime]
+async fn create_dir_merged_into_unlinked_dir_adds_it_to_the_link() {
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	let unauth_client = client.get_unauthed();
+
+	let parent = client
+		.create_dir(&test_dir.into(), "linked_parent")
+		.await
+		.unwrap();
+	client
+		.public_link_dir::<fn(u64, Option<u64>)>(&parent, None)
+		.await
+		.unwrap();
+	let link: DirPublicLink = client
+		.get_dir_link_rw(&parent)
+		.await
+		.unwrap()
+		.unwrap()
+		.try_into()
+		.unwrap();
+	let info = unauth_client
+		.get_dir_public_link_info(*link.uuid(), &link.key_string())
+		.await
+		.unwrap();
+	let linked_dirs = async || {
+		unauth_client
+			.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+			.await
+			.unwrap()
+			.0
+	};
+
+	// valid metadata, written without adding the directory to the link
+	let meta = client.crypter().encrypt_meta(r#"{"name":"child"}"#).await;
+	let unpropagated = client
+		.create_malformed_dir(&(&parent).into(), "child", &meta.0)
+		.await
+		.unwrap();
+	assert!(
+		!linked_dirs()
+			.await
+			.iter()
+			.any(|d| d.inner().uuid() == unpropagated)
+	);
+
+	let merged = client.create_dir(&(&parent).into(), "child").await.unwrap();
+	assert_eq!(merged.uuid(), unpropagated);
+	assert!(
+		linked_dirs()
+			.await
+			.iter()
+			.any(|d| d.inner().uuid() == unpropagated),
+		"the merged directory must be visible in the link"
 	);
 }
 

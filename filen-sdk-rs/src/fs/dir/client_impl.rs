@@ -9,6 +9,7 @@ use crate::error::ResultExt;
 use crate::{
 	api,
 	auth::Client,
+	connect::ParentTargets,
 	crypto::shared::MetaCrypter,
 	error::{Error, ErrorExt, InvalidTypeError, MetadataWasNotDecryptedError},
 	fs::{
@@ -57,17 +58,20 @@ impl Client {
 		let lock = self.lock_drive().await?;
 		let (uuid, meta) = RemoteDirectory::make_parts(name, created)?;
 
-		let dir = match self.post_create_dir(parent, uuid, meta).await? {
-			CreateDirOutcome::Created(dir) => dir,
+		let (dir, targets) = match self.post_create_dir(parent, uuid, meta).await? {
+			CreateDirOutcome::Created(dir) => (dir, ParentTargets::All),
 			// The server deduplicated against a pre-existing directory with the same
 			// (case-insensitive) name hash and returned its uuid. Our locally built meta
 			// carries the caller's casing and created=now, which do not match the existing
 			// directory; adopt its real metadata instead of pushing fabricated meta into
-			// the share/link mirrors.
-			CreateDirOutcome::Merged(existing) => return self.get_dir(existing).await,
+			// the share/link mirrors. It is still added to the parent's links and shares it
+			// is missing from: a retry of a create whose propagation failed lands here.
+			CreateDirOutcome::Merged(existing) => {
+				(self.get_dir(existing).await?, ParentTargets::Missing)
+			}
 		};
 
-		self.update_item_with_maybe_connected_parent(&lock, (&dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&dir).into(), targets)
 			.await?;
 		Ok(dir)
 	}
@@ -316,7 +320,7 @@ impl Client {
 		// Mirror the restored subtree's metadata into the (now current) parent's
 		// shares/links (as create/upload do); otherwise recipients of a connected
 		// parent cannot see or decrypt the restored items.
-		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into(), ParentTargets::All)
 			.await?;
 		Ok(())
 	}
@@ -447,7 +451,7 @@ impl Client {
 		// Mirror the moved subtree's metadata into the new parent's shares/links (as
 		// create/upload do); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in items.
-		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*dir).into(), ParentTargets::All)
 			.await?;
 		Ok(())
 	}

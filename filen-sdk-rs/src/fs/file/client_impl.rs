@@ -11,6 +11,7 @@ use rayon::iter::ParallelIterator;
 use crate::{
 	api,
 	auth::{Client, shared_client::SharedClient},
+	connect::ParentTargets,
 	consts::CHUNK_SIZE_U64,
 	crypto::{error::ConversionError, shared::MetaCrypter},
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError, ResultExt},
@@ -111,7 +112,7 @@ impl Client {
 		// Mirror the restored file's metadata into the (now current) parent's
 		// shares/links (as upload does); otherwise recipients of a connected parent
 		// cannot see or decrypt the restored file.
-		self.update_item_with_maybe_connected_parent(&lock, (&*file).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*file).into(), ParentTargets::All)
 			.await?;
 		Ok(())
 	}
@@ -143,7 +144,7 @@ impl Client {
 		// Mirror the moved file's metadata into the new parent's shares/links (as
 		// upload does); otherwise recipients of a shared or publicly-linked
 		// destination cannot see or decrypt the moved-in file.
-		self.update_item_with_maybe_connected_parent(&lock, (&*file).into())
+		self.update_item_with_maybe_connected_parent(&lock, (&*file).into(), ParentTargets::All)
 			.await?;
 		Ok(())
 	}

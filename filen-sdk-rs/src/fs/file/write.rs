@@ -15,6 +15,7 @@ use super::exif::ExifTeeState;
 use crate::{
 	api,
 	auth::Client,
+	connect::ParentTargets,
 	consts::{CHUNK_SIZE, CHUNK_SIZE_U64, FILE_CHUNK_SIZE, FILE_CHUNK_SIZE_EXTRA},
 	crypto::{
 		self,
@@ -653,6 +654,7 @@ impl<'a> FileWriterCompletingState<'a> {
 				.update_item_with_maybe_connected_parent(
 					&drive_lock,
 					NonRootItemType::File(Cow::Borrowed(temp_file.as_ref())),
+					ParentTargets::All,
 				)
 				.await?;
 			Ok(())
