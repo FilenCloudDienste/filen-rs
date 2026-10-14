@@ -1226,6 +1226,22 @@ pub const SCENARIOS: &[Scenario] = &[
 			dir_moves: Count::Exactly(0),
 		},
 	),
+	// The first sync of a 1M-node pair, the size users report: the only 1M row that hashes
+	// every file.
+	balanced(
+		"twoway_first_sync_1m",
+		1_000_000,
+		Change::FirstSync,
+		SyncMode::TwoWay,
+		1,
+		ExpectRead::Whole(FullPassReason::EmptyBaseline),
+		Expect {
+			actions: Count::PerNode,
+			held: Count::Exactly(0),
+			conflicts: Count::Exactly(0),
+			dir_moves: Count::Exactly(0),
+		},
+	),
 	balanced(
 		"twoway_idle_1m",
 		1_000_000,

@@ -302,7 +302,7 @@ rule files in it, which is listed below as not covered.
 
 The three headline classes at 1k, 10k, 100k and 1M, plus the two passes that edit
 their own view of the baseline — `twoway_dir_move_*` and `twoway_after_upload_*`
-— at 100k and 1M.
+— at 100k and 1M. `twoway_first_sync_*` runs at 10k, 100k and 1M.
 
 `twoway_top_dir_move_100k` renames the largest directory a change-scoped pass folds:
 its own shape, seven top-level directories of 16,384 files each (16384/1/73 ASCII), one
