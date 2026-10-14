@@ -59,11 +59,12 @@ const PAGE_CACHE_KIB: i64 = 4 * 1024;
 /// in RAM, where it stayed at its high-water mark after the next `DELETE`. The read connections
 /// already had this, SQLite's native default; the worker's kept them in memory. The price is
 /// their file I/O: with TEMP in memory, a warm whole-subtree read of a million items took
-/// 4.0-5.2 s instead of 7.5-7.8 s, holding its de-duplication index in RAM. On unix the files go
-/// to `SQLITE_TMPDIR`, `TMPDIR` or the first of `/var/tmp`, `/usr/tmp` and `/tmp`; where that is
-/// a tmpfs, they are held in RAM after all. Not on Android, where the bundled SQLite is built with
-/// `SQLITE_TEMP_STORE=3` and keeps TEMP in memory whatever this says: it has no temp directory it
-/// can find.
+/// 4.0-5.2 s instead of 7.5-7.8 s, holding its de-duplication index in RAM. That read no longer
+/// de-duplicates (`raw/enumerate_subtree.sql` says why); `diff_subtree_absent.sql` and the subtree
+/// search still do. On unix the files go to `SQLITE_TMPDIR`, `TMPDIR` or the first of `/var/tmp`,
+/// `/usr/tmp` and `/tmp`; where that is a tmpfs, they are held in RAM after all. Not on Android,
+/// where the bundled SQLite is built with `SQLITE_TEMP_STORE=3` and keeps TEMP in memory whatever
+/// this says: it has no temp directory it can find.
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 const TEMP_STORE: &str = "FILE";
 /// On the web the DB file itself lives in memory (the wasm build's default VFS, `memvfs`, keeps

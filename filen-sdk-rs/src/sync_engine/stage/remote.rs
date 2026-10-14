@@ -671,7 +671,10 @@ mod tests {
 	};
 	use crate::{
 		alloc_meter,
-		cache::{CacheState, read_subtree_snapshot, read_subtree_snapshot_into},
+		cache::{
+			CacheState, read_capped_subtree_snapshot, read_subtree_snapshot,
+			read_subtree_snapshot_into,
+		},
 	};
 
 	const CASES: u64 = 200;
@@ -973,7 +976,9 @@ mod tests {
 			.upsert_dirs([cacheable_dir(ROOT, d, "loop")].into_iter())
 			.unwrap();
 
-		let read = read_subtree_snapshot(&path, ROOT).unwrap();
+		// Capped, and read before the uncapped streamed read below: a read that loses its stop
+		// rule cycles without end, which must fail here, not hang.
+		let read = read_capped_subtree_snapshot(&path, ROOT, 16).unwrap();
 		assert_eq!(
 			read.dirs.len() + read.files.len(),
 			3,

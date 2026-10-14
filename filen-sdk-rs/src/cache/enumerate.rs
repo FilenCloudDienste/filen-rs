@@ -229,12 +229,60 @@ impl SnapshotSink for Materialize {
 pub(crate) fn read_subtree_snapshot(path: &Path, root: Uuid) -> rusqlite::Result<SubtreeSnapshot> {
 	let mut sink = Materialize::default();
 	let watermark = read_subtree_snapshot_into(path, root, &mut sink)?;
-	Ok(SubtreeSnapshot {
-		dirs: sink.dirs,
-		files: sink.files,
-		watermark,
-		undecodable: sink.undecodable,
-	})
+	Ok(sink.into_snapshot(watermark))
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+impl Materialize {
+	fn into_snapshot(self, watermark: Option<u64>) -> SubtreeSnapshot {
+		SubtreeSnapshot {
+			dirs: self.dirs,
+			files: self.files,
+			watermark,
+			undecodable: self.undecodable,
+		}
+	}
+}
+
+/// [`Materialize`] that panics on the item past `max_items`, so a test reading a corrupt tree
+/// fails when the recursion loses its stop rule instead of collecting rows until the process runs
+/// out of memory.
+#[cfg(test)]
+struct Capped {
+	inner: Materialize,
+	max_items: usize,
+}
+
+#[cfg(test)]
+impl SnapshotSink for Capped {
+	fn undecodable(&mut self, items: Vec<UndecodableItem>) {
+		self.inner.undecodable(items);
+	}
+
+	fn item(&mut self, is_dir: bool, item: RemoteItem) {
+		assert!(
+			self.inner.dirs.len() + self.inner.files.len() < self.max_items,
+			"the read went past {} item(s): the recursion is not stopping",
+			self.max_items
+		);
+		self.inner.item(is_dir, item);
+	}
+}
+
+/// [`read_subtree_snapshot`] for a test whose subtree holds at most `max_items` rows, panicking
+/// past that instead of reading without end.
+#[cfg(test)]
+pub(crate) fn read_capped_subtree_snapshot(
+	path: &Path,
+	root: Uuid,
+	max_items: usize,
+) -> rusqlite::Result<SubtreeSnapshot> {
+	let mut sink = Capped {
+		inner: Materialize::default(),
+		max_items,
+	};
+	let watermark = read_subtree_snapshot_into(path, root, &mut sink)?;
+	Ok(sink.inner.into_snapshot(watermark))
 }
 
 /// How many uuids one [`hydrate_by_uuids`] statement binds. The sync engine's apply asks for what
@@ -738,6 +786,62 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
+	}
+
+	/// Corrupt parent links never make the read repeat a row or run forever: the anchor listed
+	/// under its own child is read once (as that child's child) and not descended into again, and
+	/// a cycle that does not pass through the anchor cannot be reached from it. Anchored inside a
+	/// two-dir cycle, or at a self-parented item, the read returns each member once and stops.
+	#[test]
+	fn every_reachable_item_is_read_once_whatever_cycles_the_parents_hold() {
+		let path = temp_db_path();
+		let account = Uuid::from_u128(1);
+		let anchor = Uuid::from_u128(2);
+		let d = Uuid::from_u128(3);
+		let f = Uuid::from_u128(4);
+		let g = Uuid::from_u128(5);
+		let (x, y) = (Uuid::from_u128(6), Uuid::from_u128(7));
+		let z = Uuid::from_u128(8);
+		let mut state = CacheState::new_on_path(&path, account);
+		state
+			.upsert_dirs(
+				[
+					test_dir(anchor, account, "anchor"),
+					test_dir(d, anchor, "d"),
+					test_dir(x, y, "x"),
+					test_dir(y, x, "y"),
+					test_dir(z, z, "z"),
+				]
+				.iter(),
+			)
+			.unwrap();
+		state
+			.upsert_files([test_file(f, anchor, "f"), test_file(g, d, "g")].iter())
+			.unwrap();
+		state
+			.upsert_dirs([test_dir(anchor, d, "loop")].iter())
+			.unwrap();
+
+		let read = |root: Uuid| {
+			// Capped: a read that loses its stop rule cycles without end, which must fail the
+			// test, not hang it.
+			let snapshot = read_capped_subtree_snapshot(&path, root, 16).unwrap();
+			let mut got: Vec<Uuid> = snapshot
+				.dirs
+				.iter()
+				.chain(&snapshot.files)
+				.map(|item| item.uuid)
+				.collect();
+			got.sort_unstable();
+			got
+		};
+		assert_eq!(
+			read(anchor),
+			[anchor, d, f, g],
+			"anchored at the looped root"
+		);
+		assert_eq!(read(x), [x, y], "anchored inside the detached cycle");
+		assert_eq!(read(z), [z], "anchored at the self-parented dir");
 	}
 
 	#[test]
