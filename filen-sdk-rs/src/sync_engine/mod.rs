@@ -62,6 +62,8 @@ mod stage;
 // reader (`rows`) is held to in the tests, and a structure the probe still sizes.
 #[cfg(any(test, feature = "bench-internals"))]
 mod tree;
+// The local scan's directory walk.
+mod walk;
 mod watch;
 
 /// Close the pass step ending here, for the benchmark harness.

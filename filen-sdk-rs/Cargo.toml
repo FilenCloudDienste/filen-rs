@@ -41,9 +41,9 @@ http-provider = ["dep:axum", "dep:axum-extra"]
 cache = ["dep:rusqlite", "dep:itertools", "filen-types/rusqlite"]
 # The folder<->folder sync engine (local <-> remote). Native-only (the module is cfg'd off on
 # wasm); builds on the cache's remote mirror plus the io/ transfer + fs-tree primitives, and the
-# `notify` FS watcher for the continuous engine, and `ignore` for gitignore-syntax `.filenignore`
-# matching.
-sync-engine = ["cache", "dep:notify", "dep:ignore"]
+# `notify` FS watcher for the continuous engine, `ignore` for gitignore-syntax `.filenignore`
+# matching, and `same-file` for the local walk's directory loop check.
+sync-engine = ["cache", "dep:notify", "dep:ignore", "dep:same-file"]
 # Exposes the otherwise-`pub(crate)` cache apply path (`cache::bench_support`) for the criterion
 # insertion benchmark only, and `nix` for the sync engine probe's peak resident set. Never enable
 # in production builds.
@@ -324,6 +324,9 @@ napi = { version = "3.12.6", default-features = false, features = [
 napi-derive = { version = "3.6.12", optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false }
 walkdir = "2.5.0"
+# The sync engine's walk tells a directory loop as `walkdir` does, with the same crate (already
+# locked as `walkdir`'s own dependency).
+same-file = { version = "1.0.6", optional = true }
 # gitignore(5) pattern matching for the sync engine's `.filenignore` rules (pure Rust).
 ignore = { version = "0.4.25", optional = true }
 

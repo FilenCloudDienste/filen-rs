@@ -13,7 +13,7 @@
 //! missing root) must never let the mass-delete guard propagate deletions.
 //!
 //! Symlinks are followed and their targets read as regular files (Filen has no symlink concept and
-//! the engine never writes one); `walkdir`'s loop detection guards against cycles. A symlink that
+//! the engine never writes one); the walk's loop detection guards against cycles. A symlink that
 //! cannot be followed (dangling, or part of a loop) is recorded as an error but does not make the
 //! scan incomplete, unless the baseline tracks a directory at that path (see
 //! [`LocalScan::complete`]).
@@ -52,6 +52,7 @@ use super::{
 	rows::Baseline,
 	side::Side,
 	stage::{Paging, Stage, StageSink},
+	walk::{self, Walk, WalkError},
 };
 use crate::{
 	fs::name::ValidatedName,
@@ -307,8 +308,8 @@ pub(super) fn record(errors: &mut Vec<ScanError>, root: &Path, error: ScanError)
 /// Whether a walk error is a symlink that cannot be followed: one looping back onto an ancestor, or
 /// one whose target does not resolve (dangling, or a link to itself). A symlink to a directory that
 /// merely cannot be READ is not one of these — its target exists and was not read.
-fn unfollowable_symlink(err: &walkdir::Error) -> bool {
-	if err.loop_ancestor().is_some() {
+fn unfollowable_symlink(err: &WalkError) -> bool {
+	if matches!(err, WalkError::Loop { .. }) {
 		return true;
 	}
 	err.path().is_some_and(|path| {
@@ -331,7 +332,7 @@ fn changed_under_walk(source: &std::io::Error) -> bool {
 /// ROOT, which is the one directory the rule does not apply to: a root reached through a symlink
 /// (macOS's `/var`) is the pair's anchor, not an alias of something else it syncs.
 fn alias_target(
-	entry: &walkdir::DirEntry,
+	entry: &walk::Entry,
 	canonical_root: Option<&Path>,
 	depth: usize,
 ) -> Option<String> {
@@ -704,15 +705,6 @@ enum Reading {
 	Other,
 }
 
-/// The followed metadata of `entry`, as the walk follows links: a symlinked dir or file is
-/// classified by its target.
-fn stat(entry: &walkdir::DirEntry) -> std::io::Result<std::fs::Metadata> {
-	entry.metadata().map_err(|err| {
-		err.into_io_error()
-			.unwrap_or_else(|| std::io::Error::other("metadata error"))
-	})
-}
-
 /// `metadata` as a [`Reading`], with `hash` answering for a file by its size and mtime.
 fn reading(
 	metadata: &std::fs::Metadata,
@@ -735,8 +727,8 @@ fn reading(
 
 /// Stat `entry` and, for a file, take the hash `row` holds when the fast path allows it and read the
 /// file otherwise.
-fn read_entry(entry: &walkdir::DirEntry, row: Option<&BaselineEntry>) -> std::io::Result<Reading> {
-	Ok(reading(&stat(entry)?, |size, mtime_millis| {
+fn read_entry(entry: &walk::Entry, row: Option<&BaselineEntry>) -> std::io::Result<Reading> {
+	Ok(reading(&entry.metadata()?, |size, mtime_millis| {
 		fast_path_hash(row, size, mtime_millis).map_or_else(|| hash_file(entry.path()), Ok)
 	}))
 }
@@ -994,7 +986,7 @@ impl<S: ScanSink> Window<'_, S> {
 }
 
 /// An entry handed to a worker under its sequence number, with the baseline row its fast path asks.
-type ReadJob = (usize, walkdir::DirEntry, Option<BaselineEntry>);
+type ReadJob = (usize, walk::Entry, Option<BaselineEntry>);
 
 /// A worker's answer for the entry it was handed under a sequence number: its reading, or the
 /// panic that read raised.
@@ -1110,11 +1102,9 @@ fn scan_local_watched<S: ScanSink>(
 		// read it was in, to its end.
 		let mut cut = false;
 
-		// Filtered by hand rather than through `filter_entry`, so an entry is keyed once for the
-		// filter and the read alike. A refused directory is skipped as `filter_entry` skips one.
-		let mut walker = walkdir::WalkDir::new(&start_path)
-			.follow_links(true)
-			.into_iter();
+		// An entry is keyed once for the filter and the read alike. A refused directory is skipped,
+		// so nothing under it is listed.
+		let mut walker = Walk::new(&start_path);
 		'walk: while let Some(entry) = walker.next() {
 			while window.listed.len() >= READ_WINDOW {
 				if stopped() {
@@ -1154,14 +1144,12 @@ fn scan_local_watched<S: ScanSink>(
 						window.complete = false;
 					}
 					let below_root = err.path().is_some_and(|path| path != root);
-					let source = match err.loop_ancestor() {
-						Some(ancestor) => std::io::Error::other(format!(
+					let source = match err {
+						WalkError::Loop { ancestor, .. } => std::io::Error::other(format!(
 							"symlink loops back onto {}",
 							ancestor.display()
 						)),
-						None => err
-							.into_io_error()
-							.unwrap_or_else(|| std::io::Error::other("directory walk error")),
+						WalkError::Io { source, .. } => source,
 					};
 					// An entry gone or replaced since its directory was listed, or a directory gone
 					// or replaced by a file before its listing was read, changed under the walk:
@@ -1273,7 +1261,7 @@ fn scan_local_watched<S: ScanSink>(
 				|| max_read_workers == 0
 				|| window.next_seq() < INLINE_STATS
 			{
-				match stat(&entry) {
+				match entry.metadata() {
 					Ok(metadata) => {
 						let is_file = metadata.is_file();
 						let known = is_file
@@ -2131,7 +2119,7 @@ mod tests {
 	fn a_directory_the_walk_could_not_descend_into_leaves_the_scan_incomplete() {
 		let root = temp_root();
 		fs::write(root.join("keep.txt"), b"x").unwrap();
-		// `walkdir` opens a directory as it hands the entry over, so the entry that vanishes
+		// The walk opens a directory as it hands the entry over, so the entry that vanishes
 		// BETWEEN listing and descent is one of the siblings already buffered in an open stream.
 		let outer = root.join("outer");
 		fs::create_dir(&outer).unwrap();

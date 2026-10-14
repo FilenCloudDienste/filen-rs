@@ -2311,6 +2311,7 @@ dependencies = [
  "rusqlite",
  "rustls-connector",
  "ruzstd",
+ "same-file",
  "scraper",
  "serde",
  "serde-wasm-bindgen",
