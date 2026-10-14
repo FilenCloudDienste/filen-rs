@@ -388,6 +388,11 @@ pub(super) fn normalize_rel_path(rel: &Path) -> Option<String> {
 /// names case-insensitively, so two paths differing only in case collide. Shared with the remote
 /// view, which has to fold case the same way for its own duplicate check to mean the same thing.
 pub(super) fn collision_key(rel_path: &str) -> String {
+	// Same answer as the `char::to_lowercase` fold below, which maps an ASCII char to exactly one
+	// ASCII char (see `at_or_under_folded`), without decoding and pushing one char at a time.
+	if rel_path.is_ascii() {
+		return rel_path.to_ascii_lowercase();
+	}
 	rel_path.chars().flat_map(char::to_lowercase).collect()
 }
 
@@ -1118,6 +1123,21 @@ mod tests {
 	fn collision_key_folds_case() {
 		assert_eq!(collision_key("A/B.txt"), "a/b.txt");
 		assert_eq!(collision_key("already/low.txt"), "already/low.txt");
+		assert_eq!(collision_key("Dir/İstanbul.TXT"), "dir/i\u{307}stanbul.txt");
+		assert_eq!(collision_key("ẞ/Ä"), "ß/ä");
+	}
+
+	#[test]
+	fn collision_key_folds_ascii_like_the_full_unicode_fold() {
+		let unicode_fold = |s: &str| s.chars().flat_map(char::to_lowercase).collect::<String>();
+		let every_ascii_char = (0u8..=127).map(char::from).collect::<String>();
+		for path in [
+			every_ascii_char.as_str(),
+			"MiXeD/Case/Path.TXT",
+			"ZZ/@[`{/~_-",
+		] {
+			assert_eq!(collision_key(path), unicode_fold(path), "{path:?}");
+		}
 	}
 
 	#[test]
