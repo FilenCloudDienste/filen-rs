@@ -28,6 +28,8 @@ pub use meta_ext::FilenMetaExt;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub(crate) use canonical_path::CanonicalPath;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use canonical_path::is_safe_descendant;
 
 /// Windows NT times (FILETIME) count 100 ns ticks from 1601-01-01.
 const NT_TICKS_PER_SEC: u64 = 10_000_000;

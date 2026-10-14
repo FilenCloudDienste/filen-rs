@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 /// The check goes through [`std::path::Component`] so "separator" and "absolute"
 /// are interpreted exactly as the host filesystem these paths are materialized
 /// on would interpret them.
-fn is_safe_descendant(name: &str) -> bool {
+pub fn is_safe_descendant(name: &str) -> bool {
 	let mut components = Path::new(name).components();
 	matches!(
 		(components.next(), components.next()),
