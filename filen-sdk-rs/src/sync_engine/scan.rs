@@ -32,7 +32,7 @@ use std::{
 	mem,
 	num::NonZero,
 	ops::ControlFlow,
-	path::{Component, Path, PathBuf},
+	path::{Component, Path},
 	sync::{Mutex, mpsc},
 };
 
@@ -87,7 +87,7 @@ pub(crate) enum ScanError {
 	/// loop, an unreadable `.filenignore`), or the root itself was gone when the walk finished. An
 	/// entry gone or replaced since the walk listed it is NOT one of these, nor is a directory gone
 	/// or replaced before the walk read its listing: nothing is wrong with the tree, so they are
-	/// logged at `debug` only. An entry gone between the walk handing it over and the scan's stat or
+	/// logged at `debug` only. A FILE gone between the walk handing it over and the scan's stat or
 	/// hash read leaves the scan complete, since the walk observed it; any other such change leaves
 	/// it partial.
 	Io {
@@ -320,14 +320,6 @@ fn changed_under_walk(source: &std::io::Error) -> bool {
 		source.kind(),
 		ErrorKind::NotFound | ErrorKind::NotADirectory
 	)
-}
-
-/// The walk of `root` caught `rel_path` mid-change: the scan is partial, but nothing is reported.
-fn caught_mid_change(root: &Path, rel_path: &str, why: impl fmt::Display) {
-	tracing::debug!(
-		"local scan of {}: {rel_path:?} changed under the walk, leaving the scan partial: {why}",
-		root.display()
-	);
 }
 
 /// The root-relative path of the directory `entry` links to, if `entry` is a symlinked directory
@@ -603,8 +595,8 @@ pub(crate) fn scan_local(
 		&rule_files,
 		Hooks {
 			on_listed: &mut |_| ControlFlow::Continue(()),
-			moved_hash: &mut |_, _, _| None,
-			max_hash_workers: MAX_HASH_WORKERS,
+			moved_hash: None,
+			max_read_workers: MAX_READ_WORKERS,
 		},
 		MapSink::with_capacity(baseline.len().max(1024)),
 	);
@@ -615,9 +607,10 @@ pub(crate) fn scan_local(
 /// [`StageSink`]). The nodes come back as a [`Side::Staged`], read out of the stage a page at a
 /// time, so the tree is in the file rather than in memory from the walk to the end of the plan.
 /// `baseline` (keyed by rel_path) drives the fast-path and is read for the symlink rule on
-/// [`LocalScan::complete`]. Blocking work; the hashes the fast path misses are read on up to
-/// [`MAX_HASH_WORKERS`] threads of the walk's own and no more than the machine's available
-/// parallelism, one started per miss up to that.
+/// [`LocalScan::complete`]. Blocking work; past its first [`INLINE_STATS`] entries the walk stats
+/// them, and reads the hashes the fast path misses, on up to [`MAX_READ_WORKERS`] threads of its
+/// own and no more than the machine's available parallelism, one started per entry handed over up
+/// to that.
 ///
 /// Entries `rules` ignore are pruned: recorded in [`LocalScan::ignored`] and never descended into.
 /// Each directory's `.filenignore` that `rule_files` reads joins `rules` before its children are
@@ -640,24 +633,32 @@ pub(crate) fn scan_local_staged(
 		&rule_files,
 		Hooks {
 			on_listed: &mut |_| ControlFlow::Continue(()),
-			moved_hash: &mut |_, _, _| None,
-			max_hash_workers: MAX_HASH_WORKERS,
+			moved_hash: None,
+			max_read_workers: MAX_READ_WORKERS,
 		},
 		StageSink::new(stage, Paging::PASS)?,
 	)
 }
 
-/// The most threads a walk reads file hashes on, beside its own; fewer on a machine whose available
-/// parallelism is lower. The hash reads are what a first
-/// sync's walk spends most of its time in, open and read alike, and they overlap well; eight is
-/// what that takes on an SSD, and the one knob to lower for a spinning disk, where parallel readers
-/// seek against each other.
-const MAX_HASH_WORKERS: usize = 8;
+/// The most threads a walk reads entries on, beside its own; fewer on a machine whose available
+/// parallelism is lower. A first sync's walk spends most of its
+/// time reading hashes, open and read alike, and a converged one stat-ing entries; both overlap
+/// well, and eight is what that takes on an SSD. It is the one knob to lower for a spinning disk,
+/// where parallel readers seek against each other.
+const MAX_READ_WORKERS: usize = 8;
 
-/// How many listed entries a walk holds, at most, behind one whose hash is still being read. They
-/// are put in the order they were listed, so a slow read holds up the ones after it; at this many
-/// the walk waits for it rather than holding more.
-const HASH_WINDOW: usize = 4096;
+/// How many listed entries a walk holds, at most, behind one that is still being read. They are put
+/// in the order they were listed, so a slow read holds up the ones after it; at this many the walk
+/// waits for it rather than holding more.
+const READ_WINDOW: usize = 4096;
+
+/// How many entries a whole walk stats on its own thread before it hands the rest to workers: a
+/// tree this small is read before a thread would have started. A file the fast path misses among
+/// them still has its hash read on a worker.
+const INLINE_STATS: usize = 256;
+
+/// [`scan_subtree`]'s hook answering for a file the fast path missed (see [`Hooks::moved_hash`]).
+type MovedHash<'h> = &'h mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>;
 
 /// What a walk asks its caller as it goes (see [`scan_local_watched`]).
 struct Hooks<'h> {
@@ -665,34 +666,97 @@ struct Hooks<'h> {
 	/// walk there, incomplete.
 	on_listed: &'h mut dyn FnMut(&Path) -> ControlFlow<()>,
 	/// [`scan_subtree`]'s: the hash of a file the fast path missed, by its path, size and mtime.
-	moved_hash: &'h mut dyn FnMut(&str, u64, i64) -> Option<Blake3Hash>,
-	/// How many threads, at most, read the hashes the fast path missed ([`MAX_HASH_WORKERS`]
-	/// outside the tests), and no more than the machine's available parallelism; `0` reads them on
-	/// the walk's own thread.
-	max_hash_workers: usize,
+	/// It is asked in walk order, as the walk lists each file, so a walk that has one stats every
+	/// entry on its own thread; a walk with none (`None`) stats them on workers.
+	moved_hash: Option<MovedHash<'h>>,
+	/// How many threads, at most, read entries ([`MAX_READ_WORKERS`] outside the tests), and no more
+	/// than the machine's available parallelism; `0` reads them all on the walk's own thread.
+	max_read_workers: usize,
 }
 
-/// An entry the walk listed and read, waiting in a [`Window`] for its turn to be put.
+/// What a listed entry turned out to be once read, followed through a symlink.
+enum Reading {
+	Dir {
+		mtime_millis: i64,
+	},
+	File {
+		size: u64,
+		mtime_millis: i64,
+		/// The baseline's hash when the fast path took it (or `moved_hash` answered), read otherwise.
+		hash: std::io::Result<Blake3Hash>,
+	},
+	/// A socket, FIFO or device: not syncable, and skipped silently. (A broken symlink never gets
+	/// here: following it fails, and the walk hands it over as an error.)
+	Other,
+}
+
+/// The followed metadata of `entry`, as the walk follows links: a symlinked dir or file is
+/// classified by its target.
+fn stat(entry: &walkdir::DirEntry) -> std::io::Result<std::fs::Metadata> {
+	entry.metadata().map_err(|err| {
+		err.into_io_error()
+			.unwrap_or_else(|| std::io::Error::other("metadata error"))
+	})
+}
+
+/// `metadata` as a [`Reading`], with `hash` answering for a file by its size and mtime.
+fn reading(
+	metadata: &std::fs::Metadata,
+	hash: impl FnOnce(u64, i64) -> std::io::Result<Blake3Hash>,
+) -> Reading {
+	let mtime_millis = FilenMetaExt::modified(metadata).timestamp_millis();
+	if metadata.is_dir() {
+		Reading::Dir { mtime_millis }
+	} else if metadata.is_file() {
+		let size = metadata.len();
+		Reading::File {
+			size,
+			mtime_millis,
+			hash: hash(size, mtime_millis),
+		}
+	} else {
+		Reading::Other
+	}
+}
+
+/// Stat `entry` and, for a file, take the hash `row` holds when the fast path allows it and read the
+/// file otherwise.
+fn read_entry(entry: &walkdir::DirEntry, row: Option<&BaselineEntry>) -> std::io::Result<Reading> {
+	Ok(reading(&stat(entry)?, |size, mtime_millis| {
+		fast_path_hash(row, size, mtime_millis).map_or_else(|| hash_file(entry.path()), Ok)
+	}))
+}
+
+/// An entry the walk listed, waiting in a [`Window`] for its turn to be put.
 enum Listed {
 	/// An error to record, with nothing to put.
 	Error(ScanError),
-	/// What to put.
-	Found(Found),
-	/// A file, whose node takes its hash once `read` holds it; `None` while a worker reads it.
-	File {
-		node: LocalNode,
+	/// An entry, settled once `read` holds its reading; `None` while a worker reads it.
+	Entry {
+		rel_path: String,
+		/// The type the walker listed this with, followed through a symlink: a directory's entries
+		/// are listed from it.
+		listed_type: std::fs::FileType,
 		/// Whether this is the `.filenignore` of a directory its rules could not be read for: a
 		/// read that fails here has been reported already, as that directory's.
 		blocked_rule_file: bool,
-		read: Option<std::io::Result<Blake3Hash>>,
+		read: Option<std::io::Result<Reading>>,
 	},
 }
 
-/// What a walk has listed and not yet put, in the order it listed it. The hashes of the files the
-/// fast path missed are read on worker threads, and finish in any order; holding everything listed
-/// after an unread file until it is read keeps what the sink is handed, and every error recorded,
-/// in walk order — which entry of a twin takes the name included — exactly as a walk reading each
-/// hash in turn would have it.
+/// What the walk does with an entry it listed.
+enum Next {
+	/// Read on the walk's own thread already.
+	Read(std::io::Result<Reading>),
+	/// Handed to a worker, with the baseline row the fast path asks about.
+	HandOver(Option<BaselineEntry>),
+}
+
+/// What a walk has listed and not yet put, in the order it listed it. Entries are read on worker
+/// threads, and finish in any order; holding everything listed after an unread entry until it is
+/// read keeps what the sink is handed, every error recorded and every rejected name, in walk order
+/// — which entry of a twin takes the name included — exactly as a walk reading each entry in turn
+/// would have it.
 struct Window<'r, S> {
 	root: &'r Path,
 	listed: VecDeque<Listed>,
@@ -701,35 +765,41 @@ struct Window<'r, S> {
 	sink: S,
 	errors: Vec<ScanError>,
 	complete: bool,
+	invalid_names: BTreeMap<String, String>,
 }
 
 impl<S: ScanSink> Window<'_, S> {
+	/// The sequence number the next entry pushed takes.
+	fn next_seq(&self) -> usize {
+		self.front + self.listed.len()
+	}
+
 	/// Hold `listed` behind what is held already, and put whatever that leaves ready at the front.
 	/// The entry's sequence number, by which a worker's answer finds it.
 	fn push(&mut self, listed: Listed) -> Result<usize, S::Error> {
-		let seq = self.front + self.listed.len();
+		let seq = self.next_seq();
 		self.listed.push_back(listed);
 		self.put_ready()?;
 		Ok(seq)
 	}
 
-	/// A worker's answer for the file at `seq`; whatever it leaves ready at the front is put.
-	fn answer(&mut self, seq: usize, read: std::io::Result<Blake3Hash>) -> Result<(), S::Error> {
+	/// A worker's reading of the entry at `seq`; whatever it leaves ready at the front is put.
+	fn answer(&mut self, seq: usize, reading: std::io::Result<Reading>) -> Result<(), S::Error> {
 		match seq
 			.checked_sub(self.front)
 			.and_then(|at| self.listed.get_mut(at))
 		{
-			Some(Listed::File {
+			Some(Listed::Entry {
 				read: slot @ None, ..
-			}) => *slot = Some(read),
-			_ => unreachable!("a worker answers once for a file the window still holds"),
+			}) => *slot = Some(reading),
+			_ => unreachable!("a worker answers once for an entry the window still holds"),
 		}
 		self.put_ready()
 	}
 
 	fn put_ready(&mut self) -> Result<(), S::Error> {
 		while let Some(front) = self.listed.front() {
-			if matches!(front, Listed::File { read: None, .. }) {
+			if matches!(front, Listed::Entry { read: None, .. }) {
 				return Ok(());
 			}
 			let listed = self
@@ -738,56 +808,8 @@ impl<S: ScanSink> Window<'_, S> {
 				.expect("just peeked (should be impossible)");
 			// The one place an entry leaves the window, so `front` cannot fall out of step with it.
 			self.front += 1;
-			let found = match listed {
-				Listed::File { read: None, .. } => {
-					unreachable!("an unread file stays at the front (should be impossible)")
-				}
-				Listed::Error(error) => {
-					record(&mut self.errors, self.root, error);
-					continue;
-				}
-				Listed::Found(found) => found,
-				Listed::File {
-					mut node,
-					blocked_rule_file,
-					read: Some(read),
-				} => match read {
-					Ok(hash) => {
-						node.content_hash = Some(hash);
-						Found::Node(node)
-					}
-					// A rule file the scan could not read has blocked its directory and been
-					// reported already. Nothing is planned under a blocked directory, so the
-					// missing node cannot read as a deletion.
-					Err(_) if blocked_rule_file => Found::Claim(node.rel_path),
-					// Removed between the walk listing it and the hash reading it: the same race as
-					// the `metadata` call in the walk, and the same answer.
-					Err(source) if source.kind() == ErrorKind::NotFound => {
-						tracing::debug!(
-							"local scan of {}: {:?} vanished after the walk listed it",
-							self.root.display(),
-							node.rel_path
-						);
-						continue;
-					}
-					Err(source) if changed_under_walk(&source) => {
-						self.complete = false;
-						caught_mid_change(self.root, &node.rel_path, source);
-						Found::Claim(node.rel_path)
-					}
-					Err(source) => {
-						self.complete = false;
-						record(
-							&mut self.errors,
-							self.root,
-							ScanError::Io {
-								rel_path: node.rel_path.clone(),
-								source,
-							},
-						);
-						Found::Claim(node.rel_path)
-					}
-				},
+			let Some(found) = self.settle(listed) else {
+				continue;
 			};
 			// Put once the entry is read, so a file is hashed before its name is claimed: a twin
 			// that vanishes before its hash read is not one, and a twin whose read fails is
@@ -805,19 +827,172 @@ impl<S: ScanSink> Window<'_, S> {
 		}
 		Ok(())
 	}
+
+	/// What a read entry puts, if anything, recording what it has to report.
+	fn settle(&mut self, listed: Listed) -> Option<Found> {
+		let (rel_path, listed_type, blocked_rule_file, read) = match listed {
+			Listed::Error(error) => {
+				record(&mut self.errors, self.root, error);
+				return None;
+			}
+			Listed::Entry {
+				rel_path,
+				listed_type,
+				blocked_rule_file,
+				read: Some(read),
+			} => (rel_path, listed_type, blocked_rule_file, read),
+			Listed::Entry { read: None, .. } => {
+				unreachable!("only a read entry is settled (should be impossible)")
+			}
+		};
+		// The walk goes by the type it listed an entry with, and the read must agree. A directory
+		// gone or replaced by then had its entries listed from what it was, and an entry that became
+		// a directory had none listed at all: either way the walk caught it mid-change. So did one
+		// that changed between a file and anything else, a symlink or a socket in particular, which
+		// would otherwise be dropped as unsyncable and read as the file's deletion. The entry is
+		// dropped, what was already read under it stays, and the scan is partial, so its absence and
+		// its children's do not read as deletions. Nothing is wrong with the tree, so nothing is
+		// reported either: the next pass reads it as it settled.
+		let listed_dir = listed_type.is_dir();
+		match &read {
+			Ok(Reading::File { .. } | Reading::Other) if listed_dir => {
+				self.caught_mid_change(&rel_path, "it is no longer a directory");
+				return None;
+			}
+			Err(source) if listed_dir && changed_under_walk(source) => {
+				self.caught_mid_change(&rel_path, source);
+				return None;
+			}
+			Ok(Reading::Dir { .. }) if !listed_dir => {
+				self.caught_mid_change(&rel_path, "it became a directory");
+				return None;
+			}
+			Ok(Reading::Other) if listed_type.is_file() => {
+				self.caught_mid_change(&rel_path, "it is no longer a file");
+				return None;
+			}
+			Ok(Reading::File { .. }) if !listed_type.is_file() => {
+				self.caught_mid_change(&rel_path, "it became a file");
+				return None;
+			}
+			_ => {}
+		}
+		let (kind, size, mtime_millis, hash) = match read {
+			Ok(Reading::Dir { mtime_millis }) => (NodeKind::Dir, 0, mtime_millis, None),
+			Ok(Reading::File {
+				size,
+				mtime_millis,
+				hash,
+			}) => (NodeKind::File, size, mtime_millis, Some(hash)),
+			Ok(Reading::Other) => return None,
+			// Gone since the walk listed it: the walk observed this entry and something removed it
+			// meanwhile, so nothing was missed and the scan still completed. Its absence is real
+			// evidence, which is the whole point — a temp file that came and went during the walk
+			// must not hold every deletion of the pair. Any other error (a permission denial above
+			// all) IS missing evidence and still makes the scan partial.
+			Err(source) if source.kind() == ErrorKind::NotFound => {
+				self.vanished(&rel_path);
+				return None;
+			}
+			// A directory above it stopped being one: that directory changed under the walk.
+			Err(source) if changed_under_walk(&source) => {
+				self.caught_mid_change(&rel_path, source);
+				return None;
+			}
+			Err(source) => {
+				self.complete = false;
+				record(
+					&mut self.errors,
+					self.root,
+					ScanError::Io { rel_path, source },
+				);
+				return None;
+			}
+		};
+
+		// A name the remote would reject can never be pushed: report it once, at the top of the
+		// subtree, and let the engine screen the whole subtree out of the plan rather than failing
+		// an upload every pass. The node itself is still recorded — the scan reports what is on
+		// disk, and an entry that exists but is omitted here reads downstream as a local DELETION,
+		// so renaming a synced item into a rejected name would trash its remote copy. The scan also
+		// still COMPLETED: this is a fully observed item that cannot be synced, not evidence the
+		// walk missed anything, so `complete` stays true and the delete guard is unaffected.
+		if !under_invalid_name(&self.invalid_names, &rel_path)
+			&& let Some(reason) = name_rejection(&rel_path)
+		{
+			self.invalid_names.insert(rel_path.clone(), reason);
+		}
+
+		let content_hash = match hash {
+			None => None,
+			Some(Ok(hash)) => Some(hash),
+			// A rule file the scan could not read has blocked its directory and been reported
+			// already. Nothing is planned under a blocked directory, so the missing node cannot
+			// read as a deletion.
+			Some(Err(_)) if blocked_rule_file => return Some(Found::Claim(rel_path)),
+			// Removed between its stat and its hash read: the same race as the stat's, and the same
+			// answer.
+			Some(Err(source)) if source.kind() == ErrorKind::NotFound => {
+				self.vanished(&rel_path);
+				return None;
+			}
+			Some(Err(source)) if changed_under_walk(&source) => {
+				self.caught_mid_change(&rel_path, source);
+				return Some(Found::Claim(rel_path));
+			}
+			Some(Err(source)) => {
+				self.complete = false;
+				record(
+					&mut self.errors,
+					self.root,
+					ScanError::Io {
+						rel_path: rel_path.clone(),
+						source,
+					},
+				);
+				return Some(Found::Claim(rel_path));
+			}
+		};
+		Some(Found::Node(LocalNode {
+			rel_path,
+			kind,
+			size,
+			mtime_millis,
+			content_hash,
+		}))
+	}
+
+	fn vanished(&self, rel_path: &str) {
+		tracing::debug!(
+			"local scan of {}: {rel_path:?} vanished after the walk listed it",
+			self.root.display()
+		);
+	}
+
+	/// The walk caught `rel_path` mid-change: the scan is partial, but nothing is reported.
+	fn caught_mid_change(&mut self, rel_path: &str, why: impl fmt::Display) {
+		self.complete = false;
+		tracing::debug!(
+			"local scan of {}: {rel_path:?} changed under the walk, leaving the scan partial: {why}",
+			self.root.display()
+		);
+	}
 }
 
-/// A worker's answer for the file it was handed under a sequence number: its hash read, or the
-/// panic that read raised.
-type HashAnswer = (usize, std::thread::Result<std::io::Result<Blake3Hash>>);
+/// An entry handed to a worker under its sequence number, with the baseline row its fast path asks.
+type ReadJob = (usize, walkdir::DirEntry, Option<BaselineEntry>);
 
-/// Read the hashes of the files handed over `jobs`, answering each with its sequence number over
-/// `done`, until either channel closes. A panic in a read is carried over `done` to the walk's
-/// thread and resumed there, as if the walk had read the file itself.
-fn hash_worker(jobs: &Mutex<mpsc::Receiver<(usize, PathBuf)>>, done: &mpsc::Sender<HashAnswer>) {
+/// A worker's answer for the entry it was handed under a sequence number: its reading, or the
+/// panic that read raised.
+type ReadAnswer = (usize, std::thread::Result<std::io::Result<Reading>>);
+
+/// Read the entries handed over `jobs`, answering each with its sequence number over `done`, until
+/// either channel closes. A panic in a read is carried over `done` to the walk's thread and resumed
+/// there, as if the walk had read the entry itself.
+fn read_worker(jobs: &Mutex<mpsc::Receiver<ReadJob>>, done: &mpsc::Sender<ReadAnswer>) {
 	// The lock is let go before the read: only taking a job is serialized.
-	while let Ok(Ok((seq, path))) = jobs.lock().map(|jobs| jobs.recv()) {
-		let read = std::panic::catch_unwind(|| hash_file(&path));
+	while let Ok(Ok((seq, entry, row))) = jobs.lock().map(|jobs| jobs.recv()) {
+		let read = std::panic::catch_unwind(|| read_entry(&entry, row.as_ref()));
 		if done.send((seq, read)).is_err() {
 			return;
 		}
@@ -837,8 +1012,8 @@ fn scan_local_watched<S: ScanSink>(
 	rule_files: &RuleFiles,
 	Hooks {
 		on_listed,
-		moved_hash,
-		max_hash_workers,
+		mut moved_hash,
+		max_read_workers,
 	}: Hooks<'_>,
 	sink: S,
 ) -> Result<(LocalScan, IgnoreRules), S::Error> {
@@ -859,7 +1034,6 @@ fn scan_local_watched<S: ScanSink>(
 	// The walk asks about one directory's entries at a time, so the lookup keeps that directory in
 	// hand instead of resolving every path from the root again.
 	let mut rows = baseline.cursor();
-	let mut invalid_names = BTreeMap::new();
 
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
@@ -887,11 +1061,11 @@ fn scan_local_watched<S: ScanSink>(
 	let job_rx = Mutex::new(job_rx);
 	let walked = std::thread::scope(|scope| {
 		// Moved in, so that leaving the scope by any path closes the channel and the workers stop.
-		let jobs: mpsc::Sender<(usize, PathBuf)> = job_tx;
-		let (done_tx, done_rx) = mpsc::channel::<HashAnswer>();
-		// One started per file the fast path misses, up to the cap: a walk that hashes nothing — a
-		// converged pass, most subtree walks — starts no thread, and one that hashes a file or two
-		// starts no more than that.
+		let jobs: mpsc::Sender<ReadJob> = job_tx;
+		let (done_tx, done_rx) = mpsc::channel::<ReadAnswer>();
+		// One started per entry handed over, up to the cap: a walk that hands over nothing — a small
+		// tree, most subtree walks — starts no thread, and one that hands over a file or two starts
+		// no more than that.
 		let mut workers = 0usize;
 		let mut worker_cap = None;
 		let mut window = Window {
@@ -901,6 +1075,7 @@ fn scan_local_watched<S: ScanSink>(
 			sink,
 			errors: Vec::new(),
 			complete: true,
+			invalid_names: BTreeMap::new(),
 		};
 		let wait = |window: &mut Window<'_, S>| {
 			let (seq, read) = done_rx
@@ -918,7 +1093,7 @@ fn scan_local_watched<S: ScanSink>(
 			.follow_links(true)
 			.into_iter();
 		while let Some(entry) = walker.next() {
-			while window.listed.len() >= HASH_WINDOW {
+			while window.listed.len() >= READ_WINDOW {
 				wait(&mut window)?;
 			}
 			let entry = match entry {
@@ -930,7 +1105,7 @@ fn scan_local_watched<S: ScanSink>(
 						.and_then(normalize_rel_path)
 						.unwrap_or_default();
 					// A directory the walk listed but could not descend into does NOT get the rule
-					// the `metadata` and hash calls below use for an entry that vanished: its
+					// the stat and the hash read below use for an entry that vanished: its
 					// children were never listed, so their absence is not something the walk
 					// observed. Trusting it reads a directory moved or removed mid-walk as one
 					// deletion per file under it, and the destination — listed before the move — is
@@ -968,7 +1143,7 @@ fn scan_local_watched<S: ScanSink>(
 					// as the open the loop check makes on a followed directory: nothing places it
 					// below the root.
 					if below_root && !unfollowable && changed_under_walk(&source) {
-						caught_mid_change(root, &rel_path, source);
+						window.caught_mid_change(&rel_path, source);
 						continue;
 					}
 					window.push(Listed::Error(ScanError::Io { rel_path, source }))?;
@@ -1061,139 +1236,102 @@ fn scan_local_watched<S: ScanSink>(
 				continue;
 			};
 
-			// `metadata()` follows symlinks (the walker has follow_links set), so a symlinked
-			// dir/file is classified by its target.
-			let metadata = match entry.metadata() {
-				Ok(metadata) => metadata,
-				Err(err) => {
-					let source = err
-						.into_io_error()
-						.unwrap_or_else(|| std::io::Error::other("metadata error"));
-					// Gone since the walk listed it: the walk observed this entry and something
-					// removed it meanwhile, so nothing was missed and the scan still completed. Its
-					// absence is real evidence, which is the whole point — a temp file that came and
-					// went during the walk must not hold every deletion of the pair. Any other error
-					// (a permission denial above all) IS missing evidence and still makes the scan
-					// partial.
-					if source.kind() == ErrorKind::NotFound {
-						tracing::debug!(
-							"local scan of {}: {rel_path:?} vanished after the walk listed it",
-							root.display()
-						);
-						continue;
-					}
-					window.complete = false;
-					// A directory above it stopped being one: that directory changed under the walk.
-					if changed_under_walk(&source) {
-						caught_mid_change(root, &rel_path, source);
-						continue;
-					}
-					window.push(Listed::Error(ScanError::Io { rel_path, source }))?;
-					continue;
-				}
+			let blocked_rule_file = entry.file_name() == OsStr::new(FILENIGNORE) && {
+				let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+				rule_files.reads(dir) && ignore_blocked.contains(dir)
 			};
-
-			let kind = if metadata.is_dir() {
-				NodeKind::Dir
-			} else if metadata.is_file() {
-				NodeKind::File
-			} else {
-				// Sockets, FIFOs, devices: not syncable, skip silently. (A broken symlink never gets
-				// here: following it fails, and the walk hands it over as an error above.)
-				continue;
-			};
-
-			// A name the remote would reject can never be pushed: report it once, at the top of the
-			// subtree, and let the engine screen the whole subtree out of the plan rather than
-			// failing an upload every pass. The node itself is still recorded — the scan reports
-			// what is on disk, and an entry that exists but is omitted here reads downstream as a
-			// local DELETION, so renaming a synced item into a rejected name would trash its remote
-			// copy. The scan also still COMPLETED: this is a fully observed item that cannot be
-			// synced, not evidence the walk missed anything, so `complete` stays true and the
-			// delete guard is unaffected.
-			if !under_invalid_name(&invalid_names, &rel_path)
-				&& let Some(reason) = name_rejection(&rel_path)
+			// A walk with a `moved_hash` asks it in walk order, as each file is listed, so it stats
+			// every entry here; a whole walk stats its first few here, and hands the rest over. A file
+			// that both miss is still read on a worker, which stats it again.
+			let next = if moved_hash.is_some()
+				|| max_read_workers == 0
+				|| window.next_seq() < INLINE_STATS
 			{
-				invalid_names.insert(rel_path.clone(), reason);
-			}
-
-			let mtime_millis = FilenMetaExt::modified(&metadata).timestamp_millis();
-			let mut job = None;
-			let listed = match kind {
-				NodeKind::Dir => Listed::Found(Found::Node(LocalNode {
-					rel_path,
-					kind,
-					size: 0,
-					mtime_millis,
-					content_hash: None,
-				})),
-				NodeKind::File => {
-					let size = metadata.len();
-					let read =
-						match fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime_millis)
-							.or_else(|| moved_hash(&rel_path, size, mtime_millis))
-						{
-							Some(hash) => Some(Ok(hash)),
-							None if max_hash_workers == 0 => Some(hash_file(entry.path())),
-							None => None,
-						};
-					let blocked_rule_file = entry.file_name() == OsStr::new(FILENIGNORE) && {
-						let dir = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
-						rule_files.reads(dir) && ignore_blocked.contains(dir)
-					};
-					if read.is_none() {
-						job = Some(entry.into_path());
-					}
-					Listed::File {
-						node: LocalNode {
-							rel_path,
-							kind,
-							size,
-							mtime_millis,
-							content_hash: None,
-						},
-						blocked_rule_file,
-						read,
-					}
-				}
-			};
-			let seq = window.push(listed)?;
-			if let Some(path) = job {
-				let cap = *worker_cap.get_or_insert_with(|| {
-					std::thread::available_parallelism()
-						.map_or(1, NonZero::get)
-						.min(max_hash_workers)
-				});
-				if workers < cap {
-					let (jobs, done) = (&job_rx, done_tx.clone());
-					match std::thread::Builder::new()
-						.name("filen-sync-scan".to_owned())
-						.spawn_scoped(scope, move || hash_worker(jobs, &done))
-					{
-						Ok(_) => workers += 1,
-						// Out of threads: the walk goes on with the workers it has, and reads on its
-						// own thread if it has none.
-						Err(err) => {
-							tracing::warn!(
-								"local scan of {}: could not start a hash worker, {workers} running: {err}",
-								root.display()
-							);
-							worker_cap = Some(workers);
+				match stat(&entry) {
+					Ok(metadata) => {
+						let is_file = metadata.is_file();
+						let known = is_file
+							.then(|| {
+								let size = metadata.len();
+								let mtime_millis =
+									FilenMetaExt::modified(&metadata).timestamp_millis();
+								fast_path_hash(rows.get(&rel_path).as_ref(), size, mtime_millis)
+									.or_else(|| {
+										moved_hash.as_deref_mut().and_then(|moved_hash| {
+											moved_hash(&rel_path, size, mtime_millis)
+										})
+									})
+							})
+							.flatten();
+						if is_file && known.is_none() && max_read_workers > 0 {
+							Next::HandOver(None)
+						} else {
+							Next::Read(Ok(reading(&metadata, |_, _| {
+								known.map_or_else(|| hash_file(entry.path()), Ok)
+							})))
 						}
 					}
+					Err(source) => Next::Read(Err(source)),
 				}
-				// A job is sent only with a worker started to answer it: the waits on `done_rx` would
-				// otherwise never return.
-				if workers == 0 {
-					window.answer(seq, hash_file(&path))?;
-				} else {
-					jobs.send((seq, path))
-						.expect("the workers' channel outlives the walk (should be impossible)");
+			} else {
+				// The cursor is asked in walk order, here. The walker's type only decides whether it is
+				// asked: `settle` holds the worker's stat against that type, and drops an entry whose
+				// type changed.
+				Next::HandOver(
+					entry
+						.file_type()
+						.is_file()
+						.then(|| rows.get(&rel_path))
+						.flatten(),
+				)
+			};
+			let seq = window.push(Listed::Entry {
+				rel_path,
+				listed_type: entry.file_type(),
+				blocked_rule_file,
+				read: None,
+			})?;
+			let row = match next {
+				Next::Read(read) => {
+					window.answer(seq, read)?;
+					continue;
 				}
+				Next::HandOver(row) => row,
+			};
+			let cap = *worker_cap.get_or_insert_with(|| {
+				std::thread::available_parallelism()
+					.map_or(1, NonZero::get)
+					.min(max_read_workers)
+			});
+			if workers < cap {
+				let (jobs, done) = (&job_rx, done_tx.clone());
+				match std::thread::Builder::new()
+					.name("filen-sync-scan".to_owned())
+					.spawn_scoped(scope, move || read_worker(jobs, &done))
+				{
+					Ok(_) => workers += 1,
+					// Out of threads: the walk goes on with the workers it has, and reads on its
+					// own thread if it has none.
+					Err(err) => {
+						tracing::warn!(
+							"local scan of {}: could not start a read worker, {workers} running: {err}",
+							root.display()
+						);
+						worker_cap = Some(workers);
+					}
+				}
+			}
+			// A job is sent only with a worker started to answer it: the waits on `done_rx` would
+			// otherwise never return.
+			if workers == 0 {
+				window.answer(seq, read_entry(&entry, row.as_ref()))?;
+			} else {
+				jobs.send((seq, entry, row))
+					.expect("the workers' channel outlives the walk (should be impossible)");
 			}
 		}
 
-		// Whatever is still held waits on a hash read; the walk is over once every one is in.
+		// Whatever is still held waits on a read; the walk is over once every one is in.
 		while !window.listed.is_empty() {
 			wait(&mut window)?;
 		}
@@ -1203,6 +1341,7 @@ fn scan_local_watched<S: ScanSink>(
 		sink,
 		mut errors,
 		mut complete,
+		invalid_names,
 		..
 	} = walked?;
 
@@ -1301,8 +1440,8 @@ pub(crate) fn scan_subtree(
 					ControlFlow::Continue(())
 				}
 			},
-			moved_hash,
-			max_hash_workers: MAX_HASH_WORKERS,
+			moved_hash: Some(moved_hash),
+			max_read_workers: MAX_READ_WORKERS,
 		},
 		// Sized to the walk and not to the pair: a subtree walk covers one directory, and the pair's
 		// count would size its table to the tree instead — a 50k-entry directory of a 100k-row pair
@@ -1784,6 +1923,172 @@ mod tests {
 		fs::remove_dir_all(&root).ok();
 	}
 
+	/// A directory the walk has gone into and that is something else by the time it is read was
+	/// caught mid-change: entries may have been listed under what it was, so neither a node at its
+	/// path nor its absence is evidence, and the scan is partial instead. Nothing is wrong with the
+	/// tree, so the read reports nothing. There are more of them than the walk stats inline, so the
+	/// workers' stats meet it too.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_replaced_by_a_file_once_listed_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let swapped = INLINE_STATS + 16;
+		for i in 0..swapped {
+			fs::create_dir(root.join(format!("swap{i:03}"))).unwrap();
+		}
+
+		let baseline = HashMap::new();
+		// A name recreated while its directory is still being listed may be listed again, with its
+		// new type (POSIX leaves that open): each one is swapped once.
+		let mut done = HashSet::new();
+		let scan = scan_watched(
+			&root,
+			&tree(&baseline),
+			// The walker has opened the directory by the time it hands it over.
+			&mut |path| {
+				if path
+					.file_name()
+					.is_some_and(|name| name.to_string_lossy().starts_with("swap"))
+					&& done.insert(path.to_owned())
+				{
+					fs::remove_dir(path).unwrap();
+					fs::write(path, b"now a file").unwrap();
+				}
+				ControlFlow::Continue(())
+			},
+		);
+
+		assert!(!scan.complete);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		assert_swapped_from(&scan, NodeKind::Dir);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// The mirror case: a file the walk listed, and so did not go into, that is a directory by the
+	/// time it is read had none of its entries listed. A node with nothing under it would read every
+	/// synced child as a deletion, so the scan is partial instead, and again reports nothing.
+	#[test]
+	fn a_file_replaced_by_a_directory_once_listed_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let swapped = INLINE_STATS + 16;
+		for i in 0..swapped {
+			fs::write(root.join(format!("swap{i:03}")), b"a file").unwrap();
+		}
+
+		let baseline = HashMap::new();
+		// Swapped once each, as above.
+		let mut done = HashSet::new();
+		let scan = scan_watched(&root, &tree(&baseline), &mut |path| {
+			if path
+				.file_name()
+				.is_some_and(|name| name.to_string_lossy().starts_with("swap"))
+				&& done.insert(path.to_owned())
+			{
+				fs::remove_file(path).unwrap();
+				fs::create_dir(path).unwrap();
+			}
+			ControlFlow::Continue(())
+		});
+
+		assert!(!scan.complete);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		assert_swapped_from(&scan, NodeKind::File);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A file the walk listed that is a symlink by the time it is read is neither a file nor a
+	/// directory to the read, which stats the entry itself. Dropped as unsyncable, it would read as
+	/// the file's deletion, so the scan is partial instead, and again reports nothing.
+	#[cfg(unix)]
+	#[test]
+	fn a_file_replaced_by_a_symlink_once_listed_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let swapped = INLINE_STATS + 16;
+		for i in 0..swapped {
+			fs::write(root.join(format!("swap{i:03}")), b"a file").unwrap();
+		}
+
+		let baseline = HashMap::new();
+		// Swapped once each, as above. A swapped name listed again is a link to `keep.txt`, and so a
+		// file again.
+		let mut done = HashSet::new();
+		let scan = scan_watched(&root, &tree(&baseline), &mut |path| {
+			if path
+				.file_name()
+				.is_some_and(|name| name.to_string_lossy().starts_with("swap"))
+				&& done.insert(path.to_owned())
+			{
+				fs::remove_file(path).unwrap();
+				std::os::unix::fs::symlink(root.join("keep.txt"), path).unwrap();
+			}
+			ControlFlow::Continue(())
+		});
+
+		assert!(!scan.complete);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		let nodes = sorted_entries(&scan.nodes.whole());
+		assert!(
+			nodes.iter().any(|(path, _)| path == "keep.txt"),
+			"{nodes:?}"
+		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// What a swap test's scan keeps: `keep.txt`, and no node of the type a swapped entry was
+	/// listed with. A swapped name listed again with its new type may be a node of that type.
+	fn assert_swapped_from(scan: &LocalScan, listed: NodeKind) {
+		let nodes = sorted_entries(&scan.nodes.whole());
+		assert!(
+			nodes.iter().any(|(path, _)| path == "keep.txt"),
+			"{nodes:?}"
+		);
+		assert!(
+			!nodes
+				.iter()
+				.any(|(path, node)| path.starts_with("swap") && node.kind == listed),
+			"{nodes:?}"
+		);
+	}
+
+	/// A directory the walk listed that is gone by the time it is read had its entries listed from
+	/// what it was: the scan is partial, and the read reports nothing, as for one replaced by a
+	/// file. There are more of them than the walk stats inline, so the workers' stats meet it too.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
+	#[test]
+	fn a_directory_removed_once_listed_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let removed = INLINE_STATS + 16;
+		for i in 0..removed {
+			fs::create_dir(root.join(format!("gone{i:03}"))).unwrap();
+		}
+
+		let baseline = HashMap::new();
+		let scan = scan_watched(&root, &tree(&baseline), &mut |path| {
+			if path
+				.file_name()
+				.is_some_and(|name| name.to_string_lossy().starts_with("gone"))
+			{
+				fs::remove_dir(path).unwrap();
+			}
+			ControlFlow::Continue(())
+		});
+
+		assert!(!scan.complete);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+		assert_eq!(sorted_paths(&scan), vec!["keep.txt"]);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
 	/// A DIRECTORY the walk listed but could not descend into is the opposite case: its children
 	/// were never listed, so their absence is not something the walk observed. Trusting it reads
 	/// every file under a directory that was moved or removed mid-walk as a deletion — and the
@@ -1833,15 +2138,16 @@ mod tests {
 
 	/// A file whose directory is replaced by a file once the walk listed it fails its read with
 	/// ENOTDIR: that directory changed under the walk, as one gone before the walk descends into it
-	/// does, so the scan is partial and nothing is reported. Only the stat is met here: a hash read
-	/// cannot be made to fail that way from the outside, between the stat and the read.
+	/// does, so the scan is partial and nothing is reported. There are more of them than the walk
+	/// stats inline, so the workers' stats meet it too. Only the stat is met here: a hash read cannot
+	/// be made to fail that way from the outside, between the stat and the read.
 	// Windows does not remove a directory the walker holds open.
 	#[cfg(unix)]
 	#[test]
 	fn a_file_whose_directory_is_replaced_by_a_file_leaves_the_scan_incomplete() {
 		let root = temp_root();
 		fs::write(root.join("keep.txt"), b"x").unwrap();
-		let swapped = 16;
+		let swapped = INLINE_STATS + 16;
 		for i in 0..swapped {
 			let dir = root.join(format!("swap{i:03}"));
 			fs::create_dir(&dir).unwrap();
@@ -1971,14 +2277,14 @@ mod tests {
 				on_listed: &mut |_| ControlFlow::Continue(()),
 				// Asked about each file between its stat and its hash read, with no baseline to
 				// take a hash from: the second of the two is removed there.
-				moved_hash: &mut |rel_path, _, _| {
+				moved_hash: Some(&mut |rel_path, _, _| {
 					asked.push(rel_path.to_owned());
 					if asked.len() == 2 {
 						fs::remove_file(root.join(rel_path)).unwrap();
 					}
 					None
-				},
-				max_hash_workers: MAX_HASH_WORKERS,
+				}),
+				max_read_workers: MAX_READ_WORKERS,
 			},
 			MapSink::with_capacity(4),
 		);
@@ -2903,17 +3209,25 @@ mod tests {
 		}
 	}
 
-	/// Reading the hashes the fast path missed on worker threads changes nothing a walk reports:
-	/// what it puts and in which order, which entry of a twin wins, every error in its order, and
-	/// whether it completed — over a tree with more files than the walk holds while a hash is
-	/// read, a name the remote rejects, an ignored file, a file removed once listed, files and a
-	/// `.filenignore` that cannot be read, and, where the volume keeps them apart, case twins.
+	/// Reading entries on worker threads — their stats, and the hashes the fast path missed —
+	/// changes nothing a walk reports: what it puts and in which order, which entry of a twin wins,
+	/// every error in its order, and whether it completed. The tree holds more entries than the walk
+	/// holds while one is read, a name the remote rejects (a file, and a directory with entries
+	/// under it), an ignored file, a file removed once listed, files and a `.filenignore` that cannot
+	/// be read, and, where the volume keeps them apart, case twins. Every directory holds a symlink
+	/// to a file, one to a directory inside the root and one to a directory outside it, and two
+	/// dangling ones, so the links past [`INLINE_STATS`] that resolve are stat-ed on a worker. It
+	/// walks with no baseline, and once with a baseline whose every hash only the fast path can
+	/// produce.
 	#[cfg(unix)]
 	#[test]
-	fn a_walk_reading_hashes_on_workers_finds_what_one_reading_them_inline_finds() {
-		use std::os::unix::fs::PermissionsExt;
+	fn a_walk_reading_entries_on_workers_finds_what_one_reading_them_inline_finds() {
+		use std::os::unix::fs::{PermissionsExt, symlink};
 
 		let root = temp_root();
+		let outside = temp_root();
+		fs::write(outside.join("o1.txt"), b"outside 1").unwrap();
+		fs::write(outside.join("o2.txt"), b"outside 2").unwrap();
 		for dir in 0..5 {
 			let dir_path = root.join(format!("d{dir}"));
 			fs::create_dir(&dir_path).unwrap();
@@ -2924,26 +3238,32 @@ mod tests {
 				)
 				.unwrap();
 			}
+			symlink(dir_path.join("f0000.txt"), dir_path.join("link.txt")).unwrap();
+			symlink(root.join("d0").join("deep"), dir_path.join("alias")).unwrap();
+			symlink(&outside, dir_path.join("ext")).unwrap();
+			symlink(root.join("nowhere"), dir_path.join("dangling")).unwrap();
+			symlink(root.join("nowhere_dir"), dir_path.join("dangling_dir")).unwrap();
 		}
 		fs::create_dir(root.join("d0").join("deep")).unwrap();
 		fs::write(root.join("d0").join("deep").join("leaf.txt"), b"leaf").unwrap();
 		fs::write(root.join("bad."), b"rejected name").unwrap();
+		fs::create_dir_all(root.join("rej.").join("sub")).unwrap();
+		fs::write(
+			root.join("rej.").join("child.txt"),
+			b"under a rejected name",
+		)
+		.unwrap();
+		fs::write(root.join("rej.").join("sub").join("bad."), b"under it too").unwrap();
 		fs::write(root.join(FILENIGNORE), "*.log\n").unwrap();
 		fs::write(root.join("d1").join("x.log"), b"ignored").unwrap();
 		// Alone in its directory, so putting it back between the walks leaves every other
-		// directory's order as it was; the directory's mtime is put back too.
+		// directory's order as it was. Removing it changes the directory's mtime, which a walk
+		// reading on workers may read after the removal: that one mtime is left out of the
+		// comparison.
 		let gone_dir = root.join("gone");
 		fs::create_dir(&gone_dir).unwrap();
 		let gone = gone_dir.join("temp.txt");
-		let gone_mtime =
-			std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
-		let restore_gone = || {
-			fs::write(&gone, b"gone").unwrap();
-			fs::File::open(&gone_dir)
-				.unwrap()
-				.set_modified(gone_mtime)
-				.unwrap();
-		};
+		let restore_gone = || fs::write(&gone, b"gone").unwrap();
 		restore_gone();
 		let locked = [
 			root.join("d1").join("f0100.txt"),
@@ -2957,12 +3277,12 @@ mod tests {
 		}
 		let twins = case_twins(&root.join("d4")).is_some();
 
-		let walk = |max_hash_workers: usize| {
+		let walk = |baseline: &Baseline, max_read_workers: usize| {
 			let mut put = Vec::new();
 			let Ok((scan, _)) = scan_local_watched(
 				&root,
 				"",
-				&Baseline::default(),
+				baseline,
 				IgnoreRules::default(),
 				&RuleFiles::Read,
 				Hooks {
@@ -2972,8 +3292,8 @@ mod tests {
 						}
 						ControlFlow::Continue(())
 					},
-					moved_hash: &mut |_, _, _| None,
-					max_hash_workers,
+					moved_hash: None,
+					max_read_workers,
 				},
 				Recording {
 					map: MapSink::with_capacity(1024),
@@ -2983,30 +3303,100 @@ mod tests {
 			restore_gone();
 			(scan, put)
 		};
-		let (inline, inline_put) = walk(0);
-		let (pooled, pooled_put) = walk(MAX_HASH_WORKERS);
+		let errors = |scan: &LocalScan| -> Vec<String> {
+			scan.errors.iter().map(ToString::to_string).collect()
+		};
+		let without_gone_mtime = |found: &Found| match found {
+			Found::Node(node) if node.rel_path == "gone" => Found::Node(LocalNode {
+				mtime_millis: 0,
+				..node.clone()
+			}),
+			found => found.clone(),
+		};
+		let assert_same = |(pooled, pooled_put): &(LocalScan, Vec<Found>),
+		                   (inline, inline_put): &(LocalScan, Vec<Found>)| {
+			assert!(
+				inline_put.len() > READ_WINDOW,
+				"the tree must outgrow the window: {} put",
+				inline_put.len()
+			);
+			assert_eq!(
+				pooled_put
+					.iter()
+					.map(without_gone_mtime)
+					.collect::<Vec<_>>(),
+				inline_put
+					.iter()
+					.map(without_gone_mtime)
+					.collect::<Vec<_>>(),
+				"what is put, and in which order"
+			);
+			assert_eq!(errors(pooled), errors(inline));
+			assert_eq!(pooled.complete, inline.complete);
+			assert_eq!(pooled.invalid_names, inline.invalid_names);
+			assert_eq!(pooled.aliased_dirs, inline.aliased_dirs);
+			assert_eq!(pooled.ignored, inline.ignored);
+			assert_eq!(pooled.ignore_blocked, inline.ignore_blocked);
+			let nodes = |scan: &LocalScan| {
+				let mut nodes = sorted_entries(&scan.nodes.whole());
+				for (_, node) in nodes.iter_mut().filter(|(rel_path, _)| rel_path == "gone") {
+					node.mtime_millis = 0;
+				}
+				nodes
+			};
+			assert_eq!(nodes(pooled), nodes(inline));
+		};
+
+		let inline = walk(&Baseline::default(), 0);
+		let pooled = walk(&Baseline::default(), MAX_READ_WORKERS);
+		assert_same(&pooled, &inline);
+
+		// Every hash the baseline vouches for is one no file has, so only the fast path can have
+		// produced it.
+		let fake = Blake3Hash::from([0xAB; 32]);
+		let row = |rel_path: String, kind, size, local_mtime| BaselineEntry {
+			rel_path,
+			kind,
+			remote_uuid: None,
+			content_hash: (kind == NodeKind::File).then_some(fake),
+			size,
+			local_mtime,
+			remote_modified: None,
+			state: BaselineState::Synced,
+			local_kind: None,
+			remote_kind: None,
+			remote_hash: None,
+			remote_size: None,
+			remote_stable_uuid: None,
+			agreed_hash: None,
+		};
+		let baseline =
+			Baseline::from_rows(sorted_entries(&inline.0.nodes.whole()).into_iter().map(
+				|(rel_path, node)| {
+					row(
+						rel_path,
+						node.kind,
+						Some(node.size),
+						Some(node.mtime_millis),
+					)
+				},
+			));
+		let inline_fast = walk(&baseline, 0);
+		let pooled_fast = walk(&baseline, MAX_READ_WORKERS);
+		assert_same(&pooled_fast, &inline_fast);
 
 		for path in locked.iter().chain([&rule_file]) {
 			fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
 		}
-		assert!(
-			inline_put.len() > HASH_WINDOW,
-			"the tree must outgrow the window: {} put",
-			inline_put.len()
-		);
-		assert_eq!(pooled_put, inline_put, "what is put, and in which order");
-		let errors = |scan: &LocalScan| -> Vec<String> {
-			scan.errors.iter().map(ToString::to_string).collect()
-		};
-		assert_eq!(errors(&pooled), errors(&inline));
+		let (inline, _) = inline;
 		assert_eq!(
 			inline
 				.errors
 				.iter()
 				.filter(|error| matches!(error, ScanError::Io { .. }))
 				.count(),
-			locked.len() + 1,
-			"each unreadable file, and the unreadable rule file: {:?}",
+			locked.len() + 1 + 2 * 5,
+			"each unreadable file, the unreadable rule file and the dangling links: {:?}",
 			inline.errors
 		);
 		assert_eq!(
@@ -3019,22 +3409,39 @@ mod tests {
 			inline.errors
 		);
 		assert!(!inline.complete);
-		assert_eq!(pooled.complete, inline.complete);
-		assert_eq!(pooled.invalid_names, inline.invalid_names);
 		assert_eq!(
 			inline.invalid_names.keys().collect::<Vec<_>>(),
-			vec!["bad."]
+			vec!["bad.", "rej."]
 		);
-		assert_eq!(pooled.ignored, inline.ignored);
-		assert_eq!(inline.ignored.keys().collect::<Vec<_>>(), vec!["d1/x.log"]);
-		assert_eq!(pooled.ignore_blocked, inline.ignore_blocked);
-		assert_eq!(inline.ignore_blocked.iter().collect::<Vec<_>>(), vec!["d2"]);
 		assert_eq!(
-			sorted_entries(&pooled.nodes.whole()),
-			sorted_entries(&inline.nodes.whole())
+			inline.aliased_dirs.keys().cloned().collect::<Vec<_>>(),
+			(0..5)
+				.map(|dir| format!("d{dir}/alias"))
+				.collect::<Vec<_>>()
+		);
+		assert_eq!(inline.ignored.keys().collect::<Vec<_>>(), vec!["d1/x.log"]);
+		assert_eq!(inline.ignore_blocked.iter().collect::<Vec<_>>(), vec!["d2"]);
+		let nodes = sorted_entries(&inline.nodes.whole());
+		for linked in ["d3/link.txt", "d3/ext/o1.txt", "d3/ext/o2.txt"] {
+			assert!(
+				nodes.iter().any(|(rel_path, _)| rel_path == linked),
+				"{linked} is walked through its link"
+			);
+		}
+		let files = sorted_entries(&pooled_fast.0.nodes.whole())
+			.into_iter()
+			.filter(|(_, node)| node.kind == NodeKind::File)
+			.collect::<Vec<_>>();
+		assert!(files.len() > READ_WINDOW);
+		assert!(
+			files
+				.iter()
+				.all(|(_, node)| node.content_hash == Some(fake)),
+			"every file takes the baseline's hash on the fast path"
 		);
 
 		fs::remove_dir_all(&root).ok();
+		fs::remove_dir_all(&outside).ok();
 	}
 
 	/// A walk of `root` into a map, with `on_listed` called for each entry it lists.
@@ -3051,8 +3458,8 @@ mod tests {
 			&RuleFiles::Read,
 			Hooks {
 				on_listed,
-				moved_hash: &mut |_, _, _| None,
-				max_hash_workers: MAX_HASH_WORKERS,
+				moved_hash: None,
+				max_read_workers: MAX_READ_WORKERS,
 			},
 			MapSink::with_capacity(1024),
 		);
