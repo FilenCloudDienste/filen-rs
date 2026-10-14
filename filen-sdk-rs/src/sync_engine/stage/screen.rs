@@ -576,7 +576,7 @@ fn fold_side(conn: &Connection, op: i64) -> rusqlite::Result<usize> {
 			open.pop();
 		}
 		if let Some(dir) = open.iter().find(|dir| plan::is_under(path, dir)) {
-			tracing::debug!(
+			tracing::trace!(
 				"plan: {} — the deletion of {dir:?} takes it along",
 				action.describe()
 			);

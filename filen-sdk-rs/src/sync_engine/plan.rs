@@ -160,7 +160,7 @@ impl SyncAction {
 		)
 	}
 
-	/// A short human-readable description of the action, for `tracing::debug!` tracing of a pass.
+	/// A short human-readable description of the action, for the `tracing` lines a pass logs.
 	pub(super) fn describe(&self) -> String {
 		match self {
 			Self::CreateLocalDir { rel_path } => format!("create local dir {rel_path:?}"),
@@ -1348,7 +1348,7 @@ fn adopt_if_baseline_stale(
 	let action = SyncAction::AdoptBaseline {
 		rel_path: rel_path.to_string(),
 	};
-	tracing::debug!(
+	tracing::trace!(
 		"plan: {} — the two sides already agree; recording the baseline",
 		action.describe()
 	);
@@ -1368,7 +1368,7 @@ fn push_to_remote(
 	match (local, remote) {
 		(Some(local), None) => {
 			let action = create_remote(rel_path, local.kind);
-			tracing::debug!(
+			tracing::trace!(
 				"plan: {} — new locally, absent on remote",
 				action.describe()
 			);
@@ -1383,11 +1383,11 @@ fn push_to_remote(
 						kind: remote.kind,
 						remote_uuid: remote.remote_uuid,
 					};
-					tracing::debug!("plan: {} — local/remote kind differs", trash.describe());
+					tracing::trace!("plan: {} — local/remote kind differs", trash.describe());
 					actions.push(trash);
 				}
 				let action = create_remote(rel_path, local.kind);
-				tracing::debug!(
+				tracing::trace!(
 					"plan: {} — local content differs from remote",
 					action.describe()
 				);
@@ -1403,7 +1403,7 @@ fn push_to_remote(
 					kind: remote.kind,
 					remote_uuid: remote.remote_uuid,
 				};
-				tracing::debug!("plan: {} — gone locally (deletion)", trash.describe());
+				tracing::trace!("plan: {} — gone locally (deletion)", trash.describe());
 				actions.push(trash);
 			}
 		}
@@ -1436,7 +1436,7 @@ fn pull_to_local(
 	match (remote, local) {
 		(Some(remote), None) => {
 			let action = create_local(rel_path, remote);
-			tracing::debug!(
+			tracing::trace!(
 				"plan: {} — new on remote, absent locally",
 				action.describe()
 			);
@@ -1449,11 +1449,11 @@ fn pull_to_local(
 						rel_path: rel_path.to_string(),
 						kind: local.kind,
 					};
-					tracing::debug!("plan: {} — local/remote kind differs", del.describe());
+					tracing::trace!("plan: {} — local/remote kind differs", del.describe());
 					actions.push(del);
 				}
 				let action = create_local(rel_path, remote);
-				tracing::debug!(
+				tracing::trace!(
 					"plan: {} — remote content differs from local",
 					action.describe()
 				);
@@ -1468,7 +1468,7 @@ fn pull_to_local(
 					rel_path: rel_path.to_string(),
 					kind: local.kind,
 				};
-				tracing::debug!("plan: {} — gone on remote (deletion)", del.describe());
+				tracing::trace!("plan: {} — gone on remote (deletion)", del.describe());
 				actions.push(del);
 			}
 		}
@@ -1512,7 +1512,7 @@ pub(super) fn confirm_agreed(row: BaselineEntry) -> BaselineEntry {
 pub(super) fn snapshot_confirms(at: Option<&RemoteNode>, entry: &BaselineEntry) -> bool {
 	let confirmed = at.map(|node| node.remote_uuid) == entry.remote_uuid;
 	if confirmed {
-		tracing::debug!(
+		tracing::trace!(
 			"plan: the remote confirms {:?} — both sides hold what the baseline records",
 			entry.rel_path
 		);
@@ -1532,7 +1532,7 @@ pub(super) fn push_vouched(vouched: &HashSet<Uuid>, entry: &BaselineEntry) -> bo
 		.remote_uuid
 		.is_some_and(|uuid| vouched.contains(&uuid));
 	if stood {
-		tracing::debug!(
+		tracing::trace!(
 			"plan: {:?} — this engine's push stood as the remote head long enough to count as agreed",
 			entry.rel_path
 		);
@@ -1682,7 +1682,7 @@ pub(crate) fn adopt_destination_rows(
 			},
 		};
 		if let Some(row) = row {
-			tracing::debug!(
+			tracing::trace!(
 				"reconfigure: adopting the destination's copy of {rel_path:?} — the source no longer has it"
 			);
 			rows.push(row);
@@ -1695,7 +1695,7 @@ pub(crate) fn adopt_destination_rows(
 				if local.holds(&rel_path) {
 					continue;
 				}
-				tracing::debug!(
+				tracing::trace!(
 					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
 				);
 				rows.push(adopted_from_remote(&rel_path, &node));
@@ -1706,7 +1706,7 @@ pub(crate) fn adopt_destination_rows(
 				if remote.holds(&rel_path) {
 					continue;
 				}
-				tracing::debug!(
+				tracing::trace!(
 					"reconfigure: adopting the destination-only item {rel_path:?} — the pair never tracked it"
 				);
 				rows.push(adopted_from_local(&rel_path, &node));
@@ -1870,7 +1870,7 @@ fn reconcile_two_way(
 				let action = SyncAction::AdoptBaseline {
 					rel_path: rel_path.to_string(),
 				};
-				tracing::debug!(
+				tracing::trace!(
 					"plan: {} — both sides converged on identical content; recording the baseline",
 					action.describe()
 				);
@@ -4109,7 +4109,7 @@ pub(super) fn decide_path<'n>(
 		};
 		if local_node.is_some() || remote_node.is_some() {
 			if !source_holds {
-				tracing::debug!(
+				tracing::trace!(
 					"reconcile: leaving {key:?} alone — the destination's copy was adopted at a mode switch and the source is still empty here"
 				);
 				return;
@@ -4347,7 +4347,7 @@ pub(super) mod test_support {
 			let Some(dir) = ancestors(path).find(|dir| dirs.contains(*dir)) else {
 				return true;
 			};
-			tracing::debug!(
+			tracing::trace!(
 				"plan: {} — the deletion of {dir:?} takes it along",
 				action.describe()
 			);
