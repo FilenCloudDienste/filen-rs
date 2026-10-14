@@ -24,18 +24,18 @@
 //! [`LocalScan::aliased_dirs`].
 
 use std::{
-	cell::RefCell,
 	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	convert::Infallible,
 	ffi::OsStr,
 	fmt,
 	io::{ErrorKind, Read},
+	mem,
 	ops::ControlFlow,
 	path::{Component, Path},
 };
 
 use filen_types::crypto::Blake3Hash;
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 use super::{
 	baseline::{BaselineEntry, NodeKind},
@@ -374,14 +374,25 @@ fn under_invalid_name(invalid: &BTreeMap<String, String>, rel_path: &str) -> boo
 /// Shared with the filesystem watcher's changelist (`changes::relative_key`), so a path an event
 /// names is keyed exactly as the walk would key it.
 pub(super) fn normalize_rel_path(rel: &Path) -> Option<String> {
-	let mut parts = Vec::new();
+	let mut key = String::with_capacity(rel.as_os_str().len());
 	for component in rel.components() {
-		match component {
-			Component::Normal(os) => parts.push(os.to_str()?.nfc().collect::<String>()),
-			_ => return None,
+		let Component::Normal(name) = component else {
+			return None;
+		};
+		let name = name.to_str()?;
+		// A `Normal` component is never empty, so an empty key means this is the first one.
+		if !key.is_empty() {
+			key.push('/');
+		}
+		// Almost every name is NFC already (always so for ASCII): copied as is, it skips running
+		// the composition over every character.
+		if is_nfc(name) {
+			key.push_str(name);
+		} else {
+			key.extend(name.nfc());
 		}
 	}
-	Some(parts.join("/"))
+	Some(key)
 }
 
 /// The case-insensitive collision key for a (already NFC-normalized) relative path. Filen treats
@@ -680,9 +691,8 @@ fn scan_local_watched<S: ScanSink>(
 	let mut aliased_dirs = BTreeMap::new();
 	let mut ignored = BTreeMap::new();
 	let mut ignored_default_untracked = 0usize;
-	// Shared: the filter fills it, and the walk loop reads it for a rule file it cannot hash.
-	let ignore_blocked = RefCell::new(BTreeSet::new());
-	// Apart from `errors`, which the walk loop writes while the filter is alive.
+	let mut ignore_blocked = BTreeSet::new();
+	// Apart from `errors`: the rule files' errors are reported after the walk's.
 	let mut rule_errors = Vec::new();
 	// Canonical, so a root reached through a symlink (macOS's `/var`) compares with the canonical
 	// targets. A root that does not resolve fails the walk below anyway.
@@ -694,75 +704,17 @@ fn scan_local_watched<S: ScanSink>(
 			"",
 			root,
 			&mut rules,
-			&mut ignore_blocked.borrow_mut(),
+			&mut ignore_blocked,
 			&mut rule_errors,
 		);
 	}
 
-	let walker = walkdir::WalkDir::new(&start_path)
+	// Filtered by hand rather than through `filter_entry`, so an entry is keyed once for the filter
+	// and the read alike. A refused directory is skipped as `filter_entry` skips one.
+	let mut walker = walkdir::WalkDir::new(&start_path)
 		.follow_links(true)
-		.into_iter()
-		.filter_entry(|e| {
-			let depth = start_depth + e.depth();
-			if depth == 0 {
-				return true;
-			}
-			// The engine's own files come before every rule, so no pattern can re-include one.
-			// Never descend into our own quarantine dir (it holds locally-deleted items).
-			if depth == 1 && e.file_name() == OsStr::new(QUARANTINE_DIR) {
-				return false;
-			}
-			// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this
-			// very tree (see `Client::download_file_to_path`): partial bytes that must never be read
-			// as a local item to upload. A directory with that suffix is a legitimate user item.
-			// `file_type` is the followed type, as the walk follows links.
-			let is_dir = e.file_type().is_dir();
-			if !is_dir && e.path().extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT)) {
-				return false;
-			}
-			// A non-UTF-8 path is reported by the walk loop.
-			let Some(rel_path) = e
-				.path()
-				.strip_prefix(root)
-				.ok()
-				.and_then(normalize_rel_path)
-			else {
-				return true;
-			};
-			// Its ancestors were all accepted, so the leaf's own decision is git's answer.
-			if let Some(hit) = rules.decide(&rel_path, is_dir) {
-				// Hidden either way. But a BUILT-IN default hit with nothing synced at or under it is
-				// not a root: it is the `.DS_Store` every folder has, and carrying one per folder
-				// through the pass costs every later filter its whole directory count. A user-level
-				// or `.filenignore` line makes a root whether or not anything was synced there — the
-				// user named that path, and the report says so.
-				if hit.origin == Origin::Default && !baseline.tracked(&rel_path, is_dir) {
-					ignored_default_untracked += 1;
-				} else {
-					ignored.insert(rel_path, hit.into());
-				}
-				return false;
-			}
-			if let Some(target) = alias_target(e, canonical_root.as_deref(), depth) {
-				// Only targets INSIDE the root have a real path that wins. Two links to one directory
-				// outside the root are both still walked, and upload it twice.
-				aliased_dirs.insert(rel_path, target);
-				return false;
-			}
-			if is_dir && rule_files.reads(&rel_path) {
-				load_rule_file(
-					root,
-					&rel_path,
-					e.path(),
-					&mut rules,
-					&mut ignore_blocked.borrow_mut(),
-					&mut rule_errors,
-				);
-			}
-			true
-		});
-
-	for entry in walker {
+		.into_iter();
+	while let Some(entry) = walker.next() {
 		let entry = match entry {
 			Ok(entry) => entry,
 			Err(err) => {
@@ -816,6 +768,69 @@ fn scan_local_watched<S: ScanSink>(
 			}
 		};
 
+		let depth = start_depth + entry.depth();
+		// `file_type` is the followed type, as the walk follows links.
+		let is_dir = entry.file_type().is_dir();
+		let rel = entry.path().strip_prefix(root).ok();
+		// `None` for a non-UTF-8 path, which the filter lets through and the read reports.
+		let mut rel_path = rel.filter(|_| depth > 0).and_then(normalize_rel_path);
+		let admitted = depth == 0
+			|| 'filter: {
+				// The engine's own files come before every rule, so no pattern can re-include one.
+				// Never descend into our own quarantine dir (it holds locally-deleted items).
+				if depth == 1 && entry.file_name() == OsStr::new(QUARANTINE_DIR) {
+					break 'filter false;
+				}
+				// A `<uuid>.filendl` FILE is the temp file a download in flight is writing into this
+				// very tree (see `Client::download_file_to_path`): partial bytes that must never be
+				// read as a local item to upload. A directory with that suffix is a legitimate user
+				// item.
+				if !is_dir && entry.path().extension() == Some(OsStr::new(DOWNLOAD_TMP_EXT)) {
+					break 'filter false;
+				}
+				let Some(rel_path) = rel_path.as_mut() else {
+					break 'filter true;
+				};
+				// Its ancestors were all accepted, so the leaf's own decision is git's answer. A refused
+				// entry is not read below, so the maps take its key.
+				if let Some(hit) = rules.decide(rel_path, is_dir) {
+					// Hidden either way. But a BUILT-IN default hit with nothing synced at or under it
+					// is not a root: it is the `.DS_Store` every folder has, and carrying one per folder
+					// through the pass costs every later filter its whole directory count. A user-level
+					// or `.filenignore` line makes a root whether or not anything was synced there — the
+					// user named that path, and the report says so.
+					if hit.origin == Origin::Default && !baseline.tracked(rel_path, is_dir) {
+						ignored_default_untracked += 1;
+					} else {
+						ignored.insert(mem::take(rel_path), hit.into());
+					}
+					break 'filter false;
+				}
+				if let Some(target) = alias_target(&entry, canonical_root.as_deref(), depth) {
+					// Only targets INSIDE the root have a real path that wins. Two links to one
+					// directory outside the root are both still walked, and upload it twice.
+					aliased_dirs.insert(mem::take(rel_path), target);
+					break 'filter false;
+				}
+				if is_dir && rule_files.reads(rel_path) {
+					load_rule_file(
+						root,
+						rel_path,
+						entry.path(),
+						&mut rules,
+						&mut ignore_blocked,
+						&mut rule_errors,
+					);
+				}
+				true
+			};
+		if !admitted {
+			if is_dir {
+				walker.skip_current_dir();
+			}
+			continue;
+		}
+
 		if on_listed(entry.path()).is_break() {
 			// Cut short: what the walk did not get to is evidence of nothing.
 			complete = false;
@@ -823,14 +838,14 @@ fn scan_local_watched<S: ScanSink>(
 		}
 
 		// The root itself is the pair's anchor, not a synced item. A subtree walk's start IS one.
-		if start_depth + entry.depth() == 0 {
+		if depth == 0 {
 			continue;
 		}
 
-		let Ok(rel) = entry.path().strip_prefix(root) else {
+		let Some(rel) = rel else {
 			continue;
 		};
-		let Some(rel_path) = normalize_rel_path(rel) else {
+		let Some(rel_path) = rel_path else {
 			complete = false;
 			record(
 				&mut errors,
@@ -925,7 +940,6 @@ fn scan_local_watched<S: ScanSink>(
 							.reads(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir))
 							&& entry.file_name() == OsStr::new(FILENIGNORE)
 							&& ignore_blocked
-								.borrow()
 								.contains(rel_path.rsplit_once('/').map_or("", |(dir, _)| dir)) =>
 					{
 						Found::Claim(rel_path)
@@ -1011,7 +1025,7 @@ fn scan_local_watched<S: ScanSink>(
 		aliased_dirs,
 		ignored,
 		ignored_default_untracked,
-		ignore_blocked: ignore_blocked.into_inner(),
+		ignore_blocked,
 	};
 	Ok((scan, rules))
 }
@@ -1117,6 +1131,34 @@ mod tests {
 			.collect();
 		paths.sort_unstable();
 		paths
+	}
+
+	#[test]
+	fn normalize_rel_path_keeps_ascii_and_composes_decomposed_names() {
+		let key = |path: &str| normalize_rel_path(Path::new(path));
+		assert_eq!(key("a/b.txt").as_deref(), Some("a/b.txt"));
+		assert_eq!(key("single").as_deref(), Some("single"));
+		assert_eq!(key("").as_deref(), Some(""));
+		assert_eq!(key("cafe\u{301}").as_deref(), Some("caf\u{e9}"));
+		assert_eq!(
+			key("Docs/re\u{301}sume\u{301}/caf\u{e9}/x.txt").as_deref(),
+			Some("Docs/r\u{e9}sum\u{e9}/caf\u{e9}/x.txt")
+		);
+		// Hangul jamo compose too, and an already composed name is kept byte for byte.
+		assert_eq!(
+			key("\u{1100}\u{1161}/\u{ac00}").as_deref(),
+			Some("\u{ac00}/\u{ac00}")
+		);
+		assert_eq!(key("../escape"), None);
+		assert_eq!(key("/abs"), None);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn normalize_rel_path_refuses_a_non_utf8_component() {
+		use std::os::unix::ffi::OsStrExt;
+		let path = Path::new(OsStr::from_bytes(b"ok/bad\xff/leaf"));
+		assert_eq!(normalize_rel_path(path), None);
 	}
 
 	#[test]
