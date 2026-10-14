@@ -23,7 +23,7 @@ use filen_sdk_rs::{
 		HasName, HasUUID,
 		file::{FileBuilderOptionalName, RemoteFile, traits::HasFileInfo},
 	},
-	io::{FilenMetaExt, client_impl::IoSharedClientExt},
+	io::{FilenMetaExt, client_impl::IoSharedClientExt, is_safe_descendant},
 };
 use filen_types::{
 	crypto::Blake3Hash,
@@ -163,13 +163,21 @@ pub(crate) async fn update_task(
 	}
 }
 
+/// `cache_dir/<uuid>/<name>`. The name is decrypted, so whoever wrote the item (a sharer
+/// included) controls it: one that is not a single path component (`..`, `/abs`, `a/b`, empty)
+/// would escape `cache_dir` once joined, so it falls back to the uuid like an undecryptable
+/// (`None`) name does.
+fn cached_file_path(cache_dir: &Path, uuid: &str, name: Option<&str>) -> PathBuf {
+	let name = name.filter(|n| is_safe_descendant(n)).unwrap_or(uuid);
+	cache_dir.join(uuid).join(name)
+}
+
 impl AuthCacheState {
 	// we use the uuid as the folder and the actual name of the file because otherwise we run into a bug in IOS
 	// where files get shared as a full UUID
 
 	pub(crate) fn get_cached_file_path_from_name(&self, uuid: &str, name: Option<&str>) -> PathBuf {
-		self.cache_dir
-			.join(format!("{}/{}", uuid, name.unwrap_or(uuid)))
+		cached_file_path(&self.cache_dir, uuid, name)
 	}
 
 	pub(crate) fn get_cached_file_path(&self, file: &RemoteFile) -> PathBuf {
@@ -1229,6 +1237,30 @@ impl FilenMobileCacheState {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const UUID: &str = "00000000-0000-0000-0000-000000000001";
+
+	#[test]
+	fn a_plain_name_is_kept_under_its_uuid_dir() {
+		assert_eq!(
+			cached_file_path(Path::new("/cache"), UUID, Some("photo.jpg")),
+			Path::new("/cache/00000000-0000-0000-0000-000000000001/photo.jpg"),
+		);
+	}
+
+	#[test]
+	fn a_name_that_would_leave_the_cache_dir_falls_back_to_the_uuid() {
+		let fallback = Path::new(
+			"/cache/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000001",
+		);
+		for name in ["..", "../../evil", "/etc/passwd", "a/b", "", "."] {
+			assert_eq!(
+				cached_file_path(Path::new("/cache"), UUID, Some(name)),
+				fallback,
+				"name {name:?}",
+			);
+		}
+	}
 
 	/// A staging file whose last write was `age` ago. Backdating the timestamp is what makes this
 	/// deterministic — the alternative is waiting out the threshold on the real clock.
