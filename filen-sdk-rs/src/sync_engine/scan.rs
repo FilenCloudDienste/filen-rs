@@ -81,11 +81,13 @@ pub(crate) struct LocalNode {
 /// [`LocalScan::ignore_blocked`]), so nothing was missed, only withheld.
 #[derive(Debug)]
 pub(crate) enum ScanError {
-	/// An entry could not be read (permission, a directory that vanished before the walk could
-	/// descend into it, hash failure, a symlink that is dangling or part of a loop, an unreadable
-	/// `.filenignore`), or the root itself was gone when the walk finished. A FILE the walk listed
-	/// and that is gone by the time the scan stats or hashes it is NOT one of these: the walk
-	/// observed it, so it is skipped silently.
+	/// An entry could not be read (permission, hash failure, a symlink that is dangling or part of a
+	/// loop, an unreadable `.filenignore`), or the root itself was gone when the walk finished. An
+	/// entry gone or replaced since the walk listed it is NOT one of these, nor is a directory gone
+	/// or replaced before the walk read its listing: nothing is wrong with the tree, so they are
+	/// logged at `debug` only. An entry gone between the walk handing it over and the scan's stat or
+	/// hash read leaves the scan complete, since the walk observed it; any other such change leaves
+	/// it partial.
 	Io {
 		rel_path: String,
 		source: std::io::Error,
@@ -235,9 +237,9 @@ impl ScanSink for MapSink {
 pub(crate) struct LocalScan {
 	pub(crate) nodes: Side<LocalNode>,
 	/// `false` if the node set may be INCOMPLETE — a missing/unreadable root, an unreadable
-	/// subtree, a non-UTF-8 name, or a normalized-name collision. The mass-delete guard refuses to
-	/// propagate deletions from an incomplete scan (an empty/half-read source must not nuke the
-	/// destination).
+	/// subtree, a directory that changed under the walk (which has no [`ScanError`]), a non-UTF-8
+	/// name, or a normalized-name collision. The mass-delete guard refuses to propagate deletions
+	/// from an incomplete scan (an empty/half-read source must not nuke the destination).
 	///
 	/// A symlink that cannot be followed (dangling, or looping back onto an ancestor) leaves it
 	/// true: the link itself is all there is, and treating it as missing evidence would hold every
@@ -307,6 +309,23 @@ fn unfollowable_symlink(err: &walkdir::Error) -> bool {
 		std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 			&& std::fs::metadata(path).is_err()
 	})
+}
+
+/// Whether a read failed because the entry, or a directory above it, is gone or is no longer a
+/// directory: what the walk listed changed under it.
+fn changed_under_walk(source: &std::io::Error) -> bool {
+	matches!(
+		source.kind(),
+		ErrorKind::NotFound | ErrorKind::NotADirectory
+	)
+}
+
+/// The walk of `root` caught `rel_path` mid-change: the scan is partial, but nothing is reported.
+fn caught_mid_change(root: &Path, rel_path: &str, why: impl fmt::Display) {
+	tracing::debug!(
+		"local scan of {}: {rel_path:?} changed under the walk, leaving the scan partial: {why}",
+		root.display()
+	);
 }
 
 /// The root-relative path of the directory `entry` links to, if `entry` is a symlinked directory
@@ -511,8 +530,8 @@ pub(super) fn load_rule_file(
 	let bytes = match read {
 		Ok(Some(bytes)) => bytes,
 		Ok(None) => return,
-		// A directory that cannot be listed is the walk's error to report, and it leaves the scan
-		// incomplete on its own.
+		// A directory that cannot be listed is the walk's to handle: it leaves the scan incomplete on
+		// its own, and reports why unless the directory changed under the walk.
 		Err(_) if std::fs::read_dir(dir_path).is_err() => return,
 		Err(source) => {
 			blocked.insert(dir.to_owned());
@@ -760,13 +779,15 @@ fn scan_local_watched<S: ScanSink>(
 				// was synced through it (a link to an unmounted drive), whose subtree would
 				// otherwise read as deleted. A file synced as a link's copy is only that copy, and
 				// its deletion propagates like any other.
-				if !unfollowable_symlink(&err)
+				let unfollowable = unfollowable_symlink(&err);
+				if !unfollowable
 					|| rows
 						.get(&rel_path)
 						.is_some_and(|entry| entry.kind == NodeKind::Dir)
 				{
 					complete = false;
 				}
+				let below_root = err.path().is_some_and(|path| path != root);
 				let source = match err.loop_ancestor() {
 					Some(ancestor) => std::io::Error::other(format!(
 						"symlink loops back onto {}",
@@ -776,6 +797,15 @@ fn scan_local_watched<S: ScanSink>(
 						.into_io_error()
 						.unwrap_or_else(|| std::io::Error::other("directory walk error")),
 				};
+				// An entry gone or replaced since its directory was listed, or a directory gone or
+				// replaced by a file before its listing was read, changed under the walk: partial as
+				// above, but nothing is wrong with the tree, so nothing is reported. A missing pair
+				// root is reported, and so is an error that names no path, such as the open the loop
+				// check makes on a followed directory: nothing places it below the root.
+				if below_root && !unfollowable && changed_under_walk(&source) {
+					caught_mid_change(root, &rel_path, source);
+					continue;
+				}
 				record(&mut errors, root, ScanError::Io { rel_path, source });
 				continue;
 			}
@@ -828,6 +858,11 @@ fn scan_local_watched<S: ScanSink>(
 					continue;
 				}
 				complete = false;
+				// A directory above it stopped being one: that directory changed under the walk.
+				if changed_under_walk(&source) {
+					caught_mid_change(root, &rel_path, source);
+					continue;
+				}
 				record(&mut errors, root, ScanError::Io { rel_path, source });
 				continue;
 			}
@@ -899,6 +934,11 @@ fn scan_local_watched<S: ScanSink>(
 						);
 						continue;
 					}
+					Err(source) if changed_under_walk(&source) => {
+						complete = false;
+						caught_mid_change(root, &rel_path, source);
+						Found::Claim(rel_path)
+					}
 					Err(source) => {
 						complete = false;
 						record(
@@ -935,14 +975,26 @@ fn scan_local_watched<S: ScanSink>(
 	// unmounted tree), nothing the walk listed is evidence that anything was deleted.
 	if let Err(source) = std::fs::metadata(&start_path) {
 		complete = false;
-		record(
-			&mut errors,
-			root,
-			ScanError::Io {
-				rel_path: start.to_owned(),
-				source,
-			},
-		);
+		// A subtree's start gone or replaced is a directory below the root that changed under the
+		// walk: partial, but nothing is reported. Only a missing pair root is (a removed volume). A
+		// subtree walk's caller, `observe_local`, stats the pair root again and reports a removed
+		// volume there.
+		if !start.is_empty() && changed_under_walk(&source) {
+			tracing::debug!(
+				"local scan of {}: {start:?} changed under the walk, leaving the scan partial: \
+				 {source}",
+				root.display()
+			);
+		} else {
+			record(
+				&mut errors,
+				root,
+				ScanError::Io {
+					rel_path: start.to_owned(),
+					source,
+				},
+			);
+		}
 	}
 
 	errors.extend(rule_errors);
@@ -1454,7 +1506,8 @@ mod tests {
 	/// were never listed, so their absence is not something the walk observed. Trusting it reads
 	/// every file under a directory that was moved or removed mid-walk as a deletion — and the
 	/// destination, listed before the move, is not in the scan either, so the pass cannot see the
-	/// move. One held pass costs nothing; the next one folds it.
+	/// move. One held pass costs nothing; the next one folds it. Nothing is wrong with the tree, so
+	/// nothing is reported.
 	#[test]
 	fn a_directory_the_walk_could_not_descend_into_leaves_the_scan_incomplete() {
 		let root = temp_root();
@@ -1491,12 +1544,52 @@ mod tests {
 			!scan.complete,
 			"the children of a directory the walk never descended into were not observed absent"
 		);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A file whose directory is replaced by a file once the walk listed it fails its read with
+	/// ENOTDIR: that directory changed under the walk, as one gone before the walk descends into it
+	/// does, so the scan is partial and nothing is reported. Only the stat is met here: a hash read
+	/// cannot be made to fail that way from the outside, between the stat and the read.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
+	#[test]
+	fn a_file_whose_directory_is_replaced_by_a_file_leaves_the_scan_incomplete() {
+		let root = temp_root();
+		fs::write(root.join("keep.txt"), b"x").unwrap();
+		let swapped = 16;
+		for i in 0..swapped {
+			let dir = root.join(format!("swap{i:03}"));
+			fs::create_dir(&dir).unwrap();
+			fs::write(dir.join("inner.txt"), b"z").unwrap();
+		}
+
+		let baseline = HashMap::new();
+		// A name recreated while its directory is still being listed may be listed again: each
+		// directory is swapped once.
+		let mut done = HashSet::new();
+		let scan = scan_watched(&root, &tree(&baseline), &mut |path| {
+			if path.ends_with("inner.txt")
+				&& let Some(dir) = path.parent()
+				&& done.insert(dir.to_owned())
+			{
+				fs::remove_dir_all(dir).unwrap();
+				fs::write(dir, b"now a file").unwrap();
+			}
+			ControlFlow::Continue(())
+		});
+
+		assert_eq!(done.len(), swapped);
+		assert!(!scan.complete);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
 		assert!(
-			scan.errors
+			!sorted_paths(&scan)
 				.iter()
-				.any(|error| matches!(error, ScanError::Io { .. })),
-			"and the pass is told why: {:?}",
-			scan.errors
+				.any(|path| path.ends_with("inner.txt")),
+			"{:?}",
+			sorted_paths(&scan)
 		);
 
 		fs::remove_dir_all(&root).ok();
@@ -1699,6 +1792,15 @@ mod tests {
 		assert!(
 			!scan.complete,
 			"the root itself is gone: nothing the walk listed is evidence of a deletion"
+		);
+		assert!(
+			matches!(
+				scan.errors.as_slice(),
+				[ScanError::Io { rel_path, source }]
+					if rel_path.is_empty() && source.kind() == ErrorKind::NotFound
+			),
+			"a missing pair root is a removed volume, and is reported: {:?}",
+			scan.errors
 		);
 
 		fs::remove_dir_all(&root).ok();
@@ -2235,6 +2337,73 @@ mod tests {
 			"the start directory is a node, its keys are root-relative, and only the ROOT's own \
 			 quarantine bin is the engine's"
 		);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A subtree walk whose start is removed once the walk has opened it finds every entry it lists
+	/// gone and the start gone after it. That start is a directory below the root that changed under
+	/// the walk, as any other is: the scan is partial and nothing is reported.
+	// Windows does not remove a directory the walker holds open.
+	#[cfg(unix)]
+	#[test]
+	fn a_subtree_start_removed_during_the_walk_leaves_the_scan_incomplete_and_unreported() {
+		let root = temp_root();
+		let start = root.join("sub");
+		fs::create_dir(&start).unwrap();
+		for name in ["a.txt", "b.txt", "c.txt"] {
+			fs::write(start.join(name), b"x").unwrap();
+		}
+
+		let (scan, _) = scan_subtree(
+			&root,
+			"sub",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			&mut |_, _, _| None,
+			&|listed| {
+				if listed == 1 {
+					fs::remove_dir_all(&start).unwrap();
+				}
+				false
+			},
+		)
+		.expect("a walk nothing stops");
+
+		assert!(!start.exists());
+		assert!(
+			!scan.complete,
+			"what the walk listed under a start that is gone is evidence of nothing"
+		);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// A subtree start removed after the caller stat'd it and before the walk read it is the same
+	/// change caught a moment earlier: the walk's first read answers `NotFound` at the start, and
+	/// the scan is partial with nothing reported.
+	#[test]
+	fn a_subtree_start_gone_before_the_walk_reads_it_leaves_the_scan_incomplete_and_unreported() {
+		let root = temp_root();
+
+		let (scan, _) = scan_subtree(
+			&root,
+			"sub",
+			&Baseline::default(),
+			IgnoreRules::default(),
+			&RuleFiles::Read,
+			&mut |_, _, _| None,
+			&|_| false,
+		)
+		.expect("a walk nothing stops");
+
+		assert!(
+			!scan.complete,
+			"a start that is gone lists nothing that is evidence of a deletion"
+		);
+		assert!(scan.errors.is_empty(), "{:?}", scan.errors);
 
 		fs::remove_dir_all(&root).ok();
 	}

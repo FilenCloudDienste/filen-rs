@@ -595,6 +595,10 @@ pub(super) fn observe_local(
 							);
 							continue;
 						}
+						Err(source) if source.kind() == ErrorKind::NotADirectory => {
+							changed_under_observation(&mut out, root, path, &source);
+							continue;
+						}
 						Err(source) => {
 							out.complete = false;
 							record(
@@ -641,6 +645,9 @@ pub(super) fn observe_local(
 					gone: path.to_owned(),
 				};
 				insert(&mut out, root, path, LocalObservation::Absent(absence));
+			}
+			Err(source) if source.kind() == ErrorKind::NotADirectory => {
+				changed_under_observation(&mut out, root, path, &source);
 			}
 			Err(source) => {
 				out.complete = false;
@@ -743,6 +750,10 @@ fn walk_ancestors<'p>(
 			Err(source) if source.kind() == ErrorKind::NotFound => {
 				return Ancestors::Gone(ancestor);
 			}
+			Err(source) if source.kind() == ErrorKind::NotADirectory => {
+				changed_under_observation(out, root, ancestor, &source);
+				return Ancestors::Unreadable;
+			}
 			Err(source) => {
 				out.complete = false;
 				record(
@@ -772,6 +783,25 @@ fn walk_ancestors<'p>(
 		walked.insert(ancestor.to_owned());
 	}
 	Ancestors::Walked
+}
+
+/// A `stat` or read of `path` that met a file where a directory above it stood when it was
+/// stat'd — for this path or for one observed before it: that directory changed under the
+/// observation, as one the scan's walk finds replaced does. Nothing is wrong with the tree, so
+/// nothing is reported, but the path has no reading, so the observation is partial and the next
+/// pass looks again.
+fn changed_under_observation(
+	out: &mut LocalObservations,
+	root: &Path,
+	path: &str,
+	source: &std::io::Error,
+) {
+	out.complete = false;
+	tracing::debug!(
+		"local observation of {}: {path:?} changed under the observation, leaving it partial: \
+		 {source}",
+		root.display()
+	);
 }
 
 /// Whether an observation already answers for `path`: one at the path itself, or at an ancestor. A
@@ -812,10 +842,17 @@ fn read_siblings(root: &Path, dir: &str, out: &mut LocalObservations) -> Option<
 	};
 	let entries = match std::fs::read_dir(&dir_path) {
 		Ok(entries) => entries,
-		// Gone since the ancestor walk stat'ed it as a directory: a race, not missing evidence (the
-		// same rule the walk applies to an entry it listed), and there is nothing left in it to
-		// collide with either.
-		Err(source) if source.kind() == ErrorKind::NotFound => return None,
+		// Gone, or replaced by a file, since the ancestor walk stat'ed it as a directory: a race, not
+		// missing evidence (the same rule the walk applies to an entry it listed), and there is
+		// nothing left in it to collide with either.
+		Err(source)
+			if matches!(
+				source.kind(),
+				ErrorKind::NotFound | ErrorKind::NotADirectory
+			) =>
+		{
+			return None;
+		}
 		Err(source) => {
 			out.complete = false;
 			record(
@@ -1210,6 +1247,43 @@ mod tests {
 		);
 		assert_eq!(node.size, 5);
 		assert_eq!(node.mtime_millis, mtime);
+
+		fs::remove_dir_all(&root).ok();
+	}
+
+	/// An ancestor stat'd as a directory for an earlier dirty path and replaced by a file since
+	/// fails the next stat below it with ENOTDIR: that directory changed under the observation, as
+	/// one the walk finds replaced does. The path has no reading, so the observation is partial, and
+	/// nothing is reported. Called directly: the swap has to land between two dirty paths, which
+	/// nothing outside the observation can time.
+	// Windows answers a file standing in a path with NotFound, not ENOTDIR.
+	#[cfg(unix)]
+	#[test]
+	fn an_ancestor_replaced_by_a_file_leaves_the_observation_incomplete_and_unreported() {
+		let root = temp_root();
+		fs::write(root.join("a"), b"was a directory").unwrap();
+		let mut out = LocalObservations {
+			observed: BTreeMap::new(),
+			siblings: BTreeMap::new(),
+			ignore_blocked: BTreeSet::new(),
+			complete: true,
+			errors: Vec::new(),
+		};
+		let mut walked = BTreeSet::from(["a".to_owned()]);
+
+		let ancestors = walk_ancestors(
+			&root,
+			"a/b/c.txt",
+			&mut IgnoreRules::default(),
+			&RuleFiles::Read,
+			&mut walked,
+			&mut out,
+		);
+
+		assert!(matches!(ancestors, Ancestors::Unreadable));
+		assert!(!out.complete);
+		assert!(out.errors.is_empty(), "{:?}", out.errors);
+		assert_eq!(walked, BTreeSet::from(["a".to_owned()]));
 
 		fs::remove_dir_all(&root).ok();
 	}
