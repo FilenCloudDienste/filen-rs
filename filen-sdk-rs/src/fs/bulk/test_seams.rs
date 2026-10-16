@@ -1,13 +1,20 @@
-//! The `*_for_test` seams that send the `bulk/*` wrappers with no operation of their own to the
-//! server, so the live `bulk_tests` can drive each endpoint.
+//! The `*_for_test` seams that send the `bulk/*` wrappers with no operation of their own, and the
+//! endpoints with no wrapper, to the server, so the live `bulk_tests` can drive each endpoint.
 
-use filen_types::{api::v3::bulk::FileOrDir, traits::CowHelpers};
+use std::fmt::Debug;
+
+use filen_types::{
+	api::v3::bulk::{FileOrDir, MAX_READ_ITEMS},
+	traits::CowHelpers,
+};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
 	api::{
 		self,
 		v3::bulk::{
-			ItemData, Sent, delete, dir::link, linked, metadata, r#move, run_each, share, shared,
+			Body, ItemData, Sent, answered, delete, dir::link, linked, metadata, r#move, run_each,
+			send, share, shared,
 		},
 	},
 	auth::Client,
@@ -42,15 +49,57 @@ where
 	Fut: Future<Output = Result<T, Error>>,
 {
 	match sent? {
-		Sent::Unsupported(_) => Err(Error::custom(
-			ErrorKind::Internal,
-			format!("the server did not run {endpoint} as a bulk request"),
-		)),
+		Sent::Unsupported(_) => Err(not_run_as_bulk(endpoint)),
 		sent => Ok(run_each(sent, single).await),
 	}
 }
 
+fn not_run_as_bulk(endpoint: &str) -> Error {
+	Error::custom(
+		ErrorKind::Internal,
+		format!("the server did not run {endpoint} as a bulk request"),
+	)
+}
+
 impl Client {
+	/// Posts `request`, whose items are `items`, to the bulk `endpoint` and answers each item's
+	/// result in the same order, decoded as `T` by the rule its single route's answer goes
+	/// through. For the endpoints no operation wraps. Test code only.
+	///
+	/// It takes no lock: the caller holds what the single route takes. The body is always sent as
+	/// `Body::WithTopLevelFields`, so a whole-request `invalid_params` comes back as the
+	/// server's own error: these endpoints have no single calls to fall back on, so an item
+	/// answered `internal_error`, or a server without `endpoint`, is an error too.
+	/// [`MAX_READ_ITEMS`] is only the local bound; the server enforces each endpoint's own cap.
+	pub async fn post_bulk_for_test<I, T: DeserializeOwned>(
+		&self,
+		endpoint: &'static str,
+		request: &(impl Serialize + Debug),
+		items: &[I],
+	) -> Result<Vec<Result<T, Error>>, Error> {
+		match send(
+			items,
+			MAX_READ_ITEMS,
+			Body::WithTopLevelFields,
+			self.client().post_auth(endpoint.into(), request),
+		)
+		.await?
+		{
+			Sent::Answers(answers) => Ok(answers
+				.into_iter()
+				.map(|(_, answer)| {
+					answered(answer).unwrap_or_else(|| {
+						Err(Error::custom(
+							ErrorKind::Internal,
+							"answered internal_error",
+						))
+					})
+				})
+				.collect()),
+			Sent::Unsupported(_) => Err(not_run_as_bulk(endpoint)),
+		}
+	}
+
 	/// Deletes `items` permanently in one `bulk/delete/permanent` request under the drive lock and
 	/// answers each item's result in the same order. Nothing splits `items` into chunks: the tests
 	/// send fewer than the endpoint takes. Test code only.

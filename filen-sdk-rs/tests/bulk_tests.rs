@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use chrono::Utc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
-	ErrorKind,
+	Error, ErrorKind,
 	auth::Client,
 	connect::PublicLinkSharedClientExt,
 	fs::{
@@ -14,9 +14,15 @@ use filen_sdk_rs::{
 };
 use filen_types::{
 	api::v3::{
-		bulk::{FileOrDir, dir::link::add, file::stable, linked, share, shared},
+		bulk::{
+			FileOrDir,
+			dir::{color, link::add},
+			exists, favorite,
+			file::stable,
+			linked, present, rename, restore, share, shared,
+		},
 		contacts::Contact,
-		dir::{self, link::PublicLinkExpiration},
+		dir::{self, color::DirColor, link::PublicLinkExpiration},
 		file,
 	},
 	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
@@ -814,6 +820,484 @@ async fn get_files_by_stable_uuid_fails_only_an_unknown_lineage() {
 		(ErrorKind::FileNotFound, Some("file_not_found"))
 	);
 	assert_eq!(found_b.unwrap().uuid(), b.uuid());
+}
+
+#[shared_test_runtime]
+async fn exists_finds_files_and_dirs_by_name() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+
+	let item = |name: &str| exists::Item {
+		name_hashed: Cow::Owned(client.hash_name(name)),
+	};
+	let items = [
+		FileOrDir::File(item("f.txt")),
+		FileOrDir::File(item("missing.txt")),
+		FileOrDir::Dir(item("d")),
+		FileOrDir::Dir(item("missing")),
+	];
+	let results = client
+		.post_bulk_for_test::<_, file::exists::Response>(
+			exists::ENDPOINT,
+			&exists::Request {
+				parent: test_dir.uuid(),
+				items: &items,
+			},
+			&items,
+		)
+		.await
+		.unwrap();
+	let found = results
+		.into_iter()
+		.map(|result| result.unwrap().0)
+		.collect::<Vec<_>>();
+	assert_eq!(found, [Some(f.uuid()), None, Some(d.uuid()), None]);
+}
+
+#[shared_test_runtime]
+async fn present_reports_what_each_uuid_is() {
+	// Without get_resources_with_lock, for the reason trash_items_trashes_the_topmost_dirs_it_is_given
+	// gives: the trash lock comes first, then the drive lock.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	// Held to the end: another leg's empty-trash would delete the trashed file first.
+	let _trash_lock = client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let _drive_lock = client.lock_drive().await.unwrap();
+
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let g = drive_helpers::upload(client, test_dir, "g.txt", b"g").await;
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+	for result in client
+		.trash_items_for_test(&[FileOrDir::File(file::trash::Request { uuid: g.uuid() })])
+		.await
+		.unwrap()
+	{
+		result.unwrap();
+	}
+
+	let items = [
+		FileOrDir::File(present::Item { uuid: f.uuid() }),
+		FileOrDir::File(present::Item { uuid: g.uuid() }),
+		FileOrDir::Dir(present::Item { uuid: d.uuid() }),
+		FileOrDir::File(present::Item {
+			uuid: Uuid::new_v4(),
+		}),
+		FileOrDir::Dir(present::Item { uuid: f.uuid() }),
+	];
+	let results = client
+		.post_bulk_for_test::<_, present::Data>(
+			present::ENDPOINT,
+			&present::Request { items: &items },
+			&items,
+		)
+		.await
+		.unwrap();
+	let [found_f, found_g, found_d, unknown, file_as_dir] = results
+		.into_iter()
+		.map(Result::unwrap)
+		.collect::<Vec<_>>()
+		.try_into()
+		.unwrap();
+	assert!(
+		matches!(
+			found_f,
+			present::Data::File { versioned: false, trash: false, uuid, stable_uuid }
+				if uuid == f.uuid() && stable_uuid == f.stable_uuid()
+		),
+		"{found_f:?}"
+	);
+	assert!(
+		matches!(
+			found_g,
+			present::Data::File { versioned: false, trash: true, uuid, .. } if uuid == g.uuid()
+		),
+		"{found_g:?}"
+	);
+	assert!(
+		matches!(found_d, present::Data::Dir { trash: false }),
+		"{found_d:?}"
+	);
+	assert!(matches!(unknown, present::Data::Missing), "{unknown:?}");
+	assert!(
+		matches!(file_as_dir, present::Data::Missing),
+		"{file_as_dir:?}"
+	);
+}
+
+#[shared_test_runtime]
+async fn rename_renames_files_and_dirs() {
+	// The generic seam takes no lock: the test holds the drive lock the single routes take.
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let a = drive_helpers::upload(client, test_dir, "a.txt", b"a").await;
+	let b = client.create_dir(&test_dir.into(), "b").await.unwrap();
+
+	let items = [
+		client
+			.metadata_item_for_test(FileOrDir::File(&a), "a2.txt")
+			.await
+			.unwrap(),
+		client
+			.metadata_item_for_test(FileOrDir::Dir(&b), "b2")
+			.await
+			.unwrap(),
+	];
+	let results = client
+		.post_bulk_for_test::<_, ()>(rename::ENDPOINT, &rename::Request { items: &items }, &items)
+		.await
+		.unwrap();
+	assert_eq!(results.len(), 2);
+	for result in results {
+		result.unwrap();
+	}
+
+	// Each name decrypts from what the server stored, the only check that the item's encryption
+	// is right; the old name's hash no longer finds the file.
+	assert_eq!(
+		client.get_file(a.uuid()).await.unwrap().name(),
+		Some("a2.txt")
+	);
+	assert_eq!(client.get_dir(b.uuid()).await.unwrap().name(), Some("b2"));
+	assert_eq!(
+		client.file_exists("a.txt", &test_dir.into()).await.unwrap(),
+		None
+	);
+}
+
+#[shared_test_runtime]
+async fn restore_returns_trashed_items_to_their_parent() {
+	// Without get_resources_with_lock, for the reason trash_items_trashes_the_topmost_dirs_it_is_given
+	// gives: the trash lock comes first, then the drive lock.
+	let resources = test_utils::RESOURCES.get_resources().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+	// Held across trash -> restore: another leg's empty-trash would delete the items first.
+	let _trash_lock = client
+		.acquire_lock_with_default(test_utils::locks::TRASH)
+		.await
+		.unwrap();
+	let _drive_lock = client.lock_drive().await.unwrap();
+
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+	for result in client
+		.trash_items_for_test(&[
+			FileOrDir::File(file::trash::Request { uuid: f.uuid() }),
+			FileOrDir::Dir(dir::trash::Request { uuid: d.uuid() }),
+		])
+		.await
+		.unwrap()
+	{
+		result.unwrap();
+	}
+
+	let items = [
+		FileOrDir::File(file::restore::Request { uuid: f.uuid() }),
+		FileOrDir::Dir(dir::restore::Request { uuid: d.uuid() }),
+	];
+	let results = client
+		.post_bulk_for_test::<_, ()>(
+			restore::ENDPOINT,
+			&restore::Request { items: &items },
+			&items,
+		)
+		.await
+		.unwrap();
+	assert_eq!(results.len(), 2);
+	for result in results {
+		result.unwrap();
+	}
+
+	assert_eq!(
+		*client.get_file(f.uuid()).await.unwrap().parent(),
+		ParentUuid::Uuid(test_dir.uuid())
+	);
+	assert_eq!(
+		*client.get_dir(d.uuid()).await.unwrap().parent(),
+		ParentUuid::Uuid(test_dir.uuid())
+	);
+	let (dirs, files) = client
+		.list_dir(&test_dir.into(), None::<&fn(u64, Option<u64>)>)
+		.await
+		.unwrap();
+	assert_eq!(dir_uuids(&dirs), [d.uuid()]);
+	assert_eq!(names(&files), ["f.txt"]);
+}
+
+/// The `bulk/favorite` item that sets `uuid` favorited.
+fn favorite(uuid: Uuid, r#type: ObjectType) -> favorite::Item {
+	favorite::Item {
+		uuid,
+		r#type,
+		value: true,
+	}
+}
+
+/// Each item's answer to one `bulk/favorite` request: the item echoed back, as
+/// `uuid, type, value`.
+async fn post_favorite(
+	client: &Client,
+	items: &[favorite::Item],
+) -> Vec<Result<(Uuid, ObjectType, bool), Error>> {
+	client
+		// the single route answers the request as sent, so the echo has the item's type
+		.post_bulk_for_test::<_, favorite::Item>(
+			favorite::ENDPOINT,
+			&favorite::Request { items },
+			items,
+		)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|result| result.map(|echo| (echo.uuid, echo.r#type, echo.value)))
+		.collect()
+}
+
+async fn assert_favorited(client: &Client, f: Uuid, d: Uuid) {
+	assert!(
+		client.get_file(f).await.unwrap().favorited,
+		"file favorited"
+	);
+	assert!(client.get_dir(d).await.unwrap().favorited, "dir favorited");
+}
+
+#[shared_test_runtime]
+async fn favorite_sets_files_and_dirs_favorited() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+
+	let results = post_favorite(
+		client,
+		&[
+			favorite(f.uuid(), ObjectType::File),
+			favorite(d.uuid(), ObjectType::Dir),
+		],
+	)
+	.await;
+	let echoes = results.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+	assert_eq!(
+		echoes,
+		[
+			(f.uuid(), ObjectType::File, true),
+			(d.uuid(), ObjectType::Dir, true)
+		]
+	);
+	assert_favorited(client, f.uuid(), d.uuid()).await;
+}
+
+#[shared_test_runtime]
+async fn favorite_fails_only_an_item_that_does_not_exist() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+
+	let results = post_favorite(
+		client,
+		&[
+			favorite(f.uuid(), ObjectType::File),
+			favorite(Uuid::new_v4(), ObjectType::File),
+			favorite(d.uuid(), ObjectType::Dir),
+		],
+	)
+	.await;
+	let [file, missing, dir] = results.try_into().unwrap();
+	assert_eq!(file.unwrap(), (f.uuid(), ObjectType::File, true));
+	assert_eq!(
+		missing.unwrap_err().server_code().as_deref(),
+		Some("file_not_found")
+	);
+	assert_eq!(dir.unwrap(), (d.uuid(), ObjectType::Dir, true));
+	assert_favorited(client, f.uuid(), d.uuid()).await;
+}
+
+#[shared_test_runtime]
+async fn dir_color_sets_each_dirs_color() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let mut uuids = Vec::new();
+	for name in ["a", "b", "c"] {
+		uuids.push(
+			client
+				.create_dir(&test_dir.into(), name)
+				.await
+				.unwrap()
+				.uuid(),
+		);
+	}
+	let colors = [
+		DirColor::Blue,
+		DirColor::Custom(Cow::Borrowed("#ff0000")),
+		DirColor::Gray,
+	];
+	let items = uuids
+		.iter()
+		.zip(&colors)
+		.map(|(&uuid, color)| color::Item {
+			uuid,
+			color: color.as_borrowed_cow(),
+		})
+		.collect::<Vec<_>>();
+	let results = client
+		.post_bulk_for_test::<_, ()>(color::ENDPOINT, &color::Request { items: &items }, &items)
+		.await
+		.unwrap();
+	assert_eq!(results.len(), 3);
+	for result in results {
+		result.unwrap();
+	}
+
+	let mut found = Vec::new();
+	for uuid in uuids {
+		found.push(client.get_dir(uuid).await.unwrap().color);
+	}
+	assert_eq!(found, colors);
+}
+
+#[shared_test_runtime]
+async fn linked_rename_updates_an_items_name_in_a_link() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+	let s = client.create_dir(&(&d).into(), "s").await.unwrap();
+	let info = drive_helpers::dir_link_info(client, &d).await;
+	// The bulk metadata route renames on the drive alone, leaving the link's copy of the name.
+	for result in client
+		.update_metadata_for_test(&[client
+			.metadata_item_for_test(FileOrDir::Dir(&s), "s2")
+			.await
+			.unwrap()])
+		.await
+		.unwrap()
+	{
+		result.unwrap();
+	}
+	let (dirs, _) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(names(&dirs), ["s"]);
+
+	let renamed = client.get_dir(s.uuid()).await.unwrap();
+	let items = [linked::rename::Item {
+		uuid: s.uuid(),
+		link_uuid: *info.link.uuid(),
+		metadata: renamed
+			.get_encrypted_meta(info.link.crypter_for_test())
+			.await
+			.unwrap(),
+	}];
+	let results = client
+		.post_bulk_for_test::<_, ()>(
+			linked::rename::ENDPOINT,
+			&linked::rename::Request { items: &items },
+			&items,
+		)
+		.await
+		.unwrap();
+	let [renamed_in_link] = results.try_into().unwrap();
+	renamed_in_link.unwrap();
+
+	// The name decrypts only if the metadata was encrypted with the link's key.
+	let (dirs, _) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(names(&dirs), ["s2"]);
+}
+
+/// The name the receiver `share_client` reads for the dir `uuid` shared with it.
+async fn shared_in_name(share_client: &Client, uuid: Uuid) -> Option<String> {
+	let (dirs_in, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let shared_in = dirs_in
+		.iter()
+		.filter(|dir| dir.get_dir().uuid() == uuid)
+		.collect::<Vec<_>>();
+	let [shared_in] = shared_in.as_slice() else {
+		panic!("the receiver lists {} rows for the dir", shared_in.len());
+	};
+	shared_in.get_dir().name().map(str::to_owned)
+}
+
+#[shared_test_runtime]
+async fn shared_rename_updates_an_items_name_for_its_receiver() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+
+	let d = client
+		.create_dir(&(&resources.dir).into(), "old")
+		.await
+		.unwrap();
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None)
+		.await
+		.unwrap();
+	// The bulk metadata route renames on the drive alone, leaving the receiver's copy of the name.
+	for result in client
+		.update_metadata_for_test(&[client
+			.metadata_item_for_test(FileOrDir::Dir(&d), "new")
+			.await
+			.unwrap()])
+		.await
+		.unwrap()
+	{
+		result.unwrap();
+	}
+	assert_eq!(
+		shared_in_name(&share_client, d.uuid()).await.as_deref(),
+		Some("old")
+	);
+
+	let renamed = client.get_dir(d.uuid()).await.unwrap();
+	let items = [shared::rename::Item {
+		uuid: d.uuid(),
+		receiver_id: contact.user_id,
+		metadata: renamed
+			.get_rsa_encrypted_meta(&contact.public_key)
+			.await
+			.unwrap(),
+	}];
+	let results = client
+		.post_bulk_for_test::<_, ()>(
+			shared::rename::ENDPOINT,
+			&shared::rename::Request { items: &items },
+			&items,
+		)
+		.await
+		.unwrap();
+	let [renamed_for_receiver] = results.try_into().unwrap();
+	renamed_for_receiver.unwrap();
+
+	// The name decrypts on the receiver only if the metadata was encrypted with its key.
+	assert_eq!(
+		shared_in_name(&share_client, d.uuid()).await.as_deref(),
+		Some("new")
+	);
 }
 
 fn dir_uuids(dirs: &[RemoteDirectory]) -> Vec<Uuid> {
