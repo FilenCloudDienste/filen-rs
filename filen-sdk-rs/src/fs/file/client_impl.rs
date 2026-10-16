@@ -20,7 +20,7 @@ use crate::{
 		categories::{DirType, Normal},
 		file::{
 			FileVersion, FileWithInfo,
-			meta::{FileMeta, FileMetaChanges},
+			meta::{DecryptedFileMeta, FileMeta, FileMetaChanges},
 			traits::HasFileMeta,
 			write::FileWriterDefault,
 		},
@@ -171,39 +171,46 @@ impl Client {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 
+		let request = self.file_metadata_request(file.uuid(), &temp_meta).await?;
+		api::v3::file::metadata::post(self.client(), &request).await?;
+
+		file.update_meta(changes)?;
+
+		self.update_maybe_connected_item(&lock, file).await?;
+		Ok(())
+	}
+
+	/// The `file/metadata` request that gives the file `uuid` the metadata `meta`: its name
+	/// encrypted with the file's own key, the name hash and the metadata encrypted with the
+	/// account's key.
+	pub(crate) async fn file_metadata_request(
+		&self,
+		uuid: Uuid,
+		meta: &DecryptedFileMeta<'_>,
+	) -> Result<api::v3::file::metadata::Request<'static>, Error> {
 		let crypter = self.crypter();
 
 		let (name, metadata) = do_cpu_intensive(|| {
 			blocking_join!(
 				|| Ok::<_, ConversionError>(
-					temp_meta
-						.key()
+					meta.key()
 						.to_meta_key()?
-						.blocking_encrypt_meta(temp_meta.name.as_ref())
+						.blocking_encrypt_meta(meta.name.as_ref())
 				),
 				|| {
-					let meta_json = serde_json::to_string(&temp_meta)?;
+					let meta_json = serde_json::to_string(meta)?;
 					Ok::<_, Error>(crypter.blocking_encrypt_meta(&meta_json))
 				}
 			)
 		})
 		.await;
 
-		api::v3::file::metadata::post(
-			self.client(),
-			&api::v3::file::metadata::Request {
-				uuid: file.uuid(),
-				name: name?,
-				name_hashed: Cow::Owned(self.hash_name(temp_meta.name())),
-				metadata: metadata?,
-			},
-		)
-		.await?;
-
-		file.update_meta(changes)?;
-
-		self.update_maybe_connected_item(&lock, file).await?;
-		Ok(())
+		Ok(api::v3::file::metadata::Request {
+			uuid,
+			name: name?,
+			name_hashed: Cow::Owned(self.hash_name(meta.name())),
+			metadata: metadata?,
+		})
 	}
 
 	pub async fn get_file(&self, uuid: Uuid) -> Result<RemoteFile, Error> {

@@ -426,33 +426,42 @@ impl Client {
 			return Err(MetadataWasNotDecryptedError.into());
 		};
 
-		let (lock_result, encrypted_meta) = futures::join!(
+		let (lock_result, request) = futures::join!(
 			self.lock_drive(),
-			do_cpu_intensive(|| {
-				Ok::<_, Error>(
-					self.crypter()
-						.blocking_encrypt_meta(&serde_json::to_string(&temp_meta)?),
-				)
-			})
+			self.dir_metadata_request(dir.uuid(), &temp_meta)
 		);
 		// Propagate a failed drive lock instead of proceeding unlocked, matching the
 		// `let _lock = self.lock_drive().await?` guard every other dir/file op uses.
 		let lock = lock_result?;
+		let request = request?;
 
-		api::v3::dir::metadata::post(
-			self.client(),
-			&api::v3::dir::metadata::Request {
-				uuid: dir.uuid(),
-				name_hashed: Cow::Borrowed(&self.hash_name(temp_meta.name())),
-				metadata: encrypted_meta?,
-			},
-		)
-		.await?;
+		api::v3::dir::metadata::post(self.client(), &request).await?;
 
 		dir.update_meta(changes)?;
 		self.update_maybe_connected_item(&lock, dir).await?;
 
 		Ok(())
+	}
+
+	/// The `dir/metadata` request that gives the directory `uuid` the metadata `meta`: the name
+	/// hash and the metadata encrypted with the account's key.
+	pub(crate) async fn dir_metadata_request(
+		&self,
+		uuid: Uuid,
+		meta: &DecryptedDirectoryMeta<'_>,
+	) -> Result<api::v3::dir::metadata::Request<'static>, Error> {
+		let metadata = do_cpu_intensive(|| {
+			Ok::<_, Error>(
+				self.crypter()
+					.blocking_encrypt_meta(&serde_json::to_string(meta)?),
+			)
+		})
+		.await?;
+		Ok(api::v3::dir::metadata::Request {
+			uuid,
+			name_hashed: Cow::Owned(self.hash_name(meta.name())),
+			metadata,
+		})
 	}
 
 	// /// Finds an item in the directory by name or UUID.
