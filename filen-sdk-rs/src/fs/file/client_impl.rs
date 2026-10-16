@@ -251,6 +251,36 @@ impl Client {
 		self.decrypt_file_response(uuid, response).await
 	}
 
+	// Test seam: the live tests send `bulk/file/stable` to the server. Gated behind the
+	// `test-seams` feature, which production builds never enable.
+	/// [`Client::get_file_by_stable_uuid`] for each of `items` in one `bulk/file/stable` request,
+	/// answered in the same order and decrypted as the single fetch decrypts its file. It takes no
+	/// lock, as a read. Test code only.
+	#[cfg(feature = "test-seams")]
+	pub async fn get_files_by_stable_uuid_for_test(
+		&self,
+		items: &[api::v3::bulk::file::stable::Item],
+	) -> Result<Vec<Result<RemoteFile, Error>>, Error> {
+		let responses = crate::fs::bulk::test_seams::answered_by_bulk(
+			api::v3::bulk::file::stable::ENDPOINT,
+			api::v3::bulk::file::stable::post(
+				self.client(),
+				&api::v3::bulk::file::stable::Request { items },
+			)
+			.await,
+			|item| api::v3::file::stable::post(self.client(), item),
+		)
+		.await?;
+		let mut files = Vec::with_capacity(responses.len());
+		for response in responses {
+			files.push(match response {
+				Ok(response) => self.decrypt_file_response(response.uuid, response).await,
+				Err(e) => Err(e),
+			});
+		}
+		Ok(files)
+	}
+
 	/// Decrypt one single-file API response into a [`RemoteFile`] under `uuid`. Shared by the
 	/// by-uuid and by-stable-id fetches, which differ only in which uuid the row is filed under.
 	async fn decrypt_file_response(

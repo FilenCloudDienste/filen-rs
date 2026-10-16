@@ -217,6 +217,15 @@ impl DirPublicLink {
 		&self.link_key
 	}
 
+	// Test seam: the live tests encrypt `bulk/dir/link/add` items with the link's key. Gated
+	// behind the `test-seams` feature, which production builds never enable.
+	/// The link key's crypter, for [`HasMetaExt::get_encrypted_meta`] as
+	/// [`Client::public_link_dir`] uses it. Test code only.
+	#[cfg(feature = "test-seams")]
+	pub fn crypter_for_test(&self) -> &impl MetaCrypter {
+		self.crypter()
+	}
+
 	pub fn uuid(&self) -> &Uuid {
 		&self.link_uuid
 	}

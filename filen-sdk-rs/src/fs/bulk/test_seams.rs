@@ -1,12 +1,14 @@
 //! The `*_for_test` seams that send the `bulk/*` wrappers with no operation of their own to the
 //! server, so the live `bulk_tests` can drive each endpoint.
 
-use filen_types::api::v3::bulk::FileOrDir;
+use filen_types::{api::v3::bulk::FileOrDir, traits::CowHelpers};
 
 use crate::{
 	api::{
 		self,
-		v3::bulk::{ItemData, Sent, delete, metadata, r#move, run_each},
+		v3::bulk::{
+			ItemData, Sent, delete, dir::link, linked, metadata, r#move, run_each, share, shared,
+		},
 	},
 	auth::Client,
 	error::{Error, ErrorKind, MetadataWasNotDecryptedError},
@@ -153,5 +155,92 @@ impl Client {
 				))
 			}
 		}
+	}
+
+	/// Shares `request`'s items with its receiver in one `bulk/share` request under the drive lock,
+	/// as [`Client::share_dir`] holds it, and answers each item's result in the same order. Nothing
+	/// splits the items into chunks: the tests send fewer than the endpoint takes. Test code only.
+	pub async fn share_items_for_test(
+		&self,
+		request: &share::Request<'_>,
+	) -> Result<Vec<Result<(), Error>>, Error> {
+		let _lock = self.lock_drive().await?;
+		answered_by_bulk(
+			share::ENDPOINT,
+			share::post(self.client(), request).await,
+			|item| async move {
+				api::v3::item::share::post(
+					self.client(),
+					&api::v3::item::share::Request {
+						uuid: item.uuid,
+						parent: item.parent,
+						email: request.email.as_borrowed_cow(),
+						r#type: item.r#type,
+						metadata: item.metadata.as_borrowed_cow(),
+					},
+				)
+				.await
+			},
+		)
+		.await
+	}
+
+	/// Adds `request`'s items to its link in one `bulk/dir/link/add` request under the drive lock,
+	/// as [`Client::public_link_dir`] holds it, and answers each item's result in the same order.
+	/// Nothing splits the items into chunks: the tests send fewer than the endpoint takes. Test
+	/// code only.
+	pub async fn add_to_dir_link_for_test(
+		&self,
+		request: &link::add::Request<'_>,
+	) -> Result<Vec<Result<(), Error>>, Error> {
+		let _lock = self.lock_drive().await?;
+		answered_by_bulk(
+			link::add::ENDPOINT,
+			link::add::post(self.client(), request).await,
+			|item| async move {
+				api::v3::dir::link::add::post(
+					self.client(),
+					&api::v3::dir::link::add::Request {
+						uuid: item.uuid,
+						parent: item.parent,
+						link_uuid: request.link_uuid,
+						r#type: item.r#type,
+						metadata: item.metadata.as_borrowed_cow(),
+						key: request.key.as_borrowed_cow(),
+						expiration: request.expiration,
+					},
+				)
+				.await
+			},
+		)
+		.await
+	}
+
+	/// The public links each of `items` is in, from one `bulk/linked` request, in the same order.
+	/// It takes no lock, as a read. Test code only.
+	pub async fn linked_for_test(
+		&self,
+		items: &[linked::Item],
+	) -> Result<Vec<Result<api::v3::item::linked::Response<'static>, Error>>, Error> {
+		answered_by_bulk(
+			linked::ENDPOINT,
+			linked::post(self.client(), &linked::Request { items }).await,
+			|item| api::v3::item::linked::post(self.client(), item),
+		)
+		.await
+	}
+
+	/// The users each of `items` is shared with, from one `bulk/shared` request, in the same order.
+	/// It takes no lock, as a read. Test code only.
+	pub async fn shared_for_test(
+		&self,
+		items: &[shared::Item],
+	) -> Result<Vec<Result<api::v3::item::shared::Response<'static>, Error>>, Error> {
+		answered_by_bulk(
+			shared::ENDPOINT,
+			shared::post(self.client(), &shared::Request { items }).await,
+			|item| api::v3::item::shared::post(self.client(), item),
+		)
+		.await
 	}
 }

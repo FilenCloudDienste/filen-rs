@@ -1,15 +1,26 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use filen_macros::shared_test_runtime;
 use filen_sdk_rs::{
 	ErrorKind,
 	auth::Client,
+	connect::PublicLinkSharedClientExt,
 	fs::{
-		HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory, file::RemoteFile,
+		HasMetaExt, HasName, HasParent, HasUUID, NewDir, NewDirParent, dir::RemoteDirectory,
+		file::RemoteFile,
 	},
+	sync::lock::ResourceLock,
 };
 use filen_types::{
-	api::v3::{bulk::FileOrDir, dir, file},
-	fs::{ParentUuid, Uuid},
+	api::v3::{
+		bulk::{FileOrDir, dir::link::add, file::stable, linked, share, shared},
+		contacts::Contact,
+		dir::{self, link::PublicLinkExpiration},
+		file,
+	},
+	fs::{ObjectType, ParentUuid, StableUuid, Uuid},
+	traits::CowHelpers,
 };
 
 mod drive_helpers;
@@ -383,6 +394,426 @@ async fn create_dirs_fails_only_a_dir_named_like_a_file_in_its_parent() {
 		.unwrap();
 	assert_eq!(dir_uuids(&dirs), [y.uuid]);
 	assert_eq!(names(&files), ["x"]);
+}
+
+/// The share account as a contact of the test account, with both accounts' contact lock, which
+/// the caller holds for the whole test and takes before the drive lock, as the share tests in
+/// connect_tests do.
+async fn contact(
+	client: &Client,
+	share_client: &Client,
+) -> (Contact<'static>, [Arc<ResourceLock>; 2]) {
+	let locks = [
+		client
+			.acquire_lock_with_default(test_utils::locks::CONTACT)
+			.await
+			.unwrap(),
+		share_client
+			.acquire_lock_with_default(test_utils::locks::CONTACT)
+			.await
+			.unwrap(),
+	];
+	if let Some(contact) = find_contact(client, share_client.email()).await {
+		return (contact, locks);
+	}
+	// Only when the accounts are not contacts yet: between contacts the server answers a request
+	// with the existing contact's uuid, which is no request to accept.
+	test_utils::add_contact(client, share_client).await;
+	let contact = find_contact(client, share_client.email()).await.unwrap();
+	(contact, locks)
+}
+
+async fn find_contact(client: &Client, email: &str) -> Option<Contact<'static>> {
+	client
+		.get_contacts()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|contact| contact.email == email)
+}
+
+/// The dir "shared" in `test_dir` and the file "f.txt" in it.
+async fn share_fixtures(
+	client: &Client,
+	test_dir: &RemoteDirectory,
+) -> (RemoteDirectory, RemoteFile) {
+	let d = client.create_dir(&test_dir.into(), "shared").await.unwrap();
+	let f = drive_helpers::upload(client, &d, "f.txt", b"f").await;
+	(d, f)
+}
+
+/// How many of `client`'s outgoing shares are `uuid`. Other legs share from the share account
+/// outside the contact lock, so only rows for this test's dir can be counted.
+async fn out_shared_count(client: &Client, uuid: Uuid) -> usize {
+	let (dirs, _) = client
+		.list_out_shared::<fn(u64, Option<u64>)>(None, None)
+		.await
+		.unwrap();
+	dirs.iter()
+		.filter(|dir| dir.get_dir().uuid() == uuid)
+		.count()
+}
+
+#[shared_test_runtime]
+async fn share_items_shares_a_dir_and_its_file_with_the_receiver() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let (d, f) = share_fixtures(&client, &resources.dir).await;
+
+	let items = [
+		share::Item {
+			uuid: d.uuid(),
+			parent: None,
+			r#type: ObjectType::Dir,
+			metadata: d.get_rsa_encrypted_meta(&contact.public_key).await.unwrap(),
+		},
+		share::Item {
+			uuid: f.uuid(),
+			parent: Some(d.uuid()),
+			r#type: ObjectType::File,
+			metadata: f.get_rsa_encrypted_meta(&contact.public_key).await.unwrap(),
+		},
+	];
+	let results = client
+		.share_items_for_test(&share::Request {
+			email: contact.email.as_borrowed_cow(),
+			items: &items,
+		})
+		.await
+		.unwrap();
+	assert_eq!(results.len(), 2);
+	for result in results {
+		result.unwrap();
+	}
+
+	assert_eq!(out_shared_count(&client, d.uuid()).await, 1);
+	// The names decrypt on the receiver only if each item's metadata was encrypted with its key.
+	let (dirs_in, _) = share_client
+		.list_in_shared_root::<fn(u64, Option<u64>)>(None)
+		.await
+		.unwrap();
+	let shared_in = dirs_in
+		.iter()
+		.filter(|dir| dir.get_dir().uuid() == d.uuid())
+		.collect::<Vec<_>>();
+	let [shared_in] = shared_in.as_slice() else {
+		panic!("the receiver lists {} rows for the dir", shared_in.len());
+	};
+	assert_eq!(shared_in.get_dir().name(), Some("shared"));
+	let (_, files_in) = share_client
+		.list_shared_dir::<fn(u64, Option<u64>)>(
+			&(*shared_in).into(),
+			shared_in.sharing_role(),
+			None,
+		)
+		.await
+		.unwrap();
+	assert_eq!(names(&files_in), ["f.txt"]);
+}
+
+#[shared_test_runtime]
+async fn share_items_fails_only_an_item_that_does_not_exist() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let (d, f) = share_fixtures(&client, &resources.dir).await;
+
+	let d_meta = d.get_rsa_encrypted_meta(&contact.public_key).await.unwrap();
+	let items = [
+		share::Item {
+			uuid: d.uuid(),
+			parent: None,
+			r#type: ObjectType::Dir,
+			// cloned: the missing dir below reuses it
+			metadata: d_meta.clone(),
+		},
+		share::Item {
+			uuid: Uuid::new_v4(),
+			parent: None,
+			r#type: ObjectType::Dir,
+			metadata: d_meta,
+		},
+		share::Item {
+			uuid: f.uuid(),
+			parent: Some(d.uuid()),
+			r#type: ObjectType::File,
+			metadata: f.get_rsa_encrypted_meta(&contact.public_key).await.unwrap(),
+		},
+	];
+	let results = client
+		.share_items_for_test(&share::Request {
+			email: contact.email.as_borrowed_cow(),
+			items: &items,
+		})
+		.await
+		.unwrap();
+	let [shared_dir, missing, shared_file] = results.try_into().unwrap();
+	shared_dir.unwrap();
+	let missing = missing.unwrap_err();
+	assert_eq!(
+		(missing.kind(), missing.server_code().as_deref()),
+		(ErrorKind::FolderNotFound, Some("folder_not_found"))
+	);
+	shared_file.unwrap();
+
+	assert_eq!(out_shared_count(&client, d.uuid()).await, 1);
+}
+
+#[shared_test_runtime]
+async fn shared_reports_who_each_item_is_shared_with() {
+	let client = test_utils::RESOURCES.client().await;
+	let share_client = test_utils::SHARE_RESOURCES.client().await;
+	let (contact, _contact_locks) = contact(&client, &share_client).await;
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let (d, f) = share_fixtures(&client, &resources.dir).await;
+	let u = client
+		.create_dir(&(&resources.dir).into(), "u")
+		.await
+		.unwrap();
+	client
+		.share_dir::<fn(u64, Option<u64>)>(&d, &contact, None)
+		.await
+		.unwrap();
+
+	let results = client
+		.shared_for_test(&[
+			shared::Item { uuid: d.uuid() },
+			shared::Item { uuid: f.uuid() },
+			shared::Item { uuid: u.uuid() },
+			shared::Item {
+				uuid: Uuid::new_v4(),
+			},
+		])
+		.await
+		.unwrap();
+	let users = results
+		.into_iter()
+		.map(|result| {
+			let response = result.unwrap();
+			let users = response
+				.users
+				.into_iter()
+				.map(|user| (user.id, user.email.into_owned()))
+				.collect::<Vec<_>>();
+			(response.sharing, users)
+		})
+		.collect::<Vec<_>>();
+	let receiver = vec![(contact.user_id, share_client.email().to_owned())];
+	assert_eq!(
+		users,
+		[
+			(true, receiver.clone()),
+			(true, receiver),
+			(false, Vec::new()),
+			(false, Vec::new()),
+		]
+	);
+}
+
+#[shared_test_runtime]
+async fn linked_reports_the_links_each_item_is_in() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let d = client.create_dir(&test_dir.into(), "linked").await.unwrap();
+	let f = drive_helpers::upload(client, &d, "f.txt", b"f").await;
+	let u = client.create_dir(&test_dir.into(), "u").await.unwrap();
+	let link = client
+		.public_link_dir::<fn(u64, Option<u64>)>(&d, None)
+		.await
+		.unwrap();
+
+	let results = client
+		.linked_for_test(&[
+			linked::Item { uuid: d.uuid() },
+			linked::Item { uuid: f.uuid() },
+			linked::Item { uuid: u.uuid() },
+			linked::Item {
+				uuid: Uuid::new_v4(),
+			},
+		])
+		.await
+		.unwrap();
+	let links = results
+		.into_iter()
+		.map(|result| {
+			let response = result.unwrap();
+			let links = response
+				.links
+				.iter()
+				.map(|link| link.link_uuid)
+				.collect::<Vec<_>>();
+			(response.link, links)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		links,
+		[
+			(true, vec![link.uuid()]),
+			(true, vec![link.uuid()]),
+			(false, Vec::new()),
+			(false, Vec::new()),
+		]
+	);
+}
+
+#[shared_test_runtime]
+async fn add_to_dir_link_adds_items_to_an_existing_link() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	// Linked while empty, then filled by calls that do not add to links: the bulk dir create and
+	// the bulk move.
+	let d = client.create_dir(&test_dir.into(), "d").await.unwrap();
+	let info = drive_helpers::dir_link_info(client, &d).await;
+	let s = client
+		.create_dirs_for_test(&[new_dir("s", NewDirParent::Existing(d.uuid()))])
+		.await
+		.unwrap()
+		.remove(0)
+		.unwrap()
+		.uuid;
+	let s = client.get_dir(s).await.unwrap();
+	let f = drive_helpers::upload(client, test_dir, "f.txt", b"f").await;
+	let moved = client
+		.move_items_for_test(&[FileOrDir::File(file::r#move::Request {
+			uuid: f.uuid(),
+			new_parent: d.uuid(),
+		})])
+		.await
+		.unwrap();
+	for result in moved {
+		result.unwrap();
+	}
+	let (dirs, files) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!((dirs.len(), files.len()), (0, 0));
+
+	let listed = client
+		.linked_for_test(&[linked::Item { uuid: d.uuid() }])
+		.await
+		.unwrap()
+		.remove(0)
+		.unwrap()
+		.links
+		.remove(0);
+	assert_eq!(listed.link_uuid, *info.link.uuid());
+	let crypter = info.link.crypter_for_test();
+	let items = [
+		add::Item {
+			uuid: s.uuid(),
+			parent: Some(d.uuid()),
+			r#type: ObjectType::Dir,
+			metadata: s.get_encrypted_meta(crypter).await.unwrap(),
+		},
+		add::Item {
+			uuid: f.uuid(),
+			parent: Some(d.uuid()),
+			r#type: ObjectType::File,
+			metadata: f.get_encrypted_meta(crypter).await.unwrap(),
+		},
+	];
+	let results = client
+		.add_to_dir_link_for_test(&add::Request {
+			link_uuid: listed.link_uuid,
+			key: listed.link_key,
+			expiration: PublicLinkExpiration::Never,
+			items: &items,
+		})
+		.await
+		.unwrap();
+	assert_eq!(results.len(), 2);
+	for result in results {
+		result.unwrap();
+	}
+
+	// The names decrypt only if each item's metadata was encrypted with the link's key.
+	let (dirs, files) = client
+		.list_linked_dir::<fn(u64, Option<u64>)>(&(&info.root).into(), &info.link, None)
+		.await
+		.unwrap();
+	assert_eq!(names(&dirs), ["s"]);
+	assert_eq!(names(&files), ["f.txt"]);
+}
+
+#[shared_test_runtime]
+async fn get_files_by_stable_uuid_resolves_each_lineage() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let a = drive_helpers::upload(client, test_dir, "a.txt", b"a").await;
+	let b = drive_helpers::upload(client, test_dir, "b.txt", b"b").await;
+
+	let results = client
+		.get_files_by_stable_uuid_for_test(&[
+			stable::Item {
+				stable_uuid: a.stable_uuid(),
+			},
+			stable::Item {
+				stable_uuid: b.stable_uuid(),
+			},
+		])
+		.await
+		.unwrap();
+	let [found_a, found_b] = results.try_into().unwrap();
+	let (found_a, found_b) = (found_a.unwrap(), found_b.unwrap());
+	assert_eq!((found_a.uuid(), found_a.name()), (a.uuid(), Some("a.txt")));
+	assert_eq!((found_b.uuid(), found_b.name()), (b.uuid(), Some("b.txt")));
+	assert_eq!(
+		found_a,
+		client
+			.get_file_by_stable_uuid(a.stable_uuid())
+			.await
+			.unwrap()
+	);
+	assert_eq!(
+		found_b,
+		client
+			.get_file_by_stable_uuid(b.stable_uuid())
+			.await
+			.unwrap()
+	);
+}
+
+#[shared_test_runtime]
+async fn get_files_by_stable_uuid_fails_only_an_unknown_lineage() {
+	let (resources, _lock) = test_utils::RESOURCES.get_resources_with_lock().await;
+	let client = &resources.client;
+	let test_dir = &resources.dir;
+
+	let a = drive_helpers::upload(client, test_dir, "a.txt", b"a").await;
+	let b = drive_helpers::upload(client, test_dir, "b.txt", b"b").await;
+
+	let results = client
+		.get_files_by_stable_uuid_for_test(&[
+			stable::Item {
+				stable_uuid: a.stable_uuid(),
+			},
+			stable::Item {
+				stable_uuid: StableUuid::new_for_test(Uuid::new_v4()),
+			},
+			stable::Item {
+				stable_uuid: b.stable_uuid(),
+			},
+		])
+		.await
+		.unwrap();
+	let [found_a, unknown, found_b] = results.try_into().unwrap();
+	assert_eq!(found_a.unwrap().uuid(), a.uuid());
+	let unknown = unknown.unwrap_err();
+	assert_eq!(
+		(unknown.kind(), unknown.server_code().as_deref()),
+		(ErrorKind::FileNotFound, Some("file_not_found"))
+	);
+	assert_eq!(found_b.unwrap().uuid(), b.uuid());
 }
 
 fn dir_uuids(dirs: &[RemoteDirectory]) -> Vec<Uuid> {
